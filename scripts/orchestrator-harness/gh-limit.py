@@ -1351,15 +1351,25 @@ def _cred_digest():
     ⛔ ALL FOUR credential names: `gh` reads the ENTERPRISE pair for a non-github.com host, and a key
     on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced).
 
-    ⛔ AND THE SERVED ARM (#3429). The installation token and the user credential can see DIFFERENT
-    repositories, so a body (or a 404) cached under one must never be replayed to the other — that
-    is precisely the "the call failed and the caller read the failure as no data" class #3584 is
-    made of, and it is silent: rc 0, a plausible empty answer. The arm is a fixed word, not a
-    secret. One consequence is accepted and stated: the existing cache warms twice, once per arm."""
+    ⛔ DELIBERATELY UNCHANGED BY THE CREDENTIAL LAYER (#3429). This digest stays a PURE function of
+    the environment, because `cache_key`/`flight_key` must be computable from an invocation alone.
+    Mixing the served arm in here was the FIRST attempt and gh-limit.test.sh caught it: three
+    assertions plant a flight claim by computing `flight_key(argv)` out-of-process, and an arm that
+    only exists after `main()` runs made the key unreproducible — the planted claim landed on a
+    different path and the takeover/orphan-reclaim arms silently stopped being exercised. Cross-
+    credential safety is enforced per ENTRY instead (`_CRED_CLASS`)."""
     tok = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
            or os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN") or "")
-    base = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
-    return "%s.%s" % (base, _CRED_ARM)
+    return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+
+
+def _cred_class_ok(entry):
+    """Was this cached answer produced by the credential THIS process serves calls with?
+
+    A missing `cred` means the entry predates the credential layer, i.e. the user credential — which
+    is what an unlabelled entry correctly is. A MISS here costs exactly one re-fetch, and it can only
+    ever move an answer toward the caller's own visibility, never away from it."""
+    return (entry.get("cred") or "user") == _CRED_CLASS
 
 
 def cache_key(plan):
@@ -1393,11 +1403,15 @@ def cache_get(key):
     """The cached entry, with its body as BYTES. Base64, not a decoded string: a 304 replay must
     reproduce the 200 body EXACTLY, and any text decoding (`utf-8`, `replace`) silently corrupts a
     body that is not UTF-8 — a `gh api` of a contents/binary endpoint would come back mangled while
-    the caller believed it had the unchanged resource."""
+    the caller believed it had the unchanged resource.
+
+    ⛔ AND AN ENTRY FROM THE OTHER CREDENTIAL IS A MISS (#3429): see `_CRED_CLASS`."""
     try:
         with open(cache_path(key)) as fh:
             d = json.load(fh)
         if isinstance(d, dict) and d.get("etag") and isinstance(d.get("body_b64"), str):
+            if not _cred_class_ok(d):
+                return None
             d["body"] = base64.b64decode(d["body_b64"].encode("ascii"))
             return d
     except (OSError, ValueError, binascii.Error):
@@ -1457,7 +1471,8 @@ def cache_put(key, etag, body):
     try:
         os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
         with open(tmp, "w") as fh:
-            json.dump({"etag": etag, "body_b64": base64.b64encode(body).decode("ascii")}, fh)
+            json.dump({"etag": etag, "cred": _CRED_CLASS,
+                       "body_b64": base64.b64encode(body).decode("ascii")}, fh)
         os.replace(tmp, p)
     except OSError:
         try:
@@ -1584,6 +1599,8 @@ def pass_cache_get(gh_argv):
         out = base64.b64decode(e["out_b64"].encode("ascii"))
         err = base64.b64decode(e["err_b64"].encode("ascii"))
         rc = int(e["rc"])
+        if not _cred_class_ok(e):
+            return None                 # produced by the OTHER credential — ask GitHub (#3429)
     except (OSError, ValueError, KeyError, TypeError, binascii.Error):
         return None
     if rc != 0:
@@ -1608,7 +1625,7 @@ def pass_cache_put(gh_argv, out, err, rc):
     tmp = p + ".tmp-%d" % os.getpid()
     try:
         with open(tmp, "w") as fh:
-            json.dump({"rc": rc,
+            json.dump({"rc": rc, "cred": _CRED_CLASS,
                        "out_b64": base64.b64encode(out).decode("ascii"),
                        "err_b64": base64.b64encode(err).decode("ascii")}, fh)
         os.replace(tmp, p)
@@ -2558,6 +2575,8 @@ def read_cache_get(key, ttl):
             e = json.load(fh)
         if int(e["rc"]) != 0:
             return None            # never trust a stored failure (see the exclusion list)
+        if not _cred_class_ok(e):
+            return None            # produced by the OTHER credential — ask GitHub (#3429)
         if clock() - float(e["at"]) > ttl:
             return None            # too old for THIS class: ask GitHub
         if float(e["at"]) > clock() + 60:
@@ -2597,7 +2616,7 @@ def read_cache_put(key, rc, out, err):
     tmp = p + ".tmp-%d" % os.getpid()
     try:
         with open(tmp, "w") as fh:
-            json.dump({"at": clock(), "rc": rc,
+            json.dump({"at": clock(), "rc": rc, "cred": _CRED_CLASS,
                        "out_b64": base64.b64encode(out).decode("ascii"),
                        "err_b64": base64.b64encode(err).decode("ascii")}, fh)
         os.replace(tmp, p)
@@ -3450,11 +3469,14 @@ def main(argv):
     # ⛔ RESOLVE THE CREDENTIAL ONCE, BEFORE any cache is keyed (#3429). `_cred_digest()` partitions
     # the ETag/flight caches by the SERVED arm, so the arm has to be known before the first read of
     # one; resolving here also bounds minting to one call per process.
-    global _CRED_ARM
+    global _CRED_ARM, _CRED_CLASS
     if gh_argv and cred_purpose(gh_argv) == "request":
-        _CRED_ARM = credential_for(gh_argv).arm
+        _decision = credential_for(gh_argv)
+        _CRED_ARM = _decision.arm
+        _CRED_CLASS = "app" if _decision.credential == "app" else "user"
     else:
         _CRED_ARM = "meter" if gh_argv and cred_purpose(gh_argv) == "meter" else "plain"
+        _CRED_CLASS = "user"          # the meter and introspection are pinned to the user credential
     if budget:
         snap = probe_budget(real_gh) if real_gh and os.path.isfile(real_gh) else None
         if snap is None:

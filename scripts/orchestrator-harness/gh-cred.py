@@ -122,7 +122,7 @@ ARM_OVERRIDE = (os.environ.get("GH_CRED_ARM_OVERRIDE") or "").strip()
 
 TOKEN_FILE = "token.json"
 BUDGET_FILE = "app-budget.json"
-COUNTER_FILE = "counters.json"
+COUNTER_FILE_LEGACY = "counters.json"
 DECISIONS_FILE = "decisions.log"
 
 DECISIONS_MAX_BYTES = 256 * 1024
@@ -199,12 +199,22 @@ def _write(name, doc):
 
 
 # ── attribution: one log line and one counter per decision ──────────────────────────────────────
+# ⛔ APPEND-ONLY, ONE SMALL LINE PER EVENT (`O_APPEND`), written by up to four boxes and dozens of
+# lanes at once. gh-limit.py already learned this the hard way and states the reason for its own
+# stats log: "concurrent lanes cannot lose each other's counts the way a read-modify-write of one JSON
+# document would". A counter that SILENTLY UNDER-COUNTS is worse than none here, because the number it
+# under-reports is the regression assertion — the one signal that says the fleet is back on the user
+# bucket.
+COUNTERS_FILE = "counters.jsonl"
+COUNTERS_MAX_BYTES = 1 << 20
+
+
 def log(line):
     path = os.path.join(_cache_dir(), DECISIONS_FILE)
     try:
         if os.path.exists(path) and os.path.getsize(path) > DECISIONS_MAX_BYTES:
             # Bounded, append-only, one generation: the log is evidence, not an archive, and an
-            # unbounded log on a box with 40 lanes is a disk leak (#3429's own lesson about polls).
+            # unbounded log on a box with 40 lanes is a disk leak.
             try:
                 os.replace(path, path + ".1")
             except Exception:
@@ -215,21 +225,21 @@ def log(line):
         pass
 
 
-def count(arm, kind, unjustified=False):
-    doc = _read(COUNTER_FILE) or {}
-    arms = doc.setdefault("arms", {})
-    arms[arm] = int(arms.get(arm, 0)) + 1
-    if kind:
-        kinds = doc.setdefault("kinds", {})
-        kinds[kind] = int(kinds.get(kind, 0)) + 1
-        if kind == "read" and arm not in ("app",) and arm not in USER_READ_ARMS:
-            doc["read_on_user_unjustified"] = int(doc.get("read_on_user_unjustified", 0)) + 1
-        if kind == "read" and arm != "app":
-            doc["read_on_user"] = int(doc.get("read_on_user", 0)) + 1
-    if unjustified:
-        doc["read_on_user_unjustified"] = int(doc.get("read_on_user_unjustified", 0)) + 1
-    doc["updated"] = int(now())
-    _write(COUNTER_FILE, doc)
+def count(arm, kind):
+    """Record ONE decision. Append-only; aggregation happens in `_stats()`."""
+    d = _cache_dir()
+    path = os.path.join(d, COUNTERS_FILE)
+    try:
+        if os.path.exists(path) and os.path.getsize(path) > COUNTERS_MAX_BYTES:
+            try:
+                os.replace(path, path + ".1")
+            except Exception:
+                pass
+        line = json.dumps({"at": int(now()), "arm": arm, "kind": kind}, separators=(",", ":"))
+        with open(path, "a") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        pass
 
 
 # ── RS256 JWT from the STATIC key ───────────────────────────────────────────────────────────────
@@ -536,6 +546,35 @@ def resolve(kind, purpose="request", argv=None):
 
 
 # ── CLI ────────────────────────────────────────────────────────────────────────────────────────
+def _aggregate():
+    """(arms, kinds, reads_on_user, reads_on_user_unjustified) from the append-only counters."""
+    arms, kinds = {}, {}
+    on_user = unjustified = 0
+    for name in (COUNTERS_FILE, COUNTERS_FILE + ".1"):
+        try:
+            with open(os.path.join(_cache_dir(), name)) as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        e = json.loads(line)
+                    except ValueError:
+                        continue                 # a torn final line is skipped, never fatal
+                    arm, kind = e.get("arm") or "?", e.get("kind") or ""
+                    arms[arm] = arms.get(arm, 0) + 1
+                    if kind:
+                        kinds[kind] = kinds.get(kind, 0) + 1
+                    if kind == "read":
+                        if arm != "app":
+                            on_user += 1
+                        if arm != "app" and arm not in USER_READ_ARMS and not arm.startswith("purpose:"):
+                            unjustified += 1
+        except OSError:
+            continue
+    return arms, kinds, on_user, unjustified
+
+
 def _status():
     tok = current_token()
     if not tok:
@@ -583,10 +622,7 @@ def _resets_in(reset):
 
 
 def _stats():
-    doc = _read(COUNTER_FILE) or {}
-    arms = doc.get("arms") or {}
-    kinds = doc.get("kinds") or {}
-    bad = int(doc.get("read_on_user_unjustified", 0))
+    arms, kinds, on_user, bad = _aggregate()
     if not arms:
         sys.stdout.write("gh-cred no-decisions-counted-yet\n")
         return 0
@@ -597,7 +633,7 @@ def _stats():
         sys.stdout.write("  arm %-22s n=%d\n" % (arm, arms[arm]))
     for kind in sorted(kinds):
         sys.stdout.write("  kind %-21s n=%d\n" % (kind, kinds[kind]))
-    sys.stdout.write("  reads served by the user credential: %d\n" % int(doc.get("read_on_user", 0)))
+    sys.stdout.write("  reads served by the user credential: %d\n" % on_user)
     # ⛔ THE REGRESSION ASSERTION (#3429). A read on the user credential with no named arm is the
     # defect this file exists to prevent — the fleet quietly back on the 5,000/hour bucket. It is
     # reported on its own line and it makes the verb exit non-zero, so a caller can gate on it.

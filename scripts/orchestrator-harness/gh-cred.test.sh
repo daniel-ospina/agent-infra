@@ -359,30 +359,49 @@ ck "  …and --stats then exits non-zero, so a caller can gate on it" \
    "$([ "$src" -ne 0 ] && echo 0 || echo 1)"
 
 # ── §7 the two credentials must not share a cache entry ───────────────────────────────────────
-echo "§7 the ETag/flight cache is credential-partitioned (a body must not cross arms)"
+echo "§7 the response caches refuse an answer produced by the OTHER credential"
 # ⛔ THE INSTALLATION TOKEN AND THE USER CREDENTIAL CAN SEE DIFFERENT REPOSITORIES. A body — or a
-# 404 — cached under one and replayed to the other is a wrong answer with rc 0, i.e. "the call failed
-# and the caller read the failure as no data" (#3584's own class), and it is SILENT. The arm is mixed
-# into `_cred_digest()`, and this pins it: same host, same path, different arm, different key.
-cat >"$TMP/keyprobe.py" <<'KP'
-import importlib.util, sys
+# 404 — produced under one and replayed to the other is a wrong answer with rc 0, i.e. "the call
+# failed and the caller read the failure as no data" (#3584's own class), and it is SILENT.
+#
+# ⛔ AND THE FIRST ATTEMPT AT THIS WAS WRONG, WHICH IS WHY THE TEST LOOKS LIKE THIS. Mixing the served
+# arm into `_cred_digest()` made `cache_key`/`flight_key` depend on process state that only exists
+# after `main()` runs, so the key stopped being computable from the invocation — gh-limit.test.sh
+# caught it with three failures (its takeover and orphan-reclaim arms plant a claim by computing
+# `flight_key(argv)` out-of-process, and the claim landed on a different path). The fix keeps keys
+# PURE and puts the credential on the ENTRY; this asserts the entry-level guard, and mutating it
+# proves the guard is what stands between the two credentials.
+cat >"$TMP/credprobe.py" <<'CP'
+import importlib.util, os, sys
+os.environ.setdefault("GH_LIMIT_DIR", sys.argv[2])
 spec = importlib.util.spec_from_file_location("gh_limit", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(m)
-plan = {"host": "github.com", "path": "repos/o/r/pulls/1"}
-m._CRED_ARM = "app"
-k_app = m.cache_key(plan)
-m._CRED_ARM = "write"
-k_write = m.cache_key(plan)
-sys.stdout.write("same\n" if k_app == k_write else "differ\n")
-KP
-ck "the same path under two arms yields two different cache keys" \
-   "$([ "$(python3 "$TMP/keyprobe.py" "$LIMIT")" = differ ] && echo 0 || echo 1)"
+key = "probe|" + sys.argv[3]
+if sys.argv[4] == "write-app":
+    m._CRED_CLASS = "app"
+    m.cache_put(key, '"etag-a"', b'{"who":"app"}')
+else:
+    m._CRED_CLASS = "app" if sys.argv[4] == "read-app" else "user"
+    sys.stdout.write("hit" if m.cache_get(key) else "miss")
+CP
+_probe() { python3 "$TMP/credprobe.py" "$1" "$2" "$3" "$4" 2>&1; }
 
-mutate "$LIMIT" "$MUT/nodigest.py" '    return "%s.%s" % (base, _CRED_ARM)' '    return base' \
-  && ck "  …and removing the arm from the digest collapses them into ONE key (the partition bites)" \
-         "$([ "$(python3 "$TMP/keyprobe.py" "$MUT/nodigest.py")" = same ] && echo 0 || echo 1)" \
-  || { fail=$((fail+1)); echo "  FAIL digest mutation target missing"; }
+rm -rf "$TMP/cachep"; mkdir -p "$TMP/cachep"
+_probe "$LIMIT" "$TMP/cachep" k1 write-app >/dev/null
+ck "an answer produced by the app credential is a HIT for the app credential" \
+   "$([ "$(_probe "$LIMIT" "$TMP/cachep" k1 read-app)" = hit ] && echo 0 || echo 1)"
+ck "  …and a MISS for the user credential (an answer never crosses credentials)" \
+   "$([ "$(_probe "$LIMIT" "$TMP/cachep" k1 read-user)" = miss ] && echo 0 || echo 1)"
+
+if mutate "$LIMIT" "$MUT/nocredguard.py" '            if not _cred_class_ok(d):
+                return None' '            if False:
+                return None'; then
+  rm -rf "$TMP/cachep2"; mkdir -p "$TMP/cachep2"
+  _probe "$MUT/nocredguard.py" "$TMP/cachep2" k2 write-app >/dev/null
+  ck "  …and removing the guard makes the app's answer visible to the user credential (it bites)" \
+     "$([ "$(_probe "$MUT/nocredguard.py" "$TMP/cachep2" k2 read-user)" = hit ] && echo 0 || echo 1)"
+else fail=$((fail+1)); echo "  FAIL credential-guard mutation target missing"; fi
 
 echo
 printf '%s\n' "----------------------------------------"
