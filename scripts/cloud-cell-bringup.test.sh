@@ -1869,6 +1869,39 @@ case "$BR_OUT" in
   *) bad "the LINKED WORKTREE line does not carry UNVERIFIED, so CELL READY still claims all links were verified: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
 esac
 
+say_case "repo identity: an UNPARSEABLE own-repo declaration is UNVERIFIED, never a wildcard and never a refusal"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P2, in BOTH directions. `repo_identity_own_repo` fell back to raw
+# `$REPO_SLUG`/`$OR` with no `repo_slug_valid`, and that value is handed to the generic-name row as the
+# EXPECTED repo — where the literal `*` is the documented ANY-REPO exemption.
+#   REPO_SLUG='*'                        → `clone` holding `someone/evil` read clean (the exact fail-open
+#                                          the generic row's own comment says is not taken);
+#   REPO_SLUG='…/tortoise/' (trailing /) → own became 'tortoise/', so a HEALTHY clone of tortoise read
+#                                          FATAL — a false block with a remedy to move a tree that is not lying.
+# An unparseable declaration means "this box declares no repo of its own", which is already handled
+# honestly as `?`/UNVERIFIED.
+mk_checkout "$T/ident-ownstar/home/clone" "https://github.com/someone/evil.git" z1 \
+  && ok "fixture: a FOREIGN repo under a generic cell-checkout name" \
+  || bad "fixture: could not create the foreign repo"
+STAR_OUT="$(bash -c '. "$1"; ( unset REPO WORKDIR O OR; REPO_SLUG="*" repo_identity_scan "$2" ); echo "rc=$?"' _ \
+  "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-ownstar/home" 2>&1)"
+case "$STAR_OUT" in
+  *"allowed only for THE CELL'S OWN repo (*)"*) bad "REPO_SLUG='*' was taken as the ANY-REPO exemption — every repo under a generic name now reads clean" ;;
+  *) ok "REPO_SLUG='*' is not a wildcard exemption" ;;
+esac
+case "$STAR_OUT" in
+  *"UNVERIFIED"*) ok "…it falls back to the honest UNVERIFIED path instead" ;;
+  *) bad "an unparseable own-repo declaration produced no UNVERIFIED line: $STAR_OUT" ;;
+esac
+mk_checkout "$T/ident-ownslash/home/clone" "https://github.com/daniel-ospina/tortoise.git" z2 \
+  && ok "fixture: a clone of the box's OWN repo under a generic name" \
+  || bad "fixture: could not create the own-repo clone"
+SLASH_OUT="$(bash -c '. "$1"; ( unset REPO WORKDIR O OR; REPO_SLUG="daniel-ospina/tortoise/" repo_identity_scan "$2" ); echo "rc=$?"' _ \
+  "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-ownslash/home" 2>&1)"
+case "$SLASH_OUT" in
+  *"CHECK FAILED"*|*"fatal"*) bad "a trailing slash in REPO_SLUG turned a HEALTHY clone of the box's own repo into a lying directory" ;;
+  *) ok "a trailing slash in the declaration does not refuse a healthy cell" ;;
+esac
+
 say_case "repo identity: two checkouts at the SAME head is reported as same-head, not as a divergence"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A FALSE ALARM. The head list was built with ", " and then split on
 # `,`, so every value after the first kept a leading space: two copies at the IDENTICAL commit printed

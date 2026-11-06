@@ -360,8 +360,22 @@ repo_identity_own_repo() {
     url="$(repo_identity_origin "$REPO")" || url=""
     if [ -n "$url" ]; then slug="$(repo_slug_from_remote "$url" 2>/dev/null)"; fi
   fi
+  # ⛔ VALIDATE EVERY CANDIDATE WITH THE ONE SHAPE RULE (review finding, P2). `repo_slug_valid` above is
+  # the single owner of "what is an owner/name slug", and without this an unvalidated `$REPO_SLUG`/`$OR`
+  # is handed straight into the generic-name row as the EXPECTED repo — where the literal `*` is the
+  # documented ANY-REPO exemption. Both directions reproduced:
+  #   REPO_SLUG='*'                         → `clone` holding `someone/evil` read clean (the exact
+  #                                           fail-open the generic row's own comment says is not taken);
+  #   REPO_SLUG='daniel-ospina/tortoise/'   → own became 'tortoise/', so a HEALTHY clone of tortoise read
+  #                                           FATAL — a false block on a healthy cell, with a remedy
+  #                                           telling the operator to move a tree that is not lying.
+  # An unparseable declaration is "this box declares no repo of its own", which the generic row already
+  # handles honestly as `?`/UNVERIFIED — never as a wildcard and never as a refusal.
+  [ -n "$slug" ] && repo_slug_valid "$slug" || slug=""
   [ -n "$slug" ] || slug="${REPO_SLUG:-}"
+  [ -n "$slug" ] && repo_slug_valid "$slug" || slug=""
   [ -n "$slug" ] || slug="${OR:-}"
+  [ -n "$slug" ] && repo_slug_valid "$slug" || slug=""
   [ -n "$slug" ] || return 0
   printf '%s\n' "${slug#*/}"
 }
