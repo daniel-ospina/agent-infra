@@ -57,7 +57,9 @@
 # classifier, exposed — see §2b. Do not re-implement "is anything at risk" anywhere else: a second
 # copy is a second answer, and the whole point of this file is that a FAILED status is never read as
 # `clean`. Exit in that mode: 0 = clean, 1 = dirty, 2 = CANNOT VERIFY (unmeasured — never "nothing to
-# rescue"). Usage/other refusals are 2 as well, because a path this tool cannot read is unmeasured.
+# rescue"), and every path this file cannot resolve is 2 as well, because a worktree it cannot read is
+# unmeasured. (A MISSING ARGUMENT is not one of those cases: `${1:?}` is the shell's own usage failure
+# and exits 1 in both modes.)
 set -uo pipefail
 
 # Two ADDITIVE read-only modes, each of which returns before any archive work (#3484's `--slug`, and

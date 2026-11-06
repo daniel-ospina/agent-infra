@@ -788,6 +788,56 @@ esac
   && ok "unlinked: …the old (branch-named) ref still travels, so nothing is lost by the new naming" \
   || bad "unlinked: the rescue did not travel under the branch-named ref"
 
+# ── --verdict: the READ-ONLY mode `scripts/wip-sweep.sh` classifies with (agent-infra#3485) ─────────
+# ⛔ THIS SUITE OWNS THE CONTRACT, so the mode is pinned HERE and not only in its consumer's suite: an
+# edit to THIS file that broke `--verdict` would otherwise be seen only by a suite about a different
+# script, and the sweep would silently archive nothing while reporting a clean fleet (its `clean`
+# verdict is the one answer that costs work). The properties: one machine-readable line, 0/1/2 for
+# clean/dirty/cannot-verify, NO `paths=` on cannot-verify (an unknown count is not zero), and the
+# ordinary mode's exit codes untouched.
+echo; echo "── --verdict: the read-only classifier ──"
+mk_repo vd || { echo "❌ fixture failed (vd)"; exit 1; }
+V="$T/vd"
+OVO="$(bash "$RR" --verdict "$V/wt" 2>&1)"; RCVO=$?
+case "$RCVO:$OVO" in
+  0:*verdict=clean*) ok "V1 a clean tree is verdict=clean, exit 0" ;;
+  *) bad "V1 clean verdict wrong (rc=$RCVO): $OVO" ;;
+esac
+printf 'wip\n' >> "$V/wt/base.txt"; printf 'new\n' > "$V/wt/new.txt"
+OVO="$(bash "$RR" --verdict "$V/wt" 2>&1)"; RCVO=$?
+case "$RCVO:$OVO" in
+  1:*verdict=dirty*paths=2*) ok "V2 a dirty tree is verdict=dirty paths=2, exit 1" ;;
+  *) bad "V2 dirty verdict wrong (rc=$RCVO): $OVO" ;;
+esac
+case "$OVO" in
+  *" slug=fix-lane-one"*) ok "V3 the verdict carries the file's OWN slug, so a caller never re-derives the ref name" ;;
+  *) bad "V3 the verdict did not carry slug=: $OVO" ;;
+esac
+# The mode must not archive: no ref may exist after a verdict run on a dirty tree.
+[ -z "$(ref_of "$V/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "V4 --verdict archived NOTHING (it returns before §3: no tree, no commit, no push)" \
+  || bad "V4 --verdict pushed a ref — the read-only mode is not read-only"
+# ⛔ THE ARM THAT MATTERS: an INCOMPLETE enumeration is cannot-verify, and it carries NO path count.
+if [ "$(id -u)" = "0" ]; then
+  skip "V5/V6 an unreadable directory cannot be simulated as root — the cannot-verify arm is UNPROVEN here"
+else
+  mkdir -p "$V/wt/locked" && printf 'x\n' > "$V/wt/locked/f.txt" && chmod 000 "$V/wt/locked"
+  OVO="$(bash "$RR" --verdict "$V/wt" 2>&1)"; RCVO=$?
+  chmod 755 "$V/wt/locked"
+  [ "$RCVO" -eq 2 ] && case "$OVO" in *verdict=cannot-verify*) true ;; *) false ;; esac \
+    && ok "V5 an INCOMPLETE enumeration is verdict=cannot-verify, exit 2 — never clean" \
+    || bad "V5 an unreadable directory was not cannot-verify (rc=$RCVO): $OVO"
+  case "$OVO" in
+    *paths=*) bad "V6 cannot-verify carried a paths= field: $OVO" ;;
+    *) ok "V6 cannot-verify carries NO paths= (an unenumerated tree has no count — 0 would read as clean)" ;;
+  esac
+fi
+# The shipped ordinary contract must not move: same path, plain mode, still exit 1.
+bash "$RR" "$V/origin.git" >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 1 ] \
+  && ok "V7 plain mode still exits 1 for a non-worktree — the mode is ADDITIVE, no shipped code moved" \
+  || bad "V7 plain-mode exit code moved for a non-worktree (rc=$RCVO, want 1)"
+
 echo; echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
