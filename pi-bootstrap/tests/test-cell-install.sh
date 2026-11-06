@@ -3912,31 +3912,70 @@ except OSError: print("absent")' "$TMP/bak-dst.json.bak")"
 _SENTINEL="tt_SENTINELSENTINELSENTINEL12345"
 printf 'TORTOISE_MCP_API_KEY=%s\n' "$_SENTINEL" > "$TMP/sent-keys.env"
 chmod 600 "$TMP/sent-keys.env"
+# ⛔ DRIVE THE *REAL* FUNCTION, NOT A COPY OF ITS GUARD (#3374 round 14 P1 — round 13's arm could
+# not fail). bash traces the SUBSTITUTED VALUE not only of the assignment that reads the key but of
+# EVERY later expansion of it: `+ '[' -n tt_… ']'`, `+ GRAPH_KEY=tt_…`, `+ case tt_… in`,
+# `+ local key=tt_…`. Round 13 guarded only the first of those four and this arm re-implemented THAT
+# guard beside a plain assignment, so the real function leaked the key twice under `bash -x` while
+# the arm stayed green — a test that cannot fail for the property it names. The arm therefore calls
+# `graph_key_resolve` itself, and asserts the negative control below so that a FIX THAT MOVES BACK
+# to holding the secret in a variable goes RED rather than silently passing.
 {
   sed -n '/^_no_group_world_write()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_mcp_var()/,/^}/p' "$INSTALLER"
   sed -n '/^graph_key_from_env_file()/,/^}/p' "$INSTALLER"
+  sed -n '/^_graph_key_read()/,/^}/p' "$INSTALLER"
+  sed -n '/^graph_key_resolve()/,/^}/p' "$INSTALLER"
 } > "$TMP/keyfn.sh"
+[ -s "$TMP/keyfn.sh" ] && grep -q '^_graph_key_read()' "$TMP/keyfn.sh" \
+  && ok "the round-14 arms found their instrument (the REAL resolver, including _graph_key_read)" \
+  || fail "the resolver could not be extracted — every arm below would measure nothing"
+mkdir -p "$TMP/xt-dest" "$TMP/xt-home"
+printf '{"mcpServers":{"tortoise":{"type":"http","url":"https://api.premiselabs.co/mcp/","headers":{"Authorization":"Bearer ${TORTOISE_MCP_API_KEY}"}}}}' \
+  > "$TMP/xt-dest/.mcp.json"
+cp "$TMP/sent-keys.env" "$TMP/xt-home/keys.env"
+chmod 600 "$TMP/xt-home/keys.env"
 cat > "$TMP/xtrace.sh" <<'XT'
 #!/usr/bin/env bash
 set -uo pipefail
-KEYFN="$1"; KEYFILE="$2"
+KEYFN="$1"; DEST="$2"; HOME="$3"; CELL_HOME=""; GRAPH_VAR=""
 . "$KEYFN"
 set -x
-case $- in *x*) _had_xtrace=1 ;; *) _had_xtrace=0 ;; esac
+graph_key_resolve
 set +x
-val="$(graph_key_from_env_file "$KEYFILE" TORTOISE_MCP_API_KEY)"
-if [ "$_had_xtrace" = 1 ]; then set -x; fi
-set +x
-echo "RESOLVED_LEN=${#val}"
+echo "RESOLVED set=$GRAPH_KEY_SET shaped=$GRAPH_KEY_SHAPED len=$GRAPH_KEY_LEN src=$GRAPH_KEY_SRC"
 XT
-out="$(bash "$TMP/xtrace.sh" "$TMP/keyfn.sh" "$TMP/sent-keys.env" 2>&1)"
-if grep -qF "$_SENTINEL" <<<"$out"; then
-  fail "a 'bash -x' trace printed the resolved graph key verbatim — the assignment is traced, so every bring-up log can carry the tenant key"
-elif grep -q "RESOLVED_LEN=${#_SENTINEL}" <<<"$out"; then
-  ok "a 'bash -x' run does NOT trace the resolved key, and still RESOLVES it — the guard is not a silent disable"
+# the FILE path (HOME/keys.env) — `env -u` so the operator's own environment cannot satisfy the
+# lookup first and make the arm measure the wrong branch
+_out="$(env -u TORTOISE_MCP_API_KEY -u TORTOISE_API_KEY \
+        bash "$TMP/xtrace.sh" "$TMP/keyfn.sh" "$TMP/xt-dest" "$TMP/xt-home" 2>&1)"
+if grep -qF "$_SENTINEL" <<<"$_out"; then
+  fail "a 'bash -x' run of the REAL resolver printed the graph key verbatim — every bring-up log can carry the tenant key"
+elif ! grep -q "RESOLVED set=1 shaped=1 len=${#_SENTINEL}" <<<"$_out"; then
+  fail "the xtrace arm could not resolve the key from HOME/keys.env (got '$(tr '\n' ' ' <<<"$_out" | cut -c1-100)') — the arm is vacuous"
 else
-  fail "the xtrace arm could not resolve the key at all (got '$(tr '\n' ' ' <<<"$out" | cut -c1-80)') — the arm is vacuous"
+  ok "a 'bash -x' run of the REAL resolver does NOT trace the key, and still RESOLVES it (the guard is not a silent disable)"
 fi
+# the ENVIRONMENT path (`printenv`) — round 13 never guarded this one at ALL
+_out="$(env TORTOISE_MCP_API_KEY="$_SENTINEL" bash "$TMP/xtrace.sh" "$TMP/keyfn.sh" "$TMP/xt-dest" "$TMP/xt-empty-home" 2>&1)"
+if grep -qF "$_SENTINEL" <<<"$_out"; then
+  fail "a 'bash -x' run printed the key when it resolved from the ENVIRONMENT — the printenv path was never guarded"
+elif ! grep -q "RESOLVED set=1 shaped=1 len=${#_SENTINEL}" <<<"$_out"; then
+  fail "the environment-path arm could not resolve the key (got '$(tr '\n' ' ' <<<"$_out" | cut -c1-100)')"
+else
+  ok "...nor when it resolves from the ENVIRONMENT (the round-13 guard covered only the file read)"
+fi
+# ⛔ THE NEGATIVE CONTROL — without it this arm cannot fail. Delete the guard from a COPY of the
+# extracted resolver; the sentinel MUST appear. If it does not, the assertions above are vacuous and
+# a stream of future regressions would be certified clean (which is exactly what round 13 shipped).
+grep -q '^  set +x$' "$TMP/keyfn.sh" \
+  && sed '/^  set +x$/d' "$TMP/keyfn.sh" > "$TMP/keyfn-unguarded.sh" \
+  || : > "$TMP/keyfn-unguarded.sh"
+_out="$(env -u TORTOISE_MCP_API_KEY -u TORTOISE_API_KEY \
+        bash "$TMP/xtrace.sh" "$TMP/keyfn-unguarded.sh" "$TMP/xt-dest" "$TMP/xt-home" 2>&1)"
+[ -s "$TMP/keyfn-unguarded.sh" ] && grep -qF "$_SENTINEL" <<<"$_out" \
+  && ok "NEGATIVE CONTROL: with the guard removed the same arm DOES print the key — so the two arms above can fail" \
+  || fail "the xtrace arm is VACUOUS — removing the guard still does not surface the key, so it would certify a leak as clean"
 
 # -------------------------------------------------------------------------
 hdr "syntax"

@@ -345,12 +345,48 @@ print(name)
 ' "$DEST/.mcp.json" 2>/dev/null
 }
 
+# ⛔ THE SECRET MUST NOT OUTLIVE THE READ (#3374 review, round 14 P1 — round 13's own fix was
+# INCOMPLETE, and its arm could not see that). `set -x` prints the SUBSTITUTED VALUE not only of the
+# assignment that reads the key but of EVERY expansion of it afterwards: `+ '[' -n tt_… ']'`,
+# `+ GRAPH_KEY=tt_…`, `+ case tt_… in`, `+ local key=tt_…`. Round 13 guarded only the file-read
+# substitution, so a `bash -x` bring-up STILL printed the tenant key — measured with the real
+# `graph_key_resolve` under `bash -x`, twice, two lines below the new `set -x` restore — and the
+# environment path (`printenv`) was never guarded at all, nor were the two renderings. Patching each
+# sink with its own `set +x` is a rule every future edit has to remember; a sink that is never
+# CREATED cannot be forgotten. So the value is read once, inside one guarded region, and immediately
+# reduced to what the rest of this file actually uses — presence, the `tt_`/`tk_` shape, and the
+# LENGTH (the note prints the length, never the key). No variable that holds the secret survives the
+# call, so there is nothing left for any later trace, log line, or error path to expand.
+# The caller sees only `GRAPH_KEY_SET`/`GRAPH_KEY_SHAPED`/`GRAPH_KEY_LEN`; the exit status is "we got
+# one". The xtrace state is preserved, because a caller debugging this layer depends on it.
+_graph_key_read() { # <env|file> <path-or-empty> <variable> -> SET/SHAPED/LEN; rc=0 when non-empty
+  local src="$1" path="$2" var="$3" _xt=0 raw="" shaped=0 got=0
+  case $- in *x*) _xt=1 ;; esac
+  set +x
+  if [ "$src" = env ]; then
+    raw="$(printenv "$var" 2>/dev/null || true)"
+  else
+    raw="$(graph_key_from_env_file "$path" "$var")"
+  fi
+  GRAPH_KEY_LEN=${#raw}
+  case "$raw" in tt_*|tk_*) shaped=1 ;; esac
+  if [ "$GRAPH_KEY_LEN" -gt 0 ]; then got=1; fi
+  GRAPH_KEY_SET="$got"
+  GRAPH_KEY_SHAPED="$shaped"
+  unset raw
+  if [ "$_xt" = 1 ]; then set -x; fi
+  [ "$GRAPH_KEY_SET" = 1 ]
+}
+
 # ONE resolver, two renderings. `graph_credential_note` prints the long explanation; the
 # `LAYER VERIFIED` line prints the one-word state. Two independent resolutions of the same question
 # is how a cell gets certified "credential: OK" while the note below it says NOT resolvable.
 graph_key_resolve() {
   GRAPH_VAR="$(graph_mcp_var)"
-  GRAPH_KEY=""
+  # NOT the key itself — see `_graph_key_read`. Presence, shape and length are all any caller needs.
+  GRAPH_KEY_SET=0
+  GRAPH_KEY_SHAPED=0
+  GRAPH_KEY_LEN=0
   GRAPH_KEY_SRC="the environment"
   GRAPH_NOAUTH=0
   GRAPH_NOENTRY=0
@@ -383,10 +419,7 @@ graph_key_resolve() {
     GRAPH_NOAUTH=1
     return 0
   fi
-  local val
-  val="$(printenv "$GRAPH_VAR" 2>/dev/null || true)"
-  if [ -n "$val" ]; then
-    GRAPH_KEY="$val"
+  if _graph_key_read env "" "$GRAPH_VAR"; then
     GRAPH_KEY_SRC="the environment ($GRAPH_VAR)"
     return 0
   fi
@@ -410,22 +443,13 @@ graph_key_resolve() {
     [ -n "$base" ] || continue
     f="$base/keys.env"
     [ -f "$f" ] || continue
-    # ⛔ THE ASSIGNMENT IS WHERE THE PLAINTEXT APPEARS (#3374 review, round 13 P2). bash's trace
-    # prints `val=<the resolved key>` for a plain assignment, so a `bash -x` bring-up leaked the
-    # tenant key past every redaction this file does — and `bash -x` is not hypothetical here: the
-    # `log_line` note below describes debugging this layer exactly that way, and a bring-up log is
-    # what gets pasted into issues fleet-wide. The gate in `graph_key_from_env_file` is unaffected
-    # (it stats before sourcing and discards its own stderr); only the ASSIGNMENT is traced, so
-    # `set +x` is scoped to the one substitution and restored only if it was on.
-    case $- in *x*) _had_xtrace=1 ;; *) _had_xtrace=0 ;; esac
-    set +x
-    val="$(graph_key_from_env_file "$f" "$GRAPH_VAR")"
-    if [ "$_had_xtrace" = 1 ]; then set -x; fi
+    # ⛔ THE READ IS GUARDED INSIDE `_graph_key_read`, NOT HERE (#3374 review, round 14 P1). Round 13
+    # scoped `set +x` to this substitution and left the `[ -n "$val" ]` test and the `GRAPH_KEY="$val"`
+    # assignment below it traced — measured: the key printed twice, with the suite green, because the
+    # arm asserted the guard on a COPY of it. Nothing secret is assigned, tested or expanded here now.
+    _graph_key_read file "$f" "$GRAPH_VAR"
     GRAPH_KEY_SRC="$f ($GRAPH_VAR)"
-    if [ -n "$val" ]; then
-      GRAPH_KEY="$val"
-      break
-    fi
+    if [ "$GRAPH_KEY_SET" = 1 ]; then break; fi
   done
   return 0
 }
@@ -449,16 +473,21 @@ graph_credential_state() {
     printf 'none required — the tortoise entry declares no Authorization (self-hosted daemon)'
     return 0
   fi
-  case "$GRAPH_KEY" in
-    tt_*|tk_*) printf 'resolves from %s' "$GRAPH_KEY_SRC" ;;
-    "")        printf 'UNRESOLVED — the entry expands ${%s}, so the tortoise MCP sends an empty Bearer and the server answers 401' "$GRAPH_VAR" ;;
-    *)         printf 'resolves from %s but is not tt_/tk_-shaped (401 likely)' "$GRAPH_KEY_SRC" ;;
-  esac
+  # ⛔ A `case "$key" in tt_*…` HERE WOULD PRINT THE KEY UNDER `bash -x` (#3374 review, round 14 P1):
+  # the dispatcher traces the word it matches. The shape was decided inside the guarded read, so the
+  # renderings only ever touch FLAGS that cannot contain the secret.
+  if [ "$GRAPH_KEY_SET" = 0 ]; then
+    printf 'UNRESOLVED — the entry expands ${%s}, so the tortoise MCP sends an empty Bearer and the server answers 401' "$GRAPH_VAR"
+  elif [ "$GRAPH_KEY_SHAPED" = 1 ]; then
+    printf 'resolves from %s' "$GRAPH_KEY_SRC"
+  else
+    printf 'resolves from %s but is not tt_/tk_-shaped (401 likely)' "$GRAPH_KEY_SRC"
+  fi
 }
 
 graph_credential_note() {
   graph_key_resolve
-  local key="$GRAPH_KEY" src="$GRAPH_KEY_SRC"
+  local src="$GRAPH_KEY_SRC"
   if [ "$GRAPH_NOENTRY" -eq 1 ]; then
     log_line "⚠️  graph credential: UNKNOWN — there is no readable tortoise entry at $DEST/.mcp.json, so there is no credential to resolve (the failure above names the reason). ⛔ A MISSING entry is not a self-host and must not be reported as one"
     return 0
@@ -479,10 +508,9 @@ graph_credential_note() {
     log_line "graph credential: the tortoise entry declares no Authorization — a self-hosted daemon needs none, so there is nothing to resolve"
     return 0
   fi
-  case "$key" in
-    tt_*|tk_*)
-      log_line "graph credential: resolves from $src (len ${#key}) — the hosted MCP will authenticate" ;;
-    "")
+  # ⛔ NEVER `case "$key"`: the dispatcher traces the word it matches (#3374 review, round 14 P1).
+  # The length is printed, not the key.
+  if [ "$GRAPH_KEY_SET" = 0 ]; then
       log_line "⚠️  graph credential: NOT resolvable — the tortoise MCP entry expands \${$GRAPH_VAR} to the EMPTY"
       log_line "    string, the server answers 401 'invalid or missing Bearer token', and every lane writes"
       log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
@@ -491,11 +519,13 @@ graph_credential_note() {
          || { [ -n "${HOME:-}" ] && [ -n "$(graph_key_from_env_file "${HOME}/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; } \
          || [ -n "$(graph_key_from_env_file "${CELL_HOME:-}/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; }; then
         log_line "    ⚠️  the LEGACY name TORTOISE_API_KEY IS set — add the alias line above and it resolves"
-      fi ;;
-    *)
+      fi
+  elif [ "$GRAPH_KEY_SHAPED" = 1 ]; then
+      log_line "graph credential: resolves from $src (len $GRAPH_KEY_LEN) — the hosted MCP will authenticate"
+  else
       log_line "⚠️  graph credential: $GRAPH_VAR in $src does not look like a hosted key (expected tt_/tk_ prefix);"
-      log_line "    the MCP will send whatever it holds and the server may answer 401 (#5153)." ;;
-  esac
+      log_line "    the MCP will send whatever it holds and the server may answer 401 (#5153)."
+  fi
 }
 
 # verify_graph_mcp — checks the config this script INSTALLS ($DEST/.mcp.json), on the artifact.
