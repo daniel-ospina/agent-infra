@@ -25,8 +25,9 @@ case "${PR:-}" in ''|*[!0-9]*) echo "[fix] refusing non-numeric PR: ${PR:-<empty
 is_num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
 # ⛔ MAGNITUDE, NOT JUST SHAPE (P2, third review round, 2026-10-14). `is_num` is UNBOUNDED, so it
 # accepted `9223372036854775807`; `FIX_LEASE=$(( FIX_TIMEOUT + 1200 ))` then wrapped NEGATIVE, the
-# lease failed to parse (`_lease_of`'s `[0-9]*` cannot match a minus sign), and an unparseable lease
-# is read as LIVE — so the head was frozen across ALL boxes and `claim_prune` could never reap it.
+# lease failed to parse (`_lease_of`'s anchored ASCII-digit match cannot match a minus sign), and an unparseable lease
+# is never read as EXPIRED — so the head was frozen across ALL boxes and `claim_prune` could not
+# reap it before #3203's bounded arm.
 # FAIL-CLOSED, the opposite of the design's fail-open policy. `is_limit` (is_num AND at most 9
 # digits) is the predicate orch-loop.sh applies to every other tunable for exactly this reason.
 is_limit() { is_num "${1:-}" && [ "${#1}" -le 9 ]; }
@@ -231,6 +232,41 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
   if [ "$?" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
+    # ⛔ REFUND HERE TOO (#3511). This arm exited without refunding while the branch refusal above
+    # does. The rule is #1720's: a refusal that ran no fixer gives the attempt back — otherwise three
+    # refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never had a single fixer
+    # run.
+    # ⛔ THE DELIVERY DEPENDS ON WHERE THE CONTROLLER BOOKS, AND ONLY ONE OF THE FOUR SPAWN ARMS
+    # PRE-BOOKS. The red-tree arm books `fixcount` BEFORE `wt_spawn` (that ordering was a fix in its own
+    # right: booking after the spawn let the child's decrement be overwritten by the controller's
+    # pre-refusal value). The CONFLICTED, NEEDS-FIX and CI-red arms still book AFTER the spawn, so a
+    # refund landing in that window is overwritten and the attempt is consumed anyway. The per-head
+    # `fixgate-<PR>-<HEAD>` marker this call also writes does not rescue them either: among those four
+    # `fixcount` arms only the red-tree one consumes it, and no other consumer of that marker touches
+    # `fixcount` — they refund or reclaim their OWN head-keyed budgets (`psick`; the reclaim-on-land
+    # paths read no budget from it at all). That residual is filed (#3562); this call is still correct
+    # and still the fix, because the arm that most needs it pre-books and the others shrink the window
+    # rather than widening it.
+    # The test is the exit code and nothing else: ANY non-zero `wt_provision` rc refunds. The helper
+    # names the cause in `$WT_RESULT`, which is logged on the line above — this comment does not restate
+    # the cause list, because a list here is a second definition that goes stale the next time the
+    # helper grows an arm.
+    # ⛔ NOT `prlock_refuse`'s RULE (the function below, with its note above it), which CONSUMES the
+    # attempt: a `$PRLOCK` that is not a regular file, or a `$O/state` this box cannot write, is
+    # bookkeeping no re-dispatch can change. ⛔ But the answer here is NOT "so consume a sticky one":
+    # this file deliberately refunds refusals that never clear by themselves — the repo-IDENTITY
+    # refusal above refunds a permanent misconfiguration by its own wording, and the #2223 per-head
+    # note inside `refund_gate_attempt` refunds a DISK refusal whose comment says outright it "never
+    # clears by waiting". The trade is stated there and applies here: parking the PR on "attempts
+    # exhausted" is a FALSE sentence about work that never ran, so a sticky refusal is left LOUD in
+    # `fix-$PR.log` and re-spawned rather than silently parked. ⛔ What bounds that re-spawn is per-cycle
+    # capacity only (the `$MF` fix-lane ceiling, the cross-box claim, `can_spawn`) — it is THROTTLED per
+    # cycle, not bounded across cycles, and the fix that would let it park is a `REPAIR:` line in
+    # `wt_provision`'s refusals, which carries none today (its absence is recorded in the comment on
+    # #2632; none of those refusals carries repair text, which is why a human gets a cause and no next
+    # step). No line numbers in this block on purpose: a citation here already
+    # rotted once when an edit to this comment shifted the function it pointed at.
+    refund_gate_attempt
     exit 1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
@@ -816,7 +852,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # skew) or the copy is corrupt, so the probe measured nothing. The capability arm below would have
     # this operator repair the box or dispatch the PR elsewhere — the extension set is fine and every
     # other box runs the same pair, so both remedies send them to an event that cannot arrive.
-    why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991) — this is a harness defect, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair (cp scripts/orchestrator-harness/*.sh \$O/) and re-run. Nothing was consumed"
+    why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991) — this is a harness defect, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) and re-run. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting

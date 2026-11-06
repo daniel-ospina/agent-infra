@@ -40,9 +40,22 @@ RECORD="$SCRIPT_DIR/record-review.sh"
 # fixed once. Pinning the root to THIS tree is the isolation. It SUPPLIES a resolution root rather than
 # opening a gate (the `spawn-gate.test.sh` rule): the fail-closed case is still pinned, by 13v4's
 # stale-validator arm, which wins on the `$SELF`-adjacent rung ABOVE this one.
-export AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)"
-
-
+#
+# ⛔ NOT `export VAR="$(…)"` (the #2569 shape, and the same fix `install-launchd.test.sh` carries).
+# A DECLARATION builtin's exit status is the BUILTIN's, not the substitution's, so `$?` does not
+# report a `cd` that failed — the shape hides it, which is why `scripts/check-false-pass-shapes.sh`
+# bans it (`discarded-status`, and this line was the ONE finding that red reported on main: #2741).
+# A bare assignment carries the substitution's status, so the `||` is a real check: a root that
+# cannot be resolved stops the suite loudly instead of being pinned to whatever `pwd` managed to
+# print. Stated so it is not read as more than it is: `SCRIPT_DIR` is already resolved the same way
+# higher up under `set -euo pipefail`, so an empty `SCRIPT_DIR` is not reachable here and an empty
+# operand would in any case resolve to `/` rather than fail. This arm is therefore the banned-shape
+# repair plus defence in depth — not the only thing between the arms below and the ambient rung.
+AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)" || {
+    echo "record-review.test.sh: cannot resolve the checkout root from SCRIPT_DIR='$SCRIPT_DIR'" >&2
+    exit 1
+}
+export AGENT_INFRA_PATH
 
 PASS=0
 FAIL=0

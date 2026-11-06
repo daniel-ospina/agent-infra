@@ -95,10 +95,152 @@ bash "$GATE" --check - lane < "$CANON" >/dev/null 2>&1; rc=$?
 bash "$GATE" --missing "$TMP/scoped.txt" 2>/dev/null | grep -qx 'EXTERNAL'; ck $? "a label OUTSIDE the research section does not count (scoping is enforced)"
 # Bold / bullet / numbered / subsection spellings must all be accepted: the contract is about the
 # content, not about markdown style, and refusing a well-formed brief teaches authors to fight the gate.
+# ⛔ THE PREVIOUS WORK BLOCK IS INCLUDED HERE FOR THE REASON IT EXISTS (#3484): this fixture's subject is
+# MARKDOWN SPELLINGS, so it must satisfy the OTHER contracts completely — otherwise a refusal reported
+# here would be about the absent PW block and this arm would prove nothing about style.
 { printf '## RESEARCH FIRST\n### Internal\n- **INTERNAL:** read the tracker first\n### External\n1. EXTERNAL: fetch the RFC\n'
-  printf 'RUNG: 3 — web_fetch https://example.com/rfc\nCONTRADICTION TEST: no recorded decision reaches this work\n'; } > "$TMP/styled.txt"
+  printf 'RUNG: 3 — web_fetch https://example.com/rfc\nCONTRADICTION TEST: no recorded decision reaches this work\n'
+  printf '\n## PREVIOUS WORK\n- **CLAIM:** unclaimed\n- **WIP:** issue-<N> -> none (measured in fixture)\n'
+  # ⛔ `printf` NEEDS A FORMAT STRING: a line starting with `-` is parsed as an OPTION and the whole
+  # argument is dropped (`printf: - : invalid option`), which silently produced a fixture that was
+  # short three labels — a vacuous-arm generator, not a spelling test.
+  printf '%s\n' '- **BRANCH:** none' '- **WORKTREE:** none' '- **PRIOR:** no previous attempt'; } > "$TMP/styled.txt"
 bash "$GATE" --check "$TMP/styled.txt" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "bold/bullet/numbered/subsection spellings are all admitted (got $rc)"
+
+echo
+# ── §A2 THE REVIEW ROUND (#3441) — the mandate PAST ROUND 3, and the round as a real input ──────
+# Owner ruling (2026-11-04): from round 4 a REVIEW brief must name what COMPARABLE / COMPETITOR
+# implementations do, because rounds 1-3 converge on "is this line correct" (a local read CAN answer)
+# and past round 3 the loop has stopped converging. Before this change the brief generator had NO
+# round input at all, so round 1 and round 7 were briefed identically and the mandate could not be
+# expressed — let alone enforced.
+echo "§A2 the review ROUND — the mandate past round 3, and the round as a real input (agent-infra#3441)"
+# ⛔ THE REQUIREMENT IS A LABEL (`COMPARABLES:`), NOT A WORD-SEARCH INSIDE `EXTERNAL:` — and that is a
+# fix a fresh review of this very change forced. The first draft matched /comparable|competitor/ in the
+# EXTERNAL line, and the canonical block THIS GATE EMITS says "how comparable systems solve this", so
+# the clause was satisfied by the gate own boilerplate for every generated brief at every round: a gate
+# whose PASS was supplied by itself, inert on the one path #3441 exists for. The fixtures below pin
+# both directions — a brief with the full research contract but NO `COMPARABLES:` line is admitted at
+# rounds 1-3 and refused from 4 — and the strongest arm is (r7-canon3): a brief built by the ROUND-3
+# generator is REFUSED when it is used at round 7, which is the missing-round-plumbing defect itself.
+# ⛔ EVERY FIXTURE BELOW ALSO CARRIES THE #3442 NON-VACUITY BLOCK, AND THAT IS PART OF THE MERGE, NOT
+# DECORATION. `main` added a THIRD reviewer requirement while this branch was open (a `MUTATION
+# ATTRIBUTION` section — #3442/#3481), so a reviewer brief that carries only the research contract is
+# now refused for a reason that has nothing to do with the round. Without the block these arms redden
+# with rc=80 at ROUND 1 as well, i.e. they would measure #3442 instead of the round they name — the
+# same "the arm cannot tell which contract failed" defect §A pins for the missing tokens. The block
+# is identical across the fixtures ON PURPOSE: the only variable any of these arms may move is the
+# `COMPARABLES:` line and the round.
+# ⛔ THE SAME MERGE-TIME REASON APPLIES AGAIN TO #3484's `PREVIOUS WORK` BLOCK, which landed while
+# this branch was open: the contract is UNIVERSAL (every role, every round), so a round fixture
+# without it is refused at round 1 as well and the arm would measure #3484 instead of the round it
+# names. `PW_FIXTURE` is appended to every round fixture below, identically, for that reason — the
+# arms must move ONE variable.
+PW_FIXTURE='## PREVIOUS WORK
+CLAIM: unclaimed (fixture)
+WIP: issue-9999 -> none (measured in the round fixture)
+BRANCH: none
+WORKTREE: none
+PRIOR: no previous attempt'
+printf '## RESEARCH FIRST\nINTERNAL: read the diff at the head.\nEXTERNAL: vendor docs for the review gate only.\nRUNG: 2 — web_search model="sonar"\nCONTRADICTION TEST: no recorded decision reaches this work.\n\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n\n%s\n' "$PW_FIXTURE" > "$TMP/rev-vendor.txt"
+printf '## RESEARCH FIRST\nINTERNAL: read the diff at the head.\nEXTERNAL: vendor docs for the review gate only.\nCOMPARABLES: comparable harnesses (an agent CI gate) cap review rounds and escalate at the ceiling.\nRUNG: 2 — web_search model="sonar"\nCONTRADICTION TEST: no recorded decision reaches this work.\n\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n\n%s\n' "$PW_FIXTURE" > "$TMP/rev-cmp.txt"
+for r in 1 2 3; do
+  bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer "$r" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(r$r) a brief with NO comparables line is ADMITTED at round $r — the mandate starts at 4 (got $rc)"
+done
+for r in 4 7 12; do
+  bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer "$r" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(r$r) the same brief is REFUSED with 80 at round $r (got $rc)"
+done
+bash "$GATE" --check "$TMP/rev-cmp.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "a round-7 brief that DOES carry comparables is admitted (got $rc)"
+# The refusal is ATTRIBUTABLE: the round clause has its own token, so a message that omitted it could
+# not pass as "the author already knows about comparables".
+bash "$GATE" --missing "$TMP/rev-vendor.txt" reviewer 7 2>/dev/null | grep -qx 'EXTERNAL-COMPARABLES'; ck $? "the missing token is EXTERNAL-COMPARABLES — one element, not a generic refusal"
+OUTR="$(bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer 7 2>&1)"
+grep -q 'COMPARABLE / COMPETITOR' <<<"$OUTR"; ck $? "the round-4 refusal TEACHES what is missing (a comparables line)"
+grep -q 'round: 7' <<<"$OUTR"; ck $? "…and names the round it was refused at, so the author can see the input took effect"
+# THE ROUND REACHES THE GENERATED BLOCK, which is the half a validator alone cannot give: every
+# briefing caller splices `--section`, so a mandate that only lived in the validator would be advice.
+bash "$GATE" --section reviewer 7 > "$TMP/sec-r7.txt" 2>/dev/null
+grep -q '^COMPARABLES:' "$TMP/sec-r7.txt"; ck $? "--section reviewer 7 emits a COMPARABLES: line (the round is an INPUT to the canonical text)"
+bash "$GATE" --section reviewer 3 > "$TMP/sec-r3.txt" 2>/dev/null
+grep -q '^COMPARABLES:' "$TMP/sec-r3.txt"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "--section reviewer 3 does NOT (round 3 was never the problem to solve)"
+bash "$GATE" --check "$TMP/sec-r7.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "the round-7 canonical block SATISFIES the round-7 validator (the gate cannot refuse its own advice) (got $rc)"
+# ⛔ STATED RESIDUAL, PINNED AS BEHAVIOUR (fresh review of #3441, P2): THIS IS A *DELIVERY* CHECK, NOT A
+# DEPTH CHECK. A brief whose `COMPARABLES:` line is nothing but the mandate's OWN wording names no
+# comparable at all, and it is ADMITTED — because the gate reads the BRIEF, and the answer to "what do
+# comparables do" lives in the reviewer's VERDICT. The alternative was worse: rejecting the placeholder
+# would refuse `merge-one.sh`'s own generated brief (it splices exactly this block) at exit 80, i.e. it
+# would break every round-≥4 review in order to make a text check look stronger than it is. So the
+# clause guarantees the mandate REACHES the reviewer and refuses a hand-authored brief that dropped the
+# label; it cannot guarantee the reviewer complied. Pinned here so the stronger reading — the one the
+# README used to carry — cannot be re-adopted by a later lane without reddening this arm.
+{ printf '## RESEARCH FIRST\nINTERNAL: read the head.\nEXTERNAL: vendor docs only.\nRUNG: 3 — web_fetch https://x\n'
+  printf 'COMPARABLES: name at least one COMPARABLE / COMPETITOR implementation and say how it solves it.\n'
+  printf 'CONTRADICTION TEST: none recorded.\n'
+  printf '\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n\n%s\n' "$PW_FIXTURE"; } > "$TMP/cmp-boilerplate.txt"
+bash "$GATE" --check "$TMP/cmp-boilerplate.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(residual) the mandate's own wording SATISFIES the clause — a DELIVERY check, not a depth check (got $rc)"
+# …and the delivery half is real and non-vacuous: the SAME brief with the label DELETED is refused. Without
+# this contrast the arm above would pin the clause as unfalsifiable rather than as a weakened one.
+grep -v '^COMPARABLES:' "$TMP/cmp-boilerplate.txt" > "$TMP/cmp-boilerplate-no.txt"
+bash "$GATE" --check "$TMP/cmp-boilerplate-no.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(residual) …but the SAME brief with the label DELETED is REFUSED — the clause is non-vacuous on delivery (got $rc)"
+# (r7-canon3) ⛔ THE ARM THAT WOULD HAVE CAUGHT THE VACUOUS GATE: a brief generated at the WRONG round
+# is refused by the round it is used at. This is the plumbing defect #3441 names, pinned as behaviour.
+bash "$GATE" --check "$TMP/sec-r3.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(r7-canon3) a ROUND-3 generated brief is REFUSED when used at round 7 — the round really is an input (got $rc)"
+# ⛔ THE LABEL IS SCOPED TO THE RESEARCH SECTION, LIKE ITS SIBLINGS (round 2 review, P2). `cmp` was set
+# outside the `ins` guard, so a `COMPARABLES:` line under an unrelated heading satisfied the round>=4
+# clause — the same trick §A refuses for `EXTERNAL:` ("scoping is enforced"). Pinned in both directions.
+{ printf '## RESEARCH FIRST\nINTERNAL: read the head.\nEXTERNAL: vendor docs only.\nRUNG: 3 — web_fetch https://x\n'
+  printf 'CONTRADICTION TEST: none recorded.\n\n## NOTES\nCOMPARABLES: out of the research section\n'
+  printf '\n## MUTATION ATTRIBUTION\nNO NEW ASSERTIONS: round fixture — this brief carries no assertion of its own.\n\n%s\n' "$PW_FIXTURE"; } > "$TMP/cmp-outside.txt"
+bash "$GATE" --check "$TMP/cmp-outside.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "a COMPARABLES line OUTSIDE the research section does NOT satisfy round 4+ (got $rc)"
+bash "$GATE" --check "$TMP/cmp-outside.txt" reviewer 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and the same brief is still admitted at round 3, where the clause does not apply (got $rc)"
+# STATED RESIDUAL, pinned as behaviour so nobody discovers it as a surprise: a caller that passes NO
+# round gets the round-3 contract. `merge-one.sh` always supplies one (`REV_ROUND`, else
+# `state/reviewround-<PR>`), so our own path cannot reach this — a HAND-authored brief can.
+bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(residual) NO round supplied => the round-3 contract applies (a lost round cannot buy the mandate) (got $rc)"
+bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer banana >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(residual) a GARBAGE round is treated as unknown, not as a high one (got $rc)"
+# ⛔ FAIL-OPEN ARITHMETIC ON THE ROUND (fresh review, P2): `$(( 10#… ))` on a longer-than-nine-digit
+# value WRAPS NEGATIVE, and a negative round is neither 0 nor >= the threshold — it would slip past the
+# mandate entirely. Pinned so the bound cannot be dropped.
+bash "$GATE" --check "$TMP/rev-vendor.txt" reviewer 9223372036854775808 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(round-bound) an absurd-but-numeric round is coerced to UNKNOWN (0), never wrapped negative past the mandate (got $rc)"
+bash "$GATE" --check "$TMP/rev-cmp.txt" reviewer 9223372036854775808 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "…and the wrapped value does not REFUSE a brief either (the coercion is to 0, not to a huge round) (got $rc)"
+# ── NON-VACUITY, TWO MUTANTS because the arm makes TWO claims (#3441 acceptance: "mutation-test that
+# refusal"). Both are derived FROM THE SHIPPED FILE so they track it, and both assert the file CHANGED
+# — a sed whose anchor stopped matching yields an unchanged file and would prove nothing.
+MUT2="$TMP/mutant-nocmp.sh"
+sed 's/^  if (gr_role == "reviewer".*EXTERNAL-COMPARABLES"$/  # MUTANT: the round-4 refusal is removed/' "$GATE" > "$MUT2"
+diff -q "$GATE" "$MUT2" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "MUTANT-A really changed the file (the sed anchor still matches the awk refusal)"
+bash -n "$MUT2" && bash "$MUT2" --section reviewer 7 >/dev/null 2>&1; ck $? "MUTANT-A still parses and renders (a program, not a syntax error failing for the wrong reason)"
+bash "$MUT2" --check "$TMP/rev-vendor.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "MUTATION-A: 'a round-7 brief with no comparables is refused' now FAILS — the mutant admits it (rc=$rc, §A2 would report ❌)"
+bash "$MUT2" --check "$TMP/rev-vendor.txt" reviewer 3 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "MUTATION-A leaves the round-3 arm UNCHANGED — the refusal is scoped to the round, not blanket (rc=$rc)"
+MUT3="$TMP/mutant-nosection.sh"
+# MUTANT-B removes the round>=4 EMISSION from the generator — the plumbing half. It must redden
+# (r7-canon3)'s sibling: the round-7 canonical block would no longer satisfy the round-7 validator.
+# ⛔ MUTATE THE CONDITION, NOT THE STRING: `round_note` is a multi-line assignment, so replacing its
+# first line alone yields a file that does not parse — a mutant that fails for the wrong reason.
+sed 's/\[ "\$rnd" -ge "\$BRIEF_GATE_COMPARABLE_ROUND" \]/[ "$rnd" -ge 999 ]/' "$GATE" > "$MUT3"
+diff -q "$GATE" "$MUT3" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "MUTANT-B really removed the round>=4 emission (the sed anchor still matches)"
+bash -n "$MUT3" && bash "$MUT3" --section reviewer 7 > "$TMP/sec-m3.txt" 2>/dev/null; ck $? "MUTANT-B still parses and renders a section"
+bash "$MUT3" --check "$TMP/sec-m3.txt" reviewer 7 >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "MUTATION-B: without the emission the round-7 canonical block is REFUSED by the round-7 validator — 'the gate cannot refuse its own advice' would report ❌ (rc=$rc)"
 
 echo
 echo "§B the refusal TEACHES — it names what is missing and prints a pasteable block"
@@ -124,7 +266,11 @@ echo "§C NON-VACUITY — the mutation makes §A's two central asserts FAIL"
 MUT="$TMP/mutant.sh"
 # The mutation is on the DECISION line, not the function header: replacing the header alone leaves the
 # body behind and yields a syntax error, i.e. a mutant that fails for the wrong reason.
-sed 's/^  \[ -n "\$miss" \] || return 0$/  return 0  # MUTANT: always pass/' "$GATE" > "$MUT"
+# ⛔ THE ANCHOR IS THE DECISION ITSELF, IN ITS CURRENT SHAPE (#3484 moved it from a one-line `||` to an
+# `if`/`then` because the PREVIOUS WORK cross-check had to run on the SAME body — a `||` short-circuit
+# would have returned before it). The `sed` still targets ONE line and the arm below asserts the file
+# really changed, so a future refactor that moves it again reddens here instead of silently weakening §C.
+sed 's/^  if \[ -z "\$miss" \]; then$/  if true; then  # MUTANT: always pass/' "$GATE" > "$MUT"
 # The transformation is ASSERTED, not assumed: if the anchor stops matching, sed yields an UNCHANGED
 # file and the arms below would "pass" for the wrong reason.
 diff -q "$GATE" "$MUT" >/dev/null 2>&1; rc=$?
@@ -138,7 +284,11 @@ bash "$MUT" --check "$TMP/no-contradiction.txt" lane >/dev/null 2>&1; rc=$?
 # …and the OTHER direction: a validator that refuses everything is equally useless, so pin that a
 # complete brief is ADMITTED by the shipped gate (already §A.iii) and that the mutation is not the
 # only way to be wrong.
-sed 's/^  \[ -n "\$miss" \] || return 0$/  miss="${miss:-RESEARCH-SECTION}"  # MUTANT: always refuse/' "$GATE" > "$TMP/mutant-refuse.sh"
+# ⛔ THE REFUSE-EVERYTHING MUTANT FLIPS THE CONDITION, IT DOES NOT SEED `miss` (#3484). Seeding `miss`
+# before an `if true;` takes the EARLY-RETURN branch and returns 0 — the opposite of what this arm
+# intends — so the arm would go green for the wrong reason. `if false;` skips the return and falls
+# through to the refusal text with whatever `miss` holds, EMPTY included.
+sed 's/^  if \[ -z "\$miss" \]; then$/  if false; then  # MUTANT: always refuse/' "$GATE" > "$TMP/mutant-refuse.sh"
 bash "$TMP/mutant-refuse.sh" --check "$CANON" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "MUTATION (other direction): 'a complete brief passes' FAILS when the gate refuses everything (rc=$rc)"
 
@@ -676,6 +826,135 @@ miss="$(bash "$TMP/mutant-slot.sh" --mutation-missing "$TMP/mut-none-angle.txt" 
 [ -z "$miss" ]; ck $? "§G …and it still ADMITS a real reason with angle brackets, so the arm tests the SLOT rule and not the characters (got '$miss')"
 
 echo
+echo "§H the PREVIOUS WORK contract (#3484) — a brief must say what is already there, and a claim of absence is CHECKED"
+# ── WHAT THIS SECTION PINS. Two mechanisms that make a reaped claim safe existed and were both
+# VOLUNTARY: `lane-wip.py` ("did the lane stop mid-WIP, and WHAT is the WIP?") and `bg-rescue-wip.sh`
+# (archives uncommitted work to `refs/wip/*` on origin). Measured 2026-11-05: 222 rescued archives
+# existed and NOTHING told the next actor to look — `claims.sh` and `claim-reaper.sh` mentioned WIP
+# zero times, and one session produced three branches for a single issue. So the brief must carry the
+# measurement, and a `WIP:` line that names NO ref is a claim of absence that this gate CHECKS.
+#
+# ⛔ THE REMOTE IS A REAL LOCAL BARE REPO, so `refs/wip/*` is read by the shipped `git ls-remote` —
+# nothing below mocks the git layer, and no ref ever leaves this machine.
+HW="$TMP/pw"; mkdir -p "$HW"
+git init -q --bare "$HW/origin.git" 2>/dev/null
+git init -q "$HW/work" 2>/dev/null
+git -C "$HW/work" remote add origin "$HW/origin.git" 2>/dev/null
+PW_EMPTY_TREE=4b825dc642cb6eb9a060e54bf8d69288fbee4904
+mk_wip() { # mk_wip <refname>
+  local sha
+  sha="$(git -C "$HW/work" -c user.name=pw -c user.email=pw@localhost commit-tree "$PW_EMPTY_TREE" -m "wip: fixture $1" 2>/dev/null)"
+  [ -n "$sha" ] || { echo "fixture: cannot build a wip commit"; return 1; }
+  git -C "$HW/work" push -q origin "$sha:refs/wip/$1" 2>/dev/null
+}
+mk_wip "issue-4242-first-attempt" && mk_wip "fix-4243-other-work" && mk_wip "ai-fork-headroom"
+ck $? "§H fixture: the fixture remote carries refs/wip/* (3 real refs, one with no issue number at all)"
+PW_REFS="$(bash "$GATE" --wip-refs 4242 "$HW/work" 2>/dev/null)"
+grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_REFS"; ck $? "(i) --wip-refs FINDS the ref for its issue (the verb claim-reaper.sh and claims.sh consume)"
+grep -q 'refs/wip/fix-4243-other-work' <<<"$PW_REFS"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(i-b) …and does NOT match a ref belonging to another issue (the matcher discriminates, it is not a firehose)"
+grep -q 'refs/wip/ai-fork-headroom' <<<"$(bash "$GATE" --wip-refs 4243 "$HW/work" 2>/dev/null)"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(i-c) …and a ref with no issue token in it matches NO issue — which is why bg-rescue-wip.sh now says so out loud"
+[ -z "$(bash "$GATE" --wip-refs 99999 "$HW/work" 2>/dev/null)" ]; ck $? "(i-d) an issue with no ref answers EMPTY and exits 0 (empty is an answer; unreadable is 2)"
+bash "$GATE" --wip-refs 99999 "$TMP/no-such-repo" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 2 ]; ck $? "(i-e) …and an EXPLICIT repository that is not one is 2 (UNMEASURED) — no silent fallback to another tree (got $rc)"
+
+# ── the shape: five labelled facts, and the absent block is REFUSED.
+sed '/^## PREVIOUS WORK/,$d' "$CANON" > "$TMP/no-pw.txt"
+grep -q '^CONTRADICTION TEST:' "$TMP/no-pw.txt"; ck $? "§H fixture: the no-PW brief is otherwise COMPLETE (research + contradiction test intact)"
+bash "$GATE" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(ii) a brief with NO PREVIOUS WORK section names the block as missing"
+bash "$GATE" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(ii-b) …and is REFUSED with 80, not admitted (got $rc)"
+sed '/^PRIOR:/d' "$CANON" > "$TMP/pw-no-prior.txt"
+bash "$GATE" --missing "$TMP/pw-no-prior.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-PRIOR'; ck $? "(iii) a block missing ONE label names that label (PRIOR), not the whole block"
+bash "$GATE" --check "$TMP/pw-no-prior.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(iii-b) …and is refused (got $rc)"
+# ⛔ EVERY FIXTURE BELOW IS DERIVED WITH `sed … "$CANON"` — the FILE — not with a pipe from the
+# variable. `printf '%s\n' "$CANON" | sed …` prints the PATH, so the fixture becomes a one-line file
+# holding a filename, and every arm below would then be asserting "a brief with no research section"
+# while claiming to test the WIP line — the vacuous-fixture failure this suite exists to catch.
+sed 's/^WIP:.*/WIP:       none, nothing to see/' "$CANON" > "$TMP/pw-unkeyed.txt"
+grep -qx 'WIP:       none, nothing to see' "$TMP/pw-unkeyed.txt"; ck $? "§H fixture: the unkeyed brief really carries the unkeyed WIP line"
+bash "$GATE" --missing "$TMP/pw-unkeyed.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; ck $? "(iv) an UNKEYED WIP value ('none, nothing to see') is refused — it names no issue to check"
+
+# ── the CONTRADICTION: a keyed absence claim against a ref that exists.
+sed 's|^WIP:.*|WIP:       issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06T00:00Z)|' "$CANON" > "$TMP/pw-contradicted.txt"
+grep -qF 'refs/wip/*' "$TMP/pw-contradicted.txt"; ck $? "§H fixture: the absence claim carries a MEASUREMENT NOTE naming refs/wip/* — a note must not be mistaken for a named ref"
+bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(v) a brief claiming 'no WIP for issue 4242' while refs/wip holds one is REFUSED (got $rc)"
+PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" 2>&1)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$PW_OUT"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(v-b) …the refusal does not print the raw token at the author (it is translated)"
+grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_OUT"; ck $? "(v-c) …it NAMES the ref that contradicts the claim (a refusal that names nothing sends the author to grep)"
+grep -q 'CONTINUE that work' <<<"$PW_OUT"; ck $? "(v-d) …and says what to do about it, which is the whole point of the handover"
+# …and the SAME brief passes on stdin: two passes read the brief, so a second `-` reader at EOF would
+# silently see no WIP line and the cross-check would be INERT on pane orders (the inline carrier).
+bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(vi) the same contradiction is caught through STDIN (both passes read one materialised body) (got $rc)"
+# …and naming ANY ref satisfies the shape: the gate checks the CONTRADICTION, not whether the ref is
+# the right one — that judgement is the next actor's, and pretending otherwise would manufacture it.
+sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-named.txt"
+bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(vii) a brief that NAMES the rescued ref is ADMITTED — the block is a handover, not a wall (got $rc)"
+# ── the STATED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR A PASS: an unmeasurable refs/wip ADMITS
+# the brief and says so. The alternative — refusing every dispatch on a network blip — converts a
+# memory gap into a fleet-wide outage, and the claim pre-flight already hard-depends on origin.
+# ⛔ THE FIXTURE MUST FAIL THE MEASUREMENT. A repo with a reachable `origin` and no `refs/wip/*` is a
+# SUCCESSFUL read that answers "none" (rc 0) — the ordinary case, not the residual. Only a repository
+# whose `ls-remote` cannot answer (no `origin` at all, or an unreachable one) exercises this arm.
+git init -q "$HW/noremote" 2>/dev/null
+PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/noremote" 2>&1)"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(viii) an UNREADABLE refs/wip ADMITS the brief (documented residual) (got $rc)"
+grep -q 'UNVERIFIED' <<<"$PW_OUT"; ck $? "(viii-b) …and says the absence claim is UNVERIFIED on stderr, so the pass is never silent"
+
+# ── QUOTED MATERIAL IS NOT A CLAIM (fresh-context review of #3484, P1) ──────────────────────────
+# The first cut's WIP reader took the LAST `WIP:` label anywhere in the section with no fence or indent
+# awareness, so pasting the canonical block as a REFERENCE both satisfied the shape and switched the
+# cross-check off: `issue-<N> -> refs/wip/<ref>` inside a fence read as the author's own claim. Measured
+# before the fix: a brief claiming `issue-4242 -> none` was refused (80) alone, and ADMITTED (0) once a
+# fenced copy of the block was pasted after it. Two arms, one per carrier of the paste.
+{ sed 's|^PRIOR:.*|PRIOR: no previous attempt|' "$TMP/pw-contradicted.txt"
+  printf '\nReference (the shape the harness hands you):\n\n```\nWIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n```\n'; } > "$TMP/pw-fenced-after.txt"
+grep -q 'issue-4242 -> none' "$TMP/pw-fenced-after.txt"; ck $? "§H fixture: the LIVE claim is still the absence claim (the fenced copy comes after it)"
+bash "$GATE" --check "$TMP/pw-fenced-after.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xi) a FENCED quotation of a ref does not switch the cross-check off — the live absence claim is still REFUSED (got $rc)"
+{ printf '# a brief\n\n```\n'
+  sed -n '/^## PREVIOUS WORK/,/^PRIOR:/p' "$CANON"
+  printf '```\n'; } > "$TMP/pw-only-fenced.txt"
+bash "$GATE" --missing "$TMP/pw-only-fenced.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(xii) a PREVIOUS WORK block that exists ONLY inside a fence is QUOTED, not claimed — the section is still missing"
+# …and the four-column carrier, which is the same quote in CommonMark's other spelling.
+awk '{ print "    " $0 }' "$TMP/pw-contradicted.txt" > "$TMP/pw-indented.txt"
+bash "$GATE" --missing "$TMP/pw-indented.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(xiii) …and an INDENTED copy (a code block) is quoted too, so the whole brief is refused as having no section"
+# ── THE DIAGNOSTIC VERB MUST AGREE WITH THE GATE (fresh-context review of #3484, P2). `--missing` is
+# what an author iterates with; reading stdin twice made it report "complete, rc=0" for a brief `--check`
+# refuses on the SAME bytes.
+miss="$(bash "$GATE" --missing - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(xiv) --missing on STDIN sees the SAME body --check does (no second EOF reader)"
+bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xiv-b) …and --check on the same bytes refuses it, so (xiv) is not a green over a broken pipe (got $rc)"
+
+# ── NON-VACUITY: remove the check and the arms above go green.
+MUT_PW="$TMP/mutant-pw.sh"
+sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
+diff -q "$GATE" "$MUT_PW" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(ix) the cross-check mutation REALLY changed the file (its anchor still matches)"
+bash -n "$MUT_PW"; ck $? "(ix-b) …and the mutant still parses"
+bash "$MUT_PW" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(ix-c) MUTATION: (v) now FAILS — with the cross-check removed the contradicted brief is admitted (rc=$rc)"
+bash "$MUT_PW" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(ix-d) …and the SHAPE refusal is untouched by that mutant, so (ii) was not green because of it (rc=$rc)"
+MUT_PW2="$TMP/mutant-pw2.sh"
+sed 's|^  if (!pwsec) print "PREVIOUS-WORK-SECTION"$|  # MUTANT: no section token|' "$GATE" > "$MUT_PW2"
+diff -q "$GATE" "$MUT_PW2" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(x) the section-token mutation really changed the file"
+# ⛔ THIS MUTANT REMOVES ONE TOKEN, AND THE ARM SAYS EXACTLY THAT. The five LABEL tokens still refuse a
+# brief with no block at all, so asserting "the brief is admitted" would be false; asserting the token
+# is gone is the claim §H(ii) actually rests on.
+bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(x-b) MUTATION: (ii) now FAILS — with the token line deleted, no-PW is no longer named as PREVIOUS-WORK-SECTION"
+bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-CLAIM'; ck $? "(x-c) …and the FIVE LABEL tokens still refuse the same brief, so (x-b) removed a token and not the contract"
+
+echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
 # ── the stub `pi` records every invocation, so "refused" is proven by ABSENCE, and the admitted
 #    control proves the machinery under it actually works (a negative assert alone passes on a tree
@@ -1191,7 +1470,7 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     filtered out of the scan: a filter on a directory would silently absorb the next caller that happens
 #     to live there, which is the "gate that cannot see the thing it exists for" shape this list exists
 #     to prevent.
-EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

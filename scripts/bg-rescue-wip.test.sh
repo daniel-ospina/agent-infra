@@ -70,7 +70,7 @@ n_refs() {
 # Returns NON-ZERO if any step failed: with `set -uo pipefail` and no `-e`, a silent fixture failure
 # would otherwise degrade an arm into a green assertion about nothing.
 mk_repo() {
-  local n="$1" d="$T/$1"
+  local n="$1" br="${2:-fix/lane-one}" d="$T/$1"
   mkdir -p "$d" || return 1
   git init -q --bare "$d/origin.git" || return 1
   git clone -q "$d/origin.git" "$d/wt" 2>/dev/null || return 1
@@ -79,8 +79,8 @@ mk_repo() {
   printf 'base\n' > "$d/wt/base.txt" || return 1
   git -C "$d/wt" add base.txt || return 1
   git -C "$d/wt" commit -qm "base" || return 1
-  git -C "$d/wt" checkout -q -b fix/lane-one || return 1
-  git -C "$d/wt" push -q -u origin fix/lane-one 2>/dev/null || return 1
+  git -C "$d/wt" checkout -q -b "$br" || return 1
+  git -C "$d/wt" push -q -u origin "$br" 2>/dev/null || return 1
 }
 
 echo; echo "── a CLEAN worktree has nothing at risk, and the rescue says so ──"
@@ -754,6 +754,39 @@ else
     && ok "dispatch: a second live call covers whatever was written during the grace period" \
     || bad "dispatch: no live rescue after the grace period"
 fi
+
+echo; echo "── the REF CARRIES ITS ISSUE, or says it does not (#3484) ──"
+# ⛔ Measured 2026-11-05: 222 rescued refs/wip archives existed on origin and nothing told the next
+# actor to look, because a ref named from the branch (`fix-3484-x`) is not reliably mappable to an
+# issue. A rescue that cannot be found is a rescue that happens twice.
+mk_repo wipissue fix/4242-first-attempt || { echo "❌ fixture failed (wipissue)"; exit 1; }
+printf 'half-finished work\n' >> "$T/wipissue/wt/base.txt"
+OUT="$(bash "$RR" "$T/wipissue/wt" "test" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "issue-link: exit 0 (rescued)" || bad "issue-link: exit $RC (want 0) — $OUT"
+case "$OUT" in
+  *"refs/wip/issue-4242-first-attempt"*) ok "issue-link: the pushed ref NAME carries the issue (refs/wip/issue-4242-first-attempt)" ;;
+  *) bad "issue-link: the ref does not carry the issue — got: $OUT" ;;
+esac
+[ -n "$(ref_of "$T/wipissue/origin.git" refs/wip/issue-4242-first-attempt)" ] \
+  && ok "issue-link: …and it really exists on ORIGIN under that name (verified, not echoed)" \
+  || bad "issue-link: no refs/wip/issue-4242-first-attempt on origin"
+case "$OUT" in
+  *"NO ISSUE LINK"*) bad "issue-link: a branch that NAMES an issue was reported as UNLINKED (the rule matched nothing)" ;;
+  *) ok "issue-link: a branch that names an issue is NOT reported as unlinked (no false alarm)" ;;
+esac
+# …and the other direction: a branch with no issue in it is rescued anyway — and SAYS it carries no
+# issue link, because a silent unlinked ref is the failure the issue was filed for.
+mk_repo wipnolink fix/lane-two || { echo "❌ fixture failed (wipnolink)"; exit 1; }
+printf 'more work\n' >> "$T/wipnolink/wt/base.txt"
+OUT="$(bash "$RR" "$T/wipnolink/wt" "test" 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && ok "unlinked: a branch with no issue is STILL rescued (losing the work is worse)" || bad "unlinked: exit $RC (want 0) — $OUT"
+case "$OUT" in
+  *"refs/wip/fix-lane-two CARRIES NO ISSUE LINK"*) ok "unlinked: …and the run REPORTS that the ref carries no issue link (not silently ignored)" ;;
+  *) bad "unlinked: an unlinked ref was pushed silently — got: $OUT" ;;
+esac
+[ -n "$(ref_of "$T/wipnolink/origin.git" refs/wip/fix-lane-two)" ] \
+  && ok "unlinked: …the old (branch-named) ref still travels, so nothing is lost by the new naming" \
+  || bad "unlinked: the rescue did not travel under the branch-named ref"
 
 echo; echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

@@ -1254,6 +1254,22 @@ repro_script_log() {  # <path> <nodeid-to-echo> <request-log>
   chmod +x "$1"
 }
 
+# repro_script_pwd <path> <nodeid-to-echo> <request-log> <pwd-record>
+#
+# `repro_script_log` plus a record of the directory the seam ACTUALLY ran in. The
+# `ADMIN_MERGE_REPRO_CMD` contract is "no worktree is created and the command runs
+# in `$PWD`", and that contract is only observable if the seam reports where it
+# was — without this the shard arm silently relocating the pytest arm (measured in
+# review of #3415: one shared directory variable) cannot be asserted at all.
+repro_script_pwd() {  # <path> <nodeid-to-echo> <request-log> <pwd-record>
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'pwd -P > %q\n' "$4"
+    printf 'tee %q | grep -F %q | sed "s/^/FAILED /"\n' "$3" "$2"
+  } > "$1"
+  chmod +x "$1"
+}
+
 # Lane-run fixture lines. The parser reads the lane's COMPLETION state from the
 # SAME `gh run list` projection as its failures (that is the point of P0 #3), so
 # the fixture models the projection: `<status>\t<conclusion>\t<sha>:<run-id>`.
@@ -2552,6 +2568,27 @@ repro_base_shard() {  # <repo-relative path> <exit-code> [unlisted]
   repro_base_publish
 }
 
+# repro_pr_shard_copy <repo-relative path> <exit-code>
+#
+# OVERWRITES the shard in the PR WORKING TREE ONLY — never committed — so the PR
+# checkout's copy of the shard DISAGREES with the BASE COMMIT's. Without it the two
+# trees are byte-identical for that path, and "measured in the base tree" cannot be
+# distinguished from "measured in the PR checkout" (measured in review of #3415:
+# the mutant that ran the shard in `$PWD` instead of the base worktree left EVERY
+# assertion green, because the PR's copy was the same failing script). It also
+# writes a `pr-shard-ran` marker the scenarios assert is ABSENT, which states the
+# property directly instead of inferring it from an exit code.
+repro_pr_shard_copy() {  # <repo-relative path> <exit-code>
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# #3415 fixture: the PR WORKING TREE%ss copy of this shard — deliberately the\n' "'"
+    printf '# OTHER verdict from the base commit, so a rail that measures the PR checkout\n'
+    printf '# is caught instead of agreeing with itself.\n'
+    printf 'printf "ran-pr\\n" >> %q\n' "$SCEN/pr-shard-ran"
+    printf 'exit %s\n' "$2"
+  } > "$SCEN/$1"
+}
+
 # run_admin_repro <pytest-seam> <shard-seam> <rail args…> — the TWO #3715 seams,
 # either omitted when empty (an OMITTED seam means the PRODUCTION path for that
 # arm, which is what case 1 needs). The rail runs with ITS CWD SET TO THE SCENARIO,
@@ -2601,6 +2638,12 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3402"
 # NO SEAM AT ALL: this exercises the real worktree, the real `bash <path>`, and the
 # real containment check. `run_admin_cwd` also gives the rail the scenario AS ITS
 # CHECKOUT, which the production path needs in order to materialise the base.
+# ⛔ THE PR CHECKOUT'S COPY IS MADE TO DISAGREE (#3415 review 4): `repro_pr_shard_copy`
+# leaves a working-tree copy that exits 0 while the BASE COMMIT's exits 1. A rail that
+# measured the PR checkout would therefore see 0 and BLOCK, and the marker assertion
+# below names the property outright. Without this the fixture agreed with itself and
+# the mutant was invisible.
+repro_pr_shard_copy "$SHARD_BO" 0
 run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -eq 0 ] && pass "#3415: a shard the BASE fails no longer blocks the PR (exit 0)" \
@@ -2608,6 +2651,9 @@ rc=$?
 [ -f "$SCEN/base-shard-ran" ] \
   && pass "#3415: the shard was EXECUTED in the base tree (measured, not inferred)" \
   || fail "#3415: the base shard never ran — the clearance (if any) did not come from a measurement"
+[ ! -f "$SCEN/pr-shard-ran" ] \
+  && pass "#3415: …and NOT from the PR checkout — the BASE tree's copy was the one measured" \
+  || fail "#3415: the shard RAN from the PR WORKING TREE — a rail that measures the PR's own copy clears every residual shard, and the PR's copy exits 0 here"
 grep -q "^   pre-existing: bash-shard::$SHARD_BO" "$SCEN/err" \
   && pass "#3415: the base-owned shard is reported pre-existing by its full id" \
   || { fail "#3415: the cleared shard was not reported pre-existing"; grep -n 'pre-existing\|reproduced' "$SCEN/err" | sed 's/^/      /' | head; }
@@ -2632,6 +2678,11 @@ log_failed_shard "$SHARD_PC" > "$SCEN/log-3411"
 cp "$SCEN/log-3411" "$SCEN/log-after-3411"
 lane_fail mainpc 3412 > "$SCEN/runs-main"
 log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3412"
+# ⛔ THE OPPOSITE DISAGREEMENT (#3415 review 4): here the BASE PASSES the shard
+# (exit 0) and the PR checkout's copy exits 1. A rail that measured the PR checkout
+# would read 1 as "the base fails it" and CLEAR a red the PR caused — so this half
+# of the discriminator is the fail-open one, and it needs the same fixture.
+repro_pr_shard_copy "$SHARD_PC" 1
 run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "#3415: a shard the PR broke still BLOCKS (exit $rc)" \
@@ -2639,6 +2690,9 @@ rc=$?
 [ -f "$SCEN/base-shard-ran" ] \
   && pass "#3415: …and the base shard really did run (the block rests on a measurement)" \
   || fail "#3415: the PR-caused case blocked without the base being measured — the assertion is vacuous"
+[ ! -f "$SCEN/pr-shard-ran" ] \
+  && pass "#3415: …measured in the BASE tree, not the PR checkout (whose copy exits 1 and would have cleared)" \
+  || fail "#3415: the PR-caused shard was measured from the PR WORKING TREE — its copy exits 1, i.e. the clearance came from the PR's own tree"
 grep -qF -- "bash-shard::$SHARD_PC" "$SCEN/err" \
   && pass "#3415: the surviving refusal NAMES the shard still in the residual" \
   || fail "#3415: the PR-caused shard vanished from the refusal"
@@ -2899,6 +2953,220 @@ grep -q "budget is EXHAUSTED" "$SCEN/err" \
 grep -q "^   pre-existing: bash-shard::" "$SCEN/err" \
   && fail "#3415: a shard was reported pre-existing off a bound-killed run" \
   || pass "#3415: …and nothing was cleared"
+
+# (12) A SIGNAL DEATH IS NOT A VERDICT — the CLASS, not just SIGALRM (#3415 review 4,
+# P1). The shard arm's verdict IS the exit status, so every status that did not come
+# FROM the shard is a non-measurement, and 142 is a MEMBER of that class (128+N =
+# death by signal N), not the class itself. Pinning only 142 left an OOM SIGKILL (137)
+# on a loaded box, or a reaper's SIGTERM (143), reading as "the base fails this
+# shard" — clearing a red the PR caused off a run that produced no verdict. The base
+# shard here is really SIGKILLed in the real worktree, so the case cannot be
+# satisfied by echoing a status through the seam.
+new_scen repro-shard-signal
+SHARD_SIG='tests/fixture-shard-sigkilled.sh'
+mkdir -p "$SCEN/$(dirname "$SHARD_SIG")"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# #3415 fixture: the BASE tree%ss run of this shard is KILLED by an outside\n' "'"
+  printf '# signal, so it never returns a verdict of its own. Records that it RAN first.\n'
+  printf 'printf "ran\\n" >> %q\n' "$SCEN/base-shard-ran"
+  printf 'kill -KILL $$\n'
+} > "$SCEN/$SHARD_SIG"
+git -C "$SCEN" add -- "$SHARD_SIG" >/dev/null 2>&1
+SCEN_SHARD_LIST="$SHARD_SIG"
+repro_base_publish
+HEAD_SSG="fcfc000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SSG" > "$SCEN/head"
+lane_fail "$HEAD_SSG" 3501 > "$SCEN/runs-$HEAD_SSG"
+log_failed_shard "$SHARD_SIG" > "$SCEN/log-3501"
+cp "$SCEN/log-3501" "$SCEN/log-after-3501"
+lane_fail mainsig 3502 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3502"
+run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ -f "$SCEN/base-shard-ran" ] \
+  && pass "#3415: the SIGNAL-killed base shard really did run (the case is not vacuous)" \
+  || fail "#3415: the signal case never executed the base shard — the fixture, not the guard, would be under test"
+[ "$rc" -ne 0 ] && pass "#3415: a base shard that DIED ON A SIGNAL is not a clearance (exit $rc)" \
+  || { fail "#3415: a signal-killed base run (137) was read as 'the base fails this shard' — the 128+N CLASS is unhandled, so any kill on a loaded box clears a PR-caused red"; sed 's/^/      /' "$SCEN/err" | tail -40; }
+grep -q "DIED ON SIGNAL 9 (status 137)" "$SCEN/err" \
+  && pass "#3415: the refusal names the SIGNAL, not only the alarm bound" \
+  || fail "#3415: a non-SIGALRM signal death was not reported as a non-measurement"
+grep -q "^   pre-existing: bash-shard::$SHARD_SIG" "$SCEN/err" \
+  && fail "#3415: a signal-killed shard was reported pre-existing" \
+  || pass "#3415: …and nothing was cleared"
+
+# (13) EACH ARM OWNS ITS DIRECTORY — the PYTEST SEAM stays in `$PWD` (#3415 review 4,
+# P2). The shard arm needs a base WORKTREE; the pytest seam's own documented contract
+# is the opposite ("when set, no worktree is created and the command runs in `$PWD`").
+# ONE shared directory variable let the shard arm's tree RELOCATE the seam, so a seam command
+# written relative to `$PWD` executed somewhere else. This is the mix the fleet
+# actually runs: a nodeid seam plus a production shard arm.
+new_scen repro-shard-seam-cwd
+SHARD_SC='tests/fixture-shard-seam-cwd.sh'
+repro_base_shard "$SHARD_SC" 1            # a REAL base commit, so the worktree materialises
+NODE_SC='tests/test_genuinely_new_3415_sc.py::test_pr_broke_it'
+HEAD_SSC="fdfd000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SSC" > "$SCEN/head"
+lane_fail "$HEAD_SSC" 3511 > "$SCEN/runs-$HEAD_SSC"
+{ log_failed "$NODE_SC"; log_failed_shard "$SHARD_SC"; } > "$SCEN/log-3511"
+cp "$SCEN/log-3511" "$SCEN/log-after-3511"
+lane_fail mainsc 3512 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3512"
+repro_script_pwd "$SCEN/repro-pwd.sh" "$NODE_SC" "$SCEN/repro-request.txt" "$SCEN/seam-pwd.txt"
+run_admin_repro "bash $SCEN/repro-pwd.sh" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+seam_pwd="$(cat "$SCEN/seam-pwd.txt" 2>/dev/null)"
+scen_real="$(cd "$SCEN" && pwd -P)"
+[ "$seam_pwd" = "$scen_real" ] \
+  && pass "#3415: the PYTEST SEAM ran in \$PWD — the shard arm's worktree did not relocate it" \
+  || fail "#3415: the pytest seam ran in '$seam_pwd', not the caller's \$PWD ('$scen_real') — the shard arm hijacked its cwd, breaking the documented seam contract"
+grep -q "^   pre-existing: $NODE_SC" "$SCEN/err" \
+  && pass "#3415: …and the nodeid still cleared through its seam" \
+  || { fail "#3415: the nodeid did not clear in the mixed residual — the seam arm was suppressed"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+grep -q "^   pre-existing: bash-shard::$SHARD_SC" "$SCEN/err" \
+  && pass "#3415: …while the shard cleared through the PRODUCTION worktree arm beside it" \
+  || fail "#3415: the shard did not clear in the mixed seam/production residual"
+
+# (14) A WORKTREE THAT CANNOT BE MATERIALISED MUST NOT SUPPRESS THE OTHER ARM
+# (#3415 review 4, P2). The bogus base OID makes `git worktree add` fail; the old
+# code `return 1`ed there, BEFORE arm 1 ran — so the pytest seam, which needs no
+# worktree at all, never executed and cleared nothing. That is one arm's missing tree
+# becoming the other arm's verdict, which this function's own RETURN contract
+# ("one arm that could not run never suppresses the other arm's measurement")
+# forbids.
+new_scen repro-shard-seam-nobase
+NODE_NB='tests/test_genuinely_new_3415_nb.py::test_pr_broke_it'
+SHARD_NB='tests/fixture-shard-pr-tree-only.sh'
+repro_base_sha                             # a base OID that does NOT exist: `git worktree add` FAILS
+# ⛔ THE PR WORKING TREE CARRIES A *RUNNABLE* COPY of the shard AND its OWN shard
+# LIST (#3415 review 4, P1). That is what makes this case discriminating: with the
+# worktree creation failing and `shard_dir` left at `$PWD`, a rail that runs the
+# PRODUCTION arm anyway finds both, executes the PR's copy (which exits 1, i.e.
+# "fails") and CLEARS the PR's own red — a fail-open that is strictly worse than
+# the pre-change `return 1`, which cleared nothing. Without the list in the PR tree
+# the arm would refuse for the unrelated "unreadable list" reason and the assertion
+# below would go green for the wrong cause.
+mkdir -p "$SCEN/scripts" "$SCEN/$(dirname "$SHARD_NB")"
+printf '#!/usr/bin/env bash\n[ "${1:-}" = "--list" ] || exit 0\nprintf "%%s\\n" %q\n' "$SHARD_NB" \
+  > "$SCEN/scripts/run-bash-shards.sh"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf 'printf "ran-pr\\n" >> %q\n' "$SCEN/pr-shard-ran"
+  printf 'exit 1\n'
+} > "$SCEN/$SHARD_NB"
+HEAD_SNB="fefe000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SNB" > "$SCEN/head"
+lane_fail "$HEAD_SNB" 3521 > "$SCEN/runs-$HEAD_SNB"
+{ log_failed "$NODE_NB"; log_failed_shard "$SHARD_NB"; } > "$SCEN/log-3521"
+cp "$SCEN/log-3521" "$SCEN/log-after-3521"
+lane_fail mainnb 3522 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3522"
+repro_script_log "$SCEN/repro-nb.sh" "$NODE_NB" "$SCEN/repro-request.txt"
+run_admin_repro "bash $SCEN/repro-nb.sh" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+grep -q "^   pre-existing: $NODE_NB" "$SCEN/err" \
+  && pass "#3415: a base worktree that could NOT be materialised does not suppress the seam arm" \
+  || { fail "#3415: the pytest seam never ran because the SHARD arm's worktree failed — one arm's tree suppressed the other arm's measurement"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+grep -q "^   pre-existing: bash-shard::$SHARD_NB" "$SCEN/err" \
+  && fail "#3415: the shard cleared with no base worktree at all — the arm ran in the PR CHECKOUT and cleared a red the PR caused" \
+  || pass "#3415: …and nothing was cleared on the arm that HAD no tree (fail closed)"
+[ ! -f "$SCEN/pr-shard-ran" ] \
+  && pass "#3415: …and the PR working tree's copy of the shard was never EXECUTED" \
+  || fail "#3415: the production shard arm EXECUTED the PR working tree's copy — with no base worktree it measured the PR, not the base"
+grep -q "the shard arm needs the base worktree" "$SCEN/err" \
+  && pass "#3415: …and the refusal names the missing WORKTREE as the reason" \
+  || fail "#3415: the missing-worktree case was not reported as such (it may have been refused for an unrelated cause)"
+
+# (15) EVERY REFUSAL ARM IN `repro_shard_path`, NOT ONLY `..` (#3415 review 4, P2).
+# The token is attacker-influenced, and only the traversal arm was pinned — so
+# deleting the leading-`-` arm (the code's OWN documented `bash -c` OPTION INJECTION
+# hazard) or the absolute / percent-encoded arms could not turn any assertion red.
+# The shard seam here is `exit 1`, so a token that got EXECUTED would CLEAR: the
+# assertions fail on EXECUTION, not merely on a changed message. The last token is a
+# LISTED control that MUST clear, so "nothing was cleared" cannot be satisfied by an
+# arm that never ran.
+# ⛔ THE "NOTHING HOSTILE CLEARED" ASSERTION IS A COUNT, NOT A LITERAL PATTERN
+# (review round 5, P2). The obvious pattern — `pre-existing: bash-shard::tests/%2e%2e/`
+# — is DEAD TEXT: `ci_exemption._shard_token` percent-encodes `%` again, so the id the
+# rail actually emits is `tests/%252e%252e/…` and the literal never matches. A cleared
+# percent token would have gone unnoticed. Counting `pre-existing: bash-shard::` lines
+# and requiring EXACTLY ONE (the control) is encoding-independent: any hostile token
+# that clears takes the count to 2 and reddens, whatever the encoder did to it.
+# The `%` arm is additionally REDUNDANT with the alphabet arm by construction (`%` is
+# outside `[A-Za-z0-9_./-]`), so `*%*` is belt-and-braces; what these tokens pin is the
+# REFUSAL PATH for three shapes, not three independently-deletable arms.
+new_scen repro-shard-token-arms
+SHARD_CTL='tests/fixture-shard-token-control.sh'
+repro_base_shard "$SHARD_CTL" 1           # a listed, real base shard: the arm must RUN
+HEAD_STK="ffff000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_STK" > "$SCEN/head"
+lane_fail "$HEAD_STK" 3531 > "$SCEN/runs-$HEAD_STK"
+{
+  log_failed_shard '-c'
+  log_failed_shard '/etc/passwd'
+  log_failed_shard 'tests/%2e%2e/agent-infra-3415-evil.sh'
+  log_failed_shard "$SHARD_CTL"
+} > "$SCEN/log-3531"
+cp "$SCEN/log-3531" "$SCEN/log-after-3531"
+lane_fail maintk 3532 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3532"
+run_admin_repro "" 'exit 1' 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+refused="$(grep -c "does not name a repo-relative script" "$SCEN/err" 2>/dev/null)"
+[ -n "$refused" ] || refused=0
+[ "$refused" -ge 3 ] \
+  && pass "#3415: the leading '-', absolute and percent-encoded tokens are EACH refused by name ($refused)" \
+  || fail "#3415: only $refused of the 3 hostile tokens was refused by name — a repro_shard_path arm is unguarded"
+grep -q "^   pre-existing: bash-shard::$SHARD_CTL" "$SCEN/err" \
+  && pass "#3415: …and the LISTED control still cleared, so the arm really ran" \
+  || { fail "#3415: the control shard did not clear — 'nothing was cleared' would be vacuous here"; sed 's/^/      /' "$SCEN/err" | tail -30; }
+cleared_n="$(grep -c '^   pre-existing: bash-shard::' "$SCEN/err" 2>/dev/null)"
+[ -n "$cleared_n" ] || cleared_n=0
+[ "$cleared_n" -eq 1 ] \
+  && pass "#3415: …and EXACTLY ONE shard cleared — the listed control, not a hostile token" \
+  || fail "#3415: $cleared_n shard(s) were reported pre-existing — a hostile token was EXECUTED and cleared the residual"
+
+# (16) THE PRODUCTION PYTEST ARM NEEDS THE TREE TOO (#3415 review 4, P1). The SAME
+# fail-open as (14), one arm over: with the base worktree missing, the pytest arm's
+# directory falls back to the PR's own checkout, so an UNGATED arm 1 selects
+# `uv run --frozen pytest` against the PR tree, recovers the residual nodeid from ITS
+# capture and CLEARS it — a PR-caused red cleared with no base ever measured. Gating
+# only the shard arm does not cover this, which is why it is fixtured separately.
+# The `uv` stub is what makes the case DISCRIMINATE: with no real uv, or no uv.lock,
+# arm 1 refuses for "no runnable lane runner" and the assertions would go green for
+# the wrong cause.
+new_scen repro-pytest-nobase
+NODE_PN='tests/test_genuinely_new_3415_pn.py::test_pr_broke_it'
+repro_base_sha                             # a base OID that does NOT exist: `git worktree add` FAILS
+STUB_PN="$TMP/stubbin-3415-pn"; rm -rf "$STUB_PN"; mkdir -p "$STUB_PN"
+{
+  printf '#!/usr/bin/env bash\n'
+  printf '# #3415 fixture: a uv that records WHERE it ran, then reports the nodeid on\n'
+  printf '# stdin as a pytest failure — the shape `ci_exemption.py ids` recovers.\n'
+  printf 'printf "ran-pytest-pr\\n" >> %q\n' "$SCEN/pr-pytest-ran"
+  printf 'sed "s/^/FAILED /"\n'
+} > "$STUB_PN/uv"
+chmod +x "$STUB_PN/uv"
+: > "$SCEN/uv.lock"                        # arm 1 takes the PRODUCTION runner selection
+HEAD_SPN="f0f0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_SPN" > "$SCEN/head"
+lane_fail "$HEAD_SPN" 3541 > "$SCEN/runs-$HEAD_SPN"
+log_failed "$NODE_PN" > "$SCEN/log-3541"
+cp "$SCEN/log-3541" "$SCEN/log-after-3541"
+lane_fail mainpn 3542 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-3542"
+PATH="$STUB_PN:$PATH" run_admin_repro "" "" 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+grep -q "the pytest arm needs the base worktree" "$SCEN/err" \
+  && pass "#3415: the PRODUCTION pytest arm is REFUSED when the base worktree is missing" \
+  || fail "#3415: the missing-worktree case was not reported for the pytest arm (it may have refused for an unrelated cause)"
+[ ! -f "$SCEN/pr-pytest-ran" ] \
+  && pass "#3415: …and the PR working tree was never used as the pytest run's directory" \
+  || fail "#3415: the production pytest arm RAN in the PR working tree — with no base worktree it measured the PR, not the base"
+grep -q "^   pre-existing: $NODE_PN" "$SCEN/err" \
+  && fail "#3415: a PR-caused nodeid was CLEARED off a run in the PR checkout" \
+  || pass "#3415: …and nothing was cleared (fail closed)"
 
 # ── 5. extraction failure is fail-closed (the vacuous-pass guard) ──────────
 echo "== 5. unreadable log → extraction failure → BLOCK (never a vacuous pass) =="
@@ -16304,6 +16572,351 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
   && fail "(o7) the reported bound is the stale pre-clamp 3600s value" \
   || pass "(o7) the reported bound is the clamped one, not the stale explicit value"
 
+
+# ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
+# THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
+# is push-only and runs the SAME sweep UNSHARDED as `script-validate`. Main is red on
+# `script-validate`, so every PR is red on the shards — and the rail refused every merge
+# for a red NO diff can clear. Measured 2026-11-05: three unrelated PRs (#3478, #3168,
+# #3486) were red on the identical nine checks, and #3478 had zero unique reds.
+#
+# THE RULE UNDER TEST: a red on the PR's evaluated tree is EXCLUDED from the required
+# surface when the BASE's own check surface (read from GitHub, not from a caller flag)
+# fails the same suite under the equivalent name declared by `declared_base_equivalent`,
+# on a workflow that declares no PR trigger.
+# (b)/(c)/(d) are the guards that stop this becoming a blanket exemption, (f) is the arm
+# that keeps a NON-CODE tree red out of it, (g)/(h) pin the two ways a NAME-ONLY set could
+# excuse something the base evidence does not support, and (e) is the mutant: the fix's own
+# arm must go RED when the exclusion is deleted.
+echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
+
+# (a) THE FIX — the observed block. main fails `script-validate` (push-only ci-main.yml,
+# the sharded PR lane's unsharded twin); the PR's tree is red on `bash-suites (3)`.
+new_scen baseowned-excluded
+HEAD_BO1="b0b0000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO1" > "$SCEN/head"
+lane_pass "$HEAD_BO1" 7101 > "$SCEN/runs-$HEAD_BO1"
+lane_pass mainbo1 7102 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5101 'ci / lint' completed success 7201)" \
+  "$(check_run 5102 'bash-suites (3)' completed failure 7202)"
+pr_run_map 7201 pull_request 'CI'
+pr_run_map 7202 pull_request 'CI'
+write_main_checks \
+  "$(check_run 6101 'script-validate' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6102 'extension-tests / lint' completed success 8201)"
+main_run_map 8201 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8201"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a) an INHERITED tree red (main fails the suite under its other-lane name) no longer refuses the merge (exit 0)" \
+  || fail "(a) the rail still held this PR to a check MAIN ITSELF FAILS (exit $rc) — the #3322 defect: $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened" || fail "(a) no merge attempted"
+# AN EXCLUSION THAT IS ONLY AN ABSENCE IS A SILENT DROP: stderr must NAME the red it set
+# aside AND the base check that owns it, or the operator cannot tell "the repo is red"
+# from "the PR is clean". Deleting the TREE_REDS_BASEOWNED print must fail THIS arm.
+# ⛔ THREE INDEPENDENT GREPS ARE NOT A CONJUNCTION (review cycle 2). `grep -q "script-validate"`
+# is satisfied by step 2c's own "Base red(s) reported but NOT blocking" block, and
+# `grep -q "bash-suites (3)"` by the exclusion line's ${job} — so deleting the OWNER NAME from
+# that line left this arm GREEN. The phrase `the base itself fails '<name>'` is emitted ONLY
+# by the exclusion line (stderr) and by the evidence comment's exclusion block, so it is the
+# one string that makes the "with the base check that owns it" claim deny-able.
+if grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+   && grep -q "the base itself fails 'script-validate'" "$SCEN/err" \
+   && grep -q "bash-suites (3)" "$SCEN/err"; then
+  pass "(a) …and the excluded red is REPORTED by name, with the base check that owns it"
+else
+  fail "(a) the exclusion is SILENT or UNATTRIBUTED — an excluded red must be named WITH the base check that owns it: $(grep -n 'EXCLUDED\|bash-suites\|base itself fails' "$SCEN/err" 2>/dev/null | head -3)"
+fi
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && fail "(a) the rail still refused at §4.5" || pass "(a) …and §4.5 did not refuse"
+# ⛔ THE ISOLATION PRECONDITION for (a). The merge above must be earned by the EXCLUSION
+# — not by the tree surface having been read as green, nor by the base red having been
+# classified blocking (which would mean a different code path decided). The base red must
+# be present AND classified not-PR-evaluable in the same run.
+grep -q "NOT pull-request-evaluable" "$SCEN/err" \
+  && pass "(a) precondition: the base's own red IS classified not-PR-evaluable (the #6807 evidence chain)" \
+  || fail "(a) precondition FAILED — the base red never reached the #6807 classification, so (a) would be merging for an unrelated reason: $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
+# …and the DURABLE posted evidence carries it too. stderr is ephemeral; a reviewed merge
+# is audited from the posted comment, and an exclusion visible only in a terminal log is
+# indistinguishable there from a silent drop (the #6807 rule, same reason).
+if [ -f "$SCEN/comment" ] \
+   && grep -q "Tree red(s) EXCLUDED from the required surface" "$SCEN/comment" \
+   && grep -q "the base itself fails 'script-validate'" "$SCEN/comment" \
+   && grep -q "bash-suites (3)" "$SCEN/comment"; then
+  pass "(a) …and the DURABLE evidence comment carries the excluded red, not just stderr"
+else
+  fail "(a) the exclusion is absent from the posted evidence — an ephemeral-only report is a silent drop in the durable record"
+fi
+
+# (b) THE FIRST GUARD — NO BASE MEASUREMENT, NO EXCLUSION. The SAME tree red, but the
+# base surface is GREEN on the equivalent name. That is the #1261 incident (a lint red
+# main does NOT carry): the red is the PR's own and must still refuse. If (b) stops
+# holding, the fix has become "a shell red is base-caused", which is wrong even though
+# (a) passes.
+new_scen baseowned-base-green
+HEAD_BO2="b0b2000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO2" > "$SCEN/head"
+lane_pass "$HEAD_BO2" 7111 > "$SCEN/runs-$HEAD_BO2"
+lane_pass mainbo2 7112 > "$SCEN/runs-main"
+main_green_surface
+write_pr_checks \
+  "$(check_run 5111 'ci / lint' completed success 7211)" \
+  "$(check_run 5112 'bash-suites (3)' completed failure 7212)"
+pr_run_map 7211 pull_request 'CI'
+pr_run_map 7212 pull_request 'CI'
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(b) a tree red with NO base counterpart STILL BLOCKS (exit $rc)" \
+  || fail "(b) a PR-introduced red was excluded — the fix is a blanket exemption"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(b) …as the §4.5 tree-red refusal" || fail "(b) the refusal is not the tree-red one"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(b) an exclusion was reported over a GREEN base" || pass "(b) …and nothing was excluded"
+grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted over a red tree" || pass "(b) no merge attempted"
+
+# (c) THE SECOND GUARD — A PR-EVALUABLE BASE RED IS NOT BASE-OWNED. The base's
+# `script-validate` is red here too, but its workflow DECLARES pull_request, so a PR CAN
+# attach that check and §4.5/§4.6 must keep insisting the repair PR clear it (#1261).
+# This is the arm that keeps the new exclusion off the repair direction.
+new_scen baseowned-base-prevaluable
+HEAD_BO3="b0b3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO3" > "$SCEN/head"
+lane_pass "$HEAD_BO3" 7121 > "$SCEN/runs-$HEAD_BO3"
+lane_pass mainbo3 7122 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 6121 'script-validate' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8221 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8221"
+wf_declares .github/workflows/ci-main.yml push pull_request
+write_pr_checks \
+  "$(check_run 5121 'ci / lint' completed success 7221)" \
+  "$(check_run 5122 'bash-suites (3)' completed failure 7222)"
+pr_run_map 7221 pull_request 'CI'
+pr_run_map 7222 pull_request 'CI'
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(c) a base red on a PR-EVALUABLE workflow still BLOCKS the inherited tree red (exit $rc)" \
+  || fail "(c) a PR-evaluable base red was treated as base-owned — the repair direction is gone"
+# ⛔ WHICH REFUSAL. An exit-code test alone passes on ANY non-zero exit, including one
+# produced before §4.5 was ever reached (a missing sibling script, a repo-resolution
+# failure) — so the arm would print ✅ while never exercising the filter it exists to
+# pin. Ask for the tree-red refusal by name, exactly as (b) does.
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(c) …as the §4.5 tree-red refusal" || fail "(c) the refusal is not the tree-red one — this arm may not have reached §4.5 at all: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(c) the PR-evaluable base red entered the base-owned name set" \
+  || pass "(c) …and the base-owned name set stays empty for it"
+
+# (d) MIXED SURFACE — the rule is PER CHECK, not all-or-nothing. `bash-suites (3)` is
+# inherited (excluded); `verify` is red on no main lane at all, so there is no evidence
+# to exclude it and it must still refuse — and the refusal must name `verify`, not the
+# excluded shard. The count in the summary (1, not 2) is the discriminating assertion.
+new_scen baseowned-mixed
+HEAD_BO4="b0b4000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO4" > "$SCEN/head"
+lane_pass "$HEAD_BO4" 7131 > "$SCEN/runs-$HEAD_BO4"
+lane_pass mainbo4 7132 > "$SCEN/runs-main"
+write_main_checks \
+  "$(check_run 6131 'script-validate' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8231 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8231"
+wf_declares .github/workflows/ci-main.yml push
+write_pr_checks \
+  "$(check_run 5131 'bash-suites (3)' completed failure 7231)" \
+  "$(check_run 5132 'verify' completed failure 7232)"
+pr_run_map 7231 pull_request 'CI'
+pr_run_map 7232 pull_request 'CI'
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(d) a tree red with NO base counterpart keeps the surface RED (exit $rc)" \
+  || fail "(d) an unmapped tree red was excluded — the match is a rule, not a pair"
+grep -q "RED — 1 code-measuring check(s) FAIL" "$SCEN/err" \
+  && pass "(d) …counting EXACTLY ONE blocking red (the excluded shard is not counted)" \
+  || fail "(d) the blocking count is wrong — the exclusion did not apply per-check: $(grep -n 'code-measuring check' "$SCEN/err" 2>/dev/null | head -2)"
+grep -q 'verify' "$SCEN/err" \
+  && pass "(d) …and the refusal NAMES the red that is the PR's own (verify)" \
+  || fail "(d) the refusal does not name the surviving red"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && pass "(d) …while still REPORTING the inherited shard it set aside" \
+  || fail "(d) the inherited shard vanished instead of being reported as excluded"
+
+# (e) THE MUTANT — THE FIX'S OWN ASSERTION MUST BE ABLE TO GO RED. `base_owned_check`
+# is neutered (`return 0`), everything else identical: the SAME scenario as (a) must now
+# reproduce the ORIGINAL defect (exit != 0, §4.5 tree-red refusal, no merge). Without
+# this arm, (a) would only prove that SOME path merges — not that THIS one does.
+MUTD3="$TMP/mut-base-owned"; rm -rf "$MUTD3"; mkdir -p "$MUTD3"
+awk '
+  /^base_owned_check\(\) \{/ { infn = 1; print; print "  return 0   # MUTANT (#3322): the base-owned exclusion is deleted"; next }
+  infn && /^\}/ { infn = 0; print; next }
+  infn { next }
+  { print }
+' "$ADM" > "$MUTD3/admin-merge.sh"
+cp "$CFS" "$ROOT/scripts/ci_exemption.py" "$ROOT/scripts/ci-workflow-pr-evaluable.sh" "$MUTD3/"
+bash -n "$MUTD3/admin-merge.sh" \
+  && pass "(e) the mutant (base-owned exclusion deleted) is still valid bash" \
+  || fail "(e) the mutant does not parse — the mutation is not a clean arm deletion"
+grep -q "MUTANT (#3322)" "$MUTD3/admin-merge.sh" \
+  && pass "(e) …and the mutation actually landed in the file it runs" \
+  || fail "(e) the mutation did not apply — (e)'s red arm below would be vacuous"
+new_scen baseowned-mutant
+HEAD_BO5="b0b5000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO5" > "$SCEN/head"
+lane_pass "$HEAD_BO5" 7141 > "$SCEN/runs-$HEAD_BO5"
+lane_pass mainbo5 7142 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5141 'ci / lint' completed success 7241)" \
+  "$(check_run 5142 'bash-suites (3)' completed failure 7242)"
+pr_run_map 7241 pull_request 'CI'
+pr_run_map 7242 pull_request 'CI'
+write_main_checks \
+  "$(check_run 6141 'script-validate' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6142 'extension-tests / lint' completed success 8241)"
+main_run_map 8241 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8241"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
+  ADMIN_MERGE_FIRST_CHECKS_WAIT=0 ADMIN_MERGE_MERGE_REF_WAIT=0 ADMIN_MERGE_POLL_INTERVAL=0 \
+  ADMIN_MERGE_HEAD_READ_SLEEP=0 ADMIN_MERGE_VERIFY_POLL=0 \
+  bash "$MUTD3/admin-merge.sh" 42 >"$SCEN/out" 2>"$SCEN/err"
+qrc=$?
+[ "$qrc" -ne 0 ] && pass "(e) ⛔ MUTANT RED: with the exclusion deleted the SAME PR is refused again (exit $qrc) — (a) is earned by this arm" \
+  || fail "(e) ⛔ THE MUTANT PASSED — the (a) merge does NOT depend on the base-owned exclusion, so (a) proves nothing"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(e) …and it is the ORIGINAL #3322 refusal (§4.5 tree red), reproduced exactly" \
+  || fail "(e) the mutant failed for a different reason — the arm does not isolate the fix: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+# ⛔ THE ISOLATION PRECONDITION. A mutant that broke EARLIER than the exclusion (a missing
+# sibling script would make the base red read `unknown` -> PR-evaluable -> BLOCKING, and the
+# tree would refuse for THAT reason) would make the arm above pass while proving nothing.
+# The base surface must still classify the red as not-PR-evaluable INSIDE the mutant, i.e.
+# the run must reach §4.5 with the same evidence and differ ONLY in the exclusion.
+grep -q "NOT pull-request-evaluable" "$SCEN/err" \
+  && pass "(e) …reaching §4.5 with the SAME base evidence (the base red is still classified not-PR-evaluable)" \
+  || fail "(e) the mutant diverged BEFORE the exclusion — the arm does not isolate the fix: $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
+grep -q "pr merge" "$SCEN/calls" && fail "(e) the mutant merged — no defect reproduced" || pass "(e) …and no merge, exactly as before the fix"
+
+# (f) THE THIRD GUARD — NEVER A NON-CODE RED, EVEN WHEN THE NAME MATCHES. The exclusion is
+# applied per-red inside the probe, and `[ "$noncode" -eq 0 ]` (admin-merge.sh:~6338) is the
+# only thing keeping a `schedule`/`issues` red out of it. Nothing else in §80 exercises that
+# conjunct: (a)-(e) all fail a `pull_request`-evented check, so DELETING the conjunct left
+# every other assertion green — the vacuous-guard class #3442 exists to end (a test that
+# cannot fail is not a test). This arm makes the conjunct load-bearing: the tree's red is
+# `bash-suites (3)` (so `declared_base_equivalent` WOULD match it) but its run map says
+# `schedule`, and the base is red on `script-validate` under a push-only workflow. Without
+# the conjunct the red is excluded as base-owned and the merge proceeds; with it the red is
+# the ANOMALY the header calls it and the rail must still refuse.
+new_scen baseowned-noncode
+HEAD_BO6="b0b6000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO6" > "$SCEN/head"
+lane_pass "$HEAD_BO6" 7151 > "$SCEN/runs-$HEAD_BO6"
+lane_pass mainbo6 7152 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5151 'ci / lint' completed success 7251)" \
+  "$(check_run 5152 'bash-suites (3)' completed failure 7252)"
+pr_run_map 7251 pull_request 'CI'
+# ⛔ THE TREE RED'S EVENT IS `schedule` — the same impossible-but-observed shape §52(a)
+# models: a run a PR cannot attach re-routed to a check on the head sha.
+pr_run_map 7252 schedule 'CI'
+write_main_checks \
+  "$(check_run 6151 'script-validate' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6152 'extension-tests / lint' completed success 8251)"
+main_run_map 8251 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8251"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(f) a NON-CODE tree red whose name matches a base-owned red still BLOCKS (exit $rc)" \
+  || fail "(f) a schedule-evented tree red was EXCLUDED as base-owned and merged — the non-code conjunct is gone"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(f) …as the §4.5 tree-red refusal" || fail "(f) the refusal is not the tree-red one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+# ⛔ THE DISCRIMINATOR. The exit code alone would also pass if the exclusion had fired and
+# something ELSE refused, so the arm must also see that NOTHING was excluded — that is the
+# conjunct's own effect, and the only assertion a deleted conjunct turns red here.
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(f) a NON-CODE red was excluded as base-owned — the tree anomaly was treated as an inherited defect" \
+  || pass "(f) …and nothing was excluded as base-owned"
+grep -q "NOT EXEMPT ON THIS SURFACE" "$SCEN/err" \
+  && pass "(f) …saying the non-code exemption does not apply on the evaluated tree" \
+  || fail "(f) the refusal does not state that the non-code exemption is base-only"
+grep -q "pr merge" "$SCEN/calls" && fail "(f) a merge was attempted over an excluded non-code tree red" || pass "(f) …and no merge attempted"
+
+# (g) THE FOURTH GUARD — ONE NAME, TWO ROWS, ONE OF THEM BLOCKING. The base-owned set is
+# built from the base's `exempt: this workflow declares no PR trigger` rows, but the base can
+# publish the SAME check name from two different apps/workflows: exempt on a push-only lane
+# AND blocking on a PR-evaluable one. A set that takes the name from the exempt row and
+# ignores the blocking row contradicts the header's own rule ("the base red is on a workflow
+# that DOES declare a PR trigger -> it is a BLOCKING base red, deliberately NOT in the set:
+# that is the repair direction") — and it would exclude the PR's shard red on evidence the
+# base actively contradicts. This arm fails if the `blocked[n]` condition is dropped.
+new_scen baseowned-same-name-blocked
+HEAD_BO7="b0b7000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO7" > "$SCEN/head"
+lane_pass "$HEAD_BO7" 7161 > "$SCEN/runs-$HEAD_BO7"
+lane_pass mainbo7 7162 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5161 'ci / lint' completed success 7261)" \
+  "$(check_run 5162 'bash-suites (3)' completed failure 7262)"
+pr_run_map 7261 pull_request 'CI'
+pr_run_map 7262 pull_request 'CI'
+# THE SAME NAME, twice — but from TWO DIFFERENT APPS, which is what makes this arm bite.
+# ⛔ WHY NOT TWO `check_run` ROWS (verifier finding, round 3): `check_run` hardcodes
+# `app.slug` to `github-actions`, and the probe keys its de-duplication on (app, name) with
+# newest-id-wins — so two same-named `check_run` rows COLLAPSE into one (the blocking one)
+# before the bash ever sees them, and the arm would pass with or without the `blocked[n]`
+# guard. The second row is therefore written raw with a different app slug: two identities,
+# one name — the real shape of "two apps publish the same check name".
+write_main_checks \
+  "$(check_run 6161 'script-validate' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(printf '{"id":6162,"name":"script-validate","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
+main_run_map 8261 push 'CI on main' 8262 pull_request 'CI'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8261"
+printf 'pull_request\tCI\t.github/workflows/ci.yml\n' > "$SCEN/run-8262"
+wf_declares .github/workflows/ci-main.yml push
+wf_declares .github/workflows/ci.yml pull_request
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(g) a base name that is ALSO red on a PR-evaluable workflow does NOT excuse the tree red (exit $rc)" \
+  || fail "(g) the base-owned set was built from the exempt row ALONE — a name the base also fails on a PR-evaluable workflow excluded the PR's red"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(g) …as the §4.5 tree-red refusal" || fail "(g) the refusal is not the tree-red one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(g) a red the base BLOCKS on was excluded as base-owned — the set ignored a contradicting row" \
+  || pass "(g) …and nothing was excluded"
+
+# (h) THE FIFTH GUARD — A PLACEHOLDER IS NOT A NAME. The probe gives a nameless row the
+# identity `(unnamed check)`. If that placeholder enters the name set, ONE unnamed base red
+# excuses ANY unnamed tree red — the #1353 property ("an unnamed red must never vanish")
+# inverted into a waiver, on evidence that establishes nothing about the tree's unnamed row.
+# This arm fails if the placeholder exclusion is dropped from the awk.
+new_scen baseowned-unnamed
+HEAD_BO8="b0b8000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO8" > "$SCEN/head"
+lane_pass "$HEAD_BO8" 7171 > "$SCEN/runs-$HEAD_BO8"
+lane_pass mainbo8 7172 > "$SCEN/runs-main"
+write_pr_checks "$(check_run 5171 '' completed failure 7271)"
+pr_run_map 7271 pull_request 'CI'
+write_main_checks "$(check_run 6171 '' completed failure 8271 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+main_run_map 8271 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8271"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(h) an UNNAMED base red does not excuse an UNNAMED tree red (exit $rc)" \
+  || fail "(h) the '(unnamed check)' PLACEHOLDER matched itself and the tree red was excluded — a nameless row is not a name"
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(h) …as the §4.5 tree-red refusal" || fail "(h) the refusal is not the tree-red one: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
+grep -q "EXCLUDED from the required surface" "$SCEN/err" \
+  && fail "(h) an unnamed tree red was excluded on an unnamed base red" \
+  || pass "(h) …and nothing was excluded"
 
 # #3194 — THE RAIL MUST ALWAYS TERMINATE. Wired here, not merely added beside this
 # file: shard discovery is `tests/*/run.sh` only, so a `*.test.sh` in this directory is

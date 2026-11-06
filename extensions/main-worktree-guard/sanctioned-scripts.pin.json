@@ -2,16 +2,16 @@
   "_why": "sha256 of the audited bytes of every SANCTIONED_SCRIPT_RELPATHS entry (index.ts). The exemption is granted on IDENTITY, not on a path string: a script is the sanctioned one when it sits at a sanctioned relpath inside a framework checkout AND its bytes hash to the value below. Re-cut with `node extensions/main-worktree-guard/test-sanctioned-identity.mjs --cut` in the SAME commit that changes any listed script; test-sanctioned-identity.mjs reds when this file is stale, so a stale pin cannot reach main silently. Why a pin and not a path: a path is purchasable (`git init` + two fingerprint files), and `committed` is purchasable (the #1485 A5 rejection) — but the AUDITED BYTES are not, so the pin is the only reference an agent cannot forge with allowed operations.",
   "version": 2,
   "sha256": {
-    "scripts/check-pipeline-compliance.sh": "c6225a9768b9736806a723069d72e70a0d9250683cbe5e25fda2bd451d941a27",
+    "scripts/check-pipeline-compliance.sh": "a95d557c8ab1941bb1b5d4234367efdd83cff13eb474a841d987a5ee3164fd62",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/record-review.sh": "d4f998d3eb669c4c432ead1494999495a86b01690bb3daf7342d2bb06eaa4fc3",
-    "scripts/admin-merge.sh": "427ecc3e1437423599428b3c18008d1191b8ae724614fd682e92d0c5230983a8",
+    "scripts/admin-merge.sh": "a77d705dd3ab70f6ba4e7a72e0e7e658d42b2f0b29c6c2554eeccff7fe97a6f0",
     "scripts/gh-shim/gh": "a5e5464ca1c06fe945deada66caff5ab9a1df07360f95aa5c1d12015edffa991"
   },
   "delegates": {
-    "scripts/admin-merge.sh": "427ecc3e1437423599428b3c18008d1191b8ae724614fd682e92d0c5230983a8",
-    "scripts/check-pipeline-compliance.sh": "c6225a9768b9736806a723069d72e70a0d9250683cbe5e25fda2bd451d941a27",
+    "scripts/admin-merge.sh": "a77d705dd3ab70f6ba4e7a72e0e7e658d42b2f0b29c6c2554eeccff7fe97a6f0",
+    "scripts/check-pipeline-compliance.sh": "a95d557c8ab1941bb1b5d4234367efdd83cff13eb474a841d987a5ee3164fd62",
     "scripts/checkout-hygiene/hub-worktree-refresh-advance.sh": "88bde611c5f53bc75c94d56f97b8d6048d21029b1396cb0db162b082ebb9a643",
     "scripts/checkout-hygiene/hub-worktree-salvage-commit.sh": "f747ad00b5babe4474a625b3564f27d3e6523f05147bef79126ff5e4a5a5c29e",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
