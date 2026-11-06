@@ -895,7 +895,8 @@ bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null
 # the right one — that judgement is the next actor's, and pretending otherwise would manufacture it.
 sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-named.txt"
 bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(H16) a brief that NAMES the rescued ref is ADMITTED — the block is a handover, not a wall (got $rc)"# ── the STATED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR A PASS: an unmeasurable refs/wip ADMITS
+[ "$rc" -eq 0 ]; ck $? "(H16) a brief that NAMES the rescued ref is ADMITTED — the block is a handover, not a wall (got $rc)"
+# ── the STATED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR A PASS: an unmeasurable refs/wip ADMITS
 # the brief and says so. The alternative — refusing every dispatch on a network blip — converts a
 # memory gap into a fleet-wide outage, and the claim pre-flight already hard-depends on origin.
 # ⛔ THE FIXTURE MUST FAIL THE MEASUREMENT. A repo with a reachable `origin` and no `refs/wip/*` is a
@@ -963,10 +964,11 @@ bash "$GATE" --check "$TMP/pwplus-pr.txt" fixer 0 "$HW/work" >/dev/null 2>&1; rc
 { bash "$GATE" --section reviewer; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr-rev.txt"
 bash "$GATE" --check "$TMP/pwplus-pr-rev.txt" reviewer 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(H30) …and for a REVIEWER too (it reviews one PR at a head) (got $rc)"
-# ── THE INDENT HALF OF THE QUOTING FIX NEEDS ITS OWN MUTANT-KILLING ARM (review cycle 2, P2). §H(xiii)
-# indents the WHOLE brief, and heading detection already rejects an indented heading — so that arm
-# stayed green with the indent logic deleted. This one keeps the brief live and indents one LATE line:
-# the only thing that can refuse it is the indent rule itself.
+# ── THE INDENT RULE'S BEHAVIOUR, ON A LIVE BRIEF (review cycle 2, P2; corrected in review of #3621).
+# ⛔ THESE TWO ARMS ARE CONTROLS, NOT MUTANT-KILLERS: their fixture inherits a LIVE absence claim that
+# refuses on its own, so they stay at 80 with the indent logic deleted (measured). They assert the
+# RULE's behaviour (an indented late line does not change the verdict); the arms that actually redden
+# under `sed 's/^  line = _qskip($0)/  line = $0/'` are H36/H37 below, whose base is a CLEAN claim.
 { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-ind.txt"; printf '\n    WIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n' >> "$TMP/pwplus-ind.txt"; }
 bash "$GATE" --check "$TMP/pwplus-ind.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H31) a 4-COLUMN INDENTED late WIP line is a code block, so the live absence claim still decides (got $rc)"
@@ -999,10 +1001,57 @@ bash "$GATE" --check "$TMP/pw-clean.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$
 [ "$rc" -eq 0 ]; ck $? "§H control: a clean absence claim for an issue with no ref is ADMITTED (got $rc)"
 { cat "$TMP/pw-clean.txt"; printf '\n    WIP:       none\n'; } > "$TMP/pw-clean-ind.txt"
 bash "$GATE" --check "$TMP/pw-clean-ind.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(H36) a 4-COLUMN INDENTED 'WIP: none' is a code block and does NOT become a live unkeyed claim — deleting `_qskip` reddens THIS arm (got $rc)"
+[ "$rc" -eq 0 ]; ck $? "(H36) a 4-COLUMN INDENTED 'WIP: none' is a code block and does NOT become a live unkeyed claim — deleting \`_qskip\` reddens THIS arm (got $rc)"
 { cat "$TMP/pw-clean.txt"; printf '\n\tWIP:       none\n'; } > "$TMP/pw-clean-tab.txt"
 bash "$GATE" --check "$TMP/pw-clean-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(H37) …and the TAB spelling of the same indent (got $rc)"
+
+
+# ── A GLOB IS NOT A REF (review of #3621, P2) ─────────────────────────────────────────────────────────
+# `refs/wip/* is empty` begins with `refs/wip/`, so it was read as "a ref is named" and the check was
+# SWITCHED OFF by the most honest possible statement of having looked. Measured rc 0 with a matching
+# ref on origin, on the merged baseline too.
+sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/* is empty (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-glob.txt"
+bash "$GATE" --check "$TMP/pw-glob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H48) a GLOB claim ('refs/wip/* is empty') is a claim of ABSENCE and is CHECKED (got $rc)"
+sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/ — nothing there (measured)|' "$CANON" > "$TMP/pw-barewip.txt"
+bash "$GATE" --check "$TMP/pw-barewip.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H49) …and so is `refs/wip/` with no token after it (got $rc)"
+bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H50) …while a CONCRETE ref still satisfies it (no over-block; got $rc)"
+# ── `keyless — <why>` HAD NO ARM AT ALL (review of #3621, P2): the branch that decides it is a single
+# unasserted point whose deletion false-blocks the honest diagnosis-lane form the canonical block hands
+# out. Two rows: the form is ADMITTED, and deleting the branch REFUSES it.
+sed 's|^WIP:.*|WIP:       keyless — a diagnosis lane with no issue or PR key|' "$CANON" > "$TMP/pw-keyless.txt"
+bash "$GATE" --check "$TMP/pw-keyless.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H51) a keyless diagnosis-lane brief is ADMITTED (the third documented form) (got $rc)"
+sed 's|^WIP:.*|WIP:       keyless|' "$CANON" > "$TMP/pw-keyless-bare.txt"
+bash "$GATE" --check "$TMP/pw-keyless-bare.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H51b) …but a bare 'keyless' with no reason is not (got $rc)"
+MUT_PW4="$TMP/mutant-pw-nokeyless.sh"
+sed 's|^      keyless\*)$|      keyless-NEVER*)|' "$GATE" > "$MUT_PW4"
+diff -q "$GATE" "$MUT_PW4" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H52) the KEYLESS-BRANCH mutation really changed the file"
+bash "$MUT_PW4" --check "$TMP/pw-keyless.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H52b) MUTATION: H51 now FAILS — with the keyless branch deleted the honest form is refused (rc=$rc)"
+# ── the KEY is case-folded like the label (review of #3621, nit): `Issue-4242 -> none` was refused.
+sed 's|^WIP:.*|WIP:       Issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-case.txt"
+bash "$GATE" --check "$TMP/pw-case.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H53) a case-folded key ('Issue-4242') is the same key — its claim is CHECKED (got $rc)"
+
+# ── THE TWO COPIES OF THE QUOTING HELPERS MUST STAY BYTE-IDENTICAL (review of #3621, P3). They are
+# duplicated because the two awk programs are separate single-quoted strings by design (#3442's reason:
+# wrapping two contracts in one END block is how a change to one re-opens the other). That is safe only
+# while the bodies are equal — unequal copies is exactly how the cycle-3 recognizer divergence happened.
+extract_qskip() { # <n> — the n-th `function _qskip(s,…){…}` block of the gate
+  awk -v want="$1" 'BEGIN{n=0;f=0}
+    /^function _qskip\(s,/{n++; f=(n==want); if (f) print; next}
+    f && /^\}/{print; f=0; next}
+    f {print}' "$GATE"
+}
+diff <(extract_qskip 1) <(extract_qskip 2) >/dev/null 2>&1; ck $? "(H54) the two copies of the quoting helper are IDENTICAL (a divergence is the cycle-3 defect class)"
+[ "$(extract_qskip 1 | grep -c '')" -gt 4 ]; ck $? "(H54b) …and the extract is not empty (an empty pair would make 'identical' vacuous)"
+[ "$(extract_qskip 1 | grep -c 'function _qskip')" = "1" ] && [ "$(extract_qskip 2 | grep -c 'function _qskip')" = "1" ]; ck $? "(H54c) …and both copies were really found (a missing second copy cannot pass as equal)"
 
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"
@@ -1021,11 +1070,24 @@ bash "$MUT_PW" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
 # which proves nothing about WHICH values are read. This revert restores "the last WIP line wins" — the
 # exact shape cycle 2 found — and the carriers that must notice are named one by one.
 MUT_PW3="$TMP/mutant-pw-lastwins.sh"
+# ⛔ TWO ANCHORS, BOTH PROVEN (review of #3621, P2). The second `sed` expression below spells the source
+# `\n` as `\n`, which GNU sed reads as a NEWLINE \u2014 the pattern then matched nothing, so the "last-wins"
+# mutant left the every-value printer in place, `_n` was never incremented, the reader emitted NOTHING,
+# and H42 was green over a mutant that deletes the reader rather than one that restores last-wins. The
+# two anchors are now asserted SEPARATELY, by grepping the mutant for the text each one writes.
+# ⛔ THE PRINTER ANCHOR IS MATCHED ON ITS STABLE PREFIX, not on the `\t`/`\n` literals: spelling those in
+# a sed PATTERN is where the first attempt went inert (a BRE `\n` is a newline, so the pattern matched
+# nothing and the mutant silently kept the every-value loop). `.` for the escapes, and the replacement
+# writes the two characters back with `\\t`.
 sed -e 's|^    _v\[++_n\] = t$|    val = t|' \
-    -e 's|^END { for (_i = 1; _i <= _n; _i++) printf "V\\t%s\\n", _v\[_i\] }$|END { if (length(val) > 0) printf "V\\t%s\\n", val }|' \
+    -e 's|^END { for (_i = 1.*$|END { if (length(val) > 0) print "V\\t" val }|' \
     "$GATE" > "$MUT_PW3"
-diff -q "$GATE" "$MUT_PW3" >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(H42) the LAST-WINS mutation really changed the file (both anchors still match)"
+grep -qx '    val = t' "$MUT_PW3"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H42) the LAST-WINS mutation replaced the COLLECTOR anchor (the file really changed there)"
+grep -q 'if (length(val) > 0) print "V' "$MUT_PW3"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H42a) …and the PRINTER anchor too — an inert expression leaves the every-value loop in place and the mutant then proves nothing"
+grep -q '_v\[++_n\] = t' "$MUT_PW3"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H42b) …and the old collector is GONE (a mutant that kept it would not be last-wins either)"
 bash -n "$MUT_PW3"; ck $? "(H43) …and it still parses"
 # ⛔ NOT EVERY CARRIER FLIPS UNDER THIS MUTANT, and asserting one that cannot would be its own
 # vacuous arm: (H5) has a SINGLE `WIP:` line (last-wins == every-value, so nothing changes) and the

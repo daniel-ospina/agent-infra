@@ -445,11 +445,12 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
 # honest line (`issue-4242 -> none (measured: git ls-remote refs/wip/* at …)`) look like a named ref,
 # so the check silently skipped exactly the briefs that did the measurement properly. The value is
 # `issue-<N> -> <claim>`, and the claim is what decides: it begins `refs/wip/` ⇒ a ref is named;
-# anything else (`none`, `unclaimed`, `nothing`, `-`, a half-finished sentence) ⇒ a claim of absence,
-# which is then CHECKED. No word list to defeat, and no measurement note that can switch it off.
+# anything else (`none`, `unclaimed`, `nothing`, `-`, `refs/wip/* is empty`, a half-finished sentence)
+# ⇒ a claim of absence, which is then CHECKED. No word list to defeat, no measurement note that can
+# switch it off, and a GLOB is not a ref.
 brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
-  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val tag key claim rest issue
-  local unkeyed=0 issues="" evidence="" seen=""
+  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val vlow tag claim rest issue ref
+  local unkeyed=0 issues="" evidence=""
   values="$(awk "$BRIEF_GATE_WIP_AWK" "$f" 2>/dev/null)"
   [ -n "$values" ] || return 0            # no WIP line at all: the SHAPE token already refuses
   # ── EVERY VALUE IS CHECKED, NOT THE LAST ONE (fresh-context review of #3484, P1) ──────────────
@@ -460,30 +461,44 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
   while IFS=$'\t' read -r tag val; do
     [ "${tag:-}" = "V" ] || continue
     if [ -z "${val:-}" ]; then unkeyed=1; continue; fi
-    case "$val" in
+    # ⛔ THE KEY IS FOLDED TOO (review of #3621, nit). The LABEL was already case-insensitive
+    # (`_label` lowercases), so `WIP: Issue-4242 -> none` was refused while `WIP:` was accepted — an
+    # asymmetry no author can be expected to guess. `vlow` is what every key and claim test reads.
+    vlow="$(printf '%s' "$val" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+    case "$vlow" in
       # ⛔ THE SLOT IS A KEY TOO (`issue-<N>`, `pr-<N>`). The canonical block ships the slot, and the
       # gate cannot refuse its own advice — the same reason the research contract admits `<…>`. A slot
       # has no number to look up, so it is keyed-but-unchecked; that is the stated coverage limit.
       issue-"<"*|pr-"<"*) : ;;   # `<` is a REDIRECTION metacharacter in a bare case pattern
       issue-[0-9]*)
-        issue="${val#issue-}"; issue="${issue%%[!0-9]*}"
+        issue="${vlow#issue-}"; issue="${issue%%[!0-9]*}"
         # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
         # claim of absence (an earlier draft read the whole value and switched itself off)
-        rest="${val#issue-}"; rest="${rest#"$issue"}"
+        rest="${vlow#issue-}"; rest="${rest#"$issue"}"
         # ⛔ ERE, NOT GNU's `\|` (review cycle 3, P2). BSD sed — macOS, where install.sh and launchd
         # run — does not implement `\|` in a BRE, so this substitution was INERT there: the arrow
         # stayed in `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its
         # ref was falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
         # Same class as orch-loop.sh:1329 and fleet-inventory.sh:927.
         claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)[[:space:]]*//')"
-        case "$claim" in refs/wip/*) : ;; *) issues="$issues $issue" ;; esac ;;
+        # ⛔ A GLOB IS NOT A REF (review of #3621, P2). `refs/wip/* is empty` begins with `refs/wip/`
+        # and was therefore read as "a ref is named", so the most honest possible way to say "I looked
+        # and there is nothing" switched the check OFF — measured rc 0 with a matching ref on origin,
+        # on the merged baseline too. A named ref must be a CONCRETE token: the word after `refs/wip/`
+        # must be non-empty and free of glob characters, or the value is a claim of absence.
+        case "$claim" in
+          refs/wip/*)
+            ref="$(printf '%s' "${claim#refs/wip/}" | sed -E 's/[[:space:]].*$//')"
+            case "$ref" in ''|*'*'*|*'?'*|*'['*) issues="${issues:+$issues }$issue" ;; esac ;;
+          *) issues="${issues:+$issues }$issue" ;;
+        esac ;;
       pr-[0-9]*)
         # A PR key is the FIXER's and the REVIEWER's key (they hold `refs/claims/<pr>-<sha>`); for a
         # lane/worker dispatch the key is the issue, so `pr-<N> -> none` there is an unkeyed claim, not
         # an exemption (fresh-context review of #3484, P1: it was accepted for every role).
         case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       keyless*)
-        rest="${val#keyless}"
+        rest="${vlow#keyless}"
         case "$rest" in ' '?*) : ;; *) unkeyed=1 ;; esac ;;
       *) unkeyed=1 ;;
     esac
@@ -919,7 +934,7 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
       # made (a full disk, an unusable TMPDIR). `NO-FILE` sends the author to look for a brief that
       # exists; this token says what actually failed, and it refuses rather than answering "complete".
       printf '[brief-gate] CANNOT VERIFY: no temp file for the stdin brief (mktemp failed) — the brief was NOT read.\n' >&2
-      printf 'GATE-UNAVAILABLE\n'; return 0; }
+      printf 'GATE-UNAVAILABLE\n'; return "$BRIEF_GATE_UNAVAILABLE"; }
     cat > "$tmpf"
     f="$tmpf"
   fi
