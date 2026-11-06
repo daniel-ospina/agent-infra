@@ -3316,6 +3316,38 @@ for _dv_alarm in reap-ineffective unmeasured mixed unlisted-new-verdict; do
     *) bad "status: the ALARM delegate verdict '$_dv_alarm' was swallowed — $OUT" ;;
   esac
 done
+# (3e) ⛔ THE TWO NEWER CLASSES' VERDICTS ARE THE OTHER ROUTE TO A SILENT PASS (#3057 review, P1).
+# `verdict_runner_work` / `verdict_duplicate_install` are `partial`/`abstained` on a pass that EXITS 0 by
+# decision (the RECORD is the alarm channel), so the healthy arm (`_drc -eq 0`) is the ONLY arm that can
+# carry them — and a note built with the WRONG SHELL FORM never prints there at all. This arm was
+# MEASURED MISSING: the first version wrote `$(_dr_cls_all)` — a COMMAND SUBSTITUTION of a VARIABLE — so
+# every `status` on a healthy cell emitted `_dr_cls_all: command not found` and an
+# `unmeasurable_runner_work=1` census reached no operator surface, while the alarm arms further down
+# still looked right (they use `${_dr_rw:-?}`, not this note). ⛔ ASSERT THE NOTE, not just the pass line:
+# a case that only matched `disk reaper: last pass` passes with the note absent, which is exactly how
+# this stayed green.
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\nverdict_runner_work=partial\nunmeasurable_runner_work=1\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"⚠️ runner-work=partial unmeasurable=1"*) \
+    ok "status: the HEALTHY line carries a non-ok runner-work verdict AND its unreadable tally" ;;
+  *) bad "status: a partial runner-work census reached no operator surface — $OUT" ;;
+esac
+case "$OUT" in
+  *"command not found"*) bad "status: the class note runs as a COMMAND, so it never prints — $OUT" ;;
+  *) ok "status: the class note is a variable expansion, so stderr stays clean" ;;
+esac
+# …and the benign spelling stays SILENT, so this is not a note painted onto every pass of every cell
+# (the alarm-fatigue arm (3d) pins for the delegate; the same rule applies to the class verdicts).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\nverdict_runner_work=ok\nunmeasurable_runner_work=0\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"runner-work="*) bad "status: an ok runner-work verdict still grew a note — $OUT" ;;
+  *"disk reaper: last pass"*) ok "status: an ok runner-work verdict gains no note (the pass line is still there)" ;;
+  *) bad "status: the healthy pass line vanished for an ok runner-work verdict — $OUT" ;;
+esac
 # ⛔ THE PAIRED ASSERTION LIVES ABOVE, IMMEDIATELY AFTER BLOCK (3)'s OWN `OUT`, and it must stay
 # there: blocks (3b)/(3c) each REWRITE `disk-reaper.status` and reassign `OUT`, so an assertion left
 # down here reads (3c)'s healthy record — which never prints `verdict_worktree=` at all — and the

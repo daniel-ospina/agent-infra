@@ -279,7 +279,11 @@ jobs:
         # #1187 — scripts/test_cmux_payload.py: the cmux sender's payload-TAIL checker
         # (scripts/lib/cmux_payload.py) is exec'd by orch-send.sh, so a suite CI never
         # runs is a suite the repo does not have.
-        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py -x --timeout=60 -q
+        # #3382 — scripts/test_lane_wip.py: `lane-wip.py`'s payload contract (the `…` truncation
+        # marker, `turns_truncated` as a real flag, and the 3-vs-2 exit split) was asserted only by
+        # prose in its own comments, and the marker was silently dropped by a rewrite. A suite the
+        # repo does not RUN is a suite it does not have.
+        run: python3.12 -m pytest scripts/test_parallel_work_check.py tests/test_ci_exemption.py tests/test_ci_exemption_producer.py scripts/test_lane_status.py scripts/test_lane_actions.py scripts/test_lane_watchdog.py scripts/test_admin_merge_head.py scripts/test_objective.py scripts/test_cmux_payload.py scripts/test_merge_queue.py scripts/test_turn_classify_state.py scripts/test_pr_doctor.py scripts/test_ask_owner.py scripts/test_dispatch_wiring.py scripts/test_pr_loop.py tests/test_pytest_root_cut.py scripts/test_beta_progress.py scripts/test_bounce_state.py scripts/test_lane_registry.py scripts/test_lane_wip.py mcp-servers/orchestrator/test_server.py -x --timeout=60 -q
 
   sanctioned-pin:
     # ⛔ ITS OWN JOB, NOT A STEP IN `verify` (agent-infra#3121). The pin-freshness
@@ -600,10 +604,13 @@ jobs:
         # Its own step, not a flag on the step above (one verdict cannot suppress the other).
         run: python3.12 tools/fleet/fleet_health.test.py
       - name: fleet-health REAPER-table mutation evidence (#1862, zero-dep)
-        # The suite above is only a pin if it can FAIL. Four mutations are written to TEMP copies of
-        # the module and re-imported: drop the orphan row (the pre-#1862 module), re-file `orphan` as
-        # `worktree`, drop the label from `REQUIRED_LABELS`, and flatten exit 4 to a benign ok — each
-        # must turn its paired leg RED. Its own step, same rule as every suite here.
+        # The suite above is only a pin if it can FAIL. Eight mutations are written to TEMP copies of
+        # the module and re-imported: the four lane-CENSUS ones (neuter the reconciliation, drop
+        # `attributed`, split the UNVERIFIED tails on `attributed` instead of the note, and let the
+        # census speak about a roster it could not read), plus the four #1862 reaper ones (drop the
+        # orphan row, re-file `orphan` as `worktree`, drop the label from `REQUIRED_LABELS`, and
+        # flatten exit 4 to a benign ok) — each must turn its paired leg RED. Its own step, same rule
+        # as every suite here.
         run: python3.12 tools/fleet/fleet_health.test.py --red-control
       - name: Outcome-canary suite (fleet outcome assertions, zero-dep)
         # The fleet's failures are OUTCOMES that are absent while every component is up: a

@@ -549,10 +549,20 @@ them off the tool's own output/exit code — never off this table alone, and nev
 | `fresh` | **the DIFF CHANGED** — the record does not cover what would merge | ⛔ run a review, or drop it from the batch |
 | `norecord` | no record in **this box's** store | ⛔ a review — **but take the cheaper paths the tool prints first**: `scripts/registry-sync.sh pull` (it may have run on another box) and `record-review.sh --recover-body <pr> <owner/repo>` (the PR body carries a signed marker). An absence here is **not** evidence no review happened |
 | `unreadable` | the PR's live diff **could not be READ** (transport, shared gate queue, rate limit) | ⚠️ **RETRY** — this is NOT a changed diff and NOT a carry |
+| `red-surface` | **the head's check surface is RED** and the red is **not** base-owned (#3440). The head judged is the one that would MERGE: on the `carry` arm that is the LIVE head, not the recorded one | ⛔ **NOT mergeable** — fix or re-run the failing checks. A **re-review is not the remedy for a broken build** |
+| `red-base-owned` | the head is RED but **every red group also reproduces on the base** (#3440) — the groups are **named** on stderr | ⚠️ the record **does** cover the artifact, so no review is owed. **On a rail repo** the rail re-measures base reds against its own reproduction and that is the merge decision; **in gate mode nothing else verifies it**, so treat this as a *named residual*, not a green light. Never report the head as green — say which groups |
+| `surface-unknown` | the head's check surface **could not be READ** (#3440) — a refused API read, or no repo resolved to scope the query | ⚠️ **RETRY** — a failed read is its own answer, never a green one |
 
 `carry-patch`, `nodigest` and `unreadable` are the expensive mistakes: each one *looks* like "needs re-review" and
 isn't. `unreadable` in particular is a transient read failure, and a lane that re-reviews on it burns a full review
-cycle for nothing.
+cycle for nothing. **`red-surface` is the mirror-image mistake**: it *looks* like a reason to re-review, and it is
+not — a red build needs a fix or a re-run, and a review of a red tree tells you nothing about the tree.
+
+⛔ **`head` is NOT a statement that the tree is green** (#3440). `head`/`carry` certify the **record's identity**
+with the diff that would merge; the check surface is reported separately (and `red-surface`/`surface-unknown`
+refuse). A head whose surface is **empty** or **in flight** still answers `head`, loudly, because an absent
+surface is not evidence of anything — so if you need "is this head green", **read the checks yourself**; do not
+read it off a carry verdict.
 
 **A conflict resolved at batch time does NOT repair `fresh`.** Resolving a conflict reconciles a moved base; it says
 nothing about an unreviewed diff. Measured 2026-11-02 to show how sharp this is: of six open PRs carrying a *clean*
