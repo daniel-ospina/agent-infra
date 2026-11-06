@@ -319,6 +319,33 @@ ck "2k6 a \`~/…\` override is EXPANDED like pi does, so a store that exists on
    "$([ "${RC:-1}" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "agent_dir=$OV3" "2k7 …and it reads the expanded directory, not the home-relative default"
 
+# ⛔ AND A `file://` OVERRIDE IS A PATH TO pi, NOT A RELATIVE NAME (round 26, P2, measured): `normalizePath` converts a
+# `file:` URL with `fileURLToPath` BEFORE the absolute/relative test (`dist/utils/paths.js:78-80`), and `getAgentDir()`
+# runs the override through it. Joining the URL onto `cwd` answered about a directory pi never reads — measured:
+# `PI_CODING_AGENT_DIR=file://<tmp>/altagent` listed that directory's provider under `pi --list-models` while the gate
+# said `cannot-resolve-provider-credential ... from <cwd>/file://<tmp>/altagent/models.json`. Only the host-less absolute
+# form is reproduced (a percent-escape or `file://host/...` answers cannot-say rather than a path that is silently wrong).
+HFU="$(mkset fileurl "$TWO_JSON" ABSENT)"
+mkdir -p "$T/furl/agent"
+printf '{"providers":{"deepseek":{"apiKey":"$KG_CANARY_KEY","models":[{"id":"m"}]}}}\n' > "$T/furl/agent/models.json"
+OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://$T/furl/agent" \
+        bash -c 'set -u
+          . "$KG_GATE" || exit 99
+          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"
+          printf "VAR=%s\n" "$(key_gate_var "$HOME" deepseek "")"' 2>&1)"
+has "$OUT" "AGENT=$T/furl/agent" \
+    "2k8 a file:// override resolves to the PATH pi reads, not to \$cwd/file://..."
+has "$OUT" "VAR=KG_CANARY_KEY" \
+    "2k9 ...so the models.json inside it is found"
+OUT="$(env -i PATH=/usr/bin:/bin:/usr/sbin:/sbin HOME="$HFU" KG_GATE="$KG" PI_CODING_AGENT_DIR="file://host$T/furl/agent" \
+        bash -c 'set -u
+          . "$KG_GATE" || exit 99
+          printf "AGENT=%s\n" "$(key_gate_agent_dir "$HOME" "")"' 2>&1)"
+hasnt "$OUT" "host$T" \
+    "2k10 a file://HOST/... override answers cannot-say, not a joined path about a directory pi never reads"
+eqv "$(printf '%s\n' "$OUT" | sed -n 's/^AGENT=\(.*\)$/\1/p')" "" \
+    "2k11 …(it prints NO directory at all, which is the answer every caller turns into a cannot-say)"
+
 # ── 3. BLINDNESS IS NOT A REFUSAL (polarity, the direction that stops a fleet) ───────────────────
 for spec in "absent:ABSENT" \
             "literal:{\"providers\":{\"deepseek\":{\"apiKey\":\"sk_literal_not_a_template\"}}}" \
@@ -1465,6 +1492,32 @@ ck "8L20 …while an ARRAY store is NOT refused — pi reaches the provider from
    "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
 has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
     "8L21 …so the null rule is not a blanket refusal of every non-object"
+# ⛔ AND AN ENTRY THAT IS A FALSY SCALAR IS "NOTHING STORED" TO pi, WHICH THEN USES THE ENVIRONMENT (round 26, P1,
+# measured): `auth-storage.js:377-380` returns the raw entry and `pi-ai/dist/auth/resolve.js:24` branches on `if (stored)`
+# — JS TRUTHINESS — so `false`, `0`, `0.0`/`-0` and `""` are all absent, and measured with the key exported pi RAN
+# (401 from the env key). Grading them rc 5 refused 82 a box pi runs, with the destructive remedy "repair auth.json".
+# The OPPOSITE shapes stay rc 5 and are asserted below, because `true`/`[]`/a non-empty string ARE stored values pi
+# cannot turn into a key (measured `{"deepseek":[]}` -> `Provider is not configured`).
+for _falsy in 'false' '0' '0.0' '""'; do
+  HFY="$(mkset "storefalsy" "$TWO_JSON" ABSENT)"
+  printf '{"deepseek":%s}\n' "$_falsy" > "$HFY/.pi/agent/auth.json"
+  OUT="$(run_gate "$HFY" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+  ck "8L25.$_falsy an entry of $_falsy is NOTHING STORED — pi runs on the env (rc=${rc:-<none>})" \
+     "$([ "${rc:-0}" = "0" ] && echo 0 || echo 1)"
+  has "$OUT" "check=ok var=KG_CANARY_KEY provider=deepseek" \
+      "8L26.$_falsy …so the template variable is asserted instead of the store being called broken"
+  hasnt "$OUT" "store-invalid" \
+      "8L27.$_falsy …and the file is not blamed for a credential pi simply does not find there"
+done
+for _truthy in 'true' '[]' '"sk-a-string"'; do
+  HFY2="$(mkset "storetruthy" "$TWO_JSON" ABSENT)"
+  printf '{"deepseek":%s}\n' "$_truthy" > "$HFY2/.pi/agent/auth.json"
+  OUT="$(run_gate "$HFY2" KG_CANARY_KEY=v)"; rc="$(rc_of "$OUT")"
+  ck "8L28.$_truthy a TRUTHY entry pi cannot use stays rc 5 (rc=${rc:-<none>})" \
+     "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+  has "$OUT" "reason=store-invalid" \
+      "8L29.$_truthy …which is the positive reading this gate is allowed to refuse on"
+done
 # ⛔ AND A FILE CONTAINING ONLY A BOM IS NOT AN EMPTY STORE (round 25, P1, measured): pi tests the RAW string
 # (`if (!content) return {};`) and strips the BOM only inside `JSON.parse`, so `"\ufeff"` is NON-EMPTY and unparseable
 # (`Unexpected end of JSON input`, fatal). Decoding as `utf-8-sig` first made it "" and the round-24 empty rule called
