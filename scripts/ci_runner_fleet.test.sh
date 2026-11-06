@@ -152,9 +152,10 @@ world
 export RUNNER_FLEET_BOXES="cell-a cell-b"
 cell cell-a 0 "$(block cell-a 8 3 2 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1
 gh-runner-a-2            222       live      pi-runner-a-2" 2 0 0 0 2 0)"
-cell cell-b 0 "$(block cell-b 4 2 1 9000 3584 "gh-runner-b-1            333       live      pi-runner-b-1" 1 0 0 0 1 0)"
+cell cell-b 0 "$(block cell-b 4 2 2 9000 3584 "gh-runner-b-1            333       live      pi-runner-b-1
+gh-runner-b-2            334       live      pi-runner-b-2" 2 0 0 0 2 0)"
 reg o/a pi-runner-a-1 online false pi-runner-a-2 online true pi-runner-b-1 online false
-reg o/b pi-runner-b-1 online false
+reg o/b pi-runner-b-2 online false
 run_fleet bash "$FLEET"
 assert_eq "$RC" 0 "A: every cell measured and every registration claimed => exit 0"
 assert_contains "$OUT" "cell label=cell-a read=ok host=cell-a ncpu=8 ceiling=3 slots=2 mem_available_mb=14375 floor_mb=3584" \
@@ -163,7 +164,7 @@ assert_contains "$OUT" "runner cell=cell-a name=gh-runner-a-1 github_name=pi-run
   "A: a registered name, its listener pid and its GitHub state are reconciled on ONE row"
 assert_contains "$OUT" "runner cell=cell-a name=gh-runner-a-2 github_name=pi-runner-a-2 listener=222 local=live github=online busy=true" \
   "A: busy-ness comes from the registry (the local view cannot know it)"
-assert_contains "$OUT" "cell label=cell-b read=ok host=cell-b ncpu=4 ceiling=2 slots=1 mem_available_mb=9000" \
+assert_contains "$OUT" "cell label=cell-b read=ok host=cell-b ncpu=4 ceiling=2 slots=2 mem_available_mb=9000" \
   "A: a SECOND cell is reported with ITS OWN memory reading and ceiling, not the first cell's"
 assert_contains "$OUT" "verdict=ok" "A: a row that both sources agree on is ok"
 assert_contains "$OUT" "summary cells=2 measured=2 unmeasured=0 registry=4 registry_unread=0 claimed=4 unclaimed=0 unregistered=0 unjoinable=0" \
@@ -299,7 +300,7 @@ cannot-measure why=pool-root-incomplete root=/tmp/actions-runner outside=/opt/gh
 reg o/a
 run_fleet bash "$FLEET"
 assert_eq "$RC" 2 "K: an ambiguous refusal stays cannot-measure"
-assert_contains "$OUT" "cell label=cell-4 read=cannot-measure why=pool-unreadable" "K: and is reported as unmeasured"
+assert_contains "$OUT" "cell label=cell-4 read=cannot-measure why=pool-root-incomplete" "K: and is reported as unmeasured, with the producer's own token"
 assert_eq "$(wc -l <"$FLEET_CALLS" | tr -d ' ')" "1" "K: NO retry was attempted — one root cannot contain both parents"
 
 # ══ L. A PINNED ROOT IS NEVER MOVED BY THIS TOOL ════════════════════════════════════════════════
@@ -388,6 +389,81 @@ assert_contains "$OUT" "verdict=defect-tmpdir-mode:755" \
   "Q: the verdict names the MODE defect (remedy: chmod 700), not a missing root (remedy: restart)"
 assert_omits "$OUT" "verdict=tmpdir-missing" "Q: and does not mislabel it as missing"
 
+# ══ S. --box IS A SCOPE, NOT A CLAIM THAT THE REST OF THE FLEET DOES NOT EXIST (cycle-2 P1) ══════
+# Leaving excluded boxes uncounted made the attribution guard read a scoped run as a COMPLETE one, so
+# `--box cell-a` printed cell-b's registration as `registry-unclaimed … no-measured-cell-claims-it`
+# and exited 3 — advice whose printed remedy is `reclaim`, aimed at a live registration on a box
+# nobody asked about.
+world
+export RUNNER_FLEET_BOXES="cell-a cell-b"
+cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
+cell cell-b 0 "$(block cell-b 4 2 1 9000 3584 "gh-runner-b-1            222       live      pi-runner-b-1" 1 0 0 0 1 0)"
+reg o/a pi-runner-a-1 online false pi-runner-b-1 online false
+run_fleet bash "$FLEET" --box cell-a
+assert_eq "$RC" 0 "S: a scoped run over a healthy fleet is not a defect"
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-b-1 registry=a status=online reason=cannot-attribute(1-cell-not-requested)" \
+  "S: the excluded box's registration is an abstention, and the reason NAMES the exclusion"
+assert_omits "$OUT" "no-measured-cell-claims-it" "S: never a phantom, so never the destructive 'reclaim' advice"
+
+# ══ T. A REPO SEAM THAT WORD-SPLITS TO NOTHING IS AN UNREAD REGISTRY (cycle-2 P2) ══════════════
+# `RUNNER_FLEET_REPOS=" "` iterated zero times, the registry half vanished, and every healthy runner
+# became `verdict=unregistered` — the class the malformed-token arm covers, one value over.
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
+run_fleet env RUNNER_FLEET_REPOS=" " bash "$FLEET"
+assert_eq "$RC" 2 "T: an empty repo list => exit 2"
+assert_contains "$OUT" "registry repo=- read=cannot-measure why=repo-list-empty" "T: the registry half names the empty seam"
+assert_omits "$OUT" "verdict=unregistered" "T: and no healthy runner is turned into a defect by it"
+assert_contains "$OUT" "registry_unread=1" "T: the unread registry is counted as one"
+
+# ══ U. AN EMPTY ROSTER SEAM IS A REFUSAL, NOT A FLEET OF ZERO (cycle-2 P2) ══════════════════════
+world
+run_fleet env RUNNER_FLEET_BOXES=" " bash "$FLEET"
+assert_eq "$RC" 2 "U: a whitespace-only roster => exit 2, never 'a clean bill of health from nothing'"
+assert_contains "$OUT" "cell roster=cannot-measure why=roster-empty" "U: and the roster half says why"
+
+# ══ V. ONE NAME IN TWO REGISTRIES CANNOT BE ATTRIBUTED TO BOTH (cycle-2 P2) ═════════════════════
+# Runner names are unique PER REPO, and two registries are read by default: one local row matching one
+# name used to count `claimed=2` and silently swallow the other registry's registration — the very
+# lost-its-box class clause 2 exists for.
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 3 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
+reg o/a pi-runner-a-1 online false
+reg o/b pi-runner-a-1 offline false
+run_fleet bash "$FLEET"
+assert_contains "$OUT" "registry=a" "V: the first registry keeps the attribution"
+assert_contains "$OUT" "registry-unclaimed name=pi-runner-a-1 registry=b status=offline reason=cannot-attribute(name-carried-by-more-than-one-registry)" \
+  "V: the second registry's registration is NAMED, not swallowed"
+assert_contains "$OUT" "unjoinable=1" "V: and counted as an abstention"
+assert_eq "$RC" 2 "V: an unattributable registration => exit 2"
+
+# ══ W. THE PRODUCER'S OWN why= TOKEN SURVIVES THE rc-DERIVED ONE (cycle-2 P3) ════════════════════
+# `pool-tool-absent` (a peer with no clone) was flattened to `pool-unreadable` — four different causes
+# printed as one word a consumer must branch on.
+world
+export RUNNER_FLEET_BOXES="cell-a"
+printf 'cannot-measure why=pool-tool-absent searched=/tmp/cell-ai:\$HOME/agent-infra\n' >"$FIXTURE/cell-a.out"
+printf '2\n' >"$FIXTURE/cell-a.rc"
+reg o/a
+run_fleet bash "$FLEET"
+assert_eq "$RC" 2 "W: no clone on the peer => exit 2"
+assert_contains "$OUT" "cell label=cell-a read=cannot-measure why=pool-tool-absent rc=2" \
+  "W: the producer's own token is reported, not a generic one"
+
+# ══ X. A DEFECT ROW THAT ALSO DISAGREES IS STILL A DISAGREEMENT (cycle-2 P3) ═════════════════════
+# The `defect` arm sat before the offline arm, so `disagreements=0` was printed on a box that had one.
+world
+export RUNNER_FLEET_BOXES="cell-a"
+cell cell-a 3 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 1)
+defect tmpdir-missing name=gh-runner-a-1 path=/opt/a/_tmp — the instance private temp root is missing"
+reg o/a pi-runner-a-1 offline false
+run_fleet bash "$FLEET"
+assert_contains "$OUT" "local=live github=offline" "X: the row carries both facts"
+assert_contains "$OUT" "verdict=defect-tmpdir-missing" "X: the defect names the row verdict"
+assert_contains "$OUT" "disagreements=1" "X: and the disagreement is STILL counted (it is not the verdict's to hide)"
+
 # ══ R. THE MUTANTS — each one must make a named case FAIL ══════════════════════════════════════
 # ⛔ A TEST THAT PASSES AGAINST THE MUTANT PINS NOTHING. Each mutant below removes exactly ONE guard
 # this suite claims to cover, and the assertion is that the case built for that guard FLIPS.
@@ -418,7 +494,7 @@ world
 export RUNNER_FLEET_BOXES="cell-a cell-y"
 cell cell-a 0 "$(block cell-a 8 3 1 14375 3584 "gh-runner-a-1            111       live      pi-runner-a-1" 1 0 0 0 1 0)"
 reg o/a pi-runner-a-1 online false pi-runner-y-1 online false
-mutant_case attribution-guard 's/if \[ "\$unmeasured" -eq 0 \] && \[ "\$reg_unread" -eq 0 \]; then/if [ 1 -eq 1 ]; then/' 'reason=no-measured-cell-claims-it'
+mutant_case attribution-guard 's/if \[ "\$unmeasured" -eq 0 \] && \[ "\$skipped" -eq 0 \] && \[ "\$reg_unread" -eq 0 \]; then/if [ 1 -eq 1 ]; then/' 'reason=no-measured-cell-claims-it'
 
 # R3 — match the claim on the INSTANCE DIRECTORY instead of the agentName
 world

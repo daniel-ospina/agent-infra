@@ -121,7 +121,10 @@ usage: ci_runner_fleet.sh [report] [options]
   THE REPORT IS ON STDOUT (machine-readable, one fact per line); diagnostics are on stderr.
 
   --box LABEL        report only this cell (repeatable). A label the roster does not carry is a
-                     CANNOT MEASURE, never a silently smaller fleet (exit 2).
+                     CANNOT MEASURE, never a silently smaller fleet (exit 2). The boxes it EXCLUDES
+                     are counted (`--box` is a SCOPE, not a claim that the rest of the fleet does not
+                     exist): a registration they carry is `cannot-attribute(<N>-cell-not-requested)`,
+                     never a phantom — so a scoped run never advises `reclaim` on a live runner.
   --root PATH        set RUNNER_ROOT on EVERY cell (default: each cell's own).
   --no-root-derive   do not retry a cell whose pool read was refused as
                      `cannot-measure why=pool-root-incomplete` using the parents of the directories
@@ -132,16 +135,18 @@ usage: ci_runner_fleet.sh [report] [options]
     registry repo=<name> read=ok runners=…            | read=cannot-measure why=… detail=…
     cell     label=… read=ok host=… ncpu=… ceiling=… slots=… mem_available_mb=… floor_mb=…
              live=… dead=… orphaned=… quarantine=… registrations=… tmpdir_defects=… rc=…
-    cell     label=… read=cannot-measure why=… detail=…     (ONE line per requested cell, ALWAYS)
+    cell     label=… read=cannot-measure why=… [rc=…] [unclassified=…] detail=…
+             (ONE line per requested cell, ALWAYS; where=roster=… for the roster itself)
     cell-note label=… root_derived=…                        (a retry that succeeded)
     runner   cell=… name=… github_name=… listener=… local=… github=… busy=… registry=… verdict=…
-             verdict ∈ ok | dead-listener | orphaned | tmpdir-missing | quarantine |
-                       github-offline | unregistered
-    registry-unclaimed name=… registry=… status=… reason=no-measured-cell-claims-it
-                                                        | cannot-attribute(<N>-cell-unmeasured)
+             verdict ∈ ok | dead-listener | orphaned | quarantine | defect-<token> |
+                       github-offline | github-unreadable | unregistered | cannot-attribute
+    registry-unclaimed name=… registry=… status=… reason=no-measured-cell-claims-it |
+             cannot-attribute(<N>-cell-unmeasured[,<N>-cell-not-requested][,<N>-registry-unread] |
+                              name-carried-by-more-than-one-registry)
     name-collision name=… cells=…
-    summary  cells=… measured=… unmeasured=… registry=… claimed=… unclaimed=… unregistered=…
-             disagreements=… collisions=… not_ok=…
+    summary  cells=… measured=… unmeasured=… registry=… registry_unread=… claimed=… unclaimed=…
+             unregistered=… unjoinable=… disagreements=… collisions=… not_ok=…
 
   Seams: RUNNER_FLEET_BOXES (explicit roster), RUNNER_FLEET_EXEC (exec template, `{box}` substituted),
   RUNNER_FLEET_REPOS (registry repos), RUNNER_FLEET_ROOT / RUNNER_FLEET_ROOTS (RUNNER_ROOT per fleet /
@@ -241,8 +246,8 @@ exec_box() {
 }
 
 # BOX_AWK — the per-box block reader. Input: the remote probe's combined output. Output: the three
-# line kinds this report aggregates (`K|…` per box, `R|…` per registration, `Q|…` per non-registration
-# row). ⛔ IT IS THE ONLY PARSER: the row grammar it must survive is #2381's (fixed-width
+# line kinds this report aggregates (`K|…` per box, `R|…` per registration, `X|…` for a line it could
+# not classify, `C|…` for the producer's own refusal text). ⛔ IT IS THE ONLY PARSER: the row grammar it must survive is #2381's (fixed-width
 # NAME/LISTENER/STATE/GITHUB_NAME), and it classifies by the STATE TOKEN rather than a byte offset,
 # because the QUARANTINE rows carry prose in the fourth column and a width-based read would put that
 # prose in `github_name` and report a retired install as an unregistered runner.
@@ -335,7 +340,12 @@ derive_root() {
 # a pool larger than one page is never truncated to its first 100 — the same reason
 # `ci_runner_gate.sh` paginates.
 registry_read() {
-  cap_bounded "$FLEET_TIMEOUT" "$FLEET_GH" api --paginate \
+  # ⛔ STDERR IS MERGED HERE TOO (review cycle 2, P3). `cap_bounded` redirects the child's stderr to
+  # /dev/null on every arm, so the caller's `2>"$TMPD/regerr"` never received it and every refusal
+  # read `detail=no-output` — 404, auth and rate-limit indistinguishable, which is the failure the
+  # cell arm explicitly refuses to flatten. Same `sh -c 'exec "$@" 2>&1'` wrapper `exec_box` uses.
+  cap_bounded "$FLEET_TIMEOUT" sh -c 'exec "$@" 2>&1' _ \
+    "$FLEET_GH" api --paginate \
     "repos/$1/actions/runners?per_page=100" \
     --jq '.runners[] | [.name, .status, (.busy|tostring)] | @tsv' </dev/null
 }
@@ -351,6 +361,14 @@ registry_read() {
 unmeasured=0; measured=0; cells=0
 reg_unread=0; reg_total=0; reg_claimed=0; reg_unclaimed=0
 local_rows=0; unregistered=0; unjoinable=0; disagreements=0; not_ok=0; collision=0
+skipped=0; reg_scope=0
+# ⛔ A BOX DELIBERATELY EXCLUDED BY --box IS NOT A BOX THAT FAILED (review cycle 2, P1). Leaving it
+# uncounted made the attribution guard read a scoped run as a COMPLETE one, so `--box cell-a` on a
+# healthy two-cell fleet printed cell-b's registration as `registry-unclaimed …
+# reason=no-measured-cell-claims-it` and exited 3 — advice whose printed remedy is `reclaim`, aimed at
+# a live registration on a box nobody asked about. Excluded boxes are counted (`skipped=`) and the
+# guard refuses a phantom claim while any exist; they do NOT force exit 2, because the operator asked
+# for a SCOPE, not a full fleet.
 : >"$TMPD/reg"     # name<TAB>repo<TAB>status<TAB>busy
 : >"$TMPD/claim"   # github_name<TAB>cell<TAB>name
 
@@ -363,7 +381,7 @@ for repo in $FLEET_REPOS; do
     printf 'registry repo=%s read=cannot-measure why=repo-token-malformed detail=%s\n' "$repo" "not owner/name"
     reg_unread=$((reg_unread + 1)); continue ;;
   esac
-  short="${repo#*/}"
+  short="${repo#*/}"; reg_scope=$((reg_scope + 1))
   : >"$TMPD/regerr"
   if reg_out="$(registry_read "$repo" 2>"$TMPD/regerr")"; then
     # ⛔ AN EMPTY REGISTRY IS A LEGITIMATE READING (a repo whose jobs run on GitHub-hosted runners —
@@ -384,12 +402,21 @@ for repo in $FLEET_REPOS; do
     reg_unread=$((reg_unread + 1))
   fi
 done
+# ⛔ A SEAM THAT WORD-SPLITS TO NOTHING IS AN UNREAD REGISTRY, NOT AN EMPTY ONE (review cycle 2, P2).
+# `RUNNER_FLEET_REPOS=" "` iterated zero times, so the registry half simply vanished: `registry=0` read
+# as "this repo has no runners" and every healthy runner was then `verdict=unregistered` — the same
+# class the malformed-token arm covers, one value over.
+if [ "$reg_scope" -eq 0 ]; then
+  printf 'registry repo=- read=cannot-measure why=repo-list-empty detail=RUNNER_FLEET_REPOS is empty
+'
+  reg_unread=$((reg_unread + 1))
+fi
 reg_total="$(awk 'NF' "$TMPD/reg" | wc -l)"; reg_total=$((reg_total))
 
 # ── 2. the roster ────────────────────────────────────────────────────────────────────────────────
 if [ -n "$FLEET_BOXES" ]; then
   # shellcheck disable=SC2086
-  printf '%s\n' $FLEET_BOXES >"$TMPD/roster"
+  printf '%s\n' $FLEET_BOXES | awk 'NF {print $1}' >"$TMPD/roster"
 else
   roster="$(cap_fleet_inventory)"; rrc=$?
   if [ "$rrc" -ne 0 ]; then
@@ -399,6 +426,18 @@ else
     exit 2
   fi
   printf '%s\n' "$roster" | awk 'NF { print $1 }' >"$TMPD/roster"
+fi
+
+# ⛔ AN EMPTY ROSTER IS A REFUSAL, NOT A FLEET OF ZERO (review cycle 2, P2). A whitespace-only
+# `RUNNER_FLEET_BOXES` produced one blank line, the loop skipped it, and the run printed
+# `cells=0 measured=0 unmeasured=0 not_ok=0` and exited 0 — a clean bill of health from a run that
+# probed nothing. `--list`-style discovery has the same rule (`cap_expected_boxes` refuses a roster
+# that tokenises to nothing).
+if [ ! -s "$TMPD/roster" ] || ! awk 'NF {found = 1} END {exit !found}' "$TMPD/roster"; then
+  printf 'cell roster=cannot-measure why=roster-empty detail=no-usable-label-in-the-roster\n'
+  printf 'summary cells=0 measured=0 unmeasured=UNKNOWN registry=%s registry_unread=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN unjoinable=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' \
+    "$reg_total" "$reg_unread"
+  exit 2
 fi
 
 # ⛔ A `--box` THE ROSTER DOES NOT CARRY IS A REFUSAL, NOT A SMALLER FLEET. A typo (or a label the
@@ -415,7 +454,7 @@ done
 while read -r box <&3; do
   [ -n "$box" ] || continue
   if [ -n "$ONLY_BOXES" ]; then
-    case " $ONLY_BOXES " in *" $box "*) : ;; *) continue ;; esac
+    case " $ONLY_BOXES " in *" $box "*) : ;; *) skipped=$((skipped + 1)); continue ;; esac
   fi
   cells=$((cells + 1))
   root="$FLEET_ROOT"; note=""
@@ -455,7 +494,11 @@ while read -r box <&3; do
       2)   tok="pool-unreadable" ;;
       *)   tok="transport-unreachable" ;;
     esac
-    printf 'cell label=%s read=cannot-measure why=%s rc=%s detail=%s\n' "$box" "$tok" "$rc" "${why:-no-output}"
+    # ⛔ THE PRODUCER'S OWN TOKEN WINS OVER THE rc-DERIVED ONE (review cycle 2, P3): `cwhy` was
+    # computed two lines above and then dropped, so `cannot-measure why=pool-tool-absent` (a peer with
+    # no clone) printed `why=pool-unreadable` — the same word as an unreadable root or instance, for
+    # four different causes a consumer must branch on differently.
+    printf 'cell label=%s read=cannot-measure why=%s rc=%s detail=%s\n' "$box" "${cwhy:-$tok}" "$rc" "${why:-no-output}"
     unmeasured=$((unmeasured + 1)); continue
   fi
   # ⛔ A COMPLETE BLOCK WITH A NON-ZERO PRODUCER rc IS NOT A MEASUREMENT (review P1-1). `status`
@@ -524,7 +567,7 @@ while read -r box <&3; do
     elif [ -z "$hit" ]; then
       verdict="unregistered"; unregistered=$((unregistered + 1)); not_ok=$((not_ok + 1))
     elif [ "$rstatus" = "offline" ]; then
-      verdict="github-offline"; not_ok=$((not_ok + 1)); disagreements=$((disagreements + 1))
+      verdict="github-offline"; not_ok=$((not_ok + 1))
     elif [ "${rstatus}" != "online" ]; then
       verdict="github-unreadable"; not_ok=$((not_ok + 1))
     else
@@ -536,6 +579,11 @@ while read -r box <&3; do
     if [ -z "$rstatus" ]; then
       if [ -n "$hit" ]; then gshow="unread"; else gshow="ABSENT"; fi
     else gshow="$rstatus"; fi
+    # ⛔ THE DISAGREEMENT IS COUNTED INDEPENDENTLY OF WHICH VERDICT WON (review cycle 2, P3): the
+    # `-n "$dtok"` arm sits before the offline arm, so a row carrying BOTH a tmpdir defect and
+    # `github=offline` never reached `disagreements++` and the summary printed `disagreements=0` on a
+    # box that had one — the counter the docs advertise as "the disagreements between the two sources".
+    [ "$rstatus" = "offline" ] && disagreements=$((disagreements + 1))
     printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=%s busy=%s registry=%s verdict=%s\n' \
       "$box" "$name" "${ghname:--}" "${listener:--}" "$state" "$gshow" "${rbusy:-?}" "${rrepo:--}" "$verdict"
     [ -n "$ghname" ] && printf '%s\t%s\t%s\n' "$ghname" "$box" "$name" >>"$TMPD/claim"
@@ -547,18 +595,41 @@ done 3<"$TMPD/roster"
 # requested cell was measured AND every registry was read; while either is short the name may live in
 # the part that was not read, and calling it a phantom would send an operator to `reclaim` a
 # registration that is serving jobs.
+# ⛔ RUNNER NAMES ARE UNIQUE PER REPO, NOT ACROSS REPOS (review cycle 2, P2): this report reads TWO
+# registries by default, so one local row matching one name must not "claim" that name in BOTH — it
+# counted `claimed=2` for one runner AND swallowed the second registry's registration, which is
+# exactly the lost-its-box class clause 2 exists for. A name carried by more than one registry is
+# attributed to the FIRST and the rest are an abstention, named.
+# ⛔ NO PIPE INTO A QUIET GREP (scripts/check-no-sigpipe-grep.sh's class): both tables are built once,
+# then read as FILE ARGUMENTS, so a truncated reader cannot turn a valid answer into a SIGPIPE failure.
+awk -F'\t' '{c[$1]++} END {for (n in c) if (c[n] > 1) print n}' "$TMPD/reg" >"$TMPD/ambig"
+awk -F'\t' '!seen[$1]++ { print $1 "\t" $2 }' "$TMPD/reg" >"$TMPD/regfirst"
 while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
   [ -n "$rname" ] || continue
   if awk -F'\t' -v n="$rname" '$1==n {found=1} END {exit !found}' "$TMPD/claim"; then
+    if grep -qxF -- "$rname" "$TMPD/ambig"; then
+      # the FIRST registry carrying this name is the attribution; every later one is an abstention
+      if grep -qxF -- "$rname"$'\t'"$rrepo2" "$TMPD/regfirst"; then
+        reg_claimed=$((reg_claimed + 1)); continue
+      fi
+      reg_unclaimed=$((reg_unclaimed + 1)); unjoinable=$((unjoinable + 1))
+      printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(name-carried-by-more-than-one-registry)\n' \
+        "$rname" "$rrepo2" "$rstatus2"
+      continue
+    fi
     reg_claimed=$((reg_claimed + 1)); continue
   fi
   reg_unclaimed=$((reg_unclaimed + 1))
-  if [ "$unmeasured" -eq 0 ] && [ "$reg_unread" -eq 0 ]; then
+  if [ "$unmeasured" -eq 0 ] && [ "$skipped" -eq 0 ] && [ "$reg_unread" -eq 0 ]; then
     printf 'registry-unclaimed name=%s registry=%s status=%s reason=no-measured-cell-claims-it\n' "$rname" "$rrepo2" "$rstatus2"
     not_ok=$((not_ok + 1))
   else
     why=""
     [ "$unmeasured" -gt 0 ] && why="${unmeasured}-cell-unmeasured"
+    if [ "$skipped" -gt 0 ]; then
+      [ -n "$why" ] && why="$why,"
+      why="${why}${skipped}-cell-not-requested"
+    fi
     if [ "$reg_unread" -gt 0 ]; then
       [ -n "$why" ] && why="$why,"
       why="${why}${reg_unread}-registry-unread"

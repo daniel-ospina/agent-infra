@@ -763,7 +763,10 @@ three different places an operator must go (`unmeasured=` a CELL, `registry_unre
 - a **complete block behind a non-zero producer rc**. `ci_runner_pool.sh status` exits **2** for "a
   PARTIAL MEASUREMENT" and still prints `host=`, every row and `summary` — its own words are that
   `slots=` then "counts a PARTIAL pool". A block alone is not a measurement; the complete-reading codes
-  are 0 and 3, and anything else reports the producer's own `why=` token (e.g. `why=pool-root-incomplete`).
+  are 0 and 3, and anything else reports the producer's own `why=` token (e.g.
+  `why=pool-root-incomplete`) where it printed one; an rc=2 shape that prints NO refusal line (the
+  UNPROBED-quarantine case, whose probe stderr the producer discards) reports the report's own
+  `why=pool-partial`, which is named as such so it cannot be mistaken for a producer token.
 - an **unclassifiable line**. A row is recognised by its STATE column being one the producer prints;
   any other non-blank line refuses the whole cell (`why=block-unparseable`) instead of certifying the
   rows the parser happened to understand. Measured: an instance directory whose name contains a space
@@ -777,10 +780,19 @@ three different places an operator must go (`unmeasured=` a CELL, `registry_unre
   `github-unreadable`. A whitespace split collapsed that empty field to `github=false … verdict=ok`.
 
 The same fail-closed rule governs **attribution**: a registry name no cell claims is a phantom only when
-**every** requested cell was measured **and** every registry was read; while either is short it is
+**every** requested cell was measured **and** every registry was read; while either is short — or a box was excluded by `--box` — it is
 `cannot-attribute` (the reason names which side), because that registration may be serving jobs in the
-part nobody could read. A `defect` token is carried **verbatim** (`verdict=defect-tmpdir-mode:755`), so
-the remedy printed is the one the defect needs (`chmod 700`, not `restart`). Exit `0` all measured and
+part nobody could read. A `defect` token is carried through with `=` rendered as `:`
+(`verdict=defect-tmpdir-mode:755`), so the remedy printed is the one the defect needs (`chmod 700`,
+not `restart`).
+
+⛔ **`--box` is a SCOPE, not a claim that the rest of the fleet does not exist.** The boxes it excludes
+are counted: a registration they carry is `cannot-attribute(<N>-cell-not-requested)`, never a phantom,
+so a scoped run never prints advice whose remedy is `reclaim` on a live runner. A name carried by
+**more than one registry** (names are unique per repo, and two registries are read by default) is
+attributed to the first and the rest are `cannot-attribute(name-carried-by-more-than-one-registry)` —
+one local row cannot claim the same name in both, which would both miscount `claimed=` and swallow the
+second registry's registration (the lost-its-box class clause 2 exists for). Exit `0` all measured and
 agreed · `2` cannot measure (outranks 3; any of the three counters non-zero) · `3` measured with a named
 defect.
 
