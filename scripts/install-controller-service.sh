@@ -32,6 +32,11 @@ fi
 # Restart=always within RestartSec) and `start` starts the unit when one is enabled (a tmux controller
 # beside an enabled unit is two dispatchers on one queue, #1761).
 #
+# ⛔ AND THE UNIT NAMES A PATH THAT OUTLIVES THE SHELL THAT RENDERED IT (agent-infra#2697). `Existing at
+# render time` is not a property systemd can rely on at boot, so the resolved supervisor is refused when it
+# cannot survive a cleaning (see `scratch_supervisor_reason`), and the revision it names is RECORDED in the
+# unit's environment (`ORCH_SUPERVISOR_PIN`) so `merged ≠ running` is a readable fact rather than a guess.
+#
 # INSTALL TARGETS, tried in this order, and the reason is named in the output:
 #   1. a SYSTEM unit via passwordless sudo (/etc/systemd/system) — the cell's normal shape; the service
 #      runs as the invoking user, so the state dir, keys.env and gh auth are the operator's, not root's.
@@ -51,6 +56,17 @@ fi
 # Env seams (tests + unusual cells):
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
+#                          ⛔ REFUSED when it resolves into a lane worktree, or under a temporary root that no
+#                          deployment root declares (agent-infra#2697): a unit whose ExecStart a cleaning
+#                          removes retries a 127 for ever while every surface reads supervised. The refusal
+#                          names the durable alternatives (the farm, $AGENT_INFRA_PATH/scripts, the harness pin)
+#   ORCH_SUPERVISOR_PREFER a CALLER's preference (cloud-cell-bringup.sh names the layer checkout it just
+#                          installed). A non-durable one is SKIPPED with a loud note and the next candidate is
+#                          used — a preference never silently becomes the boot entry point, and it never
+#                          withholds the unit a durable candidate can supply
+#   AGENT_INFRA_PATH       the checkout this box declares as its deployment surface — one of the roots the
+#                          ExecStart refusal accepts under a temporary root (the cells keep their home under
+#                          /tmp, so "under /tmp" alone cannot be the rule)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
 #   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 60; a whole number, and one that fits
 #                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install).
@@ -134,18 +150,173 @@ help_text() {
 # ⛔ RESOLVED AND PROVEN TO EXIST BEFORE ANYTHING IS RENDERED. A unit whose ExecStart names a missing file
 # is the inert-enforcer shape: `enable --now` succeeds, `is-active` says active, and every restart is a
 # 127 with no controller — a supervised-looking box that dispatches nothing.
+#
+# ⛔ AND IT MUST STILL RESOLVE AFTER THE BOX STOPS TOUCHING IT (agent-infra#2697). Existing-at-render-time
+# was the ONLY guard on the rendered value, so the installer happily pinned the fleet's dispatcher to
+# whatever checkout the operator happened to run `--install` from. MEASURED on cell-1:
+# `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start`, i.e. a LANE WORKTREE at a
+# branch nobody merged (`fix/2402-fence-and-scope`). Two silent consequences: `/tmp` entries are dropped by
+# `systemd-tmpfiles --clean` ten days after they are last touched (`/tmp` is not its own mount on these
+# cells, so the CLEANER, not a reboot, is the mechanism) — after which the unit's ExecStart cannot resolve,
+# `Restart=always` retries a 127 for ever, `is-active` reads `activating`, and NOTHING pages — and the code
+# the dispatcher runs is a branch nobody merged. Same seam, three cells, three different ExecStart shapes,
+# all of them "whatever was beside the installer". Measured again on cell-4 in the shape a TEST render
+# leaves behind: `ExecStart="/usr/local/bin/python3.12" "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r"
+# --dry-run`, timer enabled and failing every ten minutes since 2026-10-30.
+#
+# ⛔ WHAT IS DURABLE IS DECIDED BY THE ROOT THE PATH RESOLVES INTO, NOT BY ITS SPELLING, AND NOT BY "is it
+# under /tmp". The cells keep their home under `/tmp` (`/tmp/cell-home`) and their harness pin at
+# `/tmp/cell-home/harness/<sha>/…` — the CORRECT ExecStart shape, measured on cell-3 — so a rule that
+# refused `/tmp` outright would refuse every healthy cell install. That is the same false block
+# `runner_autoscale.py` records against a blanket refusal ("refusing would make --install-unit unusable ON
+# THE BOXES IT EXISTS FOR"), and this guard must not reintroduce it. So: a path under a temporary root is
+# accepted only while it is inside a root THIS BOX DECLARES as its deployment surface (its cell home, its
+# home, the checkout `$AGENT_INFRA_PATH` names), and a lane worktree (`/.worktrees/`) is refused wherever it
+# lives, because that is the directory a lane removes when it ends.
+# ⛔ THE TEMPORARY-ROOT LIST IS THE ONE `scripts/orchestrator-harness/runner_autoscale.py` ALREADY USES for
+# the same judgement (`TRANSIENT_UNIT_PREFIXES`). Two lists would drift, and the copy that stays un-updated
+# would be the one that admits the next measured shape. `$TMPDIR` joins it because a fixture — or a box with
+# a relocated temp — is under whatever it says.
+TRANSIENT_ROOTS="/tmp /var/tmp /run /dev/shm /var/folders /private/tmp /private/var/tmp /private/var/folders"
+
+# path_under <path> <root> — true when <path> IS <root> or inside it. Both already resolved by canon_dir.
+path_under() {
+    local p="${1%/}" r="${2%/}"
+    [ -n "$r" ] && [ "$r" != "/" ] || return 1
+    case "$p" in "$r"|"$r"/*) return 0 ;; esac
+    return 1
+}
+
+# canon_file <path> — the physical path of a FILE. `canon_dir` resolves a DIRECTORY (and follows a symlinked
+# leaf through realpath/readlink -f), but its last resort is `cd && pwd -P`, which a file cannot do — so on a
+# box where neither `realpath` nor `readlink -f` answers, canon_dir reports EVERY file as unresolved and this
+# guard would refuse a perfectly durable supervisor. That is a false block, so the fallback resolves the
+# CONTAINING DIRECTORY and re-appends the name.
+# ⛔ AND THE FALLBACK DOES NOT GET TO FAIL OPEN ON A SYMLINKED LEAF. Resolution is what sees through an alias
+# (the measured #2666 escape: `ln -s /etc/systemd/system.control $T/alias` was ADMITTED by a literal match), so
+# when the leaf IS a symlink and nothing here can follow it, the answer is "cannot prove" → the caller refuses.
+canon_file() {
+    local f="${1:-}" out d
+    out="$(canon_dir "$f")"
+    case "$out" in "$CANON_UNRESOLVED"*) ;; *) printf '%s\n' "$out"; return 0 ;; esac
+    [ -L "$f" ] && { printf '%s\n' "$out"; return 0; }
+    d="$(canon_dir "$(dirname "$f")")"
+    case "$d" in "$CANON_UNRESOLVED"*) printf '%s\n' "$out"; return 0 ;; esac
+    printf '%s/%s\n' "${d%/}" "$(basename "$f")"
+}
+
+# scratch_supervisor_reason <resolved supervisor> — prints WHY this path is not boot-durable, or nothing
+# when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
+# refused for the same reason the #2666 unit-dir guard resolves before it grades.
+scratch_supervisor_reason() {
+    local p="${1:-}" d root="" declared=""
+    case "$p" in
+        */.worktrees/*)
+            printf 'it is inside a lane worktree (%s), which is removed when that lane ends — the branch it names is not merged anywhere' "${p%%/.worktrees/*}/.worktrees"
+            return 0 ;;
+    esac
+    for d in $TRANSIENT_ROOTS ${TMPDIR:-}; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
+        path_under "$p" "$d" && { root="$d"; break; }
+    done
+    [ -n "$root" ] || return 1      # not under any temporary root: durable wherever it is
+    for d in "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:-}"; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
+        path_under "$p" "$d" && { declared="$d"; break; }
+    done
+    [ -z "$declared" ] || return 1
+    printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries 10 days after they are last touched), and it is under none of the deployment roots this box declares (CELL_HOME=%s, HOME=%s%s)' \
+        "$root" "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
+    return 0
+}
+
 SUPERVISOR=""
 resolve_supervisor() {
-    local c
-    for c in "${ORCH_SUPERVISOR:-}" \
-             "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" \
-             "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
-        [ -n "$c" ] && [ -f "$c" ] && { SUPERVISOR="$c"; break; }
+    # ⛔ TWO KINDS OF CANDIDATE, AND THE DIFFERENCE IS WHO DECIDED (agent-infra#2697). `ORCH_SUPERVISOR`
+    # is the OPERATOR's requirement for this box — a non-durable one is REFUSED, never silently swapped for
+    # something else, because the operator named exactly what the unit should run. `ORCH_SUPERVISOR_PREFER`
+    # is a CALLER's preference: `cloud-cell-bringup.sh` names the layer checkout it has just installed, so
+    # the unit runs the layer's code rather than a possibly-stale farm (that call site's recorded reason).
+    # On a durable checkout the preference is honoured unchanged; on a LANE WORKTREE — the measured #2697
+    # shape — it is SKIPPED with a loud note instead of arming a unit at a path a lane reaps. What counts as
+    # durable still has exactly ONE owner (this guard), so the two call sites cannot drift apart.
+    local c r why hard i beside
+    local -a cands candk
+    beside="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"
+    cands=( "${ORCH_SUPERVISOR:-}" "${ORCH_SUPERVISOR_PREFER:-}" \
+            "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" "$beside" )
+    candk=( 1 0 0 0 )
+    for i in 0 1 2 3; do
+        c="${cands[$i]}"; hard="${candk[$i]}"
+        [ -n "$c" ] && [ -f "$c" ] || continue
+        # ⛔ THE VALUE THE UNIT NAMES IS THE VALUE THAT WAS GRADED — resolved, not as spelled, for the same
+        # reason `systemd_unit_dir_refusal` grades the resolved unit directory: otherwise the guard and the
+        # ExecStart line can describe two different files whenever either path has a symlink in it.
+        r="$(canon_file "$c")"
+        case "$r" in
+            "$CANON_UNRESOLVED"*)
+                err "REFUSING: cannot resolve '$c' to a physical path, so whether the unit's ExecStart would survive a cleaning cannot be shown — a broken symlink and a directory this user cannot read both look like this. Point ORCH_SUPERVISOR at a readable, resolved path."
+                return 1 ;;
+        esac
+        if why="$(scratch_supervisor_reason "$r")"; then
+            if [ "$hard" = 1 ]; then
+                err "REFUSING to render an ExecStart that will not survive this box: $r"
+                err "  $why."
+                err "  This is the agent-infra#2697 shape, and it fails SILENTLY: once that path is gone the unit's"
+                err "  ExecStart cannot resolve, Restart=always retries a 127 for ever, is-active reads activating,"
+                err "  and nothing pages — while the fleet believes this box has a supervisor."
+                err "  Name a DURABLE supervisor instead, any one of:"
+                err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm: bash pi-bootstrap/setup.sh)"
+                err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh"
+                err "    $CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh   (the harness pin)"
+                err "  …or pass one explicitly: ORCH_SUPERVISOR=<that path> bash $0 --install"
+                return 1
+            fi
+            # A PREFERENCE, not a requirement: say so loudly and fall through to the next candidate.
+            err "note: NOT rendering ExecStart from $r — $why."
+            err "  Falling through to the next durable candidate (the #2697 refusal, applied to a CALLER's"
+            err "  preference: ORCH_SUPERVISOR_PREFER — an explicit ORCH_SUPERVISOR would have been refused)."
+            continue
+        fi
+        SUPERVISOR="$r"
+        break
     done
     [ -n "$SUPERVISOR" ] || {
-        err "cloud-cell-supervisor.sh not found — looked at \$ORCH_SUPERVISOR, \$HOME/.pi/agent/scripts, and beside this installer. Farm it first: bash pi-bootstrap/setup.sh"
+        err "no DURABLE cloud-cell-supervisor.sh to render — looked at \$ORCH_SUPERVISOR, \$ORCH_SUPERVISOR_PREFER, \$HOME/.pi/agent/scripts, and beside this installer."
+        err "  A unit whose ExecStart a cleaning removes is not supervised: Restart=always retries a 127 for ever,"
+        err "  is-active reads activating, and nothing pages (agent-infra#2697). Farm it first, or name a durable copy:"
+        err "    bash pi-bootstrap/setup.sh   # farms \$HOME/.pi/agent/scripts"
+        err "    ORCH_SUPERVISOR=$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh bash $0 --install"
+        err "  Durable roots this box declares: CELL_HOME=$CELL_HOME, HOME=$HOME${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
         return 1
     }
+    supervisor_pin
+}
+
+# ⛔ RECORD THE REVISION THE UNIT WILL RUN, NOT JUST THE PATH (agent-infra#2697, third bullet). The other
+# half of the measured defect was that NOTHING recorded which code a box executes: cell-4's farmed copy was
+# sha 9228492e… of Oct 23 while `main` was 1680457a…, and the only way to learn that was `git -C` guessing
+# at a path the unit merely names. Rendered into the unit's ENVIRONMENT it is readable from
+# `systemctl show eldato-orchestrator -p Environment` and from `--status`, and the controller process
+# inherits it, so "which revision is this box running" stops being an inference.
+# ⛔ IT IS AN OBSERVATION, NOT A GATE: a supervisor outside any git work tree (a farmed copy, an unpacked
+# tarball) is legitimate and records `unknown@unknown`. Refusing it would be a false block on the shape the
+# farm actually produces, and this installer must never withhold a supervisor over a diagnostic.
+SUPERVISOR_PIN=""
+supervisor_pin() {
+    local dir repo="" sha=""
+    dir="$(dirname "$SUPERVISOR")"
+    if command -v git >/dev/null 2>&1; then
+        repo="$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || repo=""
+        sha="$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
+    fi
+    case "$sha" in ''|*[!0-9a-f]*) sha="unknown" ;; esac
+    [ -n "$repo" ] || repo="unknown"
+    SUPERVISOR_PIN="${repo}@${sha}"
     return 0
 }
 
@@ -353,6 +524,7 @@ render() {
         -e "s|{{ENV_FILE}}|$(sed_esc "$ENV_FILE")|g" \
         -e "s|{{PATH}}|$(sed_esc "$PATH")|g" \
         -e "s|{{SUPERVISOR}}|$(sed_esc "$SUPERVISOR")|g" \
+        -e "s|{{SUPERVISOR_PIN}}|$(sed_esc "$SUPERVISOR_PIN")|g" \
         -e "s|{{RESTART_SEC}}|$RESTART_SEC|g" \
         -e "s|{{START_TIMEOUT_SEC}}|$START_TIMEOUT_SEC|g" \
         -e "s|{{HANDOVER_TIMEOUT_SEC}}|$HANDOVER_TIMEOUT_SEC|g" \
@@ -378,6 +550,7 @@ verify_unit() {
              "Environment=CONTROLLER_ORPHAN_TIMEOUT=$START_TIMEOUT_SEC" \
              "Environment=CONTROLLER_HANDOVER_TIMEOUT=$HANDOVER_TIMEOUT_SEC" \
              "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
+             "Environment=ORCH_SUPERVISOR_PIN=$SUPERVISOR_PIN" \
              "Environment=CONTROLLER_UNIT=$UNIT_NAME" \
              "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
              "WantedBy=${WANTED_BY:-multi-user.target}"; do
@@ -1026,6 +1199,12 @@ do_status() {
         fi
     fi
     log_line "unit=$UNIT_NAME target=$TARGET"
+    # ⛔ WHICH REVISION BOOTS THIS BOX, read off the INSTALLED artifact (agent-infra#2697). Informational
+    # only: a unit rendered before the pin existed prints `absent`, and that is exactly the fact an operator
+    # needs (re-render to record it) — it never moves the verdict, because supervision is not the pin.
+    local _pin=""
+    _pin="$(sed -n 's|^Environment=ORCH_SUPERVISOR_PIN=||p' "$UNIT_DIR/$UNIT_NAME" 2>/dev/null | head -1)"
+    log_line "supervisor_pin=${_pin:-absent (rendered before the pin was recorded — re-render with --install)}"
     # ⛔ NAME A COPY THAT IS NOT THIS STATE DIR'S, INSTEAD OF ANSWERING FOR IT (review P1, #2402). Silence
     # here is what made this verb's rc 0 readable as "my cell is supervised" on a box whose only unit belongs
     # to another state dir. It is reported on its own line and never addressed: the manager answers about the

@@ -246,6 +246,15 @@ export SYSTEMD_UNIT_DIR="$T/systemd-units"
 # directory is derived from it.
 export CONTROLLER_SYSTEM_UNIT_DIR="$T/systemd-units"
 export HOME="$T/home"
+# ⛔ THE FIXTURE FARMS THE SUPERVISOR, AND THAT IS NOT COSMETIC (agent-infra#2697). `check_controller_service`
+# hands the installer the LAYER's supervisor as a PREFERENCE, and the installer SKIPS it when it cannot survive
+# a cleaning — which is the case whenever this suite runs from a lane worktree (`.worktrees/`), the exact
+# shape #2697 measured. What it falls through to is this farm, so a fixture home with an empty
+# `.pi/agent/scripts` would leave the controller install with nowhere durable to land. A cell whose farm has
+# no supervisor (#1938's named residual) is the shape that then gets the installer's loud refusal — correct
+# on a worktree, and not what these arms are about.
+mkdir -p "$T/home/.pi/agent/scripts"
+cp "$HERE/cloud-cell-supervisor.sh" "$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
 # The one-home check (#2916) refuses a cell-state path under a volatile root that is NOT under
 # CELL_HOME. This fixture's home IS under the host's temp dir, so the shipped default (`/tmp:/var/tmp`)
 # would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
@@ -553,6 +562,37 @@ if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
 else
   bad "no controller unit was installed under $T/systemd-units"
 fi
+# ⛔ AND ITS ExecStart MUST BE A PATH THAT OUTLIVES THE LANE (agent-infra#2697). The bring-up prefers the
+# LAYER's supervisor; when the layer IS a lane worktree that preference must be skipped, never rendered — a
+# unit whose ExecStart a lane reap removes retries a 127 for ever while every surface reads supervised. This
+# assertion is location-independent on purpose: on a durable checkout the layer path IS correct, and on a
+# worktree the farm is.
+case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eldato-orchestrator.service" 2>/dev/null | head -1)" in
+  */.worktrees/*) bad "the controller unit's ExecStart is a LANE WORKTREE path — the measured #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
+  '') bad "the controller unit carries no readable ExecStart — cannot tell what this box would boot" ;;
+  *) ok "the controller unit's ExecStart is not a lane worktree — it survives the lane that installed it" ;;
+
+esac
+
+# ⛔ AND WITH NO FARM THERE IS NOTHING DURABLE LEFT, SO THE RUN MUST **REFUSE** RATHER THAN ARM THE WORKTREE.
+# This is the discriminating half of the arm above: a fixture that always has a farm would pass on pre-#2697
+# code too (the pre-fix installer ignores ORCH_SUPERVISOR_PREFER and picks the farm), while the shape this
+# fleet actually hit — install from a lane worktree with no farm — is exactly where the old code armed
+# `/tmp/wt-*` as the boot entry point. Measured before the fix: this run exits 0 with a worktree ExecStart.
+FARMED_SUP="$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
+mv -f "$FARMED_SUP" "$FARMED_SUP.aside" 2>/dev/null
+rm -f "$T/systemd-units/eldato-orchestrator.service"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "with no farm the bring-up REFUSES to supervise the controller from a transient checkout (rc=$BR_RC)" \
+                   || bad "the bring-up installed a controller unit with no durable supervisor available — the #2697 defect, re-shipped"
+if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
+  bad "a refused controller check still left a unit behind — a boot-armed path a cleaning removes: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")"
+else
+  ok "…and it wrote NO unit (fail-closed, never a half-install)"
+fi
+mv -f "$FARMED_SUP.aside" "$FARMED_SUP" 2>/dev/null
+rm -f "$T/systemd-units/eldato-orchestrator.service"
 
 say_case "a cell whose CONTROLLER cannot be supervised is refused (not certified)"
 # A REAL installer that fails is the shape: the fix must not be "install it, ignore the exit code".
