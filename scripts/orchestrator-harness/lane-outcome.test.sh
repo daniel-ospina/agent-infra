@@ -274,8 +274,12 @@ hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment this lane
     "1f3b …nor do the NOT-started lines, which are the ones an operator reads in the lane log"
 hasnt "$(cat "$(LOG)" 2>/dev/null)" "credential \$" \
     "1f3c …nor does any line call the credential MISSING for a verdict about the FILE"
-has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
-    "1f4 …it names the FILE the operator must repair or delete"
+# ⛔ SCOPED TO THE LANE'S OWN SENTENCE (round 28, P2, measured): a bare `has "$(cat LOG)" "auth.json"` is satisfied by
+# the GATE's refusal line, which always names `${agent_dir}/auth.json` in the same log — so deleting the file from
+# `lane.sh`'s remedy left every one of these arms GREEN. The lane's sentences are the only ones that carry the words
+# `credential STORE`, so that is the text the assertion is about.
+has "$(grep -F 'credential STORE' "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1f4 …the LANE's own remedy names the FILE the operator must repair or delete (not just the gate's line)"
 # ⛔ AND NO REMEDY NAMES A VARIABLE THAT DOES NOT EXIST (round 25, P3, measured): on a box with NO models.json template
 # the gate sets `KEY_GATE_VAR` to the literal `<none>`, and the store sentence below printed "exporting $<none>" — a
 # shell token, inside an instruction the operator is meant to follow. The clause is now dropped when there is no name.
@@ -291,8 +295,8 @@ drive "$WT"
 check_terminal "1h" refused "key-gate:store-invalid:<none>" 82
 hasnt "$(cat "$(LOG)" 2>/dev/null)" 'exporting $<none>' \
     "1f5 …and no remedy tells an operator to export the sentinel $<none>, on the shape that produces it"
-has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
-    "1h2 …while the remedy still names the file to repair"
+has "$(grep -F 'credential STORE' "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1h2 …while the LANE's remedy still names the file to repair"
 
 # ⛔ AND THE NO-TEMPLATE CLAUSE IS A WHOLE SENTENCE (round 26, P3, measured): dropping only the export half left a
 # dangling conjunction — "and neither a models.json template rescues that" — which also claims a template exists on the
@@ -319,8 +323,8 @@ eqv "$(printf '%s' "$(lastline | sed -n 's/.*reason=\(key-gate:[^ ]*\).*/\1/p')"
     "1g2 the token carries the unreadable-STORE reason, not the credential-missing default"
 hasnt "$(cat "$(LOG)" 2>/dev/null)" "holds no value in the environment this lane would run with" \
     "1g3 …and no line prescribes exporting the variable for a verdict about the FILE"
-has "$(cat "$(LOG)" 2>/dev/null)" "auth.json" \
-    "1g4 …while the remedy names auth.json, which is what has to be repaired"
+has "$(grep -F 'credential STORE' "$(LOG)" 2>/dev/null)" "auth.json" \
+    "1g4 …while the LANE's remedy names auth.json, which is what has to be repaired"
 [ ! -s "$PI_MARK" ]; ck "1g5 pi was never spawned for an unreadable store" $?
 [ ! -s "$PI_MARK" ]; ck "1f5 pi was never spawned for a store verdict" $?
 
