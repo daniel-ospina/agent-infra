@@ -918,6 +918,23 @@ p4_seed pr-3209 weird3203 HAVOC 700000 >/dev/null
 outP4CE=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 \
               && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
 ck "A30 [RED→GREEN] a ~31-year override is clamped to the 7-day ceiling, so the bound stays a BOUND" "pruned unreadable-lease refs/claims/pr-3209" "$outP4CE"
+# ⛔ THE CEILING'S OWN CAP IS AN ARM, AND IT WAS PINNED NOWHERE (review round 23, agent-infra#3203).
+# `claims.sh` states it as "a LITERAL, not a knob", but `git grep MAX_AGE_CEIL` finds the knob in
+# `claims.sh` ONLY: no assertion referenced it, and A30 above overrides `CLAIM_UNREADABLE_LEASE_MAX_AGE`
+# ALONE — its 700000 s fixture is past BOTH 604800 and 2592000, so it cannot tell the default ceiling
+# from the hard cap. Measured: deleting the cap line left the suite at 242 passed / 0 failed, and with
+# BOTH vars at 999999999 the bound resolved to 999999999 (~31 years) and a 3000000 s-old claim was
+# KEPT — the eternal block this PR exists to end, restored as configuration.
+# So the DECISION is asserted, not merely the value: the fixture is INSIDE the raised bound and PAST
+# the capped one, which is the only interval that distinguishes the two.
+p4_seed pr-3226 weird3203 HAVOC 3000000 >/dev/null
+outP4CAPR=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
+                 CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
+                 && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+echo "  prune with BOTH bound knobs at 999999999 over a 3000000s-old claim:"; printf '%s\n' "$outP4CAPR" | sed 's/^/    /'
+ck "A30b [RED→GREEN] the CEILING is itself hard-capped at 30 days, so a raised CEIL knob cannot make the bound eternal" "PAST the 2592000s bound" "$outP4CAPR"
+p4_has pr-3226 && P4CAPK=1 || P4CAPK=0
+ck "A30c [RED→GREEN] ...so the claim is really REAPED (the cap is a bound, not a message)" "^0$" "$P4CAPK"
 # AN UNMEASURABLE AGE MUST NOT BECOME A FABRICATED ONE (review, agent-infra#3203 — T3). A ref that
 # points at a NON-COMMIT object has no committer stamp: _claim_commit_time returns rc 1, so the age is
 # unmeasurable. Without the `-z "$ct"` guard the arithmetic invents an age from nothing and REAPS.
@@ -1006,6 +1023,19 @@ ck "A48 [RED→GREEN] a locale-collated NON-ASCII digit lease is unreadable, not
 outP4HU=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
              && _claim_lease_state "$(( P4NOW + 900 ))" "20000000000000000000" ) 2>&1 )
 ck "A49 [RED→GREEN] a clock ABOVE 2**63 that ERRORS the comparison answers unknown, never expired" "unknown" "$outP4HU"
+# ⛔ AND THE 13-CHARACTER ARM IS ITS OWN ARM (review round 23, agent-infra#3203). The 20-digit shape
+# above is ALSO caught DOWNSTREAM — `[ ]` errors, `$?` is 2, the `case "$?"` arm answers `unknown` —
+# so deleting the `?????????????*` alternative left EVERY existing clock fixture green. But the 13–18
+# digit window does NOT error: a `date` shim reporting epoch MILLISECONDS gives
+# `[ 1700000000000 -le <a 10-digit lease> ]` → rc **1** → `expired` ⇒ FREE. That arm is load-bearing at
+# `claim-reaper.sh`'s `_lease_is_live` call, whose own `CR_NOW` guard is shape-only. Asserted at BOTH
+# the state reader and the polarity wrapper, because `expired` is only a steal when the wrapper agrees.
+outP4MS=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+             && _claim_lease_state "$(( P4NOW + 900 ))" "1700000000000" ) 2>&1 )
+ck "A49b [RED→GREEN] an epoch-MILLISECONDS clock (13 digits) answers unknown, never expired" "^unknown$" "$outP4MS"
+outP4MSL=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+               && _lease_is_live "$(( P4NOW + 900 ))" "1700000000000"; printf '%s' "$?" ) 2>&1 )
+ck "A49c [RED→GREEN] ...and the polarity wrapper still says DO NOT STEAL for it (rc 0)" "^0$" "$outP4MSL"
 # TWO `committer` HEADERS (review, agent-infra#3203): git dates a commit from the LAST one, so a crafted
 # commit can carry `committer … 1 +0000` then `committer … <now> +0000` — a `head -n 1` reader dates it
 # 1970 and REAPS a claim that is seconds old, while `git log` says it is fresh. `git hash-object -t commit
