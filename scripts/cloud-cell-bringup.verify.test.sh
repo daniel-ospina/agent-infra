@@ -270,7 +270,7 @@ cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() 
 # session whose named state dir does NOT exist is a DEAD peer (a retired pin root / removed cell
 # home), and since 6b6daa49 the supervisor REPLACES it deliberately ("belongs to the retired state
 # dir … replacing it") rather than dying — with no way to clear a dead one, `start` could never
-# succeed again. So the peer's state dir (`$T/peer6`, below) must EXIST here: it does, therefore
+# succeed again. So the fixture's peer dir (a few lines below) must EXIST here: it does, therefore
 # the supervisor must refuse and print the remedy. The fixture used to hard-code
 # `O='/other/cell/orchestrator'` and never create it, which put the arm on the pre-#2315 branch and
 # made it red on a correct supervisor. Note what does NOT discriminate here: the "message carries
