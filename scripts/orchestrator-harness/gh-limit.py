@@ -93,6 +93,33 @@
 # `events.log`; only a FINAL FAILURE (where the call is already non-zero and the caller already
 # prints stderr) is written to stderr.
 #
+# ⛔ WHICH CREDENTIAL (#3429) — THIS LAYER CHOOSES IT, AND ONLY HERE. Everything above bounds HOW
+# MUCH this box spends; none of it changed WHERE the spend lands, and the whole fleet's reads landed
+# on ONE 5,000/hour budget (REST `core`, per USER) that the landing rail also needs. Measured on
+# #3429: `core` reached `0/5000` at 06:10Z, 07:10Z and 07:20Z on one day (2609 → 0 in 40 minutes,
+# ~65 calls/min) while GraphQL still held 4,321; #3584 is what that costs — `provision` failed, the
+# board came back unparsable, the claim gate went INCOMPLETE, dispatch stopped, `DRAIN DEADLOCK — no
+# PR merged in 360m`.
+#
+# A GitHub App INSTALLATION token has its OWN bucket, so reads stop competing with the rail's writes.
+# `gh-cred.py` (beside this file) is the ONE decision function: given an operation it answers WHICH
+# credential and WHY, as a NAMED arm. `run()` below — the single place this layer executes the real
+# `gh` — applies that answer to the child's `GH_TOKEN`, so no call site can be forgotten and none
+# can opt out.
+#
+# ⛔ WHAT THIS CHANGE DELIBERATELY DOES NOT DO. #3429 keeps the two-bucket PACING decision function
+# as future work and never claims the App replaces it, so NOTHING below is relaxed: the core floor,
+# the budget gates, the single-flight/box lock, the documented backoff, the ETag and pass caches,
+# and the failover all behave exactly as they did. The App changes the CREDENTIAL, never the pacing.
+# Two pinned consequences make that concrete:
+#   * `purpose=meter` — `gh api rate_limit`, the probe the pacing layer reads to decide whether the
+#     ACCOUNT is out — ALWAYS uses the USER credential. Served from the app it would report the
+#     app's remaining and tell this layer the user bucket is healthy, i.e. it would disarm the very
+#     guard #3429 landed.
+#   * every arm that is not `app` is NAMED and COUNTED (`gh-cred.py --stats`), and a READ served by
+#     the user credential with no arm behind it is counted as a DEFECT — that is the regression
+#     assertion for this change, because "a read on the user bucket" is exactly the bug.
+#
 # USAGE (both entry points call this; neither reimplements it)
 #   gh-limit.py --real-gh <path>   -- <gh argv…>     # the Mac REST adapter resolves gh itself
 #   gh-limit.py --self <this shim> -- <gh argv…>     # the cell-side wrapper (`--self` is skipped
@@ -116,6 +143,16 @@ import tempfile
 import time
 
 REENTRANCY_ENV = "GH_LIMIT_LOCK_HELD"
+
+# ── the credential decision (#3429) ──────────────────────────────────────────────────────────────
+# The helper is a SIBLING, because both are deployed into ONE runtime dir by `deploy-harness.sh`
+# (`$O/gh-limit.py` and `$O/gh-cred.py`), and the same relative shape holds in `scripts/`.
+CRED_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh-cred.py")
+# The arm that served the MAIN call. It partitions the ETag/flight caches (see `_cred_digest`), so a
+# body or a 404 fetched with one credential is never replayed to the other.
+_CRED_ARM = "-"
+_CRED_CACHE = {}
+_CRED_MOD = [None]
 
 # ── configuration (env is the operator's seam; tests replace the CLOCK and the SLEEP, not the logic) ──
 def cfg(name, default):
@@ -1063,10 +1100,112 @@ class Result(object):
         self.rc, self.out, self.err, self.status = rc, out, err, status
 
 
-def run(real_gh, argv, extra=None, timeout=None):
-    cmd = [real_gh] + list(argv) + list(extra or [])
-    env = dict(os.environ)
-    env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
+# ── the credential decision, applied at the ONE place a real gh is executed (#3429) ─────────────
+def cred_helper():
+    """The `gh-cred` module, or None when it is not installed.
+
+    ⛔ A MISSING HELPER IS NAMED, NEVER SILENT. Without it every read stays on the user bucket —
+    exactly the state #3429 measured — so the arm is `no-helper`, it is logged to events.log on
+    every call, and `gh-cred.py --stats` cannot report clean because it cannot report at all. The
+    alternative (refusing the call) would take the fleet down for a missing optimisation, which is
+    a worse trade than a loud, attributable fallback.
+    """
+    if _CRED_MOD[0] is not None:
+        return _CRED_MOD[0] if _CRED_MOD[0] is not False else None
+    mod = False
+    try:
+        if os.path.isfile(CRED_HELPER):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("gh_cred", CRED_HELPER)
+            loaded = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(loaded)
+            mod = loaded
+    except Exception as exc:                      # a broken helper must not break the shim
+        log_event("gh-cred load failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+        mod = False
+    if mod is False:
+        log_event("gh-cred MISSING at %s — every call falls back to the user credential (arm=no-helper)"
+                  % CRED_HELPER)
+    _CRED_MOD[0] = mod
+    return mod if mod else None
+
+
+def cred_purpose(argv):
+    """`meter` / `introspect` / `request` — WHICH QUESTION this invocation is asking (#3429).
+
+    ⛔ THE METER IS PINNED TO THE USER CREDENTIAL, DELIBERATELY. `gh api rate_limit` is what the
+    pacing layer reads to decide whether the ACCOUNT is out; served from the installation token it
+    would report the APP's remaining, and `mark_marker_stale`/`record_recovery` would then clear a
+    live user-bucket limit — the guard disarming itself through the fix. `gh auth …` is the same
+    class in the other direction: those verbs INTROSPECT the credential on disk, so substituting a
+    token would make `gh auth token` lie."""
+    if argv[:1] == ["auth"]:
+        return "introspect"
+    if argv[:1] == ["api"]:
+        ep = api_endpoint(argv)
+        if ep is not None and ep.strip("/").lower() == "rate_limit":
+            return "meter"
+    return "request"
+
+
+def credential_for(argv):
+    """The `gh-cred` Decision for this argv. Cached per (kind, purpose) — one mint per process."""
+    mod = cred_helper()
+    if mod is None:
+        return _NoCred()
+    kind = "write" if is_mutating(argv) else "read"
+    purpose = cred_purpose(argv)
+    key = (kind, purpose)
+    if key not in _CRED_CACHE:
+        try:
+            _CRED_CACHE[key] = mod.resolve(kind, purpose, argv)
+        except Exception as exc:                  # never let a credential bug fail a gh call
+            log_event("gh-cred resolve failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+            _CRED_CACHE[key] = _NoCred()
+    return _CRED_CACHE[key]
+
+
+class _NoCred(object):
+    arm = "no-helper"
+    credential = "user"
+    token = None
+
+
+# An installation token that the App itself REJECTS must not fail the call — #3429's fourth arm. It
+# is a 401/403 whose text says the credential (not the request) is the problem, and the retry is on
+# the user credential for a READ only (a write never goes to the app, so it can never reach here).
+_APP_REFUSAL = ("resource not accessible by integration", "insufficient", "bad credentials",
+                "must have admin rights", "not accessible by personal access token")
+
+
+def _app_refused(res):
+    if res.rc == 0:
+        return False
+    blob = (res.err or b"") + (res.out or b"")
+    txt = blob.decode("utf-8", "replace").lower()
+    return any(p in txt for p in _APP_REFUSAL)
+
+
+def _app_dry(res):
+    """The app's own bucket is empty. Recorded so the NEXT call takes the `floor` arm, and the caller
+    still gets a real answer because the retry uses the user credential."""
+    blob = (res.err or b"") + (res.out or b"")
+    txt = blob.decode("utf-8", "replace").lower()
+    if "rate limit" not in txt and "abuse" not in txt:
+        return False
+    mod = cred_helper()
+    try:
+        reset = None
+        m = re.search(r"reset[=:\s]+(\d{9,})", txt)
+        if m:
+            reset = int(m.group(1))
+        mod.note_app_refusal(0, reset)
+    except Exception:
+        pass
+    return True
+
+
+def _run_child(cmd, env, timeout):
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                            timeout=timeout)
@@ -1078,6 +1217,41 @@ def run(real_gh, argv, extra=None, timeout=None):
         # call (rc 124, `timeout`'s own code), which every caller already treats as "no measurement".
         return Result(124, b"", ("gh-limit: the call did not finish within %ss\n" % timeout).encode())
     return Result(p.returncode, p.stdout, p.stderr)
+
+
+def run(real_gh, argv, extra=None, timeout=None):
+    cmd = [real_gh] + list(argv) + list(extra or [])
+    env = dict(os.environ)
+    env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
+    cred = credential_for(list(argv))
+    if cred.token:
+        # The app token is injected into the CHILD's env only. `os.environ` is left alone on purpose:
+        # `_cred_digest()` and any nested child see the box's own credential, so the identity of the
+        # cache key cannot flip depending on which arm happened to serve a call.
+        env["GH_TOKEN"] = cred.token
+        env.pop("GITHUB_TOKEN", None)
+    env["GH_CRED_SERVED_ARM"] = cred.arm
+    res = _run_child(cmd, env, timeout)
+    if cred.credential == "app" and (cred_purpose(list(argv)) == "request") and _app_refused(res):
+        # ARM 4 (#3429): the App answered "not for you". Retry ONCE on the user credential and say
+        # so. Bounded to a single retry and to reads — a write never reaches here (arm `write`), so
+        # the rail's merge path cannot be silently retried with a different credential.
+        arm = "app-dry" if _app_dry(res) else "scope-403"
+        log_event("credential fallback arm=%s — the application credential was refused; retrying "
+                  "once on the user credential (#3429)" % arm)
+        cred.arm = arm
+        retry_env = dict(os.environ)
+        retry_env[REENTRANCY_ENV] = "1"
+        retry_env["GH_CRED_SERVED_ARM"] = arm
+        res2 = _run_child(cmd, retry_env, timeout)
+        try:
+            mod = cred_helper()
+            if mod is not None:
+                mod.count(arm, "read")
+        except Exception:
+            pass
+        return res2
+    return res
 
 
 # ── conditional REST (the polling half) ────────────────────────────────────────────────────────
@@ -1175,10 +1349,17 @@ def _cred_digest():
     """A digest of the credential this call will use — never the secret itself.
 
     ⛔ ALL FOUR credential names: `gh` reads the ENTERPRISE pair for a non-github.com host, and a key
-    on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced)."""
+    on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced).
+
+    ⛔ AND THE SERVED ARM (#3429). The installation token and the user credential can see DIFFERENT
+    repositories, so a body (or a 404) cached under one must never be replayed to the other — that
+    is precisely the "the call failed and the caller read the failure as no data" class #3584 is
+    made of, and it is silent: rc 0, a plausible empty answer. The arm is a fixed word, not a
+    secret. One consequence is accepted and stated: the existing cache warms twice, once per arm."""
     tok = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
            or os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN") or "")
-    return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+    base = hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+    return "%s.%s" % (base, _CRED_ARM)
 
 
 def cache_key(plan):
@@ -3266,6 +3447,14 @@ def main(argv):
     gh_argv = list(argv[i:])
     if real_gh is None:
         real_gh = os.environ.get("GH_LIMIT_REAL_GH") or resolve_real_gh(self_path)
+    # ⛔ RESOLVE THE CREDENTIAL ONCE, BEFORE any cache is keyed (#3429). `_cred_digest()` partitions
+    # the ETag/flight caches by the SERVED arm, so the arm has to be known before the first read of
+    # one; resolving here also bounds minting to one call per process.
+    global _CRED_ARM
+    if gh_argv and cred_purpose(gh_argv) == "request":
+        _CRED_ARM = credential_for(gh_argv).arm
+    else:
+        _CRED_ARM = "meter" if gh_argv and cred_purpose(gh_argv) == "meter" else "plain"
     if budget:
         snap = probe_budget(real_gh) if real_gh and os.path.isfile(real_gh) else None
         if snap is None:

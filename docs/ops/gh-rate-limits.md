@@ -1,12 +1,12 @@
 ---
-title: "GitHub API rate limits — detection & fallback runbook (#143, #1988)"
+title: "GitHub API rate limits — detection & fallback runbook (#143, #1988, #3429)"
 type: engineering
 domain: operations
 doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, issue-3429, issue-3584, gh-rate-limits, gh-limit, gh-cred, github-app-installation
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -1046,3 +1046,107 @@ gh api -X PATCH repos/{owner}/{repo}/issues/{n} --input - <<< '{"state":"closed"
 - Prefer one REST call per fact over repeated `gh ... view` calls in loops.
 - PR review records, merges, and issue closes are idempotent-safe: check current state
   before retrying after a rate-limit error.
+
+---
+
+## Which credential — the App installation bucket (#3429)
+
+Everything above bounds **how much** the fleet spends. None of it changed **where** the spend lands,
+and the whole fleet's reads landed on the ONE 5,000/hour `core` budget that the landing rail also
+needs. Measured on #3429: `core` reached `0/5000` at 06:10Z, 07:10Z and 07:20Z on a single day —
+2,609 → 0 in 40 minutes, ~65 calls/min — while GraphQL still held 4,321. The consequence is #3584:
+reads ate the budget `provision` needed, the board came back unparsable, the claim gate went
+INCOMPLETE, dispatch stopped, `DRAIN DEADLOCK — no PR merged in 360m`.
+
+A **GitHub App installation token has its own bucket**, so reads stop competing with the rail's
+writes. Primary sources (docs.github.com, fetched 2026-11-06):
+
+| fact | value | source |
+|---|---|---|
+| installation token lifetime | **1 hour, fixed, not configurable** | *"The installation access token will expire after 1 hour."* — `apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app` |
+| per-installation primary limit | **5,000/hr base**, `+50/hr` per repo and `+50/hr` per org user beyond 20 each, capped at **12,500** (15,000 GHEC) | `rest/using-the-rest-api/rate-limits-for-the-rest-api` |
+| an app acting **on your behalf** drains YOUR bucket | the installation bucket is separate *because* it does not act on anyone's behalf | same page: *"if an app with a 15,000 request limit makes 10,000 requests on your behalf, you will have exhausted the 5,000 request budget for your personal access tokens"* |
+
+### The one decision function
+
+`scripts/orchestrator-harness/gh-cred.py` answers *which credential* and *why*, as a NAMED arm.
+`gh-limit.py` calls it from the one place it executes the real `gh` (its `run()`), so every call site
+goes through it and none can opt out. The arms, **in order — the order is the security boundary**:
+
+| # | condition | arm | credential |
+|---|---|---|---|
+| 0 | the call is the **meter** (`gh api rate_limit`) or credential **introspection** (`gh auth …`) | `purpose:meter` / `purpose:introspect` | user |
+| 1 | the call is a **write** (merge, comment, push, label, review…) | `write` | user |
+| 2 | `GH_CRED_APP=0` | `disabled` | user |
+| 3 | no readable private key | `no-key` | user |
+| 4 | minting the installation token failed | `mint-failed` | user |
+| 5 | the app bucket is at or below the floor (`GH_CRED_FLOOR`, default **500**) | `floor` | user |
+| 6 | the App refused the call (401/403) | `scope-403`, or `app-dry` when the refusal was a rate limit | user — after ONE retry |
+| 7 | otherwise | `app` | **app** |
+
+**Arm 0 is not a preference — it is what keeps this change from disarming the layer it sits in.**
+`gh api rate_limit` is what the pacing layer reads to decide whether the *account* is out. Served
+from the installation token it would report the **app's** remaining and tell `gh-limit` the user
+bucket is healthy, clearing a live limit from inside the fix. `gh auth …` is the same class the other
+way: those verbs introspect the credential on disk, so substituting a token would make
+`gh auth token` lie.
+
+**What this change does NOT touch (the #3429 contradiction test).** #3429 keeps the two-bucket
+*pacing* decision function as future work and never claims the App replaces it. So the core floor,
+the budget gates, the box lock / single flight, the documented backoff, the ETag and pass caches, and
+the REST/GraphQL failover all behave exactly as they did. The App changes the credential, never the
+pacing.
+
+### Operator note
+
+```bash
+~/orchestrator/gh-app-token --status    # the APP budget and the USER budget, side by side
+~/orchestrator/gh-app-token --stats     # which arm served what + the read-on-user regression count
+~/orchestrator/gh-app-token --refresh   # force a new installation token
+~/orchestrator/gh-app-token --which -- pr view 123   # which credential WOULD serve this, and why
+```
+
+- **Where the key lives:** `~/.pi/agent/gh-app.pem`, mode `0600`, **static — it is never rotated on a
+  schedule.** App ID `5649054`, installation `179404600`, permissions read-only, no event
+  subscriptions. Nothing in this repo ships or copies it (see *Blast radius*).
+- **Nothing has to be renewed.** The token has a 1-hour ceiling that GitHub does not let us raise; the
+  answer is not a longer token but **zero scheduled maintenance**: mint on demand, cache at 0600,
+  re-mint inside the last 5 minutes (`GH_CRED_RETIRE_MARGIN`), and re-mint transparently when a cached
+  token has already expired. **If a change to this layer needs a timer, a cron or a manual step to
+  keep working, it is wrong.**
+- **How to tell which credential served a call:** each decision writes one line to
+  `~/.pi/agent/gh-cred/decisions.log` (`arm=… kind=… why=… argv=…`) and bumps a counter;
+  `--stats` is the summary. The child also receives `GH_CRED_SERVED_ARM`.
+- **If the key is revoked or deleted:** every read falls back to the user credential with the NAMED
+  arm `mint-failed` (or `no-key`), which is *today's* behaviour and is therefore safe — but it is the
+  bug this change exists to prevent, so `--stats` will show reads accumulating on the user bucket.
+  Re-place the key, run `--refresh`, and the fleet returns to the installation bucket with no restart.
+- **The regression signal:** `--stats` reports `reads-on-user-unjustified`. **It must be 0.** A read
+  served by the user credential with no arm behind it means the layer is not wired, and `--stats`
+  exits **3** so a check can gate on it. Every legitimate fallback names its arm, so the two are
+  never confused.
+- **Turning it off:** `GH_CRED_APP=0` returns the whole fleet to the user credential, with no code
+  change, and every read is then counted as `disabled` (visible, not silent).
+
+### Blast radius, and why the key is not copied to cells
+
+The owner's constraint is explicit: **do not copy the private key per lane or per cell.** That is
+enforced by layout, not by convention — `deploy-harness.sh` copies every file under
+`scripts/orchestrator-harness/`, and the key lives at `~/.pi/agent/gh-app.pem`, outside every
+checkout. So no deploy can propagate it.
+
+- **A box with the key (the controller):** compromise yields **read-only** access to the repositories
+  the App is installed on — the installation holds `checks:read`, `pull_requests:read`,
+  `actions:read`, `contents:read`, `metadata:read` and nothing else. It **cannot** write, merge, push
+  or comment. Revocation is one action (replace the key); live tokens then expire within the hour on
+  their own.
+- **A box without the key (the cells):** holds **no App secret at all** — blast radius zero. Its
+  reads fall back to the user credential and report the named arm `no-key`, so an unprotected box is
+  a *visible* condition rather than a silent one.
+
+**The distribution channel is deliberately NOT built here, and that is a decision, not an omission.**
+Minting centrally and shipping short-lived tokens to cells needs a transport; the cheapest correct one
+is a `refs/ghcred/<exp>` ref the boxes already know how to read, and it is filed as follow-up work
+rather than invented inside this change — a half-built secret-distribution path whose failure mode is
+a stale token silently served to a lane is worse than an honestly-unprotected cell that says `no-key`.
+The controller is where #3584's deadlock was measured, so the fix lands where the problem was.
