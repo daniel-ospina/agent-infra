@@ -63,8 +63,8 @@
 #   scripts/daily-backup.sh:282 · scripts/orchestrator-harness/fix-one.sh:139 ·
 #   scripts/orchestrator-harness/test-crossbox.sh:91
 # Widening the verdict half to a literal `return 0` was MEASURED against this scan set and reds
-# SEVEN further functions (check-pipeline-compliance.sh:503, cleanup-stale-branches.sh:903,1021,
-# pi-cache-reap.sh:656, reap-lane-venvs.sh:482, restore-smoke.sh:64, worktree-hygiene-sweep.sh:234)
+# SEVEN further functions (check-pipeline-compliance.sh:503, cleanup-stale-branches.sh:905,1023,
+# pi-cache-reap.sh:677, reap-lane-venvs.sh:482, restore-smoke.sh:64, worktree-hygiene-sweep.sh:234)
 # — including restore-smoke.sh:64, whose `newest_backup_dir()` is FAIL-CLOSED, returning 1 when the
 # feeder is empty. Deciding which of those seven are real needs a per-function reading, and that is a
 # review, not a text match; the trade this header already refuses is a linter that reds correct code
