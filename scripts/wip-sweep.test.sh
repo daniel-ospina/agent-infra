@@ -645,6 +645,85 @@ S_UN="$(sed -n 's/^unmeasured=//p' "$T/state-pru/wip-sweep.status" 2>/dev/null)"
   && ok "J6 the accounting identity holds: seen = clean + skipped + dirty + unmeasured ($S_SEEN)" \
   || bad "J6 seen=$S_SEEN does not equal clean+skipped+dirty+unmeasured = $S_CL+$S_SK+$S_DI+$S_UN"
 
+# ── L) A REFUSAL AT STARTUP MUST NOT LEAVE THE PREVIOUS PASS'S `ok` STANDING ───────────────────────
+echo; echo "── L. a pass that refuses at startup overwrites the previous record ──"
+mk_fixture lref fix/3485-lref || { echo "❌ fixture failed (lref)"; exit 1; }
+O_L0="$(sweep "$T/state-lref" --apply --repo "$T/lref/wt")"; RC_L0=$?
+[ "$RC_L0" -eq 0 ] && grep -qx 'status=ok' "$T/state-lref/wip-sweep.status" 2>/dev/null \
+  && ok "L1 a GOOD pass records status=ok (the baseline this arm needs)" \
+  || bad "L1 the prior pass did not record ok (rc=$RC_L0): $O_L0"
+# ⛔ A MISSING RESCUER IS THE "BOX BEING SWEPT NOWHERE" CASE, AND IT REFUSES AFTER THE MARKER MUST BE
+# WRITTEN. This is the half of the b063e6c fix that I10 cannot see: I10 runs a pass that SUCCEEDS, so a
+# marker written below the delegate resolution still reads `running` while it is in flight. Measured with
+# the marker moved back below that resolution: the whole suite stayed PASS=96 FAIL=0 and the sequence
+# below answered `rc=0 status=ok` over a pass that archived nothing.
+O_L1="$(WIP_SWEEP_RESCUE="$T/no-such-rescuer" WIP_SWEEP_STATE_DIR="$T/state-lref" \
+  bash "$SW" --apply --repo "$T/lref/wt" 2>&1)"; RC_L1=$?
+[ "$RC_L1" -eq 3 ] && ok "L2 a pass whose rescuer is missing exits 3" \
+  || bad "L2 a missing rescuer answered $RC_L1 (want 3): $O_L1"
+grep -qx 'status=ok' "$T/state-lref/wip-sweep.status" 2>/dev/null \
+  && bad "L3 the REFUSED pass left the previous status=ok standing — the record still claims a swept box" \
+  || ok "L3 the refused pass REPLACED the previous ok (nothing on this box was archived)"
+O_L2="$(sweep "$T/state-lref" --print-status)"; RC_L2=$?
+[ "$RC_L2" -ne 0 ] && ok "L4 --print-status is NOT green after a refused pass (rc=$RC_L2)" \
+  || bad "L4 --print-status answered 0 over a pass that archived nothing: $O_L2"
+has "$O_L2" 'status=ok' \
+  && bad "L5 the reader still prints status=ok — the record was not overwritten" \
+  || ok "L5 the reader prints no status=ok"
+
+# ── M) A BARE REPO IS A SKIP, NEVER A CLEAN ───────────────────────────────────────────────────────────
+# The `bare` branch of `examine()` had no arm at all: mutating ONLY its counter (`N_SKIPPED`→`N_CLEAN`)
+# reddened nothing, while the accounting identity the doc asks an instrument to reconcile against
+# (`seen = clean + skipped + dirty + unmeasured`) broke silently. The `prunable` flavour is pinned by
+# J4/J5; this pins the second one.
+echo; echo "── M. a BARE repo is a skip, never a clean ──"
+git init -q --bare "$T/bare-m.git" || { echo "❌ fixture failed (bare)"; exit 1; }
+O_M="$(sweep "$T/state-bare" --apply --repo "$T/bare-m.git")"; RC_M=$?
+[ "$RC_M" -eq 0 ] && ok "M1 a bare repo does not fail the pass (exit 0) — there is no working tree to lose" \
+  || bad "M1 a bare repo failed the pass (rc=$RC_M): $O_M"
+grep -q 'bare-repo-no-working-tree' "$T/state-bare/wip-sweep.tsv" 2>/dev/null \
+  && ok "M2 the index records WHY it was skipped (a fact about the repository, not a failed read)" \
+  || bad "M2 the index does not record the bare-repo skip"
+grep -qx 'skipped=1' "$T/state-bare/wip-sweep.status" 2>/dev/null \
+  && ok "M3 the bare record is counted as skipped=1" \
+  || bad "M3 the bare record is missing from the skipped= counter: $(sed -n 's/^skipped=//p' "$T/state-bare/wip-sweep.status" 2>/dev/null)"
+grep -qx 'clean=0' "$T/state-bare/wip-sweep.status" 2>/dev/null \
+  && ok "M4 clean=0 — a repository nothing examined is not a clean one" \
+  || bad "M4 a bare repo was counted CLEAN: $(sed -n 's/^clean=//p' "$T/state-bare/wip-sweep.status" 2>/dev/null)"
+
+# ── N) A RESCUE CUT OFF BY ITS OWN BOUND IS A FAILURE, NOT A BUDGET DEFERRAL ────────────────────────
+# 124/137 on the rescue call is TWO facts, and the deferral branch used to claim both: the pass ran out
+# of wall clock (a deferral, exit 1), or the rescue was cut off by its own WIP_SWEEP_RESCUE_TIMEOUT — a
+# hung push, the case the doc spends a paragraph on (a FAILURE, exit 3, "the work is still only on this
+# disk"). Without the `budget_exhausted` guard the second read as the first, `rescue-exit-124`/`-137`
+# became unreachable, and `failed=0` claimed the archive had merely not been attempted.
+echo; echo "── N. a rescue cut off by ITS OWN bound is a failure, not a deferral ──"
+mk_fixture rto fix/3485-rto || { echo "❌ fixture failed (rto)"; exit 1; }
+printf 'uncommitted edit\n' >> "$T/rto/wt/base.txt"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-rto slug=fix-3485-rto"; exit 1 ;;' \
+  'esac' \
+  'sleep 10' \
+  'exit 0' > "$T/stub-hang.sh"
+chmod +x "$T/stub-hang.sh"
+O_N="$(WIP_SWEEP_RESCUE="$T/stub-hang.sh" WIP_SWEEP_RESCUE_TIMEOUT=1 \
+  WIP_SWEEP_STATE_DIR="$T/state-rto" bash "$SW" --apply --repo "$T/rto/wt" 2>&1)"; RC_N=$?
+[ "$RC_N" -eq 3 ] && ok "N1 a rescue killed by its OWN bound FAILS the pass (exit 3), not incomplete/1" \
+  || bad "N1 a rescue timeout answered $RC_N (want 3 — the work is still only on this disk): $O_N"
+grep -qx 'failed=1' "$T/state-rto/wip-sweep.status" 2>/dev/null \
+  && ok "N2 failed=1 — the archive broke, and the record says so" \
+  || bad "N2 failed=0 over a rescue that never completed"
+grep -qx 'deferred=0' "$T/state-rto/wip-sweep.status" 2>/dev/null \
+  && ok "N3 deferred=0 — the pass budget was never spent, so nothing is deferred" \
+  || bad "N3 the rescue's own timeout was counted as a budget deferral"
+IDX_N="$(cat "$T/state-rto/wip-sweep.tsv" 2>/dev/null)"
+if has "$IDX_N" 'rescue-exit-124' || has "$IDX_N" 'rescue-exit-137'; then
+  ok "N4 the row names the RESCUE's exit (rescue-exit-124/137), not deferred-pass-budget"
+else
+  bad "N4 the row does not attribute the failure to the rescue: $(sed -n '$p' "$T/state-rto/wip-sweep.tsv" 2>/dev/null)"
+fi
+
 echo
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

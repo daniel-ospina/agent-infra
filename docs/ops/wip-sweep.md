@@ -96,6 +96,12 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
   before the box goes. (`mktemp`, `date`, `sed` and the record write run outside the watchdog: a local
   syscall, not a hang surface.) What the cap defers is **named** (`deferred=N`,
   `status=incomplete`, exit `1`), never silently dropped.
+  ⛔ **A `124`/`137` IS NOT ONE FACT, AND ONLY ONE OF THEM IS A DEFERRAL.** The pass budget expiring is a
+  deferral (`deferred-pass-budget`, exit 1). The RESCUE hitting its own `WIP_SWEEP_RESCUE_TIMEOUT` — a
+  hung `git push` — is a **failure** (`rescue-exit-124`/`-137`, `failed=1`, exit `3`): the work is still
+  only on this disk and, on a quiesce, no next pass is coming. Both surface on the same call, so the
+  branch is gated on the budget actually being spent; a rescue timeout counted as “no time” is how a
+  broken archive gets handed on as an unfinished one.
 - **The archive is READ BACK, not inferred from an exit code.** `bg-rescue-wip.sh` exits `0` both for
   *archived and pushed* and for *clean — nothing at risk*, so a worktree that goes clean between the
   verdict and the rescue would otherwise be recorded as archived with a ref that does not exist. After
