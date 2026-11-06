@@ -520,21 +520,29 @@ WIP_SWEEP_STATE_DIR="$T/state-cap" bash "$SW" --print-status >/dev/null 2>&1; RC
 # record with no `ts=` line SKIPPED the age check entirely and reported `status=ok` — a pass record of
 # any age read as current.
 O="$(cd "$T" && WIP_SWEEP_STALE_SECONDS=abc WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW" --print-status 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "I5 an UNPARSEABLE WIP_SWEEP_STALE_SECONDS is refused (a typo'd bound never means 'no bound')" \
-                || bad "I5 unparseable stale bound exit $RC (want 2): $O"
+# ⛔ THE READER ANSWERS A CONFIG REFUSAL INSTEAD OF EXITING SILENTLY (#3588 review, cycle 5). It is a
+# consumer surface: exit 2 with no `status=`/`rc=` left a keyed consumer with nothing on exactly the box
+# whose sweep refuses every pass. The INTENT this arm was written for is unchanged and is now stronger —
+# a typo'd bound can never read as "no bound", and the answer is never green.
+[ "$RC" -eq 3 ] && has "$O" 'status=failed' && has "$O" 'rc=3' \
+  && ok "I5 an UNPARSEABLE WIP_SWEEP_STALE_SECONDS is refused AND answered (failed/3, a typo'd bound never means 'no bound')" \
+  || bad "I5 unparseable stale bound answered $RC (want 3 with status=failed): $O"
 # ⛔ AND A PLAUSIBLE-LOOKING VALUE MUST NOT DISABLE IT EITHER (review round 2, residual R1). `tb_timeout
 # 0 …` is "unbounded" and `WIP_SWEEP_STALE_SECONDS=0` read as "do not check" — so a record from 1970
 # answered `ok`. Only --max and WIP_SWEEP_BUDGET document 0 as a disable; the watchdogs and the
 # staleness window do not.
 O="$(cd "$T" && WIP_SWEEP_STALE_SECONDS=0 WIP_SWEEP_STATE_DIR="$T/state-stale" bash "$SW" --print-status 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "I5b WIP_SWEEP_STALE_SECONDS=0 is REFUSED, not read as 'skip the staleness check'" \
-                || bad "I5b a zero staleness window exited $RC (want 2): $O"
+[ "$RC" -eq 3 ] && has "$O" 'status=failed' \
+  && ok "I5b WIP_SWEEP_STALE_SECONDS=0 is REFUSED, not read as 'skip the staleness check'" \
+  || bad "I5b a zero staleness window answered $RC (want 3 with status=failed): $O"
 O="$(cd "$T" && WIP_SWEEP_STATUS_TIMEOUT=0 WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW" --print-status 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "I5c WIP_SWEEP_STATUS_TIMEOUT=0 is REFUSED (a zero watchdog bound is 'unbounded' in bounded.sh)" \
-                || bad "I5c a zero watchdog bound exited $RC (want 2): $O"
+[ "$RC" -eq 3 ] && has "$O" 'status=failed' \
+  && ok "I5c WIP_SWEEP_STATUS_TIMEOUT=0 is REFUSED (a zero watchdog bound is 'unbounded' in bounded.sh)" \
+  || bad "I5c a zero watchdog bound answered $RC (want 3 with status=failed): $O"
 O="$(cd "$T" && WIP_SWEEP_RESCUE_TIMEOUT=0 WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW" --print-status 2>&1)"; RC=$?
-[ "$RC" -eq 2 ] && ok "I5d WIP_SWEEP_RESCUE_TIMEOUT=0 is REFUSED too (the rescue is the longest call on the quiesce path)" \
-                || bad "I5d a zero rescue bound exited $RC (want 2): $O"
+[ "$RC" -eq 3 ] && has "$O" 'status=failed' \
+  && ok "I5d WIP_SWEEP_RESCUE_TIMEOUT=0 is REFUSED too (the rescue is the longest call on the quiesce path)" \
+  || bad "I5d a zero rescue bound answered $RC (want 3 with status=failed): $O"
 # ⛔ AND THE OTHER DIRECTION: the two seams that DO document 0 as a disable must still accept it. A gate
 # that refuses everything is as useless as one that accepts everything, and `--max 0` / a zero budget
 # are the documented "no cap" / "no pass budget" values.
@@ -852,9 +860,25 @@ O_R1="$(WIP_SWEEP_BOUNDED_LIB=/nonexistent/bounded.sh WIP_SWEEP_STATE_DIR="$T/st
   || bad "R1 the reader answered over a box that cannot sweep (rc=$RC_R1): $O_R1"
 O_R2="$(WIP_SWEEP_STALE_SECONDS=abc WIP_SWEEP_STATE_DIR="$T/state-envb" \
   bash "$SW" --print-status 2>&1)"; RC_R2=$?
-[ "$RC_R2" -eq 2 ] && has "$O_R2" 'WIP_SWEEP_STALE_SECONDS' \
-  && ok "R2 the reader still validates the seams IT depends on (a typo'd staleness window is a config error, exit 2, named)" \
+[ "$RC_R2" -eq 3 ] && has "$O_R2" 'status=failed' && has "$O_R2" 'WIP_SWEEP_STALE_SECONDS' \
+  && ok "R2 the reader still validates the seams IT depends on, and NAMES the broken one" \
   || bad "R2 an unparseable staleness window answered $RC_R2: $O_R2"
+
+# ⛔ R3 — THE P0 ARM (#3588 review, cycle 5). The reader answered `status=ok rc=0` over a box whose sweep
+# refuses EVERY pass for four of its eight startup conditions: an unparseable `WIP_SWEEP_BUDGET` /
+# `WIP_SWEEP_MAX`, a rescuer that does not exist, and a bounded-library pin that EXISTS but is not the
+# library. Its baseline is a fresh `ok` record — with a `running` record every seam looks refused for the
+# wrong reason (R1's first version made exactly that mistake).
+printf '#!/usr/bin/env bash\nexit 0\n' > "$T/notalib.sh"; chmod +x "$T/notalib.sh"
+for _seam in "WIP_SWEEP_BUDGET=abc" "WIP_SWEEP_MAX=abc" "WIP_SWEEP_RESCUE=$T/no-such-rescuer" \
+             "WIP_SWEEP_BOUNDED_LIB=$T/notalib.sh" "WIP_SWEEP_STALE_SECONDS=0"; do
+  O_R3="$(env "$_seam" WIP_SWEEP_STATE_DIR="$T/state-rlib" bash "$SW" --print-status 2>&1)"; RC_R3=$?
+  if [ "$RC_R3" -eq 0 ] || has "$O_R3" 'status=ok'; then
+    bad "R3 '${_seam%%=*}' answers GREEN over a box whose sweep refuses every pass (rc=$RC_R3): $O_R3"
+  else
+    ok "R3 '${_seam%%=*}' is never green on the reader surface (rc=$RC_R3)"
+  fi
+done
 
 # ── S) A REPO THAT LISTED NOTHING IS ESCALATED ON ITS OWN ────────────────────────────────────────────
 echo; echo "── S. a repo that listed NOTHING is escalated even when a sibling repo deferred rows ──"
@@ -875,6 +899,25 @@ grep -qx 'status=failed' "$T/state-empty/wip-sweep.status" 2>/dev/null \
 grep -q 'worktree-list-empty' "$T/state-empty/wip-sweep.tsv" 2>/dev/null \
   && ok "S3 the index names WHY (worktree-list-empty), so the next actor is not left guessing" \
   || bad "S3 the index does not record the empty listing"
+# ⛔ S4 — THE SHAPE THE PER-REPO FIX EXISTS FOR (#3588 review, cycle 5). With ONE repo the global
+# zero-examination rule already fails the pass, so only the note string was pinned: deleting the per-repo
+# escalation reddened S3 and left S1/S2 green. Two repos is different — repo B is examined normally, so
+# the global rule cannot fire, and without the per-repo check the pass answered `status=ok rc=0` over a
+# repo that was NEVER ENUMERATED (measured on the mutant). That is a false PASS, not a mis-diagnosis.
+mkdir -p "$T/selbin"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" worktree list --porcelain "*)\n     case " $* " in *"%s"*) exit 0 ;; esac ;;\nesac\nexec %s "$@"\n' \
+  "$T/budq/wt" "$REAL_GIT" > "$T/selbin/git"
+chmod +x "$T/selbin/git"
+O_S4="$(PATH="$T/selbin:$PATH" WIP_SWEEP_STATE_DIR="$T/state-sel" \
+  bash "$SW" --apply --repo "$T/budq/wt" --repo "$T/rlib/wt" 2>&1)"; RC_S4=$?
+[ "$RC_S4" -eq 3 ] && ok "S4 one empty listing out of two repos still FAILS the pass (exit 3)" \
+  || bad "S4 an empty listing was excused by a sibling repo (rc=$RC_S4, want 3): $O_S4"
+grep -q "worktree-list-empty" "$T/state-sel/wip-sweep.tsv" 2>/dev/null \
+  && ok "S5 the empty repo is named in the index" \
+  || bad "S5 the index does not name the empty listing"
+grep -q "$T/rlib/wt" "$T/state-sel/wip-sweep.tsv" 2>/dev/null \
+  && ok "S6 the other repo was still EXAMINED — the pass did not abort at the first empty listing" \
+  || bad "S6 the healthy repo was not examined: $(sed -n '1,4p' "$T/state-sel/wip-sweep.tsv" 2>/dev/null)"
 
 echo
 echo "── summary ──"

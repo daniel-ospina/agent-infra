@@ -200,9 +200,16 @@ can only be loud on stderr with a non-zero exit — that is a host problem, and 
 (`disk-reaper.sh` gets its equivalent witness from the scheduler's own exit status; this pass has no
 scheduler yet, so the marker is the substitute.)
 
-`--print-status` answers from that record alone: `0` ok, `1` incomplete, `3` failed / stale / never, and
-it prints a derived `rc=` on EVERY path including `never` (a consumer keyed on `rc=` finds a value even on
-a box that has never run).
+`--print-status` answers from that record **and from the same startup checks the pass makes**: `0` ok,
+`1` incomplete, `3` failed / stale / never, and it prints a derived `rc=` on EVERY path including `never`
+(a consumer keyed on `rc=` finds a value even on a box that has never run).
+⛔ **THE READER IS NEVER GREEN OVER A BOX THAT CANNOT SWEEP.** Every startup refusal — an unusable
+`WIP_SWEEP_BOUNDED_LIB` pin, an unparseable or zero bound (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_MAX`, the two
+watchdogs, the staleness window), a rescuer that does not exist — is answered on the reader surface as
+`status=failed` / `rc=3` / `detail=<the cause>`, never as an older `ok`. That is why it is not literally
+"the record alone": a green from a record the pass could no longer reproduce would be the stale-green
+class this doc opens with. The ONE case it still answers from the record alone is a `WIP_SWEEP_BUDGET=0`
+or `--max 0` (documented disables), which change no verdict.
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
 and nowhere else. The printed `status=` and `rc=` are the **derived** ones, emitted last, so the
 key=value surface agrees with the exit code; the recorded values are kept beside them as `recorded=` and
