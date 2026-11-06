@@ -2568,7 +2568,7 @@ case "$_why_ok" in
     if [ "${_fx_tmpl:-x}" = "2" ] && [ "${_fx_tail:-x}" = "2" ]; then
       ok "pin/writer: both ok fixtures claiming the template carry the shipped tail (\`head #N is what dispatch takes next\`)"
     else
-      bad "pin/writer: ${_fx_tmpl:-<unreadable>} ok fixture(s) claim the writer's template and ${_fx_tail:-<unreadable>} carry its tail (want 2 and 2) — \`$_why_ok\`"
+      bad "pin/writer: ${_fx_tmpl:-<unreadable>} ok fixture(s) claim the writer's template and ${_fx_tail:-<unreadable>} carry its tail (want 2 and 2) — if you ADDED a faithful fixture, update these numbers; if you did not, one lost the template's tail. Writer template: \`$_why_ok\`"
     fi
     # ⛔ THE SUBSTITUTION (review P3). The writer fills the sentence and the two fields from the SAME
     # variables (`refresh-candidates.sh:6014-6016`), so "queue depth 9; head #7" with its own
@@ -2580,7 +2580,13 @@ case "$_why_ok" in
       _h="$(printf '%s' "$_l" | sed -n 's/.*head #\([0-9][0-9]*\).*/\1/p')"
       _bk="$(printf '%s' "$_l" | sed -n 's/.*backlog=\([0-9][0-9]*\).*/\1/p')"
       _hd="$(printf '%s' "$_l" | sed -n 's/.*handed=\([0-9][0-9]*\).*/\1/p')"
-      if [ "$_d" != "$_bk" ] || [ "$_h" != "$_hd" ]; then
+      # ⛔ AN UNGRADABLE LINE IS A FAILURE, NOT AN EQUALITY (review P2): a fixture formatting its numbers
+      # through `printf` placeholders extracts "" on both sides, and "" = "" passed — so the exact record
+      # this check exists to forbid (`queue depth 9` beside `backlog=2`) stayed GREEN when written the way
+      # this file already writes such fixtures (`backlog=%s\nhanded=%s`, line 1123). Measured.
+      if [ -z "$_d" ] || [ -z "$_h" ] || [ -z "$_bk" ] || [ -z "$_hd" ]; then
+        _sub_ok=0; bad "pin/writer: line $_ln is not gradable — its 'queue depth'/'head #'/'backlog='/'handed=' values do not all resolve (depth='$_d' head='$_h' backlog='$_bk' handed='$_hd'); a fixture whose numbers come from \`printf\` placeholders must be checked by rendering it"
+      elif [ "$_d" != "$_bk" ] || [ "$_h" != "$_hd" ]; then
         _sub_ok=0; bad "pin/writer: line $_ln says 'queue depth $_d; head #$_h' but its own record holds backlog=$_bk handed=$_hd — the writer fills both from ONE variable, so this record cannot exist"
       fi
     done
@@ -2600,40 +2606,60 @@ if grep -qF -- "$_DTH" "$REFRESH"; then
   if [ "${_run_fx:-x}" = "17" ] && [ "${_run_lit:-x}" = "14" ] && [ "${_run_nowhy:-x}" = "3" ]; then
     ok "pin/writer: all 14 tombstone fixtures carry the shipped \`why=\` (death clause included); the 3 hand-edited ones carry none"
   else
-    bad "pin/writer: result=running fixtures: ${_run_fx:-<unreadable>} total, ${_run_lit:-<unreadable>} with the writer's death clause, ${_run_nowhy:-<unreadable>} with no \`why=\` at all (want 17 / 14 / 3) — a truncated or reshaped fixture models a record the writer cannot write"
+    bad "pin/writer: result=running fixtures: ${_run_fx:-<unreadable>} total, ${_run_lit:-<unreadable>} with the writer's death clause, ${_run_nowhy:-<unreadable>} with no \`why=\` at all (want 17 / 14 / 3) — if you ADDED a faithful fixture, update these three numbers; if you did not, one was truncated or reshaped into a record the writer cannot write"
   fi
 else
   bad "pin/writer: refresh-candidates.sh no longer writes the tombstone's death clause — the fixtures are stale"
 fi
 # ── the `handed_why=` value: BOTH `_head_why` arms must still end in a rank clause ───────────────────
+# ⛔ THE CHECK GRADES BYTES, AND SAYS SO (review P3): it is a literal grep, so it cannot tell a semantic
+# regression from a cosmetic one — `${_head_rank}` braces the same variable and produces the same durable
+# value, and the old wording ("becomes a dangling phrase") asserted a defect that a brace-only refactor
+# does not create. The message now names what moved and what it grades.
 for _arm in 'judged CLEAN by THIS pass, and $_head_rank' 'carried over from an earlier pass — $_head_rank'; do
-  grep -qF -- "$_arm" "$REFRESH" \
-    && ok "pin/writer: \`_head_why\` still ends in the rank clause (\`$_arm\`)" \
-    || bad "pin/writer: \`_head_why\` lost its rank clause (\`$_arm\`) — \`handed_why=\` becomes a dangling phrase in the durable record"
+  for _form in "$_arm" "$(printf '%s' "$_arm" | sed 's/\$_head_rank/${_head_rank}/')"; do
+    grep -qF -- "$_form" "$REFRESH" && { _arm_found=1; break; }
+  done
+  if [ "${_arm_found:-0}" = "1" ]; then
+    ok "pin/writer: \`_head_why\` still ends in the rank clause (\`$_arm\`)"
+  else
+    bad "pin/writer: the WRITER's \`_head_why\` no longer ends in \`$_arm\` — if you changed refresh-candidates.sh, the fixtures must follow; if you changed a fixture, revert it. (This check grades the writer's BYTES.)"
+  fi
+  _arm_found=0
 done
 # ⛔ EVERY ARM THE WRITER CAN TAKE IS FAITHFUL (review P3): `_head_rank` has FIVE arms and only one says
 # "highest-ranked", so a fixture carrying the writer's exact `unranked`/`empty` sentence is CORRECT — the
 # previous pin called it wrong. A fixture value must end in SOME arm the writer actually writes.
 _head_ranks="$(grep -o '_head_rank="[^"]*"' "$REFRESH" | sed 's/^_head_rank="//; s/"$//')"
-_narms="$(printf '%s\n' "$_head_ranks" | grep -c . || true)"
+_narms="$(grep -c . <<<"$_head_ranks" || true)"
 if [ "${_narms:-x}" = "5" ]; then
   ok "pin/writer: \`_head_rank\` still has its 5 arms (a fixture may model any of them)"
 else
-  bad "pin/writer: \`_head_rank\` has ${_narms:-<unreadable>} arm(s) (want 5) — the fixtures are graded against a moving set"
+  bad "pin/writer: the WRITER's \`_head_rank\` has ${_narms:-<unreadable>} arm(s) (want 5) — if you changed refresh-candidates.sh, re-baseline this expectation; if not, a fixture-side check below will name the line"
 fi
 _hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" || true)"
 _hw_bad=0
 for _ln in $(grep -nE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" | cut -d: -f1); do
   _val="$(sed -n "${_ln}p" "$_PINFILE" | sed -n 's/.*handed_why=\([^\\]*\).*/\1/p')"
-  _tail="${_val#judged CLEAN by THIS pass, and }"
-  _tail="${_tail#carried over from an earlier pass — }"
-  printf '%s\n' "$_head_ranks" | grep -qxF -- "$_tail" \
-    || { _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` does not end in any \`_head_rank\` arm the writer writes: '$_val'"; }
+  # ⛔ THE PREFIX IS REQUIRED (review P2): `_tail="${_val#prefix}"` is a silent no-op when the value does
+  # not start with it, so a fixture holding the BARE arm — a record the writer cannot emit, since it always
+  # writes one of the two prefixes — was accepted. Measured: stripping the prefix from a fixture stayed
+  # 288/0 GREEN, and a doubled prefix stayed GREEN too.
+  case "$_val" in
+    'judged CLEAN by THIS pass, and '*)       _tail="${_val#judged CLEAN by THIS pass, and }" ;;
+    'carried over from an earlier pass — '*) _tail="${_val#carried over from an earlier pass — }" ;;
+    *) _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` carries NEITHER \`_head_why\` prefix — the writer always writes one, so this value cannot exist: '$_val'"; continue ;;
+  esac
+  if [ -z "$_tail" ]; then
+    _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` has a prefix and an EMPTY rank clause — a dangling phrase in the durable record: '$_val'"
+  elif ! grep -qxF -- "$_tail" <<<"$_head_ranks"; then
+    _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` ends in '$_tail', which no writer arm produces — a FIXTURE-side move"
+  fi
 done
 if [ "${_hw_fx:-x}" != "7" ]; then
-  bad "pin/writer: ${_hw_fx:-<unreadable>} fixture \`handed_why=\` value(s) (want 7) — the population moved, so this pin graded nothing"
+  bad "pin/writer: ${_hw_fx:-<unreadable>} fixture \`handed_why=\` value(s) (want 7) — if you ADDED a faithful fixture, update this number; if you did not, a fixture lost its field"
 elif [ "$_hw_bad" = "0" ]; then
-  ok "pin/writer: all 7 fixture \`handed_why=\` values end in an arm the writer actually writes"
+  ok "pin/writer: all 7 fixture \`handed_why=\` values carry a writer prefix and end in an arm the writer writes"
 fi
 fi
 
