@@ -2617,7 +2617,11 @@ else
 # is also how a look-back at column 1 broke (`substr($0, 0, 1)` CLAMPS to the first character in awk, so a
 # line STARTING `$'` compared its `$` against itself) and leaked `$'it\'s' # stale` — and it still
 # leaked `$$$'a\' # stale`, measured through the shipped strip: `rem` empty, the comment kept. The guard
-# now COUNTS the run and takes its parity, which is bash's own rule, and all three spellings are probes.
+# now COUNTS the run and takes its parity, which is bash's own rule for an UNESCAPED run — and the run
+# must stop at the last ESCAPED character (review P3, cycle 34): `X=\$'a\' # stale` is valid bash in which
+# ` # stale` IS a comment, but the escape arm consumes that `$` and the counter re-scanned it from the raw
+# line, over-counting by one and flipping every parity in the class — the leak, fail-open. The awk now
+# records the escaped character's index in `esc` and the run stops there. All four spellings are probes.
 # ⛔ A BACKSLASH ESCAPES THE NEXT CHARACTER (review P2, cycle 29). Without that arm, an escaped quote
 # outside quotes opened a PHANTOM quote state, so every `#` after it read as data and a REAL shell
 # comment survived into the graded view — a deleted `_head_rank` arm recorded as `: \' # was: unranked)
@@ -2627,15 +2631,15 @@ else
 _strip_marked() {   # $1=0 stdin → view;  $1=1 stdin → "view\001<the comment text it removed>"
 awk -v mark="${1:-0}" '
 {
-  out = ""; rem = ""; q = ""; prev = ""; ansi = 0;
+  out = ""; rem = ""; q = ""; prev = ""; ansi = 0; esc = 0;
   n = length($0);
   for (i = 1; i <= n; i++) {
     c = substr($0, i, 1);
     if (q == "") {
-      if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
+      if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; esc = i + 1; i++; continue }
       if (c == "\047" || c == "\"") {
         nrun = 0; k = i - 1;
-        while (k > 0 && substr($0, k, 1) == "$") { nrun++; k-- }
+        while (k > esc && substr($0, k, 1) == "$") { nrun++; k-- }
         ansi = (c == "\047" && nrun % 2 == 1);
         q = c; out = out c; prev = c; continue
       }
@@ -2673,15 +2677,15 @@ _strip_comments() { _strip_marked 0; }
 _strip_ref() {   # stdin → view, per the rule as reviewed; $1=1 also prints "view\001<removed>"
 awk -v mark="${1:-0}" '
 {
-  out = ""; rem = ""; q = ""; prev = ""; ansi = 0;
+  out = ""; rem = ""; q = ""; prev = ""; ansi = 0; esc = 0;
   n = length($0);
   for (i = 1; i <= n; i++) {
     c = substr($0, i, 1);
     if (q == "") {
-      if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
+      if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; esc = i + 1; i++; continue }
       if (c == "\047" || c == "\"") {
         nrun = 0; k = i - 1;
-        while (k > 0 && substr($0, k, 1) == "$") { nrun++; k-- }
+        while (k > esc && substr($0, k, 1) == "$") { nrun++; k-- }
         ansi = (c == "\047" && nrun % 2 == 1);
         q = c; out = out c; prev = c; continue
       }
@@ -2723,12 +2727,31 @@ _strip_probe="$(printf '%s\n' 'A=1;# stale' '(echo hi)# stale' 'C=3|# stale' 'D=
   'E=5(# stale' 'F=6<# stale' 'I=7># stale' $'J=8\t# stale' \
   'K="head #5 is data"  # stale' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x # stale" 'O="a\"b" # stale' \
   "P=\$'it\\'s' # stale" "Q=\$\$'a\\' # stale" "$'it\\'s' # stale" \
-  "R=\$\$\$'it\\'s' # stale" 'S=1 # elevenchr' | _strip_comments)"
+  "R=\$\$\$'it\\'s' # stale" 'S=1 # elevenchr' \
+  "T=\\$'a\\' # stale" | _strip_comments)"
 _strip_bad=""
+# ⛔ ONE PROBE PER COMMENT LENGTH, GENERATED (review P2, cycle 34). A single hand-written probe cannot
+# grade a BAND: probe `S` (an 11-character tail) redded a rule keeping 11-19 characters as data, but a
+# rule keeping 12-19 — or any band that excludes 11 — passed the whole suite, measured GREEN with a real
+# comment back in the graded view (\`# thirteenchr\`). A rule change applied to BOTH copies is invisible to
+# the reference equality by construction, so the lengths have to be covered by construction instead: one
+# probe per tail length from 1 to 19, each required to be cut.
+_strip_len_bad=""
+for _L in $(seq 1 19); do
+  _tail="$(printf '%*s' "$_L" '' | tr ' ' x)"
+  _got="$(printf '%s\n' "V=$_L # $_tail" | _strip_comments)"
+  [ "$_got" = "V=$_L " ] || _strip_len_bad="$_strip_len_bad $_L"
+done
+if [ -z "$_strip_len_bad" ]; then
+  ok "pin/writer: a comment is cut at EVERY tail length 1-19 (19 generated probes) — no length band can hide a class of comments, including one changed in BOTH copies"
+else
+  bad "pin/writer: a comment tail of length(s)$_strip_len_bad was NOT cut (19 generated probes, one per length 1-19) — a length rule is keeping that band as DATA, so those comments are graded as code"
+fi
 for _want in 'A=1;' '(echo hi)' 'C=3|' 'D=4&&' 'E=5(' 'F=6<' 'I=7>' $'J=8\t' \
               'K="head #5 is data"  ' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x " 'O="a\"b" ' \
               "P=\$'it\\'s' " "Q=\$\$'a\\' " "$'it\\'s' " \
-              "R=\$\$\$'it\\'s' " 'S=1 '; do
+              "R=\$\$\$'it\\'s' " 'S=1 ' \
+              "T=\\$'a\\' "; do
   grep -qxF -- "$_want" <<<"$_strip_probe" || _strip_bad="$_strip_bad[$_want]"
 done
 if [ -z "$_strip_bad" ]; then
@@ -2766,7 +2789,7 @@ _diff_first() {   # <expected> <actual> → "at col N: <window> / <window>", for
     /^</ { if (!a) a = substr($0, 3) }
     /^>/ { if (!b) { b = substr($0, 3); exit } }
     END {
-      if (a == "" && b == "") { printf "no differing line"; exit }
+      if ((a == "") && (b == "")) { printf "excerpt unavailable (diff emitted no change record)"; exit }
       if (a == "") { printf "at col 0: <none> / %s", substr(b, 1, 100); exit }
       if (b == "") { printf "at col 0: %s / <none>", substr(a, 1, 100); exit }
       p = 1
@@ -2783,13 +2806,13 @@ esac
 # AND THE WINDOW, on the shape that broke it: two long lines differing only near the END. A fixed
 # `substr(…, 1, 80)` printed two IDENTICAL strings here — which is exactly what a long writer comment
 # looks like — so the self-test has to diverge BEYOND the excerpt's reach, not at column 11.
-_d2="$(_diff_first "$(printf 'A%.0s' $(seq 1 40))tailX" "$(printf 'A%.0s' $(seq 1 40))tailY")"
+_d2="$(_diff_first "$(printf 'A%.0s' $(seq 1 100))tailX" "$(printf 'A%.0s' $(seq 1 100))tailY")"
 case "$_d2" in
-  'at col 45: '*) case "$_d2" in
-      *tailX*tailY*) ok "pin/writer: the divergence excerpt is WINDOWED — a divergence in the LAST character of a 45-column line still shows both tails (self-test)" ;;
+  'at col 105: '*) case "$_d2" in
+      *tailX*tailY*) ok "pin/writer: the divergence excerpt is WINDOWED — a divergence in the LAST character of a 105-column line still shows both tails, past the 80-column reach (self-test)" ;;
       *) bad "pin/writer: _diff_first lost the differing tails on a long line: '$_d2'" ;;
     esac ;;
-  *) bad "pin/writer: _diff_first returned '$_d2' for a divergence in the last character of a 45-column line (want a window starting 'at col 45: ') — an unbounded-left excerpt prints two IDENTICAL strings for two long lines that differ near the end" ;;
+  *) bad "pin/writer: _diff_first returned '$_d2' for a divergence in the last character of a 105-column line (want a window starting 'at col 105: ') — an unbounded-left excerpt prints two IDENTICAL strings for two long lines that differ near the end, which is the shape a long writer comment has" ;;
 esac
 _content_lines() { grep -c '[^[:space:]]' || true; }
 # how many comments a marked pass removes, and the first one it removes
@@ -2824,18 +2847,19 @@ else
   # silently rejoined the graded view. The short comments this writer carries are therefore named BY THEIR
   # OWN TEXT, derived from the writer and required to be REMOVED, so the class is covered exactly rather
   # than counted.
-  _n_short="$(_strip_ref 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2); if (n >= 4 && n <= 19) c++ } END { print c + 0 }')"
+  _n_short="$(_strip_ref 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2); if (n < 20) c++ } END { print c + 0 }')"
   _ref_view="$(_strip_ref < "$REFRESH")"
   if [ "${_n_short:-0}" -lt 5 ]; then
     bad "pin/writer: the reference strip removes only ${_n_short:-<unreadable>} comment(s) shorter than 20 characters (want >= 5), so this writer no longer has a SHORT-comment population to grade — if comments were legitimately removed from the writer, lower this number deliberately"
   else
-    ok "pin/writer: the short-comment population is $_n_short comments under 20 characters (>= 5 required, so the class is non-empty; the 11-19-character band is graded by probe \`S\`, which no rule change can follow silently)"
+    ok "pin/writer: the short-comment population is $_n_short removed comments literally under 20 characters (no lower floor: a 1-character comment counts) (>= 5 required, so the class is non-empty; every length 1-19 is graded by a generated probe, so no band can be followed silently)"
   fi
-  _wpin="$(grep -cE '^_WCODE="\$\(_strip_comments < "\$REFRESH"\)"$' "$_PINFILE" || true)"
-  if [ "${_wpin:-x}" = "1" ]; then
-    ok "pin/writer: the graded view is derived by the stripper UNDER TEST (\`_WCODE=\$(_strip_comments < \"\$REFRESH\")\`), not by the reference — equality alone cannot tell those apart"
+  _wpin="$(grep -cE '^_WCODE=.*_strip_comments' "$_PINFILE" || true)"
+  _wref="$(grep -cE '^_WCODE=.*_strip_ref' "$_PINFILE" || true)"
+  if [ "${_wpin:-x}" = "1" ] && [ "${_wref:-x}" = "0" ]; then
+    ok "pin/writer: the graded view is derived by the stripper UNDER TEST (the \`_WCODE=\` line calls \`_strip_comments\`, and no \`_WCODE=\` line names \`_strip_ref\`) — equality alone cannot tell those apart, and this grades the CALL rather than its spelling"
   else
-    bad "pin/writer: ${_wpin:-<unreadable>} line(s) assign \`_WCODE\` from \`_strip_comments\` (want 1) — if the view is now built by the REFERENCE, the equality below is a tautology and every predicate beneath it grades a view nothing under test produced"
+    bad "pin/writer: the line that builds \`_WCODE\` does not call the stripper UNDER TEST (found ${_wpin:-<unreadable>} assignment(s) naming \`_strip_comments\`, want 1, and ${_wref:-<unreadable>} naming \`_strip_ref\`, want 0) — if the view is built by the REFERENCE, the equality below is a tautology and every predicate beneath it grades a view nothing under test produced"
   fi
   if [ "$_WCODE" = "$_ref_view" ]; then
     ok "pin/writer: the graded view is BYTE-IDENTICAL to the frozen reference strip ($_n_strip comments removed, $_n_short of them under 20 characters) — a strip weakened on ONE side, a truncation, or a stale spelling diverges here. A rule change applied to BOTH copies is not detectable by this test (said in the comment above \`_strip_ref\`); the probes and the length-band probe are what grade the RULE"
