@@ -3210,6 +3210,15 @@ ISSUES 2')"
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
   # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
   RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
+  # ⛔ THE FIXTURE CHECKOUT MUST BE A REAL CHECKOUT, and every arm below needs it (measured — (9)–(9c4)
+  # were ALL red without this line). `report.sh` stopped accepting a bare directory: its `REPO` goes
+  # through `repo-slug.sh`'s `resolve_repo`, which PROVES `git rev-parse --show-toplevel` answers and
+  # refuses by name otherwise, because a REPO that is not the intended checkout is how a box graded the
+  # wrong repo silently. A plain `mkdir` therefore made report.sh exit 2 before ANY queue line, so the
+  # arms read `[]` and were red for a reason that had nothing to do with the counting they pin.
+  # `git init` is the smallest thing that satisfies the check: the counting arms never ask the checkout
+  # for a commit, a remote or a ref.
+  git init -q "$RPT/repo"
   # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
   # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
   # The controller used to be able to leave two markers for one PR; report.sh must not report that as
@@ -3283,29 +3292,34 @@ GHOPEN3
   eqv "…and a SUPERSEDED park is not counted as stale evidence" "  stale evidence (needs re-review): 0" "$(printf '%s\n' "$_rpt_superseded" | grep 'stale evidence')"
   rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-newhead"
   rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-aaa" "$RPT/state/needsreview-6002-ddd"
-  # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
-  # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
-  # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
-  _rpt_norepo="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
-  case "$_rpt_norepo" in
-    *"open PRs: 0"*|*"stale evidence (needs re-review): 0"*) echo "  ❌ with no repo checkout report.sh printed a confident 0: [$_rpt_norepo]"; FAIL=$((FAIL+1)) ;;
-    *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ an unreadable environment produced [$_rpt_norepo] — expected the named missing dependency"; FAIL=$((FAIL+1)) ;;
-  esac
+  # (9c) …and a REPO that is not a CHECKOUT is its OWN state, not 0 (review round 2, P1; re-pinned when
+  # `REPO` moved behind `repo-slug.sh`'s `resolve_repo`). The old form read report.sh's own
+  # `[ ! -d "$REPO" ]` arm, which is now UNREACHABLE: `resolve_repo` proves the operator's value is a
+  # checkout before any queue read and refuses by name otherwise, so a bogus REPO is a CONFIGURATION
+  # error rather than a degraded environment. The property this arm exists for is unchanged, and it is
+  # now asserted where it happens: a read that cannot start prints NEITHER `open PRs: 0` NOR
+  # `stale evidence …: 0`, and the refusal names REPO so the operator is not left to invent a third way
+  # to set it.
+  _rpt_norepo_out="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2>"$TMP/rpt-norepo.err" )"; _rpt_norepo_rc=$?
+  if [ "$_rpt_norepo_rc" -eq 2 ] \
+     && ! grep -qE 'open PRs: 0|stale evidence \(needs re-review\): 0' <<<"$_rpt_norepo_out" \
+     && grep -q 'REPO=.* is not a git checkout' "$TMP/rpt-norepo.err"; then
+    echo "  ✅ with no repo checkout report.sh REFUSES by name (rc 2) — it never prints a confident 0"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an unreadable environment produced rc=$_rpt_norepo_rc [$_rpt_norepo_out] [$(head -1 "$TMP/rpt-norepo.err")] — expected the named refusal and no confident 0"; FAIL=$((FAIL+1))
+  fi
   # (9c4) ⛔ AND ON THE DEGRADED PATHS THE PARKED COUNT NAMES ITS OWN PROVENANCE (landing-review note,
-  # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so with no
-  # checkout, or with an unreadable listing, the number that gets printed is the raw `parked-*` FILE
-  # count and a superseded park is indistinguishable from a current one. Printing it UNLABELLED
-  # presents an inflated human queue as a measured one; the stale line on these same two paths already
-  # names its degradation, so the parked line must too. Driven, not grepped: two parks exist, NEITHER
-  # of which can be attributed on these paths (that is the whole reason the count is raw).
+  # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so where the
+  # listing cannot be read the number that gets printed is the raw `parked-*` FILE count and a
+  # superseded park is indistinguishable from a current one. Printing it UNLABELLED presents an inflated
+  # human queue as a measured one; the stale line on the same path already names its degradation, so the
+  # parked line must too. Driven, not grepped: two parks exist, NEITHER of which can be attributed on
+  # this path (that is the whole reason the count is raw).
+  # ⛔ ONE DEGRADED PATH NOW, NOT TWO. The "no checkout at all" half of this pair was retired by
+  # `resolve_repo` (see (9c) above — that state is a refusal and publishes no lines at all), so the
+  # provenance note is driven on the path report.sh still owns: a checkout whose listing is unreadable.
   printf '%s\n' livehead > "$RPT/state/parked-6001"
   printf '%s\n' oldhead > "$RPT/state/parked-6999"
-  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
-  case "$_rpt_norepo_parked" in
-    *" 2  (raw marker count"*) echo "  ✅ with no repo checkout the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ with no repo checkout the parked line printed [$_rpt_norepo_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
-  esac
   cat > "$TMP/ghstub/gh" <<'GHFAIL2'
 #!/bin/bash
 exit 1
