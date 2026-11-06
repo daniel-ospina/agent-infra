@@ -1154,9 +1154,9 @@ ${marker}"; else newbody="$marker"; fi
 # post_marker_comment <repo> <pr> <marker> -> ALWAYS 0 (best-effort, never fatal)
 #
 # agent-infra#1224, PRODUCER HALF — the consumer half shipped in the gate in 2026-09,
-# and daniel-ospina/tortoise:docs/ai-review-gate.md STILL carries "Producer status:
-# the producer half is NOT deployed" a month on. Everything below is why this is not
-# optional, and it lives at the FUNCTION because every caller (the mint path, both failure arms,
+# and daniel-ospina/tortoise:docs/ai-review-gate.md STILL carries its "Producer
+# status" note — "The producer half (agent-infra#1224) is **not deployed**" — a month on.
+# Everything below is why this is not optional, and it lives at the FUNCTION because every caller (the mint path, both failure arms,
 # --flush-pending and --recover-body) must publish the same channel with the same
 # guarantees:
 #
