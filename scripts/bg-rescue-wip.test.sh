@@ -862,8 +862,15 @@ assert_unshadow_arm wfunshadow wfunshadow 'GH_TOKEN=shadow-readonly-pat GITHUB_T
 
 # ⛔ THE macOS DEFAULT, ASSERTED WHERE IT EXISTS. Without this arm the `uname = Darwin` branch is green
 # nowhere: red on the Mac (via the bug above) and dead code on Linux.
+# ⛔ AND IT MUST RUN WITH AN AMBIENT TOKEN SET (review round 7, P2). Without one, `osxkeychain` at the
+# platform arm and the `unshadow` fall-through below it are INDISTINGUISHABLE — both return the same
+# plan — so swapping those two lines (a plausible "check the token before the platform" tidy-up)
+# reversed the proven macOS default and falsified the declared residual, with the suite fully GREEN on a
+# clean machine (and red only if the developer happened to have GH_TOKEN exported). With the token set,
+# `wf_then_ok` accepts a helper-named attempt and only that, so an inverted order cannot pass.
 if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-  try_rescue wfhelper wf_then_ok fix/lane-one "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW"
+  try_rescue wfhelper wf_then_ok fix/lane-one \
+    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN GH_TOKEN=shadow-readonly-pat"
   [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
     && ok "wfhelper: the Darwin default retries ONCE with a helper credential and rescues (exit 0, 2 attempts)" \
     || bad "wfhelper: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — $OUT"
