@@ -23,6 +23,7 @@ name: Pipeline Compliance
 #       contents: read
 #       issues: read
 #       pull-requests: read
+#       checks: read          # #3440: the gate reads the PR head's check surface
 #     jobs:
 #       pipeline-compliance:
 #         uses: daniel-ospina/agent-infra/.github/workflows/pipeline-compliance.yml@main
@@ -62,6 +63,13 @@ permissions:
   contents: read
   issues: read
   pull-requests: read
+  # ⛔ `checks: read` IS REQUIRED BY #3440, NOT OPTIONAL (#3440 review round 3, P2). The gate now
+  # reads `GET /repos/{owner}/{repo}/commits/{ref}/check-runs`, which GitHub documents as needing
+  # the "Checks" repository permission (read). Public repos answer without it, which is why the
+  # fleet's own repos are unaffected — but a PRIVATE consumer repo would get 403, the reader would
+  # answer `surface-unknown`/8, and check (c) would refuse EVERY PR whose marker sits at an earlier
+  # head: fail-closed, and a legitimate caller newly refused. Grant it here.
+  checks: read
 
 jobs:
   pipeline-compliance:
