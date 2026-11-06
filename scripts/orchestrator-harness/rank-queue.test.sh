@@ -1710,7 +1710,9 @@ ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not rep
 
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
-sed 's/if \[ -s "\$o\/.pool-sat" \]; then/if false; then/' "$FNS" > "$MUT_NOSAT"
+# The anchor is the READ itself, so it survives a change of guard shape (it has already drifted once,
+# from `[ -s ]` to the read-status form: the `cmp` below caught it rather than passing vacuously).
+sed 's|if ! _sat_raw=.*then|if false; then|' "$FNS" > "$MUT_NOSAT"
 if cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null; then rc=1; echo "      the .pool-sat mutation did not apply — the sed anchor drifted"; else
   d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
@@ -1743,7 +1745,13 @@ ck "(14d) the UNRANKED arm names a RECOGNISED clipped tier (and carries windows=
 printf 'EVIL-not-a-tier\n' > "$_d14/o/.pool-sat"
 ( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unrec" 2>&1
 _r14="$(cat "$_d14/out-unrec" 2>/dev/null)"
+# ⛔ A POSITIVE ASSERTION, NOT ONLY TWO NEGATIONS (review P2, cycle 41). `names no tier this code
+# recognises` is `_why_none`'s wording; the `_sat_said` clause says "carried no tier NAME". Grading the
+# clip claim only by `! grep windows=TRUNCATED` / `! grep 'tier window was clipped'` catches one spelling
+# and misses its paraphrase — measured: a re-claim in prose passed all four predicates. The honest clause
+# is asserted positively ("NO clip is asserted"), so replacing it with any claim of a clip fails.
 if grep -q 'unranked:' <<<"$_r14" && grep -q 'names no tier this code recognises' <<<"$_r14" \
+   && grep -q 'NO clip is asserted and no tier is repeated here' <<<"$_r14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_r14" && ! grep -q 'tier window was clipped' <<<"$_r14"; then rc=0
 else rc=1; echo "      (b) unranked+unrecognised '$(printf '%s' "$_r14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) an UNRECOGNISED window record is NOT reported as a clip this pass measured (no windows=TRUNCATED clause at all)" $rc
@@ -1773,13 +1781,37 @@ printf 'aaa\nbbb\n' > "$_d14c/o/candidates.txt"; printf '200\n' > "$_d14c/o/.poo
 printf 'P1-severe\n' > "$_d14c/o/.pool-sat"; chmod 000 "$_d14c/o/.pool-sat"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14c/drive.sh"
 ( cd "$_d14c" && HOME="$_d14c" bash drive.sh "$_d14c/o" ) > "$_d14c/out" 2>&1
-_x14="$(cat "$_d14c/out" 2>/dev/null)"; chmod 644 "$_d14c/o/.pool-sat" 2>/dev/null || true
-if [ ! -r "$_d14c/o/.pool-sat" ] 2>/dev/null; then
-  rc=0; echo "      (skipped: this host can still read a 000 file — usually root)"
-elif grep -q 'could not be READ' <<<"$_x14" && ! grep -qi 'permission denied' <<<"$_x14" \
-     && ! grep -q 'windows=TRUNCATED' <<<"$_x14"; then rc=0
+_x14="$(cat "$_d14c/out" 2>/dev/null)"
+# ⛔ THE SKIP IS DECIDED WHILE THE FILE IS STILL 000 (review P2, cycle 41). Testing `[ -r ]` AFTER the
+# restore asked "is it unreadable now", which is false for the owner on every host — the advertised skip
+# could never fire, and on a host where `chmod 000` does not bind the check graded a run that never took
+# the unread branch. Readability is sampled before the restore, the way `mandate-preflight.test.sh` and
+# `claim-reaper.test.sh` do it.
+if [ -r "$_d14c/o/.pool-sat" ]; then _bis_skipped=1; else _bis_skipped=0; fi
+chmod 644 "$_d14c/o/.pool-sat" 2>/dev/null || true
+if [ "$_bis_skipped" = "1" ]; then
+  rc=0; echo "      (skipped: this user can read a 000 file — running as root?)"
+elif grep -qi 'permission denied' <<<"$_x14"; then
+  rc=1; echo "      the shell's own message reached the operator line '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
+elif grep -q 'could not be READ' <<<"$_x14" \
+     && grep -q 'tier-window record could not be read, so no cause is asserted' <<<"$_x14" \
+     && ! grep -q 'windows=TRUNCATED' <<<"$_x14" \
+     && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_x14"; then rc=0
 else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
-ck "(14d) an UNREADABLE window record asserts NO clip and leaks no shell 'Permission denied'" $rc
+ck "(14d) an UNREADABLE window record asserts NO clip (both clauses) and leaks no shell 'Permission denied'" $rc
+
+# 14d-ter) A RECORD THAT EXISTS BUT CANNOT BE OPENED IS THE SAME STATE (review P3, cycle 41). `[ -s ]` and
+# `[ -r ]` are both TRUE for a directory, so a test-shaped guard let it through unread and reported "held
+# nothing this code could classify" over zero bytes. The read-status guard must classify it as unread.
+_d14d="$TMP/arm-clip-dir"; rm -rf "$_d14d"; mkdir -p "$_d14d/o/.pool-sat"
+printf 'aaa\nbbb\n' > "$_d14d/o/candidates.txt"; printf '200\n' > "$_d14d/o/.pool"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14d/drive.sh"
+( cd "$_d14d" && HOME="$_d14d" bash drive.sh "$_d14d/o" ) > "$_d14d/out" 2>&1
+_y14="$(cat "$_d14d/out" 2>/dev/null)"
+if grep -q 'could not be READ' <<<"$_y14" && ! grep -q 'held nothing this code could classify' <<<"$_y14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_y14" && ! grep -qi 'is a directory' <<<"$_y14"; then rc=0
+else rc=1; echo "      directory record '$(printf '%s' "$_y14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a window-record PATH that cannot be opened is reported as unread, not as empty" $rc
 
 # 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
 MUT_NOSAT2="$TMP/fns-nosat2.sh"

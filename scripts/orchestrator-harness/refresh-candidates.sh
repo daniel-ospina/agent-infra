@@ -3962,7 +3962,7 @@ queue_order_refuse() {
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
 # silently inert, and a caller that skipped it would leave every assertion here green.
 queue_order_from_pool() {
-  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said _sat_unread _why_none
+  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_raw _sat_said _sat_unread _why_none
   [ -n "$o" ] || return 1
   rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
   if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
@@ -4078,20 +4078,27 @@ queue_order_from_pool() {
   # cannot inject text into an operator-facing line. An unreadable mix is disclosed as such rather than
   # printed. Absent file = no tier was truncated (the normal case) and no clause is added.
   _sat=""; _sat_junk=0; _sat_tier=""; _sat_unread=0
-  # ⛔ THE READ IS GUARDED, LIKE THE `.queue-rank` ONE ABOVE (review P3, cycle 40). Without `[ -r ]` the
-  # shell's own `Permission denied` lands on stderr above an otherwise honest operator line — the exact
-  # defect the comment twenty lines up documents — and the BLOCKED read was then classified as
-  # `unrecognised`, i.e. "no tier was clipped". An unreadable record is its own state and asserts nothing.
-  if [ -s "$o/.pool-sat" ] && [ ! -r "$o/.pool-sat" ]; then
-    _sat_unread=1
-  elif [ -s "$o/.pool-sat" ]; then
+  # ⛔ THE READ IS GUARDED, AND THE GUARD IS THE READ ITSELF (review P3, cycle 40; hardened cycle 41). A
+  # `[ -r ]` test is a TOCTOU, not a read guard: a directory passes `[ -s ]` AND `[ -r ]`, is never read,
+  # and was then reported as "held nothing this code could classify" — a measured claim over zero bytes.
+  # A record REMOVED between the test and the `done <` redirect (reachable: a concurrent pass deletes this
+  # file at its own entry, see the note above `queue_order_from_pool`) landed in the same state AND printed
+  # the shell's own message, because `2>/dev/null` on a `done` compound does not cover the redirect that
+  # opens it — the same mechanism the `.queue-rank` comment twenty lines up documents. `cat` gives an
+  # OBSERVABLE status for every shape at once, so the read cannot fail silently and the two cases below
+  # are decided by what actually happened. Absent record: no clause, and `_sat_unread` stays 0.
+  if ! _sat_raw="$(cat "$o/.pool-sat" 2>/dev/null)"; then
+    if [ -e "$o/.pool-sat" ] || [ -L "$o/.pool-sat" ]; then
+      _sat_unread=1
+    fi
+  elif [ -n "$_sat_raw" ]; then
     while IFS= read -r _sat_tier; do
       case "$_sat_tier" in
         P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
         "") : ;;
         *) _sat_junk=1 ;;
       esac
-    done < "$o/.pool-sat" 2>/dev/null
+    done <<<"$_sat_raw"
     [ -n "$_sat" ] || _sat="unrecognised"
   fi
   _sat_said=""
