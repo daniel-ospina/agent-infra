@@ -1781,7 +1781,7 @@ is_limit "${STALE_MIN:-}" || STALE_MIN=40
 # same module the spawner uses, so "what the controller counts", "what it reaps" and "what it starts"
 # cannot disagree. The tmux sessions it used to kill are still covered: they are in the same census.
 reap_stale_workers() {
-  local s f age m _wn=0 _wl=""
+  local s f age m _wm _wn=0 _wl=""
   while IFS="$(printf '\t')" read -r s _st; do
     case "$s" in ''|*[!A-Za-z0-9-]*) continue ;; esac
     # ⛔ `review-*` IS IN THIS LIST NOW (owner ruling 2026-11-04) AND IT WAS THE EXPENSIVE OMISSION.
@@ -1800,7 +1800,15 @@ reap_stale_workers() {
     age=$(( $(date +%s) - m ))
     # The wedge measurement the cascade reports (owner ask: "check for wedged lanes"). Counted here,
     # at the ONE place that already walks the census with an age, rather than in a second walk.
-    if [ "$age" -gt $(( $( _wedge_min ) * 60 )) ]; then _wn=$(( _wn + 1 )); _wl="${_wl:+$_wl,}$s(${age}s)"; fi
+    # ⛔ THE HELPER IS NOT IN SCOPE IN EVERY RIG THAT DRIVES THIS FUNCTION (review 2026-11-04, P0).
+    # Two shipped extractors pull `reap_stale_workers` + `is_num` + `file_mtime_epoch` out STANDALONE
+    # (`selftest.sh:2751`, `:4092`) and `_wedge_min` is defined ~1,900 lines BELOW this body — so the
+    # call was `command not found`, `$(( * 60 ))` was an ARITHMETIC ERROR, and that ABORTED THE WHOLE
+    # REAPER (measured: rc=1, no log line written, four assertions red). The `m=` line above is
+    # guarded for exactly this reason; this is the same failure mode one line later. A missing helper
+    # must degrade to the documented bound (STALE_MIN*2 = 80), never abort the pass.
+    _wm="$( _wedge_min 2>/dev/null )"; is_num "${_wm:-}" || _wm=80
+    if [ "$age" -gt $(( _wm * 60 )) ]; then _wn=$(( _wn + 1 )); _wl="${_wl:+$_wl,}$s(${age}s)"; fi
     [ "$age" -gt $(( 10#${STALE_MIN} * 60 )) ] || continue
     echo "[reap-worker] $s silent ${age}s -> closing its worker surface" >> "$LOG"
     # ⛔ A KILL THAT CANNOT BE PROVEN IS NOT A KILL. wt_close() re-reads the surface after closing and
@@ -1820,9 +1828,9 @@ EOF
   # reaper's own bound — i.e. a record that survived two reap attempts, the only state in which a
   # corpse can still be holding a PR.
   if [ "${_wn:-0}" -gt 0 ]; then
-    echo "[reap-worker] wedged=$_wn records alive past $( _wedge_min )m with no log progress: $_wl — these are EXCLUDED from ownership this pass (the PRs they held are dispatchable again) and are re-closed every cycle until the close can be proven" >> "$LOG"
+    echo "[reap-worker] wedged=$_wn records alive past ${_wm:-?}m with no log progress: $_wl — these are EXCLUDED from ownership this pass (the PRs they held are dispatchable again) and are re-closed every cycle until the close can be proven" >> "$LOG"
   else
-    echo "[reap-worker] wedged=0 (no worker record is alive past $( _wedge_min )m with a log that has stopped advancing)" >> "$LOG"
+    echo "[reap-worker] wedged=0 (no worker record is alive past ${_wm:-?}m with a log that has stopped advancing)" >> "$LOG"
   fi
 }
 
@@ -3033,12 +3041,20 @@ cascade_issue_slots() { # <max_lanes> <lanes> <backlog> [<can_spawn 0|1>] -> iss
 # the instant a lane finishes instead of sleeping through it. The poll is CASCADE_POLL seconds (20) —
 # a measurement cadence, not a pacing rule: it decides nothing except how soon the same question is
 # asked again, and the loop's own bound (the jittered CYC interval) still ends it.
-cascade_wait() { # <nap_seconds>
-  local left="${1:-0}" poll="${CASCADE_POLL:-20}" used=0 ok
+cascade_wait() { # <nap_seconds> <lanes_at_pass_end> -> 0 a slot FREED · 1 the interval expired
+  # ⛔ IT MEASURES A SLOT BEING FREED, NOT ROOM EXISTING (review 2026-11-04, P1). The first version
+  # re-asked the ALLOCATOR, and the allocator answers a different question: on any pass where a
+  # pyramid level HELD the room, `cascade_issue_slots` returns tickets on the very first sample while
+  # nothing has changed — so the loop logged `a slot freed after 20s` every cycle and re-swept every
+  # ~20s instead of every ~240s. That is a false log claim AND a pacing change, which the owner's ask
+  # explicitly forbids ("no new pacing"). The datum that can actually change is the LANE CENSUS, so
+  # the sample is `LANES` and the answer is "it went DOWN".
+  local left="${1:-0}" base="${2:-}" poll="${CASCADE_POLL:-20}" used=0 ok
   is_num "${left:-}" || left=0
   is_num "${poll:-}" || poll=20
   [ "$poll" -ge 1 ] || poll=20
   [ "$left" -gt 0 ] || return 1
+  is_num "${base:-}" || return 1   # no baseline ⇒ nothing to compare against ⇒ let the interval run
   while [ "$left" -gt 0 ]; do
     [ "$left" -lt "$poll" ] && poll="$left"
     fork_free_sleep "$poll" || sleep "$poll" 2>/dev/null
@@ -3046,8 +3062,11 @@ cascade_wait() { # <nap_seconds>
     L="$(load1)"
     measure_lanes
     ok=0; can_spawn && ok=1
-    if [ "$(cascade_issue_slots "${MAX_LANES:-}" "${LANES:-}" "1" "$ok")" -gt 0 ]; then
-      echo "[cascade] a slot freed after ${used}s (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}) — RE-CYCLING NOW instead of napping the rest of the ${CYC:-240}s interval. Owner ruling 2026-11-04: fill the capacity, do not sleep through it." >> "$LOG"
+    # A slot FREED means the census DROPPED below the pass-end count. An UNREADABLE census cannot
+    # show that, so it never counts as freed (an unreadable read must not add work — the same
+    # polarity `cascade_issue_slots` takes on the room).
+    if is_num "${LANES:-}" && [ "$LANES" -lt "$base" ] && [ "$ok" = "1" ]; then
+      echo "[cascade] a slot FREED after ${used}s (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}, was ${base}) — RE-CYCLING NOW instead of napping the rest of the ${CYC:-240}s interval. Owner ruling 2026-11-04: fill the capacity, do not sleep through it." >> "$LOG"
       return 0
     fi
   done
@@ -3107,20 +3126,66 @@ cascade_main_probe() {
   local repo="${1:-${OR:-}}" raw n tok out
   [ -n "$repo" ] || { rm -f "$O/state/main-verdict" 2>/dev/null || true; return 1; }
   out="$O/state/main-verdict"
-  raw="$(gh api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" 2>/dev/null \
-        | python3 -c '
-import json,sys
-try:
-    d=json.load(sys.stdin)
-except Exception:
-    sys.exit(3)
-red=[]
-for c in d.get("check_runs") or []:
-    if c.get("status") != "completed":
+  # ⛔ THE NEWEST ATTEMPT PER (app, job) DECIDES, AND THE LISTING IS PAGINATED (review 2026-11-04, P1).
+  # The first version took ANY completed non-green run on `filter=all` as a red. `filter=all` returns
+  # EVERY ATTEMPT, so a job that failed once and passed on the re-run read RED for ever — and a
+  # 100-run page silently hid a red on page 2. That is the defect AGENTS.md's "Reading verification
+  # state" rule names verbatim: *a re-run ADDS a red — it does not clear one*, so the flakier a check
+  # is the redder a green commit looks. The consequence here is not cosmetic: a permanent phantom red
+  # pins level 1 (FIX_MAIN), which zeroes the issue batch on every pass — the barrier this change
+  # exists to remove, re-created one level up.
+  # The grouping key is `(app.slug, job name)`, which is the RAIL's own key (`admin-merge.sh` groups
+  # checks by `(app, name)`); the two must not answer "is main red" differently, and the rail states
+  # the residual it accepts (two workflows publishing the same job name). Ordering is by check-run
+  # `id`, never `started_at` (nullable for a queued attempt).
+  # ⛔ DECLARED LIMIT: the rail additionally EXEMPTS a red whose workflow declares no `pull_request`
+  # trigger (a push-only job cannot be measured by a PR) and reds on non-code events. This probe does
+  # NOT reproduce that classifier — a second implementation of it is the defect class this file names
+  # — so a push-only workflow that is legitimately red on main reads RED here. That is the honest
+  # residual, it is filed, and it fails in the direction that keeps a red-looking main first.
+  # Payload: one TSV row per ATTEMPT via `--jq` (that is what makes `--paginate` concatenable — `gh`
+  # emits one JSON object PER PAGE, and a naive `json.load` reads only the first).
+  # ⛔ `gh` IS READ FIRST, INTO A VARIABLE, SO ITS FAILURE CANNOT READ AS GREEN. Piping `gh` straight
+  # into python makes the pipeline's status PYTHON's: a transport failure produces an EMPTY stdin, the
+  # helper prints GREEN, and a blind read becomes an all-clear — the fail-open this probe exists to
+  # avoid. The rc is checked before anything is interpreted.
+  local rows rc
+  rows="$(gh api "repos/$repo/commits/main/check-runs?per_page=100&filter=all" --paginate \
+        --jq '.check_runs[] | [.id, (.app.slug // "?"), (.name // "?"), (.status // ""), (.conclusion // "")] | @tsv' 2>/dev/null)"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    printf 'UNMEASURED the listing could not be read this pass (gh rc=%s)\n' "$rc" > "$out" 2>/dev/null && return 1
+    rm -f "$out" 2>/dev/null || true
+    return 1
+  fi
+  raw="$(printf '%s\n' "$rows" | python3 -c '
+import sys
+GREEN = ("success", "neutral", "skipped", "cancelled", "stale")
+newest = {}
+any_row = False
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if not line:
         continue
-    if c.get("conclusion") in ("success","neutral","skipped","cancelled","stale"):
+    f = line.split("\t")
+    if len(f) < 5:
         continue
-    red.append(str(c.get("name") or "?"))
+    any_row = True
+    try:
+        cid = int(f[0])
+    except ValueError:
+        continue
+    key = (f[1], f[2])
+    prev = newest.get(key)
+    if prev is None or cid > prev[0]:
+        newest[key] = (cid, f[3], f[4])
+red = []
+for (slug, name), (_cid, status, concl) in newest.items():
+    if status != "completed":
+        continue          # in flight: NOT YET KNOWN, and not a red
+    if concl in GREEN:
+        continue
+    red.append(name)
 print(("RED:" + ",".join(sorted(set(red))[:8])) if red else "GREEN")
 ' 2>/dev/null)" || raw=""
   case "${raw:-}" in
@@ -3173,14 +3238,30 @@ cascade_level() {
   # ⛔ EVERY FIELD IS SANITISED BEFORE IT ENTERS THE STRING: the head must look like a git object id
   # and the class must be one of the four the sweep writes, so a crafted row cannot forge a token
   # that matches some other PR (the same hardening `disp()` applies to its own record).
+  # ⛔ LAST ROW WINS, NOT FIRST — AND IT IS THE FILE'S OWN DOCUMENTED RULE (`lo_class_compact`,
+  # live-ownership.sh: *"keep only the LAST row per PR … last-row-wins is the same rule the ordering
+  # read applies"*). The set below deduped instead, so when one head carried BOTH a GREEN and a RED
+  # observation the GREEN token was kept and level 2 (MERGE) beat level 3 (FIX_PR) — a healthy answer
+  # preferred over a failing one, on the one question that decides whether a merge is attempted
+  # (review 2026-11-04, P2). The reduction runs in ONE forward pass and keeps the LAST class seen per
+  # (pr, head), which is what the class file means by its own ordering.
+  # ⛔ NO FORK PER ROW: the reduction is `sed`+`sort`-free awk over the file (a 70-PR box x a compacted
+  # 70-row class file), because the loop's fork headroom is itself a dispatch gate (#2293).
   local clsf="$d/prclass.tsv" cls_set=" " _p _h _c
   if [ -f "$clsf" ]; then
-    while IFS="$(printf '\t')" read -r _p _h _c; do
-      case "${_p:-}" in ''|*[!0-9]*) continue ;; esac
-      case "${_c:-}" in GREEN|RED|PENDING|NOCHECKS) : ;; *) continue ;; esac
-      case "${_h:-}" in ''|*[!A-Za-z0-9]*) continue ;; esac
-      case "$cls_set" in *" $_p:$_h:$_c "*) : ;; *) cls_set="$cls_set$_p:$_h:$_c " ;; esac
-    done < "$clsf"
+    cls_set=" $(awk -F'\t' '
+      NF >= 3 {
+        p = $1; h = $2; c = $3
+        if (p !~ /^[0-9]+$/) next
+        if (c != "GREEN" && c != "RED" && c != "PENDING" && c != "NOCHECKS") next
+        if (h == "" || h ~ /[^A-Za-z0-9]/) next
+        last[p SUBSEP h] = c          # LAST observation wins (the file is append-only)
+        key[p SUBSEP h] = p ":" h
+        seen[p SUBSEP h] = 1
+      }
+      END { for (k in seen) printf "%s:%s ", key[k], last[k] }
+    ' "$clsf" 2>/dev/null) "
+    [ -n "${cls_set// /}" ] || cls_set=" "
   fi
   for tok in $list; do
     pr="${tok%%:*}"; rest="${tok#*:}"; sha="${rest%%:*}"; br="${rest#*:}"
@@ -6658,8 +6739,22 @@ PY
   # ⛔ THE PASS ENDED WITH WORK WAITING AND NO ROOM: that is the one state in which the interval is
   # worth spending on a poll (`cascade_wait`) instead of a fixed nap. Work waiting means EITHER issue
   # backlog OR un-owned PR work — both are dispatched by the next pass that finds a free slot.
+  # ⛔ POLLING IS FOR A **FULL** BOX, AND FOR NOTHING ELSE (review 2026-11-04, P1). The trigger is
+  # "there is work waiting AND no room EXISTS", not "this pass granted no room": a pass whose room was
+  # withheld by a pyramid LEVEL has capacity — the level is spending it — and re-cycling every 20s
+  # there just re-runs a sweep that cannot change until the lane finishes. The pre-change interval is
+  # correct for that state, and the whole point of the cascade is that it adds NO pacing.
+  # ⛔ AND IT IS THE SAME ARITHMETIC THE ALLOCATOR USES (`max_lanes - lanes`), never a second
+  # derivation: two answers to "is there room" is how the total and its parts came to disagree here.
+  CASCADE_ROOM=0
+  if is_num "${MAX_LANES:-}" && is_num "${LANES:-}"; then CASCADE_ROOM=$(( MAX_LANES - LANES )); fi
+  # ⛔ PLAIN `&&` ON ONE LOGICAL LINE, NO BACKSLASH CONTINUATION AND NO BRACE GROUP: this file is
+  # parsed by bash 3.2 in CI, and a continued `&& { … };` condition is the one shape this change kept
+  # producing syntax errors in. Two booleans cost two lines and cannot be mis-parsed.
+  CASCADE_WAITING=0
+  if [ "${CASCADE_BACKLOG:-0}" -gt 0 ] || [ -n "${MP_PRIORITY:-}" ]; then CASCADE_WAITING=1; fi
   CASCADE_WAIT=0
-  if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && { [ "${CASCADE_BACKLOG:-0}" -gt 0 ] || [ -n "${MP_PRIORITY:-}" ] || [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ]; }; then
+  if [ "${CASCADE_ROOM:-0}" -le 0 ] && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_WAITING:-0}" = "1" ]; then
     CASCADE_WAIT=1
   fi
   # ⛔ THE FUNNEL'S ONE NEW INPUT, DERIVED FROM THE SAME MEASUREMENT THE BATCH USES (never a second
@@ -6673,10 +6768,12 @@ PY
   # priority string. Without this term `pr_waiting=0` would tell the funnel "the PR sweep left room"
   # on a pass where the room was WITHHELD — the funnel would print "DISPATCH — CASCADE" and nothing
   # would dispatch, which is a false PASS rather than a wrong number.
-  if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] \
-     && { [ -n "${MP_PRIORITY:-}" ] || [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ] || [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; }; then CASCADE_PR_WAITING=1; fi
+  # ⛔ SAME RULE AS ABOVE: one logical line, no continuation, no brace group (the 3.2 parser in CI).
+  CASCADE_PRW=0
+  if [ -n "${MP_PRIORITY:-}" ] || [ "${CASCADE_LEVEL_HOLDS:-0}" = "1" ] || [ "${CASCADE_UPN_UNREADABLE:-0}" = "1" ]; then CASCADE_PRW=1; fi
+  if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && [ "${CASCADE_PRW:-0}" = "1" ]; then CASCADE_PR_WAITING=1; fi
   # [cascade:end]
-  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
+  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
   # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
   # ⛔ ONLY THE FIRST GATE THAT FIRED WAS EVER VISIBLE. `GATE_WHY` is ONE string and the arms were an
   # `elif` chain, so the first arm that fired MASKED every arm behind it — and the arm that fires first

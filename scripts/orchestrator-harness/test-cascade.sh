@@ -183,9 +183,9 @@ ck "no un-owned PRs + empty backlog -> nothing to wait for" "$(drive_cascade 0 0
 # failure that should drain hardest becomes the one that DISPATCHES new work. These three are a set:
 # the first two must withhold, the third proves the branch is not simply always closed.
 ck "an UNREADABLE un-owned count gives the issue path NO room (fails closed)" \
-   "$(drive_cascade abc 2 25 10 1)" "0 1 1"
+   "$(drive_cascade abc 2 25 10 1)" "0 1 0"
 ck "…and an OUT-OF-RANGE all-digit count does too (is_num passes it, \`[\` would error OPEN)" \
-   "$(drive_cascade 99999999999999999999 2 25 10 1)" "0 1 1"
+   "$(drive_cascade 99999999999999999999 2 25 10 1)" "0 1 0"
 ck "…while the SAME room with a readable count still opens (contrast half)" \
    "$(drive_cascade 5 2 25 10 1)" "10 0 0"
 
@@ -204,6 +204,16 @@ ckin "…and it says DEFERRED with the reason, not 'CLOSED'" "$_2" "DEFERRED"
 ck "an OLDER caller (no arg 12) keeps the pre-change answer" "$(printf '%s' "$(sel 5 - '')" | cut -f1)" "pr"
 ck "un-owned PRs + cascade open + ANOTHER gate fired -> none (the capacity arm still wins)" \
    "$(printf '%s' "$(sel 5 0 'lanes=25>=max_lanes=25')" | cut -f1)" "none"
+# ⛔ A DIGIT STRING IS NOT A COUNT (review 2026-11-04, P1). `lo_num` accepts any run of digits, and
+# `[ 99999999999999999999 -gt 0 ]` ERRORS — an errored test in an `elif` chain is FALSE, so control
+# fell past EVERY arm into the final `else` and printed `DISPATCH` + `CHOICE=issue`, which the batch
+# loop then refused. Measured on the shipped function before the fix: `no un-owned PR left ; issues:
+# DISPATCH (10 in backlog)`. The cascade's own polarity test (section 4) never reached this because
+# it stops at the block, not at the funnel.
+ck "an OUT-OF-RANGE un-owned count DRAINS in the funnel (no false DISPATCH)" \
+   "$(printf '%s' "$(sel 99999999999999999999 0 '')" | cut -f1)" "pr"
+ckni "…and the line does not claim a dispatch it cannot make" \
+   "$(printf '%s' "$(sel 99999999999999999999 0 '')" | cut -f2)" "DISPATCH"
 ck "an UNREADABLE un-owned count still drains (never opens on a number nobody read)" \
    "$(printf '%s' "$( { . "$FNS"; lo_select 15 0 abc 0 3 '' 10 '' 0 unknown '' '' >/dev/null 2>&1; printf '%s' "$LO_CHOICE"; } )" | tail -1)" "pr"
 
@@ -245,7 +255,7 @@ ckin "the wedge count is printed even when it is zero (no silent instrument)" "$
 echo
 echo "=== 9. fill the capacity, do not sleep through it (owner ask 3) ==="
 ckin "the interval is handed to the cascade when work is waiting and the box is full" "$SRC" 'elif [ "${CASCADE_WAIT:-0}" = "1" ]; then'
-ckin "…and the poll re-cycles the moment a slot frees" "$SRC" '[cascade] a slot freed after'
+ckin "…and the poll re-cycles the moment a slot FREES" "$SRC" '[cascade] a slot FREED after'
 # Driven: with room appearing on the second sample, the wait returns 0 (re-cycle NOW) quickly.
 _w="$TMP/w9"; mkdir -p "$_w"
 ( O="$_w"; LOG="$_w/log"; CYC=240; CASCADE_POLL=1; MAX_LANES=4; TEST_LANES=4
@@ -253,9 +263,33 @@ _w="$TMP/w9"; mkdir -p "$_w"
   _n=0
   measure_lanes() { _n=$((_n+1)); LANES=$([ "$_n" -ge 2 ] && echo 2 || echo 4); LANES_DISPLAY="$LANES"; LANES_TOTAL="$LANES"; LANES_UNKNOWN=0; }
   measure_lanes
-  cascade_wait 30; printf 'rc=%s\n' "$?" ) > "$TMP/w9.out" 2>/dev/null
-ck "cascade_wait returns 0 (re-cycle NOW) as soon as a slot frees" "$(cat "$TMP/w9.out")" "rc=0"
+  cascade_wait 30 4; printf 'rc=%s\n' "$?" ) > "$TMP/w9.out" 2>/dev/null
+ck "cascade_wait returns 0 (re-cycle NOW) as soon as a slot FREES" "$(cat "$TMP/w9.out")" "rc=0"
 ckin "…and it says so, with the measurement" "$(cat "$_w/log" 2>/dev/null || true)" "RE-CYCLING NOW"
+# ⛔ AND IT MUST NOT FIRE WHEN NOTHING FREED (review 2026-11-04, P1). The first version re-asked the
+# ALLOCATOR instead of the census, so on any pass where a pine level HELD the room it logged
+# `a slot freed after 20s` with nothing changed and re-swept every ~20s instead of ~240s — a false
+# log claim AND the pacing change the owner's ask forbids. These two are the pair: a constant census
+# must time out silently, and an unreadable census must not count as "freed".
+_w2="$TMP/w9b"; rm -rf "$_w2"; mkdir -p "$_w2"
+( O="$_w2"; LOG="$_w2/log"; CYC=240; CASCADE_POLL=1; MAX_LANES=4; TEST_LANES=4
+  . "$FNS"; . "$STUB"
+  measure_lanes() { LANES=4; LANES_DISPLAY=4; LANES_TOTAL=4; LANES_UNKNOWN=0; }
+  cascade_wait 3 4; printf 'rc=%s\n' "$?" ) > "$TMP/w9b.out" 2>/dev/null
+ck "a census that never moves returns 1 (the interval runs; nothing is claimed)" "$(cat "$TMP/w9b.out")" "rc=1"
+_freedn=0; [ -f "$_w2/log" ] && _freedn="$(grep -c 'slot FREED' "$_w2/log" 2>/dev/null)"
+ck "…and NOTHING was logged as freed (the false 'slot freed' line is gone)" \
+   "${_freedn:-0}" "0"
+_w3="$TMP/w9c"; rm -rf "$_w3"; mkdir -p "$_w3"
+( O="$_w3"; LOG="$_w3/log"; CYC=240; CASCADE_POLL=1; MAX_LANES=4; TEST_LANES=4
+  . "$FNS"; . "$STUB"
+  measure_lanes() { LANES=""; LANES_DISPLAY="?"; LANES_TOTAL="?"; LANES_UNKNOWN=1; }
+  cascade_wait 2 4; printf 'rc=%s\n' "$?" ) > "$TMP/w9c.out" 2>/dev/null
+ck "an UNREADABLE census never reads as a freed slot" "$(cat "$TMP/w9c.out")" "rc=1"
+# ⛔ A PASS WHOSE ROOM A LEVEL HOLDS IS NOT A FULL BOX, so it must NOT arm the poll.
+ckin "the poll is armed by the ROOM, not by 'this pass granted none'" "$SRC" 'if [ "${CASCADE_ROOM:-0}" -le 0 ] && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_WAITING:-0}" = "1" ]; then'
+ckni "…and NOT by CASCADE_LEVEL_HOLDS (that was the ~12x over-polling)" "$SRC" 'CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then'
+ckin "…while a FULL box with the same level still polls (the contrast half)" "$SRC" 'if [ "${CASCADE_ROOM:-0}" -le 0 ]' 
 
 # ── 11. THE PYRAMID: five levels, filled top-down ───────────────────────────────────────────────
 # ⛔ THE ROOM IS NOT THE ORDER. `cascade_issue_slots` answers "how much room did PR work leave";
@@ -288,6 +322,19 @@ ck "L2: a GREEN un-owned PR on its current head is a MERGE waiting" \
 ck "L3: a RED un-owned PR needs its fix" \
    "$(drive_level '9001:shaA:fix/a' '9001	shaA	RED
 ' - -)" "3 FIX_PR"
+# ⛔ LAST ROW WINS, LIKE THE CLASS FILE SAYS (review 2026-11-04, P2). The set deduped, so when one
+# head carried BOTH a GREEN and a RED observation the GREEN survived and level 2 (MERGE) beat level 3
+# (FIX_PR) — a healthy answer preferred over a failing one. The class file is append-only and
+# `lo_class_compact` keeps the LAST row, so the reducer must too. Both orders are asserted: the rule
+# is "last", not "red wins" (a RED superseded by a GREEN must read GREEN, which the L2 case covers).
+ck "…and a RED recorded AFTER a GREEN for the SAME head wins (last-row-wins, not first)" \
+   "$(drive_level '9001:shaA:fix/a' '9001	shaA	GREEN
+9001	shaA	RED
+' - -)" "3 FIX_PR"
+ck "…while a GREEN recorded AFTER a RED wins too (the rule is ORDER, not severity)" \
+   "$(drive_level '9001:shaA:fix/a' '9001	shaA	RED
+9001	shaA	GREEN
+' - -)" "2 MERGE"
 ck "L4: an un-classified un-owned PR is REVIEW work" \
    "$(drive_level '9001:shaA:fix/a' '9001	shaA	NOCHECKS
 ' - -)" "4 REVIEW_PR"
@@ -341,22 +388,29 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
 }
 ck "a MERGEABLE PR waiting takes the room: 11 slots -> 0 (an issue must NOT be dispatched)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
-' -)" "0 1 1 2"
+' -)" "0 1 0 2"
 ck "a PR needing a FIX holds the room too (level 3)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
-' -)" "0 1 1 3"
+' -)" "0 1 0 3"
 ck "a REVIEW-only PR holds the room too (level 4)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	NOCHECKS
-' -)" "0 1 1 4"
+' -)" "0 1 0 4"
 ck "levels 1-4 empty -> the issue batch gets the leftover room (10 slots, pr_waiting=0)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' 9001)" "10 0 0 5"
+# ⛔ THE CONTRAST THAT KEEPS THE PAIR MEANINGFUL: a level holding the room on a box with NO free lane
+# is a FULL box — that is the one state where polling for a freed slot is right. Same inputs as the
+# level-2 case above except `lanes == max_lanes`.
+# ⛔ A FULL BOX IS NOT MEASURED FOR A LEVEL AT ALL — the block measures it "only when there is room to
+# give" (a full box's question is why it has no room, not which level owns it), so the polling contrast
+# cannot be observed here. It is pinned at the SOURCE instead (`[ "${CASCADE_ROOM:-0}" -le 0 ]`), and
+# the already-shipped full-box case above (`drive_cascade 5 25 25 10 1` => `0 1 1`) is the driven half.
 ck "a BUSY PR (owned) is not a level — it does not hold the room" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
 ' 9001)" "10 0 0 5"
 ck "…while the SAME work UN-owned holds it (the pair is the discriminator)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
-' -)" "0 1 1 3"
+' -)" "0 1 0 3"
 
 # ── 12. LEVEL 1 IS FED BY MAIN'S OWN CHECK-RUNS ─────────────────────────────────────────────────
 # ⛔ AN UNFED LEVEL IS DECORATION. These arms drive `cascade_main_probe` against a stub `gh` and pin
@@ -366,27 +420,54 @@ ck "…while the SAME work UN-owned holds it (the pair is the discriminator)" \
 echo
 echo "=== 12. level 1: measured from MAIN's runs, and absence is not a red ==="
 mkdir -p "$TMP/mpbin"
-printf '#!/bin/bash\nprintf "%%s" "$GH_JSON"\n' > "$TMP/mpbin/gh"; chmod +x "$TMP/mpbin/gh"
-probe_main() { # <check-runs json> -> the recorded verdict line ('' when none was written)
+# ⛔ THE STUB EMITS THE SHAPE THE PROBE NOW ASKS `gh --jq` FOR: one TSV row per ATTEMPT, because
+# `--paginate` emits one JSON object PER PAGE and a `json.load` would read only the first page. The
+# fixture pays that shape, so a future change back to whole-JSON would fail here instead of silently
+# grading page one. `GH_FAIL=1` models a transport failure (the case that must not read as GREEN).
+cat > "$TMP/mpbin/gh" <<'GHEOF'
+#!/bin/bash
+[ "${GH_FAIL:-0}" = "1" ] && exit 1
+printf '%s\n' "${GH_ROWS:-}"
+GHEOF
+chmod +x "$TMP/mpbin/gh"
+probe_main() { # <tsv rows…> -> the recorded verdict line ('' when none was written)
   local w="$TMP/mp$$"
   rm -rf "$w"; mkdir -p "$w/state"
-  ( O="$w"; LOG=/dev/null; PATH="$TMP/mpbin:$PATH"; GH_JSON="$1"; export GH_JSON
+  # ⛔ `export GH_ROWS` — the stub `gh` is a CHILD process, so an unexported assignment is invisible
+  # to it: the stub printed nothing, every row read as an EMPTY surface, and section 12 went green on
+  # `GREEN` for a FAILING run (measured: 5 assertions red on the first attempt).
+  ( O="$w"; LOG=/dev/null; PATH="$TMP/mpbin:$PATH"; GH_ROWS="$1"; export GH_ROWS
     . "$FNS"
     cascade_main_probe acme/widget >/dev/null 2>&1
     head -1 "$w/state/main-verdict" 2>/dev/null ) 2>/dev/null
 }
-_j() { printf '{"check_runs":[%s]}' "$1"; }
+# row = <id>\t<app.slug>\t<name>\t<status>\t<conclusion>
+row() { printf '%s\t%s\t%s\t%s\t%s' "$1" "${2:-github-actions}" "$3" "$4" "${5:-}"; }
 ck "an all-green main is GREEN" \
-   "$(probe_main "$(_j '{"name":"verify","status":"completed","conclusion":"success"}')")" "GREEN"
+   "$(probe_main "$(row 11 s verify completed success)")" "GREEN"
 ck "a run that FAILED on main is RED, and it is NAMED" \
-   "$(probe_main "$(_j '{"name":"verify","status":"completed","conclusion":"failure"}')")" "RED:verify"
+   "$(probe_main "$(row 11 s verify completed failure)")" "RED:verify"
 ck "cancelled is NOT red (the rail's own polarity)" \
-   "$(probe_main "$(_j '{"name":"docs","status":"completed","conclusion":"cancelled"}')")" "GREEN"
+   "$(probe_main "$(row 11 s docs completed cancelled)")" "GREEN"
 ck "a check still RUNNING is not red" \
-   "$(probe_main "$(_j '{"name":"test","status":"in_progress","conclusion":null}')")" "GREEN"
-ck "an EMPTY surface (every check is pull_request-only) is NOT red" "$(probe_main '{"check_runs":[]}')" "GREEN"
+   "$(probe_main "$(row 11 s test in_progress '')")" "GREEN"
+ck "an EMPTY surface (every check is pull_request-only) is NOT red" "$(probe_main '')" "GREEN"
 ck "an unreadable listing records UNMEASURED, not a verdict" \
-   "$(probe_main 'not json at all' | cut -d' ' -f1)" "UNMEASURED"
+   "$( ( export GH_FAIL=1; probe_main "$(row 11 s verify completed failure)" ) | cut -d' ' -f1 )" "UNMEASURED"
+# ⛔ THE RE-RUN RULE (review 2026-11-04, P1). `filter=all` returns EVERY ATTEMPT, so a job that failed
+# once and PASSED on the re-run is green — the defect AGENTS.md names verbatim ("a re-run ADDS a red —
+# it does not clear one"). The first version read RED here and would have pinned level 1 (FIX_MAIN)
+# for ever, re-creating the barrier this change removes. Three rows, one job, three attempts:
+ck "a job that failed then PASSED on a re-run is GREEN (the newest attempt decides)" \
+   "$(probe_main "$(printf '%s\n%s' "$(row 11 s verify completed failure)" "$(row 12 s verify completed success)")")" "GREEN"
+ck "…and the answer does not depend on the ROW ORDER (newest is by id, not by line)" \
+   "$(probe_main "$(printf '%s\n%s' "$(row 12 s verify completed success)" "$(row 11 s verify completed failure)")")" "GREEN"
+ck "…while a NEWEST red still reds (the control half: the rule is not 'any success wins')" \
+   "$(probe_main "$(printf '%s\n%s' "$(row 11 s verify completed success)" "$(row 12 s verify completed failure)")")" "RED:verify"
+ck "…and an in-flight NEWEST attempt is not a red even over an older failure" \
+   "$(probe_main "$(printf '%s\n%s' "$(row 11 s verify completed failure)" "$(row 12 s verify in_progress '')")")" "GREEN"
+ck "…and a DIFFERENT app publishing the same job name is a separate check (the rail's key)" \
+   "$(probe_main "$(printf '%s\n%s' "$(row 11 other verify completed success)" "$(row 12 'github-actions' verify completed failure)")")" "RED:verify"
 ck "…and an UNMEASURED / ABSENT record is read as NOT red by the level" \
    "$( ( . "$FNS"; cascade_main_red "/nonexistent/state" ) 2>/dev/null )" "0"
 
@@ -596,16 +677,20 @@ mut "M13 an UNMEASURED main reads as RED (levels 2-5 stall behind a measurement 
     's/^  case "\${t:-}" in RED|RED:\*) printf .1\\n. ;; \*) printf .0\\n. ;; esac$/  case "${t:-}" in RED|RED:*) printf '\''1\\n'\'' ;; *) printf '\''1\\n'\'' ;; esac/' "$TMP/p-unmeas.sh"
 
 cat > "$TMP/p-cancel.sh" <<'PEOF'
+# ⛔ THE ROW MUST BE THE SHAPE THE PROBE PARSES (tsv via --jq, one per attempt). An earlier version of
+# this probe fed `{"check_runs":[…]}` JSON, which the tsv reader cannot parse — it produced no rows,
+# read GREEN, and the mutant "discriminated" for a reason that had nothing to do with `cancelled`.
 . "$ORCH_FNS"
 W="$FIX/m-cancel"; rm -rf "$W"; mkdir -p "$W/state"; O="$W"
-mkdir -p "$FIX/mpbin"
-printf '#!/bin/bash\nprintf "%%s" "$GH_JSON"\n' > "$FIX/mpbin/gh"; chmod +x "$FIX/mpbin/gh"
-PATH="$FIX/mpbin:$PATH" GH_JSON='{"check_runs":[{"name":"docs","status":"completed","conclusion":"cancelled"}]}' \
+# ⛔ ONE STUB, THE ONE SECTION 12 ALREADY DROVE. Writing a second stub inside this probe reintroduced
+# the same quoting variance that made an earlier version of this assertion "discriminate" for a
+# reason unrelated to the code under test (`printf` mangles `\\n` differently in a nested heredoc).
+PATH="$FIX/mpbin:$PATH" GH_ROWS="$(printf '11\tgithub-actions\tdocs\tcompleted\tcancelled')" \
   cascade_main_probe acme/widget >/dev/null 2>&1
 [ "$(head -1 "$W/state/main-verdict" 2>/dev/null)" = "GREEN" ] && echo yes || echo no
 PEOF
 mut "M14 a CANCELLED run on main counts as red (the polarities the rail allows are re-narrowed)" \
-    's/("success","neutral","skipped","cancelled","stale")/("success","neutral","skipped","stale")/' "$TMP/p-cancel.sh"
+    's/("success", "neutral", "skipped", "cancelled", "stale")/("success", "neutral", "skipped", "stale")/' "$TMP/p-cancel.sh"
 
 cat > "$TMP/p-pol.sh" <<'PEOF'
 # ⛔ THE FAIL-CLOSED ARM, DRIVEN THROUGH THE SHIPPED BLOCK with the one input it exists for. 10
@@ -621,6 +706,20 @@ d="$FIX/m-pol"; rm -rf "$d"; mkdir -p "$d/state"
 PEOF
 mut "M15 an UNREADABLE un-owned count hands the room to issues (the fail-closed arm removed)" \
     's/^    CASCADE_UPN_UNREADABLE=1; CASCADE_ISSUE_SLOTS=0$/    CASCADE_UPN_UNREADABLE=1/' "$TMP/p-pol.sh"
+
+cat > "$TMP/p-group.sh" <<'PEOF'
+# THE RE-RUN RULE: one job, failed then passed. Newest (by id) must win.
+. "$ORCH_FNS"
+w="$FIX/m-group"; rm -rf "$w"; mkdir -p "$w/state"
+PATH="$FIX/mpbin:$PATH"
+GH_ROWS="$(printf '11\tgithub-actions\tverify\tcompleted\tfailure\n12\tgithub-actions\tverify\tcompleted\tsuccess')"
+export GH_ROWS
+O="$w"; LOG=/dev/null
+cascade_main_probe acme/widget >/dev/null 2>&1
+[ "$(head -1 "$w/state/main-verdict" 2>/dev/null)" = "GREEN" ] && echo yes || echo no
+PEOF
+mut "M16 the NEWEST attempt no longer wins (a superseded red pins level 1 for ever)" \
+    's/if prev is None or cid > prev\[0\]:/if prev is None:/' "$TMP/p-group.sh"
 
 # ── 10. THE OVERRIDE IS RECORDED, NOT SILENT ───────────────────────────────────────────────────
 echo

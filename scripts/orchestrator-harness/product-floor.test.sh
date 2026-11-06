@@ -198,7 +198,13 @@ echo "── P6: the floor sits AFTER merge priority, and an unmet floor DEGRADE
 # reject) left the pin GREEN. This is the same shape P8 already fixed for its own pin (`done < \$ORDER_FILE`
 # matched the comment quoting it): anchor to the line that DECIDES, and assert BOTH lines, because
 # `ORDER_FILE` is what the dispatch loop actually reads and `FLOOR_N` is what produces it.
-LINE_GATE="$(grep -n '^[[:space:]]*GATE_WHY="\$(mp_reason' "$LOOP" | head -1 | cut -d: -f1)"
+# ⛔ THE ANCHOR MOVED WITH THE BINDING (owner ruling 2026-11-04, review P0). The merge-priority rule
+# no longer assigns `GATE_WHY` — that assignment WAS the barrier — so it is computed into
+# `MP_PRIORITY` from the same count. Anchoring to the old spelling made this assertion UNSATISFIABLE
+# (`LINE_GATE` empty ⇒ `[ -n "" ]` false ⇒ rc 1 ⇒ P6 red on a correct tree), i.e. the pin would have
+# failed CI for the fix rather than for the defect. The contract P6 grades is unchanged: the floor's
+# ORDERING CODE must still sit after the priority decision, whichever variable carries it.
+LINE_GATE="$(grep -nE '^[[:space:]]*(MP_PRIORITY|GATE_WHY)="\$\(mp_reason' "$LOOP" | head -1 | cut -d: -f1)"
 LINE_FLOORN="$(grep -n '^[[:space:]]*FLOOR_N="\$(floor_norm' "$LOOP" | head -1 | cut -d: -f1)"
 LINE_ORDER="$(grep -n '^[[:space:]]*ORDER_FILE="\$(floor_choose_order' "$LOOP" | head -1 | cut -d: -f1)"
 [ -n "$LINE_GATE" ] && [ -n "$LINE_FLOORN" ] && [ -n "$LINE_ORDER" ] \
