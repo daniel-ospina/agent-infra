@@ -1529,7 +1529,7 @@ lane_bound_path() {
 # a bare assignment resets it to empty and silently re-resolves the DEPLOYED helper instead — measured:
 # every capability arm reported the REAL probe's verdict instead of its fixture's, and five of them
 # went red saying the gate never refused. Keep the default, keep the override.
-CELL_PREFLIGHT_SH="${CELL_PREFLIGHT_SH:-}"
+# MUTATION (temporary): module-scope init deleted — the #2991 P0 shape
 cell_preflight_path() {
   local c here
   if [ -n "$CELL_PREFLIGHT_SH" ]; then printf '%s\n' "$CELL_PREFLIGHT_SH"; return 0; fi
