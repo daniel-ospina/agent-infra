@@ -233,7 +233,17 @@ lock_holder_is_live() {  # $1 = lock dir; rc 0 = a LIVE auto-rail holds it (do n
   if [ -n "$pid" ] && ps -p "$pid" -o args= 2>/dev/null | grep -q 'auto-rail[.]sh'; then
     return 0   # a real holder: right pid AND the process is this script
   fi
-  mtime=$(stat -f %m "$d" 2>/dev/null || stat -c %Y "$d" 2>/dev/null)
+  # ⛔ PORTABLE MTIME — `date -r` FIRST, NEVER `stat -f %m` FIRST (agent-infra#3434). `stat -f %m` is
+  # BSD-ONLY. On GNU coreutils `-f` means `--file-system`, so `stat -f %m DIR` treats `%m` as a FILE
+  # operand, prints the whole filesystem block to STDOUT and exits 1 — the `||` fallback then runs and
+  # APPENDS the real epoch to that garbage. The old line therefore produced a non-numeric `$mtime` on
+  # every Linux box, the fail-closed guard below read it as "cannot date the lock -> assume held", and
+  # the actuator became permanently dead with a clean log — the exact state the comment above claims to
+  # have eliminated. Measured on GNU 9.4: a lock whose pid was `kill -9`d was never reclaimed and every
+  # later instance exited 0 with `another auto-rail holds the lock`.
+  # `date -r <path> +%s` is the same portable idiom admin-merge.sh:7693 already uses and needs no
+  # capability probe (it is `--reference` on GNU, `-r` on BSD). Verified on both shapes.
+  mtime=$(date -r "$d" +%s 2>/dev/null || true)
   case "${mtime:-}" in ''|*[!0-9]*) return 0;; esac   # cannot date the lock -> assume held
   now=$(date +%s); age=$(( now - mtime ))
   [ "$age" -lt "$LOCK_AGE_GRACE" ]
