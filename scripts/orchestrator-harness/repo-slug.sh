@@ -597,16 +597,6 @@ repo_identity_scan() {
         i=$((i + 1)); continue ;;
     esac
     if [ "${_wt[$i]}" -eq 1 ]; then
-      # ⛔ THIS NAME WAS NOT COMPARED, SO THE VERDICT SAYS SO — as a VERDICT, not as prose. It used to be
-      # a `warn` whose text carried the word "UNVERIFIED", which the bring-up matched to decide whether
-      # the `CELL READY` banner could claim the check; that is a contract made of a phrase, and it is the
-      # class this round removes. Without the distinction a worktree placed at a path named after ANOTHER
-      # repo — `…/agent-infra` holding tortoise, the measured cell-2 shape reached via `git worktree add`
-      # instead of `git clone` — read as verified and the banner printed `CELL READY — all links
-      # verified`. TRADE-OFF, stated plainly: a cell that holds any linked worktree reports
-      # `repo identity PARTIALLY verified`, because that name genuinely was not compared. That is the
-      # honest reading; a refinement (treat a branch-shaped name as "nothing to verify" rather than
-      # "unverified") is a separate change with its own evidence.
       # ⛔ `ok`, NOT `unverified` (review finding, P1 — and it reverses a call this file made two commits
       # ago). A linked worktree's name is a BRANCH, not a claim about a repository, so there is nothing
       # unanswered about THIS BOX — while the fleet's own launcher recipe is `git worktree add
@@ -690,8 +680,17 @@ repo_identity_scan() {
           fi
           # Are all the heads the same? Then nothing is at stake YET — say so at `ok`, but say it: the
           # divergence this reports is only invisible until someone commits.
+          # ⛔ AND AN UNREAD HEAD IS NOT A HEAD THAT AGREES (review finding, P2). `_head` carries the
+          # sentinel `<unreadable>` when `rev-parse` answered nothing (an unborn HEAD from `git init` +
+          # `remote add`, an empty remote, an orphan branch), so a group of two could not be told apart
+          # from a group of two that agree — and the report announced "all at the same head" about data
+          # nothing read. That is the `, `-separator bug INVERTED: this message invents a convergence
+          # instead of a divergence, and it is the line an operator picks a canonical tree from.
           slug="${_slug[$i]}"
-          if [ "$(printf '%s' "$hlist" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
+          if [ "$(printf '%s' "$dup" | tr ',' '\n' | grep -cF '<unreadable>')" -gt 0 ]; then
+            printf '%s\t%s\n' warn \
+              "repo identity: $slug is checked out at $n paths ($dup) and $resolves. At least one HEAD could not be READ, so whether these trees are on the same commit is unknown — not a divergence, and not an agreement either (agent-infra#3521)"
+          elif [ "$(printf '%s' "$hlist" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
             printf '%s\t%s\n' ok \
               "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#3521)"
           else

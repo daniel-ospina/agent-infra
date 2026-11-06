@@ -1556,7 +1556,9 @@ rm -rf "$T/standalone"
 #     (not fatal — several trees can be legitimate — but never silent);
 #   * that a clean box passes and says `ok`, so the check cannot be an always-red arm that tells nobody
 #     anything;
-#   * that an EMPTY population is a warn, never a pass.
+#   * that an EMPTY population is an `unverified` VERDICT (not a `warn` with a word in it — the verdict is
+#     the contract, because it is what keeps the `CELL READY` banner from claiming the check), so it is
+#     never a pass.
 # ⛔ THE ARMS ASSERT THE IDENTITY VERDICT, not the whole bring-up's exit status. On a host whose
 # launchd/schedule layer refuses (this suite's own documented temp-HOME shape) the run dies AFTER this
 # check, and an arm keyed on `rc` would then be measuring that environment rather than this predicate.
@@ -1805,6 +1807,26 @@ OWN_OUT="$(WORKDIR="$T/ident-own/cell" REPO_SLUG=daniel-ospina/tortoise \
 [ "$OWN_OUT" = "agent-infra" ] \
   && ok "the box's own repo is WORKDIR's origin (agent-infra), not the REPO_SLUG default (tortoise)" \
   || bad "own repo read as '$OWN_OUT' with WORKDIR an agent-infra checkout — a hardcoded default is being used"
+
+say_case "repo identity: two trees whose HEAD cannot be read do not 'agree'"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P2. `_head` holds the sentinel `<unreadable>` for an unborn HEAD
+# (`git init` + `remote add`, the exact fixture shape both doctor suites use), so a group of two could not
+# be told apart from a group of two that AGREE — and the report printed "all at the same head" about data
+# nothing read. The `, `-separator bug inverted: this message invented a convergence.
+# Two checkouts with an origin but NO COMMIT: `rev-parse HEAD` answers nothing, which is the shape the
+# doctor suite's own `$T/repo` fixture has.
+for d in agent-infra ai; do
+  mkdir -p "$T/ident-unborn/$d"
+  git init -q "$T/ident-unborn/$d" >/dev/null 2>&1
+  git -C "$T/ident-unborn/$d" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+done
+UNBORN_OUT="$(REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; repo_identity_scan "$2"' _ "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-unborn" 2>&1)" || true
+case "$UNBORN_OUT" in
+  *"all at the same head"*) bad "the report claims two trees AGREE on a head it could not read: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+  *"could not be READ"*|*"unknown"*) ok "an unread HEAD is reported as unknown — neither a divergence nor an agreement" ;;
+  *) bad "an unreadable-head group produced no honest line: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
 
 say_case "repo identity: a SUFFIXED working copy is not lying, whatever the separator"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The exemption was dash-only, so `tortoise.old`, `tortoise_wip` and
