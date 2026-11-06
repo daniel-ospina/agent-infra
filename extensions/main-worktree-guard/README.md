@@ -125,6 +125,161 @@ any directory git reports as `not a git repository` / `must be run in a work
 tree`. Every OTHER status-read failure (index.lock contention, permissions, the
 5 s timeout) stays fail-CLOSED.
 
+### The #1228 arm refuses a PATH, so DATA must not become one (#3243)
+
+The expansion arm's premise is a sentence about a WORD: *this word is the script
+the shell WILL execute, and I cannot read it*. Shapes that violated it refused
+the ENTIRE shipped script that merely CONTAINED the data. Measured on this tree
+with the handler driven over every committed `*.sh` in the `pi -p` child env:
+**73 of 373 were refused, 62 of them by this expansion arm** — and the cheapest
+way out of a suite that will not run is to claim it is green without running it,
+i.e. a false PASS.
+
+| Observed | Was claimed | Why it is not a script path |
+|---|---|---|
+| `awk '/^tree=/{t=$2}' …` | an expanded script path | an awk PROGRAM is an argument |
+| `sed 's/^[[:space:]]*//;s/[[:space:]]*$//'` | the same | a sed EXPRESSION is an argument |
+| `grep -n "bash\|sh -x" f | head` | a pipe into `sh` | a quoted `\|` is DATA (KNOWN-FALSE pin D5) |
+| `` `active`, `` in a comment paragraph | a piped producer | a comment is not code |
+| `*NOT*` in a comment paragraph | a piped producer | the same |
+
+The three narrowings, each POSITIVE (a word must BE a path, rather than "some
+program text we have not yet listed is rejected"):
+
+1. **`wtIsPathShapedScriptWord`** (classify-git.mjs) — a command-position word is
+a script-path candidate only if, with every expansion form (`$`, `` ` ``, `*`,
+`?`, `[...]`, `{…}`, extglob, `~`) replaced by a placeholder, what REMAINS is a
+plain path. ⛔ THE GRAMMAR IS A FILTER ON A PATH THE SHELL **EXECUTES**, so every
+byte it REJECTS deletes the candidate and blinds the arm — a rejection is not
+"proof the word is data", it is a lost script (review cycle-2, F2). The terminal
+test is therefore TWO ORed ACCEPTS: what remains is over the plain alphabet
+`[A-Za-z0-9._+@!%~-]` joined by `/`, OR the word carries an EXPLICIT path prefix
+(`./`, `../`, `~/`) whatever bytes follow it. `,`, `:`, `=`, `^`, a non-leading
+`#` and `\` are all ordinary FILENAME bytes — `./undo,2-*.sh` and `./undo2-\*.sh`
+really execute and the first cut of this change ALLOWED them. Program text
+(`awk '/^tree=/{t=$2}'`, `sed 's/[[:space:]]*$//'`) carries no such prefix, so it
+stays non-path — and every real expanded-path spelling still is
+(`./undo*.sh`, `~/undo.sh`, `$WT/.venv/bin/python`, `./undo@(-g|).sh`,
+`sub/undo.sh`). Accepting more can only ADD candidates, so it cannot fail open.
+2. **The extglob word scan walks the COMMAND only.** The loop always said "only a
+word that IS the command" and walked every word; on a whole file body that made
+any argument containing `+(`/`@(` an executed path, and made the `#!` SHEBANG
+line a "directly-executed path" that opened the whole word list to the hunt.
+3. **`wtSplitPipeline`** (classify-git.mjs) — `wtPipelineFeedsShell` and the
+piped-producer arm split on `|` with no quote model. A quoted alternation, a sed
+`s/…|…/` expression and a markdown table in a comment each became a "pipeline
+into a shell". The split is now quote / escape / extglob / `||`-aware.
+
+⛔ A NARROWED RECOGNISER NEEDS A FALLBACK, AND THE FALLBACK MUST COVER **EVERY**
+STATE VARIABLE (review cycle-2, F1). This model tracks TWO — `quote` and
+`globDepth` — and each one can be stranded by text that is DATA: an unterminated
+quote (a comment apostrophe, a heredoc body, ANSI-C `$'…'`) or an unterminated
+extglob group (`# it is *(broken`, `regex: a+(b|c`). Past either desync every
+later `|` is read as DATA, so a real unquoted `cat ./undo*.sh | bash` merges into
+one segment and disappears. BOTH desyncs therefore take the BLIND split
+(`s.split("|")`), which has no state and can only OVER-report — this arm's
+fail-closed direction. The cycle-1 fix covered only `quote`, so the identical
+fail-open remained one state variable over (measured: base BLOCK, head ALLOW on
+five shapes). It also falsified the earlier claim here that "a REAL pipeline's
+`|` is unquoted, so nothing is hidden".
+
+**MEASURED EFFECT, over all 373 committed `*.sh` (handler-driven, before and
+after, in the `pi -p` child env): 73 refused before, 56 after — 17 scripts newly
+RUN, 0 newly REFUSED.** Both directions are audited, because a narrowing that
+unblocks one script and blocks another is not a fix — it is a trade, and this one
+must be net-positive for the defect it names. ⛔ THE PAIR MUST BE MEASURED IN ONE
+ENVIRONMENT: a verifier running the same census from a fixture HOME got 70 → 52
+(18 newly RUN, 0 newly REFUSED) — the same polarity, a different absolute count,
+because the fixture has no deployed `~/.pi/agent` state. Quote the pair you
+measured together, never one number from one run against another run's total.
+
+⛔ **A REFUSAL CENSUS IS ONE-DIRECTIONAL, AND THAT IS HOW BOTH CYCLE-2 DEFECTS
+SURVIVED IT** (review cycle-2, note 3). Counting *newly REFUSED* only sees a
+narrowing that over-blocks; a shape that became newly ALLOWED is invisible to it,
+and both fail-opens above were exactly that — the same 373-script sweep reported
+"0 newly REFUSED" while a real pipeline and six real execution spellings had
+silently started running UNGATED. The reverse arm is measured separately, at the
+predicate over **380** committed `*.sh` / **352,993** lines, base vs head:
+
+| | base | head |
+|---|---|---|
+| lines `wtPipelineFeedsShell` fires on | 50 | 40 |
+| newly firing (over-widening) | — | **0** |
+| no longer firing | — | **10** |
+
+Every one of the 10 was re-read and is a FALSE POSITIVE the narrowing exists to
+remove, not a hidden pipeline: a quoted `\|` alternation in `printf`/`grep` data,
+an awk regex (`!(pfx ~ /^(sh|bash|dash|zsh)$/ …)`), four `sed 's|…|…|'`
+expressions whose quoted `|` had split the segment head into `/bin/bash`, a
+comment naming `|| sessions=UNKNOWN`, and a `printf '%s\n' '… printf x | sh -c'`
+that writes a shell-out into a file as DATA (consumer `head` / quoted literal in
+every case — none feeds a shell). The reverse arm is committed as the `B15j-n`
+handler arms plus the `M2` both-polarity predicate pairs, where each pair must go
+BLIND when its fix is textually reverted — verified by reverting both cycle-2
+fixes and watching 6 arms go red.
+
+**Residual, recorded not chased:** the one-directional census above is still the
+instrument in CI, because a base-vs-head replay needs the base module at test
+time. A committed corpus of *refused-before* shapes replayed against the live
+head would close it; that is its own change.
+
+⛔ **A FOURTH HUNK WAS MEASURED AND REJECTED: preparing the body as CODE.** The
+draft of this fix ran a script's body through `stripHeredocData` first (the
+preparation `extractWorkingTreeDiscards` has always used: `#` comments removed
+quote-aware, heredoc DATA blanked). It is correct in principle — a comment's
+APOSTROPHE desyncs the segment quote model for the rest of the file (#1949's
+class, on this arm), which is why `install-harness-apply-timer.sh` was refused
+over the piped producer `"boxs clock, on BOTH platforms\n# …"`, a COMMENT
+paragraph — and it is NOT LANDED, because the same comment artefact was also
+MASKING real `bash "$VAR"` operands. With the preparation on, the arm reaches
+them for the first time, and the measured trade is:
+
+| variant | committed `*.sh` newly RUN | newly REFUSED |
+|---|---|---|
+| with body preparation | 22 | **21** (11 of them CI suites: `claim-reaper.test.sh`, `live-ownership.test.sh`, `worktree-disk-probe.test.sh`, `run-bash-shards.recap.test.sh`, `launchd-controller.test.sh`, `session-postmortem.test.sh`, `lane-container-reap.test.sh`, `cloud-cell-doctor.hygiene.test.sh`, `cloud-cell-bringup.verify.test.sh`, `enforce-protocol-table.test.sh`, `tests/pi-shim/run.sh`) |
+| **without it (landed)** | 17 | **0** |
+
+An arm that refuses 21 MORE suites is the wrong direction for `#3243`. Closing
+it properly means addressing the `$VAR`-operand over-block itself (the
+fail-closed-allowlist question #2755 names), not making the parse that exposes it
+more accurate — so the preparation is recorded on `#3243` with these numbers
+rather than half-landed here.
+
+The two walks and the seven `_expRefusalForBody` readers now share ONE predicate
+(the walks previously duplicated the digest stand-down inline). That predicate does
+NOT prepare the body — the preparation is the rejected hunk above — so every reader
+sees the same RAW text it saw before, and the sanded-off edges are only the
+recogniser's.
+
+**What did NOT change — and must not.** A nested invocation the guard cannot
+resolve is still refused: `bash ./undo*.sh` on line 3 of a body, `bash "$NB"`
+whose value is not statically readable, a real `cat ./undo*.sh | bash` inside a
+body with an EXPANDED producer, and a body that really discards are each BLOCKED
+(B14e-j). The `$`-in-a-script-PATH over-block is a **stated residual** of the
+same arm (README's fail-closed list above, #2755: a deny list over-blocks
+wherever it under-specifies). What changed for those is the MESSAGE: a body
+finding no longer claims "the script path contains a shell-expansion form" —
+about a path the operator had passed literally — and no longer offers "pass the
+path literally" as its remedy. It names the observed nested token, its LINE, and
+the file:
+
+```
+⚠️ the body of ./suite.test.sh cannot be fully read — "$NB" is invoked as a
+   script (line 256 of ./suite.test.sh), and that path is not statically
+   resolvable as spelled …
+```
+
+That misattribution is why the same refusal was re-reported six times in one day
+(#3243): an unsatisfiable remedy reads as a broken gate.
+
+**Two KNOWN-FALSE pins are recorded, not fixed** (`test-discard-gate.mjs` B14k,
+`test-command-position.mjs` D5's siblings): (a) a `cat <producer> | bash` written
+inside a BODY is not seeded at all, so the discard it runs is unprobed — identical
+before and after this change, and its control (the same pipeline as the COMMAND)
+is blocked; (b) an apostrophe or unbalanced quote in a COMMENT opens a quote that
+`_wtCommandSegments` / `wtShellWords` never close, so a real pipeline written after
+it is not seen. Both are the body walk's contract, not this arm's recogniser.
+
 ### `git show <rev>:<path> > <target>` is decided on STATE, not on the spelling (#1060)
 
 The revert form is a **hint**, not a target list: the extractor can only report
