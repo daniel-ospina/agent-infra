@@ -5,7 +5,8 @@ This file is a guard rail, not documentation. The watched script signals process
 here exists to prove a specific way it could kill something it must not:
 
   * a subtree that is WORKING                 -> never a candidate (gate 1)
-  * a parked child with a BUSY grandchild     -> never a candidate (gate 1, subtree not process)
+  * a parked child with a BUSY grandchild     -> never a candidate (gate 1, descendant KIND)
+  * a parked child with a BUSY nested pi      -> never a candidate (gate 1, SUBTREE CPU sum)
   * a lane's OWN pi                           -> never a candidate (only dispatched offspring)
   * anything under a human terminal           -> refused outright (gate 2)
   * a chain we cannot prove is the fleet's    -> refused outright (gate 2)
@@ -97,44 +98,14 @@ def stub_rule(tmp_path, status="holder", rc=0):
     return str(p)
 
 
-def ripen(W, monkeypatch, tmp_path, argv):
-    """Put a genuinely ripe candidate in front of `main()`, with the tick internals stubbed."""
-    (tmp_path / "ripe.json").write_text(json.dumps(
-        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
-                 "subtree": [300]}}))
-    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
-    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
-    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
-    monkeypatch.setattr(W, "ps_table",
-                        lambda: {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
-                                 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
-    monkeypatch.setattr(W.time, "sleep", lambda s: None)
-    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
-    # ⛔ AND THE CONNECTION PROBE, FOR THE SAME REASON AS `ps_table` ABOVE — see `parked`. It is a
-    # real `lsof` call on a SYNTHETIC pid, so an unstubbed run lets the host decide `main()`'s exit:
-    # on this cell `lsof` writes overlay/nsfs WARNINGS to stderr, `has_live_connection` reads that as
-    # UNKNOWN, `main()` returns 3, and all six `main()`/state-write tests below fail for a reason
-    # none of them is about. A test that stubs four of five inputs is hermetic by luck, not design.
-    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
-    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
-
-
-def test_cpu_seconds_parses_every_ps_shape(W):
-    assert W.cpu_seconds("0:09.69") == pytest.approx(9.69)
-    assert W.cpu_seconds("1:04:00") == pytest.approx(3840.0)
-    assert W.cpu_seconds("02-01:00:00") == pytest.approx(2 * 86400 + 3600.0)
-    assert W.cpu_seconds("garbage") == 0.0
-
-
-# ── GATE 1: zero CPU delta, measured over the whole SUBTREE ───────────────────
-
 def parked(W, monkeypatch):
-    """Stub the CONNECTION PROBE to "no connection", so a CPU/descendant gate is what is under test.
+    """Stub the tick's REAL-WORLD probes — the connection probe and the process age — to constants.
 
-    ⛔ GATE 1's TESTS MUST NOT CONSULT THE HOST'S REAL `lsof` — MEASURED, TWICE, IN OPPOSITE
-    DIRECTIONS. `frozen_subtrees` calls `has_live_connection(pid)` for every pid in a subtree, and
-    the gate-1 tables below carry SYNTHETIC pids (300, 301, 36186). Left unstubbed, the real probe
-    decides those tests' verdicts on the host, so the same commit is green or red by where it runs:
+    ⛔ GATE 1's TESTS MUST NOT CONSULT THE HOST'S REAL `lsof` OR `ps` — MEASURED, TWICE, IN OPPOSITE
+    DIRECTIONS. `frozen_subtrees` calls `has_live_connection(pid)` for every pid in a subtree and
+    `_age_seconds(pid, table)` for every candidate, and the gate-1 tables below carry SYNTHETIC pids
+    (300, 301, 36186). Left unstubbed, the real probes decide those tests' verdicts on the host, so
+    the same commit is green or red by where it runs:
 
       * IN A CONTAINER it is a determinate FALSE FAIL. `lsof 4.95` prints `can't stat() overlay
         file system` / `nsfs` WARNINGS to stderr on this cell, and `has_live_connection` reads rc=1
@@ -151,9 +122,46 @@ def parked(W, monkeypatch):
     established_connection_is_never_a_candidate`, `..._anywhere_in_the_subtree_...`) and they stub
     this function explicitly; `test_the_connection_probe_still_licenses_a_reap` deliberately does
     NOT, and reaches the REAL probe through a `subprocess.run` stub — that polarity stays.
+
+    `_age_seconds` is stubbed for the SAME reason, and it was the second input short (cycle-2
+    review): it shells out to `ps -o etime=`, so the gate-1 tests were making ten real `ps` calls
+    whose answers came back `None` for pids that do not exist. No assertion reads `age_s` today, so
+    it could not flip a verdict yet — the defect was a docblock claiming hermeticity one input
+    short, and the first `age_s` assertion anyone added would have inherited the host dependence.
     """
     monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
 
+
+def ripen(W, monkeypatch, tmp_path, argv):
+    """Put a genuinely ripe candidate in front of `main()`, with the tick internals stubbed."""
+    (tmp_path / "ripe.json").write_text(json.dumps(
+        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
+                 "subtree": [300]}}))
+    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
+    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
+    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
+    monkeypatch.setattr(W, "ps_table",
+                        lambda: {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
+                                 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
+    monkeypatch.setattr(W.time, "sleep", lambda s: None)
+    # ⛔ ONE DEFINITION OF THE PROBE CONTRACT, NOT TWO (cycle-2 review). This function used to carry
+    # its own inline `has_live_connection` lambda, identical to `parked()`'s — so a future change to
+    # that contract (a sequenced probe, a different verdict) would reach the gate-1 tests and
+    # SILENTLY NOT reach the six `main()` tests here, which is the exact leak class these commits
+    # close. `parked()` is also what stubs `_age_seconds`; calling it keeps both in one place.
+    parked(W, monkeypatch)
+    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
+
+
+def test_cpu_seconds_parses_every_ps_shape(W):
+    assert W.cpu_seconds("0:09.69") == pytest.approx(9.69)
+    assert W.cpu_seconds("1:04:00") == pytest.approx(3840.0)
+    assert W.cpu_seconds("02-01:00:00") == pytest.approx(2 * 86400 + 3600.0)
+    assert W.cpu_seconds("garbage") == 0.0
+
+
+# ── GATE 1: zero CPU delta, measured over the whole SUBTREE ───────────────────
 
 def test_a_working_child_is_never_a_candidate(W, monkeypatch):
     """The one true positive this must never produce: a child doing work."""
@@ -164,9 +172,21 @@ def test_a_working_child_is_never_a_candidate(W, monkeypatch):
 
 
 def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W, monkeypatch):
-    """⛔ THE SUBTREE, NOT THE PROCESS. A `pi` wrapper sits at ~0 CPU while its own bash child does
-    the work -- judging the process alone would reap a subtree that is demonstrably busy. Measured
-    shape 2026-10-12: Drain's pi at `S+`, +7.70 CPU-s/25s, driving a `curl -sS --http1.1 -m 25`."""
+    """⛔ THE DESCENDANT **KIND** RULE, WHICH IS WHAT THIS FIXTURE ACTUALLY PROVES (cycle-2 review).
+
+    A `pi` wrapper sits at ~0 CPU while its own child does the work, and the parent must not be
+    reaped for it. Measured shape 2026-10-12: Drain's pi at `S+`, +7.70 CPU-s/25s, driving a
+    `curl -sS --http1.1 -m 25`.
+
+    ⚠️ CORRECTED — THIS TEST USED TO BE TITLED "THE SUBTREE, NOT THE PROCESS", AND THAT WAS FALSE OF
+    IT. Its busy grandchild is a `curl`, a NON-`pi` descendant, so `frozen_subtrees`' "only `pi` may
+    be under a candidate" rule excludes the parent FIRST and gate 1's subtree CPU sum never runs.
+    MEASURED: mutating the sum to process-only left this test GREEN. The property in the title was
+    therefore pinned by NOTHING — it is pinned now, by
+    `test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind`, whose descendant is a
+    nested `pi` (the one kind the rule ALLOWS, so only the sum can refuse it). This test keeps its
+    own, real, narrower subject.
+    """
     parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
          301: T(300, cpu=1.0, cmd="curl -sS --http1.1 -m 25 ...")}

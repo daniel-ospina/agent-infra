@@ -109,9 +109,17 @@ drop_dispatched_rows() {
 # unevaluable probe. So a lane that pushed before its spawn was reported failed keeps both, and a
 # resumed branch keeps both; only a provably EMPTY checkout goes back. Exit status is the verdict
 # (0 reaped · 1 preserved · 2 refused/failed) and every one of them is printed, never absorbed.
-# ⛔ AND IT TAKES BACK ONLY A CHECKOUT, NEVER THE ISSUE CLAIM. A failed spawn keeps its claim because
-# the chain below is alive and waiting for that PR; releasing it would declare an issue this box is
-# actively working free, and a peer would duplicate the work. Nothing on these paths releases.
+# ⛔ THIS HELPER TAKES BACK ONLY A CHECKOUT. WHETHER THE ISSUE CLAIM IS RELEASED IS PER-PATH, AND
+# THIS HELPER DECIDES NONE OF IT (cycle-2 review, P1 — the unscoped form of this sentence read
+# "nothing on these paths releases" while `these paths` in the paragraph above INCLUDES the no-chain
+# path, which releases deliberately; acting on it would have deleted that release and held a dead
+# lane's claim for the whole lease). The two paths in full:
+#   · LANE-NEVER-STARTED — KEEPS the claim. The chain below is alive and waiting for that PR;
+#     releasing would declare an issue this box is actively working free and a peer would duplicate it.
+#   · NO-CHAIN — RELEASES, exactly once, and only after `wt_alive` confirms the lane is gone; if it
+#     cannot be stopped the claim is KEPT, because the lease expiring it is the safe direction (#2033).
+# The release belongs to the CALL SITE and to the ordering the lane that wrote it measured; never to
+# this helper, and never to a comment that describes both paths as one.
 # ⚠️ SCOPE, so this header cannot be read as "every exit": the PER-ISSUE repo/branch assertion below
 # also `continue`s after a checkout was provisioned, and deliberately does NOT take it back — that
 # refusal says the checkout/branch is not what the target claims, so the owner of the thing is
