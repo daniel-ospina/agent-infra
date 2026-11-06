@@ -352,13 +352,23 @@ review_round_spend() {
   # `REVIEW-CEILING … rounds=999999999/10` and a reason asserting a spent budget that was never spent:
   # the false-diagnosis class this whole change exists to close. A rename is atomic, so no reader can
   # observe a partial book.
-  # ⛔ AND THE TEMP NAME MUST NOT SPELL THE COUNTER PATH. The `(c4g)` writer census counts write VERBS
-  # per DESTINATION, and it matches any `>`/`mv`/`cp`/`dd`/`install` whose target names `_rr_f` or
-  # `reviewround-`. A temp called `${_rr_f}.new.$$` is a second match and reddens that arm for doing
-  # the safer thing; `$_rr_new` names no counter, so the ONE counted write stays the `mv` below.
+  # ⛔ AND THE REDIRECT WORD MUST BE A VARIABLE THAT DOES NOT SPELL THE COUNTER (fresh review of
+  # #3441, P3 — this note used to state the rule WRONG, and the wrong version is the one a tidy would
+  # implement). The temp's VALUE is `${_rr_f}.new.$$`, which does name the counter — that is fine and
+  # intended. What keeps the `(c4g)` census at ONE counted write is the INDIRECTION: the census matches
+  # the redirect's WORD, and `> "$_rr_new"` spells no counter, so only the rename below counts.
+  # Inlined (the temp path spelled literally in the redirect) the very same write becomes a SECOND
+  # census match and `(c4g)` reddens (measured) — so the invariant to preserve is the VARIABLE, not the
+  # name. (This note deliberately does not quote that spelling: the census reads comments too, and a
+  # comment that quoted it would redden the arm it is explaining.)
+  # ⛔ AND THE RENAME MUST BE ABLE TO LAND. `mv` where the DESTINATION is an existing DIRECTORY moves
+  # the temp INSIDE it and exits 0 — the `||` failure group below would then never run, the temp would
+  # be left behind, and a reader would coerce the directory to 999999999 and park a healthy PR: the
+  # same false-`REVIEW-CEILING` diagnosis this atomicity exists to prevent, reached by a non-torn route.
+  # `[ ! -d "$_rr_f" ]` makes that case take the failure branch, which is the half that SPEAKS.
   local _rr_new="${_rr_f}.new.$$"
   printf '%s\n' "$REVIEW_ROUND" > "$_rr_new" 2>/dev/null \
-    && mv "$_rr_new" "$_rr_f" 2>/dev/null \
+    && [ ! -d "$_rr_f" ] && mv "$_rr_new" "$_rr_f" 2>/dev/null \
     || { rm -f "$_rr_new" 2>/dev/null; echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN — the per-PR round ceiling cannot be counted on this path (the per-head budget still binds); this review is round $REVIEW_ROUND" >> "$L.log" 2>/dev/null || true; }
   _rr_written=1
 }

@@ -1208,17 +1208,50 @@ esac
 # visible under the counter's name until they are complete") is a property of HOW the file is written,
 # not of what a caller can observe in a test — there is no deterministic way to lose a race on demand
 # in this suite. What it removes is the regression that reintroduces the window, and MUTANT-Q below
-# proves it can fail. Read from the EXTRACTED HELPER, not the whole file, so the comment block above
-# (which explains the hazard and therefore names it) cannot satisfy the pin.
+# in this suite. What it removes is the regression that reintroduces the window, and MUTANT-Q below
+# proves it can fail. ⛔ AND IT READS COMMENT-STRIPPED SOURCE, NOT THE EXTRACTED TEXT AS-IS (fresh review
+# of #3441, P3 — MEASURED DECOY): the badge above used to claim extraction made comment text
+# unusable, but extraction drops the block ABOVE the function, not the comments INSIDE it, and the
+# helper is full of them. Restoring the truncating write AND adding one `#` comment inside the helper
+# carrying both literals left this arm GREEN (207/2, the second red being MUTANT-Q's moved anchor). The
+# strip is the SAME `c4mc`-style one `(c4m)`/`(c4n)` use, so the scans cannot drift.
+RRSPEND_CODE="$(awk '!/^[[:space:]]*#/' "$RRSPEND" 2>/dev/null | c4mc)"
 RR_ATOMIC=0
-if [ -s "$RRSPEND" ] \
-   && grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' "$RRSPEND" \
-   && grep -qF 'mv "$_rr_new" "$_rr_f"' "$RRSPEND"; then
+if [ -n "$RRSPEND_CODE" ] \
+   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' \
+   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'mv "$_rr_new" "$_rr_f"'; then
   RR_ATOMIC=1
   ok "(c4q) the round book is written to a SIBLING and RENAMED onto the counter — a reader can never observe a torn (empty) book, which both readers would read as 999999999 and park a healthy PR"
 else
   bad "(c4q) review_round_spend does NOT write the book atomically — a `printf` straight onto the counter truncates before it writes, a concurrent reader coerces the empty book to 999999999, and a healthy PR parks with a false REVIEW-CEILING rounds=999999999/10 diagnosis"
 fi
+# ⛔ (c4r) THE FAILURE BRANCH MUST STILL BE REACHABLE, AND A DIRECTORY IS HOW IT BECOMES UNREACHABLE
+# (fresh review of #3441, P2 — a REGRESSION THE ATOMIC WRITE INTRODUCED). `mv` onto an existing
+# DIRECTORY moves the temp INSIDE it and exits 0, so the `|| { rm -f …; echo … CANNOT BE WRITTEN … }`
+# group never fires: the temp is left behind, the log says nothing, and `_rr_read_book` coerces the
+# directory to 999999999 — the false `REVIEW-CEILING … rounds=999999999/10` park this atomicity exists
+# to prevent, reached by a non-torn route, with `_rr_written=1` suppressing the EXIT-hook retry.
+# Driven BEHAVIOURALLY against the SHIPPED helper (so it needs no mutant: dropping the `[ ! -d ]`
+# guard reddens it — that is the defect this arm was written from, measured at 209/0 -> ❌ here).
+rrspend_bookdir() { # -> "named=<0|1> temps=<n>" for a DIRECTORY planted at the counter path
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; MAX_REVIEW=10
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRSPEND"
+    review_round_spend 2>/dev/null || true
+    n=0; grep -qF 'CANNOT BE WRITTEN' "$d/log.log" 2>/dev/null && n=1
+    printf 'named=%s ' "$n"
+    # ⛔ COUNTED ANYWHERE UNDER state/, not just as a sibling: `mv` onto a DIRECTORY moves the temp
+    # INSIDE it, so a sibling-only count reads 0 on the very failure this arm exists for (measured).
+    t="$(find "$d/state" -name 'reviewround-777.new.*' 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'temps=%s\n' "$t" )
+  mv "$d" "$TMP/rrspend.dir.spent.$RANDOM" 2>/dev/null || true
+}
+RR_DIR="$(rrspend_bookdir)"
+case "$RR_DIR" in
+  'named=1 temps=0') ok "(c4r) an UNWRITABLE counter (a directory at the path) is NAMED in the log and leaves NO temp file behind — the failure branch is reachable, so the operator is not left with a silent false REVIEW-CEILING" ;;
+  *) bad "(c4r) an unwritable counter is NOT reported cleanly ($RR_DIR, expected named=1 temps=0) — a directory at state/reviewround-<PR> makes the rename move the temp INSIDE it and exit 0, so the failure group never fires: the log says nothing, a temp file is left under state/, and the next reader coerces the book to 999999999 and parks a healthy PR with a false REVIEW-CEILING rounds=999999999/10" ;;
+esac
 # MUTANT-Q: reintroduce the truncating spelling in a COPY and require the pin above to red. Mutation
 # tested rather than asserted, because "the write is atomic" is exactly the kind of claim a later tidy
 # silently reverts while every behavioural arm stays green.
