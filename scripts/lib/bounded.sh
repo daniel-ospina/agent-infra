@@ -157,7 +157,6 @@ tb_watchdogs_reap() {
 # WATCHDOG is forked with job control OFF so it stays in the CALLER's group, where the caller's group
 # signal reaches it, and its trap FORWARDS that TERM to the command's group — GNU `timeout`'s behaviour,
 # which is what the header above says this replicates.
-# which is what the header above says this replicates.
 # ⛔ AND THE FORWARDED TERM IS ESCALATED, BECAUSE THE TWO-STAGE REAP IS THE FLEET'S CONTRACT (review of PR
 # #3399, P2 — REPRODUCED). A reaper sends `kill -TERM -- -<pgid>`, waits a grace, then `kill -KILL --
 # -<pgid>`. Ungrouping the command — which is what lets the TIMER reach a transport helper — means the
@@ -171,11 +170,15 @@ tb_watchdogs_reap() {
 # has the identical property, which is why the fleet reaps in two stages.
 tb_watchdog() {
     local secs="$1"; shift
-    local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 jobctl=0 g=0
+    local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 g=0
     TB_BOUND_N=$((TB_BOUND_N + 1))
     was_m=0; case $- in *m*) was_m=1 ;; esac
-    jobctl=0
-    set -m 2>/dev/null && jobctl=1
+    # ⛔ THE FALLBACK IS THE `|| kill -9 "$pid"` AT EACH KILL SITE, NOT A FLAG.
+    # `set -m` is best-effort: a shell that refuses it leaves the command in the CALLER's group, where the
+    # negative-pid kill reaches nothing and the direct-child kill does the job — a strict improvement on
+    # every host, with no new dependency. There used to be a `jobctl` variable recording whether `set -m`
+    # took, assigned and NEVER READ, which invited a future reader to believe the fallback was gated on it.
+    set -m 2>/dev/null || true
     # ⛔ STDIN IS REDIRECTED, SO THE BOUND DOES NOT GAIN AN INPUT. bash gives a background job `/dev/null`
     # as stdin only when job control is OFF; with `set -m` in effect (one line up) it INHERITS the caller's
     # stdin, so a bounded `cat` or an interactive `gh` would silently consume a pipe meant for the caller.
