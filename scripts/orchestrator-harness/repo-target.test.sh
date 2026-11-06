@@ -297,8 +297,8 @@ c4=$?
     && [ "$(cat "$FO/state/fixcount-4004" 2>/dev/null)" = "1" ]; }; ck "C4 --argv (CTRL=1) identity refusal -> REFUNDS fixcount AND writes fixgate-<PR>-<head> (rc=$c4)" $?
 
 # ⛔ A WORKTREE-MATERIALISATION REFUSAL MUST REFUND TOO (#3511). This arm exited without refunding
-# while the identity refusals above do, and the rule is the file's own (#1720, and #2223 above
-# `refund_gate_attempt`): the controller books the attempt UPSTREAM of every gate, so a refusal that
+# while the identity refusals above do, and the rule is the file's own (#1720 above `refund_gate_attempt`,
+# #2223 inside it): the controller books the attempt UPSTREAM of every gate, so a refusal that
 # ran no fixer must give it back — otherwise three refusals reach MAX_FIX_TRIES and the PR is PARKED
 # "needs a human" having never had a single fixer run. The exit code is the whole test: any non-zero
 # `wt_provision` rc refunds, and the helper names the cause in `$WT_RESULT` (logged as `ABORT:`). No
