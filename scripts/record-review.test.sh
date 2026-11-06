@@ -42,12 +42,15 @@ RECORD="$SCRIPT_DIR/record-review.sh"
 # stale-validator arm, which wins on the `$SELF`-adjacent rung ABOVE this one.
 #
 # ⛔ NOT `export VAR="$(…)"` (the #2569 shape, and the same fix `install-launchd.test.sh` carries).
-# A DECLARATION builtin's exit status is the BUILTIN's, not the substitution's, so a FAILED `cd` and an
-# EMPTY answer are the same observable — and an EMPTY root is the exact regression the block above
-# exists to prevent: the pin silently stops being a pin and every arm below reads the ambient rung
-# again, while the suite still prints PASS. A bare assignment carries the substitution's status, so
-# the `||` is a real check; `scripts/check-false-pass-shapes.sh` then no longer reports the
-# `discarded-status` shape this file was red for on main (#2741).
+# A DECLARATION builtin's exit status is the BUILTIN's, not the substitution's, so `$?` does not
+# report a `cd` that failed — the shape hides it, which is why `scripts/check-false-pass-shapes.sh`
+# bans it (`discarded-status`, and this line was the ONE finding that red reported on main: #2741).
+# A bare assignment carries the substitution's status, so the `||` is a real check: a root that
+# cannot be resolved stops the suite loudly instead of being pinned to whatever `pwd` managed to
+# print. Stated so it is not read as more than it is: `SCRIPT_DIR` is already resolved the same way
+# higher up under `set -euo pipefail`, so an empty `SCRIPT_DIR` is not reachable here and an empty
+# operand would in any case resolve to `/` rather than fail. This arm is therefore the banned-shape
+# repair plus defence in depth — not the only thing between the arms below and the ambient rung.
 AGENT_INFRA_PATH="$(cd "$SCRIPT_DIR/.." && pwd)" || {
     echo "record-review.test.sh: cannot resolve the checkout root from SCRIPT_DIR='$SCRIPT_DIR'" >&2
     exit 1
