@@ -231,6 +231,39 @@ def endpoint_key(url):
     return key + u[m.end():]
 
 
+def authority_key(url):
+    """`scheme://host[:non-default-port]` — `endpoint_key` with the PATH, QUERY and FRAGMENT cut off.
+
+    MUST MATCH `cell-install.sh`'s `_authority_key` (same derivation, one URL parser).
+
+    ⛔ "IS THIS THE HOSTED ENDPOINT?" IS A QUESTION ABOUT THE AUTHORITY (#3374 review, round 12 P1 —
+    a FALSE PASS on BOTH sides). `endpoint_key` appends `u[m.end():]` verbatim, so a hosted url
+    spelled `/mcp` (no trailing slash), `/foo/../mcp/`, `/mcp/?x=1` or `/mcp/#x` keyed DIFFERENTLY
+    from `HOSTED_DEFAULT_URL` — and `node -e 'new URL(u).href'` normalises every one of them onto the
+    canonical hosted url, which answers 401 to an unauthenticated POST. On the verifier side that
+    meant `SELFHOSTED:` rc=0 over an EMPTY Bearer; on this side it meant the merge MINTED
+    `_selfHosted` onto the hosted endpoint and printed "kept this machine's own tortoise url" about
+    it, and a TEMPLATE spelled without the trailing slash was installed verbatim with `headers:
+    null` — an entry `--verify` then certified `SELFHOSTED:`, i.e. install and verify CONVERGING on
+    the false pass. No path/query/fragment can make a hosted AUTHORITY a self-host: what the
+    credential requirement is about is the HOST the key is sent to. A genuine self-host is a
+    different authority (another host, or `:8443`) and `endpoint_key` keeps the port.
+
+    ⛔ THE SCHEME IS PART OF IT, DELIBERATELY. `http://api.premiselabs.co/mcp/` is NOT the hosted
+    endpoint (cleartext, and `usable()` refuses it as INSECURE_URL); keying it as hosted here would
+    silently normalise a template this file must REFUSE into the https default.
+    """
+    k = endpoint_key(url)
+    m = re.match(r"^((?:userinfo@)?[a-z][a-z0-9+.\-]*://[^/?#]*)", k, re.I)
+    return m.group(1) if m else k
+
+
+def on_hosted_authority(url):
+    """True when `url` is the HOSTED endpoint however its path/query/fragment is spelled."""
+    return authority_key(url) == authority_key(HOSTED_DEFAULT_URL)
+
+
+
 # WHATWG URL's forbidden HOST code points. A host containing one is not "a spelling of a host" —
 # the client's parser refuses it outright (`new URL(...)` -> ERR_INVALID_URL), so a predicate that
 # calls it usable certifies an endpoint no request can be built from.
@@ -801,6 +834,20 @@ def main(argv):
         )
         return 3
 
+    # ⛔ THE HOSTED ENDPOINT IS A FIXED FACT, SO ITS SPELLING IS TOO (#3374 review, round 12 P1).
+    # A template whose url is the hosted AUTHORITY spelled some other way — `/mcp` without the
+    # trailing slash, `/foo/../mcp/`, `/mcp/?x=1`, `/mcp/#x`, `:0443` — went into `.mcp.json`
+    # VERBATIM. Measured: the no-slash template installed an entry carrying `headers: null`, and
+    # `--verify` certified it `SELFHOSTED:` rc=0 — a false PASS over the LIVE hosted endpoint (it
+    # answers 401) with NO credential at all; `:0443` installed a non-canonical spelling instead.
+    # Both are wrong for one reason: a template cannot make the hosted endpoint stop being the hosted
+    # endpoint. The canonical url is what gets installed, so `verify -> install -> verify` converges.
+    # ⛔ THE SCHEME IS NOT NORMALISED HERE: `authority_key` keeps it, so `http://api.premiselabs.co`
+    # keys to a DIFFERENT authority and is left for `usable()` to refuse as INSECURE_URL. Upgrading
+    # it would silently repair a template this file must REFUSE.
+    if on_hosted_authority(want.get("url")):
+        want["url"] = HOSTED_DEFAULT_URL
+
     # ⛔ TOTAL OVER THE DESTINATION'S *STRUCTURE*, not only over its entries. `usable()` was made
     # total one level down (a `headers` that is a string, a non-string url/Authorization) and these
     # two containers were left assuming a mapping: a `.mcp.json` whose ROOT is `[]`/`"x"`/`5`, or
@@ -883,12 +930,24 @@ def main(argv):
                 # Bearer, #3275/#3289) came out `SELFHOSTED:` rc=0. The marker is minted here and read
                 # by the verifier, so the truth has to start here: the hosted endpoint is the hosted
                 # endpoint whatever the template asks for, it keeps its entry, and it is never marked.
-                if endpoint_key(cur.get("url")) == endpoint_key(HOSTED_DEFAULT_URL):
+                if on_hosted_authority(cur.get("url")):
                     cur.pop("_selfHosted", None)
+                    if (cur.get("url") or "").strip() != HOSTED_DEFAULT_URL:
+                        # ⛔ A NON-CANONICAL SPELLING IS NORMALISED, NOT PRESERVED (#3374 review,
+                        # round 12 P1). `/mcp` without the trailing slash, `/foo/../mcp/`,
+                        # `/mcp/?x=1` and `/mcp/#x` are the hosted endpoint as the client parses
+                        # them; keeping the bytes let `--verify` refuse the file this just wrote.
+                        print(
+                            "NOTE: normalised this cell's HOSTED tortoise url (%s) to the default "
+                            "(%s) — a different spelling of the SAME authority is a typo, not a "
+                            "self-host, and the client parses both as the default"
+                            % (cur.get("url"), HOSTED_DEFAULT_URL)
+                        )
+                        cur["url"] = HOSTED_DEFAULT_URL
                     print(
                         "NOTE: kept this cell's HOSTED tortoise endpoint (%s) — its url is the "
                         "hosted default, not a self-host, so it is NOT marked _selfHosted and the "
-                        "hosted credential is still required" % (cur.get("url"),)
+                        "hosted credential is still required" % (HOSTED_DEFAULT_URL,)
                     )
                 elif not cur.get("_selfHosted"):
                     cur["_selfHosted"] = True
