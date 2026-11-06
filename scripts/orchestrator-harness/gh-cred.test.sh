@@ -358,6 +358,32 @@ ck "a READ forced onto the user credential IS counted as unjustified" \
 ck "  …and --stats then exits non-zero, so a caller can gate on it" \
    "$([ "$src" -ne 0 ] && echo 0 || echo 1)"
 
+# ── §7 the two credentials must not share a cache entry ───────────────────────────────────────
+echo "§7 the ETag/flight cache is credential-partitioned (a body must not cross arms)"
+# ⛔ THE INSTALLATION TOKEN AND THE USER CREDENTIAL CAN SEE DIFFERENT REPOSITORIES. A body — or a
+# 404 — cached under one and replayed to the other is a wrong answer with rc 0, i.e. "the call failed
+# and the caller read the failure as no data" (#3584's own class), and it is SILENT. The arm is mixed
+# into `_cred_digest()`, and this pins it: same host, same path, different arm, different key.
+cat >"$TMP/keyprobe.py" <<'KP'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gh_limit", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+plan = {"host": "github.com", "path": "repos/o/r/pulls/1"}
+m._CRED_ARM = "app"
+k_app = m.cache_key(plan)
+m._CRED_ARM = "write"
+k_write = m.cache_key(plan)
+sys.stdout.write("same\n" if k_app == k_write else "differ\n")
+KP
+ck "the same path under two arms yields two different cache keys" \
+   "$([ "$(python3 "$TMP/keyprobe.py" "$LIMIT")" = differ ] && echo 0 || echo 1)"
+
+mutate "$LIMIT" "$MUT/nodigest.py" '    return "%s.%s" % (base, _CRED_ARM)' '    return base' \
+  && ck "  …and removing the arm from the digest collapses them into ONE key (the partition bites)" \
+         "$([ "$(python3 "$TMP/keyprobe.py" "$MUT/nodigest.py")" = same ] && echo 0 || echo 1)" \
+  || { fail=$((fail+1)); echo "  FAIL digest mutation target missing"; }
+
 echo
 printf '%s\n' "----------------------------------------"
 printf 'gh-cred: %d passed, %d failed\n' "$pass" "$fail"
