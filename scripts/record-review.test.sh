@@ -7856,6 +7856,39 @@ run_record_delta $EH53 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524301" \
 assert_eq "$RECORD_RC" "3" "20h45 naming a commit INSIDE the range is still refused (declared residual)"
 assert_contains "$RECORD_ERR" "INSIDE the range" "20h45 the refusal says INSIDE the range"
 assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h45 and does NOT accuse the artifact of an unparseable narrowing"
+# 20h46 THE THIRD LOCATION: A COMMIT AFTER THE HEAD (twelfth cycle, P2). The eleventh cycle's fix
+#       split the refusal in two and its own comment claimed a token that is not INSIDE the range
+#       "can only be a narrowing endpoint written in a notation the parser did not tokenise". That is
+#       FALSE: a commit whose PARENT is the attested head reaches the same message and was told it
+#       had written an unparseable narrowing — a narrowing is BELOW the range, a descendant of B is
+#       ABOVE it, and no notation is involved in either. The refusal is right (a verdict naming a
+#       commit that did not exist at B is not a verdict at B); the diagnosis was not. This vector is
+#       the only one that reaches that branch, which is why the wording was never exercised before.
+EH54=425244; rm -f "$(Q2 $EH54)"
+_b46="$(printf 'later\n' | git -C "$DG" hash-object -w --stdin)"
+_t46="$(printf '100644 blob %s\tlater.txt\n' "$_b46" | git -C "$DG" mktree)"
+DG_AFTER="$(git -C "$DG" commit-tree "$_t46" -p "$DG_HEAD" -m 'later work')"
+run_record_delta $EH54 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found. The head later moved to ${DG_AFTER}."
+assert_eq "$RECORD_RC" "3" "20h46 a commit AFTER the attested head is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "AFTER" "20h46 the refusal says AFTER the attested head"
+assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h46 and does NOT accuse the artifact of an unparseable narrowing"
+# 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
+#       commit that descends from `from` while being neither an ancestor NOR a descendant of the
+#       attested head is the one shape a narrowing endpoint can actually take — and no shipped vector
+#       reached it (M24's token is skipped by the unrelated-lineage arm), so the third message was
+#       dead text. Here it is measured, so a later edit that collapses the three branches reds.
+EH55=425246; rm -f "$(Q2 $EH55)"
+_b47="$(printf 'sibling\n' | git -C "$DG" hash-object -w --stdin)"
+_t47="$(printf '100644 blob %s\tsib.txt\n' "$_b47" | git -C "$DG" mktree)"
+DG_SIB="$(git -C "$DG" commit-tree "$_t47" -p "$DG_BASE" -m 'sibling work')"
+run_record_delta $EH55 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I also reviewed up to ${DG_SIB} on the side branch, which is where the real work happened."
+assert_eq "$RECORD_RC" "3" "20h47 a narrowing endpoint OUTSIDE the range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "NARROWER range" "20h47 and the refusal is the narrowing one, not the inside/after one"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames

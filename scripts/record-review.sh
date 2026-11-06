@@ -1966,9 +1966,17 @@ $m"
       # ordinary reviewer artifact, and what `skills/code-review/SKILL.md` asks a reviewer to return
       # — was refused with "a NARROWER range … written in a notation this code does not parse", when
       # the artifact narrowed nothing and the token was a plain sha. The RULE is unchanged and stays
-      # a declared residual above; only the DIAGNOSIS is now true. A token that is an ancestor of the
-      # attested head is INSIDE the range; one that is not can only be a narrowing endpoint written
-      # in a notation the range parser above did not tokenise.
+      # a declared residual above; only the DIAGNOSIS is now true.
+      # ⛔ AND THERE ARE THREE LOCATIONS, NOT TWO (twelfth review cycle, P2 — the eleventh cycle's
+      # comment here claimed a token not INSIDE the range "can only be a narrowing endpoint written
+      # in a notation the parser did not tokenise", and that is FALSE: MEASURED with a commit whose
+      # PARENT is the attested head, a token AFTER B reached this message and was told it had written
+      # an unparseable narrowing — a narrowing is below the range, a descendant of B is above it, and
+      # no notation is involved in either. The comment is the justification a later reader trusts, so
+      # a false one propagates. Three tests now, in this order: an ancestor of the attested head is
+      # INSIDE the range; a DESCENDANT of it is AFTER the head (a verdict naming one is not a verdict
+      # at B at all, since that commit did not exist at B); only what remains can be a narrowing
+      # endpoint outside the range.
       _r=0
       delta_git "$root" merge-base --is-ancestor "$_tsha" "$to" 2>/dev/null || _r=$?
       if [ "$_r" -eq 0 ]; then
@@ -1976,7 +1984,14 @@ $m"
         echo "   → refer to commits INSIDE the range by description (\"the merge commit\", \"the lane commit\") rather than by sha, and state the range once as delta:${from:0:12}..${to:0:12}." >&2
         return 1
       fi
-      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — LATER than ${from:0:12}… (the range's start), not ${to:0:12}… (the head being attested), and not an ancestor of it, so it is outside the range altogether. That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$to" "$_tsha" 2>/dev/null || _r=$?
+      if [ "$_r" -eq 0 ]; then
+        echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit AFTER ${to:0:12}…, the head being attested. ${to:0:12}… is an ancestor of it, so it did not exist when a verdict at ${to:0:12}… was written: an artifact that names it is a verdict against a LATER head (or a reference to work that has not been reviewed here), and a `clean` record at ${to:0:12}… would extend it to a commit nobody reviewed. Nothing was written." >&2
+        echo "   → record the verdict at the head it actually reviews, or drop the reference — quote the range as delta:${from:0:12}..${to:0:12} and name no commit later than ${to:0:12}…." >&2
+        return 1
+      fi
+      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — LATER than ${from:0:12}… (the range's start), not ${to:0:12}… (the head being attested), not inside the range above it, and not a descendant of it either. That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
       echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}, and refer to commits INSIDE the range by description rather than by sha." >&2
       return 1
     done
