@@ -893,16 +893,27 @@ review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; p
 # head is the cap-deferral publish: it says "no owner yet" about the PR rather than a revision, and it
 # stays plain presence.
 publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
-  local repo=$1 pr=$2 state=$3 head=${4:-} basis=${5:-} tag seen text _ratt_basis
+  local repo=$1 pr=$2 state=$3 head=${4:-} basis=${5:-} tag seen text _ratt_basis _ratt_tail
   tag="<!-- auto-rail-review:${state}${head:+:$head} -->"
   # ⛔ WHAT MAY BE SAID ABOUT THE COUNT (review round 6, P3): when the attempt ledger could not be READ, the
   # count the loop acted on is the CAP, not a measurement — so the comment says that instead of asserting
   # "3 dispatch(es)" as a fact. The caller passes `cap` for that case (a global flag cannot work: the count
   # is fetched in `$( … )`, and a subshell cannot write back).
+  # ⛔ AND THE TAIL IS PART OF THAT CLAIM, NOT BOILERPLATE (review round 7, P2, reproduced). The sentence after
+  # the basis used to be shared: "… until that window rolls — which it does BY ITSELF, so an environmental
+  # cause needs no action at all". That is TRUE of the counted case (the window is a clock, and a head ages out
+  # of it with nobody's help) and FALSE of the CAP case, which is exactly the case this basis exists for:
+  # `review_attempts` returns the cap on its unreadable path WITHOUT computing `cut` or consulting the clock,
+  # so no window exists to roll — the ledger stays unreadable on every future pass and waiting changes
+  # nothing. `review-retries-exhausted` is deliberately NOT in the positional family (nothing supersedes it),
+  # so a "no action required" there is a PERMANENT false instruction on the operator's only visible surface.
+  # Same class as the round-2 defect this file already carries: a false claim on the PR that nothing corrects.
   if [ "$basis" = cap ]; then
     _ratt_basis="its ATTEMPT LEDGER could not be read, so it is held fail-closed as if ${REVIEW_MAX_ATTEMPTS} dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count)"
+    _ratt_tail="That is NOT a window that rolls by itself: the ledger file is present but UNREADABLE, so every pass reads the same fail-closed value and waiting changes nothing. Repair or remove that file, or push a new head — a new head is a new review."
   else
     _ratt_basis="${REVIEW_MAX_ATTEMPTS} dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s"
+    _ratt_tail="That window rolls BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review."
   fi
   case "$state" in
     awaiting-review)
@@ -912,7 +923,7 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     review-found-issues)
       text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
     review-retries-exhausted)
-      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${_ratt_basis}. No attestation exists, and auto-rail is not dispatching another review at this revision until that window rolls — which it does BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review.";;
+      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${_ratt_basis}. No attestation exists, and auto-rail is not dispatching another review at this revision. ${_ratt_tail}";;
     review-record-unbound)
       text="⚠️ **auto-rail: a review record exists at \`${head:0:12}\` but the PR body carries no marker this loop can bind.** Re-running \`record-review.sh\` for this PR re-posts the signed marker at the same head (that write is idempotent). auto-rail never writes records, so it cannot do this itself — and it is deliberately NOT buying a second review, which would not help. **It is not waiting on a lane.**";;
     review-dispatch-failed)
@@ -1379,7 +1390,7 @@ PY
           if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=; fi
           publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"
           if [ "$_rbasis" = cap ]; then
-            log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read, so this head is held fail-closed as if $REVIEW_MAX_ATTEMPTS dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count; last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
+            log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read, so this head is held fail-closed as if $REVIEW_MAX_ATTEMPTS dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count; last state $_rstate, record $_rout, ledger $_ratt); that window will NOT roll by itself — an unreadable ledger reads the same value on every pass, so repair or remove that file. A new head is a new key and gets a review immediately"
           else
             log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s (cap $REVIEW_MAX_ATTEMPTS, last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
           fi

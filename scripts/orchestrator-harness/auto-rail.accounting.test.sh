@@ -1621,6 +1621,23 @@ if chmod 000 "$_UL2" 2>/dev/null && [ ! -r "$_UL2" ]; then
     *'that is the CAP, not a count'*) ;;
     *) bad "an unreadable ledger must be published as the CAP, not as '$ _hn dispatch(es)' — the number is fail-closed, not measured (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
   esac
+  # ⛔ AND THE SELF-HEALING TAIL IS PART OF THE CLAIM (review round 7, P2, REPRODUCED). The sentence AFTER the
+  # basis used to be shared by both cases: "… until that window rolls — which it does BY ITSELF, so an
+  # environmental cause … needs no action at all". That holds only for a COUNTED window (a clock ages the head
+  # out of it with nobody's help). In the CAP case it is false BY CONSTRUCTION: `review_attempts` returns the
+  # cap on its unreadable path without computing `cut` or consulting the clock, so no window exists to roll and
+  # the ledger never becomes readable by waiting — and `review-retries-exhausted` is deliberately NOT in the
+  # positional family, so nothing supersedes the marker. The instruction is therefore PERMANENT, on the only
+  # surface an operator reads, about a head that will never be reviewed again. Same class as the round-2
+  # defect this whole step exists to close (a false claim on the PR that nothing corrects).
+  case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
+    *'needs no action at all'*)
+      bad "the CAP wording must NOT promise that the state heals by itself ('needs no action at all') — the cap comes back on every pass because the ledger is unreadable, so the window never rolls and waiting changes nothing (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
+  esac
+  case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
+    *'NOT a window that rolls by itself'*) ;;
+    *) bad "the CAP wording must NAME the non-self-healing fact ('that is NOT a window that rolls by itself') and the remedy (repair/remove the ledger, or push a new head) — otherwise the one comment this head ever gets tells the operator nothing is needed (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
+  esac
 else
   echo "SKIP: cannot make a ledger unreadable as $(id -un) — the CAP-wording arm is INERT on this host"
 fi
@@ -1641,12 +1658,51 @@ case "$(sed -n "$(( _b1 + 1 )),\$p" "$POSTED")" in
   *'dispatch(es) inside'*) ;;
   *) bad "a MEASURED exhaustion must still publish the count — the CAP wording must not leak into the readable case (got: $(sed -n "$(( _b1 + 1 )),\$p" "$POSTED" | head -1))" ;;
 esac
+# …and the readable case KEEPS its self-healing promise, which is TRUE there: the tail is per-basis, not a
+# sentence that replaced the old one for both. An arm asserting only "the cap does not say 'no action at all'"
+# is satisfiable by DELETING the promise from both cases, which would stop telling the operator that a
+# rate-limit window clears itself.
+case "$(sed -n "$(( _b1 + 1 )),\$p" "$POSTED")" in
+  *'rolls BY ITSELF'*) ;;
+  *) bad "a MEASURED exhaustion must still say the window rolls BY ITSELF — that is true for a counted window, and deleting it from both cases trades one false claim for a silent operator (got: $(sed -n "$(( _b1 + 1 )),\$p" "$POSTED" | head -1))" ;;
+esac
 # …and the LOOP must pass the basis it computed: a bare publish (no 5th argument) would silently fall back
 # to the measured wording, which is the inert shape this fix replaced.
 grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"' "$SUT" \
   || bad "the loop must PASS its basis to the EXHAUSTED publish ('… review-retries-exhausted \"\$head\" \"\$_rbasis\"') — without the argument the comment falls back to asserting the CAP as a measured count, which is the defect this change closes"
 grep -qF 'if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=; fi' "$SUT" \
   || bad "the loop must ASK, directly, whether the ledger is unreadable ('if review_ledger_unreadable \"\$_ratt\"; then _rbasis=cap; else _rbasis=; fi') — a flag set inside \`\$(review_attempts …)\` never reaches the publisher (subshell)"
+# ⛔ AND THE **LOG** HALF MUST BE PINNED AS HARD AS THE COMMENT HALF (review round 7, P2, REPRODUCED). The
+# delta's own comment says "the published comment AND the log say that", and only the comment had an arm: the
+# reviewer restored the single unconditional log line (the fail-closed cap printed as "N dispatch(es)" — a
+# past-tense measurement the loop never took) and this whole suite stayed GREEN, on the file's primary
+# operator instrument. So the log is pinned by REACHABILITY, not by the existence of a string: both log lines
+# must exist, the `_rbasis` branch must OPEN BEFORE the cap line, and the measured line must come AFTER it —
+# which is unsatisfiable by one unconditional line (it would either lack the cap text entirely or print the
+# cap through `$_rattn`). The rc-3 arm's bounds keep both lines inside the EXHAUSTED drain, so neither can be
+# satisfied from an unrelated part of the file.
+_R3A=$(grep -nF 'if [ "$_ract" -eq 3 ]; then' "$SUT" | head -1 | cut -d: -f1)
+_R3B=$(grep -nF 'if [ "$_ract" -eq 2 ]; then' "$SUT" | head -1 | cut -d: -f1)
+_RBR=$(grep -nF 'if [ "$_rbasis" = cap ]; then' "$SUT" | head -1 | cut -d: -f1)
+_RCAP=$(grep -nF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' "$SUT" | head -1 | cut -d: -f1)
+_RMEA=$(grep -nF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' "$SUT" | head -1 | cut -d: -f1)
+grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' "$SUT" \
+  || bad "the EXHAUSTED LOG LINE must not print the fail-closed CAP as a measured count — when the ledger cannot be read there is no log line stating the non-measured fact, so the operator's primary instrument asserts '\$_rattn dispatch(es)' as a past-tense fact the loop never measured (the defect this delta closes, restored, with this suite GREEN)"
+grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' "$SUT" \
+  || bad "the MEASURED log line must still exist ('REVIEW-RETRIES-EXHAUSTED at \$head — \$_rattn dispatch(es) inside') — dropping it trades a fabricated count for no count at all in the readable case"
+case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
+  *[!0-9]*) bad "the EXHAUSTED log lines could not all be located (rc3=${_R3A:-MISSING} rc2=${_R3B:-MISSING} branch=${_RBR:-MISSING} capLog=${_RCAP:-MISSING} measuredLog=${_RMEA:-MISSING}) — the log stub changed shape, so this arm can no longer see it" ;;
+  *)
+    [ "$_R3A" -lt "$_RBR" ] && [ "$_RBR" -lt "$_RCAP" ] && [ "$_RCAP" -lt "$_RMEA" ] && [ "$_RMEA" -lt "$_R3B" ] \
+      || bad "the EXHAUSTED log must BRANCH on the basis INSIDE the rc-3 arm (rc3=${_R3A} branch=${_RBR} capLog=${_RCAP} measuredLog=${_RMEA} rc2=${_R3B}) — an unconditional line, or a branch outside the drain, restores the fabricated count with this suite green (reproduced, review round 7)"
+    # ⛔ AND THE BRANCH ALONE IS NOT ENOUGH — the CAP line must not CARRY the count (page 2 of the same defect,
+    # reproduced: keeping the branch, the phrase and the ordering while appending "$_rattn dispatch(es)" to the
+    # cap line left this suite GREEN, so the operator's instrument still asserted the fail-closed cap as a
+    # measured fact). The named line is the unit, exactly as the recall/ordering arms above treat it.
+    case "$(sed -n "${_RCAP}p" "$SUT" 2>/dev/null)" in
+      *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
+    esac ;;
+esac
 
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"
