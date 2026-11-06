@@ -1272,8 +1272,8 @@ review_forgive_refusal "$_led" "$_o1"
 [ "$(review_attempts "$_led")" = 0 ] || bad "forgiving an EMPTY ledger must be a no-op"
 review_forgive_refusal "$_rdir/no-such.attempts" "$_o1" || bad "forgiving a ledger that does not exist must be a no-op, not an error"
 rm -f "$_led"
-grep -qF '[ "$_rstate" = refused ] && review_forgive_refusal "$_ratt"' "$SUT" \
-  || bad "the loop must CALL review_forgive_refusal, GUARDED by the refused state — unguarded it drops a line on every dispatch, so the ledger never reaches the cap and the paid retry is unbounded again; guarded on any other state it forgives paid attempts"
+grep -qF '[ "$_rstate" = refused ] && review_forgive_refusal "$_ratt" "$(review_dispatched_at "$_rout")"' "$SUT" \
+  || bad "the loop must CALL review_forgive_refusal with the REFUSAL'S OWN dispatch epoch, GUARDED by the refused state — unguarded it drops a line on every dispatch, so the ledger never reaches the cap and the paid retry is unbounded again; guarded on any other state it forgives paid attempts. ⛔ THE SECOND ARGUMENT IS LOAD-BEARING AND WAS UNPINNED (review round 7, P2, REPRODUCED): a pin that stops at \"\$_ratt\" is a strict PREFIX of the shipped line, so deleting the epoch argument left this whole suite GREEN while the forgiver then skipped on EVERY refusal ('no dispatch epoch was supplied' → fail-closed, nothing dropped) — refusals consumed the paid budget and three rc=75 load refusals made the first real review read EXHAUSTED, the round-2 defect this forgiver exists to prevent. The callee arms above cannot catch that: they all pass an explicit epoch, so the only thing supplying it is this call."
 # ⛔ AND THE COUNT MUST BE READ FROM THE HEAD-KEYED LEDGER, NOT MANUFACTURED (review round 3, P2,
 # measured): the consumer was pinned but not this line, so `_rattn=0` — or pointing it at the RECORD —
 # left the suite green with the attempt term permanently zero and the paid retry loop unbounded again,
