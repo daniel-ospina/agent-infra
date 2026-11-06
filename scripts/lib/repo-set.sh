@@ -271,32 +271,92 @@ repo_set_parse() {
   return 0
 }
 
+# ⛔ THE PROOF IS DELEGATED, NOT RE-IMPLEMENTED (review round 4, P2). The first version parsed origin
+# URLs in bash, and review measured it disagreeing with the doctor IN BOTH DIRECTIONS on the same
+# remote: `case "$url" in *github.com[:/]*)` is a SUBSTRING match, so `notgithub.com/o/n` and
+# `mirror.github.com/o/n` "proved" a GitHub repo the doctor's `_names_github()` refuses to attest —
+# the reader certified a checkout the doctor grades read-only, and (with `notgithub.com/other/repo`)
+# REFUSED the whole set on a proof the doctor treats as none. Every extra parsing rule written here is
+# another chance to diverge from `resolve_repo()`; the honest fix is to ask the component that owns
+# the rule. `pr-doctor.py` sits beside the wrapper in BOTH layouts the farm produces
+# (`scripts/pr-doctor.py` and `$DEST/scripts/pr-doctor.py`), so `_rs_doctor_py()` finds it from
+# `scripts/lib/` in each.
+#
+# ⛔ WHAT A FAILURE TO ASK MEANS: nothing is PROVEN. A missing `pr-doctor.py`, a missing `python3`, a
+# module that will not load, a checkout this process may not stat, a checkout that is not a directory
+# — all of those are "unverifiable", never "wrong", and the caller WARNS on them. Only a slug the
+# doctor's own `_origin_slug()` returns can disagree with the declared one, and only that refuses.
+_rs_doctor_py() {
+  local d="${REPO_SET_DOCTOR:-}"
+  if [ -z "$d" ]; then
+    d="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)/pr-doctor.py"
+  fi
+  [ -f "$d" ] || return 0
+  printf '%s' "$d"
+}
+
+# _rs_with_doctor <verb> <arg> — run ONE question against pr-doctor.py's own functions, so the reader
+# and the doctor cannot disagree about a remote or a slug. Prints the answer, or "" when nothing could
+# be asked. `verb` is `origin` (_origin_slug) or `norm` (_normalize_slug).
+_rs_with_doctor() {
+  local verb="${1:-}" arg="${2:-}" doc py
+  doc="$(_rs_doctor_py)"
+  [ -n "$doc" ] || return 0
+  py="$(command -v python3 2>/dev/null)"
+  [ -n "$py" ] || return 0
+  "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
+import importlib.util, sys
+doc, verb, arg = sys.argv[1], sys.argv[2], sys.argv[3]
+spec = importlib.util.spec_from_file_location("_prd", doc)
+mod = importlib.util.module_from_spec(spec)
+try:
+    spec.loader.exec_module(mod)
+except Exception:
+    raise SystemExit(0)
+if verb == "norm":
+    sys.stdout.write(mod._normalize_slug(arg))
+else:
+    slug, why = mod._origin_slug(arg)
+    sys.stdout.write(("%s\t" % slug) if slug else ("\t%s" % why))
+PY_PROOF
+}
+
 # _rs_origin_slug <checkout> — the `owner/name` this checkout's `origin` PROVES, or "" and a reason.
-# One parser, same shapes pr-doctor.py's `_origin_slug()` accepts, and the CALLER compares it through
-# `_rs_lower()` like the doctor's `resolve_repo()` does — so the set's verdict and the doctor's verdict
-# about the same checkout cannot disagree, in either direction.
+# The SAME function `pr-doctor` grades with, so the two verdicts are one verdict.
 _rs_origin_slug() {
-  local dir="${1:-}" url=""
-  command -v git >/dev/null 2>&1 || { printf '\tgit is not on PATH'; return 0; }
-  url="$(git -C "$dir" config --get remote.origin.url 2>/dev/null)" || url=""
-  [ -n "$url" ] || { printf '\tno remote.origin.url'; return 0; }
-  case "$url" in
-    *github.com[:/]*)
-      local tail="${url#*github.com}"; tail="${tail#:}"; tail="${tail#/}"; tail="${tail%.git}"
-      if _rs_slug_ok "$tail"; then printf '%s\t' "$tail"; return 0; fi
-      printf '\torigin url is not owner/name: %s' "$url"; return 0 ;;
-  esac
-  printf '\torigin does not name github.com: %s' "$url"
+  local dir="${1:-}" out
+  if [ -z "$dir" ]; then printf '\tno checkout was named'; return 0; fi
+  out="$(_rs_with_doctor origin "$dir")"
+  if [ -z "$out" ] && [ -z "$(_rs_doctor_py)" ]; then
+    printf '\tpr-doctor.py was not found beside this reader, so no origin can be proved'
+    return 0
+  fi
+  if [ -z "$out" ]; then
+    printf '\tpr-doctor.py could not be asked (no python3, or it would not load)'
+    return 0
+  fi
+  printf '%s' "$out"
+}
+
+# _rs_normalize_slug <value> — `owner/name` from anything `_normalize_slug` accepts (a bare slug, a
+# `[HOST/]OWNER/REPO`, a URL, `.git`, an scp-style remote), or "" when it names no repo. Delegated for
+# the same reason: the DEGRADED path advertises a slug and then the doctor re-resolves it, so a
+# stricter parser here refuses values the doctor runs (measured: a `https://github.com/o/n` seam).
+_rs_normalize_slug() {
+  local v="${1:-}"
+  [ -n "$v" ] || return 0
+  _rs_with_doctor norm "$v"
   return 0
 }
 
 # repo_set_check — the SYNTAX half plus the proofs that make the list trustworthy:
-#   * every checkout exists — PROVEN absent refuses;
-#   * its `origin` PROVES the slug it is declared under (a PROVEN disagreement refuses; an UNVERIFIABLE
-#     checkout only warns — the same split pr-doctor.py's `resolve_repo()` makes, because launchd has
-#     no Full Disk Access under ~/Documents and refusing there would refuse every real multi-repo box,
-#     AND for exactly the same reason "there is no git work tree here" must never be inferred from
-#     "this process could not look");
+#   * its `origin` PROVES the slug it is declared under — THE ONLY PROOF THAT CAN REFUSE, because the
+#     proof is `pr-doctor.py`'s own `_origin_slug()`, delegated rather than re-implemented;
+#   * nothing else refuses. Absent, denied, not a directory, no `origin`, no `git`, no `python3`: all
+#     UNVERIFIABLE, all a WARN, and the pass grades that repo read-only — the same split
+#     `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
+#     under `~/Documents` (the default checkout), so refusing there discarded a pass the doctor
+#     completes. "I could not look" must never be reported as "it is wrong".
 #   * no two repos share a state dir — the silent-sharing failure `multi-repo-controller.sh` refuses
 #     by name, one level up: two controllers pointed at one state dir fight over ONE `.orch.lock`,
 #     ONE candidates list and ONE worker registry, so each believes it is alone on the box.
@@ -334,20 +394,25 @@ repo_set_check() {
     #
     # So: PROVEN wrong (absent, or a checkout of a different repo) refuses; UNVERIFIABLE warns and
     # lets the pass grade read-only, which is what the doctor does with the same evidence.
-    if [ ! -e "$checkout" ]; then
-      problems="$problems; $checkout does not exist"
-    else
-      local proof why
-      proof="$(_rs_origin_slug "$checkout")"; why="${proof#*$'\t'}"; proof="${proof%%$'\t'*}"
-      if [ -n "$proof" ]; then
-        if [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug")" ]; then
-          problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
-        fi
-      else
-        # `why` is the reader's own reason, so "cannot change to …: Permission denied", "no
-        # remote.origin.url" and "git is not on PATH" are all reported as what they are.
-        printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves no repo (%s); its queue will be graded read-only and nothing will be spawned\n' "$slug" "$checkout" "$why"
+    # ⛔ NOTHING ABOUT THE CHECKOUT'S EXISTENCE REFUSES (review round 4, P1; round 3, P1). Round 3 moved
+    # this refusal off `git rev-parse` and onto `test -e` — which is the SAME defect one syscall over:
+    # macOS TCC denies at the ANCESTOR (`~/Documents`), so `stat` fails with EACCES, `-e` is false, and
+    # the reader printed a false "does not exist" and refused the WHOLE set while the doctor handed the
+    # same entry a complete read-only pass. And a sandbox is entitled to answer ENOENT for a denied
+    # path, so even an errno-aware test cannot PROVE absence from inside it.
+    #
+    # THE RULE, THEN, AND IT IS THE WHOLE RULE: only a PROVEN fault refuses. A slug the doctor's own
+    # `_origin_slug()` returns that differs from the declared one is proven. Everything else — absent,
+    # denied, not a directory, no `origin`, no `git`, no `python3` — is UNVERIFIABLE and warns, and the
+    # pass grades that repo read-only, which is exactly what the doctor does with the same evidence.
+    local proof why
+    proof="$(_rs_origin_slug "$checkout")"; why="${proof#*$'\t'}"; proof="${proof%%$'\t'*}"
+    if [ -n "$proof" ]; then
+      if [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug")" ]; then
+        problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
       fi
+    else
+      printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves no repo (%s); its queue will be graded read-only and nothing will be spawned\n' "$slug" "$checkout" "$why"
     fi
 
     if [ -n "$state" ]; then

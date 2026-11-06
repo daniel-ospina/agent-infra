@@ -83,12 +83,17 @@
          read another repo's worktrees, and a box whose checkout does not resolve grades the queue
          read-only and says so instead of spawning.
 
-         ⛔ WHAT HAPPENS ON A BOX WITH NO SET (the migration state). The wrapper does not refuse: it
-         runs the single-repo form, resolves the repo from `REPO`'s `origin` / `OR` exactly as this
-         unit did before, and LOGS `DEGRADED — NO-REPO-SET` with the exact file to create on every
-         pass. Refusing there would stop grading every existing box on upgrade; degrading silently
-         would be the 'installed but inert' state this repo keeps paying for, so it is one loud line
-         per pass. Create the set and the same unit grades every repo in it with no reinstall.
+         ⛔ WHAT HAPPENS ON A BOX WITH NO SET (the migration state), IN TWO CASES, and this is the
+         distinction that matters because THIS template's default checkout lives under `~/Documents`:
+           * the wrapper CAN still name a repo (`PR_DOCTOR_REPO`, `OR`, or a `REPO` whose git origin
+             proves one) → it runs the single-repo form and LOGS `DEGRADED — NO-REPO-SET` with the
+             exact file to create;
+           * it CANNOT → it REFUSES (exit 2), naming both fixes.
+         On macOS the launchd job usually lands in the SECOND case without a set, because it has no
+         Full Disk Access under `~/Documents` and so cannot read the checkout's origin. So the
+         accurate statement is not "it keeps working"; it is "it says, every pass, in the launchd
+         capture, exactly what to create". Create the set and the same unit grades every repo in it
+         with no reinstall — which is the whole point, and the reason the refusal names the file.
 
          ⛔ A SET THAT EXISTS BUT DOES NOT VALIDATE IS A REFUSAL (exit 2, named). Dropping a line the
          reader cannot parse would grade a shorter set, and a shorter set reads exactly like a
