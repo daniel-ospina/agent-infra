@@ -1754,3 +1754,93 @@ def test_T_lane_dispatch_refuses_when_branch_existence_cannot_be_read(tmp_path, 
         assert is_err and payload["refused"] == "branch-exists", payload
     finally:
         monkeypatch.undo()
+
+
+def test_T_box_exec_refuses_the_read_back_escapes_cat_left_open():
+    """[P1, review cycle 2] Removing `cat` did NOT close the file-read class, and nothing pinned it.
+
+    Measured by the reviewer on the 0600 JEV key store: `["git","diff","--no-index","<file>","/dev/null"]`
+    validated, hardened intact, needed no repo, and `_box_exec` returns stdout whatever the rc — so the
+    whole file landed in the response. The removal of `cat` itself was UNPINNED (a grep for `"cat"` in
+    this file returned nothing), which is how the class survived its own fix.
+    """
+    mod = _saved_mod()
+    # the program is gone
+    ok, why = mod._allowlisted(["cat", "/etc/shadow"])
+    assert not ok and "not on the allowlist" in why, (ok, why)
+    # …and its capability is gone too: an allowlisted program could still dump a named file
+    for probe in (["git", "diff", "--no-index", "/etc/shadow", "/dev/null"],
+                  ["git", "diff", "--no-index=/etc/shadow", "/dev/null"]):
+        ok, why = mod._allowlisted(probe)
+        assert not ok and "--no-index" in why, (probe, ok, why)
+    # the legitimate forms still pass
+    assert mod._allowlisted(["git", "diff"])[0]
+    assert mod._allowlisted(["git", "status"])[0]
+    assert mod._allowlisted(["ls", "/tmp"])[0]
+
+
+def test_T_pr_queue_refuses_every_unrecognised_shape_not_just_one(tmp_path, monkeypatch):
+    """[P2, review cycle 2] The shape refusal covered only `dict WITHOUT rows/prs`.
+
+    Every other unreadable shape still fell into the loop and answered `row_count: 0, isError: false`
+    — the confident empty queue invariant 1 forbids. An EMPTY LIST stays a real answer (an empty board
+    is a measurement); anything unrecognised is an abstention.
+    """
+    mod = _saved_mod()
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        for payload in ('{"foo": 1}', '{"rows": "nope"}', '{"rows": {}}', '42', '"a string"', '[1,2,3]'):
+            ran = mod.Ran(["pr_state.py", "--json"], rc=0, stdout=payload)
+            monkeypatch.setattr(mod, "run_module", lambda *a, **k: ran)
+            is_err, out = mod._pr_queue(None, {"repo": "o/r"})
+            assert "unmeasured" in out, (payload, out)
+            assert out.get("row_count", 0) == 0 and "rows" not in out, (payload, out)
+        # and an EMPTY LIST is still a legitimate measurement, not an abstention
+        ran = mod.Ran(["pr_state.py", "--json"], rc=0, stdout="[]")
+        monkeypatch.setattr(mod, "run_module", lambda *a, **k: ran)
+        is_err, out = mod._pr_queue(None, {"repo": "o/r"})
+        assert out["rows"] == [] and out["row_count"] == 0 and "unmeasured" not in out, out
+    finally:
+        monkeypatch.undo()
+
+
+def test_T_lane_dispatch_fresh_branch_proceeds_and_remote_only_refuses(tmp_path, monkeypatch):
+    """[P1, review cycle 2] `measured` is not `rc == 0`, and the two cases the guard exists for.
+
+    `git rev-parse --verify --quiet refs/heads/<absent>` answers **rc=1 for a MEASURED ABSENCE** — that
+    is how it says "no such branch". Treating `not exists.ok()` as unreadable inverted the guard: it
+    refused every brand-new branch (the normal dispatch) and reported a branch the remote probe could
+    SEE (`remote: true` in the same payload) as "unmeasured". These two arms are the ones missing.
+    """
+    import subprocess
+    mod = _saved_mod()
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        origin = tmp_path / "origin.git"
+        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        wt = tmp_path / "wt"
+        subprocess.run(["git", "clone", "-q", str(origin), str(wt)], check=True)
+        subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        subprocess.run(["git", "-C", str(wt), "push", "-q", "origin", "HEAD:refs/heads/main"], check=True)
+        brief = tmp_path / "b.md"
+        brief.write_text("x")
+        monkeypatch.setenv("O", str(tmp_path / "o"))
+        (tmp_path / "o" / "bg").mkdir(parents=True)
+
+        # (a) a FRESH branch, both probes readable → the dispatch must PROCEED (pid from the launcher)
+        (tmp_path / "o" / "bg" / "F1.pid").write_text("999\n")
+        monkeypatch.setenv("ORCH_MCP_DISPATCH", stub(tmp_path, "d-ok.sh", "print('launched')"))
+        is_err, payload = one(mod, "lane.dispatch", {"name": "F1", "worktree": str(wt),
+                                                    "brief": str(brief), "branch": "brand-new"})
+        assert is_err is False and payload.get("pid") == 999, payload
+
+        # (b) a branch that exists ONLY on the remote → a MEASURED collision, not an abstention
+        subprocess.run(["git", "-C", str(wt), "push", "-q", "origin",
+                        "HEAD:refs/heads/remote-only"], check=True)
+        (tmp_path / "o" / "bg" / "F2.pid").write_text("998\n")
+        is_err, payload = one(mod, "lane.dispatch", {"name": "F2", "worktree": str(wt),
+                                                    "brief": str(brief), "branch": "remote-only"})
+        assert is_err and payload["refused"] == "branch-exists", payload
+    finally:
+        monkeypatch.undo()

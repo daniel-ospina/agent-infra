@@ -1455,8 +1455,35 @@ def _pr_queue(mods: Modules, args: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]
                                         "got a dict with keys %s)" % (ran.cmd, sorted(rows.keys())[:8]),
                           "exit_code": ran.rc}
         rows = picked
+    # ⛔ THE SHAPE REFUSAL HAS TO COVER EVERY SHAPE, NOT THE ONE IT WAS WRITTEN FOR (review cycle 2,
+    # P2). Gating only `dict WITHOUT rows/prs` left `{"rows": "nope"}`, `{"rows": {}}`, a bare JSON
+    # scalar and a list of non-dicts still falling into the loop below and answering
+    # `row_count: 0, isError: false` — the exact reading this refusal exists to kill. Required now:
+    # the top level is a dict or a list, and whatever we picked is a LIST. An empty list stays a real
+    # answer (an empty board is a measurement); anything unrecognised is an abstention.
+    if not isinstance(rows, (dict, list)):
+        return True, {"measured_at": _now(), "repo": repo,
+                      "unmeasured": "UNMEASURED(%s -> shape + expected a list or {\"rows\": [...]}; "
+                                    "got %s)" % (ran.cmd, type(rows).__name__),
+                      "exit_code": ran.rc}
+    if not isinstance(rows, list):
+        return True, {"measured_at": _now(), "repo": repo,
+                      "unmeasured": "UNMEASURED(%s -> shape + expected {\"rows\": [...]} to carry a "
+                                    "LIST; got %s)" % (ran.cmd, type(rows).__name__),
+                      "exit_code": ran.rc}
+    # ⛔ A LIST OF NON-DICTS IS NOT A QUEUE OF ROWS. Skipping the bad elements answered
+    # `row_count: 0` for `[1,2,3]` — the same confident empty reading, one shape further out. It is
+    # now an explicit abstention: a payload whose rows are not objects cannot be counted, and
+    # "zero rows matched" must never be the report for "I could not read these rows".
+    if any(not isinstance(row, dict) for row in rows):
+        return True, {"measured_at": _now(), "repo": repo,
+                      "unmeasured": "UNMEASURED(%s -> shape + expected a list of row objects; got a "
+                                    "list whose elements include %s)"
+                                    % (ran.cmd, sorted({type(r).__name__ for r in rows
+                                                        if not isinstance(r, dict)})),
+                      "exit_code": ran.rc}
     out_rows = []
-    for row in rows if isinstance(rows, list) else []:
+    for row in rows:
         if not isinstance(row, dict):
             continue
         action = row.get("action") or row.get("ACTION")
@@ -1768,8 +1795,14 @@ def _dispatch(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         # ⛔ ORDER MATTERS: a branch the LOCAL probe FOUND is `branch-exists` whatever the remote says;
         # only an ABSENT local answer makes an unreadable remote a refusal. (My first version got this
         # order wrong and the existing branch-exists test caught it.)
-        local_has = exists.ok() and bool(exists.stdout.strip())
-        if not local_has and (remote_exists is None or not exists.ok()):
+        # ⛔ "MEASURED" IS NOT "rc == 0" (review cycle 2, P1). `git rev-parse --verify --quiet
+        # refs/heads/<branch>` answers **rc=1 for a MEASURED ABSENCE** — that is how it says "no such
+        # branch", not a failure. Treating `not exists.ok()` as unreadable inverted this guard: it
+        # refused every brand-new branch (the normal dispatch) and, worse, reported a branch that the
+        # remote probe could SEE (`remote: true` in the same payload) as "unmeasured".
+        local_measured = (not exists.error) and (not exists.timed_out) and exists.rc in (0, 1)
+        local_has = local_measured and exists.rc == 0 and bool(exists.stdout.strip())
+        if not local_has and (remote_exists is None or not local_measured):
             payload["refused"] = "branch-existence-unmeasured"
             payload["branch"] = branch
             payload["local"] = exists.unmeasured() if not exists.ok() else False
@@ -1887,6 +1920,13 @@ GIT_OK_VERBS = ("status", "log", "rev-parse", "ls-files", "show", "diff")
 # diagnostic was refused with "writes a file the caller names" — wrong about the command and wrong
 # about the reason. Scope the ban to the program whose option actually behaves that way.
 WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
+# ⛔ `--no-index` READS ARBITRARY FILES BACK, SO REMOVING `cat` CLOSED NOTHING ON ITS OWN (review cycle
+# 2, P1). Measured: `["git","diff","--no-index","<home>/.pi/agent/jev-config.json","/dev/null"]` is
+# allowlisted, hardens intact, needs no repo, and `_box_exec` returns `ran.stdout` regardless of rc — so
+# the whole file (the 0600 key store included) lands in the response, rc=1. This is the same escape the
+# code's own note describes ("plant content, read it back"), through a program that is still allowlisted.
+# Refused BY SHAPE, like `--output`, so a future verb inherits the refusal.
+READ_ESCAPE_TOKENS = ("--no-index",)
 # ⛔ A THIRD SHAPE: THESE FLAGS MAKE GIT EXECUTE A PROGRAM. `--ext-diff` runs `diff.external` (or a
 # `diff.<driver>.command`) and `--textconv` runs a `textconv` driver — both NAMED IN THE TARGET REPO's
 # config / `.gitattributes`, i.e. chosen by anything that can write the checkout the exec lands in.
@@ -2311,6 +2351,16 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
                 if low == bad or low.startswith(bad + "="):
                     return False, ("refusing %r: %s writes a file the caller names — an argv surface "
                                    "allowlisted for READING is not a write channel" % (token, bad))
+            # ⛔ A READ-BACK ESCAPE IS NEITHER A METACHARACTER NOR A WRITE (see READ_ESCAPE_TOKENS).
+            # `git diff --no-index <a> <b>` dumps any readable file the caller names, needs no repo,
+            # and `_box_exec` returns stdout whatever the rc — so it is the `cat` capability wearing an
+            # allowlisted program, and removing `cat` did not close that class on its own (review
+            # cycle 2, P1: measured on the 0600 JEV key store).
+            for bad in READ_ESCAPE_TOKENS:
+                if low == bad or low.startswith(bad + "="):
+                    return False, ("refusing %r: %s reads a file the caller names back into the "
+                                   "response — an argv surface allowlisted for READING is not a "
+                                   "file-dump channel" % (token, bad))
             # ⛔ AND AN EXEC-ESCAPE IS NEITHER A METACHARACTER NOR A WRITE (see EXEC_ESCAPE_TOKENS).
             for bad in EXEC_ESCAPE_TOKENS:
                 if low == bad or low.startswith(bad + "="):
@@ -2331,7 +2381,7 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
                                "identity every lane record and lane_id is minted from" % token)
     if prog == "git" and (not rest or rest[0] not in GIT_OK_VERBS):
         return False, "git verb %r is not read-only" % (rest[0] if rest else "")
-    if prog in ("cat", "wc", "sha256sum", "pgrep") and not rest:
+    if prog in ("wc", "sha256sum", "pgrep") and not rest:
         return False, "%r needs an argument" % prog
     return True, ""
 
