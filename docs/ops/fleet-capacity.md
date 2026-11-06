@@ -748,18 +748,41 @@ It is an **aggregator, not a second probe**: it runs `ci_runner_pool.sh status` 
 fleet's exec transport (`cmux vm exec`) and parses the machine-readable block that tool already
 prints, so the four facts (#2373 clause 2) come from the box itself. Output is one line per cell
 (`cell label=… read=ok host=… ncpu=… ceiling=… slots=… mem_available_mb=… floor_mb=… live=… dead=…`),
-one line per runner (`runner cell=… name=… github_name=… listener=… local=live|DEAD|ORPHANED github=online|offline|ABSENT … verdict=…`), then `registry-unclaimed` / `name-collision` / `summary`.
+one line per runner (`runner cell=… name=… github_name=… listener=… local=live|DEAD|ORPHANED|QUARANTINE|LIVE-QUAR|UNPROBED github=online|offline|ABSENT|unread … verdict=…`), then `registry-unclaimed` / `name-collision` / `summary`.
 
 ⛔ **The claim key is the `github_name`** (the agentName in `.runner`), never the instance directory —
 measured on `pi-cell-5`, directory `gh-runner-x64-2` carries agentName `pi-runner-c5-x64-2`, so
 matching on the directory reports a healthy runner as BOTH unregistered and a phantom.
 
 ⛔ **Fail-closed, per cell (#2429 clause 3).** A cell whose pool cannot be read reports
-`read=cannot-measure why=…` — never `0 runners`, the class #2381 closed one layer down. The same holds
-for the registry (an unreadable registry is not an empty one) and for **attribution**: a registry name
-no cell claims is a phantom only when **every** requested cell was measured; while one is unread, it is
-`cannot-attribute`, because that registration may be serving jobs on the box nobody could read. Exit
-`0` all measured and agreed · `2` cannot measure (outranks 3) · `3` measured with a named defect.
+`read=cannot-measure why=…` — never `0 runners`, the class #2381 closed one layer down. Four distinct
+readings are refused rather than published, and the summary keeps **three separate counters** for the
+three different places an operator must go (`unmeasured=` a CELL, `registry_unread=` a REGISTRY,
+`unjoinable=` a local row that could not be joined to either):
+
+- a **complete block behind a non-zero producer rc**. `ci_runner_pool.sh status` exits **2** for "a
+  PARTIAL MEASUREMENT" and still prints `host=`, every row and `summary` — its own words are that
+  `slots=` then "counts a PARTIAL pool". A block alone is not a measurement; the complete-reading codes
+  are 0 and 3, and anything else reports the producer's own `why=` token (e.g. `why=pool-root-incomplete`).
+- an **unclassifiable line**. A row is recognised by its STATE column being one the producer prints;
+  any other non-blank line refuses the whole cell (`why=block-unparseable`) instead of certifying the
+  rows the parser happened to understand. Measured: an instance directory whose name contains a space
+  was split into a fabricated row, and the registration it really carried was reported as a **phantom**
+  on a fully measured fleet.
+- an **unreadable registry** — and, crucially, the JOIN to it. A local row that cannot be attributed is
+  `verdict=cannot-attribute`, never `unregistered`: one refused registry read used to print every
+  healthy runner on the box as `unregistered`, a defect fabricated from a read that never happened.
+- the GitHub side is an **allow-list**: `online` is agreement, `offline` is `github-offline`, and any
+  other value — including the **empty field** `gh … @tsv` produces for a null status — is
+  `github-unreadable`. A whitespace split collapsed that empty field to `github=false … verdict=ok`.
+
+The same fail-closed rule governs **attribution**: a registry name no cell claims is a phantom only when
+**every** requested cell was measured **and** every registry was read; while either is short it is
+`cannot-attribute` (the reason names which side), because that registration may be serving jobs in the
+part nobody could read. A `defect` token is carried **verbatim** (`verdict=defect-tmpdir-mode:755`), so
+the remedy printed is the one the defect needs (`chmod 700`, not `restart`). Exit `0` all measured and
+agreed · `2` cannot measure (outranks 3; any of the three counters non-zero) · `3` measured with a named
+defect.
 
 ⚠️ **The transport is the current blocker, and it is not this tool's:** measured 2026-11-06 from
 `pi-cell-5`, `cmux vm exec <peer> -- hostname` fails for every peer (`no known daemon matches this
@@ -771,8 +794,8 @@ clause 3 behaving correctly from day one. The transport is a seam (`RUNNER_FLEET
 one-line #2345 fix lands there without touching the aggregation, attribution or exit contract. The
 tool is NOT allowed to route around it with a hand-rolled `--carrier` socket (AGENTS "Fix Broken
 Infrastructure"); its suite proves the aggregation and the reconciliation hermetically
-(`scripts/ci_runner_fleet.test.sh`), with three mutants keeping the measured gate, the attribution
-guard and the claim key honest.
+(`scripts/ci_runner_fleet.test.sh`, 77 assertions), with four mutants keeping the measured gate, the
+producer-rc gate, the attribution guard and the claim key honest.
 
 ⚠️ Two smaller residuals, stated: the tool reads every cell **through** the transport, including the
 box it runs on (use `ci_runner_pool.sh status` for that one); and `RUNNER_FLEET_ROOTS` exists because a

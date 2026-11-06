@@ -187,11 +187,35 @@ echo "cannot-measure why=pool-tool-absent searched=/tmp/cell-ai:\$HOME/agent-inf
 exit 2
 SH
 
-probe_for_root() {  # <root|''> -> the snippet, with the root exported (or nothing)
+# ⛔ THE ROOT IS INLINED INTO A REMOTE SHELL WORD, SO EVERY SOURCE IS VALIDATED, not just `--root`.
+# The check that lived on the argument alone was false for the two ENV seams and for a derived root:
+# `RUNNER_FLEET_ROOT="/opt/it's"` composed `RUNNER_ROOT='/opt/it's'; export RUNNER_ROOT`, which `sh -n`
+# refuses as an unterminated string, and a value carrying `'; …; :'` composes a VALID remote command —
+# i.e. an unvalidated seam turned a typo into arbitrary execution on a peer. This predicate is the one
+# place that decides, and `probe_for_root` applies it so no caller can skip it.
+valid_root() { case "${1:-}" in ''|*[!A-Za-z0-9._/-]*) return 1 ;; esac; return 0; }
+
+probe_for_root() {  # <root|''> -> the snippet (rc 1 when the root cannot be a shell word)
   local pre="" snip="$PROBE_TMPL"
-  [ -n "$1" ] && pre="RUNNER_ROOT='$1'; export RUNNER_ROOT"
+  if [ -n "$1" ]; then
+    valid_root "$1" || return 1
+    pre="RUNNER_ROOT='$1'; export RUNNER_ROOT"
+  fi
   printf '%s' "${snip//@ROOT@/$pre}"
 }
+
+# ⛔ EVERY ROOT SEAM IS VALIDATED BEFORE ANY WORK (review P2-5): all three reach `probe_for_root`,
+# which inlines them into the remote shell word, so a value outside the charset is a usage error here
+# rather than a broken probe (or a composed command) on a peer.
+if [ -n "$FLEET_ROOT" ] && ! valid_root "$FLEET_ROOT"; then
+  err "RUNNER_FLEET_ROOT='$FLEET_ROOT' is not a plain path (allowed: A-Za-z0-9._/-) — it is inlined into the remote probe, so it must not be able to carry a quote, a space or a \$"; exit 1
+fi
+for pair in $FLEET_ROOTS; do
+  case "$pair" in *=*) : ;; *) err "RUNNER_FLEET_ROOTS entry '$pair' is not <label>=<path>"; exit 1 ;; esac
+  if ! valid_root "${pair#*=}"; then
+    err "RUNNER_FLEET_ROOTS entry '$pair' carries a path that is not plain (allowed: A-Za-z0-9._/-) — it is inlined into the remote probe"; exit 1
+  fi
+done
 
 # ── reading one cell ─────────────────────────────────────────────────────────────────────────────
 # exec_box <label> <snippet> -> combined stdout+stderr of the remote probe; rc is the REMOTE rc
@@ -227,6 +251,17 @@ function tok(name,   i, kv) {
   for (i = 1; i <= NF; i++) { split($i, kv, "="); if (kv[1] == name) return kv[2] }
   return ""
 }
+# ⛔ THE STATE COLUMN IS AN ALLOW-LIST, AND ANYTHING ELSE IS A REFUSAL — not a row (review P2-6).
+# A row is recognised by its THIRD field being a state the producer can print; a line that is neither
+# a known prefix nor a known row makes the whole block UNPARSEABLE, because the alternative was
+# measured: an instance directory whose name contains a space (`my runner  111  live  pi-runner-1`)
+# was split into NAME=my, LISTENER=runner, STATE=111, printed as a fabricated row, and the REAL
+# registration it carried was then reported as a PHANTOM on a fully measured fleet
+# (`registry-unclaimed … reason=no-measured-cell-claims-it`) — the exact harm the attribution rule
+# of clause 2 exists to prevent. Refusing the cell cannot invent a defect.
+function isstate(s) {
+  return (s == "live" || s == "DEAD" || s == "ORPHANED" || s == "QUARANTINE" || s == "LIVE-QUAR" || s == "UNPROBED")
+}
 /^host=/ {
   H = tok("host"); NCPU = tok("ncpu"); CEIL = tok("ceiling"); SLOTS = tok("slots")
   MEM = tok("mem_available"); FLOOR = tok("floor"); seen_host = 1; next
@@ -235,14 +270,27 @@ function tok(name,   i, kv) {
   LIVE = tok("live"); DEAD = tok("dead"); ORPH = tok("orphaned"); QN = tok("quarantine")
   REGS = tok("registrations"); TDEF = tok("tmpdir_defects"); seen_sum = 1; next
 }
-/^defect / { d = tok("name"); if (d != "") defect[d] = 1; next }
+/^defect / {
+  d = tok("name")
+  # ⛔ THE DEFECT TOKEN TRAVELS (review P3-8): every `defect` line used to render as `tmpdir-missing`,
+  # so `defect tmpdir-mode=755` pointed an operator at a MISSING root (remedy: restart) when the defect
+  # was a wrong MODE (remedy: chmod 700).
+  if (d != "") { defect[d] = 1; dtype[d] = $2 }
+  next
+}
 /^cannot-measure / { CM = $0; next }
-/^NAME[ \t]/ { next }
-/^[A-Za-z0-9._-]+[ \t]+/ {
-  # ⛔ NOT `RS`: that name is the awk RECORD SEPARATOR builtin, and indexing it is a syntax error
-  # under mawk (the awk every cell ships, #2637). The state column is `ST[n]`.
-  n++; RN[n] = $1; RL[n] = $2; ST[n] = $3
-  if ($3 == "live" || $3 == "DEAD" || $3 == "ORPHANED") RG[n] = $4; else RG[n] = ""
+/^NAME[ \t]+LISTENER/ { next }
+/^[ \t]*$/ { next }
+{
+  if (NF >= 3 && isstate($3)) {
+    # ⛔ NOT `RS`: that name is the awk RECORD SEPARATOR builtin, and indexing it is a syntax error
+    # under mawk (the awk every cell ships, #2637). The state column is `ST[n]`.
+    n++; RN[n] = $1; RL[n] = $2; ST[n] = $3
+    if ($3 == "live" || $3 == "DEAD" || $3 == "ORPHANED") RG[n] = $4; else RG[n] = ""
+    next
+  }
+  if (bad == 0) badline = $0
+  bad++
   next
 }
 END {
@@ -252,7 +300,8 @@ END {
   if (!seen_host || !seen_sum) { print "M|0"; if (CM != "") print "C|" CM; exit 0 }
   print "M|1"
   printf "K|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n", H, NCPU, CEIL, SLOTS, MEM, FLOOR, LIVE, DEAD, ORPH, QN, REGS, TDEF
-  for (i = 1; i <= n; i++) printf "R|%s|%s|%s|%s|%d\n", RN[i], RL[i], ST[i], RG[i], (RN[i] in defect)
+  for (i = 1; i <= n; i++) printf "R|%s|%s|%s|%s|%s\n", RN[i], RL[i], ST[i], RG[i], ((RN[i] in defect) ? dtype[RN[i]] : "")
+  printf "X|%d|%s\n", bad, badline
   if (CM != "") print "C|" CM
 }'
 
@@ -292,15 +341,28 @@ registry_read() {
 }
 
 # ══ RUN ═════════════════════════════════════════════════════════════════════════════════════════
+# ⛔ THREE COUNTERS, THREE DIFFERENT FAILURES — never one "unmeasured" (review P2-4). The first
+# version carried cells and registries in one counter, so a run with EVERY cell measured and one
+# registry unreadable printed `cells=1 measured=1 unmeasured=1` and explained an unclaimed
+# registration as `cannot-attribute(1-cell-unmeasured)` — naming a cell that does not exist, and
+# sending an operator to hunt for it. They are separated here because the three populations send you
+# to three different places: a CELL you could not reach, a REGISTRY you could not read, and a local
+# row you could not JOIN to either.
 unmeasured=0; measured=0; cells=0
-reg_total=0; reg_claimed=0; reg_unclaimed=0
-local_rows=0; unregistered=0; disagreements=0; not_ok=0; collision=0
+reg_unread=0; reg_total=0; reg_claimed=0; reg_unclaimed=0
+local_rows=0; unregistered=0; unjoinable=0; disagreements=0; not_ok=0; collision=0
 : >"$TMPD/reg"     # name<TAB>repo<TAB>status<TAB>busy
 : >"$TMPD/claim"   # github_name<TAB>cell<TAB>name
 
 # ── 1. the registries (independent of the cells, so a fleet with no reachable cell still gets them) ─
 for repo in $FLEET_REPOS; do
-  case "$repo" in */*) : ;; *) err "registry '$repo' is not owner/name"; continue ;; esac
+  # ⛔ A MALFORMED REPO TOKEN IS AN UNREAD REGISTRY, NOT A SKIP (review P1-3, related). It used to
+  # `continue` with no counter, so a typo'd seam left the registry half EMPTY while `summary …
+  # registry=0` read as "this repo has no runners" — the absence-reads-as-zero shape, one seam in.
+  case "$repo" in */*) : ;; *)
+    printf 'registry repo=%s read=cannot-measure why=repo-token-malformed detail=%s\n' "$repo" "not owner/name"
+    reg_unread=$((reg_unread + 1)); continue ;;
+  esac
   short="${repo#*/}"
   : >"$TMPD/regerr"
   if reg_out="$(registry_read "$repo" 2>"$TMPD/regerr")"; then
@@ -308,11 +370,18 @@ for repo in $FLEET_REPOS; do
     # `ci-queue.sh` names that shape). It is NOT `cannot-measure`, and it is NOT "the fleet is gone".
     n="$(printf '%s\n' "$reg_out" | awk 'NF' | wc -l)"; n=$((n))
     printf 'registry repo=%s read=ok runners=%s\n' "$short" "$n"
-    printf '%s\n' "$reg_out" | awk -v R="$short" 'NF { printf "%s\t%s\t%s\t%s\n", $1, R, $2, $3 }' >>"$TMPD/reg"
+    # ⛔ TAB-AWARE, BECAUSE `@tsv` YIELDS EMPTY FIELDS AND WHITESPACE SPLITTING COLLAPSES THEM
+    # (review P1-2). A null `.status` renders as `name<TAB><TAB>false`; the old default-FS split made
+    # that `name false` — status="false", busy="" — and the polarity test `= offline` fell through to
+    # `verdict=ok`, certifying a runner whose registry row could not be read. Measured:
+    # `runner … github=false busy=? registry=a verdict=ok`.
+    printf '%s\n' "$reg_out" | awk -F'\t' -v R="$short" '
+      /^[ \t]*$/ { next }
+      { printf "%s\t%s\t%s\t%s\n", $1, R, (NF >= 2 ? $2 : ""), (NF >= 3 ? $3 : "") }' >>"$TMPD/reg"
   else
     why="$(awk 'NF {print; exit}' "$TMPD/regerr")"
     printf 'registry repo=%s read=cannot-measure why=registry-unreadable detail=%s\n' "$short" "${why:-no-output}"
-    unmeasured=$((unmeasured + 1))
+    reg_unread=$((reg_unread + 1))
   fi
 done
 reg_total="$(awk 'NF' "$TMPD/reg" | wc -l)"; reg_total=$((reg_total))
@@ -325,7 +394,8 @@ else
   roster="$(cap_fleet_inventory)"; rrc=$?
   if [ "$rrc" -ne 0 ]; then
     printf 'cell roster=cannot-measure why=roster-unreadable detail=%s\n' "${roster#UNKNOWN }"
-    printf 'summary cells=UNKNOWN measured=0 unmeasured=UNKNOWN registry=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' "$reg_total"
+    printf 'summary cells=UNKNOWN measured=0 unmeasured=UNKNOWN registry=%s registry_unread=%s claimed=0 unclaimed=UNKNOWN unregistered=UNKNOWN unjoinable=UNKNOWN disagreements=UNKNOWN collisions=UNKNOWN not_ok=UNKNOWN\n' \
+      "$reg_total" "$reg_unread"
     exit 2
   fi
   printf '%s\n' "$roster" | awk 'NF { print $1 }' >"$TMPD/roster"
@@ -353,18 +423,28 @@ while read -r box <&3; do
   for pair in $FLEET_ROOTS; do
     case "$pair" in "$box="*) root="${pair#*=}" ;; esac
   done
-  out="$(exec_box "$box" "$(probe_for_root "$root")")"; rc=$?
+  if ! snip="$(probe_for_root "$root")"; then
+    printf 'cell label=%s read=cannot-measure why=root-unusable detail=RUNNER_ROOT=%s\n' "$box" "$root"
+    unmeasured=$((unmeasured + 1)); continue
+  fi
+  out="$(exec_box "$box" "$snip")"; rc=$?
   # ⛔ ONE RETRY, DRIVEN BY THE REFUSAL ITSELF, AND ONLY WHEN NO ROOT WAS PINNED. Moving a root a
   # human chose would be the tool overriding its operator; deriving it from the directories the pool
   # tool NAMED is the pool tool's own documented remedy, executed once.
   if [ "$ROOT_DERIVE" = 1 ] && [ -z "$root" ] && [ "$rc" -eq 2 ]; then
     derived="$(derive_root "$out")"
-    if [ -n "$derived" ]; then
-      out="$(exec_box "$box" "$(probe_for_root "$derived")")"; rc=$?
-      note="root_derived=$derived"
+    if [ -n "$derived" ] && valid_root "$derived"; then
+      snip="$(probe_for_root "$derived")" || snip=""
+      if [ -n "$snip" ]; then
+        out="$(exec_box "$box" "$snip")"; rc=$?
+        note="root_derived=$derived"
+      fi
     fi
   fi
   printf '%s\n' "$out" | awk "$BOX_AWK" >"$TMPD/parsed"
+  # ── the refusal arm. FOUR ways to be unmeasured, and each keeps its own reason ────────────────
+  cdetail="$(awk -F'|' '$1=="C" {print substr($0, 3); exit}' "$TMPD/parsed")"
+  cwhy="$(printf '%s' "$cdetail" | awk '{ for (i = 1; i <= NF; i++) if (index($i, "why=") == 1) { print substr($i, 5); exit } }')"
   if ! grep -qxF 'M|1' "$TMPD/parsed"; then
     # ⛔ THE DETAIL IS THE TRANSPORT'S OR THE PROBE'S OWN FIRST LINE — never a summary this tool
     # invented, because the operator's next step depends on which failure it was.
@@ -376,8 +456,27 @@ while read -r box <&3; do
       *)   tok="transport-unreachable" ;;
     esac
     printf 'cell label=%s read=cannot-measure why=%s rc=%s detail=%s\n' "$box" "$tok" "$rc" "${why:-no-output}"
-    unmeasured=$((unmeasured + 1))
-    continue
+    unmeasured=$((unmeasured + 1)); continue
+  fi
+  # ⛔ A COMPLETE BLOCK WITH A NON-ZERO PRODUCER rc IS NOT A MEASUREMENT (review P1-1). `status`
+  # exits 2 for "a PARTIAL MEASUREMENT" — `pool-root-incomplete` and an UNPROBED quarantine BOTH print
+  # a full block (host, rows, summary) AND exit 2, saying in its own words that `slots=` "counts a
+  # PARTIAL pool". Keying "measured" on the block alone certified exactly that: measured with
+  # `rc=2`, `unmeasured=0`, not_ok=0 → **exit 0**, publishing a partial count as the box's pool.
+  # The producer's complete-reading codes are 0 and 3 (3 = measured, and the report names a defect).
+  case "$rc" in 0|3) : ;; *)
+    printf 'cell label=%s read=cannot-measure why=%s rc=%s detail=%s\n' \
+      "$box" "${cwhy:-pool-partial}" "$rc" "${cdetail:-block-complete-but-rc=$rc}"
+    unmeasured=$((unmeasured + 1)); continue ;;
+  esac
+  # ⛔ A LINE THE PARSER COULD NOT CLASSIFY MAKES THE BLOCK UNPARSEABLE (review P2-6). Certifying the
+  # rows it DID understand is how a fabricated row became a phantom registration on a measured fleet.
+  xcount="$(awk -F'|' '$1=="X" {print $2; exit}' "$TMPD/parsed")"
+  if [ "${xcount:-0}" != "0" ]; then
+    xline="$(awk -F'|' '$1=="X" {print substr($0, index($0, $3)); exit}' "$TMPD/parsed")"
+    printf 'cell label=%s read=cannot-measure why=block-unparseable rc=%s unclassified=%s detail=%s\n' \
+      "$box" "$rc" "$xcount" "$xline"
+    unmeasured=$((unmeasured + 1)); continue
   fi
   measured=$((measured + 1))
   IFS='|' read -r _ kh kncpu kceil kslots kmem kfloor klive kdead korph kq kregs ktdef < <(awk -F'|' '$1=="K"' "$TMPD/parsed")
@@ -386,10 +485,10 @@ while read -r box <&3; do
     "${klive:--}" "${kdead:--}" "${korph:--}" "${kq:--}" "${kregs:--}" "${ktdef:--}" "$rc"
   [ -n "$note" ] && printf 'cell-note label=%s %s\n' "$box" "$note"
   # ── the rows, joined to the registry BY agentName ──────────────────────────────────────────────
-  while IFS='|' read -r kind name listener state ghname tmpdef; do
+  while IFS='|' read -r kind name listener state ghname dtok; do
     [ "$kind" = "R" ] || continue
     local_rows=$((local_rows + 1))
-    rstatus=""; rbusy=""; rrepo=""
+    rstatus=""; rbusy=""; rrepo=""; hit=""
     if [ -n "$ghname" ]; then
       hit="$(awk -F'\t' -v n="$ghname" '$1==n {print; exit}' "$TMPD/reg")"
       if [ -n "$hit" ]; then
@@ -398,46 +497,73 @@ while read -r box <&3; do
         rrepo="$(printf '%s' "$hit" | cut -f2)"
       fi
     fi
-    # ⛔ THE VERDICT ORDER IS THE SAFETY ORDER: a registration GitHub does not have cannot serve work
-    # whatever its listener says; an ORPHANED row is not fixed by `restart` (rc 6) and needs `reclaim`;
-    # a DEAD listener is capacity one start away; a live listener GitHub reports offline is up but not
-    # connected, which is capacity the queue cannot use either.
+    # ⛔ THE VERDICT ORDER IS THE SAFETY ORDER — the LOCAL facts are measured first, then the join,
+    # then the GitHub side, which is the only half that can be a value this report cannot classify.
+    #   * a state outside `live|DEAD|ORPHANED` is one the producer prints for an install that is not a
+    #     runner (QUARANTINE / LIVE-QUAR / UNPROBED): a defect, and never a registry claim;
+    #   * ORPHANED is not fixed by `restart` (it exits 6) and needs `reclaim`;
+    #   * a DEAD listener is capacity one start away;
+    #   * a `defect` token is carried VERBATIM, so `tmpdir-mode=755` no longer claims a missing root;
+    #   * an EMPTY agentName, or a missing hit while a registry was UNREAD, is `cannot-attribute` —
+    #     an abstention, never `unregistered` (review P1-3: one refused registry read printed every
+    #     healthy runner on the box as `unregistered`, a defect fabricated from a read that never
+    #     happened);
+    #   * `unregistered` is claimed ONLY when the registries were all read.
     if [ "$state" != "live" ] && [ "$state" != "DEAD" ] && [ "$state" != "ORPHANED" ]; then
       verdict="quarantine"; not_ok=$((not_ok + 1))
-    elif [ -z "$ghname" ] || [ -z "$rstatus" ]; then
-      verdict="unregistered"; unregistered=$((unregistered + 1)); not_ok=$((not_ok + 1))
     elif [ "$state" = "ORPHANED" ]; then
       verdict="orphaned"; not_ok=$((not_ok + 1))
     elif [ "$state" = "DEAD" ]; then
       verdict="dead-listener"; not_ok=$((not_ok + 1)); disagreements=$((disagreements + 1))
-    elif [ "$tmpdef" = "1" ]; then
-      verdict="tmpdir-missing"; not_ok=$((not_ok + 1))
+    elif [ -n "$dtok" ]; then
+      verdict="defect-$(printf '%s' "$dtok" | tr '=' ':')"; not_ok=$((not_ok + 1))
+    elif [ -z "$ghname" ]; then
+      verdict="cannot-attribute"; unjoinable=$((unjoinable + 1))
+    elif [ -z "$hit" ] && [ "$reg_unread" -gt 0 ]; then
+      verdict="cannot-attribute"; unjoinable=$((unjoinable + 1))
+    elif [ -z "$hit" ]; then
+      verdict="unregistered"; unregistered=$((unregistered + 1)); not_ok=$((not_ok + 1))
     elif [ "$rstatus" = "offline" ]; then
       verdict="github-offline"; not_ok=$((not_ok + 1)); disagreements=$((disagreements + 1))
+    elif [ "${rstatus}" != "online" ]; then
+      verdict="github-unreadable"; not_ok=$((not_ok + 1))
     else
       verdict="ok"
     fi
+    # ⛔ ABSENT AND UNREADABLE ARE DIFFERENT ANSWERS: a row the registry DID carry but whose status the
+    # report cannot classify prints `github=unread`, never `ABSENT` (which is a claim about the
+    # registry this read did not make).
+    if [ -z "$rstatus" ]; then
+      if [ -n "$hit" ]; then gshow="unread"; else gshow="ABSENT"; fi
+    else gshow="$rstatus"; fi
     printf 'runner cell=%s name=%s github_name=%s listener=%s local=%s github=%s busy=%s registry=%s verdict=%s\n' \
-      "$box" "$name" "${ghname:--}" "${listener:--}" "$state" "${rstatus:-ABSENT}" "${rbusy:-?}" "${rrepo:--}" "$verdict"
+      "$box" "$name" "${ghname:--}" "${listener:--}" "$state" "$gshow" "${rbusy:-?}" "${rrepo:--}" "$verdict"
     [ -n "$ghname" ] && printf '%s\t%s\t%s\n' "$ghname" "$box" "$name" >>"$TMPD/claim"
   done <"$TMPD/parsed"
 done 3<"$TMPD/roster"
 
 # ── 4. the registry names no measured cell claims ────────────────────────────────────────────────
 # ⛔ THE ATTRIBUTION RULE IS WHERE CLAUSE 3 ACTUALLY BITES. A name is a PHANTOM only when every
-# requested cell was measured; while ANY cell is unmeasured the name may live there, and calling it a
-# phantom would send an operator to `reclaim` a registration that is serving jobs.
+# requested cell was measured AND every registry was read; while either is short the name may live in
+# the part that was not read, and calling it a phantom would send an operator to `reclaim` a
+# registration that is serving jobs.
 while IFS=$'\t' read -r rname rrepo2 rstatus2 rbusy2; do
   [ -n "$rname" ] || continue
   if awk -F'\t' -v n="$rname" '$1==n {found=1} END {exit !found}' "$TMPD/claim"; then
     reg_claimed=$((reg_claimed + 1)); continue
   fi
   reg_unclaimed=$((reg_unclaimed + 1))
-  if [ "$unmeasured" -eq 0 ]; then
+  if [ "$unmeasured" -eq 0 ] && [ "$reg_unread" -eq 0 ]; then
     printf 'registry-unclaimed name=%s registry=%s status=%s reason=no-measured-cell-claims-it\n' "$rname" "$rrepo2" "$rstatus2"
     not_ok=$((not_ok + 1))
   else
-    printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(%s-cell-unmeasured)\n' "$rname" "$rrepo2" "$rstatus2" "$unmeasured"
+    why=""
+    [ "$unmeasured" -gt 0 ] && why="${unmeasured}-cell-unmeasured"
+    if [ "$reg_unread" -gt 0 ]; then
+      [ -n "$why" ] && why="$why,"
+      why="${why}${reg_unread}-registry-unread"
+    fi
+    printf 'registry-unclaimed name=%s registry=%s status=%s reason=cannot-attribute(%s)\n' "$rname" "$rrepo2" "$rstatus2" "$why"
   fi
 done <"$TMPD/reg"
 
@@ -451,10 +577,11 @@ for dup in $(awk -F'\t' '{c[$1]++; cell[$1]=cell[$1] "," $2} END {for (n in c) i
 done
 
 # ── 6. the verdict ───────────────────────────────────────────────────────────────────────────────
-printf 'summary cells=%s measured=%s unmeasured=%s registry=%s claimed=%s unclaimed=%s unregistered=%s disagreements=%s collisions=%s not_ok=%s\n' \
-  "$cells" "$measured" "$unmeasured" "$reg_total" "$reg_claimed" "$reg_unclaimed" "$unregistered" "$disagreements" "$collision" "$not_ok"
-# ⛔ 2 OUTRANKS 3: a report that could not read a cell (or a registry) cannot certify anything about
-# what it holds, so "a defect was found" is the weaker claim and must not mask the unmeasured one.
-if [ "$unmeasured" -gt 0 ]; then exit 2; fi
+printf 'summary cells=%s measured=%s unmeasured=%s registry=%s registry_unread=%s claimed=%s unclaimed=%s unregistered=%s unjoinable=%s disagreements=%s collisions=%s not_ok=%s\n' \
+  "$cells" "$measured" "$unmeasured" "$reg_total" "$reg_unread" "$reg_claimed" "$reg_unclaimed" "$unregistered" "$unjoinable" "$disagreements" "$collision" "$not_ok"
+# ⛔ 2 OUTRANKS 3: a report that could not read a cell, a registry, or the join between them cannot
+# certify anything about what it holds, so "a defect was found" is the weaker claim and must not mask
+# the unmeasured one.
+if [ "$unmeasured" -gt 0 ] || [ "$reg_unread" -gt 0 ] || [ "$unjoinable" -gt 0 ]; then exit 2; fi
 [ "$not_ok" -eq 0 ] || exit 3
 exit 0
