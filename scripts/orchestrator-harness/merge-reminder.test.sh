@@ -3107,16 +3107,31 @@ ck "§27b box-status REFUSES the same shape and names the pointer as the reason"
 # ⛔ `GIT_COMMON_DIR` IS OBSERVABLE ONLY ON AN **ACCEPTED** CANDIDATE (round-9 review, measured): on a repo the
 # marker test already refuses it changes nothing, so a pin there is vacuous. The read it corrupts is the
 # RELATION — git takes OBJECTS from the inherited common dir, so a pin that is not an object in THIS repo is
-# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history. Asserted
-# against `$HERE_TOP`, which IS the harness repo.
+# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history.
 # The pin is a commit that EXISTS in the FOREIGN repo and NOT in this one: an inherited common dir makes
 # `cat-file -e` succeed for it, which is what turns `[unknown]` into `[diverged]`. A synthetic zero sha would
 # be absent from both repos and the case would pass for the wrong reason.
+# ⛔ THE CANDIDATE MUST BE A FIXTURE HERE TOO (#3512 review, P2). This arm asserted against
+# `$HERE_TOP` — the checkout the suite happens to run in — and on a CI-shaped checkout that made it
+# VACUOUS rather than flaky: `box-status.sh` computes `relation` only when `origin/main` RESOLVES, so
+# with no such ref the value keeps its initial "unknown" and the assertion is satisfied by
+# construction — a regression that re-admits `GIT_COMMON_DIR` hijacking shipped GREEN on every
+# PR/batch run, and only the main lane (which materialises `origin/main`, #3131) could catch it.
+# `$REPO_SRC` is this suite's own harness fixture: it tracks the marker, so the candidate is ACCEPTED
+# (which this arm requires — on a REFUSED candidate the pin changes nothing and the arm is vacuous by
+# design), and it has its own `origin/main`, so the relation is actually computed.
+# ⛔ AND THE ASSERTION PINS THE ACCEPTANCE ITSELF (#3512 review, cycle 2, P2). `harness: … [unknown]`
+# alone cannot tell "accepted candidate, relation computed, no hijack" from "candidate REFUSED, relation
+# never computed" — the refusal path still prints the pin, so both look identical and the arm would pass
+# on a broken reader. The `ref: origin/main=` conjunct (the shape the subdirectory arm above already
+# uses) is what makes "the relation was actually computed" an assertion rather than an assumption, and
+# it also protects the arm if this fixture ever loses its `origin/main`.
 git -C "$PLAIN" rev-parse HEAD > "$TMP/pin-foreign"
 out="$(env REPO= HARNESS_PIN="$TMP/pin-foreign" GIT_COMMON_DIR="$PLAIN/.git" HOME="$TMP/home" FIXTURE="$FX" \
-  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$HERE_TOP" 2>&1)"
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$REPO_SRC" 2>&1)"
 ck "§27b box-status is not hijacked by an inherited GIT_COMMON_DIR (an absent pin stays [unknown])" \
-   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" \
+      && grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
 # measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
@@ -3359,7 +3374,14 @@ ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
 # refused — i.e. a regression to a literal-path marker shipped green).
 # `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for `HARNESS_REPO`; a reader that
 # tested the literal path would refuse it and the deploy probe would read CANNOT VERIFY forever.
-out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+# ⛔ AND THE CANDIDATE MUST BE A FIXTURE, NOT THE AMBIENT CHECKOUT (#3160). This arm used
+# `$HERE_TOP/scripts` — the checkout the suite happens to run in — and then grepped for a `ref:`
+# line, which requires `origin/main` to RESOLVE there. `actions/checkout` fetches one ref (or
+# `refs/remotes/pull/N/merge`), so on every PR/batch checkout `origin/main` does not exist, no ref
+# line is printed at all, and the arm reds for a reason that has nothing to do with
+# subdirectory-acceptance. `$REPO_SRC` is this suite's own fixture: it tracks the marker and has its
+# own `origin/main` (`git push --quiet origin main` above), so the assertion tests the RESOLVER.
+out="$(env REPO= HARNESS_REPO="$REPO_SRC/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status ACCEPTS a SUBDIRECTORY candidate of the harness repo" \
    "$(grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
