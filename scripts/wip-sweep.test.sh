@@ -758,25 +758,31 @@ O_O3="$(sweep "$T/state-envb" --no-such-flag 2>&1)"; RC_O3=$?
   && ok "O7 it did NOT touch the record — a mistyped argument is not a pass" \
   || bad "O7 an argument error rewrote the pass record"
 
-# ── P) THE EXIT TRAP HONOURS BOTH OF THE LIBRARY'S DOCUMENTED OBLIGATIONS ──────────────────────────
+# ── P) THE EXIT TRAP HONOURS BOTH OF THE LIBRARY'S DOCUMENTED OBLIGATIONS ───────────────────────
 echo; echo "── P. the EXIT trap honours both obligations of the bounded-execution contract ──"
-# ⛔ THIS IS A WIRING ASSERTION, AND IT SAYS SO. `scripts/lib/bounded.sh`'s CONTRACT names TWO EXIT-trap
-# obligations — `tb_watchdogs_reap` (TERM every live watchdog timer) and `tb_bound_cleanup` (remove the
-# per-run probe scratch dir) — and the leak the first one prevents only manifests on a host with no GNU
-# `timeout` (macOS, the platform the watchdog exists for) under SIGTERM/SIGINT, which cannot be reproduced
-# here without a process-table race. All three sibling callers honour both; this pins that this caller
-# does too, so a tidy-up cannot drop the reap line silently.
-TRAP_BODY="$(awk '/^cleanup_all\(\) \{/,/^\}/' "$SW" 2>/dev/null | sed 's/^[[:space:]]*#.*$//')"
-# ⛔ COMMENT LINES ARE STRIPPED FIRST. The function's own comment NAMES both obligations, so a grep over
-# the raw body passed with the call deleted — measured: dropping the reap line left PASS=117 FAIL=0. The
-# assertion has to read the CODE, and it matches either calling idiom (`command -v X && X` or
-# `X 2>/dev/null || true`) because both sibling callers use one of the two.
-has "$TRAP_BODY" 'tb_watchdogs_reap' \
-  && ok "P1 the EXIT trap TERMs live watchdog timers (a leaked timer SIGKILLs a recycled pid later)" \
-  || bad "P1 the EXIT trap does not reap watchdog timers — the library's first documented obligation"
-has "$TRAP_BODY" 'tb_bound_cleanup' \
-  && ok "P2 the EXIT trap also removes the probe scratch dir (the second obligation)" \
-  || bad "P2 the EXIT trap does not remove the probe scratch dir"
+# ⛔ THIS IS AN EXECUTION, NOT A GREP (review finding, and the grep version was measurably a false
+# GREEN). `scripts/lib/bounded.sh`'s CONTRACT names TWO EXIT-trap obligations — `tb_watchdogs_reap`
+# (TERM every live watchdog timer) and `tb_bound_cleanup` (remove the per-run probe scratch dir) — and
+# the leak the first one prevents only manifests on a host with no GNU `timeout` under SIGTERM/SIGINT.
+# That leak cannot be reproduced here, but the FUNCTION can be run: extract `cleanup_all` into a temp
+# file, source it in a subshell where both library calls are stubs that announce themselves, call it,
+# and require BOTH announcements. A text grep passed with the call sitting after an unconditional
+# `return 0` — the present-but-unreachable shape — and this does not.
+EXTRACT="$T/cleanup_all.sh"
+awk '/^cleanup_all\(\) \{/,/^\}/' "$SW" > "$EXTRACT" 2>/dev/null
+OUT_P="$(bash -c '
+  tb_watchdogs_reap() { echo REAPED; }
+  tb_bound_cleanup()  { echo CLEANED; }
+  LISTF=""; ERRF=""; REC_TMP=""
+  . "$1" || exit 1
+  cleanup_all
+' _ "$EXTRACT" 2>&1)"
+has "$OUT_P" 'REAPED' \
+  && ok "P1 running cleanup_all TERMs live watchdog timers (a leaked timer SIGKILLs a recycled pid later)" \
+  || bad "P1 cleanup_all never calls tb_watchdogs_reap when it runs — the library's first obligation"
+has "$OUT_P" 'CLEANED' \
+  && ok "P2 running cleanup_all also removes the probe scratch dir (the second obligation)" \
+  || bad "P2 cleanup_all never calls tb_bound_cleanup when it runs"
 
 # ── Q) A BUDGET SPENT BEFORE THE FIRST EXAMINATION IS `incomplete`, NOT A BROKEN ENUMERATE ──────────
 echo; echo "── Q. a budget spent before the first examination is incomplete, not a failed pass ──"
@@ -807,6 +813,68 @@ grep -qx 'seen=0' "$T/state-budq/wip-sweep.status" 2>/dev/null \
 [ "$(grep -c 'deferred-pass-budget' "$T/state-budq/wip-sweep.tsv" 2>/dev/null)" = "3" ] \
   && ok "Q5 the index carries three unreached rows — it still reconciles against git worktree list" \
   || bad "Q5 the index carries $(grep -c 'deferred-pass-budget' "$T/state-budq/wip-sweep.tsv" 2>/dev/null) unreached row(s) (want 3)"
+
+# ⛔ AND A WORKTREE WHOSE OWN CLASSIFY CALL WAS CUT OFF IS NOT `seen` EITHER (#3588 review, cycle 4).
+# `seen` was incremented at the top of `examine`, and the classify-deferral branch returns before
+# clean/skipped/dirty/unmeasured — so `seen=1` appeared with every term 0, breaking the documented
+# identity. A `git` shim that sleeps only on `status` (the call the VERDICT makes) puts the stop inside
+# the first examination instead of before it, which is the variant that produced the bad count.
+mkdir -p "$T/statusbin"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" status --porcelain "*) sleep 2 ;;\nesac\nexec %s "$@"\n' "$REAL_GIT" > "$T/statusbin/git"
+chmod +x "$T/statusbin/git"
+O_Q6="$(PATH="$T/statusbin:$PATH" WIP_SWEEP_BUDGET=1 WIP_SWEEP_STATE_DIR="$T/state-budq2" \
+  bash "$SW" --apply --repo "$T/budq/wt" 2>&1)"; RC_Q6=$?
+[ "$RC_Q6" -eq 1 ] && ok "Q6 a stop inside the first verdict call is still INCOMPLETE (exit 1)" \
+  || bad "Q6 answered $RC_Q6 (want 1): $O_Q6"
+grep -qx 'seen=0' "$T/state-budq2/wip-sweep.status" 2>/dev/null \
+  && ok "Q7 seen=0 — a worktree whose classification never completed was NOT examined" \
+  || bad "Q7 seen=$(sed -n 's/^seen=//p' "$T/state-budq2/wip-sweep.status" 2>/dev/null) with clean/skipped/dirty/unmeasured all 0 — the identity is false"
+[ "$(sed -n 's/^deferred=//p' "$T/state-budq2/wip-sweep.status" 2>/dev/null)" -ge 1 ] 2>/dev/null \
+  && ok "Q8 the deferred counter still names the work that never got its turn" \
+  || bad "Q8 deferred is not counted: $(sed -n 's/^deferred=//p' "$T/state-budq2/wip-sweep.status" 2>/dev/null)"
+
+# ── R) THE READER ANSWERS ON THE BOXES WHOSE SWEEP REFUSES ───────────────────────────────────────
+echo; echo "── R. --print-status answers on the boxes whose sweep refuses ──"
+# ⛔ THE READER USED TO RUN AFTER THE BOUNDED-LIB RESOLUTION AND THE BOUND VALIDATIONS, so on exactly the
+# box an instrument is asking about (the one whose sweep refuses every pass) it exited 3 with NO
+# `status=`/`rc=` line at all — while the doc promises a derived `rc=` on every path.
+# ⛔ THE RECORD UNDER IT MUST BE A FRESH `ok`, or the arm is satisfied by an unrelated state: measured on
+# a record left `running` by an earlier arm, R1 stayed GREEN with the library check deleted.
+mk_fixture rlib fix/3485-rlib || { echo "❌ fixture failed (rlib)"; exit 1; }
+sweep "$T/state-rlib" --apply --repo "$T/rlib/wt" >/dev/null 2>&1
+grep -qx 'status=ok' "$T/state-rlib/wip-sweep.status" 2>/dev/null \
+  && ok "R0 a good pass leaves status=ok (the baseline this arm needs)" \
+  || bad "R0 the baseline pass did not record ok"
+O_R1="$(WIP_SWEEP_BOUNDED_LIB=/nonexistent/bounded.sh WIP_SWEEP_STATE_DIR="$T/state-rlib" \
+  bash "$SW" --print-status 2>&1)"; RC_R1=$?
+[ "$RC_R1" -eq 3 ] && has "$O_R1" 'rc=3' && ! has "$O_R1" 'status=ok' \
+  && ok "R1 a box with no bounded library CANNOT SWEEP, so the reader answers failed/3 rather than the last ok" \
+  || bad "R1 the reader answered over a box that cannot sweep (rc=$RC_R1): $O_R1"
+O_R2="$(WIP_SWEEP_STALE_SECONDS=abc WIP_SWEEP_STATE_DIR="$T/state-envb" \
+  bash "$SW" --print-status 2>&1)"; RC_R2=$?
+[ "$RC_R2" -eq 2 ] && has "$O_R2" 'WIP_SWEEP_STALE_SECONDS' \
+  && ok "R2 the reader still validates the seams IT depends on (a typo'd staleness window is a config error, exit 2, named)" \
+  || bad "R2 an unparseable staleness window answered $RC_R2: $O_R2"
+
+# ── S) A REPO THAT LISTED NOTHING IS ESCALATED ON ITS OWN ────────────────────────────────────────────
+echo; echo "── S. a repo that listed NOTHING is escalated even when a sibling repo deferred rows ──"
+# ⛔ THE ZERO-EXAMINATION ESCALATION IS GLOBAL, and flushed rows can come from another repo — so a repo
+# answering exit 0 with an EMPTY list could be excused as `incomplete` by a sibling's deferrals. Not a
+# false PASS (a deferral never yields `status=ok`), but a mis-attributed diagnosis: "no time" for what is
+# "the enumerate is broken". `sweep_repo` now counts its own listing.
+mkdir -p "$T/emptybin"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" worktree list --porcelain "*) exit 0 ;;\nesac\nexec %s "$@"\n' "$REAL_GIT" > "$T/emptybin/git"
+chmod +x "$T/emptybin/git"
+O_S="$(PATH="$T/emptybin:$PATH" WIP_SWEEP_STATE_DIR="$T/state-empty" \
+  bash "$SW" --apply --repo "$T/envb/wt" 2>&1)"; RC_S=$?
+[ "$RC_S" -eq 3 ] && ok "S1 a repo whose listing names zero worktrees FAILS the pass (exit 3)" \
+  || bad "S1 an empty listing answered $RC_S (want 3): $O_S"
+grep -qx 'status=failed' "$T/state-empty/wip-sweep.status" 2>/dev/null \
+  && ok "S2 the record says failed, not incomplete — nothing was swept and nobody ran out of clock" \
+  || bad "S2 the record says $(sed -n 's/^status=//p' "$T/state-empty/wip-sweep.status" 2>/dev/null)"
+grep -q 'worktree-list-empty' "$T/state-empty/wip-sweep.tsv" 2>/dev/null \
+  && ok "S3 the index names WHY (worktree-list-empty), so the next actor is not left guessing" \
+  || bad "S3 the index does not record the empty listing"
 
 echo
 echo "── summary ──"

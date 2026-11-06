@@ -242,47 +242,51 @@ ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create 
 LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
 fi
 
-# ── the bounded-execution helper — REFUSED when missing, never a silent different file ───────────
-# Every subprocess below is bounded: `git status` on a 179 GB worktree and a `git push` to a remote
-# that has stopped answering are both unbounded by nature, and this pass is what a cell quiesce calls
-# BEFORE the box is destroyed — a hang here is a box that never finishes dying.
-BOUNDED_LIB="${WIP_SWEEP_BOUNDED_LIB:-}"
-if [ -n "$BOUNDED_LIB" ]; then
-  [ -f "$BOUNDED_LIB" ] || { err "WIP_SWEEP_BOUNDED_LIB=$BOUNDED_LIB does not exist — REFUSING (a pin that is wrong must be named, not ignored)"; exit 3; }
-elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/lib/bounded.sh" ]; then
-  BOUNDED_LIB="$SELF_DIR/lib/bounded.sh"
-elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh" ]; then
-  BOUNDED_LIB="$HOME/.pi/agent/scripts/lib/bounded.sh"
-else
-  err "no scripts/lib/bounded.sh (looked at \$WIP_SWEEP_BOUNDED_LIB, ${SELF_DIR:-<no script dir>}/lib, \$HOME/.pi/agent/scripts/lib) — REFUSING: an unbounded sweep is worse than none. Farm it: bash pi-bootstrap/setup.sh"
-  exit 3
-fi
-# shellcheck source=/dev/null
-. "$BOUNDED_LIB" || { err "cannot source $BOUNDED_LIB"; exit 3; }
-# An INHERITED pin is the caller's; an absent one is "no pin", not an unbound-variable abort under -u.
-TB_TIMEOUT_BIN="${TB_TIMEOUT_BIN:-}"
-if ! tb_resolve_timeout; then
-  err "no usable watchdog for bounded execution (TB_TIMEOUT_BIN='${TB_TIMEOUT_BIN:-}') — REFUSING"
-  exit 3
-fi
-TB_TIMEOUT_KIND="${TB_TIMEOUT_KIND:-unknown}"
-
-BUDGET="${WIP_SWEEP_BUDGET:-900}"
+# ⛔ THE READER NEEDS THE RECORD AND THREE ENVIRONMENT SEAMS, AND NOTHING ELSE — so they are resolved
+# here, ABOVE the bounded-execution library resolution and the pass validations, and the reader branch
+# runs before them (review finding). `--print-status` must answer on a box whose sweep refuses every
+# pass: those boxes are exactly the ones a fleet instrument is looking at, and the reader used to exit 3
+# out of the library resolution with NO `status=`/`rc=` line at all.
+# ⛔ BUT THE SEAMS IT **DOES** DEPEND ON ARE STILL VALIDATED, with the same rules as pass mode — a zero
+# staleness window would make a 1970 record read `ok`, and a zero watchdog means this box cannot sweep at
+# all, so a reader that answered `ok` there would be the stale-green class again. Those two refusals are
+# config errors (exit 2, exactly as in pass mode); everything else the reader can answer from the record.
+STALE_SECONDS="${WIP_SWEEP_STALE_SECONDS:-86400}"
 STATUS_TIMEOUT="${WIP_SWEEP_STATUS_TIMEOUT:-60}"
 RESCUE_TIMEOUT="${WIP_SWEEP_RESCUE_TIMEOUT:-300}"
-STALE_SECONDS="${WIP_SWEEP_STALE_SECONDS:-86400}"
-need_int WIP_SWEEP_BUDGET          "$BUDGET"
-need_pos_int WIP_SWEEP_STATUS_TIMEOUT  "$STATUS_TIMEOUT"
-need_pos_int WIP_SWEEP_RESCUE_TIMEOUT  "$RESCUE_TIMEOUT"
-need_pos_int WIP_SWEEP_STALE_SECONDS   "$STALE_SECONDS"
-need_int WIP_SWEEP_MAX             "$MAX"
 
-
+# bounded_lib_path — resolve the bounded-execution library and PRINT it; non-zero when there is none.
+# ONE implementation, because the reader now asks the same question the pass does: a box with no library
+# cannot sweep, so the reader must say so rather than silently answer about an older record.
+bounded_lib_path() {
+  if [ -n "${WIP_SWEEP_BOUNDED_LIB:-}" ]; then
+    printf '%s' "$WIP_SWEEP_BOUNDED_LIB"
+    [ -f "$WIP_SWEEP_BOUNDED_LIB" ]
+    return $?
+  fi
+  if [ -n "${SELF_DIR:-}" ] && [ -f "$SELF_DIR/lib/bounded.sh" ]; then printf '%s' "$SELF_DIR/lib/bounded.sh"; return 0; fi
+  if [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh" ]; then printf '%s' "$HOME/.pi/agent/scripts/lib/bounded.sh"; return 0; fi
+  return 1
+}
 
 # ── --print-status: answer "did the last pass run, and what did it find" from the RECORD alone ────
 # Same polarity as `disk-reaper.sh --print-status`: `never` and `stale` are NOT success, because a
 # sweeper that has not run is a box whose WIP is on the disk and nowhere else.
 if [ "$MODE" = status ]; then
+  # The three seams this reader depends on, validated with pass mode's own rules (exit 2, a config error).
+  need_pos_int WIP_SWEEP_STALE_SECONDS  "$STALE_SECONDS"
+  need_pos_int WIP_SWEEP_STATUS_TIMEOUT "$STATUS_TIMEOUT"
+  need_pos_int WIP_SWEEP_RESCUE_TIMEOUT "$RESCUE_TIMEOUT"
+  # ⛔ A BOX WITH NO BOUNDED LIBRARY CANNOT SWEEP, SO THE READER ANSWERS **AND** REFUSES. It prints the
+  # derived surface a consumer keys on (`status=`, `rc=`, `detail=` naming the cause) instead of exiting
+  # from the library resolution with no output at all — the shape that made a broken box look like a
+  # silent tool.
+  if ! R_LIB="$(bounded_lib_path)"; then
+    echo "status=failed"
+    echo "rc=3"
+    echo "detail=no scripts/lib/bounded.sh (WIP_SWEEP_BOUNDED_LIB='${WIP_SWEEP_BOUNDED_LIB:-}', SELF_DIR='${SELF_DIR:-}', HOME='${HOME:-}') — this box cannot sweep"
+    exit 3
+  fi
   if [ ! -f "$STATUS_FILE" ]; then
     # rc= IS PART OF THE DOCUMENTED SURFACE TOO (review finding). A consumer keyed on the derived
     # `rc=` — the reader shape I7c exists for — found NO value at all on a never-run box (a fresh cell,
@@ -368,6 +372,33 @@ elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bg-rescue-wip.sh" ]; then
 elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh" ]; then
   RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
 fi
+# ── the bounded-execution helper — REFUSED when missing, never a silent different file ───────────
+# Every subprocess below is bounded: `git status` on a 179 GB worktree and a `git push` to a remote
+# that has stopped answering are both unbounded by nature, and this pass is what a cell quiesce calls
+# BEFORE the box is destroyed — a hang here is a box that never finishes dying.
+if ! BOUNDED_LIB="$(bounded_lib_path)"; then
+  err "no scripts/lib/bounded.sh (looked at \$WIP_SWEEP_BOUNDED_LIB='${WIP_SWEEP_BOUNDED_LIB:-}', ${SELF_DIR:-<no script dir>}/lib, \$HOME/.pi/agent/scripts/lib) — REFUSING: an unbounded sweep is worse than none. Farm it: bash pi-bootstrap/setup.sh"
+  exit 3
+fi
+# shellcheck source=/dev/null
+. "$BOUNDED_LIB" || { err "cannot source $BOUNDED_LIB"; exit 3; }
+# An INHERITED pin is the caller's; an absent one is "no pin", not an unbound-variable abort under -u.
+TB_TIMEOUT_BIN="${TB_TIMEOUT_BIN:-}"
+if ! tb_resolve_timeout; then
+  err "no usable watchdog for bounded execution (TB_TIMEOUT_BIN='${TB_TIMEOUT_BIN:-}') — REFUSING"
+  exit 3
+fi
+TB_TIMEOUT_KIND="${TB_TIMEOUT_KIND:-unknown}"
+
+BUDGET="${WIP_SWEEP_BUDGET:-900}"
+need_int WIP_SWEEP_BUDGET          "$BUDGET"
+need_pos_int WIP_SWEEP_STATUS_TIMEOUT  "$STATUS_TIMEOUT"
+need_pos_int WIP_SWEEP_RESCUE_TIMEOUT  "$RESCUE_TIMEOUT"
+need_pos_int WIP_SWEEP_STALE_SECONDS   "$STALE_SECONDS"
+need_int WIP_SWEEP_MAX             "$MAX"
+
+
+
 # ⛔ A MISSING RESCUER MUST NEVER READ AS "NOTHING TO RESCUE". This is the same rule
 # `spawn-gate.sh`'s rescue seam already enforces (`rescue=UNAVAILABLE`, never `rescue=nothing`): the
 # absence of the tool says nothing about the state of the worktrees, so this REFUSES.
@@ -530,6 +561,14 @@ examine() {
     # `record` takes <branch> <head>; forget the normalisation and the head lands in the branch column.
     record "$repo" "$path" "${bref#refs/heads/}" "$head" "unreached" "-" "-" "-" "-" "deferred-pass-budget"
     N_DEFERRED=$((N_DEFERRED + 1))
+    # ⛔ AND IT WAS NOT EXAMINED, SO IT IS NOT `seen` (#3588 review, cycle 4). `seen` was incremented at
+    # the top of this function, and this branch returns before clean/skipped/dirty/unmeasured — so the
+    # documented identity `seen = clean + skipped + dirty + unmeasured` ("over the worktrees examined",
+    # docs/ops/wip-sweep.md) read `seen=1` with every term 0. Measured on a 3-worktree fixture whose budget
+    # expired inside the first verdict call: `seen=1 clean=0 skipped=0 dirty=0 unmeasured=0 deferred=3` —
+    # the same summary-vs-index disagreement the flush fix closed, on the other counter an instrument
+    # reads. Handing the increment back keeps `seen` meaning what the doc says it means.
+    N_SEEN=$((N_SEEN - 1))
     err "DEFERRED — the pass budget ended before $path could be classified (bg-rescue-wip --verdict exit $vrc). Not a failure: this worktree never got its turn."
     return 0
   fi
@@ -724,6 +763,12 @@ sweep_repo() {
     record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-failed"
     return 0
   fi
+  # ⛔ HOW MANY RECORDS THIS REPO'S LISTING PRODUCED (#3588 review, cycle 4). The zero-examination
+  # escalation below is GLOBAL, and flushed rows can come from a DIFFERENT repo — so a repo that answered
+  # exit 0 with an empty list could be excused as `incomplete` because a sibling repo deferred rows. Not a
+  # false PASS (a deferral never yields `status=ok`), but a mis-attributed diagnosis: "no time" for what is
+  # "this repo listed nothing, the enumerate is broken". Counted per repo, escalated unconditionally.
+  local listed=0
   while IFS= read -r line || [ -n "$line" ]; do
     # THE PASS BUDGET BOUNDS THE PASS, NOT ONLY THE ARCHIVES (review finding). It used to be tested
     # once, inside the dirty/apply branch, so a pass over 139 CLEAN worktrees cost
@@ -742,6 +787,7 @@ sweep_repo() {
     [ "$STOP_EXAMINE" -eq 0 ] && budget_exhausted && { BUDGET_STOPPED=1; STOP_EXAMINE=1; }
     case "$line" in
       'worktree '*)
+        listed=$((listed + 1))
         [ "$started" -eq 1 ] && flush_record "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
         cur="${line#worktree }"; cur_head=""; cur_branch=""; cur_bare=0; cur_prunable=0; started=1 ;;
       'HEAD '*)   [ "$started" -eq 1 ] && cur_head="${line#HEAD }" ;;
@@ -755,6 +801,11 @@ sweep_repo() {
     esac
   done < "$LISTF"
   [ "$started" -eq 1 ] && flush_record "$repo" "$cur" "$cur_head" "$cur_branch" "$cur_bare" "$cur_prunable"
+  if [ "$listed" -eq 0 ]; then
+    err "UNMEASURED — `git worktree list` answered for '$repo' but named no worktree at all. This repo was NOT swept; it is not clean, it is unknown."
+    N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+    record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-empty"
+  fi
   return 0
 }
 
@@ -780,12 +831,14 @@ done
 # ⛔ A PASS THAT EXAMINED ZERO WORKTREES HAS NOT SWEPT ANYTHING. Repos resolved and every one of them
 # listed at least its own main worktree, so zero here means the enumeration broke — never "no work to
 # rescue".
-# ⛔ UNLESS IT DEFERRED ROWS (#3588 review, cycle 3). A flushed `unreached` row is proof the enumeration
+# ⛔ UNLESS IT DEFERRED ROWS (#3588 review, cycle 3/4). A flushed `unreached` row is proof SOME enumeration
 # WORKED and the budget ended the pass before the first examination, which is `incomplete`/exit 1 and is
 # already stated via `deferred=` and `budget_stopped=yes`. Firing this escalation over flushed rows made
 # a spent budget read as a broken enumerate — measured: 3 worktrees, budget 1s, `deferred=0` (the count
 # bug above) and exit 3. With nothing examined AND nothing deferred, the premise (the listing produced
 # nothing) is true and the escalation stands.
+# The PER-REPO half of that premise is not waivable at all: `sweep_repo` escalates on its own when a repo
+# that answered names zero worktrees, so a sibling repo's deferrals cannot excuse it.
 if [ "$N_SEEN" -eq 0 ] && [ "$N_DEFERRED" -eq 0 ]; then
   err "UNMEASURED — no worktree was examined at all, though ${#REPOS[@]} repo(s) resolved. This pass swept NOTHING; it is not a clean one."
   FAILED=1
