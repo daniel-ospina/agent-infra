@@ -378,6 +378,30 @@ _graph_key_read() { # <env|file> <path-or-empty> <variable> -> SET/SHAPED/LEN; r
   [ "$GRAPH_KEY_SET" = 1 ]
 }
 
+# ⛔ "IS A KEY PRESENT AT ALL?" MUST NOT EXPAND ONE EITHER (#3374 review, round 15 P1 — the same class
+# as `_graph_key_read`, in the one place it was left). `graph_credential_note`'s legacy-alias hint read
+# the ALIAS through `[ -n "${TORTOISE_API_KEY:-}" ]` and `[ -n "$(graph_key_from_env_file …)" ]`, and
+# `set -x` traces both with the VALUE — measured: `+ '[' -n tt_… ']'` for a box whose primary name is
+# unset and whose legacy alias is set, which is EXACTLY the population the hint exists for. It prints
+# nothing and sets nothing: callers ask it a yes/no question in a `||` chain, so a boolean of the
+# secret never reaches a variable that a later line could expand.
+_graph_key_present() { # <env|file> <path-or-empty> <variable> -> rc=0 when a non-empty key resolves
+  local src="$1" path="$2" var="$3" _xt=0 raw="" got=0
+  case $- in *x*) _xt=1 ;; esac
+  set +x
+  if [ "$src" = env ]; then
+    # indirect expansion, not `printenv`: the original test was `${TORTOISE_API_KEY:-}` and it must
+    # keep matching a shell variable that was set without being exported.
+    raw="${!var:-}"
+  else
+    raw="$(graph_key_from_env_file "$path" "$var")"
+  fi
+  if [ -n "$raw" ]; then got=1; fi
+  unset raw
+  if [ "$_xt" = 1 ]; then set -x; fi
+  [ "$got" = 1 ]
+}
+
 # ONE resolver, two renderings. `graph_credential_note` prints the long explanation; the
 # `LAYER VERIFIED` line prints the one-word state. Two independent resolutions of the same question
 # is how a cell gets certified "credential: OK" while the note below it says NOT resolvable.
@@ -487,7 +511,7 @@ graph_credential_state() {
 
 graph_credential_note() {
   graph_key_resolve
-  local src="$GRAPH_KEY_SRC"
+  local src="$GRAPH_KEY_SRC" _legacy=0
   if [ "$GRAPH_NOENTRY" -eq 1 ]; then
     log_line "⚠️  graph credential: UNKNOWN — there is no readable tortoise entry at $DEST/.mcp.json, so there is no credential to resolve (the failure above names the reason). ⛔ A MISSING entry is not a self-host and must not be reported as one"
     return 0
@@ -515,9 +539,19 @@ graph_credential_note() {
       log_line "    string, the server answers 401 'invalid or missing Bearer token', and every lane writes"
       log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
       log_line "    $GRAPH_VAR, or alias the name an older box carries: export TORTOISE_MCP_API_KEY=\"\$TORTOISE_API_KEY\" (#5153)."
-      if [ "$GRAPH_VAR" = "TORTOISE_MCP_API_KEY" ] && { [ -n "${TORTOISE_API_KEY:-}" ] \
-         || { [ -n "${HOME:-}" ] && [ -n "$(graph_key_from_env_file "${HOME}/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; } \
-         || [ -n "$(graph_key_from_env_file "${CELL_HOME:-}/keys.env" TORTOISE_API_KEY 2>/dev/null)" ]; }; then
+      # `if/elif`, not a `{ …; } || { …; }` chain: `}` followed by `; then` is a syntax error (measured),
+      # and the chain read worse than the thing it replaced.
+      _legacy=0
+      if [ "$GRAPH_VAR" = "TORTOISE_MCP_API_KEY" ]; then
+        if _graph_key_present env "" TORTOISE_API_KEY; then
+          _legacy=1
+        elif [ -n "${HOME:-}" ] && _graph_key_present file "${HOME}/keys.env" TORTOISE_API_KEY; then
+          _legacy=1
+        elif [ -n "${CELL_HOME:-}" ] && _graph_key_present file "${CELL_HOME}/keys.env" TORTOISE_API_KEY; then
+          _legacy=1
+        fi
+      fi
+      if [ "$_legacy" = 1 ]; then
         log_line "    ⚠️  the LEGACY name TORTOISE_API_KEY IS set — add the alias line above and it resolves"
       fi
   elif [ "$GRAPH_KEY_SHAPED" = 1 ]; then
