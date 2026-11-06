@@ -222,8 +222,14 @@ $(printf '%s\n' "$out" | grep -v '^\[claim-reaper\] listed=' | tail -4)"
             *)                                  verdict=RELEASE-INCOMPLETE ;;
         esac
         crp_record "$verdict" "$mode" "$rc" "$listed" "$releasable" "$released"
+        # ⛔ A PASS CAN HIT THE BOUND *AND* LOSE A FENCE (#3481 round-3, P2). `--max 3` with 3 released,
+        # 1 refused and 1 bound-deferred prints the `bound reached` line AND a `REFUSED (the ref moved)`
+        # line — so a bound-only advisory named a remedy ("raise the bound") that cannot clear the
+        # refused claim, and dropped the tool's own refusal evidence. When refusals are present they
+        # are ALWAYS quoted, in both arms.
+        _refused="$(printf '%s\n' "$out" | grep 'REFUSED (the ref moved' | tail -4)"
         if [ "$verdict" = "BOUND-REACHED" ]; then
-            crp_block "the claim reaper is ARMED and its per-pass bound (--max $CRP_MAX) stopped it: released=$released of releasable=$releasable, so the remainder is STILL holding dispatch and is only retried next hour. Raise the bound (CLAIM_REAPER_MAX) or let the next pass take them."
+            crp_block "the claim reaper is ARMED and its per-pass bound (--max $CRP_MAX) stopped it: released=$released of releasable=$releasable, so the remainder is STILL holding dispatch and is only retried next hour. Raise the bound (CLAIM_REAPER_MAX) or let the next pass take them.$([ -n "$_refused" ] && printf '\n⚠️ AND some of the remainder were NOT bound-deferred — those deletes were REFUSED because a peer took the ref, so raising the bound will not clear THOSE:\n%s' "$_refused")"
         else
             crp_block "the claim reaper is ARMED and released only $released of $releasable RELEASABLE claims, and the tool did NOT report its bound as the cause — so the remainder was refused at the fenced delete (usually: another box took the ref while this pass was reading it) or could not be recorded. Those claims are still holding dispatch for the next pass. THIS IS NOT A BOUND PROBLEM — do not raise CLAIM_REAPER_MAX. The tool's own lines:
 $(printf '%s\n' "$out" | grep -E 'RELEASABLE but|REFUSED|-> ' | tail -4)"
