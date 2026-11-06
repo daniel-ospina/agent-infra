@@ -228,8 +228,10 @@ esac
 # ⛔ CALIBRATED ON THE LONGEST MINTABLE TERM, NOT ON ONE KNOB (review round 20). `CLAIM_ISSUE_TTL` is
 # NOT the longest lease this file can mint: `CLAIM_BRANCH_TTL` (branch claims) and `CLAIM_TTL_MAX`
 # (PR/fix leases) are each first-class overrides with their own digit clamps above, and either can be
-# raised PAST `CLAIM_ISSUE_TTL` — measured, `CLAIM_BRANCH_TTL=40000` mints `lease_until = now + 39996`
-# while a floor nailed to 18000 would reap that live branch claim ~22 000 s inside its own term,
+# raised PAST `CLAIM_ISSUE_TTL` — measured, `CLAIM_BRANCH_TTL=40000` mints `lease_until = now + 40000`
+# (a `until - now` delta reads 39996 only because it is taken seconds after the mint; the mint site is
+# `_claim_acquire_at`'s `until=$(( now + ttl ))`), while a floor nailed to 18000 would reap that live
+# branch claim ~22 000 s inside its own term,
 # re-creating exactly the bug this block closes, one knob over. So the FLOOR TERM is the max of all
 # three, computed once into an internal (`_claim_`-prefixed like the helpers, never a knob): the ceiling
 # has to be compared against the TERM, not against whatever the operator configured, or the legitimate
@@ -1184,8 +1186,18 @@ _claim_commit_time() {
   # measured: `sed s/[0-9]/X/` turned `٣` into X, `sed s/[0123456789]/X/` did not. The enumerated `case`
   # below rejects the result, so there is no fail-open today, but the parse must not depend on the
   # downstream guard to stay ASCII.
-  ct="$(printf '%s' "$raw" | sed -n '/^$/q;p' | sed -n '/^committer /p' | tail -n 1 \
-        | sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
+  # ⛔ THE PARSE IS BYTE-ORIENTED, SO ITS ANSWER DOES NOT DEPEND ON THE BOX'S LOCALE (review round 26).
+  # `sed`'s `.` does not consume an INVALID UTF-8 byte under a UTF-8 locale, so a `committer` line
+  # carrying one (a latin-1 name, or a peer-forged byte — the header is peer-writable) matched here
+  # under `LC_ALL=POSIX` and did NOT under `LC_ALL=C.UTF-8`: measured, the same object answered
+  # `1700000000` on one box and UNMEASURABLE on the next, and `tools/fleet/claim_lanes.py`'s mirror
+  # (which decodes with `errors="replace"`) answered a stamp in both. `git` itself dates that commit
+  # fine — the encoding of a name has nothing to do with its timestamp — so the byte answer is the
+  # correct one AND the one that stops this reader disagreeing with its own mirror. `LC_ALL=C` on the
+  # three stages is the whole fix: `.` becomes byte-oriented, and every shape that measures today still
+  # measures the same value.
+  ct="$(printf '%s' "$raw" | LC_ALL=C sed -n '/^$/q;p' | LC_ALL=C sed -n '/^committer /p' | tail -n 1 \
+        | LC_ALL=C sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
   # ⛔ SELECT THE LAST `committer` LINE *FIRST*, THEN PARSE IT (review round 20, agent-infra#3203). The
   # parse above used to be ONE anchored `sed` piped to `tail -n 1`, which selects "the last line that
   # MATCHES", not "the last committer line". Git dates the object from the last `committer` header
