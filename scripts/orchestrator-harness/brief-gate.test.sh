@@ -933,9 +933,56 @@ grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(xiv) --missing on S
 bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(xiv-b) …and --check on the same bytes refuses it, so (xiv) is not a green over a broken pipe (got $rc)"
 
+# ── CYCLE-2 P1: EVERY `WIP:` VALUE IS CHECKED, NOT THE LAST ONE (fresh-context review of #3484) ──
+# The shape check accepted ANY keyed `WIP:` line while the cross-check measured only the LAST one, so
+# each carrier below satisfied the shape and made the checker abstain on a line that was never the
+# claim. Measured before the fix, all with a live `issue-4242 -> none` against an EXISTING ref:
+#   E a pasted canonical block (a live, unfenced `issue-<N> -> refs/wip/<ref>` line — the text this
+#     gate itself hands the author), F a trailing `WIP: none`, G a bare `WIP:`, H a keyed line for a
+#     DIFFERENT issue, N `pr-<N>` on a lane. Each was ADMITTED (rc=0); each must now be REFUSED.
+cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-canon.txt"; sed -n '/^## PREVIOUS WORK/,$p' "$CANON" >> "$TMP/pwplus-canon.txt"
+bash "$GATE" --check "$TMP/pwplus-canon.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xv) a pasted canonical block after a live absence claim does NOT switch the check off (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-none.txt"; printf '\nWIP:       none\n'; } >> "$TMP/pwplus-none.txt" 2>/dev/null || { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-none.txt"; printf '\nWIP:       none\n' >> "$TMP/pwplus-none.txt"; }
+bash "$GATE" --check "$TMP/pwplus-none.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xvi) a trailing UNKEYED 'WIP: none' does not exempt the keyed claim above it (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-bare.txt"; printf '\nWIP:\n' >> "$TMP/pwplus-bare.txt"; }
+bash "$GATE" --check "$TMP/pwplus-bare.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xvii) a BARE 'WIP:' label does not exempt it either (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-other.txt"; printf '\nWIP:       issue-4243 -> refs/wip/fix-4243-other @ 111111111111\n' >> "$TMP/pwplus-other.txt"; }
+bash "$GATE" --check "$TMP/pwplus-other.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xviii) a keyed ref for a DIFFERENT issue does not exempt the claim about this one (got $rc)"
+# ⛔ THE ROLE-SCOPING ARM NEEDS A BRIEF THAT IS OTHERWISE CLEAN, or it measures the absence claim it
+# inherited instead of the key rule (measured: built from the contradicted fixture it was 80 for the
+# FIXER too, for the unrelated reason).
+{ cat "$CANON"; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr.txt"
+bash "$GATE" --check "$TMP/pwplus-pr.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xix) 'pr-<N>' is NOT a lane/worker key — it is the fixer's and the reviewer's (got $rc)"
+bash "$GATE" --check "$TMP/pwplus-pr.txt" fixer "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(xix-b) …and for a FIXER it is the right key, so the rule is role-scoped and not a blanket ban (got $rc)"
+# ⛔ THE REVIEWER FIXTURE MUST BE THE REVIEWER SECTION (`--section reviewer`): the same file tested as
+# `reviewer` is ALSO refused for the missing MUTATION ATTRIBUTION block, which would make this arm
+# measure the wrong contract (it did, at 80, until the fixture was role-shaped).
+{ bash "$GATE" --section reviewer; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr-rev.txt"
+bash "$GATE" --check "$TMP/pwplus-pr-rev.txt" reviewer "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(xix-c) …and for a REVIEWER too (it reviews one PR at a head) (got $rc)"
+# ── THE INDENT HALF OF THE QUOTING FIX NEEDS ITS OWN MUTANT-KILLING ARM (review cycle 2, P2). §H(xiii)
+# indents the WHOLE brief, and heading detection already rejects an indented heading — so that arm
+# stayed green with the indent logic deleted. This one keeps the brief live and indents one LATE line:
+# the only thing that can refuse it is the indent rule itself.
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-ind.txt"; printf '\n    WIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n' >> "$TMP/pwplus-ind.txt"; }
+bash "$GATE" --check "$TMP/pwplus-ind.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xx) a 4-COLUMN INDENTED late WIP line is a code block, so the live absence claim still decides (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-tab.txt"; printf '\n\tWIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n' >> "$TMP/pwplus-tab.txt"; }
+bash "$GATE" --check "$TMP/pwplus-tab.txt" lane "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(xx-b) …and the TAB spelling of the same indent (a 4-column stop) too (got $rc)"
+
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"
-sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
+# ⛔ THE ANCHOR TRACKS THE CALL SITE (review cycle 2): the reader now takes the ROLE too, and an anchor
+# that stops matching makes the "mutant" byte-identical to the real file — the arm that proves the check
+# is load-bearing then passes for the wrong reason. The diff assertion below is what catches that.
+sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo" "\$role")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
 diff -q "$GATE" "$MUT_PW" >/dev/null 2>&1; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(ix) the cross-check mutation REALLY changed the file (its anchor still matches)"
 bash -n "$MUT_PW"; ck $? "(ix-b) …and the mutant still parses"
