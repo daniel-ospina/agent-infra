@@ -74,8 +74,31 @@ const unquote = (s) => {
 // (YAML 1.1 parses a bare `on` as the boolean true, and some formatters quote it).
 function onRegion(text, file) {
   const lines = text.split("\n");
-  const onRe = /^(?:"on"|'on'|on):/;
-  const onStarts = lines.map((raw, i) => (onRe.test(raw) ? i : -1)).filter((i) => i >= 0);
+  // ⛔ THE KEY NAME IS PARSED, NOT MATCHED AGAINST A LIST OF SPELLINGS. `/^(?:"on"|'on'|on):/` demanded
+  // the colon abutting the name, so `on :` — the SAME key in YAML — slipped past the duplicate guard
+  // below and the reader inspected the FIRST block: appending `on :` carrying `push:` read green with
+  // an effective key set of `['push']` (measured), which is the surface the 7f pin exists for. KEY_RE
+  // already tolerates `[ \t]*:` and every quoting, so the name is read out of the line.
+  const topLevelKeyName = (raw) => {
+    const m = KEY_RE.exec(raw);
+    return m && m[1].length === 0 ? (m[2] ?? m[3] ?? m[4] ?? "").trim() : null;
+  };
+  const onStarts = lines.map((raw, i) => (topLevelKeyName(raw) === "on" ? i : -1)).filter((i) => i >= 0);
+  // ⛔ AND A DUPLICATE TOP-LEVEL `jobs:` IS THE SAME ROOT AT THE LEVEL ABOVE THE JOB ID. YAML keeps the
+  // LAST `jobs:` and discards the rest, so a second block redefines `pipeline-compliance` with no
+  // `if:` at all — and every header in it sits at the same indent, so a reader that only counted job
+  // ids inside the FIRST block found one header, skipped the guard, and read green over an effective
+  // `if` of ABSENT (measured). Counting the container is what makes the job-id check meaningful.
+  const jobsStarts = lines
+    .map((raw, i) => (topLevelKeyName(raw) === "jobs" ? i : -1))
+    .filter((i) => i >= 0);
+  if (jobsStarts.length > 1) {
+    refuse(
+      `${file}: \`jobs:\` appears ${jobsStarts.length} times (lines ${jobsStarts
+        .map((i) => i + 1)
+        .join(", ")}). YAML keeps only the LAST, so no job block read below is the one in force — the guard is UNVERIFIED.`
+    );
+  }
   // ⛔ A DUPLICATE TOP-LEVEL `on:` IS LAST-WINS IN YAML, and a first-match reader reads the WRONG
   // block: appending a second `on:` carrying `push:` leaves this pin inspecting the first one and
   // reporting green (measured: rc=0 while the effective key set was ['push', 'pull_request']). Same
@@ -114,11 +137,23 @@ const KEY_RE = /^([ \t]*)(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))[ \t]*:(.*)$/;
 // `edited` was silently re-addable one line away from the assertion that says it is gone. A
 // `pull_request:` trigger on `workflow-lock.yml` would ALSO collapse its trust split.
 function onKeys(region, childIndent) {
-  return region
-    .filter((l) => l.indent === childIndent)
-    .map((l) => keyOf(l))
-    .filter((k) => k !== null)
-    .map((k) => k.key);
+  const own = region.filter((l) => l.indent === childIndent);
+  // ⛔ A LINE THE READER CANNOT CLASSIFY IS CANNOT-VERIFY, NEVER A SILENT DROP. `.filter((k) => k !==
+  // null)` discarded every line KEY_RE did not match — and YAML's EXPLICIT-KEY syntax (`? push`) is
+  // legal, so a trigger written that way was invisible while being effective (measured: PyYAML key set
+  // `['workflow_call','pull_request','issue_comment','push']`, gate read green). Dropping an
+  // unparsed line is how a gate reports "as decided" about a file it did not fully read.
+  return own.map((l) => {
+    const k = keyOf(l);
+    if (k === null) {
+      refuse(
+        `${l.no === undefined ? "" : `line ${l.no}: `}cannot read the key on ${JSON.stringify(
+          l.raw
+        )} under \`on:\` (YAML explicit-key syntax and other shapes this reader does not model). The trigger set is therefore UNVERIFIED.`
+      );
+    }
+    return k.key;
+  });
 }
 
 function keyOf(line) {
@@ -244,6 +279,23 @@ function jobBlock(text, name) {
     if (!m || m[1].length !== 2) return null; // job headers sit at 2 spaces, one level under `jobs:`
     return (m[2] ?? m[3] ?? m[4] ?? "").trim();
   };
+  // ⛔ AND AN UNCLASSIFIABLE 2-SPACE LINE IS CANNOT-VERIFY, for the same reason as `onKeys`: YAML's
+  // explicit-key form (`  ? pipeline-compliance` / `  : {if: true}`) is a legal job header this reader
+  // does not model, and skipping it made a duplicate job id — and therefore an effective `if` of
+  // `True` — invisible. Anything at a job header's own indent that is not a key we can read means the
+  // job set is not fully understood, and a partially-read job set must not answer "green".
+  lines.forEach((l, i) => {
+    if (nameOfJobHeader(l) !== null) return;
+    const m = KEY_RE.exec(l);
+    if (m && m[1].length === 2) return; // a readable sibling key: fine
+    if (/^ {2}[?:](?:\s|$)/.test(l)) {
+      refuse(
+        `line ${i + 1}: cannot read the job header ${JSON.stringify(
+          l
+        )} — YAML explicit-key syntax is not modelled, so the job set is UNVERIFIED.`
+      );
+    }
+  });
   const starts = lines
     .map((l, i) => ({ l, i }))
     .filter(({ l }) => nameOfJobHeader(l) === name)

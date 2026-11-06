@@ -765,6 +765,53 @@ if apply_mutation "$PC" "$PC_DUP_JOB" \
   run_check 2 "a DUPLICATE \`pipeline-compliance:\` job id is CANNOT-VERIFY, never green" PC_FILE="$PC_DUP_JOB"
 fi
 
+# (c1e) ⛔ THE CONTAINER `jobs:` IS LAST-WINS TOO, one level above the job id. YAML keeps only the LAST
+#       `jobs:` and discards the rest, so a second block redefines `pipeline-compliance` with no `if:`
+#       at all while every job-id check inside the FIRST block still passes — measured rc=0 over an
+#       effective `if` of ABSENT, including the plausible witness where the second block renames the
+#       job (`pc-renamed:`) so no duplicate job id exists to count at all.
+PC_DUP_JOBS="$TMP/pc-dup-jobs.yml"
+if apply_mutation "$PC" "$PC_DUP_JOBS" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+jobs:
+  pc-renamed:
+    name: pipeline-compliance' \
+  "a duplicate top-level \`jobs:\` must be constructible"; then
+  run_check 2 "a DUPLICATE top-level \`jobs:\` is CANNOT-VERIFY, never green" PC_FILE="$PC_DUP_JOBS"
+fi
+
+# (c1f) ⛔ AND AN UNCLASSIFIABLE LINE IS CANNOT-VERIFY, NOT A SILENT DROP. YAML's explicit-key syntax
+#       (`? push` / `: value`) is legal; `onKeys` filtered every line KEY_RE did not match, so a trigger
+#       written that way was invisible while being effective (measured: effective key set included
+#       `push`, gate read green). A gate that drops what it cannot read reports "as decided" about a
+#       file it did not fully read — the no-op-gate class, arriving through a filter instead of a
+#       return. Both levels are pinned here because both had the filter.
+PC_EXPLICIT_ON="$TMP/pc-explicit-on.yml"
+if apply_mutation "$PC" "$PC_EXPLICIT_ON" \
+  "  issue_comment:
+" \
+  "  ? push
+  :
+  issue_comment:
+" \
+  "an explicit-key trigger must be constructible"; then
+  run_check 2 "an EXPLICIT-KEY trigger (\`? push\`) the reader cannot parse is CANNOT-VERIFY" PC_FILE="$PC_EXPLICIT_ON"
+fi
+
+PC_EXPLICIT_JOB="$TMP/pc-explicit-job.yml"
+if apply_mutation "$PC" "$PC_EXPLICIT_JOB" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+jobs:
+  ? pipeline-compliance
+  : {if: true}' \
+  "an explicit-key job header must be constructible"; then
+  run_check 2 "an EXPLICIT-KEY job header (\`? pipeline-compliance\`) is CANNOT-VERIFY" PC_FILE="$PC_EXPLICIT_JOB"
+fi
+
 # (c1b2) ⛔ AND THE DUPLICATE MUST BE FOUND FOR EVERY HEADER SPELLING, not just the bare one. The
 #        guard that refuses a duplicate job id located the header with a list of spellings, so
 #        `  pipeline-compliance :` (space before the colon), `  pipeline-compliance: &anchor` and
@@ -782,6 +829,23 @@ if apply_mutation "$PC" "$PC_DUP_JOB_SPACE" \
     if: true' \
   "a duplicate job id with a space before the colon must be constructible"; then
   run_check 2 "a duplicate job id spelled \`pipeline-compliance :\` is CANNOT-VERIFY too" PC_FILE="$PC_DUP_JOB_SPACE"
+fi
+
+# (c1c2) ⛔ AND THE DUPLICATE `on:` MUST BE FOUND FOR `on :` TOO — the same key in YAML, one space
+#        away from the spelling the arm below covers. `/^(?:"on"|'on'|on):/` demanded the colon abut the
+#        name, so `on :` carrying `push:` was invisible and the 7f pin read green (measured: effective
+#        key set `['push']`). The name is now parsed with KEY_RE's `[ \t]*:` tolerance rather than
+#        matched against a list — the same repair the job-header rule needed.
+PC_DUP_ON_SPACE="$TMP/pc-dup-on-space.yml"
+if apply_mutation "$PC" "$PC_DUP_ON_SPACE" \
+  '          echo "✅ no symlinks under .github/workflows"' \
+  '          echo "✅ no symlinks under .github/workflows"
+
+on :
+  push:
+    branches: [main]' \
+  "a duplicate \`on :\` must be constructible"; then
+  run_check 2 "a duplicate top-level \`on :\` (space before the colon) is CANNOT-VERIFY too" PC_FILE="$PC_DUP_ON_SPACE"
 fi
 
 # (c1d) ⛔ AND A DUPLICATE TOP-LEVEL `on:` IS THE SAME ROOT, one level up: YAML keeps the LAST, so a
