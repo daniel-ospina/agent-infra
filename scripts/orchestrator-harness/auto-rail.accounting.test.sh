@@ -1102,7 +1102,7 @@ grep -qF 'if [ "$_ract" -eq 3 ]; then' "$SUT" \
 # An anchored on the WAIT branch's OWN LOG LINE rather than on the `if`: the `case "$_rstate"` block that
 # chooses `_rwin` sits between the `if` and the `continue`, so any `-A` window that reached the `continue`
 # from the `if` would also reach the NEXT arm's, and a tighter one fails for the wrong reason.
-grep -qF 'continue' <<<"$(grep -A2 -F 'review $_rstate at $head — dispatched' <<<"$_branch")" \
+grep -qF 'continue' <<<"$(grep -A2 -F 'log_line "$repo #$pr review $_rstate at $head' <<<"$_branch")" \
   || bad "the WAIT branch's log line must be followed by CONTINUE — without it a head whose review is ALREADY IN FLIGHT falls through to the dispatch and buys a second concurrent paid review, resetting the cooldown key it is measured by, and nothing else in this file notices"
 # ⛔ AND THE ATTEMPT BUDGET MUST BE FED INTO THE DECISION, OR THE P1 PAID LOOP IS BACK (review round 2,
 # P2, measured): the loop's call is the ONLY thing that makes `$att` non-zero, so dropping the third
@@ -1757,6 +1757,82 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
       *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
     esac ;;
 esac
+
+# ⛔ THE POSITIONAL FAMILY HAS THREE MEMBERS (review round 7, P2, measured): `awaiting-review:<head>` joins
+# `review-in-flight` and `review-dispatch-failed`, so each of the three must be suppressed only by the
+# NEWEST of the other two. Comparing against ONE partner left a newer awaiting-review suppressing the whole
+# pair for ever: `refused` fast-finish posts awaiting-review, the rolled-back launch removes the record (no
+# attempt is spent), the state returns to `none`, and every later pass publishes `review-dispatch-failed` —
+# which, compared only against in-flight, posted once and then never again. The PR then reads as "a
+# reviewer is dispatched as soon as this repo has a free slot" while the reviewer path is broken.
+_HF=9999999999999999999999999999999999999999
+for _pair in "review-in-flight:review-in-flight:2" "review-dispatch-failed:review-dispatch-failed:2"; do
+  _st=${_pair%%:*}; _rest=${_pair#*:}; _wnt=${_rest##*:}
+  : > "$COMMENTS"; : > "$POSTED"
+  publish_review_state acme/widget 42 "$_st" "$_HF"
+  publish_review_state acme/widget 42 awaiting-review "$_HF"      # NEWER truth: "a dispatch finished with no verdict"
+  publish_review_state acme/widget 42 "$_st" "$_HF"               # the state is true AGAIN and must be posted
+  _got=$(grep -cF "auto-rail-review:$_st:$_HF" "$COMMENTS")
+  [ "$_got" = "$_wnt" ] \
+    || bad "a state re-published AFTER a newer 'awaiting-review:<head>' must still post (one comment per real transition): '$_st' got $_got marker(s), want $_wnt — comparing against a single partner member lets the third family member suppress it for ever, and nothing later corrects a rolled-back launch because it spends no attempt"
+done
+# …and the pair still corrects each other in both directions (unchanged behaviour, re-pinned here because
+# the comparison moved from one partner to a max over the family).
+: > "$COMMENTS"; : > "$POSTED"
+publish_review_state acme/widget 42 review-in-flight "$_HF"
+publish_review_state acme/widget 42 review-dispatch-failed "$_HF"
+publish_review_state acme/widget 42 review-in-flight "$_HF"
+[ "$(grep -cF "auto-rail-review:review-in-flight:$_HF" "$COMMENTS")" = 2 ] \
+  && [ "$(grep -cF "auto-rail-review:review-dispatch-failed:$_HF" "$COMMENTS")" = 1 ] \
+  || bad "in-flight <-> dispatch-failed must each post on every real transition (2 in-flight, 1 dispatch-failed) — got $(grep -cF "auto-rail-review:review-in-flight:$_HF" "$COMMENTS") / $(grep -cF "auto-rail-review:review-dispatch-failed:$_HF" "$COMMENTS")"
+# …and a HEADLESS awaiting-review (the cap deferral: "no owner yet" about the PR) is NOT in that family, so
+# it must never suppress a head-bound correction.
+: > "$COMMENTS"; : > "$POSTED"
+publish_review_state acme/widget 42 awaiting-review
+publish_review_state acme/widget 42 review-in-flight "$_HF"
+[ "$(grep -cF "auto-rail-review:review-in-flight:$_HF" "$COMMENTS")" = 1 ] \
+  || bad "a HEADLESS awaiting-review says 'no owner yet' about the PR, not about a revision, so it must not suppress a head-bound 'review-in-flight' — the correction is what stops the PR claiming nothing is reviewing it"
+
+# ⛔ AND A MISSING EPOCH MUST NOT READ AS "DISPATCHED 0m AGO" (review round 7, P3, measured): a record with
+# an exit line but no dispatch line (an older auto-rail's record, a truncated or foreign one) left `_rage`
+# at 0 — a value that is BOTH "no measurement" and a real one — so a `retry`/`refused` head reported
+# "dispatched 0m ago, within its 900s window" on every pass and waited FOR EVER: never retried, never
+# exhausted, never published again. The record's mtime is the conservative fallback and is named as such.
+eval "$(sed -n '/^review_age() {/,/^}$/p' "$SUT")"
+command -v review_age >/dev/null || { echo "FATAL: review_age not found in $SUT"; exit 2; }
+_AG="$_rdir/age.out"
+_now0=$(date +%s)
+printf 'REVIEW-DISPATCHED at=%s head=x\nREVIEW-EXIT rc=0\n' "$(( _now0 - 5000 ))" > "$_AG"
+_a=$(review_age "$_AG"); _arc=$?
+[ "$_arc" = 0 ] && [ "$_a" = "$(( _now0 - 5000 ))" ] \
+  || bad "a record WITH a dispatch epoch must be aged from that epoch (rc=$_arc, got '$_a') — the epoch is the measurement of record"
+# strip the epoch line: the mtime fallback must answer, and the age must be TODAY's, i.e. small
+printf 'REVIEW-EXIT rc=9\n' > "$_AG"
+_a2=$(review_age "$_AG"); _arc2=$?
+[ "$_arc2" = 1 ] \
+  || bad "a record with NO dispatch epoch must fall back to its own mtime, and SAY SO (rc=$_arc2, want 1; got '$_a2') — returning nothing made the caller treat the age as 0"
+_anow=$(date +%s); _aage=$(( _anow - _a2 ))
+[ "$_aage" -ge 0 ] && [ "$_aage" -lt 60 ] \
+  || bad "the mtime fallback must yield a REAL age for a just-written record (got an age of ${_aage}s)"
+# an old, epoch-less retry record must now RETRY rather than wait for ever
+touch -t 200001010000 "$_AG" 2>/dev/null || true
+_a3=$(review_age "$_AG"); _arc3=$?
+_aage3=$(( $(date +%s) - _a3 ))
+[ "$_arc3" = 1 ] && [ "$_aage3" -gt 900 ] \
+  || bad "an epoch-less record whose mtime is old must produce an age past the transient window (rc=$_arc3, age=${_aage3}s) — otherwise the head waits for ever on a 0 it never measured"
+review_action retry "$_aage3" 1; _ar=$?
+[ "$_ar" = 1 ] \
+  || bad "with that age a 'retry' record must be RETRIED (rc=$_ar, want 1) — the defect was a permanent 0-age WAIT"
+rm -f "$_AG"
+review_age "$_rdir/absent.out" >/dev/null; [ $? = 2 ] \
+  || bad "a MISSING record has nothing measurable and must say so (want rc 2) — 0 would read as a fresh dispatch"
+# …and the loop must actually USE the fallback and NAME it (a function nobody calls is an inert fix)
+grep -qF '_rdat=$(review_age "$_rout"); _rage_rc=$?' "$SUT" \
+  || bad "the loop must age the record through review_age and keep its rc — without the fallback a record with no epoch keeps the 0-age WAIT the P3 named, and without the rc the log cannot name the basis of the age"
+grep -qF 'measured from the record file' "$SUT" \
+  || bad "the WAIT log line must NAME the age's basis when it comes from the record's mtime ('measured from the record file') — otherwise the operator's primary instrument reports a measurement that does not exist, which is the defect class itself"
+grep -qF 'its mtime could not be read, so the age is UNKNOWN' "$SUT" \
+  || bad "the WAIT log line must also name the UNMEASURABLE case — a basis that degrades to silence is the same false claim one step later"
 
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"

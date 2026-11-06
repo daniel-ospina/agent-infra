@@ -695,6 +695,28 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
 }
 # The dispatch epoch, from the record the PARENT wrote — never the file's mtime, which a reviewer that
 # keeps writing output would keep refreshing and which would therefore never age out.
+# ⛔ THE AGE OF A DISPATCH WITHOUT AN EPOCH (review round 7, P3, measured). `review_dispatched_at` prints
+# nothing when the record has no dispatch line (a record written by an older auto-rail, a foreign/truncated
+# record), and the loop then used `0` — which is BOTH "no measurement" and a legitimate value — so a
+# `retry`/`refused` record with an exit line but no epoch reported "dispatched 0m ago, within its 900s
+# window" on every pass and waited FOR EVER: never retried, never exhausted, never published again. The
+# file's own mtime is a real, conservative measurement (it is at least as new as the dispatch, so the age
+# it yields is never larger than the truth), so it is used as the fallback and named as such in the log.
+# rc 0 = epoch, 1 = mtime fallback, 2 = nothing measurable.
+review_age() {  # $1 = the review's output file
+  local f=$1 ep mt
+  ep=$(review_dispatched_at "$f")
+  case "${ep:-}" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' "$ep"; return 0;;
+  esac
+  [ -f "$f" ] || return 2
+  mt=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)
+  case "${mt:-}" in
+    ''|*[!0-9]*) return 2;;
+  esac
+  printf '%s\n' "$mt"; return 1
+}
 review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
   head -1 "$1" 2>/dev/null | sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p'
 }
@@ -952,7 +974,9 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # in-flight claim as the permanent last word; and both-positional WITH the in-flight publish before the
   # launch alternated two comments per pass on a broken path. The loop now publishes in-flight only for a
   # launch it PROVED started, so exactly one of the pair is published per real transition and positional
-  # converges: each transition adds one comment, a repeated no-op adds none. Every other state keeps plain
+  # converges: each transition adds one comment, a repeated no-op adds none. (The family has THREE
+  # members once `awaiting-review` carries a head — see below — so "newer than its partner" is computed
+  # against the newest of all of them, never against one.) Every other state keeps plain
   # presence — nothing corrects it, so one marker IS the truth.
   # ⛔ AND `awaiting-review` JOINS THAT FAMILY WHEN IT CARRIES A HEAD (review round 6, P2, measured): a
   # dispatch that finished WITHOUT a verdict corrects an in-flight marker by publishing it, and
@@ -961,19 +985,29 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # ever, because `refused` retries on time alone and never posts another state. Position is the only
   # rule that both corrects and converges. The headless call (cap deferral) stays plain presence: it
   # says "no owner yet" about the PR, not about a revision.
-  local _pos=0 _other _mine_last _other_last
+  local _pos=0 _o _on _mine_last _other_last
   case "$state" in
     review-in-flight|review-dispatch-failed) _pos=1 ;;
     awaiting-review) [ -n "$head" ] && _pos=1 ;;
   esac
   if [ "$_pos" = 1 ]; then
-    case "$state" in
-      review-in-flight) _other=review-dispatch-failed ;;
-      review-dispatch-failed) _other=review-in-flight ;;
-      *) _other=review-in-flight ;;
-    esac
+    # ⛔ THE FAMILY HAS THREE MEMBERS, SO "newer than the ONE other state" IS WRONG (review round 7, P2,
+    # measured). `awaiting-review:<head>` joined at the top of this function, and comparing each state
+    # against a single partner let a NEWER awaiting-review suppress both halves of the pair for ever: with
+    # `refused` fast-finish posting awaiting-review and the record removed on the next rolled-back launch,
+    # the state returns to `none` and every later pass publishes `review-dispatch-failed` — which was
+    # compared only against in-flight, found newer awaiting-review irrelevant, and posted. Measured
+    # sequence (in-flight, awaiting-review:H, in-flight) left ONE in-flight marker where two transitions
+    # happened, and (dispatch-failed, awaiting-review:H, dispatch-failed) left ONE dispatch-failed notice
+    # while the reviewer path stayed broken — the false claim standing indefinitely, which is the exact
+    # reason this family exists. Compare against the NEWEST of the other members instead.
+    _other_last=0
+    for _o in review-in-flight review-dispatch-failed awaiting-review; do
+      [ "$_o" = "$state" ] && continue
+      _on=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_o:$head -->" 'index($0,t){n=NR} END{print n+0}')
+      [ "${_on:-0}" -gt "$_other_last" ] && _other_last=$_on
+    done
     _mine_last=$(printf '%s\n' "$seen" | awk -v t="$tag" 'index($0,t){n=NR} END{print n+0}')
-    _other_last=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_other${head:+:$head} -->" 'index($0,t){n=NR} END{print n+0}')
     [ "${_mine_last:-0}" -gt 0 ] && [ "${_mine_last:-0}" -ge "${_other_last:-0}" ] && return 0
   else
     case "$seen" in *"$tag"*) return 0;; esac
@@ -1365,8 +1399,11 @@ PY
         _ratt="$RAIL_DIR/review-$(printf '%s' "$repo" | tr '/' '-')-$pr-$head.attempts"
         _rstate=$(review_state "$_rout")
         _rattn=$(review_attempts "$_ratt")
-        _rdat=$(review_dispatched_at "$_rout")
-        case "${_rdat:-}" in ''|*[!0-9]*) _rage=0;; *) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;; esac
+        _rdat=$(review_age "$_rout"); _rage_rc=$?
+        case "$_rage_rc" in
+          0|1) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;;
+          *)   _rage=0;;   # nothing measurable: the WAIT path below is the safe direction (it costs a pass)
+        esac
         review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?
         if [ "$_ract" -eq 0 ]; then
           # ⛔ THE WINDOW IN THE LOG MUST BE THE ONE THE PREDICATE USED (review round 3, P3): `_ract` is 0
@@ -1377,7 +1414,14 @@ PY
             pending) _rwin=$REVIEW_COOLDOWN_S;;
             *)       _rwin=$COOLDOWN_TRANSIENT_S;;
           esac
-          log_line "$repo #$pr review $_rstate at $head — dispatched $(( _rage / 60 ))m ago, within its ${_rwin}s window for this state; waiting, not re-dispatching (a slow review is not a stuck one)"
+          # ⛔ STATE THE BASIS OF THE AGE (review round 7, P3): "dispatched 0m ago" was printed for a record
+          # with NO epoch, so the operator's primary instrument asserted a measurement that did not exist.
+          case "$_rage_rc" in
+            0) _rage_txt="dispatched $(( _rage / 60 ))m ago";;
+            1) _rage_txt="the record carries NO dispatch epoch, so the age is ${_rage}s measured from the record file's own mtime";;
+            *) _rage_txt="the record carries NO dispatch epoch and its mtime could not be read, so the age is UNKNOWN";;
+          esac
+          log_line "$repo #$pr review $_rstate at $head — ${_rage_txt}, within its ${_rwin}s window for this state; waiting, not re-dispatching (a slow review is not a stuck one)"
           continue
         fi
         if [ "$_ract" -eq 3 ]; then
