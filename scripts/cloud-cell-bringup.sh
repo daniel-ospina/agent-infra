@@ -165,7 +165,27 @@ done
 # hermetic suite must never grade the machine that runs it. The DEFAULT is the cell's three real
 # populations — the one home, the bring-up checkout, and the legacy `/tmp/cell-home` a re-install or a
 # reboot leaves behind (a second tree no instrument looked at).
-REPO_IDENTITY_ROOTS="${REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} /tmp/cell-ai /tmp/cell-home}"
+# ⛔ THE ROOTS ARE COMPUTED AT CALL TIME, NOT AT LOAD TIME — and that is load-bearing (verification
+# finding on the first attempt at this: the default was expanded here, where `$HOME_ORIG` does not exist
+# yet, so the OS-home root was an EMPTY SLOT and the fix for the finding below was inert while its own
+# comment claimed otherwise). `$HOME_ORIG` is assigned at the top of `main()`, before `setup_home`
+# rewrites `HOME`; a load-time default read it too early.
+# ⛔ AND `$HOME_ORIG` MUST BE IN THE LIST: `setup_home` EXPORTS `HOME=$CELL_HOME`, so `${HOME}` is no
+# longer the account's home by the time this check runs — and the measured incident was
+# `/home/cmux/agent-infra`, one level under the OS home. A cell with `CELL_HOME=/tmp/cell-home` and a
+# real `/home/cmux` holding checkouts would otherwise be walked nowhere near the tree the brief told a
+# lane to `cd` into, and would certify clean. A non-existent `$HOME_ORIG` (`cmux vm exec` hands over
+# `/home/ubuntu`) simply fails the walker's `-d` test and costs nothing.
+# `REPO_IDENTITY_ROOTS` still wins when set — the hermetic-suite seam.
+repo_identity_roots() {
+  printf '%s\n' "${REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} ${HOME_ORIG:-} /tmp/cell-ai /tmp/cell-home}"
+}
+# What the `CELL READY` banner is allowed to say about this check. ⛔ IT IS NOT A CONSTANT (review
+# finding, P1): `--check` reaches its banner on the UNVERIFIED paths too (a standalone bring-up whose
+# `$O` predates the walker, an origin-less `.git`, a local-mirror origin, an empty population), and a
+# banner that lists `repo identity` among the VERIFIED links is a false PASS on the certification line —
+# the one thing this change exists to stop. `check_repo_identity` sets this to what it actually measured.
+REPO_IDENTITY_TOKEN="repo identity NOT verified"
 
 log_line()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { log_line "FATAL: $*" >&2; exit 1; }
@@ -689,7 +709,7 @@ check_gh() {
 # running after it would grade the tree this run just created (the same "a check must not grade its own
 # repair" rule `check_one_home env` states above). What is judged here is the box as it arrived.
 check_repo_identity() {
-  local out v m rc=0 seen_fatal=0
+  local out v m rc=0 seen_fatal=0 seen_unverified=0
   if [ -z "$REPO_SLUG_LIB" ]; then
     # CANNOT-VERIFY, said out loud, and not fatal: a standalone bring-up on a bare VM carries no harness
     # at all (the same degraded state `check_dispatch` names), and refusing provisioning for a check
@@ -702,13 +722,17 @@ check_repo_identity() {
     fi
     return 0
   fi
-  # shellcheck disable=SC2086  # the roots are a declared, space-separated list (REPO_IDENTITY_ROOTS)
-  out="$(repo_identity_scan $REPO_IDENTITY_ROOTS)" || rc=$?
+  # shellcheck disable=SC2086  # the roots are a declared, space-separated list (see repo_identity_roots)
+  out="$(repo_identity_scan $(repo_identity_roots))" || rc=$?
   while IFS="$(printf '\t')" read -r v m; do
     [ -n "$v" ] || continue
     case "$v" in
       fatal) seen_fatal=1; die "CHECK FAILED [repo identity]: $m" ;;
-      warn)  warn "$m" ;;
+      warn)
+        # An UNVERIFIED line means this check did NOT answer the identity question for that directory,
+        # so the banner must not claim it did (see REPO_IDENTITY_TOKEN above).
+        case "$m" in *UNVERIFIED*) seen_unverified=1 ;; esac
+        warn "$m" ;;
       ok)    ok "$m" ;;
     esac
   done <<< "$out"
@@ -716,6 +740,12 @@ check_repo_identity() {
   # `fatal` line). Continuing here would be the silent pass the whole check exists to remove.
   if [ "$rc" -ne 0 ] && [ "$seen_fatal" -eq 0 ]; then
     die "CHECK FAILED [repo identity]: the identity walker returned rc=$rc without naming a directory — cannot say whether any checkout on this box lies about its repo, and cannot-verify is never a pass (agent-infra#2148)"
+  fi
+  # The banner may now say what was actually measured — fully, partially, or not at all.
+  if [ "$seen_unverified" -eq 1 ]; then
+    REPO_IDENTITY_TOKEN="repo identity PARTIALLY verified (see the UNVERIFIED lines above)"
+  else
+    REPO_IDENTITY_TOKEN="repo identity"
   fi
   return 0
 }
@@ -2130,7 +2160,7 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      log_line "CELL READY — all links verified (one home, repo identity, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
+      log_line "CELL READY — all links verified (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;

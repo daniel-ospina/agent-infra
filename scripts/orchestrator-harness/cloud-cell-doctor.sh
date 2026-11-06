@@ -123,7 +123,17 @@ done
 # The roots the walker scans: the cell's one home, the bring-up checkout, and the legacy
 # `/tmp/cell-home` a re-install or a reboot leaves behind. Overridable so a suite never grades the
 # machine that runs it (the same seam as SYSTEMD_UNIT_DIR / SWAP_PROC / DOCTOR_PS_BIN).
-DOCTOR_REPO_IDENTITY_ROOTS="${DOCTOR_REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} /tmp/cell-ai /tmp/cell-home}"
+# ⛔ AND THE ACCOUNT'S OWN HOME, when it is not the cell home (review finding, P2). The doctor runs with
+# `HOME=$CELL_HOME`, so `${HOME}` alone would stop at the cell home — but a cell can carry a second real
+# home one level up (`docs/ops/disk-consumers.md` records `/home/cmux` on cells 3 and 4 holding tortoise
+# checkouts with worktrees), and the measured incident's directory was `/home/cmux/agent-infra`. The
+# passwd record is the honest source; where `getent` does not exist (macOS) the list is unchanged, which
+# is the same coverage as before rather than a claim of more.
+_os_home=""
+if command -v getent >/dev/null 2>&1; then
+  _os_home="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
+fi
+DOCTOR_REPO_IDENTITY_ROOTS="${DOCTOR_REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} ${_os_home:-} /tmp/cell-ai /tmp/cell-home}"
 
 # The PROCESS reaper (#2163), resolved ONCE. It is the lane-reap.sh shipped beside this file (or
 # seeded into $O, which is what a running cell executes). It is deliberately NOT a second

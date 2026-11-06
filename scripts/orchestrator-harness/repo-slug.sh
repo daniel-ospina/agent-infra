@@ -257,6 +257,23 @@ REMEDY
 # refused like any other. A name-keyed exemption would have been a permanent hole in the check, on the
 # one box (cell-1) where three of these directories already exist.
 repo_identity_declared() {
+  # ⛔ THE PIN ROOT FIRST — and this branch is why a review round exists (P1). `HARNESS_PIN_DIR` defaults
+  # to `$CELL_HOME/harness`, and `check_harness_pin` EXPLICITLY supports a LEGACY FLAT PIN where the ROOT
+  # ITSELF is a linked worktree of the harness repo (`_pin_is_worktree_of "$HARNESS_PIN_DIR" "$repo"`).
+  # A linked worktree carries `.git` as a FILE, so the walker SEES it — and without this branch it emitted
+  # a FATAL saying the DEPLOYED HARNESS PIN is a directory lying about itself, which should be renamed or
+  # quarantined: exactly the destructive act this check must never invite, on a healthy cell. The harness
+  # always comes from agent-infra, so the expectation is `agent-infra` whatever repo this cell works; a
+  # `harness` holding anything else is still refused.
+  # Keyed on the CONFIGURED pin name as well as the literal, so an operator who moves the pin
+  # (`HARNESS_PIN_DIR=$HOME/.harness`) is not handed a false block by a name this table did not guess.
+  # ${HARNESS_PIN_DIR:-} because this file is sourced under `set -u` — and NOT inside the `case` pattern
+  # below, where an unset variable would be a fatal expansion rather than an empty match.
+  if [ "${1:-}" = 'harness' ] || { [ -n "${HARNESS_PIN_DIR:-}" ] && [ "${1:-}" = "${HARNESS_PIN_DIR##*/}" ]; }; then
+    printf '%s\n%s\n' 'agent-infra' \
+      'the harness PIN ROOT (or a legacy flat pin, where the root itself is a linked worktree at a commit) — the harness always comes from agent-infra, and the directory names its role, not the repo'
+    return 0
+  fi
   case "${1:-}" in
     # The per-commit harness tree: the harness is checked out AT A COMMIT, so the directory is named
     # for its role, not for the repo. Legitimate (measured on cell-1 beside `agent-infra/`).
@@ -285,9 +302,7 @@ repo_identity_declared() {
     # provisioning — and the rule is to fix the instrument, not to make an operator rename a directory
     # to satisfy it.
     # ⛔ IT IS STILL NOT A HOLE: the expectation is THE CELL'S OWN REPO, so a `clone` holding some
-    # OTHER repo is refused exactly like any other lying name. `cell-ai`/`cell-ai-main` are matched by
-    # the row ABOVE (first match wins), because those two are always the HARNESS checkout, never the
-    # cell's own.
+    # OTHER repo is refused exactly like any other lying name.
     clone|repo|cell|cell-*)
       # ⛔ NO `*` FALLBACK. With the box's own repo unknown, `*` would exempt EVERY repo under these
       # names while the message claimed the opposite — a fail-open with a reassuring sentence, which is
@@ -373,19 +388,24 @@ repo_identity_fold() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 repo_identity_scan() {
   local -a _cd=() _slug=() _fold=() _head=() _base=() _sp=()
   local root c r p base url slug hsha want exp reason decl own checked=0 fatal=0
-  local i j n dup listed heads resolves v pv rp
+  local i j n dup listed hlist resolves v pv rp where
 
   own="$(repo_identity_own_repo)"
 
-  # ⛔ `_cd` holds the RESOLVED path (dedupe, display, the "resolves to" match); `_base`/`_sp` hold the
-  # SPELLED one, because that is the NAME a lane types and therefore the name that can lie. A directory
+  # ⛔ `_cd` holds the RESOLVED path (dedupe, the "resolves to" match); `_base`/`_sp` hold the SPELLED
+  # one, because that is the NAME a lane types and therefore the name that can lie. A directory
   # `$HOME/agent-infra` that is a SYMLINK to `…/real/tortoise` resolves to a basename of `tortoise` —
   # reading the name off the resolved path would call that `ok` while `cd $HOME/agent-infra` does
   # tortoise work, which is this check's own defect wearing the repair an operator is most likely to
-  # attempt. (Hosts whose HOME is itself a symlink are unaffected: only the CHILD's own last segment is
-  # taken from the spelled path, and an ancestor's spelling never changes it.)
+  # attempt.
+  # ⛔ AND THE DEDUPE KEY IS (resolved path, SPELLED NAME), not the resolved path alone (review finding,
+  # P1). Keying it on the resolved path meant the FIRST spelling to sort won and every other spelling of
+  # that tree was never name-checked: `$HOME/tortoise` (honest) plus `$HOME/zz-agent-infra -> $HOME/tortoise`
+  # produced ONE `ok` line and rc=0, so a lane told `cd $HOME/zz-agent-infra` did tortoise work with
+  # nothing reported — the very class this scan exists for, reachable by the repair it recommends. Each
+  # spelling is a name, and a name is what must be compared.
   _ident_add() { # <spelled-path>
-    local sp="$1" rr
+    local sp="$1" rr k=0
     # ⛔ A TRAILING SLASH MAKES `##*/` EMPTY (`"$root"/*/` produces one): normalise ONCE, so the last
     # segment is the directory's NAME rather than the empty string — the first cut of this compared
     # every directory against '' and would have refused the whole box.
@@ -393,9 +413,8 @@ repo_identity_scan() {
     [ -e "$sp/.git" ] || return 0
     rr="$( ( cd "$sp" 2>/dev/null && pwd -P ) )" || return 0
     [ -n "$rr" ] || return 0
-    local k=0
     while [ "$k" -lt "${#_cd[@]}" ]; do
-      [ "${_cd[$k]}" = "$rr" ] && return 0
+      [ "${_cd[$k]}" = "$rr" ] && [ "${_base[$k]}" = "${sp##*/}" ] && return 0
       k=$((k + 1))
     done
     _cd[${#_cd[@]}]="$rr"; _sp[${#_sp[@]}]="$sp"; _base[${#_base[@]}]="${sp##*/}"
@@ -422,6 +441,17 @@ repo_identity_scan() {
     p="${_cd[$i]}"
     base="${_base[$i]}"
     checked=$((checked + 1))
+    # ⛔ THE SUBJECT OF EVERY LINE IS THE SPELLED PATH — the one a lane types. Reporting the RESOLVED
+    # path made the message name the HONEST directory as the liar when the lying alias sorted first
+    # (reproduced: `'…/tortoise' is a checkout of daniel-ospina/tortoise … but its directory is named
+    # 'agent-infra'` — a sentence about a directory that is right, offering a remedy that moves it to
+    # where it already is). The resolved path is kept as a parenthetical because it is where the git
+    # really is, and for a plain checkout the two are identical and the note is empty.
+    # ⛔ ONLY WHEN THE NAME ITSELF DIFFERS. `/tmp` resolving to `/private/tmp` (every macOS host) makes
+    # `$p` differ from the spelled path for EVERY checkout, and a parenthetical on every line is noise an
+    # operator learns to skip. What matters is the case the note exists for: the last segment differs, so
+    # the name a lane types points at a directory named something else.
+    if [ "${p##*/}" = "$base" ]; then where=""; else where=" (it resolves to $p)"; fi
     url="$(repo_identity_origin "$p")" || url=""
     if [ -z "$url" ]; then
       # CANNOT-VERIFY, said out loud. A `.git` whose origin cannot be read is the one state where the
@@ -429,14 +459,14 @@ repo_identity_scan() {
       # pass on it either. It is not `fatal` because an unreadable origin cannot be shown to name a
       # WRONG repo, and refusing a bring-up on it would be a false block on a legitimate local mirror.
       printf '%s\t%s\n' warn \
-        "repo identity UNVERIFIED: $p carries a .git but no readable 'origin' remote, so whether its name ($base) names the repo it actually is cannot be answered — an unanswered identity is not a pass (agent-infra#2148)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where carries a .git but no readable 'origin' remote, so whether its name ($base) names the repo it actually is cannot be answered — an unanswered identity is not a pass (agent-infra#2148)"
       _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
       i=$((i + 1)); continue
     fi
     slug="$(repo_slug_from_remote "$url" 2>/dev/null)" || slug=""
     if [ -z "$slug" ]; then
       printf '%s\t%s\n' warn \
-        "repo identity UNVERIFIED: $p's origin ($url) is not an <owner>/<name> slug this fleet accepts, so its name ($base) cannot be checked against it — a readable origin that names no GitHub repo is still not an answer (agent-infra#2148)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where origin ($url) is not an <owner>/<name> slug this fleet accepts, so its name ($base) cannot be checked against it — a readable origin that names no GitHub repo is still not an answer (agent-infra#2148)"
       _slug[${#_slug[@]}]=""; _fold[${#_fold[@]}]=""; _head[${#_head[@]}]=""
       i=$((i + 1)); continue
     fi
@@ -446,7 +476,7 @@ repo_identity_scan() {
     _head[${#_head[@]}]="${hsha:-<unreadable>}"
     if [ "$(repo_identity_fold "$base")" = "$(repo_identity_fold "$want")" ]; then
       printf '%s\t%s\n' ok \
-        "repo identity: $p is a checkout of $slug (origin $url, head ${hsha:-<unreadable>})"
+        "repo identity: ${_sp[$i]}$where is a checkout of $slug (origin $url, head ${hsha:-<unreadable>})"
       i=$((i + 1)); continue
     fi
     exp=""; reason=""
@@ -459,17 +489,17 @@ repo_identity_scan() {
       # A generic cell-checkout name on a box that declares no repo of its own: nothing was measured, so
       # this is UNVERIFIED — not a lie, and not a pass either.
       printf '%s\t%s\n' warn \
-        "repo identity UNVERIFIED: $p is a checkout of $slug under the generic cell-checkout name '$base' — $reason (agent-infra#2148)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where is a checkout of $slug under the generic cell-checkout name '$base' — $reason (agent-infra#2148)"
       i=$((i + 1)); continue
     fi
     if [ -n "$exp" ] && { [ "$exp" = '*' ] || [ "$(repo_identity_fold "$exp")" = "$(repo_identity_fold "$want")" ]; }; then
       printf '%s\t%s\n' warn \
-        "repo identity: $p is a checkout of $slug under the DECLARED exception name '$base' — $reason. Deliberate, not a defect; named so the exception stays visible, and a DIFFERENT repo at this name is still refused (agent-infra#2148)"
+        "repo identity: ${_sp[$i]}$where is a checkout of $slug under the DECLARED exception name '$base' — $reason. Deliberate, not a defect; named so the exception stays visible, and a DIFFERENT repo at this name is still refused (agent-infra#2148)"
       i=$((i + 1)); continue
     fi
     fatal=$((fatal + 1))
     printf '%s\t%s\n' fatal \
-      "repo identity: '$p' is a checkout of $slug (origin $url) but its directory is named '$base'. Every lane told 'cd ${_sp[$i]}' would work $slug while the path says $base — silently, with no error (measured 2026-11-05: /home/cmux/agent-infra on cell-2 was a tortoise checkout, so pull/<n>/head would not resolve and its main reported commits no other box had). The path this repo belongs at is '${_sp[$i]%/*}/$want'. NOTHING IS MOVED OR DELETED BY THIS CHECK ON PURPOSE: the measured tree still held three worktrees whose commits existed nowhere else (is3446, rev3235, w3446) plus an unmerged pr-3235 branch, so renaming, re-cloning or quarantining it is a human decision — clear it by hand, then re-run"
+      "repo identity: '${_sp[$i]}'$where is a checkout of $slug (origin $url) but its directory is named '$base'. Every lane told 'cd ${_sp[$i]}' would work $slug while the path says $base — silently, with no error (measured 2026-11-05: /home/cmux/agent-infra on cell-2 was a tortoise checkout, so pull/<n>/head would not resolve and its main reported commits no other box had). The path this repo belongs at is '${_sp[$i]%/*}/$want'. NOTHING IS MOVED OR DELETED BY THIS CHECK ON PURPOSE: the measured tree still held three worktrees whose commits existed nowhere else (is3446, rev3235, w3446) plus an unmerged pr-3235 branch, so renaming, re-cloning or quarantining it is a human decision — clear it by hand, then re-run"
     i=$((i + 1))
   done
 
@@ -489,13 +519,18 @@ repo_identity_scan() {
         j=$((j + 1))
       done
       if [ "$listed" -eq 1 ]; then
-        n=0; heads=""; dup=""
+        n=0; hlist=""; dup=""
         j=0
         while [ "$j" -lt "${#_cd[@]}" ]; do
           if [ "${_fold[$j]:-}" = "${_fold[$i]}" ]; then
             n=$((n + 1))
-            dup="${dup}${dup:+, }${_cd[$j]}=${_head[$j]}"
-            heads="${heads}${heads:+, }${_head[$j]}"
+            dup="${dup}${dup:+, }${_sp[$j]}=${_head[$j]}"
+            # ⛔ A SEPARATOR WITH NO SPACE IN IT (review finding, P2). This list fed `tr ',' '\n' | sort -u`,
+            # and building it as ", " left every value after the first with a LEADING SPACE — so two
+            # checkouts at the IDENTICAL head counted as two distinct heads and the run printed "DIFFERENT
+            # heads (…=abc, …=abc)". The same-head arm below was therefore dead code, and the one message
+            # an operator uses to pick a canonical tree claimed a divergence that did not exist.
+            hlist="${hlist}${hlist:+,}${_head[$j]}"
           fi
           j=$((j + 1))
         done
@@ -516,11 +551,20 @@ repo_identity_scan() {
               j=$((j + 1))
             done
           done
-          [ -n "$resolves" ] || resolves="neither REPO, WORKDIR nor O resolves to any of these checkouts"
+          if [ -z "$resolves" ]; then
+            # ⛔ TWO DIFFERENT FACTS. "none of REPO/WORKDIR/O names one of these" is a claim about a box
+            # that SET them; on a box that sets none of them the honest sentence is that nothing names a
+            # canonical tree at all — printing the first sentence there asserts a search that never ran.
+            if [ -n "${REPO:-}${WORKDIR:-}${O:-}" ]; then
+              resolves="neither REPO, WORKDIR nor O resolves to any of these checkouts"
+            else
+              resolves="no REPO, WORKDIR or O is set on this box to name a canonical tree"
+            fi
+          fi
           # Are all the heads the same? Then nothing is at stake YET — say so at `ok`, but say it: the
           # divergence this reports is only invisible until someone commits.
           slug="${_slug[$i]}"
-          if [ "$(printf '%s' "$heads" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
+          if [ "$(printf '%s' "$hlist" | tr ',' '\n' | sort -u | grep -c .)" -le 1 ]; then
             printf '%s\t%s\n' ok \
               "repo identity: $slug is checked out at $n paths ($dup — all at the same head) and $resolves; several trees can be legitimate, so this is reported rather than refused (agent-infra#2148)"
           else

@@ -1705,6 +1705,25 @@ case "$BR_OUT" in
   *"repo identity UNVERIFIED:"*"no readable 'origin'"*) ok "the cell's own WORKDIR is scanned even outside every root, and an origin-less .git is UNVERIFIED (not a pass)" ;;
   *) bad "WORKDIR outside the roots was not scanned, or an origin-less .git read as fine: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
 esac
+# ⛔ THE OS-HOME ROOT IS COMPUTED WHEN THE CHECK RUNS, NOT WHEN THE FILE LOADS (verification finding on
+# the first attempt). `$HOME_ORIG` is assigned at the top of `main()`, AFTER every top-level statement in
+# this file — so a default expanded at load time read it as EMPTY and the OS-home root was an inert
+# slot while its own comment claimed it was walked. The measured incident's directory is one level under
+# the OS home, so this is the difference between catching it and not.
+# (its own load-only copy: the arms above build theirs later in the file, and sourcing a copy that does
+# not exist yet would assert on an undefined function rather than on the roots)
+mkdir -p "$T/roots-bringup"
+sed 's/^main "\$@"$/:/' "$BRINGUP" > "$T/roots-bringup/cloud-cell-bringup.sh"
+# ⛔ `-u REPO_IDENTITY_ROOTS`: this suite EXPORTS that seam globally, and the arm must exercise the
+# SHIPPED default — with the override set it would only prove that the override works.
+ROOTS_OUT="$(env -u REPO_IDENTITY_ROOTS CELL_HOME=/fixture/cell-home HOME_ORIG=/fixture/os-home \
+  REPO_SLUG=daniel-ospina/tortoise \
+  bash -c '. "$1"; repo_identity_roots' _ "$T/roots-bringup/cloud-cell-bringup.sh" 2>&1)"
+case "$ROOTS_OUT" in
+  *"/fixture/os-home"*) ok "the roots include the OS home, computed at CALL time (not at load time, where \$HOME_ORIG does not exist yet)" ;;
+  *) bad "the OS-home root is inert — the measured incident's /home/cmux/agent-infra would never be walked: $ROOTS_OUT" ;;
+esac
+
 # (c) an EMPTY population is not a pass — driven at the function level, because every `br` run carries a
 # WORKDIR that really is a checkout.
 EMPTY_OUT="$(bash -c '. "$1"; ( unset REPO WORKDIR O REPO_SLUG OR; repo_identity_scan "$2" ); echo "rc=$?"' _ \
@@ -1712,6 +1731,70 @@ EMPTY_OUT="$(bash -c '. "$1"; ( unset REPO WORKDIR O REPO_SLUG OR; repo_identity
 case "$EMPTY_OUT" in
   *"NO checkout was found"*"rc=0"*) ok "an empty population is reported, never silently passed" ;;
   *) bad "a walk that found no checkout said nothing — an empty population must not read as clean: $EMPTY_OUT" ;;
+esac
+
+say_case "repo identity: a LEGACY FLAT HARNESS PIN is a declared exception, never a directory to move"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P1. `HARNESS_PIN_DIR` defaults to `$CELL_HOME/harness` and
+# `check_harness_pin` supports a LEGACY FLAT PIN where that directory is ITSELF a linked worktree of the
+# harness repo. A worktree carries `.git` as a FILE, so the walker SEES it — and without a declared row
+# the shipped check emitted a FATAL saying the DEPLOYED HARNESS PIN is a directory lying about itself,
+# with a remedy inviting exactly the rename/quarantine this check must never invite, on a healthy cell.
+mk_checkout "$T/ident-pin/repo" "https://github.com/daniel-ospina/agent-infra.git" p1 \
+  && ok "fixture: an agent-infra checkout to pin FROM" \
+  || bad "fixture: could not create the pin source checkout"
+git -C "$T/ident-pin/repo" worktree add --detach "$T/ident-pin/home/harness" HEAD >/dev/null 2>&1 \
+  && ok "fixture: a LEGACY FLAT PIN — the pin root itself is a linked worktree (…/harness)" \
+  || bad "fixture: could not create the flat-pin worktree"
+BR_IDENT_ROOTS="$T/ident-pin/home" br ok normal --check
+case "$BR_OUT" in
+  *"DECLARED exception name 'harness'"*"PIN ROOT"*) ok "the flat pin is reported as a declared exception, with the reason" ;;
+  *) bad "a legacy flat harness pin was not recognised: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a HEALTHY cell's deployed harness pin was refused as a lying directory — and the remedy invites moving it" ;;
+  *) ok "and it is not fatal (the deployed harness pin is never a directory to move)" ;;
+esac
+[ -e "$T/ident-pin/home/harness/.git" ] && ok "the pin worktree is still in place (nothing was moved)" \
+  || bad "the check removed or moved the harness pin"
+
+say_case "repo identity: two checkouts at the SAME head is reported as same-head, not as a divergence"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A FALSE ALARM. The head list was built with ", " and then split on
+# `,`, so every value after the first kept a leading space: two copies at the IDENTICAL commit printed
+# "DIFFERENT heads (…=abc, …=abc)" and the same-head arm was dead code. The message an operator uses to
+# pick a canonical tree must not invent a divergence.
+mk_checkout "$T/ident-same/agent-infra" "https://github.com/daniel-ospina/agent-infra.git" s1 \
+  && cp -a "$T/ident-same/agent-infra" "$T/ident-same/ai" \
+  && ok "fixture: two copies of one repo at the same commit" \
+  || bad "fixture: could not create the same-head copies"
+BR_IDENT_ROOTS="$T/ident-same" br ok normal --check
+case "$BR_OUT" in
+  *"all at the same head"*) ok "the same head is reported as same-head" ;;
+  *) bad "two copies at the same commit were reported as a divergence: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+case "$BR_OUT" in
+  *"DIFFERENT heads"*) bad "a divergence was invented where the heads are identical" ;;
+  *) ok "and no divergence is invented" ;;
+esac
+
+say_case "repo identity: a LYING ALIAS is caught even when the honest spelling sorts first"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P1, reachable by the repair this very check recommends: a symlink
+# created to "fix" a mislabelled directory. The walker deduped on the RESOLVED path, so whichever spelling
+# sorted first decided the verdict — `tortoise/` (honest) plus `zz-agent-infra -> tortoise/` printed ONE
+# ok line and exited 0, while `cd $HOME/zz-agent-infra` did tortoise work with nothing reported. The name
+# a lane types is the name that must be compared, so the dedupe key includes the SPELLED name.
+mk_checkout "$T/ident-alias/tortoise" "https://github.com/daniel-ospina/tortoise.git" al1 \
+  && ln -sfn "$T/ident-alias/tortoise" "$T/ident-alias/zz-agent-infra" \
+  && ok "fixture: an honest checkout plus a LYING ALIAS that sorts AFTER it" \
+  || bad "fixture: could not create the alias fixture"
+BR_IDENT_ROOTS="$T/ident-alias" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*"directory is named 'zz-agent-infra'"*) ok "the alias whose name lies is FATAL, by its spelled name" ;;
+  *) bad "a lying alias was never name-checked (the dedupe swallowed it): $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-600)" ;;
+esac
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*"'$T/ident-alias/tortoise'"*"named 'zz-agent-infra'"*)
+    bad "the FATAL named the HONEST directory as the liar (a remedy that moves it to where it already is)" ;;
+  *) ok "and the FATAL does not accuse the honest directory" ;;
 esac
 
 say_case "repo identity: a repo-slug.sh from the LAST release cannot brick --check, and it is NAMED"
@@ -1759,6 +1842,31 @@ case "$STALE_OUT" in
   *"FATAL"*) bad "a stale library produced a FATAL over a box nothing was measured on: $STALE_OUT" ;;
   *) ok "no FATAL is raised over a box nothing was measured on" ;;
 esac
+# (d) ⛔ THE BANNER MAY NOT CLAIM WHAT WAS NOT MEASURED (review finding, P1). `CELL READY — all links
+# verified (…, repo identity, …)` is printed on the UNVERIFIED path too (a standalone bring-up whose `$O`
+# predates the walker), so the token has to say what this run actually measured. The arm reads the token
+# the banner interpolates, because on this host the run does not reach the banner itself (the schedule
+# layer refuses a temp HOME first — see the suite header).
+STALE_TOK="$(CELL_HOME="$T/empty-home" REPO_SLUG=daniel-ospina/tortoise \
+  bash -c '. "$1"; REPO_SLUG_LIB=""; REPO_SLUG_LIB_STALE="'"$T/stale-lib/repo-slug.sh"'"; check_repo_identity >/dev/null 2>&1; printf "%s" "$REPO_IDENTITY_TOKEN"' _ "$LIBBR" 2>&1)"
+case "$STALE_TOK" in
+  *UNVERIFIED*|*"NOT verified"*) ok "an UNVERIFIED identity keeps the banner from claiming it ($STALE_TOK)" ;;
+  *"PARTIALLY"*) ok "an UNVERIFIED identity keeps the banner from claiming it fully ($STALE_TOK)" ;;
+  "repo identity") bad "the banner token claims a verified identity on the UNVERIFIED path — a false PASS on the certification line" ;;
+  *) bad "the banner token is not tied to what was measured: $STALE_TOK" ;;
+esac
+# …and the positive control needs a copy whose SIBLING library is CURRENT (`$LIBBR` lives beside the
+# STALE one — the fixture for the arms above), so the loader has something that can answer.
+mkdir -p "$T/clean-bringup/orchestrator-harness"
+sed 's/^main "\$@"$/:/' "$BRINGUP" > "$T/clean-bringup/cloud-cell-bringup.sh"
+cp "$HERE/orchestrator-harness/repo-slug.sh" "$T/clean-bringup/orchestrator-harness/repo-slug.sh"
+CLEAN_TOK="$(REPO_IDENTITY_ROOTS="$T/ident-clean" REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; check_repo_identity >/dev/null 2>&1; printf "%s" "$REPO_IDENTITY_TOKEN"' _ "$T/clean-bringup/cloud-cell-bringup.sh" 2>&1)"
+case "$CLEAN_TOK" in
+  "repo identity") ok "and a measured box DOES earn the token (non-vacuity: it is not always the pessimistic string)" ;;
+  *) bad "a verified identity did not earn the banner token: $CLEAN_TOK" ;;
+esac
+
 # (c) and with NO copy at all, the UNVERIFIED line names what was looked for
 MISS_OUT="$(CELL_HOME="$T/empty-home" bash -c '. "$1"; REPO_SLUG_LIB=""; REPO_SLUG_LIB_STALE=""; check_repo_identity; echo "rc=$?"' _ "$LIBBR" 2>&1)"
 case "$MISS_OUT" in
