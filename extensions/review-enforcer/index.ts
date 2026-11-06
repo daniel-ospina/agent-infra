@@ -9722,33 +9722,41 @@ export default function (pi: ExtensionAPI) {
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
       if (event.toolName === "task_status" && !isTerminalStatus) return undefined;
 
-      // #3155: the status view's OWN `status` cannot classify the run. The background mapping
-      // reports a success-but-silent child (`exit 0`, empty stdout) as `done`, so a classifier
-      // reading the label alone counts a reviewer that produced NOTHING — the exact fail-open the
-      // collect path closes by reading the child's composed details (#2665 review). The producer
-      // carries that same payload on a terminal view as `final_details`; read it and classify
-      // EXACTLY as the collect path does.
+      // #3155: a reap must be CERTIFIED before it counts, and certification is a property of the
+      // REAP — not of the verb. The child's composed payload is the classifier's only evidence that
+      // a verdict exists: the run's own `status` maps a success-but-silent child (`exit 0`, empty
+      // stdout) to `done`, so a classifier reading the label alone counts a reviewer that produced
+      // NOTHING (the #2665 fail-open). `task_collect` carries that payload at `details`; a terminal
+      // `task_status` carries it at `final_details`. Read it from whichever verb fired and classify
+      // through it — the SAME code path, so the two verbs cannot disagree.
       //
-      // ⛔ ABSENCE IS NOT A VERDICT. A view with no composed details (a producer that predates the
-      // field, or a record with none) cannot be certified, so it is NOT counted — fail-closed, and
-      // the remedy is the terminal `task_collect`, which carries the payload by contract. It is
-      // deliberately NOT written to the ATTEMPT ledger: that ledger's vocabulary describes spawn
-      // OUTCOMES (refused/cut/failed), and "the producer did not carry a field" is not one —
-      // recording it there would ship a false capacity/refusal claim to the refusal text (#2665's
-      // fix exists to stop exactly that), so the console line is the record.
+      // ⛔ THE COLLECT VERB GETS THE SAME GUARD (fresh review of the first version of this fix, P1
+      // — and it was right): applying it to `task_status` only was a false PASS, not a
+      // half-measure. A record with NO composed payload was REFUSED through the observation verb and
+      // COUNTED through the collect verb, because a rejected payload merged to `{}` and left the
+      // view's `status: "done"` label deciding — and the message the guard printed ("reap it with
+      // task_collect") named the lenient verb as the remedy. One rule, both verbs: no payload, no
+      // verdict.
       //
-      // ⛔ AND IT SITS BEFORE THE DEDUPE, DELIBERATELY. Marking an uncertifiable view as "already
-      // reaped" would spend that run's ONE slot on a view that counted nothing, so the lane's
-      // follow-up `task_collect` — the documented remedy, carrying the payload — would then be
-      // rejected as a repeat and the run could never be counted in this session. Uncounted means
-      // unrecorded.
-      const statusComposedDetails = isTerminalStatus
-        ? composedDetailsOf((reviewDetails as { final_details?: unknown })?.final_details)
-        : null;
-      if (isTerminalStatus && statusComposedDetails === null) {
+      // ⛔ ABSENCE IS NOT A VERDICT. It is a missing datum, and it is NOT written to the ATTEMPT
+      // ledger either: that ledger's vocabulary describes spawn OUTCOMES (refused/cut/failed), and
+      // "the producer did not carry a field" is not one — recording it there would ship a false
+      // capacity/refusal claim to the refusal text (#2665's fix exists to stop exactly that), so the
+      // console line is the record.
+      //
+      // ⛔ AND IT SITS BEFORE THE DEDUPE, DELIBERATELY. Marking an uncertifiable reap as "already
+      // counted" would spend that run's ONE slot on a reap that counted nothing, so a later
+      // certifiable one could never count it in this session. Uncounted means unrecorded.
+      const reapComposedDetails = isTerminalCollect
+        ? composedDetailsOf((reviewDetails as { details?: unknown })?.details)
+        : isTerminalStatus
+          ? composedDetailsOf((reviewDetails as { final_details?: unknown })?.final_details)
+          : null;
+      if ((isTerminalCollect || isTerminalStatus) && reapComposedDetails === null) {
         console.error(
-          "[review-enforcer] ⚠️ a TERMINAL task_status carried no composed details — NOT counted as a " +
-            "reviewer dispatch (#3155). Reap it with task_collect({ run_id }) to count its verdict."
+          `[review-enforcer] ⚠️ a TERMINAL ${event.toolName} carried no composed details — NOT counted ` +
+            "as a reviewer dispatch (#3155): a run whose payload is missing cannot be certified as a " +
+            "verdict, and its own `status` label must not stand in for one."
         );
         return undefined;
       }
@@ -9778,20 +9786,13 @@ export default function (pi: ExtensionAPI) {
       // producer set, and the evidence it read is carried into the audit row and the refusal.
       const spawn = classifySpawnOutcome({
         // A terminal reap is a `TaskRunStatusView` / `TaskCollectView`: the CHILD's composed payload
-        // sits at `view.details` (collect) or `view.final_details` (status), and the run's own
-        // `status`/`reason` sit at the top level. Read BOTH (nested last, so the child's own
-        // `killed`/`exitCode` win), because classifying on the view alone re-opened the same
-        // fail-open one path over (review of #2665): the
-        // background status mapping reports a no-output `clean-empty` settle as `done`, so the
-        // view said "done" while the child's details carried `exitCode:0` with no output — and
-        // the FOREGROUND path already classifies that same shape as `cut`.
-        details: isTerminalCollect
-          ? {
-              ...(reviewDetails as Record<string, unknown>),
-              ...(composedDetailsOf((reviewDetails as { details?: unknown })?.details) ?? {}),
-            }
-          : isTerminalStatus && statusComposedDetails !== null
-            ? { ...(reviewDetails as Record<string, unknown>), ...statusComposedDetails }
+        // sits at `view.details` (collect) or `view.final_details` (status) — read above, one
+        // narrowing for both verbs — and the run's own `status`/`reason` sit at the top level. Merge
+        // BOTH (payload last, so the child's own `killed`/`exitCode` win): the payload is present by
+        // construction here, because the certification guard above refuses a reap without one.
+        details:
+          isTerminalCollect || isTerminalStatus
+            ? { ...(reviewDetails as Record<string, unknown>), ...(reapComposedDetails ?? {}) }
             : (reviewDetails as Record<string, unknown> | undefined),
         isError: (event as { isError?: unknown }).isError,
       });

@@ -1974,8 +1974,17 @@ testAsync("#1662: a background dispatch is not counted until its terminal task_c
         const b2 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(b2 && b2.block === true, "a not-finished collect must NOT count");
 
+        // #3155: and neither is a TERMINAL collect whose record carries no composed payload —
+        // certification is a property of the REAP, not of the verb (a payload-less reap is refused
+        // through task_status above, so counting it here would be a false PASS reachable by
+        // following this gate's own advice). The fixture below is producer-shaped because a real
+        // settled `task_collect` always carries `details` (`{model, provider}` on a clean success).
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-NOPAYLOAD" } });
+        const b3 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(b3 && b3.block === true, "a terminal collect with no composed payload must NOT count");
+
         // The terminal collect is the reviewer's completion — now it counts.
-        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done" } });
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-OK", details: { model: "m", provider: "p" } } });
         const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         equal(allowed, undefined, "the terminal collect satisfies the ≥1-dispatch gate");
       } finally {
@@ -1999,10 +2008,10 @@ testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted
         await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
 
         // The verdict is reaped — counted once.
-        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A", details: { model: "m", provider: "p" } } });
 
         // The SAME finished lane is re-collected (`task_collect` is idempotent).
-        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A", details: { model: "m", provider: "p" } } });
 
         // The durable per-event audit count must not be inflated by the repeat.
         const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
@@ -2033,10 +2042,11 @@ testAsync("#3155: a TERMINAL task_status reap counts as a reviewer dispatch — 
         ok(blocked && blocked.block === true, "blocked without dispatches");
 
         // A NON-terminal view is still not a verdict (#1662's fail-open, preserved). ⛔ THE PAYLOAD
-        // IS DELIBERATELY PRESENT HERE (fresh review, P1): without it these cases exit at the
-        // missing-payload guard ABOVE the `terminal` test, so the only thing that could refuse them
-        // was never exercised — and a mutant that counted a non-terminal view *carrying* a payload
-        // survived the whole suite. With it, `terminal` is the sole gate on this path.
+        // IS DELIBERATELY PRESENT HERE (fresh review, P1): without it these cases would fall
+        // through to the missing-payload guard BELOW the `terminal` test and be refused for the
+        // wrong reason — so the only thing that could refuse a non-terminal view *carrying* a
+        // payload was never exercised, and a mutant that counted exactly that survived the suite.
+        // With the payload present, `terminal` is the sole gate on this path.
         for (const status of ["alive", "wedged", "gone"]) {
           await fire("tool_result", {
             toolName: "task_status",
@@ -2120,7 +2130,7 @@ testAsync("#3155: a terminal task_status with NO composed details is never count
           });
         }
         const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
-        ok(blocked && blocked.block === true, "an unclassifiable terminal view is an ATTEMPT, never a dispatch");
+        ok(blocked && blocked.block === true, "an unclassifiable terminal view is neither a dispatch nor an ATTEMPT — it counts nothing and writes no ledger row");
         const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
         equal(rows.length, 0, "no durable dispatch was recorded for it");
 

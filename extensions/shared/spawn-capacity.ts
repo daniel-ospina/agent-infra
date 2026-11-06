@@ -425,16 +425,39 @@ export function describeSpawnCapacity(
   // refusal-only ledger cannot be told its child came back, a latch-only one cannot be told
   // "several classes failed", and a mixed one claims neither (review of #2665: the header and the
   // label disagreed on a latch-only ledger).
+  //
+  // ⛔ AND IT NAMES THE VERBS THE LEDGER ACTUALLY HOLDS (fresh review, P2). Every arm used to say
+  // "a `task`/`subagent` dispatch WAS ATTEMPTED" as a LITERAL, which #3155 turned into a false
+  // claim: a `task_status` reap can now be the ledger's ONLY row, and that refusal then asserted a
+  // `task`/`subagent` dispatch this gate never observed. The subject is derived from the evidence
+  // beside it (#2349: a refusal says what it read), and an unrecognised tool falls back to the
+  // generic noun rather than being rendered verbatim.
+  const VERB_WORDING: Record<string, string> = {
+    task: "`task`",
+    subagent: "`subagent`",
+    task_collect: "`task_collect`",
+    task_status: "`task_status`",
+  };
+  const observedVerbs = [
+    ...new Set(
+      attempts
+        .map((a) => VERB_WORDING[a.tool])
+        .filter((v): v is string => typeof v === "string")
+    ),
+  ].sort();
+  const dispatchNoun = observedVerbs.length
+    ? `a ${observedVerbs.join("/")} dispatch`
+    : "a sub-agent dispatch";
   const headline =
     cls === "capacity"
-      ? "a `task`/`subagent` dispatch WAS ATTEMPTED and its child never returned a verdict"
+      ? `${dispatchNoun} WAS ATTEMPTED and its child never returned a verdict`
       : cls === "refusal"
-        ? "a `task`/`subagent` dispatch WAS ATTEMPTED and refused BEFORE a child existed"
+        ? `${dispatchNoun} WAS ATTEMPTED and refused BEFORE a child existed`
         : cls === "breaker"
-          ? "a `task`/`subagent` dispatch WAS ATTEMPTED and the dispatch breaker refused it before a child existed"
+          ? `${dispatchNoun} WAS ATTEMPTED and the dispatch breaker refused it before a child existed`
           : cls === "latch"
-            ? `a \`task\`/\`subagent\` dispatch WAS HALTED ${latchClause} because a provider family is latched/exhausted`
-            : "a `task`/`subagent` dispatch WAS ATTEMPTED and produced no reviewer verdict — several spawn classes failed (see ATTEMPTS)";
+            ? `${dispatchNoun} WAS HALTED ${latchClause} because a provider family is latched/exhausted`
+            : `${dispatchNoun} WAS ATTEMPTED and produced no reviewer verdict — several spawn classes failed (see ATTEMPTS)`;
   const lines = [
     `${SPAWN_UNSPAWNABLE_TOKEN} — ${n} sub-agent spawn ATTEMPT(s), 0 reviewer verdicts counted.`,
     `   → This is a ${spawnFaultLabel(cls)}, NOT a compliance one: ${headline},`,
@@ -495,8 +518,9 @@ export function describeSpawnCapacity(
     lines.push(`   → REFUSAL OBSERVED (${c.refusalAt?.evidence ?? "status=refused"}): ${gloss}`);
   }
   lines.push(
-    "   → WHAT THIS GATE READ: the `task`/`subagent` result DETAILS of this session (the `key=value`",
-    "     above). It does NOT see the child session id (that is the parent's `[task] child session",
+    "   → WHAT THIS GATE READ: the sub-agent result DETAILS of this session (the `task`,",
+    "     `subagent`, `task_collect` and `task_status` results — the `key=value` above). It does NOT see",
+    "     the child session id (that is the parent's `[task] child session",
     "     <uuid>` console line) and it does not see why the box was loaded."
   );
   // ── the ACTION ──────────────────────────────────────────────────────────────────────
