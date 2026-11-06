@@ -154,6 +154,7 @@ SH
 d="$(cd "$(dirname "$0")" && pwd)"
 if [ "$1" = api ] && [ "$2" = -i ]; then
   shift 2
+  printf '%s\n' "$*" >> "$d/gh.argv"
   out="$("$d/gh.body" api "$@" 2>"$d/.gh.err")"; rc=$?
   [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
   rm -f "$d/.gh.err"
@@ -380,6 +381,43 @@ case "$OUT" in
   *"could not be read"*) ok "no-probe: the unreadable budget is REPORTED, not silently assumed" ;;
   *) bad "no-probe: the unreadable budget is not reported — output: $OUT" ;;
 esac
+
+# ── 6) EVERY TIER WINDOW IS ASKED OLDEST-FIRST (agent-infra#2019, review cycle 1 P1) ───────────#
+# ⛔ WHY THIS ARM EXISTS. The provider's default order is created-DESCENDING, so an unqualified
+# `--limit N` keeps the NEWEST N. The pool ranks AGE-SECOND (oldest-first inside a tier) and, since
+# #2019, the queue's ORDER is derived from `.pool` — so an unsorted window made the oldest queued
+# members of an over-capacity tier read as "unranked" and pinned them to the TAIL on every pass,
+# forever, while the pass still claimed `severity-first`. The tier IS over capacity in production
+# (open `P2-moderate` 450 against the 200 bound, 2026-11-05), so this is the live shape, not a
+# hypothetical. Asking oldest-first makes truncation lose the NEWEST members — the end the ranking
+# does not need, and the one that makes the unranked TAIL the ordering `age-second` actually asks for.
+# This pins the QUESTION the helper puts to the provider — a stub cannot emulate the provider's order,
+# so pinning the returned rows would prove nothing. The complementary half — that pool-unranked rows
+# land at the TAIL in queue order — is pinned in `rank-queue.test.sh`.
+# ⛔ THIS ARM'S COMMENT PROSE TRIPPED A GUARD ONCE. A reviewer measured this file REFUSED before its
+# first assertion with an unpaired parenthesis in the comment above, and 28/0 with it removed; on this
+# box the refusal then outlived the removal and is keyed to this file's PATH rather than its bytes — the
+# same bytes under another name run 28/0 (agent-infra#3528). Recorded here so the next lane does not
+# read the refusal as this suite failing.
+mk_case order-dir 1000   # the reserve is 300: a 100-call budget refuses before the pool is built
+mk_gh "$D" "$(rows 6)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+for _tier in P0-blocker P1-severe P2-moderate; do
+  _url="$(grep -F "labels=$_tier" "$D/bin/gh.argv" 2>/dev/null | head -1)"
+  if [ -z "$_url" ]; then
+    bad "tier-order: no listing was made for $_tier at all (the assertion below would pass by vacuity)"
+    continue
+  fi
+  case "$_url" in
+    *"sort=created"*)  ok "tier-order: $_tier is asked with sort=created" ;;
+    *) bad "tier-order: $_tier listing has no sort=created — the window keeps the NEWEST rows, the opposite end from the pool's oldest-first rank: $_url" ;;
+  esac
+  case "$_url" in
+    *"direction=asc"*) ok "tier-order: $_tier is asked direction=asc (the window keeps the OLDEST, so truncation loses the newest)" ;;
+    *) bad "tier-order: $_tier listing has no direction=asc — a truncated tier would lose its OLDEST members: $_url" ;;
+  esac
+done
 
 echo
 echo "  $PASS passed, $FAIL failed"

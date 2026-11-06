@@ -599,7 +599,17 @@ fi
 # one a cell finds) to converge the per-box review-record registry with the fleet's before lanes
 # are dispatched, and `atomic-land.sh` runs it beside itself. A cell without it boots BLIND —
 # every PR another box reviewed reads as unreviewed — which is the state #2374 measures.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh tortoise-graph.sh tortoise_graph_client.py)
+# agent-infra#2403 adds install-runner-autoscale-timer.sh: the runner-pool converger
+# (`scripts/orchestrator-harness/runner_autoscale.py`, merged in #2877/#2900) had NO scheduler, so a
+# box kept whatever runner count it happened to have — pi-cell-1 measured 5 live against a ceiling of
+# 3 on 8 cores while tortoise CI sat at 34 queued. The FARMED installer is the arming surface a
+# bring-up or an operator reaches for (`~/.pi/agent/scripts/install-runner-autoscale-timer.sh --arm`).
+# It resolves the converger from the CHECKOUT by absolute path — the farm is FLAT
+# (`$INFRA_ROOT/scripts/<name>`) and the converger lives under `scripts/orchestrator-harness/`, so it
+# is not itself farmed; the unit names the checkout copy, which is the artifact #2877 landed and the
+# path this installer verifies before rendering. It ships DISARMED: `--install` renders a dry-run
+# unit and timer, and `--arm` (a dated owner step) is what lets the pass ACT.
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh tortoise-graph.sh tortoise_graph_client.py)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -617,6 +627,33 @@ for base in "${fleet_srcs[@]}"; do
   cp -f "$f" "$dest"
   chmod +x "$dest" 2>/dev/null || true
   fleet_copied=$((fleet_copied+1))
+done
+
+# ── the orchestrator MCP's own harness module ────────────────────────────────────────────────
+# `lane_registry.py` lives in `scripts/orchestrator-harness/` but is farmed FLAT into
+# `$DEST/scripts/` deliberately: that flat path is one of the candidate locations the MCP server
+# itself searches (`_candidate_paths` in mcp-servers/orchestrator/server.py), so the install
+# layout and the server's own lookup cannot drift.
+# ⛔ It is NOT a member of `fleet_srcs`. That array resolves every source as
+# `$INFRA_ROOT/scripts/$base`, so listing a file that lives one directory DOWN made the install
+# treat it as missing, exit 1, and take the whole farm — guards, skills, every assertion after it —
+# down with it. Measured on #3486: `FAIL: install exited 1`, then `GUARD MISSING: …` × 6.
+# A `src` subdirectory with a flat `dest` is exactly what the installer's own reader models, so the
+# test's independent expectation stays a superset of this declaration with no change in semantics.
+mcp_harness_srcs=(lane_registry.py)
+for base in "${mcp_harness_srcs[@]}"; do
+  farm_declared_rel+="scripts/$base"$'\n'
+  f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
+  if [ ! -f "$f" ]; then
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner gate, #1719)"
 

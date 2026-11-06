@@ -240,6 +240,7 @@ denied_extension_note() {
 # An array in setup.sh that is NOT named here is a loud failure (see read_farm_set).
 FARM_LAYOUT="$(printf '%s\n' \
   $'fleet_srcs\tscripts\tscripts' \
+  $'mcp_harness_srcs\tscripts/orchestrator-harness\tscripts' \
   $'merge_gate_srcs\tscripts\tscripts' \
   $'lane_root_srcs\tscripts\tscripts' \
   $'lane_srcs\tscripts/lane\tscripts' \

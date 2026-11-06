@@ -425,11 +425,39 @@ bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=
 # 262144 → pi renders `262k`); unlike the heartbeat's probe, safe-send's has NO `(auto)` or
 # model-bullet rescue arm, so an unlisted window is an outright refusal. Pin every shipped window
 # here, not just the current clamp.
+# ⛔ THE LATER GATE MUST BE THE FIXTURE'S, NOT THIS HOST'S. `safe-send.sh` delegates busy/idle to
+# `lane-guard.py`, whose `cmux` calls run through `lane-status.py`'s `env=CMUX` with four HARD-CODED
+# absolute bin dirs PREPENDED to PATH (`_CMUX_BIN_DIRS` is `:49-54`; the prepend itself is `:58`,
+# `CMUX["PATH"] = os.pathsep.join(_present + …)`, guarded by `:57 if _present:`). So the `$TMP/bin/cmux` stub below is
+# SHADOWED wherever a real `cmux` sits in one of the four dirs that EXIST on the box — `/usr/local/bin` or
+# `~/.local/bin` on a Linux box, `/opt/homebrew/bin` or the macOS app dir on a Mac — and is reached only
+# when none of them holds one (CI: ubuntu-latest). This is NOT a Mac-only condition: measured on the
+# Linux box this was diagnosed on, `cmux` resolves at `/usr/local/bin/cmux`, `/usr/local/bin` is one of
+# the four, and the real gate therefore ran and satisfied the grep. Wherever it runs, its empty read
+# produces the SAME message this arm wants, purely by accident. Measured both ways: the green was a
+# property of the HOST, not of `safe-send.sh`.
+#
+# SO WHAT GETS PINNED HERE IS THE **CONSUMER** SIDE, AND ONLY THROUGH A SENTINEL. This arm pins
+# `safe-send.sh:182-189`: that it READS `SAFE_SEND_GUARD` (`:182`), runs it (`:183`), and turns a
+# non-zero rc (`:185`) into its `REFUSED … Not consumable` message with `exit 3` (`:189`). ⛔ But a fixture that emits the REAL gate's message cannot prove the
+# seam was honoured at all — the real `lane-guard.py` emits `REFUSED [3.1s] pane UNREADABLE — busy/idle
+# UNKNOWN, not idle`, which satisfies a bare `pane UNREADABLE` grep. Measured: deleting the seam
+# (`GUARD="$SCRIPTS/lane-guard.py"`, so `SAFE_SEND_GUARD` is never read) left this suite at an IDENTICAL
+# `118 passed, 1 failed` — the arm was grading the host again, one layer down. So the fixture prints a
+# `FIXTURE-GUARD:` sentinel that the real gate never emits, and the positive arms assert on THAT. Re-run
+# the same mutation after any edit here: it must go RED.
+# The real `lane-guard.py` is STUBBED, not pinned: it has no host-independent seam to drive (`lane-status.py`
+# hard-codes `_CMUX_BIN_DIRS` with no env override), which is precisely why the stub `cmux` could never
+# reach it. ⛔ RESIDUAL, named rather than absorbed: on a host WITH `cmux` this arm used to execute the real
+# gate incidentally, and on CI it always did; after this change NO arm in this suite executes
+# `lane-guard.py`, so a regression in its busy/idle refusal ships with nothing red here. Tracked at #3524.
+printf 'import sys\nprint("REFUSED [0.0s] FIXTURE-GUARD: pane UNREADABLE — busy/idle UNKNOWN, not idle")\nsys.exit(3)\n' > "$TMP/bin/fake-guard.py"
 for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
   printf '#!/bin/sh\necho "CMUX_RAN $*" >> "$CMUX_LOG"\ncase "$1 $2" in "read-screen --workspace") echo "~/Documents/GitHub/agent-infra"; echo "  deepseek-flash %s";; esac\nexit 0\n' "$_budget" > "$TMP/bin/cmux"
   chmod +x "$TMP/bin/cmux"
   : > "$CMUX_LOG"
   PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" SAFE_SEND_DISPATCH=/bin/true \
+    SAFE_SEND_GUARD="$TMP/bin/fake-guard.py" \
     bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 pane-probe "$ALERT" --notice >"$TMP/probe.out" 2>&1; rc=$?
   if [ "$_budget" = '%/500k' ]; then
     grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; ck $? "negative control: a budget pi never draws (%/500k) is still REFUSED as 'no pi' (rc=$rc)"
@@ -440,7 +468,24 @@ for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
     # "pane UNREADABLE" and ALSO exits 3 — so an rc-only assertion cannot tell them apart, and a
     # probe that rejected the live footer would print the message this arm forbids.
     grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; [ $? -ne 0 ]; ck $? "the pane probe ACCEPTS the live footer budget ${_budget} (it does not report 'NO pi IN THIS PANE')"
-    grep -q 'pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the later busy/idle gate, so the probe admitted ${_budget}"
+    # ⛔ THE SENTINEL IS THE POINT: 'pane UNREADABLE' alone is emitted by the REAL `lane-guard.py` too, so a
+    # bare grep passes when `SAFE_SEND_GUARD` is ignored and the host's gate runs instead of the fixture.
+    # 'FIXTURE-GUARD:' is a string the real gate never prints, so this assertion can only be satisfied by
+    # the fixture the seam installed — re-run the seam-deletion mutation to confirm it goes red.
+    grep -q 'FIXTURE-GUARD: pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the FIXTURE busy/idle gate, so the probe admitted ${_budget}"
+    # ⛔ AND THE REFUSAL MUST REACH THE CALLER AS A REFUSAL. The two greps above are blind to the exit
+    # code, so a `safe-send.sh` that prints its busy/idle refusal and then reports SUCCESS is green
+    # everywhere — measured: mutating `safe-send.sh:189` `exit 3` → `exit 0` left this suite at an
+    # IDENTICAL `118 passed, 1 failed`. That is the regression worth catching, because the rc IS the
+    # verdict: `tools/fleet/outcome_canary.py:2944` renders it through `SAFE_SEND_RC`
+    # (`0: "DELIVERED (consumed)"`, `3: "REFUSED (lane busy or state unknown)"`), so a refusal that
+    # returned 0 would be recorded as delivered. (⛔ NOT `lane.sh`/`fix-one.sh`: they LAUNCH an agent and
+    # never send into a pane — `grep -c safe-send` is 0 in both, and `lane-status.py` records that
+    # `safe-send.sh` is manual-only now. Citing them here was a round-7 review finding.)
+    # `-eq 3` pins the CODE, not the identity of the refuser: the pane probe's own refusals are also 3
+    # (`safe-send.sh:130`, `:155`), and so is the real host gate's — which is why WHICH gate refused is
+    # settled by the `FIXTURE-GUARD:` sentinel above and only there.
+    [ "$rc" -eq 3 ]; ck $? "…and the busy/idle refusal is a REFUSAL to the caller (3), never a success (rc=$rc)"
   fi
 done
 
@@ -577,12 +622,32 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
 # `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
 # ⛔ AND THE LIST IS AN EQUALITY, SO IT MUST BE KEPT CURRENT BY WHOEVER MOVES THE SCAN (#1881 LANE,
-# measured). The five `orchestrator-harness` entries without a comment above arrived on `main` after
-# the last time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the
-# four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
-# superset), independently of any branch. Declared here because an equality that is red on its own
-# base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# measured). The `orchestrator-harness` entries without a comment above arrived on `main` after the last
+# time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the suites drive
+# gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict superset),
+# independently of any branch. Declared here because an equality that is red on its own base stops being
+# a signal: every PR inherits the same red and nobody can attribute it.
+# ⛔ THE COUNT IS DELIBERATELY NOT NAMED (this list changes; a pinned integer is the drift
+# `check-single-source.sh` warns about). What each entry IS still has to be said:
+#   * `mandate-preflight.sh` / `mandate-preflight.test.sh` (#3377) are REFERENCERs — the helper names
+#     `brief-gate.sh` in its header prose and the suite quotes it — and neither dispatches a `pi`
+#     invocation, so they join this equality without joining the dispatch population.
+#   * `check-farm-drift.sh` (88c720f54, #3120) and `nonblocking-dispatch.test.sh` (e9b8b7663, #3219 —
+#     issue #3162) landed on `main` after the list was last edited and are the same class: a REFERENCER
+#     (it names the gate in prose, `:19`) and a SUITE (it stubs the gate). They are TWO of the four names
+#     that kept this equality red at this change's base — measured there (29b3af07), `found`=30 vs the 26
+#     declared — which is the condition this block's own paragraph calls out: an equality red on its own
+#     base attributes nothing, so a NEW dispatch path added tomorrow would inherit the same red and stay
+#     invisible. They are declared here so the arm can pass and therefore say something again.
+#   * `cloud-cell-supervisor.sh` and `key-gate.sh` (29b3af07, #3331/#3342) are the OTHER two of those
+#     four, arriving with that same commit and declared for the same reason: the supervisor NAMES the
+#     gate in prose and in its own preflight list (`:2654`, `:2656`), the key gate names it in prose
+#     (`:33`). Measured at this change's rebase head (19f1c6fe), `found`=32 vs the 30 declared. Neither
+#     dispatches a `pi` invocation, so neither joins the dispatch population.
+#   * ⛔ THE `pi`-INVOKER CENSUS COVERS THE HELPER ONLY, NOT ITS SUITE (measured): `spawn-gate.test.sh`'s
+#     scan excludes `*.test.*` by name, so `mandate-preflight.test.sh` is invisible to it. That is why the
+#     suite's own E5 states its residual in-line instead of pointing at that census for protection.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"

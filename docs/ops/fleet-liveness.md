@@ -429,10 +429,9 @@ The shared rule, in the reaper's own vocabulary (`scripts/lib/pid-identity.sh`,
    returns **3** for `unknown` and **2** for a usage error — an env/usage failure decides nothing.
 
 > The fence, the zombie rule, non-vacuity, incarnation matching, and the abstention direction are
-> all pinned by `tools/fleet/liveness.test.py` (**T1–T31 — 31 tests with 38 paired mutations**, this
-> block's own counts rather than the file's; the file's measured total is stated in the regression
-> contract at the end of this document: the
-> #1178/#5389 verdict suite is **T1–T24** and the #1777 claim evidence is **T25–T31**. The ids are
+> all pinned by `tools/fleet/liveness.test.py` (**57 tests with 112 paired mutations**: the
+> #1178/#5389 verdict suite is **T1–T24**, the #1777 claim evidence is **T25–T31**, and the log-axis
+> suite is **T32–T57**. The ids are
 > unique — the #5389 in-flight-tool tests are T21–T24 and simply *defined last*, appended after the
 > #1777 block, so definition order is not label order) and by the
 > reaper's own suite (`scripts/pi-reap-idle.test.sh`).
@@ -812,11 +811,11 @@ python3 tools/fleet/lane_liveness.py --dry-run
 fails without its fix):
 
 ```bash
-python3 tools/fleet/liveness.test.py               # 51 tests
-python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (72)
+python3 tools/fleet/liveness.test.py               # 57 tests
+python3 tools/fleet/liveness.test.py --mutations   # every mutation must go RED (112)
 python3 tools/fleet/lane_liveness.test.py          # the scheduled report + its RED control (10)
-python3 tools/fleet/claim_lanes.test.py            # 26 reader tests
-python3 tools/fleet/claim_lanes.test.py --mutations  # 30 mutations, each must go RED
+python3 tools/fleet/claim_lanes.test.py            # 28 reader tests
+python3 tools/fleet/claim_lanes.test.py --mutations  # 33 mutations, each must go RED
 bash scripts/pi-reap-idle.test.sh                  # the reaper's regression gate
 python3 scripts/orphan-reap.test.py --mutations    # the `pi` pool's gates + the fence-default pin
 ```
@@ -1603,8 +1602,8 @@ Three mechanisms, and mtime models only the third:
    lane is working hard.
 2. **A lane that finished without a verdict any reader recognised was indistinguishable from a
    crash.** `lane-bound.sh` had been writing one all along — see 13.3.
-3. **Real death** — the completion watchdog's `sub-agent completed but did not exit within 15s —
-   killing`, a provider stall, or a true hang.
+3. **Real death** — the completion watchdog's `[task] sub-agent (pid N) completed but did not exit
+   within 15s — killing (completion watchdog)` line, a provider stall, or a true hang.
 
 ### 13.2 The states, in the vocabulary of §1
 
@@ -1619,8 +1618,8 @@ reader can mistake `finished` for a transcript state.
 | `working` **(`progress:<signal>`)** | the tree is alive **and** work was OBSERVED | at least one progress signal advanced inside the sample window |
 | `working` **(`within-window`)** | the tree is alive and nothing is happening **yet** | every signal flat, but for less than `LOG_FREEZE_MS`. This is NOT positive liveness evidence — it is the fleet's normal resting state — so a consumer must not read `working` as "something happened" without looking at `reason` |
 | `frozen` | the tree is alive **and nothing is happening** | **ZERO progress on EVERY signal** — the log's silence for the full `LOG_FREEZE_MS` window, CPU over the `LOG_WINDOW_MS` sample — with the freeze window echoed in `detail` as `freeze_ms=` and named SEPARATELY from `window_ms=`, the sample span the deltas were taken over, so a machine reader can always tell which window it received |
-| `finished` | the tree is **gone** and the lane **completed** | positive identity evidence of absence + `verdict=finished` **with `rc=0` or `rc=na`** |
-| `no-verdict` | the tree is **gone** and the lane **told us nothing** | positive identity evidence of absence + no recognisable verdict |
+| `finished` | the tree is **gone** and the lane **completed** | positive identity evidence of absence + `verdict=finished` **with `rc=0`**, **or** `rc=na` corroborated by the launcher's own `[timeout] agent pid=<pid> … rc=0` line |
+| `no-verdict` | the tree is **gone** and the lane's turn is **not established as complete** — either **no recognisable bound verdict** was written (the launcher's own `rc=` may still be readable and is then reported in `detail`), or a `verdict=finished` **was** written and an `rc=` — on the bound line or on the corroborating launcher line — shows the turn did **not** complete | positive identity evidence of absence + (**no** bound verdict, **or** a `verdict=finished` whose `rc=` is non-zero, **on the bound line or on the launcher line** — the `rc=na` + launcher `rc=<non-zero>` shape is `bound-finished-runner-rc:<n>`) |
 | `dead` | the tree is gone **because the bound killed it** | `verdict=stalled` / `verdict=exceeded-wallclock` |
 | `unknown` | abstention, reason named | an unreadable log, an unreadable signal, or an unfenceable process |
 
@@ -1631,6 +1630,16 @@ re-dispatch that re-does finished work, which is exactly the 2026-11-03 false-ne
 **⛔ AND ABSENCE IS NEVER DEATH.** No log, no readable log, or an unfenceable pid is `unknown` with a
 named reason. This is the same `no-log-evidence`-is-a-refusal rule the reaper already states (§11.2
 gate 3), applied to the diagnostic.
+
+**A LOG IS `readable` ONLY IF IT CAN BE OPENED.** `S_ISREG` says what the inode IS; it never says we
+may read it. Deciding readability from `stat` alone made a **mode-000** regular file a readable log
+whose byte channel was never read — and the second sample then computed
+`size_delta = st_size - st_size = 0` from that unread channel, publishing it as a positively FLAT
+reading, so a LIVE lane read `frozen/no-progress bytes_delta=0` (measured). The readability claim is
+therefore **proved with the open it depends on** (`S_ISREG` first, so a fifo/socket/device is never
+opened at all, then a single `open(…, "rb")`), and the two facts stay NAMED apart —
+`not-a-regular-file:` and `unreadable:` — because a reader routes on the reason. Pinned by T40 (both
+reasons) and T41 (the census arm).
 
 ### 13.3 The signals, and their measured resolution
 
@@ -1645,7 +1654,7 @@ is STALLED (both signals flat)"*.
 |---|---|---|
 | **S2 — CPU delta on the lane's process TREE** (load-bearing) | cumulative CPU of the pid **and every descendant**, two readings `LOG_WINDOW_MS` apart, compared strictly above `LOG_CPU_TOL_CS`. Read from **`/proc`** (Linux) at `SC_CLK_TCK`, with `ps -axo pid=,ppid=,time=` as the BSD/macOS fallback | **this is the one that survives a long silent tool call**: a tool that prints nothing still burns CPU. Measured, tortoise #5387: 1203 s of silence at `toolCpuAdvanced=true`, **154 CPU-seconds burned**. A `pi` parked in `ep_poll` reads exactly 0 |
 | **S1 — log BYTE size** (corroborating veto) | `wc -c` delta across the window | `lane-bound.sh` contracts on it, so it is kept — but it is *insufficient alone*, which is the whole defect. It can only ever turn flat→working, never working→flat |
-| **S1b — TRANSCRIPT growth** | the session JSONL's size delta, when the lane has one (`--no-session` lanes do not) | the signal a session-bearing lane already gets (§3); `None` here is "no transcript", an abstention on this signal, never a flat one |
+| **S1b — TRANSCRIPT growth** | the session JSONL's size delta, when the lane has one (`--no-session` lanes do not) | the signal a session-bearing lane already gets (§3); `None` here is "no transcript". It can never *supply* the flat reading and never *blocks* it — `frozen` is decided on the log's silence plus CPU alone, which is what makes it reachable for the axis's whole `--no-session` target population |
 
 **Resolution, measured — TWO floors, both stated because they differ by 10x:**
 
@@ -1659,18 +1668,25 @@ So on Linux, `LOG_WINDOW_MS` = 30 s (`LANE_REAP_WINDOW`) with `LOG_CPU_TOL_CS` =
 (`LANE_REAP_CPU_TOL_CS`) resolves S2 to **0.10 CPU-seconds per 30 s (about 3.3 mCPU)**. Where only a
 whole-second `ps` is available the floor is **1.0 CPU-s per window (about 33 mCPU)** — a lane burning
 under ~3 % of a core reads flat there, which is why `/proc` is preferred and why the tolerance alone
-is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is `lane-bound.sh`'s
-`LANE_BOUND_IDLE_S` default (2700 s) — the fleet's own declared NO-PROGRESS allowance, and since
-`agent-infra#2888` the bound that decides wedged-vs-slow — reused so one number answers one question
-instead of a second, unreviewed one.
+is never treated as proof of idleness. `LOG_FREEZE_MS` = 45 min is the fleet's **already declared
+no-progress allowance**, copied rather than invented: `lane-bound.sh`'s `--idle` default
+(`LANE_BOUND_IDLE_S` = 2700 s, `scripts/orchestrator-harness/lane-bound.sh`) and
+`DEFAULT_PROGRESS_AGE_MS` = 2_700_000 ms (`extensions/shared/heartbeat-progress-edges.ts`). `frozen`
+**borrows that DURATION, not that measurement**: the allowance is taken because the fleet already
+declared it, not because the two agree — `--idle` resets its clock on EITHER signal, so the two
+instruments CAN disagree (the consequence is stated below), and `frozen` is not a licence to kill.
 
-⛔ **NOT `LANE_REAP_LIVE_MIN`, AND NOT THE WALL.** This paragraph once said the 45 min was
-`LANE_REAP_LIVE_MIN`'s value "chosen above `lane.sh`'s 2400 s wall limit". Every half was wrong,
-and the file contradicted itself: `LANE_REAP_LIVE_MIN` defaults to **125 min** (stated correctly in
-§11.3) and the lane's wall is `LANE_BACKSTOP_S` = **7200 s** (`spawn-gate.sh:1480`, consumed as the
-default in `lane.sh`'s `run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"` call) — so the number
-was described as sitting above a bound it actually sat 75 min below (45 vs 120). The source of the
-45 min is the progress allowance, because that is the bound that asks the same question.
+**It is NOT `LANE_REAP_LIVE_MIN`** (125 min, `agent-infra#2888`), and an earlier revision of this
+paragraph said it was. That window is decided on log **mtime alone**, so it must sit *above* the 2 h
+wall backstop or a live lane inside one silent tool call reads as dead. This axis is decided on CPU as
+well, so its analogue is the **progress** bound; re-pointing it at 125 min would make `frozen`
+unreachable on exactly the wedge class it exists to name. **And it sits below the wall clock on
+purpose:** `--wall` (`LANE_BACKSTOP_S` = 7200 s) is a BACKSTOP, and since `agent-infra#2888` the
+progress bound is PRIMARY — it must fire first, otherwise the wall pre-empts it and a lane that is
+still working is killed by elapsed time, which is the measured defect #2888 fixes. (That earlier
+revision called this ordering a defect and cited stale literals — `lane.sh`'s `3300`, a `--wall`
+default of `3300`, and a 1200 s `--idle` bound. `lane.sh` now passes
+`run_agent "${LANE_TIMEOUT:-$LANE_BACKSTOP_S}"`.)
 
 **A NEGATIVE DELTA IS A BROKEN READING, NOT A FLAT ONE.** A stable subtree cannot *lose* CPU, so a
 negative delta means one of the two reads was incomplete (a child exited between the samples, a
@@ -1678,6 +1694,11 @@ truncated read, a root row that vanished mid-stream). It ABSTAINS (`no-progress-
 the identical rule `lane-reap.sh` states for its own two-sample CPU gate. Measured with real `ps`: a
 silent tool loop spawning short-lived CPU children read -200 cs on 2 of 5 trials; read as "flat", that
 freezes a lane that is working.
+⛔ **THE SAME RULE COVERS THE LOG AGE.** `age_ms < 0` is a broken reading — the acquisition path
+clamps it to `max(0, …)`, so only a caller-supplied `--log-census` row can carry one — and it abstains
+as `log-age-unreadable` rather than being read as "less than the freeze window", which published
+`working/within-window` for a parked lane whose freeze check could then never fire.
+
 
 **Stated boundary, not hidden:** `lane-bound.sh` requires TWO CONSECUTIVE CONFIRMING samples before it
 will KILL; this axis decides `frozen` on one sample pair plus the mtime age. The two signals therefore
@@ -1689,6 +1710,16 @@ half of the evidence — nothing written for the full 45-minute window — is it
 sample. An unparseable `time=` row anywhere inside the subtree abstains the WHOLE total
 (`subtree_cpu_cs` → `None`) rather than shrinking it, because a smaller total is how a busy tree reads
 flat.
+
+⛔ **AND THE CONSEQUENCE OF THAT ASYMMETRY, SAID PLAINLY — the two instruments can DISAGREE.**
+`lane-bound.sh` resets its own no-progress clock on **EITHER** signal (`_lb_dbytes > 0 ||
+_lb_dcpu > TOL_CS`), so a lane whose CPU advanced 10 minutes ago is still *progressing* to the
+supervisor for another ~35 minutes; this axis sees a 50-minute-old log, a flat 30 s CPU delta, and
+answers `frozen`. **That is not a defect in either tool — they measure different spans — but it does
+mean `frozen` is NOT a licence to kill.** Anyone wiring a kill path to it must first close this gap
+(by sampling CPU across `LOG_FREEZE_MS` rather than `LOG_WINDOW_MS`), or they will kill a lane the
+supervisor still considers alive. `frozen` is a diagnosis for a human and for the re-dispatch
+question, and it is the same reason the state is not named `dead`.
 
 ### 13.4 The verdict the supervisor already writes
 
@@ -1710,18 +1741,73 @@ would let a future producer's new spelling decide a state this module has never 
 fired*, and it puts the child's **real exit status** in `rc=` on the same line. Measured:
 `lane-bound.sh run --log L -- sh -c 'exit 7'` emits `verdict=finished … rc=7` — a **crashed** lane.
 Reading that as `finished` is a false PASS over lost work: nobody re-dispatches it. So `finished`
-requires `rc` ∈ {`0`, `na`} (`na` is `watch` mode's shape: the supervised pid's status is not the
-bound's to report); a non-zero numeric `rc` publishes **`no-verdict`** (`bound-finished-rc:<rc>`), and
-a verdict whose `rc=` is missing or unparseable **abstains** (`finished-rc-unreadable`) rather than
+requires `rc=0`, a non-zero numeric `rc` publishes **`no-verdict`** (`bound-finished-rc:<rc>`), and a
+verdict whose `rc=` is missing or unparseable **abstains** (`finished-rc-unreadable`) rather than
 assuming success.
+
+⛔ **`rc=na` IS NOT COMPLETION EVIDENCE — IT IS THE *ABSENCE* OF EXIT-STATUS EVIDENCE, AND IT MUST BE
+CORROBORATED.** `lane-bound.sh` sets `V_RC=na` **unconditionally** in `watch` mode (its own
+`V_RC=na` assignment), and `watch` is the mode `spawn-gate.sh`'s `run_agent` uses for **every**
+lane/fixer/worker; `run` mode — the only one that puts the child's real status on the bound line —
+is never used by the fleet. In `watch` mode a lane that **completed** and a lane that **crashed / was
+OOM-killed / was killed by the completion watchdog's 15 s TERM→KILL** write the *identical*
+`verdict=finished rc=na`. Accepting `na` on its own therefore makes the `rc` conjunct **inert for the
+axis's entire production population** and publishes `finished` for a crashed lane.
+
+The real status *is* in the same log, one line later, from the caller:
+`[timeout] agent pid=<pid> … rc=<n>` (`spawn-gate.sh`'s launcher line). `na` is therefore corroborated against
+that line (`parse_runner_line` → `LogRead.runner_rc`):
+
+| bound line | launcher line (`[timeout] agent pid=<same pid> … rc=<n>`) | result |
+|---|---|---|
+| `rc=0` | `rc=0`, or **absent** | `finished` — `run` mode's own success witness (nothing contradicts it) |
+| `rc=0` | `rc=<non-zero>` | **`no-verdict`** (`bound-finished-runner-rc:<n>`) — the CALLER reaped the child and says it did not complete, so the two lines disagree and **completion is not established**. `rc=0` reaches this row only from `run` mode (production is `watch`, where `V_RC=na`), a hand-edited `$log.lanebound`, or a foreign producer — exactly the population where a disagreement must resolve fail-closed |
+| `rc=na` | `rc=0` | `finished` — corroborated completion |
+| `rc=na` | `rc=<non-zero>` | **`no-verdict`** (`bound-finished-runner-rc:<n>`) — the bound fired nothing, yet the child did NOT complete |
+| `rc=na` | **absent** | **`unknown`** (`finished-rc-uncorroborated`) — an abstention, never an assumed success |
+| `rc=na` | **present, but naming another incarnation** | **`unknown`** — the witness is not this lane's (`runner-rc-unbound` in `detail`) |
+| `rc=na` | **present, but its `pid=` is unusable** (`0x1f`, `?`, empty, over-long) | **`unknown`** — a line EXISTS but names no incarnation (`runner-pid-unreadable` in `detail`), and it is never adopted |
+| `rc=na` | **a `[timeout] agent` line with NO `pid=` token at all** (a truncated or garbled write) | **not a launcher report** — it is skipped, so an earlier readable line still corroborates; it never shadows the witness and never claims a pid token existed |
+| `rc=na` | the COMPLETION WATCHDOG's line — `[task] sub-agent (pid N) completed but did not exit within 15s — killing (completion watchdog)` (`extensions/builtin-tools/index.ts`) | **absent to this parser, for a different reason**: it carries no `[timeout] agent` marker at all, so it is never a candidate. (An earlier revision of this row quoted that line with a `[timeout] agent` prefix — a shape **no producer writes** — and attributed its skip to the missing `pid=`, which is the wrong guard) |
+| `rc=na` | present but its `rc` is **unreadable** (not a 1–3 digit status, e.g. `0x0`, `exit:0`, a runaway token) | **`unknown`** (`finished-rc-uncorroborated`, and `detail` names `runner-rc-unreadable`) — an unreadable status is not a negative fact, and it is **not** the same fact as an absent line |
+| `rc=7` | (not consulted) | **`no-verdict`** (`bound-finished-rc:7`) |
+| `rc=` **present but unreadable** (`0x0`, a runaway token, …) | (not consulted) | **`unknown`** (`finished-rc-unreadable`, `detail` says the `rc=` was **PRESENT and UNREADABLE**) |
+| **no `rc=` at all** | (not consulted) | **`unknown`** (`finished-rc-unreadable`, `detail` says no readable `rc=` was **supplied**) |
+
+⛔ **THE LAUNCHER LINE IS CONSULTED FOR EVERY ACCEPTED `rc=`, NOT ONLY `na`.** An earlier revision
+left this table saying `(not consulted)` for `rc=0`, while the `no-verdict` row above it said a
+non-zero `rc=` "**on the bound line or on the launcher line**" is `no-verdict`. The two rules differ
+exactly when the bound line says `rc=0` and the caller's own line says otherwise, and the code
+implemented the narrower one — measured: `LogRead(verdict="finished", rc="0", runner_rc="7")`
+returned `finished`, a false PASS of precisely the class this axis exists to remove. Both the code
+and this row now follow the fail-closed reading, and T37 pins the disagreement.
 
 `test-gates.sh` already uses `NO-VERDICT` for exactly this shape (a review that ended and produced no
 usable verdict), so `no-verdict` reuses that name rather than inventing a parallel one.
+
+**The launcher line is read for EVERY readable log, not only for `rc=na`.** That restriction was a real
+false negative for the population that has **no bound at all**: `merge-one.sh`'s reviewer run is its own
+plain sleep watchdog which never invokes `lane-bound.sh` (that file says so itself), so it writes
+`[timeout] agent … rc=<n>` and **no** `[lane-bound] VERDICT` line — and `merge-one.sh` is named in this
+axis's population (§13's first paragraph). Under the `rc=na`-only gate that witness was discarded, and
+a reviewer run that had finished sat there as `no-verdict` whose `detail` asserted *"the process ended
+and told us nothing"* over a log that plainly said `rc=0`. It now reports what the launcher said, e.g.
+`… (the process ended and wrote NO bound verdict; the launcher reported rc=0 — so it did NOT tell us
+nothing, but completion stays undecidable without a bound verdict)`. ⛔ **The state stays `no-verdict`:**
+without a bound verdict there is no assertion that the bound fired nothing, so a launcher `rc=0` is
+EVIDENCE, never a completion — promoting it to `finished` is a separate claim this axis does not make.
 
 ⛔ **THE LAST STATUS LINE WINS, EVEN WHEN ITS TOKEN IS UNRECOGNISED.** Keeping the last *recognised*
 verdict would adopt a STALE earlier one when a future producer appends `verdict=needs-review` — read
 as `finished`, which is the false-PASS class this axis exists to remove. An unrecognised final token
 is `("", None)` = no verdict, never "the previous one".
+
+⛔ **AND THE *LINE* IS LOCATED, NOT THE TOKEN.** The rule above is only true if the parser finds the
+last `[lane-bound] VERDICT` **marker**; if it instead finds the last *token-matching* line, a final line
+whose token it cannot match — uppercase, empty, or spaced (`verdict = stalled`) — simply does not exist,
+and an earlier `finished` is silently returned. Measured before the fix: all three shapes returned
+`('finished', '0')`. `parse_bound_line` and `parse_bound_pid` share ONE locator (`_last_bound_line`),
+so the two parsers cannot disagree about which line is "the line".
 
 **⛔ A VERDICT MUST NAME THE INCARNATION IT DESCRIBES.** The lane log is **appended to**
 across dispatches — `lane.sh` writes it with `tee -a` / `>>` and nothing truncates or
@@ -1737,10 +1823,10 @@ is **this** incarnation:
 
 | the line's `pid=` | binding | result |
 |---|---|---|
-| equals the queried pid | verified | the verdict is adopted |
-| inside the queried pid's tree | verified (the ppid chain is walked) | adopted |
+| equals the queried pid | **adopted by PID EQUALITY — this is NOT an incarnation fence** | the verdict is adopted; a RECYCLED pid can therefore carry a previous dispatch's verdict (see the named residual under this table) |
+| inside the queried pid's tree | verified (the ppid chain is walked) — **only while that tree is LIVE**; after it exits the chain is unreadable, so a genuine descendant degrades to `unbound-bound-verdict` → `no-verdict` (an abstention, never a false PASS) | adopted |
 | a live pid outside that tree | `stale-bound-verdict` | **dropped** → `no-verdict` |
-| a pid that cannot be resolved | `unbound-bound-verdict` | **dropped** → `no-verdict` |
+| a pid that cannot be resolved, **or the `?` "present but unusable" token** | `unbound-bound-verdict` | **dropped** → `no-verdict` |
 | absent from the line | `bound-verdict-without-pid` | adopted, and said so |
 | (the same five rules apply to `--verdict-file`, and to column 11 of `--log-census`) | | |
 
@@ -1750,6 +1836,23 @@ supervised — not necessarily the tree root a caller asks about — which is wh
 `no-verdict`, never `finished` and never `dead`: an unverifiable binding over-refuses,
 which is the only acceptable direction for this state. §13.6 states the caller-side
 consequence: pass the pid `lane-bound.sh` itself supervised when you have it.
+
+⛔ **NAMED RESIDUAL — PID EQUALITY IS NOT AN INCARNATION FENCE.** The first row above is
+the WEAKEST arm and it is the one that survives a lane's exit (`_pid_within` returns `None`
+once the tree is gone, so only `child == root` remains). It proves the verdict came from a
+process with that PID NUMBER, not from THIS dispatch: `lane.sh` appends
+(`logs/lane-$N.log`, `tee -a`, never truncated), so a re-dispatched lane leaves the
+previous dispatch's `VERDICT … pid=` in the tail, and if the new dispatch draws a recycled
+pid and is killed hard (no bound line, no launcher line — the completion-watchdog shape
+§13.1 ranks as mechanism 3) the lane publishes **`finished` with work lost and nobody
+re-dispatching it**. The surface already holds the one fact that would settle it — the
+caller's `--start-seconds` — but it is used only to fence the LIVE `probe`, never the bound
+line, and no producer writes an incarnation or a start time onto that line. The launcher's
+`pid=`-carrying `[timeout] agent` line does not help: it carries the SAME bare pid and is
+consumed only for `runner_rc`. The real fix is an incarnation id (or `pid_start=`) on the
+produced line, bound together with the pid — a producer change, filed separately rather
+than half-built here. Until then, read this row as *"the same pid number reported it"*, never
+as *"this dispatch reported it"*.
 
 The verdict token and the `rc=` are parsed **separately** — the token alone, then that line's head
 (everything before ` log=`) scanned for `rc=` with the LAST occurrence winning — because one regex
@@ -1774,11 +1877,13 @@ by T36 and by the mutation that degenerates its `if ev.log_read is not None:` gu
 is checked first — that would be the #1777 B7 defect (an added axis masking other evidence) rebuilt on
 a new axis.
 
-⛔ **AN ABSTENTION IS EVIDENCE TOO** (T50). `ps_ok=False` / `store_ok=False` are the session axis
+⛔ **AN ABSTENTION IS EVIDENCE TOO** (T55). `ps_ok=False` / `store_ok=False` are the session axis
 answering `unknown/ps-unreadable` / `unknown/store-unreadable`, so a log read resolving over them
 discards that answer — and when the log read is `frozen` it does worse than mask: it **convicts** a
 lane on evidence it threw away. The guard listed only *positive* session fields once; the two
-failed-read flags are in it for that reason.
+failed-read flags are in it for that reason. **T55, not T50**: the #3404 train re-landed this guard
+into the code without its test, and the log axis's own T50 is the `LOG_STATES` vocabulary pin — so
+the guard was unpinned and deleting it left the suite at `PASS/FAIL=0`. T55 is the re-landed test.
 
 Considered and rejected: a new `tools/fleet/log_liveness.py` (that **is** the second verdict function
 the rule forbids), and widening `lane_liveness.py`'s population (§8/§11) to log lanes (its population
@@ -1801,13 +1906,37 @@ liveness.py --log-census  < pid\tlog\tsize_delta\tcpu_delta_cs\tverdict\talive\t
 `--start-seconds` is the process's start **epoch** (the same field the store's `pidStartSeconds`
 carries), and it is not optional in practice: the identity probe is the FENCED `probe` subcommand, so
 without a start time every live lane reads `unknown/process-identity-unreadable` (rc 3) rather than a
-presence-only guess. `--no-sample` skips the 30 s second reading (deltas then stay `None`, so a fresh
+presence-only guess. **Pass the pid `lane-bound.sh` ITSELF supervised when you have it** (§13.4): in
+`run` mode that is the child it supervised, in `watch` mode the `--pid` you gave it — not necessarily
+the tree root a caller asks about. Passing anything else does not produce a false answer, it makes the
+binding over-refuse (`no-verdict`), which is the only acceptable direction for this state.
+`--no-sample` skips the 30 s second reading (deltas then stay `None`, so a fresh
 call abstains instead of claiming a state), and `--window-ms` below 1 is REFUSED: a zero-length window
 collapses both readings into one instant, making both signals trivially flat, so a live working lane
 would read `frozen`.
 
+⛔ **THE CPU TOLERANCE IS A RATE, AND IT SCALES WITH THE WINDOW (T56).** `LOG_CPU_TOL_CS` is quoted
+for a `LOG_WINDOW_MS` span, so applying the raw constant at a SHORTER window silently raised the bar:
+measured on one CPU burner at one instant, `--window-ms 30000` read `working progress:cpu cpu+2891cs`
+while `--window-ms 50` read `frozen no-progress … cpu_delta_cs=9` — a live, working lane convicted at
+every window under ~10 s (the break-even is `window <= 0.1 / f` seconds, i.e. 10 s for a lane at 1 %
+of a core). The tolerance is now `max(1, cpu_tol_cs * window_ms // LOG_WINDOW_MS)`, which restores the
+rate the constant states; a genuinely flat lane still reads `frozen` at every window. `window_ms=` in
+the detail is the span **actually sampled** (the tree walk plus the sleep), not the number requested.
+
+⛔ **`--log-census` REFUSES every per-lane flag rather than ignoring it** (`--log`, `--pid`,
+`--verdict-file`, `--transcript`, `--start-seconds`, `--json`, `--no-sample`, `--window-ms`, exit 2). Accepting and
+dropping one is not harmless: a `--verdict-file` that makes the single-lane arm say `finished` was
+ignored, so the census published `no-verdict` for that lane and exited 0 — the §13.1 false-negative
+class with no signal that a flag had been discarded.
+
 `--log-census` takes the deltas **from the caller** (`?` = unread, which abstains) because a census
-that judged 76 lanes must not sleep 30 s per lane — the caller owns the two samples. Both shapes
+that judged 76 lanes must not sleep 30 s per lane — the caller owns the two samples. Because the
+census therefore never measures a sample span of its own, its rows publish `window_ms=?` (the same
+"NOT READ" convention as every other unread cell) rather than the module default, and a `?` CPU cell
+is reported as `cpu_unreadable=1` — never as `0` beside the `?` that contradicts it. It also takes
+**no** `--window-ms`: a flag that cannot change a delta the census does not take is refused with the
+other per-lane flags. Both shapes
 publish the same states from the same function; there is no state decided at the seam that
 `log_lane_verdict` does not decide.
 
@@ -1818,17 +1947,42 @@ hand the token over and have a previous dispatch's outcome published on the surf
 fleet reader's home. A row whose `verdict_pid` does not resolve inside the queried tree is dropped to
 `no-verdict` exactly as in `gather_log_lane`.
 
-Regression contract: `python3 tools/fleet/liveness.test.py` (51 tests) and
-`python3 tools/fleet/liveness.test.py --mutations` (72 mutations, each of which must make its paired
+⛔ **"COLUMN ABSENT" AND "COLUMN PRESENT BUT UNREADABLE" ARE DIFFERENT FACTS.** The adopting arm is
+reserved for a **10-column** row; a row that *has* column 11 but whose value is unusable — `?` (the
+census's own documented "NOT READ" token), a non-numeric token, or an over-long one — is dropped, not
+adopted. Collapsing the two published a previous dispatch's `finished` while `gather_log_lane` dropped
+the identical token.
+
+⛔ **AN IMPLAUSIBLE NUMBER IS NOT A READING.** The census's numeric columns (`size_delta`,
+`cpu_delta_cs`, `age_ms`, `bytes`) are bounded at decode (10 digits). `int()` accepts a 40-digit
+cell happily, so an out-of-range value used to become a STATE — `size_delta=9…` published
+`working/progress:bytes`, a 40-digit `age_ms` published `frozen/no-progress` — and was interpolated
+whole. An implausible value now reads as NOT READ and abstains, exactly like an unread one.
+
+⛔ **AN UNREADABLE `rc` IS NOT A NEGATIVE FACT — ON EVERY SURFACE, FROM ONE DOOR.** The `rc` token is
+an exit *status*: a 1–10 digit number, or `na`. Anything else (`0x0`, `exit:0`, a non-ASCII digit, or a
+runaway token) is **not read**, and `rc` becomes `None` → `finished-rc-unreadable` → `unknown`. The
+bound line's own `rc=` applies this in its parser (a bounded `[0-9]{1,10}|na` match), and
+`log_lane_verdict` applies it again for every `LogRead` a caller builds directly — which is what covers
+the census's 10th column, where an unreadable token used to publish
+`no-verdict/bound-finished-rc:0x0`, the positive claim "the child did NOT complete" from nothing
+readable. The allow-list is deliberately **not** re-implemented at the census seam: a second copy would
+be a second definition of one rule (and would mask its own mutation, since either copy alone produces
+the same observable state). A runaway token was also interpolated whole into `reason`; it is not read,
+so it never is.
+
+⛔ **A CENSUS `rc=na` ROW IS `unknown`, NOT `finished`.** The census carries no launcher line, so it has
+no corroboration for `na` (see §13.4) — and an uncorroborated `na` cannot witness completion.
+
+Regression contract: `python3 tools/fleet/liveness.test.py` (57 tests) and
+`python3 tools/fleet/liveness.test.py --mutations` (110 mutations, each of which must make its paired
 test RED). T32–T38 are the log axis's VERDICT; T39–T42 are its ACQUISITION (`_cpu_time_cs` /
 `subtree_cpu_cs` over both platforms' `ps` spellings, `gather_log_lane`'s every failure path, and the
-`--log-census` decoder); T43–T44 are its BINDING (an appended log line left by an EARLIER dispatch is
-not this lane's, and a stale `--verdict-file` cannot outrank a fresh one); T45–T46 are the drop-reason
-and `--log-census` binding rules; T47–T49 are broken readings and fact-naming (a SHRINKING log is not
-`no-output`, the census survives the `?` it prints itself, and an abstention names the FACT rather than
-only its class); T50 is the abstention-masking refusal; and T51 is the `/proc` reader's own ABSTENTION
-— a malformed row abstains the whole read rather than being re-parented to `0` (its `ps` twin is T39).
-Their paired mutations re-introduce the exact pre-fix behaviours — the
+`--log-census` decoder); T43–T54 are the 2026-11-04 binding / corroboration / abstention rounds;
+T55 is the masking-abstention guard re-landed after the #3404 train merge dropped its test;
+T56 is the CPU tolerance pinned as a RATE across `--window-ms` (a short window froze a working
+lane); T57 pins every conjunct of the masking refusal ALONE, because T36 exercised them only in
+aggregate and eight of the ten could be deleted with the suite still green. Their paired mutations re-introduce the exact pre-fix behaviours — the
 dropped progress veto, the exited process falling into the freeze ladder, the missing window, the
 absent log as a death witness, the log axis masking a session query, every bound verdict reading
 `finished`, the dropped `rc` conjunct, the `or`-conjunct turned back into `and`, the dropped

@@ -164,6 +164,7 @@ run_verify() {
 expected_farm_rows() {
   local name dest src rest rel base line req
   for spec in "fleet_srcs||scripts|required" \
+              "mcp_harness_srcs||scripts/orchestrator-harness|required" \
               "merge_gate_srcs||scripts|required" \
               "lib_srcs|lib|scripts/lib|required" \
               "fleet_tools|fleet|tools/fleet|required" \
