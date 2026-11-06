@@ -1054,7 +1054,12 @@ if sys.argv[2] == "compose":
     # model definition from that baseline (`provider-composer.js:117-123`). So on the DEFAULT gateway such a definition is
     # NOT a dropped catalog — measured, `pi -p` reached the gateway (404) — while a custom gateway\x27s empty catalog makes
     # the throw real (`Unknown provider`). The warning must not fire on the first shape: it says "dropped".
-    _gw = (_body.get("baseUrl") or "")
+    # \u26d4 THE VENDOR STRIPS A TRAILING `/v1` BEFORE IT NORMALIZES (round 35, P1, measured): `configureRadiusProviders`
+    # passes `config.baseUrl.replace(/\/v1\/?$/u, "")` (`model-runtime.js:130`) and only then does `radiusProvider` decide
+    # whether the baseline catalog applies. A gateway written `https://radius.pi.dev/v1` \u2014 the spelling every
+    # OpenAI-compatible baseUrl uses \u2014 is therefore the DEFAULT one, and the earlier test called it custom: measured,
+    # `pi -p` reached the gateway (401) while this gate refused 82 saying the provider was deleted.
+    _gw = re.sub(r"/v1/?$", "", _body.get("baseUrl") or "")
     _gw = _gw if re.match(r"^https?://", _gw, re.I) else "https://" + _gw
     _grant_default = _grant and _gw.rstrip("/") == "https://radius.pi.dev"
     _suffix = ":oauth" if _body.get("oauth") else ""
@@ -1882,6 +1887,20 @@ key_gate_box_default_assert() {
   drop="$(printf '%s\n' "$pcomp" | grep -v '^radius-grant$' | head -1)"
   # ⛔ see the lane site: a granted pin whose model definition cannot compose is a certain death (pi deletes the provider)
   # and NO credential answers it (round 34, P1, measured). Refused here too, because the pin path has its own code.
+  # ⛔ AND THE PIN PATH NEEDS THE UNSHIPPED-PROVIDER RULE TOO (round 35, P1, measured): it ignored `no-api`/`no-baseurl`
+  # entirely, so `--probe --box-default` printed `check=ok var=MYV` for a `myprov` pin whose bare `pi -p` answers
+  # `Error: Unknown provider "myprov".` (a DELETED provider) or `No API key found for the selected model.` A provider pi
+  # does not ship has no base to compose from, so the model definition takes it with it.
+  if [ -n "$drop" ] && [ -z "$(key_gate_builtin "$prov")" ] && [ "$drop" != "oauth-no-baseurl" ] && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s box_default=%s provider=%s settings_json=%s - `%s` is not a provider pi ships, so the composer has no base model to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s"`, and a bare `pi -p` on this pin answers `No API key found for the selected model.` No credential answers that; give the model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
+      "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov" "$dm" "$prov"
+    return "$KEY_GATE_REFUSED"
+  fi
+  if [ "$drop" = "oauth-no-baseurl" ] && [ -z "$(key_gate_builtin "$prov")" ] && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=oauth-no-baseurl model=%s box_default=%s provider=%s settings_json=%s - this provider sets `oauth` with no `baseUrl`, which makes the pi composer THROW, and `%s` is not a provider pi ships, so there is no built-in base to fall back on: `recomposeProvider` DELETES the provider (measured: `Error: Unknown provider "%s"`). Add a `baseUrl` to the provider body or drop it (agent-infra#3443)\n' \
+      "$label" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ -n "$pgrant" ] && [ -n "$drop" ] && [ "$quiet" != 1 ]; then
     printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s box_default=%s provider=%s settings_json=%s - the pi composer cannot build this provider\x27s model definition (%s) and, because a Radius grant replaces the built-in catalog with a gateway one whose models arrive only after a refresh, `recomposeProvider` DELETES the provider: measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` No credential answers that, so the pin is unusable until the definition carries its own `api` (and `baseUrl`) (agent-infra#3443)\n' \
       "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$drop" "$prov" "$dm" "$prov"
@@ -2200,6 +2219,16 @@ key_gate_assert_main() {
   # RADIUS_API_KEY (grant + RADIUS_API_KEY -> 401; grant + DEEPSEEK_API_KEY -> `No API key found`). So the template keeps
   # its meaning when it exists, RADIUS_API_KEY answers when it does not (the built-in arm below), and the provider's OWN
   # variable is never the answer for a granted provider.
+  # \u26d4 AND `oauth` WITHOUT A `baseUrl` DELETES AN UNSHIPPED PROVIDER TOO (round 35, P1, measured): the composer throws on
+  # that shape, and with no built-in base to fall back on the provider is gone \u2014 measured `Error: Unknown provider` \u2014 so
+  # the cannot-say the shipped-provider half earns is a false answer here.
+  if [ "$drop" = "oauth-no-baseurl" ] && [ -z "$(key_gate_builtin "$KEY_GATE_PROVIDER")" ]; then
+    KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    KEY_GATE_REASON="models-json-provider-dropped"
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=oauth-no-baseurl model=%s provider=%s var=%s models_json=%s - this provider sets `oauth` with no `baseUrl`, which makes the pi composer THROW, and `%s` is not a provider pi ships, so there is no built-in base to fall back on: `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s` answers `Error: Unknown provider "%s".` No credential answers that; add a `baseUrl` to the provider body (and an `api`/`baseUrl` to each model) or drop the provider (agent-infra#3443)\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER" "$KEY_GATE_PROVIDER" "$KEY_GATE_PROVIDER"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ "$drop" = "oauth-no-baseurl" ] && [ -n "$names" ]; then
     printf '[key-gate] %s check=warn reason=models-json-api-key-discarded why=oauth-no-baseurl provider=%s model=%s var=%s home=%s agent_dir=%s — a models.json for this provider sets `oauth` with no `baseUrl`, and the pi composer THROWS on that (`provider-composer.js:154`), so the provider apiKey override is discarded and $%s is NOT the variable pi resolves here; the answer below comes from the store and the provider built-in variable instead
 ' \
@@ -2457,17 +2486,28 @@ key_gate_assert_main() {
       # warned about unconditionally. And `known:` (a vendor provider with no env-var entry, `amazon-bedrock`) is a
       # provider pi ships, so its model IS composed and it must not be reported as dropped.
       bkind="$(key_gate_builtin "$KEY_GATE_PROVIDER")"
+      # the field-level diagnosis, shared by the warn and the refusal
+      case "$drop" in
+        no-api:*) drop_why='a model definition here declares neither `api` nor `baseUrl`, and the provider body declares neither either' ;;
+        *) drop_why='a model definition here declares `api` but no `baseUrl`, and the provider body declares no `baseUrl` either' ;;
+      esac
       case "$drop" in
         *:oauth) warn_drop=1 ;;
-        *) if [ -z "$bkind" ]; then warn_drop=1; else warn_drop=0; fi ;;
+        # \u26d4 A PROVIDER pi DOES NOT SHIP IS DELETED, NOT WARNED ABOUT (round 35, P1, measured): the warn-only policy
+        # assumed this gate cannot know what pi does with a provider it does not recognise, but it can \u2014 there is no
+        # base to compose from, so `recomposeProvider` DELETES it. Measured on a `myprov` fixture: `pi -p --provider
+        # myprov --model m1` answers `Error: Unknown provider "myprov".` while this gate printed the warning and then
+        # `check=ok var=MYV`. No credential can rescue that box, so the answer is a refusal about the FILE.
+        *) if [ -z "$bkind" ]; then
+             KEY_GATE_VAR="${KEY_GATE_VAR:-<none>}"
+             KEY_GATE_REASON="models-json-provider-dropped"
+             printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s provider=%s var=%s models_json=%s - `%s` is not a provider pi ships, %s, so there is no base model for the composer to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` NO credential can rescue it, so no environment variable is the question. Give this model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
+               "$label" "$drop" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$drop_why" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER"
+             return "$KEY_GATE_REFUSED"
+           fi
+           warn_drop=0 ;;
       esac
       if [ "$warn_drop" = "1" ]; then
-        case "$drop" in
-          no-api:*)
-            drop_why='a model definition here declares neither `api` nor `baseUrl`, and the provider body declares neither either' ;;
-          *)
-            drop_why='a model definition here declares `api` but no `baseUrl`, and the provider body declares no `baseUrl` either' ;;
-        esac
         printf '[key-gate] %s check=warn reason=models-json-provider-dropped why=%s provider=%s model=%s var=%s models_json=%s — %s, which makes the pi composer THROW; when the provider is not one pi ships that DELETES the provider (measured: `pi -p --provider <custom> --model <id>` -> `Unknown provider`), so this credential assertion names a variable pi may never consult — check `pi --list-models`. A provider pi ships composes both from its own model instead, EXCEPT when `oauth` is set: pi then swaps the built-in catalog for a gateway provider whose models arrive only after a refresh, so the same throw deletes the config there too (measured: `Unknown provider "deepseek"`)\n' \
           "$label" "$drop" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${KEY_GATE_VAR:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "$drop_why"
       fi ;;

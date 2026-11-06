@@ -81,7 +81,9 @@ gets `radiusProvider`, so with NO `apiKey` declared the credential is `RADIUS_AP
 template still wins - `RADIUS_API_KEY` does not substitute for it. A `models` entry with no `api` does NOT drop a granted
 provider on the default gateway (pi composes it from `RADIUS_MODELS`, measured: it reached the gateway), only on a custom one — where pi answers
 `Error: Unknown provider` and no credential can rescue it, so that shape is REFUSED (`reason=models-json-provider-dropped`)
-with a model-level remedy instead of a variable to export. Such a provider also has an oauth handler, so the store
+with a model-level remedy instead of a variable to export. The vendor strips a trailing `/v1` before normalizing
+the gateway, so `https://radius.pi.dev/v1` IS the default one (measured: pi reaches it); and an UNSHIPPED provider
+with an unbuildable definition is refused too, because pi deletes it (`Error: Unknown provider`). Such a provider also has an oauth handler, so the store
 refusal below never applies to it.
 ⛔ **AND ONE STORE SHAPE IS REFUSED, NOT SKIPPED** (measured): an `oauth` entry in `auth.json` for a provider `pi` ships NO
 oauth handler for. The handler set is static — `anthropic github-copilot kimi-coding meta openai-codex openai openrouter radius xai`

@@ -597,6 +597,16 @@ HRGM="$(mkhome radius_grant_models "$RG_MJSON")"
 # a CUSTOM gateway: the grant's baseline catalog is empty, so an `api`-less model definition deletes the provider
 RG_CUSTOM_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example/v1","models":[{"id":"ZZDIFF"}]}}}'
 OUT="$(run_gate "$HRGM" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+# ⛔ AND THE VENDOR STRIPS A TRAILING `/v1` BEFORE IT NORMALIZES (round 35, P1, measured):
+# `configureRadiusProviders` passes `config.baseUrl.replace(/\/v1\/?$/u, "")` (`model-runtime.js:130`), so a gateway
+# written `https://radius.pi.dev/v1` is the DEFAULT one and its baseline catalog applies — measured, `pi -p` reached
+# the gateway (401). A test that only stripped trailing slashes called it custom and refused 82 with "the provider was
+# deleted" over a box that runs.
+RG_V1_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
+HRGV1="$(mkhome radius_grant_v1 "$RG_V1_JSON")"
+OUT="$(run_gate "$HRGV1" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y18 a \`/v1\` gateway spelling is the DEFAULT gateway, so the box is not refused (rc=${RC:-none})"
+hasnt "$OUT" "models-json-provider-dropped" "3z15y19 …and never reported as a deleted provider"
 eqv "${RC:-none}" "0" "3z15y15 a granted provider with a model definition and no api is NOT refused on RADIUS_API_KEY (rc=${RC:-none})"
 has "$OUT" "check=ok var=RADIUS_API_KEY" "3z15y16 …the answer stays the grant's variable"
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
@@ -677,11 +687,16 @@ hasnt "$(printf '%s\n' "$OUT" | grep -F 'REFUSED')" "var=MYK" \
 # warn is therefore conditional, and the built-in half is the arm that keeps it from crying wolf.
 HY2="$(mkhome dropped_custom '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
 OUT="$(run_gate "$HY2" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
-ck "3y8 an unbuildable model definition refuses nothing (rc=$(rc_of "$OUT"))" \
-   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
-has "$OUT" "check=warn reason=models-json-provider-dropped why=no-api:m1" \
-    "3y9 …it warns that pi DELETES this provider"
-has "$OUT" "check=ok var=MYV" "3y10 …and the credential assertion still stands for a provider that composes"
+# ⛔ AND AN UNSHIPPED PROVIDER IS REFUSED, NOT WARNED ABOUT (round 35, P1, measured): there is no base model for the
+# composer to fall back on, so `recomposeProvider` DELETES it — measured, `pi -p --provider myprov --model m1` answers
+# `Error: Unknown provider "myprov".` — while the earlier cut warned and then printed `check=ok var=MYV`. No credential
+# can rescue that box, so the verdict is about the FILE. (3y8-3y10 pinned the opposite polarity until this round.)
+ck "3y8 an unbuildable model definition on an UNSHIPPED provider is REFUSED (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" \
+    "3y9 …with the file-level reason, because pi deletes the provider"
+hasnt "$OUT" "check=ok" "3y10 …and never a green line over a box pi cannot use"
+has "$OUT" "Unknown provider" "3y10b …quoting the sentence pi prints there"
 HY3="$(mkhome builtin_noapi '{"providers":{"deepseek":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
 OUT="$(run_gate "$HY3" MYV=sk_myv KG_PROV=deepseek KG_MODEL=m1)"
 hasnt "$OUT" "reason=models-json-provider-dropped" \
@@ -694,10 +709,18 @@ HY5="$(mkhome dropped_nobase '{"providers":{"myprov":{"apiKey":"$MYV","models":[
 OUT="$(run_gate "$HY5" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
 has "$OUT" "reason=models-json-provider-dropped why=no-baseurl:m1" \
     "3y8b a model with \`api\` but NO \`baseUrl\` is reported as that, not as \"declares neither\""
-has "$OUT" "declares \`api\` but no \`baseUrl\`" \
-    "3y8c …and the sentence names the field that is actually missing"
 hasnt "$OUT" "declares neither \`api\` nor \`baseUrl\`" \
-    "3y8d …never the wrong description, which this document would falsify"
+    "3y8c …never the wrong description, which this document would falsify"
+# \u26d4 AND AN UNSHIPPED PROVIDER WITH `oauth` BUT NO `baseUrl` IS REFUSED, NOT "cannot-say" (round 35, P1, measured): the
+# composer throws on that shape and there is no built-in base to fall back on, so the provider is DELETED \u2014 measured
+# `Error: Unknown provider "myprov"`. The shipped-provider half of this arm (deepseek) keeps its cannot-say, because pi
+# really does run there on the built-in variable.
+HMYL="$(mkhome dropped_oauth_myprov '{"providers":{"myprov":{"apiKey":"$MYV","oauth":"radius"}}}')"
+OUT="$(run_gate "$HMYL" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3y18 an UNSHIPPED provider with oauth and no baseUrl is REFUSED (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped why=oauth-no-baseurl" \
+    "3y18b \u2026naming the shape, because the remedy is the baseUrl"
 # ⛔ AN `oauth` PROVIDER'S BASE IS REPLACED, SO A VENDOR BUILT-IN IS **NOT** AUTOMATICALLY UNAFFECTED (round 29, P2,
 # measured): `configureRadiusProviders` swaps the built-in catalog for a gateway provider that is EMPTY until a refresh,
 # so `findModelDefaults` has nothing to compose from, the throw deletes the config, and `pi -p` answers `Unknown
@@ -1094,6 +1117,19 @@ OUT="$(run_box_at "$HRGMD" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
 ck "8z41 a granted PIN whose model definition cannot compose is REFUSED (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-provider-dropped" "8z42 …with the model-level reason, not a variable to export"
+# \u26d4 AND THE PIN PATH NEEDS THE UNSHIPPED-PROVIDER RULE TOO (round 35, P1, measured): it ignored `no-api`/`no-baseurl`
+# entirely, so `--probe --box-default` printed `check=ok var=MYV` for a `myprov` pin whose bare `pi -p` answers
+# `No API key found for the selected model.` / `Error: Unknown provider "myprov"`.
+HMY="$(mkset pin_myprov '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
+OUT="$(run_box_at "$HMY" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
+ck "8z43 a PIN of an UNSHIPPED provider with an unbuildable definition is REFUSED (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "8z44 \u2026with the file-level reason, because pi deletes the provider"
+HMY2="$(mkset pin_myprov_oauth '{"providers":{"myprov":{"apiKey":"$MYV","oauth":"radius"}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
+OUT="$(run_box_at "$HMY2" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
+ck "8z45 \u2026and so is one whose provider sets oauth with no baseUrl (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "why=oauth-no-baseurl" "8z46 \u2026naming that shape, so the remedy is the baseUrl"
 # A provider whose credential needs more than one value warns: the pin is NOT refused, because a false 82 on a box
 # that would run costs a lane and this gate cannot tell.
 HSB3="$(mkset boxazure ABSENT '{"defaultProvider":"azure","defaultModel":"gpt-4o"}')"
@@ -1734,6 +1770,17 @@ ck "8S4f …still refused with the provider key EXPORTED, which is the shadowing
 HOOA="$(mkset oauth_live "$ANTH_JSON" ABSENT)"
 printf '{"anthropic":{"type":"oauth","access":"a","refresh":"r"}}\n' > "$HOOA/.pi/agent/auth.json"
 OUT="$(run_gate "$HOOA" KG_PROV=anthropic KG_MODEL=claude-sonnet-4-5)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+# ⛔ EVERY HANDLER IN THE TABLE NEEDS AT LEAST ONE ARM, OR A DELETED ENTRY IS INVISIBLE (round 35, P3, measured):
+# removing `radius` from `OAUTH_PROVIDERS` left the suite GREEN while inverting polarity — a stored `oauth` entry for
+# `radius` would be refused `auth-store-oauth-unusable` although pi ships that handler (`providers/radius.js:31-34`,
+# measured: pi RAN on a stored oauth entry for `radius`). One arm per id the gate can fixture without a grant.
+for _op in radius openai; do
+  HROP="$(mkset "oauth_$_op" "{\"providers\":{\"$_op\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}" ABSENT)"
+  printf '{"%s":{"type":"oauth","access":"a","refresh":"r"}}\n' "$_op" > "$HROP/.pi/agent/auth.json"
+  OUT="$(run_gate "$HROP" KG_PROV="$_op")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+  eqv "${RC:-none}" "0" "8S4i a stored oauth entry for $_op is not refused \u2014 pi ships that handler (rc=${RC:-none})"
+  hasnt "$OUT" "auth-store-oauth-unusable" "8S4j \u2026so the no-handler reason never fires for $_op"
+done
 eqv "${RC:-none}" "0" "8S4g the same oauth shape on a HANDLER provider is not refused (rc=${RC:-<none>})"
 hasnt "$OUT" "auth-store-oauth-unusable" \
     "8S4h …and never carries the no-handler reason"
