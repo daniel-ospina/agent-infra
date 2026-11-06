@@ -924,6 +924,16 @@ done
 #   * a heading written as a list item is not detected — under-detection
 #   * a consumer that overrides MD026's `punctuation` is not modelled
 #   * non-ASCII final characters are reported (awk has no Unicode properties)
+#
+# ⛔ PORTABILITY, MEASURED: the ATX test below is TWO patterns, not
+# `/^#{1,6}([ \t]|$)/`. mawk — the `awk` on ubuntu-latest, i.e. this suite's own CI
+# runner — PANICS on the grouped `$` alternation:
+#   REcompile() - panic: values still on machine stack for ^#{1,6}([ \t]|$)
+#   (exit 100)
+# so the scan could not run at all and this gate reported `NOT a clean result` on a
+# healthy tree for EVERY pull request. The split form is byte-for-byte equivalent
+# (differentially checked against gawk over 72 hash-run/suffix cases) and both
+# awks accept it: mawk's regex compiler has no interval-expression-into-`$` path.
 # The safe set is ASCII alphanumerics plus `_` `)` `?`, a backtick, and `*`.
 # If a legitimate heading trips this, widen the set in `md026_scan` — do NOT
 # narrow the class of reported characters back into a deny-list.
@@ -955,7 +965,9 @@ md026_scan() {
 
         t = substr(line, ind + 1)
         while (t ~ /^>/) sub(/^>[ \t]?/, "", t)
-        if (t ~ /^#{1,6}([ \t]|$)/) {
+        # TWO patterns, never `/^#{1,6}([ \t]|$)/` — mawk panics on that (see the
+        # portability note in the header of this file). Equivalent, and portable.
+        if (t ~ /^#{1,6}[ \t]/ || t ~ /^#{1,6}$/) {
           sub(/^#{1,6}[ \t]*/, "", t)
           sub(/[ \t]+#+[ \t]*$/, "", t)       # closing sequence is not heading text
         } else {
