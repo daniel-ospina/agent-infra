@@ -349,10 +349,15 @@ ck "…and the raw nodename never reaches the line" $rc
 # arm: reverting that one token to `REFUSED-DISK` on a copy left the suite at 88 passed / 0 failed.
 # The stub is the ONLY way that branch runs — a `disk_admit` that REFUSES without setting
 # `DISK_ADMIT_LINE` — and `disk_box_id` is stubbed so the arm never reads this host.
-mkdir -p "$T/noname"
+mkdir -p "$T/noname" "$T/bin-fakehost"
+printf '#!/bin/sh\nprintf "cell 3,x"\n' > "$T/bin-fakehost/hostname"
+chmod +x "$T/bin-fakehost/hostname"
 cp "$WTL" "$T/noname/wt-lifecycle.sh"
 _drive_noname() { # <wt-lifecycle-copy> -> "rc=<n>" + the WT_RESULT the seam produced
-  ( cd "$REPO" && bash -c '
+  # `hostname` is a shim returning a HOSTILE id (a space and a comma), so the box arm below is decided
+  # here rather than by this host's nodename — and so a mutation that routes the id around the one
+  # sanitiser produces a value that cannot collide with the stub's.
+  ( cd "$REPO" && env PATH="$T/bin-fakehost:$PATH" bash -c '
       disk_admit() { DISK_ADMIT_LINE=""; return 77; }
       disk_box_id() { printf "cell-9"; }
       . "$1" || exit 99
@@ -367,17 +372,41 @@ case "$NOUT" in *'REFUSED-UNKNOWN(free=?'*) rc=0 ;; *) rc=1 ;; esac
 ck "…and names it REFUSED-UNKNOWN(free=?), never REFUSED-DISK, so an UNMEASURED refusal is not reported as a full disk" $rc
 case "$NOUT" in *'box=cell-9'*) rc=0 ;; *) rc=1 ;; esac
 ck "…and takes the box id from the ONE sanitiser (disk_box_id), not a private hostname read" $rc
-# NON-VACUITY, driven through the SAME runner: reverting that token to `REFUSED-DISK` on a COPY must
-# red the two arms above. The shipped file is untouched (the arm G idiom).
+# ⛔ NON-VACUITY, DRIVEN THROUGH THE SAME RUNNER — **ONE MUTATION PER ARM, AND THE COMMENT NAMES WHICH**
+# (review cycle 11, P2 — MEASURED). The first version of this proof said it red "the two arms above"
+# and drove ONE mutation, which moves only the token: the box arm stayed green under it, so a reader
+# was told a guard was protected that was not — the "comment claims a guard that does not exist"
+# class this file has already had to fix twice (cycles 9 and 10). The measured proof of that: with the
+# token reverted on a copy, the suite read 90 passed / 2 failed and the box arm was NOT among the two.
+# So there are two mutations below, each naming the ONE arm it must red, and each guarded by `cmp -s`
+# so a sed that matches nothing fails instead of passing silently. The shipped file is untouched.
+#   (i) THE TOKEN ARM. Reverting `REFUSED-UNKNOWN` to `REFUSED-DISK` moves the token and nothing else
+#   (`rc` stays 1, `box=` stays `cell-9`), so it must red the token arm — and it is NOT claimed to
+#   red the others.
 sed 's/REFUSED-UNKNOWN(free=?, need=?/REFUSED-DISK(free=?, need=?/' \
-  "$WTL" > "$T/noname/wt-lifecycle-mut.sh"
-if cmp -s "$WTL" "$T/noname/wt-lifecycle-mut.sh"; then
-  bad "G2) the mutation did not change the copy — this non-vacuity proof proves nothing (the sed matched nothing)"
+  "$WTL" > "$T/noname/wt-lifecycle-token-mut.sh"
+if cmp -s "$WTL" "$T/noname/wt-lifecycle-token-mut.sh"; then
+  bad "G2) the TOKEN mutation did not change the copy — that non-vacuity proof proves nothing (the sed matched nothing)"
 else
-  MOUT="$(_drive_noname "$T/noname/wt-lifecycle-mut.sh")"
+  MOUT="$(_drive_noname "$T/noname/wt-lifecycle-token-mut.sh")"
   case "$MOUT" in
-    *'REFUSED-UNKNOWN(free=?'*) bad "G2) the arm is VACUOUS: reverting the fallback's token to REFUSED-DISK on a copy still reads REFUSED-UNKNOWN" ;;
-    *) ok "G2) …and that arm is NON-VACUOUS: reverting the fallback's token to REFUSED-DISK on a copy IS caught" ;;
+    *'REFUSED-UNKNOWN(free=?'*) bad "G2) the TOKEN arm is VACUOUS: reverting the fallback's token to REFUSED-DISK on a copy still reads REFUSED-UNKNOWN" ;;
+    *) ok "G2) …and the TOKEN arm is non-vacuous: reverting the fallback's token to REFUSED-DISK on a copy IS caught" ;;
+  esac
+fi
+#   (ii) THE BOX ARM. Routing the id around the one sanitiser — a private `hostname -s` read, which is
+#   exactly what emitted `box=cell 3,x` before cycle 10 — must red the box arm and leave the token arm
+#   green (the token is untouched), so this arm is not resting on the first mutation either.
+sed 's|box=$(disk_box_id 2>/dev/null|box=$(hostname -s 2>/dev/null|' \
+  "$WTL" > "$T/noname/wt-lifecycle-box-mut.sh"
+if cmp -s "$WTL" "$T/noname/wt-lifecycle-box-mut.sh"; then
+  bad "G2) the BOX mutation did not change the copy — that non-vacuity proof proves nothing (the sed matched nothing)"
+else
+  BOUT="$(_drive_noname "$T/noname/wt-lifecycle-box-mut.sh")"
+  case "$BOUT" in
+    *'box=cell-9'*) bad "G2) the BOX arm is VACUOUS: a private hostname read on a copy still produced the sanitiser's id" ;;
+    *'REFUSED-UNKNOWN(free=?'*) ok "G2) …and the BOX arm is non-vacuous: routing the id around \`disk_box_id\` to a bare \`hostname -s\` IS caught, while the token arm stays green" ;;
+    *) bad "G2) the BOX mutation did not produce a named refusal at all ($(printf '%s' "$BOUT" | head -1)) — fix the harness, do not read the arm above as coverage" ;;
   esac
 fi
 
