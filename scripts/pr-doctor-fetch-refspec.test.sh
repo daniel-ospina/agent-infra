@@ -410,17 +410,6 @@ live_lines() { # <file> <anchor> [<also-required>] -> ALL non-comment matching l
     ' "$1"
 }
 
-# A whole shipped BLOCK (from <first-line> up to the next line that is exactly `fi` at column 0), so the
-# test runs the script's own DECISION — an `if` whose condition it never re-implements — instead of one
-# line lifted out of it. A decoy line inside a dead branch cannot pass this: the block decides.
-live_block() { # <file> <exact first line>
-    awk -v start="$2" '
-        $0 == start { on = 1 }
-        on { print }
-        on && $0 == "fi" && NR > 0 { exit }
-    ' "$1"
-}
-
 # Run extracted text VERBATIM in <dir>, with the script's own variables bound, and return its status.
 # The subshell is what makes this safe: the shipped lines carry `exit 1` on failure and redirections to
 # `$L.log`, and neither may touch this suite.
@@ -502,7 +491,7 @@ for _sib in scripts/orchestrator-harness/fix-one.sh \
     done < "$WORK/sib-lines.txt"
 done
 
-# ── LA. `adopt-fix.sh`'s WORKTREE BLOCK — the inert-fix arm (review P1, 2026-10-31) ─────────────
+# ── LA. `adopt-fix.sh`'s PROVISIONING CALL — the inert-fix arm (review P1, 2026-10-31) ─────────────
 # The fetch above is necessary and NOT sufficient for this caller. `git worktree add "$WT" "$BR"` is
 # DWIM, and DWIM does not consult the tracking ref — it resolves a bare name through
 # `remote.<name>.fetch` CONFIGURED refspecs. So `adopt-fix.sh` was still dying one line after a
@@ -517,7 +506,7 @@ done
 # arm still goes RED when that argument is reverted.
 _adoptf="$HERE/../scripts/orchestrator-harness/adopt-fix.sh"
 if [ ! -f "$_adoptf" ]; then
-    bad "adopt-fix.sh is missing — its worktree block cannot be driven"
+    bad "adopt-fix.sh is missing — its provisioning call cannot be driven"
 elif [ ! -f "$_WTLIB" ]; then
     # Say it ONCE, by name. The alternative is five reds under a fabricated cause, which is the
     # #864-class misdiagnosis this file exists to stop.
@@ -529,7 +518,7 @@ else
         [ -n "$_afl" ] && run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_afl"
         # ⛔ THE MUTANT (the PRE-FIX form): DWIM, on the SAME clone where the fixed fetch has just
         # created the tracking ref. It must STILL fail — that is the measured fact that made the first
-        # #3009 fix inert, and it is what proves the block below is load-bearing rather than decorative.
+        # #3009 fix inert, and it is what proves the provisioning call below is load-bearing rather than decorative.
         if ( cd "$_ad" && git worktree add "$WORK/wt-dwim" fix/some-branch ) >/dev/null 2>"$WORK/dwim.err"; then
             bad "MUTANT: the DWIM form WORKED on a single-branch clone — the premise of the driver arm is wrong"
         elif grep -qi 'invalid reference' "$WORK/dwim.err"; then
@@ -618,7 +607,7 @@ else
                 fi
             fi
         fi
-        # ══ (c) THE ALREADY-LOCAL BRANCH ARM (the other half of the two-arm block) ══════════════════
+        # ══ (c) THE ALREADY-LOCAL BRANCH ARM (the other half of the two-arm pair) ════════════════════
         # When `refs/heads/$BR` already exists WITH WORK — a previous adopt whose worktree was pruned
         # — `wt_provision` must ATTACH it (`worktree add "$path" "$br"`), not refuse on `-b`.
         # ⛔ THE BRANCH MUST HOLD WORK (review P2, 2026-11-06). The previous fixture pointed the local
