@@ -789,16 +789,37 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # defect is that the guard's stated population was not the population it checked.)
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
 # not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
-# now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
+# now READS the bookkeeping assignments it used to drop, so the four names below are the full set it
 # finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
 # any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
+# ⛔ AND THE SET IS RE-DERIVED, NOT REMEMBERED. This list said "the three names below are the full
+# set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree: the sentence was a
+# measurement nobody re-took, and nothing forced it to be. ⛔ THE RED WAS VISIBLE, NOT HIDDEN — a
+# first draft of this comment claimed "bash-shards never run on a main push", and that is FALSE:
+# `.github/workflows/ci-main.yml` runs this same shard list on every main push (`bash
+# scripts/run-bash-shards.sh`), and it reported these shards red — main run 42225299527 on cf3c46c6d
+# names `spawn-gate.test.sh`, `test-gates.sh`, `tests/ci-trigger-scope/run.sh` and
+# `tests/record-review/run.sh`. So the gap was never the signal; it was that a prose COUNT in a
+# list is a claim nobody re-derives. The next editor re-derives it in one command (the `REFUSAL_AWK`
+# heredoc above, over the deploy unit), which prints every family-shaped declaration whose value is
+# not a 70..89 code — i.e. exactly the population this list must name:
+#   awk '/^cat > "\$TMP\/refusal-codes.awk" <<.REFUSAL_AWK.$/{f=1;next} /^REFUSAL_AWK$/{f=0} f' \
+#     scripts/orchestrator-harness/spawn-gate.test.sh > /tmp/refusal-codes.awk
+#   awk -f /tmp/refusal-codes.awk scripts/orchestrator-harness/*.sh \
+#     | awk -F'\t' '$1=="unknown"'
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
 #   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
 #   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
 #   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
 #   (`claim-registry-absent`) or `none`; not an exit code either.
-_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
+#   watchdog-loop.sh:RESTART_REFUSED — the watchdog's per-pass VERDICT FLAG (0/1), set wherever the
+#   pass declined to issue a restart verb and read at the one place that decides whether `main`
+#   restates that verdict (#1986). It never leaves the process as a status: nothing assigns it to a
+#   command's `$?` and every read is `-eq 1`. Measured on the tree that added the required-declarer
+#   rule for `key-gate.sh`: with it unlisted the scan emitted its 0/1 rows as `unknown` and the whole
+#   deploy-unit check read RED over a flag that declares no code.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED watchdog-loop.sh:RESTART_REFUSED"
 # A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
 # reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
 # derived filter yields exactly the family claims today, so the namespace costs nothing — and a future

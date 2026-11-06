@@ -791,7 +791,7 @@ _arm() { review_candidate_arm "$1" "$2"; }
 [ "$(_arm red rejected)"  = skip ] || bad "a RED candidate whose only head-bound record is verdict=not-clean must be SKIPPED, not re-reviewed and not railed (got '$(_arm red rejected)')"
 # …and the loop must PUBLISH that state rather than let it read as 'nobody has looked at this': the head
 # HAS been reviewed and rejected, and the remedy is a fix (a new head), which is what the message says.
-grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" | grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"' \
+grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"'  <<<"$(grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" || true)" \
   || bad "a NOT-CLEAN record at the head must PUBLISH 'review-found-issues' (head-bound) — otherwise a PR blocked on its own rejected review is indistinguishable from a PR nobody has looked at, which is the #3489 invisibility on the one class where at-head also disables the review arm"
 _empty_arm=$(_arm "" "")
 [ "$_empty_arm" = rail ] || bad "an UNCLASSIFIABLE candidate must default to the RAIL — the arm that spends nothing — never to a paid review (got '$_empty_arm')"
@@ -808,37 +808,42 @@ _call_ln=$(grep -nF '_rarm=$(review_candidate_arm "$_kind" "$_att")' "$SUT" | he
 _branch_ln=$(grep -nF 'if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then' "$SUT" | head -1 | cut -d: -f1)
 [ -n "${_call_ln:-}" ] && [ -n "${_branch_ln:-}" ] && [ "$_call_ln" -lt "$_branch_ln" ] \
   || bad "the predicate must be CONSULTED BEFORE the review branch that consumes it (predicate call at line ${_call_ln:-MISSING}, branch at ${_branch_ln:-MISSING}) — below it, '_rarm' keeps its 'rail' default, the review arm is never entered, and every unattested candidate is railed with the producer dead while this suite stays green"
-printf '%s\n' "$_branch" | grep -qF '[ "$_kind" != green ]' \
+grep -qF '[ "$_kind" != green ]'  <<<"$_branch" \
   && bad "the REVIEW branch must not carry its own red-kind guard — the red decision belongs to review_candidate_arm, and a second copy inside the branch is exactly the P1 (a 'continue' that bypasses the rail path)"
 # ⛔ THE SKIP ARM'S `continue` (window widened: the not-clean-record branch below added lines between
 # the `if` and the outer `continue`, so a tight -A window stopped reaching it and the arm failed for a
 # reason that had nothing to do with the guard).
-grep -A11 -F 'if [ "$_rarm" = skip ]; then' "$SUT" | grep -qF 'continue' \
+# ⛔ ANCHORED ON THE ARM'S OWN LOG LINE, NOT ON THE `if` (review cycle 7, P2 — measured). `-A11` from
+# `if [ "$_rarm" = skip ]; then` spans the REJECTED sub-arm, whose `continue` is two branches earlier,
+# so the window was satisfied by the NEIGHBOUR's `continue`: deleting the skip arm's own `continue`
+# (which is what makes a red marker-less candidate fall through to `launch_rail`) stayed GREEN. The
+# WAIT arm below has always been anchored this way for the same reason.
+grep -qF 'continue' <<<"$(grep -A1 -F 'AWAITING-REVIEW ($_att) and its checks are RED' "$SUT" || true)" \
   || bad "the 'skip' arm must CONTINUE (never fall through to the rail) — a red candidate with no marker anywhere has nothing for check (c) to carry, so railing it burns a MAX slot on the one class the base's filter deliberately dropped"
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH: a missing reviewer must be named per candidate, not dispatched
 # into. Unpinned, deleting the guard left the suite green while the loop wrote a dispatch record and
 # published `review-in-flight` — a claim that something is running — on a box with no reviewer at all.
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH. Same gate-vs-text distinction: the expression alone is satisfied
 # while the loop dispatches into a reviewer that does not exist and publishes 'review in flight' for it.
-printf '%s\n' "$_branch" | grep -A2 -F '[ "$REVIEW_AVAILABLE" != 1 ]' | grep -qF 'continue' \
+grep -qF 'continue'  <<<"$(grep -A2 -F '[ "$REVIEW_AVAILABLE" != 1 ]' <<<"$_branch" || true)" \
   || bad "the review branch must REFUSE to dispatch when no reviewer is available — the '[ \"\$REVIEW_AVAILABLE\" != 1 ]' guard must be followed by a 'continue'; without it a box with no reviewer records a dispatch, counts an attempt against the cap, and tells the PR 'review in flight'"
 # ⛔ THE TWO STATES THE LOOP MUST PUBLISH FOR ITSELF, PINNED WHERE THE LOOP CALLS THEM (review, P1/P2).
 # Driving `publish_review_state` directly proves the TEXT works, not that anything ever posts it —
 # measured with this very harness: deleting the loop's `review-record-unbound` publish left the suite
 # GREEN, so the fix for "a clean record whose body marker is gone is log-only and invisible for ever"
 # could be removed without a sound. Same for EXHAUSTED, which is what stops the paid retry loop.
-printf '%s\n' "$_branch" | grep -qF 'review-record-unbound' \
+grep -qF 'review-record-unbound'  <<<"$_branch" \
   || bad "the CLEAN-but-unbound arm must PUBLISH 'review-record-unbound' — logging 're-running the recorder is the remedy' while nothing performs it and nothing appears on the PR is the #3489 invisibility again, permanently, because the key never changes without a new head"
-printf '%s\n' "$_branch" | grep -qF 'review-retries-exhausted' \
+grep -qF 'review-retries-exhausted'  <<<"$_branch" \
   || bad "the review branch must PUBLISH 'review-retries-exhausted' when the attempts are spent — otherwise a head nobody can review reads exactly like a head waiting on a lane"
 # ⛔ AND BOTH MUST BE HEAD-BOUND, ON THE EXACT CALL SHAPE (review round 2, P2, measured): a bare name
 # match is satisfied by dropping the head argument, which collapses the tag to a headless
 # `<!-- auto-rail-review:<state> -->` — so the second head of that PR can never publish its own marker
 # (it is already present) and the message renders with nothing after "at". That is the exact invisibility
 # these two states exist to remove. The `review-in-flight` arm above shows the shape: the literal call.
-printf '%s\n' "$_branch" | grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head"' \
+grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head"'  <<<"$_branch" \
   || bad "EXHAUSTED must be published HEAD-BOUND ('publish_review_state \"\$repo\" \"\$pr\" review-retries-exhausted \"\$head\"') — a headless tag means the next head in the same state can never publish, so the PR goes invisible again"
-printf '%s\n' "$_branch" | grep -qF 'publish_review_state "$repo" "$pr" review-record-unbound "$head"' \
+grep -qF 'publish_review_state "$repo" "$pr" review-record-unbound "$head"'  <<<"$_branch" \
   || bad "the unbound-record remedy must be published HEAD-BOUND ('… review-record-unbound \"\$head\"') — a headless tag is invisible on the next head, which is the #3489 defect itself"
 # ⛔ AND THE AVAILABILITY ITSELF MUST BE AN HONEST ANSWER (review, P2 + P2): computed BEFORE the
 # rail-hub refresh, it latches the PREVIOUS clone's contents — the exact file the refresh is what
@@ -951,7 +956,7 @@ grep -qF 'pending) _rwin=$REVIEW_COOLDOWN_S;;' "$SUT" \
   || bad "the wait log must use REVIEW_COOLDOWN_S for a pending review"
 grep -qF '*)       _rwin=$COOLDOWN_TRANSIENT_S;;' "$SUT" \
   || bad "the wait log must use COOLDOWN_TRANSIENT_S for retry/refused — that is the window the predicate actually compared against, and a log that names a different one is a false report on the file's primary instrument"
-printf '%s\n' "$_branch" | grep -qF 'within its ${_rwin}s window' \
+grep -qF 'within its ${_rwin}s window'  <<<"$_branch" \
   || bad "the wait log line must print \${_rwin}, not a fixed window"
 publish_review_state acme/widget 42 review-in-flight "$H"
 publish_review_state acme/widget 42 review-dispatch-failed "$H"
@@ -982,7 +987,7 @@ grep -qF 'if [ "$_ract" -eq 3 ]; then' "$SUT" \
 # An anchored on the WAIT branch's OWN LOG LINE rather than on the `if`: the `case "$_rstate"` block that
 # chooses `_rwin` sits between the `if` and the `continue`, so any `-A` window that reached the `continue`
 # from the `if` would also reach the NEXT arm's, and a tighter one fails for the wrong reason.
-printf '%s\n' "$_branch" | grep -A2 -F 'review $_rstate at $head — dispatched' | grep -qF 'continue' \
+grep -qF 'continue'  <<<"$(grep -A2 -F 'review $_rstate at $head — dispatched' <<<"$_branch" || true)" \
   || bad "the WAIT branch's log line must be followed by CONTINUE — without it a head whose review is ALREADY IN FLIGHT falls through to the dispatch and buys a second concurrent paid review, resetting the cooldown key it is measured by, and nothing else in this file notices"
 # ⛔ AND THE ATTEMPT BUDGET MUST BE FED INTO THE DECISION, OR THE P1 PAID LOOP IS BACK (review round 2,
 # P2, measured): the loop's call is the ONLY thing that makes `$att` non-zero, so dropping the third
@@ -1016,13 +1021,13 @@ _capdef=$(printf '%s\n' "$_capblock" | grep -F 'publish_review_state "$repo" "$p
   || bad "the CAP-DEFERRAL block must still PUBLISH 'awaiting-review' for a deferred candidate — measured: deleting it left the suite GREEN, so the state a mergeable unattested PR is in whenever the box is at MAX existed only in the log. Located INSIDE the 'candidate_deferred' block, so a decoy line elsewhere in the file cannot satisfy this arm (a file-wide grep did, measured)"
 [ "$(printf '%s\n' "$_capdef" | grep -cF 'publish_review_state')" -eq 1 ] \
   || bad "the CAP-DEFERRAL block must hold EXACTLY ONE 'awaiting-review' publish — the assertions below are 'any matching line contains this substring', so a second one inside the same block would let either requirement be satisfied by a line that is not the cap-deferral publish"
-printf '%s\n' "$_capdef" | grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]' \
+grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]'  <<<"$_capdef" \
   || bad "the CAP-DEFERRAL publish line must still START '[ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ]' — it is the only publish that runs while the box is at MAX, i.e. the COMMON state for a mergeable unattested PR (#3489 on the most common path)"
-printf '%s\n' "$_capdef" | grep -qF '[ "$_att" != rejected ]' \
+grep -qF '[ "$_att" != rejected ]'  <<<"$_capdef" \
   || bad "the CAP-DEFERRAL publish must EXCLUDE 'rejected' — its text promises a reviewer 'as soon as this repo has a free slot', but review_candidate_arm maps *:rejected to skip, so a not-clean head (TERMINAL — only a new head gets a review) was left carrying a promise no dispatch would keep; under cap saturation the pass never reaches the review-found-issues publish that would correct it, so the false claim stands indefinitely"
-grep -A2 -F 'if review_should_defer "$_rdispatched"; then' "$SUT" | grep -qF 'publish_review_state "$repo" "$pr" awaiting-review' \
+grep -qF 'publish_review_state "$repo" "$pr" awaiting-review'  <<<"$(grep -A2 -F 'if review_should_defer "$_rdispatched"; then' "$SUT" || true)" \
   || bad "the BURST-BOUND deferral must publish 'awaiting-review' — deleted, the suite stayed GREEN and a head queued behind this repo's REVIEW_PER_PASS budget reads as waiting on a lane"
-printf '%s\n' "$_branch" | grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' | grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"' \
+grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"'  <<<"$(grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' <<<"$_branch" || true)" \
   || bad "the loop must PUBLISH 'review-found-issues' from the '\$_ract -eq 2' / issues arm — the state's TEXT and its marker count are pinned, so deleting this CALL left the suite GREEN while a head the reviewer REJECTED (and which the loop will not re-review) stayed as invisible as #3489"
 # ⛔ AND A REFUSAL MUST HAND THE BUDGET BACK (review round 2, P2): `refused` ignores `$att`, so without
 # this reset a run of load refusals leaves the ledger saturated and the FIRST real review that then

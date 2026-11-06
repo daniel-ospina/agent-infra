@@ -136,14 +136,14 @@ const KEY_RE = /^([ \t]*)(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))[ \t]*:(.*)$/;
 // and the content lock untouched — `workflow-lock.yml` is not one of the three locked paths), so
 // `edited` was silently re-addable one line away from the assertion that says it is gone. A
 // `pull_request:` trigger on `workflow-lock.yml` would ALSO collapse its trust split.
-function onKeys(region, childIndent) {
+function onKeys(region, childIndent, file = PC_FILE) {
   const own = region.filter((l) => l.indent === childIndent);
   // ⛔ A LINE THE READER CANNOT CLASSIFY IS CANNOT-VERIFY, NEVER A SILENT DROP. `.filter((k) => k !==
   // null)` discarded every line KEY_RE did not match — and YAML's EXPLICIT-KEY syntax (`? push`) is
   // legal, so a trigger written that way was invisible while being effective (measured: PyYAML key set
   // `['workflow_call','pull_request','issue_comment','push']`, gate read green). Dropping an
   // unparsed line is how a gate reports "as decided" about a file it did not fully read.
-  return own.map((l) => {
+  const names = own.map((l) => {
     const k = keyOf(l);
     if (k === null) {
       refuse(
@@ -154,6 +154,38 @@ function onKeys(region, childIndent) {
     }
     return k.key;
   });
+  // ⛔ A DUPLICATE TRIGGER NAME IS LAST-WINS TOO — AND IT IS ONE LEVEL ABOVE THE FILTER KEYS, so it
+  // discards the WHOLE block those pins read. Every other last-wins level is refused here (top-level
+  // `on:`, `jobs:`, the job id, a job's `if:`, and the filter keys via `singleKey`); a second
+  // `pull_request:`/`pull_request_target:`/`issue_comment:` block was the remaining hole, and it is the
+  // widest one: an appended second `pull_request:` carrying `branches: [develop]` + `types: [edited]`
+  // makes the required context UNSATISFIABLE on `main` while the reader answers about the FIRST block
+  // and exits 0 (measured, all three files). `trigger()` resolves a name with `findIndex`, i.e. first
+  // match, so nothing downstream can catch it.
+  const seen = new Map();
+  for (let i = 0; i < names.length; i++) {
+    if (seen.has(names[i])) {
+      // ⛔ THE *FIRST* LINE IS THE ONE TO NAME FIRST, AND THE REPEAT IS NAMED TOO. Reporting the
+      // DUPLICATE own line as "first" is a diagnostic that points at the block YAML DISCARDS, so an
+      // operator deleting "the one at line N" removes the block that is NOT in force and silently
+      // changes the effective trigger (measured: the message said "first at line 95" for a first
+      // declaration at line 36).
+      const first = seen.get(names[i]);
+      const where =
+        first.no === undefined
+          ? own[i].no === undefined
+            ? ""
+            : ` (repeated at line ${own[i].no})`
+          : ` (first at line ${first.no}${
+              own[i].no === undefined ? "" : `; repeated at line ${own[i].no}`
+            })`;
+      refuse(
+        `${file}: \`on:\` declares \`${names[i]}:\` more than once${where}. YAML keeps only the LAST block and discards the rest, so which \`${names[i]}:\` is in force is UNANSWERABLE — a reader that takes the first would answer about the block that is NOT in force. Re-run after the duplicate is resolved.`
+      );
+    }
+    seen.set(names[i], own[i]);
+  }
+  return names;
 }
 
 function keyOf(line) {
@@ -204,26 +236,86 @@ function valueLinesFor(entry, lines) {
   return out;
 }
 
+// ⛔ A TRAILING YAML COMMENT IS NOT PART OF THE VALUE. YAML starts a comment at a `#` PRECEDED BY
+// WHITESPACE (outside quotes), so `- opened  # first gate run` is the item `opened`. Reading the whole
+// rest of the line fabricated a list like `[opened # first gate run, synchronize # every push]`, which a
+// SET comparison then reported as "LOST [opened, synchronize]" — rc=1 over a correct workflow, the
+// same "the printed list was FABRICATED" class the value-line reader was fixed for.
+// ⛔ QUOTE STATE IS TRACKED ACROSS THE WHOLE SCALAR, not per character-pair. `indexOf(close, 1)` looked
+// right and is not: YAML's single-quoted escape is a DOUBLED quote, so `'it''s # x'` is the value
+// `it's # x` and a first-match scan truncated it to `it`. A corrupted item is then reported as a
+// missing/extra member — the over-block direction this whole function exists to remove.
+// ⛔ AND A SCALAR THAT *BEGINS* WITH `#` IS A COMMENT, i.e. NO ITEM AT ALL (`- #x` in a block sequence,
+// `types: # note` before a nested sequence). Returning it literally fabricated the item `#x`.
+function stripYamlComment(s) {
+  const t = String(s);
+  if (t.trimStart().startsWith("#")) return "";
+  let quote = null;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (quote) {
+      if (quote === '"' && ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        // A doubled quote inside a SINGLE-quoted scalar is the escape, not the close.
+        if (quote === "'" && t[i + 1] === "'") {
+          i++;
+          continue;
+        }
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && i > 0 && /\s/.test(t[i - 1])) return t.slice(0, i).trim();
+  }
+  return t;
+}
+
 // readList(entry, valueLines) — a flow list on the key's own line, or a block sequence below it.
 // Returns string[]; refuses anything else (see the exit-2 note in the header).
 function readList(entry, valueLines) {
-  const value = entry.value.trim();
+  const value = stripYamlComment(entry.value.trim()).trim();
   if (value) {
     const m = /^\[(.*)\]$/.exec(value);
     if (!m) refuse(`line ${entry.line.no}: the value of \`${entry.key}:\` is ${JSON.stringify(value)} — not a flow list`);
     return m[1]
       .split(",")
-      .map(unquote)
+      .map((s) => unquote(stripYamlComment(s.trim()).trim()))
       .filter((s) => s.length > 0);
   }
   const items = [];
   for (const l of valueLines) {
     const m = /^[ \t]*-[ \t]+(.*)$/.exec(l.raw);
     if (!m) refuse(`line ${l.no}: expected a \`- item\` block-sequence entry, got ${JSON.stringify(l.raw)}`);
-    const v = unquote(m[1]);
+    const v = unquote(stripYamlComment(m[1]).trim());
     if (v) items.push(v);
   }
   return items;
+}
+
+// singleKey(keys, key, where) — the trigger's ONE `key:` entry, or a refusal if it declares two.
+// ⛔ YAML IS LAST-WINS, SO A DUPLICATE MAKES THE QUESTION UNANSWERABLE — and a `findIndex` reader
+// answers it with the FIRST copy instead, which is the wrong block. Measured: appending a second
+// `types:` (`- created`) under `issue_comment:` leaves the effective set `[created]` (PyYAML) and the
+// read of the first block reported the decided set; same for a second `branches:` (`- develop`). This
+// file already closes last-wins at four other levels (`on:`, `jobs:`, the job id, a job's `if:`), so
+// the same verdict is owed here: CANNOT-VERIFY, never a green read of the wrong block. (The repo's own
+// parser refuses a duplicate key outright — `scripts/workflow-yaml.mjs` throws on it — so this can only
+// fire on a file that is already broken.)
+function singleKey(keys, key, where, file = PC_FILE) {
+  const hits = keys.filter((k) => k.key === key);
+  if (hits.length > 1) {
+    refuse(
+      `${file}: \`${where}\` declares \`${key}:\` ${hits.length} times. YAML keeps the LAST one and discards the rest, so which ${key} set is in force here is UNANSWERABLE — and a reader that takes the first would answer about the wrong block. Re-run after the duplicate is resolved.`
+    );
+  }
+  return hits[0] ?? null;
 }
 
 // trigger(region, childIndent, name, file) — the named trigger's filter keys, or a refusal.
@@ -382,6 +474,60 @@ function jobBlock(text, name) {
 // while the job itself carries no `if:` at all and therefore RUNS on the comment event. Measured: move
 // `if: github.event_name != 'issue_comment'` from the job to its first step and a text-wide matcher
 // returns ok/rc=0. The key indent is what distinguishes the two, so it is what is asserted.
+// jobIfExprs(block) — the YAML-FOLDED value of each own-level `if:` in a job block, ONE entry per
+// occurrence. A separate reader from `jobKeyIs` on purpose: that one refuses an `if: >-` BLOCK SCALAR
+// for the REQUIRED job's guard (a `>-` body of `guard` + `|| true` folds to TRUE, and its arms pin the
+// refusal), while the revalidation job's own `if:` IS a block scalar in the live file. Stripping a
+// leading block indicator here does not weaken that refusal: it is applied to a DIFFERENT job, whose
+// predicates are required as a conjunction and whose disjunctions are refused below.
+// ⛔ AND "OWN-LEVEL" MEANS THE JOB'S KEY INDENT, NOT "ANYTHING DEEPER THAN THE HEADER". A step's
+// `if:` is 8 spaces deep, so a `keyIndent > headerIndent` test read a STEP guard as the JOB's — in
+// BOTH directions, each measured: (a) delete the job's `if:` and move the same conjunction onto its
+// first step and the job RUNS on every event while this reader reported green (fail-open); (b) put an
+// unrelated `if: always()` on a step and the reader reported a FINDING claiming the JOB's guard is
+// wrong (false block, and a false statement about the job). The job's own keys are all at ONE indent —
+// the shallowest key line deeper than the header, exactly the way `jobKeyIs` derives it — so that is
+// what a job-level `if:` must equal.
+function jobIfExprs(block) {
+  const lines = String(block ?? "").split("\n");
+  const headerIndent = (lines[0] ?? "").length - (lines[0] ?? "").trimStart().length;
+  const ownIndents = lines
+    .slice(1)
+    .map((l) => KEY_RE.exec(l))
+    .filter((m) => m && m[1].length > headerIndent)
+    .map((m) => m[1].length);
+  const jobKeyIndent = ownIndents.length ? Math.min(...ownIndents) : headerIndent + 2;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\s*)(?:"if"|'if'|if)\s*:(.*)$/.exec(lines[i]);
+    if (!m) continue;
+    const keyIndent = m[1].length;
+    // A STEP's `if:` (deeper than the job's own key indent) is not the job's guard, and an `if:` at or
+    // left of the header belongs to `jobs:` or to the previous job.
+    if (keyIndent !== jobKeyIndent) continue;
+    let v = m[2].trim();
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j];
+      if (l.trim() === "" || /^\s*#/.test(l)) continue;
+      if (l.length - l.trimStart().length <= keyIndent) break;
+      v += (v === "" ? "" : " ") + l.trim();
+    }
+    v = v.replace(/^(?:[>|][+-]?\d?)\s*/, "").trim();
+    // ⛔ A TRAILING YAML COMMENT ON THE GUARD IS NOT PART OF THE EXPRESSION — and here it decides the
+    // verdict. This reader folds the value and then scans it for `||` / bare `true` / `false`, so a
+    // comment whose WORDING contains one of those words turned a byte-for-byte correct guard into a
+    // FINDING that quoted the comment back as if it were the expression (measured: `… = null  # holds
+    // true only for plain issues` -> rc=1; the same line commented `# owns the comment event` -> rc=0).
+    // Every other reader in this file already strips a comment (`PC_COMMENT_GUARD`'s `(?:\s+#.*)?`, and
+    // `stripYamlComment` for lists); this one is stripped by the SAME helper, quote-aware, so `#` inside
+    // a quoted whole-scalar value survives.
+    v = stripYamlComment(v).trim();
+    v = v.replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
+    out.push(v);
+  }
+  return out;
+}
+
 function jobKeyIs(block, key, valueRe) {
   const lines = String(block ?? "").split("\n");
   const header = lines[0] ?? "";
@@ -460,7 +606,7 @@ function checkWorkflowLock() {
   const { region, childIndent } = onRegion(text, WL_FILE);
   const t = trigger(region, childIndent, "pull_request_target", WL_FILE);
 
-  const onSet = onKeys(region, childIndent);
+  const onSet = onKeys(region, childIndent, WL_FILE);
   const extraOn = extraSet(onSet, ["pull_request_target"]);
   if (extraOn.length) {
     findings.push(
@@ -483,14 +629,19 @@ function checkWorkflowLock() {
   // The trigger must stay a pull_request_target: it is the reason the job runs from a copy the PR
   // cannot rewrite (see the workflow's own header). Losing it is not a narrowing, it is the gate
   // existing at all.
-  const typesIdx = t.keys.findIndex((k) => k.key === "types");
-  if (typesIdx < 0) {
+  // A DUPLICATE `types:` IS LAST-WINS TOO — routed through `singleKey` so the first copy can never be
+  // answered for the block YAML actually keeps.
+  const wlTypesEntry = singleKey(t.keys, "types", "pull_request_target:", WL_FILE);
+  if (!wlTypesEntry) {
     findings.push(
       "workflow-lock.yml declares no `types:` under `pull_request_target:`. GitHub's default set happens to be the same three types, but an implicit default carries no artifact: the decision recorded above the trigger stops being readable, and the next editor cannot tell a deliberate three-type set from an inherited one. Write `types: [opened, synchronize, reopened]`."
     );
     return;
   }
-  const entry = t.keys[typesIdx];
+  // ⛔ THE ENTRY `singleKey` RETURNED IS THE ONE READ — not `t.keys[findIndex(...)]`. Binding the
+  // result and then re-finding the key is the first-match read the duplicate rule exists to forbid,
+  // one refactor away from answering about the block YAML discarded.
+  const entry = wlTypesEntry;
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`workflow-lock pull_request_target types: ${items.join(", ") || "<none>"}\n`);
@@ -517,7 +668,7 @@ function checkHarnessSingleSource() {
   const { region, childIndent } = onRegion(text, HSS_FILE);
   const t = trigger(region, childIndent, "pull_request", HSS_FILE);
 
-  const onSet = onKeys(region, childIndent);
+  const onSet = onKeys(region, childIndent, HSS_FILE);
   const extraOn = extraSet(onSet, ["pull_request"]);
   if (extraOn.length) {
     findings.push(
@@ -536,7 +687,9 @@ function checkHarnessSingleSource() {
       `harness-single-source.yml's \`pull_request:\` declares [${extraHss.join(", ")}] besides \`paths:\`. Each of those is a COVERAGE NARROWING on a guard whose whole job is to red a reappearing fork or a drifting deployed copy: \`types: [opened]\` drops every \`synchronize\` (so no later head is ever measured), and \`branches-ignore: [main]\` stops the job firing on any PR in this repo at all — while the path arm stays true. The trigger's only filter is \`paths:\`.`
     );
   }
-  const pathsIdx = t.keys.findIndex((k) => k.key === "paths");
+  // A DUPLICATE `paths:` IS LAST-WINS TOO — see `singleKey`.
+  const hssPathsEntry = singleKey(t.keys, "paths", "pull_request:", HSS_FILE);
+  const pathsIdx = hssPathsEntry ? t.keys.indexOf(hssPathsEntry) : -1;
   const ignoreIdx = t.keys.findIndex((k) => k.key === "paths-ignore");
   if (ignoreIdx >= 0) {
     findings.push(
@@ -831,7 +984,7 @@ function checkPipelineComplianceUnchanged() {
   // itself, and over-blocking is the direction this gate must err in.
   const PC_COMMENT_GUARD =
     /(?:\$\{\{\s*)?(?:!cancelled\(\)\s*&&\s*)?github\.event_name\s*!=\s*['"]issue_comment['"](?:\s*&&[^|}]*)?(?:\s*\}\})?(?:\s+#.*)?/;
-  const onNames = onKeys(region, childIndent);
+  const onNames = onKeys(region, childIndent, PC_FILE);
   const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
   const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
   // ⛔ THE REQUIRED CONTEXT IS THE JOB **NAME**, NOT THE JOB ID. The workflow's own header says main
@@ -866,6 +1019,90 @@ function checkPipelineComplianceUnchanged() {
     );
   }
 
+  // ⛔ THE ADMISSION IS A PAIR *AND* AN OWNED ACTIVITY SET — NOT A NAME. Admitting `issue_comment` to
+  // the allow-list and pinning only the required job's guard leaves the OTHER half of #2467's
+  // justification unpinned, and it is the half that makes the trigger safe: the comment event is
+  // harmless because `revalidate-on-issue-comment` OWNS it and re-runs the EXISTING run. Each of the
+  // four facts below was measured GREEN on this reader before it existed (the mutation and its result
+  // are re-driven, one arm each, in `run.sh` 7i–7m):
+  //   * the `issue_comment:` trigger deleted            → green, so the trigger could vanish silently
+  //   * `issue_comment: types:` reduced to `[created]`    → green, so the retraction edit stopped
+  //     re-reading (retracting a scoping marker is an `edited` activity — the file's own header says
+  //     the arm is BIDIRECTIONAL and a one-sided read leaves the previous GREEN standing)
+  //   * the revalidation job re-pointed at another event, or its body given `&& false` → green, so the
+  //     event had no owner at all while every assertion about the required job still held
+  if (!onNames.includes("issue_comment")) {
+    findings.push(
+      `pipeline-compliance.yml no longer declares \`issue_comment:\`. That trigger is the ADMITTED one (${PC_ADMITTED_EXTRA.map((n) => `\`${n}:\``).join(", ")}): #2467 added it because checks (b) and (d) read the LINKED ISSUE, which fires no \`pull_request\` event, so without it the repo's only required context is non-deterministic in time (measured on PR #3122: two runs of the same check on the same commit disagreed, and only queue latency decided the difference). Removing it silently reopens that window. To remove it, remove it from \`PC_ADMITTED_EXTRA\` in this file AND record the decision it reverses — the allow-list is derived from those constants, never spelled out in prose, so the two cannot drift apart here.`
+    );
+  } else {
+    // ⛔ AND THE ACTIVITY SET IS PART OF THE PAIR. An absent `types:` is ADMISSIBLE here — GitHub's
+    // default for `issue_comment:` is `created`, `edited`, `deleted`, which already covers both
+    // activities this decision needs — but a DECLARED set that lost one of them is a refusal. So the
+    // rule is "the effective set contains both", not "the key is present": refusing an absent key
+    // would be a false block on a workflow that is correct.
+    const ic = trigger(region, childIndent, "issue_comment", PC_FILE);
+    const icTypesEntry = singleKey(ic.keys, "types", "issue_comment:");
+    const icTypes = icTypesEntry ? readList(icTypesEntry, valueLinesFor(icTypesEntry, ic.lines)) : ["created", "edited", "deleted"];
+    const icMissing = ["created", "edited"].filter((a) => !icTypes.includes(a));
+    if (icMissing.length) {
+      findings.push(
+        `pipeline-compliance.yml's \`issue_comment:\` no longer carries the ${icMissing.length > 1 ? "activities" : "activity"} [${icMissing.join(", ")}] (declared: [${icTypes.join(", ")}]). \`created\` is what re-runs the gate for an open PR that cross-references a newly-scoped issue; \`edited\` is what re-reads it after a body edit, and the retraction direction (a scoping marker REMOVED from a comment) is why the file's header calls that arm bidirectional. Without it a retracted marker leaves the previous GREEN standing indefinitely. GitHub's default set for this trigger is \`created, edited, deleted\`, so an ABSENT \`types:\` key is admissible; a declared set missing either activity is not.`
+      );
+    }
+    // ⛔ AND THE EVENT MUST HAVE AN OWNER. `revalidate-on-issue-comment` is what makes the comment
+    // event safe: it re-runs the EXISTING run for each open PR cross-referencing the issue, posts no
+    // marker, holds no `contents: write` and cannot turn a red green. This is asserted on that job BY
+    // NAME, because a guard on any other job says nothing about who owns the event. Its `if:` is a
+    // `>-` BLOCK SCALAR in the live file, which the required job's guard reader deliberately does not
+    // model (a `>-` body of `guard` + `|| true` folds to TRUE) — so it is read here with the block
+    // indicator stripped and both predicates required as a CONJUNCTION, with any `||` or bare
+    // `true`/`false` literal refused. That is the safe direction: ANDing can only exclude more events.
+    // ⛔ AND THE JOB MUST EXIST — checked BEFORE `jobBlock`, because `jobBlock` REFUSES (rc 2,
+    // CANNOT-VERIFY) when it cannot locate a job, which is the right answer for "cannot verify this
+    // job's guard" but the WRONG one here: absence of the OWNER is a fact this reader can state. A
+    // `jobBlock`-first reader made the finding below unreachable (measured: deleting the whole job
+    // produced `CANNOT-VERIFY: no revalidate-on-issue-comment job found`, never this finding).
+    const rvHeader = /^ {2}(?:"revalidate-on-issue-comment"|'revalidate-on-issue-comment'|revalidate-on-issue-comment)\s*:/m.test(
+      text
+    );
+    const rv = rvHeader ? jobBlock(text, "revalidate-on-issue-comment") : "";
+    const rvExprs = jobIfExprs(rv);
+    if (!rvHeader) {
+      findings.push(
+        "pipeline-compliance.yml no longer declares the `revalidate-on-issue-comment` job. It OWNS the `issue_comment:` event that the allow-list admits: on a scoping comment it re-runs the EXISTING gate run for each open PR cross-referencing the issue (it posts no marker, holds no `contents: write` and cannot turn a red green). With the trigger admitted and this job gone, the comment event re-runs nothing — checks (b)/(d) stay non-deterministic in time, which is the #2467 window itself."
+      );
+    } else if (rvExprs.length === 0) {
+      findings.push(
+        "pipeline-compliance.yml's `revalidate-on-issue-comment` job carries no job-level `if:`, so it runs on EVERY event the workflow fires — including `pull_request`, where it would re-run the gate run it is already inside. The job exists to own the `issue_comment` event and nothing else."
+      );
+    } else {
+      for (const expr of rvExprs) {
+        const keysEvent = /github\.event_name\s*==\s*['"]issue_comment['"]/.test(expr);
+        // ⛔ `!github.event.issue.pull_request` IS THE SAME PREDICATE — on a comment event the field is
+        // absent for a plain issue, so the negation is true exactly when the `== null` form is. Not
+        // modelling it minted a FINDING asserting the job's guard "does not require `== null`" about a
+        // tree that DOES require it (measured, rc=1) — a false block AND a false statement. The
+        // unmodelled-shape path is `refuse` (rc 2), never a finding; this shape is modelled instead.
+        const keysIssue = /(?:github\.event\.issue\.pull_request\s*==\s*null|!\s*github\.event\.issue\.pull_request\b)/.test(
+          expr
+        );
+        // ⛔ NOTHING LEGAL IN THE MODELLED CONJUNCTION CARRIES A BARE `true`/`false`. The old pattern
+        // used a `(?<![=!<>])` lookbehind so the harmless `x != true` spelling stayed accepted — but
+        // that lookbehind also suppressed `&& !true`, which is the ALWAYS-FALSE spelling this rule
+        // exists to catch: measured rc=0 on `… == null && !true`, i.e. the owner can never run while
+        // the gate prints ok (the #2467 window, in its minimal adversarial form). Over-blocking a
+        // `!=true` spelling is the safe direction; admitting a never-runs owner is not.
+        const escape = /\|\||\b!?\s*(?:true|false)\b/.test(expr);
+        if (!keysEvent || !keysIssue || escape) {
+          findings.push(
+            `pipeline-compliance.yml's \`revalidate-on-issue-comment\` job \`if:\` is ${JSON.stringify(expr)}, which does not both (i) key on \`github.event_name == 'issue_comment'\` and (ii) require \`github.event.issue.pull_request == null\`, with no \`||\` disjunction and no bare \`true\`/\`false\` literal. That conjunction is what confines the job to comments on ISSUES (a comment on a PR must never re-run that PR's gate) — and it is the whole reason admitting the trigger is safe: the event is owned by a job that re-runs the EXISTING run and can neither post a marker nor turn a red green. A disjunction or an \`&& false\` body makes the owner unable to run while every assertion about the required job still reads true.`
+          );
+        }
+      }
+    }
+  }
+
   // ⛔ AND NO PATH FILTER UNDER IT (review cycle 1, P1). This is the change the current sweep most
   // invites — "finish the job, filter the required check too" — and it is the one that hurts most:
   // GitHub documents that "if a workflow is skipped due to path filtering … then checks associated
@@ -878,6 +1115,26 @@ function checkPipelineComplianceUnchanged() {
       `pipeline-compliance.yml's \`pull_request:\` declares [${extraPc.join(", ")}]. It is the repo's ONLY required status context, so a path filter here does not narrow a check — it makes the required context UNSATISFIABLE on every head whose diff does not match: GitHub keeps a path-filtered workflow's checks "Pending", and a PR that requires them cannot merge. Allowed filter keys on this trigger are \`branches\` and \`types\` only.`
     );
   }
+  // ⛔ THE BRANCH FILTER IS CHECKED BEFORE THE `types:` EARLY-RETURN, ON PURPOSE: both facts are about
+  // the required context being SATISFIABLE, and a `types:`-absent tree can also carry a `branches:`
+  // that no longer admits `main`. Checked below the return, the second fact was withheld until the first
+  // was fixed — two red rounds for one edit (measured: `types:` deleted AND `branches: [develop]` emitted
+  // only the `types:` finding, while PyYAML shows the effective trigger is `['branches']`).
+  // ⛔ AND ITS BRANCH FILTER MUST STILL ADMIT main. An absent `branches:` key is ADMISSIBLE — the
+  // trigger then fires for every target branch, which still includes `main`, so the required context is
+  // still satisfiable and no false block is owed. A DECLARED filter that no longer lists `main` is the
+  // dangerous direction and was measured GREEN before this check existed: `pipeline-compliance` would
+  // never run on a PR to `main`, GitHub keeps a non-triggered required check "Pending", and every PR to
+  // `main` becomes unmergeable — the same unsatisfiable-context class as a `paths:` filter here.
+  const brEntry = singleKey(t.keys, "branches", "pull_request:");
+  if (brEntry) {
+    const branches = readList(brEntry, valueLinesFor(brEntry, t.lines));
+    if (!branches.includes("main")) {
+      findings.push(
+        `pipeline-compliance.yml's \`pull_request: branches:\` is [${branches.join(", ") || "<none>"}], which no longer admits \`main\`. This is the repo's ONLY required status context: on a PR to \`main\` the workflow would never trigger, GitHub keeps an untriggered required check "Pending", and that PR can never merge. (An ABSENT \`branches:\` key is admissible — it fires for every target branch and therefore still includes \`main\`.)`
+      );
+    }
+  }
   const idx = t.keys.findIndex((k) => k.key === "types");
   if (idx < 0) {
     findings.push(
@@ -885,13 +1142,46 @@ function checkPipelineComplianceUnchanged() {
     );
     return;
   }
-  const entry = t.keys[idx];
+  // A DUPLICATE `types:` IS LAST-WINS TOO — see `singleKey`. Read before the rest of this section, and
+  // before the branch filter, so a duplicated key can never be answered from the first copy.
+  const singleEntry = singleKey(t.keys, "types", "pull_request:");
+  // ⛔ THE ENTRY `singleKey` RETURNED IS THE ONE READ — see the same note in `checkWorkflowLock`.
+  const entry = singleEntry;
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`pipeline-compliance pull_request types: ${items.join(", ") || "<none>"}\n`);
-  if (!items.includes("edited")) {
+  // ⛔ THE ACTIVITY SET IS A SET, NOT A MEMBERSHIP TEST. The decision is `opened, synchronize,
+  // reopened, edited` — all four, and nothing else:
+  //   * losing `edited` lets a forged `verdict=clean-micro` marker ride a stale green check to merge
+  //     (the marker is written to the PR body AFTER the last push, which is an `edited` activity);
+  //   * losing `synchronize` is the MIRROR fail-open and was measured GREEN on the membership test that
+  //     used to stand here: a new push never re-runs the gate, so the previous head's GREEN keeps
+  //     standing on a body of evidence nobody re-read — the exact staleness `edited` exists to prevent,
+  //     arriving from the other side;
+  //   * losing `opened` means the first commit of a PR is never gated at all;
+  //   * an EXTRA activity is a new run site on the repo's only required context, reported here rather
+  //     than silently admitted.
+  const PC_REQUIRED_TYPES = ["opened", "synchronize", "reopened", "edited"];
+  const lostTypes = PC_REQUIRED_TYPES.filter((a) => !items.includes(a));
+  const extraTypes = items.filter((a) => !PC_REQUIRED_TYPES.includes(a));
+  if (lostTypes.length || extraTypes.length) {
+    const parts = [];
+    if (lostTypes.length) {
+      parts.push(
+        `LOST [${lostTypes.join(", ")}]${
+          lostTypes.includes("edited")
+            ? " — `edited` is the #513 binding: `record-review.sh` PATCHes the marker into the PR body after the last push, so without it a forged `verdict=clean-micro` marker rides a stale green check to merge"
+            : ""
+        }${
+          lostTypes.includes("synchronize")
+            ? " — without `synchronize` a NEW PUSH never re-runs the gate, so the previous head's green keeps standing on evidence nobody re-read"
+            : ""
+        }`
+      );
+    }
+    if (extraTypes.length) parts.push(`ADDS [${extraTypes.join(", ")}], a new run site on the required context`);
     findings.push(
-      "pipeline-compliance.yml's `types:` LOST `edited`. That is the required context and its #513 binding depends on re-running after `record-review.sh` PATCHes the marker into the PR body; without `edited` a forged `verdict=clean-micro` marker rides a stale green check to merge. #3196 scopes this reduction to the ADVISORY guards precisely so this file is untouched."
+      `pipeline-compliance.yml's required-context \`types:\` is [${items.join(", ") || "<none>"}], not the decided set [${PC_REQUIRED_TYPES.join(", ")}]. ${parts.join("; ")}. #3196 scopes a reduction to the ADVISORY guards precisely so this file is untouched.`
     );
   }
 }
