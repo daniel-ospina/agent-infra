@@ -16693,6 +16693,12 @@ run_admin_here 42 >/dev/null 2>&1
 rc=$?
 [ "$rc" -ne 0 ] && pass "(c) a base red on a PR-EVALUABLE workflow still BLOCKS the inherited tree red (exit $rc)" \
   || fail "(c) a PR-evaluable base red was treated as base-owned — the repair direction is gone"
+# ⛔ WHICH REFUSAL. An exit-code test alone passes on ANY non-zero exit, including one
+# produced before §4.5 was ever reached (a missing sibling script, a repo-resolution
+# failure) — so the arm would print ✅ while never exercising the filter it exists to
+# pin. Ask for the tree-red refusal by name, exactly as (b) does.
+grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
+  && pass "(c) …as the §4.5 tree-red refusal" || fail "(c) the refusal is not the tree-red one — this arm may not have reached §4.5 at all: $(sed -n '1,6p' "$SCEN/err" 2>/dev/null)"
 grep -q "EXCLUDED from the required surface" "$SCEN/err" \
   && fail "(c) the PR-evaluable base red entered the base-owned name set" \
   || pass "(c) …and the base-owned name set stays empty for it"
