@@ -2567,14 +2567,27 @@ else
 # `_head_rank` arm whose value survived in a comment kept `_narms=5`. The writer is read ONCE with its
 # comments removed and every predicate grades that view.
 # ⛔ AND A TRAILING COMMENT IS STILL A COMMENT (review P2, cycle 26): dropping only FULL-LINE comments
-# left 94 code lines with a trailing `# …` in the graded view, so deleting the `unranked` arm and
+# left 69 lines that a shell would CUT at a trailing `# …` in the graded view (94 lines carry a `#`
+# after whitespace; 25 of those have it inside a quoted string, where it is data), so deleting the
+# `unranked` arm and
 # recording it beside the `severity` arm kept `_narms=5` and BOTH suites green — while the surviving
 # `case` writes the `priority-unreadable` sentence into the durable `handed_why=`, exactly the
 # conflation `81f9b3402` removed. The strip is therefore QUOTE-AWARE: a `#` inside '…' or "…" is data
-# (`head #$_head_issue` and the printf templates are full of them), and a `#` at a word boundary
-# outside quotes ends the line. RESIDUAL: a heredoc body line beginning with `#` is still dropped —
-# already true of the full-line strip, and no pinned literal lives in one.
-_WCODE="$(awk '
+# (`head #$_head_issue` and the printf templates are full of them), and a `#` at a WORD BOUNDARY
+# outside quotes ends the line.
+# ⛔ THE BOUNDARY IS SHELL'S, NOT "SPACE OR TAB" (review P2, cycle 27): `x=1;# stale` is a comment in
+# every shell, and the first version of this stripper kept it — so deleting the `unranked` arm and
+# recording it as a `;;#` comment ON the `severity` line left `_narms=5` and the whole suite GREEN
+# (measured). `;` `(` `)` `|` `&` `<` `>` therefore end the line too. `{` `}` `/` `:` `%` do NOT — they
+# legitimately precede `#` in `${x#y}`, `${#a[@]}`, `${a##*/}`.
+# RESIDUALS, stated rather than hidden: a heredoc body line beginning with `#` is still dropped (already
+# true of the full-line strip; no pinned literal lives in one), and a `#` inside a `\`-continued string
+# keeps the rest of the line.
+# ⛔ THE STRIPPER IS A FUNCTION, so the checks below grade THE MECHANISM ITSELF rather than trusting it
+# (review P2, cycle 27: the first version was only ever tested against a ` #` spelling, and every other
+# shell comment spelling stayed green).
+_strip_comments() {   # stdin → stdout, shell-comment-aware
+awk '
 {
   out = ""; q = ""; prev = "";
   n = length($0);
@@ -2582,14 +2595,30 @@ _WCODE="$(awk '
     c = substr($0, i, 1);
     if (q == "") {
       if (c == "\047" || c == "\"") { q = c; out = out c; prev = c; continue }
-      if (c == "#" && (prev == "" || prev == " " || prev == "\t")) break
+      if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) break
     } else if (c == q) {
       q = ""; out = out c; prev = c; continue
     }
     out = out c; prev = c;
   }
   print out
-}' "$REFRESH")"
+}'
+}
+_WCODE="$(_strip_comments < "$REFRESH")"
+# ⛔ ONE PROBE PER SHELL COMMENT SPELLING, because the mechanism — not just its ` #` form — is what the
+# pin trusts. `;)` `|` `&` end a comment in every shell; `#` inside quotes and `${#a[@]}` are DATA.
+_strip_probe="$(printf '%s\n' 'A=1;# stale' 'B=2)# stale' 'C=3|# stale' 'D=4&&# stale' \
+  'E="head #5 is data"  # stale' 'G="${OR##*/}"' 'H=${#arr[@]}' | _strip_comments)"
+_strip_bad=""
+for _want in 'A=1;' 'B=2)' 'C=3|' 'D=4&&' 'E="head #5 is data"  ' 'G="${OR##*/}"' 'H=${#arr[@]}'; do
+  grep -qxF -- "$_want" <<<"$_strip_probe" || _strip_bad="$_strip_bad[$_want]"
+done
+if [ -z "$_strip_bad" ]; then
+  ok "pin/writer: the comment stripper cuts every shell comment spelling and keeps \`#\` inside quotes and \`\${#arr[@]}\`"
+else
+  bad "pin/writer: the comment stripper missed $_strip_bad — a stale sentence written in that spelling stays in the graded view"
+fi
+
 _why_ok="$(grep -o 'pass completed; queue depth [^"]*' <<<"$_WCODE" | head -1)"
 case "$_why_ok" in
   *'is what dispatch takes next'*)
@@ -2674,8 +2703,23 @@ fi
 # ⛔ THE PREFIXES COME FROM THE WRITER TOO (review P3): typed here, they let a writer-side rename print
 # "all 7 fixtures carry a writer prefix" while NO prefix the writer writes was carried by any fixture
 # (measured: the sibling assertion reddened but this sentence claimed a measurement never taken).
-_head_why_pref="$(grep -o '_head_why="[^"]*"' <<<"$_WCODE" | sed 's/^_head_why="//; s/"$//' \
-  | sed 's/\$_head_rank$//; s/\${_head_rank}$//' | grep -v '^$' || true)"
+# ⛔ A VALUE IS NOT A PREFIX UNLESS THE RANK SUFFIX WAS ACTUALLY REMOVED (review P3, cycle 27): the
+# `sed` above strips `$_head_rank` only when it is the whole tail, so a writer that hoists a sentence
+# into a variable — `_hw2="carried over from an earlier pass — $_head_rank"; _head_why="$_hw2"` — emits
+# the SAME durable bytes while `$_hw2` counted as a second "distinct prefix". The suite then reported
+# "the writer always writes one, so this value cannot exist" about a value the writer produces. Rows
+# whose suffix was NOT removed are dropped, so only real prefixes survive.
+_head_why_full="$(grep -o '_head_why="[^"]*"' <<<"$_WCODE" | sed 's/^_head_why="//; s/"$//' || true)"
+_head_why_pref=""
+while IFS= read -r _hv; do
+  [ -n "$_hv" ] || continue
+  case "$_hv" in
+    *'$_head_rank'|*'${_head_rank}')
+      _strip="${_hv%\$_head_rank}"; [ "$_strip" = "$_hv" ] && _strip="${_hv%\${_head_rank}}"
+      [ "$_strip" != "$_hv" ] && [ -n "$_strip" ] && _head_why_pref="${_head_why_pref}${_head_why_pref:+
+}${_strip}" ;;
+  esac
+done <<<"$_head_why_full"
 # ⛔ THE OLD CHECK COULD NOT FAIL (review P3): each derived prefix was grepped BACK into the view it was
 # derived from, so `grep -qF` always hit, its `bad` branch was dead code, and `_pfx_ok` was a sticky OR
 # that would have said "both" on one match. What is falsifiable is the SET: the writer must expose two
@@ -2685,7 +2729,7 @@ _npfx="$(printf '%s\n' "$_head_why_pref" | sort -u | grep -c . || true)"
 if [ "${_npfx:-x}" = "2" ]; then
   ok "pin/writer: the writer exposes TWO distinct \`_head_why\` prefixes (judged-by-THIS-pass and carried-over)"
 else
-  bad "pin/writer: the writer exposes ${_npfx:-<unreadable>} distinct \`_head_why\` prefix(es) (want 2) — with one arm gone, every \`handed_why=\` claim that arm made is now unsupported"
+  bad "pin/writer: the writer exposes ${_npfx:-<unreadable>} distinct \`_head_why\` prefix(es) (want 2). Either an arm was deleted — every \`handed_why=\` claim it made is now unsupported — or the writer was REFACTORED so a sentence is no longer a literal ending in the rank clause (e.g. hoisted into a variable). The second is behaviour-identical and still needs the fixtures and this derivation re-baselined: this pin grades BYTES."
 fi
 _hw_fx="$(grep -cE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" || true)"
 _hw_bad=0
@@ -2703,7 +2747,7 @@ for _ln in $(grep -nE "^[[:space:]]*printf 'result=ok.*handed_why=" "$_PINFILE" 
     esac
   done <<<"$_head_why_pref"
   if [ "$_matched" = "0" ]; then
-    _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` carries NEITHER of the writer's \`_head_why\` prefixes — the writer always writes one, so this value cannot exist: '$_val'"; continue
+    _hw_bad=$((_hw_bad + 1)); bad "pin/writer: line $_ln \`handed_why=\` carries NEITHER of the derived \`_head_why\` prefixes. Either the fixture is wrong, or the writer refactored an arm out of a literal (see the prefix count above) — check that first: this pin grades BYTES, so a behaviour-identical refactor still needs a re-baseline. Value: '$_val'"; continue
   fi
   _fx_pfx_used="${_fx_pfx_used:-}
 $_matched_pfx"
