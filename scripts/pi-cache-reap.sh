@@ -498,13 +498,23 @@ ps_matches() {
 }
 
 # mtime_of <path> — the path's mtime in epoch seconds, or rc 1 when it cannot be read.
-# ⛔ NOT `date -r <path>`: GNU `date -r` takes a REFERENCE FILE, but the BSD/macOS `date -r` takes
-# EPOCH SECONDS — the spelling this repo records as measured in
-# scripts/cleanup-stale-branches.sh:1359. On macOS it therefore returns empty, every age fell back
-# to 0, and the stale-lock recovery became inert on the ONLY platform with a launchd clock: an
-# abandoned break token wedged the lock for ever (exit 4 = "silence" to both callers) and a
-# mis-set lock path degraded from the loud exit 3 to a silent 4. `stat` is the family idiom
-# (heartbeat-loop.sh:265, lane-scan-fallback.sh:53, monitor-worker.sh:43, atomic-land.sh:289).
+# ⛔ CORRECTED (agent-infra#3509 review P2, agent-infra#3434): this comment used to say `date -r
+# <path>` is GNU-only and "returns empty" on macOS. That is FALSE, and it is falsified by the
+# primary source rather than by an opinion: Apple's own `date` (apple-oss-distributions/
+# shell_cmds, date/date.c:147-157) parses `-r` with `strtoq(optarg, &tmp, 0)` and, when the whole
+# argument is not a number, falls back to `stat(optarg, &sb)` and prints `sb.st_mtim`; its usage
+# string is `[-r filename|seconds]`. FreeBSD's `bin/date/date.c` is identical. `date -r <path> +%s`
+# is therefore correct on BOTH GNU and BSD, and `admin-merge.sh:7683-7699` (`path_mtime`) plus
+# `scripts/orchestrator-harness/auto-rail.sh:236-247` rely on exactly that.
+# ⛔ THE REAL macOS BUG IS THE `-r <SECONDS>` FORM, NOT THE PATH FORM, and it is why nothing here
+# may format an epoch with a bare `date -r <digits>`: `strtoq` is called with BASE 0, so a
+# ZERO-PADDED `%ct` such as `0000000009` is read as OCTAL, stops consuming at the `9`, fails the
+# `stat` fallback and dies — measured at `scripts/cleanup-stale-branches.sh:1362-1370`, whose own
+# text records exactly that outcome (`illegal option -- d`, from the `date -d` fallback) and the
+# `$((10#$n))` fix. That measurement is about EPOCH-DIGITS, and it does not generalize to paths.
+# This file keeps the `stat` family idiom because the OS-guarded shim is `box_mtime`
+# (`scripts/lib/box.sh`), which `scripts/check-portability-traps.sh` points at for `stat-c-gnu`;
+# a single probe shape is what the arms below pin.
 mtime_of() {
     local m
     m="$(stat -f %m "$1" 2>/dev/null)" || m="$(stat -c %Y "$1" 2>/dev/null)" || return 1
