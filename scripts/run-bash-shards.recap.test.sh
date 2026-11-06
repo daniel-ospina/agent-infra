@@ -176,14 +176,28 @@ rm -f "$SLOW_SHARD_MARKER"
 # `kill -TERM -<pid>` reaches the RUNNER *and* the shard it waits on. Bash defers a trap until the
 # foreground child finishes, so signalling the runner alone would print the recap only after the
 # shard returned — an hour later on the real job. GitHub terminates the process GROUP on a timeout.
-# ⛔ THE FIXTURE MUST NOT INHERIT THE CALLER'S DISPATCH DECISION. CI's `bash-suites` step exports
-# `BASH_SHARD_SLICE=<i>/8` (ci.yml:1381); the narrowed runner lists THREE shards, so it REFUSES —
-# `❌ BASH_SHARD_SLICE asks for 8 slice(s) of 3 listed shard(s)` (run-bash-shards.sh:432, rc 2) — and
-# every arm below then reads a refusal as if it were a recap. `run-bash-shards.sh` already sanitises
-# at its own `shard_exec` (:926), but this suite spawns the runner DIRECTLY, so that fix cannot reach
-# it. `env -u` (not `unset`) is that contract, and it keeps `$!` equal to the runner's pid because
-# `env` execs in place — a wrapper subshell would reintroduce the pid-vs-pgid ambiguity :907-925
-# documents.
+# ⛔ THE FIXTURE MUST NOT INHERIT THE CALLER'S DISPATCH DECISION — and this `env -u` is the half of
+# that contract which sits at the SPAWN SITE. `run-bash-shards.sh` scrubs the identical three names at
+# its own `shard_exec` (:926), but that guard protects a shard the RUNNER spawns; it cannot reach the
+# runner when a TEST spawns it, and this suite spawns `runner-narrow.sh` DIRECTLY. The narrowed list is
+# THREE shards, so a child handed the outer job's slice REFUSES — `❌ BASH_SHARD_SLICE asks for 8
+# slice(s) of 3 listed shard(s)` (run-bash-shards.sh:432, rc 2) — and every arm below would then read a
+# refusal as if it were a recap. `env -u` (not `unset`) is the contract, and it keeps `$!` equal to the
+# runner's pid because `env` execs in place — a wrapper subshell would reintroduce the pid-vs-pgid
+# ambiguity :907-925 documents.
+#
+# ⛔ WHAT THIS GUARD IS **NOT**, stated so the comment is not over-read: it is NOT claiming that CI's
+# `bash-suites` lane leaks today — it does not, and it is covered twice over. `bash-suites` exports
+# `BASH_SHARD_SLICE=<i>/<n>` for the whole step (`.github/workflows/ci.yml:1384`), but every SHARD is
+# already scrubbed by `shard_exec` before this file runs, and the script-wide `unset` at :109 (#3452)
+# drops it again for everything below. Both halves are MUTUALLY SUFFICIENT — measured on the merged
+# tree with `BASH_SHARD_SLICE=5/8`, the value a real `bash-suites (<n>)` job hands its shards:
+#   · `unset` KEPT,   `env -u` REMOVED  ->  PASS 13 · FAIL 0   (#3452 alone covers the CI lane)
+#   · `unset` REMOVED, `env -u` KEPT    ->  PASS 13 · FAIL 0   (this guard alone is sufficient here)
+#   · BOTH removed                      ->  PASS  4 · FAIL 9   (the leak, reproduced — the hazard is real)
+# So what this buys is defence in depth at the one seat the runner's guard cannot reach: the leak
+# re-opens at these two sites if :109 ever moves or is deleted, and a DIRECT invocation (a repro shell
+# that exports the slice and runs THIS FILE rather than the runner) relies on this guard alone.
 set -m
 env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
   bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
@@ -270,6 +284,8 @@ if ! build_fixture "$COMPLETE" fast; then
   echo "❌ run-bash-shards.recap: cannot build the fixture — refusing to report"
   exit 2
 fi
+# The same spawn-site contract as ARM 1's child above (:188) — see the note there for what it is and
+# is not. Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
 env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
   bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
 CRC=$?
