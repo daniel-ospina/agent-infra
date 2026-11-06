@@ -594,10 +594,17 @@ else
                     *"worktree add failed"*) _mbase=1 ;;
                     *) _mbase=0 ;;
                 esac
-                # rc=1 is the base's own "worktree add" failure; 2 is a path refusal, 98 a runner that
-                # could not load its library, 127 an undefined wt_provision. Only 1 measures the argv.
-                if [ "$_mrc" != 1 ]; then
-                    bad "MUTANT: the bare-branch base failed for a cause that is NOT the base — rc=$_mrc is not the 'worktree add' failure this arm measures (2 = path refusal, 98 = library could not be loaded, 127 = wt_provision undefined). 'It failed' is satisfied by all of them: $_mres"
+                # wt_provision's WHOLE contract (wt-lifecycle.sh:299-302): 1 = nothing created and
+                # nothing left behind — the clean measurement; 3 = the SAME worktree-add failure whose
+                # ROLLBACK also failed, so residue remains (it returns 3 BEFORE setting the 'worktree add
+                # failed' account, so `_mbase` cannot see it — it is still a MEASURED base failure, and
+                # the most informative one); 2 = a path refusal; 98 = the runner could not load its
+                # library; 127 = wt_provision undefined. Only 1 is a clean verdict; 3 must be surfaced
+                # as residue rather than read either as a pass or as a foreign cause.
+                if [ "$_mrc" = 3 ]; then
+                    bad "MUTANT: the bare-branch base DID fail at 'worktree add' but its ROLLBACK failed too (rc=3) — residue was left in the fixture and must be surfaced, not read as a clean pass: $_mres"
+                elif [ "$_mrc" != 1 ]; then
+                    bad "MUTANT: the bare-branch base failed for a cause that is NOT the base — rc=$_mrc is not the 'worktree add' failure this arm measures (2 = path refusal, 98 = library could not be loaded, 127 = wt_provision undefined, or any code outside that contract). 'It failed' is satisfied by all of them: $_mres"
                 elif [ "$_mbase" != 1 ]; then
                     bad "MUTANT: rc=1 but the account is not the base's 'worktree add': $_mres"
                 elif [ "$_mmat" = 1 ]; then
