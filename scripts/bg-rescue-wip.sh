@@ -9,7 +9,10 @@
 #
 # WHAT IT GUARANTEES: after it returns 0, every TRACKED and UNTRACKED byte of the worktree's own files
 # (minus ignored paths, and minus the CONTENTS of nested repositories/submodules — see LIMITS) exists
-# as a commit reachable from `refs/wip/<branch-slug>` on `origin`. It does NOT commit to the branch,
+# as a commit reachable from `refs/wip/<slug>` on `origin`, where <slug> CARRIES THE ISSUE
+# (`fix/3442-nonvacuity` → `refs/wip/issue-3442-nonvacuity`) — agent-infra#3484: 222 archives existed
+# and nothing could map them back to an issue. A branch with no issue in it is still rescued and the
+# ref's lack of a link is REPORTED. It does NOT commit to the branch,
 # does not touch the working tree, and does not move the branch — a rescuer must never change the
 # state it is rescuing.
 #
@@ -142,7 +145,42 @@ git -C "$WT" rev-parse -q --verify HEAD >/dev/null 2>&1 && HEAD_OK=1
 
 BR="$(git -C "$WT" branch --show-current 2>/dev/null)"
 [ -z "$BR" ] && BR="detached-$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unborn)"
-SLUG="$(printf '%s' "$BR" | tr '/' '-')"
+
+# ── 3a. THE REF MUST CARRY ITS ISSUE (agent-infra#3484) ───────────────────────────────────────────
+# ⛔ THE MEASURED FAILURE. The rescue worked and the work was unfindable: 222 `refs/wip/*` archives
+# existed on origin, named `<repo>-<slug>` from the BRANCH, and nothing told the next actor to look —
+# because a diligent agent could not map a ref to the issue it should check. Slack naming is fine for a
+# human who remembers; it is useless as a HANDOVER, which is exactly what a rescue is.
+#
+# The rule is the DECLARED convention this fleet already uses for branches — `<type>/<N>-<slug>` — so a
+# branch that follows it gets a ref whose NAME carries the issue: `fix/3442-nonvacuity` →
+# `refs/wip/issue-3442-nonvacuity`. A branch that does not is still rescued (a rescued-but-unlinked
+# ref is worth infinitely more than losing the work) and the fact that it carries NO issue link is
+# REPORTED — `a ref without one is reported, not silently ignored`.
+# ⚠️ It is deliberately NOT a hard number scan: `detached-0b1d1ec` and `fix/lane-one` contain digits and
+# hex, and reading an issue number out of those would attach a real rescue to the WRONG issue. Only the
+# declared `<type>/<N>` shape is trusted.
+WIP_ISSUE=""
+case "$BR" in
+  */*)
+    case "${BR%%/*}" in
+      fix|rescue|feat|chore|docs|test|hotfix|wip|issue|pr)
+        case "${BR#*/}" in
+          [0-9]*) WIP_ISSUE="${BR#*/}"; WIP_ISSUE="${WIP_ISSUE%%[!0-9]*}" ;;
+        esac ;;
+    esac ;;
+esac
+if [ -n "$WIP_ISSUE" ]; then
+  TAIL="${BR#*/}"               # drop the type prefix
+  TAIL="${TAIL#"$WIP_ISSUE"}"     # drop the issue number
+  TAIL="${TAIL#-}"               # and the separator after it
+  SLUG="issue-$WIP_ISSUE${TAIL:+-$TAIL}"
+else
+  SLUG="$BR"
+fi
+# The same sanitisation the original used (a `/` is not legal in a ref name), extended by one character
+# for the same reason: a space would make the refspec unparseable.
+SLUG="$(printf '%s' "$SLUG" | tr '/ ' '--')"
 
 if [ "$AT_RISK" -eq 0 ]; then
   # Honest about what is NOT covered: a lane that committed locally but never pushed has a clean tree
@@ -359,6 +397,13 @@ if [ "$PUSHED" -eq 1 ]; then
     echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C) — pushed with the OSXKEYCHAIN credential after the configured one was refused for workflow scope"
   else
     echo "bg-rescue-wip: rescued $BR → origin refs/wip/$SLUG ($C)"
+  fi
+  # ── 7. REPORT AN UNLINKED REF, EVERY TIME IT IS CREATED (agent-infra#3484) ─────────────────────
+  # A rescue nobody can find is a rescue that happens twice. This is a REPORT, not a failure: the work
+  # is safely on origin either way, so it does not change the exit code — but it says the one thing the
+  # next actor cannot get anywhere else, which is that THIS ref has no issue to be mapped to.
+  if [ -z "$WIP_ISSUE" ]; then
+    echo "bg-rescue-wip: ⚠ refs/wip/$SLUG CARRIES NO ISSUE LINK — branch '$BR' does not follow <type>/<N>-<slug>, so nothing can map this rescue to an issue. Record it by hand (an issue comment naming refs/wip/$SLUG) or rename the branch and re-rescue (#3484)." >&2
   fi
   # A partial archive is a rescue, not a clean one: the skipped paths are still only on this disk.
   if [ "${#SKIPPED[@]}" -gt 0 ]; then
