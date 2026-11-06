@@ -64,6 +64,10 @@ mk_repo "$T/agent-infra" daniel-ospina/agent-infra
 mk_repo "$T/decoy"       daniel-ospina/somebody-else
 mkdir -p "$T/plaindir"        # a directory that is not a work tree
 mkdir -p "$T/state" "$T/state-ai"
+# Round 6, P2 fixtures: a real SUBDIRECTORY (so `../..` traversal has somewhere to go) and a
+# SYMLINK to a state dir. Both are ONE directory with `$T/state`; the reader must say so.
+mkdir -p "$T/state/sub"
+ln -s "$T/state" "$T/state-link"
 
 # The canonical two-repo set. `#2281` is exactly the box in the issue: one controller for tortoise,
 # a second repo whose 39 open PRs nothing enumerated.
@@ -558,6 +562,34 @@ printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/state\nslug=daniel-ospi
   "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/spell-state.conf"
 ck "m2 two SPELLINGS of one state dir are the shared-state refusal (// and . fold)" \
    'run_reader "$T/spell-state.conf" check | grep -q "is shared with another repo in this set"'
+# Round 6, P2: spelling alone cannot express identity for a path that EXISTS. `..` and a symlink are
+# one directory with their target, and `_rs_norm_path` never touches the filesystem, so it folds
+# neither. Before `_rs_state_key` BOTH of these printed `repo-set: ok` twice and exited 0 with
+# `OK — 2 repo(s)` — the green validation of the one collision this arm exists to refuse.
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/state/sub/..\n' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/dotdot-state.conf"
+ck "m3 a state dir named through \`..\` is the shared-state refusal (one directory)" \
+   'run_reader "$T/dotdot-state.conf" check | grep -q "is shared with another repo in this set"'
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/state-link\n' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/symlink-state.conf"
+ck "m4 a state dir named through a SYMLINK is the shared-state refusal (one directory)" \
+   'run_reader "$T/symlink-state.conf" check | grep -q "is shared with another repo in this set"'
+# …and the resolved-key arm DISCRIMINATES: two genuinely different existing dirs still pass. Without
+# this the two arms above would be satisfied by a key that refuses everything.
+ck "m5 two genuinely DIFFERENT state dirs are still accepted — the resolved key discriminates (rc 0)" \
+   '[ "$(run_reader_rc "$CONF" check)" = 0 ]'
+# The controls below prove m3/m4 are not vacuous: they assert the fixtures really ARE one directory,
+# using the platform's own stat (GNU `-c` / BSD `-f`), which is the evidence `_rs_state_key` acts on.
+# ⛔ `-L` IS LOAD-BEARING. Both `stat` flavours report a SYMLINK'S OWN inode by default, so a
+# non-dereferencing probe made m6 red on a correct fix (measured: `state` 65024:163921 vs
+# `state-link` 65024:141209 without `-L`, identical with it). A control that cannot pass on either
+# platform is a false red in the arm that exists to prove the other arms are real.
+ino() { stat -L -c '%d:%i' "$1" 2>/dev/null || stat -L -f '%d:%i' "$1"; }
+STATE_INO="$(ino "$T/state")"
+ck "m6 …and the control fixtures really are one directory (\`..\` and the symlink share an inode)" \
+   '[ -n "$STATE_INO" ] && [ "$STATE_INO" = "$(ino "$T/state/sub/..")" ] && [ "$STATE_INO" = "$(ino "$T/state-link")" ]'
+ck "m7 …while the two DIFFERENT dirs do not (so m3/m4 are proving identity, not refusing everything)" \
+   '[ "$STATE_INO" != "$(ino "$T/state-ai")" ]'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the

@@ -137,6 +137,38 @@ EOF_NORM
   printf '%s' "$out"
 }
 
+# _rs_state_key <path> — the IDENTITY of a state dir, for the shared-state refusal. Spelling is not
+# identity, and `_rs_norm_path` alone cannot express that: it folds `//`, `.` and a trailing `/`
+# WITHOUT touching the filesystem (right for a dir the operator has not created yet), so `..` and a
+# SYMLINK survive it — and each of those is ONE DIRECTORY with its target.
+#
+# ⛔ MEASURED, WITH INODE PROOF (review round 6, P2 — the arm round 3 opened and only half-closed).
+# Against this reader before this helper existed, `state=/srv/s` vs `state=/srv/s/sub/..` and
+# `state=/srv/s` vs a symlink to it both printed `repo-set: ok` for BOTH entries and exited 0 with
+# `repo-set: OK — 2 repo(s)` — while `stat -c '%d:%i'` returned ONE inode for each pair. That is a
+# green `check` on precisely the silent-sharing failure this file's own docstring says it refuses:
+# two controllers on one `.orch.lock`, one candidates list, one worker registry, each believing it is
+# alone on the box. The controls (identical spellings, a trailing `/`) DO refuse, which is what makes
+# it a defect rather than a matter of taste — the refusal was satisfiable by a differently-typed path.
+#
+# So: RESOLVE when the path exists, fall back to the pure-spelling norm when it does not.
+#   * `cd -P` collapses `..`, `//`, `.` AND symlinks in one step on macOS and GNU alike — no
+#     `readlink -f` (BSD does not have it) and no `stat -f`/`stat -c` flag divergence to get wrong,
+#     which is the same portability argument this file already makes for `case` over `[[ =~ ]]`.
+#   * the fallback is not an oversight: `check` deliberately does NOT require `state` to exist, and a
+#     set whose state dir the operator creates afterwards must not start failing.
+#   * case stays the CALLER's fold (`_rs_lower`), because a dir that does not exist cannot be
+#     resolved at all — folding after resolution is the only way the APFS arm (m1) survives when the
+#     fixture (and a real box) has no such directory yet.
+_rs_state_key() {
+  local p="${1:-}" resolved=""
+  if [ -n "$p" ]; then
+    resolved="$( cd -P "$p" 2>/dev/null && pwd -P )"
+  fi
+  [ -n "$resolved" ] || resolved="$(_rs_norm_path "$p")"
+  printf '%s' "$resolved"
+}
+
 # _rs_slug_ok <s> — `owner/name`, and exactly one `/`. `case` rather than `[[ =~ ]]` so this file
 # parses under bash 3.2 (macOS) as readily as under bash 5 (cells) — the shard runs the same file on
 # both, and a `=~` that only one of them supports is a suite that fails on the box nobody is looking
@@ -437,8 +469,13 @@ repo_set_check() {
       # ⛔ SPELLING AND CASE BOTH FOLD (round 3, P2). `/srv/state`, `/srv//state` and `/srv/./state`
       # are one directory, so a raw comparison passed the collision this arm refuses; `_rs_norm_path`
       # collapses them without touching the filesystem, and `_rs_lower` covers APFS/HFS+.
+      # ⛔ AND SO DO `..` AND SYMLINKS (round 6, P2). Those two are one directory with their target
+      # and `_rs_norm_path` cannot see it — it never touches the filesystem — so both passed as `ok`.
+      # `_rs_state_key` resolves identity when the path exists and keeps the spelling norm as the
+      # not-yet-created fallback; `_rs_lower` still folds on top, which is what keeps the APFS arm
+      # working for a directory that does not exist yet.
       local norm_state
-      norm_state="$(_rs_lower "$(_rs_norm_path "$state")")"
+      norm_state="$(_rs_lower "$(_rs_state_key "$state")")"
       case "$seen_states" in
         *$'\n'"$norm_state"$'\n'*)
           problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit" ;;
