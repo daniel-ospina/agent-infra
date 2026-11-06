@@ -1282,7 +1282,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" stated_from_sha="" sfr="" range_ok="" _delta_tok="" E_OUT="" E_RC=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1685,33 +1685,58 @@ $m"
     # blind again. Using the SAME regex token prefix in both is what makes divergence
     # impossible rather than merely unlikely.
     if [[ "$EVIDENCE_BODY" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*: ]]; then _delta_tok=1; fi
-    if [[ "$EVIDENCE_BODY" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*:[[:space:]]*([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; then
-      stated_from="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
-      stated_sep="${BASH_REMATCH[2]}"
-      stated_to="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
-    elif [ "$_delta_tok" -eq 1 ]; then
-      echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as delta:<40-hex>..<40-hex> (or ...), or run a fresh review at the head and use plain --evidence comment:<id>." >&2
-      return 1
-    fi
-    if [ -n "$stated_to" ]; then
-      range_ok=0
-      case "$to" in
-        "$stated_to"*) range_ok=1 ;;
-      esac
-      if [ "$range_ok" = 1 ]; then
-        range_ok=0
-        stated_from_sha="$(delta_git "$root" rev-parse --verify "${stated_from}^{commit}" 2>/dev/null || true)"
-        if [ -n "$stated_from_sha" ]; then
-          sfr=0
-          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?
-          [ "$sfr" = 0 ] && range_ok=1
+    # ⛔ ARM ON THE RANGE SHAPE, AND CHECK EVERY OCCURRENCE (4th review cycle — two findings,
+    # both reproduced against this file).
+    # (a) Keying the guard on the WORD `delta` left every other honest spelling of "I read
+    #     only A1..HEAD" invisible to BOTH layers — `Reviewed only A1...HEAD`, `deltas:
+    #     A1..HEAD` — so they fell through to the bare needle TOGETHER. That is the
+    #     shared-blind-spot failure a third time, one level up: the guard must arm on the
+    #     SHAPE that carries the claim, not on a word that merely introduces it. MEASURED:
+    #     `Reviewed only <A1>...<HEAD>; no issues found.` recorded rc 0 with
+    #     delta_range=BASE..HEAD, marking the authored commit as reviewed.
+    # (b) `=~` is a LEFTMOST match, so parsing ONE range made the arm ORDER-DEPENDENT: a body
+    #     quoting the wide range first and the narrower one it actually read SECOND was
+    #     accepted on the first — even when the artifact said in words that the extension was
+    #     invalid — while the mirror order refused. Order-dependence is not containment, and
+    #     a reviewer quoting the brief's range before their own is ordinary prose. So EVERY
+    #     stated range is checked and ALL must pass.
+    # A body that states no range at all still falls to the bare needle, which is the case
+    # that arm exists for; a body that names a `delta:` token but states no parseable range
+    # REFUSES, so an unreadable claim is never reinterpreted as a bare-head one.
+    _scan="$EVIDENCE_BODY"; _any=0; _all_ok=1
+    while [[ "$_scan" =~ ([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; do
+      _any=1
+      _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
+      _ss="${BASH_REMATCH[2]}"
+      _st="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
+      # Advance PAST this match so the next iteration cannot re-match a suffix of it.
+      _scan="${_scan#*"${BASH_REMATCH[0]}"}"
+      _ok=0
+      case "$to" in "$_st"*) _ok=1 ;; esac
+      if [ "$_ok" = 1 ]; then
+        _ok=0
+        _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
+        if [ -n "$_sfs" ]; then
+          _r=0
+          delta_git "$root" merge-base --is-ancestor "$_sfs" "$from" 2>/dev/null || _r=$?
+          [ "$_r" = 0 ] && _ok=1
         fi
       fi
-      [ "$range_ok" = 1 ] && body_claim=1
-      if [ "$range_ok" -ne 1 ]; then
-        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
-        return 1
+      if [ "$_ok" -ne 1 ]; then
+        stated_from="$_sf"; stated_sep="$_ss"; stated_to="$_st"
+        _all_ok=0
+        break
       fi
+    done
+    if [ "$_any" -eq 1 ] && [ "$_all_ok" -ne 1 ]; then
+      echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts. (EVERY range the artifact states is checked, not just the first.)" >&2
+      return 1
+    fi
+    if [ "$_any" -eq 1 ]; then
+      body_claim=1
+    elif [ "$_delta_tok" -eq 1 ]; then
+      echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as <40-hex>..<40-hex> (or ...), or run a fresh review at the head and use plain --evidence comment:<id>." >&2
+      return 1
     else
       for _needle in "$to" "${to:0:12}"; do
         case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
