@@ -1881,17 +1881,26 @@ def test_T_lane_dispatch_local_field_and_unreadable_local_probe(tmp_path, monkey
         assert payload["local"] is False, payload          # MEASURED, not UNMEASURED
         assert "UNMEASURED(" in str(payload["remote"]), payload
 
-        # (b) worktree is NOT a repo at all → the local probe cannot RUN (rc=128) → still a refusal,
-        #     even with a readable origin whose branch list is empty.
-        origin = tmp_path / "origin.git"
-        subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+        # (b) worktree is NOT a repo (the local probe cannot RUN, rc=128) WITH A READABLE ORIGIN whose
+        #     branch list is empty. Both probes are stubbed because that is the only way to build this
+        #     state portably — without the stub, `origin` is simply unreadable and the refusal fires on
+        #     the REMOTE axis, so the arm would pass with the `rc in (0, 1)` guard removed (review
+        #     cycle 4, P2: the guard's label was pinned, its decision was not).
         notrepo = tmp_path / "notrepo"
         notrepo.mkdir()
+        def _stubbed_run(argv, *a, **k):
+            if "rev-parse" in argv:          # local probe: COULD NOT RUN
+                return mod.Ran(list(argv), rc=128, stderr="fatal: not a git repository")
+            return mod.Ran(list(argv), rc=0, stdout="")   # remote probe: READ, and empty
+        monkeypatch.setattr(mod, "run", _stubbed_run)
         (tmp_path / "o" / "bg" / "P2.pid").write_text("777\n")
         monkeypatch.setenv("ORCH_MCP_DISPATCH", stub(tmp_path, "d-ok2.sh", "print('launched')"))
         is_err, payload = one(mod, "lane.dispatch", {"name": "P2", "worktree": str(notrepo),
                                                     "brief": str(brief), "branch": "nope-2"})
         assert is_err and payload["refused"] == "branch-existence-unmeasured", payload
         assert "UNMEASURED(" in str(payload["local"]), payload
+        # and the remote axis is genuinely MEASURED here — this is what makes the assertion above
+        # discriminate on `rc in (0, 1)` rather than on an unreadable remote
+        assert payload["remote"] is False, payload
     finally:
         monkeypatch.undo()

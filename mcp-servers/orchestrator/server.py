@@ -1882,17 +1882,29 @@ ALLOWLIST = {
     "whoami": ([], 1),
     "id": ([], 1),
     # ⛔ THE PREFIX IS ENFORCED (see `_allowlisted`), SO IT MUST MEAN SAFETY, NOT FORMATTING. `df`,
-    # `free` and `ps` were the entries where the prefix was a PRETTY-PRINTING default rather than a
-    # safety property: enforcing them refused `df /`, `free -h` and `ps -ef` — read-only calls, refused
+    # `df`, `free` and (then-admitted) `ps` were the entries where the prefix was a PRETTY-PRINTING
+    # default rather than a safety property: enforcing it refused `df /`, `free -h` and `ps -ef` —
+    # read-only calls, refused
     # with a reason naming neither. `max_args` is the real limit for all three, and none of them mutates
-    # state from an operand (`df /` QUERIES that filesystem; `ps -ef` is the standard listing).
+    # state from an operand (`df /` QUERIES that filesystem). `ps` was removed afterwards — see the
+    # removal note below; its `max_args` bound is history, not a live limit.
     # ⛔ THE PREFIX MECHANISM IS KEPT AND IS NOT DEAD CODE: it is the INVARIANT that a declared fixed
     # prefix is honoured rather than unpacked and ignored (the defect that made `hostname NAME` pass),
     # and it is pinned by an arm that installs a prefixed entry and asserts the prefix is enforced — so
     # a future entry can rely on it and a future deletion of the check reds.
     "df": (None, 3),
     "free": (None, 3),
-    "ps": (None, 2),
+    # ⛔ `ps` AND `pgrep` USED TO SIT HERE, AND THEY DISCLOSE THE SAME SECRET CLASS `cat` DID (review
+    # cycle 4, P2). `ps` was bounded only by ARG COUNT, and the BSD combined form takes an `e`:
+    # `ps auxe` appends every process's ENVIRONMENT. Measured with a canary that existed only in the
+    # environment and on no command line — `ps auxe` printed it. On procps, `pgrep -a --list-full`
+    # similarly carries other processes' command lines, which routinely contain tokens.
+    # Bounding them by flag was rejected for the same reason a path bound was rejected for `cat`: the
+    # safe and unsafe spellings are one letter apart (`auxe` vs `aux`), and a rule that must enumerate
+    # `-eo e`, `e`, `auxe`, `eax`, … is a rule that will miss one. Removed instead. What remains for
+    # process/liveness diagnostics is metadata and counts (`df`, `free`, `ls`, `wc`, `sha256sum`,
+    # `uname`, `uptime`, `id`, `whoami`, `hostname`), and lane liveness is answered by `lane.list` /
+    # `lane.show`, which is the surface this server exists to provide.
     "git": (None, 8),
     "ls": (None, 6),
         # ⛔ `cat` IS DELIBERATELY NOT ALLOWLISTED (review P2). With no path bound it admitted
@@ -1903,7 +1915,7 @@ ALLOWLIST = {
     # the legitimate paths are most of the box, so a bound would have been decorative.
     "wc": (None, 4),
     "sha256sum": (None, 4),
-    "pgrep": (None, 4),
+    # (`pgrep` travelled with `ps` — see the note above.)
 }
 
 # ⛔ THE VERB LIST IS THE BOUNDARY, NOT THE FLAG LIST (review cycle 3, P1). Three cycles tried to
@@ -2137,8 +2149,11 @@ def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, boo
         record = token
         key, _, value = record.partition("\n")
         key = key.strip()
-        if _git_origin_is_checkout(origin):
-            saw_repo = True
+        # ⛔ NO SECOND `saw_repo` SET HERE (review cycle 4, P2). `origin` is assigned once, above, and
+        # `_git_origin_is_checkout` is pure on its argument — so by the time this branch runs, the guard
+        # below could only ever re-set a value the earlier check already settled. It read as
+        # evidence-gathering and changed nothing; a reader could delete it or trust it with identical
+        # behaviour, which is the same class as the constants this file deleted.
         if GIT_PARTIAL_CLONE_RE.match(key):
             fault = fault or ("the target checkout declares a PARTIAL CLONE (%s): an object read can "
                               "trigger a LAZY FETCH from the promisor remote, which runs that "
@@ -2388,7 +2403,10 @@ def _allowlisted(argv: List[str]) -> Tuple[bool, str]:
                                "identity every lane record and lane_id is minted from" % token)
     if prog == "git" and (not rest or rest[0] not in GIT_OK_VERBS):
         return False, "git verb %r is not read-only" % (rest[0] if rest else "")
-    if prog in ("wc", "sha256sum", "pgrep") and not rest:
+    # ⛔ `pgrep` IS NOT IN THIS TUPLE ANY MORE (review cycle 4): it was removed from the allowlist for
+    # disclosing other processes' command lines, and `prog not in ALLOWLIST` already returns earlier —
+    # so naming it here was residue that read as "pgrep is admitted" inside the gate itself.
+    if prog in ("wc", "sha256sum") and not rest:
         return False, "%r needs an argument" % prog
     return True, ""
 
