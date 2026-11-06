@@ -123,6 +123,55 @@ function subtree(region, startIdx, parentIndent) {
   return out;
 }
 
+// jobBlock(text, name, file) — the lines owned by `jobs.<name>`, or a refusal.
+//
+// ⛔ THIS READER EXISTS FOR ONE FACT THE `on:` REGION CANNOT CARRY (2026-11-06): whether the REQUIRED
+// job is kept OFF a trigger that is legitimate for the FILE. The `on:` reader stops at the first
+// column-0 key, so it never sees `jobs:`, and the guard lives there. A trigger pinned only by its
+// name would accept `issue_comment:` on a file whose required job no longer excludes it — a
+// `pull_request`-shaped verdict attached to an event that has no PR head at all.
+//
+// The block runs from `  <name>:` to the next non-blank, non-comment line at indent <= 2 (the next job
+// under `jobs:`). Absent job: refusal (exit 2), never a silent "no guard found → pass".
+function jobBlock(text, name, file) {
+  const lines = text.split("\n");
+  const start = lines.findIndex((raw) => {
+    const m = /^([ \t]+)(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))[ \t]*:[ \t]*(?:#.*)?$/.exec(raw);
+    if (!m) return false;
+    return m[1].length === 2 && (m[2] ?? m[3] ?? m[4]) === name;
+  });
+  if (start < 0)
+    refuse(`${file}: no \`${name}:\` job at the two-space indent under \`jobs:\` — the trigger's guard cannot be read`);
+  const out = [];
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const raw = lines[i];
+    if (!blank(raw) && !comment(raw) && indentOf(raw) <= 2) break;
+    out.push({ raw, indent: indentOf(raw), no: i + 1 });
+  }
+  return out;
+}
+
+// guardKeepsJobOff(lines, token) — is there an `if:` in this job block that EXCLUDES `token`?
+//
+// Two accepted spellings, both read from the expression itself rather than from the line's position:
+// an expression that NAMES the token (`github.event_name != 'issue_comment'`, the shipped form) and a
+// positive allow-list of PR-shaped events (`== 'pull_request'`). Anything else is a finding — a
+// one-line `if:` this reader cannot attribute is a guard it cannot vouch for, and the over-block
+// direction is the deliberate one here.
+//
+// STATED LIMIT: a FOLDED `if: >-` puts the expression on following lines, so the token would not be
+// seen and this reads as "no guard" (RED). That is a visible false block, not a silent pass — and
+// the shipped file uses the one-line form.
+function guardKeepsJobOff(lines, token) {
+  return lines.some((l) => {
+    const m = /^[ \t]*if:[ \t]*(.+)$/.exec(l.raw);
+    if (!m) return false;
+    const expr = m[1];
+    if (new RegExp(`(^|[^A-Za-z0-9_])${token}([^A-Za-z0-9_]|$)`).test(expr)) return true;
+    return /github\.event_name[ \t]*==[ \t]*['"](pull_request|workflow_run)['"]/.test(expr);
+  });
+}
+
 // filterKeys(lines) — the depth-1 keys of a trigger's value, and their raw lines.
 function filterKeys(lines) {
   if (lines.length === 0) return null;
@@ -334,10 +383,31 @@ function checkPipelineComplianceUnchanged() {
 
   // `workflow_call` is legitimate here (consumers reuse this file); anything else is a new run site
   // on the repo's only required context, and a `push:` arm would attach its verdict to main.
-  const extraOn = extraSet(onKeys(region, childIndent), ["workflow_call", "pull_request"]);
+  //
+  // ⛔ `issue_comment` IS THE SANCTIONED THIRD TRIGGER (#2467) — AND IT IS SANCTIONED WITH A GUARD, NOT
+  // BY NAME ALONE (2026-11-06). #3196 pinned this key set to `workflow_call` + `pull_request`; three
+  // days later #2467 added an `issue_comment:` arm so a scoping comment landing on the linked ISSUE —
+  // which fires no `pull_request` event — can re-run the EXISTING gate run instead of leaving a red
+  // minted before that comment standing. It is a RE-RUN SITE, not a second verdict site: the
+  // `pipeline-compliance` job carries `if: github.event_name != 'issue_comment'`, and every other job
+  // that would mis-attach is guarded the same way. The pin was simply never taught about it, so the
+  // live tree read RED (`declares [issue_comment] besides workflow_call: and pull_request:`) against a
+  // deliberate, documented trigger — a false block, which is how a gate stops being read.
+  //
+  // So the name is admitted HERE and the property it depends on is pinned BELOW: the required job must
+  // keep saying, in its own `if:`, that a comment event is not its business. Dropping the guard is the
+  // edit that would turn this trigger into a way to attach the repo's only required status context to
+  // an event with no PR head — and it is now a RED rather than an invisible one.
+  const onSet = onKeys(region, childIndent);
+  const extraOn = extraSet(onSet, ["workflow_call", "pull_request", "issue_comment"]);
   if (extraOn.length) {
     findings.push(
-      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\` and \`pull_request:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
+      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\`, \`pull_request:\` and \`issue_comment:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
+    );
+  }
+  if (onSet.includes("issue_comment") && !guardKeepsJobOff(jobBlock(text, "pipeline-compliance", PC_FILE), "issue_comment")) {
+    findings.push(
+      "pipeline-compliance.yml declares `issue_comment:` on `on:`, but its `pipeline-compliance` JOB carries no `if:` that keeps the required context off that event. The trigger is only a re-run site (#2467) BECAUSE the job refuses a comment event (`if: github.event_name != 'issue_comment'`); without that guard the repo's ONLY required status context can report a verdict against an event that has no pull-request head, which is the fail-open the trigger's own header says the job guard prevents."
     );
   }
 
