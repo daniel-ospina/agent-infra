@@ -843,6 +843,16 @@ br ok normal --check
 [ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '$$DSK' ] \
   && ok "an ESCAPED literal ('\$\$DSK') is a credential and is left alone" \
   || bad "an escaped-literal key was rewritten — pi resolves it to a literal string"
+# ⛔ NOT-REWRITTEN IS NOT ENOUGH: a classifier that regressed this to `other` would die WITHOUT
+# touching the file and the arm above would stay green over a refused box.
+# ⛔ NOT `BR_RC -eq 0`: the whole run also has to survive the LATER gates, and on a non-cell host the
+# scheduled layer refuses for its own (documented) reasons — an arm keyed on rc would be measuring
+# this host, not the store. The store verdict is asserted where it is printed.
+case "$BR_OUT" in
+  *"will not rewrite"*|*"holds no usable"*|*"could not be written"*)
+    bad "an escaped literal was REFUSED by the store gate instead of accepted: $BR_OUT" ;;
+  *) ok "…and the store gate CERTIFIED it (no refusal in the run, even where a later gate stops)" ;;
+esac
 
 printf '{"deepseek":{"type":"api_key","key":"$$DSK$x"}}\n' > "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"
@@ -856,9 +866,28 @@ br ok normal --check
 rm -f "$AUTH"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
+for empty_shape in absent '{}' '   '; do
+  case "$empty_shape" in
+    absent) rm -f "$AUTH" ;;
+    '{}')   printf '{}\n' > "$AUTH" ;;
+    '   ')  printf '   \n\n' > "$AUTH" ;;
+  esac
+  printf '%s\n' "$TOK_BODY" > "$TOK"
+  br ok normal --check
+  case "$BR_OUT" in
+    *"the pi CLI would reject"*) bad "an '$empty_shape' store was REPORTED as holding CLI-invalid entries: $BR_OUT" ;;
+    *) ok "an '$empty_shape' store draws NO CLI-invalid report (the warn path reads the right line)" ;;
+  esac
+done
+# …and the shape the delta's new clause names — an entry that is NOT an object — is reported and refused.
+printf '{"deepseek":false}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an entry that is not a JSON object REFUSES the cell (a lane reads no key from it)" \
+                   || bad "a non-object entry was certified"
 case "$BR_OUT" in
-  *"the pi CLI would reject"*) bad "a store with no entries was REPORTED as holding CLI-invalid entries: $BR_OUT" ;;
-  *) ok "an absent/empty store draws NO CLI-invalid report (the warn path reads the right line)" ;;
+  *"will not rewrite"*) ok "…naming the shape it will not rewrite" ;;
+  *) bad "the non-object refusal does not say what it will not do: $BR_OUT" ;;
 esac
 
 # (q) …while a store the CLI WOULD reject is reported — even though the lane path uses the key fine.

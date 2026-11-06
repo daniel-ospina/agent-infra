@@ -868,6 +868,13 @@ case "$CC_OUT" in
   *"has no usable 'deepseek' credential"*) ok "…as \"no usable credential\", not as an unreadable file" ;;
   *) bad "the refusal does not classify the entry correctly: $CC_OUT" ;;
 esac
+# …and the CLI-invalid entry is ALSO reported: a POSITIVE control for the warn path, which the
+# "an empty store draws NO report" arm below cannot supply (an absence assertion is satisfied by a
+# warning that was deleted outright — the same trap this suite names elsewhere).
+case "$CC_OUT" in
+  *"the pi CLI would reject"*deepseek*) ok "…and the CLI-invalid entry IS reported (a lane is unaffected; 'pi auth' is not)" ;;
+  *) bad "an entry the pi CLI rejects is SILENT in 'check' — the warn path is dead: $CC_OUT" ;;
+esac
 # (e2) …and with the key DELIVERED it is not a refusal at all: the bring-up rewrites that one field.
 printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
 cellcheck 0
