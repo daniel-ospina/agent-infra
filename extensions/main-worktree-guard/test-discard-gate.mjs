@@ -1852,6 +1852,245 @@ async function partB() {
     execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
     for (const f of [undoExp, undoExpGlob, undoExpHome, undoExpSub, undoCleanGlob, outerExp, outerPipeExp, producerExp, outerBarePipeExp, outerGlobPayload, casePatternExp]) rmSync(f, { force: true });
 
+    // ── B14 (#3243): the arm refuses a PATH, so DATA must not become one ──
+    //
+    // The expansion arm's premise is "this word is the script the shell WILL
+    // execute". Two shapes violated it, each refusing the ENTIRE shipping script
+    // that merely CONTAINED the data (measured 2026-11-02). Both are now
+    // ALLOWED, and each is fixed by a NARROWING of the recogniser, not by a
+    // change to the verdict polarity:
+    //   (a) an awk PROGRAM — an argument, not a command word. Fixed by
+    //       `wtIsPathShapedScriptWord` (a command-position word must BE a path)
+    //       and by the extglob hunt walking only the word that IS the command.
+    //   (b) a sed EXPRESSION — the same; plus `wtSplitPipeline`'s quote model,
+    //       which stops reading a `|` inside an expression as a pipeline.
+    // Both are measured over the whole committed corpus, not just these fixtures:
+    // 17 of the 373 committed `*.sh` are newly RUN by this change and 0 are
+    // newly refused (73 refused before it, 56 after — one environment; README's
+    // #3243 section carries the census and the reason the pair is quoted together).
+    //
+    // ⛔ B14c/B14d are pinned as ALLOWED-AND-HONESTLY-LABELLED, not as "the quote
+    // model is now correct for a body". A comment's apostrophe still desyncs the
+    // segment quote model — `_wtCommandSegments` carries ONE quote state across
+    // the whole text — and the FIRST DRAFT of this fix papered over that by
+    // preparing the body through `stripHeredocData`, which was MEASURED and
+    // REJECTED: correct parsing makes 22 scripts run but 21 others REFUSED
+    // (11 of them CI suites), because the same comment artefact had been
+    // MASKING real `bash "$VAR"` operands. B14k pins the residual the desync
+    // leaves behind, with its control, so the next lane inherits the map.
+    const awkProg = join(wt, "awkprog-3243.sh");
+    write(awkProg, [
+      "#!/bin/bash",
+      'echo "a\tb" | awk -F"\\t" \'/^tree=/{t=$2} /^ref=/{f=$2} \'',
+      "git status --porcelain >/dev/null",
+      "",
+    ].join("\n"));
+    expectTrue("B14a (#3243): an awk PROGRAM in a script body is not a script path → ALLOWED",
+      allowed(await bash("bash ./awkprog-3243.sh", wt)), "was blocked");
+
+    const sedProg = join(wt, "sedprog-3243.sh");
+    write(sedProg, [
+      "#!/bin/bash",
+      "echo ' a b ' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'",
+      "",
+    ].join("\n"));
+    expectTrue("B14b (#3243): a sed EXPRESSION in a script body is not a script path → ALLOWED",
+      allowed(await bash("bash ./sedprog-3243.sh", wt)), "was blocked");
+
+    const proseBody = join(wt, "prose-3243.sh");
+    write(proseBody, [
+      "#!/bin/bash",
+      "# CI reads this on BOTH platforms | the badge says `sh` is absent (#2416).",
+      "# It costs ~520 lines; see `bash script*.sh` in the old notes.",
+      "exit 0",
+      "",
+    ].join("\n"));
+    expectTrue("B14c (#3243): a COMMENT paragraph carrying `|`, `$`, backticks and a glob is not a script path or a pipeline → ALLOWED",
+      allowed(await bash("bash ./prose-3243.sh", wt)), "was blocked");
+
+    const apostropheBody = join(wt, "apostrophe-3243.sh");
+    write(apostropheBody, [
+      "#!/bin/bash",
+      "# edit the COPY's fleet_srcs array (one line, as ci_runner_gate.test.sh reads it).",
+      "grep -v '^[[:space:]]*#' f | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'",
+      "",
+    ].join("\n"));
+    // ⛔ THE LABEL IS THE PIN. An earlier draft of this arm said the apostrophe
+    // "no longer desyncs the quote model" — it still does; what changed is that the
+    // sed EXPRESSION the desync exposed is no longer read as a command, because the
+    // expression is not path-shaped and the word hunt only walks the command word.
+    expectTrue("B14d (#3243): a comment APOSTROPHE must not turn a later sed EXPRESSION into an executed path → ALLOWED",
+      allowed(await bash("bash ./apostrophe-3243.sh", wt)), "was blocked");
+
+    // ── B14k KNOWN-FALSE pin (#3243 residual, PRE-EXISTING, recorded not fixed) ──
+    // A `cat <producer> | bash` written at TOP LEVEL is probed (the producer file is
+    // seeded and its discard gated). The SAME pipeline written INSIDE A SCRIPT BODY is
+    // not: the body walk only follows `extractScriptPath(content)` for a literal nested
+    // script, and a piped producer is not that, so nothing is seeded and the discard in
+    // `undo.sh` is never read. MEASURED identical at the pre-change head and here (probe
+    // against both module builds), so this is not a regression this change introduces —
+    // it is the same body walk the #1228 arm reads one field over.
+    //
+    // The pair discriminates in the direction that matters: the pin records the gap, and
+    // B14k-control shows the SAME pipeline at top level is BLOCKED — so the pin cannot
+    // pass because the pipeline recogniser went quiet. Closing it means seeding the
+    // producer from a body's own pipeline segments, which is a change to the walk's
+    // contract (and to what its `$VAR` residual means) — recorded on #3243.
+    const bodyPipe = join(wt, "bodypipe-3243.sh");
+    write(bodyPipe, "#!/bin/bash\ncat ./undo-bodypipe.sh | bash\n");
+    write(join(wt, "undo-bodypipe.sh"), "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    write(join(wt, "dirty.txt"), "MUTANT-3243\n");
+    expectTrue("B14k KNOWN-FALSE (#3243 residual, pre-existing): a `cat <producer> | bash` inside a BODY is not seeded, so the discard it runs is unprobed",
+      allowed(await bash("bash ./bodypipe-3243.sh", wt)),
+      "now BLOCKED — the residual was closed: flip this pin and update README's #3243 section");
+    expectTrue("B14k-control: the SAME pipeline as the COMMAND is BLOCKED — so B14k is the body walk, not the recogniser",
+      blocked(await bash("cat ./undo-bodypipe.sh | bash", wt)), "was allowed");
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    for (const f of [bodyPipe, join(wt, "undo-bodypipe.sh")]) rmSync(f, { force: true });
+
+    // ── B15: the REVIEW CYCLE-1 findings — a paraphrase of "/the narrowings must not
+    // make a RECOGNISER go blind". Each of these was a fail-OPEN regression in the
+    // first cut of this change (base BLOCK, head ALLOW), measured through this same
+    // handler, and each really discards when run. They are pinned here so the
+    // regression cannot return, and each is paired with the base's own verdict.
+    //
+    // B15a-d (F1): `wtSplitPipeline` introduced the first quote model this arm ever
+    // had, and ANY construct that leaves a quote open past a `|` — a comment
+    // apostrophe, a here-doc data body, ANSI-C `$'…'` (whose `\'` IS an escape) —
+    // blindfolded it. The blind `split("|")` it replaced had no state to desync.
+    // The fix is a BLIND-SPLIT FALLBACK when the scan ends with a quote open: that
+    // text is not a well-formed word sequence, and the blind split can only
+    // OVER-report. B15d is the control: with balanced quoting, the D5 narrowing
+    // still applies (a quoted `\|` alternation is data).
+    const writeBody = (name, text) => { const p = join(wt, name); write(p, text); return p; };
+    const undoGlob = writeBody("undo-b15-*.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    write(join(wt, "dirty.txt"), "MUTANT-3243\n");
+    const f1Shapes = [
+      ["B15a", "a COMMENT apostrophe before a real `cat <expanded> | bash`",
+        writeBody("b15a.sh", "#!/bin/bash\n# don't touch the copy\ncat ./undo-b15-*.sh | bash\n")],
+      ["B15b", "a HERE-DOC DATA apostrophe before the same pipeline",
+        writeBody("b15b.sh", "#!/bin/bash\ncat <<EOF\nit's fine\nEOF\ncat ./undo-b15-*.sh | bash\n")],
+      ["B15c", "ANSI-C `$'…'` quoting before the same pipeline (it's `\\'` is an escape)",
+        writeBody("b15c.sh", "#!/bin/bash\nprintf $'it\\'s\\n'\ncat ./undo-b15-*.sh | bash\n")],
+    ];
+    for (const [tag, label, file] of f1Shapes) {
+      expectTrue(`${tag} (#3243 review F1): ${label} is STILL refused inside a body`,
+        blocked(await bash(`bash ./${file.split("/").pop()}`, wt)),
+        "was ALLOWED — the quote model desynced and a REAL pipeline disappeared");
+    }
+    expectTrue("B15a' (#3243 review F1): the same top-level ANSI-C desync is STILL refused",
+      blocked(await bash(`cat $'a\\'b' ./undo-b15-*.sh | bash`, wt)), "was allowed");
+    expectTrue("B15d control (#3243 review F1): BALANCED quoting still takes the D5 narrowing — a quoted `\\|` alternation is data",
+      allowed(await bash('grep -n "bash\\|sh -x" clean.txt | head -2', wt)), "was blocked");
+
+    // B15e-g (F2): quoting is shell SYNTAX and may be MID-WORD, so `"$TOOLS"/undo.sh`
+    // and `./run"$S".sh` are ordinary ways to spell a runtime-resolved path. The
+    // first cut's grammar rejected every quote, so those stopped being candidates
+    // and the file ran UNGATED (base refused them).
+    for (const [tag, cmd] of [
+      ["B15e", 'echo hi && "$TOOLS"/undo-b15-glob.sh'],
+      ["B15f", 'true; ./undo-b15-glo"$S".sh'],
+    ]) {
+      expectTrue(`${tag} (#3243 review F2): a MID-WORD quoted runtime path is STILL refused (${cmd})`,
+        blocked(await bash(cmd, wt)), "was ALLOWED — the shape grammar rejected the quotes and the path vanished");
+    }
+    const f2Body = writeBody("b15g.sh", '#!/bin/bash\n./undo-b15-glo"$S".sh\n');
+    expectTrue("B15g (#3243 review F2): …and the same spelling INSIDE a body is still refused",
+      blocked(await bash(`bash ./${f2Body.split("/").pop()}`, wt)), "was allowed");
+
+    // B15h-i (F3): the `sp` branch had NO shape test, so a segment's FIRST word being
+    // program TEXT was claimed as an executed script — the same misattribution one
+    // branch over from where it was fixed. `~520` still blocks (it IS a valid tilde
+    // expansion spelling), so only the program-text shape is pinned here.
+    const f3Body = writeBody("b15h.sh", "#!/bin/bash\n/^tree=/{t=$2}\n");
+    const f3Var = writeBody("b15i-var.sh", '#!/bin/bash\nNB="$HERE/nonblocking.sh"\nbash "$NB" arg\n');
+    expectTrue("B15h (#3243 review F3): a SEGMENT-INITIAL awk program is not an executed script path → ALLOWED",
+      allowed(await bash(`bash ./${f3Body.split("/").pop()}`, wt)), "was blocked");
+    expectTrue("B15i (#3243 review F3) PROTECTION: the carve-out does not weaken a bare `$VAR` OPERAND — it stays refused",
+      blocked(await bash("bash ./b15i-var.sh", wt)), "was allowed — the #1228 residual must stay closed");
+
+    // ── B15j-n: the REVIEW CYCLE-2 findings. Same polarity as B15: each was a
+    // fail-OPEN measured on the first cut (base BLOCK, head ALLOW) and each
+    // really discards when run. Two SECOND-ORDER versions of the same two bugs.
+    //
+    // B15j-l (F1-c2): `quote` was not the only state variable that can desync.
+    // An UNTERMINATED extglob — in a comment or in heredoc DATA, both inert in a
+    // real shell — strands `globDepth > 0`, swallowing every later `|` as data
+    // and merging a REAL pipeline into one segment.
+    const f1c2Shapes = [
+      ["B15j", "a COMMENT with an unbalanced extglob before a real pipeline",
+        "#!/bin/bash\n# it is *(broken\ncat ./undo-b15-*.sh | bash\n"],
+      ["B15k", "a COMMENT with an unbalanced `a+(b|c` before the same pipeline",
+        "#!/bin/bash\n# regex: a+(b|c\ncat ./undo-b15-*.sh | bash\n"],
+      ["B15l", "HERE-DOC DATA with an unbalanced extglob before the same pipeline",
+        "#!/bin/bash\ncat <<EOF\nit is *(broken\nEOF\ncat ./undo-b15-*.sh | bash\n"],
+    ];
+    const f1c2Files = [];
+    for (const [tag, label, text] of f1c2Shapes) {
+      const p = writeBody(`b15${tag.slice(-1)}.sh`, text);
+      f1c2Files.push(p);
+      expectTrue(`${tag} (#3243 review c2 F1): ${label} is STILL refused inside a body`,
+        blocked(await bash(`bash ./${p.split("/").pop()}`, wt)),
+        "was ALLOWED — a desynced EXTGLOB merged a real pipeline into one segment");
+    }
+    expectTrue("B15j' (#3243 review c2 F1): the same desync at TOP LEVEL is still refused",
+      blocked(await bash("# it is *(broken\ncat ./undo-b15-*.sh | bash", wt)), "was allowed");
+
+    // B15m-n (F2-c2): the shape grammar FILTERS a path the shell executes, so a
+    // REJECTED byte deletes the candidate. `,` is an ordinary filename byte and
+    // `\\*` spells a LITERAL one; the first cut rejected both, so these really
+    // executed the destructive script and ran UNGATED.
+    const f2Comma = writeBody("undo,2-b15.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    const f2Esc = writeBody("undo2-b15.sh", "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    expectTrue("B15m (#3243 review c2 F2): a COMMA in a really-executed expanded path is STILL refused",
+      blocked(await bash("./undo,2-*.sh", wt)),
+      "was ALLOWED — the `,` byte rejected the candidate and the file ran UNGATED");
+    expectTrue("B15n (#3243 review c2 F2): an ESCAPED star (`\\*` = a literal byte) is still a candidate",
+      blocked(await bash("./undo2-\\*.sh", wt)),
+      "was ALLOWED — the escape rejected the candidate and the file ran UNGATED");
+    expectTrue("B15n' control (#3243 review c2 F2): an awk PROGRAM is still not a script path",
+      allowed(await bash("awk /^tree=/{t=$2} clean.txt", wt)), "was blocked — the widening over-fired");
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+    for (const f of [undoGlob, join(wt, "b15a.sh"), join(wt, "b15b.sh"), join(wt, "b15c.sh"), f2Body, f3Body, f3Var, f2Comma, f2Esc, ...f1c2Files]) rmSync(f, { force: true });
+
+    // ── the PROTECTION side: a real nested script the guard cannot read is
+    // STILL refused, and now the refusal must be about the REAL thing (the
+    // nested invocation, at a line, in a named file) instead of claiming the
+    // command's own literal path was expanded. ──
+    const nestedGlob = join(wt, "nested-glob-3243.sh");
+    write(nestedGlob, "#!/bin/bash\n# comment\nbash ./undo-3243*.sh\n");
+    const rGlob = await bash("bash ./nested-glob-3243.sh", wt);
+    expectTrue("B14e (#3243 PROTECTION): a nested EXPANDED script path is STILL refused",
+      blocked(rGlob), "was allowed — a real unreadable script must fail closed");
+    expectTrue("B14f (#3243): …and the reason names the OBSERVED nested token + line + file, not the command's literal path",
+      /"\.\/undo-3243\*\.sh" is invoked as a script \(line 3 of /.test(String(rGlob?.reason ?? "")) &&
+      /nested-glob-3243\.sh/.test(String(rGlob?.reason ?? "")) &&
+      !/the script path contains a shell-expansion form/.test(String(rGlob?.reason ?? "")),
+      `reason=${JSON.stringify(String(rGlob?.reason ?? "")).slice(0, 300)}`);
+
+    const nestedVar = join(wt, "nested-var-3243.sh");
+    write(nestedVar, "#!/bin/bash\nNB=\"$HERE/nonblocking.sh\"\nbash \"$NB\" arg\n");
+    const rVar = await bash("bash ./nested-var-3243.sh", wt);
+    expectTrue("B14g (#3243 RESIDUAL, deliberate): a nested `bash \"$VAR\"` whose value is not statically resolvable is STILL refused",
+      blocked(rVar), "was allowed — that is the #1228 fail-closed residual, unchanged");
+    expectTrue("B14h (#3243): …and its reason names the VARIABLE operand, not a path property of the command",
+      /"\$NB" is invoked as a script/.test(String(rVar?.reason ?? "")) &&
+      !/the script path contains a shell-expansion form/.test(String(rVar?.reason ?? "")),
+      `reason=${JSON.stringify(String(rVar?.reason ?? "")).slice(0, 300)}`);
+
+    const discardingBody = join(wt, "discarding-3243.sh");
+    write(discardingBody, "#!/bin/bash\ngit checkout -- dirty.txt\n");
+    write(join(wt, "dirty.txt"), "MUTANT-3243\n");
+    expectTrue("B14i (#3243 PROTECTION): a script body that REALLY discards is STILL refused",
+      blocked(await bash("bash ./discarding-3243.sh", wt)), "was allowed");
+    execSync("git checkout -- dirty.txt", { cwd: wt, stdio: "ignore" });
+
+    const pipeBody = join(wt, "pipe-body-3243.sh");
+    write(pipeBody, "#!/bin/bash\ncat ./undo-3243*.sh | bash\n");
+    expectTrue("B14j (#3243 PROTECTION): a REAL pipeline into a shell with an expanded producer is STILL refused inside a body",
+      blocked(await bash("bash ./pipe-body-3243.sh", wt)), "was allowed");
+    for (const f of [awkProg, sedProg, proseBody, apostropheBody, nestedGlob, nestedVar, discardingBody, pipeBody]) rmSync(f, { force: true });
+
     // ── B11: escape hatches unchanged ──
     write(join(wt, "dirty.txt"), "MUTANT\n");
     process.env.AGENT_ALLOW_MAIN_EDITS = "1";
@@ -2337,6 +2576,152 @@ if (process.argv.includes("--mutations")) {
     expectTrue(`M: with the ${label} defect reintroduced the pinned case goes BLIND — so the pin CAN fail`,
       discs === 0, `mutated descriptors=${discs} (want 0; the pin would not go red)`);
   }
+  // ── Part M2 (#3243) — PREDICATE MUTATIONS for the three RELAXATIONS. ──
+  //
+  // Part M above pins a DETECTION defect (mutate ⇒ the pin must go BLIND). A
+  // relaxation has the opposite polarity: mutate ⇒ the measured false positive
+  // must come BACK, and the neighbouring protection must still hold on the same
+  // mutated module. Both directions are asserted, because a pin that only showed
+  // "the false positive is gone" cannot tell a narrowing from an arm that simply
+  // stopped firing.
+  //
+  // Each probe reads a CLASSIFY-GIT PREDICATE (the same zero-dep surface Part M
+  // uses). The handler-level use of that predicate is pinned behaviourally by
+  // B14a-j and by test-command-position.mjs D5/D5c.
+  const PREDICATE_PAIRS = [
+    [
+      "the quote-aware pipeline split (#3243 / KNOWN-FALSE D5)",
+      [[
+        "  return wtSplitPipeline(command).slice(1).some((seg) => {",
+        '  return String(command ?? "").split("|").slice(1).some((seg) => {',
+      ]],
+      (m) => m.wtPipelineFeedsShell('grep -n "bash\\|sh -x" scripts/x.mjs | head -2'),
+      false,
+      true,
+      "a QUOTED `\\|` alternation is read as a pipe into a shell again",
+    ],
+    [
+      "the quote-aware pipeline split still feeds a REAL pipeline",
+      [[
+        "  return wtSplitPipeline(command).slice(1).some((seg) => {",
+        '  return String(command ?? "").split("|").slice(1).some((seg) => {',
+      ]],
+      (m) => m.wtPipelineFeedsShell("cat ./undo-3243*.sh | bash"),
+      true,
+      true,
+      "an UNQUOTED pipeline into a shell must stay detected in BOTH builds (#1228)",
+    ],
+    [
+      "the path-shaped word grammar (#3243)",
+      [[
+        "  if (/^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out)) return true;\n  return /^(?:\\.{1,2}|~)\\//.test(s);",
+        "  return true;",
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("/^tree=/{t=$2}"),
+      false,
+      true,
+      "an awk PROGRAM is a script path again",
+    ],
+    [
+      "the path-shaped word grammar still admits every EXPANSION form",
+      [[
+        "  if (/^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out)) return true;\n  return /^(?:\\.{1,2}|~)\\//.test(s);",
+        "  return true;",
+      ]],
+      (m) => ["./undo-3243*.sh", "~/undo.sh", "$WT/.venv/bin/python", "./undo@(-g|).sh", "sub/undo.sh"].every((w) => m.wtIsPathShapedScriptWord(w)),
+      true,
+      true,
+      "the real expanded-path spellings must stay candidates in BOTH builds",
+    ],
+    // ── M2 (#3243 review cycle-2) — the two SECOND-ORDER fail-opens. ──
+    //
+    // Each of these was a real fail-open measured on THIS head before the fix:
+    // the base BLOCKED and the first cut ALLOWED. The mutation REVERTS the fix,
+    // so a pin that merely reported "the case is handled" cannot pass — it must
+    // show the case goes BLIND again when the fix is removed.
+    //
+    // F1-c2: `quote` was not the only state variable that can desync. An
+    // UNTERMINATED extglob (`# it is *(broken`, `a+(b|c` — comment/heredoc DATA,
+    // inert in a real shell) strands `globDepth > 0`, which swallows every later
+    // `|` AND `'`/`"` as data. Testing only `quote` left a REAL unquoted
+    // `cat ./undo*.sh | bash` merged into one segment (base: BLOCK).
+    [
+      "the blind-split fallback covers a DESYNCED EXTGLOB, not just a desynced quote (#3243 c2 F1)",
+      [[
+        "  if (quote !== null || globDepth > 0) return s.split(\"|\");",
+        "  if (quote !== null) return s.split(\"|\");",
+      ]],
+      (m) => m.wtPipelineFeedsShell("# it is *(broken\ncat ./undo-3243*.sh | bash"),
+      true,
+      false,
+      "an unterminated extglob blindfolds the split and a REAL pipeline disappears",
+    ],
+    [
+      "…and a BALANCED extglob group is still not a pipeline (both builds)",
+      [[
+        "  if (quote !== null || globDepth > 0) return s.split(\"|\");",
+        "  if (quote !== null) return s.split(\"|\");",
+      ]],
+      (m) => m.wtSplitPipeline("./undo@(-g|).sh").length === 1,
+      true,
+      true,
+      "a closed extglob's `|` is data in BOTH builds — the fallback must not over-widen",
+    ],
+    // F2-c2: this grammar FILTERS a path the shell will execute, so a REJECTION
+    // deletes the candidate and blinds the arm. `,` `:` `=` `^` `#` are ordinary
+    // filename bytes and `\\` spells a literal one; the first cut rejected them,
+    // so `./undo,2-*.sh` and `./undo2-\\*.sh` really executed the destructive
+    // script and ran UNGATED (base: BLOCK).
+    [
+      "a REJECTED path byte does not delete the candidate (#3243 c2 F2)",
+      [[
+        "  return /^(?:\\.{1,2}|~)\\//.test(s);",
+        "  return false;",
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./undo,2-X.sh"),
+      true,
+      false,
+      "a legal filename byte makes the really-executed path invisible to the arm",
+    ],
+    [
+      "an ESCAPED path byte is a LITERAL, not a disqualifier (#3243 c2 F2)",
+      [[
+        "    if (ch === \"\\\\\") { out += PH; i++; continue; }",
+        "    if (ch === \"\\\\\") return false;",
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./undo2-\\*.sh"),
+      true,
+      false,
+      "`./undo2-\\*.sh` spells a real file and the arm goes blind on it",
+    ],
+    [
+      "…and an awk/sed PROGRAM is still not a path (both builds)",
+      [[
+        "  return /^(?:\\.{1,2}|~)\\//.test(s);",
+        "  return false;",
+      ]],
+      (m) => ["/^tree=/{t=$2}", "s/[[:space:]]*$//"].every((w) => m.wtIsPathShapedScriptWord(w) === false),
+      true,
+      true,
+      "program TEXT carries no explicit path prefix, so it stays non-path in BOTH builds",
+    ],
+  ];
+  for (const [label, reverts, probe, wantBefore, wantAfter, why] of PREDICATE_PAIRS) {
+    let mutated = SRC;
+    let applied = 0;
+    for (const [from, to] of reverts) { if (!mutated.includes(from)) continue; mutated = mutated.replace(from, to); applied++; }
+    expectTrue(`M2: the #3243 relaxation "${label}" was actually reverted (every textual revert applied)`,
+      applied === reverts.length, `applied ${applied}/${reverts.length} — a stale anchor proves less than it claims`);
+    let before, after;
+    try { before = probe(cg); } catch (e) { before = `<threw ${String(e?.message ?? e).slice(0, 80)}>`; }
+    expect(`M2: unmutated — ${label}: ${why}`, before, wantBefore);
+    const copy = join(mutRoot, `pred-${Math.random().toString(36).slice(2)}.mjs`);
+    writeFileSync(copy, mutated);
+    try { after = probe(await import(pathToFileURL(copy).href)); }
+    catch (e) { after = `<threw ${String(e?.message ?? e).slice(0, 80)}>`; }
+    expect(`M2: MUTATED — ${label}: ${why}`, after, wantAfter);
+  }
+
   try { rmSync(mutRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
 }
 
