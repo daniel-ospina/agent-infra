@@ -747,6 +747,25 @@ add_claim() {
 run_reaper() {
     local envname="$1"; shift
     local nowval="${REAP_WT_NOW_EPOCH_OVERRIDE-$NOW}"
+    # ⛔ `HOME` MUST BE REMOVABLE, NOT JUST SETTABLE (#10114 review round 2). The `$HOME` guard in
+    # `pin_tree_match` can only be exercised with HOME **and** CELL_HOME both UNSET — with either one
+    # set, `${CELL_HOME:-$HOME}` never expands `$HOME` and the guard is untested, which is how the
+    # assertion it protects passed against the exact pre-fix spelling. A test that bypassed this helper
+    # to hand-roll `env -u HOME` lost every other seam (see G15i). So the seams stay ONE list and the
+    # unset is applied LAST, by `env`, to the same list: the `HOME=` assignment reaches `env`, and
+    # `-u HOME` removes it before bash starts. The array is NEVER empty (it carries a no-op name on
+    # the default path) because `"${arr[@]}"` on an empty array is an unbound-variable error under
+    # `set -u` in bash 3.2, which this suite must run on.
+    # `-u NAME`, not `--unset=NAME`: BSD/macOS `env` has no long options, and it answers an unknown
+    # one by REFUSING to exec — which is how the first draft of this silently produced empty output
+    # for every fixture downstream (the failure mode the mutation legs exist to prevent, caught here
+    # by the suite's own G-rows going red).
+    local -a unset_env=(-u __REAP_WT_TEST_NO_SUCH_VAR__)
+    # ⛔ ONLY `HOME`/`CELL_HOME` ARE REMOVED. `HARNESS_PIN_FILE`/`HARNESS_PIN` are SET by the list below
+    # (to "" or to their own override), so an ambient value cannot leak — and unsetting them here would
+    # delete the very seam the no-home fixture names its record through (measured: the record was
+    # dropped and the row read `reason=reclaimable`, which is how this was caught).
+    [ -n "${RUN_REAPER_UNSET_HOME:-}" ] && unset_env=(-u HOME -u CELL_HOME)
     # ⛔ EVERY FIXTURE IS OFFLINE: REAP_WT_MAIN_PROOF is pinned to `local` in the env list below.
     # `auto` (the production default) asks the remote that pushes which branch it calls HEAD — a
     # network round trip that would make a fixture's verdict depend on the host's connectivity and the
@@ -763,7 +782,7 @@ run_reaper() {
     # hermetic (no `df` on the host's real state, no verdict firing by accident); a fixture that wants
     # the probe sets REAP_WT_FREE_MB_OVERRIDE="" (empty = "measure it") and points DF_BIN_OVERRIDE at a
     # shim. `${VAR-default}`, not `${VAR:-default}`: SET-BUT-EMPTY is a real, meaningful value here.
-    HOME="$T/$envname/home" \
+    HOME="${HOME_OVERRIDE:-$T/$envname/home}" \
     PATH="$T/bin:$PATH" \
     REAP_WT_STATE_DIR="${REAP_WT_STATE_DIR_OVERRIDE:-$T/$envname/state}" \
     REAP_WT_LOG="${REAP_WT_LOG_OVERRIDE:-$T/$envname/reap.log}" \
@@ -819,6 +838,9 @@ run_reaper() {
     REAP_WT_MAIN_PROOF="local" \
     REAP_WT_MIN_AGE_MINUTES="${REAP_WT_MIN_AGE_MINUTES_OVERRIDE:-45}" \
     REAP_WT_TREE_TS="${REAP_WT_TREE_TS:-}" \
+    CELL_HOME="${CELL_HOME_OVERRIDE:-}" \
+    HARNESS_PIN_FILE="${HARNESS_PIN_FILE_OVERRIDE:-}" \
+    HARNESS_PIN="${HARNESS_PIN_OVERRIDE:-}" \
     FAKE_GH_FAIL="${FAKE_GH_FAIL:-}" \
     FAKE_GH_EXIT="${FAKE_GH_EXIT:-}" \
     FAKE_GH_ARGS_LOG="${FAKE_GH_ARGS_LOG:-}" \
@@ -831,8 +853,14 @@ run_reaper() {
     FAKE_STATUS_SLEEP="${FAKE_STATUS_SLEEP:-3}" \
     DU_CANARY="${DU_CANARY:-}" \
     REAL_GIT_BIN="$REAL_GIT" \
-    bash "${REAPER_OVERRIDE:-$REAPER}" "$@"
+    env "${unset_env[@]}" bash "${REAPER_OVERRIDE:-$REAPER}" "$@"
 }
+
+# reason_token <row> — the row's reason FIELD, exactly. `reason=pin-tree` is a PREFIX of
+# `reason=pin-tree-shape`, so `assert_contains "reason=pin-tree"` accepts BOTH and a deletion of the
+# record-based probe leaves the assertion green (#10114 review round 2, measured). Comparing the parsed
+# token pins the class, and a row with no reason field at all cannot satisfy it.
+reason_token() { printf '%s\n' "$1" | sed -n 's/^ *reason=\([^ ]*\).*$/\1/p' | head -1; }
 
 row_for() { # <output> <path> — the verdict line + its reason line for one path
     printf '%s\n' "$1" | awk -v p="$2" 'index($0,p)>0 {print; if (getline > 0) print; exit}'
@@ -911,6 +939,167 @@ ANCHORS = {
     "no-per-repo-offset-key": (
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees$(printf \x27%s\x27 \"$REPO_CANON\" | cksum | cut -d\x27 \x27 -f1).offset\"",
         "    OFFSET_FILE=\"$STATE_DIR/pi-reap-worktrees.offset\"   # MUTANT: the per-repo key dropped",
+    ),
+    # ── G15 (the harness pin-tree veto, #10114) ── ONE ANCHOR PER INPUT of the veto: the record probe,
+    # the shape backstop, the `$HOME` guard, the sha-record derivation, the NORMALISATION of that derivation,
+    # the QUOTING of the `$HOME` element, the `$CELL_HOME` element, the ABSOLUTENESS of the record
+    # content, the ABSOLUTENESS of the `pin_root` ARM, and the FAIL-CLOSED arm for an UNREADABLE record.
+    # ⛔ NO COUNT IN THIS SENTENCE ON PURPOSE: it read "four" over five entries and then "six"
+    # over seven, and a numeral that has to be maintained by hand is a claim this file cannot keep true.
+    # The dict is the count.
+    # The veto shipped with no mutation leg at all, and that is precisely how two of its assertions
+    # passed vacuously through three recorded clean reviews.
+    # (1) delete the RECORD-BASED probe entirely, leaving the shape backstop. The row then reads
+    # `reason=pin-tree-shape`, which a prefix match on `reason=pin-tree` ACCEPTS — so before the
+    # exact-token assertion this mutant left G15a green.
+    "no-pin-tree-record-probe": (
+        "    for rec in \"${HARNESS_PIN_FILE:-}\" \"$cellpin\" \"${home:+\"$home/.harness-path\"}\" \"${pin_root:+\"$pin_root/.harness-path\"}\"; do",
+        "    for rec in \"${__MUTANT_PIN_RECORD_PROBE_REMOVED:-}\"; do   # MUTANT: the record-based probe is deleted",
+    ),
+    # (2) delete the SHAPE backstop. A pin tree with no readable record falls to rule 3.
+    "no-pin-tree-shape": (
+        "        */harness|*/harness/*|*/harness-next|*/harness-next/*)",
+        "        */__mutant_pin_shape_removed__|*/__mutant_pin_shape_removed__/*)",
+    ),
+    # (3) restore the PRE-FIX spelling of the `$HOME` guard — bare `$HOME` under `set -u`. The
+    # harness-apply pass then reads `pin_tree=none` and the disk pass removes the tree the box execs.
+    "unguarded-home": (
+        "    local home=\"${HOME:-}\"",
+        "    local home=\"${HOME}\"   # MUTANT: the ${HOME:-} guard is removed (the pre-fix spelling)",
+    ),
+    # (4) delete the sha-record root derivation, so a `.harness-path` under a CUSTOM pin root is a
+    # silent miss (`check-farm-drift.sh:161-208` measures the same class one variable over).
+    # ⛔ THE ANCHOR IS THE DERIVATION, NOT THE RULE. This arm has been re-spelled three times
+    # (one-liner → multi-line body → one-liner carrying `pin_matched`), and each time the previous
+    # anchor matched 0 times — which `mutate_reaper_anchored` reports as "anchor matched 0 times
+    # (want 1)" and exits 9 on, reddening G15-M4 instead of silently skipping the leg. The DECISION is
+    # unchanged (delete the derivation), so the anchor follows the code: the mutant KEEPS `pin_matched=1`
+    # and blanks only the strip, leaving `pin_root` the FULL record path — the empty-root guard is then
+    # false, and the derived source is `…/state/HARNESS-PIN/.harness-path`, which misses.
+    "no-pin-root-derivation": (
+        "        */state/HARNESS-PIN) pin_matched=1; pin_root=\"${pin_root%/state/HARNESS-PIN}\" ;;",
+        "        */state/HARNESS-PIN) pin_matched=1 ;;   # MUTANT: the derivation is deleted",
+    ),
+    # (4b) delete the `//` COLLAPSE only — the trailing-slash strip still runs — but keep the derivation, so a
+    # non-canonical spelling of the sha record derives the WRONG root — `<root>/.pi/agent/` — where the
+    # production dir record does not live. That is a silent miss and therefore a removal, and it is why
+    # the normalisation is not cosmetic (`check-farm-drift.sh:195` needed the same one).
+    "no-pin-root-normalisation": (
+        "        pin_root=\"$(printf \x27%s\x27 \"$pin_root\" | tr -s \x27/\x27)\"   # collapse `//` — POSIX, no bashism",
+        "        :   # MUTANT: the `//` collapse is deleted (the trailing-slash strip below still runs)",
+    ),
+    # (4c) delete the PLACEMENT guard on the record CONTENT — the arm that refuses to answer NEGATIVE
+    # on content it cannot place (empty, whitespace-only, or a relative `.harness-path` that would only
+    # resolve against the reaper CWD itself). Replacing it with `continue` reproduces the PRE-FIX
+    # one-liner EXACTLY (`case "$rec_t" in /?*) : ;; *) continue ;; esac`), so the mutant is the code
+    # this arm replaced, not a stand-in for it: the record is skipped in silence and the tree the box
+    # EXECUTES falls to rule 3. G15o (relative) and G15v (empty) must both red, which is how the ONE
+    # arm is shown to carry BOTH shapes.
+    # ⛔ NO APOSTROPHES IN THIS BLOCK: it is a single-quoted `python3 -c` argument, so one would end
+    # the shell string (see the same warning on the ANCHORS header).
+    "no-record-absoluteness": (
+        "            /?*) : ;;\n            *)\n                PIN_VERDICT=\"pin-tree\"",
+        "            /?*) : ;;\n            *) continue\n                PIN_VERDICT=\"pin-tree\"",
+    ),
+    # (4d) delete the TRAILING-JUNK arm alone. The arms below it test only the PREFIX, so an absolute
+    # path ENDING in a space sails past them and is compared verbatim, where it cannot match and `rec_c`
+    # cannot rescue it (dirname/basename of that spelling give a different path). The ROOT form is
+    # production-written (an operator `HARNESS=<pin root>` is what install.sh records), and the
+    # descendant form is safe only by the accident of the `"$canon"/*` arm absorbing trailing junk.
+    # Deleting the arm restores the removal; G15x and G15-M14 must red.
+    "no-record-trailing-junk": (
+        "            /?*[[:space:]]|/?*[[:cntrl:]])\n",
+        "            __mutant_record_trailing_junk_removed__)\n",
+    ),
+    # (4e) the SAME junk on the SHA-RECORD SPELLING that feeds the fourth record source. `/` and `//` are
+    # normalised, but a trailing space makes the final `*/state/HARNESS-PIN` test fail, so the arm
+    # silently assigns `pin_root=""` and that source VANISHES with no proof. On the box where the derived
+    # source is the only one that can name the tree, the record would have named it and rule 3 removes it.
+    # Deleting the arm restores the silent drop; G15y and G15-M15 must red.
+    "no-pin-root-trailing-junk": (
+        "    case \"$pin_root\" in\n        [[:space:]]*|[[:cntrl:]]*|*[[:space:]]|*[[:cntrl:]])\n            PIN_VERDICT=\"pin-tree\"",
+        "    case \"$pin_root\" in\n        __mutant_pin_root_trailing_junk__)\n            PIN_VERDICT=\"pin-tree\"",
+    ),
+    # (4f) a recognised sha-record spelling whose root strips to EMPTY — `/state/HARNESS-PIN` (pin
+    # root `/`), or `/.pi/agent/state/HARNESS-PIN` (the `pi-bootstrap/setup.sh:1109` spelling with
+    # `$HOME=/`); the `.pi/agent` strip below the first one can empty it too. The `${pin_root:+…}`
+    # guard then SKIPS the derived source entirely and the arm fails open. ⛔ THE GUARD IS BOUND TO
+    # `pin_matched`, so deleting it must leave a NON-record spelling still falling back — which is
+    # why the G15-M4 fixture (a different spelling, one source short) must stay green under this
+    # mutant. G15z drives both empty-root shapes and G15-M17/G15-M18 assert the mutant reclaims.
+    "no-pin-root-empty-root": (
+        "    if [ \"$pin_matched\" = 1 ] && [ -z \"$pin_root\" ]; then\n        PIN_VERDICT=\"pin-tree\"",
+        "    if false; then\n        PIN_VERDICT=\"pin-tree\"",
+    ),
+    # (5) remove BOTH layers of quoting from the `$HOME` element — the spelling a tidy-up would reach for
+    # because it looks equivalent. `${home:+"$home/.harness-path"}` is ONE word (the value is quoted
+    # inside the alternate word); `${home:+$home/.harness-path}` is TWO, so a HOME containing a space
+    # becomes `<prefix>/home` + `space/.harness-path`, neither readable, and the record is skipped in
+    # silence. ⛔ MEASURED 2026-11-04: the first draft of this leg mutated only the OUTER quotes and
+    # stayed GREEN, which falsifies the second half of review finding 5 — bash does not split
+    # `${h:+"$h/.p"}`. That is why the anchor below drops the inner quotes too: it models the regression
+    # that actually exists.
+    "home-expansion-unquoted": (
+        "\"${home:+\"$home/.harness-path\"}\"",
+        "${home:+$home/.harness-path}",
+    ),
+    # (6) delete the `$CELL_HOME` record element ALONE, leaving the other three sources and both probes.
+    # ⛔ THIS LEG EXISTS BECAUSE THE COVERAGE THE COMMENT CLAIMED DID NOT (round 3, measured): with only
+    # G15a/G15k/G15l naming the cell root, `cell` was either `$HOME` (so the NEXT element found the same
+    # file and masked the deletion) or a record-less home — deleting this one element changed ZERO
+    # assertions. G15n gives `CELL_HOME` the record and leaves `$HOME` without one, so this mutant is the
+    # only thing that can turn it red, and it does.
+    "no-cell-home-record": (
+        "\"$cellpin\" \"${home:+\"$home/.harness-path\"}\"",
+        "\"${home:+\"$home/.harness-path\"}\"",
+    ),
+    # (7) delete the ABSOLUTENESS guard on the `pin_root` ARM itself. ⛔ THE MISSING TWIN: (4c) above
+    # guards the record CONTENT and had a leg; the ARM that NAMES the record (`:3141`) is load-bearing
+    # for cwd-independence and had NEITHER a fixture NOR a leg — so a tidy-up could delete it and the
+    # suite stayed green. With it gone a RELATIVE `$HARNESS_PIN` derives a root from wherever the reaper
+    # was invoked: one box, two cwds, two verdicts, on a veto whose miss is a REMOVAL. G15r runs the same
+    # relative spelling from two cwds and asserts `reclaimable` from BOTH; this mutant answers `pin-tree`
+    # from the cwd where the relative path happens to resolve, and only there.
+    "no-pin-root-absoluteness": (
+        "    case \"$pin_root\" in /?*) : ;; *) pin_root=\"\" ;; esac",
+        "    :   # MUTANT: the $pin_root absoluteness guard is deleted",
+    ),
+    # (8) delete the FAIL-CLOSED arm for an UNREADABLE record. A bare `[ -r "$rec" ] || continue` made
+    # "cannot read it" and "it is not there" the same answer, so the ONE thing that says the box needs
+    # these bytes became "no evidence" and rule 3 removed the tree the box EXECUTES. Same class as
+    # `no-stash-unverifiable-arm` ("cannot read the register" read as "the register is clear") and as
+    # the truncated-scan arm in `holders_live`. Deleting the arm restores the fail-open; G15q must red.
+    "no-record-unreadable-failclosed": (
+        "            if [ -e \"$rec\" ] || [ -L \"$rec\" ] || { [ -d \"$_rdir\" ] && [ ! -x \"$_rdir\" ]; }; then",
+        "            if false; then   # MUTANT: the unreadable-record fail-closed arm is deleted",
+    ),
+    # (8b) and (8c): the (8) anchor replaces the WHOLE condition, so it cannot distinguish its three
+    # disjuncts — and only `[ -e ]` had a fixture. Each disjunct is now pinned ALONE, because each one
+    # is a shape a tidy-up can talk itself into deleting: `-L` looks redundant next to `-e` (it is not —
+    # `-e` is FALSE for a DANGLING symlink, which is exactly the record a rotated pin leaves behind),
+    # and the unsearchable-parent arm looks like a broken box (it is the TCC / mixed-root case).
+    # ⛔ NO TRAILING COMMENT IN EITHER MUTANT: these replace a MID-LINE substring, so a `#` would
+    # comment out the `; then` that follows and the mutant would die of a SYNTAX ERROR instead of
+    # answering — which reads as an empty row, not as a red assertion (measured on the first draft).
+    "no-record-unreadable-symlink": (
+        " || [ -L \"$rec\" ] ||",
+        " || false ||",
+    ),
+    "no-record-unreadable-parent": (
+        "{ [ -d \"$_rdir\" ] && [ ! -x \"$_rdir\" ]; }",
+        "{ false; }",
+    ),
+    # (8d) and the disjunct that FAILS OPEN on a shape none of the three above can see: `-r` tests READ
+    # PERMISSION, and it is TRUE for a DIRECTORY, a symlink to one, and a FIFO. Before this leg the arm
+    # above was never even entered for those, `head -n 1 <dir>` yielded nothing and the
+    # `[ -n "$rec_t" ] || continue` re-created "cannot read it" ⇒ "no record" — so rule 3 removed the
+    # tree the box EXECUTES, with the record sitting right there. A FIFO is worse again: `[ -r ]`
+    # passes and `head` BLOCKS, hanging the classifier. `[ -e ]` inside was ALREADY true for a
+    # directory, i.e. the code knew and convicted anyway. Deleting this disjunct restores the
+    # fail-open, and G15u must red.
+    "no-record-unreadable-notfile": (
+        " || [ ! -f \"$rec\" ]",
+        " || false",
     ),
 }
 s = open(src).read()
@@ -5119,6 +5308,14 @@ assert_eq "$(find "$T/$ENV/state" -maxdepth 1 -name '*.tmp.*' 2>/dev/null | wc -
 # 23 cannot-verify for 2h17m. The age floors are pinned OUT of the fixture
 # (`TREE_TS` 30d old, `MIN_AGE_MINUTES=0`) so every assertion below is about the
 # VETO and not about the clock.
+#
+# ⛔ THE REASON IS COMPARED AS AN EXACT TOKEN, NEVER AS A PREFIX (#10114 review round 2). `reason=pin-tree`
+# is a prefix of `reason=pin-tree-shape`, and the two are DIFFERENT PROBES: the first reads a record, the
+# second matches a directory name. Measured: with the assertions written as `assert_contains …, "reason=pin-tree"`
+# the deletion of the ENTIRE record-based probe left G15a and G15b GREEN (the row still read
+# `reason=pin-tree-shape rule=P`), so of the three assertions the body cited as proving the record probe
+# only one was discriminating. `reason_token` compares the field, and a row with no reason field at all
+# cannot satisfy it either.
 ENV=pin_tree
 REPO="$(mk_repo "$ENV")"
 PINWT="$T/$ENV/harness/5b1b09aad2c1"
@@ -5128,8 +5325,8 @@ mkdir -p "$T/$ENV/home"
 printf '%s\n' "$PINWT/scripts/orchestrator-harness" >"$PIN_REC"
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$PINWT")" "reason=pin-tree" \
-    "G15a a recorded harness pin tree is a HOLDER (reason=pin-tree), not residue"
+assert_eq "$(reason_token "$(row_for "$OUT" "$PINWT")")" "pin-tree" \
+    "G15a a recorded harness pin tree is a HOLDER (reason is pin-tree EXACTLY — pin-tree-shape is the other probe)"
 assert_contains "$(row_for "$OUT" "$PINWT")" "rule=P" \
     "G15b the veto prints rule=P (a preserve — never a removal rule)"
 assert_contains "$(row_for "$OUT" "$PINWT")" "this box EXECUTES it" \
@@ -5147,7 +5344,7 @@ SHAPEWT="$T/$ENV/harness/5b1b09aad2c1"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$SHAPEWT" HEAD
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$SHAPEWT")" "reason=pin-tree-shape" \
+assert_eq "$(reason_token "$(row_for "$OUT" "$SHAPEWT")")" "pin-tree-shape" \
     "G15e with no record at all, the harness shape still preserves (backstop)"
 
 # G15f: the NEGATIVE control — the veto is the RECORD/shape, not 'anything
@@ -5183,8 +5380,8 @@ mkdir -p "$T/$ENV/home"
 printf '%s\n' "$LINKPINS/5b1b09aad2c1/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$LINKWT")" "reason=pin-tree" \
-    "G15g a record spelled through a SYMLINK still matches the canonicalised worktree"
+assert_eq "$(reason_token "$(row_for "$OUT" "$LINKWT")")" "pin-tree" \
+    "G15g a record spelled through a SYMLINK still matches the canonicalised worktree (and it is the RECORD, not the shape)"
 
 # G15h: the pin ROOT is ITSELF a registered worktree (the legacy FLAT pin —
 # `cloud-cell-supervisor.sh` `cmd_prune` has a branch for it, and on the affected
@@ -5197,27 +5394,42 @@ mkdir -p "$T/$ENV"
 "$REAL_GIT" -C "$REPO" worktree add -q --detach "$ROOTWT" HEAD
 OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
     run_reaper "$ENV" --dry-run --repo "$REPO")"
-assert_contains "$(row_for "$OUT" "$ROOTWT")" "reason=pin-tree-shape" \
+assert_eq "$(reason_token "$(row_for "$OUT" "$ROOTWT")")" "pin-tree-shape" \
     "G15h the pin ROOT itself (no <sha12> child, no record) is preserved by shape"
+# …and the SECOND variant this backstop names, `harness-next`. ⛔ IT WAS DRIVEN BY NO FIXTURE (review
+# cycle 5, P3): the `no-pin-tree-shape` anchor replaces the WHOLE four-way alternation, so deleting
+# just the two `harness-next` arms kept the suite green — the "a spelling no fixture drives" defect
+# this PR exists to remove, inside the backstop that rescues an unreadable record.
+NEXTWT="$T/$ENV/harness-next"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NEXTWT" HEAD
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$NEXTWT")")" "pin-tree-shape" \
+    "G15h …and the harness-next variant is preserved by shape too (its two arms had NO fixture)"
 
-# G15i: `HOME` UNSET must not abort the classifier. `${CELL_HOME:-$HOME}` does not
-# guard `$HOME`, and this file runs `set -u`: the old code killed the classifier's
-# subshell, which returned an EMPTY row, which the caller counted as a PRESERVE —
-# a pass that removes nothing and reports `verdict=idle`, the HEALTHY verdict.
+# G15i: `HOME` AND `CELL_HOME` BOTH UNSET — the ONLY configuration in which bare
+# `$HOME` aborts. `${CELL_HOME:-$HOME}` does NOT guard `$HOME`, and this file runs
+# `set -u`: with HOME unset the old code killed the classifier's subshell, which
+# returned an EMPTY row, which the caller counts as a PRESERVE — a pass that
+# removes nothing and reports `verdict=idle`, the HEALTHY verdict. MEASURED (round 2):
+# a fixture that set `CELL_HOME` instead proved NOTHING — the `${CELL_HOME:-$HOME}`
+# arm never expanded `$HOME`, so the pre-fix spelling kept this assertion green.
+# ⛔ AND IT ROUTES THROUGH `run_reaper` (round 2, finding 6): the hand-rolled
+# `env -u HOME … bash "$REAPER"` it used to be set NO seams, so this fixture consulted
+# the REAL host process table in `holders_live` — contrary to the rule at the top of
+# `run_reaper`. `RUN_REAPER_UNSET_HOME` applies the unset to the SAME seam list.
 ENV=pin_tree_nohome
-REPO="$(mk_repo "$ENV")"
-NHWT="$T/$ENV/harness/5b1b09aad2c1"
-"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NHWT" HEAD
-mkdir -p "$T/$ENV/home"
-printf '%s\n' "$NHWT/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
-OUT="$(env -u HOME CELL_HOME="$T/$ENV/home" \
-    REAP_WT_DRY_RUN=1 REAP_WT_STATE_DIR="$T/$ENV/state" REAP_WT_LOG="$T/$ENV/reap.log" \
-    REAP_WT_NOW_EPOCH="$NOW" REAP_WT_MAIN_PROOF=local REAP_WT_TREE_TS=$((NOW - 86400 * 30)) \
-    REAP_WT_MIN_AGE_MINUTES=0 \
-    bash "${REAPER_OVERRIDE:-$REAPER}" --dry-run --repo "$REPO" 2>&1)"
+NH_REPO="$(mk_repo "$ENV")"
+NHWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$NH_REPO" worktree add -q --detach "$NHWT" HEAD
+NHREC="$T/$ENV/pin-record"
+printf '%s\n' "$NHWT/scripts/orchestrator-harness" >"$NHREC"
+OUT="$(RUN_REAPER_UNSET_HOME=1 HARNESS_PIN_FILE_OVERRIDE="$NHREC" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$NH_REPO" 2>&1)"
 assert_absent "$OUT" "unbound variable" \
-    "G15i an unset HOME does not abort the classifier (set -u)"
-assert_contains "$(row_for "$OUT" "$NHWT")" "reason=pin-tree" \
+    "G15i with HOME and CELL_HOME BOTH unset the classifier does not abort (set -u)"
+assert_eq "$(reason_token "$(row_for "$OUT" "$NHWT")")" "pin-tree" \
     "G15i …and the pin tree is still classified, not left as a blank row"
 
 # G15j: THE PIN RECORD IS ASKED AGAIN AT REMOVAL TIME, LIKE EVERY OTHER HOLDER ─────────────────
@@ -5246,7 +5458,7 @@ cat >"$T/seq-g15j/2.hook" <<HOOK
 printf '%s\n' "$(cd "$WT_RELATE" && pwd -P)/scripts/orchestrator-harness" >"$T/$ENV/pinfile"
 HOOK
 mkdir -p "$WT_RELATE/scripts/orchestrator-harness"
-OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j" HARNESS_PIN_FILE="$T/$ENV/pinfile" \
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j" HARNESS_PIN_FILE_OVERRIDE="$T/$ENV/pinfile" \
     REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
 assert_contains "$OUT" "PRESERVED — removal-time re-check kept it (pin-tree)" \
     "G15j a pin record written AFTER classification STOPS the delete"
@@ -5260,9 +5472,718 @@ mkdir -p "$WT_CONTROL/.venv"; printf 'x\n' >"$WT_CONTROL/.venv/marker"
 mkdir -p "$T/seq-g15j-ctl"
 printf '1 0 /sbin/launchd\n%s 1 /bin/bash\n' "${REAP_WT_SELF_PID:-1}" >"$T/seq-g15j-ctl/1"
 cp "$T/seq-g15j-ctl/1" "$T/seq-g15j-ctl/2"
-OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE="$T/$ENV/pinfile-none" \
+OUT="$(FAKE_PS_SEQ_DIR="$T/seq-g15j-ctl" HARNESS_PIN_FILE_OVERRIDE="$T/$ENV/pinfile-none" \
     REAP_WT_NOW_EPOCH_OVERRIDE="$NOW" run_reaper $ENV --apply --repo "$REPO" 2>&1)"
 assert_nodir "$WT_CONTROL" "G15j …and a checkout with no pin record at either reading is still removed"
+# G15p: the record named by `$HARNESS_PIN_FILE` ITSELF — the production variable. Those three sites
+# only ROOT it: `cloud-cell-bringup.sh:89` and `cloud-cell-supervisor.sh:1775` default it to
+# `$CELL_HOME/.harness-path`, `install.sh:837` to `$HOME` (all `${VAR:-…}`, no write). The WRITERS are
+# `install.sh:1072` (`pin_write_record`), `cloud-cell-bringup.sh:1034` and
+# `cloud-cell-supervisor.sh:2316`; `orchestrator-bringup.sh:449` is what persists it into the cell
+# ENV_FILE. This fixture points it OUTSIDE both `$CELL_HOME` and `$HOME`. Before round 2 that source
+# appeared NOWHERE in this suite, so it was a claimed input with no coverage at all.
+
+ENV=pin_tree_pinfile
+REPO="$(mk_repo "$ENV")"
+PFWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$PFWT" HEAD
+mkdir -p "$T/$ENV/record"
+printf '%s\n' "$PFWT/scripts/orchestrator-harness" >"$T/$ENV/record/.harness-path"
+OUT="$(HARNESS_PIN_FILE_OVERRIDE="$T/$ENV/record/.harness-path" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$PFWT")")" "pin-tree" \
+    "G15p \$HARNESS_PIN_FILE's own record preserves the tree, from a root that is neither CELL_HOME nor HOME"
+
+# G15k: THE MIXED ROOTS — `CELL_HOME` names one home and the record lives at `$HOME`. This is the
+# shape `check-farm-drift.sh:161-208` MEASURED as a false PASS (`14683c442`: a CELL_HOME-rooted
+# record beside a `$HOME`-rooted pin). Here it is the third source that carries the verdict, and
+# without it the tree is rule-3 residue because the fixture path carries no `harness` component.
+ENV=pin_tree_mixed
+REPO="$(mk_repo "$ENV")"
+MXWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$MXWT" HEAD
+mkdir -p "$T/$ENV/cell-home" "$T/$ENV/home"
+printf '%s\n' "$MXWT/scripts/orchestrator-harness" >"$T/$ENV/home/.harness-path"
+OUT="$(CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$MXWT")")" "pin-tree" \
+    "G15k a \$HOME-rooted record is still read when CELL_HOME names a DIFFERENT home (the mixed-root shape)"
+
+# G15l: a HOME containing a SPACE — the record must still be read. This is a REAL host shape
+# (`HOME=/Users/first last`), and the property under test is that the expansion yields ONE word.
+# ⛔ TWO CORRECTIONS TO THE ROUND-2 DRAFT OF THIS FIXTURE, both measured:
+#   (a) `CELL_HOME` MUST name a DIFFERENT home. With it unset, `cell` IS `$HOME`, so the SECOND source
+#       — `$cellpin` — resolves to the same file and matches first; the `$HOME` element is
+#       never reached and the fixture proves nothing about it. A cell home with no record leaves the
+#       `$HOME` element as the only candidate.
+#   (b) THE PROPERTY IS NOT THE OUTER QUOTING. `${home:+"$home/.harness-path"}` was reported by review as
+#       word-splitting; it does not — the value is quoted inside the alternate word, so bash produces one
+#       word, and a mutant of just the outer quotes stays GREEN. What splits is
+#       `${home:+$home/.harness-path}`, so the mutation leg (`home-expansion-unquoted`, G15-M5) drives
+#       THAT spelling. The fixture is worth keeping because the property is load-bearing (a split record
+#       is a silent miss and a silent miss here REMOVES the tree the box executes). Its UNIQUE property
+#       is the SPACE in `HOME` — not "the only leg that reaches `$HOME`", which is false: G15k reaches
+#       that element with a live `$HOME` too (its record is `$T/pin_tree_mixed/home/.harness-path`), and
+#       so does G15l. Both are discriminating for that element only because their tree paths
+#       (`pins/5b1b09aad2c1`) carry no `harness` component, so nothing else can carry the verdict.
+#   (c) ⛔ THE SPACE IS NOT ENOUGH — THE SPLIT WORDS MUST NOT BE EXISTING DIRECTORIES (measured after
+#       the `[ ! -f "$rec" ]` fail-closed disjunct landed). `mk_repo` creates `$T/<env>/home`, so a home
+#       spelled `$T/<env>/home with space` splits into `$T/<env>/home` — a REAL DIRECTORY — plus two
+#       more words. The mutant then entered the fail-closed arm on that first word and PRESERVED, so
+#       G15-M5 stopped discriminating: it still showed "the record was not read", but no longer showed
+#       "the tree is REMOVED". That preserve is the right POLARITY (a non-regular path fails closed,
+#       which is the whole point of that disjunct), so the mutant is what had to move, not the arm. The
+#       home is therefore spelled so that NO split word exists: `$T/<env>/spaced` and a relative
+#       `home/.harness-path`, neither of which is there. That is also the real shape the leg exists
+#       for — a `HOME=/Users/first last` whose `/Users/first` does not exist removes the tree.
+ENV=pin_tree_space
+REPO="$(mk_repo "$ENV")"
+SPWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$SPWT" HEAD
+SPHOME="$T/$ENV/spaced home"
+mkdir -p "$SPHOME" "$T/$ENV/cell-home"
+printf '%s\n' "$SPWT/scripts/orchestrator-harness" >"$SPHOME/.harness-path"
+OUT="$(HOME_OVERRIDE="$SPHOME" CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$SPWT")")" "pin-tree" \
+    "G15l a HOME containing whitespace is still read as ONE record path (the expansion is not split)"
+
+# G15m: THE DERIVED ROOT — a CUSTOM pin root, not named `harness`/`harness-next`, recorded by a
+# `HARNESS-PIN` sha record at `<root>/.pi/agent/state/HARNESS-PIN`. `check-farm-drift.sh:161-208`
+# derives the `.harness-path` root this way and records WHY: a record rooted anywhere else is a
+# silent miss, and a silent miss HERE deletes the tree the box executes. The shape backstop cannot
+# save this box, because `HARNESS_PIN_DIR` is operator-settable (`install.sh:836`).
+ENV=pin_tree_derived
+REPO="$(mk_repo "$ENV")"
+DVWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$DVWT" HEAD
+DVHOME="$T/$ENV/derived-home"
+mkdir -p "$DVHOME/.pi/agent/state"
+printf '5b1b09aad2c1\n' >"$DVHOME/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$DVWT/scripts/orchestrator-harness" >"$DVHOME/.harness-path"
+OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
+    "G15m the dir record is derived from the HARNESS-PIN sha record's OWN root (custom pin root, no 'harness' component)"
+# …and the DOUBLED-`//` spelling of the same record still derives and still PRESERVES, because the
+# `tr -s` collapse runs BEFORE the suffix strip and the derivation then lands on the same root a
+# canonical spelling does. Without that collapse the strip leaves `<root>/.pi/agent/`, the `/.pi/agent`
+# strip does not fire, and the derived candidate is `<root>/.pi/agent//.harness-path` — a path the
+# production layout never writes, so the tree is a silent miss and rule 3 REMOVES it. That is the
+# mutant G15-M4b drives, and it is why the normalisation is not cosmetic. A TRAILING `/` is normalised
+# by the same block and asserted below.
+OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent//state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
+    "G15m a DOUBLED-'//' spelling of the sha record still derives the root and PRESERVES (the collapse runs before the suffix strip)"
+
+# …and a TRAILING `/` on the same record normalises to the same root. Asserting it here (rather than
+# declaring it) is the point: this fixture's tree path carries no `harness` component, so if the strip
+# did not fire the row would read `reclaimable` — a silent miss, which on this veto REMOVES the tree.
+OUT="$(HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN/" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "pin-tree" \
+    "G15m a TRAILING-SLASH spelling of the sha record normalises to the same root and PRESERVES"
+
+# G15n: THE `$CELL_HOME` RECORD ELEMENT, ALONE (round 3, measured gap). Source 2 of the list is
+# `"$cell/.harness-path"`, and until this fixture existed NO assertion could see it: in G15a `cell` IS
+# `$HOME`, so the `$HOME` element that follows names the SAME file and masks a deletion of source 2;
+# G15k/G15l point `CELL_HOME` at a home with no record. Measured: deleting `"$cell/.harness-path"` from
+# a mutant left all 21 G15 rows GREEN — the comment claimed a coverage that did not exist. That matters
+# beyond tidiness because this is the only record source that survives a box where `CELL_HOME != HOME`
+# and `HARNESS_PIN_FILE` is not in the reaper's environment (`harness-apply-pass.sh:207` CONSUMES the
+# dir record and roots its own default at `$CELL_HOME/.harness-path` — it does not write it; the writers
+# are `install.sh:1072`, `cloud-cell-bringup.sh:1034`, `cloud-cell-supervisor.sh:2316`), and a silent
+# miss here REMOVES the tree the box executes.
+# The record is under `CELL_HOME`, `$HOME` has NONE, and the tree path carries no `harness` component —
+# so neither the `$HOME` element nor the shape backstop can carry the verdict.
+ENV=pin_tree_cellhome
+REPO="$(mk_repo "$ENV")"
+CHWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$CHWT" HEAD
+mkdir -p "$T/$ENV/cell-home"
+printf '%s\n' "$CHWT/scripts/orchestrator-harness" >"$T/$ENV/cell-home/.harness-path"
+assert_nofile "$T/$ENV/home/.harness-path" \
+    "G15n precondition: the \$HOME record is ABSENT, so the \$CELL_HOME element is the only candidate"
+OUT="$(CELL_HOME_OVERRIDE="$T/$ENV/cell-home" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "pin-tree" \
+    "G15n a \$CELL_HOME-rooted record is read with NO record at \$HOME and no 'harness' in the path (the mixed-root shape, other direction from G15k)"
+
+# G15o: THE RECORD'S OWN CONTENT — content this probe cannot PLACE IN SPACE must PRESERVE, and the
+# verdict must not move with the caller. `$canon` is absolute (`pwd -P`), so a relative record can only
+# ever match through `rec_c`, and `rec_c` is `cd "$(dirname "$rec_t")"` — i.e. relative to WHEREVER THE
+# REAPER WAS INVOKED. Resolving it by guesswork is one box, one record, two cwds, two verdicts. But
+# NEGATIVE is not the alternative: "cannot place it" is not "names something else", so the arm
+# PRESERVES — the same rule the EMPTY record gets in G15v, deliberately ONE arm for both shapes (see
+# the comment in `pin_tree_match`). The worktree PATH carries NO `harness` component, so the shape
+# backstop cannot mask the miss, and the FIRST half asserts that the ABSOLUTE spelling of the same
+# record PRESERVES — without it the second half would be vacuous, because a fixture that cannot see
+# a record at all proves nothing about the record it declines to place.
+#
+# ⛔ THE PATH THE RECORD NAMES MUST EXIST IN THE WORKTREE, AND THAT IS LOAD-BEARING (#10114). `rec_c`
+# is `cd "$(dirname "$rec_t")" && pwd -P`, so a relative record only resolves when the directory it
+# names is REACHABLE — and it is only reachable here because this fixture COMMITS it. Measured with
+# the path absent (`mk_repo` alone commits `base.txt` and nothing else): `cd` failed for every
+# spelling, `rec_c` was EMPTY, and the record could not match by ANY route — so the production guard
+# and the `no-record-absoluteness` mutant returned the SAME `reclaimable` row. G15o then passed
+# vacuously (its "discarded" assertion was satisfied by a fixture that could never see the record)
+# and G15-M7 went red on `got: reclaimable, want: pin-tree`, which is the mutation leg doing its job:
+# it refused to certify a guard whose effect no fixture exercised. The path is COMMITTED rather than
+# created untracked so the row stays `clean`, and the pin-tree probe runs before every dirty rule, so
+# the mutant's verdict cannot be perturbed by it either way.
+ENV=pin_tree_relrec
+REPO="$(mk_repo "$ENV")"
+mkdir -p "$REPO/scripts/orchestrator-harness"
+printf 'pin\n' >"$REPO/scripts/orchestrator-harness/harness.sh"
+"$REAL_GIT" -C "$REPO" add scripts
+GIT_AUTHOR_DATE="$OLD_DATE" GIT_COMMITTER_DATE="$OLD_DATE" \
+    "$REAL_GIT" -C "$REPO" commit -qm "pin tree"
+RELWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$RELWT" HEAD
+RELREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$RELWT/scripts/orchestrator-harness" >"$RELREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
+    "G15o precondition: the ABSOLUTE spelling of this record PRESERVES, so the fixture can see it"
+# …and now the SAME record file with the SAME tree, the content rewritten RELATIVE. Invoked from a
+# cwd where that relative spelling DOES resolve (`$T/$ENV` -> `opt/5b1b09aad2c1/scripts` exists in the
+# worktree, because the line above commits it) AND from `/` where it does not: BOTH must PRESERVE,
+# which is the whole property — the verdict is not a function of the caller. `G15-M7` shows the
+# discriminating mutant (the pre-fix `continue`) reclaiming it from BOTH cwds.
+printf '%s\n' "opt/5b1b09aad2c1/scripts/orchestrator-harness" >"$RELREC"
+OUT="$(cd "$T/$ENV" && REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
+    "G15o a RELATIVE record PRESERVES from the cwd where its spelling resolves (it is not resolved, it is refused)"
+OUT="$(cd / && REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RELWT")")" "pin-tree" \
+    "G15o …and from the cwd where it does not, so the verdict is not a function of the caller"
+assert_contains "$(row_for "$OUT" "$RELWT")" "cannot place it" \
+    "G15o …and the row says WHY it declined to place the record, rather than reading it as no record"
+
+# G15v: an EMPTY — and a whitespace-only — record. This is a MEASURED production state, not a
+# hypothetical: `cloud-cell-supervisor.sh` writes the dir record NON-ATOMICALLY (`printf … >
+# "$HARNESS_PIN_FILE"`), and `cloud-cell-bringup.sh` states the consequence in its own comment —
+# "a concurrent `status`/`start` can `head -1` an EMPTY pin, and a write that fails after the
+# redirect leaves a previously valid pin EMPTY … (the measured `pinned=none`-with-a-pin-file
+# state)". The pre-fix `[ -n "$rec_t" ] || continue` read that as "no record" and rule 3 removed the
+# tree the box EXECUTES, in exactly the state the bringup was hardened against. The sibling reader
+# refuses the same input (`install.sh`: "Empty means 'no usable record', never 'current'"), and
+# PRESERVE is this probe's analogue of that refusal. The tree path carries no `harness` component, so
+# the shape backstop cannot mask it, and the first half asserts the READABLE record preserves — the
+# vacuity guard G15o was caught without.
+ENV=pin_tree_emptyrec
+REPO="$(mk_repo "$ENV")"
+EMWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$EMWT" HEAD
+EMREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$EMWT/scripts/orchestrator-harness" >"$EMREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$EMWT")")" "pin-tree" \
+    "G15v precondition: the POPULATED record preserves, so the fixture can see the record it empties"
+: >"$EMREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$EMWT")")" "pin-tree" \
+    "G15v an EMPTY record PRESERVES (a truncated write is not 'names something else')"
+assert_contains "$(row_for "$OUT" "$EMWT")" "names NOTHING" \
+    "G15v …and the row says the record is empty, so the operator sees a failed write instead of losing the tree"
+printf '   \n' >"$EMREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$EMWT")")" "pin-tree" \
+    "G15v …and a WHITESPACE-ONLY record also PRESERVES (same cannot-answer input, same arm)"
+
+# G15q: the UNREADABLE RECORD (review cycle 5, P2). `[ -r "$rec" ] || continue` made "cannot read
+# it" and "it is not there" the SAME answer, so the one record that says the box needs these bytes
+# became "no evidence" exactly when it could not be read — and rule 3 then removed the tree the box
+# EXECUTES. Same class as `no-stash-unverifiable-arm` ("cannot read the register" read as "the
+# register is clear") and as the truncated-scan arm in `holders_live`. The worktree path carries NO
+# `harness` component, so the shape backstop cannot mask the miss, and the first half asserts the
+# READABLE record preserves — without it the second half could be satisfied by a fixture that never
+# saw a record at all (the vacuity G15o was caught in).
+ENV=pin_tree_unreadable
+REPO="$(mk_repo "$ENV")"
+UNRWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$UNRWT" HEAD
+UNRREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$UNRWT/scripts/orchestrator-harness" >"$UNRREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$UNRWT")")" "pin-tree" \
+    "G15q precondition: the READABLE record preserves, so the fixture can see the record it unreads"
+if chmod 000 "$UNRREC" 2>/dev/null && [ -z "$(cat "$UNRREC" 2>/dev/null)" ]; then
+    OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper "$ENV" --dry-run --repo "$REPO")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$UNRWT")")" "pin-tree" \
+        "G15q an UNREADABLE record PRESERVES (cannot-read is NOT names-something-else)"
+    assert_contains "$(row_for "$OUT" "$UNRWT")" "UNREADABLE" \
+        "G15q …and the row says WHY, so the operator fixes permissions instead of losing the tree"
+else
+    echo "  → G15q unreadable-record leg skipped (chmod 000 did not block reading here)"
+fi
+chmod 644 "$UNRREC" 2>/dev/null || true
+
+# G15r: the `pin_root` ARM'S OWN ABSOLUTENESS (review cycle 5, P3). G15o/`no-record-absoluteness` pin
+# the guard on the record's CONTENT; the arm that NAMES the record is the same hazard and had NO
+# fixture at all — every `HARNESS_PIN_OVERRIDE` in this suite is absolute — so a tidy-up could delete
+# the guard at the top of `pin_tree_match` with the suite green. A relative `$HARNESS_PIN` that the
+# guard ACCEPTED would derive its root from wherever the reaper was invoked: one box, two cwds, two
+# verdicts, on a veto whose miss is a removal. Driven from BOTH cwds, because a single-cwd fixture
+# cannot tell a discarded record from a resolved one.
+ENV=pin_tree_relpinroot
+REPO="$(mk_repo "$ENV")"
+RPWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$RPWT" HEAD
+mkdir -p "$T/$ENV/pinroot/state"
+printf '%s\n' "$RPWT/scripts/orchestrator-harness" >"$T/$ENV/pinroot/.harness-path"
+printf '%s\n' "5b1b09aad2c1" >"$T/$ENV/pinroot/state/HARNESS-PIN"
+OUT="$(HARNESS_PIN_OVERRIDE="$T/$ENV/pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "pin-tree" \
+    "G15r precondition: the ABSOLUTE spelling derives the root and PRESERVES, so the fixture can see it"
+OUT="$(cd "$T/$ENV" && HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
+    "G15r a RELATIVE \$HARNESS_PIN is DISCARDED even from the cwd where it resolves"
+OUT="$(cd / && HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT")")" "reclaimable" \
+    "G15r …and from the cwd where it does not, so the verdict is not a function of the caller"
+
+# G15s: the record is a DANGLING SYMLINK — and `[ -e ]` is FALSE for one, so this is the ONE shape
+# where the `-L` disjunct is the entire guard. It is not hypothetical: a rotated pin leaves exactly a
+# link to a path that no longer exists. G15q exercises only `[ -e ]` (chmod 000 on a regular file), so
+# without this fixture the `-L` arm could be deleted with the suite green.
+ENV=pin_tree_symrec
+REPO="$(mk_repo "$ENV")"
+SYMWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$SYMWT" HEAD
+ln -s "/nonexistent/pin-audit-rotated" "$T/$ENV/home/.harness-path"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$SYMWT")")" "pin-tree" \
+    "G15s a DANGLING SYMLINK record PRESERVES (-e is false for it; -L is the whole guard)"
+assert_contains "$(row_for "$OUT" "$SYMWT")" "UNREADABLE" \
+    "G15s …and the row says WHY, so an operator can see the rotated-pin link rather than lose the tree"
+
+# G15t: the record's PARENT exists but cannot be SEARCHED, so `[ -r ]`, `[ -e ]` and `[ -L ]` are ALL
+# false for a path that is really there. Only the parent disjunct can see it, and that disjunct is the
+# one a tidy-up is most likely to call "a broken box". The tree path carries no `harness` component.
+ENV=pin_tree_nox
+REPO="$(mk_repo "$ENV")"
+NOXWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$NOXWT" HEAD
+NOXDIR="$T/$ENV/nox"
+mkdir -p "$NOXDIR"
+printf '%s\n' "$NOXWT/scripts/orchestrator-harness" >"$NOXDIR/.harness-path"
+if chmod 600 "$NOXDIR" 2>/dev/null && [ -z "$(cat "$NOXDIR/.harness-path" 2>/dev/null)" ]; then
+    OUT="$(HARNESS_PIN_FILE_OVERRIDE="$NOXDIR/.harness-path" \
+        REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper "$ENV" --dry-run --repo "$REPO")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$NOXWT")")" "pin-tree" \
+        "G15t a record under an UNSEARCHABLE directory PRESERVES (-r, -e and -L are all false for it)"
+    assert_contains "$(row_for "$OUT" "$NOXWT")" "UNREADABLE" \
+        "G15t …and the row says WHY, so the operator fixes permissions instead of losing the tree"
+else
+    echo "  → G15t unsearchable-parent leg skipped (chmod 600 did not block traversal here)"
+fi
+chmod 755 "$NOXDIR" 2>/dev/null || true
+
+# G15u: the record EXISTS and is READABLE, but is NOT A REGULAR FILE — a DIRECTORY on the record path.
+# ⛔ `-r` tests READ PERMISSION, not "readable as a record", and it is TRUE for a directory, a symlink
+# to one, and a FIFO. So the fail-closed arm above was not even ENTERED: `head -n 1 <dir>` yielded
+# nothing, the `[ -n "$rec_t" ] || continue` read that as "no record", and rule 3 REMOVED the tree the
+# box executes — with the record sitting right there and `[ -e ]` inside ALREADY true for it. This is
+# the same predicate the sibling record reader settles by REFUSING (`orchestrator-harness/install.sh`,
+# "A RECORD THAT IS NOT A FILE IS CANNOT-VERIFY, NOT AN EMPTY PIN"). A FIFO would be worse than a
+# removal here: `[ -r ]` passes and `head` BLOCKS on `open()`, hanging the whole classifier — so the
+# DIRECTORY is driven here and the FIFO gets its own bounded fixture below (a plain FIFO fixture would
+# hang the suite rather than red it if either arm were ever deleted).
+# The tree path carries NO `harness` component, so the shape backstop cannot mask the miss.
+ENV=pin_tree_dirrec
+REPO="$(mk_repo "$ENV")"
+DIRWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$DIRWT" HEAD
+DIRREC="$T/$ENV/home/.harness-path"
+mkdir -p "$DIRREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DIRWT")")" "pin-tree" \
+    "G15u a record that is a DIRECTORY (readable, but not a regular file) PRESERVES — -r is not 'readable as a record'"
+assert_contains "$(row_for "$OUT" "$DIRWT")" "UNREADABLE" \
+    "G15u …and the row says WHY, so the operator sees the mis-created record instead of losing the tree"
+
+# G15w: the FIFO — the ONE shape where deleting `[ ! -f "$rec" ]` does not merely mis-classify but
+# HANGS. `[ -r ]` is true for a FIFO and `[ -f ]` is false, so production never reaches `head`; without
+# the disjunct, `head -n 1 <fifo>` blocks in `open()` waiting for a writer that never comes, and the
+# whole reap pass stops. A directory can no longer distinguish the disjunct (the PLACEMENT arm catches
+# the empty `head` result, which is the right end state and is exactly what G15-M12 asserts), so the
+# FIFO is the disjunct's remaining reason to exist and it is driven here.
+# ⛔ BOUNDED, DELIBERATELY, AND NOT WITH `timeout` (not in BSD userland): a bare run would hang the
+# SUITE rather than fail a leg, so the pair is driven by a `sleep` + `kill`, and a bound that fires is
+# an assertion failure, never a silent pass. ⛔ THE OUTPUT GOES TO A FILE, NOT THROUGH `$( )`: a command
+# substitution is a SUBSHELL, so a status the helper set would be lost and the caller would read an
+# unbound variable (measured — the first draft of this helper did exactly that).
+# ⛔ AND THE BOUND MUST KILL THE WHOLE PROCESS GROUP, NOT THE JOB HANDLE. `run_reaper` is a FUNCTION
+# whose last act is `env … bash <reaper>`, and the blocked `head` sits THREE levels below `$pid` — so a
+# `kill -9 "$pid"` reaps the wrapper and leaves `head` blocked in `open()` FOR EVER, with the FIFO
+# already unlinked so nothing can ever unblock it. That is not theoretical: the first draft of this
+# helper leaked one 4-process chain per suite run, MEASURED as two live chains 8m14s and 1m34s old after
+# two runs. `set -m` gives each background job its OWN process group, which is what makes the group
+# kill reach it.
+_bounded_reap() { # <secs> <shell-command> <outfile> -> exit status IS the reaper's (137 = killed)
+    local secs="$1" cmd="$2" out="$3" pid killer rc
+    set -m
+    eval "$cmd" >"$out" 2>&1 &
+    pid=$!
+    ( sleep "$secs"; kill -9 -- "-$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    killer=$!
+    set +m
+    wait "$pid" 2>/dev/null; rc=$?
+    # …and the killer gets its own group too, so its `sleep` cannot outlive it and late-fire `kill` at a
+    # pid the system has since reused.
+    kill -9 -- "-$killer" 2>/dev/null
+    wait "$killer" 2>/dev/null
+    return "$rc"
+}
+ENV=pin_tree_fiforec
+REPO="$(mk_repo "$ENV")"
+FIFOWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$FIFOWT" HEAD
+mkfifo "$T/$ENV/home/.harness-path"
+_bounded_reap 20 "REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 run_reaper $ENV --dry-run --repo $REPO" "$T/.bounded-fifo.out"
+FIFO_RC=$?
+OUT="$(cat "$T/.bounded-fifo.out")"
+assert_eq "$FIFO_RC" "0" \
+    "G15w a FIFO record returns at once (it never reaches head, so it cannot block)"
+assert_eq "$(reason_token "$(row_for "$OUT" "$FIFOWT")")" "pin-tree" \
+    "G15w a FIFO record PRESERVES — -r is true for it and -f is the disjunct that catches it"
+
+# G15x: an ABSOLUTE record that ENDS in whitespace — the ROOT FORM of the record, which is the only
+# form the `"$canon"/*` arm cannot rescue. `/?*` passes it, the verbatim comparison misses (the path has
+# a trailing space), and `rec_c` misses too (dirname/basename of `<tree> ` are a DIFFERENT path), so the
+# pre-fix answer is NEGATIVE and rule 3 removes the tree the box EXECUTES. The root form is
+# PRODUCTION-WRITTEN: install.sh accepts an explicit `HARNESS=<pin root>` ("an operator may pin a
+# deliberate checkout") and records it with `pin_write_record`. ⛔ NOT TRIMMED on the way in — a path may
+# legitimately END in a space (that is why G15l exists), so the record is refused, not corrected.
+# The tree path carries no `harness` component, so the shape backstop cannot mask it.
+ENV=pin_tree_wsprec
+REPO="$(mk_repo "$ENV")"
+WSWT="$T/$ENV/pins/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WSWT" HEAD
+WSREC="$T/$ENV/home/.harness-path"
+printf '%s\n' "$WSWT" >"$WSREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSWT")")" "pin-tree" \
+    "G15x precondition: the ROOT form with no trailing junk PRESERVES, so the fixture can see the record"
+printf '%s\n' "$WSWT " >"$WSREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSWT")")" "pin-tree" \
+    "G15x a ROOT-form record with a TRAILING SPACE PRESERVES (unplaceable, not 'names something else')"
+assert_contains "$(row_for "$OUT" "$WSWT")" "will not TRIM" \
+    "G15x …and the row says the path was refused rather than trimmed, so a real trailing space is not silently lost"
+# ⛔ THE SHORT-ABSOLUTE PROOF ARM IS ASSERTED HERE, because its first draft was DEAD: it tested `/?*` on a
+# value that had already failed `/?*` one line above, so the false proof it replaced still shipped. `/` is
+# the only content that reaches it, and this assertion is what stops it going dead again.
+printf '%s\n' "/" >"$WSREC"
+OUT="$(REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSWT")")" "pin-tree" \
+    "G15x a one-character absolute record ('/') PRESERVES"
+assert_contains "$(row_for "$OUT" "$WSWT")" "an absolute path this probe cannot place" \
+    "G15x …with the SHORT-ABSOLUTE proof, which must not claim a cwd resolution that never ran"
+
+# G15y: the SHA-RECORD SPELLING carries the same junk, and it is the one input whose junk makes a whole
+# record SOURCE disappear instead of a single record unplaceable. `/` and `//` are normalised, but a
+# trailing space makes the final `*/state/HARNESS-PIN` test fail, so the arm assigns `pin_root=""` in
+# SILENCE — no fail-closed arm, no proof — and the derived source is gone. Driven on the box where that
+# source is the ONLY one that can name the tree (custom pin root, not named `harness`, so the shape
+# backstop cannot save it), which is exactly the box the derivation was added for.
+ENV=pin_tree_wspin
+REPO="$(mk_repo "$ENV")"
+WSINWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WSINWT" HEAD
+WSINHOME="$T/$ENV/derived-home"
+mkdir -p "$WSINHOME/.pi/agent/state"
+printf '5b1b09aad2c1\n' >"$WSINHOME/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$WSINWT/scripts/orchestrator-harness" >"$WSINHOME/.harness-path"
+OUT="$(HARNESS_PIN_OVERRIDE="$WSINHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSINWT")")" "pin-tree" \
+    "G15y precondition: the clean sha-record spelling derives the root and PRESERVES, so the fixture can see it"
+OUT="$(HARNESS_PIN_OVERRIDE="$WSINHOME/.pi/agent/state/HARNESS-PIN " \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSINWT")")" "pin-tree" \
+    "G15y a sha-record spelling with a TRAILING SPACE PRESERVES instead of silently dropping the source"
+assert_contains "$(row_for "$OUT" "$WSINWT")" "will not be TRIMMED" \
+    "G15y …and the row says so, rather than the fourth source vanishing with no proof at all"
+
+# G15z: JUNK AT THE FRONT of `$HARNESS_PIN`, and a spelling that derives an EMPTY root. Both are the
+# SAME class as G15y one end over, and both failed open the same way: the `/?*` guard (or the `%s:+…`
+# guard) drops the derived source IN SILENCE, so the record that WOULD have named the tree is replaced by
+# "no record" and rule 3 removes it. Same box as G15y — custom pin root, no `harness` component, so the
+# shape backstop cannot save it.
+ENV=pin_tree_wspin2
+REPO="$(mk_repo "$ENV")"
+WSZWT="$T/$ENV/opt/5b1b09aad2c1"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$WSZWT" HEAD
+WSZHOME="$T/$ENV/derived-home"
+mkdir -p "$WSZHOME/.pi/agent/state"
+printf '5b1b09aad2c1\n' >"$WSZHOME/.pi/agent/state/HARNESS-PIN"
+printf '%s\n' "$WSZWT/scripts/orchestrator-harness" >"$WSZHOME/.harness-path"
+OUT="$(HARNESS_PIN_OVERRIDE="$WSZHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSZWT")")" "pin-tree" \
+    "G15z precondition: the clean sha-record spelling derives the root and PRESERVES, so the fixture can see it"
+OUT="$(HARNESS_PIN_OVERRIDE=" $WSZHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSZWT")")" "pin-tree" \
+    "G15z a sha-record spelling with a LEADING SPACE PRESERVES instead of silently dropping the source"
+OUT="$(HARNESS_PIN_OVERRIDE="/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSZWT")")" "pin-tree" \
+    "G15z a recognised spelling whose root strips to EMPTY PRESERVES (root '/', not 'no record')"
+# ⛔ THE SECOND EMPTY-ROOT SHAPE, and the one the first fix MISSED: `/.pi/agent/state/HARNESS-PIN`.
+# That is the spelling `pi-bootstrap/setup.sh:1109` actually writes (`--pin-file "$DEST/state/HARNESS-PIN"`
+# with `DEST=$HOME/.pi/agent`), and with `$HOME=/` it strips to `/.pi/agent` at the sha-record arm and
+# to "" at the `.pi/agent` arm — so a guard placed BETWEEN the two strips did not cover it and the
+# tree was `remove … rule=3`. Only a fixture on THIS spelling can see that, which is why it is here
+# rather than assumed covered by the leg above.
+OUT="$(HARNESS_PIN_OVERRIDE="/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$((NOW - 86400 * 30)) REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper "$ENV" --dry-run --repo "$REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$WSZWT")")" "pin-tree" \
+    "G15z a '/.pi/agent'-rooted sha-record spelling — the documented one, emptied by the SECOND strip — PRESERVES too"
+
+# ── G15 MUTATIONS: every INPUT of the veto, proven by removing exactly it ────────────────────────
+# ⛔ THIS SECTION IS THE ROUND-2 FINDING, NOT A NICETY. The veto shipped with NO mutation leg, while
+# every gate it was reviewed alongside (dirty · ancestry · scratch floor · the cwd self-pid exemption ·
+# `set -f` · stash x2 · the per-repo offset key) has one — and that is how two vacuous assertions
+# survived three recorded clean reviews. Each leg below asserts the MUTANT's behaviour — so each one shows the
+# corresponding G15 assertion can go red, which is the only thing that makes it an assertion.
+G15_REPO="$T/pin_tree/repo"
+G15_PINWT="$T/pin_tree/harness/5b1b09aad2c1"
+G15_TS=$((NOW - 86400 * 30))
+
+MUTP1="$T/mutant-no-pin-tree-record-probe.sh"
+mutate_reaper_anchored "$MUTP1" no-pin-tree-record-probe
+OUT="$(REAPER_OVERRIDE="$MUTP1" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree --dry-run --repo "$G15_REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$G15_PINWT")")" "pin-tree-shape" \
+    "G15-M1 MUTATION: with the record-based probe deleted the tree falls to the SHAPE backstop, so G15a's exact-reason assertion reds => it is discriminating"
+
+MUTP2="$T/mutant-no-pin-tree-shape.sh"
+mutate_reaper_anchored "$MUTP2" no-pin-tree-shape
+OUT="$(REAPER_OVERRIDE="$MUTP2" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_shape --dry-run --repo "$T/pin_tree_shape/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_shape/harness/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M2 MUTATION: without the shape backstop the unrecorded pin tree is WRONGLY rule-3 residue => G15e/G15h are discriminating"
+OUT="$(REAPER_OVERRIDE="$MUTP2" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree --dry-run --repo "$G15_REPO")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$G15_PINWT")")" "pin-tree" \
+    "G15-M2 …and the RECORD probe preserves on its own, so the two probes are proven INDEPENDENTLY"
+
+MUTP3="$T/mutant-unguarded-home.sh"
+mutate_reaper_anchored "$MUTP3" unguarded-home
+OUT="$(RUN_REAPER_UNSET_HOME=1 REAPER_OVERRIDE="$MUTP3" HARNESS_PIN_FILE_OVERRIDE="$NHREC" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_nohome --dry-run --repo "$NH_REPO" 2>&1)"
+assert_contains "$OUT" "unbound variable" \
+    "G15-M3 MUTATION: restoring bare \$HOME makes G15i's assertion go RED => the guard is the thing that fixture proves"
+
+MUTP4="$T/mutant-no-pin-root-derivation.sh"
+mutate_reaper_anchored "$MUTP4" no-pin-root-derivation
+OUT="$(REAPER_OVERRIDE="$MUTP4" HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_derived --dry-run --repo "$T/pin_tree_derived/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "reclaimable" \
+    "G15-M4 MUTATION: without the sha-record derivation the custom-root pin tree is WRONGLY rule-3 residue => G15m is discriminating"
+
+MUTP4B="$T/mutant-no-pin-root-normalisation.sh"
+mutate_reaper_anchored "$MUTP4B" no-pin-root-normalisation
+OUT="$(REAPER_OVERRIDE="$MUTP4B" HARNESS_PIN_OVERRIDE="$DVHOME/.pi/agent//state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_derived --dry-run --repo "$T/pin_tree_derived/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$DVWT")")" "reclaimable" \
+    "G15-M4b MUTATION: without the doubled-slash collapse the derived root is <root>/.pi/agent/ where no record lives, so the tree is WRONGLY rule-3 residue => G15m's '//' assertion is discriminating"
+
+MUTP5="$T/mutant-home-expansion-unquoted.sh"
+mutate_reaper_anchored "$MUTP5" home-expansion-unquoted
+OUT="$(REAPER_OVERRIDE="$MUTP5" HOME_OVERRIDE="$SPHOME" CELL_HOME_OVERRIDE="$T/pin_tree_space/cell-home" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_space --dry-run --repo "$T/pin_tree_space/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$SPWT")")" "reclaimable" \
+    "G15-M5 MUTATION: with BOTH quoting layers removed the spaced HOME splits, the record is skipped and the tree is WRONGLY rule-3 residue => G15l is discriminating"
+
+MUTP6="$T/mutant-no-cell-home-record.sh"
+mutate_reaper_anchored "$MUTP6" no-cell-home-record
+OUT="$(REAPER_OVERRIDE="$MUTP6" CELL_HOME_OVERRIDE="$T/pin_tree_cellhome/cell-home" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_cellhome --dry-run --repo "$T/pin_tree_cellhome/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$CHWT")")" "reclaimable" \
+    "G15-M6 MUTATION: without the \$CELL_HOME record element that tree is WRONGLY rule-3 residue => G15n is discriminating (it was NOT, before this leg)"
+
+MUTP7="$T/mutant-no-record-absoluteness.sh"
+mutate_reaper_anchored "$MUTP7" no-record-absoluteness
+# ⛔ BOTH cwds, because the mutant reproduces the PRE-FIX `continue` and the fix's property is
+# cwd-INDEPENDENCE — asserting from one cwd could not tell a discard from a discard that happens to
+# land the same way here. Production answers `pin-tree` from both (G15o).
+for _cwd in "$T/pin_tree_relrec" /; do
+    OUT="$(cd "$_cwd" && REAPER_OVERRIDE="$MUTP7" \
+        REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper pin_tree_relrec --dry-run --repo "$T/pin_tree_relrec/repo")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_relrec/opt/5b1b09aad2c1")")" "reclaimable" \
+        "G15-M7 MUTATION (cwd=$_cwd): without the placement arm a RELATIVE record is skipped and the tree is WRONGLY rule-3 residue => G15o is discriminating"
+done
+# G15-M13: the SAME anchor, asserted against the EMPTY fixture — which is how ONE arm is shown to
+# carry BOTH cannot-answer shapes. Without it the empty record reads as "no record" and the tree the
+# box EXECUTES is removed in the state `cloud-cell-bringup.sh` says it was hardened against.
+MUTP13="$T/mutant-no-record-empty.sh"
+mutate_reaper_anchored "$MUTP13" no-record-absoluteness
+: >"$T/pin_tree_emptyrec/home/.harness-path"
+OUT="$(REAPER_OVERRIDE="$MUTP13" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_emptyrec --dry-run --repo "$T/pin_tree_emptyrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_emptyrec/pins/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M13 MUTATION: without the placement arm an EMPTY record is skipped and the tree is WRONGLY rule-3 residue => G15v is discriminating"
+# G15-M14: delete the TRAILING-JUNK arm. The mutant answers like the pre-fix prefix-only test did — a
+# root-form record ending in a space is "absolute", so it is compared verbatim, misses, and the tree
+# falls to rule 3. That is the one IN-SURFACE shape cycle 5 reproduced, and this leg is what keeps it
+# from coming back.
+MUTP14="$T/mutant-no-record-trailing-junk.sh"
+mutate_reaper_anchored "$MUTP14" no-record-trailing-junk
+printf '%s\n' "$T/pin_tree_wsprec/pins/5b1b09aad2c1 " >"$T/pin_tree_wsprec/home/.harness-path"
+OUT="$(REAPER_OVERRIDE="$MUTP14" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wsprec --dry-run --repo "$T/pin_tree_wsprec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wsprec/pins/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M14 MUTATION: without the trailing-junk arm a ROOT-form record with a trailing space is compared verbatim, misses, and the tree is WRONGLY rule-3 residue => G15x is discriminating"
+# G15-M15: delete the sha-record trailing-junk arm. The mutant drops the derived source in silence, so on
+# a box whose tree is named only by that source the record is "no record" and rule 3 removes it.
+MUTP15="$T/mutant-no-pin-root-trailing-junk.sh"
+mutate_reaper_anchored "$MUTP15" no-pin-root-trailing-junk
+OUT="$(HARNESS_PIN_OVERRIDE="$T/pin_tree_wspin/derived-home/.pi/agent/state/HARNESS-PIN " \
+    REAPER_OVERRIDE="$MUTP15" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wspin --dry-run --repo "$T/pin_tree_wspin/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M15 MUTATION: without the sha-record trailing-junk arm the derived source is dropped in silence and the tree is WRONGLY rule-3 residue => G15y is discriminating"
+# G15-M16: the same anchor, driven with a LEADING space — one arm, both ends, two fixtures.
+OUT="$(HARNESS_PIN_OVERRIDE=" $T/pin_tree_wspin2/derived-home/.pi/agent/state/HARNESS-PIN" \
+    REAPER_OVERRIDE="$MUTP15" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wspin2 --dry-run --repo "$T/pin_tree_wspin2/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin2/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M16 MUTATION: without the arm a LEADING-space spelling drops the source in silence and the tree is WRONGLY rule-3 residue => G15z is discriminating at the front too"
+# G15-M17: the empty-root leg.
+MUTP17="$T/mutant-no-pin-root-empty-root.sh"
+mutate_reaper_anchored "$MUTP17" no-pin-root-empty-root
+OUT="$(HARNESS_PIN_OVERRIDE="/state/HARNESS-PIN" REAPER_OVERRIDE="$MUTP17" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wspin2 --dry-run --repo "$T/pin_tree_wspin2/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin2/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M17 MUTATION: without the empty-root arm a '/'-rooted sha-record spelling skips the derived source and the tree is WRONGLY rule-3 residue => G15z is discriminating"
+# G15-M18: the SAME arm, driven through the SECOND strip. One arm covers both strips, so one anchor
+# deletes both — but a mutant leg per shape is what proves the arm is the thing standing between each
+# shape and a reclaim, rather than the other three record sources happening to name this tree.
+OUT="$(HARNESS_PIN_OVERRIDE="/.pi/agent/state/HARNESS-PIN" REAPER_OVERRIDE="$MUTP17" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_wspin2 --dry-run --repo "$T/pin_tree_wspin2/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_wspin2/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M18 MUTATION: without the empty-root arm the '/.pi/agent'-rooted spelling — emptied by the second strip — also reclaims, so the moved guard is what covers it"
+
+# G15-M8: delete the FAIL-CLOSED arm for an unreadable record. The mutant answers like the pre-fix
+# `[ -r "$rec" ] || continue` did — an unreadable record reads as "no record" — so the tree the box
+# EXECUTES falls to rule 3 and is RECLAIMED. ⛔ This is the assertion G15q exists for: "cannot read
+# the record" being read as "the record names something else", which is the same fail-open
+# `no-stash-unverifiable-arm` and the truncated-scan arm in `holders_live` were fixed for.
+MUTP8="$T/mutant-no-record-unreadable-failclosed.sh"
+mutate_reaper_anchored "$MUTP8" no-record-unreadable-failclosed
+UNRMUT="$T/pin_tree_unreadable/opt/5b1b09aad2c1"
+chmod 000 "$T/pin_tree_unreadable/home/.harness-path" 2>/dev/null || true
+if [ -z "$(cat "$T/pin_tree_unreadable/home/.harness-path" 2>/dev/null)" ]; then
+    OUT="$(REAPER_OVERRIDE="$MUTP8" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper pin_tree_unreadable --dry-run --repo "$T/pin_tree_unreadable/repo")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$UNRMUT")")" "reclaimable" \
+        "G15-M8 MUTATION: without the fail-closed arm an UNREADABLE record silently removes the tree => G15q is discriminating"
+else
+    echo "  → G15-M8 skipped (chmod 000 did not block reading here, so the mutant is unobservable)"
+fi
+chmod 644 "$T/pin_tree_unreadable/home/.harness-path" 2>/dev/null || true
+
+# G15-M9: delete the `pin_root` absoluteness guard. The mutant derives a root from a RELATIVE
+# `$HARNESS_PIN` resolved against the REAPER'S CWD, so the same tree is preserved when the reaper is
+# run where the relative path happens to resolve — a verdict that is a function of the caller. Driven
+# from the resolving cwd (where the mutant PRESERVES and the production code does not), which is the
+# only cwd where the two differ; G15r asserts BOTH cwds stay `reclaimable`.
+MUTP9="$T/mutant-no-pin-root-absoluteness.sh"
+mutate_reaper_anchored "$MUTP9" no-pin-root-absoluteness
+RPWT_M="$T/pin_tree_relpinroot/opt/5b1b09aad2c1"
+OUT="$(cd "$T/pin_tree_relpinroot" && REAPER_OVERRIDE="$MUTP9" \
+    HARNESS_PIN_OVERRIDE="pinroot/state/HARNESS-PIN" \
+    REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_relpinroot --dry-run --repo "$T/pin_tree_relpinroot/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$RPWT_M")")" "pin-tree" \
+    "G15-M9 MUTATION: without the \$pin_root guard a RELATIVE spelling PRESERVES from the resolving cwd => G15r is discriminating"
+
+# G15-M10 / G15-M11: the (8) anchor replaces the WHOLE fail-closed condition, so it cannot show WHICH
+# disjunct carries the fix. Each disjunct is deleted ALONE here; both mutants must fall back to the
+# pre-fix answer (`reclaimable`, i.e. the tree removed), which is what makes G15s and G15t assertions.
+MUTP10="$T/mutant-no-record-unreadable-symlink.sh"
+mutate_reaper_anchored "$MUTP10" no-record-unreadable-symlink
+OUT="$(REAPER_OVERRIDE="$MUTP10" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_symrec --dry-run --repo "$T/pin_tree_symrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_symrec/opt/5b1b09aad2c1")")" "reclaimable" \
+    "G15-M10 MUTATION: without the -L disjunct a DANGLING SYMLINK record removes the tree => G15s is discriminating"
+
+MUTP11="$T/mutant-no-record-unreadable-parent.sh"
+mutate_reaper_anchored "$MUTP11" no-record-unreadable-parent
+if chmod 600 "$T/pin_tree_nox/nox" 2>/dev/null && [ -z "$(cat "$T/pin_tree_nox/nox/.harness-path" 2>/dev/null)" ]; then
+    OUT="$(REAPER_OVERRIDE="$MUTP11" HARNESS_PIN_FILE_OVERRIDE="$T/pin_tree_nox/nox/.harness-path" \
+        REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+        run_reaper pin_tree_nox --dry-run --repo "$T/pin_tree_nox/repo")"
+    assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_nox/opt/5b1b09aad2c1")")" "reclaimable" \
+        "G15-M11 MUTATION: without the unsearchable-parent disjunct that record removes the tree => G15t is discriminating"
+else
+    echo "  → G15-M11 skipped (chmod 600 did not block traversal here, so the mutant is unobservable)"
+fi
+chmod 755 "$T/pin_tree_nox/nox" 2>/dev/null || true
+
+# G15-M12: delete the `[ ! -f "$rec" ]` disjunct alone, and drive BOTH non-regular shapes.
+#  (a) the DIRECTORY: the mutant falls through to `head -n 1 <dir>`, which FAILS, so the PLACEMENT arm
+#      answers — the tree is STILL PRESERVED, which is the end state that matters. This leg therefore
+#      asserts the redundancy rather than a removal: two independent arms now cover a directory.
+#  (b) the FIFO: `head` does not fail, it BLOCKS. The mutant must be KILLED by the bound, because a
+#      hang is the defect this disjunct exists to prevent and no assertion on the row can express it.
+MUTP12="$T/mutant-no-record-unreadable-notfile.sh"
+mutate_reaper_anchored "$MUTP12" no-record-unreadable-notfile
+OUT="$(REAPER_OVERRIDE="$MUTP12" REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 \
+    run_reaper pin_tree_dirrec --dry-run --repo "$T/pin_tree_dirrec/repo")"
+assert_eq "$(reason_token "$(row_for "$OUT" "$T/pin_tree_dirrec/opt/5b1b09aad2c1")")" "pin-tree" \
+    "G15-M12a MUTATION: without [ ! -f ] a DIRECTORY record reaches the PLACEMENT arm and is STILL preserved — the two arms are independent, so G15u's outcome does not depend on either alone"
+_bounded_reap 6 "REAPER_OVERRIDE=$MUTP12 REAP_WT_TREE_TS=$G15_TS REAP_WT_MIN_AGE_MINUTES_OVERRIDE=0 run_reaper pin_tree_fiforec --dry-run --repo $T/pin_tree_fiforec/repo" "$T/.bounded-fifo-mut.out"
+M12B_RC=$?
+assert_eq "$M12B_RC" "137" \
+    "G15-M12b MUTATION: without [ ! -f ] a FIFO record BLOCKS the pass until killed => the disjunct's remaining job is the HANG, and G15w is the fixture that proves production does not take it"
+
 
 echo ""
 # ⛔ AND IT MUST NOT FAIL OPEN WHEN THE RECORD CANNOT BE READ (review of #3422, P3): the creation

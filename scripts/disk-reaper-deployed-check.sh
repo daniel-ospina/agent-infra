@@ -32,10 +32,17 @@ set -uo pipefail
 PROG="$(basename "${0:-disk-reaper-deployed-check.sh}")"
 DIR_DEFAULT="${HOME:-/tmp}/.pi/agent/scripts"
 RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
-# The entry point the timer executes, the wrapper it goes through, the six pinned delegates, AND the
+# The entry point the timer executes, the wrapper it goes through, the seven pinned delegates, AND the
 # bounded-execution library the delegates source (pinned by `Environment=BOUNDED_LIB=`, and the reaper
 # fails closed at startup without it — so a stale or absent copy means no class runs at all, which the
 # checker must not certify as ok; review of #3405 round 2, P2).
+# ⛔ `reap-runner-work.sh` IS THE ONE THAT MATTERS MOST HERE, and it was the only delegate outside the
+# set. It holds the `rm -rf` rule for the runners' `_work` sink, and it is pinned in BOTH units
+# (`Environment=RUNNER_WORK_REAPER=` / `RUNNER_WORK_REAPER` in the plist). A cell still carrying an
+# EARLIER farmed copy is therefore a live delete-policy nobody hashes — and an earlier revision of that
+# very file shipped a retain set that deleted a LIVE job's `_work/_temp`, which is exactly the shape
+# this check exists to make impossible to miss. `--source <checkout>` reported `deployed ok` for it
+# because `grep -c reap-runner-work` here was 0: the checker could not see the file at all.
 # `lib/live-paths.sh` is here for the same reason as `lib/bounded.sh`, only MORE so: two pinned
 # delegates resolve it from `$(dirname $0)/lib/` and `exit 3` without it (the installer's own farmed set
 # carries it — "a missing library breaks TWO classes"), and it is the shared process-census code every
@@ -43,7 +50,7 @@ RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
 # `--source <checkout>` could report `deployed ok` while the census ran a different library than the
 # checkout's.
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh lib/live-paths.sh"
 
 usage() {
     cat <<EOF

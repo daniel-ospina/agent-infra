@@ -4135,7 +4135,7 @@ cmd_status() {
   # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
   # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
   # reason cells stopped working: at ~97% a controller still beats and every dispatch is refused.
-  local _dr _drs _drc _dst _det cand
+  local _dr _drs _drc _dst _det cand _dr_rw _dr_dup _dr_cls_all
   _dr=""
   for cand in "${DISK_REAPER:-}" \
               "${HOME:-}/.pi/agent/scripts/disk-reaper.sh" \
@@ -4177,12 +4177,47 @@ cmd_status() {
     # verdict added to the reaper and not taught to this reader) is printed, never swallowed.
     _dr_del="$(printf '%s\n' "$_drs" | sed -n 's/^delegate_verdict_worktree=//p' | head -1)"
     _dr_del_note() { case "${_dr_del:-}" in ''|ok|'?'|not-run|dry-run|reclaimed|idle|mixed-benign) printf '' ;; *) printf ' ⛔ worktree-delegate=%s' "$_dr_del" ;; esac; }
+    # ⛔ THE OTHER TWO CLASSES THAT CAN SAY "I COULD NOT MEASURE" (#3057 review, P2). `verdict_runner_work`
+    # and `verdict_duplicate_install` are recorded by the reaper and were printed by NOTHING: the per-class
+    # lines below named only uv/venv/worktree, so `verdict_runner_work=partial` — a census that could read
+    # some of the runner `_work` sink and not the rest — reached no operator surface at all. A field the
+    # reader does not print does not exist, which is the rule this same block already states for
+    # `delegate_verdict_worktree`.
+    # ⛔ PRINTED, NOT ALARMED, for the recorded reason stated at the reaper (`docs/ops/disk-reaper.md`):
+    # `abstained`/`partial` are rc 0 by decision and the RECORD is the alarm channel — an hourly ⛔ for a
+    # permission mismatch is the alarm-fatigue shape the ⏸ symbol below exists to avoid. The benign
+    # spellings stay silent so a healthy cell gains no noise; anything unrecognised prints (FAIL-LOUD).
+    _dr_cls_note() { # <class-kebab> <verdict>
+      local _k
+      case "${2:-}" in ''|ok|'?'|not-run) printf '' ; return 0 ;; esac
+      case "$1" in runner-work) _k=runner_work ;; duplicate-install) _k=duplicate_install ;; *) _k="$1" ;; esac
+      printf ' ⚠️ %s=%s' "$1" "$2"
+      # ⛔ ONLY `runner_work` PUBLISHES `unmeasurable_=` (#3057 review, measured): `disk-reaper.sh`
+      # writes `unmeasurable_runner_work=` and NO `unmeasurable_duplicate_install=` — the
+      # duplicate-install owner has no such field — so the generic lookup below advertised a number
+      # that class can never show. The VERDICT above is written for both and stays printed.
+      case "$_k" in runner_work) _dr_unm "$_k" ;; esac
+    }
+    # The tally that makes the verdict honest: `partial` means the census could not read all of the class's
+    # population, and the CANDIDATE COUNT beside it is a LOWER BOUND — a reader that prints `partial`
+    # without the number leaves the operator unable to tell one unreadable root from fifty. `0` and an
+    # unanswered `?` stay silent (nothing was missed, or the tally itself did not answer — the verdict
+    # already says so).
+    _dr_unm() { # <record-key-suffix>
+      local _n
+      _n="$(printf '%s\n' "$_drs" | sed -n "s/^unmeasurable_$1=//p" | head -1)"
+      case "${_n:-}" in ''|0|'?') return 0 ;; esac
+      printf ' unmeasurable=%s' "$_n"
+    }
+    _dr_rw="$(printf '%s\n' "$_drs" | sed -n 's/^verdict_runner_work=//p' | head -1)"
+    _dr_dup="$(printf '%s\n' "$_drs" | sed -n 's/^verdict_duplicate_install=//p' | head -1)"
+    _dr_cls_all="$(_dr_cls_note runner-work "${_dr_rw:-}")$(_dr_cls_note duplicate-install "${_dr_dup:-}")"
     if [ "$_drc" -eq 0 ]; then
             # ⛔ THE UNIT IS CONDITIONAL. A per-class field may read `unmeasured` (df could not answer),
             # and the old format appended a hardcoded MB to it — `uv=unmeasuredMB` reads as a byte count
             # to every consumer. Numeric values keep their unit; the sentinel is printed as it stands.
             _dr_mb() { case "${1:-}" in ''|*[!0-9]*) printf '%s' "${1:-?}" ;; *) printf '%sMB' "$1" ;; esac; }
-            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)"))$(_dr_del_note)"
+            log_line "disk reaper: last pass $(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) ($(printf '%s\n' "$_drs" | sed -n 's/^age_seconds=//p' | head -1)s ago) mode=$(printf '%s\n' "$_drs" | sed -n 's/^mode=//p' | head -1) freed $(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb=//p' | head -1)") (uv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_uv=//p' | head -1)") venv=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_venv=//p' | head -1)") worktree=$(_dr_mb "$(printf '%s\n' "$_drs" | sed -n 's/^freed_mb_worktree=//p' | head -1)")${_dr_cls_all})$(_dr_del_note)"
     elif [ "$_dst" = "never" ]; then
       log_line "⛔ DISK REAPER HAS NEVER RUN — installed but no pass recorded ($_det); start it: sudo systemctl start eldato-disk-reaper.service (Linux) / launchctl kickstart gui/$(id -u)/com.eldato.disk-reaper (macOS)"
     elif [ "$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1)" = "6" ] \
@@ -4199,10 +4234,10 @@ cmd_status() {
       # (⚠️ This verb's exit code comes from the doctor's status, not the reaper's, so the headline IS
       # the channel here — which is why it must not go quiet.)
       log_line "⏸ DISK REAPER DEFERRED — status=failed rc=6 last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1) (${_dage}s ago): ${_det:-no detail} (a delegate declined; nothing was claimed)"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1) runner-work=${_dr_rw:-?} duplicate-install=${_dr_dup:-?}$(_dr_del_note)"
     else
       log_line "⛔ DISK REAPER NOT HEALTHY — status=${_dst:-unknown} rc=$(printf '%s\n' "$_drs" | sed -n 's/^rc=//p' | head -1) last=$(printf '%s\n' "$_drs" | sed -n 's/^iso=//p' | head -1): ${_det:-no detail}"
-      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1)$(_dr_del_note)"
+      log_line "    per class: uv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_uv=//p' | head -1) venv=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_venv=//p' | head -1) worktree=$(printf '%s\n' "$_drs" | sed -n 's/^verdict_worktree=//p' | head -1) runner-work=${_dr_rw:-?} duplicate-install=${_dr_dup:-?}$(_dr_del_note)"
     fi
   fi
   # the loop's own view of itself
