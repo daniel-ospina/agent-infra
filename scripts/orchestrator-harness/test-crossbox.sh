@@ -50,7 +50,17 @@ CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache-verify-$$}"; export CLAIM_CA
 # its own SUBJECT as broken, on exactly the box the gate was written for. It is exported (not a
 # per-call prefix) because the arms reach fix-one.sh through `exec env`, which starts from this env.
 # 1 is the documented neutralizer: a legal, tiny floor that no real filesystem is below.
-DISK_MIN_FREE_MB=1; export DISK_MIN_FREE_MB
+# ⛔ AND THE THREE LANE TERMS GO WITH IT, ON THE SAME LINE — THIS FILE WAS THE ONE SUITE BOTH CENSUSES
+# MISSED (fresh review, P1 — MEASURED). The floor alone stopped being sufficient when #3395 added a
+# PRE-START admission: `wt_provision` → `disk_admit` now charges `max(TREE, SELF) + 4×floor`, i.e.
+# 6,148 MB with the lane terms unstated, so on a box under ~6 GB free every arm here exits 77 BEFORE
+# `claim_acquire` (`fix-one.sh:231` → rc 4 → `:259` exit 77) and reports a disk refusal where it asserts
+# a claim outcome — the same wrong-cause class this block already names for the 500 MB floor. It was
+# invisible because the file is named `test-crossbox.sh`, not `*.test.sh`; the censuses now read
+# `test-*.sh` too. It is ONE `export` line because that is the shape both censuses treat as an effective
+# neutralisation (`export <four terms>`, the shipped S1 idiom) — split across lines it neutralises just
+# as well but the census cannot see it, and that is the false PASS this whole block exists against.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 # ⛔ AND SO IS THE LOAD CEILING, FOR THE SAME REASON (verification round, P1). NO arm in this file
 # asserts a LOAD refusal (0 hits for MAX_LOAD outside this block), so the shipped load gate is a pure
 # CONFOUNDER here: every arm that expects the fixer to run instead gets AGENT_LOAD_REFUSED, and the
