@@ -3301,13 +3301,182 @@ export function joinContinuations(command) {
  * @param {string} command
  * @returns {boolean}
  */
+/**
+ * Quote-, escape- and extglob-aware split of a command on the PIPELINE operator
+ * `|` (#3243).
+ *
+ * `String.split("|")` has NO quote model, so a `|` inside a QUOTED word was read
+ * as a pipeline: `grep -n "bash\|sh -x" f | head -2` split into `… grep -n "bash\`
+ * and `sh -x" f `, the second segment's head read as the interpreter `sh`, and
+ * the whole command was refused as "piped into a shell" — the scanner reading
+ * DATA as code. That is the false positive `test-command-position.mjs` pins as
+ * KNOWN-FALSE D5, and the one that refused a read-only `grep -E "(bash|sh)" | head`
+ * on 2026-11-02. The `|` of an extglob group (`./undo@(-g|).sh`) and the `||`
+ * logical operator are not pipelines either; a REAL pipeline's `|` is unquoted,
+ * so this narrowing cannot hide one.
+ * @param {string} command
+ * @returns {string[]} the pipeline segments (a one-element array when there is
+ *   no unquoted `|`)
+ */
+export function wtSplitPipeline(command) {
+  const s = String(command ?? "");
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let globDepth = 0; // inside an extglob group `@( … | … )`
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      cur += ch;
+      // A backslash inside DOUBLE quotes escapes only `$`, backtick, `\` and
+      // newline (same rule as `wtShellWords`) — otherwise the quote after it
+      // really closes the word.
+      if (ch === "\\" && quote === '"' && '"$`\\\n'.includes(s[i + 1] ?? "")) { cur += s[i + 1] ?? ""; i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === "(" && /[?*+@!]$/.test(cur)) { globDepth++; cur += ch; continue; }
+    if (globDepth > 0) { if (ch === ")") globDepth--; cur += ch; continue; }
+    if (ch === "|") {
+      if (s[i + 1] === "|") { cur += "||"; i++; continue; } // logical OR
+      out.push(cur); cur = ""; continue;
+    }
+    cur += ch;
+  }
+  // ⛔ AN UNTERMINATED QUOTE MEANS THE MODEL CANNOT BE TRUSTED PAST IT (#3243
+  // review cycle-1, F1). A quote left open at the end of the text is not a valid
+  // shell word sequence — it is a COMMENT apostrophe (`# don't touch the copy`), a
+  // HERE-DOCUMENT body, or ANSI-C `$'…'` quoting (whose `\'` IS an escape while a
+  // plain `'…'` has none, so the model closes or opens the wrong one). Past that
+  // point every later `|` is read as DATA, and a real `cat ./undo*.sh | bash`
+  // became ALLOWED where the pre-#3243 blind `split("|")` refused it — a
+  // fail-OPEN regression, measured on four shapes (top-level ANSI-C, a comment
+  // apostrophe, a here-doc data apostrophe, an ANSI-C `printf`). The fallback is
+  // therefore the BLIND split: it has no quote state and can only OVER-report,
+  // which is this arm's fail-closed direction. A well-formed command never reaches
+  // it, so the narrowing that removes the D5 false positive still holds.
+  //
+  // ⛔ AND THE SAME HOLDS FOR THE OTHER STATE VARIABLE (#3243 review cycle-2, F1).
+  // `quote` is not the only thing this model tracks: `globDepth` is stranded
+  // exactly the same way by an UNTERMINATED extglob group (`# it is *(broken`,
+  // `regex: a+(b|c` — a comment or heredoc line that is DATA, inert in a real
+  // shell). While `globDepth > 0`, EVERY `|` and every `'`/`"` is swallowed as
+  // data, so a real unquoted pipeline merges into one segment and
+  // `wtPipelineFeedsShell` cannot see the consumer. Testing only `quote` left
+  // `cat ./undo*.sh | bash` ALLOWED on five measured shapes where the base
+  // BLOCKS — the F1 regression one state variable over, and it also falsified
+  // this function's own claim that "a REAL pipeline's `|` is unquoted, so this
+  // narrowing cannot hide one". Both desync sources take the blind split, which
+  // can only OVER-report.
+  if (quote !== null || globDepth > 0) return s.split("|");
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Is this command-position WORD shaped like a PATH at all? (#3243)
+ *
+ * The #1228 arm exists to refuse a script path the SHELL resolves at runtime, so
+ * the expansion forms themselves (`$`, backtick, `*`, `?`, `[...]`, `{…}`,
+ * extglob, a leading `~`) are ALLOWED here — refusing them is the arm's job.
+ * What a path is not is a PROGRAM'S TEXT. `awk '/^tree=/{t=$2}'`, a sed
+ * expression `s/[[:space:]]*$//` and a grep alternation were each read as an
+ * executed script path, which refused the ENTIRE script that contains them
+ * (measured 2026-11-02 on `scripts/orchestrator-harness/nonblocking-dispatch.sh`,
+ * `pi-bootstrap/tests/test-farm-unfarm.sh`, `scripts/worktree-hygiene-sweep.sh`,
+ * `scripts/pi-cache-reap.test.sh`).
+ *
+ * The rule is POSITIVE, not a deny list of the programs seen so far: replace
+ * every expansion form with a placeholder and require what REMAINS to be a plain
+ * path — components over `[A-Za-z0-9._+@!%~-]` joined by `/`.
+ *
+ * ⛔ BUT A POSITIVE GRAMMAR IS USED AS A **FILTER ON A PATH THE SHELL EXECUTES**,
+ * so every byte it REJECTS is a script this arm can no longer see — a rejection
+ * does not "prove the word is data", it DELETES the candidate (#3243 review
+ * cycle-2, F2). The first cut of this function also rejected `\`, `,`, `:`, `=`,
+ * `^` and `#`, on the stated grounds that a shell would not run a path carrying
+ * them. That is false: `,`, `:`, `=`, `^` and a non-leading `#` are ordinary
+ * FILENAME bytes, and `\` spells a LITERAL (escaped) byte in a path. Measured,
+ * each spelling below really executes the destructive script and the pre-#3243
+ * arm refused it, while the first cut of this change ALLOWED it —
+ * `./undo,2-*.sh`, `./undo2-\*.sh`, `./undo^*X.sh`, `./undo=1*.sh`,
+ * `./undo:1*.sh`, `./undo#1*.sh`. This is the same lesson the `?` branch below
+ * records ("a shape test that drops a glob is a fail-OPEN"), applied to every
+ * other byte.
+ *
+ * The terminal test is therefore TWO-ORed ACCEPTS, both of which can only ADD a
+ * candidate: a remaining word over the plain alphabet, OR a word with an
+ * EXPLICIT path prefix (`./`, `../`, `~/`) whatever bytes follow it. Program text
+ * — `awk '/^tree=/{t=$2}'`, the sed expression `s/[[:space:]]*$//` — carries no
+ * such prefix, so the #3243 false positives stay false.
+ * @param {unknown} word
+ * @returns {boolean}
+ */
+export function wtIsPathShapedScriptWord(word) {
+  let s = String(word ?? "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
+  if (!s) return false;
+  // A path carries a separator or a leading `~`; a bare word resolves through
+  // PATH, not through this arm (same rule `directish` states).
+  if (!/[\/~]/.test(s)) return false;
+  const PH = "\u0000";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    // ⛔ QUOTING IS SHELL SYNTAX, NOT A PATH CHARACTER — and it may be MID-WORD
+    // (#3243 review cycle-1, F2). Rejecting every quote made `"$TOOLS"/undo.sh`
+    // and `./run"$S".sh` fail this grammar, so the arm stopped seeing a REAL
+    // runtime-resolved script path that the pre-#3243 `directish` (which had no
+    // shape test at all) refused: measured BLOCK on the base, ALLOW on the first
+    // cut of this change, and both spellings really execute the file. Quoting a
+    // path is ordinary shell (`"$DIR"/x.sh`), so the quotes are skipped and the
+    // rest of the word is judged on its own. Skipping can only ADD candidates,
+    // never remove one, so it cannot open anything the old test caught.
+    if (ch === '"' || ch === "'") continue;
+    // An ESCAPE spells one LITERAL byte (`./undo2-\*.sh` is the file whose name
+    // contains a `*`), so it is a path character, not a disqualifier (#3243
+    // review cycle-2, F2). Placeholder it: the byte is present and it is not an
+    // expansion form, which is exactly what the later arms need to know.
+    if (ch === "\\") { out += PH; i++; continue; }
+    if (ch === "`") {
+      const end = s.indexOf("`", i + 1);
+      if (end < 0) return false; // unbalanced — prose, not a substitution
+      out += PH; i = end; continue;
+    }
+    if (ch === "$") {
+      let j = i + 1;
+      if (s[j] === "{") { const e = s.indexOf("}", j); if (e < 0) return false; j = e + 1; }
+      else if (s[j] === "(") { const e = s.indexOf(")", j); if (e < 0) return false; j = e + 1; }
+      else while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+      out += PH; i = j - 1; continue;
+    }
+    if (ch === "*") { out += PH; continue; }
+    // ⛔ `?` IS A GLOB, and it is named in this function's own contract above — it
+    // was simply not implemented, so `./undo-1228?.sh` failed the grammar and the
+    // arm went BLIND on a real single-character glob (caught by B13 the moment the
+    // `sp` branch started consulting this predicate). A shape test that drops a
+    // glob is a fail-OPEN, which is why it is pinned by an arm in both directions.
+    if (ch === "?") { out += PH; continue; }
+    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    out += ch;
+  }
+  // TWO-ORed ACCEPTS — see the contract above: a rejection here deletes the
+  // candidate and blinds the arm, so the only safe direction is to accept more.
+  if (/^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out)) return true;
+  return /^(?:\.{1,2}|~)\//.test(s);
+}
+
 export function wtPipelineFeedsShell(command) {
   const STDIN_ALIAS = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
   // A REDIRECTION is not an operand either (`… | bash 2>/dev/null` executes the
   // pipe as code; treating `2>/dev/null` as a script operand silently disabled
   // the whole arm — reviewer round-11 P0).
   const REDIRECT = /^[0-9]*(?:>>?|<<?|<>|>&|<&|&>)/;
-  return String(command ?? "").split("|").slice(1).some((seg) => {
+  return wtSplitPipeline(command).slice(1).some((seg) => {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));

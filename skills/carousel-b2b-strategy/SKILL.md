@@ -211,7 +211,15 @@ mv "docs/carousels/$slug/status.yaml.tmp" "docs/carousels/$slug/status.yaml"
 ### Step 2 — Create Tracking Issue
 
 ```bash
-gh issue create --title "Carousel: <slug>" --label "Content Creation" --body "<brief summary>"
+# Write the brief to a file with the `write` tool first, to a path unique to this checkout
+# (never a fixed /tmp name — #729). The tool takes a LITERAL path, not a shell expansion, so print
+# it — hand THIS output to the tool (#3445); an inline --body is part of the shell command string
+# and is scanned for destructive git verbs, so a brief quoting one is unfilable that way (#3445):
+echo "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+# Repeat the derivation INLINE in the gh call — every bash tool call is a fresh shell, so a
+# `BODY=…` set on an earlier line would be EMPTY here:
+gh issue create --title "Carousel: <slug>" --label "Content Creation" \
+  --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
 ```
 
 Set workflow label: `content-creating`.

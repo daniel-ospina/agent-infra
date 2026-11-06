@@ -32,7 +32,9 @@ Run:  python3 -m pytest scripts/test_beta_progress.py -q
 from __future__ import annotations
 
 import importlib.util
+import json
 import pathlib
+import time
 
 import pytest
 
@@ -50,8 +52,15 @@ MERGED_TODAY = "2999-01-01T00:00:00Z"
 LONG_AGO = "2020-01-01T00:00:00Z"
 
 
-def pr(number, merged="", ref=None, title=None):
-    """One row in the `gh pr list --json` shape this file consumes."""
+def pr(number, merged=None, ref=None, title=None):
+    """One row in the `gh pr list --json` shape this file consumes.
+
+    ⛔ `merged` DEFAULTS TO `None`, NOT `""` (#3457 review round 14). `mergedAt` is MANDATORY in a
+    merged window (`_shape_pr_rows`), and every row of a `gh pr list --state merged` read carries a
+    non-empty stamp, so `""` was a payload NEITHER production arm can emit — and it was the easy
+    default, so three fixtures put an impossible row into a merged window and pinned the leniency.
+    With `None` the mistake is refused: a merged-window fixture must pass `merged=` explicitly.
+    """
     return {
         "number": number,
         "title": "PR %d" % number if title is None else title,
@@ -97,13 +106,16 @@ def test_graphql_failure_uses_rest_and_still_counts_merged_today(monkeypatch, no
 
     deadlines = []
 
-    def fake_rest(state, limit=100, deadline=None):
+    def fake_rest(state, limit=100, deadline=None, repo=None):
         rest_calls.append((state, limit))
         deadlines.append(deadline)
         if state == "open":
             return [pr(1), pr(2)]
         return [pr(3, merged=MERGED_TODAY), pr(4, merged=LONG_AGO)]
 
+    # These two tests pin the TRACKER's GraphQL-refusal/REST-fallback contract, and their `gh` stub
+    # answers every `pr list` alike — so the cross-repo gap read is pinned to the tracker here,
+    # and graded on its own by the FIX_REPOS tests at the end of this file.
     monkeypatch.setattr(bp, "gh", fake_gh)
     monkeypatch.setattr(bp, "_rest_prs", fake_rest)
 
@@ -111,13 +123,18 @@ def test_graphql_failure_uses_rest_and_still_counts_merged_today(monkeypatch, no
     assert out is not None
     assert out["open_prs"] == 2
     assert out["merged_today"] == 1
-    # BOTH lists were re-read over REST, at the windows the GraphQL calls ask for, and the PAIR
-    # shares ONE deadline: a per-read budget doubles the phase's worst case inside a tick that is
-    # killed (the doc states the shared budget as a rule, so the suite must hold it).
+    # BOTH lists were re-read over REST, at the windows the GraphQL calls ask for, and the whole
+    # READ PHASE shares ONE deadline: a per-read budget multiplies the phase's worst case by the
+    # number of reads inside a tick that is killed (the doc states the shared budget as a rule, so
+    # the suite must hold it).
     assert ("open", 500) in rest_calls
     assert ("merged", 400) in rest_calls
     assert deadlines[0] is not None
-    assert deadlines[0] == deadlines[1], "the pair must share one deadline"
+    # ⛔ ALL of them, not just the tracker pair. Asserting only that `deadlines[0] == deadlines[1]`
+    # left each fix-repo read free to take a FRESH budget (measured: passing `None` instead of
+    # `rest_deadline` to `_repo_prs` kept 25/25 green) -- the per-read budget the rule bans.
+    assert len(deadlines) == 4, "tracker pair + both fix-repo reads, not %d" % len(deadlines)
+    assert len(set(deadlines)) == 1, "every REST read must share ONE clock: %r" % (deadlines,)
 
     assert bp.main() == 0
     printed = capsys.readouterr().out
@@ -344,7 +361,7 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
             return [pr(n) for n in range(1, 8)]
         return None
 
-    def fake_rest(state, limit=100, deadline=None):
+    def fake_rest(state, limit=100, deadline=None, repo=None):
         if state == "open":
             return [pr(100), pr(101)]          # REST's open window: 2, not 7
         return [pr(200, merged=LONG_AGO)]      # no PR merged today
@@ -368,7 +385,7 @@ def test_a_failed_graphql_read_never_produces_a_mixed_source_read(monkeypatch):
             return [pr(300, merged=LONG_AGO)]  # GraphQL says: 0 merged today
         return None
 
-    def fake_rest_mirror(state, limit=100, deadline=None):
+    def fake_rest_mirror(state, limit=100, deadline=None, repo=None):
         if state == "open":
             return [pr(400), pr(401), pr(402), pr(403)]
         return [pr(500, merged=MERGED_TODAY), pr(501, merged=LONG_AGO)]   # REST says: 1
@@ -506,7 +523,8 @@ def test_rest_pages_the_requested_window_and_refuses_a_partial_read(monkeypatch)
 # exercised. This one spends the budget ACROSS a page boundary, so a request is always issued
 # with less than a full timeout left.
 def test_a_request_near_the_deadline_gets_only_the_time_left(monkeypatch):
-    """The budget is shared by the open/merged PAIR, so a page that hangs must not eat the
+    """The budget is shared by ALL FOUR PR lists (the tracker's open/merged pair and every fix
+    repo's pair), so a page that hangs must not eat the
     remainder in a single 15 s request -- the timeout handed to the transport is the remaining
     budget, whichever is smaller."""
     budget = 0.5
@@ -1002,6 +1020,1147 @@ def test_a_limit_that_is_not_a_multiple_of_100_keeps_the_page_offsets_sound(monk
     assert [u.split("per_page=")[1].split("&")[0] for u in seen_urls] == ["100", "100", "100"]
     assert len(seen_urls) == 3
 
+
+# ══ THE GAP COUNT MUST SEE THE REPO THE FIX LANDS IN (tortoise#10951) ═══════════════
+# `REPO` is the TRACKER. It is not the repo every fix lands in: tortoise's P0/P1 backlog is
+# worked by the harness (agent-infra), whose PRs live under a different repo. A metric that reads a
+# single repo's PR list turns "landed elsewhere" into "nobody is on it", and this is the number the
+# owner reads to decide whether beta ships.
+# ⛔ NOT A NOISE THE PRE-FIX COUNT IS MAKING TODAY. On 2026-11-05 #10114 reads `with_pr` anyway --
+# a MERGED tracker PR (#10250) carries its number -- so `main` prints the same gap set with and
+# without this change. These tests are COUNTERFACTUAL regression guards: they pin the rule that a
+# fix-repo PR is a landing path, which becomes load-bearing the moment #10250 scrolls out of the
+# newest-400 merged window, and they are red on `main` because the MECHANISM is absent, not because
+# a number moved. (The first draft of this header claimed #10114 was reported `without_pr`, which
+# tortoise#11020's own correction comment retracts; restated as measured rather than deleted.)
+def _issue_rows(*numbers):
+    return [{"number": n} for n in numbers]
+
+
+def _gh_by_repo(monkeypatch, tracker_open, tracker_merged, other_open, other_merged=None):
+    """A `gh` whose answer depends on `--repo` AND on `--state`, which is what the defect is about.
+
+    ⛔ THE FIX REPO'S TWO WINDOWS ARE SEPARATE ARGUMENTS ON PURPOSE. When one list answers both
+    states, an assertion that `without == 0` cannot say WHICH window produced the cover -- and the
+    mutant `for _state, _l in (...): rows = _repo_prs(...); if _state == "open": fix_prs.extend(rows)`
+    keeps the whole suite green (measured on the first draft). `other_merged` therefore defaults to
+    an EMPTY window: a test that means "the OPEN window covers this" cannot be satisfied by the
+    merged one, and the merged window has its own test below.
+    """
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        repo = args[args.index("--repo") + 1] if "--repo" in args else bp.REPO
+        if args[:2] == ("pr", "list"):
+            state = args[args.index("--state") + 1]
+            if repo == bp.REPO:
+                return tracker_open if state == "open" else tracker_merged
+            return other_open if state == "open" else ([] if other_merged is None else other_merged)
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": (10951,)}[label])
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    return calls
+
+
+def test_a_fix_in_another_repo_is_a_landing_path_not_a_gap(monkeypatch, no_cache):
+    """#10114: no tortoise PR, an OPEN agent-infra PR whose TITLE carries `(#10114)`.
+
+    ⛔ A COUNTERFACTUAL GUARD, not a reproduced flip: `main` prints the SAME gap set today (see
+    the section header). The assertion is not "the number changed" — it is that an OPEN PR
+    referencing the issue, in the repo the fix is actually written in, makes `without` ZERO,
+    because that is the fact a lane charter reads. What is red on `main` is the MECHANISM; what
+    becomes red later is the number, the moment the merged tracker PR that covers #10114 by
+    accident leaves the 400-row window.
+
+    The fix repo's merged window is EMPTY here on purpose: this test grades the OPEN half only, so
+    a read that asked for `--state open` and nothing else would still pass it.
+
+    ⛔ NO `FIX_REPOS` PIN HERE, ON PURPOSE. The shipped default already names agent-infra, and
+    pinning it made the red-first run die on `AttributeError: no attribute 'FIX_REPOS'` against
+    the pre-change module — an error that PROVES A NEW CONSTANT EXISTS, not that the defect does.
+    Unpinned, the same tests are red on the old code with the real defect in the assertion
+    (`p0 == {'open': 1, 'with_pr': 0, 'without': 1}`).
+    """
+    other = "daniel-ospina/agent-infra"
+    calls = _gh_by_repo(
+        monkeypatch,
+        tracker_open=[pr(900)],
+        tracker_merged=[],
+        other_open=[pr(3368, ref="fix/10114-pin-tree-is-a-holder",
+                        title="fix(reaper): the harness PIN TREE is a holder, not residue (#10114)"),
+                    pr(3333, title="batch(#3309 #10114 #3243): one integration branch")])
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "an OPEN PR in the fix repo IS a landing path; counting it as a gap is what chartered "
+        "a lane to rebuild landed-elsewhere work")
+    # #10951 has NO PR in EITHER repo — the metric must not become optimistic either.
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}
+    # The headline count keeps its meaning: the TRACKER's open PRs, not the fleet's.
+    assert out["open_prs"] == 1
+    # ⛔ THE WINDOW IS PART OF THE CONTRACT, so it is asserted and not just commented: a fix-repo
+    # read that asked only for `--state open` would drop #10114 the moment #3368 merged — "no PR,
+    # you are the path" about work that had LANDED, which is worse than the open case this fixes.
+    for want in ("open", "merged"):
+        assert any(a[:2] == ("pr", "list")
+                   and a[a.index("--repo") + 1] == other
+                   and a[a.index("--state") + 1] == want for a in calls), \
+            "the fix repo was never read as an %r window — a merged fix would read as a gap" % want
+
+
+def test_a_refused_fix_repo_read_falls_back_to_rest_not_to_unavailable(monkeypatch, no_cache):
+    """⛔ THE #2139 REFUSAL IS A SECONDARY-LIMIT ONE, SO IT HITS EVERY `gh pr list` AT ONCE.
+
+    `compute()`'s REST fallback covered only the tracker pair; a fix repo read through the same
+    GraphQL call would return None on those boxes and take the whole DELIVERY line down — while
+    the tracker's own successful read had already been paid for. The fix repo gets the same
+    second source, and the REST URL is built from the repo it was asked for (it used to hardcode
+    the TRACKER, which would hand back the tracker's `/pulls` under the fix repo's name).
+    """
+    other = "daniel-ospina/agent-infra"
+    rest_calls = []
+
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            return None                      # refused for EVERY repo, as it is on a cell
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
+
+    def fake_rest(state, limit=100, deadline=None, repo=None):
+        rest_calls.append(repo)
+        if repo == other:
+            # a stamp on the merged arm: `mergedAt` is mandatory in a merged window (#3457 round 14)
+            return [pr(3368, merged=LONG_AGO,
+                       title="fix(reaper): the harness PIN TREE is a holder (#10114)")]
+        return [pr(900)] if state == "open" else []
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", fake_rest)
+
+    out = bp.compute()
+    assert out is not None, "a refused GraphQL read must not cost the line its REST fallback"
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}
+    assert other in rest_calls, "the fix repo was never read over REST — it has no second source"
+
+
+def test_an_unreadable_fix_repo_is_not_a_gap(monkeypatch, no_cache):
+    """⛔ COULD NOT READ IS NOT 'NO PR'. A refused read of the fix repo must make the metric
+    UNAVAILABLE, never inflate `without` — that is the fail-open direction, and it is the one
+    that sends a lane to rebuild work somebody else already has open.
+
+    ⛔ BOTH SOURCES MUST BE REFUSED, NOT JUST GRAPHQL. The first draft stubbed only `gh`, so the
+    fix-repo REST fallback went to the REAL api.github.com; on a box with a token it answered 38
+    real rows and the metric came back non-None — the test passed only where the network was
+    absent (caught by the [VGATE] verifier, which reproduced it live). A test about "unreadable"
+    has to make both sources unreadable.
+    """
+    _gh_by_repo(monkeypatch, tracker_open=[pr(900)], tracker_merged=[], other_open=None)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)   # no second source either
+
+    assert bp.compute() is None, (
+        "a refused read of a fix repo must not be reported as a real gap — it must not be "
+        "reported at all")
+
+
+def test_the_rest_fallback_asks_the_repo_it_was_given(monkeypatch):
+    """⛔ THE URL IS PART OF THE FIX, AND THIS IS THE ONLY TEST THAT CAN SEE IT.
+
+    `_rest_prs` built its URL from the module constant `REPO`, so a fix-repo call would have been
+    answered with the TRACKER's `/pulls` and the fix repo's name attached to it — a wrong list that
+    still looks complete. Every other test stubs `_rest_prs` wholesale and can only observe the
+    `repo` ARGUMENT, so reverting the URL to `% (REPO, ...)` used to leave the whole suite green
+    (measured: 23 passed). This pins the bytes actually requested.
+    """
+    other = "daniel-ospina/agent-infra"
+    seen = []
+
+    def fake_get(url, tok, timeout=None):
+        seen.append(url)
+        return []
+
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    monkeypatch.setattr(bp, "_rest_get_json", fake_get)
+
+    assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 30, repo=other) == []
+    assert seen, "_rest_prs made no request at all"
+    assert "/repos/%s/pulls" % other in seen[0], (
+        "the REST read asked for %r, not the repo it was given" % seen[0])
+
+
+def test_a_malformed_fix_repo_payload_is_unavailable_not_a_traceback(monkeypatch, no_cache):
+    """⛔ `gh` CAN EXIT 0 WITH A JSON OBJECT (`{"message": "Not Found"}`) OR A LIST OF NON-DICTS.
+
+    `covered()` calls `.get()` on every row, so a str row RAISES; `main()` catches it and the box
+    then prints a traceback and `unavailable` on EVERY refresh for as long as that payload persists
+    — a whole metric lost to one repo's odd answer, and nothing cached to self-heal. The shape gate
+    in `_repo_prs` turns that into the honest `unavailable`-by-return-None path instead.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+            return {"message": "Not Found"}          # rc 0, wrong shape
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    tried = []
+
+    def refusing_rest(state, limit=100, deadline=None, repo=None):
+        tried.append((repo, state))
+        return None
+
+    monkeypatch.setattr(bp, "_rest_prs", refusing_rest)
+
+    assert bp.compute() is None, (
+        "a malformed fix-repo payload must not raise out of compute(), and must not be read as "
+        "a complete list")
+    # ⛔ "REST TRIED AND REFUSED" IS NOT "REST NEVER TRIED" (#3457 review round 11). The shape gate
+    # used to sit AFTER the fallback, so this payload returned None without ever asking the second
+    # source — and this test could not see the difference, because both outcomes are `compute() is
+    # None`. That is precisely the "one repo's odd answer costs the whole line" failure `_repo_prs`
+    # exists to prevent: a fix repo answering `{"message": "Not Found"}` took the DELIVERY line
+    # down while a REST read would have answered.
+    assert ("daniel-ospina/agent-infra", "open") in tried, (
+        "the second source was never asked for the malformed fix repo — the shape gate ran before "
+        "the fallback instead of as part of it")
+
+    # ⛔ AND A MALFORMED LIST MUST ASK IT TOO, not only a non-list (#3457 review round 12). The
+    # first form of this test glued a `{"message": ...}` OBJECT, which `_rest_prs` also refuses, so
+    # the round-11 mutant — fallback gated on `not isinstance(rows, list)` only — stayed green while
+    # the shipped code recovered `with_pr=1` on the same payload. Here the bad answer is a LIST of
+    # non-rows, which is the shape a `isinstance(rows, list)`-only fallback lets through to the gate
+    # AFTER it: the read comes back `None` instead of asking the second source.
+    def fake_gh_bad_list(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+            return ["nope", 42]                     # a LIST, of things that are not rows
+        return []
+
+    tried.clear()
+    monkeypatch.setattr(bp, "gh", fake_gh_bad_list)
+    answered = {"n": 0}
+
+    def answering_rest(state, limit=100, deadline=None, repo=None):
+        tried.append((repo, state))
+        answered["n"] += 1
+        return [pr(3368, merged=LONG_AGO, ref="fix/10114-x",
+                   title="fix(reaper): the thing (#10114)")]
+
+    monkeypatch.setattr(bp, "_rest_prs", answering_rest)
+    assert bp.compute() is not None, (
+        "a malformed LIST from the fix repo must fall back to REST, not lose the line")
+    assert ("daniel-ospina/agent-infra", "open") in tried, (
+        "the second source was never asked for a malformed LIST — the gate ran after the fallback "
+        "again, one shape further out")
+
+
+def test_a_non_list_tracker_list_of_non_dicts_is_unavailable_not_a_count(monkeypatch, no_cache):
+    """⛔ `len()` TURNS A BAD LIST INTO A NUMBER, AND ONLY `covered()` WOULD HAVE RAISED.
+
+    The tracker lists had a LIST-level gate for one round and no per-row one. With both tier lists
+    EMPTY, `covered()` never runs — so nothing raised, and an answered `["nope", None, 42]` printed
+    `... | 3 open PRs, 0 merged today` and CACHED it for the 1800 s TTL (measured on a copy before
+    the fix). That is the same class, and the same caching consequence, that makes the issue read's
+    `{}` the worst of the four.
+
+    The second member is silent: a falsy non-str `mergedAt` (`{}`, `0`) is swallowed by
+    `(p.get("mergedAt") or "")` and UNDER-counts `merged_today`, where the fix-repo path refuses
+    the identical row. Both are refused now, by the one shared predicate.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            # ⛔ REPO-DISCRIMINATING, AND THAT IS THE POINT (#3457 review round 12). The first form
+            # answered the malformed list for EVERY repo, so the FIX-REPO consumer refused it
+            # first and the assertion passed for the wrong reason: deleting BOTH tracker
+            # `_shape_pr_rows` call sites left 42/42 GREEN (measured). Only `FIX_REPOS == (REPO,)`
+            # made the tracker gate observable, which is not a test — it is a coincidence.
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []                          # the fix repo answers fine; ONLY the tracker is bad
+            return ["nope", None, 42] if args[args.index("--state") + 1] == "open" else []
+        return []                                    # both tiers EMPTY: `covered()` never runs
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    assert bp.compute() is None, (
+        "a list of non-dict tracker rows must be `unavailable`, never `3 open PRs`")
+
+    # ...and the silent half: a `merged` row whose `mergedAt` is a dict, with an EMPTY open list.
+    def fake_gh_merged(*args):
+        if args[:2] == ("pr", "list"):
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []
+            return [] if args[args.index("--state") + 1] == "open" \
+                else [{"number": 1, "title": "t", "headRefName": "r", "mergedAt": {}}]
+        return []
+
+    monkeypatch.setattr(bp, "gh", fake_gh_merged)
+    assert bp.compute() is None, (
+        "a non-str `mergedAt` must refuse the read, not UNDER-count `merged_today` through "
+        "`(p.get(\"mergedAt\") or \"\")`")
+
+    # ⛔ AND AN ABSENT OR NULL `mergedAt` IS MANDATORY-IN-A-MERGED-WINDOW (#3457 review round 13).
+    # The lenient form ("a string WHEN PRESENT") let these through, and every row of a `gh pr list
+    # --state merged` read is merged BY CONSTRUCTION — so an absent key is a PARTIAL payload, and
+    # `merged_today` reported 0 for it and cached that for the TTL (measured). `_rest_prs` filters
+    # unmerged rows out and always emits a string, so nothing legitimate reaches this shape.
+    # ⛔ AND `""` BELONGS IN THAT SET (#3457 review round 14): a type check alone accepted it, and
+    # `(p.get("mergedAt") or "")` then reports 0 for it exactly as it does for `null` — the
+    # rationale this block gives for refusing `None` applies to the empty string verbatim. Only
+    # `--state merged` reads are affected: an OPEN list legitimately carries no `mergedAt`.
+    for absent in ({}, {"mergedAt": None}, {"mergedAt": ""}):
+        def fake_gh_partial(*args, _absent=absent):
+            if args[:2] == ("pr", "list"):
+                if args[args.index("--repo") + 1] != bp.REPO:
+                    return []
+                if args[args.index("--state") + 1] == "open":
+                    return []
+                row = {"number": 3, "title": "a merged PR", "headRefName": "fix/3-x"}
+                row.update(_absent)
+                return [row]
+            return []
+
+        monkeypatch.setattr(bp, "gh", fake_gh_partial)
+        assert bp.compute() is None, (
+            "a merged-window row with %r must refuse the read — `merged_today` must not report 0 "
+            "for a payload it could not fully read" % (absent,))
+
+
+def test_the_merged_fix_repo_window_alone_covers_a_landed_fix(monkeypatch, no_cache):
+    """⛔ THE MERGED HALF IS THE WHOLE POINT, AND IT WAS UNTESTED.
+
+    A PR in a fix repo does NOT close a TRACKER issue, so the issue stays open AFTER the fix
+    merges. Read only OPEN rows and #10114 becomes `without_pr` the moment agent-infra#3368 merges
+    — "no PR, you are the path" about work that had LANDED, which is strictly worse than the open
+    case this change exists to fix.
+
+    ⛔ THIS TEST IS THE ONE THAT KILLS THE FETCH-AND-DISCARD MUTANT. The first draft asserted only
+    that a `--state merged` call was MADE, so
+
+        for _state, _l in (("open", 500), ("merged", 400)):
+            rows = _repo_prs(...)
+            if _state == "open": fix_prs.extend(rows)      # merged rows fetched, then dropped
+
+    kept 25/25 green. Here the OPEN window is EMPTY and the fix PR exists ONLY in the merged one,
+    so `without == 0` can only come from the merged rows actually being USED.
+    """
+    other = "daniel-ospina/agent-infra"
+    _gh_by_repo(
+        monkeypatch,
+        tracker_open=[pr(900)],
+        tracker_merged=[],
+        other_open=[],
+        other_merged=[pr(3368, merged=MERGED_TODAY, ref="fix/10114-pin-tree-is-a-holder",
+                          title="fix(reaper): the harness PIN TREE is a holder (#10114)")])
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "a MERGED fix-repo PR is a landing path — reading only the OPEN window would report a "
+        "landed fix as a gap and charter a lane to rebuild it")
+    # And the fix must not become optimistic in the other direction: #10951 has no PR in any window.
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}
+
+
+def test_a_fix_repo_row_citing_its_own_number_still_covers_it_pins_the_disclosed_residual(monkeypatch, no_cache):
+    """⛔ THE KNOWN FALSE-COVER RESIDUAL, PINNED AS THE SHIPPED BEHAVIOUR — NOT AS CORRECT.
+
+    agent-infra numbers its own issues and PRs in the SAME sequence as the tracker, so its branch
+    `fix/2513-pool-filter` cites agent-infra#2513 while tortoise#2513 is a different issue with the
+    same number. `covered()` cannot tell which repo a row came from, so that row marks tortoise#2513
+    covered and nobody builds it.
+
+    ⛔ A "SELF-REFERENCE" FILTER WAS SHIPPED FOR THIS AND THEN REMOVED, because the measurement did
+    not support it: of 447 agent-infra rows only 2 carry their own number at all, and 0 of the 7
+    rows that actually collide with an open tracker unit are self-references — they all cite the
+    tracker BARE (`fix/10114-pin-tree-is-a-holder`, `p0-10114`, `batch(#3309 #10114 …)`), which is
+    the same fact that rules out a qualified match. So the filter closed nothing measurable while
+    suppressing genuine covers (a fix-repo PR numbered N that really does fix tortoise#N).
+
+    This test therefore asserts the RESIDUAL IS OPEN. If it ever goes red because someone narrowed
+    `covered()`, that is a behaviour change to be justified against the comment in
+    `scripts/beta-progress.py` — not a test to "fix" by relaxing it.
+    """
+    other = "daniel-ospina/agent-infra"
+
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            state = args[args.index("--state") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if state == "open" else []
+            if state != "open":
+                return []
+            return [
+                # agent-infra's OWN issue 2513 — a DIFFERENT issue from tortoise#2513.
+                pr(2513, ref="fix/2513-pool-filter", title="fix(2513): the pool filter, one def"),
+                # a cross-reference to a different number covers, as it must (#10114).
+                pr(4000, ref="fix/pin-tree", title="fix(reaper): the PIN TREE (#10114)"),
+            ]
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": (2513,)}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    out = bp.compute()
+    assert out is not None
+    assert out["p1"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "the disclosed residual: a fix-repo row citing an in-range number IS read as a cover. If "
+        "this changed, the change needs its own justification against the measured collision data")
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}
+
+
+def test_a_malformed_fix_repo_entry_is_unavailable_not_a_typeerror(monkeypatch, no_cache):
+    """⛔ `dict.fromkeys(FIX_REPOS)` RAN BEFORE THE `owner/name` VALIDATION.
+
+    An UNHASHABLE entry (a list, a dict) therefore raised `TypeError` out of `compute()` — the
+    traceback-and-no-line path the shape gate exists to prevent — instead of the documented
+    `return None`. The dedupe now runs AFTER validation, so every malformed entry takes the honest
+    `unavailable` path.
+    """
+    # ⛔ THE TRACKER PAIR MUST BE VALID, OR THIS TEST PINS NOTHING (#3457 review round 15). It used
+    # to answer `[pr(900)]` for BOTH windows; when `pr()`'s `merged` default became `None` (round
+    # 14), the MERGED row was refused by the mandatory-`mergedAt` clause, `compute()` returned None
+    # BEFORE the `FIX_REPOS` loop, and the historic `dict.fromkeys`-before-validation bug went
+    # invisible: re-applying it left 42/42 GREEN, where at `da437ada3` it redded (measured). A
+    # fixture that short-circuits ahead of the code under test is the same false PASS in the other
+    # direction.
+    def fake_gh(*a):
+        if a[:2] != ("pr", "list"):
+            return []
+        return [pr(900)] if a[a.index("--state") + 1] == "open" else [pr(900, merged=LONG_AGO)]
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO (#3457 review round 10). Every entry in this
+    # loop is rejected BEFORE a read, so the fallback never ran -- but the tracker pair's own REST
+    # arm does, and a mutant that forces it sent this test to the REAL api.github.com (measured on
+    # a copy: 31 live `/pulls` requests, 39.9 s, and the test still PASSED). The suite must not
+    # spend the bucket `REST_BUDGET_S` exists to ration.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    for bad in (None, "", "agent-infra", "daniel-ospina/agent-infra/extra", "daniel-ospina/",
+                ["daniel-ospina/agent-infra"], {"repo": "daniel-ospina/agent-infra"}):
+        monkeypatch.setattr(bp, "FIX_REPOS", (bp.REPO, bad))
+        assert bp.compute() is None, (
+            "%r must be UNREADABLE (return None), never a TypeError and never a silent "
+            "substitution of the tracker" % (bad,))
+
+
+def test_an_empty_object_issue_read_is_unavailable_not_a_zero_line(monkeypatch, no_cache):
+    """⛔ THE WORST NON-LIST PAYLOAD IS THE ISSUE READ'S `{}` (#3457 review round 10).
+
+    `{}` iterates to NOTHING, so there is no row to reject: `len({})` is 0 and the tier renders
+    `0 open, 0 with PR, 0 NONE` — a WRONG NUMBER rather than `unavailable`, and `main()` CACHES it
+    for the whole 1800 s TTL. Measured on the shipped module before the gate: an issue read that
+    answered `{}` printed `P0 0 open (0 with PR, 0 NONE) | P1 0 open (0 with PR, 0 NONE)`, i.e.
+    "beta has no open P0/P1" — the single most misleading line this instrument can print.
+
+    The fix-repo path got this gate in this PR; the three tracker/issue reads did not, and `gh` can
+    exit 0 with a JSON object (`{"message": "Not Found"}`) exactly as it can for a PR list.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+        return {}                                   # rc 0, an empty JSON OBJECT
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+    assert bp.compute() is None, (
+        "an answered non-list ISSUE read must be `unavailable`, never a cached zero line")
+
+    # ⛔ AND THE ISSUE ROWS ARE THE ONLY ONES WHOSE `number` IS DEREFERENCED — so the shared
+    # predicate's bool-is-not-an-int rule belongs here most of all (#3457 review round 12). A tier
+    # list of `[{"number": True}]` used to pass the old `isinstance(rows, list)` gate and reach
+    # `covered(True)`, where `"%d" % True` is `"1"` — a cover decided by a searched-for `1`.
+    def fake_gh_bool(*args):
+        if args[:2] == ("pr", "list"):
+            return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+        return [{"number": True}]
+
+    monkeypatch.setattr(bp, "gh", fake_gh_bool)
+    assert bp.compute() is None, (
+        "a bool `number` on a tier row must refuse the read — `covered(True)` searches for '1'")
+
+
+def test_an_answered_non_list_tracker_pr_read_engages_the_rest_fallback(monkeypatch, no_cache):
+    """⛔ A DICT IS TRUTHY AND SIZED, SO `is None` NEVER FIRES ON IT (#3457 review round 10).
+
+    Measured before the gate: an open read answered `{"message": "Not Found"}` against a good
+    merged list printed `... | 1 open PRs, 0 merged today` — `len(dict)` == 1 — and never reached
+    the REST fallback, which is the failure this file's whole second-source exists to prevent.
+    The tracker reads now apply the SAME rule the fix-repo path already had: a non-list answer is
+    a FAILED read, so the second source is tried; if that refuses too, the line is `unavailable`.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            # ⛔ REPO-DISCRIMINATING (#3457 review round 12): the tracker answers badly and the fix
+            # repo answers well, so ONLY the tracker's normalisation can produce this `None`.
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []
+            return {"message": "Not Found"}         # rc 0, wrong shape, TRUTHY
+        return []
+
+    spent = []
+
+    def refusing_rest(state, limit=100, deadline=None, repo=None):
+        spent.append(state)
+        return None
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", refusing_rest)
+
+    assert bp.compute() is None, (
+        "a malformed-but-answered tracker list is a FAILED read, never `1 open PRs`")
+    assert "open" in spent, (
+        "the second source was never asked — a non-list answer must trigger the fallback, not be "
+        "counted through `len()`")
+
+
+def test_a_fix_repo_listed_twice_is_read_once(monkeypatch, no_cache):
+    """The dedupe is load-bearing on the BUDGET, not only on tidiness: a repo listed twice used to
+    be one read via `dict.fromkeys`, and moving validation ahead of it must not lose that."""
+    other = "daniel-ospina/agent-infra"
+    calls = []
+
+    def fake_gh(*args):
+        calls.append(args)
+        if args[:2] == ("pr", "list"):
+            if args[args.index("--repo") + 1] != bp.REPO:
+                return []
+            # the merged window needs its stamp: `mergedAt` is mandatory there (#3457 round 14)
+            return [pr(900)] if args[args.index("--state") + 1] == "open" \
+                else [pr(900, merged=LONG_AGO)]
+        return []
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "FIX_REPOS", (bp.REPO, other, other))
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    assert bp.compute() is not None
+    reads = [a for a in calls
+             if a[:2] == ("pr", "list") and a[a.index("--repo") + 1] == other]
+    assert len(reads) == 2, "one repo, two windows — got %d reads: %r" % (len(reads), reads)
+    # ⛔ AND THE WINDOW SIZES ARE PART OF THE CONTRACT, NOT A DETAIL (#3457 review round 6). They
+    # were unpinned: on a /tmp copy, `(500, 400)` -> `(100, 100)` left the whole suite GREEN. A
+    # 100-row merged window scrolls `agent-infra#3368`'s cover of #10114 out within DAYS (the
+    # 400-row window already spans #2035..#3418), silently re-creating the decay this change exists
+    # to remove -- and nothing would red. The tracker pair's windows are already asserted; this is
+    # the same assertion for the pair that feeds the gap count.
+    windows = {a[a.index("--state") + 1]: a[a.index("--limit") + 1] for a in reads}
+    assert windows == {"open": "500", "merged": "400"}, (
+        "the fix-repo windows must be the tracker's windows (open 500 / merged 400), got %r"
+        % (windows,))
+    # ⛔ AND THE MERGED READ MUST ASK FOR THE STAMP (#3457 review round 15). `mergedAt` is
+    # MANDATORY in a merged window, so dropping it from the `--json` list would make every merged
+    # read refuse — and, because `_repo_prs` then falls back, silently move all four lists onto the
+    # un-layer'd REST arm forever. Nothing asserted the field list, so both such edits left 42/42
+    # GREEN (measured). This is the one place the field list is observable.
+    for a in calls:                    # EVERY list, the TRACKER's included
+        if a[:2] == ("pr", "list") and a[a.index("--state") + 1] == "merged":
+            assert "mergedAt" in a[a.index("--json") + 1], (
+                "a merged read does not ask for `mergedAt` (%r) — every row it returns will be "
+                "refused by the mandatory-stamp rule, and the read will silently live on the REST "
+                "fallback with nothing red" % (a,))
+
+
+def test_a_non_dict_fix_repo_row_is_unavailable_not_a_traceback(monkeypatch, no_cache):
+    """⛔ `isinstance(r, dict)` ALONE IS NOT THE SHAPE GATE ITS DOCSTRING CLAIMS.
+
+    `covered()` runs `pat.search()` over `title` and `headRefName`, so a row that IS a dict but
+    carries a non-str in either field raised `TypeError: expected string or bytes-like object` out
+    of `compute()` — the traceback this gate says it prevents. `_rest_prs` already refuses such a
+    row per page; `_repo_prs` now applies the same rule, TYPES INCLUDED.
+    """
+    other = "daniel-ospina/agent-infra"
+
+    def payload(bad_row):
+        def fake_gh(*args):
+            if args[:2] == ("pr", "list"):
+                repo = args[args.index("--repo") + 1]
+                state = args[args.index("--state") + 1]
+                if repo == bp.REPO:
+                    return [pr(900)] if state == "open" else []
+                # ⛔ BOTH WINDOWS: `mergedAt` is only requested/checked for a NON-open window, so a
+                # bad row offered only as `open` never reaches that branch of the gate.
+                return [bad_row]
+            return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[
+                args[args.index("--label") + 1]])
+        return fake_gh
+
+    for bad_row in (
+            "fix/10114",                                                  # a str, not a row
+            # ⛔ EVERY CASE HERE CARRIES A VALID `mergedAt` (#3457 review round 15). Without a
+            # stamp the MERGED window refused each row first, so the branch under test was never
+            # the one that refused: deleting the `title`/`headRefName` clause left 42/42 GREEN
+            # (measured). A valid stamp makes the type branch the ONLY possible refusal.
+            {"number": 3368, "title": {"a": 1}, "headRefName": "fix/x", "mergedAt": LONG_AGO},
+            {"number": 3368, "title": "t", "headRefName": ["fix/x"], "mergedAt": LONG_AGO},
+            {"number": {"n": 1}, "title": "t", "headRefName": "fix/x", "mergedAt": LONG_AGO},
+            {"number": True, "title": "t", "headRefName": "fix/x", "mergedAt": LONG_AGO},
+            # ⛔ THE `mergedAt` GATE TOO. `_repo_prs` requests `mergedAt` for a non-open window, so a
+            # non-str there is the documented shape violation -- and it was the one branch of that
+            # gate with no test, so deleting it left the suite green.
+            {"number": 3368, "title": "t", "headRefName": "fix/x", "mergedAt": {"m": 1}},
+    ):
+        monkeypatch.setattr(bp, "gh", payload(bad_row))
+        monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+        assert bp.compute() is None, (
+            "a row of the wrong shape must REFUSE the read, not raise out of compute(): %r"
+            % (bad_row,))
+
+
+def test_an_empty_object_fix_repo_payload_is_unavailable_not_a_gap(monkeypatch, no_cache):
+    """⛔ THE ONE PAYLOAD THE PER-ROW GATE CANNOT SEE: `{}`.
+
+    `_repo_prs` refuses a non-list, then refuses any row that is not a well-shaped dict. An EMPTY
+    JSON OBJECT (`{}`, rc 0) satisfies BOTH: iterating it yields no row to reject, and
+    `fix_prs.extend({})` is a silent no-op — so the fix repo contributes nothing and the metric
+    reports a GAP for every unit whose fix lives there, which is the exact fail-open direction this
+    change exists to remove (an unreadable repo must read `unavailable`, never `without_pr`).
+
+    ⛔ THIS TEST PINNED A GAP IN THE GATE, measured: deleting `if not isinstance(rows, list):
+    return None` left the suite GREEN at 35 passed, because `{"message": "Not Found"}` happens to
+    be caught one line later (iterating a dict yields its KEYS, which are not dicts) and
+    `{}` was never offered. With the gate removed this test's `compute()` returns a clean-looking
+    `p0 {open: 1, with_pr: 0, without: 1}` instead of `None`.
+    """
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if args[args.index("--state") + 1] == "open" else []
+            return {}                                # rc 0, an empty JSON OBJECT
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (10114,), "P1-severe": ()}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    assert bp.compute() is None, (
+        "an empty-object fix-repo payload must read `unavailable`, never a gap — an unread repo "
+        "that contributes no rows is indistinguishable from a repo with no PRs")
+
+
+def test_the_token_spawn_draws_on_the_phase_clock_too(monkeypatch, tmp_path):
+    """⛔ "ONE CLOCK BOUNDS THE WHOLE PHASE" WAS FALSE BY 5 s — THE CREDENTIAL SPAWN.
+
+    `gh auth token` is a `gh` CHILD on a flat 5 s and `_rest_prs` resolves it BEFORE checking its own
+    deadline, so on a gh-refusing box (keyring config, no env token) the phase's worst case was
+    `PHASE_BUDGET_S + 5 s`. Measured before the fix: with `PHASE_BUDGET_S = 0.0001` `compute()`
+    still spawned `['…/gh', 'auth', 'token', '--hostname', 'github.com']` with `timeout=5`, i.e. the
+    phase can outlive its own clock inside exactly the case the clock was added for.
+    """
+    monkeypatch.delenv("GH_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path))        # no hosts.yml -> the subprocess path
+    spawned = []
+
+    def fake_run(args, **kw):
+        spawned.append(kw.get("timeout"))
+        raise RuntimeError("stop here — the timeout is the datum")
+
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+
+    # A spent clock: refuse, do NOT spend the last seconds of the pass on a credential lookup.
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() - 1)
+    assert bp._token() == ""
+    assert spawned == [], "a spent phase clock must refuse the credential spawn, not run it"
+
+    # A live clock: the child's timeout is what is LEFT of the phase, not the flat 5 s.
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 2)
+    assert bp._token() == ""                       # the fake_run raises -> caught -> ""
+    assert spawned and spawned[0] is not None and spawned[0] <= 2.1, (
+        "the credential spawn got %r, not what was left of the phase clock" % (spawned[0],))
+
+
+def test_a_number_that_is_only_a_PREFIX_of_a_fix_repo_citation_is_not_covered(monkeypatch, no_cache):
+    """⛔ THE BOUNDARY GUARD IN `covered()` IS NOW LOAD-BEARING ON 448x MORE ROWS.
+
+    `covered()` matches `(?<![\\d])N(?![\\d])`, and that guard was unpinned: replacing the
+    pattern with a bare `%d` left the whole suite GREEN (measured, 38 passed). The consequence is a
+    FALSE COVER — demonstrated end-to-end on that copy with a P0 unit `#1011` and a fix-repo PR
+    titled `fix(reaper): the thing (#10114)`: shipped code reports
+    `p0 {open: 1, with_pr: 0, without: 1}`, the mutant reports `{open: 1, with_pr: 1, without: 0}`
+    — a P0 silently dropped from the gap count a lane is chartered off. The guard predates this
+    change, but the change runs that regex over every row of every repo a fix lands in, so a
+    boundary defect that used to see one repo's PRs now sees ~448 more.
+
+    `#101` is included because the prefix relation goes both ways: a PR citing `#10114` must not
+    cover `#101` either, and a naive `startswith`-style match would take both.
+    """
+    other = "daniel-ospina/agent-infra"
+
+    def fake_gh(*args):
+        if args[:2] == ("pr", "list"):
+            repo = args[args.index("--repo") + 1]
+            state = args[args.index("--state") + 1]
+            if repo == bp.REPO:
+                return [pr(900)] if state == "open" else []
+            # The ONLY citation in either repo is `#10114` — a fix for 10114, not for 1011/101.
+            return ([pr(3368, ref="fix/10114-pin-tree-is-a-holder",
+                         title="fix(reaper): the thing (#10114)")] if state == "open" else [])
+        label = args[args.index("--label") + 1]
+        return _issue_rows(*{"P0-blocker": (1011,), "P1-severe": (101,)}[label])
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    assert other in bp.FIX_REPOS
+    # ⛔ AND THE SECOND SOURCE IS REFUSED HERE TOO. Without this, a mutation that forces the REST
+    # path sends the test to the REAL api.github.com: on a box holding a token it PASSES on live
+    # data (measured: the suite goes 0.9 s -> 21.9 s and the mutant stays green, because the
+    # network answered 38 real rows). A test the internet can satisfy is not pinning the code it
+    # names — `test_an_unreadable_fix_repo_is_not_a_gap` already stubs both sources for this reason.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 0, "without": 1}, (
+        "#1011 must NOT be covered by a citation of #10114 — a prefix match silently drops a P0 "
+        "from the gap count, which is the miss this instrument exists to report")
+    assert out["p1"] == {"open": 1, "with_pr": 0, "without": 1}, (
+        "#101 must NOT be covered by a citation of #10114 either — the boundary holds in both "
+        "directions")
+
+
+def test_the_phase_clock_restores_the_deadline_it_found(monkeypatch):
+    """⛔ THE RESTORE IS A CONTRACT, AND IT WAS UNPINNED IN BOTH DIRECTIONS (#3457 review round 7).
+
+    `_phase_clock` claims it "restores what was there before" and the module comment says
+    `compute()` "restores the previous value when it returns". Neither was observable: `compute()`
+    is the only `with` caller, so `_prev` is always `None` in production, and BOTH mutations —
+    `__exit__` assigning `None` unconditionally, and deleting `_prev`/`__slots__` outright — left
+    the suite GREEN. A context manager whose restoration is indistinguishable from a hard reset is
+    a claim, not a mechanism; the next caller to nest it (a partial re-read, a test that opens a
+    short clock inside a long one) would silently have its outer bound destroyed.
+    """
+    outer = bp.time.monotonic() + 100
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", outer)
+
+    with bp._phase_clock() as inner:
+        assert inner is not outer, "the block did not open its own clock"
+        assert bp._PHASE_DEADLINE == inner
+        with bp._phase_clock() as innermost:
+            assert bp._PHASE_DEADLINE == innermost
+        assert bp._PHASE_DEADLINE == inner, (
+            "the nested block did not restore the clock it found — a partial re-read would lose "
+            "its parent's bound")
+
+    assert bp._PHASE_DEADLINE == outer, (
+        "the outermost block must restore the deadline that was there BEFORE it, not `None`")
+
+    # ⛔ AND IT MUST NOT SWALLOW WHAT HAPPENS INSIDE IT (#3457 review round 8). `__exit__` returns
+    # `False`, and that was unpinned: mutating it to `return True` left 38 passed, because the
+    # restore is asserted and the exception's fate is not. A swallowed exception means `main()`'s
+    # handler — the one whose recorded detail the module calls invaluable in a hand run — never
+    # runs, the tick prints a bare `unavailable`, and NOTHING is red. The clock is restored on the
+    # way out either way, so both halves are asserted here.
+    with pytest.raises(RuntimeError, match="boom"):
+        with bp._phase_clock():
+            raise RuntimeError("boom")
+    assert bp._PHASE_DEADLINE == outer, (
+        "an exception must not leave the phase clock spent either")
+
+
+def test_a_spent_phase_clock_refuses_the_read_instead_of_spawning(monkeypatch):
+    """⛔ THE PHASE CLOCK IS WHAT KEEPS THE WORST CASE CONSTANT AS REPOS ARE ADDED.
+
+    Every `gh()` read used to get a flat 120 s, so the phase's worst case grew with the NUMBER of
+    reads: 4 reads (2 PR lists + 2 issue lists) was already 480 s against a 390 s `run_bounded`
+    kill, and the two fix-repo PR lists added here take it to 720 s — the tick is killed and the
+    box prints NOTHING. With one clock, a spent budget REFUSES (None → the honest `unavailable`
+    line) instead of spawning a read it cannot bound.
+    """
+    spawned = []
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: spawned.append(a))
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() - 1)
+
+    assert bp.gh("pr", "list", "--repo", bp.REPO) is None
+    assert spawned == [], "a spent clock must refuse, not spawn a read it cannot bound"
+
+
+def test_the_phase_clock_bounds_the_rest_deadline_and_is_then_restored(monkeypatch, no_cache):
+    """⛔ REST IS A CHILD OF THE PHASE CLOCK, NOT A PEER OF IT.
+
+    A slow `gh` read has already spent part of the phase; REST may not spend that part a second
+    time, or the two budgets are additive and the tick dies anyway. And the clock must be
+    RESTORED — a deadline left behind would silently bound every later `gh()` call to nothing.
+    """
+    monkeypatch.setattr(bp, "gh", lambda *a: None if a[:2] == ("pr", "list") else [])
+    deadlines = []
+
+    def fake_rest(state, limit=100, deadline=None, repo=None):
+        deadlines.append(deadline)
+        return []
+
+    monkeypatch.setattr(bp, "_rest_prs", fake_rest)
+    monkeypatch.setattr(bp, "PHASE_BUDGET_S", 5)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
+
+    started = bp.time.monotonic()
+    assert bp.compute() is not None
+    assert deadlines, "the REST arm never ran"
+    assert all(d is not None for d in deadlines)
+    assert max(deadlines) <= started + 5 + 1, (
+        "a REST read was given a budget that outlives the phase clock: %r" % (deadlines,))
+    assert bp._PHASE_DEADLINE is None, "the phase clock must be RESTORED, never left spent"
+
+    # ⛔ AND THE CLAMP IS NOT THE ONLY HALF (#3457 review round 7). `rest_deadline` is a MIN of the
+    # REST budget and the phase clock, and every assertion above runs with a SHORT clock (5 s),
+    # which the min always wins -- so the REST arm's own half was untested. Measured: with the
+    # phase clock at 100 s, mutating `REST_BUDGET_S` -> `PHASE_BUDGET_S` there left 37 passed, i.e.
+    # a future edit could silently hand the REST arm the whole phase budget (60 s) and the
+    # "REST IS A CHILD OF THE PHASE CLOCK, not a peer" property would be gone with nothing red.
+    deadlines.clear()
+    monkeypatch.setattr(bp, "PHASE_BUDGET_S", 100)     # well ABOVE REST_BUDGET_S, so the min matters
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 100)
+    started = bp.time.monotonic()
+    assert bp._compute() is not None
+    assert deadlines and all(d is not None for d in deadlines)
+    assert max(deadlines) - started <= bp.REST_BUDGET_S + 1, (
+        "the REST arm was handed %r, i.e. NOT bounded by its own %ss budget -- the phase clock is "
+        "its PARENT, not its substitute" % (max(deadlines) - started, bp.REST_BUDGET_S))
+
+
+def test_the_phase_budget_fits_the_slack_band_and_holds_the_rest_budget():
+    """⛔ A PHASE BUDGET IS NOT A READ BUDGET — TWO EARLIER DRAFTS GOT THIS WRONG IN OPPOSITE WAYS.
+
+    * 40 s set it BELOW a single measured `gh` read.
+    * 100 s set it ABOVE the 40-90 s this step actually has left inside the tick
+      (`scripts/heartbeat-loop.sh`: `run_bounded $((TARGET - IN_PASS_RESERVE))` = 390 s for the
+      WHOLE `orchestrator-heartbeat.sh`, of which ~300-350 s is spent before `beta-progress.py`
+      runs (the `DELIV=` step in `scripts/orchestrator-heartbeat.sh`)). A budget above the remaining
+      slack can
+      never fire before `run_bounded` kills the tick, so it is an INERT ENFORCER: it looks like
+      protection and protects nothing.
+
+    ⛔ AND THE BAND HAS A FLOOR THE CEILING TEST CANNOT SEE. 60 s fires whenever at least 60 s of
+    the pass remain — the band's middle and up — but it CANNOT fire in the band's bottom (40-59 s),
+    where the tick is killed first; below 40 it is worse, and the harness's own accounting floors a
+    tick residual at 20 s (the `remaining()` helper in `heartbeat-loop.sh`). The module states that
+    residual instead of
+    claiming the clock covers the whole band. What this test must catch is the OPPOSITE error (a
+    constant so large it can never fire), which is why the ceiling is asserted against the band's
+    TOP — not a figure of speech about "inside the window".
+
+    So the pin is two-sided: the phase must FIT under the band's top (else it is inert) and must
+    HOLD the REST arm it contains (else the REST reads are clipped by the clock instead of by their
+    own budget). It is deliberately NOT tied to a single-read latency measurement — a phase
+    containing six such reads cannot fit this step whatever the constants say, and that residual is
+    stated in the module rather than papered over with a number the step cannot honour.
+    """
+    assert bp.PHASE_BUDGET_S >= 2 * bp.REST_BUDGET_S, (
+        "the REST arm (%ss) must fit INSIDE the phase budget (%ss) with room, or the phase clock "
+        "clips reads the REST budget meant to allow" % (bp.REST_BUDGET_S, bp.PHASE_BUDGET_S))
+    assert bp.PHASE_BUDGET_S <= 90, (
+        "a phase budget above the TOP of this step's residual slack (40-90 s) cannot fire before "
+        "`run_bounded` kills the tick even in the best case — it is an inert enforcer, not a bound")
+    assert bp.PHASE_BUDGET_S < 390, (
+        "a phase budget at or above the tick's own kill cannot bound anything")
+
+
+def test_gh_derives_its_child_timeout_from_the_phase_clock(monkeypatch):
+    """⛔ THE PHASE CLOCK'S CENTRAL CLAIM: `gh()` SHRINKS ITS CHILD'S TIMEOUT TO WHAT IS LEFT.
+
+    Deleting just `tmo = min(tmo, left)` (keeping the spent-clock refusal) left 33/33 green — so the
+    mechanism the whole bound rests on was untested. Without it a read starting with 1 s left still
+    gets a flat 120 s and can outlive the phase by 119 s, which is exactly the unbounded growth the
+    clock exists to remove.
+    """
+    seen = []
+
+    def fake_run(args, **kw):
+        seen.append(kw.get("timeout"))
+        raise RuntimeError("stop here — the timeout is the datum")
+
+    monkeypatch.setattr(bp.subprocess, "run", fake_run)
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 3)
+    assert bp.gh("pr", "list", "--repo", bp.REPO) is None   # no output -> None
+    assert seen, "gh() never spawned the child"
+    assert seen[0] is not None and seen[0] <= 3.1, (
+        "the child timeout %r was not derived from the 3 s left on the phase clock" % (seen[0],))
+
+    # ...and with NO phase in flight, the pre-existing flat timeout is kept.
+    seen.clear()
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
+    assert bp.gh("pr", "list", "--repo", bp.REPO) is None
+    assert seen[0] == 120.0, "a direct call must keep gh()'s own 120 s, got %r" % (seen[0],)
+
+
+def test_the_rest_read_refuses_a_falsy_repo_instead_of_substituting_the_tracker(monkeypatch):
+    """⛔ `repo or REPO` WAS THE HAZARD ITS OWN CALLER'S COMMENT NAMED.
+
+    The `FIX_REPOS` validation only protects the call sites that remember it; `_rest_prs` itself
+    still fell back to the tracker for any falsy `repo`, handing back the TRACKER's `/pulls` under
+    the caller's repo name — a wrong list that still looks complete. `None` is the documented
+    "the tracker" default; anything else must be well-formed or the read is refused.
+    """
+    urls = []
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")
+    monkeypatch.setattr(bp, "_rest_get_json",
+                        lambda url, tok, timeout=None: (urls.append(url) or []))
+
+    for bad in ("", "agent-infra", "daniel-ospina/", "a/b/c", False, 0):
+        assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 5, repo=bad) is None, (
+            "repo=%r must be REFUSED, not answered with the tracker's list" % (bad,))
+    assert urls == [], "a refused repo still made a request: %r" % (urls,)
+
+    # `None` is the documented tracker default and still works.
+    assert bp._rest_prs("open", limit=100, deadline=bp.time.monotonic() + 5, repo=None) == []
+    assert "/repos/%s/pulls" % bp.REPO in urls[0]
+
+
+# ── a cover that lives ONLY in a branch name, which nothing else exercised ────
+def test_a_number_that_appears_ONLY_in_the_fix_repo_branch_is_a_cover(monkeypatch, no_cache):
+    """⛔ THE `headRefName` HALF OF `covered()` WAS PINNED BY NO TEST (#3457 review round 19).
+
+    Mutating `covered()` to search `title` only left the whole suite GREEN, because every fixture
+    that cites a tracker unit in a fix-repo row carried the number in BOTH fields — so no
+    assertion could say which one produced the cover, and the branch half could be deleted in
+    silence. That is the wrong half to be blind to: this section's own measured collision list is
+    BRANCH citations (`fix/10114-pin-tree-is-a-holder`, `fix/10951-pool-filter`), i.e. exactly the
+    shape nothing exercised on its own.
+
+    Here the TITLE carries no number at all, so `with_pr` can only come from `headRefName`.
+    """
+    _gh_by_repo(
+        monkeypatch,
+        tracker_open=[pr(900)],
+        tracker_merged=[],
+        other_open=[pr(3368, ref="fix/10114-pin-tree-is-a-holder",
+                        title="fix(reaper): the harness PIN TREE is a holder, not residue")])
+    # Same reason as the test above: a forced-REST mutant must not reach api.github.com.
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **k: None)
+
+    out = bp.compute()
+    assert out is not None
+    assert out["p0"] == {"open": 1, "with_pr": 1, "without": 0}, (
+        "the branch carries `10114` and the title does NOT — a cover visible only through "
+        "`headRefName` must still count, or every `fix/<n>-…` PR is invisible to the gap count")
+
+
+# ── the `merged_today` day boundary: `>=`, and the suite was blind to it ──────
+def test_merged_today_counts_a_pr_merged_at_exactly_midnight_utc(monkeypatch):
+    """⛔ THE DAY BOUNDARY IS `>=`, AND THE WHOLE SUITE WAS BLIND TO IT (#3457 review round 16).
+
+    MEASURED defect this pins: flipping `>=` to `>` in `_compute()`'s
+    `merged_today = sum(1 for p in merged if (p.get("mergedAt") or "") >= today)` left **42/42
+    GREEN**, because every "merged today" fixture is either `MERGED_TODAY =
+    "2999-01-01T00:00:00Z"` or `LONG_AGO = 2020…` — both far from the boundary — so not one
+    assertion in this file could tell the two operators apart. `>` drops a PR merged AT midnight
+    UTC out of the headline count with no refusal: a silently SHORT `merged_today`, the direction
+    this file says it must never fail in.
+
+    Both directions are pinned (the midnight row must COUNT, the row one second earlier must
+    NOT), and the calendar is FROZEN rather than read: `MERGED_TODAY`'s own comment exists so a
+    midnight-straddling run cannot flake, and a boundary test that read the live clock would red
+    for the clock instead of for the code.
+
+    ⛔ AND THE STUB DELEGATES ITS ARGUMENT, which is the difference between pinning the OPERATOR
+    and pinning the BOUNDARY (#3457 review round 17). The first form answered `gmtime()` with the
+    frozen instant for ANY argument, so it could not see a boundary derived from the wrong
+    instant: `today = time.strftime(…, time.gmtime(time.time() - 86400))` — yesterday's midnight
+    as the boundary, an INFLATED `merged_today` — left the suite 43/43 GREEN. `time()`
+    is frozen to the same instant and `gmtime(secs)` really delegates, so a wrong derivation is a
+    wrong answer here rather than an invisible one.
+    """
+    import datetime
+    import time as _time
+
+    epoch = 1_790_000_000
+    instant = _time.gmtime(epoch)
+
+    class _Frozen:                      # a closure over `_time`, NOT a module-level class
+        """`bp.time` with a PINNED calendar, delegating the stopwatch to the real module.
+
+        `gmtime`/`strftime`/`time` answer from the pinned instant; everything else — `monotonic()`
+        above all, which the phase clock budgets on — stays REAL. Freezing the stopwatch would
+        make `_PHASE_DEADLINE` unreachable and pin a different program from the one that ships.
+        """
+
+        def __init__(self, instant, epoch):
+            self._instant = instant
+            self._epoch = epoch
+
+        def time(self):
+            return float(self._epoch)
+
+        def gmtime(self, secs=None):
+            # ⛔ DELEGATE THE ARGUMENT, do not discard it: this is what makes a boundary
+            # derived from the WRONG instant observable instead of invisible.
+            return self._instant if secs is None else _time.gmtime(secs)
+
+        def strftime(self, fmt, tm):
+            return _time.strftime(fmt, tm)
+
+        def __getattr__(self, name):
+            return getattr(_time, name)
+
+    day = datetime.datetime(instant.tm_year, instant.tm_mon, instant.tm_mday,
+                            tzinfo=datetime.timezone.utc)
+    at_midnight = day.strftime("%Y-%m-%dT00:00:00Z")        # == the module's own `today`
+    one_second_before = (day - datetime.timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def fake_gh(*args):
+        if args[:2] != ("pr", "list"):
+            return []
+        if "--state" in args and args[args.index("--state") + 1] == "merged":
+            return [pr(1, merged=at_midnight), pr(2, merged=one_second_before)]
+        return []
+
+    monkeypatch.setattr(bp, "gh", fake_gh)
+    monkeypatch.setattr(bp, "_rest_prs", lambda *a, **kw: [])
+    monkeypatch.setattr(bp, "time", _Frozen(instant, epoch))
+    # ⛔ THE STUB'S OWN FIDELITY, ASSERTED RATHER THAN PROMISED. The phase clock budgets on
+    # `monotonic()`; a stub that froze it would leave `_PHASE_DEADLINE` unreachable and this test
+    # would be pinning a different program from the one that ships.
+    assert abs(bp.time.monotonic() - _time.monotonic()) < 5, (
+        "the frozen stub must delegate `monotonic()` to the REAL module")
+
+    out = bp.compute()
+    assert out is not None
+    assert out["merged_today"] == 1, (
+        "a PR merged at exactly today's 00:00:00Z must COUNT (`>=`) and one merged one second "
+        "earlier must NOT — got %r, so the boundary is wrong in one direction: `>` drops the "
+        "midnight row (a silently SHORT count) and anything looser counts yesterday"
+        % (out["merged_today"],))
+
+
+def test_rest_prs_with_no_deadline_is_clamped_to_a_live_phase_clock(monkeypatch):
+    """⛔ `deadline=None` MUST NOT OUTLIVE THE PHASE CLOCK (#3457 review round 21).
+
+    The default was a bare `REST_BUDGET_S`, so a caller omitting the deadline got 30 s even with
+    2 s left on the phase — and the module's "ONE clock bounds the WHOLE phase" then held only
+    while every caller remembered to clamp (`_compute` does: `min(rest_deadline, _PHASE_DEADLINE)`).
+    A bound a callee holds only when its caller remembers is not a bound; the shipped call sites
+    are unaffected, and this removes the trap for the next read someone adds.
+
+    Both halves are asserted because they fail in opposite directions: a LIVE clock shortens the
+    request timeout, a SPENT one refuses without spending a request at all.
+    """
+    seen = []
+    monkeypatch.setattr(bp, "_token", lambda: "test-token")          # bypass the credential refusal
+    monkeypatch.setattr(bp, "_rest_get_json",
+                        lambda url, tok, timeout=None: (seen.append(timeout) or []))
+
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() + 2)
+    assert bp._rest_prs("open", limit=100) == []
+    assert seen and seen[0] <= 2.1, (
+        "the request timeout %r was not clamped to the 2 s the phase has left" % (seen[0],))
+
+    seen.clear()
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", bp.time.monotonic() - 1)
+    assert bp._rest_prs("open", limit=100) is None, "a spent phase clock must REFUSE the read"
+    assert seen == [], "a spent phase clock still issued a request"
+
+    # ...and with NO phase in flight the pre-existing default budget is unchanged.
+    seen.clear()
+    monkeypatch.setattr(bp, "_PHASE_DEADLINE", None)
+    assert bp._rest_prs("open", limit=100) == []
+    assert seen == [bp.REST_TIMEOUT_S], (
+        "without a phase clock the read keeps its own per-request timeout, got %r" % (seen,))
+
+
+# ── the PRODUCER'S contract: a failed read is UNKNOWN (None), never an empty list ──
+def test_gh_returns_None_on_any_failure_and_never_an_empty_list(monkeypatch):
+    """⛔ MUTATION-SURVIVED (measured 2026-11-03) BEFORE THIS TEST EXISTED.
+
+    `test_both_sources_failing_keeps_the_unavailable_path` monkeypatches `bp.gh` itself, so it
+    proves the CALLERS honour None and stays green when `gh()` is mutated back to the pre-fix
+    `return []` on failure: every mutant of the producer passed the whole suite. That is defect
+    (1) in this module's header — `json.loads(r.stdout or "[]")` turned a FAILED read into a
+    VALID EMPTY LIST, so every `is None` guard became dead code and the fleet read "0 open PRs"
+    while 100 were open. The invariant "unknown is not zero" has to be pinned where the
+    regression lives, at the producer.
+    """
+    class R:
+        def __init__(self, rc, out):
+            self.returncode = rc
+            self.stdout = out
+            self.stderr = ""
+
+    # A failing gh (auth refusal, rate limit, network) is UNKNOWN whatever it printed.
+    for rc, out in ((1, ""), (1, "[]"), (2, "[]"), (0, ""), (0, "   \n")):
+        monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(rc, out))
+        assert bp.gh("issue", "list") is None, (
+            "rc=%r stdout=%r must be UNKNOWN (None) -- an empty list renders as a measured zero"
+            % (rc, out))
+
+    # ⛔ …AND THE TWO `except` ARMS WERE STILL UNPINNED (review cycle 11, finding 1). Every case
+    # above hands `gh()` a COMPLETED command with empty-or-`[]` stdout, so it never reaches either
+    # exception path: `(0, "")` and `(0, "   \n")` short-circuit at the `if not out: return None`
+    # guard BEFORE the parse, and nothing makes `subprocess.run` raise. Measured: mutating EITHER
+    # arm's `return None` to the pre-fix `return []` left the suite at `22 passed` — the same
+    # mutation-survival this test exists to end, one arm over. Both are reachable in production:
+    # a truncated body, an HTML rate-limit page, or a layer warning on stdout takes the PARSE arm;
+    # a missing or unelevatable `gh` binary takes the SPAWN arm. Both mean UNKNOWN.
+    for out in ("not json", '{"truncated"', "<html>rate limited</html>"):
+        monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(0, out))
+        assert bp.gh("issue", "list") is None, (
+            "rc=0 stdout=%r is not JSON -- a parse failure is UNKNOWN, never an empty list" % out)
+
+    def _cannot_spawn(*a, **k):
+        raise OSError("gh is not on PATH")
+
+    monkeypatch.setattr(bp.subprocess, "run", _cannot_spawn)
+    assert bp.gh("issue", "list") is None, (
+        "a gh that could not be spawned is UNKNOWN -- the spawn arm must not render as []")
+
+    # ... and a SUCCESSFUL read that genuinely returns [] is a real answer, not an abstention.
+    monkeypatch.setattr(bp.subprocess, "run", lambda *a, **k: R(0, "[]"))
+    assert bp.gh("issue", "list") == []
+
+
+# ── the age's POSITIVE half: a stale cache must SAY it is stale ──
+def test_a_cache_25_minutes_old_prints_25m_ago_not_zero(no_cache, capsys):
+    """⛔ ONLY THE NEGATIVE HALF OF THE AGE WAS PINNED (measured 2026-11-03).
+
+    `test_a_slightly_future_cache_stamp_never_prints_a_negative_age` covers `-Nm ago`; nothing
+    asserted a POSITIVE age, so `age_m = 0` — the reported "always 0m ago" defect, which defeats
+    the entire purpose of printing an age — survived the whole suite when mutated in. The header's
+    own evidence is a line that read "P0 21 open" for ~50 minutes while the truth was 19, and the
+    orchestrator nearly dispatched on it: a stale figure is read as LIVE unless the age says
+    otherwise.
+
+    The stamp is 25 min old, inside the 1800 s TTL, so this exercises the CACHE-HIT path — the
+    one taken on ~15 of every 16 beats — rather than a recompute that would print 0m correctly.
+    """
+    stamp = int(time.time()) - 25 * 60
+    with open(bp.CACHE, "w") as fh:
+        json.dump({"ts": stamp, "open_prs": 5, "merged_today": 2,
+                   "p0": {"open": 3, "with_pr": 2, "without": 1},
+                   "p1": {"open": 4, "with_pr": 4, "without": 0}}, fh)
+
+    assert bp.main() == 0
+    out = capsys.readouterr().out
+    assert "25m ago" in out, (
+        "a 25-minute-old cache must print `25m ago` — an always-0m age makes a stale figure "
+        "indistinguishable from a live one. got: %r" % out)
 
 # ── `--repo` must never relabel another repo's cached figures ──
 def test_a_repo_call_never_returns_another_repos_cached_figures(monkeypatch, no_cache, capsys):
