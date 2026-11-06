@@ -637,7 +637,15 @@ examine() {
   # and counting that as `rescue-exit-124` would report a rescue FAILURE for work this pass simply never
   # got to. It is deferred, named as deferred, and the pass is INCOMPLETE (exit 1), which is the honest
   # word for "there was no time", not "the archive broke".
-  if [ "$vrc" -eq 124 ] || [ "$vrc" -eq 137 ]; then
+  # ⛔ AND THE BUDGET MUST ACTUALLY BE SPENT (#3588 review). 124/137 on this call is TWO different facts:
+  # the pass ran out of wall clock (a deferral), or the RESCUE was cut off by its own
+  # WIP_SWEEP_RESCUE_TIMEOUT — a hung push, the case the doc spends a paragraph on — (a FAILURE: the work
+  # is still only on this disk and no next pass is coming on a box that is being reclaimed). Without the
+  # `budget_exhausted` guard every 124 was attributed to the budget, `rescue-exit-124`/`-137` became
+  # unreachable, and a broken archive read as "deferred" — exit 1 `incomplete` (`failed=0`) instead of
+  # exit 3 fail-closed, while `budget_stopped=yes` meant two different things. The classify call above
+  # has carried this exact guard since the deferral split was introduced; this branch is its sibling.
+  if { [ "$vrc" -eq 124 ] || [ "$vrc" -eq 137 ]; } && budget_exhausted; then
     BUDGET_STOPPED=1
     record "$repo" "$path" "$br" "$head" "dirty" "${paths:-?}" "$age" "${issue:--}" "-" "deferred-pass-budget" "${unpushed:-?}"
     N_DEFERRED=$((N_DEFERRED + 1))
