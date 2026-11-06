@@ -2609,27 +2609,30 @@ else
 # ⛔ AN ANSI-C STRING IS NOT A PLAIN SINGLE-QUOTED ONE (review P2, cycle 30). Inside `$'...'` a backslash
 # DOES escape, so treating it as an ordinary single-quoted string closed the quote state on an escaped
 # quote and let a REAL comment survive — the fail-open direction — and this writer already uses the
-# form, so it is a live spelling. The awk keeps an `ansi` flag set when the quote is preceded by `$`.
+# form, so it is a live spelling. The awk keeps an `ansi` flag set when the quote is preceded by a SINGLE
+# `$` — not by `$$`, where the `$$` is the PID expansion and the quote after it is a PLAIN single-quoted
+# string, so a ` # …` there is a real comment (measured: `X=$$'a\' # stale` leaked the whole comment
+# under the first version of this flag, which is the fail-open direction).
 # ⛔ A BACKSLASH ESCAPES THE NEXT CHARACTER (review P2, cycle 29). Without that arm, an escaped quote
 # outside quotes opened a PHANTOM quote state, so every `#` after it read as data and a REAL shell
 # comment survived into the graded view — a deleted `_head_rank` arm recorded as `: \' # was: unranked)
 # _head_rank="…"` kept the pin green on a writer that passes `bash -n`. Measured end-to-end, with
 # exactly that one pin differing between the two variants. (This comment is OUTSIDE the awk program: an
 # apostrophe inside it ends the bash single-quoted string — measured as `syntax error near … '{'`.)
-_strip_comments() {   # stdin → stdout, shell-comment-aware
-awk '
+_strip_marked() {   # $1=0 stdin → view;  $1=1 stdin → "view\001<the comment text it removed>"
+awk -v mark="${1:-0}" '
 {
-  out = ""; q = ""; prev = ""; ansi = 0;
+  out = ""; rem = ""; q = ""; prev = ""; ansi = 0;
   n = length($0);
   for (i = 1; i <= n; i++) {
     c = substr($0, i, 1);
     if (q == "") {
       if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
       if (c == "\047" || c == "\"") {
-        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$");
+        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$" && substr($0, i - 2, 1) != "$");
         q = c; out = out c; prev = c; continue
       }
-      if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) break
+      if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) { rem = substr($0, i); break }
     } else if (c == "\\" && (q == "\"" || ansi)) {
       out = out c substr($0, i + 1, 1); prev = "x"; i++; continue
     } else if (c == q) {
@@ -2637,9 +2640,17 @@ awk '
     }
     out = out c; prev = c;
   }
-  print out
+  if (mark) print out "\001" rem; else print out
 }'
 }
+# ⛔ THE LEAK CHECK'S POPULATION IS THE STRIP'S OWN CUT, NOT A RE-DERIVATION (review P3, cycle 31). The
+# first version re-derived the comments from the RAW line with a ` *' # '*` selector and a `##* # }` tail,
+# which is a DIFFERENT and NARROWER set than the one the strip acts on: it skipped `;#`/`)#`/TAB-`#`
+# spellings entirely, took everything after the LAST ` # ` (so a longer comment could hide a shorter
+# leak), and had to skip tails under 20 characters to stay quiet — which put five real writer comments
+# out of the population (four of them < 20 chars). The marked mode makes the population EXACTLY "every
+# comment this strip removes", at any length, in any spelling, with no floor and no selector to get wrong.
+_strip_comments() { _strip_marked 0; }
 _WCODE="$(_strip_comments < "$REFRESH")"
 # ⛔ ONE PROBE PER BOUNDARY CHARACTER (review P3, cycles 28 and 29). The set is `prev == ""` plus NINE
 # characters — space, TAB, `;` `(` `)` `|` `&` `<` `>` — and the first probe set skipped TAB, `(` and
@@ -2648,10 +2659,11 @@ _WCODE="$(_strip_comments < "$REFRESH")"
 # actually appear, and the sentence below says "boundary characters", not "spellings": `C=3|# stale`
 # and `F=6<# stale` are syntax errors, so they prove the CHARACTER ends the line, which is the
 # property the awk implements, not a line any shell would read.
-# Measured against `bash -n`: SIX of the eleven are valid shell (line start, `;`, subshell `)`, TAB, and
-# the three data lines) and FIVE are syntax errors — `C` `D` `E` `F` `I` — because a `|`, `&&`, `(` or a
-# redirection cannot precede `#` without a command. Those five grade the CHARACTER, which is what the
-# stripper implements.
+# Measured against `bash -n`, all FOURTEEN: NINE are valid shell (`A` `(echo hi)` `J` `K` `L` `M` `N` `O`
+# `P`) and FIVE are syntax errors — `C` `D` `E` `F` `I` — because a `|`, `&&`, `(` or a redirection cannot
+# precede `#` without a command. Those five grade the CHARACTER, which is what the stripper implements.
+# (The counts are stated because an earlier version of this note said "six of the eleven", a population
+# that had already grown to fourteen — a claim about a set is exactly as good as the set.)
 # `)` is probed on a SUBSHELL close, the form where it genuinely is a boundary — `B=2)# stale` is a
 # syntax error, and `echo $(echo hi)#there` keeps the `#` as DATA (a disclosed residual above). `O` and
 # `P` pin the two ESCAPE arms, which were the only code in the stripper with no probe at all (measured:
@@ -2661,11 +2673,11 @@ _WCODE="$(_strip_comments < "$REFRESH")"
 _strip_probe="$(printf '%s\n' 'A=1;# stale' '(echo hi)# stale' 'C=3|# stale' 'D=4&&# stale' \
   'E=5(# stale' 'F=6<# stale' 'I=7># stale' $'J=8\t# stale' \
   'K="head #5 is data"  # stale' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x # stale" 'O="a\"b" # stale' \
-  "P=\$'it\\'s' # stale" | _strip_comments)"
+  "P=\$'it\\'s' # stale" "Q=\$\$'a\\' # stale" | _strip_comments)"
 _strip_bad=""
 for _want in 'A=1;' '(echo hi)' 'C=3|' 'D=4&&' 'E=5(' 'F=6<' 'I=7>' $'J=8\t' \
               'K="head #5 is data"  ' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x " 'O="a\"b" ' \
-              "P=\$'it\\'s' "; do
+              "P=\$'it\\'s' " "Q=\$\$'a\\' "; do
   grep -qxF -- "$_want" <<<"$_strip_probe" || _strip_bad="$_strip_bad[$_want]"
 done
 if [ -z "$_strip_bad" ]; then
@@ -2679,39 +2691,69 @@ fi
 # stale comment for the strip to remove — so the one defence that makes findings like cycle 25's
 # impossible could be deleted in a single line with no signal. Two checks wire it, and each one closes a
 # hole the other could not (both measured):
-#   (a) CONTENT-LEVEL, on the wiring: no trailing-comment TEXT the writer carries may appear in the view.
-#       The metric is content lines (`[^[:space:]]`), never raw lines — `grep -c .` counts a line as kept
-#       when ANY byte survives a cut, and a cut always leaves the indentation, so a COLUMN-0-ONLY strip
-#       scored identically to the quote-aware one (4,337 of 6,094 both) and left all 69 trailing comments
-#       in the graded view: cycle 25's exact class, with the suite GREEN. A 55% ratio floor, tried next,
-#       fired instead on a legitimate indented-comment strip (43%) and on a docs edit that adds comment
-#       lines — RED, and diagnosed as "truncated or empty", which was false both times. Leaking comment
-#       text is the thing the strip exists to prevent, so it is the thing graded. The tails are DERIVED
-#       from the writer's own trailing comments (never typed here), and tails shorter than 20 characters
-#       are skipped so a stray word cannot make it fire on a legitimate edit.
+#   (a) ON THE WIRING, as a FIXED POINT: the graded view must contain nothing the strip would still
+#       remove. Three earlier metrics were measured wrong. `grep -c .` counts a line as kept when ANY byte
+#       survives a cut and a cut leaves the indentation, so it really measured "lines not starting with
+#       `#`" — a COLUMN-0-ONLY strip scored identically (4,337 of 6,094 both) and kept all 69 trailing
+#       comments: cycle 25's class, GREEN. A 55% ratio floor then fired on a legitimate indented-comment
+#       strip (43%) and on a docs edit that adds comment lines, diagnosing both as "truncated or empty".
+#       A re-derived tail set (` # ` selector, after the LAST ` # `, >= 20 chars) had to skip 5 real writer
+#       comments to stay quiet, and could not see `;#`/`)`/TAB spellings at all. Fixed-point testing needs
+#       no population, no length floor and no selector: a strip that leaves ANY comment is not a fixed
+#       point, so the property is graded by construction instead of by enumerating what should be caught.
 #   (b) THE FUNCTION, complementarily, on a shape the real writer has no instance of today: a FABRICATED
 #       writer whose only `_head_rank=` arm hides behind a `;;#` must yield one fewer text than it
 #       contains. With `_WCODE="$(cat …)"` this stays GREEN while (a) reds, so (a) is what makes the strip
 #       non-removable and (b) is what makes a `;;#` arm count as absent.
 _content_lines() { grep -c '[^[:space:]]' || true; }
+# how many comments a marked pass removes, and the first one it removes
+_removed_n() {  awk -F'\001' 'NF > 1 && $2 != "" { n++ } END { print n + 0 }'; }
+_removed_first() { awk -F'\001' 'NF > 1 && $2 != "" { print $2; exit }'; }
 _raw_content="$(_content_lines < "$REFRESH")"
 _view_content="$(_content_lines <<<"$_WCODE")"
+_n_strip="$(_strip_marked 1 < "$REFRESH" | _removed_n)"
 if [ "${_view_content:-0}" -ge "${_raw_content:-0}" ]; then
   bad "pin/writer: the graded view has $_view_content content lines and the file $_raw_content — the strip is NOT wired (\`_WCODE\` is the raw file), so every predicate below grades comments, not code"
+elif [ "${_view_content:-0}" -lt 1 ]; then
+  # ⛔ AN EMPTY VIEW PROVES NOTHING (review P3, cycle 31): the NOT-WIRED test above is an inequality, so a
+  # view that emits NOTHING satisfied it, produced zero leaks, and printed "the strip is wired AND
+  # comment-aware (0 content lines kept of 6094)". The deleted 55% floor had refused that state; the half
+  # of it worth keeping is this one, and it cannot false-fire (a correct strip keeps ~2,641 lines).
+  bad "pin/writer: the graded view kept NO content line of $_raw_content — an empty view proves nothing about the strip, and no predicate below it can be trusted"
+elif [ "${_n_strip:-0}" -lt 100 ]; then
+  bad "pin/writer: the strip reports only ${_n_strip:-<unreadable>} removed comment(s) from a file this comment-dense (want > 100), so the idempotence check below would be vacuous — the STRIPPER is not doing its job, which is a different failure from the wiring's"
 else
-  _leak=0; _leak_first=""
-  while IFS= read -r _raw; do
-    case "$_raw" in *' # '*) ;; *) continue ;; esac
-    _tail="${_raw##* # }"
-    [ "${#_tail}" -ge 20 ] || continue
-    if grep -qF -- "$_tail" <<<"$_WCODE"; then
-      _leak=$((_leak + 1)); [ -z "$_leak_first" ] && _leak_first="$_tail"
-    fi
-  done < "$REFRESH"
-  if [ "$_leak" = "0" ]; then
-    ok "pin/writer: the graded view carries NO trailing-comment text the writer writes ($_view_content content lines kept of $_raw_content) — the strip is wired AND comment-aware"
+  # ⛔ THE VIEW MUST BE A FIXED POINT OF THE STRIP (review P3, cycle 31). Three earlier metrics were all
+  # measured wrong: `grep -c .` really counted "lines not starting with `#`" (a column-0-only strip scored
+  # 4,337/6,094 — identical to the quote-aware one — and kept all 69 trailing comments); a 55% ratio floor
+  # then fired on a legitimate indented-comment strip (43%) and on a docs edit; and a re-derived tail set
+  # (` # ` selector, after the LAST ` # `, >= 20 chars) had to skip 5 real writer comments to stay quiet
+  # and could not see `;#`/`)`/TAB spellings at all. Fixed-point testing needs no population, no length
+  # floor and no selector: re-run the SAME strip over its own output and require that it removes nothing.
+  # A strip that leaves ANY comment — of any spelling, at any length — is not a fixed point, so it is
+  # caught by construction rather than by enumerating what should have been caught.
+  # ⛔ AND THE STRIPPER'S RULE MUST NOT BE LENGTH-DEPENDENT (review P3, cycle 31). A fixed point is a
+  # fixed point OF ITS OWN RULE, so a stripper that deliberately ignores one length class is still a fixed
+  # point of itself — measured: a rule that skips exactly 5-character comments left the suite 293/0 GREEN.
+  # That is not hypothetical: the previous version of this check carried a `>= 20 chars` floor, and FIVE
+  # real comments this writer carries are shorter than that (`# <ref>` 5, `# <arm>` 5, `# <slug>
+  # [<reason>]` 17, `# table shape` 11, `# <pre-flight output>` 19). The coverage is asserted instead of
+  # assumed, on the writer's own bytes. What this does NOT cover, stated rather than implied: a rule that
+  # skips one EXACT length (measured: skipping only 5-character comments stays green here, and the probes
+  # all carry 7-character tails). No finite probe set closes that, so it is a disclosed residual — a
+  # length rule introduced deliberately would have to be a whole-class rule, and those are caught (a
+  # `< 20` floor reds the probes; a `>= 20` floor reds the probes AND this count).
+  _n_short="$(_strip_marked 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2); if (n >= 4 && n <= 19) c++ } END { print c + 0 }')"
+  if [ "${_n_short:-0}" -lt 5 ]; then
+    bad "pin/writer: the strip removes only ${_n_short:-<unreadable>} comment(s) shorter than 20 characters (want >= 5) — a length rule has crept back in, and the short comments this writer carries are exactly what such a rule drops silently"
   else
-    bad "pin/writer: $_leak trailing-comment tail(s) survived into the graded view (first: '$_leak_first') — a strip that removes only column-0 comments scores the SAME content-line count, so this is the check that notices"
+    ok "pin/writer: the strip removes comments at every length — $_n_short of them are under 20 characters, so no length floor is hiding them"
+  fi
+  _n_re="$(_strip_marked 1 <<<"$_WCODE" | _removed_n)"
+  if [ "${_n_re:-x}" = "0" ]; then
+    ok "pin/writer: the graded view is a FIXED POINT of the strip — re-stripping it removes nothing, while the file yields $_n_strip ($_view_content content lines kept of $_raw_content). A view that left any comment, in any spelling, would remove something here"
+  else
+    bad "pin/writer: re-stripping the graded view still removes ${_n_re:-<unreadable>} comment(s) (first: '$(_strip_marked 1 <<<"$_WCODE" | _removed_first)') — the strip left them in, so every predicate below grades them as code"
   fi
 fi
 _synth_writer="$(printf '%s\n' 'severity) _head_rank="the ranked one" ;;# was: unranked) _head_rank="the hidden one" ;;' \
