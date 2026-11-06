@@ -1127,7 +1127,7 @@ cap_wip_snapshot() {
 # it. ⛔ THE REASON IS THE CALLEE'S CONTRACT, NOT BRANCH SAFETY (review P2, round 5, PR #2975). An
 # earlier version of this note argued that pushing would "move a branch" — it would not:
 # `bg-rescue-wip.sh` builds its archive with `commit-tree` and pushes `refs/wip/<slug>`, which is NOT a
-# branch and is pushed without force (`:326-349`). The real binding constraint is the callee's own
+# branch and is pushed without force (`:326-355`, all three push functions). The real binding constraint is the callee's own
 # `AT_RISK` rule (`bg-rescue-wip.sh:141-157`): it archives only a NON-EMPTY `git status`, so a
 # clean-but-unpushed tree makes it `exit 0` having done nothing, and it never considers `HEAD`'s own
 # commits. Teaching it to archive `HEAD`'s tree when the tree is clean is a change to the SHIPPED

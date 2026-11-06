@@ -506,6 +506,18 @@ SHIM
   # worktree", which reads like a rescue bug and hides the real one (measured in this file's own
   # development — a mangled heredoc produced five confident reds about the wrong thing).
   bash -n "$d/git" 2>/dev/null || { echo "❌ generated stub is not valid bash: $d/git"; return 1; }
+  # ⛔ A `timeout` STUB, SO "THE RETRY IS TIME-BOUNDED" IS MEASURABLE (review round 5, P2).
+  # `bg-rescue-wip.sh`'s own docblock claims all three push functions carry "the same bounds", and
+  # deleting `bounded 45 ` from `push_unshadowed` was FULLY GREEN: only GIT_TERMINAL_PROMPT was pinned,
+  # so half of "it cannot block the kill" was unasserted — and an unbounded retry is a hang in the
+  # second before a cap kill. `bounded` resolves `timeout` through PATH, so recording here is enough.
+  # On a host with no real `timeout` (macOS) the stub records and runs the command unbounded, which is
+  # exactly what `bounded` does there anyway — so the arm is platform-neutral.
+  local _realt; _realt="$(command -v timeout 2>/dev/null)"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >> "%s/timeout.log"\nif [ -n "%s" ]; then exec "%s" "$@"; fi\nshift\nexec "$@"\n' \
+    "$d" "$_realt" "$_realt" > "$d/timeout" || return 1
+  chmod +x "$d/timeout" || return 1
+  bash -n "$d/timeout" 2>/dev/null || { echo "❌ generated timeout stub is not valid bash: $d/timeout"; return 1; }
   return 0
 }
 # try_rescue <fixture> <mode> [<branch>] [<retry-env>] — build a worktree that touches
@@ -788,6 +800,13 @@ assert_unshadow_arm() { # assert_unshadow_arm <fixture> <label> <attempt-1 token
   grep -qx 'GIT_TERMINAL_PROMPT=0' "$f/shim/attempts.env.2" 2>/dev/null \
     && ok "$l: the retry ran with GIT_TERMINAL_PROMPT=0 (it cannot block the kill on a prompt)" \
     || bad "$l: the stored-credential retry did not disable the terminal prompt — a missing store entry could hang the rescue"
+  # ⛔ AND IT IS TIME-BOUNDED (review round 5, P2). The docblock claims all three push functions carry
+  # "the same bounds"; deleting `bounded 45 ` from `push_unshadowed` was green. The fixture records every
+  # `timeout` invocation, so TWO 45 s bounds (first push + retry) must be present.
+  T45="$(grep -c '^45$' "$f/shim/timeout.log" 2>/dev/null)"
+  [ "${T45:-0}" = "2" ] \
+    && ok "$l: BOTH pushes ran under the 45 s bound (an unbounded retry can hang the pre-kill rescue)" \
+    || bad "$l: ${T45:-0} bounded push(es) recorded (want 2) — the stored-credential retry is UNBOUNDED"
   for p in "$f/shim/argv.1" "$f/shim/argv.2"; do
     [ -f "$p" ] && grep -qE '^(\+|-f$|-[fF]$|--force)' "$p" 2>/dev/null && force=1
   done
@@ -911,6 +930,20 @@ esac
 try_rescue wfshadow2 wf_shadowed fix/lane-one \
   "-u BG_RESCUE_PUSH_HELPER -u GH_TOKEN BG_RESCUE_PUSH_UNSHADOW=1 GITHUB_TOKEN=shadow-readonly-pat"
 assert_unshadow_arm wfshadow2 wfshadow2 'GH_TOKEN=unset GITHUB_TOKEN=shadow-readonly-pat'
+
+# ⛔ AND THE **DEFAULT**-PATH UNShadow BRANCH NEEDS ITS OWN `GITHUB_TOKEN` ARM (review round 5, P1).
+# `wfshadow2` reaches the candidate through the SEAM (`:392`); the `GITHUB_TOKEN` term of the platform
+# default (`:394`) — the branch every Linux cell actually takes — had no coverage at all, so narrowing
+# it to `GH_TOKEN` alone was fully green while the run then told the operator there was "no ambient
+# GH_TOKEN/GITHUB_TOKEN to unshadow" on a host that exports one. This arm is the same shape with NO
+# seam, and (like its sibling) it is non-Darwin only: on macOS the default is `osxkeychain`.
+if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
+  skip "wfshadow3: on macOS the DEFAULT candidate is osxkeychain — the default-path GITHUB_TOKEN term only exists on non-Darwin hosts"
+else
+  try_rescue wfshadow3 wf_shadowed fix/lane-one \
+    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN GITHUB_TOKEN=shadow-readonly-pat"
+  assert_unshadow_arm wfshadow3 wfshadow3 'GH_TOKEN=unset GITHUB_TOKEN=shadow-readonly-pat'
+fi
 
 # ⛔ A RETRIED RESCUE THAT IS STILL PARTIAL MUST EXIT 2 (review round 4, P2). The partial-archive guard
 # was pinned only on a NON-retried rescue, so `if [ "${#SKIPPED[@]}" -gt 0 ] && [ "$RETRIED" -eq 0 ]` — a
