@@ -285,6 +285,7 @@ _spec.loader.exec_module(_real)
 _slug_from_remote = _real._slug_from_remote
 _normalize_slug = _real._normalize_slug
 _origin_slug = _real._origin_slug
+set_tag_collisions = _real.set_tag_collisions
 if __name__ == "__main__":
     print("ARGV " + " ".join(sys.argv[1:]))
     print("SET " + (os.environ.get("PR_DOCTOR_REPOS") or "<unset>"))
@@ -514,6 +515,28 @@ mkdir -p "$T/dirset"
 ck "j3 a DIRECTORY at the config path is INVALID (5), not NO-REPO-SET (3)" '[ "$(run_reader_rc "$T/dirset" list)" = 5 ]'
 ck "j4 …and it says so rather than claiming the path does not exist" \
    'run_reader "$T/dirset" list | grep -q "exists but is not a regular file"'
+# ⛔ A DANGLING SYMLINK AT THE CONFIG PATH IS NOT "ABSENT" (review round 7, P2). `-e` follows the
+# link, so a dotfile manager whose target moved (stow/chezmoi) read as "this machine has named no
+# repo" — code 3 — and the wrapper DEGRADED on it: the machine silently stopped grading every repo
+# but one and was told to create a file that exists.
+ln -s "$T/definitely-not-here.conf" "$T/dangling.conf" 2>/dev/null
+ck "j8 a DANGLING SYMLINK at the config path is INVALID (5), not NO-REPO-SET (3)" \
+   '[ "$(run_reader_rc "$T/dangling.conf" list)" = 5 ]'
+ck "j9 …and it says the LINK is broken, so the operator is not sent to create the file" \
+   'run_reader "$T/dangling.conf" list | grep -q "SYMLINK whose target does not exist"'
+
+# ⛔ THE DOCTOR'S SET-LEVEL TAG GUARD IS THE ONE WHOLE-SET REFUSAL THE READER CANNOT EXPRESS ITSELF
+# (review round 7, P2): `acme/tools-api` and `acme-tools/api` both render the tag `acme-tools-api`, so
+# their registers, worker names and status files are ONE file. Without it a set this reader certified OK
+# was refused wholesale by the doctor, making the wrapper's "grading N repo(s)" false.
+mkdir -p "$T/tools-api" "$T/acme-tools-api"
+mk_repo "$T/tools-api" acme/tools-api
+mk_repo "$T/acme-tools-api" acme-tools/api
+printf 'slug=acme/tools-api checkout=%s\nslug=acme-tools/api checkout=%s\n' "$T/tools-api" "$T/acme-tools-api" > "$T/tag-collide.conf"
+ck "j10 a TAG collision is refused here, not left for the doctor to refuse after we certify OK" \
+   '[ "$(run_reader_rc "$T/tag-collide.conf" check)" = 1 ] && run_reader "$T/tag-collide.conf" check | grep -q "REFUSED set"'
+ck "j11 …and the wrapper never announces a count for it" \
+   'REPO_SET_FILE="$T/tag-collide.conf" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q . ; [ $? -ne 0 ]'
 ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
    '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
 ck "j6 check returns 1 for a set that PARSES but whose proof fails (a different fix from a broken file)" \

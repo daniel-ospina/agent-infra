@@ -192,6 +192,16 @@ _rs_slug_ok() {
 # repo_set_parse — the SYNTAX half. Emits `slug<TAB>checkout<TAB>state`, or nothing and a refusal.
 repo_set_parse() {
   local f; f="$(repo_set_file)"
+  # ⛔ `-L` BEFORE `-e`: `-e` FOLLOWS the link, so a DANGLING symlink reads as absent and the box
+  # silently degrades — measured in review round 7. A dotfile manager whose target moved (stow,
+  # chezmoi) lands exactly here: the machine stops grading every repo but one and is told to create a
+  # file that is already there. An existing LINK that does not resolve is the broken state (5).
+  if [ -L "$f" ] && [ ! -e "$f" ]; then
+    _rs_say 2 "repo-set: INVALID — $f is a SYMLINK whose target does not exist, so this machine has"
+    _rs_say 2 "repo-set:   named no repo and nothing can read the set. Fix the link's target; creating the"
+    _rs_say 2 "repo-set:   file would replace the link."
+    return 5
+  fi
   if [ ! -e "$f" ]; then
     _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
     _rs_say 2 "repo-set:   Create it, one repo per line:"
@@ -263,7 +273,7 @@ repo_set_parse() {
     seen="$seen"$'\n'"$(_rs_lower "$slug")"$'\n'
 
     if [ -z "$checkout" ]; then
-      _rs_say 2 "repo-set: MISSING-CHECKOUT — $f:$ln: \`$slug\` names no checkout, so nothing can be spawned for it (its queue could only be graded read-only)"
+      _rs_say 2 "repo-set: MISSING-CHECKOUT — $f:$ln: \`$slug\` names no checkout; the doctor will fall back to REPO/cwd for one, or grade its queue read-only"
       rc=5; continue
     fi
     # ⛔ A COMMA IS A SEPARATOR IN THE VALUE THIS FILE RENDERS, SO IT CANNOT APPEAR IN A VALUE.
@@ -345,7 +355,9 @@ try:
     spec.loader.exec_module(mod)
 except Exception:
     raise SystemExit(0)
-if verb == "norm":
+if verb == "tags":
+    sys.stdout.write(mod.set_tag_collisions(arg.split(",") if arg else []))
+elif verb == "norm":
     sys.stdout.write(mod._normalize_slug(arg))
 else:
     slug, why = mod._origin_slug(arg)
@@ -374,6 +386,18 @@ _rs_origin_slug() {
 # `[HOST/]OWNER/REPO`, a URL, `.git`, an scp-style remote), or "" when it names no repo. Delegated for
 # the same reason: the DEGRADED path advertises a slug and then the doctor re-resolves it, so a
 # stricter parser here refuses values the doctor runs (measured: a `https://github.com/o/n` seam).
+# _rs_tag_collision <comma-joined entries> — the doctor's own SET-LEVEL guard, delegated. It refuses a
+# set whose repo TAGS collide (`acme/tools-api` and `acme-tools/api` both render `acme-tools-api`, so
+# their registers, worker names and status files are one file), and it is the ONE whole-set refusal the
+# reader cannot express from its own arms — so a set this reader certified could still be refused
+# wholesale by the doctor, which made the wrapper's "grading N repo(s)" false (review round 7).
+_rs_tag_collision() {
+  local entries="${1:-}"
+  [ -n "$entries" ] || return 0
+  _rs_with_doctor tags "$entries"
+  return 0
+}
+
 _rs_normalize_slug() {
   local v="${1:-}"
   [ -n "$v" ] || return 0
@@ -385,9 +409,10 @@ _rs_normalize_slug() {
 #   * its `origin` PROVES the slug it is declared under — THE ONLY PROOF THAT CAN REFUSE, because the
 #     proof is `pr-doctor.py`'s own `_origin_slug()`, delegated rather than re-implemented;
 #   * nothing else refuses. Absent, denied, not a directory, no `origin`, no `git`, no `python3`: all
-#     UNVERIFIABLE, all a WARN. What the PASS then does is the doctor's to say (it may adopt another
-#     checkout for the slug, or grade read-only); this reader states only what it measured. The split
-#     is the one `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
+#     UNVERIFIABLE, all a WARN. What the PASS then does is the doctor's to say — it may adopt another
+#     checkout for the slug (`REPO`, then the cwd, through `_checkout_that_proves()`) and SPAWN, or
+#     grade read-only; this reader states only what it measured, and makes no promise about the pass.
+#     The split is the one `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
 #     under `~/Documents` (the default checkout), so refusing there discarded a pass the doctor
 #     completes. "I could not look" must never be reported as "it is wrong".
 #   * no two repos share a state dir — the silent-sharing failure `multi-repo-controller.sh` refuses
@@ -425,8 +450,9 @@ repo_set_check() {
     # below unreachable for exactly the case it was written for. Same for a missing `git` and a
     # `dubious ownership` refusal, which are not facts about the checkout.
     #
-    # So: PROVEN wrong (absent, or a checkout of a different repo) refuses; UNVERIFIABLE warns and
-    # lets the pass grade read-only, which is what the doctor does with the same evidence.
+    # So: a checkout of a DIFFERENT repo refuses (the only proven fault about a checkout);
+    # UNVERIFIABLE warns, and this reader makes no promise about what the pass then does — the doctor
+    # may adopt `REPO`/cwd for the checkout and spawn, or grade read-only.
     # ⛔ NOTHING ABOUT THE CHECKOUT'S EXISTENCE REFUSES (review round 4, P1; round 3, P1). Round 3 moved
     # this refusal off `git rev-parse` and onto `test -e` — which is the SAME defect one syscall over:
     # macOS TCC denies at the ANCESTOR (`~/Documents`), so `stat` fails with EACCES, `-e` is false, and
@@ -436,7 +462,8 @@ repo_set_check() {
     #
     # THE RULE, THEN, AND IT IS THE WHOLE RULE: only a PROVEN fault refuses. A slug the doctor's own
     # `_origin_slug()` returns that differs from the declared one is proven. Everything else — absent,
-    # denied, not a directory, no `origin`, no `git`, no `python3` — is UNVERIFIABLE and warns.
+    # denied, not a directory, no `origin`, no `git`, no `python3` — is UNVERIFIABLE and warns, and
+    # nothing is promised about what the pass then does (the doctor may adopt `REPO`/cwd and spawn).
     #
     # ⛔ AND A WARN IS A STATEMENT ABOUT THIS ENTRY'S CHECKOUT, NOT ABOUT THE PASS. The doctor resolves
     # each entry through `_checkout_that_proves()`, which falls back to `REPO` and then the cwd, so it
@@ -492,6 +519,17 @@ repo_set_check() {
   done <<EOF
 $parsed
 EOF
+
+  # ⛔ THE DOCTOR'S OWN SET-LEVEL GUARD RUNS HERE TOO (review round 7, P2). `set_tag_collisions` is
+  # the one whole-set refusal the arms above cannot express, and without it a set this reader called OK
+  # was refused wholesale by the doctor — so the wrapper's "grading N repo(s)" was false and nothing
+  # was graded. Delegated for the same reason every other proof is: one rule, one home.
+  local tagwhy
+  tagwhy="$(_rs_tag_collision "$(repo_set_doctor_repos 2>/dev/null)")"
+  if [ -n "$tagwhy" ]; then
+    printf 'repo-set: REFUSED set — %s\n' "$tagwhy"
+    bad=1
+  fi
 
   if [ "$bad" != 0 ]; then
     printf 'repo-set: REFUSING — %d repo(s) named, at least one refused above\n' "$n"
