@@ -740,6 +740,48 @@ if [ "$race_rc" -ne 0 ] && [ "$race_rows" = "111 222" ] \
 else rc=1; echo "      rc=$race_rc rows='$race_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH/out" 2>/dev/null | head -c 300)"; fi
 ck "a prune that refills the queue between the read and the install is REFUSED — the rows survive, no 'EMPTY' is reported" $rc
 
+# ⛔ AND THE EMPTY-REORDER CLAUSE ON ITS OWN (review P3, cycle 56). That guard has TWO clauses; deleting the
+# first (`[ ! -s ranked ] && [ -s candidates.txt ]`) left the suite at 133/0, because the row-set clause
+# catches the same state whenever `sort` works. Its independent value is exactly the case where `sort -u`
+# CANNOT run: both substitutions then yield "", the sets compare EQUAL, the row-set clause goes silent — and
+# the emptied-reorder clause is the last thing between a torn read and a zero-byte install.
+SH2="$TMP/prunerace-empty"; rm -rf "$SH2"; mkdir -p "$SH2/o" "$SH2/bin"
+printf '111\n222\n' > "$SH2/seed"
+printf '200\n300\n' > "$SH2/o/.pool"
+: > "$SH2/o/candidates.txt"
+cat > "$SH2/bin/cmp" <<'SHIM'
+#!/usr/bin/env bash
+cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
+exec /usr/bin/cmp "$@"
+SHIM
+chmod +x "$SH2/bin/cmp"
+cat > "$SH2/bin/sort" <<'SHIM'
+#!/usr/bin/env bash
+# `sort -u` is the ROW-SET clause's tool: make it fail so that clause cannot decide, leaving the
+# emptied-reorder clause alone on the path (the ranker's own `sort -k1,1n` is untouched).
+case " $* " in *' -u '*) exit 1 ;; esac
+exec /usr/bin/sort "$@"
+SHIM
+chmod +x "$SH2/bin/sort"
+{ drive_prologue
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'
+} > "$SH2/drive.sh"
+( cd "$SH2" && HOME="$SH2" PATH="$SH2/bin:$PATH" PRUNE_SEED="$SH2/seed" PRUNE_QUEUE="$SH2/o/candidates.txt" bash drive.sh "$SH2/o" ) > "$SH2/out" 2>&1
+race2_rc=$?
+race2_rows="$(tr '\n' ' ' < "$SH2/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+# the shim must really have blinded the row-set clause, else this fixture grades nothing
+sort_u_blind=0
+( PATH="$SH2/bin:$PATH"; [ "$(LC_ALL=C sort -u "$SH2/o/candidates.txt" 2>/dev/null)" = "$(LC_ALL=C sort -u "$SH2/o/.cand.ranked" 2>/dev/null)" ] ) && sort_u_blind=1
+if [ "$sort_u_blind" -ne 1 ]; then
+  rc=1; echo "      the sort shim did NOT blind the row-set clause (the two substitutions still differ) — this fixture grades nothing"
+elif [ "$race2_rc" -ne 0 ] && [ "$race2_rows" = "111 222" ] \
+   && grep -q 'STATE=priority-unreadable' "$SH2/out" 2>/dev/null \
+   && grep -q 'the queue changed between this pass' "$SH2/out" 2>/dev/null \
+   && [ ! -e "$SH2/o/.cand.ranked" ]; then rc=0
+else rc=1; echo "      rc=$race2_rc rows='$race2_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH2/out" 2>/dev/null | head -c 300)"; fi
+ck "the EMPTY-REORDER clause refuses an emptied reorder even when the row-set clause CANNOT decide (sort -u blind)" $rc
+
 # ── 12) THE PRODUCT FLOOR'S FILE FOLLOWS THE ORDER THIS PASS INSTALLED ───────────────────────
 # `orch-loop.sh`'s `floor_order` walks `candidates.product.txt` in ITS OWN order and takes up to
 # `PRODUCT_FLOOR` (default 1) rows that ALSO live in candidates.txt. On a MAIN pass `write_product_queues`
@@ -1394,6 +1436,7 @@ if [ "$SDRC" -eq 0 ] && grep -q 'the queue is empty (0 rows)' <<<"$SDOUT" \
    && ! grep -q 'could NOT be READ' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/empty: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a MEASURED empty queue: 'the queue is empty (0 rows)' + backlog=0 + queue_readable=1)"; fi
 ck "SKIP arm: a MEASURED empty queue says so, with backlog=0 (driven)" $rc
+
 skip_drive withhead rows
 if [ "$SDRC" -eq 0 ] && grep -q 'head #300' <<<"$SDOUT" \
    && grep -q 'handed=300' <<<"$SDOUT" \
@@ -1523,6 +1566,9 @@ main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
   {
     printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS=""\n' "$st"
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+    # the provenance clause the "handed NOTHING" records compose is stubbed as its own MARKER, so a record
+    # that drops the field (or a state the arm forgot to pass) is visible in the row rather than silently ""
+    printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
     printf 'unusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
     printf 'O="%s/o"\nSTARVED=0\n' "$d"
@@ -1682,6 +1728,23 @@ if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
    && ! grep -q 'integer expression expected' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      absent queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (an ABSENT queue is unreadable, and neither the redirection nor the depth gate may leak stderr)"; fi
 ck "an ABSENT queue is unmeasured too, and neither the failed redirection nor the depth gate leaks stderr" $rc
+
+# ⛔ THE PROVENANCE ON A "HANDED NOTHING" ARM (review P3, cycle 56). These four records omitted `handed_why=`,
+# so an `unranked` pass and a `priority-unreadable` pass — states whose operator answers are OPPOSITE — wrote
+# BYTE-IDENTICAL durable rows over the same measured depth (driven below: the `garbage` queue, whose head is
+# not a candidate number). Two drives, one variable: the state word.
+main_handoff garbage-unranked garbage unranked; _mh_u="$MHOUT"
+main_handoff garbage-refused garbage priority-unreadable; _mh_p="$MHOUT"
+_mh_u_rec="$(printf '%s\n' "$_mh_u" | grep '^RECORD:' | grep 'handed=' | head -1)"
+_mh_p_rec="$(printf '%s\n' "$_mh_p" | grep '^RECORD:' | grep 'handed=' | head -1)"
+if [ -z "$_mh_u_rec" ] || [ -z "$_mh_p_rec" ]; then
+  rc=1; echo "      neither drive recorded a handoff row (unranked '${_mh_u_rec:-<none>}' / refused '${_mh_p_rec:-<none>}')"
+elif [ "$_mh_u_rec" = "$_mh_p_rec" ]; then
+  rc=1; echo "      an unranked pass and a priority-unreadable pass recorded the SAME durable row ('$_mh_u_rec') — the record cannot say which of the two happened"
+elif ! grep -q 'handed_why=WHY:unranked' <<<"$_mh_u_rec" || ! grep -q 'handed_why=WHY:priority-unreadable' <<<"$_mh_p_rec"; then
+  rc=1; echo "      the rows differ but not in the provenance: unranked '$_mh_u_rec' / refused '$_mh_p_rec' (want handed_why=WHY:unranked / WHY:priority-unreadable)"
+else rc=0; fi
+ck "a 'handed NOTHING' record carries the order's PROVENANCE, so unranked and priority-unreadable never record the same row" $rc
 # (c) NON-VACUITY — revert the guarded read to the pre-fix unguarded one (which coerces a failed `wc` to 0)
 # and show fixture (a) goes RED. A guard that survives its own revert is not the thing being graded.
 MHREV="$TMP/main-handoff-rev.sh"

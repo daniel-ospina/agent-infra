@@ -6283,13 +6283,13 @@ elif [ -n "$_backlog_n" ] && [ "$_backlog_n" -eq 0 ]; then
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue is empty and no candidate this pass was usable" \
-    "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 elif [ -n "$_backlog_n" ]; then
   echo "[refresh] handed to dispatch: NONE — this pass queued nothing usable, and the queue holds $_backlog_n row(s) but its HEAD could not be read as a candidate number, so this pass cannot say WHICH one dispatch takes next — the depth is MEASURED, the head is UNKNOWN, and this is NOT an empty queue (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue holds $_backlog_n row(s) and its head could not be read, so the DEPTH is measured and the HEAD is unknown (this is not an empty queue)" \
-    "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 elif [ "$_q_readable" -eq 0 ]; then
   # ⛔ THE THIRD ARM (review P2, cycle 11): the queue could not be READ, so its depth is UNKNOWN — never
   # the success word, and never a `backlog=0` the durable record would be asserting as a measurement.
@@ -6297,7 +6297,7 @@ elif [ "$_q_readable" -eq 0 ]; then
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed; the queue could NOT be read, so the depth and the head are UNKNOWN and nothing was handed" \
-    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 else
   # ⛔ READABLE, BUT NEITHER NUMBER CAME BACK (review P2, cycle 15): the file WAS read (the guard above
   # proved it), the depth read failed, and the head is not a plain number. Saying "not a readable regular
@@ -6307,5 +6307,5 @@ else
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed; the queue WAS readable but neither its DEPTH nor its HEAD could be measured, so both are UNKNOWN and nothing was handed (this is not an empty queue)" \
-    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 fi
