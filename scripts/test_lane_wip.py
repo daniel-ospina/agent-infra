@@ -139,6 +139,20 @@ def test_an_unreadable_session_file_is_still_UNMEASURED_not_exit_1(monkeypatch, 
     assert rc == 3 and "UNMEASURED(" in (p.get("unmeasured") or ""), (rc, p)
 
 
+def test_a_bad_chars_or_turns_value_is_a_usage_error_not_a_traceback(monkeypatch):
+    """⛔ `int()` RAISES `ValueError`, WHICH NOTHING CAUGHT: rc 1 with empty stdout from a caller typo.
+
+    The contract assigns 2 to "usage", and 1 is the code it retires. `--chars --json` is included
+    because the flag is consumed as the VALUE there, which is the shape a caller hits by accident.
+    """
+    lw = _load()
+    for argv in (["lane-wip.py", "WS1", "--chars", "abc"],
+                 ["lane-wip.py", "WS1", "--turns", "x"],
+                 ["lane-wip.py", "WS1", "--chars", "--json"]):
+        monkeypatch.setattr(lw.sys, "argv", argv)
+        assert lw.main() == 2, argv
+
+
 def test_a_json_line_that_is_not_an_object_is_skipped_not_a_crash(monkeypatch, tmp_path):
     """⛔ `null`, `5`, `[]` and `"x"` PARSE, then raise `AttributeError` from `.get()`.
 

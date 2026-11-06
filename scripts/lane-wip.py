@@ -188,11 +188,23 @@ def main():
     chars = 400
     want = 1
     as_json = "--json" in sys.argv[1:]
+    # ⛔ A BAD `--chars`/`--turns` VALUE IS A USAGE ERROR (2), NOT A TRACEBACK. `int()` raises
+    # ValueError — not an OSError — so `--chars abc` (or `--chars --json`, where the flag is taken as
+    # the value) killed the process with rc 1 and EMPTY stdout: the code this module's contract says
+    # must never occur, produced by a caller typo rather than by an unreadable lane.
     for i, a in enumerate(sys.argv):
         if a == "--chars" and i + 1 < len(sys.argv):
-            chars = int(sys.argv[i + 1])
+            try:
+                chars = int(sys.argv[i + 1])
+            except (TypeError, ValueError):
+                sys.stderr.write("lane-wip: --chars needs an integer, got %r\n" % (sys.argv[i + 1],))
+                return 2
         if a == "--turns" and i + 1 < len(sys.argv):
-            want = int(sys.argv[i + 1])
+            try:
+                want = int(sys.argv[i + 1])
+            except (TypeError, ValueError):
+                sys.stderr.write("lane-wip: --turns needs an integer, got %r\n" % (sys.argv[i + 1],))
+                return 2
 
     rc, payload = collect(key, chars=chars, want=want)
     if as_json:

@@ -1461,13 +1461,24 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     occurrence of a flag and a caller-supplied `--ext-diff` would otherwise re-enable the hook.
     """
     mod = _saved_mod()
-    # ⛔ EVERY ALLOWLISTED GIT VERB IS fsmonitor-PINNED, and `-c` is a GLOBAL option so it precedes
-    # the verb. `status` is NOT untouched: `core.fsmonitor` is exactly the hook a plain `git status`
-    # runs, so a diff-only hardening leaves the commonest call on the surface able to execute one.
-    assert mod._harden_argv(["git", "diff"]) == ["git", "-c", "core.fsmonitor=", "diff",
-                                                  "--no-ext-diff", "--no-textconv",
-                                                  "--no-ext-diff", "--no-textconv"]
-    assert mod._harden_argv(["git", "status"]) == ["git", "-c", "core.fsmonitor=", "status"]
+    # ⛔ THE CONFIG CLASS, NOT ONE KEY. Every repo-config key that NAMES A PROGRAM and is reachable by a
+    # READ verb is pinned in the same global slot; `gpg.program` and `core.alternateRefsCommand` were
+    # both measured executing on an allowlisted argv, one of them with NO flag at all
+    # (`log.showSignature=true` + `gpg.program` make a plain `git show` run it).
+    for key in ("core.fsmonitor=", "core.alternateRefsCommand=", "log.showSignature=false",
+                "gpg.program=/bin/false", "core.pager=cat", "core.hooksPath=/dev/null"):
+        assert key in mod.GIT_PIN_CONFIG, key
+    expected_head = ["git"]
+    for pin in mod.GIT_PIN_CONFIG:
+        expected_head += ["-c", pin]
+    assert mod._harden_argv(["git", "diff"])[:len(expected_head)] == expected_head, \
+        mod._harden_argv(["git", "diff"])
+    tail = mod._harden_argv(["git", "diff"])[len(expected_head):]
+    assert tail == ["diff", "--no-ext-diff", "--no-textconv", "--no-ext-diff", "--no-textconv"], \
+        tail
+    # `status` carries the pins and nothing else — it has no diff machinery to disarm
+    assert mod._harden_argv(["git", "status"])[-1] == "status"
+    assert "--no-ext-diff" not in mod._harden_argv(["git", "status"])
     # ⛔ THE PAIR IS EMITTED TWICE, AND BOTH COPIES ARE LOAD-BEARING — see `_harden_argv`. The FIRST
     # copy is the only one a value-taking option cannot swallow (nothing can precede it); the LAST is
     # the only one that beats a caller flag that would re-enable a hook. Measured with
@@ -1475,20 +1486,21 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     # its VALUE (rc 0, no "invalid option") and the external driver runs.
     hardened = mod._harden_argv(["git", "diff", "--dst-prefix"])
     assert hardened.count("--no-ext-diff") == 2 and hardened.count("--no-textconv") == 2, hardened
-    assert hardened[4:6] == ["--no-ext-diff", "--no-textconv"], hardened
-    # ⛔ AND THE RE-ENABLING SPELLINGS `--ext-diff`/`--textconv` NEVER REACH THE ARGV AT ALL: the
-    # allowlist refuses them AND every unambiguous abbreviation of them (`--ext`, `--ex`, `--textc`),
-    # which a token-equality denylist cannot enumerate.
-    for tok in ("--ext-diff", "--ext", "--ex", "--textconv", "--textc"):
-        ok, why = mod._allowlisted(["git", "diff", tok])
-        assert ok is False, tok
-    # `--text` is a REAL, different diff option (not an abbreviation of `--textconv`), so it stays
-    assert mod._allowlisted(["git", "log", "--text"])[0] is True
+    # ⛔ AND THE RE-ENABLING SPELLINGS NEVER REACH THE ARGV: both are refused by exact token, and their
+    # abbreviations are `invalid option` IN GIT (measured) — so no stem rule is needed, and none is
+    # applied (an earlier revision refused every `--ex…` and thereby FALSE-BLOCKED the bounded-search
+    # primitive `git ls-files --others --exclude-standard`, which is pinned allowed below).
+    for tok in ("--ext-diff", "--textconv"):
+        assert mod._allowlisted(["git", "diff", tok])[0] is False, tok
+    for argv in (["git", "ls-files", "--others", "--exclude-standard"],
+                 ["git", "ls-files", "--exclude=*.pyc"],
+                 ["git", "log", "--extended-regexp", "--grep=one"],
+                 ["git", "log", "--text"]):
+        assert mod._allowlisted(argv)[0] is True, argv
     # ⛔ AND LAST MEANS LAST BEFORE `--`, NEVER AFTER IT. Everything following the separator is a
     # PATHSPEC, so an append past it hardens NOTHING and adds a bogus path — `git diff -- .` is an
     # ordinary invocation, so that placement would let a caller defeat the guard by accident.
-    assert mod._harden_argv(["git", "diff", "--", "src/"]) == [
-        "git", "-c", "core.fsmonitor=", "diff", "--no-ext-diff", "--no-textconv",
+    assert mod._harden_argv(["git", "diff", "--", "src/"])[-4:] == [
         "--no-ext-diff", "--no-textconv", "--", "src/"], \
         mod._harden_argv(["git", "diff", "--", "src/"])
     # `git log -p` reaches the SAME diff machinery, so it is covered with `diff`/`show`.
