@@ -4668,6 +4668,31 @@ export interface TaskRunStatusView {
   } | null;
   exit_code?: number | null;
   reason?: string;
+  /** #3155: the CHILD's composed `details` for a TERMINAL run — the SAME payload
+   * `task_collect` hands back as `view.details`, surfaced here as well so a
+   * consumer that only ever saw `task_status` can classify the run with the
+   * producer's own fields instead of guessing from the run's label.
+   *
+   * WHY THE NESTED PAYLOAD, AND NOT A FLATTENED VIEW. The run's OWN `status`
+   * maps a success-but-silent child (`exit 0`, empty stdout) to `done` — a
+   * defect closed for `task_collect` by reading the child's `exitCode` there
+   * (`classifySpawnOutcome`'s `exitCode=0 clean-empty` arm). A view without
+   * this field re-opens it for any consumer keyed on `status === "done"`.
+   *
+   * ABSENT (undefined) on a non-terminal view and on the no-record view. A
+   * consumer that must classify has to treat absence as "cannot certify",
+   * never as "nothing to see" — absence is a missing datum, not a verdict.
+   *
+   * ⛔ AND IT IS THE WHOLE COMPOSED PAYLOAD, WHICH IS NOT FREE (fresh review,
+   * measured: mean 3.1 kB, max 4.3 kB across 201 terminal records on one box,
+   * 198 of them carrying the child's bounded `stderr`). `task_status` is a
+   * POLLING verb, so a poll now carries what `task_collect` returns. That is a
+   * deliberate trade — the alternative is to narrow the payload to the keys
+   * `classifySpawnOutcome` reads, which would break the invariant that this
+   * field and `collectTaskRun(...).details` are the SAME value (pinned by a
+   * test). Kept whole, and stated here rather than left for a reader to
+   * discover from a payload dump. */
+  final_details?: Record<string, unknown> | null;
   /** Always "parent-required" — see the #1662 design constraint above. */
   review_gate: "parent-required";
   note?: string;
@@ -4715,7 +4740,10 @@ export function evaluateTaskRunStatus(
     review_gate: "parent-required" as const,
   };
   if (rec.status !== "running") {
-    return { ...base, status: rec.status, terminal: true, alive };
+    // #3155: a TERMINAL view carries the child's composed details, so the same
+    // classification `task_collect` performs is available from a `task_status`
+    // poll. See the field's doc for why the view's own `status` cannot stand in.
+    return { ...base, status: rec.status, terminal: true, alive, final_details: rec.final_details ?? null };
   }
   if (!alive) {
     // The child is gone but the settle handler has not persisted yet (a

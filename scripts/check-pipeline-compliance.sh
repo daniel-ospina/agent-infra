@@ -32,12 +32,20 @@
 #   b. SCOPING COMMENT   — linked issue has a comment with the
 #                          `<!-- issue-scoping:` marker (posted by the
 #                          issue-scoping skill)
-#   c. CODE-REVIEW EVID  — the PR body or a commit message must carry a
-#                          record-review.sh RECORD MARKER bound to THIS PR at
-#                          its CURRENT head (#1825):
-#                             review recorded: reviews/<PR>.json verdict=<v> @
-#                               <40-hex head sha>[ diff=<64hex>] (owner/repo)
-#                               [ sig=<64hex>]
+#   c. CODE-REVIEW EVID  — a HEAD-BOUND code-review record must exist for THIS
+#                          PR at its CURRENT head (#1825). THREE artifacts can
+#                          carry it, and the order is fixed (#1224):
+#                          1. the RECORD FILE, written and owned by
+#                             record-review.sh, which the PR cannot edit:
+#                             ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json
+#                                 → {pr, head_sha, verdict, repo, reviewed_at}
+#                          2. only when no record covers this head, the SAME
+#                             marker LINE as a PR COMMENT from an
+#                             OWNER/MEMBER/COLLABORATOR — the copy a body edit
+#                             cannot wipe and the only one that travels to a CI
+#                             runner with no record store;
+#                          3. only when neither answers, that marker line in the
+#                             PR body (or a commit message):
 #                          Every field is checked against the live PR: the PR
 #                          number, the repo, and the recorded sha == the PR's
 #                          current head. A bare PHRASE no longer satisfies this
@@ -65,6 +73,18 @@
 #                          OWN definition (record-review.sh::clean_low_*,
 #                          SOURCED — never restated here). Both bindings apply to
 #                          a CARRIED record too — a carry carries its verdict.
+#                          ⛔ SOURCE ORDER (#1224): the head-bound RECORD FILE
+#                          ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json is read
+#                          FIRST, and the body/commit marker is the FALLBACK. The
+#                          body is one `gh pr edit` away from any lane — an
+#                          unrelated typo fix destroyed the attestation on
+#                          agent-infra#1209 and premise-labs#3788 — while the
+#                          record cannot be edited by the PR at all. Every (c)
+#                          line PRINTS which source answered, so a green proved by
+#                          the immutable artifact is distinguishable from one
+#                          proved by a mutable field. A record whose head_sha is
+#                          NOT the head being merged is always refused, naming
+#                          both shas: a record certifies exactly one revision.
 #   d. PLAN DOC          — complexity:standard/complex issues need a plan doc:
 #                          the PR adds/modifies a file under docs/plans/*.md,
 #                          OR the scoping comment contains a `Wiring` section
@@ -551,12 +571,26 @@ CLEAN_LOW_MARKER_RE='verdict=clean-low @ [0-9a-f]{40}'
 #   that QUOTES the shape in a paragraph therefore does not satisfy (c); the
 #   remedy is to record the review, which appends the real line.
 #
-#   The here-string keeps the #836 property: no writer process is closed early,
-#   so `[[ =~ ]]` over a multi-MB body cannot race the way `grep -q` did.
-#   BASH_REMATCH is used instead of a subprocess per line — the scan is over
-#   EVERY line of a body that may carry many stale markers from earlier heads.
+#   ⛔ THE VERDICT IS TAKEN FROM THE LINE THAT MATCHED — never from the whole
+#   text (#1224 review finding: "the answering source's verdict is not the
+#   verdict of the source that matched"). The #513/#1356 verdict predicates are
+#   shape greps (`verdict=clean-micro @ [0-9a-f]{40}`, ANY 40-hex, NOT this
+#   head), and they used to run over the ENTIRE field — so ONE stale marker
+#   anywhere in it (an earlier head, another repo, an agent QUOTING the shape)
+#   pinned the verdict for this head. That was tolerable while the field was the
+#   PR body, which its author can edit; it is not tolerable once the field is the
+#   append-only comment stream, where nobody can remove the stale line. So the
+#   scan selects the MARKER LINE, and only that line's verdict is read — see
+#   review_marker_verdict below.
+#
+#   Sets REVIEW_RECORD_MATCHED_LINE / REVIEW_RECORD_MATCHED_VERDICT on success.
+#   Several bound markers can coexist at ONE head (the producer APPENDS and never
+#   removes), so the STRONGEST verdict wins: re-recording `clean` therefore
+#   supersedes a stale `clean-micro`/`clean-low` line, which is what makes the
+#   (c) refusal's own remedy actually able to clear the state.
 has_review_record() {
-  local text="$1" pr="$2" repo="$3" head="$4" line want_repo got_repo
+  local text="$1" pr="$2" repo="$3" head="$4" line want_repo got_repo v rank best_rank=0
+  REVIEW_RECORD_MATCHED_LINE=""; REVIEW_RECORD_MATCHED_VERDICT=""
   [[ -n "$pr" && -n "$repo" && -n "$head" ]] || return 1
   want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
   while IFS= read -r line; do
@@ -565,13 +599,543 @@ has_review_record() {
     [[ "${BASH_REMATCH[3]}" == "$head" ]] || continue
     got_repo="$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')"
     [[ "$got_repo" == "$want_repo" ]] || continue
-    return 0
+    v="$(review_marker_verdict "$line")"
+    rank="$(review_verdict_rank "$v")"
+    if [ "$rank" -gt "$best_rank" ]; then
+      best_rank="$rank"
+      REVIEW_RECORD_MATCHED_LINE="$line"
+      REVIEW_RECORD_MATCHED_VERDICT="$v"
+    fi
   done <<<"$text"
-  return 1
+  [ -n "$REVIEW_RECORD_MATCHED_LINE" ]
 }
 has_test_evidence() { grep -qiE "$TEST_EVIDENCE_RE" <<<"$1"; }
 has_clean_micro_marker() { grep -qE "$CLEAN_MICRO_MARKER_RE" <<<"$1"; }
 has_clean_low_marker() { grep -qE "$CLEAN_LOW_MARKER_RE" <<<"$1"; }
+
+# review_marker_verdict <bound marker line> — the verdict OF THE LINE THAT
+# MATCHED, through the same #513/#1356 SHAPE predicates the whole-text scan used
+# (so both predicates stay the single definition of "what a micro/low marker
+# looks like"), applied to ONE line.
+review_marker_verdict() {
+  if has_clean_micro_marker "$1"; then printf 'clean-micro'
+  elif has_clean_low_marker "$1"; then printf 'clean-low'
+  else printf 'clean'; fi
+}
+
+# review_verdict_rank <verdict> — clean 3 > clean-low 2 > clean-micro 1.
+# Ordering, not preference: the producer APPENDS markers and never removes one,
+# so a re-record leaves the previous line in place. Taking the STRONGEST bound
+# verdict is what lets "re-record clean" clear a stale clean-micro, which is the
+# only remedy that exists for a line in an append-only comment stream.
+review_verdict_rank() {
+  case "$1" in
+    clean)       printf '3' ;;
+    clean-low)   printf '2' ;;
+    clean-micro) printf '1' ;;
+    *)           printf '0' ;;
+  esac
+}
+
+# ── #1224 review findings: THE COMMENT ARM'S TRANSPORT AND ITS ADMISSION ─────
+#
+# Two defects, both in the arm the diff itself calls "the copy that TRAVELS" —
+# i.e. the only arm that can answer on the required `pipeline-compliance` check
+# (a clean `ubuntu-latest` runner whose $HOME has no `~/.pi/agent/reviews`).
+#
+# (1) THE SEPARATOR WAS INSIDE THE LINE THE MATCHER ANCHORS ON. The fetch
+#     terminates EVERY comment body with a raw 0x1e (`+ "\u001e"`), because the
+#     in-band separator is what proves comment boundaries. `has_review_record`
+#     scans line-wise and anchors the marker at `$` — and `record-review.sh`
+#     posts the marker as the comment's WHOLE body, with no trailing newline. So
+#     the line the gate read for the producer's own evidence comment was
+#     `review recorded: … sig=<64hex><0x1e>`, which `$` cannot match: the arm was
+#     INERT for the exact artifact the producer writes, and the red #1224 measures
+#     (agent-infra#1209, premise-labs#3788) stayed red on the only merge-blocking
+#     check while `pass 1224d` reported green — because its fixture handed over a
+#     BARE marker and bypassed the transport entirely. That is the #633 class
+#     (model the TRANSPORT, not just the URL), one file over.
+#     FIX: split the blob on the separator here (`read -d $'\036'`), the same way
+#     `has_scoping_marker` splits it with `awk -v RS='\036'`, and make the fixture
+#     build its input through the PRODUCTION shape (p1224_comment below), so a
+#     future change to the separator reds the vector instead of silently
+#     disabling the arm.
+#
+# (2) THE ARM ADMITTED ANY COMMENTer'S TEXT. `PR_COMMENTS` was `.[].body` for
+#     EVERY comment with no author filter, and `REVIEW_RECORD_MARKER_RE`'s
+#     `sig=` group is optional and never verified on that arm. On a PUBLIC repo
+#     (this one) any GitHub account can comment, so one typed line satisfied the
+#     repo's only required status check with no review behind it — the gate
+#     defeated by a party with NO write access, which IS new reach: the PR body
+#     it replaced can only be edited by someone who already has write access.
+#     FIX: the fetch now carries each comment's `author_association` in-band, and
+#     the arm admits a comment only when
+#       (a) GitHub attests its author is OWNER / MEMBER / COLLABORATOR — the
+#           byte-identical admission rule the #1224 decision comment fixes as the
+#           shared contract (`PR_EVIDENCE_COMMENTS_JQ`), so this reader admits
+#           the same evidence the other readers do; and
+#       (b) the marker is the comment's WHOLE body (that is the producer's
+#           artifact; a marker quoted inside a longer comment is a MENTION, the
+#           same distinction check (b) makes with "mentioned, not artifact"); and
+#       (c) its `sig=` verifies under the gate key WHEN one is resolvable here —
+#           the HMAC over the marker text up to ` sig=`, exactly as
+#           record-review.sh signs it and merge-one.sh::verify_any_marker checks
+#           it. When no key exists on the box the arm falls back to the
+#           association bound alone and SAYS SO in the (c) line
+#           (`source=comment … no gate key on this box`), because the required
+#           check's workflow passes no `AI_REVIEW_GATE_KEY` and this repo has no
+#           such secret: requiring a verifiable sig there would make the arm
+#           inert again, which is defect (1) all over. The association is
+#           GitHub-asserted provenance (a commenter cannot choose it), so with no
+#           key the admission is the ASSOCIATION — and that is a SUPERSET of
+#           "can already edit the body": COLLABORATOR includes read-only
+#           collaborators and MEMBER includes org members with no write access to
+#           THIS repo. ⛔ So the boundary DOES move on a keyless runner, and the
+#           honest statement is the residual, not an equivalence (review round 3
+#           finding 7): without a key, (c) is satisfiable by parties who cannot
+#           edit the PR body. A key, where present, tightens it to the key holder.
+#
+# The separator is IN-BAND, so both fields are stripped of 0x1e/0x1f before the
+# frame is built: a comment containing the delimiter must not be able to
+# fabricate a record boundary (the same rule the scoping fetch states).
+REVIEW_COMMENT_TRUSTED_ASSOC_RE='^(OWNER|MEMBER|COLLABORATOR)$'
+# The ONLY place the comments fetch expression is written. The SELF_TEST builds
+# its fixtures from the same two bytes, so the vector and production cannot
+# drift (the defect (1) above).
+REVIEW_COMMENTS_ASSOC_SEP=$'\037'
+REVIEW_COMMENTS_REC_SEP=$'\036'
+REVIEW_COMMENTS_JQ='.[] | "\(.author_association)\u001f\(.body | gsub("[\u001e\u001f]"; ""))" + "\u001e"'
+
+# review_marker_sig_ok <marker-line> <key> — the producer's marker HMAC, verified.
+# Signs the marker text UP TO (excluding) ` sig=`, exactly as
+# record-review.sh::MARKER does and merge-one.sh::verify_any_marker verifies. A
+# marker with no `sig=`, a non-hex `sig=` or a mismatch is NOT ok — fail closed.
+review_marker_sig_ok() {
+  local line="$1" key="$2" txt sig exp
+  [ -n "$key" ] || return 1
+  [[ "$line" =~ ^(.*)\ sig=([0-9a-f]{64})$ ]] || return 1
+  txt="${BASH_REMATCH[1]}"
+  sig="${BASH_REMATCH[2]}"
+  exp="$(printf '%s' "$txt" | command openssl dgst -sha256 -hmac "$key" 2>/dev/null | command awk '{print $NF}' || true)"
+  [ -n "$exp" ] && [ "$exp" = "$sig" ]
+}
+
+# has_comment_review_record <comment-blob> <pr> <owner/repo> <head>
+#   True iff the PR's comment stream carries the producer's marker for THIS PR at
+#   THIS head, from an admitted author. Sets:
+#     REVIEW_COMMENT_MATCHED_LINE    the marker line that matched
+#     REVIEW_COMMENT_MATCHED_VERDICT the verdict OF THAT LINE (never of the blob)
+#     REVIEW_COMMENT_AUTH            sig | association (WHY the author is trusted)
+#     REVIEW_COMMENT_REFUSED         why a marker-SHAPED comment was refused, for
+#                                    the refusal text ("" when none was)
+#
+#   <comment-blob> is `REVIEW_COMMENTS_JQ`'s output verbatim: one record per
+#   comment, `<author_association>\x1f<body>\x1e`.
+has_comment_review_record() {
+  local blob="$1" pr="$2" repo="$3" head="$4"
+  local rec assoc body want_repo got_repo key best_rank=0 rank v auth
+  REVIEW_COMMENT_MATCHED_LINE=""; REVIEW_COMMENT_MATCHED_VERDICT=""
+  REVIEW_COMMENT_AUTH=""; REVIEW_COMMENT_REFUSED=""
+  [[ -n "$pr" && -n "$repo" && -n "$head" ]] || return 1
+  [ -n "$blob" ] || return 1
+  want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  key="$(review_gate_key)"
+  while IFS= read -r -d "$REVIEW_COMMENTS_REC_SEP" rec; do
+    [ -n "$rec" ] || continue
+    case "$rec" in
+      *"$REVIEW_COMMENTS_ASSOC_SEP"*)
+        assoc="${rec%%"$REVIEW_COMMENTS_ASSOC_SEP"*}"
+        body="${rec#*"$REVIEW_COMMENTS_ASSOC_SEP"}" ;;
+      *)
+        # Not the production frame: refuse rather than guess an author.
+        REVIEW_COMMENT_REFUSED="a comment record carried no author_association field, so its author could not be admitted"
+        continue ;;
+    esac
+    # The marker is the comment's WHOLE body (trailing whitespace tolerated: a
+    # client that adds a newline still posts the same artifact).
+    while [[ "$body" == *[[:space:]] ]]; do body="${body%?}"; done
+    [[ "$body" =~ $REVIEW_RECORD_MARKER_RE ]] || continue
+    [[ "${BASH_REMATCH[1]}" == "$pr" ]] || continue
+    [[ "${BASH_REMATCH[3]}" == "$head" ]] || continue
+    got_repo="$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')"
+    [[ "$got_repo" == "$want_repo" ]] || continue
+    # (a) ADMISSION BY AUTHOR.
+    if ! [[ "$assoc" =~ $REVIEW_COMMENT_TRUSTED_ASSOC_RE ]]; then
+      REVIEW_COMMENT_REFUSED="its author_association is '$assoc', not OWNER/MEMBER/COLLABORATOR — on a public repo any account can comment, so an unattested commenter is not evidence"
+      continue
+    fi
+    # (c) ADMISSION BY SIGNATURE, wherever a key exists to check it against.
+    if [ -n "$key" ]; then
+      if review_marker_sig_ok "$body" "$key"; then
+        auth="sig"
+      else
+        REVIEW_COMMENT_REFUSED="its sig= does not verify under this box's gate key (missing, re-keyed, or edited after minting), so nothing binds that comment to the review gate"
+        continue
+      fi
+    else
+      auth="association"
+    fi
+    v="$(review_marker_verdict "$body")"
+    rank="$(review_verdict_rank "$v")"
+    if [ "$rank" -gt "$best_rank" ]; then
+      best_rank="$rank"
+      REVIEW_COMMENT_MATCHED_LINE="$body"
+      REVIEW_COMMENT_MATCHED_VERDICT="$v"
+      REVIEW_COMMENT_AUTH="$auth"
+    fi
+  done <<<"$blob"
+  [ -n "$REVIEW_COMMENT_MATCHED_LINE" ]
+}
+
+# ── #1224: THREE SOURCES, IN ONE FIXED ORDER — RECORD → COMMENT → BODY ──────
+#
+# THE DEFECT THIS REMOVES FROM THE TRUST PATH. `record-review.sh` mints THREE
+# artifacts for one review and they are NOT interchangeable:
+#   1. the record FILE (`~/.pi/agent/reviews/<owner>-<repo>-<PR>.json`), carrying
+#      `head_sha`, `verdict` and now a `sig` — head-bound, PR-ineditable, and
+#      PER BOX;
+#   2. a signed MARKER LINE appended to the PR BODY;
+#   3. a PR COMMENT carrying that same signed marker line.
+# The body is one `gh pr edit` away from anybody — an unrelated typo fix, a
+# corrected claim, the closing keyword `pipeline-compliance` demands — while the
+# file cannot be edited by the PR at all. Measured 2026-09-18: agent-infra#1209 and
+# premise-labs#3788 both went RED on a genuinely reviewed head because the body had
+# been improved after the review. So the RECORD is read first.
+#
+# ⛔ WHY THE COMMENT IS BETWEEN THEM, AND NOT AN OPTIONAL EXTRA. The record store
+# is `$HOME/.pi/agent/reviews` — the required `pipeline-compliance` check runs on a
+# clean `ubuntu-latest` runner, where that directory does not exist, so the record
+# arm can NEVER answer there and the measured red would stay red on the only check
+# that blocks a merge. The comment is the copy that TRAVELS; it is also a WIDER
+# write field than the body (on a public repo any account can comment, where a
+# body edit needs write access), so it carries its own admission rule —
+# author_association ∈ OWNER/MEMBER/COLLABORATOR, plus the marker `sig` wherever a
+# gate key is resolvable on the box (the CI runner passes none, and a sig-only arm
+# there would be inert again). See has_comment_review_record.
+#
+# ⛔ NEVER RE-ORDERED, and never silently: which source answered is PRINTED on
+# every (c) arm (`source=record (…)` / `source=comment (…)` / `source=body (…)`),
+# so a reader can tell a green proved by an immutable artifact from one proved by a
+# mutable field — and a red that reports what each arm actually read.
+#
+# ⛔ THIS MAKES THE BODY AUTHORITATIVE NOWHERE. The fallback keeps every existing
+# binding (PR number, repo, head, #513 tier, #1356 shape) so no in-flight PR
+# loses its only surviving copy, and the tier bindings are applied to the
+# verdict OF THE SOURCE THAT ANSWERED. An in-flight PR whose only record is the
+# body still passes, and still prints `source=body`.
+#
+# ⛔ AND A PRE-#1224 RECORD IS NO LONGER EVIDENCE. The record arm requires a `sig`
+# over the four fields the gate reads (see below), so every record minted before
+# that requirement — including every record already sitting on a box — is refused
+# and the gate falls through to the comment, then the body. That is a behaviour
+# change, not an accident: an unsigned private file nobody can audit is exactly
+# the artifact that was unacceptable. Re-running the producer mints a signed one.
+#
+# ⛔ THE HEAD COMPARISON IS THE WHOLE POINT. A record bound to a different
+# revision is the STALE class: accepting it would certify an unreviewed head, so
+# it is refused BY NAME, with both shas printed.
+#
+# Fail closed everywhere: an absent file, an unreadable field, a `verdict`
+# outside the accepted set, or an empty head are all NON-evidence — the arms
+# below refuse rather than degrade to "close enough".
+REVIEW_STORE_VERDICTS_RE='^(clean|clean-micro|clean-low)$'
+
+# ── #1224 review finding 3: THE RECORD MUST BE AUTHENTICATED ─────────────────
+#
+# A record FILE is a PRIVATE, per-box artifact. Unlike the body marker it leaves
+# NO trace on the PR — no body line, no comment, nothing `gh` or a human reviewer
+# can audit. Before this guard, the gate accepted any file at the store path whose
+# `verdict`/`repo`/`head_sha` fields read correctly, so
+#   printf '{"pr":1,"head_sha":"<head>","verdict":"clean","repo":"o/r"}' > ~/.pi/agent/reviews/o-r-1.json
+# satisfied check (c) with nothing to see afterwards. That is BELOW the bar the
+# producer already sets for the artifact that DOES travel: `record-review.sh`
+# signs its marker with HMAC-SHA256 under AI_REVIEW_GATE_KEY precisely so a
+# `sig=<64 zeros>` shape cannot be adopted (#784/#2055/#2872). An unauthenticated
+# primary source that nobody can observe is the worse half of the same problem.
+#
+# So a record is EVIDENCE only when its `sig` verifies under the gate key. The
+# producer writes it (`record_sig_for`); the canonical text is
+#   review-record:v1:<pr>:<head_sha>:<verdict>:<repo>
+# — a FIXED-ORDER field list, NOT the record's on-disk bytes. That is deliberate:
+# RFC 8785 (JSON Canonicalization Scheme) exists because "cryptographic
+# operations like hashing and signing need the data to be expressed in an
+# invariant format"; the record file is written by a `printf` whose optional
+# fields (diff_sha256, merge_base, mint, evidence) reorder the byte layout for
+# different mints of the SAME identity, so signing the serialization would make
+# a legitimate record unverifiable for a reason unrelated to its content. The
+# fields are exactly the four the gate acts on, so the signature covers the
+# verdict and the revision it certifies — nothing the gate reads is outside it.
+#
+# FAIL CLOSED on every arm: no `sig` field, a `sig` that is not 64 hex, no gate
+# key on this box, and a `sig` that does not verify are all NON-evidence. The
+# body/comment fallback below is what keeps a PR from being stranded by that.
+REVIEW_RECORD_SIG_RE='^[0-9a-f]{64}$'
+
+# review_gate_key — the HMAC key, env first then the producer's key file. Same
+# resolution order as record-review.sh, so a gate and a producer on one box
+# agree by construction. Prints "" when unconfigured (the caller fails closed).
+review_gate_key() {
+  local k="${AI_REVIEW_GATE_KEY:-}"
+  if [ -z "$k" ] && [ -f "${HOME:-/nonexistent}/.pi/agent/.ai-review-gate-key" ]; then
+    k="$(cat "${HOME:-/nonexistent}/.pi/agent/.ai-review-gate-key" 2>/dev/null || true)"
+  fi
+  printf '%s' "$k" | tr -d '[:space:]'
+}
+
+# review_record_sig_text <pr> <head> <verdict> <repo> — the canonical signed text.
+# ONE definition, here, and the SELF_TEST pins it against the producer's copy so a
+# divergence reds the suite instead of silently refusing every record.
+review_record_sig_text() { printf 'review-record:v1:%s:%s:%s:%s' "$1" "$2" "$3" "$4"; }
+
+# review_store_candidates <pr> <owner/repo> — the record paths, qualified first.
+# The producer writes the repo-QUALIFIED name and keeps a legacy `<pr>.json`
+# until a qualified record for the same repo migrates it (#426), so both are
+# read (a box mid-migration must not read as "no evidence"); the qualified name
+# wins because it is the one the producer maintains. The repo spelling is
+# lowercased for the file name only — `has_review_record` already compares repo
+# case-insensitively, and GitHub repo names are case-insensitive.
+review_store_candidates() {
+  local pr="$1" repo="$2" slug
+  [ -n "$pr" ] && [ -n "$repo" ] || return 0
+  slug="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  printf '%s\n' \
+    "${HOME:-/nonexistent}/.pi/agent/reviews/${slug%/*}-${slug#*/}-$pr.json" \
+    "${HOME:-/nonexistent}/.pi/agent/reviews/${repo%/*}-${repo#*/}-$pr.json" \
+    "${HOME:-/nonexistent}/.pi/agent/reviews/$pr.json"
+}
+
+# review_record_field <file> <field> — the record's raw string value, "" if absent.
+# Same idiom the record's other consumers use (merge-one.sh::record_at_head,
+# admin-merge.sh's update-safety read): a flat `"key":"value"` scan, so a
+# record whose fields are in a different ORDER still reads. ⛔ It reads NOTHING
+# from a record re-serialised with spaces around the colon (`"head_sha": "…"`)
+# — that yields empty, which every caller treats as NON-evidence: a fail-closed
+# miss, never a pass on a field we could not read. The producer writes compact
+# JSON, and this refuses rather than guesses if that ever changes.
+review_record_field() {
+  local f="$1" key="$2"
+  sed -n 's/.*"'"$key"'":"\([^"]*\)".*/\1/p' "$f" 2>/dev/null | command head -1
+}
+
+# review_record_eval <file> <pr> <owner/repo> <head> — prints the record's
+# verdict and returns 0 iff <file> is EVIDENCE for this PR at this head.
+#
+# ONE implementation BOTH accepts and explains (the reviewer's finding 4): on a
+# refusal it prints nothing and sets REVIEW_RECORD_REJECT_REASON to the one fact
+# that refused the file, so the refusal text can never assert a cause the check
+# never evaluated. Before this, the gate printed "record absent" for a record
+# that was present-but-unusable — unprovability it had not verified.
+#
+# ⛔ THE HEAD BINDING IS THE WHOLE POINT, and it is load-bearing: with the
+# comparison neutered a record for an OLDER head is accepted and check (c)
+# certifies an unreviewed revision (the SELF_TEST's 1224b mutation flips exactly
+# that arm). The signature binding (below it) is the second load-bearing arm —
+# the 1224e mutation flips that one.
+review_record_eval() {
+  local f="$1" pr="$2" repo="$3" head="$4"
+  local verdict rec_repo sha want_repo sig expect key
+  REVIEW_RECORD_REJECT_REASON=""
+  if [ ! -f "$f" ]; then
+    REVIEW_RECORD_REJECT_REASON="no file"
+    return 1
+  fi
+  verdict="$(review_record_field "$f" verdict)"
+  if ! [[ "$verdict" =~ $REVIEW_STORE_VERDICTS_RE ]]; then
+    REVIEW_RECORD_REJECT_REASON="its verdict is '${verdict:-<absent>}', not one of clean|clean-micro|clean-low"
+    return 1
+  fi
+  # A record that NAMES another repo is not this PR's, however its number reads —
+  # PR numbers collide across repos, and the legacy `<pr>.json` candidate is
+  # shared by all of them.
+  #
+  # ⛔ AN ABSENT `repo` IS NOT A MATCH, IT IS AN ABSENCE OF BINDING (review finding
+  # 5). This used to fall through as "the legacy shape (#426), accepted on the head
+  # binding alone" — and the measured consequence was that ONE signed repo-less file
+  # (`reviews/9.json`) answered for `daniel-ospina/agent-infra#9` AND for
+  # `premise-labs/tortoise#9` at the same head, because the signature covers an
+  # EMPTY repo slot and therefore verifies. The producer writes `repo` on every
+  # mint whose REPO is set, and a record is evidence here ONLY with a verifiable
+  # sig= (#1224) — so the legacy acceptance protected only the REPO-LESS SIGNED
+  # record, which the producer really emits on a repo-less mint and which verifies
+  # because the signature covers an EMPTY repo slot. That is the fail-open this
+  # refusal closes, and it is pinned by vector 1224o + mutation G.
+  rec_repo="$(review_record_field "$f" repo)"
+  want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  if [ -z "$rec_repo" ]; then
+    REVIEW_RECORD_REJECT_REASON="it carries NO repo field, so it binds no repository — PR numbers collide across repos, and a repo-less record would answer for every repo's PR of the same number"
+    return 1
+  fi
+  if [ "$(printf '%s' "$rec_repo" | tr 'A-Z' 'a-z')" != "$want_repo" ]; then
+    REVIEW_RECORD_REJECT_REASON="it names repo '$rec_repo', not '$repo' (PR numbers collide across repos)"
+    return 1
+  fi
+  sha="$(review_record_field "$f" head_sha)"
+  # ⛔ `if [ … ]; then` on its own line, NOT `[ … ] || continue`: the SELF_TEST's
+  # 1224b mutation neutralises THIS test by name, and a one-liner guard would be
+  # silently skipped by a regex that no longer matches (a mutation that reports
+  # itself blind is a mutation that proves nothing).
+  if [ "$sha" != "$head" ]; then
+    REVIEW_RECORD_REJECT_REASON="its head_sha is '${sha:-<absent>}', not this head"
+    return 1
+  fi
+  # THE AUTHENTICITY ARM (#1224 finding 3). See the REVIEW_RECORD_SIG_RE block.
+  #
+  # ⛔ The signed text covers the record's OWN `head_sha`, not the live head: the
+  # signature attests "this file says <pr, head, verdict, repo>", and the guard
+  # directly above attests "that head is the one merging". Making the canonical
+  # text use the LIVE head would fold both assertions into one — the suite could
+  # then not tell which arm refused, and the head binding would go untested
+  # behind a signature that fails for the same reason (measured: the 1224b
+  # mutation read as "not caught" until this was split).
+  sig="$(review_record_field "$f" sig)"
+  if [ -z "$sig" ]; then
+    REVIEW_RECORD_REJECT_REASON="it carries no sig= field, so nothing binds its content to the review gate (every pre-#1224 record, and any hand-written one)"
+    return 1
+  fi
+  if ! [[ "$sig" =~ $REVIEW_RECORD_SIG_RE ]]; then
+    REVIEW_RECORD_REJECT_REASON="its sig= field is not a sha256 hex digest"
+    return 1
+  fi
+  key="$(review_gate_key)"
+  if [ -z "$key" ]; then
+    REVIEW_RECORD_REJECT_REASON="its signature cannot be VERIFIED — no AI_REVIEW_GATE_KEY in the environment or at ~/.pi/agent/.ai-review-gate-key on this box, so the record is unauthenticated rather than merely unproven"
+    return 1
+  fi
+  expect="$(printf '%s' "$(review_record_sig_text "$pr" "$sha" "$verdict" "$rec_repo")" \
+    | command openssl dgst -sha256 -hmac "$key" 2>/dev/null | command awk '{print $NF}' || true)"
+  if [ "$expect" != "$sig" ]; then
+    REVIEW_RECORD_REJECT_REASON="its sig= does not verify under this box's gate key — written under a different key, edited after minting, or minted for a different revision"
+    return 1
+  fi
+  printf '%s' "$verdict"
+}
+
+# review_record_at_head <pr> <owner/repo> <head> — prints "<path> <verdict>" and
+# returns 0 iff a RECORD for this PR is EVIDENCE at exactly this head.
+review_record_at_head() {
+  local pr="$1" repo="$2" head="$3" f verdict
+  [ -n "$pr" ] && [ -n "$repo" ] && [ -n "$head" ] || return 1
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    [ -f "$f" ] || continue
+    if verdict="$(review_record_eval "$f" "$pr" "$repo" "$head")"; then
+      printf '%s %s\n' "$f" "$verdict"
+      return 0
+    fi
+  done < <(review_store_candidates "$pr" "$repo")
+  return 1
+}
+
+# resolve_review_evidence <evid-text> <pr> <owner/repo> <head> [<comment-text>]
+#   Returns 0 iff a HEAD-BOUND source was found, and sets:
+#     REVIEW_EVIDENCE_SOURCE          record | comment | body
+#     REVIEW_EVIDENCE_VERDICT         clean | clean-micro | clean-low
+#     REVIEW_EVIDENCE_WHERE           the record path, "PR comments", or
+#                                     "PR body/commit messages"
+#     REVIEW_EVIDENCE_STALE_PATH/SHA  a record present at ANOTHER head (refused,
+#                                     reported) — "" when there is none
+#     REVIEW_EVIDENCE_RECORD_PRESENT  the first record file seen for this PR,
+#                                     even when unusable (so a refusal can say
+#                                     "a file exists but is not evidence")
+#     REVIEW_EVIDENCE_RECORD_REASON   WHY that file is not evidence, produced by
+#                                     the same review_record_eval that refused it
+#     REVIEW_EVIDENCE_COMMENT_AUTH    sig | association — WHY the comment arm
+#                                     trusted the comment it read ("" when the
+#                                     comment arm did not answer)
+#     REVIEW_EVIDENCE_COMMENT_REFUSED why a marker-SHAPED comment was refused
+#                                     (unauthorised author, unverifiable sig) —
+#                                     so a refusal can report what it evaluated
+#   Order is RECORD → COMMENT → BODY.
+#
+#   ⛔ WHY THE COMMENT ARM EXISTS (#1224 review finding 2, the P1). The record
+#   store is `$HOME/.pi/agent/reviews` — PER BOX. The required `pipeline-compliance`
+#   check runs on a clean `ubuntu-latest` runner, where nothing materializes that
+#   directory, so the record arm can never answer there and #1224's measured red
+#   (agent-infra#1209, premise-labs#3788) would stay RED on the only check that
+#   blocks a merge. Issue #1224 records option (a) — gate reads the record file —
+#   as the recommendation with option (b) "post the attestation as a COMMENT… a
+#   body edit cannot wipe one" as its documented fallback; this is (a) as the
+#   PRIMARY source plus (b) as the source that TRAVELS, which is what reaching
+#   the reported population requires. The comment is append-only in practice, so
+#   the `gh pr edit` that wiped #1209 cannot reach it, and unlike the record file
+#   it is PUBLIC — it leaves an audit trail in the same place the body marker did.
+#
+#   ⛔ AND IT IS NOT "THE SAME AS THE BODY ARM". It is a WIDER field — on a public
+#   repo any GitHub account can comment, where the body needs write access — so it
+#   carries its OWN admission rule (author_association ∈ OWNER/MEMBER/COLLABORATOR,
+#   plus the marker sig wherever a key exists to verify it).
+#   `has_comment_review_record` states what that rule closes and why it is not
+#   simply "require a sig": the required check's workflow passes no gate key, so
+#   a sig-only arm would be INERT there — the defect it was meant to fix.
+#
+#   ⛔ AND THE VERDICT IS THE MATCHED LINE'S, on every arm — see
+#   review_marker_verdict. Reading it from the whole field let one stale marker
+#   (any 40-hex, any head) set the tier binding for THIS head, which on an
+#   append-only comment stream could not be undone.
+#
+#   The body arm keeps the pre-#1224 matcher (`has_review_record`) with its legacy
+#   unsigned tolerance, so an in-flight PR is not stranded: nothing about what a
+#   BODY marker must say changed here — only which artifact is consulted first.
+resolve_review_evidence() {
+  local text="$1" pr="$2" repo="$3" head="$4" comments="${5:-}" hit path verdict f sha
+  REVIEW_EVIDENCE_SOURCE=""; REVIEW_EVIDENCE_VERDICT=""; REVIEW_EVIDENCE_WHERE=""
+  REVIEW_EVIDENCE_STALE_PATH=""; REVIEW_EVIDENCE_STALE_SHA=""; REVIEW_EVIDENCE_RECORD_PRESENT=""
+  REVIEW_EVIDENCE_RECORD_REASON=""; REVIEW_EVIDENCE_COMMENT_AUTH=""; REVIEW_EVIDENCE_COMMENT_REFUSED=""
+  [ -n "$pr" ] && [ -n "$repo" ] && [ -n "$head" ] || return 1
+  # 1. THE IMMUTABLE SOURCE.
+  if hit="$(review_record_at_head "$pr" "$repo" "$head")"; then
+    path="${hit% *}"; verdict="${hit##* }"
+    REVIEW_EVIDENCE_SOURCE="record"
+    REVIEW_EVIDENCE_VERDICT="$verdict"
+    REVIEW_EVIDENCE_WHERE="$path"
+    REVIEW_EVIDENCE_RECORD_PRESENT="$path"
+    return 0
+  fi
+  # Remember what was there for the refusal text: a record at another head, a
+  # record that is not evidence, and no record at all are THREE different facts,
+  # and only one of them is fixed by re-recording. The reason comes from the same
+  # review_record_eval that refused the file, so it cannot assert a cause the
+  # check never evaluated.
+  while IFS= read -r f; do
+    [ -n "$f" ] && [ -f "$f" ] || continue
+    if [ -z "$REVIEW_EVIDENCE_RECORD_PRESENT" ]; then
+      REVIEW_EVIDENCE_RECORD_PRESENT="$f"
+      review_record_eval "$f" "$pr" "$repo" "$head" >/dev/null || true
+      REVIEW_EVIDENCE_RECORD_REASON="$REVIEW_RECORD_REJECT_REASON"
+    fi
+    sha="$(review_record_field "$f" head_sha)"
+    if [ -n "$sha" ] && [ "$sha" != "$head" ]; then
+      REVIEW_EVIDENCE_STALE_PATH="$f"; REVIEW_EVIDENCE_STALE_SHA="$sha"
+      break
+    fi
+  done < <(review_store_candidates "$pr" "$repo")
+  # 2. THE SOURCE THAT TRAVELS — the PR comment the producer posts beside the body
+  #    marker. NOT the same matcher: comment bodies arrive in the fetch's frame
+  #    (`<association>\x1f<body>\x1e`) and are admitted by AUTHOR and by SIGNATURE,
+  #    because a comment — unlike the body it backs up — can be written by any
+  #    account on a public repo. The bindings (PR, repo, head) and the verdict
+  #    rule (the matched LINE, never the blob) are identical to the other arms;
+  #    see has_comment_review_record for the two defects this closes.
+  if has_comment_review_record "${comments:-}" "$pr" "$repo" "$head"; then
+    REVIEW_EVIDENCE_SOURCE="comment"
+    REVIEW_EVIDENCE_VERDICT="$REVIEW_COMMENT_MATCHED_VERDICT"
+    REVIEW_EVIDENCE_COMMENT_AUTH="$REVIEW_COMMENT_AUTH"
+    case "$REVIEW_EVIDENCE_COMMENT_AUTH" in
+      sig) REVIEW_EVIDENCE_WHERE="PR comments, sig verified" ;;
+      *)   REVIEW_EVIDENCE_WHERE="PR comments, from a trusted author_association (no gate key on this box to verify sig=)" ;;
+    esac
+    return 0
+  fi
+  REVIEW_EVIDENCE_COMMENT_REFUSED="${REVIEW_COMMENT_REFUSED:-}"
+  # 3. THE LAST-RESORT FALLBACK — the PR body / commit messages, unchanged bindings.
+  if has_review_record "$text" "$pr" "$repo" "$head"; then
+    REVIEW_EVIDENCE_SOURCE="body"
+    REVIEW_EVIDENCE_WHERE="PR body/commit messages"
+    REVIEW_EVIDENCE_VERDICT="$REVIEW_RECORD_MATCHED_VERDICT"
+    return 0
+  fi
+  return 1
+}
 
 # ── #3315: CHECK (c) CONSULTS THE CARRY — one predicate, not two readers ────
 #
@@ -619,6 +1183,49 @@ has_clean_low_marker() { grep -qE "$CLEAN_LOW_MARKER_RE" <<<"$1"; }
 # that is why the allow-list below is exactly one pair (exit 0 + token `carry`)
 # and everything else fails closed.
 #
+# admitted_comment_marker_text <blob> <pr> <repo>
+#   Print the marker bodies of PR COMMENTS that pass the SAME admission the
+#   head-bound comment arm applies — author_association in
+#   OWNER/MEMBER/COLLABORATOR, plus a verifiable sig= wherever a gate key exists —
+#   as one marker per line, at ANY head.
+#
+#   WHY THE CARRY NEEDS THIS. On the runner the required check runs on there is no
+#   review store, so a marker that travelled can only be a COMMENT (that is #1224's
+#   whole point), and a PR whose BODY was edited — the measured defect — holds its
+#   only surviving marker there. A carry arm that read only the body and the commit
+#   messages would therefore refuse to carry exactly the population the comment
+#   channel exists for. The admission rule is NOT restated: it is the same author
+#   set and the same sig arm as has_comment_review_record, applied to the same
+#   production frame, so a comment admitted here is one the head-bound arm would
+#   have admitted at its own head.
+admitted_comment_marker_text() { # <blob> <pr> <repo>
+  local blob="$1" pr="$2" repo="$3"
+  local rec assoc body want_repo got_repo key
+  [[ -n "$blob" && -n "$pr" && -n "$repo" ]] || return 0
+  want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
+  key="$(review_gate_key)"
+  while IFS= read -r -d "$REVIEW_COMMENTS_REC_SEP" rec; do
+    [ -n "$rec" ] || continue
+    case "$rec" in
+      *"$REVIEW_COMMENTS_ASSOC_SEP"*)
+        assoc="${rec%%"$REVIEW_COMMENTS_ASSOC_SEP"*}"
+        body="${rec#*"$REVIEW_COMMENTS_ASSOC_SEP"}" ;;
+      *) continue ;;
+    esac
+    while [[ "$body" == *[[:space:]] ]]; do body="${body%?}"; done
+    [[ "$body" =~ $REVIEW_RECORD_MARKER_RE ]] || continue
+    [[ "${BASH_REMATCH[1]}" == "$pr" ]] || continue
+    got_repo="$(printf '%s' "${BASH_REMATCH[5]}" | tr 'A-Z' 'a-z')"
+    [[ "$got_repo" == "$want_repo" ]] || continue
+    [[ "$assoc" =~ $REVIEW_COMMENT_TRUSTED_ASSOC_RE ]] || continue
+    if [ -n "$key" ]; then
+      review_marker_sig_ok "$body" "$key" || continue
+    fi
+    printf '%s\n' "$body"
+  done <<<"$blob"
+  return 0
+}
+
 # review_record_carry_candidates <text> <pr> <repo> <current-head>
 #   Print "<prior-head>\t<diff_sha256|->", ONE LINE PER marker bound to THIS PR
 #   and THIS repo at a head that is NOT the current one, NEWEST FIRST. Always
@@ -642,7 +1249,7 @@ has_clean_low_marker() { grep -qE "$CLEAN_LOW_MARKER_RE" <<<"$1"; }
 #   marker for another PR or another repo is not a candidate at all (#426).
 review_record_carry_candidates() {
   local text="$1" pr="$2" repo="$3" head="$4" line want_repo got_repo i
-  local -a heads=() diffs=()
+  local -a heads=() diffs=() verds=()
   [[ -n "$pr" && -n "$repo" && -n "$head" ]] || return 0
   want_repo="$(printf '%s' "$repo" | tr 'A-Z' 'a-z')"
   while IFS= read -r line; do
@@ -653,17 +1260,22 @@ review_record_carry_candidates() {
     [[ "$got_repo" == "$want_repo" ]] || continue
     heads+=("${BASH_REMATCH[3]}")
     diffs+=("${BASH_REMATCH[4]# diff=}")
+    # The candidate's OWN tier, from the SAME line-bound predicate the head-bound
+    # arms use, so a carried record is graded on its own verdict rather than on a
+    # stale clean-micro elsewhere in the append-only marker stream (#1224/#1224c).
+    verds+=("$(review_marker_verdict "$line")")
   done <<<"$text"
   # Append order IS the marker order, so the last match is the newest.
   for (( i=${#heads[@]}-1; i>=0; i-- )); do
-    printf '%s\t%s\n' "${heads[i]}" "${diffs[i]:--}"
+    printf '%s\t%s\t%s\n' "${heads[i]}" "${diffs[i]:--}" "${verds[i]:-}"
   done
   return 0
 }
 
 # c_carry_resolve <pr-body> <commit-messages> <pr> <repo> <current-head>
 #   Resolve check (c)'s carry question over EVERY candidate marker. On success
-#   sets C_CARRIED_HEAD / C_CARRIED_DIFF; otherwise C_CARRY_WHY (the NEWEST
+#   sets C_CARRIED_HEAD / C_CARRIED_DIFF / C_CARRIED_VERDICT (the carried line's
+#   own tier, so the tier bindings are graded on it); otherwise C_CARRY_WHY (the NEWEST
 #   candidate's refusal — that is the diagnosis a lane needs) and
 #   C_NODIGEST_HEAD (the newest digest-less marker). Returns:
 #     0  CARRIED — some candidate's own diff is what would merge (the producer's
@@ -675,15 +1287,19 @@ review_record_carry_candidates() {
 #   a hundred stale markers cannot turn the required check into a hundred `gh`
 #   walks. The bound is on COST, never on correctness — the newest candidates are
 #   the ones tried, and exhausting it is REPORTED as a refusal.
-c_carry_resolve() {
-  local body="$1" commits="$2" pr="$3" repo="$4" head="$5"
-  local cands ph pd n=0 tried=0 nodhead="" why="" whyhead=""
-  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""; C_REFUSED_HEAD=""
-  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""
+c_carry_resolve() { # <pr-body> <commit-messages> <pr> <repo> <current-head> [<admitted-comment-markers>]
+  local body="$1" commits="$2" pr="$3" repo="$4" head="$5" ctext="${6:-}"
+  local cands ph pd pv n=0 tried=0 nodhead="" why="" whyhead="" relay=""
+  C_CARRIED_HEAD=""; C_CARRIED_DIFF=""; C_CARRIED_VERDICT=""; C_CARRY_WHY=""; C_NODIGEST_HEAD=""; C_REFUSED_HEAD=""; C_CARRY_RELAY=""
+  # The PR body first, then commit messages, then the ADMITTED comment markers —
+  # the same precedence the head-bound resolution uses, minus the record file (a
+  # record cannot be carried by content identity alone: it carries no marker, and
+  # the producer's own carry re-binds THROUGH the marker it verifies).
   cands="$(review_record_carry_candidates "$body" "$pr" "$repo" "$head"
-           review_record_carry_candidates "$commits" "$pr" "$repo" "$head")"
+           review_record_carry_candidates "$commits" "$pr" "$repo" "$head"
+           review_record_carry_candidates "$ctext" "$pr" "$repo" "$head")"
   [[ -n "$cands" ]] || return 1
-  while IFS=$'\t' read -r ph pd; do
+  while IFS=$'\t' read -r ph pd pv; do
     [[ -n "$ph" ]] || continue
     if [[ -z "$pd" || "$pd" == "-" ]]; then
       if [[ -z "$nodhead" ]]; then nodhead="$ph"; fi
@@ -698,14 +1314,20 @@ c_carry_resolve() {
     fi
     tried=$((tried + 1))
     if c_carry_ask "$pr" "$repo" "$ph" "$pd"; then
-      C_CARRIED_HEAD="$ph"; C_CARRIED_DIFF="$pd"
+      C_CARRIED_HEAD="$ph"; C_CARRIED_DIFF="$pd"; C_CARRIED_VERDICT="$pv"
       return 0
     fi
     # The FIRST refusal is the NEWEST candidate's — a reason from a marker
-    # further down the list would describe evidence that is not the newest.
-    if [[ -z "$why" ]]; then why="$C_CARRY_WHY"; whyhead="$ph"; fi
+    # further down the list would describe evidence that is not the newest. The producer's
+    # red-group lines travel WITH that reason, so they are stashed here and relayed once below:
+    # printing them per ask would repeat the block and could leave groups above a message that
+    # describes a different candidate's cause (#3440 review, nit 4).
+    if [[ -z "$why" ]]; then why="$C_CARRY_WHY"; whyhead="$ph"; relay="$C_CARRY_RELAY"; fi
   done <<<"$cands"
   C_CARRY_WHY="$why"; C_NODIGEST_HEAD="$nodhead"; C_REFUSED_HEAD="$whyhead"
+  # ONCE, immediately above the refusal that check (c) will print — which is what makes that
+  # refusal's "named in the producer's own output above" true. Empty for every non-surface cause.
+  c_carry_relay_red "$relay"
   if [[ "$tried" -gt 0 ]]; then
     if [[ -z "$C_CARRY_WHY" ]]; then
       C_CARRY_WHY="the carry predicate could not be run for any candidate marker"
@@ -724,22 +1346,69 @@ c_carry_resolve() {
 #   ⛔ FAIL-CLOSED POLARITY, NOT A VOCABULARY MATCH. The pass condition is an
 #   ALLOW-LIST of one; an unknown token, an empty answer, a usage error, a
 #   recorder that is absent or unreadable, or a token paired with the wrong exit
-#   code is a REFUSAL. That is deliberate: `--check-carry` documents seven
-#   verdicts today, and a producer that grows an eighth must not be able to make
+#   code is a REFUSAL. That is deliberate: `--check-carry` documents TEN
+#   verdicts today, and a producer that grows an eleventh must not be able to make
 #   this gate green by having produced a token nobody here classified.
+#   (#3440) The allow-list is now TWO tokens, both named explicitly: `carry` and
+#   `red-base-owned` (the record covers the artifact and the only reds reproduce on
+#   the base — which this gate already passed over, silently, before it read the
+#   surface at all). `red-surface` (exit 7) and `surface-unknown` (exit 8) REFUSE,
+#   each with its own diagnosis.
 #   ⛔ THE ANSWER MUST ALSO BE THE PRODUCER'S, NOT A LOOKALIKE. `--recorded-diff`
 #   is a verb this gate can only get from a producer at this revision; a recorder
 #   too old to understand it exits 2 with no verdict line, which lands on the
 #   catch-all refusal and names the tooling fault instead of grading the PR.
+
+# c_carry_relay_red <producer-stderr-text> — echo the producer's own red-group lines into THIS
+# gate's output. `record-review.sh --check-carry` writes the groups it is accepting or refusing to
+# stderr; for a required status check (GATE mode) that is the only place an operator can learn
+# WHICH check is failing, so discarding it left the gate's own "named in the producer's output
+# above" claim with nothing above it (#3440 review of `554d272`, P2). NO PIPE (#841/#864): a
+# here-string feeds the loop.
+c_carry_relay_red() { # <producer-stderr-text>
+  local ln=""
+  [[ -n "$1" ]] || return 0
+  while IFS= read -r ln; do
+    case "$ln" in
+      *"Red group(s):"* | *"You are accepting:"*) echo "      $ln" ;;
+    esac
+  done <<< "$1"
+}
+
 c_carry_ask() {
-  local pr="$1" repo="$2" rh="$3" rd="$4" out="" rc=0 tok="" recd="" live=""
+  local pr="$1" repo="$2" rh="$3" rd="$4" out="" rc=0 tok="" recd="" live="" cerr="" errf=""
   C_CARRY_TOKEN=""
   C_CARRY_WHY=""
+  # The producer's red-group lines, for the CALLER to relay once (see C_CARRY_RELAY in
+  # c_carry_resolve). Relaying them here instead would print them once PER CANDIDATE ASKED and,
+  # worse, above a refusal whose reason came from a DIFFERENT candidate — so the text would
+  # contradict the message it is supposed to support (#3440 review, nit 4).
+  C_CARRY_RELAY=""
   if [[ ! -f "$RECORDER" || ! -r "$RECORDER" ]]; then
     C_CARRY_WHY="the carry predicate could not be EXECUTED — record-review.sh is not readable beside this gate (looked at $RECORDER), so whether the reviewed diff is unchanged is UNVERIFIABLE, and an unverifiable carry is refused"
     return 1
   fi
-  out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>/dev/null)" || rc=$?
+  # ⛔ THE PRODUCER'S STDERR IS KEPT, NOT THROWN AWAY (#3440 review of `554d272`, P2). Two
+  # messages below tell the operator the red groups were "named in the producer's own output
+  # above" — while this line used to discard that output with `2>/dev/null`. `record-review.sh`
+  # writes every red-group line to STDERR, so in GATE mode (the population where check (c) is a
+  # required status check and no rail re-measures anything) the one datum an operator needs was
+  # never present. Capture it here and relay it in the red arms below, which is what makes those
+  # claims TRUE rather than merely reassuring.
+  errf="$(mktemp "${TMPDIR:-/tmp}/pcc-carry-ask.XXXXXX" 2>/dev/null)" || errf=""
+  if [[ -n "$errf" ]]; then
+    out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>"$errf")" || rc=$?
+    cerr="$(command cat "$errf" 2>/dev/null || true)"
+    command rm -f "$errf" 2>/dev/null || true
+  else
+    # No temp file: fall back to discarding, and the relay below is simply empty. A read builtin
+    # is used instead of a pipeline throughout — a producer piped into a quiet reader can take
+    # SIGPIPE under this repo's `pipefail` (#841/#864).
+    out="$(bash "$RECORDER" --check-carry "$pr" "$repo" --recorded-diff "$rd" --recorded-head "$rh" 2>/dev/null)" || rc=$?
+  fi
+  # Relay ONLY the lines that NAME a group (or name the set being accepted). Everything else on the
+  # producer's stderr is its own diagnostic and would drown the gate's output; a transport warning
+  # must not be dressed up as a finding either.
   if [[ -n "$out" ]]; then
     # The producer's documented line, FIRST line only: `<verdict>\t<record
     # digest|->\t<live digest|status>`. A recorder that printed diagnostics
@@ -750,6 +1419,27 @@ c_carry_ask() {
   C_CARRY_TOKEN="$tok"
   if [[ "$rc" -eq 0 && "$tok" == "carry" ]]; then
     C_CARRY_WHY="diff unchanged"
+    return 0
+  fi
+  # (#3440) `red-base-owned` PASSES, and this is NOT a weakening: before #3440 this
+  # gate never read the check surface at all, so every PR sitting on a base-owned red
+  # already passed it — silently. What changes is that the red is now NAMED here, in
+  # the gate's own output, instead of being invisible. A red the PR CAUSED
+  # (`red-surface`) and a surface that could not be READ (`surface-unknown`) refuse
+  # below: those are the false PASSes #3440 measured.
+  if [[ "$rc" -eq 0 && "$tok" == "red-base-owned" && -n "$recd" && "$recd" != "-" && "$recd" == "$live" ]]; then
+    # ⛔ THE PASS NEEDS CONTENT IDENTITY, NOT JUST THE TOKEN (#3440 review round 3, P2).
+    # `red-base-owned` is emitted by BOTH producer arms. On the CARRY arm the equality printed below
+    # is proven; on the HEAD-bound arm it is an identity by construction (`recd == live ==` the one
+    # head's digest), and for a head-bound record with NO `diff_sha256` the producer emits
+    # `red-base-owned<TAB>-<TAB><hash>` — so this gate would print "diff unchanged (- = bbbb…)", an
+    # equality it never checked. That state is ALSO the TOCTOU the `0:head` arm refuses (the head
+    # moved between the gate's read and the producer's), so it must reach that arm instead of
+    # passing here. A token with no proven identity falls through to the `case` and is classified
+    # there: `0:red-base-owned` is not an arm, so it lands on the catch-all refusal, which names it.
+    # A SUCCESS terminal: c_carry_resolve stops here, so relaying now is relaying once.
+    c_carry_relay_red "$cerr"
+    C_CARRY_WHY="diff unchanged (${recd:0:12}… = ${live:0:12}…); the head's check surface is RED but BASE-OWNED — the producer named the groups in its own output above. On a rail repo the rail re-measures base reds against its own reproduction before it merges anything (#3322/#3715); in gate mode this same-name comparison is the only evidence and is a named residual. This gate passing is not a claim that the head is green"
     return 0
   fi
   case "$rc:$tok" in
@@ -778,6 +1468,24 @@ c_carry_ask() {
       C_CARRY_WHY="the producer answered 'norecord' — it could not identify a record to carry, so the carry predicate did not run (a tooling fault, not a policy verdict on this PR)" ;;
     5:nodigest)
       C_CARRY_WHY="the record carries no usable diff digest, so content identity cannot be established and nothing may be carried" ;;
+    7:red-surface)
+      # (#3440) THE FALSE PASS THIS ISSUE MEASURED. The diff may be identical and the
+      # record may be perfectly valid — the TREE is broken, and this gate must not be
+      # greener than the truth. Refusing here reddens the PR's own CI on a red the PR
+      # caused, which is exactly what a red check should do. The red-group lines are
+      # STASHED, not printed: the caller relays them only for the refusal it reports.
+      C_CARRY_RELAY="$cerr"
+      C_CARRY_WHY="the JUDGED head's CHECK SURFACE IS RED (the JUDGED head is the LIVE head the producer would merge — this gate asks about an EARLIER head, so the recorded head is NOT the one judged; an unread live head answers 'surface-unknown' below, never a substitution) and the red is NOT shown base-owned (the producer named the red group(s) in its own output above) — the record may cover the artifact, but it does not cover a tree whose checks are failing, and passing here would be the false PASS of #3440 (#3355 was attested clean over 7 red checks). Fix or re-run the failing checks — a re-review is not the remedy for a broken build" ;;
+    8:surface-unknown)
+      C_CARRY_WHY="the JUDGED head's check surface could NOT BE READ (the producer answered 'surface-unknown': a refused gh/API read, an unreadable PR HEAD identity — in which case no sha was judged at all and the RECORDED head was NOT substituted — or no repo resolvable for the check-runs query). A read that FAILED is not a green surface, so nothing is certified here — this is a transport/budget fault, not a fault of the PR, and the remedy is to RE-RUN this gate, not to change the code" ;;
+    0:red-base-owned)
+      # ⛔ THE TOKEN WITHOUT ITS PROOF (#3440 review round 3, P2). The pre-`case` arm passes
+      # `red-base-owned` only when it carries a record digest that EQUALS the live one; this arm is
+      # the rest — the producer's HEAD-bound shape (`recd` is `-` for a record with no
+      # `diff_sha256`), and the TOCTOU the `0:head` arm above refuses. Refuse, and say what is
+      # missing rather than "cannot classify a carry", which would send the operator at the wrong
+      # tool.
+      C_CARRY_WHY="the producer answered 'red-base-owned' (the head's check surface is RED but base-owned) WITHOUT a usable record digest it could compare to the live one, so whether the reviewed artifact is the one that would merge is UNPROVEN — base ownership of the red does not establish that the record covers this head. Re-record naming the head the record carries (record-review.sh $pr $rh <same verdict> $repo — a CARRY, not a review), or re-run this gate if the head moved between its reads" ;;
     0:head)
       # Unreachable in the normal path (the caller only asks about a head that is
       # NOT the current one), but reachable on a TOCTOU: the producer read the
@@ -799,7 +1507,7 @@ c_carry_ask() {
   return 1
 }
 
-# grade_c_record <evidence-text> <pass-prefix>
+# grade_c_record <verdict-of-the-answering-source> <pass-prefix>
 #   THE #513 / #1356 VERDICT-TIER BINDINGS, shared by the HEAD-BOUND and the
 #   CARRIED arms — one writer, because a second copy is exactly how two readers
 #   drift apart. A carry carries the VERDICT the record was minted with, so
@@ -830,11 +1538,11 @@ c_carry_ask() {
 #   The FAIL texts deliberately do NOT print the accepted phrases: the old
 #   message advertised them, so the fastest path to green was typing one
 #   (agent-infra#1904's own failure text).
-grade_c_record() {
-  local text="$1" prefix="$2"
-  if has_clean_micro_marker "$text"; then
-    fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>), and remove the stale \"verdict=clean-micro\" marker line from the PR body."
-  elif has_clean_low_marker "$text"; then
+grade_c_record() { # <verdict-of-the-answering-source> <pass-prefix>
+  local v="$1" prefix="$2"
+  if [[ "$v" == "clean-micro" ]]; then
+    fail c "clean-micro verdict marker on a NON-micro linked issue (tier $tier) — clean-micro certifies the micro process only; run the code-review skill on the current head, re-record clean (record-review.sh <PR> <head-sha> clean <repo> --evidence <artifact>). A stale \"verdict=clean-micro\" line in the PR BODY should be removed; where it lives in an append-only PR COMMENT it cannot be, which is exactly why the verdict is read from the LINE that answered — the stronger clean record at this head supersedes it."
+  elif [[ "$v" == "clean-low" ]]; then
     if [[ "$CLEAN_LOW_CLASS_SOURCED" != "true" ]]; then
       fail c "clean-low verdict marker, but the Low content-shape class could not be read — record-review.sh is not beside this gate (looked at $RECORD_REVIEW_SH), so the diff's shape is UNVERIFIABLE and the clean-low attestation is refused. Ship record-review.sh alongside scripts/check-pipeline-compliance.sh (both are agent-infra files; templates/.github/workflows/pipeline-compliance.yml's WIRING notes cover copying/fetching it), or re-record with the verdict the diff earns."
     elif pr_is_clean_low_shaped "$FILES"; then
@@ -1686,10 +2394,37 @@ run_checks() {
       fail c "code-review evidence cannot be graded — the PR's current head sha could not be read, so no record can be BOUND to this revision. Re-run the gate once the API is reachable (the fetch this check needs is pulls/$PR_NUMBER .head.sha)."
       echo "      Missing: a readable PR head sha."
       echo "      Invoke:  re-run this gate — a transient API/permission failure leaves the head unresolved."
-    elif has_review_record "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD"; then
-      # #3315 — the verdict-tier bindings live in grade_c_record, shared with the
-      # CARRIED arm below so a carry cannot smuggle a tier past them.
-      grade_c_record "$EVID_TEXT" "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}…"
+    elif resolve_review_evidence "$EVID_TEXT" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" "${PR_COMMENTS:-}"; then
+      # #1224 — WHICH SOURCE ANSWERED, printed on every arm of (c).
+      REV_SRC="source=${REVIEW_EVIDENCE_SOURCE} (${REVIEW_EVIDENCE_WHERE})"
+      REV_FELLBACK=""
+      if [[ "$REVIEW_EVIDENCE_SOURCE" != "record" ]]; then
+        if [[ -n "$REVIEW_EVIDENCE_STALE_PATH" ]]; then
+          REV_FELLBACK="; the on-disk record ${REVIEW_EVIDENCE_STALE_PATH} is bound to ${REVIEW_EVIDENCE_STALE_SHA} — NOT this head — so it was refused and the ${REVIEW_EVIDENCE_SOURCE} answered"
+        elif [[ -n "$REVIEW_EVIDENCE_RECORD_PRESENT" ]]; then
+          REV_FELLBACK="; the on-disk record ${REVIEW_EVIDENCE_RECORD_PRESENT} was read and is NOT evidence (${REVIEW_EVIDENCE_RECORD_REASON:-refused}), so the ${REVIEW_EVIDENCE_SOURCE} answered"
+        fi
+      fi
+      # #513 verdict-tier binding (Approach B): clean-micro certifies the MICRO
+      # process only (record-review.sh verifies the linked issue's complexity:micro
+      # label at mint; micro skips checks b–e, so reaching this branch means the
+      # issue is NOT micro). A non-micro PR carrying verdict=clean-micro is a false
+      # certification.
+      #
+      # ⛔ THE GRADER IS SHARED WITH THE CARRIED ARM (#3315), AND THE VERDICT IS THE
+      # ONE THE ANSWERING SOURCE REPORTED — not a rescan of the blob. Two rules,
+      # both load-bearing:
+      #   · ONE WRITER. grade_c_record is the only place the tiers are bound, so a
+      #     carry cannot smuggle clean-micro past the non-micro binding or clean-low
+      #     past the content-shape binding while the head-bound arm refuses them.
+      #   · THE MATCHED SOURCE'S VERDICT. record-review.sh APPENDS markers and never
+      #     removes them, so a PR legitimately holds a stale clean-micro line from an
+      #     earlier micro review; taking the verdict from a whole-text rescan would
+      #     bind the PR to the STRONGEST stale line and refuse it again after a clean
+      #     re-record — a state the remedy cannot clear for an append-only COMMENT
+      #     stream. The verdict passed here is the record field (record arm) or the
+      #     LINE that matched (comment/body arms), so a stale tier does not bind.
+      grade_c_record "$REVIEW_EVIDENCE_VERDICT" "code-review record bound to $GH_REPO#$PR_NUMBER at ${PR_HEAD:0:12}… [$REV_SRC$REV_FELLBACK]"
     else
       # ── #3315 · THE CARRY, CONSULTED ────────────────────────────────────
       # No marker at the current head. Before refusing — which, on a required
@@ -1698,12 +2433,36 @@ run_checks() {
       # diff that would merge. `c_carry_resolve` only ever proposes markers bound
       # to THIS PR and THIS repo, and asks the producer about each (newest first);
       # the verdict is the producer's.
+      # ⛔ EVERY (c) LINE PRINTS WHICH SOURCE ANSWERED — the refusals included
+      # (#1224). Without this the refusal would be the one (c) line that says
+      # nothing about what was consulted, and a reader could not tell a PR with no
+      # record from one whose record was present and refused.
+      if [[ -n "${REVIEW_EVIDENCE_STALE_SHA:-}" ]]; then
+        REV_NONE="source=none: record=${REVIEW_EVIDENCE_STALE_PATH} (bound to ${REVIEW_EVIDENCE_STALE_SHA}), no marker binds ${PR_HEAD:0:12}… in comments/body/commits"
+      elif [[ -n "${REVIEW_EVIDENCE_RECORD_PRESENT:-}" ]]; then
+        REV_NONE="source=none: record=${REVIEW_EVIDENCE_RECORD_PRESENT} (unusable: ${REVIEW_EVIDENCE_RECORD_REASON:-refused}), no marker binds ${PR_HEAD:0:12}… in comments/body/commits"
+      else
+        REV_NONE="source=none: record absent from the review store, no marker binds ${PR_HEAD:0:12}… in comments/body/commits"
+      fi
       C_CARRY_RC=0
-      c_carry_resolve "$PR_BODY" "$COMMIT_MSGS" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" || C_CARRY_RC=$?
+      c_carry_resolve "$PR_BODY" "$COMMIT_MSGS" "$PR_NUMBER" "$GH_REPO" "$PR_HEAD" \
+        "$(admitted_comment_marker_text "${PR_COMMENTS:-}" "$PR_NUMBER" "$GH_REPO")" || C_CARRY_RC=$?
       if [[ "$C_CARRY_RC" -eq 0 ]]; then
-        grade_c_record "$EVID_TEXT" "code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
+        # (#3440) NAME THE SURFACE ON THE PASS LINE ITSELF. A `red-base-owned` carry passes
+        # (the record covers the artifact and the only reds reproduce on the base — which
+        # this gate already passed over, silently, before it read the surface at all), but
+        # the reader who greps the gate's output must not be left with "CARRIED … diff
+        # unchanged" and no hint that the tree is red. A reason only in C_CARRY_WHY would
+        # be invisible here: the PASS line is what the log carries.
+        # ⛔ THE VERDICT GRADED IS STILL `C_CARRIED_VERDICT` (#3315): the carried LINE's
+        # own verdict, not a whole-text rescan — see the ONE-WRITER note above.
+        C_CARRIED_PASS="code-review record CARRIED from ${C_CARRIED_HEAD:0:12}… — diff unchanged (diff_sha256 ${C_CARRIED_DIFF:0:12}…)"
+        if [[ "$C_CARRY_TOKEN" == "red-base-owned" ]]; then
+          C_CARRIED_PASS="$C_CARRIED_PASS; ⛔ the head's CHECK SURFACE IS RED but BASE-OWNED (#3440) — every red group also reproduces on the base (the producer named them in its own output above, relayed from its stderr by check (c)). This gate passing is NOT a claim that the head is green: base ownership here is the PRODUCER's same-name comparison, and on a rail repo the rail re-measures it against its own reproduction (#3322/#3715) before it exempts anything — in gate mode nothing else does, which is a named residual, not a guarantee"
+        fi
+        grade_c_record "$C_CARRIED_VERDICT" "$C_CARRIED_PASS"
       elif [[ "$C_CARRY_RC" -eq 1 ]]; then
-        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
+        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh artifact for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): the head-bound record FILE, the same marker line as a PR COMMENT posted by an OWNER/MEMBER/COLLABORATOR, or that marker line in the PR body/commit messages. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825). [$REV_NONE]"
         echo "      Missing: the code-review record marker for this PR at this head."
         echo "      Invoke:  code-review — Step 10 records the verdict (record-review.sh <PR> <head-sha> <verdict> --evidence <artifact>), and the tool appends the marker this check reads. If a record already exists at an OLDER head, re-record NAMING THAT HEAD (record-review.sh <PR> <the head the record carries> <same verdict> $GH_REPO): that is the producer's carry-forward, not a review cycle."
       elif [[ "$C_CARRY_RC" -eq 2 ]]; then
@@ -1713,12 +2472,42 @@ run_checks() {
         # of it). The FIRST line is the canonical one — an older-head marker
         # without a digest IS "no head-bound record" — and the second names what
         # was tried, so a lane with a pre-#2982 marker is not left guessing.
-        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh marker for THIS PR at the CURRENT head (${PR_HEAD:0:12}…): a line of exactly the form 'review recorded: reviews/$PR_NUMBER.json verdict=<clean|clean-micro|clean-low> @ $PR_HEAD ($GH_REPO)'. A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825)."
+        fail c "no head-bound code-review record for $GH_REPO#$PR_NUMBER — check (c) accepts ONLY the record-review.sh artifact for THIS PR at the CURRENT head (${PR_HEAD:0:12}…). A phrase in the PR body or a commit message ('code-review', 'reviewer', 'VGATE', …) is NOT evidence — it names no review, no PR and no revision (#1825). [$REV_NONE]"
         echo "       Carry check: the record for $GH_REPO#$PR_NUMBER is at an OLDER head (${C_NODIGEST_HEAD:0:12}…) and carries NO diff digest (`diff=<64hex>` predates it), so whether the reviewed diff is unchanged cannot be established."
         echo "      Missing: the code-review record marker for this PR at this head (or an older-head marker carrying its diff digest)."
         echo "      Invoke:  re-record NAMING THE EARLIER head the record carries — record-review.sh $PR_NUMBER ${C_NODIGEST_HEAD} <same verdict> $GH_REPO — which is the producer's carry-forward (it re-binds the verified record to ${PR_HEAD:0:12}…), not a review cycle; naming the current head instead is a FRESH mint, which it refuses for a clean verdict without --evidence. Run the code-review skill only if the diff changed."
       else
-        fail c "the code-review record at ${C_REFUSED_HEAD:0:12}… does NOT cover this revision (head ${PR_HEAD:0:12}…): $C_CARRY_WHY"
+        fail c "the code-review record at ${C_REFUSED_HEAD:0:12}… does NOT cover this revision (head ${PR_HEAD:0:12}…): $C_CARRY_WHY [$REV_NONE]"
+      fi
+      # #1224 — the refusal names EVERY source it consulted, and distinguishes the
+      # three facts that the old single sentence collapsed into one:
+      #   * a record at ANOTHER head  → re-record at this head;
+      #   * a record AT this head that
+      #     is NOT evidence           → the file was read and refused, and the
+      #                                 reason is the one that refused it;
+      #   * no record at all          → the record was never written here.
+      # Before this, the else-arm asserted "record absent" for a file that was
+      # PRESENT but unusable (verdict outside the accepted set, another org's
+      # repo, a re-serialised head_sha, an unverifiable sig) — unprovability the
+      # gate had not verified — and the remedy it printed would overwrite a file
+      # that may be the only copy of another repo's verdict (reviewer finding 4).
+      # Exactly ONE fail c above carries the verdict; these Notes add the facts the
+      # carry refusal alone cannot express.
+      if [[ -n "${REVIEW_EVIDENCE_STALE_SHA:-}" ]]; then
+        echo "      Note:    the on-disk record ${REVIEW_EVIDENCE_STALE_PATH} is bound to ${REVIEW_EVIDENCE_STALE_SHA} — NOT this head (${PR_HEAD:0:12}…) — so it was refused: a record certifies exactly ONE revision, and accepting it would certify an unreviewed head."
+        echo "      Invoke:  re-record at the current head — record-review.sh <PR> $PR_HEAD <verdict> --evidence <artifact> — which rewrites the record FILE and appends the marker beside it."
+      elif [[ -n "${REVIEW_EVIDENCE_RECORD_PRESENT:-}" ]]; then
+        echo "      Note:    a record file EXISTS at ${REVIEW_EVIDENCE_RECORD_PRESENT} but is NOT evidence for this head — ${REVIEW_EVIDENCE_RECORD_REASON:-it was refused}. Do NOT hand-edit it: it may belong to another repo, and a field patched by hand carries no valid signature."
+      else
+        echo "      Note:    no record file was found in the review store, and no marker binds ${PR_HEAD:0:12}… in the PR comments, body or commit messages."
+      fi
+      # #1224 — a marker-SHAPED comment that was REFUSED is a different fact from
+      # no comment at all (the review finding that produced
+      # REVIEW_EVIDENCE_RECORD_REASON, one artifact over): say which rule refused
+      # it, so the reader fixes the right thing instead of hunting for a missing
+      # comment that is present.
+      if [[ -n "${REVIEW_EVIDENCE_COMMENT_REFUSED:-}" ]]; then
+        echo "      Note:    a marker-shaped PR COMMENT was read and REFUSED — ${REVIEW_EVIDENCE_COMMENT_REFUSED}"
       fi
     fi
 
@@ -1851,7 +2640,7 @@ if [[ "$DRY_RUN" == "1" && "$FAIL_ALL" != "1" ]]; then
   echo "  a. LINKED ISSUE      gh api repos/$GH_REPO/pulls/$PR_NUMBER   → parse PR body for an issue reference that BEGINS A LINE (a Markdown line-leading prefix — bullet, ordered-list marker, blockquote, ATX heading, task-list checkbox, compound prefixes included — or an emphasis/bold/backtick marker may precede; a mid-sentence mention does not count, and can auto-close an issue on merge): EITHER a closing keyword (Fixes/Closes/Resolves #N, owner/repo#N, or full https://github.com/owner/repo/issues/N URL), which auto-closes on merge, OR a non-closing traceability keyword (Refs/Part of/Advances/Tracks/Relates to #N), which does not — accepted for ANY diff (#1630), so a PR implementing only PART of an issue need not lie; the artifact-only class ($ARTIFACT_CLASS_DESC) is no longer required for the traceability form — closure is not implied"
   echo "                      labels + scoping comments are fetched from the issue's OWN repo when it differs from $GH_REPO (cross-repo)"
   echo "  b. SCOPING COMMENT   gh api repos/$GH_REPO/issues/<n>/comments → the '<!-- issue-scoping:' marker as the FIRST content line of a comment, or as its LAST one set off by a blank line (an artifact, not a mention)"
-  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits → the PR body or a commit message must carry a record-review.sh RECORD MARKER bound to THIS PR at its CURRENT head: 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)'. No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825). #3315 adds ONE arm and it is a carry, not a relaxation: a marker for an EARLIER head of this PR passes as 'CARRIED from <head> — diff unchanged' when record-review.sh --check-carry (the single owner of carry semantics) says its diff_sha256 equals the PR's live diff; a changed diff, an unreadable diff, no record, no digest, a rebase (carry-patch — re-record, do not re-review) and an unrunnable predicate all still FAIL CLOSED. Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356) — both apply to a CARRIED record too"
+  echo "  c. CODE-REVIEW EVID  gh api repos/$GH_REPO/pulls/$PR_NUMBER + /commits + /issues/$PR_NUMBER/comments → READ RECORD-FIRST (#1224): the head-bound record FILE ~/.pi/agent/reviews/<owner>-<repo>-<PR>.json is consulted first and must carry a sig= that verifies under AI_REVIEW_GATE_KEY (an unauthenticated private file leaves no audit trail, so it is not evidence); the signed marker line in a PR COMMENT is next (comments survive the body edit that wipes the other copy — this is the copy that TRAVELS to a CI runner, whose $HOME has no record store); the PR body/commit marker is the LAST fallback | ⛔ the marker line 'review recorded: reviews/<PR>.json verdict=<v> @ <40-hex head sha> (<owner/repo>)' is accepted from any of the three, so a body edit cannot destroy the proof; the (c) line always prints source=<record|comment|body> | A record whose head_sha is NOT the current head is REFUSED naming both shas, and a record that exists but is unusable is reported as UNUSABLE (with the field that refused it), never as absent | When NO marker binds the current head, the CARRY arm (#3315) asks the producer record-review.sh --check-carry whether the reviewed diff is still the diff that would merge: a carry PASSES as 'CARRIED from <prior head> — diff unchanged', while a changed diff, an unreadable diff, no record, no digest, a rebase (carry-patch), or an unrunnable predicate all FAIL CLOSED | No phrase ('code-review', 'reviewer', 'VGATE', …) satisfies it (#1825) | Two markers carry a VERDICT and are bound: verdict=clean-micro on a non-micro issue fails, and verdict=clean-low is accepted only when the PR's whole diff is in the Low content-shape class sourced from record-review.sh (#513, #1356) — both apply to a CARRIED record too"
   echo "  d. PLAN DOC          gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → docs/plans/*.md change, or 'Wiring' in scoping comment (complexity:standard/complex only)"
   echo "  e. TEST-COVERAGE EVID gh api repos/$GH_REPO/pulls/$PR_NUMBER/files → runtime code changes (extensions/**/*.ts excl. *.test.ts, extensions/**/*.js, bin/*.js) need test files in the diff or test-run markers in PR body/commits"
   echo ""
@@ -2215,6 +3004,485 @@ if [[ "$FAIL_ALL" == "1" ]]; then
   fi
   summarize || true
 
+  # ── #1224 — THE RECORD-FIRST READ: the red-to-green case, the refusal that
+  # must survive the fix, and the fallback that keeps in-flight PRs working ──
+  #
+  # MUTATIONS BELOW: A (record read deleted), B (head comparison dropped),
+  # C (record signature arm removed), D (comment AUTHOR admission dropped),
+  # E (comment SIGNATURE check removed), F (comment arm HEAD comparison removed),
+  # G (absent-repo refusal neutered), H (comment arm moved ahead of the record
+  # arm), I (comment arm PR comparison dropped), J (comment arm repo comparison
+  # dropped), K (both repo filters on the carry path dropped). Each asserts its
+  # OWN named flip plus one named green control; what ELSE it reddens is not
+  # asserted, and a mutant whose run never reached its control says so.
+  #
+  # THE MEASURED DEFECT. The attestation lived only in the PR body, so a later
+  # body edit — a typo fix, a corrected claim, the closing keyword that
+  # `pipeline-compliance` itself demands — destroyed it, and check (c) went RED
+  # on a review that genuinely happened (agent-infra#1209 and premise-labs#3788,
+  # both 2026-09-18). The record FILE is head-bound and the PR cannot edit it, so
+  # (c) now reads it FIRST and falls back to the body only when it is absent.
+  #
+  #   1224a  body marker WIPED + SIGNED on-disk record for THIS head  ⇒ PASS,
+  #          source=record.  THIS IS THE RED-TO-GREEN CASE: it is the population
+  #          the issue measures (the NO_MARKER class), and it must move from red
+  #          to green — not the other way while looking green.
+  #   1224b  record bound to a DIFFERENT head, no marker anywhere ⇒ FAIL, naming
+  #          BOTH shas. The refusal the fix must never relax: a record certifies
+  #          one revision, and accepting a stale one certifies an UNREVIEWED head.
+  #   1224c  NO record at all + body marker at this head ⇒ PASS, source=body.
+  #          The fallback control: every in-flight PR, and every box whose store
+  #          was never written, keeps working — so this change cannot strand a
+  #          PR that is green today.
+  #   1224d  NO record at all + the producer's SIGNED marker COMMENT (in the fetch's
+  #          own `<association>\x1f<body>\x1e` frame), body WIPED ⇒ PASS,
+  #          source=comment. #1224 review finding 2: the record store is PER BOX,
+  #          so on the required `pipeline-compliance` check (a clean ubuntu-latest
+  #          runner with no ~/.pi/agent/reviews) the record arm can never answer.
+  #          Without this arm the whole fix is inert in the only environment whose
+  #          verdict blocks a merge — which is exactly what this PR's own head
+  #          measured (`source=none: record absent at /home/runner/.pi/...`).
+  #   1224e  an UNSIGNED record at this head, nothing else ⇒ FAIL, and the refusal
+  #          says so. #1224 review finding 3: a private, per-box file that leaves
+  #          no audit trail on the PR is below the bar the producer already sets
+  #          for the artifact that travels (a signed marker), so it is not evidence
+  #          by shape alone.
+  #   1224f  a record at this head whose verdict is OUTSIDE the accepted set ⇒
+  #          FAIL, and the refusal reports UNUSABLE with the field that refused it.
+  #          #1224 review finding 4: REVIEW_EVIDENCE_RECORD_PRESENT was documented
+  #          and written but read nowhere, so a present-but-unusable record was
+  #          reported as "absent" — an unprovability the gate had not verified.
+  #   1224g/h/i/j  THE COMMENT ARM'S ADMISSION AND VERDICT — see the block above
+  #          those passes: an unsigned comment, an untrusted author, a stale
+  #          clean-micro elsewhere in the stream, and the no-gate-key (CI) path.
+  #
+  # Each pass runs under its OWN $HOME: an ambient record on the machine RUNNING
+  # the suite would let 1224a pass for the wrong reason and make 1224c
+  # unreachable. Failures ACCUMULATE (no early exit) so the SELF_TEST can show
+  # which mutation flipped which pass, and that the OTHER passes stayed green.
+  P1224_FAILS=0
+  P1224_BASE="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1224.XXXXXX")"
+  P1224_ALT="$(printf 'b%.0s' {1..40})"
+  # The fixture gate key: the vectors exercise the REAL signature path, so a
+  # `sig` requirement that drifted from the producer's canonical text fails here
+  # instead of passing on a hand-written file.
+  P1224_KEY="pipeline-compliance-1224-fixture-key"
+  p1224_sig() { # p1224_sig_pr <pr> <head> <verdict> <repo> — the producer's canonical sig
+    printf '%s' "review-record:v1:$1:$2:$3:$4" \
+      | command openssl dgst -sha256 -hmac "$P1224_KEY" 2>/dev/null | command awk '{print $NF}'
+  }
+  p1224_record() { # p1224_record <home> <head> <verdict> [sig-override]
+    local sig
+    mkdir -p "$1/.pi/agent/reviews"
+    if [ -n "${4-}" ]; then sig="$4"; else sig="$(p1224_sig "$PR_NUMBER" "$2" "$3" "$GH_REPO")"; fi
+    printf '{"pr":%d,"head_sha":"%s","verdict":"%s","repo":"%s","reviewed_at":"2026-09-18T00:00:00Z","sig":"%s"}\n' \
+      "$PR_NUMBER" "$2" "$3" "$GH_REPO" "$sig" > "$1/.pi/agent/reviews/${GH_REPO%/*}-${GH_REPO#*/}-$PR_NUMBER.json"
+  }
+  p1224_fixtures() { # p1224_fixtures <body> <commits> [comments] — a PR whose ONLY question is (c)
+    PR_BODY="$1"; LABELS="complexity:standard"
+    SCOPING_COMMENT='<!-- issue-scoping: 2026-09-18 (standard) -->'
+    COMMIT_MSGS="$2"
+    PR_COMMENTS="${3-}"
+    FILES=$'added\tdocs/plans/2026-09-18-issue-1224-review-record-source.md\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+  }
+  p1224_run() { # p1224_run <home> <log> — run_checks against a given record store
+    local home="$1" log="$2" saved_home="$HOME"
+    HOME="$home"
+    run_checks > "$log" 2>&1 || true
+    HOME="$saved_home"
+  }
+  # ── THE COMMENT ARM'S TRANSPORT-FAITHFUL FIXTURES ──────────────────────────
+  # Every comment fixture is built from REVIEW_COMMENTS_JQ's OWN frame
+  # (`<association>\x1f<body>\x1e`), not hand-written to look like a marker.
+  # That is the whole point: 1224d used to hand `PR_COMMENTS` a BARE marker, a
+  # shape the live fetch never produces, so it stayed green while the production
+  # arm — whose marker line ends at `sig=<64hex><0x1e>` — could never match. A
+  # vector that bypasses the transport cannot see the transport, and this is the
+  # #633 rule (model the TRANSPORT, not just the URL) applied to a fixture.
+  p1224_comment() { # p1224_comment <author_association> <body> — one comment, production frame
+    printf '%s%s%s%s' "$1" "$REVIEW_COMMENTS_ASSOC_SEP" "$2" "$REVIEW_COMMENTS_REC_SEP"
+  }
+  # ⛔ AND THE FRAME IS BOUND TO THE EXPRESSION ITSELF, not to a second copy of its
+  # bytes. REVIEW_COMMENTS_JQ spells its two separators as jq escapes, so a change
+  # to the EXPRESSION alone (say 0x1f → 0x7c) would leave the constants — and every
+  # vector built from them — describing a transport the gate no longer has, which
+  # is the P1 the vectors exist to catch, one level up. This runs the PRODUCTION
+  # expression over a synthesized API page and requires its output to be
+  # byte-identical to the frame the fixtures build, so the two definitions cannot
+  # drift silently. jq is a hard dependency of the fetch path (`gh api --jq`), and
+  # a box without it CANNOT verify this: that is reported as a failure, never as
+  # a pass.
+  p1224_frame_is_production() {
+    local body got want
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "no 'jq' on this box, so the comment fixtures were NOT proved identical to REVIEW_COMMENTS_JQ's output — install jq (the fetch path's own dependency) and re-run" >&2
+      return 1
+    fi
+    # ⛔ THE PROBE BODY CARRIES THE FRAME DELIMITERS (review round 3 finding 3).
+    # With a plain body, deleting the `gsub` strip from REVIEW_COMMENTS_JQ leaves the
+    # output BYTE-IDENTICAL, so the strip was unpinned — and its loss is a
+    # credential-free bypass: an UNATTESTED account posts a body containing
+    # `x\x1eOWNER\x1f<marker>` and the gate reads a second, ADMITTED record that it
+    # manufactured. With the delimiters IN the probe, the strip is observable: the
+    # production expression must return the body with both bytes REMOVED, so a
+    # missing `gsub` makes `got` differ from `want` and 1224T reddens.
+    body="attestation${REVIEW_COMMENTS_REC_SEP}OWNER${REVIEW_COMMENTS_ASSOC_SEP}review recorded: reviews/$PR_NUMBER.json verdict=clean @ $FIX_HEAD ($GH_REPO)"
+    got="$(printf '[{"author_association":"OWNER","body":%s}]' "$(printf '%s' "$body" | jq -Rs .)" | jq -r "$REVIEW_COMMENTS_JQ")"
+    want="$(p1224_comment OWNER "$(printf '%s' "$body" | tr -d "$REVIEW_COMMENTS_REC_SEP$REVIEW_COMMENTS_ASSOC_SEP")")"
+    [ "$got" = "$want" ]
+  }
+  # p1224_marker <verdict> [<head>] — the producer's SIGNED marker line. Note the
+  # signed text: it is the MARKER UP TO ` sig=`, NOT the record's
+  # `review-record:v1:` canonical text — that is what record-review.sh signs for
+  # the marker and what merge-one.sh::verify_any_marker verifies, so a consumer
+  # that used the record computation here would fail this vector.
+  p1224_marker() { # <verdict> [<head>] [<pr>] [<repo>]
+    local v="$1" h="${2:-$FIX_HEAD}" pr="${3:-$PR_NUMBER}" repo="${4:-$GH_REPO}" body sig
+    body="review recorded: reviews/$pr.json verdict=$v @ $h ($repo)"
+    sig="$(printf '%s' "$body" | command openssl dgst -sha256 -hmac "$P1224_KEY" 2>/dev/null | command awk '{print $NF}' || true)"
+    printf '%s sig=%s' "$body" "$sig"
+  }
+  AI_REVIEW_GATE_KEY="$P1224_KEY"
+
+  echo ""
+  echo "== SIMULATION: pass 1224a (#1224: body attestation WIPED, on-disk record intact → (c) PASSES) =="
+  p1224_record "$P1224_BASE/a" "$FIX_HEAD" clean
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/a" "$P1224_BASE/a.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=record' "$P1224_BASE/a.log"; then
+    echo "  ✅ pass 1224a: (c) PASSED from the on-disk record with NO body marker (0 failures, source=record)"
+  else
+    echo "  ❌ pass 1224a: the on-disk record at THIS head did NOT satisfy check (c) (failures=$FAILURES) — the #1224 red-to-green case is broken" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/a.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224b (#1224: record bound to ANOTHER head → (c) REFUSES, naming both shas) =="
+  p1224_record "$P1224_BASE/b" "$P1224_ALT" clean
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/b" "$P1224_BASE/b.log"
+  if [[ "$FAILURES" -eq 1 ]] \
+    && grep -q '❌ \[c\]' "$P1224_BASE/b.log" \
+    && grep -q "$P1224_ALT" "$P1224_BASE/b.log" \
+    && grep -q "$FIX_HEAD" "$P1224_BASE/b.log"; then
+    echo "  ✅ pass 1224b: a record bound to ${P1224_ALT:0:12}… was REFUSED for head ${FIX_HEAD:0:12}…, with BOTH shas named (1 failure)"
+  else
+    echo "  ❌ pass 1224b: a record bound to ANOTHER head was ACCEPTED, or the refusal did not name both shas (failures=$FAILURES) — a stale record would certify an unreviewed head" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/b.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224c (#1224 fallback: NO record at all → the body attestation still PASSES) =="
+  mkdir -p "$P1224_BASE/c"   # a HOME with NO ~/.pi/agent/reviews at all
+  p1224_fixtures "Fixes #1" "$(rec_marker clean)"
+  p1224_run "$P1224_BASE/c" "$P1224_BASE/c.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=body' "$P1224_BASE/c.log"; then
+    echo "  ✅ pass 1224c: with no record on disk the body marker still satisfied (c) (0 failures, source=body)"
+  else
+    echo "  ❌ pass 1224c: the body FALLBACK stopped working (failures=$FAILURES) — every in-flight PR whose only record is the body would be stranded" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/c.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224T (#1224: the comment fixture IS the production fetch expression's output) =="
+  if p1224_frame_is_production; then
+    echo "  ✅ pass 1224T: the fixture's comment frame is BYTE-IDENTICAL to what REVIEW_COMMENTS_JQ emits for a live API page (association 0x1f body 0x1e) — the vectors below cannot drift from the transport they model"
+  else
+    echo "  ❌ pass 1224T: the comment fixtures do NOT describe the production fetch frame — REVIEW_COMMENTS_JQ and the p1224_comment separators have diverged, so every comment vector below grades a transport the gate does not have (#1224 P1, the fixture-bypasses-the-transport class)" >&2
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224d (#1224: body WIPED, record store ABSENT, the producer's SIGNED marker comment → (c) PASSES) =="
+  mkdir -p "$P1224_BASE/d"   # a clean-runner $HOME: no ~/.pi/agent/reviews at all
+  # ⛔ THE PRODUCTION SHAPE, INCLUDING THE 0x1e TERMINATOR. Before this, the
+  # fixture passed the BARE marker while the live fetch appends 0x1e to every
+  # body — so the vector proved a value the transport never produces and stayed
+  # green over a dead arm (the review's P1 #1). A change to the separator now
+  # reds THIS pass instead of silently disabling the arm.
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(p1224_marker clean)")"
+  p1224_run "$P1224_BASE/d" "$P1224_BASE/d.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=comment.*sig verified' "$P1224_BASE/d.log"; then
+    echo "  ✅ pass 1224d: (c) PASSED from the producer's OWN comment frame (association + signed marker + 0x1e) with no record store on the box (0 failures, source=comment, sig verified) — the arm that reaches CI"
+  else
+    echo "  ❌ pass 1224d: the producer's marker COMMENT did not satisfy (c) (failures=$FAILURES) — the fix is inert on the required check, whose runner has no record store (#1224 finding 2), or the transport shape is not handled" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/d.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224e (#1224: UNSIGNED record at this head, nothing else → (c) REFUSES) =="
+  p1224_record "$P1224_BASE/e" "$FIX_HEAD" clean "0000000000000000000000000000000000000000000000000000000000000000"
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/e" "$P1224_BASE/e.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/e.log" \
+    && grep -q 'NOT evidence' "$P1224_BASE/e.log" \
+    && grep -q 'does not verify' "$P1224_BASE/e.log"; then
+    echo "  ✅ pass 1224e: a record at THIS head whose sig= does not verify was REFUSED as not-evidence (1 failure) — a private file with no audit trail is not evidence by shape"
+  else
+    echo "  ❌ pass 1224e: an UNSIGNED/unverifiable record was ACCEPTED as evidence (failures=$FAILURES) — a hand-written file at the store path would satisfy (c) with nothing in the PR to audit (#1224 finding 3)" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/e.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224f (#1224: record present but UNUSABLE → refusal says UNUSABLE, never 'absent') =="
+  p1224_record "$P1224_BASE/f" "$FIX_HEAD" wip   # a verdict outside clean|clean-micro|clean-low
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/f" "$P1224_BASE/f.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/f.log" \
+    && grep -q 'exists' "$P1224_BASE/f.log" \
+    && grep -q "its verdict is 'wip'" "$P1224_BASE/f.log" \
+    && ! grep -q 'record absent at' "$P1224_BASE/f.log"; then
+    echo "  ✅ pass 1224f: a record file that EXISTS but is not evidence is reported as UNUSABLE with the field that refused it — not as 'record absent' (#1224 finding 4)"
+  else
+    echo "  ❌ pass 1224f: a present-but-unusable record was reported as ABSENT (or the reason was not named) (failures=$FAILURES) — the gate asserts unprovability it never verified" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/f.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  # ── THE COMMENT ARM'S ADMISSION AND ITS VERDICT (fresh-review findings) ────
+  # The arm 1224d proves EXISTS is only safe if it admits the RIGHT comments and
+  # reads the RIGHT verdict. Three vectors, each RED on the pre-fix code:
+  #   1224g  an UNSIGNED marker comment from a trusted author, a gate key present
+  #          ⇒ FAIL. Before the fix the optional `sig=` group made any typed line
+  #          evidence, i.e. a credential-free bypass of the repo's only required
+  #          check on a PUBLIC repo.
+  #   1224h  a VALIDLY SIGNED marker comment from an UNTRUSTED author
+  #          (`author_association: NONE`, what any outside account gets) ⇒ FAIL.
+  #          Before the fix `PR_COMMENTS` was `.[].body` for every comment, so
+  #          anyone could satisfy (c); the fetch now carries the association and
+  #          the arm admits only OWNER/MEMBER/COLLABORATOR — the same constant the
+  #          #1224 decision comment fixes as the shared contract.
+  #   1224i  a signed clean marker comment PLUS a separate stale
+  #          `verdict=clean-micro @ 0000…` comment ⇒ PASS as clean. Before the
+  #          fix the verdict was a whole-blob grep, so the junk line pinned the
+  #          #513 tier binding to micro and RED-ed (c) on a non-micro issue — a
+  #          public off-switch on any PR, in an append-only stream.
+  #   1224j  NO gate key on the box (what the required check's runner has: its
+  #          workflow passes no AI_REVIEW_GATE_KEY and this repo has no such
+  #          secret) + a trusted-author marker comment ⇒ PASS, source=comment
+  #          with `no gate key on this box` said out loud. This is the CI path:
+  #          requiring a verifiable sig with no key would make the arm inert
+  #          again, which is the defect 1224d exists to prevent.
+  echo ""
+  # 1224k — THE PRECEDENCE ITSELF IS PINNED (prior review finding 2: every vector
+  # either wiped the body or supplied no record, so a BODY-FIRST mutant — the exact
+  # regression this PR exists to prevent — passed the whole self-test). Here a
+  # signed record at THIS head says `clean` AND the PR body carries a marker at this
+  # head saying `clean-micro` on a NON-micro issue. Two sources, two different
+  # veredicts, one order:
+  #   · record-first (the shipped rule) ⇒ (c) PASSES, source=record — the stronger
+  #     head-bound artifact answers and the weaker fallback is never consulted;
+  #   · body-first (the mutant)        ⇒ the #513 tier binding fires on the body's
+  #     clean-micro and (c) FAILS.
+  # The assertion on `source=record` is what makes the ORDER load-bearing rather
+  # than merely the record's presence.
+  echo "== SIMULATION: pass 1224k (#1224: record beats the body — the PRECEDENCE is pinned, not just the arms) =="
+  p1224_record "$P1224_BASE/k" "$FIX_HEAD" clean
+  p1224_fixtures "Fixes #1" "$(rec_marker clean-micro)"
+  p1224_run "$P1224_BASE/k" "$P1224_BASE/k.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=record' "$P1224_BASE/k.log"; then
+    echo "  ✅ pass 1224k: with a signed record AND a weaker body marker both naming this head, (c) answered from the RECORD (0 failures, source=record) — a body-first regression is visible"
+  else
+    echo "  ❌ pass 1224k: the RECORD did not take precedence over the body marker (failures=$FAILURES) — a body-first read would let a mutable field outrank the head-bound artifact, which is the defect #1224 exists to close" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/k.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  # 1224l — THE COMMENT ARM'S HEAD BINDING (review finding 1: it was pinned by NO
+  # vector, and deleting the comparison left 1224a–1224k green while an
+  # OLDER-head comment was accepted as head-bound — the exact "a stale record
+  # certifies an unreviewed head" defect, reachable through the new channel).
+  # An admitted OWNER comment whose marker names an EARLIER head and carries no
+  # `diff=` digest is not a carry candidate either (no digest ⇒ nothing to carry),
+  # so (c) must FAIL.
+  # 1224n — EVERY (c) LINE NAMES THE SOURCE IT CONSULTED, refusals included
+  # (review finding 7: the `[$REV_NONE]` suffix was pinned only by ACCIDENT, via a
+  # grep inside 1224g that was there for the sig rule). One vector per branch of
+  # the distinction the suffix exists to draw — here, the plainest: no record file
+  # AND no marker anywhere. Deleting the suffix reddens THIS vector and nothing it
+  # was not meant to redden.
+  echo "== SIMULATION: pass 1224n (#1224: a refusal states WHICH source answered — here, none) =="
+  mkdir -p "$P1224_BASE/n"   # a HOME with no review store
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/n" "$P1224_BASE/n.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/n.log" \
+    && grep -q '\[source=none: record absent' "$P1224_BASE/n.log"; then
+    echo "  ✅ pass 1224n: the refusal names what was consulted ([source=none: record absent …]) — a reader can tell 'no record was ever written' from 'a record was read and refused'"
+  else
+    echo "  ❌ pass 1224n: the (c) refusal did not name the source it consulted (failures=$FAILURES) — the one (c) line the reader most needs to diagnose would describe no source at all" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/n.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  # 1224o — A REPO-LESS RECORD IS NOT EVIDENCE (review round 2 finding 2, which is
+  # round-1 finding 5's guard with no vector behind it). Two things were measured:
+  # the refusal could be deleted or replaced by the legacy acceptance and every
+  # vector stayed green, and the shipped-but-unpinned guard is what stops ONE signed
+  # `reviews/<pr>.json` — a shape the producer really emits on a repo-less mint —
+  # from answering for `org-a/app#9` AND `org-b/lib#9` at the same head. The fixture
+  # writes the file the producer writes when REPO is unset: `repo` field absent,
+  # signature over an EMPTY repo slot (so it verifies), head == this head.
+  echo "== SIMULATION: pass 1224o (#1224: a SIGNED record with NO repo field binds no repository ⇒ REFUSED) =="
+  mkdir -p "$P1224_BASE/o/.pi/agent/reviews"
+  Q1224O_SIG="$(p1224_sig "$PR_NUMBER" "$FIX_HEAD" clean "")"
+  printf '{"pr":%d,"head_sha":"%s","verdict":"clean","reviewed_at":"2026-09-18T00:00:00Z","sig":"%s"}\n' \
+    "$PR_NUMBER" "$FIX_HEAD" "$Q1224O_SIG" > "$P1224_BASE/o/.pi/agent/reviews/$PR_NUMBER.json"
+  p1224_fixtures "Fixes #1" ""
+  p1224_run "$P1224_BASE/o" "$P1224_BASE/o.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/o.log" \
+    && grep -q 'NO repo field' "$P1224_BASE/o.log"; then
+    echo "  ✅ pass 1224o: a repo-less signed record was REFUSED, naming the absent binding (1 failure) — one record cannot answer for two repos' PR of the same number"
+  else
+    echo "  ❌ pass 1224o: a repo-less record was ACCEPTED (failures=$FAILURES) — PR numbers collide across repos, so it would certify another repo's revision" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/o.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  # 1224p/1224q — THE COMMENT ARM'S PR AND REPO BINDINGS (review round 3 finding 3:
+  # three of the four bindings on the arm the diff itself calls "the copy that
+  # TRAVELS" had no vector, and each was silently removable — `foreign-PR =>
+  # ACCEPTED` and `foreign-repo => ACCEPTED` were both measured on mutants with the
+  # whole self-test green). These are the marker's identity fields, no different
+  # from the body arm's: a marker minted for another PR or another repo is not this
+  # PR's evidence, however well it is signed and however current its head.
+  echo "== SIMULATION: pass 1224p (#1224: a signed admitted comment bound to ANOTHER PR does NOT bind this one) =="
+  mkdir -p "$P1224_BASE/p"
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(p1224_marker clean "$FIX_HEAD" 424299)")"
+  p1224_run "$P1224_BASE/p" "$P1224_BASE/p.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/p.log"; then
+    echo "  ✅ pass 1224p: a signed comment marker naming PR 424299 was NOT accepted for #$PR_NUMBER (1 failure) — the PR number is part of the binding on the comment arm"
+  else
+    echo "  ❌ pass 1224p: a comment marker for ANOTHER PR satisfied (c) (failures=$FAILURES) — one PR's review would certify another's revision" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/p.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+  echo "== SIMULATION: pass 1224q (#1224: a signed admitted comment bound to ANOTHER REPO does NOT bind this one) =="
+  mkdir -p "$P1224_BASE/q"
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(p1224_marker clean "$FIX_HEAD" "$PR_NUMBER" premise-labs/tortoise)")"
+  p1224_run "$P1224_BASE/q" "$P1224_BASE/q.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/q.log"; then
+    echo "  ✅ pass 1224q: a signed comment marker naming another REPO was NOT accepted (1 failure) — PR numbers collide across repos, so the repo is part of the binding here too"
+  else
+    echo "  ❌ pass 1224q: a comment marker for ANOTHER REPO satisfied (c) (failures=$FAILURES)" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/q.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo "== SIMULATION: pass 1224l (#1224: an ADMITTED comment naming an OLDER head does NOT bind this head) =="
+  mkdir -p "$P1224_BASE/l"
+  # ⛔ THE MARKER MUST BE SIGNED, or the arm refuses it for the SIGNATURE reason and
+  # the head comparison is never reached — measured: the first version of this
+  # vector stayed green under mutation F (head compare dropped), because the gate
+  # key is set for this whole block and an unsigned marker is refused earlier. A
+  # vector that passes for a reason other than the one it names cannot detect that
+  # reason moving.
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(p1224_marker clean "$P1224_ALT")")"
+  p1224_run "$P1224_BASE/l" "$P1224_BASE/l.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/l.log"; then
+    echo "  ✅ pass 1224l: a trusted-author comment bound to ${P1224_ALT:0:12}… was REFUSED at ${FIX_HEAD:0:12}… (1 failure) — the comment arm compares the head, it does not merely match its shape"
+  else
+    echo "  ❌ pass 1224l: an OLDER-head comment marker satisfied (c) (failures=$FAILURES) — the comment arm would certify an unreviewed head" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/l.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  # 1224m — RECORD vs COMMENT PRECEDENCE (review finding 4: 1224k pinned
+  # record-vs-BODY only, and a COMMENT-first mutant stayed green across every
+  # vector while the SELF_TEST banner claimed the whole order was pinned). A signed
+  # record saying `clean` at this head, and an admitted comment at this head saying
+  # `clean-micro` on a NON-micro issue: record-first PASSES (source=record);
+  # comment-first hits the #513 tier binding and FAILS.
+  echo "== SIMULATION: pass 1224m (#1224: the RECORD outranks an admitted COMMENT too — the whole order is pinned) =="
+  p1224_record "$P1224_BASE/m" "$FIX_HEAD" clean
+  # ⛔ SIGNED, for the reason 1224l had to be signed: the gate key is set for this
+  # whole block, so an UNSIGNED comment marker is refused on the sig arm and the
+  # precedence question is never reached — the vector then has only one candidate
+  # source and a comment-first mutant ships fully green (measured in round 2).
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(p1224_marker clean-micro)")"
+  p1224_run "$P1224_BASE/m" "$P1224_BASE/m.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=record' "$P1224_BASE/m.log"; then
+    echo "  ✅ pass 1224m: with a signed record AND a weaker admitted COMMENT both at this head, (c) answered from the RECORD (0 failures, source=record) — a comment-first regression is visible"
+  else
+    echo "  ❌ pass 1224m: the RECORD did not outrank an admitted COMMENT at this head (failures=$FAILURES) — the comment arm would let a weaker tier outrank the head-bound artifact" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/m.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo "== SIMULATION: pass 1224g (#1224: UNSIGNED marker comment from a trusted author → (c) REFUSES) =="
+  mkdir -p "$P1224_BASE/g"
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(rec_marker clean)")"
+  p1224_run "$P1224_BASE/g" "$P1224_BASE/g.log"
+  # ⛔ `source=none` IS NOT THIS VECTOR'S ASSERTION (review finding 7): it was, and
+  # the measured consequence was that DELETING every `[$REV_NONE]` suffix reddened
+  # only this vector, whose message then read "an UNSIGNED marker comment SATISFIED
+  # (c) … any account could satisfy the ONLY required check" — a cosmetic
+  # diagnostic regression reported as a P0-class bypass. The suffix has its own
+  # vector (1224n) and its own three branches; the sig rule is what this one pins.
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/g.log" \
+    && grep -q 'sig= does not verify' "$P1224_BASE/g.log"; then
+    echo "  ✅ pass 1224g: an UNSIGNED marker comment was REFUSED, and the refusal names the sig rule (1 failure) — a comment is not evidence by shape"
+  else
+    echo "  ❌ pass 1224g: an UNSIGNED marker comment satisfied (c) (failures=$FAILURES) — any account that can comment could satisfy the ONLY required check with no review behind it" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/g.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224h (#1224: SIGNED marker comment from an UNTRUSTED author_association → (c) REFUSES) =="
+  mkdir -p "$P1224_BASE/h"
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment NONE "$(p1224_marker clean)")"
+  p1224_run "$P1224_BASE/h" "$P1224_BASE/h.log"
+  if [[ "$FAILURES" -eq 1 ]] && grep -q '❌ \[c\]' "$P1224_BASE/h.log" \
+    && grep -q "author_association is 'NONE'" "$P1224_BASE/h.log"; then
+    echo "  ✅ pass 1224h: a marker comment from an author GitHub does NOT attest as OWNER/MEMBER/COLLABORATOR was REFUSED (1 failure) — the comment arm's admission rule is the author, not the text"
+  else
+    echo "  ❌ pass 1224h: an UNTRUSTED commenter satisfied (c) (failures=$FAILURES) — on a public repo any GitHub account could post the marker and defeat the gate (#1224 P0)" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/h.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224i (#1224: the verdict comes from the marker LINE, not from a stale clean-micro elsewhere) =="
+  mkdir -p "$P1224_BASE/i"
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment OWNER "$(p1224_marker clean)")$(p1224_comment OWNER "a review note quoting a stale marker: verdict=clean-micro @ $(printf '0%.0s' {1..40})")"
+  p1224_run "$P1224_BASE/i" "$P1224_BASE/i.log"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=comment' "$P1224_BASE/i.log" \
+    && ! grep -q 'clean-micro verdict marker on a NON-micro' "$P1224_BASE/i.log"; then
+    echo "  ✅ pass 1224i: a stale verdict=clean-micro line elsewhere in the stream did NOT become this head's verdict (0 failures) — the #513 tier binding reads the matched line (#1224 P1)"
+  else
+    echo "  ❌ pass 1224i: a stale clean-micro line in the comment stream pinned the verdict for THIS head (failures=$FAILURES) — a public off-switch on every non-micro PR, in a stream nobody can edit" >&2
+    grep -E '❌ \[c\]|✅ \[c\]' "$P1224_BASE/i.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  echo ""
+  echo "== SIMULATION: pass 1224j (#1224: no gate key on the box — the CI runner — still admits a TRUSTED author's marker) =="
+  mkdir -p "$P1224_BASE/j"
+  p1224_fixtures "Fixes #1" "" "$(p1224_comment MEMBER "$(p1224_marker clean)")"
+  AI_REVIEW_GATE_KEY=""
+  p1224_run "$P1224_BASE/j" "$P1224_BASE/j.log"
+  AI_REVIEW_GATE_KEY="$P1224_KEY"
+  if [[ "$FAILURES" -eq 0 ]] && grep -q '✅ \[c\].*source=comment.*no gate key on this box' "$P1224_BASE/j.log"; then
+    echo "  ✅ pass 1224j: with NO gate key (the required check's runner) a trusted author's marker comment still answers, and the (c) line says the sig could not be verified (0 failures) — the authenticated-where-possible rule never makes the arm inert"
+  else
+    echo "  ❌ pass 1224j: with no gate key a trusted author's marker comment did NOT satisfy (c) (failures=$FAILURES) — requiring a sig nobody can produce would make the arm inert on the required check, the very defect #1224 fixes" >&2
+    grep -E '❌ \[c\]|✅ \[c\]|Note:' "$P1224_BASE/j.log" >&2 || true
+    P1224_FAILS=$((P1224_FAILS + 1))
+  fi
+
+  if [[ "$P1224_FAILS" -ne 0 ]]; then
+    echo "  ❌ passes 1224a–q: $P1224_FAILS record-source assertion(s) failed" >&2
+    exit 2
+  fi
+  unset AI_REVIEW_GATE_KEY
+  rm -rf "$P1224_BASE"
   # ── #3315: CHECK (c) CONSULTS THE CARRY — the fail-closed contract ────────
   #
   # WHAT IS BEING PINNED. Before this change the only way past check (c) on a PR
@@ -2253,6 +3521,20 @@ case "${PCC3315_MODE:-carry}" in
   nodigest)    printf 'nodigest\t-\t-\n'; exit 5 ;;
   unreadable)  printf 'unreadable\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 3 ;;
   carry-patch) printf 'carry-patch\t%s\t%s\n' "${PCC3315_DIGEST:-}" cccccccccccc; exit 6 ;;
+  # (#3440) the three CHECK-SURFACE verdicts, modelled exactly as the producer emits them —
+  # INCLUDING the red-group lines it writes to STDERR, because check (c) now RELAYS them
+  # (see c_carry_relay_red): its pass/refusal text tells the operator the groups were named
+  # "in the producer's own output above", and before that relay existed the gate threw that
+  # stderr away with `2>/dev/null` (review of `554d272`, P2). Passes 33/34 pin the relay.
+  red-base-owned) printf 'record-review.sh --check-carry: RED, and every red group ALSO reproduces on the base — You are accepting: CI|verify\n' >&2
+                  printf 'red-base-owned\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 0 ;;
+  # The HEAD-bound shape: the producer answers `red-base-owned` with NO record digest on the left, so
+  # the consumer cannot prove the reviewed artifact is the one that would merge (pass 33b).
+  red-base-owned-nodigest) printf 'record-review.sh --check-carry: RED and base-owned, but this record carries no diff digest\n' >&2
+                  printf 'red-base-owned\t-\t%s\n' "${PCC3315_DIGEST:-}"; exit 0 ;;
+  red-surface)  printf 'record-review.sh --check-carry: RED and NOT shown base-owned — Red group(s): CI|bash-suites (3)\n' >&2
+                printf 'red-surface\t%s\t%s\n' "${PCC3315_DIGEST:-}" "${PCC3315_DIGEST:-}"; exit 7 ;;
+  surface-unknown) printf 'surface-unknown\t%s\t%s\n' "${PCC3315_DIGEST:-}" unavailable; exit 8 ;;
   # THE PREDICATE'S REAL PREDICATE, MODELLED: `carry` only for the digest it was
   # minted over, `fresh` for anything else. Without this mode a stub that answers
   # `carry` unconditionally cannot tell a gate that tried the NEWEST marker from
@@ -2286,10 +3568,21 @@ C3315_STUB_EOF
   C3315_PRIOR="$(printf 'b%.0s' {1..40})"
   C3315_DIGEST="$(printf 'c%.0s' {1..64})"
   C3315_FAILS=0
-  c3315_case() { # <label> <mode> <marker-commits> <pass|fail> <want-substring> [<recorder>] [<body-extra>] [<carry-only-digest>]
-    local label="$1" mode="$2" marker="$3" want="$4" sub="$5" rec="${6:-$C3315_STUB}" body_extra="${7:-}" carry_only="${8:-$C3315_DIGEST}"
+  # One PR COMMENT in the PRODUCTION fetch frame (`REVIEW_COMMENTS_JQ`'s
+  # `<association>\x1f<body>\x1e`), so the carry vectors exercise the transport the
+  # gate actually reads rather than a hand-built lookalike.
+  c3315_comment() { # <author_association> <body>
+    printf '%s%s%s%s' "$1" "$REVIEW_COMMENTS_ASSOC_SEP" "$2" "$REVIEW_COMMENTS_REC_SEP"
+  }
+  c3315_case() { # <label> <mode> <marker-commits> <pass|fail> <want-substring> [<recorder>] [<body-extra>] [<carry-only-digest>] [<comments>]
+    local label="$1" mode="$2" marker="$3" want="$4" sub="$5" rec="${6:-$C3315_STUB}" body_extra="${7:-}" carry_only="${8:-$C3315_DIGEST}" comments="${9:-}"
     local log n why_ok=0 c_ok=0 rec_save="$RECORDER"
     PR_BODY="Fixes #1"; LABELS="complexity:standard"
+    # ⛔ HERMETIC: the carry arm now also consults the ADMITTED PR-COMMENT markers
+    # (the only channel that survives on a CI runner, #1224), so a frame left
+    # behind by an earlier vector would silently satisfy a carry here — every case
+    # states its own comment frame explicitly, and the default is NONE.
+    PR_COMMENTS="$comments"
     if [[ -n "$body_extra" ]]; then PR_BODY="$(printf 'Fixes #1\n%s' "$body_extra")"; fi
     SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
     COMMIT_MSGS="$marker"
@@ -2323,7 +3616,19 @@ C3315_STUB_EOF
     rm -f "$log"
   }
   echo ""
-  echo "== SIMULATION: passes 15–29 (#3315: check (c) consults the carry) =="
+  echo "== SIMULATION: passes 15–38 (#3315 × #3440: check (c) consults the carry) =="
+  # ⛔ HERMETIC KEY STATE (found the hard way). `review_gate_key` falls back to
+  # ~/.pi/agent/.ai-review-gate-key, so these cases inherited whatever key the BOX
+  # happened to hold. Measured: with a key file present, pass 30 (an admitted comment
+  # marker) went red for a reason that has nothing to do with the carry — the marker
+  # is unsigned, and a key-bearing box requires a verifiable sig=. On the runner this
+  # arm exists for there IS no key, so the harness must say which box it is testing:
+  # a temp HOME with no key file and an empty AI_REVIEW_GATE_KEY.
+  C3315_HOME_SAVE="$HOME"
+  C3315_KEY_SAVE="${AI_REVIEW_GATE_KEY-__unset__}"
+  C3315_ISO="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-3315-home.XXXXXX")"
+  HOME="$C3315_ISO"
+  AI_REVIEW_GATE_KEY=""
   # 15 — THE CARRY ITSELF. A marker at an EARLIER head carrying that record's
   # diff, and a predicate that says the live diff is that same digest: PASS, and
   # the line says what was established (content identity from a prior head) and
@@ -2415,10 +3720,116 @@ C3315_STUB_EOF
   c3315_case "pass 29: the PR BODY marker is preferred to an OLDER commit-message marker ⇒ CARRIED" \
     selective "$(rec_marker_d clean "$(printf 'f%.0s' {1..40})" "$(printf 'd%.0s' {1..64})")" pass 'diff unchanged (diff_sha256 cccccccccccc…)' \
     "$C3315_STUB" "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")"
+  # 30 — THE COMMENT CHANNEL IS CONSULTED (#1224 × #3315). A marker at an earlier
+  # head that survives ONLY as an admitted PR comment — the body was edited away,
+  # which is the measured #1224 defect and the ONLY channel that exists on a CI
+  # runner with no review store — must still be carried. Reverting the
+  # comment-arm read (dropping the third candidate source) reddens exactly this
+  # vector and leaves 15 green, which is what makes it load-bearing.
+  c3315_case "pass 30: an earlier-head marker surviving ONLY as an ADMITTED PR COMMENT ⇒ CARRIED" \
+    carry "" pass 'diff unchanged (diff_sha256 cccccccccccc…)' \
+    "$C3315_STUB" "" "$C3315_DIGEST" \
+    "$(c3315_comment OWNER "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")")"
+  # 31 — …AND ITS ADMISSION IS THE SAME ONE. The identical marker from an author
+  # GitHub does not attest (NONE) is not a candidate at all: the predicate must not
+  # even be asked, so a public repo's arbitrary commenter cannot drive a carry.
+  # The label says "predicate never asked", so the vector asserts it: the argv log
+  # the stub writes must stay EMPTY. Without this the label claimed a property the
+  # case never checked (review finding 9).
+  : > "$C3315_ARGV"
+  c3315_case "pass 31: an earlier-head marker in an UNATTESTED comment is NOT a candidate (predicate never asked)" \
+    carry "" fail 'no head-bound code-review record' \
+    "$C3315_STUB" "" "$C3315_DIGEST" \
+    "$(c3315_comment NONE "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")")"
+  if [[ -s "$C3315_ARGV" ]]; then
+    echo "  ❌ pass 31b: the carry predicate WAS asked about an UNATTESTED comment marker (argv: $(cat "$C3315_ARGV")) — the author admission does not gate the carry channel" >&2
+    C3315_FAILS=$((C3315_FAILS + 1))
+  else
+    echo "  ✅ pass 31b: the predicate was never asked about the unattested comment marker — admission gates the carry channel, not just the head-bound arm"
+  fi
+  # 32 — THE CARRY CHANNEL'S REPO BINDING (review round 3 finding 3/G9). An
+  # earlier-head marker that survives only as an admitted comment for a DIFFERENT
+  # repo is not a candidate: PR numbers collide across repos, and the carry
+  # predicate would otherwise be asked about another repo's record.
+  c3315_case "pass 32: an earlier-head comment marker for ANOTHER REPO is NOT a carry candidate" \
+    carry "" fail 'no head-bound code-review record' \
+    "$C3315_STUB" "" "$C3315_DIGEST" \
+    "$(c3315_comment OWNER "$(printf 'review recorded: reviews/1.json verdict=clean @ %s diff=%s (premise-labs/tortoise)' "$C3315_PRIOR" "$C3315_DIGEST")")"
+  # ── #3440: THE CHECK SURFACE (renumbered 33–35 — #1224 × #3315 took 30–32) ──
+  # 33 — `red-base-owned` PASSES, and this pins WHY: the record covers the artifact
+  # and every red reproduces on the base. Before #3440 this gate never read the
+  # surface at all, so this PR would have passed SILENTLY; what changed is that the
+  # gate now says which red it is accepting. The assertion demands BOTH halves —
+  # a pass AND the naming — because a bare pass is exactly the shape #3440 removes.
+  c3315_case "pass 33: 'red-base-owned' ⇒ check (c) PASSES and NAMES the base-owned red (#3440)" \
+    red-base-owned "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" pass 'BASE-OWNED'
+  # 34 — THE FALSE PASS OF #3440: the head is red and the PR caused it. The record may
+  # be perfectly stale-free; the TREE is broken. Passing here would certify a merge the
+  # rail will refuse, which is the two-readers disagreement this gate exists to end.
+  c3315_case "pass 34: 'red-surface' ⇒ check (c) FAILS CLOSED, naming a broken build (#3440)" \
+    red-surface "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'CHECK SURFACE IS RED'
+  # 35 — a REFUSED read is not a green surface. The remedy is a re-run of the gate,
+  # not a code change and not a re-review.
+  c3315_case "pass 35: 'surface-unknown' ⇒ check (c) FAILS CLOSED, naming a RETRY (#3440)" \
+    surface-unknown "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'could NOT BE READ'
+  # 33/34 — THE PRODUCER'S RED GROUPS REACH THIS GATE'S OWN LOG (review of `554d272`, P2).
+  # Both messages say the groups were named in the producer's output "above", and the gate used
+  # to discard that stderr entirely, so in GATE mode — where check (c) IS the required status
+  # check and no rail re-measures anything — the operator could not see WHICH check was red. The
+  # stub writes the producer's real stderr shape and the assertion demands it in the log.
+  # MUTANT: restore `2>/dev/null` on the producer call and both vectors go red.
+  c3315_case "pass 36: the producer's BASE-OWNED group line is RELAYED into the gate's log (#3440)" \
+    red-base-owned "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" pass 'You are accepting: CI|verify'
+  # 35b — A `red-base-owned` TOKEN WITH NO PROVEN CONTENT IDENTITY DOES NOT PASS (#3440 review round 3,
+  # P2). The producer emits that token from its HEAD-bound arm too, where `recd` is `-` for a record
+  # with no `diff_sha256`; the first version of the arm printed "diff unchanged (- = cccc…)" and
+  # PASSED — an equality it never checked, and the TOCTOU the `0:head` arm refuses. The stub's
+  # `red-base-owned-nodigest` mode models exactly that argv pair. It sits in the SURFACE run (33–35)
+  # because that is what it pins, not in the relay run (36–38) that follows it.
+  c3315_case "pass 35b: 'red-base-owned' with NO proven diff digest ⇒ FAILS CLOSED, never a licence" \
+    red-base-owned-nodigest "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'WITHOUT a usable record digest'
+  c3315_case "pass 37: the producer's RED group line is RELAYED into the gate's log (#3440)" \
+    red-surface "$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")" fail 'Red group(s): CI|bash-suites (3)'
+  # 38 — THE RELAY FIRES ONCE, ABOVE THE REFUSAL IT SUPPORTS (review of this change, nit 4). With TWO
+  # stale markers check (c) asks the producer twice, but it reports only the NEWEST candidate's
+  # refusal; relaying inside c_carry_ask printed the identical group block once per ASK, and an
+  # older candidate's groups could appear above a message describing a different cause. The relay
+  # is now stashed per ask and printed once, immediately above the reported refusal.
+  # MUTANT: move the relay back into c_carry_ask's `7:red-surface` arm → the count below becomes 3
+  # (one per ASK, for the two candidates, plus the one the resolve path prints for the reported
+  # refusal). Measured: "appeared 3 time(s), wanted 1".
+  {
+    PR_BODY="Fixes #1
+$(rec_marker_d clean "$C3315_PRIOR" "$C3315_DIGEST")"
+    LABELS="complexity:standard"
+    SCOPING_COMMENT='<!-- issue-scoping: 2026-10-17 (standard) -->'
+    COMMIT_MSGS="$(rec_marker_d clean "$(printf 'e%.0s' {1..40})" "$(printf 'd%.0s' {1..64})")"
+    FILES=$'added\tdocs/plans/2026-10-17-issue-3315-carry.md\t'
+    FILES_EXPECTED=1
+    FAILURES=0
+    C35_LOG="$(mktemp /tmp/pipeline-3315once.XXXXXX)"
+    export PCC3315_MODE=red-surface PCC3315_DIGEST="$C3315_DIGEST" PCC3315_ARGV_LOG="$C3315_ARGV" PCC3315_CARRY_ONLY="$C3315_DIGEST"
+    RECORDER="$C3315_STUB"
+    run_checks > "$C35_LOG" 2>&1 || true
+    RECORDER="$C3315_STUB"
+    unset PCC3315_MODE PCC3315_DIGEST PCC3315_ARGV_LOG PCC3315_CARRY_ONLY
+    C35_N="$(grep -cF 'Red group(s): CI|bash-suites (3)' "$C35_LOG" 2>/dev/null || true)"
+    if [[ "${C35_N:-0}" -eq 1 ]]; then
+      echo "  ✅ pass 38: the producer's red-group lines are RELAYED exactly ONCE, above the refusal they support"
+    else
+      echo "  ❌ pass 38: the red-group lines appeared ${C35_N:-0} time(s), wanted 1 — the relay is per-ASK, not per-REPORT" >&2
+      C3315_FAILS=$((C3315_FAILS + 1))
+    fi
+    command rm -f "$C35_LOG"
+    unset C35_LOG C35_N
+  }
   unset PCC3315_CARRY_ONLY
-  rm -rf "$C3315_DIR"
+  HOME="$C3315_HOME_SAVE"
+  if [ "$C3315_KEY_SAVE" = "__unset__" ]; then unset AI_REVIEW_GATE_KEY; else AI_REVIEW_GATE_KEY="$C3315_KEY_SAVE"; fi
+  unset C3315_KEY_SAVE C3315_HOME_SAVE
+  rm -rf "$C3315_ISO" "$C3315_DIR"
   if [[ "$C3315_FAILS" -ne 0 ]]; then
-    echo "  ❌ passes 15–29: $C3315_FAILS carry-arm assertion(s) failed (#3315)" >&2
+    echo "  ❌ passes 15–38: $C3315_FAILS carry-arm assertion(s) failed (#3315 / #3440)" >&2
     exit 2
   fi
   summarize || true
@@ -3699,6 +5110,308 @@ $big_filler"
   unset CL_SHA40 CL_MODERN CL_PROSE CL_MODERN_OK CL_PROSE_OK CL_LOG CL_RC CL_OK CL_MUT_DIR CL_MUT CL_MLOG CL_MRC \
     CL_ABS_DIR CL_ABS CL_ALOG CL_ARC CL_AOK CL_AMUT CL_AMLOG CL_AMRC 2>/dev/null || true
 
+  # ── #1224 — the RECORD-FIRST source, and the two mutations that must flip it ──
+  # check (c) read its attestation from ONE place: the PR body, which any
+  # `gh pr edit` overwrites (a typo fix did exactly that on agent-infra#1209 and
+  # premise-labs#3788). It now reads the head-bound RECORD FILE first and the
+  # body only as a fallback. THREE runs pin it, because a suite that only proved
+  # the happy path would let a fail-open land green:
+  #   * the REAL gate must report passes 1224a–1224f clean (record-first works; the
+  #     stale record is refused with both shas; the body fallback still serves; a
+  #     marker in a PR COMMENT reaches a box with no record store; an unsigned
+  #     record and a present-but-unusable record are both REFUSED by name) — this
+  #     is what puts those vectors in front of CI at all, since CI runs SELF_TEST
+  #     and never FAIL_ALL (#991).
+  #   * MUTANT A deletes the JSON read (`review_record_at_head() { return 1; }`)
+  #     and must FLIP pass 1224a — while 1224c stays green, which is what makes
+  #     the mutation specific to the record read rather than to check (c) as a
+  #     whole.
+  #   * MUTANT B drops the head comparison (its `if [ "$sha" != "$head" ]; then`
+  #     becomes `if false; then`) and must FLIP pass 1224b — while 1224a and 1224c
+  #     stay green. That arm is the whole point of the fix: with it gone a record
+  #     for an OLDER head certifies an UNREVIEWED revision.
+  #   * MUTANT C drops the SIGNATURE arm (its `sig=` block is replaced by `:`) and
+  #     must FLIP pass 1224e — while 1224a stays green. Without it, a hand-written
+  #     file at the store path satisfies (c) and leaves nothing in the PR to audit.
+  #   * MUTANT D drops the comment arm's AUTHOR admission (the association test
+  #     becomes `if false; then`) and must FLIP pass 1224h — while 1224d (a
+  #     trusted author) stays green. Without it, any GitHub account can post the
+  #     marker on a public repo and satisfy the ONLY required check.
+  #   * MUTANT E drops the comment arm's SIGNATURE check (its verdict test becomes
+  #     `if true; then`) and must FLIP pass 1224g — while 1224d stays green.
+  #     Without it, an UNSIGNED comment line is evidence wherever a gate key is
+  #     present to have proven otherwise.
+  RV1224_DIR="$(mktemp -d "${TMPDIR:-/tmp}/pipeline-1224-mut.XXXXXX")"
+  rv1224_drive() { # rv1224_drive <script> <log> — FAIL_ALL, isolated $HOME, rc on stdout
+    local s="$1" log="$2" rc=0
+    mkdir -p "$RV1224_DIR/home"
+    HOME="$RV1224_DIR/home" \
+    PIPELINE_COMPLIANCE_SELF_TEST=0 PIPELINE_COMPLIANCE_DRY_RUN=1 PIPELINE_COMPLIANCE_FAIL_ALL=1 \
+      PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
+      GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$s" >"$log" 2>&1 || rc=$?
+    printf '%s' "$rc"
+  }
+  # ⛔ THE CHILD'S WHOLE-RUN EXIT CODE IS NOT A VERDICT ON THESE VECTORS (review
+  # finding 6). FAIL_ALL exits 1 by design, but an `exit 2` from ANY earlier block
+  # TRUNCATES the log — so `rc == 1` was never the right predicate. Measured, twice:
+  # with the #3315 pass-30 vector red the banner read "0 of 11 vectors not green"
+  # while all 12 were green, and a red in the #1825 block emitted five
+  # "mutation X NOT caught" lines for mutations that were applied fine and simply
+  # never reached. Two changes: judge on the GREPS only, and separate a vector that
+  # is RED from one that was never REACHED (the log has no line for it at all).
+  # One driver for the mutants added after A–G, so each of them gets the same
+  # "caught / not caught / never reached" trichotomy as those above.
+  rv1224_mutation() { # <label> <perl-expr> <needle> <flip-vector> <control-vector> <caught-msg>
+    local label="$1" expr="$2" needle="$3" flip="$4" control="$5" what="$6" mf="" rc=""
+    mf="$RV1224_DIR/mut$label.sh"
+    perl -0pe "$expr" "$SELF_SRC" > "$mf" || true
+    if [[ ! -s "$mf" ]] || cmp -s "$mf" "$SELF_SRC" || ! bash -n "$mf" 2>/dev/null \
+       || ! grep -q -- "$needle" "$mf"; then
+      printf '❌ #1224 mutation %s: could not apply (%s absent after the edit) — the mutation guard is blind\n' "$label" "$needle" >&2
+      selffail=$((selffail + 1)); return 0
+    fi
+    rc="$(rv1224_drive "$mf" "$RV1224_DIR/mut$label.log")"
+    if grep -q "❌ pass $flip" "$RV1224_DIR/mut$label.log" && grep -q "✅ pass $control" "$RV1224_DIR/mut$label.log"; then
+      printf '✅ #1224 mutation %s is caught: %s\n' "$label" "$what"
+    elif ! rv1224_reached "$RV1224_DIR/mut$label.log" "$control"; then
+      printf '⚠️ #1224 mutation %s: the mutant run ABORTED before the control vector (%s), so the missing flip is NOT a verdict on the mutation\n' "$label" "$control" >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation %s NOT caught (mutant rc=%s): %s\n' "$label" "$rc" "$what" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mut$label.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  }
+
+  # ⛔ "NOT CAUGHT" AND "NEVER REACHED" ARE DIFFERENT DIAGNOSES (review finding 6).
+  # Every guard below asserts a flip AND a green control; when an `exit 2` in an
+  # earlier block truncates the child log, neither line exists and the old message
+  # blamed the mutation — measured: five simultaneous false "NOT caught" verdicts
+  # from one red in the #1825 block. The control vector's presence in the log is
+  # what proves this block ran.
+  rv1224_reached() { # <log> <control-vector>
+    grep -q "✅ pass $2" "$1"
+  }
+  RV1224_RC="$(rv1224_drive "$SELF_SRC" "$RV1224_DIR/real.log")"
+  RV1224_VECTORS=(1224T 1224a 1224b 1224c 1224d 1224e 1224f 1224g 1224h 1224i 1224j 1224k 1224l 1224m 1224n 1224o 1224p 1224q)
+  RV1224_BAD=0; RV1224_MISSING=0
+  for RV1224_P in "${RV1224_VECTORS[@]}"; do
+    if grep -q "✅ pass $RV1224_P" "$RV1224_DIR/real.log"; then continue; fi
+    if grep -q "❌ pass $RV1224_P" "$RV1224_DIR/real.log"; then
+      RV1224_BAD=$((RV1224_BAD + 1))
+    else
+      RV1224_MISSING=$((RV1224_MISSING + 1))
+    fi
+  done
+  if [[ "$RV1224_BAD" == "0" && "$RV1224_MISSING" == "0" ]]; then
+    printf '✅ #1224: the REAL gate resolves check (c) from the head-bound SIGNED record FIRST — 1224T proves the comment fixtures are BYTE-IDENTICAL to the production fetch expression REVIEW_COMMENTS_JQ emits, 1224a passes with the body attestation WIPED (source=record), 1224b REFUSES a record bound to another head naming both shas, 1224c still accepts the body fallback, 1224d accepts the producer marker COMMENT, signed, inside the fetch frame (association + 0x1e) on a box with NO record store (the CI runner, finding 2), 1224e REFUSES an unverifiable sig as not-evidence (finding 3), 1224f reports a present-but-unusable record as UNUSABLE rather than absent (finding 4), 1224g REFUSES an UNSIGNED marker comment, 1224h REFUSES a marker comment from an author GitHub does not attest as OWNER/MEMBER/COLLABORATOR, 1224i reads the verdict from the matched LINE rather than from a stale clean-micro elsewhere in the stream, 1224j admits a trusted-author marker where NO gate key exists (the required check runner) while saying so, 1224k and 1224m pin the PRECEDENCE ITSELF in BOTH directions — with a signed record AND a weaker artifact (1224k: the body marker; 1224m: an admitted COMMENT) both naming this head, the RECORD answers, so a body-first OR comment-first mutant is visible; and 1224l pins the OWN head comparison of the COMMENT arm, so an older-head comment cannot certify this revision\n'
+  else
+    printf '❌ #1224: the record-first read is unpinned or wrong (child rc=%s; %s of %s vector(s) RED, %s NOT REACHED — a non-zero count here means the child aborted before this block ran) — check (c) could fall back to the mutable PR body\n' \
+      "$RV1224_RC" "$RV1224_BAD" "${#RV1224_VECTORS[@]}" "$RV1224_MISSING" >&2
+    grep -E 'pass 1224|❌ \[c\]' "$RV1224_DIR/real.log" >&2 || true
+    selffail=$((selffail + 1))
+  fi
+  # MUTANT A — the JSON read deleted. Nothing else touched, so the body fallback
+  # must survive: 1224c green is the control that proves what was removed.
+  RV1224_MA="$RV1224_DIR/mutantA.sh"
+  perl -0pe 's/\Qreview_record_at_head()\E \{.*?\n\}/review_record_at_head() { return 1; }/s' "$SELF_SRC" > "$RV1224_MA" || true
+  if [[ ! -s "$RV1224_MA" ]] || cmp -s "$RV1224_MA" "$SELF_SRC" || ! bash -n "$RV1224_MA" 2>/dev/null; then
+    printf '❌ #1224 mutation A: could not delete the record read (review_record_at_head reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_ARC="$(rv1224_drive "$RV1224_MA" "$RV1224_DIR/mutA.log")"
+    if grep -q '❌ pass 1224a' "$RV1224_DIR/mutA.log" && grep -q '✅ pass 1224c' "$RV1224_DIR/mutA.log"; then
+      printf '✅ #1224 mutation A is caught: with the JSON record read DELETED, 1224a flips to red ("❌ pass 1224a: the on-disk record at THIS head did NOT satisfy check (c)") while the body fallback 1224c stays green — the record read is load-bearing, and only it\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutA.log" "1224c"; then
+      printf '⚠️ #1224 mutation A: the mutant run ABORTED before the control vector (1224c), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation A NOT caught (mutant rc=%s) — deleting the record read does not redden 1224a, so the vector proves nothing\n' "$RV1224_ARC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutA.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT B — the head comparison dropped: the fix's whole point.
+  RV1224_MB="$RV1224_DIR/mutantB.sh"
+  # ⛔ EXPLICIT ESCAPING, not \Q...\E: `\Q` quotemeta runs AFTER variable
+  # interpolation in a Perl regex, so \Q"$sha"\E compiles to `""` and silently
+  # matches nothing — the mutation would report itself blind (measured here).
+  # The guard is its own `if` statement (not a `|| continue` one-liner) so this
+  # regex stays anchored on a stable, uniquely-indented line.
+  perl -0pe 's/\n  if \[ "\$sha" != "\$head" \]; then/\n  if false; then # mutantB/' "$SELF_SRC" > "$RV1224_MB" || true
+  if [[ ! -s "$RV1224_MB" ]] || cmp -s "$RV1224_MB" "$SELF_SRC" || ! bash -n "$RV1224_MB" 2>/dev/null \
+     || ! grep -q 'if false; then # mutantB' "$RV1224_MB"; then
+    printf '❌ #1224 mutation B: could not drop the head comparison ([ "$sha" != "$head" ] guard reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_BRC="$(rv1224_drive "$RV1224_MB" "$RV1224_DIR/mutB.log")"
+    if grep -q '❌ pass 1224b' "$RV1224_DIR/mutB.log" && grep -q '✅ pass 1224a' "$RV1224_DIR/mutB.log"; then
+      printf '✅ #1224 mutation B is caught: with the head comparison DROPPED, 1224b flips to red ("❌ pass 1224b: a record bound to ANOTHER head was ACCEPTED…") while 1224a stays green — the head binding is what refuses a stale record, not the record'\''s presence\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutB.log" "1224a"; then
+      printf '⚠️ #1224 mutation B: the mutant run ABORTED before the control vector (1224a), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation B NOT caught (mutant rc=%s) — dropping the head comparison does not redden 1224b, so a stale record would certify an unreviewed head\n' "$RV1224_BRC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutB.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT C — the SIGNATURE arm neutralised: 1224e must flip, 1224a must stay green.
+  # It is neutered at its COMPARISON rather than by deleting the block: a one-line
+  # anchor stays stable, and the no-`sig`/shape arms still run, so what flips is
+  # exactly "the HMAC decides", not "the field exists".
+  RV1224_MC="$RV1224_DIR/mutantC.sh"
+  perl -0pe 's/\n  if \[ "\$expect" != "\$sig" \]; then/\n  if false; then # mutantC/' "$SELF_SRC" > "$RV1224_MC" || true
+  if [[ ! -s "$RV1224_MC" ]] || cmp -s "$RV1224_MC" "$SELF_SRC" || ! bash -n "$RV1224_MC" 2>/dev/null; then
+    printf '❌ #1224 mutation C: could not neuter the signature comparison (review_record_eval reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_CRC="$(rv1224_drive "$RV1224_MC" "$RV1224_DIR/mutC.log")"
+    if grep -q '❌ pass 1224e' "$RV1224_DIR/mutC.log" && grep -q '✅ pass 1224a' "$RV1224_DIR/mutC.log"; then
+      printf '✅ #1224 mutation C is caught: with the SIGNATURE arm removed, 1224e flips to red (an unverifiable-sig record is ACCEPTED) while 1224a stays green — the signature, not the file'\''s presence, is what makes a private record evidence\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutC.log" "1224a"; then
+      printf '⚠️ #1224 mutation C: the mutant run ABORTED before the control vector (1224a), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation C NOT caught (mutant rc=%s) — deleting the signature arm does not redden 1224e, so any hand-written file at the store path would satisfy (c)\n' "$RV1224_CRC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutC.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT D — the comment arm's AUTHOR admission removed: 1224h must flip.
+  # 1224d (a trusted author) stays green, which is what makes the mutation
+  # specific to the ASSOCIATION test and not to the comment arm as a whole.
+  RV1224_MD="$RV1224_DIR/mutantD.sh"
+  perl -0pe 's/\n    if ! \[\[ "\$assoc" =~ \$REVIEW_COMMENT_TRUSTED_ASSOC_RE \]\]; then/\n    if false; then # mutantD/' "$SELF_SRC" > "$RV1224_MD" || true
+  if [[ ! -s "$RV1224_MD" ]] || cmp -s "$RV1224_MD" "$SELF_SRC" || ! bash -n "$RV1224_MD" 2>/dev/null \
+     || ! grep -q 'if false; then # mutantD' "$RV1224_MD"; then
+    printf '❌ #1224 mutation D: could not drop the comment AUTHOR admission (%s reformatted?) — the mutation guard is blind\n' 'REVIEW_COMMENT_TRUSTED_ASSOC_RE' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_DRC="$(rv1224_drive "$RV1224_MD" "$RV1224_DIR/mutD.log")"
+    if grep -q '❌ pass 1224h' "$RV1224_DIR/mutD.log" && grep -q '✅ pass 1224d' "$RV1224_DIR/mutD.log"; then
+      printf '✅ #1224 mutation D is caught: with the comment AUTHOR admission dropped, 1224h flips to red (a NONE-association commenter is ACCEPTED) while 1224d stays green — the author, not the marker text, is what admits a comment on a public repo\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutD.log" "1224d"; then
+      printf '⚠️ #1224 mutation D: the mutant run ABORTED before the control vector (1224d), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation D NOT caught (mutant rc=%s) — dropping the author admission does not redden 1224h, so any GitHub account could satisfy check (c)\n' "$RV1224_DRC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutD.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT E — the comment arm's SIGNATURE check removed: 1224g must flip while
+  # 1224d (correctly signed) stays green.
+  RV1224_ME="$RV1224_DIR/mutantE.sh"
+  perl -0pe 's/\n      if review_marker_sig_ok "\$body" "\$key"; then/\n      if true; then # mutantE/' "$SELF_SRC" > "$RV1224_ME" || true
+  if [[ ! -s "$RV1224_ME" ]] || cmp -s "$RV1224_ME" "$SELF_SRC" || ! bash -n "$RV1224_ME" 2>/dev/null \
+     || ! grep -q 'if true; then # mutantE' "$RV1224_ME"; then
+    printf '❌ #1224 mutation E: could not neuter the comment SIGNATURE check (review_marker_sig_ok call reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_ERC="$(rv1224_drive "$RV1224_ME" "$RV1224_DIR/mutE.log")"
+    if grep -q '❌ pass 1224g' "$RV1224_DIR/mutE.log" && grep -q '✅ pass 1224d' "$RV1224_DIR/mutE.log"; then
+      printf '✅ #1224 mutation E is caught: with the comment SIGNATURE check removed, 1224g flips to red (an UNSIGNED marker comment is ACCEPTED where a gate key exists to have refused it) while 1224d stays green — the sig, not the text shape, is what binds a comment to the gate\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutE.log" "1224d"; then
+      printf '⚠️ #1224 mutation E: the mutant run ABORTED before the control vector (1224d), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation E NOT caught (mutant rc=%s) — neutering the comment signature check does not redden 1224g, so a typed (unsigned) comment line could satisfy (c)\n' "$RV1224_ERC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutE.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT F — the COMMENT arm's HEAD comparison removed (review finding 1):
+  # 1224l must flip while 1224d (correctly head-bound) stays green.
+  RV1224_MF="$RV1224_DIR/mutantF.sh"
+  # ⛔ THE PATTERN MUST ANCHOR ON THE COMMENT ARM. `has_review_record` (the BODY
+  # arm) carries a byte-identical head comparison two functions earlier, so a
+  # bare match neuters the WRONG one — measured: mutant F left 1224l green and
+  # silently re-ran mutation B. The preceding `"$body" =~ $REVIEW_RECORD_MARKER_RE`
+  # line exists only in the comment arm, so it is the anchor.
+  perl -0pe 's/(\[\[ "\$body" =~ \$REVIEW_RECORD_MARKER_RE \]\] \|\| continue\n    \[\[ "\$\{BASH_REMATCH\[1\]\}" == "\$pr" \]\] \|\| continue\n    )\[\[ "\$\{BASH_REMATCH\[3\]\}" == "\$head" \]\] \|\| continue/${1}: # mutantF/' "$SELF_SRC" > "$RV1224_MF" || true
+  if [[ ! -s "$RV1224_MF" ]] || cmp -s "$RV1224_MF" "$SELF_SRC" || ! bash -n "$RV1224_MF" 2>/dev/null \
+     || ! grep -q ': # mutantF' "$RV1224_MF"; then
+    printf '❌ #1224 mutation F: could not neuter the comment arm HEAD comparison (the guard was reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_FRC="$(rv1224_drive "$RV1224_MF" "$RV1224_DIR/mutF.log")"
+    if grep -q '❌ pass 1224l' "$RV1224_DIR/mutF.log" && grep -q '✅ pass 1224d' "$RV1224_DIR/mutF.log"; then
+      printf '✅ #1224 mutation F is caught: with the COMMENT arm HEAD comparison dropped, 1224l flips to red (an OLDER-head comment is ACCEPTED as head-bound, bypassing both the binding and the carry content-identity proof) while 1224d, which names this head, stays green\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutF.log" "1224d"; then
+      printf '⚠️ #1224 mutation F: the mutant run ABORTED before the control vector (1224d), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation F NOT caught (mutant rc=%s) — neutering the comment head comparison does not redden 1224l, so any admitted comment could certify any revision\n' "$RV1224_FRC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutF.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT G — the ABSENT-`repo` refusal removed (review round 2 finding 2): 1224o
+  # must flip while 1224a (a record that DOES name this repo) stays green.
+  RV1224_MG="$RV1224_DIR/mutantG.sh"
+  perl -0pe 's/\n  if \[ -z "\$rec_repo" \]; then/\n  if false; then # mutantG/' "$SELF_SRC" > "$RV1224_MG" || true
+  if [[ ! -s "$RV1224_MG" ]] || cmp -s "$RV1224_MG" "$SELF_SRC" || ! bash -n "$RV1224_MG" 2>/dev/null \
+     || ! grep -q 'if false; then # mutantG' "$RV1224_MG"; then
+    printf '❌ #1224 mutation G: could not neuter the absent-repo refusal ([ -z "$rec_repo" ] guard reformatted?) — the mutation guard is blind\n' >&2
+    selffail=$((selffail + 1))
+  else
+    RV1224_GRC="$(rv1224_drive "$RV1224_MG" "$RV1224_DIR/mutG.log")"
+    if grep -q '❌ pass 1224o' "$RV1224_DIR/mutG.log" && grep -q '✅ pass 1224a' "$RV1224_DIR/mutG.log"; then
+      # ⛔ HONEST SPLIT (review round 3 finding 4): neutering `if [ -z "$rec_repo" ]`
+      # does NOT by itself reopen the fail-open — the NEXT guard (repo equality)
+      # still refuses, with a message that names repo '' — so what this flip proves
+      # is the DIAGNOSIS (the refusal names the absent binding), not the refusal.
+      # The fail-open itself was measured separately: full legacy acceptance (drop
+      # the block, compare only when repo is non-empty) reddens 1224o and nothing
+      # else. Both are pinned; they are not the same assertion.
+      printf '✅ #1224 mutation G is caught: with the ABSENT-repo refusal neutered, 1224o flips to red (the refusal no longer NAMES the absent binding; the repo-equality guard still refuses, and full legacy acceptance was measured separately to redden 1224o alone) while 1224a, whose record names this repo, stays green\n'
+    elif ! rv1224_reached "$RV1224_DIR/mutG.log" "1224a"; then
+      printf '⚠️ #1224 mutation G: the mutant run ABORTED before the control vector (1224a), so the missing flip is NOT a verdict on the mutation — an upstream block is red; fix that first\n' >&2
+      selffail=$((selffail + 1))
+    else
+      printf '❌ #1224 mutation G NOT caught (mutant rc=%s) — removing the absent-repo refusal does not redden 1224o, so a repo-less record could certify another repo\n' "$RV1224_GRC" >&2
+      grep -E 'pass 1224' "$RV1224_DIR/mutG.log" >&2 || true
+      selffail=$((selffail + 1))
+    fi
+  fi
+  # MUTANT H — the COMMENT arm moved AHEAD of the record arm (review round 3
+  # finding 8: 1224m discriminates a comment-first order — measured — but nothing
+  # stopped the fixture from silently going back to an UNSIGNED comment, which
+  # would make it blind again). This is the order mutant 1224m exists for.
+  rv1224_mutation H \
+    's/(\n  # 1\. THE IMMUTABLE SOURCE\.)/\n  if has_comment_review_record "\${comments:-}" "\$pr" "\$repo" "\$head"; then\n    REVIEW_EVIDENCE_SOURCE="comment"; REVIEW_EVIDENCE_WHERE="PR comments"; REVIEW_EVIDENCE_VERDICT="\$REVIEW_COMMENT_MATCHED_VERDICT"; return 0\n  fi$1/' \
+    'if has_comment_review_record "${comments:-}" "$pr" "$repo" "$head"; then' \
+    1224m 1224a \
+    'with the COMMENT arm ahead of the RECORD arm, 1224m flips to red (a weaker comment tier would outrank the signed head-bound record) while 1224a, which has no comment, stays green — the precedence 1224m pins is the shipped one'
+  # MUTANT I — every PR-number comparison dropped. Coarse ON PURPOSE: the same
+  # `BASH_REMATCH[1] == pr` line exists on the body arm too, so a per-arm mutant
+  # would have to be regex-anchored to one function and would report itself blind
+  # the moment that function is reformatted. The claim made here is the weaker,
+  # true one: the PR binding is load-bearing on the comment arm.
+  rv1224_mutation I \
+    's/(\[\[ "\$body" =~ \$REVIEW_RECORD_MARKER_RE \]\] \|\| continue\n    )\[\[ "\$\{BASH_REMATCH\[1\]\}" == "\$pr" \]\] \|\| continue/${1}: # mutantI/' \
+    '# mutantI' \
+    1224p 1224d \
+    'with the COMMENT arm PR-number comparison dropped, 1224p flips to red (a marker minted for PR 424299 certifies #1) while 1224d, whose marker names this PR, stays green'
+  # MUTANT J — the COMMENT arm repo comparison dropped. Anchored on the `$body`
+  # marker line and closed non-greedily on the FIRST repo compare after it, so the
+  # body arm's identical line is untouched (a coarse mutant would abort the #1825
+  # block that runs BEFORE the 1224 vectors, making the control unreachable).
+  rv1224_mutation J \
+    's/(\[\[ "\$body" =~ \$REVIEW_RECORD_MARKER_RE \]\].*?)\[\[ "\$got_repo" == "\$want_repo" \]\] \|\| continue/${1}: # mutantJ/s' \
+    '# mutantJ' \
+    1224q 1224d \
+    'with the COMMENT arm repo comparison dropped, 1224q flips to red (a marker naming premise-labs/tortoise certifies daniel-ospina/agent-infra) while 1224d stays green'
+  # MUTANT K — the CARRY channel's repo comparison dropped (round 3 finding 3: the
+  # same hole one function over, measured fully green).
+  rv1224_mutation K \
+    's/(\[\[ -n "\$blob" && -n "\$pr" && -n "\$repo" \]\] \|\| return 0.*?)\[\[ "\$got_repo" == "\$want_repo" \]\] \|\| continue/${1}: # mutantK/s; s/(if \[\[ "\$\{BASH_REMATCH\[3\]\}" == "\$head" \]\]; then continue; fi.*?)\[\[ "\$got_repo" == "\$want_repo" \]\] \|\| continue/${1}: # mutantK2/s' \
+    '# mutantK' \
+    32 30 \
+    'with BOTH repo filters on the carry path dropped (the admitted-comment filter AND the candidate scan), pass 32 flips to red (an earlier-head marker for premise-labs/tortoise drives a carry on this repo) while pass 30, whose marker names this repo, stays green — the binding is defence in depth, so removing one layer alone is not observably unsafe and the mutant says so by removing both'
+  rm -rf "$RV1224_DIR"
+
   # ── #1825 — check (c)'s evidence is a HEAD-BOUND RECORD, not a phrase ──────
   # The issue's measured defect: (c) was a substring alternation over the PR
   # body and the commit messages, so a PR merged with no reviewer behind it as
@@ -3762,6 +5475,77 @@ $big_filler"
   # A verdict the producer does not mint is not a record either — the shape is
   # the producer's, not "any word after verdict=".
   expect_record 'an invented verdict' "$(bound_marker approve)" absent
+
+  # ⛔ #3164 — THE VERDICT IS THE PRODUCER'S CLEAN FAMILY, AND NOTHING ELSE. record-review.sh MINTS
+  # four verdicts (`clean|clean-micro|clean-low|not-clean`); this gate accepts exactly the three that
+  # are an APPROVAL, and `not-clean` is the recorder's NEGATIVE verdict — admitted there so the newest
+  # negative review is SEEN (#3410), never so it can merge. So a `not-clean` marker must not satisfy
+  # check (c), and neither may a negated, empty or prefix-widened verdict.
+  #
+  # ⛔ Anchors in this block were RE-MEASURED after #3164's change was re-applied onto main (main's
+  # record-first rewrite, #2983/#3454, moved this file ~1713 lines and `record-review.sh` inside the
+  # cited regions). Cite the tree you are reading, not the PR body: the body quotes the pre-merge
+  # numbers and an append-only proof comment cannot be corrected, so this copy is the live one.
+  #
+  # ⛔ WHY THESE VECTORS EXIST (measured, not hypothetical): NO control above can see the widening
+  # THIS ISSUE IS ABOUT — admitting `not-clean`, the verdict the recorder MINTS FOR A REFUSAL
+  # (`record-review.sh:1718`). The controls that name a verdict assert `clean` (`:5449`, `:5473`),
+  # which every widening of this form still ADMITS; `approve` (`:5477`) is refused, but only a `(.*)`
+  # widening reddens it (one of the 5 reds below) — `+ not-clean` leaves it GREEN, because `approve`
+  # and `not-clean` are different strings; the two phrase controls (`:5444`, `:5446`) name no verdict.
+  #
+  # ⛔ AND A REFUSAL IS NOW REFUSED TWICE, WHICH IS WHY THERE ARE TWO NOT-CLEAN ROWS. A `not-clean`
+  # marker is not just a different verdict: `record-review.sh:5287-5294` appends its `findings=<N>`
+  # trailer AFTER `(<repo>)`, DELIBERATELY ("the only consequence is that those parsers do not
+  # certify the line as clean — which is the CORRECT outcome for a NOT CLEAN record"), and this
+  # gate's `… (\(…\))( sig=…)?$` anchor stops at the repo group. So the refusal holds on two
+  # independent mechanisms: the verdict allow-list, and the trailer defeating the anchor. A lane
+  # that widens the allow-list alone therefore still cannot admit the producer's record — but a lane
+  # that widens the allow-list AND teaches the anchor the trailer (a perfectly ordinary "make the
+  # gate able to SEE the negative record" change, which is the #3410 motivation this comment block
+  # cites) admits a refusal the recorder can actually mint.
+  #
+  # ⛔ AND THE TWO ROWS PIN THE TWO-MECHANISM DEFENCE AS A SET, NOT ONE-APIECE. Measured: teaching the
+  # anchor the trailer ALONE (allow-list untouched) reds NOTHING — 267 ✅ / 0 ❌ / rc 0, stdout
+  # byte-identical to the green control — because a `not-clean` verdict still fails the allow-list. Only the COMBINED
+  # mutant reddens the producer-shaped row. So the anchor half is pinned JOINTLY, and a lane that
+  # widens the anchor tail by itself will see a fully green self-test. Do not read the row pair as
+  # "neither mechanism can be dropped silently": the ALLOW-LIST can be, alone (1 red); the ANCHOR
+  # cannot — nothing reds for it on its own. That is stated rather than papered over because a
+  # comment promising a per-mechanism pin would be the same class of defect as an unpinned pin (#3164
+  # review r15 measured the anchor-only widening at 255/0 and falsified the earlier wording here;
+  # RE-MEASURED at this tree it is 267/0 — same verdict, larger green control, because main added
+  # assertions above this block (#2983/#1224, #3454/#3440). Re-measure, do not carry a count across a
+  # base.)
+  #
+  # WHICH MUTANT REDDENS WHICH ROW (measured, one mutant per row group — a widening is not one shape):
+  #   · `+ not-clean` in the allow-list → the TRAILERLESS not-clean row alone (1 red); the
+  #     producer-shaped row stays green because the trailer still defeats the anchor.
+  #   · `+ not-clean` AND a `findings=( note=…)?` trailer admitted before the optional `sig=` → both
+  #     not-clean rows (2 red). This is the mutant that admits a mintable REFUSAL — the false PASS.
+  #   · `verdict=(.*)` (the allow-list stops being a vocabulary at all) → 5 red: the TRAILERLESS
+  #     not-clean row, negated, empty, prefix-widened, and the pre-existing `invented verdict`
+  #     control. The producer-shaped row survives even this, because its trailer still defeats the
+  #     anchor — only the mutant above (allow-list AND trailer) reddens it.
+  #   · narrowed to `verdict=(clean)` → the two clean-family controls below (+ the #1356/#3315/#1825
+  #     FAIL_ALL paths), i.e. the opposite mutation: the one that would false-BLOCK every micro and
+  #     low record. MEASURED at this tree: 20 assertions red (274 ✅, rc 2), 16 of them leading-`❌`
+  #     lines — up from the 8 recorded pre-merge because main's #1224 and #3315/#3440 FAIL_ALL paths
+  #     now abort on the SAME narrowing. The DIRECTION is what this row pins; the count moves with
+  #     the FAIL_ALL surface, so re-measure it rather than trusting this number.
+  # Do not simplify this to "every row is red against the widening": FOUR of the five ABSENT rows in
+  # this block survive `+ not-clean` by construction (only the trailerless row reddens), and a lane
+  # that validates these pins with the wrong mutant learns the opposite of the truth.
+  expect_record 'a NOT-CLEAN verdict — a recorded refusal is not an attestation' "$(bound_marker not-clean)" absent
+  expect_record 'a NOT-CLEAN verdict in the PRODUCER shape (`findings=2` trailer)' \
+    "$(bound_marker not-clean) findings=2" absent
+  expect_record 'a NEGATED verdict (`clean is not claimed`)' "$(bound_marker 'clean is not claimed')" absent
+  expect_record 'an EMPTY verdict' "$(bound_marker '')" absent
+  expect_record 'a PREFIX-WIDENED verdict (`cleanish`)' "$(bound_marker cleanish)" absent
+  # ...and the rest of the family the producer mints still attests, so the allow-list can never be
+  # narrowed to the one spelling the vectors above happen to name.
+  expect_record 'the bound marker, clean-micro (a micro-tier approval)' "$(bound_marker clean-micro)" present
+  expect_record 'the bound marker, clean-low (a content-shape approval)' "$(bound_marker clean-low)" present
 
   # The FAIL_ALL simulation is the PRODUCTION path for check (c)'s fixtures, and
   # CI runs SELF_TEST (never FAIL_ALL) — so the passes that carry the #1825
@@ -4057,7 +5841,7 @@ $big_filler"
   unset reval_sh pipeline_repo_root pipeline_wf pipeline_is_self 2>/dev/null || true
 
   # ── #3315 — CHECK (c) CONSULTS THE CARRY: run the FAIL_ALL arms for real ───
-  # The vectors themselves live in the FAIL_ALL block (passes 15–26), the same
+  # The vectors themselves live in the FAIL_ALL block (passes 15–38), the same
   # way #1356's clean-low vectors do — and for the same reason (#991): CI runs
   # SELF_TEST and never FAIL_ALL, so a vector that only lives there is executed by
   # nothing and pins nothing. This subprocess run is what puts them in front of
@@ -4075,6 +5859,7 @@ $big_filler"
     PIPELINE_COMPLIANCE_ISSUE_ONLY=0 PIPELINE_COMPLIANCE_ISSUE= PIPELINE_COMPLIANCE_SKIP=0 \
     GH_REPO="$GH_REPO" PR_NUMBER=1 bash "$SELF_SRC" >"$C3315_LOG" 2>&1 || C3315_RC=$?
   C3315_MISS=0
+  C3315_N=0
   for C3315_WANT in \
     'pass 15: an earlier-head marker' \
     'pass 15b: the predicate was asked about the MARKER' \
@@ -4092,14 +5877,34 @@ $big_filler"
     'pass 26: an earlier-head marker with NO diff digest' \
     "pass 27: 'carry' with a NON-ZERO exit" \
     "pass 28: 'head'" \
-    'pass 29: the PR BODY marker is preferred' ; do
+    'pass 29: the PR BODY marker is preferred' \
+    'pass 30: an earlier-head marker surviving ONLY as an ADMITTED PR COMMENT' \
+    'pass 31: an earlier-head marker in an UNATTESTED comment is NOT a candidate' \
+    'pass 31b: the predicate was never asked about the unattested comment marker' \
+    'pass 32: an earlier-head comment marker for ANOTHER REPO is NOT a carry candidate' \
+    "pass 33: 'red-base-owned'" \
+    "pass 34: 'red-surface'" \
+    "pass 35: 'surface-unknown'" \
+    "pass 35b: 'red-base-owned' with NO proven diff digest" \
+    'pass 36: the producer'\''s BASE-OWNED group line is RELAYED' \
+    'pass 37: the producer'\''s RED group line is RELAYED' \
+    'pass 38: the producer'\''s red-group lines are RELAYED exactly ONCE' ; do
+    # The count is DERIVED from this list, never a literal: a hardcoded total is how a
+    # vector that is added — or silently deleted — leaves the report claiming coverage it
+    # no longer has (#3440 review round 2).
+    C3315_N=$((C3315_N + 1))
     grep -qF -- "  ✅ $C3315_WANT" "$C3315_LOG" || { C3315_MISS=$((C3315_MISS + 1)); printf '   missing: ✅ %s\n' "$C3315_WANT" >&2; }
   done
-  if [[ "$C3315_MISS" -eq 0 ]]; then
-    printf '✅ #3315: all 17 carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), and a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer each FAIL CLOSED\n'
+  # ⛔ THE CHILD'S STATUS IS ASSERTED TOO (review of #3440, BLOCKING). The label list above can
+  # only see a vector that FAILED to appear as green; it cannot see a vector that was DELETED
+  # from the FAIL_ALL block along with its line, and it cannot see a NEW failing vector that the
+  # list does not name yet. FAIL_ALL exits 1 by design (it ends BLOCKED), 2 when any of its own
+  # assertion groups fails — so `> 1` is the suite reporting a failure, and it must redden here.
+  if [[ "$C3315_MISS" -eq 0 && "${C3315_RC:-0}" -le 1 ]]; then
+    printf '✅ #3315/#3440: all %s carry-arm vectors ran green — the carry PASSES (newest evidence first, body before commit messages), an admitted PR COMMENT carries while an unattested or foreign-repo one does not, and a base-owned red is NAMED; a changed diff / unreadable diff / no record / no digest / rebase / crashing or prose-printing predicate / absent recorder / foreign-repo marker / carried clean-micro marker / carry-with-a-non-zero-exit / head-answer / PR-CAUSED red surface / UNREADABLE check surface each FAIL CLOSED, and the producer\047s own red-group lines are RELAYED into this gate\047s log\n' "$C3315_N"
   else
-    printf '❌ #3315: %s carry-arm vector(s) missing or red (FAIL_ALL rc=%s) — check (c)'"'"'s carry contract is unpinned\n' "$C3315_MISS" "$C3315_RC" >&2
-    grep -E 'pass 1[5-9]|pass 2[0-9]|❌ \[c\]' "$C3315_LOG" >&2 || true
+    printf '❌ #3315/#3440: %s carry-arm vector(s) missing or red (FAIL_ALL rc=%s — anything above 1 is the suite reporting its own failure) — check (c)'"'"'s carry contract is unpinned\n' "$C3315_MISS" "$C3315_RC" >&2
+    grep -E 'pass 1[5-9]|pass (2[0-9]|3[0-9])|❌ \[c\]' "$C3315_LOG" >&2 || true
     selffail=$((selffail + 1))
   fi
   rm -f "$C3315_LOG"
@@ -4117,7 +5922,13 @@ $big_filler"
     printf '⏭️  #3315 contract pin SKIPPED — record-review.sh is not beside this gate (%s), so there is nothing to compare the stub against.\n' "$RECORD_REVIEW_SH"
   else
     C3315_CONTRACT_BAD=0
-    for C3315_PAIR in "carry:0" "head:0" "carry-patch:6" "fresh:1" "unreadable:3" "norecord:4" "nodigest:5"; do
+    # ⛔ EVERY PAIR THE GATE CLASSIFIES (review of #3440, round 2). The list stopped at the seven
+    # pre-#3440 verdicts while `c_carry_ask` already classified TEN, and the green line claimed the
+    # set — so the three surface pairs could drift (a renamed token or a renumbered exit) with this
+    # pin green. The count printed below is derived from this list, never hardcoded.
+    C3315_PAIRS="carry:0 head:0 red-base-owned:0 carry-patch:6 fresh:1 unreadable:3 norecord:4 nodigest:5 red-surface:7 surface-unknown:8"
+    C3315_PAIR_N=0
+    for C3315_PAIR in $C3315_PAIRS; do
       C3315_TOK="${C3315_PAIR%%:*}"; C3315_CODE="${C3315_PAIR#*:}"
       # (1) the header still documents `<token> <spaces> <exit> <description>`
       if ! grep -qE "^#     ${C3315_TOK}[[:space:]]+${C3315_CODE}[[:space:]]" "$RECORD_REVIEW_SH"; then
@@ -4125,17 +5936,18 @@ $big_filler"
         C3315_CONTRACT_BAD=$((C3315_CONTRACT_BAD + 1))
       fi
       # (2) the producer still PRINTS the token on its documented line
+      C3315_PAIR_N=$((C3315_PAIR_N + 1))
       if ! grep -qF "printf '${C3315_TOK}\t" "$RECORD_REVIEW_SH"; then
         printf '❌ #3315 contract: %s no longer prints `%s<TAB>…` — the gate parses that line, so a renamed token would leave every arm green and production red\n' "${RECORD_REVIEW_SH##*/}" "$C3315_TOK" >&2
         C3315_CONTRACT_BAD=$((C3315_CONTRACT_BAD + 1))
       fi
     done
     if [[ "$C3315_CONTRACT_BAD" -eq 0 ]]; then
-      printf '✅ #3315 contract: the real producer still DOCUMENTS and PRINTS all seven verdict/exit pairs the gate classifies (carry:0 head:0 carry-patch:6 fresh:1 unreadable:3 norecord:4 nodigest:5) — the FAIL_ALL stub cannot drift from it silently\n'
+      printf '✅ #3315/#3440 contract: the real producer still DOCUMENTS and PRINTS all %s verdict/exit pairs the gate classifies (%s) — the FAIL_ALL stub cannot drift from it silently\n' "$C3315_PAIR_N" "$C3315_PAIRS"
     else
       selffail=$((selffail + 1))
     fi
-    unset C3315_CONTRACT_BAD C3315_PAIR C3315_TOK C3315_CODE
+    unset C3315_CONTRACT_BAD C3315_PAIR C3315_TOK C3315_CODE C3315_PAIRS C3315_PAIR_N
   fi
 
   # Run the exit check AFTER the #1611 guards, so a failure there is reported
@@ -4146,7 +5958,7 @@ $big_filler"
     exit 2
   fi
 
-  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and check (c)'s ONE carry arm delegates the content-identity verdict to the producer and is pinned in BOTH directions — a carried record PASSES (naming the prior head and the digest, with the predicate asked about the marker's OWN pair) while a changed diff, an unreadable diff, no record, no digest, a rebase, a crashing or prose-printing or absent predicate, a foreign-repo marker and a carried clean-micro marker each FAIL CLOSED, and the stub's verdict/exit pairs are held to the real producer's own documented contract (#3315); and the marker-probe seam that the revalidation script DELEGATES its parse to is pinned by its own vectors, with a PR-lane wiring assertion that the revalidation suite is actually executed (#2467)."
+  echo "✅ SELF-TEST PASS — parse_issue_ref matches a POSITIONAL reference context only (bare #N, owner/repo#N, full URL, pull-URL exclusion; #1012); parse_trace_ref shares that context and covers the NON-closing traceability form, accepted for ANY diff since #1630; pr_is_artifact_only answers over the class declared ONCE as ARTIFACT_CLASS_RE/ARTIFACT_CLASS_DESC and fails closed on any code path, and the class's wording, its --help text and its check-(a) refusal are bound to that declaration (#1611); the check (c) clean-low binding consumes the producer's OWN Low class (sourced from record-review.sh, never restated) and is proven load-bearing by a mutation, INCLUDING in a CONSTRUCTED producer-absent copy where both fail-closed layers must be neutered to reach a false PASS, and the source is held to contributing ONLY that class — the gate's own REFCTX/CLOSING_KW/CLOSING_KW_BOUNDARY are restored, so a consumer repo without §8.13 cannot have check (a) rebound by a sibling (#1356); resolve_issue_ref prefers closure; and check (c) accepts ONLY the record-review.sh marker BOUND to this PR, this repo and this head — every legacy phrase is refused, and each identity field is proven load-bearing by its own vector (#1825); and check (c)'s ONE carry arm delegates the content-identity verdict to the producer and is pinned in BOTH directions — a carried record PASSES (naming the prior head and the digest, with the predicate asked about the marker's OWN pair) while a changed diff, an unreadable diff, no record, no digest, a rebase, a crashing or prose-printing or absent predicate, a foreign-repo marker and a carried clean-micro marker each FAIL CLOSED, and the stub's verdict/exit pairs are held to the real producer's own documented contract (#3315); and (#1224) that evidence is resolved RECORD → COMMENT → BODY — the signed head-bound record file first, the marker in a PR COMMENT next (the copy that survives a body edit AND travels to a CI runner with no record store), the PR body/commit marker last; the source that answered is printed on every (c) line; the body-wiped red-to-green case passes from the record; a record bound to another head is REFUSED naming both shas; a record at this head whose sig= does not verify is refused as NOT evidence; a record that exists but is unusable is reported as UNUSABLE with the field that refused it, never as absent; the COMMENT arm is proven on the PRODUCTION fetch frame (author_association + the 0x1e record terminator), admits only an OWNER/MEMBER/COLLABORATOR author, refuses an unsigned marker wherever a gate key exists, still answers on the no-key runner the required check runs on, and takes its verdict from the marker LINE that matched rather than from a stale clean-micro elsewhere in the append-only stream; ELEVEN mutations (the record read deleted; the head comparison dropped; the record signature arm removed; the comment AUTHOR admission dropped; the comment SIGNATURE check removed; the COMMENT arm head comparison removed; the absent-repo refusal removed; the COMMENT arm moved AHEAD of the record arm; the COMMENT arm PR comparison dropped; the COMMENT arm repo comparison dropped; the carry path as a whole made repo-blind) each redden their own named vector while a named control vector stays green (which OTHER vectors each mutation also reddens is not asserted), and a mutation whose run never reached its control is reported as NOT REACHED rather than NOT CAUGHT; and the marker-probe seam that the revalidation script DELEGATES its parse to is pinned by its own vectors, with a PR-lane wiring assertion that the revalidation suite is actually executed (#2467)."
   exit 0
 fi
 
@@ -4182,6 +5994,31 @@ fi
 
 # ── Live run ────────────────────────────────────────────────────────────────
 PR_BODY="$(fetch_json "pulls/$PR_NUMBER" '.body // ""')"
+# #1224 — the PR COMMENTS: the copy of the review attestation that survives a
+# `gh pr edit` AND reaches a CI runner (whose $HOME has no `~/.pi/agent/reviews`,
+# so the record file cannot travel — see resolve_review_evidence's comment arm).
+#
+# The frame is `<author_association>\x1f<body>\x1e` per comment, and it is built by
+# REVIEW_COMMENTS_JQ — the ONE definition, which the self-test's fixtures use too
+# (a fixture that hand-builds a different shape is how the `0x1e` defect stayed
+# invisible: the vector proved a value the transport never produces).
+#   * the association travels IN-BAND because admission needs the AUTHOR: any
+#     GitHub account can comment on a public repo, so `.[].body` alone was a
+#     field writable by parties with no write access (see
+#     has_comment_review_record);
+#   * both delimiter bytes are stripped from every body first, so the frame
+#     cannot be forged from comment content (the same rule the scoping fetch
+#     states, and the reason the separator is unforgeable);
+#   * the 0x1e terminator is kept (not turned into a newline) so the consumer can
+#     still tell comments apart — the consumer splits on it, which is what makes
+#     the producer's marker-only comment match at all.
+# ⛔ A fetch failure does NOT leave this empty: `fetch_json` classifies the failure
+# and exits 2, so the gate ABORTS with BLOCKED-BY-TOOLING rather than continuing
+# on an empty value (the earlier wording here claimed a degradation the code does
+# not perform). That is the same posture as PR_BODY and SCOPING_COMMENT, and on
+# this endpoint it is the paginated read, i.e. the most failure-prone of the
+# four — if the API cannot answer, no verdict is issued.
+PR_COMMENTS="$(fetch_json "issues/$PR_NUMBER/comments" "$REVIEW_COMMENTS_JQ" 1)"
 # The CURRENT head sha — check (c)'s binding target (#1825). Fetched BEFORE the
 # checks run, and a failed read leaves it EMPTY so (c) fails closed rather than
 # grading a marker against no revision at all.

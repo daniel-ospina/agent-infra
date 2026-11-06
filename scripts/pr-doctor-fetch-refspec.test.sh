@@ -41,6 +41,18 @@
 # revision it was taken at; `tail -1` on a run is the only count this file will ever let a reader check.
 set -uo pipefail
 
+# ⛔ THE PRE-START DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395, review P1).
+# `run_shipped_provision` below drives the REAL `wt_provision`, which now asks the disk predicate BEFORE
+# it creates anything (agent-infra#3395). Without this line the suite is decided by THIS HOST's free
+# space: a `df` reporting under the 8,144 MB requirement flips three arms to rc=4 and reds the suite on
+# an otherwise-green box — and it does so BEFORE `$base` is read, so the MUTANT arm's whole claim ("the
+# 4th argument is load-bearing") collapses into "both were refused for disk". Measured with a 1 GB `df`
+# stub: 23 passed / 3 failed here, 26 passed / 0 failed on the same stub at the base commit. The idiom
+# is the one `harness-refresh.test.sh`, `repo-target.test.sh` and `wt-lifecycle.test.sh` use; the gate's
+# own behaviour is pinned in `disk-admission.test.sh`, which STUBS `df` and therefore measures the gate
+# and not the host. ALL FOUR TERMS: leaving TREE unstated defaults it to 350 MB and re-arms the host.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/pr-doctor.py"
 PASS=0
@@ -410,17 +422,6 @@ live_lines() { # <file> <anchor> [<also-required>] -> ALL non-comment matching l
     ' "$1"
 }
 
-# A whole shipped BLOCK (from <first-line> up to the next line that is exactly `fi` at column 0), so the
-# test runs the script's own DECISION — an `if` whose condition it never re-implements — instead of one
-# line lifted out of it. A decoy line inside a dead branch cannot pass this: the block decides.
-live_block() { # <file> <exact first line>
-    awk -v start="$2" '
-        $0 == start { on = 1 }
-        on { print }
-        on && $0 == "fi" && NR > 0 { exit }
-    ' "$1"
-}
-
 # Run extracted text VERBATIM in <dir>, with the script's own variables bound, and return its status.
 # The subshell is what makes this safe: the shipped lines carry `exit 1` on failure and redirections to
 # `$L.log`, and neither may touch this suite.
@@ -430,6 +431,40 @@ run_shipped() { # <dir> <branch> <worktree> <text> -> rc
       L="$WORK/shipped.log"; O="$WORK/o"
       export BR WT PR L O wt_registered
       eval "$4" ) >/dev/null 2>&1
+}
+
+# The PROVISIONING call needs its helper defined and `$REPO` bound, because that is what the shipped
+# line reads (`wt_provision "$REPO" "$WT" "$BR" "origin/$BR"`). Sourcing the SAME library the
+# script sources keeps the arm honest: the assertion is on the shipped CALL (its arguments included),
+# not on a re-implementation of the provisioning logic inside this test.
+#
+# ⛔ THE LIBRARY IS LOADED FAIL-CLOSED AND ITS ABSENCE IS ITS OWN EXIT CODE (review P1, 2026-11-06).
+# A bare `.` that fails does NOT abort a `set -uo pipefail` subshell, so `eval` then ran an UNDEFINED
+# `wt_provision` and every arm read rc=127 (`command not found`). Measured with the library moved
+# aside: the shipped arm went red under the WRONG cause ("the pre-fix DWIM line?") and the MUTANT arm
+# printed OK — "it failed" is satisfied by a runner that never ran. rc=98 is deliberately a code
+# `wt_provision` never returns (it uses 1/2/3), so no arm can mistake a broken runner for the property
+# it claims to measure.
+#
+# `WT_RESULT` is the producer's own account of WHY, so it is written to <result-file> for the caller:
+# `wt_provision` uses rc=1 for its worktree-add failure and rc=2 for "a pre-existing state I refuse to
+# touch", and those are different facts about different arguments.
+_WTLIB="$HERE/../scripts/orchestrator-harness/wt-lifecycle.sh"
+run_shipped_provision() { # <dir> <branch> <worktree> <text> [<result-file>] -> rc (WT_RESULT in file)
+    ( cd "$1" || exit 99
+      REPO="$PWD"; BR="$2"; WT="$3"; PR="4242"; wt_registered=0
+      L="$WORK/shipped.log"; O="$WORK/o"
+      _res="${5:-$WORK/shipped.result}"
+      export REPO BR WT PR L O wt_registered
+      if ! . "$_WTLIB" >/dev/null 2>&1; then
+          printf '%s' "wt-lifecycle.sh could not be sourced from $_WTLIB — this arm cannot be driven" > "$_res"
+          exit 98
+      fi
+      eval "$4"
+      _rc=$?
+      printf '%s' "${WT_RESULT-}" > "$_res"
+      exit "$_rc"
+    ) >/dev/null 2>&1
 }
 
 mkdir -p "$WORK/o/logs"
@@ -468,26 +503,34 @@ for _sib in scripts/orchestrator-harness/fix-one.sh \
     done < "$WORK/sib-lines.txt"
 done
 
-# ── LA. `adopt-fix.sh`'s WORKTREE BLOCK — the inert-fix arm (review P1, 2026-10-31) ─────────────
+# ── LA. `adopt-fix.sh`'s PROVISIONING CALL — the inert-fix arm (review P1, 2026-10-31) ─────────────
 # The fetch above is necessary and NOT sufficient for this caller. `git worktree add "$WT" "$BR"` is
 # DWIM, and DWIM does not consult the tracking ref — it resolves a bare name through
 # `remote.<name>.fetch` CONFIGURED refspecs. So `adopt-fix.sh` was still dying one line after a
 # now-green fetch, with the fixer never started, and the section above stayed green over it.
-# ⛔ DRIVEN AS A BLOCK, NOT A LINE: the script's own `if [ "$wt_registered" -eq 0 ]; then … fi` is
-# extracted and executed with `wt_registered=0`, so the branch it takes is the branch it ships. A decoy
-# `-b … origin/$BR` line inside a dead branch cannot satisfy this, because the block decides, not a grep.
+# ⛔ DRIVEN AS THE SHIPPED CALL: `adopt-fix.sh` no longer carries an inline worktree block — #2033/#2102
+# refactored it into `wt-lifecycle.sh`'s `wt_provision`, and the caller now just names its arguments:
+#     wt_provision "$REPO" "$WT" "$BR" "origin/$BR"
+# So the argv IS the decision here: the 4th argument is the BASE the branch is created from, and a
+# regression that names the bare `$BR` there resolves through no refspec on a single-branch clone and
+# dies exactly as the pre-fix DWIM line did. The call is extracted (comments skipped) and RUN against
+# the same library, so a decoy in a comment cannot satisfy it, and the MUTANT arm below proves the
+# arm still goes RED when that argument is reverted.
 _adoptf="$HERE/../scripts/orchestrator-harness/adopt-fix.sh"
 if [ ! -f "$_adoptf" ]; then
-    bad "adopt-fix.sh is missing — its worktree block cannot be driven"
+    bad "adopt-fix.sh is missing — its provisioning call cannot be driven"
+elif [ ! -f "$_WTLIB" ]; then
+    # Say it ONCE, by name. The alternative is five reds under a fabricated cause, which is the
+    # #864-class misdiagnosis this file exists to stop.
+    bad "wt-lifecycle.sh is missing at $_WTLIB — adopt-fix.sh's provisioning call cannot be driven (nothing here can load wt_provision)"
 else
     _ad="$WORK/sib-adopt"
     _afl="$(live_line "$_adoptf" 'git fetch origin' '$BR')"
-    _ablk="$(live_block "$_adoptf" 'if [ "$wt_registered" -eq 0 ]; then')"
     if git clone -q --single-branch --branch main "$WORK/origin.git" "$_ad" 2>/dev/null; then
         [ -n "$_afl" ] && run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_afl"
         # ⛔ THE MUTANT (the PRE-FIX form): DWIM, on the SAME clone where the fixed fetch has just
         # created the tracking ref. It must STILL fail — that is the measured fact that made the first
-        # #3009 fix inert, and it is what proves the block below is load-bearing rather than decorative.
+        # #3009 fix inert, and it is what proves the provisioning call below is load-bearing rather than decorative.
         if ( cd "$_ad" && git worktree add "$WORK/wt-dwim" fix/some-branch ) >/dev/null 2>"$WORK/dwim.err"; then
             bad "MUTANT: the DWIM form WORKED on a single-branch clone — the premise of the driver arm is wrong"
         elif grep -qi 'invalid reference' "$WORK/dwim.err"; then
@@ -495,45 +538,158 @@ else
         else
             bad "MUTANT: the DWIM form failed for a different reason: $(head -2 "$WORK/dwim.err" | tr '\n' ' ')"
         fi
-        if [ -z "$_ablk" ]; then
-            bad "adopt-fix.sh's worktree block ('if [ \"\$wt_registered\" -eq 0 ]') is not where this test looks — the arm cannot be driven"
-        elif run_shipped "$_ad" fix/some-branch "$WORK/wt-adopt" "$_ablk"; then
-            # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
-            # `pipefail` is the exact bug adopt-fix.sh:31-34 documents (#864). Same idiom, same reason.
-            _wtl="$(git -C "$_ad" worktree list --porcelain)"
-            case "$_wtl" in
-                *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's OWN worktree block materialises the branch on a single-branch clone (driven)" ;;
-                *) bad "adopt-fix.sh's worktree block returned 0 but no worktree is on branch fix/some-branch" ;;
-            esac
-        else
-            bad "adopt-fix.sh's OWN worktree block FAILED on a single-branch clone — the fixer never starts (the pre-fix DWIM line?)"
-        fi
-        # ⛔ THE LOCAL-BRANCH ARM (the other half of the two-arm block this fix introduces). When
-        # `refs/heads/$BR` already exists — a previous adopt whose worktree was pruned — the block must
-        # still materialise, on the LOCAL branch, without `-b` (which would fail: the branch exists).
-        # Driving it here keeps the new arm from being the one thing in this block that nothing covers.
-        _ld="$WORK/sib-local"
-        if git clone -q --single-branch --branch main "$WORK/origin.git" "$_ld" 2>/dev/null; then
-            [ -n "$_afl" ] && run_shipped "$_ld" fix/some-branch "$WORK/wt-local" "$_afl"
-            if git -C "$_ld" branch fix/some-branch refs/remotes/origin/fix/some-branch >/dev/null 2>&1; then
-                if run_shipped "$_ld" fix/some-branch "$WORK/wt-local" "$_ablk"; then
-                    _wtl2="$(git -C "$_ld" worktree list --porcelain)"
-                    case "$_wtl2" in
-                        *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's block also materialises an ALREADY-LOCAL branch (the re-adopt arm, no -b collision)" ;;
-                        *) bad "adopt-fix.sh's block returned 0 for a pre-existing local branch but no worktree is on it" ;;
-                    esac
-                else
-                    bad "adopt-fix.sh's block FAILED when refs/heads/\$BR already exists — a re-adopt would die"
-                fi
-            else
-                bad "could not pre-create the local branch for the local-arm fixture"
-            fi
-        else
-            bad "could not clone the local-branch fixture for adopt-fix.sh"
-        fi
     else
         bad "could not clone the single-branch fixture for adopt-fix.sh"
     fi
+    # ⛔ EVERY LIVE PROVISIONING LINE, NEVER THE FIRST ONE (review P2, 2026-11-06) — this file's own
+    # doctrine, stated one section up for the fetch lines and silently unapplied here. `live_line`
+    # returned the FIRST match only, so a SECOND live `wt_provision` call appended to adopt-fix.sh (a
+    # fallback arm carrying the pre-#2033 bare base, say) was invisible and the suite stayed green over
+    # it. Measured: appending `if [ "$_wt_rc" != 0 ]; then wt_provision "$REPO" "$WT" "$BR" "$BR"; fi`
+    # below the intact line 38 gave `26 passed, 0 failed` — a live bare-base provisioning call, green.
+    # Each extracted line is DRIVEN in its own fresh single-branch clone, shipped form and mutant
+    # alike, so a decoy that names a second call is caught by the mechanism that catches a decoy fetch.
+    live_lines "$_adoptf" 'wt_provision' > "$WORK/adopt-prov.txt"
+    if [ ! -s "$WORK/adopt-prov.txt" ]; then
+        bad "adopt-fix.sh's provisioning call ('wt_provision …') is not where this test looks — the arm cannot be driven"
+    fi
+    _PN=0
+    while IFS= read -r _aprov; do
+        [ -n "$_aprov" ] || continue
+        _PN=$((_PN + 1))
+        # ══ (a) THE SHIPPED CALL, on a single-branch clone ══════════════════════════════════════════
+        _ad="$WORK/sib-prov-$_PN"
+        _awt="$WORK/wt-prov-$_PN"
+        if ! git clone -q --single-branch --branch main "$WORK/origin.git" "$_ad" 2>/dev/null; then
+            bad "could not clone the single-branch fixture for adopt-fix.sh's provisioning call ('$_aprov')"
+            continue
+        fi
+        [ -n "$_afl" ] && run_shipped "$_ad" fix/some-branch "$_awt" "$_afl"
+        _src=0
+        run_shipped_provision "$_ad" fix/some-branch "$_awt" "$_aprov" "$WORK/prov-ship-$_PN.res" || _src=$?
+        if [ "$_src" != 0 ]; then
+            bad "adopt-fix.sh's OWN provisioning call FAILED on a single-branch clone — the fixer never starts (the pre-fix DWIM line?) rc=$_src [$(cat "$WORK/prov-ship-$_PN.res" 2>/dev/null)]: $_aprov"
+        else
+            # Capture, then classify in the SHELL — never `… | grep -q`, whose false negative under
+            # `pipefail` is the exact bug adopt-fix.sh:31-34 documents (#864). Same idiom, same reason.
+            case "$(git -C "$_ad" worktree list --porcelain)" in
+                *"branch refs/heads/fix/some-branch"*) ok "adopt-fix.sh's OWN provisioning call materialises the branch on a single-branch clone (driven): $_aprov" ;;
+                *) bad "adopt-fix.sh's provisioning call returned 0 but no worktree is on branch fix/some-branch: $_aprov" ;;
+            esac
+        fi
+        # ══ (b) THE MUTANT: the 4th argument reverted to the bare branch (the pre-#2033 shape) ══════
+        # ⛔ ON ITS OWN FRESH CLONE (review P1, 2026-11-06). Run on the clone above — as this arm used
+        # to — the branch is ALREADY checked out at $_awt, so `wt_provision` takes its "branch $br is
+        # already checked out at <other path>" arm and returns 2 BEFORE `$base` is ever read
+        # (the `elif` arm on `symbolic-ref --short HEAD = "$br"` in `wt-lifecycle.sh`'s `wt_provision`;
+        # `base` is consulted only by `wt_ahead_count` and the `worktree add -b` branch — cited by
+        # SYMBOL, not by line: this diff's own insertion into `wt-lifecycle.sh` moved the
+        # ranges these three citations used to name (`344-365`, `298-301`, `394-419`), so a line number
+        # here is a stale number waiting to happen). Measured: rc=2 with the CORRECT base too, so the old arm's
+        # "non-zero ⇒ the 4th argument is load-bearing" verdict was decided by the PATH, not the argv —
+        # and rc=127 (library absent) printed OK too. A fresh clone makes the base the only variable.
+        # ⛔ BOTH SPELLINGS OF THE CORRECT BASE (review P2, 2026-11-06). Pinning the rewrite to one
+        # literal made a semantically identical `"origin/${BR}"` redden under "the argv pin would be
+        # vacuous" — a false red (measured: 25 passed, 1 failed on a clean tree) that also MISNAMED the
+        # cause. Each spelling is rewritten; a base spelled any other way still fails CLOSED here, and
+        # the message now says which spellings this arm knows.
+        _amut="$(printf '%s' "$_aprov" | sed -e 's|"origin/\$BR"|"$BR"|' -e 's|"origin/\${BR}"|"$BR"|')"
+        if [ "$_amut" = "$_aprov" ]; then
+            bad "MUTANT: could not build the bare-base variant from the shipped call — the argv pin would be vacuous. This arm rewrites the 4th argument from \"origin/\$BR\" or \"origin/\${BR}\"; a base spelled any other way cannot be mutated from the call and must be pinned another way: $_aprov"
+        else
+            _md="$WORK/sib-mut-$_PN"
+            _mwt="$WORK/wt-mut-$_PN"
+            if ! git clone -q --single-branch --branch main "$WORK/origin.git" "$_md" 2>/dev/null; then
+                bad "could not clone the FRESH single-branch fixture the MUTANT needs ('$_amut')"
+            else
+                [ -n "$_afl" ] && run_shipped "$_md" fix/some-branch "$_mwt" "$_afl"
+                _mrc=0
+                run_shipped_provision "$_md" fix/some-branch "$_mwt" "$_amut" "$WORK/prov-mut-$_PN.res" || _mrc=$?
+                _mres="$(cat "$WORK/prov-mut-$_PN.res" 2>/dev/null)"
+                _mmat=0
+                case "$(git -C "$_md" worktree list --porcelain)" in
+                    *"branch refs/heads/fix/some-branch"*) _mmat=1 ;;
+                esac
+                case "$_mres" in
+                    *"worktree add failed"*) _mbase=1 ;;
+                    *) _mbase=0 ;;
+                esac
+                # wt_provision's WHOLE contract (the rc rows of `wt_provision`'s doc comment in
+                # `wt-lifecycle.sh` — cited by SYMBOL, not by line): 0 = a usable worktree exists
+                # (what the shipped arm asserts); 1 = nothing created and nothing left behind — the clean
+                # mutant measurement; 3 = the SAME worktree-add failure whose ROLLBACK also failed, so
+                # residue remains (it returns 3 BEFORE setting the 'worktree add failed' account, so
+                # `_mbase` cannot see it — it is still a MEASURED base failure, and the most informative
+                # one); 2 = a path refusal; 4 = the PRE-START DISK REFUSAL (agent-infra#3395, nothing was
+                # created — this suite neutralises the admission above so it cannot fire here, and the code
+                # is named so a future arm that misses a term is not misread as a worktree failure);
+                # 98 = the runner could not load its library; 127 = wt_provision undefined. Only 1 is a
+                # clean verdict; 3 must be surfaced as residue rather than read either as a pass or as a
+                # foreign cause.
+                if [ "$_mrc" = 3 ]; then
+                    bad "MUTANT: the bare-branch base DID fail at 'worktree add' but its ROLLBACK failed too (rc=3) — residue was left in the fixture and must be surfaced, not read as a clean pass: $_mres"
+                elif [ "$_mrc" != 1 ]; then
+                    bad "MUTANT: the bare-branch base failed for a cause that is NOT the base — rc=$_mrc is not the 'worktree add' failure this arm measures (2 = path refusal, 4 = REFUSED-DISK from the pre-start admission — a term of the four-term neutralisation at the top of this file is missing — 98 = library could not be loaded, 127 = wt_provision undefined, or any code outside that contract). 'It failed' is satisfied by all of them: $_mres"
+                elif [ "$_mbase" != 1 ]; then
+                    bad "MUTANT: rc=1 but the account is not the base's 'worktree add': $_mres"
+                elif [ "$_mmat" = 1 ]; then
+                    bad "MUTANT: the bare-branch base returned rc=1 yet a worktree is on the branch — the base was not what failed"
+                else
+                    ok "MUTANT: on a FRESH single-branch clone the pre-#2033 bare-branch base FAILS at 'worktree add' and leaves no worktree behind (rc=1) — the shipped 4th argument is load-bearing"
+                fi
+            fi
+        fi
+        # ══ (c) THE ALREADY-LOCAL BRANCH ARM (the other half of the two-arm pair) ════════════════════
+        # When `refs/heads/$BR` already exists WITH WORK — a previous adopt whose worktree was pruned
+        # — `wt_provision` must ATTACH it (`worktree add "$path" "$br"`), not refuse on `-b`.
+        # ⛔ THE BRANCH MUST HOLD WORK (review P2, 2026-11-06). The previous fixture pointed the local
+        # branch AT refs/remotes/origin/$BR — 0 commits ahead — which `wt_provision` classifies as a
+        # GHOST and CAS-DELETES before taking the `-b` path (the `A ghost:` arm inside `wt_provision`
+        # that ends in `WT_RESULT="refs/heads/$br is a 0-ahead ghost …"` — cited by SYMBOL, not by
+        # line). So this arm drove
+        # the SAME code as (a) while reporting "ALREADY-LOCAL branch … no -b collision", and the attach
+        # path `adopt-fix.sh:35-37` calls "the normal adopt case" was covered by nothing. The assertion
+        # is on the DISTINGUISHING EFFECT — the materialised HEAD is the LOCAL commit, not `origin/$BR`
+        # — so the `-b` path cannot satisfy it.
+        _ld="$WORK/sib-local-$_PN"
+        _lwt="$WORK/wt-local-$_PN"
+        if ! git clone -q --single-branch --branch main "$WORK/origin.git" "$_ld" 2>/dev/null; then
+            bad "could not clone the local-branch fixture for adopt-fix.sh"
+        else
+            [ -n "$_afl" ] && run_shipped "$_ld" fix/some-branch "$_lwt" "$_afl"
+            _ltip="$(git -C "$_ld" rev-parse --verify --quiet refs/remotes/origin/fix/some-branch 2>/dev/null)"
+            _ltree="$(git -C "$_ld" rev-parse --verify --quiet 'refs/remotes/origin/fix/some-branch^{tree}' 2>/dev/null)"
+            _loid=""
+            if [ -n "$_ltree" ] && [ -n "$_ltip" ]; then
+                _loid="$(git -C "$_ld" -c user.email=t@t -c user.name=t commit-tree "$_ltree" -p "$_ltip" \
+                            -m 'work a previous adopt lane left on this branch' 2>/dev/null)" || _loid=""
+            fi
+            if [ -z "$_loid" ] || [ "$_loid" = "$_ltip" ]; then
+                bad "could not pre-create a NON-GHOST local branch for the local-arm fixture (tip='${_ltip:-<none>}')"
+            elif ! git -C "$_ld" update-ref refs/heads/fix/some-branch "$_loid" 2>/dev/null; then
+                bad "could not pre-create the local branch for the local-arm fixture"
+            else
+                _lrc=0
+                run_shipped_provision "$_ld" fix/some-branch "$_lwt" "$_aprov" "$WORK/prov-local-$_PN.res" || _lrc=$?
+                if [ "$_lrc" != 0 ]; then
+                    bad "adopt-fix.sh's provisioning call FAILED when refs/heads/\$BR already holds work — a re-adopt would die (rc=$_lrc: $(cat "$WORK/prov-local-$_PN.res" 2>/dev/null))"
+                else
+                    _lhead="$(git -C "$_lwt" rev-parse HEAD 2>/dev/null)"
+                    _lm=0
+                    case "$(git -C "$_ld" worktree list --porcelain)" in
+                        *"branch refs/heads/fix/some-branch"*) _lm=1 ;;
+                    esac
+                    if [ "$_lm" = 0 ]; then
+                        bad "adopt-fix.sh's provisioning call returned 0 for a pre-existing local branch but no worktree is on it"
+                    elif [ "$_lhead" != "$_loid" ]; then
+                        bad "the local-branch arm did not ATTACH the local branch — HEAD is '${_lhead:-<unreadable>}', expected the local commit '$_loid'; the ghost-delete + '-b' path re-created it from origin/\$BR instead"
+                    else
+                        ok "adopt-fix.sh's provisioning call ATTACHES an already-local branch that holds work (HEAD is the local commit, not origin/\$BR) — the re-adopt arm, no -b collision"
+                    fi
+                fi
+            fi
+        fi
+    done < "$WORK/adopt-prov.txt"
     # ⛔ THE CONTROL, ISOLATING THE CAUSE. Same clone shape, the ref held constant, NO fetch re-run:
     # the ONLY change is `remote.origin.fetch`, and the outcome flips to 0. That is the evidence that the
     # operative mechanism is the configured refspec mapping and not the tracking ref — stated here so a
