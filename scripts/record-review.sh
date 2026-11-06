@@ -1659,19 +1659,33 @@ $m"
     # quotes the notation the artifact actually used instead of misquoting it back.
     # ⛔ AND A RANGE THIS CODE CANNOT PARSE IS **REFUSED**, NOT FALLEN PAST (review of
     # this merge, second cycle). Widening the separator was necessary but NOT sufficient:
-    # the regex was still anchored on the exact spelling `delta:<hex><sep><hex>`, so a body
-    # writing `delta: AAA..BBB` — one space — did not match, `stated_to` stayed empty, and
-    # control reached the SAME bare-needle fallback, accepting a body that names B alone.
-    # The fail-open was in the FALL-THROUGH, not in the separator: any tolerance gap in the
-    # matcher re-opened it. So the token is now detected FIRST and independently — if the
-    # artifact MENTIONS a `delta:` range at all, an unparseable one refuses. The bare-needle
-    # arm is left reachable ONLY by a body that names no range, which is the case it exists
-    # for. Whitespace around the colon and the separator is tolerated, and upper-case hex is
-    # accepted and lower-cased (bash 3.2: no `${x,,}`), so the canonical spellings are not
-    # refused for cosmetics — but anything else fails CLOSED rather than open.
+    # the regex was still anchored on an exact spelling, so a body writing `delta: AAA..BBB`
+    # — one space — did not match, `stated_to` stayed empty, and control reached the SAME
+    # bare-needle fallback, accepting a body that names B alone. The fail-open was in the
+    # FALL-THROUGH, not in the separator: any tolerance gap in the matcher re-opened it. So
+    # the token is now detected FIRST and independently of parsing: if the artifact MENTIONS
+    # a range at all, an unparseable one refuses. The bare-needle arm is left reachable ONLY
+    # by a body that names no range, which is the case it exists for.
+    # ⛔ AND BOTH LAYERS MUST AGREE ON THE SPELLING, NOT JUST ON THE SHAPE (third cycle —
+    # this is the same P1 a third time, and the reason is instructive). The first cut made
+    # detection independent of the REGEX but both still opened with the lower-case literal
+    # `delta:`, so `Delta:`, `DELTA:` and `delta :` disabled detection AND failed the parse
+    # together — the two layers missed the same class in concert, the elif was never
+    # reached, and the body fell to the bare needle. Independent guards are only independent
+    # if they disagree SOMEWHERE; sharing a literal is sharing a blind spot. Both now match
+    # case-insensitively with optional padding before the colon, so the token that arms the
+    # refusal and the token the parser reads cannot diverge. (`[Dd][Ee]…` rather than
+    # `shopt -s nocasematch`, which would silently change every other match in this file;
+    # bash 3.2 has no `${x,,}`.) Canonical spellings are therefore not refused for cosmetics,
+    # and everything else fails CLOSED.
     _delta_tok=0
-    case "$EVIDENCE_BODY" in *delta:*) _delta_tok=1 ;; esac
-    if [[ "$EVIDENCE_BODY" =~ delta:[[:space:]]*([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; then
+    # ⛔ BOTH LAYERS ARE REGEX FOR A REASON: in a `case` GLOB, `[[:space:]]*` means "one space,
+    # then anything" (`*` is not a quantifier there), so the token would not match the bare
+    # `delta:` form the parser accepts — the two layers would diverge and the guard would go
+    # blind again. Using the SAME regex token prefix in both is what makes divergence
+    # impossible rather than merely unlikely.
+    if [[ "$EVIDENCE_BODY" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*: ]]; then _delta_tok=1; fi
+    if [[ "$EVIDENCE_BODY" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*:[[:space:]]*([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; then
       stated_from="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       stated_sep="${BASH_REMATCH[2]}"
       stated_to="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
