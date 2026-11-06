@@ -232,7 +232,7 @@ _nreg="$(printf '%s\n' $STG_REGISTRY | wc -l | tr -d ' ')"
 ck "every registry stage appears in the record (registry: $_nreg stages)${_missing:+ — missing:$_missing}" \
    "$(if [ -z "$_missing" ]; then echo 0; else echo 1; fi)"
 _dups="$(printf '%s' "$F_BOOT" | tr ',' '\n' | cut -d: -f1 | sort | uniq -d)"
-ck "  …and no stage appears TWICE (a duplicated key is read as the last one, silently)${_dups:+ — dup:$_dups}" \
+ck "  …and no stage appears TWICE (a duplicated key is read as the FIRST one, silently)${_dups:+ — dup:$_dups}" \
    "$(if [ -z "$_dups" ]; then echo 0; else echo 1; fi)"
 # ⛔ THE PROPERTY THAT MATTERS: adding a stage to the registry is the ONLY edit needed. A change that
 # adds a stage at a call site but forgets the registry must fail HERE, not in a record nobody reads.
@@ -419,9 +419,14 @@ ck "an overlay interval opened INSIDE a pipeline has NOT yet reached the parent 
 stg_lvl_fold || :
 ck "  …and the FOLD turns that queued interval into the level's measured time (got ${STG_V_l2_merge:-0} us)" \
    "$(if [ "${STG_V_l2_merge:-0}" -ge 1000000 ]; then echo 0; else echo 1; fi)"
+_v_after_1="${STG_V_l2_merge:-0}"
 stg_lvl_fold || :
-ck "  …and folding twice adds nothing (the queue is drained), still ${STG_V_l2_merge:-0} us" \
-   "$(if [ "${STG_V_l2_merge:-0}" -lt 3000000 ]; then echo 0; else echo 1; fi)"
+# ⛔ EQUALITY, NOT A CEILING (fourth fresh-context review, P1 — measured). An absolute `< 3000000` bound
+# was satisfied by ONE duplicated fold of a 1.2 s interval, so a `stg_lvl_fold` that never truncated its
+# queue — double counting EVERY overlay interval in EVERY record, the pyramid-fill defect this field
+# exists to prevent — stayed GREEN (83/0; measured after fold2 2404098, after fold3 3606147).
+ck "  …and folding twice adds nothing at all — the queue is drained (after 1 fold ${_v_after_1} us, after 2 ${STG_V_l2_merge:-0} us)" \
+   "$(if [ "${STG_V_l2_merge:-X}" = "${_v_after_1}" ] && [ "${_v_after_1}" -ge 1000000 ]; then echo 0; else echo 1; fi)"
 ck "  …and a level with no interval is 'ns' — never a measured-looking 0 for a level nothing entered" \
    "$(if [ "${STG_V_l3_fix-UNSET}" = "" ]; then echo 0; else echo 1; fi)"
 STG_LVL_TMP=""
@@ -455,8 +460,8 @@ _loop_nc="$(grep -vE '^[[:space:]]*#' "$ORCH")"
 # first draft of this arm was VACUOUS: it matched the TOP-OF-LOOP settle and stayed green after the
 # shipped end-of-body settle was deleted — verified, 75 passed with the line removed). The top-of-loop
 # settle exists on every iteration, so only adjacency to `done` distinguishes the two.
-ck "the shipped sweep SETTLES as its LAST statement — 'stg_lvl_settle || :' immediately before its 'done'" \
-   "$(if printf '%s\n' "$_loop_nc" | awk 'prev ~ /stg_lvl_settle \|\| :/ && $0 ~ /^[[:space:]]*done[[:space:]]*$/ {found=1} {prev=$0} END {exit !found}'; then echo 0; else echo 1; fi)"
+ck "the shipped sweep SETTLES as its LAST statement — an ANCHORED 'stg_lvl_settle || :' immediately before its 'done'" \
+   "$(if printf '%s\n' "$_loop_nc" | awk 'prev ~ /^[[:space:]]*stg_lvl_settle[[:space:]]*\|\|[[:space:]]*:/ && $0 ~ /^[[:space:]]*done[[:space:]]*$/ {found=1} {prev=$0} END {exit !found}'; then echo 0; else echo 1; fi)"
 # ⛔ AND IT MUST MATCH THE SWEEP'S OWN CALL, NOT `stg_field`'s (my second draft of this arm was
 # VACUOUS: `stg_field` is DEFINED after the sweep's `done` and its body contains a bare `stg_lvl_fold`,
 # so deleting the shipped post-`done` fold stayed GREEN — verified). The sweep's call is spelled
@@ -472,50 +477,142 @@ ck "the shipped sweep FOLDS the overlay queue AFTER its 'done', in the parent ('
 # catch. This arm now requires ORDER: the nearest preceding sample line must contain the real call
 # (`stg_now_us_vars STG_WAIT_T0`), and it must NOT be preceded-in-window by a `STG_WAIT_T0=0` reset
 # without a re-sample. It also refuses a constant `STG_WAIT_T0=0` as the "sample".
-_nap_bad=""
-for _nln in $(printf '%s\n' "$_loop_nc" | grep -n '^[[:space:]]*stg_nap_mark[[:space:]]*$' | cut -d: -f1); do
-  _blk="$(printf '%s\n' "$_loop_nc" | sed -n "$(( _nln > 6 ? _nln - 6 : 1 )),$(( _nln - 1 ))p")"
-  # the sample line and whether a nap follows it, before stg_nap_mark
-  case "$_blk" in
-    *'stg_now_us_vars STG_WAIT_T0'*'fork_free_sleep'*|*'stg_now_us_vars STG_WAIT_T0'*'sleep '*) : ;;
-    *) _nap_bad="$_nap_bad $_nln" ;;
-  esac
-done
-ck "every stg_nap_mark call site samples STG_WAIT_T0 BEFORE the nap it measures, so prev_wait is one gap${_nap_bad:+ (bad line(s):$_nap_bad)}" \
-   "$([ -z "$_nap_bad" ] && echo 0 || echo 1)"
+# ⛔ THE SITE SPELLING MUST ALLOW A TRAILING COMMENT, OR THE ARM SILENTLY SKIPS A THIRD OF ITS SUBJECTS
+# (fourth fresh-context review, P1 — measured). The fork-starved site is
+# `    stg_nap_mark        # CARRIED into the NEXT cycle's \`prev_wait\` …`, so the `…[[:space:]]*$`
+# spelling matched only TWO of the three sites and deleting the fork-starved arm's sample stayed
+# GREEN (83/0).
+# ⛔ AND THE SAMPLE MUST BE THE LAST WORD BEFORE THE NAP: a bare `STG_WAIT_T0=0` line inserted BETWEEN
+# the sample and the nap re-zeroes the stamp and reproduces the uptime defect while a proximity test
+# still passes (measured 83/0). A window-glob cannot tell the two apart — this walks the stripped code
+# line by line, so it sees ORDER and a CLOBBER independently.
+_nap_rep="$(printf '%s\n' "$_loop_nc" | awk '
+  /^[[:space:]]*stg_cycle_reset[[:space:]]*$/ { have=0; next }
+  /^[[:space:]]*stg_now_us_vars STG_WAIT_T0([[:space:]]|$)/ { have=1; next }
+  /^[[:space:]]*STG_WAIT_T0=0[[:space:]]*$/ { if (have) have="clobber"; next }
+  /^[[:space:]]*stg_nap_mark([[:space:]]|$)/ {
+    sites++
+    if (have == 1) ok++
+    else bad = bad sprintf(" line=%d(%s)", NR, (have == "clobber" ? "clobbered" : "no-sample"))
+    have = 0; next
+  }
+  END { printf "%d %d%s", sites+0, ok+0, bad }')"
+_nap_sites="${_nap_rep%% *}"
+_nap_okc="$(printf '%s' "$_nap_rep" | cut -d' ' -f2)"
+_nap_bad="$(printf '%s' "$_nap_rep" | cut -d' ' -f3- | sed 's/^ *//')"
+ck "  …and all THREE nap sites were actually inspected (got ${_nap_sites:-0}) — a site the pattern cannot spell is ungraded" \
+   "$(if [ "${_nap_sites:-0}" -ge 3 ]; then echo 0; else echo 1; fi)"
+ck "every stg_nap_mark call site samples STG_WAIT_T0 BEFORE the nap, with no clobber in between (${_nap_okc}/${_nap_sites:-0} ok)${_nap_bad:+ — bad:$_nap_bad}" \
+   "$(if [ "${_nap_sites:-0}" -ge 3 ] && [ "${_nap_okc:-0}" = "${_nap_sites:-0}" ]; then echo 0; else echo 1; fi)"
 
 # 9.1d THE REST OF THE SHIPPED WIRING — the holes 9.1c did not reach (this review, measured).
 # Every arm below was GREEN before it existed: deleting the `stages=` field from either early-exit
 # record, deleting a tiled stage's `stg_mark` call site, deleting the disk-held arm's `stg_nap_mark`,
 # deleting `stg_field`'s own fold, and removing the monotonic clamp ALL left the suite at 76/0.
-# 9.1d-i: BOTH EARLY-EXIT RECORDS CARRY THE FIELD. These are the cycles that produced NOTHING — the
-# ones an operator most needs to attribute, and the ones the docs call "the very arms the 161-minute
-# narrative is about". Enumerated by arm name so a NEW early-exit record cannot silently omit it.
+# 9.1d-i: EVERY `cycle_record_write` CARRIES A **VALID** `stages=`, DERIVED FROM THE SITE COUNT.
+# These early-exit arms are the cycles that produced NOTHING — the ones an operator most needs to
+# attribute, and the ones the docs call "the very arms the 161-minute narrative is about".
+# ⛔ THREE VACUITIES WERE MEASURED HERE (fourth fresh-context review), all now closed:
+#   · a `-ge 3` FLOOR cannot see a FOURTH record site added later without the field (measured 83/0);
+#   · grading the `stages=` TOKEN only cannot see the `stg_field STG_FIELD` CALL deleted, which writes
+#     `stages=` with an EMPTY value — `cycle_stages_valid` refuses it, `cycle-record.sh stages` answers
+#     `UNREADABLE`, and `status` still reads HEALTHY (measured 83/0 on BOTH arms);
+#   · grading one global `stg_mark <stage>` site cannot see the mark deleted from an early-exit arm,
+#     where the stage then reads `ns` on a cycle where it DID run (measured 83/0 for boot and disk).
+_writes_n="$(printf '%s\n' "$_loop_nc" | grep -c 'cycle_record_write "\$O"')"
 _emit_n="$(printf '%s\n' "$_loop_nc" | grep -c 'stages="\${STG_FIELD:-}"')"
-ck "all THREE record-write sites carry stages= (full cycle + disk-held + fork-starved; got ${_emit_n})" \
-   "$(if [ "${_emit_n:-0}" -ge 3 ]; then echo 0; else echo 1; fi)"
-_nostage=""
-for _arm in disk_held fork_held; do
-  # find the arm's own record write and prove the field is inside it
-  printf '%s\n' "$_loop_nc" | awk -v a="$_arm" '$0 ~ ("placement=\"" a "\"") {seen=1} seen && /stages="\$\{STG_FIELD:-\}"/ {ok=1} seen && /^[[:space:]]*else$/ {seen=0} END{exit !ok}' \
-    || _nostage="$_nostage $_arm"
-done
-ck "  …and neither EARLY-EXIT arm was dropped from that set${_nostage:+ — missing:$_nostage}" \
-   "$(if [ -z "$_nostage" ]; then echo 0; else echo 1; fi)"
-# 9.1d-ii: EVERY TILED STAGE HAS A MARK SITE. §4 proves the EMITTER walks the registry, so a registered
-# stage always APPEARS — and can appear as `ns` forever if nothing ever marks it. That is a missing
-# instrument wearing a valid label, and it reddened nothing before this arm.
+ck "EVERY cycle_record_write site carries stages= (${_emit_n} of ${_writes_n} — derived, not a floor)" \
+   "$(if [ "${_writes_n:-0}" -ge 3 ] && [ "${_emit_n:-0}" = "${_writes_n:-0}" ]; then echo 0; else echo 1; fi)"
+# The emitter must be CALLED, once per record-write site — a token alone writes an EMPTY field, which
+# `cycle_stages_valid` refuses. Counts are DERIVED from the record-write sites, not hardcoded.
+_sf_calls="$(printf '%s\n' "$_loop_nc" | grep -c 'stg_field STG_FIELD')"
+ck "  …and stg_field is CALLED once per record-write site, not just its token written (${_sf_calls} of ${_writes_n})" \
+   "$(if [ "${_sf_calls:-0}" = "${_writes_n:-0}" ]; then echo 0; else echo 1; fi)"
+# The grammar end of it, driven: an empty value is REFUSED, so the failure above is not cosmetic.
+ck "  …and an EMPTY stages= value is refused by the reader's own grammar (so the above is a real break)" \
+   "$(if cycle_stages_valid ""; then echo 1; else echo 0; fi)"
+
+# 9.1d-ii: EVERY TILED STAGE HAS A MARK SITE, INCLUDING ONE PER EARLY-EXIT ARM.
+# §4 proves the EMITTER walks the registry, so a registered stage always APPEARS — and can appear as
+# `ns` forever if nothing ever marks it. That is a missing instrument wearing a valid label.
+# ⛔ A SINGLE GLOBAL SITE IS NOT ENOUGH (fourth fresh-context review, P3 — measured): `boot` and `disk`
+# each have TWO sites, one on the main path and one in the corresponding early-exit arm, and deleting
+# the arm's own mark made that stage read `ns` on a cycle where it DID run — GREEN at 83/0. So the
+# requirement is one site per STAGE and, for the two stages the early exits mark, one per ARM as well.
+# ⛔ FED BY A HERE-STRING, NOT A PIPE (this suite's own header forbids `… | grep -q …`): under
+# `pipefail` a quiet grep exits at its first match while the writer is still pushing, the writer takes
+# SIGPIPE, and the pipeline reports the WRITER's status — so the `||` branch fires on a file that DOES
+# contain the mark and `unmarked:` names a false FAIL. `scripts/check-no-sigpipe-grep.sh` (a REQUIRED
+# check) flags the piped form; the payload here is `_loop_nc` at ~197 KB, well past the pipe buffer, so
+# the window is real rather than theoretical.
 _unmarked=""
 for _s in $STG_REGISTRY_TILED; do
-  printf '%s\n' "$_loop_nc" | grep -qE "^[[:space:]]*stg_mark $_s([[:space:]]|\$|;|\|)" || _unmarked="$_unmarked $_s"
+  grep -qE "^[[:space:]]*stg_mark $_s([[:space:]]|\$|;|\|)" <<<"$_loop_nc" || _unmarked="$_unmarked $_s"
 done
 ck "every TILED stage has a stg_mark call site in the shipped loop${_unmarked:+ — unmarked:$_unmarked}" \
    "$(if [ -z "$_unmarked" ]; then echo 0; else echo 1; fi)"
-# 9.1d-iii: NO NAP SITE MAY BE DROPPED. 9.1c grades the SAMPLE of each nap that exists; it cannot see a
-# nap that was deleted outright, which is how the disk-held arm loses `prev_wait` entirely.
+_dup_mark=""
+for _st in boot disk; do
+  _c="$(printf '%s\n' "$_loop_nc" | grep -cE "^[[:space:]]*stg_mark $_st([[:space:]]|$)")"
+  [ "${_c:-0}" -ge 2 ] || _dup_mark="$_dup_mark $_st(only ${_c})"
+done
+ck "  …and the two stages marked on an EARLY-EXIT path keep that arm's own site too${_dup_mark:+ — lost:$_dup_mark}" \
+   "$(if [ -z "$_dup_mark" ]; then echo 0; else echo 1; fi)"
+
+# 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
 _nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
-ck "all THREE nap sites still call stg_nap_mark (fork-starved + disk-held + end of body; got ${_nap_n})" \
-   "$(if [ "${_nap_n:-0}" -ge 3 ]; then echo 0; else echo 1; fi)"
+_loop_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
+ck "every nap path calls stg_nap_mark (${_nap_n} nap_mark sites for ${_loop_n} sleep/fork_free_sleep lines — a path without one loses prev_wait)" \
+   "$(if [ "${_nap_n:-0}" -ge 3 ] && [ "${_nap_n:-0}" -ge "$(( ${_loop_n:-0} - 1 ))" ]; then echo 0; else echo 1; fi)"
+
+# 9.1g THE READER REFUSES A GLOB AS A STAGE NAME.
+# `cycle_stage_get` validates the WANTED name and then uses it as a `case` PATTERN. Without that guard a
+# caller passing `*` matches the FIRST stage in the field and returns its value as if it were the one
+# requested — a silent wrong answer, which is worse than a refusal because the whole point of the field
+# is that its numbers can be trusted. ⛔ THAT GUARD HAD NO ARM AT ALL (fourth fresh-context review, P3 —
+# measured: deleting it left the suite at 83/0 while `cycle_stage_get 'stages=boot:3' '*'` began
+# answering `3` rc 0).
+ck "a GLOB is refused as a stage name — '?' matches any one character and must not be a reading" \
+   "$(if cycle_stage_get 'stages=boot:3' '?' >/dev/null 2>&1; then echo 1; else echo 0; fi)"
+ck "  …and '*' — the one that would otherwise return the FIRST stage's value as the requested one" \
+   "$(if cycle_stage_get 'stages=boot:3,sweep:9' '*' >/dev/null 2>&1; then echo 1; else echo 0; fi)"
+ck "  …and a bracketed class ('[bs]oot', which the record sanitiser does NOT strip) is refused too" \
+   "$(if cycle_stage_get 'stages=boot:3' '[bs]oot' >/dev/null 2>&1; then echo 1; else echo 0; fi)"
+ck "  …while a real name beside those still reads (sweep=9)" \
+   "$(if [ "$(cycle_stage_get 'stages=boot:3,sweep:9' sweep)" = "9" ]; then echo 0; else echo 1; fi)"
+
+# 9.1h `stg_mark` SETTLES AN OPEN OVERLAY, so no overlay interval can span a tiled boundary.
+# ⛔ THE CLAIM HAD NO ARM (fourth fresh-context review, P3 — measured: deleting the `stg_lvl_settle`
+# from `stg_mark` left the suite at 83/0). It is unreachable in the SHIPPED arrangement today — every
+# `stg_lvl_start` lives inside the sweep's pipeline subshell, so the parent's `STG_OPEN_LVL` is always
+# empty when a `stg_mark` runs — which is exactly why it needs a DRIVEN arm: an unreachable guard with
+# no arm is one deletion away from being an untested claim. Driven at top level, where it IS reachable.
+STG_LVL_TMP="$TMP/lvlq-mark"; : >"$STG_LVL_TMP"
+STG_OPEN_LVL=""; STG_OPEN_T0=0
+stg_cycle_reset
+stg_lvl_start l2_merge || :
+sleep 1.1
+stg_mark gate                      # a tiled mark must CLOSE the open overlay first
+_open_after_mark="${STG_OPEN_LVL-UNSET}"
+sleep 1.1                          # a SECOND tiled interval with NO overlay opened: it must accrue none
+stg_mark l5_issue
+# ⛔ `stg_field` is called AT TOP LEVEL, never inside `$( … )`: it writes its result into a NAMED
+# variable, and inside a command substitution that assignment dies with the subshell.
+_mf=""
+stg_field _mf || _mf=""
+_mark_l2="$(cycle_stage_get "stages=$_mf" l2_merge 2>/dev/null || echo ABSENT)"
+ck "stg_mark SETTLES an open overlay into its own level — it cannot be credited to the tiled stage (l2_merge='$_mark_l2')" \
+   "$(if [ "$_mark_l2" = "1" ]; then echo 0; else echo 1; fi)"
+# ⛔ THE CLAIM IS ABOUT THE BOUNDARY, NOT ABOUT WHETHER THE TILED STAGE ALSO SEES THE TIME. An overlay
+# is a BREAKDOWN of the tiled stage it ran inside, so both legitimately count it (`sum(l1..l4) <=
+# sweep`). What must NOT happen is an overlay interval SPANNING the boundary — which is what an unclosed
+# `STG_OPEN_LVL` after a mark would mean. Asserted two ways: the level is closed by the mark, and a
+# LATER tiled interval with no overlay opened accrues nothing to it.
+ck "  …so the mark CLOSED the overlay: no level is left open after it (STG_OPEN_LVL='${_open_after_mark}')" \
+   "$(if [ "$_open_after_mark" = "" ]; then echo 0; else echo 1; fi)"
+ck "  …and a LATER tiled interval (no overlay opened) adds NOTHING to the level — it cannot span the boundary (l2_merge='$_mark_l2', stayed 1 s over 2.2 s of body)" \
+   "$(if [ "$_mark_l2" = "1" ]; then echo 0; else echo 1; fi)"
+STG_LVL_TMP=""
 
 # 9.1e `stg_field` FOLDS BEFORE IT EMITS — driven, not grepped.
 # The post-`done` fold is not the last word: an overlay interval that closes at TOP level afterwards is
