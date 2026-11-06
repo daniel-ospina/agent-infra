@@ -1042,15 +1042,6 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     note: "#2033 — the abandoned-WIP class's age floor (24 h), much longer than the ghost floor because a dirty tree an hour old may be a lane someone is debugging. ⛔ MEASURED ON THE CHECKOUT RECORD (`wt_created_ts`), NOT on the HEAD COMMIT's date (#2102 review §4): the class requires refs=merged, so the commit date is the BASE commit's age, not the checkout's — the floor was decorative and a minutes-old tree read as days old. An unreadable record age PRESERVES (`unreadable-worktree-age`) rather than reaping on the wrong datum. The class itself is OFF unless REAP_WT_WIP is set AND the patch backup verifies, so this bound only ever narrows a decision the operator already opted into.",
   },
   {
-    name: "REAP_WT_PRESERVE_KEEP_DAYS",
-    owners: ["scripts/pi-reap-worktrees.sh"],
-    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
-    axis: "retention",
-    guardedBy:
-      "scripts/pi-reap-worktrees.test.sh §G2aa (the archive sink is BOUNDED) — a dated dir older than the floor is PRUNED by `--apply` (and only REPORTED by a dry run), a RECENT dated dir survives, a non-date name and a MALFORMED/prefixed date-shaped name are left alone (only an exact `YYYY-MM-DD` is ever a candidate), `0` keeps EVERYTHING (disabled, not everything-expired), and a non-numeric value is REFUSED by seam validation at exit 2 with the seam NAMED and nothing pruned; the same bound is driven on the FALLBACK root, which is where writes land when the configured root is full or read-only",
-    note: "#3405 (review round 2, P2) — how long a dated subdirectory of the gate-(b) evidence archive is kept (default 14 days; `0` disables the prune). The archive is a NEW SINK opened on the reclaim path, so it needs a bound or the reaper that exists to free disk slowly fills one: the bound is registered rather than exempted for the same reason `REAP_WT_AGED_DAYS`/`REAP_WT_SCRATCH_AGE_DAYS` are, and a retention floor only the reaper knows about is invisible to the audit that exists to notice exactly that. ⛔ It bounds a side effect of reclaiming, never the reclaim itself — every survival gate on a candidate (clean / no live holder / no open PR / ref-holding) is untouched by it.",
-  },
-  {
     name: "WT_INIT_LOCK_MIN_AGE",
     owners: ["scripts/orchestrator-harness/wt-lifecycle.sh"],
     value: "${WT_INIT_LOCK_MIN_AGE:-300}",
