@@ -224,10 +224,24 @@ assert_clean_of "$REPO" 2047 "T5 nothing named 2047 is left on this box"
 assert_releases "$O/claim-releases.log" 1 "T5 the no-chain path released the issue claim exactly once (and only after the lane was confirmed gone)"
 
 echo "── T6: the shipped dispatcher is the one under test (a moved script would prove nothing)"
-if grep -q 'reap_unused_worktree' "$DM_REL" && grep -q 'wt_reap_if_empty' "$DM_REL"; then
-    ok "T6 dispatch-merge.sh still routes its take-back through the reviewed wt_reap_if_empty"
+# ⛔ COMMENTS ARE STRIPPED AND THE COUNTS ARE PINNED (#3577 review, P2 — MEASURED). The condition here
+# used to be `grep -q 'reap_unused_worktree'` && `grep -q 'wt_reap_if_empty'`, and BOTH were satisfiable
+# by prose: `wt_reap_if_empty` appears in the comment above the helper, `reap_unused_worktree` in the
+# helper's own DEFINITION and in the SCOPE comment above it. So the stated failure condition —
+# "dispatch-merge.sh no longer calls wt_reap_if_empty" — could never fire: replacing the helper's call
+# with a raw `git worktree remove --force` + `update-ref -d`, and deleting BOTH call sites, each left
+# T6 GREEN. The counts below are over non-comment lines, i.e. executable text only:
+#   · `wt_reap_if_empty`      — EXACTLY 1: the single teardown, inside reap_unused_worktree. A second
+#                               occurrence means a second teardown has been introduced.
+#   · `reap_unused_worktree`  — at least 3: its definition plus BOTH call sites (lane-not-spawned and
+#                               no-chain). Dropping either call site falls below 3 and reddens.
+_dm_code="$(grep -vE '^[[:space:]]*#' "$DM_REL")"
+_reaps="$(printf '%s\n' "$_dm_code" | grep -c 'wt_reap_if_empty')"
+_calls="$(printf '%s\n' "$_dm_code" | grep -c 'reap_unused_worktree')"
+if [ "${_reaps:-0}" -eq 1 ] && [ "${_calls:-0}" -ge 3 ]; then
+    ok "T6 both take-backs still route through the reviewed wt_reap_if_empty (1 teardown, ${_calls} call/definition lines)"
 else
-    bad "T6 dispatch-merge.sh no longer calls wt_reap_if_empty — this suite would be testing a second teardown"
+    bad "T6 dispatch-merge.sh no longer routes both take-backs through wt_reap_if_empty (non-comment wt_reap_if_empty=$_reaps want 1, reap_unused_worktree=$_calls want >=3) — this suite would be testing a second teardown"
 fi
 
 echo ""
