@@ -212,6 +212,7 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
 | `claim-reaper.sh` | R4's release half: a claim is released only when its holder is demonstrably GONE — 7 stale refs on a box with 0 live lanes made the fleet originate nothing (§7.2b, measured 2026-10-21) |
+| `claim-reaper-pass.sh` | the SCHEDULE for it (#2048): the controller's hourly clock invokes this, which reads the dated arming record, runs the reaper in that mode, records `state/claim-reaper.last`, and exits **4 + `state/.claim-reap-blocked`** when RELEASABLE claims were found while UNARMED — the tool shipped deployed, documented and invoked by nothing on 0 of 6 boxes. Mutation suite: every gate (arming, advisory, mode cross-check, resolution) reddens when reverted |
 | `lane-container-reap.sh` | the leaked test-DB reaper (#2868): removes a lane's private `fdb-lane-*` / `*-pg` / `*-fdb` / `falkordb-6673-*` / `tortoise-ci-*` container ONLY when the owning lane is provably gone — the slug is absent from `git worktree list` (or the PR has no `refs/claims/` snapshot), no live process holds the name, AND the container is past the age bound. **Dry run by default** (`--apply` arms it); all three proofs must hold, and an unreadable `docker ps`/`ps` aborts the whole pass (exit 3, `CANNOT-VERIFY`) rather than reaping blind. Shared instances (`falkordb`, …) are protected by name and never candidates. Its test suite is a mutation suite: every deletion gate reddens when reverted |
 | `live-ownership.sh` | R2/R3's predicate as a live fact: "owned" means a LIVE PROCESS is working the PR, not that a registry says so; it supplies the sweep order and the un-owned count (§7.2f) |
 | `worker-supply.sh` + `install-worker-supply.sh` | the SUPPLY half of the repair pool (agent-infra#2700): the doctor CLASSIFIES orders and places at most one pass worth; without a supplier the pool empties and every later pass prints `undeliverable` with `inflight=0`. This re-offers the DEAD orders through the one dispatcher, on a 60 s clock, under the machine's own `fix + review` budget |
@@ -4061,8 +4062,43 @@ then the fenced delete, then the record finalized as `released` (or `refused` wh
 `state/claim-reaper.log` carries one TSV row per release; `state/reclaimed/<ref>` is the readable
 record, for a lane that comes back to a claim it still thinks it holds. With no writable record
 directory the pass **refuses and deletes nothing** — an unrecorded release can be neither audited nor
-protested. It is deliberately NOT
-scheduled by the loop: releasing is the operator's word, and the dry run is safe to run at any time.
+protested.
+
+**SCHEDULE (agent-infra#2048).** It IS now scheduled — report-only — on the controller's hourly clock
+(`orch-loop.sh`, beside `claim_prune`, stamp `state/.claim-reaped`), through
+`scripts/orchestrator-harness/claim-reaper-pass.sh`. The earlier line here said it was deliberately
+NOT scheduled, and #2048 supersedes that: the tool shipped *deployed, documented and invoked by
+nothing*, on 0 of 6 boxes, so the only half that can release an orphaned claim never ran and the
+fleet kept answering *"a peer owns it"* indefinitely. The reason that line gave is preserved, not
+overturned — **releasing is still the operator's word**: the clock runs the pass in its default
+dry-run mode and nothing in `orch-loop.sh` can release a claim. What the clock adds is the
+MEASUREMENT, hourly, on every box that runs a controller (which is every box that can dispatch).
+
+```bash
+claim-reaper-pass.sh        # what the clock runs: mode from the arming record, records, exits
+```
+
+Its exit vocabulary is the load-bearing part: `0` nothing releasable (or everything found was
+released), **`4` WORK LEFT BEHIND that policy or the bound stopped** — RELEASABLE claims while
+UNARMED, or an armed pass whose `--max` ran out (`claim-reaper.sh` releases at most `--max` per pass
+and still exits 0, so without this arm a box that released 3 of 20 would erase the ⛔ line while 17
+were still holding dispatch) — `3` CANNOT-VERIFY (no tool resolved, an unreadable summary, or an
+arming decision that provably did not reach the tool), otherwise the tool's exit. **Every non-zero
+arm also writes `state/.claim-reap-blocked`**, which `cloud-cell-supervisor.sh` prints as a ⛔ line —
+so an unarmed box whose stale claims are blocking dispatch does not read like a healthy idle one. An
+unreadable registry takes the `3` arm rather than a failure exit (the tool exits 2 *before* printing
+its summary), which is why `3` writes the advisory too.
+
+**ARMING** is one dated record, the same shape as `worktree-hygiene` and `pi-reap-orphans`
+(`#1678`: the reaper may run unattended; arming it may not). Both keys are required — a half-written
+record is NOT armed:
+
+```bash
+printf 'armed-by=%s\narmed-date=%s\nreason=%s\n' "$(id -un)" "$(date -u +%FT%TZ)" '<why>' \
+  > "${O:-$HOME/orchestrator}/state/claim-reaper.armed"
+```
+
+`state/claim-reaper.last` is the pass record (`at= verdict= mode= rc= listed= releasable= released=`).
 ⛔ Its observation seams (`CR_PS`, `CR_PROC_TABLE`, `CR_LIVE_ROWS`) SUBSTITUTE the evidence that
 authorises a release, so they are refused unless the caller declares `CR_TEST_SEAMS=1` (a test run) —
 an ambient value must never be able to free a live lane's claim.

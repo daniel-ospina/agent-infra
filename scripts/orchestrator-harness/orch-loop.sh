@@ -4018,6 +4018,39 @@ while true; do
       touch "$O/state/.claims-pruned"
       ( claim_prune >> "$LOG" 2>&1 ) &
     fi
+    # ── release-when-orphaned (agent-infra#2048) ────────────────────────────────────────────────
+    # `claim_prune` above reaps by EXPIRY and by ORPHANED HOST only, so a claim whose holder is
+    # demonstrably gone but whose lease still has hours left — or whose lease cannot be parsed —
+    # keeps the fleet from originating anything on that issue/PR (#9077/#9097/#9202). The half that
+    # releases those is `claim-reaper.sh` (#2262) with per-claim EVIDENCE, a fenced delete and a
+    # record; it shipped DEPLOYED AND SCHEDULED BY NOTHING, on 0 of 6 boxes, so that half was inert.
+    #
+    # WHY HERE AND NOT A PLIST/TIMER. The claim registry is PER-REPO and this loop is the only place
+    # that already knows which checkout this box owns (`$REPO`) — a globally installed job does not,
+    # so it would have to pin one repo and silently miss the other. Same clock idiom as claim_prune:
+    # an mtime stamp, hourly, in the background, never blocking the sweep.
+    #
+    # ⛔ THE CLOCK DOES NOT DECIDE THE MODE. `claim-reaper-pass.sh` ships REPORT-ONLY and reads the
+    # dated arming record (#1678 / #2094); this loop is a clock, not the owner of the policy. An
+    # unarmed pass that FIND_RELEASABLE claims writes `state/.claim-reap-blocked` and exits 4, which
+    # `cloud-cell-supervisor.sh` prints — so "nothing was released" is a ⛔ line on the box's health
+    # output, never a silent green.
+    if [ -z "$(find "$O/state/.claim-reaped" -mmin -60 2>/dev/null)" ]; then
+      touch "$O/state/.claim-reaped"
+      _claim_pass=""
+      for _cand in "${CLAIM_REAPER_PASS:-}" "$O/claim-reaper-pass.sh" \
+                   "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/claim-reaper-pass.sh" \
+                   "${HOME:-}/.pi/agent/scripts/claim-reaper-pass.sh"; do
+        [ -n "$_cand" ] && [ -f "$_cand" ] && { _claim_pass="$_cand"; break; }
+      done
+      if [ -n "$_claim_pass" ]; then
+        # CLAIM_REPO explicitly, like the snapshot above: launchd starts this loop at cwd `/`, which
+        # macOS denies reading, so a registry resolved relative to cwd finds nothing (#1996).
+        ( CLAIM_REPO="$REPO" O="$O" bash "$_claim_pass" >> "$LOG" 2>&1 ) &
+      else
+        echo "[claims] ⛔ claim release-when-orphaned NOT RUN — no claim-reaper-pass.sh resolved (looked at \$CLAIM_REAPER_PASS, $O, the bundle beside this loop, and \$HOME/.pi/agent/scripts): stale claims whose holder is gone are never released on this box, so it can originate nothing while they hold (agent-infra#2048). Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >> "$LOG"
+      fi
+    fi
   else
     # ⛔ NO REGISTRY IS NOT A FREE FLEET (agent-infra#2466). This arm used to be silent — there was
     # nothing to snapshot — and every reader below then saw NO SNAPSHOT FILE, which they answered as

@@ -4375,6 +4375,16 @@ cmd_status() {
     log_line "⛔ CACHE BOUND NOT ENFORCED — the package-cache reaper's last pass:"
     sed 's/^/    /' "$O/state/.cache-reap-blocked"
   fi
+  # agent-infra#2048: the claim release-when-orphaned pass (claim-reaper.sh) runs on this box's clock
+  # as a BACKGROUND job — the same shape, and the same blind spot: its exit status is discarded at
+  # the call site in orch-loop.sh. Without this line an unarmed box whose stale claims are blocking
+  # dispatch reads exactly like a healthy idle one (`lanes: 0` is both), and a pass that could not
+  # answer (exit 3, CANNOT-VERIFY) or was stopped by its bound (exit 4) is indistinguishable from a
+  # claim registry that is genuinely empty. The pass writes this file on EVERY non-zero arm.
+  if [ -f "$O/state/.claim-reap-blocked" ]; then
+    log_line "⛔ CLAIM RELEASE NOT ENFORCED — the claim reaper's last pass:"
+    sed 's/^/    /' "$O/state/.claim-reap-blocked"
+  fi
   # agent-infra#2032: the scheduled DISK reaper. Its pass record is the only place that answers
   # "did the last unattended run succeed, and how much did it free" — a failed or STALE pass is
   # therefore a ⛔ line here, never an absence that reads like health. Disk exhaustion is the second
