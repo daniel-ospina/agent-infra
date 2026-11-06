@@ -237,8 +237,9 @@
 #   review-comment:<id>     an inline review comment
 #   delta:<A>..<B>          a RANGE-scoped verdict: the reviewer's verdict covers
 #                           exactly the commits in A..B and B is the PR's CURRENT
-#                           head. `delta:A..B+comment:<id>` is the form REQUIRED
-#                           when the range holds authored commits (below)
+#                           head. `delta:A..B+<artifact>` is REQUIRED in BOTH cases:
+#                           a bare `delta:A..B` is ALWAYS refused, because a delta
+#                           EXTENDS an attestation and can never create one (below)
 #   <a GitHub URL>          any of the three, pasted (…/pull/N#issuecomment-ID,
 #                           #discussion_rID, #pullrequestreview-ID)
 #
@@ -1205,7 +1206,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" stated_from_sha="" sfr="" range_ok=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" stated_from_sha="" sfr="" range_ok="" _delta_tok="" E_OUT="" E_RC=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1580,8 +1581,27 @@ $m"
     # still requires `stated_from` to be an ancestor of the recorded A, and refuses
     # otherwise. The separator is CAPTURED rather than normalised, so the refusal
     # quotes the notation the artifact actually used instead of misquoting it back.
-    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})(\.\.\.?)([0-9a-f]{12,40}) ]]; then
-      stated_from="${BASH_REMATCH[1]}"; stated_sep="${BASH_REMATCH[2]}"; stated_to="${BASH_REMATCH[3]}"
+    # ⛔ AND A RANGE THIS CODE CANNOT PARSE IS **REFUSED**, NOT FALLEN PAST (review of
+    # this merge, second cycle). Widening the separator was necessary but NOT sufficient:
+    # the regex was still anchored on the exact spelling `delta:<hex><sep><hex>`, so a body
+    # writing `delta: AAA..BBB` — one space — did not match, `stated_to` stayed empty, and
+    # control reached the SAME bare-needle fallback, accepting a body that names B alone.
+    # The fail-open was in the FALL-THROUGH, not in the separator: any tolerance gap in the
+    # matcher re-opened it. So the token is now detected FIRST and independently — if the
+    # artifact MENTIONS a `delta:` range at all, an unparseable one refuses. The bare-needle
+    # arm is left reachable ONLY by a body that names no range, which is the case it exists
+    # for. Whitespace around the colon and the separator is tolerated, and upper-case hex is
+    # accepted and lower-cased (bash 3.2: no `${x,,}`), so the canonical spellings are not
+    # refused for cosmetics — but anything else fails CLOSED rather than open.
+    _delta_tok=0
+    case "$EVIDENCE_BODY" in *delta:*) _delta_tok=1 ;; esac
+    if [[ "$EVIDENCE_BODY" =~ delta:[[:space:]]*([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; then
+      stated_from="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
+      stated_sep="${BASH_REMATCH[2]}"
+      stated_to="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
+    elif [ "$_delta_tok" -eq 1 ]; then
+      echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as delta:<40-hex>..<40-hex> (or ...), or run a fresh review at the head and use plain --evidence comment:<id>." >&2
+      return 1
     fi
     if [ -n "$stated_to" ]; then
       range_ok=0

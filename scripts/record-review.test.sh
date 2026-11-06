@@ -643,6 +643,17 @@ assert_contains "$RECORD_ERR" "without a repo" "repo-less refusal names the reme
 run_record_verdict clean-micro "" 424244
 [ -f "$L" ] && ok "repo-less record at legacy key (clean-micro path)" || bad "repo-less record at legacy key ($L)"
 if grep -q '"repo"' "$L"; then bad "repo-less record has no repo field"; else ok "repo-less record has no repo field"; fi
+# ⛔ AND IT MUST PARSE, WITH ITS SLOTS ALIGNED. The record printf has TWO branches
+# (repo / no-repo) whose slot counts differ, and the no-repo branch is reachable in
+# production — a lane with no repo context mints here. "a file exists and it has no
+# repo key" is satisfied by a record whose fields have SHIFTED one slot: MEASURED, in
+# review of this merge, by dropping `"$DELTA_FIELDS"` from the no-repo argument list —
+# BOTH suites stayed green while the minted record did not parse, which is the #3400
+# "an unparseable record is NO RECORD" shape arriving on a successful exit. Asserting
+# the parse is what makes the slot count actually covered rather than counted by eye.
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["verdict"]=="clean-micro", d.get("verdict"); assert d["pr"]==424244, d.get("pr"); assert "head_sha" in d' "$L" 2>/dev/null \
+    && ok "repo-less record PARSES with verdict/pr slots aligned (no-repo printf branch covered)" \
+    || bad "repo-less record is MALFORMED or misaligned: $(cat "$L" 2>/dev/null)"
 
 echo "── 5. Unparseable legacy (formatted JSON) is never deleted ─────"
 UNPARSEABLE="$F_HOME/.pi/agent/reviews/424245.json"
@@ -7075,6 +7086,35 @@ assert_eq "$RECORD_RC" "3" "20h17 a body stating a NARROWER range in THREE-DOT f
 assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h17 the three-dot body reaches the RANGE arm, not the bare-needle fallback"
 assert_contains "$RECORD_ERR" "delta:${DG_A1:0:12}...${DG_HEAD:0:12}" "20h17 the refusal quotes the notation the ARTIFACT used, not the two-dot form misquoted back"
 [ -f "$(Q2 $EH21)" ] && bad "20h17 no record was written" || ok "20h17 no record was written"
+
+# 20h18 A TOLERATED SPELLING IS PARSED, NOT FALLEN PAST. The matcher must accept the
+#       range with spaces around the colon/separator (an artifact may wrap or pad it),
+#       and the answer must be the RANGE arm's — "states a DIFFERENT range" — because a
+#       refusal that says "cannot parse" would mean the widening regressed and the
+#       comparison never happened. Asserting the MESSAGE (not just rc 3) is what
+#       discriminates: both paths refuse, so rc alone cannot tell them apart.
+EH22=425180; rm -f "$(Q2 $EH22)"
+run_record_delta $EH22 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta: $DG_A1 .. $DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h18 a padded (but parseable) NARROWER range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h18 the padded range is PARSED and compared, not written off as unparseable"
+[ -f "$(Q2 $EH22)" ] && bad "20h18 no record was written" || ok "20h18 no record was written"
+
+# 20h19 AN UNPARSEABLE `delta:` RANGE FAILS **CLOSED**. This is the fail-open the second
+#       review cycle found, and it is in the FALL-THROUGH rather than in the separator:
+#       the regex pinned an exact spelling, so ANY tolerance gap (here: short shas) left
+#       `stated_to` empty and control reached the bare-needle fallback — which is satisfied
+#       by a body naming B ALONE. The body below carries the unparseable token AND the full
+#       head, so the fallback WOULD accept it: only the explicit refuse-on-unparseable arm
+#       stops the record asserting a range its artifact never stated.
+EH23=425182; rm -f "$(Q2 $EH23)"
+run_record_delta $EH23 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:abc1234..def5678 at $DG_HEAD; no issues found."
+assert_eq "$RECORD_RC" "3" "20h19 an UNPARSEABLE delta: range is REFUSED (rc 3), never fallen past"
+assert_contains "$RECORD_ERR" "cannot parse" "20h19 the refusal names the unparseable range rather than accepting a bare-head match"
+[ -f "$(Q2 $EH23)" ] && bad "20h19 no record was written" || ok "20h19 no record was written"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7200,8 +7240,25 @@ mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_
 #       recorder exactly: the three-dot body stops matching, the bare-needle fallback accepts
 #       a body naming B alone, and the vector's refusal flips to ACCEPTED. Distinct from M14
 #       by construction, not by label.
-MUT="$(mk_mutant sepdots 'delta:([0-9a-f]{12,40})(\.\.\.?)([0-9a-f]{12,40})' 'delta:([0-9a-f]{12,40})(\.\.)([0-9a-f]{12,40})')"
+# M15 — THE PRE-FIX RECORDER, REPRODUCED EXACTLY. This cell mutates BOTH layers of the
+#       fix, because either one ALONE still refuses and would make the cell vacuous: the
+#       separator tolerance (`(\.{2,3})` → `(\.\.)`) AND the refuse-on-unparseable arm
+#       (`elif [ "$_delta_tok" -eq 1 ]` → `elif false`). Those two together ARE the shipped
+#       pre-fix code, so the three-dot body falls through to the bare-needle fallback and
+#       20h17 flips to ACCEPTED — measured, not asserted. Keeping only the separator
+#       mutation is what the first cut did, and it reported "mutant still refused", which
+#       is the correct signal: the second layer alone already closes the bypass.
+MUT="$(mk_mutant sepdots '(\.{2,3})' '(\.\.)')"
+mk_mutant2 "$MUT" '    elif [ "$_delta_tok" -eq 1 ]; then' '    elif false; then'
 mut_check "M15 a three-dot narrower stated range is refused" 425174 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42517501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1...$DG_HEAD only; no issues found."
+# M16 — THE REFUSE-ON-UNPARSEABLE ARM. Deleting it restores the fall-through: an artifact
+#       whose `delta:` token the matcher cannot read drops to the bare-needle arm, which
+#       the body satisfies by naming B — so a range the artifact never stated is asserted,
+#       which is the exact fail-open the second review cycle reproduced. Distinct from M15:
+#       M15 breaks the MATCH for a well-formed three-dot range, M16 removes the GUARD that
+#       stops a range this code cannot read from being reinterpreted as a bare-head claim.
+MUT="$(mk_mutant unparseablepassed '    elif [ "$_delta_tok" -eq 1 ]; then' '    elif false; then')"
+mut_check "M16 an unparseable stated range is refused, not reinterpreted" 425182 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:abc1234..def5678 at $DG_HEAD; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
