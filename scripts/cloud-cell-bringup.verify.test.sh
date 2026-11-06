@@ -293,7 +293,7 @@ cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() 
 # branches, because `doctor_session_orphaned_foreign()` and the refusal `die` print the same
 # `doctor_session_state_dir` parse. Branch discrimination is carried by the rc, the remedy-text and
 # the killed-nothing arms below.
-mkdir -p "$T/o6/state/roles" "$T/stub6" "$T/peer6"
+mkdir -p "$T/o6/state/roles" "$T/stub6"
 cat > "$T/stub6/tmux" <<'EOF'
 #!/bin/sh
 case "$1" in
@@ -304,7 +304,7 @@ esac
 exit 0
 EOF
 chmod +x "$T/stub6/tmux"
-OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6" FOREIGN_O="$T/peer6" OR=daniel-ospina/tortoise \
+OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6" FOREIGN_O="$T/nonexistent-peer6" OR=daniel-ospina/tortoise \
         O="$T/o6" HOME="$T" CELL_HOME="$T" ENV_FILE="$T/keys6.env" \
         bash -c '. "$1"; start_doctor_loop' _ "$SUPLIB" 2>&1 )"; RC=$?
 [ "$RC" -ne 0 ] && ok "red/fatal: a FOREIGN doctor session -> REFUSED (rc=$RC)" \
