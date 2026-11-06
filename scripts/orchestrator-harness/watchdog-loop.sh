@@ -181,7 +181,20 @@ PIN_ROOT="${WATCHDOG_PIN_DIR:-${HARNESS_PIN_DIR:-$HOME/harness}}"
 # refusal line, rc 0). Any value a verb can return is unsafe as a sentinel. `RESTART_VERB` below is the
 # same pattern done right, and `RESTART-REFUSED` coverage has its own case (§8b(i)) so a verb's 75 is
 # still RESTART-FAILED.
-RESTART_REFUSED=0
+#
+# ⛔ AND IT IS NAMED `RESTART_WITHHELD`, NOT `RESTART_REFUSED` (2026-11-06). In this deploy unit
+# `*_REFUSED` is the GATE-CODE namespace: `spawn-gate.test.sh`'s codes scanner reads every `*.sh` that
+# ships together and refuses a `*_REFUSED` name holding anything that is not an exit code in 70..89,
+# because a number under that spelling is a refusal classifier callers dispatch on. A boolean that ends
+# in `_REFUSED` is read as exactly that and reds the scan (`unparseable declaration:
+# watchdog-loop.sh:RESTART_REFUSED`) — correctly, since nothing but the scan can tell a flag from a code.
+# `RESTART_REFUSED=0` landed 23 minutes after that scanner did, in a different PR, and neither author
+# could see the other. The FIX belongs here rather than in the scanner: loosening the net to tolerate a
+# non-code value under the code spelling would let a mistyped `AGENT_*_REFUSED=8` through, which is the
+# duplicate-gate class the scan exists to catch. `RESTART_WITHHELD` says what it is (this pass's restart
+# never ran) in a namespace this file owns, and the log/verdict vocabulary (`RESTART-REFUSED`, §8b(i))
+# is untouched — that text is a verdict name, not a variable.
+RESTART_WITHHELD=0
 LOG="${WATCHDOG_LOG:-$STATE_DIR/controller-watchdog.log}"
 STREAK_FILE="$STATE_DIR/controller-watchdog.streak"
 CRASH_FILE="$STATE_DIR/controller-watchdog.crash"
@@ -837,7 +850,7 @@ RESTART_VERB=""
 restart_stack() {
   local rc=0
   # this invocation's own answer: a caller must never inherit a previous pass's refusal (or its absence)
-  RESTART_REFUSED=0
+  RESTART_WITHHELD=0
   if [ -n "${WATCHDOG_RESTART_CMD:-}" ]; then
     # TESTS ONLY: an exact stand-in for the platform verb, so every case is driven hermetically.
     RESTART_VERB="$WATCHDOG_RESTART_CMD"
@@ -862,7 +875,7 @@ restart_stack() {
         # sixth arm of this function, and the same invariant the plist and cell arms were fixed for.
         # §8b(k) covers it (uname shim = Darwin, no launchctl anywhere on the fixture PATH).
         rc=127
-        RESTART_REFUSED=1
+        RESTART_WITHHELD=1
         log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no launchctl on this box's PATH — nothing was issued (this is the macOS arm, so the job cannot be recovered from here)"
       else
         # ⛔ A PINNED BINARY THAT IS NOT THE ONE ON PATH REFUSES EVERY VERB — INCLUDING THE READS.
@@ -877,7 +890,7 @@ restart_stack() {
           local lc; lc="$(command -v launchctl 2>/dev/null)"
           if [ "$lc" != "$WATCHDOG_LAUNCHCTL_PIN" ]; then
             log_line "verdict=RESTART-REFUSED"$'\t'"note=WATCHDOG_LAUNCHCTL_PIN=${WATCHDOG_LAUNCHCTL_PIN} but launchctl resolves to ${lc:-nothing} — NO launchctl verb was issued (not even the state read); whatever would have answered is not the binary this caller pinned"
-            RESTART_REFUSED=1; return 1
+            RESTART_WITHHELD=1; return 1
           fi
         fi
         # ONE restart, but WHICH verb depends on a MEASURED state — see launchd_job_state above. A
@@ -933,14 +946,14 @@ restart_stack() {
             fi
             if [ -n "$live" ]; then
               log_line "verdict=RESTART-REFUSED"$'\t'"pid=$live"$'\t'"note=$LABEL is NOT in any launchd domain, but a controller (pid $live) is ALIVE — NOT bootstrapping: over a job an operator deliberately stopped this reverses that stop, a bootstrapped job that then loses the lock race exits at once so KeepAlive thrashes it, and where that controller's lock is absent or stale the newcomer WOULD take over — a SECOND controller on one PR queue. Nothing was issued; if the box needs this controller replaced, stop it first (the handoff ritual) and the next REMOVED pass will restore it"
-              RESTART_REFUSED=1; return 1
+              RESTART_WITHHELD=1; return 1
             elif [ ! -f "$PLIST_PATH" ]; then
               # ⛔ ALSO A REFUSAL, FOR THE SAME REASON (review P2, #1986): NOTHING WAS EXECUTED. Without
               # the flag `main` emitted a second, FALSE verdict over this one — `RESTART-FAILED rc=127
               # verb=unknown note=the platform restart verb failed` — while the only launchctl calls in
               # the pass were the two `print` reads. The arm below states the verdict and its reason;
               # `main` must not restate it as a failed verb. §8b(c) asserts RESTART-FAILED is ABSENT.
-              RESTART_REFUSED=1; rc=127
+              RESTART_WITHHELD=1; rc=127
               # ⛔ THE REMEDY IS LABEL-DEPENDENT (review P2, cycle 2 of #1986). `install.sh` renders
               # `com.eldato.orchestrator-loop` (see `PLIST_PATH` above), which IS this arm's subject when
               # LABEL is that label — so a hardcoded "it repairs the loop label and NOT this one" withheld
@@ -966,7 +979,7 @@ restart_stack() {
               local _plist_why
               if _plist_why="$(plist_not_this_job "$PLIST_PATH")"; then
                 log_line "verdict=RESTART-REFUSED"$'\t'"plist=$PLIST_PATH"$'\t'"note=$LABEL is NOT loaded and a plist exists at $PLIST_PATH, but it is NOT this job: $_plist_why — NOTHING was issued, because launchctl bootstrap resolves the job by the plist's own Label, so loading it would load a DIFFERENT job beside this box's model (the #1761/#1715 duplicate-controller class) and report it as a failed restart of a controller it never touched. Point WATCHDOG_PLIST at $LABEL's own plist, or provision it there"
-                RESTART_REFUSED=1; return 1
+                RESTART_WITHHELD=1; return 1
               fi
               # ⛔ AN `enable` THAT FAILS STOPS THE ARM — it is not swallowed. It used to be
               # `enable … || true`, so a REFUSED verb fell through to a `bootstrap` of a label that may
@@ -985,7 +998,7 @@ restart_stack() {
                 # block either.
                 case "$(disable_state "$dom" "$LABEL")" in
                   disabled)
-                    RESTART_REFUSED=1
+                    RESTART_WITHHELD=1
                     log_line "verdict=RESTART-REFUSED"$'\t'"note=launchctl enable $dom/$LABEL exited 0, but the persistent Disabled override STILL reads 'disabled' — NOT bootstrapping: the load would either fail or succeed into a state the next boot loses. Next: launchctl enable $dom/$LABEL; launchctl print-disabled $dom | grep $LABEL"
                     return 1 ;;
                   unknown)
@@ -1034,7 +1047,7 @@ restart_stack() {
         # when what would run is not that path.
         if [ -n "${WATCHDOG_SUPERVISOR_PIN:-}" ] && [ "$sup" != "$WATCHDOG_SUPERVISOR_PIN" ]; then
           log_line "verdict=RESTART-REFUSED"$'\t'"note=WATCHDOG_SUPERVISOR_PIN=${WATCHDOG_SUPERVISOR_PIN} but the supervisor resolves to ${sup} — NO supervisor verb was issued; whatever would have answered is not the binary this caller pinned"
-          RESTART_REFUSED=1; return 1
+          RESTART_WITHHELD=1; return 1
         fi
         # ⛔ PIN `ORCH_FOREGROUND=0` (review P2, #2402). A watchdog that itself runs INSIDE a service-managed
         # controller's environment inherits `Environment=ORCH_FOREGROUND=1` from the unit (it is exported into
@@ -1052,7 +1065,7 @@ restart_stack() {
         # are the same class; the invariant stated there ("a deliberate refusal is not a failed verb")
         # holds on every platform, and a cell farm deployed by `cp *.sh` (agent-infra#2041) is exactly
         # where this arm is reached. §8c asserts RESTART-FAILED is ABSENT here too.
-        RESTART_REFUSED=1
+        RESTART_WITHHELD=1
         log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no $O/cloud-cell-supervisor.sh and no SUPERVISOR set — nothing was restarted"
       fi ;;
   esac
@@ -1270,7 +1283,7 @@ main() {
   # (there is nothing to settle into), which is how a refusal used to surface as STILL_NOT_CYCLING.
   # The flag, not `rc`: see its declaration — a reserved exit code collides with a verb that fails with
   # that same value, and a failed `kickstart` must stay a FAILED kickstart.
-  if [ "${RESTART_REFUSED:-0}" -eq 1 ]; then
+  if [ "${RESTART_WITHHELD:-0}" -eq 1 ]; then
     # ⛔ AND A REFUSAL COSTS NOTHING (review P2, cycle 4 of #1986), in both directions:
     #   * NO CLAIM. The decision line above carries `restart=1` and, at the cap, "ONE probe restart". It
     #     used to be EMITTED BEFORE this test, so every refusal pass logged a restart — and a probe
