@@ -95,6 +95,81 @@ drop_dispatched_rows() {
   fi
   return 0
 }
+# ── A CHECKOUT THE DISPATCHER PROVISIONED AND NO LANE EVER RAN IN IS RESIDUE AT ONCE (#2047) ────
+# `wt_provision` proves a USABLE checkout was created; the LANE is a later, separate step and it can
+# fail — the launcher has no surface (no cmux answer AND no tmux), the credential contract refuses,
+# the spawn dies. Until this existed, that outcome left the worktree AND the branch `-b` had just
+# created sitting on disk, at 0 commits ahead and with nothing ever having run in them — which is
+# exactly the artifact the intake pre-flight reads as IN FLIGHT. Measured (2026-10-18, #8090):
+# `refs/heads/feat/8090-tm — 0 commit(s) ahead` made a FREE issue permanently undispatchable on
+# EVERY box, with 19 of 20 lane slots free, while the batch reported a lane it never started.
+# `wt_reap_if_empty` is the SAME function the lane's own EXIT trap and the no-chain path below run —
+# not a second teardown — and it REFUSES on anything that could be work: commits ahead, a pushed
+# branch, a dirty tree, an ignored-data tree, a live holder, a checkout on another branch, an
+# unevaluable probe. So a lane that pushed before its spawn was reported failed keeps both, and a
+# resumed branch keeps both; only a provably EMPTY checkout goes back. Exit status is the verdict
+# (0 reaped · 1 preserved · 2 refused/failed) and every one of them is printed, never absorbed.
+# ⛔ THIS HELPER TAKES BACK ONLY A CHECKOUT. WHETHER THE ISSUE CLAIM IS RELEASED IS PER-PATH, AND
+# THIS HELPER DECIDES NONE OF IT (cycle-2 review, P1 — the unscoped form of this sentence read
+# "nothing on these paths releases" while `these paths` in the paragraph above INCLUDES the no-chain
+# path, which releases deliberately; acting on it would have deleted that release and held a dead
+# lane's claim for the whole lease). The two paths in full:
+#   · LANE-NEVER-STARTED — KEEPS the claim. The chain below is ABOUT TO BE started and will wait for
+#     that PR; if that spawn ALSO fails, the NO-CHAIN bullet below releases once the lane is proven
+#     gone. Releasing HERE would declare an issue this box is actively working free and a peer would
+#     duplicate it.
+#   · NO-CHAIN — RELEASES, exactly once, and only after `wt_alive` confirms the lane is gone; if it
+#     cannot be stopped the claim is KEPT, because the lease expiring it is the safe direction (#2033).
+# The release belongs to the CALL SITE and to the ordering the lane that wrote it measured; never to
+# this helper, and never to a comment that describes both paths as one.
+# ⚠️ SCOPE, so this header cannot be read as "every exit": the PER-ISSUE repo/branch assertion below
+# also `continue`s after a checkout was provisioned, and deliberately does NOT take it back — that
+# refusal says the checkout/branch is not what the target claims, so the owner of the thing is
+# exactly what is in question; it is reported (`REFUSED … claim released`) instead of deleted.
+reap_unused_worktree() { # <issue> <why> — reports; never changes the caller's status
+  # ⛔ IT DERIVES ITS OWN TARGET FROM THE ISSUE IT REPORTS ON. `$WT`/`$BR` are LOOP GLOBALS set per
+  # iteration, so a helper that took `$1` for its REPORT and the globals for its KILL could delete one
+  # issue's checkout while reporting under another's id — and `wt_reap_if_empty`'s "only a provably
+  # EMPTY checkout goes back" gate would not catch it, because an empty checkout is exactly what a
+  # wrong target usually is. Both current call sites are inside the same iteration, so this is not a
+  # live bug; it is a helper whose two inputs could disagree, which is one input too many.
+  local WT="tm-$1" BR="feat/$1-tm"
+  # ⛔ NO VERDICT IS ANNOUNCED BEFORE IT IS REACHED (#3577 review). This line used to read
+  # "— taking the checkout back" and printed UNCONDITIONALLY, so on exactly the arms where a safety
+  # gate fires (commits ahead, a dirty tree, a live holder) the log claimed a deletion that did not
+  # happen and then contradicted itself on the next line — and the dispatch log is the only record of
+  # what the box did to a lane's checkout, read by the next lane and by the human triaging a stuck
+  # issue. The reason is stated; the verdict line that follows says what actually happened.
+  echo "#$1: $2"
+  # ⛔ AND THE VERDICT IS CLEARED AND THE VERB PROVEN PRESENT FIRST. `wt_provision` leaves its own
+  # verdict in `WT_RESULT`, and `$WTL` is sourced beside this script with NO verb guard (the file only
+  # has to source cleanly), so a script directory whose module predates `wt_reap_if_empty` ran
+  # `command not found` (rc 127) straight into the `*)` arm — which then reported the PROVISION's
+  # sentence, `created … on feat/N-tm from origin/main`, as the reason the reap FAILED. The one arm
+  # that exists to surface a failed take-back named a wrong cause while the residue survived.
+  # ⚠️ SCOPED (#3577 review, P2 — VERIFIED against both files): what the guard makes unreachable is a
+  # STALE verdict, NOT this arm. `wt_reap_if_empty` resets `WT_RESULT` at its OWN entry — its first
+  # version (e83d41a15) already did — and the guard below returns without reading `WT_RESULT` at all, so
+  # nothing here can bill `wt_provision`'s `created …` sentence. The `*)` arm itself is LIVE and
+  # load-bearing: the module returns 2 for its OWN refusals (the checkout contains the caller's cwd, an
+  # unresolvable refs/heads/<br>, a refused `worktree remove`, a failed ref delete) and those verdicts
+  # are exactly what this arm must print. The clear below is belt-and-braces, not load-bearing — it is
+  # this caller's only protection if either the module's reset-at-entry or the guard is ever weakened.
+  # ⛔ So: do NOT delete the `*)` arm on the strength of this note, and do not read the note as evidence
+  # that a stale verdict is reachable through the shipped path.
+  WT_RESULT=""
+  if ! command -v wt_reap_if_empty >/dev/null 2>&1; then
+    echo "#$1: ⚠️ worktree NOT reaped — the sourced ${WTL:-wt-lifecycle.sh} has no wt_reap_if_empty (it predates the take-back); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
+    return 0
+  fi
+  wt_reap_if_empty "${REPO_ABS:-$REPO}" ".worktrees/$WT" "$BR" "dispatch #$1"
+  case $? in
+    0) echo "#$1: $WT_RESULT" ;;
+    1) echo "#$1: worktree kept — $WT_RESULT" ;;
+    *) echo "#$1: ⚠️ worktree NOT reaped — $WT_RESULT (bash scripts/pi-reap-worktrees.sh --repo '$REPO' reports it)" ;;
+  esac
+  return 0
+}
 # ── NO TARGET = REFUSED, AND THE CLAIMS ARE RELEASED (agent-infra#2724/#2694) ────────────────────
 # This runs AFTER `release_issue_claim_unspawned` is defined because the controller has ALREADY taken
 # `refs/claims/issue-<N>` for every id it handed us. "Nothing will start" must therefore also mean
@@ -337,13 +412,31 @@ for N in "$@"; do
     echo "#$N: lane-$N (implement+PR, launcher=$_lan)$_hd"
   else
     echo "#$N: lane-$N NOT spawned (launcher=$_lan)$_hd"
+    # ⛔ THE WORKTREE MUST NOT OUTLIVE A LANE THAT NEVER STARTED (#2047). Everything above this
+    # line succeeded — the checkout was provisioned and proven usable — so on this path the
+    # dispatcher owns an artifact nobody will ever use, and leaving it is the #8090 residue: 0
+    # commits ahead, so the pre-flight reads the issue as in flight on EVERY box while its slots are
+    # free. The CLAIM stays held: the chain below is ABOUT TO BE started and will wait for that PR,
+    # and only the NO-CHAIN exit below (its spawn failing, then the lane proven gone) releases it —
+    # nothing here does. So this releases nothing: it takes back a checkout, and nothing else.
+    # ⛔ AND IT ASKS THE LAUNCHER FIRST, exactly as the no-chain path below does. A spawn that
+    # reported failure while a terminal DID start is the one shape where reaping could pull a live
+    # lane's checkout out from under it (#2499/#2787) — so a lane that answers alive keeps its
+    # worktree, whatever the spawn's status said.
+    if wt_alive "lane-$N"; then
+      echo "#$N: lane-$N reported NOT spawned but is alive — keeping its worktree (no reap of a live lane, #2047)"
+    else
+      reap_unused_worktree "$N" "the lane never started, so nothing ran in this checkout"
+    fi
   fi
   # ⛔ IF THE CHAIN CANNOT BE STARTED, NO TRAP WILL EVER RELEASE THE CLAIM (2026-10-16 review): this
   # was the second no-chain path, and it was covered by nothing. A stale `chain-$N` session name, a
   # dead tmux server or tmux missing all land here, and the issue then stays claimed on every box for
-  # the whole lease. (A failed LANE spawn is deliberately NOT released here: the chain IS alive and
-  # waiting for that PR, so releasing would let a peer duplicate the work. That wait is bounded —
-  # 90 minutes, then chain-merge.sh's own trap releases it.)
+  # the whole lease. (A failed LANE spawn is not released by the lane-spawn arm above; the NO-CHAIN arm
+  # below releases it once the lane is proven gone. If the chain DOES start, its wait is bounded —
+  # 90 minutes, then chain-merge.sh's own trap releases it. ⚠️ This sentence read "the chain IS alive
+  # and waiting for that PR", which is false on the doubly-failed dispatch — no chain exists to trap —
+  # and contradicted the corrected header above. Cycle-4 review, P1.)
   # ⛔ HAND THE CHAIN ITS GENERATION (adversarial review). The record here is the one THIS dispatch
   # wrote — the one fact a chain cannot safely discover for itself later (see chain-merge.sh's comment).
   # ⚠️ The window is NOT microseconds for every member of a batch: the loop sleeps between issues, so
@@ -385,17 +478,10 @@ for N in "$@"; do
       release_issue_claim_unspawned "$N"
       # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
       # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is
-      # residue by definition — and residue is what makes the issue undispatchable everywhere.
-      # `wt_reap_if_empty` is the SAME function the lane's own EXIT trap runs, and it refuses on
-      # anything that could be work: commits ahead, a pushed branch, a dirty tree, a live holder.
-      # A lane that pushed and opened a PR within seconds keeps its worktree (the branch is ahead).
-      wt_reap_if_empty "$REPO" ".worktrees/$WT" "$BR" "dispatch #$N"
-      _rp=$?
-      case "$_rp" in
-        0) echo "#$N: $WT_RESULT" ;;
-        1) echo "#$N: worktree kept — $WT_RESULT" ;;
-        *) echo "#$N: ⚠️ worktree NOT reaped — $WT_RESULT (bash scripts/pi-reap-worktrees.sh --repo '$REPO' reports it)" ;;
-      esac
+      # residue by definition — and residue is what makes the issue undispatchable everywhere. Same
+      # take-back as the lane-never-started path above; its gates (commits ahead, a pushed branch, a
+      # dirty tree, a live holder) are documented at the helper.
+      reap_unused_worktree "$N" "the chain could not start, so no chain will ever look at it"
     fi
   fi
   sleep 30   # stagger uv sync
