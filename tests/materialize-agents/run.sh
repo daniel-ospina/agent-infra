@@ -927,13 +927,17 @@ done
 #
 # ⛔ PORTABILITY, MEASURED: the ATX test below is TWO patterns, not
 # `/^#{1,6}([ \t]|$)/`. mawk — the `awk` on ubuntu-latest, i.e. this suite's own CI
-# runner — PANICS on the grouped `$` alternation:
+# runner — PANICS on that pattern:
 #   REcompile() - panic: values still on machine stack for ^#{1,6}([ \t]|$)
 #   (exit 100)
 # so the scan could not run at all and this gate reported `NOT a clean result` on a
 # healthy tree for EVERY pull request. The split form is byte-for-byte equivalent
-# (differentially checked against gawk over 72 hash-run/suffix cases) and both
-# awks accept it: mawk's regex compiler has no interval-expression-into-`$` path.
+# (differentially checked against gawk over 950 hash-run/suffix/prefix cases) and
+# both awks accept it.
+# The trigger is NOT the `$` — it is an INTERVAL EXPRESSION IMMEDIATELY FOLLOWED BY A
+# PARENTHESISED ALTERNATION, measured in mawk 1.3.4: `^#{1,6}([ \t]|x)` panics too
+# (no `$` present), as does `^a{1,6}([ ]|$)`, while `^(#{1,6})([ \t]|$)` and
+# `^a([ ]|$)` are fine. So do not "fix" a panic here by deleting the `$`.
 # The safe set is ASCII alphanumerics plus `_` `)` `?`, a backtick, and `*`.
 # If a legitimate heading trips this, widen the set in `md026_scan` — do NOT
 # narrow the class of reported characters back into a deny-list.
