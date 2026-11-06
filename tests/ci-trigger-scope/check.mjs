@@ -219,9 +219,29 @@ function jobBlock(text, name) {
   if (start < 0) return "";
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i++) {
-    if (/^  [A-Za-z0-9_-]+:\s*$/.test(lines[i])) { end = i; break; }
+    // Any 2-space-indent YAML key ends the job — not only a BARE one. A legal header carrying a
+    // trailing comment (`  lint-docs:  # advisory`) or a quoted name (`  "lint-docs":`) would slip
+    // past a bare-only matcher, the block would then over-extend into that later job, and a guard
+    // line inside THAT job would satisfy an assertion about this one. That is the fail-open direction.
+    if (/^  (?:[A-Za-z0-9_-]+|"[^"]*"|'[^']*'):(?:\s+#.*)?\s*$/.test(lines[i])) { end = i; break; }
   }
   return lines.slice(start, end).join("\n");
+}
+
+// jobKeyIs(block, key, valueRe) — does THIS job's own `key:` line (at the job's key indent, i.e. one
+// level deeper than the job header) match `valueRe`?
+//
+// ⛔ NOT a text search, and the difference is a fail-open rather than tidiness. `^\s*if:` matches a
+// STEP's `if:` just as well as the job's, so a whole-block text match reports the required job guarded
+// while the job itself carries no `if:` at all and therefore RUNS on the comment event. Measured: move
+// `if: github.event_name != 'issue_comment'` from the job to its first step and a text-wide matcher
+// returns ok/rc=0. The key indent is what distinguishes the two, so it is what is asserted.
+function jobKeyIs(block, key, valueRe) {
+  const lines = String(block ?? "").split("\n");
+  const header = lines[0] ?? "";
+  const keyIndent = " ".repeat(header.length - header.trimStart().length + 2);
+  const re = new RegExp(`^${keyIndent}${key}:\\s*(?:${valueRe.source})\\s*$`);
+  return lines.some((l) => re.test(l));
 }
 
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────
@@ -360,22 +380,29 @@ function checkPipelineComplianceUnchanged() {
   // would produce the verdict a PR head is gated on — a surface no PR head controls. So the widening is
   // bound to the EVIDENCE that makes it safe (`PC_COMMENT_GUARD` below), and dropping the guard from
   // the job is refused exactly like an unreviewed new trigger. A genuinely NEW trigger still lands in
-  // `refusedExtra` and is reported by name, so the arm that says "a new dispatch path must declare
-  // itself" keeps firing.
+  // `extraOn` and is reported by name, so the arm that says "a new dispatch path must declare itself"
+  // keeps firing.
   const PC_ALLOWED_ON = ["workflow_call", "pull_request"];
   const PC_ADMITTED_EXTRA = ["issue_comment"];
-  const PC_COMMENT_GUARD = /^\s*if:\s*.*github\.event_name\s*!=\s*'issue_comment'\s*$/m;
+  // `.*` before `github.event_name` tolerates a compound `if:`; the INDENT is what jobKeyIs binds.
+  const PC_COMMENT_GUARD = /.*github\.event_name\s*!=\s*'issue_comment'/;
   const onNames = onKeys(region, childIndent);
   const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
   const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
-  if (admitted.length && !PC_COMMENT_GUARD.test(jobBlock(text, "pipeline-compliance"))) {
+  if (
+    admitted.length &&
+    !jobKeyIs(jobBlock(text, "pipeline-compliance"), "if", PC_COMMENT_GUARD)
+  ) {
     findings.push(
       `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB no longer carries \`if: github.event_name != 'issue_comment'\`. The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
     );
   }
   if (extraOn.length) {
     findings.push(
-      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\` and \`pull_request:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
+      // The allow-list is BUILT from the constants, never spelled out in prose: prose drifts, and a
+      // FINDING that names an allow-list the file no longer has leaves the reader unable to tell
+      // whether the admitted trigger is admitted or an unreported extra.
+      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides ${[...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA].map((n) => `\`${n}:\``).join(", ")}. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
     );
   }
 

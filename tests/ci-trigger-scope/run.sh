@@ -460,6 +460,60 @@ if apply_mutation "$PC" "$PC_COMMENT_AND_PUSH" \
   esac
 fi
 
+# ⛔ AND THE GUARD MUST BE AT THE JOB'S OWN KEY INDENT — not merely somewhere in the job's text.
+# `^\s*if:` also matches a STEP's `if:`, and a step-level guard does NOT stop the job from running on
+# the comment event, so a text-wide matcher reports the required job guarded while the job itself
+# carries no `if:` at all and mints the required verdict from a comment. Measured: this mutant returned
+# ok/rc=0 under the text-wide binding.
+PC_STEPGUARD_MID="$TMP/pc-stepguard-mid.yml"
+PC_STEPGUARD="$TMP/pc-stepguard.yml"
+if apply_mutation "$PC" "$PC_STEPGUARD_MID" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event." \
+  "the required job's guard must be removable for the step-guard arm"; then
+  if apply_mutation "$PC_STEPGUARD_MID" "$PC_STEPGUARD" \
+    "      - name: Run pipeline compliance gate" \
+    "      - name: probe
+        if: github.event_name != 'issue_comment'
+        run: echo probe
+      - name: Run pipeline compliance gate" \
+    "a step-level guard must be insertable"; then
+    run_check 1 "a guard moved onto a STEP does not satisfy the required job's guard" PC_FILE="$PC_STEPGUARD"
+  fi
+fi
+
+# ⛔ AND THE BLOCK MUST END ON A JOB HEADER THAT CARRIES A COMMENT. A legal header with a trailing YAML
+# comment does not match a bare-only terminator, so the required job's block over-extends into the NEXT
+# jobs and a guard in a LATER job satisfies an assertion about THIS one. Both intervening headers are
+# commented because `revalidate-on-issue-comment` sits between the required job and the twin that
+# carries the same guard line — with only the twin commented, a bare header still stops the block and
+# the arm cannot be driven (measured: that version of this arm was vacuous, it read rc=1 either way).
+PC_OVEREXT_MID1="$TMP/pc-overext-mid1.yml"
+PC_OVEREXT_MID2="$TMP/pc-overext-mid2.yml"
+PC_OVEREXT="$TMP/pc-overext.yml"
+if apply_mutation "$PC" "$PC_OVEREXT_MID1" \
+  "    # gate for a PR only. The revalidation job below owns the comment event.
+    if: github.event_name != 'issue_comment'" \
+  "    # gate for a PR only. The revalidation job below owns the comment event." \
+  "the required job's guard must be removable for the over-extension arm"; then
+  if apply_mutation "$PC_OVEREXT_MID1" "$PC_OVEREXT_MID2" \
+    "  revalidate-on-issue-comment:
+" \
+    "  revalidate-on-issue-comment:  # comment-driven revalidation
+" \
+    "the next job header must be commentable"; then
+    if apply_mutation "$PC_OVEREXT_MID2" "$PC_OVEREXT" \
+      "  workflow-drift:
+" \
+      "  workflow-drift:  # twin job, same guard
+" \
+      "the twin's job header must be commentable"; then
+      run_check 1 "a job header carrying a trailing comment still ENDS the required job's block" PC_FILE="$PC_OVEREXT"
+    fi
+  fi
+fi
+
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="
 # Each entry names the reader it belongs to. This list is the assertion: a filter that stops
 # admitting one of them is a coverage loss, and the mandate for this change is to err WIDE (#3001 —
