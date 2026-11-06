@@ -3210,6 +3210,16 @@ ISSUES 2')"
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
   # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
   RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
+  # ⛔ THE FIXTURE CHECKOUT IS A REAL ONE, AND THAT IS THE ARM'S SETUP (2026-11-06). `report.sh`
+  # resolves `REPO` through `repo-slug.sh`'s `resolve_repo` (#3054), which REFUSES by name — exit 2,
+  # message on stderr — when `REPO` is not a git checkout. It deliberately no longer guesses and no
+  # longer degrades. `$RPT/repo` used to be an empty directory, so every `report.sh` run below exited 2
+  # before printing a line and six assertions measured the refusal instead of the queue they name (the
+  # whole section read `got []`). `git init` is exactly what `resolve_repo` asks of it
+  # (`rev-parse --show-toplevel`), the stub `gh` supplies the listing, so the fixture stays hermetic and
+  # offline. A fixture that cannot be built must say so rather than quietly redden the arms below.
+  git -C "$RPT/repo" init -q 2>/dev/null \
+    || { echo "  ❌ the fixture checkout ($RPT/repo) could not be initialised — every report.sh arm below is unproven"; FAIL=$((FAIL+1)); }
   # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
   # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
   # The controller used to be able to leave two markers for one PR; report.sh must not report that as
@@ -3286,12 +3296,23 @@ GHOPEN3
   # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
   # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
   # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
-  _rpt_norepo="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
-  case "$_rpt_norepo" in
-    *"open PRs: 0"*|*"stale evidence (needs re-review): 0"*) echo "  ❌ with no repo checkout report.sh printed a confident 0: [$_rpt_norepo]"; FAIL=$((FAIL+1)) ;;
-    *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ an unreadable environment produced [$_rpt_norepo] — expected the named missing dependency"; FAIL=$((FAIL+1)) ;;
-  esac
+  # ⛔ RE-POINTED AT THE SHIPPED CONTRACT (#3054). A wrong `REPO` is no longer a DEGRADED READ that
+  # prints `<needs a repo checkout and gh>`: it is a CONFIGURATION REFUSAL — exit 2, before any section
+  # runs. The property this arm exists for is unchanged and is asserted directly (a blind environment
+  # publishes no queue line), plus the refusal must NAME what is wrong instead of disappearing into an
+  # empty report. Deleting the arm would have restored the same hole the original review found: nothing
+  # at all watching what a blind box prints.
+  _rpt_norepo_out="$TMP/rpt-norepo.out"; _rpt_norepo_err="$TMP/rpt-norepo.err"
+  O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 >"$_rpt_norepo_out" 2>"$_rpt_norepo_err"; _rpt_norepo_rc=$?
+  if [ "$_rpt_norepo_rc" -ne 2 ]; then
+    echo "  ❌ with no repo checkout report.sh exited $_rpt_norepo_rc, not the 2 that means \"the operator's REPO is absent or wrong\""; FAIL=$((FAIL+1))
+  elif grep -qE 'open PRs:|stale evidence \(needs re-review\)' "$_rpt_norepo_out"; then
+    echo "  ❌ with no repo checkout report.sh still published a queue line: [$(grep -E 'open PRs:|stale evidence' "$_rpt_norepo_out" | tr '\n' '|')]"; FAIL=$((FAIL+1))
+  elif ! grep -q "REPO=$RPT/does-not-exist is not a git checkout" "$_rpt_norepo_err"; then
+    echo "  ❌ the refusal did not name REPO and why (stderr: [$(head -1 "$_rpt_norepo_err")])"; FAIL=$((FAIL+1))
+  else
+    echo "  ✅ with no repo checkout report.sh REFUSES at exit 2 naming REPO — a blind environment publishes no queue line at all"; PASS=$((PASS+1))
+  fi
   # (9c4) ⛔ AND ON THE DEGRADED PATHS THE PARKED COUNT NAMES ITS OWN PROVENANCE (landing-review note,
   # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so with no
   # checkout, or with an unreadable listing, the number that gets printed is the raw `parked-*` FILE
@@ -3301,10 +3322,35 @@ GHOPEN3
   # of which can be attributed on these paths (that is the whole reason the count is raw).
   printf '%s\n' livehead > "$RPT/state/parked-6001"
   printf '%s\n' oldhead > "$RPT/state/parked-6999"
-  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
-  case "$_rpt_norepo_parked" in
-    *" 2  (raw marker count"*) echo "  ✅ with no repo checkout the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ with no repo checkout the parked line printed [$_rpt_norepo_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
+  # ⛔ THE `norepo` BRANCH IS REACHED BY A MISSING `gh` NOW, NOT BY A MISSING CHECKOUT (#3054).
+  # `resolve_repo` refuses a non-checkout before any section runs, so `! -d "$REPO"` inside report.sh can
+  # no longer fire — but `! command -v gh` can, and that is a REAL fleet state (a cell that was never
+  # given the CLI), so the branch still prints and still needs its provenance asserted. The fixture PATH
+  # is a symlink farm of every executable the ambient PATH offers EXCEPT `gh`: built by one python pass
+  # (no curated list to rot, and no `/usr/bin` walk that could shadow half the tools), and the arm reds
+  # if the farm cannot be made — never a silent skip.
+  NOGH="$TMP/nogh-bin"; rm -rf "$NOGH"; mkdir -p "$NOGH"
+  python3 - "$NOGH" <<'NOGHFARM' 2>/dev/null || true
+import os, sys
+out = sys.argv[1]
+for d in os.environ.get("PATH", "").split(":"):
+    if not d or not os.path.isdir(d):
+        continue
+    for name in os.listdir(d):
+        if name == "gh":
+            continue
+        src = os.path.join(d, name); dst = os.path.join(out, name)
+        if os.path.exists(dst) or not (os.path.isfile(src) and os.access(src, os.X_OK)):
+            continue
+        try:
+            os.symlink(src, dst)
+        except OSError:
+            pass
+NOGHFARM
+  _rpt_nogh_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
+  case "$_rpt_nogh_parked" in
+    *" 2  (raw marker count"*) echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
+    *) echo "  ❌ with no gh on PATH the parked line printed [$_rpt_nogh_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
   esac
   cat > "$TMP/ghstub/gh" <<'GHFAIL2'
 #!/bin/bash
