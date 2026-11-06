@@ -2296,6 +2296,20 @@ if [ -d "$DELTA_REPO" ]; then
   else
     fail "(33a4) delta_proof_fields() could not be extracted from record-review.sh — re-anchor the pin rather than dropping it"
   fi
+  # (33a7) THE TWO `delta` FEATURES MUST NOT WRITE EACH OTHER'S FIELDS. The `--delta` verb (#10583) and
+  # `--evidence delta:<A>..<B>` (#3299) landed from opposite sides of the same file, and both
+  # put a `delta`-named thing into the SAME signed record while asserting DIFFERENT claims: the
+  # verb writes `delta{from,to,proved,arm}` ("the head moved, the authored change did not"),
+  # the evidence arm writes `delta_range`/`delta_base`/`delta_kind`/`delta_digest` ("a reviewer's
+  # verdict covers A..B"). The evidence arm's builder fired on `[ -n "$DELTA_FROM" ]`, and the
+  # verb set `DELTA_FROM` too — so when the two trees merged, every `--delta` record silently
+  # gained `"delta_range":"<head>.."` with an EMPTY upper bound, an empty base and EMPTY
+  # kind/digest. That is a signed record asserting a range a reviewer never covered, written by
+  # a verb whose whole contract is that NO reviewer ran. Nothing else in either feature's tests
+  # could see it: they each assert their OWN fields' presence, never the other's absence.
+  ! grep -q 'delta_range\|delta_base\|delta_kind\|delta_digest' <<<"$D_REC32" \
+    && pass "(33a7) a --delta record carries NONE of the evidence arm's fields (delta_range/delta_base/delta_kind/delta_digest) — the two delta features share no record field and no global" \
+    || fail "(33a7) the --delta record carries an EVIDENCE-arm delta field it never measured (record='$D_REC32')"
   # (33a5) THE `from` AXIS (#3247 review, P1). The record's `delta.from` must name the head
   # the DECIDING ARM measured, never automatically the record's head: `diff` measures from
   # the prior MARKER's head and `patch` from `PRIOR_PATCH_SHA`, and asserting
@@ -2659,7 +2673,14 @@ echo; echo "── (32) post_marker: a marker already present is NOT re-patched 
 awk '/^post_marker\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$SRC" > "$TMP/pm-live.sh"
 if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
   # The MUTANT is the pre-#3347 line, written the way the script spelled it.
-  sed 's#if command grep -qF -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep -qF -- "$marker"; then return 0; fi#' \
+  # ⛔ THE PATTERN MUST MATCH THE SHIPPED SPELLING. main's here-string later gained `-x`
+  # (`grep -qxF`, whole-line, so a QUOTED copy of the marker in prose cannot read as present),
+  # and this `sed` was left looking for `-qF`. It therefore matched nothing, `pm-old.sh` came out
+  # byte-identical to the live function, and (32a)/(32c) reported the arm vacuous — a BASE-BORNE
+  # red, measured on pristine origin/main (`6fea8b687`: 2 of 213 failing, identical) before this
+  # was touched. Repairing the pattern is the root-cause fix: the mutant has to be built from the
+  # line that is actually there, or the arm measures nothing.
+  sed 's#if command grep -qxF -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep -qxF -- "$marker"; then return 0; fi#' \
     "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
   grep -q 'printf "%s' "$TMP/pm-old.sh" \
     && pass "(32a) the pre-fix pipe form was rebuilt for the mutation arm (the mutant is real, not a no-op)" \
@@ -2778,7 +2799,16 @@ fi
 # so it must be raised with the arm or the arm can be skipped silently; it is not a ceiling.
 # MEASURED: `ALL PASSED (213 assertion(s))` on this tree (macOS, bash 3.2). `bash-suites` REFUSES to
 # run on a live cell (exit 78), so a local ALL PASSED is NOT CI evidence — see the PR comment.
-MIN_ASSERTIONS=213
+# Review round 5 (THE MERGE WITH #10583): 213 -> 214. The `--delta` verb and this PR's
+# `--evidence delta:<A>..<B>` arm merged from opposite sides and shared ONE global
+# (`DELTA_FROM`), so EVERY `--delta` record was minted carrying `delta_range`/`delta_base`/
+# `delta_kind`/`delta_digest` for a range no reviewer covered. Neither feature's tests could
+# see it — each asserted its OWN fields' presence, never the other's absence. (33a7) pins the
+# absence, and it was MEASURED red against the merged tree before the fix: the record read
+# `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
+# `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
+# contract is that no reviewer ran.
+MIN_ASSERTIONS=214
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"
