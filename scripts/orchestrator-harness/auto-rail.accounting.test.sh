@@ -813,7 +813,12 @@ grep -qF '[ "$_kind" != green ]'  <<<"$_branch" \
 # ⛔ THE SKIP ARM'S `continue` (window widened: the not-clean-record branch below added lines between
 # the `if` and the outer `continue`, so a tight -A window stopped reaching it and the arm failed for a
 # reason that had nothing to do with the guard).
-grep -qF 'continue'  <<<"$(grep -A11 -F 'if [ "$_rarm" = skip ]; then' "$SUT" || true)" \
+# ⛔ ANCHORED ON THE ARM'S OWN LOG LINE, NOT ON THE `if` (review cycle 7, P2 — measured). `-A11` from
+# `if [ "$_rarm" = skip ]; then` spans the REJECTED sub-arm, whose `continue` is two branches earlier,
+# so the window was satisfied by the NEIGHBOUR's `continue`: deleting the skip arm's own `continue`
+# (which is what makes a red marker-less candidate fall through to `launch_rail`) stayed GREEN. The
+# WAIT arm below has always been anchored this way for the same reason.
+grep -qF 'continue' <<<"$(grep -A1 -F 'AWAITING-REVIEW ($_att) and its checks are RED' "$SUT" || true)" \
   || bad "the 'skip' arm must CONTINUE (never fall through to the rail) — a red candidate with no marker anywhere has nothing for check (c) to carry, so railing it burns a MAX slot on the one class the base's filter deliberately dropped"
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH: a missing reviewer must be named per candidate, not dispatched
 # into. Unpinned, deleting the guard left the suite green while the loop wrote a dispatch record and
