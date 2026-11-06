@@ -49,7 +49,6 @@ set -uo pipefail
 # `bash -n "$0"` is done against the literal path (skipped when the suite is run from a copy outside
 # the repo, where that path does not exist — the run's own exit status still covers it).
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd -P)" || exit 2
-ROOT="$PWD"
 SELF_REL="scripts/orchestrator-harness/dispatch-teardown.test.sh"
 DM_REL="scripts/orchestrator-harness/dispatch-merge.sh"
 [ -f "$DM_REL" ] || { echo "FATAL: $DM_REL is missing (run this suite from the repo checkout)" >&2; exit 2; }
@@ -72,6 +71,7 @@ ok()  { PASS=$((PASS + 1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL + 1)); echo "  ❌ $1"; }
 assert_eq()       { if [ "$1" = "$2" ]; then ok "$3"; else bad "$3 (got: '$1', want '$2')"; fi; }
 assert_contains() { if grep -qF -- "$2" "$1" 2>/dev/null; then ok "$3"; else bad "$3 (missing: $2)"; fi; }
+assert_not_contains() { if grep -qF -- "$2" "$1" 2>/dev/null; then bad "$3 (present: $2)"; else ok "$3"; fi; }
 assert_dir()      { if [ -d "$1" ]; then ok "$2"; else bad "$2 (missing dir: $1)"; fi; }
 assert_nodir()    { if [ -d "$1" ]; then bad "$2 (still present: $1)"; else ok "$2"; fi; }
 assert_branch()   { if git -C "$1" rev-parse --verify -q "refs/heads/$2" >/dev/null 2>&1; then ok "$3"; else bad "$3 (no ref: $2)"; fi; }
@@ -186,6 +186,11 @@ assert_branch "$REPO" feat/2047-tm "T2 …and the branch holding the commit"
 assert_eq "$(git -C "$REPO" rev-list --count "origin/main..feat/2047-tm")" "1" \
     "T2 the commit is intact"
 assert_contains "$T/t2/log" "worktree kept" "T2 the refusal is reported as a KEEP, with its reason"
+# ⛔ THE LOG MAY NOT CLAIM A TAKE-BACK IT DID NOT DO (#3577 review). The helper used to announce
+# "taking the checkout back" BEFORE it knew the verdict, so this arm — where the reaper's gates fire
+# and the commit is preserved — carried a line saying the checkout had been taken back, immediately
+# contradicted by the next line. Nothing is deleted here, so nothing may say it was.
+assert_not_contains "$T/t2/log" "taking the checkout back" "T2 the log does not announce a take-back that its own next line contradicts"
 
 echo "── T3: an UNCOMMITTED tree keeps its worktree (the dirty class is the reaper's, not the exit path's)"
 mk_box t3
@@ -197,6 +202,7 @@ assert_contains "$T/t3/log" "#2047: lane-2047 NOT spawned" "T3 the lane spawn wa
 assert_dir "$REPO/.worktrees/tm-2047" "T3 a DIRTY worktree is KEPT"
 if [ -f "$REPO/.worktrees/tm-2047/wip.txt" ]; then ok "T3 the uncommitted file is still there"; else bad "T3 the uncommitted file is GONE (silent destruction of work)"; fi
 assert_contains "$T/t3/log" "DIRTY" "T3 the reason names the dirt"
+assert_not_contains "$T/t3/log" "taking the checkout back" "T3 uncommitted work is not reported as taken back (it is still on disk)"
 
 echo "── T4: a spawn reported FAILED while the lane is ALIVE keeps its worktree (#2499/#2787)"
 mk_box t4
@@ -236,12 +242,43 @@ echo "── T6: the shipped dispatcher is the one under test (a moved script wo
 #   · `reap_unused_worktree`  — at least 3: its definition plus BOTH call sites (lane-not-spawned and
 #                               no-chain). Dropping either call site falls below 3 and reddens.
 _dm_code="$(grep -vE '^[[:space:]]*#' "$DM_REL")"
-_reaps="$(printf '%s\n' "$_dm_code" | grep -c 'wt_reap_if_empty')"
-_calls="$(printf '%s\n' "$_dm_code" | grep -c 'reap_unused_worktree')"
+# ⛔ THE CALL SHAPES ARE COUNTED, NOT THE WORDS. A whole-line count of `wt_reap_if_empty` also counts
+# the `command -v wt_reap_if_empty` existence probe and the failure message that names the missing
+# verb (T7) — both are non-comment lines, so the exact-1 pin reddened on the very guard it exists to
+# protect. Anchoring to a call shape counts teardowns: one at the start of a line, one definition.
+_reaps="$(printf '%s\n' "$_dm_code" | grep -cE '^[[:space:]]*wt_reap_if_empty[[:space:]]')"
+_calls="$(printf '%s\n' "$_dm_code" | grep -cE '(^|[[:space:]])reap_unused_worktree(\(|[[:space:]])')"
 if [ "${_reaps:-0}" -eq 1 ] && [ "${_calls:-0}" -ge 3 ]; then
     ok "T6 both take-backs still route through the reviewed wt_reap_if_empty (1 teardown, ${_calls} call/definition lines)"
 else
     bad "T6 dispatch-merge.sh no longer routes both take-backs through wt_reap_if_empty (non-comment wt_reap_if_empty=$_reaps want 1, reap_unused_worktree=$_calls want >=3) — this suite would be testing a second teardown"
+fi
+
+echo ""
+echo "── T7: a take-back that CANNOT RUN must not bill a stale verdict (the module may predate the verb)"
+# ⛔ MEASURED, NOT ASSUMED (#3577 review). `$WTL` is sourced beside this script with no verb guard —
+# `$WTL` only has to source cleanly — so a module without `wt_reap_if_empty` reaches the call as
+# `command not found` (rc 127) and falls into the `*)` arm. Without the two lines pinned below, that
+# arm printed `WT_RESULT` exactly as `wt_provision` had left it:
+#   "⚠️ worktree NOT reaped — created .worktrees/tm-2047 on feat/2047-tm from origin/main (…)"
+# i.e. the one arm that exists to surface a failed take-back named a wrong cause, and the #8090
+# residue it was reporting survived. A behaviour-only arm cannot reach this without shipping a
+# broken module into the fixture, so it is pinned on the helper's executable text — and T6 shows
+# what a pin over non-comment code is worth here.
+T7_CODE="$(sed -n '/^reap_unused_worktree() {/,/^}$/p' "$DM_REL" | grep -v '^[[:space:]]*#')"
+printf '%s\n' "$T7_CODE" | grep -qF 'WT_RESULT=""' \
+    && ok "T7 the helper clears WT_RESULT before the call (a stale provision verdict cannot become the reap verdict)" \
+    || bad "T7 the helper leaves WT_RESULT as wt_provision set it — a missing verb would report 'created …' as why the reap failed"
+if printf '%s\n' "$T7_CODE" | grep -qF 'command -v wt_reap_if_empty'; then
+    ok "T7 …and it proves the verb exists, naming the missing verb instead of a wrong cause"
+else
+    bad "T7 the helper calls wt_reap_if_empty unguarded — an older module turns the failure arm into a wrong-cause report"
+fi
+
+if ! printf '%s\n' "$T7_CODE" | grep -qF 'taking the checkout back'; then
+    ok "T7 …and it announces no verdict before the call (the verdict lines are the only claim)"
+else
+    bad "T7 the helper still announces 'taking the checkout back' before it knows the verdict"
 fi
 
 echo ""

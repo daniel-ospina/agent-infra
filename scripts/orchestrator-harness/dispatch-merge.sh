@@ -134,7 +134,24 @@ reap_unused_worktree() { # <issue> <why> — reports; never changes the caller's
   # wrong target usually is. Both current call sites are inside the same iteration, so this is not a
   # live bug; it is a helper whose two inputs could disagree, which is one input too many.
   local WT="tm-$1" BR="feat/$1-tm"
-  echo "#$1: $2 — taking the checkout back"
+  # ⛔ NO VERDICT IS ANNOUNCED BEFORE IT IS REACHED (#3577 review). This line used to read
+  # "— taking the checkout back" and printed UNCONDITIONALLY, so on exactly the arms where a safety
+  # gate fires (commits ahead, a dirty tree, a live holder) the log claimed a deletion that did not
+  # happen and then contradicted itself on the next line — and the dispatch log is the only record of
+  # what the box did to a lane's checkout, read by the next lane and by the human triaging a stuck
+  # issue. The reason is stated; the verdict line that follows says what actually happened.
+  echo "#$1: $2"
+  # ⛔ AND THE VERDICT IS CLEARED AND THE VERB PROVEN PRESENT FIRST. `wt_provision` leaves its own
+  # verdict in `WT_RESULT`, and `$WTL` is sourced beside this script with NO verb guard (the file only
+  # has to source cleanly), so a script directory whose module predates `wt_reap_if_empty` ran
+  # `command not found` (rc 127) straight into the `*)` arm — which then reported the PROVISION's
+  # sentence, `created … on feat/N-tm from origin/main`, as the reason the reap FAILED. The one arm
+  # that exists to surface a failed take-back named a wrong cause while the residue survived.
+  WT_RESULT=""
+  if ! command -v wt_reap_if_empty >/dev/null 2>&1; then
+    echo "#$1: ⚠️ worktree NOT reaped — the sourced ${WTL:-wt-lifecycle.sh} has no wt_reap_if_empty (it predates the take-back); fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O"
+    return 0
+  fi
   wt_reap_if_empty "${REPO_ABS:-$REPO}" ".worktrees/$WT" "$BR" "dispatch #$1"
   case $? in
     0) echo "#$1: $WT_RESULT" ;;
