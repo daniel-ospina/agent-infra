@@ -944,17 +944,30 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # that case the lexical path is refused if it carries `..` and is otherwise prefix-tested as written — the
   # ">path outside the home" verdict must be reached from the prefix rule, not from a parent-existence rule
   # that would shadow it and report the wrong reason (measured: it did, on the suite's own doctor).
+  # ⛔ AND BOTH SIDES OF THE COMPARISON MUST BE RESOLVED — OR LEXICAL — *TOGETHER* (round-14 review, P2).
+  # The two sides were mixed: `home_real` was always `cd "$CELL_HOME" && pwd -P` (RESOLVED) while
+  # `exec_real` fell back to the RAW `$CELL_HOME/…` string whenever the payload's parent did not resolve —
+  # which is EVERY FIRST INSTALL, because `place_pass` runs after `verify_unit` and the parent does not exist
+  # yet. So on any box whose `$CELL_HOME` is reached through a symlink (macOS `CELL_HOME=/tmp/cell-home` →
+  # `/private/tmp/cell-home`, the supervisor's own documented default) the two strings could never match and
+  # the FIRST install was refused with a cause naming the containment rule, on a payload that was inside the
+  # home. The second attempt passed only because the first had created the parent in between. MEASURED on
+  # this box: `CELL_HOME=$T/symhome -> $T/realhome`, `--install` → rc=1, "ExecStart resolves to
+  # '…/symhome/.pi/agent/scripts/cell-self-pin.sh', which is NOT under CELL_HOME ('…/realhome')".
+  # Resolved-vs-resolved when the payload's parent resolves; lexical-vs-lexical when it does not. The
+  # lexical arm keeps the `..` refusal, so no traversal becomes reachable by taking it.
   exec_dir="$(cd "$(dirname "$exec_path")" 2>/dev/null && pwd -P)" || exec_dir=""
   if [ -n "$exec_dir" ]; then
     exec_real="${exec_dir%/}/$(basename "$exec_path")"
+    home_real="$(cd "$CELL_HOME" 2>/dev/null && pwd -P)" || home_real="$CELL_HOME"
   else
     case "$exec_path" in
       */../*|*/..|../*|..)
         bad "the rendered unit's ExecStart payload '${exec_path}' traverses '..' through a directory that does not resolve — the containment rule this file holds cannot be evaluated on it, so it is refused rather than guessed"; return 1 ;;
     esac
     exec_real="$exec_path"
+    home_real="$CELL_HOME"
   fi
-  home_real="$(cd "$CELL_HOME" 2>/dev/null && pwd -P)" || home_real="$CELL_HOME"
   case "$exec_real" in
     "${home_real%/}"/*) ;;
     *) bad "ExecStart resolves to '${exec_real}', which is NOT under CELL_HOME ('${home_real}') — a path outside the one home can be pruned out from under the unit, which is the failure this change exists to remove (203/EXEC every tick)"; return 1 ;;
@@ -1604,7 +1617,10 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
     # unit. (The control with the drop-in removed reads `enabled` and has the symlink.) Refused by SECTION
     # rather than by key, because the whole section is meaningless here: the rendered unit already declares
     # the enablement, and a drop-in can only reset or duplicate it.
-    if printf '%s\n' "$(unit_section "$body" Install)" | grep -qv '^[[:space:]]*$'; then
+    # ⛔ AND IT IS A HERE-STRING, NOT A PIPE: `printf … | grep -q` is the SIGPIPE false-negative idiom
+    # (#841/#864) that `scripts/check-no-sigpipe-grep.sh` refuses, and this file's other 13 occurrences were
+    # already converted — these two were missed by the later round that added the [Install] rule.
+    if grep -qv '^[[:space:]]*$' <<<"$(unit_section "$body" Install)"; then
       bad "the installed drop-in ${f} carries an [Install] section — systemd applies that at ENABLE time, where an empty WantedBy=/RequiredBy= is a LIST RESET that makes 'systemctl enable' exit 0 and create NO symlink (measured: \"The unit files have no installation config\", rc=0), so 'installed' would print over a pin that is never enabled; the rendered unit already declares its enablement — remove ${f}"; return 1
     fi
     refuse_env_mutators "the installed drop-in ${f}" "$body" || return 1
@@ -1947,7 +1963,7 @@ one_actor_check() {
 }
 
 do_install() { # [--takeover]
-  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown="" still="" scopes_now=""
+  local takeover="${1:-}" unit_dir="${SYSTEMD_UNIT_DIR:-/etc/systemd/system}" tmp rc=0 u script scopes="" retired="" who="" s unknown="" still="" scopes_now="" retiring=""
   case "$takeover" in
     ""|--takeover) ;;
     *) bad "unknown argument '${takeover}' to --install (only --takeover is accepted)"; return 64 ;;
@@ -2047,7 +2063,15 @@ do_install() { # [--takeover]
     fi
   fi
   if [ -n "$scopes" ] && [ "$takeover" = --takeover ]; then
-    note "installing into $unit_dir (retiring the duplicate actuator in the ${who} manager(s) LAST, after the units are placed)"
+    # ⛔ AND IT NAMES THE SCOPES THAT WILL ACTUALLY BE RETIRED (round-14 review, P2). `$who` is reassigned
+    # above to the scopes that did NOT ANSWER, so reusing it here printed "retiring the duplicate actuator in
+    # the user manager(s)" on the documented no-sudo migration (unreadable `--user` + the hatch) and then
+    # retired the SYSTEM one — the operator's only read of the migration naming the wrong manager. The
+    # retirement list comes from `$scopes` (what the run could READ as enabled); `$who` stays the
+    # unreadable-scope prose.
+    retiring=""
+    for s in $scopes; do retiring="$retiring ${s}"; done
+    note "installing into $unit_dir (retiring the duplicate actuator in the ${retiring# } manager(s) LAST, after the units are placed)"
   elif [ -n "${CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR:-}" ] && [ -n "$scopes" ]; then
     note "  WARNING: eldato-harness-apply.timer is ENABLED (${who# }) and CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR is set — two actuators on one pin, deliberately"
   else

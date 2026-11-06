@@ -862,7 +862,7 @@ roots_out="$(runat "$T/home" CELL_SELF_PIN_DROPIN_ROOTS= bash "$PIN" --print-dro
 # by systemd and read by nothing: #3194's false PASS one directory over, in the load path `systemd.unit(5)`
 # Table 1 ranks ABOVE /etc/systemd/system. The four-name leg above could not see a root that is MISSING.
 for _r in /etc/systemd/system.control /run/systemd/system.control /etc/systemd/system.attached /run/systemd/system.attached; do
-  if printf '%s\n' "$roots_out" | grep -qxF "$_r"; then ok "…and the drop-in gate SCANS ${_r} — a .control/.attached root systemd MERGES over the unit (measured)"
+  if grep -qxF "$_r" <<<"$roots_out"; then ok "…and the drop-in gate SCANS ${_r} — a .control/.attached root systemd MERGES over the unit (measured)"
   else bad "the drop-in gate does not scan ${_r}: a drop-in there is merged over the rendered unit by systemd and read by NOTHING — #3194's false PASS in the dbus-managed load path — [$roots_out]"; fi
 done
 # ⛔ AND THE MATCH MUST BE THE WHOLE LINE. These four were SUBSTRING tests (`case "$roots_out" in *"$_r"*)`),
@@ -872,7 +872,7 @@ done
 # and the documented case) the root list is the ONLY source for those two, so their removal shipped green
 # and re-opened #3194's drop-in false PASS silently. `grep -qxF` is the test that a leg can lose.
 for _r in /etc/systemd/system /run/systemd/system /usr/local/lib/systemd/system /usr/lib/systemd/system; do
-  if printf '%s\n' "$roots_out" | grep -qxF "$_r"; then ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit"
+  if grep -qxF "$_r" <<<"$roots_out"; then ok "…and the drop-in gate SCANS ${_r} — a systemd SYSTEM unit directory it merges for this unit"
   else bad "the drop-in gate does not scan ${_r}: a legacy drop-in there is merged over the rendered unit and read by NOTHING, which is #3194's false PASS one directory over — [$roots_out]"; fi
 done
 # ⛔ AND EVERY OTHER LEG IS HERMETIC (round-12 review, P2). Unsetting the seam did NOT make the scan
@@ -1428,6 +1428,17 @@ case "$out" in
   *'TWO actuators on this pin, as'*) bad "…but it asserted TWO actuators when it never read that scope: $out" ;;
   *) bad "…but the read-back does not name the unread scope: $out" ;;
 esac
+# ⛔ AND THE MIGRATION NOTE NAMES THE SCOPE THAT WILL ACTUALLY BE RETIRED, NOT THE ONE THAT DID NOT ANSWER
+# (round-14 review, P2). `$who` is reassigned to the UNREADABLE scopes inside the `--takeover` arm, and the
+# note below it reused `$who` — so on this exact shape (the documented no-sudo migration: readable system
+# scope carries the shipped timer, `--user` is structurally unreachable, hatch set) it printed
+# "retiring the duplicate actuator in the user manager(s) LAST" and then retired the SYSTEM one. The
+# operator's only read of the migration named the wrong manager. MEASURED pre-fix on this fixture:
+# `… (retiring the duplicate actuator in the user manager(s) LAST, after the units are placed)`.
+case "$out" in
+  *'retiring the duplicate actuator in the system manager(s)'*) ok "…and the migration note names the scope it will ACTUALLY retire (system), not the scope that did not answer" ;;
+  *) bad "…but the migration note does not name the scope being retired (system) — it must not reuse the unreadable-scope name: $out" ;;
+esac
 : >"$T/state-blind/user-$SHIPPED"
 # ── (c) BOTH managers carry it: `--takeover` must retire BOTH, not the first one it finds ────────
 # ⛔ MEASURED FALSE PASS, NOT A HYPOTHETICAL: `actuator_scope` returned ONLY the first enabled scope, so
@@ -1674,7 +1685,14 @@ out="$(runat "$T/home-nolayer" PATH="$T/fake-nolayer:$PATH" bash "$PIN" 2>&1)"; 
 # rollback alone would satisfy it (the tick could disable and then re-enable on every read-only failure,
 # stopping and re-arming the shipped timer every ten minutes). `mk_scoped_systemctl` records every verb it
 # is asked for, so "the retirement was never TAKEN" is a fact about the fake's own log.
-if grep -q "^disable $SHIPPED\$\|^disable --now $SHIPPED\$" "$T/state-nolayer/calls.log" 2>/dev/null; then
+# ⛔ AND THE PATTERN IS ERE, NOT BRE WITH `\|` (round-14 review, P2). `grep -q "^disable X$\|^disable --now X$"`
+# relies on GNU reading `$` as an anchor before `\|`; BSD/macOS grep has no `\|` alternation and reads the
+# whole thing as a literal, so it matches NOTHING. The two halves then had opposite consequences: the
+# POSITIVE leg below (leg 2) red'd on macOS ("the failing tick never issued a disable", while the calls log
+# contained `disable eldato-harness-apply.timer`), and this NEGATIVE leg passed VACUOUSLY — an assertion that
+# cannot red is not a gate. Linux-only CI stayed green, so neither surfaced. `mk_scoped_systemctl` logs
+# `"$verb $unit"` with `--now` already shifted away, so the optional group covers both spellings.
+if grep -qE "^disable( --now)? $SHIPPED$" "$T/state-nolayer/calls.log" 2>/dev/null; then
   bad "a tick that could not even resolve a LAYER still issued 'disable' on eldato-harness-apply.timer (calls log: $(tr '\n' ';' <"$T/state-nolayer/calls.log")) — a read-only failure must not touch the box's pin actuator at all, let alone stop and re-arm it"
 else
   ok "…and it never even ISSUED a disable (the calls log has no retirement for it), so a read-only failure cannot stop and re-arm the box's actuator"
@@ -1709,7 +1727,7 @@ out="$(runat "$FAILPIN" PATH="$T/fake-applyfail:$PATH" bash "$PIN" 2>&1)"; rc=$?
   || bad "a tick that retired eldato-harness-apply.timer and then failed at apply left it DISABLED and this unit RED — zero pin actuators, i.e. #3194's own state"
 # …and it is a ROLLBACK that undoes a retirement that really happened, not a leg passing because the tick
 # never retired in the first place: both verbs are in the fake's own call log.
-if grep -q "^disable $SHIPPED\$\|^disable --now $SHIPPED\$" "$T/state-applyfail/calls.log" 2>/dev/null; then
+if grep -qE "^disable( --now)? $SHIPPED$" "$T/state-applyfail/calls.log" 2>/dev/null; then
   ok "…after ACTUALLY retiring it first (the calls log has the disable), so the rollback is exercised, not assumed"
 else
   bad "the failing tick never issued a disable, so the rollback leg above proved nothing (calls log: $(tr '\n' ';' <"$T/state-applyfail/calls.log"))"
@@ -1760,6 +1778,30 @@ if [ -f "$T/units2/cell-self-pin.service" ]; then
     *) bad "with HOME != CELL_HOME the pass read the wrong record: $out" ;;
   esac
 else bad "the shipped template did not install: $(cat "$T/install.log")"; fi
+
+# ── 5b. A SYMLINKED CELL_HOME IS THE SAME HOME, NOT A CONTAINMENT BREACH ───────────────────────────
+# ⛔ THE CONTAINMENT RULE'S TWO SIDES MUST BE RESOLVED-OR-LEXICAL *TOGETHER* (round-14 review, P2).
+# `home_real` was always `cd "$CELL_HOME" && pwd -P` (RESOLVED) while `exec_real` stayed the RAW
+# `$CELL_HOME/…` string whenever the payload's parent did not resolve — which is EVERY FIRST INSTALL,
+# because `place_pass` runs AFTER `verify_unit`, so `$CELL_HOME/.pi/agent/scripts` does not exist yet.
+# On any box whose `$CELL_HOME` is reached through a symlink — macOS `CELL_HOME=/tmp/cell-home` →
+# `/private/tmp/cell-home`, the supervisor's own documented default — the two strings could never match
+# and the FIRST install was refused with a cause naming the containment rule, on a payload that was
+# inside the home. The second attempt passed only because the first had created the parent in between,
+# i.e. the operator's remedy was "run it twice". MEASURED here: rc=1, "ExecStart resolves to
+# '…/symhome/.pi/agent/scripts/cell-self-pin.sh', which is NOT under CELL_HOME ('…/realhome')".
+# The leg is DISCRIMINATING rather than cosmetic: `symhome` → `realhome` makes the resolved and the
+# lexical spellings differ, which on a host whose `/tmp` is not itself a symlink is the only way to
+# exercise the asymmetry at all.
+mkdir -p "$T/realhome"
+ln -s "$T/realhome" "$T/symhome"
+[ ! -d "$T/realhome/.pi/agent/scripts" ] \
+  || bad "the symlink leg's home already carries .pi/agent/scripts, so it cannot exercise the FIRST install (the shape the fix is about)"
+runat "$T/symhome" TEMPLATES_DIR="$TPL" CELL_SELF_PIN_ALLOW_DUPLICATE_ACTUATOR=1 SYSTEMD_UNIT_DIR="$T/units-sym" \
+  PATH="$T/fakebin:$PATH" bash "$PIN" --install >"$T/install-sym.log" 2>&1; sym_rc=$?
+[ "$sym_rc" -eq 0 ] \
+  && ok "the FIRST --install on a SYMLINKED CELL_HOME is accepted — the home and the payload are compared in the SAME spelling, so a not-yet-created payload parent cannot refuse a payload that is inside the home" \
+  || bad "the first --install on a symlinked CELL_HOME was refused (rc=$sym_rc), so an operator on a box whose CELL_HOME is reached through a symlink has to run it twice: $(cat "$T/install-sym.log")"
 
 # ── 6. `--status` reads the REF, not a stale local copy of it, and uses the repo's exit codes ───────
 # ⛔ THE MEASURED BLINDNESS. #3194 was a pin RECORD that disagreed with the layer the cell executed for
