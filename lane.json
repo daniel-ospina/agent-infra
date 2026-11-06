@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1793975427,
+  "host": "cmux",
+  "issue": 0,
+  "kind": "reviewer",
+  "lane_id": "cmux.kreviewer-0-1793975427-p2912147-0755ea27",
+  "lease_until": 1793976032,
+  "pid": 2912147,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1793975427,
+  "state": "RUNNING",
+  "tag": "0",
+  "worktree": "/tmp/base3481"
+}
