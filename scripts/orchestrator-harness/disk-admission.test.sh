@@ -319,6 +319,25 @@ case "$SOUT" in *'rc=1'*) rc=0 ;; *) rc=1 ;; esac
 ck "wt_disk_admit REFUSES when the predicate is not loadable ($(printf '%s' "$SOUT" | head -1))" $rc
 case "$SOUT" in *'REFUSED-UNKNOWN'*) rc=0 ;; *) rc=1 ;; esac
 ck "…and names it REFUSED-UNKNOWN, so a skew is diagnosed instead of looking like a full disk" $rc
+# ⛔ THE BOX ID ON THIS ARM IS SANITISED TOO (review cycle 10, P2 — MEASURED). This is the ONE refusal
+# that cannot call `disk_box_id` — `spawn-gate.sh` is precisely the file that is missing — so it used a
+# bare `hostname -s` and emitted a nodename containing a space or a comma VERBATIM, splitting `box=`
+# into two tokens in a line whose contract says that cannot happen, and leaking it into `WT_RESULT`,
+# which all three callers quote into their own logs. Driven with a hostile `hostname` shim, because a
+# source census would not notice a sanitisation that stopped running.
+mkdir -p "$T/bin-badhost" "$T/skew2"
+printf '#!/bin/sh\nprintf "cell 3,x"\n' > "$T/bin-badhost/hostname"
+chmod +x "$T/bin-badhost/hostname"
+cp "$WTL" "$T/skew2/wt-lifecycle.sh"
+SOUT2="$( cd "$REPO" && env PATH="$T/bin-badhost:$PATH" bash -c '
+        . "$1" || exit 99
+        wt_disk_admit "$2" "$2/.worktrees/skew-tm2"
+        printf "%s\n" "$WT_RESULT"
+      ' _ "$T/skew2/wt-lifecycle.sh" "$REPO" 2>&1 )"
+case "$SOUT2" in *'box=UNIDENTIFIED'*) rc=0 ;; *) rc=1 ;; esac
+ck "…and a hostile hostname is REPLACED with UNIDENTIFIED, not printed raw ('box=cell 3,x' would split the two-token contract)" $rc
+case "$SOUT2" in *'box=cell'*|*'box=cell '*) rc=1 ;; *) rc=0 ;; esac
+ck "…and the raw nodename never reaches the line" $rc
 
 echo
 # ── H) THE CALLERS KEEP THE MAPPING (review round 1, P3: rc 4 was pinned at the seam only) ─────
@@ -420,9 +439,16 @@ esac
 # start, or after any non-alphanumeric character (`$(`, `;`, `&&`, whitespace), with `[^#]*` unable to
 # cross a `#` so a commented-out call (wt-lifecycle.sh:365's own doc line) is not counted as a caller,
 # and `[^[:alnum:]_.-]` keeping longer words (`my_wt_provision`, `wt_provision_helper`) out.
-census_pop() { # <dir> -> space-separated basenames of the files holding a wt_provision CALL
+census_pop() { # <dir> -> space-separated paths RELATIVE TO <dir> of the files holding a wt_provision CALL
+  # ⛔ RELATIVE PATHS, NOT BASENAMES (review cycle 10, P1 — MEASURED). `basename` discarded the
+  # subdirectory, so the only way a consumer could open the file was to re-guess the directory — and
+  # the remedy census below guessed wrong (`$HERE` instead of the `scripts/` root it had just walked),
+  # silently `continue`d past every caller that was not directly in `$_pd`, and printed "every caller
+  # selects" over a population it had only partly looked at. Emitting the path this walk already had
+  # removes the guess entirely: one derivation, and a consumer joins it to the SAME root it passed in.
+  # For a probe root (`$_pd`) the relative path IS the basename, so those assertions are unchanged.
   grep -rlE '^([^#]*[^[:alnum:]_.-])?wt_provision[[:space:]]' --include='*.sh' "$1" \
-    | grep -v '\.test\.sh$' | while IFS= read -r _cf; do basename "$_cf"; done | sort | tr '\n' ' '
+    | grep -v '\.test\.sh$' | while IFS= read -r _cf; do printf '%s\n' "${_cf#"$1"/}"; done | sort | tr '\n' ' '
 }
 # ⛔ ROOTED AT `scripts/`, NOT AT `$HERE` (review round 7, P2 — MEASURED). The arm's stated purpose is
 # that "a 4th ungated caller reds the suite", but a census rooted at the harness directory cannot see
@@ -434,7 +460,7 @@ census_pop() { # <dir> -> space-separated basenames of the files holding a wt_pr
 # population is unchanged by the wider root, because the three callers are the only files under
 # `scripts/` that invoke `wt_provision` at all.
 _census_pop="$(census_pop "$(cd "$HERE/.." && pwd)")"
-_census_want='adopt-fix.sh dispatch-merge.sh fix-one.sh '
+_census_want='orchestrator-harness/adopt-fix.sh orchestrator-harness/dispatch-merge.sh orchestrator-harness/fix-one.sh '
 if [ "$_census_pop" = "$_census_want" ]; then
   ok "H) the wt_provision caller population is EXACTLY the censused set (${_census_want% })"
 else
@@ -483,6 +509,34 @@ case "$_c77" in
     ok "H) adopt-fix.sh's exit-77 remedy names the PRE-START refusal and its own token, not only the live arm" ;;
   *) bad "H) adopt-fix.sh's exit-77 remedy does not name the #3395 pre-start refusal (REFUSED-DISK / REFUSED-UNKNOWN) — the operator is sent to a '[disk-gate] REFUSED' line that does not exist on that path" ;;
 esac
+# ⛔ AND THE REMEDY ON THAT LINE MUST FOLLOW THE CAUSE (review cycle 10, P2 — MEASURED). The assertion
+# above only proves BOTH tokens appear — it cannot tell a cause-SELECTED remedy from one sentence
+# prescribing "Reclaim space … waiting will NOT clear it" for all three causes, which is what shipped.
+# For the REFUSED-UNKNOWN cause that remedy cannot arrive (broken probe, or spawn-gate.sh missing), so
+# the line the file's own comment calls "the log a manual operator reads (#1720)" sent the operator to
+# prune a filesystem that was not full — the #2721 class the rc-4 arms were fixed for. This arm now
+# pins the distinction, and its non-vacuity proof applies the SAME match to a mutated copy.
+_c77r="$(grep -F 'remedy follows the cause' "$HERE/adopt-fix.sh" | grep -E '^[[:space:]]*echo ')"
+if [ -z "$_c77r" ]; then
+  bad "H) adopt-fix.sh's exit-77 summary has no cause-selected REMEDY line — one remedy is prescribed for three causes"
+else
+  _c77r_ok() { case "$1" in *REFUSED-UNKNOWN*'NOT a full disk'*) return 0 ;; esac; return 1; }
+  if _c77r_ok "$_c77r"; then
+    ok "H) adopt-fix.sh's exit-77 remedy follows the CAUSE — the UNKNOWN cause is named as explicitly NOT a full disk"
+  else
+    bad "H) adopt-fix.sh's exit-77 remedy does not distinguish the UNKNOWN cause — a broken probe or a missing spawn-gate.sh is answered with a space remedy that cannot arrive (#2721)"
+  fi
+  case "$_c77r" in
+    *'Reclaim space (cloud-cell-supervisor.sh prune --caches, and --scratch for /tmp); waiting will NOT clear it'*)
+      bad "H) adopt-fix.sh still prescribes the UNCONDITIONAL reclaim-space sentence for all three causes" ;;
+    *) ok "H) …and the unconditional reclaim-space sentence is gone" ;;
+  esac
+  if _c77r_ok "$(printf '%s' "$_c77r" | sed 's/NOT a full disk/a full disk/')"; then
+    bad "H) the cause-selected remedy arm is VACUOUS: it still passes with the distinction removed"
+  else
+    ok "H) …and that arm is non-vacuous: removing the distinction makes it fail"
+  fi
+fi
 
 # ⛔ THE VERDICT→REMEDY SELECTOR IS DRIVEN, NOT CENSUSED (review round 7, P2 — MEASURED). The `_c77`
 # arm above pins the exit-77 echo; the `case "$WT_RESULT" in …` selector that CHOOSES the remedy was
@@ -516,9 +570,20 @@ esac
 
 # ⛔ ONE MATCHER AND ONE POPULATION PREDICATE, USED BY THE CENSUS **AND** BY ITS NON-VACUITY PROOF.
 # A second copy of either would let the check regress while its proof still passed — the `arm_of` idiom.
-arm_selects_remedy() { # <script> -> rc 0 when its rc-4 arm selects a remedy from the verdict
-  case "$(arm_of "$1")" in
-    *REFUSED-UNKNOWN*) return 0 ;;
+arm_selects_remedy() { # <script> -> rc 0 when its rc-4 arm really BRANCHES on the verdict
+  # ⛔ A SUBSTRING TEST IS NOT A SELECTION (review cycle 10, P2 — MEASURED). This predicate used to be
+  # `case "$(arm_of "$1")" in *REFUSED-UNKNOWN*)`, and the census therefore printed "selects its
+  # rc-4 remedy from $WT_RESULT" for a caller whose arm was ONE hardcoded sentence —
+  # `echo "zz4: REFUSED-UNKNOWN or full disk — reclaim space and retry"` — which is exactly the #2721
+  # misattribution the census exists to catch. A selector has a PATTERN (the glob, asterisks included)
+  # and a NON-UNKNOWN fallback arm (the other `case` arm or the `else`); prose only mentions the token.
+  local _arm
+  _arm="$(arm_of "$1")"
+  case "$_arm" in
+    *'*REFUSED-UNKNOWN*'*)
+      case "$_arm" in
+        *else*|*'*)'*) return 0 ;;
+      esac ;;
   esac
   return 1
 }
@@ -539,9 +604,23 @@ remedy_names_reclaim() { # <remedy text> -> rc 0 when it tells the operator to r
 # HERE instead of drifting in with one hardcoded remedy — the round-8 defect.
 _remedy_uncovered=""
 _remedy_covered=0
-for _rf in $(census_pop "$(cd "$HERE/.." && pwd)"); do
-  [ -f "$HERE/$_rf" ] || continue
-  if arm_selects_remedy "$HERE/$_rf"; then
+_remedy_root="$(cd "$HERE/.." && pwd)"
+# ⛔ RESOLVE AGAINST THE SAME ROOT `census_pop` WALKED (review cycle 10, P1 — MEASURED). `census_pop`
+# is rooted at `scripts/` (the round-7 widening, so a caller one directory up is SEEN) but returns
+# BASENAMES, and this loop resolved them against `$HERE` — `scripts/orchestrator-harness/`. A caller
+# at `scripts/zz-outside-caller.sh` therefore failed `[ -f "$HERE/$_rf" ]` and was `continue`d away
+# SILENTLY, while the arm printed "every wt_provision caller (3 of them) selects …". A silent skip that
+# reads as coverage is the same fail-open shape this suite exists against, one level up: the round-8
+# defect drifts straight back in behind a green line. The root is held once and used for BOTH the walk
+# and the resolve, and the count is asserted against the population so a skip can never read as clean.
+_remedy_popn=0
+for _rf in $(census_pop "$_remedy_root"); do
+  _remedy_popn=$((_remedy_popn + 1))
+  if [ ! -f "$_remedy_root/$_rf" ]; then
+    _remedy_uncovered="$_remedy_uncovered $_rf(unresolvable)"
+    continue
+  fi
+  if arm_selects_remedy "$_remedy_root/$_rf"; then
     _remedy_covered=$((_remedy_covered + 1))
   else
     _remedy_uncovered="$_remedy_uncovered $_rf"
@@ -549,17 +628,28 @@ for _rf in $(census_pop "$(cd "$HERE/.." && pwd)"); do
 done
 if [ -n "$_remedy_uncovered" ]; then
   bad "H) these wt_provision caller(s) do NOT select a remedy from \$WT_RESULT:${_remedy_uncovered} — a REFUSED-UNKNOWN (probe failure / version skew) is reported as a full disk, the #2721 wrong-cause class"
+elif [ "$_remedy_covered" -ne "$_remedy_popn" ]; then
+  bad "H) the remedy census resolved $_remedy_covered of $_remedy_popn caller(s) — a cohort was SKIPPED, and a skip must never read as coverage"
 else
-  ok "H) every wt_provision caller ($_remedy_covered of them) selects its rc-4 remedy from \$WT_RESULT"
+  ok "H) every wt_provision caller ($_remedy_covered of $_remedy_popn) selects its rc-4 remedy from \$WT_RESULT"
 fi
-# NON-VACUITY for that census: a caller with an rc-4 arm that does NOT mention REFUSED-UNKNOWN must be
-# flagged. Driven through the SAME predicate, on a scratch file — the real tree untouched.
+# NON-VACUITY for that census: BOTH shapes it must catch are driven through the SAME predicate, on
+# scratch files — the real tree untouched. (i) an arm that never mentions the token; (ii) the subtler
+# one, an arm that MENTIONS it inside a single hardcoded sentence with no branch — the shape the
+# substring predicate above could not see.
 _rf_probe="$T/noremedy-caller.sh"
 printf '%s\n' 'case "$_wt_rc" in' '  4) echo "reclaim space and retry"; break ;;' 'esac' > "$_rf_probe"
 if arm_selects_remedy "$_rf_probe"; then
   bad "H) the derived census is VACUOUS: a caller whose rc-4 arm hardcodes one remedy was counted as covered"
 else
   ok "H) the derived census is non-vacuous: a hardcoded single-remedy caller IS flagged"
+fi
+_rf_probe2="$T/noremedy-caller2.sh"
+printf '%s\n' 'case "$_wt_rc" in' '  4) echo "zz4: REFUSED-UNKNOWN or a full disk — reclaim space and retry"; break ;;' 'esac' > "$_rf_probe2"
+if arm_selects_remedy "$_rf_probe2"; then
+  bad "H) the census counts MENTIONING as selecting: a single hardcoded sentence that names REFUSED-UNKNOWN but never branches on it passed"
+else
+  ok "H) …and merely MENTIONING the token in one hardcoded sentence is NOT counted as selection"
 fi
 _af_sel="$(awk '/^[[:space:]]*case "\$WT_RESULT" in/{f=1} f{print} f&&/^[[:space:]]*esac[[:space:]]*$/{exit}' "$HERE/adopt-fix.sh")"
 if [ -z "$_af_sel" ]; then
@@ -786,6 +876,17 @@ case "$H3ULOG" in
   *REFUSED-DISK*) bad "H3) an UNREADABLE probe was reported as a DISK refusal — a version skew or a broken df cannot be cleared by reclaiming space (#2721 class)" ;;
   *) ok "H3) …and an UNREADABLE probe is NOT reported as a DISK refusal (the remedy names the probe/skew)" ;;
 esac
+# ⛔ AND THE THIRD SHIPPED UNKNOWN REMEDY IS PINNED THE SAME WAY AS THE OTHER TWO (review cycle 10,
+# P1 — MEASURED). The round-9 `remedy_names_reclaim` widening was wired to `adopt-fix.sh` and
+# `dispatch-merge.sh` only; the assert above looks for the token `REFUSED-DISK`, which a reclaim
+# remedy does not contain, so restoring the exact spelling round 9 was ABOUT ("Reclaiming space will
+# NOT clear it") into `fix-one.sh` left the suite at 81 passed / 0 failed. Two of three remedies pinned
+# and the third free to regress is how the round-8 miss happened; all three are pinned now.
+if remedy_names_reclaim "$H3ULOG"; then
+  bad "H3) fix-one.sh's REFUSED-UNKNOWN remedy names RECLAIMING at all — a broken probe or a missing spawn-gate.sh is not a space problem, and the operator cannot clear it that way (#2721 class)"
+else
+  ok "H3) …and it does not name reclaiming in any spelling (the third shipped UNKNOWN remedy, now pinned)"
+fi
 # The DISK verdict must reach the operator with a DISK REMEDY, not merely echo its own token: the
 # verdict-echo line ALWAYS contains `REFUSED-DISK(…)`, so a `*REFUSED-DISK*` match here would be
 # satisfied by that line alone — the original vacuity (deleting the remedy line left 55/0). The
