@@ -1942,6 +1942,23 @@ GIT_UNPINNABLE_KEY_RE = re.compile(
 # then fetched from that remote and ran its `remote.<name>.uploadpack` program). Presence is the
 # signal, so presence refuses.
 GIT_PARTIAL_CLONE_RE = re.compile(r"^extensions\.partialclone$", re.IGNORECASE)
+# how `--show-origin` labels a source: `file:…`, `command line:`, `blob:…`, `standard input:`, `-`
+_GIT_CONFIG_ORIGIN_RE = re.compile(r"^(file:|command line:|blob:|standard input:|-)", re.IGNORECASE)
+
+
+def _git_origin_is_checkout(origin: str) -> bool:
+    """Is this origin a config file INSIDE a checkout?
+
+    ⛔ BOTH REAL SHAPES, OR THE EVIDENCE NEVER FIRES WHERE IT MATTERS. A plain checkout prints a
+    RELATIVE origin — `file:.git/config` (measured on git 2.43 from the root, a subdirectory, and via
+    `git -C <abs>`) — while a linked worktree prints an absolute `.git/worktrees/<n>/config`, and a
+    worktree-config repo prints `…/.git/worktrees/<n>/config.worktree`. Matching only `/.git/` missed
+    the commonest shape and would have reported a real checkout `unmeasured` forever.
+    """
+    if not origin.lower().startswith("file:"):
+        return False
+    path = origin[len("file:"):]
+    return "/.git/" in path or path.startswith(".git/")
 # only `remote.<name>.promisor` is a BOOLEAN, and only here does a false-set make sense
 GIT_LAZY_FETCH_KEY_RE = re.compile(r"^remote\..+\.promisor$", re.IGNORECASE)
 # ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
@@ -1994,18 +2011,27 @@ def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, boo
     listing = (got.stdout or "")
     fault = ""
     saw_repo = False
-    # `-z --show-origin` alternates tokens: ORIGIN \0 KEY\nVALUE \0 ORIGIN \0 … — so the origin is
-    # how we tell a checkout's own config from a global/system one without a second exec.
+    # `-z --show-origin` prints ORIGIN \0 KEY\nVALUE \0 ORIGIN \0 … — the origin is how we tell a
+    # checkout's own config from a global/system one without a second exec.
+    # ⛔ THE PAIRING IS BY SHAPE, NOT BY POSITION. A positional `tokens[k], tokens[k+1]` walk desyncs
+    # on ONE foreign NUL-terminated token at the head of the stream (a transport banner — this repo
+    # already documents that shape drifting between cmux builds), after which every record is read as
+    # an ORIGIN, no anchored key regex can match, `saw_repo` never fires, and the scan silently reports
+    # nothing. So a token is an ORIGIN only when it LOOKS like one; everything else is a record.
     tokens = listing.split("\0")
-    for k in range(0, len(tokens) - 1, 2):
-        origin, record = tokens[k], tokens[k + 1]
-        if "/.git/" in origin:
-            saw_repo = True
-        if not record:
+    origin = ""
+    for token in tokens:
+        if not token:
             continue
+        if _GIT_CONFIG_ORIGIN_RE.match(token):
+            origin = token
+            if _git_origin_is_checkout(origin):
+                saw_repo = True
+            continue
+        record = token
         key, _, value = record.partition("\n")
         key = key.strip()
-        if key.lower() == "core.repositoryformatversion":
+        if _git_origin_is_checkout(origin):
             saw_repo = True
         if GIT_PARTIAL_CLONE_RE.match(key):
             fault = fault or ("the target checkout declares a PARTIAL CLONE (%s): an object read can "
@@ -2032,8 +2058,10 @@ def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, boo
     # ⛔ ANY NON-ZERO STATUS IS A REFUSAL. `--local` is not used (it misses worktree/global scope), so
     # `git config --list` now SUCCEEDS outside a checkout and a non-zero status means the read itself
     # failed — a transport timeout (rc 124), a missing git, a corrupt config. A read that did not
-    # succeed is not evidence, and it must not fall through to the exec.
-    if got.timed_out or got.error or got.rc != 0:
+    # succeed is not evidence, and it must not fall through to the exec. `timed_out` needs no separate
+    # clause: `run()` returns `rc=None` on its own kill, which this already catches (claiming
+    # otherwise was a comment about an arm that could not discriminate).
+    if got.error or got.rc != 0:
         detail = got.error or ("rc=%s%s" % (got.rc, (": " + (got.stderr or "").strip()[:120])
                                             if (got.stderr or "").strip() else ""))
         return ("the target checkout's config could not be READ (%s), so it cannot be checked for a "
@@ -2042,12 +2070,10 @@ def _repo_config_fault(cmux: str, target: str, timeout_s: int) -> Tuple[str, boo
         return ("the target checkout's config listing was CUT SHORT by the %s-byte channel cap "
                 "(truncated is a CHANNEL fact over stdout+stderr, not a statement about the "
                 "listing), so it could not be checked for a program-naming key" % got.cap), True
-    if got.rc != 0:
-        return "", False
     # ⛔ AND `rc 0` DOES NOT BY ITSELF PROVE A REPOSITORY WAS READ. Without `--local`, `git config
     # --list` SUCCEEDS OUTSIDE a repository (global+system scope only), so "not a checkout" would
     # report `clean` — the conflation the tri-state exists to end. Evidence is EITHER the format key a
-    # `git init` always writes, OR a config file under `/.git/` in the listing's origins — the second
+    # `git init` always writes, OR a config file under `.git/` in the listing's origins — the second
     # so a real checkout whose key was unset is NOT mislabelled `unmeasured` forever.
     if not saw_repo:
         return "", False

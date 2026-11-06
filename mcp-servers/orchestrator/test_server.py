@@ -1499,7 +1499,11 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     monkeypatch.setenv("FAKE_GIT_CONFIG", str(cfg))
     monkeypatch.setenv("FAKE_ARGV_LOG", str(argv_log))
 
-    REPO_ORIGIN = "file:/box/repo/.git/config"
+    # ⛔ THE REAL SHAPES. A plain checkout prints a RELATIVE origin (`file:.git/config`, measured on git
+    # 2.43 from the root, a subdirectory and via `git -C <abs>`); only a linked worktree prints an
+    # absolute `.git/worktrees/<n>/config`. A fixture that used neither certified nothing.
+    REPO_ORIGIN = "file:.git/config"
+    WORKTREE_ORIGIN = "file:/box/repo/.git/worktrees/lane/config.worktree"
     GLOBAL_ORIGIN = "file:/box/.gitconfig"
 
     def z(*records, origin=REPO_ORIGIN):
@@ -1586,9 +1590,9 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
         mod.run = lambda *a, **kw: mod.Ran(["git"], rc=None, error="OSError: boom")
         fault, measured = mod._repo_config_fault("cmux", "box", 60)
         assert fault and "could not be READ" in fault, fault
-        # ⛔ AND A TIMEOUT OVER A **CLEAN** LISTING STILL REFUSES. Without this the timeout branch was
-        # reached only AFTER the fault scan had already returned, so deleting `got.timed_out` from the
-        # condition left the suite green — the exact "arm that cannot fail" shape.
+        # ⛔ AND A TIMEOUT OVER A **CLEAN** LISTING STILL REFUSES. `run()` reports its own kill as
+        # `rc=None`, so the `rc != 0` clause is what fires here — `timed_out` needs no separate term,
+        # and claiming it did was a comment about a distinction the fixture cannot make.
         mod.run = lambda *a, **kw: mod.Ran(
             ["git"], rc=None, timed_out=True,
             stdout=z(("core.repositoryformatversion", "0")))
@@ -1618,10 +1622,21 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     # repo presence from that ONE optional key mislabelled a real repo `unmeasured` forever — a false
     # "the check did not run" for a config that was read and clean. An origin under `/.git/` is the
     # second, and stronger, piece of evidence.
-    cfg.write_text(z(("user.email", "a@b")))          # REPO_ORIGIN, no version key
+    for origin in (REPO_ORIGIN, WORKTREE_ORIGIN):
+        cfg.write_text(z(("user.email", "a@b"), origin=origin))   # a checkout, no version key
+        is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+        assert payload.get("refused") is None, (origin, payload)
+        assert payload["repo_config"] == "clean", (origin, payload)
+
+    # ⛔ AND FOREIGN BYTES AT THE HEAD OF THE STREAM CANNOT DESYNC THE SCAN. This repo documents that
+    # the transport can prefix payload bytes (a banner line that drifted between cmux builds); a
+    # POSITIONAL origin/record pairing would shift by one on a NUL-terminated banner, read every record
+    # as an origin, match no anchored key and report the poisoned repo CLEAN. The pairing is by token
+    # SHAPE now, so a banner is neither an origin nor a matchable key and the fault is still found.
+    cfg.write_text("warning: cmux 0.1.1 available\0" + z(("filter.evil.clean", "/tmp/x.sh")))
     is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
-    assert payload.get("refused") is None, payload
-    assert payload["repo_config"] == "clean", payload
+    assert payload.get("refused") == "repo-config-names-a-program", payload
+    assert "filter.evil.clean" in payload["reason"], payload
 
     # a NON-git program never pays the pre-check — asserted on the REAL argv log (the cmux stub above is
     # still installed: it logs every `config` invocation), not on its stdout.
