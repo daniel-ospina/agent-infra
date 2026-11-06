@@ -1861,7 +1861,7 @@ WRITE_ESCAPE_TOKENS = ("--output", "--outfile", "-output")
 # Same class as the `["/tmp/evil/git", …]` bypass above (a caller-chosen program running under this
 # surface's authority), reached through a verb that IS read-only — so the verb gate cannot see it, and
 # neither can the metacharacter filter (there is no shell metacharacter in either flag).
-EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv")
+EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv", "--show-signature")
 # ⛔ ABBREVIATIONS ARE NOT A HOLE, AND THIS COMMENT SAID THEY WERE. `--ext-diff`/`--textconv` are
 # parsed EXACT-MATCH in git's diff.c, so `--ext`, `--ext-d`, `--textc`, `--textco` all give
 # `error: invalid option` (measured on git 2.43.0) — fail-closed, and `--text`/`--exclude-standard`/
@@ -1876,21 +1876,37 @@ EXEC_ESCAPE_TOKENS = ("--ext-diff", "--textconv")
 #   core.fsmonitor            -> runs on `status` (and any index read)
 #   core.alternateRefsCommand -> a SHELL command, run by `log --alternate-refs`
 #   log.showSignature=true    -> turns every plain `log`/`show` into a gpg invocation
-#   gpg.program               -> the program that invokes; pinned to a FIXED path, not `''`
-#   core.pager                -> a pager is a program (no tty here, but pinning costs nothing)
-#   core.hooksPath            -> a hook is a program; no read verb runs one, kept for the next verb
-# ⛔ NOT REACHABLE BY THESE VERBS, which is why they are NOT pinned: `core.sshCommand`,
-# `credential.helper` and `core.editor` belong to fetch/push/commit — verbs `GIT_OK_VERBS` never admits —
-# and `filter.*.clean/smudge` runs on checkout, not on a read. The verb gate is what keeps them out, so
-# a NEW read-only verb must be checked against this list before it is allowed.
+#   gpg.program               -> the OPENPGP verifier; `gpg.<format>.program` is a SEPARATE key per
+#                                format (`git help --config` lists all three), so pinning only this
+#                                one left x509/ssh signatures running a repo-named program
+#   core.pager / pager.<cmd>  -> a pager is a program; `--no-pager` (GIT_GLOBAL_FLAGS) covers the
+#                                per-command form too, which `core.pager` alone does not
+#   core.hooksPath            -> a hook is a program (measured: `status` runs post-index-change)
+# ⛔ THE LIST IS DERIVED FROM GIT'S OWN `git help --config`, FILTERED TO KEYS THAT NAME A PROGRAM AND
+# TO THE VERBS `GIT_OK_VERBS` ADMITS — not from the last review finding. The program-naming keys that
+# are deliberately NOT here and why: `core.sshCommand`, `credential.helper`, `core.gitProxy`,
+# `http.proxy`, `remote.<name>.proxy`, `core.askPass` (transport/auth — reached only by fetch/push);
+# `core.editor`, `sequence.editor` (commit/rebase); `notes.rewrite.<command>` (commit/amend);
+# `gpg.ssh.defaultKeyCommand` (SIGNING; verification uses `gpg.ssh.program`, which IS pinned);
+# `filter.<driver>.clean/smudge` (checkout); `diff.external`, `diff.<driver>.command`,
+# `diff.<driver>.textconv` (the diff machinery — disarmed per-argv by GIT_HOOK_FLAGS, which also
+# covers a NEW driver a caller cannot anticipate); `completion.commands`, `rebase.abbreviateCommands`,
+# `color.pager` (not executables a read verb runs). A NEW read-only verb must be re-checked against
+# `git help --config` beside this list — that check is what keeps the enumeration honest.
 GIT_PIN_CONFIG = (
     "core.fsmonitor=",
     "core.alternateRefsCommand=",
     "log.showSignature=false",
     "gpg.program=/bin/false",
+    "gpg.openpgp.program=/bin/false",
+    "gpg.x509.program=/bin/false",
+    "gpg.ssh.program=/bin/false",
     "core.pager=cat",
     "core.hooksPath=/dev/null",
 )
+# `--no-pager` is a GLOBAL option and the only thing that neutralises `pager.<cmd>`, which takes
+# precedence over `core.pager` PER COMMAND and cannot be enumerated.
+GIT_GLOBAL_FLAGS = ("--no-pager",)
 GIT_DIFF_VERBS = ("diff", "log", "show")
 GIT_HOOK_FLAGS = ("--no-ext-diff", "--no-textconv")
 # ⛔ A BARE ARGUMENT TO `hostname` IS THE SETTER FORM, NOT A QUERY. `hostname NAME` and
@@ -1917,9 +1933,10 @@ def _harden_argv(argv: List[str]) -> List[str]:
     `cmux vm exec` forwards no environment, so a hardened env cannot be passed: the guarantee has to
     travel inside the argv. Three placement rules, each load-bearing:
 
-    * `-c core.fsmonitor=` is a GLOBAL option, so it precedes the verb — and it covers every
-      allowlisted verb, `status` included (`status` is exactly where fsmonitor runs). A diff-only
-      fix leaves `core.fsmonitor` reachable through the most ordinary call on the surface.
+    * `-c <key>=…` pins every repo-config key that NAMES A PROGRAM and is reachable by the verbs this
+      surface allows (`GIT_PIN_CONFIG`), and `--no-pager` is a GLOBAL option (so it precedes the verb)
+      and the only thing that neutralises `pager.<cmd>`. `-c` beats every config FILE, including one
+      pulled in by `include.path`.
     * `--no-ext-diff`/`--no-textconv` are DIFF options, so they follow the verb, and they are emitted
       TWICE: once IMMEDIATELY after the verb, and once LAST among options. Both copies are
       load-bearing, and neither alone is enough:
@@ -1931,9 +1948,11 @@ def _harden_argv(argv: List[str]) -> List[str]:
         - the FIRST copy cannot be swallowed by anything, because it is the first token after the
           verb and no caller token can precede it — so the disables are applied whatever the caller
           does afterwards.
-      Together they mean a caller cannot both re-enable a hook and swallow the disarm. The
-      ABBREVIATION route to re-enabling (`--ext`, `--textc`) is refused outright in `_allowlisted`,
-      because a token denylist cannot enumerate prefixes.
+      Together they mean a caller cannot both re-enable a hook and swallow the disarm. There is
+      deliberately NO abbreviation rule to go with them: `--ext-diff`, `--textconv` and
+      `--show-signature` are parsed EXACT-MATCH by git (`--ext`, `--textc`, `--show-sig` are all
+      `error: invalid option`, measured), so a prefix cannot reach them — and an earlier revision
+      that refused every `--ex…` FALSE-BLOCKED `git ls-files --others --exclude-standard`.
     * LAST means last BEFORE the `--` separator, never after it: everything following `--` is a
       PATHSPEC. Appending past it would harden NOTHING and add a bogus path, so the completely
       ordinary `git diff -- .` would silently defeat the guard.
@@ -1953,6 +1972,7 @@ def _harden_argv(argv: List[str]) -> List[str]:
     head: List[str] = ["git"]
     for pin in GIT_PIN_CONFIG:
         head += ["-c", pin]
+    head += list(GIT_GLOBAL_FLAGS)
     out = head + [verb] + rest[1:]
     if verb in GIT_DIFF_VERBS:
         # FIRST copy: immediately after the verb, where no caller token can precede it (or swallow

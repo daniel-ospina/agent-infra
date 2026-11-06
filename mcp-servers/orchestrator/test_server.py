@@ -1434,6 +1434,22 @@ def test_T_saved_work_reads_a_RELATIVE_origin_without_writing_the_checkout(tmp_p
                           check=True, capture_output=True, text=True).stdout
     assert "refs/wip-remote" not in refs, refs
 
+    # ⛔ AND THE `repo` ARGUMENT ITSELF MAY BE RELATIVE — `claim.check` hands it straight to `git -C`.
+    # `os.path.normpath(join(repo, url))` is only absolute when `repo` is, so with `repo='.'` the join
+    # stayed RELATIVE and the fetch ran from the server's scratch dir: the same UNMEASURED regression,
+    # in the one case that could silently read a DIFFERENT repository. Nothing tested it — the arm
+    # above passes an absolute path, where both implementations agree.
+    cwd = os.getcwd()
+    try:
+        os.chdir(str(work))
+        rel = mod._saved_for_issue(".", 9001)
+    finally:
+        os.chdir(cwd)
+    assert rel["count"] == 1, rel
+    rel_entry = rel["matches"][0]
+    assert rel_entry["file_count"] == 1, rel_entry
+    assert "UNMEASURED" not in str(rel_entry["age"]), rel_entry
+
 
 def test_T_saved_work_unreadable_is_unmeasured_never_none(tmp_path):
     """An unreadable registry is `UNMEASURED`, never `none` — invariant 1 on the saved axis.
@@ -1466,11 +1482,19 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     # both measured executing on an allowlisted argv, one of them with NO flag at all
     # (`log.showSignature=true` + `gpg.program` make a plain `git show` run it).
     for key in ("core.fsmonitor=", "core.alternateRefsCommand=", "log.showSignature=false",
-                "gpg.program=/bin/false", "core.pager=cat", "core.hooksPath=/dev/null"):
+                "gpg.program=/bin/false", "core.pager=cat", "core.hooksPath=/dev/null",
+                # ⛔ `gpg.program` IS THE OPENPGP VERIFIER ONLY. `gpg.<format>.program` is a SEPARATE
+                # key per format (all three are listed by `git help --config`), so pinning the first
+                # left x509/ssh signatures running a repo-named program — measured through a fully
+                # allowlisted `git log --show-signature`.
+                "gpg.openpgp.program=/bin/false", "gpg.x509.program=/bin/false",
+                "gpg.ssh.program=/bin/false"):
         assert key in mod.GIT_PIN_CONFIG, key
+    assert mod.GIT_GLOBAL_FLAGS == ("--no-pager",), mod.GIT_GLOBAL_FLAGS
     expected_head = ["git"]
     for pin in mod.GIT_PIN_CONFIG:
         expected_head += ["-c", pin]
+    expected_head += list(mod.GIT_GLOBAL_FLAGS)
     assert mod._harden_argv(["git", "diff"])[:len(expected_head)] == expected_head, \
         mod._harden_argv(["git", "diff"])
     tail = mod._harden_argv(["git", "diff"])[len(expected_head):]
@@ -1490,7 +1514,7 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     # abbreviations are `invalid option` IN GIT (measured) — so no stem rule is needed, and none is
     # applied (an earlier revision refused every `--ex…` and thereby FALSE-BLOCKED the bounded-search
     # primitive `git ls-files --others --exclude-standard`, which is pinned allowed below).
-    for tok in ("--ext-diff", "--textconv"):
+    for tok in ("--ext-diff", "--textconv", "--show-signature"):
         assert mod._allowlisted(["git", "diff", tok])[0] is False, tok
     for argv in (["git", "ls-files", "--others", "--exclude-standard"],
                  ["git", "ls-files", "--exclude=*.pyc"],
