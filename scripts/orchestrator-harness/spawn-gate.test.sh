@@ -789,16 +789,27 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # defect is that the guard's stated population was not the population it checked.)
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
 # not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
-# now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
+# now READS the bookkeeping assignments it used to drop, so the four names below are the full set it
 # finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
 # any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
+# ⛔ AND THE SET IS RE-DERIVED, NOT REMEMBERED. This comment said "the three names below are the full
+# set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree, so the collision arm read RED
+# on every run over a flag that declares no code. The sentence is a measurement, so it is taken by a
+# command rather than by memory — this one prints every family-shaped declaration whose value is not a
+# 70..89 code, i.e. exactly the population this list must name. Run it whenever this list is edited:
+#   awk -f "$TMP/refusal-codes.awk" scripts/orchestrator-harness/*.sh | awk -F'\t' '$1=="unknown"'
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
 #   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
 #   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
 #   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
 #   (`claim-registry-absent`) or `none`; not an exit code either.
-_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
+#   watchdog-loop.sh:RESTART_REFUSED — the watchdog's per-pass VERDICT FLAG (0/1), set wherever the
+#   pass declined to issue a restart verb and read by the one place that restates that verdict. It
+#   never leaves the process as a status: nothing assigns it to a command's `$?` and every read is
+#   `-eq 1` / `:-0`. Unlisted, the scan emitted its 0/1 rows as `unknown` and the whole deploy-unit
+#   check read RED over a flag that declares no code.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED watchdog-loop.sh:RESTART_REFUSED"
 # A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
 # reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
 # derived filter yields exactly the family claims today, so the namespace costs nothing — and a future
@@ -5199,7 +5210,14 @@ rdrive() { # rdrive <label> <registry:0|1> [<cap seconds>] -> "rc=… started=�
 }
 
 rlist() { # the registry's own reader, against the fixture origin only
-  python3 "$HERE/lane_registry.py" list --remote "$RREG/origin.git" --json 2>/dev/null
+  # ⛔ "THE FIXTURE ORIGIN ONLY" IS WHAT THIS COMMENT CLAIMED, AND WHAT IT DID NOT DO (measured).
+  # `--remote` redirects only the SHARED read; when that read fails the helper falls back to the box's
+  # own witness (~/.pi/agent/state/lanes — the ambient fleet, 281 records here), so an unreadable
+  # fixture origin made every R-arm below grade ambient state. The fixture's own state root is passed,
+  # exactly as `rdrive`/`r_end` already pass it to the lane under test.
+  env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+      LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+      python3 "$HERE/lane_registry.py" list --remote "$RREG/origin.git" --json 2>/dev/null
 }
 
 cat > "$TMP/bin/pi" <<'PI'
@@ -5300,12 +5318,22 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist — and BOTH readers are pinned to the fixture's own (emptied) state root, so no
+# fallback can answer either.
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+# ⛔ THE PROBE MUST BE HERMETIC TOO (measured — it was not, and that is the whole RED). `--remote`
+# redirects only the SHARED read; with it broken the helper falls back to the box's own witness, which
+# without the fixture's env is the REAL one — so this clause read `rc=0, coverage: local-only` over 281
+# ambient records instead of the abstention it pins, while the lane above it (already driven with these
+# variables) was reading the fixture. One arm, two different registries. With the fixture's EMPTY
+# witness in force, an unreachable remote is `UNMEASURED` (rc 3): an empty local witness is explicitly
+# NOT an empty fleet, so no 0 can be published from it.
+unreachable="$( env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+  LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
