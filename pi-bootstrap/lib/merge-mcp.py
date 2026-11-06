@@ -220,6 +220,13 @@ def endpoint_key(url):
     # userinfo, so no secret can ever reach a key (keys are never printed; the rule still costs one word).
     authority = u.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ THE DOT STRIP ITSELF (#3374 review, round 14 P1 — round 13 wrote the rationale above and
+    # shipped NO CODE FOR IT: `--verify` stripped the dot and this file did not, so a dotted HOSTED
+    # template installed verbatim and `--verify` refused the result `NOAUTH`/`WRONG_AUTH`/
+    # `NOTHTTP:sse` for ever — the non-convergent repair loop this whole commit exists to close, one
+    # spelling deeper. The two ends asking the same question MUST answer it the same way.)
+    if host.endswith("."):
+        host = host[:-1]
     # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT (#3374 review, round 12 residual). WHATWG parses the
     # DIGITS, so `https://api.premiselabs.co:0443/mcp/` and `:00443` both normalise to the canonical
     # hosted url (measured with the client's own parser: `new URL(...).href` is
@@ -675,6 +682,23 @@ def usable(entry, want_url):
         # non-loopback non-https url; preserving such an entry would mint a config the verifier
         # refuses and `--install` then exits non-zero on — a bring-up that can never converge, which
         # is exactly the "config `--verify` must refuse in perpetuity" this function exists to stop.
+        return False, "insecure"
+    # ⛔ CLEARTEXT IS NOT A SELF-HOST WHEN THE HOST IS THE HOSTED ONE (#3374 review, round 14 P2 —
+    # a FALSE PASS, measured). The arm above needs a CREDENTIAL to fire, so a template with NO
+    # Authorization escaped it entirely: `http://api.premiselabs.co/mcp/` keyed by SCHEME as a
+    # different endpoint, took the self-host early return below ("a daemon may need no key at all"),
+    # was installed verbatim, and `--verify` then certified it `SELFHOSTED:` rc=0 — LAYER VERIFIED
+    # over the LIVE hosted host, in cleartext, with no credential: the exact false green the hosted
+    # arms exist to close, reached from the one direction that skips them all. The hosted endpoint is
+    # https-only, so cleartext to it is not "a different endpoint the operator chose" — it is a
+    # template that cannot work, and it is REFUSED (exit 3, nothing written) exactly like its
+    # credentialed twin above, so `verify -> install -> verify` converges by refusal.
+    # The test is the endpoint identity with the SCHEME SWAPPED for `https`, not a host comparison:
+    # `_endpoint_key` already owns the default-port, leading-zero and root-dot rules, so this cannot
+    # drift from them, and a genuine self-host is untouched (`http://localhost:8000/mcp` and
+    # `http://api.premiselabs.co:8443/mcp/` keep a different port, so they stay preserved).
+    if not url.lower().startswith("https://") \
+            and endpoint_key("https://" + url.split("://", 1)[1]) == endpoint_key(want_url):
         return False, "insecure"
     if endpoint_key(url) != endpoint_key(want_url):
         # a self-hosted daemon may need no key at all (docs/quickstart-selfhosted.md), and its
