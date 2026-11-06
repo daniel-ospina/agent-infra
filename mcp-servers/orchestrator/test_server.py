@@ -1718,3 +1718,39 @@ def test_T_box_exec_disables_the_program_git_config_can_name():
     # a non-git program and a non-verb are untouched — the hardening is scoped, not a blanket append
     assert mod._harden_argv(["cat", "/etc/hostname"]) == ["cat", "/etc/hostname"]
     assert mod._harden_argv(["git", "--version"]) == ["git", "--version"]
+
+
+def test_T_lane_dispatch_refuses_when_branch_existence_cannot_be_read(tmp_path, monkeypatch):
+    """[P2, review] An UNREADABLE existence probe must not read as "the branch is free".
+
+    The guard exists for a measured silent actuator (`fatal: a branch named 'p0-10000' already exists`
+    reaching a caller as prose). Before this, a failed probe set `remote_exists = None` and the code fell
+    through to DISPATCH — the guard disappearing exactly when it could not be evaluated, which is when a
+    collision is most likely. Three-valued now, and ORDERED: a branch the LOCAL probe finds is still a
+    measured `branch-exists`; only an absent local answer makes an unreadable remote a refusal.
+    """
+    import subprocess
+    mod = _saved_mod()
+    monkeypatch = pytest.MonkeyPatch()
+    try:
+        wt = tmp_path / "wt"
+        wt.mkdir()
+        subprocess.run(["git", "init", "-q", str(wt)], check=True)
+        subprocess.run(["git", "-C", str(wt), "-c", "user.email=t@t", "-c", "user.name=t",
+                        "commit", "-q", "--allow-empty", "-m", "x"], check=True)
+        brief = tmp_path / "b.md"
+        brief.write_text("x")
+        monkeypatch.setenv("O", str(tmp_path / "o"))
+        (tmp_path / "o" / "bg").mkdir(parents=True)
+        # no `origin` here → the remote probe cannot be read, and the local branch does not exist
+        is_err, payload = one(mod, "lane.dispatch", {"name": "L9", "worktree": str(wt),
+                                                    "brief": str(brief), "branch": "p0-77777"})
+        assert is_err and payload["refused"] == "branch-existence-unmeasured", payload
+        assert "UNMEASURED(" in str(payload["remote"]), payload
+        # a branch the LOCAL probe FINDS is a measured collision, not an abstention
+        subprocess.run(["git", "-C", str(wt), "branch", "p0-77778"], check=True)
+        is_err, payload = one(mod, "lane.dispatch", {"name": "L10", "worktree": str(wt),
+                                                    "brief": str(brief), "branch": "p0-77778"})
+        assert is_err and payload["refused"] == "branch-exists", payload
+    finally:
+        monkeypatch.undo()

@@ -1444,7 +1444,17 @@ def _pr_queue(mods: Modules, args: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]
                       "exit_code": ran.rc,
                       "note": "UNMEASURED — an unreadable board is not an empty queue"}
     if isinstance(rows, dict):
-        rows = rows.get("rows") or rows.get("prs") or []
+        picked = rows.get("rows")
+        if picked is None:
+            picked = rows.get("prs")
+        if picked is None:
+            # ⛔ A SHAPE NOBODY RECOGNISES IS NOT AN EMPTY QUEUE (review P2, invariant 1): the old
+            # fall-through answered `row_count: 0, isError: false` for a payload it did not understand.
+            return True, {"measured_at": _now(), "repo": repo,
+                          "unmeasured": "UNMEASURED(%s -> shape + expected a list or {\"rows\": [...]}; "
+                                        "got a dict with keys %s)" % (ran.cmd, sorted(rows.keys())[:8]),
+                          "exit_code": ran.rc}
+        rows = picked
     out_rows = []
     for row in rows if isinstance(rows, list) else []:
         if not isinstance(row, dict):
@@ -1752,6 +1762,23 @@ def _dispatch(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
                       "refs/heads/%s" % branch], timeout=30.0)
         claimed = run(["git", "-C", worktree, "ls-remote", "--heads", "origin", branch], timeout=60.0)
         remote_exists = bool(claimed.stdout.strip()) if claimed.ok() else None
+        # ⛔ THREE-VALUED, NOT TWO (review P2). `remote_exists is None` means THE PROBE FAILED, and the
+        # old code fell through to dispatch — the guard disappearing exactly when it could not be
+        # evaluated, which is when a collision is most likely.
+        # ⛔ ORDER MATTERS: a branch the LOCAL probe FOUND is `branch-exists` whatever the remote says;
+        # only an ABSENT local answer makes an unreadable remote a refusal. (My first version got this
+        # order wrong and the existing branch-exists test caught it.)
+        local_has = exists.ok() and bool(exists.stdout.strip())
+        if not local_has and (remote_exists is None or not exists.ok()):
+            payload["refused"] = "branch-existence-unmeasured"
+            payload["branch"] = branch
+            payload["local"] = exists.unmeasured() if not exists.ok() else False
+            payload["remote"] = (claimed.unmeasured() if remote_exists is None
+                                 else bool(claimed.stdout.strip()))
+            payload["note"] = ("the branch-existence probe could not be read, so 'free' cannot be "
+                               "asserted — a dispatch here could collide with a branch that already "
+                               "exists, which is the silent-actuator failure this refusal types")
+            return True, payload
         if (exists.ok() and exists.stdout.strip()) or remote_exists:
             # ⛔ A TYPED REFUSAL FOR A MEASURED SILENT-ACTUATOR FAILURE: `fatal: a branch named
             # 'p0-10000' already exists` used to reach the caller as stderr prose.
@@ -1831,7 +1858,12 @@ ALLOWLIST = {
     "ps": (None, 2),
     "git": (None, 8),
     "ls": (None, 6),
-    "cat": (None, 4),
+        # ⛔ `cat` IS DELIBERATELY NOT ALLOWLISTED (review P2). With no path bound it admitted
+    # `cat /etc/shadow`, `cat ~/.pi/agent/jev-config.json` (the 0600 key store this fleet never
+    # prints) and `cat -` — while the gate's own refusal text said "allowlisted for READING", a word
+    # with no scope behind it. Removed rather than path-bounded: the diagnostics it served are served
+    # by `ls`, `wc` and `sha256sum`, none of which can dump a file into a transcript, and on a cell
+    # the legitimate paths are most of the box, so a bound would have been decorative.
     "wc": (None, 4),
     "sha256sum": (None, 4),
     "pgrep": (None, 4),
