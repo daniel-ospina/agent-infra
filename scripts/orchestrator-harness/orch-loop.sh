@@ -1015,11 +1015,8 @@ stg_nap_mark() {
 # the PREVIOUS cycle spent outside its own body and is by definition read one cycle later.
 stg_cycle_reset() {
   local _sr_n _sr_v
-  for _sr_n in $STG_REGISTRY_TILED $STG_REGISTRY_PENDING; do
+  for _sr_n in $STG_REGISTRY_TILED $STG_REGISTRY_PENDING $STG_REGISTRY_LVL; do
     _sr_v="STG_V_${_sr_n}"; printf -v "$_sr_v" '%s' ""     # "" => 'ns' (never sampled)
-  done
-  for _sr_n in $STG_REGISTRY_LVL; do
-    _sr_v="STG_V_${_sr_n}"; printf -v "$_sr_v" '%s' 0       # 0 => a MEASURED zero
   done
   STG_OPEN_LVL=""; STG_OPEN_T0=0; STG_TILE_MARK=0; STG_WAIT_T0=0
   # An overlay interval queued by a previous cycle must never be folded into this one. Truncation is a
@@ -4094,14 +4091,19 @@ while true; do
       CAP_CHAN_V="$(cap_chan_of "$REPO")"
       echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
     fi
-    fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
-    # ⛔ SAMPLE THE GAP'S START BEFORE NAPPING, EXACTLY AS THE FORK-STARVED ARM DOES (fresh-context
-    # review, P0). `stg_cycle_reset` zeroes `STG_WAIT_T0`, and `stg_nap_mark` computes
-    # `now - STG_WAIT_T0` — so WITHOUT this sample a disk-held cycle recorded the controller's WHOLE
-    # PROCESS UPTIME as "the gap": measured with the shipped clock, a 2 s cycle followed by a 1 s nap
-    # emitted `prev_wait=3004153` us for a 1000000 us nap. That is the fabricated-measurement class
-    # this field exists to end, arriving through the arm opposite the one that was instrumented.
+    # ⛔ SAMPLE THE GAP'S START **BEFORE** NAPPING, EXACTLY AS THE FORK-STARVED ARM DOES (third
+    # fresh-context review, P0 — and my own first attempt at this fix put the sample AFTER the nap,
+    # which is the same defect wearing the opposite mask). `stg_cycle_reset` zeroes `STG_WAIT_T0` and
+    # `stg_nap_mark` computes `now - STG_WAIT_T0`, so the sample must be taken BEFORE
+    # `fork_free_sleep`:
+    #   · NO sample at all   ⇒ `prev_wait` = the controller's WHOLE PROCESS UPTIME (measured 3004153 us
+    #                          for a 1000000 us nap);
+    #   · sample AFTER the nap ⇒ `prev_wait` = a fabricated `0` for the entire gap (measured 0 us for a
+    #                          1000000 us nap), i.e. "the gap outside the body cost nothing", on every
+    #                          disk-held cycle for ever.
+    # Both are the fabricated-measurement class this field exists to end. Order matters, not proximity.
     stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
+    fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
     stg_nap_mark
     continue
   fi
@@ -5836,10 +5838,11 @@ while true; do
               # THAT PR's count here — and this value is written to `reviewdisp-<PR>` and printed as
               # the attempt number, so a stale carry would silently spend another PR's budget.
               # ⛔ CASCADE LEVEL 4 IS MARKED HERE, AND IT WAS MISSING (fresh-context review, P0).
-              # `l4_review` is declared in `STG_REGISTRY_LVL`, so `stg_cycle_reset` initialises it to `0`
-              # — "a MEASURED zero" — yet nothing ever called `stg_lvl_start l4_review`, so every record
-              # reported the review level as measured-and-free while this arm was the one doing its
-              # work. That is precisely the false pass this block refuses for `l1_main`. The mark is
+              # `l4_review` is declared in `STG_REGISTRY_LVL`; nothing ever called
+              # `stg_lvl_start l4_review`, so the review level was never sampled while this arm was the
+              # one doing its work. That is precisely the false pass this block refuses for `l1_main`
+              # (it then read `0` because the reset initialised levels to `0` — since changed to `ns`, see
+              # `stg_cycle_reset`). The mark is
               # the review-DISPATCH arm's own body time: the controller spawns the worker and moves on,
               # so this is small by design and is not the reviewer's own runtime — which is attributed
               # inside the worker, not to the cycle body.

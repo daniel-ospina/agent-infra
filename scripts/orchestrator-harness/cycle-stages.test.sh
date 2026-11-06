@@ -300,9 +300,14 @@ ck "no backtick substitution either (\`\` forks exactly like \$( ))" \
    "$(if qF '`' "$_ccode"; then echo 1; else echo 0; fi)"
 ck "no 'date' fork in the clock's code (the whole point is a clock without a process)" \
    "$(if qF 'date ' "$_ccode"; then echo 1; else echo 0; fi)"
-_when="$(awk '/^while true; do/{W=NR} /stg_cycle_reset/{if(!R)R=NR} /^  fork_gate$/{if(!F)F=NR}
-                 END{ if (R && F && R < F) print "ok"; else print "bad" }' "$ORCH")"
-ck "the reset is called ABOVE fork_gate in the shipped loop (so a starved cycle is timed at all)" \
+# ⛔ THIS ARM USED TO BE VACUOUS (third fresh-context review, P0): the pattern `/stg_cycle_reset/`
+# matched the DOC COMMENT at the function definition, which sits above `fork_gate` — so moving the real
+# CALL below the gate left the suite at 75 passed. Fixed by stripping full-line comments and keying on
+# the CALL ONLY (`^  stg_cycle_reset$`), so the prose cannot satisfy its own arm.
+_loopcode6="$(grep -vE '^[[:space:]]*#' "$ORCH")"
+_when="$(printf '%s\n' "$_loopcode6" | awk '/^while true; do/{W=NR} /^[[:space:]]*stg_cycle_reset[[:space:]]*$/{if(!R)R=NR} /^  fork_gate$/{if(!F)F=NR}
+                 END{ if (R && F && R < F) print "ok"; else print "bad" }')"
+ck "the reset is CALLED (not merely defined) above fork_gate in the shipped loop (so a starved cycle is timed at all)" \
    "$(if [ "$_when" = "ok" ]; then echo 0; else echo 1; fi)"
 
 # ── §7 BACKWARDS COMPATIBILITY: an old-format record still parses ─────────────────────────────
@@ -397,8 +402,8 @@ echo "── §9 REGRESSIONS the main-shell drives above could never catch (subs
 # code queues the interval in `$STG_LVL_TMP` and folds it in the parent; the pre-review code called
 # `stg_add` there and the write died at `done`, so every record said `l2_merge:0` whatever happened.
 # This arm drives that exact boundary — it is the only arm in the suite that does.
-STG_LVL_TMP="$TMP/lvlq"; : >"$STG_LVL_TMP"
-STG_V_l2_merge=0; STG_V_l3_fix=0; STG_V_l4_review=0; STG_OPEN_LVL=""; STG_OPEN_T0=0
+STG_LVL_TMP="$TMP/lvlq"
+stg_cycle_reset                      # the REAL initialiser: levels become "" (ns), the queue is truncated
 printf 'row\n' | while read -r _prow; do
   stg_lvl_start l2_merge || :
   sleep 1.2
@@ -412,8 +417,8 @@ ck "  …and the FOLD turns that queued interval into the level's measured time 
 stg_lvl_fold || :
 ck "  …and folding twice adds nothing (the queue is drained), still ${STG_V_l2_merge:-0} us" \
    "$(if [ "${STG_V_l2_merge:-0}" -lt 3000000 ]; then echo 0; else echo 1; fi)"
-ck "  …and a level with no interval is still a MEASURED 0, not an accident of the mechanism" \
-   "$(if [ "${STG_V_l3_fix:-x}" = "0" ]; then echo 0; else echo 1; fi)"
+ck "  …and a level with no interval is 'ns' — never a measured-looking 0 for a level nothing entered" \
+   "$(if [ "${STG_V_l3_fix-UNSET}" = "" ]; then echo 0; else echo 1; fi)"
 STG_LVL_TMP=""
 
 # 9.1b THE LAST ROW'S OPEN INTERVAL MUST NOT DIE AT `done`.
@@ -453,17 +458,25 @@ ck "the shipped sweep SETTLES as its LAST statement — 'stg_lvl_settle || :' im
 # `stg_lvl_fold || :`, which is the form only that call site uses.
 ck "the shipped sweep FOLDS the overlay queue AFTER its 'done', in the parent ('stg_lvl_fold || :' after a 'done')" \
    "$(if printf '%s\n' "$_loop_nc" | awk '$0 ~ /^[[:space:]]*done[[:space:]]*$/ {after=1} after && /^[[:space:]]*stg_lvl_fold[[:space:]]*\|\|[[:space:]]*:/ {f=1} END {exit !f}'; then echo 0; else echo 1; fi)"
-# ⛔ AND EVERY `stg_nap_mark` CALL SITE MUST SAMPLE `STG_WAIT_T0` FIRST. `stg_cycle_reset` zeroes that
-# sample, so a call site that omits it records the controller's WHOLE UPTIME as "the gap" — measured
-# 3004153 us for a 1000000 us nap on the disk-held arm, which is the fabricated-measurement class
-# this field exists to end. The disk-held arm shipped with exactly that omission, so this arm pins
-# the CLASS, not the one site: any future nap site that forgets the sample reds here.
+# ⛔ AND EVERY `stg_nap_mark` CALL SITE MUST SAMPLE `STG_WAIT_T0` **BEFORE THE NAP**, NOT MERELY NEAR
+# IT. `stg_cycle_reset` zeroes that sample and `stg_nap_mark` computes `now - STG_WAIT_T0`, so:
+#   · no sample          ⇒ `prev_wait` = the controller's whole uptime (measured 3004153 us for a 1 s nap);
+#   · sample AFTER the nap ⇒ `prev_wait` = a fabricated `0` (measured 0 us for a 1 s nap).
+# ⛔ A PROXIMITY WINDOW WAS VACUOUS (third fresh-context review): "some line within 4 above contains
+# `STG_WAIT_T0=`" was satisfied by the sample placed AFTER the nap — the exact defect it was meant to
+# catch. This arm now requires ORDER: the nearest preceding sample line must contain the real call
+# (`stg_now_us_vars STG_WAIT_T0`), and it must NOT be preceded-in-window by a `STG_WAIT_T0=0` reset
+# without a re-sample. It also refuses a constant `STG_WAIT_T0=0` as the "sample".
 _nap_bad=""
 for _nln in $(printf '%s\n' "$_loop_nc" | grep -n '^[[:space:]]*stg_nap_mark[[:space:]]*$' | cut -d: -f1); do
-  _win="$(printf '%s\n' "$_loop_nc" | sed -n "$(( _nln > 4 ? _nln - 4 : 1 )),$(( _nln - 1 ))p")"
-  case "$_win" in *'STG_WAIT_T0='*) : ;; *) _nap_bad="$_nap_bad $_nln" ;; esac
+  _blk="$(printf '%s\n' "$_loop_nc" | sed -n "$(( _nln > 6 ? _nln - 6 : 1 )),$(( _nln - 1 ))p")"
+  # the sample line and whether a nap follows it, before stg_nap_mark
+  case "$_blk" in
+    *'stg_now_us_vars STG_WAIT_T0'*'fork_free_sleep'*|*'stg_now_us_vars STG_WAIT_T0'*'sleep '*) : ;;
+    *) _nap_bad="$_nap_bad $_nln" ;;
+  esac
 done
-ck "every stg_nap_mark call site samples STG_WAIT_T0 first, so prev_wait cannot become the process uptime${_nap_bad:+ (bad line(s):$_nap_bad)}" \
+ck "every stg_nap_mark call site samples STG_WAIT_T0 BEFORE the nap it measures, so prev_wait is one gap${_nap_bad:+ (bad line(s):$_nap_bad)}" \
    "$([ -z "$_nap_bad" ] && echo 0 || echo 1)"
 
 # 9.2 `prev_wait` IS ONE GAP, NOT THE LIFETIME SUM OF EVERY NAP.

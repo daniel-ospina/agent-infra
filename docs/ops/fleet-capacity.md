@@ -542,13 +542,22 @@ different reading from `0` ("measured, cost nothing"), deliberately, so an unimp
 never read as a measured zero-cost one. `l4_review` is the review-**dispatch** arm's own body time: the
 controller spawns the reviewer and moves on, so it is small by design and is not the reviewer's runtime.
 
-⛔ **THE TILING INVARIANT IS A FULL-CYCLE PROPERTY, NOT A UNIVERSAL ONE.** Only a cycle that reaches
-the end of its body marks every tiled stage. On the **disk-held** arm and the **fork-starved** arm the
-cycle `continue`s early, so the stages it never reached read `ns` and `sum(tiled)` is legitimately SHORT
-of `end - start` — `ns` is the label that says so. The same is true of the tail after `stg_mark record`
-(the field is built, then the line is appended, then the nap). So a reader checking `sum == end - start`
-should first confirm no stage reads `ns`; where one does, the shortfall is the un-run remainder, not a
-broken instrument. The very arms the 161-minute narrative above is about are these early-exit ones.
+⛔ **THE TILING INVARIANT IS A FULL-CYCLE PROPERTY, NOT A UNIVERSAL ONE, AND IT IS TRUE ONLY WITHIN A
+TOLERANCE OF A FEW SECONDS.** Three things move the arithmetic, all of them small and all of them
+stated so a reader does not misread them as a broken instrument:
+
+- **Only a cycle that reaches the end of its body marks every tiled stage.** On the **disk-held** arm
+  and the **fork-starved** arm the cycle `continue`s early, so every stage it never reached reads `ns`
+  and `sum(tiled)` is legitimately SHORT of `end - start`. `ns` is the label that says so. The same is
+  true of the tail after `stg_mark record` (the field is built, then the line is appended, then the nap).
+- **Each stage is truncated to WHOLE SECONDS** when emitted, so eleven tiled stages can sum up to ~11 s
+  short of the body even on a full cycle — with no `ns` anywhere to explain it.
+- **`boot` opens at `stg_cycle_reset`, which runs BEFORE `CYCLE_T0="$(date +%s)"`**, so the sum can also
+  come out slightly LONGER than `end - start`.
+
+So the correct reading of a full cycle is `sum(tiled) ≈ end - start` within a few seconds, and a
+shortfall on a cycle that shows any `ns` is the un-run remainder. The very arms the 161-minute
+narrative above is about are these early-exit ones.
 
 The stage SET lives in exactly one place — `orch-loop.sh`'s `STG_REGISTRY_*` block — and the emitter
 walks it, so a stage added there appears in every later record with no second edit. The grammar and the

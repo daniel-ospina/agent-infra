@@ -192,9 +192,10 @@ sum is legitimately SHORT of `end - start`; check for `ns` before reading a shor
 instrument. It exists because `end - start` did not
 track work: measured cycles of 2.2 / 17.5 / 131 / 145 / 161 minutes against `interval=240`, with the
 161-minute cycle spawning **zero** workers. `CYC` bounds only the nap — the body is unbounded, and
-until `stages=` existed that was also unobservable. Grammar and reader: `cycle_stages_valid` /
-`cycle_stage_get` (both refuse a malformed value rather than returning it); records written before the
-field existed carry no `stages=` token and still parse.
+until `stages=` existed that was also unobservable. Grammar and reader: `cycle_stages_valid` validates a
+whole field, and `cycle_stage_get` validates the value of the stage it RETURNS (it does not validate
+the rest of the field — a corrupt sibling entry is not this reader's business); records written before
+the field existed carry no `stages=` token and still parse.
 The three states a caller must read apart live in the *fields*, not the verdict:
 `dispatched=<n> nothing=none` = **ALIVE** (work placed); `dispatched=0 nothing=no_candidate` =
 **IDLE** (a readable world, nothing selected); `dispatched=0 nothing=gate:<name>(<reason>)` or
