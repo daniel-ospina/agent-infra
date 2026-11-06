@@ -1288,6 +1288,18 @@ ck "N15f …a MISSING scripts/lib/bounded.sh REFUSES the push by name and reache
 mk15f="$O/state/lane-exit-nobound.state"
 [ -s "$mk15f" ] && grep -qx 'push=UNAVAILABLE' "$mk15f" && grep -q '^next=MANUAL' "$mk15f"; rcn15g=$?
 ck "N15g …and the artifact records push=UNAVAILABLE with next=MANUAL, so a reclaim pass cannot read an unbound exit as safe [$(grep -m1 '^push=' "$mk15f" 2>/dev/null)]" $rcn15g
+# ⛔ N15h — THE LAST LINE OF THE LANE LOG MAY NOT ASSERT AN OFF-BOX ABSENCE (review of PR #3399 round 14,
+# P2 — REPRODUCED). `[wip] NOTE`'s fallback arm still said "exist ONLY locally and were NOT pushed" from
+# `unpushed>0`, i.e. from the LOCAL `refs/remotes/*` cache — the third consumer of that enumeration, after
+# `next=` and the shared caveat. It is the line an operator reads LAST. This arm is driven through the
+# real `run_agent`: the isolated-harness lane above ends `push=UNAVAILABLE` and writes exactly that NOTE.
+! grep -q 'exist ONLY locally' "$O/logs/nobound.log" \
+  && grep -q "LOCAL refs/remotes/\* cache" "$O/logs/nobound.log" \
+  && grep -q 'NOT a claim about any remote' "$O/logs/nobound.log"; rcn15h=$?
+ck "N15h …and the [wip] NOTE that ends the lane log scopes the same claim to the LOCAL cache instead of asserting the commits exist only on this disk" $rcn15h
+# …and the note still carries the survival facts, so it is scoped and not deleted.
+grep -q 'They survive this WORKTREE being removed' "$O/logs/nobound.log"; rcn15i=$?
+ck "N15i …while still naming what does and does not survive (scoped, not silenced)" $rcn15i
 # ⛔ N23 — ANY DOMAIN THAT SAYS MANUAL OUTRANKS A DOMAIN THAT ONLY REPORTS (review cycle 8, P1).
 # `lane_end_next`'s arms are `return 0`, so arm ORDER decided the verdict: the push case ran first, and its
 # `refused-protected|refused-main-checkout` arm is a NON-MANUAL sentence, so a DIRTY tree whose archive
@@ -2709,6 +2721,64 @@ for _n50u in /srv/push-repo.git ''; do
     ck "N50 …and with NO divergence it still says origin (a fence, not a blanket rewrite) [${n50:0:64}]" $rcn50b
   fi
 done
+# ⛔ N51 — THE REMEDY NAMES THE PUSH REPOSITORY EVEN WHEN THE PUSH STEP NEVER RAN (review of PR #3399
+# round 14, P2 — REPRODUCED). `lane_end_push` resolves and PROVES `LANE_END_PUSH_URL` only after the
+# `unpushed > 0` gate — `nothing`, `unmeasured` and `detached` all return before it — so round 13's fix
+# fell back to `origin` exactly on those paths. Measured end-to-end by the reviewer on the previous head:
+# a `pushurl`-divergent repo, a clean tree with one stray file and `unpushed=0` gave
+# `next=… git fetch origin refs/wip/<slug>`, whose own command answered `couldn't find remote ref` while
+# `bg-rescue-wip.sh` had put the archive in the push repository. `lane_end_push_repo` reads the push url
+# from CONFIG (no network, no proof needed for a remedy).
+N51="$TMP/n51"
+rm -rf "$N51"
+git init -q -b main "$N51"
+git -C "$N51" config user.name t; git -C "$N51" config user.email t@t
+git -C "$N51" commit -q --allow-empty -m seed
+git -C "$N51" remote add origin https://example.invalid/fetch.git
+git -C "$N51" config remote.origin.pushurl https://example.invalid/push.git
+[ "$(git -C "$N51" remote get-url origin)" != "$(git -C "$N51" remote get-url --push origin)" ]; rcn51b=$?
+ck "N51b FIXTURE: the repo's fetch and push urls really DIVERGE — else this arm cannot see the class" $rcn51b
+n51="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=refs/wip/fix-x; LANE_END_PUSH=nothing
+  LANE_END_UNPUSHED=0; LANE_END_ROOT="$2"; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" "$N51" 2>/dev/null )"
+case "$n51" in *'git fetch https://example.invalid/push.git refs/wip/fix-x'*) rcn51=0 ;; *) rcn51=1 ;; esac
+ck "N51 …even when the push step never ran (push=nothing leaves LANE_END_PUSH_URL unset), the archive recovery fetches from the PUSH url [${n51:0:70}]" $rcn51
+n51c="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=running
+  LANE_END_UNPUSHED=2; LANE_END_ROOT="$2"; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" "$N51" 2>/dev/null )"
+case "$n51c" in *'git ls-remote --heads https://example.invalid/push.git refs/heads/develop'*) rcn51c=0 ;; *) rcn51c=1 ;; esac
+ck "N51c …and so does the push=running 're-read the remote' remedy, which is written before the push step" $rcn51c
+# ⛔ AND `push=unmeasured` HAS NO REPOSITORY TO NAME — its remedy is the endpoint-free
+# `rev-list --count HEAD --not --remotes`, deliberately (a narrower question about one remote is what the
+# round-15 finding was about). Asserted so a later "make it name a repo" change cannot narrow it silently.
+n51d="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=nothing; LANE_END_PUSH=unmeasured
+  LANE_END_UNPUSHED=
+  LANE_END_ROOT="$2"; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" "$N51" 2>/dev/null )"
+case "$n51d" in *'rev-list --count HEAD --not --remotes'*) rcn51d=0 ;; *) rcn51d=1 ;; esac
+ck "N51d …while push=unmeasured still prescribes the ENDPOINT-FREE count (naming a remote would answer a narrower question)" $rcn51d
+# …and TWO push urls are not this code's to guess: it answers `origin` rather than picking one.
+N51E="$TMP/n51e"
+rm -rf "$N51E"
+git init -q -b main "$N51E"
+git -C "$N51E" config user.name t; git -C "$N51E" config user.email t@t
+git -C "$N51E" commit -q --allow-empty -m seed
+git -C "$N51E" remote add origin https://example.invalid/fetch.git
+git -C "$N51E" config --add remote.origin.pushurl https://example.invalid/p1.git
+git -C "$N51E" config --add remote.origin.pushurl https://example.invalid/p2.git
+n51e="$( bash -c '
+  . "$1"
+  LANE_END_TREE=dirty; LANE_END_RESCUE=refs/wip/fix-x; LANE_END_PUSH=nothing
+  LANE_END_UNPUSHED=0; LANE_END_ROOT="$2"; LANE_END_BRANCH=develop
+  lane_end_next' _ "$GATE" "$N51E" 2>/dev/null )"
+case "$n51e" in *'git fetch origin refs/wip/fix-x'*) rcn51e=0 ;; *) rcn51e=1 ;; esac
+ck "N51e …while TWO push urls answer origin — an ambiguous target is not this code's to pick, the same way the push half refuses it by name [${n51e:0:60}]" $rcn51e
 echo
 
 # ⛔ N44 — THE READ AND THE WRITE MUST ADDRESS THE SAME REPOSITORY (review cycle 17, P0 — REPRODUCED).
