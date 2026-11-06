@@ -1744,12 +1744,17 @@ printf 'EVIL-not-a-tier\n' > "$_d14/o/.pool-sat"
 ( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unrec" 2>&1
 _r14="$(cat "$_d14/out-unrec" 2>/dev/null)"
 if grep -q 'unranked:' <<<"$_r14" && grep -q 'names no tier this code recognises' <<<"$_r14" \
-   && ! grep -q 'tier window was clipped' <<<"$_r14"; then rc=0
+   && ! grep -q 'windows=TRUNCATED' <<<"$_r14" && ! grep -q 'tier window was clipped' <<<"$_r14"; then rc=0
 else rc=1; echo "      (b) unranked+unrecognised '$(printf '%s' "$_r14" | tr '\n' '|' | head -c 320)'"; fi
-ck "(14d) an UNRECOGNISED window record is NOT reported as a clip this pass measured" $rc
+ck "(14d) an UNRECOGNISED window record is NOT reported as a clip this pass measured (no windows=TRUNCATED clause at all)" $rc
 
 _d14b="$TMP/arm-clip-head"; rm -rf "$_d14b"; mkdir -p "$_d14b/o"
-printf 'aaa\nbbb\n' > "$_d14b/o/candidates.txt"; printf 'bbb\n' > "$_d14b/o/.pool"
+# ⛔ ONE ROW, ON PURPOSE (review P2, cycle 40). With a second queued row the WARN arm (`_u > 0 && _r > 0`)
+# printed the SAME `windows=TRUNCATED(P1-severe)` token, so deleting `$_sat_said` from the head arm alone
+# left this check green — it graded the WARN line, not its own subject. One row gives `_u = 0`, the WARN
+# cannot fire, and the token can only come from the arm under test. Measured: shipped source prints the
+# token once, the arm-dropped mutant zero times.
+printf 'bbb\n' > "$_d14b/o/candidates.txt"; printf 'bbb\n' > "$_d14b/o/.pool"
 printf 'P1-severe\n' > "$_d14b/o/.pool-sat"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14b/drive.sh"
 ( cd "$_d14b" && HOME="$_d14b" bash drive.sh "$_d14b/o" ) > "$_d14b/out-head" 2>&1
@@ -1757,6 +1762,24 @@ _h14="$(cat "$_d14b/out-head" 2>/dev/null)"
 if grep -q 'HEAD cannot be named here' <<<"$_h14" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_h14"; then rc=0
 else rc=1; echo "      (c) non-numeric head '$(printf '%s' "$_h14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) the HEAD-NOT-NUMERIC arm still carries windows=TRUNCATED (it used to drop the clause)" $rc
+
+# 14d-bis) AN UNREADABLE RECORD IS ITS OWN STATE (review P3, cycle 40). Without a `[ -r ]` guard the
+# shell's own `Permission denied` leaked onto stderr and the blocked read was classified as
+# `unrecognised` — "no tier was clipped" asserted from a file that was never opened. Both halves are
+# graded: the operator line must SAY the record could not be read, and the shell's message must not be
+# what a reader sees. Skipped when the file cannot be made unreadable (running as root).
+_d14c="$TMP/arm-clip-unread"; rm -rf "$_d14c"; mkdir -p "$_d14c/o"
+printf 'aaa\nbbb\n' > "$_d14c/o/candidates.txt"; printf '200\n' > "$_d14c/o/.pool"
+printf 'P1-severe\n' > "$_d14c/o/.pool-sat"; chmod 000 "$_d14c/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14c/drive.sh"
+( cd "$_d14c" && HOME="$_d14c" bash drive.sh "$_d14c/o" ) > "$_d14c/out" 2>&1
+_x14="$(cat "$_d14c/out" 2>/dev/null)"; chmod 644 "$_d14c/o/.pool-sat" 2>/dev/null || true
+if [ ! -r "$_d14c/o/.pool-sat" ] 2>/dev/null; then
+  rc=0; echo "      (skipped: this host can still read a 000 file — usually root)"
+elif grep -q 'could not be READ' <<<"$_x14" && ! grep -qi 'permission denied' <<<"$_x14" \
+     && ! grep -q 'windows=TRUNCATED' <<<"$_x14"; then rc=0
+else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) an UNREADABLE window record asserts NO clip and leaks no shell 'Permission denied'" $rc
 
 # 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
 MUT_NOSAT2="$TMP/fns-nosat2.sh"

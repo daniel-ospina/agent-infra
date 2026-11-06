@@ -2903,21 +2903,28 @@ else
   # textual matching were each defeated by delegating one level deeper than the names it looked at — the
   # last one by a helper BETWEEN the stripper and the reference, which stayed GREEN with the graded view
   # literally BEING the reference (the "unify the copies" mistake, made transitive). So the reference is
-  # made UNAVAILABLE and the strip must still produce the same bytes: any delegation, indirect call or
-  # variable indirection through `_strip_ref` fails loudly as `command not found` and changes nothing.
-  # Residual, stated rather than implied: RENAMING the reference and moving every call site defeats this
-  # too — no test can see that, and it would be a deliberate act on a comment that says DO NOT do it.
+  # replaced by a SENTINEL and the strip must produce the same bytes: a delegation that SUCCEEDS prints
+  # `REF-USED` and is caught, whatever its depth, because the stub is what answers.
+  # Residual, stated rather than implied (two, both deliberate): RENAMING the reference and moving every
+  # call site defeats this, since no test can see a name it never reads; and a delegation whose OUTPUT is
+  # DISCARDED (into `/dev/null`, a captured-but-unused variable, or a helper that swallows it) leaves no
+  # sentinel in the graded bytes and is therefore out of scope — the check grades the BYTES the view is
+  # built from, not every call the shell could make.
   # ⛔ A SENTINEL STUB, NOT A REMOVAL (review P2, cycle 39). `unset -f` only reddens a delegation whose
   # FAILURE changes the bytes: a helper that prefers the reference and falls back to an equivalent copy
   # caught the `command not found` and produced identical output, so the property held while the graded
   # view literally WAS the reference — measured GREEN, with the ok line asserting a dependence that
   # existed. Replacing the reference with a stub makes a SUCCESSFUL delegation visible (it emits
   # `REF-USED`), while a failed one still cannot hide.
-  _wcode_nodep="$({ _strip_ref() { printf 'REF-USED\n'; }; _strip_comments < "$REFRESH"; } 2>&1)"
+  # ⛔ BOTH SIDES CAPTURED THE SAME WAY (review P3, cycle 40). `_WCODE` takes stdout only, so merging
+  # stderr here (`2>&1`) would make ANY benign warning from the strip look like a changed view and print
+  # "it reaches `_strip_ref` somewhere the names above did not" — a false accusation. The sentinel goes to
+  # stdout, so nothing is lost by comparing like with like.
+  _wcode_nodep="$({ _strip_ref() { printf 'REF-USED\n'; }; _strip_comments < "$REFRESH"; })"
   case "$_wcode_nodep" in
     *'REF-USED'*) bad "pin/writer: the strip CALLS \`_strip_ref\` — the reference answered with a sentinel, so the graded view is the REFERENCE and every predicate below it is a tautology" ;;
     *) if [ "$_wcode_nodep" = "$_WCODE" ]; then
-         ok "pin/writer: the strip produces IDENTICAL output when \`_strip_ref\` is replaced by a SENTINEL STUB — it genuinely does not call it, at any call depth"
+         ok "pin/writer: the strip produces IDENTICAL output when \`_strip_ref\` is replaced by a SENTINEL STUB — the graded view is not built from the reference, so the byte-equality below is not a comparison of the reference with itself (a delegation whose output is discarded is out of scope; said above)"
        else
          bad "pin/writer: the strip's output CHANGES when the reference is stubbed — it reaches \`_strip_ref\` somewhere the names above did not: '$(_diff_first "$_WCODE" "$_wcode_nodep")'"
        fi ;;

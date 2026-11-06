@@ -3962,7 +3962,7 @@ queue_order_refuse() {
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
 # silently inert, and a caller that skipped it would leave every assertion here green.
 queue_order_from_pool() {
-  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said _why_none
+  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said _sat_unread _why_none
   [ -n "$o" ] || return 1
   rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
   if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
@@ -4077,8 +4077,14 @@ queue_order_from_pool() {
   # ⛔ SANITISED, NOT ECHOED: only the three tier names are ever repeated, so a foreign or corrupt file
   # cannot inject text into an operator-facing line. An unreadable mix is disclosed as such rather than
   # printed. Absent file = no tier was truncated (the normal case) and no clause is added.
-  _sat=""; _sat_junk=0; _sat_tier=""
-  if [ -s "$o/.pool-sat" ]; then
+  _sat=""; _sat_junk=0; _sat_tier=""; _sat_unread=0
+  # ⛔ THE READ IS GUARDED, LIKE THE `.queue-rank` ONE ABOVE (review P3, cycle 40). Without `[ -r ]` the
+  # shell's own `Permission denied` lands on stderr above an otherwise honest operator line — the exact
+  # defect the comment twenty lines up documents — and the BLOCKED read was then classified as
+  # `unrecognised`, i.e. "no tier was clipped". An unreadable record is its own state and asserts nothing.
+  if [ -s "$o/.pool-sat" ] && [ ! -r "$o/.pool-sat" ]; then
+    _sat_unread=1
+  elif [ -s "$o/.pool-sat" ]; then
     while IFS= read -r _sat_tier; do
       case "$_sat_tier" in
         P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
@@ -4089,12 +4095,23 @@ queue_order_from_pool() {
     [ -n "$_sat" ] || _sat="unrecognised"
   fi
   _sat_said=""
-  if [ -n "$_sat" ]; then
-    _sat_said=" — windows=TRUNCATED($_sat): a tier window ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool and any of them that is queued sits in the unranked TAIL, behind every ranked row of every LOWER tier"
-    if [ "$_sat_junk" -eq 1 ]; then
-      _sat_said="$_sat_said (the window record also carried a line that is not a tier name — it is NOT repeated here)"
-    fi
-  fi
+  # ⛔ `unrecognised` DOES NOT ASSERT A CLIP (review P2, cycle 40). Cycle 39 moved the clip out of the
+  # `unranked` parenthetical but left `$_sat_said` on the SAME operator line still saying "a tier window
+  # ended FULL ... so that tier's NEWEST members are NOT in .pool" — a MEASURED clip, on the state whose
+  # whole meaning is "no recognised tier was recorded". Two distinct states share that word: junk lines
+  # in the record, and a record that could not be read at all. Neither may claim a clip, and the
+  # unreadable one may not be reduced to "no clip" either.
+  case "$_sat" in
+    "") [ "$_sat_unread" -eq 1 ] && _sat_said=" — the tier-window record EXISTED but could not be READ, so this pass measured no clip and asserts none" ;;
+    unrecognised)
+      if [ "$_sat_junk" -eq 1 ]; then
+        _sat_said=" — the tier-window record carried no tier name this code recognises, so NO clip is asserted and no tier is repeated here"
+      else
+        _sat_said=" — the tier-window record held nothing this code could classify, so NO clip is asserted"
+      fi ;;
+    *) _sat_said=" — windows=TRUNCATED($_sat): a tier window ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool and any of them that is queued sits in the unranked TAIL, behind every ranked row of every LOWER tier"
+       [ "$_sat_junk" -eq 1 ] && _sat_said="$_sat_said (the window record also carried a line that is not a tier name — it is NOT repeated here)" ;;
+  esac
   if [ -z "$_r" ] || [ -z "$_u" ]; then
     # ⛔ THE ORDER WAS DERIVED AND INSTALLED — ONLY THE COUNTS ARE UNKNOWN (review P2, cycle 10). This arm
     # said `priority-unreadable`, whose word for the ORDER is "UNVERIFIED (whatever the PREVIOUS pass
@@ -4201,7 +4218,11 @@ queue_order_from_pool() {
     # "the pass could not tell WHICH tier was clipped". Asserting a clip there is a claim the pass did not
     # take, on a corrupt/foreign record. Only a RECOGNISED tier name makes the clip a fact.
     case "$_sat" in
-      "") _why_none="no P0-blocker/P1-severe/P2-moderate row matched" ;;
+      "") if [ "$_sat_unread" -eq 1 ]; then
+            _why_none="no ranked row was left for this queue, and its tier-window record could not be read, so no cause is asserted"
+          else
+            _why_none="no P0-blocker/P1-severe/P2-moderate row matched"
+          fi ;;
       unrecognised) _why_none="no ranked row was left for this queue, and its window record names no tier this code recognises, so no cause is asserted" ;;
       *) _why_none="no ranked row was left for this queue — the $_sat tier window was clipped, so its newest members were never ranked at all" ;;
     esac
