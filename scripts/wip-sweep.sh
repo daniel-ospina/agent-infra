@@ -112,6 +112,26 @@ if [ -n "${BASH_SOURCE[0]:-}" ]; then
 fi
 
 err() { echo "wip-sweep: ⛔ $*" >&2; }
+
+# refuse_startup <pass-mode-exit> <message>
+# ⛔ ONE REFUSAL, TWO SURFACES (#3588 review, cycle 5 — this was a P0). A startup refusal used to silence
+# `--print-status` completely (exit 3 or 2 with NO `status=`/`rc=` line), and the first attempt at fixing
+# that moved the reader ABOVE the checks — after which it answered `status=ok rc=0` over a box whose sweep
+# refuses EVERY pass (`WIP_SWEEP_BUDGET=abc`, `WIP_SWEEP_MAX=abc`, a rescuer that does not exist, a library
+# pin that exists but is not the library). Both shapes are wrong in the same direction: the reader is a
+# consumer surface, so it must ANSWER on every path with a derived status/rc/detail — and it must never be
+# green over a box that cannot sweep. The checks therefore run once, below, before the reader; pass mode
+# keeps its own exit codes (2 usage, 3 refusal), and reader mode answers failed/3 with the cause.
+refuse_startup() {
+  if [ "${MODE:-sweep}" = status ]; then
+    printf 'status=failed\n'
+    printf 'rc=3\n'
+    printf 'detail=%s\n' "$2"
+    exit 3
+  fi
+  err "$2"
+  exit "$1"
+}
 note() { echo "wip-sweep: $*" >&2; }
 
 usage() {
@@ -126,7 +146,7 @@ REPOS=()
 
 need_int() { # need_int <name> <value> — a bound that does not parse is a REFUSAL, never "unbounded"
   case "$2" in
-    ''|*[!0-9]*) err "$1 is not a non-negative integer: '$2' (an unparseable bound must never mean 'no bound')"; exit 2 ;;
+    ''|*[!0-9]*) refuse_startup 2 "$1 is not a non-negative integer: '$2' (an unparseable bound must never mean 'no bound')" ;;
   esac
 }
 # need_pos_int <name> <value> — the WATCHDOG bounds, where `0` is NOT a disable.
@@ -139,7 +159,7 @@ need_int() { # need_int <name> <value> — a bound that does not parse is a REFU
 # else must be a real bound.
 need_pos_int() {
   need_int "$1" "$2"
-  [ "$2" -gt 0 ] 2>/dev/null || { err "$1 must be greater than 0: '$2' (0 is only a disable for --max and WIP_SWEEP_BUDGET; for a watchdog or a staleness window it silently removes the bound)"; exit 2; }
+  [ "$2" -gt 0 ] 2>/dev/null || refuse_startup 2 "$1 must be greater than 0: '$2' (0 is only a disable for --max and WIP_SWEEP_BUDGET; for a watchdog or a staleness window it silently removes the bound)"
 }
 
 while [ $# -gt 0 ]; do
@@ -259,34 +279,80 @@ RESCUE_TIMEOUT="${WIP_SWEEP_RESCUE_TIMEOUT:-300}"
 # ONE implementation, because the reader now asks the same question the pass does: a box with no library
 # cannot sweep, so the reader must say so rather than silently answer about an older record.
 bounded_lib_path() {
+  local cand=""
   if [ -n "${WIP_SWEEP_BOUNDED_LIB:-}" ]; then
-    printf '%s' "$WIP_SWEEP_BOUNDED_LIB"
-    [ -f "$WIP_SWEEP_BOUNDED_LIB" ]
-    return $?
+    cand="$WIP_SWEEP_BOUNDED_LIB"
+  elif [ -n "${SELF_DIR:-}" ] && [ -f "$SELF_DIR/lib/bounded.sh" ]; then
+    cand="$SELF_DIR/lib/bounded.sh"
+  elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh" ]; then
+    cand="$HOME/.pi/agent/scripts/lib/bounded.sh"
+  else
+    return 1
   fi
-  if [ -n "${SELF_DIR:-}" ] && [ -f "$SELF_DIR/lib/bounded.sh" ]; then printf '%s' "$SELF_DIR/lib/bounded.sh"; return 0; fi
-  if [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/lib/bounded.sh" ]; then printf '%s' "$HOME/.pi/agent/scripts/lib/bounded.sh"; return 0; fi
-  return 1
+  # ⛔ EXISTENCE IS NOT USABILITY (#3588 review, cycle 5). `[ -f … ]` blessed a WRONG pin that exists — a
+  # truncated or empty farm copy, `bounded.sh.bak`, another repo's file — while pass mode refuses at
+  # `tb_resolve_timeout` every single pass. The check is the one pass mode actually makes: source it in a
+  # subshell and require the resolver to succeed there. A pin that exists but does not work is a refusal,
+  # named, never a green.
+  # ⛔ THE PROBE PRINTS ITS OWN EVIDENCE, because a sourced file can `exit 0` on the way through and a
+  # bare `( . "$cand" && tb_resolve_timeout )` then returns that 0 before the resolver is ever asked —
+  # measured with a stub that exists and exits 0: the check passed and the box read as sweepable.
+  local probe=""
+  probe="$(bash -c '. "$1" >/dev/null 2>&1; if command -v tb_resolve_timeout >/dev/null 2>&1 && tb_resolve_timeout >/dev/null 2>&1; then printf USABLE; fi' _ "$cand" 2>/dev/null)"
+  [ "$probe" = USABLE ] || return 1
+  printf '%s' "$cand"
+  return 0
 }
+
+# ── the bounded-execution helper — REFUSED when missing, never a silent different file ───────────
+# Every subprocess below is bounded: `git status` on a 179 GB worktree and a `git push` to a remote
+# that has stopped answering are both unbounded by nature, and this pass is what a cell quiesce calls
+# BEFORE the box is destroyed — a hang here is a box that never finishes dying.
+if ! BOUNDED_LIB="$(bounded_lib_path)"; then
+  refuse_startup 3 "no USABLE scripts/lib/bounded.sh (looked at \$WIP_SWEEP_BOUNDED_LIB='${WIP_SWEEP_BOUNDED_LIB:-}', ${SELF_DIR:-<no script dir>}/lib, \$HOME/.pi/agent/scripts/lib) — REFUSING: an unbounded sweep is worse than none. Farm it: bash pi-bootstrap/setup.sh"
+fi
+# shellcheck source=/dev/null
+. "$BOUNDED_LIB" || refuse_startup 3 "cannot source $BOUNDED_LIB"
+# An INHERITED pin is the caller's; an absent one is "no pin", not an unbound-variable abort under -u.
+TB_TIMEOUT_BIN="${TB_TIMEOUT_BIN:-}"
+if ! tb_resolve_timeout; then
+  refuse_startup 3 "no usable watchdog for bounded execution (TB_TIMEOUT_BIN='${TB_TIMEOUT_BIN:-}') — REFUSING"
+fi
+TB_TIMEOUT_KIND="${TB_TIMEOUT_KIND:-unknown}"
+
+BUDGET="${WIP_SWEEP_BUDGET:-900}"
+need_int WIP_SWEEP_BUDGET          "$BUDGET"
+need_pos_int WIP_SWEEP_STATUS_TIMEOUT  "$STATUS_TIMEOUT"
+need_pos_int WIP_SWEEP_RESCUE_TIMEOUT  "$RESCUE_TIMEOUT"
+need_pos_int WIP_SWEEP_STALE_SECONDS   "$STALE_SECONDS"
+need_int WIP_SWEEP_MAX             "$MAX"
+
+
+
+# ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
+RESCUE="${WIP_SWEEP_RESCUE:-}"
+if [ -n "$RESCUE" ]; then
+  [ -f "$RESCUE" ] || refuse_startup 3 "WIP_SWEEP_RESCUE=$RESCUE does not exist — REFUSING (a pin that is wrong must be named, not ignored)"
+elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bg-rescue-wip.sh" ]; then
+  RESCUE="$SELF_DIR/bg-rescue-wip.sh"
+elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh" ]; then
+  RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
+fi
+# ⛔ A MISSING RESCUER MUST NEVER READ AS "NOTHING TO RESCUE". This is the same rule
+# `spawn-gate.sh`'s rescue seam already enforces (`rescue=UNAVAILABLE`, never `rescue=nothing`): the
+# absence of the tool says nothing about the state of the worktrees, so this REFUSES.
+if [ -z "$RESCUE" ]; then
+  refuse_startup 3 "bg-rescue-wip.sh not found or not a file (looked at \$WIP_SWEEP_RESCUE='${WIP_SWEEP_RESCUE:-}', ${SELF_DIR:-<no script dir>}, \$HOME/.pi/agent/scripts) — REFUSING: without it this sweep cannot archive anything, and a sweep that cannot archive is NOT 'nothing to rescue'."
+fi
 
 # ── --print-status: answer "did the last pass run, and what did it find" from the RECORD alone ────
 # Same polarity as `disk-reaper.sh --print-status`: `never` and `stale` are NOT success, because a
 # sweeper that has not run is a box whose WIP is on the disk and nowhere else.
 if [ "$MODE" = status ]; then
-  # The three seams this reader depends on, validated with pass mode's own rules (exit 2, a config error).
-  need_pos_int WIP_SWEEP_STALE_SECONDS  "$STALE_SECONDS"
-  need_pos_int WIP_SWEEP_STATUS_TIMEOUT "$STATUS_TIMEOUT"
-  need_pos_int WIP_SWEEP_RESCUE_TIMEOUT "$RESCUE_TIMEOUT"
-  # ⛔ A BOX WITH NO BOUNDED LIBRARY CANNOT SWEEP, SO THE READER ANSWERS **AND** REFUSES. It prints the
-  # derived surface a consumer keys on (`status=`, `rc=`, `detail=` naming the cause) instead of exiting
-  # from the library resolution with no output at all — the shape that made a broken box look like a
-  # silent tool.
-  if ! R_LIB="$(bounded_lib_path)"; then
-    echo "status=failed"
-    echo "rc=3"
-    echo "detail=no scripts/lib/bounded.sh (WIP_SWEEP_BOUNDED_LIB='${WIP_SWEEP_BOUNDED_LIB:-}', SELF_DIR='${SELF_DIR:-}', HOME='${HOME:-}') — this box cannot sweep"
-    exit 3
-  fi
+  # ⛔ EVERY STARTUP CHECK HAS ALREADY RUN ABOVE (library resolution and usability, the four bounds, the
+  # rescuer) and each one answers through `refuse_startup` — so reaching this line means this box CAN
+  # sweep, and the only question left is what the last pass found. That is what makes the answer safe to
+  # be `ok`: the green below is never printed over a box whose sweep would refuse.
   if [ ! -f "$STATUS_FILE" ]; then
     # rc= IS PART OF THE DOCUMENTED SURFACE TOO (review finding). A consumer keyed on the derived
     # `rc=` — the reader shape I7c exists for — found NO value at all on a never-run box (a fresh cell,
@@ -362,50 +428,6 @@ if [ "$MODE" = status ]; then
   esac
 fi
 
-
-# ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
-RESCUE="${WIP_SWEEP_RESCUE:-}"
-if [ -n "$RESCUE" ]; then
-  [ -f "$RESCUE" ] || { err "WIP_SWEEP_RESCUE=$RESCUE does not exist — REFUSING"; exit 3; }
-elif [ -n "$SELF_DIR" ] && [ -f "$SELF_DIR/bg-rescue-wip.sh" ]; then
-  RESCUE="$SELF_DIR/bg-rescue-wip.sh"
-elif [ -f "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh" ]; then
-  RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
-fi
-# ── the bounded-execution helper — REFUSED when missing, never a silent different file ───────────
-# Every subprocess below is bounded: `git status` on a 179 GB worktree and a `git push` to a remote
-# that has stopped answering are both unbounded by nature, and this pass is what a cell quiesce calls
-# BEFORE the box is destroyed — a hang here is a box that never finishes dying.
-if ! BOUNDED_LIB="$(bounded_lib_path)"; then
-  err "no scripts/lib/bounded.sh (looked at \$WIP_SWEEP_BOUNDED_LIB='${WIP_SWEEP_BOUNDED_LIB:-}', ${SELF_DIR:-<no script dir>}/lib, \$HOME/.pi/agent/scripts/lib) — REFUSING: an unbounded sweep is worse than none. Farm it: bash pi-bootstrap/setup.sh"
-  exit 3
-fi
-# shellcheck source=/dev/null
-. "$BOUNDED_LIB" || { err "cannot source $BOUNDED_LIB"; exit 3; }
-# An INHERITED pin is the caller's; an absent one is "no pin", not an unbound-variable abort under -u.
-TB_TIMEOUT_BIN="${TB_TIMEOUT_BIN:-}"
-if ! tb_resolve_timeout; then
-  err "no usable watchdog for bounded execution (TB_TIMEOUT_BIN='${TB_TIMEOUT_BIN:-}') — REFUSING"
-  exit 3
-fi
-TB_TIMEOUT_KIND="${TB_TIMEOUT_KIND:-unknown}"
-
-BUDGET="${WIP_SWEEP_BUDGET:-900}"
-need_int WIP_SWEEP_BUDGET          "$BUDGET"
-need_pos_int WIP_SWEEP_STATUS_TIMEOUT  "$STATUS_TIMEOUT"
-need_pos_int WIP_SWEEP_RESCUE_TIMEOUT  "$RESCUE_TIMEOUT"
-need_pos_int WIP_SWEEP_STALE_SECONDS   "$STALE_SECONDS"
-need_int WIP_SWEEP_MAX             "$MAX"
-
-
-
-# ⛔ A MISSING RESCUER MUST NEVER READ AS "NOTHING TO RESCUE". This is the same rule
-# `spawn-gate.sh`'s rescue seam already enforces (`rescue=UNAVAILABLE`, never `rescue=nothing`): the
-# absence of the tool says nothing about the state of the worktrees, so this REFUSES.
-if [ -z "$RESCUE" ]; then
-  err "bg-rescue-wip.sh not found (looked at \$WIP_SWEEP_RESCUE, ${SELF_DIR:-<no script dir>}, \$HOME/.pi/agent/scripts) — REFUSING: without it this sweep cannot archive anything, and a sweep that cannot archive is NOT 'nothing to rescue'."
-  exit 3
-fi
 
 # ── repos ────────────────────────────────────────────────────────────────────────────────────────
 # ⛔ NO AMBIENT-`$REPO` DEFAULT, DELIBERATELY. `$REPO` is a generic name the cell supervisor and the
