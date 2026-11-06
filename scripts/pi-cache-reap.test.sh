@@ -1011,12 +1011,15 @@ echo "── 10c. portability pins (the launchd clock is macOS) ──"
 # The arms below still pin ONE probe shape in the reaper (the `box_mtime` family idiom) so a
 # second, differently-shaped mtime read cannot drift in; keep them about the shape, not about a
 # portability claim that has been falsified.
-# ⛔ BOTH ARMS READ THE EXECUTED VIEW — `grep -v '^[[:space:]]*#'`, not `grep -v '^#'` and never
-# `cat`. A column-0-only strip leaves an INDENTED comment in the view, and `cat` leaves every
-# comment in it: either way a comment alone satisfies an arm, which is a false PASS on the one
-# thing these two lines exist to pin (agent-infra#3509 review, measured).
-assert_not_contains "$(grep -v '^[[:space:]]*#' "$REAPER")" 'date -r' "the reaper keeps a SINGLE probe shape — no second 'date -r' mtime read in EXECUTED code"
-assert_contains "$(grep -v '^[[:space:]]*#' "$REAPER")" 'stat -f %m' "mtime is read with the family's portable stat idiom (in EXECUTED code)"
+# ⛔ BOTH ARMS READ THE EXECUTED VIEW — full-line AND trailing comments stripped, not `grep -v '^#'`
+# and never `cat`. A column-0-only strip leaves an INDENTED comment in the view; `cat` leaves every
+# comment; and a full-line-only strip still leaves a TRAILING one (this suite's own arms sit beside
+# prose). In each case a comment alone satisfies an arm, which is a false PASS on the one thing these
+# two lines exist to pin (agent-infra#3509 review, measured: a GNU-only `stat -c` probe carrying a
+# trailing `# … date -r …` passed both arms).
+reaper_executed_view() { sed 's/[[:space:]]#.*$//' "$REAPER" | grep -v '^[[:space:]]*#'; }
+assert_not_contains "$(reaper_executed_view)" 'date -r' "the reaper keeps a SINGLE probe shape — no second 'date -r' mtime read in EXECUTED code"
+assert_contains "$(reaper_executed_view)" 'stat -f %m' "mtime is read with the family's portable stat idiom (in EXECUTED code)"
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

@@ -506,6 +506,11 @@ ps_matches() {
 # and prints `sb.st_mtim`; its usage string is `[-r filename|seconds]`. FreeBSD's
 # `bin/date/date.c:131-143` does the same for a non-empty path (the two differ only on an EMPTY
 # argument — Apple reads it as 0 seconds, FreeBSD `usage()`s — which no call site here produces).
+# ⛔ AND it is only correct for a path that does NOT parse as a number: `strtoq` succeeds on an
+# all-digits argument, so `*tmp == 0` takes the SECONDS branch and the `stat()` fallback is skipped
+# entirely. A bare numeric relative path (e.g. a log named `1793955620` in cwd) therefore reads that
+# epoch instead of the file's mtime ON MACOS ONLY, while GNU treats it as `--reference=FILE`. Every
+# call site here passes a full `$LOCK`/`$LOG` path, so this is a qualification, not a live bug.
 # `date -r <path> +%s` is therefore correct on BOTH GNU and BSD, and
 # `admin-merge.sh:7988-8003` (`path_mtime`) relies on exactly that. (`scripts/orchestrator-harness/
 # auto-rail.sh` uses the GNU-first `stat` spelling instead; both are portable, and neither is

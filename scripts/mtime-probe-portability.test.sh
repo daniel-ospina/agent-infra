@@ -55,12 +55,16 @@ done
 T="$(mktemp -d "${TMPDIR:-/tmp}/mtime-probe-portability.XXXXXX")"
 trap 'rm -rf "$T"' EXIT
 
-# ⛔ THE EXECUTED VIEW IS `grep -v '^[[:space:]]*#'`, NOT `grep -v '^#'`. A
-# COLUMN-0-only strip leaves an INDENTED comment in the view — and the probe in
-# `lane-scan-fallback.sh` sits inside an `if`, so a comment written next to it is
-# indented by construction. Measured: an indented `# … date -r …` over a probe
-# replaced with a non-`date -r` reader passed BOTH arms under the old strip.
-executed_view() { grep -v '^[[:space:]]*#' "$1"; }
+# ⛔ THE EXECUTED VIEW DROPS *FULL-LINE AND TRAILING* COMMENTS — never `cat`, and never a
+# column-0-only strip. Three ways a comment alone satisfies a positive arm, all measured:
+#   * `grep -v '^#'`  — leaves INDENTED comments (the probe in `lane-scan-fallback.sh` sits inside
+#     an `if`, so a comment written next to it is indented by construction);
+#   * `grep -v '^[[:space:]]*#'` — still leaves a TRAILING comment. `MTIME="$(stat -c %Y "$LOG")"
+#     \  # equivalently: date -r "$LOG" +%s` carried `date -r` in its view and passed 16/16 while
+#     being GNU-only, i.e. the one defect these arms exist to catch;
+#   * `cat` — leaves every comment.
+# So: strip trailing comments FIRST, then drop what remains that is a full-line comment.
+executed_view() { sed 's/[[:space:]]#.*$//' "$1" | grep -v '^[[:space:]]*#'; }
 
 echo
 echo "── executed-view pins (the rationale MAY name the trap; executed code may not) ──"
@@ -117,8 +121,16 @@ mkdir -p "$LH/.pi/agent/state/lane-scan-fallback.lock"
 HOME="$LH" bash "$LANE_SCAN" >/dev/null 2>&1; rc=$?
 LLOG="$LH/.pi/agent/state/orchestrator-heartbeat.log"
 assert_eq "$rc" 0 "a FRESH lock exits 0 (the age was computable)"
-assert_contains "$(cat "$LLOG" 2>/dev/null)" 'already running (lock 0s old)' \
-    "the lock age is computed as a real number (0s), not a filesystem block"
+# ⛔ BOUNDED, not exact. The lock is created immediately before this call, so the true age is 0s —
+# but a runner whose bash startup crosses a second boundary legitimately reports 1s (STALE_LOCK_S is
+# 900, so 1s is still "fresh"). Pinning the literal `0s` reds intermittently on a loaded box —
+# measured 2/200 direct runs, deterministic under `sleep 1.2` — which is a flaky pin, not a stricter
+# one. What must be pinned is that the age is a COMPUTED SMALL NUMBER and not a filesystem block.
+if grep -Eq 'already running \(lock [0-9]{1,2}s old\)' "$LLOG" 2>/dev/null; then
+    ok "the lock age is a computed number (0-99s), not a filesystem block"
+else
+    bad "the lock age is a computed number (0-99s), not a filesystem block (missing: already running (lock <N>s old))"
+fi
 assert_not_contains "$(cat "$LLOG" 2>/dev/null)" 'unbound variable' \
     "the lock age arithmetic did not die"
 
