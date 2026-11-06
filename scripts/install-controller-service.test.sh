@@ -39,6 +39,13 @@
 #       a second supervisor is a second dispatcher), no service manager at all, a bad RestartSec, and
 #       an unresolved template token. Plus idempotency: a second install changes nothing, and a second
 #       uninstall is a reported no-op.
+#   §P  the ExecStart must OUTLIVE the shell that rendered it (#2697): a scratch root (a lane worktree,
+#       a temp dir no deployment root declares) is REFUSED before anything is written, and the refusal
+#       names the durable alternative — while the shape the cells really run (a harness pin under the
+#       cell home, a farmed copy, an explicit ORCH_SUPERVISOR) stays green, because a blanket "under
+#       /tmp" rule would block every cell bring-up. §P2 grades the RESOLVED path (a symlink onto a
+#       scratch tree is refused, one onto a durable tree is not), and §P3 pins the revision the unit
+#       runs into its environment so `merged ≠ running` is readable from `systemctl show`/`--status`.
 #
 # Hermetic: temp HOME/state/unit dirs, stub `systemctl`/`tmux` that RECORD their argv (so "did it call
 # start/stop" is answered by evidence, not by the absence of an error), a stub supervisor built from
@@ -106,15 +113,26 @@ bnd() { timeout "$BOUND" "$@"; }
 # ── per-arm fixture ──────────────────────────────────────────────────────────────────────────────
 # Each arm gets its OWN state dir, so a pid left by one arm can never be read as evidence by another
 # (the supervisor's ownership reads are path-scoped, and a shared $O would make them cross-talk).
+# ⛔ EVERY ARM IS HANDED A FARMED SUPERVISOR, LIKE A REAL CELL (agent-infra#2697). The installer now
+# REFUSES to render an ExecStart under a temporary root unless the path is inside a root the box DECLARES
+# (its cell home, its home, or $AGENT_INFRA_PATH) — because a lane worktree under /tmp is exactly the
+# measured defect and `$SUP` (this checkout) may itself live in one. So the fixture FARMS the shipped
+# supervisor into its own CELL_HOME, which is both the real deployment surface and the durable root the
+# arm then asserts on. It is a COPY, never a symlink: the installer grades the RESOLVED path, so a symlink
+# back into a worktree is (correctly) refused — §P4 pins that.
 arm_root() { # <name> -> echoes the root
   local r="$T/$1"
-  mkdir -p "$r/home" "$r/o" "$r/repo" "$r/harness" "$r/units" "$r/state" "$r/bin"
+  mkdir -p "$r/home" "$r/o" "$r/repo" "$r/harness" "$r/units" "$r/state" "$r/bin" \
+           "$r/home/.pi/agent/scripts"
+  cp -f "$SUP" "$r/home/.pi/agent/scripts/cloud-cell-supervisor.sh" 2>/dev/null || true
   if [ ! -d "$r/repo/.git" ]; then
     git init -q "$r/repo" 2>/dev/null
     git -C "$r/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
   fi
   printf '%s\n' "$r"
 }
+# farmed_sup <arm root> — the supervisor this fixture's HOME farms (the installer's 2nd candidate).
+farmed_sup() { printf '%s\n' "$1/home/.pi/agent/scripts/cloud-cell-supervisor.sh"; }
 
 # ── ⛔ NO TEST MAY REACH THE REAL SYSTEM THROUGH AN UNSTUBBED NAME (#2910) ───────────────────────
 # THE DEFECT THIS PRELUDE EXISTS FOR. §B and §F execute a SLICE of `cloud-cell-supervisor.sh` in a
@@ -233,9 +251,15 @@ inst() {
   # root login installed a root-owned, enabled, unusable unit). This suite runs on root runners too, so the
   # fixture carries the same explicit opt-in an operator would; the one arm that must SEE the refusal
   # (`§G`, root is refused) runs `inst` with `EXTRA_ENV` unsetting it, so the rule is exercised, not bypassed.
-  bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
+  # ⛔ AND THE DEPLOYMENT ROOT IS PINNED TOO, BECAUSE #2697's GUARD READS IT (agent-infra#2697). The ExecStart
+  # refusal accepts a temporary-root path only when the path is inside a root this box DECLARES — its CELL_HOME,
+  # its HOME, or `$AGENT_INFRA_PATH`. An ambient `AGENT_INFRA_PATH` (every cell exports one; this box has one)
+  # would therefore decide a §P verdict from OUTSIDE the fixture. Pinned to a path that does not exist, so the
+  # only roots in play are the fixture's own — exactly what a hermetic arm needs.
+  bnd env SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
       CONTROLLER_SYSTEM_UNIT_DIR="$r/units" CONTROLLER_USER_UNIT_DIR="$r/nouser" CONTROLLER_ALLOW_ROOT=1 \
       TEMPLATES_DIR="${TPL_DIR:-$(dirname "$TPL")}" HOME="$r/home" CELL_HOME="$r/home" \
+      AGENT_INFRA_PATH="$r/layer" \
       ENV_FILE="$r/home/keys.env" O="$r/o" PATH="$r/bin:$PATH" ELDATO_PLATFORM="${PLATFORM:-Linux}" \
       ${EXTRA_ENV:-} bash "$INST" "$@"
 }
@@ -288,8 +312,11 @@ if [ -f "$UNIT" ]; then
   u 'Environment=CONTROLLER_UNIT=eldato-orchestrator.service' \
     && ok 'the unit CARRIES its own name — the supervisor reads it, so every verb addresses THIS unit' \
     || bad 'the unit does not render CONTROLLER_UNIT — the verbs address a default name instead ($UNIT)'
-  u "ExecStart=/bin/bash $SUP start" && ok "ExecStart runs the shipped supervisor's start" \
-    || bad "ExecStart does not name the shipped supervisor ($SUP)"
+  # ⛔ THE FARMED COPY, NOT $SUP (agent-infra#2697): the fixture farms the shipped supervisor into its own
+  # CELL_HOME (see `arm_root`) because the installer refuses an ExecStart under a temporary root no deployment
+  # root declares — and $SUP is this checkout, which may itself be a lane worktree. The bytes are identical.
+  u "ExecStart=/bin/bash $(farmed_sup "$A") start" && ok "ExecStart runs the supervisor's start" \
+    || bad "ExecStart does not name the farmed supervisor ($(farmed_sup "$A"))"
   u "User=$(id -un)" && ok 'the service runs as the invoking user, not root' \
     || bad "User= is not the invoking user ($(id -un))"
   # The tmux path passes `O='$O'` explicitly, so the unit must carry it too: the supervisor sources
@@ -374,7 +401,7 @@ chmod +x "$US/bin/loginctl"
 # SUDO=false makes the system probe fail, so the walk reaches the user manager (the stub answers
 # `--user show-environment`). SYSTEMD_UNIT_DIR is NOT set: it would pin the override target instead.
 UU_RC=0
-UU_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
+UU_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
           ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || UU_RC=$?
@@ -422,7 +449,7 @@ esac
 printf '%s\n' '#!/bin/bash' 'case "$*" in *Linger*) printf "no\n" ;; *) exit 0 ;; esac' > "$US/bin/loginctl"
 chmod +x "$US/bin/loginctl"
 rm -f "$UUNIT"
-UL_RC=0; UL_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
+UL_RC=0; UL_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
           ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || UL_RC=$?
@@ -964,7 +991,7 @@ esac
 printf '%s\n' '#!/bin/bash' 'exit 1' > "$G/bin/systemctl-fail"; chmod +x "$G/bin/systemctl-fail"
 mkdir -p "$G/nobin"; ln -sf "$G/bin/systemctl-fail" "$G/nobin/systemctl"
 GN_RC=0
-GN_OUT="$(bnd env SUDO=false SYSTEMCTL="$G/bin/systemctl-fail" ORCH_SUPERVISOR="$SUP" \
+GN_OUT="$(bnd env SUDO=false SYSTEMCTL="$G/bin/systemctl-fail" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$G/home" CELL_HOME="$G/home" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 PATH="$G/nobin:/usr/bin:/bin" bash "$INST" --install 2>&1)" || GN_RC=$?
 [ "$GN_RC" -ne 0 ] && ok 'install: refuses when NO service manager is available (never a silent no-op)' \
@@ -988,7 +1015,7 @@ mkdir -p "$G/tpl"; cp "$TPL" "$G/tpl/eldato-orchestrator.service"
 { printf 'Description={{NOPE}}\n'; grep -v '^Description=' "$TPL"; } > "$G/tpl/mutant.tmp"
 mv -f "$G/tpl/mutant.tmp" "$G/tpl/eldato-orchestrator.service"
 GT_RC=0
-GT_OUT="$(bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$G/bin/systemctl" SYSTEMD_UNIT_DIR="$G/units" \
+GT_OUT="$(bnd env SYSTEMCTL="$G/bin/systemctl" SYSTEMD_UNIT_DIR="$G/units" \
           TEMPLATES_DIR="$G/tpl" HOME="$G/home" CELL_HOME="$G/home" PATH="$G/bin:/usr/bin:/bin" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || GT_RC=$?
 [ "$GT_RC" -ne 0 ] && ok 'install: refuses a template with an unresolved token' \
@@ -2672,6 +2699,214 @@ esac
 case "$FRAG_SYSTEM_CALLS" in
   *say*open*osascript*afplay*) ok '§O: the recorder covers the other macOS binaries a fragment could reach (open/osascript/afplay), not just `say`' ;;
   *) bad "§O: a fragment could still reach a system binary unrecorded — FRAG_SYSTEM_CALLS='$FRAG_SYSTEM_CALLS' (#2910)" ;;
+esac
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# §P — the ExecStart must OUTLIVE the shell that rendered it (agent-infra#2697)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE DEFECT. The only guard on the rendered ExecStart was `[ -f "$SUPERVISOR" ]` AT RENDER TIME, so the
+# installer pinned the fleet's dispatcher to whatever checkout the operator happened to run `--install`
+# from. MEASURED on cell-1: `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start` —
+# a LANE WORKTREE at an unmerged branch. Once that path goes, the unit's ExecStart cannot resolve,
+# `Restart=always` retries a 127 for ever, `is-active` reads `activating`, and nothing pages: an
+# inert-enforcer that reads as supervised on every surface. MEASURED again on cell-4 as a TEST render
+# installed as the real unit (`ExecStart=… "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r" --dry-run`).
+#
+# ⛔ THE ARMS BELOW ARE PAIRED IN BOTH DIRECTIONS, WHICH IS THE WHOLE POINT: a guard that refused every
+# temporary path would pass the refusal arms and be a FALSE BLOCK on every cell — the cells keep their HOME
+# (`/tmp/cell-home`) and their harness pin (`/tmp/cell-home/harness/<sha>/…`, the shape cell-3 measured as
+# CORRECT) under /tmp. So each refusal arm has a control that must stay green.
+say_case 'install refuses an ExecStart that a cleaning removes, and keeps the roots a cell really uses'
+P="$(arm_root p)"; mk_systemctl "$P/bin" "$P/state" "$P/sc.log"; mk_tmux "$P/bin" "$P/tmux.log"
+# The measured shape: a real supervisor file, under a temp root that no deployment root declares.
+SCRATCH_P="$T/wt-p-fixture/scripts"; mkdir -p "$SCRATCH_P"
+cp "$SUP" "$SCRATCH_P/cloud-cell-supervisor.sh"
+P_OUT=""; P_RC=0
+P_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P_RC=$?
+[ "$P_RC" -ne 0 ] && ok '§P: a scratch-root supervisor (the /tmp/wt-* shape) is REFUSED' \
+                  || bad "§P: installed a unit whose ExecStart a tmp cleaner removes — the #2697 defect, re-shipped: $P_OUT"
+case "$P_OUT" in
+  *"$SCRATCH_P/cloud-cell-supervisor.sh"*) ok '§P: the refusal NAMES the offending path (an operator can see what was rejected)' ;;
+  *) bad "§P: the refusal does not name the rejected path — $P_OUT" ;;
+esac
+case "$P_OUT" in
+  *'.pi/agent/scripts/cloud-cell-supervisor.sh'*) ok '§P: the refusal names the durable alternative (the farm)' ;;
+  *) bad "§P: the refusal does not say where a DURABLE supervisor would be — an operator is left with no remedy: $P_OUT" ;;
+esac
+[ ! -f "$P/units/eldato-orchestrator.service" ] \
+  && ok '§P: and NOTHING was written — the refusal is fail-closed, not a half-install' \
+  || bad '§P: a refused install still left a unit file behind — a boot-armed path a cleaning removes'
+# ⛔ THE NEGATIVE CONTROL THAT MAKES THE ARM MEAN SOMETHING: the SAME bytes, under a root the box declares.
+DURABLE_P="$P/home/scripts"; mkdir -p "$DURABLE_P"
+cp "$SUP" "$DURABLE_P/cloud-cell-supervisor.sh"
+P2_RC=0; P2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$DURABLE_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P2_RC=$?
+[ "$P2_RC" -eq 0 ] && ok '§P: the SAME supervisor under the cell home INSTALLS (the refusal is the root, not the file)' \
+                   || bad "§P: refused a durable supervisor — the guard is a false block on the shape a cell uses: $P2_OUT"
+grep -qxF "ExecStart=/bin/bash $DURABLE_P/cloud-cell-supervisor.sh start" "$P/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P: and the unit names that durable path, resolved' \
+  || bad '§P: the installed unit does not name the durable supervisor that was graded'
+# ⛔ A LANE WORKTREE IS REFUSED WHEREVER IT LIVES — including under a root the box DECLARES, which is the
+# other half of the measured class (a lane's worktree under $HOME is deleted when the lane ends).
+WT_P="$P/home/agent-infra/.worktrees/lane-2697/scripts"; mkdir -p "$WT_P"
+cp "$SUP" "$WT_P/cloud-cell-supervisor.sh"
+rm -f "$P/units/eldato-orchestrator.service"
+P3_RC=0; P3_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$WT_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P3_RC=$?
+[ "$P3_RC" -ne 0 ] && ok '§P: a .worktrees/ supervisor is REFUSED even inside the cell home' \
+                   || bad "§P: installed from a lane worktree — the measured #2697 shape, one directory deeper: $P3_OUT"
+case "$P3_OUT" in
+  *'lane worktree'*) ok '§P: and the refusal says it is a lane worktree (not merely "under /tmp")' ;;
+  *) bad "§P: the .worktrees refusal does not name the reason — $P3_OUT" ;;
+esac
+# ⛔ THE PREVIEW VERB REFUSES TOO: `--dry-run` is how an operator inspects a render before arming it, so a
+# preview that printed a scratch ExecStart would be the instruction to install one.
+rm -f "$P/units/eldato-orchestrator.service"    # so the two assertions below are about THIS arm, not P2's unit
+P5_RC=0; P5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst p --dry-run 2>&1)" || P5_RC=$?
+[ "$P5_RC" -ne 0 ] && ok '§P: --dry-run refuses the same render (a preview never prints an unarmable ExecStart)' \
+                   || bad "§P: --dry-run printed a scratch ExecStart without refusing — $P5_OUT"
+[ ! -f "$P/units/eldato-orchestrator.service" ] \
+  && ok '§P: and the dry run wrote nothing' || bad '§P: --dry-run wrote a unit'
+
+# ── §P2 — a SYMLINK is a spelling, and the guard grades what it resolves to ───────────────────────
+# ⛔ THE MEASURED ESCAPE THIS ARM EXISTS FOR IS #2666's: `ln -s <refused dir> $T/alias` was ADMITTED by a
+# literal comparison. The ExecStart guard has the same shape, so a durable-LOOKING link into a scratch tree
+# must be refused, AND a link onto a durable tree must still be admitted — otherwise the arm would pass by
+# refusing every symlink, which is a false block on a farmed or pinned layout.
+say_case 'a symlinked supervisor is graded by where it RESOLVES, not by how it is spelled'
+PS="$(arm_root ps)"; mk_systemctl "$PS/bin" "$PS/state" "$PS/sc.log"; mk_tmux "$PS/bin" "$PS/tmux.log"
+PS_SCRATCH="$T/wt-ps-fixture/scripts"; mkdir -p "$PS_SCRATCH"
+cp "$SUP" "$PS_SCRATCH/cloud-cell-supervisor.sh"
+mkdir -p "$PS/home/scripts"; cp "$SUP" "$PS/home/scripts/cloud-cell-supervisor.sh"
+ln -s "$PS_SCRATCH/cloud-cell-supervisor.sh" "$PS/home/scripts/alias.sh"    # durable NAME, scratch TARGET
+ln -s "$PS/home/scripts/cloud-cell-supervisor.sh" "$PS/home/scripts/good.sh" # durable name AND target
+PS_RC=0; PS_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PS/home/scripts/alias.sh" inst ps --install 2>&1)" || PS_RC=$?
+[ "$PS_RC" -ne 0 ] && ok '§P2: a symlink whose TARGET is scratch is REFUSED (resolution, not spelling)' \
+                   || bad "§P2: a durable-looking symlink into a scratch tree was ADMITTED — the #2666 escape, re-shipped: $PS_OUT"
+case "$PS_OUT" in
+  *"$PS_SCRATCH/cloud-cell-supervisor.sh"*) ok '§P2: the refusal names the RESOLVED path, so the operator can see the real target' ;;
+  *) bad "§P2: the refusal names the spelling instead of the resolved target — $PS_OUT" ;;
+esac
+PS2_RC=0; PS2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PS/home/scripts/good.sh" inst ps --install 2>&1)" || PS2_RC=$?
+[ "$PS2_RC" -eq 0 ] && ok '§P2: a symlink onto a durable tree is still ADMITTED (no blanket refusal of links)' \
+                   || bad "§P2: refused a durable symlinked supervisor — false block: $PS2_OUT"
+grep -qxF "ExecStart=/bin/bash $PS/home/scripts/cloud-cell-supervisor.sh start" "$PS/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P2: and the unit names the RESOLVED durable target, not the link that was typed' \
+  || bad '§P2: the installed unit does not name the resolved path'
+
+# ── §P3 — the pin a box actually runs is RECORDED, and readable from the status verb ──────────────
+# ⛔ THE SECOND SILENT HALF OF #2697: `merged ≠ running`. cell-4's farmed copy was sha 9228492e… of Oct 23
+# while `main` was 1680457a…, and nothing on the box recorded which code the unit executes — the only way to
+# learn it was `git -C` guessing at a path the unit merely names. The installer now renders the resolved
+# supervisor's own `HEAD` into the unit's environment, so `systemctl show`/`--status` answer it.
+say_case 'the unit RECORDS the revision of the supervisor it runs'
+PP="$(arm_root pp)"; mk_systemctl "$PP/bin" "$PP/state" "$PP/sc.log"; mk_tmux "$PP/bin" "$PP/tmux.log"
+PP_REPO="$PP/home/agent-infra"; mkdir -p "$PP_REPO/scripts"
+cp "$SUP" "$PP_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PP_REPO" 2>/dev/null
+git -C "$PP_REPO" add -A >/dev/null 2>&1
+git -C "$PP_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PP_SHA="$(git -C "$PP_REPO" rev-parse HEAD 2>/dev/null)"
+PP_TOP="$(git -C "$PP_REPO" rev-parse --show-toplevel 2>/dev/null)"
+PP_RC=0; PP_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PP_REPO/scripts/cloud-cell-supervisor.sh" inst pp --install 2>&1)" || PP_RC=$?
+if [ -z "$PP_SHA" ]; then
+  ok '§P3: skipped — the fixture git checkout could not be created, so the pin has no premise (the arm above covers the refusal)'
+elif [ "$PP_RC" -ne 0 ]; then
+  bad "§P3: could not install from the fixture repo, so the pin arms cannot run — $PP_OUT"
+else
+  grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PP_TOP}@${PP_SHA}" "$PP/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P3: the unit carries the resolved supervisor’s repo@sha (merged-≠-running is now readable)' \
+    || bad "§P3: the unit does not record the revision it runs (expected ${PP_TOP}@${PP_SHA})"
+  PP_ST="$(inst pp --status 2>&1)"
+  case "$PP_ST" in
+    *"supervisor_pin=${PP_TOP}@${PP_SHA}"*) ok '§P3: --status prints the pin from the INSTALLED unit (not from a git guess)' ;;
+    *) bad "§P3: --status does not print the recorded pin — $PP_ST" ;;
+  esac
+fi
+# ⛔ AND A SUPERVISOR OUTSIDE ANY GIT WORK TREE IS STILL A VALID DEPLOYMENT (a farmed copy is exactly that).
+# The pin records `unknown@unknown`; it NEVER refuses — a diagnostic that withholds a supervisor is a false
+# block on the shape the farm produces.
+PPF="$(arm_root ppf)"; mk_systemctl "$PPF/bin" "$PPF/state" "$PPF/sc.log"; mk_tmux "$PPF/bin" "$PPF/tmux.log"
+PPF_RC=0; PPF_OUT="$(inst ppf --install 2>&1)" || PPF_RC=$?
+[ "$PPF_RC" -eq 0 ] && ok '§P3: a supervisor outside any git work tree installs (the pin is an observation, not a gate)' \
+                   || bad "§P3: refused a supervisor merely because its revision is unknown — $PPF_OUT"
+grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPF/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P3: and it records unknown@unknown rather than claiming a revision nobody read' \
+  || bad '§P3: a supervisor with no git work tree recorded something other than unknown@unknown'
+# ⛔ AND A UNIT RENDERED BEFORE THE PIN EXISTED DOES NOT BREAK --status: the line reports `absent` and the
+# verdict is untouched, because supervision is not the pin.
+if [ -f "$PP/units/eldato-orchestrator.service" ]; then
+  grep -v '^Environment=ORCH_SUPERVISOR_PIN=' "$PP/units/eldato-orchestrator.service" > "$PP/units/nopin.tmp" \
+    && mv -f "$PP/units/nopin.tmp" "$PP/units/eldato-orchestrator.service"
+  PP_OLD="$(inst pp --status 2>&1)"
+  case "$PP_OLD" in
+    *'supervisor_pin=absent'*) ok '§P3: a pre-pin unit reports `absent` (and says to re-render) instead of inventing one' ;;
+    *) bad "§P3: a pre-pin unit did not report absent — $PP_OLD" ;;
+  esac
+fi
+
+# ── §P4 — the shape the CELLS actually render stays green ───────────────────────────────────────
+# ⛔ THE FALSE BLOCK THIS ARM PREVENTS. cell-3 measured the CORRECT ExecStart as
+# `/tmp/cell-home/harness/d4ccaf6ee8e6/scripts/cloud-cell-supervisor.sh` — a harness PIN under a home that is
+# itself under /tmp (the cells' HOME is `/tmp/cell-home`; /tmp is not its own mount there). A guard that read
+# "under /tmp" as scratch would refuse the one shape three cells proved right, and would do it on every
+# bring-up (`check_controller_service` runs `--install`).
+say_case 'the harness pin under the cell home — the shape cell-3 measured as CORRECT — is ADMITTED'
+PIN="$(arm_root pin)"; mk_systemctl "$PIN/bin" "$PIN/state" "$PIN/sc.log"; mk_tmux "$PIN/bin" "$PIN/tmux.log"
+PIN_SHA="d4ccaf6ee8e6db52a60e1507b47099f06ae20df2"
+PIN_SUP="$PIN/home/harness/$PIN_SHA/scripts"
+mkdir -p "$PIN_SUP"; cp "$SUP" "$PIN_SUP/cloud-cell-supervisor.sh"
+PIN_RC=0; PIN_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_SUP/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_RC=$?
+[ "$PIN_RC" -eq 0 ] && ok '§P4: the pin path installs (a cell home under /tmp is a DECLARED root, not scratch)' \
+                    || bad "§P4: refused the cell-3 shape — this guard would block every cell bring-up: $PIN_OUT"
+grep -qxF "ExecStart=/bin/bash $PIN_SUP/cloud-cell-supervisor.sh start" "$PIN/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P4: and the unit names the pin, which is what cell-3 already runs' \
+  || bad '§P4: the installed unit does not name the pin path'
+# …and the same path under a temp root that NO root declares is refused, so §P4 is not a blanket pass.
+PINB="$(arm_root pinb)"; mk_systemctl "$PINB/bin" "$PINB/state" "$PINB/sc.log"; mk_tmux "$PINB/bin" "$PINB/tmux.log"
+PINB_SUP="$T/harness/$PIN_SHA/scripts"; mkdir -p "$PINB_SUP"; cp "$SUP" "$PINB_SUP/cloud-cell-supervisor.sh"
+PINB_RC=0; PINB_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PINB_SUP/cloud-cell-supervisor.sh" inst pinb --install 2>&1)" || PINB_RC=$?
+[ "$PINB_RC" -ne 0 ] && ok '§P4: the same pin SHAPE outside every declared root is still refused (the root decides, not the shape)' \
+                    || bad "§P4: a pin-shaped path under no declared root was admitted — the control proves §P4 passes everything: $PINB_OUT"
+
+# ── §P5 — a CALLER's preference is skipped, not obeyed and not fatal ──────────────────────────────
+# ⛔ THE SECOND CALL SITE (agent-infra#2697). `cloud-cell-bringup.sh` names the LAYER's supervisor because it
+# wants the unit to run the code the layer install just put there — but `self_root` IS a lane worktree when a
+# lane runs the bring-up from its own checkout, and refusing there would kill the bring-up on the one shape
+# a lane can produce (measured: 23 red arms in cloud-cell-bringup.test.sh). So a PREFERENCE that cannot
+# survive a cleaning is skipped with a note and the next durable candidate is used, while an explicit
+# ORCH_SUPERVISOR keeps the hard refusal the issue asks for. Both directions are pinned here.
+say_case 'a non-durable PREFERENCE is skipped with a note; an explicit requirement is still refused'
+PREF="$(arm_root pref)"; mk_systemctl "$PREF/bin" "$PREF/state" "$PREF/sc.log"; mk_tmux "$PREF/bin" "$PREF/tmux.log"
+PREF_FARM="$(farmed_sup "$PREF")"
+PREF_RC=0; PREF_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR_PREFER=$SCRATCH_P/cloud-cell-supervisor.sh" inst pref --install 2>&1)" || PREF_RC=$?
+[ "$PREF_RC" -eq 0 ] && ok '§P5: a non-durable preference does NOT withhold the unit — the farm supplies it' \
+                   || bad "§P5: a non-durable preference killed the install — the bring-up would die on a lane worktree: $PREF_OUT"
+case "$PREF_OUT" in
+  *'NOT rendering ExecStart from'*) ok '§P5: and it says loudly which candidate it skipped and why' ;;
+  *) bad "§P5: the skipped preference was silent — the operator sees a unit running code they did not ask for: $PREF_OUT" ;;
+esac
+grep -qxF "ExecStart=/bin/bash $PREF_FARM start" "$PREF/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P5: the unit names the DURABLE candidate it fell through to' \
+  || bad '§P5: the installed unit does not name the durable fallback'
+# …and the SAME path passed as a REQUIREMENT is refused, so the preference never weakens ORCH_SUPERVISOR.
+PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst pref --install 2>&1)" || PREF2_RC=$?
+[ "$PREF2_RC" -ne 0 ] && ok '§P5: the same path as an explicit ORCH_SUPERVISOR is still REFUSED (hard, not skipped)' \
+                    || bad "§P5: an explicit non-durable requirement was silently swapped — the operator's decision was overridden: $PREF2_OUT"
+# …and when NOTHING durable exists, the preference does not rescue the install either: fail closed, naming
+# the durable roots, instead of arming whatever was beside the installer.
+PREFB="$(arm_root prefb)"; mk_systemctl "$PREFB/bin" "$PREFB/state" "$PREFB/sc.log"; mk_tmux "$PREFB/bin" "$PREFB/tmux.log"
+rm -f "$(farmed_sup "$PREFB")"    # no farm, so the only remaining candidate is "beside the installer" (a worktree)
+PREFB_RC=0
+PREFB_OUT="$(bnd env SYSTEMCTL="$PREFB/bin/systemctl" SYSTEMD_UNIT_DIR="$PREFB/units" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$PREFB/units" CONTROLLER_USER_UNIT_DIR="$PREFB/nouser" CONTROLLER_ALLOW_ROOT=1 \
+    TEMPLATES_DIR="$(dirname "$TPL")" HOME="$PREFB/home" CELL_HOME="$PREFB/home" \
+    AGENT_INFRA_PATH="$PREFB/layer" ENV_FILE="$PREFB/home/keys.env" O="$PREFB/o" \
+    PATH="$PREFB/bin:$PATH" ELDATO_PLATFORM=Linux \
+    ORCH_SUPERVISOR_PREFER="$SCRATCH_P/cloud-cell-supervisor.sh" bash "$INST" --install 2>&1)" || PREFB_RC=$?
+[ "$PREFB_RC" -ne 0 ] && ok '§P5: with no durable candidate at all the pref does not rescue it — refused, not armed' \
+                    || bad "§P5: installed from a scratch preference when no durable candidate existed: $PREFB_OUT"
+case "$PREFB_OUT" in
+  *'no DURABLE cloud-cell-supervisor.sh'*) ok '§P5: and that refusal names what a durable supervisor would be' ;;
+  *) bad "§P5: the nothing-durable refusal does not name a durable alternative — $PREFB_OUT" ;;
 esac
 
 printf '\n────────────────────────────────────────────\n'
