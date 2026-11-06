@@ -234,9 +234,10 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   if [ "$_wt_rc" = 4 ]; then
     # ── THE PRE-START DISK REFUSAL (agent-infra#3395) ─────────────────────────────────────────
     # Nothing was created and no agent ran, so the attempt is REFUNDED and the exit code is the disk
-    # gate's own (77): `adopt-fix.sh:93` reads 77 as "waiting will not clear this — reclaim space",
-    # and folding it into a generic rc=1 (the old `exit 1` below) is the misattribution #2721 fixed
-    # for the live arm. Measured cost of NOT distinguishing it: the operator is sent to wait for a
+    # gate's own (77): `adopt-fix.sh:93` reads 77 as the DISK gate and names WHICH of its three
+    # causes fired before it names any remedy (that arm no longer prescribes one remedy for all
+    # three), and folding it into a generic rc=1 (the old `exit 1` below) is the misattribution #2721
+    # fixed for the live arm. Measured cost of NOT distinguishing it: the operator is sent to wait for a
     # load remedy that cannot arrive.
     # ⛔ `chain-merge.sh` IS NOT A READER OF THIS CODE (review P2, #3409 — an earlier revision of this
     # line named it, and that pointer does not exist). `chain-merge.sh` never references `fix-one.sh`

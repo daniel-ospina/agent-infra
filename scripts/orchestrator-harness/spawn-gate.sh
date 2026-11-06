@@ -418,8 +418,9 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 # verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
 # THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
 # not — is the whole defect.
-# ⚠️ SCOPE, STATED (review rounds 2, 4 and 7): those three are the LANE creation paths, not every
-# checkout this tree ever creates. MANY scripts still call `git worktree add` directly and are NOT
+# ⚠️ SCOPE, STATED (review rounds 2, 4 and 7): those three are the DISPATCH paths' route to a lane
+# checkout — not the only route to one, and not every checkout this tree ever creates. MANY scripts
+# still call `git worktree add` directly and are NOT
 # gated here — `stall-fix.sh` (a throwaway mend checkout), `ai-drainer.sh` (its own per-lane working
 # checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no admission at all),
 # `refresh-candidates.sh`,
