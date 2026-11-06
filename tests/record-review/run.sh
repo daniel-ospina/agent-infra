@@ -2661,9 +2661,12 @@ if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
   # The MUTANT is the pre-#3347 line: same call, same flags, only the PRODUCER changed from a
   # here-string to a pipe. ⛔ THE FLAGS ARE CAPTURED, NOT SPELLED (#2983 moved the live call to
   # `-qxF` and left this builder spelling `-qF`, so the substitution matched NOTHING and both arms
-  # below went red over a mutant that was never built — red on every run for a day, and no main push
-  # runs these shards, so nothing surfaced it). What makes the pre-fix form pre-fix is the PIPE; a
-  # capture keeps that the only thing this sed decides, through any future change of flags.
+  # below went red over a mutant that was never built). ⛔ AND THAT RED WAS NOT HIDDEN: a first draft
+  # of this comment said "no main push runs these shards", which is FALSE — `ci-main.yml` runs the
+  # same shard list on every main push, and main run 42225299527 on cf3c46c6d names this file. The
+  # gap was that nothing forced the builder to be re-checked when the call it mutates changed.
+  # What makes the pre-fix form pre-fix is the PIPE; a capture keeps that the only thing this sed
+  # decides, through any future change of flags.
   sed -E 's#if command grep (.*) <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep \1; then return 0; fi#' \
     "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
   # ⛔ A SED THAT MATCHED NOTHING IS NOT A MUTANT. The predecessor tested `grep -q 'printf "%s'`,
