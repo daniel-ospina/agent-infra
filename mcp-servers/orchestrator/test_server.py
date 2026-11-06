@@ -1485,6 +1485,8 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     mod = server_mod(monkeypatch)
     cfg = tmp_path / "gitconfig.txt"
     argv_log = tmp_path / "argv.log"
+    # the stub echoes a REAL `git config --includes --list -z` listing: NUL-separated records, key and
+    # value separated by a NEWLINE — so a key containing `=` is exercised for real
     cmux = stub(tmp_path, "cmux_cfg.sh",
                 "import sys, os\n"
                 "args = sys.argv[1:]\n"
@@ -1497,36 +1499,73 @@ def test_T_box_exec_refuses_a_checkout_whose_config_names_a_program(tmp_path, mo
     monkeypatch.setenv("FAKE_GIT_CONFIG", str(cfg))
     monkeypatch.setenv("FAKE_ARGV_LOG", str(argv_log))
 
-    for config, needle in (("user.email=a@b\nfilter.evil.clean=/tmp/x.sh\n", "filter.evil.clean"),
-                           ("filter.lfs.process=git-lfs filter-process\n", "filter.lfs.process"),
-                           ("merge.md.driver=/tmp/m.sh %O %A %B\n", "merge.md.driver"),
-                           ("extensions.partialClone=origin\n", "PARTIAL CLONE"),
-                           ("remote.origin.promisor=true\n", "PARTIAL CLONE")):
+    def z(*records):
+        """Render a REAL `git config --includes --list -z` listing: `key\nvalue\0` per record.
+
+        A bare string is a VALUELESS key (git prints just the key); a tuple is (key, value). The
+        distinction matters: a key may itself contain `=`, which is why the parser must not split on it.
+        """
+        out = []
+        for rec in records:
+            key, value = rec if isinstance(rec, tuple) else (rec, None)
+            out.append(key + ("\0" if value is None else "\n%s\0" % value))
+        return "".join(out)
+
+    for config, needle in ((z(("user.email", "a@b"), ("filter.evil.clean", "/tmp/x.sh")),
+                            "filter.evil.clean"),
+                           (z(("filter.lfs.process", "git-lfs filter-process")), "filter.lfs.process"),
+                           (z(("merge.md.driver", "/tmp/m.sh %O %A %B")), "merge.md.driver"),
+                           (z(("extensions.partialClone", "origin")), "PARTIAL CLONE"),
+                           (z(("remote.origin.promisor", "true")), "PARTIAL CLONE"),
+                           # ⛔ A VALUELESS ENTRY IS `true` IN GIT and must refuse; a subsection
+                           # containing `=` must not hide the key from the parser.
+                           (z("remote.origin.promisor"), "PARTIAL CLONE"),
+                           (z(("filter.a=b.clean", "/tmp/x.sh")), "filter.a=b.clean"),
+                           (z(("merge.a=b.driver", "/tmp/m.sh")), "merge.a=b.driver")):
         cfg.write_text(config)
         is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
         assert is_err, (config, payload)
         assert payload["refused"] == "repo-config-names-a-program", (config, payload)
         assert needle in payload["reason"], (config, payload)
 
-    # ⛔ AND THE INCLUDED FILE IS READ TOO. `include.path` can declare a filter driver in a file that a
-    # plain `--local` read never prints (measured: `git config --file <cfg> --list` shows only
-    # `include.path`; the same read with `--includes` shows the included keys), so the pre-check must
-    # pass `--includes` — asserted on the REAL argv the stub was handed, not on the source text.
-    cfg.write_text("include.path=/tmp/inc\nfilter.evil.clean=/tmp/x.sh\n")
-    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
-    assert payload["refused"] == "repo-config-names-a-program", payload
+    # the listing is read in the scopes the VERB reads (no `--local`), NUL-separated, with includes
     assert argv_log.exists(), "the pre-check never ran"
     precheck = argv_log.read_text().strip().splitlines()[-1].split()
-    assert "--includes" in precheck and "--local" in precheck, precheck
+    assert "--includes" in precheck and "-z" in precheck, precheck
+    assert "--local" not in precheck, ("the pre-check must read the EFFECTIVE config: `--local` misses "
+                                        "`.git/config.worktree` and the global scope, which the verb "
+                                        "does read: %r" % (precheck,))
 
     # a config that names NO program is fine, and the exec runs — with the pre-check REPORTED, so the
     # caller can tell a clean pre-check from one that never ran
-    for config in ("user.email=a@b\ncore.pager=less\n", "remote.origin.promisor=false\n"):
+    for config in (z(("user.email", "a@b"), ("core.pager", "less")),
+                   z(("remote.origin.promisor", "false")),
+                   z(("remote.origin.promisor", "off"))):
         cfg.write_text(config)
         is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
         assert payload.get("refused") is None, (config, payload)
         assert payload["rc"] == 0, (config, payload)
         assert payload["repo_config"] == "clean", (config, payload)
+
+    # ⛔ AND A LISTING THAT DID NOT FIT IS A REFUSAL, NOT A CLEAN ONE. The driver here sits past
+    # `MAX_CAP`; `run()` truncates and DISCARDS the remainder, so a check that trusted its output would
+    # report `clean` on a config it never finished reading (measured at byte 468123 by review).
+    cfg.write_text(z(("fill.k", "y" * 2_100_000), ("filter.evil.clean", "/tmp/x.sh")))
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+    assert payload.get("refused") == "repo-config-names-a-program", payload
+    assert "did not fit" in payload["reason"], payload
+
+    # ⛔ AND A PRE-CHECK THAT COULD NOT READ IS `unmeasured`, NEVER `clean` — the field exists to tell
+    # those two apart. (A non-repo answer is the ordinary case: rc 128.)
+    cmux_fail = stub(tmp_path, "cmux_fail.sh",
+                     "import sys\n"
+                     "if 'config' in sys.argv[1:]:\n"
+                     "    sys.stderr.write('fatal: not a git repository\\n'); sys.exit(128)\n"
+                     "print('ok')\n")
+    monkeypatch.setenv("ORCH_MCP_CMUX", cmux_fail)
+    is_err, payload = one(mod, "box.exec", {"box": "pi-cell-1", "argv": ["git", "status"]})
+    assert payload.get("refused") is None, payload
+    assert payload["repo_config"] == "unmeasured", payload
 
     # a NON-git program never pays the pre-check (the stub would have printed the config)
     cfg.write_text("filter.evil.clean=/tmp/x.sh\n")

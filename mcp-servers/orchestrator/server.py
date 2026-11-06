@@ -1949,40 +1949,57 @@ HOSTNAME_OK_FLAGS = ("-a", "-A", "-d", "-f", "-i", "-I", "-s", "-y", "-V", "--ve
 
 
 
-def _repo_config_fault(cmux: str, target: str) -> str:
-    """Read the TARGET checkout's own local config; refuse if it names a program we cannot neutralise.
+def _repo_config_fault(cmux: str, target: str) -> Tuple[str, bool]:
+    """(refusal reason, MEASURED). See GIT_UNPINNABLE_KEY_RE for why this check exists.
 
-    The control for the unpinnable classes (see GIT_UNPINNABLE_KEY_RE). It asks the SAME box, with the
-    SAME program name the exec will use, so a poisoned `~/.gitconfig` on the cell is irrelevant — only
-    the checkout's own config can make a read verb spawn a program, and only for the unbounded keys.
+    ⛔ IT MUST READ THE SAME SCOPES THE VERB READS, OR IT IS THEATRE. `--local` was one scope only: a
+    repo with `extensions.worktreeConfig=true` puts per-worktree keys in `.git/config.worktree`, and a
+    GLOBAL `[filter "evil"] clean` plus a repo `.gitattributes` runs just as well — both are invisible
+    to `--local`, and both were reproduced running under an allowlisted `git status`. So the read is
+    the EFFECTIVE config (`--local` dropped), which is exactly what the verb resolves.
 
-    A repo with NO local config (not a checkout, or an unreadable one) is not a fault: there is nothing
-    that could name a program. That is the fail-OPEN direction by design, because the alternative is
-    refusing every ordinary read on a box where `git config` is slow — and the keys this protects are
-    only reachable when they are DECLARED.
+    ⛔ AND IT PARSES `-z`, NOT `key=value`. A config SUBSECTION may legally contain `=`, and `git
+    config --list` prints `filter.a=b.clean=/tmp/x.sh` — splitting on the first `=` yields the key
+    `filter.a`, which no pattern here can match, while git itself reads the driver `a=b` correctly.
+    With `-z` the record separator is NUL and the key/value separator is a NEWLINE, so a key can
+    contain anything.
+
+    ⛔ AND A TRUNCATED LISTING IS A REFUSAL, NOT A CLEAN ONE. `run()` caps the read and DISCARDS the
+    rest; a config with the driver past the cap (measured at byte 468123) would otherwise pass as
+    clean. A read that was CUT SHORT is not evidence that nothing was declared.
+
+    Second element is False only when the read did not happen at all (no repo at that path, or git
+    failed) — the caller reports that as `unmeasured` rather than `clean`, because a control that did
+    not run must not read as one that passed.
     """
-    # ⛔ `--includes` IS EXPLICIT AND LOAD-BEARING. Without it an `include.path` in the checkout's
-    # config can declare `filter.<driver>.clean` in a file this read never sees, and the EXEC would
-    # still run it — measured: `git config --file <cfg> --list` prints only `include.path`, while the
-    # same read with `--includes` prints the included file's keys too.
     got = run([cmux, "vm", "exec", "--timeout", "20", target, "--",
-               "git", "config", "--local", "--includes", "--list"], timeout=45.0, cap=200_000)
+               "git", "config", "--includes", "--list", "-z"], timeout=45.0, cap=MAX_CAP)
     if got.rc != 0:
-        return ""
-    for line in (got.stdout or "").splitlines():
-        key, _, value = line.partition("=")
+        return "", False
+    if got.truncated:
+        return ("the target checkout's config listing did not fit in %d bytes, so it could not be "
+                "checked for a program-naming key — refused rather than run with an unread config"
+                % MAX_CAP), True
+    for record in (got.stdout or "").split("\0"):
+        if not record:
+            continue
+        key, _, value = record.partition("\n")
         key = key.strip()
         if GIT_UNPINNABLE_KEY_RE.match(key):
-            return ("the target checkout's local config names a program this surface CANNOT "
-                    "neutralise (%s): a filter/merge driver is chosen by `.gitattributes`, so its "
-                    "key name cannot be pinned by a `-c` argument — the exec is refused rather than "
-                    "run with a program the repo chose" % key)
-        if GIT_LAZY_FETCH_KEY_RE.match(key) and value.strip().lower() not in ("", "false", "0", "no"):
-            return ("the target checkout declares a PARTIAL CLONE / promisor remote (%s), so an "
-                    "object read can trigger a LAZY FETCH, which runs the repo's transport program "
-                    "(`core.sshCommand`, `remote.<name>.proxy`, or a `remote.<url>` of the form "
-                    "`ext::<program>`)" % key)
-    return ""
+            return ("the target checkout's config names a program this surface CANNOT neutralise "
+                    "(%s): a filter/merge driver is chosen by `.gitattributes`, so its key name "
+                    "cannot be pinned by a `-c` argument — the exec is refused rather than run with "
+                    "a program the repo chose" % key), True
+        if GIT_LAZY_FETCH_KEY_RE.match(key):
+            # ⛔ A VALUELESS ENTRY IS `true` IN GIT (`[remote "origin"] promisor` prints with no `=`),
+            # so an empty/missing value must NOT read as false; and `off`/`n`/`f` ARE legal false
+            # spellings. The earlier allow-list inverted both directions.
+            if value.strip().lower() not in ("false", "no", "off", "0", "n", "f"):
+                return ("the target checkout declares a PARTIAL CLONE / promisor remote (%s), so an "
+                        "object read can trigger a LAZY FETCH, which runs the repo's transport "
+                        "program (`core.sshCommand`, `remote.<name>.proxy`, or a remote URL of the "
+                        "form `ext::<program>`)" % key), True
+    return "", True
 
 
 def _harden_argv(argv: List[str]) -> List[str]:
@@ -2102,14 +2119,16 @@ def _box_exec(mods: Modules, args: Dict[str, Any], read_only: bool) -> Tuple[boo
         # ⛔ FAIL CLOSED ON THE CLASS THAT CANNOT BE PINNED. See GIT_UNPINNABLE_KEY_RE: a filter or
         # merge driver is named by the CHECKOUT, so the only defence is to read the checkout's own
         # config and refuse. Runs before the exec, on the same box, with the same cwd.
-        fault = _repo_config_fault(cmux, target)
+        fault, measured = _repo_config_fault(cmux, target)
         if fault:
             payload["refused"] = "repo-config-names-a-program"
             payload["argv"] = list(argv)
             payload["reason"] = fault
             return True, payload
-        # the control is part of the answer: a caller can see the pre-check ran and found nothing
-        payload["repo_config"] = "clean"
+        # ⛔ TRI-STATE, because "the check passed" and "the check never ran" are different answers and
+        # a caller must be able to tell them apart. Only a read that HAPPENED and found nothing is
+        # `clean`.
+        payload["repo_config"] = "clean" if measured else "unmeasured"
     # ⛔ THE EXECUTED ARGV IS HARDENED, AND HARDENING HAPPENS AFTER VALIDATION ON PURPOSE. `_allowlisted`
     # must bound what the CALLER sent — its `max_args` limit would otherwise be inflated by our own
     # flags, refusing or admitting on the wrong count — and the argv that actually runs is ours to
