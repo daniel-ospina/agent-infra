@@ -134,6 +134,59 @@ SWAP_SWAPPINESS="${SWAP_SWAPPINESS:-30}"
 # (the suite's seam); `false` is how a case reproduces a cell that cannot escalate.
 SWAP_SUDO="${SWAP_SUDO-sudo -n}"
 
+# ── the SHARED slug parser + repo-identity walker (agent-infra#3521) ─────────────────────────────
+# ⛔ SOURCED FROM THE CHECKOUT THIS SCRIPT LIVES IN, and only as a fallback from the deployed harness
+# the cell will actually execute. `repo-slug.sh` is the one place that turns a checkout into
+# `owner/name`; the identity check below compares a directory's NAME against that answer, so using a
+# second parser here would let the bring-up refuse a box the rails grade (or bless one they refuse).
+# The fallback exists because bring-up is normally pushed STANDALONE to a bare VM (see check_dispatch):
+# on that box the checkout's own harness dir is absent and the deployed `$O` is the only copy.
+REPO_SLUG_LIB=""
+REPO_SLUG_LIB_STALE=""
+for _rsl in "${BRINGUP_HERE:+$BRINGUP_HERE/orchestrator-harness/repo-slug.sh}" \
+            "${CELL_HOME:-${HOME:-}}/orchestrator/repo-slug.sh"; do
+  [ -n "$_rsl" ] && [ -r "$_rsl" ] || continue
+  . "$_rsl"
+  # ⛔ A LIB FROM THE PREVIOUS RELEASE IS THE NORMAL STATE OF A CELL, NOT AN EDGE CASE. `$O/repo-slug.sh`
+  # is the harness the LAST release deployed, and the standalone bring-up path (a script pushed to /tmp
+  # on a bare VM) can only resolve THAT one. Sourcing it succeeds while `repo_identity_scan` does not
+  # exist, so the call below returned rc=127 into a fail-closed branch and `--check` REFUSED a healthy
+  # box with a diagnosis about a box that "cannot say whether a checkout lies" — and the repair
+  # (re-deploying `$O`) sat BEHIND the gate that refused. So a candidate without the walker is not
+  # used: the loop keeps looking, and if none has it the check takes its UNVERIFIED path and NAMES the
+  # stale copy instead of pretending it measured anything.
+  if command -v repo_identity_scan >/dev/null 2>&1; then REPO_SLUG_LIB="$_rsl"; break; fi
+  [ -n "$REPO_SLUG_LIB_STALE" ] || REPO_SLUG_LIB_STALE="$_rsl"
+done
+# (No second `.` here: the loop sources every candidate it examines, so the one it CHOSE is already
+# loaded — and the chosen one is always the LAST source, so a stale candidate cannot shadow it.)
+#
+# The roots `check_repo_identity` walks, overridable for the same reason every other path here is: a
+# hermetic suite must never grade the machine that runs it. The DEFAULT is the cell's three real
+# populations — the one home, the bring-up checkout, and the legacy `/tmp/cell-home` a re-install or a
+# reboot leaves behind (a second tree no instrument looked at).
+# ⛔ THE ROOTS ARE COMPUTED AT CALL TIME, NOT AT LOAD TIME — and that is load-bearing (verification
+# finding on the first attempt at this: the default was expanded here, where `$HOME_ORIG` does not exist
+# yet, so the OS-home root was an EMPTY SLOT and the fix for the finding below was inert while its own
+# comment claimed otherwise). `$HOME_ORIG` is assigned at the top of `main()`, before `setup_home`
+# rewrites `HOME`; a load-time default read it too early.
+# ⛔ AND `$HOME_ORIG` MUST BE IN THE LIST: `setup_home` EXPORTS `HOME=$CELL_HOME`, so `${HOME}` is no
+# longer the account's home by the time this check runs — and the measured incident was
+# `/home/cmux/agent-infra`, one level under the OS home. A cell with `CELL_HOME=/tmp/cell-home` and a
+# real `/home/cmux` holding checkouts would otherwise be walked nowhere near the tree the brief told a
+# lane to `cd` into, and would certify clean. A non-existent `$HOME_ORIG` (`cmux vm exec` hands over
+# `/home/ubuntu`) simply fails the walker's `-d` test and costs nothing.
+# `REPO_IDENTITY_ROOTS` still wins when set — the hermetic-suite seam.
+repo_identity_roots() {
+  printf '%s\n' "${REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} ${HOME_ORIG:-} /tmp/cell-ai /tmp/cell-home}"
+}
+# What the `CELL READY` banner is allowed to say about this check. ⛔ IT IS NOT A CONSTANT (review
+# finding, P1): `--check` reaches its banner on the UNVERIFIED paths too (a standalone bring-up whose
+# `$O` predates the walker, an origin-less `.git`, a local-mirror origin, an empty population), and a
+# banner that lists `repo identity` among the VERIFIED links is a false PASS on the certification line —
+# the one thing this change exists to stop. `check_repo_identity` sets this to what it actually measured.
+REPO_IDENTITY_TOKEN="repo identity NOT verified"
+
 log_line()  { printf '%s %s\n' "$(date -u +%FT%TZ)" "$*"; }
 die()  { log_line "FATAL: $*" >&2; exit 1; }
 ok()   { log_line "ok: $*"; }
@@ -634,6 +687,75 @@ check_gh() {
   [ -n "$login" ] && ok "gh login: $login" || die "gh cannot read the API"
   gh api "repos/$REPO_SLUG" --jq '.permissions.push' 2>/dev/null | grep -q true \
     && ok "push permission: true" || die "no push permission on $REPO_SLUG — lanes cannot open PRs"
+}
+
+# ── repo identity: a directory must not lie about which repo it is (agent-infra#3521) ──────────
+# MEASURED 2026-11-05 on cell-2: `/home/cmux/agent-infra` was a checkout of `daniel-ospina/tortoise`.
+# Nothing errored. `pull/3456/head` would not resolve, its `main` reported commits no other box had, and
+# every lane told `cd /home/cmux/agent-infra` was doing tortoise work — silently. A dead box is visible;
+# a mis-pointed box produces PLAUSIBLE work against the wrong repository. The four other cells were
+# clean, so no check existed and nothing noticed.
+#
+# ⛔ THE DIRECTION OF THE COMPARISON IS THE FIX. Identity is read from `remote.origin.url` and the
+# DIRECTORY NAME is then compared against it — never the reverse. The bug was trusting a name.
+# ⛔ A REPORT IS NOT A FIX. The whole failure was silence, so a mismatch is FATAL and stops bring-up
+# here; the walker's verdicts are shared with the doctor (`repo_identity_scan` in repo-slug.sh), so the
+# self-healing path reports the same thing rather than a second opinion.
+# ⛔ IT REFUSES AND NAMES; IT NEVER TIDIES. On the live box the mislabelled tree still held three
+# worktrees whose commits existed nowhere else (is3446, rev3235, w3446) plus an unmerged `pr-3235`
+# branch. Moving or deleting a checkout is a human decision, so this check does neither.
+#
+# PLACED BEFORE `check_repo`, deliberately: that step CLONES `$WORKDIR` from `$REPO_SLUG`, so a check
+# running after it would grade the tree this run just created (the same "a check must not grade its own
+# repair" rule `check_one_home env` states above). What is judged here is the box as it arrived.
+check_repo_identity() {
+  local out v m rc=0 seen_fatal=0 seen_unverified=0
+  if [ -z "$REPO_SLUG_LIB" ]; then
+    # CANNOT-VERIFY, said out loud, and not fatal: a standalone bring-up on a bare VM carries no harness
+    # at all (the same degraded state `check_dispatch` names), and refusing provisioning for a check
+    # whose parser is missing would be a false block. The statement is that the identity is UNVERIFIED —
+    # never that it is fine.
+    if [ -n "$REPO_SLUG_LIB_STALE" ]; then
+      warn "repo identity UNVERIFIED: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check — it carries no repo_identity_scan, so it is the harness the LAST release deployed and nothing here can compare a checkout's name to its origin. An unanswered identity is not a pass (agent-infra#3521). Deploying the current harness ('cloud-cell-supervisor.sh apply', or bringing up from a full checkout) makes this checkable"
+    else
+      warn "repo identity UNVERIFIED: repo-slug.sh was not found in this bring-up's checkout (${BRINGUP_HERE:-<unresolved>}/orchestrator-harness/) nor in the deployed harness (${CELL_HOME:-${HOME:-}}/orchestrator/), so no checkout's name could be checked against its origin — an unanswered identity is not a pass (agent-infra#3521)"
+    fi
+    return 0
+  fi
+  # shellcheck disable=SC2086  # the roots are a declared, space-separated list (see repo_identity_roots)
+  out="$(repo_identity_scan $(repo_identity_roots))" || rc=$?
+  while IFS="$(printf '\t')" read -r v m; do
+    [ -n "$v" ] || continue
+    case "$v" in
+      fatal) seen_fatal=1; die "CHECK FAILED [repo identity]: $m" ;;
+      # ⛔ READ THE VERDICT, NEVER THE MESSAGE TEXT (review finding, P1). This used to substring-match
+      # "UNVERIFIED" out of a `warn`, and the one unverified verdict whose text does not carry that word —
+      # an EMPTY population — then licensed the `CELL READY` banner to claim the check was verified.
+      # `unverified` is now its own verdict from the walker, so a caller cannot miss it and a reworded
+      # message cannot change a verdict.
+      unverified) seen_unverified=1; warn "$m" ;;
+      warn)  warn "$m" ;;
+      ok)    ok "$m" ;;
+      # ⛔ EVERY UNRECOGNISED VERDICT IS UNVERIFIED, NEVER SILENT (review finding, P2). A `case` with no
+      # default drops a verdict a NEWER walker may emit — and because `rc` is 0 for anything that is not
+      # `fatal`, the pass would read clean while the walker said something this caller could not classify.
+      # (`repo-slug.sh` can come from a cell's `$O`, i.e. it may be NEWER than this bring-up.) The rail's
+      # own allow-list polarity is the same rule: an unnamed value must never fall through a gap.
+      *)     seen_unverified=1; warn "repo identity UNVERIFIED: the identity walker returned an unrecognised verdict ('$v') — this bring-up cannot classify it, so nothing about that line is claimed as verified (agent-infra#3521): $m" ;;
+    esac
+  done <<< "$out"
+  # ⛔ FAIL-CLOSED ON A VERDICT THIS CODE CANNOT READ (the walker returned non-zero but printed no
+  # `fatal` line). Continuing here would be the silent pass the whole check exists to remove.
+  if [ "$rc" -ne 0 ] && [ "$seen_fatal" -eq 0 ]; then
+    die "CHECK FAILED [repo identity]: the identity walker returned rc=$rc without naming a directory — cannot say whether any checkout on this box lies about its repo, and cannot-verify is never a pass (agent-infra#3521)"
+  fi
+  # The banner may now say what was actually measured — fully, partially, or not at all.
+  if [ "$seen_unverified" -eq 1 ]; then
+    REPO_IDENTITY_TOKEN="repo identity PARTIALLY verified (see the UNVERIFIED lines above)"
+  else
+    REPO_IDENTITY_TOKEN="repo identity"
+  fi
+  return 0
 }
 
 # ── repo clone ──────────────────────────────────────────────────────────────────
@@ -1418,7 +1540,7 @@ swap_avail_kb() {
 # farm, and its key is in the environment of the process that runs it. Both were false on every cell
 # and NO instrument said so — the client had been hand-copied (so a fresh box received nothing, and the
 # next bring-up would not have changed that), and a missing key surfaced only when a lane tried to use
-# it. So: the client is farmed (`pi-bootstrap/setup.sh`'s `fleet_srcs`, which
+# it. So: the client is farmed (`pi-bootstrap/setup.sh`'s `graph_srcs`, which
 # `pi-bootstrap/cell-install.sh` parses — the ONE seam that already delivers per-box scripts), and the
 # key gets this reading.
 #
@@ -1439,12 +1561,12 @@ check_graph_client() {
     # change exists to replace, and claiming otherwise would be the false PASS the review named. The
     # byte-comparison against the checkout is `cell-install.sh --verify`'s job, not this line's.
     # ⛔ PRESENCE ONLY, AND SAY SO. The byte comparison is `cell-install --verify`'s job — but that job
-    # grades this file only once the CELL'S OWN checkout declares it in `fleet_srcs` (`read_farm_set`
+    # grades this file only once the CELL'S OWN checkout declares it in a farm array (`read_farm_set`
     # parses `$INFRA_ROOT/pi-bootstrap/setup.sh`), so on a cell pinned before agent-infra#3253 NOTHING
     # compares the deployed bytes. An unqualified `ok … present` would therefore certify the very
     # hand-copy this change exists to expose (measured: 2328 B / 5079 B deployed vs 2698 B / 8123 B
     # shipped). The line states its own scope instead of implying a verification it cannot do.
-    ok "graph client: present at $client (presence only — byte-identity is graded by \`cell-install.sh --verify\`, which covers this file only once this box's checkout declares it in \`fleet_srcs\`)"
+    ok "graph client: present at $client (presence only — byte-identity is graded by \`cell-install.sh --verify\`, which covers this file only once this box's checkout declares it in its farm (\`graph_srcs\`))"
   else
     warn "graph client MISSING: $client — the graph mandate is UNEXECUTABLE on this box, so every lane must report GRAPH-UNREACHABLE(...). FIX: re-run the farm that installs it (bash pi-bootstrap/cell-install.sh --install, or pi-bootstrap/setup.sh on a Mac) — a hand-copy is not a deployment and does not survive the next bring-up"
     # ⛔ NO EARLY RETURN. The absence of the client and the absence of its CREDENTIAL are two
@@ -1467,7 +1589,7 @@ check_graph_client() {
     if [ -f "$py" ]; then
       ok "graph client: tortoise_graph_client.py beside it (the sibling the .sh execs)"
     else
-      warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — fleet_srcs carries BOTH files, and farming the .sh alone is the defect"
+      warn "graph client HALF-DELIVERED: $py is absent, so every call dies on its first turn. FIX: the same farm run — graph_srcs carries BOTH files, and farming the .sh alone is the defect"
     fi
   fi
   # The client prefers TORTOISE_MCP_API_KEY and falls back to TORTOISE_API_KEY, so this reading mirrors
@@ -1992,6 +2114,9 @@ main() {
       # (later steps rewrite WORKDIR/HARNESS_PIN_DIR, and a check that reads them afterwards grades
       # its own repair).
       check_one_home env
+      # BEFORE check_gh/check_repo: this judges the box as it ARRIVED. `check_repo` clones $WORKDIR, so a
+      # check placed after it would grade the tree this run just created.
+      check_repo_identity
       check_gh
       check_repo
       check_dispatch
@@ -2043,7 +2168,17 @@ main() {
       # too, so the banner is never printed while a registered secret is still there.
       remove_secrets \
         || die "a secret file could not be removed — refusing to report readiness; delete it by hand before using this VM"
-      log_line "CELL READY — all links verified (one home, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
+      # ⛔ THE HEADLINE MUST NOT CONTRADICT THE TOKEN INSIDE THE SAME PARENTHESIS (review finding, P2).
+      # The line used to hard-code "all links verified" and then put the identity token inside the same
+      # parenthesis — so with an UNVERIFIED token the sentence an operator and every log-scraper reads
+      # FIRST still asserted that all links were verified. That is the exact
+      # framing `REPO_IDENTITY_TOKEN` was introduced to remove, so the headline is now derived from what
+      # the check measured rather than hard-coded.
+      case "$REPO_IDENTITY_TOKEN" in
+        "repo identity") READY_HEADLINE="all links verified" ;;
+        *)                 READY_HEADLINE="links checked — one or more NOT fully verified (see the lines above)" ;;
+      esac
+      log_line "CELL READY — $READY_HEADLINE (one home, $REPO_IDENTITY_TOKEN, tools, network, provider, gh auth, push, clone, dispatch pre-flight, operational layer, harness pin, scheduled layer, caches reported, swap active, harness activation scheduled, controller supervised, cell timers, rendered units)"
       ;;
     *)
       log_line "unknown mode: $MODE (use --check)"; exit 2 ;;

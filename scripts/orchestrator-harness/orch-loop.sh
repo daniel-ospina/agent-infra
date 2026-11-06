@@ -296,9 +296,11 @@ MERGE_PRIORITY_MAX_AGE_MIN="${MERGE_PRIORITY_MAX_AGE_MIN:-180}"
 # the landing rate rather than open a 68th PR.
 LANDING_FLOOR="${LANDING_FLOOR:-25}"
 # How old a `state/refresh-funnel` record may be before the funnel line says STALE instead of
-# printing it as this cycle's decomposition. Two refresh cycles (the refresh only runs while the
-# backlog is below 6, so a quiet box can legitimately go a few cycles between records); past that,
-# an old pass's numbers beside a newer `queue=` are a contradiction, not a measurement.
+# printing it as this cycle's decomposition. Two refresh cycles (a quiet box can legitimately go a few
+# cycles between records — NOT because the refresh needs a short backlog: the spawn test below is
+# `backlog < 6` **or** a funnel record older than `LATCH_MAX_AGE_MIN`, so a pass runs on a long queue
+# too, and has since that age latch landed, agent-infra#2019); past that, an old pass's numbers beside
+# a newer `queue=` are a contradiction, not a measurement.
 FUNNEL_MAX_AGE_MIN="${FUNNEL_MAX_AGE_MIN:-30}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 # Available memory = free + inactive. macOS shows memory pressure as COMPRESSION with swap flat,
@@ -2034,8 +2036,9 @@ refresh_cause_brief() {   # <snapshot>
 # died" look identical in the record. The only thing that separates them is TIME, and this file
 # already owns that bound — the stale-lock guard (20 min) — so a start marker younger than it is
 # reported as in-flight and an older one as a death. Without the bound a healthy 4-minute pass reads
-# BLOCKED for its whole duration on a box whose backlog is empty (i.e. the normal case, since the
-# refresh runs only while the backlog is short), and an alarm that cries wolf is the failure this PR
+# BLOCKED for its whole duration on any box mid-pass — the backlog's LENGTH does not gate it, because
+# the spawn test is `backlog < 6` OR a funnel record older than `LATCH_MAX_AGE_MIN` (#2019): a pass on
+# a 179-row queue is ordinary, not exceptional — and an alarm that cries wolf is the failure this PR
 # exists to remove.
 REFRESH_STALE_LOCK_MIN="${REFRESH_STALE_LOCK_MIN:-20}"
 case "$REFRESH_STALE_LOCK_MIN" in ''|*[!0-9]*) REFRESH_STALE_LOCK_MIN=20 ;; esac
@@ -2049,15 +2052,42 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   at="$(refresh_record_field at "$rec")"
   qrec="$(refresh_record_field queued "$rec")"
   hrec="$(refresh_record_field handed "$rec")"
+  # the writer's readability witness: 1 = it read the queue, 0 = it could not, "" = a record predating it
+  rqread="$(refresh_record_field queue_readable "$rec")"
   case "${qrec:-}" in ''|*[!0-9]*) qrec="" ;; esac
   case "${hrec:-}" in ''|*[!0-9]*) hrec="" ;; esac
   # ⛔ `2>/dev/null` DOES NOT SUPPRESS A FAILED REDIRECTION (review finding): the shell reports
   # `candidates.txt: No such file or directory` for `<` before the command's stderr is redirected, so a
   # box with no queue file would pollute the very line this function exists to keep clean. The file is
   # tested FIRST instead.
-  backlog=0
-  [ -r "$O/candidates.txt" ] && backlog="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
-  case "$backlog" in ''|*[!0-9]*) backlog=0 ;; esac
+  # ⛔ A FAILED DEPTH READ IS UNKNOWN, NOT ZERO (review P2, cycle 15). The refresh pass records
+  # `backlog=UNKNOWN` for a queue it could not measure — and this reader ignored that field entirely and
+  # re-measured, coercing a failed read to `0`. So the beat printed "the queue is EMPTY now … drained
+  # work, not a stalled origin" over a queue holding rows while the record beside it said UNKNOWN: the
+  # same #1931 polarity the pass was just fixed to stop, one layer out. `_bl_state` is the witness; every
+  # EMPTY sentence below is gated on `READ`.
+  backlog=0; _bl_state="UNKNOWN"
+  if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+    _bl="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
+    case "$_bl" in
+      ''|*[!0-9]*) _bl_state="UNKNOWN" ;;
+      *)           backlog="$_bl"; _bl_state="READ" ;;
+    esac
+  fi
+  # ⛔ AND THE PASS'S OWN MEASUREMENT IS READ, not merely printed (review P2, cycle 15): when this beat
+  # cannot measure the depth itself, the attempt the pass recorded is the only evidence there is, and its
+  # `UNKNOWN` is what stops the EMPTY word below.
+  brec="$(refresh_record_field backlog "$rec")"
+  case "${brec:-}" in
+    # ⛔ THE RECORD IS THE FALLBACK, NEVER AN OVERRIDE (review P3, cycle 16). This arm used to set
+    # UNKNOWN unconditionally, so a beat that HAD measured the queue printed "this beat and the last
+    # refresh pass both failed to read it" — two false clauses on a queue it read perfectly well (and the
+    # sibling arm below already refuses to let a recorded NUMBER override `READ`, so the two disagreed
+    # about precedence). A measurement taken here outranks a recorded absence of one.
+    UNKNOWN) [ "$_bl_state" = "READ" ] || _bl_state="UNKNOWN" ;;
+    ''|*[!0-9]*) : ;;
+    *) [ "$_bl_state" = "READ" ] || { backlog="$brec"; _bl_state="RECORDED"; } ;;
+  esac
   # ⛔ `-r`, NOT `-f` (review P2): a mode-000 or foreign-owned queue file passes `-f`, and `wc -l <`
   # then fails with a Permission-denied the `2>/dev/null` does NOT suppress (a failed redirection is
   # reported before the command's stderr is redirected) — so the beat would print "the queue is
@@ -2078,7 +2108,24 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     else age="$(( d / 60 ))h ago"; fi
   fi
   tailnote=""
-  [ "$backlog" -gt 0 ] && tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
+  # ⛔ A NUMBER WRITTEN EARLIER IS NOT A COUNT NOW (review P3, cycle 24). `backlog` is the RECORD's when
+  # `_bl_state=RECORDED` — this cycle read nothing — and this bracket asserted "N usable candidate(s)
+  # still queued" in the present tense, appended to the BLOCKED/died/SEED-SKEW arms (the same defect the
+  # caller's own arms refuse one line up). Only a measurement taken here may say "still queued"; a
+  # recorded number is attributed, and a recorded absence claims nothing.
+  if [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
+    tailnote=" [$backlog usable candidate(s) still queued from an earlier pass — deferred work exists, but origination is what is broken]"
+  elif [ "$backlog" -gt 0 ]; then
+    # ⛔ ATTRIBUTED TO THE ARTEFACT, NOT TO A PASS (review P3, cycle 25). The arms that can print this are
+    # exactly the ones whose own sentence says the record was NOT written by the last pass ("the record on
+    # disk is an EARLIER pass", "written by NOTHING here") — so "the last pass recorded N" contradicted the
+    # clause beside it. The record is what is known; the pass that wrote it is not.
+    # ⛔ NAME THE FIELD (review P3, cycle 26): `$backlog` comes from the record's `backlog=` key, while
+    # `queued=` is a DIFFERENT key on the same record holding a different number (the pass writes both, from
+    # different counts) — so "says N queued" sends an operator to the wrong field. The rest of this function
+    # already quotes them under their own names ("recorded backlog=", "recorded queued=").
+    tailnote=" [the record on disk carries backlog=$backlog; THIS cycle could not measure the queue, so deferred work is UNPROVEN rather than counted]"
+  fi
   # ⛔ THE UNRECORDED-FAILURE MARKER COMES BEFORE EVERYTHING (review P1, two reviewers). When a pass
   # FAILS and cannot write its record (`$O/state` unwritable while `$O` is writable), the record still
   # holds the PREVIOUS pass's `result=ok` — so a reader that trusts it prints `skipped (refresh ok)`
@@ -2113,9 +2160,9 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
   fi
   # ⛔ `skipped` IS A CLAIM IN TWO PARTS: a pass SUCCEEDED **and** a usable candidate is deferred. The
   # branches keep it honest in BOTH directions — a failed pass never prints it (the mask this fixes),
-  # and a healthy queue is never called BLOCKED merely because no pass has been needed yet (the
-  # refresh only runs while the backlog is short, so a box with 8 candidates queued and nothing
-  # failing must not alarm — it says `deferred`).
+  # and a healthy queue is never called BLOCKED merely because no pass has been needed yet (and a
+  # pass is not gated on a SHORT backlog — the spawn test is `backlog < 6` OR an age-latched record,
+  # #2019 — so a box with 8 candidates queued and nothing failing must not alarm: it says `deferred`).
   if [ -n "$unrec" ]; then
     printf '[dispatch] BLOCKED: a refresh pass finished and could not record its outcome (%s) — the record on disk is an EARLIER pass and is NOT the health of this cycle; read the marker: rc=0 means the pass SUCCEEDED and only its record failed%s | %s lanes=%s workers=%s | PR path: %s\n' \
       "$unrec" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
@@ -2145,16 +2192,66 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
       "${REFRESH_TRIED:-none}" "$_skew_run" "${REFRESH_SELF_DIR:-?}" \
       "$tailnote" "$why" "$lanes" "$workers" "$prtail"
   elif [ "${result:-}" = "ok" ]; then
-    if [ "$backlog" -gt 0 ]; then
+    # ⛔ THE COUNT ARMS ARE KEYED ON THE WITNESS TOO (review P3, cycle 22). `backlog -gt 0` was tested
+    # before every state arm, so a RECORDED count (the pass's number, written at some earlier time) printed
+    # "deferred: N usable candidate(s) queued" in the PRESENT TENSE under the `skipped (` prefix — whose
+    # documented meaning is "a pass succeeded AND a usable candidate IS deferred", a claim about now —
+    # while `head #?` on the same line admitted this cycle had read nothing. `READ` keeps the measured
+    # sentence; a recorded count gets its own, attributing the number.
+    if [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
       printf '[dispatch] skipped (%s) lanes=%s workers=%s — deferred: %s usable candidate(s) queued, head #%s (refresh ok, %s) | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    elif [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] deferred (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s, which is the PASS'"'"'s count and not a measurement now (so the prefix is not `skipped`, which would assert a usable candidate IS deferred) | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$backlog" "$prtail"
     else
       # ⛔ WHAT THE PASS RECORDED, NOT WHAT THE QUEUE IMPLIES (review P1, two reviewers). The first
       # version said “the last refresh pass queued 0 usable candidate(s)” because the queue is empty
       # NOW — but the ordinary drain state is “the pass queued 3 and dispatch took all 3”, where that
       # sentence is false and sends an operator after origination that worked. The record carries the
       # truth (`queued=`, `handed=`); it is printed as recorded, and `?` when it recorded nothing.
-      if [ -n "$hrec" ]; then
+      if [ "$_bl_state" = "UNKNOWN" ]; then
+        # ⛔ THE THIRD STATE (review P2, cycle 15): the queue's depth could not be measured HERE, so
+        # "EMPTY" is a claim about a file nobody read. ⛔ AND THE CLAUSE ABOUT THE PASS IS READ FROM THE
+        # RECORD, NOT TYPED (review P3, cycle 17; CORRECTED cycle 18). The writer has FOUR shapes that
+        # reach here with no measured depth, and TWO of them mean opposite things: the queue could NOT be
+        # read, and the queue WAS read but neither its DEPTH nor its HEAD could be measured — both publish
+        # `backlog=UNKNOWN` with an empty `handed=`, so those two fields cannot tell a reader which one it
+        # is (a review proved this by driving the record the writer emits for the second shape and getting
+        # the first shape's clause). `queue_readable=` is the writer's own witness and settles it; a record
+        # written before that field existed is only known to carry no depth and no head, and that is all
+        # that may be claimed of it.
+        # A measured HEAD outranks the witness (it proves both readability and which issue was handed).
+        if [ -n "$hrec" ]; then
+          _pass_said="the last refresh pass READ the queue (it recorded head #$hrec) but could not measure its DEPTH"
+        else
+          case "${rqread:-}" in
+            0) _pass_said="the last refresh pass also could NOT read the queue" ;;
+            1) _pass_said="the last refresh pass READ the queue but measured neither its DEPTH nor a head" ;;
+            *) _pass_said="the last refresh record carries no measured depth and no head" ;;
+          esac
+        fi
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured by THIS cycle, and %s, so this is NOT known to be an empty queue: work may be queued and unread | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$_pass_said" "$prtail"
+      elif [ "$_bl_state" = "RECORDED" ]; then
+        # ⛔ A RECORDED ZERO IS NOT A MEASUREMENT OF NOW (review P3, cycle 21). `RECORDED` means this beat
+        # could NOT read the queue and `backlog` is the PASS's number, but it passed the
+        # `_bl_state != UNKNOWN` test above — so a beat that had just failed to open the queue printed
+        # "the queue is EMPTY now": a present-tense fact about a file nobody read, licensed by a field
+        # written at some earlier time. The EMPTY word below is now reachable only from `READ`. (No
+        # shipped path can yet produce "record ok/backlog=0" with rows on disk — the pass writes both —
+        # but that invariant is enforced by nothing, which is exactly why the sentence must not rely on it.)
+        # ⛔ ONE ARGUMENT PER SPEC (review P2, cycle 22). This sentence was written with EIGHT arguments
+        # for SEVEN `%s` — `"${hrec:+handed #$hrec}" "${hrec:-handed nothing}"` were meant to be one — and
+        # `printf` RECYCLES the format over a surplus argument: the beat emitted a SECOND, fabricated
+        # `[dispatch]` line with `recorded backlog=` empty, and the first line's `| PR path:` slot carried
+        # the head issue number. Every check in the suite was a substring match on one line, so nothing saw
+        # it. The word is built once, and the fixtures now assert the line COUNT and the surviving prtail.
+        _handed_word="handed nothing"
+        [ -n "$hrec" ] && _handed_word="handed #$hrec"
+        printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s and %s, so that is the PASS'"'"'s count, not a measurement of the queue now — it is NOT evidence the queue is empty | PR path: %s\n' \
+          "$why" "$lanes" "$workers" "$age" "$backlog" "$_handed_word" "$prtail"
+      elif [ -n "$hrec" ]; then
         printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY now; the last refresh pass (%s) recorded queued=%s and handed #%s to dispatch, so this is drained work, not a stalled origin | PR path: %s\n' \
           "$why" "$lanes" "$workers" "$age" "${qrec:-?}" "$hrec" "$prtail"
       else
@@ -2188,12 +2285,33 @@ dispatch_gate_line() {   # <gate_why> <lanes> <workers> <pr_tail>
     elif [ "${d:-0}" -ge "$RUNNING_STALE_MIN" ]; then
       printf '[dispatch] BLOCKED: a refresh pass wrote its start marker %s and has recorded no outcome since — %sm is past the %sm stale bound, so the pass DIED (SIGKILL, OOM, cycle timeout, or an uncaught error) and nothing will replace that marker but a pass that finishes;%s %s lanes=%s workers=%s | PR path: %s\n' \
         "$age" "${d:-?}" "$RUNNING_STALE_MIN" "$tailnote" "$why" "$lanes" "$workers" "$prtail"
-    elif [ "$backlog" -gt 0 ]; then
+    elif [ "$_bl_state" = "UNKNOWN" ]; then
+      # ⛔ THE SAME WITNESS AS THE `result=ok` ARM (review P2, cycle 16). `backlog` is 0 by
+      # INITIALISATION when the depth could not be read, so testing `[ "$backlog" -gt 0 ]` alone made this
+      # arm print "the queue is EMPTY" over rows nobody read — the #1931 polarity, in the branch one level
+      # down from where the witness was wired. Measured: two rows on disk behind a mode-000 file, and the
+      # beat said EMPTY.
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the DEPTH of the queue could not be measured, so this is NOT known to be an empty queue (work may be queued and unread); a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$prtail"
+    elif [ "$backlog" -gt 0 ] && [ "$_bl_state" = "READ" ]; then
       printf '[dispatch] deferred (%s) lanes=%s workers=%s — %s usable candidate(s) queued, head #%s; a refresh pass wrote its start marker %s and has recorded no outcome yet. A deferral whose origination is UNPROVEN: do not read this as a healthy pass | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$backlog" "${head:-?}" "$age" "$prtail"
+    elif [ "$backlog" -gt 0 ]; then
+      printf '[dispatch] deferred (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s, which is the PASS'"'"'s count and not a measurement now; a refresh pass wrote its start marker and has recorded no outcome yet, so origination is UNPROVEN | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$backlog" "$prtail"
+    elif [ "$_bl_state" = "RECORDED" ]; then
+      # ⛔ THE SAME ARM AS THE `result=ok` BRANCH (review P3, cycle 23). A record carrying `backlog=0` is a
+      # number written earlier, and it DOWNGRADED the correct UNKNOWN sentence below into a present-tense
+      # "the queue is EMPTY" over a file this cycle never read: `_bl_state` was `RECORDED`, not `UNKNOWN`,
+      # so the UNKNOWN arm did not take it. Only `READ` may say EMPTY.
+      _handed_word="handed nothing"
+      [ -n "$hrec" ] && _handed_word="handed #$hrec"
+      printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — THIS cycle could not measure the queue; the last refresh pass (%s) recorded backlog=%s and %s, which is the PASS'"'"'s count and not a measurement now; a refresh pass wrote its start marker and has recorded no outcome yet, so origination is UNPROVEN and this is NOT evidence the queue is empty | PR path: %s\n' \
+        "$why" "$lanes" "$workers" "$age" "$backlog" "$_handed_word" "$prtail"
     else
       # The empty-queue-yet-fresh case: the pass is in flight and has not queued anything YET. That is
-      # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED.
+      # the ordinary state for a healthy pass on a short backlog, so it must not be BLOCKED — and it is
+      # reachable only from `READ`, so "the queue is EMPTY" is a measurement this cycle took.
       printf '[dispatch] nothing to defer (%s) lanes=%s workers=%s — the queue is EMPTY; a refresh pass wrote its start marker %s and has recorded no outcome yet, so this is work in progress, not a drained queue and not a death | PR path: %s\n' \
         "$why" "$lanes" "$workers" "$age" "$prtail"
     fi
@@ -2281,8 +2399,19 @@ dispatch_funnel() { # <dispatched_count> <queue_token> [<held_reason>] [<now_epo
     esac
   done
   # The queue depth is measured HERE, not taken from the refresh's record: it is this cycle's file.
-  [ -f "$O/candidates.txt" ] && backlog="$(wc -l < "$O/candidates.txt" | tr -d ' ')"
-  is_num "${backlog:-}" || backlog=0
+  # ⛔ AND A FAILED READ IS UNKNOWN, NOT ZERO (review P3, cycle 16 — the last of the #1931 family). This
+  # line tested `[ -f ]` (a mode-000 file passes it), ran `wc -l <` with NO redirect (so the shell printed
+  # `…: Permission denied` onto the operator line) and then coerced the miss with `is_num || backlog=0` —
+  # the depth rendered as a measurement. `_fl_state` carries the verdict; the two "queued of an
+  # UNRECORDED pool" sentences below print UNKNOWN rather than a number this beat did not take.
+  _fl_state="UNKNOWN"; backlog=""
+  if [ -f "$O/candidates.txt" ] && [ -r "$O/candidates.txt" ]; then
+    _fl_b="$( { wc -l < "$O/candidates.txt"; } 2>/dev/null | tr -d ' ')"
+    if is_num "${_fl_b:-}"; then backlog="$_fl_b"; _fl_state="READ"; fi
+  fi
+  # `backlog` becomes the WORD `UNKNOWN` when unmeasured — never the empty string and never a bare `0`,
+  # which are the two shapes that render an unmeasured depth as a measurement.
+  [ "$_fl_state" = "READ" ] || backlog="UNKNOWN"
   if [ -z "${listed:-}" ]; then
     # No usable record. Say so — do NOT print a decomposition that does not exist, and do NOT fall
     # back to "backlog empty", which is the claim this function exists to stop. ⛔ The two causes are

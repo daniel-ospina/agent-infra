@@ -994,6 +994,15 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: NONE,
   },
   {
+    name: "REAP_WT_PRESERVE_KEEP_DAYS",
+    owners: ["scripts/pi-reap-worktrees.sh"],
+    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
+    axis: "retention",
+    guardedBy:
+      "scripts/pi-reap-worktrees.test.sh §G2aa (the archive sink is BOUNDED) — a dated dir older than the floor is PRUNED by `--apply` (and only REPORTED by a dry run), a RECENT dated dir survives, a non-date name and a MALFORMED/prefixed date-shaped name are left alone (only an exact `YYYY-MM-DD` is ever a candidate), `0` keeps EVERYTHING (disabled, not everything-expired), and a non-numeric value is REFUSED by seam validation at exit 2 with the seam NAMED and nothing pruned; the same bound is driven on the FALLBACK root, which is where writes land when the configured root is full or read-only",
+    note: "#3405 review round 2 — the ARCHIVE bound on the reclaim path: a reclaimed worktree's evidence is copied into a dated archive, and only subdirectories strictly older than this many days are swept (0 disables the sweep entirely). It is a retention bound in the same family as REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS above, so it is REGISTERED rather than exempted — a reader must be able to see the archive's retention move. It was missing from this registry when the bound shipped, which is why `verify`'s reverse scan failed on main for EVERY PR: the declaration landed, the registration did not, so a base-owned failure on a single unregistered constant held every open PR to a red check none of them caused.",
+  },
+  {
     name: "REAP_WT_BUDGET_SECONDS",
     owners: ["scripts/pi-reap-worktrees.sh"],
     value: "${REAP_WT_BUDGET_SECONDS:-300}",
@@ -1067,6 +1076,29 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     axis: "hygiene",
     guardedBy: NONE,
     note: "#1932 (review of PR #1949) — the STATED free-disk floor the reaper's per-pass capacity line asserts against (2 GiB = one MEASURED lane env, ~1.85 GB of real non-shared disk per lane), so 'above the floor' means 'one more lane still fits'. Registered rather than left as a bare constant because it bounds how much of the box the fleet may consume, and a bound only the reaper knows about is invisible to the audit that exists to notice exactly that. It ASSERTS, it does not reclaim: a breach exits 5 (the reaper's own `over-bound` code — `disk-reaper.sh` KEEPS that 5 since agent-infra#2156 landed, so an apply pass records `rc=3 verdict_venv=fail-closed` and a dry run records `rc=5 verdict_venv=over-bound`; the old `worst_rc` drop of 5 that recorded `rc=0 verdict=ok` is gone, do not restate it) and is named on the report, and no live lane's env is ever deleted to get back above it. Unlike the age floor this is a SPACE bound, so it answers to the hygiene axis (disk reapers that are not agent-stall detectors), not retention.",
+  },
+  // ── ai#3057: the runner-work reclaim class's floor, as a MATCHED PAIR ────────────────────────────
+  // The entry point's pass-through and the owner's own floor are two declarations of one policy (as
+  // `VENV_MIN_AGE` / `REAP_VENV_MIN_AGE_SECONDS` above are), so both are registered: a floor only ONE
+  // of the two layers knows about is invisible to the audit that exists to notice exactly that.
+  {
+    name: "RUNNER_MIN_AGE",
+    owners: ["scripts/disk-reaper.sh"],
+    value: "${DISK_REAPER_RUNNER_MIN_AGE:-7200}",
+    axis: "reap",
+    guardedBy:
+      "scripts/disk-reaper-runner-work.test.sh case (a) — (a) drives the seam to 60 s and requires the 5-minute `_work` entry to become a candidate while the 0 s one stays kept, so a hardcoded floor fails it; its SECOND mutant (`MUT_A2` — the entry point's `--min-age \"$RUNNER_MIN_AGE\"` replaced by a literal 3600) is the one that guards THIS symbol, and it turns (a) RED; and `MUT_A3` (this layer's shipped default halved back to 3600) is what pins the registered VALUE — case (a) keeps a 90-minute entry that sits BETWEEN the two, so a halved default turns it RED with no seam set",
+    note: "ai#3057 — the entry point's pass-through of the runner `_work` mtime floor to its owner (`reap-runner-work.sh`, whose own `RUNNER_WORK_MIN_AGE` is registered below). It exists here so the scheduled cell pass can tune the floor WITHOUT editing the owner, and it is registered for the same reason `VENV_MIN_AGE` is: a floor that only the scheduler knows about is invisible to the audit. ⛔ NOT an 'idle' or busy-check bound — the class deliberately has none (the listener is a child of the runner service and `_work/<entry>` carries no owner pid or lock), so this mtime floor is the ONLY gate on the delete decision.",
+  },
+  {
+    name: "RUNNER_WORK_MIN_AGE",
+    owners: ["scripts/reap-runner-work.sh"],
+    value: "${REAP_RW_MIN_AGE:-7200}",
+    axis: "reap",
+    guardedBy:
+      "scripts/disk-reaper-runner-work.test.sh cases (a), (b), (g) and (m) — (a) a YOUNG entry is neither counted nor reaped in `--dry-run` AND `--apply`, (b) an OLD entry IS removed by `--apply` and reported as a `df` delta, (g) a full-disk fallback pass still REAPS the dead entry it exists for, (m) an OUT-OF-RANGE floor is refused with rc 2 so `now - 2^64` can never wrap the floor to `now` and delete a live-looking entry, and a leading-zero floor ('08') is NORMALISED instead of aborting the arithmetic; THREE mutants guard THIS symbol — `MUT_A` (the floor reference becomes `now`), `MUT_M` (the magnitude bound disabled) and `MUT_A4` (this owner's shipped default halved back to 3600, caught by case (a)'s 90-minute entry directly against the owner with no relayed flag) — and each turns its case RED",
+    overrides: ['RUNNER_WORK_MIN_AGE="$2"; shift 2 ;;', 'RUNNER_WORK_MIN_AGE="$_rw_floor_norm"'],
+    note: "ai#3057 — the owner's own mtime FLOOR for the runner `_work` class: an entry is a candidate only when nothing under it — including its own top directory — has been written for longer than this. ⛔ NAMED `RUNNER_WORK_MIN_AGE`, NOT the bare `MIN_AGE`, and that was a REVIEW FINDING, not a style choice: the bare name is already a REGISTERED term owned by `scripts/orchestrator-harness/lane-container-reap.sh` (4 h), so declaring it here made ONE name hold TWO unrelated floors and the reverse scan refused it — correctly, because co-owner registration would demand both files carry the SAME value and they must not. The `X_MIN_AGE` form is the recorded convention for exactly this collision (`CR_MIN_AGE`/`VENV_MIN_AGE`). ⚠️ The shipped default is 7200 s — the ONLY empirically validated value (the measured 120-minute hand reap that took a cell 98 % → 90 % with no job disturbed) — at BOTH layers. It shipped as 3600 s until a review of this class (P1, commit `6b197040`) measured that 3600 was HALF of that, in a class that is in the default `DISK_REAPER_ONLY` and whose timer carries `--apply`: 3600 s armed a delete at twice the measured aggressiveness on every box. A box whose jobs write outside the checkout should still raise it.",
   },
   {
     name: "STALL_FIX_BRIEF_MAX_AGE_MIN",

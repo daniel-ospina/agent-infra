@@ -143,6 +143,539 @@ bash "$TMP/mutant-refuse.sh" --check "$CANON" lane >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "MUTATION (other direction): 'a complete brief passes' FAILS when the gate refuses everything (rc=$rc)"
 
 echo
+echo "§F the NON-VACUITY contract (#3442) — the reviewer brief must carry a mutation attribution"
+# ── WHAT THIS SECTION PINS. A clean REVIEW was the one claim in the system nobody had to prove could
+# fail, so five PRs in one night were reviewed clean over assertions that stay GREEN with the bug
+# restored (docs/ops/review-non-vacuity-baseline.md). The gate now demands the block from the REVIEWER
+# role, and `record-review.sh` calls the SAME parser on a review artifact, so these arms are the shape
+# half of that contract. §G is the mutation proof that they can FAIL.
+REV_CANON="$TMP/canonical-reviewer.txt"; bash "$GATE" --section reviewer > "$REV_CANON"
+# The block is the LAST section of the canonical reviewer brief, so dropping from its heading to EOF
+# yields a brief that is complete in every OTHER respect — the fixture that isolates this requirement.
+sed '/^## MUTATION ATTRIBUTION/,$d' "$REV_CANON" > "$TMP/reviewer-no-mutation.txt"
+grep -q '^CONTRADICTION TEST:' "$TMP/reviewer-no-mutation.txt"; ck $? "fixture: the reviewer brief WITHOUT the block is otherwise complete (research + contradiction test intact)"
+bash "$GATE" --check "$TMP/reviewer-no-mutation.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(i) a REVIEWER brief with NO mutation attribution is REFUSED with 80 (got $rc)"
+bash "$GATE" --missing "$TMP/reviewer-no-mutation.txt" reviewer 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "…and the missing token NAMES the block (MUTATION-ATTRIBUTION)"
+# ⛔ THE OTHER DIRECTION, and it is what keeps this from being a wall on every dispatch: the identical
+# brief is a VALID brief for a non-reviewer role, so the requirement is scoped to the role that makes
+# the claim — not to the file.
+bash "$GATE" --check "$TMP/reviewer-no-mutation.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(ii) the SAME brief is still admitted for role 'lane' — the requirement belongs to the role, not the file (got $rc)"
+bash "$GATE" --check "$REV_CANON" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(iii) the canonical reviewer brief PASSES (the gate cannot refuse its own advice) (got $rc)"
+# …and the one-line disclosure a reviewer's lane log carries names it too, or an operator grepping the
+# log sees the research contract and would not know the verdict half exists.
+bash "$GATE" --line reviewer | grep -q '3442'; ck $? "(iv) the reviewer one-line disclosure names the non-vacuity contract"
+bash "$GATE" --line lane | grep -q '3442'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(iv-b) …and the LANE line does not (the block is not demanded of a lane brief)"
+# ── the parser, on the four shapes the artifact side can actually be in.
+printf '## MUTATION ATTRIBUTION\n\nI read the diff and it looks right.\n' > "$TMP/mut-prose.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-prose.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(v) a heading with prose and no table is REFUSED (a heading alone is not an attribution)"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | note | reddened row |\n|---|---|---|\n| a | b | c |\n' > "$TMP/mut-nocol.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-nocol.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(vi) a table whose header never names the MUTANT is REFUSED (the attribution key is the column, not the prose)"
+# ⛔ EACH OF THE THREE COLUMN KEYS GETS ITS OWN FIXTURE (review cycle 4, P1 — VACUOUS ARM). This one
+# used to omit BOTH `mutant` and `redden`, so deleting EITHER term of the header test was masked by
+# the other: §G's §F(vi) mutant could not say which key it had removed. Each fixture below lacks
+# EXACTLY ONE key and carries a real data row, so under the mutant that stops requiring that key the
+# table is a COMPLETE attribution — and the arm goes RED, which is the only thing that makes it a test.
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | what I checked |\n|---|---|---|\n| a | b | c |\n' > "$TMP/mut-noredden.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-noredden.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(vi-b) …and a table that never names the REDDENED ROW is REFUSED"
+printf '## MUTATION ATTRIBUTION\n\n| note | mutant | reddened row |\n|---|---|---|\n| a | b | c |\n' > "$TMP/mut-noassertion.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-noassertion.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(vi-c) …and a table that never names the ASSERTION is REFUSED"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row |\n|---|---|---|\n' > "$TMP/mut-norow.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(vii) a header with EVERY data row deleted is REFUSED (a header is not a kill)"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff touches docs/ops/*.md and adds no assertion.\n' > "$TMP/mut-none.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-none.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(viii) the NO NEW ASSERTIONS exemption is REACHABLE — a diff that adds no assertion is not deadlocked (got '$miss')"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS:\n' > "$TMP/mut-none-empty.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-empty.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(viii-b) …but a BARE 'NO NEW ASSERTIONS:' with no reason is REFUSED (an unexplained exemption is how the block becomes a rubber stamp)"
+# ⛔ THE CARRIER THE RECORD PATH ACTUALLY USES: a GitHub comment body arrives @tsv-ESCAPED, so its
+# newlines are the two characters `\n` and the whole artifact is ONE awk record. A line-oriented
+# parser finds no heading there and would refuse EVERY honest review — the `13v1` arm in
+# record-review.test.sh proves the same thing end-to-end; this pins the parser half where it lives.
+printf '%s' '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: docs-only — the diff adds no assertion.\n' > "$TMP/mut-tsv.txt"
+[ "$(grep -c '' "$TMP/mut-tsv.txt")" = "1" ]; ck $? "fixture: the escaped carrier really is ONE line (otherwise this arm proves nothing about @tsv)"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-tsv.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(ix) a ONE-LINE @tsv-escaped body is parsed (the review-artifact carrier; got '$miss')"
+bash "$GATE" --mutation-missing "$TMP/does-not-exist-mut.txt" 2>/dev/null | grep -qx 'NO-FILE'; ck $? "(x) an UNREADABLE artifact is refused as NO-FILE, never admitted (fail-closed)"
+# ── THE SHAPED-BUT-VACUOUS CARRIERS (fresh-context review of #3442, P1/P2). Each of these carries the
+#    SHAPE of an attribution and NONE of its content — which is the exact vacuity the contract exists to
+#    refuse, so each is a separate arm rather than a variant of (v)–(vii).
+printf '## MUTATION ATTRIBUTION\n\n| assertion (file:line) | mutant | reddened row | observed |\n|---|---|---|---|\n' > "$TMP/mut-hdr-decorated.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-hdr-decorated.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xi) a header whose FIRST CELL is DECORATED ('assertion (file:line)') with no data rows is REFUSED — the header is excluded by POSITION, not by matching its text"
+printf '## MUTATION ATTRIBUTION\r\n\r\n| assertion | mutant | reddened row | observed |\r\n|---|---|---|---|\r\n' > "$TMP/mut-crlf.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-crlf.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xii) …and that header-plus-rule table delivered over CRLF is REFUSED too (the trailing \\r made the RULE the data row)"
+printf '## Review\n\nQuoting the shape:\n\n```\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| example | example | example | ok |\n```\n' > "$TMP/mut-fenced.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-fenced.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xiii) a block inside a TRIPLE-BACKTICK fence is QUOTED, not claimed — the artifact still carries no attribution"
+printf '## MUTATION ATTRIBUTION\n\n| assertion (file:line) | mutant | reddened row | observed |\n|---|---|---|---|\n| a:1 | sed s/x/y/ | §A | ❌ rc=1 |\n' > "$TMP/mut-hdr-decorated-full.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xiv) POSITIVE CONTROL: a decorated header WITH a real data row is ADMITTED — the position rule excludes the header, never the table (got '$miss')"
+# ── CYCLE 2: THE CARRIER THE RECORDER ACTUALLY FEEDS, AND THE TWO DIRECTIONS OF OVER-BLOCK. The
+#    escape reversal runs here because `evidence_fetch` hands this program a `jq @tsv` body; a fix that
+#    only handles a REAL CR/LF file fixes the fixture, not the path that mints records.
+printf '## MUTATION ATTRIBUTION\\r\\n\\r\\n| assertion | mutant | reddened row | observed |\\r\\n|---|---|---|---|\\r\\n' > "$TMP/mut-tsv-crlf.txt"
+[ "$(grep -c '' "$TMP/mut-tsv-crlf.txt")" = "1" ]; ck $? "fixture: the CRLF+@tsv carrier is ONE line of literal \\r\\n escapes (the shape jq @tsv emits)"
+bash "$GATE" --mutation-missing "$TMP/mut-tsv-crlf.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xv) the SAME header-plus-rule table through the @tsv carrier is REFUSED (an escaped \\r left unreversed made the RULE the data row)"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row |\n|---|---|---|\n| a:1 | sed s/a\\nb// | §A |\n' > "$TMP/mut-literal-escape.txt"
+grep -q 's/a\\nb//' "$TMP/mut-literal-escape.txt"; ck $? "fixture: a real multi-line artifact whose CELL contains a literal backslash-n (a newline-editing mutant)"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-literal-escape.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xvi) …is ADMITTED — un-escaping a REAL multi-line body splits that cell and REFUSES an honest row (got '$miss')"
+printf '## Review\n\n~~~text\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| example | example | example | ok |\n~~~\n' > "$TMP/mut-tilde.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-tilde.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xvii) a QUOTE inside a tilde fence is quoted too — CommonMark has two fence characters, and the paste-back shape is the same"
+printf '## MUTATION ATTRIBUTION\n\n    | assertion | mutant | reddened row | observed |\n    |---|---|---|---|\n    | example | example | example | ok |\n' > "$TMP/mut-indented.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-indented.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(xviii) …and a 4-SPACE INDENTED table under a real heading is an indented CODE BLOCK, not a data row — REFUSED, and the token names the COLUMN it therefore never supplied (a two-token match could not tell which guard fired)"
+printf '  ## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\n' > "$TMP/mut-indented-heading.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-indented-heading.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xix) a heading indented by 1–3 spaces is a HEADING (Markdown) and its table is ADMITTED — requiring column 0 would deadlock an honest verdict until it is reflowed (got '$miss')"
+# ── CYCLE 3: THE SUMMARY TABLE ABOVE THE ATTRIBUTION, AND GFM'S OPTIONAL OUTER PIPES.
+#    A "what I ran" table is the NORMAL shape of a review comment, and it sits ABOVE the attribution
+#    table — so a row seen before the header must not survive into it.
+printf '## MUTATION ATTRIBUTION\n\nWhat I ran:\n\n| suite | result | notes |\n|---|---|---|\n| brief-gate.test.sh | 183 pass, 1 known-fail | pre-existing |\n\nNow the attribution:\n\n| assertion | mutant (the edit that reverts the fix) | reddened row | observed |\n|---|---|---|---|\n' > "$TMP/mut-table-before-header.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-table-before-header.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xx) a SUMMARY table above the attribution does not donate a row to it — the attribution header with no rows of its own is REFUSED"
+printf '## MUTATION ATTRIBUTION\n\nassertion | mutant | reddened row | observed\n---|---|---|---\n| x.sh:1 | sed s/a/b/ | §A | rc=1 |\n' > "$TMP/mut-no-outer-pipes.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-no-outer-pipes.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxi) a GFM table WITHOUT outer pipes is a table — the attribution is complete, and telling the reviewer its header lacks a column it has is a false block (got '$miss')"
+
+# ── CYCLE 4: THE FIVE DEFECTS A FRESH-CONTEXT REVIEW OF THIS HEAD FOUND — four carrier holes and one
+#    in the canonical block itself. EVERY one of these was ADMITTED by the cycle-3 parser, so each is
+#    its own arm rather than a variant of (v)–(vii), and §G carries a mutant that reverts its fix.
+printf '## MUTATION ATTRIBUTION\n\n**NO NEW ASSERTIONS:**\n' > "$TMP/mut-none-bold-empty.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-bold-empty.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(xxii) a DECORATED but EMPTY exemption (\`**NO NEW ASSERTIONS:**\`) is REFUSED — the closing emphasis is NOT a reason (fail-open: it minted a clean record with no attribution and no justification)"
+printf '## MUTATION ATTRIBUTION\n\n*NO NEW ASSERTIONS: docs-only — no executable assertion.*\n' > "$TMP/mut-none-decorated.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-none-decorated.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxiii) …and the OTHER direction: an honest DECORATED exemption is ADMITTED — a one-sided strip refused it, which is a false block on the reviewer who decorated a label (got '$miss')"
+printf '## MUTATION ATTRIBUTION\n\n> | assertion | mutant | reddened row |\n> |---|---|---|\n' > "$TMP/mut-blockquote.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-blockquote.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "(xxiv) a BLOCKQUOTED header-plus-rule table is REFUSED as ROWS — the '>' marker made the RULE non-all-separator, so the rule itself became the DATA row and a table with no attribution at all was admitted"
+printf '## Review\n\n```\n~~~\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n```\n' > "$TMP/mut-tilde-in-fence.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-tilde-in-fence.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xxv) a \`~~~\` line INSIDE a triple-backtick block does NOT close it — a fence is closed only by its own character, so the paste-back it quotes stays quoted"
+printf '## Review\n\n```\n    ```\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n```\n' > "$TMP/mut-indented-fence.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-indented-fence.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xxvi) …and a fence line INDENTED BY FOUR inside a fence does not close it either — an indented line is CODE, tested BEFORE the fence (otherwise it re-opened the live region)"
+printf '## MUTATION ATTRIBUTION\n\n| assertion | mutant | reddened |\n|---|---|---|\n| `g.sh:120` the new assertion | `sed s/rc=80/rc=0/` (the mutant) | g.test.sh sec A (reddened) | rc=1 |\n' > "$TMP/mut-honest-wordy.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-honest-wordy.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxvii) a DATA row that happens to spell out all three column words is ADMITTED — ONE header per section, so a row can never reset the row set and refuse the row it was told to write (got '$miss')"
+printf '## MUTATION ATTRIBUTION\n\nI read the diff.\n\n## What I ran\n\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n' > "$TMP/mut-section-close.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-section-close.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(xxviii) a heading at or above the section CLOSES it — an attribution table filed under a LATER heading is not this block's claim"
+# ⛔ THE CANONICAL BLOCK MUST NOT EXEMPT ITSELF (review cycle 4, P1 — FAIL-OPEN, and the worst of the
+# four because the HARNESS teaches it). A LIVE `NO NEW ASSERTIONS:` line inside the block made every
+# artifact pasted from it admissible, so a reviewer who pasted the block and deleted the table minted a
+# clean record on a code diff. It is an INDENTED code block now; this arm is what says so.
+grep -v '^|' "$REV_CANON" > "$TMP/canonical-no-table.txt"
+grep -q '^    NO NEW ASSERTIONS: docs-only' "$TMP/canonical-no-table.txt"; ck $? "fixture: the canonical exemption example survives the table strip (otherwise this arm proves nothing about the paste-back)"
+bash "$GATE" --mutation-missing "$TMP/canonical-no-table.txt" 2>/dev/null | grep -qx 'MUTATION-EXEMPTION-INDENTED'; ck $? "(xxix) the CANONICAL block with its table DELETED is REFUSED — and the token NAMES the indented exemption, because that is what the artifact actually holds; telling its reviewer its TABLE HEADER is wrong sends it to look for a table it never wrote"
+# ⛔ A CLOSING FENCE CARRIES NO INFO STRING (review cycle 5, P1 — FAIL-OPEN). Deriving the fence
+# CHARACTER alone closed the block on an inner fenced command, so a log excerpt ending in one
+# re-opened the live region and the paste-back it was quoting was ADMITTED.
+printf '## Review\n\n```\nsome log\n```bash\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n```\n' > "$TMP/mut-infostring-fence.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-infostring-fence.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xxx) an inner fence line WITH AN INFO STRING (a fenced command inside the block) does not CLOSE it — a closing fence has none, so the quoted table stays quoted"
+printf '## Review\n\n~~~\nlog\n~~~sh\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n~~~\n' > "$TMP/mut-infostring-tilde.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-infostring-tilde.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xxx-b) …and the same hole in the TILDE fence is closed too — one rule, both characters"
+# ⛔ A PLACEHOLDER IS NOT A REASON (review cycle 5, P2). Every carrier that tells a reviewer about the
+# exemption spells it `NO NEW ASSERTIONS: <why>`, so the literal slot is the text most likely pasted,
+# and it minted a clean record on a code diff.
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: <why>\n' > "$TMP/mut-none-slot.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-slot.txt" 2>/dev/null | grep -qx 'MUTATION-EXEMPTION-PLACEHOLDER'; ck $? "(xxxi) an exemption whose only reason is the literal slot the harness itself prints is REFUSED, and the token NAMES the slot — the generic column token would send the reviewer to look for a table it never wrote"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: only docs/<file>.md is touched\n' > "$TMP/mut-none-angle.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-none-angle.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxxi-b) …and a real reason that merely CONTAINS angle brackets is still ADMITTED — only a reason that is nothing but ONE slot is refused (got '$miss')"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: "<why>"\n' > "$TMP/mut-none-quoted.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-quoted.txt" 2>/dev/null | grep -qx 'MUTATION-EXEMPTION-PLACEHOLDER'; ck $? "(xxxi-c) …and the QUOTED re-spelling of the slot is refused too — one layer of quotes comes off before the test, because a paste arrives quoted"
+# ⛔ A TAB IS FOUR COLUMNS (review cycle 6, P1 — FAIL-OPEN). CommonMark expands a leading tab to the
+# next 4-column stop, so a tab-indented exemption IS a code block to every renderer — but it is ONE
+# character, so a four-CHARACTER test let the copied exemption go LIVE.
+printf '## MUTATION ATTRIBUTION\n\n\tNO NEW ASSERTIONS: docs-only.\n' > "$TMP/mut-tab-exemption.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-tab-exemption.txt" 2>/dev/null | grep -qx 'MUTATION-EXEMPTION-INDENTED'; ck $? "(xxxii) a TAB-indented exemption is QUOTED like a four-space one — it is refused as an indented paste-back, not read as the claim"
+# ⛔ INDENT IS COLUMNS, NOT CHARACTERS (final verification, P2 — FAIL-OPEN). A tab advances to the next
+# 4-column stop, so `" \t"` and `"  \t"` are FOUR columns of indent — an indented code block to every
+# renderer — while a character test saw two or three characters and let the copied exemption go LIVE.
+# The miss set was non-monotonic (more indentation was caught, less was not), which is what a rule
+# measuring the wrong thing looks like.
+for _sp in ' \t' '  \t' '   \t' '\t\t' '\t   '; do
+  printf '## MUTATION ATTRIBUTION\n\n%bNO NEW ASSERTIONS: docs-only.\n' "$_sp" > "$TMP/mut-tabstop.txt"
+  bash "$GATE" --mutation-missing "$TMP/mut-tabstop.txt" 2>/dev/null | grep -qx 'MUTATION-EXEMPTION-INDENTED'; ck $? "(xxxv) a tab that reaches the 4-column stop is INDENTED CODE — refused as a paste-back (spacing: $(printf '%s' "$_sp" | cat -v))"
+done
+# ⛔ AND THE EMPTINESS TEST READS THE STRIPPED FORM (final verification, P2 — FAIL-OPEN). `\"\"` is an
+# empty reason with a quoted pair around it, so `length(r)` saw two characters and minted a clean record.
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: ""\n' > "$TMP/mut-none-quoted-empty.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-quoted-empty.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(xxxvi) an EMPTY quoted reason is REFUSED — the quotes are decoration, not a reason"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: "   "\n' > "$TMP/mut-none-quoted-space.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-none-quoted-space.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "(xxxvi-b) …and a WHITESPACE-ONLY quoted reason is refused too (same defect, one more spelling)"
+printf '## MUTATION ATTRIBUTION\n\nNO NEW ASSERTIONS: the reviewer wrote "no new assertions" elsewhere\n' > "$TMP/mut-none-quotes.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-none-quotes.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxxvi-c) …but a real reason that CONTAINS quotes is still admitted — the strip is one layer, not a ban (got '$miss')"
+# ⛔ THE CLOSER IS MEASURED (review cycle 6, P1/P2). A closing fence carries no info string AND must be
+# at least as long as the opener; the character alone expresses neither.
+printf '## Review\n\n````markdown\nRun it:\n\n```bash\necho hi\n```\n\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n````\n' > "$TMP/mut-4tick-inner.txt"
+bash "$GATE" --mutation-missing "$TMP/mut-4tick-inner.txt" 2>/dev/null | grep -qx 'MUTATION-ATTRIBUTION'; ck $? "(xxxiii) a 4-TICK block quoting fenced markdown is NOT closed by the inner 3-tick run — a shorter run is content, so the whole quote stays quoted"
+printf '## Review\n\n````markdown\n```bash\necho hi\n```\n`````\n\n## MUTATION ATTRIBUTION\n| assertion | mutant | reddened |\n|---|---|---|\n| a | b | c |\n' > "$TMP/mut-longer-closer.txt"
+miss="$(bash "$GATE" --mutation-missing "$TMP/mut-longer-closer.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "(xxxiv) …and a LONGER closer (five ticks closing four) DOES close — CommonMark permits it, and refusing it told the reviewer it had no section that is plainly there (got '$miss')"
+
+# ── §G THE MUTATION PROOF: each §F assertion above must be able to FAIL. Same discipline as §C — the
+# mutant is derived FROM THE SHIPPED FILE so it tracks it, and the transformation is itself asserted.
+echo
+echo "§G NON-VACUITY of §F — removing the requirement makes §F's refusals pass, and the mutant is alive"
+# ⛔ NO TRAILING COMMENT IN THE REPLACEMENT: `if false  # MUTANT…` swallows the `; then` that follows
+# on the same line and yields a mutant that fails to PARSE — a mutation that fails for the wrong reason.
+sed 's/if \[ "$role" = "reviewer" \]/if false/' "$GATE" > "$TMP/mutant-no-role.sh"
+cmp -s "$GATE" "$TMP/mutant-no-role.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the role mutation REALLY changed the file (both role tests still match the anchor)"
+# ⛔ NO PIPE: `grep -c` writes its count ONCE at EOF, but a `| grep -q` consumer exits on the
+# first match — the SIGPIPE/#841 idiom, refused by `scripts/check-no-sigpipe-grep.sh` (this
+# line was the `sigpipe-grep` red on PR #3481). Test the count directly instead.
+[ "$(grep -c 'if false; then' "$TMP/mutant-no-role.sh" || true)" = "4" ]; ck $? "§G …and it replaced ALL FOUR role tests (two parse branches + the section render + the disclosure), which is the pre-#3442 behaviour: nothing asked"
+bash -n "$TMP/mutant-no-role.sh"; ck $? "§G the mutant still parses — a program, not a syntax error"
+bash "$TMP/mutant-no-role.sh" --check "$TMP/reviewer-no-mutation.txt" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "§G ⛔ MUTATION: §F(i) 'a reviewer brief with no attribution is REFUSED' now FAILS — the mutant admits it (rc=$rc)"
+bash "$TMP/mutant-no-role.sh" --check "$REV_CANON" reviewer >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "§G …and the control still passes, so the flip is the missing requirement and not a broken fixture (rc=$rc)"
+# …and the OTHER direction on the PARSER half: a mutant that stops requiring the mutant COLUMN makes
+# §F(vi) — the single most load-bearing arm, since a table with no mutant column is the shape a real
+# reviewer writes when it believes prose is enough — pass.
+sed 's|^  if (!hdr) {$|  if (0) {|' "$GATE" > "$TMP/mutant-no-column.sh"
+cmp -s "$GATE" "$TMP/mutant-no-column.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the column mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-no-column.sh"; ck $? "§G …and the column mutant still parses"
+miss="$(bash "$TMP/mutant-no-column.sh" --mutation-missing "$TMP/mut-nocol.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(vi) 'a table whose header never names the mutant is REFUSED' now FAILS — the mutant admits it (got '$miss')"
+
+# §F(xi)/(xii) — the header is excluded from `row` BY POSITION. The mutant drops that index, so the
+# header counts as its own data row and a header-only table is admitted (measured: the decorated-header
+# and CRLF fixtures both return EMPTY under it, which is §F(xi) and §F(xii) failing).
+sed 's/i > hl) row = 1/1) row = 1  # MUTANT: a header may count as its own row/' "$GATE" > "$TMP/mutant-hdr-row.sh"
+cmp -s "$GATE" "$TMP/mutant-hdr-row.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the header-position mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-hdr-row.sh"; ck $? "§G …and the header-position mutant still parses"
+for _f in mut-hdr-decorated mut-crlf; do
+  miss="$(bash "$TMP/mutant-hdr-row.sh" --mutation-missing "$TMP/$_f.txt" 2>/dev/null)"
+  [ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xi)/(xii) on '$_f' now FAILS — the mutant lets the HEADER be the row (got '$miss')"
+done
+
+# §F(xii)'s SECOND half — the trailing CR is what made the RULE the data row. The mutant keeps the
+# position rule and drops the CR strip, so only the CRLF fixture is admitted: the arm is load-bearing
+# for the strip, not merely a restatement of the position rule.
+sed 's/; sub(\/\\r\$\/, "", line)//' "$GATE" > "$TMP/mutant-cr.sh"
+cmp -s "$GATE" "$TMP/mutant-cr.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the CR-strip mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-cr.sh"; ck $? "§G …and the CR-strip mutant still parses"
+miss="$(bash "$TMP/mutant-cr.sh" --mutation-missing "$TMP/mut-crlf.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xii) now FAILS — without the strip the all-separator RULE is the data row (got '$miss')"
+miss="$(bash "$TMP/mutant-cr.sh" --mutation-missing "$TMP/mut-hdr-decorated.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G …and the \\r-less fixture is STILL refused, so the strip is what the arm tests (got '$miss')"
+
+# §F(xiii) — fenced material is quoted, never claimed. The mutant stops the fence from OPENING, so the
+# quoted block is parsed as the artifact's own claim.
+# ⛔ NO TRAILING COMMENT: the replacement sits mid-line (`else if (…)` follows it), so a `#` here
+# would swallow the rest of the statement and yield a syntax error instead of a mutant.
+sed 's|if (!fence) {|if (0) {|' "$GATE" > "$TMP/mutant-fence.sh"
+cmp -s "$GATE" "$TMP/mutant-fence.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the fence mutation REALLY changed the file (the awk anchor still matches)"
+bash -n "$TMP/mutant-fence.sh"; ck $? "§G …and the fence mutant still parses"
+miss="$(bash "$TMP/mutant-fence.sh" --mutation-missing "$TMP/mut-fenced.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xiii) now FAILS — the mutant admits a paste-back of the worked example (got '$miss')"
+
+# §F(xv) — the `\r` half of the escape reversal. Emptying that branch's body makes a `\r` fall
+# through unchanged, which is the pre-fix behaviour on the @tsv carrier: the escaped CR survives as a
+# cell, `|---|` stops being all-separator, and the RULE becomes the data row.
+sed 's/if (nx == "r")  { out = out "\\r"; i++; continue }/if (nx == "r")  { }  # MUTANT: the escaped CR is not reversed/' "$GATE" > "$TMP/mutant-tsvcr.sh"
+cmp -s "$GATE" "$TMP/mutant-tsvcr.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the escaped-CR mutation REALLY changed the file (the un-escape anchor still matches)"
+bash -n "$TMP/mutant-tsvcr.sh"; ck $? "§G …and the escaped-CR mutant still parses"
+miss="$(bash "$TMP/mutant-tsvcr.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the escaped-CR mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-tsvcr.sh" --mutation-missing "$TMP/mut-tsv-crlf.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xv) now FAILS — the @tsv carrier admits the vacuous table again (got '$miss')"
+
+# §F(xvi) — the single-record DETECTION. Dropping it applies the reversal to real multi-line bodies
+# too, which un-escapes a literal `\n` inside a cell and splits the row: an honest verdict refused.
+sed 's/if (nraw == 1 || (nraw == 2 \&\& RAW\[2\] == "")) buf = _unescape(buf)/buf = _unescape(buf)  # MUTANT: un-escape unconditionally/' "$GATE" > "$TMP/mutant-uncond.sh"
+cmp -s "$GATE" "$TMP/mutant-uncond.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the single-record mutation REALLY changed the file (the detection anchor still matches)"
+bash -n "$TMP/mutant-uncond.sh"; ck $? "§G …and the single-record mutant still parses"
+miss="$(bash "$TMP/mutant-uncond.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the single-record mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-uncond.sh" --mutation-missing "$TMP/mut-literal-escape.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xvi) now FAILS — the honest row is refused over a cell that merely mentions a newline edit (got '$miss')"
+
+# §F(xvii) — the tilde fence. The mutant stops recognising `~~~`, so the quoted block parses as a
+# claim. §F(xviii) has its own mutant because the indented block is a different markdown construct.
+# ⛔ AND EVERY MUTANT BELOW IS PROVEN TO STILL *ANSWER*: a sed that fails to apply leaves an EMPTY
+# program, which `bash -n` accepts and which admits everything — a false green this suite hit once.
+sed 's@/^(```|~~~)/@/^(```)/@' "$GATE" > "$TMP/mutant-tilde.sh"
+cmp -s "$GATE" "$TMP/mutant-tilde.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the tilde-fence mutation REALLY changed the file (the fence regex anchor still matches)"
+bash -n "$TMP/mutant-tilde.sh"; ck $? "§G …and the tilde-fence mutant still parses"
+miss="$(bash "$TMP/mutant-tilde.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the tilde-fence mutant still ANSWERS (a control is admitted, so it is a mutation and not a broken program; got '$miss')"
+miss="$(bash "$TMP/mutant-tilde.sh" --mutation-missing "$TMP/mut-tilde.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xvii) now FAILS — the mutant admits a quoted block fenced with tildes (got '$miss')"
+
+# §F(xviii) — the 4-space INDENTED block: same paste-back, no fence at all.
+sed 's@if (icol >= 4) {@if (0) {@' "$GATE" > "$TMP/mutant-indent.sh"
+cmp -s "$GATE" "$TMP/mutant-indent.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the indented-block mutation REALLY changed the file (the indent anchor still matches)"
+bash -n "$TMP/mutant-indent.sh"; ck $? "§G …and the indented-block mutant still parses"
+miss="$(bash "$TMP/mutant-indent.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the indented-block mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-indent.sh" --mutation-missing "$TMP/mut-indented.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xviii) now FAILS — the mutant reads the indented code block as a data row (got '$miss')"
+# …and the SAME guard is what keeps a 4-space INDENTED FENCE from closing an open fence (§F(xxvi)),
+# because the indent test runs BEFORE the fence test.
+miss="$(bash "$TMP/mutant-indent.sh" --mutation-missing "$TMP/mut-indented-fence.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxvi) now FAILS too — an indented fence line closes the block and the quoted table is admitted (got '$miss')"
+
+# §F(xix) — the heading indent allowance. Narrowing it back to column 0 refuses a Markdown-valid
+# indented heading, which is the false block the allowance exists to remove.
+sed 's@if (icol >= 4) {@if (icol >= 1) {@' "$GATE" > "$TMP/mutant-hindent.sh"
+cmp -s "$GATE" "$TMP/mutant-hindent.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the heading-indent mutation REALLY changed the file (the indent-allowance anchor still matches)"
+bash -n "$TMP/mutant-hindent.sh"; ck $? "§G …and the heading-indent mutant still parses"
+miss="$(bash "$TMP/mutant-hindent.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the heading-indent mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-hindent.sh" --mutation-missing "$TMP/mut-indented-heading.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xix) now FAILS — a 2-space-indented heading is refused as if there were no block (got '$miss')"
+
+# §F(xx) — the header RESETS the row. Without the reset a row from a summary table ABOVE the header
+# survives into it, and a header-only attribution table is admitted.
+sed 's/hdr = 1; hl = i; row = 0/hdr = 1; hl = i/' "$GATE" > "$TMP/mutant-noreset.sh"
+cmp -s "$GATE" "$TMP/mutant-noreset.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the row-reset mutation REALLY changed the file (the header anchor still matches)"
+bash -n "$TMP/mutant-noreset.sh"; ck $? "§G …and the row-reset mutant still parses"
+miss="$(bash "$TMP/mutant-noreset.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the row-reset mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-noreset.sh" --mutation-missing "$TMP/mut-table-before-header.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xx) now FAILS — the summary row above the header is inherited, so the vacuous table is admitted (got '$miss')"
+
+# §F(xxi) — outer pipes are OPTIONAL in GFM. Restoring the column-0 requirement refuses an honest
+# table, which is the false block the widening removes.
+sed 's@if (l ~ /.|/) {@if (l ~ /^\\|/) {@' "$GATE" > "$TMP/mutant-outerpipe.sh"
+cmp -s "$GATE" "$TMP/mutant-outerpipe.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the outer-pipe mutation REALLY changed the file (the table-line anchor still matches)"
+bash -n "$TMP/mutant-outerpipe.sh"; ck $? "§G …and the outer-pipe mutant still parses"
+miss="$(bash "$TMP/mutant-outerpipe.sh" --mutation-missing "$TMP/mut-hdr-decorated-full.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and the outer-pipe mutant still ANSWERS (control admitted; got '$miss')"
+miss="$(bash "$TMP/mutant-outerpipe.sh" --mutation-missing "$TMP/mut-no-outer-pipes.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxi) now FAILS — an honest pipe-less table is refused again (got '$miss')"
+
+# ── THE ARMS THAT ONLY FALSIFY THE **OVER-BLOCK** DIRECTION, WHICH HAD NO MUTANT AT ALL (cycle-3
+#    review, P2). §F(ii)/(iv-b) are the scoping half: making the reviewer requirement GLOBAL is the
+#    plausible well-meaning defect, and it would deadlock every lane dispatch. §F(iii)/(viii)/(ix)/(x)
+#    are the reachability half — a parser that refuses EVERYTHING passes every refusal arm in §F.
+sed 's/if \[ "$role" = "reviewer" \]/if true/' "$GATE" > "$TMP/mutant-role-true.sh"
+cmp -s "$GATE" "$TMP/mutant-role-true.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the over-block role mutation REALLY changed the file (both role tests still match the anchor)"
+bash -n "$TMP/mutant-role-true.sh"; ck $? "§G …and the over-block mutant still parses"
+bash "$TMP/mutant-role-true.sh" --check "$TMP/reviewer-no-mutation.txt" lane >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "§G ⛔ MUTATION: §F(ii) 'the SAME brief is still admitted for role lane' now FAILS — a global requirement refuses a lane brief (rc=$rc)"
+bash "$TMP/mutant-role-true.sh" --line lane 2>/dev/null | grep -q '3442'; ck $? "§G ⛔ MUTATION: §F(iv-b) 'the LANE line does not name the block' now FAILS — the mutant's lane line demands it"
+
+sed 's/if (none) exit/if (0) exit/' "$GATE" > "$TMP/mutant-none.sh"
+cmp -s "$GATE" "$TMP/mutant-none.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the exemption mutation REALLY changed the file (the NO NEW ASSERTIONS anchor still matches)"
+bash -n "$TMP/mutant-none.sh"; ck $? "§G …and the exemption mutant still parses"
+bash "$TMP/mutant-none.sh" --mutation-missing "$TMP/mut-none.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "§G ⛔ MUTATION: §F(viii) 'NO NEW ASSERTIONS is REACHABLE' now FAILS — the mutant refuses the exemption"
+
+sed 's/if (nx == "n")  { out = out ".n"; i++; continue }/if (nx == "n")  { }/' "$GATE" > "$TMP/mutant-nl.sh"
+cmp -s "$GATE" "$TMP/mutant-nl.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the escaped-LF mutation REALLY changed the file (the un-escape anchor still matches)"
+bash -n "$TMP/mutant-nl.sh"; ck $? "§G …and the escaped-LF mutant still parses"
+bash "$TMP/mutant-nl.sh" --mutation-missing "$TMP/mut-tsv.txt" 2>/dev/null | grep -qx 'MUTATION-MUTANT-COLUMN'; ck $? "§G ⛔ MUTATION: §F(ix) 'a ONE-LINE @tsv body is parsed' now FAILS — without the LF reversal the escaped carrier has no heading"
+
+sed 's/printf .NO-FILE.n./:/' "$GATE" > "$TMP/mutant-nofile.sh"
+cmp -s "$GATE" "$TMP/mutant-nofile.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the NO-FILE mutation REALLY changed the file (the refusal anchors still match)"
+bash -n "$TMP/mutant-nofile.sh"; ck $? "§G …and the NO-FILE mutant still parses"
+miss="$(bash "$TMP/mutant-nofile.sh" --mutation-missing "$TMP/does-not-exist-mut.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(x) 'an UNREADABLE artifact is refused as NO-FILE' now FAILS — a missing file reads as clean (got '$miss')"
+
+# ── CYCLE 4 — ONE MUTANT PER CARRIER FIX, each derived from the shipped file. A fix with no mutant is
+#    the exact thing this PR exists to refuse: an assertion nobody ever tried to break.
+
+# §F(xxii)/(xxiii) — the DECORATION strip. This mutant restores the PRE-FIX handling exactly (strip a
+# leading `**`/`__` only, measure the reason without stripping), which is what made an empty exemption
+# admit AND an honest decorated one refuse. Both directions must go red.
+# ⛔ THE DELIMITER IS `@`, NOT `|`: the replacement contains a `|` (the awk alternation in
+# `sub(/^(\*\*|__)/, …)`), which would terminate an `s|…|…|` command early — measured: sed reported
+# `unknown option to 's'`, the mutation silently did NOT apply, and the arm below read the FLIP as a
+# missing flip. That is the "a mutation that did not apply is a false green" trap, so the application
+# is asserted on BOTH sides (the new call present, the old one gone).
+sed -e 's@nn = _undress(l)@sub(/^(\\*\\*|__)/, "", l); nn = l@' \
+    -e 's@r = _undress(r)@r = r@' \
+    -e 's@_undress(rq)@rq@g' \
+    "$GATE" > "$TMP/mutant-undress.sh"
+cmp -s "$GATE" "$TMP/mutant-undress.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the decoration-strip mutation REALLY changed the file (both anchors still match)"
+# ⛔ ASSERT THE EXECUTABLE FORMS, NOT THE WORD: `_undress` also appears in the function definition and
+# in two comments, so a bare `grep -c _undress` can never reach zero and the assertion would be red on
+# a perfectly good mutant. These three patterns are the CALL SITES.
+[ "$(grep -c 'length(_undress(rq))' "$TMP/mutant-undress.sh" || true)" = "0" ] && [ "$(grep -c 'nn = _undress(l)' "$TMP/mutant-undress.sh" || true)" = "0" ] && [ "$(grep -c 'r = _undress(r)' "$TMP/mutant-undress.sh" || true)" = "0" ]; ck $? "§G …and EVERY strip call site was really replaced (the decoration rule has THREE now, because the emptiness test strips too — a two-site mutant would leave that guard standing and prove nothing)"
+bash -n "$TMP/mutant-undress.sh"; ck $? "§G …and the decoration-strip mutant still parses"
+bash "$TMP/mutant-undress.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the decoration-strip mutant still REFUSES a header-only table — a REFUSAL control, because an EMPTY program admits everything and would satisfy an ADMISSION control (the false green this suite already hit once)"
+miss="$(bash "$TMP/mutant-undress.sh" --mutation-missing "$TMP/mut-none-bold-empty.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxii) 'a DECORATED but EMPTY exemption is REFUSED' now FAILS — the mutant admits it (got '$miss')"
+miss="$(bash "$TMP/mutant-undress.sh" --mutation-missing "$TMP/mut-none-decorated.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxiii) 'an honest DECORATED exemption is ADMITTED' now FAILS — the mutant refuses it (got '$miss')"
+
+# §F(xxiv) — the BLOCKQUOTE strip. Without it the `>` marker is the first cell, the rule stops being
+# all-separator, and the rule itself becomes the data row.
+sed 's|while (bq) { bq = sub(/^\[ \\t\]\*>\[ \\t\]?/, "", l) }|while (0) { }|' "$GATE" > "$TMP/mutant-blockquote.sh"
+cmp -s "$GATE" "$TMP/mutant-blockquote.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the blockquote-strip mutation REALLY changed the file (the strip anchor still matches)"
+bash -n "$TMP/mutant-blockquote.sh"; ck $? "§G …and the blockquote-strip mutant still parses"
+bash "$TMP/mutant-blockquote.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the blockquote-strip mutant still REFUSES a header-only table — a REFUSAL control, because an EMPTY program admits everything and would satisfy an ADMISSION control (the false green this suite already hit once)"
+bash "$TMP/mutant-blockquote.sh" --mutation-missing "$TMP/mut-blockquote.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G ⛔ MUTATION: §F(xxiv) 'a BLOCKQUOTED header-plus-rule table is REFUSED as ROWS' now FAILS — the marker defeats the all-separator check (got '$(bash "$TMP/mutant-blockquote.sh" --mutation-missing "$TMP/mut-blockquote.txt" 2>/dev/null)')"
+
+# §F(xxv) — the FENCE CHARACTER. Back to one boolean, so a \`~~~\` line inside a \`\`\` block re-opens the
+# live region and the paste-back it was quoting is ADMITTED.
+sed 's|else if (fc == fencec|else if (1|' "$GATE" > "$TMP/mutant-fencechar.sh"
+cmp -s "$GATE" "$TMP/mutant-fencechar.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the fence-character mutation REALLY changed the file (the fence-state anchor still matches)"
+bash -n "$TMP/mutant-fencechar.sh"; ck $? "§G …and the fence-character mutant still parses"
+bash "$TMP/mutant-fencechar.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the fence-character mutant still REFUSES a header-only table — a REFUSAL control, because an EMPTY program admits everything and would satisfy an ADMISSION control (the false green this suite already hit once)"
+miss="$(bash "$TMP/mutant-fencechar.sh" --mutation-missing "$TMP/mut-tilde-in-fence.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxv) now FAILS — a \`~~~\` inside a \`\`\` block closes it and the quoted table is admitted (got '$miss')"
+
+# §F(xxvii) — the ONE-HEADER-PER-SECTION guard. Without `!hdr` any row whose cells spell out the three
+# column words is a new header, so an honest single-row attribution is refused (the false block).
+sed 's|if (!hdr && t ~ /mutant/|if (t ~ /mutant/|' "$GATE" > "$TMP/mutant-hdr-any.sh"
+cmp -s "$GATE" "$TMP/mutant-hdr-any.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the one-header mutation REALLY changed the file (the header anchor still matches)"
+bash -n "$TMP/mutant-hdr-any.sh"; ck $? "§G …and the one-header mutant still parses"
+bash "$TMP/mutant-hdr-any.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the one-header mutant still REFUSES a header-only table — a REFUSAL control, because an EMPTY program admits everything and would satisfy an ADMISSION control (the false green this suite already hit once)"
+miss="$(bash "$TMP/mutant-hdr-any.sh" --mutation-missing "$TMP/mut-honest-wordy.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxvii) now FAILS — a data row that names the column words is read as a new header and the honest attribution is refused (got '$miss')"
+
+# §F(xxviii) — the SECTION CLOSE. Pinned to the shipped rule and mutated in place, because a guard the
+# PR itself documents but nothing breaks is exactly the invisibility this contract exists to end.
+sed 's|if (ins && nh > 0 && nh <= depth) ins = 0|if (0) ins = 0|' "$GATE" > "$TMP/mutant-secclose.sh"
+cmp -s "$GATE" "$TMP/mutant-secclose.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the section-close mutation REALLY changed the file (the close anchor still matches)"
+bash -n "$TMP/mutant-secclose.sh"; ck $? "§G …and the section-close mutant still parses"
+bash "$TMP/mutant-secclose.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the section-close mutant still REFUSES a header-only table — a REFUSAL control, because an EMPTY program admits everything and would satisfy an ADMISSION control (the false green this suite already hit once)"
+miss="$(bash "$TMP/mutant-secclose.sh" --mutation-missing "$TMP/mut-section-close.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxviii) now FAILS — the section never closes and a table under a later heading is credited to it (got '$miss')"
+
+# §F(xxix) — the CANONICAL block cannot exempt itself. The mutant de-indents the worked 'NO NEW
+# ASSERTIONS' line, making it a LIVE claim again: the paste-back hole this fix closes.
+sed 's|^    NO NEW ASSERTIONS: docs-only|NO NEW ASSERTIONS: docs-only|' "$GATE" > "$TMP/mutant-canonlive.sh"
+cmp -s "$GATE" "$TMP/mutant-canonlive.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the canonical-exemption mutation REALLY changed the file (the indented example anchor still matches)"
+bash -n "$TMP/mutant-canonlive.sh"; ck $? "§G …and the canonical-exemption mutant still parses"
+bash "$TMP/mutant-canonlive.sh" --section reviewer > "$TMP/canon-live.txt" 2>/dev/null; rc=$?
+[ "$rc" -eq 0 ]; ck $? "§G …and it still RENDERS the reviewer brief (rc=$rc) — a mutation, not a broken program"
+grep -v '^|' "$TMP/canon-live.txt" > "$TMP/canon-live-notable.txt"
+miss="$(bash "$TMP/mutant-canonlive.sh" --mutation-missing "$TMP/canon-live-notable.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxix) now FAILS — the canonical block's LIVE exemption admits the artifact with its table deleted (got '$miss')"
+
+# §F(vi)/(vi-b)/(vi-c) — EACH column key, mutated on its OWN. Before cycle 4 one fixture omitted two
+# keys at once, so deleting any single term of the header test stayed green; these three arms are what
+# make a one-key deletion a RED.
+# ⛔ EVERY `&&` IN A SED *REPLACEMENT* MUST BE `\&\&`: a bare `&` stands for the WHOLE MATCH, so an
+# unescaped one silently splices the matched text into the mutant and yields a program that ERRORS at
+# runtime — empty stdout, which reads as "admitted" and turned three of these arms into false greens
+# until the refusal control below caught it.
+for _spec in \
+  'mutant|if (!hdr \&\& t ~ /assertion/ \&\& t ~ /redden/)|mut-nocol|no-MUTANT' \
+  'redden|if (!hdr \&\& t ~ /mutant/ \&\& t ~ /assertion/)|mut-noredden|no-REDDENED-ROW' \
+  'assertion|if (!hdr \&\& t ~ /mutant/ \&\& t ~ /redden/)|mut-noassertion|no-ASSERTION'; do
+  _term="${_spec%%|*}"; _rest="${_spec#*|}"
+  _repl="${_rest%%|*}"; _rest="${_rest#*|}"
+  _fixt="${_rest%%|*}"; _label="${_rest#*|}"
+  sed "s|if (!hdr && t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/)|${_repl}|" \
+    "$GATE" > "$TMP/mutant-col-$_term.sh"
+  cmp -s "$GATE" "$TMP/mutant-col-$_term.sh"; rc=$?
+  [ "$rc" -ne 0 ]; ck $? "§G the '$_label' column mutation REALLY changed the file (the header anchor still matches)"
+  bash -n "$TMP/mutant-col-$_term.sh"; ck $? "§G …and the '$_label' mutant still parses"
+bash "$TMP/mutant-col-$_term.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the '$_label' mutant still REFUSES a header-only table — a REFUSAL control, because an EMPTY program admits everything and would satisfy an ADMISSION control (the false green this suite already hit once)"
+  miss="$(bash "$TMP/mutant-col-$_term.sh" --mutation-missing "$TMP/$_fixt.txt" 2>/dev/null)"
+  [ -z "$miss" ]; ck $? "§G ⛔ MUTATION: the §F arm for '$_label' now FAILS — the mutant treats the key $_term as optional and admits the incomplete table (got '$miss')"
+done
+
+# §F(xxx) — the CLOSING FENCE has no info string. Dropping that clause closes the block on an inner
+# fenced command and admits the paste-back it was quoting.
+sed 's|rest ~ /^|rest !~ /^|' "$GATE" > "$TMP/mutant-fenceinfo.sh"
+cmp -s "$GATE" "$TMP/mutant-fenceinfo.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the fence-info mutation REALLY changed the file (the close-clause anchor still matches)"
+bash -n "$TMP/mutant-fenceinfo.sh"; ck $? "§G …and the fence-info mutant still parses"
+bash "$TMP/mutant-fenceinfo.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the fence-info mutant still REFUSES a header-only table (a refusal control, so an empty program cannot pass as a mutation)"
+miss="$(bash "$TMP/mutant-fenceinfo.sh" --mutation-missing "$TMP/mut-infostring-fence.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxx) now FAILS — an inner fenced command closes the block and the quoted table is admitted (got '$miss')"
+miss="$(bash "$TMP/mutant-fenceinfo.sh" --mutation-missing "$TMP/mut-infostring-tilde.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxx-b) now FAILS too — the same clause protects BOTH fence characters, so one mutant kills both arms and neither is unguarded"
+
+# §F(xxxii) — a TAB is four columns. Dropping the tab alternative from the indent test lets the copied
+# exemption go live, which is the fail-open this arm exists for.
+# §F(xxxii)/(xxxv) — INDENT IS COLUMNS. Two mutants, because the rule has two halves: counting a tab
+# as ONE column lets `" \t"` through, and treating a tab as zero would refuse an honest exemption.
+sed 's@for (tw = 4 - (col % 4); tw > 0; tw--)@for (tw = 1; tw > 0; tw--)@' "$GATE" > "$TMP/mutant-tab.sh"
+cmp -s "$GATE" "$TMP/mutant-tab.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the tab-stop mutation REALLY changed the file (the expansion-loop anchor still matches)"
+bash -n "$TMP/mutant-tab.sh"; ck $? "§G …and the tab-stop mutant still parses"
+bash "$TMP/mutant-tab.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the tab-stop mutant still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-tab.sh" --mutation-missing "$TMP/mut-tab-exemption.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxii) now FAILS — a tab counts as ONE column, so the copied exemption goes live (got '$miss')"
+sed 's@if (c == "\\t") {@if (c == "\\t" \&\& 0) {@' "$GATE" > "$TMP/mutant-tabzero.sh"
+cmp -s "$GATE" "$TMP/mutant-tabzero.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the tab-ignored mutation REALLY changed the file (the tab-branch anchor still matches)"
+bash -n "$TMP/mutant-tabzero.sh"; ck $? "§G …and the tab-ignored mutant still parses"
+bash "$TMP/mutant-tabzero.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the tab-ignored mutant still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-tabzero.sh" --mutation-missing "$TMP/mut-tab-exemption.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxii)/(xxxv) now FAIL — a tab contributes no columns, so tab-indented code is read as the live claim (got '$miss')"
+
+# §F(xxxiii)/(xxxiv) — the measured closer. Two clauses, two mutants: dropping the LENGTH test lets a
+# shorter inner run close the block, and requiring EQUALITY refuses a legal longer closer.
+sed 's@fc == fencec && flen >= fencelen && rest@fc == fencec \&\& rest@' "$GATE" > "$TMP/mutant-fenlen.sh"
+cmp -s "$GATE" "$TMP/mutant-fenlen.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the fence-length mutation REALLY changed the file (the close-clause anchor still matches)"
+bash -n "$TMP/mutant-fenlen.sh"; ck $? "§G …and the fence-length mutant still parses"
+bash "$TMP/mutant-fenlen.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the fence-length mutant still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-fenlen.sh" --mutation-missing "$TMP/mut-4tick-inner.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxiii) now FAILS — the inner 3-tick run closes a 4-tick block and the quoted table is admitted (got '$miss')"
+sed 's@flen >= fencelen@flen == fencelen@' "$GATE" > "$TMP/mutant-fenlen-eq.sh"
+cmp -s "$GATE" "$TMP/mutant-fenlen-eq.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the fence-length-equality mutation REALLY changed the file (the comparison anchor still matches)"
+bash -n "$TMP/mutant-fenlen-eq.sh"; ck $? "§G …and the fence-length-equality mutant still parses"
+bash "$TMP/mutant-fenlen-eq.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and it still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-fenlen-eq.sh" --mutation-missing "$TMP/mut-longer-closer.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxiv) now FAILS — a legal LONGER closer is refused and the artifact is told it has no section (got '$miss')"
+
+# §F(xxxi-b) — the over-refusal direction. Inverting the slot test to reject ANY angle bracket must red
+# the arm that says a real reason with angle brackets is still admitted.
+# ⛔ `\&\&` IN THE REPLACEMENT: a bare `&` splices the whole match in, and the resulting program dies
+# at runtime — empty stdout, which reads as "admitted". The refusal control on the next line is what
+# makes that visible instead of a silent false green.
+sed 's@if (length(_undress(rq)) > 0 && rq !~ /^<@if (0 \&\& rq !~ /^<@' "$GATE" > "$TMP/mutant-slotwide.sh"
+cmp -s "$GATE" "$TMP/mutant-slotwide.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the wide-slot mutation REALLY changed the file (the slot-test anchor still matches)"
+bash -n "$TMP/mutant-slotwide.sh"; ck $? "§G …and the wide-slot mutant still parses"
+bash "$TMP/mutant-slotwide.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the wide-slot mutant still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-slotwide.sh" --mutation-missing "$TMP/mut-none-angle.txt" 2>/dev/null)"
+[ -n "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxi-b) now FAILS — an over-refusing parser rejects an honest reason that mentions a path (got '$miss')"
+
+# §F(xxxvi) — the reason is measured AFTER the quote strip. Reverting to the pre-strip length mints a
+# clean record over `NO NEW ASSERTIONS: ""`, which is an exemption with no reason at all.
+sed 's@if (length(_undress(rq)) > 0 && rq !~ /^<@if (length(r) > 0 \&\& rq !~ /^<@' "$GATE" > "$TMP/mutant-emptystrip.sh"
+cmp -s "$GATE" "$TMP/mutant-emptystrip.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the pre-strip-emptiness mutation REALLY changed the file (the emptiness anchor still matches)"
+bash -n "$TMP/mutant-emptystrip.sh"; ck $? "§G …and the pre-strip-emptiness mutant still parses"
+bash "$TMP/mutant-emptystrip.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and it still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-emptystrip.sh" --mutation-missing "$TMP/mut-none-quoted-empty.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxvi) now FAILS — the quote pair makes an EMPTY reason look non-empty (got '$miss')"
+
+# §F(xxxi) — a PLACEHOLDER is not a reason. Dropping the slot test mints a clean record over the
+# literal `NO NEW ASSERTIONS: <why>` every carrier tells a reviewer to write.
+sed 's|rq !~ /^<|rq !~ /^QQ|' "$GATE" > "$TMP/mutant-slot.sh"
+cmp -s "$GATE" "$TMP/mutant-slot.sh"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "§G the placeholder mutation REALLY changed the file (the slot-test anchor still matches)"
+bash -n "$TMP/mutant-slot.sh"; ck $? "§G …and the placeholder mutant still parses"
+bash "$TMP/mutant-slot.sh" --mutation-missing "$TMP/mut-norow.txt" 2>/dev/null | grep -qx 'MUTATION-ROWS'; ck $? "§G …and the placeholder mutant still REFUSES a header-only table (refusal control)"
+miss="$(bash "$TMP/mutant-slot.sh" --mutation-missing "$TMP/mut-none-slot.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G ⛔ MUTATION: §F(xxxi) now FAILS — the literal slot is admitted as an exemption (got '$miss')"
+miss="$(bash "$TMP/mutant-slot.sh" --mutation-missing "$TMP/mut-none-angle.txt" 2>/dev/null)"
+[ -z "$miss" ]; ck $? "§G …and it still ADMITS a real reason with angle brackets, so the arm tests the SLOT rule and not the characters (got '$miss')"
+
+echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
 # ── the stub `pi` records every invocation, so "refused" is proven by ABSENCE, and the admitted
 #    control proves the machinery under it actually works (a negative assert alone passes on a tree
@@ -217,7 +750,11 @@ res="$(drive_m1 "$TMP/no-contradiction.txt")"
 [ "$res" = "rc=80 started=0" ]; ck $? "merge-one.sh's run_agent REFUSES an invalid reviewer brief: 80, started=0 ($res)"
 [ -s "$PI_LOG" ]; rc=$?
 [ "$rc" -ne 0 ]; ck $? "…and the reviewer model was NOT invoked"
-res="$(drive_m1 "$CANON")"
+# ⛔ THE POSITIVE CONTROL USES THE REVIEWER BRIEF, NOT `$CANON` (agent-infra#3442): merge-one.sh's
+# `run_agent` gates role `reviewer`, and since #3442 a reviewer brief must carry the mutation block.
+# Driving the LANE canonical brief here stopped being a control the moment the contract landed — it
+# now proves the gate fires, which the arm ABOVE already covers.
+res="$(drive_m1 "$REV_CANON")"
 [ "$res" = "rc=0 started=1" ]; ck $? "POSITIVE CONTROL: merge-one.sh's run_agent runs the reviewer for a valid brief ($res)"
 grep -q 'PI_RAN' "$PI_LOG"; ck $? "…and the stub pi really ran there too"
 
@@ -425,11 +962,39 @@ bash "$ROOT/scripts/safe-send.sh" ws label "$ALERT" --bogus >/dev/null 2>&1; rc=
 # 262144 → pi renders `262k`); unlike the heartbeat's probe, safe-send's has NO `(auto)` or
 # model-bullet rescue arm, so an unlisted window is an outright refusal. Pin every shipped window
 # here, not just the current clamp.
+# ⛔ THE LATER GATE MUST BE THE FIXTURE'S, NOT THIS HOST'S. `safe-send.sh` delegates busy/idle to
+# `lane-guard.py`, whose `cmux` calls run through `lane-status.py`'s `env=CMUX` with four HARD-CODED
+# absolute bin dirs PREPENDED to PATH (`_CMUX_BIN_DIRS` is `:49-54`; the prepend itself is `:58`,
+# `CMUX["PATH"] = os.pathsep.join(_present + …)`, guarded by `:57 if _present:`). So the `$TMP/bin/cmux` stub below is
+# SHADOWED wherever a real `cmux` sits in one of the four dirs that EXIST on the box — `/usr/local/bin` or
+# `~/.local/bin` on a Linux box, `/opt/homebrew/bin` or the macOS app dir on a Mac — and is reached only
+# when none of them holds one (CI: ubuntu-latest). This is NOT a Mac-only condition: measured on the
+# Linux box this was diagnosed on, `cmux` resolves at `/usr/local/bin/cmux`, `/usr/local/bin` is one of
+# the four, and the real gate therefore ran and satisfied the grep. Wherever it runs, its empty read
+# produces the SAME message this arm wants, purely by accident. Measured both ways: the green was a
+# property of the HOST, not of `safe-send.sh`.
+#
+# SO WHAT GETS PINNED HERE IS THE **CONSUMER** SIDE, AND ONLY THROUGH A SENTINEL. This arm pins
+# `safe-send.sh:182-189`: that it READS `SAFE_SEND_GUARD` (`:182`), runs it (`:183`), and turns a
+# non-zero rc (`:185`) into its `REFUSED … Not consumable` message with `exit 3` (`:189`). ⛔ But a fixture that emits the REAL gate's message cannot prove the
+# seam was honoured at all — the real `lane-guard.py` emits `REFUSED [3.1s] pane UNREADABLE — busy/idle
+# UNKNOWN, not idle`, which satisfies a bare `pane UNREADABLE` grep. Measured: deleting the seam
+# (`GUARD="$SCRIPTS/lane-guard.py"`, so `SAFE_SEND_GUARD` is never read) left this suite at an IDENTICAL
+# `118 passed, 1 failed` — the arm was grading the host again, one layer down. So the fixture prints a
+# `FIXTURE-GUARD:` sentinel that the real gate never emits, and the positive arms assert on THAT. Re-run
+# the same mutation after any edit here: it must go RED.
+# The real `lane-guard.py` is STUBBED, not pinned: it has no host-independent seam to drive (`lane-status.py`
+# hard-codes `_CMUX_BIN_DIRS` with no env override), which is precisely why the stub `cmux` could never
+# reach it. ⛔ RESIDUAL, named rather than absorbed: on a host WITH `cmux` this arm used to execute the real
+# gate incidentally, and on CI it always did; after this change NO arm in this suite executes
+# `lane-guard.py`, so a regression in its busy/idle refusal ships with nothing red here. Tracked at #3524.
+printf 'import sys\nprint("REFUSED [0.0s] FIXTURE-GUARD: pane UNREADABLE — busy/idle UNKNOWN, not idle")\nsys.exit(3)\n' > "$TMP/bin/fake-guard.py"
 for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
   printf '#!/bin/sh\necho "CMUX_RAN $*" >> "$CMUX_LOG"\ncase "$1 $2" in "read-screen --workspace") echo "~/Documents/GitHub/agent-infra"; echo "  deepseek-flash %s";; esac\nexit 0\n' "$_budget" > "$TMP/bin/cmux"
   chmod +x "$TMP/bin/cmux"
   : > "$CMUX_LOG"
   PATH="$TMP/bin:$PATH" CMUX_LOG="$CMUX_LOG" AGENT_INFRA_PATH="$ROOT" SAFE_SEND_DISPATCH=/bin/true \
+    SAFE_SEND_GUARD="$TMP/bin/fake-guard.py" \
     bash "$ROOT/scripts/safe-send.sh" 00000000-0000-0000-0000-000000000000 pane-probe "$ALERT" --notice >"$TMP/probe.out" 2>&1; rc=$?
   if [ "$_budget" = '%/500k' ]; then
     grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; ck $? "negative control: a budget pi never draws (%/500k) is still REFUSED as 'no pi' (rc=$rc)"
@@ -440,7 +1005,24 @@ for _budget in '%/800k' '%/300k' '%/1.0M' '%/262k' '%/500k'; do
     # "pane UNREADABLE" and ALSO exits 3 — so an rc-only assertion cannot tell them apart, and a
     # probe that rejected the live footer would print the message this arm forbids.
     grep -q 'NO pi IN THIS PANE' "$TMP/probe.out"; [ $? -ne 0 ]; ck $? "the pane probe ACCEPTS the live footer budget ${_budget} (it does not report 'NO pi IN THIS PANE')"
-    grep -q 'pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the later busy/idle gate, so the probe admitted ${_budget}"
+    # ⛔ THE SENTINEL IS THE POINT: 'pane UNREADABLE' alone is emitted by the REAL `lane-guard.py` too, so a
+    # bare grep passes when `SAFE_SEND_GUARD` is ignored and the host's gate runs instead of the fixture.
+    # 'FIXTURE-GUARD:' is a string the real gate never prints, so this assertion can only be satisfied by
+    # the fixture the seam installed — re-run the seam-deletion mutation to confirm it goes red.
+    grep -q 'FIXTURE-GUARD: pane UNREADABLE' "$TMP/probe.out"; ck $? "…and the refusal it DOES hit is the FIXTURE busy/idle gate, so the probe admitted ${_budget}"
+    # ⛔ AND THE REFUSAL MUST REACH THE CALLER AS A REFUSAL. The two greps above are blind to the exit
+    # code, so a `safe-send.sh` that prints its busy/idle refusal and then reports SUCCESS is green
+    # everywhere — measured: mutating `safe-send.sh:189` `exit 3` → `exit 0` left this suite at an
+    # IDENTICAL `118 passed, 1 failed`. That is the regression worth catching, because the rc IS the
+    # verdict: `tools/fleet/outcome_canary.py:2944` renders it through `SAFE_SEND_RC`
+    # (`0: "DELIVERED (consumed)"`, `3: "REFUSED (lane busy or state unknown)"`), so a refusal that
+    # returned 0 would be recorded as delivered. (⛔ NOT `lane.sh`/`fix-one.sh`: they LAUNCH an agent and
+    # never send into a pane — `grep -c safe-send` is 0 in both, and `lane-status.py` records that
+    # `safe-send.sh` is manual-only now. Citing them here was a round-7 review finding.)
+    # `-eq 3` pins the CODE, not the identity of the refuser: the pane probe's own refusals are also 3
+    # (`safe-send.sh:130`, `:155`), and so is the real host gate's — which is why WHICH gate refused is
+    # settled by the `FIXTURE-GUARD:` sentinel above and only there.
+    [ "$rc" -eq 3 ]; ck $? "…and the busy/idle refusal is a REFUSAL to the caller (3), never a success (rc=$rc)"
   fi
 done
 
@@ -577,12 +1159,39 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 # and an undeclared one reddens this equality. Measured: unregistered, this arm fails with
 # `ADDED: scripts/test_cmux_payload.py`, which is exactly the attributable red the census exists for.
 # ⛔ AND THE LIST IS AN EQUALITY, SO IT MUST BE KEPT CURRENT BY WHOEVER MOVES THE SCAN (#1881 LANE,
-# measured). The five `orchestrator-harness` entries without a comment above arrived on `main` after
-# the last time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the
-# four suites drive gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict
-# superset), independently of any branch. Declared here because an equality that is red on its own
-# base stops being a signal: every PR inherits the same red and nobody can attribute it.
-EXPECTED="AGENTS.md scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+# measured). The `orchestrator-harness` entries without a comment above arrived on `main` after the last
+# time this list was edited — `ai-drainer.sh` dispatches through `brief_gate_run`, and the suites drive
+# gate-carrying paths — so the arm was ALREADY red on `main` (`found` is a strict superset),
+# independently of any branch. Declared here because an equality that is red on its own base stops being
+# a signal: every PR inherits the same red and nobody can attribute it.
+# ⛔ THE COUNT IS DELIBERATELY NOT NAMED (this list changes; a pinned integer is the drift
+# `check-single-source.sh` warns about). What each entry IS still has to be said:
+#   * `mandate-preflight.sh` / `mandate-preflight.test.sh` (#3377) are REFERENCERs — the helper names
+#     `brief-gate.sh` in its header prose and the suite quotes it — and neither dispatches a `pi`
+#     invocation, so they join this equality without joining the dispatch population.
+#   * `check-farm-drift.sh` (88c720f54, #3120) and `nonblocking-dispatch.test.sh` (e9b8b7663, #3219 —
+#     issue #3162) landed on `main` after the list was last edited and are the same class: a REFERENCER
+#     (it names the gate in prose, `:19`) and a SUITE (it stubs the gate). They are TWO of the four names
+#     that kept this equality red at this change's base — measured there (29b3af07), `found`=30 vs the 26
+#     declared — which is the condition this block's own paragraph calls out: an equality red on its own
+#     base attributes nothing, so a NEW dispatch path added tomorrow would inherit the same red and stay
+#     invisible. They are declared here so the arm can pass and therefore say something again.
+#   * `cloud-cell-supervisor.sh` and `key-gate.sh` (29b3af07, #3331/#3342) are the OTHER two of those
+#     four, arriving with that same commit and declared for the same reason: the supervisor NAMES the
+#     gate in prose and in its own preflight list (`:2654`, `:2656`), the key gate names it in prose
+#     (`:33`). Measured at this change's rebase head (19f1c6fe), `found`=32 vs the 30 declared. Neither
+#     dispatches a `pi` invocation, so neither joins the dispatch population.
+#   * ⛔ THE `pi`-INVOKER CENSUS COVERS THE HELPER ONLY, NOT ITS SUITE (measured): `spawn-gate.test.sh`'s
+#     scan excludes `*.test.*` by name, so `mandate-preflight.test.sh` is invisible to it. That is why the
+#     suite's own E5 states its residual in-line instead of pointing at that census for protection.
+#   * ⛔ AND #3442 ADDS FIVE MEMBERS OF ITS OWN, declared on the same terms: `record-review.sh` (it calls
+#     `brief-gate.sh --mutation-missing` rather than merely naming it), `record-review.test.sh` and
+#     `mutation-attribution.test.sh` (both DRIVE that parser), and the two `fixtures/mutation-attribution/`
+#     documents (they name the parser where a suite's author copies the shape from). Declared rather than
+#     filtered out of the scan: a filter on a directory would silently absorb the next caller that happens
+#     to live there, which is the "gate that cannot see the thing it exists for" shape this list exists
+#     to prevent.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
