@@ -1878,13 +1878,16 @@ git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
 # `--check` claims gate (#2466, 8a3e5359) refuses this fixture with its OWN NOT PROVISIONABLE, and
 # the assertion below still passes because `[refresh] check: repo=…` is printed BEFORE that gate —
 # so "ACCEPTED (no false block)" was green about a run the claims gate refused end-to-end.
-# ⛔ AND THE PATTERN NAMES THE *CLAIMS* SENTENCE, NOT THE TOKEN. `NOT PROVISIONABLE` is emitted by
+# ⛔ AND THE PATTERN NAMES THE *CLAIMS* SENTENCES, NOT THE TOKEN. `NOT PROVISIONABLE` is emitted by
 # every gate that runs AFTER the resolver — a jq that resolves but does not RUN
 # (refresh-candidates.sh:1299), an interpreter below the tool's floor (:1358) — so pinning the bare
 # token reds this arm on a tool-poor box for a fact about the box, which is exactly the host-movement
-# the comment below forbids. The claims gate has ONE sentence of its own, on its absent-registry
-# branch (:1326): pin that, so the arm still reds when the registry is missing and holds still when
-# a later gate answers instead.
+# the comment below forbids. The claims gate has TWO refusals of its own, and BOTH are facts about
+# the REGISTRY rather than the host: an absent file (:1326, "is NOT INSTALLED") and a file that is
+# present but unloadable or predates the issue-claim reader (:1314, "cannot answer the issue-claim
+# question"). Pin those two, not the token, and not only one of them: pinning only :1326 left the
+# drift shape (#2466's own failure mode — a `claims.sh` without `claim_issue_preflight`) green about
+# a run the gate refused end-to-end, which is the class this arm exists to close.
 mkdir -p "$TMP/repoexplicit/o3"; printf 'claim_issue_preflight() { return 0; }\n' > "$TMP/repoexplicit/o3/claims.sh"
 ( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
   HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1 )
@@ -1899,7 +1902,7 @@ case "$(cat "$TMP/repo-explicit-ok.out")" in
 esac
 ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
 case "$(cat "$TMP/repo-explicit-ok.out")" in
-  *"NOT the queue target"*|*"has no readable 'origin'"*|*"cross-box claim registry is NOT INSTALLED"*) xr=1 ;;
+  *"NOT the queue target"*|*"has no readable 'origin'"*|*"cross-box claim registry is NOT INSTALLED"*|*"cannot answer the issue-claim question"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
@@ -1931,10 +1934,11 @@ case "$(cat "$TMP/repo-localpath.out")" in
 esac
 ck "a local-path origin with an UNDECLARED \$OR is TOLERATED and ANNOUNCED (the stated residual, not silence)" $xr
 case "$(cat "$TMP/repo-localpath.out")" in
-  # ⛔ NARROWED TO THE CLAIMS SENTENCE, not the bare token — the reason is stated in the
+  # ⛔ NARROWED TO THE CLAIMS GATE'S OWN SENTENCES, not the bare token — the reason is stated in the
   # `repoexplicit` block above: the post-resolver jq and interpreter gates emit `NOT PROVISIONABLE`
-  # too, and this arm is named for the RESOLVER's tolerance.
-  *"cross-box claim registry is NOT INSTALLED"*) xr=1 ;;
+  # too, and this arm is named for the RESOLVER's tolerance. Both claims-gate branches are pinned,
+  # because a census of one of them left the other shape (registry present, reader absent) green.
+  *"cross-box claim registry is NOT INSTALLED"*|*"cannot answer the issue-claim question"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "…and it is TOLERATED, not refused (the residual is the tolerance; a refusal here would block local dev clones)" $xr
@@ -1959,7 +1963,7 @@ mkdir -p "$TMP/repolocalpath/op0"; printf 'claim_issue_preflight() { return 0; }
   HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=0 O="$TMP/repolocalpath/op0" bash "$REFRESH" --check > "$TMP/repo-localpath-loop.out" 2>&1 ) || true
 case "$(cat "$TMP/repo-localpath-loop.out")" in
   *"cannot prove it is a checkout"*) xr=1 ;;
-  *"cross-box claim registry is NOT INSTALLED"*) xr=1 ;;
+  *"cross-box claim registry is NOT INSTALLED"*|*"cannot answer the issue-claim question"*) xr=1 ;;
   *"the pairing is not cross-checked"*) xr=0 ;;
   *) xr=1; echo "      out: $(head -3 "$TMP/repo-localpath-loop.out")" ;;
 esac
@@ -2425,7 +2429,7 @@ ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
 # is that the spawn guard consults the CROSS-BOX lease (which is exactly what the chain writes and
 # releases), so assert that call survives inside `claim_live()`.
 # ⛔ AND A BODY PIN ALONE IS NOT A CALL-SITE PIN (review of this change, P2). Pinning only
-# `claim_live()`'s body stays GREEN with NOTHING calling it — measured: replace `orch-loop.sh:3272`
+# `claim_live()`'s body stays GREEN with NOTHING calling it — measured: replace `orch-loop.sh:3401`
 # with `:` and the body still matches, so the arm passed while the controller honoured no claim at all,
 # which is the exact vacuity this change exists to remove. So pin BOTH: a call site exists
 # (`claim_live "`, spelling-agnostic so a `$PR`→`$pr` rename cannot red it) AND the callee consults
