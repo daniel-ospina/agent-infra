@@ -316,7 +316,8 @@ repo_identity_declared() {
         printf '%s\n%s\n' '?' \
           "a generic CELL CHECKOUT name (orchestrator-bringup.sh's own candidate list), but this box declares no repo of its own (no \$REPO origin, no \$REPO_SLUG, no \$OR) — so WHICH repo may sit here cannot be decided"
       fi ;;
-    *) return 1 ;;
+    *)
+      return 1 ;;
   esac
 }
 
@@ -523,9 +524,35 @@ repo_identity_scan() {
     # name is a BRANCH (or a module name), so there is nothing to compare it against — reporting it FATAL
     # reds every pass on a healthy cell that holds one live lane. It is still NAMED (never silent), and
     # it still contributes its path+head to the duplicate report below.
+    # ⛔ `<held-repo>-<suffix>` — A WORKING COPY WHOSE NAME **DOES** NAME THE REPO IT HOLDS (review
+    # finding, P0). The comparison is against `want` (the repo the ORIGIN names), not against the box's
+    # own repo, because a box legitimately holds OTHER repos: `/tmp/cell-home/dmeer-wt` is a REAL CLONE
+    # (`.git` a DIRECTORY) of `daniel-ospina/DMeer` on the live cell home — and on a TORTOISE box that
+    # was reported FATAL, i.e. a healthy tree refused, the doctor red on every pass, and a remedy telling
+    # an operator to rename a tree that is not lying. `docs/ops/fleet-liveness.md` records the same shape
+    # for worktrees (`git worktree add ~/tortoise-wip fix/x`).
+    # ⛔ IT IS STILL NOT A HOLE: the prefix must be the repo the origin ACTUALLY names. `agent-infra`
+    # holding tortoise stays FATAL (base 'agent-infra' is not 'tortoise-*'), and `tortoise-wip` holding
+    # agent-infra stays FATAL (it is not 'agent-infra-*'). The prefix is FOLDED, because `dmeer-wt` must
+    # match `DMeer`.
+    case "$(repo_identity_fold "$base")" in
+      "$(repo_identity_fold "$want")"-*)
+        printf '%s\t%s\n' warn \
+          "repo identity: ${_sp[$i]}$where is a WORKING COPY of $slug under the suffixed name '$base' — the name names the repo it holds, so it does not lie about which repo it is. Named so the exception stays visible (agent-infra#3521)"
+        i=$((i + 1)); continue ;;
+    esac
     if [ "${_wt[$i]}" -eq 1 ]; then
+      # ⛔ THE `UNVERIFIED` LITERAL IS A CONTRACT, NOT PROSE — AND IT APPLIES HERE (review finding, P1).
+      # The bring-up picks the `CELL READY` token by matching that literal, so this line's own admission
+      # ("nothing to compare against its origin") must be machine-readable. Without it a worktree placed
+      # at a path named after ANOTHER repo — `…/agent-infra` holding tortoise, the measured cell-2 shape
+      # reached via `git worktree add` instead of `git clone` — left `seen_unverified` at 0 and the banner
+      # printed `CELL READY — all links verified`. TRADE-OFF, stated plainly: a cell that holds any linked
+      # worktree now reports `repo identity PARTIALLY verified`, because that name genuinely was not
+      # compared. That is the honest reading; a refinement (treat a branch-shaped name as "nothing to
+      # verify" rather than "unverified") is a separate change with its own evidence.
       printf '%s\t%s\n' warn \
-        "repo identity: ${_sp[$i]}$where is a LINKED WORKTREE of $slug (its .git is a file, not a directory), so its directory name '$base' names a BRANCH, not a repository — nothing to compare against its origin, and it is never a directory lying about itself. Named so the tree is visible; the duplicate report below still lists every path and head (agent-infra#3521)"
+        "repo identity UNVERIFIED: ${_sp[$i]}$where is a LINKED WORKTREE of $slug (its .git is a file, not a directory), so its directory name '$base' names a BRANCH, not a repository — nothing to compare against its origin, and it is never a directory lying about itself. Named so the tree is visible (agent-infra#3521)"
       i=$((i + 1)); continue
     fi
     fatal=$((fatal + 1))

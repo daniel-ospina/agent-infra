@@ -1821,6 +1821,54 @@ else
   ok "the CELL READY headline is derived from what was measured, not hard-coded"
 fi
 
+say_case "repo identity: a <repo>-wt WORKING COPY names the repo it holds, so it is not a lie"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A **P0** — a second false block on a healthy cell, the CLONED half of
+# the same family round 1 closed only for worktrees. MEASURED on the live cell home: `/tmp/cell-home/dmeer-wt`
+# is a REAL CLONE (`.git` a DIRECTORY) of `daniel-ospina/DMeer`, and `docs/ops/fleet-liveness.md` records
+# `git worktree add ~/tortoise-wip fix/x`. The comparison must be against the repo the ORIGIN names (a box
+# legitimately holds OTHER repos), never against the box's own — otherwise every foreign repo under the
+# cell home is "a directory lying about itself".
+mk_checkout "$T/ident-wtsuf/home/tortoise-wt" "https://github.com/daniel-ospina/tortoise.git" x1 \
+  && ok "fixture: a <repo>-wt REAL clone of the cell's own repo" \
+  || bad "fixture: could not create the <repo>-wt working copy"
+BR_IDENT_ROOTS="$T/ident-wtsuf/home" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a HEALTHY <repo>-wt working copy was refused as a lying directory" ;;
+  *) ok "a <repo>-wt working copy is not fatal" ;;
+esac
+case "$BR_OUT" in
+  *"WORKING COPY of daniel-ospina/tortoise"*) ok "…and it is NAMED as a working copy, so the exception stays visible" ;;
+  *) bad "the <repo>-wt working copy was passed over in silence: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+# ⛔ IT IS STILL NOT A HOLE: the prefix must be the repo the ORIGIN names. A `<repo>-wt` holding a
+# DIFFERENT repo is refused exactly like any other lying name.
+mk_checkout "$T/ident-wtsufbad/home/tortoise-wt" "https://github.com/daniel-ospina/agent-infra.git" x2 \
+  && ok "fixture: a tortoise-wt clone that actually holds agent-infra" \
+  || bad "fixture: could not create the lying <repo>-wt"
+BR_IDENT_ROOTS="$T/ident-wtsufbad/home" br fail normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) ok "…while a <repo>-wt holding a DIFFERENT repo is still refused" ;;
+  *) bad "the <repo>-suffix exemption widened to any repo — a lying working copy now reads clean: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+
+say_case "repo identity: a LINKED WORKTREE carries UNVERIFIED, so the banner cannot claim full verification"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P1. The worktree warn's own text says "nothing to compare against
+# its origin", but it carried no UNVERIFIED literal — and that LITERAL is what `check_repo_identity`
+# matches to pick the `CELL READY` token. So a worktree placed at a path named after ANOTHER repo (the
+# measured cell-2 shape, reached via `git worktree add` instead of `git clone`) left the banner printing
+# `all links verified` over a directory a lane would work as the wrong repo.
+mk_checkout "$T/ident-wtunv/r" "https://github.com/daniel-ospina/tortoise.git" y1 \
+  && ok "fixture: the cell's own repo to branch from" \
+  || bad "fixture: could not create the worktree source"
+git -C "$T/ident-wtunv/r" worktree add --detach "$T/ident-wtunv/home/agent-infra" HEAD >/dev/null 2>&1 \
+  && ok "fixture: a worktree of tortoise at a path NAMED agent-infra" \
+  || bad "fixture: could not create the mis-named worktree"
+BR_IDENT_ROOTS="$T/ident-wtunv/home" br ok normal --check
+case "$BR_OUT" in
+  *"UNVERIFIED"*"LINKED WORKTREE"*) ok "…the worktree line carries UNVERIFIED, so the token drops to PARTIALLY verified" ;;
+  *) bad "the LINKED WORKTREE line does not carry UNVERIFIED, so CELL READY still claims all links were verified: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
+esac
+
 say_case "repo identity: two checkouts at the SAME head is reported as same-head, not as a divergence"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A FALSE ALARM. The head list was built with ", " and then split on
 # `,`, so every value after the first kept a leading space: two copies at the IDENTICAL commit printed
