@@ -1999,14 +1999,35 @@ lane_end_next() {
   # has an arm today, so this is latent — but a latent arm is precisely the one a FUTURE verdict lands on,
   # and the value it would land on is a removal licence. Only `pushed` and `nothing` are verdicts that
   # measured the branch safe; anything else (including empty) abstains and names the verdict.
-  case "${LANE_END_PUSH:-}" in
-    pushed|nothing)
-      printf 'nothing at risk (tree=%s, unpushed=%s, measured over the paths git does NOT ignore — a file git IGNORES is not covered here and a lane whose only copy of its work is ignored reads clean; the branch column came from LOCAL refs/remotes/*, a cache): %s may be removed once its PR is terminal\n' \
-        "${LANE_END_TREE:-clean}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}"
-      return 0 ;;
+  # ⛔ AND THE SAME ARGUMENT WAS LEFT UNFINISHED IN THE **OTHER** DIMENSION (review of PR #3399 round 11,
+  # P2 — REPRODUCED). The arm above stopped consulting the default for `push` but kept interpolating
+  # `${LANE_END_TREE:-clean}`, so a SEVENTH tree verdict reaching this tail with a safe push value would be
+  # PUBLISHED as `tree=clean` — an affirmative reclaim licence over a tree state nobody classified, which is
+  # the identical defect one dimension over, in the arm whose own comment names the class. Measured on the
+  # shipped function: `LANE_END_TREE=submodule-dirty push=pushed` printed "nothing at risk (tree=submodule-
+  # dirty …): … may be removed", while the same value with an empty push correctly abstained. Reachable
+  # only by `clean` today, so fail-closed in practice — fixed because a latent removal licence is exactly
+  # what the paragraph above refuses to accept for the push half. Both dimensions are therefore gated BY
+  # NAME, and the abstain names WHICH one it could not classify rather than blaming the push by default.
+  case "${LANE_END_TREE:-}" in
+    clean)
+      case "${LANE_END_PUSH:-}" in
+        pushed|nothing)
+          printf 'nothing at risk (tree=%s, unpushed=%s, measured over the paths git does NOT ignore — a file git IGNORES is not covered here and a lane whose only copy of its work is ignored reads clean; the branch column came from LOCAL refs/remotes/*, a cache): %s may be removed once its PR is terminal\n' \
+            "${LANE_END_TREE}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_ROOT:-<unknown>}"
+          return 0 ;;
+      esac ;;
   esac
-  printf 'MANUAL — tree=%s and unpushed=%s, but this artifact does NOT classify the branch push (push=%s), so it asserts neither delivery nor absence for the commit(s); read the [lane-exit] line in the lane log before removing %s\n' \
-    "${LANE_END_TREE:-clean}" "${LANE_END_UNPUSHED:-?}" "${LANE_END_PUSH:-<unset>}" "${LANE_END_ROOT:-<unknown>}"
+  # Which dimension is unclassified — named, never assumed. `clean` and `pushed|nothing` are the only
+  # values this tail treats as measured-safe, so the first dimension that is not one of them is the one the
+  # reader has to go and settle.
+  local _bad_dim="push" _bad_val="${LANE_END_PUSH:-<empty>}"
+  case "${LANE_END_TREE:-}" in
+    clean) ;;
+    *) _bad_dim="tree"; _bad_val="${LANE_END_TREE:-<empty>}" ;;
+  esac
+  printf 'MANUAL — tree=%s and unpushed=%s, but this artifact does NOT classify the %s value (%s), so it asserts neither delivery nor absence for the commit(s); read the [lane-exit] line in the lane log before removing %s\n' \
+    "${LANE_END_TREE:-<empty>}" "${LANE_END_UNPUSHED:-?}" "$_bad_dim" "$_bad_val" "${LANE_END_ROOT:-<unknown>}"
 }
 
 # lane_end_unpushed_col — the ONE derivation of the `unpushed` column, shared by the TSV row and the
