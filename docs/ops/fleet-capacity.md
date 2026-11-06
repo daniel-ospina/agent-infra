@@ -536,7 +536,7 @@ state that read as fine on cell-1.
 This is what answers "is it self-dispatching" without a human reading a pane: a live pane shows a
 *process*, a fresh record shows a *cycle*.
 
-## 8. Tests
+### 7.1 Tests
 
 `scripts/orchestrator-harness/capacity-placement.test.sh` (in `scripts/run-bash-shards.sh`, so both
 CI lanes run it): the saturated box skipped and the least-loaded eligible box chosen; an
@@ -772,6 +772,122 @@ action, the age bound sweeps a stale entry and keeps a fresh one (and the operan
 threshold), a missing root is a `defect tmpdir-missing` whose printed remedy restores it, and a mutant
 with the export removed must leave the listener running under whatever temp dir the box gave it.
 
+### 8.1 The ceiling bounds ADDITION only — surplus above it is permanent until a human retires it
+
+⛔ **The ceiling is ONE-DIRECTIONAL: it bounds ADDITION. Nothing in this repo can bring a box that
+is already ABOVE it back down, and that is a live oversubscription, not a theoretical one. Do not
+read "ceiling" as a target the box converges to from either side — a box above it stays above it.**
+
+**The intended count, from the owner's own sizing** (agent-infra#2344 comment 6347825624: *"the
+sustainable counts are 3 on cell-1, 3 on cell-4, 2 on cell-3"*). ⚠️ **Two tools encode it, and they
+are not the same predicate**: `runner_autoscale.py`'s `core_ceiling` (`>=8` cores → 3, `4..7` → 2,
+`1..3` → 1) and `ci_runner_pool.sh`'s `ceil(ncpu / RUNNER_CORES_PER_SLOT)` with
+`RUNNER_CORES_PER_SLOT=3`. They agree on every box in the table and **diverge outside it**: at **7 cores** (`core_ceiling` says 2,
+the division says 3) and at **10+ cores** (`core_ceiling` caps at 3, the division keeps rising). So
+quote the tool you mean rather than "the ceiling":
+
+| box | cores | intended runner slots |
+|---|---|---|
+| cell-1 | 8 | **3** |
+| cell-4 | 8 | **3** |
+| cell-3 | 4 | **2** |
+
+The `cores` column is this doc's own §1 reading (cell-1 `cpu` = 8), not a new measurement.
+
+**The contradiction, as reported 2026-11-03 19:47Z** (a fleet reading quoted in the dispatch that
+produced this section — *not* re-measured while writing it, so treat the numbers as a report and
+re-take them before acting): cell-1 carried **five** runner listeners (`/opt/gh-runner-x64-4` …
+`-8`) against a ceiling of **three** — **167 %** of the intended CI load, on the same 8 cores as
+the agent fleet, with lanes on that box showing static logs for 12+ minutes. Five is not a
+configuration anyone chose: the header of `runner_autoscale.py` records the pool as *"whatever the
+last brief happened to ask for"* (`runnercap2/3/4/5`, `runnerrecon`), and ad-hoc additions outlive
+the briefs that made them.
+
+**Why it stays broken — three separate reasons, so no single fix closes it:**
+
+1. **`over-ceiling` is REPORT-ONLY.** `runner_autoscale.py` derives a ceiling from `core_ceiling`,
+memory **and disk** — `min(by_core, by_mem, by_disk)`, with the memory/disk arms counting runners
+already running because their bytes are already paid for — and when `live > ceil` it sets the
+verdict and *changes nothing*. (The file's own header quotes the two-arm form
+`min(core_ceiling, runners_live + headroom_by_memory)`; that is an **upper bound**, and on a
+disk-tight box the effective ceiling is lower.) The tool is an enforcer in one direction only.
+2. **Removal is an explicit NON-GOAL, not an oversight.** The same file states it will not
+"restart, relabel or remove a runner that is serving (or may be serving) a job" — correct as a
+safety property, and it is why the surplus is permanent: nothing decides *which* runner to drop or
+*when* it is safe to drop it.
+3. **`ci_runner_pool.sh reclaim` is not that verb.** `reclaim` only retires a registration
+**GitHub already deleted** (`probe_listener` rc 0 → `live=$((live + 1))`, *"not touched"*). A live
+surplus runner is **counted and skipped**, and the pass then exits **0** with `retired=0` — which
+reads as "the pool is clean" rather than as a refusal. So the one command an operator would reach
+for answers "nothing to do".
+
+**Retiring a surplus is an OPERATIONAL step with a human decision in it** — no verb in this repo
+removes a live registration, and the drain below is not one. ⚠️ **`RUNNER_ROOT` must be passed**: its
+default is `/tmp/actions-runner`, while the installs this section is about live under `/opt`, and a
+root that excludes a **LIVE** listener is a hard refusal
+(`cannot-measure why=pool-root-incomplete`, rc 2) — ⚠️ `status` prints the table it could see and
+*then* refuses. ⛔ That refusal fires **only for a LIVE listener**: when every listener outside the
+root is **DEAD** the read is silently EMPTY instead (`slots=0`, rc 0 — the caveat in §8 above),
+which is exactly the state step 3b is about — so never read a bare `status` under the default root
+as this box's pool.
+
+```bash
+# 1. LIST this box's installs — RUNNER_ROOT is REQUIRED (default root cannot see /opt)
+RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh status --all
+#    The NAME column is the instance dir's basename, so the install is /opt/<name>. STATE reads
+#    `live` / `DEAD` / `ORPHANED` / `QUARANTINE` (plus `LIVE-QUAR` / `UNPROBED` on a quarantined
+#    install). It does NOT report busy-ness — that comes from the GitHub pool read, so take it
+#    per runner and pick one that is BOTH `live` AND not busy:
+#    gh api repos/daniel-ospina/tortoise/actions/runners --jq '.runners[] | {name, status, busy}'
+#    (ci-queue.sh is NOT a substitute: it publishes one aggregate busy=N over the online runners.)
+
+# 2. STOP the listener so it takes no new job. Which command depends on how it was started:
+#    (a) systemd-managed:  sudo systemctl stop actions.runner.daniel-ospina-tortoise.<agentName>.service
+#        ⚠️ `<agentName>` is the .runner `agentName` (the GITHUB_NAME column), NOT the NAME column:
+#        on a hand-provisioned install they differ (`/opt/gh-runner-x64-1` carries
+#        agentName=pi-runner-cell4-x64-1), and a wrong name is refused as `Failed to stop …: Unit …
+#        not loaded` (older systemd: `Unit … not found`). Read the real
+#        ones with:  systemctl list-unit-files 'actions.runner.*' --no-pager
+#        (That unit is written by `svc.sh install` from `bin/actions.runner.service.template`.)
+#    (b) started by ci_runner_pool.sh: it backgrounds `run.sh` and renders NO unit, and the script
+#        has no `stop` verb — stop the pid that `status` printed for that instance instead.
+
+# 3. Confirm nothing is executing on it before removing anything:
+#    no `Runner.Worker` process in that instance's tree, and no in-flight job for it.
+
+# 3b. REMOVE the unit step 2(a) stopped — BEFORE the directory goes, because svc.sh lives IN it.
+#     Skipping this leaves an ENABLED unit whose WorkingDirectory no longer exists: systemd fails it
+#     at every boot (status=200/CHDIR) and runner_autoscale.py's own unit audit reports it on every
+#     pass until someone deletes that unit file or fixes the path with a drop-in (the audit reads
+#     unit files and their drop-ins, last `WorkingDirectory=` winning — so the finding clears when
+#     the file goes, not only when the same name is re-registered).
+(cd /opt/<name> && sudo ./svc.sh uninstall)     # ⚠️ the cd is REQUIRED, not decoration — see below
+#     `svc.sh` resolves RUNNER_ROOT=$(pwd) and its template at the relative
+#     ./bin/actions.runner.service.template, and its pre-flight ("Must run from runner root or
+#     install is corrupt") fires BEFORE the command dispatch. So `sudo /opt/<name>/svc.sh uninstall`
+#     run from any other cwd — including this repo's root — exits 1 having done NOTHING, with an
+#     error that misdirects at the install instead of at the caller's directory.
+#     (`svc.sh install` has the same requirement.)
+#     (for a 2(b) listener there is no unit — nothing to remove here)
+
+# 4. REMOVE the registration. This needs a REMOVE token, which is a different token kind from
+#    RUNNER_TOKEN (that one feeds `add` and is single-use):
+REMOVE_TOKEN="$(gh api -X POST repos/daniel-ospina/tortoise/actions/runners/remove-token --jq .token)"
+/opt/<name>/config.sh remove --token "$REMOVE_TOKEN"     # <name> from step 1's NAME column
+# then delete ONLY that instance dir; leave every other slot untouched
+```
+
+**Revert** is the ordinary add path, already floor- and ceiling-gated — and it needs the same
+`RUNNER_ROOT`, or it creates the runner under `/tmp/actions-runner` instead of `/opt`:
+`RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh add --name <name>`. ⚠️ On a box whose pristine
+release still sits under the OLD root, `add` also needs `RUNNER_TEMPLATE`: it defaults to
+`$RUNNER_ROOT/_template`, and a missing `<template>/config.sh` is `cannot-act
+why=runner-template-absent`. So pass `RUNNER_TEMPLATE=/tmp/actions-runner/_template` when that is
+where the unpacked release actually is. No bespoke restore exists, and none is needed.
+
+⛔ **Do not automate the shrink without an owner ruling.** "Fill every machine to the capacity it
+can actually sustain" decided the CEILING; it did not delegate the choice of which live registration
+to destroy, and a wrong pick cancels a running job.
 
 ## 9. The required-check reservation — so the ONE required status never queues behind advisory work
 
