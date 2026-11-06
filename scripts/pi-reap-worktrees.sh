@@ -3122,8 +3122,11 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # unit nor `pr-repair-loop.sh` names `HARNESS_PIN` at all. Its separateness is a recorded DECISION,
     # not an accident (`templates/systemd/eldato-pr-repair.service`, "they stay separate units with
     # separate names and separate installers"). So the two production invokers of the reaper do NOT
-    # carry `HARNESS_PIN`: the repair unit, and the doctor's hygiene role, which resolves the pin tree
-    # from `$HARNESS_PIN_DIR` and never names `$HARNESS_PIN_FILE`. ⛔ NOT an enumeration: a "the only
+    # carry `HARNESS_PIN`: the repair unit, which neither names it nor hands it to the reaper. THE
+    # DOCTOR'S REACH IS UNMEASURED, and must not be claimed either way: the doctor resolves its pin from
+    # `$HARNESS_PIN_DIR` and never names `$HARNESS_PIN_FILE`, but it is started BY THE SUPERVISOR
+    # (`cloud-cell-supervisor.sh` `start_doctor_loop`), and the supervisor DOES read `$HARNESS_PIN` — so
+    # "the doctor never names it" is not evidence about the environment the reaper inherits from it. ⛔ NOT an enumeration: a "the only
     # readers of that one are …" draft was FALSE (a `grep` also puts `harness-refresh.sh`,
     # `check-deployed-drift.sh`, `orchestrator-bringup.sh`, `cloud-cell-supervisor.sh`, `harness-exec.sh`
     # and `orch-pin-exec.sh` among the readers), and a false enumeration here is the defect class this
@@ -3171,11 +3174,18 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
     # ⛔ REFUSED, NOT TRIMMED — the same polarity as the record-content arm, for the same reason: a
     # path may legitimately end in a space, so trimming would trade one wrong verdict for another.
     # G15y drives it, `no-pin-root-trailing-junk` deletes the arm and G15-M15 asserts the mutant reclaims.
+    # ⛔ JUNK AT EITHER END (#10114 cycle 7, P2 — same class, the OTHER end). Cycle 6 refused a value that
+    # ENDS in junk and left the FRONT open, so a leading blank took the very path that finding was about:
+    # the `/?*` guard below fails, `pin_root=""` is assigned in silence, the fourth source disappears and
+    # rule 3 fires. Measured: clean spelling preserves; one LEADING SPACE, or a leading TAB, is
+    # `remove … rule=3` on an intact pin tree. The asymmetry was internal, not declared — the SAME junk at
+    # the front of a record content preserves, so this variable was the only input in the group that
+    # failed open. Both ends are now the same test.
     local pin_root="${HARNESS_PIN:-}"
     case "$pin_root" in
-        *[[:space:]]|*[[:cntrl:]])
+        [[:space:]]*|[[:cntrl:]]*|*[[:space:]]|*[[:cntrl:]])
             PIN_VERDICT="pin-tree"
-            PIN_PROOF="\$HARNESS_PIN ends in whitespace or a control character, so the record root it would derive cannot be placed — it will not be TRIMMED (a real path may end in a space); 'cannot place it' is not 'names something else'; failed CLOSED"
+            PIN_PROOF="\$HARNESS_PIN ('$pin_root') starts or ends with whitespace or a control character, so the record root it would derive cannot be placed — it will not be TRIMMED (a real path may begin or end with a space); 'cannot place it' is not 'names something else'; failed CLOSED"
             return 0 ;;
     esac
     case "$pin_root" in /?*) : ;; *) pin_root="" ;; esac
@@ -3184,7 +3194,18 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         while [ "${pin_root%/}" != "$pin_root" ]; do pin_root="${pin_root%/}"; done
     fi
     case "$pin_root" in
-        */state/HARNESS-PIN) pin_root="${pin_root%/state/HARNESS-PIN}" ;;
+        */state/HARNESS-PIN)
+            pin_root="${pin_root%/state/HARNESS-PIN}"
+            # ⛔ A RECOGNISED SPELLING THAT DERIVES AN EMPTY ROOT IS NOT A DIFFERENT FILE NAME (#10114
+            # cycle 7). `HARNESS_PIN=/state/HARNESS-PIN` means the pin root is `/`, so the dir record is
+            # `/.harness-path`; the strip leaves `pin_root=""`, the `%s:+…` guard then SKIPS the source
+            # entirely, and the arm fails open. Measured: `remove … rule=3`. The root is empty, not
+            # absent — refuse rather than synthesise a `//`-spelled candidate out of it.
+            if [ -z "$pin_root" ]; then
+                PIN_VERDICT="pin-tree"
+                PIN_PROOF="\$HARNESS_PIN ('$HARNESS_PIN') is rooted at / , so the dir record it derives is '/.harness-path' — this probe will not synthesise that candidate from an empty root; 'cannot place it' is not 'names something else'; failed CLOSED"
+                return 0
+            fi ;;
         *)                   pin_root="" ;;
     esac
     case "$pin_root" in
@@ -3244,9 +3265,11 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         # merged worktree, and preserving on absence would make the reaper inert). An UNREADABLE record
         # is not evidence of anything, so it PRESERVES — a false positive here costs disk, never work.
         # ⛔ AND ITS BLAST RADIUS IS EVERY CANDIDATE, NOT THE TREE THE RECORD NAMES — stated here
-        # because it is a real operating consequence and nothing else says it. Both this arm and the
-        # placement arm below return before any per-record comparison, so ONE unreadable / empty /
-        # relative / trailing-junk record answers PRESERVE for EVERY worktree the pass examines, all
+        # because it is a real operating consequence and nothing else says it. THREE arms do this: the
+        # `$HARNESS_PIN` junk arm ABOVE the record loop (which reads no record at all), this arm, and
+        # the placement arm below — all return before any per-record comparison. So ONE unreadable /
+        # empty / relative / trailing-junk record — or one junk `$HARNESS_PIN` — answers PRESERVE for
+        # EVERY worktree the pass examines, all
         # labelled `reason=pin-tree`, and the pass reclaims nothing box-wide. Measured: with an empty
         # `$HOME/.harness-path`, an unrelated plain worktree moves from `remove … rule=3` (on main and
         # on this branch with the record ABSENT) to `preserve … reason=pin-tree … names NOTHING`. That
@@ -3262,9 +3285,10 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
         # path that is really there.
         # ⛔ AND `-r` IS NOT "READABLE AS A RECORD" (#10114 review, P1). It tests READ PERMISSION, so it
         # is TRUE for a DIRECTORY, a symlink to one, and a FIFO — the arm above is then never entered,
-        # `head -n 1 <dir>` yields nothing, and the `[ -n "$rec_t" ] || continue` below re-creates the
-        # very reading the arm was added to forbid ("cannot read it" ⇒ "no record"), so rule 3 removes
-        # the tree the box EXECUTES. Measured: a `.harness-path` that is a DIRECTORY reclaims the pin
+        # `head -n 1 <dir>` yields nothing and the PRE-FIX `[ -n "$rec_t" ] || continue` re-created the
+        # very reading the arm was added to forbid ("cannot read it" ⇒ "no record"), so rule 3 removed
+        # the tree the box EXECUTES. (That one-liner is gone — the placement arm below replaced it — so
+        # this is stated as the pre-fix form, not as a citation to code that is no longer there.) Measured: a `.harness-path` that is a DIRECTORY reclaims the pin
         # tree, while the identical path holding a regular file preserves it. A FIFO is worse again —
         # `[ -r ]` passes and `head` BLOCKS, hanging the classifier. The `[ -e ]` disjunct inside is
         # already TRUE for a directory, so the code knew the record was there and convicted anyway.
@@ -3345,11 +3369,15 @@ pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harne
                 PIN_VERDICT="pin-tree"
                 case "$rec_t" in
                     "")  PIN_PROOF="pin record $rec is READABLE but names NOTHING — empty, or a write that failed after the redirect; 'no content' is not 'names something else'; failed CLOSED" ;;
-                    # ⛔ A SHORT ABSOLUTE (only `/` can land here: `/?*` needs two characters) was never
-                    # cwd-RESOLVED, so its proof must not say it was. Fail closed either way — the proof
-                    # text is the only thing that differs, and a proof naming a mechanism that did not run
-                    # is the class this PR exists to remove.
-                    /?*)  PIN_PROOF="pin record $rec names '$rec_t', an absolute path this probe cannot place as written; 'cannot place it' is not 'names something else'; failed CLOSED" ;;
+                    # ⛔ A SHORT ABSOLUTE — only `/` can land here, because the outer guard is `/?*` and
+                    # that needs two characters — was never cwd-RESOLVED, so its proof must not say it
+                    # was. Fail closed either way; the proof text is the only thing that differs, and a
+                    # proof naming a mechanism that did not run is the class this PR exists to remove.
+                    # ⛔ THE FIRST DRAFT OF THIS ARM TESTED `/?*` ON A VALUE THAT HAD ALREADY FAILED `/?*`
+                    # ONE LINE ABOVE, so it was DEAD and the false proof it was added to remove still
+                    # shipped (cycle 7 measured it). `/*` is the pattern that matches `/`. G15x asserts
+                    # this proof text, so the arm cannot go dead again without reddening.
+                    /*)   PIN_PROOF="pin record $rec names '$rec_t', an absolute path this probe cannot place as written; 'cannot place it' is not 'names something else'; failed CLOSED" ;;
                     *)    PIN_PROOF="pin record $rec names '$rec_t', which this probe will not resolve against its own cwd — 'cannot place it' is not 'names something else'; failed CLOSED" ;;
                 esac
                 return 0 ;;
