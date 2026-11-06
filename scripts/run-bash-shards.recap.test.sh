@@ -189,15 +189,17 @@ rm -f "$SLOW_SHARD_MARKER"
 # ⛔ WHAT THIS GUARD IS **NOT**, stated so the comment is not over-read: it is NOT claiming that CI's
 # `bash-suites` lane leaks today — it does not, and it is covered twice over. `bash-suites` exports
 # `BASH_SHARD_SLICE=<i>/<n>` for the whole step (`.github/workflows/ci.yml:1384`), but every SHARD is
-# already scrubbed by `shard_exec` before this file runs, and the script-wide `unset` at :109 (#3452)
-# drops it again for everything below. Both halves are MUTUALLY SUFFICIENT — measured on the merged
-# tree with `BASH_SHARD_SLICE=5/8`, the value a real `bash-suites (<n>)` job hands its shards:
+# already scrubbed by `shard_exec` before this file runs, and the script-wide `unset` in the notice
+# block above (#3452) drops it again for everything below. Both halves are MUTUALLY SUFFICIENT —
+# measured on the merged tree with `BASH_SHARD_SLICE=5/8`, the value a real `bash-suites (<n>)` job
+# hands its shards:
 #   · `unset` KEPT,   `env -u` REMOVED  ->  PASS 13 · FAIL 0   (#3452 alone covers the CI lane)
 #   · `unset` REMOVED, `env -u` KEPT    ->  PASS 13 · FAIL 0   (this guard alone is sufficient here)
 #   · BOTH removed                      ->  PASS  4 · FAIL 9   (the leak, reproduced — the hazard is real)
 # So what this buys is defence in depth at the one seat the runner's guard cannot reach: the leak
-# re-opens at these two sites if :109 ever moves or is deleted, and a DIRECT invocation (a repro shell
-# that exports the slice and runs THIS FILE rather than the runner) relies on this guard alone.
+# re-opens at these two sites if that `unset` ever moves or is deleted, and a DIRECT invocation (a
+# repro shell that exports the slice and runs THIS FILE rather than the runner) relies on this guard
+# alone.
 set -m
 env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
   bash "$KILLED/scripts/runner-narrow.sh" >"$TMP/killed.out" 2>&1 &
@@ -285,8 +287,8 @@ if ! build_fixture "$COMPLETE" fast; then
   exit 2
 fi
 # The same spawn-site contract as ARM 1's child above — see the ⛔ note in the ARM 1 section for what
-# it is and is not. (Deliberately NOT a line number: a same-file pin drifts on every edit above it, and
-# this comment's own first draft carried a stale one. The other pins in this file name OTHER files.)
+# it is and is not. (Deliberately NOT a line number, here or in that note: a same-file pin drifts on
+# every edit above it, and this comment's own first draft carried one that had already gone stale.)
 # Kept inline for the same reason: `env` execs in place, so `$?` is the runner's own status.
 env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS -u SHARD_BOUND \
   bash "$COMPLETE/scripts/runner-narrow.sh" >"$TMP/complete.out" 2>&1
