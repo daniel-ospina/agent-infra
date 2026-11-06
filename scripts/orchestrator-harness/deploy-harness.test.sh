@@ -1225,18 +1225,21 @@ fi
 #   deploy-harness.sh --repo . --o $O").
 #   ⛔ `check-deployed-drift.sh` reads 3 and KEEPS a floor of 1 DELIBERATELY — this is the one entry
 #   that must NOT be re-cut to its raw count. Of its three mentions, two are PROSE naming the
-#   producer (`:65` a comment; `:294` an "unknown: no harness record … written by the deploy path:"
-#   message) and only `:869` hands out a redeploy. Pinning 3 would pin two sentences, so a comment
+#   producer (`:91` a comment; `:320` an "unknown: no harness record … written by the deploy path:"
+#   message) and only `:1366` hands out a redeploy. Pinning 3 would pin two sentences, so a comment
 #   reword would red this arm over correct code — precisely the `say`→`log_line` brittleness this
 #   change exists to retire, moved one target to the left. Its residual is STATED, not hidden:
-#   replacing the remedy at `:869` with a bare `cp` IS caught by arm (2) below, but DELETING that
-#   line is caught by neither arm. A remedy-shaped count (rather than a mention count) would fix it;
+#   replacing the remedy at `:1366` with a bare `cp` IS caught by arm (2) below, but DELETING that
+#   line is caught by neither arm. (Those three line numbers were `:65`/`:294`/`:869` and had gone
+#   stale; re-verified against the tree 2026-11-06, because a citation nobody can follow is not the
+#   stated residual it claims to be.) A remedy-shaped count (rather than a mention count) would fix it;
 #   that is a change to the ARM, not to this number, so it is a follow-up rather than a floor
 #   smuggled in here.
 # Adding the three files that gained remedies above (`lane.sh:3`, `lane-merge.sh:2`,
 # `spawn-gate.sh:3`) is the same doctrine applied to them: a file that gains a remedy gets a floor, or
 # arm (1) is silent on it and arm (2) is silent on a remedy replaced by prose.
-# ⛔ FIVE FLOORS RE-CUT 2026-11-06 (PR #3508, #3073 roots 2+3) — the same drift the two entries above
+# ⛔ NINE FLOORS RE-CUT 2026-11-06 (PR #3508, #3073 roots 2+3) — five in the first round recorded
+# here, four more in the review P2 paragraph further down. The same drift the two entries above
 # record, found again one round later. Seven remedies were reverted to the unverified depth-1 copy
 # (chain-merge.sh:313, dispatch-merge.sh:155, fix-one.sh:819, lane.sh:970,1010, spawn-gate.sh:2275,2309)
 # and the fix that restored them ALSO left all five floors at their pre-revert numbers, so each restore
@@ -1244,7 +1247,9 @@ fi
 # arm (1) stays GREEN. Arm (2) does catch the `cp *.sh` shape — that is how the class was found — but a
 # remedy DELETED or reworded to name a third mechanism is arm (2)'s blind spot, which is the case a
 # floor exists for. Re-cut to the measured counts, per the rule stated above:
-#   `lane.sh` 3→5, `spawn-gate.sh` 4→6, `fix-one.sh` 2→3, `dispatch-merge.sh` 2→3, `chain-merge.sh` 1→2.
+#   `lane.sh` 3→5, `spawn-gate.sh` 3→6, `fix-one.sh` 2→3, `dispatch-merge.sh` 2→3, `chain-merge.sh` 1→2.
+# (FLOOR→FLOOR, the same convention as the four rows in the P2 paragraph below — `spawn-gate.sh`'s floor
+# was 3 at base `6fea8b687`, never 4; 4 is that file's base MEASURED COUNT, a different quantity.)
 # ⛔ EACH NUMBER WAS RE-MEASURED ON THE MERGED HEAD (review P1, 2026-11-06), NOT ON THE PRE-MERGE BRANCH
 # HEAD. The first cut measured the branch tree, and the forward merge with `origin/main` added another
 # `deploy-harness.sh` comment to `spawn-gate.sh` (`:1787`), taking it to 6 against a floor of 5 — so
