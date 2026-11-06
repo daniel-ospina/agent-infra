@@ -139,6 +139,18 @@ tb_watchdogs_reap() {
 # (the same discipline `run_agent` records for its own `set -m`), and the negative-pid kill still reaches
 # the group afterwards. A shell that refuses `set -m` falls back to the direct-child kill, so this is a
 # strict improvement on every host rather than a new dependency.
+# ⛔ ONE SHAPE THIS FIX DOES **NOT** BOUND, STATED BECAUSE THE PARAGRAPH ABOVE MEASURES IT (cycle-21
+# verification of a reviewer's finding — REPRODUCED ON BOTH SIDES of this change, so it is NOT a
+# regression of it). The timer only fires while `wait "$pid"` is still running. A command that FORKS a
+# helper and then EXITS 0 without waiting for it returns from `wait` at once, so nothing here ever signals
+# that group: the helper keeps the caller's capture pipe open and the `out="$(…)"` shape blocks for the
+# helper's whole lifetime. Measured: `tb_timeout 2` over `bash -c 'sleep 30 & exit 0'` returns rc=0 in
+# ~2 ms, while the CAPTURED form does not return for 30 s — and the same measurement is identical on the
+# pre-fix helper (`origin/main`) and under GNU `timeout 2` (which has the same property). Closing it
+# requires a group signal AFTER the direct child has been reaped, i.e. against a pid the shell has
+# already released to reuse; that trade is not made here. The pre-fix paragraph's measurement still
+# holds for the shape it names — a command that IS still running when the timer fires, where the
+# direct-child kill left the transport helper alive — and that shape is what this change fixes.
 # ⛔ THE GUARANTEE IS THE COMMAND'S OWN PROCESS GROUP, AND IT IS NOT TRANSITIVE (review cycle 20, P2 —
 # MEASURED). A command that itself calls `tb_timeout` enables job control in ITS shell too, so the inner
 # command is a NEW group leader and is not a member of the group this timer signals: measured
