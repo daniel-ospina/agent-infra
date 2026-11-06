@@ -494,39 +494,63 @@ mk_case sat-writer 1000
 mk_gh_sat "$D"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 rf "$D" refresh
-SAT="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"; 
-case "$SAT" in
-  *P0-blocker*) ok "truncation-writer: a FULL tier window with a next page still advertised is RECORDED — .pool-sat names P0-blocker" ;;
-  *) bad "truncation-writer: .pool-sat does NOT name the truncated tier (got '${SAT:-<absent>}') — the producer the order line's windows=TRUNCATED() disclosure rests on wrote nothing" ;;
-esac
-# ⛔ NON-VACUITY, THE POINT OF THE ARM: delete the three writer lines from the SHIPPED script and the
-# assertion above must be the one that reddens. Without this, the case could pass on a fixture artifact
-# (a stale file, a `d` that never resolved) and pin nothing about the writer.
-mk_case sat-writer-mut 1000
-mk_gh_sat "$D"
-mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
-MUT_SAT="$T/mut-sat/refresh-candidates.sh"; mkdir -p "$T/mut-sat"
-sed '/\[ "\${REST_WINDOW_FILLED:-0}" = "1" \] && echo "P[012]-[a-z]*" >> "\$O\/\.pool-sat"/d' \
-  "$REFRESH" > "$MUT_SAT"
-if cmp -s "$REFRESH" "$MUT_SAT" 2>/dev/null; then
-  bad "truncation-writer: the writer-deletion mutation did not apply — the sed anchor drifted, so the non-vacuity check below would pass by vacuity"
-else
+# ⛔ ONE ASSERTION PER TIER, NOT ONE FOR THE SET (review cycle 37, P2 — MEASURED). Matching only
+# `*P0-blocker*` left the OTHER TWO writer lines deletable-green: removing just the `P1-severe` line from
+# the shipped script gave this suite 31 passed, 0 failed, and `rank-queue` stayed 106/0 (its §14b/§14c
+# hand-write the fixture). `P2-moderate` is the tier this suite itself documents as over capacity in
+# production (450 open against a 200 window), so an ungraded P2 line is the one that matters most.
+# #3481's standard is one named mutant per new assertion; a single wildcard match cannot satisfy it.
+SAT="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+for _satt in P0-blocker P1-severe P2-moderate; do
+  case "$SAT" in
+    *"$_satt"*) ok "truncation-writer: $_satt is RECORDED in .pool-sat for a FULL window with a next page still advertised" ;;
+    *) bad "truncation-writer: .pool-sat does NOT name $_satt (got '${SAT:-<absent>}') — that tier's writer line can be deleted green, so the windows=TRUNCATED() disclosure loses that tier silently" ;;
+  esac
+done
+# ⛔ NON-VACUITY, PER WRITER LINE: delete ONE tier's writer from a copy of the SHIPPED script and the
+# assertion for THAT tier must be the one that reddens. A single "delete all three" mutation cannot
+# satisfy this — it deletes whatever remains, so a pre-deleted line just shrinks the deletion set and the
+# mutant's record still comes out empty, which the old arm read as "the writer is what produces it".
+for _satt in P0-blocker P1-severe P2-moderate; do
+  mk_case "sat-writer-mut-$_satt" 1000
+  mk_gh_sat "$D"
+  mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+  MUT_SAT="$T/mut-sat-$_satt/refresh-candidates.sh"; mkdir -p "$T/mut-sat-$_satt"
+  sed "s|\[ \"\${REST_WINDOW_FILLED:-0}\" = \"1\" \] && echo \"$_satt\" >> \"\\\$O/\\.pool-sat\"||" \
+    "$REFRESH" > "$MUT_SAT"
+  if cmp -s "$REFRESH" "$MUT_SAT" 2>/dev/null; then
+    bad "truncation-writer: the $_satt writer-deletion mutation did not apply — the sed anchor drifted, so the non-vacuity check for that tier would pass by vacuity"
+    continue
+  fi
   REFRESH_SAVED="$REFRESH"
   REFRESH="$MUT_SAT"; rf "$D" refresh; REFRESH="$REFRESH_SAVED"
-  if [ -s "$D/o/.pool-sat" ]; then
-    bad "truncation-writer: with the .pool-sat writer DELETED the record was still written ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the fixture, not the writer, is producing it"
-  else
-    ok "truncation-writer: deleting the three .pool-sat writes removes the record (the check above can fail, so it grades the WRITER)"
-  fi
-fi
+  MUT_SAT_REC="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+  case "$MUT_SAT_REC" in
+    *"$_satt"*) bad "truncation-writer: with the $_satt writer DELETED the record still names it ('$MUT_SAT_REC') — the fixture, not that writer line, is producing it" ;;
+    *) ok "truncation-writer: deleting ONLY the $_satt writer line removes $_satt from .pool-sat (each of the three writers is graded, not just the set)" ;;
+  esac
+done
 # And the NEGATIVE: an ordinary short listing (no full window, no next page) records NOTHING, so the
 # clause cannot appear on the routine path where no tier was clipped.
+# ⛔ AND THE ABSENCE IS GATED ON THE PASS HAVING ACTUALLY LISTED (review cycle 37, P2 — MEASURED). Asserting
+# only "`.pool-sat` is absent" passed on a REFUSED pass: with the case budget dropped to 20 the pass refused
+# at the core-reserve gate (`remaining=0 cannot buy one candidate`), made ZERO `labels=` listings, and the
+# arm still reported "the clause is not emitted for a tier that fit" — absence of evidence read as evidence.
+# §6 above already sets this precedent (`tier-order: no listing was made for $_tier at all (the assertion
+# below would pass by vacuity)`); this arm had no equivalent.
 mk_case sat-writer-none 1000
 mk_gh "$D" "$(rows 2)"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 rf "$D" refresh
-[ ! -s "$D/o/.pool-sat" ] && ok "truncation-writer: an UNSATURATED listing writes no .pool-sat (the clause is not emitted for a tier that fit)" \
-                          || bad "truncation-writer: .pool-sat exists for an unsaturated listing ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the signal would fire on every pass and stop meaning anything"
+NEG_OK=1
+[ "$RC" -eq 0 ] || { NEG_OK=0; bad "truncation-writer: the unsaturated case's pass did not complete (rc=$RC) — the absence assertion below would pass without a pass: $OUT"; }
+if ! grep -q 'labels=' "$D/bin/gh.argv" 2>/dev/null; then
+  NEG_OK=0; bad "truncation-writer: the unsaturated case made NO tier listing at all — 'no .pool-sat' would pass by vacuity rather than because the window fit"
+fi
+if [ "$NEG_OK" -eq 1 ]; then
+  [ ! -s "$D/o/.pool-sat" ] && ok "truncation-writer: an UNSATURATED listing (tier listings made, pass complete) writes no .pool-sat (the clause is not emitted for a tier that fit)" \
+                            || bad "truncation-writer: .pool-sat exists for an unsaturated listing ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the signal would fire on every pass and stop meaning anything"
+fi
 
 echo
 echo "  $PASS passed, $FAIL failed"
