@@ -146,9 +146,12 @@ BASE_LABEL="com.eldato.orchestrator-loop"
 # therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
 [ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
-# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
-# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
-# and a second production label that the guard did not know about would be installable from a sandbox.
+# The OTHER production label: `com.eldato.orchestrator-watchdog`, the hand-provisioned controller
+# watchdog RETIRED by agent-infra#2303 (`templates/launchd/RETIRED` — `install-launchd.sh`'s
+# `retire_pass` unloads and removes it). It has no plist template any more, and it is still listed
+# here so `label_guard` treats it as PRODUCTION: the guard's rule is about the labels launchd may
+# still resolve on a live box, and a retired label a sandbox did not know about would still be
+# addressable from one.
 PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
@@ -1571,14 +1574,18 @@ DRIFTED=""
 # all: it is the STABLE program the plist execs (see the STABLE_PROG block above), so a `$O` copy that
 # drifted from the pin is the one file whose divergence turns every launchd tick into exit 127 while
 # `launchctl list` still reports the job `loaded`. It is also a $O seed, so it belongs here.
+# mandate-preflight.sh (#3377) is the disclosure half of the same class: both `run_agent` copies resolve
+# it at SPAWN time, and a `$O` that lost it makes every lane report the mandate files' state as
+# UNVERIFIED — the silence this change exists to end, restored silently.
 # key-gate.sh (#3331) is the same class for the same reason, one gate later: `lane.sh` sources it
 # fail-loud and refuses to start a lane whose model credential nothing asserts, so a $O without it stops
 # every dispatch on the box — and the refusal is *meant* to be loud, which is why the DRIFT must be
 # detected here rather than discovered as a box-wide standstill with nothing naming the cause.
 # ⛔ EVERY NAME HERE IS MAINTAINED, NONE IS EITHER/OR: `stall-fix.sh` came from #2929,
-# `orch-pin-exec.sh` from #3309, `key-gate.sh`/`lane-env.sh` from #3331. No side of any of those
-# merges was a superset of another — dropping one leaves a file its caller executes UNCHECKED,
-# which is the exact defect this list exists to catch. Merge conflicts here resolve as a UNION.
+# `orch-pin-exec.sh` from #3309, `mandate-preflight.sh` from #3377, `key-gate.sh`/`lane-env.sh` from
+# #3331. No side of any of those merges was a superset of another — dropping one leaves a file its
+# caller executes UNCHECKED, which is the exact defect this list exists to catch. Merge conflicts here
+# resolve as a UNION.
 # lane-env.sh (#3060) is the SAME defect already live one line up in `lane.sh`: that file sources it and
 # `exit 78`s without it, and it was in NEITHER list (review of #3331, verified `grep -c` = 0 on both), so
 # a $O deployed before #3060 — or half-synced — stops every lane while this check reports no divergence
@@ -1586,7 +1593,7 @@ DRIFTED=""
 # lane_registry.py (#3382) is the registry the harness's own lane-surface tools import to answer "did
 # this lane finish?"; a $O deployed without it makes every such caller import-fail, so it joins the
 # same union as the names above — this one from the #3382 branch, not from main.
-for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh lane_registry.py cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh lane-env.sh; do
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
