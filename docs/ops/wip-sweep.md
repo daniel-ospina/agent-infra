@@ -1,11 +1,13 @@
 # WIP sweep — is a lane's uncommitted work on origin, or only on this box?
 
-**Status:** shipped. `scripts/wip-sweep.sh` + `scripts/wip-sweep.test.sh` (one paired `ok`/`bad`
-assertion per arm, every arm driven against a real bare remote — no assertion is recorded without an
-observation from this run), and a hook in `scripts/cloud-cell-quiesce.sh`.
-⛔ No assertion COUNT is written here on purpose: the two numbers this line has already carried (55,
-then 65) both went stale the moment an arm was added, and a stale count in a status line is a claim the
-suite does not support. `grep -c 'ok "' scripts/wip-sweep.test.sh` is the count, and it is never wrong.
+**Status:** shipped. `scripts/wip-sweep.sh` + `scripts/wip-sweep.test.sh`, plus a hook in
+`scripts/cloud-cell-quiesce.sh`. The suite builds real `git init --bare` remotes for the runs it makes,
+reads the records those runs write, and drives some arms from hand-written records or refused inputs with
+no remote at all. No assertion is recorded without an observation from that run.
+⛔ This line carries no assertion COUNT and no inventory of which arm touches a remote, on purpose: two
+counts (55, then 65) and four separate attempts to enumerate the remote-touching arms were stale or
+simply wrong within a round of being written. A number or a list here is a claim the suite cannot keep.
+`grep -c 'ok "' scripts/wip-sweep.test.sh` is the count, and it is never wrong.
 **Issue:** agent-infra#3485. **Depends on:** `scripts/bg-rescue-wip.sh` (#2045, unchanged semantics).
 **Not covered here:** the typed `refs/wip` index and the ref-naming rule — that is agent-infra#3484.
 
@@ -47,11 +49,12 @@ and the mutant that reverts it (`AT_RISK=1` → `AT_RISK=0` in `bg-rescue-wip.sh
 on the PR: a dirty worktree with an unreadable directory then reports
 `status=ok rc=0 seen=1 clean=1 dirty=0 unmeasured=0` — a clean fleet over unfiled work.
 
-A worktree record whose **checkout directory is gone** is the one case that is not measured: git says
-the record is `prunable`, no directory exists to hold uncommitted work, and the row is recorded as
-`skip`. Requiring *git's own* prunable verdict is what stops that becoming fail-open — a permission
-blip makes the directory stat-invisible without git saying prunable, and that case is
-`cannot-verify`.
+**Two** record classes are not measured. A **bare repository** record has no working tree at all, so it
+is recorded as `skip` (`bare-repo-no-working-tree`). A worktree record whose **checkout directory is
+gone** is the other: git says the record is `prunable`, no directory exists to hold uncommitted work,
+and the row is recorded as `skip` (`prunable-checkout-dir-absent`). Requiring *git's own* prunable verdict
+for the second is what stops it becoming fail-open — a permission blip makes the directory
+stat-invisible without git saying prunable, and that case is `cannot-verify`.
 
 ## The pass
 
@@ -65,7 +68,11 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
   `cloud-cell-quiesce.sh` passes `--apply` because it is about to hand the box on: a report-only hook
   on the path that destroys the disk would archive nothing for ever while reading as a safeguard.
 - **Bounded twice.** `--max N` (default 25) caps ARCHIVES per pass, and the pass budget
-  (`WIP_SWEEP_BUDGET`, default 900 s) stops it between worktrees.
+  (`WIP_SWEEP_BUDGET`, default 900 s) bounds the WHOLE pass: it is tested before every examination, not
+  only before an archive, so a pass over a checkout with hundreds of CLEAN worktrees is still bounded by
+  the budget rather than by `worktree_count x WIP_SWEEP_STATUS_TIMEOUT`. A budget stop is stated —
+  `status=incomplete`, `detail=… budget_stopped=yes`, exit `1` — never a green 0 over worktrees it did
+  not reach.
   ⛔ **`0` is a disable for exactly those two and nothing else.** `tb_timeout 0 …` means *unbounded*, and
   a zero staleness window means *everything is stale* while reading as *do not check* — so
   `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT` and `WIP_SWEEP_STALE_SECONDS` must be greater
@@ -92,9 +99,10 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
   naming a slug), is the same class.
   ⛔ **What the read-back proves, exactly: that a `refs/wip/<slug>` EXISTS on origin.** It does not prove
   the commit is *this* pass's snapshot — a pre-existing ref of the same slug satisfies the existence
-  test — which is why the note is worded `ref-present` and not `verified`. That residual is bounded and
-  named: in the branch where a pre-existing ref makes it so, the rescue took its *clean* path, so the
-  lane's work is committed on its branch, and what is wrong is a stale-archive claim rather than loss.
+  test — which is why the note is worded `ref-present` and not `verified`. What that residual costs is
+  a stale-archive CLAIM; it is not a claim that the work is safe, and it must not be read as one: a
+  commit on a local branch is saved only if that branch is PUSHED, and this tool does not push branches
+  (see "What this does NOT do").
 - **No ambient repo.** There is deliberately no `$REPO` default. `$REPO` is a generic name the cell
   supervisor and the Mac bring-up both export, and a sweep that adopted it archived work from a repo
   nobody asked about — measured while writing this: an arm meant to prove "no repo resolvable" swept a
@@ -105,7 +113,7 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
 
 | code | meaning |
 |---|---|
-| 0 | every worktree MEASURED, and every dirty one archived (apply), or nothing found (dry run) |
+| 0 | nothing failed and nothing was deferred: every enumerated record was either EXAMINED or deliberately skipped (a bare repo, or a git-`prunable` record with no directory), and (apply) every dirty worktree was archived. A `skip` row does NOT mean "nothing to rescue" — it means nothing COULD be there; the sweep still refuses (exit 3) when it cannot tell |
 | 1 | INCOMPLETE — the cap or the budget deferred work, or a dry run found work it would archive |
 | 2 | usage (including an unparseable `--max`: a typo'd bound must never mean "no bound") |
 | 3 | FAIL-CLOSED — a worktree unmeasured, a rescue failed (the work is still only on this disk), no repo resolved, or the rescue / bounded-execution library is missing |
@@ -118,8 +126,23 @@ worktrees. This is the same polarity as `spawn-gate.sh`'s `rescue=UNAVAILABLE`.
 One TSV row per worktree examined, in `${O:-$HOME/orchestrator}/state/wip-sweep.tsv`:
 
 ```
-ts  repo  path  branch  head  verdict  paths  age_h  issue  ref  note
+ts  repo  path  branch  head  verdict  paths  age_h  issue  ref  note  unpushed
 ```
+
+The header line is `#ts\trepo\t…` — one field per column, exactly like a data row, so a header-driven
+reader resolves every column. `verdict` is `clean` / `dirty` / `skip` (a bare repo, or a record git calls
+`prunable`) / `cannot-verify` / `unreached`. **`unreached` is one row per worktree the pass budget
+stopped before examining**, so the index still reconciles against `git worktree list` after a stopped
+pass and the pass under-reports nothing silently. Its `branch` is normalised (`fix/x`, not
+`refs/heads/fix/x`) and its head is in the `head` column, exactly like an examined row — arms C5c/C5d/C5e
+pin the COUNT and the COLUMNS, not just the row's presence, because round 3 of review measured a
+transposed pair that a row-count assertion had passed. Two shapes are stated rather than implied: a
+detached worktree's unreached row has an EMPTY `branch` (an examined one says `detached-<sha>`), and a
+bare repository's has an empty `branch` and an empty `head` (an examined one says `-`/`-`) — the parser
+forwards porcelain's own fields for a record it deliberately did not examine. `unpushed` is the count of commits on that branch
+which **no remote has** — see "What this does NOT do"; it is `?` when HEAD or the remote set could not be
+read, and it is carried on the cap/budget-DEFERRED rows too (those are the rows where work was **not**
+archived). An `unreached` row cannot carry it (nothing was read), and neither can a `skip` row.
 
 `issue` is derived from the branch (`feat/8090-tm`, `fix/3442-nonvacuity` → the issue number). A dirty
 worktree whose branch carries no issue number is **reported** (`issue=-`, a loud line, `no_issue=N`) —
@@ -144,10 +167,27 @@ list` refused, or a path that is not a repository) adds an `unmeasured` count an
 `cannot-verify` row and does **not** add to `seen` — it is a failure about the repository, not an
 examination of a worktree, and it always fails the pass (exit 3).
 
+⛔ **The record is written TWICE: `status=running` before any worktree is touched, then the verdict.**
+That is what makes an interrupted pass visible. A pass that crashes, is OOM-killed, is cut off by a
+quiesce, or cannot write its verdict leaves `running` — which `--print-status` maps to `failed`/exit 3 —
+instead of the PREVIOUS pass's `status=ok` standing there, fresh, for up to `WIP_SWEEP_STALE_SECONDS`. The
+limit is stated rather than implied: a state dir unwritable at BOTH the start and the end cannot be marked
+at all, so the old record stands and the pass can only be loud on stderr with a non-zero exit — that is a
+host problem, and the reader cannot see it. (`disk-reaper.sh` gets its equivalent witness from the
+scheduler's own exit status; this pass has no scheduler yet, so the marker is the substitute.)
+
 `--print-status` answers from that record alone: `0` ok, `1` incomplete, `3` failed / stale / never.
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
-and nowhere else. A record whose `ts=` is missing or unreadable also answers `3`: an uncomputable age is
-not freshness.
+and nowhere else. The printed `status=` and `rc=` are the **derived** ones, emitted last, so the
+key=value surface agrees with the exit code; the recorded values are kept beside them as `recorded=` and
+`recorded_rc=` (both preceded by every other key, so each derived value is the LAST occurrence of its
+own key — `detail=` follows `status=`, which is why the rule is per-key, not "derived keys end the
+stream"). Neither emitted key can contain the substring `status=ok`, so even a `grep 'status=ok'`
+consumer cannot read green off a record this run judged stale — the same polarity
+`disk-reaper.sh --print-status` prints. Two clocks it refuses to
+judge: a `ts=` that is missing or unreadable (an uncomputable age is not freshness), and a `ts=` in the
+FUTURE (a clock step backwards — VM restore, NTP, a cell re-image — would otherwise disable the
+staleness test for the whole skew).
 
 ## The quiesce hook
 
@@ -178,9 +218,21 @@ and restarts one controller (step 3b). Lanes are dead by then, so their trees ar
 - **The quiesce's claim is REPO-scoped, not box-scoped.** It sweeps `--repo "$REPO"`, which is the one
   checkout the cell is being reset onto; another clone's worktrees on the same box are NOT swept and the
   success line says so. A box-wide sweep is `WIP_SWEEP_REPOS=A:B wip-sweep.sh --apply`.
+- **It does NOT save commits that exist only locally.** `bg-rescue-wip.sh` archives UNCOMMITTED work
+  (#2045's scope, unchanged), so a branch with clean status and three unpushed commits is `clean` to
+  this pass. It is not silent for any worktree the pass EXAMINED: such a worktree gets a
+  `COMMITS ONLY ON THIS DISK` line recording the count, its TSV row carries `unpushed=<n>` (except the
+  two post-rescue failure rows, `archived-but-ref-unparsed` and `rescue-exit-<rc>`, which carry `-` and
+  fail the pass anyway), and the pass record carries `unpushed_worktrees=<n>`. Three row classes cannot say — `cannot-verify` (the pass
+  fails, exit 3), and `skip` / `unreached` (no examination happened) — and none of the three can end as
+  a green pass when work was left behind. On a
+  box about to be reclaimed those commits die with it unless the branch is pushed; archiving branch
+  commits is a separate capability and is not claimed here.
 - **It never deletes, and it changes no working tree.** It adds commits to `refs/wip/<slug>` on
-  ORIGIN; inside the examined worktree's own repository it writes only the local pin
-  `refs/wip-local/<slug>` plus the unreferenced commit/tree/blob objects that pin holds. The working
+  ORIGIN; inside the examined worktree's own repository it writes two refs — the local pin
+  `refs/wip-local/<slug>`, and the fetched copy of origin's snapshot `refs/wip-remote/<slug>` that the
+  accumulate-don't-replace logic chains onto — plus the unreferenced commit/tree/blob objects the pin
+  holds and `.git/FETCH_HEAD`. None of them is removed by this tool, and none is a branch. The working
   tree, the real index and the branch are untouched (`bg-rescue-wip.sh` stages into a throwaway index
   and never moves the branch — pinned by the suite's A5/A6).
 - **A `cannot-verify` worktree is a failed pass, not a retry.** A record that is both unreadable and

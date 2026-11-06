@@ -591,10 +591,11 @@ fi
 # agent-infra#3485 farms wip-sweep.sh BESIDE IT: the two are a pair (`wip-sweep.sh` classifies every
 # worktree with `bg-rescue-wip.sh --verdict` and archives with `bg-rescue-wip.sh`, both resolved as
 # SIBLINGS of its own directory), and `cloud-cell-quiesce.sh` — also farmed, and the one path that
-# destroys a cell's disk — resolves the sweep from `$REPO/scripts`, the pinned harness tree, `$O` and
-# THIS farm. Farming the pair FLAT is what makes the sibling lookup hold in every one of those homes;
-# farming the sweep alone would leave it unable to classify, which is a refusal at startup (exit 3),
-# not a silent clean pass. A sweep that nothing can run is #3485's defect one layer up.
+# destroys a cell's disk — resolves the sweep from `$REPO/scripts`, the tree the PIN record
+# (`$CELL_HOME/.harness-path`, a FILE holding a path) names, `$O` and THIS farm. Farming the pair FLAT
+# is what makes the sibling lookup hold in every one of those homes; farming the sweep alone would leave
+# it unable to classify, which is a refusal at startup (exit 3), not a silent clean pass. A sweep that
+# nothing can run is #3485's defect one layer up.
 # ⛔ THE GRAPH CLIENT IS FARMED BY `graph_srcs` (below), AND THAT ARRAY IS THE ONLY DELIVERY OF IT
 # (agent-infra#3253). ⛔ It is NOT also listed in `fleet_srcs`: #3253 first put the pair there, #3374
 # gave the hosted-graph fallback its own array (with a farm loop that reports a MISSING entry loudly),
