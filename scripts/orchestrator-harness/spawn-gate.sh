@@ -423,14 +423,16 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
 # gated here — `stall-fix.sh` and `ai-drainer.sh` (throwaway / mend checkouts), `refresh-candidates.sh`,
 # `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts), the
 # merge rail's own base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (on the live
-# scout path, via `refresh-candidates.sh`), among others.
+# scout path), among others.
 # ⛔ NO COUNT IS GIVEN HERE, DELIBERATELY. This paragraph used to say "Five scripts" and name exactly
 # five. That number was FALSE, and so was every numeral that replaced it: run the census below and you
 # get many more files than five. A hand-maintained count rots, and a reader sizing the exposure from a
 # number nobody re-measures is worse off than one who enumerates. So ENUMERATE instead — this is the
 # script-scoped census, and it deliberately admits comments (a comment-only mention still lists the
-# file), which makes it a SUPERSET to audit rather than a list that can silently shrink. Filter
-# `\.test\.sh$`, `retired/`, and the three gated callers:
+# file), which makes it a SUPERSET to audit rather than a list that can silently shrink. That command
+# filters `\.test\.sh$` and `retired/` and NOTHING ELSE — it does NOT drop the gated callers, so drop
+# those yourself after reading it (the three `wt_provision` callers, and this seam's own
+# `wt-lifecycle.sh`):
 #     git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired
 # Moving any of them onto `wt_provision` (or the `--disk-admit` verb) is the follow-up.
 #
