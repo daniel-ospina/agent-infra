@@ -295,8 +295,9 @@ echo
 echo "=== step 4d (P2): an ENORMOUS REVIEW_TIMEOUT must not mint an unprunable lease ==="
 # `is_num` is UNBOUNDED, so it accepted `9223372036854775807`: `CLAIM_LEASE=$(( REVIEW_TIMEOUT +
 # 1200 ))` then wrapped NEGATIVE, `claims.sh`'s `until=$(( now + ttl ))` was negative, `_lease_of`'s
-# `[0-9]*` cannot parse a minus sign, an unparseable lease is read as LIVE forever, and `claim_prune`
-# can never reap it — so that PR/head was frozen across ALL boxes with no automatic recovery
+# anchored ASCII-digit match cannot parse a minus sign, an unparseable lease is never read as EXPIRED (nothing steals
+# it), and `claim_prune` could not reap it before #3203's bounded arm
+# — so that PR/head was frozen across ALL boxes with no automatic recovery
 # (FAIL-CLOSED, the opposite of the design's fail-open policy). `is_limit` bounds REVIEW_TIMEOUT to 9
 # digits, so the sum cannot overflow. The lease LENGTH distinguishes "the caller's guard ran" from
 # "claims.sh silently clamped": a coerced REVIEW_TIMEOUT=1800 must yield ~3000s, not ~1800s.

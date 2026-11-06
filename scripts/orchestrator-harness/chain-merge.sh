@@ -106,7 +106,7 @@ cap_refusal_gate() { # -> prints `fork|load|disk|land|capability|skew|key` and r
   if [ "$win" -gt 0 ] && [ "$grace" -ge "$win" ]; then grace=$(( win - 1 )); fi
   [ "$ep" -ge "$(( CHAIN_START - grace ))" ] || return 1
   # Field 3 is the REMEDY this chain reports to whoever reads the exit code (71 capability /
-  # 73 fork / 74 land-backlog / 75 load / 77 disk / 81 harness-skew / 82 key), not a gate: an
+  # 73 fork / 74 land-backlog / 75 load / 77 disk / 82 key / 83 harness-skew), not a gate: an
   # unrecognised value is reported as
   # `load` because the refusal
   # itself is already proven by fields 1-2, and refusing to end the wait over one corrupt byte is the
@@ -282,14 +282,20 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
       # measured: `gate=capability` → `exit=75`, "refused at the load gate"). Both halves are pinned
       # by one behavioural table in `spawn-gate.test.sh` ("EVERY REFUSAL CODE …").
       capability) _cap_rc=71 ;;
-      # 81 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
+      # 83 is spawn-gate.sh's AGENT_HARNESS_SKEW_REFUSED (follow-up review of #2991, P2): the probe RAN
       # and either rejected its own arguments (a usage/version skew between the caller and the deployed
       # helper) or died without a verdict (`rc=2` on a corrupt copy). ⛔ IT MUST NOT BE 71: every reader
       # treats 71 as a property of THIS box, so the operator is told to repair the box's pi/extension
       # set or hand the item to a peer — and the peer runs the SAME helper pair and refuses identically.
       # The chain still stops here (no PR can appear), and the EXIT trap still releases
       # refs/claims/issue-$N, because the item is fine and must not stay stranded on one box.
-      skew) _cap_rc=81 ;;
+      # ⛔ AND IT IS 83, NOT 81 (2026-11-01): 81 belongs to `AGENT_MEM_REFUSED` (#2387), which claimed it
+      # nine days before this gate was written, and this literal is what pinned the collision into a
+      # second caller. ⛔ SCOPED, NOT OWNED: #2387 is a BRANCH, so nothing on THIS tree declares 81 and
+      # the derived distinctness guard in `spawn-gate.test.sh` cannot see it — a lane that re-derives
+      # "which codes are free" from the tree alone reads 81 as free and re-claims it green. That is the
+      # exact failure this PR exists to prevent, so the sentence must not be read as a registry entry.
+      skew) _cap_rc=83 ;;
       # 82 is key-gate.sh's KEY_GATE_REFUSED (#3331): the lane REFUSED before spawning the agent because
       # its environment holds no model credential for the provider. Named rather than folded, for the
       # same reason as every other arm: an operator told 75 waits for load to fall on a box whose
@@ -304,7 +310,7 @@ for i in $(seq 1 "$CHAIN_POLLS"); do
     elif [ "$_cap_gate" = "key" ]; then
       echo "[chain $N] credential refusal: lane-$N was refused before its agent started because the lane's environment holds no model credential for its provider (key-gate.sh, exit ${_cap_rc}), so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N. This IS a capacity transfer in the one sense that matters here: the credential is a property of THIS box, so a peer that HAS one can take the item — the remedy is to put the key in the environment lanes run with ([key-gate] line in logs/lane-$N.log names the variable and every candidate file), not to wait" >> "$LOG"
     elif [ "$_cap_gate" = "skew" ]; then
-      echo "[chain $N] harness mismatch: lane-$N was refused because either the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing, OR the spawn gate could not resolve capacity.sh at all (its nodeploy arm, #2293 follow-up) — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is to sync the pair (cp scripts/orchestrator-harness/*.sh \$O/) wherever lanes run" >> "$LOG"
+      echo "[chain $N] harness mismatch: lane-$N was refused because either the lane's caller and the deployed cell-lane-preflight.sh disagree (a usage/version skew, or a corrupt copy), so the capability probe measured nothing, OR the spawn gate could not resolve capacity.sh at all (its nodeploy arm, #2293 follow-up) — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N so the item is not stranded on this box. This is NOT a capacity transfer: every box running the same helper pair refuses identically, so handing the issue to a peer would only circulate it — the remedy is a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever lanes run" >> "$LOG"
     else
       echo "[chain $N] capacity transfer: lane-$N was refused at the $_cap_gate gate, so no PR can appear — exiting now instead of after ${CHAIN_POLLS} x ${CHAIN_POLL_SECS}s. The EXIT trap releases refs/claims/issue-$N, so a peer with capacity can claim it; this box stands down via state/capacity-refused-$N for the record's yield window (agent-infra#1909)" >> "$LOG"
     fi

@@ -1287,11 +1287,31 @@ PY
   ck "holder-only INCOMPLETE queued via the registry is also marked checked" $rc
   # (ii-b) the registry is NOT INSTALLED: nothing has answered the holder question, so refuse. This is
   # the arm that keeps the re-route from becoming "no registry, so nobody holds it".
+  # ⛔ IT MUST RUN THE REAL READER. `refreshloop-claim.sh` prepends a STUB whose whole body is
+  # `return 0`, so moving `claims.sh` away changed NOTHING: the stub answered CLEAN and #10 was
+  # queued — the fixture could no longer express the shape it is named for. #2466 (8a3e5359) moved
+  # the missing-file verdict INTO `issue_claim_verdict` (refresh-candidates.sh:1089-1115; the
+  # NOT-INSTALLED verdict itself is at :1092) and deleted
+  # the loop's own `[ -f "$O/claims.sh" ]` arm, so the stub became the only decider.
+  sed -n '/^issue_claim_verdict() {/,/^}$/p' "$REFRESH" > "$TMP/icv-real.sh"
+  { cat "$TMP/icv-real.sh"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-real.sh"
   mv "$HI/claims.sh" "$HI/claims.sh.away"
   : > "$HI/candidates.txt"; : > "$HI/checked.txt"
-  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-claim.sh" > "$TMP/holderinc-noreg.out" 2>&1
+  O="$HI" LIMIT=5 SC="$HI/fakesc" PY="$HI/fakesc/.venv/bin/python" PREFLIGHT="$HI/fakesc/tools/collision_preflight.py" bash "$TMP/refreshloop-real.sh" > "$TMP/holderinc-noreg.out" 2>&1
   case "$(tr '\n' ' ' < "$HI/candidates.txt")" in *10*) rc=1;; *) rc=0;; esac
   ck "holder-only INCOMPLETE with NO claim registry on the box is NOT queued" $rc
+  # ⛔ AND THE ARM MUST SHOW ITS OWN SUBJECT ANSWERED (review of this change, P2). "Not queued" ALONE
+  # cannot tell the real reader's INCOMPLETE (rc 2) from a call that never found a reader: an empty
+  # extraction gives rc 127, and the loop body's own "unrecognised verdict" default
+  # (refresh-candidates.sh:5243-5244) resolves 127 to INCOMPLETE too — so on a drifted signature
+  # (`sed` is anchored on the literal `^issue_claim_verdict() {`) this arm stayed GREEN while proving
+  # nothing, which is the exact class this arm was rewritten to fix. Pin the producer's sentence, the
+  # way `(2952b)` already does, so the drift reds THIS arm instead of silencing it.
+  case "$(cat "$TMP/holderinc-noreg.out")" in
+    *"is NOT INSTALLED"*) rc=0 ;;
+    *) rc=1; echo "      out: $(grep -F '#10' "$TMP/holderinc-noreg.out" | head -3)" ;;
+  esac
+  ck "…and the refusal names the MISSING registry (the real reader answered, not a 127 fallback)" $rc
   mv "$HI/claims.sh.away" "$HI/claims.sh"
   # (iii) a SECOND unreadable surface means the tool could not judge the work: no re-route.
   HI2="$TMP/holderinc2"; mkdir -p "$HI2/fakesc/.venv/bin"
@@ -1600,8 +1620,17 @@ REPORT
   # fail-open this whole substitution is shaped to avoid. (The pre-#2952 arm `(ii-b)` pins the same
   # wiring on the OLD wording; this one pins it on the producer's real one.)
   CELL2952B2="$(holder_report x "$CELL2952_REPORT")"
+  # ⛔ THE STUB ABOVE ANSWERS rc=2 WITH ITS OWN TEXT, so `rm -f claims.sh` was inert and the assertion
+  # below could never see the producer's real sentence. Rebuild the loop with the REAL reader extracted
+  # from the shipped script (the same seam `(ii-b)` uses) so the removal is load-bearing.
+  sed -n '/^issue_claim_verdict() {/,/^}$/p' "$REFRESH" > "$TMP/icv-real.sh"
+  { cat "$TMP/icv-real.sh"; cat "$TMP/refreshloop.sh"; } > "$TMP/refreshloop-2952-real.sh"
+  r2952_run_real() { # <dir> <name>
+    O="$1" LIMIT=5 SC="$1/fakesc" PY="$1/fakesc/.venv/bin/python" PREFLIGHT="$1/fakesc/tools/collision_preflight.py" \
+      bash "$TMP/refreshloop-2952-real.sh" > "$TMP/2952-$2.out" 2>&1
+  }
   rm -f "$CELL2952B2/claims.sh"
-  r2952_run "$CELL2952B2" b2b
+  r2952_run_real "$CELL2952B2" b2b
   if r2952_is_queued "$CELL2952B2"; then rc=1; else rc=0; fi
   ck "(2952b) an ABSENT claims registry is still INCOMPLETE — not queued (no registry is not a free issue)" $rc
   case "$(cat "$TMP/2952-b2b.out")" in
@@ -1844,6 +1873,22 @@ case "$(cat "$TMP/repo-explicit-noorigin.out")" in
 esac
 ck "the no-origin refusal names the missing remote (not a downstream provisioning failure)" $xr
 git -C "$X/samerepo" remote add origin https://github.com/acme/widget.git
+# ⛔ THIS FIXTURE'S $O MUST BE PROVISIONED TOO (review of this change, P2) — the SAME defect the
+# `repolocalpath` block below states, left in place 30 lines away. Without a registry the shared
+# `--check` claims gate (#2466, 8a3e5359) refuses this fixture with its OWN NOT PROVISIONABLE, and
+# the assertion below still passes because `[refresh] check: repo=…` is printed BEFORE that gate —
+# so "ACCEPTED (no false block)" was green about a run the claims gate refused end-to-end.
+# ⛔ AND THE PATTERN NAMES THE *CLAIMS* SENTENCES, NOT THE TOKEN. `NOT PROVISIONABLE` is emitted by
+# every gate that runs AFTER the resolver — a jq that resolves but does not RUN
+# (refresh-candidates.sh:1299), an interpreter below the tool's floor (:1358) — so pinning the bare
+# token reds this arm on a tool-poor box for a fact about the box, which is exactly the host-movement
+# the comment below forbids. The claims gate has TWO refusals of its own, and BOTH are facts about
+# the REGISTRY rather than the host: an absent file (:1326, "is NOT INSTALLED") and a file that is
+# present but unloadable or predates the issue-claim reader (:1314, "cannot answer the issue-claim
+# question"). Pin those two, not the token, and not only one of them: pinning only :1326 left the
+# drift shape (#2466's own failure mode — a `claims.sh` without `claim_issue_preflight`) green about
+# a run the gate refused end-to-end, which is the class this arm exists to close.
+mkdir -p "$TMP/repoexplicit/o3"; printf 'claim_issue_preflight() { return 0; }\n' > "$TMP/repoexplicit/o3/claims.sh"
 ( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR
   HOME="$RH" REPO="$X/samerepo" OR=acme/widget O="$TMP/repoexplicit/o3" bash "$REFRESH" --check > "$TMP/repo-explicit-ok.out" 2>&1 )
 # The ACCEPTANCE is asserted on the resolver's own line, not on rc: `[refresh] check: repo=…` is printed
@@ -1857,7 +1902,7 @@ case "$(cat "$TMP/repo-explicit-ok.out")" in
 esac
 ck "an EXPLICIT REPO that IS a checkout of the queue target is ACCEPTED (no false block)" $xr
 case "$(cat "$TMP/repo-explicit-ok.out")" in
-  *"NOT the queue target"*|*"has no readable 'origin'"*) xr=1 ;;
+  *"NOT the queue target"*|*"has no readable 'origin'"*|*"cross-box claim registry is NOT INSTALLED"*|*"cannot answer the issue-claim question"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray rc)" $xr
@@ -1872,6 +1917,12 @@ ck "the accepted arm carries NO resolver refusal (the acceptance is not a stray 
 # turning it into a refusal is a deliberate test edit with a stated reason — never a silent tightening
 # that refuses every local dev clone (`git init` + `remote add origin <path>`).
 XP="$TMP/repolocalpath"; mkdir -p "$XP/tools" "$XP/origin.git"
+# ⛔ THE FIXTURE'S $O MUST BE PROVISIONED, OR A DIFFERENT GATE ANSWERS. `--check` gained a claims gate
+# (#2466, 8a3e5359) that refuses an absent `$O/claims.sh` with its own NOT PROVISIONABLE, six days
+# after this arm was written — so the assertion below was reading the CLAIMS verdict, not the
+# resolver's tolerance. Seeding the registry makes the removal meaningful: only the local-path
+# resolver can then decide, which is the thing this arm is named for.
+mkdir -p "$XP/o"; printf 'claim_issue_preflight() { return 0; }\n' > "$XP/o/claims.sh"
 printf '# fixture: `--check` only tests that the pre-flight tool EXISTS (#1736)\n' > "$XP/tools/collision_preflight.py"
 git -C "$XP/origin.git" init -q --bare
 git -C "$XP" init -q; git -C "$XP" remote add origin "$XP/origin.git"
@@ -1883,7 +1934,11 @@ case "$(cat "$TMP/repo-localpath.out")" in
 esac
 ck "a local-path origin with an UNDECLARED \$OR is TOLERATED and ANNOUNCED (the stated residual, not silence)" $xr
 case "$(cat "$TMP/repo-localpath.out")" in
-  *"NOT PROVISIONABLE"*) xr=1 ;;
+  # ⛔ NARROWED TO THE CLAIMS GATE'S OWN SENTENCES, not the bare token — the reason is stated in the
+  # `repoexplicit` block above: the post-resolver jq and interpreter gates emit `NOT PROVISIONABLE`
+  # too, and this arm is named for the RESOLVER's tolerance. Both claims-gate branches are pinned,
+  # because a census of one of them left the other shape (registry present, reader absent) green.
+  *"cross-box claim registry is NOT INSTALLED"*|*"cannot answer the issue-claim question"*) xr=1 ;;
   *) xr=0 ;;
 esac
 ck "…and it is TOLERATED, not refused (the residual is the tolerance; a refusal here would block local dev clones)" $xr
@@ -1899,10 +1954,16 @@ ck "…and the resolver really returned 0 for it (the NOTE is not printed on the
 # production pass (rc 3 → `.refresh-blocked` → a merge-only cell), while the loop's own comment calls
 # that shape legitimate. The loop therefore passes its intent in `OR_OPERATOR_DECLARED`, and these
 # three arms pin the distinction: intent=0 tolerates, intent=1 proves, no marker keeps the old rule.
+# ⛔ op0's $O MUST BE PROVISIONED, for the reason stated above (review of this change, P2):
+# un-provisioned, the claims gate refuses with NOT PROVISIONABLE, yet "the pairing is not
+# cross-checked" is printed BEFORE it — so this arm read a downstream refusal as the resolver's
+# tolerance. `op1` deliberately stays un-provisioned: its refusal is the resolver's own.
+mkdir -p "$TMP/repolocalpath/op0"; printf 'claim_issue_preflight() { return 0; }\n' > "$TMP/repolocalpath/op0/claims.sh"
 ( unset TORTOISE_REPO; unset TORTOISE; unset WORKDIR; unset OR_OPERATOR_DECLARED
   HOME="$RH" REPO="$XP" OR=acme/widget OR_OPERATOR_DECLARED=0 O="$TMP/repolocalpath/op0" bash "$REFRESH" --check > "$TMP/repo-localpath-loop.out" 2>&1 ) || true
 case "$(cat "$TMP/repo-localpath-loop.out")" in
   *"cannot prove it is a checkout"*) xr=1 ;;
+  *"cross-box claim registry is NOT INSTALLED"*|*"cannot answer the issue-claim question"*) xr=1 ;;
   *"the pairing is not cross-checked"*) xr=0 ;;
   *) xr=1; echo "      out: $(head -3 "$TMP/repo-localpath-loop.out")" ;;
 esac
@@ -2183,7 +2244,7 @@ ck "every limit resolves to a real default in both files (not UNSET=UNSET)" $rcu
 # Its default is derived from `_NCPU` too now, so it cannot sit in a host-independent table — the
 # driver immediately below pins the derivation BEHAVIOURALLY, against a substituted probe instead.
 dval() { printf '%s\n' "$_db" | awk -F= -v k="$1" '$1==k{print $2}' | head -1; }
-expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=4 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600 PRODUCT_FLOOR=1"
+expect_lim="BATCH=2 CYC=240 FUNNEL_MAX_AGE_MIN=30 MAX_FIX=3 MAX_FIX_TRIES=3 MAX_REVIEW=10 MERGE_PRIORITY_AT=25 MERGE_PRIORITY_MAX_AGE_MIN=180 MIN_MEM_FREE_MB=512 MIN_SWAP_FREE=600 PRODUCT_FLOOR=1"
 got_lim=""
 for _k in BATCH CYC FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN MIN_MEM_FREE_MB MIN_SWAP_FREE PRODUCT_FLOOR; do
   got_lim="$got_lim $_k=$(dval "$_k")"
@@ -2362,8 +2423,23 @@ grep -q 'if wt_spawn "fix-\$PR"' "$LOOP" && rc=0 || rc=1
 ck "fixer spawn is attempted before the attempt is recorded" $rc
 grep -q 'PARKED after' "$LOOP" && rc=0 || rc=1
 ck "reaching MAX_FIX_TRIES parks the PR instead of re-reviewing forever" $rc
-grep -q 'claim_live "\$PR"' "$LOOP" && rc=0 || rc=1
-ck "controller honours the claim written by the chain path" $rc
+# ⛔ PIN THE DELEGATION, NOT A VARIABLE SPELLING. `claim_live "$PR"` was rewritten by 61b195ee
+# (#2831) so the spawn guards call `claim_live "$pr" "$sha"` inside a helper and the literal no longer
+# exists — a pin on the spelling reds on a rename while proving nothing. What the chain path depends on
+# is that the spawn guard consults the CROSS-BOX lease (which is exactly what the chain writes and
+# releases), so assert that call survives inside `claim_live()`.
+# ⛔ AND A BODY PIN ALONE IS NOT A CALL-SITE PIN (review of this change, P2). Pinning only
+# `claim_live()`'s body stays GREEN with NOTHING calling it — measured: replace `orch-loop.sh:3401`
+# with `:` and the body still matches, so the arm passed while the controller honoured no claim at all,
+# which is the exact vacuity this change exists to remove. So pin BOTH: a call site exists
+# (`claim_live "`, spelling-agnostic so a `$PR`→`$pr` rename cannot red it) AND the callee consults
+# the lease.
+# ⛔ SCOPE, STATED: that call site is `pr_owner_live`'s `PL_MOD=0` fallback. With the liveness module
+# present (`PL_MOD=1`, the normal path in this repo) ownership is decided by `pr_owned`/`pl_verdict`
+# instead, so this arm covers the SPAWN-GUARD FALLBACK — which is what its name now says. Pinning the
+# `PL_MOD=1` chain is a separate gap, not silently claimed here.
+sed -n '/^claim_live() {/,/^}$/p' "$LOOP" | grep -q 'claim_lease_live "\$1"' && grep -q 'claim_live "' "$LOOP" && rc=0 || rc=1
+ck "the spawn-guard fallback honours the claim written by the chain path (a caller reaches claim_live, which consults the cross-box lease)" $rc
 
 # ── 10) template / renderer placeholder parity ───────────────────────────────────
 tpl="$(grep -oE '__[A-Z_]+__' "$HERE/launchd.plist.template" | sort -u)"
@@ -2531,7 +2607,8 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   [ -f "$O/state/mergeclaim-2.lock" ] && rc=1 || rc=0
   ck "shipped claim_live(): the stale claim file is removed" $rc
   # ⛔ A FOREIGN OVERSIZED (>= 2**63) LEASE (P2, fourth review round, 2026-10-14). claim_acquire()
-  # treats such a lease as unparseable => LIVE (claims.sh's 18-digit bound; test-claims.sh §P3e seeds
+  # treats such a lease as unparseable => an ABSTENTION (rc=1, never stolen; since #3203 it is not
+  # reported as live either; test-claims.sh §P3e seeds
   # the same value), but claim_live() read the SAME datum with a bare `[ "$now" -le "$until" ]`,
   # which ERRORS at 2**63 and — read as false — reported it DEAD. The two readers then disagreed
   # forever: the controller reached the spawn branch EVERY cycle, fix-one.sh was refused by
@@ -2551,11 +2628,13 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   [ "$spawn" = "no" ] && rc=0 || rc=1
   ck "shipped claim_live(): no spawn is attempted for an oversized-lease claim" $rc
   # ⛔ THE `0` SENTINEL IS NOT THE SAME AS ABSENT (P2, fifth review round, 2026-10-14). claims.sh
-  # documents `0` as "a claim exists whose lease is UNREADABLE" and treats it as LIVE (claim_acquire's
-  # `[ -z "$held_until" ] || [ "$held_until" = "0" ]`; claim_prune keeps it via `[ "$until" != "0" ]`).
-  # `_lease_of` collapses a negative lease to the same `0` (its `[0-9]*` cannot match the minus sign),
+  # documents `0` as "a claim exists whose lease is UNREADABLE" and ABSTAINS on it — the acquire
+  # refuses rc 1 with `held-by-unreadable-lease` (`_lease_unparseable`), and since #3203 `claim_prune`
+  # reaps it once the claim commit passes `CLAIM_UNREADABLE_LEASE_MAX_AGE` rather than keeping it for ever.
+  # `_lease_of` collapses a negative lease to the same `0` (its anchored ASCII-digit match cannot match the minus sign),
   # so `lease_until=-5` ARRIVES HERE AS `0`. claim_live used to read that `0` as DEAD while
-  # claim_acquire read the same datum as LIVE — the SAME disagreement as the oversized class above,
+  # claim_acquire ABSTAINED on the same datum (its reason names the class: `held-by-unreadable-lease`;
+  # LIVE below is claim_live's OWN word for "do not steal") — the SAME disagreement as the oversized class above,
   # with the same consequence (refund_bailed_fixer un-parks the PR every cycle, so the cap never
   # trips). Drive the snapshot entry the function actually reads.
   printf 'refs/claims/5-%s\tforeignbox\t0\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
@@ -2569,7 +2648,7 @@ if need "$TMP/claimlive.sh" "claim_live() is extracted from the shipped orch-loo
   # (never as reaped). The reader must AGREE on this row as well.
   printf 'refs/claims/6-%s\tforeignbox\t-5\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
   claim_live 6 "$CLSHA" && rc=0 || rc=1
-  ck "shipped claim_live(): a negative lease reports LIVE, matching claim_acquire/claim_prune" $rc
+  ck "shipped claim_live(): a negative lease reports LIVE, not dead (LIVE is this reader's own word for do-not-steal)" $rc
   # Non-vacuity: an entry ABSENT from the snapshot is still NOT live. Without this the fix could be
   # "return 0 always" and every assertion above would still pass.
   printf 'refs/claims/999-%s\tforeignbox\t1799999999\n' "${CLSHA:0:12}" > "$O/state/claims-snapshot"
@@ -3536,7 +3615,14 @@ printf '#!/bin/bash\nexit 0\n' > "$BG/stub/tmux"
 chmod +x "$BG/stub/"*
 printf 'HOME=%s\nDEEPSEEK_API_KEY=sk-test\n' "$BG/otherhome" > "$BG/home/keys.env"
 GH_HOME_RECORD="$TMP/bg-gh-home.txt"; rm -f "$GH_HOME_RECORD"
-GH_HOME_RECORD="$GH_HOME_RECORD" PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
+# ⛔ THE ONE-HOME GATE RUNS BEFORE `check_gh` (cloud-cell-bringup.sh:2116 `check_one_home env`, then
+# :2120 `check_gh`; 0d6d630c).
+# A sandbox `CELL_HOME` under the host temp dir is by design not this box's home, so the fixture must
+# supply the two seams the file itself declares: HOME equal to the cell home (the point of the arm —
+# a keys.env `HOME=` must not win), and `CELL_VOLATILE_ROOTS`, the documented FIXTURE SEAM at :380-385
+# that every hermetic cell suite already sets.
+GH_HOME_RECORD="$GH_HOME_RECORD" HOME="$BG/home" CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root \
+  PATH="$BG/stub:$PATH" CELL_HOME="$BG/home" REPO_SLUG=acme/widget \
   WORKDIR="$BG/work" ENV_FILE= GH_TOKEN_FILE="$TMP/gh-tok" \
   bash "$HERE/../cloud-cell-bringup.sh" --check > "$TMP/bg.out" 2>&1 || true
 if [ -s "$TMP/bg-gh-home.txt" ]; then
@@ -3879,10 +3965,56 @@ ck "refresh-candidates.sh ranks the tiers P0=0 < P1=1 < P2=2 (a constant rank wo
 # reaping pass above that writes dispatched.txt/checked.txt — so nothing above the loop can re-sort the
 # backlog today. A re-sort GATED on a value assigned above the loop would still be missed (verified).
 # Widening further means stubbing `gh` and driving the pool build too; this is the boundary drawn.
+# ⛔ AND THE FUNCTIONS THE TAIL CALLS MUST BE IN THE DRIVEN REGION (#2019, PR #3234). The queue's order
+# is now RE-DERIVED from the pool at the dedupe site, so the tail CALLS `queue_order_from_pool`. Both
+# definitions sit ~1,100 lines ABOVE this anchor, so the first version of that change left the drive
+# calling an UNDEFINED command — `command not found`, absorbed by `|| true`, output discarded — and this
+# check stayed GREEN while its own name asserted "nothing running it re-sorts it" about a file the
+# shipped code now re-sorts on every pass. The shipped behaviour and the guard's claim had inverted and
+# nothing reddened: a false-PASS guard. The definitions are therefore PREPENDED here, and a SECOND
+# fixture gives the pool a rank so the drive must actually move the head — a POSITIVE assertion, so an
+# inert call reads RED instead of green.
+# ⛔ BOTH RESULTS START AT 1, BEFORE ANY BRANCH (review P2). They used to be assigned only INSIDE the
+# success branch, while the two `ck` calls below read them unconditionally — so on the very path this
+# check exists for (missing/empty $REFRESH, or either extraction anchor drifting) the run died under
+# `set -u` with `rc_dedupe: unbound variable`: no FAIL line, no summary, and every check after this one
+# never ran. The guard's failure path is the one thing that must never itself crash. Defaulting to 1
+# makes a skipped drive count a named FAIL and lets the suite continue, as it did before this change.
+rc_dedupe=1; rc_rank=1; rc_handoff=1; rc_uncounted=1; rc_tailu=1
 if [ -s "$REFRESH" ]; then
   awk '/^done < /{f=1;next} f' "$REFRESH" > "$TMP/tail.sh"
-  # Fail closed if the extraction found nothing, or lost the file it is supposed to exercise.
-  if [ -s "$TMP/tail.sh" ] && grep -q 'candidates\.txt' "$TMP/tail.sh"; then
+  # Start at the rank function and stop at the comment opening the next block AFTER queue_order_from_pool:
+  # both functions are contiguous there, and a terminator anchor cannot silently capture half the file.
+  awk '/^rank_queue_by_pool\(\) \{/{f=1} f && /^# The previous pass.s record/{exit} f' "$REFRESH" > "$TMP/qorder-fns.sh"
+  # ⛔ THE EXTRACTION'S EXTENT IS CHECKED, NOT ASSUMED (review P2, cycle 6). The gate below used to ask
+  # only that the block be non-empty and CONTAIN the definition, so a DRIFTED terminator anchor — awk
+  # then runs to EOF and captures every remaining line of the file — still satisfied it. Over-capture is
+  # harmless today, but it made the two suites DISAGREE about what a broken anchor looks like:
+  # `rank-queue.test.sh` additionally requires the block's last line to be `}`, so the same drift reddens
+  # there and stayed GREEN here. Measured on a drifted terminator: this check reported 3 passed / 0
+  # failed. The extent is now compared with the SOURCE — the block must be exactly the lines from the
+  # start anchor up to (excluding) the terminator — so neither an over-capture nor a drifted start can
+  # pass, and the failure is named instead of being absorbed into three anonymous FAILs.
+  _qo_start="$(grep -n '^rank_queue_by_pool() {' "$REFRESH" 2>/dev/null | head -1 | cut -d: -f1)"
+  _qo_term="$(grep -n "^# The previous pass.s record" "$REFRESH" 2>/dev/null | head -1 | cut -d: -f1)"
+  _qo_n="$(wc -l < "$TMP/qorder-fns.sh" 2>/dev/null | tr -d ' ')"
+  _qo_extent=1
+  if [ -n "$_qo_start" ] && [ -n "$_qo_term" ] && [ -n "$_qo_n" ]; then
+    case "${_qo_start}${_qo_term}${_qo_n}" in
+      *[!0-9]*) _qo_extent=1 ;;
+      *) [ "$_qo_n" -eq "$(( _qo_term - _qo_start ))" ] && _qo_extent=0 ;;
+    esac
+  fi
+  # Fail closed if an extraction found nothing, lost the file it is supposed to exercise, or captured
+  # more than the anchor pair says it should.
+  _qo_ok=1
+  if [ -s "$TMP/tail.sh" ] && grep -q 'candidates\.txt' "$TMP/tail.sh" \
+     && grep -q '^queue_order_from_pool() {' "$TMP/qorder-fns.sh" \
+     && [ "$_qo_extent" -eq 0 ]; then _qo_ok=0; fi
+  if [ "$_qo_ok" -ne 0 ]; then
+    echo "      extraction REFUSED: qorder-fns=$_qo_n line(s), expected $([ -n "$_qo_start" ] && [ -n "$_qo_term" ] && printf '%s' "$(( _qo_term - _qo_start ))" || printf 'an exact anchor extent') from the anchors (start=${_qo_start:-MISSING} terminator=${_qo_term:-MISSING}) — a drifted anchor over-captures or captures nothing, and this half must not read green while the sibling suite reddens"
+  fi
+  if [ "$_qo_ok" -eq 0 ]; then
     # Redirect $O at the SOURCE rather than editing paths: `awk -v` passes the fixture dir without any
     # shell quoting of `$O` on the command line. Escape it first — in awk's gsub REPLACEMENT `&` means
     # the matched text and `\x` is an escape, so a `&` or `\\` in $TMP would corrupt the generated
@@ -3890,20 +4022,95 @@ if [ -s "$REFRESH" ]; then
     # TMPDIR and this harness treats `&`-in-path as hostile everywhere else.
     esc_tmp="${TMP//\\/\\\\}"; esc_tmp="${esc_tmp//&/\\&}"
     awk -v tmp="$esc_tmp" '{gsub(/\$O/, tmp)} 1' "$TMP/tail.sh" > "$TMP/tail-drive.sh"
-    # 5000 leads AND repeats, so one expectation separates all three outcomes: in-place dedupe keeps
-    # the first occurrence (5000 100 9000); a re-sort of ANY spelling moves 100 to the front; a
-    # deleted dedupe leaves both 5000s.
-    printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
+    awk -v tmp="$esc_tmp" '{gsub(/\$O/, tmp)} 1' "$TMP/qorder-fns.sh" > "$TMP/qorder-fns-drive.sh"
+    # ⛔ THE DRIVE RUNS UNDER `set -u`, LIKE THE SHIPPED FILE (review P3, cycle 11). `set -u` is NOT
+    # inherited by a child `bash <file>`, so a tail driven without it reports an unbound reference GREEN in
+    # the only check that grades this region — while in production it is a fatal abort BEFORE
+    # `REFRESH_RECORDED=1`, which the EXIT trap then reports as a failed pass. The state the tail reads is
+    # produced by the EARLIER half of the pass, which is not part of this drive, so it is seeded here —
+    # explicitly, one name per line (measured: without the seeds the drive aborts on `judged: unbound
+    # variable`; the list is the exact set the tail reads, found by driving it and adding each name).
+    tail_prologue() {
+      printf 'set -u\n'
+      printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+      printf 'unusable_summary() { printf "none"; }\n'
+      for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED SKIP_CHECKED SKIP_DISPATCHED \
+                SKIP_LANDED SKIP_COLLIDED LIMIT ICR_INCOMPLETE ICR_HELD ICR_RECLAIMED STARVED \
+                POOL_SWEPT QUEUED; do
+        printf ': "${%s:=}"\n' "$_n"
+      done
+    }
+    # DEFINITIONS BEFORE THE TAIL — the order the shipped file has, and the order the tail needs.
+    { tail_prologue; cat "$TMP/qorder-fns-drive.sh" "$TMP/tail-drive.sh"; } > "$TMP/tail-with-qorder.sh"
     # ⛔ SANDBOX THE DRIVE. The substitution above only rewrites the literal `$O`; a path spelled any
     # other way escapes to the REAL location — and `$HOME/orchestrator/candidates.txt` is the shipped
     # script's own default O and is live on a running box. Binding O and HOME to $TMP closes it
     # (confirmed: without this a `$HOME/orchestrator/...` variant rewrote the live file).
-    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-drive.sh ) >/dev/null 2>&1
+    #
+    # A) DEDUPE. 5000 leads AND repeats, so one expectation separates all three outcomes: in-place
+    #    dedupe keeps the first occurrence (5000 100 9000); a re-sort by NUMBER of ANY spelling moves
+    #    100 to the front; a deleted dedupe leaves both 5000s. No `.pool` here — the only reorder in the
+    #    tail is the pool rank, and with no pool rank it must leave the order alone (which is ALSO the
+    #    fail-closed arm, so this fixture no longer doubles as an accidental one).
+    rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
+    printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-with-qorder.sh ) > "$TMP/dedupe-drive.log" 2>&1
     tail_got="$(tr '\n' ' ' < "$TMP/candidates.txt" 2>/dev/null | sed 's/ *$//')"
-    [ "$tail_got" = "5000 100 9000" ] && rc=0 || rc=1
-  else rc=1; fi
-else rc=1; fi
-ck "refresh-candidates.sh dedupes the backlog in place and nothing running it re-sorts it" $rc
+    [ "$tail_got" = "5000 100 9000" ] && rc_dedupe=0 || rc_dedupe=1
+    # B) THE ORDER IS THE POOL'S, and the call is LIVE. Same fixture, plus a pool that ranks `100` once:
+    #    the ranked row must move to the head and the unranked rows keep their order at the tail. If the
+    #    tail's call is `command not found` (definitions missing) this stays `5000 100 9000` and REDS.
+    rm -f "$TMP/.cand.ranked" "$TMP/.queue-rank"
+    printf '5000\n100\n9000\n5000\n' > "$TMP/candidates.txt"
+    printf '100\n' > "$TMP/.pool"
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-with-qorder.sh ) > "$TMP/qorder-drive.log" 2>&1
+    rank_got="$(tr '\n' ' ' < "$TMP/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+    [ "$rank_got" = "100 5000 9000" ] && rc_rank=0 || rc_rank=1
+    [ "$rc_rank" -eq 0 ] || echo "      pool-ranked drive gave '$rank_got' (want '100 5000 9000'); log: $(tr '\n' '|' < "$TMP/qorder-drive.log" 2>/dev/null | head -c 240)"
+    # C) THE HANDOFF LINE NAMES THE ORDER IT ACTUALLY HAS (review P2, cycle 2). The two arms are the
+    #    ONE place the claim reaches the durable record (`handed_why=`), so an adjective typed rather
+    #    than read survives there long after the log line is gone. A (no pool) must take the
+    #    `priority-unreadable` arm and must NOT name "ARRIVAL order" — the file was left UNTOUCHED, so
+    #    its order is the previous pass's, not one this pass read. B (a pool that ranks) must take the
+    #    `severity` arm. Both arms are asserted, so a message that collapses to one wording REDS.
+    if grep -q 'established NO priority order' "$TMP/dedupe-drive.log" 2>/dev/null \
+       && ! grep -q 'ARRIVAL order' "$TMP/dedupe-drive.log" 2>/dev/null \
+       && grep -q 'highest-ranked CLEAN entry in the pool-ordered queue' "$TMP/qorder-drive.log" 2>/dev/null; then rc_handoff=0; fi
+    [ "$rc_handoff" -eq 0 ] || { echo "      handoff arm (no pool): $(grep -c 'established NO priority order' "$TMP/dedupe-drive.log" 2>/dev/null) / ARRIVAL-named: $(grep -c 'ARRIVAL order' "$TMP/dedupe-drive.log" 2>/dev/null) / severity arm: $(grep -c 'highest-ranked CLEAN entry in the pool-ordered queue' "$TMP/qorder-drive.log" 2>/dev/null)"; }
+    # C2) THE THIRD STATE HAS ITS OWN WORDS (review P2, cycle 10). `severity-uncounted` — the reorder was
+    #     DERIVED AND IS ON DISK, only its count could not be read back — fell into the `*` arm, which says
+    #     "this pass established NO priority order": the opposite, and it becomes `handed_why=` in
+    #     `state/refresh-last`, where it outlives the log line that contradicted it. The STATE is stubbed
+    #     (reaching it needs a concurrent pass racing the count file); the ARM is the shipped one.
+    { tail_prologue
+      cat "$TMP/qorder-fns-drive.sh"
+      printf 'queue_order_from_pool() { QUEUE_ORDER_STATE="severity-uncounted"; }\n'
+      cat "$TMP/tail-drive.sh"; } > "$TMP/tail-uncounted.sh"
+    printf '200\n300\n' > "$TMP/candidates.txt"
+    ( cd "$TMP" && O="$TMP" HOME="$TMP" bash tail-uncounted.sh ) > "$TMP/uncounted-drive.log" 2>&1
+    if grep -q 'the entry at the head of the queue this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null \
+       && ! grep -q 'established NO priority order' "$TMP/uncounted-drive.log" 2>/dev/null; then rc_uncounted=0; else rc_uncounted=1; fi
+    [ "$rc_uncounted" -eq 0 ] || echo "      severity-uncounted arm: own-words $(grep -c 'this pass derived' "$TMP/uncounted-drive.log" 2>/dev/null) / NO-priority-order $(grep -c 'established NO priority order' "$TMP/uncounted-drive.log" 2>/dev/null) (want 1 / 0)" 
+
+    # BOTH tail drives must carry `set -u`, or the mode this check exists for is absent from the very
+    # drivers it grades (a prologue is only worth what is pinned).
+    _pro_drives=""; _pro_n=0
+    for _d in "$TMP/tail-with-qorder.sh" "$TMP/tail-uncounted.sh"; do
+      [ -f "$_d" ] || continue
+      _pro_n=$(( _pro_n + 1 ))
+      grep -qx 'set -u' "$_d" || _pro_drives="$_pro_drives ${_d##*/}"
+    done
+    if [ "$_pro_n" -eq 2 ] && [ -z "$_pro_drives" ]; then rc_tailu=0; else rc_tailu=1; fi
+    [ "$rc_tailu" -eq 0 ] || echo "      tail drives: ${_pro_n} found; WITHOUT 'set -u':${_pro_drives:- none} (want 2, both under set -u)"
+    ck "both generated tail drives run under \`set -u\`, the mode the shipped file runs in" $rc_tailu
+    [ "$rc_dedupe" -eq 0 ] || echo "      dedupe drive gave '$tail_got' (want '5000 100 9000')"
+    rm -f "$TMP/.pool" "$TMP/.cand.ranked" "$TMP/.queue-rank"
+  fi
+fi
+ck "refresh-candidates.sh dedupes the backlog in place (and leaves the order alone when the pool ranks nothing)" $rc_dedupe
+ck "refresh-candidates.sh re-derives the queue's head from the pool — the ranked row leads, unranked rows keep their tail order" $rc_rank
+ck "the handoff line names the order it actually has — 'priority-unreadable' without inventing 'ARRIVAL order', and the severity arm when the pool ranked" $rc_handoff
+ck "a severity-uncounted handoff names the row as the highest-ranked CLEAN entry it DERIVED, not 'no priority order' (the third state has its own words)" $rc_uncounted
 
 # ── 19) the harness runs on Linux as well as macOS (#1702) ──────────────────────
 # The shipped cell controller (cloud-cell-supervisor.sh) starts THIS loop on a Linux cell, and every
@@ -4091,31 +4298,41 @@ ck "install.sh derives _NCPU portably too (its MAX_LOAD must match the loop's on
 # through the last MAX_LOAD guard, so any guard added inside it is picked up automatically.
 sed -n '/^_NCPU=/,/^is_limit "${MAX_LOAD:-}"/p' "$INST" > "$TMP/ncpu-inst.sh"
 if need "$TMP/ncpu-inst.sh" "install.sh's _NCPU + MAX_LOAD lines are extracted"; then
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
+  # ⛔ THE FIXTURE DRIVES install.sh's GUARD, SO IT MUST NOT INHERIT THE CALLER'S MAX_LOAD. install.sh
+  # opens with `MAX_LOAD="${MAX_LOAD:-…}"`, so an ambient EXPORTED MAX_LOAD — a harness/agent shell
+  # sets one — short-circuits every arm below and all five red for a fact about the operator's shell,
+  # not the guard. `unset` inside each drive script makes it self-contained whichever way it is called.
+  # ⛔ AND `unset` ALONE IS NOT A MUTATION LEG (review of this change, P2): the drives below are invoked
+  # with NO ambient value, so removing any `unset` produced byte-identical output and a future edit
+  # could drop one with every arm still green. So one arm CONTAMINATES itself — `MAX_LOAD=999` on the
+  # command line of the GOOD-`_NCPU` drive, the idiom `ncpu-drive6.sh` already uses one arm below. It
+  # must still read 120: with the `unset` the ambient value never reaches the guard, without it the
+  # value IS 999 and that row reds. Measured both directions.
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo garbage; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive.sh"
   _nout="$(bash "$TMP/ncpu-drive.sh" 2>&1)"; _nrc=$?
   [ "$_nrc" -eq 0 ] && [ "$_nout" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU guard -> rc=$_nrc out='$_nout'"; }
   ck "install.sh falls back to 4 cores when sysctl succeeds but prints garbage (no arithmetic abort)" $rc
   # Non-vacuity: the stub really is the value being consulted, and a good one is still honoured.
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
-  _nout2="$(bash "$TMP/ncpu-drive2.sh" 2>&1)"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 12; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive2.sh"
+  _nout2="$(MAX_LOAD=999 bash "$TMP/ncpu-drive2.sh" 2>&1)"
   [ "$_nout2" = "120" ] && rc=0 || { rc=1; echo "      a GOOD sysctl=12 gave '$_nout2', expected 120"; }
   ck "install.sh still derives MAX_LOAD from a good _NCPU (12 cores -> 120)" $rc
   # ⛔ THE PRODUCTION PATH'S OWN WRAP (P3, fifth review round, 2026-10-14). install.sh substitutes
   # __MAX_LOAD__ into the LIVE plist, so an absurd-but-numeric `_NCPU` here — not in the loop — was
   # the one that actually wrote `MAX_LOAD=0` into a running box. 2**63 * 10 wraps to exactly 0 and
   # every guard accepts 0, so this is RED on the pre-fix install.sh (which had is_num only).
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 9223372036854775808; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive3.sh"
   _nout3="$(bash "$TMP/ncpu-drive3.sh" 2>&1)"
   [ "$_nout3" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=2**63 -> plist MAX_LOAD='$_nout3', expected 40 (not 0)"; }
   ck "install.sh bounds an absurd _NCPU so the plist cannot get MAX_LOAD=0 (would dispatch nothing)" $rc
   # A 0-valued probe is a failed probe: the same guard as the loop's.
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 0; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive4.sh"
   _nout4="$(bash "$TMP/ncpu-drive4.sh" 2>&1)"
   [ "$_nout4" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=0 -> plist MAX_LOAD='$_nout4', expected 40 (not 0)"; }
   ck "install.sh treats a 0-valued _NCPU probe as a failed probe (MAX_LOAD=40, not 0)" $rc
   # The other wrap a MAX_LOAD-only guard cannot see: a 9-digit probe is IN range, but its product is
   # 10 digits and never binds. Only the true-default fallback catches it.
-  { echo 'set -euo pipefail'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
+  { echo 'set -euo pipefail'; echo 'unset MAX_LOAD'; echo 'sysctl() { echo 999999999; }'; cat "$TMP/ncpu-inst.sh"; printf 'printf "%%s" "$MAX_LOAD"'; } > "$TMP/ncpu-drive5.sh"
   _nout5="$(bash "$TMP/ncpu-drive5.sh" 2>&1)"
   [ "$_nout5" = "40" ] && rc=0 || { rc=1; echo "      install.sh _NCPU=999999999 -> plist MAX_LOAD='$_nout5', expected 40"; }
   ck "install.sh falls back to 40 for a product that outgrows the 9-digit bound" $rc
@@ -4181,19 +4398,19 @@ ck "the shipped CYC floor is extracted too (CYC=0 cannot be driven without it)" 
 nlim() { ( _NCPU=10; MAX_LOAD="$1"; MAX_LANES="$2"; MERGE_PRIORITY_AT="$3"; BATCH="$4"; CYC="${5:-abc}"
            MAX_REVIEW=; MAX_FIX=; MAX_FIX_TRIES=; MAX_RED_FIX=; MAX_RED_FIX_TRIES=; STALE_MIN=; MAX_REVIEW_TRIES=
            eval "$NGRD"; printf 'load=%s lanes=%s mpa=%s batch=%s cyc=%s review=%s fix=%s fixtries=%s revtries=%s stale=%s' "$MAX_LOAD" "$MAX_LANES" "$MERGE_PRIORITY_AT" "$BATCH" "$CYC" "$MAX_REVIEW" "$MAX_FIX" "$MAX_FIX_TRIES" "$MAX_REVIEW_TRIES" "$STALE_MIN" ); }
-[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
+[ "$(nlim abc abc notanum two)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=10 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim abc abc notanum two)'"; }
 ck "non-numeric plist limits are coerced to their defaults, not left to fail OPEN" $rc
 # ⛔ AND MAX_LANES IS REPAIRED TO ITS DERIVED DEFAULT, NOT TO A FLAT NUMBER (owner ruling, 2026-10-17):
 # the driver pins `_NCPU=10`, so a garbage lane ceiling must come back as 25 — the value the box's
 # CORES imply — not the 4 it used to be repaired to. Reverting the coercion to `|| MAX_LANES=4`
 # reddens the two cases above and below.
-[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || rc=1
+[ "$(nlim 30 6 20 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=10 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || rc=1
 ck "numeric plist limits survive the coercion unchanged" $rc
 # ⛔ A 2**63-shaped value is the SECOND failure mode, and is_num alone cannot see it: `[ -ge ]` on it
 # prints "integer expression expected" and exits 2, which under `set -e` aborts the gate chain -- or,
 # read as false, OPENS it. `is_limit` bounds the digits, so this must coerce exactly as a typo does.
 # Review found MAX_LOAD was still is_num while the README claimed otherwise: this is that gap, driven.
-[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
+[ "$(nlim 99999999999999999999 6 20 5)" = "load=100 lanes=6 mpa=20 batch=5 cyc=240 review=10 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 99999999999999999999 6 20 5)'"; }
 ck "an absurd-but-numeric MAX_LOAD (>= 2**63) is coerced, not left to error the gate chain" $rc
 # ⛔ THE DERIVATION, not just the coercion (P3, fourth review round, 2026-10-14). Every fixture above
 # passes MAX_LOAD EXPLICITLY, so nothing drove the fallback `is_limit … || MAX_LOAD=$(( 10#$_NCPU * 10 ))`
@@ -4236,17 +4453,17 @@ fi
 # `is_num`, so tightening the predicate coerces every leading-zero limit to its default — this drives
 # that, and it is RED on the lax predicate. (`nlim 08 09 030 05` covers 2-digit, 3-digit and the
 # single `0`-followed-by-digit forms.)
-[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
+[ "$(nlim 08 09 030 05)" = "load=100 lanes=25 mpa=25 batch=2 cyc=240 review=10 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 08 09 030 05)'"; }
 ck "leading-zero limits (08/09/030/05) are coerced to defaults, not read as octal" $rc
 # ⛔ CYC=0 — the FOURTH failure mode, and the one every guard above lets through: `0` is a valid
 # integer and a valid is_limit, so it survives the coercion and the loop then runs `sleep 0` per
 # cycle, revisiting with no delay and hammering the GitHub API (P3, third review round, 2026-10-14).
 # The floor is part of the same block, so this drives it: CYC=0 must come out 240. A mutation that
 # drops the floor line leaves cyc=0 here — RED.
-[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
+[ "$(nlim 30 6 20 5 0)" = "load=30 lanes=6 mpa=20 batch=5 cyc=240 review=10 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 0)'"; }
 ck "CYC=0 is floored to 240 (a zero-delay cycle re-hits the GitHub API with no delay)" $rc
 # Non-vacuity: the floor must not swallow a deliberately SMALL cycle. 5 is allowed and must survive.
-[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=4 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
+[ "$(nlim 30 6 20 5 5)" = "load=30 lanes=6 mpa=20 batch=5 cyc=5 review=10 fix=3 fixtries=3 revtries=3 stale=40" ] && rc=0 || { rc=1; echo "      got '$(nlim 30 6 20 5 5)'"; }
 ck "a deliberate small CYC=5 survives the floor unchanged" $rc
 # And pin the predicate itself, so the coercion above cannot be satisfied by some unrelated path:
 # `is_num 08` must be FALSE, while `0` and a real number stay true.
@@ -4276,7 +4493,7 @@ done
 ck "both files default MAX_LOAD to the cores*10 formula (it cannot drift in both together)" $rc
 # ⛔ The leading-zero trap, again: MERGE_PRIORITY_AT is normalised with `10#` for the scope decision
 # but review_slots read MAX_REVIEW through $(( )) -- `030` returned 26, not 30.
-grep -qF '10#${MAX_REVIEW:-4} + 2' "$LOOP" && rc=0 || rc=1
+grep -qF '10#${MAX_REVIEW:-10} + 2' "$LOOP" && rc=0 || rc=1
 ck "review_slots reads MAX_REVIEW in base 10 (a leading zero is not octal)" $rc
 grep -qF '10#${STALE_MIN} * 60' "$LOOP" && rc=0 || rc=1
 ck "the reaper reads STALE_MIN in base 10" $rc
@@ -5000,7 +5217,11 @@ fi
 # report.sh is an operator summary and MUST be safe to run while the loop is working: read-only,
 # and every section degrades to a message rather than aborting when its surface is absent.
 if [ -f "$HERE/report.sh" ]; then
-  RO="$TMP/report-o"; RREPO="$TMP/report-repo"; mkdir -p "$RO/state" "$RO/logs" "$RREPO"
+  # ⛔ THE FIXTURE REPO MUST BE A GIT CHECKOUT, because report.sh now gets `REPO` from repo-slug.sh's
+  # `resolve_repo`, which PROVES it is one (the same rule every other script had except this one, whose
+  # `$HOME/eldato/tortoise` default meant nothing ever checked). A plain `mkdir` directory is exactly
+  # what the resolver must refuse, so the fixture is a real (empty) repo.
+  RO="$TMP/report-o"; RREPO="$TMP/report-repo"; mkdir -p "$RO/state" "$RO/logs" "$RREPO"; git init -q "$RREPO"
   printf '{ "version": 1, "surface": "laptop", "commit": "0123456789abcdef0123456789abcdef01234567", "relation": "current" }\n' > "$RO/.agent-infra-stamp.json"
   touch "$RO/state/merged-4242.done"
   printf '%s\treviewer\t7\t1800\t1790\t1\n' "$(date +%s)" > "$RO/state/walltime.tsv"
@@ -5384,6 +5605,136 @@ if [ -f "$CSS" ]; then
     ck "check-single-source: an UNSEARCHABLE --fork cannot report 'no fork' (rc 2)" $rc
     chmod 755 "$CSD/noread"
   fi
+  # ⛔ THE FOURTH INSTRUMENT'S OWN ARM — `REPO` IS SET ONCE PER BOX (this PR). A per-script REPO path
+  # default is the same defect as a forked directory one variable over, and before this arm NOTHING
+  # reddened for it: three shipped scripts carried `$HOME/…`, `/tmp/cell-ai` and `$PWD` respectively.
+  # Both directions in a THROWAWAY copy of the harness, so the repo is never mutated.
+  rm -rf "$TMP/rpdef"; mkdir -p "$TMP/rpdef/h"
+  cp -a "$HERE"/. "$TMP/rpdef/h"/
+  # A COMMENT mentioning a default must not red (prose is how the defect is recorded), the assignment
+  # on the next line must.
+  printf '#!/bin/bash\n# REPO="${REPO:-/some/path}" is the shape this arm forbids\nREPO="$HOME/x"\n' > "$TMP/rpdef/h/zz-holdout.sh"
+  # ⛔ `env -u O` ON BOTH ARMS (#3054 review, P2). Without it the throwaway run inherits the ambient
+  # `$O`, so on any box whose deployed copy differs from this checkout — i.e. every box mid-change —
+  # the run exits 1 from the DEPLOYED-COPY divergence arms and the "allowed shapes" arm below blames
+  # the REPO arm for it. It was green only in CI, where `$O` is absent, so it proved the shapes are
+  # allowed nowhere that matters. `check-single-source.sh` reads `O_DIR="${O:-}"`, so unsetting it
+  # narrows the run to the half under test instead of inventing a target.
+  out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:3' <<<"$out"; } && rc=0 \
+    || { rc=1; echo "      a private REPO path default exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') (a comment mentioning one must NOT be the hit: the reported line is the assignment's)"; }
+  ck "check-single-source: a private REPO path default is refused, naming file AND line (rc 1)" $rc
+  # ⛔ A DEFAULT SPELLED AS ANOTHER VARIABLE IS THE SAME DEFECT, ONE INDIRECTION OVER (#3054 review,
+  # P1). `pathish` only recognised `$HOME`/`$PWD`/a literal path, and `allowed_default` (which catches
+  # `$AI`, `$CELL_HOME/x`, `$(pwd)`) was reached ONLY inside the `${REPO:-…}` branch — so measured at
+  # 637c21c19 these two passed GREEN over a live private default. Both spellings are fixtures here;
+  # `$AI` is not a made-up name: it is deploy-crossbox.sh's old default one variable over.
+  for _aspell in '$AI' '$(pwd)' '${CELL_HOME:-}/tortoise'; do
+    printf '#!/bin/bash\nREPO="%s"\n' "$_aspell" > "$TMP/rpdef/h/zz-holdout.sh"
+    out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -q 'zz-holdout.sh:2' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      REPO=\"$_aspell\" exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>')"; }
+    ck "check-single-source: a private REPO default spelled REPO=\"$_aspell\" is refused" $rc
+  done
+  # Non-vacuity in the other direction: the shapes the whole harness is converging ON must not red.
+  # ⛔ THE CARVE-OUTS ARE PINNED HERE (#3054 review, P1), because the rule that catches `$AI` can
+  # over-reach: a value THIS FILE holds (`$L_DIR`, and a substitution derived from a `for` variable)
+  # is something the script MEASURED, and a SLUG — literal or defaulted — is not a checkout path at
+  # all. If a later widening starts reddening these, it reds the shipped tree instead.
+  {
+    printf '#!/bin/bash\n'
+    printf 'REPO="${REPO:-}"\n'
+    printf 'REPO="$1"\n'
+    printf 'REPO="$(resolve_repo)"\n'
+    printf 'REPO="${HARNESS_REPO:-${HARNESS_APPLY_REPO:-}}"\n'   # a nested EMPTY default supplies nothing
+    printf 'REPO="$REPO"\nREPO="${REPO:?REPO is required}"\n'      # the operator's OWN value, re-asserted
+    printf 'REPO="${FLEET_REPO:-daniel-ospina/agent-infra}"\n'      # a SLUG default
+    printf 'REPO="daniel-ospina/agent-infra"\n'                       # a SLUG literal
+    printf 'L_DIR="/tmp/x"\nREPO="$L_DIR"\n'                        # a value THIS FILE holds
+    printf 'for cand in /tmp\ndo\n  REPO="$(cd "$cand" && pwd -P)"\ndone\n'
+  } > "$TMP/rpdef/h/zz-holdout.sh"
+  out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  [ "$rc" -eq 0 ] && rc=0 \
+    || { rc=1; echo "      the ALLOWED shapes (no default / assigned from a caller / the one resolver / an empty default / the operator's own value / a slug / a value this file holds) exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' | head -3)"; }
+  ck "check-single-source: REPO=\"\${REPO:-}\", a caller-assigned REPO, resolve_repo, an EMPTY default, a SLUG and a value THIS FILE holds all pass" $rc
+  # ⛔ THE POPULATION IS TWO DIRECTORIES, AND THIS ARM PINS IT (verification finding, P1). The scan was
+  # `$HERE/*.sh` only, so two of the three offenders this arm was written for — `pi-reap-worktrees.sh`
+  # and `deploy-crossbox.sh`, both in the repo's `scripts/` — sat OUTSIDE it: measured, putting
+  # `REPO="${REPO:-$PWD}"` back into the reaper reddened nothing. The fixture is the repo's OWN layout
+  # (`scripts/` containing `orchestrator-harness/`), so a narrowing back to one directory reds here.
+  # ⛔ AND THE PATH CONTAINS A SPACE ON PURPOSE (round 2): the parent path was expanded UNQUOTED in the
+  # population loop, so under a space-bearing checkout the `scripts/` half was never scanned and the gate
+  # exited 0 OVER this exact fixture, printing "nothing to scan there". `$TMP` never holds a space, so
+  # without this the regression is invisible — and macOS space-bearing paths are ordinary.
+  mkdir -p "$TMP/rpdef/repo scripts"
+  cp -a "$HERE"/. "$TMP/rpdef/repo scripts/orchestrator-harness"/
+  cp "$HERE/../pi-reap-worktrees.sh" "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+  printf 'REPO="${REPO:-$PWD}"\n' >> "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+  out="$(bash "$TMP/rpdef/repo scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; rc=$?
+  { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
+    || { rc=1; echo "      a default in scripts/ (the reaper) exited $rc: $(printf '%s\n' "$out" | grep -iE 'PRIVATE|nothing to scan' || echo '<not named>') — the arm is scanning ONE directory again (or word-split the parent path)"; }
+  ck "check-single-source: a REPO path default in scripts/*.sh (not just the harness dir) is refused" $rc
+  # ⛔ THE SPELLING WAS A WAY AROUND THE ARM (#3054 review, P2). `pathish` matched the LITERAL `$HOME`
+  # and `$PWD`, so writing the exact default this PR removes ONE BRACE AWAY — `${HOME}/eldato/tortoise`,
+  # `${PWD}` — passed the gate untouched: the "a PR or an agent can defeat it" class. Both spellings are
+  # fixtures here, in the same throwaway copy, so a rewrite back to a bare-only match reds.
+  for _bshape in '${HOME}/eldato/tortoise' '${PWD}'; do
+    printf '#!/bin/bash\nREPO="${REPO:-%s}"\n' "$_bshape" > "$TMP/rpdef/repo scripts/pi-reap-worktrees.sh"
+    out="$(bash "$TMP/rpdef/repo scripts/orchestrator-harness/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -q 'pi-reap-worktrees.sh:[0-9]' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      the brace spelling $_bshape exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>') — pathish matches only the BARE \$HOME/\$PWD"; }
+    ck "check-single-source: the brace spelling REPO=\"\${REPO:-$_bshape}\" is refused too" $rc
+  done
+  # ⛔ THREE MORE WAYS AROUND THE ARM, EACH MEASURED TO PASS BEFORE ITS FIX (#3054 review, P2). They
+  # share one shape: a fixture planted in the throwaway copy that the SHIPPED gate must still name.
+  # ⛔ EACH HAS A MUTANT, and that is why they are arms rather than prose — each pins an `awk` guard
+  # that can be deleted without any other arm in this file noticing:
+  #   (a) a TRAILING COMMENT — `REPO="/tmp/cell-ai" # why` is how the defect is re-introduced WITH an
+  #       explanation. Without the comment strip the value never ends in a quote, so the quote-strip
+  #       never runs and it never looks like a path. MUTANT: `if (0)` on the strip (measured green).
+  #   (b) a DECLARATION PREFIX — `local REPO=…` / `readonly REPO=…`. Only `export` was stripped, so
+  #       every other prefix was invisible. MUTANT: narrow the strip back to `^export` (measured green).
+  #   (c) a BACKTICK COMMAND SUBSTITUTION — the SAME substitution as `$(pwd)` in its older spelling.
+  #       The arm asked only about `$(`, so this one walked through: a FAIL-OPEN. MUTANT: drop the
+  #       backtick from the command-substitution test (measured green).
+  # Every arm is asserted on LINE 2 as well as by exit code, so a run that happens to be red for some
+  # other hit in the same file cannot satisfy it for the wrong reason.
+  _tc='REPO="/tmp/cell-ai-tc" # the old cell default, re-introduced with an explanation'
+  _lc='local REPO="/tmp/cell-ai-local"'
+  _bc='REPO=`pwd`'
+  # ⛔ THREE MORE, EACH A MEASURED BYPASS OF THE ARM BEFORE ITS FIX (#3054 review, P2):
+  #   the `:=` operator — the family test matched `:-`/`-` only, and `sanctioned()` then read the
+  #       `${REPO` expansion as a value the file already holds;
+  #   a second command on the line — `REPO="/tmp/x"; export REPO` stopped the value ending in a
+  #       quote, exactly as a trailing comment did;
+  #   a `||` fallback inside the substitution — the unqualified pipe carve-out exempted it, and it is
+  #       the shape a script writes when it "should not fail".
+  _eq='REPO="${REPO:=/tmp/cell-ai-eq}"'
+  _sc='REPO="/tmp/cell-ai-semi"; export REPO'
+  _pc='REPO="$(git rev-parse --show-toplevel 2>/dev/null || echo /tmp/cell-ai-or)"'
+  for _cshape in "$_tc" "$_lc" "$_bc" "$_eq" "$_sc" "$_pc"; do
+    printf '#!/bin/bash\n%s\n' "$_cshape" > "$TMP/rpdef/h/zz-holdout2.sh"
+    out="$(env -u O bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+    { [ "$rc" -eq 1 ] && grep -qE 'zz-holdout2\.sh:2:' <<<"$out"; } && rc=0 \
+      || { rc=1; echo "      the spelling [$_cshape] exited $rc: $(printf '%s\n' "$out" | grep -i 'PRIVATE' || echo '<not named>')"; }
+    ck "check-single-source: the spelling [$_cshape] is refused too" $rc
+  done
+  # ⛔ A SCAN THAT DID NOT RUN IS NOT A CLEAN SCAN (#3054 review, P1 — a FALSE PASS). Both call sites
+  # threw away `awk`'s exit status, so a scanner that could not execute was read as "no hits": MEASURED,
+  # with `awk` stubbed to exit 127 over a tree carrying `REPO="${REPO:-$PWD}"`, the gate exited 0 and
+  # printed "ok: the REPO path-default arm scanned 72 + 103". The gate now answers UNKNOWN (rc 2 — the
+  # cannot-verify code, never a pass) and names the file. MUTANT: drop the `[ "$_scan_rc" -eq 0 ] ||`
+  # guard at either call site -> this arm goes green.
+  mkdir -p "$TMP/rpdef/fakebin"
+  printf '#!/bin/bash\nexit 127\n' > "$TMP/rpdef/fakebin/awk"
+  chmod +x "$TMP/rpdef/fakebin/awk"
+  printf 'REPO="${REPO:-$PWD}"\n' > "$TMP/rpdef/h/zz-holdout3.sh"
+  out="$(env -u O PATH="$TMP/rpdef/fakebin:$PATH" bash "$TMP/rpdef/h/check-single-source.sh" 2>&1)"; rc=$?
+  { [ "$rc" -ne 0 ] && grep -q 'scan FAILED' <<<"$out"; } && rc=0 \
+    || { rc=1; echo "      a broken awk exited $rc — an unrun scan read as clean: $(printf '%s\n' "$out" | grep -iE 'ok: the REPO|scan FAILED' | head -2)"; }
+  ck "check-single-source: an awk that cannot run is UNKNOWN (rc 2), never a clean scan" $rc
+  rm -f "$TMP/rpdef/h/zz-holdout3.sh"
+  rm -rf "$TMP/rpdef"
 else
   ck "check-single-source.sh is shipped" 1
 fi

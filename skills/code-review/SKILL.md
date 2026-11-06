@@ -1549,6 +1549,12 @@ Found N issues:
 
 2. ...
 
+## MUTATION ATTRIBUTION — every NEW assertion names the mutant that reddens it (agent-infra#3442)
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/x.sh:120` — "the gate refuses an empty brief" | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `❌ … REFUSED with 80 (got 0)`, rc=1 |
+
 🤖 Generated with [Pi](https://pi.dev)
 
 <sub>- If this code review was useful, please react with 👍. Otherwise, react with 👎.</sub>
@@ -1561,8 +1567,33 @@ Or if no issues:
 
 No issues found. Checked for bugs, guidance compliance, historical context, and prior PR comments.
 
+## MUTATION ATTRIBUTION — every NEW assertion names the mutant that reddens it (agent-infra#3442)
+
+| assertion | mutant (the edit that reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| `scripts/x.sh:120` — "the gate refuses an empty brief" | `sed 's/rc=80/rc=0/' scripts/x.sh` | `x.test.sh` §A (i) | `❌ … REFUSED with 80 (got 0)`, rc=1 |
+
 🤖 Generated with [Pi](https://pi.dev)
 ```
+
+> ⛔ The row in both templates above is a **WORKED example, not a `<slot>`**: paste the SHAPE, then
+> replace every cell with your own attribution. An unfilled template satisfies the parser (its cells
+> are non-empty) and that is the one paste a reviewer who skipped the pass is most likely to make —
+> a filled example at worst yields a shaped-but-fabricated row, which a reader can falsify, while an
+> unfilled one yields nothing a reader can even check (fresh-context review of #3442, P2-D).
+
+> ⛔ **MUTATION ATTRIBUTION is REQUIRED, not decoration (agent-infra#3442).** For every assertion the
+> diff ADDS or CHANGES, name the mutant that reverts the behaviour and the row it turns RED — the
+> catch must be ATTRIBUTABLE to that row, not merely to the suite. An assertion whose value cannot
+> vary under any mutation of the diff is a **finding**, not a nit: make it reachable or delete it.
+> When the diff adds no assertion at all, replace the table with one line:
+> `NO NEW ASSERTIONS: <why — the paths touched and what they contain>`.
+> A verdict that carries no block is **INCOMPLETE, not clean**: `record-review.sh` refuses to mint a
+> fresh `clean` record over it (exit 3), so the merge gate cannot go green without it. Five PRs in one
+> night were reviewed clean over guards that stay GREEN with the bug restored —
+> `docs/ops/review-non-vacuity-baseline.md`. Why this is safe: the block is attributed to the row that
+> names the behaviour. The shape lives in
+> `scripts/orchestrator-harness/fixtures/mutation-attribution/` — one worked example per suite class.
 
 **Link format:** `https://github.com/<owner>/<repo>/blob/<full sha>/<file>#L<start>-L<end>`. Require full SHA, provide 1 line of context before and after the issue.
 
