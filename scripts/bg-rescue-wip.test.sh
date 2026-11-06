@@ -112,6 +112,28 @@ assert_plain_untouched() { # assert_plain_untouched <fixture> <label>
   fi
 }
 
+# assert_ambient_preserved <fixture> <label> — the HELPER retry runs in the SAME environment as the first
+# push (review round 12, P3). `push_with_helper` is "the same push, one named helper" — it must NOT also
+# strip the ambient token the way `push_unshadowed` deliberately does. Nothing asserted that, so adding
+# `env -u GH_TOKEN -u GITHUB_TOKEN` to it was FULLY GREEN (measured `PASS=182 FAIL=0`, same as a correct
+# tree) while silently breaking the seam's own documented contract ("trusted exactly as the caller is"):
+# on a host whose workflow-scoped credential IS `GH_TOKEN` — the #3483/#3453 shapes this PR exists for —
+# an operator who sets the documented escape hatch would get a retry that cannot see its credential, and
+# the run would degrade to local-only with no arm to say so. The shim already records each attempt's
+# `GH_TOKEN`/`GITHUB_TOKEN`, so the property is one comparison: attempt 2's token line is attempt 1's.
+assert_ambient_preserved() { # assert_ambient_preserved <fixture> <label>
+  local f="$T/$1" l="$2" e1 e2
+  e1="$(grep '^GH_TOKEN=' "$f/shim/attempts.env.1" 2>/dev/null)"
+  e2="$(grep '^GH_TOKEN=' "$f/shim/attempts.env.2" 2>/dev/null)"
+  if [ -z "$e1" ] || [ -z "$e2" ]; then
+    bad "$l: one attempt's environment was not recorded, so 'the helper retry keeps the ambient token' is unproven"
+  elif [ "$e1" = "$e2" ]; then
+    ok "$l: the helper retry runs with the ambient token INTACT (only the named helper differs)"
+  else
+    bad "$l: the helper retry changed the ambient environment ('$e1' -> '$e2') — the operator's seam must be trusted exactly as the caller is"
+  fi
+}
+
 # mk_repo <name> — a bare "origin" plus a clone with one commit on branch fix/lane-one.
 # Returns NON-ZERO if any step failed: with `set -uo pipefail` and no `-e`, a silent fixture failure
 # would otherwise degrade an arm into a green assertion about nothing.
@@ -623,6 +645,7 @@ try_rescue() { # try_rescue <name> <mode> <branch> <retry-env>
 try_rescue wfretry wf_then_ok
 assert_bounded_arm wfretry wfretry
 assert_plain_untouched wfretry wfretry
+assert_ambient_preserved wfretry wfretry
 WSHA="$(ref_of "$T/wfretry/origin.git" refs/wip/fix-lane-one)"
 [ "$RC" -eq 0 ] \
   && ok "wfretry: exit 0 — a workflow-bearing snapshot is RESCUED, not degraded to local-only" \
@@ -966,6 +989,7 @@ assert_unshadow_arm wfunshadow wfunshadow 'GH_TOKEN=shadow-readonly-pat GITHUB_T
 # `wf_then_ok` accepts a helper-named attempt and only that, so an inverted order cannot pass.
 try_rescue wfhelper wf_then_ok fix/lane-one \
   "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN BG_TEST_UNAME_S=Darwin GH_TOKEN=shadow-readonly-pat"
+assert_ambient_preserved wfhelper wfhelper
 [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
   && ok "wfhelper: the Darwin default retries ONCE with a helper credential and rescues (exit 0, 2 attempts)" \
   || bad "wfhelper: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — $OUT"
@@ -1000,6 +1024,7 @@ try_rescue wfhelper2 wf_then_ok fix/lane-one \
 # precedence lands on `exit 2` instead of a rescue.
 try_rescue wfprecedence wf_then_ok fix/lane-one \
   "-u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=osxkeychain BG_RESCUE_PUSH_UNSHADOW=1 GH_TOKEN=shadow-readonly-pat"
+assert_ambient_preserved wfprecedence wfprecedence
 [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
   && ok "wfprecedence: the explicit HELPER wins over BG_RESCUE_PUSH_UNSHADOW=1 (exit 0, 2 attempts)" \
   || bad "wfprecedence: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the documented precedence is inverted — $OUT"
@@ -1046,6 +1071,7 @@ try_rescue wfhelpername wf_then_store fix/lane-one \
   "-u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_RESCUE_PUSH_HELPER=store"
 assert_bounded_arm wfhelpername wfhelpername
 assert_plain_untouched wfhelpername wfhelpername
+assert_ambient_preserved wfhelpername wfhelpername
 [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
   && ok "wfhelpername: a NON-DEFAULT helper named by the operator is used and the snapshot is rescued" \
   || bad "wfhelpername: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the named helper was not used — $OUT"
@@ -1192,22 +1218,25 @@ else
       bad "wfnocred: claims a retry that was deliberately not made — $OUT" ;;
     *) ok "wfnocred: does not claim a retry it did not make (neither tense, and no retry-outcome line)" ;;
   esac
-  # ⛔ AND IT MUST NOT CLAIM A REMOVAL EITHER (review round 10, P3). "Does not claim a retry it did not
-  # make" covers the attempt; it said nothing about the MECHANISM, so this message could grow "the
-  # ambient GH_TOKEN/GITHUB_TOKEN was removed for that attempt" — on the one path where NOTHING was
-  # unset, no `env -u` ran, and no second credential exists — and the suite stayed green (measured:
-  # PASS=162 FAIL=0, identical to a correct tree). That is the false mechanism claim this script's own
-  # push_unshadowed docblock calls the worst kind, landing in the block an operator reads while the
-  # work is still single-copy on disk. The assertion is ABSENCE OF THE VERB `removed`, which is what
-  # every removal claim in this script is written with (`:441`, `:443`, both on the unshadow path);
-  # ⛔ the honest line on THIS path says "no ambient GH_TOKEN/GITHUB_TOKEN **to unshadow**", which is a
-  # statement of absence, not a claim of action — so the noun is deliberately NOT matched, and a
-  # wider deny-list would have made this arm a false red on a correct tree.
-  case "$OUT" in
-    *[Rr]emoved*)
-      bad "wfnocred: claims a credential was REMOVED on the path where nothing was tried — $OUT" ;;
-    *) ok "wfnocred: claims no removal — nothing was unset on the path where no retry was made" ;;
-  esac
+  # ⛔ AND IT MUST NOT CLAIM A REMOVAL EITHER (review round 10, P3; hardened in round 12, P3), in ANY
+  # INFLECTION OR CASE. "Does not claim a retry it did not make" covers the attempt; it says nothing about
+  # the MECHANISM, so this message could grow "the ambient GH_TOKEN/GITHUB_TOKEN was removed for that
+  # attempt" — on the one path where NOTHING was unset, no `env -u` ran, and no second credential exists
+  # — and the suite stayed green (measured: PASS=162 FAIL=0, identical to a correct tree). That is the
+  # false mechanism claim this script's own push_unshadowed docblock calls the worst kind, landing in the
+  # block an operator reads while the work is still single-copy on disk.
+  # ⛔ THE FIRST FIX MATCHED ONE SPELLING (`*[Rr]emoved*`) AND THAT WAS STILL TOO NARROW (round 12): this
+  # script writes its emphatic claims in CAPS, so `…was REMOVED for that attempt` and
+  # `Its removal of the ambient token was skipped` both stayed FULLY GREEN (measured PASS=182 FAIL=0 for
+  # each). `grep -qi 'remov'` covers removed/REMOVED/removal/Removal/removes; the stem has no other
+  # meaning in this output, and the honest line on this path says "no ambient GH_TOKEN/GITHUB_TOKEN **to
+  # unshadow**" — a statement of absence, not a claim of action — so matching the stem cannot false-red
+  # a correct tree (verified against the unmutated run below).
+  if printf '%s\n' "$OUT" | grep -qi 'remov'; then
+    bad "wfnocred: claims a credential was REMOVED on the path where nothing was tried — $(printf '%s\n' "$OUT" | grep -i 'remov' | head -1)"
+  else
+    ok "wfnocred: claims no removal, in any spelling — nothing was unset on the path where no retry was made"
+  fi
   case "$OUT" in
     *"STILL ONLY ON THIS DISK"*) ok "wfnocred: still says the work is on this disk only (never a cheerful exit)" ;;
     *) bad "wfnocred: the at-risk warning is missing — $OUT" ;;
