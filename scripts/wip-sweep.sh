@@ -88,14 +88,16 @@
 # carry (`feat/8090-tm`, `fix/3442-nonvacuity`, `rescue/3442-earlier-attempt`). A dirty worktree whose
 # branch yields NO issue link is REPORTED (`issue=-`, one loud line, and `no_issue=N` in the pass
 # record): the archive still exists on origin, but nothing ties it to the issue it belongs to, and
-# searching 222 inconsistently-named refs is not a substitute for an index. The typed version of this
+# searching the existing refs — inconsistently named, because the slug is sometimes an issue number and
+# sometimes a topic — is not a substitute for an index (no count is quoted: it moves). The typed version of this
 # (and the naming rule for the refs themselves) is agent-infra#3484 — deliberately not re-decided here.
 #
 # THE PASS RECORD (read by `--print-status`, and the surface a fleet instrument should read):
 #   status=ok|incomplete|failed|never   rc=…  mode=apply|dry-run  ts=…
 #   seen=… clean=… skipped=… dirty=… archived=… deferred=… unmeasured=… failed=… no_issue=…
 #   repos=… detail=… watchdog=…
-# `seen = clean + skipped + dirty + unmeasured` holds, and `skipped` is NOT folded into `clean`: a bare
+# `seen = clean + skipped + dirty + unmeasured` holds OVER THE WORKTREES EXAMINED (a repo-level failure
+# adds `unmeasured` and its own row without a `seen` row), and `skipped` is NOT folded into `clean`: a bare
 # repo and a git-`prunable` record were not examined, and a summary that counts them as clean cannot be
 # told apart from one over a disk where nothing is at risk.
 set -uo pipefail
@@ -574,7 +576,9 @@ if [ -n "$REC_TMP" ]; then
     # folded into `clean=` while the comment beside them said the opposite, so an instrument reading the
     # summary could not tell 5 measured-clean trees from 3 clean + 2 never-examined — a lossy count in
     # the OPTIMISTIC direction, on the surface the doc nominates for monitoring. They have their own
-    # counter, and `seen = clean + skipped + dirty + unmeasured` holds.
+    # counter, and `seen = clean + skipped + dirty + unmeasured` holds over the worktrees examined (a
+    # repo-level failure below adds `unmeasured` without a `seen` row — it is a failure about the
+    # repository, not an examination of a worktree).
     printf 'skipped=%s\n' "$N_SKIPPED"
     printf 'dirty=%s\n' "$N_DIRTY"
     printf 'archived=%s\n' "$N_ARCHIVED"

@@ -101,7 +101,9 @@ step "sweep clean: 0 orch-loop, $(tmux ls 2>/dev/null | wc -l | tr -d ' ') tmux 
 # ⛔ THE FAILURE IS LOUD AND IT IS NOT SWALLOWED, BUT IT DOES NOT STOP SUPERVISION BEING RESTORED.
 # Aborting here would leave the cell with ZERO controllers — a worse state than the one this script
 # exists to end. So the pass runs to completion and this script exits NON-ZERO at the end, which is
-# what `cloud-cell-bringup.sh --check` and the operator read. A missing sweep is the same class as a
+# what the CALLER of this quiesce reads — nothing reads it automatically yet (no `check_wip_sweep` exists
+# in `cloud-cell-bringup.sh`; adding one is follow-up, and claiming it here would be an inert alarm
+# channel). A missing sweep is the same class as a
 # failing one: "a missing rescuer must never read as nothing to rescue".
 WIP_RC=0; WIP_WHY=""
 if [ -z "$SWEEP" ]; then
