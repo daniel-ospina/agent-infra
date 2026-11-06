@@ -1452,27 +1452,6 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: "scripts/pi-reap-worktrees.test.sh G6e + G6f (rule 7, too-young)",
     note: "the reaper's too-young rule: NOTHING younger than this is removable, whatever else the rules say. It is the one clause that protects work a lane is actively writing, so it outranks the merged/aged/classification rules rather than being weighed beside them (#2756). NOTE the citation is deliberately only pi-reap-worktrees.test.sh: scripts/disk-reaper.test.sh:170 sets REAP_WT_MIN_AGE_MINUTES=0 in its own wrapper, i.e. it DISABLES rule 7 so its fixtures are not gated by it — it neither pins the 45 nor the behaviour, and citing it here would be a guard claim that reads backwards.",
   },
-  // — the #2788 root, reached again by #3405's second reaper bound —
-  // Measured on a clean detached `origin/main` worktree: it goes RED on the same reverse scan with
-  // `REAP_WT_PRESERVE_KEEP_DAYS`, i.e. red for every PR cut from that base and not attributable to
-  // any diff. Registered (not exempted): it IS a reap-axis bound whose value a change must be
-  // visible on, and it protects a `rm -rf` target chosen by a string, so the registry is exactly
-  // where a future edit of its default has to show up.
-  //
-  // ⚠️ WHY THIS ENTRY IS CARRIED HERE (agent-infra#3409, not #3431): `verify` lives in ci.yml, whose
-  // `on:` block is `pull_request:` ONLY — it has NO push leg, so main can never show this red and
-  // the rail's base attribution structurally cannot excuse it (declared_base_equivalent maps exactly
-  // one pair: `bash-suites (N)` → `script-validate`). The fix is owned by #3431; it is carried here
-  // byte-identically because a PR that cannot clear `verify` can never merge, and #3431 is itself
-  // held by the bash-suites reds. Whichever lands first, the other's hunk is identical.
-  {
-    name: "REAP_WT_PRESERVE_KEEP_DAYS",
-    owners: ["scripts/pi-reap-worktrees.sh"],
-    value: "${REAP_WT_PRESERVE_KEEP_DAYS:-14}",
-    axis: "reap",
-    guardedBy: "scripts/pi-reap-worktrees.test.sh G2aa (keep-days 0 keeps everything; a non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 — the WHOLE pass, not a skipped prune — and the refusal NAMES the seam, never a silent guess)",
-    note: "how long a dated subdirectory of the gate (b) evidence archive is kept. `0` keeps everything, so the bound can be disabled without deleting anything — the opposite polarity of a floor, which is why it is reasoned about here rather than folded into the age floors above. A non-numeric value is REFUSED BY SEAM VALIDATION at exit 2 (the startup `is_pos_int` sweep over its listed numeric seams, before any rule runs): the WHOLE pass aborts, so prune_preserve_archive is never reached — it is not a silent skip of the prune. That is deliberate: defaulting to 0 on a garbage override would silently turn retention OFF, and defaulting to the 14 would silently destroy evidence an operator asked to keep. Note the blast radius is the whole reaper and not this term — on a box already under disk pressure (#2159) the typo disables ALL reaping, which is why the refusal is pass-wide and names the seam.",
-  },
   {
     name: "MIN_AGE",
     owners: ["scripts/orchestrator-harness/lane-container-reap.sh"],
