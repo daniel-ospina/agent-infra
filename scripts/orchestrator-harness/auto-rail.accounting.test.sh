@@ -18,8 +18,9 @@
 #     `while :` around a live `gh`/`ps`/supervisor pass, so driving it here would mean stub-driving the
 #     whole actuator; those lines are pinned by whole-literal comparison at "the loop's own call"
 #     below, so a reordering or an edit inside either line reddens. What they cannot see is a line
-#     becoming UNREACHABLE (moved below a `continue`, or wrapped in `if false`) — that class is not
-#     pinned by anything here, and saying so is the point of this paragraph.
+#     becoming UNREACHABLE (moved below a `continue`, or wrapped in `if false`) — for THE LOOP'S OWN CALL
+#     LINES that class is still not pinned by anything here (later rounds pinned it for the RECORD GATE,
+#     which is pinned by reachability and not by text), and saying so is the point of this paragraph.
 #   * NOT PINNED AT ALL, declared rather than left to be discovered: the loop's HEAD-READ guard, the
 #     ordering of `cooldown_for` against the head read, and the aggregate `REFUSED` at `MAX_TOTAL=0`
 #     being reached before the rail-hub check. All are loop/startup sequencing, and driving them means
@@ -584,6 +585,23 @@ _conf() {  # $1 = mergeable value; prints the candidate lines for one green PR w
   || bad "a head whose mergeability is UNKNOWN must still be a CANDIDATE (got '$(_conf UNKNOWN)') -- GitHub computes it lazily, so a filter on anything but a DEFINITE CONFLICTING stalls every fresh head"
 [ "$(_conf MERGEABLE)" = "$(printf 'green\t11\tabsent')" ] \
   || bad "a MERGEABLE head with no record must still be a CANDIDATE (got '$(_conf MERGEABLE)') -- this is the #3489 shape"
+# ⛔ THE FILTER MUST NOT CRASH ON A VALUE THAT IS NOT A STRING (review round 7, P3). `_conf` splices its
+# argument INSIDE a JSON string, so every arm above feeds a string and the `str(…)` guard is unpinned —
+# reverting it left the suite GREEN (measured). This helper splices the value as RAW JSON, which is the
+# only way to exercise the path the guard exists for: a number raises `AttributeError` without it, the
+# heredoc exits non-zero, and `report_search` then refuses the pass for EVERY repo under a traceback
+# instead of naming SEARCH-FAILED for the one. Raw null/boolean must also stay CANDIDATES: `false` is not
+# the definite `CONFLICTING` this filter is allowed to skip.
+_conf_raw() {  # $1 = mergeable value spliced as RAW JSON
+  _ghbody "[{\"number\": 11, \"mergeable\": $1, \"isDraft\": false, \"headRefOid\": \"$H7\", \"body\": \"none\", \"statusCheckRollup\": [{\"name\": \"ci\", \"status\": \"COMPLETED\", \"conclusion\": \"SUCCESS\"}]}]"
+  PATH="$_badbin:$PATH" python3 "$_pysrc" daniel-ospina/tortoise 2 2>/dev/null
+}
+[ "$(_conf_raw 123)" = "$(printf 'green\t11\tabsent')" ] \
+  || bad "a NUMERIC mergeable must be a CANDIDATE, not a crash (got '$(_conf_raw 123)') -- the filter stringifies before comparing, so an unexpected JSON type cannot raise out of the candidate loop and refuse the pass for every repo"
+[ "$(_conf_raw null)" = "$(printf 'green\t11\tabsent')" ] \
+  || bad "a JSON null mergeable must be a CANDIDATE (got '$(_conf_raw null)') -- GitHub computes mergeable lazily, and a missing/unknown answer must still be reviewed"
+[ "$(_conf_raw false)" = "$(printf 'green\t11\tabsent')" ] \
+  || bad "a BOOLEAN mergeable must be a CANDIDATE (got '$(_conf_raw false)') -- only a DEFINITE CONFLICTING may be skipped; 'not mergeable' is not the same answer and skipping it would stall heads this loop exists to review"
 # STATE 1 — ATTESTED AT HEAD: the rail path, and nothing else, is what this PR is for.
 _ckline "review recorded: reviews/7.json verdict=clean @ $H7 diff=$(printf 'a%.0s' $(seq 1 64)) (daniel-ospina/tortoise)" "$H7" 'green\t7\tat-head' \
   "a clean record AT the current head must classify as at-head (the rail's own precondition)"
@@ -1161,8 +1179,9 @@ review_forgive_refusal "$_led"
 # missing-file arm at the end). A vacuous arm here is not cosmetic: it is the ONLY composition pin
 # (refusal forgiven → a LATER paid retry still dispatches), so the paid-retry loop could reopen with the
 # suite green.
-review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) "$(review_attempts "$_led")"; [ $? -eq 1 ] \
-  || bad "CROSS-STATE: after forgiving ONE refusal, a paid retry with 2 of $REVIEW_MAX_ATTEMPTS spent must still DISPATCH (got $? on att=$(review_attempts "$_led")) — the refusal consumed a budget the next paid attempt reads"
+review_action retry $(( COOLDOWN_TRANSIENT_S + 1 )) "$(review_attempts "$_led")"; _crc=$?
+[ "$_crc" -eq 1 ] \
+  || bad "CROSS-STATE: after forgiving ONE refusal, a paid retry with 2 of $REVIEW_MAX_ATTEMPTS spent must still DISPATCH (got $_crc on att=$(review_attempts "$_led")) — the refusal consumed a budget the next paid attempt reads"
 [ "$(review_attempts "$_led")" = 2 ] \
   || bad "the cross-state arm must see the 2 SURVIVING entries, not a deleted ledger (got '$(review_attempts "$_led")')"
 review_forgive_refusal "$_led"; review_forgive_refusal "$_led"
@@ -1288,8 +1307,9 @@ review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) 0; [ $? -eq 1 ] \
 # mark an unread head EXHAUSTED for ever — and it was asserted only in this comment for one round, which
 # is why the arm below is back (review round 3, P2, measured: folding `refused` into retry's logic left
 # the suite GREEN).
-review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) "$REVIEW_MAX_ATTEMPTS"; [ $? -eq 1 ] \
-  || bad "a refusal with the dispatch budget already spent must STILL dispatch (rc 1, got $?) — otherwise a load-gate window or a missing \`pi\` blocks heads nobody ever reviewed; the refused arm must ignore the count entirely"
+review_action refused $(( COOLDOWN_TRANSIENT_S + 1 )) "$REVIEW_MAX_ATTEMPTS"; _frc=$?
+[ "$_frc" -eq 1 ] \
+  || bad "a refusal with the dispatch budget already spent must STILL dispatch (rc 1, got $_frc) — otherwise a load-gate window or a missing \`pi\` blocks heads nobody ever reviewed; the refused arm must ignore the count entirely"
 # …and the cap must be READ, not hardcoded (review round 2, P2, measured): every arm above fixes the
 # cap at 3 and probes att ∈ {0,1,3}, so `[ "$att" -lt 3 ]` satisfied all of them. That is exactly the
 # class the REVIEW_PER_PASS arms below guard against ("must be READ, not hardcoded to 1"); the same
@@ -1370,7 +1390,7 @@ grep -qF '|| { rm -f "$out" 2>/dev/null; log_line' "$SUT" \
   || bad "a FAILED record write must roll the truncated record back ('|| { rm -f \"\$out\" …') — left behind, a zero-byte record reads as a review in flight for ever: no exit line, no dispatch epoch, so the state machine answers WAIT on every pass and nothing is ever published or exhausted"
 grep -q 'REVIEW-LAUNCH-FAILED' "$_sutlog" || bad "the failed dispatch must name itself in the log (a dispatch nobody records is a review nobody knows about)"
 # ⛔ AND THE **VERIFIED-LAUNCH ROLLBACK** — THE BRANCH THE ARM ABOVE DOES NOT REACH (review, P2). The
-# /proc arm fails one branch EARLIER, at the record write, and prints the SAME `REVIEW-LAUNCH-FAILED`
+# /dev/null arm fails one branch EARLIER, at the record write, and prints the SAME `REVIEW-LAUNCH-FAILED`
 # string, so a grep for it is satisfied while the rollback (`rm -f "$out"` + the attempt NOT counted) is
 # never executed — deleting the whole verify block left this file GREEN. Here the record write succeeds
 # and the child genuinely never starts (`run_review` unexported): the dispatch must be rolled back so the
@@ -1418,8 +1438,6 @@ rm -f "$_rfast"
 _rdl=$(sed -n '/\[ "\$_rstate" = refused \] && review_forgive_refusal/,/^        continue$/p' "$SUT")
 grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
   || bad "the in-flight publish must be GATED ON THE RECORD (no 'case \"\$(review_state \"\$_rout\")\" in' in the dispatch block) — ungated, a reviewer that already refused is reported as in flight on the PR and no state ever corrects it"
-grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
-  || bad "the in-flight publish must be GATED ON THE RECORD (no 'case \"\$(review_state \"\$_rout\")\" in' in the dispatch block) — ungated, a reviewer that already refused is reported as in flight on the PR and no state ever corrects it"
 # ⛔ REACHABILITY, NOT PRESENCE (review round 6, P1, REPRODUCED). The two arms this replaces asked only
 # whether the corrective text EXISTS and whether the in-flight publish sits somewhere AFTER the `case`
 # line — and BOTH single-edit reversions of this PR's fix satisfied that and left the suite GREEN:
@@ -1431,9 +1449,9 @@ grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
 #       text still exists; only the whole-line and the count pins see it. Measured the same way.
 # A text pin cannot see reachability, so the arm is pinned as the SHIPPED LINE, and the shape that could
 # shadow it is forbidden outright.
-grep -qxF '          pending) publish_review_state "$repo" "$pr" review-in-flight "$head" ;;' <<<"$_rdl" \
-  || bad "the in-flight publish must BE the 'pending)' arm of the record gate — as the shipped single line, not text that happens to appear near it; without the pending) literal the branch is entered for every state and a finished dispatch re-publishes the false claim"
-grep -qxF '          refused|retry) publish_review_state "$repo" "$pr" awaiting-review ;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*pending\)[[:space:]]+publish_review_state "\$repo" "\$pr" review-in-flight "\$head"[[:space:]]*;;' <<<"$_rdl" \
+  || bad "the in-flight publish must BE the 'pending)' arm of the record gate — an ARM, not text that happens to appear near it; without the pending) label the branch is entered for every state and a finished dispatch re-publishes the false claim (INDENTATION IS NOT PINNED: a reformat must not redden this)"
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review[[:space:]]*;;' <<<"$_rdl" \
   || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — and it must be its OWN arm: a catch-all makes this line unreachable while leaving its text intact, which is how the reverted defect stayed GREEN"
 grep -qE '^[[:space:]]*\*\)' <<<"$_rdl" \
   && bad "no catch-all '*)' arm may exist in the record gate — a '*)' placed before 'refused|retry)' shadows the corrective publish and restores the retry branch's own false 'review in flight' claim (reproduced: the suite stayed GREEN with it)"
@@ -1462,7 +1480,7 @@ REVIEW_SCRIPT=$_revsave
 [ "$(grep -o '|' "$_seenf" 2>/dev/null | wc -l | tr -d ' ')" = 3 ] \
   || bad "a dispatch whose reviewer READS STDIN must not consume the loop's candidate list — the loop saw '$(cat "$_seenf" 2>/dev/null)', want 3 rows: with an inherited fd 0 one review drains every remaining candidate of the repo (abandoned silently) and feeds their rows into the reviewer's prompt"
 grep -qF '2>&1 < /dev/null &' "$SUT" \
-  || bad "the review launch must DETACH stdin (`< /dev/null`) — the loop body's fd 0 is the candidate list, and a reviewer that reads it silently drops every later candidate of the repo for that pass"
+  || bad "the review launch must DETACH stdin ('< /dev/null') — the loop body's fd 0 is the candidate list, and a reviewer that reads it silently drops every later candidate of the repo for that pass"
 grep -qF '$extra < /dev/null > "$out" 2>&1 &' "$SUT" \
   || bad "the rail launch must DETACH stdin too — same inherited fd 0, same abandoned candidates, and it is the same file's shape"
 rm -f "$_stdinrev"
