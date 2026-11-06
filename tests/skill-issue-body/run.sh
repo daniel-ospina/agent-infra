@@ -74,7 +74,7 @@
 #      a committed read-only template path IS flagged, because the arm tests `not derived`, not
 #      `shared writable temp` (over-block, deliberate).
 #   C  the canonical example (skills/issue-creation) carries the citation for both rules, plus the
-#      recipe halves: call1-path, call2-write, body-quoted, derivation-unique
+#      recipe properties: call1-path, call2-write, body-quoted, derivation-unique, recipe-match
 #   D  the guard README names --body-file as the SANCTIONED route, "not a bypass" — AND the row's
 #      OWN example is the taught shape (not an inline body, not a literal path), and its title
 #      sentence still states the residual
@@ -336,7 +336,9 @@ literal_path_offenders() { scan literal; }
 odd_parity_files()      { scan parity; }
 
 # carries_deriv <string> → 0 when the string carries a derivation that resolves PER CHECKOUT or PER
-# CALL. One definition, used by the awk recipe model and by the README arm, so the two cannot drift.
+# CALL. ONE spelling, in $DERIV_RE, used by every caller, so the arms cannot drift apart on what
+# counts as a derivation (round 10: the pattern was inlined in the function and the defined constant
+# was dead, so a comment claiming "one definition" sat above two spellings).
 # ⛔ `--git-dir` IS NOT ONE OF THEM (round 9). The property is "resolves per checkout or per call",
 # and in a MAIN worktree `git rev-parse --git-dir` prints the literal `.git`, whose cksum is ONE
 # CONSTANT for every repo on the box — a WORSE collision than the #729 residual the derivation exists
@@ -344,7 +346,26 @@ odd_parity_files()      { scan parity; }
 # `--git-common-dir` is excluded for the opposite reason: every worktree of a repo shares it.
 # Accepted: `--absolute-git-dir` (per checkout) and `mktemp` (per call — but see recipe()).
 DERIV_RE='(git rev-parse --absolute-git-dir|mktemp)'
-carries_deriv() { printf '%s' "$1" | grep -qE -- 'git rev-parse --absolute-git-dir|mktemp'; }
+# ⛔ `mktemp` is a per-CALL derivation and is legitimate ONLY through an assignment — two direct
+# `$(mktemp)` expansions are two DIFFERENT files, so the print and the file disagree (the empty-body
+# defect in a new shape). `carries_deriv` answers "is there a derivation"; every arm that needs the
+# assignment precondition asks `pf_is_derived` / `deriv_ok`, never this alone.
+carries_deriv() { printf '%s' "$1" | grep -qE -- "$DERIV_RE"; }
+
+# deriv_ok <value> <via> → 0 when the body-file VALUE is a legitimate derivation. `via` is the model's
+# `via=assign|direct`: an assignment may use either derivation (one expansion, one file); a DIRECT
+# value must be the per-checkout `--absolute-git-dir` form, because a direct `$(mktemp)` resolves to a
+# brand-new EMPTY file at the gh call — the exact defect round 9 added `recipe-match` to close, which
+# the `via=direct` short-circuit then let through (measured, round 10: 51/0 on the README row and
+# arm C green on the canonical).
+deriv_ok() {
+  local v="$1" via="$2"
+  if printf '%s' "$v" | grep -q 'mktemp'; then
+    [ "$via" = assign ]
+  else
+    printf '%s' "$v" | grep -qE -- 'git rev-parse --absolute-git-dir'
+  fi
+}
 
 # shipped_cmd <file> → the `issue create` command the file ACTUALLY prints, with its `\`-continuations
 # joined. A function (not an inline awk) so a fixture can exercise the collector itself: E4 once
@@ -418,6 +439,20 @@ recipe() {
     }
     function norm(s) { gsub(/[ \t\r]+/, " ", s); return trim(s) }
     function emit(s) { gsub(/[\001-\037]/, " ", s); return s }
+    # maskQ(s) → the same string with everything INSIDE a double-quoted span replaced by `#`, so a
+    # flag match cannot land inside a value. Length is preserved, so a position found in the mask is
+    # a position in the original. Round 10 measured why this is needed: `--title` and `--label` come
+    # FIRST on every taught command, so `--title "fix: teach --body-file to the skills"` matched
+    # before the real flag and the SHIPPED canonical false-reddened three recipe arms (47/4).
+    function maskQ(s,   i, c, inq, m) {
+      inq = 0; m = ""
+      for (i = 1; i <= length(s); i++) {
+        c = substr(s, i, 1)
+        if (c == "\"") { inq = !inq; m = m c; continue }
+        m = m (inq ? "#" : c)
+      }
+      return m
+    }
     BEGIN { ghseen = 0; ingh = 0; ghbuf = ""; wrote = 0; printed = ""; order = "none"
             filed = ""; via = "direct"; quoted = "no" }
     {
@@ -430,8 +465,14 @@ recipe() {
       }
       # THE WRITE INSTRUCTION — only a mention AFTER the path has been printed is the instruction;
       # CALL 1 own comment mentions the write tool before printing (a comment is a legit place).
+      # ⛔ THE INSTRUCTION MUST BE AFFIRMATIVE AND CASE-INSENSITIVE. Round 10 measured BOTH failures
+      # in the old `line ~ /[Ww]rite/ && line ~ /write.*tool|tool.*write/` form: `do NOT write the
+      # body with the write tool` set wrote=1 (INERT against the inversion the arm exists for), and
+      # `use the Write tool to save the body to THAT path` left it 0 (a FALSE RED on correct text).
       if (line ~ /^[ \t]*#/) {
-        if (printed != "" && !wrote && line ~ /[Ww]rite/ && line ~ /write.*tool|tool.*write/) wrote = 1
+        low = tolower(line)
+        if (printed != "" && !wrote && low ~ /write/ && low ~ /(write.*tool|tool.*write)/ \
+            && low !~ /(do not|don.t|never|must not|no need to|without)/) wrote = 1
         next
       }
       # an assignment: remembered, and it is the ONLY way a per-CALL derivation is legitimate.
@@ -447,19 +488,25 @@ recipe() {
       }
       # THE PRINTED PATH — the LAST double-quoted span (a printf format is the FIRST arg, so "last"
       # reads the value in both the echo and the printf shape), else the trailing word.
+      # ⛔ ONLY A PRINT WHOSE VALUE LOOKS LIKE A PATH COUNTS. Any `echo` used to overwrite `printed`,
+      # so a benign progress line between the derivation and the gh call — `echo "Filing the issue
+      # now"` — made five arms report that the file NEVER prints the path, which is FALSE about a
+      # correct document (measured, round 10: 46/5).
       if (!ghseen && line ~ /(^|[ \t])(echo|printf)([ \t]|$)/) {
         p = line; n = 0; span = ""
         while (match(p, /"[^"]*"/)) { span = substr(p, RSTART + 1, RLENGTH - 2); p = substr(p, RSTART + RLENGTH); n++ }
         if (n == 0) { span = line; sub(/.*[ \t]/, "", span) }
-        printed = norm(resolve(span)); order = "pre"
+        cand = norm(resolve(span))
+        if (cand ~ /\// || cand ~ /(git rev-parse|mktemp)/) { printed = cand; order = "pre" }
         next
       }
     }
     END {
       if (ghbuf != "") {
-        rest = ghbuf
-        if (match(rest, /(^|[ \t])(--body-file|-F)([= \t]|$)/)) {
-          rest = substr(rest, RSTART + RLENGTH)
+        # ⛔ MATCH THE FLAG OUTSIDE DOUBLE QUOTES (maskQ). `--title`/`--label` come FIRST on every
+        # taught command, so an unquoted match reads a flag merely NAMED in the title as the real one.
+        if (match(maskQ(ghbuf), /(^|[ \t])(--body-file|-F)([= \t]|$)/)) {
+          rest = substr(ghbuf, RSTART + RLENGTH)
           sub(/^[ \t]*=*[ \t]*/, "", rest)
           if (substr(rest, 1, 1) == "\"") {
             q = index(substr(rest, 2), "\"")
@@ -507,11 +554,19 @@ canon_reasons_missing() {
   # ⛔ THE RECIPE HALVES, each of which a review round had to fix and which nothing else pinned:
   #   call1-path   — a line that PRINTS the derived path, BEFORE the gh call, so the `write` tool has
   #                  a target. Deleting it left the canonical example unrunnable and the shard green.
-  #   recipe-var   — the fresh-shell-broken `VAR=…` + `--body-file "$VAR"` recipe (see the scanner).
-#   call2-write  — the instruction to WRITE the body, AFTER the path-printing call (round 6).
-#   body-quoted  — the derived path is QUOTED, so a TMPDIR with a space cannot split the argument.
-#   derivation-unique — the lane-uniqueness token is in the --body-file VALUE, not only in the echo
-#                  (a `$`-carrying SHARED path passes arm B2 by construction — round 6).
+  #   recipe-var   — NOT an arm here: the fresh-shell-broken `VAR=…` + `--body-file "$VAR"` recipe is
+  #                  enforced POPULATION-WIDE by B3 (`canon_recipe_absent`), because it is only a bug
+  #                  when the assignment and the consumer are in DIFFERENT bash calls — a single-fence
+  #                  `BODY=` is correct and must stay accepted. It lived here as an arm C token until
+  #                  round 10, when this list and arm C's messages still promised it after the check
+  #                  had moved, so arm C reported green over a shape it only claimed to refuse.
+  #   call2-write  — the instruction to WRITE the body, AFTER the path-printing call (round 6).
+  #   body-quoted  — the derived path is QUOTED, so a TMPDIR with a space cannot split the argument.
+  #   derivation-unique — the derivation is in the --body-file VALUE, not only in the echo, and a
+  #                  per-CALL `mktemp` derivation must arrive VIA AN ASSIGNMENT (a `$`-carrying SHARED
+  #                  path passes arm B2 by construction — round 6; a direct `$(mktemp)` passes
+  #                  recipe-match as TEXT while resolving to a second, empty file — round 10).
+  #   recipe-match — the PRINTED path and the FILED path are the same resolved value (round 9).
   # ── the recipe arms, read from the ONE model above instead of four line-scoped token tests ──
   # Every one of these was a spelling test before round 9; each is now a property of `printed` /
   # `filed` / their EQUALITY, which is what the reader actually needs to be true.
@@ -538,10 +593,12 @@ canon_reasons_missing() {
   # derivation-unique — the derivation is in the FILED value, not only in the printed one. A
   # `$(pwd)`, `$(git rev-parse --show-toplevel)` or `$(git rev-parse --git-common-dir)` path keeps the
   # `$` arm B2 skips by construction, so the #729 collision returns with the suite GREEN (rounds 6-7).
-  # `mktemp` qualifies ONLY through an assignment — see the model note.
-  { carries_deriv "$P_FILE" && { [ "$P_VIA" = direct ] || printf '%s' "$P_FILE" | grep -qE -- 'git rev-parse --absolute-git-dir'; } \
-    || { printf '%s' "$P_FILE" | grep -q 'mktemp' && [ "$P_VIA" = assign ]; }; } \
-    || miss="$miss derivation-unique"
+  # ⛔ AND `mktemp` QUALIFIES ONLY THROUGH AN ASSIGNMENT (round 10). The old form short-circuited on
+  # `[ "$P_VIA" = direct ]`, so `echo "$(mktemp -u)"` + `--body-file "$(mktemp -u)"` — the reader
+  # writes to one file and files a different, EMPTY one — left arm C fully GREEN and reddened only the
+  # two mutator fixtures, whose messages blamed the MUTATOR. The rule the comment states is now the
+  # rule the code applies: see deriv_ok.
+  deriv_ok "$P_FILE" "$P_VIA" || miss="$miss derivation-unique"
   # recipe-match (#3483 round 9) — THE PRINTED PATH **IS** THE FILED PATH. Nothing tied the two, so a
   # skill could print the correct path for the `write` tool and file a DIFFERENT, freshly-`mktemp`ed
   # EMPTY file while every arm above stayed green (measured: 44/0 with an empty body). That is the
@@ -578,17 +635,37 @@ readme_route_absent() {
   # (measured, round 6: both reverts passed 41/0). The example is a table CELL, i.e. prose, so the
   # fenced scanner cannot see it — these checks on the cell are its only pin.
   ROUTE_LINE="$(printf '%s\n' "$RT" | grep -F 'gh issue create' | head -1)"
-  ROUTE_CMD="$(printf '%s\n' "$RT" | tr '`' '\n' | grep -F 'gh issue create' | head -1)"
-  if [ -z "$ROUTE_CMD" ]; then
+  # ⛔ SELECT THE SANCTIONED SPAN STRUCTURALLY — the span carrying BOTH `gh issue create` AND the
+  # body-file flag — never "the first span that mentions the command". Positional selection is how
+  # the row's FIRST column could carry a plausible command while the row's OWN example reverted to a
+  # fixed `/tmp` path and every arm stayed GREEN (measured, round 10: 51/0 with
+  # `--body-file "/tmp/x.md"` in the example cell). EXACTLY ONE such span is allowed: two is an
+  # ambiguity a reviewer cannot resolve mechanically, and picking one of them silently blesses the
+  # other. (Round 10's second measurement: with the correct example moved into an ordinary prose
+  # paragraph after the table the arm red-ed with "does NOT name --body-file", which was FALSE of
+  # the document — so the selection is by shape, not by position, and it may sit anywhere in the
+  # section.)
+  ROUTE_SPANS="$(printf '%s\n' "$RT" | tr '`' '\n' | grep -F 'gh issue create' | grep -E -- '(-F|--body-file)[= ]')"
+  ROUTE_N="$(printf '%s\n' "$ROUTE_SPANS" | grep -c . || true)"
+  ROUTE_CMD="$(printf '%s\n' "$ROUTE_SPANS" | head -1)"
+  if [ "${ROUTE_N:-0}" -eq 0 ]; then
     printf '%s\n' "$r(route-example)"
+  elif [ "${ROUTE_N:-0}" -gt 1 ]; then
+    printf '%s\n' "$r(route-example-ambiguous)"
   else
-    # ⛔ The value must be DERIVED (per checkout or per call) — not any `$`: a bare `"$BODY"` is the
-    # fresh-shell-broken shape the row's OWN sentence warns about, and `--git-common-dir` is shared by
-    # every worktree of the repo. Both passed the weaker `\$\{?` test (measured, round 7).
-    # `-F` is the documented short form of `--body-file`; `--git-dir` is NOT a per-checkout
-    # derivation (it prints the literal `.git` in a main worktree — one constant for every repo).
-    if printf '%s' "$ROUTE_CMD" | grep -qE -- '(-F|--body-file)[= ]+"?[^|]*\$' \
-       && carries_deriv "$ROUTE_CMD"; then :; else
+    # ⛔ READ THE **VALUE**, not the whole command. A derivation parked in the `--title` satisfied a
+    # whole-command carry, so `--body-file "/tmp/x.md" --title "…$(git rev-parse --absolute-git-dir)"`
+    # stayed green with a fixed body path (measured, round 10).
+    ROUTE_VAL="$(printf '%s' "$ROUTE_CMD" | sed -E 's/.*(-F|--body-file)[= ]+//' | sed -E 's/^"([^"]*)".*/\1/')"
+    # ⛔ The value must be DERIVED — not any `$`: a bare `"$BODY"` is the fresh-shell-broken shape the
+    # row's OWN sentence warns about, and `--git-common-dir` is shared by every worktree of the repo.
+    # Both passed the weaker `\$\{?` test (measured, round 7). `-F` is the documented short form of
+    # `--body-file`; `--git-dir` is NOT a per-checkout derivation (it prints the literal `.git` in a
+    # main worktree — one constant for every repo). And a bare `$(mktemp)` is refused here because
+    # this row's example is INLINE: one expansion at the gh call files a brand-new EMPTY body, the
+    # defect round 9 added `recipe-match` for, and the skill arm already refused it (measured, round
+    # 10: the README arm blessed it at 51/0 — two arms of one predicate disagreeing).
+    if printf '%s' "$ROUTE_VAL" | grep -q '\$' && deriv_ok "$ROUTE_VAL" direct; then :; else
       printf '%s\n' "$r(route-path)"
     fi
     # and never the inline body this whole change removes
@@ -703,6 +780,7 @@ fi
 # `/tmp` name, re-entering the #729 class this change exists to close (measured, round 8: five of the
 # six teach-sites had the instruction and no way to obtain the path).
 NO_PREP=""
+NO_MATCH=""
 while IFS= read -r f; do
   [ -n "$f" ] || continue
   grep -qE -- '(-F|--body-file)' -- "$f" 2>/dev/null || continue
@@ -712,9 +790,16 @@ while IFS= read -r f; do
   # unrelated substitution stood in for the body path (measured, round 9, both directions).
   R3="$(recipe "$f" 2>/dev/null)"
   P3P="$(printf '%s\n' "$R3" | sed -n 's/^printed=//p' | head -1)"
+  P3F="$(printf '%s\n' "$R3" | sed -n 's/^filed=//p' | head -1)"
   P3O="$(printf '%s\n' "$R3" | sed -n 's/^order=//p' | head -1)"
   { [ "$P3O" = pre ] && [ -n "$P3P" ] && carries_deriv "$P3P"; } \
     || NO_PREP="$NO_PREP ${f#$ROOT/}"
+  # ⛔ recipe-match IS A POPULATION PROPERTY, not a canonical-only one (round 10). It was applied to
+  # `$CANON` alone, so `skills/carousel-b2b-strategy` could print `pi-issue-body-$(…)` and file
+  # `pi-carousel-body-$(…)` — the reader writes one file, gh gets a different, EMPTY one — with the
+  # suite GREEN at 51/0. The property is the reason the three-call recipe exists, so every file that
+  # teaches it must satisfy it.
+  [ "$P3P" = "$P3F" ] || NO_MATCH="$NO_MATCH ${f#$ROOT/}"
 done <<EOF
 $(printf '%s\n' "$CENSUS")
 EOF
@@ -722,6 +807,11 @@ if [ -z "$NO_PREP" ]; then
   ok "A3: every census file that teaches \`--body-file\` prints the derived path (with \`echo\` or \`printf\`) BEFORE the gh call, so the \`write\` tool has a literal target and the reader is not left to invent a fixed \`/tmp\` name (#729)"
 else
   bad "these files teach \`--body-file\` but never PRINT the derived path before the gh call:$NO_PREP — an example the reader cannot run is an example it will improvise around, and the improvisation is a shared \`/tmp\` name"
+fi
+if [ -z "$NO_MATCH" ]; then
+  ok "A4: every one of them FILES the path it PRINTED — the \`write\` tool target and the \`--body-file\` value are the same resolved path, so a reader who follows the example cannot hand gh a different, empty file (round 10: this was pinned for the canonical only)"
+else
+  bad "these files PRINT a body path and then FILE a DIFFERENT one:$NO_MATCH — the reader writes the body to the printed file and gh reads another, which in the worst case is a freshly-created EMPTY file, so the issue is filed with no body and every other arm stays green"
 fi
 
 # ── A2: EVERY skill the README claims is "taught by" is actually pinned ─────────────────────────
@@ -742,6 +832,28 @@ done
 [ -z "$NAMED_UNPINNED" ] \
   && ok 'and every skill the guard README names as teaching the route really carries a fenced `issue create` example — the "pinned by this shard" claim holds for the files it names, one by one' \
   || bad "the README claims these are taught (and pinned) but they carry NO fenced \`issue create\` example:$NAMED_UNPINNED — deleting the example stops the skill teaching the route while the shard stays green"
+
+# ⛔ THE NAMES THE **README** DECLARES, not only the names this file happens to know (round 10). The
+# loop above asserts a HARD-CODED list, so the row could ADD a name — "… `commit-workflow` and
+# `code-review`" — and the arm stayed green while the README claimed a skill teaches the route that has
+# no `issue create` command at all (measured: 51/0 with a skill carrying zero). The claim is the
+# README's, so the README's own sentence is what gets resolved against the census.
+README_TAUGHT="$(awk '/^## Escape hatches/{f=1;next} /^Rule of thumb:/{f=0} f' "$README" 2>/dev/null \
+  | sed -n 's/.*Taught by //p' | sed 's/, and pinned by.*//')"
+TAUGHT_OFF=""; TAUGHT_SEEN=""
+for nm in $(printf '%s' "$README_TAUGHT" | tr '`,' '\n\n' | grep -E '^[a-z0-9-]+$'); do
+  TAUGHT_SEEN="$TAUGHT_SEEN $nm"
+  printf '%s\n' "$CENSUS" | grep -qE "/skills/$nm/" || TAUGHT_OFF="$TAUGHT_OFF $nm"
+done
+if [ -z "$README_TAUGHT" ]; then
+  bad 'the guard README row no longer says Taught by — the taught-by claim is what A2 pins, so with the sentence gone this arm measures nothing (mutator fault: the wording of the row moved)'
+elif [ -z "$TAUGHT_SEEN" ]; then
+  bad "the Taught-by clause in the guard README names no resolvable skill ($README_TAUGHT) — the claim is unreadable, so nothing about it can be asserted"
+elif [ -n "$TAUGHT_OFF" ]; then
+  bad "the guard README claims these skills teach the route, but they carry NO fenced \`issue create\` example:$TAUGHT_OFF — adding a name to the row is how the claim silently over-reaches the files this shard actually pins"
+else
+  ok "and every skill the README row DECLARES it is taught by ($(printf '%s' "$TAUGHT_SEEN" | sed 's/^ //')) resolves to a census file with a fenced \`issue create\` example — a name cannot be added to the row without a file behind it"
+fi
 
 # ── B: no inline body in any fenced `issue create` command ─────────────────────────────────────
 OFFENDERS="$(printf '%s\n' "$CENSUS" | inline_body_offenders)"
@@ -776,8 +888,8 @@ EOF
 # ── C: the canonical example carries the reasons, not just the shape ────────────────────────────
 C_MISS="$(canon_reasons_missing "$ROOT/$CANON")"
 [ -z "$C_MISS" ] \
-  && ok "$CANON teaches --body-file, cites why on both counts (#3445 the gated shape, #729 the derived path), prints the derived path in an earlier call so the write tool has a target AND instructs the write with it, quotes the path, and never uses the fresh-shell-broken VAR=… recipe — the shape travels with the reason, so the next editor cannot revert it as style" \
-  || bad "$CANON is missing:$C_MISS — without the cited reasons the shape reads as formatting and gets tidied away; without the path-printing call the example is UNRUNNABLE (the write tool has no target); with `VAR=` + `--body-file \"\$VAR\"` the path is empty by the time gh runs (every bash call is a fresh shell)"
+  && ok "$CANON teaches --body-file, cites why on both counts (#3445 the gated shape, #729 the derived path), prints the derived path in an earlier call so the write tool has a target AND instructs the write with it, quotes the path, FILES the path it printed, and derives that path per checkout — the shape travels with the reason, so the next editor cannot revert it as style" \
+  || bad "$CANON is missing:$C_MISS — without the cited reasons the shape reads as formatting and gets tidied away; without the path-printing call the example is UNRUNNABLE (the write tool has no target); with \`VAR=\` + \`--body-file \"\$VAR\"\` the path is empty by the time gh runs (every bash call is a fresh shell)"
 
 # ── D: the guard README documents the route (and does not call it an escape) ────────────────────
 ABSENT="$(readme_route_absent "$README")"
@@ -1374,7 +1486,7 @@ sed -E 's/(--body-file)([[:blank:]]+)/-F\2/' "$ROOT/$CANON" > "$T/mut/canon-shor
 if [ -z "$(canon_reasons_missing "$T/mut/canon-short-F.md")" ]; then
   ok 'MUTATION: the `-F` short form of `--body-file` is ACCEPTED by every recipe arm — the documented alias cannot be refused as if it were a different flag'
 else
-  bad "the `-F` short form reddened the recipe arms (\`$(canon_reasons_missing "$T/mut/canon-short-F.md")\`) — \`gh\` documents \`-F\` as \`--body-file\`, and the literal arm already accepts it, so the predicate contradicts itself"
+  bad "the \`-F\` short form reddened the recipe arms (\`$(canon_reasons_missing "$T/mut/canon-short-F.md")\`) — \`gh\` documents \`-F\` as \`--body-file\`, and the literal arm already accepts it, so the predicate contradicts itself"
 fi
 
 # (xxx) A SINGLE-FENCE `BODY=…` RECIPE IS CORRECT: assignment and consumer are ONE shell, so the
@@ -1409,14 +1521,130 @@ esac
 # (xxxii) the title-residual pin must not refuse ordinary rewordings of the SAME true fact. It is a
 # vocabulary, and a vocabulary that omits the repo own words blocks the next editor (round 7 refusals
 # of "is refused too"; round 8 of "is gated as well"; round 9 of "inspected"/"covered").
+# ⛔ THE FIXTURE MUST PROVE IT CHANGED THE FILE (round 10). The loop used to report only on failure and
+# then print an unconditional `ok`, so once the canonical sentence was reworded the `sed` matched
+# nothing, the loop measured an UNCHANGED file, and the arm still claimed to accept rewordings — an
+# assertion that cannot fail, counted in `passed`. The same mutator-precondition rule the arms
+# above apply now applies here.
+REWORD_BAD=""; REWORD_NOOP=""
 for v in 'is still inspected by that same check' 'is equally covered by the same check'; do
   sed "s/is still scanned, and is still refused/$v/" "$ROOT/$CANON" > "$T/mut/canon-title.md"
+  if cmp -s "$T/mut/canon-title.md" "$ROOT/$CANON"; then
+    REWORD_NOOP="yes"; continue
+  fi
   case "$(canon_reasons_missing "$T/mut/canon-title.md")" in
-    *title-residual*) bad "the title-residual pin refused a correct rewording ('$v') — the fact is unchanged, so this is a false RED that blocks the next improvement" ;;
+    *title-residual*) REWORD_BAD="$REWORD_BAD '$v'" ;;
     *) : ;;
   esac
 done
-ok 'MUTATION: the title-residual pin accepts ordinary rewordings of the same fact ("inspected by", "covered by") while arm E3 MEASURES that the fact still holds — the sentence pin no longer blocks the next editor'
+if [ -n "$REWORD_NOOP" ]; then
+  bad "the rewording fixture no longer changes $CANON — the canonical title sentence moved, so the sed substitutes nothing and this arm would pass while measuring an UNCHANGED file (mutator fault, not a document fault)"
+elif [ -n "$REWORD_BAD" ]; then
+  bad "the title-residual pin refused a correct rewording$REWORD_BAD — the fact is unchanged, so this is a false RED that blocks the next improvement"
+else
+  ok 'MUTATION: the title-residual pin accepts ordinary rewordings of the same fact ("inspected by", "covered by") — and the fixture is asserted to have CHANGED the file first, so a green here cannot be vacuous — while arm E3 MEASURES that the fact still holds'
+fi
+
+# ── (xxxiii) ROUND-10 PINS: each of these red-ed NOWHERE before this round, and each is a shape a
+# reader can copy. Measured in the direction it must red (and, for the two that are CORRECT, in the
+# direction it must stay green), so none of them is an assertion that cannot fail.
+
+# (a) A per-CALL derivation is legitimate ONLY through an assignment. `$(mktemp)` twice is two
+# different files: the reader writes the body to the printed one and gh reads a fresh EMPTY one.
+# Before this round arm C reported GREEN on exactly this file while two mutator fixtures red-ed with
+# messages blaming the MUTATOR.
+sed -E 's#\$\{TMPDIR:-/tmp\}/pi-issue-body-\$\(git rev-parse --absolute-git-dir \| cksum \| cut -d. . -f1\)\.md#$(mktemp /tmp/pi-issue-body.XXXXXX)#g' \
+  "$ROOT/$CANON" > "$T/mut/canon-mktemp-direct.md"
+if cmp -s "$T/mut/canon-mktemp-direct.md" "$ROOT/$CANON"; then
+  bad 'the direct-`mktemp` fixture did not change the canonical — the derivation spelling moved, so this arm measured nothing (mutator fault)'
+else
+  case "$(canon_reasons_missing "$T/mut/canon-mktemp-direct.md")" in
+    *derivation-unique*) ok 'MUTATION: two direct `$(mktemp)` expansions are REFUSED — they resolve to two DIFFERENT files, so the printed path and the filed path disagree and gh reads a freshly-created empty body; only an ASSIGNED per-call derivation is accepted' ;;
+    *) bad "arm C accepted a recipe that prints one file and files another — both are direct \`\$(mktemp)\` expansions, so the reader writes the body to the printed path and gh reads a second, EMPTY file (measured: this was GREEN before round 10)" ;;
+  esac
+fi
+
+# (b) The TITLE must not be read as the body flag. `--title` precedes `--body-file` on every taught
+# command, and "fix: teach --body-file to the skills" is the natural title of an issue about this very
+# route — it false-reddened THREE recipe arms (47/4) before the flag match was made quote-aware.
+sed 's/--title "fix: <one-liner>"/--title "fix: teach --body-file to the skills"/' \
+  "$ROOT/$CANON" > "$T/mut/canon-title-flag.md"
+if cmp -s "$T/mut/canon-title-flag.md" "$ROOT/$CANON"; then
+  bad 'the title-flag fixture did not change the canonical — the example title moved, so this arm measured nothing (mutator fault)'
+else
+  case "$(canon_reasons_missing "$T/mut/canon-title-flag.md")" in
+    '') ok 'MUTATION: a `--title` that merely NAMES `--body-file` is still CLEAN — the flag is matched OUTSIDE double quotes, so the natural title of an issue about this route is not a false RED (and the scanner arm above measures the same command as clean, so the two halves agree)' ;;
+    *) bad "a title that merely NAMES `--body-file` reddened the recipe arms ($(canon_reasons_missing "$T/mut/canon-title-flag.md")) — the flag was read from inside the quoted title instead of from the argument list, so correct text is refused" ;;
+  esac
+fi
+
+# (c) An `echo` between the derivation and the gh call is not the printed path. Any print used to
+# overwrite `printed`, so a benign progress line made FIVE arms claim the file never prints the path.
+sed '/^echo "${TMPDIR:-\/tmp}\/pi-issue-body-/a echo "Filing the issue now"' \
+  "$ROOT/$CANON" > "$T/mut/canon-benign-echo.md"
+if cmp -s "$T/mut/canon-benign-echo.md" "$ROOT/$CANON"; then
+  bad 'the benign-echo fixture did not change the canonical — the derivation line moved, so this arm measured nothing (mutator fault)'
+else
+  case "$(canon_reasons_missing "$T/mut/canon-benign-echo.md")" in
+    '') ok 'MUTATION: a benign `echo` AFTER the derivation does not displace the printed path — only a print whose value looks like a path can set it, so a progress line is not a false RED on a correct example' ;;
+    *) bad "a benign progress line between the derivation and the gh call reddened the recipe arms ($(canon_reasons_missing "$T/mut/canon-benign-echo.md")) — the doc still prints the derived path, so that message is false about the document" ;;
+  esac
+fi
+
+# (d) The write instruction must be AFFIRMATIVE, and it must survive an ordinary reword. The old test
+# was inert against the inversion AND over-strict on "use the Write tool".
+sed 's/write the body to THAT path with the `write` tool/do NOT write the body with the `write` tool/' \
+  "$ROOT/$CANON" > "$T/mut/canon-call2-negated.md"
+if cmp -s "$T/mut/canon-call2-negated.md" "$ROOT/$CANON"; then
+  bad 'the negated-write-instruction fixture did not change the canonical — CALL 2 moved, so this arm measured nothing (mutator fault)'
+else
+  case "$(canon_reasons_missing "$T/mut/canon-call2-negated.md")" in
+    *call2-write*) ok 'MUTATION: a NEGATED write instruction is REFUSED — "do NOT write the body with the write tool" left the arm green before round 10, so the one direction the arm exists for was the one it could not see' ;;
+    *) bad 'arm C accepted "do NOT write the body with the write tool" as the instruction to write the body — the call-2 arm is inert against the inversion, which is the regression it exists to catch' ;;
+  esac
+fi
+sed 's/write the body to THAT path with the `write` tool/use the Write tool to save the body to THAT path/' \
+  "$ROOT/$CANON" > "$T/mut/canon-call2-reworded.md"
+if cmp -s "$T/mut/canon-call2-reworded.md" "$ROOT/$CANON"; then
+  bad 'the reworded-write-instruction fixture did not change the canonical — CALL 2 moved, so this arm measured nothing (mutator fault)'
+else
+  case "$(canon_reasons_missing "$T/mut/canon-call2-reworded.md")" in
+    *call2-write*) bad "a correct reword of the write instruction reddened call2-write — the test was case-sensitive and spelling-bound, so the next editor's improvement is refused (measured, round 10)" ;;
+    *) ok 'MUTATION: an ordinary reword of the write instruction ("use the Write tool …") is still CLEAN — the test is case-insensitive and asks for the instruction, not for one spelling' ;;
+  esac
+fi
+
+# (e) THE README EXAMPLE'S VALUE — not the whole command — must carry the derivation, and the sanctioned
+# span must be selected by SHAPE. Both were green holes in round 10.
+readme_route_span_mut() {  # readme_route_span_mut <suffix> <sed-expr> → the mutation verdict
+  sed -E "$2" "$ROOT/extensions/main-worktree-guard/README.md" > "$T/mut/readme-$1.md"
+  if cmp -s "$T/mut/readme-$1.md" "$ROOT/extensions/main-worktree-guard/README.md"; then
+    printf 'NOOP'; return 0
+  fi
+  readme_route_absent "$T/mut/readme-$1.md" | sed "s|$T/mut/readme-$1.md||" | tr '\n' ' '
+}
+# the derivation parked in the TITLE while the body path stays a fixed /tmp name
+ROUTE_MUT="$(readme_route_span_mut deriv-in-title 's#--title … --body-file "[^"]*"#--body-file "/tmp/x.md" --title "tmp $(git rev-parse --absolute-git-dir)"#')"
+case "$ROUTE_MUT" in
+  *NOOP*) bad 'the README derivation fixture did not change the row — the example moved, so this arm measured nothing (mutator fault)' ;;
+  *route-path*) ok 'MUTATION: the derivation must be in the `--body-file` VALUE — parking it in the `--title` while the body path is a fixed `/tmp` name is REFUSED (before round 10 the whole-command carry blessed it at 51/0)' ;;
+  *) bad "the README row passed with a fixed \`/tmp\` body path because a derivation appeared elsewhere in the command ($ROUTE_MUT) — a derivation in the title does not make the body unique" ;;
+esac
+# a per-CALL `mktemp` cannot be blessed in an INLINE example: one expansion files an empty body
+ROUTE_MUT="$(readme_route_span_mut mktemp 's#--body-file "[^"]*"#--body-file "$(mktemp)"#')"
+case "$ROUTE_MUT" in
+  *NOOP*) bad 'the README mktemp fixture did not change the row — the example moved, so this arm measured nothing (mutator fault)' ;;
+  *route-path*) ok 'MUTATION: a bare `$(mktemp)` in the README example is REFUSED — the row is inline, so one expansion creates a brand-new EMPTY file at the gh call (the skill arm already refused it; the README arm blessed it at 51/0 before round 10)' ;;
+  *) bad "the README row blessed a bare \`\$(mktemp)\` body path ($ROUTE_MUT) — the reader would file an empty body, and the same shape is refused by the skill arm" ;;
+esac
+# TWO sanctioned-looking spans: the row's first column plus its example. Picking one silently blesses
+# the other, so ambiguity is its own verdict.
+ROUTE_MUT="$(readme_route_span_mut two-spans 's#^\| `gh . --body-file <path>`#| `gh issue create --title x --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir).md"`#') "
+case "$ROUTE_MUT" in
+  *NOOP*) bad 'the two-span fixture did not change the row — the first column moved, so this arm measured nothing (mutator fault)' ;;
+  *route-example-ambiguous*) ok 'MUTATION: TWO sanctioned-looking spans in the section are REFUSED as ambiguous — positional selection ("take the first") let the row own example revert to a fixed `/tmp` path while the column above it kept the arm green (measured, round 10: 51/0)' ;;
+  *) bad "two `gh issue create --body-file` spans in the escape section were not reported as ambiguous ($ROUTE_MUT)" ;;
+esac
 
 # ── NOTE (not an assertion): odd fence parity blinds arms B/B2 for the rest of that file ────────
 PARITY="$(printf '%s\n' "$CENSUS" | odd_parity_files | sed "s|$ROOT/||g" | tr '\n' ' ')"
