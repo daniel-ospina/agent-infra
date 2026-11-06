@@ -97,7 +97,11 @@ MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
 # value the loop uses. The one explicit value this CAN touch is one identical to the derivation —
 # the same absurd probe-derived number — so bounding that is the repair, not a substitution.
 if [ "$MAX_LANES" = "$(( 10#$_NCPU * 5 / 2 ))" ]; then is_limit "$MAX_LANES" || MAX_LANES=10; fi
-MAX_REVIEW="${MAX_REVIEW:-4}"
+# ⛔ 10, NOT 4 (#3441): this is BOTH the reviewer-concurrency cap and the per-PR review-ROUND
+# ceiling the loop enforces (`state/reviewround-<PR>`), and the two must be the same number here and
+# in `orch-loop.sh` — the self-test resolves all limit defaults in both scripts and asserts they agree.
+# The sync comment in `orch-loop.sh` names the three places (this file, the loop, README §4).
+MAX_REVIEW="${MAX_REVIEW:-10}"
 MERGE_PRIORITY_AT="${MERGE_PRIORITY_AT:-25}"
 # NOTE (BP0, tortoise#8468 — NOT shipped, reconciled onto main's rule): the tortoise fork's P0
 # override (a P0-blocker at the backlog head clearing ONLY the merge-priority reason) is NOT carried
@@ -146,9 +150,12 @@ BASE_LABEL="com.eldato.orchestrator-loop"
 # therefore a SEPARATE line.
 LABEL="com.eldato.orchestrator-loop"
 [ -n "${LABEL_OVERRIDE:-}" ] && LABEL="$LABEL_OVERRIDE"
-# The OTHER production label: the recovery agent PR #1986 ships (`watchdog.plist.template`). It is
-# listed here so `label_guard` treats it as production too — the guard's rule is about the LIVE jobs,
-# and a second production label that the guard did not know about would be installable from a sandbox.
+# The OTHER production label: `com.eldato.orchestrator-watchdog`, the hand-provisioned controller
+# watchdog RETIRED by agent-infra#2303 (`templates/launchd/RETIRED` — `install-launchd.sh`'s
+# `retire_pass` unloads and removes it). It has no plist template any more, and it is still listed
+# here so `label_guard` treats it as PRODUCTION: the guard's rule is about the labels launchd may
+# still resolve on a live box, and a retired label a sandbox did not know about would still be
+# addressable from one.
 PROD_WD_LABEL="com.eldato.orchestrator-watchdog"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 TEMPLATE="$HERE/launchd.plist.template"
@@ -1236,6 +1243,29 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
 for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
+  # ⛔ `MAX_REVIEW` IS NO LONGER ONLY CONCURRENCY — SAY SO AT THE RENDER (round 9 review, P2). Since
+  # agent-infra#3441 this ONE knob is BOTH the concurrent-`review-<PR>` cap AND the per-PR cumulative
+  # REVIEW-ROUND budget, at which the head is PARKED with a `REVIEW-CEILING` escalation. So a box whose
+  # plist still pins the old default (`4`, chosen when the number meant concurrency only) now parks
+  # PRs after FOUR review rounds — converting the owner's ruling ("raise 4 so the loop converges")
+  # into exactly the early exit it was made to remove. A WARNING, not a refusal: 2..9 are legitimate
+  # values for a small box, and over-blocking an install is worse than naming the consequence.
+  # ⛔ TWO RESIDUALS, NAMED RATHER THAN IMPLIED (round-16 review, P3). (1) THIS CANNOT SEE A STALE
+  # PLIST: the knob is seeded from `${MAX_REVIEW:-10}` above and this script never reads the INSTALLED
+  # plist's `EnvironmentVariables`, so a plist rendered before #3441 that pins `4` produces NO warning —
+  # re-rendering simply takes the new default (harmless, but it is not the population the README row
+  # used to say this catches). (2) IT IS UNPINNED: no suite runs a render with `MAX_REVIEW=4` and greps
+  # for this line (the install-check groups in `selftest.sh` are macOS-only and skip on Linux), so
+  # deleting the block would redden nothing. Both are stated here because an unasserted print is the
+  # first thing the next lane removes as dead, and `MAX_REVIEW=4` is the configuration this exists to
+  # make visible.
+  if [ "$_n" = "MAX_REVIEW" ]; then
+    case "${_v:-}" in ''|*[!0-9]*) : ;; *)
+      if [ "${_v}" -ge 2 ] && [ "${_v}" -lt 10 ]; then
+        echo "⚠️  MAX_REVIEW=$_v is ALSO the per-PR review-ROUND ceiling (agent-infra#3441): a PR is PARKED with a REVIEW-CEILING escalation after $_v review rounds. The shipped default is 10 — the OLD default was 4, chosen when this knob meant concurrency only, so a plist rendered before #3441 still pins it. Re-render (this run does) to take the new value." >&2
+      fi ;;
+    esac
+  fi
   case "${_v:-}" in
     ''|*[!0-9]*) die "$_n='${_v:-}' is not a whole number — a value here silently opens the gate it configures" ;;
     # ⛔ A WINDOW IS NOT A COUNT (review round 5). MERGE_PRIORITY_MAX_AGE_MIN / FUNNEL_MAX_AGE_MIN are
@@ -1571,19 +1601,26 @@ DRIFTED=""
 # all: it is the STABLE program the plist execs (see the STABLE_PROG block above), so a `$O` copy that
 # drifted from the pin is the one file whose divergence turns every launchd tick into exit 127 while
 # `launchctl list` still reports the job `loaded`. It is also a $O seed, so it belongs here.
+# mandate-preflight.sh (#3377) is the disclosure half of the same class: both `run_agent` copies resolve
+# it at SPAWN time, and a `$O` that lost it makes every lane report the mandate files' state as
+# UNVERIFIED — the silence this change exists to end, restored silently.
 # key-gate.sh (#3331) is the same class for the same reason, one gate later: `lane.sh` sources it
 # fail-loud and refuses to start a lane whose model credential nothing asserts, so a $O without it stops
 # every dispatch on the box — and the refusal is *meant* to be loud, which is why the DRIFT must be
 # detected here rather than discovered as a box-wide standstill with nothing naming the cause.
 # ⛔ EVERY NAME HERE IS MAINTAINED, NONE IS EITHER/OR: `stall-fix.sh` came from #2929,
-# `orch-pin-exec.sh` from #3309, `key-gate.sh`/`lane-env.sh` from #3331. No side of any of those
-# merges was a superset of another — dropping one leaves a file its caller executes UNCHECKED,
-# which is the exact defect this list exists to catch. Merge conflicts here resolve as a UNION.
+# `orch-pin-exec.sh` from #3309, `mandate-preflight.sh` from #3377, `key-gate.sh`/`lane-env.sh` from
+# #3331. No side of any of those merges was a superset of another — dropping one leaves a file its
+# caller executes UNCHECKED, which is the exact defect this list exists to catch. Merge conflicts here
+# resolve as a UNION.
 # lane-env.sh (#3060) is the SAME defect already live one line up in `lane.sh`: that file sources it and
 # `exit 78`s without it, and it was in NEITHER list (review of #3331, verified `grep -c` = 0 on both), so
 # a $O deployed before #3060 — or half-synced — stops every lane while this check reports no divergence
 # and the operator is told nothing. Presence + byte comparison is all this list does, so it is one word.
-for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh merge-rate.sh key-gate.sh lane-env.sh; do
+# lane_registry.py (#3382) is the registry the harness's own lane-surface tools import to answer "did
+# this lane finish?"; a $O deployed without it makes every such caller import-fail, so it joins the
+# same union as the names above — this one from the #3382 branch, not from main.
+for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh; do
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
