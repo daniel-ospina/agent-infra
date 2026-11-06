@@ -789,16 +789,21 @@ _codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gat
 # defect is that the guard's stated population was not the population it checked.)
 # A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
 # not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
-# now READS the bookkeeping assignments it used to drop, so the three names below are the full set it
-# finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
-# any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
+# now READS the bookkeeping assignments it used to drop, so the names below are the full set it finds
+# on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against any of
+# them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
 #   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
 #   an exit code; nothing compares a shell status against it.
 #   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
 #   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
 #   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
 #   (`claim-registry-absent`) or `none`; not an exit code either.
-_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED"
+#   watchdog-loop.sh:RESTART_REFUSED — a 0/1 FLAG set when the watchdog declines to restart the
+#   controller (three arms return 1 beside it); it is read back as `[ "${RESTART_REFUSED:-0}" -eq 1 ]`
+#   and is never compared against, or printed as, a shell status. It predates this scanner (#1986,
+#   2026-11-05) and arrived in the family namespace only because it ends in `_REFUSED`; the scanner
+#   now reads it, so it needs this line rather than a silent pass.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED watchdog-loop.sh:RESTART_REFUSED"
 # A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
 # reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
 # derived filter yields exactly the family claims today, so the namespace costs nothing — and a future
@@ -5305,7 +5310,15 @@ git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+# ⛔ THE PROBE MUST READ THE SAME REGISTRY THE LANE READ — `rdrive` pins LANE_REGISTRY_STATE/LOCAL/
+# REPO at the fixture, and an UNPINNED probe resolves its local witness from `CELL_HOME`/`HOME`
+# instead (lane_registry.py `_home()`). Measured on a box whose `~/.pi/agent/state/lanes` held 243
+# records: the unpinned probe FELL BACK to that witness, answered readable+rc 0, and this arm reded
+# with "registry itself: rc=0" — for an environment reason, not because the lane misbehaved. The
+# arm's non-vacuity half is only meaningful about THIS fixture, so it is pinned to it.
+unreachable="$(env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+  LANE_REGISTRY_REPO="$RREG/work" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
