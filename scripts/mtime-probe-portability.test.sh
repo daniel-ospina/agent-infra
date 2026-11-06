@@ -232,10 +232,23 @@ if [ -n "$(PATH="$SHIM:$PATH" stat -f%m "$FRESH" 2>/dev/null)" ]; then
 else
     bad "the modelled host REFUSES the GLUED 'stat -f%m' — it would red a portable chain"
 fi
-if PATH="$SHIM:$PATH" stat -c %Y "$FRESH" >/dev/null 2>&1; then
-    bad "the modelled host ACCEPTS 'stat -c' — a GNU-only probe would pass it vacuously"
+# ⛔ NON-VACUITY, IN THE TWO-SIDED SHAPE (#3509 review round 8b). This arm asks for the SIZE through
+# the GNU-only `-c` arm FIRST: a faithful macOS model refuses `-c`, so the answer comes from the BSD
+# `-f %m` arm and is an EPOCH; a PERMISSIVE shim would answer with a small byte count instead, which
+# is what the arm reds on. The `-f` counterpart sits in the same command unit, so this is the
+# two-sided chain the repo's portability gate blesses — the previous form was a LONE `stat -c` call,
+# which that gate correctly reported as a NEW trap in this very file (measured: `stat-c-gnu`,
+# baseline=0 live=1). Baselining it was the wrong fix: `scripts/portability-baseline.tsv` states its
+# rows are PRE-EXISTING traps, and this one would have been introduced here.
+SHIM_PATH="$SHIM:$PATH"
+# The chain must sit on ONE physical line: the gate's `stat-c-gnu` rule evaluates the counterpart per
+# COMMAND UNIT, and a `\` continuation puts the two arms in different units, which reds it again
+# (measured).
+shim_probe="$(PATH="$SHIM_PATH" stat -c %s "$FRESH" 2>/dev/null || PATH="$SHIM_PATH" stat -f %m "$FRESH" 2>/dev/null)"
+if [ "${shim_probe:-0}" -gt 1000000000 ] 2>/dev/null; then
+    ok "the modelled host REFUSES 'stat -c' (the chain answered from its 'stat -f' arm, with an epoch)"
 else
-    ok "the modelled host REFUSES 'stat -c' (GNU-only), which is the platform this suite exists for"
+    bad "the modelled host ACCEPTED 'stat -c' — it answered [$shim_probe] instead of an epoch, so the arms below are vacuous"
 fi
 # ⛔ THE ARMS. A GNU-only probe fails BOTH (it cannot read the mtime at all); a portable one —
 # `date -r <path>` or the two-sided chain — passes BOTH, which is what "works on GNU and BSD" means.
