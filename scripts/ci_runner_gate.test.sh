@@ -1008,6 +1008,7 @@ assert_eq "$(cat "$STATE_DIR/ci-runner-gate.state" 2>/dev/null)" "github" "an in
 assert_contains "$OUT" "demand_runs=7 < 10" "the healthy reason quotes the count the LENGTH LEG tested"
 assert_not_contains "$OUT" "queue < 10" "…and never claims a raw-depth bound it did not apply"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "queued=10" "the verdict file still publishes the RAW depth (a queue-depth consumer wants that)"
+assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand_runs=7 < 10 (raw depth 10, ghost_runs=3)" "…and the reason beside it quotes the demanding count AND the discount, so the durable verdict says a discount happened"
 assert_contains "$(cat "$STATE_DIR/ci-runner-gate.verdict" 2>/dev/null)" "demand_runs=7 < 10" "…and the reason beside it quotes the demanding count"
 assert_eq "$(grep -o 'queued=[0-9]*' "$STATE_DIR/ci-runner-gate.verdict" | wc -l | tr -d ' ')" "1" "exactly ONE queued= value on the line, so a key=value reader cannot see two numbers"
 # ⛔ THE SAME INVARIANT ON A DENY LINE (cycle-5 review, finding 2). The length-leg reason used to say
