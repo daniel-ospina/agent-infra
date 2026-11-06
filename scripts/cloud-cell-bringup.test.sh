@@ -1556,7 +1556,9 @@ rm -rf "$T/standalone"
 #     (not fatal — several trees can be legitimate — but never silent);
 #   * that a clean box passes and says `ok`, so the check cannot be an always-red arm that tells nobody
 #     anything;
-#   * that an EMPTY population is a warn, never a pass.
+#   * that an EMPTY population is an `unverified` VERDICT (not a `warn` with a word in it — the verdict is
+#     the contract, because it is what keeps the `CELL READY` banner from claiming the check), so it is
+#     never a pass.
 # ⛔ THE ARMS ASSERT THE IDENTITY VERDICT, not the whole bring-up's exit status. On a host whose
 # launchd/schedule layer refuses (this suite's own documented temp-HOME shape) the run dies AFTER this
 # check, and an arm keyed on `rc` would then be measuring that environment rather than this predicate.
@@ -1806,6 +1808,101 @@ OWN_OUT="$(WORKDIR="$T/ident-own/cell" REPO_SLUG=daniel-ospina/tortoise \
   && ok "the box's own repo is WORKDIR's origin (agent-infra), not the REPO_SLUG default (tortoise)" \
   || bad "own repo read as '$OWN_OUT' with WORKDIR an agent-infra checkout — a hardcoded default is being used"
 
+say_case "repo identity: a preserved harness copy is declared, but the specific rows still own their names"
+# ⛔ THE `harness.*` FAMILY MUST NOT CAPTURE THE MORE SPECIFIC ROWS (review finding, P2). It captured
+# `harness.not-a-worktree` (the name this repo's own pin repair tells the operator to create, which has its
+# own row and reason) and `harness.<x>-legacy-YYYYMMDD` (whose row exists so a quarantine of ANY repo is a
+# declared exception — scoped to agent-infra it refused a tortoise quarantine, with the usual rename remedy).
+PRES_OUT="$(bash -c '. "$1"; for n in harness.not-a-worktree harness.quarantine-legacy-20260101 harness.preserved-012629; do printf "%s|" "$(repo_identity_declared "$n" | head -1)"; repo_identity_declared "$n" | tail -1 | cut -c1-40; printf "\n"; done' _ "$HERE/orchestrator-harness/repo-slug.sh" 2>&1)"
+case "$PRES_OUT" in
+  *"agent-infra|a QUARANTINE created by"*) ok "the pin-repair name keeps its own row and reason" ;;
+  *) bad "harness.not-a-worktree lost its own row (the preserved-copy glob captured it): $PRES_OUT" ;;
+esac
+case "$PRES_OUT" in
+  *"*|a dated QUARANTINE"*) ok "a dated quarantine under a harness-prefixed name may still hold ANY repo (the repo COLUMN is asserted, not just the reason — a scoping regression must redden this)" ;;
+  *) bad "a harness-prefixed dated quarantine was scoped to one repo — a tortoise quarantine would be refused: $PRES_OUT" ;;
+esac
+case "$PRES_OUT" in
+  *"agent-infra|a PRESERVED or STALE harness copy"*) ok "and a preserved copy is declared with its own reason" ;;
+  *) bad "harness.preserved-<date> is not declared as a preserved copy: $PRES_OUT" ;;
+esac
+
+say_case "repo identity: a real divergence is still REPORTED when another head could not be read"
+# ⛔ ORDERING MATTERS (review finding, P2). With the unread arm first, a group of two READABLE heads at
+# different commits plus one unborn head said "not a divergence" — a false statement about data the check
+# did read. Only the readable heads can establish a divergence; the unread one stays named in the listing.
+mk_checkout "$T/ident-divmix/agent-infra" "https://github.com/daniel-ospina/agent-infra.git" dm1 \
+  && cp -a "$T/ident-divmix/agent-infra" "$T/ident-divmix/ai" \
+  && git -C "$T/ident-divmix/ai" -c user.email=f@x.invalid -c user.name=f commit -q --allow-empty -m dm2 >/dev/null 2>&1 \
+  && ok "fixture: two copies of one repo at DIFFERENT commits" \
+  || bad "fixture: could not create the diverging pair"
+mkdir -p "$T/ident-divmix/harness.preserved-0101"
+git init -q "$T/ident-divmix/harness.preserved-0101" >/dev/null 2>&1
+git -C "$T/ident-divmix/harness.preserved-0101" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+DIVMIX="$(bash -c '. "$1"; REPO_SLUG=daniel-ospina/agent-infra repo_identity_scan "$2"' _ \
+  "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-divmix" 2>&1)" || true
+case "$DIVMIX" in
+  *"at DIFFERENT heads"*) ok "two readable heads at different commits are reported as a divergence, even beside an unread one" ;;
+  *"could not be READ"*"not a divergence"*) bad "a REAL divergence was reported as 'not a divergence' because another head was unread" ;;
+  *) bad "the mixed readable/unread group produced no divergence verdict: $(printf '%s' "$DIVMIX" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: two trees whose HEAD cannot be read do not 'agree'"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P2. `_head` holds the sentinel `<unreadable>` for an unborn HEAD
+# (`git init` + `remote add`, the exact fixture shape both doctor suites use), so a group of two could not
+# be told apart from a group of two that AGREE — and the report printed "all at the same head" about data
+# nothing read. The `, `-separator bug inverted: this message invented a convergence.
+# Two checkouts with an origin but NO COMMIT: `rev-parse HEAD` answers nothing, which is the shape the
+# doctor suite's own `$T/repo` fixture has.
+for d in agent-infra ai; do
+  mkdir -p "$T/ident-unborn/$d"
+  git init -q "$T/ident-unborn/$d" >/dev/null 2>&1
+  git -C "$T/ident-unborn/$d" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+done
+UNBORN_OUT="$(REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; repo_identity_scan "$2"' _ "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-unborn" 2>&1)" || true
+case "$UNBORN_OUT" in
+  *"all at the same head"*) bad "the report claims two trees AGREE on a head it could not read: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+  *"could not be READ"*|*"unknown"*) ok "an unread HEAD is reported as unknown — neither a divergence nor an agreement" ;;
+  *) bad "an unreadable-head group produced no honest line: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: a preserved HARNESS copy is not a lying directory, and a group reports only ITS own resolution"
+# ⛔ TWO REVIEW FINDINGS, ONE FIXTURE EACH.
+# (a) `harness.<suffix>` — `disk-floor.sh` names `harness.stray-*`/`harness.preserved-*` as its stale-copy
+#     class and refuses to delete anything carrying `.git`; `docs/ops/disk-consumers.md` MEASURES
+#     `harness.preserved-012629` inside `/tmp/cell-home`, a default root. A preserved copy is a real clone of
+#     agent-infra, so it read FATAL — a remedy inviting a rename of a preserved copy on a healthy cell.
+# (b) the duplicate report's `resolves` scan was not scoped to its group, so the TORTOISE line could report
+#     the AGENT-INFRA path as the tree REPO resolves to (and that non-empty value suppressed the honest
+#     "nothing here resolves" sentence).
+mk_checkout "$T/ident-pinpre/home/harness.preserved-012629" "https://github.com/daniel-ospina/agent-infra.git" pp1 \
+  && ok "fixture: a preserved harness copy under the cell home" \
+  || bad "fixture: could not create the preserved harness copy"
+BR_IDENT_ROOTS="$T/ident-pinpre/home" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a PRESERVED HARNESS COPY was refused — the remedy invites renaming a preserved copy: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+  *"DECLARED exception name 'harness.preserved-012629'"*) ok "a preserved harness copy is a declared exception, not a directory to move" ;;
+  *) bad "the preserved harness copy produced no verdict: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+for r in agent-infra ai tortoise tortoise-old; do
+  case "$r" in agent-infra|ai) url=https://github.com/daniel-ospina/agent-infra.git ;; *) url=https://github.com/daniel-ospina/tortoise.git ;; esac
+  mk_checkout "$T/ident-two/$r" "$url" "g-$r" || bad "fixture: could not create …/$r"
+done
+ok "fixture: TWO duplicated repos, so a group can pick up the wrong group's path"
+TWO_OUT="$(REPO="$T/ident-two/agent-infra" REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; repo_identity_scan "$2"' _ "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-two" 2>&1)" || true
+# the tortoise group's line must NOT claim REPO (an agent-infra path) as its resolution
+TORTOISE_LINE="$(printf '%s\n' "$TWO_OUT" | grep -F 'daniel-ospina/tortoise is checked out')"
+case "$TORTOISE_LINE" in
+  *"REPO->"*) bad "the tortoise group reported the AGENT-INFRA path as its resolution — a false attribution: $TORTOISE_LINE" ;;
+  *) ok "each duplicate group reports only its own resolution" ;;
+esac
+case "$TORTOISE_LINE" in
+  *"neither REPO"*|*"no REPO, WORKDIR or O"*) ok "…and the honest 'nothing here resolves' sentence is not suppressed" ;;
+  *) bad "the tortoise group named no resolution at all (the honest sentence was suppressed): $TORTOISE_LINE" ;;
+esac
+
 say_case "repo identity: a SUFFIXED working copy is not lying, whatever the separator"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The exemption was dash-only, so `tortoise.old`, `tortoise_wip` and
 # `tortoise2` — each naming the repo it holds — were refused FATAL with a remedy inviting a rename.
@@ -1878,8 +1975,9 @@ esac
 # ⛔ AND THE MEASURED DEFECT IS NOT REOPENED BY THIS: cell-2's `/home/cmux/agent-infra` was a real
 # CLONE (`.git` a DIRECTORY) holding a DIFFERENT repo. If the `.git`-file exemption ever widened to `.git`
 # generally, or the walker stopped comparing real checkouts, this is the arm that would catch it.
-# `agent-infra` is a DECLARED exception name expecting agent-infra, so a tortoise checkout there is
-# exactly the "a DIFFERENT repo at this name is still refused" case.
+# `agent-infra` needs NO table row — it matches the repo the origin names — so this arm exercises the
+# plain comparison and its FATAL, not a declared row (review finding, P2: the earlier note here claimed a
+# row existed, which would have taught the next lane to edit the table for a name that needs nothing).
 mk_checkout "$T/ident-wt/home/agent-infra" "https://github.com/daniel-ospina/tortoise.git" w4 \
   && ok "fixture: a REAL CLONE (.git is a DIRECTORY) named agent-infra, holding tortoise" \
   || bad "fixture: could not create the lying clone"
