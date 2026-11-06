@@ -110,6 +110,12 @@ def ripen(W, monkeypatch, tmp_path, argv):
                                  200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
     monkeypatch.setattr(W.time, "sleep", lambda s: None)
     monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
+    # ⛔ AND THE CONNECTION PROBE, FOR THE SAME REASON AS `ps_table` ABOVE — see `parked`. It is a
+    # real `lsof` call on a SYNTHETIC pid, so an unstubbed run lets the host decide `main()`'s exit:
+    # on this cell `lsof` writes overlay/nsfs WARNINGS to stderr, `has_live_connection` reads that as
+    # UNKNOWN, `main()` returns 3, and all six `main()`/state-write tests below fail for a reason
+    # none of them is about. A test that stubs four of five inputs is hermetic by luck, not design.
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
     monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
 
 
@@ -122,17 +128,46 @@ def test_cpu_seconds_parses_every_ps_shape(W):
 
 # ── GATE 1: zero CPU delta, measured over the whole SUBTREE ───────────────────
 
-def test_a_working_child_is_never_a_candidate(W):
+def parked(W, monkeypatch):
+    """Stub the CONNECTION PROBE to "no connection", so a CPU/descendant gate is what is under test.
+
+    ⛔ GATE 1's TESTS MUST NOT CONSULT THE HOST'S REAL `lsof` — MEASURED, TWICE, IN OPPOSITE
+    DIRECTIONS. `frozen_subtrees` calls `has_live_connection(pid)` for every pid in a subtree, and
+    the gate-1 tables below carry SYNTHETIC pids (300, 301, 36186). Left unstubbed, the real probe
+    decides those tests' verdicts on the host, so the same commit is green or red by where it runs:
+
+      * IN A CONTAINER it is a determinate FALSE FAIL. `lsof 4.95` prints `can't stat() overlay
+        file system` / `nsfs` WARNINGS to stderr on this cell, and `has_live_connection` reads rc=1
+        + non-empty stderr as UNKNOWN (`None`), which REFUSES. Measured on the cell: 5 of 5 runs
+        red, `assert set() == {36186, 36189}` — the CI red at
+        `test_a_frozen_child_of_a_pi_parent_is_a_candidate`.
+      * ON A LOADED RUNNER it is a FLAKE. `lsof` is killed by its own 30 s timeout -> `None` ->
+        refuse. That is how `main` went red at `0b1d1ec65` (run 42235006110, `python-ci / test`),
+        on a test whose own inputs are literals.
+
+    ⛔ AND ON THE `== []` CASES IT IS A SILENT FALSE PASS, which is the worse half: with the probe
+    returning `None`, `frozen_subtrees` refuses EVERY candidate, so "never a candidate" holds
+    whatever gate 1 does. The connection gate has its own tests (`test_a_child_holding_an_
+    established_connection_is_never_a_candidate`, `..._anywhere_in_the_subtree_...`) and they stub
+    this function explicitly; `test_the_connection_probe_still_licenses_a_reap` deliberately does
+    NOT, and reaches the REAL probe through a `subprocess.run` stub — that polarity stays.
+    """
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+
+
+def test_a_working_child_is_never_a_candidate(W, monkeypatch):
     """The one true positive this must never produce: a child doing work."""
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=5.0)}
     b = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=12.5)}
     assert W.frozen_subtrees(a, b) == [], "a child that burned 7.5s of CPU is WORKING"
 
 
-def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W):
+def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W, monkeypatch):
     """⛔ THE SUBTREE, NOT THE PROCESS. A `pi` wrapper sits at ~0 CPU while its own bash child does
     the work -- judging the process alone would reap a subtree that is demonstrably busy. Measured
     shape 2026-10-12: Drain's pi at `S+`, +7.70 CPU-s/25s, driving a `curl -sS --http1.1 -m 25`."""
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
          301: T(300, cpu=1.0, cmd="curl -sS --http1.1 -m 25 ...")}
     b = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
@@ -140,8 +175,9 @@ def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W):
     assert W.frozen_subtrees(a, b) == [], "the grandchild is working -- nothing here is frozen"
 
 
-def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W):
+def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W, monkeypatch):
     """The real positive: three children of the orchestrator, `Ss`, dCPU exactly 0, no transcript."""
+    parked(W, monkeypatch)
     a = {**BASE, 1727: T(100, cpu=50.0), 36186: T(1727, cpu=9.69), 36189: T(1727, cpu=8.10)}
     b = {**BASE, 1727: T(100, cpu=50.7), 36186: T(1727, cpu=9.69), 36189: T(1727, cpu=8.10)}
     got = W.frozen_subtrees(a, b)
@@ -150,22 +186,24 @@ def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W):
         assert c["ppid"] == 1727 and c["d_cpu"] == 0.0
 
 
-def test_a_lane_own_pi_is_never_a_candidate(W):
+def test_a_lane_own_pi_is_never_a_candidate(W, monkeypatch):
     """⛔ IT REAPS THE CHILD, NEVER THE LANE. The lane's pi holds the conversation and its context;
     the frozen offspring hold nothing. Killing the parent destroys the work we are trying to save."""
+    parked(W, monkeypatch)
     a = {**BASE, 1727: T(100, cpu=50.0)}
     b = {**BASE, 1727: T(100, cpu=50.0)}
     assert W.frozen_subtrees(a, b) == [], "the lane's own pi must never be a candidate"
 
 
-def test_a_bash_child_is_not_a_candidate(W):
+def test_a_bash_child_is_not_a_candidate(W, monkeypatch):
     """Only dispatched `pi` offspring. A parked `bash` wrapper is not a stuck dispatch."""
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0, cmd="/bin/bash -c x")}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0, cmd="/bin/bash -c x")}
     assert W.frozen_subtrees(a, b) == []
 
 
-def test_a_live_tool_call_under_the_child_is_never_a_candidate(W):
+def test_a_live_tool_call_under_the_child_is_never_a_candidate(W, monkeypatch):
     """⛔ THE P0 REVIEW 2 KILLED. The first attempt at this rule rejected children with a SHELL
     descendant -- which does not survive contact with bash: bash `exec`s a SINGLE SIMPLE COMMAND, so
     `bash -c "gh run watch 123"` leaves NO shell in the tree and the poller IS the descendant. All
@@ -180,6 +218,7 @@ def test_a_live_tool_call_under_the_child_is_never_a_candidate(W):
     and by the reviewer: a tool shell exec'd into its command.
     """
     # bash exec'd into the poller: NO shell survives, exactly as bash behaves
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
          400: T(300, cpu=0.5, cmd="sleep 1800")}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
@@ -234,10 +273,11 @@ def test_is_pi_does_not_match_an_argument_named_pi(W):
     assert W.is_pi(T(1, cmd="/bin/bash -c x")) is False
 
 
-def test_the_cpu_tolerance_is_stated_and_tiny(W):
+def test_the_cpu_tolerance_is_stated_and_tiny(W, monkeypatch):
     """The tolerance must be a NAMED constant, because a sub-0.1s twitch has the same signature
     from a parked fork child, a human's prompt redraw, and a timer wake."""
     assert 0 < W.CPU_TOL <= 0.5
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0 + W.CPU_TOL * 2)}
     assert W.frozen_subtrees(a, b) == [], "above the tolerance is not frozen"
@@ -479,7 +519,7 @@ def test_a_victim_that_no_longer_exists_is_not_signalled(W, monkeypatch):
     assert killed == [] and res["abstained"][0]["reason"].startswith("absent")
 
 
-def test_the_measured_incarnation_is_attached_to_the_candidate(W):
+def test_the_measured_incarnation_is_attached_to_the_candidate(W, monkeypatch):
     """The fence can only check the incarnation the candidate CARRIES, and it must come from the
     SAME snapshot that judged the subtree parked: a later read would record the REPLACEMENT's start,
     so a recycled pid would answer `holder` and be signalled. Remove the attach and every victim
@@ -487,6 +527,7 @@ def test_the_measured_incarnation_is_attached_to_the_candidate(W):
     table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
     table[300]["start"] = 1111.0
     table[301]["start"] = 2222.0
+    parked(W, monkeypatch)
     cands = W.frozen_subtrees(dict(table), dict(table))
     assert cands and cands[0]["starts"] == {300: 1111.0, 301: 2222.0}
 
