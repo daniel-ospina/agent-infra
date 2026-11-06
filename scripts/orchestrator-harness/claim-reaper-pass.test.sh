@@ -97,7 +97,10 @@ runpass() {
 SUM0='[claim-reaper] listed=4 releasable=0 released=0 held=3 unresolved=0 gone=1 mode=dry-run min_age=10800s max=3 state=/state'
 SUM2='[claim-reaper] listed=4 releasable=2 released=0 held=1 unresolved=0 gone=1 mode=dry-run min_age=10800s max=3 state=/state'
 SUMR2='[claim-reaper] listed=4 releasable=2 released=2 held=1 unresolved=0 gone=1 mode=release min_age=10800s max=3 state=/state'
-SUMBOUND='[claim-reaper] listed=9 releasable=5 released=3 held=1 unresolved=0 gone=3 mode=release min_age=10800s max=3 state=/state'
+SUMBOUND='[claim-reaper] listed=9 releasable=5 released=3 held=1 unresolved=0 gone=3 mode=release min_age=10800s max=3 state=/state
+[claim-reaper] bound reached (--max 3): 2 RELEASABLE claim(s) were left for the next pass'
+SUMREFUSED='[claim-reaper] listed=4 releasable=2 released=1 held=0 unresolved=0 gone=1 mode=release min_age=10800s max=3 state=/state
+[claim-reaper]   -> RELEASABLE but the fenced delete was REFUSED (the ref moved: aaa -> bbb) — another box has it now'
 SUMOVER='[claim-reaper] listed=9 releasable=1 released=3 held=1 unresolved=0 gone=3 mode=release min_age=10800s max=3 state=/state'
 ARM_OK()   { printf 'armed-by=tester\narmed-date=2026-11-06T00:00:00Z\nreason=suite\n' > "$WS/o/state/claim-reaper.armed"; }
 ARM_HALF() { printf 'armed-by=tester\n' > "$WS/o/state/claim-reaper.armed"; }
@@ -169,12 +172,14 @@ case_6() { # an absent tool is a NAMED cannot-verify (run from the sibling-less 
     ck "6 no reaper anywhere ⇒ exit 3" "3" "$RC"
     ckg "6 the refusal NAMES what it could not find" "no claim reaper on this box" "$(cat "$WS/out6")"
     ckg "6 and the record is not a green one" "verdict=CANNOT-VERIFY" "$REC"
+    ckg "6 and the health surface is told" "no claim reaper could be resolved" "$(cat "$WS/o/state/.claim-reap-blocked" 2>/dev/null)"
 }
 
 case_7() { # no summary ⇒ cannot-verify, not zero
     runpass FAKE_SUMMARY=""
     ck "7 no summary line ⇒ exit 3" "3" "$RC"
     ckg "7 the record says cannot-verify" "verdict=CANNOT-VERIFY" "$REC"
+    ckg "7 and the health surface is told" "CANNOT-VERIFY" "$BLOCKED"
 }
 
 case_8() { # asked to release, but the tool reports it ran dry
@@ -182,6 +187,7 @@ case_8() { # asked to release, but the tool reports it ran dry
     runpass FAKE_SUMMARY="$SUM2"
     ck "8 mode mismatch ⇒ exit 3" "3" "$RC"
     ckg "8 the refusal NAMES both modes" "asked the tool for mode=release and it reported mode=dry-run" "$OUT"
+    ckg "8 and the health surface is told" "did not reach it" "$BLOCKED"
     rm -f "$WS/o/state/claim-reaper.armed"
 }
 
@@ -201,8 +207,34 @@ case_10() { # the per-repo registry is passed through
 case_11() { # a CANNOT-VERIFY pass leaves an advisory (the ⛔ line the supervisor prints)
     runpass FAKE_SUMMARY=""            # the unreadable-registry shape: claim-reaper exits 2 with no summary
     ck "11 an unreadable answer ⇒ exit 3" "3" "$RC"
-    ckg "11 and the health surface is told" "CANNOT-VERIFY" "$BLOCKED"
+    ckg "11 and the health surface is told" "NOTHING is known about this box" "$BLOCKED"
     ckng "11 the advisory never claims the registry is empty" "nothing releasable" "$BLOCKED"
+}
+
+case_14() { # an unreadable releasable= count is CANNOT-VERIFY, and says so where it is read
+    runpass FAKE_SUMMARY='[claim-reaper] listed=2 releasable=z released=0 held=1 unresolved=0 gone=0 mode=dry-run min_age=10800s max=3 state=/state'
+    ck "14 an unparseable releasable count ⇒ exit 3" "3" "$RC"
+    ckg "14 the record says cannot-verify" "verdict=CANNOT-VERIFY" "$REC"
+    ckg "14 the advisory names the missing count" "no readable releasable=" "$BLOCKED"
+}
+
+case_15() { # an unreadable released= count is CANNOT-VERIFY too
+    ARM_OK
+    runpass FAKE_SUMMARY='[claim-reaper] listed=2 releasable=1 released=x held=1 unresolved=0 gone=0 mode=release min_age=10800s max=3 state=/state'
+    ck "15 an unparseable released count ⇒ exit 3" "3" "$RC"
+    ckg "15 the advisory names the missing count" "no readable released=" "$BLOCKED"
+    rm -f "$WS/o/state/claim-reaper.armed"
+}
+
+case_16() { # a REFUSED fenced delete is NOT a bound problem, and the advisory must not say it is
+    ARM_OK
+    runpass FAKE_SUMMARY="$SUMREFUSED"
+    ck "16 a refused delete leaves work behind ⇒ exit 4" "4" "$RC"
+    ckg "16 the record does NOT blame the bound" "verdict=RELEASE-INCOMPLETE" "$REC"
+    ckng "16 the record never says BOUND-REACHED" "BOUND-REACHED" "$REC"
+    ckg "16 the advisory forbids the bound remedy" "do not raise CLAIM_REAPER_MAX" "$BLOCKED"
+    ckg "16 the advisory carries the tool's own refusal lines" "REFUSED (the ref moved" "$BLOCKED"
+    rm -f "$WS/o/state/claim-reaper.armed"
 }
 
 case_12() { # an armed pass stopped by its bound is NOT a clean pass
@@ -211,6 +243,7 @@ case_12() { # an armed pass stopped by its bound is NOT a clean pass
     ck "12 the bound stops it ⇒ exit 4" "4" "$RC"
     ckg "12 the record names the bound verdict" "verdict=BOUND-REACHED" "$REC"
     ckg "12 the advisory names how much was left" "released=3 of releasable=5" "$BLOCKED"
+    ckg "12 and names the bound remedy, because the tool DID report the bound" "Raise the bound" "$BLOCKED"
     rm -f "$WS/o/state/claim-reaper.armed"
 }
 
@@ -219,6 +252,7 @@ case_13() { # an incoherent summary is not a clean pass either
     runpass FAKE_SUMMARY="$SUMOVER"
     ck "13 released > releasable ⇒ exit 3" "3" "$RC"
     ckg "13 the record says cannot-verify" "verdict=CANNOT-VERIFY" "$REC"
+    ckg "13 and the health surface is told" "cannot both be true" "$BLOCKED"
     rm -f "$WS/o/state/claim-reaper.armed"
 }
 
@@ -266,7 +300,7 @@ case_bash32() { # the fleet's Macs run /bin/bash 3.2.57 — prove the pass SURVI
 }
 
 run_one() { case "$1" in clock) case_clock ;; bash32) case_bash32 ;; *) "case_$1" ;; esac; }
-run_all() { local c; for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 clock bash32; do printf '── case %s ──\n' "$c"; run_one "$c"; done; }
+run_all() { local c; for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 clock bash32; do printf '── case %s ──\n' "$c"; run_one "$c"; done; }
 
 # ── mutation matrix: disable ONE gate in a copy, require the owning case to go RED ──────────────
 MUTPASS=0
@@ -320,14 +354,42 @@ mutate_cv() {
     # Drop every CANNOT-VERIFY advisory write, keeping the record write that precedes it.
     sed -i.bak '/^        crp_block "CANNOT-VERIFY:/d' "$copy"
     cmp -s "$CRP" "$copy" && { printf '  ❌ mutation advisory-cv: sed changed NOTHING — a vacuous mutation\n'; MUTFAIL=$((MUTFAIL+1)); return; }
-    CRP="$copy"; PASS=0; FAIL=0
-    run_one 11 >"$WS/mut-out" 2>&1
-    out="$(cat "$WS/mut-out" 2>/dev/null)"; CRP="$saved"
-    if [ "$FAIL" -gt 0 ]; then
-        printf '  ✅ mutation %-9s reddens case 11    → %s\n' "advisory-cv" "$(printf '%s' "$out" | grep '❌' | head -1 | cut -c1-110)"
+    # All three CANNOT-VERIFY cases must redden: mutating only one arm and testing only one case is
+    # how a re-silenced advisory ships green (#3481 round-2, P2).
+    local c reddened=0 tried=0
+    CRP="$copy"
+    for c in 11 14 15; do
+        PASS=0; FAIL=0
+        run_one "$c" >"$WS/mut-out" 2>&1
+        tried=$((tried + 1))
+        [ "$FAIL" -gt 0 ] && reddened=$((reddened + 1))
+    done
+    CRP="$saved"; PASS=0; FAIL=0
+    if [ "$reddened" -eq "$tried" ]; then
+        printf '  ✅ mutation %-9s reddens cases 11,14,15 (%s/%s)\n' "advisory-cv" "$reddened" "$tried"
         MUTPASS=$((MUTPASS + 1))
     else
-        printf '  ❌ mutation %-9s left case 11    GREEN — that gate is not load-bearing\n' "advisory-cv"
+        printf '  ❌ mutation %-9s left %s of %s CANNOT-VERIFY cases GREEN — not load-bearing\n' \
+            "advisory-cv" "$((tried - reddened))" "$tried"
+        MUTFAIL=$((MUTFAIL + 1))
+    fi
+}
+
+# mutate_arm_advisory <name> <case> <sed-program> — a per-arm mutation for ONE of the five advisory
+# writes, so each arm is independently proven load-bearing.
+mutate_arm_advisory() {
+    local name="$1" owner="$2" prog="$3" copy="$WS/mut-$1.sh" saved="$CRP" out
+    cp "$CRP" "$copy"
+    sed -i.bak "$prog" "$copy" || { printf '  ❌ mutation %s: sed failed\n' "$name"; MUTFAIL=$((MUTFAIL+1)); return; }
+    cmp -s "$CRP" "$copy" && { printf '  ❌ mutation %s: sed changed NOTHING — a vacuous mutation\n' "$name"; MUTFAIL=$((MUTFAIL+1)); return; }
+    CRP="$copy"; PASS=0; FAIL=0
+    run_one "$owner" >"$WS/mut-out" 2>&1
+    out="$(cat "$WS/mut-out" 2>/dev/null)"; CRP="$saved"
+    if [ "$FAIL" -gt 0 ]; then
+        printf '  ✅ mutation %-9s reddens case %-5s → %s\n' "$name" "$owner" "$(printf '%s' "$out" | grep '❌' | head -1 | cut -c1-110)"
+        MUTPASS=$((MUTPASS + 1))
+    else
+        printf '  ❌ mutation %-9s left case %-5s GREEN — that gate is not load-bearing\n' "$name" "$owner"
         MUTFAIL=$((MUTFAIL + 1))
     fi
     PASS=0; FAIL=0
@@ -347,6 +409,11 @@ run_mutations() {
     mutate_cv
     # bound: an armed pass stopped by --max still reads as a clean release
     mutate bound    12 's/verdict=BOUND-REACHED/verdict=RELEASED/; s/^        return 4$/        return 0/'
+    # refused: a refused fenced delete is misreported as a bound problem
+    mutate refused  16 's/verdict=RELEASE-INCOMPLETE/verdict=BOUND-REACHED/'
+    # per-arm advisories: the no-tool arm and the mode-mismatch arm, each deleted on its own
+    mutate_arm_advisory advisory-notool 6 '/CANNOT-VERIFY: no claim reaper could be resolved/d'
+    mutate_arm_advisory advisory-mode   8 '/the arming decision did not reach it/d'
     # clock: the controller call site loses this repo's registry
     mutate clock    clock 's/CLAIM_REPO="\$REPO" O="\$O" bash "\$_claim_pass"/bash "$_claim_pass"/'
     # bash32: expand the args array bare again — the abort the Macs would hit, invisible on bash 5

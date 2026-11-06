@@ -112,7 +112,15 @@ main() {
     mode="$(crp_mode)"
     [ "$mode" = "release" ] && args+=(--release --max "$CRP_MAX")
     [ -n "$CRP_MIN_AGE" ] && args+=(--min-age "$CRP_MIN_AGE")
-    tmp="$(mktemp "${TMPDIR:-/tmp}/claim-reaper-pass.XXXXXX")" || { err "CANNOT-VERIFY: cannot create a temp file"; return 3; }
+    if ! tmp="$(mktemp "${TMPDIR:-/tmp}/claim-reaper-pass.XXXXXX")"; then
+        # ⛔ EVERY non-zero arm leaves BOTH the record and the ⛔ line (#3481 round-2, P2). This arm
+        # skipped both, so a box whose TMPDIR is unusable looked on every surface like a box whose
+        # pass had simply never run — the silence the advisory exists to remove.
+        err "CANNOT-VERIFY: cannot create a temp file under ${TMPDIR:-/tmp} — the pass could not run at all"
+        crp_record CANNOT-VERIFY "$mode" 3 "" "" ""
+        crp_block "CANNOT-VERIFY: the claim reaper pass could not create a temp file under ${TMPDIR:-/tmp}, so NO claim was examined and nothing was released — this is not an empty registry"
+        return 3
+    fi
     # The registry is PER-REPO (#1996): the controller passes CLAIM_REPO, and claims.sh would
     # otherwise resolve `.` against launchd's unreadable cwd.
     # ⛔ `${args[@]+…}`, NOT `"${args[@]}"`: under `set -u`, bash 3.2 (the fleet's Macs run 3.2.57,
@@ -203,9 +211,23 @@ $(printf '%s\n' "$out" | grep -v '^\[claim-reaper\] listed=' | tail -4)"
             crp_record "$verdict" "$mode" "$rc" "$listed" "$releasable" "$released"
             return 0
         fi
-        verdict=BOUND-REACHED
+        # ⛔ `released < releasable` IS NOT PROOF THAT THE BOUND WAS THE CAUSE (#3481 round-2, P2).
+        # `claim-reaper.sh` also leaves that shape when a FENCED DELETE is REFUSED because the ref
+        # moved — another box has it now (its `REFUSED (the ref moved …)` branch bumps neither
+        # `CR_RELEASED` nor `CR_BOUND_HIT`) — and the tool prints `bound reached` ONLY for the bound
+        # arm. Telling an operator to "raise the bound" when a peer legitimately won the claim names a
+        # remedy that cannot clear it, so the cause is READ from the tool's own output, not inferred.
+        case "$out" in
+            *'[claim-reaper] bound reached '*) verdict=BOUND-REACHED ;;
+            *)                                  verdict=RELEASE-INCOMPLETE ;;
+        esac
         crp_record "$verdict" "$mode" "$rc" "$listed" "$releasable" "$released"
-        crp_block "the claim reaper is ARMED but its per-pass bound (--max $CRP_MAX) stopped it: released=$released of releasable=$releasable, so the remainder is STILL holding dispatch and is only retried next hour. Raise the bound (CLAIM_REAPER_MAX) or let the next pass take them."
+        if [ "$verdict" = "BOUND-REACHED" ]; then
+            crp_block "the claim reaper is ARMED and its per-pass bound (--max $CRP_MAX) stopped it: released=$released of releasable=$releasable, so the remainder is STILL holding dispatch and is only retried next hour. Raise the bound (CLAIM_REAPER_MAX) or let the next pass take them."
+        else
+            crp_block "the claim reaper is ARMED and released only $released of $releasable RELEASABLE claims, and the tool did NOT report its bound as the cause — so the remainder was refused at the fenced delete (usually: another box took the ref while this pass was reading it) or could not be recorded. Those claims are still holding dispatch for the next pass. THIS IS NOT A BOUND PROBLEM — do not raise CLAIM_REAPER_MAX. The tool's own lines:
+$(printf '%s\n' "$out" | grep -E 'RELEASABLE but|REFUSED|-> ' | tail -4)"
+        fi
         return 4
     fi
 

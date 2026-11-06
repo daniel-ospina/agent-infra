@@ -4079,12 +4079,15 @@ claim-reaper-pass.sh        # what the clock runs: mode from the arming record, 
 ```
 
 Its exit vocabulary is the load-bearing part: `0` nothing releasable (or everything found was
-released), **`4` WORK LEFT BEHIND that policy or the bound stopped** — RELEASABLE claims while
-UNARMED, or an armed pass whose `--max` ran out (`claim-reaper.sh` releases at most `--max` per pass
-and still exits 0, so without this arm a box that released 3 of 20 would erase the ⛔ line while 17
-were still holding dispatch) — `3` CANNOT-VERIFY (no tool resolved, an unreadable summary, or an
-arming decision that provably did not reach the tool), otherwise the tool's exit. **Every non-zero
-arm also writes `state/.claim-reap-blocked`**, which `cloud-cell-supervisor.sh` prints as a ⛔ line —
+released), **`4` WORK LEFT BEHIND that policy, the bound or a refused delete stopped** — RELEASABLE
+claims while UNARMED, an armed pass whose `--max` ran out (`BOUND-REACHED`; the tool releases at most
+`--max` per pass and still exits 0, so without this arm a box that released 3 of 20 would erase the ⛔
+line while 17 still held dispatch), or an armed pass whose fenced deletes were REFUSED because a peer
+took the ref (`RELEASE-INCOMPLETE` — the tool prints `bound reached` ONLY for the bound arm, so the
+cause is read from its output rather than inferred, and the advisory for this one says explicitly
+*do not raise the bound*) — `3` CANNOT-VERIFY (no tool resolved, an unreadable summary, or an
+arming decision that provably did not reach the tool), otherwise the tool's exit — and every non-zero arm, including the `mktemp` failure, also writes
+`state/.claim-reap-blocked`**, which `cloud-cell-supervisor.sh` prints as a ⛔ line —
 so an unarmed box whose stale claims are blocking dispatch does not read like a healthy idle one. An
 unreadable registry takes the `3` arm rather than a failure exit (the tool exits 2 *before* printing
 its summary), which is why `3` writes the advisory too.
