@@ -35,13 +35,17 @@
 #
 # 1. FARMED SCRIPTS — copied from the DECLARED farm set, never from a glob.
 #    `pi-bootstrap/setup.sh` is the single declaration of what the farm carries; this
-#    script PARSES its array declarations — the four it declares today (`fleet_srcs`,
-#    `lib_srcs`, `fleet_tools`, `merge_gate_srcs`) PLUS the two #1552/#1553 adds
-#    (`lane_root_srcs`, `lane_srcs`), so the mapping is already complete when that lands —
-#    plus its `scripts_dir` checkout-hygiene farm, and copies exactly those, preserving the
+#    script PARSES its array declarations and lays each one out per `FARM_LAYOUT` below —
+#    today `fleet_srcs`, `merge_gate_srcs`, `graph_srcs` (#3374: the hosted-graph fallback
+#    has its OWN array; it is NOT also in `fleet_srcs`, because a file declared twice is
+#    copied twice and appears twice in the farm's declared set), `lane_root_srcs`,
+#    `lane_srcs`, `lib_srcs` and `fleet_tools` — plus its `scripts_dir` checkout-hygiene
+#    farm, and copies exactly those, preserving the
 #    relative layout setup.sh documents (`scripts/lib/`, `scripts/fleet/`). A farm array
 #    this script does not know how to lay out is a LOUD failure, never a silent skip: an
 #    unparsed farm would leave a cell with a partial layer that still reports success.
+#    ⛔ `FARM_LAYOUT` IS THE AUTHORITY FOR THAT LIST — this sentence is the prose reading of
+#    it, and it went stale the moment #3374 added a 7th row (#3374 review, round 10 P2).
 #    The parse is the same shape as `scripts/run-bash-shards.sh --list`, which reads its
 #    own shard lines rather than keeping a second copy of them.
 #    NOTE the dest is `scripts/fleet/`, never `tools/fleet/`: pi's startup migration treats
@@ -125,12 +129,29 @@
 #      * `models.json` and `auth.json` are NOT touched. They are the cell's identity and
 #        keys, the measured cell already has them, and the defect table above names only
 #        AGENTS.md / settings.json / .mcp.json as absent.
-#      * `.mcp.json` is deliberately NOT installed. `templates/.mcp.base.json`'s only
-#        NON-lazy server is `tortoise` ("always (core)"), and it resolves
-#        `${TORTOISE_HOME:-$HOME/Documents/GitHub/tortoise}/.venv/bin/python3` — a checkout
-#        and venv a cell does not have. Installing it would make every cell session start
-#        spawn a core server that cannot exist. `mcp-client/` IS installed, so a cell may
-#        add its own `.mcp.json`; the dispatch→review→merge cycle needs no MCP surface.
+#      * `.mcp.json` IS installed (graph-mcp-provision), from `templates/.mcp.base.json`,
+#        MERGED so a cell-local server survives. It was deliberately NOT installed while that
+#        template's only non-lazy server was `tortoise` **stdio** — it resolved
+#        `${TORTOISE_HOME:-$HOME/Documents/GitHub/tortoise}/.venv/bin/python3`, a checkout and
+#        venv a cell does not have, so installing it would have made every cell session start
+#        spawn a core server that could not exist. The template now declares the HOSTED http
+#        entry (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_MCP_API_KEY}`, lazy), which
+#        needs neither — and the old skip cost more than it saved: every lane on a cell ran
+#        with ZERO MCP servers and wrote `GRAPH-UNREACHABLE` into its report, so the owner's
+#        "every lane reads and writes the graph through the MCP" mandate was UNOBEYABLE on a
+#        cell rather than disobeyed (measured 2026-11-03: cell-3 and cell-4 had no `.mcp.json`,
+#        no key, and no fallback script). Credentials stay OUT of this file by construction:
+#        the header is env-indirect, and `--verify` FAILS if a literal `tt_`/`tk_` value ever
+#        appears in it. The credential itself is operator-pushed into `~/keys.env` (0600) —
+#        `cloud-cell-bringup.sh` documents keys.env as "operator-pushed, and NOT a bring-up
+#        byproduct" — so `--verify` WARNS (it never fails) on a cell whose `TORTOISE_MCP_API_KEY`
+#        does not resolve to something a server would accept, because a config with an unresolved
+#        `${VAR}` sends `Bearer ` (empty) and the server answers 401; that failure reads as
+#        an auth problem rather than the set-up gap it is (#5153). ⛔ WARN, not fail, on purpose: the
+#        key is operator state, so refusing to certify an otherwise-complete LAYER over a key nobody
+#        pushed is a false block — the one thing that teaches an operator to ignore the verifier.
+#        Exit 0 with an unmissable `⚠️  graph credential: NOT resolvable` line (and the same state in
+#        the `LAYER VERIFIED` verdict line) instead. Only a LITERAL credential in the file FAILS.
 #
 # 4. ⛔ NOTHING is written under `~/.pi/agent/tools/` except pi's own fd/rg. See the #1277
 #    note above; this script installs nothing there, removes a legacy `tools/fleet/` if it
@@ -197,6 +218,1100 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; FAILURES=$((FAILURES + 1)); }
 die()  { printf 'FATAL: %s\n' "$*" >&2; exit 1; }
 log_line()  { printf '  %s\n' "$*"; }
 
+# ── the hosted-graph credential (graph-mcp-provision) ────────────────────────
+# `.mcp.json`'s tortoise header is `Bearer ${TORTOISE_MCP_API_KEY}`. A plain `${VAR}` expands to the
+# EMPTY STRING when unset, so an unprovisioned cell reaches the server, sends `Bearer ` and gets
+# a 401 that reads as an auth failure rather than the set-up gap it is (#5153). The credential is
+# OPERATOR state (cloud-cell-bringup.sh: keys.env is "operator-pushed, and NOT a bring-up
+# byproduct"), so its absence is a WARNING with an exact remedy — never a certification failure,
+# which would refuse to certify a working layer over a key nobody pushed yet.
+graph_key_from_env_file() { # <file> [<variable>] -> its value
+  local f="$1" v="${2:-TORTOISE_MCP_API_KEY}"
+  [ -f "$f" ] || return 1
+  # ⛔ SOURCING A FILE IS CODE EXECUTION, SO THE FILE MUST BELONG TO THE USER RUNNING THIS. One
+  # candidate is `$CELL_HOME/keys.env`, and `CELL_HOME` defaults to `/tmp/cell-home` — a path under
+  # a WORLD-WRITABLE parent. Without this gate an unprivileged local user could plant that file and
+  # get arbitrary shell run as whoever provisions the cell (root, on a fresh box), from a script
+  # whose every comment says the file is operator-pushed and mode 600. `-O` is the portable owner
+  # test (bash 3.2/macOS: `stat -c` does not exist there); the mode test refuses anything group- or
+  # other-writable. A refused file is NOT a credential source — it is reported, and never sourced.
+  if [ ! -O "$f" ] || ! _no_group_world_write "$f"; then
+    printf '  ⚠️  %s is NOT a credential source: it is not owned by this user, or it is group/other-writable — refusing to source it\n' "$f" >&2
+    return 1
+  fi
+  # Resolve the way the LANE does — source it in a subshell (set -a) — because a box provisioning
+  # the LEGACY name spells it as an alias `export TORTOISE_MCP_API_KEY="$TORTOISE_API_KEY"`, which
+  # a line-parser reads as the literal string `$TORTOISE_API_KEY` and then reports as a malformed
+  # key. The subshell discards every other assignment it makes.
+  KEYFILE="$f" KEYVAR="$v" bash -c 'set -a; . "$KEYFILE" >/dev/null 2>&1; set +a; printf "%s" "${!KEYVAR:-}"' 2>/dev/null
+}
+
+# True when <file> has no WRITE bit for group or other. GNU `stat -c %a` first, BSD/macOS
+# `stat -f %Lp` second — the repo's tests run on both — and "cannot determine" is a REFUSAL (the
+# caller treats a non-zero return as 'not a credential source'), never an assumed "fine".
+# ⛔ `-L`: the TARGET's mode is the one that matters (a symlinked `~/keys.env` → dotfiles is a
+# legitimate setup), and `stat` without it reports the LINK's 0777 — which refused a perfectly safe
+# file and told the operator it was group-writable when it was not. `-O` in the caller already
+# follows, so the gate follows too rather than inventing a different notion of "the file".
+_no_group_world_write() {
+  local m go
+  m="$(stat -L -c '%a' "$1" 2>/dev/null || stat -L -f '%Lp' "$1" 2>/dev/null)" || return 1
+  [ -n "$m" ] || return 1
+  go="$(printf '%s' "$m" | sed 's/.*\(..\)$/\1/')"    # the last two digits: group, other
+  case "$go" in *[2367]*) return 1 ;; esac             # 2/3/6/7 all carry the write bit
+  return 0
+}
+
+# ⛔ RESOLVE THE VARIABLE THE ARTIFACT NAMES, NOT A FAMILY OF NAMES. The installed entry expands
+# exactly ONE variable (`Authorization: Bearer ${TORTOISE_MCP_API_KEY}`), and pi's mcp-client resolves
+# `process.env[NAME]` VERBATIM — there is no alias mapping anywhere in it. So a resolver that
+# also accepted the LEGACY alias `TORTOISE_API_KEY` as a substitute certified "the hosted MCP will
+# authenticate" on a box whose entry expands `${TORTOISE_MCP_API_KEY}` to the EMPTY STRING: it
+# printed the exact OPPOSITE of what the artifact does. The alias is a REMEDY (the #5153 line
+# `export TORTOISE_MCP_API_KEY="$TORTOISE_API_KEY"`), never a substitute for the standard name.
+# graph_mcp_var — the one variable the INSTALLED **tortoise** entry expands, or empty when that entry
+# declares no Authorization at all.
+#
+# ⛔ IT MUST READ THE TORTOISE ENTRY, NOT THE FILE. Two whole-file reads were both wrong, silently:
+#   * the first `${…}` in the file is `${TORTOISE_HOME}` inside `_comment` — a variable that is never
+#     a key, so a correctly provisioned box reported UNRESOLVED;
+#   * the first `"Authorization"` in the file is ANY server's header — a cell may declare its own
+#     servers (`merge-mcp.py` preserves them on purpose), so an `acme` entry ahead of `tortoise`
+#     made `LAYER VERIFIED` say "will authenticate" about a VARIABLE THE TORTOISE ENTRY DOES NOT
+#     EXPAND, while the tortoise entry expanded an unset one and the lane got a 401. A verdict that
+#     describes a different server than the one it certifies is the false green this PR exists to
+#     close.
+# An EMPTY result is meaningful, not a fallback: the documented self-host entry
+# (`{"url":"http://localhost:8000/mcp"}`) declares no header, and a local daemon needs no key — so
+# there is nothing to resolve and nothing may be reported as missing.
+# ⛔ THE MARKERS ARE A FOURTH QUESTION, and collapsing them into "empty" was a lie in the run log:
+#   NOENTRY — no readable `.mcp.json`/`tortoise` entry at all (missing template, missing lib, no
+#             python3, a merge that failed). The caller used to render that as "the tortoise entry
+#             declares no Authorization — a self-hosted daemon needs none", a sentence asserting the
+#             existence of an entry that is not there.
+#   LITERAL — an `Authorization` that is NOT env-indirect: a credential written into the shared file,
+#             which `--verify` refuses (LITERAL_AUTH). It is not "no authorization" either.
+#   BADSHAPE — the entry EXISTS and the file reads fine, but its SHAPE is one `--verify` refuses: a
+#             non-string `Authorization` (BADAUTH:int), a `headers` value that is not an object
+#             (BADDERS:str/list/…). The marker carries the name the VERIFIER prints, so the two
+#             renderers cannot contradict each other about the same file. Reporting these as NOENTRY
+#             ("there is no readable tortoise entry") was the mirror of the bug above: it told an
+#             operator that a perfectly healthy `.mcp.json` could not be read, and pointed at
+#             recreating the file instead of at the line that is wrong (#3374 review, rounds 8-10).
+#             The carried name is the resolver's OWN finding (headers/Authorization only) — `--verify`
+#             may name an EARLIER rung of its own precedence (SECRET_IN_FILE, STDIO, …), which is why
+#             the note says "the shape it names" rather than promising a specific marker.
+# Only a real entry with no `Authorization` key at all is the self-host shape.
+graph_mcp_var() {
+  [ -f "$DEST/.mcp.json" ] || { printf 'NOENTRY'; return 0; }
+  # no python3 means this file cannot be READ — "UNKNOWN", never "needs no key"
+  command -v python3 >/dev/null 2>&1 || { printf 'NOENTRY'; return 0; }
+  python3 -c '
+import json, sys
+# ⛔ READ vs SHAPE ARE TWO QUESTIONS, AND EACH SHAPE ERROR MUST CARRY THE MARKER `--verify` USES
+# (#3374 review, round 9). The previous pass gave a non-string Authorization its own state but left
+# its SIBLINGS borrowing one: `"headers": "Bearer …"` fell through to NOENTRY ("there is no readable
+# tortoise entry" about a file that reads perfectly, while --verify said BADDERS:str), and a
+# whitespace-only Authorization fell through to NOAUTH ("this entry declares no Authorization" about
+# an entry that declares one, while --verify said LITERAL_AUTH). The two renderers contradicted each
+# other about the SAME file — the exact class this marker set exists to close, one line over. So a
+# shape error now prints `BADSHAPE:<the marker verify will print>`, and the note quotes it.
+try:
+    with open(sys.argv[1], encoding="utf-8") as _f:
+        entry = json.load(_f)["mcpServers"]["tortoise"]
+except Exception:
+    print("NOENTRY")           # the FILE or the entry cannot be READ at all — never "needs no key"
+    sys.exit(0)
+if not isinstance(entry, dict):
+    print("NOENTRY")           # same marker the verifier prints for this shape: the two agree
+    sys.exit(0)
+headers = entry.get("headers")
+if headers is not None and not isinstance(headers, dict):
+    print("BADSHAPE:BADDERS:%s" % type(headers).__name__)
+    sys.exit(0)
+auth = ((headers or {}).get("Authorization") or "")
+if not isinstance(auth, str):
+    print("BADSHAPE:BADAUTH:%s" % type(auth).__name__)
+    sys.exit(0)
+if not auth:
+    sys.exit(0)                 # no Authorization AT ALL: the documented self-host shape
+if "${" not in auth:
+    # present but not env-indirect — INCLUDING whitespace-only, which is truthy: --verify refuses
+    # it (LITERAL_AUTH), so it must not be reported as "needs no key".
+    print("LITERAL")
+    sys.exit(0)
+name = auth.split("${", 1)[1].split("}", 1)[0].split(":-", 1)[0]
+print(name)
+' "$DEST/.mcp.json" 2>/dev/null
+}
+
+# ⛔ THE SECRET MUST NOT OUTLIVE THE READ (#3374 review, round 14 P1 — round 13's own fix was
+# INCOMPLETE, and its arm could not see that). `set -x` prints the SUBSTITUTED VALUE not only of the
+# assignment that reads the key but of EVERY expansion of it afterwards: `+ '[' -n tt_… ']'`,
+# `+ GRAPH_KEY=tt_…`, `+ case tt_… in`, `+ local key=tt_…`. Round 13 guarded only the file-read
+# substitution, so a `bash -x` bring-up STILL printed the tenant key — measured with the real
+# `graph_key_resolve` under `bash -x`, twice, two lines below the new `set -x` restore — and the
+# environment path (`printenv`) was never guarded at all, nor were the two renderings. Patching each
+# sink with its own `set +x` is a rule every future edit has to remember; a sink that is never
+# CREATED cannot be forgotten. So the value is read once, inside one guarded region, and immediately
+# reduced to what the rest of this file actually uses — presence, the `tt_`/`tk_` shape, and the
+# LENGTH (the note prints the length, never the key). No variable that holds the secret survives the
+# call, so there is nothing left for any later trace, log line, or error path to expand.
+# The caller sees only `GRAPH_KEY_SET`/`GRAPH_KEY_SHAPED`/`GRAPH_KEY_LEN`; the exit status is "we got
+# one". The xtrace state is preserved, because a caller debugging this layer depends on it.
+_graph_key_read() { # <env|file> <path-or-empty> <variable> -> SET/SHAPED/LEN; rc=0 when non-empty
+  local src="$1" path="$2" var="$3" _xt=0 raw="" shaped=0 got=0
+  case $- in *x*) _xt=1 ;; esac
+  set +x
+  if [ "$src" = env ]; then
+    raw="$(printenv "$var" 2>/dev/null || true)"
+  else
+    raw="$(graph_key_from_env_file "$path" "$var")"
+  fi
+  GRAPH_KEY_LEN=${#raw}
+  case "$raw" in tt_*|tk_*) shaped=1 ;; esac
+  if [ "$GRAPH_KEY_LEN" -gt 0 ]; then got=1; fi
+  GRAPH_KEY_SET="$got"
+  GRAPH_KEY_SHAPED="$shaped"
+  unset raw
+  if [ "$_xt" = 1 ]; then set -x; fi
+  [ "$GRAPH_KEY_SET" = 1 ]
+}
+
+# ⛔ "IS A KEY PRESENT AT ALL?" MUST NOT EXPAND ONE EITHER (#3374 review, round 15 P1 — the same class
+# as `_graph_key_read`, in the one place it was left). `graph_credential_note`'s legacy-alias hint read
+# the ALIAS through `[ -n "${TORTOISE_API_KEY:-}" ]` and `[ -n "$(graph_key_from_env_file …)" ]`, and
+# `set -x` traces both with the VALUE — measured: `+ '[' -n tt_… ']'` for a box whose primary name is
+# unset and whose legacy alias is set, which is EXACTLY the population the hint exists for. It prints
+# nothing and sets nothing: callers ask it a yes/no question in a `||` chain, so a boolean of the
+# secret never reaches a variable that a later line could expand.
+_graph_key_present() { # <env|file> <path-or-empty> <variable> -> rc=0 when a non-empty key resolves
+  local src="$1" path="$2" var="$3" _xt=0 raw="" got=0
+  case $- in *x*) _xt=1 ;; esac
+  set +x
+  if [ "$src" = env ]; then
+    # indirect expansion, not `printenv`: the original test was `${TORTOISE_API_KEY:-}` and it must
+    # keep matching a shell variable that was set without being exported.
+    raw="${!var:-}"
+  else
+    raw="$(graph_key_from_env_file "$path" "$var")"
+  fi
+  if [ -n "$raw" ]; then got=1; fi
+  unset raw
+  if [ "$_xt" = 1 ]; then set -x; fi
+  [ "$got" = 1 ]
+}
+
+# ONE resolver, two renderings. `graph_credential_note` prints the long explanation; the
+# `LAYER VERIFIED` line prints the one-word state. Two independent resolutions of the same question
+# is how a cell gets certified "credential: OK" while the note below it says NOT resolvable.
+graph_key_resolve() {
+  GRAPH_VAR="$(graph_mcp_var)"
+  # NOT the key itself — see `_graph_key_read`. Presence, shape and length are all any caller needs.
+  GRAPH_KEY_SET=0
+  GRAPH_KEY_SHAPED=0
+  GRAPH_KEY_LEN=0
+  GRAPH_KEY_SRC="the environment"
+  GRAPH_NOAUTH=0
+  GRAPH_NOENTRY=0
+  GRAPH_LITERAL=0
+  GRAPH_BADSHAPE=0
+  GRAPH_BADSHAPE_WHY=""
+  case "$GRAPH_VAR" in
+    NOENTRY)
+      # no readable tortoise entry at all — a DIFFERENT state from "an entry that needs no key",
+      # and reporting it as the latter asserts an entry that is not there (see graph_mcp_var).
+      GRAPH_NOENTRY=1
+      GRAPH_VAR=""
+      return 0 ;;
+    BADSHAPE*)
+      # the entry READS, but its shape is one --verify refuses; the marker it will print travels with
+      # the state so the note quotes the same name. NOT a missing entry, and NOT "needs no key".
+      GRAPH_BADSHAPE=1
+      GRAPH_BADSHAPE_WHY="${GRAPH_VAR#BADSHAPE:}"
+      GRAPH_VAR=""
+      return 0 ;;
+    LITERAL)
+      # an Authorization that is not env-indirect: a credential in the shared file, refused by
+      # --verify (LITERAL_AUTH) — also NOT "needs no key"
+      GRAPH_LITERAL=1
+      GRAPH_VAR=""
+      return 0 ;;
+  esac
+  if [ -z "$GRAPH_VAR" ]; then
+    # the tortoise entry declares no env-indirect Authorization: a self-hosted daemon needs none
+    GRAPH_NOAUTH=1
+    return 0
+  fi
+  if _graph_key_read env "" "$GRAPH_VAR"; then
+    GRAPH_KEY_SRC="the environment ($GRAPH_VAR)"
+    return 0
+  fi
+  # HOME first: that is the home a live lane on a cell actually runs in (measured on cell-3
+  # and cell-4: HOME=/home/cmux), and the launcher sources $HOME/keys.env. CELL_HOME follows
+  # because it is where THIS script installs, and on some images the two differ.
+  local f base
+  # ⛔ `${HOME:-}`, NOT `$HOME`. This function runs under `set -uo pipefail` (line 209), so a
+  # HOME-less context — systemd/launchd units, `sudo -u`, `env -i`, a CI step — aborted the WHOLE
+  # verifier here with `HOME: unbound variable`, skipping `guard_tools_dir`, `guard_spawn_gate`,
+  # `guard_gh_shim` and the `LAYER VERIFIED` verdict: a correctly-installed cell could not be
+  # certified, and the abort lands AFTER `.mcp.json verify: OK` so the log looks like a graph
+  # problem. `${CELL_HOME:-}` too — it is assigned from `${CELL_HOME:-$HOME}` elsewhere, but this
+  # loop must not depend on that.
+  # ⛔ AN EMPTY BASE YIELDS NO CANDIDATE AT ALL (#3374 review P3). The loop used to be
+  # `for f in "${HOME:-}/keys.env" "${CELL_HOME:-}/keys.env"` with `[ "$f" != "keys.env" ] || continue`
+  # beside it — a clause that can NEVER fire (both candidates are absolute), while the state it was
+  # written for (an unset base) produced `/keys.env`, which WAS stat'd. Iterate the BASES and skip the
+  # empty one: no candidate, nothing stat'd, and no dead condition in a security-relevant loop.
+  for base in "${HOME:-}" "${CELL_HOME:-}"; do
+    [ -n "$base" ] || continue
+    f="$base/keys.env"
+    [ -f "$f" ] || continue
+    # ⛔ THE READ IS GUARDED INSIDE `_graph_key_read`, NOT HERE (#3374 review, round 14 P1). Round 13
+    # scoped `set +x` to this substitution and left the `[ -n "$val" ]` test and the `GRAPH_KEY="$val"`
+    # assignment below it traced — measured: the key printed twice, with the suite green, because the
+    # arm asserted the guard on a COPY of it. Nothing secret is assigned, tested or expanded here now.
+    _graph_key_read file "$f" "$GRAPH_VAR"
+    GRAPH_KEY_SRC="$f ($GRAPH_VAR)"
+    if [ "$GRAPH_KEY_SET" = 1 ]; then break; fi
+  done
+  return 0
+}
+
+# The state as it belongs in a certification line — a cell is never reported VERIFIED without it.
+graph_credential_state() {
+  graph_key_resolve
+  if [ "$GRAPH_NOENTRY" -eq 1 ]; then
+    printf 'UNKNOWN — no readable tortoise entry at %s/.mcp.json to resolve (the failure above says why)' "$DEST"
+    return 0
+  fi
+  if [ "$GRAPH_LITERAL" -eq 1 ]; then
+    printf 'LITERAL — the tortoise entry carries a NON-ENV-INDIRECT Authorization (no ${…} to expand; a literal token, or a whitespace-only one), which --verify refuses (LITERAL_AUTH)'
+    return 0
+  fi
+  if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
+    printf 'UNKNOWN — the tortoise entry is malformed (%s), so there is no variable to resolve; --verify refuses it by the shape it names' "${GRAPH_BADSHAPE_WHY:-shape}"
+    return 0
+  fi
+  if [ "$GRAPH_NOAUTH" -eq 1 ]; then
+    printf 'none required — the tortoise entry declares no Authorization (self-hosted daemon)'
+    return 0
+  fi
+  # ⛔ A `case "$key" in tt_*…` HERE WOULD PRINT THE KEY UNDER `bash -x` (#3374 review, round 14 P1):
+  # the dispatcher traces the word it matches. The shape was decided inside the guarded read, so the
+  # renderings only ever touch FLAGS that cannot contain the secret.
+  if [ "$GRAPH_KEY_SET" = 0 ]; then
+    printf 'UNRESOLVED — the entry expands ${%s}, so the tortoise MCP sends an empty Bearer and the server answers 401' "$GRAPH_VAR"
+  elif [ "$GRAPH_KEY_SHAPED" = 1 ]; then
+    printf 'resolves from %s' "$GRAPH_KEY_SRC"
+  else
+    printf 'resolves from %s but is not tt_/tk_-shaped (401 likely)' "$GRAPH_KEY_SRC"
+  fi
+}
+
+graph_credential_note() {
+  graph_key_resolve
+  local src="$GRAPH_KEY_SRC" _legacy=0
+  if [ "$GRAPH_NOENTRY" -eq 1 ]; then
+    log_line "⚠️  graph credential: UNKNOWN — there is no readable tortoise entry at $DEST/.mcp.json, so there is no credential to resolve (the failure above names the reason). ⛔ A MISSING entry is not a self-host and must not be reported as one"
+    return 0
+  fi
+  if [ "$GRAPH_LITERAL" -eq 1 ]; then
+    log_line "⚠️  graph credential: the tortoise entry's Authorization is not env-indirect (no \${…} to expand) — nothing can be resolved from it, and --verify REFUSES this file (LITERAL_AUTH); write it as \"Bearer \${TORTOISE_MCP_API_KEY}\" and put the key in \$HOME/keys.env (mode 600)"
+    return 0
+  fi
+  if [ "$GRAPH_BADSHAPE" -eq 1 ]; then
+    # ⛔ NO PROMISE ABOUT THE REPAIR (#3374 review, round 10). "--install replaces the entry" is FALSE on
+    # the only path this note prints on: it is reached on --install when the MERGE FAILED (rc!=0, file
+    # unchanged), so the entry is still malformed precisely BECAUSE nothing could replace it. Say what
+    # is true — verify refuses it, by the shape it names.
+    log_line "⚠️  graph credential: UNKNOWN — the tortoise entry is malformed (${GRAPH_BADSHAPE_WHY:-shape}), so there is no variable to resolve; --verify REFUSES this file by the shape it names (which may be an earlier check than this one). The provenance line above says whether the merge wrote the entry or left it as it found it"
+    return 0
+  fi
+  if [ "$GRAPH_NOAUTH" -eq 1 ]; then
+    log_line "graph credential: the tortoise entry declares no Authorization — a self-hosted daemon needs none, so there is nothing to resolve"
+    return 0
+  fi
+  # ⛔ NEVER `case "$key"`: the dispatcher traces the word it matches (#3374 review, round 14 P1).
+  # The length is printed, not the key.
+  if [ "$GRAPH_KEY_SET" = 0 ]; then
+      log_line "⚠️  graph credential: NOT resolvable — the tortoise MCP entry expands \${$GRAPH_VAR} to the EMPTY"
+      log_line "    string, the server answers 401 'invalid or missing Bearer token', and every lane writes"
+      log_line "    GRAPH-UNREACHABLE. Remedy: put the hosted key in $CELL_HOME/keys.env (mode 600) as"
+      log_line "    $GRAPH_VAR, or alias the name an older box carries: export TORTOISE_MCP_API_KEY=\"\$TORTOISE_API_KEY\" (#5153)."
+      # `if/elif`, not a `{ …; } || { …; }` chain: `}` followed by `; then` is a syntax error (measured),
+      # and the chain read worse than the thing it replaced.
+      _legacy=0
+      if [ "$GRAPH_VAR" = "TORTOISE_MCP_API_KEY" ]; then
+        if _graph_key_present env "" TORTOISE_API_KEY; then
+          _legacy=1
+        elif [ -n "${HOME:-}" ] && _graph_key_present file "${HOME}/keys.env" TORTOISE_API_KEY; then
+          _legacy=1
+        elif [ -n "${CELL_HOME:-}" ] && _graph_key_present file "${CELL_HOME}/keys.env" TORTOISE_API_KEY; then
+          _legacy=1
+        fi
+      fi
+      if [ "$_legacy" = 1 ]; then
+        log_line "    ⚠️  the LEGACY name TORTOISE_API_KEY IS set — add the alias line above and it resolves"
+      fi
+  elif [ "$GRAPH_KEY_SHAPED" = 1 ]; then
+      log_line "graph credential: resolves from $src (len $GRAPH_KEY_LEN) — the hosted MCP will authenticate"
+  else
+      log_line "⚠️  graph credential: $GRAPH_VAR in $src does not look like a hosted key (expected tt_/tk_ prefix);"
+      log_line "    the MCP will send whatever it holds and the server may answer 401 (#5153)."
+  fi
+}
+
+# verify_graph_mcp — checks the config this script INSTALLS ($DEST/.mcp.json), on the artifact.
+# ⛔ It does NOT claim to describe what pi resolves: mcp-client takes the FIRST `.mcp.json` found
+# walking up from the lane's cwd (then falls back to $DEST/.mcp.json), so a lane working inside a
+# repo that carries its own `.mcp.json` uses THAT file. This is why the tracked repo configs must
+# carry the hosted entry too — a stale repo-local copy wins over a correctly installed base.
+verify_graph_mcp() {
+  local f="$DEST/.mcp.json"
+  if [ ! -f "$f" ]; then
+    fail ".mcp.json is missing — this cell has ZERO MCP servers, so no lane can read or write the hosted graph (the exact gap graph-mcp-provision closed)"
+    return 1
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    fail ".mcp.json exists but cannot be checked (no python3) — refusing to certify an unread config"
+    return 1
+  fi
+# graph_mcp_marker — the verifier's python, in ITS OWN FUNCTION BODY.
+#
+# ⛔ The heredoc must NOT be lexically inside `$( )`: the bash 3.2 scanner desynchronises and the
+# whole file stops parsing — on the `bash32-parse` CI gate, not on this box's bash 5, where
+# `bash -n` happily passes it (measured: `scripts/check-bash32-parse.sh` reported
+# "line 676: syntax error near unexpected token `('" for a defect on line 352; #2248/#2930).
+# A heredoc in a FUNCTION body called from the substitution parses correctly in both.
+graph_mcp_marker() { # <config.json> <template.json> -> marker on stdout; non-zero = not certifiable
+  python3 - "$1" "$2" <<'PY'
+import ipaddress
+import json
+import re
+import sys
+import unicodedata
+
+p = sys.argv[1]
+# ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE VERIFY SIDE (#3374 review P3).
+# `merge-mcp.py` was hardened to a named FATAL for a template that is missing, unparseable, or the
+# wrong SHAPE — but the marker kept `json.load(open(...))` then `tpl.get(...)`, so all three raised
+# straight out and left stdout EMPTY. `verify_graph_mcp` then printed `verify failed (marker: none)`
+# above Python internals instead of naming the cause, which is the exact "marker: none beside a
+# traceback" shape this file's own BADDERS/URLTYPE arms exist to prevent. It fails closed (rc is
+# still non-zero), but a checker that cannot say WHY is the instrument defect, not the audit.
+# Reachable: `is_infra_checkout` does not require `templates/.mcp.base.json` to exist.
+tpl = {}
+if len(sys.argv) > 2:
+    try:
+        # ⛔ EXPLICIT utf-8 (see the config read below): the template carries `—`, and a
+        # locale-encoding read turns a healthy template into a BADTPL on a box that pins UTF-8 off.
+        with open(sys.argv[2], encoding="utf-8") as _tf:
+            tpl = json.load(_tf)
+    except (OSError, ValueError) as exc:
+        print("BADTPL:%s: %s" % (type(exc).__name__, exc))
+        sys.exit(1)
+if not isinstance(tpl, dict) or not isinstance(tpl.get("mcpServers"), (dict, type(None))):
+    print("BADTPL:shape: root is %s, mcpServers is %s" % (
+        type(tpl).__name__,
+        type(tpl.get("mcpServers") if isinstance(tpl, dict) else None).__name__))
+    sys.exit(1)
+_want = (tpl.get("mcpServers") or {}).get("tortoise")
+if _want is not None and not isinstance(_want, dict):
+    print("BADTPL:shape: mcpServers.tortoise is %s, not an object" % type(_want).__name__)
+    sys.exit(1)
+want_url = (_want or {}).get("url") or ""
+# ⛔ THE MIRROR OF THE MERGE'S TEMPLATE-url TYPE GUARD (#3374 review, round 2 P3). A non-string
+# template `url` made `want_url` an int, so the `url != want_url` branch fired and this verifier
+# printed `URL_NOT_DEFAULT:` against the cell's CORRECT hosted entry — a refusal sentence asserting
+# the right config is wrong. Unreadable template = nothing can be certified, named as such.
+if not isinstance(want_url, str):
+    print("BADTPL:shape: mcpServers.tortoise.url is %s, not a string" % type(want_url).__name__)
+    sys.exit(1)
+# ⛔ NORMALIZE THE TEMPLATE SIDE TOO — `url` is stripped below and `want_url` was NOT (#3374 review,
+# round 11 P2). The two comparisons in the entry arm therefore disagreed about whitespace: with a
+# template url carrying any surrounding space (`…/mcp/ ` — a hand-edit, or a copy that kept the
+# pad), `url != want_url` was TRUE against a cell pointing at exactly the same endpoint, so this
+# verifier refused `URL_NOT_DEFAULT:` and asserted the cell points somewhere the operator did not
+# ask for — while the merge's `usable()` strips, so install PRESERVED the value it could not
+# certify. `--install` ends in this same verify, so verify → install → verify never converged and
+# `cloud-cell-bringup.sh` died on every attempt: the same FALSE BLOCK class round 9 fixed on the
+# destination side. WHATWG strips leading/trailing space in `new URL()`, so the padded spelling IS
+# the endpoint; one normalization, both sides, applied here so every branch below reads the same
+# value (and `want_url.strip()` just below is then non-empty exactly when the url is).
+want_url = want_url.strip()
+# ⛔ AN EMPTY TEMPLATE url IS NOT "NO OPINION" — IT IS "NOTHING TO COMPARE AGAINST", and that
+# comparison is the ONLY arm that refuses a wrong endpoint. With `want_url` empty, `if want_url and
+# url != want_url` is False, so URL_NOT_DEFAULT/BADURL/NOHOST/USERINFO are ALL skipped and the entry
+# falls through to the hosted-default `else`, which certifies ANY url as `OK:<url>:<auth>` rc=0 — the
+# tenant key attached to whatever host the file happens to name. Measured against a template whose
+# `tortoise` entry carries no `url` (the pre-#3374 stdio shape, and any hand-edited/forked template):
+#   cell url `https://api.premiselab.co/mcp/` (one-letter typo) -> `OK:https://api.premiselab.co/mcp/:…` rc=0
+#   cell url `https://evil.example/mcp/`                        -> `OK:https://evil.example/mcp/:…` rc=0
+# `merge-mcp.py:807` already REFUSES this same template (`FATAL: … declares no usable tortoise
+# entry`, exit 3), so install and verify DISAGREED about one file; this converges them in the safe
+# direction — a template that cannot establish the default certifies NOTHING, it never certifies
+# everything. Named, so the operator is told which file is the broken one.
+if not want_url.strip():
+    print("BADTPL:no-url: mcpServers.tortoise declares no url in %s" % (sys.argv[2] if len(sys.argv) > 2 else "(no template given)"))
+    sys.exit(1)
+# ⛔ THIS READ WAS THE ONE CONFIG READ ON THE VERIFY SIDE WITH NO GUARD (#3374 review, round 10 P2).
+# `graph_mcp_var`/this marker's own template read are both wrapped; this one was bare, so an
+# unreadable `.mcp.json` (an EACCES, a directory, a non-UTF-8 byte) raised straight out and left
+# stdout EMPTY — `FAIL … (marker: none)` over Python internals, the exact "marker: none beside a
+# traceback" shape BADROOT/BADDERS/NOTJSON exist to prevent. Fails closed either way; the point is
+# that a checker which cannot say WHY is the instrument defect, not the audit.
+# The explicit `encoding` is the second half: `templates/.mcp.base.json` carries non-ASCII (`—`) in
+# `_comment`/`purpose`, and `open()` in text mode uses the LOCALE encoding — `PYTHONUTF8=0` with a C
+# locale is `ascii`, and the read then dies on its own byte 503. Modern CPython coerces a C locale,
+# so this does not bite a default host; it bites an environment that pins UTF-8 off, which is the
+# one a service unit can hand you. The fix costs one keyword and removes the class.
+try:
+    with open(p, encoding="utf-8") as _cf:
+        raw = _cf.read()
+except (OSError, UnicodeDecodeError) as exc:
+    print("UNREADABLE:%s: %s" % (type(exc).__name__, exc))
+    sys.exit(1)
+try:
+    cfg = json.loads(raw)
+except ValueError as exc:
+    print("NOTJSON:%s" % exc)
+    sys.exit(1)
+if not isinstance(cfg, dict):
+    # ⛔ THE CONTAINER, NOT ONLY THE ENTRY. `.get` on a non-object ROOT (a JSON array, a string, a
+    # number) raised here, so stdout stayed EMPTY and the operator got `FAIL: … (marker: none)`
+    # above a traceback — while the merge raised on its own copy of the same assumption, so
+    # `--install` could never clear it and every bring-up died. REFUSED BY NAME; a re-install
+    # replaces the container (keeping a `.bak`).
+    print("BADROOT:%s" % type(cfg).__name__)
+    sys.exit(1)
+servers = cfg.get("mcpServers")
+if servers is None:
+    servers = {}
+if not isinstance(servers, dict):
+    # ⛔ SAME RULE ONE LEVEL DOWN: `dict(...)`/`.get` on a `mcpServers` that is a number, a string or
+    # a list raised on both sides. Named, so the refusal says what is wrong and a re-install can fix it.
+    print("BADSERVERS:%s" % type(servers).__name__)
+    sys.exit(1)
+t = servers.get("tortoise")
+# ⛔ A LEAK IS NOT A TORTOISE PROBLEM. The token scan below covers the WHOLE file, so a literal
+# pasted into any other server's entry (or into a `_comment`) is found there — and reporting it as
+# "tortoise entry is not the hosted shape" points the operator at the one entry that is correct.
+# The marker therefore carries the PATH of the first offending value.
+tok = re.compile(r"\b(t[tk])_[A-Za-z0-9]{10,}")
+
+
+def leak_path(node, trail=""):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            got = leak_path(v, "%s.%s" % (trail, k) if trail else str(k))
+            if got:
+                return got
+    elif isinstance(node, list):
+        for i, v in enumerate(node):
+            got = leak_path(v, "%s[%d]" % (trail, i))
+            if got:
+                return got
+    elif isinstance(node, str) and tok.search(node):
+        return trail
+    return ""
+
+# ⛔ THE LEAK SCAN RUNS FIRST — BEFORE EVERY SHAPE EXIT (#3374 review P2). It used to sit AFTER
+# the STDIO/URLTYPE/NOURL/BADDERS/… early exits, so a legacy stdio entry carrying a literal key in
+# its `command` (or in `args`/`env`, the plausible place — the old template shipped the variable
+# there) returned `STDIO:<the whole command, key included>`: the secret was ECHOED into the run log
+# by the marker, and `verify_graph_mcp` prints that marker into the bring-up log, while the leak was
+# never NAMED as a leak and the operator was told "not the hosted shape" instead. A literal must be
+# reported as `SECRET_IN_FILE:<path>` whatever shape the entry has, and no marker may carry it.
+if tok.search(raw):
+    # report the path UNDER `mcpServers` — `mcpServers.tortoise._comment` is noise when the whole
+    # file is already known to be that object, and `tortoise._comment` is what an operator greps.
+    # ⛔ BUT THE SCAN IS THE WHOLE FILE (`raw`), so the PATH must be looked for there too (#3374
+    # review, round 11 P1). It was searched under `servers` alone, so a literal pasted into a
+    # TOP-LEVEL key — a `_noteboard`, a hand-added `"token"`, the shape a curl-style paste actually
+    # produces — was found by the scan and then reported as `(unlocatable)`: the operator was told a
+    # secret exists and given nowhere to look, and NOTHING on the install side named it either, so
+    # the repair loop never converged. The under-`mcpServers` spelling is preserved exactly (the
+    # prefix is stripped, not the path), so every existing marker a suite greps keeps its shape.
+    _leak = leak_path(cfg)
+    if _leak.startswith("mcpServers."):
+        _leak = _leak[len("mcpServers."):]
+    print("SECRET_IN_FILE:%s" % (_leak or "(unlocatable)"))
+    sys.exit(1)
+
+
+def redact(value):
+    """Mask anything shaped like a credential — a marker is ECHOED into operator-facing logs."""
+    return tok.sub("<redacted>", value if isinstance(value, str) else str(value))
+
+
+# ⛔ A USERINFO IS A CREDENTIAL, AND `redact()` DOES NOT CATCH IT (#3374 review, round 2 P3).
+# `tok` matches `tt_`/`tk_` shapes only, so `INSECURE_URL:http://user:hunter2@evil.example/mcp/`
+# put a PASSWORD in the bring-up log — a log that gets pasted into issues and PRs fleet-wide. Every
+# url-echoing marker goes through this: the userinfo is replaced wholesale, because its whole content
+# is secret-or-irrelevant, and nothing after it is touched (the host is the actionable part).
+# ⛔ "EVERY" WAS FALSE WHEN IT WAS WRITTEN (#3374 review, round 12 P2): `URL_NOT_DEFAULT` — the marker
+# that fires for the COMMON case, an entry that differs from the template — printed the raw url, so
+# `URL_NOT_DEFAULT:https://alice:hunter2@evil.example/mcp/` put the password in the run log while the
+# `USERINFO` and `INSECURE_URL` arms, on the *same* url, printed `<redacted>`. It goes through here
+# now, and `WRONG_AUTH` (a header, not a url) does NOT go through either one — see the note at its
+# branch: `redact()` masks only `tt_`/`tk_` shapes, so a header is WITHHELD down to the `${VAR}` name it
+# names, or to a sentence that withholds it. If you add a marker that echoes a url or a header, it is
+# your job to route it through `shown_url`/`redact`, or to withhold — nothing enforces it.
+def shown_url(u):
+    u = u if isinstance(u, str) else str(u)
+    head, sep, tail = u.partition("://")
+    if sep and "@" in tail.split("/", 1)[0]:
+        rest = tail.split("/", 1)
+        authority = rest[0].rsplit("@", 1)[1]
+        u = "%s://<redacted>@%s%s" % (head, authority, ("/" + rest[1]) if len(rest) > 1 else "")
+    return redact(u)
+
+
+if not isinstance(t, dict):
+    print("NOENTRY")
+    sys.exit(1)
+if t.get("command"):
+    print("STDIO:%s" % redact(t.get("command")))
+    sys.exit(1)
+url = t.get("url") or ""
+if not isinstance(url, str):
+    print("URLTYPE:%s" % type(url).__name__)
+    sys.exit(1)
+# ⛔ NORMALIZE THE url EXACTLY AS THE MERGE'S `usable()` DOES, BEFORE ANY PREDICATE READS IT
+# (#3374 review, round 9 P2). `usable()` runs every floor on `url.strip()`, so the merge PRESERVES a
+# whitespace-padded self-host; this verifier read the RAW value, so a leading pad failed the
+# `^scheme://` match below and it refused `INSECURE_URL:` (or `BADURL:` with no key) — sentences that
+# are FALSE about the artifact, because the client's own parser builds a working transport from
+# exactly those bytes (`new URL(" https://localhost:8000/mcp")` → host `localhost:8000`, measured;
+# WHATWG strips leading/trailing C0 and space). `--install` ends in this same verify, so the repair
+# re-created the refusal for ever: verify → install → verify never converged. A FALSE BLOCK on a
+# working config, which is the one direction this file must never take. One rule, one call, both
+# sides — the same `.strip()` — so a shape one side preserves is a shape the other certifies.
+# The pad is stripped, NOT the entry rewritten: `--verify` classifies, it never writes.
+url = url.strip()
+if not url:
+    print("NOURL")
+    sys.exit(1)
+# `type` is OPTIONAL, deliberately: the client's `McpServerConfig` has no `type` field and picks
+# the HTTP transport from `url` alone, so requiring it would refuse a config that works.
+#
+# ⛔ BUT THE `type` JUDGEMENT BELONGS WITH THE URL, NOT BEFORE IT — and this arm used to run first,
+# unconditionally, which made INSTALL and VERIFY disagree about the SAME preserved entry: the merge
+# (`merge-mcp.py` `usable()`) deliberately preserves a self-hosted entry that spells `type: "sse"`
+# for its own daemon, marks it `_selfHosted`, and rc=0; this verifier then refused `sse` and rc=1.
+# ⛔ THE MECHANISM WAS A FALSE **BLOCK**, NOT A FALSE PASS — and the difference decides whether a
+# reader goes looking for the right hole. `cloud-cell-bringup.sh` repairs a verify failure by running
+# INSTALL, and INSTALL ends in this same verify (`verify_layer` runs for `--install` too, and any
+# recorded failure exits 1) — so the repair re-created the refusal and exited non-zero, which that
+# script turns into a `die`. The cell could therefore NEVER converge: every bringup failed loudly, on
+# a config the installer had itself just preserved, and no repair could clear it. Certification is not
+# the hole (it comes from the INSTALL's rc, which already carries this verdict); convergence is. The
+# rule is ONE rule, applied by both sides: a non-http `type` disqualifies the HOSTED default (where
+# `http` is the contract) and is the operator's business on their own daemon. See the url branch below.
+# ⛔ A `headers` THAT IS NOT A MAPPING IS REFUSED BY NAME, not by traceback. `"headers": "Bearer …"`
+# (a hand-edit, or a curl-style paste) made this `.get` raise: stdout stayed empty, so the operator
+# got `FAIL: … verify failed (marker: none)` above a python traceback and nothing that named the
+# shape — and the INSTALLER's `usable()` raised on the same line, so the repair path could not fix
+# it either. Both sides now treat it as what it is: an unusable entry (replaced on install, refused
+# here by name).
+# ⛔ AND `usable()` MUST BE TOTAL OVER ARBITRARY JSON — the same predicate, one level down: a
+# non-STRING `url` made `.strip()` (and `re.match`) raise, and a non-string `Authorization` made
+# `"${" not in auth` raise `TypeError`. Both left the merge rc=1 with the file unchanged and the
+# verifier with an empty marker, i.e. the "config nothing can repair" state, for a shape a hand-edit
+# produces in one keystroke. A `$TYPE` marker is what makes that legible.
+_headers = t.get("headers")
+if _headers is not None and not isinstance(_headers, dict):
+    print("BADDERS:%s" % type(_headers).__name__)
+    sys.exit(1)
+auth = ((_headers or {}).get("Authorization") or "")
+if not isinstance(auth, str):
+    print("BADAUTH:%s" % type(auth).__name__)
+    sys.exit(1)
+if auth and "${" not in auth:
+    print("LITERAL_AUTH")
+    sys.exit(1)
+# ⛔ A CREDENTIAL OVER CLEARTEXT IS NOT CERTIFIABLE, and `_selfHosted` must never become the
+# exemption that says otherwise. `merge-mcp.py` preserves a genuine self-host (a DIFFERENT HOST) and
+# this verifier reports it BY NAME; a SCHEME-only difference is a typo — and it is the one typo whose
+# cost is not just a 401: the client expands the header and sends `Bearer <tt_…>` over that transport,
+# so the live tenant key crosses the wire in cleartext while the cell prints LAYER VERIFIED and a
+# green `graph credential: resolves from …` beside it (measured: `http://api.premiselabs.co/mcp/`
+# was marked `_selfHosted` by the merge and then certified here, rc=0). `https` is therefore the FLOOR
+# for any url carrying a credential to a destination that can leave the box. ⛔ LOOPBACK IS EXEMPT ON
+# PURPOSE: a key sent to `localhost`/`127.0.0.0/8`/`::1` never crosses a network, and the repo's own
+# documented self-host fixture is exactly that shape with the template's header still attached —
+# refusing it would be the false block that teaches an operator to ignore this gate. A self-host that
+# needs a key off-box must serve it over https.
+# ⛔ THE LOOPBACK TEST IS AN IP-LITERAL TEST, NOT A PREFIX TEST — a prefix test is a BYPASS, measured:
+# `127.attacker.example` is an ordinary DNS name its owner can point anywhere, and `127.0.0.1@evil.example`
+# is the loopback spelling going on to an attacker's HOST (userinfo, not authority). Both skip a
+# `startswith("127.")` exemption and then certified `SELFHOSTED:` rc=0 with the tenant key attached.
+# So: strip userinfo, refuse anything with trailing labels, and ask ipaddress whether the literal is
+# loopback. `merge-mcp.py`'s `usable()` applies the SAME predicate (marked MUST MATCH there).
+def _loopback(authority):
+    h = (authority or "").strip().lower()
+    if "@" in h:                                  # userinfo is NOT the host
+        h = h.rsplit("@", 1)[1]
+    if h.startswith("["):                          # an IPv6 literal: `[<addr>]`, optionally `:port`
+        end = h.find("]")
+        if end < 0:
+            return False
+        rest = h[end + 1:]
+        if rest and not rest.startswith(":"):
+            return False
+        # ⛔ ASK ipaddress, DO NOT STRING-MATCH `::1` — the same rule as the IPv4 arm below, and for
+        # the same reason: `[0:0:0:0:0:0:0:1]` IS loopback and `== "::1"` called it remote, so a
+        # legal spelling of the documented local self-host was refused as INSECURE_URL (a false
+        # block on a config that cannot leave the box). `merge-mcp.py`'s `_loopback` MUST MATCH.
+        try:
+            return ipaddress.ip_address(h[1:end]).is_loopback
+        except ValueError:
+            return False
+    host = h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False                             # a DNS name is never loopback, whatever it says
+
+
+_m = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/]+)", url, re.I)
+if auth and (_m.group(1).lower() if _m else "") != "https" \
+   and not _loopback(_m.group(2) if _m else ""):
+    print("INSECURE_URL:%s" % shown_url(url))
+    sys.exit(1)
+
+
+# ⛔ `_selfHosted` IS AN EXEMPTION, AND AN EXEMPTION MAY ONLY CERTIFY SOMETHING REACHABLE (#3374 P3).
+# The floor below was "one character after //", so `https://:8443/mcp/` (NO host), `https://my
+# daemon:8000/mcp` (a space in the host) and `https://api.premiselabs.co:8443x/mcp/` (a non-numeric
+# port) all printed SELFHOSTED and exited 0 — LAYER VERIFIED over an entry pointing at nothing, the
+# same false green the scheme-less BADURL arm closes. The rule is the CLIENT's parser, not a guess:
+# every shape refused here is one `new URL(u)` THROWS on (measured ERR_INVALID_URL), so refusing it
+# cannot over-block a config that works — no request could be built from it either. The shapes URL
+# ACCEPTS stay accepted: a bare trailing `host:`, a trailing root dot, an underscore, an IDN, and
+# `[<ipv6>]:port`. Empty-labeled and alnum-free forms the client parses but DNS cannot resolve
+# (`.`, `-`, `a..b`) are refused too: typos, never a configured endpoint.
+# ⛔ `merge-mcp.py`'s `authority_names_a_host` is the SAME predicate under the SAME name — a shape
+# refused here must be refused there and vice versa, so the repair always converges.
+def _port_ok(port):
+    if port is None or port == "":              # absent, or the bare-`host:` spelling URL accepts
+        return True
+    if not port.isdigit():
+        return False
+    return 1 <= int(port) <= 65535
+
+
+# ⛔ WHATWG URL's forbidden HOST code points, and the IDNA rule for non-ASCII labels. A host
+# containing one is refused by the client's parser outright, so certifying it is a false PASS —
+# `api.premiselabs.co|evil.example` passed an "every label has an alnum" test and printed
+# `SELFHOSTED:` rc=0 (#3374 review, round 2 P3). `merge-mcp.py` carries the SAME helpers.
+_HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
+
+# ⛔ DOT-EQUIVALENT CODE POINTS SPLIT ONE LABEL INTO TWO (#3374 review, round 13 P1). `new URL` applies
+# UTS46, which maps U+3002/U+FF0E/U+FF61/U+FE52/U+2024 to `.`, so
+# `https://api.premiselabs.co。evil.example/mcp/` resolves in the CLIENT to
+# `api.premiselabs.co.evil.example` — an attacker's host — while this predicate read it as one harmless
+# label and printed `SELFHOSTED:` rc=0 with `Bearer ${TORTOISE_MCP_API_KEY}` still attached. Checked on
+# the NFKC form and BEFORE the idna branch: a box with no `idna` accepts every non-ASCII label, so an
+# idna-only guard would leave it open. `merge-mcp.py` carries the SAME rule.
+_DOT_EQUIVALENT = "\u3002\uff0e\uff61\ufe52\u2024"
+
+# The Unicode general categories UTS46 DELETES from a label (soft hyphen is `Cf`). See `_label_ok`.
+_UTS46_DELETES = ("Cf", "Mn", "Me")
+
+try:                                          # IDNA2008/UTS46 — the standard the client applies
+    import idna as _idna
+except ImportError:                           # pragma: no cover — stdlib-only box
+    _idna = None
+
+
+def _label_ok(lab):
+    if not lab or not any(ch.isalnum() for ch in lab):
+        return False
+    if any(ch in _HOST_FORBIDDEN for ch in lab):
+        return False
+    # (1) DOT-EQUIVALENTS SPLIT ONE LABEL INTO TWO. Checked on the NFKC form, in stdlib, so it holds
+    # on a box with no `idna` too.
+    if any(ch in _DOT_EQUIVALENT for ch in lab) or "." in unicodedata.normalize("NFKC", lab):
+        return False
+    if lab.isascii():
+        return True
+    if _idna is None:
+        # (3) STDLIB-ONLY FALLBACK. UTS46 DELETES every Cf/Mn/Me code point, so `co\xad` maps to `co`
+        # and the client resolves a DIFFERENT host than the one written — `new URL` sends
+        # `api.premiselabs.co\xad.evil.example` to `api.premiselabs.co.evil.example`. Without `idna`
+        # there is no way to apply the real mapping, so refuse the code points it would delete. This
+        # is deliberately narrow (a legitimately combining IDN label is refused HERE and accepted once
+        # `idna` is installed) because the alternative is a false PASS that mails the tenant key to an
+        # attacker's host.
+        return not any(unicodedata.category(ch) in _UTS46_DELETES for ch in lab)
+    try:
+        # (2) ⛔ THE RULE, AND IT IS NOT A BLOCKLIST: the label must be a FIXED POINT of the client's
+        # own UTS46 mapping. Rounds 12 and 13 each closed one SPELLING (`%2e`, then the five
+        # dot-equivalents) and each time the next spelling through the same mapping was still
+        # certified: a mapping that DELETES a code point (`co\xad` -> `co`) renames the label exactly
+        # as a mapping that INTRODUCES a separator (`co\u3002evil` -> `co.evil`) does. Comparing what
+        # we READ against what the CLIENT RESOLVES closes both, and closes the next one without an
+        # edit. Measured: `co\xad`/`co\u3002evil` change; `münchen`, `xn--mnchen-3ya`, `my_host`,
+        # `localhost`, `api.premiselabs.co` do not.
+        if _idna.uts46_remap(lab, std3_rules=False, transitional=False) != lab:
+            return False
+        encoded = _idna.encode(lab, uts46=True)
+    except Exception:
+        return False
+    return b"." not in encoded
+
+
+def authority_names_a_host(authority):
+    a = (authority or "").strip()
+    if not a or any(c.isspace() for c in a):
+        return False
+    if "@" in a:                                  # userinfo is NOT the host (refused elsewhere)
+        a = a.rsplit("@", 1)[1]
+    if a.startswith("["):                          # `[<ipv6>]`, optionally `:port`
+        m = re.match(r"^\[([0-9A-Fa-f:.]+)\](?::(.*))?$", a)
+        if not m or not _port_ok(m.group(2)):
+            return False
+        try:
+            ipaddress.IPv6Address(m.group(1))
+        except ValueError:
+            return False
+        return True
+    if a.count(":") > 1:                          # an unbracketed IPv6 is not a legal authority
+        return False
+    host, sep, port = a.partition(":")
+    if sep and port and not _port_ok(port):
+        return False
+    if not host or "%" in host:                    # empty, or pct-encoded (the client throws)
+        return False
+    labels = host[:-1].split(".") if host.endswith(".") else host.split(".")
+    return all(_label_ok(lab) for lab in labels)
+# ⛔ "contains ${" IS NOT ENOUGH FOR THE HOSTED ENDPOINT. The client DOES expand `${VAR}`
+# (extensions/mcp-client/index.ts:819-821) and then sends the value as-is — it adds no scheme — so
+# `Authorization: ${TORTOISE_MCP_API_KEY}` (no scheme) is delivered as `Authorization: tt_…` and the
+# server answers 401, yet it contains "${" and used to
+# be certified. Nor is any variable acceptable: the resolver reads TORTOISE_MCP_API_KEY (and the
+# LEGACY alias TORTOISE_API_KEY), so an entry naming a third variable would expand to the EMPTY STRING
+# while `LAYER VERIFIED` printed a green credential line beside it. Both names are allowed, nothing
+# else is, and the scheme is required.
+HOSTED_AUTH = re.compile(r"^Bearer\s+\$\{TORTOISE_(API|MCP_API)_KEY(:-[^}]*)?\}$")
+# ⛔ THE HOSTED DEFAULT IS A FIXED FACT, NOT "WHATEVER THE TEMPLATE HAPPENS TO SAY" — and getting
+# this wrong is a false BLOCK on the one configuration the docs tell self-host operators to write.
+# This marker asks two different questions and they must not be answered from one value:
+#   (i)  "is this the HOSTED endpoint?" — then it needs the env-indirect credential and its `type`
+#        must be `http` (that endpoint answers 401 without a key); and
+#   (ii) "does this cell point where the operator wants?" — the template's own `url`, which a
+#        self-host operator is DOCUMENTED to point at their own daemon (SETUP-NEW-MACHINE.md:181-183,
+#        tortoise's `docs/quickstart-selfhosted.md`).
+# Using the template's url for (i) made it a tautology: a self-host template installed the operator's
+# own entry and this marker then demanded the hosted credential for it (`NOAUTH`) — install wrote a
+# file verify refused, so `verify → install → verify` could never converge. merge-mcp.py answers the
+# same two questions from the same two values (its own HOSTED_DEFAULT_URL). (#3374 review P1.)
+# ⛔ KEEP IN SYNC WITH `merge-mcp.py` — an arm in pi-bootstrap/tests/test-cell-install.sh pins BOTH
+# constants to the SHIPPED template, so neither can drift away from the endpoint it names.
+HOSTED_DEFAULT_URL = "https://api.premiselabs.co/mcp/"
+
+
+def _endpoint_key(u):
+    """`scheme://host[:non-default-port]` + the rest — the IDENTITY of an endpoint (MUST MATCH
+    `merge-mcp.py`'s `endpoint_key`, which carries the full rationale).
+
+    ⛔ BYTE EQUALITY IS NOT ENDPOINT IDENTITY (#3374 review, round 12 P2). The client's parser drops
+    a DEFAULT port, so `https://api.premiselabs.co:443/mcp/` and `…co:/mcp/` are the SAME endpoint as
+    `HOSTED_DEFAULT_URL`; comparing bytes made them "somewhere the operator did not ask for", which
+    routed them to the `_selfHosted` exemption and SKIPPED the hosted credential requirement
+    entirely. Measured: the canonical spelling is refused `WRONG_AUTH`, the `:443` spelling of the
+    same entry is certified `SELFHOSTED:` rc=0 and the note then says "a self-hosted daemon needs
+    none" about the hosted host. Only 443/https and 80/http are dropped — a non-default port is the
+    documented self-host shape and stays distinct.
+    """
+    s = (u or "").strip()
+    m = re.match(r"^([a-z][a-z0-9+.\-]*)://(?:[^/?#]*@)?(\[[^\]]*\]|[^/?#:]*)(?::(\d*))?", s, re.I)
+    if not m:
+        return s                       # an unparseable url compares by its own bytes
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    # ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME (#3374 review, round 13 P1 — MUST MATCH
+    # `merge-mcp.py`, which carries the full rationale and the measurement). `api.premiselabs.co.`
+    # is the FQDN spelling of the hosted host: the client's parser keeps the dot and DNS resolves it
+    # to the same server, so a request there reaches the LIVE hosted endpoint and needs the hosted
+    # key. Measured before this rule: `https://api.premiselabs.co./mcp/` plus `_selfHosted: true`
+    # and `Bearer ${SOME_OTHER_VAR}` was certified `SELFHOSTED:` rc=0 — the empty-Bearer 401 this
+    # change exists to close, blessed as "a self-hosted daemon needs none". Stripping the root dot
+    # narrows NO exemption: a genuine self-host is a different HOST, and `:8443` stays distinct.
+    if host.endswith("."):
+        host = host[:-1]
+    # ⛔ USERINFO FORCES THE KEY TO DIFFER — never let a spoof url key to the hosted endpoint by
+    # DROPPING it (MUST MATCH `merge-mcp.py`). Otherwise `https://user:pw@api.premiselabs.co/mcp/`
+    # takes the hosted path and skips the arm that refuses userinfo outright.
+    authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT — `:0443` IS `:443` (MUST MATCH `merge-mcp.py`,
+    # which carries the full rationale and the measurement: the client's own parser normalises all
+    # three spellings to the canonical hosted url). Without this a leading-zero default port took
+    # the self-host exemption and was certified without any credential check.
+    if port:
+        port = port.lstrip("0") or "0"
+    if port == "" or (port is not None and ((scheme == "https" and port == "443")
+                                            or (scheme == "http" and port == "80"))):
+        port = None
+    return "%s%s://%s%s%s" % (prefix, scheme, host, (":" + port) if port else "", s[m.end():])
+
+
+def _authority_key(u):
+    """`scheme://host[:non-default-port]` — `_endpoint_key` with the PATH, QUERY and FRAGMENT cut off.
+
+    ⛔ "IS THIS THE HOSTED ENDPOINT?" IS A QUESTION ABOUT THE AUTHORITY, NOT ABOUT THE PATH (#3374
+    review, round 12 P1 — a FALSE PASS, and the most reachable one in this file). `_endpoint_key`
+    appends `s[m.end():]` VERBATIM, so every spelling the client normalises in the PATH — and the
+    FRAGMENT, which is never even sent — keyed DIFFERENTLY from `HOSTED_DEFAULT_URL` and escaped the
+    hosted branch entirely. Measured at the head that introduced `_endpoint_key`, with a self-host
+    template and `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer, #3275/#3289):
+        https://api.premiselabs.co/mcp            → SELFHOSTED: rc=0
+        https://api.premiselabs.co/foo/../mcp/    → SELFHOSTED: rc=0
+        https://api.premiselabs.co/mcp/?x=1       → SELFHOSTED: rc=0
+        https://api.premiselabs.co/mcp/#x         → SELFHOSTED: rc=0
+    and `node -e 'new URL(u).href'` normalises ALL FOUR onto the canonical hosted url, which answers
+    HTTP 401 to an unauthenticated POST — i.e. each one is the live hosted endpoint, certified with
+    no credential at all. The reachable-by-accident form needs no marker and no hand-edit: a TEMPLATE
+    whose own url is the hosted host spelled without the trailing slash installed an entry carrying
+    `headers: null` and `--verify` certified it `SELFHOSTED:`, so install and verify CONVERGED on the
+    false pass this entire change exists to close.
+
+    No path, query or fragment on the hosted AUTHORITY can make an entry a self-host, because the
+    credential requirement is about the HOST the key is sent to. A genuine self-host is a DIFFERENT
+    authority — another host, or the same host on a non-default port (`:8443`) — and `_endpoint_key`
+    keeps the port, so this does not narrow the exemption at all.
+
+    ⛔ DERIVED FROM `_endpoint_key`, NOT A SECOND PARSER. The host/port/userinfo/leading-zero rules
+    (and their measurements) live in exactly one place above; re-deriving the authority from `s`
+    would be another regex for the same question in a repo where the drift between such copies is
+    what rounds 10-12 kept closing.
+    """
+    k = _endpoint_key(u)
+    m = re.match(r"^((?:userinfo@)?[a-z][a-z0-9+.\-]*://[^/?#]*)", k, re.I)
+    return m.group(1) if m else k
+
+# ⛔ A DIFFERING url is not automatically fine, and a MISSING Authorization is not automatically
+# broken: the two questions are linked. Accepting any non-empty http url let a cell whose endpoint
+# was a typo (or copied from another box) be certified LAYER VERIFIED while pointing at nothing — a
+# false green of exactly the class this function exists to close. And demanding an env-indirect
+# header unconditionally refuses the DOCUMENTED self-host config (a local daemon needs no key,
+# tortoise docs/quickstart-selfhosted.md), which merge-mcp.py then "repairs" by repointing it.
+# So: the hosted default REQUIRES the env-indirect header; any other url requires the operator to
+# have said so with `_selfHosted: true`, and is then reported BY NAME rather than silently passed.
+# ⛔ "THE HOSTED DEFAULT" IS `HOSTED_DEFAULT_URL`, NOT `want_url` (#3374 review P1). With `want_url`
+# there, a template that points at the operator's OWN daemon made (ii) and (i) the same value, so the
+# cell's correctly-installed self-host entry fell to the hosted branch and was refused `NOAUTH` — a
+# false block, and a repair loop that could never converge. The two questions now have two answers:
+#   `url != want_url`                      → the cell points somewhere the operator did not ask for
+#                                            (needs `_selfHosted`); and
+#   `want_url != HOSTED_DEFAULT_URL`       → the operator asked for a NON-hosted endpoint, so the
+#                                            entry they got is that endpoint, certified BY NAME.
+# ⛔ A HOSTED URL IS NOT "SOMEWHERE THE OPERATOR DID NOT ASK FOR" (#3374 round 12, found by
+# measurement: the arm printed `URL_NOT_DEFAULT:https://api.premiselabs.co/mcp/` — a refusal whose
+# own NAME the payload falsifies). With a SELF-HOST template the first arm fired on the cell's
+# HOSTED entry, so `merge-mcp.py`'s correct new behaviour (keep the hosted entry, never mark it)
+# produced a file this verifier then REFUSED: `verify -> install -> verify` could never converge on
+# the one endpoint the shipped template installs. The template says what the operator asked for; it
+# cannot make the hosted endpoint stop being the hosted endpoint. So a hosted url skips this arm
+# (`_url_is_hosted` below) and is judged by the hosted branch — WHICH STILL DEMANDS THE HOSTED
+# CREDENTIAL. That is the point: the bypass this closes is the *exemption*, not the endpoint.
+# ⛔ AND THE QUESTION IS ASKED OF THE AUTHORITY (`_authority_key`), NOT THE WHOLE KEY (#3374 review,
+# round 12 P1). With `_endpoint_key` here, a hosted url spelled `/mcp` (no trailing slash),
+# `/foo/../mcp/`, `/mcp/?x=1` or `/mcp/#x` keyed DIFFERENTLY, took the exemption, and was certified
+# `SELFHOSTED:` rc=0 over an EMPTY Bearer — see `_authority_key`'s docstring for the measurement.
+# The two questions are now distinct on purpose:
+#   `_url_is_hosted`    — is this the hosted AUTHORITY? Then the hosted credential is REQUIRED, and
+#                         no marker and no template can exempt it.
+#   `_url_is_canonical` — is it the hosted endpoint spelled EXACTLY as `HOSTED_DEFAULT_URL`? Only
+#                         that spelling is certified; every other hosted spelling is a typo the
+#                         installer normalises, so it is refused by the same name `URL_NOT_DEFAULT`
+#                         and `merge-mcp.py` canonicalisation makes the repair converge.
+# ⛔ CLEARTEXT TO THE HOSTED HOST IS NOT A SELF-HOST, AND IT NEEDS NO CREDENTIAL TO BE WRONG (#3374
+# review, round 14 P2 — a FALSE PASS, measured). The INSECURE_URL floor above fires only when `auth` is
+# present, so a `http://api.premiselabs.co/mcp/` entry with NO Authorization skipped it, keyed by SCHEME
+# as a different endpoint, took the `_selfHosted`/template arms below, and printed `SELFHOSTED:` rc=0 —
+# LAYER VERIFIED over the LIVE hosted host in cleartext, with the sentence "a self-hosted daemon needs
+# none". The endpoint is https-only, so this is not an operator's daemon: the request either fails or is
+# answered by whatever the host serves in the clear, and the cell reports green either way.
+# `merge-mcp.py`'s `usable()` REFUSES this shape too (same rule, same reasoning), so install and verify
+# agree and `verify -> install -> verify` converges by refusal rather than looping.
+# The test is the endpoint identity with the scheme swapped for `https` — `_endpoint_key` owns the
+# default-port, leading-zero and root-dot rules, so this cannot drift from them, and a genuine self-host
+# on a different port (`http://localhost:8000/mcp`, `http://api.premiselabs.co:8443/mcp/`) is untouched.
+# It sits HERE, not beside the floor above, because `_endpoint_key` is defined further down this program
+# and calling it earlier raises NameError (caught by the arms below, which is why they run).
+if (url or "").lower().startswith("http://") \
+   and "://" in url \
+   and _endpoint_key("https://" + url.split("://", 1)[1]) == _endpoint_key(HOSTED_DEFAULT_URL):
+    print("INSECURE_URL:%s" % shown_url(url))
+    sys.exit(1)
+_url_is_hosted = _authority_key(url) == _authority_key(HOSTED_DEFAULT_URL)
+_url_is_canonical = _endpoint_key(url) == _endpoint_key(HOSTED_DEFAULT_URL)
+_selfhosted_shape = False
+if _url_is_hosted:
+    if not _url_is_canonical:
+        # The hosted host, spelled some other way: NOT a self-host (so never exempt), and NOT the
+        # default, so `--verify` refuses it by name and `--install` normalises it to
+        # `HOSTED_DEFAULT_URL`. Before this arm existed these spellings were CERTIFIED as self-hosts.
+        print("URL_NOT_DEFAULT:%s" % shown_url(url))
+        sys.exit(1)
+elif want_url and _endpoint_key(url) != _endpoint_key(want_url):
+    if not t.get("_selfHosted"):
+        print("URL_NOT_DEFAULT:%s" % shown_url(url))
+        sys.exit(1)
+    _selfhosted_shape = True
+elif want_url and _endpoint_key(want_url) != _endpoint_key(HOSTED_DEFAULT_URL):
+    # The TEMPLATE requests a non-hosted endpoint and the cell points exactly there: the operator
+    # declared it once, in the file this cell was built from, so no per-box `_selfHosted` is owed.
+    _selfhosted_shape = True
+# ⛔ THE EXEMPTION MAY NOT REACH THE HOSTED ENDPOINT (#3374 review, round 12 P2 — a FALSE PASS).
+# Both arms above ask about the TEMPLATE and the marker; neither asked whether the url IS the hosted
+# endpoint. So a `_selfHosted`-marked entry AT the hosted url (which `merge-mcp.py` minted itself when
+# the template named a self-host — it marked "this machine's own url" on the hosted one) was certified
+# `SELFHOSTED:` WITHOUT EVER LOOKING AT ITS CREDENTIAL. Measured: `.mcp.json` = hosted url +
+# `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer, #3275/#3289) + `_selfHosted: true`, template url
+# `https://192.168.1.5/mcp` → `SELFHOSTED:https://api.premiselabs.co/mcp/` rc=0 and LAYER VERIFIED,
+# while the SAME file against the shipped template is refused `WRONG_AUTH:${SOME_OTHER_VAR}` rc=1. The
+# endpoint that needs the key cannot be exempted from needing it by a marker or a template; the hosted
+# path is decided by the ENDPOINT, so it is decided here by key and the hosted credential is required.
+# …and it is stated as ONE invariant over BOTH arms above rather than repeated in each, so a later
+# edit to either arm cannot reintroduce the false pass by forgetting it (this file's round-12
+# pattern: the rule was written per-branch and one branch was missed). UNREACHABLE BY CONSTRUCTION
+# today — `_url_is_hosted` returns before either arm can set the flag — and kept deliberately as the
+# invariant it encodes, so the guarantee is restated where the exemption is granted rather than only
+# implied by the control flow above.
+if _selfhosted_shape and _url_is_hosted:
+    _selfhosted_shape = False
+if _selfhosted_shape:
+    # ⛔ `_selfHosted` IS AN EXEMPTION, NOT A LICENCE TO CERTIFY ANY STRING (#3374 review P2). The
+    # branch used to print SELFHOSTED and exit 0 for ANY marked url — including a SCHEME-LESS one
+    # (`localhost:8000/mcp`), which `new URL()` in the client reads with protocol `localhost:` and no
+    # host, so a cell pointing at nothing was certified LAYER VERIFIED with a green credential line.
+    # An absolute http(s) url is the minimum this exemption can honestly certify.
+    _su = re.match(r"^([a-z][a-z0-9+.\-]*)://([^/?#]+)", url or "", re.I)
+    if not _su or _su.group(1).lower() not in ("http", "https"):
+        print("BADURL:%s" % shown_url(url))
+        sys.exit(1)
+    # ⛔ AND "ABSOLUTE" IS NOT "REACHABLE" (#3374 review P3): `https://:8443/mcp/` is absolute-
+    # looking with NO host, and it was certified SELFHOSTED rc=0. The predicate is shared by name
+    # with `merge-mcp.py`, which REFUSES the shape, so the repair replaces it and this verifies the
+    # result — converge, in both directions.
+    if not authority_names_a_host(_su.group(2)):
+        print("NOHOST:%s" % shown_url(url))
+        sys.exit(1)
+    # ⛔ USERINFO IN THE AUTHORITY IS NOT A SELF-HOST, IT IS A SPOOF SPELLING (#3374 review P1). The
+    # real host is the part AFTER the `@` — `https://api.premiselabs.co@evil.example/mcp/` is
+    # **evil.example** — and this branch used to certify it `SELFHOSTED:` with the entry's
+    # `Bearer ${TORTOISE_MCP_API_KEY}` still attached, i.e. LAYER VERIFIED over the tenant key going to
+    # an attacker's host. It is also NOT a config that works: the client cannot even build a request
+    # from a url with credentials (`new Request('http://u:p@h/')` throws "Request cannot be constructed
+    # from a URL that includes credentials"). `merge-mcp.py`'s `usable()` refuses the same shape, so
+    # the repair REPLACES it — verify and install must not disagree in either direction.
+    if re.match(r"^[a-z][a-z0-9+.\-]*://[^/?#]*@", url or "", re.I):
+        print("USERINFO:%s" % shown_url(url))
+        sys.exit(1)
+    # A self-hosted entry is certified BY NAME, and its own transport spelling is part of what the
+    # operator chose: the client selects StreamableHTTP from `url` alone and never reads `type`, so
+    # refusing `sse` here would refuse a config that WORKS (and that install preserves on purpose).
+    print("SELFHOSTED:%s" % shown_url(url))
+else:
+    if t.get("type") not in (None, "http"):
+        print("NOTHTTP:%s" % t.get("type"))
+        sys.exit(1)
+    if not auth:
+        print("NOAUTH")
+        sys.exit(1)
+    if not HOSTED_AUTH.match(auth.strip()):
+        # ⛔ THE HEADER IS NOT PRINTED, AND `redact()` WAS NOT ENOUGH (#3374 review, round 12 P2).
+        # `redact()` masks `tt_`/`tk_` SHAPES only, so `WRONG_AUTH:Bearer ${TORTOISE_MCP_API_KEY}
+        # hunter2NOTATOKEN` — a trailing literal on an otherwise-correct header, which is what a bad
+        # paste or a merge of two headers produces — went into a bring-up log that gets pasted into
+        # issues fleet-wide. ⛔ A BARE LITERAL NEVER REACHES HERE (it is `LITERAL_AUTH`, one branch up,
+        # which prints no value at all), so that is NOT the shape this arm is for: measured on the
+        # PRE-FIX marker, this header printed in full, and this block prints the variable alone.
+        # What an operator actually needs is WHICH VARIABLE was named, and a `${VAR}` name is not a
+        # secret; anything else is withheld, because a literal in that position IS the secret.
+        # Measured: the arm that pins this asserts the secret is ABSENT from the log, not that the
+        # marker is present.
+        _m = re.match(r"^Bearer\s+\$\{([A-Za-z_][A-Za-z0-9_]*)", (auth or "").strip())
+        print("WRONG_AUTH:%s" % (("${%s}" % _m.group(1)) if _m
+                                 else "<a literal, not a ${VAR} reference — value withheld>"))
+        sys.exit(1)
+    # ⛔ THE SUCCESS MARKER PRINTED THE HEADER VERBATIM, SO THE LEAK SURVIVED ONE BRANCH OVER (#3374
+    # review, round 12 P2). `HOSTED_AUTH` admits `${VAR:-<anything>}` — a spelling the client DOES
+    # support (`extensions/mcp-client/index.ts`: `${VAR:-default}`, expanded recursively) — so a
+    # literal default is a value that reaches the wire, and it went into BOTH the `--verify` and the
+    # `--install` log on the branch that fires for a CORRECT config: measured,
+    # `Bearer ${TORTOISE_MCP_API_KEY:-hunter2NOTATOKEN}` printed in full, `rc=0`. An operator needs
+    # WHICH VARIABLE, and a name is not a secret; a default is a value, so it is withheld.
+    # ⛔ AND THE NAME MUST BE THE WHOLE NAME (#3374 round 12, found by measurement). The first cut
+    # used `\$\{[A-Za-z_][A-Za-z0-9_]*` with NO closing brace, so the marker printed
+    # `OK:<url>:${TORTOISE_MCP_API_KEY` — a TRUNCATED variable name that no reader can paste back,
+    # and which made the arm asserting the certified marker fail on a correct config. Taking the name
+    # from `HOSTED_AUTH`'s own match is what makes that impossible: the name printed here is by
+    # construction one the refusal branch above accepts, so the marker can never name a variable the
+    # verifier would have rejected. Only the NAME is printed — a `${VAR:-default}` default is a
+    # literal value that reaches the wire, so it is DROPPED rather than reproduced.
+    _am = HOSTED_AUTH.match((auth or "").strip())
+    print("OK:%s:%s" % (shown_url(url),
+                        ("${TORTOISE_%s_KEY}" % _am.group(1)) if _am
+                        else "<a header this verifier did not recognise — withheld>"))
+PY
+}
+
+  # The marker is CAPTURED, not just sniffed from $?: the FAIL sentence must name the thing that is
+  # actually wrong (a leak in another server's entry is not a broken tortoise entry), and $? cannot
+  # tell the two apart. The line is still echoed into the run log — the self-host case is reported
+  # BY NAME there, deliberately.
+  local out=""
+  out="$(graph_mcp_marker "$f" "$INFRA_ROOT/templates/.mcp.base.json")"
+  local rc=$?
+  [ -n "$out" ] && log_line ".mcp.json verify: $out"
+  if [ "$rc" -eq 0 ]; then
+    :
+  else
+    case "$out" in
+      SECRET_IN_FILE:*)
+        fail "a credential LITERAL is written into .mcp.json at ${out#SECRET_IN_FILE:} — a shared config file must be env-indirect (\${TORTOISE_MCP_API_KEY}); remove the literal and put the key in \$HOME/keys.env (mode 600)" ;;
+      LITERAL_AUTH*)
+        fail ".mcp.json's tortoise entry carries a LITERAL bearer token instead of \${TORTOISE_MCP_API_KEY} — the shared file is the leak" ;;
+      WRONG_AUTH:*)
+        fail ".mcp.json's tortoise Authorization is not 'Bearer \${TORTOISE_MCP_API_KEY}' (or the legacy 'Bearer \${TORTOISE_API_KEY}') — the client expands the variable and sends the value as-is (it adds no scheme), so anything else reaches the server as a 401 (got: ${out#WRONG_AUTH:})" ;;
+      INSECURE_URL:*)
+        fail ".mcp.json's tortoise url (${out#INSECURE_URL:}) is CLEARTEXT (non-https) and not loopback, in one of two shapes and both refused: it carries a credential over a NON-https scheme — the client expands the header, so the live key would cross the wire in cleartext while this cell reported LAYER VERIFIED — or it names the HOSTED host, which is https-only whether or not a credential is attached, so the cell would be certified over an endpoint that cannot answer. Use https, or point at your own local daemon (a self-host needs no key)" ;;
+      BADDERS:*)
+        fail ".mcp.json's tortoise entry declares its headers value as a ${out#BADDERS:}, not an object — the Authorization cannot be read from it, so nothing can be certified. Make it an object: {\"Authorization\": \"Bearer \${TORTOISE_MCP_API_KEY}\"} — a re-install does this for you" ;;
+      BADROOT:*|BADSERVERS:*)
+        fail ".mcp.json's ${out%%:*} is a JSON ${out#*:}, not an object — nothing can be read from it, so nothing can be certified. A re-install REPLACES it and keeps the old file as .mcp.json.bak" ;;
+      BADAUTH:*)
+        fail ".mcp.json's tortoise Authorization is a ${out#BADAUTH:}, not a string — a config the client cannot expand, and a shape no merge can repair. Make it \"Bearer \${TORTOISE_MCP_API_KEY}\" (a re-install replaces it)" ;;
+      URLTYPE:*)
+        fail ".mcp.json's tortoise url is a ${out#URLTYPE:}, not a string — nothing can be resolved from it, so nothing can be certified (a re-install replaces the entry)" ;;
+      BADURL:*)
+        fail ".mcp.json's tortoise entry is marked _selfHosted but its url (${out#BADURL:}) is not an absolute http(s) url — the client builds a transport from it, so this cell points at nothing. Write the full url (e.g. http://localhost:8000/mcp)" ;;
+      USERINFO:*)
+        fail ".mcp.json's tortoise url (${out#USERINFO:}) carries USERINFO in its authority — the host that answers is the part AFTER '@', so an entry spelled like the hosted endpoint with '@evil.example' after it sends \${TORTOISE_MCP_API_KEY} to evil.example. The client cannot even build a request from a url with credentials. Write a plain url and keep the key in \$HOME/keys.env" ;;
+      NOHOST:*)
+        fail ".mcp.json's tortoise url (${out#NOHOST:}) is marked _selfHosted but its authority names no usable host — the client cannot build a request from it (an empty host, a space, a non-numeric or out-of-range port, a percent-encoded host, or a host DNS cannot resolve). Write the real endpoint, e.g. http://localhost:8000/mcp" ;;
+      BADTPL:*)
+        fail "the template (\$INFRA_ROOT/templates/.mcp.base.json) could not be read, so nothing can be certified — ${out#BADTPL:}. A cell without a usable template is a broken checkout; re-run install from a complete one" ;;
+      UNREADABLE:*)
+        fail ".mcp.json could not be READ at all (${out#UNREADABLE:}) — nothing can be certified from a file the verifier cannot open, and this is NOT the same fault as a wrong shape. Check the file's permissions/owner (it must be readable by the installing user) or re-install, which writes it through temp+rename" ;;
+      NOAUTH*|NOURL*|NOENTRY*|NOTHTTP:*|URL_NOT_DEFAULT:*|STDIO:*|NOTJSON:*)
+        fail ".mcp.json's tortoise entry is not the hosted shape the layer installs (marker: ${out%%:*}) — a hand-edited or stale cell copy, a checkout that still ships the legacy stdio entry, or a non-default url that is not marked _selfHosted" ;;
+      *)
+        fail ".mcp.json verify failed (marker: ${out:-none}) — the hosted entry could not be certified" ;;
+    esac
+    return 1
+  fi
+  graph_credential_note
+  return 0
+}
+
 # ── the deny list: what must not run ON A CELL ──────────────────────────────
 # Kept as data so the deny is readable and testable, and so the DEFAULT for a new
 # manifest entry is "install" — the direction that cannot lose a guard. It is NOT a second
@@ -242,6 +1357,7 @@ FARM_LAYOUT="$(printf '%s\n' \
   $'fleet_srcs\tscripts\tscripts' \
   $'mcp_harness_srcs\tscripts/orchestrator-harness\tscripts' \
   $'merge_gate_srcs\tscripts\tscripts' \
+  $'graph_srcs\tscripts\tscripts' \
   $'lane_root_srcs\tscripts\tscripts' \
   $'lane_srcs\tscripts/lane\tscripts' \
   $'lib_srcs\tscripts/lib\tscripts/lib' \
@@ -690,6 +1806,89 @@ copy_repo_path() {
   fi
 }
 
+# ⛔ THE BASH SIDE OF THE SAME CONSTANT, FOR THE ONE CALLER THAT CANNOT SEE THE MARKER'S PYTHON
+# (#3374 review, round 12 P3). Bash and the marker's python are two languages in one file, so
+# `$HOSTED_DEFAULT_URL` — a PYTHON name — is unbound in the shell (`set -u` then aborts the whole
+# install). MUST MATCH the marker's `HOSTED_DEFAULT_URL` above and `merge-mcp.py`'s; the pin arm in
+# pi-bootstrap/tests/test-cell-install.sh checks EVERY assignment in all of those files against the
+# SHIPPED template, so this spelling cannot drift from the endpoint it names.
+GRAPH_HOSTED_DEFAULT_URL="https://api.premiselabs.co/mcp/"
+
+
+# merge_tortoise_is_hosted <merged .mcp.json> <template .mcp.base.json> <hosted-default-url>
+#   True only when the file that was JUST WRITTEN points its `tortoise` entry at the HOSTED endpoint
+#   and does not carry the `_selfHosted` marker. The merge may legitimately keep a machine's own url,
+#   so this is what the install summary line reports — the ARTIFACT, never the intent of having run a
+#   merge. A file that cannot be read is NOT the hosted default: the caller's other line is the honest
+#   one, and the verifier refuses such a cell by name.
+#   ⛔ THE THIRD ARGUMENT IS WHY THE SENTENCE CAN BE TRUE (#3374 review, round 12 P3). The predicate
+#   compared the written file against the TEMPLATE's url, so with a self-hosting template a cell that
+#   correctly matched its own `localhost` daemon satisfied it and the summary printed "hosted tortoise
+#   entry installed" over an entry pointing at localhost — the same "a sentence that calls a LAN
+#   address 'the hosted host'" defect round 11 fixed one file over. `merge-mcp.py` asks this question
+#   against `HOSTED_DEFAULT_URL`, never the template, and so does this now; a non-hosted endpoint
+#   falls to the caller's "NOT the hosted default" line, which is the true one.
+merge_tortoise_is_hosted() {
+  python3 - "$1" "$2" "$3" <<'MCPHOSTED' >/dev/null 2>&1
+import json, re, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as fh:
+        have = (json.load(fh).get("mcpServers") or {}).get("tortoise") or {}
+    with open(sys.argv[2], encoding="utf-8") as fh:
+        want = (json.load(fh).get("mcpServers") or {}).get("tortoise") or {}
+except Exception:
+    sys.exit(1)
+if not isinstance(have, dict) or not isinstance(want, dict):
+    sys.exit(1)
+
+def key(u):
+    # MUST MATCH `_endpoint_key` above — a default port is not part of an endpoint's identity.
+    s = (u or "").strip()
+    m = re.match(r"^([a-z][a-z0-9+.\-]*)://(?:[^/?#]*@)?(\[[^\]]*\]|[^/?#:]*)(?::(\d*))?", s, re.I)
+    if not m:
+        return s
+    scheme, host, port = m.group(1).lower(), m.group(2).lower(), m.group(3)
+    # ⛔ A TRAILING ROOT DOT IS THE SAME DNS NAME (#3374 review, round 13 P1 — MUST MATCH
+    # `_endpoint_key` above and `merge-mcp.py`). `api.premiselabs.co.` IS the hosted host, so this
+    # key must not separate it from the canonical spelling; without it, `merge_tortoise_is_hosted`
+    # would report a correctly-installed hosted cell as "NOT the hosted default".
+    if host.endswith("."):
+        host = host[:-1]
+    # ⛔ USERINFO FORCES THE KEY TO DIFFER — never let a spoof url key to the hosted endpoint by
+    # DROPPING it (MUST MATCH `merge-mcp.py`). Otherwise `https://user:pw@api.premiselabs.co/mcp/`
+    # takes the hosted path and skips the arm that refuses userinfo outright.
+    authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
+    prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT — `:0443` IS `:443` (MUST MATCH `merge-mcp.py`,
+    # which carries the full rationale and the measurement: the client's own parser normalises all
+    # three spellings to the canonical hosted url). Without this a leading-zero default port took
+    # the self-host exemption and was certified without any credential check.
+    if port:
+        port = port.lstrip("0") or "0"
+    if port == "" or (port is not None and ((scheme == "https" and port == "443")
+                                            or (scheme == "http" and port == "80"))):
+        port = None
+    return "%s%s://%s%s%s" % (prefix, scheme, host, (":" + port) if port else "", s[m.end():])
+
+def akey(u):
+    # MUST MATCH `_authority_key` above — "is the template the hosted endpoint?" is an AUTHORITY
+    # question (#3374 review, round 12 P1). A template spelled `/mcp` without the trailing slash IS
+    # the hosted default, and the merge now writes that default, so a byte key here reported the
+    # truth backwards: a correctly-installed hosted cell was summarised as "NOT the hosted default".
+    k = key(u)
+    m = re.match(r"^((?:userinfo@)?[a-z][a-z0-9+.\-]*://[^/?#]*)", k, re.I)
+    return m.group(1) if m else k
+
+sys.exit(
+    0
+    if key(have.get("url")) == key(sys.argv[3])
+    and akey(want.get("url")) == akey(sys.argv[3])
+    and not have.get("_selfHosted")
+    else 1
+)
+MCPHOSTED
+}
+
 install_config() {
   local rel cfg_fail=0
   # settings.json is the SIXTH config source, and it is checked FIRST so that the step's
@@ -754,6 +1953,48 @@ PY
       log_line "settings.json copied (python3 not found — plain copy)"
     fi
   fi
+
+  # .mcp.json — the HOSTED graph entry, plus whatever server the cell already declared
+  # (graph-mcp-provision). The merge RULES live in ONE place, `pi-bootstrap/lib/merge-mcp.py`,
+  # shared with setup.sh: the two callers merging inline is how they drift, and this exact drift
+  # (both source-wins) is what silently repointed a self-hosted tortoise url on every re-sync.
+  # In a cell's case that script installs the graph server ONLY — the template's other base
+  # servers cannot spawn here: `seo-intelligence` needs mcp-servers/…/node_modules (a cell ships
+  # extensions/ only), brave/gemini need keys, playwright pulls an npx package onto a
+  # memory-constrained box. A catalog that advertises an unspawnable tool is worse than a short one.
+  local mcp_src="$INFRA_ROOT/templates/.mcp.base.json"
+  local mcp_lib="$INFRA_ROOT/pi-bootstrap/lib/merge-mcp.py"
+  if [ ! -f "$mcp_src" ]; then
+    fail "templates/.mcp.base.json is MISSING from $INFRA_ROOT — the cell would keep ZERO MCP servers (every lane then writes GRAPH-UNREACHABLE instead of reading the graph)"
+  elif [ ! -f "$mcp_lib" ]; then
+    fail "pi-bootstrap/lib/merge-mcp.py is MISSING from $INFRA_ROOT — refusing to merge .mcp.json with a second, private implementation"
+  elif ! command -v python3 >/dev/null 2>&1; then
+    fail "python3 is missing — refusing to write .mcp.json by plain copy (it would drop a cell-local server); install python3 or merge by hand"
+  else
+    # NOTE: lines are surfaced verbatim — a preserved self-hosted url, a replaced unusable entry,
+    # and the servers deliberately not installed here must be visible, not inferred. The merge's
+    # exit status is captured FIRST: a `while read < <(...)` loop cannot report it, so a failing
+    # merge would print its error as a note and then log success.
+    mcp_out=""
+    mcp_rc=0
+    mcp_out="$(python3 "$mcp_lib" "$mcp_src" "$DEST/.mcp.json" --cell 2>&1)" || mcp_rc=$?
+    printf '%s\n' "$mcp_out" | while IFS= read -r note; do [ -n "$note" ] && log_line ".mcp.json $note"; done
+    if [ "$mcp_rc" -ne 0 ]; then
+      fail ".mcp.json merge failed (merge-mcp.py rc=$mcp_rc) — the cell would keep whatever config it already had"
+    else
+      # ⛔ THE SUMMARY LINE DESCRIBES THE FILE, NOT THE INTENT (#3374 review P2). The merge may
+      # legitimately KEEP this machine's own tortoise url — it prints a NOTE saying so — and on
+      # rc=0 alone this line then told the operator the HOSTED entry was installed, the opposite of
+      # what the artifact says. Reading the merged file back is the same discipline the layer
+      # verification below uses: a claim about an artifact is checked against the artifact.
+      if merge_tortoise_is_hosted "$DEST/.mcp.json" "$mcp_src" "$GRAPH_HOSTED_DEFAULT_URL"; then
+        log_line ".mcp.json: hosted tortoise entry installed (cell-local servers preserved)"
+      else
+        log_line ".mcp.json: merged, but the tortoise entry is NOT the hosted default (see the NOTE above) — cell-local servers preserved"
+      fi
+    fi
+  fi
+  graph_credential_note
 
   # AGENTS.md — installed when ABSENT, never overwritten.
   local base_agents="$INFRA_ROOT/templates/AGENTS.base.md"
@@ -1477,12 +2718,29 @@ PY
       || fail "settings.json is not valid JSON"
   fi
 
+  # .mcp.json — the hosted graph entry (graph-mcp-provision). Verified on the ARTIFACT: the
+  # entry present, HTTP (not the legacy stdio command that needed a checkout+venv a cell does
+  # not have), an env-indirect Authorization, and NO literal credential in the shared file.
+  verify_graph_mcp || true
+
   guard_tools_dir
   guard_spawn_gate
   guard_gh_shim
 
   if [ "$FAILURES" -eq 0 ]; then
-    log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config"
+    # ⛔ The credential state rides ON the certification line, not in a warning above it. A
+    # `--verify` that prints LAYER VERIFIED while the graph key does not resolve certifies a cell
+    # whose every lane writes GRAPH-UNREACHABLE — and nothing else catches it: the key is not part
+    # of the layer, cloud-cell-bringup.sh does not check it, and the warning above scrolls away.
+    # The exit code stays 0 on purpose (a missing key is not a broken layer, and refusing here
+    # would leave an operator unable to certify a correctly-installed cell over a key nobody has
+    # pushed yet), so the STATE is what must be unmissable.
+    # ⛔ THE STATE GOES ON THE CERTIFICATION LINE ITSELF. It was a second line, and the only
+    # programmatic consumer (`scripts/cloud-cell-bringup.sh`) filters this output with
+    # `grep -E 'mode=--verify|LAYER VERIFIED'` — so a separate line was DROPPED, and a cell whose
+    # graph key does not resolve was reported as certified with nothing about the credential. The
+    # comment above claimed the state "rides ON the certification line"; now it does.
+    log_line "LAYER VERIFIED — $DEST carries the farmed scripts, the guards, the skills and the config — graph credential: $(graph_credential_state)"
     # ⛔ THE LAYER IS NOT THE CELL (agent-infra#2916 check 2, correcting #2909). This line used to be
     # the last thing an operator saw before starting lanes, and `--install` can end here with NO
     # HARNESS PIN — measured: a `bash -x` trace STOPS at exactly this `log_line`, and the pin was then
