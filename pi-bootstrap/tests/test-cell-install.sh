@@ -2528,6 +2528,95 @@ _mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_shm
 [ "$_mrc" -eq 0 ] && grep -qF 'OK:https://api.premiselabs.co/mcp/:${TORTOISE_MCP_API_KEY}' <<<"$_mk" \
   && ok "…and the file that merge just wrote is one --verify CERTIFIES (verify -> install -> verify converges, rather than repairing a certification into a refusal or back)" \
   || fail "the merge wrote a file --verify refuses (rc=$_mrc, '${_mk}') — a self-hosting checkout could never bring a hosted cell up"
+# ⛔ THE NOTE ITSELF WAS ASSERTED NOWHERE (#3374 review, round 12 P3). The arm above captures the
+# merge's output to `selfhost-marked-merge.out` and never reads it, so deleting the sentence — or
+# reverting it to the "this machine's own tortoise url (https://api.premiselabs.co/mcp/)" wording this
+# round removed — kept the suite green on a correct FILE. The file is not the whole artifact: the
+# operator reads the log, and a sentence calling the hosted endpoint "this machine's own" is false.
+[ "$rc" -eq 0 ] && grep -qF "kept this cell's HOSTED tortoise endpoint" "$TMP/selfhost-marked-merge.out" \
+  && ! grep -q "machine's own tortoise url.*api[.]premiselabs[.]co" "$TMP/selfhost-marked-merge.out" \
+  && ok "…and the NOTE the operator reads says the HOSTED entry was kept, and never calls the hosted url 'this machine's own' (rc=$rc)" \
+  || fail "the merge's NOTE does not say the HOSTED entry was kept, or still calls the hosted url 'this machine's own' (rc=$rc) — the log is the artifact the operator reads, and a false sentence about it is the round-11 defect class"
+# ⛔ "IS THIS THE HOSTED ENDPOINT?" WAS ASKED OF THE WHOLE KEY, SO EVERY PATH SPELLING ESCAPED THE
+# HOSTED BRANCH (#3374 review, round 12 P1 — a FALSE PASS, and the most REACHABLE one in this file).
+# `_endpoint_key` appends the path/query/fragment verbatim, so only the byte-exact `/mcp/` reached the
+# hosted credential check. `node -e 'new URL(u).href'` normalises EVERY spelling below onto the
+# canonical hosted url, which answers HTTP 401 to an unauthenticated POST — they are the live hosted
+# endpoint, not self-hosts. Measured pre-fix, each one `SELFHOSTED:` rc=0 over `Bearer
+# ${SOME_OTHER_VAR}` (an EMPTY Bearer). ⛔ THE REACHABLE-BY-ACCIDENT FORM NEEDED NO MARKER AT ALL: a
+# TEMPLATE whose own url was the hosted host without the trailing slash installed `headers: null` and
+# `--verify` CERTIFIED it, so install and verify CONVERGED on the false pass this change exists to
+# close. The assertion is "refused, and never certified" rather than a named marker: which refusal is
+# correct differs by spelling (`:0443` normalises to the canonical endpoint and is refused for its
+# CREDENTIAL; a path spelling is refused for its spelling), and pinning one name would make the arm
+# pass on the wrong one.
+for _HSPELL in "https://api.premiselabs.co/mcp" "https://api.premiselabs.co/foo/../mcp/" \
+               "https://api.premiselabs.co/mcp/?x=1" "https://api.premiselabs.co/mcp/#x" \
+               "https://api.premiselabs.co:0443/mcp/"; do
+  _hlabel="${_HSPELL#https://api.premiselabs.co}"
+  python3 - "$ROOT/templates/.mcp.base.json" "$_sha_marked" "$_HSPELL" 'Bearer ${SOME_OTHER_VAR}' <<'PY'
+import json, sys
+base, out, url, auth = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+d = json.load(open(base))
+t = d["mcpServers"]["tortoise"]
+t["url"] = url
+t["headers"] = {"Authorization": auth}
+t["_selfHosted"] = True          # the marker the verifier used to honour over the hosted endpoint
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(out, "w"), indent=2)
+PY
+  _mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_sha_marked" "$SELFTPL/templates/.mcp.base.json" 2>&1)"; _mrc=$?
+  [ "$_mrc" -ne 0 ] && ! grep -qE 'SELFHOSTED:|^OK:' <<<"$_mk" \
+    && ok "a HOSTED endpoint spelled '$_hlabel' is NOT a self-host — refused (rc=$_mrc) over an EMPTY Bearer, never certified" \
+    || fail "--verify CERTIFIED the HOSTED endpoint spelled '$_HSPELL' (rc=$_mrc, '${_mk}') — the client parses this spelling as the canonical hosted url, so an empty Bearer is certified LAYER VERIFIED"
+done
+# …and the FALSE-BLOCK control: the rule is "the hosted AUTHORITY needs the hosted credential", not
+# "refuse anything that looks hosted". A genuine self-host — another host, or THIS host on a
+# non-default port (the documented own-daemon shape) — stays exempt, or the fix would repoint every
+# operator's own daemon, the silent-repoint defect this file's rule 3 forbids.
+for _SELF in "https://192.168.1.9/mcp/" "https://api.premiselabs.co:8443/mcp/"; do
+  python3 - "$ROOT/templates/.mcp.base.json" "$_sha_marked" "$_SELF" 'Bearer ${SOME_OTHER_VAR}' <<'PY'
+import json, sys
+base, out, url, auth = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+d = json.load(open(base))
+t = d["mcpServers"]["tortoise"]
+t["url"] = url
+t["headers"] = {"Authorization": auth}
+t["_selfHosted"] = True
+d["mcpServers"]["tortoise"] = t
+json.dump(d, open(out, "w"), indent=2)
+PY
+  _mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_sha_marked" "$SELFTPL/templates/.mcp.base.json" 2>&1)"; _mrc=$?
+  [ "$_mrc" -eq 0 ] && grep -qF 'SELFHOSTED:' <<<"$_mk" \
+    && ok "…while a GENUINE self-host ($_SELF) is still certified BY NAME with no credential — the exemption was narrowed to the hosted AUTHORITY, not disabled" \
+    || fail "--verify refused a genuine self-host ($_SELF) that the operator marked (rc=$_mrc, '${_mk}') — the hosted-authority rule is eating endpoints it must not touch"
+done
+# ⛔ AND THE INSTALL DIRECTION HAD TO CONVERGE WITH IT (#3374 review, round 12 P1). A template whose
+# OWN url is the hosted authority spelled some other way was installed VERBATIM, so the repair wrote
+# the very bytes the verifier now refuses — `verify -> install -> verify` could never converge. The
+# hosted endpoint is a fixed fact, so the merge writes the CANONICAL url whatever the template spelled.
+for _TSPELL in "https://api.premiselabs.co/mcp" "https://api.premiselabs.co/foo/../mcp/" \
+                "https://api.premiselabs.co/mcp/?x=1" "https://api.premiselabs.co/mcp/#x" \
+                "https://api.premiselabs.co:0443/mcp/"; do
+  _tlbl="${_TSPELL#https://api.premiselabs.co}"
+  _tcell="$TMP/hosted-spell.tpl.json"
+  python3 - "$_tcell" "$_TSPELL" <<'PY'
+import json, sys
+json.dump({"mcpServers": {"tortoise": {
+    "type": "http", "url": sys.argv[2],
+    "headers": {"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"}}}}, open(sys.argv[1], "w"))
+PY
+  _tget="$TMP/hosted-spell.cell.json"; printf '{"mcpServers":{}}' > "$_tget"
+  python3 "$ROOT/pi-bootstrap/lib/merge-mcp.py" "$_tcell" "$_tget" --cell >/dev/null 2>&1 || { fail "merge refused a template that is the HOSTED endpoint spelled '$_TSPELL' — a hosted spelling is not a bad template"; continue; }
+  _mk="$(bash -c 'source "$1"; graph_mcp_marker "$2" "$3"' _ "$_MARKER_FN2" "$_tget" "$_tcell" 2>&1)"; _mrc=$?
+  python3 - "$_tget" <<'PY' && [ "$_mrc" -eq 0 ] && grep -qF 'OK:https://api.premiselabs.co/mcp/:${TORTOISE_MCP_API_KEY}' <<<"$_mk" \
+    && ok "…and a template spelled '$_tlbl' installs the CANONICAL url and --verify CERTIFIES it (verify -> install -> verify converges)" \
+    || fail "a template spelled '$_TSPELL' produced a cell --verify refuses (rc=$_mrc, '${_mk}') — install writes what verify rejects, so the repair loop rewrites the same bytes forever"
+import json, sys
+t = (json.load(open(sys.argv[1])).get("mcpServers", {}) or {}).get("tortoise", {}) or {}
+sys.exit(0 if t.get("url") == "https://api.premiselabs.co/mcp/" else 1)
+PY
+done
 # ⛔ THE HOSTED DEFAULT IS NOW A DEFINED FACT IN TWO LANGUAGES (and in THREE assignments), SO PIN
 # EVERY ONE OF THEM TO THE ARTIFACT IT NAMES. `HOSTED_DEFAULT_URL` in merge-mcp.py and in
 # cell-install.sh's verifier, plus `GRAPH_HOSTED_DEFAULT_URL` in cell-install.sh's BASH, must all equal
