@@ -328,12 +328,23 @@ run_all() { local c; for c in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 clock
 # ── mutation matrix: disable ONE gate in a copy, require the owning case to go RED ──────────────
 MUTPASS=0
 MUTFAIL=0
+# syntax_guard <path> <mutation-name> — a mutant that does not PARSE proves nothing: it reddens every
+# case by killing the interpreter, which is indistinguishable from a load-bearing gate (#3481 round-4).
+syntax_guard() {
+    if bash -n "$1" 2>"$WS/syntax.err"; then return 0; fi
+    printf '  ❌ mutation %-9s produced a file that does not PARSE — the mutant proves nothing: %s\n' \
+        "$2" "$(head -2 "$WS/syntax.err" | tr '\n' ' ')"
+    MUTFAIL=$((MUTFAIL + 1))
+    return 1
+}
+
 mutate() { # <name> <owning-case> <sed-program>   (a `clock` mutation edits orch-loop.sh instead)
     local name="$1" owner="$2" prog="$3" copy out saved
     if [ "$name" = "clock" ]; then
         copy="$WS/orch-mut.sh"; cp "$ORCH_LOOP" "$copy"
         sed -i.bak "$prog" "$copy" || { printf '  ❌ mutation clock: sed failed\n'; MUTFAIL=$((MUTFAIL+1)); return; }
         cmp -s "$ORCH_LOOP" "$copy" && { printf '  ❌ mutation clock: sed changed NOTHING — a vacuous mutation\n'; MUTFAIL=$((MUTFAIL+1)); return; }
+        syntax_guard "$copy" clock || return
         CLOCK_ORCH="$copy"; PASS=0; FAIL=0
         run_one "$owner" >"$WS/mut-out" 2>&1
         out="$(cat "$WS/mut-out" 2>/dev/null)"; CLOCK_ORCH=""
@@ -350,6 +361,7 @@ mutate() { # <name> <owning-case> <sed-program>   (a `clock` mutation edits orch
     cp "$CRP" "$copy"
     sed -i.bak "$prog" "$copy" || { printf '  ❌ mutation %s: sed failed\n' "$name"; MUTFAIL=$((MUTFAIL+1)); return; }
     cmp -s "$CRP" "$copy" && { printf '  ❌ mutation %s: sed changed NOTHING — a vacuous mutation\n' "$name"; MUTFAIL=$((MUTFAIL+1)); return; }
+    syntax_guard "$copy" "$name" || return
     # ⛔ `CRP` IS REBOUND, NOT PASSED AS AN ENV PREFIX: the suite resolves $CRP once at load, so
     # `CLAIM_REAPER_PASS_BIN=x run_one …` would run the UNMUTATED binary and every mutation would
     # read green — which is exactly how this matrix first reported 0/4.
@@ -374,9 +386,13 @@ mutate() { # <name> <owning-case> <sed-program>   (a `clock` mutation edits orch
 mutate_cv() {
     local copy="$WS/mut-cv.sh" saved="$CRP" out
     cp "$CRP" "$copy"
-    # Drop every CANNOT-VERIFY advisory write, keeping the record write that precedes it.
-    sed -i.bak '/^        crp_block "CANNOT-VERIFY:/d' "$copy"
+    # ⛔ NEUTER THE ONE ANCHORED HELPER, NOT THE CALL SITES. A per-line delete over `crp_block
+    # "CANNOT-VERIFY: …` was BOTH incomplete (one write is nested 12 spaces deep) AND syntax-fatal
+    # (one advisory is a multi-line argument), so the matrix's "4/4 reddened" came from a copy that
+    # did not PARSE — a false PASS of the non-vacuity proof itself (#3481 round-4, P1).
+    sed -i.bak 's/^crp_block_cv() { crp_block "\$1"; } # MUT-ANCHOR:advisory-cv/crp_block_cv() { :; } # MUT-ANCHOR:advisory-cv/' "$copy"
     cmp -s "$CRP" "$copy" && { printf '  ❌ mutation advisory-cv: sed changed NOTHING — a vacuous mutation\n'; MUTFAIL=$((MUTFAIL+1)); return; }
+    syntax_guard "$copy" advisory-cv || return
     # All three CANNOT-VERIFY cases must redden: mutating only one arm and testing only one case is
     # how a re-silenced advisory ships green (#3481 round-2, P2).
     local c reddened=0 tried=0
@@ -405,6 +421,7 @@ mutate_arm_advisory() {
     cp "$CRP" "$copy"
     sed -i.bak "$prog" "$copy" || { printf '  ❌ mutation %s: sed failed\n' "$name"; MUTFAIL=$((MUTFAIL+1)); return; }
     cmp -s "$CRP" "$copy" && { printf '  ❌ mutation %s: sed changed NOTHING — a vacuous mutation\n' "$name"; MUTFAIL=$((MUTFAIL+1)); return; }
+    syntax_guard "$copy" "$name" || return
     CRP="$copy"; PASS=0; FAIL=0
     run_one "$owner" >"$WS/mut-out" 2>&1
     out="$(cat "$WS/mut-out" 2>/dev/null)"; CRP="$saved"
@@ -437,14 +454,27 @@ run_mutations() {
     # combined: the bound arm stops quoting the refusals it also saw
     mutate_arm_advisory advisory-combined 18 's/^        _refused=".*$/_refused=""/'
     # per-arm advisories: the no-tool arm and the mode-mismatch arm, each deleted on its own
-    mutate_arm_advisory advisory-notool 6 '/CANNOT-VERIFY: no claim reaper could be resolved/d'
-    mutate_arm_advisory advisory-mode   8 '/the arming decision did not reach it/d'
+    mutate_arm_advisory advisory-notool 6 's/crp_block_cv "CANNOT-VERIFY: no claim reaper could be resolved/: "CANNOT-VERIFY: no claim reaper could be resolved/'
+    mutate_arm_advisory advisory-mode   8 's/crp_block_cv "CANNOT-VERIFY: this pass asked for mode=/: "CANNOT-VERIFY: this pass asked for mode=/'
     # mktemp: the arm exists but stops advising (the round-3 gap: it had no case at all)
-    mutate_arm_advisory advisory-mktemp 17 '/could not create a temp file under/d'
+    mutate_arm_advisory advisory-nosummary 11 's/^        crp_block_cv "\$_cv"/        : "$_cv"/'
+    mutate_arm_advisory advisory-mktemp 17 's/crp_block_cv "CANNOT-VERIFY: the claim reaper pass could not create a temp file/: "CANNOT-VERIFY: the claim reaper pass could not create a temp file/'
     # clock: the controller call site loses this repo's registry
     mutate clock    clock 's/CLAIM_REPO="\$REPO" O="\$O" bash "\$_claim_pass"/bash "$_claim_pass"/'
     # bash32: expand the args array bare again — the abort the Macs would hit, invisible on bash 5
     mutate bash32   bash32 's/\${args\[@\]+"\${args\[@\]}"}/"${args[@]}"/'
+    # ⛔ THE GUARD'S OWN PROOF. Round 4 found the matrix reporting "4/4 reddened" from a mutant that
+    # did not PARSE — a false PASS of the non-vacuity proof itself. A deliberately syntax-fatal mutant
+    # must be REPORTED as a failure and must NOT be counted as a redden.
+    local f0="$MUTFAIL" p0="$MUTPASS"
+    mutate syntax-proof 11 's/^set -uo pipefail$/set -uo pipefail\nif true; then/'
+    if [ "$MUTFAIL" -eq $((f0 + 1)) ] && [ "$MUTPASS" -eq "$p0" ]; then
+        printf '  ✅ mutation %-9s is REJECTED as unparseable, not counted as a redden\n' "syntax-proof"
+    else
+        printf '  ❌ mutation %-9s was NOT rejected — a syntax-fatal mutant can pass as a result\n' "syntax-proof"
+        MUTFAIL=$((MUTFAIL + 1))
+    fi
+    MUTFAIL="$f0"   # the guard's own proof is not itself a mutation result
     printf '\n  mutations: %s reddened their case, %s did NOT\n' "$MUTPASS" "$MUTFAIL"
     [ "$MUTFAIL" -eq 0 ]
 }

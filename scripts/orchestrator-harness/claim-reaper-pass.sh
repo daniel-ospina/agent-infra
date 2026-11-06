@@ -48,8 +48,10 @@
 #
 # Exit: 0 pass completed, nothing releasable (or everything found was released when armed) ·
 #       3 CANNOT-VERIFY (no tool, an unreadable summary, or an arming decision that did not reach the
-#       tool — an unreadable answer is never zero) · 4 WORK LEFT BEHIND that policy or the bound
-#       stopped: RELEASABLE claims while UNARMED, or an armed pass that hit `--max` ·
+#       tool — an unreadable answer is never zero) · 4 WORK LEFT BEHIND that policy, the bound or a
+#       refused delete stopped: RELEASABLE claims while UNARMED (RELEASABLE-UNADMED), an armed pass
+#       that hit `--max` (BOUND-REACHED), or an armed pass whose fenced deletes were REFUSED because a
+#       peer took the ref (RELEASE-INCOMPLETE — raising the bound cannot clear those) ·
 #       otherwise the tool's own non-zero exit, passed through unchanged.
 # Each non-zero arm ALSO writes `$STATE/.claim-reap-blocked`, which cloud-cell-supervisor.sh prints.
 set -uo pipefail
@@ -105,7 +107,7 @@ main() {
         # whose schedule an operator must be able to see failing, and "no record at all" reads on
         # every surface as "the pass never ran".
         crp_record CANNOT-VERIFY none 3 "" "" ""
-        crp_block "CANNOT-VERIFY: no claim reaper could be resolved (looked at \$CLAIM_REAPER, $O/claim-reaper.sh, $HERE/claim-reaper.sh, \$HOME/.pi/agent/scripts/claim-reaper.sh), so NOTHING was examined and nothing was released — stale claims stay unreleased on this box until the harness is deployed."
+        crp_block_cv "CANNOT-VERIFY: no claim reaper could be resolved (looked at \$CLAIM_REAPER, $O/claim-reaper.sh, $HERE/claim-reaper.sh, \$HOME/.pi/agent/scripts/claim-reaper.sh), so NOTHING was examined and nothing was released — stale claims stay unreleased on this box until the harness is deployed."
         err "CANNOT-VERIFY: no claim reaper on this box (looked at \$CLAIM_REAPER, $O/claim-reaper.sh, $HERE/claim-reaper.sh, \$HOME/.pi/agent/scripts/claim-reaper.sh) — a scheduled pass that cannot find its tool must never read as a healthy one; deploy the harness: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O"
         return 3
     fi
@@ -118,7 +120,7 @@ main() {
         # pass had simply never run — the silence the advisory exists to remove.
         err "CANNOT-VERIFY: cannot create a temp file under ${TMPDIR:-/tmp} — the pass could not run at all"
         crp_record CANNOT-VERIFY "$mode" 3 "" "" ""
-        crp_block "CANNOT-VERIFY: the claim reaper pass could not create a temp file under ${TMPDIR:-/tmp}, so NO claim was examined and nothing was released — this is not an empty registry"
+        crp_block_cv "CANNOT-VERIFY: the claim reaper pass could not create a temp file under ${TMPDIR:-/tmp}, so NO claim was examined and nothing was released — this is not an empty registry"
         return 3
     fi
     # The registry is PER-REPO (#1996): the controller passes CLAIM_REPO, and claims.sh would
@@ -155,22 +157,23 @@ main() {
         verdict=CANNOT-VERIFY
         err "CANNOT-VERIFY: $tool printed no readable summary (rc=$rc) — the pass cannot be recorded as either healthy or failing"
         crp_record "$verdict" "$mode" "$rc" "" "" ""
-        crp_block "CANNOT-VERIFY: the claim reaper's last pass (rc=$rc) printed no readable summary, so NOTHING is known about this box's claims — an unreadable answer is not an empty registry, and it is not a pass. The usual cause is an UNREADABLE registry (claim-reaper.sh exits 2 before its summary). Last lines:
+        _cv="CANNOT-VERIFY: the claim reaper's last pass (rc=$rc) printed no readable summary, so NOTHING is known about this box's claims — an unreadable answer is not an empty registry, and it is not a pass. The usual cause is an UNREADABLE registry (claim-reaper.sh exits 2 before its summary). Last lines:
 $(printf '%s\n' "$out" | tail -4)"
+        crp_block_cv "$_cv"
         return 3 ;;
     esac
     case "${releasable:-}" in ''|*[!0-9]*)
         verdict=CANNOT-VERIFY
         err "CANNOT-VERIFY: $tool's summary carries no readable releasable= count (summary: ${summary:-<none>}) — an unreadable count is not zero"
         crp_record "$verdict" "$mode" "$rc" "$listed" "" ""
-        crp_block "CANNOT-VERIFY: the claim reaper's summary carries no readable releasable= count, so this pass measured nothing usable (summary: ${summary:-<none>})"
+        crp_block_cv "CANNOT-VERIFY: the claim reaper's summary carries no readable releasable= count, so this pass measured nothing usable (summary: ${summary:-<none>})"
         return 3 ;;
     esac
     if [ -n "${mode_reported:-}" ] && [ "$mode_reported" != "$mode" ]; then
         verdict=CANNOT-VERIFY
         err "CANNOT-VERIFY: asked the tool for mode=$mode and it reported mode=$mode_reported — the arming decision did not reach the pass, so its result says nothing about what this box would release"
         crp_record "$verdict" "$mode" "$rc" "$listed" "$releasable" "$released"
-        crp_block "CANNOT-VERIFY: this pass asked for mode=$mode and the reaper reported mode=$mode_reported, so the arming decision did not reach it — treat the result as unknown, not as a release pass"
+        crp_block_cv "CANNOT-VERIFY: this pass asked for mode=$mode and the reaper reported mode=$mode_reported, so the arming decision did not reach it — treat the result as unknown, not as a release pass"
         return 3
     fi
 
@@ -186,7 +189,7 @@ $(printf '%s\n' "$out" | grep -v '^\[claim-reaper\] listed=' | tail -4)"
         verdict=CANNOT-VERIFY
         err "CANNOT-VERIFY: $tool's summary carries no readable released= count (summary: ${summary:-<none>})"
         crp_record "$verdict" "$mode" "$rc" "$listed" "$releasable" ""
-        crp_block "CANNOT-VERIFY: the claim reaper's summary carries no readable released= count, so this pass cannot say how much of what it found it actually released"
+        crp_block_cv "CANNOT-VERIFY: the claim reaper's summary carries no readable released= count, so this pass cannot say how much of what it found it actually released"
         return 3 ;;
     esac
 
@@ -202,7 +205,7 @@ $(printf '%s\n' "$out" | grep -v '^\[claim-reaper\] listed=' | tail -4)"
             # An incoherent summary is not a clean pass: more released than were ever releasable.
             verdict=CANNOT-VERIFY
             crp_record "$verdict" "$mode" "$rc" "$listed" "$releasable" "$released"
-            crp_block "CANNOT-VERIFY: the claim reaper reports released=$released > releasable=$releasable, which cannot both be true — treat this pass as unknown"
+            crp_block_cv "CANNOT-VERIFY: the claim reaper reports released=$released > releasable=$releasable, which cannot both be true — treat this pass as unknown"
             return 3
         fi
         if [ "$released" -eq "$releasable" ]; then
@@ -268,5 +271,14 @@ crp_record() {
 # crp_block <text> — the ⛔ line the supervisor prints. Best-effort: an unwritable advisory must not
 # change the pass's exit code, because the code is the pass's own verdict.
 crp_block() { printf '%s\n' "$1" >"$CRP_BLOCKED" 2>/dev/null || true; }
+
+# crp_block_cv <text> — EVERY CANNOT-VERIFY advisory goes through this one call, so the mutation matrix
+# can disable all of them with ONE PARSE-SAFE edit (#3481 round-4, P1). The previous per-line sed over
+# `crp_block "CANNOT-VERIFY: …` was BOTH incomplete (one write sat nested 12 spaces deep, inside the
+# `released > releasable` arm) AND syntax-fatal — one advisory was a MULTI-LINE argument, so deleting
+# its first line orphaned its tail and the "mutant" failed to PARSE. The matrix therefore reported
+# "4/4 reddened" from a broken file rather than from a removed gate: a false PASS of the non-vacuity
+# proof itself. One anchor, and every mutant is now syntax-checked (`bash -n`) before it is trusted.
+crp_block_cv() { crp_block "$1"; } # MUT-ANCHOR:advisory-cv
 
 main "$@"
