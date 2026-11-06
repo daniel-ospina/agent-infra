@@ -720,6 +720,10 @@ fi
 # to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
 say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
 F="$T/cellcheck"; mkdir -p "$F/home" "$F/o" "$F/bin"
+# A PROVISIONED CELL, which is what every arm below claims to be testing: `check` refuses a box
+# with no usable stored credential and nothing in keys.env, so an unseeded fixture would decide
+# each arm with that refusal instead of its own subject (the store-gate ARMS unseed it again).
+seed_provider_store "$F/home"
 ai_init_repo "$F/repo"
 ai_worktree "$F/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
