@@ -2609,10 +2609,15 @@ else
 # ⛔ AN ANSI-C STRING IS NOT A PLAIN SINGLE-QUOTED ONE (review P2, cycle 30). Inside `$'...'` a backslash
 # DOES escape, so treating it as an ordinary single-quoted string closed the quote state on an escaped
 # quote and let a REAL comment survive — the fail-open direction — and this writer already uses the
-# form, so it is a live spelling. The awk keeps an `ansi` flag set when the quote is preceded by a SINGLE
-# `$` — not by `$$`, where the `$$` is the PID expansion and the quote after it is a PLAIN single-quoted
-# string, so a ` # …` there is a real comment (measured: `X=$$'a\' # stale` leaked the whole comment
-# under the first version of this flag, which is the fail-open direction).
+# form, so it is a live spelling. ⛔ THE TEST IS THE PARITY OF THE `$` RUN, NOT A SPECIAL CASE FOR `$$`
+# (review P2, cycles 32 and 33). Bash reads the run left to right: `$$` is the PID expansion, so a `$`
+# after it opens an ANSI-C string again — `$'x'` is ANSI-C, `$$'x'` is PID + a PLAIN single-quoted string,
+# `$$$'x'` is PID + ANSI-C. Two earlier guards were each one step short: the first fired on any preceding
+# `$` and leaked `$$'a\' # stale`; the second excluded `$$` by looking one character further back, which
+# is also how a look-back at column 1 broke (`substr($0, 0, 1)` CLAMPS to the first character in awk, so a
+# line STARTING `$'` compared its `$` against itself) and leaked `$'it\'s' # stale` — and it still
+# leaked `$$$'a\' # stale`, measured through the shipped strip: `rem` empty, the comment kept. The guard
+# now COUNTS the run and takes its parity, which is bash's own rule, and all three spellings are probes.
 # ⛔ A BACKSLASH ESCAPES THE NEXT CHARACTER (review P2, cycle 29). Without that arm, an escaped quote
 # outside quotes opened a PHANTOM quote state, so every `#` after it read as data and a REAL shell
 # comment survived into the graded view — a deleted `_head_rank` arm recorded as `: \' # was: unranked)
@@ -2629,7 +2634,9 @@ awk -v mark="${1:-0}" '
     if (q == "") {
       if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
       if (c == "\047" || c == "\"") {
-        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$" && (i < 3 || substr($0, i - 2, 1) != "$"));
+        nrun = 0; k = i - 1;
+        while (k > 0 && substr($0, k, 1) == "$") { nrun++; k-- }
+        ansi = (c == "\047" && nrun % 2 == 1);
         q = c; out = out c; prev = c; continue
       }
       if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) { rem = substr($0, i); break }
@@ -2673,7 +2680,9 @@ awk -v mark="${1:-0}" '
     if (q == "") {
       if (c == "\\") { out = out c substr($0, i + 1, 1); prev = "x"; i++; continue }
       if (c == "\047" || c == "\"") {
-        ansi = (c == "\047" && i > 1 && substr($0, i - 1, 1) == "$" && (i < 3 || substr($0, i - 2, 1) != "$"));
+        nrun = 0; k = i - 1;
+        while (k > 0 && substr($0, k, 1) == "$") { nrun++; k-- }
+        ansi = (c == "\047" && nrun % 2 == 1);
         q = c; out = out c; prev = c; continue
       }
       if (c == "#" && (prev == "" || index(" \t;()|&<>", prev) > 0)) { rem = substr($0, i); break }
@@ -2695,9 +2704,13 @@ _WCODE="$(_strip_comments < "$REFRESH")"
 # actually appear, and the sentence below says "boundary characters", not "spellings": `C=3|# stale`
 # and `F=6<# stale` are syntax errors, so they prove the CHARACTER ends the line, which is the
 # property the awk implements, not a line any shell would read.
-# Measured against `bash -n`, all FOURTEEN: NINE are valid shell (`A` `(echo hi)` `J` `K` `L` `M` `N` `O`
-# `P`) and FIVE are syntax errors — `C` `D` `E` `F` `I` — because a `|`, `&&`, `(` or a redirection cannot
-# precede `#` without a command. Those five grade the CHARACTER, which is what the stripper implements.
+# Measured against `bash -n`, all EIGHTEEN: THIRTEEN are valid shell (`A`, `(echo hi)`, `J`, `K`, `L`, `M`,
+# `N`, `O`, `P`, `Q`, the column-1 `$'...'`, `R`, `S`) and FIVE are syntax errors — `C` `D` `E` `F` `I` —
+# because a `|`, `&&`, `(` or a redirection cannot precede `#` without a command. Those five grade the
+# CHARACTER, which is what the stripper implements. This count has been wrong in three consecutive
+# reviews (eleven, then fourteen once `J`-`P` landed, then sixteen) — it is now measured from the list
+# that ships, one `bash -n` per line, and it is the reason every probe below carries a letter or a
+# self-describing spelling.
 # (The counts are stated because an earlier version of this note said "six of the eleven", a population
 # that had already grown to fourteen — a claim about a set is exactly as good as the set.)
 # `)` is probed on a SUBSHELL close, the form where it genuinely is a boundary — `B=2)# stale` is a
@@ -2709,11 +2722,13 @@ _WCODE="$(_strip_comments < "$REFRESH")"
 _strip_probe="$(printf '%s\n' 'A=1;# stale' '(echo hi)# stale' 'C=3|# stale' 'D=4&&# stale' \
   'E=5(# stale' 'F=6<# stale' 'I=7># stale' $'J=8\t# stale' \
   'K="head #5 is data"  # stale' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x # stale" 'O="a\"b" # stale' \
-  "P=\$'it\\'s' # stale" "Q=\$\$'a\\' # stale" "$'it\\'s' # stale" | _strip_comments)"
+  "P=\$'it\\'s' # stale" "Q=\$\$'a\\' # stale" "$'it\\'s' # stale" \
+  "R=\$\$\$'it\\'s' # stale" 'S=1 # elevenchr' | _strip_comments)"
 _strip_bad=""
 for _want in 'A=1;' '(echo hi)' 'C=3|' 'D=4&&' 'E=5(' 'F=6<' 'I=7>' $'J=8\t' \
               'K="head #5 is data"  ' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x " 'O="a\"b" ' \
-              "P=\$'it\\'s' " "Q=\$\$'a\\' " "$'it\\'s' "; do
+              "P=\$'it\\'s' " "Q=\$\$'a\\' " "$'it\\'s' " \
+              "R=\$\$\$'it\\'s' " 'S=1 '; do
   grep -qxF -- "$_want" <<<"$_strip_probe" || _strip_bad="$_strip_bad[$_want]"
 done
 if [ -z "$_strip_bad" ]; then
@@ -2741,11 +2756,41 @@ fi
 #       writer whose only `_head_rank=` arm hides behind a `;;#` must yield one fewer text than it
 #       contains. With `_WCODE="$(cat …)"` this stays GREEN while (a) reds, so (a) is what makes the strip
 #       non-removable and (b) is what makes a `;;#` arm count as absent.
-_diff_first() {   # <expected> <actual> → the first differing pair, for the message
-  diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") | awk '/^</ { if (!a) { a = substr($0, 1, 80) } }
-                                                            /^>/ { if (!b) { b = substr($0, 1, 80); exit } }
-                                                            END { printf "%s  /  %s", (a == "" ? "<none>" : a), (b == "" ? "<none>" : b) }'
+# ⛔ THE EXCERPT IS WINDOWED AROUND THE DIVERGENCE (review P3, cycle 33). A fixed `substr($0, 1, 80)`
+# printed two IDENTICAL strings for two 90-character lines differing only near the end — which is exactly
+# the shape a long writer comment has, so the one message a maintainer reads would have shown no
+# difference at all. The old version was also never invoked on a green run, so nothing graded its output:
+# the self-test below does.
+_diff_first() {   # <expected> <actual> → "at col N: <window> / <window>", for the message
+  diff <(printf '%s\n' "$1") <(printf '%s\n' "$2") | awk '
+    /^</ { if (!a) a = substr($0, 3) }
+    /^>/ { if (!b) { b = substr($0, 3); exit } }
+    END {
+      if (a == "" && b == "") { printf "no differing line"; exit }
+      if (a == "") { printf "at col 0: <none> / %s", substr(b, 1, 100); exit }
+      if (b == "") { printf "at col 0: %s / <none>", substr(a, 1, 100); exit }
+      p = 1
+      while (p <= length(a) && p <= length(b) && substr(a, p, 1) == substr(b, p, 1)) p++
+      st = (p > 25 ? p - 25 : 1)
+      printf "at col %d: %s%s / %s%s", p, (st > 1 ? "…" : ""), substr(a, st, 80), (st > 1 ? "…" : ""), substr(b, st, 80)
+    }'
 }
+_d1="$(_diff_first 'same tail XX' 'same tail YY')"
+case "$_d1" in
+  'at col 11: same tail XX / same tail YY') ok "pin/writer: the divergence message names the COLUMN and both windows (self-test)" ;;
+  *) bad "pin/writer: _diff_first returned '$_d1' for a one-character divergence (want 'at col 11: same tail XX / same tail YY') — the message a maintainer reads on a RED run is itself ungraded, and a wrong one sends them to the wrong line" ;;
+esac
+# AND THE WINDOW, on the shape that broke it: two long lines differing only near the END. A fixed
+# `substr(…, 1, 80)` printed two IDENTICAL strings here — which is exactly what a long writer comment
+# looks like — so the self-test has to diverge BEYOND the excerpt's reach, not at column 11.
+_d2="$(_diff_first "$(printf 'A%.0s' $(seq 1 40))tailX" "$(printf 'A%.0s' $(seq 1 40))tailY")"
+case "$_d2" in
+  'at col 45: '*) case "$_d2" in
+      *tailX*tailY*) ok "pin/writer: the divergence excerpt is WINDOWED — a divergence in the LAST character of a 45-column line still shows both tails (self-test)" ;;
+      *) bad "pin/writer: _diff_first lost the differing tails on a long line: '$_d2'" ;;
+    esac ;;
+  *) bad "pin/writer: _diff_first returned '$_d2' for a divergence in the last character of a 45-column line (want a window starting 'at col 45: ') — an unbounded-left excerpt prints two IDENTICAL strings for two long lines that differ near the end" ;;
+esac
 _content_lines() { grep -c '[^[:space:]]' || true; }
 # how many comments a marked pass removes, and the first one it removes
 _removed_n() {  awk -F'\001' 'NF > 1 && $2 != "" { n++ } END { print n + 0 }'; }
@@ -2784,10 +2829,16 @@ else
   if [ "${_n_short:-0}" -lt 5 ]; then
     bad "pin/writer: the reference strip removes only ${_n_short:-<unreadable>} comment(s) shorter than 20 characters (want >= 5), so this writer no longer has a SHORT-comment population to grade — if comments were legitimately removed from the writer, lower this number deliberately"
   else
-    ok "pin/writer: the short-comment population is $_n_short comments under 20 characters, and the view below must account for every one"
+    ok "pin/writer: the short-comment population is $_n_short comments under 20 characters (>= 5 required, so the class is non-empty; the 11-19-character band is graded by probe \`S\`, which no rule change can follow silently)"
+  fi
+  _wpin="$(grep -cE '^_WCODE="\$\(_strip_comments < "\$REFRESH"\)"$' "$_PINFILE" || true)"
+  if [ "${_wpin:-x}" = "1" ]; then
+    ok "pin/writer: the graded view is derived by the stripper UNDER TEST (\`_WCODE=\$(_strip_comments < \"\$REFRESH\")\`), not by the reference — equality alone cannot tell those apart"
+  else
+    bad "pin/writer: ${_wpin:-<unreadable>} line(s) assign \`_WCODE\` from \`_strip_comments\` (want 1) — if the view is now built by the REFERENCE, the equality below is a tautology and every predicate beneath it grades a view nothing under test produced"
   fi
   if [ "$_WCODE" = "$_ref_view" ]; then
-    ok "pin/writer: the graded view is BYTE-IDENTICAL to the frozen reference strip ($_n_strip comments removed, $_n_short of them under 20 characters) — a weakened strip, a different wiring, a truncation or an un-stripped spelling all diverge here"
+    ok "pin/writer: the graded view is BYTE-IDENTICAL to the frozen reference strip ($_n_strip comments removed, $_n_short of them under 20 characters) — a strip weakened on ONE side, a truncation, or a stale spelling diverges here. A rule change applied to BOTH copies is not detectable by this test (said in the comment above \`_strip_ref\`); the probes and the length-band probe are what grade the RULE"
   else
     bad "pin/writer: the graded view DIFFERS from the frozen reference strip — first divergence: '$(_diff_first "$_ref_view" "$_WCODE")'. The strip under test changed behaviour (weakened, or improved); if the change is INTENDED, update \`_strip_ref\` AND the probe set together, never one of them"
   fi
