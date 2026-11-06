@@ -219,6 +219,7 @@ function valof(v,   out, q, i) {
   # the value: drop it and let the ordinary value rules read what is inside. `X=()` still reads as
   # the empty value, i.e. `unknown` — a RED, which is the correct answer for a declaration with no code.
   if (out ~ /^\(/) out = substr(out, 2)
+  if (out ~ /^\$["']/) out = substr(out, 2)             # `$'83'` / `$"83"`: the `$` is a quoting PREFIX
   if (out ~ /^["']/) {
     q = substr(out, 1, 1)
     out = substr(out, 2)
@@ -280,7 +281,13 @@ function codeval(t,   v, i) {
     break
   }
   sub(/^[ \t]+/, "", t)
-  sub(/^%[a-zA-Z]+[ \t]+/, "", t)                   # `printf -v NAME %d 81`: the value is after the format
+  # ⛔ THE FORMAT ITSELF MAY BE QUOTED (review round 7, P3 — measured). `sub(/^%[a-zA-Z]+[ \t]+/)` did
+  # not tolerate the quotes, so `printf -v AGENT_MEM_GATE '%d' 81` produced NO ROW while the FAMILY
+  # path classified the identical shape as a `claim` — spelling, not behaviour, deciding whether a
+  # declaration is seen. That is NOT the STATED LIMIT above: the limit scopes out a COMPUTED value,
+  # and here the value is the literal 81 and only the FORMAT is quoted. It is also the dominant form in
+  # the tree (`printf -v "$3" '%s' …`), so the gap is reachable in house style, not only in theory.
+  sub(/^["']?%[a-zA-Z]+["']?[ \t]+/, "", t)          # `printf -v NAME %d 81` / `NAME '%d' 81`
   v = valof(t)
   sub(/^\+/, "", v)
   sub(/^0+/, "", v)
@@ -2873,7 +2880,7 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"absent: brief-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
 ck "(mutation d) an ABSENT required declarer (brief-gate.sh) is REFUSED and named, not skipped (rc=$CODE_RC; $CODE_MSG)" $rc
 # ⛔ (d2) THE SAME PROPERTY FOR THE NEWEST CODE IN THE UNIT (P2, fresh review of `1f45677f`). `82` has
-# exactly ONE declarer — `key-gate.sh:71 KEY_GATE_REFUSED=82` — and that file arrived on main while this
+# exactly ONE declarer — `key-gate.sh:72 KEY_GATE_REFUSED=82` — and that file arrived on main while this
 # branch was open, so it was outside `_codes_required`. Measured on the reviewed head: deleting it from
 # a copy left `RC=0 claims=14 absent: none`, i.e. the absent-declarer property this arm above proves was
 # FALSE for 82, and the tolerant `${KEY_GATE_REFUSED:-82}` in `chain-merge.sh` kept the tree readable and
@@ -2964,6 +2971,27 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
 ck "(prefix-assignment) a code after a \`FOO=1\` prefix assignment is a \`foreign\` row — the family net already refused the same shape, so the namespace must not decide whether a declaration is seen (rc=$CODE_RC; $CODE_MSG)" $rc
 
+# (d9) SPELLING MUST NOT DECIDE WHETHER A DECLARATION IS SEEN (review round 7, P3 — measured). The
+# printf-format strip did not tolerate quotes, so the FOREIGN net dropped `printf -v X '%d' 81` while
+# the family net classified the identical line as a `claim` — and the quoted format is the dominant
+# form in the tree (`printf -v "$3" '%s' …`). `$'83'` was dropped the same way. Not the STATED LIMIT:
+# that scopes out a COMPUTED value, and these values are literals.
+_codemut_dir="$(_codemut quoted-spelling)"
+printf "\nprintf -v AGENT_MQ_GATE '%%d' 81\nprintf -v AGENT_MD_GATE \"%%d\" 81\nAGENT_DOLLAR_GATE=\$'83'\n" >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+_missing=""
+for _want in AGENT_MQ_GATE AGENT_MD_GATE AGENT_DOLLAR_GATE; do
+  case "$CODE_MSG" in *"spawn-gate.sh:$_want"*) : ;; *) _missing="$_missing $_want" ;; esac
+done
+[ -z "$_missing" ]; rc=$?
+ck "(quoted-spelling) a QUOTED printf FORMAT (single and double) and an ANSI-C \`\$'…'\` operand are all \`foreign\` rows — the family net already read the same spellings, so punctuation must not decide (missing:${_missing:- none}; rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut quoted-not-code)"
+printf "\nprintf -v AGENT_PLAIN_GATE '%%s' abc\nAGENT_STR_GATE=\$'abc'\n" >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_PLAIN_GATE"*|*"AGENT_STR_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) the same QUOTED spellings carrying NO code stay SILENT — the widened reader must not turn a string into a declaration (rc=$CODE_RC; $CODE_MSG)" $rc
+
 # (d8) THE PREFIX OPERAND MAY BE QUOTED OR ESCAPED, AND `let`/`time` ARE COMMAND POSITIONS (review
 # round 6, P3 — each measured). `[^ \t]*` could not cross a space, so `FOO="a b" X=81` matched no
 # operand and got NO row; and `let X=81` / `time X=81` / `time -p X=81` assign 81 yet read silent while
@@ -2982,7 +3010,6 @@ done
 ck "(prefix-quoted) a QUOTED prefix operand, an ESCAPED one, \`let\` and \`time -p\` are all \`foreign\` rows — a space in the value, or a keyword, must not make the declaration invisible (missing:${_missing:- none}; rc=$CODE_RC; $CODE_MSG)" $rc
 
 _codemut_dir="$(_codemut where-let-is-not)"
-printf '\necho let AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
 codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
 ck "(control) the same words after \`echo\` stay SILENT — \`let\`/\`time\` are command positions only in command position (rc=$CODE_RC; $CODE_MSG)" $rc
