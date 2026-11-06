@@ -137,6 +137,13 @@ fi
 # the shipped code runs in (`QUEUE_ORDER_STATE` is initialised here for the same reason the shipped
 # script initialises it above the definitions: the functions read it before any pass has decided).
 drive_prologue() { printf 'set -u\nQUEUE_ORDER_STATE=""\n'; }
+# ⛔ THE TRACING PROLOGUE SETS `PS4` INSIDE THE SCRIPT, NOT IN THE ENVIRONMENT (measured, cycle 49). A
+# `PS4=… bash -x …` prefix is DROPPED when the shell runs as root — the trace then reads `+ echo '…'`
+# with no function name, so every witness check would red for the wrong reason on a root host. Set on
+# the script's own first lines, it is honoured for every uid.
+drive_xtrace_prologue() {
+  printf '%s\n' 'set -u' 'QUEUE_ORDER_STATE=""' "PS4='+\${FUNCNAME[0]:-main} '" 'set -x'
+}
 
 drive() {
   local label="$1" src="$2" q="$3" pool="$4" how="${5:-call}"
@@ -1738,8 +1745,8 @@ _dwit() {  # _dwit <xtrace-file> [function-name] -> the prefix of the first echo
 # from "something printed the same text".
 _base="$TMP/witness"; rm -rf "$_base"; mkdir -p "$_base/o"
 printf '300\n9\n200\n' > "$_base/o/candidates.txt"; printf '200\n300\n' > "$_base/o/.pool"
-{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
-( cd "$_base" && HOME="$_base" PS4='+${FUNCNAME[0]:-main} ' bash -x drive.sh "$_base/o" ) > "$_base/out" 2>"$_base/trace"
+{ drive_xtrace_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
+( cd "$_base" && HOME="$_base" bash drive.sh "$_base/o" ) > "$_base/out" 2>"$_base/trace"
 _wit_base="$(_dwit "$_base/trace")"
 ck "an echo INSIDE queue_order_from_pool is EXECUTED by the unmutated drive ('${_wit_base:-<none>}')" "$([ -n "$_wit_base" ] && echo 0 || echo 1)"
 if [ -n "$_wit_base" ] && grep -qF "$_wit_base" "$_base/out" 2>/dev/null; then rc=0
@@ -1751,6 +1758,7 @@ ck "the witness the trace names is text this drive actually PRINTED" $rc
 # paths, permanently: printed DATA inside the function must yield NO witness, and a real `echo` must.
 _dwp="$TMP/wit-parse"; rm -rf "$_dwp"; mkdir -p "$_dwp"
 printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
   'queue_order_from_pool() {' \
   "  cat <<'ZZZ'" \
   '  [refresh] decoy order: printed DATA, never an executed echo' \
@@ -1758,15 +1766,16 @@ printf '%s\n' \
   '  return 0' \
   '}' \
   'queue_order_from_pool' > "$_dwp/decoy.sh"
-( cd "$_dwp" && PS4='+${FUNCNAME[0]:-main} ' bash -x decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
+( cd "$_dwp" && bash decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
 ck "a heredoc body that mimics an arm names NO witness (printed data is not a witness)" \
    "$([ -z "$(_dwit "$_dwp/decoy.trace")" ] && echo 0 || echo 1)"
 printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} '" 'set -x' \
   'queue_order_from_pool() {' \
   '  echo "[refresh] queue order: severity-first from the pool — head #1"' \
   '}' \
   'queue_order_from_pool' > "$_dwp/real.sh"
-( cd "$_dwp" && PS4='+${FUNCNAME[0]:-main} ' bash -x real.sh ) > "$_dwp/real.out" 2>"$_dwp/real.trace"
+( cd "$_dwp" && bash real.sh ) > "$_dwp/real.out" 2>"$_dwp/real.trace"
 ck "an executed arm echo DOES name a witness, and it is the prefix the drive printed" \
    "$([ "$(_dwit "$_dwp/real.trace")" = '[refresh] queue order' ] && echo 0 || echo 1)"
 
@@ -1788,8 +1797,8 @@ if [ "$_mut_ok" = "0" ]; then
 else
   d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
-  { drive_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
-  ( cd "$d" && HOME="$d" PS4='+${FUNCNAME[0]:-main} ' bash -x drive.sh "$d/o" ) > "$d/out" 2>"$d/trace"
+  { drive_xtrace_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" bash drive.sh "$d/o" ) > "$d/out" 2>"$d/trace"
   # ⛔ AND THE MUTANT MUST HAVE RUN (review P2, cycle 44). The three application gates observe that the
   # mutation was WRITTEN, never that the mutated driver EXECUTED: a syntactically broken replacement passes
   # all three, the drive dies, and the only predicate (absence of the clause) is satisfied by the failure —
@@ -1980,7 +1989,7 @@ _arm14() {  # _arm14 <label> <count-content|-> -> print the drive's output
   printf '200\n300\n' > "$_ad/o/candidates.txt"; printf '200\n300\n' > "$_ad/o/.pool"
   printf 'P1-severe\n' > "$_ad/o/.pool-sat"
   sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_ad/fns-shim.sh"
-  { drive_prologue; cat "$_ad/fns-shim.sh"
+  { drive_xtrace_prologue; cat "$_ad/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; '
     if [ "$2" = "-" ]; then printf 'rm -f "$4"'; else printf 'printf "%%s\\n" "%s" > "$4"' "$2"; fi
     printf '; return $_rq_rc; }\n'
@@ -1990,7 +1999,7 @@ _arm14() {  # _arm14 <label> <count-content|-> -> print the drive's output
   # PRINTS, and printed DATA can produce the same string; the TRACE is what separates "an arm echoed it" from
   # "something printed it". Capturing both from a single run keeps them describing the same execution — two
   # runs would let the first one's reorder change what the second one takes.
-  ( cd "$_ad" && HOME="$_ad" PS4='+${FUNCNAME[0]:-main} ' bash -x drive.sh "$_ad/o" ) > "$_ad/out" 2>"$_ad/trace"
+  ( cd "$_ad" && HOME="$_ad" bash drive.sh "$_ad/o" ) > "$_ad/out" 2>"$_ad/trace"
   cat "$_ad/out"
 }
 
@@ -2031,11 +2040,11 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   # per-arm checks reported "the strip did NOT apply" for four successful strips. The first output line is
   # the verdict; the drive's own output follows it.
   if cmp -s "$_amd/fns-ren.sh" "$_amd/fns-shim.sh" 2>/dev/null; then printf '__STRIP_NOOP__\n'; else printf '__STRIP_OK__\n'; fi
-  { drive_prologue; cat "$_amd/fns-shim.sh"
+  { drive_xtrace_prologue; cat "$_amd/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; printf "%%s\\n" "%s" > "$4"; return $_rq_rc; }\n' "$3"
     printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
   } > "$_amd/drive.sh"
-  ( cd "$_amd" && HOME="$_amd" PS4='+${FUNCNAME[0]:-main} ' bash -x drive.sh "$_amd/o" ) > "$_amd/out" 2>"$_amd/trace"
+  ( cd "$_amd" && HOME="$_amd" bash drive.sh "$_amd/o" ) > "$_amd/out" 2>"$_amd/trace"
   cat "$_amd/out"
 }
 # The tuple is `arm|SOURCE-needle|count|OUTPUT-marker`: the needle locates the echo line in the SCRIPT
@@ -2067,10 +2076,10 @@ if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said
   _d="$_d14b"
   # ⛔ ITS OWN CONTROL FIRST (review P2, cycle 48): this fixture lands on the HEAD-NOT-NUMERIC arm, not on the
   # severity arm §14c drives, so the witness has to be resolved against an unmutated run of THIS fixture.
-  { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-ctl.sh"
-  ( cd "$_d" && HOME="$_d" PS4='+${FUNCNAME[0]:-main} ' bash -x drive-ctl.sh "$_d/o" ) > "$_d/out-ctl" 2>"$_d/trace-ctl"
-  { drive_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
-  ( cd "$_d" && HOME="$_d" PS4='+${FUNCNAME[0]:-main} ' bash -x drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>"$_d/trace-mut"
+  { drive_xtrace_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-ctl.sh"
+  ( cd "$_d" && HOME="$_d" bash drive-ctl.sh "$_d/o" ) > "$_d/out-ctl" 2>"$_d/trace-ctl"
+  { drive_xtrace_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
+  ( cd "$_d" && HOME="$_d" bash drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>"$_d/trace-mut"
   # ⛔ AND THE MUTANT MUST HAVE RUN HERE TOO (review P3, cycle 45). This check had exactly the defect §14c
   # was hardened for one commit earlier: a dead driver satisfies "the clause is absent" for the wrong
   # reason. Same witness, derived the same way.
