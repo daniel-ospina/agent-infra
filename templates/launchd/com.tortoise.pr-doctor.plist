@@ -18,19 +18,20 @@
          REPLACES that hand-made agent with the tracked one — same label, same
          script, now reproducible from source. That replacement is the point.
 
-         THE TARGET IS THE FARMED COPY, like every other always-installable job in
+         THE TARGET IS THE FARMED WRAPPER, like every other always-installable job in
          this directory (pi-reap-orphans, pi-cache-reap, lane-liveness): setup.sh's
-         fleet-scripts farm copies pr-doctor.py to that path BEFORE the launchd
-         convergence step, which is what makes the `<string>` resolve on a fresh box.
+         fleet-scripts farm copies pr-doctor-machine.sh (fleet_srcs) and
+         lib/repo-set.sh (lib_srcs) to that path BEFORE the launchd convergence step,
+         which is what makes the `<string>` resolve on a fresh box.
          install-launchd.sh hard-fails a job whose target does not resolve, and that
          check is deliberately NOT defeated here: a bare `install-launchd.sh` on a box
          that never ran the farm FAILs this job instead of installing a dead one, which
          is the correct verdict and the same one every farmed job gets.
-         The interpreter is `/usr/bin/env python3` — the shape the LIVE job was armed
-         with — and not the installer's PYTHON_BIN placeholder: on a non-swarm box that
-         placeholder is deliberately pointed at a venv that does not exist, so using it
-         would hard-fail this install for a reason that has nothing to do with the
-         doctor.
+         The interpreter is resolved BY THE WRAPPER (`python3` on PATH, then
+         /usr/bin/python3, then /usr/local/bin/python3) and not the installer's
+         PYTHON_BIN placeholder: on a non-swarm box that placeholder is deliberately
+         pointed at a venv that does not exist, so using it would hard-fail this install
+         for a reason that has nothing to do with the doctor.
 
          WHY 30 MINUTES. One pass is a real read of every open non-draft PR plus up
          to MAX_FIX/MAX_REVIEW load-gated worker spawns, with each gh call bounded at
@@ -44,46 +45,62 @@
 
          WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
          $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
-         .../pr-doctor.status.json; the launchd capture below is the third surface and
+         .../pr-doctor.status.json; in the multi-repo (`all-repos`) mode the wrapper
+         runs, each repo ALSO gets `pr-doctor.<owner>-<name>.log` and
+         `pr-doctor.<owner>-<name>.status.json` beside them, so one repo's verdict cannot
+         stand in for another's. The launchd capture below is the third surface and
          the one its own code names — a pass that dies before it can write either
          still leaves its crash text here (a launchd job's stderr is the only place
          an interpreter-level death lands), which is what makes an import error
-         distinguishable from an honest RED verdict.
+         distinguishable from an honest RED verdict. The wrapper's own mode line
+         (`set: … grading N repo(s)`, or `DEGRADED — NO-REPO-SET …`) is on the same
+         capture, which is what makes a box with no repo set visible instead of quiet.
 
          GH: PATH carries the fleet's gh-wrapper dir first (rendered by
          install-launchd.sh with the unreadable pi shim dir removed, #1719/#427), and
          HOME stays the real home so the doctor's state dir is the fleet's, not
          launchd's.
 
-         ⛔ THE REPO IS NAMED BY ARGV (the "repo" flag) AND NOT BY `GH_REPO` (agent-infra#2280).
-         This template used to carry `<key>GH_REPO</key><string>daniel-ospina/tortoise</string>`
-         and nothing else, which worked only because the doctor resolved its target from a
-         MODULE CONSTANT that happened to be the same repo. #2280 removed that constant: the
-         doctor now resolves its target by EVIDENCE (the "repo" flag, then `OR`, then `REPO`'s git
-         origin, then the cwd's origin) and REFUSES (exit 2) when none answers, because `GH_REPO`
-         is a box-GLOBAL selector (a pushed `keys.env` once exported
-         `GH_REPO=daniel-ospina/tortoise` and `gh` obeyed it for every command on the box, #2235).
-         A job armed from this template with only `GH_REPO` set would therefore have exited 2 on
-         every tick and dispatched NOTHING, for ever, while looking armed. That is why the change
-         that removed the constant ships this template fix WITH it. The flag is rank 1 (this job's
-         explicit word for THIS invocation); `REPO` below is rank 3 and is only ADOPTED when its
-         own git `origin` PROVES that slug, so the plist cannot make the doctor read another
-         repo's worktrees, and a box whose `{{TORTOISE_REPO}}` does not resolve grades the queue
+         ⛔ THE REPO IS NOT NAMED HERE AT ALL ANY MORE (agent-infra#2281 §1). This unit used to
+         assert its repo in argv — the literal `repo` flag followed by the tortoise slug —
+         which was correct when the box ran one repo and became the defect the moment it ran two:
+         on a cell whose config declares `OR=daniel-ospina/agent-infra` while its controller was
+         started for tortoise, the doctor logged `repo: daniel-ospina/tortoise (from the repo flag)` on
+         EVERY pass and the second repo's queue was read by nothing. #2280 fixed WHICH repo the
+         resolver picks; it could not give a multi-repo box more than one, because #2280 deliberately
+         shipped `PR_DOCTOR_REPOS` with NO default set — there was no authoritative machine list to
+         read (§4). There is one now: `scripts/lib/repo-set.sh` reads the machine's repo SET, and
+         `scripts/pr-doctor-machine.sh` — what this unit execs — grades EVERY repo in it.
+
+         ⛔ STILL NOT `GH_REPO`. `GH_REPO` is a box-GLOBAL selector (a pushed `keys.env` once
+         exported `GH_REPO=daniel-ospina/tortoise` and `gh` obeyed it for every command on the box,
+         #2235), so it is not evidence and the doctor pins it — in that direction only — for the
+         children it spawns. ⛔ AND NOT THE `repo` FLAG EITHER, for the same class of reason one
+         level up: a flag in one machine-wide plist is a SECOND place that says which repos this box
+         serves, and the whole point of §4 is that there is one. `REPO` below stays as the box's own
+         checkout EVIDENCE, and it is only used on the degraded path (no set yet): the doctor adopts
+         it only when its git `origin` PROVES the slug it names, so the plist cannot make the doctor
+         read another repo's worktrees, and a box whose checkout does not resolve grades the queue
          read-only and says so instead of spawning.
 
-         ⛔ DO NOT RE-ADD `GH_REPO` AS THE SELECTOR. It is not evidence (see above); the doctor
-         pins `GH_REPO` to the repo it resolved, in that direction only, for the children it
-         spawns. -->
+         ⛔ WHAT HAPPENS ON A BOX WITH NO SET (the migration state). The wrapper does not refuse: it
+         runs the single-repo form, resolves the repo from `REPO`'s `origin` / `OR` exactly as this
+         unit did before, and LOGS `DEGRADED — NO-REPO-SET` with the exact file to create on every
+         pass. Refusing there would stop grading every existing box on upgrade; degrading silently
+         would be the 'installed but inert' state this repo keeps paying for, so it is one loud line
+         per pass. Create the set and the same unit grades every repo in it with no reinstall.
+
+         ⛔ A SET THAT EXISTS BUT DOES NOT VALIDATE IS A REFUSAL (exit 2, named). Dropping a line the
+         reader cannot parse would grade a shorter set, and a shorter set reads exactly like a
+         smaller machine. -->
     <key>Label</key>
     <string>com.tortoise.pr-doctor</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>{{HOME}}/.pi/agent/scripts/pr-doctor.py</string>
-        <!-- The repo this job grades, as argv (rank-1 evidence in resolve_repo()). -->
-        <string>--repo</string>
-        <string>daniel-ospina/tortoise</string>
+        <!-- The FARMED wrapper (fleet_srcs), which reads the machine repo set (lib_srcs) and grades
+             every repo in it. No repo is named in this argv — see the block above. -->
+        <string>/bin/bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pr-doctor-machine.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -91,7 +108,8 @@
         <string>{{PATH}}</string>
         <key>HOME</key>
         <string>{{HOME}}</string>
-        <!-- The CHECKOUT (not a slug): adopted only if its `origin` proves the repo above. -->
+        <!-- The CHECKOUT (not a slug) — the box's own evidence for the DEGRADED path (no repo set
+             yet): adopted only if its `origin` PROVES the slug the doctor resolves. -->
         <key>REPO</key>
         <string>{{TORTOISE_REPO}}</string>
     </dict>

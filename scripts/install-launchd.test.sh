@@ -126,7 +126,7 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py pr-doctor-machine.sh; do
         touch "$1/.pi/agent/scripts/$f"
         chmod +x "$1/.pi/agent/scripts/$f"
     done
@@ -165,6 +165,12 @@ mkfakehome() { # $1 = home dir
     mkdir -p "$1/.pi/agent/scripts/lib"
     touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
     chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    # #2281 §1: pr-doctor's unit now execs the machine wrapper (fleet_srcs), which resolves the repo
+    # SET reader as a sibling `lib/` file (lib_srcs). Both must exist or the broken-target arm the
+    # line above exists for would refuse this job — the correct verdict on a box that never ran the
+    # farm, and a spurious one here.
+    touch "$1/.pi/agent/scripts/lib/repo-set.sh"
+    chmod +x "$1/.pi/agent/scripts/lib/repo-set.sh"
     # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
     # the driver + its sibling classifier under scripts/fleet/ (the broken-target
     # guard refuses the install when they are absent). NOT tools/fleet/: pi's
