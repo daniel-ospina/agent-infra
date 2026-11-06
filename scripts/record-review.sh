@@ -1282,7 +1282,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok="" _tsha=""
   local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
@@ -1702,7 +1702,38 @@ $m"
     #     stated range is checked and ALL must pass.
     # A body that states no range at all used to fall to the bare needle (a match on B's sha
     # alone). THAT FALLBACK IS GONE FOR AN AUTHORED RANGE — see the refusal below.
-    _scan="$EVIDENCE_BODY"; _any=0; _all_ok=1
+    # ⛔ THE SCAN READS THE **CLAIM**, NOT THE WHOLE ARTIFACT (#3442 block excluded). Sixth
+    # review cycle, P2: `## MUTATION ATTRIBUTION` is MANDATORY in every fresh clean artifact
+    # (agent-infra#3442) and its rows quote ranges and shas as a matter of course — a row
+    # describing a mutant "pinned to A1..B" was compared as if it were the reviewer's own
+    # claim, so a CORRECT artifact was refused because of its kill table. The claim lives in
+    # the prose; the kill table is not a claim about what was reviewed. (The converse — a
+    # narrowed claim hidden inside the table — is not a hole, because the table cannot be the
+    # statement the record relies on: the rule below requires the CLAIM to state the range.)
+    # ⛔ AND THE BODY ARRIVES `@tsv`-ESCAPED — GitHub delivers a comment as ONE record with
+    # literal `\n` sequences, so a line-oriented scan sees no line starts at all and the block
+    # was never stripped (MEASURED: the kill table's own row was compared as the claim and
+    # refused a correct artifact instead of being excluded). This is the identical defect
+    # #3442's own parser paid for and documents; un-escaping FIRST is what makes the strip
+    # work, and it is also what lets a range split across a line break be seen. `gsub(/\\n/,
+    # "\n")` is awk rather than sed because BSD and GNU sed disagree about `\n` in a
+    # replacement and this file runs on both.
+    _claim="$(printf '%s\n' "$EVIDENCE_BODY" | command awk '
+      { rec = rec $0 "\n" }
+      END {
+        gsub(/\\n/, "\n", rec)
+        n = split(rec, L, "\n")
+        skip = 0
+        for (i = 1; i <= n; i++) {
+          if (L[i] ~ /^##[[:space:]]/) {
+            skip = (L[i] ~ /^##[[:space:]]+MUTATION[[:space:]]+ATTRIBUTION/)
+            if (skip) continue
+          }
+          if (!skip) print L[i]
+        }
+      }
+    ' 2>/dev/null || true)"
+    _scan="$_claim"; _any=0; _all_ok=1
     while [[ "$_scan" =~ ([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40}) ]]; do
       _any=1
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
@@ -1757,19 +1788,69 @@ $m"
     # the reviewed head A), which is a name, not a range, and is checked there.
     if [ "$_any" -ne 1 ]; then
       if [ "$_delta_tok" -eq 1 ]; then
-        echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as <40-hex>..<40-hex> (or ...), or run a fresh review at the head and use plain --evidence comment:<id>." >&2
+        echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as <40-hex>..<40-hex> (or ...)." >&2
       else
         echo "   delta: the covering artifact '$cover' does not STATE the range ${from:0:12}…..${to:0:12}… — naming ${to:0:12}… alone is not a statement that the reviewer covered the authored commits, and a range inferred from the head's name is precisely the claim this record would assert with no evidence behind it. (A stated range is REQUIRED here; it is not inferred from the artifact's notation, length or wording.)" >&2
-        echo "   → quote the range in the artifact (e.g. delta:${from:0:12}..${to:0:12}); or, if the reviewer's verdict is at ${to:0:12}… and they did not state a range, record it as a plain --evidence comment:<id> attestation — the same head binding, without a range claim this record cannot support." >&2
       fi
+      # ⛔ THE REMEDY MUST BE ONE THAT EXISTS. The remedy this printed was "record it with
+      # plain --evidence comment:<id>" — which is NOT available in the ordering this whole
+      # feature exists for: `verify_review_evidence` requires the artifact to postdate the
+      # head, and a delta exists precisely when the verdict was written at A and B came
+      # later. Sixth review cycle, P2 — a refusal that names an impossible fix costs a full
+      # re-review while reading as a two-line workaround.
+      echo "   → the reviewer must state the range they read. Quote it as delta:${from:0:12}..${to:0:12} and re-record. A plain --evidence comment:<id> at ${to:0:12}… records the same head binding WITHOUT a range claim, but only if that verdict was written at or after ${to:0:12}… — when the verdict PREDATES the head (the ordering a delta exists for), a fresh review at ${to:0:12}… is owed." >&2
       return 1
     fi
     body_claim=1
-    fi
-    if [ "$body_claim" -ne 1 ]; then
-      echo "   delta: the covering artifact '$cover' does not NAME the range ${from:0:12}…..${to:0:12}… (it names neither the range nor ${to:0:12}…) — and a verdict that does not state which range it covered cannot be extended over authored commits by DATE alone, because a commit's date records when it was CREATED: an old-dated branch merged in after the review slips through an anchor built only from dates." >&2
-      echo "   → if the reviewer did cover this range, quote it in the artifact (e.g. delta:${from:0:12}..${to:0:12}); or run a fresh review at ${to:0:12}… and record it with plain --evidence comment:<id>." >&2
+    # ⛔ EVERY COMMIT THE CLAIM NAMES MUST BE THE HEAD OR AN ANCESTOR OF THE RANGE'S START.
+    # Sixth review cycle, P1 — and it is the FIFTH-cycle P1 one layer up, which is why the
+    # fix is structural rather than another widened pattern. Requiring a stated range does
+    # not stop a CONTRADICTING one, because the contradiction check only sees the spellings
+    # its regex tokenises (`hex[space]dots[space]hex`). This feature's own refusal messages
+    # teach reviewers to quote `delta:<A>..<B>` — so an artifact can carry an acceptably
+    # spelled decoy AND a narrower claim in any other notation (`A1–HEAD`, 8-char shas,
+    # `git diff a b`, `A1 through HEAD`), and the decoy satisfies every parsed check while
+    # the narrowing is invisible. MEASURED on the previous head: `delta:BASE..HEAD` followed
+    # by `Reviewed only A1–HEAD` recorded rc 0 with delta_range=BASE..HEAD.
+    # So the rule no longer asks what the notation IS; it asks what the artifact MEANS. Every
+    # 7-40 hex run in the claim that RESOLVES to a commit must be this range's head or an
+    # ancestor of its start (`from`): those are exactly the commits a reviewer covering
+    # A..B may name — the endpoints of the accepted range satisfy it by construction, and
+    # anything later than A is a narrowing in whatever notation it was written. Unresolvable
+    # runs are prose, not commits, and are ignored (a sha that is not in this repo cannot
+    # narrow this range). Alphabet-independent, abbreviation-length-independent, and it does
+    # not need to know the word "through".
+    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u || true)"
+    for _tok in $_toks; do
+      _tsha="$(delta_git "$root" rev-parse --verify "${_tok}^{commit}" 2>/dev/null || true)"
+      [ -n "$_tsha" ] || continue
+      [ "$_tsha" = "$to" ] && continue
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$_tsha" "$from" 2>/dev/null || _r=$?
+      [ "$_r" -eq 0 ] && continue
+      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — neither ${to:0:12}… (the head being attested) nor an ancestor of ${from:0:12}… (the range's start). That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
+      echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}." >&2
       return 1
+    done
+    # ⛔ AND A RANGE STATED RELATIVE TO THE TIP IS ALWAYS NARROWER THAN THE RANGE BEING
+    # RECORDED, so it can only ever be a narrowing claim — there is no innocent reading of
+    # `HEAD~3..HEAD` in an artifact offered as evidence that the reviewer covered A..B. It
+    # carries no hex token at all, which is why the rule above cannot see it (MEASURED: the
+    # decoy `delta:BASE..HEAD` followed by `I only actually reviewed HEAD~1..HEAD` recorded
+    # rc 0 before this arm).
+    # ⛔ DECLARED RESIDUAL, and it is stated rather than half-closed: an arbitrary SYMBOLIC
+    # ref (`main..HEAD`, `origin/main`) is NOT interpreted here. Resolving prose nouns would
+    # refuse honest artifacts — a review comment saying "rebased onto origin/main" would be a
+    # false block whenever main sits ahead of the range start — and a rule that guesses which
+    # nouns are claims is the spelling-enumeration failure in a new costume. The residual is
+    # bounded by the fact that such a ref must still be WRITTEN as a range by the artifact
+    # author, and it is named here so a later reader can tell it from an oversight.
+    case "$_claim" in
+      *HEAD~*|*HEAD^*|*head~*|*head^*|*"@~"*|*"@^*")
+        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (HEAD~N / HEAD^N / @~N) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
+        echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
+        return 1 ;;
+    esac
     fi
   fi
   DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_COVER="$cover"; DELTA_BASE="$base_sha"

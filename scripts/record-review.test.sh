@@ -7193,9 +7193,13 @@ run_record_delta $EH14 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" \
 assert_eq "$RECORD_RC" "3" "20h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
 # ⛔ The FIFTH cycle moved which arm refuses this vector. The bare-needle fallback is gone for an
 # authored range (20h25), so a cover that names nothing is now stopped by the required-stated-range
-# arm with "does not STATE the range" rather than by the post-loop "does not NAME the range" check
-# (which the MERGE-ONLY arm still reaches, and which 20h16 still pins). Re-anchored to the message
-# that actually decides it rather than to the one that used to.
+# arm with "does not STATE the range". ⚠️ CORRECTION (sixth cycle, P2): the earlier version of this
+# note claimed the old post-loop "does not NAME the range" check was "still reached by the
+# MERGE-ONLY arm and pinned by 20h16". It was NOT: that check was DEAD CODE — the merge-only arm
+# either sets body_claim or returns before it, and the authored arm now returns or sets it too —
+# and 20h16 pins the merge-only arm's own, different message. The dead block has been deleted and
+# this note no longer points at a pin that does not exist. (`rg 'does not NAME the range'` matches
+# only this comment, which is how the claim was falsified.)
 assert_contains "$RECORD_ERR" "does not STATE the range" "20h12 the refusal names the missing range claim"
 [ -f "$(Q2 $EH14)" ] && bad "20h12 no record was written" || ok "20h12 no record was written"
 
@@ -7483,6 +7487,60 @@ run_record_delta $EH33 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520301" \
     STUB_EVIDENCE_BODY="Reviewed only ${DG_BASE}..${DG_HEAD}; no issues found."
 assert_eq "$RECORD_RC" "0" "20h29 the CORRECT range without the word delta: is accepted (rc 0)"
 assert_contains "$(cat "$(Q2 $EH33)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h29 the accepted record is the normal authored one"
+# 20h30 THE CONTRADICTION LAYER WAS STILL AN ENUMERATION OF SPELLINGS (sixth cycle, P1).
+#       Requiring a stated range does not stop a CONTRADICTING one, because the comparison only
+#       saw `hex dots hex`. This feature's own refusal messages TEACH reviewers to quote
+#       `delta:<A>..<B>`, so an artifact can carry that acceptably-spelled decoy AND a narrower
+#       claim in any other notation — and the decoy satisfies every parsed check. MEASURED on
+#       the previous head: the body below recorded rc 0 with `delta_range=BASE..HEAD`.
+#       The rule no longer asks what the notation IS, it asks what the artifact MEANS: every
+#       resolvable commit the CLAIM names must be the head or an ancestor of the range start.
+EH34=425204; rm -f "$(Q2 $EH34)"
+run_record_delta $EH34 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h30 a NARROWER range in another notation, beside a passing decoy, is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h30 the refusal names the contradicting commit, not the decoy"
+[ -f "$(Q2 $EH34)" ] && bad "20h30 no record was written" || ok "20h30 no record was written"
+# 20h31 THE SAME RULE MUST NOT DEPEND ON ABBREVIATION LENGTH EITHER — `git log --oneline`
+#       shas are 7-8 hex, below the parser's 12-char floor, and were invisible to both layers.
+EH35=425206; rm -f "$(Q2 $EH35)"
+run_record_delta $EH35 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+Actually reviewed only ${DG_A1:0:8}..${DG_HEAD:0:8}."
+assert_eq "$RECORD_RC" "3" "20h31 a narrower range in 8-char shas is REFUSED (rc 3)"
+[ -f "$(Q2 $EH35)" ] && bad "20h31 no record was written" || ok "20h31 no record was written"
+# 20h32 THE MANDATORY KILL TABLE IS NOT A CLAIM (sixth cycle, P2). `## MUTATION ATTRIBUTION`
+#       is required in every fresh clean artifact (#3442) and its rows quote ranges as a matter
+#       of course — a row describing a mutant "pinned to A1..B" was compared as if it were the
+#       reviewer's own claim, refusing a CORRECT artifact because of its kill table. The scan
+#       reads the claim; the table is not a statement about what was reviewed.
+EH36=425208; rm -f "$(Q2 $EH36)"
+run_record_delta $EH36 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 20h30 the decoy beside a narrowed claim is caught | re-point this cell at delta:${DG_A1}..${DG_HEAD} | 20h30 | rc 3 |"
+assert_eq "$RECORD_RC" "0" "20h32 a range quoted inside the #3442 kill table does not refuse a CORRECT artifact (rc 0)"
+[ -f "$(Q2 $EH36)" ] || bad "20h32 no record was written for a correct artifact"
+# 20h33 A RANGE RELATIVE TO THE TIP IS ALWAYS A NARROWING (sixth cycle, P1 continuation).
+#       `HEAD~1..HEAD` carries no hex token at all, so the meaning rule above cannot see it —
+#       and beside an acceptably-spelled decoy it recorded rc 0. There is no innocent reading
+#       of a tip-relative range in an artifact offered as evidence that A..B was covered.
+EH37=425210; rm -f "$(Q2 $EH37)"
+run_record_delta $EH37 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD~1..HEAD."
+assert_eq "$RECORD_RC" "3" "20h33 a tip-relative range beside a passing decoy is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h33 the refusal names the tip-relative notation"
+[ -f "$(Q2 $EH37)" ] && bad "20h33 no record was written" || ok "20h33 no record was written"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7626,10 +7684,17 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 #       while the mutant anchors on A (merge-only) and accepts it.
 MUT="$(mk_mutant mrcstatus '[ "$mrc" -ne 0 ] || [ -z "$want" ] ||' '[ -z "$want" ] ||')"
 mut_check "M13 the merge-tree EXIT STATUS is load-bearing" 425161 "$DG_MDB" "delta:$DG_MDA..$DG_MDB+comment:42516101" accepted STUB_EVIDENCE_AT="2025-05-04T00:00:00Z" STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_MDM" STUB_BASE_REF=main
-# M14 — THE RANGE CONTAINMENT. Removing the ancestry test lets a body that declares a
-#       NARROWER range satisfy the claim for a wider one (20h15).
+# M14b — THE RANGE CONTAINMENT IS NOW REDUNDANT, and this cell measures that instead of
+#        pretending otherwise (the M1b precedent). The sixth cycle added the token rule (20h30),
+#        which refuses ANY resolvable commit in the claim that is not the head or an ancestor of
+#        the range start — so removing the ancestry test from the parsed-range arm no longer
+#        opens the vector it used to: the same body is refused one layer down. Reported as
+#        REFUSED, which for a mutation cell means "the shipped vector is still refused with this
+#        guard gone" — i.e. the guard is defence in depth, not the sole decider. That is worth
+#        knowing and is exactly what the first version of this matrix got wrong in the other
+#        direction (a cell that claimed coverage it did not have).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$_sfs" "$from" 2>/dev/null || _r=$?' '          _r=0')"
-mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+mut_check "M14b range containment is REDUNDANT behind the token rule" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
 # M15 — THE SEPARATOR TOLERANCE, RE-TARGETED BY THE FIFTH CYCLE. This cell used to mutate the
 #       separator AND the refuse-on-unparseable arm so a three-dot body fell through to the
 #       bare needle. That fallback is GONE (20h25), so the same three-dot body is refused either
@@ -7652,14 +7717,17 @@ mut_check "M15 a three-dot statement of the CORRECT range is accepted" 425200 "$
 #       the mutant must REFUSE it. Written as an `if` because the recorder runs under
 #       `set -euo pipefail` — the terse `[ … ] && _scan=…` form returns 1 when no token is present
 #       and would abort the mutant instead of reaching the fall-through it is meant to demonstrate.
-MUT="$(mk_mutant wordkeyed '_scan="$EVIDENCE_BODY"; _any=0; _all_ok=1' '_scan=""; if [ "$_delta_tok" -eq 1 ]; then _scan="$EVIDENCE_BODY"; fi; _any=0; _all_ok=1')"
+MUT="$(mk_mutant wordkeyed '_scan="$_claim"; _any=0; _all_ok=1' '_scan=""; if [ "$_delta_tok" -eq 1 ]; then _scan="$_claim"; fi; _any=0; _all_ok=1')"
 mut_check "M18 the arm keys on the RANGE SHAPE, not the word" 425202 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed only ${DG_BASE}..${DG_HEAD}; no issues found."
 # M19 — THE EXHAUSTIVE SCAN (20h24). Stopping after the FIRST match is the leftmost-match
 #       behaviour the fourth cycle found: the recorded range satisfies every clause, so the
 #       narrower range the artifact actually read is never examined and the record asserts a
 #       range over commits nobody reviewed.
+# M19b — THE EXHAUSTIVE SCAN IS NOW REDUNDANT for narrow-range detection, on the same terms as
+#        M14b: the token rule refuses the narrowed range wherever it appears in the claim, so
+#        stopping after the first match no longer re-accepts the vector. Reported as REFUSED.
 MUT="$(mk_mutant firstonly '      _scan="${_scan#*"${BASH_REMATCH[0]}"}"' '      _scan=""')"
-mut_check "M19 EVERY stated range is checked, not just the first" 425192 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="delta:${DG_BASE}..${DG_HEAD} is the brief; I read delta:${DG_A1}...${DG_HEAD} only; no issues found."
+mut_check "M19b the exhaustive scan is REDUNDANT behind the token rule" 425192 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="delta:${DG_BASE}..${DG_HEAD} is the brief; I read delta:${DG_A1}...${DG_HEAD} only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
@@ -7689,11 +7757,26 @@ mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "de
 #     required-stated-range arm. The vector is unchanged; only the line that decides it moved.
 MUT="$(mk_mutant rangeclaim '    if [ "$_any" -ne 1 ]; then' '    if false; then')"
 mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
-# M20 — THE REQUIRED STATED RANGE (20h25). Restoring the bare-needle fallback is the shipped
-#       pre-fix state: the en-dash sentence names no parseable range, falls through, and is
-#       accepted because it names B — the P1 the fifth cycle found, made executable.
+# M20 — THE REQUIRED STATED RANGE (20h27). Restoring the bare-needle fallback is the shipped
+#       pre-fix state for a body that names ONLY the head: `_any` stays 0, the requirement is
+#       bypassed, and because the body names no OTHER commit the token rule has nothing to catch
+#       — so the body is accepted. (The en-dash vector 20h25 is NOT usable here any more: the
+#       token rule refuses it independently, which would make this cell vacuous — M21 covers the
+#       token rule, and M14b/M19b record that the older arms are now defence in depth.)
 MUT="$(mk_mutant nodigits '    if [ "$_any" -ne 1 ]; then' '    if false; then')"
-mut_check "M20 the stated range is REQUIRED, no alphabet-dependent fallback" 425194 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
+mut_check "M20 the stated range is REQUIRED, no alphabet-dependent fallback" 425198 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed ${DG_HEAD}; no issues found."
+# M21 — THE TOKEN RULE (20h30). The structural half of the sixth cycle's fix: with the whole
+#       claim scanned for resolvable commits and the narrowing one caught by MEANING, disabling
+#       the population re-opens exactly the decoy bypass — the parsed range passes, the narrowed
+#       sentence beside it is never examined, and the record is minted over the wider range.
+MUT="$(mk_mutant novalley '    _toks="$(printf '\''%s\n'\'' "$_claim" | command grep -oE '\''[0-9a-fA-F]{7,40}'\'' | command tr '\''A-F'\'' '\''a-f'\'' | command sort -u || true)"' '    _toks=""')"
+mut_check "M21 every resolvable commit in the claim is checked" 425204 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
+# M22 — THE TIP-RELATIVE ARM (20h33). Disabling it re-accepts `HEAD~1..HEAD` beside the decoy,
+#       which is the one narrowing notation the meaning rule cannot reach (no hex token).
+MUT="$(mk_mutant relativehead '    case "$_claim" in' '    case "" in')"
+mut_check "M22 a tip-relative range is refused" 425210 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD~1..HEAD."
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
