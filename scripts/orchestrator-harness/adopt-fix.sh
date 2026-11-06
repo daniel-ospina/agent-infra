@@ -50,7 +50,7 @@ if [ "$_wt_rc" = 4 ]; then
   # over in `fix-one.sh`. `$WT_RESULT` already names which arm refused, so the remedy is read from it.
   case "$WT_RESULT" in
     *REFUSED-UNKNOWN*)
-      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033). Waiting will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh AND that the copy it carries DEFINES \`disk_admit\` — a presence check passes on an older copy that still refuses here (a half-deployed or skewed box fails closed here, #2033). Waiting will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
     *)
       echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-DISK: nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log" ;;
   esac
@@ -108,7 +108,7 @@ elif [ "$rc" = "77" ]; then
   # class the three rc-4 arms were fixed for, left standing in the one line this file's own comments
   # call "the log a manual operator reads (#1720)". The `_c77` arm in disk-admission.test.sh PINNED
   # the conflation rather than noticing it, so it is extended to assert the distinction.
-  echo "[adopt-fix $PR] remedy follows the cause, not this line: for (a), (b) and 'REFUSED-DISK' it is space -- run 'cloud-cell-supervisor.sh prune --caches' (and --scratch to clear /tmp). For 'REFUSED-UNKNOWN' it is NOT a full disk -- the free-space probe could not answer, or this box is missing spawn-gate.sh (a half-deployed box fails closed, #2033) -- so pruning will NOT clear it and the fix is to check that \`df\` is on PATH and that \$O carries spawn-gate.sh. Waiting clears none of them." >> "$O/logs/adopt-$PR.log"
+  echo "[adopt-fix $PR] remedy follows the cause, not this line: for (a), (b) and 'REFUSED-DISK' it is space -- run 'cloud-cell-supervisor.sh prune --caches' (and --scratch to clear /tmp). For 'REFUSED-UNKNOWN' it is NOT a full disk -- the free-space probe could not answer, or this box's \$O is missing spawn-gate.sh or carries a copy that predates \`disk_admit\` (a half-deployed or skewed box fails closed, #2033) -- so pruning will NOT clear it and the fix is to check that \`df\` is on PATH and that \$O carries spawn-gate.sh WITH \`disk_admit\` defined in it. Waiting clears none of them." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE 79 DEFERRALS ARE NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6 review, P2).
 # `fix-one.sh` exits 0 for each of them ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` would return

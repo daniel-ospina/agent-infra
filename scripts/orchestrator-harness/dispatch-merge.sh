@@ -332,7 +332,7 @@ for N in "$@"; do
        _dm_unknown=0
        case "$WT_RESULT" in *REFUSED-UNKNOWN*) _dm_unknown=1 ;; esac
        if [ "$_dm_unknown" -eq 1 ]; then
-         echo "dispatch-merge: stopping the batch — REFUSED-UNKNOWN: the free-space probe could NOT answer, or this box's \$O is missing spawn-gate.sh, so this is NOT a full disk. Nothing was created. Check that \`df\` is on PATH and that the box's \$O carries spawn-gate.sh (a half-deployed box fails closed here, #2033) — waiting will NOT clear it, so re-dispatch once the probe answers."
+         echo "dispatch-merge: stopping the batch — REFUSED-UNKNOWN: the free-space probe could NOT answer, or this box's \$O lacks spawn-gate.sh, or carries a copy that predates \`disk_admit\`, so this is NOT a full disk. Nothing was created. Check that \`df\` is on PATH and that the box's \$O carries spawn-gate.sh WITH \`disk_admit\` defined in it (a half-deployed or skewed box fails closed here, #2033) — waiting will NOT clear it, so re-dispatch once the probe answers."
        else
          echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take the remaining issues"
        fi
