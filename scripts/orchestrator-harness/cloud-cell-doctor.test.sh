@@ -48,6 +48,14 @@ mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clien
 # `git worktree list`, and an EMPTY-enumeration read is cannot-verify (rc=3) by design — so on a plain
 # directory every hygiene arm here would assert against a pass that abstained instead of deciding.
 git init -q "$T/repo" 2>/dev/null || true
+# ⛔ AND IT NEEDS AN ORIGIN, BECAUSE THE DOCTOR NOW WALKS IT (agent-infra#3521). The identity pass adds the
+# cell's own `$REPO`/`$WORKDIR` to the trees it checks (the tree the box WORKS IN lives outside any walk
+# root — `/tmp/cell-t3` is a sibling of `/tmp/cell-ai`), and a checkout with NO readable `origin` is an
+# UNVERIFIED identity (rc 3) by doctrine. A checkout with no origin is not a box that exists on a cell,
+# so leaving it origin-less made every arm here assert against a pass that abstained. The origin is a
+# github slug and names the SAME repo as `$OR`, so the generic cell-checkout row covers it as a declared
+# exception — exactly the shape of a real cell checkout.
+git -C "$T/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
 
 # ⛔ THE HYGIENE ROLE'S NEW SINKS ARE STUBBED IN THIS FIXTURE (agent-infra#2573). The doctor now reaps
 # stale `cloud-cell-*` dirs under $TMPDIR and prunes IDLE docker images/volumes, and a suite that left
@@ -279,6 +287,19 @@ export MERGE_RETRY_S=3600 CONTROLLER_STALE_S=60
 # `$CELL_HOME` (the same defect `ATOMIC_LAND_REGISTRY_SYNC` exists to prevent in tests/atomic-land).
 # The cases that DO exercise the registry set it back to a fixture script and a fixture store.
 export DOCTOR_REGISTRY_SYNC=off
+# The SAME hermetic-by-default rule for the repo-identity walk (agent-infra#3521): its shipped roots are
+# the cell's one home, `/tmp/cell-ai` and `/tmp/cell-home`, and a suite that let those stand would grade
+# THE MACHINE THAT RUNS IT (on a cell, `/tmp/cell-ai` really is a checkout — and a mislabelled one would
+# redden every doctor arm here for a reason no arm names). Cases that exercise the walk point it at their
+# own fixture population.
+# …pointed at a box that HAS a checkout, not at an empty directory: an empty population is an
+# `unverified` identity (rc 3), and a fixture describing no box at all would redden every arm here that
+# expects a clean doctor pass. The `ident-empty`/origin-less fixtures are still used by the arms that
+# exercise those verdicts.
+mkdir -p "$T/ident-ok/agent-infra" "$T/ident-empty"
+git init -q "$T/ident-ok/agent-infra" >/dev/null 2>&1
+git -C "$T/ident-ok/agent-infra" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+export DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-ok"
 # Same reason, one variable over: `AGENT_INFRA_PATH` is set for real in the operator's (and CI's)
 # environment, so a case that does not name `HARNESS_REPO` would silently resolve the CHECKOUT'S OWN
 # agent-infra remote as the store and do a real union against github (measured: a 300 s real fetch
@@ -1584,6 +1605,125 @@ rm -f "$T/tmux/ls_rc" "$T/tmux/ls_msg"
 [ "$DRC" -eq 3 ] && [ "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state")" = "3" ] \
   && ok "doctor: not-started + unreadable reap -> the record is rc=3 (not a clean 'not started')" \
   || bad "doctor: not-started recorded rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state") (want 3)"
+
+say_case "doctor: a directory on this box that LIES about its repo is reported and fails the pass (#3521)"
+# The bring-up REFUSES a mislabelled checkout at provisioning time; this is the same verdict on a running
+# box, because the measured failure was SILENCE: `/home/cmux/agent-infra` was a tortoise checkout and every
+# lane told to `cd` there worked the wrong repository with no error. A doctor that ran the reap, restarted
+# the controller and recorded a clean pass over that box would be a second instrument agreeing with a lie.
+# Fixture: a real checkout (`git init` + a real `origin` — the subject IS what git reports), not a
+# hand-written config file, which would test the reader's tolerance instead of its answer.
+mk_ident_checkout() { # <dir> <origin-url>
+  mkdir -p "$1" 2>/dev/null || return 1
+  git init -q "$1" >/dev/null 2>&1 || return 1
+  git -C "$1" remote add origin "$2" >/dev/null 2>&1
+}
+rm -rf "$T/ident-bad" "$T/ident-clean"
+mk_ident_checkout "$T/ident-bad/agent-infra" "https://github.com/daniel-ospina/tortoise.git" \
+  && ok "fixture: a checkout of tortoise placed at …/agent-infra" \
+  || bad "fixture: could not create the mislabelled checkout"
+reset_state; reset_tmux; rm -f "$T/o/state/roles/.desired"
+OUT="$(DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-bad" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+[ "$RC" -eq 1 ] && ok "doctor: a mislabelled checkout -> rc=1 (the pass does not read clean)" \
+  || bad "doctor: a mislabelled checkout produced rc=$RC — $OUT"
+result_has "[identity] ⛔ FATAL" && result_has "daniel-ospina/tortoise" \
+  && ok "doctor: the pass names the tree and the origin it actually is" \
+  || bad "doctor: the mislabel was not named in the pass — $OUT"
+case "$(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state" 2>/dev/null)" in
+  *"repo identity FATAL"*) ok "doctor: the pass RECORD says why (a reader of the state does not have to dig in the log)" ;;
+  *) bad "doctor: the pass record does not carry the identity verdict — $(sed -n 's/^last_result=//p' "$T/o/state/roles/doctor.state" 2>/dev/null)" ;;
+esac
+# …and the control: a checkout whose name matches its origin must NOT redden the pass. Without this the
+# arm above would pass on an always-red check that tells nobody anything.
+mk_ident_checkout "$T/ident-clean/agent-infra" "https://github.com/daniel-ospina/agent-infra.git" \
+  && ok "fixture: a checkout under its own name" \
+  || bad "fixture: could not create the clean checkout"
+reset_state; reset_tmux; rm -f "$T/o/state/roles/.desired"
+OUT="$(DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-clean" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+# ⛔ ASSERT THE POSITIVE LINE, NOT JUST THE ABSENCE OF A FATAL (review finding, P2). The absence-only
+# form passed unchanged if `repo_identity_report` were deleted, if the walker crashed, or if the pass
+# emitted no identity verdict at all — it could not tell "clean" from "not measured", which is the one
+# distinction this whole check exists to make.
+result_has "[identity] ok: repo identity:" \
+  && ok "doctor: a clean box is measured and reported ok (non-vacuity)" \
+  || bad "doctor: no identity verdict was emitted for a clean box — 'clean' cannot be told from 'not measured': $OUT"
+result_has "[identity] ⛔ FATAL" \
+  && bad "doctor: a CLEAN checkout was reported FATAL — the check is always-red: $OUT" \
+  || ok "doctor: a clean box is not refused by the identity pass"
+# The IDENTITY half must not abstain or fail; whether the whole pass is 0 depends on the nested reap in
+# this host's environment (it abstains here — see the suite header), which is other arms' business.
+result_has "[identity] CANNOT-VERIFY" \
+  && bad "doctor: a clean box made the identity pass abstain: $OUT" \
+  || ok "doctor: the identity half neither abstains nor fails on a clean box"
+[ "$RC" -ne 1 ] && ok "doctor: the pass is not reddened by the identity verdict (rc=$RC)" \
+  || bad "doctor: a clean box exited 1"
+
+say_case "doctor: an UNANSWERED identity is cannot-verify, not a green pass (#3521)"
+# ⛔ THE FAIL-OPEN PAIR THE FILE'S OWN DOCTRINE FORBIDS (review finding, P2). An origin-less `.git` (a
+# checkout nobody can name), an origin that is not a slug, a generic cell-checkout name on a box that
+# declares no repo, and an EMPTY population all arrived as `warn` and folded to rc=0 — `status` printed a
+# green pass over a box where "does any checkout lie about its repo" was explicitly not answered, while
+# the bring-up called the same box PARTIALLY verified.
+reset_state; reset_tmux; rm -f "$T/o/state/roles/.desired"
+mkdir -p "$T/ident-no-origin/agent-infra"
+git init -q "$T/ident-no-origin/agent-infra" >/dev/null 2>&1     # a .git with NO origin at all
+OUT="$(DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-no-origin" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+result_has "[identity] warn:" && result_has "no readable 'origin'" \
+  && ok "doctor: an origin-less checkout is reported as unverified" \
+  || bad "doctor: an origin-less checkout produced no verdict — $OUT"
+[ "$RC" -eq 3 ] && ok "doctor: and the pass is rc=3 (cannot-verify), not 0" \
+  || bad "doctor: an unanswered identity produced rc=$RC (want 3) — a green pass over a box nothing measured"
+case "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state" 2>/dev/null)" in
+  3) ok "doctor: the RECORD agrees (rc=3)" ;;
+  *) bad "doctor: the record says rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state" 2>/dev/null) for an unanswered identity" ;;
+esac
+
+say_case "doctor: a linked WORKTREE is not cannot-verify — a busy cell must not red forever (#3521)"
+# ⛔ THIS REVERSES A CALL THIS FILE MADE ONE ROUND AGO, and the reason is a measured steady state: the
+# fleet's own launcher recipe is `git worktree add $HOME/wt-<slug>`, `$CELL_HOME` IS `/tmp/cell-home`, and a
+# busy cell carries ~8 such trees. Folding them to cannot-verify made EVERY pass rc=3 and `status` red on a
+# healthy box — an alarm that can never clear. A worktree's name is a BRANCH, so there is nothing the check
+# failed to measure for it.
+reset_state; reset_tmux; rm -f "$T/o/state/roles/.desired"
+rm -rf "$T/ident-wt-busy"; mkdir -p "$T/ident-wt-busy"
+git init -q "$T/ident-wt-busy/tortoise" >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" remote add origin https://github.com/daniel-ospina/tortoise.git >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" config user.email f@x.invalid >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" config user.name f >/dev/null 2>&1
+: > "$T/ident-wt-busy/tortoise/f" && git -C "$T/ident-wt-busy/tortoise" add -A >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" commit -q -m t >/dev/null 2>&1
+git -C "$T/ident-wt-busy/tortoise" worktree add -q --detach "$T/ident-wt-busy/wt-fix-x" >/dev/null 2>&1 \
+  && ok "fixture: a healthy checkout plus a LINKED WORKTREE, as the fleet's launcher leaves them" \
+  || bad "fixture: could not create the lane worktree"
+OUT="$(DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-wt-busy" bash "$DOCTOR" doctor 2>&1)"; RC=$?
+result_has "[identity] ok: repo identity:" && result_has "LINKED WORKTREE" \
+  && ok "doctor: the worktree is NAMED, and not as a failure" \
+  || bad "doctor: the worktree produced no verdict, or the checkout did not read ok — $OUT"
+result_has "[identity] CANNOT-VERIFY" \
+  && bad "doctor: a lane worktree made the identity pass abstain — every busy cell would red forever: $OUT" \
+  || ok "doctor: a lane worktree does not make the pass abstain"
+[ "$RC" -ne 1 ] && [ "$RC" -ne 3 ] && ok "doctor: the pass stays off 1 and off 3 (rc=$RC)" \
+  || bad "doctor: a healthy box with one lane worktree produced rc=$RC — $OUT"
+
+say_case "doctor: a cannot-verify identity is NOT folded to a clean rc by the POLICY-INERT reap (#3521)"
+# ⛔ THE FOLD ORDER IS THE BUG THIS PINS. `rrc=4` (policy-inert — "the pass completed and judged nothing",
+# the STEADY STATE of a Linux cell's reaper) collapses to 0 so it cannot mask a supervision result. Folding
+# the identity verdict in BEFORE that collapse meant `[ irc -eq 3 ] && [ rrc -eq 0 ]` never fired, the 4
+# was then collapsed to 0, and the pass recorded `last_rc=0` with a `last_result` saying the identity was
+# NOT verified — the fail-open pair `status` keys on the rc. The arm drives both halves at once: a reaper
+# that judged nothing (4) and no resolvable slug library (3).
+reset_state; reset_tmux; rm -f "$T/o/state/roles/.desired"
+OUT="$(DOCTOR_REPO_SLUG_LIB=none DOCTOR_TEST_REAP_TREES=0/0 DOCTOR_TEST_REAP_INERT=2 \
+       bash "$DOCTOR" doctor 2>&1)"; RC=$?
+result_has "[identity] CANNOT-VERIFY" \
+  && ok "doctor: the identity could not be verified, and the pass says so" \
+  || bad "doctor: no cannot-verify line for an unresolvable slug library — $OUT"
+[ "$RC" -eq 3 ] && ok "doctor: rc=3 — cannot-verify outranks the policy-inert collapse (rc=$RC)" \
+  || bad "doctor: a cannot-verify identity produced rc=$RC beside a policy-inert reap (want 3) — $OUT"
+case "$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state" 2>/dev/null)" in
+  3) ok "doctor: the RECORD is rc=3 as well (a reader of the state sees the same verdict)" ;;
+  *) bad "doctor: the record says rc=$(sed -n 's/^last_rc=//p' "$T/o/state/roles/doctor.state" 2>/dev/null) while the result says cannot-verify — the fail-open pair" ;;
+esac
 
 say_case "hygiene: a FAILING reaper and a MISSING supervisor are cannot-verify"
 reset_state; reset_tmux

@@ -3784,8 +3784,11 @@ def converge(
     elif live > ceil:
         record["verdict"] = "over-ceiling"
         record["notes"].append(
-            f"over-ceiling: {live} live against a measured ceiling of {ceil} — {reading}; nothing "
-            "removed (a runner that may be serving is never removed)"
+            f"over-ceiling: {live} live against a measured ceiling of {ceil} "
+            f"(surplus={live - ceil}) — {reading}; nothing removed (a runner that may be serving is "
+            "never removed), and NOTHING HERE CAN REMOVE IT: this verdict is report-only, so the "
+            "box stays above its ceiling until a human drains the surplus — see "
+            "docs/ops/fleet-capacity.md §8.1"
         )
     elif live >= target and record["actions"]:
         record["verdict"] = "converged"

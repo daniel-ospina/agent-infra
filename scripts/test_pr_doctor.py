@@ -5156,24 +5156,29 @@ def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
     # (d) THE GENUINELY SATURATED FLEET: shipped caps, EVERY slot held (review P2, round 8). This is
     #     the population round 7's comment described and whose fixture was never built -- so the
     #     opposite word ("spent") had no test either, and a revert to a blanket sentence stayed green.
+    #     ⛔ THE FIXTURE FOLLOWS THE SHIPPED CAPS INSTEAD OF REPEATING THEM (agent-infra#3441). It used
+    #     to hold a literal 3 + 4 rows and assert "4 of 4 slots", which silently pinned MAX_REVIEW to
+    #     4: raising the shipped default to 10 turned the "genuinely saturated" fixture into a
+    #     half-empty one and this arm failed for a reason that had nothing to do with its claim. It is
+    #     driven from the module's own defaults now, so it tracks them wherever they move.
     for _k in ("MAX_FIX", "MAX_REVIEW"):
         monkeypatch.delenv(_k, raising=False)
     _now = pr.now()
     _busy = {}
-    for _i in range(3):
+    for _i in range(pr.DEFAULT_MAX_FIX):
         _busy[str(900 + _i)] = {"action": "fix-ci", "head": "b" * 40,
                                 "at_epoch": _now, "worker": "w%d" % _i}
-    for _i in range(4):
-        _busy[str(910 + _i)] = {"action": "record-review", "head": "b" * 40,
-                                "at_epoch": _now, "worker": "r%d" % _i}
+    for _i in range(pr.DEFAULT_MAX_REVIEW):
+        _busy[str(9100 + _i)] = {"action": "record-review", "head": "b" * 40,
+                                 "at_epoch": _now, "worker": "r%d" % _i}
     _rc, joined, _payload = _drive_pass(
         monkeypatch, [_pr(70)], ("record-review", "why", []), state=_busy)
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
     assert "review->NO SLOT" in casc[0], casc[0]
     assert "no class budget available" in casc[0], casc[0]
-    assert "4 of 4 slots in use" in casc[0], casc[0]
-    assert "3 of 3 slots in use" in casc[0], casc[0]
+    assert ("%d of %d slots in use" % (pr.DEFAULT_MAX_REVIEW, pr.DEFAULT_MAX_REVIEW)) in casc[0], casc[0]
+    assert ("%d of %d slots in use" % (pr.DEFAULT_MAX_FIX, pr.DEFAULT_MAX_FIX)) in casc[0], casc[0]
     assert "the cap is 0" not in casc[0], casc[0]
     assert "aggregate ceiling" not in casc[0], casc[0]
 

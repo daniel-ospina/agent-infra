@@ -32,10 +32,17 @@ set -uo pipefail
 PROG="$(basename "${0:-disk-reaper-deployed-check.sh}")"
 DIR_DEFAULT="${HOME:-/tmp}/.pi/agent/scripts"
 RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
-# The entry point the timer executes, the wrapper it goes through, the six pinned delegates, AND the
+# The entry point the timer executes, the wrapper it goes through, the seven pinned delegates, AND the
 # bounded-execution library the delegates source (pinned by `Environment=BOUNDED_LIB=`, and the reaper
 # fails closed at startup without it — so a stale or absent copy means no class runs at all, which the
 # checker must not certify as ok; review of #3405 round 2, P2).
+# ⛔ `reap-runner-work.sh` IS THE ONE THAT MATTERS MOST HERE, and it was the only delegate outside the
+# set. It holds the `rm -rf` rule for the runners' `_work` sink, and it is pinned in BOTH units
+# (`Environment=RUNNER_WORK_REAPER=` / `RUNNER_WORK_REAPER` in the plist). A cell still carrying an
+# EARLIER farmed copy is therefore a live delete-policy nobody hashes — and an earlier revision of that
+# very file shipped a retain set that deleted a LIVE job's `_work/_temp`, which is exactly the shape
+# this check exists to make impossible to miss. `--source <checkout>` reported `deployed ok` for it
+# because `grep -c reap-runner-work` here was 0: the checker could not see the file at all.
 # `lib/live-paths.sh` is here for the same reason as `lib/bounded.sh`, only MORE so: two pinned
 # delegates resolve it from `$(dirname $0)/lib/` and `exit 3` without it (the installer's own farmed set
 # carries it — "a missing library breaks TWO classes"), and it is the shared process-census code every
@@ -43,7 +50,7 @@ RECORD_DEFAULT="${HOME:-/tmp}/.pi/agent/state/disk-reaper.deployed"
 # `--source <checkout>` could report `deployed ok` while the census ran a different library than the
 # checkout's.
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh lib/live-paths.sh"
 
 usage() {
     cat <<EOF
@@ -70,7 +77,9 @@ sha256() {
     fi
 }
 
-say() { [ "${QUIET:-0}" = 1 ] || printf '%s\n' "$*"; }
+# ⛔ NOT `say` (agent-infra #2910): on macOS that is /usr/bin/say, so a missed definition is a
+# voice on the speaker rather than a log line. `emit` cannot collide with a system binary.
+emit() { [ "${QUIET:-0}" = 1 ] || printf '%s\n' "$*"; }
 warn() { printf '%s\n' "$*" >&2; }
 
 MODE=check
@@ -137,7 +146,7 @@ if [ "$MODE" = stamp ]; then
         warn "  remedy: fix the read/permission problem, then: $PROG --stamp --source <agent-infra checkout>"
         exit 1
     fi
-    say "STAMPED $RECORD (dir=$DIR source=${SOURCE:--} commit=$src_commit)"
+    emit "STAMPED $RECORD (dir=$DIR source=${SOURCE:--} commit=$src_commit)"
     exit 0
 fi
 
@@ -167,14 +176,29 @@ fi
 drift=0
 checked=0
 appeared=""
-while read -r digest name; do
-    case "$digest" in ''|\#*) continue ;; esac
-    [ -n "$name" ] || continue
+# ⛔ ONE PARSE RULE FOR THE LOOP AND THE RECONCILIATION (review of #3422). The round-5 draft parsed
+# with an explicit "two spaces" separator while the reconciliation split on ANY whitespace, so the two
+# disagreed about what a record line IS. The split is now plain whitespace (the shell's own, exactly
+# what awk does) and the FIELDS are validated instead: a malformed token is DRIFT, never a skip. The
+# remaining divergence is the unterminated last line, closed by the loop tail below.
+while read -r digest name _rest || [ -n "${digest:-}${name:-}" ]; do
+    case "$digest" in ''|'#'*|*=*) continue ;; esac
+    if [ -z "${name:-}" ]; then
+        warn "DRIFT     (malformed record line, no name field): $digest"
+        drift=1; continue
+    fi
+    case "$digest" in
+        missing|unmeasured) : ;;
+        *[!0-9a-f]*) warn "DRIFT     (malformed record line, digest is not hex): $digest $name"
+                     drift=1; continue ;;
+        *) [ ${#digest} -eq 64 ] || {
+               warn "DRIFT     (malformed record line, digest is not a sha256): $digest $name"
+               drift=1; continue; } ;;
+    esac
     checked=$((checked + 1))
-    # ⛔ AN UNMEASURED RECORD LINE IS DRIFT (review of #3405 round 3, P2). A digest that could not be
-    # taken at stamp time must never read as verified, and a malformed line (a name with no digest at
-    # all) is the same defect one step further along.
-    if [ -z "$digest" ] || [ "$digest" = unmeasured ]; then
+    if [ "$digest" = unmeasured ]; then
+        # ⛔ AN UNMEASURED RECORD LINE IS DRIFT (review of #3405 round 3, P2). A digest that could not
+        # be taken at stamp time must never read as verified.
         warn "DRIFT     $name — recorded as UNMEASURED (no digest could be taken); it has never been verified"
         drift=1; continue
     fi
@@ -214,7 +238,11 @@ while read -r digest name; do
             drift=1; continue
         fi
     fi
-    say "same      $name $now"
+    emit "same      $name $now"
+# ⛔ `read` DOES NOT RUN ITS BODY FOR A FINAL LINE WITHOUT A TRAILING NEWLINE (review of #3422, P2).
+# A truncated record — the delta's own stated threat model — therefore dropped its last line here while
+# the awk reconciliation read it normally: `deployed ok (8 files)`, exit 0, with a pinned delegate
+# DELETED. The `|| [ -n ... ]` tail makes the unterminated last line measure like any other.
 done < "$RECORD"
 
 # ⛔ THE RECORD IS RECONCILED WITH THE PINNED SET (review of #3405, P2). The loop above iterates the
@@ -223,7 +251,11 @@ done < "$RECORD"
 # the unit executes cannot sit outside the check" promise this script's header makes. A pinned file
 # with no record line is therefore a drift.
 for f in $FILES; do
-    if ! grep -qE "  $f\$" "$RECORD" 2>/dev/null; then
+    # ⛔ ANCHORED ON A REAL DIGEST FIELD, not on any line ending in the name: the old pattern matched a
+    # malformed `  <name>` line, so a file could be "recorded" and never measured (round 5, P2).
+    if ! awk -v f="$f" '
+            length($1) == 64 && $1 ~ /^[0-9a-f]+$/ || $1 == "missing" || $1 == "unmeasured" { if ($2 == f) found = 1 }
+            END { exit !found }' "$RECORD" 2>/dev/null; then
         warn "UNRECORDED $f — pinned in this checker but absent from $RECORD; it has never been measured"
         drift=1
     fi
@@ -237,5 +269,5 @@ if [ "$drift" != 0 ]; then
     warn "SUMMARY deployed drift detected — the copy that RUNS is not the copy that was farmed (or not the checkout's). Re-farm, then: $PROG --stamp --source <checkout>"
     exit 1
 fi
-say "SUMMARY deployed ok ($checked files${SOURCE:+; matches $SOURCE})"
+emit "SUMMARY deployed ok ($checked files${SOURCE:+; matches $SOURCE})"
 exit 0
