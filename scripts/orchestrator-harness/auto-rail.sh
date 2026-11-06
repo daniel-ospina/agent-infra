@@ -614,7 +614,7 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
   row="$pr	$head	$(date +%s)"
   printf '%s\n' "$row" >> "$TRIED"
   log_line "$repo #$pr GREEN+terminal -> launching rail (head $head)"
-  RAIL_SCRIPT="$RAIL_SCRIPT" nohup bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra > "$out" 2>&1 &
+  RAIL_SCRIPT="$RAIL_SCRIPT" nohup bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null > "$out" 2>&1 &
   pid=$!
   sleep "$LAUNCH_VERIFY_S"
   if kill -0 "$pid" 2>/dev/null || [ -s "$out" ]; then return 0; fi
@@ -840,9 +840,11 @@ review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; p
 # record wipes the proof the gate reads (agent-infra#1224). `review-pr.sh` refuses to PATCH a body for
 # the same reason.
 # ⛔ IDEMPOTENCE IS BY KEY, NOT BY HOPE. The hidden tag names the state AND the head, so re-running the
-# loop in the same state adds NOTHING (a second `review-in-flight` marker for one head is a duplicate
-# this cannot emit), while a real transition — in-flight → found-issues — adds exactly one new marker
-# instead of rewriting history. `awaiting-review` carries NO head: it is published where the head is
+# loop in the same state adds NOTHING, while a real transition — in-flight → found-issues — adds exactly
+# one new marker instead of rewriting history. The ONE exception is the corrective pair below
+# (`review-in-flight` ↔ `review-dispatch-failed`), which supersede each other BY POSITION: they are the
+# only two states that correct each other, so for them "is my tag already present" is the wrong question
+# and the newest of the pair wins. `awaiting-review` carries NO head: it is published where the head is
 # not yet read (a cap deferral), and it says "no owner yet" about the PR, not about a revision.
 publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
   local repo=$1 pr=$2 state=$3 head=${4:-} tag seen text
@@ -851,7 +853,7 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     awaiting-review)
       text="🔎 **auto-rail: review needed.** This PR is mergeable and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot. **It is not waiting on a lane.**";;
     review-in-flight)
-      text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ). auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
+      text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
     review-found-issues)
       text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
     review-retries-exhausted)
@@ -859,7 +861,7 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     review-record-unbound)
       text="⚠️ **auto-rail: a review record exists at \`${head:0:12}\` but the PR body carries no marker this loop can bind.** Re-running \`record-review.sh\` for this PR re-posts the signed marker at the same head (that write is idempotent). auto-rail never writes records, so it cannot do this itself — and it is deliberately NOT buying a second review, which would not help. **It is not waiting on a lane.**";;
     review-dispatch-failed)
-      text="⚠️ **auto-rail: the reviewer was announced but never started** at \`${head:0:12}\` — the dispatch was rolled back (nothing ran, and no attempt was spent). This corrects the in-flight marker posted before the launch. The head is retried on a later pass; if this state persists, the actuator's reviewer path is broken and the log has the \`REVIEW-LAUNCH-FAILED\` line for it. **Nothing is reviewing this PR right now.**";;
+      text="⚠️ **auto-rail: the reviewer was announced but never started** at \`${head:0:12}\` — the dispatch was rolled back (nothing ran, and no attempt was spent), so no \`review in flight\` marker was posted for it: this state is published only for a launch that failed to start, and in-flight only for one that did. The head is retried on a later pass; if this state persists, the actuator's reviewer path is broken and the log has the \`REVIEW-LAUNCH-FAILED\` line for it. **Nothing is reviewing this PR right now.**";;
     *) text="auto-rail: review state \`${state}\`.";;
   esac
   # ⛔ A FAILED READ IS NOT "NO MARKER": this script has no `pipefail`, so a `gh` that cannot run would
@@ -872,7 +874,29 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # posted. `--paginate` reads every page.
   seen=$(gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate --jq '.[].body' 2>/dev/null) \
     || { log_line "$repo #$pr MARKER-UNREADABLE: could not read the PR's comments to check for an existing review marker — NOT posting (a blind post is a duplicate on every pass)"; return 1; }
-  case "$seen" in *"$tag"*) return 0;; esac
+  # ⛔ IDEMPOTENCE IN THE RIGHT DIRECTION: A STATE POSTS UNLESS IT IS ALREADY THE NEWEST TRUTH.
+  # `review-in-flight` and `review-dispatch-failed` each CORRECT the other — in-flight after a failure
+  # notice (so the PR stops saying "nothing is reviewing this" while something is), and dispatch-failed
+  # when the review that WAS announced has since been retried and the retry's launch never started (so it
+  # stops saying a review is running when nothing is; that is the sequence in-flight → failure → in-flight
+  # → failure, which positional repair would otherwise suppress with its own older tag). For those two,
+  # "does my tag already exist" is the WRONG question: the stale tag outlives its truth, so the correction
+  # is suppressed for ever. Measured all three ways (review rounds 4 and 5): presence-only let a failure
+  # notice outlive its retry; one-way positional let a retry that ALSO rolled back leave the re-posted
+  # in-flight claim as the permanent last word; and both-positional WITH the in-flight publish before the
+  # launch alternated two comments per pass on a broken path. The loop now publishes in-flight only for a
+  # launch it PROVED started, so exactly one of the pair is published per real transition and positional
+  # converges: each transition adds one comment, a repeated no-op adds none. Every other state keeps plain
+  # presence — nothing corrects it, so one marker IS the truth.
+  if [ "$state" = review-in-flight ] || [ "$state" = review-dispatch-failed ]; then
+    local _other _mine_last _other_last
+    if [ "$state" = review-in-flight ]; then _other=review-dispatch-failed; else _other=review-in-flight; fi
+    _mine_last=$(printf '%s\n' "$seen" | awk -v t="$tag" 'index($0,t){n=NR} END{print n+0}')
+    _other_last=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_other${head:+:$head} -->" 'index($0,t){n=NR} END{print n+0}')
+    [ "${_mine_last:-0}" -gt 0 ] && [ "${_mine_last:-0}" -ge "${_other_last:-0}" ] && return 0
+  else
+    case "$seen" in *"$tag"*) return 0;; esac
+  fi
   gh pr comment "$pr" --repo "$repo" --body "$(printf '%s\n\n%s' "$text" "$tag")" >/dev/null 2>>"$LOG" \
     || { log_line "$repo #$pr MARKER-FAILED: could not post the review-state marker ($state) — this loop knows the state and GitHub does not"; return 1; }
   log_line "$repo #$pr review state published on the PR: $state"
@@ -1300,16 +1324,23 @@ PY
         # FIRST real review's retries. `review_forgive_refusal` drops exactly that one line, and only when
         # the last dispatch is the refusal — never a paid entry.
         [ "$_rstate" = refused ] && review_forgive_refusal "$_ratt"
-        publish_review_state "$repo" "$pr" review-in-flight "$head"
-        # ⛔ A ROLLED-BACK DISPATCH MUST CORRECT THE MARKER IT JUST POSTED (review round 3, P2). The
-        # in-flight publish is deliberately BEFORE the launch (a dispatched review must never be
-        # invisible), so when the launch is proven not to have started the comment is already on the PR
-        # claiming "a fresh-context reviewer was dispatched". The record is removed, so every later pass
-        # reads `none` and re-publishes the SAME tag — a no-op — leaving a PR that reads `review in flight`
-        # with nothing running and no attestation coming: the "indistinguishable from a lane" disguise this
-        # PR exists to remove, and the log line even claims the opposite.
+        # ⛔ THE IN-FLIGHT MARKER IS PUBLISHED ONLY ONCE THE LAUNCH IS PROVEN TO HAVE STARTED (review
+        # round 5, measured on the real functions). Both orderings were tried and both lie or thrash:
+        #  - BEFORE the launch: a rolled-back dispatch has already told the PR "a reviewer was
+        #    dispatched", so every later pass must either re-post in-flight (the failure notice outlives
+        #    its retry) or re-post the failure (the in-flight claim outlives ITS truth) — and with both
+        #    corrected positionally a permanently broken reviewer path posts TWO comments PER PASS, for
+        #    ever, which is the duplicate-marker thrash these arms exist to forbid.
+        #  - AFTER it: a dispatch that never started says nothing at all, the failure notice is the
+        #    last word AND the truth, a successful retry re-posts in-flight exactly once (it is newer than
+        #    the failure), and a quiet repeat adds nothing. No alternation, no thrash.
+        # The few seconds between launch and this line do not hide a running review: the record that
+        # `launch_review` wrote already says DISPATCHED, and the state machine reads the record.
         launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" \
           || { publish_review_state "$repo" "$pr" review-dispatch-failed "$head"; continue; }
+        # ⛔ position, not presence — see `publish_review_state`: a success after a rolled-back dispatch
+        # must be able to correct that notice.
+        publish_review_state "$repo" "$pr" review-in-flight "$head"
         _rdispatched=$(( _rdispatched + 1 ))
         continue
       fi
