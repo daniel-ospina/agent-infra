@@ -353,8 +353,9 @@ _rs_normalize_slug() {
 #   * its `origin` PROVES the slug it is declared under — THE ONLY PROOF THAT CAN REFUSE, because the
 #     proof is `pr-doctor.py`'s own `_origin_slug()`, delegated rather than re-implemented;
 #   * nothing else refuses. Absent, denied, not a directory, no `origin`, no `git`, no `python3`: all
-#     UNVERIFIABLE, all a WARN, and the pass grades that repo read-only — the same split
-#     `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
+#     UNVERIFIABLE, all a WARN. What the PASS then does is the doctor's to say (it may adopt another
+#     checkout for the slug, or grade read-only); this reader states only what it measured. The split
+#     is the one `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
 #     under `~/Documents` (the default checkout), so refusing there discarded a pass the doctor
 #     completes. "I could not look" must never be reported as "it is wrong".
 #   * no two repos share a state dir — the silent-sharing failure `multi-repo-controller.sh` refuses

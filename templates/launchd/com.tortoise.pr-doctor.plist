@@ -81,7 +81,8 @@
          checkout EVIDENCE, and it is only used on the degraded path (no set yet): the doctor adopts
          it only when its git `origin` PROVES the slug it names, so the plist cannot make the doctor
          read another repo's worktrees, and a box whose checkout does not resolve grades the queue
-         read-only and says so instead of spawning.
+         read-only if it can prove one, and otherwise the wrapper refuses with the file to create (see
+         the next block — on macOS that is the usual outcome, because the origin cannot be read).
 
          ⛔ WHAT HAPPENS ON A BOX WITH NO SET (the migration state), IN TWO CASES, and this is the
          distinction that matters because THIS template's default checkout lives under `~/Documents`:

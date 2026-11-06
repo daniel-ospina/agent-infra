@@ -233,20 +233,25 @@ case "$_rc" in
       if [ -n "$_why_not" ]; then _say "  $_why_not — so this pass has NO usable repo."; fi
       if [ -n "$_repo" ] && [ -z "$_proved" ] && [ "$_decided" = 0 ]; then
         _say "  REPO=$_repo proves no repo ($_proved_why)."
-      elif [ -z "$_repo" ] && [ -z "$_seam" ] && [ -z "$_or" ]; then
-        _say "  Neither PR_DOCTOR_REPO, OR nor REPO is set — so this pass has NO repo to name."
       fi
-      # ⛔ THE REASON IS STATED, AND IT IS A DELIBERATE DIFFERENCE FROM THE DOCTOR (review round 5,
-      # P2). `resolve_repo` has a rank-5 arm — the CURRENT WORKING DIRECTORY's `origin` — so "would
-      # exit 2 on its first line" was false for a unit or hand-run whose cwd happens to be a checkout.
-      # This wrapper does not adopt an ambient cwd (the #2238/#2280 doctrine: the box's directory is
-      # not the box's declaration), and it says so instead of asserting a fact about the doctor.
-      _say "REFUSING — no repo is DECLARED for this pass."
-      _say "  (The doctor would fall back to the current directory's git origin; this wrapper does not"
-      _say "   adopt an ambient cwd, because a working directory is not a declaration.)"
+      # ⛔ "NO USABLE REPO", NOT "NO REPO DECLARED" (review round 6, P2). This one block prints from five
+      # different states and the first repair told all five a fact that is true of ONE of them: with
+      # `PR_DOCTOR_REPO='Not A Slug'` the line above already says a repo IS declared, so "no repo is
+      # DECLARED" contradicted the line before it.
+      _say "REFUSING — no USABLE repo for this pass."
       _say "  Fix, either way:"
       _say "    (1) create the repo set above — one line per repo this box serves; or"
       _say "    (2) set PR_DOCTOR_REPO=OWNER/NAME or OR=OWNER/NAME (or point REPO at a checkout whose git origin proves it)."
+      # ⛔ AND THE CWD NOTE IS PRINTED ONLY WHERE IT IS TRUE (review round 6, P2). `resolve_repo` reaches
+      # its rank-5 arm (the current directory's `origin`) only after ranks 2, 3 and 4 answered NOTHING
+      # — and rank 4 RAISES when `REPO` is set and proves nothing, so a declared-but-unprovable `REPO`
+      # never reaches it. Printing "the doctor would fall back to the cwd" in the arms where the doctor
+      # refuses exactly as this wrapper does told the operator the wrapper was the stricter of the two.
+      # Nothing declared at all is precisely the state where the two really do differ.
+      if [ -z "$_seam" ] && [ -z "$_or" ] && [ -z "$_repo" ]; then
+        _say "  (Nothing is declared, so the doctor would fall back to the CURRENT DIRECTORY's git origin;"
+        _say "   this wrapper does not adopt an ambient cwd — a working directory is not a declaration.)"
+      fi
       exit 2
     fi
     _say "  Create the repo set above and this same unit grades every repo it names, with no reinstall."
