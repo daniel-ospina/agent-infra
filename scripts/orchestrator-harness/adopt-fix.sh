@@ -89,7 +89,16 @@ elif [ "$rc" = "77" ]; then
   # Round 1 (P2) established the first two: below the floor, and above it without the headroom for one
   # lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the operator a full
   # filesystem was the cause when it was not.
-  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — one of THREE: (a) the filesystem is below DISK_MIN_FREE_MB, (b) it has no headroom for one lane's dependency tree (DISK-NOHEADROOM), or (c) the worktree was refused BEFORE it was created (agent-infra#3395 — nothing was attempted, no worktree and no branch). The spawn log names which: '[disk-gate] REFUSED' for (a)/(b), '[disk-admit] REFUSED-DISK' or 'REFUSED-UNKNOWN' for (c). Reclaim space (cloud-cell-supervisor.sh prune --caches, and --scratch for /tmp); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
+  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — one of THREE: (a) the filesystem is below DISK_MIN_FREE_MB, (b) it has no headroom for one lane's dependency tree (DISK-NOHEADROOM), or (c) the worktree was refused BEFORE it was created (agent-infra#3395 — nothing was attempted, no worktree and no branch). The spawn log names which: '[disk-gate] REFUSED' for (a)/(b), '[disk-admit] REFUSED-DISK' or 'REFUSED-UNKNOWN' for (c). " >> "$O/logs/adopt-$PR.log"
+  # ⛔ THE REMEDY FOLLOWS THE CAUSE ON THIS LINE TOO (review cycle 10, P2 — MEASURED). The summary
+  # above names REFUSED-UNKNOWN as one of THREE causes, but the sentence below it used to prescribe
+  # ONE remedy — "Reclaim space (…prune --caches, and --scratch for /tmp); waiting will NOT clear it" —
+  # for all three. For the UNKNOWN cause that remedy CANNOT ARRIVE: the probe could not answer, or
+  # `spawn-gate.sh` is missing, and no amount of pruning fixes either. That is the #2721 wrong-cause
+  # class the three rc-4 arms were fixed for, left standing in the one line this file's own comments
+  # call "the log a manual operator reads (#1720)". The `_c77` arm in disk-admission.test.sh PINNED
+  # the conflation rather than noticing it, so it is extended to assert the distinction.
+  echo "[adopt-fix $PR] remedy follows the cause, not this line: for (a), (b) and 'REFUSED-DISK' it is space -- run 'cloud-cell-supervisor.sh prune --caches' (and --scratch to clear /tmp). For 'REFUSED-UNKNOWN' it is NOT a full disk -- the free-space probe could not answer, or this box is missing spawn-gate.sh (a half-deployed box fails closed, #2033) -- so pruning will NOT clear it and the fix is to check that \`df\` is on PATH and that \$O carries spawn-gate.sh. Waiting clears none of them." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE 79 DEFERRALS ARE NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6 review, P2).
 # `fix-one.sh` exits 0 for each of them ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` would return
