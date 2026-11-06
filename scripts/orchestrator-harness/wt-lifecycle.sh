@@ -339,7 +339,16 @@ wt_disk_admit() {
         fi
     fi
     if ! command -v disk_admit >/dev/null 2>&1; then
-        WT_RESULT="REFUSED-UNKNOWN disk-admit(free=?, need=?, box=$(hostname -s 2>/dev/null || printf '?')): ${WTL_DIR:-<unresolved>}/spawn-gate.sh is missing, so the ONE disk predicate cannot be loaded and this worktree's headroom CANNOT be verified — refusing to create $path on an unverifiable volume. Nothing was created (fail-closed; a box whose state dir is missing the disk gate cannot be trusted to have room)"
+        # ⛔ SANITISE THE HOSTNAME FALLBACK TOO (review cycle 10, P2 — MEASURED). `disk_box_id`
+        # REPLACES an illegal box id with UNIDENTIFIED (`spawn-gate.sh`), but this arm cannot call it —
+        # by definition `spawn-gate.sh` is the file that is MISSING — so it used a bare `hostname -s`
+        # and emitted a nodename containing a space or a comma verbatim, splitting `box=` into two
+        # tokens in a line whose contract says that cannot happen, and stashing it in `WT_RESULT`,
+        # which all three callers quote into their own logs. Same rule, applied inline: an id with a
+        # character outside the legal set is REPLACED, never printed raw, and never merely defaulted.
+        _wtl_box="$(hostname -s 2>/dev/null || printf '')"
+        case "$_wtl_box" in ''|*[!A-Za-z0-9._:-]*) _wtl_box="UNIDENTIFIED" ;; esac
+        WT_RESULT="REFUSED-UNKNOWN disk-admit(free=?, need=?, box=$_wtl_box): ${WTL_DIR:-<unresolved>}/spawn-gate.sh is missing, so the ONE disk predicate cannot be loaded and this worktree's headroom CANNOT be verified — refusing to create $path on an unverifiable volume. Nothing was created (fail-closed; a box whose state dir is missing the disk gate cannot be trusted to have room)"
         wt_log provision "$WT_RESULT"
         return 1
     fi
