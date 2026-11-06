@@ -241,10 +241,11 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # pre-refusal value). The CONFLICTED, NEEDS-FIX and CI-red arms still book AFTER the spawn, so a
     # refund landing in that window is overwritten and the attempt is consumed anyway. The per-head
     # `fixgate-<PR>-<HEAD>` marker this call also writes does not rescue them either: among those four
-    # `fixcount` arms only the red-tree one consumes it, and the roles that DO honour it (the sickness
-    # queue's `psick` counter, `merge-one.sh`, `cloud-cell-doctor.sh`) refund their own budgets, not
-    # `fixcount`. That residual is filed (#3562); this call is still correct and still the fix, because
-    # the arm that most needs it pre-books and the others shrink the window rather than widening it.
+    # `fixcount` arms only the red-tree one consumes it, and no other consumer of that marker touches
+    # `fixcount` — they refund or reclaim their OWN head-keyed budgets (`psick`; the reclaim-on-land
+    # paths read no budget from it at all). That residual is filed (#3562); this call is still correct
+    # and still the fix, because the arm that most needs it pre-books and the others shrink the window
+    # rather than widening it.
     # The test is the exit code and nothing else: ANY non-zero `wt_provision` rc refunds. The helper
     # names the cause in `$WT_RESULT`, which is logged on the line above — this comment does not restate
     # the cause list, because a list here is a second definition that goes stale the next time the
