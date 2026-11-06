@@ -266,7 +266,8 @@ PR_RC=0
 # ⛔ THE 20s BOUND IS A DELIBERATE TRADE (P3, second review round, 2026-10-14): it CAN kill a
 # release that would eventually have succeeded — a `git push` slower than 20s is TERM'd, the fenced
 # push leaves the ref intact, and every box then refuses that head until the lease expires (up to
-# REVIEW_TIMEOUT+1200 = 50 min). That is accepted because the alternative is strictly worse: an
+# `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300; 50 min at the defaults, longer on a box whose gate wait
+# is raised). That is accepted because the alternative is strictly worse: an
 # UNBOUNDED exit path (and, before the ordering fix above, one that dropped the local lock FIRST)
 # lets the controller spawn a second worker for the same head. DO NOT remove the bound — the
 # ordering defect it fixes is real. A future improvement is to move the release OFF the exit path
@@ -444,7 +445,8 @@ if [ -n "${HEAD:-}" ] && [ -f "$O/claims.sh" ]; then
     *) echo "[merge $PR] cross-box claim UNAVAILABLE (rc=$CROSS_RC: $CLAIM_RESULT) — proceeding on the local lock alone" >> "$L.log"
        # P2 (2026-10-14 adversarial review): the CREATE path can SUCCEED on the remote and fail only
        # the read-back. claims.sh surfaces the commit it pushed; release it, fenced, so the PR is not
-       # stalled fleet-wide until the lease expires (up to REVIEW_TIMEOUT+1200 = 50 min of every box
+       # stalled fleet-wide until the lease expires (up to `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300;
+       # 50 min at the defaults, longer on a box whose gate wait is raised) of every box
        # refusing to review it). CROSS_OWN stays set only when this fenced release FAILS, so the EXIT
        # trap retries it.
        if [ -n "${CLAIM_COMMIT:-}" ]; then

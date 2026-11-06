@@ -106,9 +106,18 @@ esac
 #                                           interval (agent-infra#1909), so the ceiling below is a
 #                                           ceiling and no longer the normal cost of a refused lane
 #   chain-merge.sh merge-phase wait 1890s  (LANE_PHASE_GRACE 90 + LANE_HANDOFF_WAIT 1800, #2029)
-#   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + the 1200s bound)
+#   merge-one.sh review+merge      ~3000s  (REVIEW_TIMEOUT + _gw + 300 — `_gw` is the gate wait,
+#                                           900 s at the defaults, so 1800+900+300; NOT a constant
+#                                           1200, and the `REVIEW_TIMEOUT + 1200` form that stood
+#                                           here was right only at that default)
 #                                 ------  =======
 #                                 17490s  -> 18000s (5 h)
+#
+#   ⛔ THIS SUM IS THE DEFAULT-GATE-WAIT SUM, AND THE ROW ABOVE IS WHY IT IS STATED AS A FORMULA.
+#   `_gw` is `GATE_POLL_TRIES x GATE_POLL_SECS` clamped to [900, 86400] (merge-one.sh), so on a box
+#   running `GATE_POLL_SECS=60` the merge term is 3900 s and this sum is 18390 s — OVER the 18000 s
+#   default below. Nothing here raises that default (it is a behaviour change, not a prose fix); the
+#   arithmetic is written out so the operator who raises the gate wait sees which default it crosses.
 #
 # ⚠️ THIS IS A CEILING, NOT A PREDICTION. The holder RELEASES on completion (chain-merge.sh, every
 # exit path) and on the failure/abandon paths, so the lease only ever runs its full length when the
@@ -1212,7 +1221,8 @@ _claim_acquire_at() {
     if [ "$back" != "$commit" ]; then
       # P2 (2026-10-14 adversarial review): the push may have CREATED the ref and only the read-back
       # failed. Surface the commit we pushed so the caller can attempt a FENCED release — otherwise
-      # the claim is orphaned for the whole lease (up to REVIEW_TIMEOUT+1200 = 50 min) and every box
+      # the claim is orphaned for the whole lease (up to `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300,
+      # 50 min at the defaults) and every box
       # refuses that head until it expires. merge-one.sh consumes CLAIM_COMMIT on rc=2.
       CLAIM_COMMIT="$commit"
       CLAIM_RESULT="push reported success but read-back differs ($back != $commit)"
@@ -1314,7 +1324,8 @@ _claim_acquire_at() {
     # in exactly that window). Returning 2 without the commit left merge-one.sh's
     # `if [ -n "${CLAIM_COMMIT:-}" ]` false, so it never attempted the fenced release — and the box
     # PROCEEDED fail-open while genuinely owning the ref, so every other box refused that head until
-    # the lease expired (up to REVIEW_TIMEOUT+1200 = 50 min). Safe to set unconditionally: the
+    # the lease expired (up to `CLAIM_LEASE` = REVIEW_TIMEOUT + _gw + 300, 50 min at the defaults).
+    # Safe to set unconditionally: the
     # fenced release is a no-op when the ref is still `$cur` (the lease does not match), so it can
     # never delete another box's claim.
     CLAIM_COMMIT="$commit"

@@ -28,7 +28,11 @@
 #  10 THE TERM             the DEFAULT branch lease is `CLAIM_BRANCH_TTL` (14400s), that same value is
 #                          the CEILING (a caller cannot mint a longer one), `CLAIM_TTL_MAX` (9600)
 #                          does NOT clamp it, an over-ceiling clamp is LOUD on stderr, and raising the
-#                          env var raises default AND ceiling together (one knob, not two). Before
+#                          env var raises default AND ceiling together (one knob, not two). Added by
+#                          later rounds on the same case: an UNPARSEABLE ttl falls back to the BRANCH
+#                          default — never the PR claim's 1800s — the printed ceiling FOLLOWS the knob,
+#                          and the bound is a STRICT `-gt` (a lease of exactly the ceiling is never
+#                          "clamped" and never warns). Before
 #                          this case NOTHING in the suite named `CLAIM_BRANCH_TTL`: measured,
 #                          reverting the default to the PR claim's 1800s left every suite green, so
 #                          the single-owner guarantee's entire term — the thing whose expiry lets a
@@ -61,12 +65,13 @@ export O="$T/orch" CLAIM_STATE_DIR="$T/orch/state"
 # ⛔ AND SO ARE THE LEASE SEAMS, for the same reason one class further along (review round 1): case 10
 # pins the DEFAULT term, so a cell that legitimately raised the knob — the operation `claims.sh`
 # advertises — would get a FALSE RED on correct code. Measured (round 7, this `unset` deleted and
-# `CLAIM_BRANCH_TTL=18000` exported): case 10 reddens on its default-lease arm, its printed-ceiling arm
-# and its over-ceiling clamp arm — a lease that was doing exactly what it was told, read as three
-# defects. The arms are NAMED rather than counted because a count rots the moment an arm is added:
-# round 1 wrote "2 failures" here, and by round 5 the same experiment reddened 3, so the sentence a
-# reader would re-run no longer reproduced. Empty is safe: `claims.sh` falls back to 14400 / 9600 on
-# an empty or unparseable value.
+# `CLAIM_BRANCH_TTL=18000` exported): case 10 reddens on EVERY arm that pins a term — the default
+# lease, the unparseable-ttl fallback, the printed ceiling and the over-ceiling clamp (four at this
+# head) — a lease that was doing exactly what it was told, read as four defects. The arms are NAMED
+# by subject rather than counted because a count rots the moment an arm is added: round 1 wrote
+# "2 failures" here, by round 5 the same experiment reddened 3, and the round-12 fallback arm made
+# it 4 — so a reader re-running it must compare SUBJECTS, not a number. Empty is safe: `claims.sh`
+# falls back to 14400 / 9600 on an empty or unparseable value.
 unset CLAIM_REPO CLAIM_OWNER_HOST CLAIM_BRANCH_TTL CLAIM_TTL_MAX
 
 BR=integration/land-batch-2
@@ -254,6 +259,7 @@ lease_arm() { # <label> <expected-seconds> <lease_until-epoch>
   fi
 }
 BR_LEASE=integration/lease-default
+BR_LEASE_BOUNDARY=integration/lease-boundary
 BR_LEASE_CEIL=integration/lease-ceiling
 BR_LEASE_FALLBACK=integration/lease-fallback
 BR_LEASE_KNOB=integration/lease-knob
@@ -263,11 +269,35 @@ acquire_from owner "$BR_LEASE"
 eq "acquire with NO explicit ttl succeeds" "$?" "0"
 L1="$(lease_of refs/claims/branch-integration-lease-default)"
 if [ -n "$L1" ]; then lease_arm "the DEFAULT lease is the branch key's own 14400s, not the PR claim's 1800s" 14400 "$L1"; else bad "no lease_until on the default-acquire claim ref"; fi
+# ⛔ AND THE BOUND IS A STRICT `-gt`, WHICH IS A PROPERTY OF ITS OWN (review round 13, P2).
+# `claim_branch_acquire` passes `CLAIM_BRANCH_TTL` as BOTH the default and the ceiling, so its DEFAULT
+# path requests a ttl EXACTLY EQUAL to `max`. Under a `-ge` bound that acquire is "clamped": nothing
+# is shortened, but every batch acquire prints `lease ttl 14400s exceeds this keying ceiling
+# (14400s) — clamped.` on stderr — telling an operator to raise a knob while the lease is exactly what
+# was asked for, on the path `merge-one.sh` runs with stdout discarded. Measured: flipping the bound
+# to `-ge` left this suite 45 passed, 0 failed, while `merge-one.sh` asserts the strictness as a FACT
+# ("its test is a STRICT `-gt`, so a lease of exactly the ceiling is never clamped"). So the
+# AT-CEILING acquire runs with the streams SPLIT and its stderr is read three ways — grep's exit 2
+# (unreadable operand) must not read as "no warning", the same fail-closed rule as the arm above.
+NOW=$(date +%s)
+( cd "$T/owner" && "$BC" acquire "$BR_LEASE_BOUNDARY" >"$T/bnd.stdout" 2>"$T/bnd.stderr" )
+eq "an acquire at EXACTLY the ceiling succeeds" "$?" "0"
+L1C="$(lease_of refs/claims/branch-integration-lease-boundary)"
+if [ -n "$L1C" ]; then lease_arm "a lease of EXACTLY the ceiling is NOT shortened (the bound is a strict -gt)" 14400 "$L1C"; else bad "no lease_until on the at-ceiling claim ref"; fi
+grep -q 'exceeds this keying ceiling' "$T/bnd.stderr"; BND_RC=$?
+case "$BND_RC" in
+  0) bad "a lease of EXACTLY the ceiling emitted the clamp warning — under a '-ge' bound every batch acquire warns while shortening nothing: $(cat "$T/bnd.stderr")" ;;
+  1) ok "a lease of EXACTLY the ceiling is not clamped and emits no warning (the bound is a strict -gt)" ;;
+  *) bad "the at-ceiling stderr probe could not be read (grep rc=$BND_RC) — an unreadable stream must not read as clean: $(cat "$T/bnd.stderr")" ;;
+esac
 # ⛔ AND THE CORE'S OWN `dflt` ARGUMENT (review of this change, P2). `claim_branch_acquire` passes
 # FOUR things to `_claim_acquire_at` — ref, ttl, dflt, max — and the arm above pins only the
 # CALLER-side default (`${3:-$CLAIM_BRANCH_TTL}`). Nothing pinned arg 3, which is what an UNPARSEABLE
 # ttl falls back to (`claims.sh`: `''|*[!0-9]*|0?*) ttl="$dflt"`); measured, changing arg 3 alone to
-# `$CLAIM_TTL` left THIS SUITE 44/0 and `claim-orphan.test.sh` 138/0 — both fully green. That is the
+# `$CLAIM_TTL` left THIS SUITE 44/0 and `claim-orphan.test.sh` 138/0 — both fully green. WITH the arm
+# below in place the same mutant reddens EXACTLY IT (the fallback arm goes red and no other arm does),
+# so the number above is the PRE-ARM baseline and is labelled as such rather than read as a statement
+# about this head: re-run it by SUBJECT, not by count. That is the
 # same class this case exists to remove, one level down, and it is REACHABLE: `branch-claim.sh`'s
 # `cmd_acquire` passes the CLI ttl through unvalidated (`acquire <branch> 07`), so a typo would hand a
 # live batch the PR claim's 1800s term. The issue keying's equivalent property is already pinned next
