@@ -26,13 +26,14 @@
 #                                            ⛔ That refusal is the truthful half: wiring the
 #                                            per-repo rubric is #2518's, and inventing one here
 #                                            would grade every PR by a declaration nobody read.
-#   set ABSENT, and the box can still name a repo -> the single-repo form, and loudly. It resolves
-#                                            from the box's OWN evidence (`OR`, then `REPO`'s git
-#                                            `origin` — pr-doctor's ranks 3 and 4) and is LOGGED
-#                                            EVERY PASS with the exact file to create. This is the state
-#                                            a box is in *before* an operator names its repos, and a
-#                                            doctor that stopped grading on upgrade would trade a
-#                                            silent gap for an outage.
+#   set ABSENT, and the box can still name a repo -> the single-repo form, and loudly. It resolves in
+#                                            pr-doctor's OWN rank order (`PR_DOCTOR_REPO` rank 2,
+#                                            `OR` rank 3, `REPO`'s proved `origin` rank 4), VALIDATES
+#                                            the value it is about to advertise, and is LOGGED EVERY
+#                                            PASS with the exact file to create. This is the state a box
+#                                            is in *before* an operator names its repos, and a doctor
+#                                            that stopped grading on upgrade would trade a silent gap
+#                                            for an outage.
 #   set ABSENT and NOTHING names a repo      -> REFUSE (exit 2), naming both fixes. ⛔ THE WRAPPER
 #                                            CHECKED THIS RATHER THAN ASSUMING IT: the doctor's
 #                                            REPO-only arm raises when the checkout's `origin` proves
@@ -153,27 +154,60 @@ case "$_rc" in
     #                                     mention the file that fixes it.
     repo_set_parse 1>&2
     _say "DEGRADED — NO-REPO-SET: $(repo_set_file) does not exist, so this box has named no repo set."
+    # The wrapper must establish the SAME evidence pr-doctor's resolver will use, in ITS rank order
+    # (2 `PR_DOCTOR_REPO`, 3 `OR`, 4 `REPO`'s proved `origin`), and refuse only when that resolution
+    # cannot produce a repo. Two easy ways to get this wrong, both MEASURED in review round 3:
+    #   * adopting `OR` VERBATIM — an `OR` that is not a slug (`"Not A Slug"`) made this line claim
+    #     "Grading the ONE repo" and the doctor then refused, i.e. the exact "claims to grade, grades
+    #     nothing" shape the round-2 fix removed from the other arm;
+    #   * IGNORING rank 2 — a box with `PR_DOCTOR_REPO` set (which the doctor honours ABOVE `OR`) was
+    #     refused here with "no repo to name", while the doctor would have run a full pass.
     _degraded=""
-    if [ -n "${OR:-}" ]; then
-      _degraded="$OR"
-      _say "  Grading the ONE repo this box declares in OR=$OR."
-    elif [ -n "${REPO:-}" ]; then
+    _why_not=""
+    _seam="$(printf '%s' "${PR_DOCTOR_REPO:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    _or="$(printf '%s' "${OR:-}" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+    _proved=""; _proved_why=""
+    if [ -n "${REPO:-}" ]; then
       # The reader's own proof function — the same one `check` uses, so the two cannot disagree.
-      _proof="$(_rs_origin_slug "$REPO")"; _why="${_proof#*$'	'}"; _proof="${_proof%%$'	'*}"
-      if [ -n "$_proof" ]; then
-        _degraded="$_proof"
-        _say "  Grading the ONE repo REPO proves: $_proof (from $REPO)."
+      _p="$(_rs_origin_slug "$REPO")"; _proved_why="${_p#*$'	'}"; _proved="${_p%%$'	'*}"
+    fi
+    if [ -n "$_seam" ]; then
+      if _rs_slug_ok "$_seam"; then
+        _degraded="$_seam"; _say "  Grading the ONE repo this unit declares in PR_DOCTOR_REPO=$_seam."
       else
-        _say "  REPO=$REPO proves no repo ($_why), and OR is not set — so this pass has NO repo to name."
+        _why_not="PR_DOCTOR_REPO='$_seam' is not an owner/name slug"
       fi
-    else
-      _say "  Neither OR nor REPO is set — so this pass has NO repo to name."
+    fi
+    # ⛔ AN `OR` THAT IS SET CONSUMES RANK 3, so it is decisive — valid-and-agreeing, or a refusal.
+    # It is NOT a hurdle to fall past: pr-doctor enters its rank-3 arm whenever `OR` is present and
+    # refuses an invalid one or a pair that names two repos, so falling through to `REPO`'s proof here
+    # would pick a repo the doctor then refuses (measured in review round 3: `OR=tortoise` with a
+    # `REPO` checkout of agent-infra ran, where the doctor refuses the pair).
+    _or_decisive=0
+    if [ -z "$_degraded" ] && [ -n "$_or" ]; then
+      _or_decisive=1
+      if ! _rs_slug_ok "$_or"; then
+        _why_not="OR='$_or' is not an owner/name slug"
+      elif [ -n "$_proved" ] && [ "$(_rs_lower "$_proved")" != "$(_rs_lower "$_or")" ]; then
+        _why_not="the box names two different repos: OR=$_or but REPO=$REPO is a checkout of $_proved"
+      else
+        _degraded="$_or"; _say "  Grading the ONE repo this unit declares in OR=$_or."
+      fi
+    fi
+    if [ -z "$_degraded" ] && [ "$_or_decisive" = 0 ] && [ -n "$_proved" ]; then
+      _degraded="$_proved"; _say "  Grading the ONE repo REPO proves: $_proved (from $REPO)."
     fi
     if [ -z "$_degraded" ]; then
-      _say "REFUSING — a pass with no repo would exit 2 on its first line, having graded nothing."
+      if [ -n "$_why_not" ]; then _say "  $_why_not — so this pass has NO usable repo."; fi
+      if [ -n "${REPO:-}" ] && [ -z "$_proved" ]; then
+        _say "  REPO=$REPO proves no repo ($_proved_why)."
+      elif [ -z "${REPO:-}" ] && [ -z "$_seam" ] && [ -z "$_or" ]; then
+        _say "  Neither PR_DOCTOR_REPO, OR nor REPO is set — so this pass has NO repo to name."
+      fi
+      _say "REFUSING — a pass with no usable repo would exit 2 on its first line, having graded nothing."
       _say "  Fix, either way:"
       _say "    (1) create the repo set above — one line per repo this box serves; or"
-      _say "    (2) set OR=OWNER/NAME (or point REPO at a checkout whose git origin proves it) for this unit."
+      _say "    (2) set PR_DOCTOR_REPO=OWNER/NAME or OR=OWNER/NAME (or point REPO at a checkout whose git origin proves it)."
       exit 2
     fi
     _say "  Create the repo set above and this same unit grades every repo it names, with no reinstall."

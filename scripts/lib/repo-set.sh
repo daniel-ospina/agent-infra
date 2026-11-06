@@ -115,6 +115,28 @@ _rs_say() { local s="$1"; shift; printf '%s\n' "$*" >&"$s"; }
 # smaller machine" failure this file exists to prevent.
 _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
+# _rs_norm_path <path> — the canonical SPELLING of a path, without touching the filesystem:
+# repeated separators collapsed, `.` components dropped, trailing `/` removed. It is not a realpath
+# (no symlink or `..` resolution — that needs the filesystem, and this must work for a dir that does
+# not exist yet), and it does not fold case: the caller composes it with `_rs_lower`.
+#
+# ⛔ WHY IT IS NEEDED, MEASURED IN REVIEW ROUND 3 (P2): `/srv/state` and `/srv//state` and
+# `/srv/./state` are ONE DIRECTORY. The shared-state guard compared raw spellings, so a set that named
+# the same state dir two ways returned OK — on exactly the silent-sharing failure the guard exists to
+# refuse (two controllers on one `.orch.lock`). The repo already treats this class as real:
+# `check-farm-drift.sh` normalises `//` and `.` after a measured incident.
+_rs_norm_path() {
+  local out="" comp
+  while IFS= read -r comp; do
+    case "$comp" in ''|.) continue ;; esac
+    out="$out/$comp"
+  done <<EOF_NORM
+$(printf '%s' "${1:-}" | tr '/' '\n')
+EOF_NORM
+  [ -n "$out" ] || out="/"
+  printf '%s' "$out"
+}
+
 # _rs_slug_ok <s> — `owner/name`, and exactly one `/`. `case` rather than `[[ =~ ]]` so this file
 # parses under bash 3.2 (macOS) as readily as under bash 5 (cells) — the shard runs the same file on
 # both, and a `=~` that only one of them supports is a suite that fails on the box nobody is looking
@@ -269,10 +291,12 @@ _rs_origin_slug() {
 }
 
 # repo_set_check — the SYNTAX half plus the proofs that make the list trustworthy:
-#   * every checkout exists and is a git work tree;
-#   * its `origin` PROVES the slug it is declared under (a PROVEN disagreement refuses; an UNREADABLE
-#     origin only warns — the same split pr-doctor.py's `resolve_repo()` makes, because launchd has no
-#     Full Disk Access under ~/Documents and refusing there would refuse every real multi-repo box);
+#   * every checkout exists — PROVEN absent refuses;
+#   * its `origin` PROVES the slug it is declared under (a PROVEN disagreement refuses; an UNVERIFIABLE
+#     checkout only warns — the same split pr-doctor.py's `resolve_repo()` makes, because launchd has
+#     no Full Disk Access under ~/Documents and refusing there would refuse every real multi-repo box,
+#     AND for exactly the same reason "there is no git work tree here" must never be inferred from
+#     "this process could not look");
 #   * no two repos share a state dir — the silent-sharing failure `multi-repo-controller.sh` refuses
 #     by name, one level up: two controllers pointed at one state dir fight over ONE `.orch.lock`,
 #     ONE candidates list and ONE worker registry, so each believes it is alone on the box.
@@ -298,10 +322,20 @@ repo_set_check() {
     n=$(( n + 1 ))
     local problems=""
 
-    if [ ! -d "$checkout" ]; then
+    # ⛔ A REFUSAL HERE MUST REST ON A PROOF, NOT ON THIS PROCESS'S ABILITY TO LOOK (review round 3,
+    # P1). This used to probe `git -C "$checkout" rev-parse` FIRST and call any failure "not a git work
+    # tree" — so on a box where the process cannot even CHDIR into the checkout, `check` refused the
+    # whole set and the wrapper exited 2, while the DOCTOR hands the same entry a complete read-only
+    # pass ("checkout: NONE … the queue is graded and NOTHING will be spawned"). That is the macOS TCC
+    # shape and it is `install-launchd.sh`'s DEFAULT checkout (`~/Documents/GitHub/tortoise`), so the
+    # refusal discarded the very pass this file exists to make possible — and it made the WARN arm
+    # below unreachable for exactly the case it was written for. Same for a missing `git` and a
+    # `dubious ownership` refusal, which are not facts about the checkout.
+    #
+    # So: PROVEN wrong (absent, or a checkout of a different repo) refuses; UNVERIFIABLE warns and
+    # lets the pass grade read-only, which is what the doctor does with the same evidence.
+    if [ ! -e "$checkout" ]; then
       problems="$problems; $checkout does not exist"
-    elif ! git -C "$checkout" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-      problems="$problems; $checkout is not a git work tree"
     else
       local proof why
       proof="$(_rs_origin_slug "$checkout")"; why="${proof#*$'\t'}"; proof="${proof%%$'\t'*}"
@@ -310,7 +344,9 @@ repo_set_check() {
           problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
         fi
       else
-        printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves no repo (%s); its queue will be graded read-only\n' "$slug" "$checkout" "$why"
+        # `why` is the reader's own reason, so "cannot change to …: Permission denied", "no
+        # remote.origin.url" and "git is not on PATH" are all reported as what they are.
+        printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves no repo (%s); its queue will be graded read-only and nothing will be spawned\n' "$slug" "$checkout" "$why"
       fi
     fi
 
@@ -322,8 +358,11 @@ repo_set_check() {
       # one candidates list, one worker registry. A case-SENSITIVE filesystem with two state dirs
       # differing only by case now gets a refusal it did not need — loud, renameable, and strictly
       # cheaper than the collision it prevents.
+      # ⛔ SPELLING AND CASE BOTH FOLD (round 3, P2). `/srv/state`, `/srv//state` and `/srv/./state`
+      # are one directory, so a raw comparison passed the collision this arm refuses; `_rs_norm_path`
+      # collapses them without touching the filesystem, and `_rs_lower` covers APFS/HFS+.
       local norm_state
-      norm_state="$(_rs_lower "$(printf '%s' "$state" | sed 's:/*$::')")"
+      norm_state="$(_rs_lower "$(_rs_norm_path "$state")")"
       case "$seen_states" in
         *$'\n'"$norm_state"$'\n'*)
           problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit" ;;
