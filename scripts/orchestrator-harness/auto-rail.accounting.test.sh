@@ -587,8 +587,16 @@ _ckline "no attestation in this body" "$H7" 'green\t7\tabsent' \
   "a mergeable green PR with NO record must still be a CANDIDATE (this is the PR #3486 shape: it was dropped, and sat for ever)"
 # ⛔ AND THE FALSE PASS THE SUBSTRING RULE PRODUCED: a body that mere QUOTES the marker shape, or carries
 # one for another PR, or names another repo, passed `"review recorded:" in body` and was never reviewed.
-_ckline "Example: review recorded: reviews/99.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "$H7" 'green\t7\tabsent' \
-  "a marker for a DIFFERENT PR number must not read as this PR's attestation (quoting the shape is not a record)"
+# ⛔ AND THIS ARM MUST BE A *WELL-FORMED* MARKER, OR IT PINS THE ANCHOR AND NOT THE PR NUMBER (review
+# round 6, P2, measured). Its body used to begin `Example: review recorded: …`, so the line was refused by
+# the `^` anchor BEFORE the PR-number comparison was ever consulted: replacing `if m.group(1) != str(pr)`
+# with `if False:` left the suite GREEN, exit 0. A stacked PR at the same 40-hex that quoted its SIBLING's
+# record on its own line would read `at-head` for a PR with no record of its own — review arm off, rail
+# refused, permanent stall — and no arm would have noticed the guard being deleted. The body is therefore
+# line-anchored and complete, so the ONLY thing that can refuse it is the PR-number comparison.
+# (The quoting case it used to cover is pinned by the indented / mid-sentence arms below.)
+_ckline "review recorded: reviews/99.json verdict=clean @ $H7 (daniel-ospina/tortoise)" "$H7" 'green\t7\tabsent' \
+  "a WELL-FORMED marker for a DIFFERENT PR number must not read as this PR's attestation — this body is line-anchored and structurally complete, so the PR-number comparison is the only guard that refuses it"
 # ⛔ AND AN INDENTED / MID-SENTENCE MARKER IS A QUOTATION, NOT A RECORD (review round 3, P2, measured).
 # The parse was unanchored, so a body that merely quoted THIS PR's marker shape at THIS head read `at-head`
 # — while check (c) is line-anchored and REJECTS it. `at-head` is the only value that disables the review
