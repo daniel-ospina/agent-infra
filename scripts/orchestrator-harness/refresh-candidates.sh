@@ -4091,8 +4091,8 @@ queue_order_from_pool() {
   # FIFO or a `/dev/zero` symlink is UNBOUNDED — there is no timeout anywhere on this path — and `-s` was
   # false for both, so the previous test-shaped guard never opened them while a plain `cat` would hang the
   # pass. Only a REGULAR file is read (a symlink to one still is), and a non-regular shape is classified
-  # unread rather than opened. `tr -d '\000'` strips NUL before the substitution can warn about it: a NUL
-  # in the record is data, not a reason to print the shell's own message above an operator line.
+  # NOT OPENED rather than opened. A NUL is RE-PLACED, not deleted, so it never reaches the substitution's
+  # warning AND it survives as data instead of being cleaned into a tier name it is not.
   # ⛔ THE READ IS WRAPPED IN A BRACE GROUP SO ITS REDIRECT FAILURE IS SUPPRESSIBLE (review P2, cycle 42).
   # `tr -d ... < "$o/.pool-sat" 2>/dev/null` does NOT cover the `<` — that redirect is set up before the
   # `2>/dev/null` applies, exactly as the `.queue-rank` comment above documents, so an unreadable record

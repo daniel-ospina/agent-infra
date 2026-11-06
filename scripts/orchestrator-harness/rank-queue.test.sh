@@ -1734,7 +1734,14 @@ else
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
   { drive_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
   ( cd "$d" && HOME="$d" bash drive.sh "$d/o" ) > "$d/out" 2>&1
-  if grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+  # ⛔ AND THE MUTANT MUST HAVE RUN (review P2, cycle 44). The three application gates observe that the
+  # mutation was WRITTEN, never that the mutated driver EXECUTED: a syntactically broken replacement passes
+  # all three, the drive dies, and the only predicate (absence of the clause) is satisfied by the failure —
+  # the same "green on `command not found`" the drift guard was hardened for. The drive's own line is the
+  # witness (measured: the correct mutation prints exactly one, a syntax-error mutant zero).
+  if ! grep -q '^\[refresh\] queue order' "$d/out" 2>/dev/null; then
+    rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
+  elif grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
 fi
 ck "non-vacuity: with the .pool-sat read removed the truncated-window clause disappears (the check can fail)" $rc
 
@@ -1818,7 +1825,8 @@ ck "(14d) an UNREADABLE window record asserts NO clip (both clauses) and leaks n
 
 # 14d-ter) A RECORD THAT EXISTS BUT CANNOT BE OPENED IS THE SAME STATE (review P3, cycle 41). `[ -s ]` and
 # `[ -r ]` are both TRUE for a directory, so a test-shaped guard let it through unread and reported "held
-# nothing this code could classify" over zero bytes. The read-status guard must classify it as unread.
+# nothing this code could classify" over zero bytes. The guard must classify it as NOT OPENED — which is
+# a different fact from "could not be READ", and the check below forbids that wording.
 _d14d="$TMP/arm-clip-dir"; rm -rf "$_d14d"; mkdir -p "$_d14d/o/.pool-sat"
 printf 'aaa\nbbb\n' > "$_d14d/o/candidates.txt"; printf '200\n' > "$_d14d/o/.pool"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14d/drive.sh"
