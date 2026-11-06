@@ -1094,13 +1094,22 @@ if [ "$PASS_MODE" = pin ]; then
         #      and reported rc=25 "nothing moved this box" — a TRUE reading of the WRONG records, and
         #      it `finish`es BEFORE predicate 4, so on that box the farm grade this whole feature
         #      exists to emit could never run at all.
-        #      ⛔ THE LIST IS EVERY NAME THIS PASS RESOLVES THAT `apply` READS — and `HARNESS_PIN` is
-        #      included even though `cmd_apply` does not consult it today: the materialiser's OTHER
-        #      verbs do (`cmd_status`, cloud-cell-supervisor.sh:4046), so forwarding it keeps a later
-        #      `status` call from answering about a different record. `HARNESS_FETCH` is the one
-        #      resolved name deliberately NOT forwarded (:205): the child re-derives the same value
-        #      from the identical default (`:1776`), and handing over `0` would change an exit code
-        #      on a hermetic box — a verdict this repair does not own. Carried on agent-infra#3593.
+        #      ⛔ THE CRITERION IS NOT "EVERY RESOLVED NAME" (review round 2, BLOCKING on the wording
+        #      first written here). It is: every LOCALLY-resolved path that the child would otherwise
+        #      resolve DIFFERENTLY. These five are set HERE as shell variables — no `export` — from the
+        #      pass's own `CELL_HOME`/`REF`, while the child's defaults are built on ITS OWN
+        #      `CELL_HOME`; that is exactly why they have to be named.
+        #      `HARNESS_FETCH` (:205) is therefore deliberately ABSENT, and that is not a gap: it
+        #      arrives from the caller's ENVIRONMENT, the pass scrubs nothing (every `env -i`/`unset`
+        #      in this file is a comment or an unrelated helper loop), and an inherited variable is
+        #      already in the child's environment, which defaults identically (`:1776`). So
+        #      `HARNESS_FETCH=0` reaches `apply` whether or not it is named here — forwarding it would
+        #      be a no-op, NOT a verdict change. (An earlier draft of this comment claimed the
+        #      opposite; it was wrong, checked against the tree, and corrected on agent-infra#3593.)
+        #      `HARNESS_PIN` IS forwarded even though `cmd_apply` never reads it — `cmd_status` does
+        #      (cloud-cell-supervisor.sh:4046). It is one of the three records the docs call the pin
+        #      paths, so all three are named uniformly rather than carrying a per-verb exception a
+        #      future reader would have to re-derive.
         OUT="$(CELL_HOME="$CELL_HOME" HARNESS_PIN="$PIN_SHA_FILE" HARNESS_PIN_FILE="$PIN_PATH_FILE" HARNESS_PIN_DIR="$PIN_ROOT" HARNESS_REPO="$REPO" HARNESS_REF="$REF" bash "$MATERIALISER" apply --force --pin-only 2>&1)"; ACT_RC=$?
         printf '%s\n' "$OUT" | sed 's/^/  /'
         [ "$ACT_RC" -eq 0 ] || {
