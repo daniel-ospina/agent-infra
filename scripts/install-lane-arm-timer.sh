@@ -98,8 +98,8 @@ done
 # Resolve the binary ONCE, before any verb. `|| echo systemctl` kept the variable NON-empty when
 # systemctl does not exist, so every call below silently failed under `|| true` and the uninstall still
 # printed "uninstalled" having removed nothing.
-say() { printf '%s\n' "$*"; }
-fail() { say "FAIL: $*" >&2; exit 1; }
+log_line() { printf '%s\n' "$*"; }
+fail() { log_line "FAIL: $*" >&2; exit 1; }
 
 os_kind() {
   case "$(uname -s)" in
@@ -219,31 +219,31 @@ EOF
 
 # ── status ────────────────────────────────────────────────────────────────────────────────────
 do_status() {
-  say "platform : $OS"
-  say "arm      : $ARM $([ -f "$ARM" ] && echo present || echo ABSENT)"
-  say "classifier: $SCRIPTS_DIR/lane-status.py $([ -f "$SCRIPTS_DIR/lane-status.py" ] && echo present || echo 'ABSENT -- the arm will report exit 4, not silence')"
+  log_line "platform : $OS"
+  log_line "arm      : $ARM $([ -f "$ARM" ] && echo present || echo ABSENT)"
+  log_line "classifier: $SCRIPTS_DIR/lane-status.py $([ -f "$SCRIPTS_DIR/lane-status.py" ] && echo present || echo 'ABSENT -- the arm will report exit 4, not silence')"
   if [ -e "$STATE_DIR/LANE-QUEUE.tsv" ]; then
     A=$("${LANE_ARM_PYTHON:-python3}" -c 'import os,sys,time
 try: print(int(time.time()-os.stat(sys.argv[1]).st_mtime))
 except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || echo '?')
     W="$(grep -c '^WEDGED' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || true)"
-    say "queue    : present, ${A}s old, wedged=${W:-0}"
+    log_line "queue    : present, ${A}s old, wedged=${W:-0}"
   else
-    say "queue    : ABSENT (no pass has succeeded here)"
+    log_line "queue    : ABSENT (no pass has succeeded here)"
   fi
   case "$OS" in
     linux)
       # use the RESOLVED binary and the same scope discipline as --install
       if [ -z "$SYSTEMCTL" ]; then
-        say "timer    : no systemctl on this box"
+        log_line "timer    : no systemctl on this box"
       else
         $SYSTEMCTL list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
           || $SYSTEMCTL --user list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" \
-          || say "timer    : not installed"
+          || log_line "timer    : not installed"
       fi
       ;;
     macos)
-      "$LAUNCHCTL" list 2>/dev/null | grep -F 'com.eldato.lane-arm' || say "job      : not installed"
+      "$LAUNCHCTL" list 2>/dev/null | grep -F 'com.eldato.lane-arm' || log_line "job      : not installed"
       ;;
     # ⛔ AN UNKNOWN PLATFORM IS NOT A SCHEDULE (2026-10-31, review). This `case` had no `*)` arm, so on
     # any platform that is neither Linux nor Darwin `--status` printed the platform/arm/classifier/queue
@@ -251,8 +251,8 @@ except OSError: raise SystemExit(1)' "$STATE_DIR/LANE-QUEUE.tsv" 2>/dev/null || 
     # question it could not answer, which is the no-op shape `install` and `uninstall` already refuse
     # (:272, :339). It refuses here too, and exits 1 because nothing was verified.
     *)
-      say "timer    : UNKNOWN platform $(uname -s) -- cannot verify a schedule here"
-      say "FAIL: unsupported platform $(uname -s) -- --status cannot answer whether anything is scheduled" >&2
+      log_line "timer    : UNKNOWN platform $(uname -s) -- cannot verify a schedule here"
+      log_line "FAIL: unsupported platform $(uname -s) -- --status cannot answer whether anything is scheduled" >&2
       exit 1
       ;;
   esac
@@ -294,7 +294,7 @@ if [ "$VERB" = uninstall ]; then
         [ -e "$_d/${LABEL}.timer" ] || [ -e "$_d/${LABEL}.service" ] || continue
         fail "removal reported but unit files remain in $_d -- not uninstalled (a manager may hold them open, or another identity owns them)"
       done
-      say "uninstalled ${LABEL}.timer (verified absent from both the system and user managers)"
+      log_line "uninstalled ${LABEL}.timer (verified absent from both the system and user managers)"
       ;;
     macos)
       # ⛔ VERIFY, NEVER THE SEND -- the same rule the Linux branch above spells out. `bootout` is
@@ -314,7 +314,7 @@ if [ "$VERB" = uninstall ]; then
       if [ -n "$_still" ] || [ -e "$P" ]; then
         fail "removal reported but ${ML} is STILL present -- not uninstalled. Still loaded as: ${_still:-<none listed>} ; plist present: $([ -e "$P" ] && echo yes || echo no)"
       fi
-      say "uninstalled ${ML} (verified absent from launchctl and LaunchAgents)"
+      log_line "uninstalled ${ML} (verified absent from launchctl and LaunchAgents)"
       ;;
     *) fail "unsupported platform $(uname -s)" ;;
   esac
@@ -360,13 +360,13 @@ case "$OS" in
 Group=$_group"; fi
           RENDER_ID="$RENDER_ID
 "
-          say "identity: the unit runs as $_owner ($RENDER_HOME) -- the owner of $STATE_DIR, not root"
+          log_line "identity: the unit runs as $_owner ($RENDER_HOME) -- the owner of $STATE_DIR, not root"
         fi
         ;;
     esac
     if [ "$DRY" = 1 ]; then
-      say "--- would install $D/${LABEL}.service ---"; service_body
-      say "--- would install $D/${LABEL}.timer ---"; timer_body
+      log_line "--- would install $D/${LABEL}.service ---"; service_body
+      log_line "--- would install $D/${LABEL}.timer ---"; timer_body
       exit 0
     fi
     mkdir -p "$D" 2>/dev/null || $SUDO mkdir -p "$D" 2>/dev/null || fail "cannot create $D"
@@ -388,7 +388,7 @@ Group=$_group"; fi
     # not), because a user-scope install that verified against the system manager failed AFTER
     # installing and enabling -- leaving a live 30-minute job under a message saying it was not there.
     if $RUN list-timers --all --no-legend 2>/dev/null | grep -qF "$LABEL"; then
-      say "installed ($SCOPE): ${LABEL}.timer, every ${INTERVAL}s"
+      log_line "installed ($SCOPE): ${LABEL}.timer, every ${INTERVAL}s"
       $RUN list-timers --all --no-legend 2>/dev/null | grep -F "$LABEL" | sed 's/^/  /'
     else
       fail "enable reported success but the timer is not listed in the $SCOPE scope -- treating as NOT installed"
@@ -396,13 +396,13 @@ Group=$_group"; fi
     ;;
   macos)
     P="$HOME/Library/LaunchAgents/com.eldato.lane-arm.plist"
-    if [ "$DRY" = 1 ]; then say "--- would install $P ---"; plist_body; exit 0; fi
+    if [ "$DRY" = 1 ]; then log_line "--- would install $P ---"; plist_body; exit 0; fi
     mkdir -p "$HOME/Library/LaunchAgents" || fail "cannot create LaunchAgents dir"
     plist_body > "$P" || fail "cannot write $P"
     "$LAUNCHCTL" bootout "gui/$(id -u)/com.eldato.lane-arm" 2>/dev/null || true
     "$LAUNCHCTL" bootstrap "gui/$(id -u)" "$P" 2>/dev/null || "$LAUNCHCTL" load "$P" 2>/dev/null || fail "launchctl could not load $P"
     if "$LAUNCHCTL" list 2>/dev/null | grep -qF 'com.eldato.lane-arm'; then
-      say "installed: com.eldato.lane-arm, every ${INTERVAL}s"
+      log_line "installed: com.eldato.lane-arm, every ${INTERVAL}s"
     else
       fail "launchctl reported success but the job is not listed -- treating as NOT installed"
     fi
