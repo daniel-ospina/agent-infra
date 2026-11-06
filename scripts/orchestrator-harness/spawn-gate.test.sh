@@ -1444,6 +1444,13 @@ ck "a capability refusal leaves the caller's job control as it found it (got '${
 # of this gate shipped with `CELL_PREFLIGHT_SH` uninitialised under `set -u`: the resolver aborted
 # inside the command substitution, `run_agent` took the "not found" fail-open, and the gate never ran
 # on any box while this suite was green (review of #2991, P0).
+# ⛔ AND THE ARM MUST PROVISION THE CREDENTIAL, or it grades the HOST instead of the resolver. The
+# probe's FIRST refusal is the key step (`cell-lane-preflight.sh`: `refused why=keys-unreadable`,
+# exit 2), which only happens on a box with no ambient key and no `~/keys.env` — i.e. exactly a bare
+# CI runner. Both refusals map to the SAME exit code 71, so the rc conjunct passed and only the
+# `why=no-return` grep failed: the arm was asserting something about the runner's environment, one
+# arm after this same class was fixed above. The rigged `pi` only `sleep 600`s, so no provider is
+# ever called; the value is a placeholder, never a real key.
 RES="$TMP/resolve"; mkdir -p "$RES/bin"
 cp "$HERE/spawn-gate.sh" "$RES/spawn-gate.sh"
 cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
@@ -1463,7 +1470,7 @@ sleep 600
 PIHANG
 chmod +x "$RES/bin/pi"
 : > "$LOG"
-env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
+env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND DEEPSEEK_API_KEY=fixture-not-a-real-key PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
   LANE_PREFLIGHT_BOUND=2 \
   bash -c '
     . "$1"
