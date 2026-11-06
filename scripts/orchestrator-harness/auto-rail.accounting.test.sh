@@ -1001,15 +1001,23 @@ grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
 #   * the loop's `review-found-issues` CALL — only the state's TEXT and its marker count were pinned, so
 #     deleting the call left a head the reviewer REJECTED (and which the loop correctly refuses to
 #     re-review) exactly as invisible as before this change.
-# ⛔ TWO ARMS, NOT ONE CONJUNCTIVE ONE (review round 7, verifier): a single `grep -qF` over the whole
-# line could not SEPARATE its two requirements — removing the publish and removing the `rejected` exclusion
-# both reddened the SAME arm, so neither could be diagnosed from a failure. Split: the line is located by
-# its own unique prefix, then each requirement is asserted on it separately.
-_capdef=$(grep -F '[ "$_kind" = green ] && [ "$_att" != at-head ]' "$SUT")
+# ⛔ AND THE LOCATOR MUST BE BOUND TO THE BLOCK, NOT TO THE WHOLE FILE (review round 8, P2, measured):
+# `_capdef=$(grep -F '…' "$SUT")` was FILE-WIDE, so ANY second line carrying the same prefix satisfied
+# both assertions below — the separation this split exists for held only while the prefix happened to be
+# unique, which no assertion pinned. Two mutations kept the suite GREEN, exit 0: (a) revert the `rejected`
+# exclusion on the real line and add a sibling line with the same prefix carrying it for a different state;
+# (b) delete the real publish and add a decoy line carrying the prefix plus all three texts. That is the
+# same false PASS this file already paid for once, on the arm for the guard it now exists to protect. So
+# the publish is located INSIDE the `candidate_deferred` block — the only place the cap-deferral publish
+# can run — and the block is required to hold exactly ONE of them.
+_capblock=$(grep -A30 -F 'if candidate_deferred "$repo" $REPOS; then' "$SUT")
+_capdef=$(printf '%s\n' "$_capblock" | grep -F 'publish_review_state "$repo" "$pr" awaiting-review')
 [ -n "$_capdef" ] \
+  || bad "the CAP-DEFERRAL block must still PUBLISH 'awaiting-review' for a deferred candidate — measured: deleting it left the suite GREEN, so the state a mergeable unattested PR is in whenever the box is at MAX existed only in the log. Located INSIDE the 'candidate_deferred' block, so a decoy line elsewhere in the file cannot satisfy this arm (a file-wide grep did, measured)"
+[ "$(printf '%s\n' "$_capdef" | grep -cF 'publish_review_state')" -eq 1 ] \
+  || bad "the CAP-DEFERRAL block must hold EXACTLY ONE 'awaiting-review' publish — the assertions below are 'any matching line contains this substring', so a second one inside the same block would let either requirement be satisfied by a line that is not the cap-deferral publish"
+printf '%s\n' "$_capdef" | grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]' \
   || bad "the CAP-DEFERRAL publish line must still START '[ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ]' — it is the only publish that runs while the box is at MAX, i.e. the COMMON state for a mergeable unattested PR (#3489 on the most common path)"
-printf '%s\n' "$_capdef" | grep -qF 'publish_review_state "$repo" "$pr" awaiting-review' \
-  || bad "the CAP-DEFERRAL arm must publish 'awaiting-review' for a green, unattested, deferred candidate — measured: deleting it left the suite GREEN, so the state a mergeable unattested PR is in whenever the box is at MAX existed only in the log"
 printf '%s\n' "$_capdef" | grep -qF '[ "$_att" != rejected ]' \
   || bad "the CAP-DEFERRAL publish must EXCLUDE 'rejected' — its text promises a reviewer 'as soon as this repo has a free slot', but review_candidate_arm maps *:rejected to skip, so a not-clean head (TERMINAL — only a new head gets a review) was left carrying a promise no dispatch would keep; under cap saturation the pass never reaches the review-found-issues publish that would correct it, so the false claim stands indefinitely"
 grep -A2 -F 'if review_should_defer "$_rdispatched"; then' "$SUT" | grep -qF 'publish_review_state "$repo" "$pr" awaiting-review' \
