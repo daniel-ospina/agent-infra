@@ -159,6 +159,15 @@ while [ $# -gt 0 ]; do
 done
 
 cleanup_all() {
+  # ⛔ THE BOUNDED LIBRARY HAS TWO EXIT-TRAP OBLIGATIONS, NOT ONE (review finding). Its CONTRACT names
+  # `tb_watchdogs_reap` AND `tb_bound_cleanup` (scripts/lib/bounded.sh), and every other caller honours
+  # both (disk-reaper.sh, pi-reap-worktrees.sh, conflict-rebase-timer.sh). Reaping first: on a host with
+  # no GNU `timeout` (macOS — the platform the watchdog exists for) `tb_timeout` forks a timer subshell
+  # that sleeps, then SIGKILLs the pid it recorded; leaving it alive after a SIGTERM/SIGINT means it
+  # outlives this pass by up to `secs` and then kills whatever now holds the recycled pid. A quiesce and
+  # a reclaim both signal this script, so that window is on the path that matters. SIGKILL bypasses traps
+  # entirely, so this is scoped to TERM/INT.
+  command -v tb_watchdogs_reap >/dev/null 2>&1 && tb_watchdogs_reap
   [ -n "${LISTF:-}" ] && rm -f "$LISTF"
   [ -n "${ERRF:-}" ] && rm -f "$ERRF"
   [ -n "${REC_TMP:-}" ] && rm -f "$REC_TMP"
@@ -185,9 +194,16 @@ NOW_S="$(date -u '+%s')"
 # pass's `status=ok` stayed in place and stayed fresh. Measured: a good pass, then uncommitted work
 # plus `WIP_SWEEP_RESCUE=/nonexistent` -> the sweep exits 3 and `--print-status` answers
 # `rc=0 status=ok`, i.e. a box being swept nowhere reads as swept WITH the work present on it.
-# So the state dir is created and marked here, BEFORE the delegate/repo refusals; a usage error
-# (exit 2) still comes earlier and deliberately does not touch the record, because a mistyped
-# argument is not a pass.
+# So the state dir is created and marked here, BEFORE the delegate/repo refusals.
+# ⛔ WHICH "exit 2" IS UNTOUCHED, STATED PRECISELY (review finding). The ARGUMENT parser runs before all
+# of this, so a mistyped flag leaves the record alone — a mistyped argument is not a pass. The four
+# ENVIRONMENT-BOUND validations below (`WIP_SWEEP_BUDGET`, the two watchdogs, the staleness window) do
+# NOT come earlier, and they must not be moved above this block: they are the same failure mode as a
+# missing rescuer — a pass that will refuse EVERY time until somebody fixes the box — and leaving the
+# previous `status=ok` standing is precisely the stale-green class this marker exists to close. So an
+# env-bound refusal marks the pass as started and `--print-status` answers `failed`/3, which is the
+# honest reading. The doc says the same two cases; it used to say "a usage error comes earlier" without
+# that distinction, and an operator reading it expected the record to be untouched.
 # ⛔ AND NOT ON A READ (review of this restructure). `--print-status` is a READER: it exits inside its own
 # branch below, so the prologue must not run for it — the first cut of this move overwrote the very record
 # the reader had been asked about with `status=running`, so every `--print-status` answered `failed`/3
@@ -679,6 +695,13 @@ examine() {
 flush_record() {
   if [ "$STOP_EXAMINE" -eq 1 ]; then
     record "$1" "$2" "${4#refs/heads/}" "$3" "unreached" "-" "-" "-" "-" "deferred-pass-budget"
+    # ⛔ A FLUSHED ROW IS A DEFERRAL AND MUST BE COUNTED AS ONE (#3588 review, cycle 3). The `unreached`
+    # rows written here were invisible to `deferred=`. Measured on 3 worktrees whose budget was spent
+    # before the FIRST examination: the index carried three `deferred-pass-budget` rows while the record
+    # said `deferred=0`, and the zero-examination escalation below then answered `status=failed`/exit 3
+    # for a pass that had simply run out of clock — the summary and the index disagreeing about the one
+    # thing an instrument reconciles, on the failure mode the quiesce reads as NOT DONE either way.
+    N_DEFERRED=$((N_DEFERRED + 1))
   else
     examine "$1" "$2" "$3" "$4" "$5" "$6"
   fi
@@ -757,7 +780,13 @@ done
 # ⛔ A PASS THAT EXAMINED ZERO WORKTREES HAS NOT SWEPT ANYTHING. Repos resolved and every one of them
 # listed at least its own main worktree, so zero here means the enumeration broke — never "no work to
 # rescue".
-if [ "$N_SEEN" -eq 0 ]; then
+# ⛔ UNLESS IT DEFERRED ROWS (#3588 review, cycle 3). A flushed `unreached` row is proof the enumeration
+# WORKED and the budget ended the pass before the first examination, which is `incomplete`/exit 1 and is
+# already stated via `deferred=` and `budget_stopped=yes`. Firing this escalation over flushed rows made
+# a spent budget read as a broken enumerate — measured: 3 worktrees, budget 1s, `deferred=0` (the count
+# bug above) and exit 3. With nothing examined AND nothing deferred, the premise (the listing produced
+# nothing) is true and the escalation stands.
+if [ "$N_SEEN" -eq 0 ] && [ "$N_DEFERRED" -eq 0 ]; then
   err "UNMEASURED — no worktree was examined at all, though ${#REPOS[@]} repo(s) resolved. This pass swept NOTHING; it is not a clean one."
   FAILED=1
 fi

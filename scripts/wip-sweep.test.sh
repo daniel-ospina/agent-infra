@@ -724,6 +724,90 @@ else
   bad "N4 the row does not attribute the failure to the rescue: $(sed -n '$p' "$T/state-rto/wip-sweep.tsv" 2>/dev/null)"
 fi
 
+# ── O) AN ENV-BOUND REFUSAL MARKS THE PASS; AN ARGUMENT ERROR DOES NOT ─────────────────────────────
+echo; echo "── O. an env-bound refusal (exit 2) marks the pass, an argument error does not ──"
+# ⛔ THE DOC USED TO SAY "a usage error (exit 2) comes earlier and deliberately does not touch the
+# record", and only the ARGUMENT parser is earlier — the four environment-bound validations run AFTER the
+# marker, on purpose. This arm pins the decision so a later tidy-up cannot move them above the marker and
+# silently restore the stale-`ok` class this PR exists to close (a box whose sweep refuses EVERY pass
+# reading as a swept box). The two cases are different and the doc now says both.
+mk_fixture envb fix/3485-envb || { echo "❌ fixture failed (envb)"; exit 1; }
+O_O0="$(sweep "$T/state-envb" --apply --repo "$T/envb/wt")"; RC_O0=$?
+[ "$RC_O0" -eq 0 ] && grep -qx 'status=ok' "$T/state-envb/wip-sweep.status" 2>/dev/null \
+  && ok "O1 a GOOD pass records status=ok (the baseline this arm needs)" \
+  || bad "O1 the prior pass did not record ok (rc=$RC_O0): $O_O0"
+O_O1="$(WIP_SWEEP_STALE_SECONDS=abc WIP_SWEEP_STATE_DIR="$T/state-envb" \
+  bash "$SW" --apply --repo "$T/envb/wt" 2>&1)"; RC_O1=$?
+[ "$RC_O1" -eq 2 ] && ok "O2 an unparseable bound is a usage refusal (exit 2)" \
+  || bad "O2 an unparseable bound answered $RC_O1 (want 2): $O_O1"
+grep -qx 'status=ok' "$T/state-envb/wip-sweep.status" 2>/dev/null \
+  && bad "O3 an ENV-bound refusal left the previous status=ok standing — the stale-green class" \
+  || ok "O3 the env-bound refusal marked the pass as started (a box that refuses every pass is not 'swept ok')"
+O_O2="$(sweep "$T/state-envb" --print-status)"; RC_O2=$?
+if [ "$RC_O2" -ne 0 ] && ! has "$O_O2" 'status=ok'; then
+  ok "O4 --print-status is not green (rc=$RC_O2) and prints no status=ok"
+else
+  bad "O4/O5 --print-status is green over a pass that refused on its bounds (rc=$RC_O2): $O_O2"
+fi
+# ⛔ AND THE ARGUMENT CASE REALLY IS UNTOUCHED: the parser runs before the record is resolved.
+REC_BEFORE="$(cat "$T/state-envb/wip-sweep.status" 2>/dev/null)"
+O_O3="$(sweep "$T/state-envb" --no-such-flag 2>&1)"; RC_O3=$?
+[ "$RC_O3" -eq 2 ] && ok "O6 an unknown argument exits 2" \
+  || bad "O6 an unknown argument answered $RC_O3 (want 2): $O_O3"
+[ "$(cat "$T/state-envb/wip-sweep.status" 2>/dev/null)" = "$REC_BEFORE" ] \
+  && ok "O7 it did NOT touch the record — a mistyped argument is not a pass" \
+  || bad "O7 an argument error rewrote the pass record"
+
+# ── P) THE EXIT TRAP HONOURS BOTH OF THE LIBRARY'S DOCUMENTED OBLIGATIONS ──────────────────────────
+echo; echo "── P. the EXIT trap honours both obligations of the bounded-execution contract ──"
+# ⛔ THIS IS A WIRING ASSERTION, AND IT SAYS SO. `scripts/lib/bounded.sh`'s CONTRACT names TWO EXIT-trap
+# obligations — `tb_watchdogs_reap` (TERM every live watchdog timer) and `tb_bound_cleanup` (remove the
+# per-run probe scratch dir) — and the leak the first one prevents only manifests on a host with no GNU
+# `timeout` (macOS, the platform the watchdog exists for) under SIGTERM/SIGINT, which cannot be reproduced
+# here without a process-table race. All three sibling callers honour both; this pins that this caller
+# does too, so a tidy-up cannot drop the reap line silently.
+TRAP_BODY="$(awk '/^cleanup_all\(\) \{/,/^\}/' "$SW" 2>/dev/null | sed 's/^[[:space:]]*#.*$//')"
+# ⛔ COMMENT LINES ARE STRIPPED FIRST. The function's own comment NAMES both obligations, so a grep over
+# the raw body passed with the call deleted — measured: dropping the reap line left PASS=117 FAIL=0. The
+# assertion has to read the CODE, and it matches either calling idiom (`command -v X && X` or
+# `X 2>/dev/null || true`) because both sibling callers use one of the two.
+has "$TRAP_BODY" 'tb_watchdogs_reap' \
+  && ok "P1 the EXIT trap TERMs live watchdog timers (a leaked timer SIGKILLs a recycled pid later)" \
+  || bad "P1 the EXIT trap does not reap watchdog timers — the library's first documented obligation"
+has "$TRAP_BODY" 'tb_bound_cleanup' \
+  && ok "P2 the EXIT trap also removes the probe scratch dir (the second obligation)" \
+  || bad "P2 the EXIT trap does not remove the probe scratch dir"
+
+# ── Q) A BUDGET SPENT BEFORE THE FIRST EXAMINATION IS `incomplete`, NOT A BROKEN ENUMERATE ──────────
+echo; echo "── Q. a budget spent before the first examination is incomplete, not a failed pass ──"
+# ⛔ THIS PATH WAS A SUB-SECOND RACE (measured: 1 run in 5 of the plain C5 fixture spent the budget before
+# the first record, flushed three `unreached` rows, and then answered `status=failed`/exit 3 with
+# `deferred=0` — the summary contradicting the index it exists to reconcile against). A `git` wrapper
+# that sleeps only on the repo-level probe makes the corner DETERMINISTIC.
+mk_fixture budq fix/3485-budq || { echo "❌ fixture failed (budq)"; exit 1; }
+git -C "$T/budq/wt" worktree add -q "$T/budq/w2" -b fix/3485-budq-b 2>/dev/null
+git -C "$T/budq/wt" worktree add -q "$T/budq/w3" -b fix/3485-budq-c 2>/dev/null
+mkdir -p "$T/slowbin"
+REAL_GIT="$(command -v git)"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" rev-parse --is-inside-work-tree "*) sleep 2 ;;\nesac\nexec %s "$@"\n' "$REAL_GIT" > "$T/slowbin/git"
+chmod +x "$T/slowbin/git"
+O_Q="$(PATH="$T/slowbin:$PATH" WIP_SWEEP_BUDGET=1 WIP_SWEEP_STATE_DIR="$T/state-budq" \
+  bash "$SW" --apply --repo "$T/budq/wt" 2>&1)"; RC_Q=$?
+[ "$RC_Q" -eq 1 ] && ok "Q1 the pass is INCOMPLETE (exit 1), not failed — the budget ended it, the enumeration did not break" \
+  || bad "Q1 answered $RC_Q (want 1): $O_Q"
+grep -qx 'status=incomplete' "$T/state-budq/wip-sweep.status" 2>/dev/null \
+  && ok "Q2 the record says status=incomplete" \
+  || bad "Q2 the record says $(sed -n 's/^status=//p' "$T/state-budq/wip-sweep.status" 2>/dev/null)"
+grep -qx 'deferred=3' "$T/state-budq/wip-sweep.status" 2>/dev/null \
+  && ok "Q3 deferred=3 — every row the pass flushed is COUNTED, so the summary agrees with the index" \
+  || bad "Q3 deferred=$(sed -n 's/^deferred=//p' "$T/state-budq/wip-sweep.status" 2>/dev/null) over three flushed rows"
+grep -qx 'seen=0' "$T/state-budq/wip-sweep.status" 2>/dev/null \
+  && ok "Q4 seen=0 — nothing was EXAMINED (the identity is over examined worktrees)" \
+  || bad "Q4 seen=$(sed -n 's/^seen=//p' "$T/state-budq/wip-sweep.status" 2>/dev/null) (want 0)"
+[ "$(grep -c 'deferred-pass-budget' "$T/state-budq/wip-sweep.tsv" 2>/dev/null)" = "3" ] \
+  && ok "Q5 the index carries three unreached rows — it still reconciles against git worktree list" \
+  || bad "Q5 the index carries $(grep -c 'deferred-pass-budget' "$T/state-budq/wip-sweep.tsv" 2>/dev/null) unreached row(s) (want 3)"
+
 echo
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
