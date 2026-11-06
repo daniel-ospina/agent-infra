@@ -235,6 +235,281 @@ In the controller the verdict has three outcomes, and only two of them stop work
   stand-down.
 - `refuse` → `GATE_WHY="capacity-placement(bound=…)"`: nothing is placed, and the bound is named.
 
+## 6a. Expected vs published — a dead box is not a full box (agent-infra #3446)
+
+§6 is fail-closed in **one** direction: a box that cannot publish is INELIGIBLE to its peers. That is
+right for safety, and it has a blind spot — **a dead box and a full box are indistinguishable**, because
+both publish nothing. MEASURED 2026-11-04: `cmux vm ls` reported **5 of 5 machines running** while
+`git ls-remote --refs origin 'refs/boxes/*'` returned **one** ref. Five live, idle boxes were invisible,
+nothing said so, and a controller concluded "there is no usable remote capacity" while ~87 lanes sat
+idle across four running cells.
+
+`cap_fleet_line <repo>` (CLI: `bash capacity.sh fleet-line <repo>`) joins the two readings into **one**
+line, emitted on every controller cycle EXCEPT the fork-exhausted one (that arm must be built from
+shell builtins, because a failed fork terminates the shell — the box is visible through its peers'
+lines instead) and on every drainer tick that OWNS THE LOCK (so a tick that skips a guard still
+reports the fleet). A **HELD** cycle still reports it: the disk-floor hold emits the line before its
+nap, because a box holding for bytes is exactly a *skipping* cycle and grepping `fleet:` on it must not
+read as "instrument not deployed".
+
+```
+fleet: expected=5 published=3 INELIGIBLE=3 extra=1 (pi-cell-3, pi-cell-4, pi-cell-1) src=cmux
+```
+
+**Reproduced against the live fleet while landing this — the reading, not a fixture.** MEASURED
+2026-11-05, from a checkout whose origin is the queue repo the cells publish to:
+
+```
+fleet: expected=5 published=4 INELIGIBLE=2 extra=1 (pi-cell-2, pi-cell-3) src=cmux
+```
+
+Five cells were running per `cmux vm list --json`; two of them (`pi-cell-2`, `pi-cell-3`) held no
+fresh record in `refs/boxes/*` and had been **invisible to the fleet**, exactly the state that read as
+"no usable remote capacity" on 2026-11-04. `extra=1` is the Mac, which publishes but is in no provider
+VM listing — the reconciliation is `published − extra = expected − INELIGIBLE` (4 − 1 = 5 − 2).
+
+- **`expected`** — the boxes that SHOULD be publishing. Resolution order: `CAP_EXPECTED_BOXES` (an
+  explicit roster of `<label>:<boxid>` or bare `<boxid>` tokens), then `CAP_EXPECTED` (an explicit
+  count), then the provider's own inventory (`cmux vm list --json`, **running** machines only; each
+  machine's `network.ipv4` is the very identity `cap_boxid` publishes under, which is what lets the
+  line NAME the missing boxes instead of only counting them). `src=` says which answered.
+- **`published`** — boxes with a **fresh, attributable** record in `refs/boxes/*`. A record older than
+  `CAP_PROBE_TTL` is *not* published: that box stopped republishing, which is the state a dead
+  controller produces. `published` counts every publishing box, including one the expectation does not
+  name (a Mac publishes but is not a provider VM), so it need not sum with `INELIGIBLE` to `expected` —
+  the three fields answer three different questions.
+- **`INELIGIBLE`** — expected boxes with no fresh record. Named in `(…)`; those that DO have a record
+  but only a **stale** one are listed separately in `stale=(…)`, because "up, but its controller stopped
+  publishing" is a different remedy from "gone". **Nothing is named when the channel could not be read**
+  — a membership claim ("these are not publishing") is exactly what an unread read cannot support, so
+  only the counts and `why=` are printed. **It is `unknown` whenever the expectation carries no key** (a
+  bare count, or a roster entry with no boxid): with nothing to match on, `expected − published` is a
+  lower bound, not a count — a publisher the expectation never names inflates `published` and quietly
+  under-reports the gap — so the boxes that ARE provably missing are named and the figure is withheld.
+- **`extra=`** — published boxes the expectation does NOT name, so the three fields are checkable:
+  `published − extra = expected − INELIGIBLE`. Without it a fleet where every expected box is silent but
+  three strangers publish would read `expected=3 published=3 INELIGIBLE=3`, and an eye comparing only
+  the first two numbers sees equality.
+- **`why=`** — present only when a side is unknown, and it names the reason (`provider-inventory-
+  unavailable`, `provider-inventory-unreadable`, `provider-inventory-unparseable`,
+  `expected-count-unparseable`, `expected-count-unusable`, `expected-has-no-boxid`, `roster-empty`,
+  `clock-unreadable`, `clock-skew`, `ttl-unreadable`, `identity-collision`, `channel-unreadable`,
+  `channel-timeout`, `channel-unverified`). `expected-has-no-boxid` means the expectation was READ but cannot be matched
+  record-for-record, so the line names what it can prove and says `INELIGIBLE=unknown` rather than a
+  subtraction. Two of those are worth calling out because each was a fail-OPEN in the first
+  cut of this line: an **unreadable clock** used to make every age negative (so every record looked
+  fresh — the line certified a fleet from a clock it never read), and a roster that **tokenized to
+  nothing** used to read as `expected=0`, a clean bill of health built from no material.
+- **`chan=`** — the channel the PUBLISHED side was read from (the origin URL, scheme, `.git` and any
+  **userinfo** stripped — an `https://x-access-token:…@` origin is a CI convention, and echoing it would
+  write a credential into the drainer's log on every tick). `src=` names the *expected* source only, so
+  without `chan=` a `published=0` was unattributable — which is how the drainer reported a healthy 3-of-5
+  fleet as `published=0 INELIGIBLE=5` while reading a **lane** checkout whose origin is not the queue
+  repo. The field is set only by the call that actually read a repo, so it can never label a reading that
+  did not take one.
+
+  **WHICH CHANNEL A DRAINER READS, in order, and nothing else is assumed:** an explicit `FLEET_REPO` (or
+  the ambient `REPO`); otherwise this drainer's own `SEED_REPO` **only when its origin IS** the
+  `REPO_SLUG` the drainer already knows — the comparison the old default assumed instead of checking;
+  otherwise `why=channel-unverified`. The units render `FLEET_REPO` (`install-drainer-timer.sh` →
+  `DRAINER_FLEET_REPO`, default `DRAINER_SEED_REPO`), so a cell installed by `install-drainer-timer.sh`
+  takes the **first** path — the unit sets the variable explicitly — while the origin comparison protects
+  every other caller (a hand-run tick, the macOS arm, a box whose unit predates this). A cell whose
+  `DRAINER_SEED_REPO` points at a foreign repo still READS it (attributable via `chan=`), it does not
+  refuse: bounded, and stated rather than implied.
+- **A field the shell cannot represent is a REFUSAL, not a PASS.** Every gate is `[ "$x" -ge "$y" ]`, and
+  an ERRORING test is FALSE: a channel record carrying a 20-digit `lpc` bypassed the load ceiling (the
+  diagnostic went to a stderr both readers discard) and `cap_place` answered `place=… eligible=1` for the
+  saturated box; the same held for `disk_free_mb` and `mem_free_mb`. `at` has its own variant —
+  `$(( 10#18446744075502150016 ))` wraps MODULO 2^64, so a stamp five centuries ahead read as *just
+  published* AND never aged out, with both readers agreeing on the wrong thing. Every numeric field is
+  bounded to 12 digits in the one helper both readers already call, which keeps `at` valid past 2286 and
+  every reading well inside int64.
+- **A CEILING the shell cannot compare silently DISABLES its own gate — the other half of the same bug.**
+  The record-side width bound above protects the datum; the values it is compared **against** are seams
+  (`CAP_LPC_CEILING`, `CAP_MIN_DISK_MB`, `CAP_MIN_MEM_MB`, `CAP_MIN_FORK_HEADROOM`), and this repo's own
+  docs spell them in prose in the form that BREAKS them — `CAP_LPC_CEILING` = 8.00 load-per-cpu. A decimal,
+  a unit (`500G`, `512MB`), a leading zero or a 20-digit value makes every `[ "$x" -ge "$y" ]` error, the
+  gate vanishes into a discarded stderr, and placement answers `eligible=1` for a box over the ceiling, out
+  of disk, out of memory or unable to fork. One predicate at load (`cap_int_seam`) applies the **default**
+  and says so on stderr — never the seam as typed (a literal `8.5` would keep the gate broken) and never 0
+  (which would make every box ineligible). The clock is the same datum in a third place: `CAP_NOW` was read
+  straight into `$(( ))`, where 20 digits wrap modulo 2^64 to the record's own `at`, the age computes as 0,
+  and placement certifies precisely the bytes the line reports as `clock-unreadable` — so `now` is
+  width-bounded in `cap_bound_hit`, the one place both readers age a record.
+- **One TTL predicate, consulted by BOTH readers.** `cap_bound_hit` (placement) and the line validate the
+  window through the same helper (`cap_ttl_secs`), and `cap_parse_lsremote` hands awk the VALIDATED
+  number — unvalidated, a duration typo made the line refuse while placement PLACED on the same bytes
+  (`place=h1 eligible=1`), and made awk read `15m` as **15**, silently shrinking the collision window
+  from 900 s to 15 s. A record whose age cannot be computed, or whose stamp is more than one window in
+  the FUTURE, is `probe_unreadable` to placement and `clock-skew`/`ttl-unreadable` to the line — never a
+  hidden difference between "may this box take work" and "is this box publishing".
+
+**The polarity is the point**, and it is the same rule the fleet already applies to check-runs (a
+missing check is not a green check):
+
+- an expectation that cannot be read is **`expected=UNKNOWN` with its reason**, never `expected=0` — a
+  zero would be a claim that the provider runs no machines, which nothing measured;
+- a channel that cannot be read is **`published=UNREADABLE`**, never `published=0`;
+- an **empty** read against a non-empty expectation is an ALARM (`published=0 INELIGIBLE=n`), not a quiet
+  fleet of one. `capacity-placement.test.sh` §15 grades all three, and two of its arms carry a MUTANT
+  that must fail the reproduction (remove the UNKNOWN arm; force a "healthy" line) so the assertions
+  cannot pass on a tree that lost the behaviour.
+
+Exit code: `0` both sides known and attributable · `1` a side is UNKNOWN/UNREADABLE (or the expectation
+carries no key, so missing boxes cannot be named) · `2` the channel itself is unreadable. **The line is
+printed in every one of those cases** — the line carries the state, the exit code carries the
+completeness, so a `$( )` caller still gets the reading.
+
+Seams (all opt-in; a box that sets none calls the provider): `CAP_EXPECTED_BOXES`, `CAP_EXPECTED`,
+`CAP_CMUX_BIN` (path to the provider CLI), `CAP_CMUX_LIST` (an operator's own inventory command line,
+e.g. a bounded wrapper), `CAP_INVENTORY_TIMEOUT` (seconds, default 10), `CAP_CHANNEL_TIMEOUT` (seconds,
+default 10 — the `git ls-remote` half is a network read too).
+
+⛔ **THE INVENTORY CALL IS BOUNDED, AND A TIMEOUT IS A NAMED READING.** `cmux vm list --json` is a
+NETWORK call: unbounded, a wedged provider hangs the **drainer tick that holds the lock** — every later
+tick then exits `SKIP: drainer already running` and the box stops topping up — and it sits on every
+controller cycle. `timeout` is GNU and macOS ships it nowhere, so the bound walks `timeout` →
+`gtimeout` → a bash-native watchdog (the same contract as `repo-authority.sh`'s `_gh_bounded`); a
+timeout reads `provider-inventory-unreadable(<cmd> timed out after <n>s)`, never a quiet fleet. The
+watchdog (the macOS arm) writes the child's stdout to a FILE rather than to the caller's own: `kill`
+reaches the direct pid only, so a descendant the provider left behind would otherwise keep the caller's
+`$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. That path does
+NOT depend on `mktemp` (a per-process name is built by the shell), because a `mktemp` that fails would
+otherwise have to fall back to inheriting stdout — the very hazard — or silently un-bound the caller.
+And the FILE applies to **every** arm, not just the watchdog: `timeout` / `gtimeout` — what every Linux
+cell (and macOS with coreutils) takes — used to hand the child the caller's stdout, so a descendant that
+escaped the child's process group held the caller's `$( )` past the bound (measured: 1 s bound, 12 s
+caller block). The bound exists so the reading can be taken inside the drainer's tick lock, so that leak
+was a wedge, not a slow read. A `CAP_*_TIMEOUT` is normalised NUMERICALLY — `0`, `00` and `000` are all
+"no timeout" to GNU `timeout` while the watchdog arm treats them as an instant expiry, so every all-zero
+spelling, any non-number and anything outside 1…999999999 is the 10 s fallback, decided by ONE helper
+(`cap_bound_secs`) that the timeout DIAGNOSTICS also print (`timed out after 10s`, never `after 0s`).
+The `timeout` arm also KILLS (`-k 1`), because a child that ignores SIGTERM otherwise ran its full
+lifetime under a 1 s bound (measured: 10 s) while the watchdog arm bounded it in 1 s. The kill-after
+status (137) is normalised to 124 ONLY when the clock says the bound really elapsed: a child that killed
+itself returned in 0 s and must not be reported as `timed out after 10s`, which is what a blanket
+normalisation did while the watchdog arm called the same child `exited 137`.
+Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
+`wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
+`exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /
+`channel-timeout`). The bound still fails closed either way — it is the NAME that was lost. The sibling
+reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this line's path.
+
+⛔ **THE CHANNEL READ IS BOUNDED FOR THE SAME REASON.** `cap_read_fleet`'s `git ls-remote` is a network
+read on the same path (`GIT_TERMINAL_PROMPT=0`, so a credential prompt cannot become a lock-holding
+hang); a timeout reads `why=channel-timeout` and `published=UNREADABLE`. This matters most where the
+reading was added: `ai-drainer.sh` takes it BEFORE its guards while holding the tick's lock, so an
+unbounded read there stops every later tick (`SKIP: drainer already running`) and the box stops topping
+up — the same consequence the provider bound exists for, on the other half of the same reading.
+
+A provider that lists **zero** running machines reads as `provider-inventory-unparseable`, not
+`expected=0`: the reader cannot tell an empty listing from one it failed to parse, and guessing zero
+would hide the parse failure (an operator in that state pins `CAP_EXPECTED=0`, which is an explicit
+claim rather than an inference). The same rule covers a machine the extractor **cannot classify**: only
+a status READ as `stopped` is treated as parked, and an unreadable/unknown status (or a case variant
+such as `Running`) refuses the WHOLE listing rather than shrinking `expected` — a smaller denominator
+reads as a whole fleet, which is the false PASS this line exists to kill. A listing the SPLITTER could
+not separate is refused the same way (a `"status"` key count higher than the object count means objects
+are still hiding inside one fragment — the CRLF shape), so an unread listing can never arrive as a
+short fleet.
+
+⛔ **A CELL HAS NO PROVIDER CLI, SO A CELL MUST PIN ITS EXPECTATION.** `cmux vm list` exists on the Mac
+that runs the VMs; a cell is a headless Linux VM with no app and no `cmux` binary
+(`pi-bootstrap/cell-install.sh`). With no seam set, a cell's line therefore reads
+`expected=UNKNOWN published=N INELIGIBLE=unknown why=provider-inventory-unavailable` on every cycle —
+the fail-closed direction, and information-free. That is honest, not healthy: **the reconciliation only
+produces a number where an expectation exists.** A cell that should reconcile must pin
+`CAP_EXPECTED_BOXES` (`pi-cell-1:10.238.144.2,pi-cell-2:10.238.144.6,…`, the roster whose keys are the
+very `network.ipv4` values `cap_boxid` publishes under) or, if only the count is known,
+`CAP_EXPECTED=<n>` (which reports `INELIGIBLE=unknown`, because a count cannot name who is missing).
+
+⛔ **A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL.** A 19+-digit `CAP_EXPECTED` made the count arm's
+loop fail (`integer expression expected`), return 0 with no output, and the line certified
+`expected=0 published=1 INELIGIBLE=0` — the `expected=0` false PASS the instrument forbids. A count must
+be a whole number of at most four digits with no leading zero beyond `0` itself
+(`expected-count-unusable`), and `CAP_EXPECTED=0` remains the one explicit, operator-made zero.
+
+The **leading-zero** refusal is a convention, not a shell limitation, and this document says so because
+it used to say the opposite. MEASURED on bash 5.2.21 and on bash 3.2.57: `[ 0 -lt 08 ]` → rc 0 and
+`[ 8 -lt 010 ]` → rc 0, i.e. `test` compares these **decimally**, and the pre-guard arm on
+`CAP_EXPECTED=08` emitted 8 expected lines rather than zero. `08` is refused because a zero-padded count
+is not a count anyone writes on purpose, and quietly re-reading an operator's value as a different
+number is its own surprise — not because the comparison would fail.
+
+⛔ **A NUMERIC TTL OUT OF RANGE IS THE SAME HOLE AS AN UNCOMPARABLE ONE.** Twenty digits make
+`[ "$age" -gt "$CAP_PROBE_TTL" ]` error, so the stale branch never runs and every record counts fresh —
+measured `expected=3 published=1 INELIGIBLE=2`, rc 0 where the truth is `published=0 INELIGIBLE=3
+stale=(cell-1)`. The TTL is whole seconds, at most ten digits, no leading zero.
+
+⛔ **THE SAME RULE FOR THE FRESHNESS COMPARISON.** `CAP_PROBE_TTL` must be whole seconds: a duration
+typo (`15m`) makes `[ age -gt TTL ]` fail, which would skip the stale branch and count EVERY record
+fresh — measured, a 100,000,000-second-old record read `published=1`, rc 0, with the only diagnostic on
+a stderr both emitters discard. An uncomparable TTL refuses the reading (`why=ttl-unreadable`), exactly
+as an unreadable clock does. A stamp more than the window in the FUTURE is likewise not a clock
+disagreement — a box with a broken RTC would otherwise read `published=1` for ever, and keep reading it
+after it died — so it refuses as `why=clock-skew`; a second or two of skew between two boxes is normal
+and still clamps to "just published".
+
+⛔ **MORE WAYS A SIDE USED TO COUNT SOMETHING IT HAD NOT ESTABLISHED.**
+
+- **A record the line cannot validate is not "this box is not publishing".** `cap_place` refuses such a
+  record (`bound=probe_unreadable`), but the published loop used to DROP it and then report the box as
+  INELIGIBLE with rc 0 — measured `expected=1 published=0 INELIGIBLE=1 (cell-1)` on a record placement
+  refuses (`lpc=18446744073709551615`: every field is bounded, `cap_valid_base_record` returns 1). rc 0
+  claims "both sides known and attributable", and the named cause sends the operator to restart a
+  controller whose record is merely malformed. An unreadable record (or one whose `at` cannot be
+  parsed) now refuses as `why=record-unreadable`, the same answer the collision arm gives: the line and
+  placement must not disagree about who is visible. The rule covers a record with **no attributable key**
+  too (an older peer writes no `boxid`; `cap_parse_lsremote` passes it through, `cap_place` refuses it
+  as `bound=box_unknown`): the line used to drop it and claim the box was missing, and now refuses as
+  `why=box-unreadable`.
+
+- **A collided key is not a published box.** `cap_parse_lsremote` already marks such a record
+  (`collide=1`) and `cap_place` refuses the whole evaluation on it (`bound=identity_collision`),
+  because two machines under one key mean the last writer masks the other — which is #3446's own
+  shape, reached through a key this codebase records as having really collided. The line was dropping
+  the mark it had just been handed: measured, two machines under one key with one of them dead read
+  `expected=1 published=1 INELIGIBLE=0` rc 0 while placement refused the same bytes. It now refuses as
+  `why=identity-collision`: the line and placement must not disagree about who is visible.
+- **A channel-legal `at` must not kill the line.** `at=08` passes the digit check and bash reads it as
+  BAD OCTAL, so the *assignment* aborted — no line at all, against the contract that says one is printed
+  in every case, and the drainer then named a false cause (`why=capacity.sh-incomplete — a STALE copy:
+  re-seed $O`). The age arithmetic is `10#`-prefixed (and a non-digit `now` refuses), so a malformed peer
+  record costs that record's freshness, never the fleet's reading.
+- **Two machines behind one address is a collision, not a typo.** The expected-side dedupe ("the same box
+  named twice is one box") is right for a roster row and wrong for the provider inventory, where the key
+  is `network.ipv4`: measured, 5 running machines with one reusing another's address read
+  `expected=4 published=1 INELIGIBLE=3`, rc 0 — a live machine invisible to the instrument built to stop
+  exactly that. The listing now refuses (`DUPLICATEKEY <addr>`) instead of picking a winner.
+- **A truncated listing is not a shorter fleet.** The round-3 fix caught a body that hid objects inside
+  one fragment; a body CUT between objects runs off the end, leaves nothing hidden, and passed every
+  check — measured on a 5-machine listing cut after object 2: `expected=2 published=2 INELIGIBLE=0`, rc
+  0, naming two of five machines. Completeness is now structural: every `{` needs its `}`, every `[`
+  its `]` (the live provider emits `{"machines":[…]}` — `]}` — so only BALANCE is assumed, not shape).
+- **One token per field, or the line names a box that does not exist.** Each inventory line is
+  `<name> <ipv4|->` and the reader splits on whitespace, so a machine NAME carrying a space
+  (`pi cell 1`) was read as `label=pi`, `bid=cell 1 10.0.0.1` — measured `expected=1 published=1
+  INELIGIBLE=1 (pi)` rc 0: a phantom box named as missing, the real box published beside it, and the
+  line's own `published − extra = expected − INELIGIBLE` invariant broken by a display-only label. The
+  label is normalised to the token charset (`cap_ref_token`, the same sanitiser a roster row's key and
+  label go through); an ADDRESS carrying whitespace is refused with the listing, because it is the
+  join key and a key that cannot be one token can never match a published record. A roster row cannot
+  carry a space at all — `CAP_EXPECTED_BOXES` is split on commas AND whitespace, so `pi cell
+  1:10.0.0.1` is three rows and reads `expected=3 … (pi, cell)`; that is a malformed seam, not a lost
+  label. The **collision compare keeps the raw name**:
+  normalising it first made `pi cell 2` and `pi_cell_2` compare equal, so two distinct machines behind
+  one address collapsed into one expected entry — the exact false PASS the duplicate-address gate
+  (`DUPLICATEKEY`) exists to stop, and one this change briefly re-opened.
+
+owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
+`cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —
+no second read) and `ai-drainer.sh` (once per tick that owns the lock, **before** any guard that can
+skip, so a skipping tick still reports the fleet). The controller emits it on every cycle with a
+READABLE probe — including the cycle whose own probe failed — plus the DISK-HELD cycle, and
+deliberately not on the fork-exhausted cycle, which is built from shell builtins only because a failed
+fork terminates the shell; a fork-starved box is seen by its PEERS' lines instead.
+
 ## 7. The self-dispatch proof
 
 `orch-loop.sh` appends **one line per cycle** to `$O/state/cycles`:
@@ -268,7 +543,15 @@ CI lanes run it): the saturated box skipped and the least-loaded eligible box ch
 unreadable/stale/absent record never chosen; no eligible box ⇒ refusal naming the bound; a controller
 with no record in more than two cycles is `DEGRADED` and one with no record at all is `ABSENT` — never
 `HEALTHY`. Hermetic: clock/host seams, and a local bare repo as the shared origin (real pushes, real
-`ls-remote`).
+`ls-remote`). §15 grades the EXPECTED-vs-PUBLISHED line (§6a): the missing boxes are NAMED, a stale
+record is not counted as published, an empty read against a non-empty expectation is an alarm, an
+unreadable expectation is `expected=UNKNOWN` (never `0`) and an unreadable channel is
+`published=UNREADABLE` (never `0`), the provider's `running` filter and its name→key mapping are
+exercised against a real listing shape (compact AND pretty-printed), and both call sites (`orch-loop.sh`,
+`ai-drainer.sh`) are asserted to emit it — with mutation arms that must fail the reproduction.
+`ai-drainer.test.sh` (`== the fleet line (#3446) ==`) grades the same line behaviourally: one line per
+tick that owns the lock, `published=UNREADABLE` on a channel with no origin, and a NAMED reason when the
+instrument is missing.
 
 ## 8. The other half: the runner POOL is provisioned from this repo
 

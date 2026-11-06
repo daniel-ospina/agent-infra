@@ -1051,6 +1051,38 @@ jobs:
         # post-merge `extensions/*/test*.mjs` glob in ci-main.yml is not
         # PR-triggered).
         run: node extensions/main-worktree-guard/test-nested-worktree.mjs
+      - name: main-worktree-guard REMOTE-EXEC boundary (#3444)
+        # Every gate here resolved PATHS and HUB STATE against the LOCAL
+        # checkout, so a command whose execution target is another box
+        # (`cmux vm exec <vm> -- …`, `ssh <host> …`, `docker exec <c> …`) was
+        # judged by local reads the command can never touch. Measured
+        # 2026-11-04: a remote `git worktree add` refused by #1919 with the
+        # LOCAL path named, a remote `git checkout`/`git pull` refused by
+        # #1484/#1144, a payload piped to a remote shell refused by #709 — ~87
+        # idle lanes on four cells, unusable from the hub.
+        # This suite pins BOTH directions of every case (the remote form
+        # ALLOWED, the SAME command run locally still REFUSED by the guard that
+        # owns it) and the safety half (a trailing/leading LOCAL segment, a
+        # local redirect target, a locally-executed substitution and a heredoc
+        # terminator all stay gated). Behavioral: loads the REAL index.ts
+        # through module-load-hooks.mjs and drives the tool_call handler against
+        # a hermetic hub. Zero-dep (`node:*` + the `git` binary), no `npm ci`,
+        # ~6s. Its own step (the post-merge `extensions/*/test*.mjs` glob in
+        # ci-main.yml is not PR-triggered).
+        run: node extensions/main-worktree-guard/test-remote-context.mjs
+      - name: main-worktree-guard REMOTE-EXEC boundary MUTATION evidence (#3444)
+        # The suite above is only a pin if it can FAIL, and this fix has TWO
+        # directions to get wrong — too little (the boundaries are not
+        # recognised, today's false blocks remain) and too much (the mask runs
+        # past the remote command and swallows LOCAL text, a fail-open).
+        # `--mutations` rebuilds a TEMP copy of the extension and requires each
+        # mutant to redden exactly the pins it reverts: the pre-fix identity
+        # mask reddens every REMOTE-ALLOWED pin, an over-reaching mask that
+        # ignores top-level separators reddens the trailing-local pins, and a
+        # masked heredoc TERMINATOR reddens the heredoc-then-local pin. Its OWN
+        # step so neither verdict can suppress the other (the rule every
+        # sibling suite here follows). Zero-dep, ~10s.
+        run: node extensions/main-worktree-guard/test-remote-context.mjs --mutations
       - name: task-cwd-guard shared-main spawn-cwd gate (#1240)
         # A `task` dispatch with no explicit `cwd` inherits the PARENT's cwd
         # (#1071), so ~124 dispatches/hour on the tortoise hub landed in a

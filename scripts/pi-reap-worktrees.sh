@@ -366,7 +366,9 @@
 #   unparseable-path (poisoned record) > bare > main-checkout > self-checkout >
 #   worktree-locked (an `initializing` lock older than REAP_WT_STALE_INIT_SECONDS is DETECTED here
 #   and the interrupted-add class stays pending) > unreadable-path | prunable > live-process >
-#   live-cwd > live-claim > claim-unverified > interrupted-add[-unreachable] >
+#   live-cwd > pin-tree | pin-tree-shape (#10114 — a HARNESS PIN TREE is a holder /proc cannot
+#   show, so it outranks every removal rule) > live-claim > claim-unverified >
+#   interrupted-add[-unreachable] >
 #   dirty | ignored-artifact | status-timeout | status-error > abandoned-wip >
 #   detached-unreachable > open-pr > too-recent | ghost-zero-ahead > too-young >
 #   stranded-stash-unverifiable | stranded-stash > unpushed-unverifiable > reclaimable
@@ -380,6 +382,7 @@
 #   #2541/#3041 (origin/main)         too-young · stranded-stash · stranded-stash-unverifiable ·
 #                                     unpushed-unverifiable · main-proof-vanished ·
 #                                     remote-holds:<remote>/<branch>
+#   #10114 (this branch, pin tree)     pin-tree · pin-tree-shape
 #   pre-existing (both sides)         bare · main-checkout · self-checkout · worktree-locked ·
 #                                     unreadable-path · prunable · live-process · live-cwd · dirty ·
 #                                     ignored-artifact · status-timeout · status-error ·
@@ -532,6 +535,16 @@
 #   live-claim             an issue named by the branch is claimed live on
 #                          origin (refs/claims/issue-<N>) — the issue is in
 #                          flight; see the LANE RESIDUE section above
+#   pin-tree               the checkout is a HARNESS PIN TREE — a tree a
+#                          `.harness-path` record names as the code this box
+#                          EXECUTES. It is a git worktree whose HEAD is main's
+#                          tip by construction, so rule 3 convicts it on every
+#                          pass; #10114 measured a reaper deleting it and the
+#                          box then exiting 23 cannot-verify for 2h17m
+#   pin-tree-shape         the same, matched on SHAPE (`<root>/harness[/<sha12>]`,
+#                          `harness-next`) because a pin record in another HOME
+#                          is unreadable from here — a silent miss deletes the
+#                          tree, so this probe can only PRESERVE
 #   claim-unverified       the claim registry could not be read; the lane-residue
 #                          classes abstain (a claim that cannot be read is LIVE)
 #   backup-unverified      the dirty-tree backup did not verify — NOTHING was
@@ -631,6 +644,9 @@ LSOF_BIN="${LSOF_BIN:-lsof}"
 # scratch/log cleanup keeps the real `rm` (it must not be defeated by a seam).
 RM_BIN="${RM_BIN:-rm}"
 TAR_BIN="${TAR_BIN:-tar}"
+# The walker the archive-signature gate uses (resolved once, like every other binary here). A seam
+# because the gate's failure arm — "the walk could not complete ⇒ RED" — has to be testable.
+FIND_BIN="${REAP_WT_FIND_BIN:-find}"
 DATE_BIN="${DATE_BIN:-/bin/date}"
 STATE_DIR="${REAP_WT_STATE_DIR:-${HOME:-}/.pi/agent/state}"
 REAP_WT_LOG="${REAP_WT_LOG:-$STATE_DIR/pi-reap-worktrees.log}"
@@ -937,7 +953,7 @@ Decision table (env REAP_WT_MIN_AGE_MINUTES, default 45):
   5 clean + PR CLOSED unmerged, head not an ancestor   KEEP (named)
   6 clean + no PR at all                               KEEP (named)
   7 younger than REAP_WT_MIN_AGE_MINUTES               KEEP
-  P pre-existing structural gates (main/self/locked/open-PR/revocable-ref)
+  P pre-existing structural gates (main/self/locked/open-PR/revocable-ref/pin-tree)
   R clean + the only holder is refs/remotes/<r>/<b> AND a bounded
     \`git ls-remote\` confirms the REMOTE still points <b> at this HEAD   REMOVE (remote-holds:<r>/<b>)
     — any probe failure, timeout, empty answer or sha mismatch is PRESERVE (remote-only-ref)
@@ -1072,7 +1088,11 @@ fs_bounded_out() {
     [ $# -gt 0 ] || return 125
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-fso.XXXXXX" 2>/dev/null)" || return 125
     run_bounded "$secs" "$out" "$@"; rc=$?
-    [ "$rc" = 0 ] && cat "$out" 2>/dev/null
+    # ⛔ A LISTING THAT COULD NOT BE DELIVERED IS NOT AN EMPTY TREE (review of #3422 round 12, P3).
+    # `cat`'s own status was discarded, so a read that failed halfway emitted a PREFIX and returned the
+    # child's rc 0 — a truncated listing that any post-archive comparison reads as "nothing changed".
+    # The caller's contract is "rc 0 ⇒ the output IS the whole output", so a failed `cat` is rc 1.
+    if [ "$rc" = 0 ] && ! cat "$out" 2>/dev/null; then rc=1; fi
     rm -f "$out" 2>/dev/null
     return "$rc"
 }
@@ -1086,6 +1106,9 @@ fs_exists_bounded() {
 # fs_isdir_bounded <secs> <path> — `[ -d ]`, bounded (same reason: a stat on a dead mount blocks).
 fs_isdir_bounded() {
     fs_bounded "$1" sh -c '[ -d "$1" ]' _ "$2"
+}
+fs_link_bounded() { # a symlink, followed or DANGLING (the shape `-e` answers wrongly)
+    fs_bounded "$1" sh -c '[ -L "$1" ]' _ "$2"
 }
 
 # fs_nonempty_bounded <secs> <path> — `[ -s ]`, bounded.
@@ -1178,9 +1201,21 @@ is_agent_pointer_entry() { # <worktree-path> <entry>
 # (empty when none). Every name comes from IGNORED_LANE_EVIDENCE, which is space-free by construction,
 # so the caller may loop over this unquoted — the same discipline as `clean_gate`'s ephemeral payload.
 lane_evidence_present() {
-    local path="$1" e out=""
+    local path="$1" e out="" rc
     for e in $IGNORED_LANE_EVIDENCE; do
-        if [ -e "$path/$e" ] || [ -L "$path/$e" ]; then out="$out$e "; fi
+        # Bounded: this runs on the removal hot path (twice, either side of the archive), and a bare
+        # `[ -e ]` is the same indefinite block on a hung mount as any other unbounded stat here.
+        if fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$e"; then
+            out="$out$e "
+        else
+            rc=$?
+            # ⛔ "COULD NOT DETERMINE" IS NOT "NO EVIDENCE" (review of #3422 rounds 11/14, P3). The probe
+            # is a predicate, so 1 is its only legitimate "absent"; 124 (timed out), 125 (no scratch
+            # file), 137 (watchdog SIGKILL with no sentinel), 126/127 — all mean the probe never answered.
+            # Reading those as absent skips the archive and the comparison and lets the removal proceed
+            # over evidence nobody could read: the fail-open this gate exists to prevent.
+            if [ "$rc" != 1 ]; then printf '!unreadable'; return 3; fi
+        fi
     done
     printf '%s' "${out% }"
 }
@@ -1837,7 +1872,7 @@ clean_gate() {
 # mid-edit when its PR auto-merged is the ordinary case).
 preserve_before_removal() { # <path> <sha> <branch> <reason>
     local path="$1" sha="$2" br="$3" why="$4"
-    local slug day dir ev tarf out listed e rc ok=1 disc root mf
+    local slug day dir ev ev_rc tarf out listed e rc ok=1 disc root mf
     root="${PRESERVE_ROOT_RESOLVED:-$(preserve_dir_resolve)}" || {
         log "PRESERVE-FAIL $path no writable preserve root (configured '$REAP_WT_PRESERVE_DIR', fallbacks '${REAP_WT_PRESERVE_FALLBACKS:-<disabled>}') — nothing may be removed"
         return 1
@@ -1876,11 +1911,26 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     fs_bounded "$REAP_WT_REMOVE_TIMEOUT" rm -f "$tarf" 2>/dev/null || true
 
     # ── the lane's own mandated evidence ─────────────────────────────────
-    ev="$(lane_evidence_present "$path")"
+    ev="$(lane_evidence_present "$path")"; ev_rc=$?
+    # ⛔ THE THIRD CALLER (review of #3422 round 12, P3): discarding the status here passed the
+    # `!unreadable` sentinel to `tar` as a MEMBER NAME — fail-closed, but red for the wrong reason and
+    # contradicting the invariant the other two call sites enforce.
+    if [ "$ev_rc" = 3 ]; then
+        log "PRESERVE-FAIL $path the lane-evidence probe could not answer before the archive — nothing removed, and this pass is RED"
+        rm -f "$out"; return 1
+    fi
     if [ -n "$ev" ]; then
         # $ev is space-free ROOT names by construction (see IGNORED_LANE_EVIDENCE) — the same
         # discipline the ephemeral payload relies on. `-C "$path"` keeps the member names relative.
         # shellcheck disable=SC2086
+        # ⛔ THE TARBALL IS WRITTEN STRAIGHT INTO THE ARCHIVE, AND THAT IS BOUNDED (review of #3422,
+        # P3). `tar` IS the watchdog's child, so its own open() of the output happens inside the
+        # bounded fork; only `tb_run`'s redirects (`: >"$out"`, then `tb_timeout … >"$out"`) happen in
+        # the caller's shell — two opens of the same path, which is
+        # why the diff/status/manifest halves needed fs_write_bounded and this one does not. Round 5
+        # rebuilt the tarball off-root "for the same reason" — a false premise, and it made the ONE
+        # large artefact be written TWICE (peak usage doubled in $TMPDIR on the box being reclaimed)
+        # while a pass killed after this step left a tarball-sized `pi-reap-presv.*.tgz` behind.
         run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$TAR_BIN" -czf "$tarf" -C "$path" $ev
         rc=$?
         if [ "$rc" != 0 ]; then
@@ -1908,20 +1958,28 @@ preserve_before_removal() { # <path> <sha> <branch> <reason>
     # ── the diff and the status: what a human would ask for first ────────
     # Written for EVERY removal, not only the evidence rows: gate (b) is a property of destroying a
     # checkout, not of one gate. Both are bounded like every other git probe in this file.
-    run_bounded "$REAP_WT_GIT_TIMEOUT" "$dir/worktree.diff" "$GIT_BIN" -C "$path" \
+    # ⛔ AND THEY ARE CAPTURED OFF-ROOT, THEN COPIED (review of #3405 round 5, P2). `run_bounded`'s
+    # first act is `: >"$out"` IN THE CALLER'S SHELL (lib/bounded.sh) — the open() happens before the
+    # watchdog exists, so pointing it at the archive root left the two LARGEST writes into that root
+    # as the only unbounded ones, on the same dead-mount path the manifest fix addressed.
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
         -c core.quotepath=false diff HEAD --no-color
     rc=$?
     if [ "$rc" != 0 ]; then
         log "PRESERVE-FAIL $path git diff rc=$rc (the working tree could not be captured)"
         rm -f "$out"; return 1
     fi
-    run_bounded "$REAP_WT_GIT_TIMEOUT" "$dir/worktree.status" "$GIT_BIN" -C "$path" \
+    fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/worktree.diff" "$out" \
+        || { log "PRESERVE-FAIL $path worktree.diff unwritable at $dir"; rm -f "$out"; return 1; }
+    run_bounded "$REAP_WT_GIT_TIMEOUT" "$out" "$GIT_BIN" -C "$path" \
         -c core.quotepath=false status --porcelain --untracked-files=normal
     rc=$?
     if [ "$rc" != 0 ]; then
         log "PRESERVE-FAIL $path git status rc=$rc (the working tree could not be captured)"
         rm -f "$out"; return 1
     fi
+    fs_write_bounded "$REAP_WT_REMOVE_TIMEOUT" "$dir/worktree.status" "$out" \
+        || { log "PRESERVE-FAIL $path worktree.status unwritable at $dir"; rm -f "$out"; return 1; }
 
     # The manifest is built OFF the archive root (a local temp) and then COPIED through a bounded
     # child: the open() on the archive root is the operation that blocks on a dead mount, and a
@@ -1998,6 +2056,92 @@ preserve_dir_resolve() {
 $(preserve_roots)
 EOF
     return 1
+}
+
+# evidence_signature <path> <root>... — a CONTENT signature of the tolerated lane-evidence roots.
+# Emits ONE short line: the `cksum` of a sorted stream of `<crc> <size> <path>` lines (one per file, via
+# POSIX `cksum`) plus a line for any root that is a symlink. Both sides of the post-archive comparison
+# are produced by THIS function, so no two tools' output formats are ever compared — GNU `tar -t` QUOTES
+# member names while `find` prints raw bytes, which made a name-listing comparison differ forever on any
+# such file (review of #3422 round 9). The size+CRC line also catches what a NAME listing cannot: a
+# member that existed at archive time and was appended to or rewritten during it.
+#
+# ⛔ THE DIGEST IS STREAMED, SO THERE IS NO SIZE CAP (review of #3422 round 10/11). Holding the listing in
+# a shell variable forced a cap, and a cap had no honest polarity: `head -c` on a `pipefail` pipeline made
+# a READABLE tree red forever via SIGPIPE, and "over the cap ⇒ PRESERVE" made the row permanently
+# unreclaimable while the pass reported success — the inert-but-green disease, back again. `| cksum`
+# consumes the whole stream and emits 11 bytes, so every file is compared and nothing needs a limit.
+#
+# ⛔ AND A SYMLINK IS FINGERPRINTED AS A LINK, NEVER FOLLOWED (review of #3422 round 11). `cksum` through
+# a DANGLING symlink fails, which would red every pass forever with the false diagnosis "evidence could
+# not be walked"; through a live one it makes the target's whole tree count against the checkout, when a
+# target outside the checkout cannot be destroyed by the removal at all. The link's own target string is
+# what the comparison needs and all it can justify.
+#
+# Return code: 0 the signature was taken; 1 the walk could not be completed => caller FAILS the removal.
+evidence_signature() {
+    local path="$1" r sig tgt prc
+    shift
+    sig="$(
+        for r in "$@"; do
+            # `*/*` is unreachable by construction (`is_lane_evidence_entry` requires a ROOT name, so a
+            # nested entry can never make a row clean — it is `ignored-artifact` ⇒ PRESERVE upstream), and
+            # `''`/`<none>` are the no-evidence encodings. Skipped rather than signed: a name with a slash
+            # would silently narrow the digest if that seam ever changed.
+            case "$r" in ''|'<none>'|*/*) continue ;; esac
+            # ⛔ THE LINK TEST COMES FIRST, because `fs_exists_bounded` deliberately says TRUE for a
+            # DANGLING symlink (`-e || -L`), so testing existence before link-ness sent a broken link
+            # into the `cksum` arm and red'd every pass (review of #3422 round 11, P2).
+            # ⛔ BOUNDED, like every other stat on this path (review of #3422 round 12, P3): a bare
+            # `[ -L ]`/`readlink` on a checkout whose mount has hung wedges the whole pass, and the
+            # oneshot unit has no timeout — so the doctrine stated above `lane_evidence_present` has to
+            # hold HERE too. A `readlink` that fails is a walk that could not complete (RED), not a
+            # `link r -> ` line that compares equal to itself forever.
+            #
+            # ⛔ AND "COULD NOT ANSWER" IS NOT "ABSENT" HERE EITHER (review of #3422 rounds 13/14). The
+            # probes are pure predicates, so their ONLY legitimate non-zero answer is 1 ("not a link" /
+            # "not a dir" / "absent"). Whitelisting just `124|125` was not enough: `lib/bounded.sh` can
+            # also surface 137 (its sentinel could not be written, so the watchdog SIGKILLs without one),
+            # 126/127 from `timeout`, or a killed child — and every one of those read as "absent" drops
+            # the root from the digest with rc 0, i.e. an INERT comparison that compares equal to itself
+            # forever (measured: two trees, one appended to, both digesting to `4294967295 0`).
+            prc=0
+            fs_link_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
+            case "$prc" in
+                0)
+                    tgt="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" readlink "$path/$r")" || exit 3
+                    printf 'link %s -> %s\n' "$r" "$tgt"
+                    continue ;;
+                1) : ;;                       # the only legitimate "no"
+                *) exit 3 ;;                  # never answered (124/125/137/126/127/…) => RED
+            esac
+            prc=0
+            fs_isdir_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
+            case "$prc" in
+                0)
+                    # `-type f` for content, PLUS `-type l` for the links inside the root: `tar` stores an
+                    # inner link as a link, so retargeting one during the archive is a change the file
+                    # listing cannot see (review of #3422 round 12, P3). `cksum` would follow such a link,
+                    # so the link arm prints the link's own target — and a `readlink` that fails there
+                    # reds the pass (round 13, P2) instead of emitting `link <path> -> ` forever.
+                    fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" "$FIND_BIN" "$path/$r/" \
+                        \( -type f -exec cksum {} + \) -o \
+                        \( -type l -exec sh -c 'for l; do t="$(readlink "$l")" || exit 3; printf "link %s -> %s\n" "$l" "$t"; done' sh {} + \) || exit 3
+                    continue ;;
+                1) : ;;
+                *) exit 3 ;;
+            esac
+            prc=0
+            fs_exists_bounded "$REAP_WT_REMOVE_TIMEOUT" "$path/$r" || prc=$?
+            case "$prc" in
+                0) fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" cksum "$path/$r" || exit 3 ;;
+                1) : ;;
+                *) exit 3 ;;
+            esac
+        done | sed '/^$/d' | sort -u | cksum
+    )" || return 1
+    printf '%s' "$sig"
+    return 0
 }
 
 # prune_preserve_archive — bound the new sink, across EVERY root an archive can land in (configured
@@ -3016,6 +3160,95 @@ abstain_gate() {
 # writing this: one stale shell masked a busy lane's shell). The scan carries a per-record EXCLUDE
 # LIST rather than rewriting the probe output, so one verdict cannot change the evidence the next
 # one sees, and the cap makes a probe that keeps returning the same pid terminate instead of spin.
+# ── IS THIS CHECKOUT A HARNESS PIN TREE? (#10114) ────────────────────────────────────────────────
+# A harness PIN TREE is the tree a box EXECUTES: `<pin root>/<sha12>/scripts/orchestrator-harness`,
+# recorded in a `.harness-path` file beside the sha record `HARNESS-PIN`. It is created as a
+# `git worktree` of the agent-infra checkout, so it is IN SCOPE for this pass — and rule 3
+# (ancestor-of-main) convicts it BY CONSTRUCTION, because a pin tree's HEAD *is* the tip of main.
+# The box's most important checkout is therefore the most removable thing in the fleet by that rule.
+#
+# MEASURED 2026-11-03 on the cmux cell (agent-infra#3323 / tortoise#10114): `/tmp/cell-home/harness`
+# and its `<sha12>` children were worktrees of `/tmp/cell-ai`; the harness-apply pass at 09:01:56
+# read `pin_tree=5b1b09aad2c1`, the disk-reaper pass at 09:02:31 classified them under rule 3, and
+# `/tmp/cell-home/harness` held NOTHING at 09:02:44. From 09:12:53 every tick read `pin_tree=none`
+# and exited 23 cannot-verify — the box's own scheduled pass could not say what it was RUNNING for
+# 2h17m, because a reaper deleted the tree it executes. Nothing was logged as an error: the reaper
+# was acting BY ITS OWN RULES, which is what makes this class invisible.
+#
+# A pin record is a HOLDER that /proc cannot show: between passes nothing has the tree as its cwd,
+# and the record is the ONLY thing that says the box needs the bytes. So this veto outranks rules
+# 3/4/5 exactly like `live-claim` — it is a preserve, never a removal.
+#
+# TWO PROBES, and the second exists because the first can be silent:
+#   (a) RECORD-BASED — every pin record this box can name. Accepted in EITHER direction, because
+#       the record names a DESCENDANT of the worktree (`<tree>/scripts/orchestrator-harness`).
+#   (b) SHAPE BACKSTOP — a checkout under a directory named `harness`/`harness-next`. A pin tree
+#       whose record is unreadable (another HOME, a lost record) still matches, and every false
+#       positive here costs DISK, never work: this probe can only PRESERVE.
+PIN_VERDICT=""; PIN_PROOF=""
+pin_tree_match() { # <canon-path> -> 0 when it is (or contains) a recorded harness pin tree
+    local canon="$1" rec rec_t rec_c _t
+    [ -n "$canon" ] || return 1
+    PIN_VERDICT=""; PIN_PROOF=""
+    # ⛔ `$HOME` IS GUARDED, AND THAT IS LOAD-BEARING (#10114 review P1). This file runs
+    # `set -uo pipefail`, and `${CELL_HOME:-$HOME}` does NOT guard `$HOME` — with HOME unset the whole
+    # expansion aborts, the classifier's subshell returns an EMPTY row, and the caller counts a
+    # blank row as a PRESERVE. The measured effect on the shipped parent: `remove=0 preserved=48`,
+    # exit 0, `verdict=idle` — a pass that removes nothing and reports the HEALTHY verdict. The
+    # parent commit carries zero bare `$HOME` in this file; every sibling uses `${HOME:-…}`.
+    local home="${HOME:-}"
+    # ⛔ AN EMPTY PREFIX MUST NOT PROBE THE ROOT (review P2). `${home:+"$home/.harness-path"}` guards the
+    # THIRD entry only; the second, `${CELL_HOME:-$home}/.harness-path`, has NO such guard, so with BOTH
+    # `CELL_HOME` and `HOME` unset-or-empty it expands to `/.harness-path` and this file probes it —
+    # exactly the shape the note claims the loop refuses. The consequence is bounded (a root-path
+    # record can only ever PRESERVE), but it is a READ no caller asked for, taken in the one function
+    # whose whole subject is not taking reads it was not given. So the entry is built only when a
+    # prefix exists, and an empty one is skipped by the same `[ -n "$rec" ]` every other empty gets.
+    local cellpin=""
+    if [ -n "${CELL_HOME:-}" ] || [ -n "$home" ]; then
+        cellpin="${CELL_HOME:-$home}/.harness-path"
+    fi
+    for rec in "${HARNESS_PIN_FILE:-}" "$cellpin" ${home:+"$home/.harness-path"}; do
+        [ -n "$rec" ] || continue
+        [ -r "$rec" ] || continue
+        rec_t="$(head -n 1 "$rec" 2>/dev/null)"
+        [ -n "$rec_t" ] || continue
+        # ⛔ THE RECORD IS NORMALISED BEFORE IT IS COMPARED (#10114 review P1). `$canon` comes from
+        # `pwd -P`, but a record is taken VERBATIM — so a record spelled through a symlink never
+        # matched, and only the shape backstop masked it. That is the shipped Darwin spelling
+        # (`/tmp` is `/private/tmp`), and `HARNESS_PIN_DIR` is operator-settable, so a custom pin
+        # root had NO coverage at all: a silent miss, and a silent miss here deletes the tree.
+        rec_c="$(cd "$(dirname "$rec_t")" 2>/dev/null && pwd -P)" || rec_c=""
+        [ -n "$rec_c" ] && rec_c="$rec_c/$(basename "$rec_t")"
+        for _t in "$rec_t" "$rec_c"; do
+            [ -n "$_t" ] || continue
+            case "$_t" in
+                "$canon"|"$canon"/*)
+                    PIN_VERDICT="pin-tree"
+                    PIN_PROOF="pin record $rec names $_t — this box EXECUTES it"
+                    return 0 ;;
+            esac
+            case "$canon" in
+                "$_t"|"$_t"/*)
+                    PIN_VERDICT="pin-tree"
+                    PIN_PROOF="pin record $rec names $_t — this box EXECUTES it"
+                    return 0 ;;
+            esac
+        done
+    done
+    # ⛔ THE ROOT FORMS ARE INCLUDED (#10114 review P1). `<root>/harness` is ITSELF a registered
+    # worktree in the legacy FLAT pin (`cloud-cell-supervisor.sh` `cmd_prune` has a branch for it),
+    # and on the affected cell it was listed as one — so matching only DESCENDANTS left exactly the
+    # root unguarded, and an empty clean root at main's tip is removed by rule 3.
+    case "$canon" in
+        */harness|*/harness/*|*/harness-next|*/harness-next/*)
+            PIN_VERDICT="pin-tree-shape"
+            PIN_PROOF="a checkout at or under $(dirname "$canon") — the harness pin-tree shape; a pin tree is the code this box RUNS and nothing has it as a cwd between passes"
+            return 0 ;;
+    esac
+    return 1
+}
+
 holders_live() {
     local canon="$1" recorded="$2" sha="$3" pid seen="" n=0 cap
     HL_VERDICT=""; HL_DETAIL=""; HL_STALE=""; HL_PROOF=""
@@ -3160,6 +3393,15 @@ classify_one() {
         printf 'preserve\t%s\t\trule=1 %s\n' "$HL_VERDICT" "$HL_PROOF"; return 0
     fi
     [ -n "$HL_STALE" ] && stale_txt="stale-shell:$HL_STALE"
+
+    # ── THE PIN TREE OUTRANKS EVERY REMOVAL RULE (#10114) ────────────────────────────────────────
+    # Placed HERE, with the other vetoes and before rule 3, because the reason it must run first is
+    # the one that failed: a pin tree is ALWAYS an ancestor of main, so rule 3 fires on it every
+    # single pass unless something says what it is. See `pin_tree_match` for the measurement.
+    if pin_tree_match "$canon"; then
+        printf 'preserve\t%s\t\trule=P %s\n' "$PIN_VERDICT" "$PIN_PROOF"
+        return 0
+    fi
 
     # ── the issue this record belongs to, and whether the fleet says it is IN FLIGHT (#2033) ──
     # A record created seconds ago by a dispatch is clean, 0 commits ahead and lane-owned: without
@@ -3646,6 +3888,21 @@ holder_recheck() {
         log "REMOVE-SKIP $path a holder is live AGAIN (${HL_VERDICT} pid=${HL_DETAIL}) — nothing removed, preserved"
         return 2
     fi
+    # ⛔ THE PIN RECORD IS RE-PROBED HERE TOO, NOT ONLY AT CLASSIFICATION (cycle-5 review, P2).
+    # `pin_tree_match` had exactly ONE call site — `classify_one` — while this function exists
+    # precisely because "classify_one decides from holders that existed minutes ago on a big box"
+    # and the same evidence must be consulted AT REMOVAL TIME. `holders_live` was re-applied that
+    # way; the pin record was not. It is the one holder `/proc` CANNOT show, and it is a FILE
+    # another process writes at arbitrary times (`cloud-cell-supervisor.sh` re-writes
+    # $HARNESS_PIN_FILE on `apply`), so a record written inside the removal window named nothing at
+    # classification and would be ignored now. For a custom `HARNESS_PIN_DIR` the shape backstop
+    # (`*/harness[/…]`) does not cover it — the record is the only protection — and the consequence
+    # is the #10114 class: this box's executable tree deleted.
+    if pin_tree_match "$rcanon"; then
+        REMOVE_SKIP_VERDICT="${PIN_VERDICT:-pin-tree}"
+        log "REMOVE-SKIP $path it is NOW a ${PIN_VERDICT:-pin-tree} (${PIN_PROOF:-re-probed at removal}) — nothing removed, preserved"
+        return 2
+    fi
     return 0
 }
 
@@ -3683,6 +3940,7 @@ holder_recheck() {
 #         2 the removal-time clean re-check was not clean ⇒ PRESERVE
 #           (the verdict is left in REMOVE_SKIP_VERDICT for the caller to print).
 remove_one() {
+    local ev_archived ev_now ev_before ev_sig_before ev_sig_now sig_rc ev_rc
     local path="$1" sha="$2" br="${3:-}" why="${4:-}" presv=""
     local eph entry target out rc crumb cverdict cpay rcanon cwd_prev cwd_prev_degraded ps_prev
     out="$(mktemp "${TMPDIR:-/tmp}/pi-reap-rm.XXXXXX")" || return 1
@@ -3757,6 +4015,27 @@ remove_one() {
     # work a human wanted, the lane-evidence tarball is the only copy of the mandatory per-lane report
     # once the tree is gone, and an inert-but-green class is the exact defect this PR removes.
     if [ "${REAP_WT_PRESERVE:-1}" != 0 ]; then
+        # The signature is taken BEFORE the archive so it can be compared with the tree AFTER it; a
+        # walk that cannot complete is a FAILED removal (this gate could not do its job), never a skip.
+        ev_before="$(lane_evidence_present "$path")"; ev_rc=$?
+        if [ "$ev_rc" = 3 ]; then
+            REMOVE_SKIP_VERDICT="evidence-unreadable"
+            log "PRESERVE-SKIP $path the lane-evidence probe could not answer — nothing removed, and this pass is RED"
+            rm -f "$out"; return 1
+        fi
+        # normalised to the manifest's own encoding: an EMPTY "no evidence" must not read as a
+        # vanished root in the waived-precondition note below (review of #3422 round 12, P3)
+        [ -n "$ev_before" ] || ev_before="<none>"
+        ev_sig_before=""
+        if [ "$ev_before" != "<none>" ]; then
+            # shellcheck disable=SC2086
+            ev_sig_before="$(evidence_signature "$path" $ev_before)"; sig_rc=$?
+            if [ "$sig_rc" != 0 ]; then
+                REMOVE_SKIP_VERDICT="evidence-unreadable"
+                log "PRESERVE-SKIP $path lane evidence could not be walked before the archive — nothing removed, and this pass is RED"
+                rm -f "$out"; return 1
+            fi
+        fi
         if ! presv="$(preserve_before_removal "$path" "$sha" "$br" "${why:-reclaimable}")"; then
             REMOVE_SKIP_VERDICT="preserve-failed"
             # ⛔ A FAILED CAPTURE IS A FAILED REMOVAL, NOT A BENIGN LATE PRESERVE (review of #3405
@@ -3768,6 +4047,99 @@ remove_one() {
             rm -f "$out"; return 1
         fi
         log "PRESERVE-OK $path $presv"
+        # ⛔ THE ORDER OF THIS BLOCK IS THE GATE, NOT A STYLE CHOICE (review of #3422, P2 — ORDERING).
+        # The post-archive cleanliness re-check exists to catch a gitignored NON-EPHEMERAL file that
+        # appeared in the window ("would be deleted with the checkout — silently"). Capturing a
+        # verdict in the `clean` position below is only worth anything if it is the LAST cleanliness
+        # read before the fork — and the evidence ladder ABOVE it is up to NINE bounded probes
+        # (the manifest read, `lane_evidence_present` once per tolerated root, and per root a link
+        # probe + a directory probe + the walk in `evidence_signature`), EACH at
+        # `REAP_WT_REMOVE_TIMEOUT` = 120 s, i.e. up to ~18 min at the defaults. A gate placed BEFORE
+        # that ladder is a `clean` verdict a lane's build has ~18 min to falsify by writing a
+        # `.env`/`data/`/`.coverage` — the A21e exposure relocated, not closed. So the ladder runs
+        # FIRST and `clean_gate` is the last cleanliness read, immediately before `holder_recheck`
+        # (which is a LIVENESS probe and cannot see such a file at all) and the fork.
+        # ⛔ `clean` ALSO TOLERATES THE LANE EVIDENCE, AND THE TOLERANCE IS SPENT (review of #3422,
+        # P2). `clean_gate` admits IGNORED_LANE_EVIDENCE because `preserve_before_removal` is
+        # ABOUT TO archive it — a precondition that no longer holds once the archive has run. A
+        # `WORKTREE-REPORT.md` that appears during the archive therefore read as `clean`, the removal
+        # proceeded, and the lane's mandatory report (the very class gate (b) exists for) was destroyed
+        # without ever being captured: measured, same fixture and probe index, `.env` ⇒ PRESERVE,
+        # `WORKTREE-REPORT.md` ⇒ REMOVED with `evidence=none`. So the tolerated payload is compared
+        # against what the archive ACTUALLY captured: a set that grew is not covered.
+        # ⛔ THE READ OF THE MANIFEST IS BOUNDED TOO (review of #3422, P2): `$presv` lives under the
+        # archive root, so a bare `sed` on it is the same unbounded open the rest of this block exists
+        # to avoid — and it would wedge a oneshot unit with no timeout while the pass lock is held.
+        ev_archived="$(fs_bounded_out "$REAP_WT_REMOVE_TIMEOUT" sed -n 's/^lane_evidence=//p' "$presv/manifest.txt" 2>/dev/null | head -1)"
+        ev_now="$(lane_evidence_present "$path")"; ev_rc=$?
+        if [ "$ev_rc" = 3 ]; then
+            REMOVE_SKIP_VERDICT="evidence-unreadable"
+            log "PRESERVE-SKIP $path the lane-evidence probe could not answer after the archive — nothing removed, and this pass is RED"
+            rm -f "$out"; return 1
+        fi
+        [ -n "$ev_now" ] || ev_now="<none>"
+        if [ "$ev_now" != "${ev_archived:-<none>}" ]; then
+            REMOVE_SKIP_VERDICT="lane-evidence-appeared"
+            log "REMOVE-SKIP $path lane evidence changed after the archive ('${ev_archived:-<none>}' -> '$ev_now') — nothing removed, the archive is kept"
+            rm -f "$out"; return 2
+        fi
+        # ⛔ AND NEITHER ARE THE ROOT NAMES ON THEIR OWN (review of #3422). Two shapes slip past a
+        # name comparison: a file created INSIDE a tolerated root (`.worktree-report/late.md`), and a
+        # member that already existed and was APPENDED to / rewritten during the archive — the lane's
+        # own `run.log` regeneration, which is exactly the data gate (b) exists to keep. Both sides are
+        # signatures produced by the SAME function over the SAME tree, so no cross-tool format can
+        # differ, and a signature that cannot be taken FAILS the removal (red) rather than reading as an
+        # empty set that compares equal to another empty set.
+        if [ "$ev_now" != "<none>" ]; then
+            # shellcheck disable=SC2086
+            ev_sig_now="$(evidence_signature "$path" $ev_now)"; sig_rc=$?
+            if [ "$sig_rc" != 0 ]; then
+                REMOVE_SKIP_VERDICT="evidence-unreadable"
+                log "PRESERVE-SKIP $path lane evidence could not be walked after the archive — nothing removed, and this pass is RED"
+                rm -f "$out"; return 1
+            fi
+            if [ "$ev_sig_now" != "$ev_sig_before" ]; then
+                REMOVE_SKIP_VERDICT="lane-evidence-changed"
+                log "REMOVE-SKIP $path lane evidence CHANGED during the archive (signature $ev_sig_before -> $ev_sig_now) — nothing removed, the archive is kept"
+                rm -f "$out"; return 2
+            fi
+        elif [ "$ev_before" != "<none>" ]; then
+            # NOT silent (review of #3422 round 11, P3). ⛔ NO CLAUSE BEYOND "there was tolerated
+            # evidence and there is none now" IS NEEDED, and the round-15 review PROVED the removed
+            # `&& [ "$ev_before" != "$ev_archived" ]` clause was a no-op on every REACHABLE state:
+            # this branch is only entered when `ev_now` is `<none>`, and getting past the name
+            # comparison above with `ev_now == <none>` forces `ev_archived` to be empty or `<none>`,
+            # so for any `ev_before != <none>` the second clause is always TRUE. (Enumerated; the one
+            # combination where the two forms could differ takes the `if` branch above instead.)
+            # ⛔ AND THE CASE IT WAS SAID TO HIDE BEHIND IS NOT SILENT EITHER — evidence present at
+            # the signature AND at capture, then removed mid-archive, leaves `ev_now == <none>` while
+            # `ev_archived` is set, which the NAME comparison above returns as `REMOVE-SKIP … lane
+            # evidence changed after the archive`, not as a note. So the clause was redundant rather
+            # than harmful, and this branch is reachable whenever tolerated evidence vanished between
+            # capture and now. Nothing is lost (the archive holds what was captured), so this is not
+            # a preserve — but it is named.
+            log "REMOVE-NOTE $path tolerated lane evidence vanished during the archive (was '$ev_before') — the before-signature is waived; what existed at capture time is in the archive"
+        fi
+        # ⛔ RE-CHECK #2 AGAIN, AFTER THE ARCHIVE (review of #3405 round 5, P3) — and DELIBERATELY THE
+        # LAST CLEANLINESS READ, which is why it sits here and not above the evidence ladder (see the
+        # ordering note at the top of this block). Gate (b) spends its bounded forks between re-check
+        # #2 and this point, so a lane's build writing `.env`/`data`/`.coverage` during the archive was
+        # admitted by a `clean` read taken BEFORE it existed — and the archive's own `git status` does
+        # not list ignored entries, so it would not even be recorded as evidence. A `clean` captured in
+        # the archive proves the checkout was clean at CAPTURE time; it does not prove it is clean now.
+        # Placed here, this narrows the window the archive opened from the ladder's ~18 min down to
+        # the `holder_recheck` probes below (~25 s at the defaults: `canonicalize`, the bounded `ps`
+        # reads and the bounded cwd probes). It does NOT close that last span — `holder_recheck` is a
+        # LIVENESS probe and cannot see a `.env` written during it — so the claim is "the last
+        # CLEANLINESS read is last but one", not "the window is closed".
+        crumb="$(clean_gate "$path")"
+        cverdict="${crumb%%$'\t'*}"
+        cpay="${crumb#*$'\t'}"
+        if [ "$cverdict" != clean ]; then
+            REMOVE_SKIP_VERDICT="$cverdict"
+            log "REMOVE-SKIP $path post-archive re-check not clean ($cverdict: $cpay) — nothing removed, the archive is kept"
+            rm -f "$out"; return 2
+        fi
     fi
 
     # Re-check #3 — THE HOLDER RULE, as the LAST thing before the fork (review round 3, P2). The
@@ -4351,7 +4723,7 @@ run() {
     log_line "rules: 1 live-holder KEEP · 2 dirty KEEP · 3 ancestor-of-main REMOVE · 4 PR-MERGED REMOVE ·"
     log_line "       5 PR-CLOSED KEEP(named) · 6 no-PR KEEP(named) · 7 younger-than-${REAP_WT_MIN_AGE_MINUTES}m KEEP ·"
     log_line "       L lane residue (ghost-zero-ahead / abandoned-wip / interrupted-add) ·"
-    log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref). Every row prints rule= and proof=."
+    log_line "       P pre-existing gates (main/self/locked/open-PR/revocable-ref/pin-tree). Every row prints rule= and proof=."
     log_line ""
     log_line "note: \`git worktree remove\` deletes the CHECKOUT. A LANE-owned ref (feat/<N>-tm) that is 0 commits"
     log_line "      ahead of main is ALSO deleted, by atomic compare-and-delete, because that ref is the residue the"
