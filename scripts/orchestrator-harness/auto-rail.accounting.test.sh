@@ -1636,7 +1636,21 @@ if chmod 000 "$_UL2" 2>/dev/null && [ ! -r "$_UL2" ]; then
   esac
   case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
     *'NOT a window that rolls by itself'*) ;;
-    *) bad "the CAP wording must NAME the non-self-healing fact ('that is NOT a window that rolls by itself') and the remedy (repair/remove the ledger, or push a new head) — otherwise the one comment this head ever gets tells the operator nothing is needed (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
+    *) bad "the CAP wording must STATE the non-self-healing fact ('that is NOT a window that rolls by itself'), not merely omit the old promise — a tail that says nothing about it leaves the operator to infer it (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
+  esac
+# ⛔ THE REMEDY IS PART OF THE FIX, SO IT IS PINNED TOO (review round 8, P2, REPRODUCED three ways). The arms
+# above match the phrase that says the state does NOT heal on its own; the sentence that tells the operator WHAT
+# TO DO was left free, so deleting it — cap tail → "waiting changes nothing" with NO action to take, measured
+# tail → no "push a new head" escape — kept this suite GREEN. That is a partial reversion of the very fix these
+# arms exist to pin, and it leaves the harm mode F1 named (a permanently stuck head the operator is told to sit
+# on). Both surfaces are pinned by the CLAUSE, on the same named-line unit the log arms use.
+  case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
+    *'Repair or remove that file'*) ;;
+    *) bad "the CAP wording must name the REMEDY ('Repair or remove that file') — 'waiting changes nothing' with no action to take is the same dead end F1 named, one sentence shorter (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
+  esac
+  case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
+    *'push a new head'*) ;;
+    *) bad "the CAP wording must offer the ESCAPE ('push a new head — a new head is a new review') — an operator told the state never heals and given no way out has no action at all (got: $(sed -n "$(( _b0 + 1 )),\$p" "$POSTED" | head -1))" ;;
   esac
 else
   echo "SKIP: cannot make a ledger unreadable as $(id -un) — the CAP-wording arm is INERT on this host"
@@ -1666,6 +1680,10 @@ case "$(sed -n "$(( _b1 + 1 )),\$p" "$POSTED")" in
   *'rolls BY ITSELF'*) ;;
   *) bad "a MEASURED exhaustion must still say the window rolls BY ITSELF — that is true for a counted window, and deleting it from both cases trades one false claim for a silent operator (got: $(sed -n "$(( _b1 + 1 )),\$p" "$POSTED" | head -1))" ;;
 esac
+case "$(sed -n "$(( _b1 + 1 )),\$p" "$POSTED")" in
+  *'push a new head'*) ;;
+  *) bad "a MEASURED exhaustion must keep the escape hatch ('push a new head: a new head is a new review') — deleting it left this suite GREEN while an operator whose head genuinely cannot be reviewed had no stated way forward (reproduced, review round 8)" ;;
+esac
 # …and the LOOP must pass the basis it computed: a bare publish (no 5th argument) would silently fall back
 # to the measured wording, which is the inert shape this fix replaced.
 grep -qF 'publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"' "$SUT" \
@@ -1694,12 +1712,43 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
   *[!0-9]*) bad "the EXHAUSTED log lines could not all be located (rc3=${_R3A:-MISSING} rc2=${_R3B:-MISSING} branch=${_RBR:-MISSING} capLog=${_RCAP:-MISSING} measuredLog=${_RMEA:-MISSING}) — the log stub changed shape, so this arm can no longer see it" ;;
   *)
     [ "$_R3A" -lt "$_RBR" ] && [ "$_RBR" -lt "$_RCAP" ] && [ "$_RCAP" -lt "$_RMEA" ] && [ "$_RMEA" -lt "$_R3B" ] \
-      || bad "the EXHAUSTED log must BRANCH on the basis INSIDE the rc-3 arm (rc3=${_R3A} branch=${_RBR} capLog=${_RCAP} measuredLog=${_RMEA} rc2=${_R3B}) — an unconditional line, or a branch outside the drain, restores the fabricated count with this suite green (reproduced, review round 7)"
+      || bad "the EXHAUSTED log must BRANCH on the basis INSIDE the rc-3 arm (rc3=${_R3A} branch=${_RBR} capLog=${_RCAP} measuredLog=${_RMEA} rc2=${_R3B}) — an unconditional line leaves no cap log at all (reproduced, review round 7)"
+    # ⛔ LINE ORDER IS NOT CONTAINMENT (review round 8, P2, REPRODUCED). Ordering the four lines only says the
+    # branch sits between the two `-eq` TESTS — anything in that gap satisfies it, including the whole block MOVED
+    # BELOW the drain's own `continue`/`fi`. That mutant is semantically the reverted defect and it stayed GREEN:
+    # on the EXHAUSTED path no REVIEW-RETRIES-EXHAUSTED line is emitted at all (the drain continues past it), and
+    # on other paths it fabricates "$_rattn dispatch(es)". So containment is measured on the DRAIN BODY — from the
+    # `-eq 3` test to its FIRST `continue` — by extraction, not by line numbers. This is the same lesson the
+    # in-flight publish arm already carries (position IS the fix; existence is not position).
+    _RCONT=$(awk -v a="$_R3A" 'NR>a && /^[[:space:]]*continue$/ {print NR; exit}' "$SUT")
+    case "${_RCONT:-x}" in
+      *[!0-9]*) bad "the rc-3 drain's `continue` could not be located below line ${_R3A} — the drain shape changed, so containment of the EXHAUSTED log cannot be measured" ;;
+      *)
+        _R3BODY=$(sed -n "${_R3A},${_RCONT}p" "$SUT")
+        grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read' <<<"$_R3BODY" \
+          || bad "the CAP log line must be INSIDE the rc-3 drain (between the `-eq 3` test at ${_R3A} and its first `continue` at ${_RCONT}) — moved below the drain it is unreachable on the EXHAUSTED path, so a stuck head emits NO exhaustion line at all while the ordering arm still passes (reproduced, review round 8)"
+        grep -qF 'REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside' <<<"$_R3BODY" \
+          || bad "the MEASURED log line must be INSIDE the rc-3 drain too (between lines ${_R3A} and ${_RCONT}) — outside it, the readable case prints no count where the count is exactly what it should state" ;;
+    esac
     # ⛔ AND THE BRANCH ALONE IS NOT ENOUGH — the CAP line must not CARRY the count (page 2 of the same defect,
     # reproduced: keeping the branch, the phrase and the ordering while appending "$_rattn dispatch(es)" to the
     # cap line left this suite GREEN, so the operator's instrument still asserted the fail-closed cap as a
     # measured fact). The named line is the unit, exactly as the recall/ordering arms above treat it.
-    case "$(sed -n "${_RCAP}p" "$SUT" 2>/dev/null)" in
+    # ⛔ AND THE TAIL OF THAT LINE IS THE FIX ITSELF (review round 8, P2, REPRODUCED): the CAP phrase this line is
+    # located BY ('the attempt ledger could not be read') is present in the PRE-FIX text as well, so locating the
+    # line pinned nothing about the false instruction F1 was filed for. Restoring the shared clause ("not
+    # dispatching again until the window rolls") — a permanent lie about a window that does not exist — left this
+    # suite GREEN. So the non-rolling fact is pinned on the SAME named line, and the specific false clause is
+    # forbidden there.
+    _RCAPTXT=$(sed -n "${_RCAP}p" "$SUT" 2>/dev/null)
+    case "$_RCAPTXT" in
+      *'will NOT roll by itself'*) ;;
+      *) bad "the CAP log line must NAME the non-self-healing fact ('that window will NOT roll by itself') — the phrase the line is located by survives the reversion, so without this the operator's log says the state clears itself when no window can ever roll (reproduced, review round 8)" ;;
+    esac
+    case "$_RCAPTXT" in
+      *'until the window rolls'*) bad "the CAP log line must NOT say 'until the window rolls' — there is no window in this case (the ledger is unreadable, so `review_attempts` returns the cap without ever consulting the clock); that clause IS the false instruction, restored" ;;
+    esac
+    case "$_RCAPTXT" in
       *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
     esac ;;
 esac
