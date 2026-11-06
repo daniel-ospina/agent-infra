@@ -78,11 +78,13 @@
          children it spawns. ⛔ AND NOT THE `repo` FLAG EITHER, for the same class of reason one
          level up: a flag in one machine-wide plist is a SECOND place that says which repos this box
          serves, and the whole point of §4 is that there is one. `REPO` below stays as the box's own
-         checkout EVIDENCE, and it is only used on the degraded path (no set yet): the doctor adopts
-         it only when its git `origin` PROVES the slug it names, so the plist cannot make the doctor
-         read another repo's worktrees, and a box whose checkout does not resolve grades the queue
-         read-only if it can prove one, and otherwise the wrapper refuses with the file to create (see
-         the next block — on macOS that is the usual outcome, because the origin cannot be read).
+         checkout EVIDENCE, and it is used in TWO places, not one: on the degraded path (no set yet),
+         and — with a set present — as the fallback `_checkout_that_proves()` adopts for an entry whose
+         OWN checkout proves nothing. In both it is adopted only when its git `origin` PROVES the slug
+         being graded, so the plist cannot make the doctor read another repo's worktrees. What the pass
+         then does with an unprovable checkout is the doctor's to say (it may adopt this one and spawn,
+         or grade read-only); on macOS, where launchd cannot read `~/Documents`, the degraded path
+         usually ends in the wrapper's refusal with the file to create — see the next block.
 
          ⛔ WHAT HAPPENS ON A BOX WITH NO SET (the migration state), IN TWO CASES, and this is the
          distinction that matters because THIS template's default checkout lives under `~/Documents`:
