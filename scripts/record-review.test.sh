@@ -7768,6 +7768,53 @@ run_record_delta $EH49 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523501" \
 The literals 0xdead..0xbeef and f00d..babe are unrelated to this range."
 assert_eq "$RECORD_RC" "0" "20h41 unresolvable short hex beside dots reads as PROSE (rc 0)"
 [ -f "$(Q2 $EH49)" ] || bad "20h41 a hex-literal pair falsely blocked a correct artifact"
+# 20h42 THE BLOCK'S OWN TABLE ENDS (tenth cycle, P1). The ninth cycle closed `ins` only on a HEADING,
+#       so from the block's heading to the next level-2 heading every table row was excluded — and the
+#       #3442 block is normally the LAST section, so a narrowing written in a table row AFTER it was
+#       dropped and a signed `clean` was minted over commits the artifact said were not read.
+#       MEASURED on that head: the body below recorded rc 0 with `delta_range=BASE..HEAD`. The
+#       exclusion is now bounded structurally: the block's header (assertion+mutant+redden) opens its
+#       table, CONTIGUOUS rows continue it, and a blank line or prose ends it for good.
+EH50=425236; rm -f "$(Q2 $EH50)"
+run_record_delta $EH50 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+| what I actually reviewed | ${DG_A1} | not the rest | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h42 a narrowing in a table row AFTER the block is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h42 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH50)" ] && bad "20h42 no record was written" || ok "20h42 no record was written"
+# 20h43 THE ROW RECOGNITION MIRRORS brief-gate's (tenth cycle, P2). A GFM table need not have OUTER
+#       PIPES (`assertion | mutant | reddened | observed` renders as one), and brief-gate strips a
+#       bullet and blockquote markers before counting cells — so an artifact it certifies valid was
+#       NOT excluded here, its row was read as the reviewer's claim, and a correct record was refused
+#       with a false accusation. Both spellings are below, and the validator is run to prove the body
+#       is valid (otherwise the vector proves nothing).
+EH51=425238; rm -f "$(Q2 $EH51)"
+BODY43="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+assertion | mutant (reverts the fix) | reddened row | observed
+---|---|---|---
+x | sed s/rc=80/rc=0/ | A (i) | rc=0
+- the guard added at ${DG_A1} | revert it | B (ii) | row red"
+run_record_delta $EH51 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="$BODY43"
+assert_eq "$RECORD_RC" "0" "20h43 a no-outer-pipe / bulleted kill table is EXCLUDED (rc 0)"
+[ -f "$(Q2 $EH51)" ] || bad "20h43 no record was written for a valid artifact"
+if printf '%s' "$BODY43" | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --mutation-missing - >/dev/null 2>&1; then
+    ok "20h43 brief-gate accepts the no-outer-pipe table (the vector is not vacuous)"
+else
+    bad "20h43 brief-gate did NOT accept the no-outer-pipe table — the vector would prove nothing"
+fi
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -8016,7 +8063,7 @@ I only actually reviewed HEAD~1..HEAD."
 #       `## ` heading, the seventh cycle's span ran to the last row — both dropped PROSE, and both
 #       re-accepted a narrowing written there. The mutant restores the span shape (skip the whole
 #       section) and 20h34's `### Scope caveat` narrowing is accepted again.
-MUT="$(mk_mutant spanblock '          if (ins && line ~ /^[ \t>]*[|]/) continue' '          if (ins) continue')"
+MUT="$(mk_mutant spanblock '          print line' '          if (!ins) print line')"
 mut_check "M23 the exclusion is the ROWS, not the whole section" 425212 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ## MUTATION ATTRIBUTION (agent-infra#3442)
@@ -8030,7 +8077,7 @@ I only actually reviewed ${DG_A1}–${DG_HEAD}; the base-side merge was not read
 # M26 — THE TABLE ROWS ARE ACTUALLY EXCLUDED (20h32). The other direction of M23: with the row
 #       predicate broken the kill table is compared as the reviewer's own claim, so a CORRECT
 #       artifact is refused because of a row describing a mutant pinned to the range.
-MUT="$(mk_mutant norowskip '          if (ins && line ~ /^[ \t>]*[|]/) continue' '          if (0) continue')"
+MUT="$(mk_mutant norowskip '            if (rowcells(line) > 0) {' '            if (0) {')"
 mut_check "M26 the kill table's rows ARE excluded from the claim" 425208 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ## MUTATION ATTRIBUTION (agent-infra#3442)
@@ -8069,7 +8116,7 @@ mut_check "M29 the heading line's prose is scanned" 425228 "$DG_HEAD" "delta:$DG
 # M30 — EVERY BLOCK, NOT JUST THE FIRST (20h40). Re-opening the section only once leaves a second
 #       block's rows outside the exclusion, so an addendum artifact is refused for a row it may
 #       carry — the ninth cycle's P2.
-MUT="$(mk_mutant secondblock '                ins = 1; depth = nh' '                opened++; if (opened > 1) { ins = 0 } else { ins = 1; depth = nh }')"
+MUT="$(mk_mutant secondblock '                ins = 1; depth = nh; hdr = 0; intable = 0' '                opened++; if (opened > 1) { ins = 0 } else { ins = 1; depth = nh; hdr = 0; intable = 0 }')"
 mut_check "M30 every MUTATION-ATTRIBUTION block is excluded" 425230 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ## MUTATION ATTRIBUTION (agent-infra#3442)
@@ -8083,6 +8130,30 @@ mut_check "M30 every MUTATION-ATTRIBUTION block is excluded" 425230 "$DG_HEAD" "
 | assertion | mutant (reverts the fix) | reddened row | observed |
 |---|---|---|---|
 | two | the row that reddens delta:${DG_A1}..${DG_HEAD} | two | rc 3 |"
+# M31 — THE TABLE ENDS (20h42). Never resetting `intable` restores the ninth cycle's unbounded row
+#       exclusion: every row to EOF is dropped, so a narrowing in a row AFTER the block is invisible.
+MUT="$(mk_mutant openended '              intable = 0        # a blank line or prose ENDS the table (and never re-opens it)' '              intable = intable')"
+mut_check "M31 the block's table ENDS at a blank or prose line" 425236 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+| what I actually reviewed | ${DG_A1} | not the rest | rc 3 |"
+# M32 — THE ROW RECOGNITION (20h43). Requiring the pipe to be the FIRST non-blank character is the
+#       tenth cycle's false block: a valid GFM table without outer pipes, or a bulleted row, is read
+#       as the reviewer's claim.
+MUT="$(mk_mutant outerpipe 'if (l2 !~ /\|/) return 0' 'if (l2 !~ /^[ \t>]*\|/) return 0')"
+mut_check "M32 a table without OUTER pipes is still a row" 425238 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+assertion | mutant (reverts the fix) | reddened row | observed
+---|---|---|---
+x | sed s/rc=80/rc=0/ | A (i) | rc=0
+- the guard added at ${DG_A1} | revert it | B (ii) | row red"
 # M24 — THE UNRELATED-LINEAGE BOUND (20h36). Dropping the "is it LATER than A" test makes every
 #       resolvable token that is not reviewed history a contradiction, which is the seventh
 #       cycle's false block: an artifact quoting a commit on an UNRELATED lineage is refused for

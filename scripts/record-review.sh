@@ -1683,7 +1683,7 @@ $m"
         # ATTRIBUTION — I also only read A1..HEAD` recorded rc 0 over the WIDE range, because the
         # entire heading line went into the bin and the range with it. Only the section NAME comes
         # off; anything a reviewer writes on that line is prose and is scanned).
-        ins = 0; depth = 0; opened = 0
+        ins = 0; depth = 0; hdr = 0; intable = 0
         for (i = 1; i <= n; i++) {
           line = L[i]
           if (match(line, /^[ \t]*#+/)) {
@@ -1693,7 +1693,7 @@ $m"
               htxt = tolower(substr(line, RLENGTH + 1))
               if (ins && nh <= depth) ins = 0
               if (htxt ~ /^[ \t]*mutation[ -]attribution/) {
-                ins = 1; depth = nh
+                ins = 1; depth = nh; hdr = 0; intable = 0
                 rest = substr(line, RLENGTH + 1)          # after the heading hashes
                 if (match(tolower(rest), /^[ \t]*mutation[ -]attribution/))
                   rest = substr(rest, RLENGTH + 1)        # the section NAME comes off, nothing else
@@ -1702,9 +1702,38 @@ $m"
               }
             }
           }
-          if (ins && line ~ /^[ \t>]*[|]/) continue               # a table row inside the block
+          if (ins) {
+            if (rowcells(line) > 0) {
+              # the block OWN table: opened by its header (assertion+mutant+redden, as
+              # brief-gate decides it) and continued while the rows are CONTIGUOUS
+              if (intable) continue
+              t = tolower(line)
+              if (!hdr && t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) {
+                hdr = 1; intable = 1; continue
+              }
+            } else {
+              intable = 0        # a blank line or prose ENDS the table (and never re-opens it)
+            }
+          }
           print line
         }
+      }
+      function rowcells(s,   l2, k, m, p, c) {
+        # ⛔ MIRRORS brief-gate row RECOGNITION (#3442 review cycle 3, P2): blockquote
+        # markers, leading indent and a bullet all come off before the pipe test, because a table
+        # need not have outer pipes (`assertion | mutant | reddened | observed` is a GFM table) and
+        # a bulleted row is a row. Dropping only lines whose FIRST non-blank char is `|` left those
+        # spellings to be read as the reviewer claim — a false block on a valid artifact
+        # (tenth review cycle, P2).
+        l2 = s
+        while (sub(/^[ \t]*>[ \t]?/, "", l2)) ;
+        sub(/^[ \t]+/, "", l2)
+        sub(/^[-*+][ \t]+/, "", l2)
+        if (l2 !~ /\|/) return 0
+        k = split(l2, p, "|")
+        c = 0
+        for (m = 1; m <= k; m++) if (p[m] !~ /^[ \t]*$/) c++
+        return c
       }
     ' 2>/dev/null || true)"
     if [ "$DELTA_KIND" = "merge-only" ]; then
