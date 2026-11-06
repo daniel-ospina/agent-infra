@@ -371,9 +371,11 @@ wt_provision() {
                 # arm trade one skip for two writers on one branch and one checkout (index.lock
                 # contention, attestations bound to a head the other lane moves).
                 # The probe answers in the caller's own name so the refusal is actionable, and rc 2 is
-                # the documented "refuses to touch, nothing changed": every caller turns it into
-                # skip + release-claim, and the issue is retried next cycle — by which time the orphan
-                # is normally gone and `wt_reap_if_empty` can take the tree back.
+                # the documented "refuses to touch, nothing changed". What each caller does with it is
+                # NOT uniform, so do not assume "retry next cycle" everywhere: `dispatch-merge.sh`
+                # skips the issue, releases its claim and drops its row (retried next cycle, by which
+                # time the orphan is normally gone and `wt_reap_if_empty` can take the tree back);
+                # `fix-one.sh` refunds the booked fixer attempt and ABORTS; `adopt-fix.sh` aborts.
                 # rc 2 from the probe itself ("the argv witness could not be evaluated") is FAIL-CLOSED,
                 # matching `wt_reap_if_empty`: handing out a checkout on an unevaluable probe is how a
                 # second writer gets in, and the cost of refusing is one cycle.
@@ -589,7 +591,26 @@ wt_live_holders() {
             sub(/^[ \t]*[0-9]+[ \t]*/, "", cmd)
             if (index(" " chain " ", " " pid " ")) { print pid > ign; next }
             if (cmd in own) { print pid > ign; next }
-            if (index(cmd, path) > 0) { print pid "\targv-lists-the-worktree"; exit }
+            # ⛔ THE MATCH IS PATH-BOUNDARY ANCHORED, NOT A BARE SUBSTRING (#3511 review cycle 3, P1).
+            # `index(cmd, path) > 0` makes `.../tm-1` match a process in `.../tm-10` — a DIFFERENT
+            # checkout — and on this fleet naming scheme (`tm-<issue>`, `fix-<PR>`, `adopt-<PR>`, with PRs
+            # spanning 351..3511) a sibling lane then refuses its neighbour. Until #3511 the only
+            # caller was `wt_reap_if_empty`, where a false holder merely KEEPS residue (fail-safe);
+            # the reuse arm is the first call site where a false holder SKIPS a free issue.
+            # A path matches only when the character AFTER it is not a NAME character (so `/x/tm-1`
+            # matches `/x/tm-1`, `/x/tm-1/` and `/x/tm-1/foo`, and never `/x/tm-10`), and the one
+            # BEFORE it is not a NAME character either (so `/a/x` never matches inside `/ba/x`).
+            # `/` deliberately counts as a non-match boundary on the right: a process working INSIDE
+            # the tree is a holder, and one working in a LONGER SIBLING name is not.
+            s = cmd
+            while ((p = index(s, path)) > 0) {
+                nxt = substr(s, p + length(path), 1)
+                prv = (p > 1) ? substr(s, p - 1, 1) : ""
+                if ((nxt == "" || nxt == "/" || nxt ~ /[^0-9A-Za-z._-]/) && prv !~ /[0-9A-Za-z._-]/) {
+                    print pid "\targv-lists-the-worktree"; exit
+                }
+                s = substr(s, p + 1)
+            }
         }' "$out" "$out")"
     rm -f "$out"
     if [ -n "$line" ]; then printf '%s\n' "$line"; rm -f "$ignore"; return 0; fi

@@ -342,12 +342,16 @@ assert_contains "$OUT" "WT_RESULT=reused" "W8 …and reports a reuse"
 # #3511's third per-issue arm drops that row the moment the claim is released — so the guard has to
 # live HERE, in the one place every caller passes through: rc=2 = "refuses to touch, nothing changed",
 # which every caller already turns into skip + release-claim + retry next cycle.
-# The holder is a process whose ARGV names the checkout (the argv witness, so the arm does not depend
-# on `lsof` being installed); the same checkout reuses once it exits, which is what proves the refusal
-# is about the HOLDER and not about the path.
+# The holder's ARGV names the checkout (a positional argument to `python3 -c`), so the arm drives
+# the ARGV witness and does not depend on `lsof` being installed. ⛔ NOT `bash -c "cd <wt> && sleep"`:
+# bash EXEC-OPTIMISES that into a bare `sleep N`, whose argv no longer carries the path, so the arm
+# silently became a test of the CWD witness only and redded on any host without a working `lsof`
+# (measured: `WT_LSOF=/nonexistent` read the same held checkout as FREE).
+# The same checkout reuses once the holder exits, which is what proves the refusal is about the
+# HOLDER and not about the path.
 ENV=W9; REPO="$(mk_repo $ENV)"
 in_wt "wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main" "$REPO" >/dev/null
-bash -c "cd '$REPO/.worktrees/tm-13' && sleep 30" &
+python3 -c 'import time; time.sleep(30)' "$REPO/.worktrees/tm-13" &
 HOLDER_PID=$!
 sleep 1
 OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
@@ -360,6 +364,38 @@ case "$OUT" in *"WT_RESULT=reused"*) bad "W9 a HELD checkout was reported as reu
 OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
 assert_contains "$OUT" "rc=0" "W9 with the holder gone the SAME checkout reuses (the refusal is the holder, not the path)"
 assert_contains "$OUT" "WT_RESULT=reused" "W9 …and reports a reuse"
+
+# ── W9b: an UNEVALUABLE holder probe is FAIL-CLOSED, not a pass ────────
+# #3511 review cycle 3, P2. `wt_live_holders` answers 2 when the argv witness cannot be read. Treating
+# that as "no holder" re-opens exactly the two-writers path this arm exists to close, and the whole
+# suite stayed green under that mutation until this arm existed — a fail-open branch nothing witnessed.
+OUT="$(in_wt "wt_live_holders() { return 2; }; wt_provision '$REPO' .worktrees/tm-13 feat/13-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+assert_contains "$OUT" "rc=2" "W9b an UNEVALUABLE holder probe refuses (rc=2, fail-closed)"
+assert_contains "$OUT" "fail-closed" "W9b …and the refusal says the probe could not be evaluated"
+
+# ── W10: a LONGER SIBLING name is a DIFFERENT checkout, not a holder ───
+# #3511 review cycle 3, P1. The argv witness was a bare `index(cmd, path)`, so probing `.../tm-14`
+# matched any process naming `.../tm-141` — and this fleet's names are `<kind>-<number>` (`tm-<issue>`,
+# `fix-<PR>`, PRs spanning 351..3511), so a sibling lane refused its neighbour. Combined with #3511's
+# row drop that is a free issue SKIPPED every cycle, with the refusal accusing the wrong checkout.
+# ⛔ THIS IS THE ARM THAT PINS THE ARGV WITNESS. W9's holder carries the path in its argv too, but a
+# `bash -c "cd <wt> && sleep"` holder does NOT (bash exec-optimises it to a bare `sleep`, whose argv
+# carries no path — measured), so an arm written that way passes on the CWD witness alone and stops
+# testing argv at all. W10's probe additionally asserts the live sibling IS found in its own checkout,
+# so a probe that simply stopped reporting anything could not pass it either.
+ENV=W10; REPO="$(mk_repo $ENV)"
+in_wt "wt_provision '$REPO' .worktrees/tm-14 feat/14-tm origin/main" "$REPO" >/dev/null
+in_wt "wt_provision '$REPO' .worktrees/tm-141 feat/141-tm origin/main" "$REPO" >/dev/null
+python3 -c 'import time; time.sleep(30)' "$REPO/.worktrees/tm-141" &
+SIB_PID=$!
+sleep 1
+OUT="$(in_wt "wt_provision '$REPO' .worktrees/tm-14 feat/14-tm origin/main; echo rc=\$?; echo \"WT_RESULT=\$WT_RESULT\"" "$REPO")"
+SIB_HELD="$(in_wt "wt_live_holders '$REPO/.worktrees/tm-141'; echo rc=\$?" "$REPO")"
+kill "$SIB_PID" 2>/dev/null
+wait "$SIB_PID" 2>/dev/null
+assert_contains "$SIB_HELD" "rc=0" "W10 the live sibling IS a holder of its OWN checkout (the probe still works)"
+assert_contains "$OUT" "rc=0" "W10 a live process in the LONGER sibling name (tm-141) does not make tm-14 look held"
+assert_contains "$OUT" "WT_RESULT=reused" "W10 …tm-14 reuses normally"
 
 # ── L-series: the lane's own exit path (wt_reap_if_empty) ──────────────
 echo "the lane exit path (a lane that produced nothing takes its checkout back)"

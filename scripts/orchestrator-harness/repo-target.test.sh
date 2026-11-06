@@ -296,6 +296,31 @@ c4=$?
 { [ "$c4" -eq 72 ] && [ -f "$FO/state/fixgate-4004-cafebabe" ] \
     && [ "$(cat "$FO/state/fixcount-4004" 2>/dev/null)" = "1" ]; }; ck "C4 --argv (CTRL=1) identity refusal -> REFUNDS fixcount AND writes fixgate-<PR>-<head> (rc=$c4)" $?
 
+# ⛔ A WORKTREE-MATERIALISATION REFUSAL MUST REFUND TOO (#3511 review cycle 3, P2). `wt_provision`
+# can refuse rc=2 for a reason that LOOKS permanent but is often transient (a live process still holds
+# `fix-<PR>`), and this arm exited without refunding while the identity refusals above do. The rule is
+# the file's own (#1720): the controller books the attempt UPSTREAM of every gate, so a refusal that
+# ran no fixer must give it back — otherwise three transient refusals reach MAX_FIX_TRIES and the PR
+# is PARKED "needs a human" having never had a single fixer run.
+# The refusal is driven through the UNREGISTERED-DIRECTORY arm (a foreign directory at the worktree
+# path), which is `wt_provision`'s other rc=2 and needs no git state to set up.
+# ⛔ THE BRANCH MUST EXIST FIRST. Without it `fix-one.sh` refuses at the BRANCH assertion (rc=72) long
+# before `wt_provision` runs, so the arm silently pins the branch refusal's refund (C2/C4's subject)
+# and NOT the materialisation refund it names — measured `52 passed, 1 failed` with rc=72 until this
+# line existed. The later `branch work` below stays for C3's own use.
+"$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
+mkdir -p "$AI/.worktrees/fix-4005"
+printf 'operator data\n' > "$AI/.worktrees/fix-4005/precious.txt"
+printf '%s\n' "2" > "$FO/state/fixcount-4005"
+printf '%s\n' "$AI" daniel-ospina/agent-infra 4005 work > "$T/argv-4005"
+( gh() { case "$*" in *headRefOid*) echo "cafebabe"; return 0 ;; esac; return 1; }; export -f gh
+  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+    bash "$FIX" --argv "$T/argv-4005" ) >/dev/null 2>&1
+c5=$?
+{ [ "$c5" -eq 1 ] && grep -q 'ABORT: .*refusing to touch it' "$FO/logs/fix-4005.log" 2>/dev/null \
+    && [ "$(cat "$FO/state/fixcount-4005" 2>/dev/null)" = "1" ] \
+    && [ -f "$AI/.worktrees/fix-4005/precious.txt" ]; }; ck "C5 --argv (CTRL=1) worktree-materialisation refusal -> REFUNDS fixcount and leaves the foreign directory intact (rc=$c5)" $?
+
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
 REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1

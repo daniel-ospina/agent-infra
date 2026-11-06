@@ -231,6 +231,14 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
   if [ "$?" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
+    # ⛔ REFUND HERE TOO (#3511 review cycle 3, P2). `wt_provision` can now refuse `rc=2` for a
+    # PERMANENT-looking but ultimately TRANSIENT reason — a live process still holds `fix-$PR` —
+    # and this arm exited without refunding while the branch refusal three lines up does. The rule
+    # this file already states (#1720, above `refund_gate_attempt`): the controller books the
+    # attempt UPSTREAM of every gate, so a refusal that ran no fixer must give it back or three
+    # transient refusals reach MAX_FIX_TRIES and the PR is PARKED "needs a human" having never had
+    # a single fixer run. The refund is a no-op on a manual (CTRL=0) run.
+    refund_gate_attempt
     exit 1
   fi
   WT="$(git worktree list --porcelain | awk -v b="refs/heads/$BR" 'BEGIN{p=""} /^worktree /{p=$2} /^branch /{if($2==b) print p}')"
