@@ -114,8 +114,10 @@ drop_dispatched_rows() {
 # "nothing on these paths releases" while `these paths` in the paragraph above INCLUDES the no-chain
 # path, which releases deliberately; acting on it would have deleted that release and held a dead
 # lane's claim for the whole lease). The two paths in full:
-#   · LANE-NEVER-STARTED — KEEPS the claim. The chain below is alive and waiting for that PR;
-#     releasing would declare an issue this box is actively working free and a peer would duplicate it.
+#   · LANE-NEVER-STARTED — KEEPS the claim. The chain below is ABOUT TO BE started and will wait for
+#     that PR; if that spawn ALSO fails, the NO-CHAIN bullet below releases once the lane is proven
+#     gone. Releasing HERE would declare an issue this box is actively working free and a peer would
+#     duplicate it.
 #   · NO-CHAIN — RELEASES, exactly once, and only after `wt_alive` confirms the lane is gone; if it
 #     cannot be stopped the claim is KEPT, because the lease expiring it is the safe direction (#2033).
 # The release belongs to the CALL SITE and to the ordering the lane that wrote it measured; never to
@@ -387,8 +389,9 @@ for N in "$@"; do
     # line succeeded — the checkout was provisioned and proven usable — so on this path the
     # dispatcher owns an artifact nobody will ever use, and leaving it is the #8090 residue: 0
     # commits ahead, so the pre-flight reads the issue as in flight on EVERY box while its slots are
-    # free. The CLAIM stays held (deliberately: the chain below is alive waiting for a PR), so this
-    # releases nothing — it takes back a checkout, and nothing else.
+    # free. The CLAIM stays held: the chain below is ABOUT TO BE started and will wait for that PR,
+    # and only the NO-CHAIN exit below (its spawn failing, then the lane proven gone) releases it —
+    # nothing here does. So this releases nothing: it takes back a checkout, and nothing else.
     # ⛔ AND IT ASKS THE LAUNCHER FIRST, exactly as the no-chain path below does. A spawn that
     # reported failure while a terminal DID start is the one shape where reaping could pull a live
     # lane's checkout out from under it (#2499/#2787) — so a lane that answers alive keeps its

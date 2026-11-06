@@ -5,8 +5,8 @@ This file is a guard rail, not documentation. The watched script signals process
 here exists to prove a specific way it could kill something it must not:
 
   * a subtree that is WORKING                 -> never a candidate (gate 1)
-  * a parked child with a BUSY grandchild     -> never a candidate (gate 1, descendant KIND)
-  * a parked child with a BUSY nested pi      -> never a candidate (gate 1, SUBTREE CPU sum)
+  * a parked child with a BUSY grandchild     -> never a candidate (gate 1: kind rule AND subtree sum)
+  * a parked child with a BUSY nested pi      -> never a candidate (gate 1: subtree sum ALONE)
   * a lane's OWN pi                           -> never a candidate (only dispatched offspring)
   * anything under a human terminal           -> refused outright (gate 2)
   * a chain we cannot prove is the fleet's    -> refused outright (gate 2)
@@ -148,8 +148,8 @@ def ripen(W, monkeypatch, tmp_path, argv):
     # ⛔ ONE DEFINITION OF THE PROBE CONTRACT, NOT TWO (cycle-2 review). This function used to carry
     # its own inline `has_live_connection` lambda, identical to `parked()`'s — so a future change to
     # that contract (a sequenced probe, a different verdict) would reach the gate-1 tests and
-    # SILENTLY NOT reach the six `main()` tests here, which is the exact leak class these commits
-    # close. `parked()` is also what stubs `_age_seconds`; calling it keeps both in one place.
+    # SILENTLY NOT reach the `main()` tests below, which is the exact leak class these commits close.
+    # `parked()` is also what stubs `_age_seconds`; calling it keeps both in one place.
     parked(W, monkeypatch)
     monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
 
@@ -172,20 +172,24 @@ def test_a_working_child_is_never_a_candidate(W, monkeypatch):
 
 
 def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W, monkeypatch):
-    """⛔ THE DESCENDANT **KIND** RULE, WHICH IS WHAT THIS FIXTURE ACTUALLY PROVES (cycle-2 review).
+    """A parked `pi` whose grandchild is BUSY — and is not a `pi` — is never a candidate.
 
-    A `pi` wrapper sits at ~0 CPU while its own child does the work, and the parent must not be
-    reaped for it. Measured shape 2026-10-12: Drain's pi at `S+`, +7.70 CPU-s/25s, driving a
+    ⛔ TWO GATES REFUSE THIS FIXTURE INDEPENDENTLY, SO IT PROVES THEIR CONJUNCTION AND NEITHER ONE
+    ALONE. This docstring has now been wrong in BOTH directions ("subtree not process" — false, the
+    kind rule also fires; "the kind rule" — false, the subtree sum also fires), so it states the
+    exactly measured result. The grandchild is `curl` at `cpu 1.0 -> 2.0`, a delta above `CPU_TOL`,
+    so gate 1's SUBTREE SUM refuses the parent; and it is not a `pi`, so the descendant-KIND rule
+    refuses it too. MEASURED: deleting the kind rule leaves this test GREEN (the sum still refuses);
+    deleting the sum leaves it GREEN (the kind rule still refuses); only removing BOTH reddens it.
+
+    Each property's single-cause test already exists, so nothing is left to this one but the real
+    end-to-end shape: `test_a_live_tool_call_under_the_child_is_never_a_candidate` uses a CPU-FLAT
+    poller (sum 0, so only the kind rule can refuse), and
+    `test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind` uses a BUSY nested `pi`
+    (the one kind the rule ALLOWS, so only the sum can refuse).
+
+    The shape is real: measured 2026-10-12, Drain's `pi` at `S+`, +7.70 CPU-s/25s, driving a
     `curl -sS --http1.1 -m 25`.
-
-    ⚠️ CORRECTED — THIS TEST USED TO BE TITLED "THE SUBTREE, NOT THE PROCESS", AND THAT WAS FALSE OF
-    IT. Its busy grandchild is a `curl`, a NON-`pi` descendant, so `frozen_subtrees`' "only `pi` may
-    be under a candidate" rule excludes the parent FIRST and gate 1's subtree CPU sum never runs.
-    MEASURED: mutating the sum to process-only left this test GREEN. The property in the title was
-    therefore pinned by NOTHING — it is pinned now, by
-    `test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind`, whose descendant is a
-    nested `pi` (the one kind the rule ALLOWS, so only the sum can refuse it). This test keeps its
-    own, real, narrower subject.
     """
     parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
@@ -542,9 +546,20 @@ def test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation(W
 
 
 def test_a_victim_that_no_longer_exists_is_not_signalled(W, monkeypatch):
-    """`absent` is not `holder`."""
+    """`absent` is not `holder`.
+
+    ⛔ THE RULE IS STUBBED HERE, AND THAT IS THE POINT (cycle-3 review). Left unstubbed this ran the
+    REAL `scripts/lib/pid-identity.sh` through `subprocess` to answer `absent` for pid 999999, so its
+    verdict rested on a file outside the test — measured: copy `lane-watchdog.py` and this file to a
+    temp dir and it reds (`unknown`, rule not found), with a docstring disclosing none of it. Its
+    subject is `reap()`'s handling of the ABSENT verdict, not the rule's ability to produce one; the
+    real rule keeps its own unstubbed tests
+    (`test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation`), and the
+    off-fence arm is stubbed the same way in its sibling above.
+    """
     killed = []
     monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setattr(W, "probe_pid", lambda pid, start, *, lib=None: (False, "absent"))
     table = {**BASE, 200: T(100, cpu=1.0)}
     res = W.reap(dict(pid=999999, ppid=200, subtree=[999999], d_cpu=0.0, age_s=99999,
                       starts={999999: 1000.0}), {}, table, 1)
