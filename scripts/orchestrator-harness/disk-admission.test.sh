@@ -996,9 +996,18 @@ esac
 # the floor as `=0` still refuses below 500 MB — measuring the HOST while its comment claims the
 # opposite. Measured: three suites copied two of the four terms; a 100 MB `df` stub turned
 # `wt-lifecycle.test.sh` into 46 passed / 62 failed, every red on a provision that was merely refused.
-# The gate was right; the SUITES lied about what they had turned off. `spawn-gate.test.sh` had always
-# named all four (`DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0`),
-# which is why it was immune. This pins the CLASS, not the three files: the next copy-paste inherits it.
+# The gate was right; the SUITES lied about what they had turned off.
+# ⛔ A CORRECTION, BECAUSE THE PREVIOUS SENTENCE HERE WAS FALSE (fresh review, P2 — MEASURED). It read
+# "`spawn-gate.test.sh` had always named all four …, which is why it was immune". It had NOT: this very
+# change ADDS `DISK_MIN_FREE_MB=1` at two arms and all three lane terms at a third, i.e. the diff in
+# front of the reader repairs that suite three times. A rationale that tells a maintainer the sibling
+# suite needs no attention, while the diff repairs it, is the claim-vs-code drift this file exists
+# against — so it is deleted rather than re-worded.
+# ⛔ AND "THIS PINS THE CLASS" WAS THE SECOND FALSE CLAIM (fresh review, P1 — MEASURED). This census
+# only inspects a command that ALREADY matches a lane term (`if (cmd !~ PAT) next`), so a command that
+# states the FLOOR and omits all three lane terms is invisible to it — and invisible to arm J too,
+# which is satisfied by any ONE effective line in the FILE. Ten such arms existed in
+# `spawn-gate.test.sh` at `4a97c0f64`; arm K below is what actually pins that class.
 echo
 echo "── I) every suite that neutralises the disk admission zeroes all FOUR terms ──"
 # The matcher is a FUNCTION, not an inline pipeline, so the positive controls below drive the SAME code
@@ -1078,6 +1087,119 @@ for _fx in no-tree no-floor zero-floor; do
     *) bad "I) POSITIVE CONTROL FAILED: a '$_fx' neutralisation was NOT flagged — the census above proves nothing" ;;
   esac
 done
+
+echo
+echo "── K) every CALLER-DRIVING command states all four terms, not the floor alone ──"
+# ⛔ WHY THIS ARM EXISTS (fresh review, P1 — MEASURED 2026-11-06). Arm I inspects only a command that
+# already MATCHES a lane term (`if (cmd !~ PAT) next`), and arm J is satisfied by ANY ONE effective line
+# in the FILE. A command that states the FLOOR and omits all three lane terms therefore satisfied
+# neither: arm I skipped it, arm J never looked at it. That is not hypothetical — TEN arms in
+# `spawn-gate.test.sh` drive the real `fix-one.sh` (→ `wt_provision` → `disk_admit`) with
+# `DISK_MIN_FREE_MB=1` alone. With the lane terms unstated, `disk_worktree_need` is 6,148 MB, so on any
+# box under ~6 GB free `disk_admit` refuses (MEASURED: a 1 GB `df` stub →
+# `REFUSED-DISK(free=1.0GB, need=6.0GB … free_mb=1024, need_mb=6148)` rc 77), and the arm reports a DISK
+# refusal where it asserts a claim/load outcome. Removing all three terms from all ten left THIS suite
+# at 106 passed / 0 failed, i.e. nothing here could see the defect. This is the same class as
+# `pr-doctor-fetch-refspec.test.sh` above: a census whose population cannot contain the defect.
+#
+# The unit is a LOGICAL COMMAND (continuations joined, comments skipped) and "DRIVES" is the same two
+# predicates arm J uses (D1/D2), evaluated per COMMAND rather than per FILE. The deliberate
+# disk-refusal arms are exempt BY VALUE, not by name: a command stating an absurd floor
+# (`DISK_MIN_FREE_MB` >= 100000) is ASKING to be refused, so unstated lane terms cannot change its
+# outcome. That is a stated rule, not a whitelist.
+caller_driving_offenders() { # <file>... -> "file:NN missing: …" for each driving command not fully stated
+  local f
+  for f in "$@"; do
+    [ -f "$f" ] || continue
+    awk -v FILE="$f" '
+      function trimleft(s) { sub(/^[ \t]+/, "", s); return s }
+      {
+        cmd = $0; start = FNR
+        while (cmd ~ /\\$/) {
+          if ((getline nxt) <= 0) break
+          sub(/\\$/, " ", cmd); cmd = cmd " " nxt
+        }
+        if (substr(trimleft(cmd), 1, 1) == "#") next
+        # DRIVES: D1 references the seam, D2 executes a shipped caller
+        drives = 0
+        if (cmd ~ /wt-lifecycle[.]sh|wt_provision/) drives = 1
+        if (cmd ~ /(^|[ \t;&|(])(bash|sh|source)[ \t]/ && cmd ~ /(wt-lifecycle|fix-one|adopt-fix|dispatch-merge)[.]sh/) drives = 1
+        if (!drives) next
+        # only a command that states SOME admission term is a neutralisation at all
+        if (cmd !~ /DISK_(MIN_FREE|LANE_(SELF|RESERVE|TREE))_MB=/) next
+        # EXEMPT BY VALUE: an absurd floor is a deliberate disk-refusal arm
+        if (match(cmd, /DISK_MIN_FREE_MB=[0-9]+/)) {
+          v = substr(cmd, RSTART + 17, RLENGTH - 17)
+          if (v + 0 >= 100000) next
+        }
+        missing = ""
+        if (cmd !~ /DISK_MIN_FREE_MB=[^ ]/)         missing = missing " DISK_MIN_FREE_MB=<nonzero>"
+        else if (cmd ~ /DISK_MIN_FREE_MB=0([^0-9]|$)/) missing = missing " DISK_MIN_FREE_MB=<nonzero: 0 is COERCED back to 500>"
+        if (cmd !~ /DISK_LANE_TREE_MB=[^ ]/)        missing = missing " DISK_LANE_TREE_MB=<explicit>"
+        if (cmd !~ /DISK_LANE_SELF_MB=[^ ]/)        missing = missing " DISK_LANE_SELF_MB=<explicit>"
+        if (cmd !~ /DISK_LANE_RESERVE_MB=[^ ]/)     missing = missing " DISK_LANE_RESERVE_MB=<explicit>"
+        if (missing != "") printf "%s:%d: %s [missing:%s]\n", FILE, start, substr(cmd, 1, 200), missing
+      }' "$f"
+  done
+}
+# the population is BOUNDED and is the same population arm J censuses — no recursion
+_kdrv_pop=( "$HERE"/*.test.sh "$HERE"/../*.test.sh "$HERE"/../../tests/*/run.sh "$HERE"/../../pi-bootstrap/tests/*.sh )
+_koff="$(caller_driving_offenders "${_kdrv_pop[@]}")"
+[ -z "$_koff" ] \
+  && ok "K) no CALLER-DRIVING command leaves an admission term unstated — every arm that provisions states all four, so none is decided by THIS host's free space" \
+  || bad "K) a CALLER-DRIVING command states the floor but LEAVES a lane term unstated, so that arm is decided by THIS host's free space (unstated TREE/SELF default to 350/6144 MB):
+$_koff
+  remedy: add $_terms4 to that command (all four terms), or — if the arm WANTS a disk refusal — state an absurd floor (DISK_MIN_FREE_MB>=100000) so its intent is explicit"
+# ⛔ THE REMEDY EMBEDS $_terms4 RATHER THAN SPELLING THE TERMS OUT (measured: arm I flagged this very
+# message). Arm I's matcher selects any command naming a lane term, so a remedy line written literally
+# is a TRUE positive against it — the same self-reference trap the fixtures above are derived to avoid.
+# NON-VACUITY: the population must actually contain driving commands with admission terms.
+_ndrv2=0
+for _f in "${_kdrv_pop[@]}"; do
+  [ -f "$_f" ] || continue
+  _n="$(grep -cE '(bash|sh|source)[ \t].*(wt-lifecycle|fix-one|adopt-fix|dispatch-merge)[.]sh|wt-lifecycle[.]sh|wt_provision' "$_f" 2>/dev/null; :)"
+  case "$_n" in ''|*[!0-9]*) _n=0 ;; esac
+  [ "$_n" -gt 0 ] && _ndrv2=$((_ndrv2 + 1))
+done
+[ "$_ndrv2" -ge 5 ] \
+  && ok "K) …and the census saw $_ndrv2 file(s) containing a seam-driving or caller-invoking command (floor 5 — an empty population is not a clean population)" \
+  || bad "K) only $_ndrv2 file(s) with a seam-driving command seen, floor 5 — the population or the predicate stopped matching, so the arm above is vacuous"
+# POSITIVE AND NEGATIVE CONTROLS, driving the SAME function the census uses.
+# ⛔ THE INCOMPLETE SHAPES ARE DERIVED FROM VARIABLES, NEVER WRITTEN LITERALLY — the same idiom arm I
+# uses, for the same reason: a literal floor-only command in THIS file's source is a TRUE positive
+# against the census above, and the census correctly flagged its own fixtures (measured: 2 failed) until
+# they were built this way. The driver token stays literal, because that is what makes them drivers.
+mkdir -p "$T/kdrv"
+_k_floor1='DISK_MIN_FREE_MB=1'
+_k_floor_absurd='DISK_MIN_FREE_MB=9999999'
+_k_load='MAX_LOAD=1'
+_k_call='bash "$HERE/../fix-one.sh" 7 work'
+# ONE logical command that both DRIVES the seam and states the floor alone — the exact shipped shape.
+printf '( cd "$X" && %s %s %s )\n' "$_k_load" "$_k_floor1" "$_k_call" > "$T/kdrv/caller-floor-only.test.sh"
+printf '( cd "$X" && %s %s %s )\n' "$_k_load" "$_terms4"  "$_k_call" > "$T/kdrv/caller-complete.test.sh"
+printf '( cd "$X" && %s %s %s )\n' "$_k_load" "$_k_floor_absurd" "$_k_call" > "$T/kdrv/caller-wants-refusal.test.sh"
+printf '# %s %s\n' "$_k_floor1" "$_k_call" > "$T/kdrv/caller-prose.test.sh"
+printf 'echo %s\n' "$_k_floor1" > "$T/kdrv/not-a-driver.test.sh"
+case "$(caller_driving_offenders "$T/kdrv/caller-floor-only.test.sh")" in
+  ?*) ok "K) POSITIVE CONTROL: a caller-driving command with the FLOOR ALONE IS flagged (the arm above can see the defect it exists for)" ;;
+  *)  bad "K) POSITIVE CONTROL FAILED: a caller-driving command with the floor alone was NOT flagged — this arm proves nothing" ;;
+esac
+case "$(caller_driving_offenders "$T/kdrv/caller-complete.test.sh")" in
+  '') ok "K) …a caller-driving command with ALL FOUR terms is NOT flagged (the census is not red on its own remedy)" ;;
+  *)  bad "K) a correctly-stated caller-driving command WAS flagged — the matcher is too broad and would be deleted, taking the real check with it" ;;
+esac
+case "$(caller_driving_offenders "$T/kdrv/caller-wants-refusal.test.sh")" in
+  '') ok "K) …and the deliberate disk-refusal arm (absurd floor) is exempt BY VALUE, so the intent is stated rather than whitelisted" ;;
+  *)  bad "K) the deliberate disk-refusal arm was flagged — the value exemption is not working, and the census would red on intent" ;;
+esac
+case "$(caller_driving_offenders "$T/kdrv/caller-prose.test.sh")" in
+  '') ok "K) NEGATIVE CONTROL: a COMMENT quoting the incomplete shape is not flagged (prose is not a neutralisation)" ;;
+  *)  bad "K) NEGATIVE CONTROL FAILED: a comment quoting the incomplete shape was flagged — the census would red on the text that explains it" ;;
+esac
+case "$(caller_driving_offenders "$T/kdrv/not-a-driver.test.sh")" in
+  '') ok "K) NEGATIVE CONTROL: a floor-only command that DRIVES NOTHING is not flagged (the live-arm floor tests are legitimate)" ;;
+  *)  bad "K) NEGATIVE CONTROL FAILED: a non-driving floor-only command was flagged — this would red ~80 legitimate live-arm arms and be deleted as cry-wolf" ;;
+esac
 
 echo
 echo "── J) every suite that DRIVES the provision seam neutralises the admission (the CLASS, not one file) ──"
