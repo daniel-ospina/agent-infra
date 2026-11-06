@@ -517,7 +517,7 @@ fork terminates the shell; a fork-starved box is seen by its PEERS' lines instea
 ```
 start=… end=… cycle=… interval=240 selected=issue:#2216 selected_n=1 dispatched=1 ids=#2216
 nothing=none placement=place placed_on=cell-1 bound=none lpc_self=7 fork=ok fork_procs=412 fork_max=15641
-stages=boot:3,disk:1,reap:0,refresh:2,authority:1,claims:0,caches:0,sweep:41,gate:6,l5_issue:0,record:0,l1_main:ns,l2_merge:0,l3_fix:12,l4_review:29,prev_wait:241
+stages=boot:3,disk:1,reap:0,refresh:2,authority:1,claims:0,caches:0,sweep:41,gate:6,l5_issue:0,record:0,l2_merge:0,l3_fix:12,l4_review:29,l1_main:ns,prev_wait:241
 ```
 
 ### 7.1 `stages=` — attributing the cycle's wall time

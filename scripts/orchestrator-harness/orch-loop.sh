@@ -4095,6 +4095,13 @@ while true; do
       echo "[capacity] $(CAP_CHAN="$CAP_CHAN_V" cap_fleet_line_from "${CAP_FLEET:-}" "$CAP_FLEET_RC")" >> "$LOG"
     fi
     fork_free_sleep "$_nap" || { sleep "$_nap" 2>/dev/null; }
+    # ⛔ SAMPLE THE GAP'S START BEFORE NAPPING, EXACTLY AS THE FORK-STARVED ARM DOES (fresh-context
+    # review, P0). `stg_cycle_reset` zeroes `STG_WAIT_T0`, and `stg_nap_mark` computes
+    # `now - STG_WAIT_T0` — so WITHOUT this sample a disk-held cycle recorded the controller's WHOLE
+    # PROCESS UPTIME as "the gap": measured with the shipped clock, a 2 s cycle followed by a 1 s nap
+    # emitted `prev_wait=3004153` us for a 1000000 us nap. That is the fabricated-measurement class
+    # this field exists to end, arriving through the arm opposite the one that was instrumented.
+    stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
     stg_nap_mark
     continue
   fi
@@ -6087,9 +6094,16 @@ while true; do
     # ⛔ SETTLE AT THE END OF THE BODY TOO, NOT ONLY AT THE START OF THE NEXT ROW (fresh-context
     # review of this fix). The top-of-iteration settle closes the PREVIOUS row's open level; the LAST
     # row has no next iteration, so its open interval used to die with the subshell and be lost.
-    # Measured: three rows of 1 s with a top-only settle accumulated 2004 ms instead of 3009 ms — one
-    # row's worth of the cascade silently dropped, every cycle. Idempotent, so the next top-of-loop
-    # settle is then a no-op and a `continue` still behaves exactly as before.
+    # Measured: three rows of 1 s with a top-only settle accumulated 2004 ms instead of 3009 ms.
+    # ⛔ WHAT THIS DOES **NOT** COVER, STATED EXACTLY (second fresh-context review, P0): a row that
+    # exits via `continue` SKIPS this line, so its open interval is closed by the NEXT row's top-of-
+    # loop settle instead — which is correct, but it means a LAST row that `continue`s loses its tail
+    # (measured: three 1 s rows where the third continues ⇒ ~2004 ms). The residual is bounded to ONE
+    # row's trailing interval per cycle, and only when the final window row takes a fixer/park/
+    # conflict path. It cannot be closed from here: a subshell `EXIT` trap does NOT fire for a
+    # pipeline subshell (verified — the trap's output never appeared), and instrumenting all ~40
+    # `continue` sites individually is the hazard this design exists to avoid. Do NOT read this line
+    # as full coverage.
     stg_lvl_settle || :
   done
   # ── FOLD THE OVERLAY QUEUE THE SWEEP'S SUBSHELL WROTE (#P0 review) ─────────────────────────────

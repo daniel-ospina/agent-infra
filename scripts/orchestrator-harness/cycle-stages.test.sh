@@ -434,6 +434,30 @@ ck "three 1 s rows accumulate ~3 intervals, not 2 — the LAST row's interval is
    "$(if [ "${STG_V_l2_merge:-0}" -ge 2700000 ]; then echo 0; else echo 1; fi)"
 STG_LVL_TMP=""
 
+# 9.1c THE TWO SHIPPED CALL SITES THE FIX DEPENDS ON MUST EXIST IN `orch-loop.sh`.
+# §9.1/§9.1b drive an arrangement the suite writes ITSELF, so neither can see whether the SHIPPED
+# loop performs that arrangement (second fresh-context review, P1: deleting the shipped trailing
+# settle and the shipped post-`done` fold left the suite at "72 passed"). These two arms read the
+# real file. Comments are NOT stripped here on purpose — the assertion is about executable lines, so
+# it matches only lines that are not full-line comments AND names the exact call.
+_loop_nc="$(grep -vE '^[[:space:]]*#' "$ORCH")"
+ck "the shipped sweep SETTLES at the end of the body — 'stg_lvl_settle || :' immediately before its 'done'" \
+   "$(if printf '%s\n' "$_loop_nc" | awk '/stg_lvl_settle \|\| :/ {seen=1; next} seen && /^[[:space:]]*done[[:space:]]*$/ {found=1} END {exit !found}'; then echo 0; else echo 1; fi)"
+ck "the shipped sweep FOLDS the overlay queue in the PARENT, after 'done' — 'stg_lvl_fold' before 'stg_mark sweep'" \
+   "$(if printf '%s\n' "$_loop_nc" | awk '/done$/ {after=1} after && /stg_lvl_fold/ {f=1} END {exit !f}'; then echo 0; else echo 1; fi)"
+# ⛔ AND EVERY `stg_nap_mark` CALL SITE MUST SAMPLE `STG_WAIT_T0` FIRST. `stg_cycle_reset` zeroes that
+# sample, so a call site that omits it records the controller's WHOLE UPTIME as "the gap" — measured
+# 3004153 us for a 1000000 us nap on the disk-held arm, which is the fabricated-measurement class
+# this field exists to end. The disk-held arm shipped with exactly that omission, so this arm pins
+# the CLASS, not the one site: any future nap site that forgets the sample reds here.
+_nap_bad=""
+for _nln in $(printf '%s\n' "$_loop_nc" | grep -n '^[[:space:]]*stg_nap_mark[[:space:]]*$' | cut -d: -f1); do
+  _win="$(printf '%s\n' "$_loop_nc" | sed -n "$(( _nln > 4 ? _nln - 4 : 1 )),$(( _nln - 1 ))p")"
+  case "$_win" in *'STG_WAIT_T0='*) : ;; *) _nap_bad="$_nap_bad $_nln" ;; esac
+done
+ck "every stg_nap_mark call site samples STG_WAIT_T0 first, so prev_wait cannot become the process uptime${_nap_bad:+ (bad line(s):$_nap_bad)}" \
+   "$([ -z "$_nap_bad" ] && echo 0 || echo 1)"
+
 # 9.2 `prev_wait` IS ONE GAP, NOT THE LIFETIME SUM OF EVERY NAP.
 # `stg_add` accumulates, so the pre-review `stg_nap_mark` made the field grow every cycle (measured
 # 1,2,3 over three 1 s naps; on a real box with CYC=240 it reaches ~2400 by cycle 10). Two resets and
@@ -470,7 +494,7 @@ done
 # value from a measurement, which defeats the one property the field exists to have.
 ck "cycle_stage_get answers ABSENT for a value with a second colon ('1:2' is not a duration)" \
    "$(if cycle_stage_get 'start=1 stages=sweep:1:2' sweep >/dev/null 2>&1; then echo 1; else echo 0; fi)"
-ck "  …and ABSENT for a stage named with no value at all — a REFUSAL (rc≠0), because an empty string\n              with rc 0 is indistinguishable from a reading at the call site" \
+ck "  …and ABSENT for a stage named with no value at all — a REFUSAL (rc≠0), because an empty string with rc 0 is indistinguishable from a reading at the call site" \
    "$(if cycle_stage_get 'start=1 stages=sweep:' sweep >/dev/null 2>&1; then echo 1; else echo 0; fi)"
 ck "  …and ABSENT for a non-numeric value" \
    "$(if cycle_stage_get 'start=1 stages=sweep:abc' sweep >/dev/null 2>&1; then echo 1; else echo 0; fi)"
