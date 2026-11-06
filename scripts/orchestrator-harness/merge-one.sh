@@ -296,13 +296,14 @@ if [ "${REV_PAID:-0}" = "1" ]; then
   # ⛔ THE WRITE IS BOUNDED LIKE THE READ — the clamp sits AFTER the whole `if`/`else` so it covers
   # BOTH branches (round 7 review, P2: it was first put inside this branch, so the NON-`REV_PAID`
   # branch — every `chain-<N>` / `fix-one` review, the majority path — still wrote an unbounded
-  # `_rr_prev + 1`, and a book at 999999999 made the next run write 1000000000). ⛔ THIS PARAGRAPH USED
-  # TO SAY that both readers "coerce to 0 and the ceiling RESETS", WHICH IS FALSE AT THE SHIPPED CODE
-  # (round-17 review, P3): both readers clamp a >9-digit book to 999999999 — EXHAUSTED, not reset — and
-  # any book at or above `max` is refused at the ceiling check before either spend site can run, so a
-  # 10-digit value can never be written in the first place. The clamp stays as canonicalisation at the
-  # writer's own bound; the reason is overflow hardening, NOT a reset it was preventing. See the clamp
-  # below the `fi`.
+  # `_rr_prev + 1`). ⛔ THIS PARAGRAPH USED TO SAY that both readers "coerce to 0 and the ceiling
+  # RESETS", WHICH IS FALSE AT THE SHIPPED CODE (round-17 review, P3): both readers clamp a >9-digit
+  # book to 999999999 — EXHAUSTED, not reset. ⛔ AND IT USED TO FOLLOW THAT WITH an inference ("so a
+  # 10-digit value can never be written"), which is FALSE AS AN INFERENCE, corrected in the same round
+  # that wrote it (fresh review of #3441, P3): the ceiling check runs ONCE, before the spend, and the
+  # spend re-reads the book — so the guarantee that the book stays 9 digits is the IN-SPEND clamp in
+  # `review_round_spend`, not the ceiling check. What this top-of-file clamp guarantees is narrower and
+  # stated at its own line below. See the two clamp notes there.
   # ⛔ `0` IS UNKNOWN, NOT ROUND ZERO (round 4 review, P3). `brief-gate.sh`'s `brief_gate_round_norm`
   # maps an unreadable round to 0, and its comparable mandate is skipped at 0 — so this file must
   # treat 0 the same way or the two halves of one feature disagree about the same value. It did: a
@@ -353,11 +354,13 @@ fi
 # ⛔ SO THE CLAMP BELOW IS **CANONICALISATION**, AND SAYING WHICH ONE IS WHICH IS THE POINT (fresh
 # review of #3441, P3). The reader's own bound is the reachable, load-bearing clamp (see the note at
 # the spend's re-derivation: a book that moved past 9 digits DURING an already-allowed review). This
-# top-of-file one guards the OTHER branches — `REV_PAID`'s caller floor and the plain `_rr_prev + 1` —
-# whose 10-digit value cannot be WRITTEN because `_rr_ceiling_hit` refuses at `book >= max` before any
-# spend site of that run. It stays as the one place that makes the top-of-file value a 9-digit numeral
-# by construction; a reader who deletes the REACHABLE clamp because this paragraph called the whole
-# bound "canonicalisation" is the failure this correction exists to prevent.
+# top-of-file one keeps the value ASSIGNED HERE a 9-digit numeral, and what it guarantees is exactly
+# that assignment — it does NOT make a 10-digit write impossible (the spend's own clamp does, in
+# `review_round_spend` below). ⛔ IT ALSO RESTS ON AN UNSTATED INVARIANT (fresh review of #3441, P3): the
+# `book >= max` refusal below only bounds this value if the book is never LOWERED (or removed, which
+# `_rr_read_book` reads as round 0 = a free budget) between the read above and the ceiling check. The
+# shipped clearers target dead or converged PRs and no path was found that lowers a LIVE PR's book in
+# that window, so the invariant holds today and is named here rather than assumed.
 if [ "${#REVIEW_ROUND}" -gt 9 ]; then REVIEW_ROUND=999999999; fi
 
 # ⛔ THE ONE WRITE, DEFINED **HERE** — BEFORE `run_agent` AND BEFORE THE TRAP (round 10 review, P1).
@@ -405,7 +408,7 @@ review_round_spend() {
   if [ "$_rr_prev_now" -ge "$REVIEW_ROUND" ]; then
     REVIEW_ROUND=$(( _rr_prev_now + 1 ))
     # ⛔ THIS CLAMP IS LOAD-BEARING AND REACHABLE, NOT CANONICALISATION (fresh review of #3441, P3,
-    # MEASURED) — unlike the top-of-file one below, which the ceiling check makes unreachable. The book
+    # MEASURED) — unlike the top-of-file one ABOVE, which bounds only the value assigned there. The book
     # is re-read HERE, after `_rr_ceiling_hit` has already ALLOWED this review, so a book that reached
     # 999999999 while the reviewer ran makes `+ 1` a TEN-digit value. Measured on a copy: book at
     # 999999999, round in hand 5 — shipped leaves 999999999; with this line deleted the book becomes
