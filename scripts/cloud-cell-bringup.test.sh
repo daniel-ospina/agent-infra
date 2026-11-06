@@ -1804,11 +1804,12 @@ esac
 mk_checkout "$T/ident-wt/home/agent-infra" "https://github.com/daniel-ospina/tortoise.git" w4 \
   && ok "fixture: a REAL CLONE (.git is a DIRECTORY) named agent-infra, holding tortoise" \
   || bad "fixture: could not create the lying clone"
-BR_IDENT_ROOTS="$T/ident-wt/home" br fail normal --check
+BR_IDENT_ROOTS="$T/ident-wt/home" br ok normal --check
 case "$BR_OUT" in
   *"CHECK FAILED [repo identity]"*) ok "…while a REAL CLONE that lies about its repo is STILL refused (the cell-2 defect)" ;;
   *) bad "the .git-is-a-file exemption widened to real checkouts — a lying CLONE now reads clean: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
 esac
+[ "$BR_RC" -ne 0 ] && ok "…and that refusal exits non-zero (rc=$BR_RC)" || bad "a lying real clone exited 0"
 
 say_case "the CELL READY headline cannot contradict the identity token in the same parenthesis"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The line read `CELL READY — all links verified (one home, repo
@@ -1845,11 +1846,12 @@ esac
 mk_checkout "$T/ident-wtsufbad/home/tortoise-wt" "https://github.com/daniel-ospina/agent-infra.git" x2 \
   && ok "fixture: a tortoise-wt clone that actually holds agent-infra" \
   || bad "fixture: could not create the lying <repo>-wt"
-BR_IDENT_ROOTS="$T/ident-wtsufbad/home" br fail normal --check
+BR_IDENT_ROOTS="$T/ident-wtsufbad/home" br ok normal --check
 case "$BR_OUT" in
   *"CHECK FAILED [repo identity]"*) ok "…while a <repo>-wt holding a DIFFERENT repo is still refused" ;;
   *) bad "the <repo>-suffix exemption widened to any repo — a lying working copy now reads clean: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-500)" ;;
 esac
+[ "$BR_RC" -ne 0 ] && ok "…and that refusal exits non-zero (rc=$BR_RC)" || bad "a lying <repo>-wt working copy exited 0"
 
 say_case "repo identity: a LINKED WORKTREE carries UNVERIFIED, so the banner cannot claim full verification"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P1. The worktree warn's own text says "nothing to compare against
