@@ -78,7 +78,7 @@ ck()  { # ck <name> <0|1> — the shared vocabulary the sibling suites use
 # A suite that cannot get the code under test must never report green. Fail ONCE, by name, instead of
 # leaving 10 cryptic assertion failures that read as "the reorder is broken".
 MISSING=""
-for t in awk sed grep sort cksum mktemp wc tr; do
+for t in awk sed grep sort cksum cmp mktemp wc tr; do
   command -v "$t" >/dev/null 2>&1 || MISSING="$MISSING $t"
 done
 if [ -n "$MISSING" ]; then
@@ -1856,6 +1856,27 @@ elif [ "$(_dwit "$_dwp/forge.trace" '' '')" != '[refresh] forged order' ]; then
 else rc=0; fi
 ck "a printed line WEARING the trace prefix names NO witness (the per-run nonce refuses it — and, with the nonce dropped, DOES)" $rc
 
+# ⛔ AND THE ANCHOR ITSELF (review P3, cycle 53): every fixture above is refused by the NONCE conjunct, so
+# deleting `^\++` left the suite at 132/0 — the anchor was claimed by a check's NAME and graded by nothing.
+# This fixture puts the WHOLE `fn [nonce] echo ` sequence MID-LINE: the nonce cannot refuse it, only the
+# requirement that the sequence starts the traced command can.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  'queue_order_from_pool() {' \
+  "  cat <<'ZZZ' >/dev/null" \
+  "zzz queue_order_from_pool [${_n_p}] echo '[refresh] midline order: sequence mid-line'" \
+  'ZZZ' \
+  '  return 0' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/midline.sh"
+( cd "$_dwp" && bash midline.sh ) > "$_dwp/midline.out" 2>"$_dwp/midline.trace"
+if ! grep -qF "queue_order_from_pool [${_n_p}] echo '[refresh] midline order" "$_dwp/midline.trace" 2>/dev/null; then
+  rc=1; echo "      the mid-line sequence never reached the trace stream — the fixture proves nothing"
+elif [ -n "$(_dwit "$_dwp/midline.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      a mid-line sequence NAMED a witness ('$(_dwit "$_dwp/midline.trace" '' "$_n_p")') — the match is not anchored to the command position"
+else rc=0; fi
+ck "a mid-line «fn [nonce] echo» sequence names NO witness (the match must START the traced command)" $rc
+
 ck "an echo in a DIFFERENT function names NO witness for the function under test" \
    "$([ -z "$(_dwit "$_dwp/other.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
 printf '%s\n' \
@@ -2078,12 +2099,16 @@ _arm14() {  # _arm14 <label> <count-content|-> -> print the drive's output
   printf '200\n300\n' > "$_ad/o/candidates.txt"; printf '200\n300\n' > "$_ad/o/.pool"
   printf 'P1-severe\n' > "$_ad/o/.pool-sat"
   sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_ad/fns-shim.sh"
-  # ⛔ THE RENAME MUST HAVE HAPPENED (review P3, cycle 52). Ungated, a drifted anchor means `_rq_real` never
-  # exists, the drive takes `priority-unreadable`, NO arm's sentence is in either stream — and the "absent
-  # from the output as well" branch reported that as a PRODUCT defect. The verdict is the first output line
-  # because this function runs inside a command substitution (a variable would never reach the caller).
-  if cmp -s "$FNS" "$_ad/fns-shim.sh" 2>/dev/null; then printf '__SHIM__rename=noop\n'; else printf '__SHIM__rename=ok\n'; fi
-  { drive_xtrace_prologue "$(_xtrace_nonce)"; cat "$_ad/fns-shim.sh"
+  # ⛔ THE RENAME MUST HAVE HAPPENED (review P3, cycle 52), AND THE GATE MUST BE A POSITIVE MEASUREMENT (review
+  # P3, cycle 53). Ungated, a drifted anchor means `_rq_real` never exists, the drive takes
+  # `priority-unreadable`, NO arm's sentence is in either stream — and the branch below reported that as a
+  # PRODUCT defect. `cmp -s` cannot carry the gate on its own: it is a DIFFERENCE test, so it answers "applied"
+  # for every non-zero exit including 127 (`cannot execute`) and 2 (`cannot read`) — a fail-open gate — and it
+  # cannot tell "the rename landed" from "some other byte changed". So the gate ASKS FOR THE RENAME ITSELF.
+  # The verdict is the first output line because this function runs inside a command substitution.
+  if grep -q '^_rq_real() {' "$_ad/fns-shim.sh" 2>/dev/null; then printf '__SHIM__rename=ok\n'; else printf '__SHIM__rename=noop\n'; fi
+  # (no nonce is passed: these checks grep the trace for a MARKER as execution proof and resolve no witness)
+  { drive_xtrace_prologue; cat "$_ad/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; '
     if [ "$2" = "-" ]; then printf 'rm -f "$4"'; else printf 'printf "%%s\\n" "%s" > "$4"' "$2"; fi
     printf '; return $_rq_rc; }\n'
@@ -2126,8 +2151,10 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   printf '200\n300\n' > "$_amd/o/candidates.txt"; printf '200\n300\n' > "$_amd/o/.pool"
   printf 'P1-severe\n' > "$_amd/o/.pool-sat"
   sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_amd/fns-ren.sh"
-  # Both gates travel on ONE first line (`rename=` and `strip=`), same subshell reason as `_arm14`.
-  if cmp -s "$FNS" "$_amd/fns-ren.sh" 2>/dev/null; then _shim_ren=noop; else _shim_ren=ok; fi
+  # Both gates travel on ONE first line (`rename=` and `strip=`), same subshell reason as `_arm14`. Both are
+  # POSITIVE measurements (review P3, cycle 53): the rename is proven by the renamed function EXISTING, and
+  # the strip by the clip's occurrence count DECREASING. `cmp -s` would report "applied" whenever it cannot run.
+  if grep -q '^_rq_real() {' "$_amd/fns-ren.sh" 2>/dev/null; then _shim_ren=ok; else _shim_ren=noop; fi
   # `sub(/[$]_sat_said/, "")` — the `[$]` bracket keeps the `$` out of the regex as an anchor, and the
   # VARIABLE is deleted while the closing quote is left standing, so the echo stays valid shell. (A
   # replacement string spelled `"\""` is a syntax error in this awk: measured, it silently produced a
@@ -2141,9 +2168,12 @@ _arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line>
   # a command substitution, i.e. a SUBSHELL, so a flag it sets never reaches the caller — measured: all four
   # per-arm checks reported "the strip did NOT apply" for four successful strips. The first output line is
   # the verdict; the drive's own output follows it.
-  if cmp -s "$_amd/fns-ren.sh" "$_amd/fns-shim.sh" 2>/dev/null; then _shim_strip=noop; else _shim_strip=ok; fi
-  printf '__SHIM__strip=%s,rename=%s\n' "$_shim_strip" "$_shim_ren"
-  { drive_xtrace_prologue "$(_xtrace_nonce)"; cat "$_amd/fns-shim.sh"
+  _clips_before="$(grep -cF '$_sat_said' "$_amd/fns-ren.sh" 2>/dev/null)"; _clips_before="${_clips_before:-0}"
+  _clips_after="$(grep -cF '$_sat_said' "$_amd/fns-shim.sh" 2>/dev/null)"; _clips_after="${_clips_after:-0}"
+  if [ "$_clips_after" -lt "$_clips_before" ]; then _shim_strip=ok; else _shim_strip=noop; fi
+  printf '__SHIM__strip=%s,rename=%s,clips=%s-%s\n' "$_shim_strip" "$_shim_ren" "$_clips_before" "$_clips_after"
+  # (no nonce: this helper greps the trace for a MARKER — it resolves no witness)
+  { drive_xtrace_prologue; cat "$_amd/fns-shim.sh"
     printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; printf "%%s\\n" "%s" > "$4"; return $_rq_rc; }\n' "$3"
     printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
   } > "$_amd/drive.sh"
@@ -2161,13 +2191,23 @@ for _arm14m in \
   _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _rest="${_rest#*|}"
   _mc="${_rest%%|*}"; _mm="${_rest#*|}"
   _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
-  _mok=0; _mren=no
-  case "$_mo" in '__SHIM__strip=ok,rename=ok'*) _mok=1; _mren=yes ;; esac
-  case "$_mo" in '__SHIM__'*) _mo="$(printf '%s\n' "$_mo" | sed '1d')" ;; esac
-  if [ "$_mren" != yes ]; then
-    rc=1; echo "      the shim did NOT apply for the $_ml arm (strip=$_mok, rename=$_mren) — a drifted sed anchor means nothing here is graded"
-  elif [ "$_mok" -ne 1 ]; then
-    rc=1; echo "      the strip did NOT apply to the $_ml arm — it already lacks the clip, so this check would report a mutation it never made"
+  # ⛔ THE VERDICT CARRIES TWO INDEPENDENT MEASUREMENTS, SO IT IS READ AS TWO (review P3, cycle 53). Collapsing them
+  # into one boolean (`strip=ok,rename=ok`) made the strip-specific branch DEAD by construction and made the
+  # surviving sentence report `rename=no` for a rename it had measured `ok` — a false cause, on the very check
+  # family that exists to catch false causes.
+  _mstrip='?'; _mren='?'; _mclips='?'
+  case "$_mo" in '__SHIM__'*)
+    _mo_raw="$(printf '%s\n' "$_mo" | head -1)"
+    _mo="$(printf '%s\n' "$_mo" | sed '1d')"
+    _mstrip="${_mo_raw#__SHIM__strip=}"; _mstrip="${_mstrip%%,*}"
+    _mclips="${_mo_raw#*clips=}"; _mren="${_mo_raw##*rename=}"; _mren="${_mren%%,*}"
+  ;; esac
+  if [ "$_mren" != ok ]; then
+    rc=1; echo "      the shim RENAME did not apply for the $_ml arm (rename=$_mren) — the sed anchor drifted, so '_rq_real' never exists and NO arm behaviour is graded (a FIXTURE defect)"
+  elif [ "$_mstrip" != ok ]; then
+    rc=1; echo "      the STRIP did not apply to the $_ml arm (strip=$_mstrip, clip occurrences before-after=$_mclips) — the awk needle drifted or the arm already lacks the clip, so this check would report a mutation it never made"
+  elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
+    rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename AND strip were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
     rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename and strip were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null; then
