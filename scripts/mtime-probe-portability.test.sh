@@ -108,14 +108,25 @@ executed_view() {
 
 echo
 echo "── executed-view pins (the rationale MAY name the trap; executed code may not) ──"
-# ⛔ WHAT IS PINNED IS THE ORDER, NOT THE SPELLING `date -r`. Only a GNU-FIRST two-sided chain is
-# portable: `stat -c %Y … || stat -f %m …` (`scripts/check-portability-traps.sh:1344`, already
-# shipped at `orchestrator-harness/auto-rail.sh:341`). A BSD-FIRST two-sided chain `stat -f %m … ||
-# stat -c %Y …` is the #3434 bug itself — the `||` chain stops at `stat -f`'s SUCCESS on macOS and
-# on GNU appends the filesystem block — so it is NOT accepted. Measured before this rule: the
-# GNU-first chain red 2/2 (a later lane re-spelling these files to main's OWN idiom got a red suite
-# for correct code), while the BSD-first chain passed both text arms.
-# Line-oriented: a chain split across lines is joined on a trailing backslash before the check.
+# ⛔ WHAT IS PINNED IS THE SHAPE OF THE `||` CHAIN, NOT THE SPELLING `date -r`. Only a GNU-FIRST
+# two-sided chain is portable: `stat -c %Y … || stat -f %m …` (`scripts/check-portability-traps.sh:1344`,
+# already shipped at `orchestrator-harness/auto-rail.sh:341`).
+#
+# The #3434 defect is precise, and it is NOT "any BSD-first spelling": it is `stat -f %m` and its
+# fallback sharing ONE substitution, e.g. `m="$(stat -f %m X 2>/dev/null || stat -c %Y X 2>/dev/null)"`.
+# There the `||` STOPS at `stat -f`'s success (macOS), and on GNU appends the filesystem block to the
+# real epoch — one variable, two outputs. Measured on GNU coreutils 9.4: that form yields the block
+# followed by the epoch. The arm therefore reds exactly that, plus a probe with NO GNU fallback at all.
+#
+# ⛔ It does NOT red the TWO-ASSIGNMENT chain, which is portable and which this same branch pins as the
+# family idiom (`scripts/pi-cache-reap.sh:531`, asserted at `scripts/pi-cache-reap.test.sh:1041-1042`):
+#     m="$(stat -f %m "$1" 2>/dev/null)" || m="$(stat -c %Y "$1" 2>/dev/null)" || return 1
+# Each assignment has its OWN status, so the first one's failure runs the second and overwrites the
+# block. Measured on GNU 9.4: it returns the true epoch, identical to `stat -c %Y`. Ranging this arm
+# over the two-assignment form too would red correct code — the one failure mode this repo refuses,
+# because a detector that cries wolf gets switched off and takes the class with it.
+# Line-oriented: a chain split across lines is joined on a trailing backslash before the check, and a
+# nested `$( )` between the probe and its `||` is not modelled — this is a shape check, not a parser.
 for f in "$MONITOR" "$LANE_SCAN"; do
     name="$(basename "$f")"
     view="$(executed_view "$f")"
@@ -125,10 +136,14 @@ for f in "$MONITOR" "$LANE_SCAN"; do
           buf = ""
           if (line ~ /stat -f %m/) {
               i = index(line, "stat -c"); j = index(line, "stat -f %m")
-              if (i == 0 || j < i) printf "%d: %s\n", NR, line
+              rest = substr(line, j + length("stat -f %m"))
+              p = index(rest, ")"); b = index(rest, "||")
+              # inside: the `||` belongs to the substitution that holds `stat -f %m`
+              inside = (b > 0 && (p == 0 || b < p))
+              if (i == 0 || inside) printf "%d: %s\n", NR, line
           } }' <<<"$view")"
     assert_eq "$bsd_first" "" \
-        "$name has no BSD-FIRST 'stat -f %m' (GNU-first two-sided chains are fine)"
+        "$name has no '||' chain sharing ONE substitution with 'stat -f %m', and no BSD-only probe with no GNU fallback"
     if grep -qF -- 'date -r' <<<"$view" || grep -qF -- 'stat -c' <<<"$view"; then
         ok "$name reads mtime with a form that works on GNU and BSD (date -r, or a GNU-first stat chain)"
     else

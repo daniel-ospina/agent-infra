@@ -74,12 +74,12 @@
 #
 # ⛔ The `check-pipeline-compliance.sh` entry above reads `:1025` where it used to read `:503` (#3509).
 # That one was NOT re-measured: the file has since grown 3456 → 5989 lines, and the function it named
-# changed shape — `has_review_record()` no longer ends on a literal `return 0` (its verdict is
-# `[ -n "$REVIEW_RECORD_MATCHED_LINE" ]`, and its loop terminates at `:609`), while the function in
-# this file that still does is `review_record_at_head()`, `return 0` at `:1023` inside the loop that
-# ends `done < <(review_store_candidates …)` at `:1025`. So the pointer was re-derived by READING the
-# two functions, not by re-running the widened arm — treat `:1025` as the function identity being
-# corrected and the line number as read, and re-measure the whole list before relying on it.
+# changed shape — `has_review_record()` no longer ends on a literal `return 0` (verdict at `:610`, loop
+# end `:609`) — and neither does `review_record_at_head()` at `:1025`: its `return 0` at `:1023` is a
+# MID-LOOP early return and it ends `return 1` after `done < <(review_store_candidates …)`. The function
+# that DOES end on a literal `return 0` is `review_record_carry_candidates()` (`done <<<"$text"` at
+# `:1267`, `return 0` at `:1272`), which a terminal-`return 0` widening reds instead. So the pointer was
+# re-derived by READING, not by the widened arm; "SEVEN" was not re-measured — re-measure before relying.
 # AMONG the shapes it cannot see, and not the only ones: a for-list SPLIT ACROSS LINES (`for x in \` then
 # `$out; do`) — the matcher is line-oriented, so the word list must be on one line, as it is for the
 # `for x in $(cmd)` arm — and a feeder filled by `read -r out < <(cmd)`, which is a read, not a capture.
