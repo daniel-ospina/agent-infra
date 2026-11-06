@@ -703,16 +703,28 @@ CLAIMED="$(printf '%s\n' "$OUT" | awk '
   || bad "wfretry: the claimed sha '${CLAIMED:-none}' is not origin's '${WSHA:-none}' — the message names a handle that does not resolve"
 
 # (1b) ⛔ THE OPPOSITE DIRECTION OF THE SUCCESS MESSAGE. A plain first-attempt push must NOT be reported
-# as a keychain push: an implementation that prints the keychain claim on BOTH success branches passed
+# as a retried push: an implementation that prints the credential claim on BOTH success branches passed
 # the arm above, and would tell an operator the scope-less token works on a run where it was never used.
+# ⛔ AN EXACT MATCH, NOT A DENY-LIST (review round 10, P2). This arm used to reject only `OSXKEYCHAIN`,
+# so a plain success that claimed ANY OTHER credential — `— pushed with the STORED credential`, the
+# mutant below — was fully green (measured: PASS=162 FAIL=0, the same counts as a correct tree). The
+# property is not "names no keychain", it is "names no credential at all", and the only form that
+# proves it is the success line in its one legal shape: this path has exactly one attempt, so there is
+# nothing for it to attribute the push to. Matching the WHOLE line is what makes an added clause of any
+# wording red, instead of a deny-list the next credential name walks straight past.
 try_rescue plainok plain_ok
 [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "1" ] \
   && ok "plainok: a first-attempt success is one attempt, exit 0" \
   || bad "plainok: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 1)"
-case "$OUT" in
-  *OSXKEYCHAIN*|*osxkeychain*) bad "plainok: a push that was NEVER retried claims the keychain credential — $OUT" ;;
-  *) ok "plainok: a non-retried push does not claim the keychain credential (the claim is evidence, not decoration)" ;;
-esac
+PLAIN_SHA="$(ref_of "$T/plainok/origin.git" refs/wip/fix-lane-one)"
+PLAIN_LINE="bg-rescue-wip: rescued fix/lane-one → origin refs/wip/fix-lane-one ($PLAIN_SHA)"
+if [ -z "$PLAIN_SHA" ]; then
+  bad "plainok: origin holds no refs/wip/fix-lane-one — the plain-success message cannot be checked"
+elif grep -qxF "$PLAIN_LINE" <<<"$OUT"; then
+  ok "plainok: the non-retried success line names NO credential — it is exactly the plain form"
+else
+  bad "plainok: a push that was NEVER retried does not print the plain success line — want '$PLAIN_LINE', got: $OUT"
+fi
 
 # (2) ⛔ A NON-WORKFLOW rejection is NOT retried. The stub would SUCCEED on the keychain attempt, so a
 # blanket retry reports a false GREEN here — and the branch is named "workflow-scope" so the rejection
@@ -1170,6 +1182,22 @@ else
     *"retrying ONCE"*|*"retried ONCE"*|*"ALSO failed"*)
       bad "wfnocred: claims a retry that was deliberately not made — $OUT" ;;
     *) ok "wfnocred: does not claim a retry it did not make (neither tense, and no retry-outcome line)" ;;
+  esac
+  # ⛔ AND IT MUST NOT CLAIM A REMOVAL EITHER (review round 10, P3). "Does not claim a retry it did not
+  # make" covers the attempt; it said nothing about the MECHANISM, so this message could grow "the
+  # ambient GH_TOKEN/GITHUB_TOKEN was removed for that attempt" — on the one path where NOTHING was
+  # unset, no `env -u` ran, and no second credential exists — and the suite stayed green (measured:
+  # PASS=162 FAIL=0, identical to a correct tree). That is the false mechanism claim this script's own
+  # push_unshadowed docblock calls the worst kind, landing in the block an operator reads while the
+  # work is still single-copy on disk. The assertion is ABSENCE OF THE VERB `removed`, which is what
+  # every removal claim in this script is written with (`:441`, `:443`, both on the unshadow path);
+  # ⛔ the honest line on THIS path says "no ambient GH_TOKEN/GITHUB_TOKEN **to unshadow**", which is a
+  # statement of absence, not a claim of action — so the noun is deliberately NOT matched, and a
+  # wider deny-list would have made this arm a false red on a correct tree.
+  case "$OUT" in
+    *[Rr]emoved*)
+      bad "wfnocred: claims a credential was REMOVED on the path where nothing was tried — $OUT" ;;
+    *) ok "wfnocred: claims no removal — nothing was unset on the path where no retry was made" ;;
   esac
   case "$OUT" in
     *"STILL ONLY ON THIS DISK"*) ok "wfnocred: still says the work is on this disk only (never a cheerful exit)" ;;
