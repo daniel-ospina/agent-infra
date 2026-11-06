@@ -555,6 +555,13 @@ if not isinstance(pargs, list) and not absolute(prog):
     sys.exit(4)                      # neither key names anything verifiable
 argv = pargs if isinstance(pargs, list) else []
 DATA_OPTIONS = {"--repo", "--root"}  # long options whose VALUE the job's work only READS
+# env options that take a SEPARATE value. Their value is NOT env's program, and mistaking it for one
+# (a) leaves the real program to be classified `exec` — a TCC-root binary launcher then verdicts 2 and
+# the unit is skipped AND DISARMED, one `-u` away from the WARN+install it gets without it — and
+# (b) stops the scan before a later `-S`, whose command line then reaches the generic loop as ONE path
+# and is reported as a broken target, failing the WHOLE install (the #3413 P1-A consequence that takes
+# `sync.sh` down). Both measured (review of #3413, round 10).
+ENV_VALUE_OPTS = ("-u", "--unset", "-C", "--chdir", "-P", "--argv0")
 launchers = []                       # what launchd actually execs
 skipped = set()                      # argv indices already reported as a launcher
 if absolute(prog):
@@ -601,13 +608,20 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                 #   `-S '<non-executable program>'`      → installed, though launchd cannot exec it
                 toks = env_split(cmd)
                 seen_prog = False
+                skip_value = False
                 for j, tok in enumerate(toks):
                     if not isinstance(tok, str) or not tok:
                         continue
                     if not seen_prog:
                         # env's FIRST POSITIONAL token is the program it execs, so it is a LAUNCHER —
-                        # exactly what the space form promotes at argv[1]. An option or a NAME=VALUE
-                        # is not the program and does not end the search.
+                        # exactly what the space form promotes at argv[1]. An option, an option's
+                        # VALUE (`-u NAME`) or a NAME=VALUE is not the program.
+                        if skip_value:
+                            skip_value = False
+                            continue
+                        if tok in ENV_VALUE_OPTS:
+                            skip_value = True
+                            continue
                         if tok.startswith("-") or ("=" in tok and not tok.startswith("/")):
                             continue
                         seen_prog = True
@@ -624,6 +638,9 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                     prev = toks[j - 1] if j and isinstance(toks[j - 1], str) else ""
                     print("%s\t%s" % ("data" if prev in DATA_OPTIONS else "exec", tok))
                 break
+            if a in ENV_VALUE_OPTS:
+                i += 2                  # `-u NAME` / `-C DIR`: the value is not env's program
+                continue
             if a.startswith("-") or ("=" in a and not a.startswith("/")):
                 i += 1
                 continue
@@ -952,6 +969,22 @@ verify_targets() {
             bad=1
             continue
         fi
+        # ⛔ A DIRECTORY CAN NEVER BE `execve`d, so an element that IS one is DATA BY FILE TYPE — that
+        # needs no role knowledge and cannot be a fail-open. It matters only for the PlistBuddy
+        # fallback, which cannot name roles at all: the four shipped `--repo {{TORTOISE_REPO}}` /
+        # `--root {{SWARM_ROOT}}` templates point at ~/Documents/GitHub/tortoise, a TCC root, so
+        # without this a python-less host skipped AND DISARMED units the python reader installs
+        # (review of #3413, round 10). Hoisted ABOVE the TCC branch, where the old `-d` exemption in
+        # the default arm could never be reached.
+        if [ "$kind" = "unknown" ] && [ -d "$arg" ]; then
+            if is_tcc_protected "$arg"; then
+                echo "    WARN TCC-protected data argument: $arg" >&2
+                echo "        a DIRECTORY is never executed, so this is DATA whatever its role. The" >&2
+                echo "        part of this job's work that reads the path is dead from launchd (#427);" >&2
+                echo "        the unit still installs, exactly as it does when the role IS derivable." >&2
+            fi
+            continue
+        fi
         # ⛔ THE TCC VERDICT COMES FIRST. A 0-byte or non-regular file INSIDE a TCC root is verdict 2
         # (skip that unit, disarm any copy) — the class this whole change exists for — not verdict 1:
         # a FAIL aborts the install and takes `sync.sh` with it.
@@ -1041,10 +1074,6 @@ verify_targets() {
                 # NON-TCC executed target: the file-type/readability guarantee applies here (existence
                 # is not readability). A TCC one was already verdicted above.
                 if ! is_tcc_protected "$arg"; then
-                    # `unknown` (no python3) + a DIRECTORY: a directory cannot be executed, so this is a
-                    # data value the fallback could not name. Failing it aborted the whole install on a
-                    # PlistBuddy-only host (the #3413 P1-A failure again).
-                    if [ "$kind" = "unknown" ] && [ -d "$arg" ]; then continue; fi
                     if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
                         echo "    unreadable or not a regular file: $arg" >&2
                         echo "        launchd would start this unit and the interpreter would die" >&2

@@ -1076,7 +1076,6 @@ OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG
         bash "$INSTALLER" 2>&1 ) )"; RC=$?
 set -e
 assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c the PlistBuddy fallback reader classifies argv[1] as an EXEC target (same rule as python)"
-assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …and does not mistake a later element for argv[0]"
 assert_not_contains "$OUT" "cannot read ProgramArguments" "§7c …and an unparseable-by-python plist is still READ by the fallback, not refused"
 
 # (c12b) READER AGREEMENT on an EMPTY element: python counts every element (enumerate), so the element
@@ -1110,7 +1109,49 @@ OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG
         bash "$INSTALLER" 2>&1 ) )"; RC=$?
 set -e
 assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c an element AFTER an empty one is still argv[1] (the two readers advance alike)"
-assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …so it is verdict-2, not excused as a launcher"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so it is verdict-2, not excused as a launcher"
+
+# (c12c) the fallback cannot name ROLES, so a TCC-protected DIRECTORY must be resolved by FILE TYPE:
+# a directory is never `execve`d, so it is DATA and the unit installs. Without this, a python-less host
+# skipped AND DISARMED the four shipped templates that pass `--repo {{TORTOISE_REPO}}` /
+# `--root {{SWARM_ROOT}}` (TORTOISE_REPO defaults to ~/Documents/GitHub/tortoise, a TCC root), while
+# the python reader installs them — and the old `-d` exemption sat inside the NON-TCC arm, so it could
+# never be reached for the case it was written for (review of #3413, round 10).
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+        <string>--repo</string>
+        <string>$PROBE_HOME/Documents/checkout</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback reader installs a claim whose TCC-protected value is a DIRECTORY"
+assert_contains "$OUT" "WARN TCC-protected data argument" "§7c …as DATA by file type (a directory is never execve'd)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the four shipped --repo/--root units are NOT skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit really is installed"
+else
+    bad "§7c …and the unit really is installed"
+fi
 
 # (c13) launchd's `Program` key IS the executed binary: `ProgramArguments[0]` is only argv[0]. A
 # `Program` pointing into a TCC tree is armed-and-dead even when every argument is farmed and readable
@@ -1469,6 +1510,38 @@ if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
 else
     ok "§7c …and nothing is installed for it (the joined-spelling fail-open)"
 fi
+
+# (c30) an env option that takes a SEPARATE value must not be mistaken for env's program. Treating
+# `-u NAME` as the program left the real (TCC binary) program to be classified `exec`, so the unit was
+# skipped AND DISARMED one `-u` away from the WARN+install the identical argv gets without it, and an
+# early break before a later `-S` let the command line reach the generic loop as ONE path — reported as
+# a broken target, failing the WHOLE install (review of #3413, round 10).
+PROBE_TCC_PY="$PROBE_HOME/Documents/checkout/.venv/bin/python"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -u FOO "$PROBE_TCC_PY" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -u NAME <TCC binary> <script> does not fail the install"
+assert_contains "$OUT" "WARN TCC-root launcher" "§7c …and `-u`'s VALUE is not taken for env's program (the real program is the launcher)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is not skipped and disarmed, as without the -u"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -u FOO -S "/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -u NAME -S '<cmd>' does not FAIL the whole install"
+assert_not_contains "$OUT" "broken target" "§7c …the scan does not stop at -u's value and leave the -S string as one path"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …and the -S command line is still classified"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …by the same verdict-2 SKIP"
+# ⛔ and the same arity inside the SPLIT string: `env -S '-u NAME <prog> …'` is env-with-options too.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "-u FOO $PROBE_TCC_PY $PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '-u NAME <TCC binary> <script>' does not fail the install"
+assert_contains "$OUT" "WARN TCC-root launcher" "§7c …and the split string's -u VALUE is not promoted as the launcher"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is not skipped and disarmed"
 
 # (c4) `env -i bash <script>`: an option AND env's program hop both sit before the script.
 set +e
