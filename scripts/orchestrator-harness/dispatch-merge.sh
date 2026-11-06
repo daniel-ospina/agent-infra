@@ -383,16 +383,23 @@ for N in "$@"; do
     else
       echo "#$N: lane-$N stopped — releasing the issue claim"
       release_issue_claim_unspawned "$N"
-      # ⛔ AND DROP THE ROW, OR THE RELEASE IS HALF A RELEASE (agent-infra#3511). This is the THIRD
-      # per-issue cleanup site in this loop, and the release above makes the issue FREE — while a row
-      # left in `$O/dispatched.txt` is exactly what makes this box skip a FREE issue until the reaper
-      # prunes it (`orch-loop.sh` reads the file and `continue`s on a hit). Same pairing as the two
-      # refusal arms above — the `wt_provision` refusal and the post-build repo/branch assertion — and
-      # named rather than line-numbered on purpose: this file's own rule is SYMBOLS, NOT LINE NUMBERS
-      # (see the note on the CI-queue release). Every arm that RELEASES the claim drops the row with it,
-      # so the two can never disagree about whether the issue is free. The reap outcome below is
-      # deliberately irrelevant to THIS question: a kept worktree is residue, the issue is still free.
-      drop_dispatched_rows "$N"
+      # ⛔ THIS IS THE THIRD PER-ISSUE CLEANUP SITE IN THE LOOP, AND IT DOES **NOT** DROP THE ROW — a
+      # KNOWN, DELIBERATE gap (#3511 review), not an oversight. The other two arms that release the
+      # claim (the `wt_provision` refusal and the post-build repo/branch assertion) also call
+      # `drop_dispatched_rows`, so "claim released ⇒ row dropped" is the invariant everywhere BUT here.
+      # The naive fix was written and reverted: dropping the row lets the NEXT cycle re-dispatch this
+      # issue, and `wt_provision`'s reuse arm had no holder probe, so the new lane could be spawned
+      # into a checkout an ORPHANED GRANDCHILD is still writing in (`wt_close` signals the pane pid
+      # only) — two writers on one branch and one checkout. The probe that would close that
+      # (`wt_live_holders` in the reuse arm) was ALSO written and reverted: its argv witness matches
+      # any process whose command line names the path, and a box's tmux SERVER inherits the argv of the
+      # client that created it (`new-session … cd '<wt>' && …`, reparented to ppid 1, argv never
+      # changes), so the probe refuses that checkout for ever and the issue becomes undispatchable on
+      # that box — a permanent false block, which is worse than the skip it fixes.
+      # So the row is kept here ON PURPOSE until the probe can tell a daemon that merely MENTIONS the
+      # path from a process WORKING in it (corroborate the argv match against the pid's own cwd), and
+      # until that probe's false-positive class is witnessed by a test. Recorded on #3511; the cost
+      # meanwhile is the bounded skip the reaper's dispatched re-check un-blacklists.
       # ── and take its EMPTY worktree back (#2033) ─────────────────────────────────────────────
       # The lane is confirmed gone and no chain will ever look at this checkout, so an empty one is
       # residue by definition — and residue is what makes the issue undispatchable everywhere.

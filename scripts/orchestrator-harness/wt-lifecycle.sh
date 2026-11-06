@@ -299,12 +299,10 @@ wt_rollback() {
 #   1 = nothing was created and nothing was left behind          (WT_RESULT says why)
 #   2 = a pre-existing state this function refuses to touch      (nothing changed)
 #   3 = ROLLBACK FAILED — residue remains, and the caller must surface it (WT_RESULT names it)
-# Idempotent: a second call for the same (path, branch) is a no-op — UNLESS a live process still
-# holds the checkout, which is refused with rc=2 rather than reported usable (see the reuse arm).
+# Idempotent: a second call for the same (path, branch) is a no-op.
 wt_provision() {
     local repo="$1" path="$2" br="$3" base="${4:-${WT_BASE:-origin/main}}"
     local created=0 oid existing_oid ahead rc wt_registered cur_canon want_canon
-    local holder="" holder_rc=0
     WT_RESULT=""
 
     [ -d "$repo" ] || { WT_RESULT="repo does not exist: $repo"; return 1; }
@@ -360,47 +358,11 @@ wt_provision() {
             cur_canon="$(wt_canon_any "$wt_registered" 2>/dev/null)" || cur_canon=""
             want_canon="$(wt_canon_any "$path" 2>/dev/null)" || want_canon=""
             if [ -n "$want_canon" ] && [ "$cur_canon" = "$want_canon" ]; then
-                # ⛔ A CHECKOUT A LIVE PROCESS STILL HOLDS IS NOT "A USABLE WORKTREE" (#3511 review, P1).
-                # This reuse arm had no holder probe, so a dispatch could be handed a checkout that an
-                # ORPHANED GRANDCHILD is still writing in: `wt_close` signals the pane pid only, so a
-                # grandchild legitimately survives the session census going `dead` — which is exactly
-                # the state `wt_reap_if_empty` names and refuses to reap (`wt_lifecycle.sh`'s live-holder
-                # gate, "a live process still holds the checkout … kept"). Before this, the only thing
-                # stopping a re-dispatch into that checkout was this box's `dispatched.txt` row — a row
-                # that is dropped the moment the claim is released, and is otherwise pruned only by
-                # refresh-candidates.sh's bounded re-check, so leaning on it is what let #3511's third
-                # arm trade one skip for two writers on one branch and one checkout (index.lock
-                # contention, attestations bound to a head the other lane moves).
-                # The probe answers in the caller's own name so the refusal is actionable, and rc 2 is
-                # the documented "refuses to touch, nothing changed". What each caller does with it is
-                # NOT uniform, so do not assume "retry next cycle" everywhere: `dispatch-merge.sh`
-                # skips the issue, releases its claim and drops its row (the next attempt RE-USES the
-                # checkout — this arm hands it out, it does not reap it — and the orphan is normally
-                # gone by then); `fix-one.sh` refunds the booked fixer attempt and ABORTS;
-                # `adopt-fix.sh` aborts.
-                # ⛔ THE TWO REPAIR ARMS ABOVE AND BELOW ARE DELIBERATELY EXEMPT, and the difference is
-                # real rather than a loophole: they do not HAND OUT the checkout, they DELETE it
-                # (`wt_rollback`: unlock, `worktree remove --force`, `rm -rf`), so a holder there is
-                # the case `wt_reap_if_empty` already governs — preserve on any doubt — and not this
-                # arm. Each is gated on evidence that the tree is unusable: the stale-`initializing`
-                # repair only fires once the record is OLDER than the lock-age floor (a younger one is
-                # REFUSED, not repaired), and the unusable-worktree repair only when HEAD cannot be
-                # resolved or is on another branch. Whether those repairs should ALSO probe for a
-                # holder is a separate question about the reaper, recorded as a residual on agent-infra
-                # #3511 rather than settled here.
-                # rc 2 from the probe itself ("the argv witness could not be evaluated") is FAIL-CLOSED,
-                # matching `wt_reap_if_empty`: handing out a checkout on an unevaluable probe is how a
-                # second writer gets in, and the cost of refusing is one cycle.
-                holder="$(wt_live_holders "$cur_canon" 2>/dev/null)"; holder_rc=$?
-                if [ "$holder_rc" != 1 ]; then
-                    WT_RESULT="a live process still holds $wt_registered (${holder:-the live-holder probe could not be evaluated — fail-closed}) — refusing to hand this checkout to a NEW lane while something is running in it; nothing was changed — retry next cycle (bash scripts/pi-reap-worktrees.sh reports it)"
-                    return 2
-                fi
                 WT_RESULT="reused existing worktree $wt_registered"
                 return 0
             fi
-            # rc=2 is the caller's documented "refuses to touch, nothing changed" answer (the callers
-            # differ in what they then do — see the note on the reuse arm's holder refusal above).
+            # rc=2 is the caller's documented "refuses to touch, nothing changed" answer, which every
+            # caller turns into skip + release-claim — the pre-PR fail-closed behaviour.
             WT_RESULT="branch $br is already checked out at $wt_registered, NOT at the requested $path — refusing to report a usable worktree at a path that does not exist"
             return 2
         else
@@ -603,39 +565,7 @@ wt_live_holders() {
             sub(/^[ \t]*[0-9]+[ \t]*/, "", cmd)
             if (index(" " chain " ", " " pid " ")) { print pid > ign; next }
             if (cmd in own) { print pid > ign; next }
-            # ⛔ THE MATCH IS PATH-BOUNDARY ANCHORED, NOT A BARE SUBSTRING (#3511 review cycle 3, P1).
-            # `index(cmd, path) > 0` makes `.../tm-1` match a process in `.../tm-10` — a DIFFERENT
-            # checkout — and on this fleet naming scheme (`tm-<issue>`, `fix-<PR>`, `adopt-<PR>`, with PRs
-            # spanning 351..3511) a sibling lane then refuses its neighbour. Until #3511 the only
-            # caller was `wt_reap_if_empty`, where a false holder merely KEEPS residue (fail-safe);
-            # the reuse arm is the first call site where a false holder SKIPS a free issue.
-            # A path matches only when the character AFTER it is not a NAME character (so `/x/tm-1`
-            # matches `/x/tm-1`, `/x/tm-1/` and `/x/tm-1/foo`, and never `/x/tm-10`), and the occurrence
-            # is not a SUFFIX of some longer path (`/data/wt/tm-1` must not match
-            # `/mnt/data/wt/tm-1`, which is a different checkout on a longer prefix — the leading
-            # `/` of the path follows that prefix character, so a bare substring test caught it too).
-            # ⛔ A SHORT OPTION GLUED TO THE PATH IS STILL A BOUNDARY (`git -C<wt>`): the char before
-            # the path is `C`, a name character, and rejecting it made a REAL holder invisible — in
-            # the one caller that DELETES (`wt_reap_if_empty`) that is a fail-safe turned fail-open,
-            # so an option letter immediately before the path counts as a boundary too.
-            # ⛔ THE OPTION MUST BE A REAL ONE, AND AT A WORD START (#3511 review cycle 5, P2): a bare
-            # `-<alnum>` before the path is not enough, because a LONGER path whose own prefix ends in
-            # `-<alnum>` (`/mnt/snap-2/…/tm-1`, `/Volumes/backup-1/…`) would be accepted as an option
-            # and re-admit the longer-prefix false positive the left test exists to reject. So: `-`,
-            # then exactly one letter, then the path — and the character before the `-` must not be a
-            # name character (or `p == 3`, where the `-` IS the first character, as in `-C/tmp/x`).
-            # `/` is not special-cased on the right: the negated class below already admits it, and
-            # saying so twice would invite the next reader to believe a narrower class is in force.
-            s = cmd
-            while ((p = index(s, path)) > 0) {
-                nxt = substr(s, p + length(path), 1)
-                prv = (p > 1) ? substr(s, p - 1, 1) : ""
-                glued_opt = (p > 2) && (substr(s, p - 2, 1) == "-") && (substr(s, p - 1, 1) ~ /^[A-Za-z]$/) && (p == 3 || substr(s, p - 3, 1) !~ /[0-9A-Za-z._-]/)
-                if (nxt !~ /[0-9A-Za-z._-]/ && (prv !~ /[0-9A-Za-z._-]/ || glued_opt)) {
-                    print pid "\targv-lists-the-worktree"; exit
-                }
-                s = substr(s, p + 1)
-            }
+            if (index(cmd, path) > 0) { print pid "\targv-lists-the-worktree"; exit }
         }' "$out" "$out")"
     rm -f "$out"
     if [ -n "$line" ]; then printf '%s\n' "$line"; rm -f "$ignore"; return 0; fi
