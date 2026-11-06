@@ -210,6 +210,17 @@ def endpoint_key(url):
     # userinfo, so no secret can ever reach a key (keys are never printed; the rule still costs one word).
     authority = u.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT (#3374 review, round 12 residual). WHATWG parses the
+    # DIGITS, so `https://api.premiselabs.co:0443/mcp/` and `:00443` both normalise to the canonical
+    # hosted url (measured with the client's own parser: `new URL(...).href` is
+    # `https://api.premiselabs.co/mcp/` for all of `:443`, `:0443`, `:00443`). Without this, those
+    # spellings keyed DIFFERENTLY, took the self-host exemption, and were PRESERVED + certified
+    # `SELFHOSTED:` with no credential check at all — the exact bypass the default-port rule above
+    # exists to close, one spelling deeper. `lstrip` rather than `int()`: it cannot raise on a
+    # 10 000-digit port (Python's int/str digit limit) and cannot turn `:00000` into a crash;
+    # `:0` stays distinct, which is what the client does too (`https://h:0/` keeps port `0`).
+    if port:
+        port = port.lstrip("0") or "0"
     # WHATWG drops a DEFAULT port; an empty one (the bare `host:` spelling) is no port at all.
     if port == "" or (port is not None and ((scheme == "https" and port == "443")
                                             or (scheme == "http" and port == "80"))):
@@ -863,7 +874,23 @@ def main(argv):
             have["tortoise"] = want
         elif ok_entry:
             if (cur.get("url") or "").strip() != (want.get("url") or "").strip():
-                if not cur.get("_selfHosted"):
+                # ⛔ THE HOSTED ENDPOINT IS NOT "THIS MACHINE'S OWN URL" (#3374 review, round 12 P2).
+                # With a SELF-HOST template, a cell whose entry is the HOSTED endpoint reached the
+                # `_selfHosted` branch below and was MARKED — measured: `--install` printed "kept this
+                # machine's own tortoise url (https://api.premiselabs.co/mcp/)" and wrote
+                # `_selfHosted: true` onto the hosted url. `--verify` then took the exemption and
+                # certified it WITHOUT any credential check, so a `${SOME_OTHER_VAR}` header (an EMPTY
+                # Bearer, #3275/#3289) came out `SELFHOSTED:` rc=0. The marker is minted here and read
+                # by the verifier, so the truth has to start here: the hosted endpoint is the hosted
+                # endpoint whatever the template asks for, it keeps its entry, and it is never marked.
+                if endpoint_key(cur.get("url")) == endpoint_key(HOSTED_DEFAULT_URL):
+                    cur.pop("_selfHosted", None)
+                    print(
+                        "NOTE: kept this cell's HOSTED tortoise endpoint (%s) — its url is the "
+                        "hosted default, not a self-host, so it is NOT marked _selfHosted and the "
+                        "hosted credential is still required" % (cur.get("url"),)
+                    )
+                elif not cur.get("_selfHosted"):
                     cur["_selfHosted"] = True
                     print(
                         "NOTE: kept this machine's own tortoise url (%s) instead of the default (%s) and marked "

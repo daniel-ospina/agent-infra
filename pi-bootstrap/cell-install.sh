@@ -927,6 +927,12 @@ def _endpoint_key(u):
     # takes the hosted path and skips the arm that refuses userinfo outright.
     authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT — `:0443` IS `:443` (MUST MATCH `merge-mcp.py`,
+    # which carries the full rationale and the measurement: the client's own parser normalises all
+    # three spellings to the canonical hosted url). Without this a leading-zero default port took
+    # the self-host exemption and was certified without any credential check.
+    if port:
+        port = port.lstrip("0") or "0"
     if port == "" or (port is not None and ((scheme == "https" and port == "443")
                                             or (scheme == "http" and port == "80"))):
         port = None
@@ -947,16 +953,42 @@ def _endpoint_key(u):
 #                                            (needs `_selfHosted`); and
 #   `want_url != HOSTED_DEFAULT_URL`       → the operator asked for a NON-hosted endpoint, so the
 #                                            entry they got is that endpoint, certified BY NAME.
+# ⛔ A HOSTED URL IS NOT "SOMEWHERE THE OPERATOR DID NOT ASK FOR" (#3374 round 12, found by
+# measurement: the arm printed `URL_NOT_DEFAULT:https://api.premiselabs.co/mcp/` — a refusal whose
+# own NAME the payload falsifies). With a SELF-HOST template the first arm fired on the cell's
+# HOSTED entry, so `merge-mcp.py`'s correct new behaviour (keep the hosted entry, never mark it)
+# produced a file this verifier then REFUSED: `verify -> install -> verify` could never converge on
+# the one endpoint the shipped template installs. The template says what the operator asked for; it
+# cannot make the hosted endpoint stop being the hosted endpoint. So a hosted url skips this arm
+# (`_url_is_hosted` below) and is judged by the hosted branch — WHICH STILL DEMANDS THE HOSTED
+# CREDENTIAL. That is the point: the bypass this closes is the *exemption*, not the endpoint.
+_url_is_hosted = _endpoint_key(url) == _endpoint_key(HOSTED_DEFAULT_URL)
 _selfhosted_shape = False
 if want_url and _endpoint_key(url) != _endpoint_key(want_url):
-    if not t.get("_selfHosted"):
-        print("URL_NOT_DEFAULT:%s" % shown_url(url))
-        sys.exit(1)
-    _selfhosted_shape = True
+    if not _url_is_hosted:
+        if not t.get("_selfHosted"):
+            print("URL_NOT_DEFAULT:%s" % shown_url(url))
+            sys.exit(1)
+        _selfhosted_shape = True
 elif want_url and _endpoint_key(want_url) != _endpoint_key(HOSTED_DEFAULT_URL):
     # The TEMPLATE requests a non-hosted endpoint and the cell points exactly there: the operator
     # declared it once, in the file this cell was built from, so no per-box `_selfHosted` is owed.
     _selfhosted_shape = True
+# ⛔ THE EXEMPTION MAY NOT REACH THE HOSTED ENDPOINT (#3374 review, round 12 P2 — a FALSE PASS).
+# Both arms above ask about the TEMPLATE and the marker; neither asked whether the url IS the hosted
+# endpoint. So a `_selfHosted`-marked entry AT the hosted url (which `merge-mcp.py` minted itself when
+# the template named a self-host — it marked "this machine's own url" on the hosted one) was certified
+# `SELFHOSTED:` WITHOUT EVER LOOKING AT ITS CREDENTIAL. Measured: `.mcp.json` = hosted url +
+# `Bearer ${SOME_OTHER_VAR}` (an EMPTY Bearer, #3275/#3289) + `_selfHosted: true`, template url
+# `https://192.168.1.5/mcp` → `SELFHOSTED:https://api.premiselabs.co/mcp/` rc=0 and LAYER VERIFIED,
+# while the SAME file against the shipped template is refused `WRONG_AUTH:${SOME_OTHER_VAR}` rc=1. The
+# endpoint that needs the key cannot be exempted from needing it by a marker or a template; the hosted
+# path is decided by the ENDPOINT, so it is decided here by key and the hosted credential is required.
+# …and it is stated as ONE invariant over BOTH arms above rather than repeated in each, so a later
+# edit to either arm cannot reintroduce the false pass by forgetting it (this file's round-12
+# pattern: the rule was written per-branch and one branch was missed).
+if _selfhosted_shape and _url_is_hosted:
+    _selfhosted_shape = False
 if _selfhosted_shape:
     # ⛔ `_selfHosted` IS AN EXEMPTION, NOT A LICENCE TO CERTIFY ANY STRING (#3374 review P2). The
     # branch used to print SELFHOSTED and exit 0 for ANY marked url — including a SCHEME-LESS one
@@ -1012,7 +1044,25 @@ else:
         print("WRONG_AUTH:%s" % (("${%s}" % _m.group(1)) if _m
                                  else "<a literal, not a ${VAR} reference — value withheld>"))
         sys.exit(1)
-    print("OK:%s:%s" % (shown_url(url), auth))
+    # ⛔ THE SUCCESS MARKER PRINTED THE HEADER VERBATIM, SO THE LEAK SURVIVED ONE BRANCH OVER (#3374
+    # review, round 12 P2). `HOSTED_AUTH` admits `${VAR:-<anything>}` — a spelling the client DOES
+    # support (`extensions/mcp-client/index.ts`: `${VAR:-default}`, expanded recursively) — so a
+    # literal default is a value that reaches the wire, and it went into BOTH the `--verify` and the
+    # `--install` log on the branch that fires for a CORRECT config: measured,
+    # `Bearer ${TORTOISE_MCP_API_KEY:-hunter2NOTATOKEN}` printed in full, `rc=0`. An operator needs
+    # WHICH VARIABLE, and a name is not a secret; a default is a value, so it is withheld.
+    # ⛔ AND THE NAME MUST BE THE WHOLE NAME (#3374 round 12, found by measurement). The first cut
+    # used `\$\{[A-Za-z_][A-Za-z0-9_]*` with NO closing brace, so the marker printed
+    # `OK:<url>:${TORTOISE_MCP_API_KEY` — a TRUNCATED variable name that no reader can paste back,
+    # and which made the arm asserting the certified marker fail on a correct config. Taking the name
+    # from `HOSTED_AUTH`'s own match is what makes that impossible: the name printed here is by
+    # construction one the refusal branch above accepts, so the marker can never name a variable the
+    # verifier would have rejected. Only the NAME is printed — a `${VAR:-default}` default is a
+    # literal value that reaches the wire, so it is DROPPED rather than reproduced.
+    _am = HOSTED_AUTH.match((auth or "").strip())
+    print("OK:%s:%s" % (shown_url(url),
+                        ("${TORTOISE_%s_KEY}" % _am.group(1)) if _am
+                        else "<a header this verifier did not recognise — withheld>"))
 PY
 }
 
@@ -1605,6 +1655,12 @@ def key(u):
     # takes the hosted path and skips the arm that refuses userinfo outright.
     authority = s.split("://", 1)[1].split("/", 1)[0].split("?", 1)[0].split("#", 1)[0]
     prefix = "userinfo@" if "@" in authority else ""
+    # ⛔ A LEADING ZERO IS NOT A DIFFERENT PORT — `:0443` IS `:443` (MUST MATCH `merge-mcp.py`,
+    # which carries the full rationale and the measurement: the client's own parser normalises all
+    # three spellings to the canonical hosted url). Without this a leading-zero default port took
+    # the self-host exemption and was certified without any credential check.
+    if port:
+        port = port.lstrip("0") or "0"
     if port == "" or (port is not None and ((scheme == "https" and port == "443")
                                             or (scheme == "http" and port == "80"))):
         port = None
