@@ -266,6 +266,24 @@ function residual(pre, tail, s, name, f, ln,   p, t2, v) {
   # AND spaces with the same rule `cmdpos` uses, then anchor at end-of-token.
   p = pre
   gsub(/[ \t"']+$/, "", p)
+  # ⛔ A `for`/`select` LOOP VARIABLE IS AN ASSIGNMENT (review round 3, P2 — measured):
+  # `for AGENT_X_REFUSED in 83; do …; done` binds 83 into the name exactly as `X=83` does
+  # (`bash -c 'for AGENT_X_REFUSED in 83; do exit "$AGENT_X_REFUSED"; done'` → 83), yet the operator
+  # chain saw no `=` and this residual arm matched none of its shapes, so the line produced NO ROW
+  # and the verdict stayed GREEN over a real duplicate of the skew code. It is NOT covered by the
+  # STATED LIMIT above: that scopes out a token with "NO assignment operator AND NO ASSIGNMENT BUILTIN
+  # writing it", and a loop binding is a write. Claimed from `in`; anything that is not one readable
+  # literal (a multi-value list, a computed operand) is REFUSED rather than silently claimed, which
+  # is this arm's standing rule. Gated on the keyword in COMMAND position so an ordinary argument
+  # that merely contains the token stays silent.
+  if (p ~ /(^|[ \t;&|({])(for|select)$/ && tail ~ /^[ \t]+in[ \t]/) {
+    t2 = tail
+    sub(/^[ \t]+in[ \t]+/, "", t2)
+    v = valof(t2)
+    if (t2 ~ /^[0-9]+[ \t]*([;&]|$)/ && v != "") row("claim", name, v, f, ln)
+    else                                        print "unparseable", name, s, f, ln
+    return
+  }
   if (p ~ /(^|[ \t;&|({])printf[ \t]+-v$/) {
     # The NAME may be QUOTED (`printf -v "X" %d 83`), in which case `tail` begins with the CLOSING
     # quote and `printfval` sees three fields instead of two (review of PR #3237, finding 2 — this
@@ -383,7 +401,7 @@ function selfdefault(nm, rhs,   m, head) {
 #       n+=1
 #       if fam.search(s[m.start():]): hits+=1
 #   print(n,hits)"
-#   → 1132 0
+#   → 1149 0
 # ZERO. So this costs the real tree NOTHING, and the real-tree scan is byte-identical (`claims=15`,
 # `unparseable: none`, RC=0). A model would have bought nothing it did not also risk.
 # This SUPERSEDES the earlier "an inline comment is documentation too" rule, which was added to silence
@@ -494,7 +512,10 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
   # and `codes_verdict` REDs on it. Two filters keep it precise: the token must be in assignment
   # position (`cmdpos`), and the OPERAND must READ AS a 70..89 code — so `MEM_BUDGET_PCT=75` in prose,
   # `rc=75` lowercase, `FOO=$bar` and the like never appear. Measured on this tree it yields EXACTLY
-  # the 15 family claims and nothing else, which is the property the arm asserts.
+  # the 15 family claims and nothing else. ⛔ No arm pins that COUNT (`_cv_n` is only compared to 0),
+  # so this line is a MEASUREMENT, not an assertion — re-measure it when the deploy unit changes. It
+  # said 14 for one review round because nothing caught the drift, which is why the distinction is
+  # written down instead of the number being trusted.
   # ⛔ THE OPERAND IS READ WITH `valof`, NOT MATCHED BARE (review of PR #3237, P2 at head 5e6ab20c).
   # The first cut's regex required a BARE two-digit literal, so the SAME declaration red or green
   # depending on how it was SPELLED — measured through the shipped predicate on a copy of the deploy
@@ -529,8 +550,18 @@ function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, 
     # `_REFUSED=81` → 0 rows, verdict GREEN (bash: `_REFUSED=81; exit "$_REFUSED"` → 81). One
     # population, one predicate.
     if (_nm ~ /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) continue
-    if (!cmdpos(_p)) continue
-    _vv = codeval(_fr)
+    if (_p ~ /(^|[ \t;&|({])(for|select)$/ && _fr ~ /^[ \t]+in[ \t]/) {
+      # ⛔ THE FOREIGN NET WAS BLIND TO THE SAME SHAPE (review round 3, P2 — measured): the loop
+      # binding carries no `=`, and `cmdpos("for ")` is false, so `for AGENT_MEM_GATE in 81` emitted
+      # no row at all — the same code declared under a name outside the family, invisible. Read the
+      # operand from `in`, so the two nets see one population.
+      _t3 = _fr
+      sub(/^[ \t]+in[ \t]+/, "", _t3)
+      _vv = codeval(_t3)
+    } else {
+      if (!cmdpos(_p)) continue
+      _vv = codeval(_fr)
+    }
     if (_vv != "") print "foreign", _nm, _vv + 0, f, LN
   }
   rest = scan
@@ -2722,12 +2753,35 @@ codes_verdict "$_codemut_dir"
 case "$CODE_MSG" in *"absent: key-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
 ck "(mutation d2) the ONLY declarer of 82 (key-gate.sh) is REFUSED when absent — it fell outside the required set, so its loss scanned CLEAN (rc=$CODE_RC; $CODE_MSG)" $rc
 
-# (e) FINDING 1, the root case: a scan that matches NOTHING. This is the shape a blind parser produces
-# on a tree it does not understand, and in the first cut it read as a clean pass.
+# (d3) A LOOP VARIABLE IS A DECLARATION (review round 3, P2 — measured). `for X in 83` binds 83 exactly
+# as `X=83` does. Neither net saw it: the operator chain needs an `=`, and `cmdpos("for ")` is false,
+# so the line produced 0 rows and a GREEN verdict over a real duplicate of the skew code. Both nets are
+# exercised — the FAMILY name must COLLIDE on 83, and a NON-family name must be a `foreign` row, since
+# the same code under a different constant is still one code.
+for _loopshape in for select; do
+  _codemut_dir="$(_codemut "loop-$_loopshape")"
+  printf '\n%s AGENT_NEW_GATE_REFUSED in 83; do echo x; done\n' "$_loopshape" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+  ck "(loop/$_loopshape) a \`$_loopshape\` LOOP VARIABLE over the skew code COLLIDES — a loop binding is a declaration, not a read (rc=$CODE_RC; $CODE_MSG)" $rc
+  _codemut_dir="$(_codemut "loopforeign-$_loopshape")"
+  printf '\n%s AGENT_MEM_GATE in 81; do echo x; done\n' "$_loopshape" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
+  ck "(loop/$_loopshape) a \`$_loopshape\` LOOP VARIABLE outside the family is a \`foreign\` row — the foreign net was blind for the same reason (rc=$CODE_RC; $CODE_MSG)" $rc
+done
+
+# (e) FINDING 1, the root case: a population the scan CANNOT READ. ⛔ This is NOT the `claims=0`
+# branch: with an empty directory the glob does not expand, awk cannot open the literal `*.sh`, and
+# the arm reds on `absent:` + `scan-unreadable:` (exit 2). `_cv_n -eq 0` cannot decide on its own — an
+# empty `absent:` list requires one row from EACH required declarer, so `_cv_n >= 5` whenever the
+# other terms are clean. What this arm therefore proves is the two fail-closed rules it actually
+# exercises — a required declarer that is ABSENT is REFUSED, and a scan that CANNOT RUN is REFUSED —
+# and it must not be described as the third, which the absent-declarer rule already implies.
 rm -rf "$TMP/codemut-nothing"; mkdir -p "$TMP/codemut-nothing"
 codes_verdict "$TMP/codemut-nothing"
 [ "$CODE_RC" -eq 1 ]; rc=$?
-ck "(mutation e) a scan that finds NO claim at all is REFUSED — an empty parse is not a clean parse (rc=$CODE_RC; $CODE_MSG)" $rc
+ck "(mutation e) a population the scan CANNOT READ is REFUSED (absent declarers + an unreadable scan), never a clean pass (rc=$CODE_RC; $CODE_MSG)" $rc
 
 # ══ AND THE PARSE MUST CLASSIFY, NOT DISCARD (review round 2, the BLOCKING finding) ═══════════════
 # ⛔ WHAT WAS MEASURED ON THE HEAD BEFORE THIS SECTION (the shipped predicate, driven directly):
