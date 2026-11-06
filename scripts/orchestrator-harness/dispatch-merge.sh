@@ -140,7 +140,7 @@ reap_unused_worktree() { # <issue> <why> — reports; never changes the caller's
   # happen and then contradicted itself on the next line — and the dispatch log is the only record of
   # what the box did to a lane's checkout, read by the next lane and by the human triaging a stuck
   # issue. The reason is stated; the verdict line that follows says what actually happened.
-  echo "#$1: $2"
+  echo "#$1: $2 — taking the checkout back"   # MUTANT M5
   # ⛔ AND THE VERDICT IS CLEARED AND THE VERB PROVEN PRESENT FIRST. `wt_provision` leaves its own
   # verdict in `WT_RESULT`, and `$WTL` is sourced beside this script with NO verb guard (the file only
   # has to source cleanly), so a script directory whose module predates `wt_reap_if_empty` ran
