@@ -3350,10 +3350,18 @@ GHOPEN3
   done
   IFS="$_nogh_ifs"
   if [ -x "$NOGH_BIN/git" ] && [ -x "$NOGH_BIN/bash" ] && [ ! -x "$NOGH_BIN/gh" ]; then
-    _rpt_nogh_parked="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH_BIN" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
-    case "$_rpt_nogh_parked" in
-      *" 2  (raw marker count"*) echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
-      *) echo "  ❌ with no gh on PATH the parked line printed [$_rpt_nogh_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
+    _rpt_nogh_out="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH_BIN" bash "$REPORT" 2 2>/dev/null )"
+    # ⛔ THE ARM MUST IDENTIFY THE BRANCH, NOT JUST THE SENTENCE (review cycle 3, P2 — measured).
+    # Both degraded paths print a raw-count note, so `*" 2  (raw marker count"*` matched either: the
+    # reviewer deleted report.sh's whole `norepo)` case and this arm stayed GREEN on the `*)`
+    # (unreadable-listing) branch, whose note ends "from an unreadable listing" instead. The `norepo`
+    # branch is the one that also degrades the STALE line to `<needs a repo checkout and gh>`, so both
+    # fragments are required here — the parked note's own wording AND that stale line.
+    case "$_rpt_nogh_out" in
+      *"parked (needs a human): 2  (raw marker count"*"without a repo checkout and gh"*"stale evidence (needs re-review): <needs a repo checkout and gh>"*)
+        echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW — on the `norepo` branch, which the stale line names"; PASS=$((PASS+1)) ;;
+      *)
+        echo "  ❌ the no-gh run did not read as the `norepo` branch: [$(printf '%s\n' "$_rpt_nogh_out" | grep -E 'parked \(needs a human\)|stale evidence' | tr '\n' ' ')] — expected the RAW count plus the `norepo` stale line"; FAIL=$((FAIL+1)) ;;
     esac
   else
     echo "  ❌ could not build a gh-less PATH (git=$([ -x "$NOGH_BIN/git" ] && echo yes || echo no) bash=$([ -x "$NOGH_BIN/bash" ] && echo yes || echo no) gh=$([ -x "$NOGH_BIN/gh" ] && echo present || echo absent)) — the no-gh arm is unproven"; FAIL=$((FAIL+1))

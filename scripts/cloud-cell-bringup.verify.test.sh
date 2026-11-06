@@ -274,12 +274,19 @@ cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() 
 # to hard-code the path /other/cell/orchestrator and never create it, which put the arm on the
 # pre-#2315 branch and made it red on a correct supervisor.
 #
-# ⛔ NO APOSTROPHES IN THIS BLOCK. `main-worktree-guard` tokenises a script it must read, splitting
-# command segments on a newline ONLY outside a quote (`_wtCommandSegments`, in
-# extensions/main-worktree-guard/index.ts). One unbalanced apostrophe therefore swallows the whole
-# rest of the file into a single quoted run, the guard can no longer resolve the script statically,
-# and it fails closed BEFORE executing it — so a lane asked to re-verify #3514 gets a refusal
-# instead of a result. Keep this block apostrophe-free.
+# ⛔ KEEP THE APOSTROPHES IN THIS BLOCK PAIRED — WITHIN ONE LINE. `main-worktree-guard` tokenises a
+# script it must read, splitting command segments on a newline only outside a quote
+# (`_wtCommandSegments`, extensions/main-worktree-guard/index.ts): a single-quote or double-quote
+# character TOGGLES the quoting state. An UNPAIRED one therefore turns quoting on and merges the rest
+# of the file into one quoted run, so a command after it can no longer be resolved statically and the
+# guard fails closed BEFORE executing it — a lane asked to re-verify #3514 gets a refusal instead of a
+# result. A pair is harmless, and this block carries several (the heredoc tag, the FOREIGN_O default,
+# the cell-doctor argument — each quoted); a pair that STRADDLES a newline is not harmless, because
+# that newline is inside the quote and two command segments merge. The rule is pairing, not absence:
+# this comment used to say "NO APOSTROPHES IN THIS BLOCK" over a block holding eight of them, which
+# is the kind of prose a reader acts on. (These comment lines are part of the text the tokeniser
+# reads, so an unpaired apostrophe HERE counts too — which is why this paragraph names no quoted
+# token and contains none.)
 #
 # Note what does NOT discriminate here: the "message carries the state dir" arm is
 # content-sensitive (it reddens when the message stops naming the dir) but it is green on BOTH

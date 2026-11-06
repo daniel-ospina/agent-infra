@@ -2667,7 +2667,7 @@ if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
   # gap was that nothing forced the builder to be re-checked when the call it mutates changed.
   # What makes the pre-fix form pre-fix is the PIPE; a capture keeps that the only thing this sed
   # decides, through any future change of flags.
-  sed -E 's#if command grep (.*) <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep \1; then return 0; fi#' \
+  sed -E 's#if command grep (.*) <<<"[$]body"; then return 0; fi#if { printf "%s\\n" "$body"; printf "%s\\n" "$body"; } | command grep \1; then return 0; fi#' \
     "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
   # ⛔ A SED THAT MATCHED NOTHING IS NOT A MUTANT. The predecessor tested `grep -q 'printf "%s'`,
   # which was sound only because this function contains no OTHER `printf` — a coincidence, not a
@@ -2701,25 +2701,31 @@ SH
     PM_BODY="$2" PM_PATCH_LOG="$3" HOME="$PMH" PATH="$PMB:$PATH" \
       bash -c 'set -uo pipefail; . "$1"; post_marker owner/repo 42 "$2"; printf "%s" "$?"' _ "$1" "MARKER-LINE-42" 2>/dev/null
   }
-  # ⛔ 1050 LINES, NOT 1200, AND THE BOUND IS NOT THE PIPE — IT IS `MAX_ARG_STRLEN`. `pm_drive` hands
+  # ⛔ 1050 LINES, NOT 1200, AND ONE BOUND IS NOT THE PIPE — IT IS `MAX_ARG_STRLEN`. `pm_drive` hands
   # the body to the child as ONE environment string, and Linux caps a single arg/env string at 131,072
   # bytes; a 1200-line body is 145,214 and the child never starts, so (32c)/(32d)/(32e) fail for a
   # reason that has nothing to do with `post_marker` (measured in a Linux container: "Argument list too
   # long"). Passing it by file would NOT dodge this either — `post_marker` also hands the patched body
-  # to `jq -n --arg body`, argv under the same cap. So the fixture must sit in the window ABOVE the
-  # 64 KiB pipe capacity and BELOW 131,072: 1050 lines x 120 chars ≈ 127 KB. Both bounds are asserted
-  # below, so this cannot silently drift out of the window.
+  # to `jq -n --arg body`, argv under the same cap. So the body must stay BELOW 131,072 and this bound
+  # is asserted below.
+  # ⛔ AND THE SIGPIPE WINDOW IS NOT BODY-SIZE ALONE (measured, review cycle 3 — this was a ~20% FLAKE
+  # of (32c) before the mutant's producer was doubled). A single `printf` of a 127,064-byte body only
+  # just exceeds the 65,536-byte pipe capacity, and GNU grep's single read frees up to another 65,536
+  # before it exits — so on ~1 run in 5 the writer FINISHES before grep exits, no SIGPIPE is raised,
+  # and the pre-fix form correctly finds the marker. Driving the same mutant 60 times gave 46
+  # re-patch / 14 no-re-patch. The window is capacity + ONE READER READ ≈ 131,072 WRITTEN BYTES, which
+  # a single pass of this body cannot guarantee — so the MUTANT writes the body twice (~254 KB). The
+  # body stays small enough to be exec'd; the producer is what makes the window deterministic.
   filler="$(printf 'x%.0s' $(seq 1 120))"
   pm_big="$(for _i in $(seq 1 1050); do printf '%s\n' "$filler"; done)"
   pm_with_marker="$(printf '%s\n%s\n' "MARKER-LINE-42" "$pm_big")"
   pm_bytes=${#pm_with_marker}
-  # BOTH bounds. Too small and the SIGPIPE window never opens (the arm passes vacuously); too large and
-  # the child cannot even be exec'd on Linux (MAX_ARG_STRLEN = 131,072), which reds the arm for a reason
-  # that is not the code under test — measured, not hypothesised.
+  # The body bound, for the ARGV reason above. Larger is NOT better here — above MAX_ARG_STRLEN the
+  # child cannot be exec'd at all — and the SIGPIPE window is the mutant's job, not the body's.
   if [ "$pm_bytes" -gt 65536 ] && [ "$pm_bytes" -lt 131072 ]; then
-    pass "(32b) the fixture body is $pm_bytes bytes — ABOVE the 64 KiB pipe buffer (or the SIGPIPE window never opens) and BELOW Linux's 131,072-byte MAX_ARG_STRLEN (or the driver cannot exec at all)"
+    pass "(32b) the fixture body is $pm_bytes bytes — ABOVE the 64 KiB pipe buffer and BELOW Linux's 131,072-byte MAX_ARG_STRLEN, so the child can be exec'd and one pass of the writer already fills the pipe"
   else
-    fail "(32b) the fixture body is $pm_bytes bytes — it must be in the window (65536, 131072): below it the pre-fix form passes too, above it the child cannot be exec'd on Linux"
+    fail "(32b) the fixture body is $pm_bytes bytes — it must be in the window (65536, 131072): above it the child cannot be exec'd on Linux, and one pass below 65536 would not even fill the pipe"
   fi
   # (32c) NON-VACUITY: the PRE-FIX form, same body, must re-patch.
   : > "$TMP/pm-old.log"
