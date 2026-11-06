@@ -27,6 +27,9 @@
 #  13  level 4 is a LOOP: a fix moves the head, and the next pass reviews again → (drives review_disp_decide)
 #  14  the escape VALVE: a level holding the room still QUEUES, and cannot record what it cannot spend
 #                                                                              → mutant: M19
+#  12b what LEVEL 1 does when it holds: it has NO ACTOR, its hold is unbounded while the PR path
+#      produces, and the issue that would repair main matches none of the shipped repair patterns
+#      (pinned as STATE — the action is an open OWNER DECISION, not decided here)
 #
 # ⛔ EVERY FUNCTION UNDER TEST IS EXTRACTED FROM THE SHIPPED SCRIPT, never re-implemented here: a
 # mirror would grade itself. Every mutation is applied to a COPY of the shipped file and the SAME
@@ -501,6 +504,87 @@ ck "…and a DIFFERENT app publishing the same job name is a separate check (the
 ck "…and an UNMEASURED / ABSENT record is read as NOT red by the level" \
    "$( ( . "$FNS"; cascade_main_red "/nonexistent/state" ) 2>/dev/null )" "0"
 
+# ── 12b. WHAT LEVEL 1 ACTUALLY DOES WHEN IT HOLDS (review P1, 2026-11-06) ────────────────────────
+# ⛔ THE FINDING: level 1's hold has NO ACTOR, so a red main closes the issue path and does nothing
+# toward fixing main. On a repo whose main carries `push`-only reds the hold is not a corner case but
+# the steady state, so the reviewer asked for "red main + free room ⇒ what happens" to be DRIVEN
+# rather than asserted as a level number.
+# ⛔ WHAT THIS SECTION DECIDES, AND WHAT IT DELIBERATELY DOES NOT. Whether level 1 SHOULD dispatch a
+# main repair or narrow its input to what the merge rail measures is a behavioural policy choice and
+# an OWNER DECISION — this change implements neither (`docs/ops/self-healing-contract.md` §6, "LEVEL 1
+# CAN HOLD WITHOUT AN ACTOR"). What IS gradeable without that decision is the STATE: (a) the hold is
+# unbounded while the PR path is producing, because the only release that exists keys on an INERT PR
+# path; (b) nothing in the controller acts on level 1; (c) the repair channel the level depends on is
+# unreachable from the issue batch. Each is pinned so the decision is made against evidence, and so a
+# future implementation of the action has to come past these assertions.
+echo
+echo "=== 12b. level 1: the hold has no actor, and its repair channel is unreachable ==="
+# ⛔ THE PREDICATE IS THE SHIPPED ONE. `pl_escape_open` and friends are EXTRACTED from
+# pr-owner-liveness.sh into the rig (a mirror here would grade itself), then driven below.
+L1H="$TMP/l1help.sh"
+: > "$L1H"
+for _f in pl_num pl_idle_file pl_idle_streak pl_streak_reset pl_note_pass pl_escape_bound pl_escape_open; do
+  _body="$(ex "$_f" "$HERE/pr-owner-liveness.sh")"
+  if [ -z "$_body" ]; then bad "could not extract $_f() from pr-owner-liveness.sh — it moved or was reformatted"; fi
+  printf '%s\n' "$_body" >> "$L1H"
+done
+. "$L1H"
+# (a) THE STEADY STATE. `pl_note_pass` resets the inert streak on a POSITIVE spawn count by design, so
+# `pl_escape_open` keeps answering NO however many passes level 1 holds for — the reviewer's measured
+# point, driven rather than restated.
+l1_escape_over_passes() { # <passes> <spawns-per-pass> <unowned> -> "<streak> <escape-open?>"
+  local d="$TMP/l1-$1-$2" n=0 i=0 sp=no
+  rm -rf "$d"; mkdir -p "$d"
+  while [ "$i" -lt "$1" ]; do
+    n="$( pl_note_pass "$d" "$2" "$3" 2>/dev/null )"
+    i=$(( i + 1 ))
+  done
+  pl_escape_open "$d" "$3" 3 >/dev/null 2>&1 && sp=yes
+  printf '%s %s\n' "${n:-?}" "$sp"
+}
+ck "a level-1 hold with the PR path PRODUCING never trips the drain escape (streak stays 0 over 6 passes)" \
+   "$(l1_escape_over_passes 6 1 2)" "0 no"
+ck "…while the SAME hold on an INERT PR path DOES trip it at the bound (the contrast that keeps this meaningful)" \
+   "$(l1_escape_over_passes 3 0 2)" "3 yes"
+
+# (b) NOTHING IN THE CONTROLLER ACTS ON LEVEL 1. Counting `FIX_MAIN` on non-comment lines turns the
+# absence of an actor into a checkable fact instead of a reviewer's impression — and it goes RED the
+# moment someone implements one, which is the point: the action is an owner decision, so it must
+# arrive with this assertion updated and the documented state corrected, never by drift.
+# ⛔ DECLARED LIMIT OF THIS PIN, so it is not read as a proof it does not give: it is NAME-based. It
+# fires when an actor is added KEYED ON THE LEVEL'S NAME (`FIX_MAIN`), which is how a level branch is
+# written in this file (`cascade_level_name` is the one map every other consumer uses) — it cannot
+# prove that no actor exists under some other spelling. It is a tripwire on the likely shape, not a
+# termination proof. Counted as OCCURRENCES, not lines: an actor appended to the existing mapping line
+# is still an actor, and a line-count would have called that mutant indistinguishable (measured — M20
+# failed exactly that way on the first form of this probe).
+ck "level 1 has NO actor: FIX_MAIN occurs on non-comment lines exactly ONCE (the name map)" \
+   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -o 'FIX_MAIN' | wc -l | tr -d ' ')" "1"
+ck "…and that one line is cascade_level_name's mapping, not a dispatch" \
+   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep 'FIX_MAIN' | sed 's/^[[:space:]]*//')" '1) echo FIX_MAIN ;;'
+
+# (c) THE REPAIR CHANNEL IS UNREACHABLE FROM THE ISSUE BATCH. Level 1's only shipped repair route is
+# the issue `ci-main.yml`'s `auto-file-on-failure` files — and that issue is recognised as a main-red
+# repair by NOTHING: its title is `main broken by merge: …`, which matches none of
+# `land_backlog_exempt`'s patterns. Driven against the SHIPPED pattern list (extracted below), so the
+# two cannot drift back into accidental agreement in either direction.
+GATE="$HERE/spawn-gate.sh"
+CIW="$HERE/../../.github/workflows/ci-main.yml"
+ck "the issue ci-main.yml auto-files is TITLED 'main broken by merge…' (the fixture is the shipped template)" \
+   "$(grep -c 'main broken by merge: \${failed.join' "$CIW" 2>/dev/null | tr -d ' ')" "1"
+repair_pat() { sed -n 's/^[[:space:]]*\(\*base-red\*.*\))[[:space:]]*$/\1/p' "$GATE" 2>/dev/null | head -1; }
+ck "the shipped main-red repair pattern list was FOUND in spawn-gate.sh (a rename must not skip this)" \
+   "$([ -n "$(repair_pat)" ] && echo found || echo missing)" "found"
+repair_match() { # <title> -> "matches" when the SHIPPED pattern list accepts it
+  local pat; pat="$(repair_pat)"
+  [ -n "$pat" ] || { echo NO-PATTERN; return 0; }
+  ( eval "case \"\$1\" in $pat) echo matches ;; *) echo no ;; esac" )
+}
+ck "⛔ …and the auto-filed title matches NONE of them — level 1's repair route is unreachable" \
+   "$(repair_match 'main broken by merge: script-validate')" "no"
+ck "…while the pattern list still accepts the shape it was written for (the control half)" \
+   "$(repair_match 'main-red: script-validate broken')" "matches"
+
 # ── 13. LEVEL 4 IS A LOOP, NOT A SINGLE PASS ────────────────────────────────────────────────────
 # ⛔ "review once and drop it" is the defect. The shipped loop's terminator is the (PR, HEAD) key: a
 # CLEAN review recorded at this head refuses a second reviewer, and a FIX moves the head — so the next
@@ -899,6 +983,48 @@ PEOF
 export MODP="$HERE/pr-owner-liveness.sh"
 mut "M19 the escape opens the issue path WITHOUT granting the slots it spends (the level-holds no-op restored)" \
     's/^    if \[ "${CASCADE_ROOM:-1}" -ge 1 \] 2>\/dev\/null && \[ "${CASCADE_UPN_UNREADABLE:-0}" = "0" \] && \[ "${CASCADE_ISSUE_SLOTS:-1}" -le 0 \] 2>\/dev\/null; then$/    if false; then/' "$TMP/p-pair.sh"
+
+# ── 12b-M. MUTANTS FOR THE LEVEL-1 STATE PINS ────────────────────────────────
+# ⛔ `mut`/`mutlo` only ever mutate `$ORCH`/`$LO` and grade FUNCTIONS. The 12b pins are SOURCE facts
+# across three files (`orch-loop.sh`, `spawn-gate.sh`, `ci-main.yml`), so they need their own runner
+# — reusing `mut` with a grep probe would mutate the controller and grade a file the probe does not
+# read, which is the vacuous-mutant shape this suite exists to refuse.
+mutfile() { # <label> <file> <sed-expr> <probe-file>  (probe reads $TGT, prints `yes` when it holds)
+  local label="$1" file="$2" expr="$3" probe="$4" m got mutgot
+  m="$TMP/mf-$(basename "$file")"
+  sed "$expr" "$file" > "$m" 2>/dev/null
+  if [ ! -s "$m" ] || cmp -s "$m" "$file"; then
+    bad "$label — the mutation changed NOTHING (a vacuous mutant)"; rm -f "$m"; return
+  fi
+  got="$(    TGT="$file" bash "$probe" 2>/dev/null )"
+  mutgot="$( TGT="$m"    bash "$probe" 2>/dev/null )"
+  rm -f "$m"
+  if [ "$got" = "yes" ] && [ "$mutgot" != "yes" ]; then
+    ok "$label  (shipped=yes, mutant=no)"
+  else
+    bad "$label — shipped=[${got:-<empty>}] mutant=[${mutgot:-<empty>}]: the assertion does NOT discriminate"
+  fi
+}
+
+# (b) an ACTOR on level 1 — the pin's whole job is to be RED the day one is added.
+cat > "$TMP/p-l1actor.sh" <<'PEOF'
+# OCCURRENCES, not lines — an actor appended to the mapping line is still an actor.
+n="$(grep -vE '^[[:space:]]*#' "$TGT" 2>/dev/null | grep -o 'FIX_MAIN' | wc -l | tr -d ' ')"
+[ "$n" = "1" ] && echo yes || echo no
+PEOF
+mutfile "M20 an ACTOR is added for level 1 (a spawn keyed on FIX_MAIN) -> the 'no actor' pin goes RED" \
+    "$ORCH" 's/^    1) echo FIX_MAIN ;;$/    1) echo FIX_MAIN ;; spawn_main_repair "FIX_MAIN"/' "$TMP/p-l1actor.sh"
+
+# (c) the repair pattern widened to accept the auto-filed title — the pin must catch that too, in the
+# OTHER direction from the control half above (widening makes the gap vanish and the pin go RED).
+cat > "$TMP/p-l1pattern.sh" <<'PEOF'
+pat="$(sed -n 's/^[[:space:]]*\(\*base-red\*.*\))[[:space:]]*$/\1/p' "$TGT" 2>/dev/null | head -1)"
+[ -n "$pat" ] || { echo no; exit 0; }
+r="$( ( eval "case \"main broken by merge: script-validate\" in $pat) echo matches ;; *) echo no ;; esac" ) )"
+[ "$r" = "no" ] && echo yes || echo no
+PEOF
+mutfile "M21 the main-red pattern widens to accept 'main broken by merge' -> the unreachable-channel pin goes RED" \
+    "$HERE/spawn-gate.sh" 's/^    \*base-red\*|\*main-red\*/    *base-red*|*main-red*|*broken*/' "$TMP/p-l1pattern.sh"
 
 # ── 10. THE OVERRIDE IS RECORDED, NOT SILENT ───────────────────────────────────────────────────
 echo
