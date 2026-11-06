@@ -575,25 +575,44 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
     while i < len(argv):
         a = argv[i]
         if isinstance(a, str):
-            if a in ("-S", "--split-string") or a.startswith("--split-string="):
-                if "=" in a:
-                    cmd = a.split("=", 1)[1]
-                    skipped.add(i)      # the ELEMENT carries the command line: mark it consumed, or the
-                                        # loop below re-reads it as `--opt=<value>` and emits the whole
-                                        # string as ONE path ("broken target: /bin/bash /x.sh").
-                else:
+            if a in ("-S", "--split-string") or a.startswith("--split-string=") or a.startswith("-S"):
+                if a in ("-S", "--split-string"):
                     i += 1
                     cmd = argv[i] if i < len(argv) and isinstance(argv[i], str) else ""
-                    skipped.add(i)
-                # ⛔ THE SAME TWO RULES THE argv LOOP APPLIES, because `-S` IS a command line and a
+                elif a.startswith("--split-string="):
+                    cmd = a.split("=", 1)[1]
+                    # the ELEMENT carries the command line: mark it consumed, or the loop below
+                    # re-reads it as `--opt=<value>` and emits the whole string as ONE path
+                    # ("broken target: /bin/bash /x.sh").
+                else:
+                    cmd = a[2:]         # getopt's JOINED spelling: `-S'<cmd>'` is `-S '<cmd>'`, and
+                                        # it is how the form is usually copied out of a shell.
+                                        # Without this the string fell into the generic option branch,
+                                        # was dropped, and the unit installed with NO verdict at all
+                                        # (review of #3413, round 9).
+                skipped.add(i)
+                # ⛔ THE SAME THREE RULES THE argv LOOP APPLIES, because `-S` IS a command line and a
                 # separate `startswith("/")` test made it disagree with the space form in BOTH
-                # directions (measured on the previous head, review of #3413 round 8):
-                #   `-S '/bin/bash --script=<TCC>'`  → no verdict at all, unit INSTALLED (fail-open)
-                #   `-S '/bin/bash <ok> --repo <TCC>'` → filed as EXEC, unit SKIPPED and DISARMED,
-                #                                       while the space form WARNs and installs.
+                # directions (measured, review of #3413 rounds 8-9):
+                #   `-S '/bin/bash --script=<TCC>'`      → no verdict at all, unit INSTALLED
+                #   `-S '/bin/bash <ok> --repo <TCC>'`   → filed as EXEC, unit SKIPPED and DISARMED
+                #   `-S '<TCC binary> <script>'`         → no launcher promotion, so SKIPPED+DISARMED
+                #                                          while the space form WARNs and installs
+                #   `-S '<non-executable program>'`      → installed, though launchd cannot exec it
                 toks = env_split(cmd)
+                seen_prog = False
                 for j, tok in enumerate(toks):
                     if not isinstance(tok, str) or not tok:
+                        continue
+                    if not seen_prog:
+                        # env's FIRST POSITIONAL token is the program it execs, so it is a LAUNCHER —
+                        # exactly what the space form promotes at argv[1]. An option or a NAME=VALUE
+                        # is not the program and does not end the search.
+                        if tok.startswith("-") or ("=" in tok and not tok.startswith("/")):
+                            continue
+                        seen_prog = True
+                        if tok.startswith("/"):
+                            print("launcher\t" + tok)
                         continue
                     if tok.startswith("--") and "=" in tok:
                         name, val = tok.split("=", 1)
@@ -868,6 +887,12 @@ launcher_grant_root() {
     local p="$1" hop=0
     while [ "$hop" -lt 3 ]; do
         is_readable_file "$p" || return 1
+        # ⛔ EVERY HOP IS `execve`d, so every hop needs the x bit: the launcher itself, and — for a
+        # `#!` script — the interpreter the kernel hands it to. A readable-but-non-executable file is
+        # EACCES on every tick while the install says `installed + loaded`, which is the false PASS
+        # this guard exists to remove (review of #3413 round 9: a 644 `notes.txt` named by `Program`
+        # INSIDE a TCC root WARNed and installed; the identical file outside a TCC root was refused).
+        [ -x "$p" ] || return 1
         if is_binary_file "$p"; then
             tcc_protected_root "$p" || return 1    # prints the root when the binary is inside one
             return 0
@@ -946,6 +971,19 @@ verify_targets() {
         fi
         case "$kind" in
             launcher)
+                # ⛔ THE X BIT IS CHECKED IN BOTH ARMS, BEFORE the TCC branch. A readable file with no
+                # x bit is EACCES on every tick whatever tree it lives in, and the remedy (a chmod, or
+                # a re-farm) IS an install step — so it FAILS, which is verdict 1's own definition.
+                # Left inside the non-TCC arm, the same file installed with only a WARN whenever it
+                # happened to sit in a TCC root (review of #3413, round 9).
+                if [ -f "$arg" ] && [ -r "$arg" ] && [ -s "$arg" ] && [ ! -x "$arg" ]; then
+                    echo "    unreadable or not an executable regular file: $arg" >&2
+                    echo "        launchd execs this path directly (Program / argv[0]), so a file with" >&2
+                    echo "        no x bit is EACCES on every tick whatever its contents. It reads as" >&2
+                    echo "        'installed' to every instrument that only checks existence." >&2
+                    bad=1
+                    continue
+                fi
                 if ! is_tcc_protected "$arg"; then
                     # ⛔ A LAUNCHER IS `execve`d BY launchd, so it must be an EXECUTABLE REGULAR FILE.
                     # The grant model below is about READABILITY from a TCC context and says nothing
@@ -957,7 +995,9 @@ verify_targets() {
                     # ⛔ `-x` IS NOT duplicated onto the `exec` arm: `bash <script>` only READS its
                     # argument, so a readable non-executable script is legitimately runnable there,
                     # while launchd READS this one and hands it to the kernel instead.
-                    if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ] || [ ! -x "$arg" ]; then
+                    # A non-reader was already refused above; what remains is the missing/empty/
+                    # non-regular class (the `-x` half is handled in the arm above).
+                    if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
                         echo "    unreadable or not an executable regular file: $arg" >&2
                         echo "        launchd execs this path directly (Program / argv[0]); a" >&2
                         echo "        directory, an empty file or a non-executable one exits 126/127" >&2
