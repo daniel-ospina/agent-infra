@@ -525,9 +525,26 @@ for _satt in P0-blocker P1-severe P2-moderate; do
   REFRESH_SAVED="$REFRESH"
   REFRESH="$MUT_SAT"; rf "$D" refresh; REFRESH="$REFRESH_SAVED"
   MUT_SAT_REC="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+  # ⛔ ABSENCE IS NOT EVIDENCE — AND THIS ARM HAD THE EXACT HOLE IT FIXES FOUR LINES BELOW (review cycle 38,
+  # P2 — MEASURED). Asserting only "the mutated tier is absent" passed on a mutant that produced NOTHING:
+  # replacing the `sed` above with `printf '#!/bin/bash\nexit 7\n' > "$MUT_SAT"` — a script that mutates
+  # nothing and writes no `.pool-sat` — still gave 35 passed, 0 failed, with all three arms reporting
+  # "deleting ONLY the X writer line removes X". A mutant that never ran is indistinguishable from a writer
+  # that really was the producer, which is the one thing these arms exist to tell apart. So the mutant's pass
+  # must COMPLETE and its record must still name the two tiers it did NOT mutate: the survivors are the
+  # witness that a record was produced at all, and the third is the tier whose line was deleted.
+  _satsurv=1
+  [ "$RC" -eq 0 ] || { _satsurv=0; bad "truncation-writer: the $_satt mutant's pass did not complete (rc=$RC) — 'removes $_satt' would then hold on a pass that wrote nothing: $OUT"; }
+  for _sat_other in P0-blocker P1-severe P2-moderate; do
+    [ "$_sat_other" = "$_satt" ] && continue
+    case "$MUT_SAT_REC" in
+      *"$_sat_other"*) ;;
+      *) _satsurv=0; bad "truncation-writer: deleting ONLY the $_satt writer line also dropped $_sat_other (got '${MUT_SAT_REC:-<absent>}') — the mutant produced nothing, so 'removes $_satt' would grade an empty file rather than the writer" ;;
+    esac
+  done
   case "$MUT_SAT_REC" in
     *"$_satt"*) bad "truncation-writer: with the $_satt writer DELETED the record still names it ('$MUT_SAT_REC') — the fixture, not that writer line, is producing it" ;;
-    *) ok "truncation-writer: deleting ONLY the $_satt writer line removes $_satt from .pool-sat (each of the three writers is graded, not just the set)" ;;
+    *) if [ "$_satsurv" -eq 1 ]; then ok "truncation-writer: deleting ONLY the $_satt writer line removes $_satt from .pool-sat while the other two tiers SURVIVE (each of the three writers is graded, not just the set)"; fi ;;
   esac
 done
 # And the NEGATIVE: an ordinary short listing (no full window, no next page) records NOTHING, so the
