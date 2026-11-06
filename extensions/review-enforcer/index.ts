@@ -8368,6 +8368,25 @@ export function auditCommand(command: string, limit = 2000): string {
   );
 }
 
+/**
+ * The CHILD's composed payload on a reap result, as a mergeable record — or `null`.
+ *
+ * #3155: `task_collect` carries it at `details.details` and a terminal `task_status` at
+ * `details.final_details`; BOTH feed the one classifier, so both narrow the same way and through
+ * this one function. ⛔ AN ARRAY IS NOT A PAYLOAD (fresh review): `typeof [] === "object"` and
+ * `[] !== null`, so the obvious guard accepts `[]`, the spread merges nothing, and the run's own
+ * `status: "done"` label decides — certifying a verdict the payload never carried. (A NON-empty
+ * array does the same: spreading it yields index keys, none of which the classifier reads.) ⛔ AN
+ * EMPTY OBJECT IS THE SAME HOLE (round-2 fresh review, measured): `{}` merges nothing either, so
+ * it carries no evidence, and a reap with `final_details: {}` was COUNTED off the view's own `done`
+ * label on BOTH verbs. `null`, primitives, arrays and empty objects are all UNKNOWN.
+ */
+export function composedDetailsOf(payload: unknown): Record<string, unknown> | null {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  return Object.keys(record).length === 0 ? null : record;
+}
+
 // ── #2349: the ≥1-dispatch floor says WHAT IT READ ─────────────────────────────
 //
 // The floor counts reviewer dispatches in THIS pi process, and (since #2287) first tries a
@@ -8379,24 +8398,6 @@ export function auditCommand(command: string, limit = 2000): string {
 // `recordState` exists so the value lands in the durable audit row: the fleet can
 // then count how many refusals were "no record on this box" (the condition that was
 // hand-measured at 3260-vs-156 records, 55/104 PRs visible) instead of inferring it.
-/**
- * The CHILD's composed payload on a reap result, as a mergeable record — or `null`.
- *
- * #3155: `task_collect` carries it at `details.details` and a terminal `task_status` at
- * `details.final_details`; BOTH feed the one classifier, so both narrow the same way and through
- * this one function. ⛔ AN ARRAY IS NOT A PAYLOAD (fresh review): `typeof [] === "object"` and
- * `[] !== null`, so the obvious guard accepts `[]`, the spread merges nothing, and the run's own
- * `status: "done"` label decides — certifying a verdict the payload never carried. ⛔ AN EMPTY
- * OBJECT IS THE SAME HOLE (round-2 fresh review, measured): `{}` merges nothing either, so it
- * carries no evidence, and a reap with `final_details: {}` was COUNTED off the view's own `done`
- * label on BOTH verbs. `null`, primitives, arrays and empty objects are all UNKNOWN.
- */
-export function composedDetailsOf(payload: unknown): Record<string, unknown> | null {
-  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
-  const record = payload as Record<string, unknown>;
-  return Object.keys(record).length === 0 ? null : record;
-}
-
 export function describeDispatchFloorRead(
   command: string,
   tier: string,

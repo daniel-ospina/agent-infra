@@ -2126,7 +2126,12 @@ testAsync("#3155: a terminal task_status with NO composed details is never count
         // A producer that does not carry `final_details` (version skew) or a record with none:
         // the datum needed to certify a verdict is MISSING, and the floor fails CLOSED. The
         // remedy is the terminal `task_collect`, which carries the payload by contract.
-        for (const missing of [{}, { final_details: null }, { final_details: [] }, { final_details: {} }]) {
+        // A reap whose record carries no composed payload (version skew, a hand-written record, an
+        // EMPTY object — which carries no evidence either — or an ARRAY, empty or not: spreading one
+        // yields index keys the classifier never reads) cannot be certified as a verdict: the datum
+        // is MISSING and the floor fails CLOSED. The NON-empty array case below is what pins
+        // `Array.isArray`; `[]` alone is caught by the empty-keys check, so it pinned nothing.
+        for (const missing of [{}, { final_details: null }, { final_details: [] }, { final_details: [{ model: "m" }] }, { final_details: {} }]) {
           await fire("tool_result", {
             toolName: "task_status",
             details: { terminal: true, status: "done", exit_code: 0, run_id: `RUN-NOEVID-${JSON.stringify(missing)}`, ...missing },

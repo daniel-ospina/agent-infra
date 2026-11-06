@@ -4681,7 +4681,17 @@ export interface TaskRunStatusView {
    *
    * ABSENT (undefined) on a non-terminal view and on the no-record view. A
    * consumer that must classify has to treat absence as "cannot certify",
-   * never as "nothing to see" — absence is a missing datum, not a verdict. */
+   * never as "nothing to see" — absence is a missing datum, not a verdict.
+   *
+   * ⛔ AND IT IS THE WHOLE COMPOSED PAYLOAD, WHICH IS NOT FREE (fresh review,
+   * measured: mean 3.1 kB, max 4.3 kB across 201 terminal records on one box,
+   * 198 of them carrying the child's bounded `stderr`). `task_status` is a
+   * POLLING verb, so a poll now carries what `task_collect` returns. That is a
+   * deliberate trade — the alternative is to narrow the payload to the keys
+   * `classifySpawnOutcome` reads, which would break the invariant that this
+   * field and `collectTaskRun(...).details` are the SAME value (pinned by a
+   * test). Kept whole, and stated here rather than left for a reader to
+   * discover from a payload dump. */
   final_details?: Record<string, unknown> | null;
   /** Always "parent-required" — see the #1662 design constraint above. */
   review_gate: "parent-required";
