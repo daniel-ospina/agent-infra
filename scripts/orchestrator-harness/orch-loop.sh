@@ -1336,6 +1336,15 @@ review_round_read() { # <pr> -> n (coerced: it feeds -ge and $(( + 1 )))
   # below fails on it, `v` stays empty, and the coercion turns that into 999999999. Only a genuinely
   # MISSING path is round 0.
   [ -e "$f" ] || { printf '0\n'; return 0; }
+  # ⛔ AND A NON-REGULAR BOOK MUST NOT BE OPENED AT ALL (fresh review of #3441, P2 — MEASURED HANG).
+  # `-e` is true for a FIFO, and `read -r v < fifo` BLOCKS on open until some writer appears — measured
+  # `rc=124` under a 5 s bound on BOTH readers. A directory short-circuits in the coercion below (the
+  # `read` fails, `v` stays empty, 999999999), but a FIFO has no such exit: this function is called from
+  # the CONTROLLER'S main loop, so the failure mode is the whole fleet loop stopping with no log line
+  # (the #943/#3331 false-silence class, at fleet scale) instead of the fail-closed park documented
+  # above. So the gate is `-f`: absent ⇒ round 0, exists-but-not-a-regular-file ⇒ 999999999, and the
+  # FIFO is never opened. `-e` stays FIRST because only a genuinely MISSING path may read as round 0.
+  [ -f "$f" ] || { printf '999999999\n'; return 0; }
   read -r v < "$f" 2>/dev/null || true
   case "${v:-}" in
     ''|*[!0-9]*) v=999999999 ;;

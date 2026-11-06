@@ -1002,6 +1002,15 @@ sed -n '/^review_round_spend() {/,/^}$/p' "$MW" > "$RRSPEND"
 # reddening on its own. `$MW` and `$TMP` are both valid here; nothing else is assumed.
 RRCEIL_O="$TMP/rrceiling.o.sh"
 sed -n '/# \[rrceiling:begin\]/,/# \[rrceiling:end\]/p' "$MW" | sed '1d;$d' > "$RRCEIL_O"
+# ⛔ AND THE WRITER'S OWN READER, FOR THE SAME ORDERING REASON AND ONE MORE (fresh review of #3441, P3).
+# `review_round_spend` RE-READS the book before it writes (the refund fix below), so the shipped helper
+# depends on `_rr_read_book` — which sits above it in merge-one.sh, unconditionally, so production always
+# has it. A fixture that sourced only the writer therefore made every spend arm noisy with
+# `_rr_read_book: command not found` (and the following `-ge` errored, leaving the write at the
+# top-of-file value); `(c4t)` caught it as a stderr leak, which is exactly what that arm is for. Extracted
+# HERE rather than at `(c4k)`, 400 lines below, so every arm that drives the writer can source it.
+RRBOOK_O="$TMP/rrbook.o.sh"
+sed -n '/^_rr_read_book() {/,/^}$/p' "$MW" > "$RRBOOK_O"
 if [ -s "$RRSPEND" ]; then
   ok "(c4o) merge-one.sh::review_round_spend was extracted (declared)"
 else
@@ -1024,7 +1033,7 @@ rrspend() { # <max> <round> <book-seed> -> the book AS FOUND after the spend, or
   printf '%s\n' "$3" > "$d/state/reviewround-777"
   # shellcheck disable=SC1090
   ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND="$2"; MAX_REVIEW="$1"
-    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRSPEND"
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"
     # ⛔ A MISSING WRITER MUST NOT LOOK LIKE A HELD GUARD (the vacuous pass the verifier measured): if the
     # extraction produced nothing, `review_round_spend` is undefined, the book is untouched, and the
     # "banks NO round" arm would be GREEN for the wrong reason. Say NOHELPER instead.
@@ -1041,10 +1050,21 @@ _got="$(rrspend "$CAP" "$CAP" $(( CAP - 1 )))"
 _got="$(rrspend garbage 11 10)"
 [ "$_got" = "11" ] && ok "(c4o) a GARBAGE MAX_REVIEW still banks (book 10 -> 11) — an unreadable knob fail-closes toward the ceiling, never toward a free budget" \
   || bad "(c4o) a GARBAGE MAX_REVIEW did not bank (book=$(printf '%s' "$_got")) — an unreadable knob must coerce to the documented default 10, never to report-only"
+# ⛔ THE WRITE RE-DERIVES THE FLOOR FROM A FRESH READ (fresh review of #3441, P3, MEASURED REFUND).
+# `$REVIEW_ROUND` is computed at the TOP of merge-one.sh, while the ceiling check that runs before the
+# spend reads the book FRESH "because a concurrent reviewer on this box may have written the book
+# since". Both were shipped at once, so the write could put the LOWER top-of-file value back over a
+# HIGHER one another reviewer had just written — refunding a round, the mirror of the `max()` floor.
+# The arm drives exactly that interleaving: round CAP-1 in hand, another writer already at CAP+3. The
+# shipped write must land CAP+4. MUTANT (measured): delete the re-derive block from the extracted
+# helper and this arm reds with the book back at CAP-1.
+_got="$(rrspend "$CAP" $(( CAP - 1 )) $(( CAP + 3 )))"
+[ "$_got" = "$(( CAP + 4 ))" ] && ok "(c4o) a book a CONCURRENT writer moved ahead is never overwritten: round $(( CAP - 1 )) against a book of $(( CAP + 3 )) lands $(( CAP + 4 )), not a REFUND back to $(( CAP - 1 ))" \
+  || bad "(c4o) the spend wrote the TOP-OF-FILE round over a higher book (book=$(( CAP + 3 )) -> $(printf '%s' "$_got"), expected $(( CAP + 4 ))) — the counter moves BACKWARDS, so each such interleaving refunds a round and the per-PR ceiling is loose by exactly as many as happen"
 sed 's/if _rr_report_only "${MAX_REVIEW:-}"; then/if false; then/' "$RRSPEND" > "$TMP/rrspend.rev.sh"
 diff -q "$RRSPEND" "$TMP/rrspend.rev.sh" >/dev/null 2>&1
 if [ $? -ne 0 ]; then
-  M6="$( . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$TMP/rrspend.rev.sh"
+  M6="$( . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$TMP/rrspend.rev.sh"
          d="$(mktemp -d)"; mkdir -p "$d/state"; printf '10\n' > "$d/state/reviewround-777"
          ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=11; MAX_REVIEW=0; review_round_spend )
          cat "$d/state/reviewround-777"; mv "$d" "$TMP/rrspend.rev.spent.$RANDOM" 2>/dev/null || true )"
@@ -1187,12 +1207,12 @@ rr_coerce_drive() { # <knob> -> the coerced max, from the SHIPPED block
   ( . "$RRCEIL"; _rr_coerce_max "$1" )
 }
 COERCE_BAD=0
-for pair in "garbage:10" "09:9" "0:0" "$CAP:$CAP" "1000000000:10" ":10"; do
+for pair in "garbage:10" "09:10" "00:10" "0:0" "$CAP:$CAP" "1000000000:10" ":10"; do
   k="${pair%%:*}"; want="${pair#*:}"
   got="$(rr_coerce_drive "$k")"
   [ "$got" = "$want" ] || { COERCE_BAD=1; bad "(c4p) MAX_REVIEW='$k' coerces to '$got', expected '$want'"; }
 done
-[ "$COERCE_BAD" = "0" ] && ok "(c4p) _rr_coerce_max maps garbage / leading-zero / oversized / empty to the documented default, so the rounds=<n>/<max> field always has a number to print"
+[ "$COERCE_BAD" = "0" ] && ok "(c4p) _rr_coerce_max maps garbage / leading-zero / oversized / empty to the documented default 10 and keeps only the exact '0' as REPORT-ONLY — the same rule is_limit/is_num applies, so both ingresses coerce one knob one way"
 RC_MAX_ASSIGN="$(grep -nE '^_rr_max=' "$MERGED_ONE_SH" | head -1)"
 RC_MAX_RHS="${RC_MAX_ASSIGN#*_rr_max=}"
 case "$RC_MAX_RHS" in
@@ -1237,7 +1257,7 @@ rrspend_bookdir() { # -> "named=<0|1> temps=<n>" for a DIRECTORY planted at the 
   local d; d="$(mktemp -d)"; mkdir -p "$d/state/reviewround-777"
   # shellcheck disable=SC1090
   ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; MAX_REVIEW=10
-    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRSPEND"
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"
     review_round_spend 2>/dev/null || true
     n=0; grep -qF 'CANNOT BE WRITTEN' "$d/log.log" 2>/dev/null && n=1
     printf 'named=%s ' "$n"
@@ -1252,6 +1272,38 @@ case "$RR_DIR" in
   'named=1 temps=0') ok "(c4r) an UNWRITABLE counter (a directory at the path) is NAMED in the log and leaves NO temp file behind — the failure branch is reachable, so the operator is not left with a silent false REVIEW-CEILING" ;;
   *) bad "(c4r) an unwritable counter is NOT reported cleanly ($RR_DIR, expected named=1 temps=0) — a directory at state/reviewround-<PR> makes the rename move the temp INSIDE it and exit 0, so the failure group never fires: the log says nothing, a temp file is left under state/, and the next reader coerces the book to 999999999 and parks a healthy PR with a false REVIEW-CEILING rounds=999999999/10" ;;
 esac
+# ⛔ (c4r2) A FAILED WRITE MUST NOT REPORT A SPEND (verifier of THIS fix round, P1-class). The fix for the
+# EXIT recorder's unconditional "round N spent" echo added an `_rr_banked` flag — and the FIRST version of
+# that fix set it AFTER the `||` chain, so the FAILURE branch (which had no `return`) fell THROUGH to it:
+# a write that provably did not land still marked the round banked, and the recorder printed
+# "review round N spent by the EXIT recorder" directly beside "CANNOT BE WRITTEN — book UNCHANGED". That
+# is the exact defect the flag was added to close, reintroduced by its own plumbing — so it gets an arm,
+# driven through the SHIPPED recorder on BOTH no-bank shapes. Measured before the `return 0` in the
+# failure branch: `dir: named=1 spent=1` and `ro: spent=1` on the report-only box, both GREEN over a book
+# that never moved; `spent=` was named nowhere in this suite.
+RRSPEND_EXIT="$TMP/rrspend.exit.sh"
+awk '/^review_round_spend_at_exit\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$MW" > "$RRSPEND_EXIT"
+rrspend_exit_shape() { # <dir|ro> -> "named=<0|1> spent=<0|1>" for a spend that does NOT bank
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  [ "$1" = "dir" ] && mkdir -p "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; REV_STARTED=1; AGENT_STARTED=1
+    if [ "$1" = "ro" ]; then MAX_REVIEW=0; else MAX_REVIEW=10; fi
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"; . "$RRSPEND_EXIT"
+    command -v review_round_spend_at_exit >/dev/null 2>&1 || { printf 'NOHELPER\n'; exit 0; }
+    review_round_spend_at_exit 2>/dev/null || true
+    n=0; grep -qF 'CANNOT BE WRITTEN' "$d/log.log" 2>/dev/null && n=1
+    s=0; grep -qF 'spent by the EXIT recorder' "$d/log.log" 2>/dev/null && s=1
+    printf 'named=%s spent=%s\n' "$n" "$s" )
+  mv "$d" "$TMP/rrspend.exit.spent.$RANDOM" 2>/dev/null || true
+}
+[ -s "$RRSPEND_EXIT" ] || bad "(c4r2) review_round_spend_at_exit could NOT be extracted from merge-one.sh — the recorder's spend echo is unverified, so both arms below are vacuous"
+RR_EX_DIR="$(rrspend_exit_shape dir)"
+RR_EX_RO="$(rrspend_exit_shape ro)"
+[ "$RR_EX_DIR" = 'named=1 spent=0' ] && ok "(c4r2) a FAILED write (directory at the counter) is NAMED and the EXIT recorder claims NO spend — a grep for 'spent' finds nothing, because the book never moved" \
+  || bad "(c4r2) a FAILED write reported ($RR_EX_DIR, expected named=1 spent=0) — a spend the book never recorded is greppable in the log beside its own CANNOT BE WRITTEN line: the false-report class this change removes, manufactured by the flag added to remove it"
+[ "$RR_EX_RO" = 'named=0 spent=0' ] && ok "(c4r2) a REPORT-ONLY box (MAX_REVIEW=0) banks nothing and the EXIT recorder claims NO spend — the two log lines no longer contradict each other" \
+  || bad "(c4r2) the REPORT-ONLY shape reported ($RR_EX_RO, expected named=0 spent=0) — the recorder still prints 'round N spent' on a box whose book it deliberately leaves untouched"
 # ⛔ (c4s) THE MESSAGE MUST STATE THE REAL CONSEQUENCE AND A REPAIR THAT WORKS (fresh review of #3441,
 # P2). The first version of that line said "the per-PR round ceiling cannot be counted on this path (the
 # per-head budget still binds)" — which reads as an INERT bound. What actually happens is the OPPOSITE
@@ -1281,7 +1333,7 @@ rrspend_stderr() { # <shape: readonly|missing> -> the bytes the helper wrote to 
   esac
   # shellcheck disable=SC1090
   ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; MAX_REVIEW=10
-    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRSPEND"
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"
     review_round_spend ) 2>&1 >/dev/null
   chmod 700 "$d/state" 2>/dev/null || true
   mv "$d" "$TMP/rrspend.err.spent.$RANDOM" 2>/dev/null || true
@@ -1461,6 +1513,37 @@ for _r in orch merge; do
   _got="$(rrb_dir "$_r")"
   [ "$_got" = 999999999 ] && ok "(c4l) a NON-REGULAR book (a stray DIRECTORY) reads as the 9-digit ceiling in the $_r reader, not as round 0" \
     || bad "(c4l) the $_r reader read a DIRECTORY standing in for the book as $_got, expected 999999999 — a non-regular book is CORRUPTION, and treating it as ABSENT hands the PR a FULL budget (the reset the coercion above exists to prevent)"
+done
+# ⛔ THE OTHER NON-REGULAR BOOK DOES NOT FAIL CLOSED — IT HANGS (fresh review of #3441, P2, MEASURED).
+# A DIRECTORY is caught only incidentally (the `read` fails, `v` stays empty, 999999999); a FIFO is
+# `-e`-true and `read -r v < fifo` BLOCKS ON OPEN until a writer appears, so the coercion below is never
+# reached. Measured on the pre-fix code: `rc=124` under a 5 s bound in BOTH readers — and in
+# `orch-loop.sh` that reader is the CONTROLLER'S main loop, so the failure mode is the whole fleet loop
+# wedging with no log line (the #943/#3331 false-silence class at fleet scale), not the fail-closed park
+# the README promises. Both readers now gate on `-f`: absent ⇒ 0, non-regular ⇒ 999999999, never opened.
+# ⛔ THE ARM IS BOUNDED ITSELF, because the failure it detects IS a hang: without a bound the suite would
+# block instead of reporting ❌. A `kill -9` on the reader subshell is the only exit from a blocked FIFO
+# open on every platform (`timeout`/`gtimeout` are not guaranteed where this suite runs).
+rrb_fifo() { # <which: orch|merge> -> the reader's answer, or HANG
+  local d out p i
+  d="$(mktemp -d)"; mkdir -p "$d/state"; mkfifo "$d/state/reviewround-777"
+  out="$TMP/rrfifo.out"
+  rm -f "$out" 2>/dev/null || true
+  case "$1" in
+    orch)  ( O="$d"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_read 777 ) > "$out" 2>/dev/null & ;;
+    merge) ( _rr_f="$d/state/reviewround-777"; . "$RRBOOK"; _rr_read_book ) > "$out" 2>/dev/null & ;;
+  esac
+  p=$!
+  i=0
+  while [ "$i" -lt 5 ] && [ ! -s "$out" ]; do sleep 1; i=$(( i + 1 )); done
+  if [ -s "$out" ]; then wait "$p" 2>/dev/null; cat "$out";
+  else kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; printf 'HANG\n'; fi
+  mv "$d" "$TMP/rrfifo.spent.$RANDOM" 2>/dev/null || true
+}
+for _r in orch merge; do
+  _got="$(rrb_fifo "$_r")"
+  [ "$_got" = 999999999 ] && ok "(c4l) a FIFO standing in for the book reads as the 9-digit ceiling in the $_r reader — it is neither OPENED (which would block for ever) nor read as round 0" \
+    || bad "(c4l) the $_r reader answered '$_got' for a FIFO at the book path, expected 999999999 — 'HANG' means the reader still OPENS a non-regular book (a fleet-wide wedge in the controller, worse than the park the docs promise), and any other value means it read corruption as a live budget"
 done
 
 # ── (c4m) THE BOOK'S LIFECYCLE IS PART OF THE BOUND, AND IT WAS PINNED BY NOTHING ────────────────────

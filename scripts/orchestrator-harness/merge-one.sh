@@ -94,8 +94,20 @@ _rr_ceiling_hit() { # <book> <max> -> 0 when the NEXT review round must be REFUS
 # leading zero outright — read it as unusable): that is precisely how a report-only box ends up banking.
 # `_rr_coerce_max` is the ONE reader; nothing else may re-spell `10#`.
 _rr_coerce_max() { # <max> -> the documented default when unusable, else its base-10 value
+  # ⛔ THE SAME RULE AS `is_limit`/`is_num`, WHICH IS WHAT THE CONTROLLER USES (fresh review of #3441,
+  # P3 — MEASURED DIVERGENCE). This function used to accept a leading zero (`10#09` ⇒ 9, `10#00` ⇒ 0),
+  # while `is_num` REFUSES `0*` outright, so `orch-loop.sh` normalises the same knob to the default 10:
+  # `MAX_REVIEW=09` gave the controller a 10-round ceiling and this ingress a 9-round one (parking a
+  # direct review two rounds early), and `MAX_REVIEW=00` gave the controller 10 rounds while this file
+  # read REPORT-ONLY (`_rr_report_only 0` ⇒ no round ever banked, the budget permanently unbindable).
+  # Two readers of one knob must not disagree about it any more than two readers of one book may — and
+  # the file's own note claimed they "cannot disagree about WHETHER TO REFUSE", which was false on `00`.
+  # `0` EXACTLY is still report-only (`is_limit 0` is true, and README §4 documents `MAX_REVIEW=0` that
+  # way); every other leading-zero spelling is UNUSABLE and falls back to the documented default.
   case "${1:-}" in
     ''|*[!0-9]*) printf '10\n' ;;
+    0) printf '0\n' ;;
+    0*) printf '10\n' ;;
     *) if [ "${#1}" -le 9 ]; then printf '%s\n' "$(( 10#${1} ))"; else printf '10\n'; fi ;;
   esac
 }
@@ -241,6 +253,16 @@ _rr_read_book() { # -> n (absent ⇒ 0; anything else unreadable/oversized ⇒ 9
   # budget. `read` then fails on it, `v` stays empty, and the coercion below turns that into
   # 999999999. Only a genuinely MISSING path is round 0.
   [ -e "$f" ] || { printf '0\n'; return 0; }
+  # ⛔ AND A NON-REGULAR BOOK MUST NOT BE OPENED AT ALL (fresh review of #3441, P2 — MEASURED HANG).
+  # `-e` is true for a FIFO, and `read -r v < fifo` BLOCKS on open until some writer appears — measured
+  # `rc=124` under a 5 s bound, on BOTH readers. The DIRECTORY case below was already caught by the
+  # coercion (the `read` fails, `v` stays empty, 999999999), but a FIFO never returns at all: on
+  # `orch-loop.sh` that is the CONTROLLER'S OWN LOOP wedged with no log line — worse than the park the
+  # README promises, and a different failure mode from the fail-closed one this block documents. So the
+  # gate is `-f`: absent ⇒ round 0, exists-but-not-a-regular-file ⇒ the writer's 9-digit ceiling (the
+  # same answer a directory gets), and the FIFO is never opened. `-e` stays FIRST because "absent" and
+  # "corrupt" are different answers and only a genuinely missing path may read as a full budget.
+  [ -f "$f" ] || { printf '999999999\n'; return 0; }
   read -r v < "$f" 2>/dev/null || true
   # ⛔ AN UNREADABLE BOOK IS NOT ROUND ZERO — IT IS THE WRITER'S OWN 9-DIGIT CEILING. Coercing a
   # corrupt or oversized value to 0 handed it a FULL budget, i.e. it RESET the ceiling: the fail-open
@@ -307,14 +329,21 @@ else
   REVIEW_ROUND=$(( _rr_prev + 1 ))
 fi
 # ⛔ THE WRITTEN VALUE IS BOUNDED LIKE THE READ ONE, FOR BOTH BRANCHES (round 7 review, P2).
-# `_rr_prev` is coerced to 9 digits when READ (`is_limit`, above), but nothing bounded what was
+# `_rr_prev` is bounded to 9 digits when READ (`_rr_read_book`, above), but nothing bounded what was
 # WRITTEN. A book at 999999999 (set in ONE run by `REV_PAID=1 REV_ROUND=999999999` — the very caller
-# the floor defends against) makes the NEXT ordinary review write 1000000000, TEN digits, which both
-# this reader and `orch-loop.sh`'s `review_round_read` coerce to 0 — so THE PER-PR CEILING RESETS and
-# every later review is free. That is precisely what the floor's own note claims to prevent, and the
-# first version of this clamp sat inside the `REV_PAID` branch only, leaving the majority path
-# (`chain-<N>` / `fix-one`) unbounded. Clamped to the reader's 9-digit ceiling, which is far past any
-# `MAX_REVIEW` and so still refuses every further round: fail-closed, never a reset.
+# the floor defends against) would make the NEXT ordinary review write 1000000000, TEN digits.
+# ⛔ WHAT THAT WOULD DO, AND WHAT IT WOULD NOT (fresh review of #3441, P3 — THIS PARAGRAPH USED TO BE
+# FALSE, in the very section whose earlier copy was corrected; the correction sat 30 lines above the
+# surviving falsehood, which is the trap `AGENTS.md` §Finding Verification names: a marker steers a
+# reader away from re-checking the sentence it did not fix). It said the 10-digit value "both this
+# reader and `orch-loop.sh`'s `review_round_read` coerce to 0 — so THE PER-PR CEILING RESETS and every
+# later review is free". NEITHER READER COERCES TO 0: both clamp anything over 9 digits to 999999999,
+# i.e. EXHAUSTED, so the ceiling cannot be reset by a long book at all. And the 10-digit write is
+# UNREACHABLE anyway — `_rr_ceiling_hit` refuses at `book >= max` above, before either spend site can
+# run, so a book already at 999999999 parks the PR instead of spending on top of it. The clamp stays as
+# what it is: CANONICALISATION at the writer's own bound (overflow hardening, and the one place that
+# guarantees the book is always a 9-digit numeral), NOT a reset it was preventing. The `_rr_read_book`
+# sibling note asserts the same thing at the reader.
 if [ "${#REVIEW_ROUND}" -gt 9 ]; then REVIEW_ROUND=999999999; fi
 
 # ⛔ THE ONE WRITE, DEFINED **HERE** — BEFORE `run_agent` AND BEFORE THE TRAP (round 10 review, P1).
@@ -327,6 +356,7 @@ if [ "${#REVIEW_ROUND}" -gt 9 ]; then REVIEW_ROUND=999999999; fi
 # ⛔ AND IT MUST BE IDEMPOTENT RATHER THAN CONDITIONAL, because the recorder path and the ingress path
 # are the SAME spend observed at two moments, not two spends.
 _rr_written=0
+_rr_banked=0
 review_round_spend() {
   [ "${_rr_written:-0}" = "1" ] && return 0
   # ⛔ A REPORT-ONLY BOX DOES NOT BANK A ROUND (fresh review of #3441, P2). `MAX_REVIEW=0` means "this box
@@ -344,6 +374,23 @@ review_round_spend() {
     echo "[merge $PR] MAX_REVIEW=$MAX_REVIEW (REPORT-ONLY) — no review round is BANKED and state/reviewround-$PR is left untouched, so a later restore of this knob does not find rounds this box never bought (the ceiling itself is disabled on this ingress; the controller's dispatch arm is the half that buys nothing)" >> "$L.log" 2>/dev/null || true
     _rr_written=1
     return 0
+  fi
+  # ⛔ THE VALUE WRITTEN IS RE-DERIVED HERE, FROM A FRESH READ (fresh review of #3441, P3 — MEASURED
+  # REFUND). `$REVIEW_ROUND` was computed at the TOP of this file, ~1400 lines above this write, while
+  # the ceiling check that runs in between reads the book FRESH precisely because "a concurrent reviewer
+  # on this box may have written the book since". Those two facts cannot both be right: if another
+  # reviewer wrote a HIGHER round into the book, this write put the LOWER top-of-file value back and
+  # REFUNDED a round — the fail-open mirror of the `max()` floor above, and the exact interleaving the
+  # fresh read exists to survive. Measured: book 5 ⇒ `REVIEW_ROUND=6` at the top; a concurrent writer
+  # sets the book to 7; the spend wrote 6, so the next review reused round 7. The floor is re-applied
+  # here so the "the counter can never move BACKWARDS" claim above is TRUE at the write and not only at
+  # the assignment, and the 9-digit clamp is re-applied with it (a book at 999999999 would otherwise
+  # make `+ 1` a TEN-digit write, which both readers coerce back to the ceiling).
+  local _rr_prev_now
+  _rr_prev_now="$(_rr_read_book)"
+  if [ "$_rr_prev_now" -ge "$REVIEW_ROUND" ]; then
+    REVIEW_ROUND=$(( _rr_prev_now + 1 ))
+    [ "${#REVIEW_ROUND}" -gt 9 ] && REVIEW_ROUND=999999999
   fi
   # ⛔ THE WRITE IS ATOMIC — A SIBLING, THEN A RENAME (fresh review of #3441, P2: a TORN book PARKS a
   # healthy PR). A `printf` redirected STRAIGHT ONTO the counter truncates before it writes, and BOTH readers coerce an EMPTY book
@@ -375,7 +422,21 @@ review_round_spend() {
   # same trap this file already documents on the sibling seam, repeated here by accident.
   { printf '%s\n' "$REVIEW_ROUND" > "$_rr_new" \
       && [ ! -d "$_rr_f" ] && mv "$_rr_new" "$_rr_f"; } 2>/dev/null \
-    || { rm -f "$_rr_new" 2>/dev/null; echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN (unwritable, or a DIRECTORY stands at the path) — this review is round $REVIEW_ROUND and the book is UNCHANGED. ⛔ THE CONSEQUENCE IS A FALSE DIAGNOSIS, NOT AN INERT BOUND: both readers coerce a book they cannot read to 999999999, so the NEXT review of this PR is PARKED with REVIEW-CEILING rounds=999999999/10 and a reason claiming a spent budget nobody spent. Nothing clears that automatically — a CLEAN verdict and MERGED/CLOSED both go through a removal that a DIRECTORY defeats — so repair the path by hand: rm -rf '$O/state/reviewround-$PR' (rm -f will NOT remove a directory, and every site swallows its failure). The per-head budget still binds meanwhile." >> "$L.log" 2>/dev/null || true; }
+    || { rm -f "$_rr_new" 2>/dev/null; echo "[merge $PR] review round counter $_rr_f CANNOT BE WRITTEN (unwritable, or a DIRECTORY stands at the path) — this review is round $REVIEW_ROUND and the book is UNCHANGED. ⛔ THE CONSEQUENCE IS A FALSE DIAGNOSIS, NOT AN INERT BOUND: both readers coerce a book they cannot read to 999999999, so the NEXT review of this PR is PARKED with REVIEW-CEILING rounds=999999999/10 and a reason claiming a spent budget nobody spent. Nothing clears that automatically — a CLEAN verdict and MERGED/CLOSED both go through a removal that a DIRECTORY defeats — so repair the path by hand: rm -rf '$O/state/reviewround-$PR' (rm -f will NOT remove a directory, and every site swallows its failure). The per-head budget still binds meanwhile." >> "$L.log" 2>/dev/null || true; _rr_written=1; return 0; }
+  # ⛔ `_rr_banked` IS THE RECORD THAT THE BOOK ACTUALLY MOVED (fresh review of #3441, P3). `_rr_written`
+  # cannot answer that: it is set to 1 by the REPORT-ONLY branch above and by the FAILURE branch just
+  # above, both of which leave the book UNTOUCHED. The EXIT recorder read `_rr_written` and echoed
+  # "round N spent" unconditionally, so a grep for `spent` found a spend that never happened — the same
+  # claim-stronger-than-its-proof class as the false `REVIEW-CEILING` diagnosis this change removes.
+  # ⛔ AND THAT IS WHY THE FAILURE BRANCH ENDS IN `return 0` (verifier of this fix round, P1-class — the
+  # FIRST version of this fix set `_rr_banked` unconditionally after the `||` chain, so a FAILED write
+  # still marked the round banked and the EXIT recorder still printed "round N spent" beside
+  # "CANNOT BE WRITTEN — book UNCHANGED": the exact defect this paragraph describes, reintroduced by the
+  # paragraph's own flag. MEASURED by that verifier against the shipped functions: a directory planted at
+  # the counter produced both log lines, and no suite arm pinned it). `_rr_written=1` still suppresses the
+  # EXIT hook's retry on that path — a write that failed once is not retried by the recorder — but nothing
+  # sets `_rr_banked` unless the rename LANDED. `(c4r2)` drives both shapes through the recorder.
+  _rr_banked=1
   _rr_written=1
 }
 # The EXIT hook. Registered on the trap, so it survives TERM/INT/an unexpected death, and it is inert
@@ -394,6 +455,12 @@ review_round_spend_at_exit() {
   [ "${_rr_written:-0}" = "1" ] && return 0
   [ -n "${REVIEW_ROUND:-}" ] || return 0
   review_round_spend
+  # ⛔ THE ECHO IS GATED ON THE BOOK ACTUALLY MOVING (fresh review of #3441, P3). It was unconditional,
+  # so a `MAX_REVIEW=0` (REPORT-ONLY) run wrote both "no review round is BANKED" and "review round N
+  # spent by the EXIT recorder" into the same log — and an operator grepping for `spent` finds the
+  # second. When nothing was banked the spend path has ALREADY spoken (its own bridge line names why), so
+  # the honest output here is silence rather than a second, contradicting sentence.
+  [ "${_rr_banked:-0}" = "1" ] || return 0
   echo "[merge $PR] review round $REVIEW_ROUND spent by the EXIT recorder — the reviewer RAN and was reaped before the ingress could write it" >> "$L.log" 2>/dev/null || true
   return 0
 }
