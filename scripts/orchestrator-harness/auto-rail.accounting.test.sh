@@ -1695,7 +1695,7 @@ esac
 _PUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-retries-exhausted "\$head" "\$_rbasis"$'
 _RBASRE='^[[:space:]]*if review_ledger_unreadable "\$_ratt"; then _rbasis=cap; else _rbasis=; fi$'
 grep -qE "$_PUBRE" "$SUT" \
-  || bad "the loop must PASS its basis to the EXHAUSTED publish ('… review-retries-exhausted \"\$head\" \"\$_rbasis\"') — without the argument the comment falls back to asserting the CAP as a measured count, which is the defect this change closes; ⛔ AND THE STATEMENT MUST BE LIVE (a `#` prefix or a `:` in place of the call keeps a substring match green while nothing is published)"
+  || bad "the loop must PASS its basis to the EXHAUSTED publish ('… review-retries-exhausted \"\$head\" \"\$_rbasis\"') — without the argument the comment falls back to asserting the CAP as a measured count, which is the defect this change closes; ⛔ AND THE STATEMENT MUST BE LIVE (a \`#\` prefix or a \`:\` in place of the call keeps a substring match green while nothing is published)"
 grep -qE "$_RBASRE" "$SUT" \
   || bad "the loop must ASK, directly, whether the ledger is unreadable ('if review_ledger_unreadable \"\$_ratt\"; then _rbasis=cap; else _rbasis=; fi') — a flag set inside \`\$(review_attempts …)\` never reaches the publisher (subshell); ⛔ ANCHORED so a commented-out computation cannot satisfy it"
 # ⛔ AND THE **LOG** HALF MUST BE PINNED AS HARD AS THE COMMENT HALF (review round 7, P2, REPRODUCED). The
@@ -1718,7 +1718,7 @@ _MEARE='^[[:space:]]*log_line "\$repo #\$pr REVIEW-RETRIES-EXHAUSTED at \$head �
 _RCAP=$(grep -nE "$_CAPRE" "$SUT" | head -1 | cut -d: -f1)
 _RMEA=$(grep -nE "$_MEARE" "$SUT" | head -1 | cut -d: -f1)
 grep -qE "$_CAPRE" "$SUT" \
-  || bad "the EXHAUSTED LOG LINE must not print the fail-closed CAP as a measured count — when the ledger cannot be read no LIVE log line states the non-measured fact, so the operator's primary instrument asserts '\$_rattn dispatch(es)' as a past-tense fact the loop never measured (the defect this delta closes, restored, with this suite GREEN); ⛔ anchored, so a `#`-commented or `:`-stubbed statement cannot satisfy it"
+  || bad "the EXHAUSTED LOG LINE must not print the fail-closed CAP as a measured count — when the ledger cannot be read no LIVE log line states the non-measured fact, so the operator's primary instrument asserts '\$_rattn dispatch(es)' as a past-tense fact the loop never measured (the defect this delta closes, restored, with this suite GREEN); ⛔ anchored, so a \`#\`-commented or \`:\`-stubbed statement cannot satisfy it"
 grep -qE "$_MEARE" "$SUT" \
   || bad "the MEASURED log line must still be LIVE ('log_line \"\$repo #\$pr REVIEW-RETRIES-EXHAUSTED at \$head — \$_rattn dispatch(es) inside') — dropping or commenting it trades a fabricated count for no count at all in the readable case"
 case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
@@ -1772,20 +1772,42 @@ case "${_R3A:-x}${_R3B:-x}${_RBR:-x}${_RCAP:-x}${_RMEA:-x}" in
     case "$_RCAPTXT" in
       *'$_rattn'*) bad "the CAP log line must NOT print \$_rattn — that value IS the fail-closed cap, so putting it in this line asserts a past-tense measurement the loop never took, which is precisely the defect (adding it back kept this suite green before this arm existed)" ;;
     esac
-    # ⛔ THE SIBLING DRAIN NEEDS THE SAME TERMINATOR PIN, AND FOR THE SAME MONEY (review round 4, P1, REPRODUCED).
-    # The `-eq 2` arm publishes "review-found-issues" / "review-record-unbound" and then MUST `continue`; deleting
-    # that one word left this suite GREEN while control fell through `review_should_defer 0` (false) into
-    # `launch_review` — a PAID dispatch on the head it has just told the operator "auto-rail will NOT re-review
-    # this head". Same class, same money as the rc-3 arm above, and the more common path (every issue-finding
-    # review reaches it). Pinned identically: the arm's own 8-space `fi`, and the line before it must be the
-    # `continue`.
-    _R2F=$(awk -v a="$_R3B" 'NR>a && /^        fi$/ {print NR; exit}' "$SUT")
-    _R2C=$(awk -v a="$_R3B" -v b="${_R2F:-0}" 'NR>a && NR<b && /^[[:space:]]*continue$/ {print NR; exit}' "$SUT")
-    case "${_R2F:-x}${_R2C:-x}" in
-      *[!0-9]*) bad "the rc-2 arm's own terminator could not be located (arm opens at ${_R3B}, closes at ${_R2F:-MISSING}, its \`continue\` at ${_R2C:-MISSING}) — the drain shape changed, so its fall-through cannot be measured" ;;
-      *) [ "$_R2C" -eq "$(( _R2F - 1 ))" ] \
-           || bad "the rc-2 arm must END IN ITS OWN \`continue\` (it closes at ${_R2F}, but the line before that close is not one; first \`continue\` found at ${_R2C}) — without it the arm that just published 'auto-rail will NOT re-review this head' falls through into launch_review and BUYS that review (fall-through reproduced with this suite GREEN, review round 4)" ;;
-    esac ;;
+    # ⛔ EVERY DECIDING ARM IN THIS BRANCH MUST END IN ITS OWN `continue` — THE WHOLE CLASS, NOT ONE CASE
+    # (review round 5, P1/P2, REPRODUCED). Pinning the rc-3 drain alone left five SIBLING arms wider found by a
+    # deletion sweep: the `rail_says_skip` skip (falls through to launch a SECOND rail for the same PR), the
+    # `candidate_deferred` cap deferral (falls through and spends the budget it just deferred on), the
+    # `_att = rejected` publish (falls through toward the rail), the `_rarm = review` launch path (falls
+    # through into the RAIL path, so one candidate gets a review AND a rail), and `review_should_defer` —
+    # the worst — which publishes "this head is next in the queue" and then BUYs a PAID review over the
+    # `REVIEW_PER_PASS` burst bound it just deferred on. Each single-word deletion left this suite GREEN,
+    # because the existing arm at the deferral sees only the `if`+1/`if`+2 window, not the terminator.
+    # The rule is structural and needs no per-arm table: an arm opens at some indent, closes at the next
+    # `fi` AT THAT SAME indent, and the line immediately before that close must be the `continue`. So a new
+    # arm added inside any of them cannot quietly fall through, and the earlier `-eq 2` pin is folded in.
+    for _anchor in \
+      'if [ "$_ract" -eq 2 ]; then' \
+      'if rail_says_skip "$_rail_rc"; then' \
+      'if candidate_deferred "$repo" $REPOS; then' \
+      'if [ "$_att" = rejected ]; then' \
+      'if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then' \
+      'if review_should_defer "$_rdispatched"; then'
+    do
+      _ol=$(grep -nF -- "$_anchor" "$SUT" | head -1 | cut -d: -f1)
+      case "${_ol:-x}" in
+        *[!0-9]*) bad "the arm '${_anchor}' could not be located in ${_SUTNAME:-the SUT} — the review branch changed shape, so its fall-through cannot be measured" ;;
+        *)
+          _ind=$(awk -v a="$_ol" 'NR==a { match($0, /^ */); print RLENGTH; exit }' "$SUT" 2>/dev/null)
+          _ind=${_ind:-0}
+          _close=$(awk -v a="$_ol" -v n="$_ind" 'NR>a { match($0, /^ */); if (RLENGTH==n && substr($0, n+1)=="fi") {print NR; exit} }' "$SUT")
+          case "${_close:-x}" in
+            *[!0-9]*) bad "the arm '${_anchor}' (line ${_ol}, indent ${_ind}) has no closing \`fi\` at its own indent — its terminator cannot be measured" ;;
+            *)
+              _prev=$(sed -n "$(( _close - 1 ))p" "$SUT" | sed 's/^[[:space:]]*//')
+              [ "$_prev" = continue ] \
+                || bad "the arm '${_anchor}' (opens ${_ol}, closes ${_close}) must END IN ITS OWN \`continue\`, but the line before that close is '${_prev}' — without the terminator the arm falls out of its own decision into the next one and, for every arm in this list, that means acting on the decision it just refused, announced or deferred (a second rail, a bypassed budget, a review bought over the burst bound, or a rail launched beside an in-flight review); all five deletions left this suite GREEN before this sweep (reproduced, review round 5)" ;;
+          esac ;;
+      esac
+    done ;;
 esac
 
 # ⛔ THE POSITIONAL FAMILY HAS THREE MEMBERS (review round 7, P2, measured): `awaiting-review:<head>` joins
