@@ -364,8 +364,8 @@ lo_select_rows() {
 # module still agree, and a module must never invent a spawn count it was not given.
 lo_select() {
   local total="${1:--}" owned="${2:--}" unowned="${3:--}" parked="${4:-0}" first="${5:--}" cap="${6:-}" backlog="${7:-0}"
-  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}" prw="${12:-}"
-  local prs_why issues_why pr_waiting
+  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}" prw="${12:-}" prwhy="${13:-}"
+  local prs_why issues_why pr_waiting _prw_tail
   LO_CHOICE=none
   lo_num "$unowned" || unowned=""
   # ⛔ A DIGIT STRING IS NOT A COUNT, AND AN OUT-OF-RANGE ONE FAILS **OPEN** HERE (review 2026-11-04,
@@ -432,7 +432,17 @@ lo_select() {
     # meets on almost every cycle, and it must not say the issue path is CLOSED — it is DEFERRED,
     # because PR work has the first call on the room the box has. The two readings are different
     # states with different remedies (wait vs. drain), so they get different words.
-    issues_why="DEFERRED (PR work holds the priority: ${unowned} un-owned PR(s) and no room left after it)"
+    # ⛔ ONE BOOLEAN, THREE CAUSES — SO THE REASON IS PASSED, NOT INFERRED (review cycle 2, P2).
+    # `pr_waiting=1` is set by ANY of: the priority label, a pyramid LEVEL holding the room with lanes
+    # idle, or an unreadable un-owned count. The first version said "no room left after it" for all
+    # three, which is false in two of them (there IS room; a higher level owns it / nobody could read
+    # the count). The default sentence is unchanged byte for byte, so an older caller keeps it.
+    case "${prwhy:-}" in
+      holds)      _prw_tail=" and a higher level is holding the room this pass" ;;
+      unreadable) _prw_tail=" and the count could not be read, so nothing is opened" ;;
+      *)          _prw_tail=" and no room left after it" ;;
+    esac
+    issues_why="DEFERRED (PR work holds the priority: ${unowned} un-owned PR(s)${_prw_tail})"
   elif [ -n "$cap" ]; then
     LO_CHOICE=none
     prs_why="no un-owned PR left"

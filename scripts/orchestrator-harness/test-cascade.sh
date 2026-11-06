@@ -222,7 +222,10 @@ echo
 echo "=== 6. one pass fills capacity (owner: \"do not stop at one batch\") ==="
 ckin "the batch breaks on CASCADE_ISSUE_SLOTS" "$SRC" '[ "$K" -ge "${CASCADE_ISSUE_SLOTS:-${BATCH:-2}}" ] && break'
 ckni "…and NOT on BATCH alone" "$SRC" '[ "$K" -ge "$BATCH" ] && break'
-ckin "the loop refuses to queue anything when the cascade granted 0" "$SRC" '[ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] 2>/dev/null || break'
+# ⛔ THE GUARD'S SPELLING IS PART OF THE INVARIANT (review cycle 2, P0): `:-0` reads an UNSET count
+# as "no room" and breaks the batch for every standalone-driving suite, so the pin follows the
+# terse-minus form and section 14 pins the absence of the other one.
+ckin "the loop refuses to queue anything when the cascade granted 0" "$SRC" '[ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 ] 2>/dev/null || break'
 
 # ── 7. DEDUP: an issue already in flight is not queued twice ───────────────────────────────────
 echo
@@ -288,8 +291,15 @@ _w3="$TMP/w9c"; rm -rf "$_w3"; mkdir -p "$_w3"
 ck "an UNREADABLE census never reads as a freed slot" "$(cat "$TMP/w9c.out")" "rc=1"
 # ⛔ A PASS WHOSE ROOM A LEVEL HOLDS IS NOT A FULL BOX, so it must NOT arm the poll.
 ckin "the poll is armed by the ROOM, not by 'this pass granted none'" "$SRC" 'if [ "${CASCADE_ROOM:-0}" -le 0 ] && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_WAITING:-0}" = "1" ]; then'
-ckni "…and NOT by CASCADE_LEVEL_HOLDS (that was the ~12x over-polling)" "$SRC" 'CASCADE_LEVEL_HOLDS:-0}" = "1" ]; then'
-ckin "…while a FULL box with the same level still polls (the contrast half)" "$SRC" 'if [ "${CASCADE_ROOM:-0}" -le 0 ]' 
+# ⛔ THE ABSENCE FORM WAS AMBIGUOUS BY CONSTRUCTION and cycle 2 retired it: ``CASCADE_LEVEL_HOLDS:-0}" =
+# "1" ]; then`` now legitimately appears in the reason-selection chain (it names the cause), so an
+# absence pin on that spelling would red a CORRECT tree. The discriminate is the positive pin above
+# (the wait arm keys on ROOM + WAITING) plus the driven pair in section 11 (level-holds with room ⇒
+# wait=0; a genuinely full box ⇒ wait=1).
+# ⛔ (the "full box still polls" contrast that used to sit here was a DUPLICATE of the pin above —
+# same needle, so nothing satisfying one could red the other. Cycle 2 removed it: the contrast is the
+# `CASCADE_ROOM <= 0` term itself, which the pin above names in full.)
+
 
 # ── 11. THE PYRAMID: five levels, filled top-down ───────────────────────────────────────────────
 # ⛔ THE ROOM IS NOT THE ORDER. `cascade_issue_slots` answers "how much room did PR work leave";
@@ -508,6 +518,48 @@ ck "…spending the per-head budget (2 of 3) still allows the re-review" \
 ck "the loop is BOUNDED: at MAX_REVIEW_TRIES it parks instead of reviewing for ever" \
    "$(rdd "$H1" 9001 shaH3 3 | cut -d' ' -f1)" "CAP"
 
+# ── 14. REVIEW CYCLE 2: the two blocking findings, pinned so they cannot come back ─────────────
+echo
+echo "=== 14. an UNSET cascade input means 'older caller', never 'no room' ==="
+# ⛔ CI RED (review cycle 2, P0). The batch guard used `:-0`, so an UNSET `CASCADE_ISSUE_SLOTS` read as
+# "no room" and the batch broke immediately. Several SHIPPED suites drive that batch body standalone
+# (`refresh-scout.test.sh:2232`), so nothing was queued at all: measured 446/9 against 455/0 on main.
+# The rule is the terse-minus one the escape block already uses one place over.
+ckin "the batch guard treats an UNSET slot count as 'pre-change', not as 0" \
+   "$SRC" '[ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 ] 2>/dev/null || break'
+ckni "…and the `:-0` form is GONE from that guard (it is the CI red)" \
+   "$SRC" '[ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] 2>/dev/null || break'
+
+ echo "=== 14b. the interval is still spent when the census gives no baseline ==="
+# ⛔ P1 (review cycle 2): the shipped call site did not pass `<lanes_at_pass_end>`, and a missing
+# baseline returned 1 BEFORE SLEEPING — and this branch REPLACES the nap, so a full box re-ran the
+# whole pass with no delay at all.
+ckin "the shipped call SITE passes the lane census as the baseline" "$SRC" 'cascade_wait $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) "${LANES:-}"'
+_s0=$SECONDS
+( O="$TMP"; LOG=/dev/null; CASCADE_POLL=1; MAX_LANES=4
+  . "$FNS"; . "$STUB"
+  measure_lanes() { LANES=4; LANES_DISPLAY=4; LANES_UNKNOWN=0; }
+  cascade_wait 2 "" >/dev/null 2>&1 ) 2>/dev/null
+_el=$(( SECONDS - _s0 ))
+ck "no baseline -> it still SPENDS the interval (returning 1 without sleeping is a hot loop)" \
+   "$([ "$_el" -ge 2 ] && echo yes || echo no)" "yes"
+
+ echo "=== 14c. the drain escape is withheld on NO ROOM, not on 'no slots' ==="
+# ⛔ P1 (review cycle 2): slots are 0 in TWO states — a full box, and a level HOLDING the room with
+# lanes idle. Withholding on the slots disabled the valve exactly where it exists (a merge ceiling
+# that keeps refusing), and printed a cause ("NO ROOM … under MAX_LANES/mem/load") that is false.
+ckin "…withheld only when the ROOM is exhausted" "$SRC" 'if [ "${CASCADE_ROOM:-1}" -le 0 ] 2>/dev/null; then'
+
+ echo "=== 14d. the funnel names WHICH of the three states deferred it ==="
+# ⛔ P2 (review cycle 2): one boolean, three causes, one sentence. `holds` and `unreadable` must not
+# claim "no room left"; the default caller keeps the original wording byte for byte.
+sel13() { ( . "$FNS"; lo_select 15 0 5 0 3 "" 10 1 2 ok 1 1 "$1" > "$TMP/s13.$$" 2>/dev/null
+           cat "$TMP/s13.$$" ) }
+ckin "a LEVEL-HOLD deferral says a higher level holds the room" "$(sel13 holds)" "a higher level is holding the room"
+ckni "…and does not claim there is no room" "$(sel13 holds)" "no room left"
+ckin "an UNREADABLE count says the count could not be read" "$(sel13 unreadable)" "the count could not be read"
+ckin "the default (no cause given) keeps the original sentence" "$(sel13 '')" "no room left after it"
+
 # ── MUTANTS: every assertion above must be able to FAIL ────────────────────────────────────────
 echo
 echo "=== M. MUTANTS — each shipped assertion is re-run against a mutated copy of the SAME file ==="
@@ -720,6 +772,28 @@ cascade_main_probe acme/widget >/dev/null 2>&1
 PEOF
 mut "M16 the NEWEST attempt no longer wins (a superseded red pins level 1 for ever)" \
     's/if prev is None or cid > prev\[0\]:/if prev is None:/' "$TMP/p-group.sh"
+
+cat > "$TMP/p-unset.sh" <<'PEOF'
+# THE CI RED: the guard must read an UNSET slot count as "pre-change", and must not carry the `:-0`
+# form that reads it as "no room".
+# ⛔ A SOURCE PIN, NOT A DRIVEN ONE, ON PURPOSE: driving the grepped line means either writing a `.sh`
+# and sourcing it (the #1484 script-backdoor shape, which the guard refused while this suite did it)
+# or `eval`-ing text read at runtime (which the same guard also refuses, and which is a real backdoor
+# idiom regardless). The BEHAVIOUR is graded by `refresh-scout.test.sh`, which drives this exact batch
+# body standalone through CI — that is where the 446/9 regression was measured — so this pin only has
+# to keep the two SPELLINGS honest.
+grep -q '\[ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 \]' "$TGT" \
+  && ! grep -q '\[ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 \]' "$TGT" && echo yes || echo no
+PEOF
+mut "M17 the batch guard reads an UNSET count as 0 again (the refresh-scout CI red)" \
+    's/\[ "\${CASCADE_ISSUE_SLOTS-1}" -ge 1 \]/[ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ]/' "$TMP/p-unset.sh"
+
+cat > "$TMP/p-call.sh" <<'PEOF'
+# THE HOT LOOP: the shipped call must hand `cascade_wait` the lane census.
+grep -q 'cascade_wait $(( 10#${CYC} - JIT + RANDOM % (2 \* JIT + 1) )) "${LANES:-}"' "$TGT" && echo yes || echo no
+PEOF
+mut "M18 the call site drops the baseline again (the interval is never spent)" \
+    's/ "${LANES:-}" || true/ || true/' "$TMP/p-call.sh"
 
 # ── 10. THE OVERRIDE IS RECORDED, NOT SILENT ───────────────────────────────────────────────────
 echo
