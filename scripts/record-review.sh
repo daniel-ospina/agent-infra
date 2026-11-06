@@ -1975,8 +1975,17 @@ $m"
       # no notation is involved in either. The comment is the justification a later reader trusts, so
       # a false one propagates. Three tests now, in this order: an ancestor of the attested head is
       # INSIDE the range; a DESCENDANT of it is AFTER the head (a verdict naming one is not a verdict
-      # at B at all, since that commit did not exist at B); only what remains can be a narrowing
-      # endpoint outside the range.
+      # at B at all, since that commit did not exist at B); only what remains DESCENDS FROM THE
+      # RANGE'S START while being neither inside the range nor a descendant of its head — the only
+      # population in which a narrowing endpoint written in an unparsed notation could live, which is
+      # why branches 1 and 2 are the ones that can be stated as fact and branch 3 is not.
+      # ⛔ AND BRANCH 3 MAY NOT ASSERT THE NARROWING (thirteenth review cycle, P2 — MEASURED with a
+      # sibling-lineage commit: an artifact that merely REFERENCED another branch's commit, writing no
+      # range and no notation at all, was told it had written "a NARROWER range … in a notation this
+      # code does not parse". That population cannot be shown to be a narrowing, so branch 3 now uses
+      # branch 1's honest framing — the CONSERVATIVE READING, stated as such — instead of asserting a
+      # fact it does not have. This is the third time in three cycles that a refusal was correct while
+      # its sentence was not; the pattern is that a message may only state what its own tests measure.)
       _r=0
       delta_git "$root" merge-base --is-ancestor "$_tsha" "$to" 2>/dev/null || _r=$?
       if [ "$_r" -eq 0 ]; then
@@ -1987,11 +1996,11 @@ $m"
       _r=0
       delta_git "$root" merge-base --is-ancestor "$to" "$_tsha" 2>/dev/null || _r=$?
       if [ "$_r" -eq 0 ]; then
-        echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit AFTER ${to:0:12}…, the head being attested. ${to:0:12}… is an ancestor of it, so it did not exist when a verdict at ${to:0:12}… was written: an artifact that names it is a verdict against a LATER head (or a reference to work that has not been reviewed here), and a `clean` record at ${to:0:12}… would extend it to a commit nobody reviewed. Nothing was written." >&2
+        echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit AFTER ${to:0:12}…, the head being attested. ${to:0:12}… is an ancestor of it, so it did not exist when a verdict at ${to:0:12}… was written: an artifact that names it is a verdict against a LATER head (or a reference to work that has not been reviewed here), and a \`clean\` record at ${to:0:12}… would extend it to a commit nobody reviewed. Nothing was written." >&2
         echo "   → record the verdict at the head it actually reviews, or drop the reference — quote the range as delta:${from:0:12}..${to:0:12} and name no commit later than ${to:0:12}…." >&2
         return 1
       fi
-      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — LATER than ${from:0:12}… (the range's start), not ${to:0:12}… (the head being attested), not inside the range above it, and not a descendant of it either. That is a NARROWER range than ${from:0:12}…..${to:0:12}… written in a notation this code does not parse, and the acceptably-spelled statement beside it satisfies every other check — so recording now would assert a range the artifact itself narrows away from." >&2
+      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit on neither the range ${from:0:12}…..${to:0:12}… nor ${to:0:12}…'s own lineage, although it descends from the range's start. From the text alone this code cannot tell a reference to a PARALLEL lineage (another branch's work, quoted for context) from a narrowing endpoint written in some notation the range parser above did not tokenise, and only the second is a witness against the record — so it takes the conservative reading (the arm's declared residual, stated above it). Nothing was written." >&2
       echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}, and refer to commits INSIDE the range by description rather than by sha." >&2
       return 1
     done
@@ -5394,7 +5403,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         exit 3
         else
         echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD'S CHECK SURFACE COULD NOT BE READ (UNREADABLE), so “not red” was never established." >&2
-        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted. An EMPTY surface (the API ANSWERED, and NOTHING OBSERVABLE is left after the exclusion — so `empty` can sit over an EXCLUDED red, which is why it is not a green answer) is deliberately not this state — check_surface_scan keeps the two apart, and an empty surface is never read as a green tree — but a REFUSED read is its own answer and nothing was established by it. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
+        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted. An EMPTY surface (the API ANSWERED, and NOTHING OBSERVABLE is left after the exclusion — so \`empty\` can sit over an EXCLUDED red, which is why it is not a green answer) is deliberately not this state — check_surface_scan keeps the two apart, and an empty surface is never read as a green tree — but a REFUSED read is its own answer and nothing was established by it. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
         exit 3
         fi
       fi

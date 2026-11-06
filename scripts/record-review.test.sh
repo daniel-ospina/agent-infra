@@ -7874,6 +7874,32 @@ run_record_delta $EH54 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524501" \
 assert_eq "$RECORD_RC" "3" "20h46 a commit AFTER the attested head is still refused (rc 3)"
 assert_contains "$RECORD_ERR" "AFTER" "20h46 the refusal says AFTER the attested head"
 assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h46 and does NOT accuse the artifact of an unparseable narrowing"
+# 20h46b THE MESSAGE MUST NOT EXECUTE ITS OWN BACKTICKS (thirteenth cycle, P2). The refusal above was
+#        written with a RAW `` `clean` `` inside a double-quoted `echo`, so bash ran `clean` as a
+#        COMMAND SUBSTITUTION: stderr carried `line NNNN: clean: command not found` and the sentence
+#        printed `a  record` with the word missing. Measured on the shipped head, and it is not
+#        cosmetic on a box where a `clean` executable exists on PATH — the message executes it. The
+#        rule and the exit code were unaffected, which is exactly why nothing caught it.
+assert_not_contains "$RECORD_ERR" "command not found" "20h46b the refusal does not RUN its own backticked word"
+assert_contains "$RECORD_ERR" 'a `clean` record' "20h46b the backticked word is PRINTED, not run"
+# 20h48 THE WHOLE SCRIPT, NOT JUST ONE SENTENCE (thirteenth cycle, P2). The same defect already
+#        pre-existed on the carry arm's `empty` message, so a vector per sentence cannot bound it —
+#        the class is "an echo/printf message that executes its own backticks". This is the sweep:
+#        every `echo`/`printf` LINE in the recorder is scanned, escaped backticks excepted. It reds
+#        on a reintroduction anywhere in the file rather than only where someone thought to test.
+_badbt="$(python3 - "$SCRIPT_DIR/record-review.sh" <<'PY48'
+import re, sys
+out = []
+for i, l in enumerate(open(sys.argv[1]), 1):
+    st = l.strip()
+    if not (st.startswith('echo ') or st.startswith('printf ')):
+        continue
+    if re.findall(r'(?<!\\)`', st):
+        out.append("%d: %s" % (i, st[:90]))
+print("\n".join(out))
+PY48
+)"
+assert_eq "$_badbt" "" "20h48 no echo/printf message anywhere in the recorder executes its own backticks"
 # 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
 #       commit that descends from `from` while being neither an ancestor NOR a descendant of the
 #       attested head is the one shape a narrowing endpoint can actually take — and no shipped vector
@@ -7887,8 +7913,9 @@ run_record_delta $EH55 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524701" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I also reviewed up to ${DG_SIB} on the side branch, which is where the real work happened."
-assert_eq "$RECORD_RC" "3" "20h47 a narrowing endpoint OUTSIDE the range is refused (rc 3)"
-assert_contains "$RECORD_ERR" "NARROWER range" "20h47 and the refusal is the narrowing one, not the inside/after one"
+assert_eq "$RECORD_RC" "3" "20h47 a commit on a PARALLEL lineage is refused (rc 3)"
+assert_contains "$RECORD_ERR" "PARALLEL lineage" "20h47 and the refusal says the lineage it cannot tell apart"
+assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h47 and does NOT assert a narrowing the artifact never wrote (thirteenth cycle)"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
