@@ -74,7 +74,8 @@ release_issue_claim_unspawned() { # <issue>
 # reaper prunes it. The CI-queue deferral already did this correctly (and exits 3 so the cycle record
 # says `dispatched=0`); the BATCH-level repo-target refusals must do the same, and do — every one of
 # them exits 72, which orch-loop.sh's `_dmrc` arm turns into `K=0` for the batch. One helper, used by
-# every refusal path, so no path can drop a claim and keep the row.
+# every refusal path, so no path can drop a claim and keep the row — EXCEPT the chain-could-not-start
+# site, which KEEPS its row on purpose (see the block at the third per-issue cleanup site).
 #   ⚠️ SCOPE: a PER-ISSUE refusal (`continue`, below) used to leave this script's exit status 0 — the
 #   controller then counted a batch that started nothing as dispatched. It is not latent: the same arm
 #   gates on the BRANCH assertion, and a REUSED `.worktrees/tm-<N>` (checked out on another named

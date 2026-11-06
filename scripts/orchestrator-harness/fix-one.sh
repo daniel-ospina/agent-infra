@@ -241,11 +241,18 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     # helper grows an arm.
     # ⛔ NOT `prlock_refuse`'s RULE (the function below, with its note above it), which CONSUMES the
     # attempt: a `$PRLOCK` that is not a regular file, or a `$O/state` this box cannot write, is
-    # bookkeeping no re-dispatch can change, so refunding it spins for ever (`fixcount` nets to zero,
-    # MAX_FIX_TRIES never trips, nothing parks). The distinction is causal, not positional: those
-    # refusals are not about a checkout, while here the checkout IS what failed and each cycle names
-    # its repair. ⛔ No line numbers in this block on purpose: a citation here already rotted once when
-    # an edit to this very comment shifted the function it pointed at.
+    # bookkeeping no re-dispatch can change. ⛔ But the answer here is NOT "so consume a sticky one":
+    # this file deliberately refunds refusals that never clear by themselves — the repo-IDENTITY
+    # refusal above refunds a permanent misconfiguration by its own wording, and the #2223 per-head
+    # note inside `refund_gate_attempt` refunds a DISK refusal whose comment says outright it "never
+    # clears by waiting". The trade is stated there and applies here: parking the PR on "attempts
+    # exhausted" is a FALSE sentence about work that never ran, so a sticky refusal is left LOUD in
+    # `fix-$PR.log` and re-spawned rather than silently parked, and the conflicted arm's `$MF`
+    # fix-lane ceiling / cross-box claim / `can_spawn` bound the re-spawn (it is not unbounded).
+    # ⛔ And `wt_provision`'s refusals carry NO `REPAIR:` token, unlike `prlock_refuse`'s — so what a
+    # human gets from a sticky one is the cause without the fix (filed separately). No line numbers in
+    # this block on purpose: a citation here already rotted once when an edit to this comment shifted
+    # the function it pointed at.
     refund_gate_attempt
     exit 1
   fi

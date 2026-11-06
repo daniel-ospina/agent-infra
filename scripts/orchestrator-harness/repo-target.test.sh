@@ -306,9 +306,11 @@ c4=$?
 # The refusal is driven through the UNREGISTERED-DIRECTORY arm (a foreign directory at the worktree
 # path), which is `wt_provision`'s other rc=2 and needs no git state to set up.
 # ⛔ THE BRANCH MUST EXIST FIRST. Without it `fix-one.sh` refuses at the BRANCH assertion (rc=72) long
-# before `wt_provision` runs, so the arm silently pins the branch refusal's refund (C2/C4's subject)
-# and NOT the materialisation refund it names — measured `52 passed, 1 failed` with rc=72 until this
-# line existed. The later `branch work` below stays for C3's own use.
+# before `wt_provision` runs, so the arm silently pins the branch refusal's refund and NOT the
+# materialisation refund it names — measured `52 passed, 1 failed` with rc=72 until this line existed.
+# (That is C2's subject, and C2 witnesses the REFUSAL, not a refund: its run is positional, so `CTRL`
+# is unset and `refund_gate_attempt` returns at once. The identity arm is C4's.) The later `branch
+# work` below stays for C3's own use.
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
 mkdir -p "$AI/.worktrees/fix-4005"
 printf 'operator data\n' > "$AI/.worktrees/fix-4005/precious.txt"
