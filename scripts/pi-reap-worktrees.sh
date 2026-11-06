@@ -3059,12 +3059,12 @@ abstain_gate() {
 # directory already gone, and `unreadable-path` is a PRESERVE. ⛔ NOT an enumeration to keep: rule 5
 # is a KEEP (`preserve pr-closed-unmerged`), the removal set is wider than any list written here,
 # and the authority is the code — `grep -n -F "printf 'remove\t" scripts/pi-reap-worktrees.sh` (the
-# escape is LITERAL in the format string) `| grep -v ':#'`. ⛔ TWO COMMANDS, NOT ONE: that `-F` form,
-# comments filtered out, yields the removal sites and the line quoting the pattern — and NOTHING
-# else. The PLAIN `grep "printf 'remove"` is what additionally lists the summary counters
-# `printf 'remove=%s`/`printf 'removed=%s`. Collapsing the two into one sentence is how this claim
-# was false: `printf 'remove=%s` does not contain `printf 'remove\t`, so it cannot appear in `-F`
-# output at all (measured). The precedence header at the top of the rule table spells this correctly.
+# escape is LITERAL in the format string) `| grep -v ':#'`. ⛔ THREE FORMS, NOT ONE — collapsing them
+# is how this sentence was false TWICE. FILTERED `-F` yields the removal sites and NOTHING else:
+# `-n` prints a comment as `NNN:#…`, so `:#` drops every line quoting the pattern (this paragraph
+# included); the UNFILTERED `-F` form is what adds those back. Only the PLAIN `grep "printf 'remove"`
+# additionally lists the counters `printf 'remove=%s`/`printf 'removed=%s`, which cannot match `-F`
+# (`printf 'remove=%s` lacks `printf 'remove\t`). The precedence header at the top states this correctly.
 #
 # TWO PROBES, and the second exists because the first can be silent:
 #   (a) RECORD-BASED — the four record sources named in `pin_tree_match` below, each of which a
