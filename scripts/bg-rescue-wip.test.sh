@@ -563,6 +563,20 @@ SHIM
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$1" >> "%s/timeout.log"\nif [ -n "%s" ]; then exec "%s" "$@"; fi\nshift\nexec "$@"\n' \
     "$d" "$_realt" "$_realt" > "$d/timeout" || return 1
   chmod +x "$d/timeout" || return 1
+  # ⛔ A `uname` STUB, SO THE macOS DEFAULT IS EXECUTED ON THE HOST CI ACTUALLY RUNS (review round 11, P2).
+  # `retry_credential`'s `uname = Darwin` candidate (`bg-rescue-wip.sh:393`) is the PRE-PR macOS behaviour
+  # this change promises to PRESERVE, and every arm that asserted it was gated on the same `uname` — so on
+  # Linux, which is every runner this repo has (`grep -rn 'runs-on' .github/workflows` has no macOS entry),
+  # **deleting :393 left the suite at its baseline** (`PASS=177 FAIL=0`, measured) and so did hoisting the
+  # `unshadow` fall-through above it. A green PR could therefore regress every Mac rescue to local-only —
+  # the exact #2292 degradation — and nothing would say so. The script resolves `uname` through PATH and
+  # the fixture already prepends this directory, so a stub that answers the value of `BG_TEST_UNAME_S`
+  # executes the branch on ANY host: the arm stops being a property of the machine. With the variable
+  # unset this delegates to the real `uname`, so no other arm changes behaviour.
+  local _realu; _realu="$(command -v uname 2>/dev/null)"
+  printf '#!/usr/bin/env bash\nif [ -n "${BG_TEST_UNAME_S:-}" ]; then printf "%%s\\n" "$BG_TEST_UNAME_S"; exit 0; fi\nif [ -n "%s" ]; then exec "%s" "$@"; fi\nexec uname "$@"\n' \
+    "$_realu" "$_realu" > "$d/uname" || return 1
+  chmod +x "$d/uname" || return 1
   bash -n "$d/timeout" 2>/dev/null || { echo "❌ generated timeout stub is not valid bash: $d/timeout"; return 1; }
   return 0
 }
@@ -940,49 +954,44 @@ try_rescue wfunshadow wf_shadowed fix/lane-one \
   "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN BG_RESCUE_PUSH_UNSHADOW=1 GH_TOKEN=shadow-readonly-pat"
 assert_unshadow_arm wfunshadow wfunshadow 'GH_TOKEN=shadow-readonly-pat GITHUB_TOKEN=unset'
 
-# ⛔ THE macOS DEFAULT, ASSERTED WHERE IT EXISTS. Without this arm the `uname = Darwin` branch is green
-# nowhere: red on the Mac (via the bug above) and dead code on Linux.
-# ⛔ AND IT MUST RUN WITH AN AMBIENT TOKEN SET (review round 7, P2). Without one, `osxkeychain` at the
+# ⛔ THE macOS DEFAULT — EXECUTED ON EVERY HOST, NOT ONLY ON A MAC (review round 11, P2). This arm used to
+# be gated on the real `uname`, so it SKIPPED everywhere CI runs and the branch it protects was unasserted
+# where the gate lives: deleting `bg-rescue-wip.sh:393` left the suite at its baseline. The fixture now
+# ships a `uname` stub, so `BG_TEST_UNAME_S=Darwin` runs the macOS branch here, on Linux, in CI.
+# ⛔ AND IT RUNS WITH AN AMBIENT TOKEN SET (review round 7, P2). Without one, `osxkeychain` at the
 # platform arm and the `unshadow` fall-through below it are INDISTINGUISHABLE — both return the same
 # plan — so swapping those two lines (a plausible "check the token before the platform" tidy-up)
 # reversed the proven macOS default and falsified the declared residual, with the suite fully GREEN on a
 # clean machine (and red only if the developer happened to have GH_TOKEN exported). With the token set,
 # `wf_then_ok` accepts a helper-named attempt and only that, so an inverted order cannot pass.
-if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-  try_rescue wfhelper wf_then_ok fix/lane-one \
-    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN GH_TOKEN=shadow-readonly-pat"
-  [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
-    && ok "wfhelper: the Darwin default retries ONCE with a helper credential and rescues (exit 0, 2 attempts)" \
-    || bad "wfhelper: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — $OUT"
-  [ "${WHO:-}" = "plain keychain " ] \
-    && ok "wfhelper: the retry selected the KEYCHAIN helper (the macOS default is not silently dropped)" \
-    || bad "wfhelper: the Darwin default selected no helper credential — attempts were: ${WHO:-none}"
-  [ -n "$(ref_of "$T/wfhelper/origin.git" refs/wip/fix-lane-one)" ] \
-    && ok "wfhelper: the snapshot reached origin" \
-    || bad "wfhelper: nothing was published"
-else
-  skip "wfhelper: the osxkeychain default only exists on macOS, and this host is $(uname -s 2>/dev/null)"
-fi
+try_rescue wfhelper wf_then_ok fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GITHUB_TOKEN BG_TEST_UNAME_S=Darwin GH_TOKEN=shadow-readonly-pat"
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfhelper: the Darwin default retries ONCE with a helper credential and rescues (exit 0, 2 attempts)" \
+  || bad "wfhelper: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — $OUT"
+[ "${WHO:-}" = "plain keychain " ] \
+  && ok "wfhelper: the retry selected the KEYCHAIN helper (the macOS default is not silently dropped)" \
+  || bad "wfhelper: the Darwin default selected no helper credential — attempts were: ${WHO:-none}"
+[ -n "$(ref_of "$T/wfhelper/origin.git" refs/wip/fix-lane-one)" ] \
+  && ok "wfhelper: the snapshot reached origin" \
+  || bad "wfhelper: nothing was published"
 
-# ⛔ THE macOS DEFAULT IS UNCONDITIONAL — ASSERTED ON A MAC WITH NO AMBIENT TOKEN AT ALL (review round 8,
+# ⛔ THE macOS DEFAULT IS UNCONDITIONAL — ASSERTED WITH NO AMBIENT TOKEN AT ALL (review round 8,
 # P2). `wfhelper` sets a token, because that is what makes the candidate ORDER observable; the cost was
 # that no Darwin-runnable arm exercised the branch in a CLEAN environment, so gating it on "a shadow
 # exists" — a plausible tidy-up, given the header's own "one rule: unshadow only when there is something
 # to unshadow" — silently removed the macOS retry for the ordinary Mac (no GH_TOKEN exported) and NO
 # host could see it: green on Linux, green in the flipped run. This arm unsets every seam and both
 # tokens and requires the retry anyway.
-if [ "$(uname -s 2>/dev/null)" = "Darwin" ]; then
-  try_rescue wfhelper2 wf_then_ok fix/lane-one \
-    "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN"
-  [ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
-    && ok "wfhelper2: on a Mac with NO ambient token and no seams, the default retry still runs (exit 0, 2 attempts)" \
-    || bad "wfhelper2: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the macOS default became CONDITIONAL on an ambient token — $OUT"
-  [ "${WHO:-}" = "plain keychain " ] \
-    && ok "wfhelper2: and it selected the keychain helper (the pre-PR behaviour, unchanged)" \
-    || bad "wfhelper2: the macOS default is no longer unconditional — attempts were: ${WHO:-none}"
-else
-  skip "wfhelper2: the osxkeychain default only exists on macOS, and this host is $(uname -s 2>/dev/null)"
-fi
+# It too is now forced through the `uname` stub rather than skipped on a non-Mac (review round 11, P2).
+try_rescue wfhelper2 wf_then_ok fix/lane-one \
+  "-u BG_RESCUE_PUSH_HELPER -u BG_RESCUE_PUSH_UNSHADOW -u GH_TOKEN -u GITHUB_TOKEN BG_TEST_UNAME_S=Darwin"
+[ "$RC" -eq 0 ] && [ "${ATTEMPTS:-0}" = "2" ] \
+  && ok "wfhelper2: on a Mac with NO ambient token and no seams, the default retry still runs (exit 0, 2 attempts)" \
+  || bad "wfhelper2: rc=$RC attempts=${ATTEMPTS:-0} (want 0 and 2) — the macOS default became CONDITIONAL on an ambient token — $OUT"
+[ "${WHO:-}" = "plain keychain " ] \
+  && ok "wfhelper2: and it selected the keychain helper (the pre-PR behaviour, unchanged)" \
+  || bad "wfhelper2: the macOS default is no longer unconditional — attempts were: ${WHO:-none}"
 
 # ⛔ THE DOCUMENTED PRECEDENCE, PINNED (review round 2, P2). The header says the explicit helper "wins
 # everywhere"; nothing observed it, so swapping the two `if` lines in `retry_credential` was GREEN. An
