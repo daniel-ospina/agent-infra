@@ -7635,6 +7635,68 @@ else
 fi
 assert_eq "$RECORD_RC" "0" "20h36 a commit on an UNRELATED lineage does not refuse the claim (rc 0)"
 [ -f "$(Q2 $EH42)" ] || bad "20h36 no record was written for a correct artifact"
+# 20h37 THE BLOCK'S PREAMBLE AND INTER-ROW PROSE ARE SCANNED (eighth cycle, P1 — the seventh
+#       cycle's exclusion was a LINE SPAN from the heading to its last row, so every non-row line
+#       INSIDE it was dropped from the claim: the block's preamble, and prose between its rows.
+#       MEASURED on that head: the body below recorded rc 0 with `delta_range=BASE..HEAD`. It is
+#       the shape a reviewer actually produces — the #3442 block is appended to a verdict, and the
+#       sentence above the table is where they say what they read. A span is a REGION in a shorter
+#       costume; the exclusion is now a LINE predicate (heading + table rows only).
+EH43=425222; rm -f "$(Q2 $EH43)"
+run_record_delta $EH43 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+The verdict I am extending actually read delta:${DG_A1}–${DG_HEAD}.
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h37 a narrowing in the block's PREAMBLE is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h37 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH43)" ] && bad "20h37 no record was written" || ok "20h37 no record was written"
+# and the same shape BETWEEN two rows, which the span also dropped.
+EH44=425224; rm -f "$(Q2 $EH44)"
+run_record_delta $EH44 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| one | y | z | rc 3 |
+
+Only delta:${DG_A1}..${DG_HEAD} was actually read.
+
+| two | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h37 a narrowing BETWEEN two kill-table rows is REFUSED (rc 3)"
+[ -f "$(Q2 $EH44)" ] && bad "20h37 no record was written" || ok "20h37 no record was written"
+# 20h38 THE HEADING IS RECOGNISED BY brief-gate.sh's CONTRACT, NOT A SECOND ONE (eighth cycle,
+#       P2). #3442's validator accepts ANY case, ANY `#` depth, indent <= 3 and
+#       `mutation[ -]attribution`; this matcher knew only the canonical spelling, so a fully valid
+#       artifact was not excluded, its row was compared as the reviewer's claim, and it was
+#       refused with a FALSE ACCUSATION. Both spellings below pass brief-gate's own arm.
+EH45=425226; rm -f "$(Q2 $EH45)"
+run_record_delta $EH45 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+### Mutation-Attribution
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| the verdict covers ${DG_A1} | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "0" "20h38 a ### Mutation-Attribution heading (brief-gate-valid) is EXCLUDED (rc 0)"
+[ -f "$(Q2 $EH45)" ] || bad "20h38 no record was written for a valid artifact"
+# and the validator really does accept that spelling — otherwise this vector proves nothing.
+if printf '### Mutation-Attribution\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\n' \
+    | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --mutation-missing - >/dev/null 2>&1; then
+    ok "20h38 brief-gate accepts the non-canonical heading (the vector is not vacuous)"
+else
+    bad "20h38 brief-gate did NOT accept the non-canonical heading — the vector would prove nothing"
+fi
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7878,12 +7940,13 @@ MUT="$(mk_mutant relativehead '    case "$_claim" in
       *HEAD~*|*HEAD^*')"
 mut_check "M22 a tip-relative range is refused" 425210 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD~1..HEAD."
-# M23 — THE BLOCK BOUND (20h34). The sixth cycle ended the kill-table skip at the next `## `
-#       heading, which is a REGION, not the block. Restoring that shape (here: letting the block
-#       run to the end of the body) re-accepts a narrowing written under a `### ` subsection
-#       after the table — the false pass the seventh cycle measured.
-MUT="$(mk_mutant blockbound '        stop = last' '        stop = n')"
-mut_check "M23 the kill-table exclusion is the BLOCK, not the region after it" 425212 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+# M23 — THE EXCLUSION IS THE ROWS, NOT THE SECTION (20h34, 20h37). Skipping every line of the
+#       block's section is a REGION in a shorter costume: the sixth cycle's region ran to the next
+#       `## ` heading, the seventh cycle's span ran to the last row — both dropped PROSE, and both
+#       re-accepted a narrowing written there. The mutant restores the span shape (skip the whole
+#       section) and 20h34's `### Scope caveat` narrowing is accepted again.
+MUT="$(mk_mutant spanblock '            if (L[i] ~ /^[ \t>]*[|]/) continue' '            continue')"
+mut_check "M23 the exclusion is the ROWS, not the whole section" 425212 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 
 ## MUTATION ATTRIBUTION (agent-infra#3442)
 
@@ -7892,7 +7955,30 @@ mut_check "M23 the kill-table exclusion is the BLOCK, not the region after it" 4
 | x | y | z | rc 3 |
 
 ### Scope caveat
-I only actually reviewed ${DG_A1}..${DG_HEAD}; the base-side merge was not read."
+I only actually reviewed ${DG_A1}–${DG_HEAD}; the base-side merge was not read."
+# M26 — THE TABLE ROWS ARE ACTUALLY EXCLUDED (20h32). The other direction of M23: with the row
+#       predicate broken the kill table is compared as the reviewer's own claim, so a CORRECT
+#       artifact is refused because of a row describing a mutant pinned to the range.
+MUT="$(mk_mutant norowskip '            if (L[i] ~ /^[ \t>]*[|]/) continue' '            if (0) continue')"
+mut_check "M26 the kill table's rows ARE excluded from the claim" 425208 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 20h30 the decoy beside a narrowed claim is caught | re-point this cell at delta:${DG_A1}..${DG_HEAD} | 20h30 | rc 3 |"
+# M27 — THE HEADING CONTRACT MIRRORS brief-gate.sh (20h38). Recognising only the canonical
+#       spelling leaves a brief-gate-VALID block unexcluded, so its row is read as the claim and a
+#       valid artifact is refused with a false accusation. The mutant restores the canonical-only
+#       matcher; 20h38's `### Mutation-Attribution` then refuses.
+MUT="$(mk_mutant canonhead 'tolower(substr(L[i], RLENGTH + 1)) ~ /^[ \t]*mutation[ -]attribution/' 'tolower(substr(L[i], RLENGTH + 1)) ~ /^[ \t]*mutation attribution/')"
+mut_check "M27 the heading contract mirrors brief-gate's" 425226 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+### Mutation-Attribution
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| the verdict covers ${DG_A1} | y | z | rc 3 |"
 # M24 — THE UNRELATED-LINEAGE BOUND (20h36). Dropping the "is it LATER than A" test makes every
 #       resolvable token that is not reviewed history a contradiction, which is the seventh
 #       cycle's false block: an artifact quoting a commit on an UNRELATED lineage is refused for

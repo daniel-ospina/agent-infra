@@ -1639,17 +1639,9 @@ $m"
     # compared as if it were the reviewer's own claim, so a CORRECT artifact was refused
     # because of its kill table. The claim lives in the prose; the kill table is not a claim
     # about what was reviewed.
-    # ⛔ THE EXCLUSION IS THE BLOCK ITSELF, NOT THE REGION AFTER IT (seventh review cycle, P1 —
-    # MEASURED on the sixth cycle's version, which ended the skip only at the next `## `
-    # heading: a narrowing written under a `### ` sub-heading after the table — e.g. "### Scope
-    # caveat / I only actually reviewed A1..HEAD" — was excluded from the claim, so the decoy
-    # `delta:BASE..HEAD` above it satisfied every check and a signed `clean` was minted over a
-    # commit the artifact said was not read. The exclusion skipped prose that was never part of
-    # the table, which is the `## `-vs-`###` distinction the header of brief-gate.sh's own
-    # parser documents.) The block now ends at its LAST table row — plus a trailing blank or
-    # `NO NEW ASSERTIONS:` line — so everything after it is scanned again, closing the false
-    # pass AND the mirror false block (a body whose only range statement follows the table used
-    # to be refused as "does not STATE the range").
+    # ⛔ THE EXCLUSION IS THE BLOCK'S OWN **ROWS**, AND NOTHING ELSE — never a region. See the
+    # note above the awk below for the two measured false passes this cost (the region after the
+    # block, then the line span through it) and for the shape contract it mirrors.
     # ⛔ AND THE BODY ARRIVES `@tsv`-ESCAPED — GitHub delivers a comment as ONE record with
     # literal `\n` sequences, so a line-oriented scan sees no line starts at all and the block
     # was never stripped (MEASURED: the kill table's own row was compared as the claim and
@@ -1658,33 +1650,55 @@ $m"
     # work, and it is also what lets a range split across a line break be seen. `gsub(/\\n/,
     # "\n")` is awk rather than sed because BSD and GNU sed disagree about `\n` in a
     # replacement and this file runs on both.
+    # ⛔ THE EXCLUSION IS THE BLOCK'S OWN **ROWS**, AND NOTHING ELSE — NOT the region after it
+    # (sixth cycle), and NOT the line span from the heading to its last row (seventh cycle, P1 —
+    # MEASURED: the span dropped the block's PREAMBLE and any prose between its rows, so an
+    # artifact that restated the range it actually read inside the section — the exact shape a
+    # reviewer produces when the block is appended to a verdict — recorded rc 0 over commits the
+    # artifact said were not read. A span is a REGION in a shorter costume; the fix has to be a
+    # LINE predicate, so prose is scanned wherever it sits and only the table's rows go.)
+    # ⛔ AND THE HEADING IS RECOGNISED BY `brief-gate.sh`'s CONTRACT, NOT BY A SECOND ONE (seventh
+    # cycle, P2 — MEASURED: `### MUTATION ATTRIBUTION`, `## Mutation Attribution` and an indented
+    # heading are all ACCEPTED by the #3442 validator and all passed its arm here, but this matcher
+    # knew only the canonical spelling — so the block was not excluded, its rows were compared as
+    # the reviewer's claim, and a fully valid artifact was refused with a FALSE ACCUSATION. The
+    # authoritative shape is brief-gate's: any case, any `#` depth, indent <= 3, `mutation[ -]
+    # attribution`, and a heading at or above the section's depth closes it. ONE SHAPE DEFINITION:
+    # this is a mirror of that predicate, and the vector below (20h38) pins the mirror rather than
+    # trusting it. DECLARED RESIDUAL: fenced blocks are not tracked here. A fenced EXAMPLE table's
+    # rows are still excluded (they are rows) and a fenced narrowing is still SCANNED — neither
+    # direction is fail-open, so the fence machinery is not mirrored.
     _claim="$(printf '%s\n' "$EVIDENCE_BODY" | command awk '
       { rec = rec $0 "\n" }
       END {
         gsub(/\\n/, "\n", rec)
         n = split(rec, L, "\n")
-        h = 0
-        for (i = 1; i <= n && h == 0; i++)
-          if (L[i] ~ /^##[[:space:]]+MUTATION[[:space:]]+ATTRIBUTION/) h = i
-        if (h == 0) { for (i = 1; i <= n; i++) print L[i]; exit }
-        # the block = its heading through the LAST table row before the next `## ` heading
-        last = 0
-        for (i = h + 1; i <= n; i++) {
-          if (L[i] ~ /^##[[:space:]]/) break
-          if (L[i] ~ /^[[:space:]]*[|]/) last = i
-        }
-        stop = h
-        if (last > 0) {
-          stop = last
-        } else {
-          # no table: the line form (`NO NEW ASSERTIONS: …`) is the whole block
-          for (i = h + 1; i <= n; i++) {
-            if (L[i] ~ /^[[:space:]]*$/) { stop = i; continue }
-            if (L[i] ~ /^[[:space:]]*NO NEW ASSERTIONS/) { stop = i; continue }
-            break
+        h = 0; hd = 0
+        for (i = 1; i <= n && h == 0; i++) {
+          if (match(L[i], /^[ \t]*#+/)) {
+            lead = index(L[i], "#") - 1
+            nh = RLENGTH - lead
+            if (lead <= 3 && tolower(substr(L[i], RLENGTH + 1)) ~ /^[ \t]*mutation[ -]attribution/) {
+              h = i; hd = nh
+            }
           }
         }
-        for (i = 1; i <= n; i++) if (i < h || i > stop) print L[i]
+        if (h == 0) { for (i = 1; i <= n; i++) print L[i]; exit }
+        # a heading at or above the section closes it (subsections stay inside)
+        end = n
+        for (i = h + 1; i <= n; i++) {
+          if (match(L[i], /^[ \t]*#+/)) {
+            lead = index(L[i], "#") - 1
+            if (lead <= 3 && RLENGTH - lead <= hd) { end = i - 1; break }
+          }
+        }
+        for (i = 1; i <= n; i++) {
+          if (i >= h && i <= end) {
+            if (i == h) continue                                   # the heading itself
+            if (L[i] ~ /^[ \t>]*[|]/) continue                     # a table row
+          }
+          print L[i]
+        }
       }
     ' 2>/dev/null || true)"
     if [ "$DELTA_KIND" = "merge-only" ]; then
