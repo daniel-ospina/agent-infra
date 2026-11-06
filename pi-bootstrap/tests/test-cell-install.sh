@@ -2264,7 +2264,9 @@ done
 # covered this class before — the table pinned `%40`, `|`, `^` and a genuine `münchen` IDN, and a
 # dot-equivalent is neither. The `_good` loop above is the other half: `münchen.example` must STAY
 # certified, so the fix cannot be "refuse all non-ASCII".
-for _spoof in "https://api.premiselabs.co$(printf '\u3002')evil.example/mcp/" \
+for _spoof in "https://api.premiselabs.co$(printf '\u00ad')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\u200b')evil.example/mcp/" \
+              "https://api.premiselabs.co$(printf '\u3002')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\uff0e')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\uff61')evil.example/mcp/" \
               "https://api.premiselabs.co$(printf '\ufe52')evil.example/mcp/" \
@@ -2281,9 +2283,15 @@ json.dump(d, open(p, "w"), indent=2)
 PY
   run_verify
   rc=$?
-  [ "$rc" -ne 0 ] && grep -qE "^(NOHOST|BADHOST):" "$LOG" \
+  [ "$rc" -eq 1 ] && grep -qF 'names no usable host' "$LOG" \
     && ok "a DOT-EQUIVALENT authority is REFUSED, never certified with the key attached ($_spoof)" \
-    || fail "a dot-equivalent spoof was CERTIFIED (rc=$rc, $_spoof) — the client resolves it to a different host while the gate prints SELFHOSTED with ${TORTOISE_MCP_API_KEY} attached"
+    || fail "a dot-equivalent spoof was CERTIFIED (rc=$rc, $_spoof) — the client resolves it to a different host while the gate certifies it SELFHOSTED with the key still attached"
+  run_install
+  run_verify
+  rc=$?
+  [ "$rc" -eq 0 ] \
+    && ok "...and install REPAIRS the dot-equivalent spoof into the hosted default, so verify converges ($_spoof)" \
+    || fail "install did not converge from a dot-equivalent spoof entry ($_spoof): verify still fails (rc=$rc)"
 done
 # ⛔ AND THE TWO COPIES MUST AGREE — THE FILE SAYS SO TWICE AND NOTHING CHECKED IT (#3374 review,
 # round 2 P3). `cell-install.sh`'s marker and `merge-mcp.py` both claim "the SAME predicate under the
@@ -2302,6 +2310,8 @@ table = ["https://api.premiselabs.co/mcp/", "http://localhost:8000/mcp", "https:
          "https://api.premiselabs.co%40evil.example/mcp/", "https://host:65536/mcp/",
          "https://host:-1/mcp/", "https://a..b/mcp/", "https://api.premiselabs.co|evil.example/mcp/",
          "https://a^b.example/mcp/", "https://a<b.example/mcp/", "https://١.example/mcp/",
+         "https://api.premiselabs.co\u00adevil.example/mcp/",
+         "https://api.premiselabs.co\u200bevil.example/mcp/",
          "https://api.premiselabs.co\u3002evil.example/mcp/",
          "https://api.premiselabs.co\uff0eevil.example/mcp/",
          "https://api.premiselabs.co\uff61evil.example/mcp/",
@@ -2315,7 +2325,7 @@ spec.loader.exec_module(mm)
 src = open(sys.argv[2]).read()
 start = src.index("def _port_ok(")
 end = src.index("    return all(_label_ok(lab) for lab in labels)") + len("    return all(_label_ok(lab) for lab in labels)")
-ns = {"re": re, "ipaddress": __import__("ipaddress")}
+ns = {"re": re, "ipaddress": __import__("ipaddress"), "unicodedata": __import__("unicodedata")}
 try:
     import idna as _pkg
     ns["idna"] = _pkg
@@ -2332,6 +2342,35 @@ for u in table:
         sys.exit(1)
 sys.exit(0)
 PY
+# ⛔ AND THE GUARD MUST HOLD ON A BOX WITH NO `idna` — WHICH IS THE ONLY REASON IT IS ORDERED FIRST
+# (#3374 review, round 14 P3). `_label_ok` accepts every non-ASCII label when `_idna is None`, so the
+# UTS46 fixed-point rule is simply absent there; the NFKC dot check and the `Cf`/`Mn`/`Me` refusal are
+# what keep a dot-equivalent and a DELETING mapping (`co\xad` -> `co`) refused on a stdlib-only box.
+# Nothing exercised that branch: every arm runs where `idna` is installed, and the `except ImportError`
+# arm is marked `# pragma: no cover`, so a mutant that deleted the guard stayed GREEN. Forced here.
+NOIDNA_CHECK="$TMP/noidna_check.py"
+cat > "$NOIDNA_CHECK" <<'NOIDNA'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("mm", sys.argv[1])
+mm = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mm)
+mm._idna = None                      # simulate the stdlib-only box
+bad = 0
+for host in ("api.premiselabs.co\u00ad.evil.example", "api.premiselabs.co\u200b.evil.example",
+             "api.premiselabs.co\u3002evil.example", "api.premiselabs.co\uff0eevil.example",
+             "api.premiselabs.co\u2024evil.example"):
+    if mm.authority_names_a_host(host) is not False:
+        print("CERTIFIED with idna absent: %r" % host, file=sys.stderr)
+        bad += 1
+for host in ("api.premiselabs.co", "localhost", "127.0.0.1", "my_host", "my-daemon.internal"):
+    if mm.authority_names_a_host(host) is not True:
+        print("FALSE BLOCK with idna absent: %r" % host, file=sys.stderr)
+        bad += 1
+sys.exit(1 if bad else 0)
+NOIDNA
+python3 "$NOIDNA_CHECK" "$ROOT/pi-bootstrap/lib/merge-mcp.py" \
+  && ok "the dot-equivalent and DELETING spoofs stay REFUSED with no idna installed (the stdlib-only branch)" \
+  || fail "with idna absent a spoof was CERTIFIED — the guard is ordered before the idna branch for exactly this box, and nothing held it to that"
 # ⛔ THE TEMPLATE READ WAS THE ONE REMAINING RAW TRACEBACK ON THE **VERIFY** SIDE (#3374 review P3).
 # `merge-mcp.py` got a named FATAL for a template that is missing, unparseable, or the wrong SHAPE;
 # the marker kept `json.load(open(...))` then `tpl.get(...)`, so all of them raised straight out and
@@ -2940,9 +2979,9 @@ auth = (((json.load(open(sys.argv[1], encoding="utf-8")).get("mcpServers", {}) o
 sys.exit(0 if auth == "Bearer ${TORTOISE_MCP_API_KEY}" else 1)
 PY
 
-# ⛔ THE HOSTED HEADER MUST BE THE CANONICAL SHAPE, not merely "contains ${". The client sends
-# headers VERBATIM (extensions/mcp-client/index.ts:819-821), so a header without the `Bearer ` scheme
-# reaches the server as `Authorization: tt_…` and gets a 401 — while `--verify` used to pass it, and
+# ⛔ THE HOSTED HEADER MUST BE THE CANONICAL SHAPE, not merely "contains ${". The client DOES expand
+# `${VAR}` (extensions/mcp-client/index.ts:819-821) and then sends the value as-is — it adds no scheme —
+# so a header without the `Bearer ` scheme reaches the server as `Authorization: tt_…` and gets a 401 — while `--verify` used to pass it, and
 # `scripts/cloud-cell-bringup.sh` SKIPS the repair install on a passing verify. Two shapes, both
 # certified before this arm existed.
 cp "$DEST/.mcp.json" "$DEST/.mcp.json.keep"
@@ -2962,7 +3001,7 @@ PY
   run_verify
   [ $? -eq 1 ] && grep -q "Authorization is not 'Bearer" "$LOG" \
     && ok "--verify REFUSES a hosted Authorization that is not 'Bearer \${TORTOISE_MCP_API_KEY}' ($bad)" \
-    || fail "--verify certified a hosted header the client sends VERBATIM ($bad) — the lane gets a 401 with LAYER VERIFIED behind it"
+    || fail "--verify certified a hosted header the client would send with no scheme ($bad) — the lane gets a 401 with LAYER VERIFIED behind it"
   cp "$DEST/.mcp.json.keep" "$DEST/.mcp.json"
 done
 # ...and the LEGACY name is accepted, because the resolver reads it too (so the certification line

@@ -919,6 +919,9 @@ _HOST_FORBIDDEN = set("\x00\t\n\r #/:<>?@[\\]^|")
 # idna-only guard would leave it open. `merge-mcp.py` carries the SAME rule.
 _DOT_EQUIVALENT = "\u3002\uff0e\uff61\ufe52\u2024"
 
+# The Unicode general categories UTS46 DELETES from a label (soft hyphen is `Cf`). See `_label_ok`.
+_UTS46_DELETES = ("Cf", "Mn", "Me")
+
 try:                                          # IDNA2008/UTS46 — the standard the client applies
     import idna as _idna
 except ImportError:                           # pragma: no cover — stdlib-only box
@@ -930,11 +933,32 @@ def _label_ok(lab):
         return False
     if any(ch in _HOST_FORBIDDEN for ch in lab):
         return False
+    # (1) DOT-EQUIVALENTS SPLIT ONE LABEL INTO TWO. Checked on the NFKC form, in stdlib, so it holds
+    # on a box with no `idna` too.
     if any(ch in _DOT_EQUIVALENT for ch in lab) or "." in unicodedata.normalize("NFKC", lab):
         return False
-    if lab.isascii() or _idna is None:
+    if lab.isascii():
         return True
+    if _idna is None:
+        # (3) STDLIB-ONLY FALLBACK. UTS46 DELETES every Cf/Mn/Me code point, so `co\xad` maps to `co`
+        # and the client resolves a DIFFERENT host than the one written — `new URL` sends
+        # `api.premiselabs.co\xad.evil.example` to `api.premiselabs.co.evil.example`. Without `idna`
+        # there is no way to apply the real mapping, so refuse the code points it would delete. This
+        # is deliberately narrow (a legitimately combining IDN label is refused HERE and accepted once
+        # `idna` is installed) because the alternative is a false PASS that mails the tenant key to an
+        # attacker's host.
+        return not any(unicodedata.category(ch) in _UTS46_DELETES for ch in lab)
     try:
+        # (2) ⛔ THE RULE, AND IT IS NOT A BLOCKLIST: the label must be a FIXED POINT of the client's
+        # own UTS46 mapping. Rounds 12 and 13 each closed one SPELLING (`%2e`, then the five
+        # dot-equivalents) and each time the next spelling through the same mapping was still
+        # certified: a mapping that DELETES a code point (`co\xad` -> `co`) renames the label exactly
+        # as a mapping that INTRODUCES a separator (`co\u3002evil` -> `co.evil`) does. Comparing what
+        # we READ against what the CLIENT RESOLVES closes both, and closes the next one without an
+        # edit. Measured: `co\xad`/`co\u3002evil` change; `münchen`, `xn--mnchen-3ya`, `my_host`,
+        # `localhost`, `api.premiselabs.co` do not.
+        if _idna.uts46_remap(lab, std3_rules=False, transitional=False) != lab:
+            return False
         encoded = _idna.encode(lab, uts46=True)
     except Exception:
         return False
