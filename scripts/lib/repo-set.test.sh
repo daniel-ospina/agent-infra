@@ -146,7 +146,13 @@ proof_arm() { # proof_arm <label> <expected-fragment> <conf-body>
   else bad "d-$label: expected rc 1 + '$frag', got rc=$rc"; printf '%s\n' "$o" | sed 's/^/       /'; fi
 }
 proof_arm missing-dir      "does not exist"                     "slug=o/n checkout=$T/nope"
-proof_arm not-a-worktree   "is not a git work tree"             "slug=o/n checkout=$T/plaindir"
+# ⛔ A NON-WORK-TREE IS A **WARN**, NOT A REFUSAL (review round 3, P1). "There is no git work tree here"
+# cannot be distinguished from "this process could not look" without privilege the reader does not
+# have, and refusing on the second discarded a read-only pass the doctor completes. Only PROVEN faults
+# refuse.
+printf 'slug=o/n checkout=%s\n' "$T/plaindir" > "$T/notree.conf"
+ck "d-not-a-worktree WARNS and passes (an unprovable checkout is graded read-only, not refused)" \
+   'o="$(run_reader "$T/notree.conf" check)"; printf "%s" "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/notree.conf" check)" = 0 ]'
 proof_arm wrong-provenance "is a checkout of daniel-ospina/somebody-else, not o/n" \
                            "slug=o/n checkout=$T/decoy"
 proof_arm shared-state     "is shared with another repo in this set" \
@@ -162,6 +168,25 @@ ck "d-provenance-refusal-does-not-just-warn (rc 1, not rc 0)" \
 # and refusing there would refuse every real multi-repo box.
 mkdir -p "$T/no-origin"
 git -C "$T/no-origin" init -q 2>/dev/null
+# ⛔ THE UNREADABLE-CHECKOUT SUB-CASE (review round 3, P1). `check` used to probe `git -C <checkout>
+# rev-parse` FIRST and call any failure "not a git work tree", so a checkout this process cannot CHDIR
+# into refused the WHOLE set — while the doctor hands the same entry a complete read-only pass. That
+# is the macOS TCC default (`install-launchd.sh` prefers ~/Documents/GitHub/tortoise) and it made the
+# WARN arm unreachable for the case it was written for. A chmod 000 dir reproduces the same EACCES.
+mk_repo "$T/hidden" o/n
+chmod 000 "$T/hidden"
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip d-unreadable-checkout (running as root: the chdir is permitted)\n'
+else
+  printf 'slug=o/n checkout=%s\n' "$T/hidden" > "$T/unreadable-checkout.conf"
+  o="$(run_reader "$T/unreadable-checkout.conf" check)"
+  if printf '%s' "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/unreadable-checkout.conf" check)" = 0 ]; then
+    ok "d-unreadable-checkout WARNS and passes (the doctor grades it read-only; refusing would discard that pass)"
+  else
+    bad "d-unreadable-checkout: expected WARN + rc 0, got rc=$(run_reader_rc "$T/unreadable-checkout.conf" check)"; printf '%s\n' "$o" | sed 's/^/       /'
+  fi
+fi
+chmod 755 "$T/hidden" 2>/dev/null
 printf 'slug=o/n checkout=%s\n' "$T/no-origin" > "$T/warn.conf"
 ck "d-unverifiable-origin-warns-and-passes (the launchd/TCC shape)" \
    'o="$(run_reader "$T/warn.conf" check)"; printf "%s" "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/warn.conf" check)" = 0 ]'
@@ -273,10 +298,26 @@ ck "f14 no set + REPO that PROVES its slug -> DEGRADED runs (rank 4 names it)" \
    'REPO_SET_FILE="$nofile" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1'
 ck "f15 no set + REPO that proves NOTHING + no OR -> REFUSES (rc 2), it does not pretend to grade" \
    '[ "$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
-ck "f16 …and it says WHY, and names both fixes (create the set / set OR or a provable REPO)" \
-   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "proves no repo" && printf "%s" "$o" | grep -q "(1) create the repo set above" && printf "%s" "$o" | grep -q "(2) set OR=OWNER/NAME"'
+ck "f16 …and it says WHY, and names both fixes (create the set / set PR_DOCTOR_REPO or OR)" \
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "proves no repo" && printf "%s" "$o" | grep -q "(1) create the repo set above" && printf "%s" "$o" | grep -q "(2) set PR_DOCTOR_REPO=OWNER/NAME or OR=OWNER/NAME"'
 ck "f17 ...and the doctor was never executed on that path" \
    '[ -z "$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)" ]'
+# ⛔ THE DEGRADED PATH MUST VALIDATE WHAT IT ADVERTISES (review round 3, P2). The first cut adopted
+# `OR` verbatim, so `OR='Not A Slug'` printed "Grading the ONE repo" and the doctor then refused — the
+# same "claims to grade, grades nothing" shape, one arm over. And `PR_DOCTOR_REPO` is rank 2 in
+# `resolve_repo`, ABOVE `OR`: ignoring it refused a pass the doctor would complete.
+ck "f19 no set + OR that is NOT a slug -> REFUSES, and never claims to be grading" \
+   'o="$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo" && [ "$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+ck "f20 no set + OR and REPO naming DIFFERENT repos -> REFUSES (it does not fall through to REPO)" \
+   'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise REPO="$T/agent-infra" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; [ $? = 2 ]'
+ck "f20b ...and it names BOTH values, so the operator can see which to fix" \
+   'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise REPO="$T/agent-infra" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "two different repos: OR=daniel-ospina/tortoise but REPO="'
+ck "f20c ...and it never falls through to the REPO proof and grades a repo the doctor refuses" \
+   '! REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise REPO="$T/agent-infra" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV"'
+ck "f21 no set + PR_DOCTOR_REPO (rank 2) -> the pass RUNS (the doctor honours it above OR)" \
+   'REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=daniel-ospina/agent-infra HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+ck "f22 no set + PR_DOCTOR_REPO that is NOT a slug -> REFUSES, never claims to be grading" \
+   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=notaslug HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
@@ -408,6 +449,11 @@ printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/Orchestrator\nslug=dani
   "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/case-state.conf"
 ck "m1 two state dirs differing only by CASE are the shared-state refusal (one dir on macOS)" \
    'run_reader "$T/case-state.conf" check | grep -q "is shared with another repo in this set"'
+# Round 3, P2: `/srv/state`, `/srv//state` and `/srv/./state` are ONE DIRECTORY too.
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s//./state\n' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/spell-state.conf"
+ck "m2 two SPELLINGS of one state dir are the shared-state refusal (// and . fold)" \
+   'run_reader "$T/spell-state.conf" check | grep -q "is shared with another repo in this set"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
