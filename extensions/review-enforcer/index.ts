@@ -8379,6 +8379,21 @@ export function auditCommand(command: string, limit = 2000): string {
 // `recordState` exists so the value lands in the durable audit row: the fleet can
 // then count how many refusals were "no record on this box" (the condition that was
 // hand-measured at 3260-vs-156 records, 55/104 PRs visible) instead of inferring it.
+/**
+ * The CHILD's composed payload on a reap result, as a mergeable record — or `null`.
+ *
+ * #3155: `task_collect` carries it at `details.details` and a terminal `task_status` at
+ * `details.final_details`; BOTH feed the one classifier, so both narrow the same way and through
+ * this one function. ⛔ AN ARRAY IS NOT A PAYLOAD (fresh review): `typeof [] === "object"` and
+ * `[] !== null`, so the obvious guard accepts `[]`, the spread merges nothing, and the run's own
+ * `status: "done"` label decides — certifying a verdict the payload never carried. `null`,
+ * primitives and arrays are all UNKNOWN, never "nothing to see".
+ */
+export function composedDetailsOf(payload: unknown): Record<string, unknown> | null {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  return payload as Record<string, unknown>;
+}
+
 export function describeDispatchFloorRead(
   command: string,
   tier: string,
@@ -8800,11 +8815,12 @@ export default function (pi: ExtensionAPI) {
     // telling a lane that tried that it never dispatched at all.
     let spawnAttempts: SpawnAttempt[] = [];
     let spawnAttemptsTotal = 0;
-    // #1662 review: run_ids whose terminal `task_collect` already counted as a
-    // reviewer dispatch. `task_collect` is idempotent (the same terminal run
-    // can be reaped repeatedly), so without this a repeated collect inflates
-    // the ≥1-dispatch count and the durable `review_dispatch` audit total.
-    const countedCollectRuns = new Set<string>();
+    // #1662 review / #3155: run_ids whose TERMINAL reap has already counted as a reviewer
+    // dispatch. TWO verbs reap a background run — `task_collect` and a `task_status` that reports
+    // `terminal: true` — and either one may be called repeatedly for the same run (`task_collect`
+    // is idempotent; a poller keeps polling), so the dedupe is keyed by run_id and SHARED between
+    // them: one run is one dispatch however many times, and in whichever order, it is reaped.
+    const countedReapedRuns = new Set<string>();
     // #2148 — the up-front disclosure's state. `preflightInjected` is the once-guard for the
     // model-visible injection (the console line is emitted once by session_start itself);
     // `earlyPushNoticePrinted` is the once-guard for the first-push notice, which must not repeat
@@ -8827,7 +8843,7 @@ export default function (pi: ExtensionAPI) {
       dispatchCount = 0;
       spawnAttempts = [];
       spawnAttemptsTotal = 0;
-      countedCollectRuns.clear();
+      countedReapedRuns.clear();
       preflightInjected = false;
       earlyPushNoticePrinted = false;
       blockRecoverySent = false;
@@ -8937,7 +8953,7 @@ export default function (pi: ExtensionAPI) {
     // ── session_shutdown ───────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
-      countedCollectRuns.clear();
+      countedReapedRuns.clear();
       blockRecoverySent = false;
       // Clear marker file to prevent persistent state leakage across sessions
       try {
@@ -9648,10 +9664,35 @@ export default function (pi: ExtensionAPI) {
       // #1662: a `task({ background: true })` dispatch returns at DISPATCH, not
       // completion — counting it would satisfy the ≥1-dispatch gate while the
       // reviewer is still running (a fail-open on the git-op gate). Count the
-      // reviewer when its verdict is actually reaped: the terminal
-      // `task_collect`. The returns-early notice and a not-finished collect are
-      // both ignored.
-      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+      // reviewer when its verdict is actually reaped. The returns-early notice
+      // and a not-finished reap are both ignored.
+      //
+      // #3155 — THERE ARE TWO REAP VERBS, AND THIS COUNTER KNEW ONE. `task_collect` is the verb
+      // that hands back the final message; `task_status` is the verb a poller uses to drive its
+      // wait, and once a run is TERMINAL it reports the same settled record (`terminal: true`).
+      // Measured on main before this change (in a live `pi -p` session, one background
+      // `task({background:true})` child): polling `task_status` to `done` and then running a git op
+      // printed `reviewer dispatches counted in THIS pi process = 0` and refused; the SAME session
+      // then reaped with `task_collect` and the count read 1. A lane that dispatched five reviewers
+      // and waited on them with the observation verb therefore had real verdicts and an accounting
+      // that read zero — an instrument that cannot tell "no review happened" from "my counter
+      // missed your reviewer", and whose natural remedy was a throwaway re-dispatch (#3155's own
+      // "why it matters"). The floor's datum is a reviewer VERDICT, and a terminal run record
+      // holds one.
+      //
+      // ⛔ COUNTING A TERMINAL STATUS IS NOT COUNTING AT DISPATCH. The fail-open #1662 closed is
+      // counting a lane that has not finished; `terminal: true` means the run IS finished and its
+      // outcome is persisted (the producer's own contract: "i.e. `task_collect` will return the
+      // final message"). An `alive`/`wedged`/`gone` view stays uncounted, and the classification
+      // below is the same one the collect path performs — including its clean-empty arm.
+      const reviewDetails = (event as {
+        details?: {
+          background?: boolean;
+          terminal?: boolean;
+          run_id?: string;
+          final_details?: unknown;
+        };
+      }).details;
       // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
       // results are built BEFORE the background branch, so they carry NO
       // `details.background` — a refused `task({ background: true })` would then
@@ -9662,7 +9703,15 @@ export default function (pi: ExtensionAPI) {
       const reviewInput = (event as { input?: { background?: boolean } }).input;
       const isTerminalCollect =
         event.toolName === "task_collect" && reviewDetails?.terminal === true;
-      if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
+      // #3155: the second reap verb — a `task_status` whose view is TERMINAL.
+      const isTerminalStatus =
+        event.toolName === "task_status" && reviewDetails?.terminal === true;
+      if (
+        event.toolName !== "task_collect" &&
+        event.toolName !== "task_status" &&
+        event.toolName !== "subagent" &&
+        event.toolName !== "task"
+      ) return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach
@@ -9671,16 +9720,50 @@ export default function (pi: ExtensionAPI) {
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
-      // #1662 review: `task_collect` is idempotent — every result carries the
-      // `run_id` it reaped (`details: view`). Count each run's verdict once, so
-      // re-collecting a finished lane cannot inflate the dispatch total (and
-      // the durable review_dispatch audit count) past the real dispatches.
-      if (isTerminalCollect) {
-        const collectRunId =
+      if (event.toolName === "task_status" && !isTerminalStatus) return undefined;
+
+      // #3155: the status view's OWN `status` cannot classify the run. The background mapping
+      // reports a success-but-silent child (`exit 0`, empty stdout) as `done`, so a classifier
+      // reading the label alone counts a reviewer that produced NOTHING — the exact fail-open the
+      // collect path closes by reading the child's composed details (#2665 review). The producer
+      // carries that same payload on a terminal view as `final_details`; read it and classify
+      // EXACTLY as the collect path does.
+      //
+      // ⛔ ABSENCE IS NOT A VERDICT. A view with no composed details (a producer that predates the
+      // field, or a record with none) cannot be certified, so it is NOT counted — fail-closed, and
+      // the remedy is the terminal `task_collect`, which carries the payload by contract. It is
+      // deliberately NOT written to the ATTEMPT ledger: that ledger's vocabulary describes spawn
+      // OUTCOMES (refused/cut/failed), and "the producer did not carry a field" is not one —
+      // recording it there would ship a false capacity/refusal claim to the refusal text (#2665's
+      // fix exists to stop exactly that), so the console line is the record.
+      //
+      // ⛔ AND IT SITS BEFORE THE DEDUPE, DELIBERATELY. Marking an uncertifiable view as "already
+      // reaped" would spend that run's ONE slot on a view that counted nothing, so the lane's
+      // follow-up `task_collect` — the documented remedy, carrying the payload — would then be
+      // rejected as a repeat and the run could never be counted in this session. Uncounted means
+      // unrecorded.
+      const statusComposedDetails = isTerminalStatus
+        ? composedDetailsOf((reviewDetails as { final_details?: unknown })?.final_details)
+        : null;
+      if (isTerminalStatus && statusComposedDetails === null) {
+        console.error(
+          "[review-enforcer] ⚠️ a TERMINAL task_status carried no composed details — NOT counted as a " +
+            "reviewer dispatch (#3155). Reap it with task_collect({ run_id }) to count its verdict."
+        );
+        return undefined;
+      }
+
+      // #1662 review / #3155: both reap verbs are repeatable — `task_collect` is idempotent and a
+      // poller keeps polling — and each result carries the `run_id` it reaped (`details: view`).
+      // Count each run's verdict once, under ONE set shared by both verbs, so re-reaping a finished
+      // lane (in either verb, in either order) cannot inflate the dispatch total and the durable
+      // review_dispatch audit count past the real dispatches.
+      if (isTerminalCollect || isTerminalStatus) {
+        const reapedRunId =
           typeof reviewDetails?.run_id === "string" ? reviewDetails.run_id : "";
-        if (collectRunId) {
-          if (countedCollectRuns.has(collectRunId)) return undefined;
-          countedCollectRuns.add(collectRunId);
+        if (reapedRunId) {
+          if (countedReapedRuns.has(reapedRunId)) return undefined;
+          countedReapedRuns.add(reapedRunId);
         }
       }
 
@@ -9694,22 +9777,22 @@ export default function (pi: ExtensionAPI) {
       // measured (see `shared/spawn-capacity.ts`). The classification reads ONLY fields the
       // producer set, and the evidence it read is carried into the audit row and the refusal.
       const spawn = classifySpawnOutcome({
-        // A terminal `task_collect` result is a `TaskRunStatusView`: the CHILD's composed payload
-        // sits at `view.details`, and the run's own `status`/`reason` sit at the top level. Read
-        // BOTH (nested last, so the child's own `killed`/`exitCode` win), because classifying on
-        // the view alone re-opened the same fail-open one path over (review of #2665): the
+        // A terminal reap is a `TaskRunStatusView` / `TaskCollectView`: the CHILD's composed payload
+        // sits at `view.details` (collect) or `view.final_details` (status), and the run's own
+        // `status`/`reason` sit at the top level. Read BOTH (nested last, so the child's own
+        // `killed`/`exitCode` win), because classifying on the view alone re-opened the same
+        // fail-open one path over (review of #2665): the
         // background status mapping reports a no-output `clean-empty` settle as `done`, so the
         // view said "done" while the child's details carried `exitCode:0` with no output — and
         // the FOREGROUND path already classifies that same shape as `cut`.
         details: isTerminalCollect
           ? {
               ...(reviewDetails as Record<string, unknown>),
-              ...((typeof (reviewDetails as { details?: unknown })?.details === "object" &&
-              (reviewDetails as { details?: unknown }).details !== null
-                ? (reviewDetails as { details: Record<string, unknown> }).details
-                : {}) as Record<string, unknown>),
+              ...(composedDetailsOf((reviewDetails as { details?: unknown })?.details) ?? {}),
             }
-          : (reviewDetails as Record<string, unknown> | undefined),
+          : isTerminalStatus && statusComposedDetails !== null
+            ? { ...(reviewDetails as Record<string, unknown>), ...statusComposedDetails }
+            : (reviewDetails as Record<string, unknown> | undefined),
         isError: (event as { isError?: unknown }).isError,
       });
       if (spawn.outcome !== "verdict") {
@@ -9751,12 +9834,25 @@ export default function (pi: ExtensionAPI) {
       if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
 
       dispatchCount++;
+      const reapVerb = isTerminalCollect
+        ? "task_collect"
+        : isTerminalStatus
+          ? "task_status (terminal)"
+          : event.toolName;
       console.log(
-        `[review-enforcer] 📊 Reviewer dispatch counted (total: ${dispatchCount})`
+        `[review-enforcer] 📊 Reviewer dispatch counted via ${reapVerb} (total: ${dispatchCount})`
       );
       // #60: durable per-event record — the running total is stamped on each
       // entry so the dispatch count is reconstructible from the audit log.
-      logGateEvent("review_dispatch", { dispatch_count: dispatchCount });
+      // #3155: the row also names the REAP VERB. Before this, every row was indistinguishable, so
+      // the audit could not answer "did this lane's reviewers come back through collect or through
+      // status" — the question that would have made the zero-count defect visible in the trail
+      // instead of only in a lane's transcript.
+      logGateEvent("review_dispatch", {
+        dispatch_count: dispatchCount,
+        tool: event.toolName,
+        ...(typeof reviewDetails?.run_id === "string" ? { run_id: reviewDetails.run_id } : {}),
+      });
       return undefined;
     });
 

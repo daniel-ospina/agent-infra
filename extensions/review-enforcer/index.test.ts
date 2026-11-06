@@ -2015,6 +2015,183 @@ testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted
   });
 });
 
+testAsync("#3155: a TERMINAL task_status reap counts as a reviewer dispatch — the SECOND reap verb", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // MEASURED ON MAIN BEFORE THIS FIX (live `pi -p`, one background child): a lane that
+        // polled `task_status` to `done` and then ran a git op was refused with
+        // "reviewer dispatches counted in THIS pi process = 0" — the same session, the same
+        // completed reviewer. Only `task_collect` moved the count. This is that lane.
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A NON-terminal view is still not a verdict (#1662's fail-open, preserved). ⛔ THE PAYLOAD
+        // IS DELIBERATELY PRESENT HERE (fresh review, P1): without it these cases exit at the
+        // missing-payload guard ABOVE the `terminal` test, so the only thing that could refuse them
+        // was never exercised — and a mutant that counted a non-terminal view *carrying* a payload
+        // survived the whole suite. With it, `terminal` is the sole gate on this path.
+        for (const status of ["alive", "wedged", "gone"]) {
+          await fire("tool_result", {
+            toolName: "task_status",
+            details: { terminal: false, status, run_id: `RUN-${status}`, final_details: { model: "m", provider: "p" } },
+          });
+        }
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a running/wedged/gone view must NOT count as a completed reviewer");
+
+        // The terminal view — the run IS finished and its verdict is persisted. Count it.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", exit_code: 0, run_id: "RUN-3155", final_details: { model: "m", provider: "p" } },
+        });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "a terminal status reap satisfies the ≥1-dispatch gate (#3155)");
+
+        // The durable trail names the REAP VERB, so an accounting read can tell the two apart.
+        const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(rows.length, 1, "one counted dispatch");
+        equal(rows[0].tool, "task_status", "the audit row names the verb that reaped it");
+        equal(rows[0].run_id, "RUN-3155", "and the run it reaped");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: a terminal task_status whose child produced NOTHING (clean-empty) must still NOT count", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // THE GUARD MUST STILL REFUSE WHAT IT EXISTS TO REFUSE. The run's own `status` maps a
+        // success-but-silent child to `done`; only the child's composed `exitCode: 0` shows it
+        // produced no verdict. Counting on the label alone would be the #2665 fail-open, one verb
+        // over — so the status arm reads the SAME field the collect arm reads.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", exit_code: 0, run_id: "RUN-EMPTY", final_details: { model: "m", provider: "p", exitCode: 0 } },
+        });
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "a clean-empty settle is NOT a reviewer verdict");
+
+        // And the same view WITH a real verdict text counts — the difference is the payload, not luck.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", exit_code: 0, run_id: "RUN-REAL", final_details: { model: "m", provider: "p" } },
+        });
+        equal(await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } }), undefined, "a real terminal verdict counts");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: a terminal task_status with NO composed details is never counted — absence is not a verdict", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A producer that does not carry `final_details` (version skew) or a record with none:
+        // the datum needed to certify a verdict is MISSING, and the floor fails CLOSED. The
+        // remedy is the terminal `task_collect`, which carries the payload by contract.
+        for (const missing of [{}, { final_details: null }, { final_details: [] }]) {
+          await fire("tool_result", {
+            toolName: "task_status",
+            details: { terminal: true, status: "done", exit_code: 0, run_id: `RUN-NOEVID-${JSON.stringify(missing)}`, ...missing },
+          });
+        }
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "an unclassifiable terminal view is an ATTEMPT, never a dispatch");
+        const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(rows.length, 0, "no durable dispatch was recorded for it");
+
+        // POSITIVE CONTROL: without it this case would also pass with the status arm REMOVED
+        // entirely (nothing counts at all), which would make it prove nothing.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", run_id: "RUN-CERTIFIED", final_details: { model: "m", provider: "p" } },
+        });
+        equal(await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } }), undefined, "a certifiable terminal reap DOES count");
+
+        // ⛔ AND AN UNCERTIFIABLE VIEW MUST NOT SPEND THE RUN'S ONE SLOT. Marking it "already
+        // reaped" would make the documented remedy (`task_collect`, which carries the payload)
+        // look like a repeat and leave the run uncountable for the whole session.
+        await fire("tool_result", { toolName: "task_status", details: { terminal: true, status: "done", run_id: "RUN-REMEDY" } });
+        const afterUncertifiable = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(afterUncertifiable.length, 1, "the uncertifiable view recorded no dispatch");
+        await fire("tool_result", {
+          toolName: "task_collect",
+          details: { terminal: true, status: "done", run_id: "RUN-REMEDY", details: { model: "m", provider: "p" } },
+        });
+        const afterRemedy = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(afterRemedy.length, 2, "the SAME run's terminal collect still counts — an uncounted view is unrecorded");
+        equal(afterRemedy[1].run_id, "RUN-REMEDY", "and it is that run that got counted");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: status-then-collect of the SAME run counts ONCE (one dedupe, both verbs)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A lane polls to done, THEN reaps with collect (the documented flow). One reviewer is
+        // one dispatch however many times, and through whichever verb, it is observed.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", run_id: "RUN-ONE", final_details: { model: "m", provider: "p" } },
+        });
+        // ⛔ ASSERT AFTER THE FIRST REAP, NOT ONLY AT THE END (fresh review, P2): with the status arm
+        // removed entirely the two collects alone still produce 2 rows, so an end-only assertion
+        // cannot tell "counted once" from "not counted at all" — the direction this case is named for.
+        const afterFirst = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(afterFirst.length, 1, "the status reap already counted");
+        equal(afterFirst[0].tool, "task_status", "…through the observation verb");
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-ONE", details: { model: "m", provider: "p" } } });
+        // …and again the other way round, to prove the shared set is order-independent.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-TWO", details: { model: "m", provider: "p" } } });
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", run_id: "RUN-TWO", final_details: { model: "m", provider: "p" } },
+        });
+
+        const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(rows.length, 2, "two runs ⇒ two counted dispatches, not four");
+        equal(rows.map((r) => r.dispatch_count).join(","), "1,2", "the running total counts runs, not reaps");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
 testAsync("#1662 review: a refused background dispatch is not counted as a completed reviewer", async () => {
   await withTempHome(async () => {
     await withMarkerIsolated(async () => {

@@ -221,7 +221,9 @@ export function classifySpawnOutcome(result: SpawnResultLike | null | undefined)
 
 /** One verdict-less attempt, as the durable audit row and the refusal render it. */
 export interface SpawnAttempt {
-  /** `task` | `subagent` | `task_collect` — the tool whose result carried this. */
+  /** `task` | `subagent` | `task_collect` | `task_status` — the tool whose result carried
+   * this. `task_status` (#3155) is the observational reap verb: a TERMINAL view is a reviewer
+   * completion just as a terminal `task_collect` is. */
   tool: string;
   outcome: Exclude<SpawnOutcome, "verdict">;
   /** The producer field(s) read, `key=value`. Never invented. */
