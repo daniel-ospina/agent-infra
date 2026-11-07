@@ -56,12 +56,22 @@
 # author READ the ref, and the next actor still has to read it.
 #
 # ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN THREE WAYS.
-#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number. The canonical
-#       block ships the slot `issue-<N>`, so a brief that still carries the slot is admitted by SHAPE —
-#       exactly as the research contract admits its own `<…>` slots. This is a presence-and-shape gate,
-#       and the number is the one field it cannot invent for the author.
+#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL ISSUE number in its KEY. Scope, and
+#       nothing broader: an `issue-` key that carries no digit inside its first bracket is the canonical
+#       slot `issue-<N>` (a CLOSED bracket, which the canonical block ships) and is ADMITTED — the gate
+#       cannot refuse its own advice, the same licence the research contract gives its own `<…>` slots.
+#       A number OUTSIDE the bracket (`issue-<x> 4242`) leaves the key unparsable and is admitted as the
+#       slot too; that adds no capability an author needs (the bare slot already admits), and it is named
+#       so the limit can be re-measured rather than trusted. The direction is one-way, not a biconditional:
+#       anything swallowed as the slot carries no digit in its first bracket, but not every digit-free
+#       value is swallowed (`issue-slot4242`, with no bracket at all, is REFUSED as unkeyed).
+#       ⓘ AND A `pr-<digits>` KEY IS NEVER RESOLVED AGAINST `refs/wip/*`: those refs are ISSUE-keyed, so a
+#       `pr-` key is accepted for fixer/reviewer roles and its absence claim is unchecked (measured: a
+#       fixer brief with `pr-<4242> -> none` and a matching `refs/wip/issue-4242-…` on origin is admitted
+#       with no token). That is the same fact this file states later — `issue-<N>` is "the only one the
+#       cross-check can resolve" — and it belongs in the limit, not only in the code.
 #   (b) MEASUREMENT: it needs a repository and a reachable `origin`. With neither, the gate says so on
-#       stderr (`UNVERIFIED` / `PREVIOUS-WORK-WIP-UNMEASURED`) and ADMITS the brief, because refusing
+#       stderr (the word `UNVERIFIED`, naming the issue) and ADMITS the brief, because refusing
 #       every dispatch on a moment's network failure converts a memory gap into a fleet-wide outage.
 #       The claim pre-flight on this same dispatch path already hard-depends on that reachability, so
 #       the ordinary case is the measured one.
@@ -295,7 +305,7 @@ function _fence(s,   fc, fl, q, rest) {
 }
 function _strip(s) { sub(/^[ \t]+/, "", s); sub(/^[-*+][ \t]+/, "", s); sub(/^[0-9]+[.)][ \t]+/, "", s);
   sub(/^(\*\*|__)/, "", s); sub(/^[ \t]+/, "", s); return s }
-BEGIN { ins = 0; depth = 0; val = ""; fence = 0; fencec = ""; fencelen = 0 }
+BEGIN { ins = 0; depth = 0; val = ""; _n = 0; fence = 0; fencec = ""; fencelen = 0 }
 {
   line = _qskip($0)
   if (line == "\001") next
@@ -307,25 +317,40 @@ BEGIN { ins = 0; depth = 0; val = ""; fence = 0; fencec = ""; fencelen = 0 }
   if (!ins && nh > 0 && lc ~ /^#+[ \t]*previous[ -]work/) { ins = 1; depth = nh; next }
   if (!ins) next
   t = _strip(line)
-  if (tolower(t) ~ /^wip[ \t]*:/) {
+  # ⛔ THE SAME RECOGNIZER AS THE SHAPE PARSER, OR THE TWO DISAGREE AND THE GATE FAILS OPEN
+  # (review cycle 3, P1). `_label` folds `[ \t-]+` into one space and strips it, so `WIP-:`, `WIP --:`,
+  # `WIP- :` are all the `wip` LABEL to the shape check — while this reader required `^wip[ \t]*:` and
+  # therefore collected NOTHING, so the cross-check abstained and the brief was ADMITTED with an
+  # unchecked claim of absence (measured: `WIP-: issue-4242 -> none` → rc 0 against an existing ref).
+  # ⛔ THE CLASS IS EXACTLY THE SEPARATORS `_label` FOLDS — SPACE AND HYPHEN — AND NOTHING ELSE (review of
+  # #3621, cycle 3, P3: the first version also spanned `_`, which `_label` never folds, so `WIP_:` was
+  # collected by this reader while the shape parser saw no `wip` label at all — the "line this reader
+  # collected and that parser ignored" the sentence above calls a new disagreement, two lines below it).
+  # TAB is excluded for a DIFFERENT reason, and it is worth stating precisely (review of #3621, P2 —
+  # the earlier text here claimed `_label` reads `WIP<TAB>:` as `wip`, which it does NOT: the label
+  # class of `_label` is `[A-Za-z][A-Za-z0-9 _-]`, so a TAB before the colon matches NO label at all, and
+  # a TAB-label brief is refused by the SHAPE parser for having no `WIP:` line — measured
+  # `PREVIOUS-WORK-WIP` with NO `CONTRADICTED` token, while the identical colon-label brief is ADMITTED
+  # at rc 0). So the guarantee here is the LABEL CLASS, NOT a fold: `_label` folds `[ \t-]+` only AFTER
+  # it has matched, so teaching that class to span `\t` (a plausible "make the two readers agree" edit)
+  # would let the shape parser see `wip` while the `[ -]*` of this reader still spans no TAB — shape
+  # satisfied, reader silent, absence claim ADMITTED. That is the #3484 fail-open, so the class and this
+  # reader move together or not at all. (H63/H63b/H63c/H63d pin the TAB spellings.)
+  if (tolower(t) ~ /^wip[ -]*:/) {
     sub(/^[^:]*:/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
     # …and the value is measured UNDRESSED, for the reason given in the `_label` comment above a
     # decorated label must not turn an honest `issue-<N> -> none` into an unkeyed value.
     gsub(/^[*_`]+/, "", t); gsub(/[*_`]+$/, "", t)
     sub(/^[ \t]+/, "", t); sub(/[ \t]+$/, "", t)
-    val = t
+    _v[++_n] = t
   }
 }
-END { if (length(val) > 0) print val }
+# ⛔ EVERY `WIP:` VALUE, one per line, prefixed `V<TAB>` — the earlier "last one wins" shape made the
+# cross-check trivially bypassable: append a second `WIP:` line (unfenced, and the canonical block IS
+# such a line) and the checker abstained on it while the shape check was satisfied by the first.
+END { for (_i = 1; _i <= _n; _i++) printf "V\t%s\n", _v[_i] }
 '
-
-# brief_gate_wip_value <file|-> — the `WIP:` value of the PREVIOUS WORK section, or nothing.
-brief_gate_wip_value() { # brief_gate_wip_value <file|->
-  local f="${1:--}"
-  if [ "$f" != "-" ] && { [ ! -e "$f" ] || [ ! -r "$f" ]; }; then return 0; fi
-  if [ "$f" = "-" ]; then awk "$BRIEF_GATE_WIP_AWK"; else awk "$BRIEF_GATE_WIP_AWK" "$f"; fi
-}
 
 # brief_gate_repo [explicit] — WHICH repository `refs/wip/*` is read from. Resolution, in order:
 #   1. the caller's explicit argument (a dispatch path that knows its repo should pass it);
@@ -381,7 +406,10 @@ brief_gate_bounded() { # brief_gate_bounded <secs> <cmd...>
     BRIEF_GATE_BOUNDED_TRIED=1
     local c here
     here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)"
-    for c in "${O:-}/lib/bounded.sh" "$here/lib/bounded.sh" \
+    # ⛔ NO `${O:-}` ROOT (review cycle 2, nit): `O` is the orchestrator STATE root (`$O/state/...`),
+    # not a scripts root — a candidate that can only ever hit the wrong tree, tried first, so a state
+    # dir that happened to contain `lib/bounded.sh` would shadow the repo's own copy.
+    for c in "$here/lib/bounded.sh" \
              "${AGENT_INFRA_PATH:-}/scripts/lib/bounded.sh" \
              "${HOME:-}/.pi/agent/scripts/lib/bounded.sh"; do
       [ -n "$c" ] && [ -f "$c" ] || continue
@@ -430,40 +458,192 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
   return 0
 }
 
-# brief_gate_previous_work <brief-file|-> [repo] — print ONE token when the PREVIOUS WORK block
-# CONTRADICTS what `refs/wip/*` holds; nothing when it is consistent, unmeasurable-but-usable, or when
-# the block's own shape tokens already speak (a shape refusal must not be doubled by a guess).
+# brief_gate_previous_work <brief-file|-> [repo] [role] — print the tokens the cross-check contributes:
+# `PREVIOUS-WORK-WIP` once when ANY `WIP:` value is unkeyed for this role, and
+# `PREVIOUS-WORK-WIP-CONTRADICTED<TAB>refs…` once when any issue that claims absence has a matching ref.
+# Nothing when the block is consistent, unmeasurable-but-usable, or when the shape tokens already speak.
 #
 # ⛔ THE ABSENCE CLAIM IS THE PART *AFTER* THE KEY, NOT THE WHOLE LINE — and this is the shape the
 # first draft got wrong. Reading the whole value for a `refs/wip/` substring made the MOST natural
 # honest line (`issue-4242 -> none (measured: git ls-remote refs/wip/* at …)`) look like a named ref,
 # so the check silently skipped exactly the briefs that did the measurement properly. The value is
 # `issue-<N> -> <claim>`, and the claim is what decides: it begins `refs/wip/` ⇒ a ref is named;
-# anything else (`none`, `unclaimed`, `nothing`, `-`, a half-finished sentence) ⇒ a claim of absence,
-# which is then CHECKED. No word list to defeat, and no measurement note that can switch it off.
-brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo]
-  local f="${1:--}" repo="${2:-}" val claim issue refs rc hits
-  val="$(brief_gate_wip_value "$f")"
-  [ -n "$val" ] || return 0
-  case "$val" in
-    issue-[0-9]*) issue="${val#issue-}"; issue="${issue%%[!0-9]*}" ;;
-    *) return 0 ;;                                   # a pr-<N> key: no issue to look up
-  esac
-  [ -n "$issue" ] || return 0
-  claim="$(printf '%s' "$val" | sed -e 's/^issue-[0-9][0-9]*//' -e 's/^[[:space:]]*\(->\|→\|:\)[[:space:]]*//')"
-  case "$claim" in refs/wip/*) return 0 ;; esac     # a NAMED ref: not a claim of absence
+# anything else (`none`, `unclaimed`, `nothing`, `-`, `refs/wip/* is empty`, a half-finished sentence)
+# ⇒ a claim of absence, which is then CHECKED. No word list to defeat, no measurement note that can
+# switch it off, and a GLOB is not a ref.
+brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
+  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val vlow tag claim rest issue ref nval inner after tail num head
+  local unkeyed=0 issues="" evidence=""
+  values="$(awk "$BRIEF_GATE_WIP_AWK" "$f" 2>/dev/null)"
+  [ -n "$values" ] || return 0            # no WIP line at all: the SHAPE token already refuses
+  # ── EVERY VALUE IS CHECKED, NOT THE LAST ONE (fresh-context review of #3484, P1) ──────────────
+  # The shapes that defeated the "last one wins" reader, all measured: a pasted canonical block (a live,
+  # unfenced `WIP: issue-<N> -> refs/wip/<ref>` line — i.e. THE TEXT THIS GATE HANDS THE AUTHOR), a
+  # trailing `WIP: none`, a bare `WIP:` label, and a second keyed line for a different issue. Each one
+  # made the checker abstain on the wrong line while the shape check stayed satisfied.
+  while IFS=$'\t' read -r tag val; do
+    [ "${tag:-}" = "V" ] || continue
+    if [ -z "${val:-}" ]; then unkeyed=1; continue; fi
+    # ⛔ THE KEY IS FOLDED TOO (review of #3621, nit). The LABEL was already case-insensitive
+    # (`_label` lowercases), so `WIP: Issue-4242 -> none` was refused while `WIP:` was accepted — an
+    # asymmetry no author can be expected to guess. `vlow` is what every key and claim test reads.
+    vlow="$(printf '%s' "$val" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
+    # ── ONE NORMALISATION, THEN ONE CLASSIFICATION, THEN ONE CLAIM READ (review of #3621, cycles 2-4)
+    # Three rounds found the same shape of bug in three spellings: an arm per key form meant that every
+    # form the arms did not name fell through to the unfilled-slot branch and was keyed-but-UNCHECKED
+    # (`issue-<4242>`, then `issue-<#4242>`, then a bracket with no `>` at all). So the bracket forms are
+    # canonicalised FIRST, into the plain `issue-<digits> -> <claim>` shape, and only then classified.
+    # ⛔ AND THE NUMBER IS THE FIRST DIGIT RUN, NOT EVERY DIGIT (review of #3621, cycle 4, P1): deleting
+    # all non-digits CONCATENATED them, so `issue-<#4242 (prev attempt #1234)> -> none` was measured as
+    # `42421234` — a key that does not exist, which ADMITTED the very claim it should refuse.
+    # ⛔ THE KEY PART IS CUT AT THE ARROW BEFORE THE BRACKET IS LOOKED FOR (review of #3621, cycle 5). The
+    # bracket search must not see the `-` AND `>` of the arrow: with the whole value in hand, the canonical
+    # `issue-<N> -> refs/wip/<ref>` was read as a CLOSED bracket whose content is `n` — i.e. malformed —
+    # and the gate refused its own canonical block. Everything before the first arrow is the key.
+    nval="$vlow"
+    head="${nval%%->*}"
+    head="${head%%→*}"
+    case "$head" in
+      issue-"<"*">"*|pr-"<"*">"*)
+        # ⛔ THE TAIL IS WHAT FOLLOWS THE BRACKET CLOSE, NOT WHAT FOLLOWS THE ARROW (review of #3621,
+        # cycle 8, P2). ⛔ THE MECHANISM BELOW WAS STATED BACKWARDS UNTIL CYCLE 12 AND IS NOW MEASURED:
+        # the ARROWED spelling is the one that breaks, NOT the arrow-less one. `head` stops at the arrow,
+        # so deriving the tail from it truncates the claim on `issue-<4242> -> refs/wip/<ref>` to a bare
+        # space, leaving `claim` empty and REFUSING an honest brief with "read the ref you already
+        # named" (measured: shipped rc 0 → 80 under `${head#*>}`, reddening H55d and all four H57c
+        # spellings). The ARROW-LESS spelling is INERT under that same mutant — with no arrow `head` IS
+        # the whole value, so H62 stays green and must NOT be cited as its proof (cycle 12 review).
+        # Cutting at the bracket handles both spellings; an UNTERMINATED bracket leaves no trustworthy
+        # claim text and is treated as an absence claim, which is the fail-closed direction.
+        after="${nval#*-<}"
+        inner="${after%%>*}"
+        # `after` always contains a `>` here — the arm was entered on `head`, which already held one, and
+        # `head` is a prefix of `nval` — so this needs no fallback branch (review of #3621, cycle 9: the
+        # `*) tail=""` arm was unreachable, and saying so is cheaper than a reader re-deriving it).
+        tail="${after#*>}"
+        num="$(printf '%s' "$inner" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
+        case "$head" in
+          # ── WHAT THIS ARM DECIDES, ONCE (review of #3621, cycle 6: an earlier draft of this comment said
+          # the opposite two lines apart and repeated its rationale).
+          # 1. A bracket carrying a NUMBER anywhere inside it is KEYED BY THAT NUMBER — the first digit run,
+          #    never the concatenation of every run (a key that does not exist measured nothing, cycle 4).
+          # 2. A bracket carrying NO DIGITS is the UNFILLED SLOT (`issue-<N>` — a CLOSED bracket — is
+          #    exactly what the canonical block ships, so this case must be admitted: the gate cannot
+          #    refuse its own advice). The coverage limit is therefore "no digit inside the key's first
+          #    bracket", not "no number anywhere in the value" — a number OUTSIDE the bracket (`issue-<x>
+          #    4242`) leaves the key unparsable and the value is treated as the slot.
+          # 3. The number is joined to the tail WITH A SEPARATOR, and it IS load-bearing — on ONE carrier
+          #    shape, which has to be NAMED or the attribution reads as false (cycle 12 review tried the
+          #    revert on `issue-<4242> -> none`, whose tail already BEGINS with the arrow's space, found it
+          #    inert, and reported the citation as non-reproducing — that is simply not the carrier).
+          #    The carrier is a number glued DIRECTLY after the closing bracket, i.e. H61's own
+          #    `issue-<4242>4242> -> none`: there `tail` is `4242> -> none (…)`, so without the separator
+          #    the key is the CONCATENATION `42424242` — a key that does not exist — and the contradicted
+          #    claim is ADMITTED (measured: base 80 → separator-revert 0, reddening
+          #    H61['issue-<4242>4242>'] and nothing else in the suite). The two lines are a PAIR: the
+          #    revert of `tail` alone is INERT here (`${nval#*>}` ≡ `${after#*>}`, since `after` always
+          #    holds the bracket close). What `tail`'s derivation decides is the ARROWED spelling — the
+          #    `tail` paragraph above, H55d/H57c — not the arrow-less one.
+          issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
+          *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
+        esac ;;
+      issue-"<"*|pr-"<"*)
+        # an UNTERMINATED bracket still carries a number: key it, and treat the rest as an ABSENCE claim
+        # (we cannot parse a named ref out of it reliably, and refusing is the fail-closed direction).
+        num="$(printf '%s' "${head#*-<}" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
+        case "$head" in
+          issue-*) if [ -n "$num" ]; then nval="issue-$num ->"; else nval="issue-slot"; fi ;;
+          *)       if [ -n "$num" ]; then nval="pr-$num ->";    else nval="pr-slot";    fi ;;
+        esac ;;
+    esac
+    issue=""
+    case "$nval" in
+      issue-[0-9]*) issue="${nval#issue-}"; issue="${issue%%[!0-9]*}" ;;
+      # ⛔ THE SLOT SENTINEL IS MATCHED EXACTLY, NOT AS A PREFIX (review of #3621, cycle 5, P3). `issue-slot*`
+      # also matched `issue-slot4242` — an author-spellable route to the unchecked arm WITH a number in it,
+      # i.e. the hole this whole file exists to close, two lines after a comment promising it cannot be
+      # reached. Only the bare sentinel, which no `issue-<digits>`/bracket form can normalise to, is a slot.
+      issue-slot)  : ;;
+      pr-slot)     case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      pr-[0-9]*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      # ⛔ ANY WHITESPACE SEPARATES `keyless` FROM ITS REASON — NOT JUST A SPACE (cycle 12 review, P2;
+      # carrier corrected in cycle 13, after the first version of this comment cited a predicate that no
+      # longer exists at this head). WHAT THE BASE DID: on `origin/main` the ONLY key test was the SHAPE
+      # parser's `_rest ~ /^keyless[ \t]+[^ \t]/` — whitespace-general — so `keyless<TAB>— why` was
+      # ADMITTED (rc 0). `1519642ff` deleted that test and made THIS classifier the sole authority, and
+      # the arm it introduced required a literal space, so the move NARROWED a spelling the base
+      # accepted: measured on byte-identical briefs, `origin/main` rc 0 versus the cycle-11 head rc 80 —
+      # UNKEYED, with a diagnostic about the key, for a brief whose key is the documented third form.
+      # The predicate below is that base test, carried into the only reader there is — separator, then
+      # real text after it — so `keyless` and `keylessfoo` stay REFUSED, the direction that matters.
+      # ⛔ IT IS DELIBERATELY STRICTER THAN THE BASE ON ONE EXOTIC CARRIER: main's `[^ \t]` treated a lone
+      # VT/FF as a "reason", this arm does not (measured `keyless  <VT>` → main 0, here 80). That is the
+      # fail-CLOSED direction — whitespace is not a reason — and it is recorded here so a later reader
+      # does not "restore parity" by widening it back.
+      # H51c is the ADMIT row. H51d is the parity row: a separator followed by WHITESPACE ONLY must still
+      # be refused — and its carrier has to be a byte the value reader's trailing trim KEEPS. That trim is
+      # `[ \t]+` (the WIP awk above), so a space/tab-only value collapses to bare `keyless` and asserts
+      # nothing new — which is exactly why the FIRST version of H51d was vacuous. ⛔ THAT PROVENANCE IS
+      # TWO STEPS, NOT ONE (checked against this PR's own review record): the row was ADDED by the
+      # cycle-12 fix round, whose finding 3 was the `keyless<TAB>` false block; it was then found VACUOUS
+      # by the cycle-13 review's finding 2, which deleted it — and the cycle-14 delta review's finding 1
+      # restored it with a carrier the trim keeps. An earlier wording cited "cycle 12 finding 2" for the
+      # vacuity, and that finding is the SEPARATOR citation, a different finding in a different cycle.
+      # CR survives the trim and really does arrive here as whitespace-only, so H51d uses CR: with it, the
+      # plausible-simplification mutant `[[:space:]]*[![:space:]]*` → `[[:space:]]*` is KILLED
+      # (`keyless<CR>` 80 → 0) while the bare-`keyless` row alone cannot kill it (80 → 80, measured).
+      keyless*)
+        rest="${nval#keyless}"
+        case "$rest" in [[:space:]]*[![:space:]]*) : ;; *) unkeyed=1 ;; esac ;;
+      *) unkeyed=1 ;;
+    esac
+    [ -n "$issue" ] || continue
+    # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
+    # claim of absence (an earlier draft read the whole value and switched itself off)
+    rest="${nval#issue-}"
+    rest="${rest#*>}"
+    rest="${rest#"$issue"}"
+    # ⛔ ERE, NOT GNU's `\|` (review cycle 3, P2). BSD sed — macOS, where install.sh and launchd run —
+    # does not implement `\|` in a BRE, so this substitution was INERT there: the arrow stayed in
+    # `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its ref was
+    # falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
+    # ⛔ THE ARROW IS OPTIONAL, AND THE `?` IS LOAD-BEARING ON THE **PLAIN** PATH (measured, review of
+    # #3621 cycles 3-4 — both earlier wordings of this comment had it inverted). After the key strip the
+    # PLAIN form `issue-4242 -> refs/wip/x` has already had its `->` consumed by the `#*>` step and keeps
+    # a LEADING SPACE, which a required-arrow sed does not remove — `refs/wip/<ref>` then fails the
+    # `case` below and an HONEST named ref is read as a CLAIM OF ABSENCE (mutant: delete the `?` and
+    # H16/H35/H50/H53b all redden, measured). The bracket forms are normalised above, so they arrive here
+    # in the plain shape.
+    claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)?[[:space:]]*//')"
+    # ⛔ A GLOB IS NOT A REF (review of #3621, P2). `refs/wip/* is empty` begins with `refs/wip/` and
+    # was therefore read as "a ref is named", so the most honest possible way to say "I looked and there
+    # is nothing" switched the check OFF — measured rc 0 with a matching ref on origin, on the merged
+    # baseline too. A named ref must be a CONCRETE token: the word after `refs/wip/` non-empty and free
+    # of glob characters, or the value is a claim of absence.
+    case "$claim" in
+      refs/wip/*)
+        ref="$(printf '%s' "${claim#refs/wip/}" | sed -E 's/[[:space:]].*$//')"
+        case "$ref" in ''|*'*'*|*'?'*|*'['*) issues="${issues:+$issues }$issue" ;; esac ;;
+      *) issues="${issues:+$issues }$issue" ;;
+    esac
+  done <<< "$values"
+  [ "$unkeyed" -eq 0 ] || printf 'PREVIOUS-WORK-WIP\n'
+  [ -n "${issues// /}" ] || return 0
   repo="$(brief_gate_repo "$repo")"
   if [ -z "$repo" ] || [ ! -d "$repo" ]; then
-    printf '[brief-gate] PREVIOUS WORK: refs/wip was NOT measured (no repository resolvable from here) — admitting the brief; the claim that #%s has no rescued WIP is UNVERIFIED.\n' "$issue" >&2
+    printf '[brief-gate] PREVIOUS WORK: refs/wip was NOT measured (no repository resolvable from here) — admitting the brief; the claim that #%s has no rescued WIP is UNVERIFIED.\n' "$(printf '%s' "$issues" | tr ' ' ',')" >&2
     return 0
   fi
-  refs="$(brief_gate_wip_refs "$issue" "$repo" 2>/dev/null)"; rc=$?
-  if [ "$rc" -ne 0 ]; then
-    printf '[brief-gate] PREVIOUS WORK: refs/wip could not be read for #%s — the claim that none exists is UNVERIFIED (admitted; see --wip-refs).\n' "$issue" >&2
-    return 0
-  fi
-  hits="$(printf '%s\n' "$refs" | awk 'NF >= 1')"
-  [ -z "$hits" ] || printf 'PREVIOUS-WORK-WIP-CONTRADICTED\t%s\n' "$(printf '%s' "$hits" | tr '\n' ',' | sed 's/,$//')"
+  for issue in $(printf '%s\n' $issues | sort -u); do
+    refs="$(brief_gate_wip_refs "$issue" "$repo" 2>/dev/null)"; local rc=$?
+    if [ "$rc" -ne 0 ]; then
+      printf '[brief-gate] PREVIOUS WORK: refs/wip could not be read for #%s — the claim that none exists is UNVERIFIED (admitted; see --wip-refs).\n' "$issue" >&2
+      continue
+    fi
+    rest="$(printf '%s\n' "$refs" | awk 'NF >= 1 { printf "%s%s", (n++ ? "," : ""), $1 }')"
+    [ -n "$rest" ] && evidence="${evidence}${evidence:+, }${rest}"
+  done
+  [ -n "$evidence" ] && printf 'PREVIOUS-WORK-WIP-CONTRADICTED\t%s\n' "$evidence"
   return 0
 }
 
@@ -601,7 +781,11 @@ BEGIN { ins = 0; depth = 0; sec = 0; internal = 0; external = 0; rung = 0; ct = 
     # one — the choice is between an honest `keyless — <why>` and an invented issue number. An author
     # who means to evade can invent a number more easily than they can justify `keyless`, so nothing is
     # gained by withholding the honest form.
-    if (_lab == "wip" && (_rest ~ /^(issue|pr)-/ || _rest ~ /^keyless[ \t]+[^ \t]/)) pwwip = 1
+    # ⛔ PRESENCE ONLY, HERE. Whether the key is valid is decided in ONE place — `brief_gate_previous_work`,
+    # which reads EVERY `WIP:` value (fresh-context review of #3484, P1: two readers that disagreed about
+    # WHICH line is the claim let a trailing `WIP: none` / a pasted canonical block / a bare label satisfy
+    # the shape while the cross-check abstained on the last line it saw).
+    if (_lab == "wip" && length(_rest) > 0) pwwip = 1
     if (_lab == "branch" && length(_rest) > 0) pwbr = 1
     if (_lab == "worktree" && length(_rest) > 0) pwwt = 1
     if (_lab == "prior" && length(_rest) > 0) pwpri = 1
@@ -870,12 +1054,19 @@ brief_gate_missing_all() { # brief_gate_missing_all <file|-> [role] [round] [rep
   rnd="$(brief_gate_round_norm "${3:-0}")"
   if [ "$f" = "-" ]; then
     tmpf="$(mktemp "${TMPDIR:-/tmp}/brief-gate.XXXXXX" 2>/dev/null)" || {
-      printf 'NO-FILE\n'; return 0; }
+      # ⛔ NOT `NO-FILE` (review cycle 2, nit): the brief is right there — the TEMP FILE could not be
+      # made (a full disk, an unusable TMPDIR). `NO-FILE` sends the author to look for a brief that
+      # exists; this token says what actually failed, and it refuses rather than answering "complete".
+      printf '[brief-gate] CANNOT VERIFY: no temp file for the stdin brief (mktemp failed) — the brief was NOT read.\n' >&2
+      printf 'GATE-UNAVAILABLE\n'; return "$BRIEF_GATE_UNAVAILABLE"; }
     cat > "$tmpf"
     f="$tmpf"
   fi
+  # ⛔ BOTH ARGUMENTS: #3441's review ROUND (on the base) and #3484's ROLE (the WIP key rule is
+  # role-scoped). Resolving this by keeping one side drops the other feature silently — which is what a
+  # rebase resolution did to this file on the shared branch before this replay.
   brief_gate_missing "$f" "$role" "$rnd"
-  brief_gate_previous_work "$f" "$repo"
+  brief_gate_previous_work "$f" "$repo" "$role"
   [ -n "$tmpf" ] && rm -f "$tmpf"
   return 0
 }
@@ -906,7 +1097,7 @@ brief_gate_verify() { # brief_gate_verify <brief-file|-> [role] [round] [repo]
     f="$tmpf"
   fi
   miss="$(brief_gate_missing "$f" "$role" "$rnd")"
-  pw="$(brief_gate_previous_work "$f" "$repo")"
+  pw="$(brief_gate_previous_work "$f" "$repo" "$role")"
   [ -n "$pw" ] && miss="${miss:+$miss$'\n'}${pw}"
   if [ -z "$miss" ]; then
     [ -n "$tmpf" ] && rm -f "$tmpf"
@@ -1038,7 +1229,7 @@ CONTRADICTION TEST: which RECORDED DECISION covers this work — an owner ruling
 ## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
 
 A released claim reads as "nothing happened here" unless someone looks, and 222 rescued \`refs/wip/*\`
-snapshots existed on this repo that nothing told the next actor about. Measure the four facts below
+snapshots existed on this repo that nothing told the next actor about. Measure the five facts below
 and paste the MEASUREMENT — this is the handover the reaper cannot write for you, because only you
 know what the previous attempt concluded.
 
