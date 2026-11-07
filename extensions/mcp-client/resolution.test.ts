@@ -872,9 +872,9 @@ await test("a REPO-ONLY entry with a contradicting `type` is reported too (no ba
 
 await test("a SAME-transport delta INHERITS the base's `type` (a delta declares what it changes, not what it drops)", () => {
   // `delete carry.type` fired whenever the repo declared a transport, so restating the SAME url — or
-  // setting only `args` on an identical launch — silently dropped a field the repo never touched, with
-  // nothing logged. That contradicts "the repo wins every field it SETS and inherits every field it
-  // OMITS" (SETUP-NEW-MACHINE.md) for a field this client does not act on but does carry forward.
+  // setting only `timeout` on an identical launch — silently dropped a field the repo never touched,
+  // with nothing logged. That contradicts "the repo wins every field it SETS and inherits every field
+  // it OMITS" (SETUP-NEW-MACHINE.md) for a field this client carries forward but never acts on.
   const sameUrl = mergeMcpLayers(
     { mcpServers: { t: { type: "http", url: "https://api.example/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
     { mcpServers: { t: { url: "https://api.example/mcp/" } } } as never,
@@ -895,16 +895,18 @@ await test("a SAME-transport delta INHERITS the base's `type` (a delta declares 
   equal((switched.w as Record<string, unknown>)?.type, undefined, "a transport SWITCH still drops the stale `type`");
 });
 
-await test("an EMPTY-string `url` is refused at the layer read (connectServer dispatches on TRUTHINESS)", async () => {
-  // `if (config.url)` makes `url: ""` fall through to `command` — so the both-transports warning ("it
-  // will run over url") was false for this shape, and an entry that cannot work as either transport
-  // reached the client. Non-string `url` was already refused for the same reason (stringification).
+await test("an EMPTY-string `url` is removed, not the whole ENTRY (connectServer dispatches on TRUTHINESS)", async () => {
+  // `if (config.url)` makes `url: ""` fall through to `command`, so such an entry WORKS over stdio. Two
+  // wrong answers were tried before this one: treating `""` as a declared transport made the ambiguous
+  // warning lie ("it will run over url"), and dropping the whole entry zeroed a config that works. The
+  // empty FIELD goes; the entry stays and runs over what the client would actually have used.
   const repoDir = tempDir("mcp-emptyurl-repo-");
   const homeDir = tempDir("mcp-emptyurl-home-");
   mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
   writeJson(repoDir, ".mcp.json", {
     mcpServers: {
       ghost: { url: "", command: "/bin/false", lazy: true },
+      nothing: { url: "", lazy: true },
       fine: { url: "https://fine/mcp", lazy: true },
     },
   });
@@ -918,11 +920,37 @@ await test("an EMPTY-string `url` is refused at the layer read (connectServer di
     })
   );
   const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
-  ok(!("ghost" in cfg.mcpServers), "an empty `url` must not reach the client — got it dispatched as a command instead");
+  ok("ghost" in cfg.mcpServers, "an entry that still has a usable `command` must NOT be zeroed");
+  equal((cfg.mcpServers.ghost as Record<string, unknown>).url, undefined, "the empty `url` field is removed");
+  equal((cfg.mcpServers.ghost as Record<string, unknown>).command, "/bin/false", "and the command it really runs is kept");
+  ok(!("nothing" in cfg.mcpServers), "an entry left with NO transport has nothing to run — dropped");
   ok("fine" in cfg.mcpServers, "and a valid sibling still loads");
   ok(
-    logs.some(l => l.includes("non-string or empty") && l.includes("ghost")),
-    `the drop must be reported — got:\n${logs.join("\n")}`
+    logs.some(l => l.includes('has an empty "url"') && l.includes("ghost")),
+    `the removal must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("an EMPTY-string `url` does not make a repo entry look AMBIGUOUS (the merge must agree with the layer read)", async () => {
+  // `mergeMcpLayers` is exported and is called directly with raw JSON, so its presence tests are part of
+  // the contract: counting `""` as a declared transport made a repo-only entry warn "will run over url"
+  // (it runs the command) and made a genuine transport SWITCH look like an ambiguous delta, discarding it.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { url: "https://base.example/mcp" } } } as never,
+      { mcpServers: { t: { url: "", command: "/bin/sh" } } } as never,
+    );
+  });
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.command, "/bin/sh", "a repo switching to stdio must have its transport APPLIED, not be called ambiguous");
+  ok(
+    t?.url !== "https://base.example/mcp",
+    "the base's url must not survive the switch (the repo's empty string may remain — it cannot select HTTP)"
+  );
+  ok(
+    !logs.some(l => l.includes("ambiguous")),
+    `an empty \`url\` is not a declared transport, so nothing is ambiguous — got:\n${logs.join("\n")}`
   );
 });
 

@@ -666,6 +666,19 @@ function hasField(entry: McpServerConfig, field: string): boolean {
 }
 
 /**
+ * Does this entry DECLARE `field` as a transport? PRESENCE is not enough for the transport tests: an
+ * empty string cannot select a transport (`connectServer` dispatches on `if (config.url)` — TRUTHINESS),
+ * so counting it as declared made a repo entry look ambiguous when it really runs over its `command`,
+ * and made a genuine transport switch look like an ambiguous delta and get discarded. The CREDENTIAL
+ * guards still key on `hasField` deliberately: `{"url": ["https://attacker/…"]}` is a typo that must
+ * count as a CHANGED destination, not as "no transport declared".
+ */
+function declaresTransport(entry: McpServerConfig, field: "url" | "command"): boolean {
+  const value = (entry as Record<string, unknown>)[field];
+  return typeof value === "string" && value !== "";
+}
+
+/**
  * `type` is OPTIONAL and is an AGREEMENT constraint, not a transport selector: `command` selects stdio
  * and `url` selects streamable HTTP, and `type` — when present — must agree (`docs/mcp.md`).
  * `connectServer` dispatches on `url`/`command` and never reads `type`, so an incoherent entry would
@@ -753,7 +766,7 @@ export function mergeMcpLayers(
       // No base entry to defend, so the ruling is the same as for the BASE layer: a repo-only entry
       // declaring both transports WORKS over `url` (`connectServer` tests it first) and `origin/main`
       // refused nothing — dropping it would zero a working server. Warn and keep.
-      if (hasField(entry, "url") && hasField(entry, "command")) {
+      if (declaresTransport(entry, "url") && declaresTransport(entry, "command")) {
         console.log(
           `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — ambiguous; it is ` +
             `KEPT and will run over "url" (the order this client dispatches in). Declare ONE transport.`
@@ -771,8 +784,8 @@ export function mergeMcpLayers(
       continue;
     }
 
-    const repoDeclaresHttp = hasField(entry, "url");
-    const repoDeclaresStdio = hasField(entry, "command");
+    const repoDeclaresHttp = declaresTransport(entry, "url");
+    const repoDeclaresStdio = declaresTransport(entry, "command");
     if (repoDeclaresHttp && repoDeclaresStdio) {
       // Two transports in one entry is ambiguous, not a delta. Guessing would silently pick `url`
       // (connectServer tests it first) and ignore the command the operator actually wrote.
@@ -791,13 +804,13 @@ export function mergeMcpLayers(
     // label. Compared by transport CLASS (url first, the order `connectServer` dispatches in), not by
     // "did the repo declare something".
     {
-      const baseTransport = hasField(inherited, "url")
+      const baseTransport = declaresTransport(inherited, "url")
         ? "http"
-        : hasField(inherited, "command")
+        : declaresTransport(inherited, "command")
           ? "stdio"
           : "none";
       const effectiveTransport = repoDeclaresHttp ? "http" : repoDeclaresStdio ? "stdio" : baseTransport;
-      if (baseTransport !== "none" && baseTransport !== effectiveTransport) delete carry.type;
+      if (baseTransport !== effectiveTransport) delete carry.type;
     }
     if (repoDeclaresHttp) {
       for (const field of STDIO_TRANSPORT_FIELDS) delete carry[field];
@@ -904,23 +917,42 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       continue;
     }
     // A transport that is not a string is a config TYPO, and a dangerous one: `connectServer` reads
-    // `if (config.url)` and would STRINGIFY an array into a real request. An EMPTY STRING is the same
-    // class of typo from the other side, and it makes the both-transports warning LIE: that `if`
-    // dispatches on TRUTHINESS, so `url: ""` does not select HTTP — it falls through to `command`
-    // (measured), the opposite of "it will run over url". An empty value cannot work as either
-    // transport (an empty URL is `Invalid URL`; an empty command cannot spawn), so it is dropped with
-    // the same message as a wrong type rather than dispatched on a guess.
+    // `if (config.url)` and would STRINGIFY an array into a real request — so a non-string is refused
+    // WITH its entry, because a stringified destination is exactly what must never reach the client.
+    //
+    // An EMPTY STRING is a typo of the other kind and needs the opposite treatment: that `if`
+    // dispatches on TRUTHINESS, so `url: ""` does not select HTTP — the entry simply runs over its
+    // `command` (`{url:"", command:…}` connects over stdio, measured). Dropping the whole ENTRY would
+    // therefore zero a config that works, which is the failure this file rules against everywhere. So
+    // the empty FIELD is removed and the entry kept: the projected entry then matches what the client
+    // would have done anyway, and the both-transports warning ("it will run over url") stops being a
+    // lie. Only an entry left with NO transport at all — which has nothing to run — is dropped.
     const typed = entry as Record<string, unknown>;
     const badTransport = (["url", "command"] as const).find(
-      field =>
-        typed[field] !== undefined && (typeof typed[field] !== "string" || typed[field] === "")
+      field => typed[field] !== undefined && typeof typed[field] !== "string"
     );
     if (badTransport) {
       console.log(
-        `[mcp-client] WARN: ${label} entry "${name}" has a non-string or empty "${badTransport}" — dropped. ` +
-          suffix
+        `[mcp-client] WARN: ${label} entry "${name}" has a non-string "${badTransport}" — dropped. ` + suffix
       );
       continue;
+    }
+    const emptyTransports = (["url", "command"] as const).filter(field => typed[field] === "");
+    if (emptyTransports.length > 0) {
+      for (const field of emptyTransports) {
+        console.log(
+          `[mcp-client] WARN: ${label} entry "${name}" has an empty "${field}" — that field is removed. ` +
+            `An empty value cannot select a transport (the client dispatches on whether the field is ` +
+            `set to a value), so it is ignored rather than treated as a declared transport.`
+        );
+        delete typed[field];
+      }
+      if (typed.url === undefined && typed.command === undefined) {
+        console.log(
+          `[mcp-client] WARN: ${label} entry "${name}" declares no usable transport — dropped. ` + suffix
+        );
+        continue;
+      }
     }
     // An unrecognised `type` is NOT an error here (see RECOGNISED_TYPES) — but it is worth saying out
     // loud, because the operator wrote it expecting an effect this client will not give it.
@@ -1922,7 +1954,8 @@ export default async function (pi: ExtensionAPI) {
   if (layers.repo || layers.base) {
     console.log(
       `[mcp-client] MCP layers: base=${layers.base ?? "(none)"} repo=${layers.repo ?? "(none)"} ` +
-        `(repo wins on a name collision; searched up from ${searchedDir})`
+        `(repo fields win per server; an ambiguous repo entry leaves the base's entry in place; ` +
+        `searched up from ${searchedDir})`
     );
   } else {
     console.log(
