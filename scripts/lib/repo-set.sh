@@ -137,32 +137,24 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 # refuse (two controllers on one `.orch.lock`). The repo already treats this class as real:
 # `check-farm-drift.sh` normalises `//` and `.` after a measured incident.
 _rs_norm_path() {
-  local comp
-  local -a parts=()
+  local out="" comp
   while IFS= read -r comp; do
-    case "$comp" in
-      ''|.) continue ;;
-      # ⛔ `..` IS COLLAPSED LEXICALLY (review round 9, P2). It used to survive, and `_rs_state_key`
-      # falls back to THIS function for a state dir that does not exist yet — so a set naming
-      # `/srv/s` and `/srv/s/new/..` was GREEN until the controller's own `mkdir -p` made the
-      # directory exist and the two collapsed to one inode, at which point the same byte-identical
-      # config refused. A verdict must not flip on a filesystem fact. Lexical collapse is safe here
-      # because the caller resolves symlinks for real (`cd -P`) whenever the path exists; where it
-      # does not, no symlink inside it can have an effect the operator would not also get from `cd`.
-      ..)
-        if [ "${#parts[@]}" -gt 0 ]; then unset "parts[$(( ${#parts[@]} - 1 ))]"; fi
-        continue ;;
-    esac
-    parts[${#parts[@]}]="$comp"
+    case "$comp" in ''|.) continue ;; esac
+    out="$out/$comp"
   done <<EOF_NORM
 $(printf '%s' "${1:-}" | tr '/' '\n')
 EOF_NORM
-  local out=""
-  local i=0
-  while [ "$i" -lt "${#parts[@]}" ]; do out="$out/${parts[$i]}"; i=$(( i + 1 )); done
   [ -n "$out" ] || out="/"
   printf '%s' "$out"
 }
+
+# ⛔ `_rs_norm_path` DELIBERATELY DOES NOT COLLAPSE `..`, AND THE SHARED-STATE KEY DOES NOT USE IT FOR
+# THAT (review round 9). Two rounds fixed this arm from opposite directions — one folded `..` here
+# textually, the other (`_rs_state_key`) walks the path and canonicalises each EXISTING prefix with
+# `cd -P` — and the walking one is the correct one: `/a/link/../b` with `/a/link -> /c` is PHYSICALLY
+# `/b`, so a textual fold would call it `/a/b` and get a real directory wrong. `_rs_state_key` is the
+# single authority for the state comparison; this function is only its fallback for the LEADING run of a
+# path, where nothing has been resolved yet and `..` is left to the caller that can look.
 
 # _rs_state_key <path> — the IDENTITY of a state dir, for the shared-state refusal. Spelling is not
 # identity, and `_rs_norm_path` alone cannot express that: it folds `//`, `.` and a trailing `/`
