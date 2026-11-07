@@ -1201,17 +1201,24 @@ def cred_kind(argv):
         # `gh api graphql` call — deliberately, and it says so: for PACING the cheap direction is to
         # treat a GraphQL payload as a read (a false mutation costs a 1 s gap). Served a CREDENTIAL
         # that reasoning inverts, exactly as it does under coalescing: `-f query='mutation{…}'`
-        # classified as a read and was handed to the read-only installation token. Found in review
-        # cycle 2, reproduced end-to-end (`SERVED_BY=tok-app`) for `mutation{…}`, for a multi-operation
-        # document selected by `operationName`, and for `-F query=@file`.
-        # The fail-closed answer already existed one function away, for precisely this reason
-        # (`_graphql_query_is_read`, which `flight_eligible` already consults), so the classifier
-        # asks THAT instead of re-deriving it — one predicate, one answer.
-        if _graphql_query_is_read(argv):
-            return "read"              # a payload we can PROVE is a query
-        if any(a == "graphql" or a.startswith("graphql=") for a in argv[1:2]):
-            return "unproven"          # `api graphql` we cannot prove is a query
-        return "read"                  # a plain REST GET: no method flag, no data
+        # classified as a read and was handed to the read-only installation token (review cycle 2).
+        #
+        # ⛔ AND THE ENDPOINT IS ATTRIBUTED WITH `api_endpoint()`, NEVER BY LOOKING AT `argv[1]`. The
+        # first repair of the cycle-2 finding wrote `any(a == "graphql" … for a in argv[1:2])` — a
+        # SECOND-TOKEN scan — so any flag before the endpoint hid it, the correct
+        # `_graphql_query_is_read() == False` answer was discarded, and the fall-through returned
+        # `read`: `api -H 'Accept: …' graphql -f query='mutation{…}'`, `api --hostname … graphql …`,
+        # `api -- graphql …` and `api -H … graphql --input=…` were ALL served by the installation
+        # token (162 of 231 enumerated write-payload shapes, review cycle 3 — a P0 on the change's own
+        # core invariant). `api_endpoint()` already exists for precisely this: it consumes flag VALUES,
+        # it is what `cred_purpose` and `flight_eligible` use, and its own comment records this exact
+        # `-H`-before-`graphql` shape as measured. One argv parser for one argv question.
+        ep = api_endpoint(argv)
+        if ep is None:
+            return "unproven"          # an argv we cannot attribute is NOT provably a read
+        if ep.strip("/").lower() == "graphql":
+            return "read" if _graphql_query_is_read(argv) else "unproven"
+        return "read"                  # a REST GET: no method flag, no data
     if argv[0] in READ_BARE:
         return "read"
     if len(argv) >= 2 and (argv[0], argv[1]) in READ_SUBCOMMANDS:
@@ -1335,7 +1342,11 @@ def run(real_gh, argv, extra=None, timeout=None):
         arm = "app-dry" if _app_dry(res) else "app-refused"
         log_event("credential fallback arm=%s — the application credential failed (rc=%s); retrying "
                   "once on the user credential (#3429)" % (arm, res.rc))
-        cred.arm = arm
+        # ⛔ NEVER MUTATE THE CACHED DECISION. `credential_for()` caches it per (kind, purpose), so
+        # `cred.arm = arm` rewrote a SHARED object: the next `run()` in the same process (the dispatch
+        # retry loop calls it per attempt) injected `GH_CRED_SERVED_ARM=app-dry` for a call the app
+        # actually served — a successful, app-served attempt attributed as a fallback (review cycle 3).
+        # The arm for THIS call rides the child env and the counter, which is all it is for.
         # ⛔ AND THE ANSWER THAT COMES BACK WAS PRODUCED BY THE USER CREDENTIAL, so the class the
         # cache writers stamp must say so. It did not, and the result was the one case where the two
         # credentials PROVABLY differ in visibility (the app was refused, the user could see it) being

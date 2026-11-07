@@ -341,6 +341,21 @@ ck "a payload we cannot read (-F query=@file) keeps the user credential" \
    "$([ "$(viah api graphql -F 'query=@/tmp/nope.graphql' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
 ck "a PROVEN GraphQL QUERY is still served by the app (the guard is not a blanket refusal)" \
    "$([ "$(viah api graphql -f 'query=query{viewer{login}}' | cut -d' ' -f1)" = "tok-1|app" ] && echo 0 || echo 1)"
+
+# ⛔ THE GRAPHQL ENDPOINT MUST BE ATTRIBUTED, NOT SCANNED. The first repair used `argv[1:2]`, a
+# SECOND-TOKEN scan, so any FLAG before the endpoint hid it and the fall-through served the mutation
+# from the installation token — a P0 on this change's own invariant (review cycle 3: the reviewer
+# enumerated 162 of 231 write-payload shapes as read-classified). These rows are those bypasses.
+ck "a FLAG before the graphql endpoint (-H) does not hide it — the mutation stays on the user credential" \
+   "$([ "$(viah api -H 'Accept: application/json' graphql -f 'query=mutation{addComment(input:{body:\"x\"})}' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "--hostname before the graphql endpoint does not hide it" \
+   "$([ "$(viah api --hostname api.github.com graphql -f 'query=mutation{x}' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a -- separator before the graphql endpoint does not hide it" \
+   "$([ "$(viah api -- graphql -f 'query=mutation{x}' | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "--input behind a flag before the endpoint stays unproven" \
+   "$([ "$(viah api -H 'Accept: x' graphql --input=/tmp/nope.json | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
+ck "a FLAG before a REST GET is still a read (the guard is not a blanket refusal)" \
+   "$([ "$(viah api -H 'Accept: application/json' repos/o/r/pulls/1 | cut -d' ' -f1)" = "tok-1|app" ] && echo 0 || echo 1)"
 ck "a WRITE through the layer keeps the USER credential" \
    "$([ "$(viah pr merge 7 --squash | cut -d' ' -f1)" = "$AMB|not-provably-read" ] && echo 0 || echo 1)"
 ck "the METER through the layer keeps the USER credential" \
@@ -458,6 +473,30 @@ sys.stdout.write(m._CRED_CLASS)
 CP
 ck "after an APP-served call the stamped class is 'app' even if a previous call left it 'user'" \
    "$([ "$(python3 "$TMP/classprobe.py" "$LIMIT" "$TMP/stub-gh" 2>/dev/null)" = app ] && echo 0 || echo 1)"
+
+# ⛔ AND THE FALLBACK MUST NOT MUTATE THE CACHED DECISION. `credential_for()` caches it per
+# (kind, purpose), so `cred.arm = arm` rewrote a SHARED object and the NEXT `run()` in the same process
+# injected `GH_CRED_SERVED_ARM=app-dry` for a call the app actually served — a successful, app-served
+# attempt attributed as a fallback (review cycle 3).
+cat >"$TMP/armprobe.py" <<'AP'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("gh_limit", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+class D(object):
+    arm = "app"
+    credential = "app"
+    token = "tok-1"
+
+d = D()
+m._CRED_CACHE[("read", "request")] = d
+m.run(sys.argv[2], ["pr", "view", "1"])          # the app is refused -> a fallback happens
+sys.stdout.write(d.arm)                            # the CACHED decision's arm, after that fallback
+AP
+_arm_after="$(GH_CRED_TEST_REFUSE_APP=1 python3 "$TMP/armprobe.py" "$LIMIT" "$TMP/stub-gh" 2>/dev/null)"
+ck "a fallback does not rewrite the CACHED decision's arm (got '${_arm_after}')" \
+   "$([ "$_arm_after" = app ] && echo 0 || echo 1)"
 
 # ⛔ NON-VACUITY: with the fallback predicate removed, the SAME read must FAIL. If this row passed
 # with the predicate gone, the three assertions above would be proven by nothing.
