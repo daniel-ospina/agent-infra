@@ -163,22 +163,35 @@ from pathlib import Path
 #: ``path`` group stays anchored, and the tail admits only
 #: ``[A-Za-z0-9_\[\]\-.:/]`` — no whitespace, no tab, no empty tail, no missing ``::``.
 #:
-#: ⛔ KNOWN RESIDUAL, deliberately NOT closed here (measured, not assumed). `rest`
-#: is an allowlist of the characters a PLAIN parameter carries (alnum, ``_``,
-#: ``[``, ``]``, ``.``, ``:``, ``-``, ``/``). Anything else is still dropped from
-#: main's table and the IDENTICAL BLOCK survives for it. It has TWO shapes:
-#:   * an ESCAPED param — pytest renders control/non-ASCII/backslash params as a
-#:     backslash sequence (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]``), so the character
-#:     that must be admitted is ``\``; admitting a non-ASCII RANGE closes nothing.
-#:     This family is unbounded, which is why it is stated as a property.
-#:   * plain-but-excluded punctuation: space, ``,``, ``;``, quotes, ``=``, ``+``, ``&``.
-#: SPACE is the only one of these whose ROW ``_RATES_RE`` also refuses (its nodeid
-#: group is ``\S+``); the rest are ``\S`` and are dropped by ``rest`` alone, so a
-#: fix for them does not touch ``_RATES_RE``.
-#: The module's own ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id``
-#: pins ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, so
-#: this is live, not hypothetical. Filed as its own finding (#3691); do not read
-#: this class as "safe" because the path case now works.
+#: ⛔ KNOWN RESIDUAL, deliberately NOT closed here — and NEVER to be written as a
+#: list. `rest` is an allowlist: alnum, ``_``, ``[``, ``]``, ``.``, ``:``, ``-``,
+#: ``/``. ANY real id carrying a character outside it is dropped from MAIN's rate
+#: table, and the IDENTICAL BLOCK survives for it. **That set is OPEN-ENDED.**
+#: Five drafts enumerated it and every one was measurably wrong — space, then
+#: ``,``, then ``;``, then the escape family, then "exactly two shapes"; the last
+#: was still false, because raw ``#``, ``(``, ``)``, ``@``, ``|``, ``<``, ``>`` are
+#: emitted verbatim and are already in this fleet's own corpus. Measured on this
+#: repo's collected population: 1543 ids, 47 dropped by this door, 10 of them
+#: carrying characters no earlier draft named. If a real id is dropped, ask WHICH
+#: DOOR and WHY — not whether it fits a list.
+#:
+#: WHAT pytest ESCAPES — both halves measured. A PARAM is escaped when needed
+#: (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]`` — backslash sequences, no raw byte), so for
+#: that class the character to admit is ``\``; a test/class NAME is NOT escaped
+#: (``def test_café`` emits the raw UTF-8 bytes ``c3 a9``), so that class needs a
+#: non-ASCII RANGE and admitting ``\`` does not help it.
+#:
+#: WHICH DOOR, precisely: ``_RATES_RE``'s nodeid group is ``\S+``, so it ALSO refuses
+#: a row whose id carries whitespace (space is the practical case) — a
+#: reader-side refusal, not a table property (the producer emits the row intact).
+#: Every other offending character is ``\S``, so ``_RATES_RE`` matches those rows
+#: and the drop is ``rest`` ALONE. Do not send a fixer to ``_RATES_RE`` for a
+#: comma; it is not involved. A whitespace fix needs BOTH widened.
+#:
+#: The module's own
+#: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins
+#: ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, so this is
+#: live, not hypothetical. Filed as agent-infra#3691.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"

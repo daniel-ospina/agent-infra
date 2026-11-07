@@ -3065,65 +3065,96 @@ def test_11365_a_main_red_with_a_path_parameter_is_EXEMPT_not_BLOCKED():
 
 
 def test_11365_the_widened_tail_still_fails_closed_on_junk():
-    """NON-VACUITY: admitting `/` must not turn the rate door into a wildcard.
+    r"""NON-VACUITY: admitting `/` must not turn the rate door into a wildcard.
 
-    ⛔ "Unbalanced bracket" is deliberately NOT in this list: `[` was already in
-    `rest` before this change, so `test_x[a` was and remains admitted. Asserting
-    otherwise would pin a narrowing the door never had.
+    ⛔ "Unbalanced bracket" is deliberately NOT asserted here: `[` was already in
+    `rest` before this change, so `test_x[a` was and remains admitted. Pinning it
+    would pin a narrowing the door never had.
 
-    ⛔ SCOPE — what this list does and does not establish. It establishes that
-    every shape below is still REFUSED by the new class. It does NOT establish
-    that everything missing from the list is safe.
+    ⛔ THE RESIDUAL, AS A PROPERTY — NEVER AS A LIST. `rest` is an allowlist:
 
-    ⛔ THE RESIDUAL, STATED AS A PROPERTY RATHER THAN A CHARACTER LIST. `rest` is an
-    allowlist of the characters a PLAIN parameter carries: `A-Za-z0-9_`, `[`, `]`,
-    `.`, `:`, `-`, `/`. Everything else is dropped from MAIN's rate table, and the
-    identical silent-drop → "absent from main's failure set" → permanent BLOCK
-    survives for it. That residual has TWO shapes, and an earlier draft of this
-    docstring listed individual characters instead — which kept coming out
-    incomplete (space, then `,`, then `;`, then the escape family), because the
-    escape family is unbounded:
+        A-Za-z0-9_  [  ]  .  :  -  /
 
-      1. **Escaped params — unbounded.** pytest does NOT emit a raw control byte, a raw
-         non-ASCII byte, or a raw backslash; it renders the parameter as a BACKSLASH
-         sequence. Measured with `pytest --collect-only -q | cat -A`:
-         `parametrize("x", ["a\\tb", "caf\\u00e9", "a\\\\b"])` emits
-         `test_esc[a\\tb]`, `test_esc[caf\\xe9]`, `test_esc[a\\\\b]`. So the character
-         that must be admitted is `\\` (backslash) — admitting any non-ASCII RANGE
-         closes nothing, because the id never contains a non-ASCII byte.
-      2. **Plain-but-excluded punctuation.** ` ` (space), `,`, `;`, `'`, `"`, `=`,
-         `+`, `&` are emitted as themselves and are all refused by `rest`.
+    ANY real id carrying a character outside that allowlist is dropped from MAIN's
+    rate table, and the identical silent-drop → "absent from main's failure set" →
+    permanent BLOCK survives for it. **That set is OPEN-ENDED and must not be
+    enumerated.** Five drafts of this docstring tried, and each one was measurably
+    wrong: it listed space, then `,`, then `;`, then the escape family, then
+    "exactly two shapes" — and "two shapes" was still false, because raw `#`,
+    `(`, `)`, `@`, `*`, `|`, `` ` ``, `<` and `>` are emitted verbatim, fit neither
+    shape, and are already live in THIS repo's own collected population.
+
+    Measured, so the shape of the gap is on the record rather than in someone's
+    memory. `pytest tests/ --collect-only -q` on this tree collects 1543 ids; the
+    strict door drops **47** of them, and **10** of those carry offending characters
+    (raw `#`, `(`, `)`, `@`, `` ` ``, `|`, `<`, `>`) that no earlier enumeration
+    named. Examples that are real ids in this very file:
+
+        tests/test_ci_exemption.py::test_no_runner_or_hook_wrapper_is_ever_an_identity[##[error]Bash exited with code '1'.]
+        ...test_queue_dispatch.py::test_an_unreadable_roster_still_aborts[None--(timeout)]
+
+    ⛔ WHAT pytest DOES AND DOES NOT ESCAPE — both halves are measured, and the
+    second half is the one that keeps getting stated wrongly.
+
+      * PARAMS are escaped when needed. `parametrize("x", ["a\tb", "caf\u00e9",
+        "a\\b"])` emits `test_esc[a\tb]`, `test_esc[caf\xe9]`, `test_esc[a\\b]` —
+        backslash sequences, no raw byte. So for that class the character to admit
+        is `\`.
+      * NAMES are NOT escaped. `def test_café(): pass` emits a nodeid containing the
+        RAW UTF-8 bytes `c3 a9` (verified with `--collect-only -q | hexdump -C`), so
+        a non-ASCII NAME needs a non-ASCII RANGE and admitting `\` does not help it.
+        An earlier draft asserted "the id never contains a non-ASCII byte" — false
+        for names.
 
     ⛔ WHICH DOOR REFUSES WHICH — measured, because the obvious guess is wrong.
-    SPACE is the only real-id class whose ROW the rate READER (`_RATES_RE`) also
-    refuses: its nodeid group is `\\S+`, so the row is IN the table and
+    `_RATES_RE`'s nodeid group is `\S+`, so it ALSO refuses a row whose id contains
+    whitespace (space is the practical case): the row is IN the table and
     `_RATES_RE` declines to match it — a reader-side refusal, not a property of the
     table (the producer's `sort | uniq -c | awk` emits the row intact). Every other
-    class above — `,`, `;`, quotes, `=`, `+`, `&`, and the whole escape family — is
-    `\\S`, so `_RATES_RE` matches those rows fine and the drop is `is_failure_key` /
-    `rest` ALONE. Do not tell a future fixer that comma needs `_RATES_RE` widened;
-    it does not. Closing space needs BOTH widened.
+    offending character — punctuation, escapes, raw non-ASCII — is `\S`, so
+    `_RATES_RE` matches those rows fine and the drop is `is_failure_key` / `rest`
+    ALONE. Do not send a future fixer to `_RATES_RE` for a comma; it is not
+    involved. A whitespace fix needs BOTH widened.
 
     The module's own
     `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
-    `[chromium-Claude Desktop]` as a REAL id the loose door must name, so this is
-    a live residual, not a hypothetical. It is filed as its own finding (#3691).
+    `[chromium-Claude Desktop]` as a REAL id the loose door must name, so the
+    residual is live, not hypothetical. Filed as agent-infra#3691.
     """
+    # ── genuinely NOT ids: refused for a STRUCTURAL reason, not by the alphabet ──
     for junk in (
-        # ⛔ none of these is a REAL id — that is what separates them from the
-        # residual above. In particular a RAW tab and a RAW non-ASCII byte are
-        # never emitted: pytest escapes them (see shape 1), so the loose door
-        # rejects the raw forms too (`is_failure_key_loose` -> False). An earlier
-        # draft put the ESCAPED form in this tuple instead, which pinned a live
-        # BLOCK as correct behaviour; and `[a;b]` was filed here for the same
-        # wrong reason — pytest emits it verbatim and the loose door accepts it.
-        "tests/test_a.py::test_x[a b]",       # SPACE: real id, but _RATES_RE (\S+) refuses
-        "tests/test_a.py::test_x[a\tb]",      # RAW tab: never emitted (pytest writes [a\tb])
         "tests/test_a.py::",                  # empty tail
         "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
         "random-string",                      # not a nodeid at all
+        # a RAW tab byte: never emitted. pytest renders a tab param as [a\tb] (a
+        # backslash and a `t`), so the raw byte is not an id and BOTH doors refuse
+        # it — `is_failure_key_loose` is False too, which is what makes it junk
+        # rather than residual.
+        "tests/test_a.py::test_x[a\tb]",
     ):
         assert not is_failure_key(junk), f"{junk!r} must NOT buy a rate row"
+
+    # ── REAL ids the strict door drops: the RESIDUAL, pinned so it cannot be
+    # silently declared fixed and CANNOT be mistaken for correct behaviour.
+    # Space is a real id (the module pins `[chromium-Claude Desktop]`), so it does
+    # NOT belong in the junk loop above — asserting "must not buy a rate row" about
+    # a real id asserts that a live BLOCK is right. It is asserted here as a KNOWN,
+    # TRACKED defect instead: if #3691 closes, this block reds and the fixer
+    # deletes it deliberately rather than discovering it as a surprise.
+    for residual in (
+        "tests/test_a.py::test_x[a b]",       # real id; dropped (space)
+        "tests/test_a.py::test_x[a,b]",       # real id; dropped (comma)
+        "tests/test_a.py::test_x[a;b]",       # real id; dropped (semicolon)
+        r"tests/test_a.py::test_x[a\tb]",     # real id as pytest emits it (escaped tab)
+    ):
+        assert not is_failure_key(residual), (
+            f"{residual!r} is now ACCEPTED by the strict door — if agent-infra#3691 "
+            "closed the residual, delete this block; if not, the alphabet changed"
+        )
+        assert is_failure_key_loose(residual), (
+            f"{residual!r} must be a REAL id (the loose/PR door names it), else it "
+            "belongs in the junk loop above, not here"
+        )
 
 
 
