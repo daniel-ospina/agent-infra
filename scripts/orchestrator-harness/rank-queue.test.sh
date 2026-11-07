@@ -720,9 +720,15 @@ printf '300\n' > "$QC/pool"
   cat "$FNS"
   printf 'rank_queue_by_pool "$1" "$2" "$3" "$4"\nexit $?\n'
 } > "$QC/one.sh"
-( cd "$QC" && HOME="$QC" bash one.sh "$QC/pool" "$QC/q" "$QC/out-bad" /dev/null ) >/dev/null 2>&1
+# ⛔ THEIR OUTPUT IS CAPTURED, NOT DISCARDED (review P2, cycle 87). Both drives used to end `>/dev/null 2>&1`, so any
+# sentence printed on the EMPTY-COUNT refusal arm (`[ -s "$cnt" ] || return 1`) reached no CRC at all — and no other
+# fixture reaches that arm (`/dev/null` as the count argument is the only route to it). Measured at the review: a
+# claim injected at that `return 1` left the suite at 177/0, contradicting the scope note's "§14 and §6 drive each
+# state arm and each refusal". The files are top-level members of the case dir, so `_out_map` pins them; `$?` still
+# holds the DRIVER's status because only the redirect changed.
+( cd "$QC" && HOME="$QC" bash one.sh "$QC/pool" "$QC/q" "$QC/out-bad" /dev/null ) > "$QC/run-bad.log" 2>&1
 bad_rc=$?
-( cd "$QC" && HOME="$QC" bash one.sh "$QC/pool" "$QC/q" "$QC/out-good" "$QC/cnt-good" ) >/dev/null 2>&1
+( cd "$QC" && HOME="$QC" bash one.sh "$QC/pool" "$QC/q" "$QC/out-good" "$QC/cnt-good" ) > "$QC/run-good.log" 2>&1
 good_rc=$?
 if [ "$bad_rc" -ne 0 ] && [ -s "$QC/out-bad" ] && [ "$good_rc" -eq 0 ] && [ -s "$QC/cnt-good" ]; then rc=0
 else
@@ -881,13 +887,13 @@ inode_of() { ls -i "$1" 2>/dev/null | awk '{print $1}'; }
 printf '200\n300\n9\n' > "$ID/o/candidates.txt"
 printf '200\n300\n' > "$ID/o/.pool"
 ino_a1="$(inode_of "$ID/o/candidates.txt")"
-( cd "$ID" && HOME="$ID" bash drive.sh "$ID/o" ) >/dev/null 2>&1
+( cd "$ID" && HOME="$ID" bash drive.sh "$ID/o" ) > "$ID/run-a.log" 2>&1
 ino_a2="$(inode_of "$ID/o/candidates.txt")"
 order_a="$(tr '\n' ' ' < "$ID/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
 # B) POSITIVE PAIR: a queue that IS out of pool order -> the reorder must actually land on disk.
 printf '9\n300\n200\n' > "$ID/o/candidates.txt"
 ino_b1="$(inode_of "$ID/o/candidates.txt")"
-( cd "$ID" && HOME="$ID" bash drive.sh "$ID/o" ) >/dev/null 2>&1
+( cd "$ID" && HOME="$ID" bash drive.sh "$ID/o" ) > "$ID/run-b.log" 2>&1
 ino_b2="$(inode_of "$ID/o/candidates.txt")"
 order_b="$(tr '\n' ' ' < "$ID/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
 if [ -n "$ino_a1" ] && [ "$ino_a1" = "$ino_a2" ] && [ "$order_a" = "200 300 9" ] \
@@ -2386,15 +2392,15 @@ _dwp="$TMP/wit-parse"; rm -rf "$_dwp"; mkdir -p "$_dwp"; _n_p="$(_xtrace_nonce)"
 # The body CARRIES THE TOKEN PAIR on purpose: a body without it proves nothing about the matcher (it would
 # have failed even the weakest predicate). `_dwit` must still name nothing, because no `echo` ran.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' 'set -v' \
   'queue_order_from_pool() {' \
   "  cat <<'ZZZ'" \
   "  queue_order_from_pool echo '[refresh] decoy order: printed DATA'" \
   'ZZZ' \
   '  return 0' \
   '}' \
-  'queue_order_from_pool' > "$_dwp/decoy.sh"
-( cd "$_dwp" && bash decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-decoy.sh"
+( cd "$_dwp" && bash drive-wit-decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
 # ⛔ AND THE BODY MUST HAVE REACHED THE STREAM (review P3, cycle 52): `set -v` is the ONLY reason the body is on
 # FD 2, and an absence assertion over a stream the body never reached passes for ANY matcher — measured:
 # deleting `set -v` left the suite at 131/0 with the pre-fix substring matcher still in place.
@@ -2408,7 +2414,7 @@ ck "a heredoc body carrying the TOKEN PAIR names NO witness (printed data is not
 # ⛔ AND THE ASSIGNMENT SHAPE, which traces the body INSIDE the assignment rather than as a command — the
 # exact line a substring matcher accepted (review P2, cycle 51).
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' \
   'queue_order_from_pool() {' \
   "  _d=\"\$(cat <<'ZZZ'" \
   "queue_order_from_pool echo '[refresh] assign order: body traced inside an assignment'" \
@@ -2416,8 +2422,8 @@ printf '%s\n' \
   ')"' \
   '  : "$_d"' \
   '}' \
-  'queue_order_from_pool' > "$_dwp/assign.sh"
-( cd "$_dwp" && bash assign.sh ) > "$_dwp/assign.out" 2>"$_dwp/assign.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-assign.sh"
+( cd "$_dwp" && bash drive-wit-assign.sh ) > "$_dwp/assign.out" 2>"$_dwp/assign.trace"
 # ⛔ AND THE BODY MUST HAVE REACHED THE STREAM (review P3, cycle 64). This was a BARE absence assertion — the
 # suite's own rule (`§:60-64`) pairs every absence with a positive, and `decoy`/`forge`/`midline` carry exactly
 # this guard while this one and the `printf` probe did not. An empty or broken trace therefore satisfied them,
@@ -2436,12 +2442,12 @@ ck "a heredoc traced INSIDE an assignment names NO witness (the match is anchore
 # ⛔ THE ` echo ` CONJUNCT, graded on its own: a function whose only command is a `printf` carrying the same
 # text must name nothing — drop that conjunct and this fixture becomes a witness.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' \
   'queue_order_from_pool() {' \
   "  printf '%s\\n' '[refresh] printf order: not an echo'" \
   '}' \
-  'queue_order_from_pool' > "$_dwp/printf.sh"
-( cd "$_dwp" && bash printf.sh ) > "$_dwp/printf.out" 2>"$_dwp/printf.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-printf.sh"
+( cd "$_dwp" && bash drive-wit-printf.sh ) > "$_dwp/printf.out" 2>"$_dwp/printf.trace"
 # the same positive counterpart (review P3, cycle 64)
 if ! grep -qF "[refresh] printf order: not an echo" "$_dwp/printf.trace" 2>/dev/null; then
   rc=1; echo "      the printf line is NOT in the trace stream — the fixture never reached the matcher, so its absence proves nothing"
@@ -2452,26 +2458,26 @@ ck "a PRINTF in the function names NO witness (an echo is required, not merely a
 
 # ⛔ AND THE `fn` CONJUNCT: an echo in ANOTHER function must not be attributed to the one under test.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' \
   'other_function() { echo "[refresh] other order: a different function"; }' \
   'queue_order_from_pool() { other_function; }' \
-  'queue_order_from_pool' > "$_dwp/other.sh"
-( cd "$_dwp" && bash other.sh ) > "$_dwp/other.out" 2>"$_dwp/other.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-other.sh"
+( cd "$_dwp" && bash drive-wit-other.sh ) > "$_dwp/other.out" 2>"$_dwp/other.trace"
 # ⛔ AND THE FORGERY ITSELF (review P3, cycle 52): a body whose line WEARS the trace prefix. The NONCE is what
 # refuses it, and both directions are asserted — with the nonce it names nothing, WITHOUT it the same stream
 # names the forgery. Delete the nonce from the matcher and this check reddens instead of quietly weakening.
 # (Residual, stated: data that reproduces THIS run's nonce would still match — it would have to read the drive
 # file that invoked it.)
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' 'set -v' \
   'queue_order_from_pool() {' \
   "  cat <<'ZZZ' >/dev/null" \
   "+queue_order_from_pool echo '[refresh] forged order: X'" \
   'ZZZ' \
   '  return 0' \
   '}' \
-  'queue_order_from_pool' > "$_dwp/forge.sh"
-( cd "$_dwp" && bash forge.sh ) > "$_dwp/forge.out" 2>"$_dwp/forge.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-forge.sh"
+( cd "$_dwp" && bash drive-wit-forge.sh ) > "$_dwp/forge.out" 2>"$_dwp/forge.trace"
 if ! grep -qF "+queue_order_from_pool echo '[refresh] forged order" "$_dwp/forge.trace" 2>/dev/null; then
   rc=1; echo "      the FORGED line never reached the trace stream — the fixture proves nothing"
 elif [ -n "$(_dwit "$_dwp/forge.trace" '' "$_n_p")" ]; then
@@ -2487,15 +2493,15 @@ ck "a printed line WEARING the trace prefix names NO witness (the per-run nonce 
 # This fixture puts the WHOLE `fn [nonce] echo ` sequence MID-LINE: the nonce cannot refuse it, only the
 # requirement that the sequence starts the traced command can.
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' 'set -v' \
   'queue_order_from_pool() {' \
   "  cat <<'ZZZ' >/dev/null" \
   "zzz queue_order_from_pool [${_n_p}] echo '[refresh] midline order: sequence mid-line'" \
   'ZZZ' \
   '  return 0' \
   '}' \
-  'queue_order_from_pool' > "$_dwp/midline.sh"
-( cd "$_dwp" && bash midline.sh ) > "$_dwp/midline.out" 2>"$_dwp/midline.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-midline.sh"
+( cd "$_dwp" && bash drive-wit-midline.sh ) > "$_dwp/midline.out" 2>"$_dwp/midline.trace"
 if ! grep -qF "queue_order_from_pool [${_n_p}] echo '[refresh] midline order" "$_dwp/midline.trace" 2>/dev/null; then
   rc=1; echo "      the mid-line sequence never reached the trace stream — the fixture proves nothing"
 elif [ -n "$(_dwit "$_dwp/midline.trace" '' "$_n_p")" ]; then
@@ -2514,12 +2520,12 @@ elif [ -n "$(_dwit "$_dwp/other.trace" '' "$_n_p")" ]; then
 else rc=0; fi
 ck "an echo in a DIFFERENT function names NO witness for the function under test" $rc
 printf '%s\n' \
-  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -u' 'set -x' \
   'queue_order_from_pool() {' \
   '  echo "[refresh] queue order: severity-first from the pool — head #1"' \
   '}' \
-  'queue_order_from_pool' > "$_dwp/real.sh"
-( cd "$_dwp" && bash real.sh ) > "$_dwp/real.out" 2>"$_dwp/real.trace"
+  'queue_order_from_pool' > "$_dwp/drive-wit-real.sh"
+( cd "$_dwp" && bash drive-wit-real.sh ) > "$_dwp/real.out" 2>"$_dwp/real.trace"
 ck "an executed arm echo DOES name a witness, and it is the prefix the drive printed" \
    "$([ "$(_dwit "$_dwp/real.trace" '' "$_n_p")" = '[refresh] queue order' ] && echo 0 || echo 1)"
 
@@ -3163,7 +3169,7 @@ _out_show() { # $1="<case>/<file>" -> the emitted text (paths folded), first 6 l
 }
 # ⛔ THE PIN. `case=crc` for every driven case, and the deduped set of distinct outputs, which is the coarse half:
 # a NEW case whose output duplicates an existing one cannot hide, and a sentence change moves the distinct set.
-_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-head/out-head=1078605162|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-clip/out-unranked=3407422058|arm-clip/out-unrec=4222849383|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-refuse-rowset/seed=2566848085|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|countguard/cnt-good=527657959|countguard/out-bad=44744305|countguard/out-good=44744305|countguard/pool=2793652360|countguard/q=44744305|dupnone/out=2058117218|empty/out=3865464101|file-identity/cnt-empty=3504554043|file-identity/cnt-mut=1123651361|file-identity/empty=EMPTY|file-identity/out-empty=EMPTY|file-identity/pool=1752088521|file-identity/rank-nrfnr.awk=4062769569|file-identity/rank.awk=2321255770|floor-a/out=3546509858|floor-b/out=1752088521|guards/absent.log=1657602827|guards/dir.log=2497213199|guards/pool=1752088521|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/cnt=1552948430|mut-member/out=882446226|mut-member/pool=882446226|mut-member/q=2173392615|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace-empty/seed=2566848085|prunerace/out=1567885012|prunerace/seed=2566848085|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out-junk=3228248317|sat/out-sat=3190065530|sat/out=4021605358|skipwhy-empty/out=4267086434|skipwhy-priority-unreadable/out=629343410|skipwhy-severity-uncounted/out=1841947048|skipwhy-severity/out=4160314136|skipwhy-unranked/out=257027211|skipwhy-unset/out=2226175176|tail/out=2809272230|wit-parse/assign.out=EMPTY|wit-parse/decoy.out=3004694436|wit-parse/forge.out=EMPTY|wit-parse/midline.out=EMPTY|wit-parse/other.out=2943144574|wit-parse/printf.out=1142707169|wit-parse/real.out=3673505914|witness/out=4021605358'
+_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-head/out-head=1078605162|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-clip/out-unranked=3407422058|arm-clip/out-unrec=4222849383|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-refuse-rowset/seed=2566848085|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|countguard/cnt-good=527657959|countguard/out-bad=44744305|countguard/out-good=44744305|countguard/pool=2793652360|countguard/q=44744305|countguard/run-bad.log=EMPTY|countguard/run-good.log=EMPTY|dupnone/out=2058117218|empty/out=3865464101|file-identity/cnt-empty=3504554043|file-identity/cnt-mut=1123651361|file-identity/empty=EMPTY|file-identity/out-empty=EMPTY|file-identity/pool=1752088521|file-identity/rank-nrfnr.awk=4062769569|file-identity/rank.awk=2321255770|floor-a/out=3546509858|floor-b/out=1752088521|guards/absent.log=1657602827|guards/dir.log=2497213199|guards/pool=1752088521|inode/run-a.log=4021605358|inode/run-b.log=4021605358|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/cnt=1552948430|mut-member/out=882446226|mut-member/pool=882446226|mut-member/q=2173392615|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace-empty/seed=2566848085|prunerace/out=1567885012|prunerace/seed=2566848085|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out-junk=3228248317|sat/out-sat=3190065530|sat/out=4021605358|skipwhy-empty/out=4267086434|skipwhy-priority-unreadable/out=629343410|skipwhy-severity-uncounted/out=1841947048|skipwhy-severity/out=4160314136|skipwhy-unranked/out=257027211|skipwhy-unset/out=2226175176|tail/out=2809272230|wit-parse/assign.out=EMPTY|wit-parse/decoy.out=3004694436|wit-parse/forge.out=EMPTY|wit-parse/midline.out=EMPTY|wit-parse/other.out=2943144574|wit-parse/printf.out=1142707169|wit-parse/real.out=3673505914|witness/out=4021605358'
 _out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1078605162 1102770011 1123651361 1142707169 1151312335 1187418021 1228480870 1296039546 132483589 1334011946 1334591389 1334787953 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1506249713 1531456368 1552948430 1567885012 1657602827 1686707371 1752088521 1806709770 1840396944 1841947048 1943905615 1954371651 2014644524 2058117218 2163807204 2173392615 2215093811 2226175176 2241773645 2321255770 2380626246 2467777652 2497213199 2561788194 2566848085 257027211 2620396432 2632535107 263720862 2645416213 273058056 2755054736 2763562739 2793652360 2809272230 2810210006 286439349 2928806463 2928854713 2943144574 3004694436 3025506656 3086333297 3104242257 3123583493 3178247719 3190065530 3228248317 3325294582 3363606256 3407422058 3504554043 3512885538 3546509858 3598440741 3673505914 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4062769569 4092273942 4111658287 4160314136 4222849383 4245042416 4253467874 4267086434 4272221706 4292339760 44744305 468363226 527657959 55288939 605356615 629343410 632953760 657909655 882446226 90999151 964254667 982395898 EMPTY'
 _out_got="$(_out_map)"
 _out_distinct="$(_out_unique)"
@@ -3353,6 +3359,10 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # ungraded (measured: `$TMP/late-case/out` before the tally → 177/0), and its exclusion filter could never match
 # because `_out_map` emits `key=crc` while the filter required the whole line to be `key`. Both are fixed here: the
 # check runs LAST, and the two declared witness captures are excluded by EXACT KEY (anchored at the CRC field, below).
+# ⛔ THE POPULATION IS A NAMING CONVENTION, AND EVERY EXECUTED DRIVER NOW FOLLOWS IT (review P3, cycle 87). The glob
+# covered 126 of the 133 scripts this suite actually RUNS: the seven `wit-parse` probes were executed with `bash
+# <name>.sh` (no `set -u`, and no pattern matched them), so the assertion said "every generated driver" about a set it
+# could not enumerate. They are now `drive-wit-<case>.sh` and carry `set -u`, like the rest.
 # ⛔ THE EXCLUSION IS BY EXACT KEY, WITH THE BOUNDARY AT THE CRC (review P3, cycle 79). A KEY PREFIX let a file named
 # `out=CLAIM` inside a witness dir ride through the only check that can see it (measured: 177/0). A map line is
 # `<case>/<file>=<crc>` with `<crc>` digits or `EMPTY`, so anchoring on `=(EMPTY|[0-9]+)$` excludes exactly the two
