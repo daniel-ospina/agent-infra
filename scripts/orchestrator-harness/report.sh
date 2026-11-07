@@ -11,8 +11,16 @@
 # them; a missing one makes its section say so, never abort the report).
 #
 # The harness's per-box constants are the same three the other shipped scripts use, so a shell
-# that already exports them for orch-loop.sh/install.sh needs no extra setup. `REPO` defaults to
-# the tortoise checkout this box drains; override it for any other target.
+# that already exports them for orch-loop.sh/install.sh needs no extra setup.
+#
+# ⛔ `REPO` HAS NO DEFAULT HERE, AND THAT IS THE FIX. This line used to read
+# `REPO="${REPO:-$HOME/eldato/tortoise}"` — ONE DEVELOPER'S HOME DIRECTORY, baked into a script every
+# machine on the fleet runs. On any other box the default names a path that does not exist, and the
+# failure surfaces far from the cause: the report prints a `cloud-cell-supervisor.sh` candidate that
+# is not there and the sections it feeds read as "nothing to report" on a box that is busy (the same
+# class refresh-candidates.sh closed for the QUEUE in #1935). `REPO` is set ONCE per box — the launchd
+# plist on a Mac, `keys.env` on a cell — and `repo-slug.sh`'s `resolve_repo` is the ONE place that
+# reads it: it refuses BY NAME when it is absent or is not a checkout, instead of guessing.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 H="${1:-12}"
@@ -23,7 +31,17 @@ H="${1:-12}"
 # file being changed rather than filed as a peer.)
 case "$H" in ''|*[!0-9]*|0[0-9]*) H=12 ;; esac
 O="${O:-$HOME/orchestrator}"
-REPO="${REPO:-$HOME/eldato/tortoise}"
+# repo-slug.sh ships beside this script (both are in install.sh's copied set), so a deployed `$O` has
+# it too; `$O` is the second candidate for an operator running a copy from elsewhere.
+_REPO_LIB=""
+for _cand in "$HERE/repo-slug.sh" "${O:-}/repo-slug.sh"; do
+  [ -n "$_cand" ] && [ -f "$_cand" ] && { _REPO_LIB="$_cand"; break; }
+done
+[ -n "$_REPO_LIB" ] || { echo "report.sh: FATAL repo-slug.sh not found (looked in $HERE and \$O=${O:-<unset>}) — REPO cannot be resolved, and this script will not guess one" >&2; exit 78; }
+# shellcheck source=repo-slug.sh
+. "$_REPO_LIB"
+command -v resolve_repo >/dev/null 2>&1 || { echo "report.sh: FATAL $_REPO_LIB is stale (no resolve_repo) — re-seed it: bash scripts/orchestrator-harness/deploy-harness.sh --src . --o ${O:-\$O}" >&2; exit 78; }
+REPO="$(resolve_repo)" || exit $?
 NOW=$(date +%s); FROM=$(( NOW - H * 3600 ))
 
 # GNU `stat -c %Y` FIRST, then BSD `stat -f %m`. The reverse order is NOT safe: GNU `stat -f %m`

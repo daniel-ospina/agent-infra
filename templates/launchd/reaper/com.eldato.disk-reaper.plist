@@ -79,6 +79,20 @@
         <string>{{REAPER_DIR}}/reap-lane-venvs.sh</string>
         <key>WORKTREE_REAPER</key>
         <string>{{REAPER_DIR}}/pi-reap-worktrees.sh</string>
+        <!-- The runner `_work` sink (19 G of dead job checkout on a box at 98%, 2026-10-28). Pinned
+             for the same reason as the three above. -->
+        <key>RUNNER_WORK_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-runner-work.sh</string>
+        <!-- ⛔ THESE TWO WERE MISSING WHILE THE SYSTEMD UNIT PINNED THEM (#3057 review, measured).
+             The plist pinned five delegates and the service pinned seven, so on macOS these two
+             classes resolved through `find_delegate`'s `$HOME/.pi/agent/scripts` fallback instead of
+             the installed copy — the precise failure the pins above exist to prevent: a box whose
+             HOME holds an older farmed copy runs THAT delete policy while the freshly installed
+             owner is never consulted. Both artifacts must pin the same set. -->
+        <key>ABANDONED_WT_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-abandoned-worktrees.sh</string>
+        <key>DUP_INSTALL_REAPER</key>
+        <string>{{REAPER_DIR}}/reap-duplicate-installs.sh</string>
         <!-- ⛔ THE WRAPPER CANNOT SEE ITS OWN PATH HERE. The launcher pipes this script to
              `/bin/bash -s` (that is why BOUNDED_LIB is pinned above), and under `bash -s`
              `BASH_SOURCE` is UNSET — so `disk-reaper-run.sh` cannot resolve `disk-reaper.sh`

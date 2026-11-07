@@ -142,12 +142,104 @@
 #   * it applies ONLY on the base side (base -> PR). A PR check with no declared
 #     counterpart keeps the unqualified `NO BASE COUNTERPART` answer: this is one
 #     pair, not a policy that shell failures are probably fine.
-#   * it does not touch §4.5. The PR's own evaluated tree still BLOCKS on a red
-#     there, base-shared or not — that gate exists for the repair direction, which
-#     requires the red to be GONE from the PR's tree (#1261).
+#   * it does NOT exempt a §4.5 tree red by name alone. The gate exists for the
+#     repair direction, which requires the red to be GONE from the PR's tree (#1261),
+#     so a name match buys nothing there. (The SEPARATE #3322 exclusion below is keyed
+#     on the BASE's own measured red, not on this name map alone.)
 #
-# The value lives in `declared_base_equivalent`, its ONE implementation; the ONE
-# reader is the step-1c named refusal (`named_unattributable_runs`).
+# The value lives in `declared_base_equivalent`, its ONE implementation, and it has
+# TWO readers, both of which consult it for the SAME question — "is there a base-side
+# checker for this PR-side check?":
+#   1. the step-1c named refusal (`named_unattributable_runs`), which names the base
+#      red it found and exempts nothing; and
+#   2. `base_owned_check` (#3322), which EXCLUDES a PR-side red from the §4.5 required
+#      surface when the base itself is measurably RED under the equivalent name on a
+#      workflow no PR can run. See "A CHECK MAIN ITSELF FAILS" below.
+#
+# ── A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE (#3322) ────────────
+# THE DEFECT. This repo splits its suites by trigger: `ci.yml` is `pull_request`-only
+# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep
+# UNSHARDED, as `script-validate` (cited in ci-main.yml's own comment). Main is red on
+# `script-validate`; every PR is red on the shards. The probe below correctly calls
+# main's red NOT-PR-EVALUABLE (#6807) and reports it without blocking — and that left
+# it in NO set the rail could use. §4.5 then read the PR's own tree, saw the shards
+# red, and refused with "a red still here means the repair is incomplete" for a red no
+# PR can ever clear: main fails the suite, so the PR CANNOT make it pass. Measured
+# 2026-11-05: three unrelated PRs (#3478 guard, #3168 attestation, #3486 MCP) were red
+# on the IDENTICAL nine checks, and #3478 had ZERO unique reds.
+#
+# THE RULE, and it is narrow on purpose. A red on the PR's evaluated tree is EXCLUDED
+# from the required surface iff BOTH hold:
+#   (i) the BASE's own check surface — read from GitHub by `check_surface_probe` on the
+#       base ref, not taken from a caller flag — carries a RED whose workflow declares
+#       no `pull_request`/`pull_request_target` trigger (the #6807 class: no PR can
+#       ever attach a check to a head sha for it); and
+#   (ii) that base red's NAME is this tree check's name, or the name
+#       `declared_base_equivalent` declares for it (the one cited pair,
+#       `bash-suites (<n>)` == `script-validate`).
+# So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
+# main is red on that suite at read time. Every fail-closed path holds:
+#   * an UNREADABLE or PARTIAL base read excuses NOTHING, but not because the set is empty:
+#     step 2c `exit 1`s on BOTH (a base the rail could not read is not a certificate, and
+#     4.6/4.7 are both gated on the base being RED), and that exit comes AFTER the name file
+#     is seeded — so the set may well be non-empty and §4.5 simply never consults it. An
+#     UNMEASURED base (0 checks, 0 statuses) writes no `exempt:` row at all, so there the set
+#     IS empty and §4.5 refuses as before. Nothing is excused on any of the three paths;
+#   * the base read is CLEAN -> no set -> the PR's red is its own and blocks, which is
+#     the #1261 incident (a lint red main does NOT carry) and every real regression;
+#   * the base red is on a workflow that DOES declare a PR trigger -> it is a BLOCKING
+#     base red, deliberately NOT in the set: that is the repair direction, where §4.5
+#     must keep insisting the red be GONE from the PR's tree;
+#   * a tree red with NO base counterpart does not match and blocks.
+# ⛔ IT IS NOT A BLANKET EXEMPTION AND IT IS NOT KEYED ON THE CHECK'S NAME ALONE. A
+# PR-side red named `bash-suites (3)` on a base whose `script-validate` is GREEN stays
+# blocking; deleting the base measurement from the rule would make every shell red
+# base-caused — the blanket excuse the #2610 mapping's own requirements forbid.
+# ⛔ THE DECLARED RESIDUAL. A check NAME main never publishes cannot be shown to be "a check
+# main itself fails", so there is no evidence to exclude it and it keeps blocking. Measured on
+# this repo: `ci.yml` declares a `verify` job; `ci-main.yml` declares NO `verify` job at all
+# (`grep -rn '^  verify:' .github/workflows/` → `ci.yml:371` only), so main can never publish
+# that NAME and this rule can never fire for it.
+# ⛔ NO ENUMERATION OF THE BASE'S JOBS BELONGS HERE, and this line is the scar: an earlier
+# revision listed them and MISSED `bash32-parse-guard` — a pattern that does not admit digits
+# skips it — which is the same "absence asserted without resolving coverage" mistake the
+# paragraph below warns about, committed inside the paragraph. Name the ONE fact that carries
+# the argument and let a reader run the grep.
+# ⛔ THE UNIT HERE IS THE NAME, NOT THE PROGRAM, and the difference decides which fix is owed.
+# Many of the programs the `verify` job runs DO run on main — some named literally in
+# ci-main.yml, others picked up by the `extension-tests` job's globs — but under OTHER JOB
+# names (`extension-tests / …`) that `declared_base_equivalent` has no arm for. It is also NOT
+# a clean split by "appears in the file", because a glob match is invisible to a text search:
+# do not restate this as a count without resolving the globs. So the residual is two things,
+# and neither is excused here:
+#   • a program main DOES run under an UNMAPPED job name needs a MAPPING arm — the
+#     `bash-suites-gate`-shaped residual stated in `declared_base_equivalent`'s docblock;
+#   • a program main truly never runs is #3415's "base-owned but unmeasurable from the base"
+#     family, where a base-side reproduction — never a name match — is the only evidence that
+#     could exist.
+# That is a refusal with a reason, never a silent pass.
+# ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
+# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
+# check `script-validate`, so while main is red on it, EVERY shard is excluded — including
+# a shard failure THIS PR introduced, whose cause is on no base. Per-shard attribution is
+# not available from base-side evidence (main publishes the sweep as ONE job-level red),
+# and inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
+# the guard for an ATTRIBUTABLE failure is deliberately NOT this rule and is untouched by
+# it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
+# reproduction still runs the residual on a pristine base worktree and refuses anything
+# the base does NOT reproduce. A PR-caused failure inside a shared shard is therefore
+# refused for its OWN reason — and it is refused BEFORE this exclusion is ever reached, since
+# both attribution legs run ahead of §4.5. The exclusion is a statement about a
+# NAME the base already fails; it is never a licence for a NEW failure inside that name.
+# ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
+# "blocked by the decision -> re-run" leg is not entered and §4.5 is the SOLE blocker in
+# every scenario. §80 therefore pins the intended property — an inherited red no longer
+# refuses at §4.5, and the exclusion is named in BOTH stderr and the durable evidence —
+# and NOT an end-to-end merge in the shape #3322 measured (a tree red on both an inherited
+# shard and its own id-level residual). That second shape is decided by the attribution
+# legs above, which this change does not touch. §80(f) closes the last untested arm of
+# the rule itself: a NON-CODE tree red must stay excluded from the exclusion even when its
+# name matches a base-owned red.
 #
 # ── THE PR'S EVALUATED TREE (#1261) ───────────────────────────────────────
 # The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
@@ -1499,9 +1591,12 @@ fetch_run_failed_job_names() {
 
 # declared_base_equivalent <pr-check-name> — THE DECLARED LANE EQUIVALENCE (#2610):
 # print the BASE-side check NAME this PR-side check is equivalent to, or nothing when
-# there is none. The pair, its reason and its citations are in the header ("THE ONE
-# DECLARED LANE EQUIVALENCE"); this is the ONE implementation and
-# `named_unattributable_runs` is its ONLY reader.
+# there is none. TWO readers, one question (see the header): `named_unattributable_runs`
+# names with it and exempts nothing; `base_owned_check` (#3322) uses it to decide a §4.5
+# exclusion, and only together with the base's own MEASURED red. The pair, its reason
+# and its citations are in the header ("THE ONE
+# DECLARED LANE EQUIVALENCE"); this is the ONE implementation, and a SECOND name-keyed
+# map is the drift the rail's one-derivation rule forbids.
 #
 # ⛔ STRUCTURAL, NOT A PREFIX, AND DELIBERATELY NARROW. Every arm is a specific,
 # cited pair. A rule that read "a shell suite failed" as an equivalence would make
@@ -1540,6 +1635,38 @@ declared_base_equivalent() {
       printf '%s\n' 'script-validate'
       ;;
   esac
+  return 0
+}
+
+# base_owned_check <pr-check-name> <base-owned-names-file> — #3322's matcher: print the
+# BASE-side check name that makes this PR-side red BASE-OWNED, or nothing when it is
+# not. `<base-owned-names-file>` is written by the caller from the BASE probe's own
+# MEASURED surface (one failing check name per line, restricted to the ones whose
+# workflow declares no PR trigger) — so this function only matches; it never decides
+# what main fails.
+#
+# ⛔ A MISSING OR EMPTY FILE ADMITS NOTHING. An unreadable base surface, a clean base,
+# and a base whose only reds are PR-evaluable all produce an empty file, and all three
+# must leave the red blocking (see "A CHECK MAIN ITSELF FAILS" in the header). A
+# matcher that treated "no evidence" as "no red on main" — or as "red on main" — would
+# turn the exclusion into the blanket pass it exists not to be.
+# ⛔ THE MATCH IS EXACT (`grep -F -x`), never a prefix: `bash-suites-gate` is NOT
+# `bash-suites (n)` and `script-validate` is not `extension-tests / script-validate`.
+# The declared mapping is the ONLY widening, and it is one cited pair.
+# ⛔ NO EXIT STATUS MEANS "NOT BASE-OWNED", exactly like `declared_base_equivalent`:
+# the answer is stdout, so a caller can never mistake an empty answer for a failure.
+base_owned_check() {
+  local name="${1:-}" names_file="${2:-}" mapped=""
+  [ -n "$name" ] && [ -s "$names_file" ] || return 0
+  if grep -Fxq -e "$name" -- "$names_file" 2>/dev/null; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  mapped="$(declared_base_equivalent "$name")"
+  [ -n "$mapped" ] || return 0
+  if grep -Fxq -e "$mapped" -- "$names_file" 2>/dev/null; then
+    printf '%s\n' "$mapped"
+  fi
   return 0
 }
 
@@ -5766,15 +5893,25 @@ lane_has_no_head_run() {
   return 0
 }
 
-# check_surface_probe <ref> <label> [<exempt-noncode-events>] — measure EVERY
-# workflow's check runs and commit statuses attached to <ref> (a branch name OR a
-# sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in the
-# summary lines, so a probe of the PR's evaluated tree never claims to be about
+# check_surface_probe <ref> <label> [<exempt-noncode-events>] [<base-owned-names-file>] —
+# measure EVERY workflow's check runs and commit statuses attached to <ref> (a branch
+# name OR a sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in
+# the summary lines, so a probe of the PR's evaluated tree never claims to be about
 # main. <exempt-noncode-events> is 1 ONLY for the BASE surface (the
 # `schedule`/`issues`/`issue_comment` exemption); the PR's evaluated tree passes 0
 # and BLOCKS on them — the third argument is explicit so the exemption can never
 # drift back onto the surface that gates the merge. Callers snapshot the scratch
 # into their own prefix (BASE_* / TREE_*) immediately; see step 2c and step 4.5.
+#
+# <base-owned-names-file> (#3322) is supplied ONLY for the PR's evaluated tree, and
+# only by §4.5. It holds the base-side check NAMES the base itself is measurably
+# failing on a workflow no PR can run; a tree red matching one (directly or via
+# `declared_base_equivalent`) is EXCLUDED from the required surface and reported
+# under its own heading rather than silently dropped. Omitted/empty = nothing is
+# excluded, which is the fail-closed direction: the base measurement is the ONLY
+# thing that can admit an exclusion, so a caller that forgets to pass it over-blocks
+# (a false block), never passes (a false PASS). See "A CHECK MAIN ITSELF FAILS" in
+# the header.
 #
 # A NON-CODE EVENT IS EXEMPT BY SURFACE, NOT BY EVENT (#1353). "Does this lane
 # measure a revision?" is a property of the EVENT; "would refusing this red
@@ -5782,10 +5919,10 @@ lane_has_no_head_run() {
 # appears on — the BASE. On the TREE the exemption can only ever exempt an
 # anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
-  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable
+  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}" base_owned_file="${4:-}"
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable base_owned
   local map_sel=()
-  local blocking=0 other=0 other_noneval=0
+  local blocking=0 other=0 other_noneval=0 baseowned=0
   local repo_args=()
   [ -n "${REPO:-}" ] && repo_args=(--repo "$REPO")
   MAIN_HEALTH_STATUS=""
@@ -5809,8 +5946,17 @@ check_surface_probe() {
   # this NAME?" needs the wider set: on agent-infra main's only red is `script-validate`
   # on a `push` run from ci-main.yml, which the probe correctly calls not-PR-evaluable —
   # so a reader built on RED_TS alone would answer "no such red" about the one red that
-  # exists. ONE probe, one extra accumulator: not a second reader.
+  # exists. TWO readers now consume that classification: `named_unattributable_runs`
+  # (which names a base counterpart) and step 2c's #3322 extraction (which turns the
+  # `exempt: this workflow declares no PR trigger` rows into the base-owned name list
+  # §4.5 excludes against). ONE probe, one extra accumulator: not a second reader.
   MAIN_HEALTH_ALL_REDS=""
+  # #3322: tree reds EXCLUDED because the BASE is measurably failing the same
+  # suite under its own lane's name, on a workflow no PR can run. Its own
+  # accumulator + its own display set, so an exclusion can never be mistaken for a
+  # red the surface did not carry (a silent drop) or for a red that blocked.
+  MAIN_HEALTH_REDS_BASEOWNED=""
+  MAIN_HEALTH_RED_BASEOWNED=0
   # The surface's own last-production time (max completed_at over its completed
   # checks) and that time as epoch seconds. Empty when the surface has no
   # completed check at all.
@@ -6219,7 +6365,31 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         if [ "$noncode" -eq 1 ]; then
           blocking_reason=" — NOT EXEMPT ON THIS SURFACE: a non-code event on the PR's evaluated tree is an ANOMALY, so BLOCKING"
         fi
-        if [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
+        # ── #3322: A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE ───────
+        # The base probe runs FIRST (step 2c) and leaves the base's own
+        # not-PR-evaluable reds on disk as names (`base_owned_file`). A red on
+        # the TREE whose name — or whose declared equivalent name — is one of
+        # them is the same suite under the other lane's name, already measured
+        # red on the base, and NO PR can make it pass. Excluding it is the
+        # difference between "the PR is red" and "the repo is red", and the
+        # defect this closes refused a merge over an inherited red that no diff
+        # could clear.
+        # ⛔ TREE ONLY (`allow_noncode=0`) and ⛔ NEVER A NON-CODE RED: on the base
+        # the #6807 arm above already owns this class, and a `schedule`/`issues`
+        # red on the tree is an ANOMALY, not an inherited defect.
+        # ⛔ NOTHING IS EXCLUDED WITHOUT THE BASE MEASUREMENT. An empty file (base
+        # unread, base clean, base reds all PR-evaluable) matches nothing.
+        base_owned=""
+        if [ "$allow_noncode" -eq 0 ] && [ "$noncode" -eq 0 ]; then
+          base_owned="$(base_owned_check "$job" "$base_owned_file")"
+        fi
+        if [ -n "$base_owned" ]; then
+            [ -n "$MAIN_HEALTH_REDS_BASEOWNED" ] && MAIN_HEALTH_REDS_BASEOWNED="${MAIN_HEALTH_REDS_BASEOWNED}"$'\n'
+            MAIN_HEALTH_REDS_BASEOWNED="${MAIN_HEALTH_REDS_BASEOWNED}   • ${job} — ${concl}${red_note_suffix} — the base itself fails '${base_owned}' on a workflow that declares no PR trigger, so NO PR can make this pass; this check is that suite under the PR lane's name — ${url}"
+            [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
+            MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}${job}"$'\t'"exempt: base-owned — the base itself fails '${base_owned}', which no PR can run"
+            baseowned=$((baseowned + 1))
+        elif [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev:-(unresolved)}' — ${concl}${red_note_suffix} — NOT pull-request-evaluable (this workflow declares no pull_request/pull_request_target trigger, so no PR can attach its checks to a head sha), so NOT blocking — ${url}"
             [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
@@ -6301,6 +6471,13 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   if [ "$other_noneval" -gt 0 ]; then
     MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $other_noneval further red check(s) on workflows that declare NO pull_request/pull_request_target trigger — NOT pull-request-evaluable, so reported, not blocking (no PR can attach their checks to a head sha, so no PR could ever measure them; #6807)"
   fi
+  # #3322: an EXCLUSION is stated in the summary the evidence carries, never left
+  # to a display block a caller might not print. `MAIN_HEALTH_RED_BASEOWNED` is the
+  # count the §4.5 disclosure and the posted evidence read.
+  MAIN_HEALTH_RED_BASEOWNED="$baseowned"
+  if [ "$baseowned" -gt 0 ]; then
+    MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $baseowned red check(s) EXCLUDED as BASE-OWNED — the base itself fails the same suite under its own lane's name, on a workflow no PR can run, so no PR can make them pass (#3322)"
+  fi
   return 0
 }
 
@@ -6352,7 +6529,7 @@ wait_for_run() {
     # OBSERVABLE identity of the re-run we requested.
     # shellcheck disable=SC2086
     line="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
-      --json status,attempt --jq '"\(.status)\t\(.attempt // "")' 2>/dev/null || true)"
+      --json status,attempt --jq '"\(.status)\t\(.attempt // "")"' 2>/dev/null || true)"
     IFS=$'\t' read -r status attempt <<< "$line"
     RERUN_WAIT_LAST="status=${status:-<unreadable>} attempt=${attempt:-<unreadable>}"
     # "Could not read the run" is NOT "the run exceeded its bound". A gh failure
@@ -6702,19 +6879,109 @@ build_evidence() {
   printf '%s\n' "$flake_line"
 }
 
-# ⛔ ONE PATTERN FOR "an id NO LOCAL REPRODUCTION can execute" (#3715, #1185).
-# These families name no pytest nodeid, so handed to the runner as ARGV ONE of
-# them makes pytest EXIT 4 having run NOTHING (`ERROR: file or directory not
-# found`) and the whole base run clears nothing. TWO readers ask this question —
-# `reproduce_residual_on_base`, which must not hand them to the runner, and the
-# #3715 block, which reports that the surviving candidate set names nothing a
-# local run could execute. A second copy of the REGEX is exactly the drift the
-# rail's one-derivation rule forbids, so the regex lives here and nowhere else.
-# (This is ONE pattern with TWO readers, not one enumeration of the families:
-# `repro_scope`'s `case` arms answer a DIFFERENT question — admission into the
-# candidate set, which is #1185's narrowing — so a family added here must be
-# considered there too, and vice versa.)
-NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^bash-shard::|^runner::|^pipeline-compliance::'
+# ⛔ THE PATTERNS FOR "an id a LOCAL REPRODUCTION can (and cannot) execute"
+# (#3715, #1185, #3415). The non-executable families name no pytest nodeid, so
+# handed to the runner as ARGV ONE of them makes pytest EXIT 4 having run NOTHING
+# (`ERROR: file or directory not found`) and the whole base run clears nothing.
+# TWO readers ask that question — `reproduce_residual_on_base`, which must not
+# hand them to the runner, and the #3715 block, which reports that the surviving
+# candidate set names nothing a local run could execute. A second copy of the
+# REGEX is exactly the drift the rail's one-derivation rule forbids, so the regex
+# lives here and nowhere else. (``repro_scope``'s `case` arms answer a DIFFERENT
+# question — admission into the candidate set, which is #1185's narrowing — so a
+# family added here must be considered there too, and vice versa.)
+#
+# ⛔ TWO PATTERNS, NOT ONE, SINCE #3415 — AND THE SPLIT IS THE POINT. There are
+# two different questions and they no longer have the same answer:
+#
+#   NON_LOCAL_REPRO_ID_RE   can NO local reproduction of ANY kind execute this id?
+#                           These families name neither a pytest nodeid nor a
+#                           script path: a guard/collection/watchdog/job/gate
+#                           identity is a REPORTED unit, never an executable
+#                           artifact. Such an id may be a candidate (the #1185
+#                           guard-step arm) but can never be CLEARED by a run.
+#   SHARD_REPRO_ID_RE       `bash-shard::<path>` names an EXECUTABLE ARTIFACT.
+#                           The path is the repo-relative shard script, so
+#                           `bash <path>` on a pristine base worktree measures it
+#                           in one command — exactly what
+#                           `scripts/run-bash-shards.sh` does per listed shard.
+#                           Excluding it from the reproduction (as this rail did
+#                           until #3415) made a BASE-OWNED shard red permanently
+#                           unattributable: the decision refuses it, the
+#                           reproduction cannot look at it, and no lane can
+#                           clear it. So it is reproduced by the SECOND runner
+#                           and IS clearable — on the base's own measured verdict
+#                           only, never on an inference.
+#
+# The PYTEST runner's boundary is therefore BOTH patterns: a shard id handed to
+# pytest is the same exit-4-having-run-nothing defect. Derive it, never respell
+# it, so a family added to either half cannot be forgotten by the runner.
+NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unreadable::|^runner::|^pipeline-compliance::'
+# ⛔ ONE LITERAL FOR THE FAMILY (`SHARD_REPRO_ID_PREFIX`), DERIVED FROM BY EVERY
+# CODE SITE THAT MATCHES OR BUILDS THE ID: the pytest boundary above, the
+# extraction that routes a token to the shard arm, the constructed id in that arm,
+# and the four pre-existing READERS of the family — `main_measured_files`,
+# `main_baseline_units` (two spellings there), `failure_file_key` and
+# `repro_scope`'s admission arm. The literal is a MATCHING PATTERN in all of them,
+# so a respelled copy is not a nit: widening the regex while any reader still names
+# the old string routes a family to NEITHER arm (excluded from the pytest argv,
+# never extracted) — the permanently-unattributable defect #3415 removes,
+# reintroduced silently and with no test that would see it. (A SECOND shard-shaped
+# family still needs its own arm and its own readers; this makes the literal exist
+# once in code. Human-readable prose and the operator-facing messages still spell
+# it, because those are not patterns.)
+SHARD_REPRO_ID_PREFIX='bash-shard::'
+SHARD_REPRO_ID_RE="^${SHARD_REPRO_ID_PREFIX}"
+PYTEST_REPRO_ID_RE="${SHARD_REPRO_ID_RE}|${NON_LOCAL_REPRO_ID_RE}"
+
+# ⛔ THE SHARD ARM'S "THE RUNNER NEVER STARTED" SENTINEL (#3415 review 3, P1).
+# The shard arm's verdict IS the exit status, so every non-zero status that is not
+# the bound's (142) is read as "the base fails this shard". A LAUNCH failure has
+# no verdict at all — `cd "$shard_dir"` failing because the worktree was reaped
+# mid-loop, or because $TMP vanished — and it must not be mistaken for one; that
+# is how a PR-caused red would be CLEARED by an infrastructure fault. 99 is chosen
+# because it cannot collide with a shard's own `exit`: it is the status the
+# WRAPPER exits with, before any shard exists. (The pytest arm needs no sentinel:
+# its verdict comes from the CAPTURE, so a launcher that produced none is already
+# "could not run" by construction.)
+REPRO_LAUNCH_FAILED_RC=99
+
+# repro_shard_path <token> — the repo-relative script a `bash-shard::<token>` id
+# names, or return 1 when the token does not name one this rail may execute.
+#
+# ⛔ THE TOKEN IS ATTACKER-INFLUENCED INPUT, and it becomes an ARGV. It is
+# produced by scripts/ci_exemption.py's `_shard_token` from a line in a CI log,
+# and a PR can print `❌ failed shard: <anything>`. For every shard
+# `run-bash-shards.sh --list` prints, the token IS the repo-relative path
+# verbatim (`scripts/…`, `tests/…`, `pi-bootstrap/…`); the encoder percent-escapes
+# only bytes outside `[A-Za-z0-9_./-]`. So the shapes below are refused, and each
+# is refused for a reason that is a HAZARD, not tidiness:
+#   * a leading `/` — an ABSOLUTE path outside the base tree;
+#   * a `..` component — path TRAVERSAL out of the worktree;
+#   * a leading `-` — `bash "$s"` would read it as an OPTION (`-c`!), not a file;
+#   * any `%` — a percent-encoded byte means the label was NOT a plain path
+#     (a hostile or a hostile-encoded name); no LISTED shard has one, and
+#     decoding to execute is an escape route this function has no need for;
+#   * any byte outside the encoder's own verbatim alphabet.
+# A refused token is NOT an error and NOT a clearance: the shard is simply not
+# measured, so it stays in the residual and blocks exactly as before (fail
+# closed). Containment inside the base tree is checked by the caller, which is
+# the only place that knows where the tree is.
+repro_shard_path() {
+  local token="$1"
+  [ -n "$token" ] || return 1
+  case "$token" in
+    -*) return 1 ;;
+    /*) return 1 ;;
+    *%*) return 1 ;;
+    ..|../*|*/..|*/../*) return 1 ;;
+    *[!A-Za-z0-9_./-]*) return 1 ;;
+  esac
+  case "/$token/" in
+    */./*|*//*) return 1 ;;
+  esac
+  printf '%s\n' "$token"
+}
 
 # ══ reproduce_residual_on_base — THE MISSING MEASUREMENT (#3715) ═══════════
 #
@@ -6796,12 +7063,19 @@ NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unre
 #     identity (no local runner), and the other non-nodeid families a local
 #     pytest cannot execute (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
-#     `bash-shard::<path>` #2643, `runner::<job>` — passed as argv they make
-#     pytest exit 4 having run NOTHING). CANDIDACY AND CLEARANCE ARE NOT THE SAME
+#     `runner::<job>` — passed as argv they make pytest exit 4 having run
+#     NOTHING). ⛔ `bash-shard::<path>` (#2643) USED TO BE IN THAT LIST AND IS
+#     NOT (#3415): it is the ONE non-nodeid family that names an EXECUTABLE
+#     ARTIFACT, so a base run CAN speak to it — `bash <path>` in the base
+#     worktree answers "does the base fail this shard?" directly. Leaving it out
+#     made a base-owned shard red permanently unattributable (the decision
+#     refuses it, nothing could measure it, no lane could clear it), so it is
+#     reproduced by the SHARD arm and cleared only on the base's own measured
+#     FAILURE. CANDIDACY AND CLEARANCE ARE NOT THE SAME
 #     SET (#1185): `repro_scope` admits ONE guard-step identity into the
 #     candidate set when the base's baseline was read and holds no row for its
 #     step, so the rail can REPORT that the base cannot speak to it — while the
-#     two filters in `reproduce_residual_on_base` keep it out of the runner's
+#     filters in `reproduce_residual_on_base` keep it out of the runner's
 #     argv AND out of the base's own capture before `intersect_sets`, so a
 #     candidate of that class is still never cleared.
 #     `repro_scope` then
@@ -6810,10 +7084,15 @@ NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unre
 #     below);
 #   * it runs the exact NODEIDS as argv, never their whole files — that bounds
 #     WHICH TESTS RUN on the base (an unrelated failure in the same file is never
-#     executed), while `intersect_sets` separately bounds WHAT MAY BE CLEARED, so
-#     a capture that NAMES an id outside its argv still clears nothing;
+#     executed) — and the exact SHARD PATHS, one `bash <path>` each, never the
+#     whole shard list (#3415), and only for a path the BASE'S OWN runner lists
+#     (`run-bash-shards.sh --list`), so a forged id cannot make the rail execute an
+#     arbitrary file from main. `intersect_sets` separately bounds WHAT MAY BE
+#     CLEARED, so a capture that NAMES an id outside its argv still clears nothing;
 #   * only nodeids the BASE ITSELF reports FAILED are cleared, and a nodeid whose
-#     reproduction cannot be parsed stays in the residual (fail-closed);
+#     reproduction cannot be parsed stays in the residual (fail-closed); a shard
+#     is cleared only on a non-zero exit WITH the shard present in the base tree,
+#     so a shard the PR ADDS is never cleared by its own absence;
 #   * a base that cannot be materialised / a lane with no runnable runner / an
 #     invalid bound clears NOTHING and the rail blocks exactly as before — an
 #     unrun reproduction is never read as "pre-existing";
@@ -6832,15 +7111,34 @@ NON_LOCAL_REPRO_ID_RE='^guard-step::|^collect-error::|^watchdog-kill::|^job-unre
 #                           stdout. When set, no worktree is created and the
 #                           command runs in $PWD — this is the harness seam, in
 #                           the same spirit as ADMIN_MERGE_GH / CI_FAILURE_SET_GH.
-#   ADMIN_MERGE_REPRO_TIMEOUT  seconds (default 900). The bound is MANDATORY
-#                           and VALIDATED (positive integer): a value perl's
-#                           `alarm` cannot numify cancels the timer, and a
-#                           hanging suite must become "not reproduced" (a
-#                           block), never an unbounded merge-time stall.
+#   ADMIN_MERGE_REPRO_SHARD_CMD  the SHARD runner seam (#3415), run as
+#                           `bash -c "$CMD" admin-merge-shard <token>` with the
+#                           token in `$1`; its EXIT STATUS is the shard's verdict
+#                           (0 = the base passes it, non-zero = the base fails
+#                           it), which is the same contract `bash <path>` has in
+#                           the production path. Same spirit as the seam above:
+#                           when set, no worktree is created for the shard arm.
+#   ADMIN_MERGE_REPRO_TIMEOUT  seconds (default 900), the bound of EVERY arm —
+#                           ONE budget per arm, not one per item. The pytest arm
+#                           has always run under a single alarm; the shard arm now
+#                           does too (each shard gets what is LEFT of the budget,
+#                           so N hung shards cost 900s and not N x 900), because
+#                           an arm that outlives the rail's whole-attempt lease is
+#                           a stall the lease TTL then reads as an abandoned
+#                           attempt. The bound is MANDATORY and VALIDATED (positive
+#                           integer): a value perl's `alarm` cannot numify cancels
+#                           the timer, and a hanging suite must become "not
+#                           reproduced" (a block), never an unbounded merge-time
+#                           stall.
 #
-# RETURN: 0 = ran (the capture was read; `$out` may be empty) · 1 = could not
-# run, so the caller clears NOTHING. "Found nothing" is NEVER reported as
-# "could not run".
+# RETURN: 0 = at least one arm ran (the capture was read; `$out` may be empty) ·
+# 1 = NO arm could run, so the caller clears NOTHING. "Found nothing" is NEVER
+# reported as "could not run", and one arm that could not run never suppresses
+# the other arm's measurement. ⛔ An arm that cannot get the BASE WORKTREE it needs
+# (#3415 review 4) is one of the ways an arm "could not run" — but it is a per-arm
+# condition, not a whole-function one: a SEAM arm still runs, so the other arm's
+# measurement survives, while a PRODUCTION arm that needs the tree is refused
+# rather than run against the PR's own checkout.
 reproduce_residual_on_base() {
   local residual="$1" out="$2" base="${3:-}"
   : > "$out"
@@ -6850,11 +7148,10 @@ reproduce_residual_on_base() {
   # no worktree, no runner, no usable bound) — clear NOTHING. "ran and found
   # nothing" must never be reported as "could not run".
   [ -s "$residual" ] || return 1
-  # ⛔ EVERY NON-NODEID FAMILY IS EXCLUDED, not just the guard step (#3715 review,
-  # P2). The parser's other non-nodeid identities — `collect-error::<file>`
+  # ⛔ WHAT THE PYTEST RUNNER MUST NEVER BE HANDED (#3715 review, P2; #3415).
+  # The parser's non-nodeid identities — `collect-error::<file>`
   # (#6798), `watchdog-kill::<reason>`, `job-unreadable::<slug>` (#7131),
-  # `bash-shard::<path>` (#2643), `runner::<job>` and
-  # `pipeline-compliance::<letter>::<subject>` (#1185) — are
+  # `runner::<job>`, `pipeline-compliance::<letter>::<subject>` (#1185) — are
   # real residual rows but they name no pytest nodeid. Handed to the runner as
   # ARGV, ONE of them makes pytest EXIT 4 having run NOTHING (`ERROR: file or
   # directory not found`), so a residual that mixes a collection error with real
@@ -6864,9 +7161,17 @@ reproduce_residual_on_base() {
   # the ones the base holds no record of, admitted so the rail can REPORT that
   # fact; this is the function's own guard, so the contract holds for every
   # caller, and it is also what keeps a base CAPTURE from volunteering one.)
-  local nodeids
-  nodeids="$(grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
-  [ -n "$nodeids" ] || return 1
+  # `bash-shard::<path>` is split out HERE and routed to the SHARD runner below
+  # instead (#3415): it names an executable artifact, so it is measured, not
+  # dropped. One filter still guards the pytest argv, because a shard id handed
+  # to pytest would abort the run in exactly the same way.
+  local nodeids shards
+  nodeids="$(grep -Ev "$PYTEST_REPRO_ID_RE" "$residual" 2>/dev/null || true)"
+  # THE EXTRACTION DERIVES ITS PREFIX from the one literal (see
+  # `SHARD_REPRO_ID_PREFIX`): respelling it here is how a family ends up routed
+  # to neither arm.
+  shards="$(sed -n "s/^${SHARD_REPRO_ID_PREFIX}\\(.*\\)$/\\1/p" "$residual" 2>/dev/null || true)"
+  [ -n "$nodeids" ] || [ -n "$shards" ] || return 1
 
   # THE BOUND IS MANDATORY, and it is VALIDATED THROUGH THE RAIL'S OWN
   # PREDICATES. `perl alarm` numifies its argument, so `alarm "abc"` is
@@ -6897,117 +7202,356 @@ reproduce_residual_on_base() {
     return 1
   fi
 
-  # THE REQUESTED SET IS THE NODEIDS, passed to the runner as ARGV (the seam also
-  # gets them on stdin). Running the exact nodeids — never their whole files —
-  # bounds the base's OWN output to the ids under test, so an unrelated failure
-  # in the same file can never be read as a reproduced one. Built BEFORE the
-  # worktree exists so an empty request can never leave one behind (#3715 review).
+  # THE REQUESTED SETS ARE BUILT BEFORE ANY WORKTREE EXISTS, so an empty request
+  # can never leave one behind (#3715 review). The NODEIDS go to the pytest
+  # runner as ARGV (the seam also gets them on stdin): running the exact nodeids —
+  # never their whole files — bounds the base's OWN output to the ids under test,
+  # so an unrelated failure in the same file can never be read as a reproduced
+  # one. The SHARD tokens go to the second runner, one `bash <path>` per token
+  # (#3415) — the same bounding argument, because the shard IS the artifact.
   local -a nodeid_arr=() n
   while IFS= read -r n; do [ -n "$n" ] && nodeid_arr+=("$n"); done <<< "$nodeids"
-  [ "${#nodeid_arr[@]}" -gt 0 ] || return 1
 
   local work="$TMP/repro-base"
   rm -rf "$work"; mkdir -p "$work" || return 1
 
-  local cmd_dir="$PWD" used_worktree=0
-  if [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
+  # ⛔ ONE WORKTREE, TWO RUNNERS (#3415), AND EITHER ARM ALONE IS A MEASUREMENT.
+  # The worktree is shared because both arms measure the SAME tree; it is
+  # materialised when at least one arm takes the PRODUCTION path, so a seam-only
+  # invocation (the harness) still creates none. An arm whose runner is
+  # unavailable is REPORTED and skipped — it must not abort the OTHER arm's
+  # measurement, because turning "one family could not run" into "nothing ran"
+  # is the false block #3715 exists to remove. Nothing is cleared by an arm that
+  # did not run: `$out` is only ever the intersection with what was measured.
+  #
+  # ⛔ EACH ARM OWNS ITS OWN DIRECTORY (#3415 review 4, P2). ONE shared directory
+  # variable made the SHARD arm's need for a worktree silently RELOCATE the PYTEST
+  # arm into it, contradicting the `ADMIN_MERGE_REPRO_CMD` contract documented above
+  # ("when set, no worktree is created and the command runs in `$PWD`") and breaking
+  # any seam command written relative to `$PWD`. Worse, a worktree that could not be
+  # created `return`ed BEFORE arm 1 ran, so one arm's missing tree suppressed the
+  # other arm's measurement — the exact false block the paragraph above promises
+  # not to produce. The PRODUCTION path still measures the SAME tree for both arms;
+  # only a SEAM arm stays in `$PWD`.
+  #
+  # ⛔ AND A PRODUCTION ARM DOES NOT RUN WITHOUT THAT TREE (#3415 review 4, P1).
+  # Both dirs fall back to `$PWD`, which is the PR'S OWN CHECKOUT. An arm that ran
+  # anyway after a failed `git worktree add` would answer "does the PR fail this?"
+  # while the code promises "does the BASE fail it?" — and every residual id is one
+  # the PR IS failing, so a PR-caused red would be cleared off an artifact nothing
+  # measured on the base. That is strictly worse than the early `return` it
+  # replaced, so EACH production arm is gated on `tree_ok` below.
+  local pytest_dir="$PWD" shard_dir="$PWD" used_worktree=0 need_tree=0
+  local nodeid_tree=0 shard_tree=0 tree_ok=0
+  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then nodeid_tree=1; need_tree=1; fi
+  if [ -n "$shards" ] && [ -z "${ADMIN_MERGE_REPRO_SHARD_CMD:-}" ]; then shard_tree=1; need_tree=1; fi
+  if [ "$need_tree" -eq 1 ]; then
     # PRODUCTION PATH: a pristine base worktree. No base ref, not a git repo, or a
-    # worktree that cannot be created -> clear NOTHING (fail closed).
-    [ -n "$base" ] || return 1
-    git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
-    if ! git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+    # worktree that cannot be created -> the arm that NEEDS the tree clears NOTHING
+    # (fail closed) — but a SEAM arm still runs, because one arm without a tree is
+    # not the other arm's measurement.
+    if [ -n "$base" ] \
+       && git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+       && git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+      tree_ok=1; used_worktree=1
+    else
       say_err "admin-merge: (reproduction) could not materialise the base '$base' as a worktree — the"
-      say_err "   residual is NOT reproduced and the rail blocks as before (fail closed)."
-      return 1
+      say_err "   residual is NOT reproduced there and the rail blocks as before (fail closed). A SEAM"
+      say_err "   arm still runs in \$PWD; a PRODUCTION arm that needs the base tree is REFUSED below."
     fi
-    cmd_dir="$work/tree"; used_worktree=1
+    if [ "$tree_ok" -eq 1 ]; then
+      if [ "$nodeid_tree" -eq 1 ]; then pytest_dir="$work/tree"; fi
+      if [ "$shard_tree" -eq 1 ]; then shard_dir="$work/tree"; fi
+    fi
   fi
 
-  local -a runner
-  if [ -n "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
-    runner=(bash -c "$ADMIN_MERGE_REPRO_CMD")
-  elif command -v uv >/dev/null 2>&1 && [ -f "$cmd_dir/uv.lock" ]; then
-    runner=(uv run --frozen pytest "${nodeid_arr[@]}" -q -p no:cacheprovider)
-  else
-    say_err "admin-merge: (reproduction) no runnable lane runner (no ADMIN_MERGE_REPRO_CMD and no uv.lock)"
-    say_err "   — the residual is NOT reproduced and the rail blocks as before (fail closed)."
-    [ "$used_worktree" -eq 1 ] && git -C "$PWD" worktree remove --force "$work/tree" >/dev/null 2>&1
-    return 1
+  local reproduced_all="$work/reproduced.all" arms_ran=0
+  : > "$reproduced_all"
+
+  # ── ARM 1 — THE PYTEST NODEIDS (#3715) ───────────────────────────────────
+  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ "$nodeid_tree" -eq 1 ] && [ "$tree_ok" -ne 1 ]; then
+    # ⛔ THE PRODUCTION PYTEST ARM NEEDS THE TREE TOO (#3415 review 4, P1). `pytest_dir`
+    # falls back to the PR's own checkout, so an arm 1 that ran anyway after a failed
+    # `git worktree add` would select `uv run --frozen pytest` against the PR tree,
+    # recover the residual nodeids from ITS capture and CLEAR them — measured: a
+    # PR-caused nodeid cleared with no base ever measured, while stderr claimed the
+    # rail "blocks as before". Only a SEAM arm (caller-supplied runner, explicit
+    # `$PWD` contract) runs without the tree.
+    say_err "admin-merge: (reproduction) the pytest arm needs the base worktree and there is none — the"
+    say_err "   nodeids are NOT reproduced here (running them in this checkout would measure the PR, not"
+    say_err "   the base) and none is cleared (fail closed)."
+  elif [ "${#nodeid_arr[@]}" -gt 0 ]; then
+    local -a runner=()
+    if [ -n "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
+      runner=(bash -c "$ADMIN_MERGE_REPRO_CMD")
+    elif command -v uv >/dev/null 2>&1 && [ -f "$pytest_dir/uv.lock" ]; then
+      runner=(uv run --frozen pytest "${nodeid_arr[@]}" -q -p no:cacheprovider)
+    else
+      say_err "admin-merge: (reproduction) no runnable lane runner (no ADMIN_MERGE_REPRO_CMD and no uv.lock)"
+      say_err "   — the NODEID half of the residual is NOT reproduced and stays refused (fail closed)."
+    fi
+    if [ "${#runner[@]}" -gt 0 ]; then
+      local raw="$work/repro.raw" run_rc=0 reproduced="" ids_rc=0
+      (
+        cd "$pytest_dir" || exit 1
+        printf '%s\n' "$nodeids" > "$work/nodeids.txt"
+        perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${runner[@]}" < "$work/nodeids.txt"
+      ) > "$raw" 2> "$work/repro.err" || run_rc=$?
+      # The reproduced set, through the CANONICAL parser so the shapes cannot
+      # drift. `ids` exits non-zero ONLY when the capture could not be READ (an
+      # empty id set is a legitimate 0), so a non-zero here is "could not run".
+      reproduced="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$raw" 2>/dev/null)" || ids_rc=$?
+      [ "$ids_rc" -eq 0 ] || reproduced=""
+      # ⛔ A RUNNER THAT DID NOT RUN IS NOT A RAN-AND-FOUND-NOTHING MEASUREMENT
+      # (#3715 review, P2). The subshell's status was DISCARDED, so a crash, a
+      # missing dependency, an argv the runner refused, or a suite KILLED at the
+      # mandatory `perl alarm` bound all left an empty capture; `ids` reads that as
+      # a legitimate empty set (exit 0), and the rail reported "NO refused failure
+      # reproduced there" — a POSITIVE measurement that the base passed tests it
+      # never executed, contradicted by the runner's own unread `$work/repro.err`.
+      # The STATUS ALONE is not the test: pytest exits 1 when tests FAIL, which is a
+      # successful measurement. The evidence is the CAPTURE — a runner that ran and
+      # found failures names them, one that could not run names none — so BOTH
+      # together are the predicate: non-zero status AND no recovered id is "could not
+      # run" (fail closed), while a non-zero status WITH recovered ids is a
+      # measurement. 142 is SIGALRM (128+14): the bound killed it.
+      if [ "$ids_rc" -ne 0 ]; then
+        say_err "admin-merge: (reproduction) the base capture could not be READ by the canonical parser"
+        say_err "   — the NODEID half of the residual is NOT reproduced and stays refused (fail closed)."
+      elif [ "$run_rc" -ne 0 ] && [ -z "$reproduced" ]; then
+        if [ "$run_rc" -eq 142 ]; then
+          say_err "admin-merge: (reproduction) the base runner was KILLED by the ${timeout_s}s bound"
+          say_err "   (SIGALRM) before it reported anything — that is a run that could NOT run, never a"
+          say_err "   measurement that the base does not fail these tests."
+        else
+          say_err "admin-merge: (reproduction) the base runner exited $run_rc with NO recovered failure id"
+          say_err "   — a crash, a missing dependency, or an argv the runner refused, NOT a run that found"
+          say_err "   nothing. 'ran and found nothing' must never be reported as 'could not run', and this"
+          say_err "   inverse is the same defect."
+        fi
+        if [ -s "$work/repro.err" ]; then
+          say_err "   runner stderr (last 3 lines):"
+          tail -n 3 "$work/repro.err" 2>/dev/null | sed 's/^/      /' >&2
+        fi
+        say_err "   Nothing in the nodeid half reproduced; those ids stay refused (fail closed)."
+      else
+        arms_ran=1
+        # THE CAPTURE IS BOUNDED BY THE ARGV THAT PRODUCED IT (#3715 review,
+        # P0; #3415). `ids --log` recovers nodeid-shaped tokens from ANYWHERE in
+        # the capture and the test seam can echo whatever it likes, so the base's
+        # raw output may name an id outside its argv — including a MEASURED one.
+        # Subtracting that from the residual would override a measured verdict,
+        # which is the #3756 fail-open the candidate set exists to stop. The
+        # PYTEST boundary is used, not the non-local one, because a shard id is
+        # clearable NOW — but only by the SHARD arm having run that shard, never
+        # by a pytest capture volunteering the token (`bash-shard::` is not in
+        # this arm's argv, so it cannot be in its successful measurement either).
+        if [ -n "$reproduced" ]; then
+          printf '%s\n' "$reproduced" \
+            | grep -Ev "$PYTEST_REPRO_ID_RE" > "$work/arm1.ids" 2>/dev/null \
+            || : > "$work/arm1.ids"
+          sort -u "$work/arm1.ids" >> "$reproduced_all"
+        fi
+      fi
+    fi
   fi
-  local raw="$work/repro.raw" run_rc=0
-  (
-    cd "$cmd_dir" || exit 1
-    printf '%s\n' "$nodeids" > "$work/nodeids.txt"
-    perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${runner[@]}" < "$work/nodeids.txt"
-  ) > "$raw" 2> "$work/repro.err" || run_rc=$?
+
+  # ── ARM 2 — THE BASH SHARDS (#3415) ──────────────────────────────────────
+  # `bash-shard::<path>` IS locally reproducible and never was attributable
+  # without this arm: the path is the shard script, so `bash <path>` on the base
+  # answers the only question that matters — does the BASE fail this shard? A
+  # non-zero exit IS the measurement (the shard's own verdict, not an inference
+  # from one), and exit 0 is the answer that keeps the PR blocked.
+  #
+  # ⛔ THE ARM HAS EXACTLY FOUR WAYS TO CLEAR, and every one of them is a
+  # MEASUREMENT of the base: the token names a LISTED shard, that shard exists in
+  # the base tree, its resolved path is inside it, and the run itself returned a
+  # verdict (not the bound's, not the launcher's). Everything else refuses.
+  # ⛔ THE ARM THAT NEEDS THE TREE DOES NOT RUN WITHOUT IT (#3415 review 4, P1).
+  # `shard_dir` falls back to `$PWD`, which is the PR'S OWN CHECKOUT — so an arm
+  # that ran anyway when the base worktree could not be materialised would answer
+  # "does the PR fail this shard?" while the comment above promises "does the BASE
+  # fail it?". Every residual shard is one the PR IS failing, so a PR-caused red
+  # would be cleared off an artifact nothing measured on the base: fail-open, and
+  # strictly worse than the pre-change `return 1`, which cleared nothing. The SEAM
+  # arm is different — its runner is supplied by the caller and its `$PWD`
+  # contract is explicit — so it keeps running; only the PRODUCTION arm is gated.
+  if [ -n "$shards" ] && [ "$shard_tree" -eq 1 ] && [ "$tree_ok" -ne 1 ]; then
+    say_err "admin-merge: (reproduction) the shard arm needs the base worktree and there is none — no shard"
+    say_err "   is executed here (running one in the PR checkout would measure the WRONG tree and"
+    say_err "   clear a red the PR caused), and none is cleared (fail closed)."
+  elif [ -n "$shards" ]; then
+    local token spath sraw s_rc=0 shard_seam="${ADMIN_MERGE_REPRO_SHARD_CMD:-}" shard_n=0
+    local tree_real="" leaf_real="" shard_list="" shard_list_ok=0
+    # THE ARM'S TOTAL BOUND (#3415 review 3). `timeout_s` bounds ONE shard, so a
+    # residual of N hung shards would cost N x timeout_s — more than the rail's
+    # whole-attempt lease for a large N, which is a stall the lease TTL then reads
+    # as an abandoned attempt. The arm therefore gets ONE budget, shaped exactly
+    # like the pytest arm's (one alarm for the whole run): each shard gets what is
+    # LEFT, and once nothing is left the arm stops measuring (those ids stay
+    # refused — fail closed) instead of outliving the attempt.
+    local arm_deadline=$((SECONDS + timeout_s)) shard_budget=0
+    if [ -z "$shard_seam" ]; then
+      # ⛔ THE MEMBERSHIP SOURCE IS THE BASE'S OWN RUNNER, NOT A SECOND LIST
+      # (#3415 review 3). A forged token can name ANY file in the base tree
+      # (`❌ failed shard: scripts/pi-reap-worktrees.sh`), and this arm would then
+      # EXECUTE it out of band — main's scripts are trusted code, but they are not
+      # written to be run with no arguments by a merge rail. `--list` is the one
+      # derivation of what a shard IS (`run-bash-shards.sh` exits on `--list`
+      # BEFORE its live-cell placement guard, so it stays readable everywhere,
+      # including the operator cells the lanes run on). Unreadable or EMPTY list ->
+      # NOTHING is executed: the refusal stands exactly as before #3415.
+      if [ ! -d "$shard_dir" ]; then
+        say_err "admin-merge: (reproduction) the base worktree '$shard_dir' is not a directory — no shard"
+        say_err "   can be measured on it, and nothing is cleared (fail closed)."
+        shard_list_ok=0
+      elif shard_list="$(cd "$shard_dir" 2>/dev/null && bash scripts/run-bash-shards.sh --list 2>/dev/null)" \
+           && [ -n "$shard_list" ]; then
+        shard_list_ok=1
+      else
+        say_err "admin-merge: (reproduction) the base's own shard list ('bash scripts/run-bash-shards.sh --list'"
+        say_err "   in the base worktree) could not be read — no shard is executed and none is cleared"
+        say_err "   (fail closed)."
+        shard_list_ok=0
+      fi
+    fi
+    while IFS= read -r token; do
+      [ -n "$token" ] || continue
+      if ! spath="$(repro_shard_path "$token")"; then
+        say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' does not name a repo-relative script this"
+        say_err "   rail may execute (an absolute path, a '..' component, a leading '-', a percent-encoded"
+        say_err "   byte, or a token outside the shard alphabet) — NOT measured, so it stays refused."
+        continue
+      fi
+      if [ -z "$shard_seam" ]; then
+        # ⛔ THE SHARD MUST BE IN THE BASE TREE (#3415). A shard this PR ADDS does
+        # not exist on the base; `bash <missing>` exits 127, which under the
+        # "non-zero means the base fails it" rule would CLEAR a failure the PR
+        # itself introduced — the fail-open direction, and the reason this check
+        # is separate from the verdict. Checked BEFORE membership so the refusal
+        # names the true fact for an added shard (the base does not HAVE it) instead
+        # of the weaker "it is not in the base's list".
+        if [ ! -f "$shard_dir/$spath" ]; then
+          say_err "admin-merge: (reproduction) the base tree has no '$spath' — a shard this PR ADDS"
+          say_err "   cannot be measured on the base, and 'absent there' is never 'fails there'. It"
+          say_err "   stays refused (fail closed)."
+          continue
+        fi
+        if [ "$shard_list_ok" -ne 1 ]; then
+          say_err "admin-merge: (reproduction) '$spath' cannot be CHECKED against the base's shard list, so it is"
+          say_err "   not executed and stays refused (fail closed)."
+          continue
+        fi
+        if ! grep -qxF -- "$spath" <<<"$shard_list"; then
+          say_err "admin-merge: (reproduction) '$spath' is NOT a shard the base's own runner lists — a"
+          say_err "   forged or stale token is never executed, and an unlisted file is not a measurement of a"
+          say_err "   shard. It stays refused (fail closed)."
+          continue
+        fi
+        # ⛔ CONTAINMENT RESOLVES THE LEAF, NOT ONLY ITS DIRECTORY — and a
+        # directory-only check is a FAIL-OPEN, measured in review: `-f` follows a
+        # symlink, so a TRACKED leaf `tests/x.sh -> /somewhere/else.sh` passed the
+        # directory test and its exit status was read as the base's verdict,
+        # clearing the PR's id. `Cwd::abs_path` resolves EVERY component (perl is
+        # already a hard dependency of this function for the alarm bound) — called
+        # FULLY QUALIFIED, because `-MCwd` does not export it on every perl, and an
+        # unresolved `abs_path` would refuse every shard instead of checking it.
+        # The resolved path must be inside the checked-out base; a path that cannot
+        # be resolved is refused, because unresolvable is not a measurement either.
+        if [ -z "$tree_real" ]; then tree_real="$(cd "$shard_dir" && pwd -P)"; fi
+        leaf_real="$(perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$shard_dir/$spath" 2>/dev/null)" || leaf_real=""
+        case "$leaf_real" in
+          "$tree_real"/*) ;;
+          *) say_err "admin-merge: (reproduction) '$spath' resolves OUTSIDE the base worktree"
+             say_err "   (${leaf_real:-unresolvable}) — not executed, so it stays refused (fail closed)."
+             continue ;;
+        esac
+      fi
+      shard_budget=$((arm_deadline - SECONDS))
+      if [ "$shard_budget" -le 0 ]; then
+        say_err "admin-merge: (reproduction) the shard arm's ${timeout_s}s budget is EXHAUSTED — '$spath' and"
+        say_err "   any shard after it are NOT measured and stay refused (fail closed). Raise"
+        say_err "   ADMIN_MERGE_REPRO_TIMEOUT if this base needs longer."
+        break
+      fi
+      [ "$shard_budget" -gt "$timeout_s" ] && shard_budget="$timeout_s"
+      shard_n=$((shard_n + 1))
+      sraw="$work/shard-$shard_n.log"; s_rc=0
+      # ⛔ A LOG THAT CANNOT BE CREATED IS NOT A SHARD THAT FAILED. Checked BEFORE
+      # the run so a full/unwritable $TMP cannot be read as the base's verdict.
+      : > "$sraw" 2>/dev/null || {
+        say_err "admin-merge: (reproduction) cannot write the log for '$spath' ($sraw) — the shard was not"
+        say_err "   run and is NOT measured; it stays refused (fail closed)."
+        continue
+      }
+      if [ -n "$shard_seam" ]; then
+        (
+          cd "$shard_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash -c "$shard_seam" admin-merge-shard "$token"
+        ) > "$sraw" 2>&1 || s_rc=$?
+      else
+        (
+          cd "$shard_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash "$spath"
+        ) > "$sraw" 2>&1 || s_rc=$?
+      fi
+      # ⛔ THE LAUNCH IS NOT THE VERDICT (#3415 review 3, P1). `cd "$shard_dir"`
+      # failing (the worktree removed mid-run by a reaper, a $TMP that vanished)
+      # exits with the sentinel, and without this arm that status was READ AS "the
+      # base fails this shard" — clearing a red the PR caused. The pytest arm has
+      # the same protection by construction (its verdict comes from the CAPTURE);
+      # this arm's verdict is the STATUS, so the status needs the discriminator.
+      if [ "$s_rc" -eq "$REPRO_LAUNCH_FAILED_RC" ]; then
+        say_err "admin-merge: (reproduction) '$spath' could not be LAUNCHED in the base worktree (cd failed or"
+        say_err "   the tree disappeared) — an infrastructure failure is not a measurement, so it stays"
+        say_err "   refused (fail closed)."
+        continue
+      fi
+      # ⛔ A STATUS THAT DID NOT COME FROM THE SHARD IS NOT THE SHARD'S VERDICT
+      # (#3415 review 4, P1). This arm's verdict IS the status, so every status that
+      # is not an exit decision has to be excluded — and 142 is the MEMBER of a class,
+      # not the class. 128+N is death by signal N: the run was KILLED, never finished,
+      # and produced no verdict. Treating only 142 as special left every other signal
+      # death reading as "the base fails this shard": an OOM SIGKILL (137) on a loaded
+      # box, or a reaper's/operator's SIGTERM (143) mid-arm, would CLEAR a red the PR
+      # caused — a false PASS on an artifact nothing measured — while the pytest arm
+      # is fail-closed for the same event by construction (a killed run recovers no
+      # ids). 142 keeps its own message because the rail's own `${shard_budget}s`
+      # bound is the commonest cause and naming it is the actionable diagnostic.
+      # ⛔ NOT a catch-all: a status <= 128 IS the shard's own exit decision and stays
+      # the verdict. 124 in particular is a shard's OWN internal bound (the convention
+      # `run-bash-shards.sh` documents), i.e. a real failure on the base, so it must
+      # keep clearing — widening this past signals would restore the false block #3415
+      # exists to remove.
+      if [ "$s_rc" -gt 128 ]; then
+        if [ "$s_rc" -eq 142 ]; then
+          say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' was KILLED by the ${shard_budget}s bound"
+          say_err "   (SIGALRM) — a run that could not finish is not a measurement that the base fails it."
+        else
+          say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' DIED ON SIGNAL $((s_rc - 128)) (status $s_rc)"
+          say_err "   — a killed run never reached the shard's own verdict, so its status is not a measurement"
+          say_err "   that the base fails it."
+        fi
+        say_err "   It stays refused (fail closed)."
+        continue
+      fi
+      # A shard that RAN is a measurement whichever way it went, so the arm ran
+      # even when every shard on the base passes.
+      arms_ran=1
+      [ "$s_rc" -eq 0 ] && continue
+      printf '%s%s\n' "$SHARD_REPRO_ID_PREFIX" "$token" >> "$reproduced_all"
+    done <<< "$shards"
+  fi
+
   [ "$used_worktree" -eq 1 ] && git -C "$PWD" worktree remove --force "$work/tree" >/dev/null 2>&1
 
-  # The reproduced set, through the CANONICAL parser so the shapes cannot drift.
-  # `ids` exits non-zero ONLY when the capture could not be READ (an empty id set
-  # is a legitimate 0), so a non-zero here is "could not run", not "found none".
-  local reproduced
-  reproduced="$("$PYTHON_BIN" "$EXEMPTION_PY" ids --log "$raw" 2>/dev/null)" || return 1
-  # ⛔ A RUNNER THAT DID NOT RUN IS NOT A RAN-AND-FOUND-NOTHING MEASUREMENT
-  # (#3715 review, P2). The subshell's status was DISCARDED, so a crash, a
-  # missing dependency, an argv the runner refused, or a suite KILLED at the
-  # mandatory `perl alarm` bound all left an empty capture; `ids` reads that as a
-  # legitimate empty set (exit 0), and the rail reported "NO refused failure
-  # reproduced there" — a POSITIVE measurement that the base passed tests it
-  # never executed, contradicted by the runner's own unread `$work/repro.err`.
-  # The STATUS ALONE is not the test: pytest exits 1 when tests FAIL, which is a
-  # successful measurement. The evidence is the CAPTURE — a runner that ran and
-  # found failures names them, one that could not run names none — so BOTH
-  # together are the predicate: non-zero status AND no recovered id is "could not
-  # run" (fail closed), while a non-zero status WITH recovered ids is a
-  # measurement. 142 is SIGALRM (128+14): the bound killed it.
-  if [ "$run_rc" -ne 0 ] && [ -z "$reproduced" ]; then
-    if [ "$run_rc" -eq 142 ]; then
-      say_err "admin-merge: (reproduction) the base runner was KILLED by the ${timeout_s}s bound"
-      say_err "   (SIGALRM) before it reported anything — that is a run that could NOT run, never a"
-      say_err "   measurement that the base does not fail these tests."
-    else
-      say_err "admin-merge: (reproduction) the base runner exited $run_rc with NO recovered failure id"
-      say_err "   — a crash, a missing dependency, or an argv the runner refused, NOT a run that found"
-      say_err "   nothing. 'ran and found nothing' must never be reported as 'could not run', and this"
-      say_err "   inverse is the same defect."
-    fi
-    local diag=""
-    if [ -s "$work/repro.err" ]; then
-      diag="$(tail -n 3 "$work/repro.err" 2>/dev/null)"
-      say_err "   runner stderr (last 3 lines):"
-      printf '%s\n' "$diag" | sed 's/^/      /' >&2
-    fi
-    say_err "   Nothing reproduced; the refusal stands (fail closed)."
-    return 1
-  fi
-  # THE CAPTURE IS INTERSECTED WITH WHAT WAS ACTUALLY ASKED FOR (#3715 review,
-  # P0). `ids --log` recovers nodeid-shaped tokens from ANYWHERE in the capture
-  # and the test seam can echo whatever it likes, so the base's raw output may
-  # name an id outside its argv — including a MEASURED one. Subtracting that from
-  # the residual would override a measured verdict, which is the #3756 fail-open
-  # the candidate set exists to stop. `$residual` IS the candidate set, so the
-  # intersection belongs here, and it goes through the ONE comparison
-  # implementation (never a second subtraction, never `comm -12`).
-  if [ -n "$reproduced" ]; then
-    printf '%s\n' "$reproduced" | sort -u > "$work/reproduced.all"
-    # ⛔ THE ARGV FILTER ABOVE DOES NOT BOUND WHAT MAY BE CLEARED (#1185 review,
-    # cycle 2). ⚠️ THIS FILTER IS UNFIXTURED: the cycle-2 author wrote a
-    # rail-level fixture for it and MEASURED that it did not discriminate (the
-    # same scenario cleared nothing with the filter removed), so the case was
-    # deleted rather than shipped as a vacuous green — the effect below is
-    # established by direct measurement of the parser instead
-    # (`python3 scripts/ci_exemption.py ids --log` on a capture carrying the
-    # `##[error]FAILED …` annotation prints the `guard-step::` id). `grep -Ev`
-    # bounds what the runner was ASKED to run; a CAPTURE can
-    # still volunteer an identity its argv never named — `ids --log` recovers
-    # them from anywhere in the log, and a capture carrying a `##[error]FAILED …`
-    # annotation emits a `guard-step::` identity. Since #1185 a guard-step id CAN
-    # be in `$residual` (the candidate set), so before this filter it could be
-    # subtracted from the rail's residual by the base's own output: a failure no
-    # local run can execute, CLEARED. One more filter on the BASE'S side, through
-    # the same one pattern, keeps "an id no local reproduction can execute can
-    # never be cleared" true whichever side reports it.
-    grep -Ev "$NON_LOCAL_REPRO_ID_RE" "$work/reproduced.all" > "$work/reproduced.exec" 2>/dev/null || : > "$work/reproduced.exec"
+  # ⛔ NO ARM RAN => COULD NOT RUN (fail closed). "Ran and found nothing" is the
+  # other outcome and is reported as such: it leaves `$out` empty and returns 0.
+  [ "$arms_ran" -gt 0 ] || return 1
+  # THE CLEARABLE SET IS `candidates ∩ measured` (#3715 review, P0), through the
+  # ONE comparison implementation — never a second subtraction, never `comm`.
+  if [ -s "$reproduced_all" ]; then
+    sort -u "$reproduced_all" > "$work/reproduced.exec"
     intersect_sets "$work/reproduced.exec" "$residual" "$out" "$work/rep-outside.txt" || {
       : > "$out"; return 1
     }
@@ -7088,7 +7632,7 @@ main_measured_files() {
     sed '/^guard-step::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     # #2643: the shard path IS the measured file (see the note above).
-    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
+    sed -n "s/^${SHARD_REPRO_ID_PREFIX}\\(.*\\)$/\\1/p" "$mainfails"
     # #1185: a gate identity is keyed by its CHECK, not by a file — the same
     # per-entry identity `job-unreadable::` uses, and for the same reason: a main
     # baseline red on a DIFFERENT check must not read as a pre-existing failure in
@@ -7111,7 +7655,7 @@ main_baseline_units() {
   local mainfails="$1"
   [ -s "$mainfails" ] || return 0
   {
-    sed '/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^bash-shard::/d; /^runner::/d; /^pipeline-compliance::/d; s/::.*//' "$mainfails"
+    sed "/^guard-step::/d; /^collect-error::/d; /^watchdog-kill::/d; /^job-unreadable::/d; /^${SHARD_REPRO_ID_PREFIX}/d; /^runner::/d; /^pipeline-compliance::/d; s/::.*//" "$mainfails"
     sed -n 's/^guard-step::\([^:]*\)::.*/\1/p' "$mainfails"
     sed -n 's/^collect-error::\(.*\)$/\1/p' "$mainfails"
     sed -n 's/^watchdog-kill::.*/watchdog-kill/p' "$mainfails"
@@ -7124,7 +7668,7 @@ main_baseline_units() {
     # generic `s/::.*//` above is suppressed for the family, every shard collapses
     # onto the literal `bash-shard`, and a main baseline red in ONE shard reads as
     # pre-existing in a DIFFERENT one.
-    sed -n 's/^bash-shard::\(.*\)$/\1/p' "$mainfails"
+    sed -n "s/^${SHARD_REPRO_ID_PREFIX}\\(.*\\)$/\\1/p" "$mainfails"
     sed -n 's/^runner::\(.*\)$/\1/p' "$mainfails"
     # #1185: the unit is the CHECK (`pipeline-compliance::<letter>`), for exactly
     # the #7131 reason — main red on check (a) must not read as a pre-existing
@@ -7157,7 +7701,7 @@ failure_file_key() {
     # would collapse every shard onto the literal `bash-shard` (and every JS
     # aggregate onto `runner`), so a main baseline red in one shard would be
     # reported as "measured on this lane" for a DIFFERENT shard's failure.
-    bash-shard::*) printf '%s\n' "${1#bash-shard::}" ;;
+    "${SHARD_REPRO_ID_PREFIX}"*) printf '%s\n' "${1#"$SHARD_REPRO_ID_PREFIX"}" ;;
     runner::*) printf '%s\n' "${1#runner::}" ;;
     # #1185: the unit is the CHECK, `pipeline-compliance::<letter>` — main red on
     # check (a) must not read as a pre-existing failure in this PR's check (c),
@@ -7218,11 +7762,19 @@ intersect_sets() {
 #     The id then keeps the pre-change exclusion — fail closed.
 #   * the other non-nodeid identities (`collect-error::<file>` #6798,
 #     `watchdog-kill::<reason>`, `job-unreadable::<slug>` #7131,
-#     `bash-shard::<path>` #2643, `runner::<job>`,
-#     `pipeline-compliance::<letter>::<subject>` #1185) also name no
-#     pytest nodeid. Handed to the runner as argv they make it EXIT 4 having run
-#     NOTHING, so they are not candidates either — they are units the rail can
-#     NAME, never measurements a local run can clear (#3715 review, P2).
+#     `runner::<job>`, `pipeline-compliance::<letter>::<subject>` #1185) also
+#     name no pytest nodeid. Handed to the runner as argv they make it EXIT 4
+#     having run NOTHING, so they are not candidates either — they are units the
+#     rail can NAME, never measurements a local run can clear (#3715 review, P2).
+#   * ⛔ `bash-shard::<path>` (#2643) IS ADMITTED (#3415) — the one non-nodeid
+#     family that names an EXECUTABLE ARTIFACT. It stays a candidate exactly as a
+#     nodeid does, and `repro_candidates`' MEASURED-ABSENT filter still applies
+#     to it (the shard PATH is a measured FILE when main's own baseline fails that
+#     shard), so a main-side measurement is never overridden by a local run. What
+#     the admission buys is the case this issue is about: main's failure-only
+#     baseline carries NO row (its `pull_request`-only job never ran on main),
+#     the shard is red on the PR *and* on main's tree — and now the rail can
+#     MEASURE that instead of reporting an unattributable red forever.
 # Return contract: 0 = computed (out may be empty) · 1 = could not compute.
 repro_scope() {
   local residual="$1" unattrib="$2" out="$3" scratch="$4" mainfails="${5:-}" nid ukey main_units=""
@@ -7255,7 +7807,9 @@ repro_scope() {
         fi
         ;;
       collect-error::*|watchdog-kill::*|job-unreadable::*) continue ;;
-      bash-shard::*|runner::*|pipeline-compliance::*) continue ;;
+      # #3415: `bash-shard::` is NOT here — it is reproducible by the shard arm.
+      "${SHARD_REPRO_ID_PREFIX}"*) ;;
+      runner::*|pipeline-compliance::*) continue ;;
     esac
     printf '%s\n' "$nid" >> "$out"
   done < "$scratch"
@@ -9359,10 +9913,56 @@ main() {
   # say whether the base is itself red — which is what makes a repair PR a repair —
   # but it NEVER blocks. It was the BLOCKING source in the previous revision, and
   # that is precisely what refused the PR that repairs a red main.
-  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH
+  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH BASE_ALL_REDS BASE_OWNED_REDS
   check_surface_probe "$base_ref" "the base branch '$base_ref'" 1
   BASE_STATUS="$MAIN_HEALTH_STATUS"; BASE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   BASE_REDS="$MAIN_HEALTH_REDS"; BASE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  # ── #3322: WHAT MAIN ITSELF FAILS, TAKEN FROM ITS OWN MEASURED SURFACE ────────
+  # The #6807 bucket above already decided which base reds NO PR CAN EVER RUN
+  # (workflow declares no pull_request/pull_request_target). Those reds are
+  # reported and not counted against the PR — and, until this line, they were also
+  # dropped on the floor, so §4.5 had no way to know that the PR's red on the SAME
+  # suite is the base's red carried forward. Materialise their NAMES once, here, and
+  # hand them to the tree probe.
+  # ⛔ THE CLASS IS NARROW ON PURPOSE: `exempt: this workflow declares no PR trigger`
+  # ONLY. A BLOCKING base red is deliberately not in this set — it is PR-evaluable,
+  # so §4.5/§4.6 must keep insisting the repair PR clear it (#1261). A NON-code
+  # event is not in it either: that red is noise from a cron lane, and a PR red
+  # that merely shares its name is not the same measurement.
+  # ⛔ EMPTY IS THE FAIL-CLOSED ANSWER and it is the common one: an UNMEASURED base (0 checks,
+  # 0 statuses), a clean base, and a base whose only reds are PR-evaluable all leave this file
+  # empty, which admits no exclusion at all. An UNREADABLE or PARTIAL base ALSO seeds nothing
+  # usable in effect — not because this file stays empty (step 2c seeds it and then `exit 1`s
+  # before §4.5 reads it), but because the rail never gets that far.
+  BASE_ALL_REDS="$MAIN_HEALTH_ALL_REDS"
+  BASE_OWNED_REDS="$TMP/base-owned-reds.txt"
+  : > "$BASE_OWNED_REDS"
+  if [ -n "$BASE_ALL_REDS" ]; then
+    # ⛔ THE SET IS NOT A FLAT NAME LIST. Two conditions, both fail-closed, both load-bearing:
+    #   (1) A NAME THAT ALSO HAS A `blocking:` ROW IS NOT EMITTED. The base can publish one
+    #       check NAME from two different apps/workflows — exempt on a push-only lane and
+    #       BLOCKING on a PR-evaluable one. Taking the name from the exempt row and ignoring
+    #       the blocking row would exclude a PR red on evidence the base contradicts (the
+    #       header: "the base red is on a workflow that DOES declare a PR trigger -> it is a
+    #       BLOCKING base red, deliberately NOT in the set").
+    #   (2) NEITHER NAMELESS PLACEHOLDER IS EMITTED. `(unnamed check)` / `(unnamed status)` are
+    #       the identities the probe gives a row with no name — they are not the NAME of
+    #       anything, so matching them would let ONE unnamed base red excuse ANY unnamed tree
+    #       red (#1353's "an unnamed red must never vanish", inverted into a waiver).
+    # Both are pinned by §80(g)/(h); the awk is the ONE place either rule lives.
+    printf '%s\n' "$BASE_ALL_REDS" \
+      | awk -F'\t' '
+          $2 ~ /^blocking:/ { blocked[$1] = 1 }
+          { row[$1] = row[$1] "\n" $2 }
+          END {
+            for (n in row) {
+              if (blocked[n]) continue
+              if (n == "(unnamed check)" || n == "(unnamed status)") continue
+              if (row[n] ~ /exempt: this workflow declares no PR trigger, so a PR can never run it/) print n
+            }
+          }' \
+      | sort -u > "$BASE_OWNED_REDS"
+  fi
   BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   BASE_PENDING="$MAIN_HEALTH_PENDING"; BASE_REF="$MAIN_HEALTH_REF"; BASE_SHA="$MAIN_HEALTH_SHA"
   # The base's BLOCKING reds with their start times, and the base surface's own
@@ -9861,10 +10461,13 @@ main() {
   # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
-  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
-  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH TREE_REDS_BASEOWNED TREE_RED_BASEOWNED
+  # #3322: the base's own not-PR-evaluable failing check names (step 2c). Passed here
+  # and ONLY here — the tree is the one surface where an inherited red is a false block.
+  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0 "$BASE_OWNED_REDS"
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  TREE_REDS_BASEOWNED="$MAIN_HEALTH_REDS_BASEOWNED"; TREE_RED_BASEOWNED="$MAIN_HEALTH_RED_BASEOWNED"
   TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_PENDINGS="$MAIN_HEALTH_PENDINGS"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
@@ -9903,6 +10506,14 @@ main() {
       if [ -n "${TREE_PENDINGS:-}" ]; then
         info "admin-merge:    in flight on this tree (reported, NOT blocking — a check still running is not a red):"
         printf '%s\n' "$TREE_PENDINGS"
+      fi
+      # #3322: an exclusion that is only an ABSENCE is indistinguishable from a
+      # silent drop, so every excluded red is printed with the base check that
+      # owns it. This is the arm the fix is read from — silence here means the
+      # rail did not exclude anything, which is a different claim entirely.
+      if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+        say_err "admin-merge:    EXCLUDED from the required surface (#3322) — the base itself fails the same suite, under its own lane's name, on a workflow no PR can run:"
+        printf '%s\n' "$TREE_REDS_BASEOWNED" | sed 's/^/      /' >&2
       fi ;;
     unmeasured)
       info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
@@ -9919,6 +10530,14 @@ main() {
         say_err "   (Also red on NON-code events — reported, not blocking here; a PR surface"
         say_err "    is not expected to carry one, so this is an anomaly:)"
         printf '%s\n' "$TREE_REDS_OTHER" >&2
+      fi
+      # #3322: the excluded reds are named even when the tree STILL refuses, so a
+      # mixed surface says which reds were inherited and which are the PR's own.
+      if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+        say_err "   EXCLUDED from the required surface (#3322) — the base itself fails the same suite,"
+        say_err "   under its own lane's name, on a workflow that declares no PR trigger, so no PR"
+        say_err "   can make it pass. These are NOT among the failures below:"
+        printf '%s\n' "$TREE_REDS_BASEOWNED" >&2
       fi
       say_err "   BASE CONTEXT: $BASE_SUMMARY"
       say_err "   If the base is red and THIS PR is the repair, the red should already be GONE"
@@ -10159,6 +10778,15 @@ Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATU
     health_line="$health_line
 Base red(s) reported but NOT blocking:
 $BASE_REDS_OTHER"
+  fi
+  # #3322: an EXCLUDED tree red is a decision this rail made about the PR's required
+  # surface, so it belongs in the durable record for the same reason the #6807 bucket
+  # does — otherwise the posted evidence shows a green tree with no trace of the red it
+  # set aside, and a reviewer cannot tell "the PR is clean" from "the repo is already red".
+  if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+    health_line="$health_line
+Tree red(s) EXCLUDED from the required surface (#3322) — ${TREE_RED_BASEOWNED} check(s) the base itself fails under its own lane's name, on a workflow that declares no PR trigger, so no PR can ever make them pass:
+$TREE_REDS_BASEOWNED"
   fi
   analyzed="$analyzed
 $health_line"
