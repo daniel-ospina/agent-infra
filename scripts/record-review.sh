@@ -237,8 +237,9 @@
 #   review-comment:<id>     an inline review comment
 #   delta:<A>..<B>          a RANGE-scoped verdict: the reviewer's verdict covers
 #                           exactly the commits in A..B and B is the PR's CURRENT
-#                           head. `delta:A..B+comment:<id>` is the form REQUIRED
-#                           when the range holds authored commits (below)
+#                           head. `delta:A..B+<artifact>` is REQUIRED in BOTH cases:
+#                           a bare `delta:A..B` is ALWAYS refused, because a delta
+#                           EXTENDS an attestation and can never create one (below)
 #   <a GitHub URL>          any of the three, pasted (…/pull/N#issuecomment-ID,
 #                           #discussion_rID, #pullrequestreview-ID)
 #
@@ -1244,7 +1245,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
 # graft file) makes `git diff` and `git rev-list` answer about history that does
 # not exist, so a digest computed with one active could attest a range that never
 # existed on the remote. Same posture, same reason, as local_diff_for_pr (#1398).
-DELTA_FROM=""; DELTA_TO=""; DELTA_KIND=""; DELTA_DIGEST=""; DELTA_COVER=""; DELTA_BASE=""
+DELTA_FROM=""; DELTA_TO=""; DELTA_KIND=""; DELTA_DIGEST=""; DELTA_BASE=""
 # ⛔ THE ONE SIGNAL THAT AN EVIDENCE-RANGE WAS VERIFIED — a flag of its OWN, not inference from
 # `[ -n "$DELTA_FROM" ]`. `--delta` (#10583) and `--evidence delta:<A>..<B>` (#3299) merged into
 # this file from opposite sides and once SHARED that global, so every `--delta` record was minted
@@ -1278,11 +1279,29 @@ delta_git() { # <root> <git args…>
   GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"
 }
 
+# ⛔ THE ORACLE READ — merge-tree with the BOX-GLOBAL attribute sources switched OFF (cycle-4
+# review, P1). `merge-tree` honours attributes from four places: the tree/worktree (what the
+# reviewed artifact says — kept), `<gitdir>/info/attributes` (refused by the caller when non-empty),
+# `core.attributesFile` or the default `$XDG_CONFIG_HOME/git/attributes` (a BOX setting), and the
+# system `gitattributes` (a HOST setting). The last three belong to the machine, not to the PR, so
+# an attestation must not let them decide what "a clean merge" is: this read neutralises all three,
+# which is stronger than refusing (a box-level rule cannot block a lane at all) and needs no
+# enumeration of spellings — the very trap this file records elsewhere.
+delta_git_neutral() { # <root> <git args…>
+  local root="$1"; shift
+  local xdg="" rc=0
+  xdg="$(mktemp -d 2>/dev/null || true)"
+  XDG_CONFIG_HOME="${xdg:-/nonexistent-delta-xdg}" GIT_ATTR_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null \
+    command git -C "$root" -c core.attributesFile=/dev/null "$@" || rc=$?
+  [ -n "$xdg" ] && rm -rf "$xdg" 2>/dev/null
+  return "$rc"
+}
+
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_from_sha="" sfr="" range_ok=""
-  local thr=0 prior_head="" prior_verdict="" _pf=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1319,23 +1338,43 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   # (4b) THE TARGET HEAD'S HEALTH — clause (E) of the carry, applied here for the
   # same reason it applies there. A delta re-attests an OLD verdict over a NEW
   # head, so it must not put a signed `clean` on a head whose own checks are
-  # measurably failing. POLARITY: only an EXPLICIT green (rc 1) proceeds — every
-  # other status refuses, including one this case does not name. Three outcomes are
-  # DOCUMENTED (#2342: red / unreadable / green), but a four-outcome future, or a
-  # helper whose own last command cannot run, must not fall through as "not red":
-  # that is the enum-allow-list error the verification-state rule in AGENTS.md names
-  # ("an unnamed value must never be allowed to fall through a gap"), and the carry
-  # arm 2,300 lines below already implements exactly this polarity — this arm was
-  # the odd one out (found by review: a stubbed rc 3 was ACCEPTED and minted clean).
-  thr=0
-  target_head_red "$to" || thr=$?
-  case "$thr" in
-    1) : ;;   # the ONLY green: measured, non-red
-    0) echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
+  # measurably failing.
+  # ⛔ `check_surface_scan` IS CALLED DIRECTLY, and that is the point: (#3440) DELETED
+  # the `target_head_red` wrapper this arm used to call — its last caller was this very
+  # arm — so that no second polarity with a divergent meaning is left behind. The mapping
+  # below is clause E's, and it is STRICTLY NARROWER than the carry arm's: a REFUSED read
+  # (rc != 0) refuses, a `red` surface refuses, and a read-but-unanswered surface
+  # (`in_flight` / `empty` / `green`) proceeds. `empty` is NOT green — the record write below
+  # still classifies it `unknown` — but it is an ANSWER, and refusing on it here would be a
+  # polarity the arm this mirrors does not share.
+  # ⛔ THE NARROWING IS DELIBERATE AND IS STATED, NOT IMPLIED (found in review: this comment
+  # used to say "taken verbatim from the carry arm", which was FALSE in the direction that
+  # matters). The carry arm's test is `rc != 0 || first-line == red`, so an rc-0 answer it does
+  # not NAME — a word `check_surface_scan` does not print today — falls through as "not red"
+  # there, while the enum below REFUSES it. Today the two agree because that helper's whole
+  # rc-0 vocabulary is `green`/`in_flight`/`empty`/`red`; the delta arm is the one written so a
+  # future sixth word fails CLOSED. The carry arm's own shape is left exactly as it is: it is a
+  # signed-clean path whose behaviour this change does not touch, and "fixing" it here would
+  # smuggle a second change into a delta-evidence PR. DECLARED RESIDUAL, not a silent one.
+  # ⛔ AN UNNAMED ANSWER STILL MUST NOT FALL THROUGH. The old `case` on the helper's rc
+  # was the only thing enforcing that, so the enum is written out explicitly rather than
+  # implied by a helper nobody reading this arm can see; anything not named refuses.
+  E_OUT=""; E_RC=0
+  E_OUT="$(check_surface_scan "$to")" || E_RC=$?
+  case "$E_RC:${E_OUT%%$'\n'*}" in
+    0:green|0:in_flight|0:empty) : ;;   # read, answered, and no red group
+    0:red)
+       echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
+       echo "   red group(s): $(printf '%s\n' "$E_OUT" | command sed -n '2,$p' | command tr '\n' ' ')" >&2
        return 1 ;;
-    *) echo "   delta: the target head's check surface returned status '$thr', which is neither a measured green nor a known red — a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
+    *)
+       echo "   delta: the target head's check surface could not be READ (rc $E_RC, answer '${E_OUT%%$'\n'*}'): neither a measured green nor a known red — and a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
        return 1 ;;
   esac
+  # The read succeeded and is not red: keep it so the record write reuses this scan
+  # instead of paying for a second identical read of the SAME head (it is the same
+  # `$SHA`, because (3) already required the range's upper bound to BE the live head).
+  SURFACE_SCANNED_HEAD="$to"; SURFACE_SCANNED_OUT="$E_OUT"
   # (5) THE CHECKOUT. Fail closed: an unreadable range is not evidence.
   if ! root="$(delta_git_root)"; then
     echo "   delta: cannot read the range from a checkout of ${REPO:-<no repo>} (run inside the PR's worktree, or set DELTA_GIT_DIR). A range this box cannot read cannot be verified, and an unverified range is not evidence." >&2
@@ -1416,9 +1455,130 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     echo "   delta: the merge walk FAILED — a failed read is not evidence; retry rather than record." >&2
     return 1
   }
+  # ⛔ (7c) THE ORACLE ITSELF IS STEERABLE — a MERGE DRIVER makes `merge-tree` answer rc 0 over a
+  # content-dropping resolution, so the comparison below would call a hand-resolved merge CLEAN.
+  # Found in review, and REPRODUCED: with `.gitattributes` naming `c.txt merge=mydrv` and
+  # `git config merge.mydrv.driver true` in the checkout, `merge-tree --write-tree <lane> <base>`
+  # exits 0 and returns EXACTLY the merge commit's hand-resolved tree — the base's conflicting
+  # edit was dropped by the driver and nobody saw the decision. Every other arm then agrees:
+  # `--no-merges` is empty, `--merges` holds one, tree equality holds, `git diff` is non-empty. The
+  # range classifies merge-only, the cover requirement degrades to "a comment naming A", and a
+  # signed `clean` is minted over lines no reviewer read — class 9's false PASS, reachable with no
+  # more privilege than the replace/graft forgery (7b) already guards.
+  # ⛔ WHY IT IS NOT COVERED BY `delta_git`'s PIN: that pin disables the mechanisms that lie about
+  # HISTORY (`refs/replace/*`, the grafts file). A merge driver lies about MERGING, and
+  # `merge-tree` reads it from the checkout's own config — which the lane owns, since
+  # `DELTA_GIT_DIR` defaults to the lane's worktree. The attribute lives in a TREE (so it can
+  # arrive from the base side) while the driver definition lives in config (so it never appears in
+  # the diff, the record, or the digest). There is no `git` flag that makes merge-tree ignore
+  # drivers, so the honest direction is REFUSE: a checkout that declares one cannot prove a merge
+  # was clean, and this arm's whole value is that proof. Cost is one `git config` read, and only
+  # when the range actually holds a merge (with none, `merge-tree` is never consulted).
+  if [ -n "$merges_in_range" ]; then
+    # ⛔ CONFIG IS ONLY HALF OF IT (cycle-3 review, P1 — reproduced before widening). The BUILT-IN
+    # drivers have NO config key at all, so `merge=union` named from an attributes file steers the
+    # oracle just as a custom driver does. Measured: a conflict whose hand resolution is the ordinary
+    # "keep both" concatenation answers rc 1 with no attributes and rc 0 returning EXACTLY the hand
+    # tree once `c.txt merge=union` is present — with no `git config` write anywhere.
+    # Which attribute SOURCES may be trusted is the whole question, and the line is the REVIEWED
+    # ARTIFACT: a `.gitattributes` carried in the merge's own tree is part of what merges (and a
+    # tracked `merge=union` is a legitimate repo semantic — tortoise#5373), so it stays accepted. An
+    # UNTRACKED or MODIFIED `.gitattributes` in the worktree, and `.git/info/attributes`, are
+    # AMBIENT: nothing in the diff, the record, or the digest shows them, and a pristine checkout of
+    # the same commit reports the conflict. Those are what this arm refuses.
+    # ⛔ EVERY READ HERE IS rc-CHECKED, and `|| true` would have been the SAME defect this file
+    # already fixed once on the token scan: "no driver found" and "nothing could be read" must not
+    # be one value, because the second one is a LICENCE to trust a merge equality nobody verified.
+    # `git config --get-regexp` exits 1 for a legitimate no-match, so only rc >= 2 refuses.
+    _drivers=""; _dg_rc=0
+    _drivers="$(delta_git "$root" config --show-scope --get-regexp '^merge\..*\.driver$' 2>/dev/null)" || _dg_rc=$?
+    if [ "$_dg_rc" -gt 1 ]; then
+      echo "   delta: the merge-driver config could not be READ (git config rc $_dg_rc) — an unread configuration is not a checkout that declares no driver, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    _gitdir=""; _gd_rc=0
+    _gitdir="$(delta_git "$root" rev-parse --absolute-git-dir 2>/dev/null)" || _gd_rc=$?
+    if [ "$_gd_rc" -ne 0 ] || [ -z "$_gitdir" ]; then
+      echo "   delta: the checkout's git directory could not be resolved (git rev-parse rc $_gd_rc) — without it the AMBIENT attribute sources cannot be ruled out, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    # ⛔ `--git-common-dir`, NOT `--absolute-git-dir` (cycle-4 review, P1). In a LINKED WORKTREE —
+    # the fleet's default layout — the per-worktree gitdir is `<repo>/.git/worktrees/<n>` while
+    # `info/attributes` lives in the COMMON dir, so reading only the worktree gitdir missed it while
+    # `merge-tree` in that worktree honoured it. Both are checked; either one being non-empty refuses.
+    _commondir=""; _cd_rc=0
+    _commondir="$(delta_git "$root" rev-parse --git-common-dir 2>/dev/null)" || _cd_rc=$?
+    if [ "$_cd_rc" -ne 0 ] || [ -z "$_commondir" ]; then
+      echo "   delta: the checkout's COMMON git directory could not be resolved (git rev-parse rc $_cd_rc) — without it the ambient attribute sources cannot be ruled out, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    case "$_commondir" in /*) : ;; *) _commondir="${root}/${_commondir}" ;; esac
+    _attr_amb=""
+    for _ad in "$_gitdir/info/attributes" "$_commondir/info/attributes"; do
+      [ -s "$_ad" ] && _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_ad}"
+    done
+    # ⛔ NO `--exclude-standard` (cycle-4 review, P1). Ignore rules do not govern ATTRIBUTES — git
+    # reads an ignored `.gitattributes` like any other — so excluding ignored paths from the scan
+    # meant one `printf 'merge=union'` plus one line in `.git/info/exclude` walked straight past it.
+    # ⛔ AND `-m` IS THE WRONG BASELINE (same review, P1): `ls-files -m` compares worktree to INDEX,
+    # so a STAGED `.gitattributes` (worktree == index, but different from every parent's tree) is
+    # invisible — and assume-unchanged hides a modified one from git entirely. Both are caught by
+    # flags, not by diffing: `ls-files -v` prints a lowercase letter for assume-unchanged (`h`) and
+    # skip-worktree (`S`), and `-o` (without --exclude-standard) lists every untracked path.
+    _wt_amb=""; _ls_rc=0
+    _wt_amb="$(delta_git "$root" ls-files -o -- '*.gitattributes' '.gitattributes' 2>/dev/null)" || _ls_rc=$?
+    if [ "$_ls_rc" -ne 0 ]; then
+      echo "   delta: the AMBIENT-ATTRIBUTES scan FAILED (git ls-files rc $_ls_rc) — a scan that did not run is not a checkout with no ambient attribute source, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    _st_amb=""; _st_rc=0
+    # ⛔ `[a-zS]`, NOT `[a-z]` (cycle-5 review, P1 — the comment above named skip-worktree while the
+    # predicate could never match it): `ls-files -v` prints `S` for skip-worktree and a LOWERCASE
+    # letter for assume-unchanged, and either one makes git refuse to compare the file at all.
+    _st_amb="$(delta_git "$root" ls-files -v -- '*.gitattributes' '.gitattributes' 2>/dev/null | command awk 'substr($0,1,1) ~ /[a-zS]/ { print substr($0,3) }')" || _st_rc=$?
+    if [ "$_st_rc" -ne 0 ]; then
+      echo "   delta: the assume-unchanged / skip-worktree scan FAILED (git ls-files -v rc $_st_rc) — a scan that did not run is not a checkout whose attributes are all real, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    _wt_amb="${_wt_amb}${_wt_amb:+$'\n'}${_st_amb}"
+    if [ -n "$_wt_amb" ]; then
+      _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_wt_amb}"
+    fi
+    if [ -n "$_drivers" ] || [ -n "$_attr_amb" ]; then
+      if [ -n "$_drivers" ]; then
+        echo "   delta: this box's git config DECLARES A MERGE DRIVER — 'merge-tree' would reproduce that driver's resolution, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified (scope and key are shown, because the key may live in GLOBAL or SYSTEM config rather than the checkout):" >&2
+        printf '%s\n' "$_drivers" | command sed -e 's/^/     /' >&2
+        echo "   Unset it in the scope shown above (git config --<scope> --unset <key>), then retry — 'recording from a pristine checkout' does NOT help, because a global or system key follows you there." >&2
+      fi
+      if [ -n "$_attr_amb" ]; then
+        echo "   delta: an AMBIENT ATTRIBUTES file steers this checkout's merge oracle — 'merge-tree' honours it, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified:" >&2
+        printf '%s\n' "$_attr_amb" | command sed -e 's/^/     /' >&2
+        echo "   These sources are not part of the reviewed artifact (nothing in the diff, the record or the digest shows them), while a gitattributes file COMMITTED in the merge's own tree is legitimate and stays accepted. Remove or commit the file, or run the record from a clean checkout of the same commit, then retry — a range whose merges cannot be judged is not evidence." >&2
+      fi
+      return 1
+    fi
+  fi
   evil=""
   while IFS= read -r m; do
     [ -n "$m" ] || continue
+    # ⛔ THE PROPERTY THAT MATTERS IS DRIFT, NOT INDEX STATUS (cycle-5 review, P0 — a REGRESSION
+    # from cycle 4, which dropped `-m` while adding `-o` and so lost the MODIFIED-TRACKED case the
+    # arm had been catching). `ls-files -o` sees untracked paths; `-m` compares worktree to INDEX,
+    # so a STAGED file is invisible to both, and assume-unchanged / skip-worktree hide a third
+    # shape. Enumerating index states is the spelling trap again. The one question is: does the
+    # `.gitattributes` the oracle will READ differ from the one in the MERGE'S OWN TREE? `git diff
+    # <merge> -- <pathspec>` answers exactly that for the worktree (staged and unstaged alike).
+    # The flag scan above still runs, because assume-unchanged/skip-worktree make git SKIP the file
+    # here — a state in which this read cannot prove equality, which is why it refuses.
+    _adrift=""; _adr_rc=0
+    _adrift="$(delta_git "$root" diff --name-only "$m" -- '*.gitattributes' '.gitattributes' 2>/dev/null)" || _adr_rc=$?
+    if [ "$_adr_rc" -ne 0 ]; then
+      echo "   delta: the ATTRIBUTES-DRIFT read FAILED for merge ${m:0:12}… (git diff rc $_adr_rc) — a read that did not run cannot prove the checkout's attributes match the commit's, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    if [ -n "$_adrift" ]; then
+      _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_adrift} (worktree copy differs from merge ${m:0:12}…)"
+    fi
     parents="$(delta_git "$root" rev-list --parents -n1 "$m" 2>/dev/null || true)"
     pcount="$(awk '{print NF-1}' <<< "$parents")"
     if [ "$pcount" != "2" ]; then
@@ -1450,7 +1610,7 @@ $m"
     # lane_dimension_carry's clause (D), which fixed exactly this and records why:
     # "rc IS CHECKED, AND THIS IS LOAD-BEARING … An earlier cut discarded the status".
     mrc=0
-    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)" || mrc=$?
+    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)" || mrc=$?
     # merge-tree prints the resulting tree on its FIRST line and extra lines for
     # conflicts. Take that line with a parameter expansion, NEVER `| head -1`: a
     # SIGPIPEd producer under `set -o pipefail` makes the substitution fail and
@@ -1469,6 +1629,14 @@ $m"
       fi
     fi
   done <<< "$merges_in_range"
+  # ⛔ THE DRIFT ARM'S ANSWER ARRIVES INSIDE THE LOOP, so the refusal is re-checked here, before any
+  # classification work can mint anything. `_attr_amb` is non-empty only for an AMBIENT source.
+  if [ -n "$_attr_amb" ]; then
+    echo "   delta: an AMBIENT ATTRIBUTES source steers this checkout's merge oracle — 'merge-tree' honours it, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified:" >&2
+    printf '%s\n' "$_attr_amb" | command sed -e 's/^/     /' >&2
+    echo "   These sources are not what the merge's own tree carries (nothing in the diff, the record or the digest shows them), while a gitattributes file COMMITTED and unmodified is legitimate and stays accepted. Restore or commit the file, or run the record from a clean checkout of the same commit, then retry — a range whose merges cannot be judged is not evidence." >&2
+    return 1
+  fi
   if [ -n "$authored" ] || [ -n "$evil" ]; then
     n_authored="$(printf '%s\n' "$authored" | grep -c . || true)"
     # THE ANCHOR: the newest commit a covering verdict must have POSTDATED.
@@ -1542,7 +1710,17 @@ $m"
   # CREATE one, because "nothing but merges happened" is not a review of anything.
   if [ "$DELTA_KIND" = "authored" ]; then
     if [ -z "$cover" ]; then
-      echo "   delta: the range ${from:0:12}…..${to:0:12}… contains authored content (${n_authored} commit(s)) and no covering verdict was named. A delta over authored content is only evidence if a reviewer's verdict covers it:" >&2
+      # ⛔ THE SENTENCE MUST NAME THE CAUSE THE CLASSIFIER MEASURED. `n_authored` counts
+      # `rev-list --no-merges`, so an EVIL-MERGE-ONLY range has ZERO non-merge commits and
+      # the count form read "contains authored content (0 commit(s))" — a diagnostic that
+      # contradicts itself on exactly the bypass this arm exists to close (the conflict
+      # resolution lives in the MERGE commit, which `--no-merges` cannot see). The range is
+      # authored BECAUSE of the merge, so the merge is what the sentence must say.
+      if [ "$n_authored" -eq 0 ]; then
+        echo "   delta: the range ${from:0:12}…..${to:0:12}… holds authored content in a MERGE: no non-merge commit in it is lane-authored, but a merge is NOT a clean merge of its parents — a conflict resolution lives only in the merge commit and no reviewer has seen it — and no covering verdict was named. A delta over a conflict resolution is only evidence if a reviewer's verdict covers it:" >&2
+      else
+        echo "   delta: the range ${from:0:12}…..${to:0:12}… contains authored content (${n_authored} commit(s)) and no covering verdict was named. A delta over authored content is only evidence if a reviewer's verdict covers it:" >&2
+      fi
       [ -n "$evil" ] && echo "   → and one of its merges is not a clean merge of its parents: ${evil}." >&2
       echo "   → record-review.sh $PR $to clean ${REPO:-<owner/repo>} --evidence delta:$from..$to+comment:<review-comment-id>" >&2
       echo "   (or run a full review at ${to:0:12}… and name its artifact with plain --evidence comment:<id>)." >&2
@@ -1568,7 +1746,7 @@ $m"
     # A, or the HMAC marker), which needs the reviewer's template to carry the sha.
     :
     if [ -z "$cover" ]; then
-      echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit (nothing base-borne entered), but a merge-only delta still needs the VERDICT that covered ${from:0:12}… — a delta EXTENDS an attestation and can never create one. Naming a head is not evidence." >&2
+      echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit (every non-merge commit in it came in from the base side), but a merge-only delta still needs the VERDICT that covered ${from:0:12}… — a delta EXTENDS an attestation and can never create one. Naming a head is not evidence." >&2
       echo "   → name the verdict at ${from:0:12}… : --evidence delta:$from..$to+comment:<id> (a verdict at ${to:0:12}… works too: then it is a plain --evidence comment:<id>)." >&2
       return 1
     fi
@@ -1614,13 +1792,123 @@ $m"
     # of A (it reviewed more than this delta needs), never one that starts below it.
     body_claim=0
     stated_from=""; stated_to=""
+    # ⛔ THE SCANNED FORM IS `_claim`, NOT THE RAW BODY, AND BOTH ARMS READ IT (seventh review
+    # cycle, P2 — the fix below was applied to the authored arm only, so the merge-only arm's
+    # "names A" needle was still satisfied by a kill-table ROW naming A: a `## MUTATION
+    # ATTRIBUTION` table is mandatory in every fresh clean artifact (#3442) and its rows quote
+    # shas as a matter of course, so the arm's own premise — "the table cannot be the statement
+    # the record relies on" — was false for exactly the shape #3442 mandates. Hoisted here so
+    # there is ONE scanned form and no second reading of the body to keep in step.)
+    # ⛔ THE SCAN EXCLUDES THE #3442 KILL TABLE, AND NOTHING ELSE (sixth review cycle, P2):
+    # `## MUTATION ATTRIBUTION` is MANDATORY in every fresh clean artifact and its rows quote
+    # ranges and shas as a matter of course — a row describing a mutant "pinned to A1..B" was
+    # compared as if it were the reviewer's own claim, so a CORRECT artifact was refused
+    # because of its kill table. The claim lives in the prose; the kill table is not a claim
+    # about what was reviewed.
+    # ⛔ THE EXCLUSION IS THE BLOCK'S OWN **ROWS**, AND NOTHING ELSE — never a region. See the
+    # note above the awk below for the two measured false passes this cost (the region after the
+    # block, then the line span through it) and for the shape contract it mirrors.
+    # ⛔ AND THE BODY ARRIVES `@tsv`-ESCAPED — GitHub delivers a comment as ONE record with
+    # literal `\n` sequences, so a line-oriented scan sees no line starts at all and the block
+    # was never stripped (MEASURED: the kill table's own row was compared as the claim and
+    # refused a correct artifact instead of being excluded). This is the identical defect
+    # #3442's own parser paid for and documents; un-escaping FIRST is what makes the strip
+    # work, and it is also what lets a range split across a line break be seen. `gsub(/\\n/,
+    # "\n")` is awk rather than sed because BSD and GNU sed disagree about `\n` in a
+    # replacement and this file runs on both.
+    # ⛔ THE EXCLUSION IS THE BLOCK'S OWN **ROWS**, AND NOTHING ELSE — NOT the region after it
+    # (sixth cycle), and NOT the line span from the heading to its last row (seventh cycle, P1 —
+    # MEASURED: the span dropped the block's PREAMBLE and any prose between its rows, so an
+    # artifact that restated the range it actually read inside the section — the exact shape a
+    # reviewer produces when the block is appended to a verdict — recorded rc 0 over commits the
+    # artifact said were not read. A span is a REGION in a shorter costume; the fix has to be a
+    # LINE predicate, so prose is scanned wherever it sits and only the table's rows go.)
+    # ⛔ AND THE HEADING IS RECOGNISED BY `brief-gate.sh`'s CONTRACT, NOT BY A SECOND ONE (seventh
+    # cycle, P2 — MEASURED: `### MUTATION ATTRIBUTION`, `## Mutation Attribution` and an indented
+    # heading are all ACCEPTED by the #3442 validator and all passed its arm here, but this matcher
+    # knew only the canonical spelling — so the block was not excluded, its rows were compared as
+    # the reviewer's claim, and a fully valid artifact was refused with a FALSE ACCUSATION. The
+    # authoritative shape is brief-gate's: any case, any `#` depth, indent <= 3, `mutation[ -]
+    # attribution`, and a heading at or above the section's depth closes it. ONE SHAPE DEFINITION:
+    # this is a mirror of that predicate, and the vector below (20h38) pins the mirror rather than
+    # trusting it. DECLARED RESIDUAL: fenced blocks are not tracked here. A fenced EXAMPLE table's
+    # rows are still excluded (they are rows) and a fenced narrowing is still SCANNED — neither
+    # direction is fail-open, so the fence machinery is not mirrored.
+    _claim="$(printf '%s\n' "$EVIDENCE_BODY" | command awk '
+      { rec = rec $0 "\n" }
+      END {
+        gsub(/\\n/, "\n", rec)
+        n = split(rec, L, "\n")
+        # A LINE-BY-LINE STATE MACHINE, mirroring brief-gate.sh s own `ins`/`depth`: open on a
+        # heading match, close on a heading at or above that depth (subsections stay inside), and
+        # drop ONLY table rows while inside — every heading is RE-TESTED, so a second block in the
+        # same artifact is excluded too (ninth review cycle, P2: locating ONE `h`/`end` pair left a
+        # second block s rows outside the exclusion, so a valid two-block artifact — the ordinary
+        # addendum shape — was refused for a row it is allowed to carry).
+        # ⛔ AND THE HEADING LINE IS NOT DROPPED WHOLE (ninth cycle, P1 — MEASURED: `## MUTATION
+        # ATTRIBUTION — I also only read A1..HEAD` recorded rc 0 over the WIDE range, because the
+        # entire heading line went into the bin and the range with it. Only the section NAME comes
+        # off; anything a reviewer writes on that line is prose and is scanned).
+        ins = 0; depth = 0; hdr = 0; intable = 0
+        for (i = 1; i <= n; i++) {
+          line = L[i]
+          if (match(line, /^[ \t]*#+/)) {
+            lead = index(line, "#") - 1
+            nh = RLENGTH - lead
+            if (lead <= 3) {
+              htxt = tolower(substr(line, RLENGTH + 1))
+              if (ins && nh <= depth) ins = 0
+              if (htxt ~ /^[ \t]*mutation[ -]attribution/) {
+                ins = 1; depth = nh; hdr = 0; intable = 0
+                rest = substr(line, RLENGTH + 1)          # after the heading hashes
+                if (match(tolower(rest), /^[ \t]*mutation[ -]attribution/))
+                  rest = substr(rest, RLENGTH + 1)        # the section NAME comes off, nothing else
+                if (rest !~ /^[ \t]*$/) print rest
+                continue
+              }
+            }
+          }
+          if (ins) {
+            if (rowcells(line) > 0) {
+              # the block OWN table: opened by its header (assertion+mutant+redden, as
+              # brief-gate decides it) and continued while the rows are CONTIGUOUS
+              if (intable) continue
+              t = tolower(line)
+              if (!hdr && t ~ /mutant/ && t ~ /assertion/ && t ~ /redden/) {
+                hdr = 1; intable = 1; continue
+              }
+            } else {
+              intable = 0        # a blank line or prose ENDS the table (and never re-opens it)
+            }
+          }
+          print line
+        }
+      }
+      function rowcells(s,   l2, k, m, p, c) {
+        # ⛔ MIRRORS brief-gate row RECOGNITION (#3442 review cycle 3, P2): blockquote
+        # markers, leading indent and a bullet all come off before the pipe test, because a table
+        # need not have outer pipes (`assertion | mutant | reddened | observed` is a GFM table) and
+        # a bulleted row is a row. Dropping only lines whose FIRST non-blank char is `|` left those
+        # spellings to be read as the reviewer claim — a false block on a valid artifact
+        # (tenth review cycle, P2).
+        l2 = s
+        while (sub(/^[ \t]*>[ \t]?/, "", l2)) ;
+        sub(/^[ \t]+/, "", l2)
+        sub(/^[-*+][ \t]+/, "", l2)
+        if (l2 !~ /\|/) return 0
+        k = split(l2, p, "|")
+        c = 0
+        for (m = 1; m <= k; m++) if (p[m] !~ /^[ \t]*$/) c++
+        return c
+      }
+    ' 2>/dev/null || true)"
     if [ "$DELTA_KIND" = "merge-only" ]; then
       # ⛔ A VERDICT AT A CANNOT NAME B — B did not exist when it was written. The
       # merge-only range's authored content is nil by construction (`--not $base_sha`
       # proved it) and `verify_review_evidence "$cover" "$anchor"` already ties the
       # artifact to A, so naming A IS the claim. Demanding B made the remedy printed
       # below unreachable for exactly the ordering this feature exists for.
-      case "$EVIDENCE_BODY" in
+      case "$_claim" in
         *"$from"*) body_claim=1 ;;
         *"${from:0:12}"*) body_claim=1 ;;
       esac
@@ -1631,42 +1919,297 @@ $m"
       fi
     fi
     if [ "$DELTA_KIND" != "merge-only" ]; then
-    stated_from=""; stated_to=""
-    if [[ "$EVIDENCE_BODY" =~ delta:([0-9a-f]{12,40})\.\.([0-9a-f]{12,40}) ]]; then
-      stated_from="${BASH_REMATCH[1]}"; stated_to="${BASH_REMATCH[2]}"
-    fi
-    if [ -n "$stated_to" ]; then
-      range_ok=0
-      case "$to" in
-        "$stated_to"*) range_ok=1 ;;
-      esac
-      if [ "$range_ok" = 1 ]; then
-        range_ok=0
-        stated_from_sha="$(delta_git "$root" rev-parse --verify "${stated_from}^{commit}" 2>/dev/null || true)"
-        if [ -n "$stated_from_sha" ]; then
-          sfr=0
-          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?
-          [ "$sfr" = 0 ] && range_ok=1
+    stated_from=""; stated_to=""; stated_sep=""
+    # ⛔ TWO-DOT **AND** THREE-DOT, because the arm below is an anti-fail-open check and
+    # a one-character difference in the ARTIFACT must not be able to route around it
+    # (review finding, PR #3401). Reading only `..` made a body that states a NARROWER
+    # range in the three-dot form fall through to the bare-needle fallback below —
+    # which accepts an artifact that names B alone — so an artifact DECLARING it
+    # covered `fa28418...3e011ea` was accepted for a wider recorded range, silently,
+    # while the identical body in the two-dot form was refused. Three dots is not a
+    # tolerated spelling invented here: it is this repo's own range notation in the
+    # `gh api compare/<base>...<head>` reads. Git's three-dot means
+    # `merge-base(A,B)..B`, so treating it as `A..B` is the CONSERVATIVE reading — it
+    # still requires `stated_from` to be an ancestor of the recorded A, and refuses
+    # otherwise. The separator is CAPTURED rather than normalised, so the refusal
+    # quotes the notation the artifact actually used instead of misquoting it back.
+    # ⛔ AND A RANGE THIS CODE CANNOT PARSE IS **REFUSED**, NOT FALLEN PAST (review of
+    # this merge, second cycle). Widening the separator was necessary but NOT sufficient:
+    # the regex was still anchored on an exact spelling, so a body writing `delta: AAA..BBB`
+    # — one space — did not match, `stated_to` stayed empty, and control reached the SAME
+    # bare-needle fallback, accepting a body that names B alone. The fail-open was in the
+    # FALL-THROUGH, not in the separator: any tolerance gap in the matcher re-opened it. So
+    # the token is now detected FIRST and independently of parsing: if the artifact MENTIONS
+    # a range at all, an unparseable one refuses. The bare-needle arm is left reachable ONLY
+    # by a body that names no range, which is the case it exists for.
+    # ⛔ AND BOTH LAYERS MUST AGREE ON THE SPELLING, NOT JUST ON THE SHAPE (third cycle —
+    # this is the same P1 a third time, and the reason is instructive). The first cut made
+    # detection independent of the REGEX but both still opened with the lower-case literal
+    # `delta:`, so `Delta:`, `DELTA:` and `delta :` disabled detection AND failed the parse
+    # together — the two layers missed the same class in concert, the elif was never
+    # reached, and the body fell to the bare needle. Independent guards are only independent
+    # if they disagree SOMEWHERE; sharing a literal is sharing a blind spot. Both now match
+    # case-insensitively with optional padding before the colon, so the token that arms the
+    # refusal and the token the parser reads cannot diverge. (`[Dd][Ee]…` rather than
+    # `shopt -s nocasematch`, which would silently change every other match in this file;
+    # bash 3.2 has no `${x,,}`.) Canonical spellings are therefore not refused for cosmetics,
+    # and everything else fails CLOSED.
+    _delta_tok=0
+    # ⛔ BOTH LAYERS ARE REGEX FOR A REASON: in a `case` GLOB, `[[:space:]]*` means "one space,
+    # then anything" (`*` is not a quantifier there), so the token would not match the bare
+    # `delta:` form the parser accepts — the two layers would diverge and the guard would go
+    # blind again. Using the SAME regex token prefix in both is what makes divergence
+    # impossible rather than merely unlikely.
+    # ⛔ THE SCANNED FORM IS `$_claim`, THE SAME ONE BOTH SCANS BELOW READ — NOT `$EVIDENCE_BODY`
+    # (found in review). The #3442 kill table is MANDATORY in every fresh clean artifact and its
+    # rows quote `delta:` as a matter of course (they exist to name the arm being re-pointed), so
+    # reading the RAW body made a table ROW arm this token while `_any` — which reads the excluded
+    # claim — stayed 0. The resulting branch accuses the artifact of a range "this code cannot
+    # parse" that it never stated, and points at a bare-head fallback that no longer exists. A row
+    # is not a claim, which is why every other reader in this block strips the table first.
+    if [[ "$_claim" =~ [Dd][Ee][Ll][Tt][Aa][[:space:]]*: ]]; then _delta_tok=1; fi
+    # ⛔ ARM ON THE RANGE SHAPE, AND CHECK EVERY OCCURRENCE (4th review cycle — two findings,
+    # both reproduced against this file).
+    # (a) Keying the guard on the WORD `delta` left every other honest spelling of "I read
+    #     only A1..HEAD" invisible to BOTH layers — `Reviewed only A1...HEAD`, `deltas:
+    #     A1..HEAD` — so they fell through to the bare needle TOGETHER. That is the
+    #     shared-blind-spot failure a third time, one level up: the guard must arm on the
+    #     SHAPE that carries the claim, not on a word that merely introduces it. MEASURED:
+    #     `Reviewed only <A1>...<HEAD>; no issues found.` recorded rc 0 with
+    #     delta_range=BASE..HEAD, marking the authored commit as reviewed.
+    # (b) `=~` is a LEFTMOST match, so parsing ONE range made the arm ORDER-DEPENDENT: a body
+    #     quoting the wide range first and the narrower one it actually read SECOND was
+    #     accepted on the first — even when the artifact said in words that the extension was
+    #     invalid — while the mirror order refused. Order-dependence is not containment, and
+    #     a reviewer quoting the brief's range before their own is ordinary prose. So EVERY
+    #     stated range is checked and ALL must pass.
+    # A body that states no range at all used to fall to the bare needle (a match on B's sha
+    # alone). THAT FALLBACK IS GONE FOR AN AUTHORED RANGE — see the refusal below.
+    # (`$_claim` — the body with the #3442 kill table excluded, computed above so the
+    # merge-only arm reads the same form — is what the two scans below consume.)
+    _scan="$_claim"; _any=0; _all_ok=1
+    # ⛔ THE FLOOR IS 4, NOT 12, AND IT IS THE SECOND HALF OF "ABBREVIATION-LENGTH-INDEPENDENT"
+    # (ninth review cycle, P1 — MEASURED: git resolves a 4-6 char unique prefix, and a body stating
+    # a narrowing as `A1:0:6..HEAD` was invisible to BOTH layers — this parser needed 12 chars on
+    # each side and the token rule needs 7 — so it recorded rc 0 over the WIDE range. 20h31 pinned
+    # 8 chars, which is exactly what made the gap look covered.) 12 stays the floor for a token that
+    # cannot be resolved at all: an unresolvable 12+ hex run is a sha this checkout does not have (a
+    # claim about a real commit, refused), while an unresolvable 4-11 run is a hex-LOOKING word
+    # (`0xdead..0xbeef` in a review of hex literals) and reading it as a range claim would be a
+    # false block. So: 4-6 hex beside dots AND unresolvable = PROSE; it is skipped, never silently
+    # accepted as a range. 7-11 unresolvable still REFUSES, because that is a sha-shaped claim
+    # (20h19 pins it, and it fails closed for exactly the reason that arm exists).
+    # DECLARED RESIDUAL, bounded by that: an AMBIGUOUS 4-6 char prefix does not resolve either, so it
+    # reads as prose. git itself refuses to name a commit by an ambiguous prefix, so no reader could
+    # verify such a claim either; the typed ranges that carry a real in-range commit are caught at 6
+    # (20h41), 8 (20h31) and 12+, and a 4-6 char REAL sha resolves here and is compared.
+    # ⛔ A TOKEN SKIPPED AS PROSE IS NOT A STATED RANGE (eleventh review cycle, P1 — MEASURED: the
+    # body "The literals 0xdead..0xbeef and f00d..babe are unrelated to this change." recorded rc 0
+    # with a `delta_range` inferred from DATES). `_any` used to be set BEFORE the 4-6-char skip
+    # below, so a prose token still marked the body as having STATED a range: `_all_ok` stayed 1, so
+    # the containment refusal could not fire, AND `_any` stayed 1, so the "a stated range is
+    # REQUIRED" refusal could not fire — the two arms cancelled and the body passed the very
+    # requirement the ninth cycle added, which is exactly what the skip's own comment promises it
+    # does not do ("it is skipped, never silently accepted as a range"). 20h41 could not see it:
+    # there a REAL range is stated beside the prose, so it takes the other branch.
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}) ]]; do
+      _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
+      _ss="${BASH_REMATCH[2]}"
+      _st="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
+      # Advance PAST this match so the next iteration cannot re-match a suffix of it.
+      _scan="${_scan#*"${BASH_REMATCH[0]}"}"
+      _ok=0
+      case "$to" in "$_st"*) _ok=1 ;; esac
+      _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
+      # ⛔ ONLY A TOKEN THAT SURVIVED THE SKIP COUNTS AS A STATED RANGE.
+      if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
+        continue
+      fi
+      _any=1
+      if [ "$_ok" = 1 ]; then
+        _ok=0
+        if [ -n "$_sfs" ]; then
+          _r=0
+          delta_git "$root" merge-base --is-ancestor "$_sfs" "$from" 2>/dev/null || _r=$?
+          [ "$_r" = 0 ] && _ok=1
         fi
       fi
-      [ "$range_ok" = 1 ] && body_claim=1
-      if [ "$range_ok" -ne 1 ]; then
-        echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}..${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts." >&2
-        return 1
+      if [ "$_ok" -ne 1 ]; then
+        stated_from="$_sf"; stated_sep="$_ss"; stated_to="$_st"
+        _all_ok=0
+        break
       fi
-    else
-      for _needle in "$to" "${to:0:12}"; do
-        case "$EVIDENCE_BODY" in *"$_needle"*) body_claim=1; break ;; esac
-      done
-    fi
-    fi
-    if [ "$body_claim" -ne 1 ]; then
-      echo "   delta: the covering artifact '$cover' does not NAME the range ${from:0:12}…..${to:0:12}… (it names neither the range nor ${to:0:12}…) — and a verdict that does not state which range it covered cannot be extended over authored commits by DATE alone, because a commit's date records when it was CREATED: an old-dated branch merged in after the review slips through an anchor built only from dates." >&2
-      echo "   → if the reviewer did cover this range, quote it in the artifact (e.g. delta:${from:0:12}..${to:0:12}); or run a fresh review at ${to:0:12}… and record it with plain --evidence comment:<id>." >&2
+    done
+    if [ "$_any" -eq 1 ] && [ "$_all_ok" -ne 1 ]; then
+      echo "   delta: the covering artifact '$cover' states a DIFFERENT range than the one being recorded — the body quotes delta:${stated_from:0:12}${stated_sep}${stated_to:0:12} but this record would assert ${from:0:12}…..${to:0:12}… — a verdict cannot be extended past the range it declared, and recording it as if it could would make delta_range a claim the artifact itself contradicts. (EVERY range the artifact states is checked, not just the first.)" >&2
       return 1
     fi
+    if [ "$_any" -eq 1 ]; then
+      body_claim=1
+    fi
+    # ⛔ NO BARE-NEEDLE FALLBACK FOR AN AUTHORED RANGE (fifth review cycle, P1 — and the reason
+    # it took five cycles is worth stating). Each previous fix widened the SPELLING the parser
+    # accepts: two dots, then three, then case-insensitive tokens, then `hex..hex` anywhere in
+    # the body. Each one closed the vector in front of it and left the next spelling open,
+    # because a guard that ENUMERATES spellings fails open on the first one nobody listed. The
+    # measured vector this time was an EN DASH: `Reviewed only A1–HEAD` matched neither the
+    # range regex nor the `delta:` token, so both layers stayed 0 and the body fell to the
+    # bare needle — which it satisfies by naming B — and the record asserted `delta_range=A..B`
+    # over a range the artifact had explicitly narrowed. The identical sentence with `..`
+    # refused. U+2026 (what macOS and Word substitute for `...`) and the word "through" were
+    # accepted identically.
+    #
+    # So the requirement is inverted: an AUTHORED range now REQUIRES a stated, parseable range.
+    # No alphabet can be silently missing from a requirement, and no abbreviation length can
+    # either — a body that states no range refuses, whatever else it contains. This costs
+    # NOTHING that the fallback provided, which is why it is a fix and not a trade: a verdict
+    # at the head that states no range is still recordable with plain `--evidence comment:<id>`
+    # — the same head binding, asserting exactly what the artifact says and no more. The
+    # fallback only ever bought a way to make the range claim the artifact never made.
+    # The MERGE-ONLY arm below is untouched: it has its own requirement (the cover must name
+    # the reviewed head A), which is a name, not a range, and is checked there.
+    if [ "$_any" -ne 1 ]; then
+      if [ "$_delta_tok" -eq 1 ]; then
+        echo "   delta: the covering artifact '$cover' MENTIONS a delta: range this code cannot parse — refusing rather than falling back to a bare-head match, because the fallback would accept an artifact that names ${to:0:12}… alone and the record would then assert a range the artifact never stated. Quote the range as <40-hex>..<40-hex> (or ...)." >&2
+      else
+        echo "   delta: the covering artifact '$cover' does not STATE the range ${from:0:12}…..${to:0:12}… — naming ${to:0:12}… alone is not a statement that the reviewer covered the authored commits, and a range inferred from the head's name is precisely the claim this record would assert with no evidence behind it. (A stated range is REQUIRED here; it is not inferred from the artifact's notation, length or wording.)" >&2
+      fi
+      # ⛔ THE REMEDY MUST BE ONE THAT EXISTS. The remedy this printed was "record it with
+      # plain --evidence comment:<id>" — which is NOT available in the ordering this whole
+      # feature exists for: `verify_review_evidence` requires the artifact to postdate the
+      # head, and a delta exists precisely when the verdict was written at A and B came
+      # later. Sixth review cycle, P2 — a refusal that names an impossible fix costs a full
+      # re-review while reading as a two-line workaround.
+      echo "   → the reviewer must state the range they read. Quote it as delta:${from:0:12}..${to:0:12} and re-record. A plain --evidence comment:<id> at ${to:0:12}… records the same head binding WITHOUT a range claim, but only if that verdict was written at or after ${to:0:12}… — when the verdict PREDATES the head (the ordering a delta exists for), a fresh review at ${to:0:12}… is owed." >&2
+      return 1
+    fi
+    body_claim=1
+    # ⛔ EVERY COMMIT THE CLAIM NAMES MUST BE THE HEAD OR AN ANCESTOR OF THE RANGE'S START.
+    # Sixth review cycle, P1 — and it is the FIFTH-cycle P1 one layer up, which is why the
+    # fix is structural rather than another widened pattern. Requiring a stated range does
+    # not stop a CONTRADICTING one, because the contradiction check only sees the spellings
+    # its regex tokenises (`hex[space]dots[space]hex`). This feature's own refusal messages
+    # teach reviewers to quote `delta:<A>..<B>` — so an artifact can carry an acceptably
+    # spelled decoy AND a narrower claim in any other notation (`A1–HEAD`, 8-char shas,
+    # `git diff a b`, `A1 through HEAD`), and the decoy satisfies every parsed check while
+    # the narrowing is invisible. MEASURED on the previous head: `delta:BASE..HEAD` followed
+    # by `Reviewed only A1–HEAD` recorded rc 0 with delta_range=BASE..HEAD.
+    # So the rule no longer asks what the notation IS; it asks what the artifact MEANS. Every
+    # 7-40 hex run in the claim that RESOLVES to a commit must be this range's head, an
+    # ancestor of its start (`from`), or on an UNRELATED lineage: those are the commits a
+    # reviewer covering A..B may name — the endpoints of the accepted range satisfy it by
+    # construction, and a commit LATER than A is refused as a narrowing in whatever notation it
+    # was written. Unresolvable runs are prose, not commits, and are ignored (a sha that is not
+    # in this repo cannot narrow this range). Alphabet-independent, and it does not need to know the
+    # word "through". Its length floor is 7 for a PROSE token (4-6 hex runs are ordinary words), and
+    # that is not a gap: a dots-adjacent 4-6 run is handled by the parser above at the SAME floor,
+    # which is where a typed abbreviation actually appears (ninth cycle, P1 — the two layers' floors
+    # used to be 12 and 7, leaving 4-6 invisible to both).
+    # ⛔ THE UNRELATED-LINEAGE HALF IS NOT SLACK, IT IS THE BOUND OF THE RULE (seventh review
+    # cycle, P2 — MEASURED: the sixth cycle refused a commit reachable from NEITHER endpoint, so
+    # an artifact quoting another PR's sha, or a base tip that is not in this branch's history,
+    # was refused for a commit that cannot narrow A..B at all — a false block whose only remedy
+    # is the full re-review this feature exists to avoid). Only a commit that is LATER than A
+    # can be a narrowing endpoint; anything else is a subject of prose.
+    # ⛔ DECLARED RESIDUAL, stated rather than half-closed: a commit INSIDE the range (B's
+    # ancestors after A, including a base-side commit a forward merge brought in) is STILL
+    # refused when the claim names it, even in an innocent reference like "the base advanced to
+    # <sha>". Telling a reference from a narrowing endpoint by what surrounds it means
+    # enumerating notations (a list of shas and `A1–HEAD` have the same shape), which is the
+    # spelling-enumeration failure this arm was written to end — six rounds of it are recorded
+    # above. The rule is therefore conservative in the FAIL-CLOSED direction, the refusal names
+    # the offending commit so the fix is one re-reading of the claim, and a false `clean` over
+    # commits nobody read is not the alternative on offer.
+    # ⛔ THE EXIT STATUS IS KEPT, NOT SWALLOWED WITH `|| true` (found in review). `grep` exits 1
+    # for "no match", which is a legitimate answer here — but a REAL failure of any pipeline member
+    # (rc >= 2: a broken `sort`, a missing `tr`) produced the SAME empty `_toks`, so the loop below
+    # simply did not execute and the arm silently did nothing. That is the vacuous-guard shape M21
+    # exists to catch, reached through the guard itself: "the claim names no commits" and "nothing
+    # scanned the claim" must not be one value. rc 1 stays a pass; rc >= 2 refuses.
+    _toks=""; _tok_rc=0
+    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
+    if [ "$_tok_rc" -gt 1 ]; then
+      echo "   delta: the commit-token scan FAILED (rc $_tok_rc) — a scan that did not run is not evidence that the claim names no commits, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    for _tok in $_toks; do
+      _tsha="$(delta_git "$root" rev-parse --verify "${_tok}^{commit}" 2>/dev/null || true)"
+      [ -n "$_tsha" ] || continue
+      [ "$_tsha" = "$to" ] && continue
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$_tsha" "$from" 2>/dev/null || _r=$?
+      [ "$_r" -eq 0 ] && continue
+      # Not A and not reviewed history. Only a LATER commit can narrow this range; a commit on
+      # an unrelated lineage (another PR's head, a base tip this branch does not carry) cannot,
+      # and refusing it would be a false block over prose.
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$from" "$_tsha" 2>/dev/null || _r=$?
+      [ "$_r" -eq 0 ] || continue
+      # ⛔ THE REFUSAL MUST NAME WHAT ACTUALLY HAPPENED (eleventh review cycle, P2 — MEASURED: an
+      # artifact that stated the CORRECT range and additionally LISTED the commits it read — the
+      # ordinary reviewer artifact, and what `skills/code-review/SKILL.md` asks a reviewer to return
+      # — was refused with "a NARROWER range … written in a notation this code does not parse", when
+      # the artifact narrowed nothing and the token was a plain sha. The RULE is unchanged and stays
+      # a declared residual above; only the DIAGNOSIS is now true.
+      # ⛔ AND THERE ARE THREE LOCATIONS, NOT TWO (twelfth review cycle, P2 — the eleventh cycle's
+      # comment here claimed a token not INSIDE the range "can only be a narrowing endpoint written
+      # in a notation the parser did not tokenise", and that is FALSE: MEASURED with a commit whose
+      # PARENT is the attested head, a token AFTER B reached this message and was told it had written
+      # an unparseable narrowing — a narrowing is below the range, a descendant of B is above it, and
+      # no notation is involved in either. The comment is the justification a later reader trusts, so
+      # a false one propagates. Three tests now, in this order: an ancestor of the attested head is
+      # INSIDE the range; a DESCENDANT of it is AFTER the head (a verdict naming one is not a verdict
+      # at B at all, since that commit did not exist at B); only what remains DESCENDS FROM THE
+      # RANGE'S START while being neither inside the range nor a descendant of its head — the only
+      # population in which a narrowing endpoint written in an unparsed notation could live, which is
+      # why branches 1 and 2 are the ones that can be stated as fact and branch 3 is not.
+      # ⛔ AND BRANCH 3 MAY NOT ASSERT THE NARROWING (thirteenth review cycle, P2 — MEASURED with a
+      # sibling-lineage commit: an artifact that merely REFERENCED another branch's commit, writing no
+      # range and no notation at all, was told it had written "a NARROWER range … in a notation this
+      # code does not parse". That population cannot be shown to be a narrowing, so branch 3 now uses
+      # branch 1's honest framing — the CONSERVATIVE READING, stated as such — instead of asserting a
+      # fact it does not have. This is the third time in three cycles that a refusal was correct while
+      # its sentence was not; the pattern is that a message may only state what its own tests measure.)
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$_tsha" "$to" 2>/dev/null || _r=$?
+      if [ "$_r" -eq 0 ]; then
+        echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit INSIDE the range ${from:0:12}…..${to:0:12}…, but neither its start nor the head being attested. A commit inside the range may not be named by SHA in a claim that also asserts the range: from the text alone this code cannot tell a reviewer LISTING what they read from a reviewer NARROWING to it, so it takes the conservative reading (the arm's declared residual, stated above it). Nothing was written." >&2
+        echo "   → refer to commits INSIDE the range by description (\"the merge commit\", \"the lane commit\") rather than by sha, and state the range once as delta:${from:0:12}..${to:0:12}." >&2
+        return 1
+      fi
+      _r=0
+      delta_git "$root" merge-base --is-ancestor "$to" "$_tsha" 2>/dev/null || _r=$?
+      if [ "$_r" -eq 0 ]; then
+        echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit AFTER ${to:0:12}…, the head being attested. ${to:0:12}… is an ancestor of it, so it did not exist when a verdict at ${to:0:12}… was written: an artifact that names it is a verdict against a LATER head (or a reference to work that has not been reviewed here), and a \`clean\` record at ${to:0:12}… would extend it to a commit nobody reviewed. Nothing was written." >&2
+        echo "   → record the verdict at the head it actually reviews, or drop the reference — quote the range as delta:${from:0:12}..${to:0:12} and name no commit later than ${to:0:12}…." >&2
+        return 1
+      fi
+      echo "   delta: the covering artifact '$cover' also names commit ${_tok}, which resolves to ${_tsha:0:12}… — a commit on neither the range ${from:0:12}…..${to:0:12}… nor ${to:0:12}…'s own lineage, although it descends from the range's start. From the text alone this code cannot tell a reference to a PARALLEL lineage (another branch's work, quoted for context) from a narrowing endpoint written in some notation the range parser above did not tokenise, and only the second is a witness against the record — so it takes the conservative reading (the arm's declared residual, stated above it). Nothing was written." >&2
+      echo "   → the claim must name ONE range, ${from:0:12}…..${to:0:12}…, and name no commit later than ${from:0:12}…; quote it as delta:${from:0:12}..${to:0:12}, and refer to commits INSIDE the range by description rather than by sha." >&2
+      return 1
+    done
+    # ⛔ AND A RANGE STATED RELATIVE TO THE TIP IS ALWAYS NARROWER THAN THE RANGE BEING
+    # RECORDED, so it can only ever be a narrowing claim — there is no innocent reading of
+    # `HEAD~3..HEAD` in an artifact offered as evidence that the reviewer covered A..B. It
+    # carries no hex token at all, which is why the rule above cannot see it (MEASURED: the
+    # decoy `delta:BASE..HEAD` followed by `I only actually reviewed HEAD~1..HEAD` recorded
+    # rc 0 before this arm).
+    # ⛔ DECLARED RESIDUAL, and it is stated rather than half-closed: an arbitrary SYMBOLIC
+    # ref (`main..HEAD`, `origin/main`) is NOT interpreted here. Resolving prose nouns would
+    # refuse honest artifacts — a review comment saying "rebased onto origin/main" would be a
+    # false block whenever main sits ahead of the range start — and a rule that guesses which
+    # nouns are claims is the spelling-enumeration failure in a new costume. The residual is
+    # bounded by the fact that such a ref must still be WRITTEN as a range by the artifact
+    # author, and it is named here so a later reader can tell it from an oversight.
+    case "$_claim" in
+      *HEAD~*|*HEAD^*|*head~*|*head^*|*"@~"*|*"@^*")
+        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (HEAD~N / HEAD^N / @~N) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
+        echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
+        return 1 ;;
+    esac
+    fi
   fi
-  DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_COVER="$cover"; DELTA_BASE="$base_sha"
+  DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_BASE="$base_sha"
   DELTA_EV_OK=1
   printf 'delta %s..%s on %s#%s, %s, %s authored commit(s), digest %s\n' \
     "${from:0:12}" "${to:0:12}" "$REPO" "$PR" "$DELTA_KIND" "$n_authored" "${DELTA_DIGEST:0:12}"
@@ -5044,7 +5587,7 @@ if [ -n "$REPO" ] && command -v gh >/dev/null 2>&1; then
         exit 3
         else
         echo "⛔ (#1575 clause E) refusing the carry onto ${CURRENT_HEAD:0:12}… — the TARGET HEAD'S CHECK SURFACE COULD NOT BE READ (UNREADABLE), so “not red” was never established." >&2
-        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted. An EMPTY surface (the API ANSWERED, and NOTHING OBSERVABLE is left after the exclusion — so `empty` can sit over an EXCLUDED red, which is why it is not a green answer) is deliberately not this state — check_surface_scan keeps the two apart, and an empty surface is never read as a green tree — but a REFUSED read is its own answer and nothing was established by it. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
+        echo "   A carry re-binds a SIGNED verdict to a new head, so it needs the head's health READ and not merely un-refuted. An EMPTY surface (the API ANSWERED, and NOTHING OBSERVABLE is left after the exclusion — so \`empty\` can sit over an EXCLUDED red, which is why it is not a green answer) is deliberately not this state — check_surface_scan keeps the two apart, and an empty surface is never read as a green tree — but a REFUSED read is its own answer and nothing was established by it. Re-read the head's checks once the budget window resets, or re-review at ${CURRENT_HEAD:0:12}… and re-record." >&2
         exit 3
         fi
       fi
@@ -5801,13 +6344,15 @@ if [ -n "$RECORD_SIG" ]; then
 else
   echo "⚠️ record-review: AI_REVIEW_GATE_KEY is not configured (env or ~/.pi/agent/.ai-review-gate-key), so the record FILE cannot be signed. #1224: the gate refuses an unauthenticated record file as evidence and falls back to the signed marker in the PR body/comment — write the record on a box with the key to make the record itself authoritative." >&2
 fi
-# ⛔ ALL fields are written, by ALL producers' rules: the #1224 signature covers the
-# record the #3440 surface fields are part of, and `SURFACE_FIELD` is the mint-time
-# check-surface observation the carry gate reads. `DELTA_FIELDS` is the #3299
-# range-attestation surface and sits with `evidence` for the same reason the
-# surface does. The format string carries one `%s` per field, so adding a field
-# means adding it in BOTH the format and the argument list — the surface sits
-# before `evidence` in both, so the two stay aligned.
+# ⛔ ALL THREE field families are written, by their producers' own rules: the #1224
+# signature covers the record the #3440 surface fields are part of, `SURFACE_FIELD` is
+# the mint-time check-surface observation the carry gate reads, and `DELTA_FIELDS` is the
+# #3299 range claim, keyed on `DELTA_EV_OK` (the FACT `delta_verify` records when it has
+# verified a range) rather than on a variable name a third feature could reuse.
+# The format string carries one `%s` per field, so adding a field means adding it in BOTH
+# the format and the argument list. The surface sits before `evidence` in both formats and
+# the delta block leads, so the three stay aligned — and the slot count is asserted, not
+# counted by eye (record-review.test.sh runs BOTH branches).
 if [ -n "$REPO" ]; then
   printf '{"pr":%d,"head_sha":"%s",%s%s%s%s%s%s%s%s%s"verdict":"%s","repo":"%s","reviewed_at":"%s"}\n' \
     "$PR" "$SHA" "$MB_FIELD" "$DIFF_FIELD" "$DELTA_FIELDS" "$MINT_FIELDS" "$CARRY_FIELDS" "$SURFACE_FIELD" "$EVIDENCE_FIELD" "$FINDINGS_FIELD" "$RECORD_SIG_FIELD" "$VERDICT" "$REPO" "$REVIEWED_AT" > "$TMP"
