@@ -2339,7 +2339,15 @@ _pin_next '^[[:space:]]*awaiting-review\)$' '^[[:space:]]*if \[ -n "\$head" \]; 
 # ⛔ AND THE DEAD SECOND ARM MUST STAY DELETED (review round 11, P3): the attempt scan always prints
 # "<digits> <digits>", so a `*[!0-9 ]*` case could never fire — an arm advertising a failure mode the code
 # cannot produce, with a message naming a count that never exists.
-grep -qE '^[[:space:]]*\*\[!0-9\\ \]\*\)' "$SUT" \
+# ⛔ THE PATTERN MUST ACTUALLY MATCH THE SPELLING IT NAMES (fresh-context review, P2, measured):
+# the previous pattern carried a `\\` before the space, i.e. an ERE-escaped BACKSLASH followed by a
+# literal space — so it demanded a `\` inside the bracket expression, which neither historically-real
+# spelling contains, and restoring the dead arm in EITHER spelling left this guard GREEN while its own
+# message asserted the branch was pinned. `[!0-9 *]` is one class: it rejects the digits, the space and
+# the `*` of the round-11 spelling, and the `]` that ends main's `[!0-9]` is not in the class, so ONE
+# pattern covers both real shapes. Verified: rc 0 on the round-11 mutant and on origin/main's spelling,
+# rc 1 on this tree.
+grep -qE '^[[:space:]]*\*\[!0-9 *\]\*\)' "$SUT" \
   && bad "review_attempts must not keep the unreachable '*[!0-9 ]*' arm — the scan above always prints two decimal fields, so that branch is dead code claiming a failure it cannot detect"
 
 PATH=$_oldpath
