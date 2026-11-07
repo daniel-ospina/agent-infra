@@ -3073,16 +3073,25 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     ⛔ SCOPE — what this list does and does not establish. It establishes that
     every shape below is still REFUSED by the new class. It does NOT establish
     that everything missing from the list is safe: a param carrying a SPACE,
-    comma, quote, `=`, `+`, `&` or a non-ASCII character is STILL dropped, and the
-    identical silent-drop → "absent from main's failure set" → permanent BLOCK
-    survives for all of them.
+    comma, SEMICOLON, quote, `=`, `+`, `&` or a non-ASCII character is STILL
+    dropped, and the identical silent-drop → "absent from main's failure set" →
+    permanent BLOCK survives for all of them.
 
     ⛔ WHICH DOOR DROPS WHICH — measured, because the obvious guess is wrong. SPACE
-    is the only one of these that the rate TABLE cannot carry (`_RATES_RE`'s
-    nodeid group is `\\S+`, so the row does not match at all). Comma, quote, `=`,
-    `+`, `&` and non-ASCII are all `\\S` — `_RATES_RE` matches those rows fine and
-    the drop is `is_failure_key` / `rest` ALONE. Do not tell a future fixer that
-    comma needs `_RATES_RE` widened; it does not.
+    is the only one of these whose ROW the rate READER (`_RATES_RE`) cannot match
+    (its nodeid group is `\\S+`, so the row does not match at all — the row is IN
+    the table, and `_RATES_RE` declines it; this is a reader-side refusal, not a
+    property of the table). Comma, semicolon, quote, `=`, `+`, `&` and non-ASCII
+    are all `\\S`: `_RATES_RE` matches those rows fine and the drop is
+    `is_failure_key` / `rest` ALONE. Do not tell a future fixer that comma needs
+    `_RATES_RE` widened; it does not.
+
+    ⛔ `;` IS A REAL ID, NOT JUNK (measured: `pytest.mark.parametrize("x", ["a;b"])`
+    emits `test_semi[a;b]`, and the loose door accepts it) — which is why it sits in
+    the RESIDUAL list above and NOT in the junk tuple below. An earlier draft of
+    this test filed it as "a shell metacharacter is not an id", i.e. it pinned a
+    live BLOCK as correct behaviour and would have left `;` out of any fix for the
+    residual.
 
     The module's own
     `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
@@ -3099,7 +3108,6 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
         "tests/test_a.py::test_x[a\tb]",      # a tab is the field separator, never an id
         "tests/test_a.py::",                  # empty tail
         "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
-        "tests/test_a.py::test_x[a;b]",       # a shell metacharacter is not an id
         "random-string",                      # not a nodeid at all
     ):
         assert not is_failure_key(junk), f"{junk!r} must NOT buy a rate row"
