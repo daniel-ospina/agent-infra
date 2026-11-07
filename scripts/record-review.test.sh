@@ -7971,14 +7971,35 @@ targets = sys.argv[2:]
 # a false PASS on the exact class this sweep claims to bound. Single-quoted content
 # is now dropped BY the machine (q == "'"), where the context is known, and
 # apostrophes inside "..." are kept literal.
-# ⛔ AND IT MUST MODEL BASH'S LEXER, NOT ITS OWN INTUITION (round 5, P2) — the
-# first cut treated ANY unquoted `#` as a comment and consumed NO unquoted
-# backslash, which gave a false CLEAN on `a#`echo X``, `"x"#`echo X`` and
-# `it\'s `echo X``, and a false RED on `\"a # ... `x`` (all four measured):
-#   * man bash, COMMENTS: "a WORD BEGINNING WITH #" — so `a#b`, `${x#a}` and a
-#     `#` after a CLOSING quote are mid-word and comment nothing.
-#   * man bash, QUOTING: a non-quoted backslash preserves the literal value of
-#     the next character — so `\'` is an apostrophe, not a quote opener.
+# ⛔ WHAT THIS MODELS, AND WHAT IT DOES NOT (round 5, P2) — stated because the earlier
+# wording claimed a bash lexer and this is not one. It is a SINGLE-LINE classifier:
+#   MODELLED       unquoted `\` escapes the next char, `'...'` is literal, `"..."` keeps
+#                  apostrophes literal, an even backslash run leaves a backtick live (parity
+#                  falls out of pair-consumption), `#` comments only at a WORD START, and
+#                  `$'...'`/`${...}`/`$(...)` do not exist for it.
+#   NOT MODELLED   a quoted string that SPANS LINES (a `#`-leading continuation line reads as
+#                  a comment), `$'...'` ANSI-C quoting, a `#` inside `${...}`, and heredoc
+#                  bodies. All four were MEASURED as false CLEANs on hand-built lines
+#                  (round 6), and NONE of them occurs in either target: every one of the 19
+#                  non-comment backtick-bearing lines in the two files (13 recorder, 6 suite)
+#                  is escaped `\`` or single-quoted, and the classifier agrees on all 19.
+# ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
+# Carrying quote state across lines is the only way to close the multi-line hole, and on the
+# REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
+# the awk program at record-review.sh:1680 ends a line inside a single-quoted string, and a
+# state machine that does not model `$(` re-opens a quote mid-program and flags the awk
+# comments at 1685-1734 as live backticks — 26 false REDs on the recorder. Modelling `$(`,
+# `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
+# project from this vector. So the scope is DECLARED here instead of over-claimed: this
+# sweep bounds the shipped defect (a `"..."` message that runs its own backticks) on every
+# line of both files, exactly, and it is a BELT — the artifact's own refusals (20h46b) are
+# the gate.
+# ⛔ WITHIN THAT SCOPE IT MUST MODEL THE RULES, NOT ITS OWN INTUITION (round 5, P2) — the
+# first cut treated ANY unquoted `#` as a comment and consumed NO unquoted backslash, which
+# gave a false CLEAN on `a#`echo X``, `"x"#`echo X`` and `it\'s `echo X``, and a false RED on
+# `\"a # ... `x`` (all four measured):
+#   * man bash, COMMENTS: "a WORD BEGINNING WITH #" — so `a#b` is mid-word and comments nothing.
+#   * man bash, QUOTING: a non-quoted backslash preserves the literal value of the next char.
 _WORDSTART=set(' \t;|&()<>')
 def scan(s):
     out=[]; q=None; i=0; last=None
