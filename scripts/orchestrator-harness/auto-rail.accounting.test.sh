@@ -1268,7 +1268,9 @@ _capdef=$(printf '%s\n' "$_capblock" | grep -F 'publish_review_state "$repo" "$p
 # ⛔ ONE STATEMENT, ANCHORED (review round 10, P3, measured): three independent substrings were satisfied after
 # the gating `&&` was replaced by `;`, which publishes "a reviewer is dispatched as soon as this repo has a
 # free slot" for a not-clean head that will never be dispatched again — the round-7 P2 this arm exists for.
-_CAPRE='^[[:space:]]*\[ "\$_kind" = green \] && \[ "\$_att" != at-head \] && \[ "\$_att" != rejected \] && publish_review_state "\$repo" "\$pr" awaiting-review$'
+# (The tail allows the `notice` basis: the corrected cap-deferral text needs a key of its own, or the old
+# marker — byte-identical to origin/main's — makes the correction a permanent no-op on every PR that has it.)
+_CAPRE='^[[:space:]]*\[ "\$_kind" = green \] && \[ "\$_att" != at-head \] && \[ "\$_att" != rejected \] && publish_review_state "\$repo" "\$pr" awaiting-review "" notice$'
 grep -qE "$_CAPRE" <<<"$_capdef" \
   || bad "the cap deferral's gating must stay ONE statement (… [ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ] && [ \"\$_att\" != rejected ] && publish_review_state … awaiting-review) — splitting it with ';' publishes 'awaiting review' for heads no dispatch will ever reach"
 grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]'  <<<"$_capdef" \
@@ -2349,6 +2351,45 @@ _pin_next '^[[:space:]]*awaiting-review\)$' '^[[:space:]]*if \[ -n "\$head" \]; 
 # rc 1 on this tree.
 grep -qE '^[[:space:]]*\*\[!0-9 *\]\*\)' "$SUT" \
   && bad "review_attempts must not keep the unreachable '*[!0-9 ]*' arm — the scan above always prints two decimal fields, so that branch is dead code claiming a failure it cannot detect"
+
+# ⛔ THE CORRECTED HEADLESS NOTICE NEEDS A KEY OF ITS OWN (review round 15, P2, measured): the headless tag was
+# byte-identical to the one `origin/main` posts, so on every PR that already carried the old promise the
+# presence check returned before posting and the corrected text was a PERMANENT no-op — on exactly the heads
+# it was written for, because the cap path is where the headless marker is posted and nothing newer ever
+# follows it there. The `notice` basis puts the correction in the key.
+: > "$COMMENTS"; : > "$POSTED"
+printf '%s\n' '<!-- auto-rail-review:awaiting-review -->' >> "$COMMENTS"   # the main-era marker, already on the PR
+publish_review_state acme/widget 42 awaiting-review "" notice
+[ "$(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS")" = 1 ] \
+  || bad "the corrected headless 'awaiting-review' must POST over a main-era marker (found $(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS") notice marker(s)) — with an unchanged key the presence check returns first and the corrected text can never reach the PRs that already carry the old promise"
+publish_review_state acme/widget 42 awaiting-review "" notice
+[ "$(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS")" = 1 ] \
+  || bad "the notice marker must still be idempotent (found $(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS") after a repeated publish, want 1) — a correction that re-posts every pass is the thrash the presence rule prevents"
+# …and the plain (no-basis) headless call keeps its own presence semantics, so nothing else is re-posted.
+_n0=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 awaiting-review
+[ "$(wc -l < "$COMMENTS")" = "$_n0" ] \
+  || bad "the plain headless 'awaiting-review' must stay presence-keyed (it added $(($(wc -l < "$COMMENTS") - _n0)) comment(s)) — the basis is for the corrected text, not a licence to re-post the old one"
+[ "$(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT")" = 2 ] \
+  || bad "BOTH headless call sites must pass the notice basis (found $(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT"), want 2: the cap deferral and the burst deferral) — one without it leaves that path's corrected text a permanent no-op on every PR that already carries the old marker"
+
+# ⛔ AND A LEDGER THAT CANNOT BE APPENDED TO IS NOT A FREE SLOT (review round 15, P2, measured): a regular file
+# that reads but refuses `>>` (root-owned 0644/0444 after a sudo run, a read-only mount) passed every existing
+# guard, `awk` succeeded, the count stayed 0 for ever and the append failure was only LOGGED — so one paid
+# review was bought on every pass past the bound (measured: 5 dispatches at one head in 5 passes, 0 lines).
+_ROL="$_rdir/readonly.attempts"
+printf '%s\n%s\n' "$(date +%s)" "$(date +%s)" > "$_ROL"
+if chmod 444 "$_ROL" 2>/dev/null && [ ! -w "$_ROL" ]; then
+  [ "$(review_attempts "$_ROL")" = "$REVIEW_MAX_ATTEMPTS" ] \
+    || bad "an UNWRITABLE ledger must FAIL CLOSED (got '$(review_attempts "$_ROL")', want the cap $REVIEW_MAX_ATTEMPTS) — its count can never grow, so reading 2 there buys a paid review on every pass for ever"
+  grep -qF 'REVIEW-LEDGER-UNWRITABLE' "$LOG" \
+    || bad "an unwritable ledger must SAY SO in the log (no REVIEW-LEDGER-UNWRITABLE line) — a silent cap is indistinguishable from the defect it replaces"
+  review_ledger_unreadable "$_ROL" \
+    || bad "review_ledger_unreadable must answer UNCOUNTABLE for an unwritable ledger — otherwise the CAP wording is skipped for exactly the record whose count can never be measured"
+else
+  echo "SKIP: cannot make a ledger unwritable as $(id -un) — the unwritable-ledger arms are INERT on this host"
+fi
+chmod 600 "$_ROL" 2>/dev/null; rm -f "$_ROL"
 
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"

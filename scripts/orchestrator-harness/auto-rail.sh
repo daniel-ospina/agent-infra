@@ -781,6 +781,17 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
   # corrupt`, `not-a-number`) was reported as **0 dispatches spent**: up to REVIEW_MAX_ATTEMPTS paid
   # reviews forgiven by a corrupted counter, with no diagnostic. The scan now ALSO reports whether every
   # non-empty line parsed, which is the fact the arm was written to test.
+  # ⛔ READABLE IS NOT COUNTABLE (review round 15, P2, measured): a regular file that opens for reading but
+  # refuses `>>` (root-owned 0644/0444 after a sudo run, a read-only mount) passed `-e`/`-L`/`-f`, `awk`
+  # succeeded, the count stayed 0 for ever, and the append failure was only LOGGED — so one paid review was
+  # bought on every pass past the bound (measured: 5 dispatches at one head in 5 passes, ledger lines=0).
+  # The named trigger for this doctrine is "a root-owned leftover after a sudo run"; this is that file's
+  # readable sibling, and it belongs in the same fail-closed branch.
+  if [ -e "$f" ] && [ ! -w "$f" ]; then
+    log_line "$f REVIEW-LEDGER-UNWRITABLE: the per-head attempt ledger exists and reads, but nothing can be appended to it (a read-only file, a root-owned leftover, a read-only mount) — treating this head as EXHAUSTED (fail-closed: a counter that cannot be incremented is not a free slot, and every pass would otherwise buy another paid review)"
+    printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"
+    return 0
+  fi
   if ! n=$(awk -v cut="$cut" '
       $0 ~ /^[[:space:]]*$/ { next }
       $1 !~ /^[0-9]+$/ { bad = 1; next }
@@ -827,6 +838,10 @@ review_ledger_unreadable() {  # $1 = attempt ledger; rc 0 = exists but its conte
   # so a readable ledger of garbage answered "readable" here while the count it produces is meaningless —
   # and the CAP wording (which exists so the published comment never asserts an unmeasured count) would then
   # be skipped for exactly the record whose count was never measured. One classifier, two consumers.
+  # ⛔ AND THE SAME QUESTION HERE (review round 15, P2): a readable-but-unappendable ledger cannot be
+  # COUNTED, so the CAP wording must apply to it — otherwise the published comment asserts a measurement
+  # taken from a counter that can never grow.
+  [ -e "$f" ] && [ ! -w "$f" ] && return 0
   bad=$(awk '
       $0 ~ /^[[:space:]]*$/ { next }
       $1 !~ /^[0-9]+$/ { bad = 1 }
@@ -1463,7 +1478,12 @@ PY
         # (#3333/#3308/#3231), and under sustained cap saturation \u2014 the NORMAL state, and the only state
         # in which this line runs \u2014 the pass never advances far enough to publish `review-found-issues`, so
         # the false claim could stand indefinitely. That is #3489's invisibility, inverted.
-        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review
+        # ⛔ AND THE CORRECTED TEXT NEEDS A KEY OF ITS OWN (review round 15, P2, measured): the headless tag
+        # was byte-identical to the one `origin/main` posts, so on every PR that already carried the old
+        # promise the presence check returned before posting and the corrected text was a PERMANENT no-op —
+        # on exactly the heads it was written for (the cap path, where nothing newer is ever posted). The
+        # `notice` basis puts the correction in the key, exactly as `record` does for `review-found-issues`.
+        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review "" notice
         continue
       fi
       # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
@@ -1590,7 +1610,7 @@ PY
         # ⛔ THE BURST BOUND, AND IT PUBLISHES WHILE IT WAITS: a PR queued behind this repo's own
         # reviews must still not look like a PR waiting on a lane.
         if review_should_defer "$_rdispatched"; then
-          publish_review_state "$repo" "$pr" awaiting-review
+          publish_review_state "$repo" "$pr" awaiting-review "" notice
           log_line "$repo #$pr AWAITING-REVIEW ($_att at $head) — $_rdispatched review(s) already dispatched for this repo this pass (cap $REVIEW_PER_PASS); this head is next in the queue"
           continue
         fi
