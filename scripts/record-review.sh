@@ -1511,7 +1511,7 @@ delta_git_neutral() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _tosha="" _tipchain="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2521,13 +2521,29 @@ $m"
     # while `HEAD@{yesterday}..HEAD` recorded a SIGNED `clean` — one narrowing, two spellings, opposite
     # verdicts. The term is now `@\{[^}]+\}`, which covers `{N}`, dated positions and `{upstream}`
     # alike; `@{upstream}` is not a residual any more because it RESOLVES to a commit like any other.
+    # ⛔ A BRACE GROUP CAN SIT ON A BARE `@` (eighteenth cycle, P1 — MEASURED at e4047ef3): the operand
+    # alternative was `HEAD|@|hex`, so the brace on `@{1}` had nothing to attach to and `@{1}..HEAD`,
+    # `@{yesterday}..HEAD` and `@{0}..HEAD` were INVISIBLE to this loop while the identical narrowing
+    # `HEAD@{1}..HEAD` was refused — one narrowing, two spellings, opposite verdicts, which is exactly
+    # the defect this cycle set out to close. `@{…}` is now an OPERAND and is normalised to `@` with
+    # the brace prepended to the chain, so the chain logic below sees `@{1}` exactly as it sees
+    # `HEAD@{1}`.
+    _tosha="$(delta_git "$root" rev-parse --verify "${to}^{commit}" 2>/dev/null || true)"
     _tipscan="$_claim"; _tiprel=0
-    while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})+) ]]; do
+    while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})*) ]]; do
       _tref="${BASH_REMATCH[2]}"; _top="${BASH_REMATCH[3]}"
+      # The operand carried the brace, so the brace IS the chain: keep it in `_top` and empty `_tref`,
+      # which makes `${_tref}${_top}` the exact revision expression (`@{1}`) for the resolution below.
+      case "$_tref" in
+        @\{*\}) _top="${_tref}"; _tref='' ;;
+      esac
       _tipscan="${_tipscan#*"${BASH_REMATCH[0]}"}"
       _tisref=1
+      # `_tref` is EMPTY for a bare-`@` brace group (the brace was moved into `_top` above) — that is
+      # the TIP's own reflog position, not a 4-6 char decimal prose run, so it must not fall into the
+      # skip below (which is what happened first: `@{1}..HEAD` read as prose and recorded a `clean`).
       case "$_tref" in
-        [Hh][Ee][Aa][Dd]|@) : ;;
+        [Hh][Ee][Aa][Dd]|@|'') : ;;
         *)
           # A 4-6 char run that is PURE DECIMAL is prose, exactly as the token scan above decides;
           # a 7+ run is sha-shaped and a 4-6 one with a hex letter is a real short sha.
@@ -2546,6 +2562,24 @@ $m"
       # the false-block class this file's own doctrine calls worse than the gap. `0+` states the rule
       # (a zero count is a zero count) instead of enumerating the spellings that happen to occur.
       [[ "$_top" =~ ^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue
+      # ⛔ NO SELECTOR, NOTHING TO CLASSIFY. The chain group is `*` because a brace group on a bare `@`
+      # IS the selector and arrives through the operand (normalised above); that also lets a bare
+      # reference match, and a bare `HEAD` — or a sha merely QUOTED in prose — names no narrowing at
+      # all. Only a chain can narrow, so an empty chain is prose by construction.
+      [ -n "$_top" ] || continue
+      # ⛔ AND A CHAIN THAT *RESOLVES* TO THE ATTESTED HEAD IS THE IDENTITY TOO (eighteenth cycle, P2 —
+      # MEASURED at e4047ef3): the sentence above claimed `@{upstream}` is not a residual "because it
+      # RESOLVES", but nothing resolved anything — `_tref` being `HEAD` refused immediately, so
+      # `HEAD@{now}` (git returns the TIP) was refused as "always NARROWER", a NEW false block of the
+      # class this file calls worse than the gap. Resolution is the authority, as it is everywhere else
+      # in this file: equal to the attested head ⇒ identity, otherwise a narrowing.
+      if [ -n "$_tosha" ]; then
+        _tipchain="$(delta_git "$root" rev-parse --verify "${_tref}${_top}^{commit}" 2>/dev/null || true)"
+        [ -n "$_tipchain" ] && [ "$_tipchain" = "$_tosha" ] && continue
+      fi
+      # A bare brace group that did NOT resolve to the attested head is a reflog position on the tip
+      # (or one that does not resolve at all) — either way it is not the identity, so it narrows.
+      [ -n "$_tref" ] || { _tiprel=1; break; }
       case "$_tref" in
         [Hh][Ee][Aa][Dd]|@) _tiprel=1; break ;;
       esac
@@ -2572,7 +2606,7 @@ $m"
     # Both are the same lesson as the arm above: a guard that enumerates spellings instead of stating
     # the grammar leaves a synonym outside it.
     _eranges="$_claim"
-    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((~0|\^0|\^\{[^}/]*\}|@\{0+\})*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@\{[^}]+\}|@)((~0+|\^0+|\^\{[^}/]*\}|@\{0+\})*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
       _elhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; _erhs="${BASH_REMATCH[5]}"
       _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
       case "${_elhs:0:4}" in
