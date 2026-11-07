@@ -576,8 +576,17 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
       # UNKEYED, with a diagnostic about the key, for a brief whose key is the documented third form.
       # The predicate below is that base test, carried into the only reader there is — separator, then
       # real text after it — so `keyless` and `keylessfoo` stay REFUSED, the direction that matters.
-      # H51c is the row. A whitespace-ONLY parity fixture is not buildable (the WIP awk above trims
-      # trailing `[ \t]+` before this function ever sees the value), which is why H51b owns that case.
+      # ⛔ IT IS DELIBERATELY STRICTER THAN THE BASE ON ONE EXOTIC CARRIER: main's `[^ \t]` treated a lone
+      # VT/FF as a "reason", this arm does not (measured `keyless  <VT>` → main 0, here 80). That is the
+      # fail-CLOSED direction — whitespace is not a reason — and it is recorded here so a later reader
+      # does not "restore parity" by widening it back.
+      # H51c is the ADMIT row. H51d is the parity row: a separator followed by WHITESPACE ONLY must still
+      # be refused — and its carrier has to be a byte the value reader's trailing trim KEEPS. That trim is
+      # `[ \t]+` (the WIP awk above), so a space/tab-only value collapses to bare `keyless` and asserts
+      # nothing new — which is exactly why the FIRST version of H51d was vacuous (cycle 12 finding 2).
+      # CR survives the trim and really does arrive here as whitespace-only, so H51d uses CR: with it, the
+      # plausible-simplification mutant `[[:space:]]*[![:space:]]*` → `[[:space:]]*` is KILLED
+      # (`keyless<CR>` 80 → 0) while the bare-`keyless` row alone cannot kill it (80 → 80, measured).
       keyless*)
         rest="${nval#keyless}"
         case "$rest" in [[:space:]]*[![:space:]]*) : ;; *) unkeyed=1 ;; esac ;;

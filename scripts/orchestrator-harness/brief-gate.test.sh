@@ -1050,12 +1050,20 @@ bash "$GATE" --check "$TMP/pw-keyless-bare.txt" lane 0 "$HW/work" >/dev/null 2>&
 # arm it introduced required a literal SPACE — so the move narrowed a spelling the base accepted. Measured
 # on byte-identical briefs: `origin/main` rc 0, the cycle-11 head rc 80 (UNKEYED, a diagnostic about the
 # key, for the documented third form). H51c is the row, and it discriminates on its own — it fails against
-# the cycle-11 head. No whitespace-ONLY parity row is asserted here because none is BUILDABLE: the WIP awk
-# trims trailing `[ \t]+` before the classifier sees the value, so such a fixture IS the bare-`keyless`
-# value H51b already covers (cycle 12 review, finding 2 — a row claiming otherwise would be vacuous).
+# the cycle-11 head.
+# ⛔ H51d IS THE PARITY ROW, AND ITS CARRIER MATTERS (cycle 13 review, P2): a separator followed by
+# WHITESPACE ONLY must still be refused, so the "reason" must contain a non-whitespace character. The
+# carrier has to be a byte the value reader's trailing trim KEEPS — that trim is `[ \t]+`
+# (brief-gate.sh:341), so a space/tab-only value collapses to bare `keyless` and re-asserts H51b (the first
+# version of this row did exactly that and was vacuous). CR survives the trim and arrives at the arm as
+# whitespace-only, so the mutant `[[:space:]]*[![:space:]]*` → `[[:space:]]*` is killed by THIS row
+# (`keyless<CR>` 80 → 0) while the bare-`keyless` row alone cannot kill it (80 → 80, measured).
 sed "s|^WIP:.*|WIP:       keyless$(printf '\t')— a diagnosis lane with no issue or PR key|" "$CANON" > "$TMP/pw-keyless-tab.txt"
 bash "$GATE" --check "$TMP/pw-keyless-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 0 ]; ck $? "(H51c) …and a TAB is a separator too — the base admitted this spelling (got $rc)"
+awk -v r="keyless$(printf '\r')" '{ if ($0 ~ /^WIP:/) printf "WIP:       %s\n", r; else print }' "$CANON" > "$TMP/pw-keyless-cr.txt"
+bash "$GATE" --check "$TMP/pw-keyless-cr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H51d) …while a separator + WHITESPACE ONLY is still refused (CR carrier: the trim keeps it) (got $rc)"
 MUT_PW4="$TMP/mutant-pw-nokeyless.sh"
 sed 's|^      keyless\*)$|      keyless-NEVER*)|' "$GATE" > "$MUT_PW4"
 diff -q "$GATE" "$MUT_PW4" >/dev/null 2>&1; rc=$?
