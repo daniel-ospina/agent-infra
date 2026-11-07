@@ -250,9 +250,9 @@ probe_shard() { # <root> — add a shard that reports the runner env it was hand
 }
 if stage_fixture "$ENVFIX" 0; then
   probe_shard "$ENVFIX"
-  # A whole-list slice (`1/1`) is a REAL slice this runner accepts, and it is the harshest input: the
-  # value reaches every shard unchanged today, so the probe reports it verbatim when the handover is
-  # restored. `SHARD_BOUND=0` rides along because it is the third member of the same env contract and
+  # A whole-list slice (`1/1`) is a REAL slice this runner accepts, and it is the harshest input: with
+  # the plain `bash "$1"` handover it reached every shard unchanged, so the probe reports it verbatim
+  # when that handover is restored (the mutant at the end of this arm does exactly that). `SHARD_BOUND=0` rides along because it is the third member of the same env contract and
   # `0` is legitimate runner config, so a set-but-meaningful value is what a shard would have inherited.
   # ⛔ AND `BASH_SHARDS_BUDGET_SECS=0` IS SET FOR THE SAME REASON (review of this arm, P3): with it
   # merely `unset` in the parent, the probe reports `<unset>` whether or not `shard_exec` clears it, so

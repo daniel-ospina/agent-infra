@@ -43,8 +43,9 @@
 #   arrive by a direct invocation — see the block at the `unset`.
 #   ⛔ WHAT THIS ARM DOES NOT PIN, stated so nobody reads it as more than it is: it sets its own
 #   slice, so it is independent of the `unset` above and CANNOT see the mitigation disappear. That
-#   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while the
-#   SLICED run (the CI shape) reds 9 arms. So the discrimination is the sliced lane's, and a box
+#   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while a run
+#   that DOES carry a slice reds 9 arms. So the discrimination belongs to a sliced invocation — which
+#   is what a DIRECT invocation can be, NOT what CI hands a shard — and a box
 #   that only ever runs unsliced cannot see it. Pinning the `unset` itself needs a hermetic-probe
 #   mutant — the pattern `tests/run-bash-shards-bound/run.sh` §0 already uses (it strips its own
 #   `unset` into a copy and requires the probe to then see the leaked value). That is not built
