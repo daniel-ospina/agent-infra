@@ -103,6 +103,22 @@ EOF
   printf '%s\n' "$body"
 }
 
+# fake_pool_saying <rc> <line> — a pool tool that prints ONE line VERBATIM (stderr) and exits rc.
+# The adapter splits the pool's rc-2 family from its rc-3 gate verdict by the pool's own CODE, so the
+# fixture has to reproduce the pool's real shapes byte for byte: `fake_pool` prefixes a human line
+# ("fake: mem_floor_mb=…"), which is not the same path.
+fake_pool_saying() {
+  local rc=$1 line=$2 body=$TMP/fake-pool-saying.sh
+  cat > "$body" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/calls.log"
+printf '%s\n' $(printf '%q' "$line") >&2
+exit $rc
+EOF
+  chmod +x "$body"
+  printf '%s\n' "$body"
+}
+
 # fake_pool_registered_dead — the pool's OTHER rc-2 arm, quoted from `scripts/ci_runner_pool.sh::add`:
 # `config.sh` wrote `.runner` (the registration EXISTS), then `start_listener` failed, so it prints
 # `registered=1 listener=dead … run: restart --name …` and returns 2. "Nothing was attempted" and
@@ -166,10 +182,27 @@ check "unsupported --fallback refused" 1 "$rc" "unsupported --fallback" "$out"
 out=$(CI_RUNNER_POOL_TOOL=$TMP/nope.sh bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "unreadable pool tool -> configuration error naming the path" 6 "$rc" "why=pool-tool-unreadable" "$out"
 
-# 5. the pool tool's rc=2 (cannot-measure / cannot-act) propagates as a REFUSAL
+# 5. ⛔ A BARE POOL rc=2 IS A BOX PROBLEM, NOT A CAPACITY ANSWER (fresh-context review, round 15, P1).
+# `ci_runner_pool.sh`'s EXIT block (:168-182) is explicit: rc 2 is "could-not-measure /
+# could-not-act — nothing changed", rc 3 is `add`'s GATE VERDICT (the memory floor / core-aware
+# ceiling). The adapter first mapped BOTH to 2, so a missing runner template reached the caller as a
+# capacity answer: recorded as `GUARD CONFLICT … a human must decide which number is wrong` over an
+# environment mistake, or as `provisioner-refused` — whose exit code is 0 — on a box whose disk arm
+# also declined, i.e. a box that can NEVER provision reported a clean pass.
 : > "$TMP/calls.log"
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool 2) bash "$SUT" --count 2 --fallback auto 2>&1); rc=$?
-check "pool cannot-measure (rc=2) propagates as a refusal" 2 "$rc" "guard-refused" "$out"
+check "a bare pool rc=2 (no .runner, no gate verdict) -> configuration error" 6 "$rc" "box-configuration" "$out"
+# …and each `cannot-act`/`cannot-measure` shape the pool actually emits is classified the same way,
+# quoted from `ci_runner_pool.sh::add` so a reworded pool cannot silently re-open the answer channel.
+for _pool_line in \
+  "cannot-act why=runner-template-absent path=/tpl/config.sh (one complete runner install to copy)" \
+  "cannot-act why=no-registration-token repo=o/r (set RUNNER_TOKEN, or authenticate gh)" \
+  "cannot-measure why=arch-unknown uname_m=mips — set RUNNER_LABELS to the pool marker" \
+  "cannot-measure why=label-unknown value=x — a runner without the marker matches no job" \
+  "cannot-act why=template-copy-failed from=/tpl to=/root/n (the instance dir could not be created)"; do
+  out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_saying 2 "$_pool_line") bash "$SUT" --count 2 --fallback auto 2>&1); rc=$?
+  check "pool box-config refusal is a FAILURE: ${_pool_line%% *}" 6 "$rc" "${_pool_line%% *} why=" "$out"
+done
 
 # 6. ⛔ THE POOL TOOL'S GATE VERDICTS ARE rc=3, NOT rc=2 (`REFUSED add … nothing added`: the memory
 # floor and the core-aware ceiling — the COMMON verdict on a box already at its limit). Mapping only
@@ -338,6 +371,17 @@ else
   ok "the rc-2 registration success path writes nothing to stderr"
 fi
 
+# 19b. ⛔ THE SAME rc-2 `.runner` ARM WITHOUT THE POOL'S `registered=1` WORD — a PEER wrote the
+# registration while this add ran (measured shape: a `cannot-measure` gate refusing on this pass after
+# another pass registered the same dir). Asserting `listener=dead` here would be a FABRICATED record
+# about someone else's live listener, so the honest reading is `added=0 skipped=1`. Covered here because
+# the rc-2 branch was restructured for the box-configuration split (review round 15) and this is the
+# only sub-arm that split can reach with `.runner` present.
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_racing 2) bash "$SUT" --count 9 --fallback auto 2>/dev/null); rc=$?
+check "rc 2 with a PEER's .runner is a skip, not a claim of `listener=dead`" 0 "$rc" \
+  "provisioned slot=9 name=gh-runner-x64-9 root=$RUNNER_ROOT added=0 skipped=1 already-registered-elsewhere" "$out"
+check "…and it does NOT assert a dead listener over a peer's live one" 0 "$(grep -c 'listener=dead' <<<"$out")"
+
 # 20. ⛔ rc 4 WITH NO `.runner` IS TWO FACTS, AND THE REMEDY DIFFERS. Both are refusals (exit 2), but a
 # path that PRE-EXISTED is a wedge a human must clear, while a path that APPEARED during the call is a
 # peer that won the race and may be registering it right now. Printing `rm -rf` for the race would tell
@@ -367,7 +411,9 @@ fi
 # 22. ⛔ THE REGISTRATION TARGET IS THE CALLER'S, NOT THE POOL TOOL'S DEFAULT (agent-infra#3469 review P2).
 # `ci_runner_pool.sh:261` resolves `POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"` and uses it for
 # BOTH the token scope (`:1659`) and the registration URL (`:1724`). The caller exports its own seam
-# (`RUNNER_AUTOSCALE_REPO`, `runner_autoscale.py:3969`); the JOIN is what translates it, because teaching the
+# (`RUNNER_AUTOSCALE_REPO`, cited by SYMBOL: `runner_autoscale.py`'s `main()` `--repo` default — a line
+# number here was wrong one commit after it was written, because this very change moved that line from
+# 3969 to 4002, in a repo whose own header says line numbers rot); the JOIN is what translates it, because teaching the
 # caller the pool tool's private variable name is the second coupling this file exists to prevent. Without
 # the translation a repointed box registered into tortoise while the caller's repo-agnostic `_live()` counted
 # the runner — `verdict=converged`, exit 0, and zero capacity for the repo it was asked to converge.

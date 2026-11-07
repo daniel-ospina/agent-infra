@@ -74,20 +74,32 @@
 #                (its rc 2/3 gate refusals), where "nothing was attempted, and that is an answer"
 #                is true.
 #        other → `ActionFailed`, with this file's output as the reason.
-#      The pool tool reports its gate verdicts as rc 3 (`REFUSED add … nothing added`: the memory
-#      floor and the core-aware ceiling), rc 2 for `cannot-measure`/`cannot-act`, rc 4 for a taken
-#      name, rc 5 for a name that could not be registered. So BOTH 2 AND 3 are refusals to this
-#      file — mapping only 2 was the bug that recorded a correct memory-floor refusal from a box at
-#      its ceiling (the #3469 shape, the COMMON case) as a hard failure every pass. 5 stays a
-#      failure: a name that could not be registered is a thing the caller's repair path must see.
-#      ⛔ 2 IS NOT ONLY "nothing attempted". The pool returns 2 from `add` in TWO states, and one of
-#      them is a SUCCESS with a defect: after `config.sh` wrote `.runner` the registration EXISTS and
-#      only `start_listener` failed (`registered=1 listener=dead … run: restart --name …`,
-#      ci_runner_pool.sh). Mapping that to a refusal made this file print "nothing further attempted"
+#      ⛔ THE POOL'S OWN CODE DECIDES THE SPLIT — ITS PROSE IS NEVER INTERPRETED. `ci_runner_pool.sh`
+#      states it in its EXIT block (`:168-182`): **rc 2 = "could-not-measure / could-not-act — nothing
+#      changed"**, i.e. facts about THIS BOX (`cannot-act why=runner-template-absent`,
+#      `cannot-act why=no-registration-token`, `cannot-measure why=arch-unknown`/`why=label-unknown`,
+#      `cannot-act why=template-copy-failed`); **rc 3 = `add`'s GATE VERDICT** (the memory floor and the
+#      core-aware ceiling) — the only capacity answer in the family. So rc 2 without `.runner` is a
+#      BOX MISCONFIGURATION and exits 6, while rc 3 without `.runner` is the capacity answer and exits
+#      2. ⛔ MAPPING BOTH TO 2 — as this file first did — re-created, one layer down, the exact defect
+#      contract fact 4 above exists to close: the caller recorded the `GUARD CONFLICT … a human must
+#      decide which number is wrong (#9672)` capacity page over a MISSING RUNNER TEMPLATE, and on a box
+#      whose DISK arm also declined it recorded `provisioner-refused` and exited 0, so a box that can
+#      never provision reported a clean pass (fresh-context review round 15, P1; measured
+#      `cannot-act why=runner-template-absent` → adapter rc 2 → caller exit 0). It was also a
+#      regression in the loud direction: before this file existed the same box raised `ActionFailed`
+#      (`no provisioner`). Mapping ONLY rc 2 to a refusal was a different, earlier bug — it recorded a
+#      correct memory-floor refusal (rc 3, the #3469 shape and the COMMON case) as a hard failure every
+#      pass — and rc 3 is still a refusal here. 5 stays a failure: a name that could not be registered
+#      is a thing the caller's repair path must see.
+#      ⛔ 2 IS ALSO NOT ALWAYS "nothing attempted". The pool returns 2 from `add` in a second state,
+#      and that one is a SUCCESS with a defect: after `config.sh` wrote `.runner` the registration
+#      EXISTS and only `start_listener` failed (`registered=1 listener=dead … run: restart --name …`,
+#      ci_runner_pool.sh). Mapping that to a failure made this file print "nothing further attempted"
 #      and the caller record `nothing was added` about a registration that is in the pool. The
-#      discriminator is the caller's own occupancy predicate: rc 2 WITH `.runner` present → exit 0
-#      with `added=1 listener=dead` accounting (the pool's words already name the restart).
-#      rc 2 or 3 without it is a refusal, as below.
+#      discriminator is the caller's own occupancy predicate: rc 2 or 3 WITH `.runner` present → exit 0
+#      (`added=1 listener=dead`, or `added=0 skipped=1` when a peer wrote it), which is checked BEFORE
+#      the code split below.
 #      ⛔ 4 IS TWO DIFFERENT FACTS AND IS SPLIT, because one of them is not a failure at all:
 #        · rc 4 AND the slot now holds `.runner` → the box CONVERGED (a peer pass took the same
 #          index, or a registration already existed). The caller asked for a slot that is now
@@ -132,11 +144,13 @@ usage: install-ci-runner-x64.sh --count <N> --fallback auto [--dry-run]
   --dry-run        report what would be added, change nothing
 Root/base default to the caller's own (RUNNER_AUTOSCALE_RUNNER_ROOT or /opt; RUNNER_AUTOSCALE_BASE
 or <root>/gh-runner-x64) because that is where runner_autoscale.py looks for installs.
-exit 2 is a POOL GUARD REFUSAL (nothing attempted, and that is an answer) — see the header of
-scripts/ci_runner_pool.sh for the predicates that decline.
-exit 6 is THIS SCRIPT'S OWN configuration error (bad --count, unreadable pool tool, disagreeing
-root/base/repo seams). It is deliberately NOT 2: the caller records a 2 as a capacity answer and
-exits 0, so a misconfiguration would read as a clean pass.
+exit 2 is a POOL GUARD REFUSAL — `add`'s gate verdict (memory floor, core-aware ceiling): nothing
+was attempted, and that IS an answer, so the pass records `provisioner-refused` and exits 0.
+exit 6 is a FAILURE the caller must see: this script's own configuration errors (bad --count,
+unreadable pool tool, disagreeing root/base/repo seams) AND a pool rc 2 (`cannot-measure` /
+`cannot-act` — the pool could not measure or could not act on THIS box). It is deliberately NOT 2:
+the caller records a 2 as a capacity answer and exits 0, so a misconfiguration would read as a
+clean pass.
 EOF
   exit 1
 }
@@ -258,15 +272,18 @@ if [ -e "$DIR" ] || [ -L "$DIR" ]; then DIR_EXISTED_BEFORE=1; fi
 out=$(bash "$POOL_TOOL" "${args[@]}" 2>&1); rc=$?
 case "$rc" in
   0) ;;
-  2|3) # The pool tool declined and changed nothing: rc 2 = cannot-measure/cannot-act, rc 3 = its own
-       # gate verdict (memory floor, core-aware ceiling). Both are ANSWERS — propagate the refusal
-       # WITH its reading, so the caller's record carries `why=memory-floor value=…`, not a bare rc,
-       # and reports `provisioner-refused` instead of a failure on every 10-minute pass.
-       # ⛔ EXCEPT when `.runner` says the registration ALREADY HAPPENED: `add` returns 2 in that
-       # state too (`registered=1 listener=dead … run: restart --name …`), and calling it "nothing was
-       # attempted" is a false statement about a slot that is in the pool. The registration is the
-       # expensive half and it succeeded; the record must say `added=1` and name the dead listener so
-       # the caller's NEXT step repairs it, instead of a refusal it would sit on.
+  2|3) # The pool tool declined and changed nothing. ⛔ THE CODE, NOT THE PROSE, SAYS WHICH KIND:
+       # rc 3 is `add`'s gate verdict (memory floor, core-aware ceiling) — a capacity ANSWER, so it is
+       # propagated WITH its reading (the pool's own `REFUSED add … nothing added` line, which carries
+       # MemAvailable and the floor/ceiling it judged) and reported as `provisioner-refused` instead of
+       # a failure on every 10-minute pass. rc 2 is `cannot-measure`/`cannot-act` — facts about THIS
+       # BOX, not about capacity — and exits 6 so the caller sees a FAILURE; see contract fact 4.
+       # ⛔ `.runner` IS CHECKED FIRST, because rc 2 AND rc 3 can both mean the registration ALREADY
+       # HAPPENED: `add` returns 2 after `config.sh` wrote `.runner` and only `start_listener` failed
+       # (`registered=1 listener=dead … run: restart --name …`), and rc 3 can arrive with `.runner`
+       # written by a PEER. Calling either "nothing was attempted" is a false statement about a slot
+       # that is in the pool; the registration is the expensive half and it succeeded, so the record
+       # says `added=1` and names the dead listener for the caller's NEXT step to repair.
        if [ -e "$DIR/.runner" ]; then
          last=$(printf '%s' "$out" | tail -1 | cut -c1-90)
          # ⛔ `listener=dead` IS CLAIMED ONLY WHEN THE POOL SAID SO. Its rc-2 arm can also be reached
@@ -284,6 +301,18 @@ case "$rc" in
          exit 0
        fi
        printf '%s\n' "$out" | tail -3 >&2
+       if [ "$rc" -eq 2 ]; then
+         # ⛔ A BOX MISCONFIGURATION IS NOT A CAPACITY ANSWER, and the caller cannot tell the two
+         # apart: rc 2 becomes `ProvisionerRefused` (`runner_autoscale.py::provision`), which the pass
+         # records as `guard-conflict` when its own disk arm says one more fits (paging a human to
+         # audit capacity arithmetic) or as `provisioner-refused` otherwise — and THAT verdict returns
+         # **exit 0**. So exit 6, which the caller turns into `ActionFailed` → `problems`/`actions` →
+         # exit 3, with the pool's own words quoted. Nothing was attempted, and the box still needs a
+         # human — those are not in tension: "nothing attempted" alone is what made this look like an
+         # answer.
+         err "box-configuration by pool tool for slot $COUNT name=$NAME (nothing attempted): the pool could not measure or could not ACT on this box — this is not a capacity answer, so it is reported as a failure"
+         exit 6
+       fi
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing further attempted)"
        exit 2 ;;
   4) # The name is taken. WHICH fact that is decides whether this is success or a refusal — the
