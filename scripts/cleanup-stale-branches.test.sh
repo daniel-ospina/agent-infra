@@ -3768,10 +3768,12 @@ echo "== 46. F25: the commit-date family is bounded by the NORMALISED NUMERIC VA
 # numeric value (9), spelled with a different digit count. Bounding the RAW
 # STRING split that one root into two OPPOSITE failures:
 #   * `0000000009` (10 characters) PASSED the 15-character bound, and then
-#     `date -r 0000000009` FAILED on macOS (it parses the argument as a DATE, not
-#     as seconds, and there is no `date -d` fallback here). Under `set -e` that
-#     assignment aborted the whole remote sweep with a raw `date` usage message,
-#     rc=1, NO plan and NO delete. Under CLEANUP_BRANCH_LOG the pass runs
+#     `date -r 0000000009` FAILED on macOS: `-r` is parsed BASE-0 (a leading zero
+#     means OCTAL), so `strtoq` stops at the `9`, the `stat()` fallback then fails
+#     on a string that is not a path, and `date` exits on its usage path. Under
+#     `set -e` that assignment aborted the whole remote sweep with a raw `date`
+#     usage message, rc=1, NO plan and NO delete. Under CLEANUP_BRANCH_LOG the
+#     pass runs
 #     `set +e`, so the same value printed the branch with an EMPTY date instead.
 #   * `0000000000000009` (16 characters, numeric 9) was FALSELY refused as
 #     "outside bash's integer range" — a reason that was itself FALSE (the bound
@@ -3780,7 +3782,7 @@ echo "== 46. F25: the commit-date family is bounded by the NORMALISED NUMERIC VA
 #     diagnostic now names the digit bound (F27).
 # The shared helper now strips leading zeros BEFORE the bound, and the remote
 # `date` call re-reads the digits as base 10 (`$((10#$v))`), so a zero-padded
-# value can never reach `date` as a date string. This section pins the WHOLE
+# value can never reach `date` as a zero-padded epoch. This section pins the WHOLE
 # family: it calls the SHARED helper directly for the value classes, then drives
 # BOTH scopes end-to-end with REAL zero-padded commit objects. `git for-each-ref`
 # (the local scope's read) NORMALISES the value, so the LOCAL half pins
@@ -3836,7 +3838,7 @@ assert_contains "$OUT" "more than 15 digits" "F25: 10^15 is refused with the tru
 # ── ACCEPTED: zero-padded values, judged by NUMERIC VALUE ─────────
 # These are the assertions that go RED if the leading-zero strip is removed:
 # without it, every value longer than 15 raw characters is refused here, and
-# `0000000009` reaches `date` as a date string in the remote half below.
+# `0000000009` reaches `date` as a zero-padded epoch in the remote half below.
 f25_helper "0000000009"
 assert_eq "$RC" "0" "F25: 0000000009 (numeric 9) is ACCEPTED"
 f25_helper "0000000000000009"

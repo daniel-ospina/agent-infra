@@ -230,7 +230,38 @@ git fetch origin "+refs/heads/$BR:refs/remotes/origin/$BR" --quiet --quiet >> "$
     fi
   fi
   wt_provision "$REPO" ".worktrees/fix-$PR" "$BR" "origin/$BR"
-  if [ "$?" != 0 ]; then
+  _wt_rc=$?
+  if [ "$_wt_rc" = 4 ]; then
+    # ── THE PRE-START DISK REFUSAL (agent-infra#3395) ─────────────────────────────────────────
+    # Nothing was created and no agent ran, so the attempt is REFUNDED and the exit code is the disk
+    # gate's own (77): `adopt-fix.sh:93` reads 77 as the DISK gate and names WHICH of its three
+    # causes fired before it names any remedy (that arm no longer prescribes one remedy for all
+    # three), and folding it into a generic rc=1 (the old `exit 1` below) is the misattribution #2721
+    # fixed for the live arm. Measured cost of NOT distinguishing it: the operator is sent to wait for a
+    # load remedy that cannot arrive.
+    # ⛔ `chain-merge.sh` IS NOT A READER OF THIS CODE (review P2, #3409 — an earlier revision of this
+    # line named it, and that pointer does not exist). `chain-merge.sh` never references `fix-one.sh`
+    # (`grep -n fix-one chain-merge.sh` → empty); its own `77` at `:261` (`disk) _cap_rc=77 ;;`) is a
+    # PRODUCER that derives a disk code from a lane's capacity-refusal RECORD, and the only lane status
+    # it INTERPRETS is `merge-one.sh`'s `rc=75` (`:500-503`) — every other code it merely propagates
+    # (`:497-510`). Named here because a rationale that points at a guard which does not exist is the
+    # same wrong-cause class this seam exists to remove, one comment over.
+    echo "[fix $PR] REFUSED before creating a worktree: $WT_RESULT" >> "$L.log"
+    # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review cycle 4, P2 — MEASURED). BOTH
+    # pre-start arms reach rc 4 with `REFUSED-UNKNOWN`: an unreadable `df`, and a half-deployed `$O`
+    # missing `spawn-gate.sh` (the file's own arm G pins that skew). Telling the operator to "reclaim
+    # space" for a version skew or a broken probe is a remedy that CANNOT ARRIVE — the exact
+    # misattribution #2721 fixed for the live arm, re-introduced one step earlier.
+    case "$WT_RESULT" in
+      *REFUSED-UNKNOWN*)
+        echo "[fix $PR] REFUSED-UNKNOWN (nothing created, attempt refunded) — the free-space probe could NOT answer, so this is NOT a full disk: check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh AND that the copy it carries DEFINES \`disk_admit\` — a presence check passes on an older copy that still refuses here (a half-deployed or skewed box fails closed, #2033). Waiting will NOT clear it." >> "$L.log" ;;
+      *)
+        echo "[fix $PR] REFUSED-DISK (nothing created, attempt refunded) — reclaim space; this will NOT clear by waiting" >> "$L.log" ;;
+    esac
+    refund_gate_attempt
+    exit "${AGENT_DISK_REFUSED:-77}"
+  fi
+  if [ "$_wt_rc" != 0 ]; then
     echo "[fix $PR] ABORT: $WT_RESULT" >> "$L.log"
     # ⛔ REFUND HERE TOO (#3511). This arm exited without refunding while the branch refusal above
     # does. The rule is #1720's: a refusal that ran no fixer gives the attempt back — otherwise three
@@ -574,7 +605,7 @@ elif PL_ORPHAN="$(prlock_no_owner_abandoned)"; then
   # `adopt-fix.sh` maps that token (its `DEFERRED: the PR-owner lock` arm) to an operator line and exit 79;
   # they began `state/mergeclaim-$PR.lock held NO pid…`, which matches NO arm there — so `adopt-fix <PR>`
   # returned SUCCESS and wrote nothing into `adopt-$PR.log` for a run that pushed nothing, and an
-  # `… && next` chain took the wrong branch. `fix-one.sh:411-414` records that exact failure once already.
+  # `… && next` chain took the wrong branch. `fix-one.sh:442-445` records that exact failure once already.
   if prlock_takeover "$PL_ORPHAN"; then
     echo "[fix $PR] PR-owner lock: RECLAIMED an ORPHANED claim — state/mergeclaim-$PR.lock held NO pid (empty record) and was older than ${PRLOCK_NO_OWNER_GRACE_MIN}m, so no create window explains it; this lane took the claim over instead of refusing the PR" >> "$L.log"
   else
@@ -852,7 +883,7 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # skew) or the copy is corrupt, so the probe measured nothing. The capability arm below would have
     # this operator repair the box or dispatch the PR elsewhere — the extension set is fine and every
     # other box runs the same pair, so both remedies send them to an event that cannot arrive.
-    why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991) — this is a harness defect, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) and re-run. Nothing was consumed"
+    why="HARNESS/MISMATCH gate: this fixer's caller and the deployed cell-lane-preflight.sh do not agree (usage/version skew, or a corrupt copy), so no measurement was possible (#2991), OR the spawn gate could not resolve `capacity.sh` at all (its `nodeploy` arm, #2293 follow-up). Both are harness defects, not a property of the box and not a finding about this PR: do NOT dispatch the PR elsewhere, sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) and re-run. Nothing was consumed"
   elif [ "$ar" = "${AGENT_CAPABILITY_REFUSED:-71}" ]; then
     # ⛔ A FIFTH REMEDY, AND THE ONE THAT IS NEITHER "wait" NOR "reclaim" (review of #2991, P1): the
     # box could not complete one model call and RETURN (agent-infra#2935). It does NOT clear by waiting
@@ -869,6 +900,19 @@ if [ "$AGENT_STARTED" = "0" ]; then
     # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
     # operator a full filesystem was the cause when it was not.
     why="disk gate: either below DISK_MIN_FREE_MB, or no headroom for one lane's dependency tree (DISK-NOHEADROOM) — the '[disk-gate] REFUSED' line above names which, with both terms; reclaim space (cloud-cell-supervisor.sh prune --caches) — this will NOT clear by waiting"
+  elif [ "$ar" = "${AGENT_MEM_REFUSED:-81}" ]; then
+    # ⛔ THE MEMORY GATE'S OWN WORDING (agent-infra#2387), for the reason the disk branch exists: the
+    # remedies differ and the wrong name sends the operator to the wrong number. "load" would have
+    # them watch a 1-min average on a box whose load is fine while the OOM killer takes lanes; the
+    # memory floor clears when resident lanes FINISH, so the action is to let them (or to stop one
+    # deliberately), not to wait for a load reading. Tolerant reference like the disk one, so a
+    # caller run against an older $O/spawn-gate.sh (file-by-file seeding) degrades instead of
+    # aborting under `set -u` before the refund below.
+    # ⛔ NO DERIVATION CLAIM HERE (review P3). This line used to say "(one pi lane plus one pytest shard,
+    # measured)" — the derivation of the SHIPPED DEFAULT, not of whatever `MEM_MIN_AVAIL_MB` currently
+    # holds. An operator who set the floor directly read a false arithmetic in the one log they have;
+    # the gate's own `[mem-gate] REFUSED` line, three lines up, states which case applies.
+    why="memory gate: available memory is below MEM_MIN_AVAIL_MB — this clears when resident lanes finish, NOT by waiting for load (the [mem-gate] line in this log carries the reading, the floor and how the floor was derived)"
   else
     why="load gate: re-dispatched when 1-min load falls below MAX_LOAD"
   fi

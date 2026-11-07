@@ -944,13 +944,17 @@ count_race() {  # <name> <shim-body> [queue-content] -> sets CROUT / CRR / CRROW
   local d="$TMP/count-$1"
   rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
   # '$3' = queue content ('-' = an EMPTY queue, omitted = the 2-row default); '$4' = pool content ('-' = an
-  # EMPTY pool, omitted = `300 200`); '$5' = which binary to shim (default `mv`). Each is honoured — an
+  # EMPTY pool, omitted = `300 200`); '$5' = which binary to shim (default `mv`); '$6' = `.pool-sat` content
+  # (omitted = no window record, the normal case). Each is honoured — an
   # argument that were silently ignored would make a fixture assert the DEFAULT's behaviour while claiming
   # to set up a different state (measured: the identical-branch fixture ran on the default order and
   # reported INSTALLED, the very thing it exists to exclude).
   if [ "${4:-}" = "-" ]; then : > "$d/o/.pool"
   elif [ -n "${4:-}" ]; then printf '%s\n' "$4" > "$d/o/.pool"
   else printf '300\n200\n' > "$d/o/.pool"; fi
+  # ⛔ `$6` EXISTS BECAUSE A FIXTURE THAT CANNOT WRITE `.pool-sat` CANNOT GRADE THE TRUNCATION CLAUSE ON
+  # ANY ARM (12-y4). Every case below this line predates the clause and therefore leaves the file absent.
+  if [ -n "${6:-}" ]; then printf '%s\n' "$6" > "$d/o/.pool-sat"; fi
   if [ "${3:-}" = "-" ]; then : > "$d/o/candidates.txt"
   elif [ -n "${3:-}" ]; then printf '%s\n' "$3" > "$d/o/candidates.txt"
   else printf '200\n300\n' > "$d/o/candidates.txt"; fi
@@ -1091,6 +1095,55 @@ if [ "$CRR" -eq 0 ] && [ -z "$CRROWS" ] && grep -q 'the queue is EMPTY' <<<"$CRO
    && ! grep -q 'DERIVED AND INSTALLED' <<<"$CROUT"; then rc=0
 else rc=1; echo "      drained queue: rc=$CRR rows='$CRROWS' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 260)' (an EMPTY queue must still say EMPTY)"; fi
 ck "a GENUINELY empty queue still reports 'the queue is EMPTY' — the artefact grounding does not turn a real empty into unknown counts" $rc
+
+# ── 12-y4) THE TRUNCATION CLAUSE SURVIVES THE DEGRADED (`severity-uncounted`) ARMS ──────────────
+# `queue_order_from_pool` prints `windows=TRUNCATED(...)` from `$_sat_said` — the ONLY disclosure that a
+# clipped tier window has pushed a tier's NEWEST members into the unranked tail, behind every ranked row of
+# every LOWER tier. The `severity` arm carried it; the THREE `severity-uncounted` arms did not. Those are
+# the arms that most need it: they run AFTER the install, so a clipped tier's inversion is LIVE ON DISK in
+# exactly the state that cannot report its counts, leaving the operator nothing but this sentence.
+# ⛔ MEASURED, NOT ASSUMED (review cycle 38, P3): reverting all three suffixes from the shipped
+# `refresh-candidates.sh` left THIS suite at 106 passed, 0 failed AND `refresh-quota.test.sh` at 35 passed,
+# 0 failed. `rg '_sat_said'` outside that script returned nothing, and no other check greps the clause, so
+# the entire product half of that change was deletable green — the same "a disclosure whose producer is
+# untested can vanish quietly" class the change exists to close, left open one line over from the writer.
+# One case per arm, each with its OWN distinct phrase so the assertion names the guard that fired (#3481).
+_sc_name=( gone totals head )
+_sc_body=( 'rm -f "$QRO/.queue-rank" 2>/dev/null || true'
+           'printf "1 0 300\n" > "$QRO/.queue-rank"'
+           'printf "1 1 999999\n" > "$QRO/.queue-rank"' )
+_sc_phrase=( 'not the previous pass' 'does not add up to the queue' 'candidates.txt' )
+_sc_anchor=( "not the previous pass's)\\\$_sat_said"
+             '(this is NOT a drained queue)\$_sat_said'
+             'ranked ANY are UNKNOWN\$_sat_said' )
+_sc_repl=( "not the previous pass's)"
+           '(this is NOT a drained queue)'
+           'ranked ANY are UNKNOWN' )
+for _sc_i in 0 1 2; do
+  _scn="${_sc_name[$_sc_i]}"; _scb="${_sc_body[$_sc_i]}"; _scphrase="${_sc_phrase[$_sc_i]}"
+  count_race "satcount-$_scn" "$_scb" '' '' mv 'P1-severe'
+  if [ "$CRR" -eq 0 ] && [ "$CRSTATE" = "severity-uncounted" ] \
+     && grep -q "$_scphrase" <<<"$CROUT" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$CROUT"; then rc=0
+  else rc=1; echo "      satcount-$_scn: rc=$CRR STATE='${CRSTATE:-<none>}' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 300)' (want severity-uncounted + '$_scphrase' + windows=TRUNCATED(P1-severe))"
+  fi
+  ck "the \`severity-uncounted\` ($_scn) arm carries the TRUNCATED-TIER clause — a clipped window is disclosed on the degraded path too" $rc
+  # NON-VACUITY: strip `$_sat_said` from THIS arm only and the assertion above must redden, while the arm's
+  # own phrase SURVIVES — otherwise the mutation merely disabled the arm and graded nothing. The `cmp` guard
+  # catches a drifted anchor, because a sed that does not apply is a vacuity pass (#3481).
+  _scmut="$TMP/fns-satcount-$_scn.sh"
+  sed "s|${_sc_anchor[$_sc_i]}|${_sc_repl[$_sc_i]}|" "$FNS" > "$_scmut" 2>/dev/null
+  if cmp -s "$FNS" "$_scmut" 2>/dev/null; then rc=1; echo "      the $_scn \$_sat_said-strip mutation did not apply — the sed anchor drifted, so the vacuity check would pass by vacuity"
+  else
+    _fan="$FNS"
+    FNS="$_scmut"; count_race "satcount-$_scn-mut" "$_scb" '' '' mv 'P1-severe'; FNS="$_fan"
+    if [ "$CRSTATE" = "severity-uncounted" ] && grep -q "$_scphrase" <<<"$CROUT" \
+       && ! grep -q 'windows=TRUNCATED' <<<"$CROUT"; then rc=0
+    else rc=1; echo "      satcount-$_scn-mut: STATE='${CRSTATE:-<none>}' out '$(printf '%s' "$CROUT" | tr '\n' '|' | head -c 300)' (want the arm's phrase still present, the TRUNCATED clause GONE)"
+    fi
+  fi
+  ck "non-vacuity: stripping \`\$_sat_said\` from the ($_scn) arm reds the clause assertion while the arm itself still fires" $rc
+done
+unset _sc_name _sc_body _sc_phrase _sc_anchor _sc_repl _scn _scb _scphrase _scmut _fan _sc_i
 # 12-y2) THE SKIP ARM'S PROVENANCE MAPPING, one case per state (#2201 shape). Inlined in the arm, nothing
 #        pinned it: swapping the `severity` and `empty` clauses left the suite GREEN, so the durable record
 #        could assert "nothing was queued" about a queue this pass had just reordered. Driven directly, so

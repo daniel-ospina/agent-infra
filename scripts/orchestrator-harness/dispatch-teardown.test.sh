@@ -144,9 +144,20 @@ SH
 
 # drive <logfile> [WT_STUB_ALIVE] [WT_STUB_LANE_RC] [WT_STUB_CHAIN_RC] — run the SHIPPED dispatcher
 # for issue 2047 exactly as the controller does, with the fixture as the whole world.
+# ⛔ AND THE DISK ADMISSION IS NEUTRALISED WITH ALL FOUR TERMS, OR THIS FIXTURE IS DECIDED BY THE
+# HOST (#3409 review). `dispatch-merge.sh` provisions a real checkout through `wt_provision`, which
+# since #3395 calls `wt_disk_admit` BEFORE `git worktree add` — so every arm below inherits whatever
+# free space the machine running the suite has. MEASURED on a 68 GB host: 33 passed / 0 failed; the
+# same suite under a 1 GB `df` stub: 21 passed / 12 failed. That is a host-decided suite, and a box
+# under the 8,144 MB bound would red it for a reason no assertion here names. The four terms are the
+# seam's own: a floor of 1 MB, and the three lane-cost terms at 0, so `need` is 0 and admission can
+# never depend on this disk. (`DISK_LANE_TREE_MB` defaults to 350 and `DISK_LANE_SELF_MB` to 6,144
+# when unstated — a bare shell assignment would not reach the child either, which is why these are
+# an ENV PREFIX on the invocation rather than statements.)
 drive() {
     local log="$1" alive="${2:-1}" lane_rc="${3:-1}" chain_rc="${4:-0}"
     HOME="$HOMEFIX" TMPDIR="$T" O="$O" HARNESS_TOKEN= \
+        DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
         WT_STUB_ALIVE="$alive" WT_STUB_LANE_RC="$lane_rc" WT_STUB_CHAIN_RC="$chain_rc" \
         bash scripts/orchestrator-harness/dispatch-merge.sh "$REPO" "$OR" 2047 >"$log" 2>&1
     return $?
