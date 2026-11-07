@@ -1005,21 +1005,41 @@ still where the next cut should start.
     path on its own, and a cascade LEVEL holds the room while it drains. So "spawn gates are the only
     capacity limit" is true of *concurrency*, and false of *dispatch*.
   - **Level 5 is lowest priority, NOT "always reachable".** It gets what levels 1-4 left free, so on a
-    pass where a level holds, level 5 gets nothing — by design, that is what a priority means. The
-    precise claim that survives is the one the 2026-10-18 barrier made false and this change restores:
-    **an un-owned PR merely EXISTING no longer closes the issue path.** What does close it is a level
-    with work of its own above it.
-  - **⛔ EXCEPTION, MEASURED, AND AN OPEN OWNER DECISION — LEVEL 1 CAN HOLD WITHOUT AN ACTOR.** Level 1
-    (`FIX_MAIN`) is the one level whose *holding* is not backed by any dispatch in the controller: it
-    sets `CASCADE_ISSUE_SLOTS=0` and nothing in `orch-loop.sh` spawns, orders or nominates work for it
-    (see the review record on PR #3594). Its input is main's own check-runs, which include `push`-only
-    lanes (`ci-main.yml`) whose only repair route is the GitHub issue that `ci-main.yml`'s
-    `auto-file-on-failure` files — an issue the issue batch would dispatch, and the batch level 1
-    zeroes. On this repo main carries such reds often, so level 1 is not a corner case there. Two
-    candidate remedies — *level 1 dispatches the main repair* or *level 1's input is narrowed to what
-    the merge rail itself measures* — are a **behavioural policy choice and an owner decision**; this
-    change deliberately implements neither and `test-cascade.sh` pins the state so the choice is made
-    against evidence rather than by drift.
+    pass where a level holds, level 5 gets nothing — by design, that is what a priority means.
+    ⛔ **AND THE PRECISE CONSEQUENCE, WHICH AN EARLIER DRAFT OF THIS BULLET OVERSTATED** (corrected
+    2026-11-06 from a fresh-context review). The draft said *"an un-owned PR merely EXISTING no longer
+    closes the issue path"*, and that is **not true of this code**: levels 2-4 partition every un-owned
+    PR (GREEN -> `MERGE`, RED -> `FIX_PR`, everything else -> `REVIEW_PR`), so `n_m + n_f + n_r == n_u`
+    and **level 5 is reached only when there is NO un-owned PR at all**. What this change actually
+    removed is the barrier's *absolute* form — a bare `mp_reason` string assigned into `GATE_WHY`,
+    which closed the issue path while masking every capacity gate behind it. What it did NOT do is
+    make a level with work stop withholding the room, and `test-cascade.sh` now pins the pole (level 5
+    only at zero un-owned PRs) so this is read as measurement, not as a promise.
+  - **⛔ OPEN OWNER DECISION — A LEVEL HOLDS ON A COUNT, NOT ON ACTIONABILITY, AND LEVEL 1 HAS NO
+    ACTOR AT ALL.** `cascade_level`'s own header says "the first level with ACTIONABLE work wins", but
+    the classification is a check-state count (`state/prclass.tsv` carries check state only — no
+    mergeability, no review state), so a level holds whether or not a lane could spend the room. Two
+    measured consequences, both pinned in `test-cascade.sh`:
+    - A GREEN-but-unreviewed PR counts as `MERGE` work even though the rail will not merge it, so
+      "mergeable + review-satisfied" is narrower than what the classifier can see.
+    - Level 1 (`FIX_MAIN`) is weaker still: it zeroes the issue batch and nothing in `orch-loop.sh`
+      spawns, orders or nominates work for it, so a red main closes the issue path and does nothing
+      toward fixing main. Its own stated rationale ("main must be green before anything lands on it")
+      is not implemented either — `CASCADE_*` is consumed only by the issue batch, never by the merge
+      path.
+    Making the levels actionability-bounded is a **behavioural policy choice and an owner decision**;
+    this change implements neither form of it and pins the state instead, so the choice is made
+    against a fixture rather than by drift. It is deliberately NOT filed as a bug: the two candidate
+    remedies (bind the hold to a spawnable actor, or narrow level 1's input to what the merge rail
+    itself measures) are policies, not defects to be repaired unilaterally.
+  - **The main-red repair exemption now recognises the title the repo actually files** (fixed
+    2026-11-06). `land_backlog_exempt` recorded the policy — *"a `base-red` / `main-red` repair …
+    holding it would be exactly backwards"* — but its six title patterns matched none of them the only
+    main-red title this repo produces: `ci-main.yml`'s `auto-file-on-failure` writes
+    `main broken by merge: <failing jobs>`. The exemption had therefore never fired for a single
+    auto-filed repair. It now includes the filer's own prefix. This introduces no policy — it makes a
+    recorded decision fire — and `test-cascade.sh` pins both directions (the filer's title IS
+    recognised; an unrelated title is not).
   - **An unreadable PR listing still fails CLOSED** (no room granted) — the polarity that used to ride
     along inside the barrier is now enforced where the room is granted, because losing it would make a
     rate-limited `gh` listing the one condition that dispatches new work. ⛔ **It keys on the ROW FILE,

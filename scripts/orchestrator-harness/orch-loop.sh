@@ -6719,10 +6719,20 @@ PY
   cascade_main_probe "${OR:-}" >/dev/null 2>&1 || true
   # [cascade:begin] (extracted and DRIVEN by test-cascade.sh — keep the markers)
   MP_PRIORITY="$(mp_reason "${UPN_WORK:-${UPN:-0}}" "$LANES" "$WORKERS" "${SEL_TOTAL:-${OPEN_N:-0}}")"
-  CASCADE_BACKLOG="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
-  is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=0
+  # ⛔ THIS COUNTER MUST NOT CARRY THE `_BACKLOG` FAMILY SUFFIX, AND THE NAME IS LOAD-BEARING (bug,
+  # fixed 2026-11-06). `spawn-gate.test.sh` cross-checks that no two refusal gates claim the same exit
+  # code, and it identifies a gate `case` arm by the FAMILY SUFFIX of the variable it emits —
+  # `[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)`. A cascade backlog COUNTER whose
+  # name ended in that suffix therefore parsed as four gate-code declarations whose values are not
+  # codes in 70..89, and the suite went RED with `unparseable: orch-loop.sh:<the counter>` on a tree
+  # where no two gates actually collide (`shared:` was clean). The fix is the NAME, not the scanner: a
+  # count is not a refusal code, so it must not be spelled like one. ⛔ THE OLD NAME IS DELIBERATELY
+  # NOT WRITTEN HERE — a comment that spells it keeps the token in the file the scanner reads, and a
+  # future scanner that stops skipping comments would re-break the suite from a comment.
+  CASCADE_QUEUE_DEPTH="$(wc -l < "$O/candidates.txt" 2>/dev/null | tr -d ' ')"
+  is_num "${CASCADE_QUEUE_DEPTH:-}" || CASCADE_QUEUE_DEPTH=0
   CASCADE_CAN=0; can_spawn && CASCADE_CAN=1
-  CASCADE_ISSUE_SLOTS="$(cascade_issue_slots "${MAX_LANES:-}" "${LANES:-}" "$CASCADE_BACKLOG" "$CASCADE_CAN")"
+  CASCADE_ISSUE_SLOTS="$(cascade_issue_slots "${MAX_LANES:-}" "${LANES:-}" "$CASCADE_QUEUE_DEPTH" "$CASCADE_CAN")"
   is_num "${CASCADE_ISSUE_SLOTS:-}" || CASCADE_ISSUE_SLOTS=0
   # ⛔ POLARITY INHERITED FROM THE BARRIER, AND NOT DROPPED WITH IT. `merge-priority` used to carry
   # two independent things in one string: the ORDERING (PRs before issues — kept) and the BARRIER
@@ -6788,7 +6798,7 @@ PY
   # parsed by bash 3.2 in CI, and a continued `&& { … };` condition is the one shape this change kept
   # producing syntax errors in. Two booleans cost two lines and cannot be mis-parsed.
   CASCADE_WAITING=0
-  if [ "${CASCADE_BACKLOG:-0}" -gt 0 ] || [ -n "${MP_PRIORITY:-}" ]; then CASCADE_WAITING=1; fi
+  if [ "${CASCADE_QUEUE_DEPTH:-0}" -gt 0 ] || [ -n "${MP_PRIORITY:-}" ]; then CASCADE_WAITING=1; fi
   CASCADE_WAIT=0
   if [ "${CASCADE_ROOM:-0}" -le 0 ] && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_WAITING:-0}" = "1" ]; then
     CASCADE_WAIT=1
@@ -6812,7 +6822,7 @@ PY
   fi
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && [ "${CASCADE_PRW:-0}" = "1" ]; then CASCADE_PR_WAITING=1; fi
   # [cascade:end]
-  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
+  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_QUEUE_DEPTH:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
   # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
   # ⛔ ONLY THE FIRST GATE THAT FIRED WAS EVER VISIBLE. `GATE_WHY` is ONE string and the arms were an
   # `elif` chain, so the first arm that fired MASKED every arm behind it — and the arm that fires first
@@ -7420,11 +7430,11 @@ PY
       # or non-numeric backlog answers **0** there. A first version of this grant capped ONLY when the
       # value was numeric, so on those inputs it granted 2 where the allocator answers 0 — an escape
       # recorded over an unmeasured queue, the same false-PASS direction the backlog=0 arm closes. The
-      # real caller normalises `CASCADE_BACKLOG` to a number above, so this was a LATENT divergence, not
+      # real caller normalises `CASCADE_QUEUE_DEPTH` to a number above, so this was a LATENT divergence, not
       # a live one — closed anyway, because a grant that is correct only because its caller sanitised
       # its input is exactly the class this block keeps re-learning.
-      is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=0
-      [ "${_egrant:-0}" -le "${CASCADE_BACKLOG:-0}" ] || _egrant="${CASCADE_BACKLOG:-0}"
+      is_num "${CASCADE_QUEUE_DEPTH:-}" || CASCADE_QUEUE_DEPTH=0
+      [ "${_egrant:-0}" -le "${CASCADE_QUEUE_DEPTH:-0}" ] || _egrant="${CASCADE_QUEUE_DEPTH:-0}"
       CASCADE_ISSUE_SLOTS="$_egrant"
       # ⛔ NO BACKTICKS IN A DOUBLE-QUOTED `echo` (review round 5, P2): command substitution is LIVE
       # there, so a backticked function name is EXECUTED at log time and its output substituted. A
@@ -7432,7 +7442,7 @@ PY
       # "the room 0 would have granted" — a bogus number in the one line whose whole purpose is
       # auditability — while calling the allocator with no arguments on every escape. The suite could
       # not see it: its grep matched the prefix BEFORE the backtick.
-      [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room the allocator would have granted (room/2, backlog ${CASCADE_BACKLOG:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
+      [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room the allocator would have granted (room/2, backlog ${CASCADE_QUEUE_DEPTH:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
     fi
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
@@ -7452,7 +7462,7 @@ PY
       # rather than diagnosed: an UNREADABLE un-owned count, a REFUSED capacity probe (load/mem), an
       # EMPTY BACKLOG (the grant is ceilinged by it, and with 0 candidates no level is measured at all —
       # the cascade block runs only when slots > 0), or no room.
-      echo "[dispatch] DRAIN ESCAPE WITHHELD — no issue slot could be granted, so opening the issue path would dispatch nothing (issue slots=${CASCADE_ISSUE_SLOTS-0}, backlog=${CASCADE_BACKLOG:-?}, capacity=${CASCADE_CAN:-?} where 0 is a load/mem refusal, un-owned count ${CASCADE_UPN_UNREADABLE:-0}=1 means UNREADABLE). No escape is taken and no record is written; the withholding cause is whichever of those inputs refused." >> "$LOG"
+      echo "[dispatch] DRAIN ESCAPE WITHHELD — no issue slot could be granted, so opening the issue path would dispatch nothing (issue slots=${CASCADE_ISSUE_SLOTS-0}, backlog=${CASCADE_QUEUE_DEPTH:-?}, capacity=${CASCADE_CAN:-?} where 0 is a load/mem refusal, un-owned count ${CASCADE_UPN_UNREADABLE:-0}=1 means UNREADABLE). No escape is taken and no record is written; the withholding cause is whichever of those inputs refused." >> "$LOG"
     else
     printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
     if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then

@@ -27,9 +27,9 @@
 #  13  level 4 is a LOOP: a fix moves the head, and the next pass reviews again → (drives review_disp_decide)
 #  14  the escape VALVE: a level holding the room still QUEUES, and cannot record what it cannot spend
 #                                                                              → mutant: M19
-#  12b what LEVEL 1 does when it holds: it has NO ACTOR, its hold is unbounded while the PR path
-#      produces, and the issue that would repair main matches none of the shipped repair patterns
-#      (pinned as STATE — the action is an open OWNER DECISION, not decided here)
+#  12b what LEVEL 1 does when it holds: no actor keyed on its name or its variable, its hold is
+#      unbounded while the PR path produces, and the main-red exemption now RECOGNISES the title the
+#      repo's own filer produces (fixed) — the levels remaining COUNT-bounded is an OPEN OWNER DECISION
 #
 # ⛔ EVERY FUNCTION UNDER TEST IS EXTRACTED FROM THE SHIPPED SCRIPT, never re-implemented here: a
 # mirror would grade itself. Every mutation is applied to a COPY of the shipped file and the SAME
@@ -173,6 +173,11 @@ drive_cascade() { # <unowned> <lanes> <max_lanes> <backlog> <can> [<listing pres
   # `state/last-open-prs` when the read fails and writes it only on success, so ABSENT is the one datum
   # that says "nobody read this" — and the room guard keys on it. Default `present`, because every other
   # case here is about the arithmetic, not about a failed listing.
+  # ⛔ AND THAT DEFAULT IS ALSO WHAT KILLED A FALSE PASS IN THIS RIG (review P1, 2026-11-06): with NO
+  # listing written, `cascade_level` hit `[ -n "${list// /}" ] || return 0` and returned `?`, so no level
+  # could hold and the headline assertion "the cascade opens" graded an UNMEASURED level — while
+  # `drive_block`, which does supply a listing, asserted the OPPOSITE for the same inputs. Two
+  # contradictory assertions were green in one run.
   case "${6:-present}" in
     absent) : ;;
     *) printf '9001:shaA:fix/a 9002:shaB:fix/b\n' > "$d/state/last-open-prs" ;;
@@ -183,13 +188,27 @@ drive_cascade() { # <unowned> <lanes> <max_lanes> <backlog> <can> [<listing pres
     : > "$d/candidates.txt"
     _i=0; while [ "$_i" -lt "$4" ]; do printf '100%s\n' "$_i" >> "$d/candidates.txt"; _i=$((_i+1)); done
     . "$FNS"; . "$STUB"
+    # ⛔ THE LISTED PRs ARE UN-OWNED, WHICH IS WHAT `UPN_WORK` SAYS THEY ARE. `drive_block` stubs
+    # `pr_owned` for exactly this reason and this rig did not, so once the listing was supplied the
+    # SHIPPED `pr_owned` ran against a fabricated `9001:shaA:fix/a` and answered whatever a box with no
+    # such claim answers — which made the level unmeasurable for a SECOND reason and would have let a
+    # "the cascade opens" reading survive on the wrong evidence. Stubbed to `return 1` (not owned), so
+    # the fixture's only un-owned count is `UPN_WORK`.
+    pr_owned() { return 1; }
     # shellcheck source=/dev/null
     . "$TMP/cascade-block.sh"
     printf '%s %s %s\n' "$CASCADE_ISSUE_SLOTS" "$CASCADE_PR_WAITING" "$CASCADE_WAIT" ) 2>/dev/null
 }
-ck "un-owned PR work + FREE room -> the cascade opens (slots>0, pr_waiting=0)" "$(drive_cascade 5 2 25 10 1)" "10 0 0"
+# ⛔ THE HEADLINE ASSERTION WAS WRONG AND IS CORRECTED HERE RATHER THAN DEFENDED. With the listing
+# present (i.e. measured, as production is) a single un-owned PR resolves to a level and the level
+# HOLDS the room: `issue_slots=0`. The old `10 0 0` was the UNMEASURED path's answer, so it graded the
+# absent file, not the cascade. This is the honest behaviour: **level 5 is reached only when there is
+# NO un-owned PR at all** — see the pole assertion in §11 below, which pins that consequence so it
+# cannot be forgotten.
+ck "un-owned PR work + FREE room -> a LEVEL holds the room (issue_slots=0, pr_waiting=1)" \
+   "$(drive_cascade 5 2 25 10 1)" "0 1 0"
 ck "un-owned PR work + NO room    -> PR priority holds (slots=0, pr_waiting=1, waits)" "$(drive_cascade 5 25 25 10 1)" "0 1 1"
-ck "no un-owned PRs + free room  -> the cascade opens exactly as before" "$(drive_cascade 0 0 25 10 1)" "10 0 0"
+ck "NO un-owned PRs + free room  -> the issue batch gets the leftover room (level 5)" "$(drive_cascade 0 0 25 10 1)" "10 0 0"
 ck "no un-owned PRs + empty backlog -> nothing to wait for" "$(drive_cascade 0 0 25 0 1)" "0 0 0"
 # ⛔ POLARITY ON THE ROOM ITSELF. `merge-priority` used to carry a fail-closed arm (any unreadable
 # count closed the issue path). Removing the barrier must not remove the polarity, or the one listing
@@ -200,14 +219,20 @@ ck "an UNREADABLE un-owned count gives the issue path NO room (fails closed)" \
 ck "…and an OUT-OF-RANGE all-digit count does too (is_num passes it, \`[\` would error OPEN)" \
    "$(drive_cascade 99999999999999999999 2 25 10 1)" "0 1 0"
 ck "…while the SAME room with a readable count still opens (contrast half)" \
-   "$(drive_cascade 5 2 25 10 1)" "10 0 0"
+   "$(drive_cascade 0 2 25 10 1)" "10 0 0"
 # ⛔ THE PRODUCTION FAILURE PATH (review cycle 5, P1). When `gh` fails, `open_pr_count` ASSUMES A NUMBER
 # and `rm -f`s the row file — so the count is always numeric and a guard keyed on the count can never
 # fire. The ABSENT row file is the signal, and this is the assertion that would have caught it.
 ck "an ABSENT listing (a failed gh read that still yielded a number) grants NO room" \
    "$(drive_cascade 26 2 25 10 1 absent)" "0 1 0"
-ck "…and the contrast: the SAME count with the listing PRESENT still opens" \
-   "$(drive_cascade 26 2 25 10 1 present)" "10 0 0"
+# ⛔ THE CONTRAST HALF, CORRECTED (review P1, 2026-11-06 — "26 with the listing PRESENT still opens"
+# was grading the OWNERSHIP fallback, not the cascade). With the listing present the level IS measured,
+# and the two listed PRs resolve to level 4 (`REVIEW_PR`) because `state/prclass.tsv` is empty in this
+# fixture — so the level HOLDS the room and `issue_slots=0`. It holds for the same reason level 5 needs
+# ZERO un-owned PRs: levels 2-4 partition every un-owned PR. Claiming it "still opens" without a
+# `pr_owned` stub was the same unmeasured-level false PASS, one layer down.
+ck "…and the contrast: the listing PRESENT means the level is MEASURED, and it HOLDS the room" \
+   "$(drive_cascade 26 2 25 10 1 present)" "0 1 0"
 
 # ── 5. THE FUNNEL FOLLOWS (lo_select) ──────────────────────────────────────────────────────────
 echo
@@ -427,6 +452,25 @@ ck "a PR needing a FIX holds the room too (level 3)" \
 ck "a REVIEW-only PR holds the room too (level 4)" \
    "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	NOCHECKS
 ' -)" "0 1 0 4"
+# ⛔ THE POLE, AND ITS DECLARED LIMIT (review P1, 2026-11-06). Every un-owned PR is classified into
+# level 2 (GREEN), 3 (RED) or 4 (anything else), so `n_m + n_f + n_r == n_u` and the issue batch gets
+# room only when NO un-owned PR exists. That is the recorded ORDER doing its job — and it is also why
+# this change must not claim to have removed the 2026-10-18 barrier outright: what it removed is the
+# barrier's ABSOLUTE form (a bare `mp_reason` string closing `GATE_WHY`); a level with work still
+# withholds the room, by design.
+# ⛔ THE DECLARED LIMIT, DRIVEN RATHER THAN HIDDEN: a GREEN PR lands on level 2 (`MERGE`) whether or
+# not it is REVIEW-SATISFIED, because `state/prclass.tsv` carries check state only — it does not carry
+# review state or mergeability. So "mergeable + review-satisfied" (the level's documented meaning) is
+# narrower than what this classifier can measure, and a GREEN-but-unreviewed PR is counted as merge
+# work. Pinned HERE so the gap is stated in one place instead of being inferred from the code; making
+# the levels genuinely actionability-bounded is an OWNER DECISION (§6 of the contract doc), not a
+# thing to be smuggled in under a fixture.
+ck "…and a GREEN PR lands on level 2 whether or not it is review-satisfied (the class file carries no review state)" \
+   "$(drive_block 5 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' -)" "0 1 0 2"
+ck "…so level 5 is reachable ONLY at zero un-owned PRs (the pole, stated as a consequence)" \
+   "$(drive_block 1 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	NOCHECKS
+' - | cut -d' ' -f4)" "4"
 ck "levels 1-4 empty -> the issue batch gets the leftover room (10 slots, pr_waiting=0)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' 9001)" "10 0 0 5"
@@ -562,10 +606,14 @@ ck "a level-1 hold with the PR path PRODUCING never trips the drain escape (stre
 ck "…while the SAME hold on an INERT PR path DOES trip it at the bound (the contrast that keeps this meaningful)" \
    "$(l1_escape_over_passes 3 0 2)" "3 yes"
 
-# (b) NOTHING IN THE CONTROLLER ACTS ON LEVEL 1. Counting `FIX_MAIN` on non-comment lines turns the
-# absence of an actor into a checkable fact instead of a reviewer's impression — and it goes RED the
-# moment someone implements one, which is the point: the action is an owner decision, so it must
-# arrive with this assertion updated and the documented state corrected, never by drift.
+# ⛔ …AND THE PIN THE ABOVE IS *NOT* (review P2, 2026-11-06). Counting the display NAME cannot see an
+# actor written against the VARIABLE — `if [ "$CASCADE_MAIN_RED" = 1 ]; then spawn_main_repair; fi`
+# contains no `FIX_MAIN` and would leave the name pin green. So the real absence being claimed is
+# pinned too: `CASCADE_MAIN_RED` is CONSUMED exactly once, and that one site is the level walk that
+# decides 1-vs-the-rest. A second consumer is where an actor would appear. (This is still a tripwire
+# on the likely shapes, not a termination proof — but it is now a tripwire on BOTH of them.)
+ck "…and CASCADE_MAIN_RED is CONSUMED exactly once (a second consumer is where an actor would live)" \
+   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -c '\${CASCADE_MAIN_RED' | tr -d ' ')" "1"
 # ⛔ DECLARED LIMIT OF THIS PIN, so it is not read as a proof it does not give: it is NAME-based. It
 # fires when an actor is added KEYED ON THE LEVEL'S NAME (`FIX_MAIN`), which is how a level branch is
 # written in this file (`cascade_level_name` is the one map every other consumer uses) — it cannot
@@ -573,32 +621,47 @@ ck "…while the SAME hold on an INERT PR path DOES trip it at the bound (the co
 # termination proof. Counted as OCCURRENCES, not lines: an actor appended to the existing mapping line
 # is still an actor, and a line-count would have called that mutant indistinguishable (measured — M20
 # failed exactly that way on the first form of this probe).
-ck "level 1 has NO actor: FIX_MAIN occurs on non-comment lines exactly ONCE (the name map)" \
+ck "level 1 has NO ACTOR keyed on the level's NAME: FIX_MAIN occurs on non-comment lines exactly ONCE" \
    "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -o 'FIX_MAIN' | wc -l | tr -d ' ')" "1"
 ck "…and that one line is cascade_level_name's mapping, not a dispatch" \
    "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep 'FIX_MAIN' | sed 's/^[[:space:]]*//')" '1) echo FIX_MAIN ;;'
 
-# (c) THE REPAIR CHANNEL IS UNREACHABLE FROM THE ISSUE BATCH. Level 1's only shipped repair route is
-# the issue `ci-main.yml`'s `auto-file-on-failure` files — and that issue is recognised as a main-red
-# repair by NOTHING: its title is `main broken by merge: …`, which matches none of
-# `land_backlog_exempt`'s patterns. Driven against the SHIPPED pattern list (extracted below), so the
-# two cannot drift back into accidental agreement in either direction.
+# (c) THE REPAIR CHANNEL: the exemption must recognise the title the repo ACTUALLY files.
+# ⛔ THIS HALF WAS A REAL BUG AND IS FIXED, NOT PINNED AS INTENDED STATE (review P2, 2026-11-06).
+# `land_backlog_exempt`'s header records the POLICY — "a `base-red` / `main-red` repair … landing one is
+# the single highest-leverage way to REDUCE the backlog, and holding it would be exactly backwards" —
+# but its six title patterns (`base-red|main-red|base red|main is red|main goes red|red main`) match
+# NONE of them the title the repo's only main-red filer produces: `ci-main.yml`'s
+# `auto-file-on-failure` titles its issue `main broken by merge: <failing jobs>`. So the decided policy
+# had never fired for a single auto-filed repair. The pattern now includes the filer's own prefix —
+# which implements a decision already recorded, and introduces no policy — and what these assertions
+# pin is that the CHANNEL IS RECOGNISED, so a future edit that removes the arm goes RED instead of
+# quietly re-inerting the exemption.
 GATE="$HERE/spawn-gate.sh"
 CIW="$HERE/../../.github/workflows/ci-main.yml"
 ck "the issue ci-main.yml auto-files is TITLED 'main broken by merge…' (the fixture is the shipped template)" \
    "$(grep -c 'main broken by merge: \${failed.join' "$CIW" 2>/dev/null | tr -d ' ')" "1"
-repair_pat() { sed -n 's/^[[:space:]]*\(\*base-red\*.*\))[[:space:]]*$/\1/p' "$GATE" 2>/dev/null | head -1; }
-ck "the shipped main-red repair pattern list was FOUND in spawn-gate.sh (a rename must not skip this)" \
-   "$([ -n "$(repair_pat)" ] && echo found || echo missing)" "found"
-repair_match() { # <title> -> "matches" when the SHIPPED pattern list accepts it
-  local pat; pat="$(repair_pat)"
-  [ -n "$pat" ] || { echo NO-PATTERN; return 0; }
-  ( eval "case \"\$1\" in $pat) echo matches ;; *) echo no ;; esac" )
+repair_arms() { # every SHIPPED title arm, joined into ONE case-pattern list
+  sed -n '/case "\$title" in/,/^  esac/p' "$GATE" 2>/dev/null \
+    | grep -vE '^[[:space:]]*#' \
+    | sed -n 's/^[[:space:]]*\(.*\))[[:space:]]*$/\1/p' \
+    | awk 'NF' | tr '\n' '|' | sed 's/|[[:space:]]*$//'
 }
-ck "⛔ …and the auto-filed title matches NONE of them — level 1's repair route is unreachable" \
-   "$(repair_match 'main broken by merge: script-validate')" "no"
-ck "…while the pattern list still accepts the shape it was written for (the control half)" \
+ck "the shipped main-red repair arms were FOUND in spawn-gate.sh (a rename must not skip this)" \
+   "$([ -n "$(repair_arms)" ] && echo found || echo missing)" "found"
+repair_match() { # <title> -> "matches" when the SHIPPED arm list accepts it
+  local arms; arms="$(repair_arms)"
+  [ -n "$arms" ] || { echo NO-ARMS; return 0; }
+  ( eval "case \"\$1\" in $arms) echo matches ;; *) echo no ;; esac" )
+}
+ck "⛔ the auto-filed 'main broken by merge: …' IS recognised as a repair (the exemption is no longer inert)" \
+   "$(repair_match 'main broken by merge: script-validate')" "matches"
+ck "…and the bare variant the filer emits when it cannot name a job is recognised too" \
+   "$(repair_match 'main broken by merge')" "matches"
+ck "…the shapes it was originally written for still match (control half)" \
    "$(repair_match 'main-red: script-validate broken')" "matches"
+ck "…and an UNRELATED title is not exempted (control: the arms are not 'everything')" \
+   "$(repair_match 'feat(harness): something unrelated')" "no"
 
 # ── 13. LEVEL 4 IS A LOOP, NOT A SINGLE PASS ────────────────────────────────────────────────────
 # ⛔ "review once and drop it" is the defect. The shipped loop's terminator is the (PR, HEAD) key: a
@@ -1088,13 +1151,21 @@ mutfile "M20 an ACTOR is added for level 1 (a spawn keyed on FIX_MAIN) -> the 'n
 # (c) the repair pattern widened to accept the auto-filed title — the pin must catch that too, in the
 # OTHER direction from the control half above (widening makes the gap vanish and the pin go RED).
 cat > "$TMP/p-l1pattern.sh" <<'PEOF'
-pat="$(sed -n 's/^[[:space:]]*\(\*base-red\*.*\))[[:space:]]*$/\1/p' "$TGT" 2>/dev/null | head -1)"
-[ -n "$pat" ] || { echo no; exit 0; }
-r="$( ( eval "case \"main broken by merge: script-validate\" in $pat) echo matches ;; *) echo no ;; esac" ) )"
-[ "$r" = "no" ] && echo yes || echo no
+# yes when the SHIPPED arm list recognises the title the repo's own filer produces.
+arms="$(sed -n '/case "\$title" in/,/^  esac/p' "$TGT" 2>/dev/null \
+  | grep -vE '^[[:space:]]*#' \
+  | sed -n 's/^[[:space:]]*\(.*\))[[:space:]]*$/\1/p' \
+  | awk 'NF' | tr '\n' '|' | sed 's/|[[:space:]]*$//')"
+[ -n "$arms" ] || { echo no; exit 0; }
+r="$( ( eval "case \"main broken by merge: script-validate\" in $arms) echo matches ;; *) echo no ;; esac" ) )"
+[ "$r" = "matches" ] && echo yes || echo no
 PEOF
-mutfile "M21 the main-red pattern widens to accept 'main broken by merge' -> the unreachable-channel pin goes RED" \
-    "$HERE/spawn-gate.sh" 's/^    \*base-red\*|\*main-red\*/    *base-red*|*main-red*|*broken*/' "$TMP/p-l1pattern.sh"
+# ⛔ THE MUTANT RUNS IN THE FIX DIRECTION: it DELETES the filer's arm, which must make the assertion go
+# RED. (The first form of this mutant ADDED a pattern and graded the old "unreachable" pin — i.e. it
+# proved that FIXING the exemption tripped the suite, which is the pin-a-defect-as-intended-state shape
+# the review called out.)
+mutfile "M21 the filer's title arm is REMOVED from land_backlog_exempt -> the repair-channel pin goes RED" \
+    "$HERE/spawn-gate.sh" '/^    main\\ broken\\ by\\ merge\*)$/d' "$TMP/p-l1pattern.sh"
 
 # ── 10. THE OVERRIDE IS RECORDED, NOT SILENT ───────────────────────────────────────────────────
 echo
