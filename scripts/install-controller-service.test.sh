@@ -3681,19 +3681,63 @@ rm -f "$(farmed_sup "$PREFB")"    # no farm
 mkdir -p "$PREFB/side"
 cp "$INST" "$PREFB/side/install-controller-service.sh"
 cp "$SUP"  "$PREFB/side/cloud-cell-supervisor.sh"
-PREFB_RC=0
-PREFB_OUT="$(bnd env SYSTEMCTL="$PREFB/bin/systemctl" SYSTEMD_UNIT_DIR="$PREFB/units" \
+# ⛔ AND "NOTHING DURABLE" IS THE FIXTURE'S FACT, NOT THE BOX'S (re-review P2, MEASURED — introduced by the head
+# that made the harness pin a CANDIDATE). This arm builds its env by hand instead of going through `inst()`, so it
+# missed the pin seams `inst()` pins for exactly this reason: every cell exports `HARNESS_PIN_FILE` /
+# `HARNESS_PIN_DIR` to its children (`cloud-cell-supervisor.sh`, `launchd-controller.sh`), and with the pin in the
+# candidate list the BOX's own `<home>/harness/<sha>/scripts/cloud-cell-supervisor.sh` was admitted — measured on
+# this box: `passed=385 failed=17`, both assertions below red, naming `/home/cmux/harness/995f86989fbd/…` — while
+# staying green on CI, which has no such pin. That is the "green in CI, RED on the fleet" shape `inst()` records
+# two hundred lines above, one seam over. Both seams are therefore NAMED BY THE FIXTURE rather than merely
+# unset, so an ambient value cannot decide this verdict at all; the paired control below proves the seam is LIVE
+# in this env rather than merely quiet.
+prefb_install() { # <extra env-var words...> — the §P5 "nothing durable exists" env, pin seams owned by the fixture
+  bnd env SYSTEMCTL="$PREFB/bin/systemctl" SYSTEMD_UNIT_DIR="$PREFB/units" \
     CONTROLLER_SYSTEM_UNIT_DIR="$PREFB/units" CONTROLLER_USER_UNIT_DIR="$PREFB/nouser" CONTROLLER_ALLOW_ROOT=1 \
     TEMPLATES_DIR="$(dirname "$TPL")" HOME="$PREFB/home" CELL_HOME="$PREFB/home" \
     AGENT_INFRA_PATH="$PREFB/layer" ENV_FILE="$PREFB/home/keys.env" O="$PREFB/o" \
     PATH="$PREFB/bin:$PATH" ELDATO_PLATFORM=Linux \
-    ORCH_SUPERVISOR_PREFER="$SCRATCH_P/cloud-cell-supervisor.sh" bash "$PREFB/side/install-controller-service.sh" --install 2>&1)" || PREFB_RC=$?
+    HARNESS_PIN_FILE="$PREFB/home/.harness-path-fixture" HARNESS_PIN_DIR="$PREFB/home/harness-fixture" \
+    ORCH_SUPERVISOR_PREFER="$SCRATCH_P/cloud-cell-supervisor.sh" "$@" \
+    bash "$PREFB/side/install-controller-service.sh" --install 2>&1
+}
+PREFB_RC=0
+PREFB_OUT="$(prefb_install)" || PREFB_RC=$?
 [ "$PREFB_RC" -ne 0 ] && ok '§P5: with no durable candidate at all the pref does not rescue it — refused, not armed' \
                     || bad "§P5: installed from a scratch preference when no durable candidate existed: $PREFB_OUT"
 case "$PREFB_OUT" in
   *'no DURABLE cloud-cell-supervisor.sh'*) ok '§P5: and that refusal names what a durable supervisor would be' ;;
   *) bad "§P5: the nothing-durable refusal does not name a durable alternative — $PREFB_OUT" ;;
 esac
+# …and the arm above is a statement about the pin seam, so the seam must be LIVE in this same env: with a
+# FIXTURE pin present the identical env ADMITS it and names it. Without this control the refusal could be caused
+# by a dead seam, and the two assertions above would be green for the wrong reason (the vacuity rule this suite's
+# header states for every arm).
+PREFB_PIN_REPO="$PREFB/home/agent-infra"
+if mkdir -p "$PREFB_PIN_REPO/scripts" \
+   && cp "$SUP" "$PREFB_PIN_REPO/scripts/cloud-cell-supervisor.sh" \
+   && git init -q "$PREFB_PIN_REPO" 2>/dev/null \
+   && git -C "$PREFB_PIN_REPO" add -A >/dev/null 2>&1 \
+   && git -C "$PREFB_PIN_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1 \
+   && PREFB_PIN_SHA="$(git -C "$PREFB_PIN_REPO" rev-parse HEAD 2>/dev/null)" \
+   && [ -n "$PREFB_PIN_SHA" ] \
+   && git -C "$PREFB_PIN_REPO" worktree add --detach "$PREFB/home/harness-fixture/$PREFB_PIN_SHA" "$PREFB_PIN_SHA" >/dev/null 2>&1 \
+   && mkdir -p "$PREFB/home/harness-fixture/$PREFB_PIN_SHA/scripts/orchestrator-harness" \
+   && : > "$PREFB/home/harness-fixture/$PREFB_PIN_SHA/scripts/orchestrator-harness/orch-loop.sh" \
+   && printf '%s\n' "$PREFB/home/harness-fixture/$PREFB_PIN_SHA/scripts/orchestrator-harness" > "$PREFB/home/.harness-path-fixture"; then
+  rm -f "$PREFB/units/eldato-orchestrator.service"
+  PREFB_PIN_RC=0
+  PREFB_PIN_OUT="$(prefb_install)" || PREFB_PIN_RC=$?
+  if [ "$PREFB_PIN_RC" -ne 0 ]; then
+    bad "§P5: control — a FIXTURE pin in this env was still refused, so the arm above proves nothing about the pin seam: $PREFB_PIN_OUT"
+  elif grep -qxF "ExecStart=/bin/bash $PREFB/home/harness-fixture/$PREFB_PIN_SHA/scripts/cloud-cell-supervisor.sh start" "$PREFB/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P5: control — the same env ADMITS a FIXTURE pin and names it (so the refusal above is "no pin", not a dead seam)'
+  else
+    bad "§P5: control — the fixture pin was not named in ExecStart: $(grep -h '^ExecStart=' "$PREFB/units/eldato-orchestrator.service" 2>/dev/null)"
+  fi
+else
+  bad '§P5: the pin-seam control fixture could not be built, so that control did NOT run'
+fi
 
 # ── §P8 — the transient-root list has ONE source of truth, and this arm is its drift gate ────────
 # ⛔ THE GUARD IS ONLY AS WIDE AS ITS ROOT LIST, AND THE INSTALLER'S LIST IS A COPY. `runner_autoscale.py`
