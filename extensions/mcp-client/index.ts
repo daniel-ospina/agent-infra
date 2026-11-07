@@ -596,9 +596,11 @@ function expandExpr(str: string): string {
  * 2. **TRANSPORT IS ATOMIC.** `connectServer` tests `url` BEFORE `command`, so a merged entry
  *    carrying both silently ignores the repo's `command` (measured: a repo switching the base's
  *    hosted server to its own stdio daemon kept talking to the base URL, with no warning). Base
- *    fields of the OTHER transport are therefore dropped when the repo declares one; an entry
- *    declaring both, or a `type` contradicting the transport it declares, is ambiguous — the DELTA
- *    is ignored and the BASE entry is kept, because a repo cannot remove a base server either.
+ *    fields of the OTHER transport are therefore dropped when the repo declares one. An entry declaring
+ *    BOTH transports is ambiguous: as a delta over a base entry it is ignored and the base entry is kept
+ *    (a repo cannot remove a base server either), and as a repo-only entry it is kept and warns — it
+ *    runs over `url`, which is what `connectServer` does with it, so refusing it would zero a config
+ *    that works. `type` is NEVER a reason to drop or ignore anything; see `RECOGNISED_TYPES`.
  *
  * ⛔ OVERRIDES: pi's replace-on-transport rule for a project entry — `docs/mcp.md` says "A project
  * entry replaces a user-level entry with the same name", and its "keeps the rest, including env,
@@ -626,10 +628,10 @@ const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
  * ⛔ PLUS an explicit rejection of the PROTOTYPE-SHAPED names, which the charset admits. What this buys
  * is HYGIENE, not pollution safety: the pollution defence is the null-prototype merge map plus
  * `Object.hasOwn`, and `connectConfig` also stores a null-prototype sanitised map — so `__proto__` is
- * already unreachable there (`loadServer("__proto__")` answers "Unknown MCP server", measured). A
- * server literally named `__proto__`/`constructor`/`prototype` is not a valid pi name
- * (`docs/mcp.md`), and on the null-prototype map it WOULD be accepted as an ordinary server, so it is
- * refused here to keep the name space sane. Do not read this as the thing that prevents pollution.
+ * already unreachable there (`loadServer("__proto__")` answers "Unknown MCP server", measured). pi's own
+ * name rule (`docs/mcp.md`) is only the charset, which ADMITS all three — on the null-prototype map they
+ * would be accepted as ordinary servers — so refusing them is THIS client's hygiene rule, stricter than
+ * pi by choice, not a platform requirement. Do not read it as the thing that prevents pollution.
  */
 const PROTOTYPE_SHAPED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -744,14 +746,14 @@ export function mergeMcpLayers(
     // returns a FUNCTION, so a repo-only server with that name would take the delta path.
     const inherited = Object.hasOwn(merged, name) ? merged[name] : undefined;
     if (!inherited) {
-      // A repo entry that declares both transports, or an impossible `type`, is incoherent even with
-      // no base entry to contradict — report it rather than adding a server that cannot work.
+      // No base entry to defend, so the ruling is the same as for the BASE layer: a repo-only entry
+      // declaring both transports WORKS over `url` (`connectServer` tests it first) and `origin/main`
+      // refused nothing — dropping it would zero a working server. Warn and keep.
       if (hasField(entry, "url") && hasField(entry, "command")) {
         console.log(
-          `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — the entry is ` +
-            `IGNORED. Declare ONE transport.`
+          `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — ambiguous; it is ` +
+            `KEPT and will run over "url" (the order this client dispatches in). Declare ONE transport.`
         );
-        continue;
       }
       if (typeDisagrees(entry)) {
         // WARN, never drop: `type` is inert in this client (see RECOGNISED_TYPES), so refusing the entry
@@ -899,6 +901,14 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
         `[mcp-client] WARN: ${label} entry "${name}" has a non-string "${badTransport}" — dropped. ` + suffix
       );
       continue;
+    }
+    // An unrecognised `type` is NOT an error here (see RECOGNISED_TYPES) — but it is worth saying out
+    // loud, because the operator wrote it expecting an effect this client will not give it.
+    if (typed.type !== undefined && !(typeof typed.type === "string" && RECOGNISED_TYPES.has(typed.type))) {
+      console.log(
+        `[mcp-client] note: ${label} entry "${name}" has "type": ${JSON.stringify(typed.type)} — this ` +
+          `client selects the transport from url/command and never reads type, so the entry is KEPT as written.`
+      );
     }
     // ⛔ BOTH TRANSPORTS: a REPO DELTA is refused, a BASE entry is only warned about.
     // `connectServer` tests `url` BEFORE `command`, so such an entry runs over HTTP and ignores the

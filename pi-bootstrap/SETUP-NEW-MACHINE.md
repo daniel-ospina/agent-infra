@@ -190,11 +190,12 @@ machine's pi instance.
     `pi-bootstrap/cell-install.sh` rule on that explicitly. A non-string
     `url`/`command`, or a name outside `[A-Za-z0-9_-]`, makes the entry invalid —
     it is dropped rather than stringified into a live request.
-  - Never declare both transports in a **repo** entry: it is ambiguous, so it is
-    IGNORED with a warning and the base's entry is kept (silently it would resolve
-    to `url`, which the client tests first). A **base** entry declaring both is
-    likewise ambiguous but is KEPT and warns — dropping it would zero a config
-    that works over `url`.
+  - Never declare both transports in one entry. It is ambiguous, and the client
+    resolves it to `url` (that is the order it dispatches in):
+    - as a **repo delta** over a server the base already declares, the delta is
+      IGNORED with a warning and the base's entry is kept;
+    - as a **repo-only** entry, or a **base** entry, it is KEPT with a warning —
+      it works over `url`, so dropping it would zero a working server.
 
   ⛔ **A repo's `.mcp.json` is TRUSTED INPUT.** These rules stop a repo from
   *accidentally* inheriting the hub's credentials. They do **not** sandbox one: a

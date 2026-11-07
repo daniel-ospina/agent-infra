@@ -398,6 +398,18 @@ await test("TRANSPORT IS ATOMIC: a repo `url` drops the base's command/args/env/
   }
 });
 
+await test("a transport switch drops the base's stale `type` instead of leaving it beside the new one", () => {
+  // Without `delete carry.type`, a repo switching the base's hosted server to stdio produced
+  // `{type:"http", command:…}` — a stale label contradicting the entry it now describes.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { type: "http", url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
+    { mcpServers: { t: { command: "/usr/bin/python3", args: ["-m", "x"] } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.type, undefined, "the base's `type: http` must not survive a switch to stdio");
+  equal(t?.command, "/usr/bin/python3", "and the repo's transport is the one that runs");
+});
+
 await test("an entry declaring BOTH transports keeps the BASE entry — an ambiguous delta is not a removal", () => {
   // Dropping the merged entry removed the hub's memory graph from that repo, while the warning said
   // the entry was "ignored" and the documented invariant says a repo cannot REMOVE a base server.
@@ -409,6 +421,17 @@ await test("an entry declaring BOTH transports keeps the BASE entry — an ambig
   ok(t, "the base server must SURVIVE an ambiguous repo entry");
   equal(t?.url, "https://api.premiselabs.co/mcp/", "and it is the BASE entry, untouched");
   equal(t?.command, undefined, "the ambiguous delta is not applied");
+});
+
+await test("a REPO-ONLY entry declaring BOTH transports is KEPT with a warning (it works over `url`)", () => {
+  // Same ruling as the base layer: `connectServer` tests `url` first, so such an entry WORKS and main
+  // refused nothing — dropping it would zero a working server.
+  const merged = mergeMcpLayers(
+    { mcpServers: {} } as never,
+    { mcpServers: { t: { url: "https://ok/mcp", command: "/bin/sh" } } } as never,
+  );
+  ok(merged.t, "kept, not dropped");
+  equal((merged.t as Record<string, unknown>).url, "https://ok/mcp", "and it will run over `url`");
 });
 
 await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropping it would zero a working config)", async () => {
@@ -478,6 +501,19 @@ await test("rewriting only `args` does NOT inherit the base's env — args decid
   const g = merged.g as Record<string, unknown> | undefined;
   deepEqual(g?.args, ["-y", "@evil/mcp"], "the repo's package runs");
   equal(g?.env, undefined, "but it must NOT receive the key that was issued for the other package");
+});
+
+await test("changing only `cwd` is a DIFFERENT launch, so the base's env is not inherited", () => {
+  // `cwd` decides which code runs for a relative command (`python3 -m pkg`, `node server.js`), so it is
+  // part of the launch identity — without it a repo could run the base's command out of its own
+  // directory and still receive the base's API keys.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { command: "python3", args: ["-m", "x"], env: { K: "1" }, cwd: "/base" } } } as never,
+    { mcpServers: { t: { cwd: "/repo" } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.cwd, "/repo", "the repo's cwd applies");
+  equal(t?.env, undefined, "but the base's env must not follow it");
 });
 
 await test("a repo that only touches `lazy` keeps the base's env (pure launch-identity delta)", () => {
@@ -647,9 +683,9 @@ await test("a repo layer that parses to `null` is a STATED failure, never a sile
   );
 });
 
-await test("a non-string `url`/`command`, or an invalid `type`/name, is DROPPED at the layer read", async () => {
-  // `connectServer` reads `if (config.url)` and would STRINGIFY a non-string into a real request; and
-  // `sse` is rejected by pi (`docs/mcp.md`). A typo must not become a live destination.
+await test("a non-string `url`/`command` and a bad name are DROPPED; an unrecognised `type` is KEPT", async () => {
+  // `connectServer` reads `if (config.url)` and would STRINGIFY a non-string into a real request, so a
+  // typo must not become a live destination. `type` is deliberately NOT in this class — see below.
   const repoDir = tempDir("mcp-bind-invalid-repo-");
   const homeDir = tempDir("mcp-bind-invalid-home-");
   mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
@@ -798,6 +834,36 @@ await test("classifyServers skips a non-object entry for a DIRECT caller", () =>
   );
   deepEqual(eager, [], "only the valid lazy server is classified");
   deepEqual(lazySkipped, ["real"], "and the invalid entries are skipped, not read");
+});
+
+await test("a BASE entry with an unrecognised `type` SURVIVES into the config and the catalog", async () => {
+  // ⛔ THE RECORDED-DECISION PIN, on the layer where cycle 7's outage happened: a base entry with
+  // `type: "sse"` and a valid url validated to ZERO servers while `cell-install --verify` called the
+  // layer VERIFIED. The client dispatches on `url`, so it works — it must not be dropped anywhere.
+  const repoDir = tempDir("mcp-bind-basesse-repo-");
+  const homeDir = tempDir("mcp-bind-basesse-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: {
+      tortoise: { type: "sse", url: "http://127.0.0.1:8181/mcp", lazy: true },
+    },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.tortoise, "a self-hosted `type: \"sse\"` base entry must SURVIVE the layer read");
+  ok(manager.catalog().some(e => e.name === "tortoise"), "and it must appear in the catalog");
+  ok(
+    logs.some(l => l.includes("never reads type") || l.includes("KEPT")),
+    `the operator must be told the type is inert — got:\n${logs.join("\n")}`
+  );
 });
 
 await test("a BASE-layer entry with a prototype-shaped name is refused too", () => {
