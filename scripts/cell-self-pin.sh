@@ -1724,19 +1724,19 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
           # before the payload runs. Refused in the drop-in path too, because a drop-in is merged OVER the
           # unit and an operator reading the unit will never see it.
           bad "the installed drop-in ${f} declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant is a unit that never began; remove ${f}"; return 1 ;;
-        ExtensionImages|ExtensionDirectories)
-          # Same class as the bind members below, one layer down: the overlay lands on `/usr/`+`/opt/`
-          # (`/etc/` for confext), so it shadows the INTERPRETER (`/bin/bash` → `/usr/bin/bash` on a merged
-          # host) rather than the payload itself — different bytes still reach the exec, so it is refused.
-          bad "the installed drop-in ${f} declares ${_c}= — systemd overlays that image/directory over the unit's /usr and /opt view BEFORE the payload runs, so it can shadow the INTERPRETER that executes the verified pass (/bin/bash is /usr/bin/bash on a merged host); the pin unit needs no extension images — remove ${f}"; return 1 ;;
-        BindPaths|BindReadOnlyPaths|TemporaryFileSystem|MountImages)
-          # ⛔ THE SAME MOUNT-REDIRECTION CLASS AS `RootDirectory=`, ONE STEP CLOSER (round-19 review, P1).
-          # `systemd.exec(5)` mounts these into the unit's own view before the payload runs, so a drop-in can
-          # bind different bytes over the exact `ExecStart` path the rendered artifact was verified against
-          # — the payload-identity rule this gate exists for, reached through the file systemd merges OVER
-          # that artifact (and which an operator reading the unit will never see). True for every value:
-          # this verification reads no mount, so nothing it approved survives the unit's view.
-          bad "the installed drop-in ${f} declares ${_c}= — systemd mounts into the unit's filesystem view BEFORE the payload runs, so the drop-in can put different bytes over the ExecStart the rendered unit was verified with (or replace that path with an empty tmpfs); remove ${f}"; return 1 ;;
+        BindPaths|BindReadOnlyPaths|TemporaryFileSystem|MountImages|ExtensionImages|ExtensionDirectories)
+          # ⛔ THE SAME MOUNT-REDIRECTION CLASS AS `RootDirectory=`, ONE STEP CLOSER (round-19 review, P1),
+          # together with its OVERLAY members, which reach the exec one layer lower (round-20 review, P2).
+          # `systemd.exec(5)` mounts these into the unit's own view before the payload runs: the bind family
+          # and `MountImages=` (destination is FREE-FORM) put different bytes over the exact `ExecStart` path
+          # the rendered artifact was verified against; `ExtensionImages=`/`ExtensionDirectories=` overlay
+          # `/usr/`+`/opt/` (`/etc/` for confext), which shadows the INTERPRETER — `/bin/bash` is
+          # `/usr/bin/bash` on a merged host. All of it reaches the exec through the file systemd merges OVER
+          # that artifact, which an operator reading the unit will never see. ONE arm and ONE message for the
+          # family, deliberately: the reason is true for every value (this verification reads no mount, so
+          # nothing it approved survives the unit's view), and a single arm is what lets the suite gate the
+          # list instead of one name per review.
+          bad "the installed drop-in ${f} declares ${_c}= — systemd mounts into the unit's filesystem view BEFORE the payload runs and nothing here reads a mount, so the drop-in can put different bytes over the ExecStart the rendered unit was verified with (BindPaths=/BindReadOnlyPaths=), replace that path with an empty tmpfs (TemporaryFileSystem=), mount an image over it (MountImages=), or overlay /usr so the INTERPRETER that runs the pass is a different file (ExtensionImages=/ExtensionDirectories=; /bin/bash is /usr/bin/bash on a merged host); remove ${f}"; return 1 ;;
         Exec*)
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)

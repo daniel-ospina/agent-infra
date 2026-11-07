@@ -537,19 +537,19 @@ refuses 'a RootDirectory= (systemd enters it before the payload)' "$(doctor root
 # MEASURED rc=0 before this arm. The reason is name-based, so the value below is deliberately realistic but
 # not load-bearing; `TemporaryFileSystem=` is the third member (it replaces a path with an empty tmpfs) and
 # is refused by the same arm, so neither can be re-opened without reddening a leg here.
-refuses 'a BindPaths= (a mount puts different bytes over the verified ExecStart)' "$(doctor bindpaths 'BindPaths=/srv/evil:/srv/payload/cell-self-pin.sh')" "$T/u29b" 'mounts into'
-refuses 'a TemporaryFileSystem= (a mount replaces a path in the unit view)' "$(doctor tmpfs 'TemporaryFileSystem=/srv/harness-current')" "$T/u29c" 'mounts into'
-# ⛔ AND EACH MOUNT MEMBER NEEDS ITS OWN LEG (round-20 review, P3 coverage). Measured: narrowing the arm to
-# `BindPaths|TemporaryFileSystem` — silently re-opening `BindReadOnlyPaths=` — left the suite GREEN at
-# 453/0, so one member of a family the arm exists to close could be dropped without a red. `MountImages=`
-# is the fourth and the one with an arbitrary DESTINATION (`systemd.exec(5)`: "the destination directory
-# can be specified"), i.e. it can mount an image over the payload path exactly as `BindPaths=` can, and it
-# was accepted rc=0 before this leg.
-refuses 'a BindReadOnlyPaths= (a read-only bind over the verified ExecStart)' "$(doctor bindro 'BindReadOnlyPaths=/srv/evil:/srv/payload/cell-self-pin.sh')" "$T/u29d" 'mounts into'
-refuses 'a MountImages= (an image mounted over the payload destination)' "$(doctor mountimages 'MountImages=/srv/evil.img:/srv/payload')" "$T/u29e" 'mounts into'
-# …and the OVERLAY member, which reaches the exec one layer lower: `/bin/bash` is `/usr/bin/bash` on a merged
-# host, so an extension image shadows the INTERPRETER that runs the verified pass.
-refuses 'an ExtensionDirectories= (an overlay that shadows the interpreter)' "$(doctor sysext 'ExtensionDirectories=/srv/evil-usr')" "$T/u29f" 'mounts into'
+# ⛔ EVERY MEMBER OF THE MOUNT FAMILY, IN EVERY GRADER THAT GATES IT (round-21 review, P3). The previous
+# two rounds each added ONE leg per member to ONE alternation, so 14 of the 24 (grader, member) pairs could
+# be dropped with the suite GREEN — MEASURED: removing `BindReadOnlyPaths=` from the DROP-IN alternation
+# left `471 ok / 0 failed`, which is verbatim the coverage defect the round before was opened for. A loop
+# over ONE shared list closes the class instead of one name per review: a member added to the list and the
+# arms is gated in all four graders at once, and dropping any single member from any alternation reds its
+# own leg. `TemporaryFileSystem=`/`MountImages=` reach the exec differently (hide the path / mount an image
+# over it) and `ExtensionImages=`/`ExtensionDirectories=` reach the INTERPRETER (`/bin/bash` is
+# `/usr/bin/bash` on a merged host) — all four are the same "bytes this run never read reach the exec" class.
+MOUNT_DIRECTIVES="BindPaths BindReadOnlyPaths TemporaryFileSystem MountImages ExtensionImages ExtensionDirectories"
+for _md in $MOUNT_DIRECTIVES; do
+  refuses "a ${_md}= (a mount in the unit's view)" "$(doctor "mount-$_md" "${_md}=/srv/evil:/srv/payload/cell-self-pin.sh")" "$T/u29-$_md" 'mounts into'
+done
 # ⛔ AND `%` IS A SPECIFIER, NOT A CHARACTER. Both `Environment=` values and the `ExecStart=` command line
 # are %-specifier-expanded by the manager (`%h` = the manager user's home), so a base that CONTAINS `%` is
 # verified as that literal string and RUNS expanded — the unit's effective CELL_HOME stops being the value
@@ -679,12 +679,15 @@ refuses_timer 'a timer with only the ONE-SHOT OnBootSec=' \
 # `Unit=`, which the template places inside `[Timer]`, so the doctor reproduces the measured state.
 refuses_timer 'a [Service]-only directive inside [Timer] (systemd IGNORES it — a green no-op)' \
   "$(doctor_timer timerinert 's|^Unit=.*$|Unit=cell-self-pin.service|' 'WorkingDirectory=/srv/harness-current')" "$T/tu20" 'Unknown key name'
-# …and the MOUNT arm in the same place: `verify_timer` refused `WorkingDirectory=`/`RootDirectory=` here and
-# accepted the whole mount family rc=0 (measured, round-20 review, P3), so the rendered timer could carry a
-# mount nobody acts on while the equally inert `WorkingDirectory=` was refused — inconsistent verdicts on
-# one class, which is how a rule stops being an invariant.
-refuses_timer 'a mount directive inside [Timer] (systemd IGNORES it — a green no-op)' \
-  "$(doctor_timer timerbind 's|^Unit=.*$|Unit=cell-self-pin.service|' 'BindPaths=/srv/evil:/srv/x')" "$T/tu20b" 'the rendered timer declares'
+# …and the MOUNT family in the same place, EVERY member (round-21 review, P3): `verify_timer` refused
+# `WorkingDirectory=`/`RootDirectory=` here and accepted the whole mount family rc=0 (measured,
+# round-20 review), so the rendered timer could carry a mount nobody acts on while the equally inert
+# `WorkingDirectory=` was refused — inconsistent verdicts on one class, which is how a rule stops being an
+# invariant. One leg per member, so the arm cannot be narrowed one name at a time.
+for _md in $MOUNT_DIRECTIVES; do
+  refuses_timer "a ${_md}= inside [Timer] (systemd IGNORES it — a green no-op)" \
+    "$(doctor_timer "timermount-$_md" 's|^Unit=.*$|Unit=cell-self-pin.service|' "${_md}=/srv/evil:/srv/x")" "$T/tu-$_md" 'the rendered timer declares'
+done
 # ⛔ AND AN EMPTY VALUE IS THE SAME DEFECT ONE SPELLING OVER: systemd ignores `OnUnitActiveSec=` with no
 # value, so the timer silently degrades to the one-shot case while the directive is present.
 refuses_timer 'an EMPTY OnUnitActiveSec=' \
@@ -979,10 +982,11 @@ elif [[ $out == *'provisioning clone'* ]]; then
 else bad "refused an out-of-unit-dir drop-in for the WRONG reason: $out"; fi
 refuses_dropin 'lives in the TYPE-LEVEL drop-in dir (service.d)' "$(dropin_doctor typedir 'ConditionPathExists=/srv/nope' 'service.d')" 'ConditionPathExists='
 refuses_dropin 'declares a RootDirectory= (systemd enters it before the payload)' "$(dropin_doctor rootdir 'RootDirectory=/srv/harness-current')" 'never began'
-# …and the BIND members of that same class, in the file systemd merges OVER the artifact this run verified.
-refuses_dropin 'declares a BindPaths= (a mount over the verified payload)' "$(dropin_doctor bindpaths 'BindPaths=/srv/evil:/srv/payload/cell-self-pin.sh')" 'mounts into'
-refuses_dropin 'declares a MountImages= (an image mounted over the payload destination)' "$(dropin_doctor mountimages 'MountImages=/srv/evil.img:/srv/payload')" 'mounts into'
-refuses_dropin 'declares an ExtensionImages= (an overlay that shadows the interpreter)' "$(dropin_doctor sysext 'ExtensionImages=/srv/evil.img')" 'overlays that image'
+# …and the whole MOUNT family, in the file systemd merges OVER the artifact this run verified. The loop is
+# the point (round-21 review): one leg per grader-and-member pair, so no member can be silently re-opened.
+for _md in $MOUNT_DIRECTIVES; do
+  refuses_dropin "declares a ${_md}= (a mount in the unit's view)" "$(dropin_doctor "mount-$_md" "${_md}=/srv/evil:/srv/payload/cell-self-pin.sh")" 'mounts into'
+done
 refuses_dropin 'declares a DynamicUser= (an allocated identity cannot pin the tree)' "$(dropin_doctor dynamicuser 'DynamicUser=yes')" 'DynamicUser='
 # ⛔ AND THE TIMER'S DROP-INS ARE A SEPARATE SET, WHICH NOTHING READ. `dropin_dirs` enumerates what systemd
 # merges FOR THE NAME IT IS GIVEN, and `--install` verified only `cell-self-pin.service` — so
@@ -1003,14 +1007,16 @@ refuses_dropin 'declares WorkingDirectory= in a TIMER drop-in (the key is inert 
 refuses_dropin 'declares a RootDirectory= in a TIMER drop-in (the key is inert there)' \
   "$(dropin_doctor timerroot 'RootDirectory=/srv/harness-current' 'cell-self-pin.timer.d')" 'Unknown key name'
 # ⛔ THE MOUNT ARM IS THE NEXT SERVICE-ONLY ARM, AND IT WAS NOT CARRIED INTO THE TIMER GRADER (round-20
-# review, P3). This reader's whole point (`:1702-1704`) is that `is_timer` guards the FAMILY so "a new
-# service-only arm added later is covered without another review" — and the very next arm added was not.
-# Measured before this leg: a `cell-self-pin.timer.d/` drop-in declaring `BindPaths=` WAS refused, but with
-# the SERVICE cause ("…put different bytes over the ExecStart…"), a failure mode a timer cannot have — the
-# exact wrong-cause class round 4 fixed for `User=`/`DynamicUser=`/`RootDirectory=`. The assertion is on
-# the TIMER wording, so the leg reds if the cause ever falls back to the service text.
-refuses_dropin 'declares a BindPaths= in a TIMER drop-in (the key is inert there)' \
-  "$(dropin_doctor timerbind 'BindPaths=/srv/evil:/srv/x' 'cell-self-pin.timer.d')" 'TIMER drop-in'
+# review, P3). `is_timer`'s whole point is that it guards the FAMILY so "a new service-only arm added later
+# is covered without another review" — and the very next arm added was not. Measured before this leg: a
+# `cell-self-pin.timer.d/` drop-in declaring `BindPaths=` WAS refused, but with the SERVICE cause ("…put
+# different bytes over the ExecStart…"), a failure mode a timer cannot have — the exact wrong-cause class
+# round 4 fixed for `User=`/`DynamicUser=`/`RootDirectory=`. One leg per member, on the TIMER wording, so
+# the cause cannot fall back to the service text one name at a time.
+for _md in $MOUNT_DIRECTIVES; do
+  refuses_dropin "declares a ${_md}= in a TIMER drop-in (the key is inert there)" \
+    "$(dropin_doctor "timermount-$_md" "${_md}=/srv/evil:/srv/x" 'cell-self-pin.timer.d')" 'TIMER drop-in'
+done
 # ⛔ AND THE IDENTITY ARMS ARE THE SAME CLASS (round-4 review, P2). `User=` and `DynamicUser=` were added
 # to this reader with a SERVICE's reason ("the pass would run as that user", "cannot show that the pass
 # still runs as the owner") — both false in a `[Timer]`, where every `[Service]`-only key is inert
@@ -1246,9 +1252,9 @@ out_id="$(runat "$T/home" CELL_HOME=/ TEMPLATES_DIR="$TPL" bash "$PIN" --print-u
 got_user="$(printf '%s\n' "$out_id" | sed -n 's/^User=//p' | head -1)"
 want_user="$(owner_of /)"
 if [ "$want_user" = "$(id -un)" ]; then
-  ok "SKIPS the owner-derivation discriminator honestly: / is owned by the INVOKING user here, so `User=` cannot tell the two renders apart on this box"
+  ok "SKIPS the owner-derivation discriminator honestly: / is owned by the INVOKING user here, so User= cannot tell the two renders apart on this box"
 elif [ "$got_user" = "$want_user" ]; then
-  ok "the rendered User= is the OWNER of CELL_HOME ('$want_user'), not the invoking user ('$(id -un)') — an `id -un` render would have baked User=$(id -un)"
+  ok "the rendered User= is the OWNER of CELL_HOME ('$want_user'), not the invoking user ('$(id -un)') — an id-un render would have baked User=$(id -un)"
 else bad "the rendered User= is '$got_user', not the owner of CELL_HOME ('$want_user') — the render followed the INVOKING identity, which is how User=root reached a box that can only pin as its owner"; fi
 got_home="$(printf '%s\n' "$out_id" | sed -n 's/^Environment=HOME=//p' | head -1)"
 if [ "$want_user" != "$(id -un)" ]; then
@@ -1856,7 +1862,15 @@ chmod +x "$T/fakebin-sudo/sudo"
 out="$(runat "$TICK" CELL_SELF_PIN_SYSTEMCTL= PATH="$T/fakebin-sudo:$T/fake-esc:$PATH" bash "$PIN" 2>&1)"; rc=$?
 [ "$rc" -eq 0 ] && ok "a re-armed SYSTEM actuator is retired by a NON-ROOT tick (the privilege is negotiated)" \
   || bad "a non-root tick could not retire the re-armed SYSTEM actuator (rc=$rc): $out"
-[ -s "$T/sudo.calls.log" ] && ok "…and it escalated through 'sudo -n' — the same probe install-harness-apply-timer.sh's `[ -z \"${SUDO+x}\" ] && sudo -n true` relies on" \
+# ⛔ NO BACKTICKS IN THESE MESSAGES (round-21 review, P3). A backticked span inside a DOUBLE-QUOTED string is
+# COMMAND SUBSTITUTION, not literal text — so the citation this line exists to carry was executed and the
+# prose printed with a hole in it (measured in the suite's own log: "…install-harness-apply-timer.sh's  relies
+# on", double space). Worse, the command it ran was the host's real `sudo -n true`: `SUDO` is unset in the
+# suite, and the per-leg `PATH="$T/fakebin-sudo:…"` override belongs to the preceding `runat`, not to this
+# `ok` line. A suite that must never reach the host's manager must not be able to reach the host's `sudo`
+# either. Same root at `:1255`/`:1257` (`User=` and `id -un` were being executed and dropped) — fixed there
+# too, so the text is literal and the only escalation path is the shimmed one.
+[ -s "$T/sudo.calls.log" ] && ok "…and it escalated through 'sudo -n' — the same probe install-harness-apply-timer.sh's [ -z \"\${SUDO+x}\" ] && sudo -n true relies on" \
   || bad "…but the retirement used NO escalation, so on a real box it is polkit's Access denied: $out"
 [ -f "$T/state-esc/system-$SHIPPED" ] && bad "…and the shipped timer is STILL enabled after the tick claimed to re-take the pin" \
   || ok "…and the shipped SYSTEM timer is really disabled, not merely claimed"
