@@ -141,13 +141,16 @@ _rs_nearest_existing_ancestor() {
 # AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file (its loop is at
 # `:95-103`, the source is `:110`) — it has to, because it refuses with its own message when no
 # interpreter resolves, and it must do that before anything from here exists in its shell. So it cannot
-# call this function at that point; it CAN (and does, once sourced) everywhere afterwards. Same three
-# candidates in the same order, and the duplication is confined to those eight lines.
-# ⛔ AND THE WRAPPER DOES *NOT* TALK TO THIS READER OVER A SUBPROCESS — it SOURCES it, deliberately, and
-# says so at `:106-110`: a `bash "$READER" check` subprocess would collapse this file's 3 (absent) /
-# 4 (empty) / 5 (malformed) into 0/1, which is exactly the distinction the wrapper's `case` exists to
-# act on. A comment here claiming a subprocess boundary described the FORBIDDEN shape, and a lane
-# "correcting" the wrapper to match it would merge "no set" with "broken set".
+# call this function at that point, and it resolves the same three candidates in the same order in its
+# own eleven lines (`:93-103`). After the source it never needs to: everything that wants an
+# interpreter goes through `_rs_doctor_available` / `_rs_with_doctor`, which call this one.
+# ⛔ AND THE WRAPPER SOURCES THIS FILE, DELIBERATELY — because it needs the FUNCTIONS below as values
+# (`repo_set_file`, `repo_set_doctor_repos`, `_rs_strip`, `_rs_slug_ok`, `_rs_origin_slug`,
+# `_rs_normalize_slug`), not merely a verdict. ⛔ NOT because a subprocess would lose the exit code: the
+# executed path returns `repo_set_check`'s code verbatim, so `bash "$READER" check` answers 3/4/5 for
+# absent/empty/malformed exactly as the sourced form does (measured, and pinned by this suite's own
+# `run_reader_rc`, which IS that subprocess). A comment claiming otherwise — in either file — describes
+# behaviour that is not there, and this PR has had to delete four of those.
 _rs_py_resolve() {
   local c
   for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
