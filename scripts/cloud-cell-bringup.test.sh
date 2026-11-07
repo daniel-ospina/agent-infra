@@ -582,8 +582,13 @@ esac
 # ⛔ AND IT IS NOT THE LITERAL "MUST REFUSE" (re-review P1). The installer's fourth candidate is the copy
 # BESIDE ITSELF, so on a DURABLE checkout — which is what CI checks out (`/home/runner/work/…`) — that
 # candidate is legitimately durable and the install must succeed; an arm asserting a refusal would go red on
-# every PR and on `main`. The invariant that holds on every box is the one that matters here: with no farm,
-# a unit may be armed only from a path that survives a cleaning.
+# ⛔ THE SHAPES, NOT A PREFIX LIST (re-review P2). This arm used to red any `/tmp/*`, `/var/tmp/*`, `/run/*`
+# ExecStart — which contradicts the installer's own contract and is a FALSE RED on the fleet's real deployment
+# shape: a PRIMARY clone under `/tmp` (`/tmp/cell-ai`) and a harness pin under `/tmp/cell-home` are both
+# explicitly ADMITTED (install-controller-service.test.sh §P7(b) and §P4 assert exactly that). The property
+# this arm can hold on every box is the one the installer enforces: no lane-scratch shape, no empty entry.
+# The installer already refused every non-durable path, so re-deriving durability here would be a second
+# implementation of the rule — the class the installer's own header forbids.
 FARMED_SUP="$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
 mv -f "$FARMED_SUP" "$FARMED_SUP.aside" 2>/dev/null
 rm -f "$T/systemd-units/eldato-orchestrator.service"
@@ -591,8 +596,8 @@ printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
 if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
   case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eldato-orchestrator.service" 2>/dev/null | head -1)" in
-    */.worktrees/*|/tmp/wt-*|/tmp/cell-wt-*|/tmp/base-*|/tmp/*|/var/tmp/*|/run/*|'') bad "with no farm the bring-up armed an ExecStart a cleaning removes — the #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
-    *) ok "with no farm the bring-up armed only a DURABLE path (this checkout is durable, so the beside-the-layer candidate is real)" ;;
+    */.worktrees/*|/tmp/wt-*|/tmp/cell-wt-*|/tmp/base-*|'') bad "with no farm the bring-up armed an ExecStart a lane removal takes — the #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
+    *) ok "with no farm the bring-up armed only a path a cleaning SURVIVES (this checkout is durable, so the beside-the-layer candidate is real)" ;;
   esac
 else
   [ "$BR_RC" -ne 0 ] && ok "with no farm the bring-up REFUSED to supervise the controller from a transient checkout (rc=$BR_RC)" \
