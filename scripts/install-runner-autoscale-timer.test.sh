@@ -59,6 +59,10 @@ cleanup() {
         */tmp.runnerautoscale.*) rm -rf "$MT" ;;
         *) : ;;
     esac
+    case "${WT:-}" in
+        /tmp/wt-runnerautoscale.*) rm -rf "$WT" ;;
+        *) : ;;
+    esac
 }
 trap cleanup EXIT
 
@@ -396,6 +400,22 @@ assert_eq "$RC" 1 "a transient-scratch install is refused (rc 1)"
 assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
     "the refusal names transient scratch, not a scheduler problem"
 assert_contains "$OUT" "127" "the refusal names the measured consequence (127 every tick)"
+# ⛔ AND THE FLEET'S OWN LANE-WORKTREE LAYOUT IS TRANSIENT BY CONSTRUCTION TOO (#3469 review).
+# `templates/systemd/eldato-pr-repair.service:91` records `/tmp/wt-<issue>-<slug>` as the shape a lane
+# creates and the reaper deletes. The predicate matched only `mktemp`'s `tmp.????`, so a lane worktree
+# sailed through — harmless while `tools/install-ci-runner-x64.sh` did not exist, and a SILENT DOOMED
+# PIN once it did (the tree is deleted with the lane, so every pass records `no provisioner`).
+# Pinned through HOME, one of the four values `refuse_unusable_target` judges, and the reachable seam:
+# the install is refused instead of rendering a unit pointed at a tree that will not exist.
+WT="/tmp/wt-runnerautoscale.$$"; mkdir -p "$WT/.pi/agent/scripts" "$WT/.pi/agent/state"
+cp "$T/home/converger.py" "$WT/.pi/agent/scripts/"
+ENVV=(HOME="$WT" RUNNER_AUTOSCALE_SCRIPT="$WT/.pi/agent/scripts/converger.py"
+      RUNNER_AUTOSCALE_STATE_DIR="$WT/.pi/agent/state" RUNNER_AUTOSCALE_ARM_FILE="$WT/arm"
+      SUDO=false)
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a /tmp/wt-<issue>-<slug> lane worktree is refused as transient (rc 1)"
+assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
+    "and the lane-worktree refusal names the same class, not a scheduler problem"
 
 # ── T6: an old interpreter is refused ─────────────────────────────────────────────────────
 say_case "T6 an interpreter older than 3.12 is refused"

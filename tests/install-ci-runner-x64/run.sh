@@ -1,5 +1,15 @@
 #!/usr/bin/env bash
-# install-ci-runner-x64.test.sh — the adapter's contract, proven against a FAKE pool tool.
+# tests/install-ci-runner-x64/run.sh — the adapter's contract, proven against a FAKE pool tool.
+#
+# Run: bash tests/install-ci-runner-x64/run.sh   (exits 0 when every assertion passes)
+#
+# ⛔ THIS SUITE LIVES UNDER `tests/*/run.sh`, NOT BESIDE THE FILE IT TESTS. It was written as
+# `tools/install-ci-runner-x64.test.sh`, which is outside every `SUITE_GLOBS` pattern in
+# `scripts/run-bash-shards.sh` (`scripts/**`, `tests/*/run.sh`, `pi-bootstrap/tests/*.sh`), so it was
+# executed by NOTHING: the 22/22 in the PR body was real and unenforced on every future push, and a
+# broken adapter could merge green. `tests/*/run.sh` is the repo's discovered convention, so the suite
+# is now part of the sharded `bash-suites` lane with no edit to the runner. (It also stops tripping the
+# #1484 guard, which refuses to execute `tools/*.test.sh` from a hub-rooted session in a worktree.)
 #
 # ⛔ NO REAL REGISTRATION IS EVER MADE HERE. `CI_RUNNER_POOL_TOOL` points at a fixture that records
 # its argv and exits with a chosen code, so the properties that matter — "a guard refusal propagates
@@ -14,7 +24,7 @@
 set -uo pipefail
 
 HERE=$(cd -P "$(dirname "${BASH_SOURCE[0]}")" && pwd) || exit 1
-SUT=$HERE/install-ci-runner-x64.sh
+SUT=$HERE/../../tools/install-ci-runner-x64.sh
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/install-ci-runner-x64.XXXXXX") || exit 1
 trap 'rm -rf "$TMP"' EXIT
 pass=0 fail=0
@@ -28,7 +38,7 @@ bad()  { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
 check() {
   local label=$1 want=$2 got=$3 sub=${4:-} hay=${5:-}
   if [ "$want" != "$got" ]; then bad "$label (rc want=$want got=$got)"; return; fi
-  if [ -n "$sub" ] && ! printf '%s' "$hay" | grep -qF -- "$sub"; then
+  if [ -n "$sub" ] && ! grep -qF -- "$sub" <<<"$hay"; then
     bad "$label (missing '$sub' in: $(printf '%s' "$hay" | tr '\n' '|' | cut -c1-140))"; return
   fi
   ok "$label"
@@ -41,6 +51,43 @@ fake_pool() {
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/calls.log"
 printf 'fake: mem_floor_mb=3584 reading_mb=2210 %s\n' "\${FAKE_NOTE:-}"
+exit $rc
+EOF
+  chmod +x "$body"
+  printf '%s\n' "$body"
+}
+
+# fake_pool_racing <rc> — a pool tool that takes the name it was given, COMPLETES the install
+# (creates `<root>/<name>/.runner`), logs its argv and then exits rc. This is the measured shape of
+# "another pass took this slot while this one ran": the caller asked for an index that is now filled.
+fake_pool_racing() {
+  local rc=$1 body=$TMP/fake-pool-racing.sh
+  cat > "$body" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/calls.log"
+name=""
+while [ \$# -gt 0 ]; do case "\$1" in --name) shift; name="\${1:-}" ;; esac; shift; done
+[ -n "\$name" ] || { printf 'fake: no --name on argv\n' >&2; exit 99; }
+mkdir -p "\$RUNNER_ROOT/\$name" && : > "\$RUNNER_ROOT/\$name/.runner"
+printf 'name-unavailable name=%s (created by another actor)\n' "\$name" >&2
+exit $rc
+EOF
+  chmod +x "$body"
+  printf '%s\n' "$body"
+}
+
+# fake_pool_wedge <rc> — a pool tool that leaves the DIRECTORY on disk with NO `.runner`: the
+# `.runner`-less leftover `_next_free_slot` counts FREE while every pool verb refuses it.
+fake_pool_wedge() {
+  local rc=$1 body=$TMP/fake-pool-wedge.sh
+  cat > "$body" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/calls.log"
+name=""
+while [ \$# -gt 0 ]; do case "\$1" in --name) shift; name="\${1:-}" ;; esac; shift; done
+[ -n "\$name" ] || { printf 'fake: no --name on argv\n' >&2; exit 99; }
+mkdir -p "\$RUNNER_ROOT/\$name"
+printf 'name-unavailable name=%s path=%s already exists (a file, a symlink, or a directory without a .runner registration) — clear it or pick another name\n' "\$name" "\$RUNNER_ROOT/\$name" >&2
 exit $rc
 EOF
   chmod +x "$body"
@@ -147,6 +194,38 @@ check "root follows RUNNER_AUTOSCALE_RUNNER_ROOT" 0 "$rc" "root=$TMP/root2 added
 # 16. two different roots is a box that provisions what the caller cannot count — refused
 out=$(RUNNER_ROOT=$TMP/root RUNNER_AUTOSCALE_RUNNER_ROOT=$TMP/other CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "disagreeing roots -> refusal" 2 "$rc" "why=root-disagreement" "$out"
+
+# 17. ⛔ rc 4 WITH the slot now holding `.runner` IS SUCCESS — the box converged, and reporting it as
+# a failure is the rc-3 defect one code over. Measured before this case: the pool created
+# `<root>/gh-runner-x64-2/.runner` and exited 4, and the pass recorded action-failed although the
+# requested slot existed. Two passes adding the same index is a real condition here (the caller takes
+# no inter-pass lock and its own docs note passes racing).
+: > "$TMP/calls.log"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_racing 4) bash "$SUT" --count 4 --fallback auto 2>"$TMP/err17.txt"); rc=$?
+check "rc 4 with the slot now FILLED is a skip, not a failure" 0 "$rc" \
+  "provisioned slot=4 name=gh-runner-x64-4 root=$RUNNER_ROOT added=0 skipped=1" "$out"
+if [ -s "$TMP/err17.txt" ]; then
+  bad "rc 4 convergence writes nothing to stderr (the pass record is the merged last line)"
+else
+  ok "rc 4 convergence writes nothing to stderr (the pass record is the merged last line)"
+fi
+if [ -e "$RUNNER_ROOT/gh-runner-x64-4/.runner" ]; then
+  ok "precondition: the raced slot really carries .runner"
+else
+  bad "precondition: the raced slot really carries .runner"
+fi
+
+# 18. ⛔ BUT rc 4 WITH NO `.runner` IS A WEDGE, NOT A FAILURE: `_next_free_slot` tests only `.runner`,
+# so it asks for this same index forever while `add`/`reclaim` refuse the path and `reconcile` never
+# enumerates it. Nothing repairs it automatically, so it is reported as a REFUSAL naming the path to
+# clear (exit 2 -> ProvisionerRefused) instead of an action-failed every ten minutes.
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_wedge 4) bash "$SUT" --count 5 --fallback auto 2>&1); rc=$?
+check "rc 4 without .runner is a REFUSAL, not a failure" 2 "$rc" "guard-refused" "$out"
+check "…naming the wedged path to clear" 0 0 "rm -rf '$RUNNER_ROOT/gh-runner-x64-5'" "$out"
+case "$out" in
+  *added=1*) bad "a wedged slot never claims to have provisioned";;
+  *) ok "a wedged slot never claims to have provisioned";;
+esac
 
 printf '\n%s\n' "install-ci-runner-x64: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1

@@ -195,7 +195,16 @@ is_absolute_path() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
 # gone before the first pass, so EVERY tick exited 127 while `list-timers` showed it healthy.
 # ⛔ NOT "anything under /tmp": a cell legitimately runs with HOME=/tmp/cell-home and checkouts under
 # /tmp/cell-ai, and refusing those would be a false block on the real target. What is transient by
-# CONSTRUCTION is the `tmp.` + random-suffix name, which is what leaked into the units.
+# CONSTRUCTION is the `tmp.` + random-suffix name, which is what leaked into the units — PLUS the
+# fleet's own lane-worktree layout (#3469 review).
+# ⛔ THE LANE-WORKTREE LAYOUT IS THE SECOND TRANSIENT SHAPE BY CONSTRUCTION, and it is named in this
+# repo as a defect rather than hypothesized: `templates/systemd/eldato-pr-repair.service:91` records
+# `/tmp/wt-<issue>-<slug>` as the shape a passer-by creates and the reaper removes. Before this change
+# the predicate matched only `mktemp`'s `tmp.????`, so a lane worktree sailed through — and once
+# `tools/install-ci-runner-x64.sh` exists (#3469) such a tree RESOLVES, so `--install` from it pinned a
+# path that is deleted with the lane. The old behaviour was a LOUD failure ("resolves nothing … it can
+# never ADD capacity"); that would have become a silent, doomed pin. See `resolve_provisioner`, which
+# SKIPS such a candidate instead of pinning it, so this is a repair and not a new false block.
 is_transient_scratch() { # is_transient_scratch <path>
     # ⛔ NORMALISE FIRST. macOS sets TMPDIR with a TRAILING SLASH, so `mktemp -d` yields a DOUBLE slash,
     # and a naive prefix test misses the exact install this guard exists to refuse.
@@ -204,8 +213,14 @@ is_transient_scratch() { # is_transient_scratch <path>
     p="$(printf '%s' "$p" | tr -s '/')"
     case "$p" in
         /tmp/tmp.?*|/var/tmp/tmp.?*|/private/tmp/tmp.?*|/private/var/tmp/tmp.?*) return 0 ;;
+        # The fleet's lane-worktree layout (`/tmp/wt-<issue>-<slug>`), which the reaper removes along
+        # with the lane. Anchored on the `/tmp/` prefix and the `wt-` segment so a durable sibling
+        # (`/tmp/cell-ai/.worktrees/…`, a real checkout) is NOT matched. (case is a glob, not a
+        # regex, so `wt-` is literal and `*` stops at `/` only by the explicit patterns below.)
+        /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
         # macOS's OWN temp root is /var/folders/<a>/<b>/T/ — NOT /tmp — so it must be named.
         /var/folders/*/*/T/tmp.?*|/private/var/folders/*/*/T/tmp.?*) return 0 ;;
+        /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
     esac
     for t in "${TMPDIR:-}"; do
         [ -n "$t" ] || continue
@@ -425,7 +440,21 @@ resolve_provisioner() {
                 "$PWD/tools/install-ci-runner-x64.sh" \
                 "${HOME:-}/.pi/agent/scripts/install-ci-runner-x64.sh"; do
         [ -n "$cand" ] || continue
-        if [ -f "$cand" ] && [ -r "$cand" ]; then PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0; fi
+        [ -f "$cand" ] && [ -r "$cand" ] || continue
+        # ⛔ A CANDIDATE IN TRANSIENT SCRATCH IS NOT A CANDIDATE (agent-infra#3469 review). Pinning one
+        # creates exactly the inert enforcer `refuse_adopted_provisioner` refuses: the tree is deleted
+        # before the first tick, so every pass records `no provisioner` and the box can never ADD
+        # capacity — with the loud warning suppressed, because a pin WAS resolved. ⛔ SKIPPED, NOT
+        # REFUSED: an outright refusal here would false-block `--install` from a lane worktree, which is
+        # where the fleet runs it. Skipping falls through to the next candidate, then to the pin the
+        # installed artifact already carries (`adopt_installed_provisioner`), and finally to the honest
+        # "can never ADD capacity" warning (`warn_provisioner_reach`) — i.e. the pre-#3469 behaviour,
+        # which is the correct one.
+        if is_transient_scratch "$cand"; then
+            err "note: skipping TRANSIENT PROVISIONER CANDIDATE $cand (a tree the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
+            continue
+        fi
+        PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0
     done
     return 0
 }
