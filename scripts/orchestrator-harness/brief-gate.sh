@@ -471,53 +471,64 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     # (`_label` lowercases), so `WIP: Issue-4242 -> none` was refused while `WIP:` was accepted — an
     # asymmetry no author can be expected to guess. `vlow` is what every key and claim test reads.
     vlow="$(printf '%s' "$val" | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz')"
-    # ── THE KEY IS CLASSIFIED ONCE, THEN THE CLAIM IS READ ONCE (review of #3621, cycle 2, P2) ─────
-    # The first cut had an arm per key spelling and only the plain `issue-<digits>` arm read the claim,
-    # so `issue-<4242> -> none` (a REAL number inside the slot brackets) was keyed-but-UNCHECKED — the
-    # very fail-open the doc says cannot exist, reachable with two brackets. Classifying first means
-    # every arm that yields a number goes through the same measurement.
+    # ── ONE NORMALISATION, THEN ONE CLASSIFICATION, THEN ONE CLAIM READ (review of #3621, cycles 2-4)
+    # Three rounds found the same shape of bug in three spellings: an arm per key form meant that every
+    # form the arms did not name fell through to the unfilled-slot branch and was keyed-but-UNCHECKED
+    # (`issue-<4242>`, then `issue-<#4242>`, then a bracket with no `>` at all). So the bracket forms are
+    # canonicalised FIRST, into the plain `issue-<digits> -> <claim>` shape, and only then classified.
+    # ⛔ AND THE NUMBER IS THE FIRST DIGIT RUN, NOT EVERY DIGIT (review of #3621, cycle 4, P1): deleting
+    # all non-digits CONCATENATED them, so `issue-<#4242 (prev attempt #1234)> -> none` was measured as
+    # `42421234` — a key that does not exist, which ADMITTED the very claim it should refuse.
+    nval="$vlow"
+    case "$nval" in
+      issue-"<"*">"*|pr-"<"*">"*)
+        inner="${nval#*-<}"; inner="${inner%%>*}"
+        tail="${nval#*>}"
+        num="$(printf '%s' "$inner" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
+        case "$nval" in
+          issue-*) nval="issue-${num:-slot}${tail}" ;;
+          *)       nval="pr-${num:-slot}${tail}" ;;
+        esac ;;
+      issue-"<"*|pr-"<"*)
+        # an UNTERMINATED bracket still carries a number: key it, and treat the rest as an ABSENCE claim
+        # (we cannot parse a named ref out of it reliably, and refusing is the fail-closed direction).
+        num="$(printf '%s' "${nval#*-<}" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
+        case "$nval" in
+          issue-*) nval="issue-${num:-slot} ->" ;;
+          *)       nval="pr-${num:-slot} ->" ;;
+        esac ;;
+    esac
     issue=""
-    case "$vlow" in
-      issue-[0-9]*)        issue="${vlow#issue-}"; issue="${issue%%[!0-9]*}" ;;
-      # ⛔ THE BRACKET ARM IS NOT A WHITELIST OF ONE SPELLING (review of #3621, cycle 3, P2). Requiring
-      # a digit immediately after `<` left `issue-<#4242>`, `issue-< 4242>`, `issue-<issue-4242>` and
-      # `issue-<+4242>` falling through to the unfilled-slot arm — keyed-but-UNCHECKED. A natural way to
-      # write "issue #4242" is a number, so the arm takes ANY bracket content ending in `>` and extracts
-      # the first digit run inside it. `<` must be quoted: it is a REDIRECTION metacharacter bare.
-      issue-"<"*[0-9]*">"*)
-        rest="${vlow#issue-<}"; issue="${rest%%>*}"
-        issue="$(printf '%s' "$issue" | sed -E 's/[^0-9]//g')" ;;
-      # a `pr-<N>` that CARRIES a number is the same key as `pr-N` — checked for the role that may use it,
-      # where the unfilled `pr-<N>` slot is keyed-but-unchecked for fixer/reviewer only (H55c)
-      pr-"<"*[0-9]*">"*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
-      # ⛔ THE UNFILLED SLOT IS KEYED BUT UNCHECKED (`issue-<N>`, `pr-<N>`): the canonical block ships it
-      # and the gate cannot refuse its own advice — the same reason the research contract admits `<…>`.
-      # That is the stated coverage limit, and it is now ONLY the literal slot: anything that carries a
-      # number in any bracket spelling is resolved and measured.
-      issue-"<"*|pr-"<"*)  : ;;
-      pr-[0-9]*)           case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+    case "$nval" in
+      issue-[0-9]*)  issue="${nval#issue-}"; issue="${issue%%[!0-9]*}" ;;
+      # `issue-slot`/`pr-slot` is the UNFILLED slot (`issue-<N>`), which the canonical block ships and
+      # the gate cannot refuse — the same reason the research contract admits `<…>`. It is the ONLY
+      # unchecked form, and it is spelled `slot` here so it can never be mistaken for a number.
+      issue-slot*)   : ;;
+      pr-slot*)      case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      pr-[0-9]*)     case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       keyless*)
-        rest="${vlow#keyless}"
+        rest="${nval#keyless}"
         case "$rest" in ' '?*) : ;; *) unkeyed=1 ;; esac ;;
       *) unkeyed=1 ;;
     esac
     [ -n "$issue" ] || continue
     # the claim is what FOLLOWS the key, so a measurement note that mentions `refs/wip/*` is still a
     # claim of absence (an earlier draft read the whole value and switched itself off)
-    rest="${vlow#issue-}"
+    rest="${nval#issue-}"
     rest="${rest#*>}"
     rest="${rest#"$issue"}"
     # ⛔ ERE, NOT GNU's `\|` (review cycle 3, P2). BSD sed — macOS, where install.sh and launchd run —
     # does not implement `\|` in a BRE, so this substitution was INERT there: the arrow stayed in
     # `claim`, the claim no longer began `refs/wip/`, and an HONEST brief that named its ref was
     # falsely REFUSED on the exact platforms the fleet runs on while Linux stayed green.
-    # ⛔ THE ARROW IS OPTIONAL HERE, AND THE `?` IS LOAD-BEARING ON THE BRACKET PATH (review of #3621,
-    # cycle 3 — the cycle-2 wording had this backwards). Measured, on the shipped expansions:
-    #   `issue-4242 -> refs/wip/x`     after the `#*>` strip → ` refs/wip/x`   (the `->` is consumed there)
-    #   `issue-<4242> -> refs/wip/x`   after the `#*>` strip → ` -> refs/wip/x` (the `->` SURVIVES)
-    # so a sed that REQUIRES the arrow leaves a leading space on the BRACKET path only, `refs/wip/<ref>`
-    # then fails the `case` below, and an HONEST named ref is read as a CLAIM OF ABSENCE (measured: 5
-    # arms red before the `?`). The bracket named-ref direction is now pinned by H55d.
+    # ⛔ THE ARROW IS OPTIONAL, AND THE `?` IS LOAD-BEARING ON THE **PLAIN** PATH (measured, review of
+    # #3621 cycles 3-4 — both earlier wordings of this comment had it inverted). After the key strip the
+    # PLAIN form `issue-4242 -> refs/wip/x` has already had its `->` consumed by the `#*>` step and keeps
+    # a LEADING SPACE, which a required-arrow sed does not remove — `refs/wip/<ref>` then fails the
+    # `case` below and an HONEST named ref is read as a CLAIM OF ABSENCE (mutant: delete the `?` and
+    # H16/H35/H50/H53b all redden, measured). The bracket forms are normalised above, so they arrive here
+    # in the plain shape.
     claim="$(printf '%s' "$rest" | sed -E 's/^[[:space:]]*(->|→|:)?[[:space:]]*//')"
     # ⛔ A GLOB IS NOT A REF (review of #3621, P2). `refs/wip/* is empty` begins with `refs/wip/` and
     # was therefore read as "a ref is named", so the most honest possible way to say "I looked and there

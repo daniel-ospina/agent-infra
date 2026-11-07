@@ -1061,7 +1061,7 @@ bash "$GATE" --check "$TMP/pw-slotpr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=
 # These are the mirror rows, including the BRACKET NAMED-REF path that the optional arrow protects.
 sed 's|^WIP:.*|WIP:       issue-<4242> -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-slot-named.txt"
 bash "$GATE" --check "$TMP/pw-slot-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(H55d) a bracketed key with a NAMED ref is ADMITTED — this is the row the optional-arrow strip protects (got $rc)"
+[ "$rc" -eq 0 ]; ck $? "(H55d) a bracketed key with a NAMED ref is ADMITTED (got $rc)"
 # ⛔ THE FIXTURE MUST BE ROLE-SHAPED: testing the LANE section as `reviewer` is ALSO refused for the
 # missing MUTATION ATTRIBUTION block, which would measure the wrong contract (it did, at 80).
 for r in fixer reviewer; do
@@ -1080,11 +1080,38 @@ done
 sed 's|^WIP:.*|WIP:       issue-<#4242> -> refs/wip/* is empty (measured)|' "$CANON" > "$TMP/pw-spellglob.txt"
 bash "$GATE" --check "$TMP/pw-spellglob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H57b) …and it cannot smuggle the GLOB claim past H48 either (got $rc)"
+# ⛔ A REFUSAL-ONLY ARM IS NOT ENOUGH FOR A WIDENED SPELLING (review of #3621, cycle 4, P3): a misfix that
+# marked `<#…>`/`<+…>` UNKEYED keeps every refusal row green while falsely refusing the honest form. One
+# admitted-direction row per spelling kills that mutant.
+for spell in 'issue-<#4242>' 'issue-< 4242>' 'issue-<issue-4242>' 'issue-<+4242>'; do
+  sed "s|^WIP:.*|WIP:       $spell -> refs/wip/issue-4242-first-attempt @ 111111111111|" "$CANON" > "$TMP/pw-spell-named.txt"
+  bash "$GATE" --check "$TMP/pw-spell-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H57c['$spell']) …and the honest NAMED form under that spelling is ADMITTED (no false block) (got $rc)"
+done
+# ── THE FIRST DIGIT RUN, NOT EVERY DIGIT (review of #3621, cycle 4, P1). Concatenating the runs measured
+# a key that does not exist (`42421234`) and ADMITTED the claim it should refuse.
+for v in 'issue-<#4242 (prev attempt #1234)>' 'issue-<4242, 5555>' 'issue-<4242 attempt 2>'; do
+  sed "s|^WIP:.*|WIP:       $v -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-firstrun.txt"
+  bash "$GATE" --check "$TMP/pw-firstrun.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(H59['$v']) the FIRST digit run is the key — a second number in the bracket does not move it (got $rc)"
+done
+# ── AN UNTERMINATED BRACKET IS STILL KEYED AND STILL CHECKED (review of #3621, cycle 4, P2): dropping the
+# closing `>` used to fall through to the unfilled-slot arm and go UNCHECKED.
+sed 's|^WIP:.*|WIP:       issue-<4242 - none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-unterm.txt"
+bash "$GATE" --check "$TMP/pw-unterm.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H60) an UNTERMINATED bracket ('issue-<4242 - none') is still CHECKED (got $rc)"
 # ── `WIP_:` IS NOT A `wip` LABEL TO THE SHAPE PARSER (`_label` folds only space/hyphen), and the reader
-# no longer collects it either: ONE verdict, fail-closed, from both readers (review of #3621, cycle 3, P3).
+# no longer collects it either: ONE verdict, fail-closed, from both readers. The READER half is only
+# observable in the TOKEN set, so this is an absence fixture and the assertion is on the tokens — `rc`
+# alone cannot tell the two worlds apart (the shape parser refuses either way).
+sed 's|^WIP:.*|WIP_:      issue-4242 -> none (measured)|' "$CANON" > "$TMP/pw-under-absence.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-under-absence.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss"; ck $? "(H58) 'WIP_:' is not a wip label — the brief is refused for having no WIP line"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H58b) …and the reader did NOT collect it either — no CONTRADICTED token, so the two readers agree (a reader that collected it would add one)"
 sed 's|^WIP:.*|WIP_:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-under.txt"
 bash "$GATE" --check "$TMP/pw-under.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(H58) 'WIP_:' is NOT a wip label to either reader — the brief is refused as having no WIP line (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H58c) …so the named form is refused too, and for the same reason (got $rc)"
 
 # ── THE TWO COPIES OF THE QUOTING HELPERS MUST STAY BYTE-IDENTICAL (review of #3621, P3). They are
 # duplicated because the two awk programs are separate single-quoted strings by design (#3442's reason:
