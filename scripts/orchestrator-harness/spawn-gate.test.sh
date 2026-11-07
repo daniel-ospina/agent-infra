@@ -5942,12 +5942,27 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist, with a local witness that cannot answer either.
+# ⛔ AND "A LOCAL WITNESS THAT CANNOT ANSWER" NEEDS ITS OWN EMPTY DIRECTORY (measured 2026-11-07,
+# two defects in this one probe):
+#   1. The probe inherited the AMBIENT fallback — `~/.pi/agent/state/lanes` on a real box, 1574
+#      records here — so the registry answered `readable:true … FELL BACK to local` with rc 0 while
+#      the remote WAS unreachable, and the arm reddened on a CORRECT fail-closed registry.
+#   2. Pinning the probe to `$RREG/state/lanes` (the obvious repair) was still wrong, because
+#      `rdrive` above is run with `LANE_REGISTRY=1` and the lane WRITES ITS OWN RECORD into that
+#      directory — the probe then reads the record the lane just wrote and answers rc 0 again. The
+#      `rm -rf` that used to sit before `rdrive` cannot help: it is undone by the run it precedes.
+# So the probe gets a PRIVATE, EMPTY pair of paths that nothing else in this fixture writes. `rc=3`
+# then means exactly what the arm asserts — the remote cannot be reached and NO local witness can
+# answer — instead of a fact about this host or about the lane the arm is measuring. Same defect
+# class the suite's own brief-gate note names: a fixture that inherits ambient (or sibling) state
+# cannot make a claim about isolation.
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
-rm -rf "$RREG/state/lanes"
+rm -rf "$RREG/probe-state"; mkdir -p "$RREG/probe-state"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+unreachable="$(LANE_REGISTRY_STATE="$RREG/probe-state" LANE_REGISTRY_LOCAL="$RREG/probe-state/lanes" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
