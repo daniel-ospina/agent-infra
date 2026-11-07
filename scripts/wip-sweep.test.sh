@@ -612,6 +612,76 @@ if grep -q 'status=ok' <<<"$OST2"; then
 else
   ok "I7e no passthrough line CONTAINS status=ok either (the pass-through is part of the guarantee)"
 fi
+# ⛔ AND THE INTERPOLATION IS PART OF THE SAME GUARANTEE, NOT ONLY THE PASSTHROUGH (finding, round 9).
+# I7e closed the record's own extra LINE. Every `detail=` / `recorded=` VALUE below is still SPLICED into
+# the printed line from a RECORD value, a CALLER value or a PATH — so the literal reached the printed
+# surface while the exit was 3, the same consumer-side false green one hop upstream. Measured at
+# b03c916, each answering rc=3 with `status=ok` in its own output:
+#   record `ts=status=ok`      → `detail=the record carries no readable ts= ('status=ok') …`
+#   record `status=status=ok`  → `recorded=status=ok`   (falsifies the round-2 "cannot collide" claim)
+#   WIP_SWEEP_MAX=status=ok    → `detail=WIP_SWEEP_MAX is not a non-negative integer: 'status=ok'`
+#   state dir with `status=ok` → `detail=no pass record at …/status=ok/…`
+# The fix REDACTES rather than drops, because unlike a passthrough line (still on disk at $STATUS_FILE)
+# these lines are the only place the cause is stated. So each arm below asserts BOTH halves: no
+# `status=ok` anywhere in stdout+stderr, AND the diagnosing line still present — a fix that deleted the
+# line would silence the refusal and still pass a bare substring test.
+# ⛔ WHICH ARM DISCRIMINATES: the `2` arms. The rc arms assert the EXIT, which the pre-fix code also
+# returned 3 — they are co-assertions (a fix that redacted by breaking the refusal would red them), not
+# the catches. MEASURED on a `/tmp` copy with every `_redact` call reverted: PASS=206 FAIL=4, and the
+# four reds are exactly I7f2/I7g2/I7h2/I7i2 — no other arm moved, nothing went SKIP, I7j stayed green,
+# and S11g (the last arm) still reported. The shipped tree is PASS=210 FAIL=0.
+mkdir -p "$T/state-xts"
+printf 'status=ok\nrc=0\nts=status=ok\n' > "$T/state-xts/wip-sweep.status"
+OXTS="$(WIP_SWEEP_STATE_DIR="$T/state-xts" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7f a record whose ts= VALUE carries status=ok still answers 3" \
+                || bad "I7f answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OXTS"; then
+  bad "I7f2 the record's own ts= VALUE reached the print — a grep consumer reads green off an rc=3 box"
+elif grep -q '^detail=' <<<"$OXTS"; then
+  ok "I7f2 that interpolated value is REDACTED, and the detail line still names the cause"
+else
+  bad "I7f2 the detail line was DROPPED — the refusal no longer states why"
+fi
+mkdir -p "$T/state-xrec"
+printf 'status=status=ok\nrc=rc=status=ok\nts=%s\n' "$(date -u '+%s')" > "$T/state-xrec/wip-sweep.status"
+OXREC="$(WIP_SWEEP_STATE_DIR="$T/state-xrec" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7g a record whose status= VALUE is itself 'status=ok' still answers 3" \
+                || bad "I7g answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OXREC"; then
+  bad "I7g2 recorded=/recorded_rc= COLLIDE with a status=ok value — the printed surface reads green"
+else
+  ok "I7g2 recorded= / recorded_rc= cannot carry the literal (both values are redacted)"
+fi
+OXENV="$(WIP_SWEEP_MAX='status=ok' WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7h an unparseable bound spelled status=ok still answers 3" \
+                || bad "I7h answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OXENV"; then
+  bad "I7h2 the caller's own value reached the refusal detail — a grep consumer reads green off rc=3"
+elif grep -q '^detail=' <<<"$OXENV"; then
+  ok "I7h2 the caller value is REDACTED in the refusal and the cause is still stated"
+else
+  bad "I7h2 the refusal detail was DROPPED — the cause is gone"
+fi
+mkdir -p "$T/state-ok-in-path/status=ok-dir"
+OXPATH="$(WIP_SWEEP_STATE_DIR="$T/state-ok-in-path/status=ok-dir" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7i a never-run state dir whose PATH carries status=ok still answers 3" \
+                || bad "I7i answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OXPATH"; then
+  bad "I7i2 the state PATH reached the never-run detail — a grep consumer reads green off an rc=3 box"
+elif grep -q '^detail=no pass record' <<<"$OXPATH"; then
+  ok "I7i2 the interpolated PATH is REDACTED and the never-run detail survives"
+else
+  bad "I7i2 the never-run detail was DROPPED — the cause is gone"
+fi
+# ⛔ AND THE REDACTION MUST NOT TOUCH A GENUINE GREEN (round 9, the false-red half). A healthy record's
+# derived `status=ok` is the ONE place the literal is correct, and it must still print with exit 0 —
+# otherwise the fix trades a false green for a false red on every healthy box.
+mkdir -p "$T/state-xok"
+printf 'status=ok\nrc=0\nts=%s\n' "$(date -u '+%s')" > "$T/state-xok/wip-sweep.status"
+OXOK="$(WIP_SWEEP_STATE_DIR="$T/state-xok" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 0 ] && grep -q '^status=ok$' <<<"$OXOK" \
+  && ok "I7j a genuine status=ok record still answers ok/0 (the redaction does not red a healthy box)" \
+  || bad "I7j a healthy record answered $RC and printed: $OXOK"
 OST_RC="$(sed -n 's/^rc=//p' <<<"$OST" | tail -1)"
 [ "$OST_RC" = "3" ] \
   && ok "I7c the printed rc= is the DERIVED one (3), not the recorded rc of a stale pass" \

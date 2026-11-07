@@ -130,14 +130,30 @@ err() { echo "wip-sweep: ⛔ $*" >&2; }
 # consumer surface, so it must ANSWER on every path with a derived status/rc/detail — and it must never be
 # green over a box that cannot sweep. The checks therefore run once, below, before the reader; pass mode
 # keeps its own exit codes (2 usage, 3 refusal), and reader mode answers failed/3 with the cause.
+# ⛔ THE `status=ok` GUARANTEE MUST HOLD ON WHAT THIS SCRIPT *EMITS*, NOT ONLY ON WHAT IT PASSES THROUGH
+# (round 9). Round 8 closed the passthrough (a record's own extra line); this closes the INTERPOLATION.
+# Every `detail=`/`recorded=` value below is built by splicing a RECORD value, a CALLER value or a PATH
+# into the printed line, so the literal travelled straight through while the exit was 3 — the same
+# consumer-side false green, one hop upstream. Measured at b03c916, each answering `rc=3` and each
+# containing `status=ok` in its own output: `ts=status=ok` in the record → `detail=…('status=ok')…`;
+# `status=status=ok` in the record → `recorded=status=ok` (which is why the round-2 claim that
+# `recorded=`/`recorded_rc=` "cannot collide" was false); `WIP_SWEEP_MAX=status=ok` → the refusal
+# detail; and a state dir whose PATH contains the literal → the never-run detail.
+# REDACTED, not dropped: unlike a passthrough line (whose content is still on disk at $STATUS_FILE),
+# these lines are the ONLY place the cause is stated, so dropping them would trade a false green for an
+# unexplained refusal. The substitution is what `systemctl show`'s machine-readable surface does with
+# untrusted property content — transform the value so a parser cannot be fooled by it, rather than
+# splice it raw. Arm I7f-I7j pin every one of the four routes, and pin that the line SURVIVES.
+_redact() { printf '%s' "${1//status=ok/status=<redacted>}"; }
+
 refuse_startup() {
   if [ "${MODE:-sweep}" = status ]; then
     printf 'status=failed\n'
     printf 'rc=3\n'
-    printf 'detail=%s\n' "$2"
+    printf 'detail=%s\n' "$(_redact "$2")"
     exit 3
   fi
-  err "$2"
+  err "$(_redact "$2")"
   exit "$1"
 }
 note() { echo "wip-sweep: $*" >&2; }
@@ -453,7 +469,9 @@ if [ "$MODE" = status ]; then
     # a rotated state dir) and fell back to its own default instead of a value this tool derived.
     echo "status=never"
     echo "rc=3"
-    echo "detail=no pass record at $STATUS_FILE"
+    # $STATUS_FILE is derived from a CALLER-supplied state dir, so its path is interpolated content like
+    # any other: redacted, never dropped (this detail is the only statement of the cause).
+    printf 'detail=%s\n' "$(_redact "no pass record at $STATUS_FILE")"
     exit 3
   fi
   S_TS="$(sed -n 's/^ts=//p' "$STATUS_FILE")"
@@ -500,8 +518,13 @@ if [ "$MODE" = status ]; then
   # NO EMITTED KEY MAY CONTAIN THE SUBSTRING `status=ok` (review finding 3, round 2). The first cut
   # printed the raw value as `recorded_status=ok`, which CONTAINS `status=ok` — so a `grep 'status=ok'`
   # consumer, the very reader shape this fix targets, still read green off a stale record while the
-  # script exited 3. The recorded values are `recorded=` / `recorded_rc=` (neither can collide), and
-  # `rc=` / `status=` are emitted LAST and DERIVED, so every line-oriented reader agrees with the exit.
+  # script exited 3. The recorded values are `recorded=` / `recorded_rc=`, and `rc=` / `status=` are
+  # emitted LAST and DERIVED, so every line-oriented reader agrees with the exit.
+  # ⛔ CORRECTION (round 9): this block used to claim the two `recorded` keys "cannot collide". They
+  # CAN — the value is spliced in RAW, so a record whose status line reads `status=status=ok` printed
+  # `recorded=status=ok` and a `grep 'status=ok'` consumer read green off an rc=3 box. Both are redacted
+  # at the print below, which is where the guarantee has to be enforced: the URL-spelled keys are fine,
+  # it is the VALUE that carries the literal.
   case "$DERIVED" in
     ok) _DERIVED_RC=0 ;;
     incomplete) _DERIVED_RC=1 ;;
@@ -518,17 +541,19 @@ if [ "$MODE" = status ]; then
   # than rewritten because dropping can only REMOVE green, never add it, and the record itself is still
   # on disk at $STATUS_FILE (the refusal below names that path). Arm I7e pins it.
   grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded' | grep -v 'status=ok'
-  printf 'recorded=%s\n' "${S_ST:-<none>}"
-  printf 'recorded_rc=%s\n' "${S_RC:-?}"
+  # ⛔ EVERY VALUE SPLICED IN BELOW IS REDACTED (round 9) — see the `_redact` comment for the four
+  # measured routes and why these are rewritten while the passthrough above is dropped.
+  printf 'recorded=%s\n' "$(_redact "${S_ST:-<none>}")"
+  printf 'recorded_rc=%s\n' "$(_redact "${S_RC:-?}")"
   printf 'rc=%s\n' "$_DERIVED_RC"
   printf 'status=%s\n' "$DERIVED"
-  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$DERIVED_WHY"
+  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$(_redact "$DERIVED_WHY")"
   case "$DERIVED" in
     ok) exit 0 ;;
     incomplete) exit 1 ;;
     never) exit 3 ;;
-    stale) err "$DERIVED_WHY"; exit 3 ;;
-    *) err "the pass record at $STATUS_FILE cannot be judged (${DERIVED_WHY:-recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'}) — a human must look; see $RECORD"; exit 3 ;;
+    stale) err "$(_redact "$DERIVED_WHY")"; exit 3 ;;
+    *) err "$(_redact "the pass record at $STATUS_FILE cannot be judged (${DERIVED_WHY:-recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'}) — a human must look; see $RECORD")"; exit 3 ;;
   esac
 fi
 
