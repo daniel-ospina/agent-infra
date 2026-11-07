@@ -796,6 +796,22 @@ _after_stmt() {
     !flag && $0 ~ re { flag=1 }
   ' "$SUT"
 }
+# ⛔ ANY-OCCURRENCE IS NOT A PIN, AND FIRST-MATCH IS NOT THE LIVE STATEMENT (review round 12, P2,
+# MEASURED). `grep -qE` is satisfied by a DECOY duplicate of a pinned block placed above the real one, and
+# `_after_stmt` reads the FIRST anchor it finds — so a duplicated block let the LIVE statements be mutated
+# with every arm green (measured: a copy of the four-line hand-off block, with the live `_rattn=0`, passed).
+# An exactly-once anchor plus a next-statement read is the pair that pins ONE live chain: one occurrence,
+# each successor required to be the next STATEMENT.
+_pin_once() {  # $1 = anchored ERE, $2 = what it pins
+  _n=$(grep -cE "$1" "$SUT" 2>/dev/null || true)
+  [ "${_n:-0}" = 1 ] \
+    || bad "$2 — expected EXACTLY ONE matching line, found ${_n:-0}: a decoy duplicate satisfies an any-occurrence pin while the live statement is mutated (a second, identical copy is not a second safety net, it is a blindfold)"
+}
+_pin_next() {  # $1 = anchor ERE, $2 = the ERE its next STATEMENT must match, $3 = the consequence
+  _nx=$(_after_stmt "$1")
+  grep -qE "$2" <<<"$_nx" \
+    || bad "$3 (found: '${_nx:-MISSING}')"
+}
 
 # ── STATE 1 — ATTESTED AT HEAD: the rail runs, no reviewer is dispatched ──────────────────────────
 # (Pinned where the decision is MADE, in the search arms above: `green 7 at-head`.) What this arm adds
@@ -862,7 +878,12 @@ awk '/the red arm owns this PR"$/{f=1;next} f&&/^[[:space:]]*continue$/{found=1;
 # …and the loop must PUBLISH that state rather than let it read as 'nobody has looked at this': the head
 # HAS been reviewed and rejected, and the remedy is a fix (a new head), which is what the message says.
 _REJPUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head" record$'
-grep -qE "$_REJPUBRE"  <<<"$(grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" || true)" \
+# ⛔ `-A2` IS A WINDOW, NOT A POSITION (review round 12, P2, MEASURED): three comment lines inserted between
+# the `if` and the publish RED-ed this arm while the publish sat there unchanged — a false block on
+# documentation, and a hole in the other direction the moment a statement is what moves. The next STATEMENT
+# is the question.
+_REJNEXT=$(_after_stmt '^[[:space:]]*if \[ "\$_att" = rejected \]; then$')
+grep -qE "$_REJPUBRE"  <<<"$_REJNEXT" \
   || bad "a NOT-CLEAN record at the head must PUBLISH 'review-found-issues' (head-bound) — otherwise a PR blocked on its own rejected review is indistinguishable from a PR nobody has looked at, which is the #3489 invisibility on the one class where at-head also disables the review arm"
 _empty_arm=$(_arm "" "")
 [ "$_empty_arm" = rail ] || bad "an UNCLASSIFIABLE candidate must default to the RAIL — the arm that spends nothing — never to a paid review (got '$_empty_arm')"
@@ -1143,10 +1164,15 @@ grep -qF 'continue' <<<"$(grep -A2 -F 'log_line "$repo #$pr review $_rstate at $
 # `_rdispatched=0; _rdispatched=0`, `(( _rdispatched = 0 ))`, `export _rdispatched=0` and an `if`-wrapped
 # reset — each LIVE, each leaving `review_should_defer` seeing 0 for every later candidate and making
 # `REVIEW_PER_PASS` inert, with the suite green.
-_rd_zero=$(grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*0([^0-9]|$)' "$SUT" | wc -l | tr -d ' ')
+# ⛔ COUNT STATEMENTS, NOT DOCUMENTATION (review round 12, P2, MEASURED): the count was taken over the raw
+# file, so a COMMENT mentioning `_rdispatched=0` added a phantom second reset and RED-ed the suite on a
+# comment — a false block, and the opposite of the doctrine the hand-off arms in this same file state
+# ("two anchors separated by documentation are still adjacent"). Comments and blank lines are dropped first.
+_rd_stmt=$(grep -vE '^[[:space:]]*(#|$)' "$SUT")
+_rd_zero=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*0([^0-9]|$)' | wc -l | tr -d ' ')
 [ "$_rd_zero" = 1 ] \
   || bad "the per-pass review counter must be SET TO ZERO exactly once per pass (found ${_rd_zero:-0} zeroing assignment(s)) — a reset after the increment, however it is written (bare, '&&', arithmetic, export, inside an if), blinds review_should_defer and disables REVIEW_PER_PASS"
-_rd_inc=$(grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*\$\(\(|\(\([[:space:]]*_rdispatched[[:space:]]*=[[:space:]]*_rdispatched' "$SUT" | wc -l | tr -d ' ')
+_rd_inc=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*\$\(\(|\(\([[:space:]]*_rdispatched[[:space:]]*=[[:space:]]*_rdispatched' "$SUT" | wc -l | tr -d ' ')
 [ "$_rd_inc" = 1 ] \
   || bad "the per-pass review counter must have exactly one increment (found ${_rd_inc:-0}) — two increments spend the cap twice as fast, and none makes the cap inert"
 grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
@@ -1368,16 +1394,34 @@ grep -qE "$_RATTRE" "$SUT" \
 # Pinning a state that is read on one line and consumed two lines later is exactly the mistake this block
 # exists to stop, so it is closed here with the same helper rather than left as the one hole in the family.
 _RSTRE='^[[:space:]]*_rstate=\$\(review_state "\$_rout"\)$'
-grep -qE "$_RSTRE" "$SUT" \
-  || bad "the loop must read the review state from the record ('_rstate=\$(review_state \"\$_rout\")') — commented out it is unbound under set -u and aborts the actuator at the review arm; replaced, every head reads as TERMINAL"
-_rnxt2=$(_after_stmt "$_RSTRE")
-grep -qE "$_RATTRE" <<<"$_rnxt2" \
-  || bad "the review state must be followed by the attempt count as the VERY NEXT STATEMENT (found: '${_rnxt2:-MISSING}') — an inserted \`_rstate=clean\` makes review_action return 2, which publishes a false 'a record exists' claim and buys no review at all, while every other arm stays green"
 _RAGERE='^[[:space:]]*_rage=\$\(review_dispatch_age "\$_rout"\); _rage_rc=\$\?$'
 _RACTRE='^[[:space:]]*review_action "\$_rstate" "\$_rage" "\$_rattn"; _ract=\$\?$'
-_rnxt=$(_after_stmt "$_RATTRE")
-grep -qE "$_RAGERE" <<<"$_rnxt" \
-  || bad "the attempt count must be followed by the age read as the VERY NEXT STATEMENT (found: '${_rnxt:-MISSING}') — a statement inserted between them can ZERO the count (measured: \`_rattn=0\`), which makes review_action's attempt bound always true, leaves EXHAUSTED unreachable and buys one PAID dispatch on every pass while the suite stays green"
+_RACTIFRE='^[[:space:]]*if \[ "\$_ract" -eq 0 \]; then$'
+# ⛔ THE WHOLE INPUT CHAIN, END TO END — the pins above start at `_rstate=` and pin its SUCCESSORS, so the
+# two values that give those reads their SUBJECT were unpinned (review round 12, P2, MEASURED): inserting
+# `_rout=<decoy record>` (or `_ratt=/dev/null`) immediately before the pinned chain left every arm GREEN
+# while `review_dispatch_age` aged a record nobody read (→ `review_action retry 0 1` = WAIT, so the head is
+# never retried, never exhausted and never re-published) or the counter read a file that yields 0 (→
+# `review_action retry <huge> 0` = DISPATCH, the unbounded-paid-retry defect). Both are the #3489 class the
+# chain exists to close, one link ABOVE where it started. The chain now runs
+#   _rout= → _ratt= → _rstate= → _rattn= → _rage= → review_action → if [ "$_ract" -eq 0 ]
+# and its LAST link is equally load-bearing: `_ract=1` inserted after the predicate forces a DISPATCH for
+# every state, including the clean/attested heads that must never be re-reviewed (also measured GREEN).
+_ROUTAS='^[[:space:]]*_rout="\$RAIL_DIR/review-\$\(printf [^)]*\)-\$pr-\$head\.out"$'
+_RATTAS='^[[:space:]]*_ratt="\$RAIL_DIR/review-\$\(printf [^)]*\)-\$pr-\$head\.attempts"$'
+_pin_once "$_ROUTAS" "the loop must derive the review RECORD path ('_rout=\"\$RAIL_DIR/review-…-\$pr-\$head.out\"')"
+_pin_once "$_RATTAS" "the loop must derive the ATTEMPT-LEDGER path with its own head key ('_ratt=\"\$RAIL_DIR/review-…-\$pr-\$head.attempts\"')"
+_pin_once "$_RSTRE" "the loop must read the review state from the record ('_rstate=\$(review_state \"\$_rout\")') — commented out it is unbound under set -u and aborts the actuator at the review arm; replaced, every head reads as TERMINAL"
+_pin_once "$_RATTRE" "the loop must read the attempt count FROM THE HEAD-KEYED LEDGER — a zeroed or misdirected source leaves the count under the cap, so EXHAUSTED is unreachable in the loop and the paid retry is unbounded while the driven arms stay green"
+_pin_once "$_RAGERE" "the age must be taken by review_dispatch_age ALONE, on its own line (_rage=\$(review_dispatch_age \"\$_rout\"); _rage_rc=\$?)"
+_pin_once "$_RACTRE" "the loop must pass the three measured values into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"; _ract=\$?')"
+_pin_once "$_RACTIFRE" "the loop must branch on review_action's OWN result ('if [ \"\$_ract\" -eq 0 ]; then')"
+_pin_next "$_ROUTAS" "$_RATTAS" "the record path must be followed by the attempt-ledger path as the VERY NEXT STATEMENT — a `_rout=<decoy>` inserted here is aged instead of the record the loop acts on, and a fresh-epoch decoy reads as age 0 = WAIT for ever"
+_pin_next "$_RATTAS" "$_RSTRE" "the attempt-ledger path must be followed by the state read as the VERY NEXT STATEMENT — a `_ratt=/dev/null` inserted here makes review_attempts return 0, so the attempt bound is always true and EXHAUSTED is unreachable"
+_pin_next "$_RSTRE" "$_RATTRE" "the review state must be followed by the attempt count as the VERY NEXT STATEMENT — an inserted \`_rstate=clean\` makes review_action return 2, which publishes a false 'a record exists' claim and buys no review at all, while every other arm stays green"
+_pin_next "$_RATTRE" "$_RAGERE" "the attempt count must be followed by the age read as the VERY NEXT STATEMENT — a statement inserted between them can ZERO the count (measured: \`_rattn=0\`), which makes review_action's attempt bound always true, leaves EXHAUSTED unreachable and buys one PAID dispatch on every pass while the suite stays green"
+_pin_next "$_RAGERE" "$_RACTRE" "the age must reach review_action as the VERY NEXT STATEMENT — a statement before the call on that line, or a line in between, can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the age call itself still matches its pin"
+_pin_next "$_RACTRE" "$_RACTIFRE" "the predicate's RESULT must be the next statement branched on — an \`_ract=1\` inserted after the call forces a DISPATCH for every state, including heads a record already covers"
 # ⛔ AND THE LEDGER IS KEYED BY THE HEAD, like the record it bounds (review round 2, P2, measured):
 # dropping the head from the ledger name turns a PER-HOST/PER-HEAD budget into a PR-LIFETIME one, so the
 # first head that spends 3 attempts poisons every later head of that PR — each new head reads 3, is
