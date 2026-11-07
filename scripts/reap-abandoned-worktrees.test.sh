@@ -29,12 +29,16 @@
 # Plus: the cap survives as an OPT-IN override (an operator ceiling that silently stopped working
 # would be the same defect in mirror image), a non-numeric seam is REFUSED rather than read as
 # "unbounded" or as "cap reached", and every safety gate this arm carries is re-asserted as a
-# regression: the symlink refusal, `preserved:main-checkout`, the keep list, `git-below`, the bare-repo
-# refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
+# regression: the symlink refusal, `preserved:main-checkout`, `preserved:home-or-state` (both the HOME
+# and the pass state-dir arm), the keep list, `git-below`, the bare-repo refusal, the young floor, the
+# `--dry-run` default, and `--include-gitless` being OPT-IN.
 #
-# ⛔ EVERY CASE IS MUTATION-CHECKED (`expect_pass` then `expect_fail` against a mutated copy). A test
-# that passes against a script with the bound deleted proves nothing, and a mutation that cannot be
-# applied is counted a FAILURE — a stale mutation is a case that has silently stopped checking.
+# ⛔ THE FOUR BOUND-SHAPING CASES (A, C, D, E) ARE MUTATION-CHECKED (`expect_pass` then `expect_fail`
+# against a mutated copy); B, F and G are not, because their subjects (an `--apply` removal, the
+# operator override, the unchanged safety gates) are asserted directly and a mutation of them would
+# only reproduce the same assertion. A test that passes against a script with the bound DELETED proves
+# nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation is a case
+# that has silently stopped checking.
 #
 # Hermetic: every fixture is under $T; HOME, CELL_HOME, the state dir and the log are redirected there;
 # the process table is a SYNTHETIC `/proc` (the library's documented `LP_PROC_ROOT` seam, driven the
@@ -57,9 +61,17 @@ trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 # ⛔ THE BOX'S OWN HARNESS ENV MUST NOT LEAK IN: a cell exports CELL_HOME, and a present-but-unparseable
 # stamp makes the owner REFUSE (exit 3) — the trap its sibling suite documents. A case must fail for
 # the code's reason, never the box's.
+# ⛔ EVERY SEAM THE OWNER READS IS UNSET, not merely the ones this suite pokes. The list is derived
+# from `grep -oE '\$\{(REAP_AW_[A-Z_]+|CELL_HOME|LP_[A-Z_]+)'` over the owner, so a seam added later
+# shows up as a diff here. The mode seam is the sharp one: `REAP_AW_DRY_RUN=0` — a DOCUMENTED arming
+# path — supplies the default mode, so on a box armed through it every case that relies on the dry-run
+# default would run as an APPLY and fail for the box's reason (review of #3278, measured: A, C, E and
+# G red with `REAP_AW_DRY_RUN=0` against a correct implementation). `REAP_AW_LOG` and
+# `REAP_AW_STATE_DIR` are set per-invocation by `pass()`, so they are listed here too and re-set there.
 unset CELL_HOME REAP_AW_STAMP REAP_AW_DIRTY REAP_AW_ROOTS REAP_AW_AGED_MINUTES \
       REAP_AW_BUDGET_SECONDS REAP_AW_GITLESS_MAX REAP_AW_GITLESS_KEEP REAP_AW_PROC_ROOT \
-      LP_PROC_ROOT 2>/dev/null || true
+      REAP_AW_DRY_RUN REAP_AW_GIT_TIMEOUT REAP_AW_LIVE_PATHS REAP_AW_LOCK_STALE_SECONDS \
+      LP_PROC_ROOT LP_CENSUS_MECH 2>/dev/null || true
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
@@ -344,6 +356,23 @@ case_g() { # <owner-script>
            REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" 2>&1)"; OUT_RC=$?
     case_check "$(grep -q 'reason=not-a-worktree (no .git; --include-gitless is off)' <<<"$OUT" && echo 0 || echo 1)" \
                "without --include-gitless the whole arm is OFF"
+    # G8 the home/state guard — the one gate whose absence was MEASURED to be catastrophic (a
+    #    non-canonical `--root /tmp/` spelling reaped `/tmp//cell-home`, ~9.8 GB of `.pi`/`.venvs`).
+    #    Two arms of the same loop, so both are asserted: the HOME and the pass's own STATE DIR.
+    mk_gitless "$root" a-cellhome >/dev/null
+    age_path "$root/a-cellhome" 400
+    mk_gitless "$root" a-statedir >/dev/null
+    age_path "$root/a-statedir" 400
+    OUT="$(HOME="$root/a-cellhome" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
+    case_check "$(grep -qF "PRESERVED($root/a-cellhome, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
+               "the cell HOME is never a candidate, even AGED and sitting inside the root (preserved:home-or-state)"
+    case_check "$(grep -q '^remove .*a-cellhome' <<<"$OUT" && echo 1 || echo 0)" \
+               "and it is not reported removable either"
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$root/a-statedir" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
+    case_check "$(grep -qF "PRESERVED($root/a-statedir, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
+               "and neither is the pass's own STATE DIR (same guard, the other reference)"
     return $((CASE_FAIL > 0))
 }
 
