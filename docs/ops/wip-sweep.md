@@ -193,9 +193,9 @@ list` refused, or a path that is not a repository) adds an `unmeasured` count an
 examination of a worktree, and it always fails the pass (exit 3).
 
 ⛔ **A LISTING THAT IS SHORTER THAN GIT'S OWN ADMIN RECORDS IS A REPO-LEVEL FAILURE, NOT A CLEAN REPO.**
-The three repo-level notes are `worktree-list-failed` (the call refused), `worktree-list-empty` (it named
-no worktree at all), `worktree-list-unverifiable` (git's common dir could not be resolved, so completeness
-cannot be checked) and `worktree-list-partial`. The last one exists because `git worktree list --porcelain`
+The four repo-level notes are `worktree-list-failed` (the call refused), `worktree-list-empty` (it named
+no worktree at all), `worktree-list-unverifiable` (git's common dir could not be resolved or the call
+timed out, so completeness cannot be checked) and `worktree-list-partial`. The last one exists because `git worktree list --porcelain`
 can answer a **subset** with `rc=0` and **completely empty stderr** — so an rc check and a stderr check
 both miss it. Measured shape: damage one worktree's admin record (`.git/worktrees/<name>/gitdir`
 removed), which an interrupted `git worktree add`, a racing `prune`, or a partial restore all produce; a
