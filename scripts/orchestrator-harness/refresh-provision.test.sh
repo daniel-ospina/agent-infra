@@ -1152,8 +1152,14 @@ ck "(g5) …and the record names a NON-ANSWER, not a cause" \
    "$(case "$GB_WHY" in *'NON-ANSWER'*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ THE OVER-CLAIM THIS ROW EXISTS FOR: the arm once said "not a spent budget", which a shim sleeping
 # out a shared throttle window falsifies — that IS the budget being slept out.
-ck "(g5) …and claims NOTHING about the budget, in either direction (same predicate as (g))" \
-   "$(if claims_exhaustion "$GB_WHY"; then echo 1; else echo 0; fi)"
+# ⛔ AND IT MUST KEEP `nothing was sent`, WHICH THE SHARED PREDICATE CANNOT CARRY (#3701 review round 15,
+# P2). The pre-change row forbade that phrase here and the broadened predicate does not match it, so this
+# row NARROWED while the change's whole purpose was to broaden: the timeout arm could say "nothing was
+# sent" — which its own comment says it cannot establish — and stay green. It cannot move into
+# `claims_exhaustion`, because the rc=75 arm says `nothing was sent, so NEITHER the credential NOR the
+# budget was tested` legitimately; the two arms need DIFFERENT forbidden sets.
+ck "(g5) …and claims NOTHING about the budget, in either direction, and not that nothing was sent" \
+   "$(if claims_exhaustion "$GB_WHY"; then echo 1; else case "$GB_WHY" in *'nothing was sent'*) echo 1 ;; *) echo 0 ;; esac; fi)"
 # ⛔ (g6) THE OTHER DEFAULT SHAPE — rc=1 with a rate-limit stderr. Without this row, deleting the
 # `$(gh_probe_evidence "$prc")` interpolation from that arm left every other arm green.
 # ⛔ AND ITS PROVENANCE IS NOT CLAIMED ANY MORE (#3701 review round 12, `unverifiable`). This comment
@@ -1256,12 +1262,23 @@ while IFS= read -r gev_line; do
     *) GEV_BAD=$((GEV_BAD+1)); GEV_TAIL="${GEV_TAIL}${GEV_TAIL:+; }…$(printf '%s' "$gev_after" | cut -c1-40)" ;;
   esac
 done < <(grep -F 'GH_PROBE_CAUSE=' "$REFRESH")
-# `-ge 4`, not an exact count: this guard's job is to catch a sweep that matched NOTHING, not to lock
-# the arm count — a legitimate arm merge should not red it.
-ck "(g11) the sweep is not vacuous — it found arms interpolating evidence= (found $GEV_ARMS)" \
-   "$([ "$GEV_ARMS" -ge 4 ]; echo $?)"
+# ⛔ THE FLOOR IS THE CURRENT COUNT, DELIBERATELY (#3701 review round 15, P2). It was relaxed to `-ge 4`
+# "so a legitimate arm merge should not red it" — but at 5 arms that makes ONE arm's evidence slot
+# indistinguishable from a merge: deleting the interpolation from the `nothing is stored` arm dropped the
+# count to 4 and the suite stayed green, which is the (g9)/(g10) class this sweep was added to close. A
+# red here is a prompt to update the number, which is a cheap, visible cost; an undetected loss is not.
+GEV_EXPECT=5
+ck "(g11) the sweep is not vacuous — it found $GEV_ARMS arm(s) interpolating evidence= (expected $GEV_EXPECT; bump this when arms merge or split)" \
+   "$([ "$GEV_ARMS" -eq "$GEV_EXPECT" ]; echo $?)"
 ck "(g11) every one of them places evidence= LAST (after it: $(printf '%s' "$GEV_BAD") offender(s)${GEV_TAIL})" \
    "$([ "$GEV_BAD" -eq 0 ]; echo $?)"
+
+# ⛔ AND THE `nothing is stored` ARM'S SLOT GETS ITS OWN ROW (#3701 review round 15, P2). `(g9)` and
+# `(g10)` pin the two timeout arms; this arm had no row at all, so deleting its interpolation was
+# invisible — the class those rows exist for, one arm over.
+GSTORE_LINE="$(grep -F 'nothing is stored for the host gh is configured for' "$REFRESH" | head -1)"
+ck "(g12) the 'nothing is stored' arm interpolates evidence= LAST" \
+   "$(case "$GSTORE_LINE" in *'evidence=$(gh_probe_evidence "$prc")"') echo 0 ;; *) echo 1 ;; esac)"
 
 # ── (g8) THE EVIDENCE TAKE IS BOUNDED (#3701 round 4, P2) ─────────────────────────────────────────
 # ⛔ `GH_PROBE_CAUSE_MAX` is the ONLY bound on the stderr take, and NOTHING exercised it: deleting the
