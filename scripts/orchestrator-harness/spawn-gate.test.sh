@@ -2344,7 +2344,24 @@ grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
 grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
-rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
+# ⛔ RE-SEED, DO NOT REMOVE (fresh review of #3231, P2 — measured, and the same class the seeder above
+# exists to end). This line used to `rm` the stub with the rationale "EVERY LATER ARM RUNS ON THE REAL
+# INSTRUMENT (or its documented ABSTAIN)", and both halves of that rationale are false:
+#   * the stub in `$RO` at this point is not the healthy one — the `adopt-7` arms above install the
+#     FORK-REFUSING `CAPSTUB` (15840/15841, headroom 1), so leaving it makes every later `O="$RO"`
+#     arm answer 73 (fork) instead of the load 75 / disk 77 / mem 81 it names;
+#   * an ABSENT instrument is no longer an abstain either: since the fork floor became the 83
+#     `nodeploy` REFUSAL, `rm` hands the decision to the resolver, whose SECOND candidate is
+#     `$_sgc_here` — the directory holding the gate — and a checkout SHIPS a complete
+#     `scripts/orchestrator-harness/capacity.sh` there, so the deciding copy becomes the repo's own
+#     capacity.sh reading THIS HOST's live fork headroom. MEASURED: run from the checkout root this
+#     suite read 479/0; the SAME tree, the SAME commit run from a foreign cwd read 476/3, the three
+#     reds being the straggler-reap, the 74-is-STARTED and the headroom positive control — a fixture
+#     that inherits ambient env cannot make a claim about isolation.
+# So: restore the HEALTHY stub (present + `ok`, it can decide nothing), and assert it landed, one line
+# that cannot rot the way the comment did.
+seed_capacity_instrument "$RO"; rc=$?
+ck "the fork instrument is re-seeded HEALTHY after the fork-refusal rig (else the later arms answer 73/83)" $rc
 
 : > "$MERGE_LOG"
 
@@ -5943,11 +5960,24 @@ done
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
 # that does not exist, with this box's local witness removed so no fallback can answer either.
+# ⛔ AND THE WITNESS THAT HAD TO GO IS NOT `$RREG/state/lanes` — THAT WAS THE VACUITY ONE ARM OVER.
+# `lane_registry.py` resolves its own state root from `CELL_HOME`, then `HOME` (its `_home()`), NOT from
+# this fixture's `LANE_REGISTRY_STATE`; removing the fixture's directory therefore removed nothing the
+# probe reads, and on a box with a populated local state dir (a real fleet box — 1,740 records when this
+# was measured) the tool answered rc=0 from its DOCUMENTED local fallback, so the probe reported the
+# BOX's state instead of the SUBJECT's and the arm reddened on a healthy tree. `CELL_HOME` is the sharp
+# one: it WINS over `HOME` and a cell sets only the former. The probe is now HERMETIC — every ambient
+# state root is unset and HOME is a scratch dir — so "no local witness can answer" is a property of the
+# fixture rather than of the host: the same defect class this suite's header names (a fixture that
+# inherits ambient env cannot make a claim about isolation).
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
+mkdir -p "$TMP/no-witness"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+unreachable="$(env -u CELL_HOME -u LANE_REGISTRY_STATE -u LANE_REGISTRY_LOCAL -u LANE_REGISTRY_GIT \
+  HOME="$TMP/no-witness" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
