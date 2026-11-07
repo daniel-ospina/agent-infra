@@ -866,10 +866,16 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
         # This function runs on `--disarm` too, and `--disarm` must never be refused: it forces a
         # DISARMED render where the pin is inert, so refusing it protects nothing and instead strands the
         # arming record (`STILL ARMED … the record was NOT removed`) — the harm already measured and
-        # written down at `refuse_adopted_provisioner`. A lane-scratch arm here refused `--disarm`
-        # (rc 1, record kept) where origin/main exited 0 and removed it. The provisioner's judgement lives
-        # in `refuse_adopted_provisioner`, which runs on BOTH rendering writers and carries the verified
-        # `FORCE_MODE_FLAG`/`REPORT_ONLY` exemption — one site, one rule, and no way for the two to drift.
+        # written down at `refuse_adopted_provisioner`. The provisioner's judgement lives ONLY there: it
+        # runs on BOTH rendering writers, applies the SAME three rules (backslash, whitespace, `%`) to the
+        # value that will actually be rendered, and carries the verified `FORCE_MODE_FLAG`/`REPORT_ONLY`
+        # exemption.
+        # ⛔ `PROVISIONER` WAS ALSO IN THE BACKSLASH LOOP BELOW AND IN `refuse_systemd_unsafe_values`, AND
+        # THAT WAS A MEASURED PRE-EXISTING DEFECT (present on origin/main), not just a tidiness issue:
+        # both loops run on `--disarm` without the exemption, so a provisioner pin carrying a backslash, a
+        # space or a `%` refused the disarm and KEPT the record (rc 1, `STILL ARMED`) — the exact stranded
+        # state this file says must be impossible. Removing it from those loops is what makes this file's
+        # own claim ("one site, one rule") true instead of aspirational.
         # (Note the asymmetry with SCRIPT: a scheduled converger copy inside a worktree is SAID OUT LOUD,
         # NOT REFUSED — see `resolve_script` — while a provisioner pinned there dies with the lane. Two
         # different facts, stated in the two places each one belongs.)
@@ -891,7 +897,7 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
     # by the SCHEDULER's own parser: systemd treats a trailing backslash as a line continuation and
     # applies C-style escapes in `Environment=`, so the value the pass sees would not be this one.
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "SCRIPT=$SCRIPT" "PYTHON=$PYTHON" \
-             "REPO=$REPO" "PROVISIONER=$PROVISIONER"; do
+             "REPO=$REPO"; do
         case "${v#*=}" in
             *\\*) err "REFUSING: ${v%%=*} contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
         esac
@@ -928,7 +934,7 @@ refuse_systemd_unsafe_values() {
     local v
     [ "${TARGET:-}" = "launchd" ] && return 0
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "SCRIPT=$SCRIPT" "PYTHON=$PYTHON" \
-             "REPO=$REPO" "PROVISIONER=$PROVISIONER"; do
+             "REPO=$REPO"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so the job would never run"; return 1 ;;
             # ⛔ `%` IS A SYSTEMD SPECIFIER, TWICE OVER. systemd expands it at load time (`%h`, `%i`,
