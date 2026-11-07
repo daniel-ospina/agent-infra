@@ -128,13 +128,16 @@ TMP="$(cd "$TMP" && pwd)" || { echo "❌ SKIP-CANNOT-RUN: cannot canonicalise $T
 # `fin() { set -u; }` + an unbound read was RED ending `exit 0` and ✅ ending `exec /bin/true`, with the unbound read
 # COMPLETING (measured). The DEBUG trap below records `$-` for the `exec` command itself, so an exec'ing script
 # answers empirically too and the parser is left with the population that never runs at all. `$BASH_COMMAND` is a
-# builtin lookup bash already maintains and costs one `case` match per command; the last record written for a path
-# wins, so an EXIT record (the true end state) still overrides it.
+# builtin lookup bash already maintains and costs one `case` match per command. WHICH record answers is decided by the
+# tag and the subshell depth it carries, NOT by position in the log — see `_opts_for`.
 # ⛔ `set -T` IS REQUIRED FOR THE DEBUG TRAP TO REACH A FUNCTION BODY (review P2, cycle 96). Without functrace the DEBUG
 # trap is not inherited by shell functions, so `p() { exec /bin/true; }; p` wrote NO record and the textual parser
 # decided — the cycle-95 false PASS exactly, one layer in (measured: that body ran without nounset and printed ✅ while
-# the identical bytes with `exec` at top level reddened). Last-wins stays correct with `-T`: a subshell's record is
-# always followed by the parent's own EXIT record, which is the true end state.
+# the identical bytes with `exec` at top level reddened). ⛔ BUT `-T` ALSO SENDS THE TRAP INTO SUBSHELLS (review P2,
+# cycle 97/98), and a BACKGROUND subshell records its FORK-time state 0.4 s AFTER the parent has exited (measured:
+# `( sleep 0.4; exit 0 ) &` then `set -u` left the subshell's `E hBT` as the last line, so last-wins graded the fork).
+# That is why every record carries its trap tag AND its `${BASH_SUBSHELL}` depth, and why the reader ignores anything
+# from a non-zero depth: a subshell's exit is not this shell's end state.
 # ⛔ AND THE TRAP RETURNS 0 UNCONDITIONALLY (review P3, cycle 96). `case` propagates the `printf`'s status, so a failed
 # append (a full or unwritable log) aborted a `set -e` child at its first matching command — measured: such a body
 # printed its first line and then stopped dead. `|| :` inside the arm makes the status unconditionally 0.
@@ -158,13 +161,17 @@ if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
   else
     printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null || :
     set -T
-    trap 'printf "%s\tE\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
+    trap 'printf "%s\tE\t%s\t%s\n" "$_b" "$-" "${BASH_SUBSHELL:-0}" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
     # ⛔ EVERY RECORD IS TAGGED WITH THE TRAP THAT WROTE IT (review P2/P3, cycle 97): `E` = an END state (this EXIT trap,
     # or an `exit`/`return` about to run), `D` = a point-in-time state taken for `exec`. See `_opts_for` for why the
     # distinction is load-bearing.
+    # ⛔ `return` IS NOT AN END STATE AND A SUBSHELL'S EXIT IS NOT THIS SHELL'S END (review P2, cycle 98). A top-level
+    # `return` prints "can only 'return' from a function or sourced script" and the script CONTINUES (measured); an
+    # interior `return` leaves the function, not the shell. Both used to write `E` and win. `exit` still does, and the
+    # depth field keeps a subshell's record out of the verdict.
     trap 'case "$BASH_COMMAND" in
-            exec[[:space:]]*) printf "%s\tD\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
-            exit|exit[[:space:]]*|return|return[[:space:]]*) printf "%s\tE\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
+            exec[[:space:]]*) printf "%s\tD\t%s\t%s\n" "$_b" "$-" "${BASH_SUBSHELL:-0}" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
+            exit|exit[[:space:]]*) printf "%s\tE\t%s\t%s\n" "$_b" "$-" "${BASH_SUBSHELL:-0}" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
           esac' DEBUG
   fi
 fi
@@ -3594,14 +3601,15 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # a `TMP` containing a backslash made EVERY lookup miss its own record and the channel quietly collapsed back to the
 # textual `_setu` — i.e. cycle 93's P2 false PASS returned in silence, on the one code path added to retire it. The
 # pin section has required `ENVIRON[]` for exactly this reason since cycle 83; this is the same rule, same file.
-# ⛔ THE LAST **END** RECORD WINS, NOT THE LAST RECORD (review P2, cycle 97). `set -T` extends the DEBUG trap into
-# BACKGROUND subshells, so `( sleep 0.5; exec /bin/true ) &` writes its FORK-time `$-` after the parent's EXIT record:
-# measured, a driver that backgrounds a subshell and then does `set -u` was graded BARE (false red) and one that
-# backgrounds it and then does `set +u` was graded PROTECTED (false pass) — the verdict was the state at fork. An `E`
-# record is an end state (the EXIT trap, or an `exit`/`return` about to run); a `D` record is a point-in-time snapshot
-# taken for `exec`, used only when the script left no end record at all.
+# ⛔ THE LAST **END** RECORD FROM **THIS** SHELL WINS, NOT THE LAST LINE IN THE LOG (review P2, cycles 97-98). `set -T`
+# sends the traps into subshells, so a background `( sleep 0.4; exec /bin/true ) &` records its FORK-time state AFTER the
+# parent has exited — measured, that alone made a driver doing `set -u` after the fork grade BARE (false red) and one
+# doing `set +u` after it grade PROTECTED (false pass). So each record carries `E` (an end state: the EXIT trap, or an
+# `exit` about to run) or `D` (a point-in-time snapshot taken for `exec`), plus the `${BASH_SUBSHELL}` depth at which it
+# was written; only depth 0 counts. The last depth-0 `E` answers; a depth-0 `D` is used only when the script left no end
+# state at all (an `exec`ing shim) and, when there is NO record whatsoever, the sweep names it instead of guessing.
 _opts_for() { RQ_P="$1" awk -F'\t' '
-  $1==ENVIRON["RQ_P"] { if ($2=="E") e=$3; else d=$3 }
+  $1==ENVIRON["RQ_P"] && ($4=="" || $4=="0") { if ($2=="E") e=$3; else if ($2=="D") d=$3 }
   END { print (e != "" ? e : d) }' "$TMP/.optlog" 2>/dev/null; }
 _setu_verdict() { # $1=script -> 0 when it RUNS under nounset (empirical when possible)
   _o="$(_opts_for "$1")"
@@ -3656,7 +3664,7 @@ while IFS= read -r _il; do
 done <<EOF2
 $(sed '/^$/d' "$TMP/.inlinelog" 2>/dev/null)
 EOF2
-exec_total=0; exec_bare=""; exec_missing=""; exec_foreign=""
+exec_total=0; exec_bare=""; exec_missing=""; exec_foreign=""; exec_norecord=""
 while IFS= read -r _ex; do
   [ -n "$_ex" ] || continue
   # ⛔ A LOGGED PATH OUTSIDE `$TMP` IS NAMED, NOT DROPPED (review P2, cycle 97). `bash /dev/stdin < body` logs
@@ -3673,17 +3681,26 @@ while IFS= read -r _ex; do
   # `set -u` like everything else (inert in their one-line `exit`/`exec` bodies, which is why it costs nothing) and
   # the graded population is now exactly the logged one.
   exec_total=$(( exec_total + 1 ))
+  # ⛔ AN EXECUTED SCRIPT THAT LEFT NO END STATE IS NAMED, NOT PARSED (review P2, cycle 98). A driver that installs its
+  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end writes NO record, so `_setu_verdict` silently
+  # falls back to the textual parser — and the parser grades a `case` arm or an uncalled `fin()` wrongly in BOTH
+  # directions (measured: a bare driver of that shape printed ✅, and a genuinely protected one was named). "Executed
+  # but unobservable" must never read as clean. Measured today: 172 executed paths, 172 with a record, 0 without.
+  if [ -z "$(_opts_for "$_ex")" ]; then exec_norecord="$exec_norecord ${_ex#"$TMP"/}"; continue; fi
   _setu_verdict "$_ex" || exec_bare="$exec_bare ${_ex#"$TMP"/}"
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
+if [ -n "$exec_norecord" ]; then
+  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that replaces the hook's EXIT trap and falls off the end does this)"
+fi
 if [ -n "$exec_foreign" ]; then
   echo "      OUTSIDE \$TMP: the hook recorded an execution this sweep cannot grade —${exec_foreign} — a body run from outside the sandbox is outside the population the check names"
 fi
 if [ "$inline_total" -ne 0 ]; then
   echo "      INLINE: $inline_total bod$([ "$inline_total" -eq 1 ] && echo y || echo ies) ran through \`bash -c\`/a heredoc feed with no FILE to grade — nothing about their \`set -u\` state could be observed, so extract each into a case dir and run it as a file"
 fi
-if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$exec_foreign" ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$exec_foreign" ] && [ -z "$exec_norecord" ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
 else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, no shim exemption); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
 ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
