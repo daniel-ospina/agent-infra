@@ -407,6 +407,25 @@ if [ "$HAS_PROC" = 1 ]; then
   grep -q 'CANNOT be verified' "$D/out" \
     && ok "F6b …and it says the archive cannot be verified, so the operator knows what is unknown" \
     || bad "F6b the missing-record refusal does not say the state is unverified: $(tail -2 "$D/out")"
+
+  # ⛔ F7 — A STALE RECORD MUST NOT SATISFY THE CHECK (#3588 review, cycle 8, second pass). F6 used a
+  # FRESH world, so it only covered "no record ever existed". The reachable shape is a record left by an
+  # EARLIER pass saying `unpushed_worktrees=0`, with the tool resolved for THIS pass writing nothing: the
+  # hook would then grade the previous moment and print DONE over commits it never counted. The fixture
+  # plants exactly that leftover, and the stub is told not to write — so this reddens if the hook ever
+  # stops removing the previous record before invoking the sweep.
+  mk_world f7 || { echo "❌ fixture failed (f7)"; exit 1; }
+  D="$T/f7"
+  mkdir -p "$D/O/state"
+  printf 'unpushed_worktrees=0\n' > "$D/O/state/wip-sweep.status"   # the LAST pass's verdict, left behind
+  echo alive > "$D/alive"
+  SWEEP_NO_RECORD=1 run_quiesce f7 0; RC=$?
+  [ "$RC" -ne 0 ] \
+    && ok "F7 a LEFTOVER record from an earlier pass does NOT satisfy DONE (rc=$RC) — absence is re-measured, not inherited" \
+    || bad "F7 the hook printed DONE off a stale record left by a previous pass, over work this pass never counted"
+  grep -q 'CANNOT be verified' "$D/out" \
+    && ok "F7b …and it refuses with the unverified message, not the stale pass's verdict" \
+    || bad "F7b the stale-record path refused for some other reason: $(tail -2 "$D/out")"
 else
   skip "F4/F5/F6 the record arms need the same /proc read-back as F2 — the unconditional-archive arm H still ran"
 fi

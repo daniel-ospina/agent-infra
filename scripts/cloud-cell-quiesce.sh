@@ -160,6 +160,16 @@ else
   # the pass, so a cap is a silent partial archive: on a cell holding 40 dirty lane trees, 25 are archived,
   # 15 are deferred, and the box is handed on. `--max 0` is the documented "no cap" value and it is the
   # configuration that matches this caller's intent.
+  # ⛔ REMOVE THE PREVIOUS PASS'S RECORD BEFORE THIS ONE RUNS (#3588 review, cycle 8, second pass).
+  # The record is read below to decide `DONE`, and a record left by an EARLIER pass says
+  # `unpushed_worktrees=0` because it described a different moment. Leaving it in place makes the check
+  # satisfiable by a stale file: a sweep that exited 0 without writing its record (a foreign or older
+  # tool resolved from one of the fallback candidates) would be graded against the LAST pass's verdict
+  # and print `DONE` over commits this pass never counted. The sweep writes the record LAST and
+  # atomically, so "no record after an exit-0 pass" means THIS pass did not report — which is
+  # unverifiable, not zero. Removing it first is what makes the absence mean that.
+  WIP_ST="${WIP_SWEEP_STATUS_FILE:-$O/state/wip-sweep.status}"
+  rm -f "$WIP_ST" 2>/dev/null || true
   WIP_OUT="$(O="$O" WIP_SWEEP_STATE_DIR="$O/state" bash "$SWEEP" --apply --max 0 --repo "$REPO" 2>&1)"; WIP_RC=$?
   printf '%s\n' "$WIP_OUT" | sed 's/^/  wip-sweep: /'
   case "$WIP_RC" in
@@ -176,7 +186,6 @@ else
        # Unreadable is treated as unverified, never as zero: the record is written LAST by the sweep and a
        # pass that could not write it exits 3, so "exit 0 and no record" means the tool that ran was not
        # the one that shipped with this hook, and its silence is not evidence.
-       WIP_ST="${WIP_SWEEP_STATUS_FILE:-$O/state/wip-sweep.status}"
        WIP_UNP=""
        [ -r "$WIP_ST" ] && WIP_UNP="$(awk -F= '$1=="unpushed_worktrees"{v=$2} END{print v}' "$WIP_ST" 2>/dev/null)"
        case "${WIP_UNP:-}" in
