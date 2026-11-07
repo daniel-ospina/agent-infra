@@ -220,8 +220,15 @@ lane_scratch_shape() {
 git_dirs() { # <dir> — prints "<absolute-git-dir> <git-common-dir>", both resolved, or nothing
     command -v git >/dev/null 2>&1 || return 0
     local d="${1:-}" gitdir common
-    gitdir="$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
-    common="$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    # ⛔ THE AMBIENT GIT_* SELECTION IS SCRUBBED (re-review P2, measured). `GIT_DIR=<hub>/.git git -C <a
+    # linked worktree> rev-parse …` answers the HUB for both questions, so the two agreed and this function
+    # printed "main" for a linked worktree — the whole refusal bypassed by one exported variable (a layout
+    # this fleet invites: `/tmp/cell-ai` is a bare-configured clone). The question here is "what does GIT
+    # say about THIS DIRECTORY", so every variable that redirects git's selection is removed for the call.
+    gitdir="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+        GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+    common="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+        GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 0
     [ -n "$gitdir" ] && [ -n "$common" ] || return 0
     # ⛔ `--git-common-dir` ANSWERS A RELATIVE PATH IN A MAIN CLONE (`.git`) AND AN ABSOLUTE ONE IN A LINKED
     # WORKTREE. Compared raw, a primary clone's two answers differ by SPELLING and every primary clone would
@@ -406,7 +413,7 @@ scratch_supervisor_reason() {
         if [ -z "$(transient_root_of "$d")" ] || primary_clone_root "$d"; then declared="$d"; break; fi
     done
     [ -z "$declared" ] || return 1
-    printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries once they age out of this box'\''s window — 30 days on the fleet'\''s Ubuntu/systemd-255 image, 10 on others), and it is under none of the deployment roots this box declares (CELL_HOME=%s, HOME=%s%s)' \
+    printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries once they age out of this box'\''s window — 30 days on the fleet'\''s Ubuntu/systemd-255 image, 10 on others), and none of the deployment roots this box declares ACCEPTS it — a root may declare a temporary path only when it is itself durable or a primary git clone (CELL_HOME=%s, HOME=%s%s)' \
         "$root" "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
     return 0
 }
@@ -461,9 +468,13 @@ resolve_supervisor() {
                 err "  systemd converges it to 'failed' — and nothing pages. Every surface that asks reads a dead"
                 err "  unit, while the fleet still believes this box has a supervisor."
                 err "  Name a DURABLE supervisor instead, any one of:"
-                err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm: bash pi-bootstrap/setup.sh)"
                 err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone — not a worktree)"
                 err "    $CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh   (the harness pin)"
+                err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm's PATH — see the warning below)"
+                err "  ⛔ THE FARM DOES NOT DELIVER THIS FILE (re-review P2, measured): 'cloud-cell-supervisor.sh' is in"
+                err "    NO pi-bootstrap array — setup.sh's own comment records it as a named residual owned by #1938 —"
+                err "    so 'bash pi-bootstrap/setup.sh' alone will NOT create the .pi/agent/scripts path above. Copy it"
+                err "    from a clone that has it, or use one of the two entries above."
                 err "  …or pass one explicitly: ORCH_SUPERVISOR=<that path> bash $0 --install"
                 return 1
             fi
@@ -479,9 +490,11 @@ resolve_supervisor() {
     [ -n "$SUPERVISOR" ] || {
         err "no DURABLE cloud-cell-supervisor.sh to render — looked at \$ORCH_SUPERVISOR, \$ORCH_SUPERVISOR_PREFER, \$HOME/.pi/agent/scripts, and beside this installer."
         err "  A unit whose ExecStart a cleaning removes is not supervised: the start limit burns inside a minute,"
-        err "  systemd converges it to 'failed', and nothing pages (agent-infra#2697). Farm it first, or name a durable copy:"
-        err "    bash pi-bootstrap/setup.sh   # farms \$HOME/.pi/agent/scripts"
-        err "    ORCH_SUPERVISOR=$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh bash $0 --install"
+        err "  systemd converges it to 'failed', and nothing pages (agent-infra#2697). Name a durable copy:"
+        err "    ORCH_SUPERVISOR=${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh bash $0 --install"
+        err "  ⛔ 'bash pi-bootstrap/setup.sh' DOES NOT CREATE \$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh —"
+        err "    the supervisor is in no farm array (setup.sh records the residual; #1938 owns delivery), so the"
+        err "    farmed path is only viable on a box that already has the file there."
         err "  Durable roots this box declares: CELL_HOME=$CELL_HOME, HOME=$HOME${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
         return 1
     }
@@ -503,11 +516,28 @@ resolve_supervisor() {
 # until it restarts. Read it as "what this box will boot", which is what it measures.
 SUPERVISOR_PIN=""
 supervisor_pin() {
-    local dir repo="" sha=""
+    local dir repo="" sha="" gd
     dir="$(dirname "$SUPERVISOR")"
     if command -v git >/dev/null 2>&1; then
-        repo="$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || repo=""
-        sha="$(GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
+        # ⛔ THE SAME SCRUB AS `git_dirs` (re-review P2): an exported GIT_DIR would make the pin describe the
+        # HUB instead of the code the unit runs — a diagnostic that lies is worse than none.
+        repo="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+            GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || repo=""
+        # ⛔ AND A BARE-CONFIGURED PRIMARY CLONE HAS NO TOP LEVEL TO NAME (re-review P3, measured: this
+        # fleet's `/tmp/cell-ai` is `core.bare=true`, so `--show-toplevel` fails while `HEAD` answers). The
+        # documented pin is `<repo>@<sha>` and `unknown@unknown` is reserved for "outside any git work tree",
+        # so falling back to the git dir is the difference between a usable pin and a diagnostic that is
+        # empty precisely on the cells' own shape. `<...>/.git` is stripped when it is a suffix.
+        if [ -z "$repo" ]; then
+            gd="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+                GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
+            case "$gd" in
+                */.git) repo="${gd%/.git}" ;;
+                *) repo="$gd" ;;
+            esac
+        fi
+        sha="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
+            GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
     fi
     case "$sha" in ''|*[!0-9a-f]*) sha="unknown" ;; esac
     [ -n "$repo" ] || repo="unknown"

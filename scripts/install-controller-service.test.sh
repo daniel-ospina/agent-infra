@@ -57,7 +57,7 @@
 #       two seam strengths (a caller's preference is skipped loudly, an operator's requirement is refused).
 #       ⛔ THE §-LABELS ARE STABLE IDENTIFIERS, NOT ORDINALS — they are cited from the installer, the docs and
 #       this file's own history, so sections are APPENDED rather than renumbered. Emission order below:
-#       §P, §P6, §P7, §P2, §P3, §P4, §P5, §P8, §P9.
+#       §P, §P6, §P7, §P2, §P3, §P4, §P5, §P8, §P9, §P10.
 #       ⛔ NAMED RESIDUAL, not silently covered: `transient_root_of`'s relocated-`$TMPDIR` branch has NO arm.
 #       Every root this fixture can create lands under the fixed `$TRANSIENT_ROOTS` list (which fires first),
 #       so the `$TMPDIR` branch can only be the deciding rule on a box whose temp root is outside that list —
@@ -135,7 +135,7 @@ bnd() { timeout "$BOUND" "$@"; }
 # measured defect and `$SUP` (this checkout) may itself live in one. So the fixture FARMS the shipped
 # supervisor into its own CELL_HOME, which is both the real deployment surface and the durable root the
 # arm then asserts on. It is a COPY, never a symlink: the installer grades the RESOLVED path, so a symlink
-# back into a worktree is (correctly) refused — §P4 pins that.
+# back into a worktree is (correctly) refused — §P2 pins that.
 arm_root() { # <name> -> echoes the root
   local r="$T/$1"
   mkdir -p "$r/home" "$r/o" "$r/repo" "$r/harness" "$r/units" "$r/state" "$r/bin" \
@@ -2882,9 +2882,26 @@ if [ -d "$PG_CLONE/.git" ]; then
     esac
     [ ! -f "$PG/units/eldato-orchestrator.service" ] \
       && ok '§P7: and the unproven checkout armed nothing' || bad '§P7: the unproven checkout still armed a unit'
+    # ⛔ AN EXPORTED GIT_DIR IS NOT A LICENCE EITHER (re-review P2, measured). `GIT_DIR=<hub>/.git git -C
+    # <linked worktree> rev-parse …` answers the HUB for BOTH questions, so they agreed and `git_dirs` printed
+    # "main" — the refusal bypassed by one environment variable (and `/tmp/cell-ai` is a shape that invites it).
+    # The fixture exports exactly that; the worktree must STILL be refused.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    PG_E_RC=0; PG_E_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh GIT_DIR=$PG_CLONE/.git" inst pg --install 2>&1)" || PG_E_RC=$?
+    [ "$PG_E_RC" -ne 0 ] && ok '§P7: an exported GIT_DIR at the hub does NOT launder a linked worktree' \
+                        || bad "§P7: GIT_DIR=<hub>/.git made a linked worktree read as a primary clone and armed it — the git questions inherited the caller's selection: $PG_E_OUT"
+    case "$PG_E_OUT" in
+      *'LINKED GIT WORKTREE'*) ok '§P7: and it is still refused as a LINKED worktree' ;;
+      *) bad "§P7: the GIT_DIR attempt was refused for another reason — the git arithmetic may still have read the hub: $PG_E_OUT" ;;
+    esac
   else
     bad '§P7: the fixture could not create a linked worktree, so the git-arithmetic arm did not run'
   fi
+else
+  # ⛔ THE SAME VACUITY GUARD §P3 HAS (re-review P3). Without this, a box with no git (or a read-only
+  # TMPDIR) skipped the whole git-arithmetic block — four assertions, including the "git failed" one — and
+  # still reported failed=0, i.e. the core proof of this fix was silently unverified.
+  bad '§P7: the fixture could not create a primary clone, so the git-arithmetic arms did NOT run'
 fi
 
 
@@ -2956,6 +2973,28 @@ PPF_RC=0; PPF_OUT="$(inst ppf --install 2>&1)" || PPF_RC=$?
 grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPF/units/eldato-orchestrator.service" 2>/dev/null \
   && ok '§P3: and it records unknown@unknown rather than claiming a revision nobody read' \
   || bad '§P3: a supervisor with no git work tree recorded something other than unknown@unknown'
+# ⛔ A BARE-CONFIGURED PRIMARY CLONE IS THE CELLS' OWN SHAPE, AND IT HAS NO TOP LEVEL TO NAME (re-review P3).
+# Measured on this fleet: `/tmp/cell-ai` answers `core.bare` → true, so `rev-parse --show-toplevel` FAILS while
+# `HEAD` answers — and the pin degraded to `unknown@<sha>` exactly where the doc promises `<repo>@<sha>`.
+# The fixture builds that shape by setting `core.bare` on a real work tree (that is what the cell does).
+PPB="$(arm_root ppb)"; mk_systemctl "$PPB/bin" "$PPB/state" "$PPB/sc.log"; mk_tmux "$PPB/bin" "$PPB/tmux.log"
+PPB_REPO="$PPB/home/hub"; mkdir -p "$PPB_REPO/scripts"
+cp "$SUP" "$PPB_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPB_REPO" 2>/dev/null
+git -C "$PPB_REPO" add -A >/dev/null 2>&1
+git -C "$PPB_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+git -C "$PPB_REPO" config core.bare true >/dev/null 2>&1
+PPB_SHA="$(git -C "$PPB_REPO" rev-parse HEAD 2>/dev/null)"
+if [ -z "$PPB_SHA" ] || [ -n "$(git -C "$PPB_REPO" rev-parse --show-toplevel 2>/dev/null)" ]; then
+  bad '§P3: the fixture could not build the bare-configured-work-tree shape, so the bare-clone pin arm did NOT run'
+else
+  PPB_RC=0; PPB_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPB_REPO/scripts/cloud-cell-supervisor.sh" inst ppb --install 2>&1)" || PPB_RC=$?
+  [ "$PPB_RC" -eq 0 ] && ok '§P3: a bare-configured primary clone still installs (the /tmp/cell-ai shape)' \
+                     || bad "§P3: refused the cells' own checkout shape — false block: $PPB_OUT"
+  grep -qxF "Environment=ORCH_SUPERVISOR_PIN=$PPB_REPO@$PPB_SHA" "$PPB/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P3: and the pin still names the REPO (not unknown@sha) when git has no top level to report' \
+    || bad "§P3: the pin lost its repo half on a bare-configured work tree — expected $PPB_REPO@$PPB_SHA, got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPB/units/eldato-orchestrator.service" 2>/dev/null)"
+fi
 # ⛔ AND A UNIT RENDERED BEFORE THE PIN EXISTED DOES NOT BREAK --status: the line reports `absent` and the
 # verdict is untouched, because supervision is not the pin.
 if [ -f "$PP/units/eldato-orchestrator.service" ]; then
