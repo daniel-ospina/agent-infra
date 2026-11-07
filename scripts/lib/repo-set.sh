@@ -670,20 +670,33 @@ _rs_split_entries() {
 # reproduces EXACTLY the entries we meant to render, a non-empty `index<TAB>got<TAB>want` report for the
 # first entry that differs, or the `__UNASKABLE__` sentinel (the question could not be answered).
 #
-# ⛔ "" IS RESERVED FOR "NO DIVERGENCE", AND "" IS NOT A DIFFERENCE (review round 12, P2). The
-# first-difference report was `printf … "$line" …`, so a divergence that IS an EMPTY entry printed an
-# empty field and the caller's `[ -n "$diverged" ]` read it as agreement. Measured with a doctored
-# `pr-doctor.py` in /tmp whose `configured_repos` yields `['o/a=…', '', 'o/b=…']`, the reader printed
-# `OK — 2 repo(s)` at rc 0 — the guard SILENT on a set the doctor would split into an entry that is
-# not there. `${line:-<empty entry>}` makes the report non-empty, so it flows through the refusal the
-# same way truncation does. ("Could not ask" is a DIFFERENT case and is handled above by the
-# `__UNASKABLE__` sentinel: one sentinel, not two.)
+# ⛔ "/" IS RESERVED FOR "NO DIVERGENCE", AND AN EMPTY FIELD IS NOT A LEGIBLE DIFFERENCE (review
+# round 12, P2). ⚠️ THIS IS ABOUT THE MESSAGE, NOT THE VERDICT — and the comment must say which, because
+# the two were the SAME bug only in the pre-index shape. There, the report was `printf … "$line" …`,
+# so a divergence whose `$line` was empty printed NOTHING and the caller's `[ -n "$diverged" ]` read
+# it as agreement: measured, `OK — 2 repo(s)` at rc 0 with no message. Round 10 then made the report
+# start with the entry INDEX (`printf '%s\t…' "$i" …`), and THAT is what guarantees a non-empty report
+# — so the false pass is closed structurally, by the index, and a revert here no longer re-opens it
+# (measured: with `"$line"` restored, rc is still 1).
+# What `${line:-<empty entry>}` still buys, and why it stays: without it the refusal reads
+#   `` the doctor reads it as `` where `o/b=…` was named ``
+# i.e. it names an empty hole instead of the fault, which is the operator-facing half of the same
+# finding. With it: `the doctor reads it as <empty entry> where o/b=… was named`.
+# ⛔ KNOWN RESIDUAL, DOCUMENTED RATHER THAN PROMISED AWAY: a TRAILING empty entry is invisible here,
+# because `got="$(…)"` strips trailing newlines — `['e1','e2','']` captures as `e1\ne2` and compares
+# equal. A LEADING or MIDDLE empty entry IS caught (measured). It is unreachable with the shipped
+# doctor — `configured_repos()` does `.strip()` then splits on `[,\s]+` (pr-doctor.py:724-727), so it
+# cannot emit a trailing empty for the env path — but it is a real hole in the forward-compat promise
+# below, and closing it needs the count to travel across the seam rather than be recovered from a
+# newline-stripped capture. ("Could not ask" is a DIFFERENT case, handled above by `__UNASKABLE__`:
+# one sentinel, not two.)
 #
 # ⛔ BY ENTRIES, NOT BY COUNT (review round 9, P2). The count-only round-trip could not see a separator
 # at the END of a value: `repo_set_doctor_repos` joins with `,`, so `/x/decoy ` + `,` is one `[,\s]+` run
 # and the count stayed `n` — the value was silently TRUNCATED to `/x/decoy` (the doctor strips it
 # again), so `check` returned 0 on a set whose checkout proved a DIFFERENT repo. Comparing the actual
-# entries to the intended ones catches truncation, insertion and reordering alike.
+# entries to the intended ones catches truncation, insertion and reordering alike — EXCEPT a TRAILING
+# empty entry, which the capture strips (see the residual above); do not restate this as unconditional.
 _rs_split_divergence() {
   local rendered="${1:-}" expected="${2:-}" got
   got="$(_rs_split_entries "$rendered")"
