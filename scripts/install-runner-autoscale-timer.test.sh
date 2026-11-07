@@ -59,6 +59,14 @@ cleanup() {
         */tmp.runnerautoscale.*) rm -rf "$MT" ;;
         *) : ;;
     esac
+    case "${WT:-}" in
+        /tmp/wt-runnerautoscale.*) rm -rf "$WT" ;;
+        *) : ;;
+    esac
+    case "${WTP2:-}" in
+        /tmp/wt-prod.*) rm -rf "${WTP2%/agent-infra}" ;;
+        *) : ;;
+    esac
 }
 trap cleanup EXIT
 
@@ -195,6 +203,21 @@ ENVV=()
 # RUNNER_AUTOSCALE_SCRIPT is pinned to the stub by default: the real converger would talk to GitHub on
 # the arming preflight, which no test may do (T14 is the one case that resolves it, and it installs
 # only — no preflight).
+#
+# ⛔ THE "NOTHING RESOLVES" SEAM, MADE EXPLICIT AND HERMETIC (#3469).
+# Before this repo shipped tools/install-ci-runner-x64.sh, `resolve_provisioner`'s candidate loop found
+# nothing whenever this suite ran from its own directory, so the adoption/judgement arms below got their
+# precondition — "a re-install that cannot resolve a pin from this shell" — for FREE: from the repo not
+# carrying the file, not from anything the arm arranged. The file now exists (which is the whole point of
+# #3469), so candidate 1 (`$INFRA_ROOT/tools/install-ci-runner-x64.sh`) resolves on EVERY invocation from
+# a checkout, `adopt_installed_provisioner` short-circuits at its first line, and 29 assertions flipped red.
+# They were measuring the repo's contents — exactly the accidental dependency a suite must not have.
+# `RUNNER_AUTOSCALE_PROVISIONER` is the installer's OWN "a named pin is the whole list" seam, so pointing
+# it at a path that does not exist makes resolution fail DETERMINISTICALLY, with no dependence on cwd or on
+# what the repo happens to ship. An arm that wants a REAL pin still passes one through ENVV, which is
+# appended AFTER this default and therefore wins (`env A=1 A=2` -> A=2) — so this default restores the
+# pre-#3469 environment for the arms that relied on it and changes nothing for the arms that pin their own.
+NOWHERE_PROVISIONER="$T/home/absent-provisioner.sh"   # deliberately never created
 run_install() {
     local plat="$1" dir="$2"; shift 2
     local dirmap=()
@@ -203,7 +226,11 @@ run_install() {
     # execution spelled with a shell expansion is an unreadable effect for the hub guard, which fails
     # closed and refuses to run this suite at all from a worktree. The cd makes the literal path
     # resolvable for exactly the same reason.
-    cd "$HERE" || return 1
+    # ⛔ `RUN_INSTALL_CWD` RELOCATES THE SAME LITERAL INVOCATION, for the arms that must judge a
+    # DIFFERENT INFRA_ROOT (the lane-scratch candidate skip: candidates 1 and 2 are derived from the
+    # installer's own directory, so no seam can move them). It is empty for every other arm, so the
+    # default stays $HERE and nothing else changes.
+    cd "${RUN_INSTALL_CWD:-$HERE}" || return 1
     env HOME="$T/home" \
         RUNNER_AUTOSCALE_SCRIPT="$T/home/converger.py" \
         RUNNER_AUTOSCALE_PYTHON="$GOOD_PY" \
@@ -213,6 +240,7 @@ run_install() {
         ELDATO_PLATFORM="$plat" \
         SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" LOGINCTL="$T/bin/loginctl" \
         RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
+        RUNNER_AUTOSCALE_PROVISIONER="$NOWHERE_PROVISIONER" \
         ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
 }
@@ -237,6 +265,7 @@ run_install_noseam() {
         ELDATO_PLATFORM="$plat" \
         SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" LOGINCTL="$T/bin/loginctl" \
         RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
+        RUNNER_AUTOSCALE_PROVISIONER="$NOWHERE_PROVISIONER" \
         ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
 }
@@ -379,6 +408,187 @@ assert_eq "$RC" 1 "a transient-scratch install is refused (rc 1)"
 assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
     "the refusal names transient scratch, not a scheduler problem"
 assert_contains "$OUT" "127" "the refusal names the measured consequence (127 every tick)"
+# ⛔ AND A PROVISIONER PINNED IN LANE SCRATCH IS REFUSED — THROUGH THE PROVISIONER SEAM, NOT THROUGH
+# HOME/SCRIPT. This scoping is deliberate: `resolve_script` records the opposite decision for the
+# CONVERGER ("a worktree path is SAID OUT LOUD, NOT REFUSED — scheduling a branch's copy is a
+# legitimate test"), so the wider lane-checkout predicate is applied to the PROVISIONER only. A
+# provisioner's whole job is to still exist at the first tick; a converger copy is a legitimate thing
+# to schedule. The shapes are adopted verbatim from `scripts/install-repair-service.sh` (#2697).
+# ⛔ THE FIXTURE IS A REAL LINKED WORKTREE, NOT A DIRECTORY WITH THE RIGHT NAME (`git worktree add` WRITES
+# THE `.git` FILE). The predicate keys on that marker precisely so a durable `/tmp/wt-prod/…` checkout is
+# not swallowed — the over-block measured in fresh-context review round 17, and pinned by the negative arm
+# below. A fixture without `.git` now proves only that the name is ignored, which is the opposite of what
+# this arm is for.
+WT="/tmp/wt-runnerautoscale.$$"; mkdir -p "$WT"
+printf 'gitdir: /somewhere/.git/worktrees/wt-runnerautoscale\n' >"$WT/.git"
+printf '#!/bin/sh\n' >"$WT/inst.sh"; chmod +x "$WT/inst.sh"
+# A real fixture target, so the judgement under test is the PROVISIONER's and not "no scheduler available".
+D="$T/cwt1"; fresh "$D"; rm -f "$ARM"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT/inst.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a provisioner pinned under /tmp/wt-<issue>-<slug> is REFUSED (rc 1)"
+assert_contains "$OUT" "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE" \
+    "…naming the class it would create, with the pin it judged"
+assert_contains "$OUT" "PROVISIONER=$WT/inst.sh" "…and the value it judged"
+# ⛔ AND THE CONSEQUENCE NAMED IS THE PROVISIONER'S OWN, NOT `127` (fresh-context review round 17). A
+# doomed pin does not fail the unit before the tool runs — the pass runs fine and records `no
+# provisioner`, so the box simply can never ADD capacity. The 127 sentence belongs to SCRIPT/HOME/
+# STATE_DIR; printing it here sent the operator to fix a HOME that was never the problem.
+case "$OUT" in
+  *127*) bad "a PROVISIONER-only scratch pin must not claim 'exit 127 every tick' — a doomed pin still runs, it just cannot ADD";;
+  *) ok "a PROVISIONER-only scratch pin names its own consequence, not the 127 one";;
+esac
+assert_contains "$OUT" "no provisioner'" "…and names the consequence it does have (every pass records 'no provisioner')"
+# ⛔ AND THE *OTHER* LANE CHECKOUT SHAPE THE REPO ALREADY NAMES, because a predicate that covers one
+# shape and not the other is exactly the partial guard this suite exists to catch. Placed under $T so it
+# matches ONLY the `*/.worktrees/*` alternative and not `/tmp/wt-*`.
+WT2="$T/.worktrees/lane"; mkdir -p "$WT2"
+printf '#!/bin/sh\n' >"$WT2/inst.sh"; chmod +x "$WT2/inst.sh"
+D="$T/cwt2"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT2/inst.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a provisioner pinned under */.worktrees/<lane> is REFUSED (rc 1)"
+assert_contains "$OUT" "PROVISIONER=$WT2/inst.sh" "…and that refusal names the value it judged"
+# ⛔ AND THE CELL LANE-WORKTREE SHAPE, WHICH IS A DIFFERENT SHAPE ENTIRELY (agent-infra#3469 review P1).
+# The two arms above cover lanes at a TEMPORARY ROOT. A CELL's lanes live one level BELOW the cell home —
+# `git worktree add $HOME/wt-<slug>` is the fleet's own recipe (`repo-slug.sh:486-487`, "measured as 8
+# trees under /tmp/cell-home/wt-*") — and the reaper keys `wt-*`/`cell-wt-*` on the BASENAME AT ANY DEPTH
+# (`pi-reap-worktrees.sh:676-682`), so it deletes them. Measured before the fix, with the predicate
+# extracted verbatim: `durable` — i.e. on the platform #3469 is actually about, the guard never fired,
+# `--install` from a lane worktree pinned candidate 1, and the "can never ADD capacity" warning was
+# suppressed because a pin DID resolve. ⛔ FIXTURED UNDER $T, NOT UNDER /tmp: the predicate must match the
+# SHAPE (`wt-<slug>` as a path component), not one hard-coded root — a second `/tmp/...` arm would pass
+# against a prefix-only predicate and prove nothing about the deployment.
+# ⛔ THE FIXTURE IS A REAL LINKED WORKTREE, NOT MERELY A DIRECTORY WITH THE RIGHT NAME: the predicate
+# keys on the `.git` FILE `git worktree add` writes, because that is the fact `pi-reap-worktrees.sh`
+# actually reaps on (`is_scratch_path`, `:1250-1263`, applies its glob to the basename of each `git
+# worktree list` entry).
+CW="$T/cellfixture/wt-9307"; mkdir -p "$CW"
+printf 'gitdir: /somewhere/.git/worktrees/wt-9307\n' >"$CW/.git"
+printf '#!/bin/sh\n' >"$CW/inst.sh"; chmod +x "$CW/inst.sh"
+D="$T/cwt2b"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$CW/inst.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a provisioner pinned at a CELL lane worktree (<cellhome>/wt-<slug>) is REFUSED (rc 1)"
+assert_contains "$OUT" "PROVISIONER=$CW/inst.sh" "…and names the value it judged"
+CWC="$T/cellfixture/cell-wt-12"; mkdir -p "$CWC"
+printf 'gitdir: /somewhere/.git/worktrees/cell-wt-12\n' >"$CWC/.git"
+printf '#!/bin/sh\n' >"$CWC/inst.sh"; chmod +x "$CWC/inst.sh"
+D="$T/cwt2c"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$CWC/inst.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "…and the cell-wt-<n> spelling of the same shape is refused too"
+# ⛔ AND THE FALSE BLOCK THAT A NAME-ONLY RULE WOULD INTRODUCE (review round 3). A durable checkout whose
+# ANCESTOR happens to be called `wt-prod` is never reaped: `pi-reap-worktrees.sh` matches the BASENAME of
+# each `git worktree list` entry, and a plain directory is not one. Classifying it as lane scratch refused
+# a working configuration while telling its operator to use "a durable path" they already had.
+WTP="$T/wt-prod/agent-infra"; mkdir -p "$WTP/tools"
+printf '#!/bin/sh\n' >"$WTP/tools/install-ci-runner-x64.sh"; chmod +x "$WTP/tools/install-ci-runner-x64.sh"
+D="$T/cwt2e"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WTP/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a durable path under a 'wt-'-named ANCESTOR is NOT refused (it is not a worktree)"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$WTP/tools/install-ci-runner-x64.sh" \
+    "…and the pin is rendered, not dropped as lane scratch"
+# ⛔ AND THE SAME PATH AT A TOP-LEVEL `/tmp/wt-…`, WHICH IS THE SHAPE THAT ACTUALLY OVER-BLOCKED. The arm
+# above is under `$T` (a mktemp dir), so it never matched the old `/tmp/wt-?*` NAME arm and could not see
+# the defect: measured `/tmp/wt-prod/agent-infra/tools/…` → MATCH → refused as lane scratch, while the
+# message told a working operator their durable path "is deleted with its lane". Requiring the `.git`
+# marker is what makes the name irrelevant; this arm is the one that would go red if it came back.
+WTP2="/tmp/wt-prod.$$/agent-infra"; mkdir -p "$WTP2/tools"
+printf '#!/bin/sh\n' >"$WTP2/tools/install-ci-runner-x64.sh"; chmod +x "$WTP2/tools/install-ci-runner-x64.sh"
+D="$T/cwt2e2"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WTP2/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a durable top-level /tmp/wt-<name>/ checkout is NOT refused (the name alone is not the fact)"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$WTP2/tools/install-ci-runner-x64.sh" \
+    "…and that pin is rendered too"
+# ⛔ AND THE *CANDIDATE* DIRECTION, WHICH NOTHING ELSE IN THIS FILE EXERCISES (review P2). Every other
+# provisioner arm sets `RUNNER_AUTOSCALE_PROVISIONER`, and A NAMED PIN IS THE WHOLE LIST — so the candidate
+# loop never runs and the `skipping LANE-SCRATCH PROVISIONER CANDIDATE` note was reachable by nothing.
+# Measured at the previous head: deleting the entire skip left the suite at PASS=518 FAIL=0. To run the
+# loop, this arm removes the seam AND relocates INFRA_ROOT (candidate 1 and, with no `.git`, candidate 2)
+# into a cell lane worktree, so the next durable candidate can only be `$AGENT_INFRA_PATH`.
+LANE_WT="$T/cellfixture/wt-9307-lane"; mkdir -p "$LANE_WT/scripts" "$LANE_WT/tools"
+printf 'gitdir: /somewhere/.git/worktrees/wt-9307-lane\n' >"$LANE_WT/.git"
+cp "$INST" "$LANE_WT/scripts/install-runner-autoscale-timer.sh"
+printf '#!/bin/sh\n' >"$LANE_WT/tools/install-ci-runner-x64.sh"; chmod +x "$LANE_WT/tools/install-ci-runner-x64.sh"
+DURINFRA="$T/durable-infra"; mkdir -p "$DURINFRA/tools"
+printf '#!/bin/sh\n' >"$DURINFRA/tools/install-ci-runner-x64.sh"; chmod +x "$DURINFRA/tools/install-ci-runner-x64.sh"
+D="$T/cwt2d"; fresh "$D"
+RUN_INSTALL_CWD="$LANE_WT/scripts"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER= AGENT_INFRA_PATH="$DURINFRA" TEMPLATES_DIR="$REPO/templates/systemd" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=(); RUN_INSTALL_CWD=""
+assert_eq "$RC" 0 "an install whose only lane-scratch candidate is skippable still succeeds"
+assert_contains "$OUT" "skipping LANE-SCRATCH PROVISIONER CANDIDATE $LANE_WT/tools/install-ci-runner-x64.sh" \
+    "…naming the lane-scratch candidate it would not pin"
+assert_absent "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$LANE_WT/tools/install-ci-runner-x64.sh" \
+    "…and the artifact carries NO pin to the lane path (the doomed pin this skip exists to prevent)"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$DURINFRA/tools/install-ci-runner-x64.sh" \
+    "…it fell through to the durable candidate instead"
+# ⛔ AND `--disarm` IS STILL EXEMPT FROM THAT JUDGEMENT (#3469 review, MEASURED). `--disarm` forces a
+# DISARMED render where the pin is inert, so refusing it protects nothing: it strands the arming record on
+# a box nobody can disarm without hand-editing. Judging the provisioner inside `refuse_unusable_target`
+# (which `--disarm` also runs) did exactly that — rc 1, record KEPT — where origin/main exited 0 and
+# removed it. The judgement now lives only in `refuse_adopted_provisioner`, which carries this exemption.
+D="$T/cwt3"; fresh "$D"; rm -f "$ARM"
+OUT="$(run_install Linux "$D" --arm --reason 'disarm exemption')"
+assert_eq "$?" 0 "precondition: the box arms with a durable pin"
+assert_file "$ARM" "precondition: the arming record exists"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT2/inst.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --disarm)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "--disarm is NOT refused by a lane-scratch provisioner (the safe direction)"
+assert_nofile "$ARM" "…and the arming record was actually removed, not stranded"
+assert_absent "$OUT" "STILL ARMED" "…and the verb did not report the record stuck"
+# ⛔ AND A STRUCTURAL PIN ON THE SAME DECISION, BECAUSE THE BEHAVIOURAL ARMS CANNOT REACH EVERY SITE.
+# The provisioner must be judged at EXACTLY ONE site: `refuse_adopted_provisioner`, which carries the
+# `--disarm` exemption. Anything matching the FIELD in another predicate is a second judge without the
+# exemption — that is the bug class, and it was measured (a backslash/space/`%` pin refused `--disarm`
+# and KEPT the arming record). ⛔ KEYED ON THE FIELD, NOT ON A PREDICATE NAME: an earlier version of this
+# assertion grepped only for `is_lane_scratch`, so reverting to origin/main's own line
+# (`is_transient_scratch "$PROVISIONER"`) would have left the suite green.
+_njudge=$(grep -cE '(is_transient_scratch|is_lane_scratch) +"\$PROVISIONER"' "$INST" || true)
+if [ "$_njudge" -eq 1 ]; then
+    ok "the PROVISIONER is judged at exactly one site (refuse_adopted_provisioner)"
+else
+    bad "the PROVISIONER is judged at $_njudge sites — it must be exactly 1 (refuse_adopted_provisioner, the site with the --disarm exemption)"
+fi
+# …and the two renderer-safety loops must not carry it either: they run on `--disarm` WITHOUT the
+# exemption, which is the stranded-record regression measured on this branch.
+if sed -n '/^refuse_unusable_target()/,/^}/p;/^refuse_systemd_unsafe_values()/,/^}/p' "$INST" | grep -q 'PROVISIONER='; then
+    bad "a renderer-safety loop still judges the PROVISIONER — those run on --disarm and would strand the arming record"
+else
+    ok "the renderer-safety loops do not judge the PROVISIONER"
+fi
+# ⛔ AND THE SAME REGRESSION, BEHAVIOURALLY, ON THE THREE VALUE CLASSES IT WAS MEASURED WITH. A pin that
+# cannot be RENDERED into a live unit is still inert under `--disarm`, so every one of these must exit 0
+# and actually remove the record.
+BSP="$T/bs\\dir"; mkdir -p "$BSP"; printf '#!/bin/sh\n' >"$BSP/inst.sh"; chmod +x "$BSP/inst.sh"
+SPP="$T/sp dir"; mkdir -p "$SPP"; printf '#!/bin/sh\n' >"$SPP/inst.sh"; chmod +x "$SPP/inst.sh"
+PCTP="$T/pc%h"; mkdir -p "$PCTP"; printf '#!/bin/sh\n' >"$PCTP/inst.sh"; chmod +x "$PCTP/inst.sh"
+for _arm in "backslash:$BSP/inst.sh" "whitespace:$SPP/inst.sh" "percent:$PCTP/inst.sh"; do
+    _label=${_arm%%:*}; _pin=${_arm#*:}
+    D="$T/cwt5-$_label"; fresh "$D"; rm -f "$ARM"
+    OUT="$(run_install Linux "$D" --arm --reason "disarm $_label")"
+    assert_eq "$?" 0 "precondition: the box arms before the $_label disarm case"
+    assert_file "$ARM" "precondition: the arming record exists ($_label)"
+    ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$_pin" SUDO=false)
+    OUT="$(run_install Linux "$D" --disarm)"; RC=$?; ENVV=()
+    assert_eq "$RC" 0 "--disarm is NOT refused by a $_label provisioner pin (the safe direction)"
+    assert_nofile "$ARM" "…and the arming record was removed, not stranded ($_label)"
+    assert_absent "$OUT" "STILL ARMED" "…and the verb did not report the record stuck ($_label)"
+done
+# ⛔ AND THE OTHER HALF OF THE SCOPING: THE CONVERGER ITSELF IS *NOT* REFUSED FROM A WORKTREE. This is
+# the decision the wider predicate must not swallow (`resolve_script`: a branch's copy is a legitimate
+# thing to schedule — say it out loud, do not refuse it). Without this arm, widening the predicate to
+# the SCRIPT value would look correct to every other assertion in this file.
+WT3="$T/.worktrees/lane3"; mkdir -p "$WT3"
+cp "$T/home/converger.py" "$WT3/converger.py"
+D="$T/cwt4"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_SCRIPT="$WT3/converger.py" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a CONVERGER pinned in a worktree still installs (the recorded decision)"
+assert_contains "$OUT" "is inside a WORKTREE" "…and the worktree is SAID OUT LOUD, as decided"
 
 # ── T6: an old interpreter is refused ─────────────────────────────────────────────────────
 say_case "T6 an interpreter older than 3.12 is refused"
@@ -2094,11 +2304,31 @@ box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$SCRAT
 OUT="$(run_install Linux "$D6" --disarm)"; RC=$?
 assert_eq "$RC" 0 "--disarm still succeeds over a transient adopted pin (the safe direction must not be the blocked one)"
 assert_absent "$OUT" "STILL ARMED" "…and does not strand the record"
+# ⛔ AND THE DISARM LEAVES NO PIN IT REFUSED TO JUDGE (agent-infra#3469 review P2). Before this, the
+# re-render emitted the transient pin anyway, so `--disarm` exited 0 and `--status` on the artifact it had
+# just written exited 1 — a false red on a legitimately disarmed box. Both halves are pinned here: the
+# artifact no longer carries the refusable pin, AND the readiness verb is green on it.
+assert_absent "$(cat "$D6/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$SCRATCH/inst.sh" \
+    "the DISARMED re-render does not write the pin it declined to judge"
+OUT="$(run_install Linux "$D6" --status)"; RC=$?
+assert_eq "$RC" 0 "…so --status is GREEN on the artifact --disarm just wrote (it was rc 1, a false red)"
+# ⛔ AND A *GOOD* PIN SURVIVES A DISARM — the omission is scoped to the refusable ones, so a box does not
+# lose the pin it adopted just because it was disarmed and re-armed from a shell that cannot resolve one.
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PROV3")
+run_install Linux "$D6" --install >/dev/null 2>&1; ENVV=()
+assert_contains "$(cat "$D6/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV3" \
+    "precondition: a DURABLE pin is rendered into the artifact"
+OUT="$(run_install Linux "$D6" --disarm)"; RC=$?
+assert_eq "$RC" 0 "a disarm over a durable pin still succeeds"
+assert_contains "$(cat "$D6/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$PROV3" \
+    "…and KEEPS the durable pin (only a pin the judgement site would refuse is dropped)"
 # ⛔ THE EXEMPTION IS `--disarm`, NOT THE FLAG: `--report-only` sets the SAME `FORCE_MODE_FLAG` while being a
 # WRITING verb, so a key on the flag skipped the guard for `--install --report-only`, which then wrote the
 # artifact with the transient pin (`changed=1`, exit 0) while `--status` refused that same artifact. Pinned
 # here, in the direction that was silent.
 box_sed_i "s|RUNNER_AUTOSCALE_PROVISIONER=.*|RUNNER_AUTOSCALE_PROVISIONER=$SCRATCH/inst.sh|" "$D6/$UNIT_NAME.service"
+assert_contains "$(cat "$D6/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$SCRATCH/inst.sh" \
+    "precondition: the transient pin is in the artifact (a no-op edit would make the next line meaningless)"
 BEFORE_SUM2="$(cksum < "$D6/$UNIT_NAME.service")"
 OUT="$(run_install Linux "$D6" --install --report-only)"; RC=$?
 assert_eq "$RC" 1 "--install --report-only REFUSES a transient adopted pin (it WRITES, so the --disarm exemption must not cover it)"
