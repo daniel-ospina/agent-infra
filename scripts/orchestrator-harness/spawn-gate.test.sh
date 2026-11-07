@@ -2344,7 +2344,15 @@ grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
 grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
-rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
+# ⛔ THE SEED IS NOT REMOVED HERE ANY MORE (fresh review of #3231, P2). This line used to say
+# "EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)" and `rm` the stub — but an
+# ABSENT instrument is no longer an ABSTAIN: since the fork floor became the 83 `nodeploy` REFUSAL, a
+# rig with no instrument answers 83 BEFORE the gate an arm names ever runs. So the `rm` turned every
+# later `O="$RO"` arm (load 75 / disk 77 / mem 81, below) into a HOST decision — green wherever
+# `$O`/`AGENT_INFRA_PATH`/`~/orchestrator` happens to supply the file, red on a clean runner — which is
+# the exact host-decides class the seeder above was added to end. The healthy stub stays: it can only
+# answer `ok`, so no later arm can be decided by it, and a rig that genuinely needs the SHIPPED
+# instrument seeds its own (`$RES`, §11).
 
 : > "$MERGE_LOG"
 
