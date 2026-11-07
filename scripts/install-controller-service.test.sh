@@ -39,6 +39,29 @@
 #       a second supervisor is a second dispatcher), no service manager at all, a bad RestartSec, and
 #       an unresolved template token. Plus idempotency: a second install changes nothing, and a second
 #       uninstall is a reported no-op.
+#   §P  the ExecStart must OUTLIVE the shell that rendered it (#2697): a scratch root (a lane worktree,
+#       a temp dir no deployment root declares) is REFUSED before anything is written, and the refusal
+#       names the durable alternative — while the shape the cells really run (a harness pin under the
+#       cell home, a farmed copy, an explicit ORCH_SUPERVISOR) stays green, because a blanket "under
+#       /tmp" rule would block every cell bring-up. §P2 grades the RESOLVED path (a symlink onto a
+#       scratch tree is refused, one onto a durable tree is not), and §P3 pins the revision the unit
+#       runs into its environment so `merged ≠ running` is readable from `systemctl show`/`--status`.
+#       §P6 and §P8 are the two DRIFT GATES: the lane-scratch SHAPES are identical to
+#       install-repair-service.sh's, and the transient ROOTS are identical to runner_autoscale.py's
+#       `TRANSIENT_UNIT_PREFIXES` (the guard is only as wide as that list, and it is a copy). §P7 proves a
+#       lane worktree is decided by GIT (a LINKED worktree is refused under a durable root and with a name
+#       no pattern matches, a caller cannot launder one by declaring its own root, and a PRIMARY clone under
+#       /tmp — the cells' `/tmp/cell-ai` — still installs), §P4 is the false-block control that a cell's
+#       harness pin under `/tmp/cell-home` still installs, §P9 covers the MEASURED `/tmp/wt-*` spelling as a
+#       SHAPE (and §P is explicit that its own fixture is the root rule, not that shape), and §P5 pins the
+#       two seam strengths (a caller's preference is skipped loudly, an operator's requirement is refused).
+#       ⛔ THE §-LABELS ARE STABLE IDENTIFIERS, NOT ORDINALS — they are cited from the installer, the docs and
+#       this file's own history, so sections are APPENDED rather than renumbered. Emission order below:
+#       §P, §P6, §P7, §P2, §P3, §P4, §P5, §P8, §P9, §P10.
+#       ⛔ NAMED RESIDUAL, not silently covered: `transient_root_of`'s relocated-`$TMPDIR` branch has NO arm.
+#       Every root this fixture can create lands under the fixed `$TRANSIENT_ROOTS` list (which fires first),
+#       so the `$TMPDIR` branch can only be the deciding rule on a box whose temp root is outside that list —
+#       not constructible portably from here. Recorded, because a green arm that cannot fail is not coverage.
 #
 # Hermetic: temp HOME/state/unit dirs, stub `systemctl`/`tmux` that RECORD their argv (so "did it call
 # start/stop" is answered by evidence, not by the absence of an error), a stub supervisor built from
@@ -106,15 +129,26 @@ bnd() { timeout "$BOUND" "$@"; }
 # ── per-arm fixture ──────────────────────────────────────────────────────────────────────────────
 # Each arm gets its OWN state dir, so a pid left by one arm can never be read as evidence by another
 # (the supervisor's ownership reads are path-scoped, and a shared $O would make them cross-talk).
+# ⛔ EVERY ARM IS HANDED A FARMED SUPERVISOR, LIKE A REAL CELL (agent-infra#2697). The installer now
+# REFUSES to render an ExecStart under a temporary root unless the path is inside a root the box DECLARES
+# (its cell home, its home, or $AGENT_INFRA_PATH) — because a lane worktree under /tmp is exactly the
+# measured defect and `$SUP` (this checkout) may itself live in one. So the fixture FARMS the shipped
+# supervisor into its own CELL_HOME, which is both the real deployment surface and the durable root the
+# arm then asserts on. It is a COPY, never a symlink: the installer grades the RESOLVED path, so a symlink
+# back into a worktree is (correctly) refused — §P2 pins that.
 arm_root() { # <name> -> echoes the root
   local r="$T/$1"
-  mkdir -p "$r/home" "$r/o" "$r/repo" "$r/harness" "$r/units" "$r/state" "$r/bin"
+  mkdir -p "$r/home" "$r/o" "$r/repo" "$r/harness" "$r/units" "$r/state" "$r/bin" \
+           "$r/home/.pi/agent/scripts"
+  cp -f "$SUP" "$r/home/.pi/agent/scripts/cloud-cell-supervisor.sh" 2>/dev/null || true
   if [ ! -d "$r/repo/.git" ]; then
     git init -q "$r/repo" 2>/dev/null
     git -C "$r/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
   fi
   printf '%s\n' "$r"
 }
+# farmed_sup <arm root> — the supervisor this fixture's HOME farms (the installer's 2nd candidate).
+farmed_sup() { printf '%s\n' "$1/home/.pi/agent/scripts/cloud-cell-supervisor.sh"; }
 
 # ── ⛔ NO TEST MAY REACH THE REAL SYSTEM THROUGH AN UNSTUBBED NAME (#2910) ───────────────────────
 # THE DEFECT THIS PRELUDE EXISTS FOR. §B and §F execute a SLICE of `cloud-cell-supervisor.sh` in a
@@ -233,9 +267,22 @@ inst() {
   # root login installed a root-owned, enabled, unusable unit). This suite runs on root runners too, so the
   # fixture carries the same explicit opt-in an operator would; the one arm that must SEE the refusal
   # (`§G`, root is refused) runs `inst` with `EXTRA_ENV` unsetting it, so the rule is exercised, not bypassed.
-  bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
+  # ⛔ AND THE DEPLOYMENT ROOT IS PINNED TOO, BECAUSE #2697's GUARD READS IT (agent-infra#2697). The ExecStart
+  # refusal accepts a temporary-root path only when the path is inside a root this box DECLARES — its CELL_HOME,
+  # its HOME, or `$AGENT_INFRA_PATH`. An ambient `AGENT_INFRA_PATH` (every cell exports one; this box has one)
+  # would therefore decide a §P verdict from OUTSIDE the fixture. Pinned to a path that does not exist, so the
+  # only roots in play are the fixture's own — exactly what a hermetic arm needs.
+  # ⛔ AND THE PIN RECORD IS PINNED TOO (review-5 P2, measured). #2697's guard now reads `HARNESS_PIN_FILE` /
+  # `HARNESS_PIN_DIR`, and EVERY cell hands those to its children (`cloud-cell-supervisor.sh`,
+  # `launchd-controller.sh`), so a lane running this suite ON A CELL had the box's real pin ambient: measured
+  # `HARNESS_PIN_FILE=<a foreign record> bash this-suite` → `passed=358 failed=2`, both §P4, i.e. green in CI
+  # and RED on the fleet. Same class as `AGENT_INFRA_PATH` above: an ambient seam decides a §P verdict from
+  # outside the fixture, so both are unset and each arm opts in via EXTRA_ENV when it wants one.
+  bnd env -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR \
+      SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
       CONTROLLER_SYSTEM_UNIT_DIR="$r/units" CONTROLLER_USER_UNIT_DIR="$r/nouser" CONTROLLER_ALLOW_ROOT=1 \
       TEMPLATES_DIR="${TPL_DIR:-$(dirname "$TPL")}" HOME="$r/home" CELL_HOME="$r/home" \
+      AGENT_INFRA_PATH="$r/layer" \
       ENV_FILE="$r/home/keys.env" O="$r/o" PATH="$r/bin:$PATH" ELDATO_PLATFORM="${PLATFORM:-Linux}" \
       ${EXTRA_ENV:-} bash "$INST" "$@"
 }
@@ -243,7 +290,8 @@ inst() {
 # is the fixture's, so an arm can never read or touch this box's real units.
 sup() {
   local r="$T/$1"; shift
-  bnd env -u OR SYSTEMCTL="$r/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
+  bnd env -u OR -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR \
+      SYSTEMCTL="$r/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
       CONTROLLER_USER_UNIT_DIR="$r/nouser" PATH="$r/bin:$PATH" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" REPO="$r/repo" SCOPE=own HARNESS="$r/harness" \
       HARNESS_REPO="$HARNESS_SRC" HARNESS_FETCH=0 HARNESS_REF="$HARNESS_REF_SHA" \
@@ -288,8 +336,11 @@ if [ -f "$UNIT" ]; then
   u 'Environment=CONTROLLER_UNIT=eldato-orchestrator.service' \
     && ok 'the unit CARRIES its own name — the supervisor reads it, so every verb addresses THIS unit' \
     || bad 'the unit does not render CONTROLLER_UNIT — the verbs address a default name instead ($UNIT)'
-  u "ExecStart=/bin/bash $SUP start" && ok "ExecStart runs the shipped supervisor's start" \
-    || bad "ExecStart does not name the shipped supervisor ($SUP)"
+  # ⛔ THE FARMED COPY, NOT $SUP (agent-infra#2697): the fixture farms the shipped supervisor into its own
+  # CELL_HOME (see `arm_root`) because the installer refuses an ExecStart under a temporary root no deployment
+  # root declares — and $SUP is this checkout, which may itself be a lane worktree. The bytes are identical.
+  u "ExecStart=/bin/bash $(farmed_sup "$A") start" && ok "ExecStart runs the supervisor's start" \
+    || bad "ExecStart does not name the farmed supervisor ($(farmed_sup "$A"))"
   u "User=$(id -un)" && ok 'the service runs as the invoking user, not root' \
     || bad "User= is not the invoking user ($(id -un))"
   # The tmux path passes `O='$O'` explicitly, so the unit must carry it too: the supervisor sources
@@ -374,7 +425,7 @@ chmod +x "$US/bin/loginctl"
 # SUDO=false makes the system probe fail, so the walk reaches the user manager (the stub answers
 # `--user show-environment`). SYSTEMD_UNIT_DIR is NOT set: it would pin the override target instead.
 UU_RC=0
-UU_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
+UU_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
           ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || UU_RC=$?
@@ -422,7 +473,7 @@ esac
 printf '%s\n' '#!/bin/bash' 'case "$*" in *Linger*) printf "no\n" ;; *) exit 0 ;; esac' > "$US/bin/loginctl"
 chmod +x "$US/bin/loginctl"
 rm -f "$UUNIT"
-UL_RC=0; UL_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" ORCH_SUPERVISOR="$SUP" \
+UL_RC=0; UL_OUT="$(bnd env SUDO=false SYSTEMCTL="$US/bin/systemctl" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$US/home" CELL_HOME="$US/home" \
           ENV_FILE="$US/home/keys.env" O="$US/o" PATH="$US/bin:/usr/bin:/bin" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || UL_RC=$?
@@ -964,7 +1015,7 @@ esac
 printf '%s\n' '#!/bin/bash' 'exit 1' > "$G/bin/systemctl-fail"; chmod +x "$G/bin/systemctl-fail"
 mkdir -p "$G/nobin"; ln -sf "$G/bin/systemctl-fail" "$G/nobin/systemctl"
 GN_RC=0
-GN_OUT="$(bnd env SUDO=false SYSTEMCTL="$G/bin/systemctl-fail" ORCH_SUPERVISOR="$SUP" \
+GN_OUT="$(bnd env SUDO=false SYSTEMCTL="$G/bin/systemctl-fail" \
           TEMPLATES_DIR="$(dirname "$TPL")" HOME="$G/home" CELL_HOME="$G/home" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 PATH="$G/nobin:/usr/bin:/bin" bash "$INST" --install 2>&1)" || GN_RC=$?
 [ "$GN_RC" -ne 0 ] && ok 'install: refuses when NO service manager is available (never a silent no-op)' \
@@ -988,7 +1039,7 @@ mkdir -p "$G/tpl"; cp "$TPL" "$G/tpl/eldato-orchestrator.service"
 { printf 'Description={{NOPE}}\n'; grep -v '^Description=' "$TPL"; } > "$G/tpl/mutant.tmp"
 mv -f "$G/tpl/mutant.tmp" "$G/tpl/eldato-orchestrator.service"
 GT_RC=0
-GT_OUT="$(bnd env ORCH_SUPERVISOR="$SUP" SYSTEMCTL="$G/bin/systemctl" SYSTEMD_UNIT_DIR="$G/units" \
+GT_OUT="$(bnd env SYSTEMCTL="$G/bin/systemctl" SYSTEMD_UNIT_DIR="$G/units" \
           TEMPLATES_DIR="$G/tpl" HOME="$G/home" CELL_HOME="$G/home" PATH="$G/bin:/usr/bin:/bin" \
           ELDATO_PLATFORM=Linux CONTROLLER_ALLOW_ROOT=1 bash "$INST" --install 2>&1)" || GT_RC=$?
 [ "$GT_RC" -ne 0 ] && ok 'install: refuses a template with an unresolved token' \
@@ -1643,7 +1694,14 @@ HW="$(arm_root hw)"; mk_systemctl "$HW/bin" "$HW/state" "$HW/sc.log"
 : > "$HW/units/eldato-orchestrator.service"; : > "$HW/state/enabled"
 printf '#!/bin/bash\ncase "${1:-}" in\n  has-session) exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$HW/bin/tmux"
 chmod +x "$HW/bin/tmux"
-HW_RC=0; HW_OUT="$(SUP_EXTRA_ENV="ORCH_FOREGROUND=1 CONTROLLER_HANDOVER_TIMEOUT=4" sup hw start 2>&1)" || HW_RC=$?
+# ⛔ BOTH BOUNDS, AND THE ORPHAN ONE IS THE ONE THAT APPLIES HERE (measured while landing #2697). The arm's
+# tmux stub answers `has-session` with NO owner, so `start` takes the ORPHAN wait — not the handover wait this
+# arm used to set — and the orphan default is 60 s. The suite bounds every call at 90 s, so on a LOADED box
+# (lanes running, ~16 load average measured) the 60 s wait plus startup crossed the bound: `timeout` SIGTERMed
+# the supervisor, the rc was non-zero, and the message this arm asserts had never been printed — a false RED
+# whose cause was the harness bound, not the behaviour. Bounding the orphan wait too keeps the arm about what
+# it is about.
+HW_RC=0; HW_OUT="$(SUP_EXTRA_ENV="ORCH_FOREGROUND=1 CONTROLLER_HANDOVER_TIMEOUT=4 CONTROLLER_ORPHAN_TIMEOUT=4" sup hw start 2>&1)" || HW_RC=$?
 [ "$HW_RC" -ne 0 ] && ok 'start: a session that is not provably this state dir is REFUSED, not waited on forever' \
                    || bad "start: waited/returned 0 over a session it could not attribute — $HW_OUT"
 case "$HW_OUT" in
@@ -2673,6 +2731,1003 @@ case "$FRAG_SYSTEM_CALLS" in
   *say*open*osascript*afplay*) ok '§O: the recorder covers the other macOS binaries a fragment could reach (open/osascript/afplay), not just `say`' ;;
   *) bad "§O: a fragment could still reach a system binary unrecorded — FRAG_SYSTEM_CALLS='$FRAG_SYSTEM_CALLS' (#2910)" ;;
 esac
+
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# §P — the ExecStart must OUTLIVE the shell that rendered it (agent-infra#2697)
+# ══════════════════════════════════════════════════════════════════════════════════════════════
+# THE DEFECT. The only guard on the rendered ExecStart was `[ -f "$SUPERVISOR" ]` AT RENDER TIME, so the
+# installer pinned the fleet's dispatcher to whatever checkout the operator happened to run `--install`
+# from. MEASURED on cell-1: `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start` —
+# a LANE WORKTREE at an unmerged branch. Once that path goes, the unit's ExecStart cannot resolve; its start
+# limit (3 attempts inside 300 s) burns inside a minute, systemd converges it to `failed`, and nothing pages:
+# an inert enforcer that reads as a dead unit, not a supervised one. MEASURED again on cell-4 as a TEST
+# render installed as the real unit (`ExecStart=… "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r" --dry-run`).
+#
+# ⛔ THE ARMS BELOW ARE PAIRED IN BOTH DIRECTIONS, WHICH IS THE WHOLE POINT: a guard that refused every
+# temporary path would pass the refusal arms and be a FALSE BLOCK on every cell — the cells keep their HOME
+# (`/tmp/cell-home`) and their harness pin (`/tmp/cell-home/harness/<sha>/…`, the shape cell-3 measured as
+# CORRECT) under /tmp. So each refusal arm has a control that must stay green.
+say_case 'install refuses an ExecStart that a cleaning removes, and keeps the roots a cell really uses'
+P="$(arm_root p)"; mk_systemctl "$P/bin" "$P/state" "$P/sc.log"; mk_tmux "$P/bin" "$P/tmux.log"
+# The measured shape: a real supervisor file, under a temp root that no deployment root declares.
+# ⛔ THIS FIXTURE IS NOT THE `/tmp/wt-*` SHAPE, AND THE ARM MUST NOT CLAIM IT IS (re-review P3). `$T` is
+# `<temp>/ctlunit.XXXX`, so `$T/wt-p-fixture` matches no lane-scratch pattern and is refused by the
+# TRANSIENT-ROOT rule. The measured `/tmp/wt-*` path has its own behavioural arm (§P9); this one covers the
+# root rule.
+SCRATCH_P="$T/wt-p-fixture/scripts"; mkdir -p "$SCRATCH_P"
+cp "$SUP" "$SCRATCH_P/cloud-cell-supervisor.sh"
+P_OUT=""; P_RC=0
+P_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P_RC=$?
+[ "$P_RC" -ne 0 ] && ok '§P: a scratch-root supervisor (a temp root no declaration covers) is REFUSED' \
+                  || bad "§P: installed a unit whose ExecStart a tmp cleaner removes — the #2697 defect, re-shipped: $P_OUT"
+# ⛔ GATED ON THE REFUSAL, NOT ON THE OUTPUT ALONE (review-5 P3). A SUCCESSFUL install prints
+# `exec:    /bin/bash <path> start`, which contains the path — so with the guard deleted this arm read a
+# success report as a refusal that named what it rejected.
+if [ "$P_RC" -ne 0 ]; then
+  case "$P_OUT" in
+    *"$SCRATCH_P/cloud-cell-supervisor.sh"*) ok '§P: the refusal NAMES the offending path (an operator can see what was rejected)' ;;
+    *) bad "§P: the refusal does not name the rejected path — $P_OUT" ;;
+  esac
+else
+  bad "§P: no refusal happened, so 'names the offending path' is untested — $P_OUT"
+fi
+case "$P_OUT" in
+  *'.pi/agent/scripts/cloud-cell-supervisor.sh'*) ok '§P: the refusal names the durable alternative (the farm)' ;;
+  *) bad "§P: the refusal does not say where a DURABLE supervisor would be — an operator is left with no remedy: $P_OUT" ;;
+esac
+[ ! -f "$P/units/eldato-orchestrator.service" ] \
+  && ok '§P: and NOTHING was written — the refusal is fail-closed, not a half-install' \
+  || bad '§P: a refused install still left a unit file behind — a boot-armed path a cleaning removes'
+# ⛔ THE NEGATIVE CONTROL THAT MAKES THE ARM MEAN SOMETHING: the SAME bytes, under a root the box declares.
+DURABLE_P="$P/home/scripts"; mkdir -p "$DURABLE_P"
+cp "$SUP" "$DURABLE_P/cloud-cell-supervisor.sh"
+P2_RC=0; P2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$DURABLE_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P2_RC=$?
+[ "$P2_RC" -eq 0 ] && ok '§P: the SAME supervisor under the cell home INSTALLS (the refusal is the root, not the file)' \
+                   || bad "§P: refused a durable supervisor — the guard is a false block on the shape a cell uses: $P2_OUT"
+grep -qxF "ExecStart=/bin/bash $DURABLE_P/cloud-cell-supervisor.sh start" "$P/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P: and the unit names that durable path, resolved' \
+  || bad '§P: the installed unit does not name the durable supervisor that was graded'
+# ⛔ A LANE WORKTREE IS REFUSED WHEREVER IT LIVES — including under a root the box DECLARES, which is the
+# other half of the measured class (a lane's worktree under $HOME is deleted when the lane ends).
+WT_P="$P/home/agent-infra/.worktrees/lane-2697/scripts"; mkdir -p "$WT_P"
+cp "$SUP" "$WT_P/cloud-cell-supervisor.sh"
+rm -f "$P/units/eldato-orchestrator.service"
+P3_RC=0; P3_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$WT_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P3_RC=$?
+[ "$P3_RC" -ne 0 ] && ok '§P: a .worktrees/ supervisor is REFUSED even inside the cell home' \
+                   || bad "§P: installed from a lane worktree — the measured #2697 shape, one directory deeper: $P3_OUT"
+case "$P3_OUT" in
+  *'lane-scratch shape'*) ok '§P: and the refusal says it is a lane-scratch shape (not merely "under /tmp")' ;;
+  *) bad "§P: the .worktrees refusal does not name the reason — $P3_OUT" ;;
+esac
+# ⛔ THE PREVIEW VERB REFUSES TOO: `--dry-run` is how an operator inspects a render before arming it, so a
+# preview that printed a scratch ExecStart would be the instruction to install one.
+rm -f "$P/units/eldato-orchestrator.service"    # so the two assertions below are about THIS arm, not P2's unit
+P5_RC=0; P5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst p --dry-run 2>&1)" || P5_RC=$?
+[ "$P5_RC" -ne 0 ] && ok '§P: --dry-run refuses the same render (a preview never prints an unarmable ExecStart)' \
+                   || bad "§P: --dry-run printed a scratch ExecStart without refusing — $P5_OUT"
+[ ! -f "$P/units/eldato-orchestrator.service" ] \
+  && ok '§P: and the dry run wrote nothing' || bad '§P: --dry-run wrote a unit'
+
+# ── §P6 — the lane-scratch shape list is ONE list, asserted, because two copies drift ────────────
+# `scripts/install-repair-service.sh` refuses the same shapes for the repair unit. The installer mirrors it
+# (with a pointer), and this arm is what keeps the mirror honest: a shape added on one side and not the other
+# is exactly the drift that admits the next measured path.
+# ⛔ ONE EXTRACTOR FOR BOTH SIDES, AND IT DOES NOT CARE HOW THE ARM IS SPELLED (cycle-2 P2, MEASURED). Two
+# separately-written parsers drifted exactly as the lists do: the repair side anchored the line end at `)`, so
+# an arm written `…|/srv/scratch-*) die "…" ;;` — body on the pattern's own line — parsed to NOTHING while the
+# arm stayed green, one spelling over from the blindness the previous fix removed. An arm is a line whose text
+# BEFORE the first `)` contains no quote, semicolon or whitespace: a `case` pattern is a bare glob, and a body's
+# first word never is. Both call sites use this ONE function, and the §P6 mutation arm below feeds it an
+# inline-body arm, so the extractor itself is covered rather than trusted.
+shape_list() { # <file> <the case block's opening line> — every pattern token, one per line, deduped
+  awk -v open="$2" '
+    index($0, open) > 0 { inb=1; next }
+    inb && /^[[:space:]]*esac[[:space:]]*$/ { inb=0 }
+    inb {
+      line=$0; sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^#/) next
+      i=index(line, ")"); if (i==0) next
+      pre=substr(line, 1, i-1)
+      if (pre=="" || pre ~ /[";[:space:]]/) next
+      n=split(pre, a, "|")
+      for (k=1; k<=n; k++) if (a[k] != "") print a[k]
+    }' "${1:-}" 2>/dev/null | sort -u
+}
+say_case 'the lane-scratch shape list is identical in this installer and in install-repair-service.sh'
+REPAIR_SH="$(dirname "$INST")/install-repair-service.sh"
+# ⛔ COMPARED AS SETS, NOT GREPPED FOR FOUR LITERALS (re-review P2). The first version of this arm looped a
+# hardcoded list, so it caught a REMOVAL and was blind to an ADDITION: a shape added to
+# install-repair-service.sh (the authority) left the arm green while this installer kept admitting it — the
+# exact drift the arm exists to catch. Each side is parsed from its own `case` statement and the two sets are
+# `comm`ed, so a shape added OR removed on either side reddens. (§P8 does the same for the OTHER list, the
+# transient roots, against runner_autoscale.py — two lists, two owners, two gates.)
+SH_SHAPES="$(sed -n '/^lane_scratch_shape()/,/^}/p' "$INST" 2>/dev/null | shape_list - 'case ')"
+REPAIR_SHAPES=""
+if [ -f "$REPAIR_SH" ]; then
+  # ⛔ PARSED STRUCTURALLY, NOT BY THE FIRST LINE THAT MENTIONS `.worktrees` (re-review P2, measured). The
+  # previous form was `grep -n '\.worktrees' | grep -m1 ')'`: it read ONE line AND only a line containing
+  # `.worktrees`, so a shape added to the repair file as its own `case` arm (`/tmp/lane-*|/srv/scratch-*)`
+  # was INVISIBLE while the arm stayed green — the drift this gate exists to catch, admitted by the gate
+  # itself. Reproduced: a mutated `install-repair-service.sh` with that second arm parsed to the SAME set as
+  # before. Every pattern line of the `case` is now collected, so an addition reddens like a removal.
+  REPAIR_SHAPES="$(shape_list "$REPAIR_SH" 'case "$SCRIPTS_DIR" in')"
+fi
+if [ -z "$SH_SHAPES" ] || [ -z "$REPAIR_SHAPES" ]; then
+  bad '§P6: could not read BOTH shape lists, so drift cannot be shown — an arm that passes on an unreadable side is vacuous'
+else
+  printf '%s\n' "$SH_SHAPES" > "$T/p6-shapes-here.txt"
+  printf '%s\n' "$REPAIR_SHAPES" > "$T/p6-shapes-repair.txt"
+  P6_ONLY_HERE="$(comm -23 "$T/p6-shapes-here.txt" "$T/p6-shapes-repair.txt" | tr '\n' ' ')"
+  P6_ONLY_REPAIR="$(comm -13 "$T/p6-shapes-here.txt" "$T/p6-shapes-repair.txt" | tr '\n' ' ')"
+  [ "$SH_SHAPES" = "$REPAIR_SHAPES" ] \
+    && ok "§P6: both files name the same $(printf '%s\n' "$SH_SHAPES" | grep -c .) lane-scratch shapes" \
+    || bad "§P6: the shape lists DRIFTED — a shape one side refuses is ADMITTED by the other (only-installer=[${P6_ONLY_HERE% }] only-install-repair-service=[${P6_ONLY_REPAIR% }])"
+  # ⛔ AND THE EXTRACTOR IS COVERED ITSELF (cycle-2 P2, MEASURED). A drift gate whose PARSER has a blind spot is
+  # the vacuity this section exists to avoid, and the previous parser was blind to exactly the arm spelling an
+  # author is most likely to add: `pattern) body ;;` on ONE line — measured, it parsed to the identical four
+  # shapes while the repair unit refused two more. The mutant below carries that spelling as a SECOND arm, so a
+  # parser that cannot see it reddens here instead of silently certifying an unread list.
+  P6_MUT="$T/p6-repair-inline.sh"
+  awk '{ print } index($0, "case \"$SCRIPTS_DIR\" in") > 0 { print "        /tmp/inline-a*|/srv/inline-b*) die \"inline body\" ;;" }' \
+    "$REPAIR_SH" > "$P6_MUT" 2>/dev/null
+  P6_MUT_SHAPES="$(shape_list "$P6_MUT" 'case "$SCRIPTS_DIR" in')"
+  case "$P6_MUT_SHAPES" in
+    *'/tmp/inline-a*'*'/srv/inline-b*'*|*'/srv/inline-b*'*'/tmp/inline-a*'*)
+      ok '§P6: an arm written with its body on the SAME line is seen by the extractor (the gate is not blind to the next spelling)' ;;
+    *)
+      bad "§P6: the extractor MISSED an inline-body arm — this gate would stay green over an added shape: got [$(printf '%s ' $P6_MUT_SHAPES)]" ;;
+  esac
+fi
+
+# ── §P7 — "lane worktree" is decided by GIT, and no declaration launders one ─────────────────────
+# ⛔ THE ESCAPE A REVIEWER MEASURED (re-review P1). The guard accepts a temporary-root path when a DEPLOYMENT
+# ROOT declares it, and `cloud-cell-bringup.sh` declares its layer (`AGENT_INFRA_PATH=$LAYER_ROOT`) — but the
+# layer IS `self_root` whenever a lane runs the bring-up from its own checkout, so a caller could declare the
+# very scratch checkout it was arming. A name list cannot be this rule either: the measured path was
+# `/tmp/wt-2433-fu`, and a copy nested one fixture deeper (`/tmp/<x>/wt-2433-fu/…`) matches no pattern. What
+# MAKES a lane checkout one is that git records it as a LINKED worktree, so the test is git's own arithmetic
+# — and the control that a PRIMARY clone under /tmp (the cells' `/tmp/cell-ai`) is still admitted is the arm
+# that keeps this from becoming a false block on every cell.
+say_case 'a declared root cannot launder a lane worktree, and a primary clone under /tmp still installs'
+PG="$(arm_root pg)"; mk_systemctl "$PG/bin" "$PG/state" "$PG/sc.log"; mk_tmux "$PG/bin" "$PG/tmux.log"
+PG_SCRATCH="$T/r2697d/wt-2433-fu/scripts"; mkdir -p "$PG_SCRATCH"
+cp "$SUP" "$PG_SCRATCH/cloud-cell-supervisor.sh"
+# (a) the caller declares the scratch tree itself — the measured escape
+PG_A_RC=0; PG_A_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_SCRATCH/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$T/r2697d" inst pg --install 2>&1)" || PG_A_RC=$?
+[ "$PG_A_RC" -ne 0 ] && ok '§P7: declaring the scratch tree as AGENT_INFRA_PATH does NOT admit it (a declaration is not a signature)' \
+                     || bad "§P7: a caller laundered a scratch ExecStart by declaring its own root — the #2697 defect, now with the guard reporting it durable: $PG_A_OUT"
+[ ! -f "$PG/units/eldato-orchestrator.service" ] \
+  && ok '§P7: and nothing was armed for it' || bad '§P7: the laundering attempt still wrote a unit'
+# (b) the control: a PRIMARY clone under /tmp — `/tmp/cell-ai`, the cells' own checkout — does declare
+PG_CLONE="$T/cell-ai"; mkdir -p "$PG_CLONE/scripts"
+cp "$SUP" "$PG_CLONE/scripts/cloud-cell-supervisor.sh"
+git init -q "$PG_CLONE" 2>/dev/null
+git -C "$PG_CLONE" add -A >/dev/null 2>&1
+git -C "$PG_CLONE" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -d "$PG_CLONE/.git" ]; then
+  PG_B_RC=0; PG_B_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_CLONE/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_CLONE" inst pg --install 2>&1)" || PG_B_RC=$?
+  grep -qxF "ExecStart=/bin/bash $PG_CLONE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P7: a PRIMARY clone under /tmp (the /tmp/cell-ai shape) still installs — the rule is not a blanket /tmp refusal' \
+    || bad "§P7: refused the cells' own /tmp checkout — this guard would block cell bring-up: $PG_B_OUT"
+  # (b2) THE SAME PRIMARY-CLONE SHAPE, BUT CHECKED OUT ON A LANE BRANCH, IS REFUSED (cycle-6 P2, MEASURED).
+  # A lane that isolates by CLONING instead of `git worktree add` was admitted here, because
+  # `primary_clone_root` is git's main-vs-linked arithmetic and never asked the branch question — and the
+  # bring-up injects `AGENT_INFRA_PATH=$LAYER_ROOT` itself, so the declaration could be the caller's own
+  # clone. The control above stays green because that clone is on `master`/`main`; this one is on `lane/x`.
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_LANE_CLONE="$T/lane-clone"; mkdir -p "$PG_LANE_CLONE/scripts"
+  cp "$SUP" "$PG_LANE_CLONE/scripts/cloud-cell-supervisor.sh"
+  if git init -q "$PG_LANE_CLONE" 2>/dev/null \
+     && git -C "$PG_LANE_CLONE" add -A >/dev/null 2>&1 \
+     && git -C "$PG_LANE_CLONE" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1 \
+     && git -C "$PG_LANE_CLONE" checkout -q -b lane/x >/dev/null 2>&1; then
+    PG_B2_RC=0
+    PG_B2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_LANE_CLONE/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_LANE_CLONE" inst pg --install 2>&1)" || PG_B2_RC=$?
+    grep -qxF "ExecStart=/bin/bash $PG_LANE_CLONE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+      && bad "§P7: a PRIMARY clone checked out on the branch lane/x was ARMED — being a clone is not being merged: $PG_B2_OUT" \
+      || ok '§P7: a PRIMARY clone checked out on a LANE branch is REFUSED (being a clone is not being merged)'
+    case "$PG_B2_OUT" in
+      *'BRANCH lane/x'*) ok '§P7: and the refusal names the unmerged branch it found' ;;
+      *) bad "§P7: the lane-branch clone refusal does not name the branch — $PG_B2_OUT" ;;
+    esac
+    rm -f "$PG/units/eldato-orchestrator.service"
+  else
+    bad '§P7: the fixture could not build the lane-branch clone, so that arm did NOT run'
+  fi
+  # (b4) A DETACHED PRIMARY CLONE IS NOT THE DEPLOYMENT SHAPE EITHER (cycle-8 P2, MEASURED — a pre-existing
+  # FAIL-OPEN). The helper used to read a detached HEAD as "no branch to be unmerged at" and ADMIT it, so a
+  # lane that isolates by CLONING and then detaches at a PR head (`git clone … && git checkout <pr-head>`)
+  # armed a unit at a path a cleaning removes — the #2697 class, re-opened by the shape that had no name.
+  # Ancestry is the only question available once there is no name: contained in the clone's default ref =
+  # the deployment's own revision (admitted); not contained = a PR head (refused). This clone CARRIES origin
+  # refs, which is what puts it on the ancestry path rather than the no-default-ref fallback.
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_DET="$T/detached-clone"; mkdir -p "$PG_DET/scripts"
+  cp "$SUP" "$PG_DET/scripts/cloud-cell-supervisor.sh"
+  if git init -q "$PG_DET" 2>/dev/null \
+     && git -C "$PG_DET" add -A >/dev/null 2>&1 \
+     && git -C "$PG_DET" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm merged >/dev/null 2>&1 \
+     && git -C "$PG_DET" update-ref refs/remotes/origin/main HEAD 2>/dev/null \
+     && git -C "$PG_DET" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main 2>/dev/null \
+     && git -C "$PG_DET" checkout -q --detach refs/remotes/origin/main >/dev/null 2>&1; then
+    # (b4-i) detached AT the commit the default ref carries — admitted (a deployment pinned at its own revision)
+    PG_B4_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_DET" inst pg --install 2>&1)" || true
+    grep -qxF "ExecStart=/bin/bash $PG_DET/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+      && ok '§P7: a clone DETACHED at the commit its default ref carries still installs (containment, not a branch name)' \
+      || bad "§P7: refused a clone detached at its own default revision — a false block on a durable deployment: $PG_B4_OUT"
+    rm -f "$PG/units/eldato-orchestrator.service"
+    # (b4-ii) detached at a commit the default ref does NOT carry — a PR head — REFUSED
+    if git -C "$PG_DET" -c user.email=fixture@example.invalid -c user.name=fixture commit -q --allow-empty -m unmerged >/dev/null 2>&1 \
+       && git -C "$PG_DET" checkout -q --detach HEAD >/dev/null 2>&1; then
+      PG_B5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_DET" inst pg --install 2>&1)" || true
+      grep -qxF "ExecStart=/bin/bash $PG_DET/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+        && bad "§P7: a clone DETACHED at an UNMERGED commit was ARMED — that is a PR head a lane removes: $PG_B5_OUT" \
+        || ok '§P7: a clone DETACHED at a commit its default ref does NOT carry is REFUSED (the #2697 class in a detached checkout)'
+      case "$PG_B5_OUT" in
+        *'DETACHED HEAD'*'does NOT contain'*) ok '§P7: and the refusal says DETACHED and names containment, not a branch it does not have' ;;
+        *) bad "§P7: the detached-clone refusal misdescribes the checkout (a branch it does not have?) — $PG_B5_OUT" ;;
+      esac
+      rm -f "$PG/units/eldato-orchestrator.service"
+      # (b4-iii) RESIDUAL (documented, not a guarantee): with NO default ref to compare against, a detached
+      # clone cannot be proven either way, so it is admitted. Named in docs/ops/controller-service.md.
+      git -C "$PG_DET" symbolic-ref -d refs/remotes/origin/HEAD >/dev/null 2>&1
+      git -C "$PG_DET" symbolic-ref -d refs/remotes/origin/main >/dev/null 2>&1 || git -C "$PG_DET" update-ref -d refs/remotes/origin/main >/dev/null 2>&1
+      PG_B6_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_DET" inst pg --install 2>&1)" || true
+      grep -qxF "ExecStart=/bin/bash $PG_DET/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+        && ok '§P7: RESIDUAL (documented): a detached clone with NO default ref is admitted — there is nothing to prove it against' \
+        || bad "§P7: the documented no-default-ref residual changed shape without the doc changing: $PG_B6_OUT"
+      rm -f "$PG/units/eldato-orchestrator.service"
+    else
+      bad '§P7: the fixture could not build the unmerged-detached commit, so those arms did NOT run'
+    fi
+  else
+    bad '§P7: the fixture could not build the detached clone, so those arms did NOT run'
+  fi
+  # (c) a LINKED worktree of that same clone, under a DURABLE root and with a name no pattern matches
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_WT="$PG/home/lane-checkout"
+  if git -C "$PG_CLONE" worktree add -q "$PG_WT" 2>/dev/null; then
+    mkdir -p "$PG_WT/scripts"; cp "$SUP" "$PG_WT/scripts/cloud-cell-supervisor.sh"
+    PG_C_RC=0; PG_C_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_C_RC=$?
+    [ "$PG_C_RC" -ne 0 ] && ok '§P7: a LINKED worktree is refused even under the cell home and even with a name no shape matches' \
+                         || bad "§P7: armed a unit from a linked git worktree — git recorded it as a worktree and the guard did not read it: $PG_C_OUT"
+    case "$PG_C_OUT" in
+      *'LINKED GIT WORKTREE'*) ok '§P7: and the refusal says GIT reported it as a linked worktree (not "under /tmp")' ;;
+      *) bad "§P7: the refusal does not name the git-worktree reason — $PG_C_OUT" ;;
+    esac
+     # ⛔ AND A DETACHED ONE IS NOT AUTOMATICALLY A PIN (review-4 P1, measured). The fleet's drainer builds a
+    # lane's scratch exactly as a DETACHED worktree (`ai-drainer.sh`: `git worktree add -f
+    # "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with `worktree remove --force` at lane end) under `$HOME` --
+    # a DECLARED root -- so admitting "detached" on its own re-opened the #2697 class one layer down from the
+    # branch rule that closed it. This arm builds THAT shape; §P4's recorded pin stays admitted.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    PG_DET="$T/agent-infra-drainer/wt-drainer-lane9"
+    if git -C "$PG_CLONE" worktree add --detach "$PG_DET" >/dev/null 2>&1; then
+      mkdir -p "$PG_DET/scripts"; cp "$SUP" "$PG_DET/scripts/cloud-cell-supervisor.sh"
+      PG_D_RC=0; PG_D_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_D_RC=$?
+      [ "$PG_D_RC" -ne 0 ] && ok "§P7: a DETACHED worktree that is not this box's recorded pin is REFUSED (the drainer scratch shape)" \
+                           || bad "§P7: armed a unit from a detached lane scratch checkout -- 'detached' alone is not a pin: $PG_D_OUT"
+      case "$PG_D_OUT" in
+        *'NOT the harness pin'*) ok '§P7: and the refusal says why detached was not enough' ;;
+        *) bad "§P7: the detached refusal does not name the pin record -- $PG_D_OUT" ;;
+      esac
+      # ⛔ AND THE VARIABLE THAT NAMES THE PIN ROOT MUST NOT REDEFINE "THE PIN" TO MEAN ANYTHING (cycle-3 P1,
+      # MEASURED — an ambient-env bypass of the very rule above). `pin_root_of_this_box` falls back to
+      # `HARNESS_PIN_DIR`, so `HARNESS_PIN_DIR=$HOME` made ALL of the fixture home a pin root and re-admitted
+      # exactly the scratch the arm above refuses: measured, refused when unset, ARMED with
+      # `ExecStart=…/wt-drainer-in-home/scripts/cloud-cell-supervisor.sh` when set to that home. A pin TREE is
+      # named for the commit it holds (`<pin dir>/<sha>`, what the bring-up's `git worktree add --detach`
+      # creates) or IS the recorded root; a lane scratch is named for its lane. The TREE is graded now, not
+      # only its prefix, so widening the root cannot widen what counts as a pin.
+      # ⛔ THE SCRATCH IS BUILT **UNDER** THE EXPORTED ROOT, because that is the whole bypass: an arm whose
+      # scratch sat outside it would be refused by the OLD prefix rule and would certify nothing (measured —
+      # the first version of this arm was exactly that, and stayed green on the unfixed installer).
+      rm -f "$PG/units/eldato-orchestrator.service"
+      PG_HW="$PG/home/wt-drainer-in-home"
+      if git -C "$PG_CLONE" worktree add -q --detach "$PG_HW" >/dev/null 2>&1; then
+        mkdir -p "$PG_HW/scripts"; cp "$SUP" "$PG_HW/scripts/cloud-cell-supervisor.sh"
+        PG_H_RC=0
+        PG_H_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_HW/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_H_RC=$?
+        [ "$PG_H_RC" -ne 0 ] && ok '§P7: HARNESS_PIN_DIR=$HOME does not turn every detached worktree UNDER it into a pin (the TREE is graded)' \
+                             || bad "§P7: an exported HARNESS_PIN_DIR=$HOME re-admitted the drainer scratch under it — an ambient env var defeated the pin rule: $PG_H_OUT"
+        [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+          && ok '§P7: and a widened pin root armed nothing' || bad '§P7: the widened pin root still wrote a unit'
+      else
+        bad '§P7: the fixture could not create the in-home detached scratch, so the widened-pin-root arm did NOT run'
+      fi
+      # …and the CONTROL that keeps the arm above from being a blanket refusal of HARNESS_PIN_DIR: a REAL pin
+      # tree named for its commit, under that same exported root, is still admitted.
+      rm -f "$PG/units/eldato-orchestrator.service"
+      PG_HSHA="$(git -C "$PG_CLONE" rev-parse HEAD 2>/dev/null)"
+      if [ -n "$PG_HSHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG/home/pins/$PG_HSHA" "$PG_HSHA" >/dev/null 2>&1; then
+        mkdir -p "$PG/home/pins/$PG_HSHA/scripts/orchestrator-harness"
+        : > "$PG/home/pins/$PG_HSHA/scripts/orchestrator-harness/orch-loop.sh"
+        cp "$SUP" "$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh"
+        PG_H2_RC=0
+        PG_H2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home/pins ORCH_SUPERVISOR=$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_H2_RC=$?
+        [ "$PG_H2_RC" -eq 0 ] && ok '§P7: control — a REAL pin tree (<pin dir>/<sha>) under the exported root is still ADMITTED' \
+                             || bad "§P7: refused a legitimate pin tree under HARNESS_PIN_DIR — a false block on the cells' shape: $PG_H2_OUT"
+      else
+        bad '§P7: the fixture could not create the <pin dir>/<sha> tree, so the pin-shape control did NOT run'
+      fi
+      # ⛔ A PIN IS NOT A NAME, AND NOT A DECLARATION (cycle-4 P1, MEASURED — the claim this replaces, that
+      # "`HARNESS_PIN_DIR` only bounds, it no longer defines", was OVERBROAD: naming and declaring are both
+      # caller-controlled, so grading them defended nothing). Three routes, each measured ARMED before this fix:
+      #   (i)   HARNESS_PIN_DIR=$HOME  + a scratch at `$HOME/<40-hex>`  — the hex BASENAME alone won;
+      #   (ii)  HARNESS_PIN_DIR=<the scratch itself>                   — the equality arm alone won;
+      #   (iii) a pin RECORD naming `<scratch>/scripts/orchestrator-harness` — any directory a record named won.
+      # ⛔ CORRECTION (cycle-5 P1/P2, MEASURED): the paragraph above overclaimed. Carrying
+      # `scripts/orchestrator-harness/orch-loop.sh` is necessary but NOT sufficient — every real checkout of
+      # this repo carries it, and a lane/drainer scratch IS such a checkout, so a missing-file test corroborated
+      # nothing while the fixture (which lacked the file) made every arm below go red for the wrong reason.
+      # The corroboration that discriminates is the one asserted below: the tree's NAME must be a prefix of the
+      # commit it actually HOLDS. The flat-pin case has no commit name, and its residual is asserted explicitly.
+      rm -f "$PG/units/eldato-orchestrator.service"
+      PG_L_TREE="$PG/home/$PG_HSHA"
+      if [ -n "$PG_HSHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG_L_TREE" "$PG_HSHA" >/dev/null 2>&1; then
+        # ⛔ THE FIXTURE MUST CARRY THE HARNESS TREE (cycle-5 P2, MEASURED). Copying only the supervisor left
+        # this tree WITHOUT `scripts/orchestrator-harness/orch-loop.sh`, so every arm below went red on the
+        # MISSING-HARNESS branch and never on the laundering each one names — they certified a property they
+        # could not see, which is exactly why the hole these arms now cover shipped green. A lane/drainer
+        # scratch IS a real checkout of this repo and therefore DOES carry the harness tree; so must the fixture.
+        mkdir -p "$PG_L_TREE/scripts/orchestrator-harness"
+        cp "$SUP" "$PG_L_TREE/scripts/cloud-cell-supervisor.sh"
+        : > "$PG_L_TREE/scripts/orchestrator-harness/orch-loop.sh"
+        # (1) THE NAME MUST AGREE WITH THE TREE IT NAMES (cycle-5 P1). A scratch named with a commit id that is
+        # NOT the commit it holds is refused; a real pin is created as `<pin dir>/<sha>`, so its name IS its
+        # HEAD. Without this arm, being-hex counted as corroboration and `$HOME/<40-hex>` armed for any commit.
+        PG_FOREIGN="0123456789abcdef0123456789abcdef01234567"
+        PG_F_TREE="$PG/home/$PG_FOREIGN"
+        if git -C "$PG_CLONE" worktree add -q --detach "$PG_F_TREE" "$PG_HSHA" >/dev/null 2>&1; then
+          mkdir -p "$PG_F_TREE/scripts/orchestrator-harness"
+          cp "$SUP" "$PG_F_TREE/scripts/cloud-cell-supervisor.sh"
+          : > "$PG_F_TREE/scripts/orchestrator-harness/orch-loop.sh"
+          PG_L1_RC=0
+          PG_L1_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_F_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L1_RC=$?
+          [ "$PG_L1_RC" -ne 0 ] && ok '§P7: a scratch NAMED with a commit id that is NOT the commit it holds is REFUSED (the name must corroborate the tree)' \
+                               || bad "§P7: a scratch named with a FOREIGN commit id was armed — the pin test graded the SPELLING, not the tree: $PG_L1_OUT"
+          rm -f "$PG/units/eldato-orchestrator.service"
+        else
+          bad '§P7: the fixture could not create the foreign-named scratch, so the corroboration arm did NOT run'
+        fi
+        # (2) A drainer-shaped name (a lane name, not a commit id) is refused even when its PARENT is exported
+        # as the pin root — the real fleet scratch shape (`ai-drainer.sh` makes `wt-drainer-<name>`).
+        PG_DRAIN="$PG/home/wt-drainer-lane7"
+        if git -C "$PG_CLONE" worktree add -q --detach "$PG_DRAIN" "$PG_HSHA" >/dev/null 2>&1; then
+          mkdir -p "$PG_DRAIN/scripts/orchestrator-harness"
+          cp "$SUP" "$PG_DRAIN/scripts/cloud-cell-supervisor.sh"
+          : > "$PG_DRAIN/scripts/orchestrator-harness/orch-loop.sh"
+          PG_L2_RC=0
+          PG_L2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_DRAIN/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L2_RC=$?
+          [ "$PG_L2_RC" -ne 0 ] && ok '§P7: the drainer scratch shape (a lane name) is REFUSED even under an exported pin root' \
+                               || bad "§P7: a drainer scratch was armed: $PG_L2_OUT"
+          [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+            && ok '§P7: and neither laundering route armed a unit' || bad '§P7: a laundered pin still wrote a unit'
+          rm -f "$PG/units/eldato-orchestrator.service"
+        else
+          bad '§P7: the fixture could not create the drainer scratch, so that arm did NOT run'
+        fi
+        # (3) NAMED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR CLOSED (cycle-5 P1, corrected cycle-6 P2).
+        # ⛔ THE TREE MUST BE ONE THE NAME ARM CANNOT ADMIT. The first version of this arm used PG_L_TREE, whose
+        # basename IS the commit it holds — so `name_ok=1` admitted it and the flat arm was never consulted: the
+        # arm passed even with the flat `elif` DELETED, i.e. it certified a residual it never exercised (the same
+        # vacuity class this file was being fixed for). PG_F_TREE is named with a FOREIGN commit id, so the name
+        # arm refuses it and only the flat arm (`tree == pin root`) can admit it — which is exactly the residual.
+        PG_L3_RC=0
+        PG_L3_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG_F_TREE ORCH_SUPERVISOR=$PG_F_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L3_RC=$?
+        grep -qxF "ExecStart=/bin/bash $PG_F_TREE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+          && ok '§P7: RESIDUAL (documented): a caller that declares a scratch AS its pin root IS admitted — the pin locators belong to the operator' \
+          || bad "§P7: the documented residual changed — a declared pin root no longer admits its own tree (rc=$PG_L3_RC): $PG_L3_OUT"
+        rm -f "$PG/units/eldato-orchestrator.service"
+        # (4) THE THIRD LAUNDERING ROUTE IS THE RECORD, AND IT IS A DIFFERENT INPUT FROM THE TWO ENV LOCATORS
+        # (cycle-6 P2). `pin_root_of_this_box` turns a record line `<scratch>/scripts/orchestrator-harness` into
+        # `root=<scratch>`, so a RECORD naming a scratch reaches the same flat arm. Like the env locators the
+        # record is box state a caller can write (it lives under CELL_HOME), so it is the same ACCEPTED RESIDUAL
+        # — but it was left out of both the residual comment and the docs, and had no arm at all. Asserted here
+        # with the foreign-named tree so it too exercises the flat arm, and labelled as residual rather than
+        # claimed closed.
+        printf '%s\n' "$PG_F_TREE/scripts/orchestrator-harness" > "$PG/home/.harness-path"
+        PG_L4_RC=0
+        PG_L4_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_F_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L4_RC=$?
+        rm -f "$PG/home/.harness-path"
+        grep -qxF "ExecStart=/bin/bash $PG_F_TREE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+          && ok '§P7: RESIDUAL (documented): a pin RECORD naming a scratch IS admitted — the record is box state, not a credential' \
+          || bad "§P7: the documented record residual changed — a record naming a scratch no longer admits it (rc=$PG_L4_RC): $PG_L4_OUT"
+        rm -f "$PG/units/eldato-orchestrator.service"
+      else
+        bad '§P7: the fixture could not create the hex-named scratch, so the name/declaration arms did NOT run'
+      fi
+    else
+      bad '§P7: the fixture could not create the detached scratch worktree, so that arm did not run'
+    fi
+   # ⛔ AND "GIT COULD NOT ANSWER" IS NOT "NOT A WORKTREE" (re-review P2). The same path with a git that
+    # FAILS — git's own `dubious ownership` refusal (a shape this repo runs: `CONTROLLER_ALLOW_ROOT=1`),
+    # a wrapper exporting GIT_DIR, or a broken binary — used to read as durable and ARM the worktree, because
+    # `git_dirs` prints nothing for both "not a repo" and "git failed". It must fail CLOSED as UNPROVEN.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    printf '#!/bin/sh\nexit 1\n' > "$PG/bin/git"; chmod +x "$PG/bin/git"
+    PG_D_RC=0; PG_D_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_D_RC=$?
+    rm -f "$PG/bin/git"
+    [ "$PG_D_RC" -ne 0 ] && ok '§P7: a checkout git cannot identify is REFUSED as UNPROVEN (a failing git is not "not a worktree")' \
+                        || bad "§P7: a linked worktree was ARMED because git failed to answer — the empty answer was read as durable: $PG_D_OUT"
+    case "$PG_D_OUT" in
+      *'could not identify'*) ok '§P7: and the refusal says git itself could not identify the checkout' ;;
+      *) bad "§P7: the unproven-checkout refusal does not name git as the reason — $PG_D_OUT" ;;
+    esac
+    [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+      && ok '§P7: and the unproven checkout armed nothing' || bad '§P7: the unproven checkout still armed a unit'
+    # ⛔ AN EXPORTED GIT_DIR IS NOT A LICENCE EITHER (re-review P2, measured). `GIT_DIR=<hub>/.git git -C
+    # <linked worktree> rev-parse …` answers the HUB for BOTH questions, so they agreed and `git_dirs` printed
+    # "main" — the refusal bypassed by one environment variable (and `/tmp/cell-ai` is a shape that invites it).
+    # The fixture exports exactly that; the worktree must STILL be refused.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    PG_E_RC=0; PG_E_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh GIT_DIR=$PG_CLONE/.git" inst pg --install 2>&1)" || PG_E_RC=$?
+    [ "$PG_E_RC" -ne 0 ] && ok '§P7: an exported GIT_DIR at the hub does NOT launder a linked worktree' \
+                        || bad "§P7: GIT_DIR=<hub>/.git made a linked worktree read as a primary clone and armed it — the git questions inherited the caller's selection: $PG_E_OUT"
+    case "$PG_E_OUT" in
+      *'LINKED GIT WORKTREE'*) ok '§P7: and it is still refused as a LINKED worktree' ;;
+      *) bad "§P7: the GIT_DIR attempt was refused for another reason — the git arithmetic may still have read the hub: $PG_E_OUT" ;;
+    esac
+    # ⛔ AND GIT_DIR *ALONE* IS THE WEAK FORM OF THE ATTACK (re-review P1, measured END-TO-END). With
+    # `GIT_DIR` and `GIT_WORK_TREE` BOTH exported — the canonical pair, and the one this repo's own guards
+    # treat as a unit (`extensions/main-worktree-guard`'s `AMBIENT_GIT_VARS`) — the unscrubbed reads answered
+    # the PIN: `--show-toplevel` printed it and `symbolic-ref -q HEAD` read its detached HEAD, so a BRANCH
+    # worktree graded "detached at this box's recorded pin" and the installer ARMED it (rc=0). The arm above
+    # could never see this: with `GIT_DIR` alone, `--show-toplevel` fell back to the cwd and named the hub.
+    # `linked_worktree_root` now reads its branch/detached answer through the same scrub as `git_dirs`.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    PG_PIN="$PG/home/harness"
+    PG_PIN_SHA="$(git -C "$PG_CLONE" rev-parse HEAD 2>/dev/null)"
+    mkdir -p "$PG_PIN"
+    if [ -n "$PG_PIN_SHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG_PIN/$PG_PIN_SHA" "$PG_PIN_SHA" 2>/dev/null; then
+      # A REAL PIN CARRIES ITS HARNESS (the bring-up refuses a pin tree without it), so the fixture carries one —
+      # otherwise this arm would be refused for the missing harness instead of for the ambient GIT_* pair it exists
+      # to test, and would certify the wrong thing.
+      mkdir -p "$PG_PIN/$PG_PIN_SHA/scripts/orchestrator-harness"
+      : > "$PG_PIN/$PG_PIN_SHA/scripts/orchestrator-harness/orch-loop.sh"
+      PG_F_RC=0
+      PG_F_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh GIT_DIR=$PG_PIN/$PG_PIN_SHA/.git GIT_WORK_TREE=$PG_PIN/$PG_PIN_SHA" inst pg --install 2>&1)" || PG_F_RC=$?
+      [ "$PG_F_RC" -ne 0 ] && ok '§P7: an ambient GIT_DIR+GIT_WORK_TREE pair pointing at the pin does NOT launder a branch worktree' \
+                          || bad "§P7: two exported variables armed an ExecStart from a BRANCH worktree — the guard's own branch/detached read inherited the caller's selection: $PG_F_OUT"
+      [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+        && ok '§P7: and the ambient-GIT pair armed nothing' || bad '§P7: the ambient-GIT pair still wrote a unit'
+    else
+      bad '§P7: the fixture could not create the pin worktree, so the ambient-GIT-pair arm did not run'
+    fi
+  else
+    bad '§P7: the fixture could not create a linked worktree, so the git-arithmetic arm did not run'
+  fi
+else
+  # ⛔ THE SAME VACUITY GUARD §P3 HAS (re-review P3). Without this, a box with no git (or a read-only
+  # TMPDIR) skipped the whole git-arithmetic block — four assertions, including the "git failed" one — and
+  # still reported failed=0, i.e. the core proof of this fix was silently unverified.
+  bad '§P7: the fixture could not create a primary clone, so the git-arithmetic arms did NOT run'
+fi
+
+
+# ── §P2 — a SYMLINK is a spelling, and the guard grades what it resolves to ───────────────────────
+# ⛔ THE MEASURED ESCAPE THIS ARM EXISTS FOR IS #2666's: `ln -s <refused dir> $T/alias` was ADMITTED by a
+# literal comparison. The ExecStart guard has the same shape, so a durable-LOOKING link into a scratch tree
+# must be refused, AND a link onto a durable tree must still be admitted — otherwise the arm would pass by
+# refusing every symlink, which is a false block on a farmed or pinned layout.
+say_case 'a symlinked supervisor is graded by where it RESOLVES, not by how it is spelled'
+PS="$(arm_root ps)"; mk_systemctl "$PS/bin" "$PS/state" "$PS/sc.log"; mk_tmux "$PS/bin" "$PS/tmux.log"
+PS_SCRATCH="$T/wt-ps-fixture/scripts"; mkdir -p "$PS_SCRATCH"
+cp "$SUP" "$PS_SCRATCH/cloud-cell-supervisor.sh"
+mkdir -p "$PS/home/scripts"; cp "$SUP" "$PS/home/scripts/cloud-cell-supervisor.sh"
+ln -s "$PS_SCRATCH/cloud-cell-supervisor.sh" "$PS/home/scripts/alias.sh"    # durable NAME, scratch TARGET
+ln -s "$PS/home/scripts/cloud-cell-supervisor.sh" "$PS/home/scripts/good.sh" # durable name AND target
+PS_RC=0; PS_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PS/home/scripts/alias.sh" inst ps --install 2>&1)" || PS_RC=$?
+[ "$PS_RC" -ne 0 ] && ok '§P2: a symlink whose TARGET is scratch is REFUSED (resolution, not spelling)' \
+                   || bad "§P2: a durable-looking symlink into a scratch tree was ADMITTED — the #2666 escape, re-shipped: $PS_OUT"
+if [ "$PS_RC" -ne 0 ]; then   # ⛔ same gate: a success report also carries the resolved path (review-5 P3)
+  case "$PS_OUT" in
+    *"$PS_SCRATCH/cloud-cell-supervisor.sh"*) ok '§P2: the refusal names the RESOLVED path, so the operator can see the real target' ;;
+    *) bad "§P2: the refusal names the spelling instead of the resolved target — $PS_OUT" ;;
+  esac
+else
+  bad "§P2: no refusal happened, so 'names the resolved target' is untested — $PS_OUT"
+fi
+PS2_RC=0; PS2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PS/home/scripts/good.sh" inst ps --install 2>&1)" || PS2_RC=$?
+[ "$PS2_RC" -eq 0 ] && ok '§P2: a symlink onto a durable tree is still ADMITTED (no blanket refusal of links)' \
+                   || bad "§P2: refused a durable symlinked supervisor — false block: $PS2_OUT"
+grep -qxF "ExecStart=/bin/bash $PS/home/scripts/cloud-cell-supervisor.sh start" "$PS/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P2: and the unit names the RESOLVED durable target, not the link that was typed' \
+  || bad '§P2: the installed unit does not name the resolved path'
+
+# ── §P3 — the pin a box actually runs is RECORDED, and readable from the status verb ──────────────
+# ⛔ THE SECOND SILENT HALF OF #2697: `merged ≠ running`. cell-4's farmed copy was sha 9228492e… of Oct 23
+# while `main` was 1680457a…, and nothing on the box recorded which code the unit executes — the only way to
+# learn it was `git -C` guessing at a path the unit merely names. The installer now renders the resolved
+# supervisor's own `HEAD` into the unit's environment, so `systemctl show`/`--status` answer it.
+say_case 'the unit RECORDS the revision of the supervisor it runs'
+PP="$(arm_root pp)"; mk_systemctl "$PP/bin" "$PP/state" "$PP/sc.log"; mk_tmux "$PP/bin" "$PP/tmux.log"
+PP_REPO="$PP/home/agent-infra"; mkdir -p "$PP_REPO/scripts"
+cp "$SUP" "$PP_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PP_REPO" 2>/dev/null
+git -C "$PP_REPO" add -A >/dev/null 2>&1
+git -C "$PP_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PP_SHA="$(git -C "$PP_REPO" rev-parse HEAD 2>/dev/null)"
+PP_TOP="$(git -C "$PP_REPO" rev-parse --show-toplevel 2>/dev/null)"
+PP_RC=0; PP_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PP_REPO/scripts/cloud-cell-supervisor.sh" inst pp --install 2>&1)" || PP_RC=$?
+if [ -z "$PP_SHA" ]; then
+  # ⛔ A SKIP IS NOT A PASS (re-review P3). A green tick over an arm that asserted nothing is the vacuity shape
+  # this section's header is about; if the fixture cannot make a git checkout, the arms cannot run and the
+  # operator must see that as a red, not as coverage.
+  bad '§P3: the fixture git checkout could not be created — the pin arms did not run, so §P3 is NOT covered on this box'
+elif [ "$PP_RC" -ne 0 ]; then
+  bad "§P3: could not install from the fixture repo, so the pin arms cannot run — $PP_OUT"
+else
+  grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PP_TOP}@${PP_SHA}" "$PP/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P3: the unit carries the resolved supervisor’s repo@sha (merged-≠-running is now readable)' \
+    || bad "§P3: the unit does not record the revision it runs (expected ${PP_TOP}@${PP_SHA})"
+  PP_ST="$(inst pp --status 2>&1)"
+  case "$PP_ST" in
+    *"supervisor_pin=${PP_TOP}@${PP_SHA}"*) ok '§P3: --status prints the pin from the INSTALLED unit (not from a git guess)' ;;
+    *) bad "§P3: --status does not print the recorded pin — $PP_ST" ;;
+  esac
+fi
+# ⛔ A DIRTY WORK TREE MAKES THE RECORDED SHA A CONFIDENT WRONG ANSWER (review-7 P2, MEASURED). `HEAD`
+# describes the COMMIT, never the BYTES: with the tracked supervisor hand-edited in the work tree, the pin
+# asserted `<repo>@<sha>` about a file whose blob is NOT `<sha>`. That is the same PLAUSIBLE WRONG answer this
+# installer rejects for the dotfiles case, and the rule `cloud-cell-supervisor.sh` already holds for its own
+# provenance stamp (`agentInfraDirty` exists because "its commit does not describe its bytes"). The pin is an
+# OBSERVATION, never a gate, so a dirty tree still INSTALLS — it just refuses to claim a revision it cannot
+# corroborate. The arm above is the control: a CLEAN tree must keep the bare `<repo>@<sha>` (it is asserted
+# with `grep -qxF`, so a stray `+dirty` there goes red).
+PPD="$(arm_root ppdirty)"; mk_systemctl "$PPD/bin" "$PPD/state" "$PPD/sc.log"; mk_tmux "$PPD/bin" "$PPD/tmux.log"
+PPD_REPO="$PPD/home/agent-infra"; mkdir -p "$PPD_REPO/scripts"
+cp "$SUP" "$PPD_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPD_REPO" 2>/dev/null
+git -C "$PPD_REPO" add -A >/dev/null 2>&1
+git -C "$PPD_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PPD_SHA="$(git -C "$PPD_REPO" rev-parse HEAD 2>/dev/null)"
+PPD_TOP="$(git -C "$PPD_REPO" rev-parse --show-toplevel 2>/dev/null)"
+if [ -z "$PPD_SHA" ] || [ -z "$PPD_TOP" ]; then
+  bad '§P3: the dirty-work-tree fixture could not be created — the +dirty arm did NOT run, so it is not covered on this box'
+else
+  printf '\n# a hand edit made in place after the commit\n' >> "$PPD_REPO/scripts/cloud-cell-supervisor.sh"
+  PPD_RC=0; PPD_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPD_REPO/scripts/cloud-cell-supervisor.sh" inst ppdirty --install 2>&1)" || PPD_RC=$?
+  [ "$PPD_RC" -eq 0 ] && ok '§P3: a supervisor in a DIRTY work tree still installs (the pin is an observation, not a gate)' \
+                      || bad "§P3: a dirty work tree refused the install — the pin must never withhold a supervisor: $PPD_OUT"
+  if grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPD_TOP}@${PPD_SHA}+dirty" "$PPD/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P3: and it marks the revision +dirty, so <sha> is not read as the bytes the unit runs'
+  elif grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPD_TOP}@${PPD_SHA}" "$PPD/units/eldato-orchestrator.service" 2>/dev/null; then
+    bad "§P3: the pin recorded ${PPD_TOP}@${PPD_SHA} for a HAND-EDITED supervisor — the recorded revision does not describe the bytes the unit boots"
+  else
+    bad "§P3: the dirty-work-tree pin is neither <repo>@<sha>+dirty nor <repo>@<sha> — $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPD/units/eldato-orchestrator.service" 2>/dev/null)"
+  fi
+fi
+# ⛔ A `git status` THAT CANNOT RUN IS CANNOT-VERIFY, NEVER "clean" (review-7 P2). WITHOUT THIS ARM THE
+# DEGRADE BRANCH WAS UNEXERCISED: measured, DELETING it left the suite at 387/0 — so a regression would have
+# shipped the confident-wrong-answer the change above exists to prevent, and nothing would have noticed. That is
+# the same vacuity class this PR has now fixed six times, so it gets an arm.
+# The failure is injected the way a real one ARRIVES — git resolving the work tree and TRACKING the file, but
+# refusing the status read (a corrupt index, ENOSPC, EACCES, `safe.directory`) — so this is a PATH stub rather
+# than a mutated installer: the installer really runs, and really fails at the one call under test.
+PPG="$(arm_root ppgiterr)"; mk_systemctl "$PPG/bin" "$PPG/state" "$PPG/sc.log"; mk_tmux "$PPG/bin" "$PPG/tmux.log"
+PPG_REPO="$PPG/home/agent-infra"; mkdir -p "$PPG_REPO/scripts"
+cp "$SUP" "$PPG_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPG_REPO" 2>/dev/null
+git -C "$PPG_REPO" add -A >/dev/null 2>&1
+git -C "$PPG_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PPG_SHA="$(git -C "$PPG_REPO" rev-parse HEAD 2>/dev/null)"
+PPG_TOP="$(git -C "$PPG_REPO" rev-parse --show-toplevel 2>/dev/null)"
+PPG_GIT="$(command -v git 2>/dev/null)"
+if [ -z "$PPG_SHA" ] || [ -z "$PPG_TOP" ] || [ -z "$PPG_GIT" ]; then
+  bad '§P3: the status-failure fixture could not be created — the cannot-verify arm did NOT run, so it is not covered on this box'
+else
+  # CONTROL FIRST: with a WORKING git the very same fixture must render a confident pin, so the next arm's
+  # `unknown@unknown` can only be the failed read and not some unrelated shape of this fixture.
+  PPG_OK_RC=0; PPG_OK_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPG_REPO/scripts/cloud-cell-supervisor.sh" inst ppgiterr --install 2>&1)" || PPG_OK_RC=$?
+  if [ "$PPG_OK_RC" -eq 0 ] && grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPG_TOP}@${PPG_SHA}" "$PPG/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P3: control — the status-failure fixture records a confident pin while git WORKS (so the arm below isolates the read)'
+    # …now the ONLY change: git resolves the tree and tracks the file, but refuses `status`.
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf '# a git that answers every question EXCEPT the dirty read — the shape a corrupt index, ENOSPC, EACCES\n'
+      printf '# or safe.directory produces: resolution works, the status read does not.\n'
+      printf 'case "$*" in *"status --porcelain"*) exit 1 ;; esac\n'
+      printf 'exec %s "$@"\n' "$PPG_GIT"
+    } > "$PPG/bin/git"
+    chmod +x "$PPG/bin/git"
+    rm -f "$PPG/units/eldato-orchestrator.service"
+    PPG_ERR_RC=0; PPG_ERR_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPG_REPO/scripts/cloud-cell-supervisor.sh" inst ppgiterr --install 2>&1)" || PPG_ERR_RC=$?
+    [ "$PPG_ERR_RC" -eq 0 ] && ok '§P3: a FAILED dirty read still installs (the pin is an observation, never a gate)' \
+                         || bad "§P3: a failed git status refused the install — a diagnostic must never withhold a supervisor: $PPG_ERR_OUT"
+    grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPG/units/eldato-orchestrator.service" 2>/dev/null \
+      && ok '§P3: and an unreadable dirty state degrades to unknown@unknown rather than claiming a revision nobody verified' \
+      || bad "§P3: a FAILED git status rendered a confident pin — the recorded revision may not describe the bytes: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPG/units/eldato-orchestrator.service" 2>/dev/null)"
+  else
+    bad "§P3: the status-failure fixture did not render a confident pin while git worked, so the cannot-verify arm proves nothing — $PPG_OK_OUT"
+  fi
+fi
+# ⛔ AND A SUPERVISOR OUTSIDE ANY GIT WORK TREE IS STILL A VALID DEPLOYMENT (a farmed copy is exactly that).
+# The pin records `unknown@unknown`; it NEVER refuses — a diagnostic that withholds a supervisor is a false
+# block on the shape the farm produces.
+PPF="$(arm_root ppf)"; mk_systemctl "$PPF/bin" "$PPF/state" "$PPF/sc.log"; mk_tmux "$PPF/bin" "$PPF/tmux.log"
+PPF_RC=0; PPF_OUT="$(inst ppf --install 2>&1)" || PPF_RC=$?
+[ "$PPF_RC" -eq 0 ] && ok '§P3: a supervisor outside any git work tree installs (the pin is an observation, not a gate)' \
+                   || bad "§P3: refused a supervisor merely because its revision is unknown — $PPF_OUT"
+grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPF/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P3: and it records unknown@unknown rather than claiming a revision nobody read' \
+  || bad '§P3: a supervisor with no git work tree recorded something other than unknown@unknown'
+# ⛔ AND A FARMED COPY UNDER A `$HOME` THAT IS ITSELF A REPOSITORY MUST NOT BORROW ITS REVISION (re-review P2,
+# measured). `git -C <farm dir> rev-parse` answers the nearest ENCLOSING work tree, so the ordinary dotfiles
+# layout recorded a confident `<home>@<sha>` — a PLAUSIBLE WRONG answer to "which code does this unit run",
+# which is worse than none because it reads as proof. The farmed file here is deliberately UNTRACKED, which is
+# what a dotfiles repo's config-only commitment produces; the pin must fall back to `unknown@unknown`.
+PPD="$(arm_root ppd)"; mk_systemctl "$PPD/bin" "$PPD/state" "$PPD/sc.log"; mk_tmux "$PPD/bin" "$PPD/tmux.log"
+mkdir -p "$PPD/home/.pi/agent/scripts"
+cp "$SUP" "$PPD/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
+printf 'dotfiles\n' > "$PPD/home/README"
+git init -q "$PPD/home" 2>/dev/null
+git -C "$PPD/home" add README >/dev/null 2>&1
+git -C "$PPD/home" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPD/home" rev-parse HEAD 2>/dev/null)" ] && [ -z "$(git -C "$PPD/home" ls-files --error-unmatch -- "$PPD/home/.pi/agent/scripts/cloud-cell-supervisor.sh" 2>/dev/null)" ]; then
+  PPD_RC=0; PPD_OUT="$(inst ppd --install 2>&1)" || PPD_RC=$?
+  [ "$PPD_RC" -eq 0 ] && ok '§P3: a farmed supervisor under a git-repo HOME still installs (the pin is an observation, not a gate)' \
+                     || bad "§P3: refused a farmed copy merely because its home is a repository — false block: $PPD_OUT"
+  grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPD/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P3: and it does NOT borrow the enclosing dotfiles repo revision — unknown@unknown, not <home>@<sha>' \
+    || bad "§P3: the pin borrowed a repo that does not carry the supervisor — got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPD/units/eldato-orchestrator.service" 2>/dev/null)"
+else
+  bad '§P3: the fixture could not build the git-repo-HOME shape, so the borrowed-revision arm did NOT run'
+fi
+# ⛔ AND A PATH THIS UNIT CANNOT CARRY IS REFUSED, NOT RENDERED (re-review P2, measured). The template renders
+# `Environment=ORCH_SUPERVISOR_PIN=…` and `ExecStart=/bin/bash {{SUPERVISOR}} start` UNQUOTED, so systemd splits
+# on whitespace: a checkout at `…/home/sp ace` rendered a pin assignment systemd DROPPED ("Invalid environment
+# assignment, ignoring: ace@…") while `verify_unit`'s exact-line grep PASSED on the raw text — a false PASS over
+# an artifact systemd reads differently. The installer now refuses and names the reason.
+PPE="$(arm_root ppe)"; mk_systemctl "$PPE/bin" "$PPE/state" "$PPE/sc.log"; mk_tmux "$PPE/bin" "$PPE/tmux.log"
+PPE_REPO="$PPE/home/sp ace"; mkdir -p "$PPE_REPO/scripts"
+cp "$SUP" "$PPE_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPE_REPO" 2>/dev/null
+git -C "$PPE_REPO" add -A >/dev/null 2>&1
+git -C "$PPE_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPE_REPO" rev-parse HEAD 2>/dev/null)" ]; then
+  PPE_RC=0
+  PPE_OUT="$(ORCH_SUPERVISOR="$PPE_REPO/scripts/cloud-cell-supervisor.sh" inst ppe --install 2>&1)" || PPE_RC=$?
+  [ "$PPE_RC" -ne 0 ] && ok '§P3: a supervisor path containing whitespace is REFUSED (systemd would split it, and verify_unit would not notice)' \
+                     || bad "§P3: rendered an unquoted ExecStart/pin for a path systemd splits — a unit that cannot start: $PPE_OUT"
+  case "$PPE_OUT" in
+    *whitespace*) ok '§P3: and the refusal says the path is unquotable in this unit' ;;
+    *) bad "§P3: the whitespace refusal does not name the reason — $PPE_OUT" ;;
+  esac
+  [ ! -f "$PPE/units/eldato-orchestrator.service" ] \
+    && ok '§P3: and nothing was armed for a path the unit cannot carry' || bad '§P3: a splittable path still wrote a unit'
+else
+  bad '§P3: the fixture could not create the spaced checkout, so the whitespace arm did NOT run'
+fi
+# ⛔ THE SAME FALSE PASS HAS A SECOND SPELLING, AND IT IS NOT WHITESPACE (cycle-2 P2, MEASURED). `%` is a systemd
+# SPECIFIER prefix and the rendered `Environment=ORCH_SUPERVISOR_PIN=…` / `ExecStart=…` carry the path verbatim, so
+# systemd REWRITES them on a path this installer passes through untouched: `systemd-analyze verify` on
+# `Environment=ORCH_SUPERVISOR_PIN=/tmp/a%x/repo@abc` answers "Failed to resolve specifiers in
+# PIN=/tmp/a%x/repo@abc, ignoring: Invalid slot" — the pin assignment is DROPPED, exactly the drop the whitespace
+# arm exists for — while `verify_unit`'s `grep -qxF` still passes, and `systemd-analyze` will not even grade an
+# ExecStart whose path contains `%`. A `$` is the same shape one layer over (variable expansion in a command
+# line). Both are refused now, and this arm is the one that would have caught the gap.
+PPQ="$(arm_root ppq)"; mk_systemctl "$PPQ/bin" "$PPQ/state" "$PPQ/sc.log"; mk_tmux "$PPQ/bin" "$PPQ/tmux.log"
+PPQ_REPO="$PPQ/home/pct%x"; mkdir -p "$PPQ_REPO/scripts"
+cp "$SUP" "$PPQ_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPQ_REPO" 2>/dev/null
+git -C "$PPQ_REPO" add -A >/dev/null 2>&1
+git -C "$PPQ_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPQ_REPO" rev-parse HEAD 2>/dev/null)" ]; then
+  PPQ_RC=0
+  PPQ_OUT="$(ORCH_SUPERVISOR="$PPQ_REPO/scripts/cloud-cell-supervisor.sh" inst ppq --install 2>&1)" || PPQ_RC=$?
+  [ "$PPQ_RC" -ne 0 ] && ok '§P3: a supervisor path containing % (a systemd SPECIFIER) is REFUSED (systemd would drop the pin assignment, and verify_unit would not notice)' \
+                     || bad "§P3: rendered a pin/ExecStart systemd REWRITES for a '%' path — 'Invalid slot' drops the assignment while verify_unit passes: $PPQ_OUT"
+  case "$PPQ_OUT" in
+    *%*specifier*|*specifier*'%'*) ok '§P3: and the refusal names the specifier as the reason' ;;
+    *) bad "§P3: the % refusal does not name the reason — $PPQ_OUT" ;;
+  esac
+  [ ! -f "$PPQ/units/eldato-orchestrator.service" ] \
+    && ok '§P3: and nothing was armed for a path systemd reads differently' || bad '§P3: a %-bearing path still wrote a unit'
+else
+  bad '§P3: the fixture could not create the %-bearing checkout, so the specifier arm did NOT run'
+fi
+# ⛔ AND THE QUOTING META-CHARACTERS ARE A THIRD SPELLING OF THE SAME FALSE PASS (cycle-3 P2, MEASURED). systemd
+# parses the two unquoted lines with its own word splitter, which STRIPS single quotes and interprets `\`: a
+# supervisor under `…/apo's/…` installed with rc=0 and an ExecStart naming `…/apos/…`, which `systemd-analyze
+# verify` then rejected as "not executable" (an unpaired quote: "Unbalanced quoting, ignoring"; a backslash:
+# "Ignoring unknown escape sequences") — the artifact systemd reads differs from the one verify_unit greps.
+PPR="$(arm_root ppr)"; mk_systemctl "$PPR/bin" "$PPR/state" "$PPR/sc.log"; mk_tmux "$PPR/bin" "$PPR/tmux.log"
+PPR_REPO="$PPR/home/apo's"; mkdir -p "$PPR_REPO/scripts"
+cp "$SUP" "$PPR_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPR_REPO" 2>/dev/null
+git -C "$PPR_REPO" add -A >/dev/null 2>&1
+git -C "$PPR_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPR_REPO" rev-parse HEAD 2>/dev/null)" ]; then
+  PPR_RC=0
+  PPR_OUT="$(ORCH_SUPERVISOR="$PPR_REPO/scripts/cloud-cell-supervisor.sh" inst ppr --install 2>&1)" || PPR_RC=$?
+  [ "$PPR_RC" -ne 0 ] && ok '§P3: a supervisor path containing a single quote is REFUSED (systemd strips it, and verify_unit would not notice)' \
+                     || bad "§P3: rendered an ExecStart whose quoted path systemd rewrites — the artifact differs from the one verify_unit greps: $PPR_OUT"
+  case "$PPR_OUT" in
+    *quote*) ok '§P3: and the refusal names the quote as the reason' ;;
+    *) bad "§P3: the quote refusal does not name the reason — $PPR_OUT" ;;
+  esac
+  [ ! -f "$PPR/units/eldato-orchestrator.service" ] \
+    && ok '§P3: and nothing was armed for a path systemd rewrites' || bad '§P3: a quoted path still wrote a unit'
+else
+  bad '§P3: the fixture could not create the quoted checkout, so the quote arm did NOT run'
+fi
+# ⛔ A BARE-CONFIGURED PRIMARY CLONE IS THE CELLS' OWN SHAPE, AND IT HAS NO TOP LEVEL TO NAME (re-review P3).
+# Measured on this fleet: `/tmp/cell-ai` answers `core.bare` → true, so `rev-parse --show-toplevel` FAILS while
+# `HEAD` answers — and the pin degraded to `unknown@<sha>` exactly where the doc promises `<repo>@<sha>`.
+# The fixture builds that shape by setting `core.bare` on a real work tree (that is what the cell does).
+PPB="$(arm_root ppb)"; mk_systemctl "$PPB/bin" "$PPB/state" "$PPB/sc.log"; mk_tmux "$PPB/bin" "$PPB/tmux.log"
+PPB_REPO="$PPB/home/hub"; mkdir -p "$PPB_REPO/scripts"
+cp "$SUP" "$PPB_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPB_REPO" 2>/dev/null
+git -C "$PPB_REPO" add -A >/dev/null 2>&1
+git -C "$PPB_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+git -C "$PPB_REPO" config core.bare true >/dev/null 2>&1
+PPB_SHA="$(git -C "$PPB_REPO" rev-parse HEAD 2>/dev/null)"
+if [ -z "$PPB_SHA" ] || [ -n "$(git -C "$PPB_REPO" rev-parse --show-toplevel 2>/dev/null)" ]; then
+  bad '§P3: the fixture could not build the bare-configured-work-tree shape, so the bare-clone pin arm did NOT run'
+else
+  PPB_RC=0; PPB_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPB_REPO/scripts/cloud-cell-supervisor.sh" inst ppb --install 2>&1)" || PPB_RC=$?
+  [ "$PPB_RC" -eq 0 ] && ok '§P3: a bare-configured primary clone still installs (the /tmp/cell-ai shape)' \
+                     || bad "§P3: refused the cells' own checkout shape — false block: $PPB_OUT"
+  grep -qxF "Environment=ORCH_SUPERVISOR_PIN=$PPB_REPO@$PPB_SHA" "$PPB/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P3: and the pin still names the REPO (not unknown@sha) when git has no top level to report' \
+    || bad "§P3: the pin lost its repo half on a bare-configured work tree — expected $PPB_REPO@$PPB_SHA, got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPB/units/eldato-orchestrator.service" 2>/dev/null)"
+fi
+# ⛔ AND A UNIT RENDERED BEFORE THE PIN EXISTED DOES NOT BREAK --status: the line reports `absent` and the
+# verdict is untouched, because supervision is not the pin.
+if [ -f "$PP/units/eldato-orchestrator.service" ]; then
+  grep -v '^Environment=ORCH_SUPERVISOR_PIN=' "$PP/units/eldato-orchestrator.service" > "$PP/units/nopin.tmp" \
+    && mv -f "$PP/units/nopin.tmp" "$PP/units/eldato-orchestrator.service"
+  PP_OLD="$(inst pp --status 2>&1)"
+  case "$PP_OLD" in
+    *'supervisor_pin=absent'*) ok '§P3: a pre-pin unit reports `absent` (and says to re-render) instead of inventing one' ;;
+    *) bad "§P3: a pre-pin unit did not report absent — $PP_OLD" ;;
+  esac
+fi
+
+# ── §P4 — the shape the CELLS actually render stays green ───────────────────────────────────────
+# ⛔ THE FALSE BLOCK THIS ARM PREVENTS. cell-3 measured the CORRECT ExecStart as
+# `/tmp/cell-home/harness/d4ccaf6ee8e6/scripts/cloud-cell-supervisor.sh` — a harness PIN under a home that is
+# itself under /tmp (the cells' HOME is `/tmp/cell-home`; /tmp is not its own mount there). A guard that read
+# "under /tmp" as scratch would refuse the one shape three cells proved right, and would do it on every
+# bring-up (`check_controller_service` runs `--install`).
+say_case 'the harness pin under the cell home — the shape cell-3 measured as CORRECT — is ADMITTED'
+PIN="$(arm_root pin)"; mk_systemctl "$PIN/bin" "$PIN/state" "$PIN/sc.log"; mk_tmux "$PIN/bin" "$PIN/tmux.log"
+# ⛔ AND IT MUST BE THE **REAL PIN**, NOT A LOOKALIKE (review-3 P2). This arm used to `cp` the supervisor into
+# `$home/harness/<sha>/scripts` — a plain directory no cell has. The bring-up creates the pin with
+# `git worktree add --detach <pin>/<sha> <sha>` (`cloud-cell-bringup.sh`), and a plain copy passed while the
+# real thing was REFUSED: the arm certified a shape that does not exist and hid a P1. The fixture now builds
+# the pin the way the bring-up does, and refuses to call the arm covered if it cannot.
+PIN_REPO="$PIN/home/agent-infra"; mkdir -p "$PIN_REPO/scripts"
+cp "$SUP" "$PIN_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PIN_REPO" 2>/dev/null
+git -C "$PIN_REPO" add -A >/dev/null 2>&1
+git -C "$PIN_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PIN_SHA="$(git -C "$PIN_REPO" rev-parse HEAD 2>/dev/null)"
+# ⛔ THE PIN LIVES OUTSIDE THE FALLBACK ROOT, SO THE RECORD IS THE **ONLY** ADMITTING ROUTE (review-7 P2,
+# MEASURED). The previous fixture put the pin under `$CELL_HOME/harness`, which IS the fallback root
+# `pin_root_of_this_box` returns when no record exists — so this arm was admitted by the FALLBACK and its own
+# claim ("the RECORD BRANCH is what RUNS") was FALSE: replacing `pin_root_of_this_box` with the bare fallback
+# left the arm ARMED. A relocated pin is also a REAL shape (`HARNESS_PIN_FILE`/`HARNESS_PIN_DIR` are how a cell
+# moves its pin), so the fixture now exercises the record the way a cell that moved it does: with the record
+# honoured the pin root is `$PIN/home/pin-store`, and with the record IGNORED it is `$CELL_HOME/harness`, which
+# is NOT an ancestor of the pin tree — so the arm goes RED. That is the property the comment claimed and the
+# fixture could not see (the same vacuity class this PR has fixed five times).
+PIN_DIR="$PIN/home/pin-store/$PIN_SHA"
+PIN_SUP="$PIN_DIR/scripts"
+if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PIN_SHA" >/dev/null 2>&1; then
+  # A REAL PIN CARRIES ITS HARNESS — the bring-up refuses a pin tree without
+  # `scripts/orchestrator-harness/orch-loop.sh`, so the fixture carries one (§P4 is about the SHAPE of the path,
+  # not about a pin that no bring-up would ever accept).
+  mkdir -p "$PIN_DIR/scripts/orchestrator-harness"
+  : > "$PIN_DIR/scripts/orchestrator-harness/orch-loop.sh"
+  # ⛔ AND THE BOX\'S OWN PIN RECORD IS WRITTEN, AND IT NAMES THE **RELOCATED** ROOT, SO THE RECORD BRANCH IS THE
+  # ONLY ROUTE THAT RUNS (review-7 P2 — this claim was FALSE: measured, replacing `pin_root_of_this_box` with
+  # the bare `${HARNESS_PIN_DIR:-$CELL_HOME/harness}` fallback left this arm ARMED, because the pin sat under
+  # that very fallback). This is the record the bring-up writes
+  # (`printf "%s\n" "$dir/scripts/orchestrator-harness"`), and the trailing-slash spelling is included because
+  # that spelling used to be read as a pin ROOT and refused the box\'s real pin.
+  printf '%s\n' "$PIN_DIR/scripts/orchestrator-harness/" > "$PIN/home/.harness-path"
+  PIN_RC=0; PIN_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_SUP/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_RC=$?
+  [ "$PIN_RC" -eq 0 ] && ok '§P4: the DETACHED pin worktree the bring-up really creates installs (a cell home under /tmp is a DECLARED root)' \
+                      || bad "§P4: refused the cell-3 shape — this guard would block every cell bring-up: $PIN_OUT"
+  grep -qxF "ExecStart=/bin/bash $PIN_SUP/cloud-cell-supervisor.sh start" "$PIN/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P4: and the unit names the pin, which is what cell-3 already runs' \
+    || bad '§P4: the installed unit does not name the pin path'
+  # ⛔ THE CONTROL THAT MAKES §P4 ABOUT THE BRANCH, NOT ABOUT WORKTREES: the SAME location, the same git
+  # checkout, but the worktree checked out ON A BRANCH — a lane's shape at a pin's address. Must be refused.
+  rm -f "$PIN/units/eldato-orchestrator.service"
+  PIN_BR="$PIN/home/harness/lane-at-pin-address"
+  if git -C "$PIN_REPO" worktree add -q -b lane2697 "$PIN_BR" "$PIN_SHA" >/dev/null 2>&1; then
+    PIN_BR_RC=0; PIN_BR_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_BR/scripts/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_BR_RC=$?
+    [ "$PIN_BR_RC" -ne 0 ] && ok "§P4: a BRANCH worktree at a pin's own address is REFUSED (the branch is the rule, not 'worktree')" \
+                          || bad "§P4: a lane's branch checkout was armed just because it sat where a pin goes: $PIN_BR_OUT"
+  else
+    bad '§P4: the fixture could not create the branch-worktree control, so that arm did not run'
+  fi
+else
+  bad '§P4: the fixture could not create the detach pin worktree, so §P4 did not run on the shape it names'
+fi
+# ⛔ AND A BENIGN SYMLINK IN THE RECORD'S OWN SPELLING MUST NOT REFUSE THE BOX'S OWN PIN (cycle-2 P1, MEASURED — a
+# FALSE BLOCK, and the loop of recommending the exact path it just refused). `path_under`'s contract is that BOTH
+# arguments are already resolved by `canon_dir`, and the three declared roots are resolved a few lines below in
+# `scratch_supervisor_reason` — but `pin_root_of_this_box` normalised SLASHES only. So `CELL_HOME` (or the record,
+# or `HARNESS_PIN_DIR`) spelled through a symlink — the layout #2666 measures with `/home/op -> /mnt/data/op` —
+# compared git's PHYSICAL toplevel against the unresolved record, refused the box's own harness pin as "NOT the
+# harness pin this box records", and printed that same path as the remedy. Measured before the fix: rc=1 here,
+# while the identical tree spelled physically was admitted. This control is what keeps §P4 from passing only on a
+# fixture whose paths happen to be symlink-free.
+SYM="$(arm_root sym)"; mk_systemctl "$SYM/bin" "$SYM/state" "$SYM/sc.log"; mk_tmux "$SYM/bin" "$SYM/tmux.log"
+SYM_REAL="$SYM/home/deep/ch-real"; SYM_LINK="$SYM/home/ch-link"
+mkdir -p "$SYM_REAL/agent-infra/scripts"
+cp "$SUP" "$SYM_REAL/agent-infra/scripts/cloud-cell-supervisor.sh"
+git init -q "$SYM_REAL/agent-infra" 2>/dev/null
+git -C "$SYM_REAL/agent-infra" add -A >/dev/null 2>&1
+git -C "$SYM_REAL/agent-infra" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+SYM_SHA="$(git -C "$SYM_REAL/agent-infra" rev-parse HEAD 2>/dev/null)"
+if [ -n "$SYM_SHA" ] && ln -sfn "$SYM_REAL" "$SYM_LINK" 2>/dev/null \
+   && git -C "$SYM_REAL/agent-infra" worktree add -q --detach "$SYM_REAL/harness/$SYM_SHA" "$SYM_SHA" >/dev/null 2>&1; then
+  # THE RECORD THE BRING-UP WRITES when CELL_HOME is spelled through the symlink: the pin TREE physically, the
+  # spelling symlinked — the mismatch no reader could see until it was resolved. The pin carries its harness
+  # tree, because the bring-up demands one and the guard now corroborates it.
+  mkdir -p "$SYM_REAL/harness/$SYM_SHA/scripts/orchestrator-harness"
+  : > "$SYM_REAL/harness/$SYM_SHA/scripts/orchestrator-harness/orch-loop.sh"
+  printf '%s\n' "$SYM_LINK/harness/$SYM_SHA/scripts/orchestrator-harness" > "$SYM_LINK/.harness-path"
+  SYM_RC=0
+  SYM_OUT="$(EXTRA_ENV="CELL_HOME=$SYM_LINK" ORCH_SUPERVISOR="$SYM_LINK/harness/$SYM_SHA/scripts/cloud-cell-supervisor.sh" inst sym --install 2>&1)" || SYM_RC=$?
+  [ "$SYM_RC" -eq 0 ] && ok '§P4: the box'"'"'s own pin is ADMITTED when CELL_HOME and its record are spelled through a benign symlink (resolved before compared)' \
+                      || bad "§P4: refused the box's OWN pin because the record was compared unresolved — a false block on any symlinked CELL_HOME: $SYM_OUT"
+else
+  bad '§P4: the fixture could not build the symlinked-CELL_HOME pin, so the resolution arm did NOT run'
+fi
+# …and the same path under a temp root that NO root declares is refused, so §P4 is not a blanket pass.
+PINB="$(arm_root pinb)"; mk_systemctl "$PINB/bin" "$PINB/state" "$PINB/sc.log"; mk_tmux "$PINB/bin" "$PINB/tmux.log"
+PINB_SUP="$T/harness/$PIN_SHA/scripts"; mkdir -p "$PINB_SUP"; cp "$SUP" "$PINB_SUP/cloud-cell-supervisor.sh"
+PINB_RC=0; PINB_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PINB_SUP/cloud-cell-supervisor.sh" inst pinb --install 2>&1)" || PINB_RC=$?
+[ "$PINB_RC" -ne 0 ] && ok '§P4: the same pin SHAPE outside every declared root is still refused (the root decides, not the shape)' \
+                    || bad "§P4: a pin-shaped path under no declared root was admitted — the control proves §P4 passes everything: $PINB_OUT"
+
+# ── §P5 — a CALLER's preference is skipped, not obeyed and not fatal ──────────────────────────────
+# ⛔ THE SECOND CALL SITE (agent-infra#2697). `cloud-cell-bringup.sh` names the LAYER's supervisor because it
+# wants the unit to run the code the layer install just put there — but `self_root` IS a lane worktree when a
+# lane runs the bring-up from its own checkout, and refusing there would kill the bring-up on the one shape
+# a lane can produce (measured: 23 red arms in cloud-cell-bringup.test.sh). So a PREFERENCE that cannot
+# survive a cleaning is skipped with a note and the next durable candidate is used, while an explicit
+# ORCH_SUPERVISOR keeps the hard refusal the issue asks for. Both directions are pinned here.
+say_case 'a non-durable PREFERENCE is skipped with a note; an explicit requirement is still refused'
+PREF="$(arm_root pref)"; mk_systemctl "$PREF/bin" "$PREF/state" "$PREF/sc.log"; mk_tmux "$PREF/bin" "$PREF/tmux.log"
+PREF_FARM="$(farmed_sup "$PREF")"
+PREF_RC=0; PREF_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR_PREFER=$SCRATCH_P/cloud-cell-supervisor.sh" inst pref --install 2>&1)" || PREF_RC=$?
+[ "$PREF_RC" -eq 0 ] && ok '§P5: a non-durable preference does NOT withhold the unit — the farm supplies it' \
+                   || bad "§P5: a non-durable preference killed the install — the bring-up would die on a lane worktree: $PREF_OUT"
+case "$PREF_OUT" in
+  *'NOT rendering ExecStart from'*) ok '§P5: and it says loudly which candidate it skipped and why' ;;
+  *) bad "§P5: the skipped preference was silent — the operator sees a unit running code they did not ask for: $PREF_OUT" ;;
+esac
+grep -qxF "ExecStart=/bin/bash $PREF_FARM start" "$PREF/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P5: the unit names the DURABLE candidate it fell through to' \
+  || bad '§P5: the installed unit does not name the durable fallback'
+# …and the SAME path passed as a REQUIREMENT is refused, so the preference never weakens ORCH_SUPERVISOR.
+PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst pref --install 2>&1)" || PREF2_RC=$?
+[ "$PREF2_RC" -ne 0 ] && ok '§P5: the same path as an explicit ORCH_SUPERVISOR is still REFUSED (hard, not skipped)' \
+                    || bad "§P5: an explicit non-durable requirement was silently swapped — the operator's decision was overridden: $PREF2_OUT"
+# …and when NOTHING durable exists, the preference does not rescue the install either: fail closed, naming
+# the durable roots, instead of arming whatever was beside the installer.
+PREFB="$(arm_root prefb)"; mk_systemctl "$PREFB/bin" "$PREFB/state" "$PREFB/sc.log"; mk_tmux "$PREFB/bin" "$PREFB/tmux.log"
+rm -f "$(farmed_sup "$PREFB")"    # no farm
+# ⛔ THE FOURTH CANDIDATE IS THE COPY BESIDE THIS INSTALLER, SO THIS ARM WOULD BE LOCATION-DEPENDENT
+# (re-review P1). Run from a DURABLE checkout — which is what CI checks out — that copy is durable and the
+# install legitimately succeeds, so an arm asserting a refusal went red on the PR lane and on `main`. The
+# fixture therefore runs a COPY of the installer inside $T with a transient supervisor BESIDE IT, which is
+# the same "nothing durable exists" premise on every box.
+mkdir -p "$PREFB/side"
+cp "$INST" "$PREFB/side/install-controller-service.sh"
+cp "$SUP"  "$PREFB/side/cloud-cell-supervisor.sh"
+PREFB_RC=0
+PREFB_OUT="$(bnd env SYSTEMCTL="$PREFB/bin/systemctl" SYSTEMD_UNIT_DIR="$PREFB/units" \
+    CONTROLLER_SYSTEM_UNIT_DIR="$PREFB/units" CONTROLLER_USER_UNIT_DIR="$PREFB/nouser" CONTROLLER_ALLOW_ROOT=1 \
+    TEMPLATES_DIR="$(dirname "$TPL")" HOME="$PREFB/home" CELL_HOME="$PREFB/home" \
+    AGENT_INFRA_PATH="$PREFB/layer" ENV_FILE="$PREFB/home/keys.env" O="$PREFB/o" \
+    PATH="$PREFB/bin:$PATH" ELDATO_PLATFORM=Linux \
+    ORCH_SUPERVISOR_PREFER="$SCRATCH_P/cloud-cell-supervisor.sh" bash "$PREFB/side/install-controller-service.sh" --install 2>&1)" || PREFB_RC=$?
+[ "$PREFB_RC" -ne 0 ] && ok '§P5: with no durable candidate at all the pref does not rescue it — refused, not armed' \
+                    || bad "§P5: installed from a scratch preference when no durable candidate existed: $PREFB_OUT"
+case "$PREFB_OUT" in
+  *'no DURABLE cloud-cell-supervisor.sh'*) ok '§P5: and that refusal names what a durable supervisor would be' ;;
+  *) bad "§P5: the nothing-durable refusal does not name a durable alternative — $PREFB_OUT" ;;
+esac
+
+# ── §P8 — the transient-root list has ONE source of truth, and this arm is its drift gate ────────
+# ⛔ THE GUARD IS ONLY AS WIDE AS ITS ROOT LIST, AND THE INSTALLER'S LIST IS A COPY. `runner_autoscale.py`
+# (`TRANSIENT_UNIT_PREFIXES`) already owns this judgement for a unit's WorkingDirectory and its ExecStart
+# program; the installer carries its own literal because a farmed copy cannot import the python. An
+# ungated copy is exactly the drift the installer's own comment warns about: a root added to the Python
+# would keep being ADMITTED here, and the measured shape under that root would re-ship — a fail-open in
+# the guard, not a cosmetic mismatch. So the two lists are compared as SETS; a root added on either side
+# reddens this arm until both agree. (Distinct from §P6, which gates the lane-scratch SHAPE list against
+# install-repair-service.sh's mirror — two different lists, two different owners, two drift gates.)
+say_case 'the transient-root list the installer grades against is the one runner_autoscale.py owns'
+PY_ROOTS="$(sed -n '/^TRANSIENT_UNIT_PREFIXES = (/,/^)/p' "$HERE/orchestrator-harness/runner_autoscale.py" 2>/dev/null \
+  | sed -n 's/^[[:space:]]*"\([^"]*\)",*$/\1/p' | grep -v '^$' | sort -u)"
+SH_ROOTS="$(sed -n 's/^TRANSIENT_ROOTS="\(.*\)"$/\1/p' "$HERE/install-controller-service.sh" 2>/dev/null \
+  | tr ' ' '\n' | grep -v '^$' | sort -u)"
+if [ -z "$PY_ROOTS" ] || [ -z "$SH_ROOTS" ]; then
+  bad '§P8: could not read BOTH root lists, so drift cannot be shown — an arm that passes on an unreadable side is vacuous'
+else
+  printf '%s\n' "$PY_ROOTS" > "$T/p8-py.txt"; printf '%s\n' "$SH_ROOTS" > "$T/p8-sh.txt"
+  P8_ONLY_PY="$(comm -23 "$T/p8-py.txt" "$T/p8-sh.txt" | tr '\n' ' ')"
+  P8_ONLY_SH="$(comm -13 "$T/p8-py.txt" "$T/p8-sh.txt" | tr '\n' ' ')"
+  [ "$PY_ROOTS" = "$SH_ROOTS" ] \
+    && ok "§P8: both lists name the same $(printf '%s\n' "$PY_ROOTS" | grep -c .) transient roots" \
+    || bad "§P8: TRANSIENT_ROOTS drifted from runner_autoscale.py's TRANSIENT_UNIT_PREFIXES — a root one side refuses is ADMITTED by the other (only-python=[${P8_ONLY_PY% }] only-shell=[${P8_ONLY_SH% }])"
+fi
+
+# ── §P9 — the MEASURED `/tmp/wt-*` shape is refused AS A SHAPE, on a real path ──────────────────
+say_case 'the measured /tmp/wt-2697-fixture shape is refused by the SHAPE rule, not only by the temp-root rule'
+# ⛔ §P's fixture sits under `$T` (`<temp>/ctlunit.XXXX`), which matches NO lane-scratch pattern — it is
+# refused by the transient-root rule. So before this arm the `/tmp/wt-*` entry of the shape list had NO
+# behavioural coverage: deleting that entry left every §P arm green (re-review P3). This is the measured
+# cell-1 spelling, created at a real `/tmp/wt-*` path.
+rm -f "$P/units/eldato-orchestrator.service"          # so the no-unit assertion is about THIS arm
+WT_DIR="$(mktemp -d /tmp/wt-2697-fixture.XXXXXX 2>/dev/null)" || WT_DIR=""
+if [ -n "$WT_DIR" ]; then
+  mkdir -p "$WT_DIR/scripts"; cp "$SUP" "$WT_DIR/scripts/cloud-cell-supervisor.sh"
+  WT_RC=0; WT_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$WT_DIR/scripts/cloud-cell-supervisor.sh" inst p --install 2>&1)" || WT_RC=$?
+  [ "$WT_RC" -ne 0 ] && ok '§P9: the measured /tmp/wt-2697-fixture shape is REFUSED' \
+                     || bad "§P9: armed the measured cell-1 shape ($WT_DIR) — the #2697 defect, re-shipped: $WT_OUT"
+  # The shape list is what must do the work; on a box where /tmp is itself a symlink the path resolves out of
+  # the pattern, so the wording is asserted only where the spelling survives resolution (Linux cells/CI).
+  if [ "$(cd /tmp && pwd -P 2>/dev/null)" = '/tmp' ]; then
+    case "$WT_OUT" in
+      *'lane-scratch shape /tmp/wt-*'*) ok '§P9: and it is refused AS a lane-scratch shape, not merely as a temporary root' ;;
+      *) bad "§P9: the /tmp/wt-* shape was refused by some OTHER rule — the shape entry is not doing the work: $WT_OUT" ;;
+    esac
+  fi
+  [ ! -f "$P/units/eldato-orchestrator.service" ] \
+    && ok '§P9: and nothing was armed for it' || bad '§P9: a refused shape still left a unit behind'
+  rm -rf "$WT_DIR"
+else
+  bad '§P9: could not create /tmp/wt-2697-fixture.* — the measured shape would have no behavioural arm'
+fi
+
+# ── §P10 — an operator's NAMED supervisor that does not exist is refused, never swapped ────────
+say_case 'a named ORCH_SUPERVISOR that does not exist is REFUSED, never silently replaced'
+# ⛔ THE CONTRACT SAYS "refused — never silently swapped" (docs/ops/controller-service.md, header), and the
+# candidate loop used to `continue` for BOTH strengths: `ORCH_SUPERVISOR=<typo or moved checkout>` armed the
+# farmed copy and printed nothing about the path the operator named (re-review P2). That is the
+# merged-not-running class the seam exists to surface, reintroduced by the fallthrough itself.
+NE="$(arm_root nosup)"; mk_systemctl "$NE/bin" "$NE/state" "$NE/sc.log"; mk_tmux "$NE/bin" "$NE/tmux.log"
+NE_RC=0; NE_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$NE/moved-away/cloud-cell-supervisor.sh" inst nosup --install 2>&1)" || NE_RC=$?
+[ "$NE_RC" -ne 0 ] && ok '§P10: a non-existent ORCH_SUPERVISOR is REFUSED (not swapped for the farm)' \
+                   || bad "§P10: an operator's missing supervisor was silently replaced by another copy — the contract says it never is: $NE_OUT"
+case "$NE_OUT" in
+  *'is not a readable file'*) ok '§P10: and the refusal names the path the operator gave as the reason' ;;
+  *) bad "§P10: the refusal does not say the named path is the problem — $NE_OUT" ;;
+esac
+[ ! -f "$NE/units/eldato-orchestrator.service" ] \
+  && ok '§P10: and nothing was armed from the fallthrough' || bad '§P10: a refused requirement still left a unit behind'
+# the control that makes it a contract test rather than a blanket refusal: UNSET installs from the farm
+NE2_RC=0; NE2_OUT="$(inst nosup --install 2>&1)" || NE2_RC=$?
+[ "$NE2_RC" -eq 0 ] && ok '§P10: control — with ORCH_SUPERVISOR unset the farmed copy installs' \
+                   || bad "§P10: refused the default path too — the guard is a false block: $NE2_OUT"
+grep -qxF "ExecStart=/bin/bash $(farmed_sup "$NE") start" "$NE/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P10: and the unit names the farm' || bad '§P10: the default install did not name the farm'
+
+# ── §P11 — `--help` documents the seams that make a pin refusal actionable ────────────────────
+say_case '--help documents the pin RECORD and its two overrides, not only the refusal'
+# ⛔ A REFUSAL AN OPERATOR CANNOT ACT ON IS HALF A GUARD (review residual, round 6). The ExecStart refusal
+# names "the harness pin" among the durable alternatives, but `--help` documented neither the record that
+# identifies THIS box's pin ($CELL_HOME/.harness-path) nor its root fallback — so the one remedy the message
+# offers was the one seam the usage text did not name. The doc covers both (docs/ops/controller-service.md,
+# "NOT EVERY LINKED WORKTREE IS A LANE'S"); the usage block an operator on a cell actually reads did not.
+HELP_OUT="$(bash "$INST" --help 2>&1)"
+for seam in HARNESS_PIN_FILE HARNESS_PIN_DIR ORCH_SUPERVISOR_PREFER ORCH_SUPERVISOR AGENT_INFRA_PATH; do
+  case "$HELP_OUT" in
+    *"$seam"*) ok "§P11: --help names $seam" ;;
+    *) bad "§P11: --help does not name $seam — an operator reading only the usage text cannot act on the refusal the installer prints" ;;
+  esac
+done
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"
