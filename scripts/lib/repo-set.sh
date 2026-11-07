@@ -588,10 +588,18 @@ _rs_tag_collision() {
 # `_rs_split_divergence`, which compares ENTRIES, so nothing called `_rs_split_count` any more — and
 # leaving a second, regex-copying splitter in the file is how a dead copy gets revived and silently
 # becomes the authority again. One splitter, one authority.
+# ⛔ AN EMPTY ANSWER FROM A VERB THAT CANNOT LEGITIMATELY BE EMPTY IS "COULD NOT ASK", NOT "NO
+# ENTRIES". `configured_repos()` always yields at least one entry for a non-empty list, so an empty
+# result means the sibling module lacks the function or it raised — and the caller must treat that
+# exactly like an unavailable doctor (WARN, do not refuse), not like a divergence. Measured: a sibling
+# without `configured_repos` made every legitimate two-repo set refuse with "entry 1 ... reads it as
+# <empty>", on any consumer that carries this file without a current doctor beside it.
 _rs_split_entries() {
-  local entries="${1:-}"
+  local entries="${1:-}" out
   [ -n "$entries" ] || return 0
-  _rs_with_doctor split "$entries"
+  out="$(_rs_with_doctor split "$entries")"
+  if [ -z "$out" ]; then printf '%s' "__UNASKABLE__"; return 0; fi
+  printf '%s' "$out"
   return 0
 }
 
@@ -610,6 +618,8 @@ _rs_split_divergence() {
   # ⛔ THE INDEX TRAVELS WITH THE ENTRY (review round 10, P2). It used to return only the offending
   # entry, and the caller paired it with the FIRST expected line — so a fault on line 2 was reported
   # against line 1, sending the operator to the wrong config line.
+  # the sentinel means "the doctor could not be asked": it is NOT a divergence, and the caller WARNs
+  if [ "$got" = "__UNASKABLE__" ]; then printf '%s' "__UNASKABLE__"; return 0; fi
   local i=1 line want
   while IFS= read -r line; do
     want="$(printf '%s\n' "$expected" | sed -n "${i}p")"
@@ -808,6 +818,10 @@ EOF
     diverged="$(_rs_split_divergence "$rendered" "$expected")"
   else
     printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+  fi
+  if [ "$diverged" = "__UNASKABLE__" ]; then
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    diverged=""
   fi
   if [ -n "$diverged" ]; then
     local dline dgot dwant
