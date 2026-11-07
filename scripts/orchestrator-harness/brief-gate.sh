@@ -56,12 +56,14 @@
 # author READ the ref, and the next actor still has to read it.
 #
 # ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN THREE WAYS.
-#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number. A key with NO
-#       NUMBER in it — the canonical slot `issue-<N>`, or any bracket spelling with no digits inside —
-#       is the UNFILLED slot and is admitted: the canonical block ships that shape and the gate cannot
-#       refuse its own advice, exactly as the research contract admits its own `<…>` slots. Every form
-#       that DOES carry a number is measured (plain, bracketed, dashed/bolded labels, and case-folded
-#       keys), so the limit is precisely "no number", not a list of exempt spellings.
+#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number in its KEY. The limit
+#       is exact, and it is "no digit inside the key's FIRST bracket": the canonical slot `issue-<N>` is a
+#       CLOSED bracket with no digits, and it — like any other digit-free bracket — is admitted, because
+#       the canonical block ships that shape and the gate cannot refuse its own advice (the same licence
+#       the research contract gives its own `<…>` slots). A number OUTSIDE the bracket (`issue-<x> 4242`)
+#       is not a key: the value falls to the slot case and is admitted unchecked. That shape is not a
+#       capability an author needs — the bare slot already admits — but it is the precise limit, stated so
+#       it can be re-measured rather than trusted.
 #   (b) MEASUREMENT: it needs a repository and a reachable `origin`. With neither, the gate says so on
 #       stderr (the word `UNVERIFIED`, naming the issue) and ADMITS the brief, because refusing
 #       every dispatch on a moment's network failure converts a memory gap into a fleet-wide outage.
@@ -494,17 +496,18 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
         tail="${nval#"$head"}"
         num="$(printf '%s' "$inner" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
         case "$head" in
-          # ⛔ THE NUMBER AND THE TAIL ARE JOINED WITH A SEPARATOR (review of #3621, cycle 5, P3): gluing
-          # them rebuilt the cycle-4 concatenation one layer down (`issue-<4242>4242>` became the key
-          # `42424242`, a key that does not exist, and the claim was ADMITTED).
-          # ⛔ AND A CLOSED BRACKET WITH NO DIGITS IS NOT THE SLOT: the canonical slot has no closing
-          # bracket, so this is malformed and is refused as unkeyed rather than waved through.
-          # ⛔ A BRACKET WITH NO DIGITS IN IT IS THE SLOT, whichever bracket is used: the canonical block
-          # ships `issue-<N>` (a closed bracket with no number), and the gate cannot refuse its own advice.
-          # The coverage limit is therefore stated exactly: a key that carries NO NUMBER is unchecked.
-          # ⛔ AND THE NUMBER AND THE TAIL ARE JOINED WITH A SEPARATOR: gluing them rebuilt the cycle-4
-          # concatenation one layer down (`issue-<4242>4242>` became the key `42424242`, and the claim was
-          # ADMITTED against a key that does not exist).
+          # ── WHAT THIS ARM DECIDES, ONCE (review of #3621, cycle 6: an earlier draft of this comment said
+          # the opposite two lines apart and repeated its rationale).
+          # 1. A bracket carrying a NUMBER anywhere inside it is KEYED BY THAT NUMBER — the first digit run,
+          #    never the concatenation of every run (a key that does not exist measured nothing, cycle 4).
+          # 2. A bracket carrying NO DIGITS is the UNFILLED SLOT (`issue-<N>` — a CLOSED bracket — is
+          #    exactly what the canonical block ships, so this case must be admitted: the gate cannot
+          #    refuse its own advice). The coverage limit is therefore "no digit inside the key's first
+          #    bracket", not "no number anywhere in the value" — a number OUTSIDE the bracket (`issue-<x>
+          #    4242`) leaves the key unparsable and the value is treated as the slot.
+          # 3. The number is joined to the tail WITH A SEPARATOR. `tail` now derives from `head`, so this
+          #    is belt-and-braces rather than the load-bearing fix it was in cycle 5 — but the two lines
+          #    together are what H61 pins, and either one alone reconstructs `42424242`.
           issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
           *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
