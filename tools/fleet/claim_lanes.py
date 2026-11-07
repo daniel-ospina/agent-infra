@@ -680,7 +680,9 @@ def _commit_body(obj: str) -> str:
 # ⛔ THE SHELL'S ACCEPTANCE, EXACTLY (review round 18, agent-infra#3203). `_claim_commit_time` takes the
 # stamp from the LAST `committer `-prefixed header line (see the selection note inside `_commit_time`),
 # parses that ONE line with an ANCHORED shape — NO trailing whitespace before EOL — and then rejects
-# anything longer than 12 digits as UNMEASURABLE (`case … |?????????????*`). This pattern used to allow
+# anything longer than 12 digits as UNMEASURABLE (the check is `[ "${#ct}" -le 12 ]` — a separate arm
+# below the `case`, NOT a `case … |?????????????*` glob: that glob is how this file's CLOCK and LEASE
+# fields bound their digits, and `ct` has never used it). This pattern used to allow
 # `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and a fresh/aged stamp
 # here: one datum, two answers, in the very field the bounded reap is measured from.
 # ⛔ UNBOUNDED, BECAUSE THE ORACLE'S IS (review round 21, agent-infra#3203): `\([0123456789][0123456789]*\)`
