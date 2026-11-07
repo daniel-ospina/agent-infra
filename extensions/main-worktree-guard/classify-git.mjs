@@ -3421,8 +3421,29 @@ export function wtIsPathShapedScriptWord(word) {
   // A path carries a separator or a leading `~`; a bare word resolves through
   // PATH, not through this arm (same rule `directish` states).
   if (!/[\/~]/.test(s)) return false;
+  // ⛔ ACCEPT (a) IS CHECKED **HERE**, BEFORE THE BYTE LOOP RUNS (batch review cycle-7, P0).
+  // It used to sit after the loop, so the loop's own early returns (`[` without `]`,
+  // `{` without `}`, `(` without `)`, a lone backtick) short-circuited it: `./a[b/undo*.sh`
+  // and `./a{b/undo-*.sh` returned false, i.e. a real executed path word was DELETED, in
+  // every position now that the `fromBody` exemptions are gone (measured: ALLOW on this
+  // head where BOTH `origin/main` and the pre-batch head BLOCK — five spellings, command
+  // AND body). A prefix accept that a `return false` above it can pre-empt is not an
+  // accept. Whatever bytes follow an explicit prefix, the word is a candidate.
+  if (/^(?:\.{1,2}|~)\//.test(s)) return true;
   const PH = "\u0000";
+  const ES = "\u0001"; // an ESCAPED separator: a separator, not a component boundary
+  const PG = "\u0002"; // a RAW glob operator (`*`/`?`): what makes a following `$` an end-anchor
   let out = "";
+  // ⛔ THE CLOSER HUNT IS HOISTED, NOT PER-BYTE (#3333 review, P2 — measured). `s.lastIndexOf("]")`
+  // inside the loop is a whole-string scan for EVERY `[` that has no later `]`, and the loop advances
+  // one byte, so a word of N unmatched `[` cost O(N²): 1.3 s for a 64 KB token, against 0.03 ms on
+  // the pre-port grammar (which `return false`d on the first unmatched `[`). This predicate runs from
+  // the `tool_call` hook on EVERY bash call, so an input-shaped cost belongs outside the loop.
+  // `lastIndexOf` did not depend on `i`, so hoisting it is semantics-preserving; the two `indexOf`
+  // hunts keep their from-`i` semantics and are skipped outright once no closer remains to the right.
+  const LAST_CLOSE = s.lastIndexOf("]");
+  const LAST_BRACE = s.lastIndexOf("}");
+  const LAST_PAREN = s.lastIndexOf(")");
   for (let i = 0; i < s.length; i++) {
     const ch = s[i];
     // ⛔ QUOTING IS SHELL SYNTAX, NOT A PATH CHARACTER — and it may be MID-WORD
@@ -3439,7 +3460,21 @@ export function wtIsPathShapedScriptWord(word) {
     // contains a `*`), so it is a path character, not a disqualifier (#3243
     // review cycle-2, F2). Placeholder it: the byte is present and it is not an
     // expansion form, which is exactly what the later arms need to know.
-    if (ch === "\\") { out += PH; i++; continue; }
+    if (ch === "\\") {
+      // ⛔ AN ESCAPED SEPARATOR IS STILL A SEPARATOR — AND IT IS NOT A COMPONENT BOUNDARY
+      // (batch review cycle-9 F2, then cycle-10 P0, both measured). `a\/undo.sh` spells the path
+      // `a/undo.sh`, so placeholdering the escaped byte REMOVED the word's only `/` and the terminal
+      // separator test rejected a path the shell really executes (ALLOW at the base, the cycle-6 head
+      // and the cycle-8 head). Emitting a literal `/` fixed that and broke the next rule over:
+      // `.\/^b/undo.sh` (the escaped spelling of the directory `^b`) then looked component-initial to
+      // the `^` anchor rule and was deleted. So an escaped separator is emitted as ES: a separator for
+      // the terminal test, NOT a boundary for the `^` rule. Every other escaped byte stays PH, because
+      // the byte it spells (`*`, `[`, …) is syntax the loop has already consumed.
+      const nx = s[i + 1];
+      out += nx === "/" || nx === "~" ? ES : PH;
+      i++;
+      continue;
+    }
     if (ch === "`") {
       const end = s.indexOf("`", i + 1);
       if (end < 0) return false; // unbalanced — prose, not a substitution
@@ -3449,25 +3484,93 @@ export function wtIsPathShapedScriptWord(word) {
       let j = i + 1;
       if (s[j] === "{") { const e = s.indexOf("}", j); if (e < 0) return false; j = e + 1; }
       else if (s[j] === "(") { const e = s.indexOf(")", j); if (e < 0) return false; j = e + 1; }
-      else while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+      else if (/[A-Za-z0-9_]/.test(s[j] ?? "")) { while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++; }
+      // ⛔ A `$` THAT INTRODUCES NOTHING IS A **LITERAL FILENAME BYTE**, IN EVERY POSITION (batch
+      // review cycle-9). Three cuts got this wrong in three different ways: the first placeholdered
+      // every `$` (so a sed program and a real `/tmp/undo$.sh` were indistinguishable), the second
+      // appended the byte but kept `$` out of the alphabet (deleting `/tmp/undo$.sh`), and the third
+      // admitted `$` mid-component but rejected it at the END of one ("end-anchor") — which the
+      // reviewer measured as a NEW fail-open: `a$/undo*.sh` really execs (bash passes the component
+      // to execve verbatim) and went BLOCK at BOTH `9a80306fb` and `08e361b74` → ALLOW here. A
+      // component-final `$` is a filename byte like any other, so ALL of it is accepted; the price is
+      // that a sed/awk program is no longer excluded by its trailing `$`, and that over-block is
+      // recorded in the README as this arm's fail-closed direction.
+      // ⛔ ...BUT A COMPONENT-FINAL `$` THAT FOLLOWS AN EXPANSION PLACEHOLDER IS AN END-ANCHOR
+      // (batch review cycle-9). `s/[[:space:]]*$//` is the sed expression #3243 was filed for, and
+      // its `$` sits immediately after the `*`/`[[:space:]]` placeholder — `*$`, `]$` is regex text.
+      // A `$` that follows LITERAL bytes is a filename byte (`a$/undo.sh`, `/tmp/undo$`, both really
+      // exec and both went ALLOW in the cycle-8 cut where the rule rejected every component-final
+      // `$`). Position alone cannot tell them apart; what precedes the `$` can.
+      // ⛔ AND WHAT MAKES IT AN END-ANCHOR IS AN **UNESCAPED** GLOB OPERATOR BEFORE IT (batch review
+      // cycles 10 and 11). `*` and `?` emit PG, a DISTINCT sentinel: an escaped `\*`/`\?` emits PH, so
+      // `a\*$/undo.sh` (the directory `a*$`, really executed) is a filename byte while
+      // `s/[[:space:]]*$//` — the measured #3243 expression, whose `$` follows a raw `*` — stays
+      // non-path. Two earlier forms of this test were wrong in opposite directions: keying on "the loop
+      // emitted a placeholder" also rejected an escaped byte and a bracket GROUP (cycle 10), and keying
+      // on the raw character also rejected an ESCAPED `*`/`?` (cycle 11, measured BLOCK → ALLOW
+      // through the handler).
+      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PG)) return false;
+      else { out += ch; continue; }
       out += PH; i = j - 1; continue;
     }
-    if (ch === "*") { out += PH; continue; }
+    if (ch === "*") { out += PG; continue; }
     // ⛔ `?` IS A GLOB, and it is named in this function's own contract above — it
     // was simply not implemented, so `./undo-1228?.sh` failed the grammar and the
     // arm went BLIND on a real single-character glob (caught by B13 the moment the
     // `sp` branch started consulting this predicate). A shape test that drops a
     // glob is a fail-OPEN, which is why it is pinned by an arm in both directions.
-    if (ch === "?") { out += PH; continue; }
-    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
-    if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
-    if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "?") { out += PG; continue; }
+    // ⛔ AN UNMATCHED BRACKET IS A FILENAME BYTE, NOT A REJECTION (batch review cycle-7, P0).
+    // `a[b/undo*.sh`, `a{b/undo*.sh`, `a(b/undo*.sh` are ordinary directories; treating the
+    // missing closer as "prose" DELETED them from every arm — the same fail-open class the
+    // cycle-2 fix named for every other byte ("a rejection deletes the candidate"), missed on
+    // the bytes that happen to be syntax. Each is now ONE placeholder byte (the group it opens is
+    // a possible expansion) whether or not a closer exists, and the alphabet judges the rest. `[`
+    // scans to the LAST `]` so a POSIX class (`[[:space:]]`) is ONE group; a leaked `]` used to be
+    // the only thing keeping the sed expression out, which made that rejection an accident instead
+    // of a rule — `$` (below) is now the named reason.
+    if (ch === "[") { const e = LAST_CLOSE; out += PH; if (e > i) i = e; continue; }
+    if (ch === "{") { const e = LAST_BRACE > i ? s.indexOf("}", i + 1) : -1; out += PH; if (e > i) i = e; continue; }
+    if (ch === "(") { const e = LAST_PAREN > i ? s.indexOf(")", i + 1) : -1; out += PH; if (e > i) i = e; continue; }
     out += ch;
   }
-  // TWO-ORed ACCEPTS — see the contract above: a rejection here deletes the
-  // candidate and blinds the arm, so the only safe direction is to accept more.
-  if (/^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out)) return true;
-  return /^(?:\.{1,2}|~)\//.test(s);
+  // THE ACCEPT BLOCK BELOW IS DELIBERATELY CONTIGUOUS CODE with its reasoning ABOVE it:
+  // `test-discard-gate.mjs --mutations` reverts it TEXTUALLY, and an anchor that straddles a
+  // comment applies 0 times — a "mutant" byte-identical to the real module, which is the
+  // stale-anchor defect that step exists to catch.
+  //   (a) EXPLICIT PATH PREFIX, checked in the loop's prologue ABOVE (before any byte rule can
+  //       short-circuit it): whatever bytes follow, the word is a candidate.
+  //   (b) THE ONE COMPONENT-POSITION STRUCTURAL REJECTION — a `^` at the START OF ANY COMPONENT OF
+  //       THE RAW WORD is a regex ANCHOR, not a filename byte: `awk '/^tree=/{t=$2}'` → `/^tree=/<PH>`
+  //       is program text, while `/tmp/undo^X.sh` is a path, and `.\/^b/undo.sh` (an ESCAPED separator)
+  //       is a path too.
+  //       ⛔ IT IS NOT "THE ONLY REJECTION" AND THIS COMMENT USED TO SAY SO (#3333 review P1, measured).
+  //       Exactly TWO other rules run on the same placeholder path and also return false: the
+  //       component-final `$` END-ANCHOR in the loop above (`a$/undo.sh` execs, `s/[[:space:]]*$//`
+  //       does not), which this head's own mutation pair proves is load-bearing, and the PLAIN
+  //       ALPHABET loop in (c) below. (The prologue's `!s` / `needs / or ~` early-outs, and the
+  //       unbalanced-quote/group refusals (lines 3420, 3423, 3480, 3485, 3486), reject BEFORE any
+  //       placeholder exists, so they are not rules on this path — the function carries EIGHT code
+  //       `return false` sites in total, and these three are the ones a placeholder can reach.)
+  //       What is SINGULAR here is only that this is the one rule keyed on a byte's POSITION within
+  //       the raw word.
+  //   (c) THE PLAIN ALPHABET — every byte a filename may carry in a component body, `,` `:` `=`
+  //       `#` `^` `$`, brackets, braces, parens, `;`, space, TAB and any non-ASCII byte — because
+  //       a rejection here DELETES the candidate. A literal `$` is in it in EVERY position: a
+  //       component-final one (`a$/undo.sh`) really execs, and excluding it was a measured
+  //       fail-open (cycle 9).
+  // ⛔ …AND AN ESCAPED SEPARATOR IS NOT A COMPONENT BOUNDARY HERE (batch review cycle-10, P0).
+  // Emitting a literal `/` for `\/` handed `.\/^b/undo.sh` — the escaped spelling of the real
+  // directory `^b` — to this rule, which then deleted it (measured BLOCK → ALLOW through the
+  // handler, a regression against the previous cut). The escape branch emits a SENTINEL for an
+  // escaped `/` or `~`, so the `^` that follows one is a filename byte, while a RAW `/^` is still a
+  // regex anchor.
+  if (/(?:^|\/)\^/.test(out)) return false;
+  const PLAIN_BYTE = /[A-Za-z0-9._+@!%~^$\u0000/,:=# \t\-\[\]{}();]/;
+  const NON_ASCII = /[\u0080-\uFFFF]/;
+  // (ES is the escaped-separator sentinel: it is a separator, already vouched for above.)
+  for (const c of out) if (c !== ES && c !== PG && !PLAIN_BYTE.test(c) && !NON_ASCII.test(c)) return false;
+  return /[\/~]/.test(out) || out.includes(ES);
 }
 
 export function wtPipelineFeedsShell(command) {
