@@ -697,8 +697,10 @@ plist_program_args() {
     # value (an interpreter's script argument, an `env` program, a second positional). Those keep the
     # TCC verdict and the directory escape — conservative in the SKIP direction, never in the arm one.
     # ⛔ THE DATA_OPTIONS TABLE IS DUPLICATED IN THE PYTHON READER ABOVE (`DATA_OPTIONS = {"--repo",
-    # "--root"}`) and this awk cannot share it, so the two must be edited together. Pinned by §7c
-    # (c22b) for the data role, (c22c) for the launcher role and (c22d) for the joined spelling.
+    # "--root"}`) and this awk cannot share it, so the two must be edited together. Pinned by §7c:
+    # (c22b) the data role, (c22c) the launcher role, (c22d) `Program`-only legality and (c22e) the
+    # joined `--opt=<value>` spelling; (c22f) the `Program`-wins skip. (c12b) pins the element-index
+    # alignment the launcher rule depends on — an empty element still counts.
     # THE SEAM (`INSTALL_LAUNCHD_PLISTBUDDY`) exists so this arm is reachable from a test at all — on
     # Linux `/usr/libexec/PlistBuddy` does not exist, and a branch no test can reach is a branch nobody
     # knows still works.
@@ -728,9 +730,22 @@ plist_program_args() {
             sub(/^[[:space:]]*/, "", line)
             sub(/[[:space:]]*$/, "", line)
             sub(/^(Arg)?[0-9]+[[:space:]]*=[[:space:]]*/, "", line)
-            if (line == "") next
+            # ⛔ EVERY ELEMENT ROW ADVANCES idx, EMPTY ONES INCLUDED — the python reader enumerates
+            # every element of the list. Skipping an empty row WITHOUT advancing made the next element
+            # land at `idx == 0`, where the launcher rule below excused it as argv[0] — so a shape the
+            # python reader refused as EXEC was WARNed and INSTALLED on the fallback path, i.e. a new
+            # fail-open in exactly the class this change exists to close (fresh review of #3413,
+            # round 3 P2). A row IS an element when it carries the PlistBuddy index prefix; a stray
+            # blank line does not, and is skipped without counting.
+            if (line == "" && $0 !~ /^[[:space:]]*(Arg)?[0-9]+[[:space:]]*=/) next
             seen = 1
             idx++
+            if (line == "") next
+            # ⛔ `Program` WINS, so element 0 is ONLY argv[0] and is not verdicted at all — exactly the
+            # python reader (its `skipped.add(0)`). This test comes BEFORE the joined `--opt=` branch,
+            # because with `Program` set python emits nothing for a `--script=<TCC>` at argv[0] while
+            # the fallback used to emit `exec` there and SKIP a unit python installs (round 3 P2).
+            if (idx == 0 && prog != "") { prev = line; next }
             # `--opt=<path>` carries its value INSIDE the token (python splits it at `:649-654`);
             # dropping it made a `--script=<TCC>` install with no verdict at all.
             if (line ~ /^--/ && index(line, "=") > 0) {
@@ -742,9 +757,7 @@ plist_program_args() {
                 next
             }
             if (line ~ /^\//) {
-                if (idx == 0 && prog != "") {
-                    # `Program` wins: argv[0] is only argv[0] — the python reader skips it too.
-                } else if (idx == 0) {
+                if (idx == 0) {
                     printf "launcher\t%s\n", line
                 } else if (prev == "--repo" || prev == "--root") {
                     printf "data\t%s\n", line

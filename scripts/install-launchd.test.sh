@@ -1115,6 +1115,12 @@ assert_not_contains "$OUT" "cannot read ProgramArguments" "§7c …and an unpars
 # argv[0] and excuse it as a LAUNCHER instead of verdicting it. Synthetic (a real plist has no empty
 # element) and driven through the same seam, because this is the only way the fallback reader is
 # exercised on Linux. RED if the awk stops advancing on an empty row.
+# ⛔ THE FIXTURE IS A BINARY-INSIDE-A-TCC-ROOT ON PURPOSE. An earlier version put the `#!/bin/bash`
+# script `$PROBE_DEAD` here, and BOTH roles (launcher / exec) land in a TCC refusal for a script, so the
+# assertions passed whether or not the row advanced — the test claimed a pin it did not have, and that
+# is what hid the fail-open it was written to catch (fresh review of #3413, round 3 P2). A BINARY holds
+# the grant (#1311), so the two roles give OPPOSITE outcomes: argv[1] → refusal, argv[0] → WARN+install.
+PROBE_ALIGN_BIN="$PROBE_HOME/Documents/checkout/.venv/bin/python"
 rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
 cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -1126,7 +1132,7 @@ cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
     <key>ProgramArguments</key>
     <array>
         <string></string>
-        <string>$PROBE_DEAD</string>
+        <string>$PROBE_ALIGN_BIN</string>
     </array>
     <key>StartInterval</key><integer>not-a-number</integer>
 </dict>
@@ -1140,8 +1146,9 @@ OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG
         unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
         bash "$INSTALLER" 2>&1 ) )"; RC=$?
 set -e
-assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c an element AFTER an empty one is still argv[1] (the two readers advance alike)"
-assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …so it is verdict-2, not excused as a launcher"
+assert_contains "$OUT" "TCC-protected target: $PROBE_ALIGN_BIN" "§7c an element AFTER an empty one is still argv[1] (the two readers advance alike)"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …so it is verdict-2, not excused as a launcher (a BINARY would have been WARNed+installed)"
+assert_not_contains "$OUT" "installed + loaded" "§7c …and the unit is not installed"
 
 # (c13) launchd's `Program` key IS the executed binary: `ProgramArguments[0]` is only argv[0]. A
 # `Program` pointing into a TCC tree is armed-and-dead even when every argument is farmed and readable
@@ -1501,6 +1508,44 @@ set -e
 assert_eq "$RC" "0" "§7c the fallback splits the JOINED --opt=value spelling (verdict 2 is a skip, not a failed install)"
 assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c …so a --script=<TCC> gets a verdict at all"
 assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and the unit is SKIPPED loudly"
+
+# (c22f) `Program` WINS, so `ProgramArguments[0]` is ONLY argv[0] and carries no verdict — including a
+# `--script=<TCC>` at that position, which python IGNORES (index 0 is in its `skipped` set). The joined
+# `--opt=` branch used to run BEFORE that skip, so the fallback emitted `exec` for an element python
+# never reads and SKIPped (and disarmed) a unit python installs (fresh review of #3413, round 3 P2).
+# A false SKIP rather than a fail-open, but still a reader disagreement in the new code.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>/bin/bash</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>--script=$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback skips element 0 when Program wins (agrees with the python reader)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so a --script=<TCC> at argv[0] under Program does not skip the unit"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit installs, as it does on the python path"
+else
+    bad "§7c …and the unit installs, as it does on the python path"
+fi
 
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
