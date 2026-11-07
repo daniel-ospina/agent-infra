@@ -3128,7 +3128,10 @@ kill "$pid19m" 2>/dev/null; sleep 1
 #    `check-bash32-parse.sh` (#2930) REDS on every PR. On a stock Mac `/bin/bash` IS 3.2, so
 #    `install.sh`'s `bash -n` sweep would `die` and the harness could not be installed at all.
 #    bash 5 parses it fine, which is why this suite stayed green and only the gate went red.
-#    #2248's remedy: the substitution carries a FUNCTION CALL and no here-doc.
+#    #2248's remedy: the substitution carries a FUNCTION CALL and no here-doc. RESIDUAL, NOT FIXED
+#    HERE: 22 other here-docs in this file still sit inside a `$( )` and are each one prose apostrophe
+#    away from the same file-wide failure. This defect's own issue is #3625; the guard that catches
+#    the next one is `check-bash32-parse.sh`, which reds the whole file (not the site).
 _out19n_probe() { python3 - "$1" "$2" "$3" "$4" <<'PY19N' 2>&1
 import importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])

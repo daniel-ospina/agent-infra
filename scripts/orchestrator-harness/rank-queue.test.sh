@@ -97,7 +97,15 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNO
 # the unguarded `trap 'rm -rf "$TMP"' EXIT` was already safe for every construct this suite uses today. The guard
 # costs one later state test and makes the cleanup insensitive to whether a FUTURE construct does run it in a
 # child — a forked shell must never delete the run's scratch tree, whatever forks it.
-trap 'if [ "$BASHPID" = "$$" ]; then rm -rf "$TMP"; fi' EXIT
+# ⛔ THE GUARD MUST STAY BASH-3.2-SAFE: `BASHPID` is bash >= 4.0, and macOS `/bin/bash` is 3.2.57, so an
+# UNGUARDED `$BASHPID` is an UNBOUND-VARIABLE error under this suite's own `set -u` (line 66). The trap
+# then ABORTS instead of cleaning up: the run's `mktemp -d` scratch tree leaks on EVERY run and
+# `BASHPID: unbound variable` is printed on stderr at exit, which reads like a crash to a stderr-scanning
+# runner. Measured, and `scripts/reap-lane-venvs.test.sh:1011-1024` reds on exactly the unguarded form
+# ("on bash 3.2 that aborts the trap (scratch dir + watchdogs leak)"). `${BASHPID:-$$}` is 3.2-safe:
+# there the expansion IS `$$`, which is correct because the trap fires only in the main shell; on 4+ a
+# forked shell still cannot delete the tree.
+trap 'if [ "${BASHPID:-$$}" = "$$" ]; then rm -rf "$TMP"; fi' EXIT
 
 # ── EXTRACT THE SHIPPED FUNCTIONS ─────────────────────────────────────────────
 # Start at `rank_queue_by_pool() {` and stop at the comment that opens the block AFTER
