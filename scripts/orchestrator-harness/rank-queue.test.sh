@@ -704,10 +704,14 @@ printf '300\n9\n' > "$GP/mode000-o/candidates.txt"
 } > "$GP/drive.sh"
 ( cd "$GP" && HOME="$GP" bash drive.sh "$GP/dir-o" ) > "$GP/dir.log" 2>&1
 pg_dir_rc=$?
-# the mode-000 shape is sampled WHILE it holds (a root host would read it): both arms are asserted below,
-# and the skip-if-readable case says so instead of passing silently
+# ⛔ THE SKIP IS DECIDED WHILE THE FILE IS STILL 000, AND IT SAYS SO (review P3, cycle 64). The first version
+# disclosed the skip only in a COMMENT and used `|| [ -r … ]` as the escape, so on a host where `chmod 000` does
+# not bind (root) the whole brace group was satisfied by the readability itself and the check returned green
+# having measured nothing — the silent pass `§14d-bis` documents and fixes twenty lines in its own words
+# ("the skip-if-readable case says so instead of passing silently"). Same shape here: sample, then disclose.
 ( cd "$GP" && HOME="$GP" bash drive.sh "$GP/mode000-o" ) > "$GP/m000.log" 2>&1
 pg_m_rc=$?
+if [ -r "$GP/mode000-o/.pool" ]; then pg_m_skipped=1; else pg_m_skipped=0; fi
 pg_dir_rows="$(tr '\n' ' ' < "$GP/dir-o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
 pg_dir_awk=0; grep -q 'is a directory' "$GP/dir.log" 2>/dev/null && pg_dir_awk=1
 pg_dir_unranked=0; grep -q 'the pool ranked NONE' "$GP/dir.log" 2>/dev/null && pg_dir_unranked=1
@@ -715,8 +719,10 @@ pg_m_unranked=0; grep -q 'the pool ranked NONE' "$GP/m000.log" 2>/dev/null && pg
 if [ "$pg_dir_rc" -ne 0 ] && [ "$pg_dir_rows" = "300 9" ] \
    && grep -q 'STATE=priority-unreadable' "$GP/dir.log" 2>/dev/null \
    && [ "$pg_dir_unranked" -eq 0 ] && [ "$pg_dir_awk" -eq 0 ] \
-   && { [ ! -r "$GP/mode000-o/.pool" ] && [ "$pg_m_rc" -ne 0 ] && grep -q 'STATE=priority-unreadable' "$GP/m000.log" 2>/dev/null && [ "$pg_m_unranked" -eq 0 ] || [ -r "$GP/mode000-o/.pool" ]; }; then rc=0
+   && { [ "$pg_m_skipped" = "1" ] || { [ "$pg_m_rc" -ne 0 ] && grep -q 'STATE=priority-unreadable' "$GP/m000.log" 2>/dev/null && [ "$pg_m_unranked" -eq 0 ]; }; }; then rc=0
 else rc=1; echo "      pool-shape: dir rc=$pg_dir_rc rows='$pg_dir_rows' unranked-claim=$pg_dir_unranked awk-warning=$pg_dir_awk | mode000 rc=$pg_m_rc unranked-claim=$pg_m_unranked (want: both refuse as priority-unreadable, rows intact, NO 'the pool ranked NONE' claim, no awk directory warning)"; fi
+[ "$pg_m_skipped" = "1" ] && echo "      (mode-000 half skipped: this user can read a 000 file — running as root?)"
+
 chmod 644 "$GP/mode000-o/.pool" 2>/dev/null || true
 ck "a NON-REGULAR or UNREADABLE .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take" $rc
 # ⛔ NON-VACUITY: delete the pool-shape guard and the case above must redden.
@@ -2088,8 +2094,20 @@ printf '%s\n' \
   '}' \
   'queue_order_from_pool' > "$_dwp/assign.sh"
 ( cd "$_dwp" && bash assign.sh ) > "$_dwp/assign.out" 2>"$_dwp/assign.trace"
-ck "a heredoc traced INSIDE an assignment names NO witness (the match is anchored to the command position)" \
-   "$([ -z "$(_dwit "$_dwp/assign.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+# ⛔ AND THE BODY MUST HAVE REACHED THE STREAM (review P3, cycle 64). This was a BARE absence assertion — the
+# suite's own rule (`§:60-64`) pairs every absence with a positive, and `decoy`/`forge`/`midline` carry exactly
+# this guard while this one and the `printf` probe did not. An empty or broken trace therefore satisfied them,
+# and "no witness was named" was true of a stream the fixture never reached.
+# ⛔ AND THE NEEDLE MUST SURVIVE THE SHELL'S OWN QUOTING (measured): this body is traced INSIDE an
+# assignment, so the trace renders its opening quote ESCAPED. A needle carrying that quote matched NOTHING even
+# on a run where the body WAS in the trace, so the guard reddened for its own reason rather than the fixture's.
+# The text that survives the escaping is the sentence itself.
+if ! grep -qF 'assign order: body traced inside an assignment' "$_dwp/assign.trace" 2>/dev/null; then
+  rc=1; echo "      the assignment-traced body is NOT in the trace stream — the fixture never reached the matcher, so its absence proves nothing"
+elif [ -n "$(_dwit "$_dwp/assign.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      the assignment body NAMED a witness ('$(_dwit "$_dwp/assign.trace" '' "$_n_p")') — the match must be anchored to the command position"
+else rc=0; fi
+ck "a heredoc traced INSIDE an assignment names NO witness (the match is anchored to the command position)" $rc
 
 # ⛔ THE ` echo ` CONJUNCT, graded on its own: a function whose only command is a `printf` carrying the same
 # text must name nothing — drop that conjunct and this fixture becomes a witness.
@@ -2100,8 +2118,13 @@ printf '%s\n' \
   '}' \
   'queue_order_from_pool' > "$_dwp/printf.sh"
 ( cd "$_dwp" && bash printf.sh ) > "$_dwp/printf.out" 2>"$_dwp/printf.trace"
-ck "a PRINTF in the function names NO witness (an echo is required, not merely a line of text)" \
-   "$([ -z "$(_dwit "$_dwp/printf.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+# the same positive counterpart (review P3, cycle 64)
+if ! grep -qF "[refresh] printf order: not an echo" "$_dwp/printf.trace" 2>/dev/null; then
+  rc=1; echo "      the printf line is NOT in the trace stream — the fixture never reached the matcher, so its absence proves nothing"
+elif [ -n "$(_dwit "$_dwp/printf.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      the printf line NAMED a witness ('$(_dwit "$_dwp/printf.trace" '' "$_n_p")') — an echo must be required, not merely a line of text"
+else rc=0; fi
+ck "a PRINTF in the function names NO witness (an echo is required, not merely a line of text)" $rc
 
 # ⛔ AND THE `fn` CONJUNCT: an echo in ANOTHER function must not be attributed to the one under test.
 printf '%s\n' \
@@ -2183,14 +2206,23 @@ _mut_ok=1
 # ALREADY GONE from the shipped function and `sed` therefore has nothing to delete. Ask for the gate first, so
 # that regression is reported as itself (and the control check above is where it must redden).
 _mut_gate="if [ -e \"\$o/.pool-sat\" ] || [ -L \"\$o/.pool-sat\" ]; then"
+# ⛔ AND THE FALSE CAUSE IS REPLACED, NOT MERELY ACCOMPANIED (review P3, cycle 64). The first version PRINTED the
+# truthful line and then ran the sed half anyway, so the same output also carried "could not be applied whole
+# (sed: '', mutant bytes '39565') — the anchor drifted": an empty sed error and a mutant that is the whole
+# function, i.e. a cause asserted AGAINST ITS OWN QUOTED EVIDENCE. When the gate is already gone the sed half is
+# skipped entirely and `_mut_cause` carries the only sentence this check gets to say.
+_mut_cause=""
 if ! grep -qF "$_mut_gate" "$FNS" 2>/dev/null; then
   _mut_ok=0
-  echo "      the .pool-sat EXISTS-GATE is not in the shipped function at all — there is nothing for this half to delete, so it grades nothing. That regression must redden the CONTROL check above (which forbids every clause an absent record may print), not this mutation gate"
+  _mut_cause="the .pool-sat EXISTS-GATE is not in the shipped function at all — there is nothing for this half to delete, so it grades nothing. That regression must redden the CONTROL check above (which forbids every clause an absent record may print), not this mutation gate"
+else
+  sed 's@^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then@  if false; then@' "$FNS" > "$MUT_NOSAT" 2>"$TMP/.mut-sed-err" || _mut_ok=0
+  grep -q '^queue_order_from_pool() {' "$MUT_NOSAT" 2>/dev/null || _mut_ok=0
+  cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null && _mut_ok=0
 fi
-sed 's@^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then@  if false; then@' "$FNS" > "$MUT_NOSAT" 2>"$TMP/.mut-sed-err" || _mut_ok=0
-grep -q '^queue_order_from_pool() {' "$MUT_NOSAT" 2>/dev/null || _mut_ok=0
-cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null && _mut_ok=0
-if [ "$_mut_ok" = "0" ]; then
+if [ -n "$_mut_cause" ]; then
+  rc=1; echo "      $_mut_cause"
+elif [ "$_mut_ok" = "0" ]; then
   rc=1; echo "      the .pool-sat mutation could not be applied whole (sed: '$(tr '\n' ' ' < "$TMP/.mut-sed-err" 2>/dev/null | head -c 120)', mutant bytes '$(wc -c < "$MUT_NOSAT" 2>/dev/null)') — the anchor drifted"
 else
   d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"; _n_m="$(_xtrace_nonce)"
@@ -2432,7 +2464,13 @@ for _arm14_case in \
     rc=1; echo "      the $_al arm's echo did not run at all — neither stream carries its sentence (the shim's rename and count injection were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null; then
     rc=1; echo "      the $_al arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the sentence proves nothing"
-  elif grep -qF "$_am" <<<"$_ao" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_ao"; then rc=0
+  elif printf '%s\n' "$_ao" | grep -F -- "$_am" | grep -q 'windows=TRUNCATED(P1-severe)'; then rc=0
+  # ⛔ THE ARM'S OWN LINE IS THE SUBJECT, NOT THE WHOLE OUTPUT (review P3, cycle 64). A MIXED pass fires the
+  # WARN arm and the severity arm TOGETHER, and both render the same `windows=TRUNCATED(P1-severe)` token, so
+  # a whole-output match satisfied this check from the SEVERITY line while the WARN line had lost the clause —
+  # measured: stripping `$_sat_said` from the WARN echo left "the warn arm … carries the clip" GREEN. This is
+  # the identical defect the head arm documents eight checks up ("with a second queued row the WARN arm printed
+  # the SAME token … it graded the WARN line, not its own subject"). Per-line is the fix that cannot recur.
   else rc=1; echo "      the $_al arm '$(printf '%s' "$_ao" | tr '\n' '|' | head -c 340)'"; fi
   ck "the $_al arm of the order line carries the clip (its sentence is '$_am')" $rc
 done
