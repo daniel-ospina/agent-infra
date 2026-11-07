@@ -222,8 +222,10 @@ if [ "$1" = "api" ]; then
             # ⛔ MODEL --jq, DO NOT IGNORE IT. When a JSON ENVELOPE fixture is supplied,
             # apply the CALLER'S OWN expression to it with the real jq — the same shape
             # real `gh` has. Without this the recorder's frame expression (the
-            # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator at
-            # scripts/record-review.sh:1901-1902) is executed by NO vector at all: every
+            # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator —
+            # `git show bd1b205d:scripts/record-review.sh | grep -n 'gsub(\['` → :2386; head
+            # `grep -n 'gsub(\[' scripts/record-review.sh` → :2445) is executed by NO vector at
+            # all: every
             # other fixture supplies the frame PRE-BUILT through $STUB_COMMENTS, so
             # deleting either half of the expression left the suite GREEN. §14.1d(b4)
             # is the vector that now reddens when the strip is removed.
@@ -5394,16 +5396,16 @@ STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FA
     STUB_COMMENT_CAPTURE="$T/ccap_e2" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$RECORD_RC" "5" "14.1d …but a comment that did NOT land is still a NAMED failure (rc 5) — neither channel carries the marker [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
 assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and does not claim an ABSENCE it cannot know (a previous run's comment may carry it)"
-# ⛔ THE RETIRED PHRASINGS BELONG TO *THIS* ARM, NOT THE PATCH ARM (#3168 review
-#    cycle 4). "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message
-#    (`git show bd1b205d:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
-#    → :6483 — the sha is NAMED because `origin/main` moves and a bare "main :NNNN" rots), so pinning
-#    its absence against the PATCH arm's stderr (14.10a3)
-#    guarded an arm the phrase was never in — restoring it HERE kept the suite GREEN
-#    (measured). The assertions above prove this variable is populated before these
-#    negatives run, so none of them can pass on an empty capture.
-assert_contains "$RECORD_ERR" "CI CANNOT SEE IT" \
-    "14.1d …and, when NOTHING landed, it DOES say CI cannot see the record — the claim is true on the only arm that emits it"
+# ⛔ CORRECTED (#3712 review round 5, P2): "CI CANNOT SEE IT" was an absence claim
+#    this arm cannot make. Its only justification — "true on the only arm that emits
+#    it" — was false: the body READ is exactly what failed here, so a PREVIOUS run's
+#    body or comment may already carry the marker, and the gate reads both channels
+#    independently. The pin had it PRESENT; it is now pinned ABSENT, with the
+#    observable statement that replaced it pinned PRESENT.
+assert_not_contains "$RECORD_ERR" "CI CANNOT SEE IT" \
+    "14.1d …and does NOT claim CI cannot see the record — a previous run's copy may already carry it"
+assert_contains "$RECORD_ERR" "is NOT observable from here" \
+    "14.1d …it states what THIS run delivered and names what it cannot observe"
 assert_not_contains "$RECORD_ERR" "currently INVISIBLE" \
     "14.1d …nor that the evidence is invisible"
 assert_not_contains "$RECORD_ERR" "attempted on the line above" \
@@ -5513,6 +5515,19 @@ assert_not_contains "$RECORD_ERR" "the body marker are still saved" \
     "14.1d(i) …nor does the comment-POST note claim the body marker survived a failed persist"
 assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
     "14.1d(i) …it defers to the persist line instead, so no line in this capture asserts the marker is saved"
+# ⛔ THE PATCH ARM'S OWN REMEDY MUST BRANCH ON *ITS* PERSIST RESULT (#3712 review
+# round 5, P3). `--flush-pending` can only fire the `edited` event if a PENDING FILE
+# exists; when the post-PATCH persist failed it answers "nothing pending … Nothing was
+# written" and exits 0 without touching the body. The read arm branches its remedy on
+# the persist result — this arm offered the inert flush anyway. No vector combined a
+# failed PATCH with an unwritable pending dir, so it went unpinned; this one does.
+PATCH_FAIL_PR=424365
+STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    run_record_633 "$PATCH_FAIL_PR" "$SHA" "$DC_CRUNS"
+assert_contains "$RECORD_ERR" "NO PENDING COPY IS ON DISK EITHER" \
+    "14.1d(j) the PATCH arm's comment-visible message names the real state when its own persist failed"
+assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
+    "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"
 rm -f "$PEND_CONF_DIR/pending"
 mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
 

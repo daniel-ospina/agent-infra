@@ -6600,7 +6600,12 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # "could not be posted" would send a lane hunting API permissions instead of
     # configuring the gate key.
     if [ "${MARKER_SIGNED:-0}" = "1" ]; then
-      _unposted_why="the #1224 evidence COMMENT could not be posted either"
+      # ⛔ "COULD NOT BE POSTED" IS ALSO UNOBSERVABLE HERE (#3712 review round 5, P2).
+      # `post_review_evidence_comment` returns 1 when the comment READ failed (the post
+      # is then SKIPPED by design — never attempted) OR when the POST itself was
+      # refused. This arm cannot tell those apart, so it must not name one; the PATCH
+      # arm already applies that rule at its own no-absence-claim line.
+      _unposted_why="this run published NO durable comment copy of its own — the comment channel was not delivered to (the comment READ failed, so the post was SKIPPED by design; or the POST was refused)"
     else
       _unposted_why="the marker is UNSIGNED (no AI_REVIEW_GATE_KEY on this box), so it was NOT published as a comment — by policy, because a comment cannot be retracted and an unsigned marker is never evidence"
     fi
@@ -6613,7 +6618,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     else
       _unposted_remedy="⛔ NO PENDING MARKER IS ON DISK EITHER — the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING for the marker this run owed and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable."
     fi
-    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (⛔ this line does NOT assert WHICH cause — the error text is discarded, so a transient API failure, a throttled token and a permanent 404 all land here), and $_unposted_why — the record is saved but CI CANNOT SEE IT. $_unposted_remedy" >&2
+    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (⛔ this line does NOT assert WHICH cause — the error text is discarded, so a transient API failure, a throttled token and a permanent 404 all land here), and $_unposted_why — the record is saved, but this run delivered the marker to NEITHER the PR body NOR a comment copy of its own. ⛔ Whether an EARLIER run's body or comment already carries it is NOT observable from here: the body READ is exactly what failed, and the gate reads both channels independently. $_unposted_remedy" >&2
     exit 5
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
@@ -6665,7 +6670,10 @@ ${MISSING}"
       # with the ONLY local record of the failure on stderr. It is now a NAMED
       # non-zero state, and the marker survives on disk so delivery can be retried
       # without re-recording (which would dilute the evidence).
-      marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy printed below WILL FIND NOTHING and will report success. The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand. >>> $MISSING <<<" >&2
+      PATCH_PERSISTED=1
+      marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || { PATCH_PERSISTED=0
+      echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy printed below WILL FIND NOTHING and will report success. The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand. >>> $MISSING <<<" >&2
+      }
       # ⛔ THE DURABLE CHANNEL IS ATTEMPTED HERE, BEFORE THE exit 5 (agent-infra#3168
       # review P2; this arm is the ONE the #2983 arms left out — see #3363). The PATCH
       # was refused, so the durable channel is the one that can still carry the
@@ -6682,7 +6690,16 @@ ${MISSING}"
       # the evidence ADMISSIBLE without making the run complete, and this line says
       # which of the two happened instead of leaving the operator to guess.
       if post_review_evidence_comment "$MISSING" "$REPO" "$PR"; then
-        echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. Re-run the recorder at this head, or post the body copy with --flush-pending, to fire the \`edited\` event that re-runs the gate." >&2
+        # ⛔ THE SAME PERSIST BRANCH THE READ ARM GOT (#3712 review round 5, P3).
+        # `--flush-pending` can only fire the `edited` event if a PENDING FILE exists;
+        # when the persist just above failed, it answers "nothing pending … Nothing was
+        # written" and exits 0 without touching the body — so offering it as a route to
+        # a stated outcome is the same inert-remedy defect the read arm branches away.
+        if [ "$PATCH_PERSISTED" -eq 1 ]; then
+          echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. Re-run the recorder at this head, or post the body copy with --flush-pending, to fire the \`edited\` event that re-runs the gate." >&2
+        else
+          echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. ⛔ NO PENDING COPY IS ON DISK EITHER (the ⚠️ body-marker persist line above says so), so --flush-pending would find NOTHING and cannot fire the \`edited\` event: copy the marker text that line reproduced and PATCH it into the PR body by hand once gh is reachable." >&2
+        fi
       else
         # ⛔ NO ABSENCE CLAIM (#3168, the same class the read-failure arm was corrected
         # for). A 1 return means "not published BY THIS RUN" and covers four different
