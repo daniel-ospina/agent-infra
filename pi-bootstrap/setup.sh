@@ -665,14 +665,30 @@ fi
 # found nothing nested OR flat. A justification nobody re-derived is how a false claim outlives the
 # shape it described (review P2-G of #3413). No line-numbered claim about any OTHER script belongs
 # here for the same reason.
-# ⛔ AND THAT FALLBACK NOW RESOLVES — this is a DECLARED BEHAVIOUR CHANGE of the farm entry, not a
-# side effect to be discovered later. `watchdog-loop.sh` is farmed NESTED, so its `$SELF_DIR` is
+# ⛔ AND THAT FALLBACK NOW RESOLVES — stated PRECISELY, because the first version of this paragraph
+# over-claimed it. `watchdog-loop.sh` is farmed NESTED, so its `$SELF_DIR` is
 # `$DEST/scripts/orchestrator-harness` and `$SELF_DIR/../cloud-cell-supervisor.sh` is
-# `$DEST/scripts/cloud-cell-supervisor.sh` — the file `fleet_srcs` now writes. The cell arm therefore
-# goes from logging `RESTART-UNAVAILABLE` (nothing to run) to issuing
-# `$sup start` (`RESTART_VERB="$sup start"`), which is the arm's documented purpose; a failure there
-# is reported as `RESTART-FAILED` naming that verb, never `verb=unknown`. The nesting is NOT
-# justified by this fallback — the templates naming the nested path is the whole reason, above.
+# `$DEST/scripts/cloud-cell-supervisor.sh` — the file `fleet_srcs` now writes. `[ -f ]` therefore
+# becomes true where it was false, and the cell arm's `if [ -n "$sup" ] && [ -f "$sup" ]` can now take
+# the `$sup start` branch (`RESTART_VERB="$sup start"`), a failure in which is reported as
+# `RESTART-FAILED` naming that verb — never `verb=unknown`.
+# ⛔ BUT NO SHIPPED CONSUMER REACHES THAT FALLBACK, so NO DEPLOYED WATCHDOG CHANGES BEHAVIOUR. The two
+# fallbacks are guarded by `[ -n "$sup" ] ||`, and the shipped systemd cell unit always sets the
+# variable that guard tests: `install-cell-timers.sh` defaults
+# `SUPERVISOR="${SUPERVISOR:-$INFRA_ROOT/scripts/cloud-cell-supervisor.sh}"` (the LAYER CHECKOUT, not
+# the farm), renders it into `templates/systemd/eldato-controller-watchdog.service` as
+# `Environment=SUPERVISOR={{SUPERVISOR}}`, and `cloud-cell-bringup.sh` passes no `SUPERVISOR` in its
+# env array — so that default is what every armed cell gets. On macOS the `com.eldato.controller-watchdog`
+# plist sets no `SUPERVISOR` either, but Darwin takes the `launchctl` arm, not this one. The arm becomes
+# live only for an invocation whose `SUPERVISOR` is UNSET: an ad-hoc/manual run, or a future installer
+# that stops hard-coding the checkout path.
+# ⚠️ AND ONE PRE-EXISTING FRAGILITY IS VISIBLE FROM HERE, not introduced here: because the guard is
+# `[ -n "$sup" ]` (non-empty) and not `[ -f "$sup" ]` (readable), a `SUPERVISOR` that NAMES a path the
+# cell cannot read SHORT-CIRCUITS both fallbacks — so when the layer checkout is reaped the arm still
+# refuses even though a farmed copy now exists. Changing that guard is a restart-path decision of its
+# own; it is recorded here, not taken, so nobody reads this farm entry as having fixed it.
+# The nesting is NOT justified by this fallback — the templates naming the nested path is the whole
+# reason, above.
 # agent-infra#2281 §1 adds pr-doctor-machine.sh: the MACHINE-scoped entry point the
 # `com.tortoise.pr-doctor` unit execs. Before it the unit asserted ONE repo in its argv
 # (`--repo daniel-ospina/tortoise`), so a box running two repos graded exactly one and the second

@@ -463,9 +463,14 @@ LANE_PRODUCERS_FOREIGN_RESIDUAL="cmux_dispatch.py:#1957 orch-loop.sh:#2413"
 # example of where the controller lives on a Mac — `bash /home/cmux/harness/<sha>/scripts/
 # orchestrator-harness/orch-loop.sh` — which the derivation reads as a cross-checkout exec site. That
 # path is rendered by the harness deploy (`install.sh`'s `HARNESS_PIN_DIR`), not by any `fleet_srcs`
-# entry, so this farm can never carry it; #1938 is where whether the harness entry points are ever
-# farmed is decided. The site only becomes VISIBLE here because this PR is what first farms
-# `orchestrator-harness/watchdog-loop.sh` — before it, the consumer was outside the scanned population.
+# entry, so this farm can never carry it. ⛔ NO ISSUE OWNS THAT ANY MORE, and the earlier pointer here was
+# WRONG: it named #1938, which is the SUPERVISOR-delivery residual this PR declares closed and which
+# never covered `orch-loop.sh` — a reader following it landed on a closed issue about a different file.
+# The disclosure stands on its own as the record: `orch-loop.sh` is a `foreign:` producer (another
+# checkout), delimited by `LANE_PRODUCERS_FOREIGN_RESIDUAL` above, and whether the pinned harness entry
+# points are ever farmed is undecided rather than owned. The site only becomes VISIBLE here because
+# this PR is what first farms `orchestrator-harness/watchdog-loop.sh` — before it, the consumer was
+# outside the scanned population.
 # DISCLOSED with an owner, which the gate's own remedy names, instead of left as an undelivered
 # producer that only shows up on a fresh box.
 # ⚠️ DELIVERABLE producers still withheld from every farm array, both owned by #1553 and unchanged

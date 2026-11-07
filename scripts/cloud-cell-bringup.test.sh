@@ -251,7 +251,8 @@ export HOME="$T/home"
 # a cleaning — which is the case whenever this suite runs from a lane worktree (`.worktrees/`), the exact
 # shape #2697 measured. What it falls through to is this farm, so a fixture home with an empty
 # `.pi/agent/scripts` would leave the controller install with nowhere durable to land. A cell whose farm has
-# no supervisor (#1938's named residual) is the shape that then gets the installer's loud refusal — correct
+# no supervisor (an install predating `fleet_srcs`'s entry, or a removed copy — #1938, whose delivery residual
+# this PR closes) is the shape that then gets the installer's loud refusal — correct
 # on a worktree, and not what these arms are about.
 mkdir -p "$T/home/.pi/agent/scripts"
 cp "$HERE/cloud-cell-supervisor.sh" "$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
