@@ -163,17 +163,22 @@ from pathlib import Path
 #: ``path`` group stays anchored, and the tail admits only
 #: ``[A-Za-z0-9_\[\]\-.:/]`` — no whitespace, no tab, no empty tail, no missing ``::``.
 #:
-#: ⛔ KNOWN RESIDUAL, deliberately NOT closed here (measured, not assumed). A param
-#: carrying a SPACE, comma, SEMICOLON, quote, ``=``, ``+``, ``&`` or a non-ASCII
-#: character is still dropped, and the IDENTICAL BLOCK survives for it: the module's
-#: own ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id``
-#: pins ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, yet
-#: ``_RATES_RE``'s nodeid group is ``\S+`` (and this ``rest`` excludes a space), so
-#: ``parse_rates`` drops that row too and the failure reads as PR-introduced. Closing
-#: it means widening BOTH ``_RATES_RE`` and ``rest`` — i.e. collapsing the strict
-#: door into the loose one — which is a decision about the allowlist's shape, not a
-#: silence to be papered over by the fix above. Filed as its own finding (#3691);
-#: do not read this class as "safe" because the path case now works.
+#: ⛔ KNOWN RESIDUAL, deliberately NOT closed here (measured, not assumed). `rest`
+#: is an allowlist of the characters a PLAIN parameter carries (alnum, ``_``,
+#: ``[``, ``]``, ``.``, ``:``, ``-``, ``/``). Anything else is still dropped from
+#: main's table and the IDENTICAL BLOCK survives for it. It has TWO shapes:
+#:   * an ESCAPED param — pytest renders control/non-ASCII/backslash params as a
+#:     backslash sequence (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]``), so the character
+#:     that must be admitted is ``\``; admitting a non-ASCII RANGE closes nothing.
+#:     This family is unbounded, which is why it is stated as a property.
+#:   * plain-but-excluded punctuation: space, ``,``, ``;``, quotes, ``=``, ``+``, ``&``.
+#: SPACE is the only one of these whose ROW ``_RATES_RE`` also refuses (its nodeid
+#: group is ``\S+``); the rest are ``\S`` and are dropped by ``rest`` alone, so a
+#: fix for them does not touch ``_RATES_RE``.
+#: The module's own ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id``
+#: pins ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, so
+#: this is live, not hypothetical. Filed as its own finding (#3691); do not read
+#: this class as "safe" because the path case now works.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"

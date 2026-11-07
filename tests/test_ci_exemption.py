@@ -2995,14 +2995,15 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # and the same ten tests fail on origin/main itself), while the eleven
 # non-path-parameterized main-reds on the SAME run were correctly EXEMPT. The
 # required `python-ci-gate` then reds, which deadlocks the very PR that repairs
-# the trunk (#11262 / tortoise#11255 is the same class).
+# the trunk (tortoise#11262 / tortoise#11255 is the same class).
 
 _PATH_PARAM_IDS = (
     "tests/test_entry_point_python_guard.py"
     "::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
     "tests/test_entry_point_python_guard.py"
     "::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/test_design_map_check.py]",
-    # a subdirectory parameter, the same shape one level deeper
+    # a SIBLING directory parameter at the same depth (graph-scripts/ is a peer of
+    # tools/, not a level below it) — the shape is unchanged, the nesting is not.
     "tests/test_entry_point_python_guard.py"
     "::test_entry_point_guards_the_interpreter_before_its_imports"
     "[graph-scripts/2146_e2e_live_orphan_cleanup.py]",
@@ -3072,40 +3073,52 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
 
     ⛔ SCOPE — what this list does and does not establish. It establishes that
     every shape below is still REFUSED by the new class. It does NOT establish
-    that everything missing from the list is safe: a param carrying a SPACE,
-    comma, SEMICOLON, quote, `=`, `+`, `&` or a non-ASCII character is STILL
-    dropped, and the identical silent-drop → "absent from main's failure set" →
-    permanent BLOCK survives for all of them.
+    that everything missing from the list is safe.
 
-    ⛔ WHICH DOOR DROPS WHICH — measured, because the obvious guess is wrong. SPACE
-    is the only one of these whose ROW the rate READER (`_RATES_RE`) cannot match
-    (its nodeid group is `\\S+`, so the row does not match at all — the row is IN
-    the table, and `_RATES_RE` declines it; this is a reader-side refusal, not a
-    property of the table). Comma, semicolon, quote, `=`, `+`, `&` and non-ASCII
-    are all `\\S`: `_RATES_RE` matches those rows fine and the drop is
-    `is_failure_key` / `rest` ALONE. Do not tell a future fixer that comma needs
-    `_RATES_RE` widened; it does not.
+    ⛔ THE RESIDUAL, STATED AS A PROPERTY RATHER THAN A CHARACTER LIST. `rest` is an
+    allowlist of the characters a PLAIN parameter carries: `A-Za-z0-9_`, `[`, `]`,
+    `.`, `:`, `-`, `/`. Everything else is dropped from MAIN's rate table, and the
+    identical silent-drop → "absent from main's failure set" → permanent BLOCK
+    survives for it. That residual has TWO shapes, and an earlier draft of this
+    docstring listed individual characters instead — which kept coming out
+    incomplete (space, then `,`, then `;`, then the escape family), because the
+    escape family is unbounded:
 
-    ⛔ `;` IS A REAL ID, NOT JUNK (measured: `pytest.mark.parametrize("x", ["a;b"])`
-    emits `test_semi[a;b]`, and the loose door accepts it) — which is why it sits in
-    the RESIDUAL list above and NOT in the junk tuple below. An earlier draft of
-    this test filed it as "a shell metacharacter is not an id", i.e. it pinned a
-    live BLOCK as correct behaviour and would have left `;` out of any fix for the
-    residual.
+      1. **Escaped params — unbounded.** pytest does NOT emit a raw control byte, a raw
+         non-ASCII byte, or a raw backslash; it renders the parameter as a BACKSLASH
+         sequence. Measured with `pytest --collect-only -q | cat -A`:
+         `parametrize("x", ["a\\tb", "caf\\u00e9", "a\\\\b"])` emits
+         `test_esc[a\\tb]`, `test_esc[caf\\xe9]`, `test_esc[a\\\\b]`. So the character
+         that must be admitted is `\\` (backslash) — admitting any non-ASCII RANGE
+         closes nothing, because the id never contains a non-ASCII byte.
+      2. **Plain-but-excluded punctuation.** ` ` (space), `,`, `;`, `'`, `"`, `=`,
+         `+`, `&` are emitted as themselves and are all refused by `rest`.
+
+    ⛔ WHICH DOOR REFUSES WHICH — measured, because the obvious guess is wrong.
+    SPACE is the only real-id class whose ROW the rate READER (`_RATES_RE`) also
+    refuses: its nodeid group is `\\S+`, so the row is IN the table and
+    `_RATES_RE` declines to match it — a reader-side refusal, not a property of the
+    table (the producer's `sort | uniq -c | awk` emits the row intact). Every other
+    class above — `,`, `;`, quotes, `=`, `+`, `&`, and the whole escape family — is
+    `\\S`, so `_RATES_RE` matches those rows fine and the drop is `is_failure_key` /
+    `rest` ALONE. Do not tell a future fixer that comma needs `_RATES_RE` widened;
+    it does not. Closing space needs BOTH widened.
 
     The module's own
     `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
     `[chromium-Claude Desktop]` as a REAL id the loose door must name, so this is
-    a live residual, not a hypothetical. It is filed as its own finding; closing
-    it means widening BOTH `_RATES_RE` and `rest` — a decision about the
-    allowlist's shape, not a silence to paper over here.
+    a live residual, not a hypothetical. It is filed as its own finding (#3691).
     """
     for junk in (
-        # the producer CARRIES a space id fine (the table is tab-separated); it is
-        # `_RATES_RE`'s `\S+` nodeid group that refuses the row — reader-side, and
-        # the same cause as the residual above, not a property of the table.
-        "tests/test_a.py::test_x[a b]",
-        "tests/test_a.py::test_x[a\tb]",      # a tab is the field separator, never an id
+        # ⛔ none of these is a REAL id — that is what separates them from the
+        # residual above. In particular a RAW tab and a RAW non-ASCII byte are
+        # never emitted: pytest escapes them (see shape 1), so the loose door
+        # rejects the raw forms too (`is_failure_key_loose` -> False). An earlier
+        # draft put the ESCAPED form in this tuple instead, which pinned a live
+        # BLOCK as correct behaviour; and `[a;b]` was filed here for the same
+        # wrong reason — pytest emits it verbatim and the loose door accepts it.
+        "tests/test_a.py::test_x[a b]",       # SPACE: real id, but _RATES_RE (\S+) refuses
+        "tests/test_a.py::test_x[a\tb]",      # RAW tab: never emitted (pytest writes [a\tb])
         "tests/test_a.py::",                  # empty tail
         "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
         "random-string",                      # not a nodeid at all
