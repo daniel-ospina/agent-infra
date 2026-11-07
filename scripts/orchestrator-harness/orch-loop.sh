@@ -7415,9 +7415,16 @@ PY
     if [ "${CASCADE_ROOM:-1}" -ge 1 ] 2>/dev/null && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_CAN:-1}" = "1" ] && [ "${CASCADE_ISSUE_SLOTS-1}" -le 0 ] 2>/dev/null; then
       _egrant=$(( ${CASCADE_ROOM:-0} / 2 ))
       [ "${_egrant:-0}" -ge 1 ] || _egrant=1
-      if is_num "${CASCADE_BACKLOG:-}"; then
-        [ "${_egrant:-0}" -le "${CASCADE_BACKLOG:-0}" ] || _egrant="${CASCADE_BACKLOG:-0}"
-      fi
+      # ⛔ THE BACKLOG IS AN INPUT THE ALLOCATOR COERCES, SO THE GRANT MUST COERCE IT THE SAME WAY
+      # (review round 6, P2). `cascade_issue_slots` does `is_num "${bl:-}" || bl=0`, so an UNSET, empty
+      # or non-numeric backlog answers **0** there. A first version of this grant capped ONLY when the
+      # value was numeric, so on those inputs it granted 2 where the allocator answers 0 — an escape
+      # recorded over an unmeasured queue, the same false-PASS direction the backlog=0 arm closes. The
+      # real caller normalises `CASCADE_BACKLOG` to a number above, so this was a LATENT divergence, not
+      # a live one — closed anyway, because a grant that is correct only because its caller sanitised
+      # its input is exactly the class this block keeps re-learning.
+      is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=0
+      [ "${_egrant:-0}" -le "${CASCADE_BACKLOG:-0}" ] || _egrant="${CASCADE_BACKLOG:-0}"
       CASCADE_ISSUE_SLOTS="$_egrant"
       # ⛔ NO BACKTICKS IN A DOUBLE-QUOTED `echo` (review round 5, P2): command substitution is LIVE
       # there, so a backticked function name is EXECUTED at log time and its output substituted. A
