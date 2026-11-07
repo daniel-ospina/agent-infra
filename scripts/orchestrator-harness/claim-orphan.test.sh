@@ -1158,9 +1158,12 @@ ck "O20 [PINNED] the expired claim from the same dead host IS still reaped (the 
 # class was blocked FOREVER could therefore stop handing over the work behind the claims it reaps, in
 # silence. (O20 cannot cover it: O20's fixture is INSIDE the bound, i.e. the KEPT half of the arm. It
 # asserts `kept unreadable-lease` and the ABSENCE of a `pruned …` line; this case is the pruned half.)
-# The claim commit is dated 2001 so its age is ~4500x `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s). That
-# is the only deterministic way to reach the deleting branch: shrinking the bound instead is itself the
-# scheduled steal claims.sh's floor exists to refuse, so a test must not do it either.
+# The claim commit is dated 2001 so its age is FAR past `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s):
+# MEASURED 2026-11-07 at 815,770,473 s ≈ 45,000x the bound (not 4,500x — the factor is quoted from a
+# measurement, and a 10x error in it is exactly the kind of unmeasured magnitude this file's
+# labelling-honesty paragraph forbids). That age is the only deterministic way to reach the deleting
+# branch: shrinking the bound instead is itself the scheduled steal claims.sh's floor exists to refuse,
+# so a test must not do it either.
 # ⛔ LABEL: [PINNED], AND NOT AS A FORMALITY. Every check below is GREEN on the tree BEFORE this commit —
 # the code it covers shipped in #3607, so this commit adds an ASSERTION, not behaviour, and nothing can
 # be red before it. Its discrimination is therefore measured against the MUTANT that removes the covered

@@ -779,6 +779,36 @@ function checkBounds(label, workflowFile) {
           )}) — this guard cannot say which slices run; exiting 2`
         );
       }
+      // ⛔ AND `fail-fast` IS PART OF THE SAME COVERAGE CLAIM (#3235 review, P2, measured) — the
+      // sibling of `continue-on-error`, one level up in `strategy:`. GitHub's default is `true`, and
+      // one arm's genuine failure then cancels every other arm in progress or queued, which
+      // `scripts/admin-merge.sh`'s NON_RED_CONC reads NON-RED and which `auto-file-on-failure`
+      // (`if: failure()`) does not even file. The seven arms that never ran would be reported as a
+      // non-red slice of a green sweep, and the red arm is exactly the one the #3322 base-owned
+      // exclusion is designed to excuse (a main red on arm k is its trigger) — so the rail could land
+      // a tree whose arms k+1..8 were never executed while every reporting check is non-red.
+      //
+      // ⛔ IT WAS UNPINNED: measured GREEN before this arm BOTH with `fail-fast: true` and with the
+      // key DELETED (GitHub's default is `true`), so the "LOAD-BEARING, not stylistic" promise in
+      // the workflow's own comment was a comment and nothing else — a one-line edit re-opened the
+      // class this guard was added to close. The assertion is on the JOB that feeds a slice, like
+      // every other matrix rule here, never on a job name; and it demands the LITERAL `false`,
+      // because every other spelling this guard cannot evaluate is a pass it cannot certify.
+      //
+      // ⚠️ THIS PARSER DOES NOT COERCE BOOLEANS: `workflow-yaml.mjs` hands back the SCALAR TEXT, so
+      // the accepted spelling is the string "false" (boolean `false` is accepted too, so this arm
+      // does not depend on which side of that seam it is given) — an equality test against the
+      // boolean alone refused the two LIVE workflows and would have been a false block.
+      const failFast = j.strategy["fail-fast"];
+      const failFastLiteral =
+        failFast === false ? "false" : typeof failFast === "string" ? failFast.trim() : null;
+      if (failFastLiteral !== "false") {
+        refuse(
+          `${label}: job '${id}' in ${file} feeds the shard runner with a matrix but its strategy does not declare 'fail-fast: false' (found ${JSON.stringify(
+            failFast
+          )}) — GitHub's default is true, so ONE arm's genuine failure cancels every other arm in progress or queued, and the merge rail reads a cancelled arm NON-RED: the arms that never ran would be reported as a non-red slice of a green sweep; exiting 2`
+        );
+      }
       const axis = matrix.shard;
       if (!Array.isArray(axis)) {
         refuse(
