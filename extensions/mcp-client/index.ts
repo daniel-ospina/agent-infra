@@ -627,8 +627,12 @@ const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
  *
  * ⛔ PLUS an explicit rejection of the PROTOTYPE-SHAPED names, which the charset admits. What this buys
  * is HYGIENE, not pollution safety: the pollution defence is the null-prototype merge map plus
- * `Object.hasOwn`, and `connectConfig` also stores a null-prototype sanitised map — so `__proto__` is
- * already unreachable there (`loadServer("__proto__")` answers "Unknown MCP server", measured). pi's own
+ * `Object.hasOwn`, and `connectConfig` also stores a null-prototype sanitised map. That map makes
+ * `__proto__` an ORDINARY OWN KEY instead of a prototype setter — so a prototype-shaped name that
+ * reaches `connectConfig` is STORED AND RESOLVED, not filtered: `connectConfig` checks that an entry is
+ * an object and never checks its name (`loadServer("__proto__")` resolves and spawns it — measured).
+ * This set and the merge's `isValidServerName` call are therefore the ONLY name locks; do not delete
+ * them believing `connectConfig` already refuses those names, because it does not. pi's own
  * name rule (`docs/mcp.md`) is only the charset, which ADMITS all three — on the null-prototype map they
  * would be accepted as ordinary servers — so refusing them is THIS client's hygiene rule, stricter than
  * pi by choice, not a platform requirement. Do not read it as the thing that prevents pollution.
@@ -910,27 +914,34 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
           `client selects the transport from url/command and never reads type, so the entry is KEPT as written.`
       );
     }
-    // ⛔ BOTH TRANSPORTS: a REPO DELTA is refused, a BASE entry is only warned about.
+    // A RECOGNISED `type` that CONTRADICTS the entry's own transport is inert to this client but means
+    // the operator expected an effect it will not get (`{"type":"http",command:…}` runs over stdio —
+    // measured). A REPO entry is reported by `mergeMcpLayers`, which evaluates the EFFECTIVE entry (the
+    // delta may be what makes it incoherent); a BASE entry never passes through that path — the merge
+    // copies base entries verbatim — so it is reported here or nowhere. WARN only: `type` must never
+    // disqualify an entry (see `RECOGNISED_TYPES`).
+    if (label.startsWith("base") && typeDisagrees(entry as McpServerConfig)) {
+      console.log(
+        `[mcp-client] note: ${label} entry "${name}" declares a "type" that disagrees with its transport — ` +
+          `this client selects the transport from url/command, so the entry is kept as written.`
+      );
+    }
+    // ⛔ BOTH TRANSPORTS: THE BASE LAYER IS WARNED ABOUT HERE, AND THE REPO RULING IS LEFT TO THE MERGE.
     // `connectServer` tests `url` BEFORE `command`, so such an entry runs over HTTP and ignores the
-    // `command`. For a repo delta, refusing it is safe — the base entry survives — and it is what the
-    // docs promise. For the BASE layer, DROPPING it would zero a config that currently WORKS over `url`,
-    // which is the same "destroy a working operator config" failure the `type` ruling forbids
-    // (`merge-mcp.py`: "replacing it would destroy the operator's config"). So: warn loudly, keep it.
-    if (typed.url !== undefined && typed.command !== undefined) {
-      if (label.startsWith("base")) {
-        console.log(
-          `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous; ` +
-            `it is KEPT and will run over "url" (that is the order this client dispatches in). ` +
-            `Remove one to be explicit.`
-        );
-      } else {
-        console.log(
-          `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous, so ` +
-            `dropped (the base's entry, if any, is kept). Declare ONE transport. ` +
-            suffix
-        );
-        continue;
-      }
+    // `command`. The ruling has TWO halves — a repo DELTA is ignored (base kept), a repo-ONLY entry is
+    // kept — and only `mergeMcpLayers` can tell them apart, because only there is the base's own entry
+    // visible. Dropping a repo entry HERE made that tested distinction unreachable: a repo-only
+    // ambiguous entry was silently unloaded, while `mergeMcpLayers` and `SETUP-NEW-MACHINE.md` both
+    // promise it is KEPT and runs over `url` (dropping it zeroes a config that works — the same failure
+    // the `type` ruling forbids). So the layer read only warns, and only for the layer whose entries the
+    // merge copies verbatim and never inspects. A repo cannot REMOVE a base server either way: the merge
+    // keeps the base entry when the repo entry is a delta.
+    if (label.startsWith("base") && typed.url !== undefined && typed.command !== undefined) {
+      console.log(
+        `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous; ` +
+          `it is KEPT and will run over "url" (that is the order this client dispatches in). ` +
+          `Remove one to be explicit.`
+      );
     }
     servers[name] = entry as McpServerConfig;
   }

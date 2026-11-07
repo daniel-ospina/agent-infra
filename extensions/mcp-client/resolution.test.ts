@@ -376,13 +376,14 @@ await test("TRANSPORT IS ATOMIC: a repo `command` drops the base's url AND its c
   // connectServer tests `url` BEFORE `command`, so a merged entry carrying both silently ignored the
   // repo's stdio daemon and kept talking to the base endpoint — with no warning.
   const merged = mergeMcpLayers(
-    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, oauth: true, lazy: true } } } as never,
     { mcpServers: { tortoise: { command: "/usr/bin/python3", args: ["-m", "tortoise.mcp_server"] } } } as never,
   );
   const t = merged.tortoise as Record<string, unknown> | undefined;
   equal(t?.command, "/usr/bin/python3", "the repo's transport is the one that runs");
   equal(t?.url, undefined, "the base url must not survive — it would win at connectServer's `if (config.url)`");
   equal(t?.headers, undefined, "nor may its credentials");
+  equal(t?.oauth, undefined, "nor its `oauth` config — it is one of HTTP_TRANSPORT_FIELDS for exactly this reason");
   equal(t?.lazy, true, "non-transport metadata is still inherited");
 });
 
@@ -434,6 +435,41 @@ await test("a REPO-ONLY entry declaring BOTH transports is KEPT with a warning (
   equal((merged.t as Record<string, unknown>).url, "https://ok/mcp", "and it will run over `url`");
 });
 
+await test("THE PRODUCTION PATH keeps a REPO-ONLY both-transports entry (asMcpJson must not pre-empt the merge)", async () => {
+  // `mergeMcpLayers` alone is not the code that runs: `connectAllLayers` reads each layer through
+  // `asMcpJson` FIRST, and that validator used to drop a repo entry declaring both transports
+  // unconditionally — so the ruling tested above was unreachable, the server was silently unloaded, and
+  // `SETUP-NEW-MACHINE.md` promised the opposite. Only a test through the real entry point catches it.
+  const repoDir = tempDir("mcp-repoonly-both-repo-");
+  const homeDir = tempDir("mcp-repoonly-both-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: {
+      both: { url: "https://ok/mcp", command: "/bin/sh", lazy: true },
+      fine: { url: "https://fine/mcp", lazy: true },
+    },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(
+    "both" in cfg.mcpServers,
+    `a repo-only entry declaring both transports must SURVIVE the layer read — got keys ${JSON.stringify(Object.keys(cfg.mcpServers))}`
+  );
+  equal((cfg.mcpServers.both as Record<string, unknown>).url, "https://ok/mcp", "and it runs over `url`");
+  ok(
+    logs.some(l => l.includes("declares BOTH") && l.includes("KEPT")),
+    `the operator must be told it is ambiguous but kept — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropping it would zero a working config)", async () => {
   // The docs promise an ambiguous entry is rejected — which was only true for a REPO entry: a base entry
   // declaring both was copied verbatim with no warning while connectServer silently used `url`.
@@ -467,16 +503,52 @@ await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropp
   );
 });
 
-await test("a `type` that disagrees with the transport is a WARNING, and the delta still applies", () => {
+await test("a `type` that disagrees with the transport is a WARNING, and the delta still applies", async () => {
   // `type` is the schema's transport selector, and connectServer dispatches on url/command — so
   // `{"type":"http","command":…}` would silently run over stdio.
-  const merged = mergeMcpLayers(
-    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
-    { mcpServers: { t: { type: "http", command: "/bin/sh" } } } as never,
-  );
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
+      { mcpServers: { t: { type: "http", command: "/bin/sh" } } } as never,
+    );
+  });
   const t = merged.t as Record<string, unknown> | undefined;
   equal(t?.command, "/bin/sh", "the delta applies — `type` is inert here, so it must not veto a working entry");
   equal(t?.url, undefined, "and the transport switch removed the base's url");
+  // The test's NAME promises a warning. Without this assertion, deleting the `typeDisagrees` block that
+  // emits it left the suite bit-identical — the promise was untested prose.
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `the contradiction must be reported, not applied silently — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a BASE-only `type` contradicting its own transport is reported (the merge never inspects base entries)", async () => {
+  // The docstring justifies the `type` check with a measured `{"type":"http","command":…}` entry that ran
+  // over stdio "so the operator learns". A repo entry is reported by the merge; a BASE entry is copied
+  // verbatim by it and so was completely silent — the one layer an operator hand-edits.
+  const repoDir = tempDir("mcp-basetype-repo-");
+  const homeDir = tempDir("mcp-basetype-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { incoherent: { type: "http", command: "/bin/sh", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok("incoherent" in cfg.mcpServers, "`type` must never disqualify an entry — it is kept");
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `a base entry's contradictory \`type\` must be reported — got:\n${logs.join("\n")}`
+  );
 });
 
 await test("a NORMALISED restatement of the same url still inherits the base's credentials", () => {
