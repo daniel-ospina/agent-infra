@@ -952,7 +952,15 @@ at **0 bytes free**, both repair loops at `cap: 0`, no cell able to dispatch for
 an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commits.
 
 So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when the
-remote advertises **exactly this HEAD sha** at that branch. The remote's own `refs/heads/*` are
+remote advertises **exactly this HEAD sha** at that branch — and, because the advertisement is read
+ONCE per remote per pass, that fact is **re-proved against the remote at the moment of the
+removal** (`remote_holds_recheck`: one targeted `ls-remote --heads <remote> refs/heads/<branch>`,
+same exact refname+sha compare). The snapshot is CLASSIFICATION evidence; a branch auto-deleted on
+merge between the snapshot and the fork would otherwise make "the remote still holds this head"
+false at the instant a checkout with **no backup** is destroyed. The cost is one round trip per
+REMOVAL (the work the pass exists to do), not per candidate. A failed, timed-out or empty targeted
+probe at removal time preserves.
+The remote's own `refs/heads/*` are
 read by ONE bounded `git ls-remote --heads <remote>` **per remote per pass** (#3371) and cached for
 that pass, so the cost no longer grows with the number of candidates: a targeted probe is one
 network round trip each, which is what made a large `remote-only-ref` population unable to finish a
