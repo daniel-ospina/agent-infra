@@ -713,7 +713,23 @@ done
 # down with it. Measured on #3486: `FAIL: install exited 1`, then `GUARD MISSING: …` × 6.
 # A `src` subdirectory with a flat `dest` is exactly what the installer's own reader models, so the
 # test's independent expectation stays a superset of this declaration with no change in semantics.
-mcp_harness_srcs=(lane_registry.py)
+#
+# ⛔ `cloud-cell-doctor.sh` BELONGS IN THIS ARRAY, and the array name is about the SOURCE DIR, not
+# about MCP: this is the repo's only src-one-down / dest-flat farm, and the doctor needs exactly that
+# (`scripts/orchestrator-harness/cloud-cell-doctor.sh` → `$DEST/scripts/cloud-cell-doctor.sh`). That
+# destination is the one `cloud-cell-supervisor.sh`'s `doctor_path()` resolves as
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh`, and the supervisor is farmed here FLAT — so without
+# this entry a fresh `$DEST/scripts` holds a supervisor whose every role `die`s "cloud-cell-doctor.sh
+# not found" (measured shape, #1552/#1899). It was EXEMPTED under #3530 when this array was believed
+# closed to it; the exemption claimed "no FARM_ARRAYS entry can carry it", which was false — the
+# installer loop below is content-agnostic, and `cell-install.sh:FARM_LAYOUT` already maps this array
+# to `scripts/orchestrator-harness → scripts`, so a cell gets it too. Measured 2026-11-07.
+# ⚠️ What farming flat does NOT carry is the doctor's OPTIONAL harness siblings (`lane-reap.sh`,
+# `rail-refusal.sh`, `repo-slug.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still
+# absent on a farm-only box. But `doctor_path()` prefers `$O` and the checkout's
+# `orchestrator-harness/` BEFORE this flat copy, so the farmed one is the last resort: previously
+# ABSENT (a dead consumer), now PRESENT with degraded optionals.
+mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
