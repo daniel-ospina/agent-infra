@@ -141,10 +141,10 @@ _rs_nearest_existing_ancestor() {
 # and omitted `_rs_stat_kind`).
 # ⛔ THE WRAPPER CARRIES THE SAME ORDER IN ITS OWN LINES, AND THAT IS AN ORDERING FACT, NOT A SECOND
 # AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file (its loop is at
-# `:95-103`, the source is `:110`) — it has to, because it refuses with its own message when no
+# `:95-103`, the source is `:119`) — it has to, because it refuses with its own message when no
 # interpreter resolves, and it must do that before anything from here exists in its shell. So it cannot
 # call this function at that point, and it resolves the same three candidates in the same order in its
-# own eleven lines (`:93-103`). After the source it never needs to: everything that wants an
+# own loop (`:95-103`). After the source it never needs to: everything that wants an
 # interpreter goes through `_rs_doctor_available` / `_rs_with_doctor`, which call this one.
 # ⛔ AND THE WRAPPER SOURCES THIS FILE, DELIBERATELY — because it needs the reader's FUNCTIONS AND
 # THEIR VALUES (the set path, the rendered entry list, the trim, the origin proof, the slug
@@ -603,6 +603,17 @@ mod = importlib.util.module_from_spec(spec)
 try:
     spec.loader.exec_module(mod)
 except Exception:
+    # ⛔ A SIBLING THAT WILL NOT LOAD IS ALSO "COULD NOT ASK" — AND THE ANSWER IS PER VERB (round 17,
+    # P2). This arm used to exit silently with empty stdout for EVERY verb, so the `tags` guard read a
+    # dead module as "no collision" and the one message that names the shared-state hazard never
+    # printed. Reachable in practice: a sibling whose annotations need a newer interpreter fails at
+    # exec_module on an older one.
+    # The `raise` below stays UNCONDITIONAL (`errno`-style early return): only `tags` is answered HERE,
+    # because only `tags` has no shell-side mapping. `split` needs nothing here because the SHELL turns
+    # its empty answer into `__UNASKABLE__` (`_rs_split_entries`), and `origin` already says "no
+    # python3, or it would not load". So the other four verbs keep their exact pre-fix bytes.
+    if verb == "tags":
+        sys.stdout.write("__UNASKABLE__")
     raise SystemExit(0)
 if verb == "strip":
     sys.stdout.write(arg.strip())
