@@ -128,22 +128,41 @@ TMP="$(cd "$TMP" && pwd)" || { echo "❌ SKIP-CANNOT-RUN: cannot canonicalise $T
 # `fin() { set -u; }` + an unbound read was RED ending `exit 0` and ✅ ending `exec /bin/true`, with the unbound read
 # COMPLETING (measured). The DEBUG trap below records `$-` for the `exec` command itself, so an exec'ing script
 # answers empirically too and the parser is left with the population that never runs at all. `$BASH_COMMAND` is a
-# builtin lookup bash already maintains and the trap returns 0, so this is errexit-safe and costs one `case` match
-# per command; the last record written for a path wins, so an EXIT record (the true end state) still overrides it.
+# builtin lookup bash already maintains and costs one `case` match per command; the last record written for a path
+# wins, so an EXIT record (the true end state) still overrides it.
+# ⛔ `set -T` IS REQUIRED FOR THE DEBUG TRAP TO REACH A FUNCTION BODY (review P2, cycle 96). Without functrace the DEBUG
+# trap is not inherited by shell functions, so `p() { exec /bin/true; }; p` wrote NO record and the textual parser
+# decided — the cycle-95 false PASS exactly, one layer in (measured: that body ran without nounset and printed ✅ while
+# the identical bytes with `exec` at top level reddened). Last-wins stays correct with `-T`: a subshell's record is
+# always followed by the parent's own EXIT record, which is the true end state.
+# ⛔ AND THE TRAP RETURNS 0 UNCONDITIONALLY (review P3, cycle 96). `case` propagates the `printf`'s status, so a failed
+# append (a full or unwritable log) aborted a `set -e` child at its first matching command — measured: such a body
+# printed its first line and then stopped dead. `|| :` inside the arm makes the status unconditionally 0.
+# ⛔ AND AN INLINE BODY IS NOT SILENTLY DROPPED (review P3, cycle 96). `bash -c "$(cat body.sh)"` runs a body with no
+# file to grade: `[ -f "$_b" ]` was false, nothing was logged, and the sweep printed ✅ while that body ran ungraded. A
+# `$0` that is the literal `bash` is counted on its own list and REDS — fail closed, because a body this suite runs
+# must never be outside the graded population. A genuinely self-deleting driver is still `EXECUTED then GONE`.
 cat > "$TMP/.boothook" <<'BOOTHOOK'
 if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
-  case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac
-  if [ -f "$_b" ]; then
-    printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null
-    trap 'printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null' EXIT
-    trap 'case "$BASH_COMMAND" in exec[[:space:]]*) printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null ;; esac' DEBUG
+  case "$0" in
+    bash|-bash) printf "inline\n" >> "${RANK_QUEUE_INLINELOG:-/dev/null}" 2>/dev/null || : ;;
+    /*)         _b="$0" ;;
+    *)          _b="$PWD/$0" ;;
+  esac
+  if [ -n "${_b:-}" ] && [ -f "$_b" ]; then
+    printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null || :
+    set -T
+    trap 'printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
+    trap 'case "$BASH_COMMAND" in exec[[:space:]]*) printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;; esac' DEBUG
   fi
 fi
 BOOTHOOK
 : > "$TMP/.bootlog"
 : > "$TMP/.optlog"
+: > "$TMP/.inlinelog"
 export RANK_QUEUE_BOOTLOG="$TMP/.bootlog"
 export RANK_QUEUE_OPTLOG="$TMP/.optlog"
+export RANK_QUEUE_INLINELOG="$TMP/.inlinelog"
 export BASH_ENV="$TMP/.boothook"
 # ⛔ ONLY THE SHELL THAT CREATED THE SANDBOX MAY REMOVE IT. This is BELT AND BRACES, not a fix for an observed
 # failure: measured on bash 5.2.21, an `EXIT` trap does NOT run in a pipeline component or a command-substitution
@@ -1913,12 +1932,23 @@ if [ "$SDRC" -eq 0 ] && grep -q 'the queue WAS read' <<<"$SDOUT" \
 else rc=1; echo "      skip/wcfail-garbage: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (readable + depth failed + unparsable head: 'the queue WAS read' + queue_readable=1, NOT 'could NOT be READ', NOT empty)"; fi
 ck "SKIP arm: readable + depth failed + unparsable head is still a READ queue, with backlog=UNKNOWN (driven)" $rc
 skip_drive unreadable mode000
-if [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
+# ⛔ THE MODE-000 BRANCH IS HOST-DEPENDENT (review P2, cycle 96). `chmod 000` does not bind for root, so this fixture
+# legitimately takes the READABLE branch there — and the check demanded the unreadable one unconditionally, reddening a
+# CORRECT tree on every root host (measured as root: this and its §14 sibling were the only two failures, 175/2, with
+# the fixture output showing `rc=0 … head #300`). That is the false-red polarity this file refuses everywhere else, so
+# the assertion follows the branch the host actually took, and the ✅ says which one it graded.
+_sa_m000_readable=0; [ -r "$TMP/sa-unreadable/o/candidates.txt" ] && _sa_m000_readable=1
+if [ "$_sa_m000_readable" = "1" ]; then
+  if [ "$SDRC" -eq 0 ] && grep -q 'still holds 2 candidate(s), head #300' <<<"$SDOUT" \
+     && ! grep -q 'could NOT be READ' <<<"$SDOUT" && ! grep -qi 'Permission denied' <<<"$SDOUT"; then rc=0
+  else rc=1; echo "      skip/mode000 (readable host): rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (this user CAN read a mode-000 file: the queue must be READ — head #300, no 'could NOT be READ', no 'Permission denied')"; fi
+elif [ "$SDRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$SDOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$SDOUT" \
    && grep -q 'queue_readable=0' <<<"$SDOUT" \
    && ! grep -q 'Permission denied' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/mode000: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 300)' (a regular file with no read bit: could NOT be READ + backlog=UNKNOWN + queue_readable=0, no 'Permission denied')"; fi
-ck "SKIP arm: a REGULAR file with NO READ BIT is unreadable, and leaks no 'Permission denied' (driven)" $rc
+_sa_m000_note=""; [ "$_sa_m000_readable" = "1" ] && _sa_m000_note=" [readable host: the READ polarity was graded, not the unreadable one]"
+ck "SKIP arm: a REGULAR file with NO READ BIT is unreadable, and leaks no 'Permission denied' (driven)$_sa_m000_note" $rc
 # NON-VACUITY: the pre-fix fail-open re-parse (`_skip_n=0`) turns the depth-read failure into a MEASURED
 # zero — "the queue is empty (0 rows)" with `backlog=0` over two rows on disk.
 SDCO="$TMP/skip-arm-coerce.sh"
@@ -2215,13 +2245,24 @@ ck "the HEAD-KNOWN/DEPTH-UNKNOWN arm records handed_why alongside handed (the fi
 # (b4) THE `-r` HALF OF THE GUARD (review P3, cycle 14). Every unreadable fixture so far was a DIRECTORY,
 # which `-f` alone rejects — so dropping `-r` re-leaked the shell's own `Permission denied` unpunished.
 main_handoff mode000 mode000
-if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
+# ⛔ SAME HOST-BLINDNESS, SAME FIX (review P2, cycle 96): `chmod 000` does not bind for root, and this check demanded
+# the unreadable branch there too — measured as root: the fixture had READ the queue (`backlog now 2 issues`, `handed to
+# dispatch: #300`) and this assertion called that a failure. The branch the host took is graded, and the ✅ says which.
+_mh_m000_readable=0; [ -r "$TMP/mh-mode000/o/candidates.txt" ] && _mh_m000_readable=1
+if [ "$_mh_m000_readable" = "1" ]; then
+  if [ "$MHRC" -eq 0 ] && grep -q 'backlog now 2 issues' <<<"$MHOUT" \
+     && grep -q 'handed to dispatch: #300' <<<"$MHOUT" \
+     && ! grep -q 'could NOT be READ' <<<"$MHOUT" && ! grep -qi 'Permission denied' <<<"$MHOUT" \
+     && ! grep -q 'backlog=UNKNOWN' <<<"$MHOUT"; then rc=0
+  else rc=1; echo "      mode-000 (readable host): rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (this user CAN read a mode-000 file: the queue must be READ — backlog now 2 issues, #300 handed, no 'could NOT be READ', no 'Permission denied', no backlog=UNKNOWN)"; fi
+elif [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
    && grep -q 'backlog=UNKNOWN' <<<"$MHOUT" \
    && grep -q 'queue_readable=0' <<<"$MHOUT" \
    && ! grep -q 'Permission denied' <<<"$MHOUT" \
    && ! grep -q 'backlog=0' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      mode-000: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a regular file with no read bit is unreadable: could NOT be READ + backlog=UNKNOWN, and no 'Permission denied' leak)"; fi
-ck "a REGULAR file with NO READ BIT is unreadable, records backlog=UNKNOWN, and leaks no 'Permission denied'" $rc
+_mh_m000_note=""; [ "$_mh_m000_readable" = "1" ] && _mh_m000_note=" [readable host: the READ polarity was graded, not the unreadable one]"
+ck "a REGULAR file with NO READ BIT is unreadable, records backlog=UNKNOWN, and leaks no 'Permission denied'$_mh_m000_note" $rc
 # (b5) THE ORDER CLAIM IS NOT TYPED IN THE STATE THAT HAS NO ORDER (review P3, cycle 14). The unranked
 # arm's `handed_why=` used to be able to carry "the highest-ranked CLEAN entry in the pool-ordered queue"
 # — a severity claim about a pass that established NO priority order. Nothing asserted its ABSENCE.
@@ -3585,6 +3626,16 @@ EOF
 # that matters (what runs) is read from the `BASH_ENV` log, and each executed script must carry the flag family or be
 # a declared input. There is NO exemption for the case dirs' PATH shims (`wc`, `mv`, `cmp`, `sort`, `awk`, `cat`,
 # `tr`): they carry `set -u` in their own one-line bodies, so a driver can never hide behind one of those names.
+# ⛔ AN INLINE BODY IS A HOLE IN THIS POPULATION, SO IT REDS (review P3, cycle 96). `bash -c "$(cat body.sh)"` reaches
+# the hook with `$0` = `bash`, has no file, and used to vanish silently — measured: such a body ran WITHOUT nounset
+# while the sweep printed ✅ (172 observed, unchanged). The hook counts it; here it is named and fails closed.
+inline_total=0
+while IFS= read -r _il; do
+  [ -n "$_il" ] || continue
+  inline_total=$(( inline_total + 1 ))
+done <<EOF2
+$(sed '/^$/d' "$TMP/.inlinelog" 2>/dev/null)
+EOF2
 exec_total=0; exec_bare=""; exec_missing=""
 while IFS= read -r _ex; do
   [ -n "$_ex" ] || continue
@@ -3603,7 +3654,10 @@ while IFS= read -r _ex; do
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
-if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
+if [ "$inline_total" -ne 0 ]; then
+  echo "      INLINE: $inline_total bod$([ "$inline_total" -eq 1 ] && echo y || echo ies) ran through \`bash -c\`/a heredoc feed with no FILE to grade — nothing about their \`set -u\` state could be observed, so extract each into a case dir and run it as a file"
+fi
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
 else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, no shim exemption); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
 ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
