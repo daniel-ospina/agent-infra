@@ -3010,16 +3010,25 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # block is a claim the next reader is entitled to check — and a bare count
 # invites the local module's own count to be read as the tortoise file's.
 #
-# ⛔ NOT the trunk repair. The sentence here used to read that this "deadlocks the
-# very PR that repairs the trunk (tortoise#11262 / tortoise#11255 is the same
-# class)". That is FALSE and was removed after measurement: NONE of tortoise#11262's
-# four heads (`6c7a15f2a5`, `c8d8c44419`, `b888b9fb33`, `01e8b085ca`) carries a
-# `ci-introduced-failure` or `python-ci-gate` check-run AT ALL — its only red is
-# `ai-review-gate` — so the predicate whose "deadlock" the claim asserted never ran
-# on that PR. The tracked issue #3686 agrees: its table records `#11262 … can land`
-# and names #11217 as the one BLOCKED by this defect. The cost is the INVERSE of
-# the claim — this defect blocks PRs that never touch those files, while #11262 is
-# not blocked by it.
+# ⛔ NOT the trunk repair — and NOT the "inverse" either. The sentence here used
+# to read that this "deadlocks the very PR that repairs the trunk (tortoise#11262 /
+# tortoise#11255 is the same class)". That claim is not SUPPORTED by measurement,
+# and this note does not replace it with its opposite, because the measurement
+# does not reach that far either. What IS measured: tortoise#11262's
+# `6c7a15f2a5` carries a `ci-introduced-failure` check-run whose status is
+# **queued** and whose conclusion is `null` — it has never completed — while the
+# other probed commits carry no such run. A queued run certifies nothing, so the
+# predicate has returned NO VERDICT on that PR and its check cannot be cited
+# either way. The basis for "can land" is agent-infra#3686's own table
+# (`#11262 … can land`, naming #11217 as the one BLOCKED by this defect) — not
+# this note, and not any claim about #11262's redness.
+#
+# (An earlier revision of this paragraph said the check-run was absent "AT ALL"
+# and concluded the predicate "never ran" there. That was FALSE: the check-run
+# exists and is queued. It was missed because a `filter=all` read taken before
+# the job starts has no check-run OBJECT yet, so grepping the response for the
+# NAME returns nothing and reads exactly like "it does not exist". Absence of a
+# check-run is not absence of a dispatch — a distinction this block exists for.)
 #
 # ⛔ This note deliberately does NOT say WHICH change landed the corpus guards.
 # #3686's table credits #11262 with "all 3 guards"; I could not reconcile that
