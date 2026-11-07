@@ -29,9 +29,9 @@
 # Plus: the cap survives as an OPT-IN override (an operator ceiling that silently stopped working
 # would be the same defect in mirror image), a non-numeric seam is REFUSED rather than read as
 # "unbounded" or as "cap reached", and every safety gate this arm carries is re-asserted as a
-# regression: the symlink refusal, `preserved:main-checkout`, `preserved:home-or-state` (both the HOME
-# and the pass state-dir arm), the keep list, `git-below`, the bare-repo refusal, the young floor, the
-# `--dry-run` default, and `--include-gitless` being OPT-IN.
+# regression: the symlink refusal, `preserved:main-checkout`, `preserved:home-or-state` (each of the
+# guard's THREE references — HOME, CELL_HOME, the pass state dir), the keep list, `git-below`, the
+# bare-repo refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
 #
 # ⛔ THE FOUR BOUND-SHAPING CASES (A, C, D, E) ARE MUTATION-CHECKED (`expect_pass` then `expect_fail`
 # against a mutated copy); B, F and G are not, because their subjects (an `--apply` removal, the
@@ -71,7 +71,7 @@ trap 'chmod -R u+rwX "$T" 2>/dev/null; rm -rf "$T"' EXIT
 unset CELL_HOME REAP_AW_STAMP REAP_AW_DIRTY REAP_AW_ROOTS REAP_AW_AGED_MINUTES \
       REAP_AW_BUDGET_SECONDS REAP_AW_GITLESS_MAX REAP_AW_GITLESS_KEEP REAP_AW_PROC_ROOT \
       REAP_AW_DRY_RUN REAP_AW_GIT_TIMEOUT REAP_AW_LIVE_PATHS REAP_AW_LOCK_STALE_SECONDS \
-      LP_PROC_ROOT LP_CENSUS_MECH 2>/dev/null || true
+      REAP_AW_LOG REAP_AW_STATE_DIR LP_PROC_ROOT LP_CENSUS_MECH 2>/dev/null || true
 
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS + 1)); printf '  ✅ %s\n' "$1"; }
@@ -358,21 +358,26 @@ case_g() { # <owner-script>
                "without --include-gitless the whole arm is OFF"
     # G8 the home/state guard — the one gate whose absence was MEASURED to be catastrophic (a
     #    non-canonical `--root /tmp/` spelling reaped `/tmp//cell-home`, ~9.8 GB of `.pi`/`.venvs`).
-    #    Two arms of the same loop, so both are asserted: the HOME and the pass's own STATE DIR.
-    mk_gitless "$root" a-cellhome >/dev/null
-    age_path "$root/a-cellhome" 400
-    mk_gitless "$root" a-statedir >/dev/null
-    age_path "$root/a-statedir" 400
-    OUT="$(HOME="$root/a-cellhome" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+    #    The guard loops THREE references — `${HOME}`, `${CELL_HOME}`, `${REAP_AW_STATE_DIR}` — and a
+    #    cell runs `CELL_HOME=/tmp/cell-home` with `HOME=/home/cmux`, i.e. the two are DIFFERENT
+    #    directories, so one fixture can only ever exercise one of them. Each reference therefore gets
+    #    its own invocation, with the other two pointed away: a case that only ever sets `HOME` would
+    #    stay green if `${CELL_HOME}` were deleted from the loop (review of #3278 round 2).
+    for _gref in home cellhome statedir; do mk_gitless "$root" "a-$_gref" >/dev/null; age_path "$root/a-$_gref" 400; done
+    OUT="$(HOME="$root/a-home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
+    case_check "$(grep -qF "PRESERVED($root/a-home, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
+               "the cell HOME is never a candidate, even AGED and sitting inside the root (preserved:home-or-state)"
+    case_check "$(grep -q '^remove .*a-home' <<<"$OUT" && echo 1 || echo 0)" \
+               "and it is not reported removable either"
+    OUT="$(HOME="$FB/home" CELL_HOME="$root/a-cellhome" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
            REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
     case_check "$(grep -qF "PRESERVED($root/a-cellhome, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
-               "the cell HOME is never a candidate, even AGED and sitting inside the root (preserved:home-or-state)"
-    case_check "$(grep -q '^remove .*a-cellhome' <<<"$OUT" && echo 1 || echo 0)" \
-               "and it is not reported removable either"
+               "and so is CELL_HOME — a SEPARATE reference from HOME on a real cell (preserved:home-or-state)"
     OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$root/a-statedir" REAP_AW_LOG="$FB/state/log" \
            REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
     case_check "$(grep -qF "PRESERVED($root/a-statedir, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
-               "and neither is the pass's own STATE DIR (same guard, the other reference)"
+               "and the pass's own STATE DIR (the third reference of the same guard)"
     return $((CASE_FAIL > 0))
 }
 
