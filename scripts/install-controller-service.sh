@@ -222,6 +222,12 @@ pin_root_of_this_box() {
     f="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
     if [ -f "$f" ]; then
         p="$(head -1 "$f" 2>/dev/null)"
+        # ⛔ NORMALISE THE SPELLING BEFORE COMPARING (review-5 P3, measured). Other readers of this record do
+        # (`check-farm-drift.sh`, `pi-reap-worktrees.sh`). A record with a trailing slash — `…/scripts/
+        # orchestrator-harness/` — did not match the `*/scripts/orchestrator-harness` case, so it was taken as
+        # the pin ROOT, compared against the pin TREE, and the box's own pin was refused as foreign.
+        while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+        while [ "${p#//}" != "$p" ]; do p="${p#//}"; done
         case "$p" in
             */scripts/orchestrator-harness) printf '%s\n' "$(dirname "$(dirname "$p")")"; return 0 ;;
             '') ;;
@@ -1952,7 +1958,7 @@ do_uninstall() {
                     "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
             [ -n "$_sup" ] && [ -f "$_sup" ] && break || _sup=""
         done
-        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (farm it: bash pi-bootstrap/setup.sh)"
+        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (from a checkout that still has it — the farm does not create it, see #1938)"
     fi
     log_line "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $_sup start', and note that a tmux controller is NOT restarted by anything (#2402)"
     return 0
