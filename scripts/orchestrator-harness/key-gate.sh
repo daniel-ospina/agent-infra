@@ -186,6 +186,20 @@ print("trusted" if cfg.get("defaultProjectTrust") == "always" else "untrusted")
 _KEY_GATE_PY='
 import json, os, re, sys
 
+# \u26d4 AN UNENCODABLE CHARACTER MUST NEVER KILL THIS PAYLOAD (round 47, P1, measured). `models.json` is USER DATA and
+# every token below interpolates some of it (`no-api:<id>`, `known:<provider>`, a template variable name), so ONE lone
+# surrogate (`\ud800`, which python\x27s `json` ACCEPTS) or one ordinary non-ASCII id under `PYTHONIOENCODING=ascii` made a
+# `print` raise `UnicodeEncodeError` \u2014 the interpreter died, the caller runs it with `2>/dev/null`, `drop` came back
+# EMPTY, and the gate printed `check=ok` over a box pi cannot start: measured, a granted api-less fixture whose model id
+# is `deepseek\ud800` answered `RC=82 models-json-bad-gateway` before the shape was routed here and `RC=0 check=ok`
+# after. Guarding the two prints that failed would leave the same hole at the NEXT one that interpolates a document
+# field, which is why this is ONE place: whatever this payload cannot encode is escaped rather than raised, so a
+# diagnostic token can never become a verdict. ASCII-only output is unchanged.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
 
 def strip_jsonc(txt):
     """R15: mirror pi exactly - dist/utils/json.js strips ONLY line comments and TRAILING COMMAS, leaving string
@@ -513,6 +527,20 @@ if sys.argv[2] == "builtin":
         _v = BUILTIN_ENV.get(_p)
         if _v:
             print("certain:" + ",".join(_v))
+        elif _p in OAUTH_PROVIDERS:
+            # ⛔ "IN NO ENV TABLE" IS NOT "pi DOES NOT SHIP IT" (round 36 review, P1, measured). An OAUTH-ONLY
+            # provider (`openai-codex`) has no `envApiKeys` entry at all, so every table above answers NOTHING for
+            # it — the SAME empty stdout a provider pi does not ship produces. The empty answer was therefore
+            # overloading two facts, and `key_gate_builtin_unshipped` (which refuses 82) read this one as "not a
+            # provider pi ships": measured on a `{"providers":{"openai-codex":{...,"models":[{"id":"gpt-5-codex"}]}}}`
+            # fixture, `origin/main` answered `check=warn` + `check=ok var=MYV` while this gate refused 82 with
+            # "`openai-codex` is not a provider pi ships" — a NEW false block, in the same PR that fixed one.
+            # A token keeps the two distinguishable: no caller\x27s `certain:`/`uncertain:`/`noenv:` arm matches it, so
+            # every caller falls to its `*)` cannot-say arm, and `key_gate_builtin_unshipped` (EMPTY stdout) never
+            # fires. A provider in NO table AND no oauth handler stays empty, which is the shape it exists for.
+            print("known:" + _p)
+            print("why:pi ships this provider with an OAuth handler and names no environment variable for it, so no"
+                  " variable is the credential and nothing is asserted here")
     # Each alternative path is emitted with its own verdict, so the caller refuses only when EVERY one is closed AND
     # none of the env variables holds a value - and the refusal can name the paths it checked (round 30, P1).
     for _pid, _label, _preds in BUILTIN_PATHS.get(_p, []):
@@ -1054,21 +1082,289 @@ if sys.argv[2] == "compose":
     # model definition from that baseline (`provider-composer.js:117-123`). So on the DEFAULT gateway such a definition is
     # NOT a dropped catalog — measured, `pi -p` reached the gateway (404) — while a custom gateway\x27s empty catalog makes
     # the throw real (`Unknown provider`). The warning must not fire on the first shape: it says "dropped".
-    _gw = (_body.get("baseUrl") or "")
-    _gw = _gw if re.match(r"^https?://", _gw, re.I) else "https://" + _gw
-    _grant_default = _grant and _gw.rstrip("/") == "https://radius.pi.dev"
+    # \u26d4 THE VENDOR STRIPS A TRAILING `/v1` BEFORE IT NORMALIZES (round 35, P1, measured): `configureRadiusProviders`
+    # passes `config.baseUrl.replace(/\/v1\/?$/u, "")` (`model-runtime.js:130`) and only then does `radiusProvider` decide
+    # whether the baseline catalog applies. A gateway written `https://radius.pi.dev/v1` \u2014 the spelling every
+    # OpenAI-compatible baseUrl uses \u2014 is therefore the DEFAULT one, and the earlier test called it custom: measured,
+    # `pi -p` reached the gateway (401) while this gate refused 82 saying the provider was deleted.
+    _gw = re.sub(r"/v1/?$", "", _body.get("baseUrl") or "")
     _suffix = ":oauth" if _body.get("oauth") else ""
+    # \u26d4 THE TEST IS "WOULD `new URL()` THROW", NOT "DOES IT LOOK LIKE A URL" (round 39, P1, measured). The hand-rolled
+    # `^https?://` test refused boxes pi RUNS: WHATWG `new URL` accepts `https:/host` (one slash), `https:host`, and
+    # surrounding whitespace \u2014 `new URL("https:/gw.example/v1/messages")` and `new URL(" https://gw.example/v1/messages")`
+    # both yield `https://gw.example/v1/messages` (node, measured), and `pi -p` on each REACHED the network (`fetch failed`)
+    # while this gate refused 82 quoting a failure that box never printed. `new URL` throws for exactly one thing here:
+    # no parseable scheme (or an empty host on a special scheme). So the discriminator is scheme PRESENCE plus a host for
+    # http(s) \u2014 never a spelling.
+    # \u26d4 THE AUTHORITY IS PART OF "WOULD `new URL()` THROW" (round 40, P1, measured): a scheme-presence test passed
+    # two boxes pi REFUSES \u2014 `new URL("https://:8080/v1/messages")` and `new URL("https:// gw.example/v1/messages")` both
+    # throw `ERR_INVALID_URL` (node, measured), and `pi -p` on each answers `Invalid URL`. So for http(s) the authority
+    # must exist, must not carry whitespace, and must not be a bare port. \u26d4 IT IS READ AFTER THE SCHEME\x27S SLASHES,
+    # NOT AS "THE TEXT UP TO THE FIRST `/`": `new URL("https:///gw.example/v1/messages")` PARSES (three slashes are
+    # normalised, measured) and `pi -p` REACHED the network (`fetch failed`) \u2014 a text-up-to-the-first-slash rule
+    # refuses that box, re-creating the false block the last round removed, and so does `urllib.parse.urlsplit`, which
+    # reads `https:/gw.example/...` as having no host at all.
+    # \u26d4 AND A VALUE THAT IS ONLY A SCHEME PLUS SLASHES IS **NOT** REFUSED (round 40, P1, measured): pi builds
+    # `new URL(`${baseUrl.replace(/\/+$/u, "")}/messages`)` (`api/pi-messages.js:251`), so `https://` becomes
+    # `https:/messages`, which PARSES against the literal host `messages` \u2014 `pi -p` answered `fetch failed`, i.e. it
+    # SENT a request. That is a network failure, not the `Invalid URL` this refusal quotes, and a gate that claimed it
+    # would be quoting a failure the box never printed. The check below therefore runs on the vendor\x27s own
+    # strip-then-append, so every arm\x27s verdict agrees with what `pi -p` actually printed.
+    def _port_ok(port):
+        # \u26d4 THE PORT IS PART OF "WOULD `new URL()` THROW" (round 41, P1, measured). node THROWS `ERR_INVALID_URL`
+        # for a port that is not all-decimal or is out of range \u2014 measured: `host:abc`, `host:+80`, `host:-1`,
+        # `host:1e3`, `host:65536` and `host:80:90` all throw, while `host:`, `host:0`, `host:080` and `host:65535`
+        # all parse. `pi-messages.js:251` builds `new URL(`${model.baseUrl.replace(/\/+$/u, "")}/messages`)`, so each
+        # of those is `Invalid URL` before a request is sent \u2014 the failure `reason=models-json-bad-gateway` exists to
+        # quote \u2014 and the earlier test (a BARE `:port` authority, and nothing else) passed them as usable.
+        # `[0-9]` and not `\d`: python\x27s `\d` matches non-ASCII decimal digits, which `int()` would then accept while
+        # the vendor\x27s parser refuses them.
+        # \u26d4 AND THE CONVERSION IS BOUNDED, BECAUSE AN UNBOUNDED ONE IS A FALSE PASS (round 42, P2, measured):
+        # `int()` raises `ValueError` above `sys.get_int_max_str_digits()` (4300 here), the exception kills this whole
+        # compose payload, and `key_gate_compose` runs the interpreter with `2>/dev/null` \u2014 so the gate lost EVERY
+        # compose-level refusal and printed `check=ok` on a box whose `new URL()` throws. \u26d4 LEADING ZEROS ARE STRIPPED
+        # RATHER THAN THE STRING LENGTH BOUNDED DIRECTLY, because node PARSES the value: measured,
+        # `host:` + 5000 zeros and `host:0000080` are both VALID (ports 0 and 80), while any value above 65535 throws.
+        # A plain `len(port) <= 5` guard (the obvious fix) would refuse those two boxes `pi -p` runs \u2014 trading a false
+        # PASS for a false BLOCK. After `lstrip`, at most 5 digits can reach `int()`, so the conversion cannot raise.
+        if port == "":
+            return True
+        if re.fullmatch(r"[0-9]+", port) is None:
+            return False
+        digits = port.lstrip("0") or "0"
+        return len(digits) <= 5 and int(digits) <= 65535
+    def _authority_ok(auth):
+        # \u26d4 THE AUTHORITY IS READ THE WAY THE PARSER READS IT, ON THE RULES THAT WERE MEASURED \u2014 AND THE SCOPE OF
+        # THAT CLAIM IS NAMED HERE SO NOBODY READS IT AS A URL-PARSER EMULATION (round 43, P2, measured). What IS
+        # mirrored, each against node on the installed vendor:
+        #   * USERINFO IS SPLIT OFF FIRST: `https://user:pass@host/v1` PARSES, and a port test applied to the whole
+        #     authority would read `pass@host` as the port and refuse a box `pi -p` runs (the false-block direction).
+        #   * AN EMPTY HOST AFTER THE SPLIT THROWS: `user@`, `user@:8080`, `user@/`, `@/` are all `ERR_INVALID_URL`
+        #     (measured) and were accepted here, which is the same false-PASS class as the port itself.
+        #   * AN EMPTY OR UNCLOSED IPV6 LITERAL THROWS: `[]`, `[]:80`, `[::1` (measured).
+        #   * THE HOST MUST NOT CARRY A CODE POINT OR A BAD `%` ESCAPE THE HOST PARSER REJECTS: measured, `ho st`,
+        #     `ho\xa0st`, `ho\u2003st`, `ho<st`, `ho>st`, `ho^st`, `ho|st`, `h%zz` and `h%2` all throw, while `h%41`
+        #     PARSES (as host `ha`).
+        # \u26d4 WHAT IS DELIBERATELY **NOT** EMULATED, and why the refusal\x27s own comment and the README row are worded
+        # to match: the IPV6 INTERIOR is not validated (`[zzz]`/`[:::]` throw in node and pass here), the WHATWG
+        # host parser\x27s full code-point and punycode pipeline is not reproduced, the IPv4-NUMBER RULE is not
+        # reproduced (`0000080` throws in node), and a NON-http(s) scheme is not inspected at all \u2014 `_buildable`
+        # returns True for it before this function is reached (`ftp://[zzz]/v1` throws in node and passes here).
+        # This is a refusal that must never
+        # fire on a box `pi -p` runs, so an unemulated shape stays ACCEPTED rather than guessed at \u2014 the direction that
+        # leaves a residual false PASS (pre-existing: no URL test at all existed before this PR) instead of inventing a
+        # false BLOCK. Both halves are declared, and the arms pin the ones that are emulated.
+        hostport = auth.rsplit("@", 1)[-1]
+        if hostport.startswith("["):
+            close = hostport.find("]")
+            if close <= 1:
+                return False  # `[]`, `[::1` \u2014 an EMPTY or unclosed literal throws (close==1 is `[]`)
+            tail = hostport[close + 1:]
+            if not tail:
+                return True
+            if not tail.startswith(":"):
+                return False  # `[::1]x:80` \u2014 text after the literal throws
+            return _port_ok(tail[1:])
+        if ":" in hostport:
+            host, port = hostport.rsplit(":", 1)
+            if ":" in host:
+                return False  # `host:80:90` \u2014 a second colon is not a port, and node throws it
+        else:
+            host, port = hostport, ""
+        if not host:
+            return False
+        # \u26d4 THE HOST IS CHECKED ON ITS **DECODED** FORM, AND THAT ONE CLASS IS THE WHOLE TEST (round 43, P2,
+        # measured). The `%` check above tests escape SYNTAX only, so `h%2Fost`, `h%00st`, `h%20st`, `h%25st`,
+        # `h%3Aost`, `h%5Bost` and `h%40ost` were accepted while node throws `ERR_INVALID_URL` on every one \u2014 the
+        # escape decodes to a code point the DOMAIN pipeline then rejects. Measured over all 256 `%XX` escapes: node
+        # PARSES 81 (`! " $ & \x27 ( ) * + , - .` digits, `; =` A-Z `_` a-z `{ } ~`) and THROWS the other 175, whose
+        # decoded forms are exactly the C0 range, space, `# % / : < > ? @ [ \\ ] ^ |` and DEL \u2014 so this class is the
+        # measured THROW set, not a guess, and it cannot refuse a host the parser accepts.
+        # \u26d4 IT IS APPLIED TO `decoded`, WHICH IS WHY THERE IS **ONE** CHECK HERE AND NO SEPARATE RAW CLASS OR
+        # ESCAPE-SYNTAX TEST (measured by mutation, and both were deleted for it): when the host carries no VALID
+        # escape, `decoded` IS the host, so a raw `\x00`/`\x7f`/`<`/`[` is caught here anyway \u2014 and a MALFORMED escape
+        # (`%zz`, `%2`) is left UNREPLACED by the substitution, so the `%` it still carries is itself in this class. Two
+        # overlapping checks meant a mutant removing one stayed GREEN, i.e. half the guard was unfalsifiable. One check,
+        # one mutant, one red arm \u2014 and the `%` in the class is what makes the syntax test unnecessary.
+        # \u26d4 NON-ASCII DECODED BYTES ARE DELIBERATELY LEFT ACCEPTED: `%C3%BC` decodes to a non-ASCII letter that the
+        # punycode stage may well accept, and refusing non-ASCII would false-block a valid IDN host \u2014 the residual
+        # stays a false PASS, which is the direction this gate may err in.
+        # \u26d4 THE ESCAPES DECODE TO **BYTES**, THEN UTF-8 \u2014 NOT ONE CHARACTER PER BYTE (round 45, P1, measured):
+        # `chr(int(g,16))` emits a LATIN-1 character per byte, so a multi-byte UTF-8 sequence is split and `\s` then
+        # matched a CONTINUATION byte (0xA0, or 0x85 for NEL) out of a perfectly valid letter: measured,
+        # `https://caf%C3%A0.example/v1` (\u00e0 = C3 A0) was REFUSED 82 while node PARSES it to `xn--caf-cla.example`, and
+        # the SAME host written raw was accepted \u2014 one host, two verdicts, 599 of 692 percent-encoded IDN hosts the
+        # parser accepts were refused. That is the false-BLOCK direction this file\x27s header forbids, introduced by
+        # this very fix, so the decoding is the parser\x27s: collect BYTES (an escape is one byte, a literal character is
+        # its UTF-8 encoding), then decode the buffer strictly. INVALID UTF-8 IS A THROW, not a pass \u2014 node refuses
+        # `%80`, `%A0`, `%C2%41` and `%C0%AF` too (measured) \u2014 and so is a malformed escape, which the `int()` below
+        # turns into `return False`. \u26d4 THE TWO MALFORMED SPELLINGS FAIL BY DIFFERENT MECHANISMS, AND SAYING BOTH "raise"
+        # WAS WRONG (round 46, P3, measured): a MID-host `%zz`/`%4s` makes `int()` raise `ValueError` directly, while a
+        # `%4` at the END of the host does NOT \u2014 `int("4", 16)` is `4`, so it appends byte `0x04` and it is the DECODED
+        # class below that refuses it (measured: removing that class makes `https://h%4` ACCEPT). Same verdict, two paths.
+        buf = bytearray()
+        _i = 0
+        while _i < len(host):
+            _c = host[_i]
+            if _c == "%":
+                try:
+                    buf.append(int(host[_i + 1:_i + 3], 16))
+                except ValueError:
+                    return False
+                _i += 3
+            else:
+                # \u26d4 AN UNENCODABLE CODE POINT IS A THROW, NOT A CRASH (round 46, P1, measured): a LONE SURROGATE
+                # (`\ud800`, which python\x27s `json` ACCEPTS inside a string) is not UTF-8-encodable, and this call used
+                # to sit OUTSIDE any handler \u2014 the interpreter DIED, `key_gate_compose` runs it with `2>/dev/null`, and
+                # the gate printed `check=ok var=DEEPSEEK_API_KEY` over a box node refuses (`ERR_INVALID_URL`) while the
+                # PREVIOUS gate refused it 82. That is the same class the `int()` above is guarded for, and an
+                # exception escaping this payload loses EVERY compose-level refusal, not just this one.
+                try:
+                    buf.extend(_c.encode("utf-8"))
+                except UnicodeEncodeError:
+                    return False
+                _i += 1
+        try:
+            decoded = bytes(buf).decode("utf-8")
+        except UnicodeDecodeError:
+            return False
+        if re.search(r"[\s\x00-\x1f\x7f#%/ :<>?@\[\]\\^|]", decoded):
+            return False
+        return _port_ok(port)
+    def _buildable(v):
+        # \u26d4 THE PARSER REMOVES ASCII TAB/NEWLINE AND TRIMS ONLY C0-CONTROL-OR-SPACE (round 43, P2, measured):
+        # `new URL("https://ho\\tst/v1/messages")`, the same with `\n` or `\r`, all PARSE (host `host`), so refusing them
+        # \u2014 which `re.search(r"\\s", auth)` did \u2014 quoted `Invalid URL` over a box `pi -p` SENDS a request from: a
+        # false BLOCK this diff introduced, since no URL test existed before it. The trim is `[\x00-\x20]`, NOT
+        # python\x27s `.strip()`, which also eats `\xa0`/`\u2003` \u2014 code points the vendor does NOT trim, so stripping
+        # them turned `"\xa0https://host/v1"` into a buildable URL while node throws (a false PASS in the other
+        # direction). `\\` is a PATH SEPARATOR for the special schemes (`https://ho\\st/v1` PARSES with host `ho`), so
+        # it ends the authority exactly like `/`; leaving it in read `pass@host`-style text as a port.
+        s = re.sub(r"[\t\n\r]", "", str(v))
+        s = re.sub(r"^[\x00-\x20]+", "", s)
+        # \u26d4 THE TRAILING TRIM IS **NOT** MIRRORED, AND MIRRORING IT WAS A FALSE PASS (round 45, P3, measured): the
+        # vendor appends `/messages` to the baseUrl FIRST, then parses, and the parser trims only the ends of THAT
+        # whole string \u2014 so a trailing space lands INSIDE THE HOST when the baseUrl has no path. Measured:
+        # `https://gw.example ` and `https://gw.example:8080 ` both THROW `ERR_INVALID_URL`, while `https://gw.example/v1 `
+        # PARSES (the space lands in the path) \u2014 and trimming the baseUrl before appending made the gate accept all
+        # three. The LEADING trim stays, because there the parser does see the space at the start of the whole string.
+        m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*):(.*)$", s, re.S)
+        if not m:
+            return False
+        if m.group(1).lower() in ("http", "https"):
+            rest = (m.group(2).rstrip("/") + "/messages").lstrip("/\\")
+            auth = re.split(r"[/?#\\]", rest, 1)[0]
+            if not auth or re.fullmatch(r":[0-9]*", auth):
+                return False
+            return _authority_ok(auth)
+        return True
+    # \u26d4 THE NORMALISATION IS THE VENDOR\x27S, AND REWRITING A SCHEME IS A FALSE PASS (round 40, P2, measured).
+    # `normalizeRadiusGatewayUrl` (`pi-ai/dist/providers/radius-config.js`) is: prefix `https://` ONLY when
+    # `/^https?:\/\//iu` does NOT match, then strip trailing slashes \u2014 it NEVER rewrites a scheme it was given. So
+    # `http://radius.pi.dev` stays http, `https:/radius.pi.dev` (one slash) does not match and becomes
+    # `https://https:/radius.pi.dev`, and neither equals the default \u2014 `radiusProvider` then takes the EMPTY baseline
+    # (`radius.js:21-24`), `findModelDefaults` finds nothing and `modelFromJson` throws, so `recomposeProvider` DELETES
+    # the provider: measured, `pi -p` on `http://radius.pi.dev` + an api-less definition answers
+    # `Error: Unknown provider "deepseek"` while the old normaliser collapsed the scheme and printed `check=ok` \u2014 a
+    # false PASS on a box pi cannot resolve at all. The last round\x27s spelling tolerance is preserved where the vendor has
+    # it (an added scheme for a scheme-LESS value, and any number of slashes) and dropped where it does not.
+    # \u26d4 AND IT DOES **NOT** TRIM WHITESPACE, BECAUSE THE VENDOR DOES NOT (round 41, P1, measured).
+    # `normalizeRadiusGatewayUrl` is `/^https?:\/\//iu.test(value) ? value : `https://${value}`` then
+    # `.replace(/\/+$/u, "")` \u2014 there is no `.trim()` anywhere on that path, and `model-runtime.js:130` hands it
+    # `config.baseUrl.replace(/\/v1\/?$/u, "")` with no trim either. So `" https://radius.pi.dev"` does NOT match the
+    # scheme test, becomes `https:// https://radius.pi.dev`, and is NOT the default gateway: its baseline catalog is
+    # empty, `modelFromJson` throws and `recomposeProvider` DELETES the provider \u2014 measured, `pi -p` on that shape
+    # answers `Error: Unknown provider "deepseek"`. A `.strip()` here (which this line carried until round 41) made the
+    # padded spelling equal the default, fired the `_grant_default` return, and printed `check=ok var=RADIUS_API_KEY` on
+    # exactly that box. \u26d4 NOTE THE ASYMMETRY: `_buildable` above DOES strip, and that is correct \u2014 it answers
+    # "would `new URL()` throw", and the WHATWG parser removes leading/trailing spaces itself. This test asks a
+    # different question ("does the vendor call this THE DEFAULT gateway"), so the two must not be made to agree.
+    _gw_norm = _gw if re.match(r"^https?://", _gw, re.I) else "https://" + _gw
+    _gw_norm = re.sub(r"/+$", "", _gw_norm)
+    _grant_default = bool(_grant and _gw_norm == "https://radius.pi.dev")
+    # \u26d4 NO EARLY RETURN HERE (round 39, P1, measured): `definition.baseUrl` wins at `provider-composer.js:88` on the
+    # DEFAULT gateway just as much as on a custom one, so a definition carrying its own scheme-less value is a certain
+    # death there too \u2014 measured, `pi -p` \u2192 `Invalid URL` while this gate printed `check=ok`. The default-gateway return
+    # now sits AFTER the per-definition own-`baseUrl` check below, and the first cut of this fix returned here, which made
+    # that check dead code on exactly the boxes it was added for (caught by `3z15y38`/`39`, which reddened on the first
+    # run of the arms rather than on the fix).
+    # \u26d4 A SCHEME-LESS `baseUrl` IS A CERTAIN DEATH, AND ONLY AS ONE SPECIFIC SHAPE (round 36, P1 + round 37, P1/P2,
+    # measured). The scheme fallback that used to stand above turned a refusal into a false PASS, but the first fix then
+    # refused on the provider body alone \u2014 and that was a FALSE BLOCK, because pi only reaches the bad URL through
+    # `modelFromJson`: `const baseUrl = definition.baseUrl ?? providerConfig.baseUrl ?? defaults?.baseUrl`
+    # (`provider-composer.js:88`), whose consumer does `new URL(\`${model.baseUrl.replace(/\\/+$/u, "")}/messages\`)`
+    # (`api/pi-messages.js:250`). Measured on the installed pi, six shapes, so the test is per DEFINITION and provider-
+    # agnostic (a non-grant provider dies the same way, and `_grant` made that a false PASS):
+    #   grant + scheme-less + NO `models` array ................. RAN (401 from Radius) — the gateway normalizes its own
+    #                                                              config URL and no definition inherits the raw one
+    #   grant + scheme-less + a definition WITH its own baseUrl .. RAN (404) — `definition.baseUrl` wins
+    #   grant + scheme-less + definition WITHOUT one ............. `Invalid URL`
+    #   same, definition ALSO without `api`, SHIPPED provider .... `Invalid URL` (composed api, inherited URL)
+    #   same, UNSHIPPED provider ................................ `Error: Unknown provider` — the composer throws first
+    #   non-grant SHIPPED provider + scheme-less ................ `Invalid URL`
+    # Same for a MODEL-LEVEL scheme-less baseUrl (measured `Invalid URL`). So: a definition whose EFFECTIVE baseUrl
+    # (its own, else the one on the provider body) has no scheme is a refusal, and the `-no-api` variant is split out because
+    # the caller must pick the measured failure by whether pi ships the provider.
+    # \u26d4 BUT "PER DEFINITION" WAS STILL TWO FALSE PASSES (round 39, P1, measured BOTH ways): the test sat INSIDE the
+    # `models` loop and AFTER the default-gateway return, so two boxes where `pi -p` dies `Invalid URL` printed
+    # `check=ok` \u2014 (a) a definition carrying its OWN scheme-less `baseUrl` on the DEFAULT gateway (:88 wins regardless of
+    # the gateway, and `_grant_default` returned before the loop), and (b) a NON-radius provider body with a scheme-less
+    # `baseUrl` and NO `models` array, where `config.baseUrl` is mapped onto every base model
+    # (`config.oauth === "radius" ? model.baseUrl : (config.baseUrl ?? model.baseUrl)`, `provider-composer.js:168`).
+    # Both are now tested: (a) before the default-gateway return, per definition, because its own value wins there;
+    # (b) after the loop, and only for a non-radius provider \u2014 a GRANT with no `models` array is exempt, because that
+    # shape was measured to RUN (401 from Radius).
+    _raw_base = _body.get("baseUrl") or ""
+    _models = [m for m in (_body.get("models") or []) if isinstance(m, dict)]
+    # \u26d4 THE URL IS BUILT PER **REQUEST**, SO ONLY THE PINNED DEFINITION CAN BREAK IT (round 40, P3, measured).
+    # pi builds `new URL(`${model.baseUrl...}/messages`)` (`api/pi-messages.js:251`) for the model it is about to use, and
+    # `modelFromJson` (`provider-composer.js:83-116`) never parses a URL \u2014 so a SIBLING definition with an unbuildable
+    # `baseUrl` composes fine and is never reached. Measured: pinned `deepseek-flash` beside
+    # `{id:other, baseUrl:"broken.example/v1"}` \u2014 `pi -p` RAN (`fetch failed`) while this gate refused 82 naming the
+    # healthy pin. The loops below therefore test the URL on the pinned definition only (all definitions when no pin
+    # matches, which is the pre-existing answer). \u26d4 THE `api`/`baseUrl` STRUCTURAL TESTS STAY PER DOCUMENT, because those
+    # are composer-level: `provider-composer.js:173-181` runs `modelFromJson` for EVERY definition and a throw discards
+    # the whole models.json, so a sibling really does take the pinned model with it.
+    _pin = str(sys.argv[4]) if len(sys.argv) > 4 else ""
+    _pinned = [m for m in _models if str(m.get("id")) == _pin] if _pin else []
+    _url_models = _pinned or _models
+    def _bad_gw(m):
+        print("bad-gateway" + ("-no-api" if not (m.get("api") or _body.get("api")) else ""))
+        raise SystemExit(0)
+    # \u26d4 THIS TEST SITS ABOVE THE DEFAULT-GATEWAY RETURN (round 40, P2, measured): with the VENDOR\x27S normaliser a
+    # scheme-less gateway (`radius.pi.dev`) IS `https://radius.pi.dev`, so `_grant_default` now fires on it \u2014 and a
+    # return here would skip the effective-`baseUrl` test on exactly the boxes that need it (a definition inheriting the
+    # RAW, scheme-less value dies `Invalid URL` whatever the gateway is). Measured: the normaliser half alone reddened
+    # `3z15y20/21/22`, `32/33`, `8z47/48`, `8z53/54`; the pair is green.
+    for _m in _url_models:
+        # \u26d4 A GRANT ON A NON-DEFAULT GATEWAY NEVER REACHES THE URL (round 46, P2, measured):
+        # `configureRadiusProviders` (`model-runtime.js:119-132`) is called BEFORE any request, `radiusProvider` takes the
+        # EMPTY baseline catalog when the gateway is not the default one (`radius.js:21-24`), `findModelDefaults` finds
+        # nothing and `modelFromJson` THROWS on the `api`-less definition \u2014 so `recomposeProvider` DELETES the provider
+        # and no URL is ever built. Measured on pi for a trailing-space gateway + an api-less definition
+        # (`https://radius.pi.dev `): `Error: Unknown provider "deepseek". Use --list-models ...`, NOT `Invalid URL` \u2014
+        # while the URL test says `_buildable` is false and quoted `Invalid URL`, a failure that box never prints. The
+        # shape therefore falls THROUGH to the `no-api` branch below, whose caller answers `no-api:<id>:oauth` on a grant
+        # as `models-json-provider-dropped` \u2014 the reason pi\x27s own sentence belongs to. The URL test still applies to
+        # every definition that HAS an `api` (composed from a baseline that exists, or from the definition itself) and to
+        # every non-grant provider.
+        if _grant and not _grant_default and not (_m.get("api") or _body.get("api")):
+            continue
+        _eff = _m.get("baseUrl") or _raw_base
+        if _eff and not _buildable(_eff):
+            _bad_gw(_m)
     if _grant_default:
         raise SystemExit(0)
-    for _m in _body.get("models") or []:
-        if not isinstance(_m, dict):
-            continue
+    for _m in _models:
         if not (_m.get("api") or _body.get("api")):
             print("no-api:" + str(_m.get("id")) + _suffix)
             raise SystemExit(0)
         if not (_m.get("baseUrl") or _body.get("baseUrl")):
             print("no-baseurl:" + str(_m.get("id")) + _suffix)
             raise SystemExit(0)
+    if not _models and not _grant and _raw_base and not _buildable(_raw_base):
+        print("bad-gateway")
+        raise SystemExit(0)
     # ⛔ A `radius` GRANT REPLACES THE PROVIDER\x27S CATALOG AND ITS CREDENTIAL (round 33, P1, measured). The handler set is
     # NOT static after all: `configureRadiusProviders` (`dist/core/model-runtime.js:119-132`) swaps ANY provider whose
     # models.json sets `oauth: "radius"` AND a `baseUrl` for `builtinProviderCatalog.radiusProvider(...)`
@@ -1368,18 +1664,50 @@ key_gate_apikind() {
     | sed -n 's/^__KG_ATTR__//p' | head -1
 }
 
+# key_gate_builtin_probe <provider> -> the table answer, AND the READ STATUS: rc 0 = the read COMPLETED and is
+# therefore an ANSWER; rc non-zero = it did not (no python3, a tripped `KEY_GATE_BOUND`, an interpreter error).
+# Empty stdout WITH rc 0 is the ONLY shape that means "pi does not ship this provider".
+# ⛔ THE READ STATUS IS PART OF THE ANSWER (round 35 review, P1, measured). `key_gate_builtin` prints nothing for
+# BOTH "not shipped" and "I could not read the table", and four call sites added in this round read the SAME empty
+# answer as a positive claim and refused 82. Measured: with a `python3` that exits 3 only in `builtin` mode, a
+# shipped `deepseek` pin carrying an `api`-less model flipped `check=ok` -> `REFUSED … is not a provider pi ships`,
+# on BOTH the pin and the lane path — the one polarity this file's header forbids ("a datum we cannot read is not a
+# verdict"; "no python3 … refuses NOTHING"). The vendor prints nothing AND exits 0 only for a provider it does not
+# ship, so the exit status is the discriminator — and reading it here costs no second bounded read.
+key_gate_builtin_probe() {
+  local prov="${1:-}" out rc
+  [ -n "$prov" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  out="$(key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" /dev/null builtin "$prov" 2>/dev/null)"; rc=$?
+  # stdout is BYTE-IDENTICAL to the pre-diff function (nothing printed when the table said nothing), so every
+  # pre-existing caller is untouched by this split.
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return "$rc"
+}
+
 # key_gate_builtin <provider> -> `certain:VAR[,VAR...]` | `uncertain:VAR` + `why:` | `noenv:VAR` + `why:` |
-# (nothing = pi does not ship this provider at all)
+# (nothing = pi does not ship this provider, OR the read failed — ask `key_gate_builtin_unshipped` which)
 # pi's OWN table (`dist/env-api-keys.js`), so this is the vendor's answer and not this gate's guess.
+# Every pre-existing caller treats an empty answer as CANNOT-SAY, which stays correct for both shapes.
 key_gate_builtin() {
-  local prov="${1:-}"
-  [ -n "$prov" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" /dev/null builtin "$prov" 2>/dev/null
+  key_gate_builtin_probe "${1:-}"
+}
+
+# key_gate_builtin_unshipped <provider> -> rc 0 IFF the read COMPLETED and pi's table has NO entry for it.
+# This is the predicate for "the answer is a REFUSAL": a failed read must keep the pre-existing `warn`, never
+# refuse. Refusing on an unread datum is the false block this file's header forbids.
+# ⛔ AND "NO ENTRY IN THE ENV TABLE" IS NOT "UNSHIPPED" EITHER (round 36 review, P1, measured): an OAUTH-only
+# provider (`openai-codex`) legitimately answers nothing from every env table, so the python emits a `known:` token
+# for it. Only EMPTY stdout means "pi ships no such provider" — the two facts this predicate needs to separate.
+key_gate_builtin_unshipped() {
+  local out
+  out="$(key_gate_builtin_probe "${1:-}")" || return 1
+  [ -z "$out" ]
 }
 
 # key_gate_compose <home> <provider> <model> [<cwd>] -> the reason pi's COMPOSER rejects this provider's
-# models.json (`oauth-no-baseurl` | `no-api:<id>` | `no-baseurl:<id>`), or nothing.
+# models.json (`oauth-no-baseurl` | `no-api:<id>` | `no-baseurl:<id>`) or its pinned definition's URL
+# (`bad-gateway` | `bad-gateway-no-api`), or nothing.
 # ⛔ pi COMPOSES models.json A SECOND TIME and can DISCARD what this gate just read (round 28, P2, measured).
 key_gate_compose() {
   local home="${1:-}" prov="${2:-}" model="${3:-}" cwd="${4:-${PWD:-}}" agent_dir mj
@@ -1392,7 +1720,10 @@ key_gate_compose() {
   # `radius-grant` comes first when a grant holds, and a `no-api:`/`no-baseurl:` line can follow it — so a caller that
   # kept only the first line could not see both, and a second read would spend the bound twice (measured: a blocking
   # models.json then answered outside it, arm 5c).
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" 2>/dev/null
+  # \u26d4 THE PIN IS FORWARDED (round 40, P3, measured): the reader used to take `$model` and drop it, so both loops
+  # tested EVERY definition and a sibling\x27s unbuildable `baseUrl` refused a lane whose pinned model is fine. `$model` is
+  # argv[4]; an EMPTY value keeps the pre-existing "every definition" answer.
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" "$model" 2>/dev/null
 }
 
 # key_gate_value_present <VARNAME> — 0 iff THIS environment holds a non-blank value.
@@ -1882,6 +2213,47 @@ key_gate_box_default_assert() {
   drop="$(printf '%s\n' "$pcomp" | grep -v '^radius-grant$' | head -1)"
   # ⛔ see the lane site: a granted pin whose model definition cannot compose is a certain death (pi deletes the provider)
   # and NO credential answers it (round 34, P1, measured). Refused here too, because the pin path has its own code.
+  # ⛔ AND THE PIN PATH NEEDS THE UNSHIPPED-PROVIDER RULE TOO (round 35, P1, measured): it ignored `no-api`/`no-baseurl`
+  # entirely, so `--probe --box-default` printed `check=ok var=MYV` for a `myprov` pin whose bare `pi -p` answers
+  # `Error: Unknown provider "myprov".` (a DELETED provider) or `No API key found for the selected model.` A provider pi
+  # does not ship has no base to compose from, so the model definition takes it with it.
+  # ⛔ A PROVIDER pi DOES NOT SHIP, which is a fact about the FILE — but ONLY when the table read COMPLETED (round 35
+  # review, P1, measured): `key_gate_builtin` is empty for an unread table too, and refusing on that turned a healthy
+  # box into `REFUSED … is not a provider pi ships` with a remedy that was not the reason it fired.
+  # \u26d4 see the lane site: the URL level, and NOT gated on a Radius grant (round 37, P1/P2, measured).
+  # ⛔ AND `warn` MODE STAYS SILENT, LIKE EVERY SIBLING ARM BELOW (round 38, P2). `warn` is the LANE path's
+  # COMPANION line (`key_gate_assert` runs it before the verdict, so a lane log carries ONE refusal); refusing here
+  # would print a second `result=REFUSED` line for the same box, which is the duplicate-noise class #3331 was filed
+  # about. The lane's own verdict is unaffected: `key_gate_assert_main` refuses this shape itself, and
+  # `--probe --box-default` drives this function in `refused` mode.
+  if { [ "$drop" = "bad-gateway" ] || { [ "$drop" = "bad-gateway-no-api" ] && ! key_gate_builtin_unshipped "$prov"; }; } && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-bad-gateway why=%s model=%s box_default=%s provider=%s settings_json=%s - the pinned model definition has no absolute URL in its effective `baseUrl` (its own, else the one on the provider body), and pi builds the request URL from that value. For `%s` the measured outcome is `Invalid URL` before anything is sent; a definition that ALSO declares no `api` may instead lose the provider entirely (`Error: Unknown provider`), because pi cannot compose one without a baseline catalog. Either way no credential answers it: write an absolute `https://` baseUrl (on the model definition, or on the provider body) and give the definition its own `api` if it has none, then re-run (agent-infra#3443)\n' \
+      "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$prov"
+    return "$KEY_GATE_REFUSED"
+  fi
+  # ⛔ AND THE `-no-api` VARIANT DOES NOT QUOTE A SINGLE FAILURE, BECAUSE THE COMPOSER'S IS NOT DECIDABLE HERE (round 39,
+  # P2, measured both ways). With a definition that declares no `api` AND an unbuildable effective `baseUrl`, pi's outcome
+  # depends on whether a baseline catalog survives, which this gate cannot read: a SHIPPED provider with a baseline
+  # composes an api and then fails to build the URL (`Invalid URL`), while a `radius` grant on a CUSTOM gateway has an
+  # empty baseline, so `modelFromJson` throws first and `recomposeProvider` DELETES the provider
+  # (`Error: Unknown provider`) — measured: `{"oauth":"radius","baseUrl":"gw.example/v1",models:[{id}]}` answers
+  # `Unknown provider "deepseek"` while the same shape on `radius.pi.dev` answers `Invalid URL`. So the refusal names BOTH
+  # and gives a remedy that unblocks either, instead of quoting one and sending the operator to the wrong file field.
+  if [ "$drop" = "bad-gateway-no-api" ] && key_gate_builtin_unshipped "$prov" && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=no-api:%s model=%s box_default=%s provider=%s settings_json=%s - this provider is not one pi ships and the pinned model definition declares no `api`, so `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` Give the definition its own `api` (and `baseUrl`), and re-run (agent-infra#3443)\n' \
+      "$label" "$dm" "$dm" "$dm" "$prov" "$sj" "$prov" "$dm" "$prov"
+    return "$KEY_GATE_REFUSED"
+  fi
+  if [ -n "$drop" ] && key_gate_builtin_unshipped "$prov" && [ "$drop" != "oauth-no-baseurl" ] && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s box_default=%s provider=%s settings_json=%s - `%s` is not a provider pi ships, so the composer has no base model to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s"`, and a bare `pi -p` on this pin answers `No API key found for the selected model.` No credential answers that; give the model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
+      "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov" "$dm" "$prov"
+    return "$KEY_GATE_REFUSED"
+  fi
+  if [ "$drop" = "oauth-no-baseurl" ] && key_gate_builtin_unshipped "$prov" && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=oauth-no-baseurl model=%s box_default=%s provider=%s settings_json=%s - this provider sets `oauth` with no `baseUrl`, which makes the pi composer THROW, and `%s` is not a provider pi ships, so there is no built-in base to fall back on: `recomposeProvider` DELETES the provider (measured: `Error: Unknown provider "%s"`). Add a `baseUrl` to the provider body or drop it (agent-infra#3443)\n' \
+      "$label" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ -n "$pgrant" ] && [ -n "$drop" ] && [ "$quiet" != 1 ]; then
     printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s box_default=%s provider=%s settings_json=%s - the pi composer cannot build this provider\x27s model definition (%s) and, because a Radius grant replaces the built-in catalog with a gateway one whose models arrive only after a refresh, `recomposeProvider` DELETES the provider: measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` No credential answers that, so the pin is unusable until the definition carries its own `api` (and `baseUrl`) (agent-infra#3443)\n' \
       "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$drop" "$prov" "$dm" "$prov"
@@ -2157,7 +2529,7 @@ key_gate_assert_main() {
   # `check=skipped reason=cannot-resolve-provider-credential` ("a provisioning detail") on a box where `pi -p`
   # prints `No API key found for deepseek.` and exits. Measured: `models.json` = `{}`, `auth.json` =
   # `{"deepseek":{"key":"sk-legacy-no-type"}}`, DEEPSEEK_API_KEY exported -> gate skipped, pi died.
-  local store_rc=1 grant="" drop="" discarded=0 warn_drop=0 drop_why="" bkind=""
+  local store_rc=1 grant="" drop="" discarded=0 warn_drop=0 drop_why="" bkind="" bkind_rc=1
   # ⛔ THE RADIUS GRANT CHANGES THE CREDENTIAL QUESTION, SO IT IS READ BEFORE THE STORE (round 33, P1, measured): a
   # models.json provider with `oauth: "radius"` + a `baseUrl` is REPLACED by the gateway provider, whose auth is
   # `envApiKeyAuth(["RADIUS_API_KEY"])`, so `$DEEPSEEK_API_KEY` is neither what pi resolves nor proof that it runs.
@@ -2179,6 +2551,25 @@ key_gate_assert_main() {
   # var=MYV` (round 29's warn-only policy). NO credential can rescue that box, so no credential answer is honest: the
   # verdict is about the FILE, with the model-level remedy. The default gateway is exempt (the baseline composes the
   # definition; measured `pi -p` reached the gateway), and the token names the model definition that failed.
+  # \u26d4 THE URL LEVEL, NOT THE CREDENTIAL LEVEL (round 36 P1 + round 37 P1/P2, measured): a definition whose effective
+  # baseUrl has no http(s) scheme makes pi build `new URL("<value>/messages")`, which throws `Invalid URL` before any
+  # request — for a grant AND for an ordinary provider, so this is not gated on `grant`. The `-no-api` variant is the
+  # shape where the definition also has no `api`: a SHIPPED provider still composes one and dies `Invalid URL`, while an
+  # UNSHIPPED one has the composer throw first (`Error: Unknown provider`), so the message has to follow the provider.
+  if [ "$drop" = "bad-gateway" ] || { [ "$drop" = "bad-gateway-no-api" ] && ! key_gate_builtin_unshipped "$KEY_GATE_PROVIDER"; }; then
+    KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    KEY_GATE_REASON="models-json-bad-gateway"
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-bad-gateway why=%s model=%s provider=%s var=%s models_json=%s - a model definition this lane can use has no absolute URL in its effective `baseUrl` (its own, else the one on the provider body), and pi builds the request from that value: measured `Invalid URL`, thrown before anything is sent. A definition that ALSO declares no `api` may instead lose the provider entirely (`Error: Unknown provider`), because pi cannot compose one without a baseline catalog. No credential answers that, so this is a verdict about the FILE: write an absolute `https://` baseUrl (on the model definition, or on the provider body) and give the definition its own `api` if it has none, then re-run (agent-infra#3443)\n' \
+      "$label" "$drop" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}"
+    return "$KEY_GATE_REFUSED"
+  fi
+  if [ "$drop" = "bad-gateway-no-api" ] && key_gate_builtin_unshipped "$KEY_GATE_PROVIDER"; then
+    KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    KEY_GATE_REASON="models-json-provider-dropped"
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=no-api:%s model=%s provider=%s var=%s models_json=%s - this provider is not one pi ships and a model definition here declares no `api`, so `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` NO credential can rescue it. Give the model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ "$grant" = "1" ] && [ -n "$drop" ]; then
     KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
     KEY_GATE_REASON="models-json-provider-dropped"
@@ -2200,6 +2591,16 @@ key_gate_assert_main() {
   # RADIUS_API_KEY (grant + RADIUS_API_KEY -> 401; grant + DEEPSEEK_API_KEY -> `No API key found`). So the template keeps
   # its meaning when it exists, RADIUS_API_KEY answers when it does not (the built-in arm below), and the provider's OWN
   # variable is never the answer for a granted provider.
+  # \u26d4 AND `oauth` WITHOUT A `baseUrl` DELETES AN UNSHIPPED PROVIDER TOO (round 35, P1, measured): the composer throws on
+  # that shape, and with no built-in base to fall back on the provider is gone \u2014 measured `Error: Unknown provider` \u2014 so
+  # the cannot-say the shipped-provider half earns is a false answer here.
+  if [ "$drop" = "oauth-no-baseurl" ] && key_gate_builtin_unshipped "$KEY_GATE_PROVIDER"; then
+    KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    KEY_GATE_REASON="models-json-provider-dropped"
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=oauth-no-baseurl model=%s provider=%s var=%s models_json=%s - this provider sets `oauth` with no `baseUrl`, which makes the pi composer THROW, and `%s` is not a provider pi ships, so there is no built-in base to fall back on: `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s` answers `Error: Unknown provider "%s".` No credential answers that; add a `baseUrl` to the provider body (and an `api`/`baseUrl` to each model) or drop the provider (agent-infra#3443)\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER" "$KEY_GATE_PROVIDER" "$KEY_GATE_PROVIDER"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ "$drop" = "oauth-no-baseurl" ] && [ -n "$names" ]; then
     printf '[key-gate] %s check=warn reason=models-json-api-key-discarded why=oauth-no-baseurl provider=%s model=%s var=%s home=%s agent_dir=%s — a models.json for this provider sets `oauth` with no `baseUrl`, and the pi composer THROWS on that (`provider-composer.js:154`), so the provider apiKey override is discarded and $%s is NOT the variable pi resolves here; the answer below comes from the store and the provider built-in variable instead
 ' \
@@ -2456,18 +2857,39 @@ key_gate_assert_main() {
       # answers `Unknown provider "deepseek"`). The `:oauth` suffix on the reason says the base is gone, and it is
       # warned about unconditionally. And `known:` (a vendor provider with no env-var entry, `amazon-bedrock`) is a
       # provider pi ships, so its model IS composed and it must not be reported as dropped.
-      bkind="$(key_gate_builtin "$KEY_GATE_PROVIDER")"
+      # ⛔ the read STATUS comes with the token (round 35 review, P1): `bkind` is empty both when pi does not ship this
+      # provider AND when the table could not be read, and only the FIRST of those is a refusal.
+      bkind="$(key_gate_builtin_probe "$KEY_GATE_PROVIDER")"; bkind_rc=$?
+      # the field-level diagnosis, shared by the warn and the refusal
+      case "$drop" in
+        no-api:*) drop_why='a model definition here declares neither `api` nor `baseUrl`, and the provider body declares neither either' ;;
+        *) drop_why='a model definition here declares `api` but no `baseUrl`, and the provider body declares no `baseUrl` either' ;;
+      esac
       case "$drop" in
         *:oauth) warn_drop=1 ;;
-        *) if [ -z "$bkind" ]; then warn_drop=1; else warn_drop=0; fi ;;
+        # \u26d4 A PROVIDER pi DOES NOT SHIP IS DELETED, NOT WARNED ABOUT (round 35, P1, measured): the warn-only policy
+        # assumed this gate cannot know what pi does with a provider it does not recognise, but it can \u2014 there is no
+        # base to compose from, so `recomposeProvider` DELETES it. Measured on a `myprov` fixture: `pi -p --provider
+        # myprov --model m1` answers `Error: Unknown provider "myprov".` while this gate printed the warning and then
+        # `check=ok var=MYV`. No credential can rescue that box, so the answer is a refusal about the FILE.
+        # ⛔ REFUSE ONLY ON A COMPLETED READ THAT SAID "NOT SHIPPED" (round 35 review, P1, measured): the round-35 fix
+        # read the same empty `bkind` an unreadable table produces as a positive claim, so a box that is healthy was
+        # refused 82 with a remedy that was not why it fired. `bkind_rc` separates the two; an unread table falls
+        # through to the pre-existing `warn` below.
+        *) if [ "$bkind_rc" -eq 0 ] && [ -z "$bkind" ]; then
+             KEY_GATE_VAR="${KEY_GATE_VAR:-<none>}"
+             KEY_GATE_REASON="models-json-provider-dropped"
+             # ⛔ THE 11th ARGUMENT (round 35 review, P2, measured): the format has 11 `%s` and this list had 10, with
+             # `drop_why` in the provider slot — it rendered "`<clause>` is not a provider pi ships, myprov", a
+             # `--provider`/`--model` pair swapped, and `Unknown provider ""`. The sibling pin-path message carries
+             # the same sentence in the right order.
+             printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s provider=%s var=%s models_json=%s - `%s` is not a provider pi ships, %s, so there is no base model for the composer to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` NO credential can rescue it, so no environment variable is the question. Give this model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
+               "$label" "$drop" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER" "$drop_why" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER"
+             return "$KEY_GATE_REFUSED"
+           fi
+           if [ -z "$bkind" ]; then warn_drop=1; else warn_drop=0; fi ;;
       esac
       if [ "$warn_drop" = "1" ]; then
-        case "$drop" in
-          no-api:*)
-            drop_why='a model definition here declares neither `api` nor `baseUrl`, and the provider body declares neither either' ;;
-          *)
-            drop_why='a model definition here declares `api` but no `baseUrl`, and the provider body declares no `baseUrl` either' ;;
-        esac
         printf '[key-gate] %s check=warn reason=models-json-provider-dropped why=%s provider=%s model=%s var=%s models_json=%s — %s, which makes the pi composer THROW; when the provider is not one pi ships that DELETES the provider (measured: `pi -p --provider <custom> --model <id>` -> `Unknown provider`), so this credential assertion names a variable pi may never consult — check `pi --list-models`. A provider pi ships composes both from its own model instead, EXCEPT when `oauth` is set: pi then swaps the built-in catalog for a gateway provider whose models arrive only after a refresh, so the same throw deletes the config there too (measured: `Unknown provider "deepseek"`)\n' \
           "$label" "$drop" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "${KEY_GATE_VAR:-<none>}" "${KEY_GATE_MODELS_JSON:-<none>}" "$drop_why"
       fi ;;

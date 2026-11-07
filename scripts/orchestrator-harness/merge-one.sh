@@ -1986,7 +1986,10 @@ if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
   REV_STARTED=0
   echo "[merge $PR] reviewer NOT started (BRIEF gate) — no verdict, NO needsfix marker; the reviewer brief failed brief-gate.sh, which is a harness defect: fix the brief's build, not the PR" >> "$L.log"
   echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
-  exit 80
+  # Tolerant like the match above, for the same reason: `AGENT_BRIEF_REFUSED` is declared in
+  # `spawn-gate.sh` and never exported, so this file does not own it either (round-5 review of #3645,
+  # P2 — it was the one remaining tolerant-match-plus-literal-exit in the family).
+  exit "${AGENT_BRIEF_REFUSED:-80}"
 fi
 # ⛔ THE SYNC REFUSAL IS ITS OWN ARM (agent-infra#2293 follow-up), and without it this file turns a
 # helper-deploy fault into a REVIEW VERDICT. The spawn point exits `AGENT_HARNESS_SKEW_REFUSED` (83) when
@@ -2009,7 +2012,31 @@ if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
   AGENT_STARTED=0
   echo "[merge $PR] reviewer NOT started (HELPER/SYNC gate: capacity.sh not resolvable from the spawn gate) — no verdict, NO marker written; this is not a property of this PR or this box: sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever reviewers run, then re-dispatch. Do NOT dispatch the PR elsewhere: every box with these files refuses identically" >> "$L.log"
   echo "[merge $PR] reviewer NOT started (helper/sync refusal) — no verdict, no marker; see $L.log" >&2
-  exit "$AGENT_HARNESS_SKEW_REFUSED"
+  # ⛔ THE EXIT READS THE SAME TOLERANT REFERENCE THE MATCH ABOVE DOES (fresh review of #3231, P1).
+  # `AGENT_HARNESS_SKEW_REFUSED` is DECLARED in `spawn-gate.sh` (the `AGENT_HARNESS_SKEW_REFUSED=83`
+  # assignment) and never exported, and none of the helpers this file sources declares it either
+  # (`gate-policy.sh`, `repo-authority.sh` and its fallback, `rail-refusal.sh` and its fallback,
+  # `$O/claims.sh` — plus a caller-supplied mandate script the line that loads it names) — so the bare
+  # `$AGENT_HARNESS_SKEW_REFUSED` never had a value here, and this file runs under `set -u`.
+  # ⛔ WHAT THE ARM ACTUALLY DID, MEASURED (round-7 review of #3645, P2 — the earlier draft of this
+  # paragraph asserted rc 2 and was wrong): with the variable UNSET, `set -u` aborts the expansion and the
+  # shell exits **1** — `AGENT_HARNESS_SKEW_REFUSED: unbound variable`, the reviewer "crashed" code — and
+  # only a SET-BUT-EMPTY value reaches `exit ""`, which is a bash usage error and returns **2**, this
+  # file's own "ABORT: no comment id". Neither is 83: 1 misreports a harness/sync fault as a crash, and 2
+  # collides with a diagnosis that means something else entirely. The match above, the log line above it,
+  # and every caller (`lane.sh`'s `skew` case and its two `_cap_gate=skew` arms, `fix-one.sh`'s skew arm,
+  # `chain-merge.sh`'s `skew)` case) all promise 83. No test covered the exit value; the structural pins
+  # only asserted ORDER.
+  # Every sibling arm in this file that PROPAGATES a code it does not declare uses the same tolerant form
+  # (the memory arm, `AGENT_MEM_REFUSED`; the brief arm, `AGENT_BRIEF_REFUSED` — both declared in
+  # `spawn-gate.sh`, neither exported); the arms that exit a code this file publishes itself exit literals
+  # (`exit 75`, `exit 127`), and that distinction is the rule — not "every arm here".
+  # ⛔ NAMED BY CODE, NEVER BY LINE NUMBER — including this paragraph's own siblings. Three review rounds
+  # of #3645 each corrected a line citation that had moved under the edit that introduced it (one cited
+  # `:1927`/`:1946` for exits that were a comment and an `if`; the next cited the MATCH of an arm as its
+  # exit). A citation that rots is a false claim in the one place a reader is told to check, so cite the
+  # code, the string, or the assignment — something a reader can grep after the lines have moved.
+  exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"
 fi
 # ⛔ THE ROUND IS SPENT **HERE**, AND THIS FILE IS ITS ONLY WRITER (#3441). It sits BELOW every
 # refusal arm above, because those are the arms whose own words are "no reviewer ran":

@@ -144,72 +144,73 @@ from pathlib import Path
 #: A pytest nodeid: ``path/to/test_x.py::[Class::]name`` (params allowed).
 #: Deliberately anchored and narrow — anything else is REJECTED, not guessed.
 #:
-#: Used by :func:`parse_rates` (MAIN's rate table). ⛔ ``/`` BELONGS IN THE
-#: ``rest`` CLASS, and its absence was #3686. The ``path`` group has always
-#: admitted ``/``; the PARAMETER SPACE did not, so a parametrized id whose
-#: parameter is itself a path was admitted by the PR-side parser
-#: (:func:`is_failure_key_loose`) and DROPPED here. That is the REAL shape
-#: ``tests/test_entry_point_python_guard.py`` produces for every ``tools/**/*.py``
-#: entry point it censuses --
-#: ``…::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]``
-#: -- so an entire class of main-side rows could never become a rate.
+#: OVERRIDES: the ``_NODEID_LOOSE_RE`` rationale ("``_NODEID_RE`` stays narrow for
+#: the RATE/UNION parsers; widening it there would loosen their fail-closed check
+#: for no gain") — the ``/`` AND the SPACE in ``rest`` are ADMITTED, because that
+#: rationale's own premise, "for no gain", is measurably false. A pytest parameter
+#: legitimately carries a PATH (``::test_x[tools/cache_evict.py]``) and a SPACE
+#: (``::test_x[chromium-Claude Desktop]``), and the ``rest`` class already admitted
+#: ``[``/``]``/``.``/``:``/``-`` — the parameter-SYNTAX characters, NOT the whole
+#: parameter space (see the residual below) — so omitting them dropped main's rate
+#: row for EVERY such id. The consequence is not a formatting nicety, it is the
+#: exact failure mode :func:`is_failure_key`'s own docstring forbids: "a dropped
+#: main-side row makes the PR-side failure look unique, which BLOCKS".
+#: Measured on tortoise#11365: main's table carries all 10
+#: ``test_entry_point_python_guard.py`` rows — 3/25, 3/25, 1/25, 2/25, 2/25 PER ARM,
+#: five tools each, so ten rows across the two arms — and ``parse_rates`` rejected
+#: all 10, so a PR that touches none of those files was BLOCKed as "introduced"
+#: while the 11 non-path-parameterized main-reds on the same run were correctly
+#: EXEMPT. Measured on #3686: ``…[argv14-at the EDGE]`` was ``STRICT False |
+#: LOOSE True`` here even after ``/`` was added, and ``parse_rates`` rejected the
+#: row main's table carried.
 #:
-#: A dropped main-side row makes the PR-side failure look unique, which BLOCKS
-#: it forever: the exact asymmetry :func:`is_failure_key`'s own docstring forbids
-#: ("the same predicate must gate :func:`parse_rates`, or main's rate row is
-#: dropped and every such failure reads as PR-unique forever"). Measured
-#: 2026-11-07: main's table carried ``…[tools/cache_evict.py]\t3\t26`` and the
-#: verdict still reported the id as "absent from main's failure set". Pinned by
-#: ``tests/test_ci_exemption.py::test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors``.
+#: The narrowness that the overridden rationale still justifies is RETAINED: the
+#: ``path`` group stays anchored, and the tail admits only
+#: ``[A-Za-z0-9_\[\]\-.:/ ]`` — no tab, no empty tail, no missing ``::``.
 #:
-#: ⛔ TWO GAPS, ONE ROOT, AND THE SECOND ONE IS A SPACE (#3686 follow-up). The
-#: parameter space is pytest's, and pytest parameter ids legitimately carry a
-#: SPACE too — ``…::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]``
-#: is a real id from a shipped suite, and it was still dropped here after ``/``
-#: was added (measured on this branch at ``f3d4ff86``: ``STRICT False |
-#: LOOSE True``, and ``parse_rates`` rejected the row main's table carried).
-#: A space is not a different defect from ``/`` — it is the SAME predicate
-#: disagreeing with the PR side, on a character the loose form has always
-#: admitted, so fixing only the character the report named would leave the class
-#: intact. Both are in the class now.
+#: ⛔ THE SPACE TOOK THREE DOORS, NOT ONE, AND ALL THREE ARE CLOSED HERE. Besides
+#: this class, ``_RATES_RE``'s nodeid group was ``\S+`` (now ``[^\t]+``) and
+#: ``scripts/ci-failure-set.sh`` built the table with ``sort | uniq -c | awk
+#: '{ c=$1; $1=""; … }'`` — and ``$1 = ""`` REBUILDS ``$0`` joined by OFS, so a
+#: whitespace RUN collapsed to one space, under a key the PR side can never
+#: produce (now ``sub(/^ *[0-9]+ +/, "")``, which edits the record in place). A fix
+#: to one door alone would have left the id dropped. Pinned end to end by
+#: ``tests/test_ci_exemption.py`` (both doors) and
+#: ``tests/test_ci_exemption_producer.py`` (the producer/reader wire format).
 #:
-#: The class is still DELIBERATELY not ``[^\t]+``: the strict/loose split exists
-#: because a key wrongly ADMITTED here enters the exemption allowlist (see the
-#: stakes in :func:`is_failure_key`), so it is widened to the characters the two
-#: reported gaps were MEASURED on — ``/`` and space, plus the punctuation that
-#: surrounds them inside an id (``[ ] - . : _``) — rather than collapsed into the
-#: loose form.
+#: ⛔ KNOWN RESIDUAL — this is agent-infra#3691's, and it is no longer a whitespace
+#: class. `rest` is an ALLOWLIST (alnum, ``_``, ``[``, ``]``, ``.``, ``:``, ``-``,
+#: ``/``, space). Any real id outside it is dropped from MAIN's rate table and the
+#: silent-drop → "absent from main's failure set" → permanent BLOCK follows. The
+#: set is open-ended; every list written here was measurably short, so read the
+#: snapshot below as a MEASUREMENT and never as the class.
 #:
-#: ⛔ THAT IS NOT THE WHOLE PARAMETER SPACE, AND THE REMAINDER IS MEASURED, NOT
-#: ASSUMED. An earlier version of this comment said the class covers "the
-#: parameter space our own suites actually PRODUCE", which was FALSE. Collecting
-#: this repo's shipped suites (``pytest tests/ scripts/test_pr_doctor.py
-#: --collect-only`` → 1891 ids, 2026-11-07) leaves **10** collected ids this form
-#: rejects while the loose form accepts: 3 in ``scripts/test_pr_doctor.py``, which
-#: ``ci.yml``'s ``test`` job runs — ``…test_capacity_rejects_a_bad_value_and_uses_the_default[+12]``,
-#: ``…[sleeps, then writes to stdout and stderr]``, ``…[writes at once, then sleeps]``
-#: — and 7 in ``test_no_runner_or_hook_wrapper_is_ever_an_identity``'s wrapper
-#: parametrization (``##[error]Bash exited with code '1'.`` …). The characters
-#: implicated are ``+ , ' # @``, plus ``( ) " \\`` among the 9 further ids under
-#: ``tests/fixtures/`` that no CI job collects.
-#:
-#: ⛔ FOR THOSE IDS THE DEADLOCK #3686 REPORTED IS STILL LIVE. #3686 itself closed
-#: for ``/`` and space; the remainder is tracked as agent-infra#3700, in the shape
-#: it was reported in: main's
-#: rate row is dropped, a ``NOTE  : rejected main rate row:`` is printed beside
-#: ``BLOCK … absent from main's failure set``, and the id is unexemptible forever.
-#: Rejection is REPORTED (``rejected`` in :class:`RatesResult`), never silently
-#: dropped, which is why this remainder is MEASURED instead of being discovered
-#: as a deadlock a third time — and
+#: MEASURED SNAPSHOT (review of agent-infra#3687, 2026-11-07). Collecting this
+#: repo's SHIPPED suites (``pytest tests/ scripts/test_pr_doctor.py
+#: --collect-only`` → 1891 ids) leaves 19 ids loose-accepted / strict-rejected: 10
+#: in shipped suites, 9 under ``tests/fixtures/`` (no CI job collects those).
+#: Three of the ten are in ``scripts/test_pr_doctor.py``, which ``ci.yml``'s
+#: ``test`` job runs — ``…test_capacity_rejects_a_bad_value_and_uses_the_default[+12]``,
+#: ``…[sleeps, then writes to stdout and stderr]``, ``…[writes at once, then
+#: sleeps]`` — and 7 are ``test_no_runner_or_hook_wrapper_is_ever_an_identity``'s
+#: wrapper annotations (``##[error]Bash exited with code '1'.`` …). Characters
+#: implicated in that snapshot: ``+ , ' # @``, plus ``( ) " \`` among the fixture
+#: ids. Each of those is ``\S``, so ``_RATES_RE`` matches the row today and the drop
+#: is ``rest`` ALONE — do not send a fixer to ``_RATES_RE`` for a comma.
 #: ``tests/test_ci_exemption.py::test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS``
-#: pins the consequence, so this paragraph cannot drift away from the code.
+#: pins three of them and REDS on a widening, so a closure cannot ship as a claim
+#: without this comment being rewritten.
 #:
-#: Widening to whatever punctuation those suites happen to print was REJECTED as
-#: the remedy (agent-infra#3687 review, 2026-11-07): it is a moving target that
-#: tracks the suites rather than a character class pytest guarantees, and every
-#: character admitted HERE can purchase an exemption — the stakes #3686's scoping
-#: artifact states. Closing the remainder is a decision for #3700, not a quiet
-#: widening at the guard that decides merges.
+#: WHICH CHARACTER TO ADMIT NEXT — pytest escapes PARAMS when needed (``[a\tb]``,
+#: ``[caf\xe9]``, ``[a\\b]`` — backslash sequences, no raw byte) but does NOT escape
+#: a test/class NAME (``def test_café`` emits the raw UTF-8 bytes ``c3 a9``). So the
+#: character to admit for the first is ``\``; the second needs a non-ASCII range,
+#: which ``\`` does not cover.
+#:
+#: Live, not hypothetical: the module's own
+#: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins
+#: ``[chromium-Claude Desktop]`` as a REAL id the loose door must name. Tracked by
+#: agent-infra#3691.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/ ]+)$"
@@ -1175,12 +1176,18 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 # turned out to be the whole point: the RATE table reads MAIN's rows, so a
 # character the strict form rejects is a rate row that never exists, and the PR-side
 # failure which the loose form admits then reads PR-unique FOREVER. The strict form
-# now admits the parameter characters our suites actually produce (``/`` and space)
-# while staying deliberately NARROWER than ``[^\t]+`` — because a key wrongly
-# ADMITTED enters the exemption allowlist — so neither predicate is a synonym and
-# neither may be silently swapped for the other. Dropping a real id here would be
-# fail-OPEN (an undecided id is an unblocked id), which is why this path is
-# deliberately the permissive one.
+# now admits the parameter characters the two reports were measured on — ``/``
+# (#3690) and space (#3686) — while staying deliberately NARROWER than ``[^\t]+``
+# — because a key wrongly ADMITTED enters the exemption allowlist — so neither
+# predicate is a synonym and neither may be silently swapped for the other.
+# Dropping a real id here would be fail-OPEN (an undecided id is an unblocked id),
+# which is why this path is deliberately the permissive one.
+#
+# ⛔ SEE ``_NODEID_RE`` ABOVE (its ``OVERRIDES:`` block). The "for no gain" this
+# paragraph used to state is measurably false — for a PATH parameter and for a
+# SPACE one — so the strict form admits both. The KNOWN RESIDUAL (``+ , ' # @``,
+# non-ASCII, raw whitespace runs) is agent-infra#3691's and is NOT a licence to
+# collapse the split either way.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
 # A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the

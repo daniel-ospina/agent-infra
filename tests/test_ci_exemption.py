@@ -1011,7 +1011,7 @@ def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
     `test_no_runner_or_hook_wrapper_is_ever_an_identity` (`#` and `'`). Those ids
     are permanently BLOCKed — the deadlock #3686 reported is STILL LIVE for them,
     and #3686 closed only for `/` and space, so the remainder is tracked separately
-    as agent-infra#3700. `test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS`
+    as agent-infra#3691. `test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS`
     pins that consequence so no lane can read this split as the end of the work.
 
     What the loop below asserts is what the predicates must keep doing: an id
@@ -1044,7 +1044,8 @@ def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
 
 
 #: ⛔ THE MEASURED **OPEN** REMAINDER OF #3686 — a pin on a HOLE, not a virtue.
-#: Tracked as agent-infra#3700; #3686 itself closed for `/` and space only.
+#: Tracked as agent-infra#3691 (whose scope is the whole residual class);
+#: #3686 itself closed for `/` and space only, and the space class is closed HERE.
 #:
 #: Every id below was COLLECTED from this repo's shipped suites (``pytest tests/
 #: scripts/test_pr_doctor.py --collect-only``), never invented, and every one is
@@ -1065,7 +1066,7 @@ _STRICT_FORM_RESIDUAL_IDS = (
 
 
 def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
-    """⛔ THIS LEG PINS A DEFECT THAT IS STILL THERE. DELETE IT WHEN #3700 CLOSES.
+    """⛔ THIS LEG PINS A DEFECT THAT IS STILL THERE. DELETE IT WHEN #3691 CLOSES.
 
     The strict form gates MAIN's rate table and still does not admit `+ , ' # @`,
     so for an id carrying one of them main's row is dropped, the PR-side failure
@@ -1078,9 +1079,9 @@ def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
     So this leg reds in BOTH directions it must:
 
     * a lane WIDENING `rest` to admit one of these characters → the
-      `not is_failure_key` assertion below fails, which is agent-infra#3700 being
+      `not is_failure_key` assertion below fails, which is agent-infra#3691 being
       CLOSED: delete this test and the "NOT THE WHOLE PARAMETER SPACE" paragraph
-      in `_NODEID_RE`'s comment, and record the closure on #3700;
+      in `_NODEID_RE`'s comment, and record the closure on #3691;
     * a lane NARROWING the strict form further, or re-opening the `_RATES_RE` door
       → `main.rejected` no longer holds the row, so the deadlock these ids pin has
       moved and the measurement here is stale.
@@ -1094,7 +1095,7 @@ def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
         assert not is_failure_key(nodeid), (
             f"{nodeid!r} is no longer a strict-form residual — `_NODEID_RE` has "
             "been widened. If that was deliberate, DELETE this leg and the "
-            "residual paragraph in its comment, and record the closure on #3700"
+            "residual paragraph in its comment, and record the closure on #3691"
         )
         row = f"{nodeid}\t3\t26"
         main = parse_rates(f"{row}\n")
@@ -3649,6 +3650,192 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
         assert is_failure_key_loose(key), f"parse_failure_rows would DROP the PR row for {key}"
 
 
+# ── the row door must admit a PATH inside the parameter space (tortoise#11365) ──
+#
+# THE DEFECT. A pytest parameter legitimately carries a PATH —
+# `tests/test_entry_point_python_guard.py` is parametrized over `tools/<name>.py`,
+# so its ids read `::test_...[tools/cache_evict.py]`. `_NODEID_RE.rest` admitted
+# `[`/`]`/`.`/`:`/`-` — the parameter-SYNTAX characters, NOT the whole parameter
+# space — but NOT `/`. So `is_failure_key`
+# (which gates `parse_rates`, i.e. MAIN's table) rejected every such id, while the
+# PR side's `is_failure_key_loose` accepted it.
+#
+# WHY IT IS NOT COSMETIC. A rejected main-side row is DROPPED, so the id has no
+# main rate and is therefore not exempt — the PR's failure reads as PR-unique
+# forever. That is the exact asymmetry `is_failure_key`'s own docstring names:
+# "a dropped main-side row makes the PR-side failure look unique, which BLOCKS".
+#
+# MEASURED (tortoise#11365, head 28ea11a4d5ac). `main`'s rate table carried ten
+# `test_entry_point_python_guard.py` rows — that table is a UNION over 10 runs
+# (five tools × two arms) — and `parse_rates` accepted 0 of the 10 and rejected
+# all 10. `VERDICT BLOCK blocked=6` then named SIX of them against a PR whose
+# diff touches none of those files, while the eleven
+# non-path-parameterized main-reds on the SAME run were correctly EXEMPT. The
+# required `python-ci-gate` then reds, which permanently BLOCKs any PR that
+# touches none of those files.
+#
+# ⛔ SIX ARE NAMED, NOT TEN — do not write "ten tests fail on main". Ten is the
+# RATE-TABLE row count over the union window; the four rows outside the six are
+# carry-over from earlier runs in that window and were not failing on this run.
+# `blocked=6` is the same run's own count of what was actually red. Earlier
+# revisions of this note said "the same ten tests fail on origin/main itself"
+# and cited a `10 failed, 955 passed` worktree run. That citation is deleted
+# rather than reworded: `955 passed` is a WHOLE-SUITE total, not this test
+# module's count, so quoting it as a per-file measurement was wrong on its face.
+# No per-file test count is stated here, because every number written into this
+# block is a claim the next reader is entitled to check — and a bare count
+# invites the local module's own count to be read as the tortoise file's.
+#
+# ⛔ NOT the trunk repair — and NOT the "inverse" either. The sentence here used
+# to read that this "deadlocks the very PR that repairs the trunk (tortoise#11262 /
+# tortoise#11255 is the same class)". That claim is not SUPPORTED by measurement,
+# and this note does not replace it with its opposite, because the measurement
+# does not reach that far either. What IS measured: tortoise#11262's
+# `6c7a15f2a5` carries a `ci-introduced-failure` check-run whose status is
+# **queued** and whose conclusion is `null` — it has never completed — while the
+# other probed commits carry no such run. A queued run certifies nothing, so the
+# predicate has returned NO VERDICT on that PR and its check cannot be cited
+# either way. The basis for "can land" is agent-infra#3686's own table
+# (`#11262 … can land`, naming #11217 as the one BLOCKED by this defect) — not
+# this note, and not any claim about #11262's redness.
+#
+# (An earlier revision of this paragraph said the check-run was absent "AT ALL"
+# and concluded the predicate "never ran" there. That was FALSE: the check-run
+# exists and is queued. It was missed because a `filter=all` read taken before
+# the job starts has no check-run OBJECT yet, so grepping the response for the
+# NAME returns nothing and reads exactly like "it does not exist". Absence of a
+# check-run is not absence of a dispatch — a distinction this block exists for.)
+#
+# ⛔ This note deliberately does NOT say WHICH change landed the corpus guards.
+# #3686's table credits #11262 with "all 3 guards"; I could not reconcile that
+# with #11262's own diff, so no provenance claim is made here. (An earlier
+# revision of this note tried to, and got it wrong in a way worth recording:
+# it enumerated #11262's files and then said it "touches no corpus file" — but
+# `tools/ci_selection.py` IS a corpus file, because tortoise's
+# `CORPUS_DIRS = ("tools", "graph-scripts")`. The enumeration was also already
+# stale — #11262 had moved.) Nothing above depends on the answer, and an
+# unverified provenance sentence is exactly the defect this block exists to
+# prevent — so it is dropped, not restated.
+
+_PATH_PARAM_IDS = (
+    "tests/test_entry_point_python_guard.py"
+    "::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
+    "tests/test_entry_point_python_guard.py"
+    "::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/test_design_map_check.py]",
+    # a SIBLING directory parameter at the same depth (graph-scripts/ is a peer of
+    # tools/, not a level below it) — the shape is unchanged, the nesting is not.
+    "tests/test_entry_point_python_guard.py"
+    "::test_entry_point_guards_the_interpreter_before_its_imports"
+    "[graph-scripts/2146_e2e_live_orphan_cleanup.py]",
+)
+
+
+def test_11365_the_row_door_admits_a_path_in_the_parameter_space():
+    """BOTH doors must admit a path-bearing parameter, or main's row is dropped."""
+    for key in _PATH_PARAM_IDS:
+        assert is_failure_key(key), (
+            f"`parse_rates` DROPS main's row for {key!r}: the id then has no main "
+            "rate and is never exempt, so an identical failure reads as PR-unique"
+        )
+        assert is_failure_key_loose(key), (
+            f"`parse_failure_rows` DROPS the PR's own row for {key!r}"
+        )
+
+
+def test_11365_a_main_red_with_a_path_parameter_is_EXEMPT_not_BLOCKED():
+    """The VERDICT, not the parse: a main-red must not read as PR-introduced.
+
+    ⛔ EVERY input goes through the real WIRE PARSER (`parse_rates` for main's
+    table, `parse_failure_rows` for the PR's). Constructing `main_rates` as a
+    dict instead would BYPASS the defect this test exists for — measured: the
+    dict-shaped version of this test stayed GREEN with the regex fix reverted,
+    because `parse_rates` (the door that drops the row) was never exercised.
+    """
+    key = _PATH_PARAM_IDS[0]
+    sig = (
+        "AssertionError: tools/cache_evict.py: the #5128 interpreter guard is not "
+        "the first statement after the docstring"
+    )
+    # main: 3/25 — measurably red, exactly as tortoise#11365's table carries it.
+    main_rates = parse_rates(f"{key}\t3\t25").rates
+    assert main_rates.get(key), (
+        "`parse_rates` DROPPED main's row — that is the whole defect; without a "
+        "main rate the id can never be exempt"
+    )
+    pr_rows = parse_failure_rows(f"{key}\t1\t1\t{sig}").failures
+    assert key in pr_rows, "the PR's own row must parse (that door is loose by design)"
+    main_signatures = {
+        k: frozenset({sig}) for k in parse_signature_rows(f"{key}\t{sig}")
+    }
+    assert key in main_signatures, "main's signature row must parse for the overlap test"
+
+    decision = decide(
+        pr_rows,
+        main_rates,
+        main_signatures=main_signatures,
+        k_pr=1,
+    )
+    assert not decision.blocked, (
+        "a failure main is measurably red for (3/25) was BLOCKED as introduced by "
+        f"the PR: {[v.line for v in decision.blocked]}"
+    )
+    assert any(key in line for line in decision.visible_exemptions()), (
+        "the main-red must be visibly EXEMPT, not merely absent from `blocked`"
+    )
+
+
+def test_11365_the_widened_tail_still_fails_closed_on_junk():
+    r"""NON-VACUITY: admitting `/` must not turn the rate door into a wildcard.
+
+    ⛔ "Unbalanced bracket" is deliberately NOT asserted: `[` was already in `rest`
+    before this change, so `test_x[a` was and remains admitted. Pinning it would pin
+    a narrowing the door never had.
+
+    ⛔ TWO DOORS, AND A KNOWN RESIDUAL. `rest` is an allowlist; an id outside it
+    is dropped from MAIN's rate table and BLOCKs. The set is open-ended — do not
+    enumerate it. The whole discussion (which door, why a whitespace id has three,
+    what pytest escapes) lives in `scripts/ci_exemption.py`'s `_NODEID_RE` block;
+    it is NOT restated here, because two copies of "measured" prose drift — the
+    first draft of this pair already disagreed with itself on the character set.
+    """
+    # ── genuinely NOT ids — never emitted, so no door should name them ──
+    for junk in (
+        "tests/test_a.py::",                  # empty tail
+        "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
+        "random-string",                      # not a nodeid at all
+        # a RAW tab byte: pytest renders a tab param as [a\tb] (backslash + `t`), so
+        # the raw byte is not an id and BOTH doors refuse it — `is_failure_key_loose`
+        # is False too, which is what makes it junk rather than residual.
+        "tests/test_a.py::test_x[a\tb]",
+    ):
+        assert not is_failure_key(junk), f"{junk!r} must NOT buy a rate row"
+
+    # ── REAL ids the strict door drops: the RESIDUAL.
+    # Each class is its OWN entry, asserted on its own, because a single block with
+    # one "delete when fixed" message let a space-only fix delete the guards for the
+    # other three. All of them are tracked by agent-infra#3691 (scope widened there).
+    #
+    # ⛔ SPACE WAS HERE AND WAS REMOVED BY #3686's OWN BRANCH (#3687), exactly as the
+    # per-entry message below instructs: the space class is CLOSED — `rest` admits a
+    # space, `_RATES_RE` delimits on the tab, and the producer no longer re-keys the
+    # row through `awk $1=""`. Entry removed ALONE; the three below are separate
+    # classes and are still open. `[a b]` is covered on the ACCEPTING side by
+    # `test_a_SPACE_PARAMETRIZED_nodeid_survives_BOTH_doors` and
+    # `test_a_SPACE_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED`.
+    for residual in (
+        "tests/test_a.py::test_x[a,b]",       # COMMA
+        "tests/test_a.py::test_x[a;b]",       # SEMICOLON
+        r"tests/test_a.py::test_x[a\tb]",     # ESCAPED TAB (as pytest emits it)
+    ):
+        assert is_failure_key_loose(residual), (
+            f"{residual!r} must be a REAL id (the loose/PR door names it), else it "
+            "belongs in the junk loop above, not here"
+        )
+        assert not is_failure_key(residual), (
+            f"RESIDUAL CLOSED for {residual!r}: the strict door now ACCEPTS it. "
+            "Remove THIS entry only — the other classes are separate and are not "
+            "fixed by closing this one (see agent-infra#3691)."
+        )
 
 
 def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
