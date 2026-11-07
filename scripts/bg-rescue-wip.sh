@@ -210,7 +210,13 @@ loud() {
 vunmeasured() { echo "bg-rescue-wip: $*" >&2; [ "$VERDICT_ONLY" -eq 1 ] && { echo 'verdict=cannot-verify'; exit 2; }; exit 1; }
 
 TOP="$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null)" || vunmeasured "not a worktree: $WT"
-HERE_R="$(cd "$WT" 2>/dev/null && pwd -P)" || vunmeasured "not a directory: $WT"
+# ⛔ ONE BRANCH, NOT TWO (#3588 review, cycle 8). The old `not a directory` arm was UNREACHABLE: every
+# path that cannot be entered already fails `git -C … rev-parse --show-toplevel` above — a FILE, a missing
+# path and a permission-denied dir all die there (verified with /etc/hostname) — so that arm could never
+# fire and the mutation pass found no arm that could redden it, i.e. it was dead weight in exactly the way
+# an unassertable guard always is. The reachable successor of the same condition is KEPT (and is now
+# graded by V10), so a path we cannot enter still answers UNMEASURED rather than `dirty`.
+HERE_R="$(cd "$WT" 2>/dev/null && pwd -P)" || vunmeasured "not a worktree root: $WT (that path cannot be entered)"
 TOP_R="$(cd "$TOP" 2>/dev/null && pwd -P)"
 if [ "$HERE_R" != "$TOP_R" ]; then
   vunmeasured "not a worktree root: $WT (that path is inside the worktree at $TOP)"
