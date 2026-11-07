@@ -475,8 +475,14 @@ STG_LVL_TMP=""
 # ⛔ THIS ARM WRITES THAT ARRANGEMENT ITSELF — it does NOT read the shipped loop, and the earlier text
 # here said otherwise (sixth fresh-context review, P3 — measured: deleting the shipped TOP-OF-ROW
 # `stg_lvl_settle` leaves this arm green). The shipped settle sites are graded by §9.1c, which reads
-# `orch-loop.sh`; the top-of-row one is deliberately not, because the next row's `stg_lvl_start`
-# settles it anyway and the observable loss is a bounded per-row sliver.
+# `orch-loop.sh`; the top-of-row one is graded separately, by §9.1d-xi below.
+# ⛔ AND THE REASON IT IS NEEDED IS THE OPPOSITE OF WHAT THIS COMMENT USED TO SAY (fresh-context review,
+# P3 — driven). It claimed the next row's `stg_lvl_start` settles it anyway and the loss is "a bounded
+# per-row sliver". Removing it does not LOSE a sliver, it ADDS the next row's head into the previous
+# row's level: driven through the shipped clock, two rows of [1 s head][1 s l3 work][continue] report
+# `l3_fix=1001 ms` WITH the settle and `l3_fix=2004 ms` WITHOUT it. In production that extra second is
+# the next row's `HEAD_N=$(gh pr view …)` (plus `gh pr ready` for a draft) — a network round trip
+# charged to a cascade level of a DIFFERENT PR, which is the #2028 class this field exists to end.
 STG_LVL_TMP="$TMP/lvlq2"; : >"$STG_LVL_TMP"
 STG_V_l2_merge=0; STG_OPEN_LVL=""; STG_OPEN_T0=0
 printf 'r1\nr2\nr3\n' | while read -r _prow; do
@@ -874,6 +880,43 @@ stg_field _ov_f
 _ov_v="$(cycle_stage_get "stages=$_ov_f" l4_review 2>/dev/null || echo X)"
 ck "a stg_mark naming an OVERLAY is refused, so no tiled span can be added to a cascade level (l4_review='${_ov_v:-?}')" \
    "$(if [ "${_ov_v:-x}" = "ns" ]; then echo 0; else echo 1; fi)"
+# ⛔ EVERY ONE OF THE THREE REVIEW-CLASSIFIER FIX-SIDE BRANCHES MUST OPEN LEVEL 3 ITSELF (fresh-context
+# review, P2 — measured). The arms below `_armlvl_bad` cover the `case` arms and the actuators OUTSIDE
+# the classifier, but NOT these three — and deleting each of them left the suite at 115/0. With the
+# `stg_lvl_settle` before `review_disp_decide` in place, a deleted open here closes level 3 for the whole
+# classifier region, so a cycle that spawned three fixers reports `l3_fix:ns` while its seconds land in
+# `sweep` as "no cascade level was the active work" — the field's headline question answered wrongly,
+# with every check green. Same vacuity shape §9.1d-v documents catching twice.
+_cls_l3="$(awk '
+  /if \[ "\$_fix_eligible" = "1" \]; then/ { sec=1; next }
+  /elif \[ "\$NF" -ge/ { sec=2; next }
+  /elif \[ "\$_rgs" = "NEEDS-FIX" \]; then/ { sec=3; next }
+  /elif \[ -z / { sec=0; next }
+  /^[[:space:]]*stg_lvl_start l3_fix/ && sec>0 { seen[sec]=1 }
+  END { for (i=1;i<=3;i++) if (!seen[i]) miss = miss " " i; print (miss=="" ? "all" : "MISSING:" miss) }' <<<"$_loop_tc")"
+ck "all THREE review-classifier fix-side branches open level 3 themselves (spawn/cap-park/capacity-wait -> '${_cls_l3:-?}')" \
+   "$(if [ "${_cls_l3:-}" = "all" ]; then echo 0; else echo 1; fi)"
+# ⛔ AND THE PER-PR-BODY `sweep` MARK IS ITS OWN ARM (fresh-context review, P2 — measured). `sweep` is
+# marked TWICE (the listing, then the per-PR body) and the "every TILED stage has a call site" arm is
+# satisfied by the listing alone — so deleting the second left the suite at 115/0. With it gone, the
+# interval from `caches` to `gate` (the ownership scan, the selection order and the ENTIRE PR sweep —
+# the largest span of any cycle, and where the 161-minute cycles live) is booked to `gate`: a record
+# reading `sweep:2, gate:5760`, i.e. exactly the P1 this PR fixed, reintroducible by one deleted line.
+_sp_body="$(awk '
+  /^[[:space:]]*stg_mark caches/ { c=NR }
+  /^[[:space:]]*stg_mark gate/   { if (!g) g=NR }
+  /^[[:space:]]*stg_mark sweep/ && c && NR>c && (g==0 || NR<g) { f=1 }
+  END { print (f?"present":"MISSING") }' <<<"$_loop_tc")"
+ck "the PER-PR-BODY sweep mark exists between 'caches' and 'gate', so the PR sweep is not booked to gate ('${_sp_body:-?}')" \
+   "$(if [ "${_sp_body:-}" = "present" ]; then echo 0; else echo 1; fi)"
+# ⛔ AND THE TOP-OF-ROW SETTLE IS GRADED (fresh-context review, P3 — driven). Removing it ADDS the next
+# row's `HEAD_N=$(gh pr view …)` to the PREVIOUS row's level (measured 1001 ms vs 2004 ms over two rows).
+_row_settle="$(awk '
+  /^[[:space:]]*\[ -z "\$\{PR:-\}" \] && continue/ { if (prev ~ /^[[:space:]]*stg_lvl_settle/) ok=1 }
+  { prev=$0 }
+  END { print (ok?"present":"MISSING") }' <<<"$_loop_tc")"
+ck "the TOP-OF-ROW stg_lvl_settle is present, so a previous row's level cannot adopt the next row's HEAD read ('${_row_settle:-?}')" \
+   "$(if [ "${_row_settle:-}" = "present" ]; then echo 0; else echo 1; fi)"
 
 # 9.1e `stg_field` FOLDS BEFORE IT EMITS — driven, not grepped.
 # The post-`done` fold is not the last word: an overlay interval that closes at TOP level afterwards is
