@@ -1085,6 +1085,25 @@ _o40="$(HOME="$T" OR=acme/stale bash "$MU/pr-doctor-machine.sh" 2>&1)"
 E40="OR='acme/stale' could not be normalised"
 ck "m40 an UNLOADABLE sibling does not make the wrapper quote the strip SENTINEL as a seam value" \
    'grep -qF "$E40" <<<"$_o40" && ! grep -q "__UNASKABLE__" <<<"$_o40"'
+# ⛔ RANK 2'S SENTINEL IS A REFUSAL, NOT A CLAIM TO GRADE — AND IT WAS THE ONE ARMLESS BRANCH THAT
+# COULD PRODUCE A FALSE PASS (review at `d84f3b5d9`, P1). Deleting the `_seam_n = "__UNASKABLE__"`
+# branch leaves the sentinel NON-EMPTY, so it falls past the `-z` arm into the `else` that PRINTS
+# "Grading the ONE repo this unit declares in PR_DOCTOR_REPO=__UNASKABLE__" and moves the exit code
+# 2 -> 1. That is not a diagnosis defect like its siblings: the wrapper claims a pass over a repo it
+# never resolved, which is the one shape that must never read as green.
+# ⛔ f21-f24 DO DRIVE RANK 2 AND STILL DO NOT REACH THIS BRANCH: every one of them uses a LOADABLE
+# doctor, so `_rs_normalize_slug` answers a real slug or "" and `__UNASKABLE__` is unreachable. Only an
+# UNLOADABLE sibling reaches it — measured: with the branch replaced by `if false`, the suite stayed
+# at zero reds. m39/m40 drive `OR` (rank 3); this pair is the rank-2 half.
+MS="$T/wraprank2"; mkdir -p "$MS/lib"
+cp "$READER" "$MS/lib/repo-set.sh"
+cp "$WRAPPER" "$MS/pr-doctor-machine.sh"
+printf 'def broken(:\n' > "$MS/pr-doctor.py"   # present, but the sibling will not LOAD
+_o_m2="$(HOME="$T" PR_DOCTOR_REPO=acme/stale bash "$MS/pr-doctor-machine.sh" 2>&1)"; _rc_m2=$?
+ck "m41 an unnormalisable rank-2 PR_DOCTOR_REPO is a REFUSAL quoting the seam, at exit 2" \
+   'grep -qE "PR_DOCTOR_REPO=[^ ]*acme/stale[^ ]* could not be normalised" <<<"$_o_m2" && [ "$_rc_m2" = 2 ]'
+ck "m42 …and it never prints a POSITIVE 'Grading the ONE repo' claim, nor quotes the sentinel" \
+   '! grep -q "Grading the ONE repo" <<<"$_o_m2" && ! grep -q "__UNASKABLE__" <<<"$_o_m2"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
