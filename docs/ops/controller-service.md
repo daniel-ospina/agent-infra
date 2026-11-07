@@ -112,7 +112,12 @@ commit it actually holds, so a scratch named with an unrelated commit id is refu
 under a transient root is admitted only when it is checked out on its **default** branch: a clone on any
 other branch is unmerged work a lane removes, so a lane that isolates by cloning instead of
 `git worktree add` is refused exactly like a linked worktree on a branch, while `/tmp/cell-ai` on `main`
-keeps installing.
+keeps installing. ⛔ **That branch question is asked for a clone under a TRANSIENT root only** — the walk
+returns "durable" for a path outside every temporary root before any clone rule is consulted (linked
+worktrees are the shape refused *wherever* they live). So a **primary** clone under a durable root (say
+`~/agent-infra`) on a lane branch is **admitted**, and the pin records which revision the unit then runs. That
+is a stated limit, not coverage: the fleet's clones live under `/tmp` (`/tmp/cell-ai`) or under their owning
+lane's checkout, which is the transient shape this rule does cover.
 
 **And a DETACHED primary clone is graded, not waved through.** A detached HEAD has no branch name to grade,
 so the helper used to read it as "nothing to be unmerged at" and admit it — which armed a unit at a clone a

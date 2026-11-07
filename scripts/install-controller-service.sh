@@ -484,6 +484,15 @@ primary_clone_root() {
 # `AGENT_INFRA_PATH` naming it rendered an ExecStart into it, rc=0. A clone at the DEFAULT branch is a
 # deployment (`/tmp/cell-ai` on `main` must keep working); a clone on any other branch is unmerged work a
 # lane removes, which is the rule this guard already states in words for every other shape.
+# ⛔ NAMED RESIDUAL — THIS HELPER IS ONLY ASKED ABOUT A CLONE UNDER A TRANSIENT ROOT (review-9 P2, MEASURED).
+# Both call sites sit AFTER `scratch_supervisor_reason`'s `[ -n "$root" ] || return 1`, which returns "durable"
+# for a path outside every temporary root before any clone rule is consulted. So a PRIMARY clone under a
+# durable root (`~/agent-infra`) checked out on a lane branch is ADMITTED. That is the same walk that keeps
+# linked worktrees refused *wherever* they live, so the asymmetry is deliberate rather than an oversight: a
+# linked worktree is removed with `worktree remove` the moment its lane ends, whereas a durable primary clone
+# is a checkout the operator owns and keeps — the thing #2697 is about is a PATH THAT DISAPPEARS, and a
+# durable path does not. The pin records which revision such a unit then runs. Stated here, and in
+# `docs/ops/controller-service.md`, rather than claimed closed.
 primary_clone_on_lane_branch() {
     local b def ref rc
     b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || b=""
@@ -895,7 +904,22 @@ supervisor_pin() {
     # assignment — while `verify_unit`'s `grep -qxF` matched the RAW TEXT and passed. So the unit ships with no
     # pin and the gate that exists to notice says OK. The pin is an OBSERVATION, never a gate, so degrading it
     # to `unknown@unknown` costs nothing and keeps the diagnostic honest.
-    case "$repo" in *[[:space:]]*|*'"'*|*"'"*|*\\*|*%*|*'$'*) repo="" ;; esac
+    # ⛔ THE DERIVED `<repo>` NEEDS NO CHARACTER GRADE OF ITS OWN — AND THE ONE THAT USED TO SIT HERE WAS DEAD
+    # CODE THAT ALSO SHIPPED AN UNDOCUMENTED SPELLING (review-9 P2, MEASURED). The cycle-6 grade existed because
+    # `--absolute-git-dir` can answer a path outside the tree; it emptied `repo` and left `sha` holding a valid
+    # `HEAD`, so the artifact read `unknown@<sha>` — a THIRD spelling this comment did not predict and
+    # `docs/ops/controller-service.md` does not document (it promises `<repo>@<sha>` or `unknown@unknown`).
+    # ⛔ AND DELETING IT LOSES NOTHING, because the byte read ABOVE already covers every shape that could reach
+    # it. A `repo` containing whitespace, a quote, a backslash, `%` or `$` is exactly the class
+    # `resolve_supervisor` refuses on the SUPERVISOR PATH, so there are only two cases and both are safe:
+    #   (a) the supervisor lives under that `repo` -> its own path carries the character -> refused before this
+    #       function is ever called;
+    #   (b) it does not -> `rel` ABOVE stays ABSOLUTE, `rev-parse "HEAD:$rel"` fails, `dirt_rc=1`, and the whole
+    #       pin degrades to `unknown@unknown` — the documented spelling.
+    # Measured: an end-to-end fixture (a work tree whose `.git` file points at a bare gitdir under a SPACED path,
+    # so `--show-toplevel` fails and `--absolute-git-dir` answers the spaced path) yields `unknown@unknown` with
+    # the grade, without it, and with only its `repo` half — i.e. the grade never decided anything (an INERT
+    # ENFORCER). §P3 pins that fixture end to end, so a regression that renders a spaced `<repo>` goes RED.
     [ -n "$repo" ] || repo="unknown"
     # ⛔ A SHA THAT CANNOT BE CORROBORATED IS NOT A SHA (review-7 P2). If the dirty read failed we cannot say
     # whether `<sha>` describes the bytes the unit boots, and recording it anyway is the confident-wrong-answer

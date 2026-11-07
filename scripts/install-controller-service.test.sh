@@ -1945,7 +1945,7 @@ PR3="$(arm_root pr3)"; mk_systemctl "$PR3/bin" "$PR3/state" "$PR3/sc.log"; mk_tm
 SUP_EXTRA_ENV="ORCH_AUTOMATED_RESTART=1" sup pr3 start > "$T/pr3.out" 2>&1; PR3_RC=$?
 [ "$PR3_RC" -eq 4 ] \
   && ok 'start: an `activating` unit is NOT re-armed (rc=4 — the RestartSec window is not a running controller)' \
-  || bad "start: re-armed/continued on an `activating` unit — rc=$PR3_RC $(tail -3 "$T/pr3.out")"
+  || bad "start: re-armed/continued on an activating unit (the RestartSec window is not a running controller) — rc=$PR3_RC $(tail -3 "$T/pr3.out")"
 grep -q 'reset-failed' "$PR3/sc.log" 2>/dev/null \
   && bad 'start: CLEARED the start limit while the unit was still activating — every 120 s doctor pass re-opens the endless retry' \
   || ok 'start: the start limit is left alone while the unit is activating (convergence to failed stays reachable)'
@@ -2688,7 +2688,7 @@ O_SAY="$(env PATH="$O/bin:/usr/bin:/bin" bash -c 'command -v say' 2>/dev/null)"
 O_OK=0
 case "$O_SAY" in
   "$O/bin/say") O_OK=1; ok '§O: `say` on the fragment PATH IS the recorder, so the arms below record and never speak' ;;
-  *) bad "§O: refusing the arms below — `say` resolves to '${O_SAY:-<none>}', not the recorder at $O/bin/say" ;;
+  *) bad "§O: refusing the arms below — say resolves to '${O_SAY:-<none>}', not the recorder at $O/bin/say (an unrecorded §O arm cannot tell a pass from a failure)" ;;
 esac
 
 # ⛔ (2b) THE RECORDER IS PROVEN LIVE, so "0 calls" below is a MEASUREMENT and not an empty file nobody
@@ -3493,6 +3493,49 @@ else
   else
     bad "§P3: a HAND-EDITED supervisor on a bare-configured clone recorded a confident revision — expected $PPB_REPO@$PPB_SHA+dirty, got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPB/units/eldato-orchestrator.service" 2>/dev/null)"
   fi
+fi
+# ⛔ A `<repo>` SYSTEMD CANNOT CARRY DEGRADES THE WHOLE PIN, END TO END (review-9 P2, MEASURED). This arm
+# exists because the previous round's two attempts at it were both VACUOUS and the measurements proved it: an
+# END-TO-END fixture cannot discriminate the old `repo` character grade (in this shape `rel` stays absolute, the
+# byte read fails, and `dirt_rc=1` already routes the pin to `unknown@unknown` — deleting the grade changed
+# nothing, 404/0 either way), and a SOURCING arm could not even see the function: the installer's source guard
+# is `return 0`, so nothing is defined, and backticks inside its double-quoted messages died on a syntax error,
+# leaving an arm that could only ever print GREEN. So the grade was DELETED (it was an inert enforcer — see the
+# proof at `supervisor_pin`), and this arm pins the BEHAVIOUR that remains, end to end:
+#
+#   a spaced `<repo>` must render `unknown@unknown`, never `<spaced repo>@<sha>`.
+#
+# A rendered spaced `<repo>` is a FALSE PASS in the pin this PR adds: systemd DROPS that `Environment=` line as
+# an invalid assignment while `verify_unit`'s `grep -qxF` matches the RAW text and reports OK, so the unit ships
+# with no pin and the gate that exists to notice says fine. The shape: a work tree whose `.git` FILE points at a
+# bare-configured gitdir under a SPACED path, supervisor at a CLEAN path. `--show-toplevel` fails (no work
+# tree), `--absolute-git-dir` answers the spaced path, and `git_dirs` still says "main" because
+# `--git-common-dir` answers that SAME path — so the supervisor is admitted and the pin has to cope with it.
+PPC="$(arm_root ppc)"; mk_systemctl "$PPC/bin" "$PPC/state" "$PPC/sc.log"; mk_tmux "$PPC/bin" "$PPC/tmux.log"
+PPC_HUB="$PPC/home/hub"; mkdir -p "$PPC_HUB/scripts"
+cp "$SUP" "$PPC_HUB/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPC_HUB" 2>/dev/null
+git -C "$PPC_HUB" add -A >/dev/null 2>&1
+git -C "$PPC_HUB" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PPC_BARE="$PPC/home/bare dir.git"
+PPC_WT="$PPC/home/wt"
+PPC_SUP="$PPC_WT/scripts/cloud-cell-supervisor.sh"
+if git clone -q --bare "$PPC_HUB" "$PPC_BARE" 2>/dev/null; then
+  mkdir -p "$PPC_WT/scripts"
+  cp "$SUP" "$PPC_SUP"
+  printf 'gitdir: %s\n' "$PPC_BARE" > "$PPC_WT/.git"
+  if [ -n "$(git -C "$PPC_WT/scripts" rev-parse --show-toplevel 2>/dev/null)" ]; then
+    bad '§P3: the spaced-git-dir fixture still reported a top level, so the spaced-repo pin arm did NOT run'
+  else
+    PPC_RC=0; PPC_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPC_SUP" inst ppc --install 2>&1)" || PPC_RC=$?
+    [ "$PPC_RC" -eq 0 ] && ok '§P3: a git-dir path systemd cannot carry still installs (the pin is an observation, never a gate)' \
+                       || bad "§P3: a spaced git-dir path refused the install — the pin must never withhold a supervisor: $PPC_OUT"
+    grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPC/units/eldato-orchestrator.service" 2>/dev/null \
+      && ok '§P3: and a spaced repo path degrades the whole pin to unknown@unknown, the spelling the doc promises' \
+      || bad "§P3: a spaced repo path rendered a pin systemd would DROP while verify_unit says OK (a false PASS) — expected unknown@unknown, got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPC/units/eldato-orchestrator.service" 2>/dev/null)"
+  fi
+else
+  bad '§P3: the spaced-git-dir fixture could not be built, so the spaced-repo pin arm did NOT run'
 fi
 # ⛔ AND A UNIT RENDERED BEFORE THE PIN EXISTED DOES NOT BREAK --status: the line reports `absent` and the
 # verdict is untouched, because supervision is not the pin.
