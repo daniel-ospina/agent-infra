@@ -513,6 +513,20 @@ if sys.argv[2] == "builtin":
         _v = BUILTIN_ENV.get(_p)
         if _v:
             print("certain:" + ",".join(_v))
+        elif _p in OAUTH_PROVIDERS:
+            # ⛔ "IN NO ENV TABLE" IS NOT "pi DOES NOT SHIP IT" (round 36 review, P1, measured). An OAUTH-ONLY
+            # provider (`openai-codex`) has no `envApiKeys` entry at all, so every table above answers NOTHING for
+            # it — the SAME empty stdout a provider pi does not ship produces. The empty answer was therefore
+            # overloading two facts, and `key_gate_builtin_unshipped` (which refuses 82) read this one as "not a
+            # provider pi ships": measured on a `{"providers":{"openai-codex":{...,"models":[{"id":"gpt-5-codex"}]}}}`
+            # fixture, `origin/main` answered `check=warn` + `check=ok var=MYV` while this gate refused 82 with
+            # "`openai-codex` is not a provider pi ships" — a NEW false block, in the same PR that fixed one.
+            # A token keeps the two distinguishable: no caller\x27s `certain:`/`uncertain:`/`noenv:` arm matches it, so
+            # every caller falls to its `*)` cannot-say arm, and `key_gate_builtin_unshipped` (EMPTY stdout) never
+            # fires. A provider in NO table AND no oauth handler stays empty, which is the shape it exists for.
+            print("known:" + _p)
+            print("why:pi ships this provider with an OAuth handler and names no environment variable for it, so no"
+                  " variable is the credential and nothing is asserted here")
     # Each alternative path is emitted with its own verdict, so the caller refuses only when EVERY one is closed AND
     # none of the env variables holds a value - and the refusal can name the paths it checked (round 30, P1).
     for _pid, _label, _preds in BUILTIN_PATHS.get(_p, []):
@@ -1405,6 +1419,9 @@ key_gate_builtin() {
 # key_gate_builtin_unshipped <provider> -> rc 0 IFF the read COMPLETED and pi's table has NO entry for it.
 # This is the predicate for "the answer is a REFUSAL": a failed read must keep the pre-existing `warn`, never
 # refuse. Refusing on an unread datum is the false block this file's header forbids.
+# ⛔ AND "NO ENTRY IN THE ENV TABLE" IS NOT "UNSHIPPED" EITHER (round 36 review, P1, measured): an OAUTH-only
+# provider (`openai-codex`) legitimately answers nothing from every env table, so the python emits a `known:` token
+# for it. Only EMPTY stdout means "pi ships no such provider" — the two facts this predicate needs to separate.
 key_gate_builtin_unshipped() {
   local out
   out="$(key_gate_builtin_probe "${1:-}")" || return 1

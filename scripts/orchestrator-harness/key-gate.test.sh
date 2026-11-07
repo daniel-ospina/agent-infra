@@ -705,6 +705,43 @@ HY3="$(mkhome builtin_noapi '{"providers":{"deepseek":{"apiKey":"$MYV","models":
 OUT="$(run_gate "$HY3" MYV=sk_myv KG_PROV=deepseek KG_MODEL=m1)"
 hasnt "$OUT" "reason=models-json-provider-dropped" \
     "3y11 a BUILT-IN provider with the same shape is NOT reported as dropped — pi composes it (measured: m1 registered, \$MYV used)"
+# ⛔ AN UNREADABLE BUILT-IN TABLE IS CANNOT-SAY, NEVER "pi DOES NOT SHIP THIS PROVIDER" (round 36 review, P1, measured).
+# This is the HEADLINE polarity of the round-35 fix, and it had NO arm at all: reverting `key_gate_builtin_unshipped`
+# to the pre-fix `[ -z "$(key_gate_builtin "…")" ]` (and dropping the `bkind_rc` guard) left this whole suite GREEN
+# — 768 passed — so the false block could return unnoticed. Driven with a STUB `python3` that fails ONLY in `builtin`
+# mode, because no fixture makes the real reader fail; on a SHIPPED provider (`deepseek`) the pre-fix code then
+# refused 82 with "`deepseek` is not a provider pi ships" over a box the unmutated gate answers `check=ok` on.
+mkdir -p "$T/stubkg/bin"
+printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = builtin ] && exit 3; done\nexec %s "$@"\n' "$(command -v python3)" > "$T/stubkg/bin/python3"
+chmod +x "$T/stubkg/bin/python3"
+# ⛔ `mkhome`, not `mkset`: this block is placed with the other 3y arms, ABOVE `mkset`'s definition (line ~1016),
+# so `mkset` is not yet a function here — it returned NOTHING, `$HKG` was empty, and the arm below happily asserted
+# "not refused" about a box that did not exist (measured: the suite stayed green with the discriminator reverted).
+HKG="$(mkhome builtin_unread '{"providers":{"deepseek":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
+printf '%s\n' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}' > "$HKG/.pi/agent/settings.json"
+KG_UNREAD_LANE="$(env -i PATH="$T/stubkg/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HKG" KG_GATE="$KG" KG_HOME="$HKG" KG_PROV=deepseek MYV=sk_myv \
+  bash -c 'set -u; . "$KG_GATE" || exit 99; out="$(key_gate_assert test "$KG_HOME" "${KG_PROV:-}" "${KG_MODEL:-}" 2>&1)"; rc=$?; printf "RC=%s\n%s\n" "$rc" "$out"' 2>&1)"
+KG_UNREAD_RC="$(printf '%s\n' "$KG_UNREAD_LANE" | sed -n 's/^RC=//p' | head -1)"
+ck "3y3e a SHIPPED provider is not refused when the built-in table could not be READ (rc=${KG_UNREAD_RC:-<none>})" \
+   "$([ "${KG_UNREAD_RC:-0}" = "82" ] && echo 1 || echo 0)"
+hasnt "$KG_UNREAD_LANE" "is not a provider pi ships" \
+    "3y3f …and never claims pi does not ship it over a table it did not read"
+KG_UNREAD_PIN="$(env -i PATH="$T/stubkg/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HKG" KG_GATE="$KG" KG_HOME="$HKG" MYV=sk_myv \
+  bash -c 'set -u; . "$KG_GATE" || exit 99; out="$(key_gate_box_default_assert box "$KG_HOME" refused "$PWD" 2>&1)"; rc=$?; printf "RC=%s\n%s\n" "$rc" "$out"' 2>&1)"
+KG_UNREAD_PIN_RC="$(printf '%s\n' "$KG_UNREAD_PIN" | sed -n 's/^RC=//p' | head -1)"
+ck "3y3g …and the PIN path answers the same cannot-say (rc=${KG_UNREAD_PIN_RC:-<none>})" \
+   "$([ "${KG_UNREAD_PIN_RC:-0}" = "82" ] && echo 1 || echo 0)"
+# ⛔ AND "IN NO ENV TABLE" IS NOT "UNSHIPPED" (round 36 review, P1, measured): `openai-codex` is an OAUTH-ONLY
+# provider pi ships — it is in `OAUTH_PROVIDERS`, and `8S4i`'s own text says "pi ships that handler" — but it has no
+# `envApiKeys` entry, so every env table answers NOTHING for it. Reading that empty answer as "not shipped" refused
+# 82 a box `origin/main` answers `check=warn` + `check=ok` on: a NEW false block, in the PR that fixed one.
+HCODX="$(mkhome shipped_oauth_only '{"providers":{"openai-codex":{"apiKey":"$MYV","models":[{"id":"gpt-5-codex"}]}}}')"
+OUT="$(run_gate "$HCODX" MYV=sk_myv KG_PROV=openai-codex)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3y3h an OAUTH-ONLY shipped provider (openai-codex) is NOT refused as unshipped (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 1 || echo 0)"
+hasnt "$OUT" "is not a provider pi ships" \
+    "3y3i …and the sentence is never printed about a provider pi ships"
+
 # ⛔ AND THE `no-baseurl` HALF OF THE COMPOSER MIRROR IS ITS OWN SHAPE (round 29, P3, measured): a model definition that
 # declares `api` but no `baseUrl`, under a provider that declares neither, throws `"baseUrl" is required when defining
 # custom models` — and the old prose described it as "declares neither `api` nor `baseUrl`", which that document
@@ -713,6 +750,12 @@ HY5="$(mkhome dropped_nobase '{"providers":{"myprov":{"apiKey":"$MYV","models":[
 OUT="$(run_gate "$HY5" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
 has "$OUT" "reason=models-json-provider-dropped why=no-baseurl:m1" \
     "3y8b a model with \`api\` but NO \`baseUrl\` is reported as that, not as \"declares neither\""
+# ⛔ AND THE CLAUSE ITSELF IS ASSERTED POSITIVELY (round 36 review, P3, measured): the round-35 commit swapped the
+# positive `has` for the `hasnt` below, so the field-level diagnosis — the whole point of the message — could be
+# deleted (`drop_why=''`) with every arm still green. A `hasnt` proves a wrong sentence is absent; only a `has`
+# proves the right one is present.
+has "$OUT" "declares \`api\` but no \`baseUrl\`" \
+    "3y8d …and NAMES the field that is actually missing (a hasnt alone cannot see the clause vanish)"
 hasnt "$OUT" "declares neither \`api\` nor \`baseUrl\`" \
     "3y8c …never the wrong description, which this document would falsify"
 # \u26d4 AND AN UNSHIPPED PROVIDER WITH `oauth` BUT NO `baseUrl` IS REFUSED, NOT "cannot-say" (round 35, P1, measured): the

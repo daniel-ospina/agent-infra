@@ -83,7 +83,9 @@ provider on the default gateway (pi composes it from `RADIUS_MODELS`, measured: 
 `Error: Unknown provider` and no credential can rescue it, so that shape is REFUSED (`reason=models-json-provider-dropped`)
 with a model-level remedy instead of a variable to export. The vendor strips a trailing `/v1` before normalizing
 the gateway, so `https://radius.pi.dev/v1` IS the default one (measured: pi reaches it); and an UNSHIPPED provider
-with an unbuildable definition is refused too, because pi deletes it (`Error: Unknown provider`). Such a provider also has an oauth handler, so the store
+with an unbuildable definition is refused too, because pi deletes it (`Error: Unknown provider`) — only on a COMPLETED
+read of the table, though: an unread table is cannot-say, and an oauth-only provider pi ships (`openai-codex`) has no
+env entry at all, so neither is mistaken for "pi does not ship it". Such a provider also has an oauth handler, so the store
 refusal below never applies to it.
 ⛔ **AND ONE STORE SHAPE IS REFUSED, NOT SKIPPED** (measured): an `oauth` entry in `auth.json` for a provider `pi` ships NO
 oauth handler for. The handler set is static — `anthropic github-copilot kimi-coding meta openai-codex openai openrouter radius xai`
