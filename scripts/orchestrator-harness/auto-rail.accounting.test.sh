@@ -841,7 +841,8 @@ awk '/the red arm owns this PR"$/{f=1;next} f&&/^[[:space:]]*continue$/{found=1;
 [ "$(_arm red rejected)"  = skip ] || bad "a RED candidate whose only head-bound record is verdict=not-clean must be SKIPPED, not re-reviewed and not railed (got '$(_arm red rejected)')"
 # …and the loop must PUBLISH that state rather than let it read as 'nobody has looked at this': the head
 # HAS been reviewed and rejected, and the remedy is a fix (a new head), which is what the message says.
-grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"'  <<<"$(grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" || true)" \
+_REJPUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head" record$'
+grep -qE "$_REJPUBRE"  <<<"$(grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" || true)" \
   || bad "a NOT-CLEAN record at the head must PUBLISH 'review-found-issues' (head-bound) — otherwise a PR blocked on its own rejected review is indistinguishable from a PR nobody has looked at, which is the #3489 invisibility on the one class where at-head also disables the review arm"
 _empty_arm=$(_arm "" "")
 [ "$_empty_arm" = rail ] || bad "an UNCLASSIFIABLE candidate must default to the RAIL — the arm that spends nothing — never to a paid review (got '$_empty_arm')"
@@ -1147,7 +1148,12 @@ grep -qF '[ "$_att" != rejected ]'  <<<"$_capdef" \
   || bad "the CAP-DEFERRAL publish must EXCLUDE 'rejected' — its text promises a reviewer 'as soon as this repo has a free slot', but review_candidate_arm maps *:rejected to skip, so a not-clean head (TERMINAL — only a new head gets a review) was left carrying a promise no dispatch would keep; under cap saturation the pass never reaches the review-found-issues publish that would correct it, so the false claim stands indefinitely"
 grep -qF 'publish_review_state "$repo" "$pr" awaiting-review'  <<<"$(grep -A2 -F 'if review_should_defer "$_rdispatched"; then' "$SUT" || true)" \
   || bad "the BURST-BOUND deferral must publish 'awaiting-review' — deleted, the suite stayed GREEN and a head queued behind this repo's REVIEW_PER_PASS budget reads as waiting on a lane"
-grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"'  <<<"$(grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' <<<"$_branch" || true)" \
+# ⛔ ANCHORED, NO ARGUMENT CAP (review round 9, P3, measured): the prefix pin was satisfied after `record`
+# was appended to the rc=7 call, which makes the comment claim a record EXISTS for a review that wrote none —
+# contradicting the log line written in the same pass, i.e. exactly the defect the split text removes,
+# mirrored. Ending the pattern at `"$head"` tells the two call sites apart by their argument lists.
+_ISSPUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head"$'
+grep -qE "$_ISSPUBRE" <<<"$(grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' <<<"$_branch" || true)" \
   || bad "the loop must PUBLISH 'review-found-issues' from the '\$_ract -eq 2' / issues arm — the state's TEXT and its marker count are pinned, so deleting this CALL left the suite GREEN while a head the reviewer REJECTED (and which the loop will not re-review) stayed as invisible as #3489"
 # ⛔ AND A REFUSAL MUST HAND THE BUDGET BACK (review round 2, P2): `refused` ignores `$att`, so without
 # this reset a run of load refusals leaves the ledger saturated and the FIRST real review that then
@@ -1297,7 +1303,12 @@ grep -qF '[ "$_rstate" = refused ] && review_forgive_refusal "$_ratt" "$(review_
 # measured): the consumer was pinned but not this line, so `_rattn=0` — or pointing it at the RECORD —
 # left the suite green with the attempt term permanently zero and the paid retry loop unbounded again,
 # while every driven `review_action` arm still passed on a hand-fed `$att`.
-grep -qF '_rattn=$(review_attempts "$_ratt")' "$SUT" \
+# ⛔ ANCHORED, WHOLE LINE (review round 9, P2, measured): a `grep -qF` substring was satisfied by
+# `_rattn=$(review_attempts "$_ratt"); _rattn=0` on the same line, which makes `review_action`'s attempt
+# bound always true and re-dispatches a paid review on EVERY pass for ever — with this pin green. The
+# suite already anchors its other statement pins (`_PUBRE`/`_RBASRE`) for exactly this reason.
+_RATTRE='^[[:space:]]*_rattn=\$\(review_attempts "\$_ratt"\)$'
+grep -qE "$_RATTRE" "$SUT" \
   || bad "the loop must read the attempt count FROM THE HEAD-KEYED LEDGER — a zeroed or misdirected source leaves the count under the cap, so EXHAUSTED is unreachable in the loop and the paid retry is unbounded while the driven arms stay green"
 # ⛔ AND THE LEDGER IS KEYED BY THE HEAD, like the record it bounds (review round 2, P2, measured):
 # dropping the head from the ledger name turns a PER-HOST/PER-HEAD budget into a PR-LIFETIME one, so the
@@ -1946,7 +1957,13 @@ review_action retry "$_d2" 1; _dract=$?
   || bad "with that age the loop must RETRY (review_action returned $_dract, want 1) — otherwise the head is never retried, never exhausted and never re-published"
 # ⛔ AND NOTHING MAY SIT BETWEEN THE CALL AND ITS CONSUMER: an inserted line is how the fallback was discarded
 # while every text pin stayed green.
-_dnext=$(grep -A1 -F '_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?' "$SUT" | sed -n '2p')
+# ⛔ THE CALL LINE ITSELF IS PART OF THE PIN (review round 9, P3, measured): the adjacency arm only checked
+# that nothing sat BETWEEN the call and `review_action`, so appending `; _rage=0` to the call line left both
+# pins green while restoring the permanent-WAIT defect (and printing "the age is 0s measured from …").
+_RAGERE='^[[:space:]]*_rage=\$\(review_dispatch_age "\$_rout"\); _rage_rc=\$\?$'
+grep -qE "$_RAGERE" "$SUT" \
+  || bad 'the age must be taken by review_dispatch_age ALONE, on its own line (_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?) — a trailing statement can overwrite the fallback while every other pin stays green'''
+_dnext=$(grep -A1 -E "$_RAGERE" "$SUT" | sed -n '2p')
 case "$_dnext" in
   *'review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?'*) ;;
   *) bad "the age must reach review_action on the VERY NEXT line (found: '$_dnext') — any line in between can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the call itself still matches its pin" ;;
