@@ -696,11 +696,13 @@ def _commit_body(obj: str) -> str:
 # which is the PERMANENT-HOLD direction: `claim_prune` `continue`s on an unmeasurable age BEFORE the bound
 # is compared, so a peer appending ` > 1 +0000` would hold its claim for ever (#3203 re-opened).
 # ⛔ THE INVARIANT: when this reader measures, it must EQUAL `git log -1 --format=%ct`; it may only
-# ABSTAIN where git is more tolerant than the `$` anchor (a trailing token after the tz digits, a CR
-# before EOL, or a tz field that is not exactly 4 digits — git dates all three, and the `$` anchor
-# refuses the whole line for each) — always the KEEP direction, and A79 pins that decision. The LENGTH
-# and leading-zero arms below abstain on a 13+ digit or leading-zero stamp this pattern itself measures:
-# a second, deliberate class (rounds 19/21), not a disagreement. The shell side is
+# ABSTAIN where git is more tolerant than the `$` anchor (a trailing token or trailing whitespace, a CR
+# before EOL, a tz field that is not exactly 4 digits, and a TAB or NO separator before it — git dates
+# all of those, and the `$` anchor refuses the whole line for each) — always the KEEP direction, and A79
+# pins that decision. The LENGTH and leading-zero arms below abstain on a 13+ digit or leading-zero stamp
+# this pattern itself measures: a second, deliberate class (rounds 19/21, pinned HERE by this suite's
+# 13-digit and `0999` cases; the shell's counterpart leading-zero arm is pinned by `test-claims.sh` A33,
+# and the shell's 12-digit cap has no pin at all), not a disagreement. The shell side is
 # pinned to the same invariant by `test-claims.sh` A88-A92, which assert git's own answer as well as the
 # reader's.
 # ⛔ ANCHORED ON `>` + ANY WHITESPACE, NOT `> ` + EXACTLY ONE SPACE (review round 28, agent-infra#3203).
