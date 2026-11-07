@@ -1511,7 +1511,10 @@ fi
 # ⛔ AND THE MATRIX AXIS IS A COVERAGE CLAIM NOTHING ELSE CHECKS. `BASH_SHARD_SLICE`'s denominator is
 # `strategy.job-total`, so an axis of `[1,1,2]` leaves slice 3 run by NOBODY while every arm still
 # passes its own set assertion (each process only knows its own index). Measured: accepted before.
-printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+# NOTE (#3235 review, P2): these two fixtures declare `fail-fast: false`, because the arm must be
+# diagnosed for ITS OWN defect — without the key the fail-fast refusal (arm (v)) pre-empts the axis
+# diagnosis, and an arm that passes on a different message is a vacuous arm, not a passing one.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
   >"$TMP/ci-pr-axis-dup.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-axis-dup.yml"
 if [ "$RC" -eq 2 ] && grep -q 'shard: \[1, 1, 2\]' <<<"$OUT"; then
@@ -1519,7 +1522,7 @@ if [ "$RC" -eq 2 ] && grep -q 'shard: \[1, 1, 2\]' <<<"$OUT"; then
 else
   fail "a duplicated matrix axis returned rc $RC (want 2): $OUT"
 fi
-printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
   >"$TMP/ci-pr-axis-ok.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-axis-ok.yml"
 if [ "$RC" -eq 0 ]; then
@@ -2026,7 +2029,7 @@ else
     fail "an unmatchable branches filter returned rc $RC (want 2): $OUT"
   fi
 fi
-printf 'name: x\non:\n  push:\n    branches: [main]\njobs:\n  script-validate:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n      - run: bash tests/ci-lane-parity/run.sh\n' \
+printf 'name: x\non:\n  push:\n    branches: [main]\njobs:\n  script-validate:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n      - run: bash tests/ci-lane-parity/run.sh\n' \
   >"$TMP/ci-main-pushok.yml"
 guard_rc "$TMP/ci-main-pushok.yml" "$PR"
 if [ "$RC" -eq 0 ]; then
@@ -2105,6 +2108,49 @@ if [ "$RC" -eq 0 ]; then
   pass "control: defaults.run.working-directory '.' is the identity and is accepted (no false block)"
 else
   fail "'working-directory: .' was refused (rc $RC — want 0): $OUT"
+fi
+
+# ⛔ (v) `fail-fast` WAS UNPINNED (#3235 review, P2, measured at the merge head). The new matrix's
+# own comment calls `fail-fast: false` LOAD-BEARING: with GitHub's default `true`, one arm's genuine
+# failure CANCELS every other arm in progress or queued, and the merge rail reads `cancelled` NON-RED
+# — so the seven arms that never ran read as a non-red slice of a green sweep, and the red arm is
+# exactly the one the #3322 base-owned exclusion excuses. `continue-on-error` (the sibling neutraliser
+# on the same job) was already refused; `fail-fast` was not. BOTH mutations below exited 0 before
+# this arm: `fail-fast: true`, and the key DELETED (GitHub's default is `true`, so absence is the
+# same hole). SCOPING CONTROL: a matrix on a job that does NOT feed the runner is outside the rule.
+sed 's|^      fail-fast: false$|      fail-fast: true|' "$MAIN" >"$TMP/ci-main-fftrue.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-fftrue.yml"; then
+  fail "the fail-fast: true mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-fftrue.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "does not declare 'fail-fast: false'" <<<"$OUT"; then
+    pass "strategy.fail-fast: true → rc 2 (one arm's failure cancels the rest, and the rail reads cancelled NON-RED)"
+  else
+    fail "fail-fast: true returned rc $RC (want 2): $OUT"
+  fi
+fi
+grep -v '^      fail-fast: false$' "$MAIN" >"$TMP/ci-main-ffabsent.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-ffabsent.yml"; then
+  fail "the fail-fast deletion did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-ffabsent.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "does not declare 'fail-fast: false'" <<<"$OUT"; then
+    pass "a DELETED fail-fast key → rc 2 (GitHub's default is true, so absence is the same hole)"
+  else
+    fail "a deleted fail-fast key returned rc $RC (want 2): $OUT"
+  fi
+fi
+{ cat "$MAIN"; printf '  unrelated-matrix:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: true\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: echo hello\n'; } \
+  >"$TMP/ci-main-ffother.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-ffother.yml"; then
+  fail "the unrelated-matrix control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-ffother.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: fail-fast on a matrix that does NOT feed the runner is outside the rule (rc 0)"
+  else
+    fail "an unrelated matrix's fail-fast was refused (rc $RC — want 0): $OUT"
+  fi
 fi
 
 # ROOT-CAUSE PIN. The guard refusing the polluted document does not prove the PARSER is fixed —
