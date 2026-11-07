@@ -652,6 +652,191 @@ if grep -q 'status=ok' <<<"$SERR"; then
 else
   ok "I7f3 the STDERR channel is redacted too — fd 2 cannot read green either"
 fi
+# ⛔ THE THIRD DOOR: A CALLER-SUPPLIED SEAM VALUE (review finding, round 12). The redaction first lived
+# beside the RECORD reads, so a value the caller put in a seam — `--max 'status=ok'`,
+# `WIP_SWEEP_MAX=status=ok`, a rescuer path containing it — was echoed verbatim by `refuse_startup`'s
+# `detail=`, on a surface that exits 3. Those values now go through the same sink, because the sink
+# moved to `refuse_startup` itself. Each arm reads the COMBINED surface (the refusal also reaches fd 2
+# in pass mode, and a consumer reads `2>&1`).
+O="$(WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW" --print-status --max 'status=ok' 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7j(argv) a caller-supplied BOUND reading status=ok still answers 3" \
+                || bad "I7j(argv) answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$O"; then
+  bad "I7j2(argv) the refusal echoed the caller's raw --max value (detail= is the leak)"
+else
+  ok "I7j2(argv) the refusal detail= is redacted (a caller's --max cannot read green)"
+fi
+O="$(WIP_SWEEP_MAX='status=ok' WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7j(env) a caller-supplied ENV bound reading status=ok still answers 3" \
+                || bad "I7j(env) answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$O"; then
+  bad "I7j2(env) the refusal echoed the caller's raw WIP_SWEEP_MAX (detail= is the leak)"
+else
+  ok "I7j2(env) the refusal detail= is redacted (a caller's env bound cannot read green)"
+fi
+O="$(WIP_SWEEP_RESCUE="$T/status=ok-no-rescuer.sh" WIP_SWEEP_STATE_DIR="$T/state-cln" \
+      bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7k an unreadable RESCUER path containing status=ok still answers 3" \
+                || bad "I7k answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$O"; then
+  bad "I7k2 the rescuer refusal echoed the caller's raw path"
+else
+  ok "I7k2 the rescuer refusal is redacted"
+fi
+# ⛔ AND THE RECORD PATH, which is a caller-supplied value too (`WIP_SWEEP_STATE_DIR`), so it is NOT a
+# declared limit — the redaction reaches it like every other value the reader prints.
+mkdir -p "$T/state=status=ok"
+O="$(WIP_SWEEP_STATE_DIR="$T/state=status=ok" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7l a state dir NAMED with status=ok and no record still answers 3" \
+                || bad "I7l answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$O"; then
+  bad "I7l2 the no-record line printed the record PATH raw — the last undeclared door"
+else
+  ok "I7l2 the record path is redacted too, so no caller-supplied value reads green"
+fi
+# ⛔ THE PATH ON THE OTHER MESSAGE (review finding, round 13). I7l used a state dir with NO record, so it
+# exercised ONLY the no-record line. The catch-all refusal prints the SAME variables — and it was left
+# raw: measured, a `state=status=ok` dir holding a `status=bogus` record put the substring on BOTH
+# channels at exit 3 while this suite was fully green. That fixture is what every earlier arm missed.
+mkdir -p "$T/state=status=ok-bogus"
+printf 'status=bogus\nrc=3\nts=%s\n' "$(date -u '+%s')" > "$T/state=status=ok-bogus/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state=status=ok-bogus" bash "$SW" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7m a poisoned record PATH reaching the CATCH-ALL refusal still answers 3" \
+                || bad "I7m answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$O"; then
+  bad "I7m2 the catch-all refusal printed a caller-supplied PATH raw — fd 1 or fd 2 reads green"
+else
+  ok "I7m2 both refusal messages redact the path (the same variable in two messages)"
+fi
+# ⛔ AND THE CONTRACT IS KEY-SCOPED (round 13). Whatever else the surface carries, the LAST `^status=`
+# line must agree with the exit — that is the shape `docs/ops/wip-sweep.md` tells consumers to rely on, so
+# it gets an arm instead of being implied. The extra `frobnicate=status=ok` line is the noise that a
+# substring consumer trips over and a key consumer ignores.
+printf 'status=bogus\nrc=3\nts=%s\nfrobnicate=status=ok\n' "$(date -u '+%s')" \
+  > "$T/state=status=ok-bogus/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state=status=ok-bogus" bash "$SW" --print-status 2>/dev/null)"; RC=$?
+LAST_STATUS="$(sed -n 's/^status=//p' <<<"$O" | tail -1)"
+{ [ "$LAST_STATUS" = failed ] && [ "$RC" -eq 3 ]; } \
+  && ok "I7n the LAST ^status= key is the DERIVED failed while the exit is 3 — the key contract holds" \
+  || bad "I7n last status='$LAST_STATUS' with rc=$RC (want failed/3)"
+# ⛔ A VALUE MUST NOT BE ABLE TO START A LINE (review finding, round 14). The key contract is "the LAST
+# `^status=` agrees with the exit", so a value that prints a SECOND `^status=` line BELOW the derived one
+# defeats it — and redaction alone cannot fix that, because the injected line need not contain
+# `status=ok` at all. Two vectors, both measured on the pre-fix code: a record with TWO `status=` lines
+# (`sed` returns BOTH, so `recorded=` emitted the second as its own line) and a caller-supplied PATH
+# containing a newline. Values are flattened at the sink now, so neither can add a line.
+mkdir -p "$T/state-multi"
+printf 'status=bogus\nrc=3\nts=%s\nstatus=status=ok\n' "$(date -u '+%s')" \
+  > "$T/state-multi/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state-multi" bash "$SW" --print-status 2>/dev/null)"; RC=$?
+NST="$(grep -c '^status=' <<<"$O")"
+LAST_STATUS="$(sed -n 's/^status=//p' <<<"$O" | tail -1)"
+{ [ "$RC" -eq 3 ] && [ "$NST" -eq 1 ] && [ "$LAST_STATUS" = failed ]; } \
+  && ok "I7o a MULTI-LINE record value cannot add a second ^status= line (n=$NST, last=$LAST_STATUS)" \
+  || bad "I7o n_status=$NST last='$LAST_STATUS' rc=$RC (want 1/failed/3)"
+NL_DIR="$T/nl"$'\n'"status=incomplete"
+mkdir -p "$NL_DIR"
+printf 'status=bogus\nrc=3\nts=%s\n' "$(date -u '+%s')" > "$NL_DIR/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$NL_DIR" bash "$SW" --print-status 2>&1)"; RC=$?
+NST="$(grep -c '^status=' <<<"$O")"
+LAST_STATUS="$(sed -n 's/^status=//p' <<<"$O" | tail -1)"
+{ [ "$RC" -eq 3 ] && [ "$NST" -eq 1 ] && [ "$LAST_STATUS" = failed ]; } \
+  && ok "I7p a seam PATH containing a NEWLINE cannot add a second ^status= line (n=$NST)" \
+  || bad "I7p n_status=$NST last='$LAST_STATUS' rc=$RC (want 1/failed/3)"
+# ⛔ THE OTHER TWO PASSTHROUGH FILTERS WERE UNPINNED (review finding, round 23 — P1). Every arm counted
+# `^status=`, and NO arm counted `^rc=` or `^recorded=`. Deleting `| grep -v '^rc='` left this suite
+# fully GREEN while the reader echoed the RECORD's own `rc=0` line ABOVE the derived `rc=3` — so a
+# first-match consumer (`grep '^rc=' | head -1`) read GREEN off a box the script reported as failed,
+# and the file's "exactly ONE `^rc=` line, both LAST and both DERIVED" was false. The `^recorded` filter
+# was equally ungraded (cosmetic rather than a false green, but unpinned is unpinned).
+# The fixture carries its own `rc=` AND `recorded=` lines, so each filter is individually load-bearing.
+mkdir -p "$T/state-keys"
+printf 'status=bogus\nrc=0\nts=%s\nrecorded=ok\nrecorded_rc=0\n' "$(date -u '+%s')" \
+  > "$T/state-keys/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state-keys" bash "$SW" --print-status 2>/dev/null)"; RC=$?
+NST="$(grep -c '^status=' <<<"$O")"
+NRC="$(grep -c '^rc=' <<<"$O")"
+NREC="$(grep -c '^recorded=' <<<"$O")"
+NRRC="$(grep -c '^recorded_rc=' <<<"$O")"
+LAST_RC="$(sed -n 's/^rc=//p' <<<"$O" | tail -1)"
+FIRST_RC="$(sed -n 's/^rc=//p' <<<"$O" | head -1)"
+{ [ "$RC" -eq 3 ] && [ "$NST" -eq 1 ] && [ "$NRC" -eq 1 ] && [ "$LAST_RC" = 3 ] && [ "$FIRST_RC" = 3 ]; } \
+  && ok "I7u exactly ONE ^rc= line and it is the DERIVED 3 — the record's own rc= does not leak" \
+  || bad "I7u rc=$RC n_status=$NST n_rc=$NRC first_rc=$FIRST_RC last_rc=$LAST_RC (want 3/1/1/3/3)"
+{ [ "$NREC" -eq 1 ] && [ "$NRRC" -eq 1 ]; } \
+  && ok "I7v exactly ONE recorded= and ONE recorded_rc= — a foreign record's own lines are dropped" \
+  || bad "I7v n_recorded=$NREC n_recorded_rc=$NRRC (want 1/1)"
+# ⛔ AND THE CARRIAGE RETURN, SEPARATELY (review finding, round 15). A bare CR is not a line break to
+# `grep`, so an arm that counts `^status=` on RAW output cannot see it — the defect only appears once a
+# reader normalises CR to LF (a log shipper, `tr`, a Windows-side consumer). This arm therefore
+# normalises BEFORE counting; without it, removing the `\r` flattening from `redact()` left the whole
+# suite GREEN over a real injection.
+CR_DIR="$T/cr"$'\r'"status=incomplete"
+mkdir -p "$CR_DIR"
+printf 'status=bogus\nrc=3\nts=%s\n' "$(date -u '+%s')" > "$CR_DIR/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$CR_DIR" bash "$SW" --print-status 2>&1)"; RC=$?
+NST="$(printf '%s\n' "$O" | tr '\r' '\n' | grep -c '^status=')"
+LAST_STATUS="$(printf '%s\n' "$O" | tr '\r' '\n' | sed -n 's/^status=//p' | tail -1)"
+{ [ "$RC" -eq 3 ] && [ "$NST" -eq 1 ] && [ "$LAST_STATUS" = failed ]; } \
+  && ok "I7q a seam PATH containing a CARRIAGE RETURN cannot add a ^status= line once CR is normalised" \
+  || bad "I7q n_status=$NST (CR-normalised) last='$LAST_STATUS' rc=$RC (want 1/failed/3)"
+# ⛔ AND THE CONTROLS A GREP-SHAPED ARM CANNOT SEE (review finding, round 16). `\v` and `\f` are not
+# line breaks to `grep`, so counting `^status=` on the raw output cannot detect them — but
+# `str.splitlines()` (Python, and the JSON/log readers built on it) splits on both, so a record reading
+# `ts=17\vstatus=incomplete` forged a `status=` line BELOW the derived one for those consumers while
+# `grep` saw one line and stayed GREEN. The sink is an allow-list now (printable ASCII only). This arm
+# normalises the two bytes IT carries (`\v`, `\f`) and no more — it is NOT a splitlines-complete normaliser, and
+# arm I7q above is CR-only. The splitlines-complete coverage is the UNION of I7o/I7p (LF), I7q (CR),
+# I7r (VT) and I7s.1-7 (FF, 0x1c/0x1d/0x1e, U+0085, U+2028, U+2029) — each of those reddens when that
+# class alone loses the allow-list. ⛔ NOT I7s ALONE: the loop carries only the seven listed above, so
+# attributing LF/CR/VT to it would license deleting exactly the arms that catch them. FF is in that loop precisely because it was NOT covered
+# when this comment claimed it was, and a FF-only mutant scored a full green suite.
+mkdir -p "$T/state-vt"
+printf 'status=bogus\nrc=3\nts=17\vstatus=incomplete\ndetail=x\n' > "$T/state-vt/wip-sweep.status"
+O="$(WIP_SWEEP_STATE_DIR="$T/state-vt" bash "$SW" --print-status 2>&1)"; RC=$?
+NST="$(printf '%s\n' "$O" | LC_ALL=C tr '\v\f' '\n\n' | grep -c '^status=')"
+LAST_STATUS="$(printf '%s\n' "$O" | LC_ALL=C tr '\v\f' '\n\n' | sed -n 's/^status=//p' | tail -1)"
+{ [ "$RC" -eq 3 ] && [ "$NST" -eq 1 ] && [ "$LAST_STATUS" = failed ]; } \
+  && ok "I7r a VERTICAL-TAB value cannot forge a ^status= line for a splitlines() reader" \
+  || bad "I7r splitlines-normalised n_status=$NST last='$LAST_STATUS' rc=$RC (want 1/failed/3)"
+# ⛔ AND THE BREAKS THAT ARE NOT ORDINARY C0 CONTROLS (review finding, round 17). `str.splitlines()`
+# breaks on 0x1c/0x1d/0x1e, on U+0085, and on U+2028/U+2029 — and `[:cntrl:]` matches only the first
+# three in any locale, so a control-byte BLACKLIST could never close this. That is why the sink is an
+# allow-list. Each arm normalises GREEDILY (every non-printable byte treated as a break) and requires the
+# LAST `^status=` to still be the DERIVED one. ⛔ 0x1c-0x1e were MISSING from the first version of this
+# loop, and a mutant keeping them uncovered scored 229/0 GREEN while forging the last `status=` line —
+# so they are in the list precisely because their absence was measured, not because they looked likely.
+_nbrk=0
+for _brk in $'\x0c' $'\x1c' $'\x1d' $'\x1e' $'\xc2\x85' $'\xe2\x80\xa8' $'\xe2\x80\xa9'; do
+  _nbrk=$((_nbrk+1))
+  mkdir -p "$T/state-brk$_nbrk"
+  printf 'status=bogus\nrc=3\nts=17%sstatus=incomplete\ndetail=x\n' "$_brk" \
+    > "$T/state-brk$_nbrk/wip-sweep.status"
+  O="$(WIP_SWEEP_STATE_DIR="$T/state-brk$_nbrk" bash "$SW" --print-status 2>&1)"; RC=$?
+  NST="$(printf '%s\n' "$O" | LC_ALL=C tr -c '[:print:]\n' '\n' | grep -c '^status=')"
+  LAST_STATUS="$(printf '%s\n' "$O" | LC_ALL=C tr -c '[:print:]\n' '\n' | sed -n 's/^status=//p' | tail -1)"
+  { [ "$RC" -eq 3 ] && [ "$NST" -eq 1 ] && [ "$LAST_STATUS" = failed ]; } \
+    && ok "I7s.$_nbrk a non-C0 line separator (splitlines-normalised n=$NST) cannot forge a ^status= line" \
+    || bad "I7s.$_nbrk n_status=$NST last='$LAST_STATUS' rc=$RC (want 1/failed/3)"
+done
+# ⛔ AND THE SIBLING RESCUER FALLBACK, WHICH NOTHING GRADED (review finding, round 19). R8/R9 create a
+# scratch dir with NO sibling, so they grade the `$HOME` FARM arm only. Deleting the `$SELF_DIR` sibling
+# usability probe therefore left this suite fully GREEN while the reader answered `status=ok`/exit 0 over
+# a box whose sibling rescuer is INERT — a false PASS, the exact class this PR exists to close. This arm
+# puts an unusable sibling beside a copy of the sweep, with `$HOME` pointed at an empty dir so the farm
+# cannot rescue it, and requires the refusal BY NAME.
+mkdir -p "$T/sib/scripts" "$T/fakehome"
+cp "$SW" "$T/sib/scripts/wip-sweep.sh"
+printf '#!/bin/sh\nexit 0\n' > "$T/sib/scripts/bg-rescue-wip.sh"
+chmod +x "$T/sib/scripts/bg-rescue-wip.sh"
+O="$(HOME="$T/fakehome" WIP_SWEEP_BOUNDED_LIB="$HERE/lib/bounded.sh" \
+      WIP_SWEEP_STATE_DIR="$T/state-cln" bash "$T/sib/scripts/wip-sweep.sh" --print-status 2>&1)"; RC=$?
+[ "$RC" -eq 3 ] \
+  && ok "I7t an INERT sibling rescuer REFUSES — it never answers from the record" \
+  || bad "I7t answered $RC (want 3) — a live false PASS on the sibling fallback"
+has "$O" 'PRESENT-but-broken' \
+  && ok "I7t2 and it names the sibling as present-but-broken, not as absent" \
+  || bad "I7t2 the refusal does not name the sibling as present-but-broken: $O"
 printf 'status=failed\nrc=3\nts=status=ok\ndetail=x\n' > "$T/state-xval2/wip-sweep.status"
 OST4="$(WIP_SWEEP_STATE_DIR="$T/state-xval2" bash "$SW" --print-status 2>&1)"; RC=$?
 [ "$RC" -eq 3 ] && ok "I7g a record whose ts= carries status=ok still answers 3" \
@@ -1030,7 +1215,7 @@ done
 # ── O) AN ENV-BOUND REFUSAL MARKS THE PASS; AN ARGUMENT ERROR DOES NOT ─────────────────────────────
 echo; echo "── O. an env-bound refusal (exit 2) marks the pass, an argument error does not ──"
 # ⛔ THE DOC USED TO SAY "a usage error (exit 2) comes earlier and deliberately does not touch the
-# record", and only the ARGUMENT parser is earlier — the four environment-bound validations run AFTER the
+# record", and only the ARGUMENT parser is earlier — the FIVE environment-bound validations run AFTER the
 # marker, on purpose. This arm pins the decision so a later tidy-up cannot move them above the marker and
 # silently restore the stale-`ok` class this PR exists to close (a box whose sweep refuses EVERY pass
 # reading as a swept box). The two cases are different and the doc now says both.
@@ -1294,7 +1479,7 @@ fi
 # ⛔ R8/R9 — THE FARM FALLBACK IS A BRANCH, NOT A FOOTNOTE (#3588 review, item 3). Every R3 seam sets
 # `WIP_SWEEP_RESCUE`, so every one of them grades the PIN branch. The finding the usability probe exists for
 # named the FARMED copy — `$HOME/.pi/agent/scripts/bg-rescue-wip.sh`, which `pi-bootstrap/setup.sh` writes
-# with `cp -f` — and the code comment at `wip-sweep.sh:402-403` CLAIMS "a 0-byte copy at SELF_DIR or in the
+# with `cp -f` — and the code comment in `wip-sweep.sh`'s FALLBACKS block CLAIMS "a 0-byte copy at SELF_DIR or in the
 # $HOME farm was still ACCEPTED there", with no arm behind the claim. So the fallback could lose the probe
 # silently and the suites would stay green. Here the sweep is copied ALONE into a scratch dir ($SELF_DIR then
 # holds no rescuer), the library is pinned, and HOME is redirected: the $HOME production is the ONLY one left

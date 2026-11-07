@@ -74,8 +74,13 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
   repo after the first**, so a multi-repo pass cannot walk one full listing per remaining repo after the
   budget is spent; a repo it did not reach is recorded `unreached` (`deferred-pass-budget`), counted in
   `deferred=`, so the index still accounts for it.
-  ⛔ **The exact bound is `WIP_SWEEP_BUDGET` + at most ONE repo listing (`WIP_SWEEP_STATUS_TIMEOUT`),
-  not the budget alone**, and the repo-level listing probe is deliberately **not** clamped with
+  ⛔ **The exact bound is `WIP_SWEEP_BUDGET` + the repo iteration already in flight, not the budget alone.**
+  A repo iteration makes several unclamped repo-level calls — `rev-parse --is-inside-work-tree`,
+  `worktree list --porcelain`, `rev-parse --git-common-dir`, plus `rev-parse --is-bare-repository` on the
+  path where the FIRST of those fails — so the
+  overrun past the budget is a small multiple of `WIP_SWEEP_STATUS_TIMEOUT` — measured 9.1s against a 6s
+  estimate with `BUDGET=1`, `STATUS_TIMEOUT=5`, two repos (1.82x) — not a hard wall of one. The repo-level probe
+  is deliberately **not** clamped with
   `cap_timeout` the way the in-examination calls are. Clamping it would turn "out of time" into a
   timeout, and the list probe answers a timeout with `worktree-list-failed`/`worktree-list-unverifiable` —
   i.e. `FAILED`, exit 3 — so a deferral would be reported as a repository that cannot be read. Measured:
@@ -270,7 +275,7 @@ repo to scan), or cannot write its verdict leaves `running` — which `--print-s
 `WIP_SWEEP_STALE_SECONDS`. **Two kinds of `exit 2` are different, and only one is untouched**: a
 mistyped ARGUMENT is parsed before the record is resolved and leaves it alone; an ENVIRONMENT-BOUND
 refusal (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT`,
-`WIP_SWEEP_STALE_SECONDS` that do not parse, or a zero watchdog) is the same failure mode as a missing
+`WIP_SWEEP_STALE_SECONDS` that do not parse, or a zero watchdog or staleness window, or `WIP_SWEEP_MAX` that does not parse) is the same failure mode as a missing
 rescuer — a pass that will refuse EVERY time until the box is fixed — so it marks the pass as started and
 `--print-status` answers `failed`/exit 3. Moving those validations above the marker would leave the
 previous `status=ok` standing over a box that is sweeping nothing, which is the stale-green class this
@@ -281,19 +286,33 @@ can only be loud on stderr with a non-zero exit — that is a host problem, and 
 scheduler yet, so the marker is the substitute.)
 
 `--print-status` answers from that record **and from the same startup checks the pass makes**: `0` ok,
-`1` incomplete, `3` failed / stale / never, and it prints a derived `rc=` on EVERY path including `never`
-(a consumer keyed on `rc=` finds a value even on a box that has never run).
-⛔ **THE READER IS NEVER GREEN OVER A BOX THAT CANNOT SWEEP.** Every startup refusal — an unusable
-`WIP_SWEEP_BOUNDED_LIB` pin, an unparseable or zero bound (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_MAX`, the two
-watchdogs, the staleness window), a rescuer that does not exist **or does not answer in its documented
+`1` incomplete, `3` failed / stale / never, and on every path that emits a record surface it prints a
+derived `rc=` including `never` (a consumer keyed on `rc=` finds a value even on a box that has never
+run). Paths that emit NO record surface are listed further down — a reader rejected by the argument
+parser exits before there is any surface to key on.
+⛔ **THE READER IS NEVER GREEN OVER A BOX THAT CANNOT SWEEP — with the stated exceptions below.**
+Every startup refusal — an unusable
+`WIP_SWEEP_BOUNDED_LIB` pin, an unparseable bound (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_MAX`, the two
+watchdogs, the staleness window) or a ZERO one where zero is not a documented disable (the two watchdogs
+and the staleness window — `0` disables only `--max` and `WIP_SWEEP_BUDGET`), a rescuer that does not exist **or does not answer in its documented
 read-only mode** (graded at the pin **and at both fallbacks** — the script's own sibling and the farmed
 `$HOME/.pi/agent/scripts` — and a copy that is PRESENT but unusable is named as present-but-broken, because
 `not found` over a truncated `cp -f` farm copy sends the next operator after the wrong fault) — is answered
 on the reader surface as
 `status=failed` / `rc=3` / `detail=<the cause>`, never as an older `ok`. That is why it is not literally
 "the record alone": a green from a record the pass could no longer reproduce would be the stale-green
-class this doc opens with. The ONE case it still answers from the record alone is a `WIP_SWEEP_BUDGET=0`
-or `--max 0` (documented disables), which change no verdict.
+class this doc opens with. Two values make a pass refuse while the reader still answers from the record,
+and both are named elsewhere in this section rather than left to be discovered: an **unwritable state
+dir** (the pass has no alarm channel and refuses; the reader merely reads the record an earlier pass
+wrote) and **no repo resolvable** (below). Neither is a false green on the question the reader answers —
+"is the sweep running, and what did its last pass find" — and neither can be turned into a green *verdict*
+by the reader, which is the line that matters here.
+⛔ **AND ONE PATH OUTSIDE THE STARTUP SEAMS, named rather than left to be discovered.** With no repo
+resolvable the reader still answers from the record — `ok`/exit 0 on a fresh record — while a PASS
+refuses with "no repo to scan". That is deliberate: the reader grades whether THE SWEEP is running and
+what its last pass found, not what the caller's current directory offers, and a quiesce invokes it with
+no `--repo` at all. It is not the stale-green class, because the record it answers from is one this box
+DID produce.
 ⛔ **AND THE BOUND ON THAT CLAIM, stated rather than implied.** "Usable rescuer" is decided by a
 BEHAVIOURAL probe in the rescuer's own no-archive mode (`--verdict` on a path that cannot exist), and it
 requires the documented PAIR — the word `verdict=cannot-verify` **and** exit `2`, which is what
@@ -307,24 +326,47 @@ classification lands `cannot-verify`, exit 3) and it archives nothing, so no wor
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
 and nowhere else. The printed `status=` and `rc=` are the **derived** ones, emitted last, so the
 key=value surface agrees with the exit code; the recorded values are kept beside them as `recorded=` and
-`recorded_rc=` (both preceded by every other key, so each derived value is the LAST occurrence of its
+`recorded_rc=`, emitted BEFORE `rc=` and `status=`, so each derived value is the LAST occurrence of its
 own key — `detail=` follows `status=`, which is why the rule is per-key, not "derived keys end the
-stream"). **No line this reader emits can contain the substring `status=ok`** except as its own
-verdict, so even a `grep 'status=ok'` consumer cannot read green off a record this run judged stale —
-the same polarity `disk-reaper.sh --print-status` prints. That holds on three surfaces, not one: the
-keys it CONSTRUCTS (the derived pair is emitted last, and the recorded pair is spelled so it cannot
-collide); the record's own extra lines, which are DROPPED (their content is still on disk at
-`$STATUS_FILE`, which the refusal names); and every value it INTERPOLATES into `detail=`/`recorded=` — a
-record's `ts=` or status value, a caller's `WIP_SWEEP_MAX`, a state-dir PATH — which are REDACTED to
-`status=<redacted>`, because those lines are the only place the cause is stated and dropping them would
-trade a false green for an unexplained refusal. This holds on **both channels**: the reason string is
-built and redacted once and every surface prints that variable, so `--print-status 2>&1 | grep
-'status=ok'` cannot read green either — the first cut of this fix redacted only stdout, and the same
-value reached stderr through the refusal message. A genuine record answering `ok` still prints
-`status=ok` with exit 0; redaction applies only to spliced content, so it can never eat a true green.
-Redacting the record PATH rewrites it only when it CARRIES the literal, which is why it is covered here
-rather than declared a limit: a normal path is byte-identical. One limit remains, stated rather than
-implied: a reader handed a malformed **argument** still exits 2 without a record surface at all. Two
+stream"). **The guarantee is KEY-SCOPED, and that is the shape to rely on:** the reader emits exactly
+one `status=` line and exactly one `rc=` line, both LAST and both DERIVED, so `grep -E '^status=' | tail -1`
+(or `^rc=` the same way) always agrees with the exit code. Every other value is prefixed (`recorded=`,
+`recorded_rc=`) — and, more to the point, no echoed value can ever ADD a key line. Values are reduced to
+**printable ASCII** (the passthrough keeps line breaks and printable ASCII, and nothing else it is
+allowed to see), so a value
+cannot start a line for any plausible splitter: not LF or CR, not `\v` or `\f`, not `U+0085`, `U+2028`
+or `U+2029` — and that last group is why the rule is an allow-list rather than a blacklist: a
+byte-oriented `[:cntrl:]` (what `tr` always is) cannot match those three in a UTF-8 locale, a
+character-aware tool (GNU `sed`/`awk`/`grep` under a UTF-8 locale) does match them, and a single-byte
+locale is a third behaviour — so no single blacklist works everywhere, and none is written. A record
+carrying two `status=` lines, or a caller-supplied path containing a
+newline, is printed as one line with the parts joined, never as a second `^status=` line below the
+derived one. The cost, stated rather than discovered later: a **non-ASCII** path or detail is mangled in
+the print (its UTF-8 bytes become spaces). The record on disk is untouched and is where an operator
+looks, so this trades display fidelity on a rare input for a guarantee that cannot be widened again.
+
+⛔ **DO NOT build a consumer on `grep 'status=ok'` over arbitrary output.** That substring test cannot
+distinguish a verdict from unrelated text, and chasing it is what produced eight review rounds. THREE
+surfaces can still show the raw word, and no redaction of the reader will change that: `--help` must
+DOCUMENT `status=ok`; an **unknown** argument is echoed back verbatim by the parser (`wip-sweep.sh
+'status=ok'` → `unknown argument: status=ok`, exit 2); and **pass-mode stderr** is an operator log, where
+messages that do not go through `refuse_startup` (a `--repo` path, for instance) print caller content as
+it was given. (An earlier draft of this
+paragraph also cited `--max 'status=ok'` and a caller-supplied seam/path — those now go through `redact`
+and are clean, so they are no longer reasons.) Redaction is applied wherever a value is cheap to redact — record VALUES
+(`recorded=`, `recorded_rc=`, the `detail=` derived from an unreadable `ts=`), the refusal reason on
+**both channels**, caller-supplied seam values, and the record path — so on the READER surface the
+fragile substring shape mostly holds too. But it is a best-effort convenience, not the contract; the
+contract is the key. Redaction also only removes bytes: what it emits is printable ASCII, and a record
+GNU `grep` classifies as binary (it contains a NUL) has its passthrough lines suppressed rather than
+sanitised — removal in both cases, never an addition, which is why the key contract is unaffected.
+
+The derived `status=ok` is deliberately exempt from redaction: when the record really is fresh and ok,
+that IS the answer. And three surfaces sit outside the reader invariant entirely, by construction rather
+than by oversight: **pass-mode stderr** is an operator log, not the key=value instrument surface;
+**parser/argv rejections** (`--bogus`, `--repo` with no value, and an argv bound refused *before*
+`--print-status` was parsed) exit 2 with no record surface at all; and **`--help`** exits 0 having
+printed the usage text, which documents `status=ok` on purpose. Two
 clocks it refuses to
 judge: a `ts=` that is missing or unreadable (an uncomputable age is not freshness), and a `ts=` in the
 FUTURE (a clock step backwards — VM restore, NTP, a cell re-image — would otherwise disable the

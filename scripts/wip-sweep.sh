@@ -22,7 +22,7 @@
 # accumulate-don't-replace chaining, the workflow-scope credential retry and the credential classification
 # all live in `bg-rescue-wip.sh`, and this script re-implements NONE of them. It decides WHICH
 # worktrees to hand over, and it reads the rescue's EXIT CODE, which is the rescue's own contract
-# (`:48-51`): for a worktree that has work at risk, exit 0 means archived-and-pushed and exit 2 means
+# (`:70-73`): for a worktree that has work at risk, exit 0 means archived-and-pushed and exit 2 means
 # NOT — so a failed archive can never be recorded as a clean one here.
 #
 # ⛔ AND IT OWNS NO "IS ANYTHING AT RISK" RULE EITHER. The three verdicts — `clean` / `dirty` /
@@ -130,19 +130,63 @@ err() { echo "wip-sweep: ⛔ $*" >&2; }
 # consumer surface, so it must ANSWER on every path with a derived status/rc/detail — and it must never be
 # green over a box that cannot sweep. The checks therefore run once, below, before the reader; pass mode
 # keeps its own exit codes (2 usage, 3 refusal), and reader mode answers failed/3 with the cause.
-# ⛔ THE `status=ok` GUARANTEE MUST HOLD ON WHAT THIS SCRIPT *EMITS*, NOT ONLY ON WHAT IT PASSES THROUGH
-# (rounds 9-10). Round 8 closed the passthrough (a record's own extra line). The reader ALSO splices
-# content into its own printed keys, and that content is not always the record's: it can be a CALLER
-# value or a PATH. Measured at b03c916, every one answering `rc=3` with the literal in its own output:
-#   record `ts=status=ok`              → `detail=…('status=ok')…`            stdout + stderr
-#   record `status=status=ok`          → `recorded=status=ok`               stdout  (falsifies the
-#                                        round-2 claim that `recorded=`/`recorded_rc=` cannot collide)
-#   WIP_SWEEP_MAX=status=ok            → `detail=WIP_SWEEP_MAX is not …'status=ok'`   stdout
-#   state dir with `status=ok` in the PATH → `detail=no pass record at …/status=ok/…`  stdout
-# and in the catch-all refusal the record values reached STDERR too, which `2>&1 | grep` — the shape
-# the doc nominates — read as green. `refuse_startup` is redacted on BOTH its surfaces for exactly that
-# reason: a startup refusal is a reader answer like any other.
-
+# ⛔ TWO SINKS FOR EVERY VALUE THE READER EMITS (review findings, rounds 8-18). `--print-status` must
+# never emit a `status=ok` VALUE except as its OWN derived verdict, and it must never let a value START A
+# NEW LINE — because the whole guarantee is key-scoped (one derived `^status=`, last), and a value
+# containing a newline prints a second `^status=` line AFTER the derived one, which a `tail -1` consumer
+# then believes. Both properties are enforced at the TWO sinks every emitted value passes through —
+# `redact()` for the values the reader CONSTRUCTS, and an allow-list `tr` on the passthrough for the
+# record lines it RELAYS. It took several rounds because the string can arrive by many doors and EACH FIX
+# REVEALED THE NEXT:
+#   * round 8  — a PASSTHROUGH record line carrying it (`detail=…status=ok…`), dropped below;
+#   * round 9  — a record VALUE the reader ECHOES (`recorded=`, `recorded_rc=`, an unreadable `ts=`
+#     quoted inside the reader's own `detail=`);
+#   * round 10 — the SAME reason on STDERR, after only the stdout sink was redacted;
+#   * round 12 — a CALLER-SUPPLIED seam value (`--max 'status=ok'`, `WIP_SWEEP_MAX=status=ok`,
+#     `WIP_SWEEP_RESCUE=/tmp/status=ok/…`) echoed by the startup refusals;
+#   * round 13 — the record PATH, printed by the CATCH-ALL refusal while the no-record message had
+#     already been redacted: the same variable in two messages, one of them forgotten;
+#   * round 14 — a MULTI-LINE value (`sed` returns EVERY `status=` line; a seam path can contain a
+#     newline), which after redaction still injected a SECOND `^status=`/`^rc=` line BELOW the derived
+#     one. Redaction alone never fixed that: the line has to be flattened.
+# Redaction, and the newline flattening that goes with it, therefore live at the SINKS (this one and
+# `refuse_startup`) rather than beside each caller.
+# ⛔ WHAT THIS INVARIANT IS, AND WHAT IT IS NOT — stated so a later round does not re-litigate it. It is
+# KEY-SCOPED: the reader emits exactly ONE `^status=` line and exactly ONE `^rc=` line, both LAST and
+# both DERIVED, and no echoed value can add another because every value is reduced to printable ASCII
+# (and, on the passthrough, printable ASCII plus line breaks). It is NOT a
+# ban on the substring appearing anywhere the process writes, because that is UNSATISFIABLE and chasing it
+# one call site at a time is exactly what produced rounds 8-14: `--help` must DOCUMENT `status=ok`, the
+# parser echoes the caller's own argv, and pass-mode stderr is an operator log rather than the key=value
+# instrument surface. The supported consumer shape is the LAST `^status=` / `^rc=` line (the doc says
+# so). Redaction is still applied wherever a value is cheap to redact, so the fragile substring shape
+# mostly works too — but the guarantee rests on the KEY.
+# ⛔ AND THE REDUCTION HAPPENS AT TWO SINKS, not one: `redact()` for every value the reader CONSTRUCTS,
+# and an allow-list `tr` on the passthrough for the record lines it relays. Both are needed — a value can
+# ride either.
+# ⛔ AND `redact()` MUST BE DEFINED FIRST: `refuse_startup` below CALLS it, and a bash function definition
+# only takes effect when control reaches it. This file has been bitten by that ordering once already.
+# `${var//pat/rep}` is POSIX pattern substitution — bash 3.2 supports it, `=` is literal in a pattern,
+# and `status=<redacted>` cannot itself contain `status=ok`.
+redact() {
+  local v="${1-}"
+  v="${v//status=ok/status=<redacted>}"
+  # ⛔ ALLOW-LIST, NOT A BLACKLIST (review findings, rounds 14-17). Flattening named control bytes was the
+  # wrong shape and it failed three times in a row: LF/CR/TAB let `\v`/`\f` through; `[:cntrl:]` closed
+  # those but NOT `U+0085`, `U+2028`, `U+2029`, which `str.splitlines()` (Python, and the JSON/log readers
+  # built on it) treats as line breaks. A BYTE-oriented `[:cntrl:]` cannot match those three in a UTF-8
+  # locale (that is what `tr` always is), so no single blacklist can be written that works everywhere —
+  # while a CHARACTER-aware tool (GNU `sed`/`awk`/`grep` under a UTF-8 locale) matches all three, and a
+  # single-byte locale is a third behaviour again. That is the real reason the sink is an allow-list
+  # rather than a blacklist: only PRINTABLE ASCII survives a value, and everything
+  # else — every control byte, every high/UTF-8 byte, every Unicode line separator — becomes a space. A
+  # value then cannot start a line for ANY plausible splitter, which is the property the guarantee needs.
+  # ⛔ THE COST, stated rather than discovered later: a non-ASCII path or detail is mangled in the PRINT
+  # (UTF-8 bytes become spaces). The pass record on disk is untouched and is where an operator looks, so
+  # this trades display fidelity on a rare input for a guarantee that cannot be widened again.
+  v="$(printf '%s' "$v" | LC_ALL=C tr -c '[:print:]' ' ')"
+  printf '%s' "$v"
+}
 refuse_startup() {
   if [ "${MODE:-sweep}" = status ]; then
     printf 'status=failed\n'
@@ -154,24 +198,6 @@ refuse_startup() {
   exit "$1"
 }
 note() { echo "wip-sweep: $*" >&2; }
-# ⛔ ONE SINK FOR EVERY VALUE THAT CAME OUT OF THE RECORD (review finding, round 9). `--print-status`
-# must never put the substring `status=ok` on its surface except as its OWN derived verdict — that is
-# the whole point of emitting the derived pair LAST, and `docs/ops/wip-sweep.md` states it as a
-# guarantee. Round 8 closed the PASSTHROUGH lines; the VALUES the reader ECHOES (`recorded=`,
-# `recorded_rc=`, and an unreadable `ts=` quoted inside the reader's own `detail=`) still went out raw,
-# which is the same defect one key over. Measured on a stale record reading `status=note status=ok`:
-# `recorded=note status=ok` was printed while the script exited 3; and a record with `ts=status=ok`
-# printed it inside `detail=`. Values are REDACTED rather than dropped so the audit trail (what the
-# record actually said) survives on the surface; the untouched record is still on disk at $STATUS_FILE.
-# `${var//pat/rep}` is POSIX pattern substitution — bash 3.2 supports it, and `=` is literal in a
-# pattern, so no quoting tricks are needed. `status=<redacted>` cannot itself contain `status=ok`.
-# ⛔ AND THIS SINK IS THE ONLY ONE — it is used for the RECORD-derived reason, for `refuse_startup`'s
-# caller-supplied message (a bad `WIP_SWEEP_MAX` is echoed inside it), and for the never-run and
-# cannot-be-judged messages that name `$STATUS_FILE` (from a caller's `WIP_SWEEP_STATE_DIR`). Redacting
-# a path only when it CARRIES the literal cannot mangle a normal one, so there is no residual here.
-# The substitution itself mirrors what `systemctl show` does with untrusted property content:
-# transform the value so a parser cannot be fooled by it, rather than splice it raw.
-redact() { printf '%s' "${1//status=ok/status=<redacted>}"; }
 
 usage() {
   sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed -n 's/^# \{0,1\}//p'
@@ -190,7 +216,7 @@ need_int() { # need_int <name> <value> — a bound that does not parse is a REFU
 }
 # need_pos_int <name> <value> — the WATCHDOG bounds, where `0` is NOT a disable.
 # ⛔ WHY THE TWO HELPERS (review round 2, residuals R1/R2). `tb_timeout 0 …` means "run unbounded"
-# (`scripts/lib/bounded.sh:176`), and a zero Stale window means "everything is stale" but READS as
+# (`scripts/lib/bounded.sh:278`), and a zero Stale window means "everything is stale" but READS as
 # "do not check". Both are defeatable by a plausible-looking value rather than a typo, and both sit on
 # the quiesce path — a `WIP_SWEEP_STATUS_TIMEOUT=0` on a hung mount is the box that never finishes
 # dying, and `WIP_SWEEP_STALE_SECONDS=0` makes a record from 1970 answer `ok`. Exactly TWO seams are
@@ -255,8 +281,9 @@ NOW_S="$(date -u '+%s')"
 # `rc=0 status=ok`, i.e. a box being swept nowhere reads as swept WITH the work present on it.
 # So the state dir is created and marked here, BEFORE the delegate/repo refusals.
 # ⛔ WHICH "exit 2" IS UNTOUCHED, STATED PRECISELY (review finding). The ARGUMENT parser runs before all
-# of this, so a mistyped flag leaves the record alone — a mistyped argument is not a pass. The four
-# ENVIRONMENT-BOUND validations below (`WIP_SWEEP_BUDGET`, the two watchdogs, the staleness window) do
+# of this, so a mistyped flag leaves the record alone — a mistyped argument is not a pass. The FIVE
+# ENVIRONMENT-BOUND validations below (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_MAX`, the two watchdogs, the
+# staleness window) do
 # NOT come earlier, and they must not be moved above this block: they are the same failure mode as a
 # missing rescuer — a pass that will refuse EVERY time until somebody fixes the box — and leaving the
 # previous `status=ok` standing is precisely the stale-green class this marker exists to close. So an
@@ -301,9 +328,13 @@ ERRF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-err.XXXXXX")" || { err "cannot create 
 LISTF="$(mktemp "${TMPDIR:-/tmp}/wip-sweep-list.XXXXXX")" || { err "cannot create a temp file"; exit 3; }
 fi
 
-# ⛔ THE READER NEEDS THE RECORD AND THREE ENVIRONMENT SEAMS, AND NOTHING ELSE — so they are resolved
-# here, ABOVE the bounded-execution library resolution and the pass validations, and the reader branch
-# runs before them (review finding). `--print-status` must answer on a box whose sweep refuses every
+# ⛔ THE READER NEEDS THE RECORD AND THREE ENVIRONMENT SEAMS, AND NOTHING ELSE — so their ASSIGNMENTS
+# live here, ABOVE the bounded-execution library resolution and the pass validations. Those checks then
+# run, still above the reader branch, on purpose: a box that cannot sweep must be REFUSED on the reader
+# surface rather than answered from the record. (An earlier draft of this paragraph said "the reader
+# branch runs before them", which is the opposite of the code — measured: `WIP_SWEEP_BOUNDED_LIB=/nonexistent`
+# and `WIP_SWEEP_BUDGET=abc` both answer `status=failed`/3 from `refuse_startup`, i.e. the checks ran.)
+# `--print-status` must answer on a box whose sweep refuses every
 # pass: those boxes are exactly the ones a fleet instrument is looking at, and the reader used to exit 3
 # out of the library resolution with NO `status=`/`rc=` line at all.
 # ⛔ BUT THE SEAMS IT **DOES** DEPEND ON ARE STILL VALIDATED, with the same rules as pass mode — a zero
@@ -312,14 +343,21 @@ fi
 # their VALIDATION but answer on the READER's own surface — `status=failed` / `rc=3`, through
 # `refuse_startup`, which is what the doc and arms R2/R3 pin — while pass mode keeps its own exit 2. A
 # reader that exited 2 here would fail the contract an instrument reads (`status=`/`rc=` on every run),
-# which is precisely the bug the paragraph above is about. FIVE seams are validated, not two:
+# which is precisely the bug the paragraph above is about. FIVE NUMERIC seams are validated, not two:
 # `WIP_SWEEP_BUDGET`, `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT`, `WIP_SWEEP_STALE_SECONDS`
 # and `WIP_SWEEP_MAX` — the last because its validation sits in the SAME block, above the reader branch,
 # so a stray `WIP_SWEEP_MAX=abc` makes the READER answer failed/3 instead of answering from the record.
+# ⛔ AND "FIVE" IS NOT THE TOTAL SEAM COUNT (review finding, round 19): two further caller-supplied
+# seams are validated through `refuse_startup` the same way — `WIP_SWEEP_BOUNDED_LIB` (an unusable pin)
+# and `WIP_SWEEP_RESCUE` (absent, or present-but-not-usable) — so a reader refuses on SEVEN. The five
+# above are the numeric ones, which is the distinction the sentence is drawing;
+# `docs/ops/wip-sweep.md` counts all seven.
 # (This comment said FOUR and added "everything else the reader can answer from the record", which the
 # code contradicted — measured: a fresh `status=ok` record plus `WIP_SWEEP_MAX=abc` answered
 # `rc=3 status=failed`. The behaviour is correct and fail-closed; only the count was wrong. The doc at
-# docs/ops/wip-sweep.md:286-287 already lists all five, so this is the artifact that was out of step.)
+# docs/ops/wip-sweep.md already lists all five (in its `--print-status` section), so this is the
+# artifact that was out of step. Deliberately NOT a line number: this citation WAS written as `:286-287`
+# and went stale the moment a later doc edit inserted two lines above it.
 STALE_SECONDS="${WIP_SWEEP_STALE_SECONDS:-86400}"
 STATUS_TIMEOUT="${WIP_SWEEP_STATUS_TIMEOUT:-60}"
 RESCUE_TIMEOUT="${WIP_SWEEP_RESCUE_TIMEOUT:-300}"
@@ -440,8 +478,11 @@ else
   # ⛔ AND A FALLBACK THAT EXISTS-BUT-IS-UNUSABLE IS NAMED AS SUCH (#3588 review, item 3/6). The refusal
   # below used to say "not found or not a file" about a path that is present and non-empty, which sends the
   # next operator hunting for a MISSING file on a box whose real fault is a truncated `cp -f` install — the
-  # exact shape the usability probe exists to catch. Arms R8/R9 grade this branch (nothing else did: every
-  # other seam pins `WIP_SWEEP_RESCUE`, so the fallback could have lost the probe with a green suite).
+  # exact shape the usability probe exists to catch. Arms R8/R9 grade the $HOME FARM arm of this branch,
+  # and arm I7t grades the `$SELF_DIR` SIBLING arm — which nothing graded until a review round showed
+  # that deleting this sibling probe left the suite fully GREEN while the reader answered `status=ok`/0
+  # over a box holding an inert sibling rescuer (every other seam pins `WIP_SWEEP_RESCUE`, and R8/R9's
+  # scratch dir has no sibling at all).
   RESCUE_UNUSABLE=""
   _add_unusable() { RESCUE_UNUSABLE="${RESCUE_UNUSABLE}${RESCUE_UNUSABLE:+, }$1"; }
   if [ -n "${SELF_DIR:-}" ]; then
@@ -474,10 +515,14 @@ fi
 # Same polarity as `disk-reaper.sh --print-status`: `never` and `stale` are NOT success, because a
 # sweeper that has not run is a box whose WIP is on the disk and nowhere else.
 if [ "$MODE" = status ]; then
-  # ⛔ EVERY STARTUP CHECK HAS ALREADY RUN ABOVE (library resolution and usability, the four bounds, the
-  # rescuer) and each one answers through `refuse_startup` — so reaching this line means this box CAN
-  # sweep, and the only question left is what the last pass found. That is what makes the answer safe to
-  # be `ok`: the green below is never printed over a box whose sweep would refuse.
+  # ⛔ EVERY STARTUP CHECK HAS ALREADY RUN ABOVE (library resolution and usability, the five numeric
+  # bounds, the rescuer resolution) and each answers through `refuse_startup` — so reaching this line
+  # means this box CAN sweep, and the only question left is what the last pass found. That is what makes
+  # the answer safe to be `ok`: the green below is never printed over a box whose sweep would refuse.
+  # (Two exceptions, both named in `docs/ops/wip-sweep.md`: an UNWRITABLE STATE DIR — the pass has no
+  # alarm channel and refuses, while the reader can only read the record an earlier pass wrote — and
+  # "no repo to scan", which the reader is deliberately allowed to ignore because a quiesce invokes it
+  # with no `--repo` at all.)
   if [ ! -f "$STATUS_FILE" ]; then
     # rc= IS PART OF THE DOCUMENTED SURFACE TOO (review finding). A consumer keyed on the derived
     # `rc=` — the reader shape I7c exists for — found NO value at all on a never-run box (a fresh cell,
@@ -500,9 +545,9 @@ if [ "$MODE" = status ]; then
   # status that AGREES with the exit code:
   #   * `ts=` missing or unparseable — an uncomputable age is not freshness (and `[ "$S_TS" -gt 0 ]
   #     2>/dev/null` used to SKIP the whole test, the same "unparseable bound means no bound" defect
-  #     `need_int` refuses for the four bounds);
+  #     `need_int` refuses for the numeric bounds);
   #   * `ts=` in the FUTURE — a clock step backwards (VM/volume restore, NTP, a re-image) would
-  #     otherwise disable staleness for the whole skew. `scripts/disk-reaper.sh:523` tests
+  #     otherwise disable staleness for the whole skew. `scripts/disk-reaper.sh:547` tests
   #     `-lt 0 || -gt STALE`; this is that polarity, so the header's claim is now true;
   #   * `ts=` older than the window — stale.
   DERIVED=failed
@@ -555,11 +600,25 @@ if [ "$MODE" = status ]; then
   # this is the foreign/corrupted-record class the reader exists to survive. The line is DROPPED rather
   # than rewritten because dropping can only REMOVE green, never add it, and the record itself is still
   # on disk at $STATUS_FILE (the refusal below names that path). Arm I7e pins it.
-  grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded' | grep -v 'status=ok'
+  # ⛔ AND THE PASSTHROUGH IS A SECOND SINK — it does not call `redact()` (review finding, round 17). It
+  # keeps the record's own line structure on purpose, so it cannot use `redact()` (which flattens to one
+  # line); instead it applies the SAME allow-list while PRESERVING newlines: whatever `grep` emits is
+  # reduced to printable ASCII plus `\n`. Without this, a control byte riding a `ts=`/`detail=` line
+  # reached the consumer raw — measured: `ts=17\vstatus=incomplete` emitted a literal 0x0b, and a
+  # `splitlines()` reader counted a forged `status=` line below the derived one.
+  # ⛔ WHAT THIS DOES NOT PROMISE, stated because an earlier draft of this comment overstated it: `tr`
+  # only sees what `grep` passes it. GNU `grep` classifies a record containing a NUL as BINARY and
+  # SUPPRESSES the passthrough entirely (`grep: binary file matches` on stderr), and under a UTF-8 locale
+  # it can drop a line carrying invalid UTF-8. Both REMOVE output and never add it, so the key contract
+  # is unaffected — but the allow-list is a claim about what is EMITTED, not a promise that every line of
+  # the record is displayed.
+  grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded' | grep -v 'status=ok' \
+    | LC_ALL=C tr -c '[:print:]\n' ' '
   # ⛔ AND THE ECHOED VALUES ARE THE SAME GUARANTEE ONE KEY OVER (review finding, round 9). The filter
   # above drops record LINES; these three lines print record VALUES, which never pass through it. Every
-  # raw value therefore goes through `redact` — the one sink defined beside `note()` at the top, above
-  # every call site — so `recorded=note status=ok` becomes `recorded=note status=<redacted>` and an
+  # raw value therefore goes through `redact` — ONE of the two sinks, defined beside `note()` at the top,
+  # above every call site (the other sink is the passthrough `tr` above) — so `recorded=note status=ok`
+  # becomes `recorded=note status=<redacted>` and an
   # unreadable `ts=status=ok` is redacted inside the reader's OWN `detail=` too. The DERIVED `status=`
   # is printed UNREDACTED below, on purpose: a genuine `status=ok` is this reader's verdict and must
   # survive (arms I7h/I7h3 pin both halves).
@@ -579,12 +638,10 @@ if [ "$MODE" = status ]; then
   printf 'rc=%s\n' "$_DERIVED_RC"
   printf 'status=%s\n' "$DERIVED"
   [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$_WHY"
-  # NO NAMED RESIDUAL HERE ANY MORE (round 10 follow-up). This block used to declare `$STATUS_FILE` — the
-  # record PATH, from a caller's `WIP_SWEEP_STATE_DIR` — as an accepted limit, because redacting "would
-  # mangle every message that names where the record lives". Measured, that is not true: `redact` rewrites
-  # only a value that CARRIES the literal, so a normal path is byte-identical and a path that carries it
-  # was a fifth false-green route (it reached the never-run detail and this refusal). The two messages
-  # that print the path therefore redact the assembled line.
+  # The record PATH is a caller-supplied value too (it comes from `WIP_SWEEP_STATE_DIR`), so it is
+  # redacted like every other value the reader prints — BOTH messages below, not one of them. An earlier
+  # revision redacted the no-record message and left the catch-all refusal printing the same variable
+  # raw, which is why arm I7m exists: it puts a poisoned path on the branch that HAD a record.
   case "$DERIVED" in
     ok) exit 0 ;;
     incomplete) exit 1 ;;
@@ -861,7 +918,8 @@ examine() {
   vrc=$?
   if [ "$vrc" -eq 0 ]; then
     # ⛔ EXIT 0 IS AMBIGUOUS, SO IT IS NOT THE EVIDENCE (review round 1, finding F3). The rescue exits 0
-    # BOTH for "archived and pushed" AND for "clean — nothing at risk" (`bg-rescue-wip.sh:186-196`), and
+    # BOTH for "archived and pushed" AND for "clean — nothing at risk" (`bg-rescue-wip.sh:296-309` clean,
+    # `:600-617` rescued), and
     # the two are distinguishable only by which path it took. A lane that COMMITS between the verdict
     # above and this call — a live lane on the periodic path, or simply a tree that changed under us —
     # makes the rescue take the clean path and push nothing, and a sweep that trusted the exit code then
@@ -1119,7 +1177,9 @@ for one in ${REPOS[@]+"${REPOS[@]}"}; do
   # a deferral and a lie. A clamped call that runs out of budget times out, and the list probe answers a
   # timeout with `worktree-list-failed`/`worktree-list-unverifiable` — i.e. `FAILED`, exit 3. Measured: it
   # turned this very arm into exit 3 "failed" instead of exit 1 "incomplete", and broke C5. So the bound
-  # here is stated as what it is (`WIP_SWEEP_BUDGET` + at most one repo listing), never tightened by turning
+  # here is stated as what it is (`WIP_SWEEP_BUDGET` + the repo iteration already in flight, which makes
+  # several unclamped repo-level calls and so can overrun by a small multiple of `WIP_SWEEP_STATUS_TIMEOUT`
+  # — measured 1.82x), never tightened by turning
   # "out of time" into "the repository is unreadable".
   # ⛔ `_repos_done` GUARDS THE FIRST REPO, and the guard is the point (#3588 review, cycle 10). With a
   # budget already spent during startup, an unconditional check here recorded the ONLY repo as `unreached`
