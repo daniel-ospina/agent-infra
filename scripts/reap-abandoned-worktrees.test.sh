@@ -40,10 +40,14 @@
 # guard's THREE references — HOME, CELL_HOME, the pass state dir), the keep list, `git-below`, the
 # bare-repo refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
 #
-# ⛔ THE FIVE BOUND-SHAPING CASES (A, C, D, E, H) ARE MUTATION-CHECKED (`expect_pass` then
-# `expect_fail` against a mutated copy); B, F and G are not, because their subjects (an `--apply`
-# removal, the operator override, the unchanged safety gates) are asserted directly and a mutation of
-# them would only reproduce the same assertion. A test that passes against a script with the bound
+# ⛔ SEVEN OF THE EIGHT CASES (A, C, D, E, F, G, H) ARE MUTATION-CHECKED (`expect_pass` then
+# `expect_fail` against a mutated copy); only B is not, because its subject (the `--apply` removal) is
+# asserted directly and a mutation of it would only reproduce the same assertion. G IS checked, and
+# round 7 is why an earlier "B, F and G are not" was wrong: emptying the variable (`MUT_CELLHOME`) and
+# reverting its USE SITE (`MUT_CELLHOME_REF`) are DIFFERENT edits, and only the use-site one shows the
+# FALLBACK protects anything. F IS checked by `MUT_NUMBOUND`, because "a bad seam is refused" is true of
+# a digit-shape check while the ceiling is still DELETABLE by an all-digit value it cannot compare.
+# A test that passes against a script with the bound
 # DELETED proves nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation
 # is a case that has silently stopped checking.
 #
@@ -338,6 +342,18 @@ case_f() { # <owner-script>
     case_check "$([ "$OUT_RC" = 2 ] && echo 0 || echo 1)" "a non-numeric REAP_AW_GITLESS_MAX is refused with exit 2 (rc=$OUT_RC)"
     case_check "$(grep -q 'REAP_AW_GITLESS_MAX' <<<"$OUT" && echo 0 || echo 1)" \
                "and the refusal NAMES the seam (not a bare usage dump)"
+    # ⛔ AND AN ALL-DIGIT BUT UNREPRESENTABLE SEAM IS A REFUSAL TOO. `[ 0 -ge 99999999999999999999 ]`
+    #    exits 2 ("integer expression expected"), and a `[ ]` failure inside an `if` reads as FALSE — so
+    #    a 19-digit ceiling did not clamp, it DISABLED the ceiling (measured round 8: 12 removable,
+    #    0 capped, rc=0, green SUMMARY — #3278's P3 shape shipped by a typo). A digit-shape check alone
+    #    cannot catch it, because every character of it IS a digit.
+    OUT="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
+           REAP_AW_PROC_ROOT="$FB/proc" REAP_AW_GITLESS_MAX=99999999999999999999 \
+           bash "$owner" --root "$FB/root" --include-gitless 2>&1)"; OUT_RC=$?
+    case_check "$([ "$OUT_RC" = 2 ] && echo 0 || echo 1)" \
+               "a 19+ digit REAP_AW_GITLESS_MAX is REFUSED (rc=$OUT_RC) — it cannot fit the shell's integer, so it would silently DISABLE the ceiling"
+    case_check "$(grep -q 'REAP_AW_GITLESS_MAX' <<<"$OUT" && echo 0 || echo 1)" \
+               "and that refusal names the seam rather than reading as 'unbounded'"
     return $((CASE_FAIL > 0))
 }
 
@@ -549,13 +565,27 @@ fi
 
 # MUT_CENSUS_FIRST makes the bound's DECISION depend on the census, i.e. the census runs first — the
 # pre-#3278 order whose overrun this PR exists to remove (one FULL census per remaining candidate).
-# The mutant is a single line so it stays portable, and it is caught only because case H now holds its
+# ⛔ IT IS ONE sed EXPRESSION OVER TWO CALL SITES, and the comment used to say "a single line": the
+# anchor matches BOTH `budget_spent` sites (the gitless arm's and the linked arm's), so both arms are
+# mutated. That is deliberate — case H is the LINKED arm's test, so a mutation confined to the gitless
+# arm would leave H green and the mutant would survive. It is caught only because case H now holds its
 # fixture: without the holder the bound fires either way and the mutant survives.
 MUT_CENSUS_FIRST='s|^        if budget_spent "$deadline"; then$|        if budget_spent "$deadline" \&\& ! lp_path_held "$CENSUS" "$canon"; then|'
 if apply_mutation "$OWNER" "$T/mut-census-first/reap-abandoned-worktrees.sh" -e "$MUT_CENSUS_FIRST"; then
     expect_fail "MUT_CENSUS_FIRST the census runs before the bound — case H must go RED" case_h "$T/mut-census-first/reap-abandoned-worktrees.sh"
 else
     bad "MUT_CENSUS_FIRST could not be applied — the bound's POSITION relative to the census is not checked"
+fi
+
+# MUT_NUMBOUND reverts `num`'s INTEGER-RANGE bound to a digit-shape check only — the exact state
+# round 8 measured. The seam is all digits, so the shape check passes; the COMPARISON is what fails,
+# and a `[ ]` failure inside an `if` reads as FALSE, so the destructive ceiling silently stops existing
+# rather than refusing. Case F must go RED: a ceiling that a typo can delete is not a ceiling.
+MUT_NUMBOUND='s|^    \[ "${#1}" -le 18 \]$|    return 0|'
+if apply_mutation "$OWNER" "$T/mut-numbound/reap-abandoned-worktrees.sh" -e "$MUT_NUMBOUND"; then
+    expect_fail "MUT_NUMBOUND num() loses its integer-range bound — case F must go RED" case_f "$T/mut-numbound/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_NUMBOUND could not be applied — the ceiling's RANGE bound is not being checked any more"
 fi
 
 # MUT_LINKED_BUDGET confines the time bound to the GITLESS arm: the linked arm is then unbounded before
