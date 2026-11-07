@@ -3749,11 +3749,14 @@ while IFS= read -r _ex; do
   # the graded population is now exactly the logged one.
   exec_total=$(( exec_total + 1 ))
   # ⛔ AN EXECUTED SCRIPT THAT LEFT NO END STATE IS NAMED, NOT PARSED (review P2, cycle 98). A driver that installs its
-  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end leaves NO END-STATE record — and when the arm
-  # first shipped (cycle 99) it wrote a `D` for that shape, which `_opts_for` read as an END state; before the arm (cycle
-  # 98) it wrote no record of any kind. Either way `_setu_verdict` would silently fall back to the textual parser, and
-  # the parser grades a `case` arm or an uncalled `fin()` wrongly in BOTH directions (measured: a bare driver of that
-  # shape printed ✅, and a genuinely protected one was named). "Executed but unobservable" must never read as clean.
+  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end leaves NO END-STATE record. BEFORE the trap arm
+  # (cycle 98) it wrote no record at all, so `_setu_verdict` silently fell back to the textual parser — and the parser
+  # grades a `case` arm or an uncalled `fin()` wrongly in BOTH directions (measured: a bare driver of that shape printed
+  # ✅, and a genuinely protected one was named). "Executed but unobservable" must never read as clean.
+  # WHEN the arm first shipped (cycle 99) it wrote a `D` for that shape instead, which `_opts_for` read as an END state,
+  # so the verdict came from a snapshot taken BEFORE the driver's own `set +u`: a bare driver graded PROTECTED, with NO
+  # parser fallback to soften it — the false PASS stated under `T` RECORDS ARE NOT A VERDICT below, and the reason this
+  # sweep now demands a `T`-vs-parser agreement rather than accepting either source alone.
   # Measured today: 172 executed paths, 172 with a record, 0 without.
   if [ -z "$(_opts_for "$_ex")" ]; then
     # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two sources answering the
@@ -3764,7 +3767,7 @@ while IFS= read -r _ex; do
     # top-level `set -u` while the real end state is BARE and the unbound read passes (rc=0, graded PROTECTED) — in TWO
     # shapes, and BOTH are text `_setu` cannot read, for the same reason (the flip is not a statement's command word):
     #   `f() { eval "set +u"; }` / `f`                        (the command word is `eval`);
-    #   `case "$x" in` / `  u) set +u ;;` / `esac`            (the first word is `u)` — the blind spot at :3645).
+    #   `case "$x" in` / `  u) set +u ;;` / `esac`            (the first word is `u)` — the `_setu` statement split).
     # Closing either needs a real end state (the `exit 0` the UNOBSERVABLE advice below recommends), so the residual
     # stands; it is stated here so the next lane does not read "agreement" as "proved".
     _tu="$(_trapopts_for "$_ex")"
