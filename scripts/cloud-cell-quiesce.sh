@@ -91,12 +91,45 @@ SWEEP=""
 # the record-as-pinroot spelling costs one `[ -s ]` test and removes the ambiguity if a writer ever moves.
 PINNED_ROOT=""
 [ -n "$PINNED_DIR" ] && PINNED_ROOT="$(dirname "$PINNED_DIR")"
+# ⛔ PARSES IS NOT SWEEPS — THE LAST FALSE PASS ON THIS HOOK (#3588 review). `-s` + `bash -n` accepted a
+# TRUNCATED PREFIX of a real `wip-sweep.sh`, and that is mechanically producible: `pi-bootstrap/setup.sh`
+# farms with `cp -f`, so an interrupted copy leaves a whole-line prefix. MEASURED on whole-line truncations
+# of the shipped sweep at 60/80/100/150 lines: all four PARSE, and `bash <prefix> --apply` exits **0 having
+# archived nothing** — so this hook printed "every dirty worktree … is archived on origin", set rc=0 and
+# `DONE`, over a box where NOTHING was archived, on the one path where the disk stops existing. That is the
+# exact false PASS the `-s` check was added to prevent, one level up.
+# So the candidate must BEHAVE in the read-only mode this hook already relies on: against a FRESH state dir
+# a usable sweep answers `status=never` with `rc=3` and a `detail=` naming the missing record. MEASURED
+# against the same truncations: 60/80/100/150 print NOTHING and exit 0 (refused); a 400-line prefix that
+# reaches partway into the reader answers `status=failed`/3 (refused — it is not `never`); the shipped
+# sweep answers `status=never`/3/`detail=no pass record at …` (accepted).
+# ⛔ `--print-status` WRITES NOTHING (its branch exits before the pass-start marker), and the state dir it
+# reads is a scratch `mktemp -d`, never `$O/state` — so probing a candidate can neither consume nor create
+# the record this hook is about to grade. `WIP_SWEEP_STATUS_FILE` is pointed into that scratch dir too, so
+# an inherited override cannot make the probe read a real record and answer `ok` for a broken candidate.
+# ⛔ IT IS NOT TIMEOUT-BOUNDED, and that is stated rather than implied: the bound would have to come from
+# `scripts/lib/bounded.sh`, which is resolved by the very candidate under test (it is not yet sourced
+# here), and `--print-status` runs only local `sed`/`date` work. A candidate that hangs there is a broken
+# install, the same class `docs/ops/wip-sweep.md` names for `bounded_lib_path`'s own probe.
+sweep_usable() { # sweep_usable <path> — it must ANSWER the reader's contract, not merely parse
+  [ -s "$1" ] || return 1
+  bash -n "$1" >/dev/null 2>&1 || return 1
+  local sd out rc st det
+  sd="$(mktemp -d 2>/dev/null)" || return 1
+  out="$(WIP_SWEEP_STATE_DIR="$sd" WIP_SWEEP_STATUS_FILE="$sd/wip-sweep.status" \
+        bash "$1" --print-status </dev/null 2>/dev/null)"; rc=$?
+  rm -rf "$sd" 2>/dev/null || true
+  [ "$rc" -eq 3 ] || return 1
+  st="$(printf '%s\n' "$out" | sed -n 's/^status=//p' | sed -n '1p')"
+  det="$(printf '%s\n' "$out" | sed -n 's/^detail=//p' | sed -n '1p')"
+  [ "$st" = never ] && [ -n "$det" ]
+}
 for c in "$REPO/scripts/wip-sweep.sh" \
          ${PINNED_ROOT:+"$PINNED_ROOT/wip-sweep.sh"} \
          ${PINNED_DIR:+"$PINNED_DIR/scripts/wip-sweep.sh"} \
          "$O/wip-sweep.sh" \
          "${HOME:-/nonexistent}/.pi/agent/scripts/wip-sweep.sh"; do
-  { [ -s "$c" ] && bash -n "$c" >/dev/null 2>&1; } && { SWEEP="$c"; break; }
+  sweep_usable "$c" && { SWEEP="$c"; break; }
 done
 step "wip-sweep: ${SWEEP:-<none found — WORK ON THIS BOX WILL NOT BE ARCHIVED>}"
 
@@ -150,7 +183,7 @@ sleep 2
 WIP_RC=0; WIP_WHY=""
 WIP_ONLY_LOCAL=0; WIP_LOCAL_WHY=""
 if [ -z "$SWEEP" ]; then
-  WIP_RC=3; WIP_WHY="wip-sweep.sh not found (looked at \$REPO/scripts, the tree the pin record ${HARNESS_PIN_REC} names, $O, \$HOME/.pi/agent/scripts)"
+  WIP_RC=3; WIP_WHY="no USABLE wip-sweep.sh (looked at \$REPO/scripts, the tree the pin record ${HARNESS_PIN_REC} names, $O, \$HOME/.pi/agent/scripts; a candidate must answer '--print-status' with status=never/rc=3, so a 0-byte, non-parsing or TRUNCATED copy is refused)"
   step "FATAL: wip-sweep: $WIP_WHY"
   step "FATAL: wip-sweep: UNCOMMITTED WORK ON THIS BOX WAS NOT ARCHIVED. Any dirty worktree here is lost if this cell is reclaimed."
 else

@@ -242,6 +242,7 @@ git -C "$T/bud/wt" worktree add -q "$T/bud/w2" -b fix/3485-bud-b 2>/dev/null
 git -C "$T/bud/wt" worktree add -q "$T/bud/w3" -b fix/3485-bud-c 2>/dev/null
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
   '  *" --verdict "*) sleep 2; echo "verdict=clean paths=0 branch=x slug=x issue=-"; exit 0 ;;' \
   'esac' \
   'exit 0' > "$T/stub-slow.sh"
@@ -332,6 +333,7 @@ mk_fixture toc fix/3485-toc || { echo "❌ fixture failed (toc)"; exit 1; }
 STUB="$T/stub-rescue.sh"
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
   '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-toc slug=issue-3485-toc issue=3485"; exit 1 ;;' \
   'esac' \
   'exit 0' > "$STUB"
@@ -351,6 +353,7 @@ grep -q '^archived=0$' "$T/state-toc/wip-sweep.status" 2>/dev/null \
 mk_fixture tcu fix/3485-tcu || { echo "❌ fixture failed (tcu)"; exit 1; }
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
   '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-tcu slug=issue-3485-tcu issue=3485"; exit 1 ;;' \
   'esac' \
   'exit 0' > "$T/stub-rescue2.sh"
@@ -438,6 +441,7 @@ UNCCOL="$(awk -F'\t' '$4 == "fix/1-x" {print $9; exit}' "$T/state-unc/wip-sweep.
 STUB_NOISS="$T/stub-noissue.sh"
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
   '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-3435 slug=issue-3485-3435"; exit 1 ;;' \
   'esac' 'exit 0' > "$STUB_NOISS"
 chmod +x "$STUB_NOISS"
@@ -662,6 +666,7 @@ O="$(cd "$T" && WIP_SWEEP_BUDGET=0 WIP_SWEEP_STATE_DIR="$T/state-bd0" bash "$SW"
 mk_fixture mk fix/3485-mk || { echo "x fixture failed (mk)"; exit 1; }
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
   '  *" --verdict "*) sleep 3; echo "verdict=clean paths=0 branch=x slug=x issue=-"; exit 0 ;;' \
   'esac' \
   'exit 0' > "$T/stub-slow2.sh"
@@ -790,6 +795,7 @@ mk_fixture rto fix/3485-rto || { echo "❌ fixture failed (rto)"; exit 1; }
 printf 'uncommitted edit\n' >> "$T/rto/wt/base.txt"
 printf '%s\n' '#!/usr/bin/env bash' \
   'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
   '  *" --verdict "*) echo "verdict=dirty paths=1 branch=fix/3485-rto slug=issue-3485-rto issue=3485"; exit 1 ;;' \
   'esac' \
   'sleep 10' \
@@ -1089,6 +1095,109 @@ has "$O_R4" 'not a USABLE' \
 [ "$_ELAPSED" -lt 15 ] \
   && ok "R4b …within the bound (${_ELAPSED}s against a 30 s hang — previously unbounded)" \
   || bad "R4b the usability probe was UNBOUNDED: ${_ELAPSED}s elapsed with STATUS_TIMEOUT=1"
+
+# ⛔ R5/R6/R7 — ANSWERING IS NOT CLASSIFYING (#3588 review). The probe used to accept ANY output containing
+# `verdict=`, so a three-line stub that ECHOED `verdict=cannot-verify` and exited 0 was a valid rescuer:
+# the reader then answered from a record on a box whose every pass fails. The probe now requires the
+# DOCUMENTED PAIR — the word AND the exit code the rescuer's own contract assigns it (`bg-rescue-wip.sh:210`
+# /`:288` answer the unmeasurable verdict as `cannot-verify` on **2**). R5 is the exact stub shape that used
+# to pass; R6 is the OTHER half (the right word, the wrong code) so neither half can be dropped alone; R7 is
+# the POSITIVE CONTROL, because without it a probe that refused everything would satisfy R5 and R6.
+# Each is judged on the READER surface with a record that a good pass left `ok` — that is where a wrong
+# answer is a false GREEN rather than a loud refusal (R0 above seeds `status=ok`).
+printf '%s\n' '#!/usr/bin/env bash' \
+  'echo "verdict=cannot-verify"; exit 0' > "$T/answers-not-classifies.sh"
+chmod +x "$T/answers-not-classifies.sh"
+O_R5="$(env WIP_SWEEP_RESCUE="$T/answers-not-classifies.sh" WIP_SWEEP_STATE_DIR="$T/state-rlib" \
+        bash "$SW" --print-status 2>&1)"; RC_R5=$?
+if [ "$RC_R5" -eq 0 ] || has "$O_R5" 'status=ok'; then
+  bad "R5 a rescuer that ECHOES a verdict and exits 0 answers GREEN on the reader surface (rc=$RC_R5): $O_R5"
+elif ! has "$O_R5" 'not a USABLE'; then
+  bad "R5 the wrong-code rescuer was not refused BY NAME (rc=$RC_R5): $O_R5"
+else
+  ok "R5 'verdict=cannot-verify' on exit 0 is REFUSED — the word without the rescuer's own code is not an answer"
+fi
+printf '%s\n' '#!/usr/bin/env bash' \
+  'echo "verdict=clean paths=0 branch=x slug=x issue=-"; exit 2' > "$T/right-code-wrong-word.sh"
+chmod +x "$T/right-code-wrong-word.sh"
+O_R6="$(env WIP_SWEEP_RESCUE="$T/right-code-wrong-word.sh" WIP_SWEEP_STATE_DIR="$T/state-rlib" \
+        bash "$SW" --print-status 2>&1)"; RC_R6=$?
+if [ "$RC_R6" -eq 0 ] || has "$O_R6" 'status=ok'; then
+  bad "R6 a rescuer answering 'verdict=clean' on exit 2 answers GREEN on the reader surface (rc=$RC_R6): $O_R6"
+elif ! has "$O_R6" 'not a USABLE'; then
+  bad "R6 the wrong-word rescuer was not refused BY NAME (rc=$RC_R6): $O_R6"
+else
+  ok "R6 'verdict=clean' on exit 2 is REFUSED — the code without the word it belongs to is not an answer"
+fi
+# R7: the POSITIVE CONTROL. A rescuer that answers the documented pair for a path that cannot exist IS
+# usable, so the reader must reach its own answer (`never` on a fresh state dir) instead of refusing the
+# rescuer. Without this arm R5/R6 are satisfied by a probe that refuses EVERYTHING.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
+  'esac' 'exit 0' > "$T/faithful-rescuer.sh"
+chmod +x "$T/faithful-rescuer.sh"
+O_R7="$(env WIP_SWEEP_RESCUE="$T/faithful-rescuer.sh" WIP_SWEEP_STATE_DIR="$T/state-r7" \
+        bash "$SW" --print-status 2>&1)"; RC_R7=$?
+if has "$O_R7" 'not a USABLE'; then
+  bad "R7 the POSITIVE CONTROL failed: a rescuer answering the documented pair was REFUSED, so R5/R6 prove nothing: $O_R7"
+elif [ "$RC_R7" -eq 3 ] && has "$O_R7" 'status=never'; then
+  ok "R7 positive control: the documented pair IS usable — the reader reaches its own 'never' answer past it"
+else
+  bad "R7 the faithful rescuer was accepted but the reader did not answer never/3 (rc=$RC_R7): $O_R7"
+fi
+
+# ⛔ R8/R9 — THE FARM FALLBACK IS A BRANCH, NOT A FOOTNOTE (#3588 review, item 3). Every R3 seam sets
+# `WIP_SWEEP_RESCUE`, so every one of them grades the PIN branch. The finding the usability probe exists for
+# named the FARMED copy — `$HOME/.pi/agent/scripts/bg-rescue-wip.sh`, which `pi-bootstrap/setup.sh` writes
+# with `cp -f` — and the code comment at `wip-sweep.sh:402-403` CLAIMS "a 0-byte copy at SELF_DIR or in the
+# $HOME farm was still ACCEPTED there", with no arm behind the claim. So the fallback could lose the probe
+# silently and the suites would stay green. Here the sweep is copied ALONE into a scratch dir ($SELF_DIR then
+# holds no rescuer), the library is pinned, and HOME is redirected: the $HOME production is the ONLY one left
+# that can answer, so what these arms measure is that branch and nothing else.
+FARMDIR="$T/farm"; FARMHOME="$T/farmhome"
+rm -rf "$FARMDIR" "$FARMHOME" "$T/farm-rescue.log" "$T/state-r8" "$T/state-r9"
+mkdir -p "$FARMDIR" "$FARMHOME/.pi/agent/scripts"
+cp "$SW" "$FARMDIR/wip-sweep.sh"
+[ -f "$FARMDIR/bg-rescue-wip.sh" ] \
+  && bad "R8 precondition failed: the scratch sweep dir already holds a rescuer, so the fallback is unreachable" \
+  || ok "R8 precondition: the copied sweep has NO sibling rescuer, so only a fallback can answer"
+# The USABLE farmed rescuer: logs every call (so the probe itself is observable) and answers the pair.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'echo "rescue:$*" >> "'"$T"'/farm-rescue.log"' \
+  'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
+  'esac' \
+  'exit 1' > "$FARMHOME/.pi/agent/scripts/bg-rescue-wip.sh"
+chmod +x "$FARMHOME/.pi/agent/scripts/bg-rescue-wip.sh"
+O_R8="$(env -u WIP_SWEEP_RESCUE HOME="$FARMHOME" WIP_SWEEP_BOUNDED_LIB="$HERE/lib/bounded.sh" \
+        WIP_SWEEP_STATE_DIR="$T/state-r8" bash "$FARMDIR/wip-sweep.sh" --print-status 2>&1)"; RC_R8=$?
+[ -s "$T/farm-rescue.log" ] \
+  && ok "R8 the $HOME FALLBACK is reached and PROBED when no sibling rescuer exists (the branch the finding named)" \
+  || bad "R8 the farmed rescuer was never probed, so the fallback branch is unexercised: $O_R8"
+if has "$O_R8" 'not a USABLE'; then
+  bad "R8b the USABLE farmed rescuer was REFUSED, so the fallback would refuse a correct box: $O_R8"
+elif [ "$RC_R8" -eq 3 ] && has "$O_R8" 'status=never'; then
+  ok "R8b …and a usable farmed rescuer is ACCEPTED — the reader reaches its own 'never' answer past it"
+else
+  bad "R8b the farmed rescuer was accepted but the reader did not answer never/3 (rc=$RC_R8): $O_R8"
+fi
+# R9 — THE CLAIM ITSELF: an INERT farmed copy must be REFUSED, not accepted because it sits at the farm.
+# `echo verdict=…; exit 0` is the shape that used to pass; at the farm it is exactly the truncated `cp -f`
+# install the probe exists for.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'echo "verdict=cannot-verify"; exit 0' > "$FARMHOME/.pi/agent/scripts/bg-rescue-wip.sh"
+chmod +x "$FARMHOME/.pi/agent/scripts/bg-rescue-wip.sh"
+O_R9="$(env -u WIP_SWEEP_RESCUE HOME="$FARMHOME" WIP_SWEEP_BOUNDED_LIB="$HERE/lib/bounded.sh" \
+        WIP_SWEEP_STATE_DIR="$T/state-r9" bash "$FARMDIR/wip-sweep.sh" --print-status 2>&1)"; RC_R9=$?
+if has "$O_R9" 'not a USABLE'; then
+  ok "R9 an INERT farmed rescuer is REFUSED by name — the fallback applies the same usability test as the pin"
+else
+  bad "R9 an inert farmed rescuer was ACCEPTED (rc=$RC_R9): the fallback branch skipped the probe: $O_R9"
+fi
+[ "$RC_R9" -eq 3 ] && has "$O_R9" 'status=failed' \
+  && ok "R9b …and the reader answers failed/3 rather than a stale green over a box whose every pass fails" \
+  || bad "R9b the inert-farm path did not answer failed/3 (rc=$RC_R9): $O_R9"
 
 # ⛔ THE UNMEASURED MESSAGE'S BACKTICKS, PINNED (#3588 review). Its label is S4m, NOT S4: the "one empty
 # listing out of two repos" arm is already S4, and two rows sharing a label make a red S4 unattributable in

@@ -349,7 +349,6 @@ need_int WIP_SWEEP_MAX             "$MAX"
 
 
 # ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
-# ── the rescue delegate: same policy as the bounded lib — a wrong path is named, never replaced ───
 # ⛔ AND EXISTENCE IS NOT USABILITY HERE EITHER (#3588 review). The library check above learned this
 # lesson; the rescuer did not. `[ -f ]` blessed a 0-BYTE farmed copy (the realistic truncation —
 # `pi-bootstrap/setup.sh` farms with `cp -f`, so an interrupted copy leaves a 0-byte executable), any file
@@ -360,10 +359,23 @@ need_int WIP_SWEEP_MAX             "$MAX"
 # and require a `verdict=` line. Measured discrimination — real rescuer `verdict=cannot-verify` (rc 2);
 # 0-byte file `rc=0` NO output; `/etc/hostname` `rc=0` junk; a parses-but-no-verdict script `rc=0` no verdict.
 # Only the real one passes, and that mode archives nothing.
-rescue_usable() { # rescue_usable <path> — it must actually ANSWER in its documented no-archive mode
+# ⛔ ANSWERING IS NOT CLASSIFYING (#3588 review). A `verdict=` line alone was satisfied by any script that
+# ECHOED one — measured: a parses-but-no-verdict prefix of this very rescuer answers nothing (so it was
+# already refused), but a three-line stub printing `verdict=cannot-verify` and exiting 0 was ACCEPTED, and
+# the reader then read `ok` off a box whose every pass fails. The probe therefore requires the documented
+# PAIR — the word AND the code the rescuer's own contract assigns it (`bg-rescue-wip.sh:210`, `:288`: the
+# unmeasurable verdict is `cannot-verify` on exit 2). A stub that returns the word with exit 0 is refused.
+# ⛔ NAMED RESIDUAL, not an implied guarantee: a rescuer FORGED to reproduce that exact pair is not
+# distinguishable without running a real classification against a generated dirty `git init` fixture, which
+# this probe deliberately does not do (it would put a multi-process, temp-dir-dependent fixture on every
+# pass AND every reader call). What a forged rescuer can win is a green READER over its own failed passes;
+# it cannot win a green PASS (every classification lands `cannot-verify` -> exit 3) and it archives nothing,
+# so no work is silently lost. Truncation, a stale pre-`--verdict` farm, a 0-byte copy and a non-script are
+# all refused, and those are the shapes an install produces.
+rescue_usable() { # rescue_usable <path> — it must ANSWER in its documented no-archive mode, with its code
   [ -f "$1" ] || return 1
   [ -s "$1" ] || return 1
-  local out
+  local out rc
   # ⛔ BOUNDED AND STDIN-CLOSED (#3588 review, B3). This probe was the only subprocess in this file running
   # WITHOUT the watchdog, and it runs on the READER path too — measured: a rescuer that sleeps made
   # `--print-status` emit nothing at all, killed only by an outer timeout. That is the one failure this pass
@@ -373,8 +385,11 @@ rescue_usable() { # rescue_usable <path> — it must actually ANSWER in its docu
   # `tb_resolve_timeout` has succeeded, and `STATUS_TIMEOUT` is already validated.
   # ⛔ AND THE BOUND IS PINNED (R4/R4b in wip-sweep.test.sh): the arm asserts the refusal AND the elapsed
   # time, and reddens when this prefix is removed (measured: 30 s elapsed with STATUS_TIMEOUT=1).
-  out="$(tb_timeout "${STATUS_TIMEOUT:-60}" bash -- "$1" --verdict /nonexistent-wip-sweep-usability-probe </dev/null 2>/dev/null)" || :
-  case "$out" in *verdict=*) return 0 ;; esac
+  out="$(tb_timeout "${STATUS_TIMEOUT:-60}" bash -- "$1" --verdict /nonexistent-wip-sweep-usability-probe </dev/null 2>/dev/null)"; rc=$?
+  # The DOCUMENTED pair, both halves: an answer with the wrong code is a rescuer whose verdict THIS sweep's
+  # allow-list would map to `cannot-verify` anyway (so every pass fails), never a rescuer.
+  [ "$rc" -eq 2 ] || return 1
+  case "$out" in *verdict=cannot-verify*) return 0 ;; esac
   return 1
 }
 RESCUE=""
@@ -386,15 +401,35 @@ if [ -n "${WIP_SWEEP_RESCUE:-}" ]; then
 else
   # THE FALLBACKS GET THE SAME TEST: a 0-byte copy at SELF_DIR or in the $HOME farm was still ACCEPTED
   # there, and the reader answered `ok`/0 over a box whose every pass fails.
-  if [ -n "${SELF_DIR:-}" ] && rescue_usable "$SELF_DIR/bg-rescue-wip.sh"; then
-    RESCUE="$SELF_DIR/bg-rescue-wip.sh"
-  elif rescue_usable "${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh"; then
-    RESCUE="$HOME/.pi/agent/scripts/bg-rescue-wip.sh"
+  # ⛔ AND A FALLBACK THAT EXISTS-BUT-IS-UNUSABLE IS NAMED AS SUCH (#3588 review, item 3/6). The refusal
+  # below used to say "not found or not a file" about a path that is present and non-empty, which sends the
+  # next operator hunting for a MISSING file on a box whose real fault is a truncated `cp -f` install — the
+  # exact shape the usability probe exists to catch. Arms R8/R9 grade this branch (nothing else did: every
+  # other seam pins `WIP_SWEEP_RESCUE`, so the fallback could have lost the probe with a green suite).
+  RESCUE_UNUSABLE=""
+  _add_unusable() { RESCUE_UNUSABLE="${RESCUE_UNUSABLE}${RESCUE_UNUSABLE:+, }$1"; }
+  if [ -n "${SELF_DIR:-}" ]; then
+    if rescue_usable "$SELF_DIR/bg-rescue-wip.sh"; then
+      RESCUE="$SELF_DIR/bg-rescue-wip.sh"
+    elif [ -e "$SELF_DIR/bg-rescue-wip.sh" ]; then
+      _add_unusable "$SELF_DIR/bg-rescue-wip.sh"
+    fi
+  fi
+  if [ -z "$RESCUE" ]; then
+    _farm="${HOME:-/nonexistent}/.pi/agent/scripts/bg-rescue-wip.sh"
+    if rescue_usable "$_farm"; then
+      RESCUE="$_farm"
+    elif [ -e "$_farm" ]; then
+      _add_unusable "$_farm"
+    fi
   fi
 fi
 # ⛔ A MISSING RESCUER MUST NEVER READ AS "NOTHING TO RESCUE". This is the same rule
 # `spawn-gate.sh`'s rescue seam already enforces (`rescue=UNAVAILABLE`, never `rescue=nothing`): the
 # absence of the tool says nothing about the state of the worktrees, so this REFUSES.
+if [ -z "$RESCUE" ] && [ -n "${RESCUE_UNUSABLE:-}" ]; then
+  refuse_startup 3 "bg-rescue-wip.sh is not a USABLE copy at: ${RESCUE_UNUSABLE} (it must answer '--verdict' with the documented pair — verdict=cannot-verify on exit 2 — for a path that cannot exist) — REFUSING: a rescuer that cannot classify archives nothing, and it is PRESENT-but-broken, not absent (the usual cause is an interrupted 'cp -f' farm: a 0-byte or truncated copy)"
+fi
 if [ -z "$RESCUE" ]; then
   refuse_startup 3 "bg-rescue-wip.sh not found or not a file (looked at \$WIP_SWEEP_RESCUE='${WIP_SWEEP_RESCUE:-}', ${SELF_DIR:-<no script dir>}, \$HOME/.pi/agent/scripts) — REFUSING: without it this sweep cannot archive anything, and a sweep that cannot archive is NOT 'nothing to rescue'."
 fi

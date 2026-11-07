@@ -285,11 +285,25 @@ scheduler yet, so the marker is the substitute.)
 (a consumer keyed on `rc=` finds a value even on a box that has never run).
 ⛔ **THE READER IS NEVER GREEN OVER A BOX THAT CANNOT SWEEP.** Every startup refusal — an unusable
 `WIP_SWEEP_BOUNDED_LIB` pin, an unparseable or zero bound (`WIP_SWEEP_BUDGET`, `WIP_SWEEP_MAX`, the two
-watchdogs, the staleness window), a rescuer that does not exist — is answered on the reader surface as
+watchdogs, the staleness window), a rescuer that does not exist **or does not answer in its documented
+read-only mode** (graded at the pin **and at both fallbacks** — the script's own sibling and the farmed
+`$HOME/.pi/agent/scripts` — and a copy that is PRESENT but unusable is named as present-but-broken, because
+`not found` over a truncated `cp -f` farm copy sends the next operator after the wrong fault) — is answered
+on the reader surface as
 `status=failed` / `rc=3` / `detail=<the cause>`, never as an older `ok`. That is why it is not literally
 "the record alone": a green from a record the pass could no longer reproduce would be the stale-green
 class this doc opens with. The ONE case it still answers from the record alone is a `WIP_SWEEP_BUDGET=0`
 or `--max 0` (documented disables), which change no verdict.
+⛔ **AND THE BOUND ON THAT CLAIM, stated rather than implied.** "Usable rescuer" is decided by a
+BEHAVIOURAL probe in the rescuer's own no-archive mode (`--verdict` on a path that cannot exist), and it
+requires the documented PAIR — the word `verdict=cannot-verify` **and** exit `2`, which is what
+`bg-rescue-wip.sh` assigns that answer. A 0-byte copy, a non-parsing file, a file that parses but has no
+`--verdict` mode, a TRUNCATED prefix of the real rescuer, an echo that exits 0, and the right code with
+the wrong word are all refused (arms R3, R5, R6). It is not a *classification* probe: a rescuer forged to
+reproduce that exact refusal pair is indistinguishable without running a real classification against a
+generated dirty `git init` fixture, which this pass deliberately does not do on every call. What such a
+forged rescuer can win is a green READER beside its own failed passes — it cannot win a green PASS (every
+classification lands `cannot-verify`, exit 3) and it archives nothing, so no work is silently lost.
 **`never` and `stale` are not success** — a sweeper that has not run is a box whose WIP is on the disk
 and nowhere else. The printed `status=` and `rc=` are the **derived** ones, emitted last, so the
 key=value surface agrees with the exit code; the recorded values are kept beside them as `recorded=` and
@@ -316,6 +330,18 @@ no longer runs first. When it does abort, it now also states the archive's own v
 cannot be misread as "nothing was at risk".
 
 - A missing or failing sweep is **loud** (`FATAL:` lines) and makes the quiesce **exit non-zero**.
+- **A candidate sweep must BEHAVE, not merely parse.** Each of `$REPO/scripts`, the pinned tree, `$O` and
+  the farmed `$HOME` is tried in turn, and a candidate is selected only when it answers `--print-status`
+  with `status=never` / `rc=3` / a `detail=` line against a FRESH scratch state dir. `-s` + `bash -n`
+  alone was a false PASS: measured on whole-line truncations of the shipped sweep at 60/80/100/150 lines,
+  all four PARSE and `bash <prefix> --apply` exits **0 having archived nothing**, so a cell was handed on
+  with the hook printing "every dirty worktree … is archived on origin" and `DONE`. `pi-bootstrap/setup.sh`
+  farms with `cp -f`, so that shape is producible by an interrupted install. An inert candidate does not
+  disable the hook — the next candidate is tried (arm E9e) — and the reader mode writes nothing, so the
+  probe can neither consume nor create the record the hook is about to grade. **The probe is not
+  watchdog-bounded**, stated rather than implied: the bound would come from `scripts/lib/bounded.sh`, whose
+  own resolution the candidate under test is supposed to provide, and `--print-status` runs only local
+  `sed`/`date` work — the same residual class this doc names for `bounded_lib_path`'s probe.
 - **`DONE` requires the pass record, not just exit 0.** The sweep exits 0 when `unpushed_worktrees>0`
   (correctly: it cannot archive commits), so the hook reads `$O/state/wip-sweep.status` and refuses
   `DONE` when that count is non-zero — a lane that committed and never pushed has a clean tree, so
