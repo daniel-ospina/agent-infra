@@ -1021,27 +1021,23 @@ def resolve_loop_lock():
         # changes MODE, not OWNERSHIP, so it does nothing about the `st_uid != getuid()` arm below
         # (the [VGATE] pass measured a 1777 root still degrading every operator loop), while it
         # would widen an operator-pinned private `FLEET_SCHEDULE_LOCK_ROOT` to world-writable for no
-        # benefit. So the root is created world-writable (the same 0o1777 shape `/dev/shm` itself
-        # has, which is what the DEFAULT root needs) and an EXISTING root's mode is left exactly as
-        # its owner set it. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
+        # benefit. So the mode is left entirely to the UMASK, on a created root and a pre-existing one
+        # alike (`makedirs(mode=…)` applies only to what it creates, and the kernel filters it), which
+        # is also `main`'s behaviour — this cut briefly corrected it to a hard 0o1777 and that was a
+        # regression, not a fix. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
         # has no lock root yet leaves it root-owned, and every operator loop then degrades with the
         # NOTE below — tracked as its own follow-up, since the sound fixes are a chown-uid decision.
-        # ⛔ ONLY A DIRECTORY WE CREATE MAY BE WIDENED. `makedirs(exist_ok=True)` cannot tell "just
-        # created" from "pre-existing", so the umask correction below is gated on the answer to that
-        # question — otherwise one `--start` turns an operator's deliberate 0700 pin into 1777 and
-        # then ANY local uid can create `loop.lock` naming a live `fleet-schedule --loop` it runs,
-        # which makes every operator loop refuse while `--start` exits 0: the box silently
-        # unscheduled, through a guard that was bypassed by widening its own directory.
-        created = not os.path.isdir(root)
+        # ⛔ AND NO `chmod`, ON *ANY* ROOT — not even one we create. Widening is the bypass, whichever
+        # directory it happens to: with `loop.lock` writable by others, ANY local uid can create one
+        # naming a live `fleet-schedule --loop` it runs, and every operator loop then refuses while
+        # `--start` exits 0 — the box silently unscheduled, through a guard defeated by the mode of
+        # its own directory. The gate this used to carry ("only a directory WE created may be
+        # widened") was measured to WEAKEN a fresh root: `makedirs`'s mode is umask-filtered (0o1755
+        # under 022), so the chmod on the created arm added world-write that was not there before —
+        # and it bought nothing, because the `st_uid != getuid()` arm below refuses a root another
+        # uid owns regardless of mode, so a world-writable root can never be SHARED across uids.
+        # The mode is therefore left to the umask, and a pre-existing root keeps its owner's choice.
         os.makedirs(root, mode=0o1777, exist_ok=True)
-        if created:
-            # `makedirs`'s mode is filtered by the umask, so under the usual 022 this lands 0o1755
-            # and the "world-writable, like /dev/shm" claim above would simply be false.
-            try:
-                if os.stat(root).st_mode & 0o7777 != 0o1777:
-                    os.chmod(root, 0o1777)
-            except OSError:
-                pass
         # /dev/shm is 1777 and this name is guessable, so a PRE-EXISTING foreign dir must never
         # become our lock dir (the same ownership rule, and the same reason, as disk-reaper.sh's
         # fallback candidates). Only a pre-existing dir can be foreign — an absent one we create.
@@ -2129,12 +2125,28 @@ def spawn_loop():
         # instead, so the child ran over a state dir the parent never reads and `--stop` set an OFF
         # switch the child never observed), and a relative `TEMPLATES_DIR` loaded a different job set
         # than the inline pass and `--verify` had just certified.
+        # ⛔ AND `INFRA_ROOT` IS THE FOURTH KNOB, not an exception to that rule. It is `abspath`-ed
+        # in `resolve_infra_root`, the child re-derives it from the RAW environment against
+        # `cwd="/"`, and `placeholder_values()` renders it as `{{AGENT_INFRA_PATH}}` into five
+        # shipped templates (ai-drainer, ai-multi-repo, controller-watchdog, objective-reminder,
+        # worker-supply). A relative `INFRA_ROOT` therefore rendered a DIFFERENT checkout in the
+        # child than in the parent's inline pass: with none of the child's own fallbacks a checkout,
+        # the placeholder rendered EMPTY, `render()` classified those five jobs as a named SKIP, and
+        # the loop ran ZERO of them while `--install` printed `SCHEDULE VERIFIED` — the same false
+        # PASS as a relative `TEMPLATES_DIR`, one knob over (measured by the #3636 reviewer, who
+        # watched the parent's marker carry the caller's path and the child's carry another).
+        # `SWARM_ROOT`/`TORTOISE_REPO` are NOT in this list on purpose: neither is `abspath`-ed
+        # anywhere, so both render VERBATIM in parent and child and cannot diverge. Named as a
+        # residual rather than silently normalised — making them absolute would change the argv the
+        # templates ship.
         child_env = os.environ.copy()
         child_env["FLEET_SCHEDULE_STATE"] = STATE
         if TEMPLATES_DIR:
             child_env["TEMPLATES_DIR"] = TEMPLATES_DIR
         if LOOP_LOCK_ROOT:
             child_env["FLEET_SCHEDULE_LOCK_ROOT"] = LOOP_LOCK_ROOT
+        if INFRA_ROOT:
+            child_env["INFRA_ROOT"] = INFRA_ROOT
         child_env.pop("FLEET_SCHEDULE_TMPFS_ROOT", None)
         child = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--loop"],
@@ -2486,7 +2498,15 @@ def cmd_verify():
         try:
             graded = {job.label for job in jobs}
             TEMPLATES_DIR = caller_templates
-            extra = [job.label for job in load_jobs() if job.label not in graded]
+            # ⛔ A NAMED SKIP IS NOT A DIVERGENCE. Every other reader of this runtime treats a
+            # declaration whose placeholders cannot resolve on THIS host as a `SKIP … for a named
+            # reason` — `--check` prints `DECLARATIONS OK` over it and the graded loop below
+            # `continue`s past it. Counting one as "a declaration no loop on this box runs" turned
+            # the documented non-fatal state into a `^  FAIL`, which `cloud-cell-bringup.sh` `die`s
+            # on: two homes whose checkouts are version-skewed (the operator's vs a cell's farmed
+            # copy, which lags by design) plus any shipped template that is a SKIP on a box without
+            # swarm/tortoise env bricked bring-up — the #3029 shape this change exists to close.
+            extra = [job.label for job in load_jobs() if job.label not in graded and not job.skip]
         except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the verdict
             # ⛔ "VANISHED WITHOUT A WORD" IS THE FAILURE MODE case 19x NAMES. A caller-side set
             # that cannot be read means the divergence could not be computed at all; swallowing that

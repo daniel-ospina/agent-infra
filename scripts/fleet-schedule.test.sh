@@ -3625,6 +3625,20 @@ mode19ab="$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0
   && ok "19ab a pre-existing private lock root keeps its 0700 mode (never widened)" \
   || bad "19ab the lock root was widened to $mode19ab — a foreign uid could plant the box's lock"
 pidAB="$(cat "$T/s19ab/loop.pid" 2>/dev/null)"; kill "$pidAB" 2>/dev/null; sleep 1
+# ⛔ AND A ROOT WE CREATE IS NOT WORLD-WRITABLE EITHER. `makedirs`'s mode is umask-filtered (0o1755
+# under the usual 022), so this cut's `if created: chmod(root, 0o1777)` ADDED world-write that `main`
+# never had — for no benefit: the `st_uid != getuid()` arm refuses a root another uid owns whatever
+# its mode, so a world-writable root can never be SHARED across uids, only ATTACKED. World-write here
+# is the bypass the arm above describes: any local uid can plant a `loop.lock` naming a live
+# `fleet-schedule --loop` it runs, and every operator loop then refuses while `--start` exits 0.
+rm -rf "$L19/ab2"
+env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ab2" FLEET_SCHEDULE_LOCK_ROOT="$L19/ab2" \
+    python3 "$SCHED" --start >/dev/null 2>&1
+mode19ab2="$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o0002))' "$L19/ab2")"
+[ "$mode19ab2" = "0o0" ] \
+  && ok "19ab a lock root WE created is NOT world-writable (no umask 'correction' widens it)" \
+  || bad "19ab a created lock root is world-writable ($mode19ab2) — any uid can plant the box's lock"
+pidAB2="$(cat "$T/s19ab2/loop.pid" 2>/dev/null)"; kill "$pidAB2" 2>/dev/null; sleep 1
 
 # 19ac — ⛔ A RELATIVE `TEMPLATES_DIR` MUST REACH THE CHILD RESOLVED TOO. The child runs `cwd="/"`,
 # so a relative set left it reading `/tpl`: `--start` printed "loop started", the loop logged
@@ -3839,6 +3853,92 @@ for pidAH in "$T/s19ahA/loop.pid" "$T/s19ahB/loop.pid"; do
   p="$(cat "$pidAH" 2>/dev/null)"; [ -n "$p" ] && kill "$p" 2>/dev/null
 done
 sleep 1
+
+# 19ai — ⛔ A RELATIVE `INFRA_ROOT` MUST REACH THE CHILD RESOLVED TOO. `INFRA_ROOT` is `abspath`-ed in
+# `resolve_infra_root()` and rendered as `{{AGENT_INFRA_PATH}}` into five shipped templates
+# (ai-drainer, ai-multi-repo, controller-watchdog, objective-reminder, worker-supply), but the child
+# re-derived it from the RAW environment against `cwd="/"`. A relative value therefore rendered a
+# DIFFERENT checkout in the loop than in the parent's inline pass; with none of the child's own
+# fallbacks a checkout the placeholder rendered EMPTY, `render()` classified the job as a named SKIP,
+# and the loop ran ZERO of those five jobs while `--install` printed `SCHEDULE VERIFIED` — the same
+# false PASS as a relative `TEMPLATES_DIR` (19ac), one knob over (measured by the #3636 reviewer).
+# ⛔ A COPY IN A SCRATCH DIR, DELIBERATELY (the same reason as 19ag/19ah): running the CHECKOUT's copy
+# makes the child's `here`-based fallback resolve the real farm, which masks the divergence entirely.
+mkdir -p "$T/bin19ai" "$T/fakeinfra19ai/root/templates/launchd" "$T/relcwd19ai"
+cp "$SCHED" "$T/bin19ai/fleet-schedule.py"
+printf '# none\n' > "$T/fakeinfra19ai/root/templates/launchd/RETIRED"
+MARK19AI="$T/out/marker19ai.log"
+python3 - "$T/fakeinfra19ai/root/templates/launchd" "$MARK19AI" <<'PY19AI'
+import os, plistlib, sys
+d = {"Label": "com.test.ainfra19ai",
+     "ProgramArguments": ["/bin/sh", "-c", "echo ainfra={{AGENT_INFRA_PATH}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.ainfra19ai.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AI
+out19ai="$(cd "$T/relcwd19ai" && env -u AGENT_INFRA_PATH -u TEMPLATES_DIR INFRA_ROOT=../fakeinfra19ai/root \
+  FLEET_SCHEDULE_STATE="$T/s19ai" FLEET_SCHEDULE_LOCK_ROOT="$L19/ai" FLEET_SCHEDULE_TICK=2 \
+  python3 "$T/bin19ai/fleet-schedule.py" --start 2>&1)"; rc19ai=$?
+[ "$rc19ai" -eq 0 ] \
+  && ok "19ai --start with a RELATIVE INFRA_ROOT exits 0" \
+  || bad "19ai --start exited $rc19ai: $out19ai"
+wait19ai=0
+while [ ! -s "$MARK19AI" ] && [ "$wait19ai" -lt 25 ]; do sleep 1; wait19ai=$((wait19ai + 1)); done
+[ -s "$MARK19AI" ] \
+  && ok "19ai the loop child RAN the {{AGENT_INFRA_PATH}} job (it rendered the placeholder)" \
+  || bad "19ai the child never ran the job — INFRA_ROOT resolved differently there: $out19ai / $(tail -3 "$T/s19ai/loop.log" 2>/dev/null)"
+grep -qvx "ainfra=$T/fakeinfra19ai/root" "$MARK19AI" 2>/dev/null \
+  && bad "19ai the child rendered a DIFFERENT {{AGENT_INFRA_PATH}}: $(grep -v '^ainfra=' "$MARK19AI" | head -2)" \
+  || ok "19ai ⛔ the child's render IS the path the parent resolved (one checkout, one argv)"
+pidAI="$(cat "$T/s19ai/loop.pid" 2>/dev/null)"; kill "$pidAI" 2>/dev/null; sleep 1
+
+# 19aj — ⛔ A NAMED SKIP IS NOT A DIVERGENCE. 19x turns a declaration no loop on the box runs into a
+# FAIL on purpose, but a declaration THIS HOST cannot run is a `SKIP … for a named reason` everywhere
+# else in the runtime (`--check` prints DECLARATIONS OK over it and the graded loop continues past it).
+# Counting one as a divergence produced a `^  FAIL`, which `cloud-cell-bringup.sh` `die`s on: two homes
+# with version-skewed checkouts (the operator's vs a cell's farmed copy, which lags by design) plus any
+# shipped template that is a SKIP on a box without swarm/tortoise env bricked bring-up — #3029's shape.
+mkdir -p "$T/tpl19ajA" "$T/tpl19ajB"
+cp "$GOOD"/*.plist "$T/tpl19ajA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19ajB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19ajA/RETIRED"; printf '# none\n' > "$T/tpl19ajB/RETIRED"
+mkplist "$T/tpl19ajB" com.test.skipme "$T/skipme.spec"
+# ⛔ THE PREMISE, ASSERTED: on THIS host the extra declaration is a named SKIP and not a runnable job.
+# Without it the arm would grade an ordinary divergence, and 19x would rightly still demand a FAIL.
+env -u SWARM_ROOT TEMPLATES_DIR="$T/tpl19ajB" FLEET_SCHEDULE_STATE="$T/s19ajB" \
+    python3 "$SCHED" --check > "$T/out/check19aj.txt" 2>&1
+grep -q 'SKIP .*com.test.skipme' "$T/out/check19aj.txt" \
+  && ok "19aj premise: the extra declaration is a NAMED SKIP on this host" \
+  || bad "19aj premise failed — the arm would grade an ordinary divergence: $(cat "$T/out/check19aj.txt")"
+s19 "$T/s19ajA" "$T/tpl19ajA" --install >/dev/null 2>&1
+pidAJ="$(cat "$T/s19ajA/loop.pid" 2>/dev/null)"
+[ -n "$pidAJ" ] && kill -0 "$pidAJ" 2>/dev/null \
+  && ok "19aj baseline: home A's loop holds the box (and its inline pass stamped its jobs)" \
+  || bad "19aj baseline loop never came up — the arm grades nothing"
+out19aj="$(env -u SWARM_ROOT TEMPLATES_DIR="$T/tpl19ajB" FLEET_SCHEDULE_STATE="$T/s19ajB" \
+  FLEET_SCHEDULE_LOCK_ROOT="$L19" python3 "$SCHED" --install 2>&1)"; rc19aj=$?
+grep -q '^  FAIL' <<<"$out19aj" \
+  && bad "19aj a named-SKIP declaration was graded a divergence: $out19aj" \
+  || ok "19aj ⛔ a named SKIP is NOT reported as a declaration no loop on the box runs"
+[ "$rc19aj" -eq 0 ] \
+  && ok "19aj --install exits 0 over a skipped extra declaration (bring-up is not bricked)" \
+  || bad "19aj --install exited $rc19aj over a named SKIP: $out19aj"
+grep -q "NOTE .*DIFFERENT state dir" <<<"$out19aj" \
+  && ok "19aj the two-home state is still DISCLOSED (only the SKIP became non-fatal)" \
+  || bad "19aj the divergence NOTE vanished — the fix over-reached: $out19aj"
+# ⛔ POSITIVE CONTROL: a RUNNABLE extra declaration is STILL a FAIL, so 19x's contract is not softened.
+python3 - "$T/tpl19ajB" <<'PY19AJ'
+import os, plistlib, sys
+d = {"Label": "com.test.extra19aj", "ProgramArguments": ["/bin/true"], "StartInterval": 3600}
+with open(os.path.join(sys.argv[1], "com.test.extra19aj.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AJ
+out19aj2="$(env -u SWARM_ROOT TEMPLATES_DIR="$T/tpl19ajB" FLEET_SCHEDULE_STATE="$T/s19ajB" \
+  FLEET_SCHEDULE_LOCK_ROOT="$L19" python3 "$SCHED" --install 2>&1)"; rc19aj2=$?
+grep -q 'run by NO loop on this box: com.test.extra19aj' <<<"$out19aj2" \
+  && ok "19aj CONTROL: a RUNNABLE extra declaration is still a FAIL (19x's contract intact)" \
+  || bad "19aj CONTROL: the fix swallowed a genuine divergence (rc=$rc19aj2): $out19aj2"
+kill "$pidAJ" 2>/dev/null; sleep 1
 
 # 19g — an UNUSABLE lock root must NOT wedge the box: it degrades to the state dir and DISCLOSES it.
 : > "$T/not-a-dir"
