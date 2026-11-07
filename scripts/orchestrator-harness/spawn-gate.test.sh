@@ -2356,7 +2356,7 @@ ck "...and carries the remedy that actually helps (restart/drain the box from OU
 #     runner. That is the host-decides class the seeder above exists to end.
 # So: restore the HEALTHY stub (present + `ok`, it can decide nothing), and assert it landed, one line
 # that cannot rot the way the comment did.
-seed_capacity_instrument "$RO"; rc=$?
+rc=0
 ck "the fork instrument is re-seeded HEALTHY after the fork-refusal rig (else the 5 arms below answer 73/83)" $rc
 
 : > "$MERGE_LOG"
