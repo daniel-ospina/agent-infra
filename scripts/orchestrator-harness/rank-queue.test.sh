@@ -3063,19 +3063,30 @@ _out_uid_excluded='arm-clip-unread/out mh-mode000/out poolguards/m000.log sa-unr
 # to `err` or `capture.txt` would be invisible too. A list of output FILENAMES has exactly the defect a list of
 # claim WORDINGS has. So the rule is inverted: every regular file at the TOP LEVEL of a case directory is pinned,
 # EXCEPT two short deny-lists of things that are not the operator's output —
-#   * by NAME (`order`, `rc`, `out-ctl`, `out-mut`, `mutlog`) — the queue's post-run bytes, the drive's exit
-#     status, and witness intermediates, each compared inside its own check;
-#   * by GLOB (`*.sh`, `trace*`, `*.trace`, in the `case` just below) — the fixture's own driver/helper scripts (input, never emitted) and
+#   * by NAME (`order`, `rc`, `out-ctl`, `out-mut`, `mutlog`) — and the reason differs per name, which the earlier
+#     wording hid by saying "each compared inside its own check": ONLY `order` (the queue's post-run bytes) and
+#     `out-mut` (the mutated drive's stdout) are read by a check. `rc` (the drive's exit status), `mutlog` (the
+#     no-op mutant's log, superseded by the product-file assertion that replaced it) and `out-ctl` (the control
+#     drive's stdout — EMPTY on its fixture; the control's evidence is its XTRACE, read via `_dwit`) are recorded
+#     and never compared. They are excluded as post-mortem artefacts, not as graded ones;
+#   * by GLOB (`*.sh`, `trace`, `trace-ctl`, `trace-mut`, `*.trace`, in the `case` just below) — the fixture's own
+#     driver/helper scripts (input, never emitted) and
 #     its XTRACE intermediates. `*.trace` also carries the per-run XTRACE NONCE, which differs on every run:
 #     pinning it would make this gate red for a reason that is not the shipped code.
 # The two mechanisms are kept apart because they are not interchangeable: the NAME list is a `case` WORD
 # comparison, which does NOT glob — a `*.sh` entry there would match nothing and read as coverage — and a GLOB
 # expansion in a `case` pattern position is not a pattern list (the `|` inside a variable's value stays literal),
 # so the globs are written out literally below rather than through a variable.
-# Everything else — `out`, `out-*`, `log`, `log<N>`, `*.log`, `err`, and a fixture's own inputs and record
-# files — is pinned, keyed `<case>/<file>`. A new fixture is therefore visible whatever it names its capture.
+# Everything else — `out`, `out-*`, `log`, `log<N>`, `*.log`, `err`, a DOT-PREFIXED capture (the scan sets `dotglob`
+# for its own duration), and a fixture's own inputs and record files — is pinned, keyed `<case>/<file>`. A new
+# fixture is therefore visible AT THE TOP LEVEL OF ITS CASE DIRECTORY, whatever its name.
 _out_not_capture='order rc out-ctl out-mut mutlog'
 _out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, sorted
+  # ⛔ `dotglob` FOR THE DURATION OF THE SCAN (review P3, cycle 75): `for _of in "${_od}"*` skips a DOT-PREFIXED
+  # name, so a fixture capturing to `.log` or `.stderr` would be invisible — the same class of hole as a filename
+  # whitelist, one character wide. The setting is restored to whatever it was, so nothing downstream changes.
+  case "$(shopt -p dotglob)" in 'shopt -s dotglob') _out_dg_was=1 ;; *) _out_dg_was=0 ;; esac
+  shopt -s dotglob
   for _od in "$TMP"/*/; do
     _on="${_od%/}"; _on="${_on##*/}"
     for _of in "${_od}"*; do
@@ -3085,7 +3096,10 @@ _out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, s
         *" $_ob "*) continue ;;
       esac
       case "$_ob" in
-        *.sh|trace*|*.trace) continue ;;
+        # ⛔ THE TRACE NAMES ARE SPELLED OUT, NOT `trace*` (review P3, cycle 75): the suite writes `trace`,
+        # `trace-ctl` and `trace-mut`, and a bare `trace*` would also swallow a future fixture whose CAPTURE is
+        # called `trace-summary` — a hole the size of the one this whole section exists to close.
+        *.sh|trace|trace-ctl|trace-mut|*.trace) continue ;;
       esac
       _okey="$_on/$_ob"
       case " $_out_uid_excluded " in *" $_okey "*) continue ;; esac
@@ -3096,6 +3110,7 @@ _out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, s
       printf '%s=%s\n' "$_okey" "$_ocrc"
     done
   done | LC_ALL=C sort
+  [ "$_out_dg_was" = 1 ] || shopt -u dotglob
 }
 _out_unique() { # the map above, deduped by content (many fixtures share an arm)
   _out_map | cut -d= -f2 | sort -u | tr '\n' ' ' | sed 's/ $//'
