@@ -1209,22 +1209,38 @@ _claim_commit_time() {
   # simply not a match — which lands on rc=1 (unmeasurable, KEPT and NAMED) instead of a forged age.
   # A76-A78 only exercised a token the `$` anchor REJECTS (`+0000 junk`), so they pinned the shape of the
   # fallback and not this: A79 drives a token that PARSES and must still not become the value.
-  # ⛔ `.*>` IS NOT "THE IDENT'S END" — `.*` IS GREEDY, SO IT BINDS THE **LAST** `>` ON THE LINE (review
-  # round 27, agent-infra#3203). The round-22 anchor above was measured only against `+0000 1 +0000` (a
-  # bare token); adding ONE `> ` in front of it put the steal straight back, because the last `> ` is then
-  # the forged one: measured on the round-22 file, `committer a <a@b> <NOW> +0000 > 1 +0000` — and the
-  # `<c@d>` variant — answered `1` while `git log -1 --format=%ct` dates the object at NOW, so
-  # `claim_prune` deleted a 0-second-old claim as `1794013553s old` (A88/A89 pin both shapes). The span is
-  # now git's OWN ident split (`ident.c::split_ident_line`: the FIRST `<`, then the FIRST `>` after it,
-  # then the date field) — `[^<]*<[^>]*>` — so a name legitimately carrying `> 1 +0000` still measures
-  # (A90 is that control), and a line whose mail span is followed by anything but the date field is not a
-  # match at all.
+  # ⛔ `.*> ` IS **GIT'S OWN RULE** — THE DATE FIELD AFTER THE **LAST** `>` ON THE LINE — AND IT WAS
+  # RIGHT (review round 27, agent-infra#3203). Round 27 was opened on a review finding claiming git reads
+  # the FIRST `<`…FIRST `>` span, and that `committer a <a@b> <NOW> +0000 > 1 +0000` is dated NOW by git.
+  # MEASURED against git 2.43.0 (`git hash-object -w -t commit --literally` + `git log -1 --format=%ct`),
+  # that premise is FALSE and the fix built on it was a REGRESSION: git dates the object from the field
+  # after the LAST `>`,
+  #
+  #   committer a <a@b> 1794013553 +0000                       git %ct = 1794013553
+  #   committer a <a@b> 1794013553 +0000 > 1 +0000             git %ct = 1            <- `.*> ` AGREES
+  #   committer a <a@b> 1794013553 +0000 <c@d> 1 +0000         git %ct = 1            <- `.*> ` AGREES
+  #   committer a <a@b> 111 +0000 > 222 +0000 > 333 +0000     git %ct = 333          <- `.*> ` AGREES
+  #   committer a <a@b> 1794013553 +0000 1 +0000              git %ct = 1794013553   <- `.*> ` abstains
+  #   committer a <a@b> 1794013553 +0000 junk                 git %ct = 1794013553   <- `.*> ` abstains
+  #
+  # so a mail-span anchor (`[^<]*<[^>]*>`) turned every object git dates ANCIENT into an UNMEASURABLE one.
+  # `claim_prune` `continue`s on an unmeasurable age BEFORE the bound is compared, so a peer appending
+  # ` > 1 +0000` would have held its claim FOR EVER — #3203's eternal hold restored, through the reaper
+  # reporting itself healthy. That is why the anchor is git's, not the mail span's.
+  # ⛔ THE INVARIANT, STATED SO IT CAN BE TESTED: **when this parse measures, it must equal
+  # `git log -1 --format=%ct`; it may only ABSTAIN where git is more tolerant than the `$` anchor.**
+  # The one divergence class is a tolerance, not a disagreement: git stops reading after the tz digits and
+  # ignores a trailing token, while the `$` anchor refuses the whole line — always in the KEEP direction
+  # (A79 pins that decision, A88-A92 pin the agreement with git on the shapes where it matters, including
+  # the `> 1 +0000` shapes git dates 1970 that must be REAPED and the `1 +0000 > <NOW> +0000` reverse sign
+  # that must NOT be). A76-A78 only exercised a token the `$` anchor REJECTS, so they pinned the shape of
+  # the fallback and not this.
   # ⛔ BOTH PROPERTIES ARE KEPT TOGETHER: byte-orientation (LC_ALL=C) decides WHICH BYTES are examined,
-  # and the mail-span anchor decides WHICH FIELD may become the value. Neither implies the other — a
+  # and the `> ` anchor decides WHICH FIELD may become the value. Neither implies the other — a
   # byte-oriented greedy `.* ` still read a forged second `digits +dddd` tail, and an anchored
   # locale-dependent `.` still answered differently on two boxes for the same object.
   ct="$(printf '%s' "$raw" | LC_ALL=C sed -n '/^$/q;p' | LC_ALL=C sed -n '/^committer /p' | tail -n 1 \
-        | LC_ALL=C sed -n 's/^committer [^<]*<[^>]*> \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
+        | LC_ALL=C sed -n 's/^committer .*> \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
   # ⛔ SELECT THE LAST `committer` LINE *FIRST*, THEN PARSE IT (review round 20, agent-infra#3203). The
   # parse above used to be ONE anchored `sed` piped to `tail -n 1`, which selects "the last line that
   # MATCHES", not "the last committer line". Git dates the object from the last `committer` header

@@ -687,17 +687,25 @@ def _commit_body(obj: str) -> str:
 # matches any run, and the LENGTH rule is a SEPARATE arm below — which is why a 13+ digit stamp rejects the
 # object instead of being skipped in favour of an earlier line. A bounded quantifier here silently changed
 # WHICH line's value is judged.
-# ⛔ ANCHORED ON THE MAIL SPAN — THE FIRST `<` THEN THE FIRST `>` — NOT `.*> ` (review round 27,
-# agent-infra#3203). `.*` is GREEDY, so `.*>` binds the LAST `>` on the line, not the ident's end: adding
-# one `> ` in front of the forged tail put round-22's steal straight back. Measured on the round-22
-# pattern, `committer a <a@b> <NOW> +0000 > 1 +0000` (and the `<c@d>` variant) answered `1` here while
-# `git log --format=%ct` dates the object at NOW, so the shell's reaper deleted a 0-second-old claim.
-# `[^<]*<[^>]*>` is `ident.c::split_ident_line`'s span verbatim (first `<`, first `>` after it) — the
-# same split git dates the object from — so a name legitimately carrying `> 1 +0000` still measures and
-# a forged tail after the span does not match at all. The two readers must agree on WHICH field is the
-# stamp, not merely on the line it is on — and both are pinned against the same two shapes (the shell
-# side is `test-claims.sh` A88-A90).
-_COMMITTER_TIME_RE = re.compile(r"^committer [^<]*<[^>]*> ([0-9]+) [+-][0-9]{4}$", re.M)
+# ⛔ `.*> ` IS GIT'S OWN RULE — THE DATE FIELD AFTER THE **LAST** `>` — AND IT IS CORRECT (review round 27,
+# agent-infra#3203). A round-27 review finding claimed git reads the FIRST `<`…FIRST `>` span and dates
+# `committer a <a@b> <NOW> +0000 > 1 +0000` at NOW. MEASURED against git 2.43.0 (`hash-object -w -t commit
+# --literally` + `git log -1 --format=%ct`): git dates from the field after the LAST `>`, so
+# `… <NOW> +0000 > 1 +0000` and `… <NOW> +0000 <c@d> 1 +0000` are dated **1** — this pattern and the
+# shell's agree with git on them. A mail-span anchor (`[^<]*<[^>]*>`) answered None for exactly those,
+# which is the PERMANENT-HOLD direction: `claim_prune` `continue`s on an unmeasurable age BEFORE the bound
+# is compared, so a peer appending ` > 1 +0000` would hold its claim for ever (#3203 re-opened).
+# ⛔ THE INVARIANT: when this reader measures, it must EQUAL `git log -1 --format=%ct`; it may only
+# ABSTAIN where git is more tolerant than the `$` anchor (a trailing token after the tz digits, which the
+# `$` anchor refuses whole) — always the KEEP direction, and A79 pins that decision. The shell side is
+# pinned to the same invariant by `test-claims.sh` A88-A92, which assert git's own answer as well as the
+# reader's.
+# ⛔ ANCHORED ON `> ` — NOT A BARE `.* ` (review round 22, agent-infra#3203). The bare greedy `.* ` took
+# the LAST `digits [+-]dddd` pair ANYWHERE on the line, including one NOT preceded by `> `, so
+# `committer a <a@b> <NOW> +0000 1 +0000` — which git dates at NOW — answered `1` here and the shell's
+# reaper deleted a 0-second-old claim. The two readers must agree on WHICH field is the stamp, not merely
+# on the line it is on.
+_COMMITTER_TIME_RE = re.compile(r"^committer .*> ([0-9]+) [+-][0-9]{4}$", re.M)
 
 
 def _commit_time(obj: str) -> Optional[int]:

@@ -856,28 +856,35 @@ def l30_committer_acceptance():
           "a SECOND 'digits +dddd' pair on the committer line must not become the stamp "
           "(the greedy .* read it as '1', dating a 0-second-old claim as ancient); got %r"
           % (cl._commit_time(obj(field_forged)),))
-    # ⛔ AND THE SAME STEAL THROUGH A SECOND `> ` (review round 27, agent-infra#3203). Round 22 replaced
-    # the greedy `.* ` with `.*> ` and measured it only against a tail that had NO `>` in front of it
-    # (`field_forged` above) — but `.*` is still GREEDY, so `.*> ` binds the LAST `>` on the line. One
-    # `> ` (or one `<c@d>`) in front of that same forged tail put round 22's answer straight back:
-    # measured on the round-22 pattern, BOTH shapes below answered `1` while `git log -1 --format=%ct`
-    # dates the object at `1793991810`, so the shell's reaper deleted a claim that was 0 s old. The pattern
-    # is now `ident.c::split_ident_line`'s span (FIRST `<`, then FIRST `>`), so neither shape measures.
+    # ⛔ AND THE SAME STEAL THROUGH A SECOND `> ` — AND WHY THE ANSWER IS THE **VALUE**, NOT `None`
+    # (review round 27, agent-infra#3203). A round-27 finding claimed git reads the FIRST `<`…FIRST `>` span,
+    # so `... +0000 > 1 +0000` would be dated NOW by git and only this pattern would answer `1`. MEASURED on
+    # git 2.43.0 (`hash-object -w -t commit --literally` + `git log -1 --format=%ct`): git dates from the
+    # field after the **LAST** `>`, so BOTH shapes below are dated **1** by git — the pattern AGREES, and an
+    # anchor on the mail span answered `None`, i.e. it refused to measure an object git dates 1970. That is
+    # the PERMANENT-HOLD direction: `claim_prune` `continue`s on an unmeasurable age BEFORE the bound is
+    # compared, so a peer appending ` > 1 +0000` would hold its claim for ever (#3203 re-opened). The pin is
+    # therefore on the VALUE git answers, not on an abstention — the two readers must agree with git, not
+    # merely with each other.
     greedy_forged = "committer a <a@b> 1793991810 +0000 > 1 +0000"
-    check(cl._commit_time(obj(greedy_forged)) is None,
-          "a forged tail after an EXTRA '> ' past the mail span must not become the stamp "
-          "(the greedy .*> read it as '1', dating a 0-second-old claim as ancient); got %r"
+    check(cl._commit_time(obj(greedy_forged)) == 1,
+          "a forged tail after the LAST '>' is dated 1 by git, so the reader must answer 1, not abstain "
+          "(an abstention here makes a git-ancient claim unreapable); got %r"
           % (cl._commit_time(obj(greedy_forged)),))
     greedy_forged_mail = "committer a <a@b> 1793991810 +0000 <c@d> 1 +0000"
-    check(cl._commit_time(obj(greedy_forged_mail)) is None,
-          "a later '<c@d>' mail-shaped span must not become the stamp either; got %r"
+    check(cl._commit_time(obj(greedy_forged_mail)) == 1,
+          "a later '<c@d>' mail-shaped span is not a split point for git either; got %r"
           % (cl._commit_time(obj(greedy_forged_mail)),))
-    # ...and the CONTROL that the fix must not over-reach: a committer NAME legitimately carrying a
-    # forged-LOOKING token BEFORE the mail span is still measured from the span (git reads the first `<`
-    # and the first `>` after it, so this object is dated `1793991810` by git too).
+    # ...and the reverse sign: a forged LATER stamp after a `>` must be MEASURED as git measures it, so a
+    # peer cannot delay a reap by appending `> <fresh> +0000`. git answers the SAME value here.
+    reverse_sign = "committer a <a@b> 1 +0000 > 1793991810 +0000"
+    check(cl._commit_time(obj(reverse_sign)) == 1793991810,
+          "a forged later stamp after '> ' is the value git reads; got %r"
+          % (cl._commit_time(obj(reverse_sign)),))
+    # ...and a name legitimately carrying a forged-LOOKING token BEFORE the date field still measures.
     name_with_tail = "committer a > 1 +0000 <a@b> 1793991810 +0000"
     check(cl._commit_time(obj(name_with_tail)) == 1793991810,
-          "a name carrying '> 1 +0000' BEFORE the mail span still measures the span's stamp; got %r"
+          "a name carrying '> 1 +0000' still measures the trailing stamp (git's answer); got %r"
           % (cl._commit_time(obj(name_with_tail)),))
     no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
     check(cl._commit_time(no_blank) == 1700000000,
