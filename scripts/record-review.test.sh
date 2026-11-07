@@ -6697,7 +6697,14 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main
         # (10a) An authored delta needs the artifact to NAME the range, so the default
         # body states it exactly as a reviewer would quote it.
-        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
+        # ⛔ #3442: the default body CARRIES the attribution block. Every delta arm has a
+        # subject that is NOT non-vacuity (the range, the classification, the anchor ordering),
+        # so a body without the block is refused by the non-vacuity arm and reports on a rule it
+        # does not pin — the unrelated-row trap #3442 rule 2 names, and exactly the fixture
+        # contract change 20e records for its own vectors.
+        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found.
+
+$VACUITY_BLOCK"
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
         rc=0
@@ -6721,7 +6728,9 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
 EP=425100; rm -f "$(Q2 $EP)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EP "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42510001" \
-    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "20a a base-borne merge-only delta with a real cover records clean (rc 0)"
 R20="$(cat "$(Q2 $EP)" 2>/dev/null || true)"
 assert_contains "$R20" '"delta_kind":"merge-only"' "20a the record says the range was merge-only"
@@ -6886,7 +6895,9 @@ run_record_carry_at() { # <pr> <recorded-sha> <live-sha> <ref> → $RECORD_RC $R
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra"
         export STUB_HEAD_SHA="$lsha" DELTA_GIT_DIR="$DG"
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main
-        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
+        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found.
+
+$VACUITY_BLOCK"
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         export STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
         rc=0
@@ -7181,7 +7192,9 @@ assert_contains "$RECORD_ERR" "incompatible with delta evidence" "20h10 the refu
 #      record — so the arm discriminates on the claim, not on the dates.
 EH14=425154; rm -f "$(Q2 $EH14)"
 run_record_delta $EH14 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" \
-    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "20h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
 assert_contains "$RECORD_ERR" "does not NAME the range" "20h12 the refusal names the missing range claim"
 [ -f "$(Q2 $EH14)" ] && bad "20h12 no record was written" || ok "20h12 no record was written"
@@ -7243,12 +7256,16 @@ assert_eq "$RECORD_RC" "3" "20h13 a modify/delete conflict resolved by hand is R
 EH16=425162; rm -f "$(Q2 $EH16)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EH16 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516301" \
-    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found."
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "20h14 merge-only + a cover posted AFTER A records clean (rc 0)"
 assert_contains "$(cat "$(Q2 $EH16)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h14 the range stays merge-only"
 EH17=425164; rm -f "$(Q2 $EH17)"
 run_record_delta $EH17 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516501" \
-    STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found."
+    STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "20h14 a cover PREDATING A is still refused (rc 3)"
 
 # 20h15 A BODY THAT STATES A DIFFERENT RANGE. Quoting a NARROWER range (X..B, X a
@@ -7257,7 +7274,9 @@ assert_eq "$RECORD_RC" "3" "20h14 a cover PREDATING A is still refused (rc 3)"
 EH18=425166; rm -f "$(Q2 $EH18)"
 run_record_delta $EH18 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
-    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "20h15 a body stating a NARROWER range is refused (rc 3)"
 assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal names the contradiction"
 [ -f "$(Q2 $EH18)" ] && bad "20h15 no record was written" || ok "20h15 no record was written"
@@ -7273,12 +7292,16 @@ assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h15 the refusal name
 EH19=425168; rm -f "$(Q2 $EH19)"
 printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
 run_record_delta $EH19 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516801" \
-    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "0" "20h16 merge-only + a cover naming A alone records clean (rc 0)"
 assert_contains "$(cat "$(Q2 $EH19)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20h16 the range stays merge-only"
 EH20=425169; rm -f "$(Q2 $EH20)"
 run_record_delta $EH20 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516901" \
-    STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+    STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found.
+
+$VACUITY_BLOCK"
 assert_eq "$RECORD_RC" "3" "20h16 a cover naming A but PREDATING A is still refused (rc 3)"
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
@@ -7311,7 +7334,9 @@ mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
         export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" DELTA_GIT_DIR="$DG"
         export STUB_EVIDENCE_PR="$pr" STUB_EVIDENCE_REPO="daniel-ospina/agent-infra" STUB_HEAD_SHA="$sha"
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main STUB_COMMIT_DATES_DIR="$T/dates"
-        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
+        export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found.
+
+$VACUITY_BLOCK"
         for kv in "$@"; do export "$kv"; done
         rc=0
         bash "$mut" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" >/dev/null 2>"$T/merr" || rc=$?
@@ -7398,7 +7423,9 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 # M14 — THE RANGE CONTAINMENT. Removing the ancestry test lets a body that declares a
 #       NARROWER range satisfy the claim for a wider one (20h15).
 MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
-mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found.
+
+$VACUITY_BLOCK"
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
@@ -7415,13 +7442,15 @@ mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "del
 #       drift, so this cell asserts REFUSED: it reddens precisely when the polarity
 #       regresses. It probes a real range (20a's), so the arm is actually reached.
 MUT="$(mk_mutant unnamedcheck '  thr=0
-  target_head_red "$to" || thr=$?' '  thr=3')"
+  SURFACE_OUT="$(check_surface_scan "$to")" || thr=$?' '  thr=0; SURFACE_OUT=nameless-status')"
 mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
 
 # M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that
 #       never says which range it reviewed — the date-only inference the arm replaced.
 MUT="$(mk_mutant rangeclaim '      for _needle in "$to" "${to:0:12}"; do' '      body_claim=1; for _needle in "$to" "${to:0:12}"; do')"
-mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
+mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found.
+
+$VACUITY_BLOCK"
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
