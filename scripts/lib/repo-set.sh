@@ -499,6 +499,14 @@ repo_set_parse() {
     # every consumer — and `set_tag_collisions` compares NORMALIZED slugs, so it cannot catch this pair
     # either. Two entries of one repo against one register is exactly what this arm forbids.
     _dupkey="$(_rs_normalize_slug "$slug")"
+    # ⛔ THE SENTINEL IS NOT A DEDUPE KEY (round 18, P2). `_rs_normalize_slug` answers
+    # `__UNASKABLE__` when the sibling will not LOAD, and that is a non-empty string — so the
+    # `[ -n ]` fallback below would NOT fire and EVERY entry would key to `__unaskable__`, refusing a
+    # healthy multi-repo set as DUPLICATE-SLUG (rc 5, wrapper exit 2) purely because the doctor was
+    # unloadable. Measured: a valid 2-repo fixture + an unloadable sibling went from `OK — 2 repo(s)`
+    # to `DUPLICATE-SLUG`/rc 5. Clear it so the slug-spelling fallback does its job, exactly as it does
+    # when normalisation is simply unavailable.
+    [ "$_dupkey" = "__UNASKABLE__" ] && _dupkey=""
     [ -n "$_dupkey" ] || _dupkey="$(_rs_lower "$slug")"
     case "$seen" in
       *$'\n'"$(_rs_lower "$_dupkey")"$'\n'*)
@@ -574,7 +582,12 @@ _rs_doctor_py() {
 
 # _rs_with_doctor <verb> <arg> — run ONE question against pr-doctor.py's own functions, so the reader
 # and the doctor cannot disagree about a remote, a slug, a tag set or the set's own splitting.
-# Prints the answer, or "" when nothing could be asked.
+# Prints the answer, or "" when nothing could be asked. ⛔ THE EXCEPTION IS THE SENTINEL: a verb whose
+# answer cannot legitimately be empty (`tags`, and `split` via `_rs_split_entries`) prints
+# `__UNASKABLE__` rather than "", because "" is a MEANINGFUL answer for them ("no tag collision", "no
+# divergence") and the caller cannot tell the two apart. `load` answers "OK" only when the module
+# actually executed. Keep this list true when adding a verb — a stale contract line here is how the
+# `tags` guard went a whole round reading a dead sibling as agreement.
 #
 # ⛔ THE VERB LIST IS PART OF THE CONTRACT — KEEP IT TRUE (review round 12, P2). It said `origin` or
 # `norm` long after three more verbs had been added, so a reader could believe the whole-set guards
@@ -604,15 +617,19 @@ try:
     spec.loader.exec_module(mod)
 except Exception:
     # ⛔ A SIBLING THAT WILL NOT LOAD IS ALSO "COULD NOT ASK" — AND THE ANSWER IS PER VERB (round 17,
-    # P2). This arm used to exit silently with empty stdout for EVERY verb, so the `tags` guard read a
-    # dead module as "no collision" and the one message that names the shared-state hazard never
-    # printed. Reachable in practice: a sibling whose annotations need a newer interpreter fails at
-    # exec_module on an older one.
-    # The `raise` below stays UNCONDITIONAL (`errno`-style early return): only `tags` is answered HERE,
-    # because only `tags` has no shell-side mapping. `split` needs nothing here because the SHELL turns
-    # its empty answer into `__UNASKABLE__` (`_rs_split_entries`), and `origin` already says "no
-    # python3, or it would not load". So the other four verbs keep their exact pre-fix bytes.
-    if verb == "tags":
+    # P2). This arm used to exit silently with empty stdout for EVERY verb, so a guard reading "" as a
+    # MEANINGFUL answer ("no collision", "no trimming needed") read a dead module as agreement.
+    # Reachable in practice: a sibling whose annotations need a newer interpreter fails at exec_module.
+    # ⛔ PER VERB, NOT A GLOBAL GATE (round 18 corrected round 17/18's own first attempt). Gating the
+    # whole-set proofs behind a loadability probe made the reader SKIP both guards, which suppressed the
+    # specific warnings and turned m29 red — strictly worse than the shape it fixed. Each guard that has
+    # a meaningful empty answer is told here instead:
+    #   tags  — "" means no collision          -> sentinel
+    #   strip — "" means "nothing to trim"     -> sentinel, and the wrapper's `_trim` falls back on it
+    #   split — mapped shell-side by `_rs_split_entries`
+    #   origin— already reports "no python3, or it would not load"
+    # The `raise` stays UNCONDITIONAL, so every other verb keeps its exact pre-fix bytes.
+    if verb in ("tags", "strip", "norm"):
         sys.stdout.write("__UNASKABLE__")
     raise SystemExit(0)
 if verb == "strip":
@@ -949,7 +966,7 @@ EOF
     expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
     diverged="$(_rs_split_divergence "$rendered" "$expected")"
   else
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves, or it would not LOAD. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
   fi
   if [ "$diverged" = "__UNASKABLE__" ]; then
     printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'

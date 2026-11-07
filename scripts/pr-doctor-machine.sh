@@ -195,8 +195,19 @@ case "$_rc" in
     # back as the original NBSP and the wrapper refused a pass the doctor ran with `REPO` instead.
     # Empty is a legitimate ANSWER here; only an unavailable doctor is a reason to fall back.
     _trim() {
-      local v="${1:-}"
-      if _rs_doctor_available; then _rs_strip "$v"; return 0; fi
+      local v="${1:-}" out
+      if _rs_doctor_available; then
+        out="$(_rs_strip "$v")"
+        # ⛔ `__UNASKABLE__` FROM THE STRIP VERB IS NOT A TRIMMED SEAM (round 18, P2). The reader emits
+        # it when the sibling is present but WILL NOT LOAD, because for `strip` the empty answer means
+        # "nothing to trim" — the two are otherwise indistinguishable, so every declared seam was
+        # silently trimmed to "" and this wrapper refused a DECLARED box while printing that nothing
+        # was declared. Fall back to the local trim instead of accepting a sentinel as a value.
+        case "$out" in
+          '__UNASKABLE__') : ;;
+          *) printf '%s' "$out"; return 0 ;;
+        esac
+      fi
       printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
     }
     _seam="$(_trim "${PR_DOCTOR_REPO:-}")"
@@ -225,7 +236,14 @@ case "$_rc" in
     if [ -n "$_seam" ] && [ "$_decided" = 0 ]; then
       _decided=1
       _seam_n="$(_rs_normalize_slug "$_seam")"
-      if [ -z "$_seam_n" ]; then
+      if [ "$_seam_n" = "__UNASKABLE__" ]; then
+        # ⛔ A VALID SLUG WE COULD NOT NORMALISE IS NOT AN INVALID SLUG (round 18, P2). Normalisation is
+        # delegated, so a sibling that is present but will not LOAD answers nothing — and this branch
+        # used to call that "not an owner/name slug", sending an operator who had already done everything
+        # right at the wrong defect. `norm` carries the sentinel for exactly this.
+        _why_not="PR_DOCTOR_REPO='$_seam' could not be normalised: the sibling pr-doctor.py is present but does not LOAD, or no python3 resolves"
+        _seam_n=""
+      elif [ -z "$_seam_n" ]; then
         _why_not="PR_DOCTOR_REPO='$_seam' is not an owner/name slug"
       else
         # Rank 2's checkout, when the launcher named one: a PROVEN disagreement is refused by the
@@ -244,7 +262,10 @@ case "$_rc" in
     if [ -n "$_or" ] && [ "$_decided" = 0 ]; then
       _decided=1
       _or_n="$(_rs_normalize_slug "$_or")"
-      if [ -z "$_or_n" ]; then
+      if [ "$_or_n" = "__UNASKABLE__" ]; then
+        _why_not="OR='$_or' could not be normalised: the sibling pr-doctor.py is present but does not LOAD, or no python3 resolves"
+        _or_n=""
+      elif [ -z "$_or_n" ]; then
         _why_not="OR='$_or' is not an owner/name slug"
       elif [ -n "$_proved" ] && [ "$(_rs_lower "$_proved")" != "$(_rs_lower "$_or_n")" ]; then
         _why_not="the box names two different repos: OR=$_or but REPO=$_repo is a checkout of $_proved"
