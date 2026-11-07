@@ -1476,6 +1476,21 @@ export const STALL_TERM_REGISTRY: readonly StallTerm[] = [
     guardedBy: "scripts/pi-reap-worktrees.test.sh G6e + G6f (rule 7, too-young)",
     note: "the reaper's too-young rule: NOTHING younger than this is removable, whatever else the rules say. It is the one clause that protects work a lane is actively writing, so it outranks the merged/aged/classification rules rather than being weighed beside them (#2756). NOTE the citation is deliberately only pi-reap-worktrees.test.sh: scripts/disk-reaper.test.sh:170 sets REAP_WT_MIN_AGE_MINUTES=0 in its own wrapper, i.e. it DISABLES rule 7 so its fixtures are not gated by it — it neither pins the 45 nor the behaviour, and citing it here would be a guard claim that reads backwards.",
   },
+  // — REAP_WT_PRESERVE_KEEP_DAYS: REGISTERED ABOVE, NOT HERE —
+  // This branch used to carry its OWN registration for that term, and the merge at 74ce0d413 kept BOTH: the
+  // copy inherited from `origin/main` (#3503, `axis: "retention"`, `guardedBy: NONE`) at the REAP_WT_*
+  // block and this one (`axis: "reap"`, guarded by `pi-reap-worktrees.test.sh G2aa`). Nothing rejects a
+  // duplicate — `forwardViolations` is per-term and the test builds a `Map` by name — so the later entry
+  // silently shadowed the earlier and the registry whose stated job is to be the ONE place a bound's
+  // movement is visible held two accounts of it, differing in `axis`, `guardedBy` and `note` (fresh review
+  // of PR #3399, P2 — REPRODUCED: `origin/main` has one occurrence, this head had two).
+  // ⛔ THE COMMENT THAT STOOD HERE ALSO BECAME FALSE, WHICH IS WHY IT IS DELETED RATHER THAN REWORDED: it
+  // described itself as "a BYTE-IDENTICAL COPY of the one PR #3431 registers" — while the copy that landed
+  // (#3503) is not byte-identical to the one this branch wrote. It also said "whichever lands second should
+  // drop its own copy", which is now an instruction with an addressee: #3503 is on `main`, so THIS branch is
+  // the one that drops its copy. The term stays registered exactly once, by the entry that landed first.
+  // ⛔ AND NOTHING IS LOST BY DROPPING IT HERE: `verify`'s reverse scan wants the term registered, not
+  // registered twice, and #3503's entry is in the same file under REAP_WT_AGED_DAYS / REAP_WT_MERGED_AGE_DAYS.
   {
     name: "MIN_AGE",
     owners: ["scripts/orchestrator-harness/lane-container-reap.sh"],

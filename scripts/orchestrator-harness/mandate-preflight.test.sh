@@ -66,6 +66,12 @@ INTERNAL: nothing — this is a TEST FIXTURE; its subject is the mandate disclos
 EXTERNAL: nothing — see INTERNAL.
 RUNG: 3 — web_fetch
 CONTRADICTION TEST: no recorded decision reaches this work — it is a test fixture.
+## PREVIOUS WORK
+CLAIM: unclaimed — test fixture
+WIP: keyless — test fixture: this brief is the subject of another suite, not a real dispatch
+BRANCH: none — test fixture
+WORKTREE: none — test fixture
+PRIOR: no previous attempt — test fixture
 BRIEF
 }
 

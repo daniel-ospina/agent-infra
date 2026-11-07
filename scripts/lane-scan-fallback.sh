@@ -49,8 +49,13 @@ bounded() {
 
 # Take the lock, breaking a stale one. A SIGKILLed run cannot clean up after itself, and bash does
 # not run an EXIT trap on SIGTERM either -- so age is the only reliable breaker.
+# ⛔ `date -r` FIRST, NEVER `stat -f %m` (agent-infra#3434): `stat -f %m` is BSD-only, and on GNU
+# coreutils `-f` is `--file-system`, so it prints the filesystem block to STDOUT and exits 1 -- the
+# `|| echo 0` then appends `0` to that block, and the arithmetic below dies BEFORE the age
+# comparison: `set -u` parses the block's first word as a variable name (`File: unbound
+# variable`). It is not a merely-wrong age — the fallback scan never runs while a lock exists.
 if ! mkdir "$LOCK" 2>/dev/null; then
-  lock_age=$(( $(date +%s) - $(stat -f %m "$LOCK" 2>/dev/null || echo 0) ))
+  lock_age=$(( $(date +%s) - $(date -r "$LOCK" +%s 2>/dev/null || echo 0) ))
   if [ "$lock_age" -gt "$STALE_LOCK_S" ]; then
     log "broke a stale lock (${lock_age}s old) -- taking over"
     rmdir "$LOCK" 2>/dev/null

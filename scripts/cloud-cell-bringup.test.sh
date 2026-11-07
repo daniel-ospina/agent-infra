@@ -62,6 +62,15 @@
 #     readiness over a failed read-back;
 #   * with the extension ABSENT and the provider healthy, `--check` reports NO provider failure.
 #
+# #2024 (the provider CREDENTIAL STORE), added here because the store is what the probe CANNOT see:
+#   `~/.pi/agent/auth.json` was `{}` on all five cells, pi exits with `No API key found` in ~8 s, and
+#   the probe still answers (it runs with the env the bring-up just sourced) while every LANE dies
+#   (lanes source nothing). The arms pin all four behaviours of the repair: materialise from the
+#   box's own `keys.env` (mode 600, pi's shape), REPORT it as a repair, REFUSE when `keys.env`
+#   carries no provider key (no guessing, no ambient source), and MERGE into an existing store
+#   without dropping an entry it did not write — plus the second home, which a lane and an operator
+#   read differently.
+#
 # Hermetic: temp HOME/state/token path, stubbed toolchain, no network, and GH_TOKEN_FILE keeps it
 # away from the REAL /tmp/.gh-tok. Run:  bash scripts/cloud-cell-bringup.test.sh
 # ⚠️ `--check` now also provisions the operational layer (#1723) from the checkout this script
@@ -95,6 +104,10 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-1718.XXXXXX")"
 # stopped on the way out — a detached loop outlives the suite otherwise and keeps ticking at a
 # deleted directory.
 export TEMPLATES_DIR="$T/schedule-templates"
+# ⛔ ONE LOOP PER BOX (#2890), pinned into the fixture: without this the scheduled layer this suite
+# brings up would contend with the HOST's own production scheduler (the cell lock is deliberately not
+# scoped to the state dir), so the suite would either fail or silently exercise nothing.
+export FLEET_SCHEDULE_LOCK_ROOT="$T/box-lock"
 mkdir -p "$TEMPLATES_DIR"
 printf '# fixture: nothing retired\n' > "$TEMPLATES_DIR/RETIRED"
 cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST
@@ -238,6 +251,12 @@ export HOME="$T/home"
 # would redden every arm on a Linux host for the fixture's own sake. Same kind of seam as
 # SYSTEMD_UNIT_DIR above; the shipped default is what cloud-cell-bringup.verify.test.sh's red arms use.
 export CELL_VOLATILE_ROOTS=/nonexistent-fixture-volatile-root
+# The account home is a passwd-record lookup — which a suite cannot pin, and which would resolve to
+# the RUNNER's own home: the store repair would then write a fixture credential into the developer's
+# ~/.pi/agent and the deny sweep would look at their extensions. Pinned EMPTY here (the second-home
+# leg is then inert); each arm that exercises it sets it explicitly. Same kind of seam as
+# SYSTEMD_UNIT_DIR / SWAP_SUDO / CELL_VOLATILE_ROOTS above.
+export CELL_ACCOUNT_HOME=""
 export SYSTEMCTL="$STUB/systemctl"
 printf '#!/bin/sh\ncase "$*" in\n  *is-enabled*) echo enabled ;;\n  *is-active*) echo active ;;\n  *list-timers*) echo "Mon 2026-10-19 00:30:00 UTC 1h left Sun 2026-10-18 23:30:00 UTC 3h ago eldato-disk-reaper.timer eldato-disk-reaper.service" ;;\n  *MainPID*) echo "MainPID=1234" ;;\n  *NRestarts*) echo "NRestarts=0" ;;\n  *show*) echo 0 ;;\n  *start*) mkdir -p "$CELL_HOME/orchestrator" 2>/dev/null; date +%%s > "$CELL_HOME/orchestrator/heartbeat" 2>/dev/null; exit 0 ;;\n  *enable*|*daemon-reload*) [ "${SYSTEMCTL_STUB_MODE:-ok}" = fail ] && exit 1; exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$STUB/systemctl"
 chmod +x "$STUB"/*   # glob, not an explicit "$STUB/git" "$STUB/pi" … list: the main-worktree-guard's script
@@ -558,6 +577,372 @@ case "$BR_OUT" in
   *"CELL READY"*) bad "CLAIMED readiness on a cell whose disk reaper is not scheduled" ;;
   *) ok "does not claim CELL READY when the reaper is unscheduled" ;;
 esac
+
+# ── 2a) the provider CREDENTIAL STORE (agent-infra#2024) ────────────────────────────────
+# MEASURED 2026-11-05 on all five cells: `~/.pi/agent/auth.json` was `{}` (2 bytes), and every launch
+# that did not source keys.env printed `Use /login …` / `No API key found for deepseek` and exited in
+# ~8 s — a ~300-byte log and no process, which a launch verifier reads as "ran" (seven lanes on one
+# box were all recorded as launched and all dead). The store is the ONLY source that survives a
+# launch which sources nothing, so the bring-up materialises it — FROM THE BOX'S OWN keys.env, never
+# from the checkout or a template (the decision at cell-install.sh:125 / auto-sync.ts:20 is about
+# COPYING and SYNCING; this is materialisation of a secret already on the box).
+# The fixtures below pin all four arms: materialise, report it as a REPAIR, REFUSE without a key,
+# and never overwrite what is already there.
+say_case "the provider credential store: materialised from keys.env, refused without one"
+AUTH="$T/home/.pi/agent/auth.json"
+# (a) An EMPTY home and a keys.env carrying DEEPSEEK_API_KEY: the store must be materialised — and the
+# run must say so as a REPAIR. Self-contained on purpose: the earlier cases in this file already
+# brought the cell up, so the store may exist by now, and an arm that asserted on their state would
+# pass for the wrong reason (and would silently stop testing the repair).
+rm -f "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ -s "$AUTH" ] && ok "--check materialised the provider store from keys.env (\$HOME/.pi/agent/auth.json exists)" \
+               || bad "--check left the provider store EMPTY on a cell that cannot then run a lane"
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "…holding the key keys.env carried, in pi's own shape ({\"provider\":{\"type\":\"api_key\",\"key\":…}})" \
+  || bad "the store does not hold the deepseek key from keys.env (got: $(jq -c . "$AUTH" 2>/dev/null))"
+[ "$(jq -r '.deepseek.type // ""' "$AUTH" 2>/dev/null)" = "api_key" ] \
+  && ok "…typed api_key, which is what pi resolves a stored credential from" \
+  || bad "the store entry is not typed api_key — pi would not resolve it"
+mode="$(ls -l "$AUTH" 2>/dev/null | awk '{print $1}')"
+case "$mode" in
+  -rw-------*) ok "…mode 600 (it is a credential, not a config file)" ;;
+  *)           bad "the provider store is $mode, not 600 — a cell-local secret is readable by anyone on the box" ;;
+esac
+case "$BR_OUT" in
+  *"REPAIRED provider store"*) ok "the materialisation is REPORTED as a REPAIR by name (never silent)" ;;
+  *) bad "the store was written silently — an operator must not have to diff the box to learn a secret was minted" ;;
+esac
+case "$BR_OUT" in
+  *"not a copy"*) ok "…and says what it is NOT (a copy from a checkout), which is the recorded decision it must not reverse" ;;
+  *) bad "the repair line does not distinguish materialising a local secret from copying one from the repo" ;;
+esac
+
+# (b) A store this script cannot parse is the cell's IDENTITY: it is REFUSED, never replaced.
+printf 'not json at all\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an unreadable provider store REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up certified a cell whose credential store it cannot read"
+[ "$(cat "$AUTH")" = "not json at all" ] \
+  && ok "…and the unreadable file was left BYTE-IDENTICAL (the cell's identity is never clobbered)" \
+  || bad "the bring-up REPLACED a store it could not read — credentials it does not understand were destroyed"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness over a store it could not read" ;;
+  *) ok "does not claim CELL READY over an unreadable store" ;;
+esac
+
+# (c) NO key anywhere: the refusal, and NO store written. An AMBIENT key is present here on purpose —
+# it is not a source (the image pre-sets a STALE one, and an ambient export does not reach a lane at
+# all), so a bring-up that materialised from it would mint a store pi accepts and the provider rejects.
+rm -f "$AUTH"
+printf 'MAX_LANES=4\n' > "$T/keys-nokey.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nokey.env" BR_EXTRA_ENV="DEEPSEEK_API_KEY=sk_ambient_decoy" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an empty store with no provider key in keys.env REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up GUESSED: it certified a cell whose store it could not materialise"
+[ ! -e "$AUTH" ] && ok "…and no store was written (a guessed store is worse than none)" \
+                 || bad "a store appeared with no keys.env key to build it from — something guessed"
+case "$BR_OUT" in
+  *"CELL READY"*) bad "CLAIMED readiness with no provider credential anywhere" ;;
+  *"CREDENTIAL STORE"*) ok "the refusal NAMES the credential store, not just 'probe failed'" ;;
+  *) bad "the refusal does not name the store — an operator would hunt the provider instead: $BR_OUT" ;;
+esac
+
+# (d) MERGE, NOT REPLACE (+ the second home, #2916/#2147). The cell home already holds an entry this
+# script knows nothing about; the account home has no store at all. A repair must keep the first and
+# materialise the second — and the ACCOUNT home (passwd record, pinned here by CELL_ACCOUNT_HOME) is
+# the home lanes do NOT run under.
+printf '{"zai":{"type":"api_key","key":"sk_keep_me"}}\n' > "$AUTH"
+mkdir -p "$T/otherhome"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_EXTRA_ENV="CELL_ACCOUNT_HOME=$T/otherhome" br ok normal --check
+[ "$(jq -r '.zai.key // ""' "$AUTH" 2>/dev/null)" = "sk_keep_me" ] \
+  && ok "an entry the bring-up did not write is PRESERVED across the repair (merge, never replace)" \
+  || bad "the repair DROPPED an existing entry — the cell's identity was overwritten"
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "…and the carried provider was ADDED beside it" \
+  || bad "the repair did not add the keys.env provider to a store that lacked it: $(jq -c . "$AUTH" 2>/dev/null)"
+[ "$(jq -r '.deepseek.key // ""' "$T/otherhome/.pi/agent/auth.json" 2>/dev/null)" = "fake" ] \
+  && ok "the ACCOUNT home's store was materialised too (both homes — a lane and an operator read different ones)" \
+  || bad "only ONE home was repaired: 'HOME=<account> pi' still answers 'No API key found'"
+
+# (f) THE SOURCE IS keys.env, NOT THE ENVIRONMENT — and the arm has to be built so it can TELL.
+# An earlier version exported an ambient DEEPSEEK_API_KEY and asserted the store got keys.env's value
+# — which was vacuous: sourcing keys.env OVERWRITES the ambient variable, so BOTH implementations
+# print the same thing. Here keys.env carries no deepseek key at all and the ambient decoy is the
+# only one in the process: a repair that read the environment would write it, and this asserts it
+# does not (it must refuse instead).
+rm -f "$AUTH"
+printf 'ANTHROPIC_API_KEY=\n' > "$T/keys-nodeepseek.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-nodeepseek.env" BR_EXTRA_ENV="DEEPSEEK_API_KEY=sk_ambient_decoy" br ok normal --check
+if [ ! -e "$AUTH" ] || [ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" != "sk_ambient_decoy" ]; then
+  ok "an AMBIENT-only key is never materialised into the store (keys.env is the only source)"
+else
+  bad "the store carries the AMBIENT value — the repair reads the environment, which is not a source"
+fi
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and the run REFUSES rather than certifying a box whose only key is ambient" \
+  || bad "the bring-up certified a cell whose credential exists only in the operator's shell"
+
+# (f) A WHITESPACE-ONLY store is `{}` wearing spaces: pi throws on it, so it needs repair — and the
+# writer must REPLACE it, not write THROUGH it. `jq '.[$p]=…' <whitespace file>` reads NO input, emits
+# nothing and exits 0, so a writer that trusts that would truncate the store to 0 bytes and report a
+# repair that did not happen (measured).
+printf '   \n\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "a WHITESPACE-ONLY store is replaced by a real one (not truncated to 0 bytes by a no-input jq)" \
+  || bad "the whitespace-only store was not repaired — the box still cannot authenticate: $(wc -c < "$AUTH" 2>/dev/null) bytes"
+
+# (g) AN EXISTING CREDENTIAL OF ANOTHER TYPE IS NEVER REPLACED. pi's oauth records carry a refresh
+# token this script could not recreate; overwriting one would destroy the cell's identity (the
+# decision at cell-install.sh:125), which the repair's own comment says it protects.
+printf '{"anthropic":{"type":"oauth","access":"acc-tok","refresh":"ref-tok","expires":9999999999}}\n' > "$AUTH"
+printf 'ANTHROPIC_API_KEY=sk_from_env\nDEEPSEEK_API_KEY=fake\n' > "$T/keys-oauth.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-oauth.env" br ok normal --check
+[ "$(jq -r '.anthropic.type // ""' "$AUTH" 2>/dev/null)" = "oauth" ] \
+  && ok "an existing 'anthropic' OAUTH entry is PRESERVED (merge, never replace)" \
+  || bad "the repair REPLACED an oauth credential with an api_key one — a refresh token it could never recreate is gone"
+[ "$(jq -r '.anthropic.refresh // ""' "$AUTH" 2>/dev/null)" = "ref-tok" ] \
+  && ok "…including its refresh token" \
+  || bad "the oauth entry's refresh token did not survive the repair"
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "…while the provider that had no entry was added" \
+  || bad "the repair skipped the provider it should have added: $(jq -c . "$AUTH" 2>/dev/null)"
+
+# (h) A BLANK assignment is not a key. `DEEPSEEK_API_KEY=` in keys.env is a placeholder, and
+# materialising it mints a store pi accepts and the provider rejects — so the bring-up must NOT write
+# one, and must REFUSE.
+rm -f "$AUTH"
+printf 'DEEPSEEK_API_KEY=\n' > "$T/keys-blank.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-blank.env" br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "a BLANK provider key in keys.env REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up certified a cell whose only key is a blank placeholder"
+[ ! -e "$AUTH" ] && ok "…and wrote NO store (a blank key is not materialised)" \
+                 || bad "a store was written from a blank assignment: $(jq -c . "$AUTH" 2>/dev/null)"
+case "$BR_OUT" in
+  *"its value is EMPTY"*) ok "…naming the blank assignment rather than the provider" ;;
+  *) bad "the blank-key refusal does not say the value was empty: $BR_OUT" ;;
+esac
+
+# (i) (superseded by (j3) below: a `key` a lane cannot READ is now REPAIRED in place rather than
+# refused — the file is sound and one FIELD is wrong, so refusing it would be a false block. The
+# refusal that remains is for a shape this script will not rewrite at all, pinned in (i2).)
+# (i2) AN `oauth` ENTRY IS NEVER TOUCHED, and it is not counted as a repair this script can make: it
+# carries a refresh token it could not recreate, so the bring-up refuses and names the file.
+printf '{"deepseek":{"type":"oauth","access":"","refresh":"","expires":9}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an oauth entry this script will not rewrite REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up certified a box whose only credential it cannot judge"
+[ "$(jq -r '.deepseek.type // ""' "$AUTH" 2>/dev/null)" = "oauth" ] \
+  && ok "…and the oauth record is left untouched (a refresh token it could not recreate)" \
+  || bad "the bring-up overwrote an oauth record"
+case "$BR_OUT" in
+  *"will not rewrite"*) ok "…naming it as a shape the script will not judge or replace" ;;
+  *) bad "the oauth refusal does not say what it will not do: $BR_OUT" ;;
+esac
+
+# (j) AN INVALID ENTRY FOR ANOTHER PROVIDER IS NOT A REFUSAL — and this arm is why the ORACLE matters.
+# A lane boots `AuthStorage`, whose `parseStorageData` is a plain `JSON.parse` that does NOT validate
+# entries (measured: `read("deepseek")` on this exact file returns the good key). The strict validator
+# is `ReadOnlyAuthStorage`, used only by `pi auth --no-refresh`. Refusing this file was a FALSE BLOCK
+# on a box whose lanes run; the CLI-invalid entry is reported instead, and the file is not rewritten.
+printf '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(cat "$AUTH")" = '{"deepseek":{"type":"api_key","key":"sk_ok"},"openai":false}' ] \
+  && ok "a CLI-invalid entry for ANOTHER provider is left BYTE-IDENTICAL (not this script's to rewrite)" \
+  || bad "the bring-up rewrote an entry it does not own"
+case "$BR_OUT" in
+  *"the pi CLI would reject"*) ok "…and it is REPORTED (a lane is unaffected; 'pi auth' is not)" ;;
+  *) bad "a CLI-invalid entry for another provider is silent: $BR_OUT" ;;
+esac
+case "$BR_OUT" in
+  *"pi REJECTS"*|*"NO provider in this file can authenticate"*)
+    bad "the run still claims pi cannot read the file — that is the CLI validator's rule, not a lane's" ;;
+  *) ok "…and the run does not claim the file is unreadable to pi" ;;
+esac
+
+# (j2) A TEMPLATE KEY is not a credential IN A CLEAN SHELL: `read()` resolves `$VAR` through the
+# environment, and a cell lane is launched with no environment. The repair writes a LITERAL key and
+# preserves the rest of the entry.
+printf '{"deepseek":{"type":"api_key","key":"$DEEPSEEK_API_KEY","note":"keep-me"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "a TEMPLATE key is replaced by the literal keys.env value (a clean-shell lane can use it)" \
+  || bad "a template key survives as a template — a clean-shell lane cannot resolve it: $(jq -c . "$AUTH" 2>/dev/null)"
+[ "$(jq -r '.deepseek.note // ""' "$AUTH" 2>/dev/null)" = "keep-me" ] \
+  && ok "…and the entry's other fields are PRESERVED" \
+  || bad "the repair dropped a field of the entry it merged into"
+
+# (j3) A KEY pi CANNOT READ (`key: 123` makes a lane THROW on `read()`) is repaired IN PLACE — the key
+# field is rewritten, nothing else is touched. Refusing the file instead would be a false block: the
+# store is sound and one field is wrong.
+printf '{"deepseek":{"type":"api_key","key":123,"note":"keep-me"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "a non-string key is repaired in place (a lane would THROW on it)" \
+  || bad "a non-string key survived — every lane read throws: $(jq -c . "$AUTH" 2>/dev/null)"
+[ "$(jq -r '.deepseek.note // ""' "$AUTH" 2>/dev/null)" = "keep-me" ] \
+  && ok "…preserving the entry's other fields" \
+  || bad "the repair dropped a field of the entry it merged into"
+
+# (k) A ROTATED KEY: the store WINS over keys.env (pi reads the store first), so a stale stored key
+# shadows a good one and the probe 401s. The repair must not overwrite the credential, but it must
+# SAY the store is what won — otherwise the operator is told to push a key that cannot take effect.
+printf '{"deepseek":{"type":"api_key","key":"sk_stale_in_store"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "sk_stale_in_store" ] \
+  && ok "an existing stored key is NOT overwritten by the delivered one (a decision, not a repair)" \
+  || bad "the repair overwrote an existing credential"
+case "$BR_OUT" in
+  *"DIFFERENT 'deepseek' key"*) ok "…and the SHADOW is reported by name, so a rotation is diagnosable" ;;
+  *) bad "a stale stored key shadows keys.env silently — the operator would chase the wrong half: $BR_OUT" ;;
+esac
+
+# (l) AN UNLISTED LANE PROVIDER is DERIVED, not refused-on-unknown: `PI_LANE_PROVIDER=zai` +
+# `ZAI_API_KEY` in keys.env must materialise a `zai` entry. A four-name table made both verbs unable
+# to judge `zai` — the supervisor passed a keyless box and the bring-up prescribed an edit its loop
+# would never read (review round 3).
+rm -f "$AUTH"
+printf 'ZAI_API_KEY=sk_zai_fixture\n' > "$T/keys-zai.env"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+BR_ENV_FILE="$T/keys-zai.env" BR_EXTRA_ENV="PI_LANE_PROVIDER=zai" br ok normal --check
+[ "$(jq -r '.zai.key // ""' "$AUTH" 2>/dev/null)" = "sk_zai_fixture" ] \
+  && ok "an unlisted provider (zai) is materialised from its DERIVED variable (ZAI_API_KEY)" \
+  || bad "PI_LANE_PROVIDER=zai was not materialised — the derived-variable path is broken: $(jq -c . "$AUTH" 2>/dev/null)"
+
+# (m) THE KEY-QUESTION IS `read()`'s, NOT A SHAPE ALLOW-LIST. Measured against pi on this host:
+# `!command` keys are EXECUTED, `$VAR` is resolved against the ENTRY's own `env` first, `$$`/`$!` are
+# escaped literals, and a LITERAL key never consults `env` at all. Every one of those is a working
+# credential, so the repair must not rewrite it — an earlier version classified them "not a
+# credential" and replaced the key, destroying exactly what pi's docs recommend.
+printf '{"deepseek":{"type":"api_key","key":"!printf %%s sk-from-op"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '!printf %s sk-from-op' ] \
+  && ok "a '!command' key is NOT rewritten (pi executes it; this script cannot judge it offline)" \
+  || bad "the repair overwrote a '!command' credential — pi runs that command to get the key"
+[ "$BR_RC" -ne 0 ] \
+  && ok "…and the cell is refused as \"does not rewrite\" (execution is how to settle it)" \
+  || bad "the bring-up certified a box on the strength of a command key it never ran"
+
+printf '{"deepseek":{"type":"api_key","key":"$DSK","env":{"DSK":"sk-env-scoped"}}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '$DSK' ] \
+  && ok "a \$VAR key the entry's OWN env supplies is left alone (pi resolves it there first)" \
+  || bad "the repair overwrote a template the entry's own env satisfies"
+
+printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "sk-literal" ] \
+  && ok "a literal key with an unusable env map is still a credential (env is never consulted for literals)" \
+  || bad "a working literal credential was refused/rewritten because of an env field pi ignores for literals"
+
+# (n) A STORE THE PROCESS CANNOT READ must never be REPLACED. `grep` fails identically on "no match"
+# and on EACCES, so a stat/grep-based classifier calls a mode-000 store "empty" and writes over
+# credentials it never saw (measured before this arm existed).
+printf '{"openai":{"type":"oauth","access":"a","refresh":"r","expires":9},"deepseek":{"type":"api_key","key":"sk-good"}}\n' > "$AUTH"
+chmod 000 "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an UNREADABLE store REFUSES the cell (rc=$BR_RC)" \
+                   || bad "bring-up certified a cell whose credential store it could not read"
+chmod 600 "$AUTH"
+[ "$(jq -r '.openai.access // ""' "$AUTH" 2>/dev/null)" = "a" ] \
+  && ok "…and it was NOT replaced: the oauth record inside it is still there" \
+  || bad "the bring-up REPLACED a store it could not read — a credential it cannot recreate is gone"
+
+# (o) THE ESCAPED-LITERAL SHORTCUT WAS A FAIL-OPEN, and this arm is what keeps it closed. `$$DSK` is
+# an escaped literal (pi yields the string "$DSK") — but `$$DSK$x` STARTS escaped and still carries an
+# unresolved `$x`, and pi resolves that to NO KEY. A shortcut that returned "present" on the `$$`
+# prefix certified such a box; measured against pi, then closed here.
+printf '{"deepseek":{"type":"api_key","key":"$$DSK"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = '$$DSK' ] \
+  && ok "an ESCAPED literal ('\$\$DSK') is a credential and is left alone" \
+  || bad "an escaped-literal key was rewritten — pi resolves it to a literal string"
+# ⛔ NOT-REWRITTEN IS NOT ENOUGH: a classifier that regressed this to `other` would die WITHOUT
+# touching the file and the arm above would stay green over a refused box.
+# ⛔ NOT `BR_RC -eq 0`: the whole run also has to survive the LATER gates, and on a non-cell host the
+# scheduled layer refuses for its own (documented) reasons — an arm keyed on rc would be measuring
+# this host, not the store. The store verdict is asserted where it is printed.
+case "$BR_OUT" in
+  *"will not rewrite"*|*"holds no usable"*|*"could not be written"*)
+    bad "an escaped literal was REFUSED by the store gate instead of accepted: $BR_OUT" ;;
+  *) ok "…and the store gate CERTIFIED it (no refusal in the run, even where a later gate stops)" ;;
+esac
+
+printf '{"deepseek":{"type":"api_key","key":"$$DSK$x"}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "'\$\$DSK\$x' is REPAIRED (pi resolves it to no key at all — a shortcut would have certified it)" \
+  || bad "an escaped prefix hid an unresolved variable: the box was certified on a key pi cannot yield"
+
+# (p) A STORE WITH NOTHING IN IT must never draw a CLI-invalid report: the warn path once read its own
+# first line off by one, so a fresh cell logged "the pi CLI would reject (empty)".
+rm -f "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+for empty_shape in absent '{}' '   '; do
+  case "$empty_shape" in
+    absent) rm -f "$AUTH" ;;
+    '{}')   printf '{}\n' > "$AUTH" ;;
+    '   ')  printf '   \n\n' > "$AUTH" ;;
+  esac
+  printf '%s\n' "$TOK_BODY" > "$TOK"
+  br ok normal --check
+  case "$BR_OUT" in
+    *"the pi CLI would reject"*) bad "an '$empty_shape' store was REPORTED as holding CLI-invalid entries: $BR_OUT" ;;
+    *) ok "an '$empty_shape' store draws NO CLI-invalid report (the warn path reads the right line)" ;;
+  esac
+done
+# …and the shape the delta's new clause names — an entry that is NOT an object — is reported and refused.
+printf '{"deepseek":false}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$BR_RC" -ne 0 ] && ok "an entry that is not a JSON object REFUSES the cell (a lane reads no key from it)" \
+                   || bad "a non-object entry was certified"
+case "$BR_OUT" in
+  *"will not rewrite"*) ok "…naming the shape it will not rewrite" ;;
+  *) bad "the non-object refusal does not say what it will not do: $BR_OUT" ;;
+esac
+
+# (q) …while a store the CLI WOULD reject is reported — even though the lane path uses the key fine.
+# `env: null` is INVALID to `ReadOnlyAuthStorage` (which validates the whole file) and ignored by a
+# lane's `read()` for a literal. Both halves are asserted: the key survives AND the report fires.
+printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "sk-literal" ] \
+  && ok "a literal key with env:null is NOT rewritten (pi ignores env for literals)" \
+  || bad "the repair rewrote a working literal credential"
+case "$BR_OUT" in
+  *"the pi CLI would reject"*deepseek*) ok "…but the CLI-invalid entry IS reported (pi auth would refuse the file)" ;;
+  *) bad "an entry the pi CLI rejects is silent — the one signal that says 'pi auth' will refuse: $BR_OUT" ;;
+esac
+
+# restore a healthy store for every arm after this block
+rm -f "$AUTH"
+printf '%s\n' "$TOK_BODY" > "$TOK"
+br ok normal --check >/dev/null 2>&1
+[ "$(jq -r '.deepseek.key // ""' "$AUTH" 2>/dev/null)" = "fake" ] \
+  && ok "the fixture is healthy again for the sections below" \
+  || bad "the fixture store was not restored — later sections would measure the wrong state"
 
 # ── 2b) a cell that ALREADY carries the layer is a read-back, not a re-install (#1723) ───────────
 # `--check` verifies first and only installs when the read-back refuses, so a re-run against a
@@ -1556,7 +1941,9 @@ rm -rf "$T/standalone"
 #     (not fatal — several trees can be legitimate — but never silent);
 #   * that a clean box passes and says `ok`, so the check cannot be an always-red arm that tells nobody
 #     anything;
-#   * that an EMPTY population is a warn, never a pass.
+#   * that an EMPTY population is an `unverified` VERDICT (not a `warn` with a word in it — the verdict is
+#     the contract, because it is what keeps the `CELL READY` banner from claiming the check), so it is
+#     never a pass.
 # ⛔ THE ARMS ASSERT THE IDENTITY VERDICT, not the whole bring-up's exit status. On a host whose
 # launchd/schedule layer refuses (this suite's own documented temp-HOME shape) the run dies AFTER this
 # check, and an arm keyed on `rc` would then be measuring that environment rather than this predicate.
@@ -1806,6 +2193,101 @@ OWN_OUT="$(WORKDIR="$T/ident-own/cell" REPO_SLUG=daniel-ospina/tortoise \
   && ok "the box's own repo is WORKDIR's origin (agent-infra), not the REPO_SLUG default (tortoise)" \
   || bad "own repo read as '$OWN_OUT' with WORKDIR an agent-infra checkout — a hardcoded default is being used"
 
+say_case "repo identity: a preserved harness copy is declared, but the specific rows still own their names"
+# ⛔ THE `harness.*` FAMILY MUST NOT CAPTURE THE MORE SPECIFIC ROWS (review finding, P2). It captured
+# `harness.not-a-worktree` (the name this repo's own pin repair tells the operator to create, which has its
+# own row and reason) and `harness.<x>-legacy-YYYYMMDD` (whose row exists so a quarantine of ANY repo is a
+# declared exception — scoped to agent-infra it refused a tortoise quarantine, with the usual rename remedy).
+PRES_OUT="$(bash -c '. "$1"; for n in harness.not-a-worktree harness.quarantine-legacy-20260101 harness.preserved-012629; do printf "%s|" "$(repo_identity_declared "$n" | head -1)"; repo_identity_declared "$n" | tail -1 | cut -c1-40; printf "\n"; done' _ "$HERE/orchestrator-harness/repo-slug.sh" 2>&1)"
+case "$PRES_OUT" in
+  *"agent-infra|a QUARANTINE created by"*) ok "the pin-repair name keeps its own row and reason" ;;
+  *) bad "harness.not-a-worktree lost its own row (the preserved-copy glob captured it): $PRES_OUT" ;;
+esac
+case "$PRES_OUT" in
+  *"*|a dated QUARANTINE"*) ok "a dated quarantine under a harness-prefixed name may still hold ANY repo (the repo COLUMN is asserted, not just the reason — a scoping regression must redden this)" ;;
+  *) bad "a harness-prefixed dated quarantine was scoped to one repo — a tortoise quarantine would be refused: $PRES_OUT" ;;
+esac
+case "$PRES_OUT" in
+  *"agent-infra|a PRESERVED or STALE harness copy"*) ok "and a preserved copy is declared with its own reason" ;;
+  *) bad "harness.preserved-<date> is not declared as a preserved copy: $PRES_OUT" ;;
+esac
+
+say_case "repo identity: a real divergence is still REPORTED when another head could not be read"
+# ⛔ ORDERING MATTERS (review finding, P2). With the unread arm first, a group of two READABLE heads at
+# different commits plus one unborn head said "not a divergence" — a false statement about data the check
+# did read. Only the readable heads can establish a divergence; the unread one stays named in the listing.
+mk_checkout "$T/ident-divmix/agent-infra" "https://github.com/daniel-ospina/agent-infra.git" dm1 \
+  && cp -a "$T/ident-divmix/agent-infra" "$T/ident-divmix/ai" \
+  && git -C "$T/ident-divmix/ai" -c user.email=f@x.invalid -c user.name=f commit -q --allow-empty -m dm2 >/dev/null 2>&1 \
+  && ok "fixture: two copies of one repo at DIFFERENT commits" \
+  || bad "fixture: could not create the diverging pair"
+mkdir -p "$T/ident-divmix/harness.preserved-0101"
+git init -q "$T/ident-divmix/harness.preserved-0101" >/dev/null 2>&1
+git -C "$T/ident-divmix/harness.preserved-0101" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+DIVMIX="$(bash -c '. "$1"; REPO_SLUG=daniel-ospina/agent-infra repo_identity_scan "$2"' _ \
+  "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-divmix" 2>&1)" || true
+case "$DIVMIX" in
+  *"at DIFFERENT heads"*) ok "two readable heads at different commits are reported as a divergence, even beside an unread one" ;;
+  *"could not be READ"*"not a divergence"*) bad "a REAL divergence was reported as 'not a divergence' because another head was unread" ;;
+  *) bad "the mixed readable/unread group produced no divergence verdict: $(printf '%s' "$DIVMIX" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: two trees whose HEAD cannot be read do not 'agree'"
+# ⛔ A REVIEW FOUND THIS AND IT WAS A P2. `_head` holds the sentinel `<unreadable>` for an unborn HEAD
+# (`git init` + `remote add`, the exact fixture shape both doctor suites use), so a group of two could not
+# be told apart from a group of two that AGREE — and the report printed "all at the same head" about data
+# nothing read. The `, `-separator bug inverted: this message invented a convergence.
+# Two checkouts with an origin but NO COMMIT: `rev-parse HEAD` answers nothing, which is the shape the
+# doctor suite's own `$T/repo` fixture has.
+for d in agent-infra ai; do
+  mkdir -p "$T/ident-unborn/$d"
+  git init -q "$T/ident-unborn/$d" >/dev/null 2>&1
+  git -C "$T/ident-unborn/$d" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+done
+UNBORN_OUT="$(REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; repo_identity_scan "$2"' _ "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-unborn" 2>&1)" || true
+case "$UNBORN_OUT" in
+  *"all at the same head"*) bad "the report claims two trees AGREE on a head it could not read: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+  *"could not be READ"*|*"unknown"*) ok "an unread HEAD is reported as unknown — neither a divergence nor an agreement" ;;
+  *) bad "an unreadable-head group produced no honest line: $(printf '%s' "$UNBORN_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+
+say_case "repo identity: a preserved HARNESS copy is not a lying directory, and a group reports only ITS own resolution"
+# ⛔ TWO REVIEW FINDINGS, ONE FIXTURE EACH.
+# (a) `harness.<suffix>` — `disk-floor.sh` names `harness.stray-*`/`harness.preserved-*` as its stale-copy
+#     class and refuses to delete anything carrying `.git`; `docs/ops/disk-consumers.md` MEASURES
+#     `harness.preserved-012629` inside `/tmp/cell-home`, a default root. A preserved copy is a real clone of
+#     agent-infra, so it read FATAL — a remedy inviting a rename of a preserved copy on a healthy cell.
+# (b) the duplicate report's `resolves` scan was not scoped to its group, so the TORTOISE line could report
+#     the AGENT-INFRA path as the tree REPO resolves to (and that non-empty value suppressed the honest
+#     "nothing here resolves" sentence).
+mk_checkout "$T/ident-pinpre/home/harness.preserved-012629" "https://github.com/daniel-ospina/agent-infra.git" pp1 \
+  && ok "fixture: a preserved harness copy under the cell home" \
+  || bad "fixture: could not create the preserved harness copy"
+BR_IDENT_ROOTS="$T/ident-pinpre/home" br ok normal --check
+case "$BR_OUT" in
+  *"CHECK FAILED [repo identity]"*) bad "a PRESERVED HARNESS COPY was refused — the remedy invites renaming a preserved copy: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+  *"DECLARED exception name 'harness.preserved-012629'"*) ok "a preserved harness copy is a declared exception, not a directory to move" ;;
+  *) bad "the preserved harness copy produced no verdict: $(printf '%s' "$BR_OUT" | tr '\n' ' ' | cut -c1-400)" ;;
+esac
+for r in agent-infra ai tortoise tortoise-old; do
+  case "$r" in agent-infra|ai) url=https://github.com/daniel-ospina/agent-infra.git ;; *) url=https://github.com/daniel-ospina/tortoise.git ;; esac
+  mk_checkout "$T/ident-two/$r" "$url" "g-$r" || bad "fixture: could not create …/$r"
+done
+ok "fixture: TWO duplicated repos, so a group can pick up the wrong group's path"
+TWO_OUT="$(REPO="$T/ident-two/agent-infra" REPO_SLUG=daniel-ospina/agent-infra \
+  bash -c '. "$1"; repo_identity_scan "$2"' _ "$HERE/orchestrator-harness/repo-slug.sh" "$T/ident-two" 2>&1)" || true
+# the tortoise group's line must NOT claim REPO (an agent-infra path) as its resolution
+TORTOISE_LINE="$(printf '%s\n' "$TWO_OUT" | grep -F 'daniel-ospina/tortoise is checked out')"
+case "$TORTOISE_LINE" in
+  *"REPO->"*) bad "the tortoise group reported the AGENT-INFRA path as its resolution — a false attribution: $TORTOISE_LINE" ;;
+  *) ok "each duplicate group reports only its own resolution" ;;
+esac
+case "$TORTOISE_LINE" in
+  *"neither REPO"*|*"no REPO, WORKDIR or O"*) ok "…and the honest 'nothing here resolves' sentence is not suppressed" ;;
+  *) bad "the tortoise group named no resolution at all (the honest sentence was suppressed): $TORTOISE_LINE" ;;
+esac
+
 say_case "repo identity: a SUFFIXED working copy is not lying, whatever the separator"
 # ⛔ A REVIEW FOUND THIS AND IT WAS A P2. The exemption was dash-only, so `tortoise.old`, `tortoise_wip` and
 # `tortoise2` — each naming the repo it holds — were refused FATAL with a remedy inviting a rename.
@@ -1878,8 +2360,9 @@ esac
 # ⛔ AND THE MEASURED DEFECT IS NOT REOPENED BY THIS: cell-2's `/home/cmux/agent-infra` was a real
 # CLONE (`.git` a DIRECTORY) holding a DIFFERENT repo. If the `.git`-file exemption ever widened to `.git`
 # generally, or the walker stopped comparing real checkouts, this is the arm that would catch it.
-# `agent-infra` is a DECLARED exception name expecting agent-infra, so a tortoise checkout there is
-# exactly the "a DIFFERENT repo at this name is still refused" case.
+# `agent-infra` needs NO table row — it matches the repo the origin names — so this arm exercises the
+# plain comparison and its FATAL, not a declared row (review finding, P2: the earlier note here claimed a
+# row existed, which would have taught the next lane to edit the table for a name that needs nothing).
 mk_checkout "$T/ident-wt/home/agent-infra" "https://github.com/daniel-ospina/tortoise.git" w4 \
   && ok "fixture: a REAL CLONE (.git is a DIRECTORY) named agent-infra, holding tortoise" \
   || bad "fixture: could not create the lying clone"

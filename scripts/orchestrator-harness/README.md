@@ -212,18 +212,19 @@ means it runs once" is wrong (research: agent-infra#1709).
 | `worker-terminal.sh` | the ONE place a worker is launched, asked whether it is alive, counted and killed (`orch-loop.sh` / `dispatch-merge.sh` both source it). Without it a lane is a tmux window that dies at ~21 log lines (§2.1) |
 | `capacity.sh` | R8's other half: MEASURED cross-box placement — load-per-core, lanes, disk and memory per box on the shared origin, so the next lane goes to the least-loaded ELIGIBLE box instead of to whichever controller asked first (§9) |
 | `claim-reaper.sh` | R4's release half: a claim is released only when its holder is demonstrably GONE — 7 stale refs on a box with 0 live lanes made the fleet originate nothing (§7.2b, measured 2026-10-21) |
+| `claim-reaper-pass.sh` | the SCHEDULE for it (#2048): the controller's hourly clock invokes this, which reads the dated arming record, runs the reaper in that mode, records `state/claim-reaper.last`, and exits **4 + `state/.claim-reap-blocked`** when RELEASABLE claims were found while UNARMED — the tool shipped deployed, documented and invoked by nothing on 0 of 6 boxes. Mutation suite: every gate (arming, advisory, mode cross-check, resolution) reddens when reverted |
 | `lane-container-reap.sh` | the leaked test-DB reaper (#2868): removes a lane's private `fdb-lane-*` / `*-pg` / `*-fdb` / `falkordb-6673-*` / `tortoise-ci-*` container ONLY when the owning lane is provably gone — the slug is absent from `git worktree list` (or the PR has no `refs/claims/` snapshot), no live process holds the name, AND the container is past the age bound. **Dry run by default** (`--apply` arms it); all three proofs must hold, and an unreadable `docker ps`/`ps` aborts the whole pass (exit 3, `CANNOT-VERIFY`) rather than reaping blind. Shared instances (`falkordb`, …) are protected by name and never candidates. Its test suite is a mutation suite: every deletion gate reddens when reverted |
 | `live-ownership.sh` | R2/R3's predicate as a live fact: "owned" means a LIVE PROCESS is working the PR, not that a registry says so; it supplies the sweep order and the un-owned count (§7.2f) |
 | `worker-supply.sh` + `install-worker-supply.sh` | the SUPPLY half of the repair pool (agent-infra#2700): the doctor CLASSIFIES orders and places at most one pass worth; without a supplier the pool empties and every later pass prints `undeliverable` with `inflight=0`. This re-offers the DEAD orders through the one dispatcher, on a 60 s clock, under the machine's own `fix + review` budget |
 | `merged-not-closed.sh` | the question no other tool could answer — which OPEN issues already have a MERGED PR (tortoise#8468). Without it, finished work sits in the priority queue looking untouched |
 | `cycle-record.sh` | the self-dispatch proof: one record per controller cycle, and a verdict that refuses to call an absent or stale record healthy (§9) |
 | `repo-slug.sh` | the one `owner/name` resolver the controller and the candidate pool read; its one deliberate exception (`cloud-cell-supervisor.sh`'s own copy) is held in lockstep by `test-gates.sh`, not by prose |
-| `key-gate.sh` | the MODEL-CREDENTIAL assertion, immediately before `pi` is spawned (agent-infra#3331). `key_gate_assert <label> [<home>] [<provider>]` resolves the env var the lane provider's `apiKey` template names (`models.json` → `${PI_LANE_PROVIDER:-deepseek}`, the same default and the same file `pi` reads) and asserts THIS process's environment holds a non-blank value — the environment `run_agent` is about to hand the agent. It REFUSES with **82** (its own code: the remedy is neither a brief to re-author (80), nor a worktree to fix (72), nor load to wait out (75)) and names the variable, the provider, the `models.json` and every candidate file: `${ENV_FILE:-$HOME/keys.env}`, `$HOME/pi-keys.env`, `$CELL_HOME/keys.env` and the ACCOUNT home's `keys.env`. ⛔ **THE ACCOUNT-HOME CANDIDATE IS THE ONE THAT MAKES THE REFUSAL ACTIONABLE** — a lane runs with `HOME=<CELL_HOME>` (required: the operational layer lives there) while the credential usually lives under the ACCOUNT home, so the one setting that makes the operational layer work is the setting that hides the credential. ⛔ **AND IT IS ONE OF FOUR CAUSES, NOT THE CAUSE** (corrected against #3331's own measurement record, review cycle 1): the key mismatch was measured on ONE of four cell lanes that died silently, sourcing `keys.env` left `api-key-errors=0` and the lane still died, and the cause the record VALIDATES is a lane launched from a directory that is not a git repository (`fatal: not a git repository`) — see `skills/cmux-cells/SKILL.md`. This gate closes the *reporting* half (`No API key found` was a silent end); it does not make a lane run. ⛔ **POLARITY: it refuses ONLY on a positive reading** — no `models.json`, a literal `apiKey`, an unparseable file, no python3, a `!command` value, a provider `pi` authenticates itself, or a stored credential in `$HOME/.pi/agent/auth.json` (what `pi /login` writes, and the FIRST source `pi` consults — a gate that refused there refused a box that would have run) all print `check=skipped` with the reason, and refuse NOTHING: a datum we cannot read is not a verdict, the same rule `worker-terminal.sh`'s credential gate states for #2210. ⛔ **A TEMPLATE IS RESOLVED THE WAY `pi` RESOLVES IT, NEVER STRING-MATCHED** (review cycle 1, P1+P2): the `apiKey` and a stored `key` are `$NAME`/`${NAME}` templates with `$$`/`$!` escapes (pi's `resolve-config-value.js`), a template naming TWO variables needs BOTH set, and text around a reference (`sk-${K}`) is a shape pi resolves — so the gate asserts EVERY referenced name, and a stored `key` that resolves to `undefined` is NOT a credential (a raw non-blank test there was a false PASS: the gate said `stored-credential` and pi died with the line this file exists to remove). A stored `!command` yields `check=skipped reason=stored-credential-unresolvable` — only pi can say what it returns, so the gate neither claims a credential it never verified nor refuses a box that works. `key-gate.test.sh` pins the split: identical answers over the shared resolution rule, and — in the PRODUCTION shape,
+| `key-gate.sh` | the MODEL-CREDENTIAL assertion, immediately before `pi` is spawned (agent-infra#3331). `key_gate_assert <label> [<home>] [<provider>] [<model>]` resolves the env var the lane provider's `apiKey` template names (`models.json` → `${PI_LANE_PROVIDER:-deepseek}`, the same default and the same file `pi` reads) and asserts THIS process's environment holds a non-blank value — the environment `run_agent` is about to hand the agent. It REFUSES with **82** (its own code: the remedy is neither a brief to re-author (80), nor a worktree to fix (72), nor load to wait out (75)) and names the variable, the provider, the `models.json` and every candidate file: `${ENV_FILE:-$HOME/keys.env}`, `$HOME/pi-keys.env`, `$CELL_HOME/keys.env` and the ACCOUNT home's `keys.env`. ⛔ **THE ACCOUNT-HOME CANDIDATE IS THE ONE THAT MAKES THE REFUSAL ACTIONABLE** — a lane runs with `HOME=<CELL_HOME>` (required: the operational layer lives there) while the credential usually lives under the ACCOUNT home, so the one setting that makes the operational layer work is the setting that hides the credential. ⛔ **AND IT IS ONE OF FOUR CAUSES, NOT THE CAUSE** (corrected against #3331's own measurement record, review cycle 1): the key mismatch was measured on ONE of four cell lanes that died silently, sourcing `keys.env` left `api-key-errors=0` and the lane still died, and the cause the record VALIDATES is a lane launched from a directory that is not a git repository (`fatal: not a git repository`) — see `skills/cmux-cells/SKILL.md`. This gate closes the *reporting* half (`No API key found` was a silent end); it does not make a lane run. ⛔ **POLARITY: it refuses ONLY on a positive reading** — a literal `apiKey` (pi uses it as the credential itself), an unparseable file, no python3, a `!command` value, a provider `pi` authenticates itself, a provider whose variable is not the whole answer (`azure`, `cloudflare-workers-ai`, `cloudflare-ai-gateway`, and `typesafe`, which ships classifier models only — each measured), a stored credential in `$HOME/.pi/agent/auth.json` (what `pi /login` writes, and the FIRST source `pi` consults — a gate that refused there refused a box that would have run) all print `check=skipped`/`check=warn` with the reason, and refuse NOTHING **except one store shape, which is a certain death and is refused (agent-infra#3443, measured)**: an `oauth` entry for a provider `pi` ships NO oauth handler for — the handler set is a static nine-id list (`anthropic github-copilot kimi-coding meta openai-codex openai openrouter radius xai`, from `pi-ai/dist/providers/`) and a stored entry SHADOWS the environment, so measured, `pi -p` answers `No API key found for <provider>.` **even with the provider key exported**; that prints `check=fail result=REFUSED reason=auth-store-oauth-unusable` naming the handler set and the shadowing, and the same shape on a handler provider stays `check=skipped` (the token may simply be stale): a datum we cannot read is not a verdict, the same rule `worker-terminal.sh`'s credential gate states for #2210. ⛔ **BUT "NO `models.json`" IS NOT ONE OF THEM ANY MORE (agent-infra#3443, measured on the installed pi)**: a provider `pi` SHIPS is provisioned from its OWN variable with no `models.json` at all (`dist/env-api-keys.js` `getApiKeyEnvVars`, read by `getEnvApiKey`/`findEnvKeys`), so the normal cell shape is DECIDABLE and the old cannot-say there was the #3443 silence — `pi -p --provider deepseek` answers `No API key found for deepseek.` with nothing exported and reaches the provider with `DEEPSEEK_API_KEY` set. The gate now asserts that table (a multi-variable provider passes on ANY of its variables; one whose variable is not the whole answer warns instead of refusing), and `source=pi-builtin-env` says so on the line. ⛔ **AND THE VARIABLE IS NOT THE ONLY PATH THAT PROVISIONS THE BOX** (measured): `google-vertex` also takes Application Default Credentials + `GOOGLE_CLOUD_PROJECT`/`GCLOUD_PROJECT` + `GOOGLE_CLOUD_LOCATION` (`dist/env-api-keys.js:136-142`), and `anthropic` also takes workload-identity federation (`dist/providers/anthropic.js:40-57`), whose third member is a FILE pi OPENS (`ANTHROPIC_IDENTITY_TOKEN_FILE`) — so that path is closed unless the token file can be read (measured: `Failed to read identity token file at <p>: ENOENT` while the variable alone is set) — with neither variable set both still reach the provider (`invalid_client`; a federation token-exchange error). The gate mirrors those paths, so such a box passes with `path=<id>` on the line and a refusal carries `paths=<id,…>` naming the paths it also checked and found closed; a provider whose chain this gate cannot read (`amazon-bedrock`'s AWS SDK) warns instead of refusing. ⛔ **AND A `models.json` `radius` GRANT CHANGES WHICH VARIABLE ANSWERS** (agent-infra#3443, measured): a provider whose body sets `oauth: "radius"` plus a `baseUrl` is given `radiusProvider` (`pi-ai/dist/providers/radius.js`), whose auth is an oauth handler AND `envApiKeyAuth(["RADIUS_API_KEY"])`. Measured, all four shapes: with NO `apiKey` declared, `RADIUS_API_KEY` runs the box (401 from Radius) and the provider's own variable does not; with an `apiKey` declared, THAT template is what pi resolves and `RADIUS_API_KEY` does not substitute for it. So the grant keeps the template when it exists and answers `RADIUS_API_KEY` when it does not. A `models` definition with no `api`/`baseUrl` does NOT drop a granted provider on the default gateway — `findModelDefaults` composes it from `RADIUS_MODELS`, measured: `pi -p` reached the gateway (404) — while a custom gateway's empty catalog makes the throw real — measured, `pi -p` then answers `Error: Unknown provider "<p>"` and NO credential can rescue the box, so that shape is REFUSED with `reason=models-json-provider-dropped` and a model-level remedy (give the definition its own `api`/`baseUrl`), never a variable to export - and the no-handler store refusal above cannot fire, because the grant supplies a handler. ⛔ **AND EACH PATH MEMBER IS TESTED THE WAY THE REQUEST PATH TESTS IT** (agent-infra#3443, measured): the provider's `resolve` receives `auth/context.js`'s env accessor, which answers `undefined` for a value whose `.trim()` is empty — so a whitespace-only `GOOGLE_CLOUD_PROJECT` or federation id is ABSENT (`pi -p` then says `No API key found`), while the vendor's `getProviderEnvValue` JS-truthiness test belongs to the listing/compat surface and is the wrong authority here. An explicit `GOOGLE_APPLICATION_CREDENTIALS` is the exception that proves it: `_existsSync` sees the RAW value with no tilde expansion, and pi's ADC loader then opens that literal path. ⛔ **AND `google-vertex` IS IN THE WARN SET, NOT THE REFUSING ONE** (measured): its `GOOGLE_CLOUD_API_KEY` is accepted by pi and then REJECTED by the API (401 `API keys are not supported by this API`), so a key alone is a credential that exists and a lane that dies — it warns with `paths=` unless ADC provisions the box, which prints `check=ok path=vertex-adc`. ⛔ **A TEMPLATE IS RESOLVED THE WAY `pi` RESOLVES IT, NEVER STRING-MATCHED** (review cycle 1, P1+P2): the `apiKey` and a stored `key` are `$NAME`/`${NAME}` templates with `$$`/`$!` escapes (pi's `resolve-config-value.js`), a template naming TWO variables needs BOTH set, and text around a reference (`sk-${K}`) is a shape pi resolves — so the gate asserts EVERY referenced name, and a stored `key` that resolves to `undefined` is NOT a credential (a raw non-blank test there was a false PASS: the gate said `stored-credential` and pi died with the line this file exists to remove). A stored `!command` yields `check=skipped reason=stored-credential-unresolvable` — only pi can say what it returns, so the gate neither claims a credential it never verified nor refuses a box that works. `key-gate.test.sh` pins the split: identical answers over the shared resolution rule, and — in the PRODUCTION shape,
 where `lane-env.sh` has exported the box file's provider into the environment — identical provider too. ⛔ the two are
 NOT expected to agree when the environment is silent: `worker-terminal.sh` runs before any source and reads the FILE,
 this gate runs after `lane-env.sh` and reads the ENVIRONMENT, which is the same question `run_agent` asks (it builds
 the `pi` argv). The silent-env case resolves `run_agent`'s own default and is pinned as its own arm, so a change to
-either side's provider SOURCE reddens something. Its refusal also writes `state/capacity-refused-<N>` with `gate=key`, so `chain-merge.sh` stops waiting and releases the claim instead of holding the issue for 90 minutes (the credential is a property of THIS box, exactly like `capability`). The declared escape is **`--key-gate-off` on the lane's invocation, never an environment variable**: a variable is inherited from the box (the cell supervisor sources `keys.env` under `set -a`, so every descendant lane carries it), which made it a fleet-wide off switch instead of a fixture-only one — so `LANE_KEY_GATE` is read by nothing and a value found in the environment is reported (`check=ignored`) and NOT honoured. Sourced by `lane.sh` (fail-loud, `exit 78` without it). The agent dir it reads is `pi`'s own — `${PI_CODING_AGENT_DIR:-<home>/.pi/agent}` — because pi honours that override (**the same rule `extensions/builtin-tools/index.ts:272-280` mirrors**) and a hardcoded home made the gate refuse a box pi would have run and stay silent on one pi dies on. ⛔ **A `~/…` OR `~` override is EXPANDED, because pi expands it** (`normalizePath`'s `expandTilde` branch, `dist/config.js:478-479`); `~user` and a relative path are not honoured, because pi does not expand those either. A store entry with an `env` map but no `key` is NOT a credential: pi uses `env` only to resolve a `key` template (`provider-composer.js:260,285-286`), so treating it as one was a false pass — and the same rule now applies to the `key` VALUE (`auth-storage.js:223` runs it through `resolveConfigValue`). Its pass line claims `check=ok` and never `result=` (#2935: a check is not an outcome — the lane's outcome is the terminal line above) |
+either side's provider SOURCE reddens something. Its refusal also writes `state/capacity-refused-<N>` with `gate=key`, so `chain-merge.sh` stops waiting and releases the claim instead of holding the issue for 90 minutes (the credential is a property of THIS box, exactly like `capability`). The declared escape is **`--key-gate-off` on the lane's invocation, never an environment variable**: a variable is inherited from the box (the cell supervisor sources `keys.env` under `set -a`, so every descendant lane carries it), which made it a fleet-wide off switch instead of a fixture-only one — so `LANE_KEY_GATE` is read by nothing and a value found in the environment is reported (`check=ignored`) and NOT honoured. Sourced by `lane.sh` (fail-loud, `exit 78` without it). The agent dir it reads is `pi`'s own — `${PI_CODING_AGENT_DIR:-<home>/.pi/agent}` — because pi honours that override (**the same rule `extensions/builtin-tools/index.ts:272-280` mirrors**) and a hardcoded home made the gate refuse a box pi would have run and stay silent on one pi dies on. ⛔ **A `~/…` OR `~` override is EXPANDED, because pi expands it** (`normalizePath`'s `expandTilde` branch, `dist/config.js:478-479`); `~user` and a relative path are **resolved against the calling process's cwd**, exactly as pi resolves them: pi does not *expand* either form, but it does not ignore them either — `getAgentDir()` returns the raw string and `SettingsManager.create` runs it through `resolvePath`, whose base directory is `process.cwd()` (measured on the installed pi: `cwd=/tmp/relx PI_CODING_AGENT_DIR=relagent` reads `./relagent/models.json`). Ignoring the override answered about a DIFFERENT store than pi reads, which is the false-82-or-blind pair the override support exists to remove; when the cwd itself is not absolute the gate answers `settings-unreadable` rather than guessing a base. A store entry with an `env` map but no `key` is NOT a credential: pi uses `env` only to resolve a `key` template (`provider-composer.js:260,285-286`), so treating it as one was a false pass — and the same rule now applies to the `key` VALUE (`auth-storage.js:223` runs it through `resolveConfigValue`). Its pass line claims `check=ok` and never `result=` (#2935: a check is not an outcome — the lane's outcome is the terminal line above). ⛔ **AND IT NAMES THE MODEL, NOT ONLY THE PROVIDER (agent-infra#3443)**: `provider=deepseek` alone does not say what was asserted, and the measured failure names the model and nothing else — every line now carries `model=<id>`, the refusal's remedy prints the exact working invocation (`pi -p --no-session --provider <p> --model <m>`), and an EXPLICIT provider wins over a `provider/`-prefixed model id, because that is what `run_agent` builds (`lane.sh` now passes BOTH halves to the gate so the two cannot disagree). With NOTHING naming a provider, a model INHERITED from `$PI_LANE_MODEL` is asserted under `deepseek` (what `run_agent` passes) and a model NAMED on the invocation asserts NOTHING (`check=skipped reason=cannot-resolve-provider-credential provider=<none>`), prefixed or not: pi infers such a prefix only when it names a provider that HAS models, then falls back to matching the whole string as a model id across every provider, and a sole authenticated raw-id match wins even over a matched inference (`dist/core/model-resolver.js:322-345,388-420`) — all of which need the model registry and the auth state this gate does not read. Measured (`aaa` declaring model `q`, `bbb` declaring the id `aaa/x`): `pi -p --model aaa/x` ran on `bbb` while the first cut of this rule printed `check=ok var=AAA_KEY provider=aaa` — a green gate asserting a variable pi never consulted — and `--model AAA/x` (which pi lowercases and resolves) went blind. An earlier cut of this sentence claimed the prefix alone decides and offered `an unprefixed model id` as the remedy, which itself abstains: prefix alone decides: falsified, corrected here. Pass `--provider … --model …` for a verdict on a prefixed id. ⛔ **AND IT REPORTS THE STARTUP PIN A BARE `pi` WOULD USE** (unless `enabledModels` scopes it away — see below) (`key_gate_box_default_assert`, `key-gate.sh --probe --box-default`): `settings.json`'s `defaultProvider`/`defaultModel` is `pi`'s startup pair, and an unprovisioned pin does **not** kill a bare `pi` — the vendor uses a saved default only when the provider is provisioned and otherwise falls through to step 4 of `findInitialModel` — the first model with a valid key, preferring that provider's known default (`dist/core/model-resolver.js:521-529`), i.e. it silently substitutes a model nobody pinned and spends tokens on it (#2208's class). That is the fact reported, and the first cut of this row claimed the box would die — FALSE, corrected at fresh-context review. The lane gate emits `check=warn reason=box-default-not-provisioned box_default=… model=… var=…` and does **not** refuse (a lane pins its own pair, so an unusable box default would be a false block), while the standalone probe `--probe --box-default` REFUSES **82** when the pin's variable can be NAMED — a `models.json` template, or pi's own built-in table for a provider it ships — and abstains with `check=skipped` when it cannot (a custom provider, an unparseable file, an `enabledModels` scope): a verdict about the PIN, not a claim that the box cannot run an agent. ⛔ **THE BOX-DEFAULT LINES CARRY `box_default=` BESIDE `model=`** (review round 2, P3): `model=` is the lane's asserted pair everywhere else, so without a distinguishing key a scan could attribute the box pin to the lane. ⛔ **AND THE COMPANION SAYS WHICH PAIR THE LANE PINS, RESOLVED IN THE WRAPPER** — it runs BEFORE `key_gate_assert_main`, which is the only place those globals are assigned, so reading them printed a blank pair (or a stale one, when two calls shared a process). The project half is read only when the project is **TRUSTED** (`loadFromStorage` returns `{}` for scope `project` under `!projectTrusted`; `settings.json` is itself trust-REQUIRING and a `-p` session has no UI, so trust is FALSE unless a decision is recorded or `defaultProjectTrust` is `always`), and the two files are merged **PER KEY**, as `pi` merges them (`deepMergeSettings`): a project file pinning only `defaultProvider` yields a real pair with the agent-dir's `defaultModel`, an explicit `null`/empty half CLEARS the lower file's value (`deepMergeObjects` treats `null` as a value, so step 3 is not attempted and that pin substitutes), and the line names only the files that supplied a half (`settings_json=<project>+<agent>` when each gave one). When trust cannot be determined the answer is `check=skipped reason=settings-unreadable` — blindness is not a verdict — and so is a READ that did not finish (a FIFO under `KEY_GATE_BOUND`, an absent python3, a `default` settings file that does not parse) or a **non-absolute `cwd`** — which used to be reported as the positive claim "this box pins NO startup model", or silently answered from the agent-dir file. A half pair is its own answer: a provider with no model is `reason=default-model-missing`, and `defaultModel: "provider/model"` with no `defaultProvider` is `reason=default-model-provider-unknown` — the settings path never splits a `provider/` prefix (`findInitialModel` step 3 takes the raw strings), so that pin matches no startup pair and `pi` substitutes. The companion never prints on the ok or cannot-say arms (a line per lane is the noise class #3331 was filed about) and never after the verdict line. A box that pins no startup model is `check=skipped reason=no-default-model` — a datum we did not read, and the reason a bare `pi` falls through to ITS OWN default. ⛔ **AND A BOX THAT SETS `enabledModels` IS `check=skipped reason=enabled-models-scoped`, NOT A VERDICT ON THE PIN** (round 8, P2, verified in the vendor source): `main.js:660` builds the scoped list from `parsed.models ?? getEnabledModels()` and `main.js:389-403` installs `scopedModels[0]` as the startup model — with **no** `hasConfiguredAuth` check — *before* `findInitialModel` consults the pin, though a pin that is itself **inside** the scope wins (`savedInScope` is tested first) and an empty resolved scope falls back to the pin, so answering from the pin is a guess in both directions (a false 82 when the scoped model is the provisioned one, a false `check=ok` when it is not). Resolving a pattern list to model ids needs the model registry, which this gate does not have, so the honest answer is a cannot-say naming the file that set the key; an EMPTY array — or an explicit `null`, which `deepMergeObjects` treats as a value that REPLACES the lower file’s list — is not a scope (`modelPatterns.length > 0` is the vendor guard), so the pin still answers there. The same applies to `--models` on a launch, which the gate does not see at all. ⛔ **THE REMEDY FOR THIS CLASS IS THE MODEL FLAG, NOT A KEYS FILE** (measured cell-5, 2026-11-04: `/home/cmux/keys.env` held only `GH_TOKEN`, `DEEPSEEK_API_KEY` was already in the base environment, and `pi -p --no-session --model deepseek/deepseek-flash` was what ran) |
 | `repo-target.sh` | the ONE repo-identity assertion for a dispatch (agent-infra#2724/#2694): the target is an argument (`--repo`/`--repo-dir`, **no default**), and after the worktree exists its own `origin` and `git-common-dir` are compared with that target. A mismatch, an unreadable origin, or an absent target REFUSES (exit 72) naming **both slugs**; the branch half refuses a branch the target repo does not have, so `cannot materialise <branch>` is never the first line a human reads. Sourced by `lane.sh`, `dispatch-merge.sh`, `fix-one.sh` and `adopt-fix.sh`; a `[repo-target]` line per assertion (identity, and branch when a branch is asserted) makes a wrong-repo lane a grep — a dispatch that refuses after its identity line reads `result=REFUSED` on its last `[repo-target]` line. ⛔ AND SINCE agent-infra#3331 THAT IS NOT THE LOG'S LAST LINE ANY MORE: a LANE ends on its terminal `outcome=…` line (below, “And the LAST line of every lane log is its OUTCOME”), so read the `[repo-target]` line for the identity verdict and the `outcome=` line for the lane's. The callers that are not lanes (`fix-one.sh`, `dispatch-merge.sh`, `adopt-fix.sh`) still end where this row says. ⛔ A mirror/`file://` origin cannot name its repo, so such a checkout refuses EVERY batch (72) and `OR=` cannot clear it: the assertion compares the artifact with the target. The remedy is `git -C <checkout> remote set-url origin https://github.com/<owner>/<name>.git`; there is deliberately no env override |
 | `reviewer-preflight.sh` | discloses the reviewer requirement BEFORE the lane works (agent-infra#2148), instead of the lane discovering it by being refused at the rail |
 | `gh-limit.py` | the serialiser every harness `gh` call passes through (agent-infra#1988): four boxes act as ONE account, so one rate-limit bucket is shared and nothing else queues the calls |
@@ -350,9 +351,10 @@ without a human in the loop:
   free and cell-3 at 0.04 load, and **47 P0/P1 issues went untouched with ~20 vCPU idle on the same
   account**; the gap was filled by hand with six manually-created dispatch lanes. The transfer
   mechanism is in §7.2d — and it is deliberately **not** built on load average: the signal is the
-  worker gate's own refusal, whatever it bound on (that gate binds on **load, disk or land** — the
-  last one is repo-wide and is recorded as NOT transferable in §7.2/§7.2g; the lanes/swap/memory terms
-  belong to the controller's separate gate, which refuses before any claim is taken), because load is a
+  worker gate's own refusal, whatever it bound on (that gate binds on **load, memory, disk or land**
+  — the last one is repo-wide and is recorded as NOT transferable in §7.2/§7.2g; the lanes/swap terms
+  — and the controller's OWN memory arm, a DIFFERENT floor (`MIN_MEM_FREE_MB`, §7 below: two
+  populations, one probe) — belong to the controller's separate gate, which refuses before any claim is taken), because load is a
   symptom of contention rather than a measure of capacity (`docs/ops/load-policy.md`), and a
   capacity gate a caller can skip is not a gate (agent-infra#1884).
 
@@ -457,6 +459,7 @@ a killed worker cannot take the controller down with it.
 | `state/reviewcount-<PR>` | **RETIRED** (agent-infra#2971): its `"<head> <n>"` budget is now the `state/reviewdisp-<PR>` record below — ONE budget shared by the two arms instead of two books neither could see. A leftover file is inert and is deleted wherever the old one was |
 | `state/reviewdisp-<PR>` | `"<head> <n>"`: review ATTEMPTS at this `(PR, head)`, spent by BOTH arms (agent-infra#2971) — the **CONTROLLER** on a dispatch, and `merge-one.sh` when a reviewer run produced no usable verdict on a path nothing counted above it (`REV_PAID=1` in the spawn command tells it the controller already paid, so one attempt is never counted twice). The controller dispatched for that (PR, head), written only after a spawn succeeded. The head is the key, so a push re-arms it; an unchanged head is never re-reviewed **once CLEAN evidence exists at it** (`REVIEW-AT-HEAD`), and otherwise spends at most `MAX_REVIEW_TRIES` re-records before `REVIEW-CAP` — the budget is per head, not per PR (agent-infra#2653). Before the spawn the arm asks `review_disp_decide`, and an **unreadable head is not a key** (a review spent on an unnamed head cannot be keyed, compared or recorded — the arm refuses and names the head): **`REVIEW-AT-HEAD`** — the enforcer's store already holds a CLEAN record at exactly this head (BOTH store names are read: the repo-qualified file and the legacy `<pr>.json`, the same pair `merge-one.sh::record_at_head` checks) — so no second review is bought for an unchanged head; **`REVIEW-CAP n/max`** parks a head that spent `MAX_REVIEW_TRIES` re-records with no verdict. None is ever a silent skip. `MAX_REVIEW_TRIES=0` is **REPORT-ONLY** (no dispatch, nothing parked — the `MAX_RED_FIX_TRIES=0` idiom), and an UNWRITABLE record is named rather than swallowed (`reviewdisp` ⇒ park, `reviewathead` ⇒ `REVIEW-AT-HEAD-UNBOUNDED`; an unwritable `parked-<PR>` ⇒ `PARK DID NOT LAND`, never `PARKED`): a swallowed write makes the bound itself best-effort, which is exactly how a cap becomes unbounded. Pruned on MERGED/CLOSED and by `prune_orphan_markers` |
 | `state/reviewathead-<PR>` | `"<head> <n>"`: consecutive `REVIEW-AT-HEAD` refusals at that head (agent-infra#2653). ⛔ It exists because AT-HEAD is the ONE state that neither dispatches nor parks, and its remedy (a re-record) is `merge-one.sh`'s, which the withholding branch prevents from running — so at `MAX_REVIEW_TRIES` the PR PARKS as **`REVIEW-AT-HEAD-STUCK`** with the exact re-record command, instead of logging a wait row for ever. Pruned with `reviewdisp` |
+| `state/reviewround-<PR>` | `"<n>"`: the review rounds this PR has SPENT, **cumulative ACROSS heads** — the per-PR half of `MAX_REVIEW` (agent-infra#3441). ⛔ NOT the same question as `state/reviewdisp-<PR>` above, which bounds ONE head and is re-armed by a push: this one is deliberately NOT re-armed by a push, because the loop it bounds spans heads. Bumped by **ONE writer**, `merge-one.sh`, and only when a reviewer actually RAN (`AGENT_STARTED=1`) — the controller does NOT write it, and neither does `rev_budget_spend`. Both of those were tried and both were wrong: the controller's write fired right after `wt_spawn`, so a worker that then took the rail-only path, lost a claim race or was refused by its own brief gate still cost a round; and `rev_budget_spend` runs only on the NO-VERDICT paths, so the ceiling was inert for every review that produced a verdict. Two review rounds found those, in that order; the rule is now one sentence. At `MAX_REVIEW` the next review is REFUSED and the head PARKS with a terminal `REVIEW-CEILING <PR> rounds=<n>/<max> head=<sha> stale_findings=<n> heads=<csv\|none>` line in the log, the ledger and the park reason — an escalation event, never a pass. ⛔ THAT SHAPE AND THOSE THREE DESTINATIONS ARE THE **CONTROLLER'S** (fresh review of #3441, P3 — this row stated them unconditionally, and §4's `MAX_REVIEW` row already qualified them, so the file contradicted itself): the DIRECT ingress (`merge-one.sh`) parks with the shorter `REVIEW-CEILING <PR> rounds=<n>/<max> head=<sha>` form, which has no `stale_findings`/`heads` field and writes no ledger row. `stale_findings` counts the `needsfix-<PR>-<head>` markers EARLIER heads left: a LIVE head with findings takes the fixer path and never reaches this line, so the field never claims to describe the live head. `MAX_REVIEW=0` is REPORT-ONLY: the CONTROLLER's dispatch arm buys nothing and parks nothing, and the DIRECT ingress (`merge-one.sh`) still buys the review its caller asked for but banks NO round on it — so restoring the knob never finds rounds a report-only box never bought. ⛔ **AN UNREADABLE BOOK IS NOT ROUND ZERO** (fresh review of #3441, P2): both readers (`orch-loop.sh::review_round_read` and `merge-one.sh::_rr_read_book`) coerce a non-numeric, negative, empty or >9-digit book to `999999999` — the writer's own clamp — so a corrupt book reads as EXHAUSTED and parks, instead of RESETTING the budget to "nothing spent yet" (the fail-open mirror of the writer clamp). ⛔ AND A **NON-REGULAR** BOOK — a directory, or a FIFO — is the same answer, not round 0 (fresh review of #3441, P2): both readers gate on `-f`, because `-e` accepts a FIFO and `read … < fifo` BLOCKS ON OPEN with no writer (measured `rc=124`), which inside `orch-loop.sh` is the controller's own loop wedged rather than a park. An ABSENT file is still round 0. Cleared on MERGED/CLOSED, by `prune_orphan_markers`, and by `merge-one.sh::review_state_clear` on a CLEAN verdict (the loop it bounded converged) |
 | `state/fixcount-<PR>` | fixer attempts for that PR, capped by `MAX_FIX_TRIES` |
 | `state/railrefusal-<PR>` | the rail's last refusal, **head-bound**: `head=`, `attempt=`, `override=`, `class=` (`red-tree`/`override`/`conflict`/`unreadable`/`other`), `reason=` (**verbatim**) and `detail=`. Written by `merge-one.sh` (every ingress) and by the cell doctor's `merge` role. The sweep spawns a red-fixer for a `red-tree` class at the CURRENT head only; a stored head ≠ the current head means a push happened, so the record is dropped and the new head is **re-railed** (agent-infra#2223). Absent ⇒ nothing to repair |
 | `state/fixgate-<PR>-<head>` | written by `fix-one.sh` when a controller-spawned fixer's agent was refused by the load/disk gate (so nothing ran). The red-fixer role consumes it to refund the per-head attempt; it is also reclaimed on a merge/close. Without it, two gate refusals burn `MAX_RED_FIX_TRIES` and park a red PR saying a fixer "did not clear it" — false, since no agent started |
@@ -477,7 +480,7 @@ a killed worker cannot take the controller down with it.
 | `logs/` | one log per worker: `lane-*.log`, `lane-merge-<PR>.log` (the lane's merge-loop chain), `chain-*.log`, `merge-*.log`, `fix-*.log`, `orch-loop.log` — `merge-rate.sh` deliberately does NOT count `lane-merge-*.log` as a lane |
 | `wip/` | dirty-worktree captures taken before a shutdown (see §6), plus one `capwip-<stamp>-<pid>/` per lane KILLED AT ITS WALL-CLOCK CAP (#2045): `tracked.patch`, `untracked.tgz`, `untracked.list`, `tracked.numstat` (the re-parse's own output, kept as evidence that the patch was verified) and `SNAPSHOT.txt`. The newest `WIP_SNAPSHOT_KEEP` (10) directories are kept — a cell's disk is the first thing that stops dispatch, so this is a bounded directory, not a log |
 | `state/capwip.tsv` | one row per cap kill **on every path** — epoch, label, cap seconds, elapsed, exit status, the verdict (`COMPLETE`/`PARTIAL`/`NOTHING-LOST`/`LOST`/`UNSNAPSHOTABLE`) and the snapshot dir (empty where no directory exists). The companion to `state/walltime.tsv` (`report.sh` computes the cap-hit RATE there; this is what says whether the kill cost any work) and the reason a cap hit is no longer an absence in the fleet's accounting |
-| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`archived-local`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, the unpushed-commit count, and **the root that was measured** (`root` — the only column that can expose a wrong-tree archive). ⛔ **Every path writes through ONE writer** (`lane_end_record`), including the two that return BEFORE the measurement — `not-measured` (the operator hatch) and `not-a-worktree` (a root that is not a worktree ROOT: not a repository at all, or a path *inside* one) — because an absence used to be indistinguishable from a lane that never ended. ⛔ The root rule is the CALLEE'S (`bg-rescue-wip.sh:96-103`, `--show-toplevel` = `pwd -P`), not a weaker one (`rev-parse --git-dir` succeeds anywhere inside a repo, so it used to ratify a corner of a checkout and then fail one layer down as `rescue=FAILED`); what it does **not** catch — and does not claim to — is a caller that sets no `WIP_PATH` while its cwd sits at the ROOT of another checkout, which is why the measured root is a recorded column rather than an assumed one. ⛔ **`FAILED` means the rescue failed AND no ref pins anything**; `archived-local` is the third state, `bg-rescue-wip.sh` having exited 2 while `refs/wip-local/<slug>` is valid (a PARTIAL archive and a failed push both land there — the replayed callee lines above say which). ⛔ **The `ref` column names the LOCAL `refs/wip-local` pin and is EMPTY over an archive in exactly one case**: `bg-rescue-wip.sh` pushed `refs/wip/<slug>` and could not write that pin (it is guarded — `:246-252` warns and carries on), so the row reads `rescue=refs/wip/<slug>` with an empty ref and a loud line saying so. An empty ref alone is **not** "nothing was archived". The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
+| `state/lane-end.tsv` | one row per **terminal agent transition, cap or not** (#2834) — epoch, label, exit status, cap flag, the tree verdict (`dirty`/`clean`/`unpushed-only`/`cannot-verify`/`not-a-worktree`/`not-measured`), the rescue (`refs/wip/<slug>`/`archived-local`/`nothing`/`FAILED`/`UNAVAILABLE`/`DISABLED`), the local ref that pins the archived commit, the unpushed-commit count, and **the root that was measured** (`root` — the only column that can expose a wrong-tree archive). ⛔ **Every path writes through ONE writer** (`lane_end_record`), including the two that return BEFORE the measurement — `not-measured` (the operator hatch) and `not-a-worktree` (a root that is not a worktree ROOT: not a repository at all, or a path *inside* one) — because an absence used to be indistinguishable from a lane that never ended. ⛔ The root rule is the CALLEE'S (`bg-rescue-wip.sh:117-123`, `--show-toplevel` = `pwd -P`), not a weaker one (`rev-parse --git-dir` succeeds anywhere inside a repo, so it used to ratify a corner of a checkout and then fail one layer down as `rescue=FAILED`); what it does **not** catch — and does not claim to — is a caller that sets no `WIP_PATH` while its cwd sits at the ROOT of another checkout, which is why the measured root is a recorded column rather than an assumed one. ⛔ **`FAILED` means the rescue failed AND no ref THIS RUN wrote pins THIS RUN's snapshot** — a pin from an EARLIER rescue may still exist, and an off-box `refs/wip/<slug>` may hold an earlier snapshot of the branch (a chain failure, a PARTIAL archive whose push succeeded, and a failed push all exit 2 — those are the causes that can leave a REF; six further paths exit 2 BEFORE any push or pin exists, when the archive cannot be BUILT at all — `mktemp`, `read-tree`, `write-tree`, `commit-tree` (`bg-rescue-wip.sh:81,186,191,196,231,253`), which is what a FULL DISK produces, and there nothing of this run was pushed and no ref of this run exists; and a failed pin write alone does NOT exit 2 — it is guarded and exits 0 when the push succeeded, which is the `rescue=refs/wip/<slug>` row with an empty ref below), so read the replayed callee lines before concluding nothing was archived; `archived-local` is the third state, `bg-rescue-wip.sh` having exited 2 while `refs/wip-local/<slug>` is valid (a PARTIAL archive and a failed push both land there — the replayed callee lines above say which). ⛔ **The `ref` column names the LOCAL `refs/wip-local` pin and is EMPTY over an archive in exactly one case**: `bg-rescue-wip.sh` pushed `refs/wip/<slug>` and could not write that pin (it is guarded — `:262-271` warns and carries on), so the row reads `rescue=refs/wip/<slug>` with an empty ref and a loud line saying so. An empty ref alone is **not** "nothing was archived". The exit-path companion to `capwip.tsv`: the cap is not the common termination (`hit its … cap` appeared in **0** of 373 lane logs on the measured session), so without this row a lane that simply ENDED left no trace at all — its report said IN PROGRESS, the branch had no new commit, and the only copy of the work was a scratch worktree a reaper eventually deletes |
 
 ### Why the *reviewer* is a separate process from the *controller*
 
@@ -541,13 +544,161 @@ things are deliberate and are asserted by `wip-rescue-exit.test.sh`:
   * it costs a network call only when there IS something to save (one `git status` + one `rev-list`
     otherwise), and it never changes the lane's exit status: a lane's status and the fate of its
     worktree are different facts;
-  * `unpushed-only` is MEASURED and NAMED but never archived **here**, and the reason is the callee's
-    contract rather than branch safety: `bg-rescue-wip.sh` archives only a NON-EMPTY `git status`
-    (`:150-166`), so a clean-but-unpushed tree makes it exit 0 having done nothing, and `refs/wip/<slug>`
-    is a non-force ref built with `commit-tree` — not a branch. Teaching it to archive `HEAD`'s tree is a
-    change to that shipped tool's contract and is deliberately out of scope, so #2834's ask 1 is met for
-    the DIRTY half and recorded for the unpushed half: the commits live in the repo's object database and
-    survive the WORKTREE being removed, but not the BRANCH being deleted.
+  * `unpushed-only` is MEASURED, NAMED **and now PUSHED** (`lane_end_push`, #3396 — the half #2834 left
+    owed). `bg-rescue-wip.sh` archives only a NON-EMPTY `git status` and never moves a branch, so the
+    branch half is its own function: `git push origin HEAD:refs/heads/<branch>`, bounded (5 s push-target
+    proof + 15 s symref + 15 s push + 5 s verify = 40 s, the whole network budget, via
+    `lib/bounded.sh`), **never forced**, and **verified by reading the remote** (`ls-remote`) rather than
+    by the push's exit status — transport success is not delivery. ⛔ **AND NO `-u`:** an upstream belongs
+    to the lane's own setup, not to a dying terminal, and `-u` writes `branch.<b>.remote`/`.merge` into
+    the repository's SHARED config — which in a linked worktree is what every PEER worktree reads, so one
+    lane's exit would silently give another a `git pull`/`git push` default it never configured. It fires
+    only when the measured
+    unpushed count is > 0, so the majority of lanes cost no network call. It REFUSES, loudly and by name,
+    to push from a hub checkout (`--git-dir` == `--git-common-dir`) or onto the landing branch, because
+    either would publish a ref that only the merge rail may move. ⛔ **AND THE READ AND THE WRITE MUST
+    ADDRESS THE SAME REPOSITORY** — `git push origin` honours `remote.origin.pushurl` and
+    `url.<base>.pushInsteadOf`, while a read of `origin` (`ls-remote origin`) honours `remote.origin.url`,
+    so an exit path that read one and wrote the other derived the landing-branch set from repository A
+    and then moved repository B's landing branch (reproduced: B's `refs/heads/trunk` moved
+    `613382f..b4e6ab9` while the same terminal recorded `push=FAILED` "does NOT hold
+    refs/heads/trunk"). `lane_end_push` therefore resolves origin's push url ONCE
+    (`git remote get-url --push --all origin`), **proves** it (`git ls-remote --get-url` must expand to the
+    same URL — otherwise a read of it is a FETCH, which re-applies `url.<base>.insteadOf` on top of the
+    resolved push url while `git push origin` does not, so the landing set and the verify would describe
+    repository C while the ref was written to B), and only then uses it for BOTH network reads; the push
+    still goes through `git push origin` so git's own rewrite is applied exactly once, as
+    `cleanup-stale-branches.sh` does for the same reason. An unprovable endpoint refuses:
+    `push=refused-pushurl-divergent` (more than one push url, or the expansion differs) and
+    `push=refused-pushurl-unresolved` (the resolution itself failed — including a checkout with no
+    `origin`, whose disagreement is NOT a divergence and gets its own remedy). A DETACHED head is
+    `push=detached`:
+    nothing is invented, and the marker tells a reclaim pass to refuse that worktree. ⛔ **AND AN
+    UNANSWERED VERIFY IS NOT AN ABSENT REF** — `push=verify-unanswered` means the push exited 0 and the
+    verifying read did not answer inside its bound, so the terminal asserts NEITHER delivery NOR loss
+    (`next=MANUAL … did NOT establish`); it is a distinct verdict from `push=FAILED` (the remote ANSWERED
+    and the ref is absent) exactly as the symref read on the same path already refuses to read silence as
+    "no protected names". `push=push-killed` is the same honesty for a push whose CLIENT WAS KILLED:
+    the timer signalled it (`rc=124`) or, on the fleet's internal watchdog with no sentinel, it was
+    SIGKILLed (`rc=137`), so the ref may already have been applied server-side and the terminal asserts
+    neither delivery nor loss — `FAILED` is reserved for an answer the remote actually gave. ⛔ **THE
+    CLASS, NOT ONE INTEGER:** `tb_bound_tmp` degrades to "no sentinel" when its scratch dir cannot be
+    made — the full-disk state this feature exists for — and `bounded.sh` then returns the killed child's
+    status, so keying on `124` alone left the most likely shape recording `FAILED` over an absence nobody
+    measured. ⛔ **AND THE VERDICT NAMES ONLY THE MEASUREMENT:** `137` is not the timer's signature
+    either — `timeout 1 sh -c 'kill -9 $$'` returns it through GNU `timeout` with the timer never firing,
+    and an OOM killer on these boxes produces it with no timer at all — so the value says `push-killed`
+    and the LOG carries the code and says which cause is *not* established. Claiming "TIMED OUT after 15s"
+    for an OOM kill would be a cause the exit path cannot know, written into the durable artifact.
+  * ⛔ **THE WHOLE `push=` VOCABULARY, IN ONE PLACE** — the marker's `push=` column is a closed set, and a
+    reader keying on it must be able to tell every value apart: `running` (the pre-network marker),
+    `pushed` (verified by reading the remote back, and it now also covers a remote that a PEER
+    fast-forwarded inside the verify window — ancestry is measured with `git merge-base --is-ancestor`,
+    because a descendant sha means our commits ARE on the ref and recording `FAILED` there would be a
+    durable false absence; ⛔ and the CAUSE beside it is NOT read from the push's exit status, because the
+    `rc≠0` path deliberately falls through to that same ancestry read — a non-zero exit covers a rejected
+    ref, a transport failure, a pre-receive hook and a server that applied the ref then failed to report,
+    so that arm names the measurement (the client did not report success; the remote held a descendant at
+    verify time; therefore every commit of this lane is on that ref) and explicitly declines to name a
+    cause — neither "advanced inside the verify window" nor "predates the push" is asserted),
+    `verify-ancestry-unmeasured` (the remote ANSWERED with a sha this worktree
+    does not HAVE, so `--is-ancestor` exited 128 and no relation was established — a DIFFERENT fact from
+    `FAILED`, and the abstaining verdict for it: `FAILED` is only for the measured `rc=1`),
+    `nothing` (the unpushed count read 0 — a statement about the LOCAL
+    `refs/remotes/*` CACHE, not about the remote, which is why the sentence says so), `unmeasured`,
+    `detached`, `verify-head-unreadable` (the remote ANSWERED with a sha, but this worktree's OWN `HEAD`
+    could not be read, so NO COMPARISON WAS MADE — it asserts neither delivery nor loss, and it is a
+    DIFFERENT fact from `FAILED`; the usual cause is a partial/promisor clone or a corrupt odb),
+    `verify-unanswered`, `push-unreported`, `push-killed`, `FAILED` (the remote ANSWERED and
+    the ref is absent or holds an unrelated sha), and the refusals: `refused-main-checkout` (a hub's
+    branch is not a dying lane's to publish), `refused-protected` (the landing branch moves only through
+    the rail), `refused-unknown-default` (the protected set could not be established — an unknown default
+    is not "no protected names"), `refused-pushurl-divergent` / `refused-pushurl-unresolved` (the read
+    and the write would address different repositories), and `UNAVAILABLE`, which has THREE causes the
+    `[lane-exit]` line distinguishes: an unreadable `--git-common-dir` (the hub-vs-worktree shape is
+    unknown), `scripts/lib/bounded.sh` not found, and the library not sourceable. Each refusal refuses
+    because an UNBOUNDED or MISADDRESSED network call on the exit path is worse than no push at all.
+    ⛔ **AND AN EMPTY `push=` IS A DECLARED STATE, NOT A GAP:** it means the terminal never ran the push
+    step at all (`state=not-measured` / `not-a-worktree` — the tree was never measured, so there was
+    nothing to push), and `lane_end_next` abstains for it rather than falling through to a removal
+    licence. Any value that is neither `pushed` nor `nothing` abstains.
+  * ⛔ **THE ARM ORDER IN `lane_end_next` IS A SAFETY PROPERTY, NOT A STYLE CHOICE** — any domain that says
+    `MANUAL` outranks a domain that only reports, and a reporter placed above a MANUAL arm silences it.
+    Three separate review cycles have now found the same defect in a neighbouring arm, so it is stated
+    rather than left emergent: `cannot-verify` is a MANUAL verdict (an incomplete listing cannot certify a
+    tree, and the paths it never saw are in neither the porcelain section nor the archive), so it sits in
+    the MANUAL block above the `archived-local` and `refs/wip/*` reporters while still NAMING the archive
+    it found. Every MANUAL arm NAMES the other domain's MANUAL fact instead of returning alone — a refused
+    push beside a failed archive says both, and says that re-running the rescue cannot fix the branch.
+    ⛔ **AND NO MANUAL ARM MAY ASSERT AN ABSENCE IT DID NOT MEASURE.** Four verdicts had that shape and
+    now say only what was established: `push=unmeasured` means the `rev-list --count` FAILED, so it says the
+    count could not be read rather than that the commits "exist only on this disk" (the enumeration that
+    failed is not evidence of existence); `push=running` is what the PRE-NETWORK marker holds, so it says
+    this MARKER did not establish a push verdict — and it names its possible causes WITHOUT asserting one,
+    because the same on-disk state is left by a kill during the push, by a successful push whose later
+    marker write did not land (a full disk — the very state this feature exists for), and by a kill in the
+    rescue that follows the push; it never says "killed mid-push", and never that the commits exist only
+    here, which the same row's own `unpushed=0` would contradict; `not-a-worktree` is not a verdict about any worktree
+    (nothing was examined — the cause is the CALLER's pointer, so `next=` names `WIP_PATH=` as the remedy);
+    and `rescue=UNAVAILABLE` means the rescue NEVER RAN — either the rescuer was not FOUND, or the
+    root is not the root of a worktree (`spawn-gate.sh:2480`, which returns BEFORE the tool is even
+    searched for at `:2661`, so an installed rescuer can be reported UNAVAILABLE and the real cause
+    is the caller's `WIP_PATH`); the `next=` remedy differs per cause for exactly that reason, so it
+    never says "re-run bg-rescue-wip.sh", a command one of the two causes cannot run. ⛔ **AND THE SCOPE IS SYMMETRIC, WHICH TOOK
+    ONE MORE CYCLE TO SEE:** `unpushed=0` was scoped to the LOCAL `refs/remotes/*` cache because that is
+    what the enumeration reads, but the SAME enumeration in the other direction (`unpushed>0`, printed by
+    `UNAVAILABLE|detached|refused-*`) still asserted the commits "exist only on this disk" — an off-box
+    claim, false whenever a peer on a reused branch name pushed and this worktree never fetched. Both
+    readings are about the CACHE, so both sentences are now scoped to it and say so, and neither asserts
+    anything about a remote — and that includes the SHARED caveat helper `lane_end_push_caveat`, which is
+    appended to the same MANUAL arms and carried the same unscoped sentence (its `refused-protected` /
+    `refused-main-checkout` members are NOT consumed by an arm above it, so it is reachable, not latent).
+    ⛔ AND THE THIRD CONSUMER OF THAT ENUMERATION IS THE `[wip] NOTE` THAT ENDS THE LANE LOG, which is the
+    line an operator reads LAST: its fallback arm said the commits "exist ONLY locally and were NOT
+    pushed". Scoped now too, so the count's three readers (`next=`, the shared caveat, the NOTE) all say
+    the same thing about the same cache.
+    ⛔ **AND A REMEDY NAMES THE REPOSITORY ITS VERDICT IS ABOUT:** `pushed` is
+    granted against the PROVEN push url, so every `next=` sentence beside it prints
+    `${LANE_END_PUSH_URL:-origin}` — a `remote.origin.pushurl` that diverges from `remote.origin.url` is
+    supported, and a hardcoded `origin` would send the reader to a repository nobody read. That covers
+    the `refs/wip/<slug>` archive recovery too: `bg-rescue-wip.sh` WRITES the archive with
+    `git push origin "$C:refs/wip/$SLUG"`, so it lands in the push repository and the instruction must
+    FETCH from there rather than from `origin`'s fetch url. ⛔ AND THE url HAS TO EXIST ON THE ARMS THAT
+    NEVER RESOLVED IT: `lane_end_push` proves `LANE_END_PUSH_URL` only once the unpushed count is > 0, so
+    `nothing`, `unmeasured`, `detached` and `running` all reach `next=` with it EMPTY and fell back to
+    `origin` — the one repository the archive is NOT in. Those arms resolve it through
+    `lane_end_push_repo`, which reads the push url from CONFIG (no network, no proof needed for a remedy)
+    and answers `origin` only when it cannot do better — no readable remote, or more than one push url,
+    which is not this code's to pick.
+    ⛔ **AND THE OTHER DOMAINS' MANUAL FACTS ARE
+    APPENDED BY SHARED HELPERS, NOT RE-TYPED PER ARM** (`lane_end_rescue_caveat`, `lane_end_tree_caveat`,
+    `lane_end_push_caveat`): four consecutive review cycles each found a fresh arm that dropped one — a
+    refused push silencing the archive, the archive silencing the refused push, a reporter silencing
+    `cannot-verify`, and finally `cannot-verify` itself being dropped by every MANUAL push and rescue arm
+    because its own arm sits below them. A caveat expressed once cannot get a case list subtly different —
+    and the two rescue arms that still re-typed the PUSH caveat by hand had already drifted (one listed
+    `UNAVAILABLE`, the other did not; neither listed `running`, which the `cannot-verify` list carries).
+  * ⛔ **AND EVERY TERMINAL WRITES `state/lane-exit-<label>.state`** — the per-lane resume artifact (one
+    aggregate ledger row cannot tell a reclaimer holding ONE worktree anything). Through the same single
+    writer as the ledger, so no path can forget it: `label`, `state` (the tree verdict), `rc`, `cap`,
+    `branch`, `head`, `root`, `unpushed`, `push`, `branch_on_origin` (the sha the REMOTE reported),
+    `push_url` (the repository those verdicts are about, so a divergence is readable after the fact),
+    `rescue`, `wip_ref`, `dirty`, `ended`, `next` (mechanically derived) and a `porcelain:` section. A
+    path that returned BEFORE the measurement writes `state=not-measured` and `next=MANUAL — …did NOT
+    measure`, never a clean bill of health: the hatch is an escape, not a licence to claim a reading
+    that was never taken. ⛔ **THE COUNT AND THE LISTING HAVE DIFFERENT ENUMERATIONS**, so `unpushed` and
+    `dirty` are blanked independently: `dirty` rides on `git status --porcelain` and is `?` whenever that
+    listing is untrusted (`cannot-verify` included), while `unpushed` comes from `git rev-list` and is `?`
+    only when THAT command failed — publishing `?` over a count that WAS measured is the inverse error,
+    and it made the ledger say "never measured" about a number the lane log beside it printed. Both the
+    ledger column and the marker read ONE derivation (`lane_end_unpushed_col`), so the two artifacts can
+    no longer drift. ⛔ `MANUAL` follows the RISK, not the tree verdict: a REFUSED push on a CLEAN
+    (unpushed-only) tree carries it too, because those commits are on that disk only just the same —
+    otherwise a consumer filtering on this file's own convention reclaims one and refuses the other for
+    the same fact. And the affirmative `nothing at risk … may be removed` sentence names its SCOPE (the
+    paths git does NOT ignore), so a lane whose only copy of its work is an ignored file cannot read more
+    safety out of the artifact than the enumeration covered. ⛔ It is deliberately NOT written into the worktree — a file at the worktree
+    root would make every clean worktree dirty, which is the exact predicate the reaper keys on.
   * ⛔ **THE SCOPE IS "AN AGENT STARTED", NOT "EVERY CALL"** — the ten GATE REFUSALS inside `run_agent`
     (brief gate, fork, disk/no-headroom, load, land-backlog, pi's own load/fork refusal) `return` before
     the spawn and therefore reach neither the rescue nor the ledger. That is the honest reading: nothing
@@ -716,13 +867,13 @@ kill is retried next cycle instead of being counted.
 |---|---|---|
 | `tmux` | the worker surface on macOS (the launchd surface) **and on a Linux cell** (where the guest cmux CLI cannot run), and half of the liveness census | `brew install tmux`. ⛔ A cloud cell DOES use it for workers — with the environment contract (`HOME` + `keys.env`); a tmux worker started without that contract is the measured `~21 log lines` death, and `worker-terminal.sh` refuses that spawn rather than starting it (see §2.1) |
 | `gh` (authenticated) | all queue + PR operations | needs push access to the target repo |
-| `pi` on `PATH` | the worker runtime (`pi -p --provider ${PI_LANE_PROVIDER:-deepseek} --model ${PI_LANE_MODEL:-deepseek-flash}`) | the resolved default is `deepseek/deepseek-flash` — an id that exists (agent-infra#2208). Both halves are **env-overridable** (`PI_LANE_PROVIDER`, `PI_LANE_MODEL`), read in the shared `run_agent` (`spawn-gate.sh`, sourced by `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh`) **and** in `merge-one.sh`'s own `run_agent` (the `chain-<N>` first-review path), which deliberately default identically — set them **in `keys.env`**, because the controller and doctor sessions re-source that file and do not inherit an ambient export. The resolved pair is written to each lane's log as `[agent] provider=… model=…`, and `cloud-cell-supervisor.sh check` REPORTS the pair and whether the box's `models.json` lists it. That report never refuses: pi merges its own built-in catalog with the box's list (and `modelOverrides`), so absence from the file is not proof the id fails — `pi --list-models <id>` is the authority |
+| `pi` on `PATH` | the worker runtime (`pi -p --provider ${PI_LANE_PROVIDER:-deepseek} --model ${PI_LANE_MODEL:-deepseek-flash}`) | the resolved default is `deepseek/deepseek-flash` — an id that exists (agent-infra#2208). ⛔ **THE PAIR IS ALSO THE REMEDY FOR THE `No API key found` CLASS, AND THE FORM IS NOT COSMETIC (agent-infra#3443, measured cell-5 2026-11-04)**: a `pi` launched with NO model flag selects its own startup model, and on that box nothing was provisioned for the model it would have started on — `pi -p --no-session --model deepseek/deepseek-flash` was what ran (with the credential for THAT pair present, which is why the flag alone is not a remedy: see the two shapes in the row above). With **no** `--provider`, spell the model as `provider/id` — the unambiguous form; a bare id resolves unreservedly only when exactly one provider exposes it, and with several matches it relies on exactly one being authenticated, otherwise it is rejected as ambiguous (`resolveCliModel`'s exact-match fallback). The harness passes the two halves separately. `key-gate.sh` now prints the model it asserted (`model=<id>`) and `key-gate.sh --probe --box-default` refuses a box whose `settings.json` startup pair has no credential — **when a variable can be NAMED**: a `models.json` `apiKey` template, or pi's own built-in table for a shipped provider (agent-infra#3443). With neither (a custom/unknown provider, an unparseable `models.json`, an `enabledModels` scope) the probe abstains with `check=skipped` and the operator must check that provider's own variable directly. Both halves are **env-overridable** (`PI_LANE_PROVIDER`, `PI_LANE_MODEL`), read in the shared `run_agent` (`spawn-gate.sh`, sourced by `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh`) **and** in `merge-one.sh`'s own `run_agent` (the `chain-<N>` first-review path), which deliberately default identically — set them **in `keys.env`**, because the controller and doctor sessions re-source that file and do not inherit an ambient export. The resolved pair is written to each lane's log as `[agent] provider=… model=…`, and `cloud-cell-supervisor.sh check` REPORTS the pair and whether the box's `models.json` lists it. That report never refuses: pi merges its own built-in catalog with the box's list (and `modelOverrides`), so absence from the file is not proof the id fails — `pi --list-models <id>` is the authority |
 | `uv` | `lane.sh` runs `uv sync --extra embeddings --extra parity` in each worktree | tortoise-specific; `refresh-candidates.sh`'s SCOUT venv is repo-aware since agent-infra#1736 (skipped when there is no `pyproject.toml`; the extras are read from that project) |
 | `python3` | `orch-loop.sh`'s required-check classifier and `fix-one.sh`'s failing-check list | absent, the classifier returns an empty verdict, no case arm matches, and **every PR is skipped in silence** |
 | `~/.pi/agent/scripts/record-review.sh` | writes the HMAC-signed review marker the `ai-review-gate` check verifies | shipped by `agent-infra`; **gate mode only** — a repo that does not require the gate consumes no such marker, so `merge-one.sh` does not mint one there. A cell's `start` provisions it when the cell has none — see below |
 | **the operational layer** (`~/.pi/agent/{scripts,extensions,skills,AGENTS.md,settings.json}`) | a lane is only as guarded as its `pi`; without the layer a box has **no review-enforcer, no verification-gate, no main-worktree-guard, no search-guard, no audit-logger, no skills** | installed by `pi-bootstrap/cell-install.sh`, and on a cell it runs from `cloud-cell-bringup.sh --check`. Measured 2026-10-15 on a live cell: `scripts/` did not exist at all (24/24 declared farm files absent), and the merge path died `rc=127` on the missing `record-review.sh` (agent-infra#1723) |
 | **`AI_REVIEW_GATE_KEY`** | the merge authority — env var, or `~/.pi/agent/.ai-review-gate-key` | **this harness cannot merge a gate-mode repo without it.** Treat as a secret; never commit it |
-| **`DEEPSEEK_API_KEY`** | the WORKER RUNTIME's provider credential — `pi -p --provider deepseek` (in the shared `run_agent` that `spawn-gate.sh` defines, sourced by `lane.sh`/`fix-one.sh`, and in `merge-one.sh`) cannot authenticate without it | `start` publishes the NAME (never the value) into tmux `update-environment`, so a worker the controller spawns inherits the value the controller sourced from `keys.env`. Measured 2026-10-16: with the name absent a cell still MERGES (the rail needs no agent) while every review and fixer died `No API key found for deepseek` — RUNNING, burning its dispatch capacity, unable to review, fix or dispatch (agent-infra#1852). `keys.env`/the shell is the authoritative source: a listed name the creating client lacks is STRIPPED by tmux, so a value living only on the tmux server is not a supported configuration. Treat as a secret; never commit it |
+| **`DEEPSEEK_API_KEY`** | the WORKER RUNTIME's provider credential — `pi -p --provider deepseek` (in the shared `run_agent` that `spawn-gate.sh` defines, sourced by `lane.sh`/`fix-one.sh`, and in `merge-one.sh`) cannot authenticate without it | `start` publishes the NAME (never the value) into tmux `update-environment`, so a worker the controller spawns inherits the value the controller sourced from `keys.env`. Measured 2026-10-16: with the name absent a cell still MERGES (the rail needs no agent) while every review and fixer died `No API key found for deepseek` — RUNNING, burning its dispatch capacity, unable to review, fix or dispatch (agent-infra#1852). `keys.env`/the shell is the authoritative source: a listed name the creating client lacks is STRIPPED by tmux, so a value living only on the tmux server is not a supported configuration. ⛔ **BUT SOURCING THAT FILE IS NOT THE FIX FOR EVERY `No API key found` (agent-infra#3443)**: measured 2026-11-04 on cell-5, `/home/cmux/keys.env` held **only `GH_TOKEN`** — no model key at all — and what fixed it was the MODEL FLAG (`pi -p --no-session --model deepseek/deepseek-flash`), NOT sourcing that file. ⛔ Read the sentence `pi` printed before choosing a remedy, because it picks its own wording from the provider name (`auth-guidance.js:17-19`): **`No API key found for <provider>.`** means a model RESOLVED and that provider's credential is missing — the fix is that key; **`No API key found for the selected model.`** means nothing was available to that process at all (the provider name is literally `unknown` only via the agent-core fallback, `pi-agent-core/dist/agent.js:18-25`) — then the model flag alone cannot help, the credential must exist too. And a key visible in *your* shell is not evidence about the lane's process. Treat as a secret; never commit it |
 | the target repo's branch protection | the REQUIRED-check list and the merge authority are read from it at runtime (agent-infra#1764) | `gh api repos/$OR/branches/main/protection/required_status_checks`. `REQ=…` in the cell env / `keys.env` overrides the read. Unreadable → `FALLBACK_REQ` (non-empty, fail-closed). Requires admin read on the repo, else the fallback applies every cycle and nothing merges |
 | `REVIEW_GATE` (optional) | names the check that IS the merge authority — the repo's gate | defaults to `ai-review-gate`; set it only for a repo whose gate has another name. It is read from the environment, so an ambient/`keys.env` value takes effect: **an override that changes the merge authority away from what the repo's own declaration gives is logged** as `⚠️ … CHANGES the merge authority`, naming the consequence. On a rail repo a flip to `gate` authority means a RAW merge (no head-bound evidence), so treat that line as an error, not noise |
 | a collision pre-flight tool | `refresh-candidates.sh` refuses overlapping dispatches | resolved **per repo** (agent-infra#1736): the target repo's own `tools/collision_preflight.py`, else a tortoise checkout (`TORTOISE_REPO`, or its legacy `TORTOISE` alias). The tool requires **Python >= 3.12** and refuses an older interpreter with exit 3 and no verdict, so the selected interpreter (scout venv, or a bare `python3` when there is no `pyproject.toml`) is version-gated: `--check` and the refresh both refuse a too-old one (permanent `rc=3`) instead of queueing nothing in silence. `SCOUT_PY` pins the interpreter, like `SCOUT_UV` pins `uv`. Put `TORTOISE_REPO` in `keys.env` — the controller session re-sources it, while an ambient-only export does not reach a pre-existing tmux server |
@@ -1116,8 +1267,8 @@ consequence: `gh-limit.py` and the `gh-limit/` shim were missing from a deployme
 current, so every harness `gh` call was unserialised and unbounded).
 
 Exit `1` = the copy or the verification failed; `78` = refused **before touching the target**
-(source absent, source is not a harness — all five identity anchors: `orch-loop.sh`, `claims.sh`,
-`gh-limit.py`, `gh-rest/gh`, `gh-limit/gh` — the source's inventory could not be read in full, the
+(source absent, source is not a harness — all SIX identity anchors: `orch-loop.sh`, `claims.sh`,
+`gh-limit.py`, `gh-cred.py`, `gh-rest/gh`, `gh-limit/gh` — the source's inventory could not be read in full, the
 source ships a symlink, a **symlinked directory** sits on the deploy path under `$O` (writing through
 it would land the bytes outside the runtime the operator named — the same escape as a symlinked
 target file, one directory up), source and target overlap, the source ships no files, target is not a
@@ -1293,8 +1444,8 @@ nothing refused, logged or counted, and the box went to load 258 against its own
 refusal is loud (1-min load, ceiling, the item, and the calling process), counted in
 `~/.pi/agent/state/spawn-gate.tsv` (allowed runs too; bounded by a one-generation rotation at 5 MiB,
 because this is the highest-volume sink in the tree and a device that fills silently is #1765's
-defect), and exits 76, which `run_agent` translates to
-the callers' usual `AGENT_LOAD_REFUSED`/`AGENT_STARTED=0`. Its stated limits are in the file's header:
+defect), and exits 76 (a LOAD refusal) or 84 (a MEMORY refusal, #2387), which `run_agent` translates to
+the callers' usual `AGENT_LOAD_REFUSED` / `AGENT_MEM_REFUSED` with `AGENT_STARTED=0`. Its stated limits are in the file's header:
 the real binary by ABSOLUTE path or a `PATH` reset is not gated (deliberately — that is the
 operator's rescue route when the box is over its ceiling, and the refusal message prints it), a
 caller that exports its own `MAX_LOAD` sets its own ceiling, and a box where neither installer has
@@ -1505,7 +1656,7 @@ manifest path above is what a box that is copied into every deploy should use.
 |---|---|---|
 | `MAX_LOAD` | `cores*10` (100 on a 10-core box; sanity ceiling) | dispatch stops above this 1-min load |
 | `MAX_LANES` | **derived**: `10#$_NCPU * 5 / 2` — 2.5× cores, floored (25 on a 10-core box, 10 on a 4-core box, 10 on an unprobeable host) | concurrent implementation lanes. **Capacity gates dispatch, not a lane count** (owner ruling, 2026-10-17, verbatim: *"dispatch should be gated on capacity, not on number of lanes. max lanes 8 is too low. that needs to be configured to 2.5x the number of CPUs"*). The shipped default was a flat `4`, and the box this was measured on had its plist **pinned** at `8`: `[cap] load=79/100 lanes=9/11 max_lanes=8 … [dispatch] skipped (lanes=9>=max_lanes=8)` — 21 points of load headroom and comfortable swap/memory, so dispatch was refused for a lane count while capacity was available. A **valid** pin (plist/`keys.env`) still wins and is never recomputed; an **invalid** one is refused by `install.sh` and repaired by the loop to the derived default; a derived value that fails `is_limit` falls back to `10`. ⚠️ The plist **pins** the number, so a box picks this default up only on a fresh `install.sh` render. ⚠️ `2.5 × cores` is ALSO `LOAD_SUSPEND_THRESHOLD`'s default (`docs/ops/load-policy.md` §2) — that is a 1-minute **load** threshold, this is a count of **lanes**; they are not one ceiling |
-| `MAX_REVIEW` | `4` | concurrent `merge-<PR>` reviewers |
+| `MAX_REVIEW` | `10` | **two ceilings under one knob (agent-infra#3441).** (1) Concurrent `review-<PR>` reviewers. (2) The **review-ROUND budget one PR may spend** (`state/reviewround-<PR>`, cumulative ACROSS heads until the loop CONVERGES — a CLEAN verdict or the PR leaving the queue clears it; a push does NOT re-arm it, `MAX_REVIEW_TRIES` is the per-head book). `0` is REPORT-ONLY, the `MAX_REVIEW_TRIES=0` idiom, decided before the counter is read: the CONTROLLER's dispatch arm dispatches nothing and parks nothing, and `merge-one.sh` — which cannot dispatch-nothing, because a direct caller asked for that review — buys it and **banks no round**, so a later restore of the knob cannot park a PR against rounds a report-only box never bought (round-17 review, P2: it used to bank them). At the round ceiling the NEXT review is REFUSED and the head is PARKED with a terminal `REVIEW-CEILING <PR> rounds=<n>/<max> head=<sha> stale_findings=<n> heads=<csv\|none>` line — an **escalation event, never a pass**, written to the log, the dispatch ledger and the park-reason file so it survives log-quiet (#943, #3331). ⛔ THAT SHAPE AND THOSE THREE DESTINATIONS ARE THE **CONTROLLER'S** (round-17 review, P3): the direct ingress parks with `REVIEW-CEILING <PR> rounds=<n>/<max> head=<sha>` — no `stale_findings`/`heads`, and no ledger row — so a mechanical reader of a chain/lane-merge park learns less than this row once implied. The round is spent only by `merge-one.sh`, which is the only writer on either ingress. ⛔ **THE REFUSAL IS ENFORCED AT BOTH INGRESSES** — `orch-loop.sh`'s dispatch arm AND `merge-one.sh` itself, which consults the ceiling above its own reviewer start (`_rr_ceiling_hit`, before `REV_STARTED=1`) and refuses with `exit 3` + a `REVIEW-CEILING` park reason. Until the fresh review of #3441, P1 that second read did not exist and this row said the bound was "delayed by at most one direct review" — which was an accurate description of a gap and not of a bound: `chain-<N>` / `fix-one` / `lane-merge` / a hand-run operator reach `merge-one.sh` DIRECTLY, so on those paths the ceiling was unbounded, not delayed. It is now exact on **both ingresses of the harness loop**. (`exit 3`, not `75`: 75's readers report a CAPACITY refusal and would tell an operator to wait for a quieter box, which cannot clear a spent budget.) ⛔ **AND THERE IS A THIRD INGRESS THIS DOES NOT BOUND, STATED HERE RATHER THAN LEFT TO BE DISCOVERED** (round-14 review, P2): `scripts/review-pr.sh` spawns its own fresh-context reviewer (`KIND=reviewer`, `pi -p --no-session`, its own watchdog) and neither consults nor spends `reviewround-<PR>`, so it has no round budget at all — and it is the seam a LANE is told to use when it wants a reviewer by hand (`templates/LANE-BRIEF.md:225`, `skills/code-review/SKILL.md:1617`, farmed to cells). This row previously claimed the bound covered EVERY ingress, which was true of the harness loop and false of the fleet; the gap is tracked as agent-infra#3494 rather than silently absorbed. It cannot spend the book today (it has no guaranteed `$O`), so the fix is a design question for that script, not a missing line here ⚠️ **Both numbers were 4, and the round ceiling did not exist at all**: `MAX_REVIEW_TRIES` bounds one head, so a PR could re-buy reviews for ever, one head at a time, with nothing counting the PR (measured on #3355 — four recorded rounds across four heads, each within its own head budget). Raised to 10 by owner ruling (2026-11-04): 4 exits before convergence on exactly the hard cases. ⚠️ `review_slots()` still returns `MAX_REVIEW+2` under drain — that headroom is about CONCURRENCY only and does not raise the round budget. ⛔ **A BOX TAKES THIS NUMBER ONLY ON A FRESH `install.sh` RENDER** (the plist PINS it — see the `MAX_LANES` row above), and the REINTERPRETATION is the hazard: a plist rendered before #3441 still pins `4`, which was chosen when this knob meant concurrency only and is now ALSO a 4-round parking ceiling — the exact early exit the ruling was made to remove. `install.sh` WARNS on any value in 2..9 that is **supplied to the render** and names the consequence; nothing raises it automatically, so re-render to pick up `10` (round 9 review, P2). ⛔ **AND IT CANNOT SEE A STALE PLIST** (round-16 review, P3): `install.sh` seeds the knob from `${MAX_REVIEW:-10}` and never reads the INSTALLED plist's `EnvironmentVariables`, so a plist rendered before #3441 that pins `4` produces no warning — re-rendering takes the new default and the warning is silent, which is the harmless direction but not what this row used to claim. The warning block is also **unpinned**: no suite runs a render with `MAX_REVIEW=4` and greps for it (the install-check groups are macOS-only and skip on Linux). Both are named residuals rather than covered behaviour: `MAX_REVIEW=4` is the configuration this row exists to make visible, and a one-line print nobody asserts will be deleted by the next lane that finds it unused. ⚠️ **ONE NUMBER, FIVE SPELLINGS**: this §4, `orch-loop.sh`, `install.sh`, `scripts/pr-doctor.py` and `orchestrator-harness/worker-supply.sh`. The three CODE fallbacks are the ones that can drift silently (the two consumer copies bind only on a box with no plist and no env, where a 4 would throttle the drain against a documented 10 — the defect `pr-doctor.py`'s own history records); `selftest.sh` pins `orch-loop.sh`/`install.sh` and `test_pr_doctor.py` + `worker-supply.test.sh` (g2) pin the other two, each by extracting the loop's own default |
 | `MERGE_PRIORITY_AT` | `25` | **no longer a gate — headroom only.** The gate is threshold-free (§7.2f): one workable un-owned PR is enough to stop the issue path, and there is no age-based release (a stalled drain gets `DRAIN STALLED`, never a licence to open work). This value now only selects the *drain posture* — from here the reviewer/fixer headroom rises to `MAX_REVIEW+2` / `MAX_FIX+2`, so a 25-PR backlog is drained by the capacity that actually clears it instead of being capped to a trickle. Kept as a name because operators and the `[cap]` line read it |
 | `MERGE_STALL_MIN` | `180` | **display only.** The age at which the `[dispatch] DRAIN STALLED — no PR merged in <age>m while <n> un-owned remain` diagnostic fires. It gates **nothing**: the issue path is closed by un-owned PRs, not by a land age, so a big or unreadable value can never open it. An unset or non-numeric value falls back to 180; a land marker stamped in the FUTURE prints `DRAIN STALL UNMEASURED` (neither a stall nor an all-clear) instead of a fresh `0m`. ⛔ An **empty** answer — nothing landed inside `mp_recent_land`'s window, including a box whose `state/merged-*.done` set is empty — is now read as the STALL (agent-infra#2929), and the age is set to **that window's own bound** (`2 × MERGE_PRIORITY_MAX_AGE_MIN`), because it is the only floor the empty answer actually proves; the line says so, and the status token prints `no_land=>=<age>m` |
 | `DRAIN_STALL_FIX_EVERY` | `3` | how many **stalled** passes pass between `stall-fix.sh` dispatches of the read-only `prfix` diagnostician (`1` = one per stalled pass). It bounds a box nobody is fixing: the stall keeps escalating every pass, but it does not spawn a worker per cycle forever. A value that is not a whole number `>= 1` falls back to 3, and `0` is not a bound. `DRAIN_STALL_FIX_TIMEOUT` (default `1800`s) bounds the worker itself; `STALL_FIX_WORKTREE`/`HARNESS_REPO` choose the throwaway detached worktree it runs in. ⛔ `STALL_FIX_VERIFY_SECS` (default `10`, clamped to `1–120`) is how long the escalation watches the worker's own record before it states a verdict — see the §drain-health paragraph below, because the verdict is READ from that record and not from the dispatcher's exit status |
@@ -1517,7 +1668,8 @@ manifest path above is what a box that is copied into every deploy should use.
 | `MAX_REVIEW_TRIES` | `3` | verdict-less reviewer runs at ONE head before that head is parked (agent-infra#2132). ⛔ ONE budget, keyed on the head, spent by BOTH arms in `state/reviewdisp-<PR>` (agent-infra#2971: the controller on dispatch, `merge-one.sh` on a verdict-less run that nobody counted — `REV_PAID=1` marks the dispatcher-paid case so an attempt is never counted twice) — so "we already tried review twice at this head" is the same number to both, and `REVIEW-CAP` and the reviewer-side park cannot disagree. The record is `"<head> <n>"`, a push resets it, and any run that DID produce a verdict (findings, or a verified CLEAN) resets it too — it bounds CONSECUTIVE verdict-less runs — so a reviewer that keeps hitting its cap cannot buy an unbounded run of paid reviews. ⛔ **THE SAME LIMIT IS READ BY TWO FILES** (agent-infra#2653): `merge-one.sh` bounds its own reviewer runs with it, and `orch-loop.sh` — which dispatches the `review-<PR>` review ORDER — keys its `state/reviewdisp-<PR>` budget on it. Two readers, ONE budget (the controller coerces it to the same default, and the suite pins the count). ⛔ AND A REVIEWER RUN THAT ENDS WITHOUT ITS `CLEAN`/`ISSUES` MARKER IS A COUNTED FAILED ATTEMPT, never silence (agent-infra#2971): `merge-one.sh`'s EXIT trap records it with its exit code and last line, which is the artifact whose absence made the 2026-10-28 log simply stop at 23:30. ⚠ A head whose signed marker verified but whose gate never reaches SUCCESS is no longer re-reviewed by the controller at all: the store's head-bound CLEAN record is read directly (`REVIEW-AT-HEAD`, agent-infra#2517's record key), which bounds the paid side of the agent-infra#1756 class — what remains is that such a head has no *actuator* in the controller (the gate re-triggers on `edited`, so a RE-RECORD, not a review, is its remedy; that arm is `merge-one.sh`'s CLEAN path) |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (`orch-loop.sh:1438` for the gate, `:1413-1415` and `:1431` for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
 | `MIN_SWAP_FREE` | `600` | MB. ⛔ Two limits worth knowing before trusting it: on a host with **no swap at all** (`SwapTotal: 0`, i.e. a container) the gate is **INERT by design** — `swap_total=0` reads as uninitialised, not as pressure (the `[cap]` gate's swap arm, beside `swap_usage_mb`/`mem_avail_mb`, for the gate; the same `swap_total=0` arm for the rule), so capacity there is decided by load and memory only — and on a host that **has** swap the metric is a level, not a counter: swap that has been used stays used, so a past spike holds the FREE level down and the gate flaps across its own threshold (measured `swap_free=549M<=min_swap_free=600M` at load 5.4 of a 64 ceiling; agent-infra#1961). `MIN_MEM_FREE_MB` is the metric that reflects the present |
-| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it |
+| `MIN_MEM_FREE_MB` | `512` | MB of *available* memory (`MemAvailable` on Linux, else `MemFree`+`Cached`; `free`+`inactive` on macOS). macOS shows pressure as compression with swap flat, so swap alone does not see it. ⛔ This is the CONTROLLER's dispatch arm; the SPAWN gate's own floor is `MEM_MIN_AVAIL_MB` below — two populations, one probe (`mem_avail_mb`, byte-identical in both files and pinned by `spawn-gate.test.sh`) |
+| `MEM_MIN_AVAIL_MB` | **derived**: `MEM_LANE_RESERVE_MB * MEM_SPAWN_RESERVE_LANES` = `1024 * 2` = `2048` | MB of available memory the SPAWN gate requires before it starts any agent (`spawn-gate.sh`, agent-infra#2387 — **fail-CLOSED**, unlike the disk and load probes). The reserve is MEASURED, not chosen: a lane's peak is `pi` PLUS the pytest shard it runs, and both halves were measured on a 10-core/32 GB box — all 54 resident `pi` processes (mean 56 MB, max **449 MB** RSS) and four EXECUTING shards against a private FalkorDB (`/usr/bin/time -l` max RSS: 151 / 164 / 359 / **564** MB). 449 + 564 = 1013 MB, so the reserve is **1024 MB**, and the ×2 pays for the lane being spawned AND a peer already inside its own peak window — the allocation that lands on a peaking box. ⛔ Both figures are SAMPLE MAXIMA (n=54, n=4) and a sample maximum is a LOWER bound on the real peak, which is why the floor carries two. The refusal prints all three numbers so it can be re-computed against the box (`mem_min_avail_mb=2048M = mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2`). ⚠️ It is a capacity POLICY knob, not a lane cap: raising it refuses earlier, lowering it refuses later, and neither changes how many lanes may run. ⚠️ A floor is a floor, not a headroom policy — see the #2387 note below for what it does and does not refuse |
 | `BATCH` | `2` | issues dispatched per cycle |
 | `PRODUCT_FLOOR` | `1` | how many slots of each batch are filled from `candidates.product.txt` FIRST (§2 "State files (`$O/`)" `candidates.txt` row, agent-infra#2054). Clamped to `[0, BATCH]`; `0` **disables** the floor and is a legitimate setting. A missing or non-numeric value falls back to the default `1` — never to `0`, which would silently switch the guarantee off. An UNMET floor LOGS AND DEGRADES (`product-floor unmet … queue=<state>`), and it never refuses a batch or caps the fleet, because a floor is not a quota. The report names its verdict either way — `product-floor MET product=<n> batch=<n> floor=<n>` on a batch that met it, `product-floor unmet (product=… batch=… floor=…) queue=<state>` on one that did not, `product-floor N/A` where no product channel exists — so "the floor worked" is never inferred from silence. ⛔ **THE FLOOR YIELDS TO AN EMERGENCY, AND SAYS SO.** Before it reorders, `floor_emergency` asks two questions of state already on disk: is a `P0-blocker` candidate inside the batch window (`candidates.emergency.txt`, derived from the item's own label), and is there a `red-tree` rail refusal for a PR that is not parked? Either one — or an emergency class that could not be read (`p0-unknown`) — stands the floor down for that cycle and logs `product-floor OVERRIDDEN emergency=<reason>` with the counts the batch actually got. The floor reorders a SEVERITY-ordered queue, so this is the one failure it must never cause; a missed product slot re-asserts itself next cycle, a P0 delayed behind a share target does not. Its intake side (`refresh-candidates.sh` → `write_product_queues`) classifies by PRODUCT_REPOS + the `harness` LABEL and records what it decided in `state/product-class`, which the dispatch line repeats: `NOT-A-PRODUCT-REPO` / `BUDGET-SKIPPED` / `LISTING-FAILED` / `LISTING-TRUNCATED` / `WRITE-FAILED` / `OK product=<n> harness=<m>`. ⛔ THE RECORD DESCRIBES THE TWO QUEUE FILES, so only the function that WRITES them invalidates it: `write_product_queues` writes `PENDING …` as its first action and every arm below overwrites it, while a pass that refuses before reaching the writer (the environment check, the budget, the pool read) or SKIPS because the pool is unchanged (#1984) leaves the previous record alone — it is still true, because neither queue file changed. `PENDING` therefore means *a split started and did not record a class*, and the loop reports it as an UNKNOWN class, never as `the split RAN and found none`. A SHORTFALL is unmet too — `PB < PRODUCT_FLOOR`, not only `PB = 0` — so a floor of 2 that fills one slot still logs `product-floor unmet … queue=<state>` |
 | `PRODUCT_REPOS` | `daniel-ospina/tortoise` | **comma-separated** `owner/repo` list (no spaces, matched as an element — `$(printf '%s' "$PRODUCT_REPOS" | tr ',' ' ')` then `*" $repo "*`), read by `refresh-candidates.sh` and deciding **which repo counts as PRODUCT**: an issue is product work when its repo is in this list AND it does not carry the `harness` label. ⛔ **TODAY ONLY THE ENTRY EQUAL TO `$OR` CAN EVER MATCH**: the backlog is read from `$OR` alone, and the intake is called with `$OR`, so every other element in the list is inert until a pass spans more than one repo. The list form is kept because that is the shape the decision has; it is not a multi-repo queue. If `$OR` is absent from the list, EVERY candidate is harness and the loop prints `product-floor N/A` — which is how a box says "no product channel here", not an error. This is the single input the whole floor rests on, so it is documented here rather than only in `ARCHITECTURE.md`: a repo **outside** the list reports `NOT-A-PRODUCT-REPO` and the loop prints `product-floor N/A`, which is **not** an unmet floor and **not** a finding about product work. ⛔ **`$ENV_FILE`-only: `install.sh` neither renders nor validates it** (its numeric `[`-based validator would reject a list, so a `__PRODUCT_REPOS__` placeholder is deliberately absent), which means exporting it and re-running `install.sh` has no effect, and a hand-added plist key is overwritten by the next render — set it in `$ENV_FILE` on a cell, or edit the `PRODUCT_REPOS=` default in `refresh-candidates.sh` (search the assignment, not a line number — it moved once already) |
@@ -1532,11 +1684,15 @@ manifest path above is what a box that is copied into every deploy should use.
 | `SWEEP_ROWS_PER_CYCLE` | `8` | the sweep's per-cycle **window**: how many swept PRs are read per cycle, rotating via `state/sweep-cursor`. A full 70-row pass costs minutes (≥2 `gh pr view` per row) and the controller is relaunched every 12–45 s, so an unbounded pass was torn down before the arms at its end — measured: 0 dispatches in 555 cycles (#2640). The cursor advances AFTER the pass, by the rows that actually produced a disposition, so an interrupted window resumes at its unfinished row instead of stepping over its tail |
 
 ⛔ **`PRODUCT_REPOS`, `STALE_MIN`, `SWEEP_MAX_AGE`, `SWEEP_MIN_REMAIN`, `SWEEP_ROWS_PER_CYCLE`, `MERGE_STALL_MIN`, `DRAIN_STALL_FIX_EVERY`, `STALL_FIX_BRIEF_MAX_AGE_MIN`, `MAX_REVIEW_TRIES` and the three wall-clock timeouts are NOT rendered into the plist.** The template
-carries 19 placeholders — the thirteen limits above them, `SCOPE`, `O`, `REPO`, `OR`, `PATH` and `HOME`
+carries **35** placeholders (counted, not incremented — a number beside a list goes stale by being incremented: `grep -o '__[A-Z_]*__' launchd.plist.template | sort -u | wc -l`) — the limits rendered above them, plus `SCOPE`, `O`, `REPO`, `OR`, `PATH`, `HOME`, and the harness-pin / uv / memory entries. Four of those limits are named HERE rather than in the table above, because they have no row of their own: `MAX_RED_FIX`, `MAX_RED_FIX_TRIES`, `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`
 — and no `__STALE_MIN__`/`__SWEEP_MAX_AGE__`/`__SWEEP_MIN_REMAIN__`/`__LANE_TIMEOUT__`/`__REVIEW_TIMEOUT__`/`__FIX_TIMEOUT__`. So exporting one
 of these and re-running `install.sh` silently has no effect, and a hand-added plist key is
 overwritten by the next render. Set them through `$ENV_FILE` on a cell, or edit the defaults in the
 scripts.
+⛔ **The three memory knobs ARE rendered** (`MEM_MIN_AVAIL_MB`, `MEM_LANE_RESERVE_MB`,
+`MEM_SPAWN_RESERVE_LANES`), unlike the row above: the spawn gate's memory floor is enforced by the
+controller's own plist, so a knob the render dropped would be a floor an operator could set and never
+have take effect (#2387).
 ⛔ **`__PROGRAM__` is not one of those:** it names the launchd **program** — `$O/orch-pin-exec.sh`, the
 stable resolver — and is substituted from `STABLE_PROG`, never from the table above. `__HARNESS__` /
 `__ENTRY__` still render, but they now describe the pin the resolver *targets*, not the program the job
@@ -1548,7 +1704,7 @@ wall-clock timeouts (named as a phrase in the sentence) and the `AGENT_GH_GATE_*
 documented in its own gate section.)
 
 ⛔ **And every limit that IS rendered must be a whole number, in range, and not a template token.**
-The thirteen are substituted verbatim — deliberately not routed through the escaping path, since a whole
+They are substituted verbatim — deliberately not routed through the escaping path, since a whole
 number has nothing to escape — so `install.sh` validates each before rendering: digits only, at most
 nine of them (`[` errors at or above 2**63, and an errored test reads FALSE, which OPENS the gate it
 configures), `CYC` additionally at least 5 (see below), and no `__…__` pattern, because the sed rules run in order and `OR=__MAX_LANES__`
@@ -1615,12 +1771,34 @@ pre-fix inline read sat ~620 lines below the FIRST spawn site, ~225 below the la
 obey; raising the default floor is a separate decision (it is a capacity policy, not a wiring bug)
 and is deliberately not made here.
 
-⚠️ **The SPAWN POINT is still memory-blind** (agent-infra#2387): `spawn-gate.sh`'s `run_agent()` gates
-on load and the disk floor and consults no memory probe, so a worker started by `lane.sh`/`fix-one.sh`
-— or by an installed `pi` — is bounded by memory only through the controller's decision to start it.
-A different population from these six sites, and it needs its own polarity decision: that file's disk
-gate fails OPEN on purpose (a live dispatch path must not stop every lane on the box for ever), while
-this memory arm fails CLOSED.
+✅ **The SPAWN POPULATION is memory-gated too** (agent-infra#2387 **FIXED**). It used to be the one
+gap: `spawn-gate.sh`'s `run_agent()` gated on load, the disk floor and the land ratio and consulted
+**no memory probe at all**, so a worker started by `lane.sh`/`fix-one.sh`/`nonblocking-dispatch.sh`,
+by `merge-one.sh`'s own unported `run_agent` (the `chain-<N>` first review of every own-lane PR), by a
+hand-written `tmux new-session … pi` runner, or by an interactive session was bounded by memory only
+through the controller's decision to start it. Both of that file's spawn surfaces now read it —
+`run_agent()` (after the disk gate, before the load gate) and the installed-`pi` SHIM — with the
+`mem_avail_mb` probe this file already carries, and the polarity is the DISPATCH gate's, not the disk
+gate's: **fail-CLOSED**, verdict `UNREADABLE`, spawn refused. That is a deliberate divergence from
+the disk gate's fail-open, and the reason is structural rather than stylistic — an unreadable `df` is
+a per-volume nuisance on a live path, while an unreadable memory probe is indistinguishable from "the
+box is fine" and treating it as capacity is exactly how a box talks itself into an OOM. Refusals are
+`AGENT_MEM_REFUSED` (81) from `run_agent` and `PI_GATE_MEM_REFUSED` (84) at the spawn point, the
+latter translated into the former so no caller learns a new code; `lane.sh` records the capacity
+yield with `gate=mem` and `fix-one.sh` names the memory gate rather than the load one.
+
+⛔ **WHAT THIS DOES NOT BUY, again stated rather than implied.** The floor is `2048 MB` by default
+(see the `MEM_MIN_AVAIL_MB` row) and it is a HEADROOM floor, not a headroom policy: a box reading
+`available=8379 MB` clears it. So the cell-4 figures in #2387 are NOT all refused by the shipped
+default, and the note in that issue deserves one correction: `rc=143` is SIGTERM — this harness's own
+wall-clock watchdog, or the stale-worker reaper — and NOT the OOM killer's SIGKILL (137), so those
+eight lane deaths are evidence that lanes died, not evidence that memory killed them. The memory
+evidence is the six `dmesg` OOM lines, and the surviving `free -m` snapshot cannot be dated against
+them (memory freed by the dead lanes is indistinguishable from memory that was free throughout). What
+the change removes is the STRUCTURAL gap: no floor — not even a raised one — could bind a spawn path
+that read no memory figure. What would have refused the documented cell-3 reading (`653 MB`) is the
+shipped default, and an operator who wants a higher floor sets `MEM_MIN_AVAIL_MB` — a capacity
+policy, deliberately not made here.
 
 ⚠️ **The account's CONCURRENCY cap is a shared FLEET resource — the ceiling on parallelism is
 neither CPU, RAM nor disk.** Every limit in the table above bounds *this box*: load, lanes, swap,
@@ -2554,8 +2732,10 @@ what distinguishes them, because a killed run genuinely has no verdict.
   (`reason=dry-run`).
 - `refused` — a gate refused BEFORE any agent started, and `reason` NAMES it: `load-gate`, `disk-gate`,
   `fork-gate`, `land-backlog`, `capability-gate`, `harness-skew`, `brief-gate`, `repo-target:…`,
-  `key-gate:<reason>:<VAR>` (see `key-gate.sh` below), and `agent-not-started:rc<rc>` for an unmapped
-  refusal code. `outcome=refused` alone would repeat the defect this line removes: those remedies are
+  `key-gate:<reason>:<VAR>:<MODEL>` (see `key-gate.sh` below), and `agent-not-started:rc<rc>` for an unmapped
+  refusal code. ⛔ THE MODEL IS PART OF THE TOKEN (`agent-infra#3443`): the failure this gate front-runs is
+  named after the model, not the variable, so a scan that carries only `$VAR` can point an operator at a
+  credential that was never the question. `outcome=refused` alone would repeat the defect this line removes: those remedies are
   mutually exclusive (#1765, #2293). ⛔ there is deliberately **no `pi-gate` reason**: `run_agent`
   translates the spawn point's refusal into the load/fork code before returning
   (`spawn-gate.sh:2460-2463`), so an arm for it here would advertise a token no lane can produce —
@@ -3495,8 +3675,11 @@ cover), and a later cycle reaps a DEAD-pid lock **only when no landing attempt i
 pid proves nobody holds the lock, not that no rail is in flight. A live pid is never reaped or taken
 over. The same re-verification applies to claims: an **expired lease is free**, exactly as
 `claims.sh`'s `_lease_is_live` defines it, because a box that died mid-review would otherwise block
-the PR forever; an unparseable lease stays LIVE (fail-closed), matching `_lease_unparseable` — **including the
-`0` sentinel**, which `test-claims.sh` pins as "UNPARSEABLE => LIVE". The claim message is read from a
+the PR forever; an unparseable lease is never read as EXPIRED (fail-closed: nothing is reclaimed on a
+term nobody can read), matching `_claim_lease_state`'s `unreadable` answer — since #3203 that is
+REPORTED as an abstention, never as live — **including the
+`0` sentinel**, which `test-claims.sh` pins as "an oversized (>=2**63) lease reads as UNPARSEABLE =>
+ABSTENTION (rc=1, never stolen)". The claim message is read from a
 PRIVATE ref, never `FETCH_HEAD` (one per `.git`, rewritten by any concurrent fetch), and its shape is
 `claims.sh`'s (`claim owner=… lease_until=<epoch> nonce=…`).
 Stated residual: two REMINDERS on two boxes with no claim held can both dispatch; the rail's
@@ -3697,8 +3880,12 @@ head; `fix-one.sh` takes the **same** claim on the current head for the fixer's 
 releases it before re-entering `merge-one.sh` (otherwise the reviewer-only claim left two boxes free
 to spawn a fixer for the same PR); `orch-loop.sh` refreshes **every** claim in **one** fetch per
 cycle into `state/claims-snapshot`, so `claim_live()` costs no per-PR network call. The lease is
-**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + 1200` for the
-reviewer and `FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit.
+**data, not liveness** (a remote pid cannot be probed), derived as `REVIEW_TIMEOUT + _gw + 300` for the
+reviewer (`_gw` is the gate wait, `GATE_POLL_TRIES` x `GATE_POLL_SECS`, 900 s at the defaults) and
+`FIX_TIMEOUT + 1200` for the fixer, and carried in the claim commit. *(Corrected: this sentence said
+`REVIEW_TIMEOUT + 1200` for the reviewer. The two forms agree only at the default gate wait — 1800 +
+900 + 300 = 1800 + 1200 = 3000 s — so on a box with `GATE_POLL_SECS=60` the code leases 3900 s while
+a reader computed 3000 s. Same stale derivation as the paragraph on the ceiling, ~140 lines below.)*
 
 #### Selection consults the registry, and an unreadable registry is not freedom (agent-infra#2466)
 
@@ -3711,7 +3898,7 @@ writer (`CLAIM_OWNER_HOST=cell-2`, `refs/claims/9777-abc123def456`, live 1800 s 
 read OWNED; an **absent** snapshot and an **empty** one both read UNOWNED.
 
 One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `_lease_is_live` and
-`claim_orphan_reason` (no second verdict path). It publishes five words:
+`claim_orphan_reason` (no second verdict path). It publishes six words:
 
 | verdict | rc | meaning for SELECTION |
 |---|---|---|
@@ -3719,6 +3906,7 @@ One reader now answers — `claims.sh`'s `claim_snapshot_verdict`, which calls `
 | `claim-expired` | 0 | an entry whose lease window has passed → free |
 | `claim-orphaned` | 0 | a live window whose holder cannot be a live lane (agent-infra#2094) → free |
 | `claim-held` | 1 | a live, non-orphaned window → **skip** (owner + `until` in the log line) |
+| `claim-lease-unreadable` | 1 | a claim EXISTS whose LEASE cannot be parsed → **skip** (an ABSTENTION: not a live claim, not a free one — agent-infra#3203; `claim_prune` reaps it past `CLAIM_UNREADABLE_LEASE_MAX_AGE`) |
 | `claim-unreadable` | 2 | the registry could not answer → **nothing is spawned, armed or merged** |
 
 Freshness is part of the verdict, not a separate guard: `claim_snapshot` writes a
@@ -3760,8 +3948,9 @@ THIS MACHINE owns, so a name handed to another box afterwards makes every claim 
 this box's own dead claim — for every keying — and the local-pid rule then probes the foreign pid HERE,
 reads a local absence, and calls a LIVE remote worker's PR claim orphaned: the steal direction, from a
 name that is no longer ours. The self-limiting claim holds only while the name is exclusive to this
-box. Remedy: once no outstanding claim can still carry the name (after `CLAIM_TTL_MAX` / `CLAIM_ISSUE_TTL`),
-delete the line from `state/claim-hosts` before the name is reused elsewhere.
+box. Remedy: once no outstanding claim can still carry the name (after the LONGEST ceiling across every
+keying — `CLAIM_TTL_MAX` 9600 / `CLAIM_ISSUE_TTL` 18000 / `CLAIM_BRANCH_TTL` 14400 — so 18000), delete the
+line from `state/claim-hosts` before the name is reused elsewhere.
 
 ⚠️ **The roster is an allow list, so an INCOMPLETE one over-reaps**: a roster that names this box and merely omits a live peer declares that peer dead and re-dispatches its unexpired work across two boxes — the failure this registry exists to prevent, reached from the opposite direction. It must be COMPLETE and authoritative, which is why the deny list (`CLAIM_DEAD_HOSTS`) is the safer knob for a one-off dead host and is checked first.
 
@@ -3815,29 +4004,54 @@ box with lanes in flight, expect the next prune to free their issue claims and l
 keying (where the minting pid IS the worker) is unaffected.
 
 An orphaned holder is reclaimable **regardless of `lease_until`**, the pre-flight reports it CLEAN
-(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease keeps its
-existing polarity — LIVE — and is never re-examined for orphanhood: those rules are a reason to stop
-trusting a *term*, not evidence about a *holder*. Every `held by …` hold reason and every pre-flight
-COLLISION carries a machine-readable token, `held-by-live` or `held-by-orphan` (the lost-CAS refusal
+(the CAS still has to be won), and `claim_prune` reaps it. An **unparseable** lease ABSTAINS
+(agent-infra#3203): the acquire and the pre-flight still refuse it (rc 1 — nothing is ever stolen),
+it is never re-examined for orphanhood (those rules are a reason to stop trusting a *term*, not
+evidence about a *holder*), and it is no longer reported as a LIVE window — the token is
+`held-by-unreadable-lease` and the snapshot word is `claim-lease-unreadable`. The block it creates is
+BOUNDED: `claim_prune` reaps the ref once the claim's own COMMIT is older than
+`CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s = `CLAIM_ISSUE_TTL`, the longest shipped lease), naming the
+fault and the age on its output line; before that bound the pass NAMES it as kept instead of skipping
+it silently. Every `held by …` hold reason and every pre-flight
+COLLISION carries a machine-readable token — `held-by-live`, `held-by-orphan`,
+`held-by-unreadable-lease`, or `held-by-unreadable-clock` for the LOCAL CLOCK itself being unreadable
+(a clock this box cannot read must not mint a term: `$(( now + ttl ))` would be `0 + ttl`, i.e. a lease
+stamped in 1970 that every peer reads EXPIRED and may steal the same second; an oversized clock WRAPS
+and mints the same term — so the acquire REFUSES the mint at **rc 1**, the code every PR-claim
+consumer refuses on, and nothing is written; rc 2 would be read as "registry unavailable, proceed" and
+would drop the cross-box exclusion. Pinned by `test-claims.sh` P4 A25–A29) (the lost-CAS refusal
 `lost the reclaim race for <ref>` carries neither — it reports a race, not a hold), and
 `refresh-candidates.sh` reports how many candidates a live
 claim withheld and how many were queued *although a claim existed* (its only claim is orphaned), so a
 claim-driven empty backlog can no longer read as "no work".
 
 **The lease has a CEILING as well as a default.** `CLAIM_TTL` (1800s) and `CLAIM_ISSUE_TTL`
-(14400s — raised from 10800s by #2029, whose merge phase lengthened the wait the lease must outlive)
-are *defaults* for their keying; `CLAIM_TTL_MAX` (7200s) and `CLAIM_ISSUE_TTL` bound what a
-caller may stamp. Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
+(18000s — raised 10800s -> 14400s by #2029, whose merge phase lengthened the wait the lease must
+outlive, and 14400s -> 18000s by #2999) are *defaults* for their keying; `CLAIM_TTL_MAX` (9600s, raised from 7200s by
+#2999) and `CLAIM_ISSUE_TTL` bound what a caller may stamp. The **branch keying is its own ceiling**:
+`CLAIM_BRANCH_TTL` (14400s) is BOTH the default and the ceiling for a batch branch, deliberately above
+`CLAIM_TTL_MAX` — a batch legitimately outlives the PR/merge ceiling, and clamping it to 9600 would
+expire a live batch mid-flight (the loss #3328 exists to prevent; pinned by `branch-claim.test.sh`
+case 10). *(Corrected in a later round: this paragraph said 14400s for `CLAIM_ISSUE_TTL` and 7200s
+for `CLAIM_TTL_MAX`, and the branch keying was absent rather than stale — `CLAIM_TTL` (1800s) was
+never wrong.)*
+Above the ceiling a ttl is **clamped to the ceiling** (never to the shorter
 default — that would expire merge-one's deliberate 3000s mid-merge) and the clamp **says so on
-stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + 1200` and `FIX_LEASE = FIX_TIMEOUT + 1200`: raising
-either timeout past `CLAIM_TTL_MAX - 1200` requires raising `CLAIM_TTL_MAX` in the same change, or
-the claim expires before the review it was taken for. The verification is `claim-orphan.test.sh`,
+stderr**, because `CLAIM_LEASE = REVIEW_TIMEOUT + _gw + 300` (merge-one; `_gw` is the gate wait, 900 s at
+the defaults, so that lease is 3000 s and the clamp threshold — `CLAIM_TTL_MAX - (_gw + 300)` — is
+8400 s) and `FIX_LEASE = FIX_TIMEOUT + 1200` (fix-one): raising either timeout past its own threshold
+requires raising `CLAIM_TTL_MAX` in the same change, or the claim is clamped below the term the worker
+asked for — and past `CLAIM_TTL_MAX` itself it expires before the review it was taken for. *(Corrected: this sentence
+said `REVIEW_TIMEOUT + 1200` and a flat `CLAIM_TTL_MAX - 1200`, which was right only for the fixer and
+only at the default gate wait.)* The verification is `claim-orphan.test.sh`,
 which reads the stamped term back out of the **pushed claim commit**. Both tunables are
 validated with `is_limit` (digits **and** at most nine of them) **before** that arithmetic, and
 `claims.sh` clamps the ttl again at its own arithmetic site — because an overflowed lease is the
-worst kind of failure: it goes **negative**, `_lease_of`'s `[0-9]*` cannot parse the minus sign, an
-unparseable lease is read as **LIVE**, and `claim_prune` can never reap it, so that PR/head is frozen
-across every box with no automatic recovery. Every
+worst kind of failure: it goes **negative**, and `_lease_of`'s anchored, spelled-out ASCII-digit
+match cannot parse the minus sign either — an unparseable lease is never read as expired, so
+`claim_prune` could never reap it — before #3203
+that PR/head was frozen across every box with no automatic recovery. The class is now an ABSTENTION
+reaped once the claim's own commit passes `CLAIM_UNREADABLE_LEASE_MAX_AGE`. Every
 release/reclaim is `--force-with-lease`, so a box holding a **stale** commit (one that is no longer
 the ref's tip) cannot release the winner's claim. Three hardening points from the adversarial
 review of this PR: a **read-back failure on the create path still surfaces the commit we pushed**,
@@ -3865,6 +4079,25 @@ it deletes with no dry run, no per-claim evidence, no age threshold, no per-pass
 record — and its orphan rules are deliberately narrow (the local-pid rule is PR-only; the host rules
 only fire for a name this box no longer answers to), so a claim stamped by THIS box on an ISSUE, whose
 controller and chain are both gone, stays `held-by-live` until its lease runs out.
+⛔ **AND A CLAIM WHOSE LEASE CANNOT BE PARSED IS NO LONGER THE OPERATOR'S PROBLEM ALONE
+(agent-infra#3203).** `claim_prune` now reaps that class on a bounded schedule — once the claim's own
+COMMIT is older than `CLAIM_UNREADABLE_LEASE_MAX_AGE` (18000 s) — so the 25-hour, unparseable,
+nobody-alive ref that motivated this tool no longer needs a human. The class is still NAMED on every
+pass (`kept unreadable-lease …` / `pruned unreadable-lease …`), and THIS tool still refuses to release
+it on holder evidence alone: the schedule is the reaper's, the judgement is not this tool's.
+
+⛔ **AND NEITHER A SHAPE NOR A COMPARISON MAY DECIDE THE CLASS ON ITS OWN.** Three defects in the
+same line came out of review rounds 7–8, each measured on the shipped file, and each failing toward
+*FREE* rather than toward the abstention: (a) the age came from **the whole commit object**, so a
+`committer … 1 +0000` line in the peer-writable MESSAGE dated the claim 1970 and had it reaped while
+`git log --format=%ct` called it seconds old — the stamp is now read from the **header block only**;
+(b) **`[ "$now" -le "$lease" ]` returns 2** when an operand is not an integer, and `if` reads that as
+FALSE ⇒ `expired` ⇒ reclaimable — so the reader reads `$?` and answers `unknown` for anything it
+cannot compare; (c) POSIX bracket RANGES are COLLATION-based, so under a UTF-8 locale `[!0-9]` does
+**not** exclude `U+0663`, and `lease_until=1٣` walked past the parser into the failing comparison —
+every digit class in `claims.sh` is now the enumerated ASCII class `[!0123456789]`. The lease is also
+bounded by **magnitude** (13+ digits: `$(( ))` and `[` both overflow, and a wrapped clock mints an
+epoch-1970 term or reaps a seconds-old claim), not merely by shape.
 
 `claim-reaper.sh` supplies that half. It is **report-only by default** and releases only with
 `--release`:
@@ -3876,8 +4109,8 @@ claim-reaper.sh --records             # what this box has reclaimed, and why
 ```
 
 Every claim passes the same ladder, each rung FAIL-CLOSED: **identity** (the claim names a
-`<box>:<pid>`) → **lease** (it parses: an unparseable lease is LIVE and is never re-examined for
-orphanhood, per `_claim_acquire_at`) → **age** (the claim's own commit time is older than `--min-age`,
+`<box>:<pid>`) → **lease** (it parses: an unparseable lease is never read as expired — an
+ABSTENTION answered before any orphan consult, per `_claim_acquire_at`) → **age** (the claim's own commit time, read with `_claim_commit_time` — the SAME reader `claim_prune` reaps on, never `git log --format=%ct`, which accepted stamps the oracle rejects and so cleared the floor for a claim minutes old — is older than `--min-age`,
 default 10800s = `CLAIM_ISSUE_TTL`) → **host** (the holder is this box, one of its former names, or a
 host declared on `CLAIM_DEAD_HOSTS` **with an expired lease**) → **pid** (`ps` first proves it can see
 *this* process, then reports the holder absent) → **work** (ISSUE claims only: no live process
@@ -3897,8 +4130,46 @@ then the fenced delete, then the record finalized as `released` (or `refused` wh
 `state/claim-reaper.log` carries one TSV row per release; `state/reclaimed/<ref>` is the readable
 record, for a lane that comes back to a claim it still thinks it holds. With no writable record
 directory the pass **refuses and deletes nothing** — an unrecorded release can be neither audited nor
-protested. It is deliberately NOT
-scheduled by the loop: releasing is the operator's word, and the dry run is safe to run at any time.
+protested.
+
+**SCHEDULE (agent-infra#2048).** It IS now scheduled — report-only — on the controller's hourly clock
+(`orch-loop.sh`, beside `claim_prune`, stamp `state/.claim-reaped`), through
+`scripts/orchestrator-harness/claim-reaper-pass.sh`. The earlier line here said it was deliberately
+NOT scheduled, and #2048 supersedes that: the tool shipped *deployed, documented and invoked by
+nothing*, on 0 of 6 boxes, so the only half that can release an orphaned claim never ran and the
+fleet kept answering *"a peer owns it"* indefinitely. The reason that line gave is preserved, not
+overturned — **releasing is still the operator's word**: the clock runs the pass in its default
+dry-run mode and nothing in `orch-loop.sh` can release a claim. What the clock adds is the
+MEASUREMENT, hourly, on every box that runs a controller (which is every box that can dispatch).
+
+```bash
+claim-reaper-pass.sh        # what the clock runs: mode from the arming record, records, exits
+```
+
+Its exit vocabulary is the load-bearing part: `0` nothing releasable (or everything found was
+released), **`4` WORK LEFT BEHIND that policy, the bound or a refused delete stopped** — RELEASABLE
+claims while UNARMED, an armed pass whose `--max` ran out (`BOUND-REACHED`; the tool releases at most
+`--max` per pass and still exits 0, so without this arm a box that released 3 of 20 would erase the ⛔
+line while 17 still held dispatch), or an armed pass whose fenced deletes were REFUSED because a peer
+took the ref (`RELEASE-INCOMPLETE` — the tool prints `bound reached` ONLY for the bound arm, so the
+cause is read from its output rather than inferred, and the advisory for this one says explicitly
+*do not raise the bound*) — `3` CANNOT-VERIFY (no tool resolved, an unreadable summary, or an
+arming decision that provably did not reach the tool), otherwise the tool's exit — and every non-zero arm, including the `mktemp` failure, also writes
+`state/.claim-reap-blocked`**, which `cloud-cell-supervisor.sh` prints as a ⛔ line —
+so an unarmed box whose stale claims are blocking dispatch does not read like a healthy idle one. An
+unreadable registry takes the `3` arm rather than a failure exit (the tool exits 2 *before* printing
+its summary), which is why `3` writes the advisory too.
+
+**ARMING** is one dated record, the same shape as `worktree-hygiene` and `pi-reap-orphans`
+(`#1678`: the reaper may run unattended; arming it may not). Both keys are required — a half-written
+record is NOT armed:
+
+```bash
+printf 'armed-by=%s\narmed-date=%s\nreason=%s\n' "$(id -un)" "$(date -u +%FT%TZ)" '<why>' \
+  > "${O:-$HOME/orchestrator}/state/claim-reaper.armed"
+```
+
+`state/claim-reaper.last` is the pass record (`at= verdict= mode= rc= listed= releasable= released=`).
 ⛔ Its observation seams (`CR_PS`, `CR_PROC_TABLE`, `CR_LIVE_ROWS`) SUBSTITUTE the evidence that
 authorises a release, so they are refused unless the caller declares `CR_TEST_SEAMS=1` (a test run) —
 an ambient value must never be able to free a live lane's claim.
@@ -3986,7 +4257,8 @@ reap. The decisions that are not obvious:
   output text: **0 CLEAN** (no claim, the only claim expired, **or the only claim is ORPHANED** —
   #2094: its holder cannot be a live lane, so the pre-flight reports what the acquire will do and the
   acquire still has to win the CAS) queues the issue; **1 COLLISION**
-  (a live claim, or a lease that cannot be parsed — a lease nobody can read is treated as live) is
+  (a live claim, or a lease that cannot be parsed — a lease nobody can read is an ABSTENTION, never
+  free: the acquire refuses it and `claim_prune` reaps it past `CLAIM_UNREADABLE_LEASE_MAX_AGE`) is
   left unchecked, so the window is re-attempted when it closes; **2 INCOMPLETE** (the registry could
   not be READ — `git ls-remote` failed, or the local clock is unreadable) is never queued and counts
   toward the run's aggregate `INCOMPLETE=n` line, and a pass that produced **no usable verdict at
@@ -4147,11 +4419,13 @@ no-chain path** in `dispatch-merge.sh`: that release runs seconds after the reco
 the record *is* that dispatch's generation — there is no older holder to refuse, and the fence is the
 record's value. It earns its keep in `chain-merge.sh`, whose trap can fire hours later, after the same
 box has re-acquired and overwritten the record.
-- **The lease polarity has ONE implementation** (`_lease_unparseable` / `_lease_is_live`) shared by
-`claim_acquire`, `claim_issue_preflight` and `claim_prune` — three copies of the same comparison, and
-"a lease that cannot be read is live" is exactly the predicate they must not answer differently.
-(`orch-loop.sh`'s `claim_live` keeps a fourth deliberately: it reads the local SNAPSHOT rather than a
-ref and `selftest.sh` extracts it standalone, so it cannot share an in-process helper.)
+- **The lease polarity has ONE implementation** — since #3203 a four-way `_claim_lease_state`
+(`live|expired|unreadable|unknown`), with `_lease_is_live` delegating to it — shared by
+`claim_acquire`, `claim_issue_preflight` and `claim_prune`: one derivation, and
+"may this be stolen?" is exactly the question they must not answer differently.
+(`orch-loop.sh`'s `claim_live` is a third SURFACE, not a third polarity: `claim_lease_live` maps
+`claim_snapshot_verdict`'s rc onto that reader's own words — `LIVE` is its word for "do not steal" —
+and `selftest.sh` extracts both standalone.)
 
 ### 7.2d Does a claim EXCLUDE? — **MEASURED, per operation** (agent-infra#1908)
 
@@ -4278,29 +4552,21 @@ already holding):
 
 | part | where | what it does |
 |---|---|---|
-| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the seven `cap_refusal_gate` names — `load`, `disk`, `land`, `fork`, `capability`, `skew`, `key` (`land` = the creation back-pressure refusal, §7.2g; the list lives in `chain-merge.sh` and the terminal-line contract in `lane.sh`, and neither may be restated from memory) | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
-| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (71 capability / 73 fork / 74 land-backlog / 75 load / 77 disk / 82 key / 83 harness-skew) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
+| the **record** | `lane.sh` writes `state/capacity-refused-<N>`, one line: `<refused_epoch>\t<yield_until>\t<gate>`, where `gate` is one of the eight `cap_refusal_gate` names — `load`, `mem`, `disk`, `land`, `fork`, `capability`, `skew`, `key` (`mem` = the SPAWN gate's memory refusal, #2387; `land` = the creation back-pressure refusal, §7.2g; the list lives in `chain-merge.sh` and the terminal-line contract in `lane.sh`, and neither may be restated from memory) | the refusal becomes durable and readable. Cleared when a lane actually runs, so a stale record cannot outlive its dispatch |
+| the **release** | `chain-merge.sh` reads field 1 and exits **at once** with the gate's own code (71 capability / 73 fork / 74 land-backlog / 75 load / 77 disk / 81 memory / 82 key / 83 harness-skew) | the EXIT trap does the FENCED release it already did — so peers see CLEAN within one poll interval instead of after 90 minutes. Field 1 is what makes it per-dispatch: a record from an earlier run cannot end a LIVE lane's wait, which would let a peer open a second lane for the same issue — and the bound needs ORDERING SLACK, because `dispatch-merge.sh` spawns the LANE first: the record is written ~4 ms after the lane's fork while the chain reads its start ~8-15 ms after its own, so the record is normally a fraction of a second to a second OLDER than `CHAIN_START`. A bare `epoch >= CHAIN_START` therefore discards real refusals whenever a second boundary falls between the two, which is precisely when the box is loaded enough to refuse. `CAPACITY_REFUSAL_GRACE_SECS` (default 60) supplies the slack, capped by the record's OWN yield window (`until - epoch`), so it still cannot admit a record older than the stand-down it declares. ⛔ **the cap is STRICTLY shorter than that window, and that is load-bearing:** this box may not re-dispatch before `until`, so every legitimately-arriving chain has `epoch <= CHAIN_START - win`; a slack equal to `win` would then admit the single second `epoch == CHAIN_START - win` — an EARLIER dispatch's record ending a LIVE lane's wait — so the effective slack is `min(CAPACITY_REFUSAL_GRACE_SECS, win - 1)`. **Required relation: `CAPACITY_REFUSAL_GRACE_SECS < CAPACITY_YIELD_SECS`** (the shipped defaults satisfy it, 60 < 900, and the clamp holds the bound for every other pairing); re-read this line before tuning either knob |
 | the **stand-down** | `orch-loop.sh`'s `capacity_yield_live()` reads field 2 and the dispatch loop `continue`s before the claim | releasing the claim makes the issue *eligible* on a peer; it does not make the peer *win* the CAS. While the yield is live this box leaves the issue **unconsumed** (no `dispatched.txt` row, no claim ref), so it stays a candidate here *and* free for every peer; when the yield expires the ordinary path resumes |
 
 **Decisions worth not re-litigating.**
 
 - **The signal is the gate's own refusal, not load average.** Whatever actually bound is named
-  (`load` or `disk` — opposite remedies — and, since #2409, `land`: the creation gate's refusal, whose
-  remedy is on neither this box nor any peer's; and, since #2293, `fork`: a box out of PROCESSES, whose
-  remedy is a restart or a drain from OUTSIDE, never a wait), and the transfer is driven by the refusal
-  event. Load is a symptom of contention rather than a measure of capacity
-  (`docs/ops/load-policy.md`), which is also why a lowering of `MAX_LOAD` — the ×8 change proposed in
-  #1907, closed unmerged 2026-10-22 — could not have moved a single item. ⚠️ NOTE what the record can
-  carry: the WORKER gate binds on **seven** values — `load`, `disk`, `land`, `fork`, `capability`,
-  `skew` and `key` (`spawn-gate.sh`'s gates plus `key-gate.sh`'s), and `chain-merge.sh`'s
-  `cap_refusal_gate` is the one place that list is written (this sentence said "four" beside a
-  six-value list before review cycle 1 caught it); the lanes/swap/memory terms belong to the CONTROLLER's own gate, which
+  six-value list before review cycle 1 caught it); the lanes/swap terms — and the CONTROLLER's own memory
+  arm, which compares `mem_avail` against `MIN_MEM_FREE_MB`, a different floor for a different population (§7) — belong to the CONTROLLER's own gate, which
   refuses *before* any claim is taken and therefore writes no record at all (§1 above). A reader that
   predates #2409 and knows only `load`/`disk` must treat `land` as `load` (it is non-numeric for its
   purposes, and `chain-merge.sh` maps an unrecognised value the same way) rather than as "no refusal";
   a reader that predates #2293 must treat `fork` the same way, and it will then publish the LOAD remedy
   for a box that cannot spawn the retry — which is exactly why the two codes were given distinct values
-  (73 fork / 74 land / 75 load / 77 disk / 82 key / 83 skew) rather than shared.
+  (71 capability / 73 fork / 74 land / 75 load / 77 disk / 81 memory / 82 key / 83 skew) rather than shared.
 - **The yield is gate-independent, deliberately.** `load` clears when the box quietens and `disk`
   never does, but both produce the same `CAPACITY_YIELD_SECS` stand-down: the field names the remedy
   for whoever reads the record, and it must not shorten the transfer window (a disk refusal is not
@@ -4316,7 +4582,7 @@ already holding):
   corrupt byte. Past that, each consumes the fields it needs and no others:
   - `chain-merge.sh` uses **field 1** (numeric, and inside this dispatch's window: `epoch` at or after
     this chain's start minus the ordering slack, and not older than the record's own yield window).
-    It reports **field 3** as the exit code (75 load / 77 disk / 74 land / 82 key) and maps an unrecognised value
+    It reports **field 3** as the exit code (71 capability / 73 fork / 74 land / 75 load / 77 disk / 81 memory / 82 key / 83 skew) and maps an unrecognised value
     to `load`, because the refusal itself is already proven by field 1 and refusing to end the wait over
     one corrupt byte is the behaviour this section forbids. It never reads field 2: an incoherent
     yield window must not make a proven refusal unreadable.
@@ -4876,6 +5142,97 @@ belongs to `fix-one.sh`'s own three pre-agent deferrals (the cross-box refusal, 
 PR-owner takeover that could not complete), which is where it is written.
 
 
+### 7.2i The disk gate existed and ran one step too late (agent-infra#3395)
+
+Measured, cell-3, 98 % used / 3.5 GB free:
+
+```
+dispatch -> fatal: cannot create directory at 'tools/ts': No space left on device
+```
+
+The harness's disk gate was already correct and already fail-closed on a readable reading — but it
+lived inside `run_agent`, i.e. it ran AFTER `wt_provision` had materialised the lane's checkout. On a
+full volume it was never reached, so a full box presented as a **dead lane** rather than a named
+refusal. The dispatcher that produced that line (an ad-hoc pusher, `/tmp/robust_push.py`) printed
+`df=` in a log line and asserted nothing, because there was nothing for it to call: a `df` in a log
+is a REPORT, and a report is not a gate.
+
+Three surfaces now exist, and they are ONE predicate — `spawn-gate.sh`'s `disk_free_mb` /
+`disk_readable` / `disk_worktree_terms` / `disk_worktree_need`, the SAME functions the live arm's
+`disk_lane_costs` / `disk_lane_need` are built on. ⛔ BOTH BOUNDS ARE COMPUTED BY `disk_lane_need`
+(`max(tree, self) + reserve`), so the two seams cannot disagree about how much room one lane needs
+(review round 5, P2 — they did: the PRE-START seam ignored a stated `DISK_LANE_TREE_MB` and admitted
+at 2,064 MB a lane `run_agent` then refused at 22,000 MB, i.e. the worktree was materialised and the
+refusal arrived one step late — #3395's own defect, under a configured bound). What differs is the
+TERM each side feeds in: the live arm CLASSIFIES the checkout (`python_target`) and charges the
+marginal `tree` when the shared cache holds; the PRE-START seam does not classify (no `--repo`) and
+charges the stated `self` worst case, because at that point the brief's install step is unknown and
+`tree` is true only while the warm shared uv cache holds — the cache is what gets pruned under
+pressure. A `tree` the OPERATOR states for the cell is honoured on both sides.
+
+| surface | when it is asked | verdict |
+|---|---|---|
+| `run_agent` (live dispatch) | immediately before the agent starts | `REFUSED … DISK-NOHEADROOM` (unchanged, fail-OPEN on an unreadable probe) |
+| `wt_provision` → `wt_disk_admit` (PRE-START) | before `git worktree add`, i.e. before anything is created | `REFUSED-DISK(free=…, need=…, box=…; free_mb=, need_mb=)`, return **4** |
+| `spawn-gate.sh --disk-admit <target>` (the VERB) | from a dispatcher that is not this tree's shell code | same lines, exit 0/77/64 |
+
+rc **4** is mapped by each caller to what ITS surface can express: `fix-one.sh` refunds the attempt
+and exits **77** (`AGENT_DISK_REFUSED`); `adopt-fix.sh` exits **77**; `dispatch-merge.sh` releases the
+claims of the unspawned remainder (never the lanes it already started) and **stops the batch**, because
+a full volume is a fact about the box rather than about one issue.
+
+The PRE-START arm fails **CLOSED** on an unreadable `df` (`REFUSED-UNKNOWN free=?`): refusing before
+anything is created costs a re-dispatch, while the live arm's documented fail-open protects a running
+fleet. Two postures, one predicate, each with the reason this tree already gives for it.
+
+The per-lane requirement at that seam is the **worst case** (6,144 MB default, or a larger
+`DISK_LANE_TREE_MB` if an operator states one), not the marginal tree (350 MB), plus the cell reserve
+(4x the dispatch floor = 2,000 MB) — so 8,144 MB at the shipped defaults, i.e. ~8.0 GB. The
+derivation is measured, not invented: two lanes consumed **11 GB in six minutes** (~5.5 GB each) on a
+cell whose `.worktrees` was 36.4 GB of 47 GB, and the check therefore takes the cell that will BUILD,
+not the box that decided. A box whose lanes are measured cheaper lowers `DISK_LANE_SELF_MB` /
+`DISK_LANE_RESERVE_MB` deliberately (the seams the live arm already documents).
+
+⛔ **THE TWO SEAMS SHARE THE NUMBERS BUT NOT THE CLASSIFIER, AND THAT IS SAID OUT LOUD.** `self` and
+`reserve` come from ONE place (`DISK_LANE_SELF_PY_DEFAULT`, `disk_lane_reserve_default()`), so raising
+the live arm's worst case cannot leave this seam admitting on the old figure; `disk-admission.test.sh`
+pins the seam's requirement against `disk_lane_costs`/`disk_lane_need` on a python fixture for exactly
+that reason. What the seam does NOT do is consult `python_target`: at this step the lane's install
+step is the BRIEF's, not the checkout's (a harness checkout whose lane runs a python suite pays the
+same 5.6 GB venv), and the marginal `tree` figure is only true while a warm shared cache holds — the
+cache that pressure prunes first. **The cost of that choice, stated:** a box at ~5 GB free refuses a
+harness lane the live gate would have admitted, until an operator states a smaller worst case.
+
+⚠️ **SCOPE:** these are the three DISPATCH paths' route to a lane checkout — not the only route to
+one. **Many** scripts create checkouts directly and are NOT gated here, which is a named residual of
+this change: `stall-fix.sh` (`git worktree add` for a throwaway mend checkout), `ai-drainer.sh` (its
+own per-lane working checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no
+admission at all), `refresh-candidates.sh`,
+`cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance checkouts), the merge rail's own
+base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (the live scout path) — among others.
+Their ENOSPC behaviour is exactly what it was; each is a place where a lane can still die on a full
+volume.
+
+⛔ **NO COUNT IS GIVEN HERE, DELIBERATELY.** An earlier revision of this paragraph said "five" and
+named exactly five. That number was **false**, and so was every numeral that replaced it: the census
+below returns many more files than five. A hand-maintained count rots and a reader sizing the
+exposure from a number nobody re-measures is worse off than one who enumerates. Enumerate instead:
+`git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired` is a
+**superset** to audit (it deliberately admits comments — a comment-only mention still lists the
+file — and the filters below then drop tests). The rows to drop from it are the three gated callers
+(`fix-one.sh`, `adopt-fix.sh`, `dispatch-merge.sh`) and the seam's own `wt-lifecycle.sh`. This file is
+NOT one of its rows: the population is `.sh`-scoped, so `README.md` is outside the printed census
+entirely. Moving the rest onto `wt_provision` (or the `--disk-admit` verb) is the follow-up this
+change does not do.
+
+Pinned by `disk-admission.test.sh` (stubbed `df`, so it measures the gate and never the host): below
+the requirement → the named refusal, rc 4, and **no worktree and no branch**; above it → a real
+worktree; `free == need` → admitted; `free - 1` → refused; an unreadable probe → `REFUSED-UNKNOWN`;
+and the verb prints the token #3395 specifies, prefixed exactly as the suite asserts it:
+`REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3; free_mb=3584, need_mb=8144)` — the raw mebibytes
+ride along on purpose (one decimal of GiB cannot separate `free == need` from `free == need - 1`).
+
+
 ### 7.3 The harness is unversioned (this directory is the remedy)
 
 Until now it existed only as `~/orchestrator/*.sh` on one machine: no history, no review,
@@ -4906,6 +5263,7 @@ These are kept as a record because each one is a *failure mode of the design*, n
 | the pre-fix sweep logged `#<PR> re-record` even when the concurrency cap suppressed the spawn (`{A\|\|B\|\|C;} \|\| D && echo` parses as `({A\|\|B\|\|C} \|\| D) && echo`) | a stalled drain looked busy | explicit `if/elif` branches |
 | **this file's own self-test** re-implemented the fixed logic instead of reading the shipped scripts | it passed on the broken copy, so it pinned nothing | every check now extracts and drives the real classifier, `sess()`, claim block and reaper, or runs `install.sh`; §9/§7 claims corrected |
 | `MAX_REVIEW` defaulted to 2 in `orch-loop.sh` but 4 in `install.sh`, the plist it renders, and §4 | running the loop directly (not via the plist) silently halved reviewer concurrency against the documented value; the `${MAX_REVIEW:-4}` fallback was dead code | default is 4 everywhere, and the self-test resolves all 10 limit defaults in both scripts and asserts they agree — including with the limits supplied via the environment, which is how the plist delivers them |
+| **the review ceiling raised 4 → 10 AND given a per-PR round counter (agent-infra#3441)** | the old `MAX_REVIEW` was concurrency only, and the per-PR review loop was bounded by `MAX_REVIEW_TRIES` — which is scoped to ONE head and re-armed by every push, so a PR could buy reviews for ever, one head at a time, with nothing anywhere counting the PR. Hitting the concurrency cap logged a `wait` row indistinguishable from "no review lane was needed" (the #3331 false-silence class), and 4 rounds exited before convergence on the hard cases (#3355 needed four recorded rounds) | `MAX_REVIEW` defaults to 10 in `orch-loop.sh`, `install.sh` and §4 (the self-test resolves all defaults in both scripts and asserts they agree, so the three cannot drift); `state/reviewround-<PR>` counts rounds CUMULATIVELY per PR (a push does not re-arm it; MERGED/CLOSED and a CLEAN verdict clear it; `MAX_REVIEW=0` is REPORT-ONLY); the round after the ceiling is REFUSED and parked with a `REVIEW-CEILING <PR> rounds=<n>/<max> head=<sha> stale_findings=<n> heads=<csv\|none>` line in the log, the ledger AND the park-reason file — ⚠️ that shape and those three destinations are the **CONTROLLER'S**: the direct ingress parks with the shorter `rounds=<n>/<max> head=<sha>` form and no ledger row (fresh review of #3441, P3; §4's `MAX_REVIEW` row states the same qualifier); and the round is passed into the reviewer brief (`REV_ROUND`) so a round-≥4 `reviewer` brief is REFUSED by `brief-gate.sh` unless it carries a `COMPARABLES:` label — ⛔ A **DELIVERY** CHECK, NOT A DEPTH CHECK: the round-≥4 canonical block emits that label itself (that is what lets `merge-one.sh`'s own generated brief pass), so the clause guarantees the comparable-practice MANDATE reaches the reviewer and refuses only a brief that dropped it. It cannot observe whether a comparable was actually named — that answer lives in the reviewer's verdict, not in the brief text (fresh review of #3441, P2; the earlier wording claimed a depth check the gate cannot perform) |
 | the live sweep dropped the `CLOSED` guard that `retired/sweep.sh` had, keeping only `MERGED` | a PR listed open that closed in between fell through to `gh pr ready` + `gh pr merge` every cycle and logged `#<PR> merge fail` forever | `case "$PR_ST" in MERGED\|CLOSED) continue ;;` |
 | `retired/auto-loop.sh` and `retired/sweep.sh` still carried the fail-open `ai-review-gate` classifier | shipping "the record" with the very bug being fixed invites reuse of it | both annotated in place as retired-with-known-fail-open |
 | §3 and §8 admitted cross-box duplication while §5.1b said "one owner per PR" | the invariant was stated more strongly than the code delivers | §5.1b scoped to per-box; §7.2b states the open cross-box gap |
@@ -4969,8 +5327,9 @@ were deleted.
   (`mem_spawn_ok()`, measured once per cycle by `measure_mem` before the first site) with the load
   arm, refusing at `mem_avail <= MIN_MEM_FREE_MB` and on an UNKNOWN probe. It is recorded here rather
   than deleted because the failure mode is the point: two gates over two populations, the resource
-  that actually kills the box consulted on one of them. ⚠️ The **spawn point** (`spawn-gate.sh`'s
-  `run_agent`) is still memory-blind — a different population, tracked as agent-infra#2387.
+  that actually kills the box consulted on one of them. ✅ The **spawn point** (`spawn-gate.sh`'s
+  `run_agent`, and the installed-`pi` shim beside it) was still memory-blind at the time — a
+  different population, tracked as agent-infra#2387 and fixed since (`MEM_MIN_AVAIL_MB`).
 - **The check classifier's `(app, name)` grouping and its newest-by-`id` selection cannot take effect
   at the call site** (agent-infra#1733). `gh pr checks --json name,state,workflow` carries no `id` and
   no `app`, so the newest attempt is decided by row order, and two non-Actions checks that share a
@@ -5003,8 +5362,9 @@ were deleted.
   `tmux new-session -d -s <name> "… pi -p …"`, no `lane.sh`, so `MAX_LOAD` was never read — on a box
   at load 258 on 10 cores against its own ceiling of 100. **✔ FIXED** — `spawn-gate.sh` is also an
   executable installed as `$HOME/.pi/agent/bin/pi` (first on PATH), so every `pi` resolves the gate; a
-  refusal names the reading/ceiling/item/caller, is counted in `~/.pi/agent/state/spawn-gate.tsv`,
-  and exits 76 (translated to the callers' 75). Named residuals: an invocation that bypasses PATH
+  refusal names the reading/ceiling/item/caller (or, for memory, the reading/floor/item/caller — #2387), is
+  counted in `~/.pi/agent/state/spawn-gate.tsv`, and exits 76 for load or 84 for memory (translated to the
+  callers' 75 / 81). Named residuals: an invocation that bypasses PATH
   (absolute path, `env -i`, a `PATH` reset) is not gated — that is the operator's documented rescue,
   and `MAX_LOAD` stays the operator's own tunable — and the **`task`/sub-agent dispatch does not pass
   through PATH at all** (`getPiInvocation` spawns `process.execPath` + the entry script so a truncated
@@ -5100,10 +5460,10 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `orch-loop.sh` | the controller: merge sweep → capacity-gated dispatch → backlog refresh |
 | `claims.sh` | cross-box claim registry: `refs/claims/<PR>-<head-sha12>` for PRs and `refs/claims/issue-<N>` for issues (agent-infra#1850), same CAS, lease-as-data and `--force-with-lease` fencing. Sourced by `orch-loop.sh`, `refresh-candidates.sh`, `chain-merge.sh`, `dispatch-merge.sh`, `merge-one.sh` and `fix-one.sh` |
 | `repo-authority.sh` | **the per-repo merge contract** (agent-infra#1764): reads THIS repo's required status checks and derives whether the review gate applies to it, so the controller no longer enforces tortoise's check names on every repo. Fail-closed — an unreadable or unrepresentable set refuses. Sourced by `orch-loop.sh` and `merge-one.sh` |
-| `spawn-gate.sh` | the load and disk gate (`disk_free_mb`/`disk_ok` `:193-231`, `can_spawn` `:269`) plus the ONE `run_agent()` (`:305`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
+| `spawn-gate.sh` | the load, memory, disk and land gate (`disk_free_mb`/`disk_ok` `:200-243`, `mem_avail_mb` `:334`, `mem_gate_verdict` `:366`, `can_spawn` `:440`) plus the ONE `run_agent()` (`:781`) used by `lane.sh` and `fix-one.sh`, so a `lane`/`fix` worker started by hand is gated exactly like one the controller spawned. ⚠️ Line numbers drift — search the function names, not the numbers. ⛔ Not every spawn goes through it: `merge-one.sh` defines its own `run_agent` (`:74`, called `:461`) for the reviewer, and `cloud-cell-bringup.sh:278` invokes `pi -p` with no gate at all (`agent-infra#1720`). Both residuals are asserted **by name** in `spawn-gate.test.sh:125-140`, whose census is an EQUALITY over `scripts/` — so a new ungated invoker fails the suite instead of arriving unannounced, within that census's three declared limits (`spawn-gate.test.sh:98-106`) |
 | `dispatch-merge.sh` | creates the worktree and starts the `lane-*` + `chain-*` pair for an issue |
 | `lane.sh` | the implementation worker (prompt template included). Since agent-infra#2148 it hard-requires `reviewer-preflight.sh`, prints the reviewer requirement once **before** any work, and splices the reviewer step into the generated brief — the requirement is no longer discovered by being refused at the rail. Since agent-infra#2258 it ALSO splices the canonical `RESEARCH FIRST` block (from `brief-gate.sh --section lane`) and refuses (78) if the brief it just generated fails the validator, so a brief that lost the contract cannot reach a lane |
-| `brief-gate.sh` | the RESEARCH contract, enforced at the dispatch seam (agent-infra#2258): a brief must carry a `RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:`/tool line) and a `CONTRADICTION TEST:` line, or the dispatch is REFUSED with **80** — nothing consumed — by a message that names every missing element and prints the block to paste. `--check <file\|-> [role]` · `--section [role]` (the ONE source of the block every generated brief splices and `templates/LANE-BRIEF.md` copies) · `--missing` · `--line`. Executed by `spawn-gate.sh::run_agent`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and `pr-doctor.py`; `0` pass / `80` refused / `78` cannot-verify (missing, empty, unknown role, or an unresolvable validator — never a pass). Presence and shape only: it cannot judge the research itself, and its own refusal says so |
+| `brief-gate.sh` | the RESEARCH contract, enforced at the dispatch seam (agent-infra#2258): a brief must carry a `RESEARCH FIRST` section (`INTERNAL:` + `EXTERNAL:` + a `RUNG:`/tool line) and a `CONTRADICTION TEST:` line, or the dispatch is REFUSED with **80** — nothing consumed — by a message that names every missing element and prints the block to paste. ⛔ FROM REVIEW ROUND 4 a `reviewer` brief must ALSO carry a `COMPARABLES:` line (agent-infra#3441) — what comparable / competitor implementations do for the mechanism under review; it is a SEPARATE LABEL and not a word-search inside `EXTERNAL:`, because the first draft matched a word the canonical block already contains, so the gate satisfied its own clause and could never fire. ⛔ WHAT THAT CLAUSE ACTUALLY GUARANTEES, STATED HONESTLY (fresh review of #3441, P2): it is a DELIVERY check. The round-≥4 canonical block EMITS the `COMPARABLES:` label itself — deliberately, because `merge-one.sh` validates the brief it just generated from that same block, so a label the block omitted would be refused at exit 80 on every round-≥4 review — which means the clause is satisfied by any brief built from the canonical block, including one that only echoes the mandate's own wording. It therefore enforces "the reviewer was TOLD to name a comparable", and refuses a hand-authored brief that dropped the label; it does NOT and cannot enforce that a comparable was named, which is a claim about the reviewer's verdict, not about the brief. `brief-gate.test.sh` pins both halves so the stronger reading cannot be re-adopted by a later lane: the canonical block passes, and the placeholder text passes. The round is an INPUT (`--check … reviewer <round>` — a positional third argument, there is no `--round` flag), which is what lets a brief generated at the wrong round be refused by the round it is used at. ⛔ SINCE #3484 it also enforces a required `PREVIOUS WORK` block (`CLAIM:`/`WIP:`/`BRANCH:`/`WORKTREE:`/`PRIOR:`) — the dispatch must say what work already exists, and a `WIP:` line that names NO `refs/wip/…` ref is a claim of absence that is REFUSED when origin holds a rescued snapshot for that issue — and it is the ONE reader/matcher of `refs/wip/*`, exposed as `--wip-refs <issue> [repo]` (`claim-reaper.sh` and `claims.sh::claim_prune` call it for their handover line, so the matcher has one home). `--check <file\|-> [role] [round] [repo]` · `--section [role] [round]` (the ONE source of the block every generated brief splices and `templates/LANE-BRIEF.md` copies) · `--missing` · `--line` · `--wip-refs`. Executed by `spawn-gate.sh::run_agent`, `lane.sh`, `fix-one.sh`, `merge-one.sh`, `nonblocking-dispatch.sh`, `orch-send.sh`, `safe-send.sh` and `pr-doctor.py`; `0` pass / `80` refused / `78` cannot-verify (missing, empty, unknown role, or an unresolvable validator — never a pass). Presence and shape only: it cannot judge the research itself, and its own refusal says so |
 | `reviewer-preflight.sh` | the reviewer requirement, disclosed up front (agent-infra#2148): `reviewer_preflight_line` / `reviewer_brief_section` for the three audiences (`self` = the lane lands through the rail; `harness` = a worker that pushes code while `merge-one.sh` mints the attestation; `reviewer` = merge-one.sh's own reviewer session, which posts the verdict comment and must not push, record or merge — no brief section, by design). The `self` line also names the override for a launcher that exports no `KIND` ("if your brief says you have no `task` tool, that overrides this") — the content-repo copy of `lane.sh` is in that state today (tortoise#8432). Sourced by `lane.sh`; also `--line`/`--brief`. Its wording is drift-pinned against the pi side (`extensions/shared/reviewer-preflight.ts`) and carried by `templates/LANE-BRIEF.md` |
 | `chain-merge.sh` | waits for the lane's PR **and its merge-phase verdict** (zero GitHub calls), then runs the merge chain if the lane did not merge it — and exits at once, releasing its issue claim, when the lane recorded a capacity refusal (agent-infra#1909) |
 | `lane-merge.sh` | **the lane's bounded merge loop** (#2029): wait for its own checks → fix rounds (cap 3, enforced here) → launch the harness chain detached → `--watch`. Emits `MERGED` / `FIX_REQUIRED` / `FIX_CONFLICT` / `BLOCKED_ATTESTATION` / `BLOCKED_ATTEMPTS` / `BLOCKED`, and posts the handoff comment |
@@ -5111,7 +5471,7 @@ algorithmic advantage. The claim worth evaluating is *utilisation*, not *efficie
 | `merge-one.sh` | fresh review → signed record → wait green → merge; marks `needsfix-*` for a verdict with findings, `needsreview-*` for no usable verdict (#2132) |
 | `fix-one.sh` | fixes a reviewer's findings, pushes, re-runs the merge chain |
 | `refresh-candidates.sh` | pre-flights issues (collision check) into the backlog |
-| `deploy-harness.sh` | **the supported manual redeploy path** (§4.1) — copies every file the SOURCE ships (recursively), verifies each byte against its source, and emits success/failure from its own copy ledger. Exit `0` = deployed and verified, `1` = copy/verify failed, `78` = refused before touching the target. Refuses a truncated inventory, a source symlink, a source/target overlap, and a source missing any of the five identity anchors. Writes `$O/.deploy-ledger.tsv`. Not part of the loop, and it never restarts the controller |
+| `deploy-harness.sh` | **the supported manual redeploy path** (§4.1) — copies every file the SOURCE ships (recursively), verifies each byte against its source, and emits success/failure from its own copy ledger. Exit `0` = deployed and verified, `1` = copy/verify failed, `78` = refused before touching the target. Refuses a truncated inventory, a source symlink, a source/target overlap, and a source missing any of the SIX identity anchors. Writes `$O/.deploy-ledger.tsv`. Not part of the loop, and it never restarts the controller |
 | `deploy-harness.test.sh` | the agent-infra#2041 contract — the measured false PASS (an absent source against a target pre-seeded with 30 scripts), partial-is-not-success, verification-not-the-copy decides, a truncated inventory, a stale-but-real harness, source symlinks, a self-deploy, the documented `--repo` + `$O/bg/notify.sh` call shape, destination symlinks, the ledger shape, the executable bit, and the stale identity record. Hermetic (scratch sources/runtimes, notifier and `cp` stubs), a CI shard |
 | `capacity.sh` | **MEASURED cross-box placement** (2026-10-21): `cap_probe_local` (load-per-CPU, lanes, free disk, free memory, with the epoch), `cap_publish`/`cap_read_fleet` (one `refs/boxes/<host>/<reading>` per box on the shared origin, read with ONE `ls-remote`), and `cap_place` — the least-loaded ELIGIBLE box, with an 8.00 load-per-cpu ceiling (refuse), a 4.00 prefer-elsewhere line (which is what stops a healthy fleet standing down for a peer that is 1% idler), disk/memory floors, and a REFUSAL that names the bound it hit. An unreadable, absent or stale box is never eligible; with no eligible box the dispatch is refused, never placed blind. `lanes` is REPORTED and is not a ceiling (owner ruling 2026-10-17: capacity, not lane count). ⛔ And `cap_fleet_line` (agent-infra#3446) — EXPECTED vs PUBLISHED in ONE line (`fleet: expected=5 published=3 INELIGIBLE=2 (pi-cell-1, pi-cell-3) src=cmux`): the fail-closed placement rule cannot tell a DEAD box from a FULL one because both publish nothing, so the provider's running-machine inventory is joined with the fresh records on the origin and the missing boxes are NAMED (an unreadable expectation is `expected=UNKNOWN`, never `0`; an unreadable channel is `published=UNREADABLE`, never `0`; a machine the extractor cannot CLASSIFY refuses the whole listing rather than shrinking `expected`, and a provider that lists zero running machines is `UNKNOWN`, never `expected=0`). The inventory call is a network call and is BOUNDED (`CAP_INVENTORY_TIMEOUT`, 10 s; timeout→gtimeout→watchdog, because `timeout` is not on macOS) so a wedged provider cannot hang the drainer tick that holds the lock. ⚠️ A cell carries no provider CLI (`pi-bootstrap/cell-install.sh`), so a cell must pin `CAP_EXPECTED_BOXES` (roster, keys = the `network.ipv4` values `cap_boxid` publishes under) or `CAP_EXPECTED` (count) — without one the line is `expected=UNKNOWN` on every cycle. Sourced by `orch-loop.sh` (every cycle except the fork-exhausted one, which is builtins-only; the probe-unreadable AND disk-held cycles DO emit) and `ai-drainer.sh` (every tick that owns the lock); also runnable: `bash capacity.sh probe`, `bash capacity.sh fleet-line <repo>`. See `docs/ops/fleet-capacity.md` §6a |
 | `cycle-record.sh` | **the self-dispatch proof** (2026-10-21): one record per cycle (`start`, `selected`, `dispatched`, `nothing=`, `placement=`, `bound=`) and the verdict over the newest one — `HEALTHY` younger than TWO of the box's own cycles, `DEGRADED` older, `ABSENT`/`UNREADABLE` rc 2. Read by `bin/harness status`; a record COUNT is never freshness. Written by `orch-loop.sh`, so the writer and the reader are one module |

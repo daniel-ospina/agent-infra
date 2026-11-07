@@ -509,7 +509,7 @@ jobs:
         # established (including "no claim visible").
         run: python3.12 tools/fleet/claim_lanes.test.py
       - name: Ref-claim reader mutation evidence (#1777, zero-dep)
-        # 30 mutations, each reintroducing the defect its test exists to catch:
+        # 48 mutations, each reintroducing the defect its test exists to catch:
         # a failed read read as an absence, an empty registry read as a failed
         # one, a missing/stale/shape-drifted snapshot accepted, presence dropped
         # when metadata fails, the LOCAL ref space read instead of the registry,

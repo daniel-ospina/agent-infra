@@ -41,6 +41,18 @@
 # revision it was taken at; `tail -1` on a run is the only count this file will ever let a reader check.
 set -uo pipefail
 
+# ⛔ THE PRE-START DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395, review P1).
+# `run_shipped_provision` below drives the REAL `wt_provision`, which now asks the disk predicate BEFORE
+# it creates anything (agent-infra#3395). Without this line the suite is decided by THIS HOST's free
+# space: a `df` reporting under the 8,144 MB requirement flips three arms to rc=4 and reds the suite on
+# an otherwise-green box — and it does so BEFORE `$base` is read, so the MUTANT arm's whole claim ("the
+# 4th argument is load-bearing") collapses into "both were refused for disk". Measured with a 1 GB `df`
+# stub: 23 passed / 3 failed here, 26 passed / 0 failed on the same stub at the base commit. The idiom
+# is the one `harness-refresh.test.sh`, `repo-target.test.sh` and `wt-lifecycle.test.sh` use; the gate's
+# own behaviour is pinned in `disk-admission.test.sh`, which STUBS `df` and therefore measures the gate
+# and not the host. ALL FOUR TERMS: leaving TREE unstated defaults it to 350 MB and re-arms the host.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SRC="$HERE/pr-doctor.py"
 PASS=0
@@ -569,8 +581,11 @@ else
         # ⛔ ON ITS OWN FRESH CLONE (review P1, 2026-11-06). Run on the clone above — as this arm used
         # to — the branch is ALREADY checked out at $_awt, so `wt_provision` takes its "branch $br is
         # already checked out at <other path>" arm and returns 2 BEFORE `$base` is ever read
-        # (wt-lifecycle.sh:344-365; `base` is consulted only by `wt_ahead_count` and the
-        # `worktree add -b` branch). Measured: rc=2 with the CORRECT base too, so the old arm's
+        # (the `elif` arm on `symbolic-ref --short HEAD = "$br"` in `wt-lifecycle.sh`'s `wt_provision`;
+        # `base` is consulted only by `wt_ahead_count` and the `worktree add -b` branch — cited by
+        # SYMBOL, not by line: this diff's own insertion into `wt-lifecycle.sh` moved the
+        # ranges these three citations used to name (`344-365`, `298-301`, `394-419`), so a line number
+        # here is a stale number waiting to happen). Measured: rc=2 with the CORRECT base too, so the old arm's
         # "non-zero ⇒ the 4th argument is load-bearing" verdict was decided by the PATH, not the argv —
         # and rc=127 (library absent) printed OK too. A fresh clone makes the base the only variable.
         # ⛔ BOTH SPELLINGS OF THE CORRECT BASE (review P2, 2026-11-06). Pinning the rewrite to one
@@ -599,18 +614,22 @@ else
                     *"worktree add failed"*) _mbase=1 ;;
                     *) _mbase=0 ;;
                 esac
-                # wt_provision's WHOLE contract (wt-lifecycle.sh:298-301): 0 = a usable worktree exists
+                # wt_provision's WHOLE contract (the rc rows of `wt_provision`'s doc comment in
+                # `wt-lifecycle.sh` — cited by SYMBOL, not by line): 0 = a usable worktree exists
                 # (what the shipped arm asserts); 1 = nothing created and nothing left behind — the clean
                 # mutant measurement; 3 = the SAME worktree-add failure whose ROLLBACK also failed, so
                 # residue remains (it returns 3 BEFORE setting the 'worktree add failed' account, so
                 # `_mbase` cannot see it — it is still a MEASURED base failure, and the most informative
-                # one); 2 = a path refusal; 98 = the runner could not load its library; 127 =
-                # wt_provision undefined. Only 1 is a clean verdict; 3 must be surfaced as residue rather
-                # than read either as a pass or as a foreign cause.
+                # one); 2 = a path refusal; 4 = the PRE-START DISK REFUSAL (agent-infra#3395, nothing was
+                # created — this suite neutralises the admission above so it cannot fire here, and the code
+                # is named so a future arm that misses a term is not misread as a worktree failure);
+                # 98 = the runner could not load its library; 127 = wt_provision undefined. Only 1 is a
+                # clean verdict; 3 must be surfaced as residue rather than read either as a pass or as a
+                # foreign cause.
                 if [ "$_mrc" = 3 ]; then
                     bad "MUTANT: the bare-branch base DID fail at 'worktree add' but its ROLLBACK failed too (rc=3) — residue was left in the fixture and must be surfaced, not read as a clean pass: $_mres"
                 elif [ "$_mrc" != 1 ]; then
-                    bad "MUTANT: the bare-branch base failed for a cause that is NOT the base — rc=$_mrc is not the 'worktree add' failure this arm measures (2 = path refusal, 98 = library could not be loaded, 127 = wt_provision undefined, or any code outside that contract). 'It failed' is satisfied by all of them: $_mres"
+                    bad "MUTANT: the bare-branch base failed for a cause that is NOT the base — rc=$_mrc is not the 'worktree add' failure this arm measures (2 = path refusal, 4 = REFUSED-DISK from the pre-start admission — a term of the four-term neutralisation at the top of this file is missing — 98 = library could not be loaded, 127 = wt_provision undefined, or any code outside that contract). 'It failed' is satisfied by all of them: $_mres"
                 elif [ "$_mbase" != 1 ]; then
                     bad "MUTANT: rc=1 but the account is not the base's 'worktree add': $_mres"
                 elif [ "$_mmat" = 1 ]; then
@@ -625,7 +644,9 @@ else
         # — `wt_provision` must ATTACH it (`worktree add "$path" "$br"`), not refuse on `-b`.
         # ⛔ THE BRANCH MUST HOLD WORK (review P2, 2026-11-06). The previous fixture pointed the local
         # branch AT refs/remotes/origin/$BR — 0 commits ahead — which `wt_provision` classifies as a
-        # GHOST and CAS-DELETES before taking the `-b` path (wt-lifecycle.sh:394-419). So this arm drove
+        # GHOST and CAS-DELETES before taking the `-b` path (the `A ghost:` arm inside `wt_provision`
+        # that ends in `WT_RESULT="refs/heads/$br is a 0-ahead ghost …"` — cited by SYMBOL, not by
+        # line). So this arm drove
         # the SAME code as (a) while reporting "ALREADY-LOCAL branch … no -b collision", and the attach
         # path `adopt-fix.sh:35-37` calls "the normal adopt case" was covered by nothing. The assertion
         # is on the DISTINGUISHING EFFECT — the materialised HEAD is the LOCAL commit, not `origin/$BR`

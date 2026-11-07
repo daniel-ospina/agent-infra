@@ -4001,6 +4001,13 @@ queue_order_from_pool() {
   # row-set compare catches a partial/torn read. Re-reading the queue here also shrinks the resurrect
   # window to two adjacent commands — it cannot be made atomic without a lock on the pruner, which this
   # file does not own.
+  # ⛔ THE RESIDUAL IS ONE COMMAND WIDE AND IS BENIGN, MEASURED NOT ASSERTED (review cycle 36, P3). A
+  # prune landing between the guard's LAST read and the `mv` can still put back a just-dispatched id
+  # (driven with a `sort` shim that drops the row after the 4th invocation: queue `111 222 333`, pool
+  # `333`, `111` in dispatched.txt -> queue after `333 111 222`). It cannot re-DISPATCH, because
+  # `orch-loop.sh:6614` skips any id in `dispatched.txt` (`grep -qx "$ISS" … && continue`) — so the
+  # worst case is one wasted row that the walker ignores, not duplicate work. Stated here with the
+  # pointer so the next reader can check the claim instead of trusting it.
   if [ ! -s "$o/.cand.ranked" ] && [ -s "$o/candidates.txt" ]; then
     queue_order_refuse "$o" "the reorder produced an EMPTY queue while $o/candidates.txt holds rows — the queue changed under this pass (a concurrent prune truncated and refilled it); NOTHING was installed, so the queue keeps its rows and its order is UNVERIFIED"
     return 1
@@ -4096,7 +4103,12 @@ queue_order_from_pool() {
     # "did not re-derive the ORDER", and the skip arm quoted the latter into `why=` — the field that
     # outlives the log. Two states, two words.
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN and so is whether it ranked ANY (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)"
+    # ⛔ AND THE TRUNCATION CLAUSE BELONGS HERE TOO (review cycle 36, P3). These arms return AFTER the
+    # install, so a clipped tier's inversion is LIVE ON DISK in exactly the state that cannot report its
+    # counts — and every one of these sentences used to stop before `$_sat_said`. The `severity` arm prints
+    # it; the three arms that most need it (the count is unknown, so the operator has nothing else to go on)
+    # did not. A disclosure that is dropped on the degraded path is the disclosure that matters least.
+    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but its COUNT could not be read back from $o/.queue-rank, so how many rows the pool ranked is UNKNOWN and so is whether it ranked ANY (this is NOT a drained queue, and the order is THIS pass's, not the previous pass's)$_sat_said"
     rm -f "$o/.queue-rank" 2>/dev/null
     return 0
   fi
@@ -4110,7 +4122,7 @@ queue_order_from_pool() {
   case "${_rows_now:-}" in ''|*[!0-9]*) _rows_now="" ;; esac
   if [ -z "$_rows_now" ] || [ $(( _r + _u )) -ne "$_rows_now" ]; then
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank ($_r ranked + $_u unranked) does not add up to the queue's ${_rows_now:-UNREADABLE} row(s), so it is NOT this queue's count and both the totals and whether the pool ranked ANY are UNKNOWN (this is NOT a drained queue)"
+    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank ($_r ranked + $_u unranked) does not add up to the queue's ${_rows_now:-UNREADABLE} row(s), so it is NOT this queue's count and both the totals and whether the pool ranked ANY are UNKNOWN (this is NOT a drained queue)$_sat_said"
     return 0
   fi
   if [ "$_r" -eq 0 ] && [ "$_u" -eq 0 ]; then
@@ -4138,7 +4150,7 @@ queue_order_from_pool() {
   _head_now="$(head -1 "$o/candidates.txt" 2>/dev/null || true)"
   if [ -n "$_h" ] && [ "$_h" != "$_head_now" ]; then
     QUEUE_ORDER_STATE="severity-uncounted"
-    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and both the totals and whether the pool ranked ANY are UNKNOWN"
+    echo "[refresh] queue order: the reorder was derived from the pool — $_inst_said, but the count read back from $o/.queue-rank names head #$_h while candidates.txt's head is #${_head_now:-none}, so that count is NOT this queue's and both the totals and whether the pool ranked ANY are UNKNOWN$_sat_said"
     return 0
   fi
   if [ -n "$_h" ]; then
@@ -4409,7 +4421,8 @@ ICR_INCOMPLETE=0; QUEUED=0
 POOL_SWEPT=1
 # ── CLAIM-DRIVEN OUTCOMES, COUNTED (agent-infra#2094) ──────────────────────────────────────────
 # Two different things a claim does to this pass, and they must never print the same line:
-#   ICR_HELD      a peer's LIVE claim withheld the candidate, so it is NOT queued — a pool full of
+#   ICR_HELD      a peer claim withheld the candidate, so it is NOT queued — either a LIVE holder or a
+#                 lease this reader cannot parse (an ABSTENTION, agent-infra#3203); a pool full of
 #                 these ends the pass at `backlog now 0`, the healthiest-looking line this script can
 #                 print and the one the incident produced over 192 readable candidates.
 #   ICR_RECLAIMED the only claim on the candidate was ORPHANED, so it WAS queued (the registry's
@@ -5541,7 +5554,7 @@ fi
 # what makes `backlog now 0` readable as "claims", not as "no work"; the reclaimed count is the
 # rename repair, which is a healthy event but must be visible.
 if [ "$ICR_HELD" -gt 0 ]; then
-  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a live cross-box claim (held-by-live) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
+  echo "[refresh] $ICR_HELD of $judged candidate(s) WITHHELD by a cross-box claim (held-by-live, or a lease that cannot be parsed — an ABSTENTION, never a free one; agent-infra#3203) — a short backlog here is claims, not an empty pool (agent-infra#2094)"
 fi
 if [ "$ICR_RECLAIMED" -gt 0 ]; then
   echo "[refresh] $ICR_RECLAIMED of $judged candidate(s) queued although a claim EXISTS, because it is ORPHANED (held-by-orphan) — the holder host cannot be a live lane; the acquire still races the CAS (agent-infra#2094)"

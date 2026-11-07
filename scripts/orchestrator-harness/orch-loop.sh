@@ -241,7 +241,20 @@ is_limit "${MAX_LOAD:-}" || MAX_LOAD=$(( 10#$_NCPU * 10 )); is_limit "${MAX_LOAD
 # recomputed — with ONE exception, spelled out at the coercion block below: a present-but-INVALID
 # value (`4x`, `09`, ten digits) is repaired there to this same derived default.
 MAX_LANES="${MAX_LANES:-$(( 10#$_NCPU * 5 / 2 ))}"
-MAX_REVIEW="${MAX_REVIEW:-4}"   # keep in sync with install.sh's default and README §4
+# ⛔ `MAX_REVIEW` IS NOW TWO CEILINGS, AND BOTH ARE "THE REVIEW CEILING" (#3441). (1) CONCURRENCY
+# — `review_slots()` caps in-flight `review-<PR>` workers at it (plus its drain headroom). (2) ROUNDS
+# — one PR may spend this many review rounds across the life of its review LOOP
+#   (`state/reviewround-<PR>`, cleared when that loop CONVERGES: a CLEAN verdict, or the PR leaving
+#   the queue) — the
+# round after that is REFUSED with a terminal `REVIEW-CEILING` line naming the PR, the rounds spent
+# and the findings still on disk, and the head is PARKED. Both were 4, and the round ceiling did not
+# exist AT ALL: `MAX_REVIEW_TRIES` bounds ONE HEAD (a push re-arms it), so a PR could re-buy reviews
+# for ever, one head at a time, with nothing anywhere counting the PR — measured on #3355, four
+# recorded rounds across four heads, each within its own budget. Raised to 10 by owner ruling
+# (2026-11-04): #3355 needed four rounds and round 4 still found a vacuous assertion, so 4 exits
+# before convergence on exactly the hard cases. ⛔ THE CEILING IS A RUNAWAY GUARD, NEVER A QUALITY
+# GATE: exceeding it is an ESCALATION EVENT (`REVIEW-CEILING`), never a pass and never a silent stop.
+MAX_REVIEW="${MAX_REVIEW:-10}"   # keep in sync with install.sh's default and README §4
 # Above this many UNOWNED open PRs (open PRs nothing is currently working — pr_owned() below),
 # merging takes priority and new lanes stop being dispatched. The pre-fix gate counted the TOTAL
 # open count, so a PR mid-review, mid-fix, mid-merge — or held by a claim on another box — read as
@@ -496,7 +509,7 @@ is_limit "${MIN_MEM_FREE_MB:-512}" || MIN_MEM_FREE_MB=512
 # repair that, since re-deriving from the same probe returns the same value. 10 = a 4-core box's
 # 2.5x. `MAX_LANES=0` still passes `is_limit` and dispatches nothing — unchanged, deliberate.
 is_limit "${MAX_LANES:-}"         || { MAX_LANES=$(( 10#$_NCPU * 5 / 2 )); is_limit "${MAX_LANES:-}" || MAX_LANES=10; }
-is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=4
+is_limit "${MAX_REVIEW:-}"        || MAX_REVIEW=10
 is_limit "${MERGE_PRIORITY_AT:-}" || MERGE_PRIORITY_AT=25
 # ⛔ A 0 WINDOW MAKES THE GATE INERT, SILENTLY: `is_limit 0` is TRUE (0 is a valid count), and with
 # a 0-minute window `[ "$age" -lt 0 ]` and `now - land <= 0` are both false, so mp_reason can never
@@ -598,7 +611,10 @@ swap_usage_mb() { # [<meminfo-file>]
 # empty, MEM_UNKNOWN was set every cycle, and the capacity gate named `mem_probe_failed` forever —
 # the controller completed cycles and dispatched nothing, which is the false green #1702 exists to
 # remove. The macOS page size is derived from vm_stat's own header (16 KiB is Apple silicon; Intel
-# Macs are supported and a hardcoded 16384 over-reports memory 4x -- the unsafe direction).
+# Macs are supported and a hardcoded 16384 over-reports memory 4x -- the unsafe direction). ⛔ SO AN
+# UNPARSEABLE HEADER IS UNMEASURABLE, NOT 16384 (review, P3): the old `if (ps=="") ps=16384` default
+# made this one arm fail OPEN on a 4 KiB-page host, contradicting the fail-closed ruling stated three
+# lines above and mirrored in spawn-gate.sh's copy of this body (the two are pinned byte-identical).
 # The argument is a TEST SEAM (the call site passes nothing).
 mem_avail_mb() { # [<meminfo-file>]
   local p="${1:-/proc/meminfo}" mb
@@ -608,13 +624,14 @@ mem_avail_mb() { # [<meminfo-file>]
       /^MemFree:/ {f=$2}
       /^Cached:/ {c=$2}
       END {if (a!="") v=a; else if (f!="" && c!="") v=f+c; else exit 1
+           if (v !~ /^[0-9]+$/) exit 1
            printf "%d", v/1024}' "$p" 2>/dev/null)" || return 1
   else
     mb="$(vm_stat 2>/dev/null | awk '
       /page size of/ {ps=$8}
       /Pages free/ {gsub(/[.]/,"",$3); f=$3}
       /Pages inactive/ {gsub(/[.]/,"",$3); i=$3}
-      END {if (ps=="") ps=16384; if (f=="" || i=="") exit 1
+      END {if (ps !~ /^[0-9]+$/) exit 1; if (f=="" || i=="") exit 1
            printf "%d", (f+i)*ps/1048576}')" || return 1
   fi
   is_num "$mb" || return 1
@@ -1073,12 +1090,15 @@ claim_lease_live() { # <pr> [<head-sha>] — the CROSS-BOX lease, and nothing lo
 # `_lease_is_live` and `claim_orphan_reason` — and the tests that pinned them (`selftest.sh` §14,
 # `test-gates.sh` (2)-(3)) drive the SHIPPED functions, so moving the mechanism did not move the
 # answers:
-#   • an OVERSIZED (>= 2**63) lease is UNPARSEABLE, and unparseable means LIVE (P2, 4th round) —
+#   • an OVERSIZED (>= 2**63) lease is UNPARSEABLE, and unparseable means NOT EXPIRED — this reader
+#     reports it IN FLIGHT (its own word for "do not steal"; since #3203 the claim's REPORTED label is
+#     the `unreadable` abstention, not live) (P2, 4th round) —
 #     the bare `[ "$now" -le "$until" ]` ERRORS there and an errored test is FALSE, so the old
 #     reader called a live foreign claim DEAD and the controller spawned for it every cycle while
 #     `claim_acquire` refused the head;
 #   • the `0` sentinel is NOT the ABSENT case — a claim EXISTS whose lease cannot be parsed, so it
-#     is LIVE, and a negative lease collapses to the same `0` (`_lease_of`'s `[0-9]*` cannot match
+#     is NOT EXPIRED (never free, never reported as live), and a negative lease collapses to the same `0` (`_lease_of`'s anchored
+#     ASCII-digit match cannot match
 #     a minus sign) as does any other non-digit;
 #   • an entry ABSENT from a snapshot that was READ is free — but only if the read is TRUSTWORTHY
 #     (that qualifier is new, and it is the whole of agent-infra#2466);
@@ -1286,6 +1306,123 @@ EOF
 }
 # [reviewdisp:end]
 
+# [reviewround:begin] (extracted and DRIVEN by pr-dispatch.test.sh — keep the markers)
+# ⛔ THE REVIEW-ROUND BUDGET — THE PER-PR COUNTER `MAX_REVIEW_TRIES` CANNOT BE (#3441).
+# `review_disp_decide` bounds review attempts at ONE HEAD and zeroes its count when the stored head is
+# not the live one, which is exactly right for "did the reviewer produce a verdict at THIS head" and
+# useless for "how many review rounds has this PR bought in total". Measured (#3355): four recorded
+# rounds across four heads, each within its own head budget, with nothing anywhere counting the PR.
+#
+# THE COUNT IS CUMULATIVE ACROSS HEADS ON PURPOSE, and that is the whole difference: a PUSH DOES NOT
+# RE-ARM IT (a push re-arms `reviewdisp-`, which is the per-head book). It is cleared when the PR
+# leaves the sweep (MERGED/CLOSED), and by `merge-one.sh` on a CLEAN verdict — a review that came back
+# clean ENDED the loop, so carrying the number past it would park the PR's next, unrelated round.
+#
+# ⛔ THE CEILING IS A RUNAWAY GUARD, NEVER A QUALITY GATE. Reaching it is an ESCALATION EVENT: the
+# next review is REFUSED, a terminal machine-readable line names the PR, the rounds spent and the
+# findings still on disk, and the head is PARKED. Never a pass, never a silent stop (the #3331
+# false-silence class). ⛔ AND IT SURVIVES LOG-QUIET (#943) BY GOING TO THREE PLACES: the log, the
+# dispatch ledger, and the park reason file — so a reader that lost the log still finds the diagnosis.
+review_round_read() { # <pr> -> n (coerced: it feeds -ge and $(( + 1 )))
+  local f="$O/state/reviewround-$1" v=""
+  # ⛔ AN ABSENT BOOK IS ROUND ZERO; AN UNREADABLE ONE IS NOT (fresh review of #3441, P2).
+  # `n=0` for BOTH gave a corrupt or oversized book a FULL budget — the ceiling RESET, which is the
+  # fail-open mirror of the write clamp in `merge-one.sh` (that one stops the writer CREATING a corrupt
+  # book; this one stops a book corrupted some other way from buying unlimited rounds). The old line
+  # was `is_limit "${n:-}" || n=0`, i.e. garbage → "nothing spent yet".
+  # Coerced to the writer's own 9-digit ceiling instead: `999999999` is past any `MAX_REVIEW`, so
+  # `review_round_exhausted` is TRUE and the PR PARKS with a REVIEW-CEILING line whose `rounds=` field
+  # (999999999/10) names the corruption to whoever reads it. Fail-closed, and `merge-one.sh`'s own
+  # book reader coerces identically — two readers must not disagree about the same file.
+  # ⛔ `-e`, NOT `-f` (round-15 review, P3): a NON-REGULAR book — a stray DIRECTORY at
+  # `state/reviewround-<pr>`, the corruption this tree's own remedies name ("rm -rf a stray directory
+  # named parked-$PR") — failed `-f` and so read as ABSENT, i.e. round 0 = a FULL budget. The `read`
+  # below fails on it, `v` stays empty, and the coercion turns that into 999999999. Only a genuinely
+  # MISSING path is round 0.
+  [ -e "$f" ] || { printf '0\n'; return 0; }
+  # ⛔ AND A NON-REGULAR BOOK MUST NOT BE OPENED AT ALL (fresh review of #3441, P2 — MEASURED HANG).
+  # `-e` is true for a FIFO, and `read -r v < fifo` BLOCKS on open until some writer appears — measured
+  # `rc=124` under a 5 s bound on BOTH readers. A directory short-circuits in the coercion below (the
+  # `read` fails, `v` stays empty, 999999999), but a FIFO has no such exit: this function is called from
+  # the CONTROLLER'S main loop, so the failure mode is the whole fleet loop stopping with no log line
+  # (the #943/#3331 false-silence class, at fleet scale) instead of the fail-closed park documented
+  # above. So the gate is `-f`: absent ⇒ round 0, exists-but-not-a-regular-file ⇒ 999999999, and the
+  # FIFO is never opened. `-e` stays FIRST because only a genuinely MISSING path may read as round 0.
+  [ -f "$f" ] || { printf '999999999\n'; return 0; }
+  read -r v < "$f" 2>/dev/null || true
+  case "${v:-}" in
+    ''|*[!0-9]*) v=999999999 ;;
+    *) if [ "${#v}" -le 9 ]; then v=$(( 10#${v} )); else v=999999999; fi ;;
+  esac
+  printf '%s\n' "$v"
+}
+# ⛔ THERE IS NO WRITER HERE, ON PURPOSE — and no dead one either (fresh review of #3441, P2).
+# `review_round_record()` used to live at this line: a SECOND writer for the same record, defined and
+# never called, with no write-failure handling (`printf … > file`, no `||`) — a silent fail-open
+# sitting inside the controller whose "never writes the round" property is this change's central
+# invariant. The invariant is enforced by a text scan in `pr-dispatch.test.sh` `(c4g2)`, so the next
+# lane that found a dead function and wired it back in would have reintroduced the round-3 defect.
+# Deleted rather than left dormant; `(c4g2)` now asserts the ABSENCE of the name, not just of calls.
+# `merge-one.sh` is the one writer; `review_round_read`/`review_round_clear` below are the readers.
+# ⛔ `rm -rf`, NOT `rm -f` (fresh review of #3441, P2). `review_round_read` treats a NON-REGULAR book as
+# CORRUPTION (`-e`, coerced to 999999999) — a stray DIRECTORY at this path is exactly the corruption
+# this tree's remedies name — so this helper is the automatic exit from that state, and `rm -f` on a
+# directory fails (`Is a directory`, rc=1) while `|| true` swallows it. Measured: with `rm -f` the
+# directory SURVIVES the MERGED/CLOSED clear, and the PR's next cycle still reads 999999999.
+review_round_clear() { rm -rf "$O/state/reviewround-$1" 2>/dev/null || true; }
+# review_round_remaining <pr> -> "stale_findings=<n> heads=<csv|none>" — what this PR still carries
+# UNRESOLVED, read from DISK rather than from a verdict's prose, and DELIBERATELY named `stale_`
+# (fresh review of #3441, P2): this arm is reached only when the LIVE head has NO findings marker
+# (`review_gate_state` returns NEEDS-FIX otherwise, and every NEEDS-FIX case is handled above it), so
+# everything countable here is a findings record left by a PREVIOUS head. Calling it `findings=` made
+# the line claim a currency it cannot observe; the honest question it answers is "what did earlier
+# heads leave unresolved", and where it says 0 the reviewer simply produced no usable verdict at the
+# live head. A `needsfix-<PR>-<head>` marker IS the findings record the fixer arm consumes, so
+# counting its heads is the honest measure of what is still open.
+review_round_remaining() { # <pr>
+  local n=0 heads="" f
+  for f in "$O"/state/needsfix-"$1"-*; do
+    [ -f "$f" ] || continue
+    n=$(( n + 1 ))
+    heads="${heads:+$heads,}${f##*-}"
+  done
+  printf 'stale_findings=%s heads=%s\n' "$n" "${heads:-none}"
+}
+# review_round_exhausted <pr> [<max>] -> 0 when the PR has spent its review-round budget.
+# `-ge`, not `-gt`: the ceiling is the number of rounds the PR may SPEND, so at n == max it is the
+# NEXT round that is refused. Refusing BEFORE the spawn is deliberate — a guard that buys the review
+# it exists to refuse is not a guard.
+# ⛔ 0 IS NOT A CEILING, IT IS REPORT-ONLY, AND `-ge` WOULD OTHERWISE MAKE IT THE OPPOSITE (fresh
+# review of #3441, P1). `is_limit 0` is TRUE and `install.sh` accepts `MAX_REVIEW=0` (only the two
+# WINDOW knobs die on 0), so `[ 0 -ge 0 ]` was true for a PR that had spent NOTHING: every PR in the
+# queue would park with a reason claiming its budget was exhausted and telling a human it "has a
+# DIAGNOSIS to report" — a false diagnosis manufactured by a knob whose sibling
+# (`MAX_REVIEW_TRIES=0`) means the OPPOSITE, REPORT-ONLY. `0` here means "this box buys no reviewer
+# rounds", so nothing is dispatched and nothing is parked (a report-only box still owns its queue).
+review_round_exhausted() { # <pr> [<max>]
+  local max="${2:-${MAX_REVIEW:-10}}"
+  is_limit "${max:-}" || max=10
+  [ "$max" -ge 1 ] || return 1
+  [ "$(review_round_read "$1")" -ge "$max" ]
+}
+# review_ceiling_report_only <max> -> 0 when MAX_REVIEW=0 means THIS BOX BUYS NO REVIEWER ROUNDS.
+# It is the same idiom as `MAX_REVIEW_TRIES=0`/`MAX_RED_FIX_TRIES=0` (decided BEFORE the counter is
+# read), and it exists so `0` never reads as "everything is exhausted" — see review_round_exhausted.
+review_ceiling_report_only() { # [<max>]
+  local max="${1:-${MAX_REVIEW:-10}}"
+  is_limit "${max:-}" || max=10
+  [ "$max" -lt 1 ]
+}
+# review_ceiling_line <pr> <head> <n> <max> — THE terminal line, one shape, one place.
+# ⛔ NO BACKTICKS AND NO APOSTROPHES: callers splice this into double-quoted strings, so a backticked
+# command would be SUBSTITUTED (the command an operator is told to run would be deleted from the log
+# and its output spliced in) — the trap REVIEW-AT-HEAD-STUCK records at its own line.
+review_ceiling_line() { # <pr> <head> <n> <max>
+  printf 'REVIEW-CEILING %s rounds=%s/%s head=%s %s' \
+    "$1" "$3" "$4" "${2:-?}" "$(review_round_remaining "$1")"
+}
+# [reviewround:end]
+
 # prune_orphan_markers <open-rows> <row-count> — delete `needsreview-*` / `needsfix-*` / `fixspend-*`
 # markers for PRs that are NO LONGER OPEN (agent-infra#2132). The per-PR MERGED|CLOSED sweep fires only
 # in the race where a PR terminates between the listing and its `gh pr view`; once a PR leaves the OPEN
@@ -1317,7 +1454,7 @@ prune_orphan_markers() {
   # the three families (say `needsfix-note.txt`) yielded itself as `mp` and was DELETED as an orphan,
   # the opposite of this function's fail-closed posture. `-En` makes a non-conforming name yield
   # nothing, which the `[ -n "$mp" ]` guard then spares.
-  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-*; do
+  for mf in "$O"/state/needsreview-* "$O"/state/needsfix-* "$O"/state/fixspend-* "$O"/state/reviewcount-* "$O"/state/reviewdisp-* "$O"/state/reviewathead-* "$O"/state/reviewround-*; do
     [ -e "$mf" ] || continue
     # ⛔ NEVER JUDGE A MARKER THE LISTING COULD NOT HAVE SEEN (review round 6, P3). `last-open-prs` is
     # written when the listing is read; this runs hundreds of lines later, so a marker written in
@@ -1328,10 +1465,18 @@ prune_orphan_markers() {
     # platform install.sh/launchd target) does not implement `\|`, so `mp` would always be empty and
     # this prune would be an INERT ENFORCER on macOS with no diagnostic, while the Linux suite stayed
     # green. `-E` is portable to both.
-    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|reviewdisp|reviewathead)-([0-9][0-9]*)$/\2/p' | head -1)"
+    mp="$(basename "$mf" | sed -En 's/^(needsreview|needsfix|fixspend)-([0-9][0-9]*)-.*/\2/p; s/^(reviewcount|reviewdisp|reviewathead|reviewround)-([0-9][0-9]*)$/\2/p' | head -1)"
     [ -n "$mp" ] || continue
     printf '%s\n' "$rows" | tr ' ' '\n' | grep -q "^$mp:" && continue
-    rm -f "$mf"
+    # ⛔ THE ROUND BOOK IS REMOVED THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2).
+    # `review_round_read` treats a NON-REGULAR book as CORRUPTION, and a stray DIRECTORY at this path is
+    # exactly the corruption this file's remedies name — so `rm -f` fails (`Is a directory`, rc=1, no
+    # redirection here, so it printed on every cycle) and the directory SURVIVED this sweep while the
+    # `-ot` gate stayed true for a dead PR: permanent stderr noise per corrupt book, and the documented
+    # prune remedy (`README.md` — "cleared … by prune_orphan_markers") silently false. `review_round_clear`
+    # already uses `rm -rf` for this exact case, so route the family through it rather than widening the
+    # verb for the sibling file-markers (which are never directories).
+    if [ "${mf##*/}" = "reviewround-$mp" ]; then review_round_clear "$mp"; else rm -f "$mf"; fi
   done
   return 0
 }
@@ -2996,7 +3141,7 @@ review_slots() { # <unowned_prs>
   # trickle") is about. `is_num` first: a non-numeric count makes `[ … -gt … ]` ERROR (rc 2, FALSE) and
   # silently return the SMALLER budget — the "errored test is FALSE ⇒ permissive arm" pattern this file
   # guards everywhere else, here landing on the restrictive side.
-  if is_num "${1:-}" && [ "${1:-0}" -gt 0 ]; then echo $(( 10#${MAX_REVIEW:-4} + 2 )); else echo "${MAX_REVIEW:-4}"; fi
+  if is_num "${1:-}" && [ "${1:-0}" -gt 0 ]; then echo $(( 10#${MAX_REVIEW:-10} + 2 )); else echo "${MAX_REVIEW:-10}"; fi
 }
 # ⛔ DRAIN MODE MUST RAISE THE FIXER BUDGET TOO (measured 2026-10-16). Only review_slots had
 # headroom, so a backlog of DIRTY/BEHIND PRs — 17 of 20 open on the live cells — sent the extra
@@ -3294,7 +3439,10 @@ pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently wor
 
 # claim_selection_verdict <pr> <head-sha> -> the PUBLISHED verdict for SELECTION
 #   rc 0 = FREE  (claim-absent | claim-expired | claim-orphaned | claim-own)
-#   rc 1 = HELD  (claim-held — a foreign, live, non-orphaned window: SKIP this head)
+#   rc 1 = HELD  (claim-held — a foreign, live, non-orphaned window: SKIP this head; or
+#                 claim-lease-unreadable — an ABSTENTION: the lease cannot be read, so this head is
+#                 neither stealable nor free. SKIP it too, and say WHICH: it is not a window and it
+#                 has no deadline the reader can name. agent-infra#3203)
 #   rc 2 = UNREADABLE (claim-unreadable — the registry could not answer; NOT freedom)
 # Globals: CLAIM_SEL_VERDICT (the word), CLAIM_SEL_OWNER, CLAIM_SEL_UNTIL, CLAIM_SEL_WHY.
 #
@@ -4018,6 +4166,39 @@ while true; do
       touch "$O/state/.claims-pruned"
       ( claim_prune >> "$LOG" 2>&1 ) &
     fi
+    # ── release-when-orphaned (agent-infra#2048) ────────────────────────────────────────────────
+    # `claim_prune` above reaps by EXPIRY and by ORPHANED HOST only, so a claim whose holder is
+    # demonstrably gone but whose lease still has hours left — or whose lease cannot be parsed —
+    # keeps the fleet from originating anything on that issue/PR (#9077/#9097/#9202). The half that
+    # releases those is `claim-reaper.sh` (#2262) with per-claim EVIDENCE, a fenced delete and a
+    # record; it shipped DEPLOYED AND SCHEDULED BY NOTHING, on 0 of 6 boxes, so that half was inert.
+    #
+    # WHY HERE AND NOT A PLIST/TIMER. The claim registry is PER-REPO and this loop is the only place
+    # that already knows which checkout this box owns (`$REPO`) — a globally installed job does not,
+    # so it would have to pin one repo and silently miss the other. Same clock idiom as claim_prune:
+    # an mtime stamp, hourly, in the background, never blocking the sweep.
+    #
+    # ⛔ THE CLOCK DOES NOT DECIDE THE MODE. `claim-reaper-pass.sh` ships REPORT-ONLY and reads the
+    # dated arming record (#1678 / #2094); this loop is a clock, not the owner of the policy. An
+    # unarmed pass that FIND_RELEASABLE claims writes `state/.claim-reap-blocked` and exits 4, which
+    # `cloud-cell-supervisor.sh` prints — so "nothing was released" is a ⛔ line on the box's health
+    # output, never a silent green.
+    if [ -z "$(find "$O/state/.claim-reaped" -mmin -60 2>/dev/null)" ]; then
+      touch "$O/state/.claim-reaped"
+      _claim_pass=""
+      for _cand in "${CLAIM_REAPER_PASS:-}" "$O/claim-reaper-pass.sh" \
+                   "$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)/claim-reaper-pass.sh" \
+                   "${HOME:-}/.pi/agent/scripts/claim-reaper-pass.sh"; do
+        [ -n "$_cand" ] && [ -f "$_cand" ] && { _claim_pass="$_cand"; break; }
+      done
+      if [ -n "$_claim_pass" ]; then
+        # CLAIM_REPO explicitly, like the snapshot above: launchd starts this loop at cwd `/`, which
+        # macOS denies reading, so a registry resolved relative to cwd finds nothing (#1996).
+        ( CLAIM_REPO="$REPO" O="$O" bash "$_claim_pass" >> "$LOG" 2>&1 ) &
+      else
+        echo "[claims] ⛔ claim release-when-orphaned NOT RUN — no claim-reaper-pass.sh resolved (looked at \$CLAIM_REAPER_PASS, $O, the bundle beside this loop, and \$HOME/.pi/agent/scripts): stale claims whose holder is gone are never released on this box, so it can originate nothing while they hold (agent-infra#2048). Fix: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o $O" >> "$LOG"
+      fi
+    fi
   else
     # ⛔ NO REGISTRY IS NOT A FREE FLEET (agent-infra#2466). This arm used to be silent — there was
     # nothing to snapshot — and every reader below then saw NO SNAPSHOT FILE, which they answered as
@@ -4448,6 +4629,10 @@ while true; do
     # rail refusal/red-fix cleanup would silently never run).
     case "${PR_ST:-}" in MERGED|CLOSED)
       rm -f "$O/state/needsreview-$PR-"* "$O/state/fixspend-$PR-"* "$O/state/needsfix-$PR-"* "$O/state/reviewcount-$PR" "$O/state/reviewdisp-$PR" "$O/state/reviewathead-$PR" 2>/dev/null || true
+      # ⛔ THE ROUND BUDGET GOES THROUGH ITS OWN HELPER (#3441, fresh review P2): the counter's
+      # lifecycle is stated in one place, so a reader cannot find the definition unused and "tidy" one
+      # of the hand-rolled `rm -f` lines that also clear it (`merge-one.sh`'s CLEAN path).
+      review_round_clear "$PR"
       # A PR that leaves the queue carries no refusal and no budget: these are head-bound records, and
       # nothing else prunes them (review P3, cycle 4 — small, but one pair per abandoned PR, forever).
       [ "${REDFIX:-0}" = "1" ] && rail_refusal_clear "$O" "$PR" 2>/dev/null
@@ -4478,8 +4663,18 @@ while true; do
          # its window or its holder is gone), `claim-own` (this box's own claim — only a live process
          # proves work, which the arms below do).
          echo "#$PR claim-free (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-the registry answered and holds nothing}) — the sweep may act on this head" >>"$LOG" ;;
-      1) echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
-         disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?}"
+      1) # ⛔ TWO CLASSES RETURN rc 1 AND ONLY ONE OF THEM OWNS A WINDOW (review round 13,
+         # agent-infra#3203). `claim-lease-unreadable` is the ABSTENTION: the term cannot be parsed, so
+         # `CLAIM_SEL_UNTIL` is `0` — and the old line narrated that as "peerbox holds this head until 0
+         # — a peer's declared window", asserting the one fact this reader has just said it cannot
+         # know. Name the class, print the reason, and never invent a deadline.
+         if [ "$CLAIM_SEL_VERDICT" = "claim-lease-unreadable" ]; then
+           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head with a lease this box CANNOT READ — an ABSTENTION, not a window; claim_prune reaps it once the claim commit passes ${CLAIM_UNREADABLE_LEASE_MAX_AGE:-18000}s)" >>"$LOG"
+           disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} lease unreadable — abstaining (bounded reap, not a window)"
+         else
+           echo "#$PR SKIPPED (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?} — a peer's declared window, not this box's work)" >>"$LOG"
+           disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_OWNER:-?} holds this head until ${CLAIM_SEL_UNTIL:-?}"
+         fi
          continue ;;
       *) echo "#$PR NOT ACTED ON (${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-the registry could not answer}) — an unreadable claim registry is NOT freedom; nothing is spawned or armed for this head" >>"$LOG"
          disp "$PR" "${HEAD_N:--}" "$CLAIM_SEL_VERDICT" wait "${CLAIM_SEL_VERDICT}: ${CLAIM_SEL_WHY:-registry unreadable} (fail-closed)"
@@ -5253,6 +5448,41 @@ while true; do
                 echo "#$PR REVIEW-CAP ${_rvn}/${MAX_REVIEW_TRIES} at head=${HEAD_N:-?} — review re-records at this head are EXHAUSTED, but the PARK DID NOT LAND (state/parked-$PR is unwritable), so this head is NOT bounded and will re-enter this arm every cycle. REFUSAL: nothing dispatched. REPAIR: make $O/state writable (rm -rf a stray directory named parked-$PR)" >>"$LOG"
                 disp "$PR" "${HEAD_N:-}" "$V" wait "REVIEW-CAP PARK UNWRITABLE — a human must look at this head"
               fi
+            elif review_ceiling_report_only "${MAX_REVIEW:-10}"; then
+              # ⛔ REPORT-ONLY IS DECIDED BEFORE THE COUNTER IS READ (fresh review of #3441, P1), the
+              # same rule `review_disp_decide` already records for `MAX_REVIEW_TRIES=0`: a box
+              # configured to buy no reviewer rounds still owns its queue, so nothing is dispatched
+              # and NOTHING IS PARKED. Without this arm `[ 0 -ge 0 ]` parked every PR with a reason
+              # claiming an exhausted budget it had never spent.
+              # ⚠️ TWO DEFENCES, AND THE ARM IS THE LOAD-BEARING ONE (round 2 review, P2 — the first
+              # version of this note claimed "removing either alone leaves (c4e) green", which was
+              # backwards). MEASURED: deleting THIS ARM alone reddens (c4e) — the box goes on to buy a
+              # review (`spawns=1`, `review round 1/0 spent`); deleting the `[ "$max" -ge 1 ]` guard
+              # alone does NOT, because this arm short-circuits first. So: the guard is the bound
+              # (it keeps a 0 from binding the ceiling for any other caller), and this arm is the
+              # sentence that tells an operator WHY nothing was dispatched instead of leaving a
+              # capacity line. Neither is decorative; do not delete the arm as "redundant".
+              echo "#$PR $V — NO review dispatched: MAX_REVIEW=0 on this box (REPORT-ONLY, the same idiom as MAX_REVIEW_TRIES=0). Nothing is parked and nothing is spent; this PR keeps its next cycle" >>"$LOG"
+              disp "$PR" "${HEAD_N:-}" "$V" wait "report-only box (MAX_REVIEW=0) — no review round dispatched"
+            elif review_round_exhausted "$PR" "${MAX_REVIEW:-10}"; then
+              # ── THE REVIEW-ROUND CEILING (#3441) ────────────────────────────────────────────
+              # ⛔ BEFORE CAPACITY, for the reason AT-HEAD and CAP are: the ceiling is a fact about
+              # THIS PR's spend, capacity is a fact about the box. Reporting a spent review budget as
+              # "review-lane ceiling reached" sends the operator at the machine and hides the PR.
+              # ⛔ AND THE NEXT ROUND IS REFUSED, NOT BOUGHT: the budget is a guard, and a guard that
+              # pays for the review it exists to refuse is not a guard. The rounds already spent stand
+              # — this line reports them, it does not retract them.
+              _rrn="$(review_round_read "$PR")"
+              _rcl="$(review_ceiling_line "$PR" "${HEAD_N:-}" "$_rrn" "${MAX_REVIEW:-10}")"
+              # ⛔ THREE PLACES, so the diagnosis survives log-quiet (#943): the log, the ledger row
+              # below, and the park reason file. A single `echo` is what #3331 measured being lost.
+              if park_ctrl "$PR" "${HEAD_N:-}" "$_rcl — the review-round budget for this PR is EXHAUSTED, so the next review is REFUSED. This is an ESCALATION, not a pass: a PR that has spent its review budget has a DIAGNOSIS to report, not a verdict. stale_findings names the findings markers EARLIER heads left unresolved; where it reads 0 the reviewer produced no usable verdict at the live head (a live head WITH findings takes the fixer path and never reaches this line). A human decides the next step (narrow the change, take the decision the rounds were circling, or re-record existing evidence); a push does NOT re-arm this budget (it is per PR, not per head). ⛔ `rounds=999999999` is not a spent budget — it is an UNREADABLE book (a directory at the path, or corrupt content), which both readers coerce to the 9-digit ceiling on purpose: rm -rf '$O/state/parked-$PR' '$O/state/parkreason-$PR' '$O/state/reviewround-$PR' (rm -rf, not rm -f — a DIRECTORY at the counter survives rm -f)"; then
+                echo "#$_rcl — review-round budget EXHAUSTED, PARKED (the next review is refused; a runaway guard, never a pass)" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "parked: $_rcl — review budget exhausted, needs a human (bounded, never a silent stop)"
+              else
+                echo "#$_rcl — review-round budget EXHAUSTED, but the PARK DID NOT LAND (state/parked-$PR is unwritable), so this PR is NOT bounded and will re-enter this arm every cycle. REFUSAL: nothing dispatched; this cycle bought no review. REPAIR: make $O/state writable (rm -rf a stray directory named parked-$PR)" >>"$LOG"
+                disp "$PR" "${HEAD_N:-}" "$V" wait "$_rcl — PARK UNWRITABLE, a human must look at this PR"
+              fi
             elif [ "$(wt_count review- merge-)" -lt "$MR" ] && can_spawn; then
               # ⛔ THIS SPAWN IS A REVIEW ORDER, AND IT IS NAMED AS ONE (agent-infra#2971). The remedy
               # the NEEDS-REVIEW diagnosis names is a REVIEW, so the worker this arm starts is
@@ -5272,13 +5502,17 @@ while true; do
               # THAT PR's count here — and this value is written to `reviewdisp-<PR>` and printed as
               # the attempt number, so a stale carry would silently spend another PR's budget.
               _rvn="${_rvd##* }"
+              # ⛔ THE REVIEW-ROUND COUNTER IS READ HERE, BEFORE THE SPAWN, so the round this spawn
+              # SPENDS is the one written after it succeeds (#3441). Same rule as `_rvn` above: a
+              # variable left by the last PR would spend another PR's budget.
+              _rrn="$(review_round_read "$PR")"
               printf '%s\n' "$REPO" "$OR" "$PR" "$BR" > "$O/state/argv-$PR"
               # Same carried contract as the GREEN rail spawn above (review P2, round 1), and the
               # same shq rule as there: `%q` is dash-unsafe (round-8 adversarial review, B6).
               # ⛔ A SPAWN THAT DID NOT HAPPEN MUST SAY SO (#2126 T1). This line was `tmux … && echo`,
               # so a FAILED re-record spawn was completely unremarked — the PR looked idle with no
               # reason. Every other spawn site in this file has an explicit failure branch.
-              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
+              if wt_spawn "review-$PR" "$SPAWN_CWD" "REV_PAID=1 REV_ROUND=$(( ${_rrn:-0} + 1 )) REQ=$(shq "$REQ") REVIEW_GATE=$(shq "$REVIEW_GATE") bash '$O/merge-one.sh' --argv '$O/state/argv-$PR'"; then
                 # SPEND THE REVIEW BUDGET ONLY ON A SPAWN THAT HAPPENED — the same rule `fixcount`
                 # follows one arm above: bookkeeping before the spawn makes a killed/failed spawn cost
                 # a real attempt, and this counter is the only thing standing between a wedged reviewer
@@ -5300,6 +5534,15 @@ while true; do
                     disp "$PR" "${HEAD_N:-}" "$V" wait "review budget UNWRITABLE and PARK DID NOT LAND — a human must look at this head"
                   fi
                 else
+                  # ⛔ THE CONTROLLER DOES **NOT** WRITE THE ROUND (#3441, round-3 review P1). It
+                  # used to, right here, after `wt_spawn` returned — i.e. before `merge-one.sh` had even
+                  # started, so a worker that then took the rail-only path, lost a claim race or was
+                  # refused by the brief gate still cost a round, and the ceiling could later refuse a
+                  # GENUINE review with a false "budget exhausted". `merge-one.sh` is the SINGLE
+                  # WRITER and pays only when a reviewer actually ran (`AGENT_STARTED=1`). What this
+                  # arm still does is state WHICH round it ordered, in `REV_ROUND`, so the brief and
+                  # the record cannot disagree; the spend is verified by the next cycle's read.
+                  echo "#$PR review ORDER review-$PR dispatched for round $(( ${_rrn:-0} + 1 ))/${MAX_REVIEW:-10} (the round is spent by the reviewer, not by this dispatch)" >>"$LOG"
                   # The `re-record` legacy token stays in this line (suites and operators read it), but
                   # the ORDER is named: `review-<PR>`, at the head it was ordered for.
                   echo "#$PR re-record" >>"$LOG"

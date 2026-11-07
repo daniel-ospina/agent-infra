@@ -1378,11 +1378,24 @@ DENY_EXTENSIONS=(
                          # manifest's trailing slash because read_manifest_entries strips it.
 )
 
+# denied_extension_stem <base> — the NAME STEM every variant of a denied entry shares. The deny is
+# enforced BY PATTERN (#2147), because `pi` discovers extensions by RULE, not by exact name:
+# `dist/core/extensions/loader.js` loads any top-level `extensions/*.ts` / `*.js` and any
+# `extensions/<dir>` holding `index.ts` or `index.js`. So `tortoise-capture.bak.ts`,
+# `tortoise-capture.disabled.js` and `tortoise-capture.old/index.ts` are LOADED, one level down from
+# the exact path an exact-name test looks at.
+denied_extension_stem() {
+  local b="${1%/}"
+  b="${b%.ts}"; b="${b%.js}"
+  printf '%s\n' "$b"
+}
+
 # denied_extension_note <base> — WHY a denied entry must be absent, worded ONCE. Both halves
 # consume it: the install half's removal line and the verify half's failure line, so they can
 # never describe different reasons for the same entry (a removal note that says "surface absent"
 # about the capture extension would send an operator looking for a desktop app that is not the
-# problem).
+# problem). The match is by NAME PREFIX (`tortoise-capture*`), so a SUFFIXED copy — the shapes that
+# were surviving on the measured cells — gets the same diagnosis as the entry it is a copy of.
 # ⛔ The capture wording is the INCIDENT'S, not a description of this checkout's file, and it is
 # pinned verbatim by BOTH suites: "it blocks session_start and corrupts the provider probe". The
 # cell ran a copy that differs from the repo (see the deny-list comment above), and an operator
@@ -1390,10 +1403,170 @@ DENY_EXTENSIONS=(
 # assert it (pi-bootstrap/tests/test-cell-install.sh, scripts/cloud-cell-bringup.test.sh).
 denied_extension_note() {
   case "${1%/}" in
-    tortoise-capture) printf 'it blocks session_start and corrupts the provider probe' ;;
-    cmux-session.ts)  printf 'its surface is absent on a Linux cell' ;;
-    *)                printf 'the cell must not run it' ;;
+    tortoise-capture*) printf 'it blocks session_start and corrupts the provider probe' ;;
+    cmux-session*)     printf 'its surface is absent on a Linux cell' ;;
+    *)                 printf 'the cell must not run it' ;;
   esac
+}
+
+# ── the homes a CELL can run a `pi` under (#2147's half) ────────────────────────────────────────
+# MEASURED 2026-11-05, five cells: the deny was NAME-scoped (one exact path) and PER-HOME (only
+# $DEST), and denied copies survived BOTH ways — 1 / 0 / 7 / 3 / 2 per box. The per-home half is
+# #2916's two-home state: where CELL_HOME=$HOME was measured, the OPERATING home (/tmp/cell-home)
+# kept its copies while the installer scanned the account home. Those copies injected
+# `paused N (attempts; continues in the background)` (250+ bytes) onto the turn path — the very
+# dead-lane shape the deny exists to stop.
+#
+# ⛔ THE EXTRA HOMES ARE DECLARED, NEVER GUESSED. Scanning the ambient `$HOME` unconditionally would
+# make this installer DELETE a developer's own `~/.pi/agent/extensions/tortoise-capture` on a LAPTOP,
+# where capture is a working feature and the box is not a cell — a destructive false positive, and
+# exactly the class of over-reach this repo treats as its own kind of defect. `cloud-cell-bringup.sh`
+# is the path that CERTIFIES a cell and it knows both homes (CELL_HOME and the account home), so it
+# passes them here. Empty by default: a bare `bash pi-bootstrap/cell-install.sh` touches only the
+# CELL_HOME it was given, as it always has.
+CELL_ALT_HOMES="${CELL_ALT_HOMES:-}"
+
+# cell_agent_dirs — every `<home>/.pi/agent` this cell can launch `pi` under, one per line, deduped.
+# $DEST first (the home the installer writes and the session forces), then each declared alt home.
+cell_agent_dirs() {
+  {
+    printf '%s\n' "${DEST%/}"
+    local rest="${CELL_ALT_HOMES:-}" one
+    while [ -n "$rest" ]; do
+      one="${rest%%:*}"
+      case "$rest" in *:*) rest="${rest#*:}" ;; *) rest="" ;; esac
+      [ -n "$one" ] || continue
+      printf '%s\n' "${one%/}/.pi/agent"
+    done
+  } | awk 'NF && !s[$0]++'
+}
+
+# loadable_extension_entry <path> — 0 iff `pi` would LOAD this entry. The rule is pi's own
+# (`dist/core/extensions/loader.js`, `discoverExtensionsInDir`): a top-level `*.ts` / `*.js` file, or a
+# directory holding `index.ts` / `index.js`, or a directory with a `package.json` naming its own
+# entries. ⛔ THIS IS WHAT KEEPS THE DENY FROM OVER-BLOCKING: a `tortoise-capture-notes.txt` sitting
+# beside the extension is NOT a copy of it (pi never reads it), and refusing OR DELETING it would be
+# the false-positive direction — the sweep below can `rm -rf`, so the predicate has to be exact.
+has_pi_manifest() { # <package.json> — 0 iff it declares pi.extensions (pi's own entry list)
+  [ -f "${1:-}" ] || return 1
+  python3 - "$1" <<'PYEOF' 2>/dev/null
+import json, os, sys
+try:
+    doc = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+pi = doc.get("pi")
+ext = pi.get("extensions") if isinstance(pi, dict) else None
+if not isinstance(ext, list) or not ext:
+    sys.exit(1)
+# pi's `resolveExtensionEntries` also requires at least one DECLARED path that RESOLVES — a
+# package.json naming a file that is not there falls through to the index check and loads nothing,
+# so such a directory is not a copy of anything and must not be swept.
+base = os.path.dirname(os.path.abspath(sys.argv[1]))
+sys.exit(0 if any(isinstance(e, str) and e and os.path.exists(os.path.join(base, e)) for e in ext) else 1)
+PYEOF
+}
+
+loadable_extension_entry() {
+  local f="${1:-}"
+  if [ -L "$f" ] && [ ! -e "$f" ]; then
+    # A DANGLING symlink: `-e` follows the link and sees nothing, but pi would still try to resolve
+    # it, so it is judged by the name it PRETENDS to be.
+    case "$f" in *.ts|*.js) return 0 ;; esac
+    return 1
+  fi
+  if [ -d "$f" ]; then
+    [ -f "$f/index.ts" ] || [ -f "$f/index.js" ] || has_pi_manifest "$f/package.json"
+    return
+  fi
+  case "$f" in *.ts|*.js) return 0 ;; esac
+  return 1
+}
+
+# denied_shipped_names — the extension ship-list, normalised (trailing slash stripped), one name per
+# line. Cached for the run: the manifest does not change under us, and `read_manifest_entries` is
+# python-backed. Read in a SUBSHELL so its own `die` cannot end the caller.
+# ⛔ WHY THE SWEEP NEEDS IT: without an exemption, a manifest entry whose name merely shares a denied
+# STEM (e.g. `<stem>-helper.ts`) would be INSTALLED by the ship-list loop and then DELETED by the
+# sweep below — `--verify` would then fail `extension MISSING` on every run, and the cell could never
+# be provisioned. A name the repo actually SHIPS is not a copy of the denied entry.
+DENIED_SHIPPED_CACHE=""
+denied_shipped_names() {
+  if [ -z "$DENIED_SHIPPED_CACHE" ]; then
+    DENIED_SHIPPED_CACHE="$(read_manifest_entries 2>/dev/null | sed 's:/$::')"
+    [ -n "$DENIED_SHIPPED_CACHE" ] || DENIED_SHIPPED_CACHE="__unreadable__"
+  fi
+  printf '%s\n' "$DENIED_SHIPPED_CACHE"
+}
+
+# denied_extension_copies <agent-dir> — every copy of a DENIED extension in that home that `pi`
+# would actually LOAD, one absolute path per line.
+# The name match is a PREFIX of the entry's stem (`tortoise-capture*`), which is what covers every
+# variant a copy can take: `<stem>`, `<stem>.bak.ts`, `<stem>.disabled.js`, `<stem>.old/index.ts`,
+# `<stem>-old/`. It is combined with `loadable_extension_entry` so the match is the SHAPES pi loads,
+# not "any file whose name starts with the stem" — the difference is the arm that proves a
+# `<stem>-notes.txt` beside the extension is neither refused nor deleted.
+denied_copy_variant() {
+  local base="${1%/}" stem="${2%/}" rest seg
+  rest="${base#"$stem"}"
+  [ "$rest" = "$base" ] && return 1          # does not start with the stem at all
+  rest="${rest//.ts/}"; rest="${rest//.js/}"  # an extension suffix is not a marker
+  # SEGMENTS, NOT ONE REMAINDER. A copy's name can compound (`-old-v2`, `.bak.1`, ` copy 2`), and each
+  # of those parts is a marker on its own — a single-segment match missed them while pi loads every one
+  # (they end in `.ts`). Split on the separators real names use, lower-case, and require EVERY remaining
+  # part to be a copy marker or a version/number.
+  local segs
+  # `-` FIRST in the tr set. It is literal only first-or-last, and LAST is the space here:
+  # GNU tr reads `._ -` as the range `_`-` ` and dies with "range-endpoints … in reverse
+  # collating sequence order" (measured on a cell), while BSD tr accepts it — so the arm
+  # passed locally and the sweep silently matched nothing on Linux.
+  segs="$(printf '%s' "$rest" | tr 'A-Z' 'a-z' | tr -- '-._ ' '\n\n\n\n' | sed '/^$/d')"
+  [ -z "$segs" ] && return 0                 # the entry itself, or the entry re-spelled `.ts`/`.js`
+  while IFS= read -r seg; do
+    case "$seg" in
+      bak|backup|old|orig|copy|save|keep|dist|local|tmp|disabled|off) continue ;;
+      # a marker carrying a version/number (`bak2`, `disabled3`) — but not an arbitrary word
+      bak[0-9]*|backup[0-9]*|old[0-9]*|orig[0-9]*|copy[0-9]*|save[0-9]*|keep[0-9]*|dist[0-9]*|local[0-9]*|tmp[0-9]*|disabled[0-9]*|off[0-9]*) continue ;;
+      v[0-9]*|[0-9]*) continue ;;
+      *) return 1 ;;
+    esac
+  done <<EOF
+$segs
+EOF
+  return 0
+}
+
+denied_extension_copies() { # <agent-dir>
+  local dir="${1%/}/extensions" d stem f fbase shipped
+  [ -d "$dir" ] || return 0
+  # ⛔ READ ONCE. This function is always used on the left of a pipe, so its own assignments die with
+  # the subshell — a cache INSIDE denied_shipped_names therefore re-ran the python-backed manifest
+  # reader for every candidate (measured: the "cached for the run" comment was simply untrue).
+  shipped="$(denied_shipped_names)"
+  for d in "${DENY_EXTENSIONS[@]}"; do
+    stem="$(denied_extension_stem "$d")"
+    for f in "$dir/$stem"*; do
+      # ⛔ TWO CLAUSES, because the deny has two subjects.
+      # (1) THE DENIED ENTRY ITSELF, at its own name, however it currently resolves. `-e` follows a
+      # symlink, so `-L` is what catches a DANGLING link at exactly this path — and a dangling link
+      # must still be removed/refused even though pi would not load it TODAY: it is the deny path, it
+      # costs one `ln -sf` to become a loaded extension again, and the install half removing it is
+      # what keeps verify from looping (refuse -> install-that-cannot-repair -> refuse forever).
+      { [ -e "$f" ] || [ -L "$f" ]; } || continue
+      fbase="$(basename "$f")"
+      if denied_extension "$fbase"; then printf '%s\n' "$f"; continue; fi
+      # (2) ANY OTHER COPY pi would LOAD — the suffixed/dir shapes an exact-name deny cannot see.
+      # ⛔ AND ONLY A COPY: a bare name PREFIX is not enough. `<stem>-helper.ts` is a DIFFERENT,
+      # loadable extension, and deleting it would be the over-block direction (the sweep can
+      # `rm -rf`) — and if the repo SHIPS such a name, install would ship it and this sweep delete
+      # it, so `--verify` would fail `extension MISSING` on every run and the cell could never be
+      # provisioned. So the remainder must be a copy MARKER, and a ship-list row is never a copy.
+      if printf '%s\n' "$shipped" | grep -Fxq "$fbase"; then continue; fi
+      denied_copy_variant "$fbase" "$stem" || continue
+      loadable_extension_entry "$f" || continue
+      printf '%s\n' "$f"
+    done
+  done | awk 'NF && !s[$0]++'
 }
 
 # ── the farm layout (#1723) ──────────────────────────────────────────────────
@@ -1742,7 +1915,7 @@ denied_extension() {
 }
 
 install_extensions() {
-  local entries base src dst n=0 removed=0 total=0 d dbase
+  local entries base src dst n=0 removed=0 total=0 adir f
   entries="$(read_manifest_entries)" || die "the extension ship-list could not be read from manifest.json (see above)"
   total="$(printf '%s\n' "$entries" | grep -c . || true)"
   if [ "$total" -lt "$MIN_SHIP_LIST" ]; then
@@ -1767,17 +1940,28 @@ install_extensions() {
   # same reason the verify half does it: if an entry is ever dropped from manifest.json, a
   # deny bound to the ship-list stops reaching it, and a copy left by a hand-push or by an older
   # checkout would survive every bringup. That is exactly the #2100 re-break with a quieter cause.
-  for d in "${DENY_EXTENSIONS[@]}"; do
-    dbase="${d%/}"
-    # `-e` follows a symlink, so a DANGLING link at this path is invisible to it; `-L` catches it.
-    { [ -e "$DEST/extensions/$dbase" ] || [ -L "$DEST/extensions/$dbase" ]; } || continue
-    # An unchecked `rm -rf` would log "removed" over a survivor. `verify_layer` runs at the end of
-    # `--install` and would still refuse the cell, so this is not a false PASS — but a log that
-    # contradicts itself two lines later is exactly what sends an operator down the wrong path.
-    rm -rf "$DEST/extensions/$dbase" || die "could not remove the denied extension at $DEST/extensions/$dbase — the cell would keep running it"
-    log_line "removed denied extension: $dbase ($(denied_extension_note "$dbase"))"
-    removed=$((removed + 1))
-  done
+  # And it sweeps BY PATTERN across EVERY home the cell runs under (#2147): the exact-name form is
+  # blind to a suffixed copy, and the one-home form is blind to the second home a cell keeps its
+  # operating state in. Both were measured on live boxes (1 / 0 / 7 / 3 / 2 copies per cell).
+  while IFS= read -r adir; do
+    [ -n "$adir" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      # Never remove outside the directory we just enumerated: a glob that escaped would otherwise
+      # turn a deny sweep into a delete.
+      case "$f" in "$adir"/*) ;; *) die "refusing to remove $f — it is not under the scanned home $adir" ;; esac
+      # An unchecked `rm -rf` would log "removed" over a survivor. `verify_layer` runs at the end of
+      # `--install` and would still refuse the cell, so this is not a false PASS — but a log that
+      # contradicts itself two lines later is exactly what sends an operator down the wrong path.
+      rm -rf -- "$f" || die "could not remove the denied extension at $f — the cell would keep running it"
+      log_line "removed denied extension: $(basename "$f") ($(denied_extension_note "$(basename "$f")")) — $f"
+      removed=$((removed + 1))
+    done <<EOF
+$(denied_extension_copies "$adir")
+EOF
+  done <<EOF
+$(cell_agent_dirs)
+EOF
   log_line "extensions: $n installed from manifest.json (ship-list: $total), $((${#DENY_EXTENSIONS[@]})) denied on a cell, $removed removed"
 }
 
@@ -2625,23 +2809,33 @@ verify_layer() {
   # ship-list it would go INERT the moment an entry is dropped from manifest.json, and a copy left
   # on the cell (a hand-push, or an install from an older checkout) would then be certified clean.
   # A deny that stops denying when the ship-list changes is the same fail-open it exists to catch.
-  local dname
-  for dname in "${DENY_EXTENSIONS[@]}"; do
-    dname="${dname%/}"
-    # Same predicate as the install half: `-e` follows a symlink, so a DANGLING link at this
-    # path is invisible to it and the deny would certify exactly what it exists to refuse.
-    { [ -e "$DEST/extensions/$dname" ] || [ -L "$DEST/extensions/$dname" ]; } || continue
-    # The capture entry gets its own NAMED line, because its failure mode is not "a surface is
-    # missing" — it is "the box stops running lanes and the bring-up probe lies about it". An
-    # operator grepping the log for the dead-lane cause must find that sentence; the generic
-    # "denied extension" wording would read as a cosmetic surface mismatch.
-    case "$dname" in
-      tortoise-capture)
-        fail "capture extension present on a cell: $(denied_extension_note "$dname")" ;;
-      *)
-        fail "denied extension is PRESENT on the cell: extensions/$dname ($(denied_extension_note "$dname"))" ;;
-    esac
-  done
+  # (#2147) BY PATTERN, across EVERY home the cell runs under: `pi` loads `extensions/*.ts|*.js` and
+  # any `extensions/<dir>` holding an index, so a `tortoise-capture.bak.ts` or a
+  # `tortoise-capture.old/index.ts` WAS being loaded while an exact-name test certified the box —
+  # measured 1 / 0 / 7 / 3 / 2 surviving copies across the five cells, injecting 250+ bytes of
+  # `paused N (attempts; continues in the background)` onto the turn path.
+  local adir dname f
+  while IFS= read -r adir; do
+    [ -n "$adir" ] || continue
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      dname="$(basename "$f")"
+      # The capture entry gets its own NAMED line, because its failure mode is not "a surface is
+      # missing" — it is "the box stops running lanes and the bring-up probe lies about it". An
+      # operator grepping the log for the dead-lane cause must find that sentence; the generic
+      # "denied extension" wording would read as a cosmetic surface mismatch.
+      case "$dname" in
+        tortoise-capture*)
+          fail "capture extension present on a cell: $(denied_extension_note "$dname") — $f" ;;
+        *)
+          fail "denied extension is PRESENT on the cell: extensions/$dname ($(denied_extension_note "$dname")) — $f" ;;
+      esac
+    done <<EOF
+$(denied_extension_copies "$adir")
+EOF
+  done <<EOF
+$(cell_agent_dirs)
+EOF
 
   local g
   for g in "${GUARD_EXTENSIONS[@]}"; do

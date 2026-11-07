@@ -1707,8 +1707,36 @@ is 4.5x that floor. `spawn-gate.sh`'s `run_agent` now also applies a **headroom*
 
 ```
 ADMIT  iff  free_mb >= max(tree_mb, self_mb) + reserve_mb      (fresh `df` reading, at every spawn)
-REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM — …`  (AGENT_DISK_REFUSED, 77)
+REFUSE with  `[disk-gate] REFUSED <label>: DISK-NOHEADROOM REFUSED-DISK(free=…, need=…, box=…) — …`
+        (AGENT_DISK_REFUSED, 77)
 ```
+
+⛔ **GREP THE TOKEN, NOT THE DASH.** Since agent-infra#3395 the verdict also carries the
+machine-readable `REFUSED-DISK(free=…, need=…, box=…)` term (the same token the PRE-START seam emits
+from `wt_provision` before a worktree is created, e.g.
+`[disk-admit] REFUSED-DISK(free=3.5GB, need=8.0GB, box=cell-3; free_mb=3584, need_mb=8144)`), so the
+line no longer reads `DISK-NOHEADROOM — `. Anchor a grep on the shared **`REFUSED-`** prefix (or on
+**`DISK-NOHEADROOM`** for the live arm and **`REFUSED-DISK(`** for a refusal that MEASURED the volume),
+not on the em dash that used to follow the verdict.
+
+⛔ **`REFUSED-DISK` IS NOT THE ONLY PRE-START VERDICT, SO GREPPING FOR IT ALONE HIDES THREE REFUSALS.**
+The `wt_provision` seam fails **CLOSED** on the three conditions that produced no measurement at all —
+an unreadable `df`, a `$O` missing `spawn-gate.sh` (version skew, #2033), and a `disk_admit` that
+refused without naming its numbers — and each of them refuses with **`REFUSED-UNKNOWN`**, never
+`REFUSED-DISK`:
+
+```
+[disk-admit] REFUSED-UNKNOWN <label>: free=? need=… box=… target=…   (spawn-gate.sh)
+REFUSED-UNKNOWN disk-admit(free=?, need=?, box=…)                   (wt-lifecycle.sh, no spawn-gate.sh)
+REFUSED-UNKNOWN(free=?, need=?, box=…)                              (wt-lifecycle.sh, un-named refusal)
+```
+
+A monitor or a runbook anchored on `REFUSED-DISK(` alone therefore sees **no line at all** for exactly
+the refusals that mean "this box cannot verify its headroom" — the refusal exists, nothing names its
+cause, and the cell reads dark. Anchor on `REFUSED-` (the prefix all of them share) and read the token
+after it to tell "the volume is full" (`REFUSED-DISK`) from "the probe could not answer"
+(`REFUSED-UNKNOWN`): the two have OPPOSITE remedies, and pruning a filesystem that was never measured
+cannot help.
 
 `tree` is what ONE more lane costs *while the shared uv cache holds*; `self` is what the same lane
 costs when it does not (a pruned cache, `--link-mode=copy`, a cache on another mount); `reserve` is the
