@@ -559,6 +559,14 @@ if not isinstance(pargs, list) and not absolute(prog):
     sys.exit(4)                      # neither key names anything verifiable
 argv = pargs if isinstance(pargs, list) else []
 DATA_OPTIONS = {"--repo", "--root"}  # long options whose VALUE the job's work only READS
+# ⛔ env OPTIONS THAT TAKE A VALUE IN THE SPACE FORM. Skipping only the OPTION left its VALUE as the
+# first positional, so the VALUE was promoted to launcher and the real program was then classified as a
+# TARGET: `env -u PYTHONPATH <TCC venv python> <script>` — the two reapers' shape — went from verdict 0
+# to verdict 2, i.e. SKIP + `launchctl bootout` + `rm -f` of an installed, grant-holding unit (review of
+# #3413, round 8 P2). The JOINED spellings (`--unset=NAME`) carry their value in the token and are
+# already skipped by the `"=" in a` arm below.
+ENV_VALUE_OPTIONS = {"-u", "--unset", "-C", "--chdir", "-P", "--block-signal",
+                     "--default-signal", "--ignore-signal"}
 launchers = []                       # what launchd actually execs
 skipped = set()                      # argv indices already reported as a launcher
 if absolute(prog):
@@ -628,6 +636,9 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                     prev = toks[j - 1] if j and isinstance(toks[j - 1], str) else ""
                     print("%s\t%s" % ("data" if prev in DATA_OPTIONS else "exec", tok))
                 break
+            if a in ENV_VALUE_OPTIONS:
+                i += 2 if i + 1 < len(argv) else 1
+                continue
             if a.startswith("-") or ("=" in a and not a.startswith("/")):
                 i += 1
                 continue
@@ -750,13 +761,15 @@ plist_program_args() {
             return n
         }
         # The three rules of the argv loop, applied to the tokens of an `env -S` command line.
-        function classify_cmd(cmd,   n, j, tok, prv, seenp, nm, val) {
+        function classify_cmd(cmd,   n, j, tok, prv, seenp, nm, val, vwant) {
             n = env_split(cmd)
-            seenp = 0
+            seenp = 0; vwant = 0
             for (j = 1; j <= n; j++) {
                 tok = SPLIT[j]
                 if (tok == "") continue
                 if (!seenp) {
+                    if (vwant) { vwant = 0; continue }
+                    if (tok in VALUE_OPTS) { vwant = 1; continue }
                     if (tok ~ /^-/ || (index(tok, "=") > 0 && tok !~ /^\//)) continue
                     seenp = 1
                     if (tok ~ /^\//) printf "launcher\t%s\n", tok
@@ -775,7 +788,14 @@ plist_program_args() {
             }
         }
         BEGIN {
-            seen = 0; prev = ""; idx = -1; envmode = 0; wantcmd = 0
+            seen = 0; prev = ""; idx = -1; envmode = 0; wantcmd = 0; wantval = 0
+            # the same table the python reader carries (ENV_VALUE_OPTIONS): an option whose VALUE is
+            # the next element, or the value is mistaken for env program and the real program becomes a
+            # TARGET (review of #3413, round 8 P2).
+            VALUE_OPTS["-u"] = 1; VALUE_OPTS["--unset"] = 1; VALUE_OPTS["-C"] = 1
+            VALUE_OPTS["--chdir"] = 1; VALUE_OPTS["-P"] = 1
+            VALUE_OPTS["--block-signal"] = 1; VALUE_OPTS["--default-signal"] = 1
+            VALUE_OPTS["--ignore-signal"] = 1
             if (prog ~ /(^|\/)env$/) envmode = 1
             # The launcher is emitted BEFORE the argument walk, as the python reader does: the exec
             # arm consults the grant this record establishes, so an order flip changes its verdict.
@@ -822,6 +842,9 @@ plist_program_args() {
                 if (line == "-S" || line == "--split-string") { wantcmd = 1; prev = line; next }
                 if (line ~ /^--split-string=/) { classify_cmd(substr(line, 16)); envmode = 0; prev = line; next }
                 if (line ~ /^-S/) { classify_cmd(substr(line, 3)); envmode = 0; prev = line; next }
+                if (line in VALUE_OPTS) { wantval = 1; prev = line; next }
+                if (wantval) { wantval = 0; prev = line; next }
+
                 # an option or a NAME=VALUE is not the program and does not end the search
                 if (line ~ /^-/ || (index(line, "=") > 0 && line !~ /^\//)) { prev = line; next }
                 # the FIRST positional is the env program: a LAUNCHER, exactly what the space form

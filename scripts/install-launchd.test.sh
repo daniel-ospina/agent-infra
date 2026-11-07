@@ -1687,6 +1687,24 @@ OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "--split-string=/bin/ba
 set -e
 assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: --split-string=<cmd> is split, not dropped"
 
+# (c22i) env OPTIONS THAT TAKE A VALUE (`-u NAME`, `-C DIR`, `-P DIR`, `--block-signal SIG`, …) in the
+# SPACE form. Skipping only the OPTION left its VALUE as the first positional, so the VALUE was promoted
+# to launcher and the real program was classified as a TARGET: `env -u PYTHONPATH <TCC venv python>
+# <script>` went from verdict 0 to verdict 2, and `install_job` answers 2 with `launchctl bootout` +
+# `rm -f` of an INSTALLED, grant-holding unit (fresh review of #3413, round 8 P2). Both readers carried
+# the same defect, so no differential test could see it — hence a case per reader.
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -u PYTHONPATH "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: env -u NAME consumes its VALUE, so the real program is still the launcher"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and the program is a LAUNCHER, not a target"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the reaper is not skipped and disarmed"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -u PYTHONPATH "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -u NAME consumes its VALUE too (the two agree)"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and promotes the program the same way"
+
 # (c22h) THE GRANT APPLIES TO THE `unknown` ROLE TOO. `[<TCC-root BINARY>, <script in the SAME TCC
 # root>]` is what the two `com.tortoise.*` reapers render whenever the farmed entry resolves into the
 # tree: the launcher is a BINARY, which #1311 measured DOES hold the grant for that tree, so the
