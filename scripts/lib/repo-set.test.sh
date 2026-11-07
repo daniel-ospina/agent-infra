@@ -109,18 +109,22 @@ EOF
 #  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION: the ancestor walk used to LOOP (a
 #     slash-less parent never shortens) and the first absent-path arm to run is `b1`, which had no bound —
 #     so a re-regression WEDGED the shard for its whole CI timeout instead of reddening. Putting the bound
-#     in the helper covers every `run_reader*` call site at once, plus the two round-44 fixture arms below
-#     (`j-emptyrender`, `j16f`), which call it directly; `124` is `timeout`'s own code, so the arms'
-#     arithmetic is unchanged.
+#     in the helper covers every `run_reader*` call site at once, plus the round-44 fixture arms below
+#     that call it DIRECTLY (`j-emptyrender`, `j16f`, `j16f2`, `m46` — named, not counted: this sentence
+#     said "the two" until `j16f2` and `m46` joined them, which is the drift the next paragraph warns
+#     about); `124` is `timeout`'s own code, so the arms' arithmetic is unchanged.
 #     ⛔ BUT IT DOES NOT COVER EVERY ARM, AND SAYING IT DID WAS A FALSE COVERAGE CLAIM (round 44 review,
 #     P2). Three populations bypass the helper and stay unbounded, and they are NAMED rather than counted
 #     on purpose — the counts in the first version of this paragraph were wrong (this file's `f11f`
 #     lesson, one arm over), which is what a count in a comment reliably becomes.
 #       (a) The `bash "$W/pr-doctor-machine.sh"` wrapper arms.
-#       (b) The direct `bash "$READER"` / `/bin/bash "$READER"` arms — the PATH-scoped fault-injection
-#           fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) and the `HOME`-unset arms. Those set `PATH=`
-#           for the CHILD, and the helper itself needs `ps` and `sleep` from the AMBIENT path, so they
-#           cannot simply wrap it. The two round-44 arms below show the shape that DOES work: route the
+#       (b) The direct `bash "$READER"` / `/bin/bash "$READER"` arms. The PATH-scoped fault-injection
+#           fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) set `PATH=` for the CHILD, and the helper
+#           itself needs `ps` and `sleep` from the AMBIENT path, so those cannot be wrapped as-is. The
+#           `HOME`-unset arms (`env -u HOME …`) and the plain direct arms set NO `PATH`, so they are
+#           merely not wrapped YET — not unwrappable (measured: `_rs_bound 30 env -u HOME bash "$READER"
+#           path` returns rc 0 with byte-identical output), and this paragraph said otherwise until a
+#           reviewer measured it. The round-44 arms below show the shape that works for either kind: route the
 #           CHILD's environment through `env` (`REPO_SET_FILE` in both, plus `PATH` in `j16f`) and leave
 #           the helper on the ambient path.
 #       (c) The COPY/MUTANT reader arms (`bash "$M/lib/repo-set.sh"` and the `$NA`/`$ND`/`$NODOC`/`$M2`/

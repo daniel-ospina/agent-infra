@@ -145,8 +145,11 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
 # _rs_nearest_existing_ancestor <path> — the first path component that EXISTS, walking up from the
 # given path's directory. It always answers: an existing ancestor, or `/` (which exists) — the "" case in
-# the first version of this line was unreachable, a reviewer found it, and the caller's `-e` on `/` is the
-# only fallback that is not a silent proof of absence. It is the whole basis of the
+# the first version of this line was unreachable, a reviewer found it, and this function's own `-e /`
+# guard, which the caller then tests with `-d`/`-x`, is the only fallback that is not a silent proof of
+# absence. (An earlier version of this sentence attributed that `-e` to the CALLER; a reviewer measured
+# that the caller's only test is `-d`/`-x` on the returned ancestor, so the attribution was wrong and the
+# guard it meant is this function's own final line.) It is the whole basis of the
 # absence proof above: `-e` false under a TRAVERSABLE existing ancestor is proof of absence, and under
 # an untraversable one it is proof of nothing.
 # ⛔ NO `dirname` IN THIS WALK, AND IT IS NOT AN OPTIMISATION (review round 44, P2 — measured). In the
