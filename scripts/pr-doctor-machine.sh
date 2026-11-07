@@ -157,7 +157,10 @@ done
 if [ -n "$_reader_missing" ]; then
   _say "REFUSING — $READER cannot be used by this wrapper; it does not provide: $_reader_missing"
   # ⛔ NO UNESCAPED BACKTICKS IN AN EMITTED LINE (round 38, P1; the co-working lane fixed the same two
-  # lines independently — both escapes are kept, one is redundant and harmless). Both of these were
+  # lines independently, so both fixes landed in one block — the redundancy is in the HISTORY, never in
+  # the escapes). ⛔ EVERY backtick below is load-bearing, and unescaping ONE of a pair is WORSE than
+  # unescaping both: the substitution never terminates and swallows the rest of the file (measured on a
+  # copy: 150 passed / 32 failed). Both of these were
   # double-quoted with raw backticks around the quoted farm message, so bash ran
   # `COPY/RENAME FAILED … leaving any` as a COMMAND: every refusal printed
   #   /path/pr-doctor-machine.sh: line N: COPY/RENAME: No such file or directory
