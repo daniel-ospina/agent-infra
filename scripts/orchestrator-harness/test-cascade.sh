@@ -178,9 +178,22 @@ drive_cascade() { # <unowned> <lanes> <max_lanes> <backlog> <can> [<listing pres
   # could hold and the headline assertion "the cascade opens" graded an UNMEASURED level — while
   # `drive_block`, which does supply a listing, asserted the OPPOSITE for the same inputs. Two
   # contradictory assertions were green in one run.
-  case "${6:-present}" in
+  case "${6:-}" in
     absent) : ;;
-    *) printf '9001:shaA:fix/a 9002:shaB:fix/b\n' > "$d/state/last-open-prs" ;;
+    present) printf '9001:shaA:fix/a 9002:shaB:fix/b\n' > "$d/state/last-open-prs" ;;
+    # ⛔ A ZERO UN-OWNED COUNT MUST NOT SHIP A LISTING OF TWO UN-OWNED PRs (integration fix,
+    # 2026-11-06). The default used to be `present` unconditionally, so `drive_cascade 0 …` told the
+    # level walk "UPN_WORK=0" and then handed it TWO un-owned PRs — the fixture contradicted itself,
+    # the level measured 4, and the assertion labelled "NO un-owned PRs + free room" could not be
+    # reached by its own rig. Absent here means "nobody read it" and is asserted explicitly via
+    # `absent`; with zero un-owned PRs a real listing IS empty, which is a different state from
+    # absent, so write an EMPTY file — that is what `open_pr_count` writes on a successful read of
+    # an empty queue.
+    *) if is_num "${1:-}" && [ "${1:-0}" -gt 0 ] 2>/dev/null; then
+         printf '9001:shaA:fix/a 9002:shaB:fix/b\n' > "$d/state/last-open-prs"
+       else
+         : > "$d/state/last-open-prs"
+       fi ;;
   esac
   ( O="$d"; LOG=/dev/null; UPN_WORK="$1"; UPN="$1"; SEL_TOTAL=15; OPEN_N=15; WORKERS=0
     LANES="$2"; LANES_DISPLAY="$2"; MAX_LANES="$3"; SEL_PARKED=0
@@ -208,7 +221,15 @@ drive_cascade() { # <unowned> <lanes> <max_lanes> <backlog> <can> [<listing pres
 ck "un-owned PR work + FREE room -> a LEVEL holds the room (issue_slots=0, pr_waiting=1)" \
    "$(drive_cascade 5 2 25 10 1)" "0 1 0"
 ck "un-owned PR work + NO room    -> PR priority holds (slots=0, pr_waiting=1, waits)" "$(drive_cascade 5 25 25 10 1)" "0 1 1"
-ck "NO un-owned PRs + free room  -> the issue batch gets the leftover room (level 5)" "$(drive_cascade 0 0 25 10 1)" "10 0 0"
+ck "NO un-owned PRs + free room  -> the leftover room reaches the issue batch" "$(drive_cascade 0 0 25 10 1)" "10 0 0"
+# ⛔ DECLARED LIMIT, and it is the SAME class as the pole: an EMPTY listing makes `cascade_level`
+# answer `?`, not `5` — its own rule is "no rows is not no work" (a listing that could not be read
+# cannot say a mergeable PR is absent). So the assertion above grades the OUTCOME (the room reaches the
+# issue batch), NOT the level number; the level-5 arm itself is driven by `drive_block` in §11, where
+# an OWNED PR gives a non-empty listing and resolves to 5. Both readings are pinned so neither is
+# inferred, and an empty-but-read listing being indistinguishable from an unread one stays disclosed
+# rather than silently corrected here (the FAIL-CLOSED guard above keys on the file's ABSENCE, which is
+# the one datum that separates them).
 ck "no un-owned PRs + empty backlog -> nothing to wait for" "$(drive_cascade 0 0 25 0 1)" "0 0 0"
 # ⛔ POLARITY ON THE ROOM ITSELF. `merge-priority` used to carry a fail-closed arm (any unreadable
 # count closed the issue path). Removing the barrier must not remove the polarity, or the one listing
@@ -783,7 +804,7 @@ esc_pair() { # <id> <room> <slots> <unread> [<backlog>] [<batch>] [<can>] -> "<s
     # where `room/2` and `min(BATCH,ROOM)` BOTH yield 2. The arm passed on the very implementation it
     # exists to reject. `CASCADE_CAN` is likewise explicit: UNSET means the driver-rig contract, and 0
     # means the allocator refused on load/mem even though the box had room.
-    CASCADE_BACKLOG="$blg"; BATCH="$btch"
+    CASCADE_QUEUE_DEPTH="$blg"; BATCH="$btch"
     if [ -n "$can" ]; then CASCADE_CAN="$can"; fi
     . "$ESCBLK"
     printf '%s %s\n' "${CASCADE_ISSUE_SLOTS:-unset}" \
@@ -1086,7 +1107,7 @@ awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(
   # ⛔ THE BACKLOG MUST BE NUMERIC HERE (review round 6): the grant now COERCES a non-numeric backlog to
   # 0 exactly as the allocator does, so leaving it unset makes this probe's own scenario unreachable —
   # "a level HOLDS the room" is only a stall when there ARE candidates to queue.
-  CASCADE_BACKLOG=10
+  CASCADE_QUEUE_DEPTH=10
   . "$FIX/pair-blk.sh"
   [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] && [ -s "$d/state/drain-escape" ] && echo yes || echo no ) 2>/dev/null
 PEOF
@@ -1111,12 +1132,12 @@ awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(
   O="$d"; LOG="$d/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
   DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
   CASCADE_ROOM=5; CASCADE_ISSUE_SLOTS=0; CASCADE_UPN_UNREADABLE=0; CASCADE_CAN=1; BATCH=2
-  unset CASCADE_BACKLOG
+  unset CASCADE_QUEUE_DEPTH
   . "$FIX/blgc-blk.sh"
   [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] && echo no || { [ -s "$d/state/drain-escape" ] && echo no || echo yes; } ) 2>/dev/null
 PEOF
 mut "M22 the grant caps the backlog ONLY when it is numeric (unset/empty/non-numeric grants anyway, the allocator answers 0)" \
-    's/^      is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=0$/      is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=999/' "$TMP/p-blgcoerce.sh"
+    's/^      is_num "${CASCADE_QUEUE_DEPTH:-}" || CASCADE_QUEUE_DEPTH=0$/      is_num "${CASCADE_QUEUE_DEPTH:-}" || CASCADE_QUEUE_DEPTH=999/' "$TMP/p-blgcoerce.sh"
 
 # ── 12b-M. MUTANTS FOR THE LEVEL-1 STATE PINS ────────────────────────────────
 # ⛔ `mut`/`mutlo` only ever mutate `$ORCH`/`$LO` and grade FUNCTIONS. The 12b pins are SOURCE facts
