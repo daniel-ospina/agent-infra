@@ -72,7 +72,8 @@ ex() { # <fn> <file>
 }
 FNS="$TMP/fns.sh"
 : > "$FNS"
-for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci_inflight pr_owned \
+for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci_inflight \
+          worker_log_name pr_owned \
           unowned_scan mp_reason cascade_issue_slots cascade_wait \
           cascade_level_name cascade_main_red cascade_level cascade_main_probe; do
   _body="$(ex "$_f" "$ORCH")"
@@ -125,7 +126,7 @@ export O="$W" CYCLE_T0=1000 STALE_MIN=40
 # PR through `gh` and holds no branch, so the cwd probe cannot see it and the count called it un-owned
 # while the spawn arms refused to double-work it.
 wt_table() { printf 'review-9001\talive\nfix-9002\talive\nmerge-9003\talive\nreview-9004\tdead\nlane-77\talive\nchain-78\tunknown\n'; }
-: > "$W/logs/review-9001.log"; : > "$W/logs/fix-9002.log"; : > "$W/logs/merge-9003.log"
+: > "$W/logs/merge-9001.log"; : > "$W/logs/fix-9002.log"; : > "$W/logs/merge-9003.log"
 printf '9001:shaA:fix/9001-a 9002:shaB:fix/9002-b 9003:shaC:fix/9003-c 9004:shaD:fix/9004-d\n' > "$W/state/last-open-prs"
 measure_ownership_sets
 ck "the census's live review lane is in WORKING_PR_SET"  "$(case "$WORKING_PR_SET" in *' 9001 '*) echo yes;; *) echo no;; esac)" "yes"
@@ -307,9 +308,15 @@ echo "=== 8. a WEDGED lane is not ownership (owner ask 4b) ==="
 W8="$TMP/w8"; mkdir -p "$W8/state" "$W8/logs"
 export O="$W8"
 wt_table() { printf 'review-9201\talive\nreview-9202\talive\n'; }
-: > "$W8/logs/review-9201.log"
-touch -t 202001010000 "$W8/logs/review-9201.log"      # long past the wedge bound
-: > "$W8/logs/review-9202.log"                        # fresh: working
+# ⛔ THE FIXTURE MUST USE THE NAME THE WRITER PRODUCES (review P1, 2026-11-06 — measured). These were
+# `logs/review-<PR>.log`, a filename NO WRITER CREATES: a reviewer is spawned as `review-<PR>` but
+# `merge-one.sh` sets `L="$O/logs/merge-$PR"` itself, and `lane-reap.sh`'s `is_lane_log_name` REJECTS
+# `review-*`. So the arm could never fire in production while these assertions stayed green over the
+# invented name — the vacuous-green shape. The fixture now supplies `merge-<PR>.log`, which is what
+# `worker_log_name` resolves `review-<PR>` to; reverting either side reddens these assertions.
+: > "$W8/logs/merge-9201.log"
+touch -t 202001010000 "$W8/logs/merge-9201.log"      # long past the wedge bound
+: > "$W8/logs/merge-9202.log"                        # fresh: working
 printf '9201:sA:b1 9202:sB:b2\n' > "$W8/state/last-open-prs"
 measure_ownership_sets
 ck "a record whose log stopped advancing is WEDGED, and named" "$(case "$WEDGED_SET" in *' review-9201 '*) echo yes;; *) echo no;; esac)" "yes"
@@ -446,7 +453,11 @@ ck "…and a GREEN main is not a red either" \
 
 # ⛔ THE HEADLINE ASSERTION, DRIVEN THROUGH THE SHIPPED BLOCK: a mergeable PR waiting takes the room
 # back from the issue batch. This is "an issue is NEVER dispatched while a mergeable PR is waiting".
-drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <owned-prs> -> "slots prw wait level"
+drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <owned-prs> [<main-verdict>] [<UPN_WORK>] -> "slots prw wait level"
+  # ⛔ `<UPN_WORK>` EXISTS SEPARATELY FROM `<unowned>` BECAUSE THE TWO ARE DIFFERENT POPULATIONS (review
+  # P1, 2026-11-06). `<unowned>` is what the LISTING shows; `UPN_WORK` is the pass's own un-owned count
+  # with `SEL_PARKED` already subtracted. A parked-at-this-head PR makes them disagree — listing has it,
+  # count says 0 — and that disagreement is the defect this rig now drives. Default: they agree.
   local w="$TMP/blk$$"
   rm -rf "$w"; mkdir -p "$w/state"
   printf '%s\n' "$6" > "$w/state/last-open-prs"
@@ -454,7 +465,7 @@ drive_block() { # <unowned> <lanes> <max> <backlog> <can> <listing> <prclass> <o
   [ -n "${7:-}" ] && [ "${7}" != "-" ] && printf '%s' "$7" > "$w/state/prclass.tsv"
   # <main-verdict> models MAIN's own recorded verdict, which `cascade_level` reads to reach level 1.
   [ -n "${9:-}" ] && printf '%s\n' "$9" > "$w/state/main-verdict"
-  ( O="$w"; LOG=/dev/null; UPN_WORK="$1"; UPN="$1"; SEL_TOTAL=15; OPEN_N=15; WORKERS=0
+  ( O="$w"; LOG=/dev/null; UPN_WORK="${10:-$1}"; UPN="$1"; SEL_TOTAL=15; OPEN_N=15; WORKERS=0
     LANES="$2"; LANES_DISPLAY="$2"; MAX_LANES="$3"; SEL_PARKED=0; TEST_CAN_SPAWN="$5"
     : > "$w/candidates.txt"; _i=0
     while [ "$_i" -lt "$4" ]; do printf '100%s\n' "$_i" >> "$w/candidates.txt"; _i=$((_i+1)); done
@@ -492,9 +503,24 @@ ck "…and a GREEN PR lands on level 2 whether or not it is review-satisfied (th
 ck "…so level 5 is reachable ONLY at zero un-owned PRs (the pole, stated as a consequence)" \
    "$(drive_block 1 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	NOCHECKS
 ' - | cut -d' ' -f4)" "4"
+# ⛔ THE PARKED-POPULATION MISMATCH, DRIVEN (review P1, 2026-11-06). `UPN_WORK` is the pass's own
+# UN-OWNED count with `SEL_PARKED` already subtracted, so `UPN_WORK=0` beside a non-empty listing is
+# exactly the state a parked-at-this-head PR produces: the count and the funnel both say "no un-owned
+# PR work", and the walk must NOT then invent a level out of the parked PR. Before this, that single
+# parked PR resolved a level, zeroed `issue_slots`, and broke the batch on its first guard — ZERO
+# issues queued every pass while the printed decision said `DISPATCH`, with no release (the drain
+# escape only runs on the `LO_CHOICE != pr` arm, and this state reaches it as `issue`, which resets the
+# inert streak). The expected level is `-` (never measured): a parked PR is not work for any level.
+ck "a PR the count has EXCLUDED (UPN_WORK=0 — parked at this head) must NOT hold the room" \
+   "$(drive_block 1 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
+' - - 0)" "10 0 0 -"
 ck "levels 1-4 empty -> the issue batch gets the leftover room (10 slots, pr_waiting=0)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
-' 9001)" "10 0 0 5"
+' 9001 - 1)" "10 0 0 5"
+# ⛔ `<UPN_WORK>` IS GIVEN EXPLICITLY HERE (review P1, 2026-11-06). The pass's own un-owned count
+# short-circuits the level walk at 0 — that is the parked-PR fix, and it is DRIVEN as its own assertion
+# above. A fixture whose POINT is which level an OWNED PR resolves to must therefore keep the count
+# non-zero, or it grades the short-circuit instead of the level and reports `-`.
 # ⛔ THE CONTRAST THAT KEEPS THE PAIR MEANINGFUL: a level holding the room on a box with NO free lane
 # is a FULL box — that is the one state where polling for a freed slot is right. Same inputs as the
 # level-2 case above except `lanes == max_lanes`.
@@ -504,10 +530,10 @@ ck "levels 1-4 empty -> the issue batch gets the leftover room (10 slots, pr_wai
 # the already-shipped full-box case above (`drive_cascade 5 25 25 10 1` => `0 1 1`) is the driven half.
 ck "a BUSY PR (owned) is not a level — it does not hold the room" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
-' 9001)" "10 0 0 5"
+' 9001 - 1)" "10 0 0 5"
 ck "…while the SAME work UN-owned holds it (the pair is the discriminator)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
-' -)" "0 1 0 3"
+' - - 1)" "0 1 0 3"
 
 # ⛔ THE STATE THAT DECIDES THE WHOLE FLEET TODAY, PINNED (review P1, fix round): a RED MAIN on a box
 # with FREE ROOM. Level 1 holds the room, so the issue path is closed — and it must be the LEVEL holding
@@ -890,7 +916,8 @@ mut() {
   sed "$expr" "$ORCH" > "$m"
   if cmp -s "$m" "$ORCH"; then bad "$label — the mutation changed NOTHING (a vacuous mutant)"; return; fi
   : > "$mutfns"
-  for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci_inflight pr_owned \
+  for _f in is_num is_limit pr_in_set _wedge_min measure_ownership_sets measure_ci_inflight \
+          worker_log_name pr_owned \
             unowned_scan mp_reason cascade_issue_slots cascade_wait \
             cascade_level_name cascade_main_red cascade_level cascade_main_probe; do
     ex "$_f" "$m" >> "$mutfns"
@@ -935,7 +962,7 @@ cat > "$TMP/p-own.sh" <<'PEOF'
 . "$ORCH_FNS"; . "$STUB"
 W="$FIX/m-own"; rm -rf "$W"; mkdir -p "$W/state" "$W/logs"; O="$W"; CYCLE_T0=1; STALE_MIN=40
 wt_table() { printf 'review-9001\talive\nfix-9002\talive\nmerge-9003\talive\n'; }
-: > "$W/logs/review-9001.log"; : > "$W/logs/fix-9002.log"; : > "$W/logs/merge-9003.log"
+: > "$W/logs/merge-9001.log"; : > "$W/logs/fix-9002.log"; : > "$W/logs/merge-9003.log"
 printf '9001:shaA:a 9002:shaB:b 9003:shaC:c\n' > "$W/state/last-open-prs"
 measure_ownership_sets
 [ "$(unowned_pr_count 3)" = "0" ] && echo yes || echo no
@@ -987,14 +1014,14 @@ cat > "$TMP/p-wedge.sh" <<'PEOF'
 . "$ORCH_FNS"; . "$STUB"
 W="$FIX/m-wedge"; rm -rf "$W"; mkdir -p "$W/state" "$W/logs"; O="$W"; CYCLE_T0=1; STALE_MIN=40
 wt_table() { printf 'review-9201\talive\n'; }
-: > "$W/logs/review-9201.log"; touch -t 202001010000 "$W/logs/review-9201.log"
+: > "$W/logs/merge-9201.log"; touch -t 202001010000 "$W/logs/merge-9201.log"
 printf '9201:sA:b1\n' > "$W/state/last-open-prs"
 measure_ownership_sets
 # yes == the wedged record does NOT own its PR
 pr_in_set "$WORKING_PR_SET" 9201 && echo no || echo yes
 PEOF
 mut "M8 a wedged record owns its PR again (a corpse holding the gate and a slot)" \
-    's/^        pr_in_set "\$wed" "\$n.log" && { WEDGED_SET="\$WEDGED_SET\$n "; continue; }$/        : # wedge filter removed/' \
+    's/^        pr_in_set "\$wed" "\$(worker_log_name "\$n")" && { WEDGED_SET="\$WEDGED_SET\$n "; continue; }$/        : # wedge filter removed/' \
     "$TMP/p-wedge.sh"
 
 cat > "$TMP/p-wait.sh" <<'PEOF'
@@ -1037,7 +1064,7 @@ awk '/^  # \[cascade:begin\]/{f=1} f{print} /^  # \[cascade:end\]/{if(f) exit}' 
 [ "$CASCADE_ISSUE_SLOTS" = 0 ] && echo yes || echo no
 PEOF
 mut "M12 a higher level no longer HOLDS the room (an issue is dispatched while a merge waits)" \
-    's/^               CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;$/               CASCADE_LEVEL_HOLDS=1 ;;/' "$TMP/p-hold.sh"
+    's/^                 CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;$/                 CASCADE_LEVEL_HOLDS=1 ;;/' "$TMP/p-hold.sh"
 
 cat > "$TMP/p-unmeas.sh" <<'PEOF'
 . "$ORCH_FNS"

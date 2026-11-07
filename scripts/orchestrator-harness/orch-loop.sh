@@ -1790,7 +1790,7 @@ reap_stale_workers() {
     # A hung reviewer therefore held its PR owned (via the census) AND held a lane slot, for ever: the
     # exact corpse `lane-bound.sh` measured (a `pi` parked in `ep_poll` at 0 bytes / 0 CPU for 3h32m).
     case "$s" in merge-*|lane-*|fix-*|review-*) : ;; *) continue ;; esac
-    f="$O/logs/$s.log"
+    f="$O/logs/$(worker_log_name "$s")"
     [ -f "$f" ] || continue
     # An unreadable mtime means the age is UNKNOWN, and unknown is not evidence of a hang: skip the
     # worker rather than reap it. Never let the probe's failure escape as an arithmetic error — on
@@ -3820,12 +3820,12 @@ MOEOF
       review-*|fix-*|merge-*)
         num="${n#*-}"
         case "$num" in ''|*[!0-9]*) continue ;; esac
-        pr_in_set "$wed" "$n.log" && { WEDGED_SET="$WEDGED_SET$n "; continue; }
+        pr_in_set "$wed" "$(worker_log_name "$n")" && { WEDGED_SET="$WEDGED_SET$n "; continue; }
         WORKING_PR_SET="$WORKING_PR_SET$num " ;;
       lane-*|chain-*)
         num="${n#*-}"
         case "$num" in ''|*[!0-9]*) continue ;; esac
-        pr_in_set "$wed" "$n.log" && { WEDGED_SET="$WEDGED_SET$n "; continue; }
+        pr_in_set "$wed" "$(worker_log_name "$n")" && { WEDGED_SET="$WEDGED_SET$n "; continue; }
         INFLIGHT_ISSUE_SET="$INFLIGHT_ISSUE_SET$num " ;;
     esac
   done <<MOEOF2
@@ -3864,6 +3864,32 @@ measure_ci_inflight() {
     END { for (p in cls) if (cls[p] == "PENDING" && hd[p] != "" && heads[p] == hd[p]) printf "%s ", p }
   ' "$O/state/last-open-prs" "$O/state/prclass.tsv" 2>/dev/null || true)"
   return 0
+}
+
+# worker_log_name <worker> -> the log BASENAME the worker actually writes, under $O/logs.
+# ⛔ THE FILENAME IS NOT THE WORKER NAME FOR THE REVIEW FAMILY (review P1, 2026-11-06 — measured).
+# A reviewer is spawned as `review-<PR>` (`wt_spawn "review-$PR" … bash merge-one.sh`), but
+# `merge-one.sh` sets its OWN log path unconditionally — `L="$O/logs/merge-$PR"` — so the file it
+# writes is `merge-<PR>.log`. NOTHING in the tree creates `logs/review-<PR>.log`: `lane-reap.sh`
+# declares the fleet's log namespace as `lane-*|chain-*|fix-*|merge-*` and `is_lane_log_name` REJECTS
+# `review-*`. Deriving the filename from the worker name was therefore INERT for the whole review
+# family, in both places that used it:
+#   • `reap_stale_workers` hit `[ -f "$f" ] || continue` and skipped every reviewer, so a hung reviewer
+#     still held its PR owned AND held a lane slot for ever — the exact corpse the arm claims to reach;
+#   • `measure_ownership_sets` compared `review-<PR>.log` against the `.log` files it enumerated, which
+#     never include the reviewer's `merge-<PR>.log`, so a live-but-wedged reviewer was NEVER in
+#     `WEDGED_SET` and stayed in `WORKING_PR_SET` — `pr_owned` held its PR indefinitely.
+# ⛔ DECLARED CONSEQUENCE OF THE MAPPING: a merge worker and a review worker for the SAME PR share one
+# log file, because that is what `merge-one.sh` writes. The census record still distinguishes them
+# (`review-<PR>` vs `merge-<PR>`), so "which record is wedged" is answerable; "which record wrote that
+# byte" is not. That is a property of `merge-one.sh`, not something this mapping can fix, and it is
+# strictly better than an arm that can never fire.
+worker_log_name() {
+  case "${1:-}" in
+    review-*) printf '%s.log\n' "merge-${1#review-}" ;;
+    '') : ;;
+    *) printf '%s.log\n' "$1" ;;
+  esac
 }
 
 pr_owned() { # <pr> <head-sha> [<head-ref>] -> 0 when something is currently working this PR
@@ -6779,16 +6805,37 @@ PY
   CASCADE_LEVEL=""; CASCADE_LEVEL_NAME="NOT-MEASURED"; CASCADE_MAIN_RED=0
   CASCADE_LEVEL_HOLDS=0
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -gt 0 ]; then
-    cascade_level "$O/state"
-    case "${CASCADE_LEVEL:-?}" in
-      1|2|3|4) # A HIGHER LEVEL HOLDS A NON-ZERO COUNT: the room is not the issue path's this pass.
-               # ⛔ NOT "has actionable work" (review round 9, P2): the classifier counts CHECK STATE
-               # only, so this arm cannot know whether a lane could spend the room — the same gap the
-               # header at 3306 and docs/ops/self-healing-contract.md §6 now state. Saying "actionable"
-               # here made the consumption site disagree with the decision site about one question.
-               CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;
-      *) : ;;   # 5 = nothing above → issues; `?` = unmeasured → decide nothing (see cascade_level)
-    esac
+    # ⛔ THE WALK MUST NOT OVERRULE THE COUNT IT SHADOWS (review P1, 2026-11-06 — measured). The pass's
+    # own un-owned count already EXCLUDES a PR parked at its current head (`SEL_PARKED`, subtracted into
+    # `UPN_WORK`), while `cascade_level` walks the raw listing and excludes nothing but OWNERSHIP. So
+    # with exactly one parked, un-owned PR — a fixer cap / needs-human park, a normal recurring state —
+    # the count said `0 un-owned` and the funnel printed `DISPATCH`, while the walk still resolved a
+    # level, zeroed `CASCADE_ISSUE_SLOTS`, and the batch's first guard broke: ZERO issues queued, every
+    # pass, silently. It was unreleasable too, because the drain escape only runs on the `LO_CHOICE != pr`
+    # arm and this state reaches it as `issue` — which resets the inert streak, so the grant could never
+    # fire. Pre-change that state dispatched (a parked PR made `mp_reason` empty), so it was a
+    # REGRESSION in the exact class this change exists to remove.
+    # ⛔ THE FIX IS NOT A SECOND PARKED PREDICATE. A parked PR is not work for ANY level — no lane can
+    # drain it — so "is there un-owned PR work at all" is the count's question, already answered with
+    # the parked exclusion applied. Ask it once: zero un-owned means nothing above level 5 can hold, and
+    # an UNREADABLE count still decides nothing (the same polarity `cascade_level` takes on its own
+    # empty listing). Re-deriving the parked set here would be the two-definitions defect this file
+    # names, and a second copy is how the count and the walk came to disagree in the first place.
+    if is_limit "${UPN_WORK:-}" && [ "${UPN_WORK:-0}" -eq 0 ] 2>/dev/null; then
+      : # no un-owned PR work (owned or parked-at-head): no level above 5 can hold the room.
+    else
+      cascade_level "$O/state"
+      case "${CASCADE_LEVEL:-?}" in
+        1|2|3|4) # A HIGHER LEVEL HOLDS A NON-ZERO COUNT: the room is not the issue path's this pass.
+                 # ⛔ NOT "has actionable work" (review round 9, P2): the classifier counts CHECK STATE
+                 # only, so this arm cannot know whether a lane could spend the room — the same gap the
+                 # `cascade_level` header and docs/ops/self-healing-contract.md §6 now state. Saying
+                 # "actionable" here made the consumption site disagree with the decision site about
+                 # one question, in a comment that a reader would take as a guarantee.
+                 CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;
+        *) : ;;   # 5 = nothing above → issues; `?` = unmeasured → decide nothing (see cascade_level)
+      esac
+    fi
   fi
   # ⛔ THE PASS ENDED WITH WORK WAITING AND NO ROOM: that is the one state in which the interval is
   # worth spending on a poll (`cascade_wait`) instead of a fixed nap. Work waiting means EITHER issue
