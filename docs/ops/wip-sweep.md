@@ -70,7 +70,18 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
 - **Bounded twice.** `--max N` (default 25) caps ARCHIVES per pass, and the pass budget
   (`WIP_SWEEP_BUDGET`, default 900 s) bounds the WHOLE pass: it is tested before every examination, not
   only before an archive, so a pass over a checkout with hundreds of CLEAN worktrees is still bounded by
-  the budget rather than by `worktree_count x WIP_SWEEP_STATUS_TIMEOUT`.
+  the budget rather than by `worktree_count x WIP_SWEEP_STATUS_TIMEOUT`. It is also tested **before every
+  repo after the first**, so a multi-repo pass cannot walk one full listing per remaining repo after the
+  budget is spent; a repo it did not reach is recorded `unreached` (`deferred-pass-budget`), counted in
+  `deferred=`, so the index still accounts for it.
+  ⛔ **The exact bound is `WIP_SWEEP_BUDGET` + at most ONE repo listing (`WIP_SWEEP_STATUS_TIMEOUT`),
+  not the budget alone**, and the repo-level listing probe is deliberately **not** clamped with
+  `cap_timeout` the way the in-examination calls are. Clamping it would turn "out of time" into a
+  timeout, and the list probe answers a timeout with `worktree-list-failed`/`worktree-list-unverifiable` —
+  i.e. `FAILED`, exit 3 — so a deferral would be reported as a repository that cannot be read. Measured:
+  an unguarded loop took 24 s against a 2 s bound over 4 hanging repos, and a `cap_timeout` clamp turned
+  the pass into exit 3 "failed" instead of exit 1 "incomplete". Size a reclaim timeout against the sum,
+  not against the budget.
   ⛔ **And every bounded call INSIDE an examination is clamped to what is left of the budget** — the
   verdict, the commit count, the age read, the rescue and the origin read-back all run under
   `min(their own bound, remaining budget)`. Without that, the true worst case was
@@ -341,7 +352,8 @@ cannot be misread as "nothing was at risk".
   two post-rescue failure rows, `archived-but-ref-unparsed` and `rescue-exit-<rc>`, which carry `-` and
   fail the pass anyway), and the pass record carries `unpushed_worktrees=<n>`. Three row classes cannot say — `cannot-verify` (the pass
   fails, exit 3), and `skip` / `unreached` (no examination happened) — and none of the three can end as
-  a green pass when work was left behind. On a
+  a green pass when work was left behind **on a repository this pass enumerated** (`unreached` makes the
+  pass `incomplete`; a `skip` row's two flavours are the bare-repo gap stated below). On a
   box about to be reclaimed those commits die with it unless the branch is pushed; archiving branch
   commits is a separate capability and is not claimed here.
   ⛔ **On a quiesce those commits are now a REFUSED `DONE`**, not merely a line above it: the hook reads
@@ -354,6 +366,13 @@ cannot be misread as "nothing was at risk".
   nowhere and do NOT make a quiesce refuse. That is a declared gap, not a coverage claim: closing it
   needs a bounded per-repo `rev-list --count --all --not --remotes` cross-check, which changes this
   counter's unit from worktrees to refs and belongs with **#3484**'s typed index.
+  ⛔ **The same gap covers a BARE repository**, and the "no green pass over left-behind work" story does
+  not hold for it: a bare repo is recorded `skip` (`bare-repo-no-working-tree`) and returns before the
+  unpushed count is taken, so a bare mirror holding thousands of commits no remote has still reads
+  `status=ok`. Measured on a fixture: `status=ok rc=0 … skipped=1 unpushed_worktrees=0`, one `skip` row
+  with `unpushed=-`. It cannot reach a quiesce `DONE` — a bare `$REPO` stops the quiesce earlier, at the
+  missing `$HARNESS/claims.sh` — but a box-wide `WIP_SWEEP_REPOS=A:B` pass can name one, so do not read a
+  green pass as "no branch commits are stranded in bare repos".
 - **It never deletes, and it changes no working tree.** It adds commits to `refs/wip/<slug>` on
   ORIGIN; inside the examined worktree's own repository it writes two refs — the local pin
   `refs/wip-local/<slug>`, and the fetched copy of origin's snapshot `refs/wip-remote/<slug>` that the

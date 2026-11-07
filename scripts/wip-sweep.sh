@@ -991,8 +991,37 @@ sweep_repo() {
 note "pass start mode=$MODE_WORD max=$MAX budget=${BUDGET}s repos=${#REPOS[@]} watchdog=$TB_TIMEOUT_KIND"
 note "index: $RECORD"
 
+# Counts the repos this pass has STARTED, not finished — the first is always attempted (see the loop).
+_repos_done=0
+
 
 for one in ${REPOS[@]+"${REPOS[@]}"}; do
+  # ⛔ THE BUDGET BOUNDS THE REPO LOOP TOO (#3588 review, cycle 10). The budget was tested before every
+  # EXAMINATION, but the loop over REPOS was unguarded, so the pass could walk every remaining repo and run
+  # one full repo-level probe for each — `WIP_SWEEP_BUDGET=2 WIP_SWEEP_STATUS_TIMEOUT=8` over 4 repos whose
+  # `worktree list` hangs took 24 s against a 2 s bound. That matters because the caller is a quiesce whose
+  # operator sizes the reclaim timeout against this number: the reclaim can then kill the pass MID-ARCHIVE
+  # with `status=running` and no `NOT DONE`. A repo the budget did not reach is RECORDED as unreached, not
+  # skipped in silence, so the index still accounts for every repo the pass was asked about.
+  # ⛔ THE REPO-LEVEL CALLS ARE DELIBERATELY *NOT* `cap_timeout`-CLAMPED, and that is the difference between
+  # a deferral and a lie. A clamped call that runs out of budget times out, and the list probe answers a
+  # timeout with `worktree-list-failed`/`worktree-list-unverifiable` — i.e. `FAILED`, exit 3. Measured: it
+  # turned this very arm into exit 3 "failed" instead of exit 1 "incomplete", and broke C5. So the bound
+  # here is stated as what it is (`WIP_SWEEP_BUDGET` + at most one repo listing), never tightened by turning
+  # "out of time" into "the repository is unreadable".
+  # ⛔ `_repos_done` GUARDS THE FIRST REPO, and the guard is the point (#3588 review, cycle 10). With a
+  # budget already spent during startup, an unconditional check here recorded the ONLY repo as `unreached`
+  # and never listed it — a pass that examined nothing and reported only "out of time". The bound that was
+  # actually wrong is the one on the REMAINING repos (budget + one listing each), so the first repo is
+  # always attempted and its rows go through the normal flush/defer path (arms C5/C5c keep pinning that
+  # path); every repo after it is the overrun this guard removes.
+  _repos_done=$((_repos_done + 1))
+  if [ "$_repos_done" -gt 1 ] && budget_exhausted; then
+    BUDGET_STOPPED=1
+    record "$one" "-" "-" "-" "unreached" "-" "-" "-" "-" "deferred-pass-budget"
+    N_DEFERRED=$((N_DEFERRED + 1))
+    continue
+  fi
   # ⛔ BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE — and this is on the quiesce path, before the box is
   # destroyed. The `! A && ! B` form also keeps the live list honest: an UNREADABLE repo and a repo
   # that is neither a work tree nor bare both land in the same refusal, and neither reads as swept.
