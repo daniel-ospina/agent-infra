@@ -79,6 +79,18 @@ O="$TMP/O"; mkdir -p "$O/state" "$O/logs" "$TMP/bin"
 # still a comparison, still a refusal path (driven in spawn-gate.test.sh §12, which owns the floor's
 # arithmetic and asserts the shipped default under `env -u`).
 export MEM_MIN_AVAIL_MB=1
+# ⛔ AND THE BOX ENV FILE IS NEUTRALISED, FOR THE SAME REASON ONE LAYER UP (measured on a real box,
+# 2026-11-07). `lane.sh` sources `lane-env.sh`, which sources `${ENV_FILE:-$HOME/keys.env}` and
+# DOCUMENTS that "the file wins" over the inherited environment — deliberately, because on the
+# controller path the file is read after the environment. The consequence for THIS suite is that a box
+# whose `keys.env` sets any knob an arm pins (`MAX_LOAD=20` on the box that measured this) silently
+# overwrites the arm's own value: §1's LOAD arm passes `MAX_LOAD=0`, nothing refused, and the arm
+# measured the BOX and reported a `land` refusal instead of its subject. That is a false RED which
+# teaches an operator to ignore the suite, and it is not a property of the code under test.
+# ENV_FILE is the seam the shipped code already provides, so nothing is patched or rewritten: the file
+# is still sourced exactly as on the controller path, it just carries nothing. The gate still probes,
+# compares and refuses — this is hermeticity, not a switch.
+ENV_FILE="$TMP/box-env.empty"; : > "$ENV_FILE"; export ENV_FILE
 LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; CLAIMS="$HERE/claims.sh"
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
