@@ -5480,6 +5480,15 @@ assert_not_contains "$RECORD_ERR" "The marker is kept in" \
     "14.1d(i) …whose exit-5 message does NOT offer --flush-pending as a remedy for bytes that were never persisted"
 assert_contains "$RECORD_ERR" "NOTHING IS ON DISK EITHER" \
     "14.1d(i) …but names the real state instead"
+# ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
+# `post_review_evidence_comment` runs INSIDE this arm and, when its comment READ
+# fails too, used to print "The signed record AND THE BODY MARKER are unaffected" —
+# on the very stream whose other two lines say the marker is on no channel and not on
+# disk. A caller cannot know the marker survived; that sentence asserted it anyway.
+assert_not_contains "$RECORD_ERR" "and the body marker are unaffected" \
+    "14.1d(i) …and NO line in the capture claims the body marker survived a failed persist"
+assert_contains "$RECORD_ERR" "This line makes NO CLAIM about the body marker" \
+    "14.1d(i) …the comment-read failure instead defers to the persist line that decides it"
 rm -f "$PEND_CONF_DIR/pending"
 mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
 
@@ -5849,13 +5858,14 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       by EVERY later minting run.
 #       ⛔ WHAT THIS ROW DOES **NOT** PROVE: that this PR anchored `post_marker()`. It did
 #       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
-#       (`git show origin/main:scripts/record-review.sh | sed -n 1939p`), and the diff
-#       hunk at scripts/record-review.sh:1995-2005 only ADDS A COMMENT above it — the
-#       predicate line is CONTEXT. Reverting this PR leaves this vector GREEN; it is kept
+#       (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED
+#       because `origin/main` moves and a bare "main :NNNN" rots the moment it does → :2482),
+#       and the only diff hunk at `post_marker()` (head :2524) ADDS A COMMENT above it — the
+#       predicate line (head :2546) is CONTEXT. Reverting this PR leaves this vector GREEN; it is kept
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
-#       sites already anchored on main (`:1939`, `:3643`, `:5956`, `:6068`).
+#       sites already anchored on main (bd1b205d :4186 :6501 :6613 / head :4272 :6625 :6770).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
