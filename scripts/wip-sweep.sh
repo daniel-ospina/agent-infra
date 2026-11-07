@@ -86,10 +86,18 @@
 # THE INDEX (acceptance item: "each `refs/wip/*` carries its issue link; a ref without one is
 # reported"). Every worktree examined adds one TSV row to $WIP_SWEEP_RECORD:
 #
-#   ts  repo  path  branch  head  verdict  paths  age_h  issue  ref  note
+#   ts  repo  path  branch  head  verdict  paths  age_h  issue  ref  note  unpushed
 #
-# `issue` is derived from the branch name — the first 2-8 digit run the harness's own lane branches
-# carry (`feat/8090-tm`, `fix/3442-nonvacuity`, `rescue/3442-earlier-attempt`). A dirty worktree whose
+# Twelve fields, matching `record()`'s `printf` and the header row it writes — an 11-field list here left
+# every column after `ref` mis-resolved for anyone reading this comment as the spec.
+#
+# `issue` is COPIED from the classifier: `bg-rescue-wip.sh --verdict` prints `issue=<N>` beside the
+# `slug=` it named the ref from, and both come from the one `wip_ref_parts` call that trusts only a
+# `<type>/<N>` prefix (`feat/8090-tm`, `fix/3442-nonvacuity`, `rescue/3442-earlier-attempt`). ⛔ IT IS NOT
+# RE-DERIVED HERE, and a digit scan is NOT the rule: measured against the real classifier, `fix/lane-3485`
+# carries NO issue (the ref is `fix-lane-3485`) while `fix/1-x` DOES (`issue-1-x`) — so a "first 2-8 digit
+# run" scan is wrong in both directions, which is exactly the two-answer divergence #3484 closed. A
+# classifier that prints no `issue=` field reads as `-` (under-claim). A dirty worktree whose
 # branch yields NO issue link is REPORTED (`issue=-`, one loud line, and `no_issue=N` in the pass
 # record): the archive still exists on origin, but nothing ties it to the issue it belongs to, and
 # searching the existing refs — inconsistently named, because the slug is sometimes an issue number and
@@ -303,6 +311,12 @@ bounded_lib_path() {
   # bare `( . "$cand" && tb_resolve_timeout )` then returns that 0 before the resolver is ever asked —
   # measured with a stub that exists and exits 0: the check passed and the box read as sweepable.
   local probe=""
+  # ⛔ THIS ONE CANNOT BE WATCHDOG-BOUNDED: it is how the watchdog is found, so `tb_timeout` does not exist
+  # yet (chicken-and-egg, not an oversight). What it runs is a LOCAL file whose only job is to define
+  # `tb_resolve_timeout` — it starts no subprocess and reaches no network — so the doc's bound claim
+  # ("no unbounded call that can reach the network") still holds and now says so explicitly, naming this
+  # probe and `rescue_usable` as the two the watchdog does not cover. A candidate that hangs here is a
+  # broken install in a way no arm can cheaply fixture; it is a named residual, not a silent one.
   probe="$(bash -c '. "$1" >/dev/null 2>&1; if command -v tb_resolve_timeout >/dev/null 2>&1 && tb_resolve_timeout >/dev/null 2>&1; then printf USABLE; fi' _ "$cand" 2>/dev/null)"
   [ "$probe" = USABLE ] || return 1
   printf '%s' "$cand"
@@ -357,6 +371,8 @@ rescue_usable() { # rescue_usable <path> — it must actually ANSWER in its docu
   # before the box goes"). `</dev/null` because a candidate that reads stdin would otherwise consume or
   # wait on the CALLER's input. `tb_timeout` is available here: the library was sourced above,
   # `tb_resolve_timeout` has succeeded, and `STATUS_TIMEOUT` is already validated.
+  # ⛔ AND THE BOUND IS PINNED (R4/R4b in wip-sweep.test.sh): the arm asserts the refusal AND the elapsed
+  # time, and reddens when this prefix is removed (measured: 30 s elapsed with STATUS_TIMEOUT=1).
   out="$(tb_timeout "${STATUS_TIMEOUT:-60}" bash -- "$1" --verdict /nonexistent-wip-sweep-usability-probe </dev/null 2>/dev/null)" || :
   case "$out" in *verdict=*) return 0 ;; esac
   return 1
