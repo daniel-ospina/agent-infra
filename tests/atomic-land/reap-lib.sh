@@ -36,7 +36,17 @@ is_running() { # <pid> — ALIVE, not merely present: a killed child of ours is 
   # family only ever targets same-user processes, and an unconfirmable target must not be
   # signalled anyway — see `reap_pid`'s identity rule.)
   kill -0 "$1" 2>/dev/null || return 1
-  case "$(ps -o stat= -p "$1" 2>/dev/null)" in
+  # ⛔ THE EXIT STATUS DECIDES WHETHER THERE IS AN ANSWER AT ALL (#3622 review round 6, P2).
+  # The rule above is "`ps` must not be able to disarm the bound", and an EMPTY answer was the
+  # only shape it guarded. A `ps` that FAILS can still WRITE TO STDOUT — a wrapper, a shim, a
+  # future procps printing a usage/legend banner — and an unanchored `*Z*` matches the `Z` in
+  # "Z zombie": measured 2026-11-07 with a `ps` that printed `Z zombie` and exited 1, this
+  # function answered GONE for a LIVE pid, so the guard took its `exit 0` ("the rail stopped
+  # on its own") over a running rail — the round-2 fail-open through a second door. So only an
+  # EXIT-0 `ps` is allowed to say "zombie"; a failed one falls through to ALIVE, fail-closed.
+  local st
+  st="$(ps -o stat= -p "$1" 2>/dev/null)" || return 0
+  case "$st" in
     *Z*) return 1 ;;   # a corpse is not running: only `ps` can tell us that
   esac
   return 0

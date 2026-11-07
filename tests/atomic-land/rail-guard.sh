@@ -18,7 +18,10 @@
 #                 NOT "fire now". The old inline loop had no lower guard, so `0` fired on its
 #                 first iteration — a caller that reads "0 seconds" as "no patience" would get
 #                 the opposite of what it expects. No caller passes 0 today; both meanings are
-#                 stated so the next one cannot guess wrong.)
+#                 stated so the next one cannot guess wrong. `0` is also the ONLY spelling of
+#                 it that is accepted — `00` is REFUSED (exit 2) rather than silently read as
+#                 "no time limit", because `[ "$limit" -gt 0 ]` is false for it and the limit
+#                 arm would go inert with no message.)
 #   <ident>       the rail's start stamp (`proc_ident`). A CAPTURED stamp makes a recycled pid
 #                 not-ours, so THAT pid is never signalled; a BLANK stamp (the capture failed)
 #                 forfeits the protection and the reap still proceeds — reaping is this
@@ -122,12 +125,39 @@ if [ "$#" -lt 3 ]; then
   exit 2
 fi
 sup="$1"; limit="$2"; pid="$3"; ident="${4:-}"
+# ⛔ THE TWO PIDS GET A VALUE-CHECK, because a NEGATIVE pid here is not an argument error — it
+# is a SIGNAL TARGET. `kill -0 -1` succeeds ("every process I may signal") and
+# `ps -o stat= -p -1` ERRORS, so `is_running -1` answers ALIVE and `still_ours -1` is TRUE;
+# the guard would poll to its limit and then execute `kill -9 -1` — SIGKILL to every process
+# this user owns (on a fleet box: the orchestrator and every other lane). Measured 2026-11-07
+# (#3622 review round 6, P2): `is_running -1` → rc 0. Symmetrically a negative `sup` makes the
+# supervisor arm silently ALWAYS-true (`kill -0 -1`), which is the inert-enforcer shape this
+# change exists to remove. The shipped caller always passes a real `$!`, so this is
+# defence-in-depth for the SEPARATELY-INVOCABLE use the header advertises (7g/7h drive it).
+for _p in "$sup" "$pid"; do
+  case "$_p" in
+    ''|*[!0-9]*) echo "rail-guard: <supervisor-pid> and <pid> must be positive integers (got '$sup', '$pid')" >&2; exit 2 ;;
+  esac
+  # Value-by-range for the same reason as the limit below: a literal too wide makes `[ -gt 0 ]`
+  # ERROR, and a failing `[` is FALSE — which would refuse a valid pid, so refuse it BY NAME.
+  [ "$_p" -gt 0 ] 2>/dev/null \
+    || { echo "rail-guard: pid '$_p' is not a positive process id" >&2; exit 2; }
+done
 case "$limit" in ''|*[!0-9]*) echo "rail-guard: the limit must be a non-negative integer" >&2; exit 2 ;; esac
-# ⛔ VALUE, not shape: `[ "$limit" -gt 0 ]` below is FALSE for `00` (all digits, not the string
-# 0) and ERRORS for a literal too wide, and a failing `[` is FALSE — either way the limit arm
-# goes silently inert and only supervisor-death bounds the rail. Refuse both instead.
-[ "$limit" -le 86400 ] 2>/dev/null \
-  || { echo "rail-guard: the limit must be 0..86400 seconds (got '$limit')" >&2; exit 2; }
+# ⛔ VALUE AND SPELLING, not shape alone. `0` is the ONE spelling of "no time limit"; `00` is
+# all digits and is NOT the string `0`, and `[ "$limit" -gt 0 ]` below is FALSE for it — so a
+# caller that meant "0 seconds = no patience" and wrote `00` would get the OPPOSITE: the limit
+# arm goes silently inert and only supervisor-death bounds the rail. A literal too wide for
+# that test ERRORS, and a failing `[` is FALSE — the same inert arm, with no message. So the
+# only accepted zero is exactly `0`, and every other value must be 1..86400.
+# (Measured 2026-11-07, review round 6: this check was `[ "$limit" -le 86400 ]` alone, which
+# ACCEPTS `00`, while the comment above it claimed both were refused. The caller in run.sh
+# refuses 00/0000 with its own `*[1-9]*` test; this is the guard's matching half, so the two
+# validators cannot disagree silently.)
+if [ "$limit" != "0" ]; then
+  [ "$limit" -ge 1 ] 2>/dev/null && [ "$limit" -le 86400 ] 2>/dev/null \
+    || { echo "rail-guard: the limit must be 0, or 1..86400 seconds (got '$limit')" >&2; exit 2; }
+fi
 
 started="$SECONDS"
 why=""
