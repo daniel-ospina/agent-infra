@@ -279,10 +279,14 @@ jobs:
         #
         # Placed in THIS job and not as a new shard deliberately: `pipeline-compliance`
         # is the repo's only required check (#646) and runs on every PR, so this is the
-        # one place the suite blocks a merge — and the shard lane is already at its
-        # runtime bound (`script-validate`'s "Bash shards" step was cancelled at 110 min
-        # on 2026-11-01), so adding a shard would buy the same coverage at the cost of a
-        # lane that is already timing out.
+        # one place the suite blocks a merge — and the shard lane was already at its runtime
+        # bound when this was written (`script-validate`'s "Bash shards" step was cancelled at
+        # 110 min on 2026-11-01), so adding a shard would have bought the same coverage at the
+        # cost of a lane that was already timing out. That lane is now an 8-way slice with a
+        # 40-minute step bound inside an 80-minute job (agent-infra#2483; the 70-minute bound is
+        # `ci.yml`'s `bash-suites`, NOT this lane — quote the lane you mean), so the constraint this
+        # paragraph describes has changed shape; the reasoning is kept because it is why the copy
+        # lives here.
         #
         # Also: the comment job's OWN copy was moved to run before its live step
         # (see that job), because a self-test that is a LATER step of a job is skipped
