@@ -6,7 +6,7 @@ doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, issue-3429, issue-3584, gh-rate-limits, gh-limit, gh-cred, github-app-installation
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, issue-3429, issue-3584, issue-3627, gh-rate-limits, gh-limit, gh-cred, github-app-installation
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -1179,7 +1179,10 @@ checkout. So no deploy can propagate it.
   arm to start covering issue reads.
 
   ⛔ **AND READ THE MEASUREMENT AS AN UPPER BOUND, NOT A COUNT.** `app-refused` is the arm a widened
-  grant would shrink, so `gh-cred.py --stats` for `issue` argvs answers "has the grant taken effect?".
+  grant would shrink, so the `app-refused` count BEFORE and AFTER the grant is what answers "has the
+  grant taken effect?". (Note `--stats` is per-ARM and takes no arguments — it cannot slice by argv;
+  `~/.pi/agent/gh-cred/decisions.log` is where the per-argv lines are, one `arm=… kind=… argv=…` row
+  per decision, if an issue-only figure is needed.)
   But `app-refused` deliberately covers EVERY non-rate-limit app failure — a genuine 404 for a
   deleted PR or a bogus path lands there too — so the count is an upper bound on permission refusals,
   not a measure of them. Splitting 404 into its own arm would sharpen it, and is NOT done here: the

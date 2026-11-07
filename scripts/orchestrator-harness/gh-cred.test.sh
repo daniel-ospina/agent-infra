@@ -661,6 +661,14 @@ ck "_epoch() is DST-insensitive (the JULY Z stamp is the one the old mktime form
    "$(TZ=Europe/Madrid python3 - "$CRED" <<'PY'
 import importlib.util, sys, os, time
 time.tzset()
+# ⛔ THE PROBE ITSELF NEEDS A GUARD. This assertion discriminates the fix ONLY on a DST-observing
+# zone: with no `Europe/Madrid` tzdata (scratch/distroless images, reduced tzdata) `time.timezone`
+# falls back to 0, the two terms stop cancelling, and the PRE-FIX `mktime() - time.timezone` form
+# returns the correct 1783378800 — i.e. the row would silently certify a fix it never exercised, which
+# is exactly the failure it was added to kill, relocated to a host property (measured: TZ=Nope/Nowhere
+# → old == new == 1783378800). Fail LOUDLY instead of vacuously.
+if time.timezone != -3600:
+    print(1); raise SystemExit
 spec = importlib.util.spec_from_file_location("gc_epoch_probe", sys.argv[1])
 gc = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(gc)
