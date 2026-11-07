@@ -603,8 +603,8 @@ if [ "$(id -u)" != 0 ]; then
   chmod 000 "$T/deep/locked"
   ck "j18 a set behind a denied ancestor is INVALID (5, broken), NOT NO-REPO-SET (3, absent)" \
      '[ "$(run_reader_rc "$T/deep/locked/repos.conf" list)" = 5 ]'
-  ck "j19 …and it says the file is not VISIBLE and warns against creating it, rather than diagnosing a cause" \
-     'o="$(run_reader "$T/deep/locked/repos.conf" list)"; printf "%s" "$o" | grep -q "not visible from here" && printf "%s" "$o" | grep -q "Do not create the file"'
+  ck "j19 …and it names the ERRNO class and warns against creating it, rather than diagnosing a cause" \
+     'o="$(run_reader "$T/deep/locked/repos.conf" list)"; printf "%s" "$o" | grep -q "cannot be STAT" && printf "%s" "$o" | grep -q "Do not create the file"'
   chmod 755 "$T/deep/locked" 2>/dev/null
 fi
 
@@ -637,8 +637,40 @@ ck "j24 a mode-111 parent still proves absence (\`x\` is what stat needs; \`r\` 
 # ⛔ "COULD NOT ASK" MUST NOT READ AS "THE PROOF HELD" (review round 10, P2).
 NODOC="$T/no-doctor"; mkdir -p "$NODOC/lib"
 cp "$READER" "$NODOC/lib/repo-set.sh"
-ck "j25 without pr-doctor.py beside it the whole-set proofs are SKIPPED WITH A WARN, not silently green" \
-   'REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check 2>&1 | grep -q "WHOLE-SET-PROOFS-SKIPPED"'
+ck "j25 without pr-doctor.py beside it the whole-set proofs are SKIPPED WITH A WARN, and the verdict is NOT a refusal" \
+   'o="$(REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check 2>&1)"; printf "%s" "$o" | grep -q "WHOLE-SET-PROOFS-SKIPPED" && REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check >/dev/null 2>&1'
+
+# ⛔ THE TWO MUTATIONS THAT WERE GREEN (review round 11, P2): a sibling doctor that EXISTS and imports
+# but LACKS `configured_repos`, and one whose `configured_repos` RAISES. Both are "could not ask", and
+# both must WARN + pass. Deleting the sentinel, or restoring round 10's first cut (WARN *then* still
+# refuse), must redden HERE — it did not before this arm existed.
+for _v in missing raises; do
+  ND="$T/nodoc-$_v"; mkdir -p "$ND/lib"
+  cp "$READER" "$ND/lib/repo-set.sh"
+  if [ "$_v" = missing ]; then
+    printf 'def _slug_from_remote(u):\n    return ""\n\ndef _normalize_slug(v):\n    return ""\n\ndef _origin_slug(p):\n    return "", "stub"\n\ndef set_tag_collisions(e):\n    return ""\n' > "$ND/pr-doctor.py"
+  else
+    printf 'def _slug_from_remote(u):\n    return ""\n\ndef _normalize_slug(v):\n    return ""\n\ndef _origin_slug(p):\n    return "", "stub"\n\ndef set_tag_collisions(e):\n    return ""\n\ndef configured_repos(e=(), env=None):\n    raise RuntimeError("boom")\n' > "$ND/pr-doctor.py"
+  fi
+  if REPO_SET_FILE="$CONF" bash "$ND/lib/repo-set.sh" check >/dev/null 2>&1; then
+    ok "j27-$_v a sibling doctor whose configured_repos is $_v ABSTAINS (rc 0), it does not refuse the set"
+  else
+    bad "j27-$_v expected rc 0 (abstain), got a non-zero verdict"
+  fi
+  if REPO_SET_FILE="$CONF" bash "$ND/lib/repo-set.sh" check 2>&1 | grep -q "WHOLE-SET-PROOFS-SKIPPED"; then
+    ok "j28-$_v …and it says which proof did not run"
+  else
+    bad "j28-$_v expected the WHOLE-SET-PROOFS-SKIPPED WARN"
+  fi
+done
+
+# ⛔ A NON-ABSENCE STAT FAILURE MUST NOT READ AS ABSENT (review round 11, P2): `-e` false covers
+# EACCES/EPERM (TCC under a MODE-traversable ancestor), ENAMETOOLONG and EIO too. The errno decides.
+LONGNAME="$T/$(printf 'a%.0s' $(seq 1 300))/repos.conf"
+ck "j29 a path that cannot be STAT'd for a reason other than absence is INVALID (5), not NO-REPO-SET (3)" \
+   '[ "$(REPO_SET_FILE="$LONGNAME" bash "$READER" list >/dev/null 2>&1; echo $?)" = 5 ]'
+ck "j30 …and it names the errno class rather than telling the operator to create the file" \
+   'REPO_SET_FILE="$LONGNAME" bash "$READER" list 2>&1 | grep -q "cannot be STAT"'
 
 # ⛔ THE DIVERGENCE NAMES THE ENTRY THAT DIVERGED, WITH ITS OWN EXPECTED VALUE (review round 10, P2).
 printf 'slug=daniel-ospina/tortoise checkout=%s\nslug=daniel-ospina/agent-infra checkout=%s\302\240\n' \

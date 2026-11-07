@@ -163,13 +163,47 @@ _rs_nearest_existing_ancestor() {
 
 # _rs_doctor_available — can the sibling `pr-doctor.py` be asked at all? The delegated proofs need BOTH
 # the file and an interpreter, and "could not ask" must never be read as "the proof held".
-_rs_doctor_available() {
-  [ -n "$(_rs_doctor_py)" ] || return 1
+# _rs_py_resolve — the interpreter, resolved the same way the wrapper resolves it (`command -v python3`,
+# then the two absolute paths launchd needs when it has no PATH of its own). ONE home for that order.
+_rs_py_resolve() {
   local c
   for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
-    command -v "$c" >/dev/null 2>&1 && return 0
+    if command -v "$c" >/dev/null 2>&1; then command -v "$c"; return 0; fi
   done
-  return 1
+  return 0
+}
+
+_rs_doctor_available() {
+  [ -n "$(_rs_doctor_py)" ] || return 1
+  [ -n "$(_rs_py_resolve)" ] || return 1
+  return 0
+}
+
+# _rs_stat_kind <path> — `present` | `absent` | `denied` | `other` | `unknown`.
+#
+# ⛔ `[ ! -e ]` DOES NOT MEAN "ABSENT", AND THE ANCESTOR WALK ALONE CANNOT TELL (review round 11, P2).
+# `-e` is false for EVERY stat failure: ENOENT (absent), EACCES/EPERM (a denial — TCC denies at an
+# ancestor while that ancestor's MODE still reads traversable, which is exactly how the walk above gets
+# it wrong), ENAMETOOLONG, EIO. A denial read as absence means the box DEGRADES on a set that exists and
+# is told to create it — the round-9 P2 this arm keeps trying to close, surviving one errno over.
+# Bash cannot see the errno; python can, and the same interpreter is already resolved for the doctor.
+_rs_stat_kind() {
+  local p="${1:-}" py
+  py="$(_rs_py_resolve)"
+  [ -n "$py" ] || { printf 'unknown'; return 0; }
+  "$py" - "$p" <<'PY_STAT' 2>/dev/null || printf 'unknown'
+import os, sys
+try:
+    os.stat(sys.argv[1])
+except FileNotFoundError:
+    print("absent")
+except PermissionError:
+    print("denied")
+except OSError:
+    print("other")
+else:
+    print("present")
+PY_STAT
 }
 
 _rs_norm_path() {
@@ -336,8 +370,28 @@ repo_set_parse() {
   # not traversable — the macOS TCC shape, `~/Documents` with no Full Disk Access — absence cannot be
   # proven, and that is the broken state (5).
   if [ ! -e "$f" ]; then
-    local anc; anc="$(_rs_nearest_existing_ancestor "$f")"
-    if [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; then
+    local anc kind; anc="$(_rs_nearest_existing_ancestor "$f")"
+    kind="$(_rs_stat_kind "$f")"
+    # ⛔ THE ERRNO DECIDES WHEN IT CAN (review round 11, P2). `-e` false covers ENOENT, EACCES/EPERM
+    # (a TCC denial under a MODE-traversable ancestor), ENAMETOOLONG and EIO; only the first is absence.
+    # When no interpreter resolves, `unknown` falls back to the ancestor walk below and the narrower
+    # claim in its message ("we cannot see it") is the honest one.
+    case "$kind" in
+      denied|other)
+        _rs_say 2 "repo-set: INVALID — $f cannot be STAT'd, and the failure is NOT "no such file""
+        _rs_say 2 "repo-set:   (errno reported: $kind). That is the BROKEN state, not the absent one: this"
+        _rs_say 2 "repo-set:   box may well have named its repos and this process cannot see them — a"
+        _rs_say 2 "repo-set:   permission denial on an ancestor (launchd has no Full Disk Access under"
+        _rs_say 2 "repo-set:   ~/Documents), a path that is too long, or an I/O error. Do not create the file;"
+        _rs_say 2 "repo-set:   check its location and the mode of the directories above it."
+        return 5 ;;
+    esac
+    if [ "$kind" = present ]; then
+      # `-e` false but stat succeeded: a link/race we do not model — broken, not absent.
+      _rs_say 2 "repo-set: INVALID — $f stat's but is not visible as a path; refusing to guess why."
+      return 5
+    fi
+    if [ "$kind" = absent ] || { [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }; then
       _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
       _rs_say 2 "repo-set:   Create it, one repo per line:"
       _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
