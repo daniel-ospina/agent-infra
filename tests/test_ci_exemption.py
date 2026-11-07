@@ -918,14 +918,22 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
 # certified. That is a deadlock, not an over-block.
 
 
-#: Real ids from the suite that REPORTED #3686 — the five below are tortoise's
-#: `tools/**/*.py` census ids as its CI printed them (`gh issue view 3686
-#: --comments` carries each parameter verbatim: `cache_evict.py`,
-#: `gen_placement_table.py`, `batch_open.py`, `test_design_map_check.py`, and the
-#: `[argv14-at the EDGE]` space id), copied here unchanged (`/` and space in the
-#: parameter). The next five are explicit SHAPE VECTORS for parameter characters
-#: no shipped id exercises, so a future narrowing of `rest` cannot pass by
-#: covering only the shape #3686 was reported for.
+#: Real ids from the suite that REPORTED #3686, copied unchanged from `gh issue
+#: view 3686 --comments` (which carries each parameter verbatim): four
+#: `tools/**/*.py` census ids — `cache_evict.py`, `gen_placement_table.py`,
+#: `batch_open.py`, `test_design_map_check.py` — and one `tests/test_pages_bindings.py`
+#: argv id whose parameter is `argv14-at the EDGE`. ⛔ NOT "five `tools/**/*.py`
+#: census ids" (review cycle 5, P2): the fifth is an argv census in another FILE,
+#: so the old sentence contradicted its own list.
+#:
+#: The next five are SHAPE VECTORS, and they are here for a shape and one
+#: character, not for "characters no shipped id exercises" — that wording was
+#: false for four of the five (review cycle 5, P2): an uppercase letter, a `-` and
+#: an `_` are already in the attested ids, and `[cache_evict]` adds NOTHING to the
+#: class. What they genuinely add is a CLASS SEGMENT (`TestK::test_param`) and
+#: `:`, the one parameter character the attested ids do not carry — the rest
+#: restate coverage so a narrowing of `rest` still has to face the parameter
+#: punctuation #3686 was not reported for.
 #:
 #: ⛔ TWO OF THE FIVE REAL IDS WERE NOT ATTESTED (review cycle 2, P2).
 #: `…[tools/longmem_eval/run.py]` and `tests/test_ci_selection.py::test_surface[…]`
