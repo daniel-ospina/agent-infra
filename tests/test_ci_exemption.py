@@ -919,10 +919,20 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
 
 
 #: Real ids from the suite that REPORTED #3686 — the five below are tortoise's
-#: `tools/**/*.py` census and shard ids as its CI printed them, copied verbatim
-#: (`/` and space in the parameter). The next five are explicit SHAPE VECTORS for
-#: parameter characters no shipped id exercises, so a future narrowing of `rest`
-#: cannot pass by covering only the shape #3686 was reported for.
+#: `tools/**/*.py` census ids as its CI printed them (`gh issue view 3686
+#: --comments` carries each parameter verbatim: `cache_evict.py`,
+#: `gen_placement_table.py`, `batch_open.py`, `test_design_map_check.py`, and the
+#: `[argv14-at the EDGE]` space id), copied here unchanged (`/` and space in the
+#: parameter). The next five are explicit SHAPE VECTORS for parameter characters
+#: no shipped id exercises, so a future narrowing of `rest` cannot pass by
+#: covering only the shape #3686 was reported for.
+#:
+#: ⛔ TWO OF THE FIVE REAL IDS WERE NOT ATTESTED (review cycle 2, P2).
+#: `…[tools/longmem_eval/run.py]` and `tests/test_ci_selection.py::test_surface[…]`
+#: appeared in NONE of #3686's measured blocks, and `test_ci_selection.py` defines
+#: no `test_surface` at all — so a nodeid naming it is not one any suite can
+#: print. They are replaced with two ids the issue record DOES carry, so
+#: "copied verbatim" is true of all five.
 #:
 #: ⛔ INCLUDING SPACE (#3686 second door). `[argv14-at the EDGE]` is a real id
 #: from a shipped suite and it was STILL dropped by both Python doors after `/`
@@ -930,8 +940,8 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
 _PARAM_SPACE_CORPUS = (
     "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
     "tests/test_entry_point_python_guard.py::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/gen_placement_table.py]",
-    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/longmem_eval/run.py]",
-    "tests/test_ci_selection.py::test_surface[tools/ci_selection.py]",
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/batch_open.py]",
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/test_design_map_check.py]",
     "tests/test_pages_bindings.py::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]",
     "tests/e2e/test_x.py::test_a[chromium-Claude Desktop]",
     "tests/test_a.py::test_param[a/b:c-d.e]",
@@ -1075,8 +1085,9 @@ def test_a_SPACE_PARAMETRIZED_ROTATING_identity_is_UNATTRIBUTABLE_not_EXEMPT():
     than the refusal it replaced.
 
     MUTATION: restore `raw.split()` in `parse_rotation_runs` → both ids shred into
-    fragments, the class is still reported rotating with the WRONG ids, the guard
-    misses the real id, and this test fails on `unattributable`.
+    fragments, and this test fails at the FIRST assertion below (`any(moved_b in s
+    …)`) — the shredding is caught before the verdict is even reached, so the
+    message names the reader, not `unattributable`.
     """
     moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
     moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
@@ -1156,11 +1167,37 @@ def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format():
         "second door's silent re-keying"
     )
 
-    # (2) the per-run sets: TAB-joined, never space-joined.
+    # (2) the per-run sets: TAB-joined, never space-joined — and ⛔ THE INVARIANT IS
+    # EXECUTED, NOT MERELY GREPPED (review cycle 2, P2). The first version asserted the
+    # `tr '\n' '\t'` text and the absence of the space join, and stayed GREEN under the
+    # tidy-up a future reader is most likely to make — appending `| sed 's/\t$//'`, the
+    # mirror of the trailing-space cleanup the OLD form carried. Under it, a run whose
+    # only failing id carries a space emits a TAB-FREE line, `parse_rotation_runs` takes
+    # its legacy fallback, the id is shredded, and E5 EXEMPTS a rotating identity — the
+    # fail-open this whole change exists to prevent, reachable with a zero-red suite.
+    # So the shipped pipeline is BOUND to its text and then RUN.
     assert "tr '\\n' '\\t'" in src, "the per-run producer is no longer TAB-joined"
     assert src.count("| tr '\\n' ' '") == 0, (
         "a per-run write is SPACE-joined again — a space-parametrized id would be "
         "shredded and E5 blinded"
+    )
+    join = "printf '%s\\n' \"$(printf '%s\\n' \"$ids\" | tr '\\n' '\\t')\""
+    assert join in src, (
+        "the per-run TAB join moved or was rewritten — this pin executes the script's "
+        "own pipeline text, so update it here in the same change"
+    )
+    single = "tests/test_x.py::TestK::t[argv14-at the EDGE]"
+    emitted = subprocess.run(
+        ["bash", "-c", 'ids="$1"; ' + join, "_", single],
+        capture_output=True, text=True, check=True,
+    ).stdout
+    assert "\t" in emitted.rstrip("\n"), (
+        "a SINGLE-id run emitted a TAB-FREE line, so the reader takes its legacy "
+        "space-split path and shreds a spacey id — E5 goes blind (the reading above)"
+    )
+    assert parse_rotation_runs(emitted) == [frozenset({single})], (
+        "the shipped producer's per-run line does not round-trip through the reader: "
+        f"{emitted!r}"
     )
 
 

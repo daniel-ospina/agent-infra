@@ -179,7 +179,7 @@ from pathlib import Path
 #: own suites actually PRODUCE — ``/``, space, and the pytest punctuation around
 #: them — rather than collapsed into the loose form. A parameter carrying some
 #: OTHER character is still rejected, and rejection is REPORTED (``rejected`` in
-#: :class:`RatesResult`, printed as ``NOTE : rejected main rate row:``), never
+#: :class:`RatesResult`, printed as ``NOTE  : rejected main rate row:``), never
 #: silently dropped: that is how a third gap would be MEASURED rather than
 #: discovered as a deadlock.
 _NODEID_RE = re.compile(
