@@ -148,9 +148,24 @@ REENTRANCY_ENV = "GH_LIMIT_LOCK_HELD"
 # The helper is a SIBLING, because both are deployed into ONE runtime dir by `deploy-harness.sh`
 # (`$O/gh-limit.py` and `$O/gh-cred.py`), and the same relative shape holds in `scripts/`.
 CRED_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh-cred.py")
-# The arm that served the MAIN call. It partitions the ETag/flight caches (see `_cred_digest`), so a
-# body or a 404 fetched with one credential is never replayed to the other.
-_CRED_ARM = "-"
+# The credential CLASS that produced the answer this process is about to cache. It is stamped into
+# every cache ENTRY (`cred:`), and `_cred_class_ok` refuses an entry from the other class — that is
+# what stops a body or a 404 fetched with one credential from being replayed to the other.
+#
+# ⛔ IT IS **NOT** PART OF THE CACHE KEY. `_cred_digest()` stays a pure function of the environment,
+# because `cache_key`/`flight_key` must be computable from an invocation ALONE (mixing the served arm
+# in was the first attempt and gh-limit.test.sh caught it: three assertions plant a flight claim
+# out-of-process by computing `flight_key(argv)`, and an arm that only exists after `main()` runs made
+# the key unreproducible, so the takeover/orphan-reclaim arms silently stopped being exercised).
+#
+# ⛔ AND IT HAS A MODULE-LEVEL DEFAULT (review P2). It used to be bound only by `main()` and by
+# `run()` via `global`, so every consumer (`_cred_class_ok`, `cache_put`, `pass_cache_put`,
+# `flight_publish`, `read_cache_put`) raised `NameError` if reached before either had run — and neither
+# `cache_put`'s `except OSError` nor `cache_get`'s `except (OSError, ValueError, binascii.Error)`
+# catches that. No production path reached it, but the PR's own §7 test had to plant the attribute by
+# hand (`m._CRED_CLASS = "app"`), which is the same defect seen from the other side: a guard with no
+# default. `user` is also the correct label for an unlabelled entry — it predates the layer.
+_CRED_CLASS = "user"
 _CRED_CACHE = {}
 _CRED_MOD = [None]
 
@@ -3589,16 +3604,14 @@ def main(argv):
     gh_argv = list(argv[i:])
     if real_gh is None:
         real_gh = os.environ.get("GH_LIMIT_REAL_GH") or resolve_real_gh(self_path)
-    # ⛔ RESOLVE THE CREDENTIAL ONCE, BEFORE any cache is keyed (#3429). `_cred_digest()` partitions
-    # the ETag/flight caches by the SERVED arm, so the arm has to be known before the first read of
-    # one; resolving here also bounds minting to one call per process.
-    global _CRED_ARM, _CRED_CLASS
+    # ⛔ RESOLVE THE CREDENTIAL ONCE HERE, BEFORE any cache ENTRY is written (#3429). `_CRED_CLASS` is
+    # stamped into every entry (`cred:`) and `run()` re-derives it per call; resolving here too bounds
+    # minting to one call per process. It is NOT part of the cache KEY — `_cred_digest()` stays a pure
+    # function of the ENVIRONMENT (see the module-level note on `_CRED_CLASS`).
+    global _CRED_CLASS
     if gh_argv and cred_purpose(gh_argv) == "request":
-        _decision = credential_for(gh_argv)
-        _CRED_ARM = _decision.arm
-        _CRED_CLASS = "app" if _decision.credential == "app" else "user"
+        _CRED_CLASS = "app" if credential_for(gh_argv).credential == "app" else "user"
     else:
-        _CRED_ARM = "meter" if gh_argv and cred_purpose(gh_argv) == "meter" else "plain"
         _CRED_CLASS = "user"          # the meter and introspection are pinned to the user credential
     if budget:
         snap = probe_budget(real_gh) if real_gh and os.path.isfile(real_gh) else None

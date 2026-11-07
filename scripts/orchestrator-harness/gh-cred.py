@@ -80,6 +80,7 @@
 """
 
 import base64
+import calendar
 import json
 import os
 import subprocess
@@ -107,7 +108,6 @@ FLOOR = int(os.environ.get("GH_CRED_FLOOR") or 500)
 RETIRE_MARGIN = int(os.environ.get("GH_CRED_RETIRE_MARGIN") or 300)
 
 MINT_TIMEOUT = float(os.environ.get("GH_CRED_MINT_TIMEOUT") or 10)
-PROBE_TTL = int(os.environ.get("GH_CRED_PROBE_TTL") or 3600)
 
 # Test/ops seams. `GH_CRED_NOW_CMD` is the same fake-clock contract gh-limit.py uses
 # (`GH_LIMIT_NOW_CMD`): the DECISION must stay assertable without sleeping out a real hour.
@@ -134,7 +134,6 @@ MINT_FAIL_FILE = "mint-failure.json"
 # the token lifetime rests on.
 MINT_COOLDOWN = int(os.environ.get("GH_CRED_MINT_COOLDOWN") or 60)
 BUDGET_FILE = "app-budget.json"
-COUNTER_FILE_LEGACY = "counters.json"
 DECISIONS_FILE = "decisions.log"
 
 DECISIONS_MAX_BYTES = 256 * 1024
@@ -333,13 +332,22 @@ def _json_or_none(raw):
 
 
 def _epoch(iso):
-    """GitHub's `expires_at` (e.g. 2026-11-06T23:00:00Z) to epoch. 0 when unparseable."""
+    """GitHub's `expires_at` (e.g. 2026-11-06T23:00:00Z) to epoch. 0 when unparseable.
+
+    ⛔ `calendar.timegm`, NOT `mktime() - time.timezone` (review note). `time.timezone` is a FIXED
+    offset with no DST term, so on a DST-observing host the cached expiry was an hour out for part of
+    the year — bounded and self-correcting (`RETIRE_MARGIN` re-mints, then the refusal takes the retry
+    arm), but wrong by construction. `timegm` reads the parsed struct fields as UTC, which is exactly
+    what GitHub sends (`Z`, i.e. `+0000`). (`strptime` KEEPS the offset in `tm_gmtoff` but does not
+    apply it to the fields, and `timegm` ignores `tm_gmtoff` — so this is correct for `Z` and would be
+    off by the offset for a `+0200` stamp, which no input path produces.)
+    """
     if not iso:
         return 0
     txt = str(iso).strip().replace("Z", "+0000")
     for fmt in ("%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
         try:
-            return int(time.mktime(time.strptime(txt, fmt)) - time.timezone)
+            return int(calendar.timegm(time.strptime(txt, fmt)))
         except Exception:
             continue
     return 0
@@ -549,8 +557,17 @@ def decide(kind, purpose="request", enabled=None, key_present=None, token_ok=Non
                     % ("unknown" if app_remaining is None else app_remaining))
 
 
-def resolve(kind, purpose="request", argv=None):
-    """Supply real inputs to `decide()` and record the outcome. THE only production entry point."""
+def resolve(kind, purpose="request", argv=None, record=True):
+    """Supply real inputs to `decide()` and record the outcome. THE only production entry point.
+
+    `record=False` is for the DIAGNOSTIC verbs (currently `--which`): they answer "what WOULD serve
+    this call", so they must not append a decision to `decisions.log` or bump a counter. A diagnostic
+    that counts mints a synthetic answer — it inflated the `app` arm in `--stats`, and under
+    `GH_CRED_ARM_OVERRIDE=user` a single `--which` made `--stats` exit 3 with
+    `READS-ON-USER-UNJUSTIFIED`, i.e. asking the question MOVED THE REGRESSION COUNTER it was asked to
+    explain (review P3). The mint itself is still performed: an operator debugging "why is this box on
+    the user bucket" needs the real token state, and a mint is not a counter.
+    """
     enabled = ENABLED_DEFAULT
     key_present = os.path.isfile(APP_KEY) and os.access(APP_KEY, os.R_OK)
     token_ok = None
@@ -581,7 +598,7 @@ def resolve(kind, purpose="request", argv=None):
                    token_ok=token_ok, app_remaining=remaining)
         d.token = token if d.credential == "app" else None
 
-    if purpose == "request":
+    if purpose == "request" and record:
         log("arm=%s kind=%s why=%r argv=%r" % (d.arm, kind, d.why[:120],
                                                (list(argv or [])[:6])))
         count(d.arm, kind)
@@ -779,7 +796,12 @@ def main(argv):
         # cannot be loaded the answer is `unproven`, which is the fail-closed default.
         args = rest[1:] if rest[:1] == ["--"] else rest
         kind = _authoritative_kind(args)
-        d = resolve(kind, "request", args)
+        # ⛔ AND IT RECORDS NOTHING (`record=False`): a diagnostic must not move the counters it
+        # exists to explain. It used to go through the recording path, so it inflated the `app` arm in
+        # `--stats` — and under `GH_CRED_ARM_OVERRIDE=user` a single `--which` made `--stats` exit 3
+        # with `READS-ON-USER-UNJUSTIFIED` (review P3). The mint still happens: an operator needs the
+        # real token state, and a mint is not a counter.
+        d = resolve(kind, "request", args, record=False)
         sys.stdout.write("credential=%s arm=%s kind=%s why=%s\n"
                          % (d.credential, d.arm, kind, d.why))
         return 0

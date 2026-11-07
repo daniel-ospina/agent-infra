@@ -614,6 +614,63 @@ fresh
 ck "…and a FAILING mint still reports failure to the caller (the cooldown hides no error)" \
    "$([ "$(GH_CRED_TEST_MINT_FAIL=1 python3 "$CRED" --token >/dev/null 2>&1; echo $?)" != 0 ] && echo 0 || echo 1)"
 
+# ── §9 the guard has a DEFAULT, and the diagnostic does not count ─────────────────────────────────
+echo "§9 a guard with no default, and a diagnostic that leaves no trace"
+# ⛔ `_CRED_CLASS` is read by EVERY cache consumer (`_cred_class_ok`, `cache_put`, `pass_cache_put`,
+# `flight_publish`, `read_cache_put`) and used to exist only after `main()`/`run()` bound it via
+# `global` — so a consumer reached first raised NameError, which no handler in those functions catches.
+# The PR's own §7 had to plant the attribute by hand, which is the same defect from the other side.
+ck "_CRED_CLASS has a module-level default (an unlabelled entry is 'user', and no NameError)" \
+   "$(python3 - "$LIMIT" <<'PY'
+import importlib.util, sys, tempfile, os
+os.environ.setdefault("GH_LIMIT_DIR", tempfile.mkdtemp())
+spec = importlib.util.spec_from_file_location("gl_default_probe", sys.argv[1])
+gl = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gl)
+if getattr(gl, "_CRED_CLASS", None) != "user":
+    print(1); raise SystemExit
+try:
+    gl.cache_put("default-probe", '"e"', b'{"x":1}')
+except NameError:
+    print(1); raise SystemExit
+print(0)
+PY
+)"
+
+# ⛔ A DIAGNOSTIC MUST NOT MOVE THE COUNTER IT EXPLAINS. `--which` runs the real decision path
+# (including a mint) and used to RECORD it too: that inflated the `app` arm in `--stats`, and under
+# `GH_CRED_ARM_OVERRIDE=user` a single `--which` made `--stats` exit 3 with READS-ON-USER-UNJUSTIFIED.
+fresh
+for _i in 1 2 3; do python3 "$CRED" --which -- pr view "$_i" >/dev/null 2>&1; done
+ck "three --which runs record NO decision (the diagnostic cannot move the counter)" \
+   "$([ ! -s "$TMP/cred/decisions.log" ] && echo 0 || echo 1)"
+fresh
+( export GH_CRED_ARM_OVERRIDE=user
+  for _i in 1 2 3; do python3 "$CRED" --which -- pr view "$_i" >/dev/null 2>&1; done
+  python3 "$CRED" --stats >/dev/null 2>&1; echo $? >"$TMP/wrc" )
+ck "  …so --which under ARM_OVERRIDE=user leaves --stats exiting 0 (not the 3 it used to cause)" \
+   "$([ "$(cat "$TMP/wrc")" -eq 0 ] && echo 0 || echo 1)"
+
+# ⛔ THE EXPIRY PARSE IS DST-INSENSITIVE, AND THE JULY STAMP IS THE ONE THAT PROVES IT. `mktime() -
+# time.timezone` has no DST term, so on a DST host a cached expiry was an hour out for part of the year.
+# ⛔ NOVEMBER ALONE IS NOT A TEST: under `TZ=Europe/Madrid` the winter offset IS `time.timezone`, so the
+# two terms cancel and the old expression returns the right number — a November-only assertion passes
+# on the pre-fix code and certifies a fix it never exercises (measured: July 1783375200 vs true
+# 1783378800; November 1794006000, correct either way). Both stamps are asserted, July last.
+ck "_epoch() is DST-insensitive (the JULY Z stamp is the one the old mktime form got wrong)" \
+   "$(TZ=Europe/Madrid python3 - "$CRED" <<'PY'
+import importlib.util, sys, os, time
+time.tzset()
+spec = importlib.util.spec_from_file_location("gc_epoch_probe", sys.argv[1])
+gc = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(gc)
+# Independently computed: date -u -d 2026-11-06T23:00:00Z → 1794006000
+#                       date -u -d 2026-07-06T23:00:00Z → 1783378800 (the old form gave 1783375200)
+ok = gc._epoch("2026-11-06T23:00:00Z") == 1794006000 and gc._epoch("2026-07-06T23:00:00Z") == 1783378800
+print(0 if ok else 1)
+PY
+)"
+
 echo
 printf '%s\n' "----------------------------------------"
 printf 'gh-cred: %d passed, %d failed\n' "$pass" "$fail"

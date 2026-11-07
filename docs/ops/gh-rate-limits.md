@@ -1154,6 +1154,48 @@ checkout. So no deploy can propagate it.
   `actions:read`, `contents:read`, `metadata:read` and nothing else. It **cannot** write, merge, push
   or comment. Revocation is one action (replace the key); live tokens then expire within the hour on
   their own.
+
+  ⛔ **AND THAT GRANT DOES NOT COVER ISSUES.** `contents:read` is files and commits; an *issue* is a
+  different resource family. Every issue read is therefore REFUSED by the installation — `403 Resource
+  not accessible by integration` where the call is REST (`gh api …/issues/…`), and a GraphQL `errors`
+  body for the `issue` subcommands, which go over the GraphQL transport — matches **no specific arm**,
+  takes the generic `app-refused` fallback, and is answered by the user credential: **two requests per
+  issue read, one burned on the app bucket**, and the spend **repeats on every call**, because a scope
+  refusal records no state (`_app_dry` only remembers a *rate-limit* refusal). A box whose installation
+  does not cover the repository it works on pays the app request forever rather than learning to skip
+  it. That is deliberate — a "this argv's app arm refuses" memory is cross-process product work, not
+  this change — and it is the cheap direction, but it should be known, not discovered from the meter.
+
+  It matters more than it sounds, because issue reads are the fleet's primary read surface. Verified
+  readers include `refresh-candidates.sh` (the board), `merged-not-closed.sh`, `merge-reminder.py`,
+  `turn-end.py`, `undelivered-answers.py`, `lane.sh`, `review-pr.sh` and `turn-classify.py` — so the
+  split this change exists to create does not cover them until the grant is widened.
+
+  **Widening the installation is an OWNER ACTION** — a permissions change on the GitHub App, not a
+  code change: grant **`Issues: read`** on the installation. There is no separate `issue_comments`
+  permission — issue comments sit UNDER the `Issues` permission (GitHub's App permission reference
+  lists `Comments` as an endpoint group inside `Issues`), so `Issues: read` covers `gh issue view`,
+  `gh issue list` and the comment endpoints together. Nothing in the code needs to change for the app
+  arm to start covering issue reads.
+
+  ⛔ **AND READ THE MEASUREMENT AS AN UPPER BOUND, NOT A COUNT.** `app-refused` is the arm a widened
+  grant would shrink, so `gh-cred.py --stats` for `issue` argvs answers "has the grant taken effect?".
+  But `app-refused` deliberately covers EVERY non-rate-limit app failure — a genuine 404 for a
+  deleted PR or a bogus path lands there too — so the count is an upper bound on permission refusals,
+  not a measure of them. Splitting 404 into its own arm would sharpen it, and is NOT done here: the
+  two-arm shape is the one this change pins in `gh-cred.test.sh` ("an installation 404 … named
+  arm=app-refused"), and reversing a pinned assertion to refine a diagnostic is not worth it inside a
+  fix round. Filed as #3627.
+
+  A **declared permission map** in `decide()` — routing an issue read straight to the user credential
+  so it never burns the app request — was considered and **rejected**, but NOT because the grant state
+  is unknowable: `POST /app/installations/{id}/access_tokens` returns the granted `permissions` map in
+  its 201 body, and `gh-cred.py:mint()` already receives that body (it reads `token` and `expires_at`
+  and drops the rest), so a LIVE grant map is one field away at zero extra requests. The reason is that
+  a **declared** map goes stale when the grant changes — and a stale map fails in the *dangerous*
+  direction (silently stranding reads on the user bucket, which is #3429's own defect), whereas the
+  current shape fails cheaply: one wasted request, attributed to a named arm. Plumbing the live map
+  into `decide()` is real follow-up work, not part of this change.
 - **A box without the key (the cells):** holds **no App secret at all** — blast radius zero. Its
   reads fall back to the user credential and report the named arm `no-key`, so an unprotected box is
   a *visible* condition rather than a silent one.
