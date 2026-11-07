@@ -1003,7 +1003,14 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
       if [ -n "$head" ]; then
         text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot and the environment allows it. **It is not waiting on a lane.**"
       else
-        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot — and if the review at that head has ALREADY run and found blocking issues, that verdict is in the reviewer's own comment and the fix is a new head, not another review. **It is not waiting on a lane.**"
+        # ⛔ EVERY TERMINAL STATE, NOT JUST ONE (review round 12, P3, measured): `review_action` returns 2 —
+        # TERMINAL, no dispatch, no window — for `issues` (rc=7) AND for `clean` (a record whose body marker
+        # is missing, i.e. `review-record-unbound`), and 3 for a spent cap (including the fail-closed cap of
+        # an unreadable ledger); none of the three shows in the PR body, and all three are reachable at this
+        # publish. Naming only the rc=7 class left the other two reading "a reviewer is coming" for a head
+        # the loop will never dispatch — and this marker is presence-keyed, so nothing later can supersede
+        # it. The text names all of them.
+        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot — and if the review at that head has ALREADY run and found blocking issues, OR a review record exists that the gate cannot bind, OR this head's review attempts are spent (including when its attempt ledger cannot be read), then no reviewer is coming: that verdict is in the reviewer's own comment or in that record, auto-rail records nothing itself, and the fix is \`record-review.sh\` or a NEW head. **It is not waiting on a lane.**"
       fi;;
     review-in-flight)
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;

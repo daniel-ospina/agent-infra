@@ -2153,6 +2153,16 @@ case "$_cap" in
   *'ALREADY run and found blocking issues'*) ;;
   *) bad "the HEADLESS 'awaiting-review' must name the other real outcome — a head whose review already ran and found blocking issues is not dispatchable — otherwise the comment's only reading is 'a review is coming'" ;;
 esac
+# ⛔ AND EVERY TERMINAL STATE MUST BE NAMED, NOT JUST rc=7 (review round 12, P3, measured): review_action
+# returns 2 (TERMINAL, no window) for `clean` too — a record whose body marker is missing — and 3 for a spent
+# cap including the fail-closed cap of an unreadable ledger. None of the three shows in the PR body, all three
+# are reachable at the cap-deferral publish, and this marker is presence-keyed so nothing later supersedes it.
+for _term in 'a review record exists that the gate cannot bind' 'review attempts are spent'; do
+  case "$_cap" in
+    *"$_term"*) ;;
+    *) bad "the HEADLESS 'awaiting-review' must name the terminal state '$_term' — review_action answers TERMINAL for it at a head the body cannot show, so omitting it promises a reviewer that will never be dispatched, in a marker nothing can supersede" ;;
+  esac
+done
 _b5=$(wc -l < "$POSTED")
 publish_review_state acme/widget 42 awaiting-review 5656565656565656565656565656565656565656
 _hk=$(sed -n "$(( _b5 + 1 )),\$p" "$POSTED")
