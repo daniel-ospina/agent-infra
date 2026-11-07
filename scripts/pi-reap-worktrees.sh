@@ -330,13 +330,15 @@
 #   * `git ls-remote` (#3041) is the ONE probe that can cross a network. THREE cost models, and they
 #     no longer coincide: the ADVERTISEMENT (`ls-remote --heads <remote>`) runs at most ONCE PER
 #     REMOTE PER PASS since #3371 and is CLASSIFICATION evidence only; and `remote_holds_recheck` pays
-#     a TARGETED `ls-remote --heads <remote> refs/heads/<branch>` TWICE for a `remote-holds` row —
-#     once at classification and once at the fork (measured on cmux/cell-3, 2026-11-07: 12 targeted
-#     probes = 7.54 s wall (0.63 s each), versus 0.56 s for the remote's whole 2,111-head
-#     advertisement). ⛔ SO THE `remote-holds` HALF OF THE POPULATION IS PER-ROW AGAIN, in BOTH
-#     phases — an earlier version of this bullet said "only the destructive act pays the old
-#     per-REMOVAL price", which is false: the classification-time targeted probe is paid by rows that
-#     are later preserved by `clean_gate`/gate (b) and never become destructive. What #3371 did buy is
+#     a TARGETED `ls-remote --heads <remote> refs/heads/<branch>` TWICE for a row that REACHES THE
+#     FORK — once at classification, once at the fork; a row preserved earlier (`clean_gate` #1/#2,
+#     gate (b), the evidence ladder, re-check #0's `holder_recheck`) pays the classification probe only
+#     (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each), versus
+#     0.56 s for the remote's whole 2,111-head advertisement). ⛔ SO THE `remote-holds` HALF IS PER-ROW
+#     IN THE CLASSIFICATION PHASE, and per-row in the removal phase only for rows that get that far —
+#     an earlier version of this bullet said "only the destructive act pays the old per-REMOVAL
+#     price", which is false: the classification-time targeted probe is paid by rows that
+#     are later preserved and never become destructive. What #3371 did buy is
 #     that the `remote-only-ref` half is free, and that the whole remote need not be re-advertised per
 #     candidate. A TRANSPORT
 #     failure is remembered per remote for the rest of the pass (a dead remote must not spend the
@@ -2440,9 +2442,13 @@ path_ctime() {
 # against tortoise's real origin (2,111 heads): 12 targeted probes = 7.54 s wall (0.63 s each),
 # the remote's WHOLE head advertisement = 0.56 s. REAP_WT_GIT_TIMEOUT is 20 s, so FIFTEEN
 # candidate probes that each hit the bound is the entire REAP_WT_BUDGET_SECONDS=300 budget — the tail
-# then DEFERS, PRUNE_BLOCKED=1, and an armed pass reclaims nothing. ⛔ AND A REMOVAL NOW PAYS TWO
-# TARGETED PROBES (classification, then the fork re-check), so ~7-8 `remote-holds` removals that each
-# hit the bound are the whole budget, not fifteen. That is "the reaper cannot
+# then DEFERS, PRUNE_BLOCKED=1, and an armed pass reclaims nothing. ⛔ BUT A DEAD-REMOTE TIMEOUT
+# CANNOT EXHAUST THE BUDGET BY ITSELF (#3371 review cycle 8, P2): `remote_is_dead` is read at
+# `remote_holds_probe` BEFORE the advertisement, so the next candidate for that remote short-circuits
+# with ZERO probes — a transport failure costs at most ONE extra timeout PER REMOTE, not one per row.
+# The shape that really can reach 300 s is a remote that answers SLOWLY BUT SUCCESSFULLY (rc 0, no
+# mark): at 0.63 s/probe that is ~200 removals, and at a 19 s probe the tail DEFERs. No cache bounds
+# that one. That is "the reaper cannot
 # finish a pass" reached from the cost side, with no single gate wrong. The advertisement is cached
 # per pass (`remote_advertise`) and a TRANSPORT failure is still remembered (`remote_mark_dead`),
 # so a dead remote costs one timeout rather than one per candidate.
@@ -2657,11 +2663,13 @@ remote_holds_recheck() { # <path> <sha> <reason> [phase] -> 0 to proceed, 2 to P
     run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
         ls-remote --heads "$best" "refs/heads/$branch"; rc=$?
     # ⛔ A TRANSPORT FAILURE IS REMEMBERED, exactly as the classification probe remembers it (#3371
-    # review cycle 2, P2). Without this a remote that dies mid-pass costs REAP_WT_GIT_TIMEOUT (20 s)
-    # PER `remote-holds` REMOVAL — seven or eight of which are now the whole
-    # REAP_WT_BUDGET_SECONDS=300, because a removal pays TWO targeted probes (classification and fork),
-    # so the tail DEFERs, PRUNE_BLOCKED=1, and an armed pass reclaims nothing: the F7/#3371 state this
-    # file argues against. ⛔ `rc` IS CAPTURED ON THE LINE AFTER THE CALL (#3371 review cycle 4, P3):
+    # review cycle 2, P2). A remote that dies mid-pass then costs at most ONE extra
+    # REAP_WT_GIT_TIMEOUT: `remote_is_dead` is read at `remote_holds_probe` BEFORE the advertisement, so
+    # every later candidate for that remote short-circuits with ZERO probes. ⛔ An earlier version of
+    # this comment claimed "seven or eight such removals are the whole budget" — that is UNREACHABLE,
+    # because the first timeout marks the remote and the second row never probes at all. What this arm
+    # actually buys is bounding a dead remote to one timeout per pass (the pre-#3371 shape, which paid
+    # it per candidate). ⛔ `rc` IS CAPTURED ON THE LINE AFTER THE CALL (#3371 review cycle 4, P3):
     # the invariant "only a non-zero rc marks it dead" is exactly what a future edit in between would
     # break silently. ⛔ ONLY a non-zero rc marks it dead: a branch DELETED on the remote answers rc 0
     # with an empty advertisement, which is a legitimate "not advertised" => preserve, never "dead".
