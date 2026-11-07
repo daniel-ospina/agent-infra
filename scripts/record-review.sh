@@ -1282,7 +1282,7 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
   local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" _needle="" stated_from="" stated_to="" stated_from_sha="" sfr="" range_ok=""
-  local thr=0 prior_head="" prior_verdict="" _pf=""
+  local thr=0 surf_out="" prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1319,23 +1319,30 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   # (4b) THE TARGET HEAD'S HEALTH — clause (E) of the carry, applied here for the
   # same reason it applies there. A delta re-attests an OLD verdict over a NEW
   # head, so it must not put a signed `clean` on a head whose own checks are
-  # measurably failing. POLARITY: only an EXPLICIT green (rc 1) proceeds — every
-  # other status refuses, including one this case does not name. Three outcomes are
-  # DOCUMENTED (#2342: red / unreadable / green), but a four-outcome future, or a
-  # helper whose own last command cannot run, must not fall through as "not red":
-  # that is the enum-allow-list error the verification-state rule in AGENTS.md names
-  # ("an unnamed value must never be allowed to fall through a gap"), and the carry
-  # arm 2,300 lines below already implements exactly this polarity — this arm was
-  # the odd one out (found by review: a stubbed rc 3 was ACCEPTED and minted clean).
+  # measurably failing.
+  # ⛔ (#3440 follow-up) THIS ARM USED TO CALL `target_head_red`, WHICH NO LONGER
+  # EXISTS — dead code removed with its last caller, while this one was left behind
+  # (see the note where it lived). The call then failed as `command not found`,
+  # `thr` was captured as 127, and EVERY delta — acceptance arms included — was
+  # refused with "check surface returned status '127'". The whole `--evidence
+  # delta:` direction was dead and the suite said so (1134 pass / 45 fail).
+  # The scan is therefore called DIRECTLY, and its mapping is clause E's, exactly as
+  # the note where `target_head_red` lived says it was preserved: a REFUSED read is
+  # not evidence (rc != 0 → refuse); a read whose verdict is `red` refuses; a read
+  # that answered anything else (`green`, and the deliberately-not-refused
+  # `in_flight`/`empty`) continues. `empty` is not GREEN and never becomes one —
+  # the record carries `unknown` — but refusing it here would deadlock a required
+  # check whose only run is the excluded gate (#2342).
   thr=0
-  target_head_red "$to" || thr=$?
-  case "$thr" in
-    1) : ;;   # the ONLY green: measured, non-red
-    0) echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
-       return 1 ;;
-    *) echo "   delta: the target head's check surface returned status '$thr', which is neither a measured green nor a known red — a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
-       return 1 ;;
-  esac
+  surf_out="$(check_surface_scan "$to")" || thr=$?
+  if [ "$thr" -ne 0 ]; then
+    echo "   delta: the target head's check surface returned status '$thr', which is neither a measured green nor a known red — a read this code cannot interpret is not a pass, so the range is not verified. Retry rather than record." >&2
+    return 1
+  fi
+  if [ "${surf_out%%$'\n'*}" = "red" ]; then
+    echo "   delta: the TARGET HEAD ${to:0:12}… IS MEASURABLY RED — a delta re-attests an earlier verdict onto this head, and putting a signed 'clean' on a head whose own checks are failing is the false-green clause (E) exists to stop. Re-run the failing checks, or record a fresh verdict at this head." >&2
+    return 1
+  fi
   # (5) THE CHECKOUT. Fail closed: an unreadable range is not evidence.
   if ! root="$(delta_git_root)"; then
     echo "   delta: cannot read the range from a checkout of ${REPO:-<no repo>} (run inside the PR's worktree, or set DELTA_GIT_DIR). A range this box cannot read cannot be verified, and an unverified range is not evidence." >&2
@@ -3378,8 +3385,14 @@ check_surface_scan() { # <sha>
 # code — and a DEAD second polarity that three comments still cite is a trap: its mapping
 # folds `empty` into "not shown red" while `cc_surface_gate` treats empty as "not green", so the
 # next editor could adopt the wrong one believing it is THE predicate. The mapping it encoded is
-# preserved exactly where it is used now (clause E: red → refuse, unanswered-but-read →
-# continue, refused read → refuse), and no name with a divergent meaning is left behind.
+# preserved exactly where it is used now (clause E, and the delta's (4b) target-head arm: red →
+# refuse, unanswered-but-read → continue, refused read → refuse), and no name with a divergent
+# meaning is left behind.
+# ⛔ AND ITS LAST CALLER WAS *NOT* THE ONLY ONE (measured 2026-11-07). One caller survived the
+# deletion — `delta_verify` (4b) — so every `--evidence delta:<A>..<B>` record died on `command not
+# found` (status 127 → "not a measured green", refused), taking the whole range-scoped direction
+# with it while the note above claimed the name was gone. Removed names must be checked by CALLER,
+# not by memory: `command grep -n '<name>' $(git ls-files 'scripts/*.sh')` after a deletion.
 
 if [ "$CHECK_CARRY" -eq 1 ]; then
   # #3315 — WHICH RECORD THIS QUESTION IS ABOUT. Default: this box's record FILE
