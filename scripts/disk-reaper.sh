@@ -11,9 +11,16 @@
 #   earlier on cell-3, ~/.cache/uv alone was 7.1 GB; clearing it freed 6-7 GB
 #
 # THE FLEET ALREADY HAD A POLICY OWNER FOR EACH CLASS — and no one thing that ran them. SEVERAL
-# scheduled ad-hoc reaps existed, among them `cloud-cell-supervisor.sh prune`, the hourly cache
-# pass inside `orch-loop.sh`, `pi-reap-worktrees-launchd.py` (macOS only), and the per-owner
-# launchd units in `templates/launchd/` (`pi-cache-reap` hourly, `worktree-hygiene` every 6 h).
+# scheduled ad-hoc reap PASSES existed, among them `cloud-cell-supervisor.sh prune` (the one whose
+# cache arm is ARMED — `pi-cache-reap.sh --apply`, cloud-cell-supervisor.sh:4875, unattended under
+# pressure), the hourly cache pass inside `orch-loop.sh` (which hardcodes `--dry-run`,
+# orchestrator-harness/orch-loop.sh:4246), `pi-reap-worktrees-launchd.py` (macOS only, so cells had
+# nothing), and the per-owner launchd units in `templates/launchd/` (`pi-cache-reap` hourly,
+# `worktree-hygiene` every 6 h). MOST SHIPPED DISARMED (#1678): both unit templates hardcode
+# `--dry-run` (com.eldato.pi-cache-reap.plist:89, com.tortoise.worktree-reaper.plist:129; arming =
+# edit that argument + re-run `install-launchd.sh`), and `worktree-hygiene` renders `--dry-run`
+# unless the box is armed (`~/.pi/agent/state/worktree-hygiene.armed`). On a default install only
+# `prune` reclaims and the rest merely report, so this header must not credit them with reaping.
 # NO COUNT is claimed: the point is not how many there were, it is that none of them answered
 # "is this box being reaped, and how much did the last pass free?". This script is the
 # CONSOLIDATION, not another policy: it OWNS NO DELETION RULE of its own. It resolves, schedules

@@ -33,15 +33,26 @@ the shipped 3600 s was half of it — see the class note below), and the vendor'
 
 ## Why one entry point
 
-The fleet already reaped ad hoc in **several** scheduled places — among them
-`cloud-cell-supervisor.sh prune`, the hourly cache pass inside `orch-loop.sh`,
-`pi-reap-worktrees-launchd.py` (macOS only, so cells had nothing), the hourly
-`com.eldato.pi-cache-reap.plist` unit, and the 6-hourly
-`com.tortoise.worktree-hygiene.plist` (whose step 1 is `pi-reap-worktrees.sh` —
-rendered `--apply` only on an armed box, `--dry-run` otherwise: the tracked
-template carries `{{WORKTREE_HYGIENE_MODE}}`, which `install-launchd.sh`
-resolves from `~/.pi/agent/state/worktree-hygiene.armed`, #1678). No single one
-answered *"is this box being reaped, and how much did the last pass free?"* — and
+The fleet already ran ad-hoc reap passes from **several** scheduled places —
+among them `cloud-cell-supervisor.sh prune` (the one whose cache arm is ARMED:
+it reaches `pi-cache-reap.sh --apply` at `cloud-cell-supervisor.sh:4875`,
+unattended under pressure), the hourly cache pass inside `orch-loop.sh`, the
+`pi-reap-worktrees-launchd.py` unit (macOS only, so cells had nothing), the
+hourly `com.eldato.pi-cache-reap.plist` unit, and the 6-hourly
+`com.tortoise.worktree-hygiene.plist` (whose step 1 is `pi-reap-worktrees.sh`).
+
+**Most of those shipped DISARMED, deliberately** (#1678: "the reaper may run
+unattended; arming it may not"): the loop's cache pass hardcodes `--dry-run`
+(`scripts/orchestrator-harness/orch-loop.sh:4246`) and so do both unit
+templates — `com.eldato.pi-cache-reap.plist:89`,
+`com.tortoise.worktree-reaper.plist:129` — where arming is an owner edit of that
+argument plus an `install-launchd.sh` re-run; `worktree-hygiene` instead renders
+`--apply` only on an armed box, `--dry-run` otherwise, from
+`{{WORKTREE_HYGIENE_MODE}}`, which `install-launchd.sh` resolves from
+`~/.pi/agent/state/worktree-hygiene.armed`. So on a default install only the
+`prune` path reclaims anything and the rest merely report, which is the
+distinction this page exists to stop blurring. No single one answered *"is this
+box being reaped, and how much did the last pass free?"* — and
 **no count is claimed here**, because a count is the claim
 that made this page wrong in the first place: the point is not how many triggers
 existed, it is that none of them could answer that question. This is the
