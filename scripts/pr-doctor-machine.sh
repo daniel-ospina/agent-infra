@@ -177,13 +177,15 @@ case "$_rc" in
     # wrapper REFUSED every pass the doctor would run, on the migration state every box is in today.
     # `_rs_strip` asks the same parser the doctor uses, and falls back to the sed form only when the
     # doctor cannot be asked at all (in which case nothing else here can be proved either).
+    # ⛔ THE FALLBACK IS GATED ON "THE DOCTOR CANNOT BE ASKED", NOT ON "THE RESULT IS EMPTY" (review
+    # round 10, P2). Round 9's first cut reinstated the RAW value whenever the strip produced nothing,
+    # so a seam that is entirely a non-ASCII space — which `str.strip()` legitimately empties — came
+    # back as the original NBSP and the wrapper refused a pass the doctor ran with `REPO` instead.
+    # Empty is a legitimate ANSWER here; only an unavailable doctor is a reason to fall back.
     _trim() {
-      local v="${1:-}" out
-      out="$(_rs_strip "$v")"
-      if [ -z "$out" ] && [ -n "$v" ]; then
-        out="$(printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
-      fi
-      printf '%s' "$out"
+      local v="${1:-}"
+      if _rs_doctor_available; then _rs_strip "$v"; return 0; fi
+      printf '%s' "$v" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//'
     }
     _seam="$(_trim "${PR_DOCTOR_REPO:-}")"
     _seam_dir="$(_trim "${PR_DOCTOR_REPO_DIR:-}")"

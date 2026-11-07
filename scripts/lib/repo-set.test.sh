@@ -386,6 +386,8 @@ ck "f31 the refusal never says a repo is UNDECLARED when the line above says one
    'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "no USABLE repo" && ! printf "%s" "$o" | grep -q "no repo is DECLARED"'
 ck "f32 a REPO padded with a NON-ASCII space still RUNS (the trim is the doctor str.strip)" \
    'REPO_SET_FILE="$nofile" REPO="$T/tortoise"$(printf "\302\240") HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+ck "f33 a seam that is ENTIRELY a non-ASCII space does not flip the wrapper against the doctor" \
+   'REPO_SET_FILE="$nofile" OR="$(printf "\302\240")" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
@@ -596,8 +598,8 @@ if [ "$(id -u)" != 0 ]; then
   chmod 000 "$T/deep/locked"
   ck "j18 a set behind a denied ancestor is INVALID (5, broken), NOT NO-REPO-SET (3, absent)" \
      '[ "$(run_reader_rc "$T/deep/locked/repos.conf" list)" = 5 ]'
-  ck "j19 …and it says the file is unreadable rather than telling the operator to create it" \
-     'run_reader "$T/deep/locked/repos.conf" list | grep -q "cannot be READ"'
+  ck "j19 …and it says the file is not VISIBLE and warns against creating it, rather than diagnosing a cause" \
+     'o="$(run_reader "$T/deep/locked/repos.conf" list)"; printf "%s" "$o" | grep -q "not visible from here" && printf "%s" "$o" | grep -q "Do not create the file"'
   chmod 755 "$T/deep/locked" 2>/dev/null
 fi
 
@@ -613,6 +615,31 @@ ck "j20 a state dir reached via a NOT-YET-CREATED dir's \`..\` is refused BEFORE
 mkdir -p "$ST/s/new"
 ck "j21 …and the same verdict AFTER it exists (no flip)" \
    '[ "$(run_reader_rc "$T/state-flip.conf" check)" = 1 ]'
+
+# ⛔ FIRST-INSTALL MUST REACH THE DEGRADED PATH (review round 10, P1). Round 9 proved absence only when
+# the IMMEDIATE parent was traversable, so a box that had never created `~/.config/orchestrator` read as
+# BROKEN (5), the wrapper REFUSED, and the documented single-repo mode was unreachable — while telling
+# that operator "the file exists" and "do not create it". Absence is proven by the NEAREST EXISTING
+# ancestor being traversable; only an untraversable one leaves it unprovable.
+FRESH="$T/fresh-home"; mkdir -p "$FRESH"
+ck "j22 a set at a path whose PARENTS do not exist yet is NO-REPO-SET (3), not broken" \
+   'REPO_SET_FILE="$FRESH/.config/orchestrator/repos.conf" bash "$READER" list >/dev/null 2>&1; [ $? = 3 ]'
+ck "j23 …and the wrapper reaches the DEGRADED path for it (the migration state this change serves)" \
+   'REPO_SET_FILE="$FRESH/.config/orchestrator/repos.conf" OR=daniel-ospina/tortoise HOME="$FRESH" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+ck "j24 a mode-111 parent still proves absence (`x` is what stat needs; `r` was over-blocking)" \
+   'mkdir -p "$T/m111"; chmod 111 "$T/m111"; if [ "$(id -u)" != 0 ]; then REPO_SET_FILE="$T/m111/repos.conf" bash "$READER" list >/dev/null 2>&1; _r=$?; chmod 755 "$T/m111"; [ "$_r" = 3 ]; else chmod 755 "$T/m111"; true; fi'
+
+# ⛔ "COULD NOT ASK" MUST NOT READ AS "THE PROOF HELD" (review round 10, P2).
+NODOC="$T/no-doctor"; mkdir -p "$NODOC/lib"
+cp "$READER" "$NODOC/lib/repo-set.sh"
+ck "j25 without pr-doctor.py beside it the whole-set proofs are SKIPPED WITH A WARN, not silently green" \
+   'REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check 2>&1 | grep -q "WHOLE-SET-PROOFS-SKIPPED"'
+
+# ⛔ THE DIVERGENCE NAMES THE ENTRY THAT DIVERGED, WITH ITS OWN EXPECTED VALUE (review round 10, P2).
+printf 'slug=daniel-ospina/tortoise checkout=%s\nslug=daniel-ospina/agent-infra checkout=%s\302\240\n' \
+  "$T/tortoise" "$T/agent-infra" > "$T/second-nbsp.conf"
+ck "j26 a fault on the SECOND entry is reported against entry 2, not entry 1" \
+   'o="$(run_reader "$T/second-nbsp.conf" check)"; printf "%s" "$o" | grep -q "entry 2 of this set" && printf "%s" "$o" | grep -q "agent-infra"'
 
 ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
    '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
