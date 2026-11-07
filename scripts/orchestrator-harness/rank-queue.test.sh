@@ -173,17 +173,22 @@ if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
     # A path may contain a TAB; the fields before it may not, so the reader rejoins `$4..$NF`.
     trap 'printf "%s\t%s\t%s\t%s\n" "E" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
     # ⛔ EVERY RECORD IS TAGGED WITH THE TRAP THAT WROTE IT (review P2/P3, cycle 97): `E` = an END state (this EXIT trap,
-    # or an `exit`/`return` about to run), `D` = a point-in-time state taken for `exec`. See `_opts_for` for why the
-    # distinction is load-bearing.
+    # or an `exit` about to run), `D` = a point-in-time state taken for `exec`, `T` = a point-in-time state taken when a
+    # driver INSTALLS its own `trap ... EXIT`. See `_opts_for` for why the distinction is load-bearing — and for why `T`
+    # is deliberately NOT one of the tags it reads.
     # ⛔ `return` IS NOT AN END STATE AND A SUBSHELL'S EXIT IS NOT THIS SHELL'S END (review P2, cycle 98). A top-level
     # `return` prints "can only 'return' from a function or sourced script" and the script CONTINUES (measured); an
     # interior `return` leaves the function, not the shell. Both used to write `E` and win. `exit` still does, and the
     # depth field keeps a subshell's record out of the verdict.
     # AND A DRIVER THAT REPLACES THE EXIT TRAP IS STILL OBSERVED (review P3, cycle 99): `trap ... EXIT` discards the
     # hook end record, so a CORRECT protected fixture that installs its own cleanup trap and falls off the end was
-    # false-blocked as NO RECORD (measured). The `trap` arm below takes the same point-in-time snapshot the `exec` arm
-    # takes, so the D-fallback answers and NO RECORD stays reserved for a shell that neither exited, exec'd, nor
-    # re-trapped. (Comments here must stay OUTSIDE the trap string: an apostrophe inside it ends the quoting.)
+    # false-blocked as NO RECORD (measured). The `trap` arm below therefore writes a `T` snapshot at TRAP-INSTALL time —
+    # and `T` is NOT an end state: the driver may `set -u`/`set +u` AFTER installing the trap, so `_opts_for` answers
+    # from `E`/`D` only and never falls back to `T`. That snapshot grades ONLY where the textual parser AGREES with it;
+    # on disagreement the exec sweep names the script UNOBSERVABLE rather than letting either source decide (the rule
+    # is stated in full at `T RECORDS ARE NOT A VERDICT`, below). NO RECORD stays reserved for a shell that neither
+    # exited, exec'd, re-trapped, nor wrote any snapshot at all.
+    # (Comments here must stay OUTSIDE the trap string: an apostrophe inside it ends the quoting.)
     trap 'case "$BASH_COMMAND" in
             exec[[:space:]]*) printf "%s\t%s\t%s\t%s\n" "D" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
             exit|exit[[:space:]]*) printf "%s\t%s\t%s\t%s\n" "E" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
@@ -3736,10 +3741,11 @@ while IFS= read -r _ex; do
   # the graded population is now exactly the logged one.
   exec_total=$(( exec_total + 1 ))
   # ⛔ AN EXECUTED SCRIPT THAT LEFT NO END STATE IS NAMED, NOT PARSED (review P2, cycle 98). A driver that installs its
-  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end writes NO record, so `_setu_verdict` silently
-  # falls back to the textual parser — and the parser grades a `case` arm or an uncalled `fin()` wrongly in BOTH
-  # directions (measured: a bare driver of that shape printed ✅, and a genuinely protected one was named). "Executed
-  # but unobservable" must never read as clean. Measured today: 172 executed paths, 172 with a record, 0 without.
+  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end leaves NO END-STATE record (before cycle 100 it
+  # left no record of any kind), so `_setu_verdict` would silently fall back to the textual parser — and the parser
+  # grades a `case` arm or an uncalled `fin()` wrongly in BOTH directions (measured: a bare driver of that shape printed
+  # ✅, and a genuinely protected one was named). "Executed but unobservable" must never read as clean. Measured today:
+  # 172 executed paths, 172 with a record, 0 without.
   if [ -z "$(_opts_for "$_ex")" ]; then
     # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two independent sources
     # answering the same question: agreement is evidence, disagreement means the state is NOT observable and must be
@@ -3765,7 +3771,7 @@ if [ -n "$exec_unobs" ]; then
   echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script replaces the hook's EXIT trap, so no end state was recorded; add an explicit \`exit 0\` (or drop the own trap) so the shell's end state is observable"
 fi
 if [ -n "$exec_norecord" ]; then
-  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that replaces the hook's EXIT trap and falls off the end does this)"
+  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no record AT ALL does this — e.g. it replaces the hook's EXIT trap with \`trap … 0\` and falls off the end, which installs no \`T\` snapshot either; \`trap … EXIT\` alone lands in the agreement test above, not here)"
 fi
 if [ -n "$exec_foreign" ]; then
   echo "      OUTSIDE \$TMP: the hook recorded an execution this sweep cannot grade —${exec_foreign} — a body run from outside the sandbox is outside the population the check names"
