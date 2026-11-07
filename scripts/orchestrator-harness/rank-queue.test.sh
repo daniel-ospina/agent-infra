@@ -1978,9 +1978,17 @@ sat_out="$(cat "$TMP/sat/out-sat" 2>/dev/null)"
 # ⛔ THE POLARITY IS GRADED, NOT JUST THE CLIP (review P3, cycle 42). Dropping the exists-gate made
 # every ORDINARY pass (no truncation, so no record) print "the tier-window record EXISTED but could not
 # be READ" — a claim about a file that does not exist — and this check stayed green because it only
-# forbade the clip. An absent record must print NEITHER clause.
+# forbade the clip. An absent record must print NO clause at all.
+# ⛔ AND IT IS ONE CLAUSE PER FAILURE, SO ALL OF THEM ARE FORBIDDEN (review P2, cycle 63). Cycle 43 split
+# that single sentence into `_sat_notopen` ("EXISTS but is NOT A REGULAR FILE, so this pass did NOT open
+# it") and `_sat_unread` ("EXISTED but could not be READ"), and the predicate below grew only the second:
+# with the exists-gate deleted the ordinary pass printed the NOT-A-REGULAR-FILE sentence — a claim about a
+# file that does not exist — and this check still passed (measured: 149/0, with the only red coming from
+# the mutation gate several hundred lines below, whose message names an anchor drift it did not measure).
+# A predicate that enumerates failures has to be re-enumerated when a failure is split.
 if [ -n "$sat_ctl" ] && ! grep -q 'windows=TRUNCATED' <<<"$sat_ctl" \
    && ! grep -q 'could not be READ' <<<"$sat_ctl" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$sat_ctl" \
    && ! grep -q 'carried no tier name this code recognises' <<<"$sat_ctl" \
    && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$sat_out"; then rc=0
 else rc=1; echo "      control (no .pool-sat) '$(printf '%s' "$sat_ctl" | tr '\n' '|' | head -c 200)' / saturated '$(printf '%s' "$sat_out" | tr '\n' '|' | head -c 260)'"; fi
@@ -2170,6 +2178,15 @@ MUT_NOSAT="$TMP/fns-nosat.sh"
 # `_mut_ok` is its OWN flag, never the previous check's `rc`: an earlier failure must not be able to
 # stand in for "the mutation was applied".
 _mut_ok=1
+# ⛔ THE GATE MEASURES WHAT IT BLAMES (review P2, cycle 63). `cmp`+`sed` can only report "the mutation did not
+# apply", and the message named an anchor drift — for the ONE case this half exists to catch, where the gate is
+# ALREADY GONE from the shipped function and `sed` therefore has nothing to delete. Ask for the gate first, so
+# that regression is reported as itself (and the control check above is where it must redden).
+_mut_gate="if [ -e \"\$o/.pool-sat\" ] || [ -L \"\$o/.pool-sat\" ]; then"
+if ! grep -qF "$_mut_gate" "$FNS" 2>/dev/null; then
+  _mut_ok=0
+  echo "      the .pool-sat EXISTS-GATE is not in the shipped function at all — there is nothing for this half to delete, so it grades nothing. That regression must redden the CONTROL check above (which forbids every clause an absent record may print), not this mutation gate"
+fi
 sed 's@^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then@  if false; then@' "$FNS" > "$MUT_NOSAT" 2>"$TMP/.mut-sed-err" || _mut_ok=0
 grep -q '^queue_order_from_pool() {' "$MUT_NOSAT" 2>/dev/null || _mut_ok=0
 cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null && _mut_ok=0
@@ -2358,7 +2375,12 @@ if ! grep -q 'windows=TRUNCATED' <<<"$_w14" && grep -q 'NO clip is asserted' <<<
 else rc=1; echo "      NUL mid-tier '$(printf '%s' "$_w14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) a NUL INSIDE a tier name is not promoted to a recognised tier" $rc
 
-# 14f) EVERY ARM THAT CAN CARRY THE CLIP DOES — INCLUDING THE ONES A NON-RACING PASS NEVER REACHES
+# 14f) EVERY ARM THAT CAN CARRY THE CLIP DOES — INCLUDING THE ONES A NON-RACING PASS NEVER REACHES.
+#      ⛔ THE POPULATION IS ENUMERATED, NOT ASSUMED (review P3, cycle 63): the WARN arm (`_u > 0 && _r > 0`,
+#      reachable on any MIXED pass) carries the clause too and used to be read by NOTHING — a one-word
+#      regression there was invisible. It is an arm of this table now. The ONE arm that deliberately carries
+#      no clause is the DRAINED one (see `empty`, below): an empty queue holds no row, so no row of a
+#      clipped tier can be sitting behind a lower one and the inversion this clause discloses cannot exist.
 #      (review P2, cycle 45). §14d grades the two arms a normal pass reaches, so deleting `$_sat_said` from
 #      the severity / severity-uncounted / totals / head arms left EVERY suite green: four disclosures the
 #      product promises and no test could miss. The counts the function reads back come from
@@ -2397,7 +2419,8 @@ for _arm14_case in \
   'severity|2 0 200|severity-first from the pool' \
   'uncounted|-|COUNT could not be read back' \
   'totals|1 0 200|does not add up to the queue' \
-  'head|2 0 999|names head #999'; do
+  'head|2 0 999|names head #999' \
+  'warn|1 1 200|not ranked by the pool at all'; do
   _al="${_arm14_case%%|*}"; _rest="${_arm14_case#*|}"
   _ac="${_rest%%|*}"; _am="${_rest#*|}"
   _ao="$(_arm14 "$_al" "$_ac")"
@@ -2458,7 +2481,8 @@ for _arm14m in \
   'severity|severity-first from the pool|2 0 200|severity-first from the pool' \
   'uncounted|COUNT could not be read back|-|COUNT could not be read back' \
   'totals|does not add up to the queue|1 0 200|does not add up to the queue' \
-  'head|names head #$_h|2 0 999|names head #999'; do
+  'head|names head #$_h|2 0 999|names head #999' \
+  'warn|not ranked by the pool at all|1 1 200|not ranked by the pool at all'; do
   _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _rest="${_rest#*|}"
   _mc="${_rest%%|*}"; _mm="${_rest#*|}"
   _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
@@ -2481,8 +2505,17 @@ for _arm14m in \
     rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename AND strip were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null; then
     rc=1; echo "      the $_ml arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the absence of the clause proves nothing"
-  elif grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
-  else rc=1; echo "      stripped-$_ml '$(printf '%s' "$_mo" | tr '\n' '|' | head -c 340)'"; fi
+  elif [ -z "$(printf '%s\n' "$_mo" | grep -F -- "$_mm" | head -1)" ]; then
+    rc=1; echo "      the $_ml arm's own line is not in the mutant's output at all — this check cannot see the arm it strips"
+  elif printf '%s\n' "$_mo" | grep -F -- "$_mm" | grep -q 'windows=TRUNCATED'; then
+    # ⛔ THE ARM'S OWN LINE IS THE SUBJECT, NOT THE WHOLE OUTPUT (review P3, cycle 63). The WARN arm fires
+    # ALONGSIDE the severity arm on a mixed pass, so "the output carries no clause" is false for a strip that
+    # worked perfectly: measured, the stripped run ended with `... (1 pool-ranked, 1 unranked at the tail) —
+    # windows=TRUNCATED(P1-severe): ...` from the severity line while the WARN line had lost its own. The
+    # clause has to be looked for on THE LINE THIS ARM WROTE; the whole-output form is only equivalent for an
+    # arm that is the sole emitter, which is exactly the assumption that hid this.
+    rc=1; echo "      stripped-$_ml still carries the clip ON ITS OWN LINE: $(printf '%s\n' "$_mo" | grep -F -- "$_mm" | head -1 | head -c 300)"
+  else rc=0; fi
   ck "non-vacuity: with the clip stripped from the $_ml arm ALONE its clause disappears" $rc
 done
 

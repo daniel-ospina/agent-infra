@@ -600,8 +600,22 @@ fi
 MUT_STALE="$T/mut-stale/refresh-candidates.sh"; mkdir -p "$T/mut-stale"
 sed 's/^rm -f "\$O\/\.pool-err" "\$O\/\.pool-read" "\$O\/\.pool-sat"$/rm -f "$O\/.pool-err" "$O\/.pool-read"/' \
   "$REFRESH" > "$MUT_STALE"
-if cmp -s "$REFRESH" "$MUT_STALE" 2>/dev/null; then
-  bad "truncation-stale: the reset-deletion mutation did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+# ⛔ THE GATE MEASURES THE TERM IT IS ABOUT (review P3, cycle 63). `cmp -s` cannot distinguish "the anchor
+# drifted" from "the reset no longer carries `.pool-sat` at all" — and the second IS the regression this half
+# exists to catch, so blaming the anchor sent the maintainer to the fixture instead of to the deleted term.
+# Ask for the term first (the `_arm14_mut` precedent: a POSITIVE measurement, then the byte comparison).
+# ⛔ TWO CAUSES, TWO MEASUREMENTS (review P3, cycle 63). Counting the term anywhere does not work: `.pool-sat`
+# also appears in the three WRITER lines, so a count of them is nonzero even with the reset term deleted
+# (measured: 4 occurrences in the shipped script, 3 after deleting the reset term — the first form of this gate
+# read that as "the anchor drifted"). The RESET LINE is the subject, so it is what is asked for: absent line =
+# the anchor drifted; present line without the term = THE REGRESSION this half exists to catch.
+_stale_reset="$(grep -E '^[[:space:]]*rm -f .*\.pool-err' "$REFRESH" 2>/dev/null | head -1)"
+if [ -z "$_stale_reset" ]; then
+  bad "truncation-stale: the entry reset line itself was not found (no 'rm -f ... .pool-err' line in the shipped script) — the fixture's anchor drifted, so this non-vacuity half grades nothing"
+elif ! grep -qF '.pool-sat' <<<"$_stale_reset"; then
+  bad "truncation-stale: the entry reset no longer carries .pool-sat AT ALL (its line is '$_stale_reset') — that IS the regression this half exists to catch, and there is no term for the mutation to delete"
+elif cmp -s "$REFRESH" "$MUT_STALE" 2>/dev/null; then
+  bad "truncation-stale: the reset-deletion mutation did not apply — the sed anchor drifted (the term IS present, so this half's own anchor is what to check), so this non-vacuity half grades nothing"
 else
   D2="$T/sat-writer-stale-mut"; mkdir -p "$D2/home" "$D2/bin" "$D2/o" "$D2/repo/.worktrees/dispatch-scout/tools"
   git init -q --bare "$D2/origin.git"; git init -q "$D2/repo"; git -C "$D2/repo" remote add origin "$D2/origin.git"
