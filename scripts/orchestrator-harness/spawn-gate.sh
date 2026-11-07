@@ -1166,6 +1166,17 @@ land_backlog_exempt() { # <issue> <owner/repo> -> prints the reason + ". ", rc 0
   case "$title" in
     *base-red*|*main-red*|*base\ red*|*main\ is\ red*|*main\ goes\ red*|*red\ main*)
       printf 'a base-red repair reduces the backlog for every PR behind it — exempt. '; return 0 ;;
+    # ⛔ THE TITLE THIS REPO ACTUALLY PRODUCES, OR THE EXEMPTION ABOVE IS INERT (bug, 2026-11-06).
+    # The six patterns were written for a naming convention nothing enforces, while the ONLY
+    # mechanism that files a main-red repair in this repo is `ci-main.yml`'s `auto-file-on-failure`,
+    # which titles its issue `main broken by merge: <failing jobs>`. "main broken by merge" matches
+    # NONE of the six (`broken`, not `-red`), so the exemption that this block's own header records as
+    # a decided policy has never fired for a single auto-filed repair. Widening to the filer's own
+    # wording implements the decision that is already recorded here — it introduces no policy.
+    # ⛔ IT IS SCOPED TO THE FILER'S PREFIX, not to the word "broken": a title must START with
+    # `main broken by merge` (case-folded, as `$title` already is) to match.
+    main\ broken\ by\ merge*)
+      printf 'a main-broken-by-merge repair reduces the backlog for every PR behind it — exempt. '; return 0 ;;
   esac
   return 1
 }
