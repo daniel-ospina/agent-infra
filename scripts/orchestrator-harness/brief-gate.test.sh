@@ -1043,19 +1043,19 @@ bash "$GATE" --check "$TMP/pw-keyless.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc
 sed 's|^WIP:.*|WIP:       keyless|' "$CANON" > "$TMP/pw-keyless-bare.txt"
 bash "$GATE" --check "$TMP/pw-keyless-bare.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H51b) …but a bare 'keyless' with no reason is not (got $rc)"
-# ⛔ THE SEPARATOR IS ANY WHITESPACE, NOT JUST A SPACE (cycle 12 review, P2). The classifier required a
-# literal space, so `keyless<TAB>— why` — the SAME documented third form, and a spelling the SHAPE parser
-# already accepts (`^keyless[ \t]+[^ \t]`) — was refused as UNKEYED, with a diagnostic about the key. A
-# false block introduced by the narrower of the two recognisers, with no arm either way. Measured on
-# byte-identical briefs: `origin/main` rc 0, the cycle-11 head rc 80. H51c is discriminating on its own
-# (it fails against that head); H51d is the parity it must not overshoot into — whitespace with no text
-# after it is refused, exactly as the shape parser decides.
+# ⛔ THE SEPARATOR IS ANY WHITESPACE, NOT JUST A SPACE (cycle 12 review, P2; the citation corrected in
+# cycle 13 — this comment first credited "the shape parser" with a test that no longer exists at this
+# head). On `origin/main` the only key test WAS the shape parser `_rest ~ /^keyless[ \t]+[^ \t]/`, which
+# is whitespace-general; `1519642ff` deleted that test and made the classifier the sole authority, and the
+# arm it introduced required a literal SPACE — so the move narrowed a spelling the base accepted. Measured
+# on byte-identical briefs: `origin/main` rc 0, the cycle-11 head rc 80 (UNKEYED, a diagnostic about the
+# key, for the documented third form). H51c is the row, and it discriminates on its own — it fails against
+# the cycle-11 head. No whitespace-ONLY parity row is asserted here because none is BUILDABLE: the WIP awk
+# trims trailing `[ \t]+` before the classifier sees the value, so such a fixture IS the bare-`keyless`
+# value H51b already covers (cycle 12 review, finding 2 — a row claiming otherwise would be vacuous).
 sed "s|^WIP:.*|WIP:       keyless$(printf '\t')— a diagnosis lane with no issue or PR key|" "$CANON" > "$TMP/pw-keyless-tab.txt"
 bash "$GATE" --check "$TMP/pw-keyless-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(H51c) …and a TAB is a separator too — the shape parser already accepted it (got $rc)"
-sed "s|^WIP:.*|WIP:       keyless$(printf '  ')|" "$CANON" > "$TMP/pw-keyless-trail.txt"
-bash "$GATE" --check "$TMP/pw-keyless-trail.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(H51d) …while 'keyless' + whitespace and NO reason after it is still refused (got $rc)"
+[ "$rc" -eq 0 ]; ck $? "(H51c) …and a TAB is a separator too — the base admitted this spelling (got $rc)"
 MUT_PW4="$TMP/mutant-pw-nokeyless.sh"
 sed 's|^      keyless\*)$|      keyless-NEVER*)|' "$GATE" > "$MUT_PW4"
 diff -q "$GATE" "$MUT_PW4" >/dev/null 2>&1; rc=$?

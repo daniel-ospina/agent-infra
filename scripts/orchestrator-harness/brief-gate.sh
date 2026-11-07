@@ -542,8 +542,8 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
           #    claim is ADMITTED (measured: base 80 → separator-revert 0, reddening
           #    H61['issue-<4242>4242>'] and nothing else in the suite). The two lines are a PAIR: the
           #    revert of `tail` alone is INERT here (`${nval#*>}` ≡ `${after#*>}`, since `after` always
-          #    holds the bracket close). What `tail`'s derivation decides is the ARROWED spelling — item 1
-          #    above, H55d/H57c — not the arrow-less one.
+          #    holds the bracket close). What `tail`'s derivation decides is the ARROWED spelling — the
+          #    `tail` paragraph above, H55d/H57c — not the arrow-less one.
           issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
           *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
@@ -566,14 +566,18 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
       issue-slot)  : ;;
       pr-slot)     case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       pr-[0-9]*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
-      # ⛔ ANY WHITESPACE SEPARATES `keyless` FROM ITS REASON — NOT JUST A SPACE (cycle 12 review, P2).
-      # This arm required a literal space, so `keyless<TAB>— why` was classified UNKEYED and refused with
-      # a diagnostic about the key, for a brief whose key is the documented THIRD form and is correct. The
-      # SHAPE parser already accepted it (`^keyless[ \t]+[^ \t]`), so the two readers disagreed and the
-      # narrower one produced a NEW false block — measured on byte-identical briefs: `origin/main` rc 0,
-      # the cycle-11 head rc 80. The predicate below is that shape parser's own, whitespace-general —
-      # separator, then real text after it — so `keyless`, `keyless   ` and `keylessfoo` all stay
-      # REFUSED, the direction that matters. H51c/H51d are the rows.
+      # ⛔ ANY WHITESPACE SEPARATES `keyless` FROM ITS REASON — NOT JUST A SPACE (cycle 12 review, P2;
+      # carrier corrected in cycle 13, after the first version of this comment cited a predicate that no
+      # longer exists at this head). WHAT THE BASE DID: on `origin/main` the ONLY key test was the SHAPE
+      # parser's `_rest ~ /^keyless[ \t]+[^ \t]/` — whitespace-general — so `keyless<TAB>— why` was
+      # ADMITTED (rc 0). `1519642ff` deleted that test and made THIS classifier the sole authority, and
+      # the arm it introduced required a literal space, so the move NARROWED a spelling the base
+      # accepted: measured on byte-identical briefs, `origin/main` rc 0 versus the cycle-11 head rc 80 —
+      # UNKEYED, with a diagnostic about the key, for a brief whose key is the documented third form.
+      # The predicate below is that base test, carried into the only reader there is — separator, then
+      # real text after it — so `keyless` and `keylessfoo` stay REFUSED, the direction that matters.
+      # H51c is the row. A whitespace-ONLY parity fixture is not buildable (the WIP awk above trims
+      # trailing `[ \t]+` before this function ever sees the value), which is why H51b owns that case.
       keyless*)
         rest="${nval#keyless}"
         case "$rest" in [[:space:]]*[![:space:]]*) : ;; *) unkeyed=1 ;; esac ;;
