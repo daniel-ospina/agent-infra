@@ -1706,10 +1706,16 @@ if [ -z "$_real_ps" ]; then
   fail "7k cannot build a ps shim (no real ps on PATH)"
 else
   # <dir> <the -o option that cannot answer> <empty|fail|noise>
-  #   empty  rc 0, prints nothing   (a busybox/slim `ps`: accepts the flag, answers nothing)
-  #   fail   rc 1, prints nothing   (a transient failure on the identity re-read)
-  #   noise  rc 1, PRINTS a legend  (a `ps` that fails *and* writes to stdout — the shape that
-  #                                  made a FAILED identity read look like a readable stamp)
+  #   empty  rc 0, prints nothing      (a busybox/slim `ps`: accepts the flag, answers nothing)
+  #   fail   rc 1, prints nothing      (a transient failure on the identity re-read)
+  #   noise  rc 1, PRINTS a `Z` legend (a `ps` that fails *and* writes to stdout — the only
+  #                                     shape that exercises the exit-status rules at all)
+  # ⛔ THE LEGEND CARRIES A `Z` ON PURPOSE. Both `is_running` and `proc_ident` now refuse to
+  # believe a FAILED read, and the ONLY observable difference between "the rule is present" and
+  # "it was deleted" is what the failing `ps` WROTE: a `Z` makes the `*Z*` arm answer "zombie"
+  # for a live pid, and any non-empty line makes a stamp comparison read as a mismatch. A shim
+  # that fails SILENTLY (`fail`) cannot tell the two apart, so the rules would stay unpinned —
+  # the gap round 6 closed for `is_running` and round 7 found still open for `proc_ident`.
   _ps_shim() {
     mkdir -p "$1"
     case "$3" in
@@ -1718,7 +1724,7 @@ else
           "$2" "$_real_ps" > "$1/ps"
         ;;
       noise)
-        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) echo "  bogus legend line from a FAILING ps"; exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) echo "Z zombie legend line from a FAILING ps"; exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
           "$2" "$_real_ps" > "$1/ps"
         ;;
       *)
@@ -1775,6 +1781,15 @@ else
   # the exit-status rule in `proc_ident` (the guard exits 0 and the victim survives) and pass
   # with it (limit arm fires, victim dead, 124).
   _ps_case lstart-fail-noisy 'lstart=' noise 'a ps whose -o lstart= FAILS but still prints'
+  # Round 8 (#3622 review round 2, P3): and the SAME rule one function up. `is_running`'s
+  # `|| return 0` is reachable only by a `ps` that FAILS **and prints a `Z`** — with the rule that
+  # is ALIVE (fail-closed); without it the `*Z*` arm reads a live pid as a corpse, the guard exits
+  # 0 over a running rail, and nothing reds. `stat-empty` above cannot see the difference: its
+  # shim exits 0 and prints nothing, so both shapes answer ALIVE. Measured 2026-11-07 by reverting
+  # ONLY the `|| return 0`: `is_running` → GONE for a live pid, all three pre-existing 7k cases
+  # stayed GREEN. So this case is what actually pins the round-6 rule that the 7k header says was
+  # measured.
+  _ps_case stat-fail-noisy 'stat=' noise 'a ps whose -o stat= FAILS but prints a Z legend'
 fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
