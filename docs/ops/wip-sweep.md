@@ -192,6 +192,21 @@ list` refused, or a path that is not a repository) adds an `unmeasured` count an
 `cannot-verify` row and does **not** add to `seen` — it is a failure about the repository, not an
 examination of a worktree, and it always fails the pass (exit 3).
 
+⛔ **A LISTING THAT IS SHORTER THAN GIT'S OWN ADMIN RECORDS IS A REPO-LEVEL FAILURE, NOT A CLEAN REPO.**
+The three repo-level notes are `worktree-list-failed` (the call refused), `worktree-list-empty` (it named
+no worktree at all), `worktree-list-unverifiable` (git's common dir could not be resolved, so completeness
+cannot be checked) and `worktree-list-partial`. The last one exists because `git worktree list --porcelain`
+can answer a **subset** with `rc=0` and **completely empty stderr** — so an rc check and a stderr check
+both miss it. Measured shape: damage one worktree's admin record (`.git/worktrees/<name>/gitdir`
+removed), which an interrupted `git worktree add`, a racing `prune`, or a partial restore all produce; a
+4-worktree repo then lists 3 and the omitted worktree is never enumerated, never swept, and the pass used
+to answer `status=ok`. The cross-check is the count of directories in `$(git rev-parse --git-common-dir)
+/worktrees/`, which is git's own authority for how many linked worktrees the repo HAS: a pass requires
+`listed >= admin_dirs + 1` (the `+1` is the main worktree, which has no admin dir; a bare repo has no
+`worktrees/` dir and lists exactly itself, so a missing dir reads as 0). It is **one-sided on purpose** —
+only a listing BELOW the expectation escalates, so a future git that lists more than it holds admin dirs
+can never false-block a sweep that was complete.
+
 ⛔ **The record is written TWICE: `status=running` before any worktree is touched — and before every
 startup refusal that follows it — then the verdict.** That is what makes an interrupted pass visible. A
 pass that crashes, is OOM-killed, is cut off by a quiesce, **refuses at startup** (a missing rescuer, no

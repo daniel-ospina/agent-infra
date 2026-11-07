@@ -75,7 +75,24 @@ PINNED_DIR=""
 # executable: mechanically producible, not hypothetical. A candidate must be non-empty AND parse; if none is
 # usable, `SWEEP` stays empty and the existing loud "WORK ON THIS BOX WILL NOT BE ARCHIVED" path fires.
 SWEEP=""
+# ⛔ THE RECORD HOLDS THE HARNESS DIR, SO THE SWEEP IS ITS SIBLING — NOT ITS CHILD (#3588 review, cycle 6).
+# `.harness-path` holds `<pinroot>/scripts/orchestrator-harness` (`scripts/cloud-cell-supervisor.sh:2315`
+# writes `HARNESS="$dir/scripts/orchestrator-harness"` into it; `scripts/harness-exec.sh:83` and
+# `scripts/orchestrator-harness/orch-pin-exec.sh:78` exec that same record). Appending `/scripts/wip-sweep.sh`
+# to it therefore built `<pinroot>/scripts/orchestrator-harness/scripts/wip-sweep.sh`, which CANNOT EXIST:
+# the sweep in a pinned tree sits at `<pinroot>/scripts/wip-sweep.sh`, exactly the relationship this script
+# already gets right for `$REPO` above. MEASURED on a real pin shape — record `…/pin/<sha>/scripts/
+# orchestrator-harness`, sweep at `…/pin/<sha>/scripts/wip-sweep.sh` (exists), candidate built by the old
+# spelling (absent). So on the one box this fallback exists for, the hook printed `FATAL: wip-sweep … WORK ON
+# THIS BOX WILL NOT BE ARCHIVED` and archived NOTHING, while the comment above it claimed the box was fixed.
+# It failed loud (never a false green) but the fallback was INERT, and no arm created a `.harness-path`
+# record at all — which is how a candidate that can never match stayed green.
+# Both shapes are tried, sibling first: the record-as-harness-dir is what every writer produces today, and
+# the record-as-pinroot spelling costs one `[ -s ]` test and removes the ambiguity if a writer ever moves.
+PINNED_ROOT=""
+[ -n "$PINNED_DIR" ] && PINNED_ROOT="$(dirname "$PINNED_DIR")"
 for c in "$REPO/scripts/wip-sweep.sh" \
+         ${PINNED_ROOT:+"$PINNED_ROOT/wip-sweep.sh"} \
          ${PINNED_DIR:+"$PINNED_DIR/scripts/wip-sweep.sh"} \
          "$O/wip-sweep.sh" \
          "${HOME:-/nonexistent}/.pi/agent/scripts/wip-sweep.sh"; do

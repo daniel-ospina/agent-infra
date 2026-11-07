@@ -1090,6 +1090,53 @@ grep -q "$T/rlib/wt" "$T/state-sel/wip-sweep.tsv" 2>/dev/null \
   && ok "S6 the other repo was still EXAMINED — the pass did not abort at the first empty listing" \
   || bad "S6 the healthy repo was not examined: $(sed -n '1,4p' "$T/state-sel/wip-sweep.tsv" 2>/dev/null)"
 
+# ── S7) A PARTIAL LISTING IS NOT A CLEAN REPO ────────────────────────────────────────────────────────
+echo; echo "── S7. a listing that OMITS a worktree is unmeasured, not clean ──"
+# ⛔ S7 IS THE NEGATIVE CONTROL THIS CLASS NEVER HAD (#3588 review, cycle 6). `git worktree list --porcelain`
+# can answer a SUBSET with rc=0 and COMPLETELY EMPTY stderr, so neither the rc guard nor the zero-record
+# guard fires and the omission is invisible. Shape: damage ONE worktree's admin record (`.git/worktrees/
+# <name>/gitdir` removed), which an interrupted `git worktree add`, a racing `prune`, or a partial restore
+# all produce. MEASURED before the fix: the pass answered `status=ok rc=0` while w2's uncommitted work was
+# never enumerated and never archived — the same false PASS this file exists to remove, one layer in.
+# A HEALTHY twin runs first, so the new guard cannot pass this arm by refusing every repo unconditionally.
+mk_fixture partial fix/3485-partial || { echo "x fixture failed (partial)"; exit 1; }
+P_REPO="$T/partial/wt"
+git -C "$P_REPO" worktree add -q "$T/partial/w2" -b wip-partial-ok 2>/dev/null \
+  || { echo "x could not add a linked worktree (partial)"; exit 1; }
+printf 'precious\n' > "$T/partial/w2/precious.txt"
+[ -n "$(git -C "$T/partial/w2" status --porcelain 2>/dev/null)" ] \
+  && ok "S7a baseline: the linked worktree holds uncommitted work, so a missed enumeration loses real work" \
+  || bad "S7a the linked worktree was NOT dirty, so this arm grades nothing"
+O_H="$(WIP_SWEEP_STATE_DIR="$T/state-partial-ok" bash "$SW" --apply --repo "$P_REPO" 2>&1)"; RC_H=$?
+[ "$RC_H" -eq 0 ] \
+  && ok "S7b a HEALTHY listing still passes (the partial guard is not a blanket refusal)" \
+  || bad "S7b an undamaged repo escalated rc=$RC_H — the guard refuses everything: $O_H"
+# the damaged twin: same shape, one admin record broken
+mk_fixture partial2 fix/3485-partial2 || { echo "x fixture failed (partial2)"; exit 1; }
+P2_REPO="$T/partial2/wt"
+git -C "$P2_REPO" worktree add -q "$T/partial2/w2" -b wip-partial2-b 2>/dev/null \
+  || { echo "x could not add a linked worktree (partial2)"; exit 1; }
+printf 'precious\n' > "$T/partial2/w2/precious.txt"
+rm -f "$P2_REPO/.git/worktrees/w2/gitdir"
+P_LISTED="$(git -C "$P2_REPO" worktree list --porcelain 2>"$T/partial2.err")"; P_LRC=$?
+P_NREC="$(printf '%s\n' "$P_LISTED" | grep -c '^worktree ')"
+[ "$P_LRC" -eq 0 ] && [ ! -s "$T/partial2.err" ] && [ "$P_NREC" -eq 1 ] \
+  && ok "S7c the damaged listing answers rc=0 with EMPTY stderr and 1 of 2 records — no rc or stderr check can see it" \
+  || bad "S7c this host did not reproduce the invisible shape (rc=$P_LRC records=$P_NREC stderr=$(cat "$T/partial2.err" 2>/dev/null))"
+O_P="$(WIP_SWEEP_STATE_DIR="$T/state-partial" bash "$SW" --apply --repo "$P2_REPO" 2>&1)"; RC_P=$?
+[ "$RC_P" -eq 3 ] \
+  && ok "S7d a PARTIAL listing FAILS the pass (exit 3) instead of reporting the repo clean" \
+  || bad "S7d a partial listing answered rc=$RC_P (want 3) — the omitted worktree was never swept and the pass read clean: $O_P"
+grep -qx 'status=failed' "$T/state-partial/wip-sweep.status" 2>/dev/null \
+  && ok "S7e the record says failed, so no fleet instrument can answer green on it" \
+  || bad "S7e the record says $(sed -n 's/^status=//p' "$T/state-partial/wip-sweep.status" 2>/dev/null)"
+grep -q 'worktree-list-partial' "$T/state-partial/wip-sweep.tsv" 2>/dev/null \
+  && ok "S7f the index names WHY (worktree-list-partial), so the next actor is not left guessing" \
+  || bad "S7f the index does not record the partial listing"
+has "$O_P" 'NEVER enumerated and NEVER swept' \
+  && ok "S7g the refusal says the omitted worktrees were never swept, so the reader is not told 'unknown' without a reason" \
+  || bad "S7g the refusal does not name what was missed: $O_P"
+
 echo
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
