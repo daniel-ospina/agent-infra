@@ -6104,9 +6104,15 @@ ${MISSING}"
       # the evidence ADMISSIBLE without making the run complete, and this line says
       # which of the two happened instead of leaving the operator to guess.
       if post_review_evidence_comment "$MISSING" "$REPO" "$PR"; then
-        echo "   ℹ️  the durable comment copy DID land, so ai-review-gate can now ADMIT this review (own endpoint, own scope). Re-run the recorder at this head, or post the body copy with --flush-pending, to fire the \`edited\` event that re-runs the gate." >&2
+        echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. Re-run the recorder at this head, or post the body copy with --flush-pending, to fire the \`edited\` event that re-runs the gate." >&2
       else
-        echo "   ⛔ the durable comment copy did NOT land either — the marker is on NO channel the required check reads." >&2
+        # ⛔ NO ABSENCE CLAIM (#3168, the same class the read-failure arm was corrected
+        # for). A 1 return means "not published BY THIS RUN" and covers four different
+        # states: refused by policy (unsigned), gh missing, the comment READ failed (post
+        # skipped BY DESIGN), and a refused POST. In the read-failure state a PREVIOUS
+        # run's comment may already carry the marker and this process cannot see it, so
+        # "the marker is on no channel" would be a claim about a state it never observed.
+        echo "   ⛔ this run published NO durable comment copy — the comment channel was not delivered to (refused by policy for an UNSIGNED marker, gh absent, the comment read failed so the post was skipped by design, or the POST was refused). Whether an EARLIER run's comment already carries the marker is not observable from here; re-run at this head once the cause is cleared — the post is idempotent." >&2
       fi
       # ⛔ NO SIGNEDNESS CLAIM IN THE MESSAGE BELOW (#3168 re-review P2): like the
       # read-failure arm, this one is reached with MARKER_SIGNED=0 as well
