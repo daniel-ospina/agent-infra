@@ -98,7 +98,12 @@ PER **PINNED** DEFINITION (a sibling's broken `baseUrl` is never requested, meas
 is unbuildable — because only there does every base model inherit it. The test itself is "would `new URL()` throw", not a
 spelling: `https:/host` and surrounding whitespace are accepted by the vendor, so a `^https?://` test refused boxes that
 run, while the AUTHORITY is part of it — `https://:8080/v1` and `https:// gw.example/v1` answer `Invalid URL` (refused),
-and `https:///host` / a bare `https://` PARSE and reach the network (not refused). Such a provider also has an oauth
+and `https:///host` / a bare `https://` PARSE and reach the network (not refused). ⛔ That test mirrors the parser's rules for
+those MEASURED shapes (userinfo split off first, empty host / empty or unclosed IPv6 literal / forbidden code point / bad
+`%` escape refused, tab-NL-CR removed rather than refused, C0-or-space trim, `\` ending the authority like `/`, port
+empty or all-decimal ≤65535 with leading zeros read as the value) — it is NOT a URL-parser emulation: the IPV6 INTERIOR
+is not validated, so `[zzz]`/`[:::]` pass here although node throws. A 9,470-case fuzz against node measured zero false
+blocks and 12 false passes, every one an IPv6-literal interior. Such a provider also has an oauth
 handler, so the store refusal below never applies to it.
 ⛔ **AND ONE STORE SHAPE IS REFUSED, NOT SKIPPED** (measured): an `oauth` entry in `auth.json` for a provider `pi` ships NO
 oauth handler for. The handler set is static — `anthropic github-copilot kimi-coding meta openai-codex openai openrouter radius xai`

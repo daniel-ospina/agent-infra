@@ -1096,35 +1096,13 @@ if sys.argv[2] == "compose":
     # SENT a request. That is a network failure, not the `Invalid URL` this refusal quotes, and a gate that claimed it
     # would be quoting a failure the box never printed. The check below therefore runs on the vendor\x27s own
     # strip-then-append, so every arm\x27s verdict agrees with what `pi -p` actually printed.
-    def _port_ok(auth):
-        # \u26d4 THE PORT IS PART OF "WOULD `new URL()` THROW" (round 41, P1, measured). `auth` is
-        # `[userinfo@]host[:port]`, and node THROWS `ERR_INVALID_URL` for a port that is not all-decimal or is out of
-        # range \u2014 measured: `https://host:abc`, `https://host:+80`, `https://host:-1`, `https://host:1e3`,
-        # `https://host:65536` and `https://host:80:90` all throw, while `https://host:`, `https://host:0`,
-        # `https://host:080` and `https://host:65535` all parse. `pi-messages.js:251` builds
-        # `new URL(`${model.baseUrl.replace(/\/+$/u, "")}/messages`)`, so each of those is `Invalid URL` before a
-        # request is sent \u2014 the failure `reason=models-json-bad-gateway` exists to quote \u2014 and the earlier
-        # test (a BARE `:port` authority, and nothing else) passed them as usable.
-        # USERINFO IS SPLIT OFF FIRST because `https://user:pass@host/v1` PARSES (measured) and a port test applied to
-        # the whole authority would read `pass@host` as the port and refuse a box `pi -p` runs \u2014 the false-block
-        # direction this file\x27s header forbids.
-        hostport = auth.rsplit("@", 1)[-1]
-        if hostport.startswith("["):
-            close = hostport.find("]")
-            if close < 0:
-                return False  # `https://[::1` \u2014 an unclosed literal throws
-            tail = hostport[close + 1:]
-            if not tail:
-                return True
-            if not tail.startswith(":"):
-                return False  # `https://[::1]x:80` \u2014 text after the literal throws
-            port = tail[1:]
-        else:
-            if ":" not in hostport:
-                return True
-            host, port = hostport.rsplit(":", 1)
-            if ":" in host:
-                return False  # `host:80:90` \u2014 a second colon is not a port, and node throws it
+    def _port_ok(port):
+        # \u26d4 THE PORT IS PART OF "WOULD `new URL()` THROW" (round 41, P1, measured). node THROWS `ERR_INVALID_URL`
+        # for a port that is not all-decimal or is out of range \u2014 measured: `host:abc`, `host:+80`, `host:-1`,
+        # `host:1e3`, `host:65536` and `host:80:90` all throw, while `host:`, `host:0`, `host:080` and `host:65535`
+        # all parse. `pi-messages.js:251` builds `new URL(`${model.baseUrl.replace(/\/+$/u, "")}/messages`)`, so each
+        # of those is `Invalid URL` before a request is sent \u2014 the failure `reason=models-json-bad-gateway` exists to
+        # quote \u2014 and the earlier test (a BARE `:port` authority, and nothing else) passed them as usable.
         # `[0-9]` and not `\d`: python\x27s `\d` matches non-ASCII decimal digits, which `int()` would then accept while
         # the vendor\x27s parser refuses them.
         # \u26d4 AND THE CONVERSION IS BOUNDED, BECAUSE AN UNBOUNDED ONE IS A FALSE PASS (round 42, P2, measured):
@@ -1141,15 +1119,72 @@ if sys.argv[2] == "compose":
             return False
         digits = port.lstrip("0") or "0"
         return len(digits) <= 5 and int(digits) <= 65535
+    def _authority_ok(auth):
+        # \u26d4 THE AUTHORITY IS READ THE WAY THE PARSER READS IT, ON THE RULES THAT WERE MEASURED \u2014 AND THE SCOPE OF
+        # THAT CLAIM IS NAMED HERE SO NOBODY READS IT AS A URL-PARSER EMULATION (round 43, P2, measured). What IS
+        # mirrored, each against node on the installed vendor:
+        #   * USERINFO IS SPLIT OFF FIRST: `https://user:pass@host/v1` PARSES, and a port test applied to the whole
+        #     authority would read `pass@host` as the port and refuse a box `pi -p` runs (the false-block direction).
+        #   * AN EMPTY HOST AFTER THE SPLIT THROWS: `user@`, `user@:8080`, `user@/`, `@/` are all `ERR_INVALID_URL`
+        #     (measured) and were accepted here, which is the same false-PASS class as the port itself.
+        #   * AN EMPTY OR UNCLOSED IPV6 LITERAL THROWS: `[]`, `[]:80`, `[::1` (measured).
+        #   * THE HOST MUST NOT CARRY A CODE POINT OR A BAD `%` ESCAPE THE HOST PARSER REJECTS: measured, `ho st`,
+        #     `ho\xa0st`, `ho\u2003st`, `ho<st`, `ho>st`, `ho^st`, `ho|st`, `h%zz` and `h%2` all throw, while `h%41`
+        #     PARSES (as host `ha`).
+        # \u26d4 WHAT IS DELIBERATELY **NOT** EMULATED, and why the refusal\x27s own comment and the README row are worded
+        # to match: the IPV6 INTERIOR is not validated (`[zzz]`/`[:::]` throw in node and pass here), and the WHATWG
+        # host parser\x27s full code-point and punycode pipeline is not reproduced. This is a refusal that must never
+        # fire on a box `pi -p` runs, so an unemulated shape stays ACCEPTED rather than guessed at \u2014 the direction that
+        # leaves a residual false PASS (pre-existing: no URL test at all existed before this PR) instead of inventing a
+        # false BLOCK. Both halves are declared, and the arms pin the ones that are emulated.
+        hostport = auth.rsplit("@", 1)[-1]
+        if hostport.startswith("["):
+            close = hostport.find("]")
+            if close <= 1:
+                return False  # `[]`, `[::1` \u2014 an EMPTY or unclosed literal throws (close==1 is `[]`)
+            tail = hostport[close + 1:]
+            if not tail:
+                return True
+            if not tail.startswith(":"):
+                return False  # `[::1]x:80` \u2014 text after the literal throws
+            return _port_ok(tail[1:])
+        if ":" in hostport:
+            host, port = hostport.rsplit(":", 1)
+            if ":" in host:
+                return False  # `host:80:90` \u2014 a second colon is not a port, and node throws it
+        else:
+            host, port = hostport, ""
+        if not host:
+            return False
+        if re.search(r"[\s\x00-\x1f<>^|\[\]]", host):
+            # every C0 control is a forbidden host code point (`\t\n\r` were already REMOVED above, as the parser
+            # removes them, so this class cannot refuse a box that parses), and so is a stray `[`/`]`
+            # (`https://o[/v1` and `https://h\x00/v1` both throw, measured).
+            return False
+        if re.search(r"%(?![0-9A-Fa-f]{2})", host):
+            return False
+        return _port_ok(port)
     def _buildable(v):
-        s = str(v).strip()
+        # \u26d4 THE PARSER REMOVES ASCII TAB/NEWLINE AND TRIMS ONLY C0-CONTROL-OR-SPACE (round 43, P2, measured):
+        # `new URL("https://ho\\tst/v1/messages")`, the same with `\n` or `\r`, all PARSE (host `host`), so refusing them
+        # \u2014 which `re.search(r"\\s", auth)` did \u2014 quoted `Invalid URL` over a box `pi -p` SENDS a request from: a
+        # false BLOCK this diff introduced, since no URL test existed before it. The trim is `[\x00-\x20]`, NOT
+        # python\x27s `.strip()`, which also eats `\xa0`/`\u2003` \u2014 code points the vendor does NOT trim, so stripping
+        # them turned `"\xa0https://host/v1"` into a buildable URL while node throws (a false PASS in the other
+        # direction). `\\` is a PATH SEPARATOR for the special schemes (`https://ho\\st/v1` PARSES with host `ho`), so
+        # it ends the authority exactly like `/`; leaving it in read `pass@host`-style text as a port.
+        s = re.sub(r"[\t\n\r]", "", str(v))
+        s = re.sub(r"^[\x00-\x20]+", "", s)
+        s = re.sub(r"[\x00-\x20]+$", "", s)
         m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*):(.*)$", s, re.S)
         if not m:
             return False
         if m.group(1).lower() in ("http", "https"):
-            rest = (m.group(2).rstrip("/") + "/messages").lstrip("/")
-            auth = re.split(r"[/?#]", rest, 1)[0]
-            return bool(auth) and not re.search(r"\s", auth) and not re.fullmatch(r":\d*", auth) and _port_ok(auth)
+            rest = (m.group(2).rstrip("/") + "/messages").lstrip("/\\")
+            auth = re.split(r"[/?#\\]", rest, 1)[0]
+            if not auth or re.fullmatch(r":[0-9]*", auth):
+                return False
+            return _authority_ok(auth)
         return True
     # \u26d4 THE NORMALISATION IS THE VENDOR\x27S, AND REWRITING A SCHEME IS A FALSE PASS (round 40, P2, measured).
     # `normalizeRadiusGatewayUrl` (`pi-ai/dist/providers/radius-config.js`) is: prefix `https://` ONLY when
