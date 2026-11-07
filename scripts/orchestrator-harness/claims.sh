@@ -1209,9 +1209,9 @@ _claim_commit_time() {
   # simply not a match — which lands on rc=1 (unmeasurable, KEPT and NAMED) instead of a forged age.
   # A76-A78 only exercised a token the `$` anchor REJECTS (`+0000 junk`), so they pinned the shape of the
   # fallback and not this: A79 drives a token that PARSES and must still not become the value.
-  # ⛔ `.*> ` IS **GIT'S OWN RULE** — THE DATE FIELD AFTER THE **LAST** `>` ON THE LINE — AND IT WAS
-  # RIGHT (review round 27, agent-infra#3203). Round 27 was opened on a review finding claiming git reads
-  # the FIRST `<`…FIRST `>` span, and that `committer a <a@b> <NOW> +0000 > 1 +0000` is dated NOW by git.
+  # ⛔ THE LAST `>` IS GIT'S OWN SPLIT POINT (review round 27, agent-infra#3203). Round 27 was opened on a
+  # review finding claiming git reads the FIRST `<`…FIRST `>` span, and that
+  # `committer a <a@b> <NOW> +0000 > 1 +0000` is dated NOW by git.
   # MEASURED against git 2.43.0 (`git hash-object -w -t commit --literally` + `git log -1 --format=%ct`),
   # that premise is FALSE and the fix built on it was a REGRESSION: git dates the object from the field
   # after the LAST `>`,
@@ -1229,18 +1229,35 @@ _claim_commit_time() {
   # reporting itself healthy. That is why the anchor is git's, not the mail span's.
   # ⛔ THE INVARIANT, STATED SO IT CAN BE TESTED: **when this parse measures, it must equal
   # `git log -1 --format=%ct`; it may only ABSTAIN where git is more tolerant than the `$` anchor.**
-  # The one divergence class is a tolerance, not a disagreement: git stops reading after the tz digits and
-  # ignores a trailing token, while the `$` anchor refuses the whole line — always in the KEEP direction
-  # (A79 pins that decision, A88-A92 pin the agreement with git on the shapes where it matters, including
-  # the `> 1 +0000` shapes git dates 1970 that must be REAPED and the `1 +0000 > <NOW> +0000` reverse sign
-  # that must NOT be). A76-A78 only exercised a token the `$` anchor REJECTS, so they pinned the shape of
-  # the fallback and not this.
+  # The ONE remaining divergence class is a tolerance, not a disagreement: git stops reading after the tz
+  # digits and ignores a trailing token, while the `$` anchor refuses the whole line — always in the KEEP
+  # direction (A79 pins that decision, A88-A92 pin the agreement with git on the shapes where it matters,
+  # including the `> 1 +0000` shapes git dates 1970 that must be REAPED and the `1 +0000 > <NOW> +0000`
+  # reverse sign that must NOT be). A76-A78 only exercised a token the `$` anchor REJECTS, so they pinned
+  # the shape of the fallback and not this.
+  # ⛔ THE ANCHOR IS `>` + **ANY WHITESPACE** (`[[:blank:]]*`), NOT `> ` + EXACTLY ONE SPACE (review round
+  # 28, agent-infra#3203). git does not require a space after the split `>`: it skips whitespace before the
+  # date field, so zero, one, two or three spaces and a TAB all yield the SAME answer. MEASURED against git
+  # 2.43.0 (`hash-object -w -t commit --literally` + `git log -1 --format=%ct`), `N = 1794013553`:
+  #
+  #   committer a <a@b> N +0000 > 1 +0000            git %ct = 1   one space
+  #   committer a <a@b> N +0000 >  1 +0000           git %ct = 1   TWO spaces
+  #   committer a <a@b> N +0000 >   1 +0000          git %ct = 1   three spaces
+  #   committer a <a@b> N +0000 ><TAB>1 +0000        git %ct = 1   tab
+  #   committer a <a@b> N +0000 >1 +0000             git %ct = 1   NO space at all
+  #   committer a <a@b> 1 +0000 >  N +0000           git %ct = N   reverse sign, two spaces
+  #
+  # A literal single space abstained on every row but the first, and for `>  1 +0000` the PREVIOUS parser
+  # (`.* `) had measured git's own answer — so the `> ` form turned a REAP into a HOLD for a claim git
+  # dates 1970. Writing the two divergence classes into a comment would have left a git-ancient claim
+  # unreapable on a shape nobody pinned; making the anchor git's own rule removes the class instead.
+  # A93-A95 pin it (oracle + reader + the reap), so it cannot silently move back.
   # ⛔ BOTH PROPERTIES ARE KEPT TOGETHER: byte-orientation (LC_ALL=C) decides WHICH BYTES are examined,
   # and the `> ` anchor decides WHICH FIELD may become the value. Neither implies the other — a
   # byte-oriented greedy `.* ` still read a forged second `digits +dddd` tail, and an anchored
   # locale-dependent `.` still answered differently on two boxes for the same object.
   ct="$(printf '%s' "$raw" | LC_ALL=C sed -n '/^$/q;p' | LC_ALL=C sed -n '/^committer /p' | tail -n 1 \
-        | LC_ALL=C sed -n 's/^committer .*> \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
+        | LC_ALL=C sed -n 's/^committer .*>[[:blank:]]*\([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
   # ⛔ SELECT THE LAST `committer` LINE *FIRST*, THEN PARSE IT (review round 20, agent-infra#3203). The
   # parse above used to be ONE anchored `sed` piped to `tail -n 1`, which selects "the last line that
   # MATCHES", not "the last committer line". Git dates the object from the last `committer` header

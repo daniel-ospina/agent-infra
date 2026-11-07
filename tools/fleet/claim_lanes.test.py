@@ -886,6 +886,26 @@ def l30_committer_acceptance():
     check(cl._commit_time(obj(name_with_tail)) == 1793991810,
           "a name carrying '> 1 +0000' still measures the trailing stamp (git's answer); got %r"
           % (cl._commit_time(obj(name_with_tail)),))
+    # ⛔ AND THE WHITESPACE AFTER THE SPLIT `>` (review round 28, agent-infra#3203). git does NOT require a
+    # space there — it skips whitespace before the date field — so zero, two, three spaces and a TAB all
+    # answer the SAME value. Measured (git 2.43.0, `hash-object -w -t commit --literally` + `git log -1
+    # --format=%ct`): `… > 1 +0000`, `… >  1 +0000`, `… >   1 +0000`, `… >\t1 +0000` and `… >1 +0000` are
+    # ALL dated 1. An anchor of `> ` (exactly one space) answered None on the others — the KEEP/HOLD
+    # direction — and for `>  1 +0000` the PREVIOUS bare-`.* ` pattern had measured git's own answer, so
+    # the narrowing was a REAP turned into a HOLD. `[ \t]*` mirrors the shell's `[[:blank:]]*`.
+    for _label, _line in (
+            ("two spaces", "committer a <a@b> 1793991810 +0000 >  1 +0000"),
+            ("three spaces", "committer a <a@b> 1793991810 +0000 >   1 +0000"),
+            ("a tab", "committer a <a@b> 1793991810 +0000 >\t1 +0000"),
+            ("no space", "committer a <a@b> 1793991810 +0000 >1 +0000")):
+        check(cl._commit_time(obj(_line)) == 1,
+              "a split '>' followed by %s is dated 1 by git, so the reader must answer 1, not abstain; "
+              "got %r" % (_label, cl._commit_time(obj(_line))))
+    # ...and the reverse sign with two spaces: a forged LATER stamp after `>  ` is still what git reads.
+    _rev_ws = "committer a <a@b> 1 +0000 >  1793991810 +0000"
+    check(cl._commit_time(obj(_rev_ws)) == 1793991810,
+          "a forged later stamp after '>' + two spaces is the value git reads; got %r"
+          % (cl._commit_time(obj(_rev_ws)),))
     no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
     check(cl._commit_time(no_blank) == 1700000000,
           "with NO blank line the shell prints the whole object, so the stamp is still found; got %r"

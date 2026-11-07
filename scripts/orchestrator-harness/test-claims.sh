@@ -1281,8 +1281,8 @@ ck "A81 [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4FIELDK"
 # ⛔ THE TWO 30-DAY LITERALS ARE THE ONLY THING KEEPING THE BOUND BOUNDED (review round 22,
 # agent-infra#3203). `_claim_floor_term` and `CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL` are both hard-capped at
 # 2592000 so no knob reaches ~31 years — and NOTHING pinned either cap: deleting one left this whole suite
-# GREEN (measured 281 passed / 0 failed on the tree before this block was hoisted out of the P4JUNK
-# loop — the COUNT follows the block's placement, the GREEN does not) while `MAXAGE=999999999 CEIL=999999999` resolved the bound to 999999999 and
+# GREEN (the COUNT of passes follows where this block sits in the file; the GREEN does not — verified by
+# deleting each cap and re-running: A82-A85 go red) while `MAXAGE=999999999 CEIL=999999999` resolved the bound to 999999999 and
 # a 2-YEAR-old unparseable-lease claim went from `pruned … PAST the 2592000s bound` to `kept … INSIDE the
 # 999999999s bound`, i.e. #3203's eternal hold restored through a knob. The knobs appeared in this suite
 # only BELOW the caps (CEIL=1, CEIL=3600) — the one region the caps do not govern.
@@ -1328,24 +1328,38 @@ P4NONUTF="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4
 P4UTF8=""
 if command -v locale >/dev/null 2>&1; then
   while IFS= read -r _p4l; do
-    case "$_p4l" in en_US.UTF-8|en_US.utf8|C.UTF-8|C.utf8) P4UTF8="$_p4l"; break ;; esac
+    # ⛔ ANY UTF-8 LOCALE, NOT FOUR LITERALS (review round 28, agent-infra#3203). Matching only
+    # `en_US.UTF-8|en_US.utf8|C.UTF-8|C.utf8` left a box whose only UTF-8 locale is, say, `de_DE.UTF-8`
+    # taking the fallback below — i.e. INERT — which is the very defect this probe was added to close.
+    case "$_p4l" in *.[Uu][Tt][Ff]-8|*.[Uu][Tt][Ff]8) P4UTF8="$_p4l"; break ;; esac
   done <<<"$(locale -a 2>/dev/null)"
 fi
 if [ -z "$P4UTF8" ]; then
-  P4UTF8=en_US.UTF-8
-  echo "  ⚠️ A86/A87: no en_US/C UTF-8 locale reported by 'locale -a' on this box — the byte-orientation"
+  echo "  ⚠️ A86/A87: no *.UTF-8/*.utf8 locale reported by 'locale -a' on this box — the byte-orientation"
   echo "     pin is INERT here: it would pass with the three LC_ALL=C prefixes removed. Not a failure of the"
-  echo "     fix, but the pin cannot measure it on this box."
+  echo "     fix, but the pin cannot measure it on this box — so it is reported as SKIPPED, never as a pass."
 fi
 ck "A86a (setup) a claim commit whose committer NAME carries an invalid UTF-8 byte is planted" "0" "$( p4_has pr-3237 && echo 0 || echo 1 )"
-P4NONUTFV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL="$P4UTF8" && . "$CLAIMS_SH" \
-               && c="$( _git ls-remote origin refs/claims/pr-3237 | awk '{print $1}' )" \
-               && _git fetch -q origin "+refs/claims/pr-3237:$CLAIM_TMP_NS/nonutf3203" \
-               && _claim_commit_time "$CLAIM_TMP_NS/nonutf3203" ) 2>/dev/null | tail -1 )
-echo "  _claim_commit_time over a committer name with a 0xFF byte, under UTF-8 ambient locale '$P4UTF8': '$P4NONUTFV'"
-ck "A86 [RED→GREEN] a non-UTF-8 byte in the committer NAME does not stop the stamp being measured (the parse is byte-oriented)" "^${P4NOW}$" "$P4NONUTFV"
-outP4NONUTFP=$( p4_prune )
-ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 18000s bound" "$outP4NONUTFP"
+# ⛔ THE PIN IS ONLY A PIN IF THE BOX CAN RUN IT (review round 28, agent-infra#3203). With no UTF-8 locale
+# installed (glibc falls back to `C`), `sed` is byte-oriented with OR without the three `LC_ALL=C` prefixes,
+# so A86/A87 pass while measuring NOTHING — a false GREEN on the only assertions for the byte-orientation
+# property. The old code reported that in an out-of-band `⚠️` and still incremented PASS. It is now a named
+# SKIP: the RESULT line carries `N SKIPPED`, and an inert pin can never read as a verified property.
+if [ -n "$P4UTF8" ]; then
+  P4NONUTFV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL="$P4UTF8" && . "$CLAIMS_SH" \
+                 && _git ls-remote origin refs/claims/pr-3237 >/dev/null 2>&1 \
+                 && _git fetch -q origin "+refs/claims/pr-3237:$CLAIM_TMP_NS/nonutf3203" \
+                 && _claim_commit_time "$CLAIM_TMP_NS/nonutf3203" ) 2>/dev/null | tail -1 )
+  echo "  _claim_commit_time over a committer name with a 0xFF byte, under UTF-8 ambient locale '$P4UTF8': '$P4NONUTFV'"
+  ck "A86 [RED→GREEN] a non-UTF-8 byte in the committer NAME does not stop the stamp being measured (the parse is byte-oriented)" "^${P4NOW}$" "$P4NONUTFV"
+  outP4NONUTFP=$( p4_prune )
+  ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 18000s bound" "$outP4NONUTFP"
+else
+  echo "  ⏭️ A86/A87 SKIPPED — this box has no UTF-8 locale, so the byte-orientation pin is INERT and cannot"
+  echo "     measure the mutation. Counted as SKIPPED, never as a pass (an inert pin that increments PASS is"
+  echo "     the false GREEN this block exists to prevent)."
+  SKIPPED=$((SKIPPED+1))
+fi
 # ⛔ THE READER'S ANSWER IS PINNED TO **GIT'S OWN ANSWER** (review round 27, agent-infra#3203).
 # A round-27 review finding claimed git reads the FIRST `<`…FIRST `>` span, so that
 # `committer a <a@b> <NOW> +0000 > 1 +0000` is dated NOW by git and only a mail-span anchor could close
@@ -1430,7 +1444,31 @@ P4G5="$(p4_plant_committer pr-3242 "committer a > 1 +0000 <a@b> $P4NOW +0000")"
 ck "A92a (setup) a committer NAME carrying '> 1 +0000' before the date field is planted" "0" "$( p4_has pr-3242 && echo 0 || echo 1 )"
 ck "A92b (oracle) GIT dates that object at <NOW>" "^${P4NOW}$" "$( p4_git_ct "$P4G5" )"
 ck "A92 [control] ...and the reader agrees with git (the anchor must not over-reach into names)" "^${P4NOW}$" "$( p4_ct_val pr-3242 nametail3203 )"
-for _p4n in P4G1 P4G2 P4G3 P4G4 P4G5; do
+# ── rows 6-8: the WHITESPACE after the split `>` (review round 28, agent-infra#3203). git does NOT
+# require a space there — it skips whitespace before the date field — so zero, two, three spaces and a
+# TAB all answer the SAME value. An anchor of `> ` (EXACTLY one space) abstained on every one of them,
+# and for `>  1 +0000` the PREVIOUS bare-`.* ` parser had measured GIT's own answer — so the `> ` form
+# turned a git-ancient claim's REAP into a HOLD (the #3203 direction). Each row pins git's answer, the
+# reader's, and, where the claim is genuinely ancient, that claim_prune really deletes it.
+P4G6="$(p4_plant_committer pr-3243 "committer a <a@b> $P4NOW +0000 >  1 +0000")"
+ck "A93a (setup) a committer line with TWO spaces after the split '>' is planted" "0" "$( p4_has pr-3243 && echo 0 || echo 1 )"
+ck "A93b (oracle) GIT dates that object at 1 — it skips whitespace after the split '>'" "^1$" "$( p4_git_ct "$P4G6" )"
+ck "A93 [RED→GREEN] ...and the reader answers GIT's value, not an abstention (which would hold the claim)" "^1$" "$( p4_ct_val pr-3243 ws3203 )"
+outP4G6=$( p4_prune )
+ck "A93c [RED→GREEN] ...so claim_prune REAPS it, never keeps a git-ancient claim past every bound" "pruned unreadable-lease refs/claims/pr-3243" "$outP4G6"
+p4_has pr-3243 && P4G6K=0 || P4G6K=1
+ck "A93d [RED→GREEN] ...and the ref is really gone" "^1$" "$P4G6K"
+# ── row 7: NO whitespace at all after the split `>`. git's split point is the `>`, not the `> ` pair.
+P4G7="$(p4_plant_committer pr-3244 "committer a <a@b> $P4NOW +0000 >1 +0000")"
+ck "A94a (setup) a committer line with NO whitespace after the split '>' is planted" "0" "$( p4_has pr-3244 && echo 0 || echo 1 )"
+ck "A94b (oracle) GIT dates that object at 1 as well" "^1$" "$( p4_git_ct "$P4G7" )"
+ck "A94 [RED→GREEN] ...and the reader agrees with git" "^1$" "$( p4_ct_val pr-3244 nows3203 )"
+# ── row 8: a TAB. git skips it, and `[[:blank:]]` is space+TAB by definition, so the anchor must too.
+P4G8="$(p4_plant_committer pr-3245 "committer a <a@b> $P4NOW +0000 >$(printf '\t')1 +0000")"
+ck "A95a (setup) a committer line with a TAB after the split '>' is planted" "0" "$( p4_has pr-3245 && echo 0 || echo 1 )"
+ck "A95b (oracle) GIT dates that object at 1" "^1$" "$( p4_git_ct "$P4G8" )"
+ck "A95 [RED→GREEN] ...and the reader agrees with git, so a TAB cannot buy an abstention" "^1$" "$( p4_ct_val pr-3245 tab3203 )"
+for _p4n in P4G1 P4G2 P4G3 P4G4 P4G5 P4G6 P4G7 P4G8; do
   [ -n "$(eval "printf '%s' \"\$$_p4n\"")" ] || echo "  ⚠️ $_p4n: the fixture did not plant — the assertions above cannot discriminate"
 done
 rm -rf "$P4ORIG" "$P4BOX"

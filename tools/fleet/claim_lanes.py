@@ -687,7 +687,7 @@ def _commit_body(obj: str) -> str:
 # matches any run, and the LENGTH rule is a SEPARATE arm below — which is why a 13+ digit stamp rejects the
 # object instead of being skipped in favour of an earlier line. A bounded quantifier here silently changed
 # WHICH line's value is judged.
-# ⛔ `.*> ` IS GIT'S OWN RULE — THE DATE FIELD AFTER THE **LAST** `>` — AND IT IS CORRECT (review round 27,
+# ⛔ THE LAST `>` IS GIT'S OWN SPLIT POINT, AND THE DATE FIELD AFTER IT IS THE STAMP (review round 27,
 # agent-infra#3203). A round-27 review finding claimed git reads the FIRST `<`…FIRST `>` span and dates
 # `committer a <a@b> <NOW> +0000 > 1 +0000` at NOW. MEASURED against git 2.43.0 (`hash-object -w -t commit
 # --literally` + `git log -1 --format=%ct`): git dates from the field after the LAST `>`, so
@@ -700,12 +700,16 @@ def _commit_body(obj: str) -> str:
 # `$` anchor refuses whole) — always the KEEP direction, and A79 pins that decision. The shell side is
 # pinned to the same invariant by `test-claims.sh` A88-A92, which assert git's own answer as well as the
 # reader's.
-# ⛔ ANCHORED ON `> ` — NOT A BARE `.* ` (review round 22, agent-infra#3203). The bare greedy `.* ` took
-# the LAST `digits [+-]dddd` pair ANYWHERE on the line, including one NOT preceded by `> `, so
-# `committer a <a@b> <NOW> +0000 1 +0000` — which git dates at NOW — answered `1` here and the shell's
-# reaper deleted a 0-second-old claim. The two readers must agree on WHICH field is the stamp, not merely
-# on the line it is on.
-_COMMITTER_TIME_RE = re.compile(r"^committer .*> ([0-9]+) [+-][0-9]{4}$", re.M)
+# ⛔ ANCHORED ON `>` + ANY WHITESPACE, NOT `> ` + EXACTLY ONE SPACE (review round 28, agent-infra#3203).
+# git skips whitespace after the split `>`, so zero, one, two or three spaces and a TAB all yield the same
+# answer. Measured (git 2.43.0, `hash-object -w -t commit --literally` + `git log -1 --format=%ct`) with
+# `N = 1794013553`: `… > 1 +0000`, `… >  1 +0000`, `… >   1 +0000`, `… >\t1 +0000` and `… >1 +0000` are
+# ALL dated **1**; `… >  N +0000` (reverse sign, two spaces) is dated **N**. A literal single space
+# abstained on every one but the first, and for `>  1 +0000` the PREVIOUS bare-`.* ` parser had measured
+# git's own answer — so the `> ` form silently turned a REAP into a HOLD for a claim git dates 1970.
+# `[ \t]*` here mirrors the shell's `[[:blank:]]*` exactly (space and tab; `\s` must not be used — with
+# `re.M` it would match a NEWLINE and let a stamp on the next header line become the value).
+_COMMITTER_TIME_RE = re.compile(r"^committer .*>[ \t]*([0-9]+) [+-][0-9]{4}$", re.M)
 
 
 def _commit_time(obj: str) -> Optional[int]:
