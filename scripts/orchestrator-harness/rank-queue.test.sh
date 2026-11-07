@@ -91,6 +91,13 @@ if [ ! -s "$REFRESH" ]; then
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNOT-RUN: mktemp failed" >&2; exit 1; }
+# ⛔ CANONICALISED IMMEDIATELY (review P2, cycle 95). `mktemp` echoes the template back verbatim, so `TMPDIR=/tmp/tq/`
+# gave `TMP=/tmp/tq//rank-queue.N` while the hook logs `$PWD/$0` (one slash) and `find "$TMP"` prints the doubled form
+# — and every comparison here is a PREFIX match (`case "$_ex" in "$TMP"/*`). Measured: 39 of 172 executed paths
+# matched, 0 of 192 `.sh` files found their `.optlog` record, and the suite still printed ✅ 177/0 — the silent
+# collapse the comment below declares closed, one layer out. `cd`+`pwd` is the only portable canonicaliser
+# (`readlink -f` is absent on macOS).
+TMP="$(cd "$TMP" && pwd)" || { echo "❌ SKIP-CANNOT-RUN: cannot canonicalise $TMP" >&2; exit 1; }
 # ⛔ WHAT BASH ACTUALLY EXECUTED IS OBSERVED, NOT INFERRED FROM A NAME (review P2, cycle 89). The `set -u` sweep
 # below classified a file as a DECLARED INPUT by its BASENAME, so an executed driver named `pf-late.sh` (or
 # `skipwhy-real.sh`, or anything under `fns*`) was waived and never inspected — measured: `pf-late.sh`, executed by
@@ -116,7 +123,23 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNO
 # file reads an unbound variable and completes). So the hook also installs an EXIT trap that appends `path<TAB>$-`:
 # the verdict for every script that reaches EXIT is then what the SHELL says, not what a parser guesses. No driver in
 # this suite sets its own EXIT trap (grep: only the suite's own teardown), so nothing is overridden.
-printf '%s\n' 'if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac; if [ -f "$_b" ]; then printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null; trap '"'"'printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null'"'"' EXIT; fi; fi' > "$TMP/.boothook"
+# ⛔ AND `exec` DOES NOT ESCAPE THE CHANNEL EITHER (review P2, cycle 95). An `exec`ing shell never reaches the EXIT
+# trap, so the parser decided those 22 shims — and the verdict flipped on a word that changes nothing: a body of
+# `fin() { set -u; }` + an unbound read was RED ending `exit 0` and ✅ ending `exec /bin/true`, with the unbound read
+# COMPLETING (measured). The DEBUG trap below records `$-` for the `exec` command itself, so an exec'ing script
+# answers empirically too and the parser is left with the population that never runs at all. `$BASH_COMMAND` is a
+# builtin lookup bash already maintains and the trap returns 0, so this is errexit-safe and costs one `case` match
+# per command; the last record written for a path wins, so an EXIT record (the true end state) still overrides it.
+cat > "$TMP/.boothook" <<'BOOTHOOK'
+if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
+  case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac
+  if [ -f "$_b" ]; then
+    printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null
+    trap 'printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null' EXIT
+    trap 'case "$BASH_COMMAND" in exec[[:space:]]*) printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null ;; esac' DEBUG
+  fi
+fi
+BOOTHOOK
 : > "$TMP/.bootlog"
 : > "$TMP/.optlog"
 export RANK_QUEUE_BOOTLOG="$TMP/.bootlog"
@@ -3505,14 +3528,15 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # ⛔ EMPIRICAL FIRST, TEXTUAL ONLY AS A FALLBACK (review P2, cycle 93). `_opts_for` reads the option string the child
 # recorded at EXIT; when it exists it IS the answer ("is this shell in nounset"), and no parse can disagree with it. A
 # script that `exec`s (the PATH shims) never reaches EXIT and has no record, so the textual `_setu` covers it.
-# ⛔ THAT IS NOT THE ONLY SUCH POPULATION, AND THE COMMENT USED TO CLAIM IT WAS (review P3, cycle 94). The `.sh` sweep
-# also runs over files that are GENERATED BUT NEVER EXECUTED — today `moved.sh` and `skip-revert.sh`, both drivers
-# under `$TMP` that are not declared inputs and are never invoked (measured: 192 `.sh`, 172 executed, 59 unexecuted of
-# which 57 are declared inputs and those 2 are not). No record exists for them, so cycle 92's four wrong rows — a
-# subshell, an uncalled `fin() { set -u; }`, `set -- -u`, a `case` arm — are LIVE on that population. The residual is
-# bounded to the harmless polarity: a file that never runs cannot be unprotected at runtime, so a wrong PROTECTED
-# verdict there costs nothing; what it CAN do is false-block a correct never-executed driver, which is the same
-# over-block this file accepts everywhere else and would be reported by the driver's own author.
+# ⛔ WHAT THE PARSER STILL DECIDES, AND IT IS NOT "ONLY EXEC" (review P3, cycles 94-95): the `.sh` sweep also runs over
+# files that are GENERATED BUT NEVER EXECUTED — today `moved.sh` and `skip-revert.sh`, drivers under `$TMP` that are
+# not declared inputs and are never invoked (measured: 192 `.sh`, 172 executed, 59 unexecuted of which 57 are declared
+# inputs and those 2 are not). Cycle 93's rows that are still live THERE: a multi-line subshell, an uncalled
+# `fin() { set -u; }`, and a `case` arm (`1) set -u ;;` is real protection and the parser FALSE-BLOCKS it).
+# `set -- -u` is NOT live — the `--` break below grades it bare, which is the correct verdict. The residual is bounded
+# to the harmless polarity: a file that never runs cannot be unprotected at runtime, so a wrong PROTECTED verdict
+# there costs nothing; what it CAN do is false-block a correct never-executed driver — the same over-block this file
+# accepts everywhere else, and one that driver's own author would report.
 # ⛔ AND THE PATH REACHES AWK THROUGH `ENVIRON`, NEVER `-v` (review P3, cycle 94). `-v` runs awk's escape processing, so
 # a `TMP` containing a backslash made EVERY lookup miss its own record and the channel quietly collapsed back to the
 # textual `_setu` — i.e. cycle 93's P2 false PASS returned in silence, on the one code path added to retire it. The
@@ -3612,7 +3636,7 @@ else
   # `APPEARED after the snapshot` and `is NEW and was ALREADY there at the first snapshot`. Measured: a late
   # `rank/appeared-late.txt` printed `APPEARED after the snapshot` under a "a pinned capture is MISSING, CHANGED, or
   # already differed" header, with all 159 pinned keys present and correct. The header now names both populations.
-  rc=1; echo "      a capture is MISSING, NEW (present at one snapshot only), CHANGED, or already differed at the first snapshot (the leaves below say which) — a file created AND removed entirely inside the window is outside what a snapshot pair can see:"
+  rc=1; echo "      a capture is MISSING, NEW TO THE PIN, CHANGED, or already differed at the first snapshot (a capture new to the pin may be late creation OR already present at the first snapshot — the leaves below say which) — a file created AND removed entirely inside the window is outside what a snapshot pair can see:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
   # PROMISED list was empty, because `for x in $( … )` split its key on the space and matched nothing.
   # ⛔ EVERY LOOKUP HERE READS THE KEY FIELD, NEVER A PREFIX (review P3, cycles 79 and 81): `grep -m1x` was parsed as
@@ -3648,7 +3672,7 @@ else
 $(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
 fi
-ck "the capture population is UNCHANGED at the END of the run — every pinned capture is present with its pinned CRC, and no capture appeared or vanished (a missing, new, changed or drifted one was named above)" $rc
+ck "the capture population is UNCHANGED at the END of the run — every pinned capture is present with its pinned CRC, and no capture is missing, new to the pin, changed or drifted (the leaf named above says which)" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
