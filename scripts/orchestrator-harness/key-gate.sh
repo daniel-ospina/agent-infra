@@ -1076,6 +1076,32 @@ if sys.argv[2] == "compose":
     _gw = re.sub(r"/v1/?$", "", _body.get("baseUrl") or "")
     _grant_default = bool(_grant and re.match(r"^https?://", _gw, re.I) and _gw.rstrip("/") == "https://radius.pi.dev")
     _suffix = ":oauth" if _body.get("oauth") else ""
+    # ⛔ THE SCHEME-LESS TEST SITS ABOVE THE DEFAULT-GATEWAY EARLY RETURN, AND IS SCOPED TO THE MODEL THE CALLER ASSERTS
+    # (round 39, P1 + P1, measured). The loop that used to own this test had two independent defects:
+    # (a) FALSE PASS — the early return below fires for EVERY default-gateway grant, so the loop below never ran there.
+    #     Measured: a grant on `https://radius.pi.dev/v1` whose definition carries its OWN scheme-less
+    #     `baseUrl: "gw.example/v1"` printed `check=ok var=RADIUS_API_KEY`, while pi composes that definition with the raw
+    #     value and `new URL(...)` throws `Invalid URL` before sending anything. The value lives in the DEFINITION, so the
+    #     default gateway does not rescue it.
+    # (b) FALSE BLOCK — the loop tested EVERY definition, so one scheme-less definition for a model the lane does not use
+    #     refused 82 a lane that runs: measured, `deepseek` with `models:[{id:"m2",baseUrl:"gw.example/v1"}]` and the lane
+    #     on `deepseek-flash` (baseline `https://api.deepseek.com`) was REFUSED, and the message named the model that
+    #     works. `modelFromJson` does not throw on a scheme-less `baseUrl`, so a sibling definition is untouched.
+    # So: only the definition whose `id` is the model the caller is asserting, and only when the caller named one — with no
+    # model the gate cannot say which definition pi will compose, and refusing on a guess is the polarity the header
+    # forbids. The no-api/no-baseurl tests stay BELOW the early return, because those really do take the whole provider.
+    _raw_base = _body.get("baseUrl") or ""
+    _sel = str(sys.argv[4]) if len(sys.argv) > 4 else ""
+    for _m in _body.get("models") or []:
+        if not isinstance(_m, dict):
+            continue
+        if not _sel or str(_m.get("id")) != _sel:
+            continue
+        _eff = _m.get("baseUrl") or _raw_base
+        if _eff and not re.match(r"^https?://", str(_eff), re.I):
+            _nokey = not (_m.get("api") or _body.get("api"))
+            print("bad-gateway" + ("-no-api" if _nokey else ""))
+            raise SystemExit(0)
     if _grant_default:
         raise SystemExit(0)
     # \u26d4 A SCHEME-LESS `baseUrl` IS A CERTAIN DEATH, AND ONLY AS ONE SPECIFIC SHAPE (round 36, P1 + round 37, P1/P2,
@@ -1095,15 +1121,9 @@ if sys.argv[2] == "compose":
     # Same for a MODEL-LEVEL scheme-less baseUrl (measured `Invalid URL`). So: a definition whose EFFECTIVE baseUrl
     # (its own, else the one on the provider body) has no scheme is a refusal, and the `-no-api` variant is split out because
     # the caller must pick the measured failure by whether pi ships the provider.
-    _raw_base = _body.get("baseUrl") or ""
     for _m in _body.get("models") or []:
         if not isinstance(_m, dict):
             continue
-        _eff = _m.get("baseUrl") or _raw_base
-        if _eff and not re.match(r"^https?://", str(_eff), re.I):
-            _nokey = not (_m.get("api") or _body.get("api"))
-            print("bad-gateway" + ("-no-api" if _nokey else ""))
-            raise SystemExit(0)
         if not (_m.get("api") or _body.get("api")):
             print("no-api:" + str(_m.get("id")) + _suffix)
             raise SystemExit(0)
@@ -1464,7 +1484,7 @@ key_gate_compose() {
   # `radius-grant` comes first when a grant holds, and a `no-api:`/`no-baseurl:` line can follow it — so a caller that
   # kept only the first line could not see both, and a second read would spend the bound twice (measured: a blocking
   # models.json then answered outside it, arm 5c).
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" 2>/dev/null
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" "$model" 2>/dev/null
 }
 
 # key_gate_value_present <VARNAME> — 0 iff THIS environment holds a non-blank value.

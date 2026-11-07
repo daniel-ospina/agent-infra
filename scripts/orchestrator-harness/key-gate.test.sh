@@ -677,6 +677,34 @@ ck "3z15y35 …while an UNSHIPPED one is the deleted provider (rc=${RC:-none})" 
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-provider-dropped" "3z15y36 …with the reason pi’s actual failure belongs to"
 has "$OUT" 'Unknown provider' "3z15y37 …quoting Unknown provider, the sentence pi prints on that box"
+# ⛔ AND THE DEFAULT GATEWAY DOES NOT RESCUE A DEFINITION'S OWN SCHEME-LESS baseUrl (round 39, P1, measured): the
+# scheme-less test used to sit BELOW the default-gateway early return, so it never ran for the commonest grant of all —
+# `https://radius.pi.dev/v1`. Measured: that grant with a definition carrying `baseUrl: "gw.example/v1"` printed
+# `check=ok var=RADIUS_API_KEY` while pi composes the definition with the RAW value and `new URL(...)` throws
+# `Invalid URL` — the silent end this file exists to remove, on a DEFAULT gateway. The bad value lives in the
+# DEFINITION, so the default gateway does not overwrite it. This arm can go RED: restoring the early return above the
+# test refuses nothing here again.
+RG_DEFOWNBAD_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages","baseUrl":"gw.example/v1"}]}}}'
+HRGDOB="$(mkhome radius_grant_default_ownbad "$RG_DEFOWNBAD_JSON")"
+OUT="$(run_gate "$HRGDOB" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y38 a DEFAULT-gateway grant whose definition has a scheme-less baseUrl REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y39 …the URL reason, because the bad value is in the DEFINITION the default gateway does not overwrite"
+# ⛔ AND ONLY THE MODEL THE CALLER ASSERTS COUNTS (round 39, P1, measured): the test used to walk EVERY definition, so a
+# scheme-less definition for a model this lane does not run refused 82 a box pi runs. Measured: `deepseek` with
+# `models:[{id:"m2",baseUrl:"gw.example/v1"}]` and the lane on `deepseek-flash` (baseline
+# `https://api.deepseek.com`) was REFUSED, and the refusal named the model that WORKS. `modelFromJson` does not throw on
+# a scheme-less baseUrl, so a sibling definition never breaks the one that is composed. Both directions are pinned: the
+# good model passes, and the bad model in the SAME file still refuses.
+RG_SIBLINGBAD_JSON='{"providers":{"deepseek":{"models":[{"id":"m2","api":"pi-messages","baseUrl":"gw.example/v1"}]}}}'
+HRGSIB="$(mkhome sibling_badurl "$RG_SIBLINGBAD_JSON")"
+OUT="$(run_gate "$HRGSIB" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y40 a scheme-less definition for a model this lane does NOT use is NOT refused (rc=${RC:-none})"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y41 …and the URL reason never fires for a sibling definition"
+KGSIBOUT="$(run_gate "$HRGSIB" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=m2)"; KGSIBRC="$(printf '%s\n' "$KGSIBOUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y42 …but the SAME file refusing the model that IS bad is still a positive reading (rc=${KGSIBRC:-none})" \
+   "$([ "${KGSIBRC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$KGSIBOUT" "reason=models-json-bad-gateway" "3z15y43 …naming the URL reason for the model that would die"
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
 # fail (measured: the mutant that restored the old order stayed green). The token count is the observable fact.
