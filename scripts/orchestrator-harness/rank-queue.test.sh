@@ -174,20 +174,21 @@ if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
     trap 'printf "%s\t%s\t%s\t%s\n" "E" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
     # ⛔ EVERY RECORD IS TAGGED WITH THE TRAP THAT WROTE IT (review P2/P3, cycle 97): `E` = an END state (this EXIT trap,
     # or an `exit` about to run), `D` = a point-in-time state taken for `exec`, `T` = a point-in-time state taken when a
-    # driver INSTALLS its own `trap ... EXIT`. See `_opts_for` for why the distinction is load-bearing — and for why `T`
-    # is deliberately NOT one of the tags it reads.
+    # `trap` command whose TEXT names `EXIT` runs. The arm matches TEXT, not intent, so this covers INSTALLING an EXIT
+    # trap, REMOVING one (`trap - EXIT`) and a `trap ... 0` whose handler merely names EXIT — the latter two measured to
+    # write `T`. See `_opts_for` for why the distinction is load-bearing, and for why `T` is deliberately NOT a tag it reads.
     # ⛔ `return` IS NOT AN END STATE AND A SUBSHELL'S EXIT IS NOT THIS SHELL'S END (review P2, cycle 98). A top-level
     # `return` prints "can only 'return' from a function or sourced script" and the script CONTINUES (measured); an
     # interior `return` leaves the function, not the shell. Both used to write `E` and win. `exit` still does, and the
     # depth field keeps a subshell's record out of the verdict.
     # AND A DRIVER THAT REPLACES THE EXIT TRAP IS STILL OBSERVED (review P3, cycle 99): `trap ... EXIT` discards the
     # hook end record, so a CORRECT protected fixture that installs its own cleanup trap and falls off the end was
-    # false-blocked as NO RECORD (measured). The `trap` arm below therefore writes a `T` snapshot at TRAP-INSTALL time —
-    # and `T` is NOT an end state: the driver may `set -u`/`set +u` AFTER installing the trap, so `_opts_for` answers
+    # false-blocked as NO RECORD (measured). The `trap` arm below therefore writes a `T` snapshot when such a command
+    # runs — and `T` is NOT an end state: the driver may `set -u`/`set +u` AFTER the trap command, so `_opts_for` answers
     # from `E`/`D` only and never falls back to `T`. That snapshot grades ONLY where the textual parser AGREES with it;
     # on disagreement the exec sweep names the script UNOBSERVABLE rather than letting either source decide (the rule
-    # is stated in full at `T RECORDS ARE NOT A VERDICT`, below). NO RECORD stays reserved for a shell that neither
-    # exited, exec'd, re-trapped, nor wrote any snapshot at all.
+    # is stated in full at `T` RECORDS ARE NOT A VERDICT, below). NO RECORD stays reserved for a shell that neither
+    # exited, exec'd, nor ran any `trap` command whose text names `EXIT` — no record at all, of any tag.
     # (Comments here must stay OUTSIDE the trap string: an apostrophe inside it ends the quoting.)
     trap 'case "$BASH_COMMAND" in
             exec[[:space:]]*) printf "%s\t%s\t%s\t%s\n" "D" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
@@ -3771,7 +3772,7 @@ if [ -n "$exec_unobs" ]; then
   echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script replaces the hook's EXIT trap, so no end state was recorded; add an explicit \`exit 0\` (or drop the own trap) so the shell's end state is observable"
 fi
 if [ -n "$exec_norecord" ]; then
-  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no record AT ALL does this — e.g. it replaces the hook's EXIT trap with \`trap … 0\` and falls off the end, which installs no \`T\` snapshot either; \`trap … EXIT\` alone lands in the agreement test above, not here)"
+  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no record AT ALL does this — e.g. it replaces the hook's EXIT trap with a \`trap … 0\` whose TEXT names no \`EXIT\` and falls off the end; a \`trap\` command naming \`EXIT\` — an install, a removal, or a handler that merely names it — writes a \`T\` and lands in the agreement test above, not here)"
 fi
 if [ -n "$exec_foreign" ]; then
   echo "      OUTSIDE \$TMP: the hook recorded an execution this sweep cannot grade —${exec_foreign} — a body run from outside the sandbox is outside the population the check names"
