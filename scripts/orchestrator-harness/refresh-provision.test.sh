@@ -1312,7 +1312,8 @@ ck "(g8) …and the tail beyond the cap is NOT in the record" \
 # ⛔ WHAT THE ROW PINS IS THE INTERPOLATION, NOT A PRODUCTION BYTE COUNT. On the default path the
 # probe usually kills the call before the shim flushes, so the capture is often EMPTY and the record
 # says `rc=142, no stderr written` — a NAMED NON-ANSWER. ⛔ But which arm of `gh_probe_bounded` ran
-# decides: perl SIGKILLs (`:994`), the `timeout --kill-after=2` fallback sends SIGTERM and the
+# decides: perl SIGKILLs (`$SIG{ALRM}=sub{ kill("KILL", -$pid) }` — cited by content, because a
+# line number is moved by any edit above it), the `timeout --kill-after=2` fallback sends SIGTERM and the
 # shim traps it and flushes (`scripts/gh-shim/gh:1828`, `:740-749`), measured `rc=124` with 233 bytes.
 # The stub writes stderr BEFORE sleeping precisely because a killed shim cannot — the row proves the
 # wiring is live, and the arm's own comment declares both production paths.

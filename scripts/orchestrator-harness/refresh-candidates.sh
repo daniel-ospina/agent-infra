@@ -1154,7 +1154,9 @@ gh_probe_env() {
     # not a quote. That is the honest maximum here and the reason the slot is worth wiring: the record
     # says the layer wrote nothing, instead of having no evidence field at all.
     # ⛔ BUT NOT ALWAYS, AND THE DIFFERENCE IS WHICH ARM OF `gh_probe_bounded` RAN (#3701 round 8,
-    # P2): its perl arm SIGKILLs (`:994`), while its `timeout --kill-after=2` fallback sends
+    # P2): its perl arm SIGKILLs (`$SIG{ALRM}=sub{ kill("KILL", -$pid) }`, cited by CONTENT because a
+    # line number here is moved by any edit above it — this one drifted :994 -> :1000 while the PR was
+    # being reviewed), while its `timeout --kill-after=2` fallback sends
     # SIGTERM first — and the shim TRAPS term and flushes its buffered notes on exit
     # (`scripts/gh-shim/gh:1828`, `:740-743`, `:744-749`). Measured on the real shim: perl arm `rc=142`
     # with 0 bytes of stderr, timeout arm `rc=124` with 233 bytes of notes. So this record says
