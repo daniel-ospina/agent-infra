@@ -107,7 +107,12 @@ one is admitted ONLY when it is the pin TREE this box records — the path in `$
 **drainer** gives a lane's
 scratch checkout (`ai-drainer.sh`: `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with
 `worktree remove --force` when the lane ends), and that one lives under `$HOME`; **every** other detached
-worktree is refused. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
+worktree is refused. The pin tree corroborates itself: its directory basename must be a prefix of the
+commit it actually holds, so a scratch named with an unrelated commit id is refused. **Named residual:**
+`HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` are how a box relocates its pin, so an operator who deliberately
+declares a scratch as its own pin root can still arm it — this is an accident guard (`#2697` was an
+install from a lane worktree with nothing exported), not a boundary against an operator who declares the
+scratch deliberately, who can write the unit anyway. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
 untouched; and **no declaration launders a lane checkout**: a caller that names its own worktree as
 `AGENT_INFRA_PATH` does not get to admit it. When git cannot identify the checkout at all (a `.git` entry
 it refuses to read — dubious ownership, an unreadable directory), the answer is **cannot prove**, and it

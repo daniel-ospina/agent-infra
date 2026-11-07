@@ -430,7 +430,7 @@ primary_clone_root() {
 # when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
 # refused for the same reason the #2666 unit-dir guard resolves before it grades.
 scratch_supervisor_reason() {
-    local p="${1:-}" d root="" declared="" shape="" pin="" tree="" base="" pin_ok=0
+    local p="${1:-}" d root="" declared="" shape="" pin="" tree="" base="" held="" pin_ok=0 name_ok=0
     shape="$(lane_scratch_shape "$p")"
     if [ -n "$shape" ]; then
         printf 'it matches the lane-scratch shape %s — a checkout a lane removes when it ends, whose branch is merged nowhere' "$shape"
@@ -467,16 +467,45 @@ scratch_supervisor_reason() {
             # ("this is not a harness tree, and a controller started from it would exit at once"). That is a
             # property of the TREE, so it cannot be produced by naming a scratch cleverly, and it is exactly
             # the condition every real pin already satisfies — so it blocks no deployment.
+            # ⛔ CORRECTION TO THE PARAGRAPH ABOVE (cycle-5 P1, MEASURED): carrying `orch-loop.sh` is NECESSARY
+            # AND NOT SUFFICIENT, so on its own it corroborated nothing. Every real checkout of this repo carries
+            # `scripts/orchestrator-harness/orch-loop.sh` — and a lane/drainer scratch IS such a checkout
+            # (`ai-drainer.sh`: `git worktree add -f … "$SEED_REF"`), so the missing-file test admitted exactly the
+            # scratch it was written to reject: with it present, `HARNESS_PIN_DIR=<scratch>` armed the unit. The
+            # discriminating corroboration is the one applied below — the tree's NAME must be a prefix of the
+            # commit the tree actually HOLDS — and the flat-pin arm's residual is stated there.
             pin="$(pin_root_of_this_box)"
             tree="${d%|detached}"
             base="$(basename "$tree")"
-            if [ "${tree%/}" = "${pin%/}" ]; then
-                pin_ok=1
-            else
+            # ⛔ THE NAME MUST AGREE WITH THE TREE IT NAMES (cycle-5 P1, MEASURED — this is the arm that did not
+            # exist). Being hex was never corroboration: a drainer scratch can be created with any name, and the
+            # hex test therefore admitted `$HOME/<40-hex>` and `<exported pin root>/<40-hex>` for a tree holding
+            # a DIFFERENT commit. A pin is created by the bring-up as `git worktree add --detach "$pin_dir/$sha"`,
+            # so the only thing a real pin guarantees is that its basename is the commit it actually holds. That
+            # is a property of the TREE (it is read from the tree), not of the caller's environment, so no naming
+            # can manufacture it: the name must be a prefix of the `rev-parse HEAD` OF THIS TREE.
+            held="$("${GIT_SCRUB[@]}" git -C "$tree" rev-parse HEAD 2>/dev/null)" || held=""
+            if [ -n "$held" ] && [ "${#base}" -ge 7 ] && [ "${#base}" -le 40 ]; then
                 case "$base" in
-                    ''|*[!0-9a-f]*) ;;        # not a commit id: a lane scratch is named by its lane
-                    *) [ "${#base}" -ge 7 ] && [ "${#base}" -le 40 ] && pin_ok=1 ;;
+                    *[!0-9a-f]*) ;;           # not a commit id at all: a lane scratch is named by its lane
+                    *) case "$held" in "$base"*) name_ok=1 ;; esac ;;
                 esac
+            fi
+            if [ "$name_ok" -eq 1 ]; then
+                pin_ok=1
+            elif [ "${tree%/}" = "${pin%/}" ]; then
+                # ⛔ THE LEGACY FLAT PIN, AND ITS NAMED RESIDUAL (cycle-5 P1). When the pin ROOT is itself the
+                # worktree (`cloud-cell-bringup.sh`'s `_pin_is_worktree_of "$HARNESS_PIN_DIR"`, the pre-sha
+                # layout) there is no commit name to corroborate, so equality with the pin root is the only
+                # signal. The pin root is located by the box's record and its `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE`
+                # overrides, which a caller CAN set — so a caller that declares its own scratch as the pin root
+                # still arms it. That is accepted, not claimed closed, for the same reason `CELL_HOME`/`HOME`
+                # are trusted below: those overrides are how a real box relocates its pin, and refusing them
+                # would false-block every cell whose pin is not at the default path. It is an ACCIDENT guard
+                # (the #2697 shape was an operator installing from a lane worktree with nothing exported), not
+                # a boundary against an operator who deliberately declares a scratch as its pin — that operator
+                # can write the unit anyway. Stated here so the claim and the code agree.
+                pin_ok=1
             fi
             [ "$pin_ok" -eq 1 ] && [ ! -f "$tree/scripts/orchestrator-harness/orch-loop.sh" ] && pin_ok=0
             if [ "$pin_ok" -ne 1 ] || ! path_under "$tree" "$pin"; then
