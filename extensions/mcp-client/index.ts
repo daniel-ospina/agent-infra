@@ -623,13 +623,13 @@ const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
 /**
  * A server name pi accepts: letters, digits, `_` and `-` (`docs/mcp.md`).
  *
- * ⛔ PLUS an explicit rejection of the PROTOTYPE-SHAPED names, which the charset admits. The real
- * defence against prototype pollution is that the merge builds `Object.create(null)` and reads it with
- * `Object.hasOwn` — this is the second lock, not the first. `connectConfig` also stores a
- * null-prototype sanitised map, so even the legacy `connectAll` config — a plain object off
- * `JSON.parse` — cannot resolve `Object.prototype` as a server; without this name check,
- * `loadServer("__proto__")` would answer "has neither 'command' nor 'url'" instead of "Unknown MCP
- * server".
+ * ⛔ PLUS an explicit rejection of the PROTOTYPE-SHAPED names, which the charset admits. What this buys
+ * is HYGIENE, not pollution safety: the pollution defence is the null-prototype merge map plus
+ * `Object.hasOwn`, and `connectConfig` also stores a null-prototype sanitised map — so `__proto__` is
+ * already unreachable there (`loadServer("__proto__")` answers "Unknown MCP server", measured). A
+ * server literally named `__proto__`/`constructor`/`prototype` is not a valid pi name
+ * (`docs/mcp.md`), and on the null-prototype map it WOULD be accepted as an ordinary server, so it is
+ * refused here to keep the name space sane. Do not read this as the thing that prevents pollution.
  */
 const PROTOTYPE_SHAPED_NAMES = new Set(["__proto__", "constructor", "prototype"]);
 
@@ -637,8 +637,18 @@ function isValidServerName(name: string): boolean {
   return /^[A-Za-z0-9_-]+$/.test(name) && !PROTOTYPE_SHAPED_NAMES.has(name);
 }
 
-/** The `type` values pi accepts. `sse` is explicitly rejected by the platform (`docs/mcp.md`). */
-const VALID_TYPES = new Set(["stdio", "http", "streamable-http"]);
+/**
+ * ⛔ `type` IS NEVER DISQUALIFYING IN THIS CLIENT — a RECORDED DECISION, not an oversight.
+ * `McpServerConfig` has no `type` field and `connectServer` selects the transport from `url`/`command`
+ * alone, so `type` is inert here. Two sibling files rule on it explicitly:
+ * `pi-bootstrap/lib/merge-mcp.py` ("On a url the operator chose, a non-http `type` is their business
+ * and is preserved with the entry (the client never reads `type`)"; a self-hosted `type: "sse"`
+ * "WORKS — replacing it would destroy the operator's config") and `pi-bootstrap/cell-install.sh`
+ * ("refusing `sse` here would refuse a config that WORKS"). Rejecting an entry for its `type` would
+ * therefore reverse that ruling AND zero a self-hosted config the installer certifies — so an
+ * unrecognised `type` only earns a warning, never a drop.
+ */
+const RECOGNISED_TYPES = new Set(["stdio", "http", "streamable-http"]);
 
 function isServerEntry(value: unknown): value is McpServerConfig {
   return !!value && typeof value === "object" && !Array.isArray(value);
@@ -659,16 +669,15 @@ function hasField(entry: McpServerConfig, field: string): boolean {
  * Evaluated on the EFFECTIVE entry, not the delta: a `{"type":"http"}`-only override is otherwise
  * applied to a stdio base and produces exactly the incoherent entry this rejects.
  */
-function typeContradicts(entry: McpServerConfig): boolean {
+function typeDisagrees(entry: McpServerConfig): boolean {
   const type = (entry as Record<string, unknown>).type;
-  if (typeof type !== "string") return false;
+  // An unrecognised or non-string `type` cannot disagree with anything this client acts on.
+  if (typeof type !== "string" || !RECOGNISED_TYPES.has(type)) return false;
   const declaresStdio = hasField(entry, "command");
   const declaresHttp = hasField(entry, "url");
   if (!declaresStdio && !declaresHttp) return false;
   if (type === "stdio") return declaresHttp && !declaresStdio;
-  if (type === "http" || type === "streamable-http") return declaresStdio && !declaresHttp;
-  // Any other value (`sse`, a typo) is rejected by the platform, so it cannot AGREE with anything.
-  return true;
+  return declaresStdio && !declaresHttp;
 }
 
 /**
@@ -744,12 +753,13 @@ export function mergeMcpLayers(
         );
         continue;
       }
-      if (typeContradicts(entry)) {
+      if (typeDisagrees(entry)) {
+        // WARN, never drop: `type` is inert in this client (see RECOGNISED_TYPES), so refusing the entry
+        // would destroy a config that works — the ruling `merge-mcp.py`/`cell-install.sh` already made.
         console.log(
-          `[mcp-client] WARN: repo entry "${name}" declares a "type" that contradicts its transport — ` +
-            `the entry is IGNORED.`
+          `[mcp-client] note: repo entry "${name}" declares a "type" that disagrees with its transport — ` +
+            `this client selects the transport from url/command, so the entry is kept as written.`
         );
-        continue;
       }
       merged[name] = { ...entry };
       continue;
@@ -789,12 +799,13 @@ export function mergeMcpLayers(
     // destination, not as "no transport declared". (The layer read rejects such an entry anyway; this
     // is the belt for a caller that hands the merge raw JSON.)
     const projected = { ...carry, ...entry } as unknown as McpServerConfig;
-    if (typeContradicts(projected)) {
+    if (typeDisagrees(projected)) {
+      // Only a warning, for the reason recorded on RECOGNISED_TYPES: `type` is inert here, so dropping
+      // or ignoring the delta would destroy a working config over a field this client never reads.
       console.log(
-        `[mcp-client] WARN: repo entry "${name}" makes the entry's "type" contradict its transport — ` +
-          `the delta is IGNORED and the base's entry is kept.`
+        `[mcp-client] note: repo entry "${name}" declares a "type" that disagrees with its transport — ` +
+          `this client selects the transport from url/command, so the entry is kept as written.`
       );
-      continue;
     }
     if (hasField(projected, "command")) {
       if (!sameLaunch(inherited, projected)) {
@@ -889,26 +900,27 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       );
       continue;
     }
-    if (typed.type !== undefined && !(typeof typed.type === "string" && VALID_TYPES.has(typed.type))) {
-      console.log(
-        `[mcp-client] WARN: ${label} entry "${name}" has "type": ${JSON.stringify(typed.type)} — ` +
-          `pi accepts only ${[...VALID_TYPES].join("/")}. Dropped. ` +
-          suffix
-      );
-      continue;
-    }
-    // ⛔ BOTH TRANSPORTS IS INVALID FOR EITHER LAYER, and it is refused at the READ so the promise holds
-    // on the base path too. `connectServer` tests `url` BEFORE `command`, so such an entry silently runs
-    // over HTTP and ignores the `command` — and a base entry declaring both used to be copied verbatim
-    // with NO warning, exactly the silent outcome the docs promise to reject. pi reports and skips an
-    // invalid entry (`docs/mcp.md`); so do we.
+    // ⛔ BOTH TRANSPORTS: a REPO DELTA is refused, a BASE entry is only warned about.
+    // `connectServer` tests `url` BEFORE `command`, so such an entry runs over HTTP and ignores the
+    // `command`. For a repo delta, refusing it is safe — the base entry survives — and it is what the
+    // docs promise. For the BASE layer, DROPPING it would zero a config that currently WORKS over `url`,
+    // which is the same "destroy a working operator config" failure the `type` ruling forbids
+    // (`merge-mcp.py`: "replacing it would destroy the operator's config"). So: warn loudly, keep it.
     if (typed.url !== undefined && typed.command !== undefined) {
-      console.log(
-        `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous, so ` +
-          `dropped. Declare ONE transport. ` +
-          suffix
-      );
-      continue;
+      if (label.startsWith("base")) {
+        console.log(
+          `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous; ` +
+            `it is KEPT and will run over "url" (that is the order this client dispatches in). ` +
+            `Remove one to be explicit.`
+        );
+      } else {
+        console.log(
+          `[mcp-client] WARN: ${label} entry "${name}" declares BOTH "url" and "command" — ambiguous, so ` +
+            `dropped (the base's entry, if any, is kept). Declare ONE transport. ` +
+            suffix
+        );
+        continue;
+      }
     }
     servers[name] = entry as McpServerConfig;
   }

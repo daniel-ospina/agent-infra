@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv, McpServerManager } from "./index.js";
+import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv, McpServerManager, classifyServers } from "./index.js";
 
 let passed = 0;
 let failed = 0;
@@ -411,7 +411,7 @@ await test("an entry declaring BOTH transports keeps the BASE entry — an ambig
   equal(t?.command, undefined, "the ambiguous delta is not applied");
 });
 
-await test("a BASE entry declaring BOTH transports is dropped at the read, with a warning", async () => {
+await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropping it would zero a working config)", async () => {
   // The docs promise an ambiguous entry is rejected — which was only true for a REPO entry: a base entry
   // declaring both was copied verbatim with no warning while connectServer silently used `url`.
   const repoDir = tempDir("mcp-bind-baseboth-repo-");
@@ -433,15 +433,18 @@ await test("a BASE entry declaring BOTH transports is dropped at the read, with 
     })
   );
   const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
-  ok(!("broken" in cfg.mcpServers), "an ambiguous BASE entry must be dropped, not silently resolved to `url`");
+  ok(
+    "broken" in cfg.mcpServers,
+    "a BASE entry declaring both transports must be KEPT — dropping it would zero a config that works over `url`"
+  );
   ok(cfg.mcpServers.fine, "and a valid base entry still loads");
   ok(
-    logs.some(l => l.includes("declares BOTH") && l.includes("base layer")),
+    logs.some(l => l.includes("declares BOTH") && l.includes("base layer") && l.includes("KEPT")),
     `the base layer must be named in the warning — got:\n${logs.join("\n")}`
   );
 });
 
-await test("a `type` that contradicts the declared transport keeps the BASE entry", () => {
+await test("a `type` that disagrees with the transport is a WARNING, and the delta still applies", () => {
   // `type` is the schema's transport selector, and connectServer dispatches on url/command — so
   // `{"type":"http","command":…}` would silently run over stdio.
   const merged = mergeMcpLayers(
@@ -449,8 +452,8 @@ await test("a `type` that contradicts the declared transport keeps the BASE entr
     { mcpServers: { t: { type: "http", command: "/bin/sh" } } } as never,
   );
   const t = merged.t as Record<string, unknown> | undefined;
-  equal(t?.url, "https://api.premiselabs.co/mcp/", "the base entry stands");
-  equal(t?.command, undefined, "the contradictory delta is not applied");
+  equal(t?.command, "/bin/sh", "the delta applies — `type` is inert here, so it must not veto a working entry");
+  equal(t?.url, undefined, "and the transport switch removed the base's url");
 });
 
 await test("a NORMALISED restatement of the same url still inherits the base's credentials", () => {
@@ -671,13 +674,19 @@ await test("a non-string `url`/`command`, or an invalid `type`/name, is DROPPED 
 
   const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
   ok(cfg.mcpServers.keep, "a valid entry still loads");
-  for (const bad of ["arrayUrl", "arrayCommand", "sseType", "bad name!"]) {
+  for (const bad of ["arrayUrl", "arrayCommand", "bad name!"]) {
     ok(!(bad in cfg.mcpServers), `\`${bad}\` must be dropped, not stringified into a live request`);
   }
   ok(
-    logs.some(l => l.includes("non-string")) && logs.some(l => l.includes("type")) &&
-      logs.some(l => l.includes("not a valid server name")),
+    logs.some(l => l.includes("non-string")) && logs.some(l => l.includes("not a valid server name")),
     `each rejection must name its reason — got:\n${logs.join("\n")}`
+  );
+  // ⛔ `type` is INERT here, and that is a RECORDED DECISION (merge-mcp.py / cell-install.sh: a
+  // self-hosted `type: "sse"` WORKS because the client selects the transport from `url`). Rejecting an
+  // entry for its `type` would zero a config the installer certifies.
+  ok(
+    cfg.mcpServers.sseType,
+    "an unrecognised `type` must NOT drop the entry — the client never reads `type`"
   );
 });
 
@@ -714,7 +723,7 @@ await test("a `__proto__` key cannot poison the merged map's prototype", () => {
   ok(merged.real, "and ordinary servers still merge");
 });
 
-await test("a `type`-only delta on a stdio base is REFUSED (the check runs on the EFFECTIVE entry)", () => {
+await test("a `type`-only delta on a stdio base is APPLIED (it cannot veto a working entry)", () => {
   // Checking the delta alone let `{"type": "http"}` be applied to a stdio base, producing exactly the
   // incoherent entry the check exists to reject.
   const merged = mergeMcpLayers(
@@ -722,8 +731,8 @@ await test("a `type`-only delta on a stdio base is REFUSED (the check runs on th
     { mcpServers: { g: { type: "http" } } } as never,
   );
   const g = merged.g as Record<string, unknown> | undefined;
-  equal(g?.type, undefined, "the contradictory type is not applied");
-  equal(g?.command, "npx", "and the base entry is kept intact");
+  equal(g?.type, "http", "the delta applies");
+  equal(g?.command, "npx", "and the transport the client dispatches on is untouched");
 });
 
 await test("`args: []` vs absent `args` is the SAME launch, so the base's env survives", () => {
@@ -777,6 +786,50 @@ await test("`connectAll` funnels through the sanitiser: no crash, clean stored c
   ok(
     entries.some(e => e.name === "real"),
     "and the valid one is still listed — catalog() must not be the tool that throws"
+  );
+});
+
+await test("classifyServers skips a non-object entry for a DIRECT caller", () => {
+  // The entry points sanitise first, so this belt exists for the exported function alone — and nothing
+  // exercised it, so removing it reintroduced `reading 'lazy'` silently.
+  const { eager, lazySkipped } = classifyServers(
+    { bad: null, ghost: 42, real: { url: "https://ok/mcp", lazy: true } } as never,
+    undefined,
+  );
+  deepEqual(eager, [], "only the valid lazy server is classified");
+  deepEqual(lazySkipped, ["real"], "and the invalid entries are skipped, not read");
+});
+
+await test("a BASE-layer entry with a prototype-shaped name is refused too", () => {
+  const merged = mergeMcpLayers(
+    JSON.parse('{"mcpServers":{"constructor":{"command":"/bin/sh"},"real":{"url":"https://ok/mcp"}}}') as never,
+    null,
+  );
+  ok(!Object.hasOwn(merged, "constructor"), "the base loop applies the same name lock as the repo loop");
+  ok(merged.real, "a valid base server still merges");
+});
+
+await test("a layer with `mcpServers: {}` is NOT reported as \"No mcpServers\"", async () => {
+  // `declaresServers` distinguishes "key absent" from "key present but empty"; without a fixture the two
+  // collapse and the message (and the comment promising it) are unverified.
+  const repoDir = tempDir("mcp-bind-empty-repo-");
+  const homeDir = tempDir("mcp-bind-empty-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  // BOTH layers carry an EMPTY map, so `sanitised` ends up empty while the KEY IS PRESENT — the only
+  // shape that distinguishes `declaresServers` from a truthiness test on the sanitised map.
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  ok(
+    !logs.some(l => l.includes("No mcpServers")),
+    `an EMPTY mcpServers map is not a missing one — got:\n${logs.join("\n")}`
   );
 });
 
