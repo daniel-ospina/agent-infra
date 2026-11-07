@@ -1141,12 +1141,24 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     # while the reviewer path stayed broken — the false claim standing indefinitely, which is the exact
     # reason this family exists. Compare against the NEWEST of the other members instead.
     _other_last=0
+    # ⛔ THE SCAN MATCHES THE TAG'S PREFIX, NOT ITS WHOLE FORM (review round 16, P2, measured): a dispatch
+    # claim is keyed by the DISPATCH (`_d<epoch>` basis, see the call sites), so an exact-form match would
+    # stop counting every such marker the moment one carried a basis — the pair would then never correct
+    # each other. The head is a 40-char sha, so a `:$_o:$head` prefix cannot collide with another revision.
     for _o in review-in-flight review-dispatch-failed awaiting-review; do
       [ "$_o" = "$state" ] && continue
-      _on=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_o:$head -->" 'index($0,t){n=NR} END{print n+0}')
+      _on=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_o:$head" 'index($0,t){n=NR} END{print n+0}')
       [ "${_on:-0}" -gt "$_other_last" ] && _other_last=$_on
     done
     _mine_last=$(printf '%s\n' "$seen" | awk -v t="$tag" 'index($0,t){n=NR} END{print n+0}')
+    # ⛔ A CLAIM KEYED TO A DISPATCH THAT HAS NO MARKER YET IS NEW TRUTH AND MUST POST (review round 16, P2,
+    # measured): `review-retries-exhausted:<head>` is deliberately NOT in this family, and its own text says
+    # the window rolls BY ITSELF — so after it, the loop dispatches again at the SAME head. With the state
+    # keyed only by (state, head), that dispatch's claim reused a tag posted BEFORE the exhaustion and was
+    # suppressed by the positional rule, leaving "not dispatching another review at this revision" as the
+    # newest comment while the loop bought up to REVIEW_MAX_ATTEMPTS more reviews at that revision — and
+    # nothing ever corrected it. `_mine_last = 0` means "no marker for THIS dispatch", which is exactly the
+    # case that must post.
     [ "${_mine_last:-0}" -gt 0 ] && [ "${_mine_last:-0}" -ge "${_other_last:-0}" ] && return 0
   else
     case "$seen" in *"$tag"*) return 0;; esac
@@ -1536,6 +1548,12 @@ PY
       fi
       if [ "$_att" != at-head ] && [ "$_rarm" = review ]; then
         if [ "$REVIEW_AVAILABLE" != 1 ]; then
+          # ⛔ THIS EXIT IS THE ONE STATE THAT PUBLISHED NOTHING (review round 16, P2, measured): on a box with
+          # no usable reviewer and free capacity, neither deferral path runs (nothing is ever dispatched, so
+          # the burst counter never moves), so a mergeable green unattested PR got NO auto-rail comment at
+          # all — indistinguishable from "a lane is working on it", the #3489 invisibility. The notice text
+          # for exactly this population already exists; it is published here.
+          publish_review_state "$repo" "$pr" awaiting-review "" notice
           log_line "$repo #$pr AWAITING-REVIEW ($_att) and this box has no reviewer at $REVIEW_SCRIPT — the PR stays unattested until one is reachable (said once at start, named here per candidate)"
           continue
         fi
@@ -1643,9 +1661,15 @@ PY
         # pass, so nothing is published for it here.
         # position, not presence — see `publish_review_state`: a success after a rolled-back dispatch must be
         # able to correct that notice.
+        # ⛔ KEYED BY THE DISPATCH, NOT JUST BY THE HEAD (review round 16, P2): the exhausted state is not in
+        # the positional family and its window rolls, so a re-dispatch at the SAME head must be able to say so
+        # on the PR. The epoch of THIS dispatch is the key — one comment per dispatch, and a repeat of the
+        # same dispatch is still a no-op. Computed BEFORE the case, because a case body cannot hold statements.
+        _rdisp="d$(review_dispatched_at "$_rout")"
+        case "$_rdisp" in d) _rdisp=;; esac
         case "$(review_state "$_rout")" in
-          pending) publish_review_state "$repo" "$pr" review-in-flight "$head" ;;
-          refused|retry) publish_review_state "$repo" "$pr" awaiting-review "$head" ;;
+          pending) publish_review_state "$repo" "$pr" review-in-flight "$head" "$_rdisp" ;;
+          refused|retry) publish_review_state "$repo" "$pr" awaiting-review "$head" "$_rdisp" ;;
         esac
         _rdispatched=$(( _rdispatched + 1 ))
         continue

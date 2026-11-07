@@ -974,8 +974,15 @@ grep -qF 'continue' <<<"$(grep -A1 -F 'AWAITING-REVIEW ($_att) and its checks ar
 # published `review-in-flight` — a claim that something is running — on a box with no reviewer at all.
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH. Same gate-vs-text distinction: the expression alone is satisfied
 # while the loop dispatches into a reviewer that does not exist and publishes 'review in flight' for it.
-grep -qF 'continue'  <<<"$(grep -A2 -F '[ "$REVIEW_AVAILABLE" != 1 ]' <<<"$_branch" || true)" \
+grep -qF 'continue'  <<<"$(grep -A12 -F '[ "$REVIEW_AVAILABLE" != 1 ]' <<<"$_branch" || true)" \
   || bad "the review branch must REFUSE to dispatch when no reviewer is available — the '[ \"\$REVIEW_AVAILABLE\" != 1 ]' guard must be followed by a 'continue'; without it a box with no reviewer records a dispatch, counts an attempt against the cap, and tells the PR 'review in flight'"
+
+# ⛔ AND THAT EXIT MUST PUBLISH (review round 16, P2, measured): with no usable reviewer AND free capacity
+# neither deferral path runs, so this is the only exit that can tell such a PR anything — it published
+# nothing, leaving a mergeable green unattested PR with no auto-rail comment at all.
+_ravail=$(sed -n '/^        if \[ "\$REVIEW_AVAILABLE" != 1 \]; then/,/^        fi$/p' "$SUT")
+grep -qF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' <<<"$_ravail" \
+  || bad "the reviewerless exit must PUBLISH the awaiting-review notice inside its own guard (the block holds: $(printf '%s' "$_ravail" | grep -c 'publish_review_state') publish(es)) — on a box with no reviewer and free capacity this is the only path that runs, and a mergeable green unattested PR that publishes nothing is indistinguishable from one a lane is working on"
 # ⛔ THE TWO STATES THE LOOP MUST PUBLISH FOR ITSELF, PINNED WHERE THE LOOP CALLS THEM (review, P1/P2).
 # Driving `publish_review_state` directly proves the TEXT works, not that anything ever posts it —
 # measured with this very harness: deleting the loop's `review-record-unbound` publish left the suite
@@ -1796,9 +1803,9 @@ grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
 #       text still exists; only the whole-line and the count pins see it. Measured the same way.
 # A text pin cannot see reachability, so the arm is pinned as the SHIPPED LINE, and the shape that could
 # shadow it is forbidden outright.
-grep -qxE '^[[:space:]]*pending\)[[:space:]]+publish_review_state "\$repo" "\$pr" review-in-flight "\$head"[[:space:]]*;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*pending\)[[:space:]]+publish_review_state "\$repo" "\$pr" review-in-flight "\$head"( "[^"]*")?[[:space:]]*;;' <<<"$_rdl" \
   || bad "the in-flight publish must BE the 'pending)' arm of the record gate — an ARM, not text that happens to appear near it; without the pending) label the branch is entered for every state and a finished dispatch re-publishes the false claim (INDENTATION IS NOT PINNED: a reformat must not redden this)"
-grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review( "\$head")?[[:space:]]*;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review( "\$head")?( "[^"]*")?[[:space:]]*;;' <<<"$_rdl" \
   || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — and it must be its OWN arm: a catch-all makes this line unreachable while leaving its text intact, which is how the reverted defect stayed GREEN (the optional \"\$head\" argument is required by the corrective-position rule: headless, the publish could supersede an in-flight claim only ONCE)"
 # ⛔ AND THE HEAD ARGUMENT IS NOT DECORATION (review round 6, P2, measured): headless, this corrective
 # publish is presence-keyed and can supersede an in-flight claim only ONCE — a later
@@ -1806,7 +1813,7 @@ grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo
 # alone and never posts another state. The arm above accepts either form (its job is "own arm, not
 # catch-all"), so the argument is pinned here: dropping it alone is invisible to every other arm, which
 # is how this exact defect survived one round.
-grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review "\$head"[[:space:]]*;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review "\$head"( "[^"]*")?[[:space:]]*;;' <<<"$_rdl" \
   || bad "the corrective publish must pass \"\$head\" so it can supersede a NEWER in-flight marker (got: $(printf '%s' "$_rdl" | grep -n 'awaiting-review' | head -1)) — headless it corrects only the first time, leaving 'review in flight' as the PR's last word for ever while nothing runs"
 grep -qE '^[[:space:]]*\*\)' <<<"$_rdl" \
   && bad "no catch-all '*)' arm may exist in the record gate — a '*)' placed before 'refused|retry)' shadows the corrective publish and restores the retry branch's own false 'review in flight' claim (reproduced: the suite stayed GREEN with it)"
@@ -2370,9 +2377,43 @@ _n0=$(wc -l < "$COMMENTS")
 publish_review_state acme/widget 42 awaiting-review
 [ "$(wc -l < "$COMMENTS")" = "$_n0" ] \
   || bad "the plain headless 'awaiting-review' must stay presence-keyed (it added $(($(wc -l < "$COMMENTS") - _n0)) comment(s)) — the basis is for the corrected text, not a licence to re-post the old one"
-[ "$(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT")" = 2 ] \
-  || bad "BOTH headless call sites must pass the notice basis (found $(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT"), want 2: the cap deferral and the burst deferral) — one without it leaves that path's corrected text a permanent no-op on every PR that already carries the old marker"
+# ⛔ EVERY HEADLESS SITE, INCLUDING THE REVIEWERLESS EXIT (review round 16, P2, measured): on a box with no
+# usable reviewer and free capacity neither deferral path ever runs, so that exit is the ONLY chance such a
+# PR has of being told anything — it published nothing, and a mergeable green unattested PR with no
+# auto-rail comment is indistinguishable from one a lane is working on.
+[ "$(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT")" = 3 ] \
+  || bad "ALL THREE headless call sites must pass the notice basis (found $(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT"), want 3: the cap deferral, the burst deferral, and the reviewerless exit) — one without it leaves that path's corrected text a permanent no-op on every PR that already carries the old marker"
 
+
+# ⛔ A DISPATCH CLAIM IS KEYED BY THE DISPATCH (review round 16, P2, measured end-to-end): the loop posted
+# `review-retries-exhausted:<head>` ("not dispatching another review at this revision"), the window then
+# rolled BY ITSELF, the loop dispatched again at the SAME head — and the new claim reused a tag that already
+# existed, so the positional rule suppressed it and the exhausted text stayed the PR's newest comment while
+# up to REVIEW_MAX_ATTEMPTS more reviews were bought. The claim carries the dispatch epoch as its key.
+_H16=$(printf 'a%.0s' $(seq 40))
+: > "$COMMENTS"; : > "$POSTED"
+publish_review_state acme/widget 42 review-in-flight "$_H16" d1700000000
+publish_review_state acme/widget 42 review-retries-exhausted "$_H16"
+publish_review_state acme/widget 42 review-in-flight "$_H16" d1700099999
+[ "$(grep -cF "auto-rail-review:review-in-flight:$_H16" "$COMMENTS")" = 2 ] \
+  || bad "a NEW dispatch at a head that already carries a claim MUST be able to say so (found $(grep -cF "auto-rail-review:review-in-flight:$_H16" "$COMMENTS") in-flight marker(s), want 2: the first dispatch and the one after the exhausted window rolled) — with a (state, head) key the second claim is suppressed by a tag posted BEFORE the exhaustion, so the PR keeps the 'not dispatching another review at this revision' text while the loop pays for more reviews"
+_case_newest=$(grep -oF "auto-rail-review:review-in-flight:$_H16" <<<"$(tail -1 "$COMMENTS")" || true)
+[ -n "$_case_newest" ] \
+  || bad "the newly dispatched claim must be the NEWEST marker on the PR (newest is: $(tail -1 "$COMMENTS")) — a correction that posts but is buried under the exhausted claim has not corrected anything"
+_n16=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 review-in-flight "$_H16" d1700099999
+[ "$(wc -l < "$COMMENTS")" = "$_n16" ] \
+  || bad "a repeat of the SAME dispatch must stay idempotent (added $(( $(wc -l < "$COMMENTS") - _n16 )) comment(s)) — the epoch key exists to let a new dispatch speak, not to re-post every pass"
+# …and BOTH head-bound claims must actually CARRY that key (the drive above proves the function honours it;
+# this ties the mechanism to the loop, or the fix lives in the library and never reaches a PR).
+[ "$(grep -cE 'publish_review_state "\$repo" "\$pr" (review-in-flight|awaiting-review) "\$head" "\$_rdisp"' "$SUT")" = 2 ] \
+  || bad "both head-bound dispatch claims must pass the per-dispatch key (found $(grep -cE 'publish_review_state "\$repo" "\$pr" (review-in-flight|awaiting-review) "\$head" "\$_rdisp"' "$SUT"), want 2) — with \"\$head\" alone the tag already exists after the first dispatch, so a re-dispatch at the same head can never be published"
+grep -qF '_rdisp="d$(review_dispatched_at "$_rout")"' "$SUT" \
+  || bad "the per-dispatch key must be the DISPATCH EPOCH read from the record, not a constant — an empty or fixed key silently restores the tag that already exists"
+# …and the family scan must match the tag's PREFIX, or every basis-carrying marker drops out of the pairing
+# the moment one is published — re-creating the permanent 'review in flight' this family exists to correct.
+grep -qF '<!-- auto-rail-review:$_o:$head" ' "$SUT" \
+  || bad "the corrective-position scan must key on the tag PREFIX ('<!-- auto-rail-review:\$_o:head'), not the whole annotated form ('...:\$head -->') — an exact-form match stops counting basis-carrying markers, so the in-flight/awaiting-review pair can no longer correct each other"
 # ⛔ AND A LEDGER THAT CANNOT BE APPENDED TO IS NOT A FREE SLOT (review round 15, P2, measured): a regular file
 # that reads but refuses `>>` (root-owned 0644/0444 after a sudo run, a read-only mount) passed every existing
 # guard, `awk` succeeded, the count stayed 0 for ever and the append failure was only LOGGED — so one paid
