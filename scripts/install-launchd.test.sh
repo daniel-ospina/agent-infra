@@ -561,6 +561,25 @@ done
 # worktree-hygiene #2047), and the result was a RED `bash-suites` on main that had nothing to do with any
 # PR that touched it. Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
 assert_eq "$GATED_TEMPLATES1" "4" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047 + pr-doctor #2303)"
+# ⛔ THE OUTPUT-LOCATION PARAGRAPH HAS BEEN INVERTED TWICE, SO IT GETS A SENSOR AND NOT A THIRD CORRECTION
+# (agent-infra#2281 review round 44, P1 — measured). The prose is operator-facing: it says where a live
+# verdict is written, and THREE readers open the canonical pair BY NAME — `heartbeat-loop.sh`,
+# `lib/fleet-inventory.sh`'s `_fleet_pr_doctor_bound`, and `objective.py`'s `pr_doctor_last_run` (review
+# cycle 2 measured the third; an earlier version of this very comment said two, which is the same
+# count-goes-stale defect the paragraph itself had). Round 44's first version said the per-repo pairs sat
+# "beside" the canonical one; its "correction" then claimed the canonical pair is never written in
+# `all-repos` mode — FALSE, because `run_all_repos()` ends by calling `canonical_paths()` and
+# `record_exit` writes the SET's aggregate there (measured over two repos: all six files appear and
+# `pr-doctor.status.json` carries `repo = "acme/alpha,acme/beta"` plus a two-row `repos` list). Both false
+# phrasings are pinned ABSENT and the aggregate fact pinned PRESENT — a paragraph nobody has got right
+# first is a claim, not a comment. The negative arms are the safe shape: they red only if the bug returns.
+_PRD_TPL="$(cat "$REPO_TEMPLATES/com.tortoise.pr-doctor.plist")"
+assert_contains "$_PRD_TPL" "each repo ALSO gets" "pr-doctor template: per-repo pairs are ADDITIONAL, not a replacement"
+assert_contains "$(tr 'A-Z' 'a-z' <<<"$_PRD_TPL")" "aggregate" "pr-doctor template: still states the SET aggregate lands on the canonical pair"
+assert_contains "$_PRD_TPL" "_fleet_pr_doctor_bound" "pr-doctor template: still names a reader that opens the canonical pair by name"
+assert_contains "$_PRD_TPL" "pr_doctor_last_run" "pr-doctor template: still names the beat's reader of the same canonical record"
+assert_not_contains "$_PRD_TPL" "NOT written at all" "pr-doctor template: does NOT claim the canonical pair is never written (round 44's inversion)"
+assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor template: does NOT claim the canonical pair moves away (round 44's inversion)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
