@@ -1510,7 +1510,9 @@ def resolve_labels(
 
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
-def _run_split(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
+def _run_split(
+    cmd: list[str], timeout: int = 300, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
     """ONE spawn, TWO streams KEPT APART.
 
     ⛔ A MERGED STREAM CANNOT ANSWER "WHICH LINE IS THE VALUE" (review finding P2, round 12). `_run`
@@ -1521,15 +1523,15 @@ def _run_split(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
     runner's own tooling. The caller that has a VALUE to read must get the stream it is on.
     """
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
     return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
 
 
-def _run(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: int = 300, env: dict[str, str] | None = None) -> tuple[int, str]:
     """The merged-stream form, for the callers whose ONLY question is the exit status."""
-    rc, out, err = _run_split(cmd, timeout)
+    rc, out, err = _run_split(cmd, timeout, env)
     return rc, ((out or "") + (err or "")).strip()
 
 
@@ -2962,7 +2964,7 @@ def resolve_provisioner() -> tuple[str | None, str]:
     )
 
 
-def provision(target_count: int) -> str:
+def provision(target_count: int, repo: str = "", root: str = "") -> str:
     """Create/extend the install so that runners 1..target_count exist — via the ONE installer.
 
     ⛔ This file never downloads a runner binary and never builds a `config.sh` argv for a NEW
@@ -2982,8 +2984,24 @@ def provision(target_count: int) -> str:
             "never downloads a runner binary). Repair/orphan paths still work; point "
             "RUNNER_AUTOSCALE_PROVISIONER (or the unit's `Environment=`) at a readable installer."
         )
+    # ⛔ THE CALLER'S OWN TWO KNOBS TRAVEL WITH THE CALL, BECAUSE A CHILD CANNOT GUESS THEM (review P2).
+    # `--count N` is all the argv carries, so the provisioner resolved its OWN defaults for the other two:
+    # the registration target (`ci_runner_pool.sh:261` — `RUNNER_POOL_REPO`, default `daniel-ospina/tortoise`)
+    # and, absent `--root`, `/opt`. On a repointed box that registered runners into the WRONG pool while
+    # `_live()` (repo-agnostic) counted them, so the pass reported `converged` with zero capacity for this
+    # repo; on a `--root X` box the install landed somewhere `discover()` never looks and the pass recorded
+    # `NO install appeared`. Both are FALSE PASSes, which is why this is a seam and not a default.
+    # The provisioner is the JOIN and translates `RUNNER_AUTOSCALE_REPO` into the pool tool's variable; this
+    # side deliberately does not name a variable that belongs to the tool on the other end of the join.
+    child_env = os.environ.copy()
+    if repo:
+        child_env["RUNNER_AUTOSCALE_REPO"] = repo
+    if root:
+        child_env["RUNNER_AUTOSCALE_RUNNER_ROOT"] = root
     rc, out = _run(
-        ["bash", provisioner, "--count", str(target_count), "--fallback", "auto"], timeout=1800
+        ["bash", provisioner, "--count", str(target_count), "--fallback", "auto"],
+        timeout=1800,
+        env=child_env,
     )
     if rc == 2:
         # `install-ci-runner-x64.sh` publishes 2 as "GUARD REFUSED — nothing was attempted". That
@@ -3489,7 +3507,7 @@ def converge(
             )
             break
         try:
-            note = provision(index)
+            note = provision(index, repo=repo, root=root)
         except ProvisionerRefused as exc:
             # ⛔ TWO ANSWERS TO TWO DIFFERENT QUESTIONS. The installer budgets space for the WHOLE
             # target plus its reserve; this pass adds ONE runner. So when its guard refuses while

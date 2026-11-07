@@ -50,6 +50,7 @@ fake_pool() {
   cat > "$body" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/calls.log"
+printf 'RUNNER_POOL_REPO=%s\n' "\${RUNNER_POOL_REPO:-}" >> "$TMP/pool-env.log"
 printf 'fake: mem_floor_mb=3584 reading_mb=2210 %s\n' "\${FAKE_NOTE:-}"
 exit $rc
 EOF
@@ -325,6 +326,33 @@ if grep -nE '^[[:space:]]*(err|printf)[^#]*rm -rf' "$SUT"; then
 else
   ok "no adapter message prescribes rm -rf"
 fi
+
+# 22. ⛔ THE REGISTRATION TARGET IS THE CALLER'S, NOT THE POOL TOOL'S DEFAULT (agent-infra#3469 review P2).
+# `ci_runner_pool.sh:261` resolves `POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"` and uses it for
+# BOTH the token scope (`:1659`) and the registration URL (`:1724`). The caller exports its own seam
+# (`RUNNER_AUTOSCALE_REPO`, `runner_autoscale.py:3969`); the JOIN is what translates it, because teaching the
+# caller the pool tool's private variable name is the second coupling this file exists to prevent. Without
+# the translation a repointed box registered into tortoise while the caller's repo-agnostic `_live()` counted
+# the runner — `verdict=converged`, exit 0, and zero capacity for the repo it was asked to converge.
+: > "$TMP/pool-env.log"
+out=$(RUNNER_AUTOSCALE_REPO=o/other CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
+      env -u RUNNER_ROOT -u RUNNER_POOL_REPO RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
+check "a call carrying the caller's repo still provisions" 0 "$rc" "" "$out"
+check "…and the pool child is told THAT repo" 0 0 "RUNNER_POOL_REPO=o/other" "$(cat "$TMP/pool-env.log")"
+: > "$TMP/pool-env.log"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
+      env -u RUNNER_ROOT -u RUNNER_POOL_REPO -u RUNNER_AUTOSCALE_REPO RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22b" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
+check "a call with NO caller repo still provisions on the pool tool's own default" 0 "$rc" "" "$out"
+check "…and the adapter invents no repo of its own" 0 0 "RUNNER_POOL_REPO=" "$(cat "$TMP/pool-env.log")"
+# ⛔ AND TWO DECLARED REPOS THAT DISAGREE ARE REFUSED, NOT ARBITRATED — the same direction the `RUNNER_ROOT`
+# guard above takes, for the same reason: picking a side is how the false PASS gets written.
+out=$(RUNNER_AUTOSCALE_REPO=o/other RUNNER_POOL_REPO=o/third CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
+      env -u RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22c" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
+check "two disagreeing repos are a refusal (rc 2)" 2 "$rc" "repo-disagreement" "$out"
+check "…naming both values" 0 0 "RUNNER_POOL_REPO=o/third RUNNER_AUTOSCALE_REPO=o/other" "$out"
+out=$(RUNNER_AUTOSCALE_REPO=o/same RUNNER_POOL_REPO=o/same CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
+      env -u RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22d" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
+check "…while two AGREEING repos are not a false block" 0 "$rc" "" "$out"
 
 printf '\n%s\n' "install-ci-runner-x64: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1

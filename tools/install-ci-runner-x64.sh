@@ -191,6 +191,30 @@ case "$BASE_NAME" in
   *) err "cannot-measure why=base-not-discoverable base=$BASE — the caller inventories <root>/gh-runner* (discover()), so an install named '$BASE_NAME' would never be counted; name it gh-runner-<something>"; exit 2 ;;
 esac
 
+# ── the repo: the CALLER's, or the registration lands in the wrong pool (contract fact 3, its twin) ──
+# ⛔ THE POOL TOOL RESOLVES ITS REGISTRATION TARGET FROM ITS **OWN** SEAM: `ci_runner_pool.sh:261` reads
+# `POOL_REPO="${RUNNER_POOL_REPO:-daniel-ospina/tortoise}"` and uses it for BOTH the token scope
+# (`:1659`) and the registration URL (`:1724`). The caller never passed its repo down (`provision()` argv
+# carried only `--count`/`--fallback`, `_run_split` spawns with no `env=`), so a box converging a
+# REPOINTED pool would register into tortoise — and the pass would count it anyway, because the caller's
+# `_live()` is repo-agnostic, so `live` reaches `target` and the pass reports `converged`, exit 0, with
+# zero capacity for that repo. That is a FALSE PASS of the file's own contract fact 3, one knob out from
+# root/base (agent-infra#3469 review P2). Nothing was broken only because both defaults agree today.
+# ⛔ THE ADAPTER TRANSLATES, AND THE CALLER KEEPS ITS OWN VOCABULARY: the caller exports its own seam
+# (`RUNNER_AUTOSCALE_REPO`), and this file — the JOIN — maps it onto the variable its child actually reads.
+# Teaching the caller the pool tool's private variable name would be the second coupling this file exists
+# to prevent.
+if [ -n "${RUNNER_AUTOSCALE_REPO:-}" ]; then
+  if [ -n "${RUNNER_POOL_REPO:-}" ] && [ "${RUNNER_POOL_REPO}" != "${RUNNER_AUTOSCALE_REPO}" ]; then
+    # ⛔ REFUSED, NOT SILENTLY PREFERRED — the same direction the `RUNNER_ROOT` guard above takes. Two
+    # declared repos that disagree mean this install would register a runner for one pool while the
+    # caller counts it against another; picking a side here is how the false PASS gets written.
+    err "cannot-measure why=repo-disagreement RUNNER_POOL_REPO=$RUNNER_POOL_REPO RUNNER_AUTOSCALE_REPO=$RUNNER_AUTOSCALE_REPO — the pool tool registers into RUNNER_POOL_REPO and the caller counts RUNNER_AUTOSCALE_REPO; a runner registered for one and counted against the other makes the pass report converged with zero capacity. Set them to the same repo (or unset one)"
+    exit 2
+  fi
+  export RUNNER_POOL_REPO="$RUNNER_AUTOSCALE_REPO"
+fi
+
 if [ "$COUNT" -eq 1 ]; then NAME=$BASE_NAME; else NAME=$BASE_NAME-$COUNT; fi
 DIR=$RUNNER_ROOT/$NAME
 

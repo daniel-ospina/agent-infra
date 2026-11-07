@@ -382,6 +382,12 @@ PROVISIONER_STUB = r"""#!/usr/bin/env bash
 # `install-ci-runner-x64.sh`'s contract: 0 = did it, 2 = ITS OWN GUARD REFUSED, anything else = fail.
 FIX="__FIX__"
 printf '%s\n' "$*" >> "$FIX/provisioner-calls.log"
+# ⛔ A SEPARATE LOG, NEVER AN EXTRA LINE IN `provisioner-calls.log`: that file is asserted
+# byte-for-byte by other arms, and a driver that also writes its env there would silently change what
+# "one call, one argv" means. The caller's two knobs must ARRIVE, not be guessable from a default.
+printf 'RUNNER_AUTOSCALE_REPO=%s\nRUNNER_AUTOSCALE_RUNNER_ROOT=%s\nRUNNER_POOL_REPO=%s\n' \
+  "${RUNNER_AUTOSCALE_REPO:-}" "${RUNNER_AUTOSCALE_RUNNER_ROOT:-}" "${RUNNER_POOL_REPO:-}" \
+  >> "$FIX/provisioner-env.log"
 [ -f "$FIX/provisioner.rc" ] && rc="$(cat "$FIX/provisioner.rc")" || rc=0
 [ -f "$FIX/provisioner.out" ] && cat "$FIX/provisioner.out" >&2
 exit "$rc"
@@ -5523,6 +5529,52 @@ def run_mutations():
                 print("   ❌ NOT RED — the paired case did NOT catch its own defect\n")
     print(f"MUTATIONS={len(MUTATIONS)} CAUGHT={len(MUTATIONS) - bad} MISSED={bad}")
     return bad == 0
+
+
+@test("T58 the caller's repo and ROOT reach the provisioner — a child cannot guess either")
+def t58_provisioner_receives_repo_and_root():
+    """`provision()` used to spawn the installer with `--count N --fallback auto` and NO `env=`, so the
+    two knobs that decide WHICH pool and WHICH root the registration lands in were left to the child's
+    own defaults (`ci_runner_pool.sh:261` — `RUNNER_POOL_REPO`, default `daniel-ospina/tortoise` — and
+    `/opt`). On a repointed box (`--repo`) that registered runners into the WRONG pool while `_live()`
+    (repo-agnostic) counted them, so the pass reported `converged`, exit 0, with zero capacity for this
+    repo; on a `--root X` box the install landed where `discover()` never looks and the pass recorded
+    `NO install appeared`. Both are FALSE PASSes, so both facts are asserted where the child can see
+    them — and asserted EMPTY on a plain call, because a value that only arrives when someone happens to
+    have it in their shell is not a seam (agent-infra#3469 review P2)."""
+    with Env():
+        for seam in ("RUNNER_AUTOSCALE_REPO", "RUNNER_AUTOSCALE_RUNNER_ROOT", "RUNNER_POOL_REPO"):
+            os.environ.pop(seam, None)
+        box = Box("join-env")
+        try:
+            box.provisioner(rc=0, out="provisioned slot=2 name=gh-runner-x64-2 added=1")
+            box.apply()
+            ra.provision(2, repo="o/other", root=box.root)
+            env = {}
+            for line in box.calls("provisioner-env.log"):
+                k, _, v = line.partition("=")
+                env[k] = v
+            check(
+                env.get("RUNNER_AUTOSCALE_REPO") == "o/other",
+                f"the caller's repo must reach the child, got {env.get('RUNNER_AUTOSCALE_REPO')!r}",
+            )
+            check(
+                env.get("RUNNER_AUTOSCALE_RUNNER_ROOT") == box.root,
+                f"the caller's root must reach the child, got {env.get('RUNNER_AUTOSCALE_RUNNER_ROOT')!r}",
+            )
+            # The adapter (the JOIN) is what translates this into the pool tool's own variable; the
+            # caller must NOT name a variable that belongs to the tool on the other side of the join.
+            check(
+                env.get("RUNNER_POOL_REPO") == "",
+                f"the caller must not speak the pool tool's private variable, got {env.get('RUNNER_POOL_REPO')!r}",
+            )
+            # ⛔ AND NO ARGUMENT WAS INVENTED: the contract is still `--count N --fallback auto`.
+            check(
+                box.calls("provisioner-calls.log")[-1] == "--count 2 --fallback auto",
+                f"argv unchanged, got {box.calls('provisioner-calls.log')[-1]!r}",
+            )
+        finally:
+            box.destroy()
 
 
 def main(argv=None) -> int:
