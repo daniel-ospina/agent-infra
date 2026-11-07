@@ -472,11 +472,17 @@ except Exception:
 if verb == "strip":
     sys.stdout.write(arg.strip())
 elif verb == "split":
-    import re as _re
-    sys.stdout.write("\n".join([x for x in _re.split(r"[,\s]+", arg) if x]))
-elif verb == "splitcount":
-    import re as _re
-    sys.stdout.write(str(len([x for x in _re.split(r"[,\s]+", arg) if x])))
+    # ⛔ DELEGATED, NOT RE-TYPED (round 10, P2). This carried its OWN copy of the splitter
+    # (`re.split(r"[,\s]+", arg)`), which is byte-identical to `configured_repos()` TODAY — and that
+    # is exactly what made it a latent false PASS. The promise below ("any future separator it learns
+    # is covered the day the doctor learns it") is undeliverable by a copy. Measured with a doctored
+    # `pr-doctor.py` in /tmp whose `configured_repos` also splits on `;`: the reader certified
+    # `OK — 1 repo(s)` at rc 0 for a checkout path carrying `;`, and the doctor then split it into a
+    # TRUNCATED real entry plus a phantom repo — the same failure this guard already refuses for `,`
+    # and for NBSP. So ask the doctor's own splitter.
+    # The dedupe `configured_repos()` applies cannot shrink an accepted set: two entries of one
+    # normalized key are already refused upstream as DUPLICATE-SLUG.
+    sys.stdout.write("\n".join(mod.configured_repos([], {"PR_DOCTOR_REPOS": arg})))
 elif verb == "tags":
     sys.stdout.write(mod.set_tag_collisions(arg.split(",") if arg else []))
 elif verb == "norm":
@@ -520,24 +526,22 @@ _rs_tag_collision() {
   return 0
 }
 
-# _rs_split_count <comma-joined entries> — how many entries the DOCTOR'S OWN splitter
-# (`configured_repos`: `re.split(r"[,\s]+", raw)`) sees. The reader refuses `,` inside a value, but that
-# enumerates ONE character class of a splitter that also splits on `\v`, `\f`, `\r` and Unicode
-# whitespace — measured in review round 8, an NBSP inside a checkout path passed every arm, produced
-# `grading 1 repo(s)`, and the doctor split it into a TRUNCATED real entry plus a phantom repo it then
-# refused. Round-tripping the rendered list through the doctor's own splitter is the check that cannot
-# drift: any future separator it learns is covered the day the doctor learns it.
+# _rs_split_entries <comma-joined entries> — the entries the DOCTOR'S OWN splitter
+# (`configured_repos`, which splits on `re.split(r"[,\s]+")` and dedupes by normalized key) yields.
+# The reader refuses `,` inside a value, but that enumerates ONE character class of a splitter that
+# also splits on `\v`, `\f`, `\r` and Unicode whitespace — measured in review round 8, an NBSP inside
+# a checkout path passed every arm, produced `grading 1 repo(s)`, and the doctor split it into a
+# TRUNCATED real entry plus a phantom repo it then refused. Round-tripping the rendered list through
+# the doctor's own splitter is the check that cannot drift — which is only true because the `split`
+# verb CALLS `configured_repos` rather than copying its regex (it copied it until round 10).
+# ⛔ THE `splitcount` VERB IS GONE (round 10). Round 9 replaced the count comparison with
+# `_rs_split_divergence`, which compares ENTRIES, so nothing called `_rs_split_count` any more — and
+# leaving a second, regex-copying splitter in the file is how a dead copy gets revived and silently
+# becomes the authority again. One splitter, one authority.
 _rs_split_entries() {
   local entries="${1:-}"
   [ -n "$entries" ] || return 0
   _rs_with_doctor split "$entries"
-  return 0
-}
-
-_rs_split_count() {
-  local entries="${1:-}"
-  [ -n "$entries" ] || { printf '0'; return 0; }
-  _rs_with_doctor splitcount "$entries"
   return 0
 }
 
@@ -612,7 +616,7 @@ repo_set_check() {
   if [ "$rc" != 0 ]; then return "$rc"; fi
 
   local f; f="$(repo_set_file)"
-  local bad=0 n=0 slug checkout state seen_states=""
+  local bad=0 n=0 slug checkout state seen_states="" seen_state_spell=""
 
   printf 'repo-set: %s\n' "$f"
   while IFS=$'\t' read -r slug checkout state; do
@@ -682,23 +686,37 @@ repo_set_check() {
       # that exists (so `..` and symlinks are PHYSICAL, not textual) and folds the not-yet-created
       # remainder lexically; `_rs_lower` still folds case on top, which is what keeps the APFS arm
       # working for a directory that does not exist yet.
-      # ⛔ AN UNPROVABLE KEY WARNS AND IS LEFT OUT OF THE DEDUPE (round 9, P2). `_rs_state_key` prints
-      # nothing when a component is PRESENT but unenterable (EACCES/EPERM/ELOOP — the TCC shape).
-      # Omitting the key is deliberately NOT a refusal: a permission denial is not a fact about the
-      # set, and "only a PROVEN fault refuses" is a recorded decision here. What it must never be is
-      # the previous SILENT assent, where two entries naming ONE directory passed as `ok` with no
-      # message at all; the operator now sees the entry named as ungraded.
-      local norm_state
+      # ⛔ AN UNPROVABLE KEY WARNS AND IS LEFT OUT OF THE IDENTITY DEDUPE (round 9, P2).
+      # `_rs_state_key` prints nothing when a component is PRESENT but unenterable (EACCES/EPERM/ELOOP
+      # — the TCC shape). Omitting the IDENTITY key is deliberately NOT a refusal: a permission denial
+      # is not a fact about the set, and "only a PROVEN fault refuses" is a recorded decision here.
+      # ⛔ BUT OMITTING IT MUST NOT DISCARD WHAT IS STILL PROVABLE (round 10, P2). Dropping the entry
+      # entirely turned a REFUSAL into rc 0 for a class that needs no filesystem at all: two entries
+      # spelled the same after folding `//`, `.`, a trailing `/` and case ARE one directory, whether
+      # or not this process may enter it. Measured before this second axis existed, with the ancestor
+      # mode 000: `state=$T/denied/state` TWICE returned `OK — 2 repo(s)` at rc 0 (and the round-8
+      # reader refused it), while the same fixture traversable refused. So there are now TWO axes:
+      #   * SPELLING — always computed, and PROOF on its own. Identical after folding `//`, `.`, a
+      #     trailing `/` and case cannot be two directories.
+      #   * IDENTITY — the resolved key, only when provable, which is what catches `..`, symlinks and
+      #     a case-differing spelling of a directory this process CAN enter.
+      # A match on either refuses. Only an entry that matches neither AND has no identity key warns.
+      local norm_state spell_state shared=""
       norm_state="$(_rs_lower "$(_rs_state_key "$state")")"
-      if [ -z "$norm_state" ]; then
-        printf 'repo-set: WARN STATE-UNVERIFIED — %s: could not resolve `%s` to a directory identity (present but not enterable), so this entry is NOT checked for a share with another repo; give it a path this process can traverse\n' "$slug" "$state"
-      else
-        case "$seen_states" in
-          *$'\n'"$norm_state"$'\n'*)
-            problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit" ;;
-        esac
-        seen_states="$seen_states"$'\n'"$norm_state"$'\n'
+      spell_state="$(_rs_lower "$(_rs_norm_path "$state")")"
+      if [ -n "$spell_state" ]; then
+        case "$seen_state_spell" in *$'\n'"$spell_state"$'\n'*) shared="spelling" ;; esac
       fi
+      if [ -n "$norm_state" ]; then
+        case "$seen_states" in *$'\n'"$norm_state"$'\n'*) shared="identity" ;; esac
+      fi
+      if [ -n "$shared" ]; then
+        problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit"
+      elif [ -z "$norm_state" ]; then
+        printf 'repo-set: WARN STATE-UNVERIFIED — %s: could not resolve `%s` to a directory identity (present but not enterable), so it is NOT checked for a share with another repo beyond its own spelling; give it a path this process can traverse\n' "$slug" "$state"
+      fi
+      if [ -n "$spell_state" ]; then seen_state_spell="$seen_state_spell"$'\n'"$spell_state"$'\n'; fi
+      if [ -n "$norm_state" ]; then seen_states="$seen_states"$'\n'"$norm_state"$'\n'; fi
     fi
 
     if [ -n "$problems" ]; then
