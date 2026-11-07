@@ -3456,7 +3456,11 @@ git -C "$WT" checkout -q -b fix/4242-first-attempt 2>/dev/null
 git -C "$WT" push -q -u origin fix/4242-first-attempt 2>/dev/null
 pi_stub dirty
 : > "$O/logs/lane.log"
-PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+# ⛔ ALL FOUR DISK TERMS, NOT THREE (disk-admission.test.sh §I). With `DISK_LANE_SELF_MB` unstated the
+# lane-headroom term defaults to this host's own cost (6144 MB), so on a host with free space between
+# the 1 MB floor and that default the arm's subject becomes a DISK-NOHEADROOM refusal instead — the
+# arm then measures the box, not the WIP rescue it exists for.
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
   drive "$GATE" 300 "issue-shaped" >/dev/null 2>&1
 arm "$O/logs/lane.log"
 PW_REF="$(git -C "$BARE" for-each-ref --format='%(refname)' 'refs/wip/*' 2>/dev/null | grep -c 'refs/wip/issue-4242-first-attempt$' || true)"
