@@ -1096,6 +1096,51 @@ if sys.argv[2] == "compose":
     # SENT a request. That is a network failure, not the `Invalid URL` this refusal quotes, and a gate that claimed it
     # would be quoting a failure the box never printed. The check below therefore runs on the vendor\x27s own
     # strip-then-append, so every arm\x27s verdict agrees with what `pi -p` actually printed.
+    def _port_ok(auth):
+        # \u26d4 THE PORT IS PART OF "WOULD `new URL()` THROW" (round 41, P1, measured). `auth` is
+        # `[userinfo@]host[:port]`, and node THROWS `ERR_INVALID_URL` for a port that is not all-decimal or is out of
+        # range \u2014 measured: `https://host:abc`, `https://host:+80`, `https://host:-1`, `https://host:1e3`,
+        # `https://host:65536` and `https://host:80:90` all throw, while `https://host:`, `https://host:0`,
+        # `https://host:080` and `https://host:65535` all parse. `pi-messages.js:251` builds
+        # `new URL(`${model.baseUrl.replace(/\/+$/u, "")}/messages`)`, so each of those is `Invalid URL` before a
+        # request is sent \u2014 the failure `reason=models-json-bad-gateway` exists to quote \u2014 and the earlier
+        # test (a BARE `:port` authority, and nothing else) passed them as usable.
+        # USERINFO IS SPLIT OFF FIRST because `https://user:pass@host/v1` PARSES (measured) and a port test applied to
+        # the whole authority would read `pass@host` as the port and refuse a box `pi -p` runs \u2014 the false-block
+        # direction this file\x27s header forbids.
+        hostport = auth.rsplit("@", 1)[-1]
+        if hostport.startswith("["):
+            close = hostport.find("]")
+            if close < 0:
+                return False  # `https://[::1` \u2014 an unclosed literal throws
+            tail = hostport[close + 1:]
+            if not tail:
+                return True
+            if not tail.startswith(":"):
+                return False  # `https://[::1]x:80` \u2014 text after the literal throws
+            port = tail[1:]
+        else:
+            if ":" not in hostport:
+                return True
+            host, port = hostport.rsplit(":", 1)
+            if ":" in host:
+                return False  # `host:80:90` \u2014 a second colon is not a port, and node throws it
+        # `[0-9]` and not `\d`: python\x27s `\d` matches non-ASCII decimal digits, which `int()` would then accept while
+        # the vendor\x27s parser refuses them.
+        # \u26d4 AND THE CONVERSION IS BOUNDED, BECAUSE AN UNBOUNDED ONE IS A FALSE PASS (round 42, P2, measured):
+        # `int()` raises `ValueError` above `sys.get_int_max_str_digits()` (4300 here), the exception kills this whole
+        # compose payload, and `key_gate_compose` runs the interpreter with `2>/dev/null` \u2014 so the gate lost EVERY
+        # compose-level refusal and printed `check=ok` on a box whose `new URL()` throws. \u26d4 LEADING ZEROS ARE STRIPPED
+        # RATHER THAN THE STRING LENGTH BOUNDED DIRECTLY, because node PARSES the value: measured,
+        # `host:` + 5000 zeros and `host:0000080` are both VALID (ports 0 and 80), while any value above 65535 throws.
+        # A plain `len(port) <= 5` guard (the obvious fix) would refuse those two boxes `pi -p` runs \u2014 trading a false
+        # PASS for a false BLOCK. After `lstrip`, at most 5 digits can reach `int()`, so the conversion cannot raise.
+        if port == "":
+            return True
+        if re.fullmatch(r"[0-9]+", port) is None:
+            return False
+        digits = port.lstrip("0") or "0"
+        return len(digits) <= 5 and int(digits) <= 65535
     def _buildable(v):
         s = str(v).strip()
         m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*):(.*)$", s, re.S)
@@ -1104,7 +1149,7 @@ if sys.argv[2] == "compose":
         if m.group(1).lower() in ("http", "https"):
             rest = (m.group(2).rstrip("/") + "/messages").lstrip("/")
             auth = re.split(r"[/?#]", rest, 1)[0]
-            return bool(auth) and not re.search(r"\s", auth) and not re.fullmatch(r":\d*", auth)
+            return bool(auth) and not re.search(r"\s", auth) and not re.fullmatch(r":\d*", auth) and _port_ok(auth)
         return True
     # \u26d4 THE NORMALISATION IS THE VENDOR\x27S, AND REWRITING A SCHEME IS A FALSE PASS (round 40, P2, measured).
     # `normalizeRadiusGatewayUrl` (`pi-ai/dist/providers/radius-config.js`) is: prefix `https://` ONLY when
@@ -1116,8 +1161,18 @@ if sys.argv[2] == "compose":
     # `Error: Unknown provider "deepseek"` while the old normaliser collapsed the scheme and printed `check=ok` \u2014 a
     # false PASS on a box pi cannot resolve at all. The last round\x27s spelling tolerance is preserved where the vendor has
     # it (an added scheme for a scheme-LESS value, and any number of slashes) and dropped where it does not.
-    _gw_raw = _gw.strip()
-    _gw_norm = _gw_raw if re.match(r"^https?://", _gw_raw, re.I) else "https://" + _gw_raw
+    # \u26d4 AND IT DOES **NOT** TRIM WHITESPACE, BECAUSE THE VENDOR DOES NOT (round 41, P1, measured).
+    # `normalizeRadiusGatewayUrl` is `/^https?:\/\//iu.test(value) ? value : `https://${value}`` then
+    # `.replace(/\/+$/u, "")` \u2014 there is no `.trim()` anywhere on that path, and `model-runtime.js:130` hands it
+    # `config.baseUrl.replace(/\/v1\/?$/u, "")` with no trim either. So `" https://radius.pi.dev"` does NOT match the
+    # scheme test, becomes `https:// https://radius.pi.dev`, and is NOT the default gateway: its baseline catalog is
+    # empty, `modelFromJson` throws and `recomposeProvider` DELETES the provider \u2014 measured, `pi -p` on that shape
+    # answers `Error: Unknown provider "deepseek"`. A `.strip()` here (which this line carried until round 41) made the
+    # padded spelling equal the default, fired the `_grant_default` return, and printed `check=ok var=RADIUS_API_KEY` on
+    # exactly that box. \u26d4 NOTE THE ASYMMETRY: `_buildable` above DOES strip, and that is correct \u2014 it answers
+    # "would `new URL()` throw", and the WHATWG parser removes leading/trailing spaces itself. This test asks a
+    # different question ("does the vendor call this THE DEFAULT gateway"), so the two must not be made to agree.
+    _gw_norm = _gw if re.match(r"^https?://", _gw, re.I) else "https://" + _gw
     _gw_norm = re.sub(r"/+$", "", _gw_norm)
     _grant_default = bool(_grant and _gw_norm == "https://radius.pi.dev")
     # \u26d4 NO EARLY RETURN HERE (round 39, P1, measured): `definition.baseUrl` wins at `provider-composer.js:88` on the

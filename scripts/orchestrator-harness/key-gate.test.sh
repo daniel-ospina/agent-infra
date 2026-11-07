@@ -812,6 +812,95 @@ has "$OUT" "reason=models-json-bad-gateway" "3z15y62 …with the URL reason, nam
 OUT="$(run_gate "$HTWO" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=ZZDIFF)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "3z15y63 a pin matching NO definition still tests EVERY definition (rc=${RC:-none})" \
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+# ── 3z15y64-68: THE VENDOR'S GATEWAY NORMALISER DOES **NOT** TRIM WHITESPACE ──────────────────────────
+# ⛔ MEASURED ON THE INSTALLED pi (round 41, P1): `normalizeRadiusGatewayUrl` is
+# `/^https?:\/\//iu.test(value) ? value : `https://${value}`` then `.replace(/\/+$/u, "")` — there is no `.trim()` on
+# that path, and `model-runtime.js:130` hands it `config.baseUrl.replace(/\/v1\/?$/u, "")` with no trim either. So a
+# PADDED default gateway is NOT the default one, its baseline catalog is empty, `modelFromJson` throws and
+# `recomposeProvider` DELETES the provider — measured, `pi -p` on either padded spelling + an api-less definition answers
+# `Error: Unknown provider "deepseek"`. A `.strip()` in the normaliser made both equal to the default, fired the
+# `_grant_default` return and printed `check=ok var=RADIUS_API_KEY` over exactly those boxes.
+# ⛔ MEASURED BY MUTATION: both pairs below redden when the normaliser\x27s `.strip()` is restored (the round-41 defect)
+# — measured, that mutant reddens exactly `3z15y64`-`68` and nothing else in the suite, so these arms pin the TRIM, not
+# the scheme grammar or the `/v1` strip, which `3z15y18/19` and `3z15y54`-`57` already pin.
+# ⛔ NOTE THE ASYMMETRY IS DELIBERATE, AND `3z15y44`/`45` PIN THE OTHER SIDE: `_buildable` strips because the WHATWG
+# parser trims, the normaliser does not because the vendor function does not. "Making them agree" breaks one of the two.
+GW_LEAD_WS_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":" https://radius.pi.dev","models":[{"id":"deepseek-flash"}]}}}'
+HGWLEAD="$(mkhome gateway_leading_ws "$GW_LEAD_WS_JSON")"
+OUT="$(run_gate "$HGWLEAD" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y64 a LEADING-SPACE default gateway is NOT the default one, so the box REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y65 …naming the provider pi deletes, which is what \`pi -p\` prints"
+GW_TRAIL_WS_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev ","models":[{"id":"deepseek-flash"}]}}}'
+HGWTRAIL="$(mkhome gateway_trailing_ws "$GW_TRAIL_WS_JSON")"
+OUT="$(run_gate "$HGWTRAIL" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y66 a TRAILING-SPACE default gateway is not the default one either (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y67 …the same deleted-provider fact"
+hasnt "$OUT" "check=ok" "3z15y68 …and never the green line the trimming normaliser printed"
+# ── 3z15y69-76: THE AUTHORITY'S PORT IS PART OF "WOULD `new URL()` THROW" ──────────────────────────────
+# ⛔ MEASURED ON node, on the vendor's own URL construction (round 41, P1): `new URL("<baseUrl>/messages")` THROWS
+# `ERR_INVALID_URL` for `host:abc`, `host:+80`, `host:-1`, `host:1e3`, `host:65536` and `host:80:90`, and PARSES
+# `host:`, `host:0`, `host:080`, `host:65535`, `user:pass@host` and `[::1]:8080`. `pi-messages.js:251` builds that URL
+# per request, so every throwing spelling is `Invalid URL` before anything is sent — the failure
+# `reason=models-json-bad-gateway` exists to quote. The earlier test caught a BARE `:port` authority and nothing else,
+# so a typo\x27d or out-of-range port printed `check=ok` over a lane that cannot start.
+# ⛔ MEASURED BY MUTATION, and the two directions were measured SEPARATELY because they are not the same mutant:
+# `3z15y69`-`72` redden when `_port_ok` is dropped from `_buildable`; `3z15y73`/`74`/`76` redden on "refuse any authority
+# containing `:`", and `3z15y75` reddens on the narrower "run the port test on the WHOLE authority, userinfo included".
+# They are what stops this fix from becoming a false block on boxes `pi -p` runs (a valid port, an IPv6 literal and
+# userinfo all PARSE), and each control was confirmed to redden under the mutant it names rather than assumed to.
+PORT_BAD_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:abc/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPBAD="$(mkhome port_nonnumeric "$PORT_BAD_JSON")"
+OUT="$(run_gate "$HPBAD" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y69 a NON-NUMERIC port REFUSES (rc=${RC:-none}) — \`pi -p\` answers \`Invalid URL\` there" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y70 …as the URL-level fact"
+PORT_RANGE_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:99999/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPRANGE="$(mkhome port_out_of_range "$PORT_RANGE_JSON")"
+OUT="$(run_gate "$HPRANGE" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y71 an OUT-OF-RANGE port REFUSES too (rc=${RC:-none}) — the parser rejects anything above 65535" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y72 …the same URL-level fact"
+PORT_OK_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:8080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPOK="$(mkhome port_valid "$PORT_OK_JSON")"
+OUT="$(run_gate "$HPOK" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y73 a VALID port is NOT refused (rc=${RC:-none}) — \`new URL\` parses it, so \`pi -p\` runs" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y74 …and the URL reason never fires for it"
+PORT_USERINFO_JSON='{"providers":{"deepseek":{"baseUrl":"https://user:pass@gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPUI="$(mkhome port_userinfo "$PORT_USERINFO_JSON")"
+OUT="$(run_gate "$HPUI" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y75 USERINFO before the host is NOT refused (rc=${RC:-none}) — a port test applied to the whole authority would read \`pass@host\` as the port" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+PORT_V6_JSON='{"providers":{"deepseek":{"baseUrl":"https://[::1]:8080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPV6="$(mkhome port_ipv6 "$PORT_V6_JSON")"
+OUT="$(run_gate "$HPV6" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y76 an IPv6 literal with a port is NOT refused (rc=${RC:-none}) — the colons inside \`[::1]\` are not a port" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+# ── 3z15y77-80: THE PORT CONVERSION IS BOUNDED, AND LEADING ZEROS ARE THE VALUE ────────────────────
+# ⛔ MEASURED (round 42, P2): an UNBOUNDED `int(port)` raises `ValueError` above sys.get_int_max_str_digits()
+# (4300 here), the exception kills the whole compose payload, `key_gate_compose` runs the interpreter with
+# `2>/dev/null`, and the gate therefore printed `check=ok` on a box whose `new URL()` THROWS
+# `ERR_INVALID_URL` — while the PRE-FIX gate refused it 82. A crash that silently deletes every compose-level
+# refusal is the fail-open direction this file\x27s header forbids, so the arm below is a REGRESSION GUARD on the
+# fix, not on the old code: it is RED on the unbounded version and green once the conversion is bounded.
+# ⛔ AND THE OBVIOUS FIX IS WRONG IN THE OTHER DIRECTION: node PARSES leading zeros — measured, `host:` + 5000
+# zeros is port 0 and `host:0000080` is port 80, both VALID — so a `len(port) <= 5` guard refuses boxes `pi -p`
+# RUNS. `3z15y79`/`80` pin that direction; the fix strips zeros BEFORE it bounds the length.
+PORT_HUGE="$(printf '%04301d' 0 | tr '0' '9')"
+PORT_HUGE_JSON="{\"providers\":{\"deepseek\":{\"baseUrl\":\"https://gw.example:${PORT_HUGE}/v1\",\"models\":[{\"id\":\"deepseek-flash\",\"api\":\"pi-messages\"}]}}}"
+HPHUGE="$(mkhome port_huge "$PORT_HUGE_JSON")"
+OUT="$(run_gate "$HPHUGE" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y77 a 4301-DIGIT port REFUSES (rc=${RC:-none}) — \`new URL\` throws, and an uncaught conversion error must never become \`check=ok\`" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y78 …the same URL-level fact, not a lost diagnosis"
+PORT_ZEROS_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:0000080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPZERO="$(mkhome port_leading_zeros "$PORT_ZEROS_JSON")"
+OUT="$(run_gate "$HPZERO" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y79 a ZERO-PADDED port is NOT refused (rc=${RC:-none}) — \`new URL\` parses \`0000080\` as port 80, so a plain length bound would false-block this box" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y80 …and the URL reason never fires for it"
 
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
