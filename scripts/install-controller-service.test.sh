@@ -2824,8 +2824,15 @@ SH_SHAPES="$(sed -n '/^lane_scratch_shape()/,/^}/p' "$INST" 2>/dev/null \
   | sed -n 's/^[[:space:]]*\([^)]*\))[[:space:]]*printf.*/\1/p' | tr '|' '\n' | grep -v '^$' | sort -u)"
 REPAIR_SHAPES=""
 if [ -f "$REPAIR_SH" ]; then
-  REPAIR_SHAPES="$(grep -n '\.worktrees' "$REPAIR_SH" 2>/dev/null | grep -m1 ')' \
-    | sed 's/^[0-9]*:[[:space:]]*//; s/)[[:space:]]*$//' | tr '|' '\n' | grep -v '^$' | sort -u)"
+  # ⛔ PARSED STRUCTURALLY, NOT BY THE FIRST LINE THAT MENTIONS `.worktrees` (re-review P2, measured). The
+  # previous form was `grep -n '\.worktrees' | grep -m1 ')'`: it read ONE line AND only a line containing
+  # `.worktrees`, so a shape added to the repair file as its own `case` arm (`/tmp/lane-*|/srv/scratch-*)`
+  # was INVISIBLE while the arm stayed green — the drift this gate exists to catch, admitted by the gate
+  # itself. Reproduced: a mutated `install-repair-service.sh` with that second arm parsed to the SAME set as
+  # before. Every pattern line of the `case` is now collected, so an addition reddens like a removal.
+  REPAIR_SHAPES="$(sed -n '/case "\$SCRIPTS_DIR" in/,/esac/p' "$REPAIR_SH" 2>/dev/null \
+    | sed -n 's/^[[:space:]]*\([^#[:space:]][^)]*\))[[:space:]]*$/\1/p' \
+    | tr '|' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | sort -u)"
 fi
 if [ -z "$SH_SHAPES" ] || [ -z "$REPAIR_SHAPES" ]; then
   bad '§P6: could not read BOTH shape lists, so drift cannot be shown — an arm that passes on an unreadable side is vacuous'
@@ -2928,6 +2935,27 @@ if [ -d "$PG_CLONE/.git" ]; then
       *'LINKED GIT WORKTREE'*) ok '§P7: and it is still refused as a LINKED worktree' ;;
       *) bad "§P7: the GIT_DIR attempt was refused for another reason — the git arithmetic may still have read the hub: $PG_E_OUT" ;;
     esac
+    # ⛔ AND GIT_DIR *ALONE* IS THE WEAK FORM OF THE ATTACK (re-review P1, measured END-TO-END). With
+    # `GIT_DIR` and `GIT_WORK_TREE` BOTH exported — the canonical pair, and the one this repo's own guards
+    # treat as a unit (`extensions/main-worktree-guard`'s `AMBIENT_GIT_VARS`) — the unscrubbed reads answered
+    # the PIN: `--show-toplevel` printed it and `symbolic-ref -q HEAD` read its detached HEAD, so a BRANCH
+    # worktree graded "detached at this box's recorded pin" and the installer ARMED it (rc=0). The arm above
+    # could never see this: with `GIT_DIR` alone, `--show-toplevel` fell back to the cwd and named the hub.
+    # `linked_worktree_root` now reads its branch/detached answer through the same scrub as `git_dirs`.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    PG_PIN="$PG/home/harness"
+    PG_PIN_SHA="$(git -C "$PG_CLONE" rev-parse HEAD 2>/dev/null)"
+    mkdir -p "$PG_PIN"
+    if [ -n "$PG_PIN_SHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG_PIN/$PG_PIN_SHA" "$PG_PIN_SHA" 2>/dev/null; then
+      PG_F_RC=0
+      PG_F_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh GIT_DIR=$PG_PIN/$PG_PIN_SHA/.git GIT_WORK_TREE=$PG_PIN/$PG_PIN_SHA" inst pg --install 2>&1)" || PG_F_RC=$?
+      [ "$PG_F_RC" -ne 0 ] && ok '§P7: an ambient GIT_DIR+GIT_WORK_TREE pair pointing at the pin does NOT launder a branch worktree' \
+                          || bad "§P7: two exported variables armed an ExecStart from a BRANCH worktree — the guard's own branch/detached read inherited the caller's selection: $PG_F_OUT"
+      [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+        && ok '§P7: and the ambient-GIT pair armed nothing' || bad '§P7: the ambient-GIT pair still wrote a unit'
+    else
+      bad '§P7: the fixture could not create the pin worktree, so the ambient-GIT-pair arm did not run'
+    fi
   else
     bad '§P7: the fixture could not create a linked worktree, so the git-arithmetic arm did not run'
   fi
@@ -3011,6 +3039,53 @@ PPF_RC=0; PPF_OUT="$(inst ppf --install 2>&1)" || PPF_RC=$?
 grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPF/units/eldato-orchestrator.service" 2>/dev/null \
   && ok '§P3: and it records unknown@unknown rather than claiming a revision nobody read' \
   || bad '§P3: a supervisor with no git work tree recorded something other than unknown@unknown'
+# ⛔ AND A FARMED COPY UNDER A `$HOME` THAT IS ITSELF A REPOSITORY MUST NOT BORROW ITS REVISION (re-review P2,
+# measured). `git -C <farm dir> rev-parse` answers the nearest ENCLOSING work tree, so the ordinary dotfiles
+# layout recorded a confident `<home>@<sha>` — a PLAUSIBLE WRONG answer to "which code does this unit run",
+# which is worse than none because it reads as proof. The farmed file here is deliberately UNTRACKED, which is
+# what a dotfiles repo's config-only commitment produces; the pin must fall back to `unknown@unknown`.
+PPD="$(arm_root ppd)"; mk_systemctl "$PPD/bin" "$PPD/state" "$PPD/sc.log"; mk_tmux "$PPD/bin" "$PPD/tmux.log"
+mkdir -p "$PPD/home/.pi/agent/scripts"
+cp "$SUP" "$PPD/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
+printf 'dotfiles\n' > "$PPD/home/README"
+git init -q "$PPD/home" 2>/dev/null
+git -C "$PPD/home" add README >/dev/null 2>&1
+git -C "$PPD/home" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPD/home" rev-parse HEAD 2>/dev/null)" ] && [ -z "$(git -C "$PPD/home" ls-files --error-unmatch -- "$PPD/home/.pi/agent/scripts/cloud-cell-supervisor.sh" 2>/dev/null)" ]; then
+  PPD_RC=0; PPD_OUT="$(inst ppd --install 2>&1)" || PPD_RC=$?
+  [ "$PPD_RC" -eq 0 ] && ok '§P3: a farmed supervisor under a git-repo HOME still installs (the pin is an observation, not a gate)' \
+                     || bad "§P3: refused a farmed copy merely because its home is a repository — false block: $PPD_OUT"
+  grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPD/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P3: and it does NOT borrow the enclosing dotfiles repo revision — unknown@unknown, not <home>@<sha>' \
+    || bad "§P3: the pin borrowed a repo that does not carry the supervisor — got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPD/units/eldato-orchestrator.service" 2>/dev/null)"
+else
+  bad '§P3: the fixture could not build the git-repo-HOME shape, so the borrowed-revision arm did NOT run'
+fi
+# ⛔ AND A PATH THIS UNIT CANNOT CARRY IS REFUSED, NOT RENDERED (re-review P2, measured). The template renders
+# `Environment=ORCH_SUPERVISOR_PIN=…` and `ExecStart=/bin/bash {{SUPERVISOR}} start` UNQUOTED, so systemd splits
+# on whitespace: a checkout at `…/home/sp ace` rendered a pin assignment systemd DROPPED ("Invalid environment
+# assignment, ignoring: ace@…") while `verify_unit`'s exact-line grep PASSED on the raw text — a false PASS over
+# an artifact systemd reads differently. The installer now refuses and names the reason.
+PPE="$(arm_root ppe)"; mk_systemctl "$PPE/bin" "$PPE/state" "$PPE/sc.log"; mk_tmux "$PPE/bin" "$PPE/tmux.log"
+PPE_REPO="$PPE/home/sp ace"; mkdir -p "$PPE_REPO/scripts"
+cp "$SUP" "$PPE_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPE_REPO" 2>/dev/null
+git -C "$PPE_REPO" add -A >/dev/null 2>&1
+git -C "$PPE_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPE_REPO" rev-parse HEAD 2>/dev/null)" ]; then
+  PPE_RC=0
+  PPE_OUT="$(ORCH_SUPERVISOR="$PPE_REPO/scripts/cloud-cell-supervisor.sh" inst ppe --install 2>&1)" || PPE_RC=$?
+  [ "$PPE_RC" -ne 0 ] && ok '§P3: a supervisor path containing whitespace is REFUSED (systemd would split it, and verify_unit would not notice)' \
+                     || bad "§P3: rendered an unquoted ExecStart/pin for a path systemd splits — a unit that cannot start: $PPE_OUT"
+  case "$PPE_OUT" in
+    *whitespace*) ok '§P3: and the refusal says the path is unquotable in this unit' ;;
+    *) bad "§P3: the whitespace refusal does not name the reason — $PPE_OUT" ;;
+  esac
+  [ ! -f "$PPE/units/eldato-orchestrator.service" ] \
+    && ok '§P3: and nothing was armed for a path the unit cannot carry' || bad '§P3: a splittable path still wrote a unit'
+else
+  bad '§P3: the fixture could not create the spaced checkout, so the whitespace arm did NOT run'
+fi
 # ⛔ A BARE-CONFIGURED PRIMARY CLONE IS THE CELLS' OWN SHAPE, AND IT HAS NO TOP LEVEL TO NAME (re-review P3).
 # Measured on this fleet: `/tmp/cell-ai` answers `core.bare` → true, so `rev-parse --show-toplevel` FAILS while
 # `HEAD` answers — and the pin degraded to `unknown@<sha>` exactly where the doc promises `<repo>@<sha>`.
