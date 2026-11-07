@@ -3397,10 +3397,12 @@ else
     _l_old="$(printf '%s\n' "$_lkv_pin" | K="$_okl" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
     _l_new="$(printf '%s\n' "$_lkv_new" | K="$_okl" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
     [ "$_l_old" = "$_l_new" ] && continue
-    # ⛔ ALL THREE BRANCHES DERIVE THEIR TIMING FROM `_out_got` (review P3, cycles 78-79). Cycle 78 fixed only the
+    # ⛔ EVERY BRANCH DERIVES ITS TIMING FROM `_out_got` (review P3, cycles 78-79, 84). Cycle 78 fixed only the
     # `CHANGED` branch: a key never captured this run was still reported as "VANISHED after the snapshot", and one
     # already present at the first snapshot as "APPEARED after the snapshot" — both false, on the check family whose
-    # whole job is to avoid false causes.
+    # whole job is to avoid false causes. Cycle 84 found the fourth case: `_l_first` EMPTY (absent at the first
+    # snapshot) with a CRC that differs from the pin fell to the last arm and was called "value drift, not late
+    # creation" — the precise opposite of what the empty `_l_first` proves, and of this check's own header.
     _l_first="$(printf '%s\n' "$_lkv_first" | K="$_okl" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
     # ⛔ EVERY BRANCH PRINTS ITS CRC (review P3, cycle 83) — `_out_show` truncates at six lines and `$TMP` is deleted
     # by the EXIT trap, so without the datum a change past line 6 is reported as text that looks correct.
@@ -3410,8 +3412,9 @@ else
     elif [ -z "$_l_old" ]; then
       if [ -z "$_l_first" ]; then echo "        capture $_okl APPEARED after the snapshot (now $_l_new): $(_out_show "$_okl")"
       else echo "        capture $_okl is NEW and was ALREADY there at the first snapshot (both checks red; neither is a late appearance) (now $_l_new): $(_out_show "$_okl")"; fi
+    elif [ -z "$_l_first" ]; then echo "        capture $_okl APPEARED after the snapshot at a CRC that differs from the pinned one (pinned $_l_old, now $_l_new — ABSENT from the first snapshot, so this IS late creation): $(_out_show "$_okl")"
     elif [ "$_l_first" = "$_l_old" ]; then echo "        capture $_okl CHANGED AFTER the snapshot (pinned $_l_old, now $_l_new): $(_out_show "$_okl")"
-    else echo "        capture $_okl DIFFERS FROM THE PINNED CRC (pinned $_l_old, now $_l_new; it already did at the first snapshot, so this is value drift, not late creation): $(_out_show "$_okl")"; fi
+    else echo "        capture $_okl DIFFERS FROM THE PINNED CRC (pinned $_l_old, now $_l_new; it already differed at the first snapshot too, so this is value drift, not late creation): $(_out_show "$_okl")"; fi
   done <<EOF
 $(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
