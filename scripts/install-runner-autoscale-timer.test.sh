@@ -440,17 +440,44 @@ OUT="$(run_install Linux "$D" --disarm)"; RC=$?; ENVV=()
 assert_eq "$RC" 0 "--disarm is NOT refused by a lane-scratch provisioner (the safe direction)"
 assert_nofile "$ARM" "…and the arming record was actually removed, not stranded"
 assert_absent "$OUT" "STILL ARMED" "…and the verb did not report the record stuck"
-# ⛔ AND A STRUCTURAL PIN ON THE SAME DECISION, BECAUSE THE BEHAVIOURAL ARM ABOVE CANNOT REACH THE BUG ON
-# EVERY BOX. The regression the reviewer measured lives in `refuse_unusable_target`, and a `SYSTEMD_UNIT_DIR`
-# override (which this suite always sets, to stay hermetic) makes that function SKIP its scratch heuristic
-# — so on a fixture box `--disarm` exits 0 whether or not the arm is there. The decision is therefore
-# pinned where it is written: the verb-level gate must not judge the provisioner at all, because it also
-# runs on `--disarm`. Without this assertion the fix above could be reverted and the suite stay green.
-if sed -n '/^refuse_unusable_target()/,/^}/p' "$INST" | grep -q 'is_lane_scratch'; then
-    bad "refuse_unusable_target judges the PROVISIONER — it runs on --disarm, so that strands the arming record"
+# ⛔ AND A STRUCTURAL PIN ON THE SAME DECISION, BECAUSE THE BEHAVIOURAL ARMS CANNOT REACH EVERY SITE.
+# The provisioner must be judged at EXACTLY ONE site: `refuse_adopted_provisioner`, which carries the
+# `--disarm` exemption. Anything matching the FIELD in another predicate is a second judge without the
+# exemption — that is the bug class, and it was measured (a backslash/space/`%` pin refused `--disarm`
+# and KEPT the arming record). ⛔ KEYED ON THE FIELD, NOT ON A PREDICATE NAME: an earlier version of this
+# assertion grepped only for `is_lane_scratch`, so reverting to origin/main's own line
+# (`is_transient_scratch "$PROVISIONER"`) would have left the suite green.
+_njudge=$(grep -cE '(is_transient_scratch|is_lane_scratch) +"\$PROVISIONER"' "$INST" || true)
+if [ "$_njudge" -eq 1 ]; then
+    ok "the PROVISIONER is judged at exactly one site (refuse_adopted_provisioner)"
 else
-    ok "refuse_unusable_target does not judge the PROVISIONER (only refuse_adopted_provisioner does, with the exemption)"
+    bad "the PROVISIONER is judged at $_njudge sites — it must be exactly 1 (refuse_adopted_provisioner, the site with the --disarm exemption)"
 fi
+# …and the two renderer-safety loops must not carry it either: they run on `--disarm` WITHOUT the
+# exemption, which is the stranded-record regression measured on this branch.
+if sed -n '/^refuse_unusable_target()/,/^}/p;/^refuse_systemd_unsafe_values()/,/^}/p' "$INST" | grep -q 'PROVISIONER='; then
+    bad "a renderer-safety loop still judges the PROVISIONER — those run on --disarm and would strand the arming record"
+else
+    ok "the renderer-safety loops do not judge the PROVISIONER"
+fi
+# ⛔ AND THE SAME REGRESSION, BEHAVIOURALLY, ON THE THREE VALUE CLASSES IT WAS MEASURED WITH. A pin that
+# cannot be RENDERED into a live unit is still inert under `--disarm`, so every one of these must exit 0
+# and actually remove the record.
+BSP="$T/bs\\dir"; mkdir -p "$BSP"; printf '#!/bin/sh\n' >"$BSP/inst.sh"; chmod +x "$BSP/inst.sh"
+SPP="$T/sp dir"; mkdir -p "$SPP"; printf '#!/bin/sh\n' >"$SPP/inst.sh"; chmod +x "$SPP/inst.sh"
+PCTP="$T/pc%h"; mkdir -p "$PCTP"; printf '#!/bin/sh\n' >"$PCTP/inst.sh"; chmod +x "$PCTP/inst.sh"
+for _arm in "backslash:$BSP/inst.sh" "whitespace:$SPP/inst.sh" "percent:$PCTP/inst.sh"; do
+    _label=${_arm%%:*}; _pin=${_arm#*:}
+    D="$T/cwt5-$_label"; fresh "$D"; rm -f "$ARM"
+    OUT="$(run_install Linux "$D" --arm --reason "disarm $_label")"
+    assert_eq "$?" 0 "precondition: the box arms before the $_label disarm case"
+    assert_file "$ARM" "precondition: the arming record exists ($_label)"
+    ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$_pin" SUDO=false)
+    OUT="$(run_install Linux "$D" --disarm)"; RC=$?; ENVV=()
+    assert_eq "$RC" 0 "--disarm is NOT refused by a $_label provisioner pin (the safe direction)"
+    assert_nofile "$ARM" "…and the arming record was removed, not stranded ($_label)"
+    assert_absent "$OUT" "STILL ARMED" "…and the verb did not report the record stuck ($_label)"
+done
 # ⛔ AND THE OTHER HALF OF THE SCOPING: THE CONVERGER ITSELF IS *NOT* REFUSED FROM A WORKTREE. This is
 # the decision the wider predicate must not swallow (`resolve_script`: a branch's copy is a legitimate
 # thing to schedule — say it out loud, do not refuse it). Without this arm, widening the predicate to
