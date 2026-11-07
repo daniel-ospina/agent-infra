@@ -3658,8 +3658,10 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # `exit` about to run) or `D` (a point-in-time snapshot taken for `exec`), plus the `${BASH_SUBSHELL}` depth at which it
 # was written; only depth 0 counts. The last depth-0 `E` answers; a depth-0 `D` is used only when the script left no end
 # state at all (an `exec`ing shim) and, when there is NO record whatsoever, the sweep names it instead of guessing.
-# ⛔ `T` RECORDS ARE NOT A VERDICT (review P2, cycle 100). The `trap … EXIT` arm snapshots the options at TRAP-INSTALL
-# time, and the script may `set -u`/`set +u` after that — so a `T` record must never be read as an end state (measured:
+# ⛔ `T` RECORDS ARE NOT A VERDICT (review P2, cycle 100). The `trap` arm snapshots the options at the moment a `trap`
+# command whose TEXT names `EXIT` runs — an install, a REMOVAL (`trap - EXIT`), or a `trap … 0` whose handler merely
+# names it (all three measured to write `T`) — and the script may `set -u`/`set +u` after that, so a `T` record must
+# never be read as an end state (measured:
 # `set -u; trap; set +u` was graded PROTECTED from it, a false PASS where the previous cycle said NO RECORD, and
 # `trap; set -u` was graded bare, naming a correct fixture). `_opts_for` therefore answers from `E`/`D` only;
 # `_trapopts_for` exposes the `T` snapshot separately for the agreement test in the exec sweep.
@@ -3748,9 +3750,14 @@ while IFS= read -r _ex; do
   # ✅, and a genuinely protected one was named). "Executed but unobservable" must never read as clean. Measured today:
   # 172 executed paths, 172 with a record, 0 without.
   if [ -z "$(_opts_for "$_ex")" ]; then
-    # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two independent sources
-    # answering the same question: agreement is evidence, disagreement means the state is NOT observable and must be
-    # named rather than decided by whichever source happens to be consulted first.
+    # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two sources answering the
+    # same question: agreement is evidence FOR THE TEXTUAL-FLIP CLASS, and disagreement means the state is NOT observable
+    # and must be named rather than decided by whichever source happens to be consulted first.
+    # RESIDUAL, declared: agreement is not proof. Both sources are blind to a NON-TEXTUAL flip — measured, with `set -u`
+    # / `trap ': cleanup' EXIT` / `f() { eval "set +u"; }` / `f` the only record is `T` = nounset, `_setu` reads the
+    # top-level `set -u` and AGREES, and the driver's real end state is bare with its unbound read passing (rc=0), so it
+    # grades PROTECTED. Closing that needs a real end state (the `exit 0` the UNOBSERVABLE advice below recommends) —
+    # stated here so the next lane does not read "agreement" as "proved".
     _tu="$(_trapopts_for "$_ex")"
     if [ -n "$_tu" ]; then
       _snap=0; case "$_tu" in *u*) _snap=1 ;; esac
@@ -3769,7 +3776,7 @@ done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
 if [ -n "$exec_unobs" ]; then
-  echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script replaces the hook's EXIT trap, so no end state was recorded; add an explicit \`exit 0\` (or drop the own trap) so the shell's end state is observable"
+  echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script ran a \`trap\` command naming \`EXIT\` (installing, REMOVING, or ignoring the hook's EXIT trap), so no end state was recorded; add an explicit \`exit 0\` so the shell's own end state is observable"
 fi
 if [ -n "$exec_norecord" ]; then
   echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no record AT ALL does this — e.g. it replaces the hook's EXIT trap with a \`trap … 0\` whose TEXT names no \`EXIT\` and falls off the end; a \`trap\` command naming \`EXIT\` — an install, a removal, or a handler that merely names it — writes a \`T\` and lands in the agreement test above, not here)"
