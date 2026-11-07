@@ -88,6 +88,13 @@ const FAKE_PI_SCRIPT = `#!/bin/bash
 NONCE="\${TASK_HEARTBEAT_NONCE:-}"
 SCENARIO="\${FAKE_PI_SCENARIO:-}"
 CLOSED_FILE="\${FAKE_PI_CLOSED_FILE:-}"
+# ⛔ The child's OWN view of the per-leg ordinal the parent exports. The row's
+# 'attempt' is written by the PARENT (record?.attempt), so a parent-side
+# assertion cannot tell whether the handshake in spawnSubAgent exists at all:
+# dropping TASK_DISPATCH_ATTEMPT from the child env left every assertion green
+# while every real orphan row silently fell back to attempt 1.
+ATTEMPT_FILE="\${FAKE_PI_ATTEMPT_FILE:-}"
+if [ -n "$ATTEMPT_FILE" ]; then echo "\${TASK_DISPATCH_ATTEMPT:-<unset>}" >> "$ATTEMPT_FILE"; fi
 m() { echo "[task-heartbeat] $1" >&2; }
 trap 'if [ -n "$CLOSED_FILE" ]; then echo closed > "$CLOSED_FILE"; fi; exit 0' TERM
 case "$SCENARIO" in
@@ -133,6 +140,7 @@ let tmpDir: string;
 let savedPath: string;
 let savedArgv1: string;
 let savedAgentDir: string | undefined;
+let savedDispatchAttempt: string | undefined;
 let sentinel: import("node:child_process").ChildProcess;
 
 // Parent-side bounds. Hermetic: no ambient value may leak into a killer arm.
@@ -157,6 +165,10 @@ function setup() {
 	savedAgentDir = process.env.PI_CODING_AGENT_DIR;
 	process.env.PI_CODING_AGENT_DIR = path.join(tmpDir, "agent-dir");
 	fs.mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
+	// Hermetic for the #385 handshake: an AMBIENT ordinal would mask a dropped
+	// parent→child export (the child would inherit it through `...env`).
+	savedDispatchAttempt = process.env.TASK_DISPATCH_ATTEMPT;
+	delete process.env.TASK_DISPATCH_ATTEMPT;
 	sentinel = spawn(process.execPath, ["-e", "setTimeout(() => {}, 1800000)"], { stdio: "ignore" });
 }
 
@@ -166,6 +178,8 @@ function teardown() {
 	for (const k of Object.keys(PARENT_ENV)) delete process.env[k];
 	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
+	if (savedDispatchAttempt === undefined) delete process.env.TASK_DISPATCH_ATTEMPT;
+	else process.env.TASK_DISPATCH_ATTEMPT = savedDispatchAttempt;
 	try { sentinel.kill("SIGKILL"); } catch { /* gone */ }
 	try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch { /* ignore */ }
 }
@@ -240,6 +254,8 @@ interface DispatchOutcome {
 	sessionId: string;
 	sessionDir: string;
 	closedFile: string;
+	/** Every ordinal the SPAWNED child actually saw, in spawn order. */
+	attemptsFile: string;
 	elapsedMs: number;
 }
 
@@ -272,12 +288,14 @@ async function dispatch(scenario: string, opts: DispatchOptions = {}): Promise<D
 	const sessionId = opts.sessionId ?? `s-${nonce}-a${opts.attempt ?? 1}`;
 	const sessionDir = path.join(tmpDir, "child-sessions", sessionId);
 	const closedFile = path.join(tmpDir, `closed-${nonce}`);
+	const attemptsFile = path.join(tmpDir, `attempts-${nonce}.txt`);
 	const subAgentEnv: Record<string, string | undefined> = {
 		...process.env,
 		TASK_HEARTBEAT: "1",
 		TASK_HEARTBEAT_NONCE: nonce,
 		FAKE_PI_SCENARIO: scenario,
 		FAKE_PI_CLOSED_FILE: closedFile,
+		FAKE_PI_ATTEMPT_FILE: attemptsFile,
 	};
 	const sessionArgs = opts.noSession ? ["--no-session"] : ["--session-id", sessionId, "--session-dir", sessionDir];
 	const args = ["-p", "--provider", "deepseek", "--model", "deepseek-v4-flash", ...sessionArgs, `simulate task4 ${nonce}`];
@@ -298,7 +316,20 @@ async function dispatch(scenario: string, opts: DispatchOptions = {}): Promise<D
 			else process.env[k] = saved[k]!;
 		}
 	}
-	return { value, nonce, sessionId, sessionDir, closedFile, elapsedMs: Date.now() - started };
+	return { value, nonce, sessionId, sessionDir, closedFile, attemptsFile, elapsedMs: Date.now() - started };
+}
+
+/** Every ordinal the spawned children reported, in spawn order (`<unset>` when
+ * the child did not receive the variable at all). */
+function seenAttempts(nonce: string): string[] {
+	try {
+		return fs
+			.readFileSync(path.join(tmpDir, `attempts-${nonce}.txt`), "utf-8")
+			.split("\n")
+			.filter((l) => l.trim().length > 0);
+	} catch {
+		return [];
+	}
 }
 
 function payloadText(value: DispatchOutcome["value"]): string {
@@ -442,6 +473,25 @@ test("#385 review fix: the read-back confirm matches the FULL row identity — a
 		false,
 		"killedPids is part of the identity",
 	);
+	// ⛔ `childSessionId` IN ISOLATION (mutant M-R1: delete that term → all green).
+	// Every fixture above differs by parentPid / killedPids / ts as well, so the
+	// `childSessionId` term was never the difference that decided any assertion.
+	// The shape it exists for is the MULTI-LEG one: two legs of one dispatch at
+	// the same attempt agree on everything EXCEPT the child session id.
+	const sessMine = buildDispatchOutcomeRow(
+		{ ...base, childSessionId: "sess-a" },
+		new Date("2026-11-02T22:00:00.000Z"),
+	);
+	const sessSibling = buildDispatchOutcomeRow(
+		{ ...base, childSessionId: "sess-b" },
+		new Date("2026-11-02T22:00:00.000Z"),
+	);
+	equal(
+		appendedLineNamesRow(line(sessSibling), sessMine),
+		false,
+		"a sibling differing ONLY by childSessionId does NOT confirm our write (the multi-leg case)",
+	);
+	equal(appendedLineNamesRow(line(sessMine), sessMine), true, "and our own line still confirms");
 	// ⛔ THE CASE THAT MADE `ts` NECESSARY (measured): a sibling leaf orphan shares
 	// childSessionId (null, --no-session), parentPid (the same dispatcher), attempt
 	// (the inherited enclosing ordinal), reason (the constant) AND killedPids ([]
@@ -576,6 +626,16 @@ test("2-attempt run writes TWO rows sharing one dispatchId, distinguished by att
 	equal(new Set(rows.map((r) => r.dispatchId)).size, 1, "one dispatchId");
 	equal(new Set(rows.map((r) => r.childSessionId)).size, 2, "fresh child session per attempt (Task 1)");
 	equal(attemptIds.length, 2, "two spawn attempts actually ran");
+	// ⛔ THE PARENT→CHILD HANDSHAKE ITSELF (mutant M9: drop
+	// `TASK_DISPATCH_ATTEMPT` from `spawnSubAgent`'s child env → this goes red).
+	// Every other `attempt` assertion in this file reads the PARENT's row, which
+	// the parent writes from its own `record?.attempt`, so none of them observes
+	// the child-side export that the #385 orphan row depends on.
+	equal(
+		seenAttempts(nonce).join(","),
+		"1,2",
+		"each spawned child really RECEIVED its leg ordinal through the env",
+	);
 });
 
 test("#783 review: the identity is dispatchId+childSessionId+attempt — a multi-leg attempt=1 collision IS distinguished", async () => {
@@ -624,6 +684,10 @@ test("#783 review: the identity is dispatchId+childSessionId+attempt — a multi
 	// The assertion that makes the doc's justification non-vacuous. The
 	// documented key is 3-part; collapsing it to the `dispatchId` + `attempt`
 	// form the doc explicitly REJECTS would merge these two rows into one.
+	//…and the child-side view of that same ordinal (see the 2-attempt test):
+	//`retry()` restarts it at 1 on EVERY leg, so both children must have been
+	//handed 1 — a blanked/deleted export would render `<unset>` here.
+	equal(seenAttempts(nonce).join(","), "1,1", "each leg's child received the per-leg ordinal (both 1)");
 	const documented = new Set(rows.map((r) => `${r.dispatchId}|${r.childSessionId}|${r.attempt}`));
 	const collapsed = new Set(rows.map((r) => `${r.dispatchId}|${r.attempt}`));
 	equal(documented.size, 2, "dispatchId+childSessionId+attempt yields 2 distinct rows");
@@ -734,6 +798,10 @@ test("attempt is threaded from retry() into every spawn leg (primary / failover 
 	ok(source.includes("spawnSubAgent(fallbackModel, fallbackProvider, subAgentEnv, buildFbArgs(), signal, recordCtx(attempt), params.cwd, dispatchStreamStallMs)"), "fallback leg threads attempt");
 	ok(source.includes("const recordCtx = (attempt: number): DispatchRecordContext"), "recordCtx carries the identity");
 	ok(source.includes("const attempt = record?.attempt ?? 1;"), "missing metadata defaults to 1 (tsx does not typecheck)");
+	ok(
+		source.includes("TASK_DISPATCH_ATTEMPT: String(attempt)"),
+		"the ordinal is EXPORTED to the child (#385: the orphan watchdog writes the row the parent never can)",
+	);
 });
 
 // ── Results ───────────────────────────────────────────────────────────
