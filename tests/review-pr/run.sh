@@ -967,7 +967,14 @@ no_comment; ck $? "no comment posted"
 # moved to 84. A fixture that hardcodes the number under test cannot notice either.
 _mem_gate_rc="$(bash -c '. "$1" >/dev/null 2>&1; printf %s "${PI_GATE_MEM_REFUSED:-}"' _ \
   "$ROOT/scripts/orchestrator-harness/spawn-gate.sh" 2>/dev/null)"
-[ -n "$_mem_gate_rc" ] || _mem_gate_rc=84
+# ⛔ AN EMPTY READ IS A RED, NOT A SILENT 84 (round-13 review of #3645, P2). This line used to be
+# `[ -n "$_mem_gate_rc" ] || _mem_gate_rc=84` — the same silent-default derivation §O3 fixes a few lines
+# below, failing the same way: rename `PI_GATE_MEM_REFUSED` in `spawn-gate.sh` and this arm keeps exercising
+# 84 against a seam that now emits another code, and stays GREEN, because the fallback fed the FIXTURE
+# instead of the declaration. So the read is ASSERTED first; the literal survives only to keep the section
+# runnable once a reshape has already been counted and printed as a red (`ck` returns, it does not abort).
+[ -n "$_mem_gate_rc" ]; ck $? "the MEMORY-gate code is READABLE from spawn-gate.sh's declaration (got '${_mem_gate_rc:-<none>}') — a reshape must red here, not fall back to a literal"
+_mem_gate_rc="${_mem_gate_rc:-84}"
 echo; echo "§O2 spawn-point MEMORY refusal (rc=$_mem_gate_rc) => exit 81, named as a capacity event"
 reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC="$_mem_gate_rc"
 run "$SRC" 2284
