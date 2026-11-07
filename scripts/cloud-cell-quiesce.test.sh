@@ -298,6 +298,47 @@ grep -q 'WORK ON THIS BOX WILL NOT BE ARCHIVED' "$D/out" \
   && ok "E6c the non-parsing candidate was NOT RESOLVED — the hook says the work will not be archived" \
   || bad "E6c the hook resolved a non-parsing candidate: $(grep -m1 'wip-sweep:' "$D/out")"
 
+# ⛔ E7 — THE PINNED-TREE FALLBACK MUST RESOLVE A PATH THAT CAN EXIST (#3588 review, cycle 6).
+# `.harness-path` holds the HARNESS DIR (`<pin>/scripts/orchestrator-harness`, written by
+# `scripts/cloud-cell-supervisor.sh:2315`). The candidate used to be `"$PINNED_DIR/scripts/wip-sweep.sh"`,
+# i.e. `<pin>/scripts/orchestrator-harness/scripts/wip-sweep.sh`, which CANNOT EXIST: in a pinned tree the
+# sweep is that dir's SIBLING, at `<pin>/scripts/wip-sweep.sh`. No arm created a `.harness-path` record at
+# all, which is exactly how an inert candidate stayed green — so E7 is the missing positive control and E8
+# is its negative twin (a record naming an absent tree must still refuse loudly).
+echo; echo "── E7. a sweep that exists ONLY in the pinned tree is invoked ──"
+mk_world e7 || { echo "❌ fixture failed (e7)"; exit 1; }
+D="$T/e7"
+rm -f "$D/repo/scripts/wip-sweep.sh"          # nothing beside the clone: the PIN is the only source
+PINROOT="$D/pin/0123456789ab"
+mkdir -p "$PINROOT/scripts/orchestrator-harness"
+printf '%s\n' "$PINROOT/scripts/orchestrator-harness" > "$D/home/.harness-path"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'echo "sweep:$*" >> "'"$D"'/events"' \
+  'exit 0' > "$PINROOT/scripts/wip-sweep.sh"
+chmod +x "$PINROOT/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+run_quiesce e7 0; RC=$?
+grep -q '^sweep:' "$D/events" \
+  && ok "E7a a sweep that exists ONLY in the pinned tree is INVOKED (the record holds the harness dir, so its SIBLING is the sweep)" \
+  || bad "E7a the pinned-tree sweep was never invoked — the candidate built a CHILD of the harness dir, which cannot exist: $(grep -m1 'wip-sweep:' "$D/out")"
+grep -q "wip-sweep: $PINROOT/scripts/wip-sweep.sh" "$D/out" \
+  && ok "E7b the step line names the pinned sweep, so the resolution graded is the one that ran" \
+  || bad "E7b the step line names something else: $(grep -m1 'wip-sweep:' "$D/out")"
+
+mk_world e8 || { echo "❌ fixture failed (e8)"; exit 1; }
+D="$T/e8"
+rm -f "$D/repo/scripts/wip-sweep.sh"
+printf '%s\n' "$D/pin/does-not-exist/scripts/orchestrator-harness" > "$D/home/.harness-path"
+echo alive > "$D/alive"
+run_quiesce e8 0; RC=$?
+NINV8="$(grep -c '^sweep:' "$D/events" 2>/dev/null || true)"
+[ "${NINV8:-0}" -eq 0 ] \
+  && ok "E8a a record naming an ABSENT tree resolves nothing — no sweep was invoked" \
+  || bad "E8a something was invoked for an absent pin: $(grep -m2 '^sweep:' "$D/events")"
+grep -q 'WORK ON THIS BOX WILL NOT BE ARCHIVED' "$D/out" \
+  && ok "E8b …and the hook still says the work will not be archived (loud, never a false green)" \
+  || bad "E8b the absent-pin path did not warn: $(grep -m1 'wip-sweep:' "$D/out")"
+
 # ── the success arm (exit code is only judgeable where /proc exists) ─────────────────────────────────
 echo; echo "── F. the success path ──"
 mk_world f || { echo "❌ fixture failed (f)"; exit 1; }

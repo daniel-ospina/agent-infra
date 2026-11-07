@@ -889,6 +889,41 @@ sweep_repo() {
     err "UNMEASURED — 'git worktree list' answered for '$repo' but named no worktree at all. This repo was NOT swept; it is not clean, it is unknown."
     N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
     record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-empty"
+  else
+    # ⛔ A LISTING SHORTER THAN GIT'S OWN ADMIN RECORDS IS PARTIAL, NOT CLEAN (#3588 review, cycle 6).
+    # The two guards above are rc!=0 and ZERO records, and `git worktree list --porcelain` can answer a
+    # SUBSET with rc=0 and COMPLETELY EMPTY stderr — so neither fires and the omission is invisible. The
+    # shape is mechanically producible: damage one worktree's admin record (`.git/worktrees/<name>/gitdir`
+    # removed), which an interrupted `git worktree add`, a racing `prune`, or a partial restore all
+    # produce. MEASURED on a 4-worktree fixture with uncommitted work in w2 and only w2 damaged:
+    #   worktree list --porcelain -> rc=0, stderr empty, 3 of 4 records
+    #   wip-sweep.sh --apply      -> status=ok rc=0 seen=3 dirty=0   (w2 never enumerated, never archived)
+    # That is this file's own headline defect one layer in, and on the quiesce path it hands a cell on to
+    # be reclaimed with the work still only on that disk. A stderr check would NOT have caught it (git
+    # wrote nothing), so the cross-check is against the count of git's admin records, which is the
+    # authority for how many worktrees this repo HAS. Verified on a real repo: 101 admin dirs <-> 102
+    # records (+1 is the main worktree, which has no admin dir); a bare repo has no `worktrees/` dir and
+    # lists exactly itself, so a missing dir reads as 0 and the expectation is 1.
+    # One-sided ON PURPOSE: only a listing BELOW the expectation escalates, so a future git that lists
+    # more records than it holds admin dirs can never false-block a sweep that was complete.
+    local admin_n=0 common="" wdir=""
+    common="$(git -C "$repo" rev-parse --git-common-dir 2>/dev/null)" || common=""
+    case "$common" in
+      '') err "UNMEASURED — could not resolve git's common dir for '$repo', so the completeness of its worktree listing cannot be verified. This repo is not clean, it is unknown."
+          N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+          record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-unverifiable"
+          return 0 ;;
+      /*) ;;
+      *)  common="$repo/$common" ;;
+    esac
+    # A plain glob, not `find`: this path is under `.git/`, maxdepth 1, and a glob cannot descend into
+    # anything. With no match the pattern stays literal and the `-d` test fails, so 0 needs no nullglob.
+    for wdir in "$common/worktrees"/*/; do [ -d "$wdir" ] && admin_n=$((admin_n + 1)); done
+    if [ "$listed" -lt $((admin_n + 1)) ]; then
+      err "UNMEASURED — 'git worktree list' named $listed worktree(s) for '$repo' but git holds $admin_n admin record(s), so the listing is PARTIAL: the worktree(s) it omitted were NEVER enumerated and NEVER swept. This repo is not clean, it is unknown."
+      N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
+      record "$repo" "-" "-" "-" "cannot-verify" "-" "-" "-" "-" "worktree-list-partial"
+    fi
   fi
   return 0
 }
