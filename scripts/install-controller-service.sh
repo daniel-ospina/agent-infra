@@ -231,7 +231,7 @@ lane_scratch_shape() {
 # bring-up's own default `$CELL_HOME/harness` (`HARNESS_PIN_DIR`). A detached worktree outside that root is
 # refused.
 pin_root_of_this_box() {
-    local f p
+    local f p root="" cr
     f="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
     if [ -f "$f" ]; then
         p="$(head -1 "$f" 2>/dev/null)"
@@ -242,12 +242,29 @@ pin_root_of_this_box() {
         while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
         while [ "${p#//}" != "$p" ]; do p="${p#//}"; done
         case "$p" in
-            */scripts/orchestrator-harness) printf '%s\n' "$(dirname "$(dirname "$p")")"; return 0 ;;
+            */scripts/orchestrator-harness) root="$(dirname "$(dirname "$p")")" ;;
             '') ;;
-            *) printf '%s\n' "$p"; return 0 ;;
+            *) root="$p" ;;
         esac
     fi
-    printf '%s\n' "${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+    [ -n "$root" ] || root="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+    # ⛔ RESOLVED BEFORE IT IS COMPARED (cycle-2 P1, MEASURED — a FALSE BLOCK on the box's own pin). The caller
+    # compares this root against the git toplevel that `linked_worktree_root` read, and git answers a PHYSICAL
+    # path; `path_under`'s own contract says both arguments are already resolved by `canon_dir` (see the three
+    # declared roots, resolved a few lines below in `scratch_supervisor_reason`). This function normalised
+    # SLASHES only, so a record — or a `CELL_HOME`/`HARNESS_PIN_DIR` — whose spelling passes through a benign
+    # symlink (`/home/op -> /mnt/data/op`, the layout #2666 measures in this same file) compared a resolved
+    # toplevel against an unresolved root, and the box's own harness pin was refused as "NOT the harness pin
+    # this box records" while the refusal named that very path as the remedy. Reproduced end to end: a
+    # symlinked `CELL_HOME` with the bring-up's own `git worktree add --detach` pin and its recorded
+    # `.harness-path` => rc=1; the same tree spelled physically => admitted. `canon_dir` uses `realpath -m`, so
+    # it resolves the existing prefix of a path that does not exist yet; an unresolvable root keeps its raw
+    # spelling (fail-closed: an ungradable root still cannot match, but the message stays readable).
+    cr="$(canon_dir "$root")"
+    case "$cr" in
+        ''|"$CANON_UNRESOLVED"*) printf '%s\n' "$root" ;;
+        *) printf '%s\n' "$cr" ;;
+    esac
 }
 
 # linked_worktree_root <resolved supervisor> — the LINKED git worktree this path lives in, or nothing.
@@ -519,16 +536,24 @@ resolve_supervisor() {
         # that is not there — while `verify_unit`'s exact-line `grep -qxF` PASSED on the raw text. That is the
         # false-PASS shape this file keeps ruling out, so the render refuses and the operator moves the
         # checkout instead of silently shipping a unit systemd reads differently than the installer does.
+        # ⛔ AND THE UNQUOTED SPLIT IS NOT THE ONLY WAY SYSTEMD REWRITES THIS LINE (cycle-2 P2, MEASURED). `%`
+        # is a SPECIFIER prefix and `$` starts a VARIABLE EXPANSION in a command line, and both apply to the
+        # rendered text: `systemd-analyze verify` on `Environment=ORCH_SUPERVISOR_PIN=/tmp/a%x/repo@abc`
+        # reports "Failed to resolve specifiers in PIN=/tmp/a%x/repo@abc, ignoring: Invalid slot" — the pin
+        # assignment is DROPPED exactly as the whitespace case drops it — while `verify_unit`'s `grep -qxF`
+        # still passes, and `systemd-analyze` refuses to even grade an ExecStart whose path contains `%`.
+        # A checkout under such a path therefore renders an artifact systemd reads differently than this
+        # installer does, so it is refused for the same reason rather than silently shipped.
         case "$r" in
-            *[[:space:]]*|*'"'*)
+            *[[:space:]]*|*'"'*|*%*|*'$'*)
                 if [ "$hard" = 1 ]; then
-                    err "REFUSING: the supervisor path '$r' contains whitespace or a double quote, and this unit renders its environment and ExecStart UNQUOTED."
-                    err "  systemd would split that value, silently DROP the pin assignment and fail to exec the supervisor (measured:"
-                    err "  'Invalid environment assignment, ignoring: …'), while the rendered text still looks right."
-                    err "  Move the checkout to a path without spaces, or pass a supervisor that has none."
+                    err "REFUSING: the supervisor path '$r' contains whitespace, a double quote, '%' (a systemd specifier) or '$' (variable expansion), and this unit renders its environment and ExecStart UNQUOTED."
+                    err "  systemd would split, expand or drop that value, silently DROP the pin assignment and fail to exec the supervisor (measured:"
+                    err "  'Invalid environment assignment, ignoring: …' and 'Failed to resolve specifiers …, ignoring: Invalid slot'), while the rendered text still looks right."
+                    err "  Move the checkout to a path without spaces, quotes, '%' or '$', or pass a supervisor that has none."
                     return 1
                 fi
-                err "note: NOT rendering ExecStart from $r — the path contains whitespace or a double quote, which this unit renders unquoted and systemd would split."
+                err "note: NOT rendering ExecStart from $r — the path contains whitespace, a double quote, '%' or '$', which this unit renders unquoted and systemd would split, expand or drop."
                 continue ;;
         esac
         if why="$(scratch_supervisor_reason "$r")"; then
