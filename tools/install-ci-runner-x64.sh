@@ -59,7 +59,13 @@
 #                advisory instead of the accounting. (That is the defect `_run_split`'s docstring
 #                records: one stderr warning turned a successful read into a rejected value.)
 #        rc 2  → `ProvisionerRefused` — "GUARD REFUSED, nothing attempted". An ANSWER, reported as
-#                the box's own deliberate no, not as a failure on a 10-minute timer.
+#                the box's own deliberate no, not as a failure on a 10-minute timer. ⛔ RC 2 IS SPENT
+#                ONLY ON A POOL VERDICT THAT ANSWERS THE REQUEST OR A CAPACITY QUESTION: `add`'s rc 3
+#                gate verdict (the memory floor and the core-aware ceiling), and its rc 4 name verdict
+#                for the ONE sub-state where the box did answer — the slot was taken by a peer during
+#                this call, which the next pass retries. Everything else the pool declines — its rc 2
+#                (`cannot-measure`/`cannot-act`) and the rc-4 states that need a human (a pre-existing
+#                wedge, a dangling `.runner` link) — exits 6 below.
 #        rc 6  → `ActionFailed`. THIS FILE'S OWN CONFIGURATION ERRORS, and they are NOT rc 2.
 #                ⛔ rc 2 IS THE CALLER'S "CAPACITY ANSWER" CHANNEL, and a misconfigured seam is not
 #                an answer about capacity. Measured: with two disagreeing repo seams the caller
@@ -147,10 +153,11 @@ or <root>/gh-runner-x64) because that is where runner_autoscale.py looks for ins
 exit 2 is a POOL GUARD REFUSAL — `add`'s gate verdict (memory floor, core-aware ceiling): nothing
 was attempted, and that IS an answer, so the pass records `provisioner-refused` and exits 0.
 exit 6 is a FAILURE the caller must see: this script's own configuration errors (bad --count,
-unreadable pool tool, disagreeing root/base/repo seams) AND a pool rc 2 (`cannot-measure` /
-`cannot-act` — the pool could not measure or could not act on THIS box). It is deliberately NOT 2:
-the caller records a 2 as a capacity answer and exits 0, so a misconfiguration would read as a
-clean pass.
+unreadable pool tool, disagreeing root/base/repo seams), a pool rc 2 (`cannot-measure` /
+`cannot-act` — the pool could not measure or could not act on THIS box), and the pool rc 4 states
+that nothing here can repair (a pre-existing path with no `.runner` registration, a dangling
+`.runner` link). It is deliberately NOT 2: the caller records a 2 as a capacity answer and exits 0,
+so a misconfiguration or a permanent wedge would read as a clean pass.
 EOF
   exit 1
 }
@@ -333,6 +340,22 @@ case "$rc" in
      # an operator to delete the path would tell them to delete a registration in progress, which is
      # what this file's own header forbids. Report the state, name BOTH possible causes, and give only
      # the non-destructive remedy: the adapter never deletes a directory it did not create.
+     # ⛔ AND THE CODE SPLIT IS THE SAME ONE rc 2/rc 3 GETS, **because rc 4 is not a capacity verdict
+     # either**: `ci_runner_pool.sh`'s EXIT block (:175-176) classifies it as "name not available (that
+     # name is taken; nothing changed, try another name)". The box did not answer a capacity question;
+     # SOMETHING IS SITTING ON THE SLOT THE CALLER WILL ASK FOR AGAIN NEXT PASS. `_next_free_slot`
+     # tests only `.runner`, so a wedge or a dangling link makes the caller re-ask the SAME index for
+     # ever and `live` never moves. Mapping those to 2 put them back in the caller's answer channel:
+     # `GUARD CONFLICT … a human must decide which number is wrong (#9672)` over a leftover DIRECTORY
+     # when the disk arm had headroom, and `provisioner-refused` → **exit 0** when it did not — a box
+     # that can never provision reporting a CLEAN pass, which is the exact defect the rc-2 split above
+     # exists to close, one code over (fresh-context review round 16, P1).
+     #   · dangling `.runner` link  → exit 6. No pass can repair it; a human must.
+     #   · path pre-existed, no `.runner` → exit 6. A stale leftover NEVER heals. It can also be a
+     #     peer's add mid-flight, which does heal — accepted: a transient `action-failed` on one pass
+     #     is cheaper than a permanent silent green, and the message still gives the remedy.
+     #   · path appeared DURING this call → exit 2. That genuinely IS another pass's answer about the
+     #     same slot, so it is a refusal this pass can retry, not a failure of this box.
      if [ -L "$DIR/.runner" ]; then
        # ⛔ THE TWO TOOLS DISAGREE ABOUT THESE BYTES, AND THE RECORD MUST SAY SO RATHER THAN PICK A SIDE.
        # The pool's occupancy test is `[ -e ] || [ -L ]`, so it answers "already registered — use
@@ -344,6 +367,9 @@ case "$rc" in
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR existed before this pass without a .runner registration — either a stale leftover from an interrupted add or a peer's add that has not written .runner yet; nothing was added, retry on the next pass. If it is still there with no .runner afterwards, a human must inspect and clear it — this adapter never deletes a path it did not create"
      else
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): another pass took this slot while this add ran — $DIR appeared during the call; retry on the next pass, or run: bash $POOL_TOOL restart --name $NAME"
+     fi
+     if [ -L "$DIR/.runner" ] || [ "$DIR_EXISTED_BEFORE" -eq 1 ]; then
+       exit 6
      fi
      exit 2 ;;
   *)   # rc 5 (this name could not be registered) and anything unexpected are real failures: the

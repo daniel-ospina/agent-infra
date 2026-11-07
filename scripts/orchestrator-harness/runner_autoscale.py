@@ -2973,11 +2973,19 @@ def provision(target_count: int, repo: str = "", root: str = "") -> str:
     memory/disk re-read never budgeted — the over-fill `_next_free_slot`'s comment below describes
     (#9639). `target_count` is a SLOT INDEX in this file's own numbering, not a count.
 
-    ⛔ This file never downloads a runner binary and never builds a `config.sh` argv for a NEW
-    install: download + sha256 verification + the headroom/arch guards are
-    `tools/install-ci-runner-x64.sh`'s job (it is the only registration path). Absent, this
-    REFUSES — improvising a provisioner here is how a second, divergent registration path is
-    born (#9639 exists precisely because there was one).
+    ⛔ THE PRECONDITION THE JOIN DOES NOT CREATE (fresh-context review round 16, P2 — the paragraph
+    above was written when the provisioner did not exist, and it overstated what landing one would
+    buy). NO FILE IN THIS REPO DOWNLOADS OR UNPACKS A RUNNER RELEASE: `tools/install-ci-runner-x64.sh`
+    explicitly disclaims it (no download, no sha256, no `config.sh` argv — all of that is
+    `ci_runner_pool.sh`'s), and `ci_runner_pool.sh::add` copies from `RUNNER_TEMPLATE` (default
+    `$RUNNER_ROOT/_template`), refusing with `cannot-act why=runner-template-absent` when no pristine
+    release has been unpacked there. So the joined pair can add a runner only on a box an operator or
+    a bootstrap has already prepared. Measured 2026-11-07 on a cell: `/opt/gh-runner-x64` and
+    `/opt/gh-runner-cell4` exist and there is NO `/opt/_template`, so an `add` there lands in that
+    refusal rather than an add. What IS true, and is all this file relies on: the headroom/arch gates
+    and the ONE registration path live behind the provisioner, so this file still never improvises
+    one (the reason #9639 exists). Repairing `runner-template-absent` is an unpack, not a download
+    from this code.
     """
     provisioner, why = resolve_provisioner()
     if not provisioner:
