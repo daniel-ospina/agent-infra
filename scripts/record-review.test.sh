@@ -5478,8 +5478,8 @@ assert_eq "$RECORD_RC" "5" \
     "14.1d(i) …and with the comment failing too the arm is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
 assert_not_contains "$RECORD_ERR" "The marker is kept in" \
     "14.1d(i) …whose exit-5 message does NOT offer --flush-pending as a remedy for bytes that were never persisted"
-assert_contains "$RECORD_ERR" "NOTHING IS ON DISK EITHER" \
-    "14.1d(i) …but names the real state instead"
+assert_contains "$RECORD_ERR" "NO PENDING MARKER IS ON DISK EITHER" \
+    "14.1d(i) …but names the real state instead — the PENDING MARKER is what is absent, not the record (the line above it says the record IS saved)"
 # ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
 # `post_review_evidence_comment` runs INSIDE this arm and, when its comment READ
 # fails too, used to print "The signed record AND THE BODY MARKER are unaffected" —

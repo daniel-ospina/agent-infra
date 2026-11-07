@@ -3797,7 +3797,7 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   # a tier chosen from a list that may be incomplete.
   #
   # The count is over the NEW path only, exactly as clean_low_shape_ok counts it
-  # (its DISTINCT `$2` count — `:643` here, `:634` on `origin/main` at `bd1b205d`; re-derive with `grep -n '^  count="$(printf' scripts/record-review.sh`) — GitHub counts a rename as ONE changed file while the compare row
+  # (its DISTINCT `$2` count — `:643` here, `:634` on `origin/main` at `bd1b205d`; re-derive with `grep -n '^ *count=.*awk' scripts/record-review.sh`, which matches that ONE line — `:810` also assigns a `count`, from `cut -f3` of the meta rather than the awk `$2`, so an anchor without `awk` returns two hits) — GitHub counts a rename as ONE changed file while the compare row
   # carries the old path too, so counting both ends would report truncation for
   # any diff containing a rename. The CLASSIFICATION below still reads BOTH ends
   # (a rename out of a rail must not slip through); only the parity arithmetic is
@@ -5793,8 +5793,8 @@ fi
 #           "review evidence posted to … as a durable comment"
 #
 # Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
-# reviewer ran — delta mode REFUSES --evidence, `:2837` here / `:2761` on `origin/main` at `bd1b205d`; re-derive
-# with `grep -n 'delta re-binds the record' scripts/record-review.sh`), the prior record's
+# reviewer ran — delta mode REFUSES --evidence, `:2837` here / `:2761` on `origin/main` at `bd1b205d`; re-derive with
+# `grep -n '^ *echo "record-review.sh: --delta re-binds' scripts/record-review.sh`, which matches that ONE echo), the prior record's
 # `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
 # and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
 # because that gate is keyed on `VERDICT = clean`, and `clean-micro`/`clean-low`
@@ -6602,7 +6602,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
       _unposted_remedy="The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers it WITHOUT a new review."
     else
-      _unposted_remedy="⛔ NOTHING IS ON DISK EITHER — the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable."
+      _unposted_remedy="⛔ NO PENDING MARKER IS ON DISK EITHER — the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable."
     fi
     echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (⛔ this line does NOT assert WHICH cause — the error text is discarded, so a transient API failure, a throttled token and a permanent 404 all land here), and $_unposted_why — the record is saved but CI CANNOT SEE IT. $_unposted_remedy" >&2
     exit 5
