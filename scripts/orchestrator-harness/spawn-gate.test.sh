@@ -5942,14 +5942,46 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist.
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
-rm -rf "$RREG/state/lanes"
+# ⛔ AND THE PROBE MUST CARRY THE FIXTURE'S OWN REGISTRY ENV, or it is not about this fixture at all.
+# Run with the ambient environment, `list` falls back to THIS BOX's write-through witness
+# (`$HOME/.pi/agent/state/lanes`) — a witness this suite does not own and cannot empty — and answers
+# exit 0 `source=local` for the SAME unreachable remote. MEASURED: 1,484 local records on this box made
+# the arm red here while it was green on a pristine one — the “a fixture that inherits ambient state
+# cannot make a claim about isolation” defect this fleet records elsewhere (record-review.test.sh,
+# #3442). The probe below therefore runs against a DEDICATED EMPTY state root, so the documented
+# answer for an unreachable remote with NO local witness — exit 3, `UNMEASURED`, never a list of zero
+# lanes (#3382 invariant 1: an empty local witness is NOT an empty fleet) — is what the arm pins.
+regprobe() { # <state-root> <json-file> -> "rc=<n>"
+  local root="$1" out="$2"
+  mkdir -p "$root/lanes"
+  env LANE_REGISTRY_STATE="$root" LANE_REGISTRY_LOCAL="$root/lanes" \
+      LANE_REGISTRY_GIT="$root/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+      python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json \
+      2>/dev/null >"$out"
+  echo "rc=$?"
+}
+unreachable="$(regprobe "$RREG/probe-empty" "$RREG/probe-empty.json")"
+ck "R4 an unreachable registry answers UNMEASURED, with no local witness to mask it ($unreachable)" \
+   $([ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+ck "R4 …and the payload says readable=false + UNMEASURED, never a list of zero lanes" \
+   $(grep -qF '"readable": false' "$RREG/probe-empty.json" 2>/dev/null \
+     && grep -qF 'UNMEASURED(' "$RREG/probe-empty.json" 2>/dev/null && echo 0 || echo 1)
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
-ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
-   $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+ck "R4 an unreachable registry does not change the lane's rc=$rcval (lane rc, want 0)" \
+   $([ "${rcval:-x}" = "0" ] && echo 0 || echo 1)
+# ⛔ AND A FALLBACK ANSWER IS LABELLED. `rdrive` has just written this fixture's own write-through
+# record, so the same unreachable remote now answers from the LOCAL witness (exit 0). That is a
+# documented answer — but only because `coverage` says `local-only`, i.e. “THIS BOX ONLY — peer lanes
+# invisible”. A fallback that reported itself as a shared read would be the false-clean the coverage
+# field exists to prevent, so the arm pins the label rather than the exit code.
+remote_probe="$(regprobe "$RREG/state" "$RREG/probe-local.json")"
+ck "R4 …and a LOCAL-witness fallback is labelled local-only, never presented as a shared read ($remote_probe)" \
+   $(grep -qF '"coverage": "local-only"' "$RREG/probe-local.json" 2>/dev/null \
+     && grep -qF 'FELL BACK' "$RREG/probe-local.json" 2>/dev/null \
+     && [ "${remote_probe##*rc=}" = "0" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo
