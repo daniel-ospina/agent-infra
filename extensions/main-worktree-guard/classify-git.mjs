@@ -3518,10 +3518,20 @@ export function wtIsPathShapedScriptWord(word) {
       // body). A glob after LITERAL bytes globs a `$`-terminated component NAME (`stage1$`); only a
       // glob applied to a GROUP is the regex text (`[[…]]*$`, sed's `s/[[:space:]]*$//`) the rule is
       // for. So the test is `PH + PG` — a group placeholder immediately followed by a glob operator.
-      // ⛔ NAMED RESIDUAL (measured, not chased): a `$` following a glob applied to a GROUP
-      // (`q[0]*$/undo.sh`) is still dismissed as an end-anchor. It is the same fail-open class at a
-      // smaller radius, and closing it needs a way to tell a bracket group that is regex text from one
-      // that is a filename, which no byte-level rule has — tracked with #3341.
+      // ⛔ NAMED RESIDUAL (measured, not chased) — AND ITS RADIUS IS WIDER THAN "a group", which is what
+      // this comment said before a review measured it (#3333 review cycle-5, F2). The test keys on
+      // `out.endsWith(PH + PG)` — ANY placeholder, not only a group sentinel — so the dismissed class is
+      // "a `$` after a glob applied to a PLACEHOLDER", and it splits in two:
+      //   (a) NOT genuinely ambiguous, and therefore FIXABLE without an oracle: an ESCAPED byte
+      //       (`a/\}*$/undo.sh`), an EXPANSION (`a/$Z*$/undo.sh`, `a/`x`*$/undo.sh`). `\}` is
+      //       unambiguously a literal `}` and can never be regex text, and the loop ALREADY carries the
+      //       distinction it needs — `ES` vs `PH` vs `PG` — which is exactly why the escaped-separator
+      //       rule exists. These measured `false` here and `true` on `origin/main`, through the handler.
+      //   (b) GENUINELY ambiguous, and the part the old sentence was about: a bracket/brace/paren GROUP
+      //       (`q[0]*$/undo.sh`, `q{0}*$`, `q(x)*$`) needs a way to tell a group that is regex text from
+      //       one that is a filename, which no byte-level rule has.
+      // Do not tell the next lane both halves need an oracle: (a) is a sentinel fix, (b) is the hard one.
+      // Tracked with #3341.
       else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PH + PG)) return false;
       else { out += ch; continue; }
       out += PH; i = j - 1; continue;
@@ -3568,17 +3578,26 @@ export function wtIsPathShapedScriptWord(word) {
     // the next `/`, so it cannot hide a separator. The earlier bug was jumping to the LAST `]` with no
     // `/` bound at all; this one is bounded by construction, not by a fallback.
     if (ch === "[") {
-      const sl = s.indexOf("/", i + 1);
-      let e = s.indexOf("]", i + 1);
-      // ⛔ THE DEPARTURE IS NARROWER THAN "a closer inside the component": it is a POSIX CHARACTER
-      // CLASS, `[[:…:]]`, which is the ONLY shape that needs folding — a class is one group in a shell
-      // glob, so leaving its inner `]` loose is what made `s/[[:space:]]*$//` depend on a leaked byte.
-      // ⚠️ A GENERAL fold was wrong and was measured wrong (#3333 review cycle-4): folding ANY group up
+      // ⛔ BOTH SCANS ARE GUARDED, BECAUSE THIS PREDICATE RUNS FROM THE `tool_call` HOOK ON EVERY BASH
+      // CALL (#3333 review cycle-5, F1 — measured, and the cut just before this one had the guard and
+      // LOST it, which is how the same defect got reintroduced 130 lines below the comment saying it was
+      // fixed). `s.indexOf("]", i+1)` and `s.lastIndexOf("]", sl)` are unbounded walks over the whole
+      // word; without `LAST_CLOSE > i` short-circuiting them, a word of N `[[:` groups with no closer
+      // cost O(N²): measured 1.08 s at 96 KB and 4.27 s at 192 KB, against 0.3 ms on `origin/main` and
+      // 44 ms for the previous cut. `e >= 0` is semantics-preserving (a `lastIndexOf` can only beat a
+      // negative `e` by returning an index below `i`, which `if (e > i)` discards anyway), and the `/`
+      // scan now runs only for a `[[:` that actually has a closer to fold toward.
+      const sl = LAST_CLOSE > i ? s.indexOf("/", i + 1) : -1;
+      let e = LAST_CLOSE > i ? s.indexOf("]", i + 1) : -1;
+      // ⛔ THE ONE DEPARTURE FROM MAIN'S JUMP IS NARROWER THAN "a closer inside the component": it is a
+      // POSIX CHARACTER CLASS, `[[:…:]]`, which is the ONLY shape that needs folding — a class is one
+      // group in a shell glob, so leaving its inner `]` loose is what made `s/[[:space:]]*$//` depend on
+      // a leaked byte. ⚠️ A GENERAL fold was measured wrong (#3333 review cycle-4): folding ANY group up
       // to the next `/` skipped an opening backtick and left its partner unbalanced, so `[]`]`/` went
       // `false` here and `true` on `origin/main` — the same fail-open class once more. Keyed on `[[:`
       // and on a `/` existing to the right, the fold cannot reach a separator and cannot skip a quote
       // opener that a POSIX class would contain.
-      if (sl >= 0 && s.startsWith("[[:", i)) {
+      if (e >= 0 && sl >= 0 && s.startsWith("[[:", i)) {
         const inComponent = s.lastIndexOf("]", sl);
         if (inComponent > e) e = inComponent;
       }

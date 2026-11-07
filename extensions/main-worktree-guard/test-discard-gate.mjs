@@ -2939,25 +2939,6 @@ if (process.argv.includes("--mutations")) {
       false,
       "a real `$`-terminated directory addressed through a glob goes blind again",
     ],
-    [
-      // ⛔ THE P1-2 PAIR (#3333 review cycle-2). `LAST_CLOSE` is the LAST `]` in the WHOLE word, so a
-      // word with two bracket groups swallowed everything between them — including the `/` that
-      // separates two real components — into ONE placeholder. `q[0]w/undo[x].sh`, `a[b]c/d[e]` and
-      // `x[b]y/z[c]` were ALLOW at that head and BLOCK on `origin/main`. Bounding the jump to a closer
-      // inside the current component is the fix; removing the bound reproduces the fail-open.
-      "the `[` fold cannot swallow a separator — the `/` in `q[0]w/undo[x].sh` survives (#3333 c2 P1-2)",
-      [[
-        String.raw`      let e = s.indexOf("]", i + 1);`,
-        String.raw`      let e = LAST_CLOSE;`,
-      ]],
-      (m) => m.wtIsPathShapedScriptWord("q[0]w/undo[x].sh"),
-      true,
-      false,
-      "the `/` between two bracket groups is swallowed into one placeholder again",
-    ],
-    // (No separate pair for the POSIX-class FOLD's `/`-bound: reverting the DEFAULT to `LAST_CLOSE` —
-    // the pair immediately above — reintroduces the old unbounded jump, and that is the only way this
-    // code can still cross a separator. The FOLD itself is structurally bounded by `sl`, so a pair
     // aimed at it could not fail. It is pinned by its own pair above (the sed exclusion).)
     [
       // ⛔ THE F1 PAIR (#3333 review cycles 2 and 4 — this rule has now been wrong TWICE, in opposite
@@ -2969,13 +2950,16 @@ if (process.argv.includes("--mutations")) {
       //          paths (`a/[/^/[0]`).
       //   cut 3 (this one): start from `origin/main`'s own jump — the FIRST closer — so parity holds by
       //          construction, and depart from it only to fold a POSIX class.
-      // This pair reverts the default back to `LAST_CLOSE` and demands the cycle-4 class come back.
+      // This pair reverts the default back to `LAST_CLOSE` and demands BOTH classes come back: the
+      // cycle-4 `[/]`-family and the cycle-2 `q[0]w/undo[x].sh` family, which the same revert
+      // reproduces — which is also why they share ONE pair rather than two that could never fail
+      // independently of each other.
       "the `[` jump starts from main's FIRST closer, so a real path is never skipped (#3333 c4 F1)",
       [[
-        String.raw`      let e = s.indexOf("]", i + 1);`,
+        String.raw`      let e = LAST_CLOSE > i ? s.indexOf("]", i + 1) : -1;`,
         String.raw`      let e = LAST_CLOSE;`,
       ]],
-      (m) => ["[/]/[]", "a[/]/[]", "x[/]/y[]", "[a/b]/[]"].every((w) => m.wtIsPathShapedScriptWord(w)),
+      (m) => ["[/]/[]", "a[/]/[]", "x[/]/y[]", "[a/b]/[]", "q[0]w/undo[x].sh", "a[b]c/d[e]"].every((w) => m.wtIsPathShapedScriptWord(w)),
       true,
       false,
       "unmatched brackets stop being literal filename bytes and every `[/]`-shaped real path goes invisible",
