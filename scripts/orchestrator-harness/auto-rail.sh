@@ -961,7 +961,15 @@ review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; p
 # stays plain presence.
 publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
   local repo=$1 pr=$2 state=$3 head=${4:-} basis=${5:-} tag seen text _ratt_basis _ratt_tail
-  tag="<!-- auto-rail-review:${state}${head:+:$head} -->"
+  # ⛔ THE BASIS IS PART OF THE KEY (review round 10, P2, measured). This state is presence-keyed, and a
+  # tag naming only (state, head) cannot tell the rc=7 text from the corrected not-clean-record text for
+  # the SAME head — so whichever published first owned that head for ever. The ordinary flow publishes the
+  # rc=7 text first (`review-pr.sh` posts its findings and exits 7; the recorder mints `verdict=not-clean`
+  # afterwards), so the correction was a PERMANENT no-op and the PR went on asserting "No attestation was
+  # recorded" about a head that demonstrably HAS a record — the false claim claim 3 removed, merely
+  # reordered. Including the basis keeps the supersession it exists for (a real transition adds exactly
+  # one comment) and makes a repeat publish of the SAME basis a no-op, which is what idempotence must mean.
+  tag="<!-- auto-rail-review:${state}${head:+:$head}${basis:+:$basis} -->"
   # ⛔ WHAT MAY BE SAID ABOUT THE COUNT (review round 6, P3): when the attempt ledger could not be READ, the
   # count the loop acted on is the CAP, not a measurement — so the comment says that instead of asserting
   # "3 dispatch(es)" as a fact. The caller passes `cap` for that case (a global flag cannot work: the count

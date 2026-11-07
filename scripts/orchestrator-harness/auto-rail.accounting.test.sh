@@ -776,6 +776,26 @@ PATH="$_ghdir/bin:$PATH"
 _rdir=$(mktemp -d)
 H=3333333333333333333333333333333333333333
 _marker_count() { grep -cF -- "<!-- auto-rail-review:$1" "$POSTED" 2>/dev/null || true; }
+# ── THE NEXT STATEMENT AFTER AN ANCHOR, COMMENTS AND BLANKS SKIPPED ──────────────────────────────
+# ⛔ "IS THE VERY NEXT LINE THE CONSUMER" IS THE WRONG QUESTION, TWICE OVER (review round 10, P1,
+# measured). It forbids a legitimately inserted COMMENT between two adjacent statements, and — the real
+# defect — it accepts a line that holds a STATEMENT followed by the expected text behind it. What these
+# arms mean is "is the next STATEMENT the consumer", and that is what this answers: the first line after
+# `$1`'s match that is neither blank nor a pure comment. Two anchors separated by documentation are still
+# adjacent; two anchors with a statement between them are not.
+# (`grep -q` below is fed by a here-string, never a pipe — a builtin writer piped into a quiet grep is the
+# SIGPIPE false-negative idiom scripts/check-no-sigpipe-grep.sh refuses, #841/#864.)
+# ⛔ THE PATTERN GOES IN THROUGH THE ENVIRONMENT, NOT `-v` (review round 10, measured): awk processes
+# escape sequences in a `-v` assignment, so `\$\(` arrived as `$(` and the anchored ERE silently became a
+# GROUPING expression — the arm then matched nothing and FAILED OPEN on a correct tree (and would have
+# matched almost anything on a broken one). `ENVIRON` is taken literally.
+_after_stmt() {
+  AS_RE="$1" awk '
+    BEGIN { re = ENVIRON["AS_RE"] }
+    flag && $0 !~ /^[[:space:]]*(#|$)/ { print; exit }
+    !flag && $0 ~ re { flag=1 }
+  ' "$SUT"
+}
 
 # ── STATE 1 — ATTESTED AT HEAD: the rail runs, no reviewer is dispatched ──────────────────────────
 # (Pinned where the decision is MADE, in the search arms above: `green 7 at-head`.) What this arm adds
@@ -1310,6 +1330,18 @@ grep -qF '[ "$_rstate" = refused ] && review_forgive_refusal "$_ratt" "$(review_
 _RATTRE='^[[:space:]]*_rattn=\$\(review_attempts "\$_ratt"\)$'
 grep -qE "$_RATTRE" "$SUT" \
   || bad "the loop must read the attempt count FROM THE HEAD-KEYED LEDGER — a zeroed or misdirected source leaves the count under the cap, so EXHAUSTED is unreachable in the loop and the paid retry is unbounded while the driven arms stay green"
+# ⛔ AND THE COUNT MUST ARRIVE AT ITS CONSUMER UNMODIFIED — anchored on ITS OWN LINE is NOT enough
+# (review round 10, P1, MEASURED). Round 9 anchored `_rattn=` and stopped there, so a SEPARATE
+# `_rattn=0` line inserted between the read and `_rage=` left the whole suite GREEN: `review_action`'s
+# `[ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ]` is then always true, EXHAUSTED (rc 3) is unreachable, and one
+# PAID dispatch is bought on every pass for ever — the round-2 defect this whole block exists to prevent,
+# reopened one line below its own pin. A statement pin protects a statement; only adjacency protects the
+# HAND-OFF between two of them.
+_RAGERE='^[[:space:]]*_rage=\$\(review_dispatch_age "\$_rout"\); _rage_rc=\$\?$'
+_RACTRE='^[[:space:]]*review_action "\$_rstate" "\$_rage" "\$_rattn"; _ract=\$\?$'
+_rnxt=$(_after_stmt "$_RATTRE")
+grep -qE "$_RAGERE" <<<"$_rnxt" \
+  || bad "the attempt count must be followed by the age read as the VERY NEXT STATEMENT (found: '${_rnxt:-MISSING}') — a statement inserted between them can ZERO the count (measured: \`_rattn=0\`), which makes review_action's attempt bound always true, leaves EXHAUSTED unreachable and buys one PAID dispatch on every pass while the suite stays green"
 # ⛔ AND THE LEDGER IS KEYED BY THE HEAD, like the record it bounds (review round 2, P2, measured):
 # dropping the head from the ledger name turns a PER-HOST/PER-HEAD budget into a PR-LIFETIME one, so the
 # first head that spends 3 attempts poisons every later head of that PR — each new head reads 3, is
@@ -1960,14 +1992,18 @@ review_action retry "$_d2" 1; _dract=$?
 # ⛔ THE CALL LINE ITSELF IS PART OF THE PIN (review round 9, P3, measured): the adjacency arm only checked
 # that nothing sat BETWEEN the call and `review_action`, so appending `; _rage=0` to the call line left both
 # pins green while restoring the permanent-WAIT defect (and printing "the age is 0s measured from …").
-_RAGERE='^[[:space:]]*_rage=\$\(review_dispatch_age "\$_rout"\); _rage_rc=\$\?$'
+# ⛔ AND THE CONSUMER LINE IS ANCHORED, NOT MATCHED AS A SUFFIX (review round 10, P1, MEASURED). The arm
+# that stood here was `case "$_dnext" in *'review_action …'*)`, a glob whose leading `*` swallowed any
+# prefix — so `_rage=0; review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?` satisfied it with the age
+# discarded, restoring the permanent-WAIT defect this block exists to prevent while the age line above
+# still matched its own anchored pin. `_RAGERE`/`_RACTRE` are both `^…$`-anchored and the two are required
+# to be ADJACENT STATEMENTS, so neither a prefix nor an inserted line can sit between the fallback and the
+# predicate that acts on it.
 grep -qE "$_RAGERE" "$SUT" \
-  || bad 'the age must be taken by review_dispatch_age ALONE, on its own line (_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?) — a trailing statement can overwrite the fallback while every other pin stays green'''
-_dnext=$(grep -A1 -E "$_RAGERE" "$SUT" | sed -n '2p')
-case "$_dnext" in
-  *'review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?'*) ;;
-  *) bad "the age must reach review_action on the VERY NEXT line (found: '$_dnext') — any line in between can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the call itself still matches its pin" ;;
-esac
+  || bad 'the age must be taken by review_dispatch_age ALONE, on its own line (_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?) — a trailing statement can overwrite the fallback while every other pin stays green'
+_dnext=$(_after_stmt "$_RAGERE")
+grep -qE "$_RACTRE" <<<"$_dnext" \
+  || bad "the age must reach review_action as the VERY NEXT STATEMENT (found: '${_dnext:-MISSING}') — a statement before the call on that line, or a line in between, can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the age call itself still matches its pin"
 rm -f "$_AD"
 
 # ⛔ THE TWO 'review-found-issues' FACTS MUST NOT SHARE ONE TEXT (review round 8, P3): rc=7 means no record was
@@ -1990,6 +2026,27 @@ case "$_iss" in
   *'No attestation was recorded'*) ;;
   *) bad "the rc=7 publish must keep saying no attestation was recorded (got: $(printf '%s' "$_iss" | head -1))" ;;
 esac
+# ⛔ AND THE BASIS IS PART OF THE IDEMPOTENCE KEY (review round 10, P2, MEASURED). The arms above drive
+# each text in isolation, so they cannot see the ORDER the loop actually produces: `review-found-issues`
+# is presence-keyed on (state, head), and with the basis absent from the tag whichever text published first
+# OWNED that head. The ordinary flow publishes the rc=7 text first (`review-pr.sh` posts its findings and
+# exits 7) and the `not-clean` record is minted afterwards, so the corrected text — "a record EXISTS" — was
+# a permanent no-op: the PR kept the false claim this round removed, and no driven publish could reveal it
+# because each was published at its own fresh head.
+_HB=5555555555555555555555555555555555555555
+_b4=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues "$_HB"
+publish_review_state acme/widget 42 review-found-issues "$_HB" record
+[ "$(( $(wc -l < "$POSTED") - _b4 ))" = 6 ] \
+  || bad "a rc=7 publish followed by a not-clean-RECORD publish at the SAME head must post TWO comments (got $(( $(wc -l < "$POSTED") - _b4 )) lines) — presence-keyed on (state, head) alone the correction is suppressed, so a PR keeps saying 'No attestation was recorded' about a head that has a record: the false claim this round removed, merely reordered"
+case "$(sed -n "$(( _b4 + 4 )),\$p" "$POSTED")" in
+  *'RECORD EXISTS'*) ;;
+  *) bad "the corrected not-clean-record text must be the NEWEST comment for that head — otherwise the operator reads the stale 'No attestation was recorded' claim" ;;
+esac
+_b5=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues "$_HB" record
+[ "$(wc -l < "$POSTED")" = "$_b5" ] \
+  || bad "re-publishing the SAME basis must still be a no-op — the key change may not turn idempotence into thrash"
 grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head" record' "$SUT" \
   || bad 'the not-clean-record arm must PASS its basis (review-found-issues "$head" record) — without it the comment falls back to the rc=7 text'
 
