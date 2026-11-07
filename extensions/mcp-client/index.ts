@@ -631,7 +631,8 @@ const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
  * `__proto__` an ORDINARY OWN KEY instead of a prototype setter — so a prototype-shaped name that
  * reaches `connectConfig` is STORED AND RESOLVED, not filtered: `connectConfig` checks that an entry is
  * an object and never checks its name (`loadServer("__proto__")` resolves and spawns it — measured).
- * This set and the merge's `isValidServerName` call are therefore the ONLY name locks; do not delete
+ * This set plus the three `isValidServerName` call sites (`asMcpJson`, which filters every name on the
+ * production path, and the two merge loops) are therefore the ONLY name locks; do not delete any of
  * them believing `connectConfig` already refuses those names, because it does not. pi's own
  * name rule (`docs/mcp.md`) is only the charset, which ADMITS all three — on the null-prototype map they
  * would be accepted as ordinary servers — so refusing them is THIS client's hygiene rule, stricter than
@@ -807,6 +808,25 @@ export function mergeMcpLayers(
 
   for (const [name, entry] of Object.entries(repoServers)) {
     if (!isServerEntry(entry) || !isValidServerName(name)) continue;
+    // ⛔ A FALSY TRANSPORT IS NOT A DELTA VALUE — IT IS THE ABSENCE OF ONE (#3628 review rounds 3-4).
+    // `declaresTransport` already refuses to treat `""`/`null` as a declared transport, but a spread
+    // copies the falsy value OVER the base's working one: a repo `{"url": ""}` turned
+    // `{url: "https://base/mcp", headers: …}` into `{url: ""}` — an entry `connectServer` rejects with
+    // "has neither 'command' nor 'url'", credentials already dropped, and nothing said so.
+    // This is the same strip the LAYER READ performs (`asMcpJson` deletes the falsy field), so the two
+    // readers cannot disagree about one config — including for a REPO-ONLY entry, where the layer read
+    // goes on to DROP the entry as declaring no usable transport while this merge used to keep it.
+    // ⛔ Only DEFINED-but-falsy values are stripped. A present TRUTHY non-string (`{"url": ["…"]}`) is
+    // deliberately kept: it is a typo that must still count as a CHANGED destination, so the credential
+    // guards below see it rather than reading it as "no transport declared".
+    const delta = { ...entry } as Record<string, unknown>;
+    let strippedTransports = 0;
+    for (const field of ["url", "command"] as const) {
+      if (delta[field] !== undefined && !delta[field]) {
+        delete delta[field];
+        strippedTransports += 1;
+      }
+    }
     // `Object.hasOwn`, never a truthiness read. `merged` is null-prototype HERE (below), so this is not
     // load-bearing today — the name lock above already refuses `constructor`/`__proto__`/`prototype`. It
     // is the belt for the day this map is built as a plain object: then `merged["constructor"]` would
@@ -816,6 +836,17 @@ export function mergeMcpLayers(
       // No base entry to defend, so the ruling is the same as for the BASE layer: a repo-only entry
       // declaring both transports WORKS over `url` (`connectServer` tests it first) and `origin/main`
       // refused nothing — dropping it would zero a working server. Warn and keep.
+      // ⛔ EXCEPT when the strip above removed the only transport it declared: that entry has nothing
+      // `connectServer` can dispatch on, so `asMcpJson` drops it ("declares no usable transport") and
+      // keeping it here would hand the client a server that throws on first connect. An entry that
+      // declared NO transport at all (`{lazy: true}`) is not this case and is still kept.
+      if (strippedTransports > 0 && delta.url === undefined && delta.command === undefined) {
+        console.log(
+          `[mcp-client] WARN: repo entry "${name}" has only an empty transport — dropped ` +
+            `(a falsy value cannot select a transport, so there is nothing to connect to).`
+        );
+        continue;
+      }
       if (declaresTransport(entry, "url") && declaresTransport(entry, "command")) {
         console.log(
           `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — ambiguous; it is ` +
@@ -830,7 +861,7 @@ export function mergeMcpLayers(
             `this client selects the transport from url/command, so the entry is kept as written.`
         );
       }
-      merged[name] = { ...entry };
+      merged[name] = { ...delta };
       continue;
     }
 
@@ -851,14 +882,10 @@ export function mergeMcpLayers(
     // `{url: "https://base/mcp", headers: …}` into `{url: ""}` — an entry `connectServer` rejects with
     // "has neither 'command' nor 'url'", credentials already dropped, and nothing said so. That is also
     // what the LAYER READ does with the identical input (`asMcpJson` deletes the falsy field, keeping
-    // the base entry), and the two readers must not disagree about one config.
-    // ⛔ Only DEFINED-but-falsy values are stripped. A present TRUTHY non-string (`{"url": ["…"]}`) is
-    // deliberately kept: it is a typo that must still count as a CHANGED destination, so the credential
-    // guards below see it rather than reading it as "no transport declared".
-    const delta = { ...entry } as Record<string, unknown>;
-    for (const field of ["url", "command"] as const) {
-      if (delta[field] !== undefined && !delta[field]) delete delta[field];
-    }
+    // the base entry), and the two readers must not disagree about one config. The strip itself is
+    // computed ABOVE, before the repo-only branch, so both branches agree.
+    // ⛔ A stripped delta with no transport left is simply a delta that changes no transport: the base's
+    // entry stands, which is the intended reading of `{"url": ""}` against a base that has one.
     const carry = { ...inherited } as Record<string, unknown>;
     // The base's `type` describes the base's transport, so it must not outlive a SWITCH: keeping it
     // beside the new transport produced `{type:"http", command:…}` — a stale label contradicting the

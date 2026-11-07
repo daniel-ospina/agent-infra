@@ -359,7 +359,9 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
 
 await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER carries the base's credentials", () => {
   // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write (named
-  // with its repo, as `pi-bootstrap/lib/merge-mcp.py` and `test-cell-install.sh` do — the file is not in
+  // with its repo, as `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/tests/test-cell-install.sh` do — the file is not in
+  // the product tree, so it ships with its repo and is cited by full path rather than by a bare name that
+  // resolves only on the box that wrote it (#3628 review round 4).
   // THIS repo, so a bare path resolves to nothing here). `lazy` and `timeoutMs`
   // must be inherited (a name-level spread dropped them → an EAGER connect at every session start on
   // memory-constrained cells, the failure the base entry's own `_comment` records). The base's
@@ -393,7 +395,7 @@ await test("PER FIELD: a TWO-FIELD base with ONE field overridden keeps the sibl
   // which is what this branch replaced) returns `{ timeoutMs: 40000 }` and silently drops `lazy` — the
   // measured failure that made a hosted server EAGER at every session start on memory-constrained cells.
   // Neither field is a transport field, so NO transport branch runs here: what this pins is the
-  // `{ ...carry, ...entry }` spread itself, which the larger fixtures above reach only through a branch
+  // `{ ...carry, ...delta }` spread itself, which the larger fixtures above reach only through a branch
   // that already deletes fields. The key-set assertion is what a whole-entry replacement cannot survive;
   // asserting the two values alone would still pass if the merge also carried an unrelated third field.
   const merged = mergeMcpLayers(
@@ -1154,6 +1156,40 @@ await test("a FALSY transport is not a delta value — the base's working transp
   ok(
     !logs.some(l => l.includes("changes the destination")),
     `a falsy field changed nothing, so no drop note is owed — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a repo-ONLY entry whose only transport is empty is dropped, as the layer read drops it", async () => {
+  // The strip was applied to a repo DELTA but not to a repo-ONLY entry, so the merge's belt still
+  // disagreed with the layer read for one input: `asMcpJson` removes the empty field and then DROPS the
+  // entry ("declares no usable transport"), while the merge kept `{url: ""}` — a server `connectServer`
+  // rejects with "has neither 'command' nor 'url'" on first connect. Measured before the fix:
+  // `mergeMcpLayers({mcpServers:{}}, {mcpServers:{s:{url:""}}})` -> `{"url":""}`.
+  // ⛔ The DISTINCTION that must survive: an entry that declared NO transport at all is not this case —
+  // `{lazy: true}` is legitimate at the merge level and the layer read keeps it too.
+  const logs = await withCapturedLogs(async () => {
+    const onlyEmpty = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { dead: { url: "" }, dead2: { command: null } } } as never,
+    );
+    equal(Object.keys(onlyEmpty).length, 0, `an entry with only an empty transport must be dropped — got ${JSON.stringify(onlyEmpty)}`);
+
+    const noTransport = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { shape: { lazy: true, timeoutMs: 40000 } } } as never,
+    );
+    ok(noTransport.shape, "an entry that declared NO transport at all (only `lazy`/`timeoutMs`) is still kept");
+
+    const withCommand = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { real: { url: "", command: "/bin/sh" } } } as never,
+    );
+    ok(withCommand.real, "an empty `url` beside a real `command` is stripped, and the entry survives");
+    equal((withCommand.real as Record<string, unknown>).url, undefined, "…with the empty field gone");
+  });
+  ok(
+    logs.some(l => l.includes("only an empty transport")),
+    `the drop must be reported — got:\n${logs.join("\n")}`
   );
 });
 
