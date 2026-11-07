@@ -58,8 +58,17 @@ RAIL="${ATOMIC_LAND_SUITE_RAIL:-$ROOT/scripts/atomic-land.sh}"
 # actually reaps a hung rail (#1845) — one statement of "is it alive / is it still the
 # same process / kill it and prove it", not two that can drift.
 GUARD="$ROOT/tests/atomic-land/rail-guard.sh"
+REAP_LIB="$ROOT/tests/atomic-land/reap-lib.sh"
+# ⛔ PREFLIGHT BEFORE THE SOURCE, and before anything can assert on it. `set -uo pipefail` does
+# NOT abort on a failed `.`: a missing reap-lib.sh leaves `is_running` UNDEFINED, and every
+# "the watchdog left no survivor behind" assertion then reports ✅ on a 127 — a false PASS of
+# exactly the class this change exists to remove. A missing guard is worse: `bash "$GUARD"`
+# exits 127, the watchdog is a silent no-op, and a rail regression becomes a hang instead of a
+# named failure. `[ -f "$RAIL" ]` below has always had this shape; these are its siblings.
+[ -f "$GUARD" ] || { echo "❌ missing $GUARD"; exit 1; }
+[ -f "$REAP_LIB" ] || { echo "❌ missing $REAP_LIB"; exit 1; }
 # shellcheck source=/dev/null
-. "$ROOT/tests/atomic-land/reap-lib.sh"
+. "$REAP_LIB"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/atomic-land-suite.XXXXXX")"
 checks=0
 failures=0
@@ -489,10 +498,10 @@ new_scen() {
   SCEN_REGISTRY_SYNC=
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
-  # #1845: the guard's evidence files are per scenario. A stale sentinel would make a
-  # watchdog report 124 for a rail that stopped by itself (a false red, and the wrong
-  # reason for it).
-  rm -f "$SCEN/wd-fired" "$SCEN/guard-fired" "$SCEN/victim-pid" 2>/dev/null || true
+  # #1845: the guard's per-scenario evidence file. `2>"$SCEN/guard-why"` truncates it at
+  # spawn, so this `rm` is belt-and-braces for a scenario that reuses a dir; it is not what
+  # protects against a stale read.
+  rm -f "$SCEN/guard-why" "$SCEN/victim-pid" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
   rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
@@ -660,10 +669,22 @@ PY
 # process rather than a backgrounded function (an inherited EXIT trap `rm -rf`'d the live
 # suite temp dir — measured, 136 false reds).
 #
-# Why not `scripts/lib/bounded.sh`: `tb_timeout` bounds a command's DURATION and its timer
-# is a child of the CALLER, so it dies with the caller — it cannot stand in for this. The
-# same supervisor hole exists there for the reaper family; folding this arm in would
-# change live reapers, so it is deliberately not done in this change.
+# ⛔ WHAT THIS DOES *NOT* COVER, stated because the bounded claim is the whole point: the
+# window between `rail_exec … &` and `bash "$GUARD" … &` (~4 statements, one of which forks for
+# `proc_ident`) is a moment in which the rail has no guard yet. It is 3 orders of magnitude
+# narrower than "the whole scenario", but it is not zero, so the claim is "a rail cannot outlive
+# the suite that bounds it — modulo the launch window", not "never". And the suite WATCHES the
+# guard (see `run_rail_watchdog`): a child can die where the old in-process loop could not, so a
+# dead guard is reported as an unbounded rail rather than waited on forever.
+#
+# Why not `scripts/lib/bounded.sh`: `tb_timeout` bounds a command's DURATION — a clock cannot
+# express "the process that owns this work is GONE", which is the field condition here (the
+# suite was killed mid-scenario; it did not run out of time). It also kills ONE pid and not a
+# subtree, so a rail that forked would leave its child — the #3255 class. Measured, not
+# assumed: on this box `TB_TIMEOUT_BIN` resolves to GNU `timeout`, and the fallback arm
+# (`tb_watchdog`) arms a timer subshell, so its behaviour is a third thing again — which is
+# itself the reason not to bolt a fourth semantic onto it. Folding a supervisor arm into it
+# would change live reapers, so it is deliberately not done in this change.
 
 # Run the rail under a hard wall-clock watchdog and report its exit status.
 #
@@ -677,22 +698,56 @@ PY
 # that `$!` is the RAIL: killing a wrapper subshell would leave the rail
 # orphaned, and an orphan on the wait bound spins forever.
 #
-# The KILLING is not done here (#1845): this function only waits, and `rail-guard.sh` —
-# a separate process that survives this script — does the reaping and records WHY it
-# fired in `$SCEN/wd-fired`, so 124 can never be confused with the rail's own exit status.
+# The KILLING is not done here while the guard is alive (#1845): `rail-guard.sh` — a separate
+# process that survives this script — owns the reap, so that a suite killed mid-scenario still
+# bounds its rail. This function WAITS, watches the guard, and reaps the rail itself only as a
+# LAST RESORT when the guard has died (see the ⛔ below) — it is not a second, routine owner of
+# the same kill.
+# The guard reports WHETHER it reaped on its EXIT STATUS (124 fired+reaped, 125 fired but the
+# rail SURVIVED, 0 the rail stopped by itself, 2 usage). It does NOT report WHY there: both
+# arms reach the same `exit 124`, and the reason (“the Ns limit expired” vs “its supervisor
+# (pid N) is gone”) exists only on its stderr — which is why 7g greps stderr to attribute the arm,
+# rather than inferring it from the status. Not a sentinel file either: `: >"$f" 2>/dev/null` does
+# not suppress the redirection's own failure, so on a deleted scratch dir the sentinel was silently
+# absent and this function returned the rail's SIGKILL status (137) as a bounded stop — the
+# exact confusion the sentinel was introduced to prevent. A status cannot be lost.
 LAST_RAIL_PID=""
+LAST_RAIL_IDENT=""
 run_rail_watchdog() { # <limit-secs> <extra args...>
   local limit="$1"; shift
-  local sentinel="$SCEN/wd-fired" rc=0 gpid ident
-  rm -f "$sentinel"
+  local rc=0 rc_guard=0 gpid ident guard_died=0
   rail_exec "$@" >"$SCEN/out" 2>"$SCEN/err" &
   local pid=$!
   ident="$(proc_ident "$pid")"
   LAST_RAIL_PID="$pid"
+  LAST_RAIL_IDENT="$ident"
   # A SEPARATE `bash` (not a backgrounded function): it must survive this script's death,
   # and a fork inherits this script's EXIT trap — see rail-guard.sh's header.
-  bash "$GUARD" "$$" "$limit" "$sentinel" "$pid" "$ident" &
+  # `$$` is THIS shell's pid and is correct for every call site here (all top-level, verified);
+  # a future call from inside `$( )` or another subshell would hand the guard the wrong
+  # supervisor, and the guard would then only be able to fire on its limit arm.
+  bash "$GUARD" "$$" "$limit" "$pid" "$ident" &
   gpid=$!
+  # ⛔ THE SUITE WATCHES THE WATCHER — and, only if the watcher dies, reaps in its place. The
+  # guard owns the kill while it is alive; it is not a routine second reaper. But the guard is a
+  # CHILD, and a child can die: the old in-process loop could not lose its timer, this one can.
+  # Measured on the first cut — guard killed 0.3s in, limit 5s — `wait "$pid"` was still blocked
+  # at t+15s with no timeout, no message and no failure, so the suite hung instead of reporting
+  # that the rail had lost its bound. Same shape for a guard that exits 2 (bad argv) or 127
+  # (missing file). Hence the last-resort arm below: it must not be deleted as "the guard's job".
+  while still_ours "$pid" "$ident"; do
+    is_running "$gpid" || break
+    sleep 1
+  done
+  if still_ours "$pid" "$ident"; then
+    # The guard is gone and the rail is not — the last resort is to reap it here, and to say
+    # so, because "the rail was reaped by the suite" is a different finding from "the rail hung".
+    guard_died=1
+    if ! reap_pid "$pid" "$ident"; then
+      echo "⚠️ watchdog: guard pid $gpid died and the rail pid $pid SURVIVED SIGKILL — not waiting on it" >&2
+      return 125
+    fi
+  fi
   wait "$pid" 2>/dev/null || rc=$?
   # ⛔ THE GUARD IS NEVER SIGNALLED — `wait` only. It exits by itself within one poll of the
   # rail's death (its loop is `while still_ours "$pid" "$ident"`), so the only cost is
@@ -704,8 +759,14 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
   # assertions reddened, and all 71 mutation children "reddened" for the same reason, so the
   # coverage gate printed ✅ while covering nothing. Reproduced 5/5 on the pre-exec window and
   # 0/1 when the TERM was delayed. Removing the signal removes the window.
-  wait "$gpid" 2>/dev/null
-  if [ -e "$sentinel" ]; then rm -f "$sentinel"; return 124; fi
+  wait "$gpid" 2>/dev/null || rc_guard=$?
+  if [ "$guard_died" = 1 ]; then
+    echo "⚠️ watchdog: guard pid $gpid died with the rail still running — the rail was UNBOUNDED (reaped here as a last resort)" >&2
+    return 125
+  fi
+  # 124 = the watchdog fired and REAPED; 125 = it fired and the rail survived (the guard's own
+  # line on stderr names it). Both are distinct from any status the rail itself can return here.
+  if [ "$rc_guard" -eq 124 ] || [ "$rc_guard" -eq 125 ]; then return "$rc_guard"; fi
   return $rc
 }
 
@@ -1201,10 +1262,12 @@ called "admin-merge" && fail "landed without terminal checks" || pass "no land b
 grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
 # #1845: `124` on its own is NOT evidence the rail stopped — the old watchdog returned
 # 124 either way, so the suite reported its expected failure and forgot the process.
-# The rail must be PROVABLY gone before the suite moves on.
+# The rail must be PROVABLY gone before the suite moves on. `reap_pid`, not a bare `kill -9`:
+# this pid has already been `wait`ed on, so it is FREE and can be reused, and signalling it
+# unguarded is the bad-reap direction that reap-lib.sh exists to prevent (#1393).
 if is_running "$LAST_RAIL_PID"; then
   fail "the rail SURVIVED the watchdog (pid $LAST_RAIL_PID is still running) — a leak, not a bound"
-  kill -9 "$LAST_RAIL_PID" 2>/dev/null
+  reap_pid "$LAST_RAIL_PID" "$LAST_RAIL_IDENT" || true
 else
   pass "the watchdog left no survivor behind (pid $LAST_RAIL_PID is gone)"
 fi
@@ -1303,7 +1366,7 @@ else
 fi
 if is_running "$LAST_RAIL_PID"; then
   fail "the rail SURVIVED the watchdog (pid $LAST_RAIL_PID is still running) — a leak, not a bound"
-  kill -9 "$LAST_RAIL_PID" 2>/dev/null
+  reap_pid "$LAST_RAIL_PID" "$LAST_RAIL_IDENT" || true
 else
   pass "the watchdog left no survivor behind (pid $LAST_RAIL_PID is gone)"
 fi
@@ -1320,8 +1383,14 @@ fi
 # rail (which stops at its own bound and never needs the guard).
 echo "── 7g. a guarded child is reaped when its SUPERVISOR disappears (#1845)"
 new_scen orphan-guard
-# A supervisor pid that is ALREADY GONE: a child we start and REAP. `wait` reaps it, so
-# this is a dead pid — not a zombie, which `kill -0` would answer TRUE for.
+# A supervisor pid that is ALREADY GONE: a child we start and REAP.
+# ⚠️ RESIDUAL, named rather than hidden: `wait` reaps it, so this is a dead pid — but pids
+# are REUSED, and if the kernel hands this number to a new process before the guard polls,
+# `kill -0` answers TRUE and the supervisor arm can never fire. The assertion below is
+# therefore on the guard's REASON line and not merely on "something fired", so a reuse shows
+# up as "the guard did not name the supervisor arm" instead of as a mysterious red blaming
+# the rail. The window is ~1 pid per 300s of pid allocation on an idle cell; closing it would
+# need a pidfd, which bash 3.2 does not have.
 sleep 1 & _dead_sup=$!
 wait "$_dead_sup" 2>/dev/null
 # A victim whose PARENT exits, so it reparents to init (the field orphan's own shape).
@@ -1337,7 +1406,10 @@ else
   # limit 120s vs a 15s observation window: the LIMIT cannot be what saves us, so only
   # the supervisor-death arm can make this pass. The guard is invoked as the SUITE invokes
   # it — same script, same argv shape — so this pins the shipped mechanism, not a copy.
-  bash "$GUARD" "$_dead_sup" 120 "$SCEN/guard-fired" "$_victim" "$_vident" &
+  # Its stderr is captured so the assertion can name WHICH arm fired: a sentinel-style
+  # "something fired" check passes on the limit arm too, and this scenario must not be able
+  # to pass on the arm it is not testing.
+  bash "$GUARD" "$_dead_sup" 120 "$_victim" "$_vident" 2>"$SCEN/guard-why" &
   _guard=$!
   _waited=0
   while is_running "$_victim" && [ "$_waited" -lt 15 ]; do
@@ -1351,9 +1423,9 @@ else
     pass "the guard reaped the child once its supervisor was gone (${_waited}s, limit 120)"
   fi
   wait "$_guard" 2>/dev/null
-  [ -e "$SCEN/guard-fired" ] \
-    && pass "the guard recorded WHY it fired, so 124 is attributable and not a guess" \
-    || fail "the guard fired without recording why (no sentinel)"
+  grep -q "supervisor (pid $_dead_sup) is gone" "$SCEN/guard-why" 2>/dev/null \
+    && pass "the guard named the SUPERVISOR arm as the reason, so the pass is not the limit arm" \
+    || fail "the guard did not record the supervisor arm as its reason ($(tail -1 "$SCEN/guard-why" 2>/dev/null))"
 fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
