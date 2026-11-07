@@ -906,7 +906,7 @@ sweep_repo() {
     # lists exactly itself, so a missing dir reads as 0 and the expectation is 1.
     # One-sided ON PURPOSE: only a listing BELOW the expectation escalates, so a future git that lists
     # more records than it holds admin dirs can never false-block a sweep that was complete.
-    local admin_n=0 common="" wdir=""
+    local admin_n=0 common="" wdir="" entry="" debris=0
     # ⛔ BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE (#3588 review, cycle 3). This was the ONLY unwrapped git
     # call in the file, so a degraded filesystem could hang the pass on the path that runs BEFORE the disk
     # stops existing, breaking the documented `WIP_SWEEP_BUDGET` guarantee an operator sizes a reclaim
@@ -923,27 +923,36 @@ sweep_repo() {
     esac
     # A plain glob, not `find`: this path is under `.git/`, maxdepth 1, and a glob cannot descend into
     # anything. With no match the pattern stays literal and the `-d` test fails, so 0 needs no nullglob.
-    # ⛔ COUNT REGISTRATIONS, NOT DIRECTORIES (#3588 review, cycles 3-4). Counting every directory made the
-    # guard FALSE-BLOCK a repo whose listing was COMPLETE: a `git worktree add` killed between
-    # `mkdir(.git/worktrees/<name>)` and the `gitdir` write leaves debris that is not a registration at
-    # all, and nothing prunes it — so the repo would answer `status=failed`/rc=3 PERMANENTLY and the
-    # quiesce would turn that into a false "work is NOT fully archived / LOST" FATAL over work that WAS
-    # archived. MEASURED: a healthy 1-worktree repo plus `mkdir .git/worktrees/leftover-empty` reported
-    # "the listing is PARTIAL … NEVER enumerated and NEVER swept", which is simply false.
-    # git writes an admin dir in the order `mkdir -> locked -> gitdir -> HEAD -> commondir` (measured), so
-    # an INTERRUPTED add leaves a PREFIX — `{}`, `{locked}`, `{gitdir}`, `{gitdir,HEAD}`, … — while a
-    # DAMAGED registration loses files by deletion (a `prune`/`remove` that died mid-delete, a partial
-    # restore, a botched repair), from anywhere in that set. That asymmetry is why the test is ANY-of
-    # rather than ALL-of: requiring `gitdir` AND both of `HEAD`+`commondir` counted 0 for a registration
-    # that lost `gitdir` plus ONE of the other two, so a genuine omission read `status=ok rc=0` (MEASURED:
-    # `rm gitdir HEAD` over a worktree still holding unswept work → `status=ok`, and this was a coverage
-    # REGRESSION, the false-PASS class this file exists to close). ANY-of keeps the true positive for every
-    # damaged spelling while still excluding debris, and because a prefix that lacks `gitdir` can only be
-    # `{}` or `{locked}`, `HEAD`/`commondir` never exist without `gitdir` in git's own output — so the
-    # ONLY shapes excluded are debris. Where this could be wrong it over-counts, which is fail-CLOSED.
+    # ⛔ SKIP ONLY MEASURED DEBRIS — COUNT EVERYTHING ELSE (#3588 review, cycles 3-5). Two earlier spellings
+    # were wrong in OPPOSITE directions, and both were measured, so this one is stated by what it EXCLUDES.
+    #   * Counting EVERY directory false-blocked a COMPLETE listing: a `git worktree add` killed before the
+    #     `gitdir` write leaves a directory that is not a registration at all, and the repo then answered
+    #     `status=failed`/rc=3 forever — on the quiesce path a false "the work is LOST" FATAL over work that
+    #     WAS archived. That trains operators to disbelieve the one line that must always be believed.
+    #   * A marker WHITELIST (`gitdir`, or `HEAD`, or `commondir`) then missed a registration damaged down to
+    #     non-marker content: with only `ORIG_HEAD`/`index`/`logs` left, git OMITS that worktree from its own
+    #     listing and the pass answered `status=ok rc=0` over a worktree still holding uncommitted work
+    #     (MEASURED). That is the same false PASS this file exists to close.
+    # So the exclusion is the two shapes git's own write order can leave as a PREFIX — `mkdir -> locked ->
+    # gitdir -> HEAD -> commondir` (measured) — namely an EMPTY dir, or one holding NOTHING BUT `locked`.
+    # A directory that holds even one other entry is counted, whatever it holds: over-counting is
+    # fail-CLOSED (a loud rc=3), while under-counting is the false PASS above.
+    # ⛔ STATED RESIDUAL, one direction only: a registration EMPTIED COMPLETELY (every file deleted) is
+    # indistinguishable from never-populated debris by content, so it is skipped and that omission reads
+    # clean. No content test can separate the two. It is narrow: `git gc` and `git worktree prune` remove an
+    # empty admin dir on their own (`Removing worktrees/<name>: gitdir file does not exist`, measured), so it
+    # does not persist — unlike the `locked`-only shape, which both commands leave in place.
     for wdir in "$common/worktrees"/*/; do
       [ -d "$wdir" ] || continue
-      [ -f "$wdir/gitdir" ] || [ -f "$wdir/HEAD" ] || [ -f "$wdir/commondir" ] || continue
+      debris=1
+      for entry in "$wdir"* "$wdir".[!.]*; do
+        [ -e "$entry" ] || [ -L "$entry" ] || continue
+        case "${entry##*/}" in
+          locked) ;;
+          *) debris=0; break ;;
+        esac
+      done
+      [ "$debris" -eq 1 ] && continue
       admin_n=$((admin_n + 1))
     done
     if [ "$listed" -lt $((admin_n + 1)) ]; then

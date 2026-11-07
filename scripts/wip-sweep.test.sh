@@ -1139,9 +1139,10 @@ has "$O_P" 'NEVER enumerated and NEVER swept' \
 
 # ⛔ S8 — THE INVERSE FALSE POSITIVE: DEBRIS IS NOT AN OMITTED WORKTREE (#3588 review, cycle 3).
 # A `git worktree add` killed between `mkdir(.git/worktrees/<name>)` and the `gitdir` write leaves a
-# directory that is not a registration at all, and NOTHING prunes it. Counting every directory made the
-# guard report a COMPLETE listing as PARTIAL, permanently — and on the quiesce path that became a false
-# "the work is LOST" FATAL over work that WAS archived. A guard that cries loss over nothing trains
+# directory that is not a registration at all. Counting every directory made the
+# guard report a COMPLETE listing as PARTIAL — persistent for the `locked`-only shape, which neither
+# `git gc` nor `git worktree prune` removes (an EMPTY dir both of them do clear) — and on the quiesce path
+# that became a false "the work is LOST" FATAL over work that WAS archived. A guard that cries loss over nothing trains
 # operators to disbelieve the one line that must always be believed, so the debris shape needs its own
 # arm: without it, a future "count everything" edit reds nothing.
 mk_fixture debris fix/3485-debris || { echo "x fixture failed (debris)"; exit 1; }
@@ -1193,6 +1194,30 @@ for pair in "gitdir HEAD" "gitdir commondir"; do
     && ok "S9b …and the note is worktree-list-partial, not a bare 'unknown'" \
     || bad "S9b the index does not record the partial listing for '$1'+'$2'"
 done
+
+# ⛔ S10 — A REGISTRATION DAMAGED DOWN TO NON-MARKER CONTENT IS STILL COUNTED (#3588 review, cycle 5).
+# A marker WHITELIST (`gitdir`/`HEAD`/`commondir`) excluded exactly this shape: with only
+# `ORIG_HEAD`/`index`/`logs` left, git OMITS the worktree and the pass answered `status=ok rc=0` over work
+# that was never swept — the same false PASS this file exists to close, hiding behind a comment that claimed
+# the exclusion was fail-closed. The exclusion is now debris-by-EXCLUSION (empty, or nothing but `locked`),
+# so this arm is what keeps the whitelist from coming back.
+mk_fixture f5 fix/3485-f5 || { echo "x fixture failed (f5)"; exit 1; }
+F5_REPO="$T/f5/wt"
+git -C "$F5_REPO" worktree add -q "$T/f5/w2" -b wip-f5-b 2>/dev/null \
+  || { echo "x could not add a linked worktree (f5)"; exit 1; }
+printf 'precious\n' > "$T/f5/w2/precious.txt"
+rm -f "$F5_REPO/.git/worktrees/w2/gitdir" "$F5_REPO/.git/worktrees/w2/HEAD" \
+      "$F5_REPO/.git/worktrees/w2/commondir"
+[ -e "$F5_REPO/.git/worktrees/w2/index" ] && [ -e "$F5_REPO/.git/worktrees/w2/logs" ] \
+  && ok "S10a baseline: the damaged registration keeps only non-marker content (index/logs), so a marker whitelist would skip it" \
+  || bad "S10a this host's admin dir has no index/logs to leave behind — the arm would grade nothing"
+O_F5="$(WIP_SWEEP_STATE_DIR="$T/state-f5" bash "$SW" --apply --repo "$F5_REPO" 2>&1)"; RC_F5=$?
+[ "$RC_F5" -eq 3 ] \
+  && ok "S10b a registration stripped to non-marker content FAILS the pass (exit 3) — git omits that worktree, so skipping it reads green over unswept work" \
+  || bad "S10b a registration holding only index/logs counted as debris, so an OMITTED dirty worktree read clean (rc=$RC_F5): $O_F5"
+grep -q 'worktree-list-partial' "$T/state-f5/wip-sweep.tsv" 2>/dev/null \
+  && ok "S10c …and the note is worktree-list-partial" \
+  || bad "S10c the index does not record the partial listing for the stripped registration"
 
 echo
 echo "── summary ──"

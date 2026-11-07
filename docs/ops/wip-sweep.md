@@ -207,15 +207,21 @@ to answer `status=ok`.
 The cross-check is a count over `$(git rev-parse --git-common-dir)/worktrees/`, which is git's own
 authority for how many linked worktrees the repo HAS: a pass requires `listed >= admin_dirs + 1` (the
 `+1` is the main worktree, which has no admin dir; a bare repo has no `worktrees/` dir and lists exactly
-itself, so a missing dir reads as 0). **A directory counts as an admin record only if it is a
-registration** — it carries `gitdir`, or `HEAD`, or `commondir`. **Debris is deliberately NOT counted**:
-a `git worktree add` killed between `mkdir` and the `gitdir` write leaves an `{}` or `{locked}` directory
-that is not a registration and that nothing prunes, and counting it made a COMPLETE listing report as
-`PARTIAL` forever — on the quiesce path a false "the work is LOST" FATAL over work that was archived,
-which is how operators learn to disbelieve the one line that must always be believed. The test is
-**ANY-of, not ALL-of**, because damage removes files by deletion from anywhere in that set (requiring
-`gitdir` *and both* others counted 0 for a registration missing `gitdir`+`HEAD`, so a genuine omission
-read `ok`). Where this can be wrong it over-counts, which is fail-closed.
+itself, so a missing dir reads as 0). **Every admin directory counts, EXCEPT measured debris**: an empty
+directory, or one holding nothing but `locked`. Those two are the prefixes git's own write order
+(`mkdir -> locked -> gitdir -> HEAD -> commondir`) can leave behind from a `git worktree add` killed before
+the `gitdir` write, so they cannot be a usable registration. **Debris is excluded on purpose**: counting
+it made a COMPLETE listing report as `PARTIAL`, and on the quiesce path a false "the work is LOST" FATAL
+over work that was archived is how operators learn to disbelieve the one line that must always be
+believed. **Everything else counts, including a registration damaged down to non-marker content** (only
+`index`/`logs`/`ORIG_HEAD` left): git OMITS such a worktree from its own listing, so counting it is
+precisely what makes the omission visible — a marker whitelist instead let that case read `ok`.
+Over-counting here is fail-CLOSED (a loud rc=3); under-counting is the false PASS this rule exists for.
+
+**One residual, stated rather than implied:** a registration EMPTIED COMPLETELY is indistinguishable, by
+content, from debris that was never populated, so it is skipped and that omission reads clean. It is
+narrow because an empty admin dir does not persist — `git gc` and `git worktree prune` remove it
+(`Removing worktrees/<name>: gitdir file does not exist`) — while the `locked`-only shape neither does.
 
 It is **one-sided on purpose** — only a listing BELOW the expectation escalates, so a future git that
 lists more than it holds admin dirs can never false-block a sweep that was complete.
