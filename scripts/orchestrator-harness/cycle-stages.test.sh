@@ -82,11 +82,26 @@ echo "==> cycle-stages self-test ($HERE)"
 echo
 echo "── §0 both shipped modules are sourced, and every function this suite calls exists ──"
 sed -n '/# \[stageclock:begin\]/,/# \[stageclock:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/clock.sh"
-if [ -s "$TMP/clock.sh" ] && qF 'STG_REGISTRY_TILED=' "$(cat "$TMP/clock.sh")"; then
-  ck "the stage-clock block is extracted from the shipped loop" 0
+# ⛔ A MISSING DELIMITER MUST ABORT, NOT SILENTLY EXTRACT THE WHOLE CONTROLLER (fresh-context review,
+# P3 — measured). `sed -n '/begin/,/end/p'` with the end marker deleted runs to EOF, and `1d;$d` then
+# shaves one line at each end — so `clock.sh` became ~6800 lines INCLUDING `while true; do`, the registry
+# token was still present, and §0 ACCEPTED it and then ran `. "$TMP/clock.sh"`: the guard suite would
+# dispatch lanes, run git and call gh. Fail-OPEN in the one direction that matters, so the extraction is
+# now bounded and shape-checked before anything is sourced.
+_clock_lines="$(wc -l < "$TMP/clock.sh" 2>/dev/null | tr -d ' ')"
+_clock_bad=""
+[ -s "$TMP/clock.sh" ] || _clock_bad="$_clock_bad empty"
+qF 'STG_REGISTRY_TILED=' "$(cat "$TMP/clock.sh")" || _clock_bad="$_clock_bad no-registry"
+[ "${_clock_lines:-0}" -le 400 ] || _clock_bad="$_clock_bad too-wide(${_clock_lines})"
+grep -qE '^[[:space:]]*while true; do' "$TMP/clock.sh" && _clock_bad="$_clock_bad contains-the-controller-loop"
+if [ -z "$_clock_bad" ]; then
+  ck "the stage-clock block is extracted from the shipped loop (${_clock_lines} lines, bounded and shape-checked)" 0
 else
   ck "the stage-clock block is extracted from the shipped loop" 1
-  echo "❌ extraction failed — aborting (every later arm would grade an empty file)"; exit 2
+  echo "❌ extraction FAILED or was UNBOUNDED (${_clock_bad# }) — aborting: sourcing an unbounded extraction"
+  echo "   would RUN the controller loop, so this suite must never do it (a missing [stageclock:end] marker"
+  echo "   is the way it happens). Restore the marker in orch-loop.sh."
+  exit 2
 fi
 # shellcheck source=/dev/null
 . "$CR"                    # cycle_stage_get / cycle_stages_valid / cycle_verdict / cycle_history
@@ -372,6 +387,19 @@ ck "  …and on an OLD-ONLY record names the absence instead of failing (NO-STAG
 ST="$(_crecord status --dir "$O" 2>&1)"
 ck "  …and 'status' still grades an OLD-ONLY record (the field is not a precondition for the verdict)" \
    "$(qF 'HEALTHY ' "$ST"; ok $?)"
+# ⛔ A RECORD THAT CANNOT BE READ IS NOT A PRE-FIELD RECORD (fresh-context review, P2 — measured).
+# `[ -s ]` is a STAT, not a read: a non-empty `state/cycles` the process cannot read (a mode-000 file, or
+# — as driven here, so the arm works for root too — a DIRECTORY at that path) passed the size test,
+# `tail`'s error was swallowed by `2>/dev/null`, and the empty read took the NO-STAGE-FIELD branch: rc 0
+# and the words "this is NOT an error" for a record that was never read, while `status`/`history`
+# answered UNREADABLE rc 2 on the SAME state. That inverts this module's own EXIT contract.
+O3="$TMP/O3"; mkdir -p "$O3/state/cycles"
+SO3="$(_crecord stages --dir "$O3" 2>&1)"; _so3rc=$?
+SO3v="$(_crecord status --dir "$O3" 2>&1)"; _so3vrc=$?
+ck "an UNREADABLE newest record answers UNREADABLE rc 2, not the rc-0 'this is NOT an error' branch (stages rc=${_so3rc}, '${SO3%% *}'; status rc=${_so3vrc})" \
+   "$(if [ "${_so3rc:-0}" = "2" ] && qF 'UNREADABLE' "${SO3:-}" && [ "${_so3vrc:-0}" = "2" ]; then echo 0; else echo 1; fi)"
+ck "  …and a genuinely READABLE old-format record still answers NO-STAGE-FIELD rc 0 (the two are not conflated)" \
+   "$(printf '%s\n' "$OLD" > "$O/state/cycles"; _so4="$(_crecord stages --dir "$O" 2>&1)"; _so4rc=$?; if [ "${_so4rc:-9}" = "0" ] && qF 'NO-STAGE-FIELD' "$_so4"; then echo 0; else echo 1; fi)"
 # `bin/harness` is the OTHER production reader. It consumes records by PASS-THROUGH: `cycle_history`
 # renders them and the JSON arm escapes each whole line as a string, so it enumerates no field names
 # of its own — which is exactly why a new field cannot break it. Pinned structurally (and driven by
@@ -553,6 +581,21 @@ ck "EVERY cycle_record_write site carries stages= (${_emit_n} of ${_writes_n} �
 # The emitter must be CALLED, once per record-write site — a token alone writes an EMPTY field, which
 # `cycle_stages_valid` refuses. Counts are DERIVED from the record-write sites, not hardcoded.
 _sf_calls="$(printf '%s\n' "$_loop_nc" | grep -c 'stg_field STG_FIELD')"
+# ⛔ AND `stages=` MUST BE GRADED PER SITE, NOT BY A GLOBAL COUNT (fresh-context review, P3 — measured):
+# deleting the disk-held record's `stages=` line and adding the same token as a no-op on any other code
+# line kept both counts equal and the suite GREEN at 101/0 — the early-exit cycle then wrote a record
+# with NO `stages=` token at all, on the arm the docs call "the very arms the 161-minute narrative is
+# about". So each `cycle_record_write "$O"` INVOCATION BLOCK (through its last `\\`-continued line) must
+# carry the field itself; a token anywhere else cannot satisfy it.
+_cw_missing=""; _cw_n=0
+while read -r _cw_ln; do
+  [ -n "${_cw_ln:-}" ] || continue
+  _cw_n=$(( _cw_n + 1 ))
+  _cw_blk="$(awk -v s="$_cw_ln" 'NR >= s { print; if ($0 !~ /\\$/) exit }' <<<"$_loop_nc")"
+  case "$_cw_blk" in *'stages="${STG_FIELD:-}"'*) : ;; *) _cw_missing="$_cw_missing $_cw_ln" ;; esac
+done <<<"$(grep -n 'cycle_record_write "\$O"' <<<"$_loop_nc" | cut -d: -f1)"
+ck "  …and every cycle_record_write INVOCATION carries its own stages= (${_cw_n:-0} sites${_cw_missing:+, MISSING at:$_cw_missing})" \
+   "$(if [ "${_cw_n:-0}" -ge 3 ] && [ -z "$_cw_missing" ]; then echo 0; else echo 1; fi)"
 ck "  …and stg_field is CALLED once per record-write site, not just its token written (${_sf_calls} of ${_writes_n})" \
    "$(if [ "${_sf_calls:-0}" = "${_writes_n:-0}" ]; then echo 0; else echo 1; fi)"
 # The grammar end of it, driven: an empty value is REFUSED, so the failure above is not cosmetic.
@@ -668,6 +711,41 @@ ck "the overlay queue is WIRED to a real path before the sweep (assign=${_q_wire
 ck "  …and a failure to CREATE it is flagged, not merely ignored (STG_LVL_QOK-style, or the path cleared)" \
    "$(grep -qE ': >"\$STG_LVL_TMP" 2>/dev/null \|\| .*STG_LVL_TMP=""' <<<"$_loop_nc" && echo 0 || echo 1)"
 
+# 9.1d-vi: THE CASCADE LEVELS MUST BE OPENED WHERE THE WORK THEY NAME HAPPENS — not merely somewhere.
+# ⛔ OPENING A LEVEL ABOVE A `case` CHARGES EVERY BRANCH OF IT, and that was MEASURED in the shipped
+# arrangement (fresh-context review, P2): `l3_fix` opened above the conflict case, so a `PENDING` PR — the
+# majority state on a rail repo — had its landing-side work reported as FIXING while `l2_merge` read `ns`
+# for the whole cycle. The suite was green at 101/0. The same class was already fixed once at
+# `[redfix:end]`, which is why attribution ORDER is now graded and not just existence.
+_cc_region="$(awk '
+  /# \[conflict-case:begin\]/ { inb=1; next }
+  /# \[conflict-case:end\]/   { inb=0 }
+  inb && /^[[:space:]]*MSTAT=/ { m=NR }
+  inb && /^[[:space:]]*stg_lvl_start l3_fix([[:space:]]|$)/ { if (!l3) l3=NR }
+  END { printf "%d %d", m+0, l3+0 }' <<<"$_loop_tc")"
+set -- $_cc_region; _cc_mstat="${1:-0}"; _cc_l3="${2:-0}"
+ck "the conflict case opens level 3 INSIDE the CONFLICTING branch, not above the case (MSTAT line ${_cc_mstat}, l3_fix line ${_cc_l3})" \
+   "$(if [ "${_cc_mstat:-0}" -gt 0 ] && [ "${_cc_l3:-0}" -gt "${_cc_mstat}" ]; then echo 0; else echo 1; fi)"
+# ⛔ AND EVERY `case` ARM THAT LANDS A PR OPENS LEVEL 2 ITSELF. The PENDING arm does landing-side work
+# and opened no level, so it inherited the previous arm's — measured.
+# ⛔ EVERY `case` ARM THAT DOES A LEVEL'S WORK MUST OPEN THAT LEVEL ITSELF — otherwise it inherits the
+# previous arm's open, so its cost is credited to a level it is not doing. Measured: deleting the GREEN
+# arm's own `l2_merge` open (the next open is PENDING's) stayed GREEN at 104/0, because §9.3 only needs a
+# site SOMEWHERE for each level. One row per (arm, level) pair the shipped code is supposed to have.
+_armlvl_bad=""
+for _pair in 'GREEN)|l2_merge' 'PENDING:[*])|l2_merge' 'FAILED:[*])|l3_fix'; do
+  _m="${_pair%%|*}"; _lv="${_pair##*|}"
+  # the arm marker must be the WHOLE case label on its own line — `      GREEN)` — not the
+  # classification one-liner `      GREEN)   _cl=GREEN ;; PENDING:*) …` far above it.
+  awk -v m="$_m" -v lv="$_lv" '
+    $0 ~ ("^[[:space:]]*" m "[[:space:]]*$") { inb=1; next }
+    inb && /^[[:space:]]*(GREEN\)|PENDING:\*\)|FAILED:\*\)|\*\))/ { inb=0 }
+    inb && $0 ~ ("^[[:space:]]*stg_lvl_start " lv "([[:space:]]|$)") { f=1 }
+    END { exit !f }' <<<"$_loop_tc" || _armlvl_bad="$_armlvl_bad $_m/$_lv"
+done
+ck "each landing/fixing arm opens ITS OWN level (GREEN->l2_merge, PENDING->l2_merge, FAILED->l3_fix)${_armlvl_bad:+ — missing:$_armlvl_bad}" \
+   "$(if [ -z "$_armlvl_bad" ]; then echo 0; else echo 1; fi)"
+
 # 9.1d-v: THE PER-PR CASCADE SITES ARE PINNED BY REGION, NOT JUST BY EXISTENCE.
 # §9.3 requires a `stg_lvl_start l<N>_` call site SOMEWHERE for each declared level, so it cannot see a
 # site deleted from the region that owns it. Measured: deleting the red-fixer block's `l3_fix` open left
@@ -688,6 +766,83 @@ _redfix_close="$(awk '
   seen && /^[[:space:]]*V="\$\(gh pr checks/ { exit }
   END { exit !f }' <<<"$_loop_tc" && echo 0 || echo 1)"
 ck "  …and CLOSES it before the per-PR check classifier, so classification is not charged to a cascade level" "$_redfix_close"
+
+# 9.1d-vii: THE SWEEP'S PAGINATED PR LISTING IS CHARGED TO `sweep`, NOT TO `authority` (P1 — measured).
+# `stg_mark` closes the current interval INTO THE STAGE IT NAMES, so an `authority` mark placed AFTER the
+# listing booked the whole paginated `gh api …/pulls?state=open` sweep (plus `open_pr_count` and the
+# branch-protection read) to `authority` — while the docs called that bucket sub-second. #2028, this
+# field's own root cause, is rate-limited `gh` calls pinning command substitutions open for 40+ minutes;
+# booking a slow LISTING to a name that describes no listing hides exactly the minutes an operator
+# wants. The marks must bracket the block, and OUTSIDE its extractable `[BEGIN|END]` markers so
+# `sweep-quota.test.sh` can still drive the block standalone.
+_ls_b="$(grep -nE '^[[:space:]]*# BEGIN sweep-listing' <<<"$_loop_tc" | head -1 | cut -d: -f1)"
+_ls_e="$(grep -nE '^[[:space:]]*# END sweep-listing' <<<"$_loop_tc" | head -1 | cut -d: -f1)"
+_ls_pre="$(printf '%s\n' "$_loop_tc" | awk -v b="${_ls_b:-0}" 'NR<b && /^[[:space:]]*stg_mark /{m=$2} END{print m}')"
+_ls_post="$(printf '%s\n' "$_loop_tc" | awk -v e="${_ls_e:-0}" 'NR>e && /^[[:space:]]*stg_mark /{print $2; exit}')"
+ck "the sweep's PR LISTING is charged to 'sweep', not 'authority' (last mark before BEGIN='${_ls_pre:- MISSING}', first mark after END='${_ls_post:- MISSING}')" \
+   "$(if [ "${_ls_pre:-}" = "authority" ] && [ "${_ls_post:-}" = "sweep" ]; then echo 0; else echo 1; fi)"
+
+# 9.1d-viii: A TYPO'D `stg_mark` MUST NOT SWALLOW THE INTERVAL (P3 — measured).
+# `stg_add` rejected only non-`[A-Za-z0-9_]` characters, so `stg_mark swep` wrote `STG_V_swep` — a
+# variable the emitter walks NEITHER as a stage nor as `ns` — and 1.2 s of wall time left the tiled
+# partition with no `ns` anywhere to signal it (measured: `sweep:0`, `STG_V_swep=1201777` µs never
+# emitted). Driven against the SHIPPED clock: the span must land on the next VALID mark.
+stg_cycle_reset
+stg_mark boot
+sleep 1.2
+stg_mark swep                 # the typo: must NOT close the interval
+stg_mark sweep
+stg_field _typo_f
+_t_boot="$(cycle_stage_get "stages=$_typo_f" boot 2>/dev/null || echo X)"
+_t_sweep="$(cycle_stage_get "stages=$_typo_f" sweep 2>/dev/null || echo X)"
+ck "a typo'd stg_mark does NOT swallow the interval — the span lands on the next VALID mark (boot='$_t_boot', sweep='$_t_sweep') and no 'swep' token is emitted" \
+   "$(if [ "${_t_boot:-X}" = "0" ] && [ "${_t_sweep:-0}" -ge 1 ] 2>/dev/null && [ "${_t_sweep:-0}" -le 5 ] 2>/dev/null && ! qF 'swep:' "$_typo_f"; then echo 0; else echo 1; fi)"
+# And the LEVEL half: an unknown level name must be REFUSED, not queued into a variable nothing reads.
+STG_LVL_TMP="$TMP/lvlq-typo"; : >"$STG_LVL_TMP"; STG_OPEN_LVL=""; STG_OPEN_T0=0
+stg_lvl_start l2_merg || :    # the typo
+stg_lvl_settle || :
+_lvq="$(wc -l < "$STG_LVL_TMP" 2>/dev/null | tr -d ' ')"
+ck "  …and an UNKNOWN cascade level is refused, so nothing is queued the emitter never walks (queue lines='${_lvq:-?}')" \
+   "$(if [ "${_lvq:-1}" = "0" ]; then echo 0; else echo 1; fi)"
+STG_LVL_TMP=""; STG_OPEN_LVL=""; STG_OPEN_T0=0
+
+# 9.1d-ix: LEVEL 3 MUST BE CLOSED AT THE CLASSIFICATION, NOT LEFT OPEN FROM THE RED-TREE ARM.
+# ⛔ THE FIRST VERSION OF THIS ARM WAS A FALSE PASS AND IS REPLACED (fresh-context review of the fix
+# round, P1 — measured end-to-end). It only demanded "no `stg_lvl_start l3_fix` between `_rgs=` and
+# `_fix_eligible=1`", so DELETING the open there left it green — and the emitted field was
+# BYTE-IDENTICAL (`l3_fix:1, l4_review:ns`), because the `FAILED:*` arm had ALREADY opened level 3 fifty
+# lines above and `stg_lvl_start` only settles at the next open. The property that actually has to hold
+# is that level 3 is SETTLED after the remedy is classified, so the review-side branches
+# (`review_disp_decide`, `review_athead_bump`, `park_ctrl`) cannot inherit the red-tree arm's open: a
+# NEEDS-REVIEW PR at AT-HEAD — the documented steady state for a PR nothing is fixing — must not report
+# "fixing". Both halves are graded: the settle present, and no l3 open above the fix-eligibility decision.
+_nf_l3_before="$(awk '
+  /_rgs="\$\(review_gate_state/ { inb=1; next }
+  inb && /_fix_eligible=1/ { fe=1 }
+  inb && /^[[:space:]]*stg_lvl_start l3_fix/ && !fe { bad=1 }
+  END { print (bad?"yes":"no") }' <<<"$_loop_tc")"
+ck "the NEEDS-FIX classifier does NOT open level 3 above the fix-eligibility decision (got '${_nf_l3_before:-?}')" \
+   "$(if [ "${_nf_l3_before:-yes}" = "no" ]; then echo 0; else echo 1; fi)"
+_nf_l3_settle="$(awk '
+  /_rgs="\$\(review_gate_state/ { inb=1; next }
+  inb && /^[[:space:]]*stg_lvl_settle/ && !seen { settle=1 }
+  inb && /review_disp_decide "\$PR"/ { seen=1; if (settle) ok=1; exit }
+  END { print (ok?"closed":"OPEN") }' <<<"$_loop_tc")"
+ck "  …and the red-tree arm's level 3 is SETTLED before the review-side branches, so a NEEDS-REVIEW PR at AT-HEAD does not read 'fixing' (got '${_nf_l3_settle:-?}')" \
+   "$(if [ "${_nf_l3_settle:-OPEN}" = "closed" ]; then echo 0; else echo 1; fi)"
+
+# 9.1d-x: `stg_mark` REFUSES AN OVERLAY NAME (P3 — verified). `stg_is_registered` accepted `l4_review`, so
+# `stg_mark l4_review` accumulated a TILED span into the overlay's variable and broke the documented
+# containment `sum(l1..l4) <= sweep` (an overlay can exceed the sweep it sits inside), silently, because
+# the name was registered. Driven: the overlay must stay untouched.
+stg_cycle_reset
+STG_LVL_TMP=""
+stg_mark boot
+stg_mark l4_review            # wrong function, registered name: must be REFUSED
+stg_field _ov_f
+_ov_v="$(cycle_stage_get "stages=$_ov_f" l4_review 2>/dev/null || echo X)"
+ck "a stg_mark naming an OVERLAY is refused, so no tiled span can be added to a cascade level (l4_review='${_ov_v:-?}')" \
+   "$(if [ "${_ov_v:-x}" = "ns" ]; then echo 0; else echo 1; fi)"
 
 # 9.1e `stg_field` FOLDS BEFORE IT EMITS — driven, not grepped.
 # The post-`done` fold is not the last word: an overlay interval that closes at TOP level afterwards is
@@ -751,9 +906,13 @@ ck "  …and the second gap is a real measurement, not a cleared-to-zero field" 
 # that merely names the call must not satisfy the arm (the fix for this defect explains itself in
 # prose, so an unstripped grep would have passed on the broken tree).
 _loopcode="$(printf '%s\n' "$_loop_tc" | grep -vE '^[[:space:]]*#')"
+# ⛔ ANCHORED AT COMMAND POSITION, LIKE THE TILED ARM ABOVE (fresh-context review, P2 — measured).
+# `qF "stg_lvl_start $_lvl"` was a bare SUBSTRING match over the whole stripped file, so deleting the real
+# call and spelling it inside any other code line (`: stg_lvl_start l4_review`) kept the arm GREEN at
+# 101/0 — while `l4_review` then reads `ns` for ever. This is the arm guarding this PR's own P0 fix.
 for _lvl in $STG_REGISTRY_LVL; do
-  ck "cascade level '$_lvl' has a stg_lvl_start call site in the shipped loop (not just a registry entry)" \
-     "$(if qF "stg_lvl_start $_lvl" "$_loopcode"; then echo 0; else echo 1; fi)"
+  ck "cascade level '$_lvl' has an ANCHORED stg_lvl_start call site in the shipped loop (not just a registry entry)" \
+     "$(if grep -qE "^[[:space:]]*stg_lvl_start $_lvl([[:space:]]|\$|;|\|)" <<<"$_loopcode"; then echo 0; else echo 1; fi)"
 done
 
 # 9.4 THE READER REFUSES A CORRUPT VALUE INSTEAD OF RETURNING IT.
@@ -814,7 +973,14 @@ ck "the fork-starved record writes start= and end= from the SAME token (got '${_
 # at `stages=` and therefore left that branch ungraded (`$(date +%s)` added there stayed 97/0, verified).
 # It is still not the whole arm BODY: the body's inline comments and printf MESSAGES name `$( )`, `date`
 # and backticks to explain the ban, and matching inside prose is the vacuating shape §6 already stripped.
-_starved_body="$(printf '%s\n' "$_loop_nc" | awk '/FORK_STARVED:-0.*= "1"/{f=1} f && /cycle_record_write/{r=1} r{print; if ($0 !~ /\\$/) exit}' | sed 's/\$((//g')"
+# ⛔ SPACES INSIDE THE ACTION BRACES, AND THAT IS NOT COSMETIC (fresh-context review, P2 — measured).
+# `{r=1}` is read by this host's #1484/#709 working-tree-discard guard as a SCRIPT PATH (it carries a `/`
+# and a brace-expansion shape), so `bash cycle-stages.test.sh` was REFUSED entirely — the guard's own
+# message: "the body … cannot be fully read — "/cycle_record_write/{r=1}" is invoked as a script". A suite
+# that cannot be run from a lane's worktree is exactly the state where "the cheapest way out is to claim
+# it is green without running it", which is the failure this file exists to prevent. `{ r=1 }` is the
+# same awk program and is not path-shaped.
+_starved_body="$(printf '%s\n' "$_loop_nc" | awk '/FORK_STARVED:-0.*= "1"/ { f=1 } f && /cycle_record_write/ { r=1 } r { print; if ($0 !~ /\\$/) exit }' | sed 's/\$((//g')"
 _sb_n="$(printf '%s\n' "$_starved_body" | grep -c . || true)"
 ck "no command substitution in the FORK-STARVED arm's record write (${_sb_n:-0} lines scanned)" \
    "$(if [ -n "$_starved_body" ] && ! qF '$(' "$_starved_body"; then echo 0; else echo 1; fi)"

@@ -339,7 +339,23 @@ cr_cli() {
       local _sf _rec _val _rest
       _sf="$(cr_path "$O")"
       if [ ! -s "$_sf" ]; then printf 'ABSENT why=no_cycle_record path=%s\n' "$_sf"; return 2; fi
-      _rec="$(tail -n 1 "$_sf" 2>/dev/null)"
+      # ⛔ `[ -s ]` IS A STAT, NOT A READ, AND THAT INVERTED THIS MODULE'S OWN EXIT CONTRACT
+      # (fresh-context review, P2 — measured). A NON-EMPTY record this process cannot read (mode 000,
+      # or a DIRECTORY at `state/cycles`) passed the size test, `tail`'s error was swallowed by
+      # `2>/dev/null`, and the empty `_rec` was indistinguishable from a pre-field line — so it took the
+      # `NO-STAGE-FIELD … (this is NOT an error)` branch below and answered **rc 0** for a record it
+      # never read, while `status`/`history` answered `UNREADABLE` **rc 2** on the same directory. The
+      # header's EXIT contract says `2 ABSENT/UNREADABLE (cannot answer — never a pass)`, and the old
+      # message also named the WRONG CAUSE (the file may well be new-format). `tail`'s own rc is what
+      # separates "no field in a readable line" from "no readable line at all".
+      if ! _rec="$(tail -n 1 "$_sf" 2>/dev/null)"; then
+        printf 'UNREADABLE why=newest_record_unreadable path=%s (the newest record could not be READ — a permission or a non-file at that path, NOT a pre-field record)\n' "$_sf"
+        return 2
+      fi
+      if [ -z "${_rec:-}" ]; then
+        printf 'UNREADABLE why=newest_record_unparseable path=%s (the newest line is empty — there is no record to attribute)\n' "$_sf"
+        return 2
+      fi
       _val=""
       case "$_rec" in *"${CR_STAGES_FIELD}="*) ;; *)
         printf 'NO-STAGE-FIELD the newest record predates the %s= field (this is NOT an error — the file\n              is append-only and old lines stay old); nothing to attribute\n' "$CR_STAGES_FIELD"

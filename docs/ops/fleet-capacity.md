@@ -532,16 +532,23 @@ matters when reading a line:
 
 | kind | examples | meaning |
 |---|---|---|
-| **tiled** | `boot disk reap refresh authority claims caches sweep gate l5_issue record` | marked once per cycle, in body order — they **tile** the body, so on a FULL cycle their sum *is* the cycle's own duration |
+| **tiled** | `boot disk reap refresh authority claims caches sweep gate l5_issue record` | marked in body order — they **tile** the body, so on a FULL cycle their sum *is* the cycle's own duration (see the tolerance bullet below). A stage may be marked **more than once** and the intervals **add**: `sweep` is marked twice — its paginated PR listing (before the claim/cache refreshes) and its per-PR body (after them) — because both are the sweep's own read and work |
 | **overlay** | `l2_merge l3_fix l4_review` | a merge-cascade level's **cumulative** wall time inside the sweep; a *breakdown of* `sweep`, never an addition to it (`sum(l1..l4) <= sweep`). Each level's intervals are queued in `$O/state/.stg-lvl` by the sweep's subshell and folded back into the parent after it — a shell variable written inside that pipeline would die at `done` and report a fabricated `0` |
-| **carried** | `prev_wait` | the post-record gap — the `CYC` nap — read one cycle later: the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration. It is **one gap, overwritten each cycle, never a running total** (that defect was measured as `1`, `2`, `3` over three 1 s naps, and would reach ~2400 by cycle 10 on a `CYC=240` box). The async backlog spawn is *launched* inside this window but is **not** part of it: the post-nap stamp is taken after the launch, so the spawn's runtime overlaps the nap instead of adding to it |
+| **carried** | `prev_wait` | the post-record gap — the `CYC` nap — read one cycle later: the record is written *before* the nap, and must be, or a HUNG cycle would look fresh for its whole duration. It is **one gap, overwritten each cycle, never a running total** (that defect was measured as `1`, `2`, `3` over three 1 s naps, and would reach ~2400 by cycle 10 on a `CYC=240` box). The async backlog spawn is **not** part of it at all: it is launched *before* the post-nap sample is taken, so neither its launch (a fork+exec) nor its runtime is in `prev_wait` — it sits in the unmeasured tail after `stg_mark record` |
 
 `l5_issue` is a tiled stage because issue launch is contiguous; `l1_main` (the cascade's *fix main if
 red*) is registered and reads **`ns`** until that level exists — `ns` ("registered, never sampled") is a
 different reading from `0` ("measured, cost nothing"), deliberately, so an unimplemented level can
 never read as a measured zero-cost one. ⛔ **AND ON A TILED STAGE, `0` MUST BE READ AS "sampled,
 under one second"** — values are whole seconds, so the genuinely sub-second stages (`boot`, `disk`,
-`reap`, `authority`, `claims`, `caches`) read `0` on a perfectly healthy cycle. `ns` is the only
+`reap`, `claims`, `caches`) read `0` on a perfectly healthy cycle. `authority` is **not** one of them:
+that bucket books two `gh` round trips — `open_pr_count` (`gh pr list`, used for the scope decision)
+and the branch-protection read inside `resolve_required_checks` — so a healthy cycle can show it
+non-zero and a rate-limited one can show it in minutes. ⛔ **The paginated PR LISTING is `sweep`'s,
+not `authority`'s** (it was misattributed until a review measured it): `#2028` — this field's own root
+cause — is rate-limited `gh` calls pinning command substitutions open for 40+ minutes, and booking a
+slow listing to a name that describes no listing hides exactly the minutes an operator is looking for.
+`ns` is the only
 token that means "nothing sampled this stage"; `0` always means the sampler ran. `l4_review` is the review-**dispatch** arm's own body time: the
 controller spawns the reviewer and moves on, so it is small by design and is not the reviewer's runtime.
 
@@ -550,8 +557,12 @@ TOLERANCE OF A FEW SECONDS.** Three things move the arithmetic, all of them smal
 stated so a reader does not misread them as a broken instrument:
 
 - **Only a cycle that reaches the end of its body marks every tiled stage.** On the **disk-held** arm
-  the cycle `continue`s early, so every stage it never reached reads `ns` and `sum(tiled)` is
-  legitimately SHORT of `end - start`. `ns` is the label that says so. ⛔ Everything a reader is most
+  the cycle `continue`s early, so every stage it never reached reads `ns`. ⛔ **The `ns` stages are NOT
+  the shortfall** (fresh-context review, P3): a stage that never ran costs zero seconds, so reading `ns`
+  as "the un-run remainder" is dimensionally impossible. What is actually short on that arm is the tail
+  between the **last mark it did reach** and the `end=` stamp — the record write and its prep, i.e.
+  milliseconds — plus truncation. `ns` is still the label that says *which* stages never ran; it is just
+  not where missing seconds can hide. ⛔ Everything a reader is most
   tempted to put in that gap is OUTSIDE it: `end=` is stamped at the record write, so the record
   append, the post-record backlog refresh and the `CYC` nap all happen AFTER it — the only tail inside
   `end - start` is the field build plus the `end=` stamp itself (milliseconds). The nap is measured as
@@ -565,9 +576,22 @@ stated so a reader does not misread them as a broken instrument:
 - **`boot` opens at `stg_cycle_reset`, which runs BEFORE `CYCLE_T0="$(date +%s)"`**, so the sum can also
   come out slightly LONGER than `end - start`.
 
-So the correct reading of a full cycle is `sum(tiled) ≈ end - start` within a few seconds, and a
-shortfall on a cycle that shows any `ns` is the un-run remainder. The very arms the 161-minute
-narrative above is about are these early-exit ones.
+So the correct reading of a full cycle is `sum(tiled) ≈ end - start` within a few seconds.
+⛔ **A SHORTFALL IS NEVER EXPLAINED BY `ns`** (fresh-context review, P3 — the earlier text said a
+shortfall on an early-exit cycle "is the un-run remainder", which is dimensionally impossible): a stage
+that never ran consumes **zero** seconds, so its absence cannot make the sum short. `ns` tells you which
+stages never ran — it is not the source of any gap. On an early-exit cycle the gap is the same two
+small movers as on a full one (truncation, and the unmarked tail between the last mark and the `end=`
+stamp), **not** an "un-run remainder". The early-exit arms are still the ones the 161-minute narrative
+above is about, and `ns` still says so — but read it as *what did not run*, never as *where the missing
+seconds went*. ⛔ **A MINUTES-SCALE shortfall with no `ns` anywhere is the silent-loss signature** (a mark
+that closed into a stage name the emitter never walks), and it must be investigated rather than
+explained away with a token that cannot cause it. ⛔ **And a shortfall WITH an `ns` is not automatically
+"the un-run remainder" either** — a misspelled `stg_mark` name is rejected rather than swallowing the
+interval (it does not advance the tile mark, so the span goes to the next valid mark), but when that
+rejected mark is the **last one before the record write** there is no next valid mark and the span
+cannot be charged: the replaced stage reads `ns` and the sum is short by that span. So `ns` plus a
+shortfall is a reason to go read the mark call sites, never a reason to stop reading.
 
 The stage SET lives in exactly one place — `orch-loop.sh`'s `STG_REGISTRY_*` block — and the emitter
 walks it, so a stage added there appears in every later record with no second edit. The grammar and the

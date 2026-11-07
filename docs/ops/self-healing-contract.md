@@ -188,12 +188,16 @@ truncated to whole seconds when emitted (up to ~11 s short across eleven of them
 `CYCLE_T0`, and the tail after `stg_mark record` is unmeasured. `fleet-capacity.md` states the three
 movers; do not read a few-second gap as a broken instrument. `l2_merge`/`l3_fix`/`l4_review` are cascade-level
 overlays *inside* `sweep`, `prev_wait` is the carried post-record gap — the `CYC` nap, **one gap
-overwritten each cycle, not a running total** (the async backlog spawn is launched inside that window,
-but the post-nap stamp is taken after the launch, so its runtime overlaps the nap rather than adding), and `ns` means registered-but-never-sampled
+overwritten each cycle, not a running total** (the async backlog spawn is launched *before* the post-nap sample is
+taken, so neither its launch nor its runtime is in `prev_wait` — it falls in the unmeasured tail after
+`stg_mark record`), and `ns` means registered-but-never-sampled
 (distinct from a measured `0`). ⛔ A cycle that exits early — the **disk-held** arm `continue`s before
-the end of the body — leaves the stages it never reached reading `ns`, so its tiled
-sum is legitimately SHORT of `end - start`; check for `ns` before reading a shortfall as a broken
-instrument. ⛔ The **fork-starved** arm is the opposite case and must not be lumped in with it: its
+the end of the body — leaves the stages it never reached reading `ns`, which tells you **which** stages
+did not run. ⛔ **It is NOT the explanation for a shortfall** (a stage that never ran costs zero
+seconds): the gap on such a cycle is the same two small movers as on a full one — whole-second
+truncation, and the unmarked tail between the last mark reached and the `end=` stamp. `fleet-capacity.md`
+states both, and it states the other half of this: a **minutes-scale** shortfall with no `ns` anywhere is
+the silent-loss signature, not something to explain away. ⛔ The **fork-starved** arm is the opposite case and must not be lumped in with it: its
 record is written `start=$_ft0 end=$_ft0`, so `end - start = 0`, and its tiled sum (which includes
 `boot` — usually positive, though each stage truncates to whole seconds, so a sub-second fork-starved
 start emits `boot:0`) can only be EQUAL or LONGER — never short. It exists because `end - start` did not
