@@ -1658,26 +1658,9 @@ else
   rc=1; echo "      could not extract exactly ONE \`_skip_order_why=\$(skip_order_why …)\` assignment from the skip arm (found $MAPLINE) — this check cannot grade the dispatch"
 fi
 ck "the SKIP arm hands skip_order_why the STATE it recorded (no second re-mapping table that can drift from it)" $rc
-# 12-z) NO GENERATED DRIVER MAY OPT OUT OF `set -u` (review P2, cycle 10). Both scripts this suite EXTRACTS
-#       from run under `set -u` (refresh-candidates.sh:16, orch-loop.sh:4), so an unbound reference inside
-#       any function under test is a FATAL abort in production while a driver without the flag reports it
-#       GREEN. Measured by the reviewer: `echo "$UNBOUND_PROBE"` planted in the count-unreadable arm left
-#       the suite at 60/0, because the only driver reaching those arms (count_race) ran without the flag.
-#       The glob is deliberate: a driver added later is covered without being listed here. ⛔ It is scoped
-#       to THIS suite's $TMP and says so — selftest.sh's tail drives live in a DIFFERENT mktemp dir, so an
-#       alternative naming them here could never match and would read as coverage it does not have (review
-#       P3, cycle 11). That suite carries its own `set -u` prologue and pins it in its own check.
-drivers_total=0; drivers_bare=""
-while IFS= read -r drv; do
-  [ -n "$drv" ] || continue
-  drivers_total=$(( drivers_total + 1 ))
-  grep -qx 'set -u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
-done <<EOF
-$(find "$TMP" -type f \( -name 'drive*.sh' -o -name 'one.sh' -o -name 'skipwhy.sh' -o -name 'floor-drive.sh' \) 2>/dev/null | sort)
-EOF
-if [ "$drivers_total" -ge 4 ] && [ -z "$drivers_bare" ]; then rc=0
-else rc=1; echo "      generated drivers: $drivers_total found; WITHOUT 'set -u':${drivers_bare:- none} (want >=4 drivers, every one under set -u — without it a driver cannot see an unbound-reference abort)"; fi
-ck "every generated driver runs under \`set -u\`, like the shipped code it extracts ($drivers_total checked)" $rc
+# 12-z) the generated-driver `set -u` sweep now runs at the END of the run — see the block immediately before the
+#       end pin, where every driver this suite creates already exists. It lived here (57 of 126 drivers visible,
+#       "every generated driver" reported) until review cycle 86.
 # 12a) NON-VACUITY by MUTATION: make `product_queue_follow` a no-op (`return 0` as its first statement)
 #      and the stale-case assertion must RED — the product file stays a pass behind.
 MUT_NOFOLLOW="$TMP/fns-nofollow.sh"
@@ -3048,7 +3031,9 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 # `{ echo … >&2; }`, a helper function), a claim behind a quoted `#`, a claim exempted by a substring. None of
 # that is enumerable. What IS finite is the set of cases this suite drives and the bytes each one emits on the
 # operator's stdout/stderr — so the emitted text of every driven case is pinned here, normalized for the sandbox
-# path and nothing else. Any prose reaching the operator, by any mechanism, changes one of these CRCs.
+# path AND for ANSI SGR colour codes, and nothing else. Any prose reaching the operator, by any mechanism, changes
+# one of these CRCs; a colour change alone does not (measured: the same line with and without `\033[31m`/`\033[0m`
+# both cksum to 2405737011 — the terminal styling of a claim is not the claim).
 # SCOPE, STATED (so this is not a claim it cannot keep):
 #   * it covers every case THIS SUITE DRIVES — §14 and §6 drive each state arm and each refusal;
 #   * it does not red a source edit that changes no output, which is correct: a reformat cannot mislead an operator;
@@ -3163,10 +3148,11 @@ _out_unique() { # the map above, deduped by CONTENT (many fixtures share an arm)
   # the very half that claims "a new case cannot hide by duplicating an existing output".
   _out_map | sed 's/.*=//' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
-# ⛔ THE DIAGNOSTICS NAME A CAPTURE, SO THEY MUST BE ABLE TO SHOW IT (review P3, cycle 74). Three failure messages
-# call `_out_show`; its earlier body printed the capture RAW (sandbox path unfolded, ANSI kept), said nothing when
+# ⛔ THE DIAGNOSTICS NAME A CAPTURE, SO THEY MUST BE ABLE TO SHOW IT (review P3, cycle 74). SEVEN failure messages
+# call `_out_show` — two in the first pin, five in the end check (the count grew as cycles 78-84 added end-check
+# arms; it said "three" until cycle 86, which is the number the cycle-73 rewrite left behind); its earlier body printed the capture RAW (sandbox path unfolded, ANSI kept), said nothing when
 # the key resolved to no file, and spelled an empty capture as a sentence longer than the finding. Worse, the
-# cycle-73 rewrite of this section DELETED the definition while keeping all three call sites, so every diagnostic
+# cycle-73 rewrite of this section DELETED the definition while keeping those call sites, so every diagnostic
 # expanded to empty air — a red that says "…produces: " and nothing else. It is defined ONCE here, folds the path,
 # names an EMPTY capture as `<EMPTY>`, and names an unresolvable key as such.
 _out_show() { # $1="<case>/<file>" -> the emitted text (paths folded), first 6 lines, '|'-joined
@@ -3371,6 +3357,32 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # `out=CLAIM` inside a witness dir ride through the only check that can see it (measured: 177/0). A map line is
 # `<case>/<file>=<crc>` with `<crc>` digits or `EMPTY`, so anchoring on `=(EMPTY|[0-9]+)$` excludes exactly the two
 # declared witness captures and nothing else.
+# ⛔ NO GENERATED DRIVER MAY OPT OUT OF `set -u` (review P2, cycle 10). Both scripts this suite EXTRACTS
+#       from run under `set -u` (refresh-candidates.sh:16, orch-loop.sh:4), so an unbound reference inside
+#       any function under test is a FATAL abort in production while a driver without the flag reports it
+#       GREEN. Measured by the reviewer: `echo "$UNBOUND_PROBE"` planted in the count-unreadable arm left
+#       the suite at 60/0, because the only driver reaching those arms (count_race) ran without the flag.
+#       The glob is deliberate: a driver added later is covered without being listed here. ⛔ It is scoped
+#       to THIS suite's $TMP and says so — selftest.sh's tail drives live in a DIFFERENT mktemp dir, so an
+#       alternative naming them here could never match and would read as coverage it does not have (review
+#       P3, cycle 11). That suite carries its own `set -u` prologue and pins it in its own check.
+# ⛔ AND IT RUNS AT THE END OF THE RUN, NOT IN THE MIDDLE (§12-z) (review P2, cycle 86). "A driver added later is
+# covered" was FALSE where it stood: at that point only the drivers created so far existed, so the check inspected 57
+# of the run's 126 and reported `✅ every generated driver … (57 checked)` while `mh-*`/`sa-*`/`arm14*`/`arm-clip*`
+# drivers — created tens of sections later — were never opened. A guard whose population is fixed before the
+# population exists is the cycle-10 defect one layer up. It now runs immediately before the end pin, over the same
+# glob, and reports how many it actually inspected.
+drivers_total=0; drivers_bare=""
+while IFS= read -r drv; do
+  [ -n "$drv" ] || continue
+  drivers_total=$(( drivers_total + 1 ))
+  grep -qx 'set -u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
+done <<EOF
+$(find "$TMP" -type f \( -name 'drive*.sh' -o -name 'one.sh' -o -name 'skipwhy.sh' -o -name 'floor-drive.sh' \) 2>/dev/null | sort)
+EOF
+if [ "$drivers_total" -ge 4 ] && [ -z "$drivers_bare" ]; then rc=0
+else rc=1; echo "      generated drivers: $drivers_total found; WITHOUT 'set -u':${drivers_bare:- none} (want >=4 drivers, every one under set -u — without it a driver cannot see an unbound-reference abort)"; fi
+ck "every generated driver runs under \`set -u\`, like the shipped code it extracts ($drivers_total generated driver(s) inspected at the END of the run)" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
 _out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
 if [ -z "$_out_late" ]; then
@@ -3387,7 +3399,11 @@ else
   # capture that APPEARED after the snapshot", but its own arms also report VANISHED, NEVER CAPTURED, CHANGED and
   # "already differed" — so the line introducing the detail contradicted it (measured: `VANISHED …` under an
   # "appeared" header). The sibling check above enumerates all three verbs for exactly this reason.
-  rc=1; echo "      a capture changed, appeared, or disappeared between the first snapshot and the END of the run — nothing created or removed after the snapshot can hide:"
+  # ⛔ THE ABSOLUTE IS SCOPED TO WHAT TWO SNAPSHOTS CAN SEE (review P3, cycle 86). "Nothing created or removed after
+  # the snapshot can hide" was false for a capture created after `_out_got` and removed before `_out_late`: it is in
+  # NEITHER map, so it hides with the suite green (measured: a transient case dir → 177/0). A snapshot pair cannot
+  # see a file that never coexisted with either — stated, not implied, because this section exists to be exact.
+  rc=1; echo "      a capture is PRESENT at one of the two snapshots and changed, appeared or disappeared between them — a file created AND removed entirely inside that window is outside what a snapshot pair can see:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
   # PROMISED list was empty, because `for x in $( … )` split its key on the space and matched nothing.
   # ⛔ EVERY LOOKUP HERE READS THE KEY FIELD, NEVER A PREFIX (review P3, cycles 79 and 81): `grep -m1x` was parsed as
