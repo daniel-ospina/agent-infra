@@ -3737,16 +3737,23 @@ print("CLAIM %r" % (got,))
 print("PRESERVED %r" % (sorted(f for f in os.listdir(sys.argv[3]) if ".reclaim." in f),))
 PY19AE
 )"
-  grep -q 'GUARD OFF' <<<"$out19ae" \
+  grep -q 'turned out to be LIVE' <<<"$out19ae" \
     && ok "19ae the displaced LIVE claim is DISCLOSED (never a silent dual-run)" \
     || bad "19ae a displaced LIVE claim was moved aside with no word: $out19ae"
   grep -q 'PRESERVED \[\]' <<<"$out19ae" \
     && bad "19ae the displaced record was DELETED — the evidence is gone: $out19ae" \
     || ok "19ae the displaced record is PRESERVED on disk (not restored over, not deleted)"
-  # ⛔ NO "the caller refuses" ASSERTION HERE, DELIBERATELY: a path-based mutex with stale takeover
-  # cannot make this race disappear (the docstring says so), so after the disclosure the next
-  # attempt may legitimately claim the freed name. What this arm pins is the part that IS owed —
-  # the displaced claim's record survives and the operator is TOLD a second scheduler may be up.
+  # ⛔ THE PASS MUST REFUSE, AND THIS ASSERTION IS THE ONE EARLIER CUTS OMITTED ON PURPOSE. The
+  # omission reasoned "a path-based mutex cannot make this race disappear", which is true — and does
+  # not license the opposite. `permit` + `continue` GUARANTEES the bad outcome: the `rename` freed
+  # `LOOP_LOCK`, `link` still refuses (the arm's precondition), so the next attempt's `O_EXCL` create
+  # SUCCEEDS, the inode check passes, and `claim_loop_lock` returns None = "I hold the box" — two
+  # loops, AND the lock now names the NEWCOMER, so a later `--verify` sees one healthy holder with a
+  # fresh tick and prints `SCHEDULE VERIFIED`. Returning the live holder is already what the sibling
+  # `fallen_holder` arm does 40 lines above; the asymmetry was the defect.
+  grep -q "CLAIM ($pidAE," <<<"$out19ae" \
+    && ok "19ae ⛔ the pass REFUSES by returning the live holder (it does not claim the freed name)" \
+    || bad "19ae the pass did not return the displaced live holder — it goes on to CLAIM the freed name and run beside it (two loops): $out19ae"
 else
   bad "19ae baseline loop never came up — the arm grades nothing"
 fi
@@ -4011,6 +4018,39 @@ grep -q 'loop already running' <<<"$out19al" \
   && ok "19al ⛔ --install over a RUNNING loop did NOT rewrite the pointer to a set nothing reads" \
   || bad "19al --install rewrote the pointer to a set the loop does not read ($T/tpl19alA -> $(cat "$T/s19al/templates-dir" 2>/dev/null))"
 kill "$pidAL" 2>/dev/null; sleep 1
+
+# 19ap — ⛔ A MISSING `loop.pid` MUST NOT LET `--install` REWRITE THE DECLARATION POINTER. 19al pins the
+# pointer rule for the EASY state (pidfile present); it granted no protection in the two states this
+# file documents as reachable — `cmd_loop` leaves the previous pidfile alone when its own write fails,
+# and #3029's recycled pid fails the identity test — because the owner test was `loop_pid()` ONLY. On
+# either, `--install` read "no loop here" over a LIVE loop, rewrote the pointer to the caller's set,
+# and a later `--verify` graded a set nothing runs and printed `SCHEDULE VERIFIED` over it. Measured
+# before the fix: real loop on tplA, `rm loop.pid`, `--install TEMPLATES_DIR=tplB` -> pointer tplB while
+# `loop.log` still start-named tplA. The owner test now reads the identity-verified BOX lock, which is
+# what `--verify` and `--start` already use for the same question.
+mkdir -p "$T/tpl19apA" "$T/tpl19apB"
+cp "$GOOD"/*.plist "$T/tpl19apA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19apB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19apA/RETIRED"; printf '# none\n' > "$T/tpl19apB/RETIRED"
+s19 "$T/s19ap" "$T/tpl19apA" --install >/dev/null 2>&1
+pidAP="$(cat "$T/s19ap/loop.pid" 2>/dev/null)"
+[ -n "$pidAP" ] && kill -0 "$pidAP" 2>/dev/null \
+  && ok "19ap baseline: --install started a loop for state dir AP" \
+  || bad "19ap baseline loop never came up — the arm grades nothing"
+[ "$(cat "$T/s19ap/templates-dir" 2>/dev/null)" = "$T/tpl19apA" ] \
+  && ok "19ap baseline: the pointer names the set the loop started with (A)" \
+  || bad "19ap baseline pointer is not A: $(cat "$T/s19ap/templates-dir" 2>/dev/null)"
+rm -f "$T/s19ap/loop.pid"
+out19ap="$(s19 "$T/s19ap" "$T/tpl19apB" --install 2>&1)"
+[ "$(cat "$T/s19ap/templates-dir" 2>/dev/null)" = "$T/tpl19apA" ] \
+  && ok "19ap ⛔ with loop.pid GONE the live loop was still found through the BOX LOCK, so the pointer did NOT move" \
+  || bad "19ap a missing loop.pid bypassed the owner test — --install rewrote the pointer to a set the live loop never reads ($T/tpl19apA -> $(cat "$T/s19ap/templates-dir" 2>/dev/null))"
+# …and the refusal is per-state-dir, not a blanket: a loop still holds the box, so no SECOND loop may
+# have been started for this state dir either (spawn_loop must defer to the verified holder).
+[ ! -f "$T/s19ap/loop.pid" ] \
+  && ok "19ap --install did not start a second loop for this state dir (it deferred to the box lock's holder)" \
+  || bad "19ap --install started a SECOND loop over a box that already had one (#2890): $(cat "$T/s19ap/loop.pid" 2>/dev/null)"
+kill "$pidAP" 2>/dev/null; sleep 1
 
 # 19am — ⛔ A RELATIVE ARMING RECORD MUST REACH THE CHILD RESOLVED TOO, and this one is not academic:
 # `WORKTREE_HYGIENE_ARM_FILE` / `REAP_ORPHAN_ARM_FILE` OVERRIDE the `home/.pi/agent/state/...` default and

@@ -1377,15 +1377,41 @@ def claim_loop_lock():
                         # is the one that holds here: KEEP the displaced record, never delete it, and
                         # SAY SO — a silent two-loop outcome is unacceptable, an evidenced one is
                         # survivable (this file's `claim_loop_lock` docstring states the same).
-                        if live_holder(read_loop_lock(fallen_aside)) is not None:
-                            _permit_without_lock(
-                                "a reclaim on a link-refusing root moved a claim aside at %s that "
-                                "turned out to be LIVE (%r) and cannot be put back without risking "
-                                "another writer's record — that claim's record is preserved there; a "
-                                "second scheduler may be running beside this one"
-                                % (fallen_aside, read_loop_lock(fallen_aside))
-                            )
-                            continue
+                        # ⛔ AND WHEN THE DISPLACED CLAIM IS LIVE, THIS PASS MUST REFUSE — NOT PERMIT
+                        # AND RETRY. `_permit_without_lock(...)` followed by `continue` was WORSE than
+                        # the permit it looks like: the `rename` above left `LOOP_LOCK` FREE, so the
+                        # next attempt's `O_EXCL` create SUCCEEDS (the link still refuses — that is why
+                        # this arm exists), the inode check passes and `claim_loop_lock` returns None,
+                        # i.e. "I hold the box". The displaced live loop does not re-read the lock, so
+                        # TWO loops run AND the name now records the NEWCOMER — after which `--verify`
+                        # sees one healthy holder with a fresh tick and prints `SCHEDULE VERIFIED`. The
+                        # disclosure that was supposed to make that survivable is one stderr line in
+                        # the starting pass that no instrument reads. The sibling arm 40 lines up
+                        # (`return fallen_holder`) already answers this condition correctly; the
+                        # asymmetry here was the defect.
+                        fallen_live = live_holder(read_loop_lock(fallen_aside))
+                        if fallen_live is not None:
+                            # Best-effort ATOMIC restore. `link` FAILS rather than replacing, so a
+                            # fourth party that took the freed name keeps its own record — the reason
+                            # `rename` is forbidden here does not apply to it. On this root `link`
+                            # cannot succeed (it is the arm's precondition), so the usual outcome is
+                            # the disclosure below with the record preserved at `fallen_aside`.
+                            try:
+                                os.link(fallen_aside, LOOP_LOCK)
+                            except OSError:
+                                print(
+                                    "  WARN   a reclaim on a link-refusing root moved a claim aside "
+                                    "at %s that turned out to be LIVE (%r) and could not be put back "
+                                    "— that claim's record is preserved there and THIS pass refuses "
+                                    "to run beside it (#2890)" % (fallen_aside, fallen_live),
+                                    file=sys.stderr,
+                                )
+                            else:
+                                try:
+                                    os.unlink(fallen_aside)
+                                except OSError:
+                                    pass
+                            return fallen_live
                         try:
                             os.unlink(fallen_aside)
                         except OSError:
@@ -2875,8 +2901,30 @@ def cmd_install():
     # reading its own set, so recording the caller's would make a later `--verify` grade a set nothing runs
     # and print "the set that actually runs here" over a misdescription (measured: pointer tplA -> tplB
     # while `loop.log` still start-named tplA — the 19al arm).
+    # ⛔ THE OWNER TEST IS THE BOX LOCK'S, NOT THE PIDFILE'S — and getting this wrong re-opened the
+    # 19al defect one precondition over. `loop.pid` is ABSENT in states this file documents as
+    # reachable (`cmd_loop` leaves the previous pidfile alone when its own write fails; 19ad removes
+    # it), and it names a RECYCLED pid in another (#3029's shape, #6 in this change). On either, a
+    # `loop_pid()`-only test reads "no loop here" over a loop that IS running, so `remember_templates_
+    # dir()` overwrote the pointer with the CALLER's set: the live loop kept reading tplA while the
+    # pointer said tplB, so `--verify` then graded a set nothing runs and printed `SCHEDULE VERIFIED`
+    # over it — the identical failure 19al pins, moved one precondition over (measured with a real
+    # loop + `rm loop.pid`: `--install TEMPLATES_DIR=tplB` rewrote the pointer, `loop.log` still named
+    # tplA, `--verify` certified it). Every OTHER "is this state dir's loop running" decision in this
+    # file — `cmd_verify`, `cmd_start` — already reads the identity-verified BOX lock; this one did
+    # not, and `loop_holder()` was called ten lines LATER (for the inline-pass check) and never for
+    # this. So it is read once, HERE, and both decisions use it.
+    # ⛔ BOTH SIGNALS, UNIONED — neither alone is sufficient. The box lock is empty when the lock root
+    # is unusable (the degraded `$STATE/loop.lock` arm), and the pidfile is missing or recycled in the
+    # states above; a loop is running if EITHER says so, and only "neither" may write the pointer.
+    holder = loop_holder()
+    own_via_lock = bool(holder is not None and same_state_dir(holder[2], STATE))
     own_pid = loop_pid()
-    own_alive = bool(own_pid and pid_is_our_loop(own_pid))
+    own_via_pid = bool(own_pid and pid_is_our_loop(own_pid))
+    own_alive = own_via_lock or own_via_pid
+    foreign_holder = None
+    if holder is not None and not same_state_dir(holder[2], STATE):
+        foreign_holder = holder
     if own_alive:
         if not os.path.exists(os.path.join(STATE, TEMPLATES_POINTER)):
             # ⛔ NAME IT INSTEAD OF GUESSING A SET. Writing the caller's here could certify a set the
@@ -2923,10 +2971,10 @@ def cmd_install():
     # is exactly the invariant this change claims to establish. Skipping the pass here is not a
     # weaker proof: the holder IS the proof that this box's job set runs, and `cmd_verify` below
     # still grades this state dir's stamps.
-    foreign_holder = None
-    holder = loop_holder()
-    if holder is not None and not same_state_dir(holder[2], STATE):
-        foreign_holder = holder
+    # ⛔ `holder` / `foreign_holder` are read ONCE, ABOVE the pointer decision — that read IS the
+    # identity-verified box lock, and the pointer write must be decided on the same signal that the
+    # inline-pass skip is (a second read here would let the two disagree on a claim published between
+    # them).
     first = []
     for j in ([] if foreign_holder is not None else jobs):
         if j.skip or j.error:
