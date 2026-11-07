@@ -947,7 +947,11 @@ repo_set_check() {
     fi
 
     if [ -n "$problems" ]; then
-      printf 'repo-set: REFUSED %s —%s\n' "$slug" "$problems"
+      # ⛔ STRIP THE LEADING SEPARATOR BEFORE PRINTING (round 24, P2). `problems` is accumulated as
+      # `problems="$problems; …"`, so the raw value starts with `; ` and every refusal rendered as
+      # `REFUSED <slug> —; reason` — a doubled separator on the one line an operator reads. Flagged as
+      # cosmetic in round 1 and left; it is cheap and it is the operator's first impression.
+      printf 'repo-set: REFUSED %s — %s\n' "$slug" "${problems#; }"
       bad=1
     else
       printf 'repo-set: ok %s -> %s%s\n' "$slug" "$checkout" "${state:+ (state $state)}"
