@@ -4650,7 +4650,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # operator to restart a box that can fork perfectly well.
   if [ "$rc" = "$AGENT_HARNESS_SKEW_REFUSED" ]; then
     AGENT_STARTED=0
-    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed; the [pi-gate] line above names the paths it searched. Sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O); do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
+    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed; the [pi-gate] line above names the paths it searched. Sync the helper pair with a VERIFIED redeploy where reviewers run (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) — and where that launcher exports no O, use one of the dirs the [pi-gate] line above lists instead; do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
     return "$AGENT_HARNESS_SKEW_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
@@ -5229,7 +5229,7 @@ pi_shim_main() {
     # cannot be established" as "capacity is available", which is the one inference an admission
     # gate may never make. The operator rescue is the real pi by absolute path.
     printf '[pi-gate] REFUSED fork headroom UNREADABLE: %s. NO pi was started and nothing was consumed.\n' "$_fdetail" >&2
-    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: place the pair in the dir the search above actually resolved (the candidate this arm exists for is the one whose launcher never exported `O`), with a VERIFIED redeploy there — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <that dir> — and set O to it, or fix the CAP_MIN_FORK_HEADROOM knob named above if the detail names one. Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
+    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: place the pair in ONE OF THE DIRS the detail above lists as SEARCHED (this arm is reached when the search resolved none of them — the candidate it exists for is the launcher that never exported `O`, whose resolvable home is ~/orchestrator), with a VERIFIED redeploy there: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <that dir> — or fix the CAP_MIN_FORK_HEADROOM knob if the detail above names one. Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
     pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
     exit "$AGENT_HARNESS_SKEW_REFUSED"
   fi
