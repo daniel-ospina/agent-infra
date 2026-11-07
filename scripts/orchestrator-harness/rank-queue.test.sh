@@ -110,9 +110,17 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNO
 # ⛔ AND ONLY A REAL FILE IS LOGGED (review P3, cycle 91): for `bash -c`, `bash -s` and a heredoc feed `$0` is the
 # literal `bash`, so `$PWD/$0` named a file that never existed and the sweep's "executed then GONE" arm reddened a
 # correct driver (measured: `EXECUTED then GONE: rank/bash`). `[ -f ]` inside the hook costs one test per child.
-printf '%s\n' 'if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac; [ -f "$_b" ] && printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null; fi' > "$TMP/.boothook"
+# ⛔ AND THE OPTIONS IN EFFECT AT EXIT ARE RECORDED (review P2, cycle 93). A TEXTUAL `set -u` does not mean the script
+# RUNS under nounset: `( set -u; : )` sets it in a subshell, `fin() { set -u; }` never executes it, and `set -- -u`
+# sets positional parameters — all three were graded PROTECTED while bash was not in nounset at all (measured: the
+# file reads an unbound variable and completes). So the hook also installs an EXIT trap that appends `path<TAB>$-`:
+# the verdict for every script that reaches EXIT is then what the SHELL says, not what a parser guesses. No driver in
+# this suite sets its own EXIT trap (grep: only the suite's own teardown), so nothing is overridden.
+printf '%s\n' 'if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac; if [ -f "$_b" ]; then printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null; trap '"'"'printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null'"'"' EXIT; fi; fi' > "$TMP/.boothook"
 : > "$TMP/.bootlog"
+: > "$TMP/.optlog"
 export RANK_QUEUE_BOOTLOG="$TMP/.bootlog"
+export RANK_QUEUE_OPTLOG="$TMP/.optlog"
 export BASH_ENV="$TMP/.boothook"
 # ⛔ ONLY THE SHELL THAT CREATED THE SANDBOX MAY REMOVE IT. This is BELT AND BRACES, not a fix for an observed
 # failure: measured on bash 5.2.21, an `EXIT` trap does NOT run in a pipeline component or a command-substitution
@@ -3494,6 +3502,16 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 #      joining them swallowed the next line and lost a real `set -u` (measured false block).
 # RESIDUAL, declared and unchanged: a `set -u` inside quoted DATA still counts (only a comment line is told apart);
 # separating data from code is the witnesses' `bash -n` + claim-check job, not this predicate's.
+# ⛔ EMPIRICAL FIRST, TEXTUAL ONLY AS A FALLBACK (review P2, cycle 93). `_opts_for` reads the option string the child
+# recorded at EXIT; when it exists it IS the answer ("is this shell in nounset"), and no parse can disagree with it. A
+# script that `exec`s (the PATH shims, and any future one) never reaches EXIT and has no record, so the textual
+# `_setu` covers it — that is the only population the parser is trusted with.
+_opts_for() { awk -F'\t' -v p="$1" '$1 == p { o = $2 } END { print o }' "$TMP/.optlog" 2>/dev/null; }
+_setu_verdict() { # $1=script -> 0 when it RUNS under nounset (empirical when possible)
+  _o="$(_opts_for "$1")"
+  if [ -n "$_o" ]; then case "$_o" in *u*) return 0 ;; *) return 1 ;; esac; fi
+  _setu "$1"
+}
 _setu() { # $1=script -> 0 when a top-level `set` command enables `u`
   awk '
     { if ($0 ~ /^[ \t]*#/) next
@@ -3506,6 +3524,7 @@ _setu() { # $1=script -> 0 when a top-level `set` command enables `u`
         while (_j <= _nw && _w[_j] ~ /^(then|do|else|elif|if|while|until|for|in)$/) _j++
         if (_j > _nw || _w[_j] != "set") continue
         for (_k = _j + 1; _k <= _nw; _k++) {
+          if (_w[_k] == "--") break
           if (_w[_k] ~ /^-[A-Za-z]*u/) f = 1
           else if (_w[_k] ~ /^\+[A-Za-z]*u/) f = 0
           else if (_w[_k] == "nounset" && _k > _j + 1 && _w[_k - 1] == "-o") f = 1
@@ -3522,7 +3541,7 @@ while IFS= read -r drv; do
       inputs_total=$(( inputs_total + 1 )); continue ;;
   esac
   drivers_total=$(( drivers_total + 1 ))
-  _setu "$drv" || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
+  _setu_verdict "$drv" || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
 done <<EOF
 $(find "$TMP" -type f -name '*.sh' 2>/dev/null | sort)
 EOF
@@ -3545,7 +3564,7 @@ while IFS= read -r _ex; do
   # `set -u` like everything else (inert in their one-line `exit`/`exec` bodies, which is why it costs nothing) and
   # the graded population is now exactly the logged one.
   exec_total=$(( exec_total + 1 ))
-  _setu "$_ex" || exec_bare="$exec_bare ${_ex#"$TMP"/}"
+  _setu_verdict "$_ex" || exec_bare="$exec_bare ${_ex#"$TMP"/}"
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
@@ -3572,7 +3591,12 @@ else
   # the snapshot can hide" was false for a capture created after `_out_got` and removed before `_out_late`: it is in
   # NEITHER map, so it hides with the suite green (measured: a transient case dir → 177/0). A snapshot pair cannot
   # see a file that never coexisted with either — stated, not implied, because this section exists to be exact.
-  rc=1; echo "      a capture is PRESENT at one of the two snapshots and changed, appeared or disappeared between them — a file created AND removed entirely inside that window is outside what a snapshot pair can see:"
+  # ⛔ THE HEADER COVERS EVERY LEAF AGAIN (review P3, cycle 93). The branch also emits `was NEVER captured this run`
+  # (a pinned capture the run never created — present at NEITHER snapshot) and `DIFFERS … already differed at the
+  # first snapshot`, and the previous header said the capture was present at one of them — a cause the leaf rules out,
+  # the cycle-85 defect re-created twelve lines below its fix. Measured: `rm -f "$TMP/rank-prefix/out"` before the
+  # first snapshot printed `was NEVER captured this run` under a "PRESENT at one of the two snapshots" header.
+  rc=1; echo "      a pinned capture is MISSING, CHANGED, or already differed at the first snapshot (the leaves below say which) — a file created AND removed entirely inside the window is outside what a snapshot pair can see:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
   # PROMISED list was empty, because `for x in $( … )` split its key on the space and matched nothing.
   # ⛔ EVERY LOOKUP HERE READS THE KEY FIELD, NEVER A PREFIX (review P3, cycles 79 and 81): `grep -m1x` was parsed as
@@ -3608,7 +3632,7 @@ else
 $(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
 fi
-ck "the pinned population is UNCHANGED at the END of the run — a capture changed, appeared or disappeared after the snapshot and was named above" $rc
+ck "the pinned population is UNCHANGED at the END of the run — every pinned capture is present with its pinned CRC (a missing, changed or drifted one was named above)" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
