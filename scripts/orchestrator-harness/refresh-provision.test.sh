@@ -1204,6 +1204,42 @@ else
   bad "(g7) the real refresh_cause_brief could not be extracted from $LOOP — the beat's cut is ungraded"
 fi
 
+# ── (g11) EVERY ARM PLACES `evidence=` LAST — checked in the SOURCE, not one arm at a time ─────────
+# ⛔ `(g7)` proves the ordering by DRIVING the real renderer — on the rc=75 arm only. That is one arm,
+# and the gap was live for eight rounds: the `gh auth token` rc≠0 arm kept `evidence=` mid-clause with
+# `question=` last, so a long enough capture reached the record with the half that names the
+# precondition cut away — and reverting the ordering on that arm, or on the `*)` fallback `(g6)`
+# drives, left this suite green (verified: 184/0 both ways). A per-arm row cannot close that; the
+# invariant is a property of the SOURCE, so this row reads the source.
+# It asserts: any `GH_PROBE_CAUSE=` assignment that interpolates `gh_probe_evidence` must have nothing
+# but the closing quote after that interpolation.
+# ⛔ AND THE SWEEP ITSELF WAS VACUOUS WHEN FIRST WRITTEN — the pattern ended at `gh_probe_evidence`
+# with no trailing `*`, so it required the ASSIGNMENT TO END there and matched ZERO lines; the
+# offender row then passed on an empty set (measured: `found 0`, the vacuity row red). The trailing
+# `*` is what makes the match, and the vacuity row below is what makes an empty sweep loud rather
+# than green — the lesson this whole file keeps re-learning about controls that cannot red.
+GEV_ARMS=0; GEV_BAD=0; GEV_TAIL=''
+while IFS= read -r gev_line; do
+  case "$gev_line" in
+    *'GH_PROBE_CAUSE='*'gh_probe_evidence'*) ;;
+    *) continue ;;
+  esac
+  GEV_ARMS=$((GEV_ARMS+1))
+  gev_after="${gev_line##*'gh_probe_evidence "$prc")'}"
+  # A `case` arm closes with ` ;;` after the assignment's closing quote; anything else after that
+  # quote is a continuation of the clause, i.e. the datum is NOT last.
+  case "$gev_after" in
+    '"'|'" ;;') ;;
+    *) GEV_BAD=$((GEV_BAD+1)); GEV_TAIL="${GEV_TAIL}${GEV_TAIL:+; }…$(printf '%s' "$gev_after" | cut -c1-40)" ;;
+  esac
+done < <(grep -F 'GH_PROBE_CAUSE=' "$REFRESH")
+# `-ge 4`, not an exact count: this guard's job is to catch a sweep that matched NOTHING, not to lock
+# the arm count — a legitimate arm merge should not red it.
+ck "(g11) the sweep is not vacuous — it found arms interpolating evidence= (found $GEV_ARMS)" \
+   "$([ "$GEV_ARMS" -ge 4 ]; echo $?)"
+ck "(g11) every one of them places evidence= LAST (after it: $(printf '%s' "$GEV_BAD") offender(s)${GEV_TAIL})" \
+   "$([ "$GEV_BAD" -eq 0 ]; echo $?)"
+
 # ── (g8) THE EVIDENCE TAKE IS BOUNDED (#3701 round 4, P2) ─────────────────────────────────────────
 # ⛔ `GH_PROBE_CAUSE_MAX` is the ONLY bound on the stderr take, and NOTHING exercised it: deleting the
 # truncation left this suite green. `why=` is a single-line key in a file every beat reads, and a

@@ -1111,9 +1111,14 @@ gh_probe_env() {
     if [ "$prc" -ne 0 ]; then
       # ⛔ EVIDENCE CLOSES THIS ARM TOO (#3701 review round 12, P2). It used to sit MID-clause with
       # `question=` last, which broke the very invariant the sibling arm's comment above claims for
-      # "every other arm": with an evidence value between ~230 and the 323-byte cap, the beat's 400-byte
-      # cut lands in `question=` and severs the half that names the precondition — measured on the real
-      # `refresh_cause_brief` (a 250-byte stderr ends the beat at `…; question=is a gh credential S`).
+      # "every other arm". MEASURED by driving the REAL `refresh_cause_brief` (`orch-loop.sh:2559`,
+      # `cut -c1-400`) over this arm's own prefix — `NOT PROVISIONABLE: the gh environment precondition
+      # refused [` plus the trailing `] — no candidate can be judged from this box` — with the pre-fix
+      # clause taken verbatim from `8f498599^` and a rising evidence VALUE, this arm's `question=` half
+      # is WHOLE through 215 bytes, arrives TRUNCATED at 216-261, and from 262 it is GONE entirely —
+      # the cut lands inside the evidence and never reaches `question=` at all. With the evidence moved
+      # last it is whole at every length the take can produce (measured 150, 243, 320 and 330; the take
+      # tops out at `rc=N: ` + 320 + `...`, so there is no length that reaches it).
       GH_PROBE_CAUSE="answer=NO — nothing is stored for the host gh is configured for; question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
       echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
       printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
