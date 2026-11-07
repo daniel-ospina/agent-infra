@@ -115,6 +115,8 @@ dirty=0
 pin=ce987bb2c1de
 pin_tree=ce987bb2c1de
 drift=clean:current          <- the deployed-drift reading, `<state>:<token>` (`executes:<dir>` is the red one)
+farm_rows=none               <- a farm drift grade: `none` (farm matched), `unwritable`, or the FILE that names every drifting file
+farm_n=0                     <- how many rows that list holds (0 when the farm matched)
 preserved=none
 remedy=none                  <- the ACTION for a refusal, never truncated (`detail=` is bounded at 240)
 action=none
@@ -126,6 +128,18 @@ detail=current: the pin tree already names origin/main — head=ce987bb2c1de dep
 `detail` is the verdict sentence **plus the readings appended by the recorder**, so the line
 an operator (or the fleet instrument) reads can never carry numbers from before a move.
 `fetch=` and `behind=` are the two fields BOTH readers gate on.
+
+⛔ **`farm_rows=` EXISTS BECAUSE A COUNT IS NOT A NAME** (tortoise#10114 arm 2: "a scheduled
+check that names *each* drifting file"). The journal keeps a bounded human view — 12 rows, then
+"… and N more" — so on a 30-row farm 18 files were counted and named nowhere durable (measured
+on the `cmux` cell, 2026-11-07). Every row the instrument reports is therefore written, atomically,
+to `${HARNESS_APPLY_STATE_DIR:-$HOME/.pi/agent/state}/harness-apply-farm-rows.txt`, and the record
+names that file. The artifact is **derived state**: a pass whose farm matches DELETES it, and says
+`farm_rows=none`, because a list that outlives the condition it describes cannot be told from
+today's answer. `farm_rows=unwritable` means the state dir could not be written — the drift is
+still red and still counted, but rows 13..N are named nowhere, which is said out loud rather than
+left to be discovered. A path that never reached the farm block (a pre-flow refusal) reads
+`not-graded`.
 
 ⛔ `deployed` EXISTS BECAUSE THE CHECKOUT IS NOT THE DEPLOYMENT. A pin-per-commit cell
 never moves its checkout, so `behind` measured there would be permanently non-zero and

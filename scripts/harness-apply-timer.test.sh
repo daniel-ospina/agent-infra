@@ -1220,10 +1220,23 @@ OUT="$(FARM_RC=3 run_pass "$T/t24b" 2>&1)"; RC=$?
 assert_eq "$RC" "24" "T24 control: an unpaid-by-the-farm stale file is RED too, not an exemption"
 # Control 2: the SAME fixture with a matching farm (checker exits 0) keeps its normal verdict — the
 # leg is a gate, not a hard-coded failure.
-mkdir -p "$T/t24c/home/.pi/agent/scripts"; printf 'x\n' >"$T/t24c/home/.pi/agent/scripts/pr-doctor.py"
+# ⛔ AND A CLEAN GRADE MUST DELETE THE ROWS ARTIFACT (tortoise#10114 arm 2). A persisted list that
+# survives a pass which found no drift is a reader trap: nothing in it says which run produced it, so
+# it reads exactly like today's answer. So yesterday's file is planted here and must be GONE.
+mkdir -p "$T/t24c/home/.pi/agent/scripts" "$T/t24c/state"; printf 'x\n' >"$T/t24c/home/.pi/agent/scripts/pr-doctor.py"
+printf 'file-from-yesterday.py | a | b | STALE\n' >"$T/t24c/state/harness-apply-farm-rows.txt"
 OUT="$(FARM_RC=0 run_pass "$T/t24c" 2>&1)"; RC=$?
 assert_contains "$OUT" "farm: ok" "T24 control: a matching farm is reported ok"
 assert_eq "$RC" "0" "T24 control: a matching farm leaves the normal verdict intact (exact rc, so a pass broken for an unrelated reason cannot pass this control)"
+if [ -f "$T/t24c/state/harness-apply-farm-rows.txt" ]; then
+    bad "T24 control: a CLEAN farm DELETES yesterday's rows list (a stale list is indistinguishable from today's)"
+else
+    ok "T24 control: a CLEAN farm DELETES yesterday's rows list (a stale list is indistinguishable from today's)"
+fi
+assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=none" \
+    "T24 control: and the record says so (`farm_rows=none`), not a path to a file that is gone"
+assert_contains "$(cat "$T/t24c/state/harness-apply.status" 2>/dev/null || true)" "farm_n=0" \
+    "T24 control: with the row count at 0"
 # Control 3: no farm at all is SKIPPED with a named reason — a controller-only host farms nothing,
 # and reddening every such box would make the alarm worthless.
 mk_origin t24d; mk_clone t24d
@@ -1389,6 +1402,23 @@ assert_contains "$OUT" "re-run the farm from a ref-consistent checkout" \
 assert_contains "$OUT" "declare it LOCAL, delete it, or retire it" \
     "T24 control: including the remedy's CONTINUATION line, which carries the actions"
 assert_contains "$OUT" "and 8 more row(s)" "T24 control: while the row excerpt says how many it elided"
+# ⛔ THE ELIDED ROWS ARE NAMED SOMEWHERE DURABLE (tortoise#10114 arm 2). The acceptance arm is "a
+# scheduled check that NAMES EACH drifting file", and the measured failure was exactly this fixture's
+# shape: 30 rows on the `cmux` cell, 12 named in the journal, 18 only COUNTED — named nowhere at all.
+# A count is not a name, so the assertion is on the artifact's CONTENTS, not on the summary line.
+ROWS="$T/t24q/state/harness-apply-farm-rows.txt"
+if [ -f "$ROWS" ]; then ok "T24 control: the drift rows are PERSISTED to state, not only printed to the journal"
+else bad "T24 control: the drift rows are PERSISTED to state, not only printed to the journal (missing: $ROWS)"; fi
+assert_eq "$(grep -c . "$ROWS" 2>/dev/null | tr -d ' ')" "20" \
+    "T24 control: and the file holds ALL 20 rows — the count is never the answer, the names are"
+assert_eq "$(grep -c 'file-19.py' "$ROWS" 2>/dev/null | tr -d ' ')" "1" \
+    "T24 control: including the LAST row, which an excerpt can never show"
+assert_contains "$OUT" "ALL 20 are named in $ROWS" \
+    "T24 control: and the journal line sends the reader to those 20 names instead of stopping at '8 more'"
+assert_contains "$(cat "$T/t24q/state/harness-apply.status" 2>/dev/null || true)" "farm_rows=$ROWS" \
+    "T24 control: the durable RECORD names the rows file, so it is reachable without the journal"
+assert_contains "$(cat "$T/t24q/state/harness-apply.status" 2>/dev/null || true)" "farm_n=20" \
+    "T24 control: and carries the row count beside it"
 # ⛔ THE COUNT MUST NOT COUNT PROSE. The instrument prints class-prose lines that contain the same
 # words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
