@@ -781,7 +781,7 @@ ck "non-vacuity: a record mention BEFORE the read reds the names rule" $rc
 
 # (h) the detector is FAIL-CLOSED: an awk that rejects its own program must report, not return silence
 _out="$(_awk_gate 'BEGIN { if (' "$FNS")"; _orc=$?
-if [ "$_orc" -eq 2 ] && printf '%s' "$_out" | grep -q 'DETECTOR-FAILED'; then rc=0
+if [ "$_orc" -eq 2 ] && grep -q 'DETECTOR-FAILED' <<<"$_out"; then rc=0
 else rc=1; echo "      a detector that could not run returned rc=$_orc and '$(printf '%s' "$_out" | head -c 80)' — silence would read as clean"; fi
 ck "fail-closed: a detector that CANNOT RUN reds instead of returning the silence a clean run returns" $rc
 
@@ -3125,7 +3125,7 @@ for _arm14_case in \
     rc=1; echo "      the $_al arm's echo did not run at all — neither stream carries its sentence (the shim's rename and count injection were verified to apply, so the arm is unreachable or its echo is gone)"
   elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null; then
     rc=1; echo "      the $_al arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the sentence proves nothing"
-  elif printf '%s\n' "$_ao" | grep -F -- "$_am" | grep -q 'windows=TRUNCATED(P1-severe)'; then rc=0
+  elif grep -q 'windows=TRUNCATED(P1-severe)' <<<"$(grep -F -- "$_am" <<<"$_ao")"; then rc=0
   # ⛔ THE ARM'S OWN LINE IS THE SUBJECT, NOT THE WHOLE OUTPUT (review P3, cycle 64). A MIXED pass fires the
   # WARN arm and the severity arm TOGETHER, and both render the same `windows=TRUNCATED(P1-severe)` token, so
   # a whole-output match satisfied this check from the SEVERITY line while the WARN line had lost the clause —
@@ -3206,7 +3206,7 @@ for _arm14m in \
     rc=1; echo "      the $_ml arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the absence of the clause proves nothing"
   elif [ -z "$(printf '%s\n' "$_mo" | grep -F -- "$_mm" | head -1)" ]; then
     rc=1; echo "      the $_ml arm's own line is not in the mutant's output at all — this check cannot see the arm it strips"
-  elif printf '%s\n' "$_mo" | grep -F -- "$_mm" | grep -q 'windows=TRUNCATED'; then
+  elif grep -q 'windows=TRUNCATED' <<<"$(grep -F -- "$_mm" <<<"$_mo")"; then
     # ⛔ THE ARM'S OWN LINE IS THE SUBJECT, NOT THE WHOLE OUTPUT (review P3, cycle 63). The WARN arm fires
     # ALONGSIDE the severity arm on a mixed pass, so "the output carries no clause" is false for a strip that
     # worked perfectly: measured, the stripped run ended with `... (1 pool-ranked, 1 unranked at the tail) —
@@ -3506,7 +3506,7 @@ _a2_mut="$(_outrun "$_m_a2" '5
 ')"
 if cmp -s "$FNS" "$_m_a2" 2>/dev/null; then
   rc=1; echo "      the channel-value mutation did not apply — its anchor drifted"
-elif ! printf '%s\n' $_out_distinct_pin | grep -qx "$_a2_ship"; then
+elif ! grep -qx "$_a2_ship" <<<"$(printf '%s\n' $_out_distinct_pin)"; then
   rc=1; echo "      the shipped unranked fixture emits an output that is NOT among the pinned ones ($_a2_ship) — the witness is not wired to the pin"
 elif [ "$_a2_ship" != "$_a2_mut" ]; then rc=0
 else rc=1; echo "      a claim in a channel VALUE (_wrote_said) did not change the emitted text — the pin cannot see it"; fi
