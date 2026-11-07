@@ -268,8 +268,10 @@ fi
 
 now() { date +%s; }
 # budget_spent <deadline-epoch> — rc 0 when the pass's TIME bound is spent (#3278).
-# ONE named predicate, so the bound is a single thing a test can mutate: the count cap it replaced was
-# checked in two places and the ordering bug was that neither of them sat after the age floor.
+# ONE named predicate, so the bound is a single thing a test can mutate. The count cap it replaced was
+# charged in ONE place and BEFORE the age floor (`GITLESS_DONE=$((GITLESS_DONE + 1))` at `:605` on
+# 2c18ff89a, with the cap test at `:587`), which is why ~89 % of its ten slots went to trees the floor
+# preserves anyway. That ordering — not a second check site — is what MUT_ORDER pins.
 budget_spent() { [ "$(now)" -ge "$1" ]; }
 # file_mtime <path> — epoch mtime, portable across GNU (stat -c %Y) and BSD (stat -f %m).
 file_mtime() {
