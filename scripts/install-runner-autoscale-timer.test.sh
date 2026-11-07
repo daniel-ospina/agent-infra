@@ -67,6 +67,10 @@ cleanup() {
         /tmp/wt-prod.*) rm -rf "${WTP2%/agent-infra}" ;;
         *) : ;;
     esac
+    case "${LNK:-}" in
+        /tmp/w9516.*) rm -rf "$LNK" ;;
+        *) : ;;
+    esac
 }
 trap cleanup EXIT
 
@@ -503,6 +507,41 @@ OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 0 "a durable top-level /tmp/wt-<name>/ checkout is NOT refused (the name alone is not the fact)"
 assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$WTP2/tools/install-ci-runner-x64.sh" \
     "…and that pin is rendered too"
+# ⛔ AND THE HALF A NAME LIST CANNOT SEE (fresh-context review round 18, P1). The lane population is NOT
+# the `wt-*` family: `scripts/lane-actions.py:445-447` records 25 of the 33 real linked `/tmp` worktrees
+# as `w9516`, `p9660-resid`, `l9400` — no prefix in common — and `repo-slug.sh:490-491` states the rule
+# the whole thing has to follow: *"the `wt-<slug>` / `<repo>-wip` family is unbounded, so the
+# discriminator is the `.git` TYPE, not the name"*. A name-decided predicate was INERT for those trees,
+# so `--install` pinned them, the pin died with the lane, and the "can never ADD capacity" warning was
+# suppressed because a pin resolved. Placed at a TOP-LEVEL `/tmp/<any-name>` on purpose — that is the
+# measured shape, and it is the one no prefix arm could ever cover.
+LNK="/tmp/w9516.$$"; mkdir -p "$LNK/tools"
+printf 'gitdir: /somewhere/.git/worktrees/w9516\n' >"$LNK/.git"
+printf '#!/bin/sh\n' >"$LNK/tools/install-ci-runner-x64.sh"; chmod +x "$LNK/tools/install-ci-runner-x64.sh"
+D="$T/cwt2f"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$LNK/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a LINKED WORKTREE at /tmp/<any-name> (not wt-*) is REFUSED — the .git type is the fact"
+assert_contains "$OUT" "PROVISIONER=$LNK/tools/install-ci-runner-x64.sh" "…and the refusal names the value it judged"
+# …and the PROJECT-LOCAL spelling of the same fact (`<repo>/<branch>`), which no root prefix can name.
+PLW="$T/proj/w9516-auth"; mkdir -p "$PLW/tools"
+printf 'gitdir: /somewhere/.git/worktrees/w9516-auth\n' >"$PLW/.git"
+printf '#!/bin/sh\n' >"$PLW/tools/install-ci-runner-x64.sh"; chmod +x "$PLW/tools/install-ci-runner-x64.sh"
+D="$T/cwt2g"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$PLW/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a project-local <repo>/<branch> linked worktree is REFUSED too"
+# ⛔ AND THE OVER-BLOCK THAT A TYPE-ONLY RULE COULD INTRODUCE: a SUBMODULE's `.git` is also a FILE, but its
+# content is `gitdir: …/.git/modules/…` — no `/worktrees/` — and a submodule is not reaped by the worktree
+# reaper. Matching the marker's CONTENT rather than "is a file" is what keeps this a guard and not a
+# blanket refusal of every vendored dependency.
+SUB="$T/proj/vendor/lib"; mkdir -p "$SUB/tools"
+printf 'gitdir: ../../.git/modules/lib\n' >"$SUB/.git"
+printf '#!/bin/sh\n' >"$SUB/tools/install-ci-runner-x64.sh"; chmod +x "$SUB/tools/install-ci-runner-x64.sh"
+D="$T/cwt2h"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$SUB/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a SUBMODULE (.git FILE, but no /worktrees/ in it) is NOT refused — it is not a worktree"
 # ⛔ AND THE *CANDIDATE* DIRECTION, WHICH NOTHING ELSE IN THIS FILE EXERCISES (review P2). Every other
 # provisioner arm sets `RUNNER_AUTOSCALE_PROVISIONER`, and A NAMED PIN IS THE WHOLE LIST — so the candidate
 # loop never runs and the `skipping LANE-SCRATCH PROVISIONER CANDIDATE` note was reachable by nothing.
@@ -526,6 +565,21 @@ assert_absent "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$LA
     "…and the artifact carries NO pin to the lane path (the doomed pin this skip exists to prevent)"
 assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$DURINFRA/tools/install-ci-runner-x64.sh" \
     "…it fell through to the durable candidate instead"
+# ⛔ AND WHEN THE ONLY CANDIDATE WAS LANE SCRATCH, THE WARNING MUST SAY THAT — not "no installer at any
+# candidate" (fresh-context review round 18, P2). The skip used to `continue` without touching
+# `PROVISIONER_WHY`, so the "can never ADD capacity" warning stated a reason that was FALSE (the file was
+# right there) and advised installing from a checkout that carries it — which is what the operator had
+# already done. Same fixture, no durable fallback: every candidate is either the skipped worktree or
+# absent.
+D="$T/cwt2i"; fresh "$D"
+RUN_INSTALL_CWD="$LANE_WT/scripts"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER= AGENT_INFRA_PATH= TEMPLATES_DIR="$REPO/templates/systemd" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=(); RUN_INSTALL_CWD=""
+assert_eq "$RC" 0 "an install with no durable candidate still succeeds (it warns; it does not refuse)"
+assert_contains "$OUT" "skipping LANE-SCRATCH PROVISIONER CANDIDATE" "…naming the skip"
+assert_contains "$OUT" "LANE SCRATCH" "…and the WARNING carries the same reason, not 'no installer at any candidate'"
+assert_absent "$OUT" "no tools/install-ci-runner-x64.sh at any candidate" \
+    "…it must NOT claim no candidate existed when one was found and skipped"
 # ⛔ AND `--disarm` IS STILL EXEMPT FROM THAT JUDGEMENT (#3469 review, MEASURED). `--disarm` forces a
 # DISARMED render where the pin is inert, so refusing it protects nothing: it strands the arming record on
 # a box nobody can disarm without hand-editing. Judging the provisioner inside `refuse_unusable_target`
@@ -2182,6 +2236,14 @@ assert_contains "$OUT" "PROVISIONER=$TPROV" "and the value it adopted"
 assert_absent "$OUT" "changed=1" "with nothing rendered or installed"
 OUT="$(run_install Linux "$D" --status)"; RC=$?
 assert_eq "$RC" 1 "and --status already refused it, so writer and reader now AGREE"
+# ⛔ THE READER'S CONSEQUENCE AND REMEDY ARE PINNED HERE, WHERE IT PRODUCES THEM (fresh-context review
+# round 18, P2). The `--install` arms above assert the WRITER's own sentence, which predates the per-field
+# split — so reverting that split left the suite green while the reader went back to telling a
+# provisioner-only operator "every pass exits 127 … re-install from the box's real HOME", neither of
+# which is true of a pin: the pass runs fine and records `no provisioner`.
+assert_absent "$OUT" "127" \
+    "a PROVISIONER-only scratch pin must not claim 'exit 127 every tick'"
+assert_contains "$OUT" "no provisioner'" "…with the consequence it actually has, named by the reader"
 # ⛔ THE PREDICATE IS SCOPED TO `PROVISIONER`, AND THAT SCOPING IS THE DIFFERENCE BETWEEN A GUARD AND A
 # FALSE BLOCK. An artifact whose declared HOME sits in a mktemp tree is rendered FRESH with the writer's
 # own HOME, so re-installing it is the REPAIR — a guard that judged the artifact's whole declared set here

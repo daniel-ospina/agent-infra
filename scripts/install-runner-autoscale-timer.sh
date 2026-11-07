@@ -45,9 +45,17 @@
 #   * a script path that is not a regular readable file, or one inside a `mktemp` scratch tree (the
 #     measured inert-enforcer: a unit pointing into a directory deleted before the first tick exits 127
 #     on EVERY pass while `list-timers` shows the job scheduled and healthy);
-#   * a PROVISIONER pin inside LANE SCRATCH — a `mktemp` tree, or the repo's own lane-checkout shapes
-#     (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`, and the cell shape
-#     `<cellhome>/wt-<slug>`; the same set `scripts/install-repair-service.sh` enforces, #2697).
+#   * a PROVISIONER pin inside LANE SCRATCH — a `mktemp` tree, a path under `*/.worktrees/*`, or ANY
+#     component that is a LINKED WORKTREE (its `.git` is a file whose content is
+#     `gitdir: …/worktrees/<name>`). ⛔ THE NAME IS IRRELEVANT IN BOTH DIRECTIONS, and that is a
+#     correction: the old text listed the prefix shapes (`/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`)
+#     and the code enforced `/tmp/wt-*` name-only — so it swallowed a durable `/tmp/wt-prod/…` checkout
+#     AND missed the 25-of-33 real lanes named `w9516`/`p9660-resid`/`l9400`
+#     (`scripts/lane-actions.py:445-447`). `repo-slug.sh:490-491` records the rule this now follows:
+#     *"the `wt-<slug>` / `<repo>-wip` family is unbounded, so the discriminator is the `.git` TYPE, not
+#     the name"*. `scripts/install-repair-service.sh` (#2697) still enforces its own prefix set for the
+#     REPAIR unit, which is a different value with a different job — see `is_lane_scratch` for why the
+#     provisioner needs the stricter test.
 #     ⛔ SCOPED TO THE PROVISIONER, AND DELIBERATELY NOT TO THE SCRIPT — an earlier revision of this
 #     header listed the lane shapes under the SCRIPT bullet, which this installer does NOT do: a branch's
 #     converger copy is a legitimate thing to SCHEDULE (`resolve_script`: "a worktree path is SAID OUT
@@ -277,24 +285,28 @@ is_lane_scratch() { # is_lane_scratch <path>
     case "$p" in
         */.worktrees/*) return 0 ;;
     esac
-    # ⛔ NO NAME-ONLY PREFIX ARMS. A NAME alone over-blocks, and it was MEASURED: `/tmp/wt-prod/
-    # agent-infra/tools/…` — a durable checkout whose FIRST component merely starts with `wt-` — matched
-    # the old `/tmp/wt-?*` arm and was refused as lane scratch, while the comment above claimed it was
-    # not; the suite could not see it because its own false-block fixture sits under a mktemp dir, never
-    # at a top-level `/tmp/wt-…` (fresh-context review round 17). `pi-reap-worktrees.sh` keys its glob on
-    # the BASENAME of each `git worktree list` entry, and a plain directory is not one.
+    # ⛔ THE DISCRIMINATOR IS THE `.git` TYPE, NEVER THE NAME — which is this repo's own recorded rule
+    # (`scripts/orchestrator-harness/repo-slug.sh:490-491`: *"the `wt-<slug>` / `<repo>-wip` family is
+    # unbounded, so the discriminator is the `.git` TYPE, not the name"*). Two measured failures of the
+    # name-based versions, in opposite directions:
+    #   · NAME-ONLY swallowed a durable checkout (`/tmp/wt-prod/agent-infra/tools/…` matched
+    #     `/tmp/wt-?*` and was told "that tree is removed with its lane"); and
+    #   · NAME+MARKER still MISSED most real lanes. `scripts/lane-actions.py:445-447` records 25 of the
+    #     33 real linked `/tmp` worktrees as `w9516`, `p9660-resid`, `l9400` — none match `wt-*` — so
+    #     the guard was INERT for three quarters of the trees the reaper actually deletes, while this
+    #     comment claimed "a lane worktree at ANY depth is caught" (fresh-context review rounds 17, 18).
     #
-    # So EVERY shape below is decided by THE MARKER, never by the name: `git worktree add` writes a
-    # `.git` FILE at the worktree root (never a directory — that marker is what distinguishes a linked
-    # tree from a clone). It is checked on the path itself and on every ancestor, so a lane worktree at
-    # ANY depth is caught, and a durable directory that merely shares the prefix is not.
+    # So: a component is lane scratch iff its `.git` is a FILE whose content is `gitdir: …/worktrees/<name>`
+    # — the marker `git worktree add` writes, and the same fact `pi-reap-worktrees.sh` lists and removes.
+    # A CLONE's `.git` is a DIRECTORY, so `/tmp/cell-ai`, `/tmp/cell-home` and a plain `$AGENT_INFRA_PATH`
+    # are untouched; a SUBMODULE's `.git` file names `…/.git/modules/…` (no `/worktrees/`), so it is not
+    # swallowed either. The name is now irrelevant in both directions, which is the only version that can
+    # be complete.
     d="$p"
     while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
-        case "${d##*/}" in
-            wt-?*|cell-wt-?*|base-?*)
-                # `-f`, because a linked worktree's `.git` is a FILE and a clone's is a directory
-                [ -f "$d/.git" ] && return 0 ;;
-        esac
+        if [ -f "$d/.git" ] && grep -q '^gitdir:.*/worktrees/' "$d/.git" 2>/dev/null; then
+            return 0
+        fi
         case "$d" in */*) d="${d%/*}" ;; *) d="" ;; esac
     done
     return 1
@@ -522,6 +534,12 @@ resolve_provisioner() {
         # which is the correct one.
         if is_lane_scratch "$cand"; then
             err "note: skipping LANE-SCRATCH PROVISIONER CANDIDATE $cand (a lane checkout the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
+            # ⛔ THE REASON TRAVELS WITH THE SKIP. Leaving PROVISIONER_WHY at its initial value made the
+            # "can never ADD capacity" warning say *"no tools/install-ci-runner-x64.sh at any candidate"*
+            # and advise installing from a checkout that carries one — when the operator's checkout had
+            # one RIGHT THERE and it was deliberately skipped. A refusal whose stated reason is false
+            # sends the next reader to fix the wrong thing (fresh-context review round 18, P2).
+            PROVISIONER_WHY="the only candidate found is LANE SCRATCH ($cand — a lane checkout the reaper removes), so it cannot be pinned"
             continue
         fi
         PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0
