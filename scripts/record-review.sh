@@ -1279,10 +1279,29 @@ delta_git() { # <root> <git args…>
   GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"
 }
 
+# ⛔ THE ORACLE READ — merge-tree with the BOX-GLOBAL attribute sources switched OFF (cycle-4
+# review, P1). `merge-tree` honours attributes from four places: the tree/worktree (what the
+# reviewed artifact says — kept), `<gitdir>/info/attributes` (refused by the caller when non-empty),
+# `core.attributesFile` or the default `$XDG_CONFIG_HOME/git/attributes` (a BOX setting), and the
+# system `gitattributes` (a HOST setting). The last three belong to the machine, not to the PR, so
+# an attestation must not let them decide what "a clean merge" is: this read neutralises all three,
+# which is stronger than refusing (a box-level rule cannot block a lane at all) and needs no
+# enumeration of spellings — the very trap this file records elsewhere.
+delta_git_neutral() { # <root> <git args…>
+  local root="$1"; shift
+  local xdg="" rc=0
+  xdg="$(mktemp -d 2>/dev/null || true)"
+  XDG_CONFIG_HOME="${xdg:-/nonexistent-delta-xdg}" GIT_ATTR_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null \
+    command git -C "$root" -c core.attributesFile=/dev/null "$@" || rc=$?
+  [ -n "$xdg" ] && rm -rf "$xdg" 2>/dev/null
+  return "$rc"
+}
+
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _gitdir="" _attr_amb="" _wt_amb=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1467,13 +1486,58 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     # UNTRACKED or MODIFIED `.gitattributes` in the worktree, and `.git/info/attributes`, are
     # AMBIENT: nothing in the diff, the record, or the digest shows them, and a pristine checkout of
     # the same commit reports the conflict. Those are what this arm refuses.
-    _drivers="$(delta_git "$root" config --show-scope --get-regexp '^merge\..*\.driver$' 2>/dev/null || true)"
-    _gitdir="$(delta_git "$root" rev-parse --absolute-git-dir 2>/dev/null || true)"
-    _attr_amb=""
-    if [ -n "$_gitdir" ] && [ -s "$_gitdir/info/attributes" ]; then
-      _attr_amb="${_gitdir}/info/attributes"
+    # ⛔ EVERY READ HERE IS rc-CHECKED, and `|| true` would have been the SAME defect this file
+    # already fixed once on the token scan: "no driver found" and "nothing could be read" must not
+    # be one value, because the second one is a LICENCE to trust a merge equality nobody verified.
+    # `git config --get-regexp` exits 1 for a legitimate no-match, so only rc >= 2 refuses.
+    _drivers=""; _dg_rc=0
+    _drivers="$(delta_git "$root" config --show-scope --get-regexp '^merge\..*\.driver$' 2>/dev/null)" || _dg_rc=$?
+    if [ "$_dg_rc" -gt 1 ]; then
+      echo "   delta: the merge-driver config could not be READ (git config rc $_dg_rc) — an unread configuration is not a checkout that declares no driver, so the range is not verified. Retry rather than record." >&2
+      return 1
     fi
-    _wt_amb="$(delta_git "$root" ls-files -o -m --exclude-standard -- '*.gitattributes' '.gitattributes' 2>/dev/null || true)"
+    _gitdir=""; _gd_rc=0
+    _gitdir="$(delta_git "$root" rev-parse --absolute-git-dir 2>/dev/null)" || _gd_rc=$?
+    if [ "$_gd_rc" -ne 0 ] || [ -z "$_gitdir" ]; then
+      echo "   delta: the checkout's git directory could not be resolved (git rev-parse rc $_gd_rc) — without it the AMBIENT attribute sources cannot be ruled out, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    # ⛔ `--git-common-dir`, NOT `--absolute-git-dir` (cycle-4 review, P1). In a LINKED WORKTREE —
+    # the fleet's default layout — the per-worktree gitdir is `<repo>/.git/worktrees/<n>` while
+    # `info/attributes` lives in the COMMON dir, so reading only the worktree gitdir missed it while
+    # `merge-tree` in that worktree honoured it. Both are checked; either one being non-empty refuses.
+    _commondir=""; _cd_rc=0
+    _commondir="$(delta_git "$root" rev-parse --git-common-dir 2>/dev/null)" || _cd_rc=$?
+    if [ "$_cd_rc" -ne 0 ] || [ -z "$_commondir" ]; then
+      echo "   delta: the checkout's COMMON git directory could not be resolved (git rev-parse rc $_cd_rc) — without it the ambient attribute sources cannot be ruled out, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    case "$_commondir" in /*) : ;; *) _commondir="${root}/${_commondir}" ;; esac
+    _attr_amb=""
+    for _ad in "$_gitdir/info/attributes" "$_commondir/info/attributes"; do
+      [ -s "$_ad" ] && _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_ad}"
+    done
+    # ⛔ NO `--exclude-standard` (cycle-4 review, P1). Ignore rules do not govern ATTRIBUTES — git
+    # reads an ignored `.gitattributes` like any other — so excluding ignored paths from the scan
+    # meant one `printf 'merge=union'` plus one line in `.git/info/exclude` walked straight past it.
+    # ⛔ AND `-m` IS THE WRONG BASELINE (same review, P1): `ls-files -m` compares worktree to INDEX,
+    # so a STAGED `.gitattributes` (worktree == index, but different from every parent's tree) is
+    # invisible — and assume-unchanged hides a modified one from git entirely. Both are caught by
+    # flags, not by diffing: `ls-files -v` prints a lowercase letter for assume-unchanged (`h`) and
+    # skip-worktree (`S`), and `-o` (without --exclude-standard) lists every untracked path.
+    _wt_amb=""; _ls_rc=0
+    _wt_amb="$(delta_git "$root" ls-files -o -- '*.gitattributes' '.gitattributes' 2>/dev/null)" || _ls_rc=$?
+    if [ "$_ls_rc" -ne 0 ]; then
+      echo "   delta: the AMBIENT-ATTRIBUTES scan FAILED (git ls-files rc $_ls_rc) — a scan that did not run is not a checkout with no ambient attribute source, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    _st_amb=""; _st_rc=0
+    _st_amb="$(delta_git "$root" ls-files -v -- '*.gitattributes' '.gitattributes' 2>/dev/null | command awk 'substr($0,1,1) ~ /[a-z]/ { print substr($0,3) }')" || _st_rc=$?
+    if [ "$_st_rc" -ne 0 ]; then
+      echo "   delta: the assume-unchanged / skip-worktree scan FAILED (git ls-files -v rc $_st_rc) — a scan that did not run is not a checkout whose attributes are all real, so the range is not verified. Retry rather than record." >&2
+      return 1
+    fi
+    _wt_amb="${_wt_amb}${_wt_amb:+$'\n'}${_st_amb}"
     if [ -n "$_wt_amb" ]; then
       _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_wt_amb}"
     fi
@@ -1525,7 +1589,7 @@ $m"
     # lane_dimension_carry's clause (D), which fixed exactly this and records why:
     # "rc IS CHECKED, AND THIS IS LOAD-BEARING … An earlier cut discarded the status".
     mrc=0
-    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)" || mrc=$?
+    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)" || mrc=$?
     # merge-tree prints the resulting tree on its FIRST line and extra lines for
     # conflicts. Take that line with a parameter expansion, NEVER `| head -1`: a
     # SIGPIPEd producer under `set -o pipefail` makes the substitution fail and

@@ -8270,6 +8270,31 @@ assert_contains "$RECORD_ERR" ".gitattributes" "20i3 …and names the file it fo
 #    refusal under test — a "control" here would refuse for a different reason and certify nothing.
 #    The premise that the attribute really steers the oracle is asserted with git itself, above.
 rm -f .gitattributes
+# 20i6 THE BOX-GLOBAL SOURCES — `core.attributesFile` and the default `$XDG_CONFIG_HOME/git/attributes`
+#      are MACHINE settings, so the oracle read neutralises them instead of refusing (cycle-4
+#      review, P1: `~/.config/git/attributes` steering `merge=union` produced rc 0 + tree-equal while
+#      every ambient scan came back empty). The recorder's HOME here is the suite's FAKE home, which
+#      is exactly where a user-level attribute file lives.
+mkdir -p "$F_HOME/.config/git"
+printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
+_un_g=0
+DG_UN_MT3="$(HOME="$F_HOME" XDG_CONFIG_HOME= git merge-tree --write-tree "$DG_UN_L" "$DG_UN_B" 2>/dev/null)" || _un_g=$?
+DG_UN_MT3="${DG_UN_MT3%%$'\n'*}"
+if [ "$_un_g" = "0" ] && [ "$DG_UN_MT3" = "$(git rev-parse "$DG_UN_H^{tree}")" ]; then
+    ok "20i6 control: a GLOBAL attributes file really steers plain merge-tree (rc 0, tree = the hand resolution)"
+else
+    bad "20i6 control: the global attributes file did not steer merge-tree (rc=$_un_g), so this vector certifies nothing"
+fi
+EHIA=425160; rm -f "$(Q2 $EHIA)"
+run_record_delta $EHIA "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" \
+    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i6 a GLOBAL attributes file does NOT steer the recorder's oracle (rc 3)"
+# ⛔ THE ANCHOR IS THE ATTRIBUTION when a cover is named (the no-cover sentence belongs to the other
+#    branch): a recorder whose oracle HAD been steered would classify merge-only, anchor on A and
+#    ACCEPT. This one still anchors on the hand merge, which is only possible if it saw the conflict.
+assert_contains "$RECORD_ERR" "postdates ${DG_UN_H:0:12}" \
+    "20i6 …the hand resolution is still classified EVIL (the anchor is the merge), because the oracle read neutralised the machine's rule"
+rm -f "$F_HOME/.config/git/attributes"
 # 20i5 THE CONFIG HALF: a CUSTOM driver (which has a config key) steered from an untracked
 #      attribute. Both halves are needed — the built-in drivers have no key, and a custom driver
 #      needs both the key and the attribute — and the refusal must name the scope, because the key
@@ -8782,6 +8807,14 @@ git config merge.hidrv.driver true || true
 MUT="$(mk_mutant nodriver '    if [ -n "$_drivers" ] || [ -n "$_attr_amb" ]; then' '    if [ -n "$_attr_amb" ]; then')"
 mut_check "M37 the CONFIG merge-driver refusal" 425159 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515901" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
 git config --unset merge.hidrv.driver 2>/dev/null || true
+# M38 — THE ORACLE NEUTRALISATION (20i6). With the box-global attributes file in place, dropping the
+#       neutralised read lets the MACHINE's `merge=union` decide the answer: the hand resolution
+#       compares equal, the range becomes merge-only, and the cover naming A is enough.
+mkdir -p "$F_HOME/.config/git"
+printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
+MUT="$(mk_mutant nonneutral '    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"' '    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"')"
+mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+rm -f "$F_HOME/.config/git/attributes"
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
