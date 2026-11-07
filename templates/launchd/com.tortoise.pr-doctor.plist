@@ -28,10 +28,14 @@
          that never ran the farm FAILs this job instead of installing a dead one, which
          is the correct verdict and the same one every farmed job gets.
          The interpreter is resolved BY THE WRAPPER (`python3` on PATH, then
-         /usr/bin/python3, then /usr/local/bin/python3) and not the installer's
-         PYTHON_BIN placeholder: on a non-swarm box that placeholder is deliberately
-         pointed at a venv that does not exist, so using it would hard-fail this install
-         for a reason that has nothing to do with the doctor.
+         /usr/bin/python3, then /usr/local/bin/python3), because this unit's
+         ProgramArguments names `/bin/bash` + the farmed wrapper and launchd gives a job
+         no PATH of its own. The installer's {{PYTHON_BIN}} placeholder is not used here —
+         it belongs to the units whose argv[0] IS the interpreter.
+         (An earlier version of this paragraph justified that by claiming the placeholder
+         points at a non-existent venv on a non-swarm box; `install-launchd.sh` actually
+         falls back to `command -v python3` when the venv is absent, so that install would
+         NOT hard-fail, and the claim was wrong. The reason above is the real one.)
 
          WHY 30 MINUTES. One pass is a real read of every open non-draft PR plus up
          to MAX_FIX/MAX_REVIEW load-gated worker spawns, with each gh call bounded at
@@ -65,7 +69,9 @@
          assert its repo in argv — the literal `repo` flag followed by the tortoise slug —
          which was correct when the box ran one repo and became the defect the moment it ran two:
          on a cell whose config declares `OR=daniel-ospina/agent-infra` while its controller was
-         started for tortoise, the doctor logged `repo: daniel-ospina/tortoise (from the repo flag)` on
+         started for tortoise, the doctor logged the repo as sourced from ARGV (its emitted line reads
+         "repo: &lt;slug&gt; (from &lt;source&gt;; checkout &lt;dir&gt;)", where the source for that path is
+         the argv repo flag) on
          EVERY pass and the second repo's queue was read by nothing. #2280 fixed WHICH repo the
          resolver picks; it could not give a multi-repo box more than one, because #2280 deliberately
          shipped `PR_DOCTOR_REPOS` with NO default set — there was no authoritative machine list to

@@ -7,8 +7,9 @@
 #
 # so on ANY box the doctor graded exactly one repo, whatever that box's controllers actually served.
 # Measured on a cell whose `keys.env` declares `OR=daniel-ospina/agent-infra` while its controller was
-# started for `daniel-ospina/tortoise`: the doctor logged `repo: daniel-ospina/tortoise (from --repo)`
-# on every pass while the second repo's queue was read by nothing at all. #2280 fixed WHICH repo the
+# started for `daniel-ospina/tortoise`: the doctor logged
+# `repo: daniel-ospina/tortoise (from --repo; checkout …)` on every pass while the second repo's queue
+# was read by nothing at all. #2280 fixed WHICH repo the
 # resolver picks; it did not give a multi-repo box more than one. §1 asks for "one unit rendered from
 # a versioned template with the repo set as a parameter" — the repo set is
 # `scripts/lib/repo-set.sh` (§4), and this file is the doctor's reader of it.
