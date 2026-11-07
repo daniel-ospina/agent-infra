@@ -919,22 +919,35 @@ GH_PROBE_CAUSE=""
 # `] — no candidate can be judged from this box`. MEASURED, byte for byte, on the rc=75 arm: the
 # prefix and the fixed `answer=` + `question=` half cost 308 bytes before the evidence VALUE starts
 # (52 of prefix + 245 of fixed clause + 11 for `; evidence=`), so the evidence gets the remaining 92 of
-# the 400. What arrives there is `rc=75: ` (7) plus the 253-byte STDERR line `gate_note` writes —
-# `gh-gate: ` (9) + the 244-byte note (`scripts/gh-shim/gh:1874`) — so the clause is 245 + 11 + 260 =
-# 516 bytes against a 348-byte window (400 − 52; the 46-byte suffix survives only when nothing is cut).
-# 516 > 348, so SOMETHING is always clipped here, and the only real decision is WHICH part yields.
+# the 400 — 95 when `source=env`, which is 3 bytes shorter than `source=stored`.
+# ⛔ AND WHAT ARRIVES THERE IS NOT THE `gh-contended` LINE (#3701 review round 7, P2). That was this
+# comment's claim and it was false: `gh_probe_evidence` takes the FIRST non-empty captured line
+# (`awk 'NF{print; exit}'`), while `wait_for_cooldown` buffers TWO notes into the same `$NOTEF` before
+# the refusal is even written (`scripts/gh-shim/gh:1477` the shared-window/pacing note, `:1485` the
+# budget-read note) — and `flush_notes 75` (`:1876`) then cats all three to stderr. So the record quotes
+# the PACING note and the `gh-contended` verdict (`:1874`, 244-byte note, 253-byte line) is line 3 and
+# never reaches it. MEASURED on a representative capture (`waiting 5s … budget 1000ms`): the quoted line
+# is 101 bytes, its evidence VALUE 108, so the clause is 245 + 11 + 108 = 364 against a 348-byte window
+# (400 − 52; the 46-byte suffix survives only when nothing is cut) — 364 > 348, so the cut still fires
+# and severs `(budget 1000ms)`. The decision below is unchanged, because it is about WHICH part yields,
+# not about which line arrives.
 # Round 2 answered "the verdict", and MEASURED on the real record that is the wrong half: leading with
 # the evidence ends the beat line INSIDE the verdict (`… — nothing was sent, so NEI`), so an operator
 # reads a severed claim and never sees `NOT auth and NOT an outage`, nor which question was asked. The
 # verdict and the question are FIXED-SIZE (245 bytes together, whatever the stderr says); the evidence
 # is the only variable-length part, AND the record keeps it whole — `GH_PROBE_CAUSE_MAX` below bounds
-# the evidence QUOTE at 320, well clear of the 253-byte line, so the record's clause tops out at
-# 245 + 11 + 330 = 586. So the verdict leads and the evidence closes, and once the evidence is long
-# enough to reach the cut (over 92 bytes, i.e. a stderr line of 86 bytes or more — a note of 77 after
-# `gate_note`'s prefix, which every real refusal is) the severed tail is evidence and its loss costs
-# nothing the record does not already hold. Below that the cut falls in `provision_fail`'s own trailing
-# consequence sentence instead — not the verdict, and still whole in the record and on the
-# `[refresh] FAILED` log line — which is the only invariant this ordering buys and the one `(g7)` pins.
+# the evidence TAKE at 320 (`line` is cut there and the ASCII marker appended, so the take tops out 3
+# over the cap, plus `rc=`), which is why the record's clause is a bounded number while the beat's
+# 400-byte window is not big enough to hold it. So the verdict leads and the evidence closes, and once
+# the evidence is long enough to reach the cut (over 92 bytes, i.e. a captured line of 86 bytes or more)
+# the severed tail is evidence and its loss costs nothing the record does not already hold. Below that
+# the cut falls in `provision_fail`'s own trailing consequence sentence instead — not the verdict, and
+# still whole in the record and on the `[refresh] FAILED` log line — which is the only invariant this
+# ordering buys and the one `(g7)` pins.
+# ⛔ DECLARED RESIDUAL: the take is the FIRST line, so an arm whose capture carries a preceding note is
+# quoted by that note, not by its verdict. That is stated rather than fixed here — re-ordering the take
+# is a behaviour change for every arm and belongs with the issue, not in a fix round — and the beat
+# still names the precondition from the `answer=`/`question=` half and the log keeps all three lines.
 # `refresh-provision.test.sh`'s `(g7)` drives the REAL `refresh_cause_brief` and pins both halves:
 # every other arm reads `rec why`, which is unbounded, so they all stay green while the beat cuts.
 GH_PROBE_CAUSE_MAX=320

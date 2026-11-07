@@ -948,16 +948,26 @@ ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 # shape production cannot emit. What DOES refuse it is the shared-cooldown layer in
 # `scripts/gh-shim/gh:1874`, and this is that layer's own wording.
 mk_case gh_budget
-# ⛔ THE FIXTURE IS THE SHIM'S OWN STDERR LINE, BYTES AND ALL (#3701 review rounds 3 and 6). It used
-# to be a hand-transcribed COPY with ASCII hyphens where the shim writes em dashes — 240 bytes against
-# the real 244 — and those 4 bytes are part of where the beat's cut lands, so a byte budget measured
-# against the copy is measured against the wrong string. It also stopped short of what actually reaches
-# stderr: `gate_note` (`scripts/gh-shim/gh:679`) writes `gh-gate: %s`, so the line the probe captures is
-# 253 bytes, not the 244 of the note alone. Both halves are derived and prefixed here, so the fixture
-# cannot drift from — and is not 9 bytes short of — the bytes it calls verbatim.
+# ⛔ THE FIXTURE IS THE SHIM'S CAPTURE, IN THE ORDER THE SHIM WRITES IT (#3701 review rounds 3, 6, 7).
+# It has been wrong twice and each time in the same direction — a hand-shaped copy instead of the bytes:
+#   * round 3: ASCII hyphens where the shim writes em dashes (240 bytes against the real 244);
+#   * round 6: the note WITHOUT `gate_note`'s own `gh-gate: ` prefix (`scripts/gh-shim/gh:679`), which
+#     made the line 253 bytes rather than the 244 of the note alone;
+#   * round 7 (P2): the wrong LINE ENTIRELY. `wait_for_cooldown` appends TWO notes to `$NOTEF` before the
+#     refusal is written — `gh:1477` the shared-window/pacing note, `gh:1485` the budget-read note — and
+#     `flush_notes 75` then cats all three to stderr. `gh_probe_evidence` takes the FIRST non-empty line,
+#     so the record quotes the PACING note and the 244-byte `gh-contended` verdict is line 3, which the
+#     probe never reaches. A fixture emitting only `gh-contended` therefore asserted a shape production
+#     cannot emit for this arm — the same defect class as the round-3 `gh-core-floor` finding, one layer
+#     down. The stub now emits all three lines in production's order.
+# ⛔ The `gh-contended` line is DERIVED from `scripts/gh-shim/gh:1874` so it cannot drift; the two pacing
+# notes carry runtime figures (`waiting Ns`, `budget Nms`), so the fixture pins concrete ones and says so.
 SHIM_NOTE="$(grep -m1 '^ *gate_note "gh-contended' "$HERE/../../scripts/gh-shim/gh" \
   | sed -e 's/^ *gate_note "//' -e 's/"$//' -e 's/\${WAIT_BUDGET_MS}/120000/')"
-SHIM_LINE="gh-gate: $SHIM_NOTE"
+SHIM_PACE='gh-gate: the account is in a shared rate-limit window — waiting 5s before this call (budget 1000ms)'
+SHIM_BUDGET='gh-gate: if the account BUDGET is what refused, one cheap read says so: cat /gate/budget (no API call)'
+SHIM_FIRST="$SHIM_PACE"
+SHIM_CAPTURE="$(printf '%s\n%s\n%s' "$SHIM_PACE" "$SHIM_BUDGET" "gh-gate: $SHIM_NOTE")"
 case "$SHIM_NOTE" in
   *'gh-contended'*) SHIM_NOTE_NOTE='' ;;
   *) SHIM_NOTE_NOTE='the shim no longer emits a gh-contended note at this line' ;;
@@ -966,9 +976,9 @@ case "${SHIM_NOTE:-}" in
   *'${'*) SHIM_NOTE_NOTE='the derived line still carries an unexpanded shell variable' ;;
 esac
 [ -z "${SHIM_NOTE_NOTE:-}" ] \
-  && ok "(g) the stub's stderr line is the SHIM's own, derived (note ${#SHIM_NOTE}, line ${#SHIM_LINE} chars)" \
+  && ok "(g) the stub emits production's 3-note capture, the gh-contended line derived (first line ${#SHIM_FIRST} chars)" \
   || bad "(g) the shim's gh-contended note could not be derived — ${SHIM_NOTE_NOTE} (a hand-typed copy is what this row exists to stop)"
-mk_gh_budget_stub "$D" 75 "$SHIM_LINE"
+mk_gh_budget_stub "$D" 75 "$SHIM_CAPTURE"
 rp "$D"
 G_WHY="$(rec why)"
 ck "(g) a locally-refused gh precondition is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
@@ -976,8 +986,14 @@ ck "(g) …and the failure is recorded at the provision stage (stage=$(rec stage
    "$([ "$(rec stage)" = provision ]; echo $?)"
 ck "(g) …and the RECORD names the PRECONDITION, not a pointer to a log line" \
    "$(case "$G_WHY" in *'refusal line above names which one'*) echo 1 ;; *'question='*) echo 0 ;; *) echo 1 ;; esac)"
-ck "(g) …and the record carries the GH LAYER'S OWN refusal line, verbatim (gh-contended)" \
-   "$(case "$G_WHY" in *'gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ AND IT QUOTES THE LINE THE PROBE ACTUALLY TAKES — the FIRST one (#3701 review round 7, P2). The
+# pair below is the point: the pacing note is IN and the `gh-contended` verdict is OUT, so a fixture (or a
+# take) that changed which line is read reddens here instead of silently grading a shape production
+# cannot emit.
+ck "(g) …and the record quotes the FIRST captured line, which is the PACING note" \
+   "$(case "$G_WHY" in *'shared rate-limit window — waiting 5s before this call'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g) …and does NOT carry the gh-contended verdict, which is line 3 and never taken" \
+   "$(case "$G_WHY" in *'gh-contended'*) echo 1 ;; *) echo 0 ;; esac)"
 # ⛔ AND IT MUST NOT CLAIM A CAUSE 75 DOES NOT ESTABLISH (#3701 review, P1). 75 is EX_TEMPFAIL —
 # "refused LOCALLY, nothing was sent" — which is ALSO single-flight BUSY and the shared-window verdict;
 # `gh-limit.py:3439` records "a contended verdict is NOT a limit" as a defect it fixed. A clause saying
@@ -1089,7 +1105,7 @@ if [ -f "$LOOP" ]; then
 fi
 if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut -c1-400' "$BRIEF"; then
   mk_case gh_beat
-  mk_gh_budget_stub "$D" 75 "$SHIM_LINE"
+  mk_gh_budget_stub "$D" 75 "$SHIM_CAPTURE"
   rp "$D"
   GBEAT_WHY="$(rec why)"
   # The REAL renderer, over the REAL record — not a re-implementation of the cut. ⛔ THE SNAPSHOT IS THE
@@ -1102,23 +1118,24 @@ if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut 
      "$(case "$GBEAT" in *'question=can the stored credential answer at all (gh api rate_limit, source='*) echo 0 ;; *) echo 1 ;; esac)"
   # ⛔ NON-VACUITY, AND THE REASON THIS ARM IS NOT A TAUTOLOGY: the cut must GENUINELY HAVE FIRED, and the
   # two rows above must not be passing on a clause short enough to fit whole. The test is a BYTE
-  # COMPARISON, not a substring: an earlier cut of this row inferred "fired" from the absence of the
-  # clause's trailing phrase, which only goes absent once the cut has eaten ~41 bytes, so the row stayed
-  # green long after the cut had started — the tripwire and the thing it claimed to measure were not the
-  # same event (#3701 review round 6, P2).
+  # COMPARISON because that is the event itself; the earlier substring form only went absent once the cut
+  # had eaten the whole 38-byte trailing phrase. (The two happen to agree — the phrase IS the tail — which
+  # is why the byte form is the honest way to say it: it states the event instead of inferring it from a
+  # phrase whose length must then be kept in step with the suffix.)
   ck "(g7) …with the cut genuinely FIRED (why=… exceeds the 400-byte window)" \
      "$([ "$(printf '%s' "$GBEAT_WHY" | wc -c)" -gt 400 ]; echo $?)"
   # ⛔ AND THE CUT LANDS IN THE EVIDENCE — the assertion is the PAIR, so neither half can pass vacuously:
-  # the beat KEEPS the evidence's head and LOSES its tail, while the RECORD keeps both.
+  # the beat KEEPS the quoted line's head and LOSES its tail, while the RECORD keeps the whole line.
   ck "(g7) …and the cut lands INSIDE the evidence (its head survives: the layer names itself)" \
-     "$(case "$GBEAT" in *'evidence=rc=75: gh-gate: gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
-  ck "(g7) …proving truncation fired: the note's TAIL is outside the beat window" \
-     "$(case "$GBEAT" in *'returning rc=75 rather than hanging'*) echo 1 ;; *) echo 0 ;; esac)"
-  # ⛔ THIS IS THE FIXTURE-DRIFT TRIPWIRE, so its message says so. It is the only row that pins the note's
-  # bytes verbatim: if the shim REWORDS its note, this reds while the rows above stay green — which would
-  # otherwise read as "the fix broke", when the real cause is that the fixture's source moved.
-  ck "(g7) …while the RECORD still carries the note WHOLE, so nothing is lost where it is read less often (if THIS reds, check whether scripts/gh-shim/gh reworded its note before assuming the ordering regressed)" \
-     "$(case "$GBEAT_WHY" in *'returning rc=75 rather than hanging into the caller'"'"'s timeout'*) echo 0 ;; *) echo 1 ;; esac)"
+     "$(case "$GBEAT" in *'evidence=rc=75: gh-gate: the account is in a shared rate-limit window'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g7) …proving the cut severed the QUOTED line's tail (…(budget 1000ms) is outside the beat)" \
+     "$(case "$GBEAT" in *'(budget 1000ms)'*) echo 1 ;; *) echo 0 ;; esac)"
+  # ⛔ AND THIS ROW IS THE FIXTURE'S OWN TRIPWIRE, so its message says so. The quoted tail is the FIXTURE's
+  # pacing literal (`$SHIM_PACE`), which mirrors `scripts/gh-shim/gh:1477` — so if that call is reworded,
+  # this reds while the rows above stay green, and the cause is the fixture's model, not the cut. If what
+  # reds is the row ABOVE instead, the fixture has stopped modelling production's capture order.
+  ck "(g7) …while the RECORD still carries the quoted line WHOLE, so nothing is lost where it is read less often (if THIS reds, check whether scripts/gh-shim/gh:1477 reworded its pacing note before assuming the ordering regressed)" \
+     "$(case "$GBEAT_WHY" in *'(budget 1000ms)'*) echo 0 ;; *) echo 1 ;; esac)"
 else
   bad "(g7) the real refresh_cause_brief could not be extracted from $LOOP — the beat's cut is ungraded"
 fi
