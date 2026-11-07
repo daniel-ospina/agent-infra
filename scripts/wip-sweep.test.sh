@@ -522,9 +522,35 @@ DEFCNT="$(awk -F'\t' '$11 ~ /deferred/ && $12 != "-" && $12 != "" {c++} END {pri
 [ "${DEFCNT:-0}" -ge 1 ] \
   && ok "U1e a DEFERRED row still carries its unpushed count (not '-')" \
   || bad "U1e a deferred row dropped the unpushed column"
+# ⛔ U2 — AN UNMEASURED COUNT IS NOT ZERO (#3588 review, cycle 9). The unreadable arm set `unpushed="?"`,
+# incremented NO counter and set NO failure, so a `rev-list` that timed out or errored wrote
+# `unpushed_worktrees=0` into a record that still said `status=ok rc=0`. The quiesce's whole refuse-DONE
+# check reads that count, so it printed DONE over commits it had never counted — the false PASS this PR
+# exists to close, one state over. The only trace was a `?` in a TSV column no caller reads.
+mk_fixture unpu fix/3485-unpu || { echo "❌ fixture failed (unpu)"; exit 1; }
+printf 'local only\n' > "$T/unpu/wt/local.txt"
+git -C "$T/unpu/wt" add local.txt 2>/dev/null
+git -C "$T/unpu/wt" commit -qm "local only" 2>/dev/null
+mkdir -p "$T/unpubin"
+UNP_REAL="$(command -v git)"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" rev-list --count "*) exit 128 ;;\nesac\nexec %s "$@"\n' \
+  "$UNP_REAL" > "$T/unpubin/git"
+chmod +x "$T/unpubin/git"
+O_U2="$(PATH="$T/unpubin:$PATH" WIP_SWEEP_STATE_DIR="$T/state-unpu" bash "$SW" --apply --repo "$T/unpu/wt" 2>&1)"; RC_U2=$?
+[ "$RC_U2" -eq 3 ] \
+  && ok "U2 an UNREADABLE unpushed count FAILS the pass (exit 3), never reads as zero" \
+  || bad "U2 an unreadable unpushed count answered rc=$RC_U2 (want 3) — a green record over a count nobody took: $O_U2"
+grep -qx 'status=failed' "$T/state-unpu/wip-sweep.status" 2>/dev/null \
+  && ok "U2b the record says status=failed, so no reader can take it for a clean pass" \
+  || bad "U2b the record says status=$(sed -n 's/^status=//p' "$T/state-unpu/wip-sweep.status" 2>/dev/null)"
+grep -q '^unpushed_unmeasured=1$' "$T/state-unpu/wip-sweep.status" 2>/dev/null \
+  && ok "U2c the record counts it (unpushed_unmeasured=1), so the failure is attributable" \
+  || bad "U2c the record does not count the unmeasured probe: $(grep -c . "$T/state-unpu/wip-sweep.status" 2>/dev/null) line(s)"
+has "$O_U2" 'UNMEASURED' \
+  && ok "U2d …and it SAYS so, naming the worktree whose state is unknown" \
+  || bad "U2d the failure is silent: $O_U2"
 grep -q 'nothing-at-risk' "$T/state-cln/wip-sweep.tsv" 2>/dev/null \
-  && ok "H3 the index records the clean verdict" || bad "H3 the index has no clean row"
-grep -q '^seen=1$' "$T/state-cln/wip-sweep.status" 2>/dev/null \
+  && ok "H3 the index records the clean verdict" || bad "H3 the index has no clean row"grep -q '^seen=1$' "$T/state-cln/wip-sweep.status" 2>/dev/null \
   && ok "H4 seen=1 — the pass EXAMINED the main worktree (a zero-examined pass is a failure)" \
   || bad "H4 the record does not show the worktree was examined"
 

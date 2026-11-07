@@ -518,6 +518,7 @@ fi
 BUDGET_STOPPED=0
 STOP_EXAMINE=0
 N_UNPUSHED=0
+N_UNPUSHED_UNMEASURED=0
 N_SEEN=0; N_CLEAN=0; N_SKIPPED=0; N_DIRTY=0; N_ARCHIVED=0; N_DEFERRED=0; N_UNMEASURED=0; N_FAILED=0; N_NO_ISSUE=0
 DETAIL=""
 FAILED=0   # latched: once this pass has failed to measure or to archive, it never ends clean
@@ -689,7 +690,21 @@ examine() {
   # here, and named in the doc's "not covered" list; archiving it is a separate capability.
   unpushed="$(tb_timeout "$(cap_timeout "$STATUS_TIMEOUT")" git -C "$path" rev-list --count HEAD --not --remotes 2>/dev/null)"
   case "${unpushed:-}" in
-    ''|*[!0-9]*) unpushed="?" ;;
+    ''|*[!0-9]*)
+      # ⛔ AN UNMEASURED COUNT IS NOT ZERO (#3588 review, cycle 9). This arm used to set `unpushed="?"`,
+      # increment NO counter and set NO failure, so a `rev-list` that timed out or errored wrote
+      # `unpushed_worktrees=0` into a record that still said `status=ok rc=0` — and the quiesce, whose
+      # whole refuse-DONE check reads that count, printed DONE over commits it had never counted. The
+      # only trace was a `?` in the TSV column, which no caller reads. Measured on a fixture whose
+      # `rev-list` hangs: `pass done status=ok rc=0 … unpushed_worktrees=0` beside a row carrying `?`.
+      # The pass cannot say whether this worktree's commits exist only on this disk, so it is not a clean
+      # pass — FAILED, which is exit 3. (Deliberately NOT a deferral: `deferred` means "reached later";
+      # there is no later pass on the quiesce path, and this is a datum the pass exists to report as
+      # unknown.) It is counted in its own field so `seen = clean + skipped + dirty + unmeasured` still
+      # holds over the worktrees examined.
+      unpushed="?"
+      N_UNPUSHED_UNMEASURED=$((N_UNPUSHED_UNMEASURED + 1)); FAILED=1
+      err "UNMEASURED — the unpushed-commit count for $path could not be read, so whether its commits exist ONLY on this disk is unknown. This pass is not a clean one." ;;
     *) if [ "$unpushed" -gt 0 ]; then N_UNPUSHED=$((N_UNPUSHED + 1)); err "COMMITS ONLY ON THIS DISK — $path is on '$br' with $unpushed commit(s) that no remote has. bg-rescue-wip archives UNCOMMITTED work only, so this pass does NOT save them."; fi ;;
   esac
 
@@ -1052,6 +1067,10 @@ if [ -n "$REC_TMP" ]; then
     # silently zero: the count is on the monitoring surface so "the pass was green and three commits
     # died with the box" cannot be read off a clean summary.
     printf 'unpushed_worktrees=%s\n' "$N_UNPUSHED"
+    # The count that could not be taken. A reader that destroys the box must treat this as "unknown",
+    # never as zero — the pass already fails (exit 3) when it is non-zero, and this field is what makes
+    # that failure attributable instead of a bare `failed=1`.
+    printf 'unpushed_unmeasured=%s\n' "$N_UNPUSHED_UNMEASURED"
     printf 'repos=%s\n' "${#REPOS[@]}"
     printf 'watchdog=%s\n' "$TB_TIMEOUT_KIND"
     printf 'detail=%s\n' "${DETAIL:-none}"
@@ -1073,5 +1092,5 @@ else
   RC=3; STATUS=failed
 fi
 
-note "pass done status=$STATUS rc=$RC seen=$N_SEEN clean=$N_CLEAN skipped=$N_SKIPPED dirty=$N_DIRTY archived=$N_ARCHIVED deferred=$N_DEFERRED unmeasured=$N_UNMEASURED failed=$N_FAILED no_issue=$N_NO_ISSUE unpushed_worktrees=$N_UNPUSHED"
+note "pass done status=$STATUS rc=$RC seen=$N_SEEN clean=$N_CLEAN skipped=$N_SKIPPED dirty=$N_DIRTY archived=$N_ARCHIVED deferred=$N_DEFERRED unmeasured=$N_UNMEASURED failed=$N_FAILED no_issue=$N_NO_ISSUE unpushed_worktrees=$N_UNPUSHED unpushed_unmeasured=$N_UNPUSHED_UNMEASURED"
 exit "$RC"
