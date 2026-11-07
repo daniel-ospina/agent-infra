@@ -7893,15 +7893,29 @@ def test_the_SHIPPED_plist_names_the_repo_the_armed_job_grades(tmp_path, monkeyp
     # ⛔ NO WorkingDirectory, DELIBERATELY: the job's cwd is `/`, so the cwd can never be its
     # evidence. If that key is ever added, this assertion should be revisited WITH the plist.
     assert "WorkingDirectory" not in spec
-    assert "--repo" in argv, "the shipped job names no repo: %r" % (argv,)
-    explicit = argv[argv.index("--repo") + 1]
+    # ⛔ THE ARGV IS THE WRAPPER, NOT THE DOCTOR (agent-infra#2281). This unit used to carry
+    # `--repo <slug>`; it now names no repo at all and delegates to `pr-doctor-machine.sh`, which
+    # renders the machine repo SET into `PR_DOCTOR_REPOS`. The property this test protects — "the
+    # armed job's own evidence must resolve, or the job is dark and looks armed" — is unchanged;
+    # what changed is WHERE the evidence lives. Asserted on the SHIPPED FILE so a future edit that
+    # puts the doctor back in argv, or re-adds a repo literal / `GH_REPO`, goes red.
+    assert len(argv) == 2, "the shipped job should name /bin/bash plus the wrapper: %r" % (argv,)
+    assert argv[0] == "/bin/bash", argv
+    assert argv[1].endswith("pr-doctor-machine.sh"), argv
+    assert "--repo" not in argv, "the shipped job must name no repo: %r" % (argv,)
+    assert "pr-doctor.py" not in " ".join(argv), "the unit targets the WRAPPER: %r" % (argv,)
+    # ⛔ `GH_REPO` IS NOT EVIDENCE (#2235) — dropped from this unit in the same change, and this
+    # arm exists to keep it dropped.
+    assert "GH_REPO" not in spec["EnvironmentVariables"], spec["EnvironmentVariables"]
 
     co = _checkout(tmp_path, "co-tortoise", _REPO_B)
     env = {k: v for k, v in spec["EnvironmentVariables"].items() if "{{" not in v}
     env["REPO"] = str(co)            # what install-launchd.sh renders {{TORTOISE_REPO}} into
-    slug, checkout, source, why = pr.resolve_repo(explicit=explicit, env=env)
+    # No `--repo` flag any more: the evidence is the SET (rendered by the wrapper) and the REPO seam
+    # this unit does render. Rank 4 must still ADOPT the checkout and prove the slug from its origin.
+    slug, checkout, source, why = pr.resolve_repo(env=env)
     assert slug == _REPO_B
-    assert source == "--repo" and why == ""
+    assert source == "REPO" and why == "", (source, why)
     assert checkout == str(co), "the checkout must be ADOPTED, not merely named"
 
     # AND THE PRE-FIX SHAPE MUST REFUSE -- otherwise this test would pass on a resolver that still
