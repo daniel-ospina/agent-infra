@@ -977,6 +977,41 @@ err_has "MEMORY gate"; ck $? "…naming the MEMORY gate, not the load one (the l
 err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
 no_comment; ck $? "no comment posted"
 
+# ── §O3 the spawn point's HELPER/SYNC refusal is not a reviewer crash either (agent-infra#3231) ──
+# The spawn point exits `AGENT_HARNESS_SKEW_REFUSED` when the gate and the `capacity.sh` it consumes were
+# not deployed together — nothing ran, nothing was paid for, and the remedy is a VERIFIED redeploy. Without
+# its own arm that code fell into the rc!=0 branch, which names a crashed/killed reviewer and tells the
+# operator to RE-RUN — straight back into a sync fault no re-run can clear.
+# ⛔ WHAT THIS ARM DOES AND DOES NOT DO (round-2 review of #3645, P2 — the previous comment overstated it):
+# the CODE comes out of `spawn-gate.sh`'s own declaration, so a collision that moves it reds here instead of
+# passing silently. The REMEDY is a literal `deploy-harness.sh` substring assertion (`err_has`, below) — it is
+# NOT read out of the harness, and no file here reads `deploy-harness.sh`. Both halves were mutation-checked:
+# `exit 83` → `exit 1` reds the rc assertion; reverting the sentence to the retired `cp ... *.sh` glob reds the
+# `deploy-harness.sh` and `err_not_has` assertions.
+_skew_decl="$(sed -n 's/^AGENT_HARNESS_SKEW_REFUSED=\([0-9][0-9]*\)$/\1/p' \
+  "$ROOT/scripts/orchestrator-harness/spawn-gate.sh" 2>/dev/null | head -1)"
+# ⛔ A DERIVATION THAT SILENTLY DEFAULTS IS NOT A DERIVATION (round-3 review of #3645, P2 — measured). This
+# block used to be `[ -n "$_skew_rc" ] || _skew_rc=83`, so a declaration the anchor cannot READ — `export
+# AGENT_HARNESS_SKEW_REFUSED=84`, or the value with a trailing comment — fell through to the literal 83 and the
+# whole arm stayed GREEN against a code that had moved. That is the fail-open the header of
+# `spawn-gate.test.sh` records as measured for this very `^NAME=` anchor (the note about `grep`ping a
+# declaration with an anchor it did not anticipate) — quoted, not line-numbered, for the reason this PR
+# keeps re-learning. So the read is ASSERTED separately and the value is used verbatim:
+# a reshape reds "the derivation could not read the declaration" instead of quietly testing a stale number.
+[ -n "$_skew_decl" ]; ck $? "the skew code is READABLE from spawn-gate.sh's declaration (got '${_skew_decl:-<none>}') — a reshape must red here, not fall back to a literal"
+_skew_rc="${_skew_decl:-83}"
+echo; echo "§O3 spawn-point HELPER/SYNC refusal (rc=$_skew_rc) => exit $_skew_rc, named as a harness fault"
+reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC="$_skew_rc"
+run "$SRC" 2284
+[ "$(rc_of)" = "$_skew_rc" ]; ck $? "exit $_skew_rc (its own code) not 6/75 and NOT the file's own rc=2 (rc=$(rc_of))"
+err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
+err_has "HELPER/SYNC"; ck $? "…naming the HELPER/SYNC fault, not the load gate's wording"
+err_has "deploy-harness.sh"; ck $? "…with the VERIFIED redeploy remedy #3508 kept, not the retired cp glob"
+err_not_has 'cp scripts/orchestrator-harness/*.sh'; ck $? "…and NOT the retired depth-1 glob that leaves a partial deploy"
+err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
+no_record; ck $? "no record written"
+no_comment; ck $? "no comment posted"
+
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
 echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
 reset; printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
