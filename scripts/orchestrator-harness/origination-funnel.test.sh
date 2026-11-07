@@ -2883,8 +2883,11 @@ else
     *) _wpin=0; _wref=0 ;;
   esac
   _wline="$(grep -E '^_WCODE=' "$_PINFILE" | awk 'END { print }')"
-  printf '%s' "$_wline" | grep -qE '\$\([^)]*_strip_comments[[:space:]<]' || _wpin=0
-  printf '%s' "$_wline" | grep -qE '_strip_ref' && _wref=1
+  # ⛔ A HERE-STRING, NOT A PIPE (#841/#864): `set -o pipefail` is on in this suite, so
+  # `printf … | grep -qE` reports 141 when the quiet grep exits early and the assertion below
+  # silently takes its failure branch on nothing but the line's LENGTH.
+  grep -qE '\$\([^)]*_strip_comments[[:space:]<]' <<<"$_wline" || _wpin=0
+  grep -qE '_strip_ref' <<<"$_wline" && _wref=1
   if [ "$_wpin" = "1" ] && [ "$_wref" = "0" ]; then
     ok "pin/writer: the graded view is derived by the stripper UNDER TEST — its BODY calls \`_strip_marked\` and never names \`_strip_ref\`, so delegating to the reference is not a green (a line-level pin was defeated by exactly that delegation), and the \`_WCODE=\` line calls it in a command substitution"
   else

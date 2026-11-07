@@ -1515,7 +1515,11 @@ denied_extension_copies() { # <agent-dir>
       # `rm -rf`) — and if the repo SHIPS such a name, install would ship it and this sweep delete
       # it, so `--verify` would fail `extension MISSING` on every run and the cell could never be
       # provisioned. So the remainder must be a copy MARKER, and a ship-list row is never a copy.
-      if printf '%s\n' "$shipped" | grep -Fxq "$fbase"; then continue; fi
+      # ⛔ A HERE-STRING, NOT A PIPE: `printf … | grep -q` is a SIGPIPE false negative under
+      # `set -o pipefail` (the writer takes SIGPIPE when the quiet grep exits early and the pipeline
+      # reports 141, so the test takes its ELSE branch and a ship-list row is treated as absent).
+      # The value and the grep flags are unchanged — only the pipe is dropped (#841/#864).
+      if grep -Fxq "$fbase" <<<"$shipped"; then continue; fi
       denied_copy_variant "$fbase" "$stem" || continue
       loadable_extension_entry "$f" || continue
       printf '%s\n' "$f"

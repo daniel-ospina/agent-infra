@@ -1252,9 +1252,12 @@ esac
 # strip is the SAME `c4mc`-style one `(c4m)`/`(c4n)` use, so the scans cannot drift.
 RRSPEND_CODE="$(awk '!/^[[:space:]]*#/' "$RRSPEND" 2>/dev/null | c4mc)"
 RR_ATOMIC=0
+# ⛔ HERE-STRINGS, NOT PIPES (#841/#864): this suite runs under `set -o pipefail`, and the code under
+# test is thousands of lines — a quiet grep that exits early gives the `printf` SIGPIPE, the pipeline
+# reports 141, and (c4q) then FAILS on a correct tree. The patterns are unchanged, only the pipe is gone.
 if [ -n "$RRSPEND_CODE" ] \
-   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' \
-   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'mv "$_rr_new" "$_rr_f"'; then
+   && grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' <<<"$RRSPEND_CODE" \
+   && grep -qF 'mv "$_rr_new" "$_rr_f"' <<<"$RRSPEND_CODE"; then
   RR_ATOMIC=1
   ok "(c4q) the round book is written to a SIBLING and RENAMED onto the counter — a reader can never observe a torn (empty) book, which both readers would read as 999999999 and park a healthy PR"
 else
