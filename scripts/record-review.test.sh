@@ -7017,9 +7017,33 @@ printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-i
 run_record_delta $EH2 "$DG_EV_HEAD" "delta:$DG_EV_L..$DG_EV_HEAD"
 assert_eq "$RECORD_RC" "3" "20h2 an EVIL MERGE (hand-resolved conflict) is refused (rc 3)"
 for _m2 in "NOT a clean merge of its parents" "does NOT merge cleanly"; do
-    case "$RECORD_ERR" in *"$_m2"*) ok "20h2 the refusal names the conflict resolution"; break ;; esac
+    case "$RECORD_ERR" in *"$_m2"*) ok "20h2 the refusal names the conflict resolution"; _named2=1; break ;; esac
 done
+# ⛔ A LOOP WITH NO FAILURE BRANCH IS AN ASSERTION THAT STOPS EXISTING WHEN THE WORDING MOVES:
+#    if neither phrasing appears, neither `ok` nor `bad` used to fire and the arm silently
+#    vanished (agent-infra#3475). The assertion now has a red half.
+[ "${_named2:-0}" = 1 ] || bad "20h2 the refusal does NOT name the conflict resolution (err='$RECORD_ERR')"
 assert_contains "$RECORD_ERR" "authored content" "20h2 the evil merge is classified AUTHORED, not merge-only"
+# ⛔ 20h2b — THE MERGE-ONLY AUTHORED SENTENCE. An EVIL MERGE whose range holds NO non-merge
+#    commit is `authored` with `n_authored = 0` — the shape whose diagnostic used to read
+#    "contains authored content (0 commit(s))", contradicting itself on the one bypass this
+#    feature exists to close. 20h2's own range carries one non-merge commit, so it takes the
+#    COUNT form and the merge sentence was pinned by NOTHING (measured: inverting its condition
+#    left the suite green). Here `A` is the merge's FIRST PARENT, so `--no-merges A..B` is empty.
+DG_EV_P1="$(git -C "$DG" rev-parse "$DG_EV_HEAD^1")"
+DG_EV_P2="$(git -C "$DG" rev-parse "$DG_EV_HEAD^2")"
+printf '%s\n' '2025-10-01T00:00:00Z' > "$T/dates/$DG_EV_P1"
+EH2B=4251315; rm -f "$(Q2 $EH2B)"
+# ⛔ THE BASE MUST BE THE MERGE'S SECOND PARENT, not the default fixture base. Otherwise the
+#    second branch's own commit is not reachable from `--not base`, it enters the walk as an
+#    authored commit, and the range takes the COUNT form — the very branch this vector exists to
+#    reach. With base = p2 the real-world shape is modelled exactly: the lane merged the base tip
+#    (p2) into its branch and hand-resolved a conflict, so `--no-merges A..B --not base` is EMPTY
+#    and the ONLY authored thing in the range is the merge's conflict resolution.
+run_record_delta $EH2B "$DG_EV_HEAD" "delta:$DG_EV_P1..$DG_EV_HEAD" STUB_BASE_SHA="$DG_EV_P2"
+assert_eq "$RECORD_RC" "3" "20h2b a range that is ONLY an evil merge, with no cover, is refused (rc 3)"
+assert_contains "$RECORD_ERR" "holds authored content in a MERGE" "20h2b the refusal names the MERGE as the authored content — \`n_authored\` is legitimately 0 here"
+assert_not_contains "$RECORD_ERR" "(0 commit(s))" "20h2b the refusal does NOT print the self-contradicting (0 commit(s)) count"
 # ⛔ ASSERT THE HEAD, NOT THE FILE: this vector plants a prior record at A (that is
 # what makes the merge-only arm reachable at all), so "no file" would be false even
 # on a correct refusal.
@@ -7900,6 +7924,44 @@ print("\n".join(out))
 PY48
 )"
 assert_eq "$_badbt" "" "20h48 no echo/printf message anywhere in the recorder executes its own backticks"
+# 20h48b THE SAME CLASS IN THE SUITE'S OWN LABELS (round 3, P2). 20h48 scans only the RECORDER, so
+#        a label in this file was invisible to it — and one carried unescaped backticks, so the
+#        suite EXECUTED `n_authored` as a command at test time and printed the label with the word
+#        deleted ("—  is legitimately 0 here"). Not cosmetic by 20h46b's own reasoning: on a box
+#        with a `clean` executable on PATH, a message that executes its own backticks runs it.
+#        The scan covers BOTH files, strips single-quoted regions (a backtick there is literal) and
+#        strips trailing comments through a small quote-state machine (so `# only \`x\` is RED`
+#        is not a hit, while a backtick in a LABEL argument is).
+_badbt2="$(python3 - "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")" <<'PY48B'
+import re, sys
+def strip_comment(s):
+    out=[]; q=None; i=0
+    while i < len(s):
+        c=s[i]
+        if q:
+            if c=='\\' and q=='"':
+                out.append(c); out.append(s[i+1:i+2]); i+=2; continue
+            if c==q: q=None
+            out.append(c)
+        else:
+            if c in '"\'': q=c; out.append(c)
+            elif c=='#': break
+            else: out.append(c)
+        i+=1
+    return ''.join(out)
+out=[]
+for path in sys.argv[1:]:
+    for i,l in enumerate(open(path),1):
+        st=l.strip()
+        if not st or st.startswith('#'): continue
+        body=strip_comment(st)
+        body=re.sub(r"'[^']*'","",body)
+        if re.search(r'(?<!\\)`', body):
+            out.append("%s:%d: %s" % (path, i, st[:90]))
+print("\n".join(out))
+PY48B
+)"
+assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder)"
 # 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
 #       commit that descends from `from` while being neither an ancestor NOR a descendant of the
 #       attested head is the one shape a narrowing endpoint can actually take — and no shipped vector
@@ -8040,8 +8102,41 @@ MUT="$(mk_mutant anchor '    anchor="$newest"' '    anchor="$to"')"
 mut_check "M5 covering-verdict anchor" 425124 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42512401" accepted STUB_EVIDENCE_AT="2025-01-01T00:00:00Z"
 # M6 — the base-aware classification (the reverse direction: breaking it must
 #      REFUSE the merge-only acceptance vector, or 20a tests nothing).
+# ⛔ THE VECTOR MUST BE 20a'S, COVER INCLUDED (agent-infra#3475). The first version dispatched
+#      `delta:$DG_A1..$DG_HEAD` with NO `+comment:`, and BOTH scripts refused it on DIFFERENT
+#      arms — the mutant on the authored-needs-cover arm (it classified the range authored) and
+#      the shipped code on the merge-only-needs-cover arm — so `mut_check … refused` scored OK
+#      for both and certified nothing about the classifier it names. Dispatching 20a's covered
+#      vector makes the CLASSIFICATION the only thing the mutant changes: shipped accepts it as
+#      merge-only, the mutant calls it authored, moves the anchor past the cover and refuses.
+#      The bare vector is kept as the SECOND cell, so the cover-less path is still measured.
 MUT="$(mk_mutant baseaware 'rev-list --no-merges "$from..$to" --not "$base_sha"' 'rev-list --no-merges "$from..$to"')"
-mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42512501" refused STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+# ⛔ ATTRIBUTION, NOT JUST AN EXIT CODE (agent-infra#3475). `mut_check … refused` accepts ANY
+#    non-zero exit, so the cell above is green even if the mutant refused on an arm it does not
+#    mutate. Two assertions make the refusal attributable to the CLASSIFIER: the shipped recorder
+#    must ACCEPT the very same vector, and the mutant's stderr must be the authored classification.
+rm -f "$(Q2 425125)"
+run_record_delta 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42512501" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "0" "20g M6 the SHIPPED recorder ACCEPTS the same covered vector (rc 0) — so the mutant's refusal is caused by the classifier, not by the cover"
+assert_contains "$(cat "$T/merr" 2>/dev/null || true)" "authored content" \
+    "20g M6 the mutant refused BECAUSE it classified the range as AUTHORED — the arm it mutates — and not on a downstream arm"
+mut_check "M6b base-aware classification (cover-less path)" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+# ⛔ M6b IS ATTRIBUTABLE, NOT MERELY GREEN (agent-infra#3475). Dispatched cover-less, BOTH
+#    scripts refuse — the shipped one on the MERGE-ONLY-needs-cover arm and the mutant on the
+#    AUTHORED-needs-cover arm — so `refused` alone would score OK for both and the cell would be
+#    the same vacuous shape it was added to retire. The two assertions below DISTINGUISH the arms:
+#    the shipped refusal must name "holds no lane-authored commit" (merge-only) and the mutant's
+#    must name "contains authored content" (authored). A regression of the classifier moves the
+#    mutant's refusal to the merge-only sentence and reds this cell.
+rm -f "$(Q2 425125)"
+run_record_delta 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
+assert_eq "$RECORD_RC" "3" "20g M6b the SHIPPED recorder refuses the cover-less vector"
+assert_contains "$RECORD_ERR" "holds no lane-authored commit" \
+    "20g M6b the shipped refusal is the MERGE-ONLY arm — so the mutant's authored refusal is a DIFFERENT arm, not the same rc 3 twice"
+assert_contains "$(cat "$T/merr" 2>/dev/null || true)" "contains authored content" \
+    "20g M6b the mutant refused at the AUTHORED arm — the classification the cell names is the thing that changed"
 # M7 — the EVIL MERGE in the anchor candidate set. 20h5's cover predates the
 #      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
 MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; then')"
@@ -8053,6 +8148,7 @@ mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_
 #       was UNMEASURED for four cycles because its own fixture's range was EMPTY — the vector
 #       stopped at the EMPTY-DIFF arm further down and never reached this classification. The
 #       20h13 fixture now adds one unrelated base-side file (and asserts the diff is
+#       NON-EMPTY, without which the vector stops at the EMPTY-DIFF arm and measures nothing).
 #       M13's vector therefore carries a COVER, which the merge-only arm requires (it has no
 #       local-record shortcut) and dates it BETWEEN A and the merge: the shipped code anchors
 #       the cover on B (authored) and refuses a verdict that predates the hand resolution,
@@ -8123,7 +8219,20 @@ mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "del
 #       record-review.sh (the same rule 14.14d states).
 MUT="$(mk_mutant unnamedcheck '  E_OUT=""; E_RC=0
   E_OUT="$(check_surface_scan "$to")" || E_RC=$?' '  E_OUT="weird_answer"; E_RC=0')"
-mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+# ⛔ THE REF MUST CARRY A COVER (agent-infra#3419). With the bare `delta:$DG_A1..$DG_HEAD`, the
+#    merge-only-needs-cover arm refuses a mutant that skips clause (E) too — both rc 3 — so
+#    emptying the `*)` body left this cell GREEN and the polarity arm was pinned by nothing.
+#    With a cover, clause (E) is the ONLY arm between this mutant and a `clean`, so the cell
+#    reds exactly when the polarity regresses. Attribution is pinned by the two assertions
+#    below: the shipped recorder ACCEPTS the same vector, and the mutant's stderr is clause
+#    (E)'s unreadable-answer refusal (site: scripts/record-review.sh, the `*)` arm's message).
+mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42515301" refused STUB_EVIDENCE_AT="2025-06-05T00:00:00Z"
+rm -f "$(Q2 425153)"
+run_record_delta 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42515301" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z"
+assert_eq "$RECORD_RC" "0" "20g M11 the SHIPPED recorder ACCEPTS the same covered vector (rc 0) — so clause (E) is the only arm that can refuse the mutant"
+assert_contains "$(cat "$T/merr" 2>/dev/null || true)" "could not be READ (rc 0, answer 'weird_answer')" \
+    "20g M11 the mutant refused AT CLAUSE (E) — the unreadable-answer arm it mutates — and not downstream"
 
 # M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that
 #       never says which range it reviewed — the date-only inference the arm replaced.

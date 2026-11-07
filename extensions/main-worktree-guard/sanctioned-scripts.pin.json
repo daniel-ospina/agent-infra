@@ -5,15 +5,9 @@
     "scripts/check-pipeline-compliance.sh": "a95d557c8ab1941bb1b5d4234367efdd83cff13eb474a841d987a5ee3164fd62",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
-<<<<<<< HEAD
-    "scripts/record-review.sh": "9c4dd34ef3b52ba73668cd4f7d11393b44229f7d100c1b9806ecc7a3f99e9edd",
+    "scripts/record-review.sh": "30018a299f1ec5b49768c011530cd1927a67465f4c3f255903c7e68e668c7e23",
     "scripts/admin-merge.sh": "9d268e0d378f260988dc32c91dc52989b96d128984cdf02f74c0e5d809d19147",
     "scripts/gh-shim/gh": "def5111b8735a6875e7d7b3cd4c76ad75caa42f8f2bdd2b044f1f86df6774be7"
-=======
-    "scripts/record-review.sh": "6b7c2b776fa87793a153a0cc2e2afcb043b696008d4072225a739772e85ccd37",
-    "scripts/admin-merge.sh": "a77d705dd3ab70f6ba4e7a72e0e7e658d42b2f0b29c6c2554eeccff7fe97a6f0",
-    "scripts/gh-shim/gh": "a5e5464ca1c06fe945deada66caff5ab9a1df07360f95aa5c1d12015edffa991"
->>>>>>> b25b46e12 (fix(record-review): the refusals executed their own backticks, and branch 3 asserted a narrowing it cannot establish)
   },
   "delegates": {
     "scripts/admin-merge.sh": "9d268e0d378f260988dc32c91dc52989b96d128984cdf02f74c0e5d809d19147",
@@ -26,11 +20,7 @@
     "scripts/ci_exemption.py": "09a127da99d5890a038a02ab7db2183e6a2a115ffc973006910ebff32eff08eb",
     "scripts/gh-shim/gh": "def5111b8735a6875e7d7b3cd4c76ad75caa42f8f2bdd2b044f1f86df6774be7",
     "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
-<<<<<<< HEAD
-    "scripts/record-review.sh": "9c4dd34ef3b52ba73668cd4f7d11393b44229f7d100c1b9806ecc7a3f99e9edd",
-=======
-    "scripts/record-review.sh": "6b7c2b776fa87793a153a0cc2e2afcb043b696008d4072225a739772e85ccd37",
->>>>>>> b25b46e12 (fix(record-review): the refusals executed their own backticks, and branch 3 asserted a narrowing it cannot establish)
+    "scripts/record-review.sh": "30018a299f1ec5b49768c011530cd1927a67465f4c3f255903c7e68e668c7e23",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/verify-admin-merge-evidence.sh": "cc32da5d99e2a02939d2c4fdf73c1c96c8dd1cc59d447bff13e75ad31d0f5f53"
   }

@@ -1245,7 +1245,7 @@ verify_review_evidence() { # <ref> <head_sha> [polarity] -> 0 = verified
 # graft file) makes `git diff` and `git rev-list` answer about history that does
 # not exist, so a digest computed with one active could attest a range that never
 # existed on the remote. Same posture, same reason, as local_diff_for_pr (#1398).
-DELTA_FROM=""; DELTA_TO=""; DELTA_KIND=""; DELTA_DIGEST=""; DELTA_COVER=""; DELTA_BASE=""
+DELTA_FROM=""; DELTA_TO=""; DELTA_KIND=""; DELTA_DIGEST=""; DELTA_BASE=""
 # ⛔ THE ONE SIGNAL THAT AN EVIDENCE-RANGE WAS VERIFIED — a flag of its OWN, not inference from
 # `[ -n "$DELTA_FROM" ]`. `--delta` (#10583) and `--evidence delta:<A>..<B>` (#3299) merged into
 # this file from opposite sides and once SHARED that global, so every `--delta` record was minted
@@ -1283,7 +1283,6 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
   local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok="" _tsha=""
-  local thr=0 prior_head="" prior_verdict="" _pf=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1554,7 +1553,17 @@ $m"
   # CREATE one, because "nothing but merges happened" is not a review of anything.
   if [ "$DELTA_KIND" = "authored" ]; then
     if [ -z "$cover" ]; then
-      echo "   delta: the range ${from:0:12}…..${to:0:12}… contains authored content (${n_authored} commit(s)) and no covering verdict was named. A delta over authored content is only evidence if a reviewer's verdict covers it:" >&2
+      # ⛔ THE SENTENCE MUST NAME THE CAUSE THE CLASSIFIER MEASURED. `n_authored` counts
+      # `rev-list --no-merges`, so an EVIL-MERGE-ONLY range has ZERO non-merge commits and
+      # the count form read "contains authored content (0 commit(s))" — a diagnostic that
+      # contradicts itself on exactly the bypass this arm exists to close (the conflict
+      # resolution lives in the MERGE commit, which `--no-merges` cannot see). The range is
+      # authored BECAUSE of the merge, so the merge is what the sentence must say.
+      if [ "$n_authored" -eq 0 ]; then
+        echo "   delta: the range ${from:0:12}…..${to:0:12}… holds authored content in a MERGE: no non-merge commit in it is lane-authored, but a merge is NOT a clean merge of its parents — a conflict resolution lives only in the merge commit and no reviewer has seen it — and no covering verdict was named. A delta over a conflict resolution is only evidence if a reviewer's verdict covers it:" >&2
+      else
+        echo "   delta: the range ${from:0:12}…..${to:0:12}… contains authored content (${n_authored} commit(s)) and no covering verdict was named. A delta over authored content is only evidence if a reviewer's verdict covers it:" >&2
+      fi
       [ -n "$evil" ] && echo "   → and one of its merges is not a clean merge of its parents: ${evil}." >&2
       echo "   → record-review.sh $PR $to clean ${REPO:-<owner/repo>} --evidence delta:$from..$to+comment:<review-comment-id>" >&2
       echo "   (or run a full review at ${to:0:12}… and name its artifact with plain --evidence comment:<id>)." >&2
@@ -1580,7 +1589,7 @@ $m"
     # A, or the HMAC marker), which needs the reviewer's template to carry the sha.
     :
     if [ -z "$cover" ]; then
-      echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit (nothing base-borne entered), but a merge-only delta still needs the VERDICT that covered ${from:0:12}… — a delta EXTENDS an attestation and can never create one. Naming a head is not evidence." >&2
+      echo "   delta: the range ${from:0:12}…..${to:0:12}… holds no lane-authored commit (every non-merge commit in it came in from the base side), but a merge-only delta still needs the VERDICT that covered ${from:0:12}… — a delta EXTENDS an attestation and can never create one. Naming a head is not evidence." >&2
       echo "   → name the verdict at ${from:0:12}… : --evidence delta:$from..$to+comment:<id> (a verdict at ${to:0:12}… works too: then it is a plain --evidence comment:<id>)." >&2
       return 1
     fi
@@ -2025,7 +2034,7 @@ $m"
     esac
     fi
   fi
-  DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_COVER="$cover"; DELTA_BASE="$base_sha"
+  DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_BASE="$base_sha"
   DELTA_EV_OK=1
   printf 'delta %s..%s on %s#%s, %s, %s authored commit(s), digest %s\n' \
     "${from:0:12}" "${to:0:12}" "$REPO" "$PR" "$DELTA_KIND" "$n_authored" "${DELTA_DIGEST:0:12}"
