@@ -3554,7 +3554,21 @@ export function wtIsPathShapedScriptWord(word) {
     if (ch === "[") {
       const sl = s.indexOf("/", i + 1);
       let e = LAST_CLOSE;
-      if (sl >= 0 && e > sl) e = s.lastIndexOf("]", sl);
+      if (sl >= 0 && e > sl) {
+        const inComponent = s.lastIndexOf("]", sl);
+        // ⛔ WHEN NO CLOSER SITS INSIDE THIS COMPONENT THERE IS NOTHING TO BOUND, AND THE JUMP MUST
+        // STILL HAPPEN (#3333 review cycle-2, F1 — measured, and it was a P0 fail-OPEN this bound
+        // introduced in its first cut). Falling through to `e = -1` and then `if (e > i)` left the loop
+        // VISITING the group's bytes as ordinary bytes, so every rejecting byte rule could fire on
+        // them — `a/[/^/[0]` hit the `^` component anchor, `a/[b/c/'${x'/undo]z/d.sh` hit the
+        // unbalanced-`${` refusal, `a/[/x'|'y/undo]z/w.sh` hit the alphabet. All three are real paths a
+        // shell expands and execs, all three were **true on `origin/main`**, and through the real
+        // handler they went ALLOW where main BLOCKed (end-to-end: uncommitted work destroyed). The
+        // greedy jump `origin/main` performed was correct here — it is only the case where a closer
+        // DOES sit inside the component (`q[0]w/undo[x].sh`) that the greedy jump swallowed a `/`.
+        // So: bound the jump when a closer is in reach, otherwise keep main's jump unchanged.
+        if (inComponent > i) e = inComponent;
+      }
       out += PH; if (e > i) i = e; continue;
     }
     if (ch === "{") { const e = LAST_BRACE > i ? s.indexOf("}", i + 1) : -1; out += PH; if (e > i) i = e; continue; }

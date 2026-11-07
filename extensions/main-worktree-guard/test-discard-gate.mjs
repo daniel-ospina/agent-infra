@@ -1935,6 +1935,15 @@ async function partB() {
     mkdirSync(bracketDir, { recursive: true });
     write(join(bracketDir, "undox.sh"), "git checkout -- dirty.txt\n");
     execSync(`chmod +x ${JSON.stringify(join(bracketDir, "undox.sh"))}`);
+    // ⛔ F1 (#3333 review cycle-2) — an UNMATCHED `[` must still JUMP. The bound above shipped in a first
+    // cut that assigned `e = -1` when no closer sat in the current component, and then did not jump at
+    // all — so the loop VISITED the group's bytes and the `^` anchor / unbalanced-`${` refusal / alphabet
+    // each deleted the word. Both directories below are ordinary expanded paths; main BLOCKed them and
+    // that cut ALLOWed them, destroying uncommitted work end-to-end.
+    const caretDir = join(wt, "a", "[", "^");
+    mkdirSync(caretDir, { recursive: true });
+    write(join(caretDir, "0"), "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${JSON.stringify(join(caretDir, "0"))}`);
     const deleted1228 = [
       ["P1-1 a `$`-terminated component addressed through a glob, after a separator", "true && st*$/undo.sh"],
       ["P1-1 …as a `-c` payload", "bash -c 'st*$/undo.sh'"],
@@ -1945,7 +1954,22 @@ async function partB() {
       ["P1-2 …as a `-c` payload", "bash -c 'q[0]w/undo[x].sh'"],
       ["P1-2 …through `eval`", "eval 'q[0]w/undo[x].sh'"],
       ["P1-2 …absolute", `true && '${join(wt, "q[0]w/undo[x].sh")}'`],
+      ["F1 an UNMATCHED `[` before a `^` component, after a separator", "true && a/[/^/[0]"],
+      ["F1 …through `eval`", "eval 'a/[/^/[0]'"],
     ];
+    for (const [why, cmd] of deleted1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(cmd, wt);
+      expectTrue(`B13d: ${why} → BLOCKED (${cmd})`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+    }
+    // ⛔ F1's other two shapes are PREDICATE-level here on purpose: they need directory/quoting fixtures
+    // (`[b`, a quoted `${`) whose SHELL quoting would be the thing under test rather than the grammar, so
+    // the assertion is made on the predicate where the failure actually lived (each was `false` on the
+    // F1 cut and `true` on `origin/main`). All three are real expanded paths a shell executes.
+    for (const f1 of ["a/[b/c/'${x'/undo]z/d.sh", "a/[/x'|'y/undo]z/w.sh"]) {
+      expectTrue(`B13d: F1 an unmatched \`[\` does not expose its bytes to a rejecting rule (${f1})`,
+        cg.wtIsPathShapedScriptWord(f1) === true);
+    }
     for (const [why, cmd] of deleted1228) {
       write(join(wt, "dirty.txt"), "MUTANT\n");
       const r = await bash(cmd, wt);
@@ -2918,13 +2942,30 @@ if (process.argv.includes("--mutations")) {
       // inside the current component is the fix; removing the bound reproduces the fail-open.
       "the `[` closer hunt is bounded to the CURRENT component, so it cannot swallow a `/` (#3333 c2 P1-2)",
       [[
-        String.raw`      if (sl >= 0 && e > sl) e = s.lastIndexOf("]", sl);`,
-        String.raw`      if (false) e = s.lastIndexOf("]", sl);`,
+        String.raw`        if (inComponent > i) e = inComponent;`,
+        String.raw`        if (false) e = inComponent;`,
       ]],
       (m) => m.wtIsPathShapedScriptWord("q[0]w/undo[x].sh"),
       true,
       false,
       "the `/` between two bracket groups is swallowed into one placeholder again",
+    ],
+    [
+      // ⛔ THE F1 PAIR (#3333 review cycle-2). The bind above shipped in a first cut that, when NO closer
+      // sat inside the current component, assigned `e = -1` and then did not jump at all — leaving the
+      // loop to VISIT the group's bytes, where the `^` anchor, the unbalanced-`${`/backtick refusals and
+      // the alphabet could each delete the word. `a/[/^/[0]` and `a/[b/c/'${x'/undo]z/d.sh` were real
+      // expanded paths that went ALLOW here and BLOCK on `origin/main`, destroying uncommitted work
+      // end-to-end. The fallback restores main's jump for that case; neutering it must reproduce F1a.
+      "an unmatched `[` STILL jumps when no closer is in reach, so its bytes reach no rejecting rule (#3333 c2 F1)",
+      [[
+        String.raw`        if (inComponent > i) e = inComponent;`,
+        String.raw`        e = inComponent;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("a/[/^/[0]"),
+      true,
+      false,
+      "an unmatched `[` falls through to the next byte and the `^` component anchor deletes a real path again",
     ],
     [
       // ⛔ THE P2-1 PAIR (#3333 review cycle-2, measured): the prologue accept was the cycle-7 P0 fix
