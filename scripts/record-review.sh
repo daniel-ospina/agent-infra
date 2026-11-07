@@ -1511,7 +1511,7 @@ delta_git_neutral() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _straw="" _stcmp="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _tipscan="" _tref="" _top="" _tiprel=0 _tisref="" _elhs="" _erhs="" _elsha="" _ersha="" _eranges="" _drivers="" _dg_rc=0 _gitdir="" _gd_rc=0 _commondir="" _cd_rc=0 _attr_amb="" _wt_amb="" _ls_rc=0 _st_amb="" _st_rc=0 _ad="" _adrift="" _adr_rc=0
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -2488,24 +2488,87 @@ $m"
     # tip-relative only when it SELECTS A PARENT/ANCESTOR — not a peel, not `^0` — and an operand is
     # a ref only when it RESOLVES: `HEAD`/`@` by name, a hex run only when `rev-parse` finds it (the
     # same authority the parser arm above already uses).
-    # ⛔ `HEAD@{N}` IS A REVISION EXPRESSION AND IS COVERED HERE, so it is no longer the residual the
-    # fourteenth cycle declared — the reason given for that residual ("matching `{` after a hex run
-    # would FALSE-BLOCK a hex literal followed by a brace block") is FALSE: a reflog position needs
-    # the `@` BEFORE the brace, and `deadbeef{2}` has none. It is tested on its own, so no
-    # hex-literal shape can reach it. `@{upstream}` stays residual (it is not tip-relative).
+    # ⛔ THAT FIX WAS STILL A SPELLING TEST IN TWO PLACES, AND THIS IS THE MEANING TEST (sixteenth
+    # review cycle, two P1s + one P2 — MEASURED at 1f32d7571, i.e. in the previous cycle's own fix).
+    # (1) `case "$_top" in '^{'*|'^0') continue ;; esac` abandoned the REST OF THE MATCH, not just the
+    #     peel: for `HEAD^{commit}~1..HEAD` it dropped `HEAD^{commit}`, rescanned from `~1..HEAD`, found
+    #     no left operand, left `_tiprel` at 0 and recorded rc 0 with a SIGNED `clean` — a REGRESSION
+    #     from both 2aba1583a and the pre-fourteenth-cycle arm, which refuse it. The same `continue`
+    #     waved through `^{/<text>}`, which is not a peel at all: gitrevisions(7) — `<rev>^{/<text>}`
+    #     "selects the youngest commit whose message matches … and that is reachable from `<rev>`" —
+    #     i.e. an ANCESTOR (`git rev-parse 'HEAD^{/commit number 2}'` returns the parent; measured), so
+    #     the sentence that called the whole `^{…}` family identity was measurably false, and it was
+    #     the justification a later reader would trust.
+    # (2) `rev-parse "${_tref}^{commit}"` as a SUFFICIENT test re-opened the prose false block the
+    #     fifteenth cycle closed: a literal that merely COLLIDES with a prefix (`0xff63` — measurably
+    #     the base's own 4-char prefix here) refused an artifact that stated the correct range and
+    #     nothing else. And the `@{N}` check made its ref OPTIONAL, so `stash@{0}` — not the tip, not
+    #     even a range — was refused with a sentence saying "RELATIVE TO THE TIP".
+    # So: the operand must be a WHOLE TOKEN (a run inside `stash@{0}`, or after `0x`/`0X`, is not a
+    # ref), a 4-6 char PURE-DECIMAL run is the prose window this file already excludes (`1351`/`2024`/
+    # `4000` — a 7+ run is a real sha and a 4-6 one with a hex letter is a real short sha), and the
+    # SELECTOR CHAIN is joined so a peel cannot hide the `~N`/`^N`/`@{N}` behind it. Only a chain that
+    # can select an ELDER commit narrows: `^{<type>}`, `^{}`, `^0`, `~0` and `@{0}` are the identity,
+    # `^{/<text>}` is an ancestor selector, and a reflog position is covered only when its ref is the
+    # tip or a sha — `main@{1}` stays inside the declared SYMBOLIC-REF residual above, not a refusal.
+    # `HEAD@{N}` IS no longer residual (the reason the fourteenth cycle gave for that "matching `{`
+    # after a hex run would false-block a hex literal followed by a brace block" is FALSE: a reflog
+    # position needs the `@` BEFORE the brace and `deadbeef{2}` has none); `@{upstream}` still is.
     _tipscan="$_claim"; _tiprel=0
-    while [[ "$_tipscan" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*(~[0-9]*|\^\{[^}]*\}|\^[0-9]*) ]]; do
-      _tref="${BASH_REMATCH[1]}"; _top="${BASH_REMATCH[2]}"
+    while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[0-9]+\})+) ]]; do
+      _tref="${BASH_REMATCH[2]}"; _top="${BASH_REMATCH[3]}"
       _tipscan="${_tipscan#*"${BASH_REMATCH[0]}"}"
-      case "$_top" in '^{'*|'^0') continue ;; esac
+      _tisref=1
+      case "$_tref" in
+        [Hh][Ee][Aa][Dd]|@) : ;;
+        *)
+          # A 4-6 char run that is PURE DECIMAL is prose, exactly as the token scan above decides;
+          # a 7+ run is sha-shaped and a 4-6 one with a hex letter is a real short sha.
+          if [ "${#_tref}" -le 6 ]; then
+            case "$_tref" in *[!0-9]*) : ;; *) _tisref=0 ;; esac
+          fi
+          ;;
+      esac
+      [ "$_tisref" = 1 ] || continue
+      # An IDENTITY-ONLY chain narrows nothing and must not be refused (20h53/20h53b) — but the test
+      # is on the WHOLE chain, so the `continue` can no longer abandon the selector behind a peel.
+      [[ "$_top" =~ ^((~0|@\{0\}|\^0|\^\{[^}/]*\})+)$ ]] && continue
       case "$_tref" in
         [Hh][Ee][Aa][Dd]|@) _tiprel=1; break ;;
       esac
       delta_git "$root" rev-parse --verify "${_tref}^{commit}" >/dev/null 2>&1 && { _tiprel=1; break; }
     done
-    if [[ "$_claim" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd])?@\{[0-9]+\} ]]; then
-      _tiprel=1
-    fi
+    # ⛔ AN EMPTY RANGE IS THE NARROWEST CLAIM THERE IS, and an identity chain must not launder one: a
+    # peel in FRONT of the dots hides the tip from the loop above, so `<head>^{commit}..<head>`,
+    # `<head>^0..<head>` and plain `<head>..<head>` all state a range whose two endpoints are the SAME
+    # commit — zero commits reviewed, offered as the evidence for a range that has some (MEASURED at
+    # 1f32d7571: rc 0, record written). Resolved and COMPARED rather than spelled out, so no notation
+    # of the endpoint is privileged, and only an empty range AT the attested head is refused (an empty
+    # range elsewhere is the parser's business, not a claim about this head).
+    # ⛔ EVERY STATED RANGE, NOT JUST THE FIRST (measured while writing 20h59: `[[ =~ ]]` yields ONE
+    # match, and the ordinary artifact states the HONEST range first — so a single match measured that
+    # pair and stopped, and the empty range behind it was never resolved at all. The same "check every
+    # occurrence" rule the parser arm above already carries, for the same reason.)
+    _eranges="$_claim"
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((\^0|\^\{[^}/]*\}|@\{0\})*)[[:space:]]*\.\.[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
+      _elhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; _erhs="${BASH_REMATCH[5]}"
+      _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
+      case "${_elhs:0:4}" in
+        [Hh][Ee][Aa][Dd]) _elhs="HEAD${_elhs:4}" ;;
+      esac
+      case "$_erhs" in
+        [Hh][Ee][Aa][Dd]) _erhs='HEAD' ;;
+      esac
+      _elsha="$(delta_git "$root" rev-parse --verify "${_elhs}^{commit}" 2>/dev/null || true)"
+      [ -n "$_elsha" ] || continue
+      case "$_erhs" in
+        @) _ersha="$(delta_git "$root" rev-parse --verify '@^{commit}' 2>/dev/null || true)" ;;
+        *) _ersha="$(delta_git "$root" rev-parse --verify "${_erhs}^{commit}" 2>/dev/null || true)" ;;
+      esac
+      if [ "$_elsha" = "$_ersha" ] && [ "$_elsha" = "$to" ]; then
+        _tiprel=1; break
+      fi
+    done
     if [ "$_tiprel" = 1 ]; then
         echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (<ref>~N / <ref>^N / <ref>@{N}) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
         echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
