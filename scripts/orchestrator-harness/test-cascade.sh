@@ -772,8 +772,13 @@ ESCBLK="$TMP/escape-blk.sh"
 awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(f) exit}' "$ORCH" > "$ESCBLK"
 ck "the [drain-escape] block was FOUND in orch-loop.sh (a marker rename would otherwise skip 14e)" \
    "$([ -s "$ESCBLK" ] && grep -q 'pl_escape_open' "$ESCBLK" && echo yes || echo no)" "yes"
-ck "…and it does NOT execute its own words: no double-quoted echo in the block contains a backtick" \
-   "$(grep -q 'echo "[^"]*`' "$ESCBLK" && echo yes || echo no)" "no"
+# ⛔ COMMAND SUBSTITUTION IS LIVE IN **ANY** DOUBLE-QUOTED WORD, NOT ONLY AFTER `echo` (review round 7,
+# P2). A first version of this pin grepped `echo "` only — so re-introducing the defect through the
+# block's own `printf` log writer (which is how the OTHER line in this block writes) stayed GREEN over an
+# executable backtick. The comment lines are stripped first: the block's comments QUOTE the historical
+# defect, so a naive `"[^"]*`' grep false-reds on them.
+ck "…and it does NOT execute its own words: no CODE line carries a backtick inside a double-quoted word" \
+   "$(sed 's/^[[:space:]]*#.*$//' "$ESCBLK" 2>/dev/null | grep -q '"[^"]*`' && echo yes || echo no)" "no"
 ck "…and it carries the SLOT GRANT (the fix; without it the escape records what it cannot spend)" \
    "$(grep -q 'DRAIN ESCAPE GRANTS' "$ESCBLK" && echo yes || echo no)" "yes"
 # The block is shipped shell, so it must PARSE before it is driven: a stray `fi` would abort the
