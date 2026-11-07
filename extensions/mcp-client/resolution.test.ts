@@ -38,6 +38,28 @@ function section(name: string) {
   console.log(`\n${name}:`);
 }
 
+// ── Hermetic-suite guard ─────────────────────────────────────────
+// ⛔ THE `connectAllLayers` SECTION HEADER'S INVARIANT, ENFORCED FOR EVERY MANAGER-DRIVEN TEST IN THIS
+// FILE, not just the fixtures someone remembered to annotate. A manager-driven fixture that omits `lazy`
+// is classified EAGER by `classifyServers` and handed to `connectServer`, which then opens a REAL
+// outbound connection — measured: two such fixtures dialled host `x:443` twice each under
+// `EAGER_CONNECT_MAX_ATTEMPTS`. Pinning that per fixture leaves the hole open for every other one
+// (measured: removing `lazy` from `keep`, `both` and `fine` left the suite 63/0 green while netspy
+// logged `ok:443`, `ok.example:443`, `fine:443`), and an `ok(eager.length === 0)` per test still misses
+// the `PI_MCP_SERVERS` forced-eager path. So count the ONE call that can dial anything instead: if any
+// fixture reaches `connectServer`, this records it and the end-of-suite assertion below goes red.
+const CONNECT_CALLS: string[] = [];
+const realConnectServer = (McpServerManager.prototype as unknown as Record<string, unknown>)
+  .connectServer as (...args: unknown[]) => unknown;
+(McpServerManager.prototype as unknown as Record<string, unknown>).connectServer = function (
+  this: unknown,
+  name: string,
+  ...rest: unknown[]
+) {
+  CONNECT_CALLS.push(name);
+  return realConnectServer.apply(this, [name, ...rest]);
+};
+
 // ── Temp helpers ─────────────────────────────────────────────────────────
 const TMP_DIRS: string[] = [];
 function tempDir(prefix: string): string {
@@ -705,10 +727,12 @@ await test("neither layer → both null (nothing invented)", () => {
 // classified EAGER — each attempting a real outbound connection to host `x` under
 // `connectEagerWithRetry` (2 attempts × the 15s default timeout, a network error being retryable). An
 // assertion that depends on the runner's resolver or proxy is not hermetic. A NEW fixture here that
-// CONSTRUCTS a manager and declares a truthy `url`/`command` MUST carry `lazy: true` — that is now
-// asserted for `broken` and `sseType` below, so deleting `lazy` from either one goes RED instead of
-// silently restoring live traffic. A test that only inspects the MERGED config (or the layer read) never
-// reaches `connectServer` and needs no `lazy`; scope the rule to the manager-driven tests.
+// CONSTRUCTS a manager and declares a truthy `url`/`command` MUST carry `lazy: true` — and that is now
+// ENFORCED FOR EVERY TEST IN THIS FILE, not just the fixtures annotated below: the `CONNECT_CALLS` guard
+// installed at the top counts every `connectServer` call and the end-of-suite assertion fails if any
+// fixture reached one, so deleting `lazy` from ANY manager-driven fixture goes RED instead of silently
+// restoring live traffic (verified: it stays green if only `broken`/`sseType` were pinned). A test that
+// only inspects the MERGED config (or the layer read) never reaches `connectServer` and needs no `lazy`.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 section("connectAllLayers — the layer→argument binding and its failure modes");
 
@@ -1397,6 +1421,14 @@ await test("non-`mcpServers` top-level keys survive from BOTH layers (base is no
 });
 
 // ── Cleanup + summary (LAST — after every fixture is created) ────────────
+(McpServerManager.prototype as unknown as Record<string, unknown>).connectServer = realConnectServer;
+await test("no fixture in this suite reached `connectServer` (every manager-driven fixture is `lazy`)", () => {
+  deepEqual(
+    CONNECT_CALLS,
+    [],
+    "an EAGER fixture got past `classifyServers` and would have opened a real socket — give it `lazy: true`"
+  );
+});
 for (const dir of TMP_DIRS) {
   try {
     rmSync(dir, { recursive: true, force: true });

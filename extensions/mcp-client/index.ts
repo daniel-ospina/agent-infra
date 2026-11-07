@@ -654,21 +654,31 @@ function isValidServerName(name: string): boolean {
  * therefore reverse that ruling AND zero a self-hosted config the installer certifies — so an
  * unrecognised `type` only earns a warning, never a drop.
  *
- * ⛔ OVERRIDES: pi's `sse`-rejection and skip-invalid-entries rules — `docs/mcp.md:79` ("`sse` is
- * rejected") and `docs/mcp.md:82` ("Invalid entries are reported and skipped without preventing other
- * servers from connecting") — this client WARNS and KEEPS such an entry instead of rejecting or skipping
- * it. Both citations are FULL paths on purpose: a bare `:80` pointed at "`command` is one executable and
+ * ⛔ OVERRIDES: pi's ENFORCEMENT of a `type` that disagrees with the entry — `docs/mcp.md:78` ("When
+ * present, `type` must be `stdio`, `http`, or `streamable-http`") plus `docs/mcp.md:79` ("`sse` is
+ * rejected") and `docs/mcp.md:82` ("Invalid entries are reported and skipped"). pi makes a disagreeing
+ * `type` DISQUALIFYING, not merely discouraged: its validator accepts a `url` entry only for
+ * `type ∈ {undefined, http, streamable-http}`, a `command` entry only for `type ∈ {undefined, stdio}`,
+ * rejects `type: "sse"` outright, and otherwise reports `needs either "command" (stdio) or "url"
+ * (streamable HTTP)` (measured: pi 1.2.0 `dist/core/mcp-servers.js`). This client keeps such an entry
+ * and only WARNS, so `type` can never select, refuse or rewrite one here.
+ *
+ * ⛔ THE DEPARTURE IS THE HANDLING OF A BAD `type`, NOT THE DISPATCH RULE. pi dispatches on `url`/
+ * `command` exactly as this client does ("A `command` selects stdio and a `url` selects streamable
+ * HTTP", the FIRST sentence of `docs/mcp.md:78`); what it adds is the second sentence of that same
+ * line, enforced by rejection. Do not read the shared dispatch rule as agreement on `type`, and do not
+ * cite `docs/mcp.md:78` for only half of what it says — that half-reading is what let an earlier
+ * revision of this marker claim the two clients agreed here.
+ *
+ * Citations are FULL paths on purpose: a bare `:80` once pointed at "`command` is one executable and
  * `args` contains its arguments", i.e. at a line about `args`, so a reader checking the marker's own
- * citation found no such rule and could only conclude the marker was wrong.
- * ⛔ Do not cite `:78` as the default being overridden: that line says "A `command` selects stdio and
- * a `url` selects streamable HTTP", i.e. pi dispatches on `url`/`command` exactly as this client does,
- * so the two agree there and a reader who follows a `:78` citation concludes the override is overstated.
- * The disagreement is the invalid-`type` HANDLING above, not the dispatch rule. Reason the departure is
- * kept: the sibling ruling in `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/cell-install.sh` is that
- * a self-hosted `type: "sse"` config WORKS as written, so refusing or rewriting it would zero a config
- * the installer certifies. ⛔ Read this line before "correcting" the behaviour back to the platform
- * default — that is a reopen of that decision, not a bug fix. The absence of this marker is what let an
- * earlier revision of the PR that introduced this file describe the opposite behaviour in its own body.
+ * citation found no such rule and could only conclude the marker was wrong. Reason the departure is
+ * kept: the sibling ruling in `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/cell-install.sh` is
+ * that a self-hosted `type: "sse"` config WORKS as written, so refusing or rewriting it would zero a
+ * config the installer certifies. ⛔ Read this line before "correcting" the behaviour back to the
+ * platform default — that is a reopen of that decision, not a bug fix. The absence of this marker is
+ * what let an earlier revision of the PR that introduced this file describe the opposite behaviour in
+ * its own body.
  */
 const RECOGNISED_TYPES = new Set(["stdio", "http", "streamable-http"]);
 
