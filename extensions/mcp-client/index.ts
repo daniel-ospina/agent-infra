@@ -563,40 +563,87 @@ function expandExpr(str: string): string {
 }
 
 /**
- * Merge the hub's BASE layer with a repo's DELTA: the repo wins on a name collision.
+ * Merge the hub's BASE layer with a repo's DELTA — **per server, then PER FIELD**: the repo wins
+ * every field it sets and inherits every field it omits.
  *
- * The repo is spread LAST on purpose: it may pin a different URL or command for its own copy of a
- * server, and the base must never shadow what a repo declares — the base is machine-local, so
- * letting it override a repo would make one box's config change what a checked-out repo means.
+ * ⛔ A NAME-LEVEL REPLACEMENT WAS THE BUG (#3614 review). Spreading at the server-name level made an
+ * override entry a whole-entry REPLACEMENT, so the two shapes this codebase and its own docs invite
+ * both destroyed the base entry:
  *
- * Pure and exported so the ordering is pinned by a test rather than by reading the spread.
+ *   {"tortoise": {"url": "http://localhost:8000/mcp"}}   ← docs/quickstart-selfhosted.md's instruction
+ *     name-level  → {url} — `headers` (the Authorization bearer) GONE → 401, and `lazy: true` GONE
+ *                   → the server is attempted EAGERLY at every session start on memory-constrained
+ *                   cells, which the base entry's own `_comment` records as a fleet-wide failure.
+ *   {"tortoise": {"timeoutMs": 40000}}                  ← the recovery hint at connectAll's failure log
+ *     name-level  → {timeoutMs} — no `command`, no `url` → "has neither 'command' nor 'url'",
+ *                   permanently unspawnable, and the `mcp_load` in the same message fails too.
+ *
+ * Field-level merge matches the platform's own documented precedence for a project entry over a
+ * user-level one — it "keeps the rest, including env, headers, and auth" (pi `docs/mcp.md`). The
+ * recorded decision in #3612 is about PRECEDENCE (the repo wins), not granularity; this does not
+ * reverse it, it makes "DELTA" true at the level an operator actually edits.
+ *
+ * The base must never shadow what a repo declares: it is spread FIRST, so every field the repo sets
+ * wins — the base is machine-local, and letting it override a repo would make one box's config
+ * change what a checked-out repo means.
+ *
+ * Pure and exported so the ordering is pinned by a test rather than by reading a spread.
  */
 export function mergeMcpLayers(
   base: McpJson | null,
   repo: McpJson | null,
 ): Record<string, McpServerConfig> {
-  return {
-    ...((base?.mcpServers ?? {}) as Record<string, McpServerConfig>),
-    ...((repo?.mcpServers ?? {}) as Record<string, McpServerConfig>),
-  };
+  const merged: Record<string, McpServerConfig> = {};
+  for (const layer of [base, repo]) {
+    for (const [name, entry] of Object.entries(layer?.mcpServers ?? {})) {
+      // A non-object entry is not a server, and it must not reach classifyServers, which reads
+      // `cfg.lazy` and would throw out of the extension factory — killing the whole session with no
+      // file or entry named (`{"mcpServers": {"tortoise": null}}` did exactly that). `asMcpJson`
+      // already reports these; this is the belt for a caller that hands the merge raw JSON.
+      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
+      merged[name] = { ...(merged[name] ?? {}), ...(entry as McpServerConfig) };
+    }
+  }
+  return merged;
 }
 
-export /**
+/**
  * A parsed `.mcp.json` must be a JSON OBJECT carrying an `mcpServers` object.
  *
  * `JSON.parse` admits `null`, arrays and scalars, and every one of those used to pass through as a
  * "readable" layer that then contributed zero servers with NO message — so `"null"` in a repo file
- * silently produced the base's config instead (measured, #3612 review). A layer that is not a config
+ * silently produced the base's config instead (measured, #3614 review). A layer that is not a config
  * is not a silent zero; it is a stated failure.
+ *
+ * Entries inside `mcpServers` are validated too, and a non-object entry is DROPPED with a warning
+ * rather than passed on: `{"mcpServers": {"tortoise": null}}` used to survive this validator and
+ * then throw `TypeError: Cannot read properties of null (reading 'lazy')` out of the extension
+ * factory, which ends the session with no file, entry or cause named.
+ *
+ * Non-`mcpServers` top-level keys are preserved — the caller spreads them as the layer's own config.
  */
-function asMcpJson(value: unknown): McpJson | null {
+function asMcpJson(value: unknown, label: string): McpJson | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
-  const servers = (value as { mcpServers?: unknown }).mcpServers;
-  if (!servers || typeof servers !== "object" || Array.isArray(servers)) return null;
-  return value as McpJson;
+  const rawServers = (value as { mcpServers?: unknown }).mcpServers;
+  if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return null;
+
+  const servers: Record<string, McpServerConfig> = {};
+  for (const [name, entry] of Object.entries(rawServers as Record<string, unknown>)) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
+      // `null` is the tempting way to say "not here" — and there is no tombstone in this schema
+      // (#3612), so say why the entry was dropped instead of crashing the session.
+      console.log(
+        `[mcp-client] WARN: ${label} entry "${name}" is not an object — dropped. ` +
+          `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`
+      );
+      continue;
+    }
+    servers[name] = entry as McpServerConfig;
+  }
+  return { ...(value as Record<string, unknown>), mcpServers: servers } as McpJson;
 }
 
-interface McpConfigPaths {
+export interface McpConfigPaths {
   /** `~/.pi/agent/.mcp.json` — the hub's shared layer. Never ships, may be absent. */
   base: string | null;
   /** The first `.mcp.json` walking up from the cwd — the repo's delta. May be absent. */
@@ -806,10 +853,12 @@ export class McpServerManager {
   /**
    * Connect from BOTH layers: the hub's base config underneath, the repo's `.mcp.json` over it.
    *
-   * ⛔ MERGE ORDER IS `{ **base, **repo }` — the repo is LAST, so a repo entry of the same name WINS
-   * (it may pin a different URL or command for its own copy of a server). The base must never be able
-   * to shadow what a repo declares: `~/.pi/agent/.mcp.json` is machine-local, and letting it override
-   * a repo would make one box's config change what a checked-out repo means.
+   * ⛔ MERGE ORDER IS `{ **base, **repo }` — the repo is LAST, so a repo field WINS against the base's,
+   * per server and per field (see `mergeMcpLayers`: an override entry that sets only `url` keeps the
+   * base's `headers`, `lazy` and `timeoutMs`; setting the whole entry is what used to destroy them).
+   * The base must never be able to shadow what a repo declares: `~/.pi/agent/.mcp.json` is
+   * machine-local, and letting it override a repo would make one box's config change what a
+   * checked-out repo means.
    *
    * ⛔ A LAYER THAT FAILS TO READ IS SAID SO, BY NAME. A broken repo file must not take the hub's
    * servers away with it — so the surviving layer is still used — but the base is machine-local, so
@@ -820,10 +869,12 @@ export class McpServerManager {
    * Read-side only: nothing is written, and `setup.sh`'s `{**dst, **src}` policy for the base file is
    * untouched.
    *
-   * ⛔ `DELTA` IS ONE-WAY. A repo can ADD a server or OVERRIDE one of the base's; it cannot REMOVE a
-   * base server, because the merge is a two-way spread and `McpServerConfig` has no `disabled` field.
-   * A base server that is wrong or unspawnable for one repo cannot be vetoed from that repo — see
-   * #3612 for the tombstone (`"<name>": { "disabled": true }`) that would close this.
+   * ⛔ `DELTA` IS ONE-WAY. A repo can ADD a server, or OVERRIDE fields of one of the base's; it
+   * cannot REMOVE a base server, because there is no tombstone in this schema and `McpServerConfig`
+   * has no `disabled` field. A base server that is wrong or unspawnable for one repo cannot be vetoed
+   * from that repo — see #3612 for the tombstone (`"<name>": { "disabled": true }`) that would
+   * close this. Writing `"<name>": null` is NOT that: it is dropped with a warning (see `asMcpJson`),
+   * and the base's entry still applies.
    */
   async connectAllLayers(paths: McpConfigPaths): Promise<void> {
     const read = async (p: string | null, layer: "base" | "repo"): Promise<McpJson | null> => {
@@ -848,7 +899,7 @@ export class McpServerManager {
         );
         return null;
       }
-      const config = asMcpJson(parsed);
+      const config = asMcpJson(parsed, `${layer} layer ${p}`);
       if (!config) {
         // `JSON.parse` admits `null`, arrays and scalars. Without this arm they read as a HEALTHY
         // layer that contributes zero servers, with nothing logged (measured: `"null"` in a repo
@@ -946,7 +997,10 @@ export class McpServerManager {
         // and registers the tools for the rest of the session.
         console.log(
           `[mcp-client] MCP server '${serverName}' unavailable — continuing without it. ` +
-            `Recover with: mcp_load ${serverName} (or raise "timeoutMs" in .mcp.json for a slow cold start).`
+            // Only the fields named here change — `mergeMcpLayers` is per-field, so an entry that sets
+            // just `timeoutMs` keeps the base's `url`/`headers`/`lazy`. A whole-entry override used to
+            // be the fix this line recommended, and it made the server unspawnable.
+            `Recover with: mcp_load ${serverName} (or raise "timeoutMs" in .mcp.json for a slow cold start — set only that field).`
         );
       } else {
         succeeded++;

@@ -176,9 +176,10 @@ await test("parses as valid config with the expected server set", () => {
   // stdio is caught by CI rather than by a fleet of lanes writing GRAPH-UNREACHABLE.
   equal(tortoise.type, "http", "tortoise is the hosted HTTP server");
   equal(tortoise.url, "https://api.premiselabs.co/mcp/", "tortoise points at the hosted endpoint");
-  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS for every agent-infra lane: mcp-client takes
-  // the FIRST `.mcp.json` walking up from the lane's cwd (then falls back to ~/.pi/agent/.mcp.json),
-  // so this file decides what an agent-infra lane connects to. Its own `_comment` claims a
+  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS the `tortoise` name for every agent-infra
+  // lane: both layers are now read and MERGED (#3612), the repo's entry winning per field, so this
+  // file — not the template — decides an agent-infra lane's `tortoise`; the template's copy is what a
+  // repo WITHOUT this file receives. Its own `_comment` claims a
   // byte-identical shape to the template's — and NOTHING checked that, so a revert here would
   // return agent-infra lanes to the legacy server while `cell-install --verify` still certified the
   // base config. Asserted for the fields a lane actually needs.
@@ -323,6 +324,54 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
   ok(merged.onlyBase, "and the base's other servers are not lost");
 });
 
+await test("PER FIELD: an override that sets only `url` KEEPS the base's headers/lazy/timeoutMs", () => {
+  // This is the shape `docs/quickstart-selfhosted.md` tells a self-host user to write, and the shape
+  // the connect-failure log recommends for a slow start. A name-level spread dropped the auth header
+  // (→ 401) and `lazy: true` (→ an EAGER connect at every session start on memory-constrained cells)
+  // or left the entry with no `command`/`url` at all (→ permanently unspawnable).
+  const merged = mergeMcpLayers(
+    {
+      mcpServers: {
+        tortoise: {
+          type: "http",
+          url: "https://api.premiselabs.co/mcp/",
+          headers: { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" },
+          lazy: true,
+          timeoutMs: 60000,
+        },
+      },
+    } as never,
+    { mcpServers: { tortoise: { url: "http://localhost:8000/mcp" } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.url, "http://localhost:8000/mcp", "the field the repo DID set wins");
+  deepEqual(t?.headers, { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" },
+    "the inheriting header survives — without it the client sends an empty bearer and gets 401");
+  equal(t?.type, "http", "`type` is inherited, so the entry stays a valid http server");
+  equal(t?.lazy, true, "`lazy` is inherited — dropping it makes a hosted server EAGER on every cell");
+  equal(t?.timeoutMs, 60000, "`timeoutMs` is inherited");
+});
+
+await test("PER FIELD: a `timeoutMs`-only override still has a url, so the server stays spawnable", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", timeoutMs: 60000 } } } as never,
+    { mcpServers: { tortoise: { timeoutMs: 40000 } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.timeoutMs, 40000, "the raised budget applies");
+  equal(t?.url, "https://api.premiselabs.co/mcp/", "and the url survives — otherwise: neither 'command' nor 'url'");
+});
+
+await test("a non-object server entry is dropped, never handed to classifyServers", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { url: "https://x/mcp" } } } as never,
+    { mcpServers: { tortoise: null, ghost: 42 } } as never,
+  );
+  equal((merged.tortoise as Record<string, unknown> | undefined)?.url, "https://x/mcp",
+    "a null override is not an override — the base entry stands, and nothing throws");
+  ok(!("ghost" in merged), "a scalar entry is not a server");
+});
+
 await test("base ONLY still resolves (the old fallback path, preserved)", () => {
   const cwd = tempDir("mcp-layers-baseonly-");
   const home = tempDir("mcp-layers-baseonly-home-");
@@ -455,6 +504,35 @@ await test("a repo layer that parses to `null` is a STATED failure, never a sile
   ok(
     logs.some(l => l.includes("WARN") && l.includes("repo layer") && l.includes("NOT in effect")),
     `\`null\` is not a config — it must be reported, not read as an empty healthy layer — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a `null` server ENTRY does not crash the session — it is dropped, with a warning", async () => {
+  // `{"mcpServers": {"tortoise": null}}` used to pass asMcpJson and then throw
+  // `TypeError: Cannot read properties of null (reading 'lazy')` out of the extension factory,
+  // ending the session with no file, entry or cause named.
+  const repoDir = tempDir("mcp-bind-nullentry-repo-");
+  const homeDir = tempDir("mcp-bind-nullentry-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: { tortoise: null, ghost: 42 } });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.tortoise, "the base's entry still applies — `null` is not a removal");
+  ok(!("ghost" in cfg.mcpServers), "a scalar entry is not a server");
+  ok(
+    logs.some(l => l.includes("WARN") && l.includes('entry "tortoise"') && l.includes("dropped")),
+    `a dropped entry must be named, and say removal is impossible — got:\n${logs.join("\n")}`
   );
 });
 

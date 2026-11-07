@@ -164,10 +164,17 @@ machine's pi instance.
   up from your working directory to the repo's git top-level, AND the base config
   at `~/.pi/agent/.mcp.json` — **both** are read and **merged**, so a repo's
   `.mcp.json` is a DELTA on the base, not a replacement for it. On a name
-  collision the **repo's entry wins** (it may pin a different URL or command for
-  its own copy of a server). The base is machine-local and is never shipped, so
-  this is also how an INTERNAL server reaches every repo without being written
-  into a product repo's tracked config. Base servers: brave-search,
+  collision the **repo's entry wins FIELD BY FIELD**: set only the fields that
+  differ and the base's other fields are kept. So `{"tortoise": {"url":
+  "http://localhost:8000/mcp"}}` points one repo at its own daemon **and keeps**
+  the base's `headers` (the bearer token), `lazy: true` and `timeoutMs`; a
+  whole-entry override would drop them, leaving an unauthenticated client that is
+  attempted eagerly at every session start. To change just the connect budget,
+  `{"tortoise": {"timeoutMs": 40000}}` is enough. There is **no way to REMOVE a
+  base server** from a repo layer (`"<name>": null` is ignored, with a warning) —
+  see #3612 for the `disabled` tombstone that would add one. The base is
+  machine-local and is never shipped, so this is also how an INTERNAL server reaches
+  every repo without being written into a product repo's tracked config. Base servers: brave-search,
   playwright-browser, gemini, tortoise (`seo-intelligence`, the Perplexity
   research server) and `orchestrator` (the fleet's own MCP — internal, why it
   lives here and not in a repo). **`exa` is not among them** — it was uninstalled by owner
