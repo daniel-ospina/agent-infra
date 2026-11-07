@@ -563,34 +563,6 @@ function expandExpr(str: string): string {
 }
 
 /**
- * Resolve the .mcp.json path for the current session (#104).
- *
- * Resolution order:
- *  1. Walk UP from `startDir` (default process.cwd()), stopping at the git
- *     top-level when one is resolvable (same `git rev-parse --show-toplevel`
- *     logic as reflect-hook / main-worktree-guard). Non-git directories walk
- *     to the filesystem root. First `.mcp.json` found wins — this lets a
- *     per-repo config override the base config.
- *  2. Fallback: `~/.pi/agent/.mcp.json` (the bootstrapped base config
- *     installed by pi-bootstrap/setup.sh from templates/.mcp.base.json).
- *  3. null → no config anywhere; the caller logs a clear zero-servers message.
- *
- * Exported (named) for unit tests; the default export stays the extension hook.
- */
-/**
- * BOTH layers that can define MCP servers (#<issue>).
- *
- * ⛔ THE BASE IS A LAYER, NOT A FALLBACK. `agent-infra` is the hub: skills, gates, AGENTS.md and the
- * harness are authored there and derived into every repo, and `~/.pi/agent/.mcp.json` is the same kind
- * of thing — the hub's per-machine shared config, installed from `templates/.mcp.base.json` and shipped
- * to nobody. A repo's own `.mcp.json` is a DELTA on that layer.
- *
- * The first-match rule made the base inert for every repo that carries a local config: adding a server
- * to the hub's base reached only the repos WITHOUT one. For a product repo (tortoise) the only workaround
- * was to write internal tooling into a TRACKED product file — the hub/product confusion this fleet must
- * not create. Measured 2026-11-06.
- */
-/**
  * Merge the hub's BASE layer with a repo's DELTA: the repo wins on a name collision.
  *
  * The repo is spread LAST on purpose: it may pin a different URL or command for its own copy of a
@@ -616,12 +588,46 @@ export interface McpConfigPaths {
   repo: string | null;
 }
 
-/** Back-compat shape: repo-local if present, else the base. Kept for existing callers/tests. */
+/**
+ * Resolve the .mcp.json path for the current session (#104) — the SINGLE-PATH form.
+ *
+ * ⛔ THIS IS A BACK-COMPAT SHIM, NOT THE RESOLVER'S CONTRACT. It answers "which ONE file is the
+ * repo-local config, else which ONE file is the base" — exactly the shape that made the base inert
+ * (#3612), because it can only ever name one of the two. Every caller that CONNECTS must use
+ * `resolveMcpConfigPaths` + `mergeMcpLayers` so the base layer is not hidden by a repo file.
+ * Kept for existing callers and tests.
+ *
+ * Exported (named) for unit tests; the default export stays the extension hook.
+ */
 export function resolveMcpJsonPath(startDir: string = process.cwd()): string | null {
   const layers = resolveMcpConfigPaths(startDir);
   return layers.repo ?? layers.base;
 }
 
+/**
+ * BOTH layers that can define MCP servers (#3612).
+ *
+ * ⛔ THE BASE IS A LAYER, NOT A FALLBACK. `agent-infra` is the hub: skills, gates, AGENTS.md and the
+ * harness are authored there and derived into every repo, and `~/.pi/agent/.mcp.json` is the same kind
+ * of thing — the hub's per-machine shared config, installed from `templates/.mcp.base.json` and shipped
+ * to nobody. A repo's own `.mcp.json` is a DELTA on that layer.
+ *
+ * The old first-match rule made the base inert for every repo that carries a local config: adding a
+ * server to the hub's base reached only the repos WITHOUT one. For a product repo (tortoise) the only
+ * workaround was to write internal tooling into a TRACKED product file — the hub/product confusion
+ * this fleet must not create. Measured 2026-11-06.
+ *
+ * Resolution order, per layer and now run INDEPENDENTLY (#104's walk semantics are unchanged):
+ *   1. repo — walk UP from `startDir` (default process.cwd()), stopping at the git top-level when one
+ *      is resolvable (same `git rev-parse --show-toplevel` logic as reflect-hook /
+ *      main-worktree-guard). Non-git directories walk to the filesystem root. First `.mcp.json` found
+ *      wins. OPTIONAL — absent is normal.
+ *   2. base — `~/.pi/agent/.mcp.json` (the bootstrapped base config installed by
+ *      pi-bootstrap/setup.sh from templates/.mcp.base.json). Resolved WHETHER OR NOT a repo file was
+ *      found — that is the whole of #3612. OPTIONAL — absent is normal.
+ *
+ * Both null → no config anywhere; the caller logs the clear zero-servers message.
+ */
 export function resolveMcpConfigPaths(startDir: string = process.cwd()): McpConfigPaths {
   let topLevel: string | null = null;
   let repo: string | null = null;
