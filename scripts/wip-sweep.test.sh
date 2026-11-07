@@ -1033,7 +1033,10 @@ has "$O_R4" 'not a USABLE' \
   && ok "R4b …within the bound (${_ELAPSED}s against a 30 s hang — previously unbounded)" \
   || bad "R4b the usability probe was UNBOUNDED: ${_ELAPSED}s elapsed with STATUS_TIMEOUT=1"
 
-# ⛔ THE UNMEASURED MESSAGE'S BACKTICKS, PINNED (#3588 review). `err "UNMEASURED — `git worktree list`
+# ⛔ THE UNMEASURED MESSAGE'S BACKTICKS, PINNED (#3588 review). Its label is S4m, NOT S4: the "one empty
+# listing out of two repos" arm is already S4, and two rows sharing a label make a red S4 unattributable in
+# a log (measured by the mutation pass: a group-D mutant reddened THIS arm while the other S4 stayed green,
+# and nothing in the log told them apart — which defeats the point of pinning either). `err "UNMEASURED — `git worktree list`
 # answered …"` was a LIVE COMMAND SUBSTITUTION inside double quotes: bash ran it and spliced its output into
 # the warning. Restoring the backticks left the suite fully green, so the fix was unpinned.
 mk_fixture elist fix/3485-elist || { echo "x fixture failed (elist)"; exit 1; }
@@ -1048,8 +1051,8 @@ chmod +x "$T/emptybin/git"
 ELIST_ERR="$(cd "$T" && PATH="$T/emptybin:$PATH" WIP_SWEEP_STATE_DIR="$T/state-elist" \
   bash "$SW" --apply --repo "$T/elist/wt" 2>&1 >/dev/null)"
 has "$ELIST_ERR" "'git worktree list' answered" \
-  && ok "S4 the UNMEASURED message quotes the command LITERALLY (its backticks were a live substitution)" \
-  || bad "S4 the empty-listing message no longer contains the literal 'git worktree list' — a backtick in a double-quoted err string RUNS it: $ELIST_ERR"
+  && ok "S4m the UNMEASURED message quotes the command LITERALLY (its backticks were a live substitution)" \
+  || bad "S4m the empty-listing message no longer contains the literal 'git worktree list' — a backtick in a double-quoted err string RUNS it: $ELIST_ERR"
 
 # ── S) A REPO THAT LISTED NOTHING IS ESCALATED ON ITS OWN ────────────────────────────────────────────
 echo; echo "── S. a repo that listed NOTHING is escalated even when a sibling repo deferred rows ──"
@@ -1218,6 +1221,62 @@ O_F5="$(WIP_SWEEP_STATE_DIR="$T/state-f5" bash "$SW" --apply --repo "$F5_REPO" 2
 grep -q 'worktree-list-partial' "$T/state-f5/wip-sweep.tsv" 2>/dev/null \
   && ok "S10c …and the note is worktree-list-partial" \
   || bad "S10c the index does not record the partial listing for the stripped registration"
+
+# ⛔ S11 — THE TWO REPO-LEVEL NOTES ON THE COMMON-DIR PATH ARE PINNED (#3588 review, cycle 8). The
+# mutation pass MEASURED that `worktree-list-failed` and `worktree-list-unverifiable` appear ZERO times in
+# this suite, and that deleting the `tb_timeout` bound on `git rev-parse --git-common-dir` left the whole
+# suite at 176/0. So the comment's "BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE" was a claim no arm could
+# falsify — on the one path where a hung git means the quiesce never finishes and the cell is handed on to
+# be reclaimed UNARCHIVED, which is the loss this PR exists to prevent.
+echo; echo "── S11. the common-dir probe is bounded, and each of its failures is attributable ──"
+mk_fixture s11 fix/3485-s11 || { echo "x fixture failed (s11)"; exit 1; }
+S11_REPO="$T/s11/wt"
+S11_REAL="$(command -v git)"
+
+# (a) a REFUSED listing -> worktree-list-failed
+mkdir -p "$T/failbin"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" worktree list --porcelain "*) exit 1 ;;\nesac\nexec %s "$@"\n' \
+  "$S11_REAL" > "$T/failbin/git"
+chmod +x "$T/failbin/git"
+O_S11F="$(PATH="$T/failbin:$PATH" WIP_SWEEP_STATE_DIR="$T/state-s11f" bash "$SW" --apply --repo "$S11_REPO" 2>&1)"; RC_S11F=$?
+[ "$RC_S11F" -eq 3 ] \
+  && ok "S11a a REFUSED 'git worktree list' FAILS the pass (exit 3)" \
+  || bad "S11a a refused listing answered $RC_S11F (want 3): $O_S11F"
+grep -q 'worktree-list-failed' "$T/state-s11f/wip-sweep.tsv" 2>/dev/null \
+  && ok "S11b …and the index names worktree-list-failed, so the cause is not a bare 'unknown'" \
+  || bad "S11b the index does not record the refused listing"
+
+# (b) an UNRESOLVABLE common dir -> worktree-list-unverifiable
+mkdir -p "$T/unverb"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" --git-common-dir "*) exit 1 ;;\nesac\nexec %s "$@"\n' \
+  "$S11_REAL" > "$T/unverb/git"
+chmod +x "$T/unverb/git"
+O_S11U="$(PATH="$T/unverb:$PATH" WIP_SWEEP_STATE_DIR="$T/state-s11u" bash "$SW" --apply --repo "$S11_REPO" 2>&1)"; RC_S11U=$?
+[ "$RC_S11U" -eq 3 ] \
+  && ok "S11c an UNRESOLVABLE common dir FAILS the pass (exit 3) — completeness is never assumed" \
+  || bad "S11c an unresolvable common dir answered $RC_S11U (want 3): $O_S11U"
+grep -q 'worktree-list-unverifiable' "$T/state-s11u/wip-sweep.tsv" 2>/dev/null \
+  && ok "S11d …and the index names worktree-list-unverifiable" \
+  || bad "S11d the index does not record the unresolvable common dir"
+
+# (c) a HANGING probe must be WATCHDOG-BOUNDED rather than waited out
+mkdir -p "$T/slowbin"
+# `exec sleep` so the TERM lands on the sleep itself and cannot fall through to the real git afterwards.
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" --git-common-dir "*) exec sleep 30 ;;\nesac\nexec %s "$@"\n' \
+  "$S11_REAL" > "$T/slowbin/git"
+chmod +x "$T/slowbin/git"
+SECONDS=0
+O_S11S="$(PATH="$T/slowbin:$PATH" WIP_SWEEP_STATUS_TIMEOUT=1 WIP_SWEEP_STATE_DIR="$T/state-s11s" bash "$SW" --apply --repo "$S11_REPO" 2>&1)"; RC_S11S=$?
+S11_EL=$SECONDS
+[ "$S11_EL" -lt 15 ] \
+  && ok "S11e a HANGING common-dir probe is BOUNDED — the pass returned in ${S11_EL}s against a 30 s hang" \
+  || bad "S11e the pass took ${S11_EL}s against a 30 s hang — the common-dir call is NOT watchdog-bounded (deleting the tb_timeout is what this arm exists for)"
+[ "$RC_S11S" -eq 3 ] \
+  && ok "S11f …and it FAILS the pass (exit 3), never reading the repo complete" \
+  || bad "S11f a hung probe answered $RC_S11S (want 3): $O_S11S"
+grep -q 'worktree-list-unverifiable' "$T/state-s11s/wip-sweep.tsv" 2>/dev/null \
+  && ok "S11g …and the index names worktree-list-unverifiable, so a timeout is attributable" \
+  || bad "S11g the index does not record the timed-out probe"
 
 echo
 echo "── summary ──"
