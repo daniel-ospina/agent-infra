@@ -977,6 +977,30 @@ err_has "MEMORY gate"; ck $? "…naming the MEMORY gate, not the load one (the l
 err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
 no_comment; ck $? "no comment posted"
 
+# ── §O3 the spawn point's HELPER/SYNC refusal is not a reviewer crash either (agent-infra#3231) ──
+# The spawn point exits `AGENT_HARNESS_SKEW_REFUSED` when the gate and the `capacity.sh` it consumes were
+# not deployed together — nothing ran, nothing was paid for, and the remedy is a VERIFIED redeploy. Without
+# its own arm that code fell into the rc!=0 branch, which names a crashed/killed reviewer and tells the
+# operator to RE-RUN — straight back into a sync fault no re-run can clear.
+# ⛔ THE CODE AND THE REMEDY ARE READ FROM THE TREE, NOT SPELLED HERE (the §O2 lesson): the code comes out
+# of `spawn-gate.sh`'s own declaration, and the remedy string out of `deploy-harness.sh`, so a caller whose
+# tolerant default goes stale (or a message that reverts to the retired `cp scripts/orchestrator-harness/*.sh`
+# glob #3508 replaced) REDS here instead of silently mis-advising an operator.
+_skew_rc="$(sed -n 's/^AGENT_HARNESS_SKEW_REFUSED=\([0-9][0-9]*\)$/\1/p' \
+  "$ROOT/scripts/orchestrator-harness/spawn-gate.sh" 2>/dev/null | head -1)"
+[ -n "$_skew_rc" ] || _skew_rc=83
+echo; echo "§O3 spawn-point HELPER/SYNC refusal (rc=$_skew_rc) => exit $_skew_rc, named as a harness fault"
+reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC="$_skew_rc"
+run "$SRC" 2284
+[ "$(rc_of)" = "$_skew_rc" ]; ck $? "exit $_skew_rc (its own code) not 6/75 and NOT the file's own rc=2 (rc=$(rc_of))"
+err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
+err_has "HELPER/SYNC"; ck $? "…naming the HELPER/SYNC fault, not the load gate's wording"
+err_has "deploy-harness.sh"; ck $? "…with the VERIFIED redeploy remedy #3508 kept, not the retired cp glob"
+err_not_has 'cp scripts/orchestrator-harness/*.sh'; ck $? "…and NOT the retired depth-1 glob that leaves a partial deploy"
+err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
+no_record; ck $? "no record written"
+no_comment; ck $? "no comment posted"
+
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
 echo; echo "§P an oversized diff never rides into one argv (truncated, with a fetch instruction)"
 reset; printf 'diff-tail: @TAILPROOF@\nCLEAN\n' > "$TMP/reviewer-out"; FIXTURE_DIFF_BYTES=200000; FIXTURE_DIFF=""
