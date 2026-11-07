@@ -91,6 +91,22 @@ if [ ! -s "$REFRESH" ]; then
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNOT-RUN: mktemp failed" >&2; exit 1; }
+# ⛔ WHAT BASH ACTUALLY EXECUTED IS OBSERVED, NOT INFERRED FROM A NAME (review P2, cycle 89). The `set -u` sweep
+# below classified a file as a DECLARED INPUT by its BASENAME, so an executed driver named `pf-late.sh` (or
+# `skipwhy-real.sh`, or anything under `fns*`) was waived and never inspected — measured: `pf-late.sh`, executed by
+# the suite, left the sweep at 177/0 while the identical bytes named `late-probe.sh` reddened. That is `set -u`
+# coverage graded by FILENAME, the mechanism this section exists to replace.
+# `BASH_ENV` is sourced by EVERY non-interactive bash this suite starts, so it records the scripts that really run —
+# whatever they are called, and whether or not they end in `.sh` (measured: `late-probe`, a driver with NO
+# extension, was also invisible to the `-name '*.sh'` glob). The hook writes a path and nothing else, so no trace,
+# stdout or stderr of any child changes; the log lives directly under `$TMP` (not a case dir), so it is not a capture.
+# ⛔ `$0` IS LOGGED ABSOLUTE: drivers are started as `bash drive.sh` from INSIDE their case dir, so a bare `$0` is a
+# relative name that cannot be matched back to a file (measured: 208 entries logged, all `drive.sh`, and the sweep
+# resolved NONE of them). `$PWD/$0` needs no `readlink -f`, which macOS lacks.
+printf '%s\n' 'if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac; printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null || :; fi' > "$TMP/.boothook"
+: > "$TMP/.bootlog"
+export RANK_QUEUE_BOOTLOG="$TMP/.bootlog"
+export BASH_ENV="$TMP/.boothook"
 # ⛔ ONLY THE SHELL THAT CREATED THE SANDBOX MAY REMOVE IT. This is BELT AND BRACES, not a fix for an observed
 # failure: measured on bash 5.2.21, an `EXIT` trap does NOT run in a pipeline component or a command-substitution
 # subshell (`bash -c 'trap …; printf x | grep -q x; x=$(echo s); ( echo p )'` fires it once, in the main shell), so
@@ -976,9 +992,15 @@ pg_m_unranked=0; grep -q 'the pool ranked NONE' "$GP/m000.log" 2>/dev/null && pg
 if [ "$pg_dir_rc" -ne 0 ] && [ "$pg_dir_rows" = "300 9" ] \
    && grep -q 'STATE=priority-unreadable' "$GP/dir.log" 2>/dev/null \
    && [ "$pg_dir_unranked" -eq 0 ] && [ "$pg_dir_awk" -eq 0 ] \
-   && { [ "$pg_m_skipped" = "1" ] || { [ "$pg_m_rc" -ne 0 ] && grep -q 'STATE=priority-unreadable' "$GP/m000.log" 2>/dev/null && [ "$pg_m_unranked" -eq 0 ]; }; }; then rc=0
+   && { [ "$pg_m_skipped" = "1" ] && grep -q 'severity-first from the pool' "$GP/m000.log" 2>/dev/null \
+        || { [ "$pg_m_skipped" = "0" ] && [ "$pg_m_rc" -ne 0 ] && grep -q 'STATE=priority-unreadable' "$GP/m000.log" 2>/dev/null \
+             && [ "$pg_m_unranked" -eq 0 ] && ! grep -qi 'permission denied' "$GP/m000.log" 2>/dev/null; }; }; then rc=0
 else rc=1; echo "      pool-shape: dir rc=$pg_dir_rc rows='$pg_dir_rows' unranked-claim=$pg_dir_unranked awk-warning=$pg_dir_awk | mode000 rc=$pg_m_rc unranked-claim=$pg_m_unranked (want: both refuse as priority-unreadable, rows intact, NO 'the pool ranked NONE' claim, no awk directory warning)"; fi
-[ "$pg_m_skipped" = "1" ] && echo "      (mode-000 half skipped: this user can read a 000 file — running as root?)"
+# ⛔ AND THE SKIP BRANCH MEASURES TOO (review P3, cycle 89). It used to short-circuit the whole half to rc=0 on a host
+# where `chmod 000` does not bind, so the ✅ claimed "an UNREADABLE .pool REFUSES the reorder" from a run that read the
+# pool — measured as root: ✅ printed with `pg_m_skipped=1`. It now grades the OTHER polarity with a positive marker:
+# a readable pool over queue '300 9' must actually RANK, i.e. the operator line says `severity-first from the pool`.
+[ "$pg_m_skipped" = "1" ] && echo "      (mode-000 half: this user can read a 000 file, so NO unreadable branch exists — graded the readable polarity instead: the pool must have been RANKED)"
 
 chmod 644 "$GP/mode000-o/.pool" 2>/dev/null || true
 ck "a NON-REGULAR or UNREADABLE .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take" $rc
@@ -2735,7 +2757,15 @@ if [ "$_bis_skipped" = "1" ]; then
     echo "      this host CAN read a mode-000 record, so the pass must have READ it — it claimed 'could not be READ': '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
   elif [ -z "$_x14" ]; then rc=1
     echo "      the fixture produced no output at all on a host that can read a mode-000 file — nothing was graded"
-  else rc=0; echo "      (this host can read a mode-000 file, so NO unreadable branch exists here; graded the readable polarity instead: the pass read the record and did not claim otherwise)"; fi
+  # ⛔ AND THE READ MUST BE POSITIVELY VISIBLE (review P3, cycle 89): "did not say 'could not be READ'" is satisfied by
+  # a pass that never opened the record at all — measured, with the `tr` read replaced by `_sat_raw=""` the arm stayed
+  # ✅ while its sibling reddened on the same tree. This record holds `P1-severe`, so a pass that READ it repeats the
+  # tier as `windows=TRUNCATED(P1-severe)`; the flag is required before the ✅.
+  elif grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_x14"; then rc=0
+    echo "      (this host can read a mode-000 file, so NO unreadable branch exists here; graded the readable polarity instead: the record was READ — its tier is repeated as windows=TRUNCATED(P1-severe) — and the pass did not claim otherwise)"
+  else rc=1
+    echo "      this host CAN read a mode-000 record, so the pass must have READ it and repeated its tier — no windows=TRUNCATED(P1-severe) in: '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
+  fi
 elif grep -qi 'permission denied' <<<"$_x14"; then
   rc=1; echo "      the shell's own message reached the operator line '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
 # ⛔ THE BRANCH ASSERTS ITS OWN NO-CLIP POLARITY, SO THAT CLAIM IS GRADED POSITIVELY (review P2, cycle 67).
@@ -3089,8 +3119,10 @@ _out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI
 }
 # ⛔ THE FOUR UID-DEPENDENT CASES ARE EXCLUDED FROM BOTH HALVES OF THE PIN (see the scope note above): root can
 # read a mode-000 file, so these fixtures take a different branch and their text is legitimately different. Each is
-# graded by ITS OWN host-dependent assertion, which grades whichever branch exists (since cycle 88 the mode-000 arm
-# measures the readable polarity instead of returning a bare `rc=0`); the pin stays silent about them rather than
+# graded by ITS OWN host-dependent assertion, which grades whichever branch EXISTS on this host instead of returning a
+# bare `rc=0`: `§14d-bis` requires the readable record's tier to be repeated (`windows=TRUNCATED(P1-severe)`), and
+# `poolguards` requires the readable pool to be RANKED (`severity-first from the pool`) — both since cycles 88-89, and
+# before that a root host printed ✅ for both without measuring anything. The pin stays silent about them rather than
 # turning "you ran as root" into a false red. Every OTHER case — including any fixture added later — is pinned.
 _out_uid_excluded='arm-clip-unread/out mh-mode000/out poolguards/m000.log sa-unreadable/out'
 # ⛔ A CAPTURE IS EVERY FILE THE FIXTURE LEAVES BEHIND — NOT A SET OF FILENAMES (review P1+P2, cycle 72). Cycle
@@ -3418,13 +3450,31 @@ while IFS= read -r drv; do
       inputs_total=$(( inputs_total + 1 )); continue ;;
   esac
   drivers_total=$(( drivers_total + 1 ))
-  grep -qx 'set -u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
+  # ⛔ THE FLAG'S SPELLING FAMILY, NOT ONE LITERAL LINE (review P3, cycle 89): `grep -qx 'set -u'` reddened a driver
+  # written `set -euo pipefail` — a FALSE BLOCK, and its message ("WITHOUT 'set -u'") was untrue of it.
+  grep -qE '^[[:space:]]*set -[A-Za-z]*u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
 done <<EOF
 $(find "$TMP" -type f -name '*.sh' 2>/dev/null | sort)
 EOF
-if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ -z "$drivers_bare" ]; then rc=0
-else rc=1; echo "      driver(s) WITHOUT 'set -u':${drivers_bare:- none} — every .sh under \$TMP is a DRIVER ($drivers_total, each needing set -u) unless it is a DECLARED INPUT ($inputs_total: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh); an undeclared file lands here"; fi
-ck "every .sh this suite generates is a DRIVER under \`set -u\` or a DECLARED input — the driver set is fail-closed, not a name list ($drivers_total driver(s), $inputs_total declared input(s))" $rc
+# ⛔ AND THE OBSERVED HALF: EVERY SCRIPT BASH ACTUALLY STARTED (review P2, cycle 89). The `.sh` walk above cannot see
+# a driver that does not end in `.sh`, and it waives anything whose NAME matches an input class — so the population
+# that matters (what runs) is read from the `BASH_ENV` log, and each executed script must carry the flag family or be
+# a declared input. `*/bin/*` is the case dirs' own PATH shims (`wc`, `mv`, `cmp`, `sort`, `awk`, `cat`, `tr`), which
+# this suite runs as COMMANDS: declared here by path class, visibly, rather than by a name that can hide a driver.
+exec_total=0; exec_bare=""
+while IFS= read -r _ex; do
+  [ -n "$_ex" ] || continue
+  case "$_ex" in "$TMP"/*) : ;; *) continue ;; esac
+  [ -f "$_ex" ] || continue
+  case "$_ex" in "$TMP"/*/bin/*) continue ;; esac
+  exec_total=$(( exec_total + 1 ))
+  grep -qE '^[[:space:]]*set -[A-Za-z]*u' "$_ex" 2>/dev/null || exec_bare="$exec_bare ${_ex#"$TMP"/}"
+done <<EOF
+$(sort -u "$TMP/.bootlog" 2>/dev/null)
+EOF
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ]; then rc=0
+else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, plus */bin/* shims); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
+ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
 _out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
 if [ -z "$_out_late" ]; then
