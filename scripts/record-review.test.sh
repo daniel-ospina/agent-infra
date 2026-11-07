@@ -5149,11 +5149,13 @@ fi
 #     `origin/main` moves and a bare "main :NNNN" rots the moment it does
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
-#     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines, plus a comment
-#     mention at :2415): the only diff hunk at `post_marker()` (:2524) ADDS A COMMENT — the
+#     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
+#     CITE-CHECK: :2546 :4272 :6639 :6796, plus a comment mention at :2415; `14.1c-CITE` below
+#     re-derives these numbers, so they cannot rot silently): the only diff hunk at
+#     `post_marker()` (:2524) ADDS A COMMENT — the
 #     predicate line beside it (:2546) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head, take the line from the grep above, because two sibling commits on this PR have already moved it). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`; on main at bd1b205d :6501 — at head CITE-CHECK: :6639). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5169,6 +5171,47 @@ fi
 #     stays green — which is what makes the pair pin the predicate rather than
 #     the fixture. The marker text is SEEDED from the recorder's own post (never
 #     hand-written) so its diff=/sig= contract cannot drift from the script's.
+#
+# 14.1c-CITE ⛔ A CITATION MUST RE-DERIVE — SO THE SENTENCE ABOVE IS A TEST, NOT A NOTE
+#     (agent-infra#3712 re-review). The comments above print head line numbers as the
+#     evidence that a reader can check the claim. Prose rots silently: the comment block
+#     added above the persist site moved BOTH body-presence predicates by +9 and the numbers
+#     beside them stayed put — so the sentence went on *reading* correct while pointing at
+#     prose (measured: the two numbers said :6625 / :6770, where :6625 is "same class as the
+#     comment-side fix" and :6770 is the `#633 review finding 3` block; the predicates were
+#     :6634 / :6779). A sibling commit then moved them AGAIN, to :6639 / :6796, and its
+#     response was to delete the numbers — which removes the rot but also removes the reader's
+#     target. Both intents are kept here: the number stays, and it is CHECKED.
+#     Every head line number the comments print is TAGGED `CITE-CHECK:`, and this vector parses
+#     the tagged numbers back OUT and checks them against the recorder's bytes: each one must
+#     land on a `grep -qxF` line, and the deduped set must EQUAL the file's executing sites, so
+#     a predicate added without a citation reddens too (a comment line is not a site — :2415 is
+#     a mention). A stale number now REDDENS here instead of waiting for a reviewer to find it.
+QR_SELF="$SCRIPT_DIR/record-review.test.sh"
+QR_CITE_SITES="$(command grep -n 'grep -qxF' "$RECORD" | command grep -vE '^[0-9]+: *#' \
+    | cut -d: -f1 | sort -un | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
+# ⛔ THE PATTERNS NAME NO BACKTICK — 20h48b scans double-quoted command substitutions for one, and
+# it CAUGHT the first draft of this guard. The tag is the anchor, so the phrasing around a number
+# can be reworded freely; only the tag and the numbers after it are contractual.
+QR_CITED="$(command grep -E '^#.*CITE-CHECK:' "$QR_SELF" \
+    | sed -n 's/.*CITE-CHECK: *\(:[0-9][0-9 :]*\).*/\1/p' \
+    | tr -d ':' | tr -s ' ' | tr '\n' ' ' | tr ' ' '\n' | sort -un | tr '\n' ' ' \
+    | sed 's/^ *//; s/ *$//')"
+# Every prerequisite below proves its capture is LIVE, so no assertion can pass on an empty parse.
+assert_eq "$([ -n "$QR_CITE_SITES" ] && echo live || echo dead)" "live" \
+    "14.1c-CITE prerequisite: the recorder has identifiable executing grep -qxF sites"
+assert_eq "$([ -n "$QR_CITED" ] && echo live || echo dead)" "live" \
+    "14.1c-CITE prerequisite: the CITE-CHECK tags parse (the citation is still tagged)"
+assert_eq "$QR_CITED" "$QR_CITE_SITES" \
+    "14.1c-CITE the head sites the comments print ARE the recorder's grep -qxF sites"
+QR_STALE=""
+for _qr_n in $QR_CITED; do
+    command grep -qF -- 'grep -qxF' <<<"$(command sed -n "${_qr_n}p" "$RECORD")" \
+        || QR_STALE="$QR_STALE :$_qr_n"
+done
+assert_eq "$QR_STALE" "" \
+    "14.1c-CITE every tagged line number IS a grep -qxF line (stale:$QR_STALE)"
+
 QB_PR=424339
 QB_SEED="$(seed_marker_body "$QB_PR")"
 QB_LINE=""
@@ -5906,7 +5949,8 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       because main's anchoring should not silently regress, and it is labelled so the
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
-#       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep above prints at head.
+#       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
+#       above prints at head, CITE-CHECK: :4272 :6639 :6796 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
