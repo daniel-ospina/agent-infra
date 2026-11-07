@@ -144,7 +144,9 @@ _rs_say() { local s="$1"; shift; printf '%s\n' "$*" >&"$s"; }
 _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
 # _rs_nearest_existing_ancestor <path> — the first path component that EXISTS, walking up from the
-# given path's directory; "" when nothing (not even /) answers. It is the whole basis of the
+# given path's directory. It always answers: an existing ancestor, or `/` (which exists) — the "" case in
+# the first version of this line was unreachable, a reviewer found it, and the caller's `-e` on `/` is the
+# only fallback that is not a silent proof of absence. It is the whole basis of the
 # absence proof above: `-e` false under a TRAVERSABLE existing ancestor is proof of absence, and under
 # an untraversable one it is proof of nothing.
 # ⛔ NO `dirname` IN THIS WALK, AND IT IS NOT AN OPTIMISATION (review round 44, P2 — measured). In the
@@ -860,12 +862,19 @@ _rs_origin_slug() {
     return 0
   fi
   if [ -z "$out" ]; then
-    # ⛔ THIS IS A RESIDUE, SO IT MUST NOT NAME A CAUSE (review round 44, P2 — measured). It said `the proof
-    # child did not start`, and with an unloadable sibling BOTH that message AND the whole-set `would not
-    # LOAD` WARNs appeared in ONE run — the child started, imported and raised. Every verb now answers its
-    # own reason (the `elif` in the load arm, the `try/except` around `_origin_slug`), so this line is what
-    # is left when NOTHING came back at all, and it says exactly that.
-    printf '\tpr-doctor.py produced no answer, and this reader cannot see why'
+    # ⛔ THIS IS A RESIDUE, SO IT MUST NOT NAME A CAUSE — BUT "NO CAUSE" IS NOT THE SAME AS "NO THIRD BRANCH"
+    # (review round 44, P2 — measured, and the first repair here was itself incomplete). It first said `the
+    # proof child did not start`, and with an unloadable sibling BOTH that message AND the whole-set `would
+    # not LOAD` WARNs appeared in ONE run — the child started, imported and raised. The repair made it a bare
+    # residue ("cannot see why") — and a reviewer then showed a shape where the reader CAN see why: the
+    # sibling is PRESENT and `_rs_py_resolve` is empty, so the very next whole-set WARN says `or no python3
+    # resolves` while this line said it could not see. A residue is for what is genuinely unaccounted for,
+    # not for the one remaining named cause.
+    if [ -z "$(_rs_py_resolve 2>/dev/null)" ]; then
+      printf '\tno python3 resolves here, so pr-doctor.py could not be RUN at all'
+      return 0
+    fi
+    printf '\tpr-doctor.py produced no answer even though it could be run, and this reader cannot see why'
     return 0
   fi
   printf '%s' "$out"

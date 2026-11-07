@@ -132,9 +132,21 @@ EOF
 #     where it was needed. Measured: with the walk broken, `_rs_bound` returned 124 at 30.9 s and the
 #     calling `$( )` STILL BLOCKED past 60 s, because the killed reader left children whose stdout IS the
 #     command-substitution pipe — and a substitution returns only when every writer closes it. `timeout`
-#     escapes that by signalling the process GROUP; this walk reproduces it without the tool: collect the
+#     escapes that by signalling the process GROUP; this walk APPROACHES it without the tool: collect the
 #     descendants BEFORE any kill (once the parent dies they reparent to init and `pgrep -P` cannot find
-#     them), then TERM and KILL the set.
+#     them), then TERM and KILL the set. ⛔ SO THIS IS NOT `timeout`: it APPROACHES what a process-group
+#     signal does, and the residuals are named rather than implied (review round 44, P2 — both measured).
+#       (a) A child that DAEMONIZES a grandchild (`( sleep 60 & )`) reparents it to init before the `ps`
+#           snapshot, so it is never in the set and still holds the pipe — the substitution blocks for the
+#           grandchild's lifetime (measured: 60 s against a 2 s bound). No arm's reader forks a detached
+#           child, so that is a residual of the technique, not of this suite.
+#       (b) With `ps` unavailable the descendant list is empty and only the parent is killed, which is the
+#           original inertness (measured: a 2 s bound returned after 20 s).
+#     Neither is observable from inside the suite, and NOTHING REDS if the tree kill is removed (measured:
+#     the mutant then blocked past 600 s) — the tree-kill is load-bearing with no sensor of its own.
+#     And a pid is TERM'd, waited on for 0.2 s, then KILL'd unconditionally: across that window a recycled
+#     pid on a fork-heavy box could in principle be signalled — the same exposure class as a group kill,
+#     recorded rather than solved.
 _rs_descendants() { # _rs_descendants <pid> — pids below <pid>, space-separated. `ps -A -o pid=,ppid=` is
   # POSIX enough for both Linux and the macOS BSD ps, and the tree is transitive (the reader execs python).
   ps -A -o pid=,ppid= 2>/dev/null | awk -v root="$1" '
@@ -1288,9 +1300,14 @@ else
   for b in sed awk tr grep printf id cat cut wc head mv rm mkdir ln chmod git date env basename uname; do
     _p4="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p4" "$ND/$b" 2>/dev/null
   done
-  NI="$T/nointerp-dirname"; mkdir -p "$NI"
-  cp "$READER" "$NI/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
-  python3 - "$NI/repo-set.sh" <<'PYNID'
+  NI="$T/nointerp-dirname"; mkdir -p "$NI/lib"
+  # ⛔ THE READER LIVES IN A `lib/` SUBDIR BECAUSE `_rs_doctor_py` RESOLVES `dirname($BASH_SOURCE)/../pr-doctor.py`
+  # (review round 44, P2 — measured). Copying it beside the doctor at `$NI/repo-set.sh` makes it look for
+  # `$NI/../pr-doctor.py`, so this arm cannot see the sibling it copies — green for a reason it never
+  # claimed, and the reason `m46` below was RED until its own layout was fixed. `j-emptyrender` already
+  # carries the same note; this one used the wrong layout too.
+  cp "$READER" "$NI/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
+  python3 - "$NI/lib/repo-set.sh" <<'PYNID'
 import sys
 p = sys.argv[1]
 s = open(p, encoding='utf-8').read()
@@ -1305,10 +1322,23 @@ PYNID
   # runs `check` on an ABSOLUTE set path — the shape a future walk regression would hang on — so it is
   # inside the wall-clock bound like the helper calls. Setting `PATH="$ND"` on the helper itself would
   # disarm the bound (`ps` and `sleep` are not in `$ND`), hence `env PATH=…` for the child alone.
-  _o_dn="$(_rs_bound 30 env REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/repo-set.sh" check 2>&1)"; _rc_dn=$?
+  _o_dn="$(_rs_bound 30 env REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_dn=$?
   chmod 755 "$T/den2/den"
   ck "j16f no \`dirname\` must not disarm the absence proof (rc 5 INVALID, never the rc 3 the wrapper degrades on)" \
      '[ "$_rc_dn" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn"'
+  # ⛔ AND ONE MORE HOP, BECAUSE THE ARM ABOVE NEVER EXECUTES THE LOOP'S SHORTENING (review round 44, P2 —
+  # measured by an instrument whose first mutant stayed green). `$T/den2/den` is `-e`-visible through its
+  # own parent, so the walk returns on its FIRST test and a `dirname` reintroduced only in the shortening
+  # line slips past `j16f` entirely. A set TWO hops above the untraversable dir forces one shortening of a
+  # slash-full path — the line that has no `dirname` now. `chmod 000` on `den` keeps `-e $T/den2/den` TRUE
+  # and `-e $T/den2/den/sub` FALSE, which is exactly the shape that enters the loop.
+  mkdir -p "$T/den2/den/sub"
+  printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/den2/den/sub/repos.conf"
+  chmod 000 "$T/den2/den"
+  _o_dn2="$(_rs_bound 30 env REPO_SET_FILE="$T/den2/den/sub/repos.conf" PATH="$ND" /bin/bash "$NI/lib/repo-set.sh" check 2>&1)"; _rc_dn2=$?
+  chmod 755 "$T/den2/den"
+  ck "j16f2 …two hops up, so the loop's SHORTENING runs without \`dirname\` too (rc 5, never the degrade code)" \
+     '[ "$_rc_dn2" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn2"'
 fi
 # ⛔ A RELATIVE `REPO_SET_FILE` USED TO HANG THIS READER, AND NO ARM USED ONE (review-instrumented round 44).
 # Removing `dirname` from the ancestor walk left `${d%/*}`, which returns a SLASH-LESS name UNCHANGED — so
@@ -1801,6 +1831,26 @@ ME="$T/noload"; mkdir -p "$ME"
 printf 'raise RuntimeError("boom at import")\n' > "$ME/pr-doctor.py"
 ck "m45 a sibling that will not LOAD names the LOAD for origin too — never 'the proof child did not start'" \
    'o="$(REPO_SET_DOCTOR="$ME/pr-doctor.py" run_reader "$CONF" check 2>&1)"; grep -q "would not LOAD, so no origin can be proved" <<<"$o" && ! grep -q "did not start" <<<"$o" && ! grep -q "cannot see why" <<<"$o"'
+# ⛔ THE THIRD CAUSE, WHICH THE FIRST RESIDUE HID (review round 44, P2 — measured). `m45` covers the
+# sibling that will not LOAD. This one is the sibling PRESENT and NO interpreter resolvable: the whole-set
+# WARN already said "or no python3 resolves" while the per-line line said it could not see why — the same
+# right-code/wrong-cause class this round exists to remove, moved one arm over. The fixture doctors ONLY
+# the interpreter loop. ⛔ THE `lib/` SUBDIR IS LOAD-BEARING: with the reader at `$MI/repo-set.sh`,
+# `_rs_doctor_py` looks for `$MI/../pr-doctor.py`, finds nothing, and the arm reds on the SHIPPED tree
+# (and stays red under its mutant, so it pins nothing) — measured before this layout was fixed.
+MI="$T/nointerp-residue"; mkdir -p "$MI/lib"
+cp "$READER" "$MI/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$MI/pr-doctor.py"
+python3 - "$MI/lib/repo-set.sh" <<'PYMI'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
+assert s.count(old) == 1, s.count(old)
+open(p, "w", encoding='utf-8').write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
+PYMI
+printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/nointerp.conf"
+ck "m46 sibling PRESENT + NO interpreter: the origin line names THAT, never 'cannot see why'" \
+   'o="$(_rs_bound 30 env REPO_SET_FILE="$T/nointerp.conf" /bin/bash "$MI/lib/repo-set.sh" check 2>&1)"; grep -q "no python3 resolves here, so pr-doctor.py could not be RUN at all" <<<"$o" && ! grep -q "cannot see why" <<<"$o"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \
