@@ -218,10 +218,22 @@ believed. **Everything else counts, including a registration damaged down to non
 precisely what makes the omission visible — a marker whitelist instead let that case read `ok`.
 Over-counting here is fail-CLOSED (a loud rc=3); under-counting is the false PASS this rule exists for.
 
-**One residual, stated rather than implied:** a registration EMPTIED COMPLETELY is indistinguishable, by
-content, from debris that was never populated, so it is skipped and that omission reads clean. It is
-narrow because an empty admin dir does not persist — `git gc` and `git worktree prune` remove it
-(`Removing worktrees/<name>: gitdir file does not exist`) — while the `locked`-only shape neither does.
+**Two skipped shapes, stated rather than implied — and the persistent one is the wider blind spot.** Both
+are skipped, and both therefore read `clean`, because git omits such a worktree from its own listing and so
+neither can be detected from the listing side:
+
+1. **A registration emptied completely** — indistinguishable, by content, from debris that was never
+   populated. Narrow in practice: `git gc` and `git worktree prune` remove an empty admin dir on their own
+   (`Removing worktrees/<name>: gitdir file does not exist`), so it does not persist.
+2. **A registration reduced to only `locked`** — measured over a linked worktree still holding uncommitted
+   work: git lists 1 of 2 records and the pass answers `status=ok rc=0`, while `git worktree prune` and
+   `git gc --prune=now` both **leave the directory in place**. This is the shape that does NOT self-heal,
+   and it is the one to remember when auditing this gate.
+
+`{locked}`-only is **not** unskipped on purpose: it is the measured prefix of a `git worktree add --lock`
+killed after the `locked` write, i.e. real debris, and counting it restores a permanent false `PARTIAL`.
+The trade is deliberate — a false "the work is LOST" over work that was archived is worse than a narrow,
+documented blind spot.
 
 It is **one-sided on purpose** — only a listing BELOW the expectation escalates, so a future git that
 lists more than it holds admin dirs can never false-block a sweep that was complete.
