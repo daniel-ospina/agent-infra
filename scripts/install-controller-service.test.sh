@@ -2966,13 +2966,49 @@ if [ -d "$PG_CLONE/.git" ]; then
       rm -f "$PG/units/eldato-orchestrator.service"
       PG_HSHA="$(git -C "$PG_CLONE" rev-parse HEAD 2>/dev/null)"
       if [ -n "$PG_HSHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG/home/pins/$PG_HSHA" "$PG_HSHA" >/dev/null 2>&1; then
-        mkdir -p "$PG/home/pins/$PG_HSHA/scripts"; cp "$SUP" "$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh"
+        mkdir -p "$PG/home/pins/$PG_HSHA/scripts/orchestrator-harness"
+        : > "$PG/home/pins/$PG_HSHA/scripts/orchestrator-harness/orch-loop.sh"
+        cp "$SUP" "$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh"
         PG_H2_RC=0
         PG_H2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home/pins ORCH_SUPERVISOR=$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_H2_RC=$?
         [ "$PG_H2_RC" -eq 0 ] && ok '§P7: control — a REAL pin tree (<pin dir>/<sha>) under the exported root is still ADMITTED' \
                              || bad "§P7: refused a legitimate pin tree under HARNESS_PIN_DIR — a false block on the cells' shape: $PG_H2_OUT"
       else
         bad '§P7: the fixture could not create the <pin dir>/<sha> tree, so the pin-shape control did NOT run'
+      fi
+      # ⛔ A PIN IS NOT A NAME, AND NOT A DECLARATION (cycle-4 P1, MEASURED — the claim this replaces, that
+      # "`HARNESS_PIN_DIR` only bounds, it no longer defines", was OVERBROAD: naming and declaring are both
+      # caller-controlled, so grading them defended nothing). Three routes, each measured ARMED before this fix:
+      #   (i)   HARNESS_PIN_DIR=$HOME  + a scratch at `$HOME/<40-hex>`  — the hex BASENAME alone won;
+      #   (ii)  HARNESS_PIN_DIR=<the scratch itself>                   — the equality arm alone won;
+      #   (iii) a pin RECORD naming `<scratch>/scripts/orchestrator-harness` — any directory a record named won.
+      # The tree now corroborates itself exactly as the bring-up corroborates a pin (`cloud-cell-bringup.sh`
+      # refuses a pin tree without `scripts/orchestrator-harness/orch-loop.sh`). That is a property of the TREE,
+      # so no naming or declaration can manufacture it, and every real pin already satisfies it.
+      rm -f "$PG/units/eldato-orchestrator.service"
+      PG_L_TREE="$PG/home/$PG_HSHA"
+      if [ -n "$PG_HSHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG_L_TREE" "$PG_HSHA" >/dev/null 2>&1; then
+        mkdir -p "$PG_L_TREE/scripts"; cp "$SUP" "$PG_L_TREE/scripts/cloud-cell-supervisor.sh"
+        PG_L1_RC=0
+        PG_L1_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L1_RC=$?
+        [ "$PG_L1_RC" -ne 0 ] && ok '§P7: a scratch NAMED with a commit id under an exported pin root is REFUSED (a name is not a pin)' \
+                             || bad "§P7: a drainer scratch named with a commit id was armed — the pin test graded the NAME: $PG_L1_OUT"
+        rm -f "$PG/units/eldato-orchestrator.service"
+        PG_L2_RC=0
+        PG_L2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG_L_TREE ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L2_RC=$?
+        [ "$PG_L2_RC" -ne 0 ] && ok '§P7: a declaration that names the scratch as the pin root is REFUSED (a declaration is not a pin)' \
+                             || bad "§P7: an exported pin root naming the scratch itself armed it: $PG_L2_OUT"
+        rm -f "$PG/units/eldato-orchestrator.service"
+        printf '%s\n' "$PG_L_TREE/scripts/orchestrator-harness" > "$PG/home/.harness-path"
+        PG_L3_RC=0
+        PG_L3_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L3_RC=$?
+        rm -f "$PG/home/.harness-path"
+        [ "$PG_L3_RC" -ne 0 ] && ok '§P7: a pin RECORD naming the scratch is REFUSED (a record is not a pin)' \
+                             || bad "§P7: a record naming the drainer scratch armed it — any directory a record named became the pin: $PG_L3_OUT"
+        [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+          && ok '§P7: and none of the three laundering routes armed a unit' || bad '§P7: a laundered pin still wrote a unit'
+      else
+        bad '§P7: the fixture could not create the hex-named scratch, so the name/declaration arms did NOT run'
       fi
     else
       bad '§P7: the fixture could not create the detached scratch worktree, so that arm did not run'
@@ -3017,6 +3053,11 @@ if [ -d "$PG_CLONE/.git" ]; then
     PG_PIN_SHA="$(git -C "$PG_CLONE" rev-parse HEAD 2>/dev/null)"
     mkdir -p "$PG_PIN"
     if [ -n "$PG_PIN_SHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG_PIN/$PG_PIN_SHA" "$PG_PIN_SHA" 2>/dev/null; then
+      # A REAL PIN CARRIES ITS HARNESS (the bring-up refuses a pin tree without it), so the fixture carries one —
+      # otherwise this arm would be refused for the missing harness instead of for the ambient GIT_* pair it exists
+      # to test, and would certify the wrong thing.
+      mkdir -p "$PG_PIN/$PG_PIN_SHA/scripts/orchestrator-harness"
+      : > "$PG_PIN/$PG_PIN_SHA/scripts/orchestrator-harness/orch-loop.sh"
       PG_F_RC=0
       PG_F_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh GIT_DIR=$PG_PIN/$PG_PIN_SHA/.git GIT_WORK_TREE=$PG_PIN/$PG_PIN_SHA" inst pg --install 2>&1)" || PG_F_RC=$?
       [ "$PG_F_RC" -ne 0 ] && ok '§P7: an ambient GIT_DIR+GIT_WORK_TREE pair pointing at the pin does NOT launder a branch worktree' \
@@ -3265,6 +3306,11 @@ PIN_SHA="$(git -C "$PIN_REPO" rev-parse HEAD 2>/dev/null)"
 PIN_DIR="$PIN/home/harness/$PIN_SHA"
 PIN_SUP="$PIN_DIR/scripts"
 if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PIN_SHA" >/dev/null 2>&1; then
+  # A REAL PIN CARRIES ITS HARNESS — the bring-up refuses a pin tree without
+  # `scripts/orchestrator-harness/orch-loop.sh`, so the fixture carries one (§P4 is about the SHAPE of the path,
+  # not about a pin that no bring-up would ever accept).
+  mkdir -p "$PIN_DIR/scripts/orchestrator-harness"
+  : > "$PIN_DIR/scripts/orchestrator-harness/orch-loop.sh"
   # ⛔ AND THE BOX\'S OWN PIN RECORD IS WRITTEN, SO THE RECORD BRANCH IS WHAT RUNS (review-5 P2). Without
   # `.harness-path` this arm was admitted by the FALLBACK (`${HARNESS_PIN_DIR:-$CELL_HOME/harness}`), so a
   # regression in the record parsing would leave it green while every cell\'s bring-up died. This is the record
@@ -3311,7 +3357,10 @@ SYM_SHA="$(git -C "$SYM_REAL/agent-infra" rev-parse HEAD 2>/dev/null)"
 if [ -n "$SYM_SHA" ] && ln -sfn "$SYM_REAL" "$SYM_LINK" 2>/dev/null \
    && git -C "$SYM_REAL/agent-infra" worktree add -q --detach "$SYM_REAL/harness/$SYM_SHA" "$SYM_SHA" >/dev/null 2>&1; then
   # THE RECORD THE BRING-UP WRITES when CELL_HOME is spelled through the symlink: the pin TREE physically, the
-  # spelling symlinked — the mismatch no reader could see until it was resolved.
+  # spelling symlinked — the mismatch no reader could see until it was resolved. The pin carries its harness
+  # tree, because the bring-up demands one and the guard now corroborates it.
+  mkdir -p "$SYM_REAL/harness/$SYM_SHA/scripts/orchestrator-harness"
+  : > "$SYM_REAL/harness/$SYM_SHA/scripts/orchestrator-harness/orch-loop.sh"
   printf '%s\n' "$SYM_LINK/harness/$SYM_SHA/scripts/orchestrator-harness" > "$SYM_LINK/.harness-path"
   SYM_RC=0
   SYM_OUT="$(EXTRA_ENV="CELL_HOME=$SYM_LINK" ORCH_SUPERVISOR="$SYM_LINK/harness/$SYM_SHA/scripts/cloud-cell-supervisor.sh" inst sym --install 2>&1)" || SYM_RC=$?
