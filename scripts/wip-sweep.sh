@@ -281,9 +281,14 @@ fi
 # their VALIDATION but answer on the READER's own surface — `status=failed` / `rc=3`, through
 # `refuse_startup`, which is what the doc and arms R2/R3 pin — while pass mode keeps its own exit 2. A
 # reader that exited 2 here would fail the contract an instrument reads (`status=`/`rc=` on every run),
-# which is precisely the bug the paragraph above is about. FOUR seams are validated, not two:
-# `WIP_SWEEP_BUDGET`, `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT`, `WIP_SWEEP_STALE_SECONDS`;
-# everything else the reader can answer from the record.
+# which is precisely the bug the paragraph above is about. FIVE seams are validated, not two:
+# `WIP_SWEEP_BUDGET`, `WIP_SWEEP_STATUS_TIMEOUT`, `WIP_SWEEP_RESCUE_TIMEOUT`, `WIP_SWEEP_STALE_SECONDS`
+# and `WIP_SWEEP_MAX` — the last because its validation sits in the SAME block, above the reader branch,
+# so a stray `WIP_SWEEP_MAX=abc` makes the READER answer failed/3 instead of answering from the record.
+# (This comment said FOUR and added "everything else the reader can answer from the record", which the
+# code contradicted — measured: a fresh `status=ok` record plus `WIP_SWEEP_MAX=abc` answered
+# `rc=3 status=failed`. The behaviour is correct and fail-closed; only the count was wrong. The doc at
+# docs/ops/wip-sweep.md:286-287 already lists all five, so this is the artifact that was out of step.)
 STALE_SECONDS="${WIP_SWEEP_STALE_SECONDS:-86400}"
 STATUS_TIMEOUT="${WIP_SWEEP_STATUS_TIMEOUT:-60}"
 RESCUE_TIMEOUT="${WIP_SWEEP_RESCUE_TIMEOUT:-300}"
@@ -502,7 +507,17 @@ if [ "$MODE" = status ]; then
     incomplete) _DERIVED_RC=1 ;;
     *) _DERIVED_RC=3 ;;
   esac
-  grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded'
+  # ⛔ AND THE PASSTHROUGH IS PART OF THAT GUARANTEE (review finding, round 8). The three filters above
+  # are ANCHORED (`^status=`, `^rc=`, `^recorded`), so they drop the reader's OWN keys and nothing else:
+  # any OTHER line the record carries — a `detail=`, or a key a later version adds — flowed through
+  # VERBATIM, so a record whose `detail=` contained the literal `status=ok` printed that substring while
+  # the script exited 3. Measured: `detail=note: status=ok was seen earlier` → the printed surface
+  # contained `status=ok` and `rc=3`. No shipped pass can write that (DETAIL is built from counters —
+  # `unmeasured=`/`rescue_failed=`, `deferred=`, `budget_stopped=` — never from a caller's string), so
+  # this is the foreign/corrupted-record class the reader exists to survive. The line is DROPPED rather
+  # than rewritten because dropping can only REMOVE green, never add it, and the record itself is still
+  # on disk at $STATUS_FILE (the refusal below names that path). Arm I7e pins it.
+  grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded' | grep -v 'status=ok'
   printf 'recorded=%s\n' "${S_ST:-<none>}"
   printf 'recorded_rc=%s\n' "${S_RC:-?}"
   printf 'rc=%s\n' "$_DERIVED_RC"

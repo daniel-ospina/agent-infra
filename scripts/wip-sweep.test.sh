@@ -597,6 +597,21 @@ if grep -q 'status=ok' <<<"$OST"; then
 else
   ok "I7b no emitted key CONTAINS status=ok (recorded= / recorded_rc= cannot collide)"
 fi
+# ⛔ AND THE PASSTHROUGH IS PART OF THE SAME GUARANTEE (review finding, round 8). I7b's fixture writes
+# `detail=x`, and the three filters upstream of the print are ANCHORED (`^status=`), so a record whose
+# OTHER keys carry the literal `status=ok` — here a `detail=` — reached the print verbatim while the
+# script exited 3. That is the same consumer-side false green I7b exists to close, one key over.
+mkdir -p "$T/state-xdetail"
+printf 'status=failed\nrc=3\nts=%s\ndetail=note: status=ok was seen earlier\n' "$(date -u '+%s')" \
+  > "$T/state-xdetail/wip-sweep.status"
+OST2="$(WIP_SWEEP_STATE_DIR="$T/state-xdetail" bash "$SW" --print-status 2>/dev/null)"; RC=$?
+[ "$RC" -eq 3 ] && ok "I7d a record whose OTHER key carries status=ok still answers 3" \
+                || bad "I7d answered $RC (want 3)"
+if grep -q 'status=ok' <<<"$OST2"; then
+  bad "I7e a passthrough line still CONTAINS status=ok — a grep consumer reads green off an rc=3 box"
+else
+  ok "I7e no passthrough line CONTAINS status=ok either (the pass-through is part of the guarantee)"
+fi
 OST_RC="$(sed -n 's/^rc=//p' <<<"$OST" | tail -1)"
 [ "$OST_RC" = "3" ] \
   && ok "I7c the printed rc= is the DERIVED one (3), not the recorded rc of a stale pass" \
