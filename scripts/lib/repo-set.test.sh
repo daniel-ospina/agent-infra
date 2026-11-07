@@ -164,6 +164,17 @@ arm missing-checkout MISSING-CHECKOUT "slug=o/n"
 arm relative-checkout RELATIVE-CHECKOUT "slug=o/n checkout=tortoise"
 arm relative-state  RELATIVE-STATE   "slug=o/n checkout=$T/tortoise state=state"
 arm duplicate-key   DUPLICATE-KEY    "slug=o/n slug=p/q checkout=$T/tortoise"
+# ⛔ ORDER MUST NOT DECIDE WHETHER A LINE IS REFUSED (review round 41, P2 — a real defect, no arm until
+# now). The three duplicate checks used the VALUE's emptiness as the seen-flag, so `checkout= checkout=/x`
+# — first occurrence empty — reported nothing and the LAST value won silently (rc 0, no message), while
+# the mirror shape `checkout=/x checkout=` WAS refused. Same malformed line, two verdicts, decided by
+# token order. Measured on the pre-fix reader: `checkout= checkout=/tmp` → `o/n<TAB>/tmp`, rc 0.
+arm duplicate-key-empty-first DUPLICATE-KEY "slug=o/n checkout= checkout=$T/tortoise"
+arm duplicate-key-state-empty-first DUPLICATE-KEY "slug=o/n checkout=$T/tortoise state= state=$T/agent-infra"
+# …and the empty value itself must stay legal ONCE (`checkout=` is how a line says "no checkout" in the
+# set's own syntax), or the flag/value split above would have traded one defect for a worse one.
+ck "c-empty-value-is-legal-once (the duplicate check must not fire on a single empty value)" \
+   'printf "slug=o/n checkout=%s state=\n" "$T/tortoise" > "$T/empty-val.conf"; [ "$(run_reader_rc "$T/empty-val.conf" list)" = 0 ]'
 
 ck "c-empty has its own code (4), distinct from an absent file (3)" \
    'printf "# only comments\n\n" > "$T/empty.conf"; [ "$(run_reader_rc "$T/empty.conf" list)" = 4 ]'
@@ -283,7 +294,7 @@ SETUP_MUT="$T/setup-mut.sh"
 python3 - "$REPO_ROOT/pi-bootstrap/setup.sh" "$SETUP_MUT" <<'PY2'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 def drop(name, entry):
     global t
     m = re.search(r"^%s=\((.*)\)$" % name, t, re.M)
@@ -293,7 +304,7 @@ def drop(name, entry):
     t = t[:m.start()] + "%s=(%s)" % (name, " ".join(words)) + t[m.end():]
 drop("fleet_srcs", "pr-doctor-machine.sh")
 drop("lib_srcs", "repo-set.sh")
-open(dst, "w").write(t)
+open(dst, "w", encoding='utf-8').write(t)
 PY2
 MUT_FARM="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP_MUT")"
 MUT_LIB="$(sed -n 's/^lib_srcs=(\(.*\))$/\1/p' "$SETUP_MUT")"
@@ -427,28 +438,34 @@ cp "$REPO_ROOT/scripts/pr-doctor.py" "$NP/pr-doctor.py"
 python3 - "$NP/pr-doctor-machine.sh" <<'PYNOPY'
 import sys
 p = sys.argv[1]
-s = open(p).read()
+s = open(p, encoding='utf-8').read()
 old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
 assert s.count(old) == 1, s.count(old)
-open(p, "w").write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
+open(p, "w", encoding='utf-8').write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
 PYNOPY
 _o_np="$(HOME="$T/nopyhome" OR=acme/tor bash "$NP/pr-doctor-machine.sh" 2>&1)"; _rc_np=$?
+# ⛔ THE SECOND ENTRY STATE, DRIVEN BY A REAL SET FILE. `f35` above is the no-set state; this one is the
+# set state, and it is the ONLY fixture that can see a RELOCATED guard (see the arm below).
+_o_np_set="$(REPO_SET_FILE="$CONF" HOME="$T/nopyhome" bash "$NP/pr-doctor-machine.sh" 2>&1)"; _rc_np_set=$?
 ck "f35 no python3 on the box is a NAMED refusal at exit 2, never a grading claim" \
    '[ "$_rc_np" = 2 ] && grep -q "no python3 on this box" <<<"$_o_np"'
-# ⛔ ONE ARM, ONE ENTRY STATE, AND NO DUPLICATE (round 39 split this in two; round 40 merged it back
-# because the split was vacuous). The `[ -z "$PY" ]` guard sits ~90 lines ABOVE both the set branch and
-# the degraded branch, so NO fixture reaches either branch: the set-state and no-set fixtures produce
-# BYTE-IDENTICAL output (the guard reads neither `REPO_SET_FILE` nor `OR`), so `f36b` could not redden
-# without `f36` and its label claimed a branch coverage it did not have. One arm pins the refusal being
-# NAMED at exit 2 in the no-set entry state; the `grading N repo(s)` conjunct is kept because the SET
-# branch owns that claim and deleting the guard DOES let it through there. ⛔ Non-vacuity is `f35`'s own
-# mutant: delete the guard and BOTH branches announce a pass before dying on `exec: : not found` at rc
-# 127 — the mutant's red set is EXACTLY f35 + f36, nothing else, which is what makes this arm
-# load-bearing. ⛔ THE COUNTS ARE DELIBERATELY NOT WRITTEN HERE. THREE lanes change this suite's arm
-# total under this branch, so a per-head "179 passed / 2 failed" written once is wrong by the next
-# commit — that happened twice in this PR's own review trail. The red SET is stable; the totals are not.
-ck "f36 no interpreter: neither entry state announces a pass the missing interpreter would silently void" \
-   '[ "$_rc_np" = 2 ] && ! grep -q "Grading the ONE repo" <<<"$_o_np" && ! grep -q "grading .* repo(s)" <<<"$_o_np"'
+# ⛔ ONE ARM, TWO ENTRY STATES — AND THE REVIEW THAT SPLIT IT WAS HALF RIGHT (rounds 39-41). The
+# `[ -z "$PY" ]` guard sits ~90 lines ABOVE both the set branch and the degraded branch, so with the
+# SHIPPED guard NO fixture reaches either branch: the set-state and no-set fixtures produce
+# BYTE-IDENTICAL output (the guard reads neither `REPO_SET_FILE` nor `OR`), which is why two arms were
+# vacuous and round 40 merged them into one. ⛔ BUT THE SET STATE IS STILL THE ONLY FIXTURE THAT CAN
+# CATCH A RELOCATED GUARD, and dropping it was a real coverage loss: a mutant that MOVES the guard into
+# the `3)` branch so only the SET branch loses it left the single no-set arm GREEN while the set branch
+# printed `set: … -> grading 2 repo(s)` and died `exec: : not found` at rc 127 (measured at round 40).
+# Hence: ONE arm (no duplicate), BOTH states driven, and the `grading N repo(s)` conjunct kept — it is
+# unreachable in the no-set state by construction and reachable in the set state the moment the guard
+# moves, which is exactly the mutant above. Non-vacuity is `f35`'s own mutant: delete the guard and BOTH
+# branches announce a pass before dying at rc 127; the mutant's red set is EXACTLY f35 + f36.
+# ⛔ THE COUNTS ARE DELIBERATELY NOT WRITTEN HERE. Three lanes change this suite's arm total under this
+# branch, so a per-head "179 passed / 2 failed" written once is wrong by the next commit — that
+# happened twice in this PR's own review trail. The red SET is stable; the totals are not.
+ck "f36 no interpreter: NEITHER entry state announces a pass the missing interpreter would silently void" \
+   '[ "$_rc_np" = 2 ] && ! grep -q "Grading the ONE repo" <<<"$_o_np" && ! grep -q "grading .* repo(s)" <<<"$_o_np" && [ "$_rc_np_set" = 2 ] && ! grep -q "grading .* repo(s)" <<<"$_o_np_set"'
 # ⛔ THE RETURN-CODES TABLE IS A CONTRACT FOR EVERY VERB, NOT JUST `check` (sweep at `bc83af08`, P1).
 # `repo_set_slugs` and `repo_set_doctor_repos` are DERIVED from `repo_set_parse`, and each carries
 # `[ "$rc" = 0 ] || return "$rc"` for exactly the reason the header gives: "ONE TABLE, AND IT IS THE
@@ -511,10 +528,10 @@ else
 python3 - "$NA/repo-set.sh" <<'PYNA'
 import sys
 p = sys.argv[1]
-s = open(p).read()
+s = open(p, encoding='utf-8').read()
 old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
 assert s.count(old) == 1, s.count(old)
-open(p, "w").write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
+open(p, "w", encoding='utf-8').write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
 PYNA
   printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/denparent/den/repos.conf"
   chmod 000 "$T/denparent/den"
@@ -585,7 +602,11 @@ subst = re.compile(r'\$\([^)]*\)|(?<!\\)`[^`]*`')
 found = set()
 # ⛔ EXPLICIT UTF-8, because this file and the wrapper are full of em dashes and `⛔`: under an ambient
 # `PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 LC_ALL=POSIX` the default text encoding makes `open()` raise
-# UnicodeDecodeError and BOTH arms red on a correct tree (fail-closed, but a false block all the same).
+# UnicodeDecodeError on a CORRECT tree (fail-closed, but a false block all the same). ⛔ THE FIRST FIX FOR
+# THIS HARDENED ONLY THE TWO SCANS AND ITS COMMENT SAID SO — “BOTH arms red” — while the file holds 31
+# `open()` calls: a reviewer measured 22 arms red under that exact locale, every one an unhardened
+# mutation fixture (round 41, P2). EVERY `open()` in this file now passes `encoding='utf-8'`, and the
+# locale is part of this suite's own matrix below rather than a sentence in a comment.
 for line in open(sys.argv[1], encoding='utf-8'):
     s = line.rstrip('\n')
     if s.lstrip().startswith('#'):      # prose is not a call — nor is a commented-out example
@@ -611,8 +632,13 @@ for _c in $_probe_list; do
 done
 ck "f11e the SOURCED guard's list EQUALS the reader functions this wrapper CALLS (a call without a probe, a probe without a call, or a second list line all redden)" \
    '[ "$_probe_nlist" = 1 ] && [ -z "$_probe_miss" ] && [ -z "$_probe_extra" ]'
-ck "f11e-0 …and that scan is non-vacuous: it really did find the nine names (an empty scan would pass f11e silently)" \
-   '[ "$_probe_n" -ge 9 ]'
+# ⛔ NO `f11e-0` ARM: IT COULD NOT REDDEN ALONE (review round 40, P2 — this is the `f36b` class again,
+# and it was introduced by this PR). The arm asserted `_probe_n >= 9` and its label claimed "an empty
+# scan would pass f11e silently". Measured, both halves are false: with the reader-side scan forced
+# empty, `_probe_miss` is "" (nothing in the list to miss) but `_probe_extra` holds all nine CALLS, so
+# `f11e` itself FAILS — and `f11e` passing already requires calls ⊇ list, so the count is ≥ 9 whenever
+# `f11e` passes. The non-vacuity it claimed is carried by `f11e`'s own `_probe_extra` conjunct; an arm
+# on top of it cannot fail independently and would only ever restate green.
 # ⛔ THE NAMESPACE f11e SCANS IS NOT AN ASSUMPTION, IT IS PINNED (round 38, P2; rounds 39-40 made the
 # pin actually hold). `f11e` can only see calls whose name starts `repo_set_` or `_rs_`; if the reader
 # ever defined a helper outside that scheme, a call to it would be invisible to the scan and the guard
@@ -623,15 +649,19 @@ ck "f11e-0 …and that scan is non-vacuous: it really did find the nine names (a
 # stayed invisible. All of it is covered now — four spellings, any indentation, brace on either line —
 # and comments are skipped so a prose mention of someone else's function (`configured_repos()`, which
 # belongs to the doctor) is not counted as one of this reader's definitions.
-# ⛔ CAPABILITY IS NOT COVERAGE, AND THIS FILE MUST NOT CONFUSE THEM (round 40, P2). The shipped reader
-# happens to use ONE of the forms — 23 definitions, all `name() {` on one line — so the next-line-brace
-# branch and the `function …` spellings are proven by MUTANT (a definition in that style reddens this
-# arm) and NOT by the baseline. A regression that deleted those branches would leave the baseline green;
-# the mutant is what catches it. Said here because the sentence above would otherwise read as "the
-# reader exercises all four", which it does not.
+# ⛔ CAPABILITY IS NOT COVERAGE (round 40, P2), AND THE FIX FOR THAT IS AN ARM, NOT A SENTENCE (round
+# 41, P2 — this comment previously claimed the extra branches were “proven by MUTANT” when no mutant
+# ran the scan at all). The shipped reader uses ONE spelling — 23 definitions, all `name() {` on one
+# line — so `f11f` alone cannot tell three working branches from three deleted ones. `f11f-0` below runs
+# the same scan against a four-spelling fixture; between them the branches are exercised in the suite.
 # ⛔ NO SHELL KEYWORD CAN PASS AS A DEFINITION: a bare `done`/`fi`/`local` line would match the
 # brace-on-the-next-line head pattern, so keywords are excluded by name.
-_reader_defs="$(python3 - "$READER" <<'PYDEFS'
+# ⛔ THE SCAN IS A FILE, NOT A HEREDOC-INLINE, SO IT CAN BE RUN AGAINST A FIXTURE (review round 41,
+# P2). As a heredoc it ran exactly ONCE, against `$READER` — so the previous comment's claim that the
+# next-line and `function` branches were “proven by MUTANT” was false: no mutant ever ran this scan.
+# Written to `$T` and run twice instead, so `f11f-0` below is a real in-suite arm and not a memory of one
+# run by hand.
+cat > "$T/defs.py" <<'PYDEFS'
 import re, sys
 
 KEYWORDS = {'if','then','else','elif','fi','for','while','until','do','done','case','esac',
@@ -662,7 +692,7 @@ for i, raw in enumerate(lines):
         break
 print(' '.join(defs))
 PYDEFS
-)"
+_reader_defs="$(python3 "$T/defs.py" "$READER")"
 _reader_defs_n=0; _reader_odd=""
 for _d in $_reader_defs; do
   _reader_defs_n=$(( _reader_defs_n + 1 ))
@@ -670,6 +700,44 @@ for _d in $_reader_defs; do
 done
 ck "f11f every function the READER defines — in ANY declaration style, brace on either line — is in the repo_set_/_rs_ namespace f11e can see" \
    '[ "$_reader_defs_n" -ge 15 ] && [ -z "$_reader_odd" ]'
+# ⛔ CAPABILITY IS NOW COVERAGE (review round 41, P2). The shipped reader uses ONE spelling — every
+# definition is `name() {` on one line — so a regression that DELETED the next-line-brace branch or the
+# `function …` branches would leave `f11f` above green while its comment claimed all four were handled.
+# This arm runs the same scan against a fixture that contains all four spellings, an indented one, a
+# brace-on-next-line pair, and bare `done`/`fi`/`local` lines followed by `{` (which must NOT be counted).
+# It is the mutation `f11f` needs to be non-vacuous, and it runs in the suite rather than in a review.
+cat > "$T/defs-fixture.sh" <<'FIXTURE'
+name_same_line() { :; }
+function name_func_kw {
+  :
+}
+  indented_same_line() { :; }
+name_next_line()
+{
+  :
+}
+function name_func_next
+{
+  :
+}
+# comment_only() {
+: # name_trailing_comment() {
+done
+{
+  :
+}
+fi
+{
+  :
+}
+local
+{
+  :
+}
+FIXTURE
+_scan_fixture="$(python3 "$T/defs.py" "$T/defs-fixture.sh")"
+ck "f11f-0 …and every one of those spellings is really SEEN (brace on either line, any indent), while bare keywords followed by '{' are not counted" \
+   '[ "$_scan_fixture" = "name_same_line name_func_kw indented_same_line name_next_line name_func_next" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
@@ -745,10 +813,10 @@ M="$T/mut"; mkdir -p "$M/lib"
 python3 - "$READER" "$M/lib/repo-set.sh" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 start = t.index('    case "$seen" in\n')
 end = t.index('    esac\n', start) + len('    esac\n')
-open(dst, "w").write(t[:start] + "    :\n" + t[end:])
+open(dst, "w", encoding='utf-8').write(t[:start] + "    :\n" + t[end:])
 PY
 ck "g0 the mutation really removed the arm (a mutation that did not apply proves nothing)" \
    '! grep -q "repo-set: DUPLICATE-SLUG" "$M/lib/repo-set.sh"'
@@ -768,7 +836,7 @@ mkdir -p "$(dirname "$OLDPLIST")"
 python3 - "$PLIST" "$OLDPLIST" <<'PY'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 start = t.index("    <key>ProgramArguments</key>")
 end = t.index("</array>", start) + len("</array>")
 old = """    <key>ProgramArguments</key>
@@ -779,11 +847,15 @@ old = """    <key>ProgramArguments</key>
         <string>--repo</string>
         <string>daniel-ospina/tortoise</string>
     </array>"""
-open(dst, "w").write(t[:start] + old + t[end:])
+open(dst, "w", encoding='utf-8').write(t[:start] + old + t[end:])
 PY
 OLDPROG="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$OLDPLIST")"
-ck "h1 the shipped unit passes e2/e3" \
-   '! grep -qE "<string>(--repo|--all-repos|daniel-ospina/)" <<<"$PROG"'
+# ⛔ NO `h1` ARM: IT WAS BYTE-IDENTICAL TO `e2` AND ITS LABEL NAMED AN ARM IT DID NOT RUN (review round
+# 40, P2). Both expressions were the same string, on `$PROG`, which is assigned once and never rebuilt —
+# so `h1` could not redden without `e2`, and the `e3` its label cited (`! grep -q "daniel-ospina"`) was
+# never evaluated. The assertion it claimed is carried by `e2` and `e3` themselves, above. Found by
+# scanning all 152 `ck` arms for expression identity; this file keeps that scan's result rather than a
+# restatement of it.
 ck "h2 the PRE-#2281 argv would FAIL e2 (the assertion discriminates the change)" \
    'grep -qE "<string>(--repo|daniel-ospina/)" <<<"$OLDPROG"'
 
@@ -797,7 +869,7 @@ PD="$T/mutdoc"; mkdir -p "$PD"
 python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$PD/pr-doctor.py" <<'PY_DOC'
 import re, sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 # _slug_from_remote -> sentinel for every input; _normalize_slug -> sentinel for every input.
 body = '    return "sentinel/owner"\n'
 # ⛔ APPENDED, NOT REGEXED INTO THE BODY. A body regex swallowed only the first line of a multi-line
@@ -808,7 +880,7 @@ t += (
     "\n\ndef _slug_from_remote(url):\n" + body +
     "\n\ndef _normalize_slug(value):\n" + body
 )
-open(dst, "w").write(t)
+open(dst, "w", encoding='utf-8').write(t)
 PY_DOC
 # Call ONE reader function in a child shell, with REPO_SET_DOCTOR inherited: `rs_call <fn> [args...]`.
 rs_call() { local fn="$1"; shift; bash -c '. "$1"; shift; "$@"' _ "$READER" "$fn" "$@"; }
@@ -822,10 +894,10 @@ cp -R "$T/tortoise" "$T/ngh" 2>/dev/null
 python3 - "$T/ngh/.git/config" <<'PY_CFG'
 import re, sys
 p = sys.argv[1]
-t = open(p).read()
+t = open(p, encoding='utf-8').read()
 t = re.sub(r"(\[remote \"origin\"\]\n(?:\t[^\n]*\n)*?\turl = )[^\n]*",
            r"\1https://notgithub.com/o/n.git", t)
-open(p, "w").write(t)
+open(p, "w", encoding='utf-8').write(t)
 PY_CFG
 ck "h2c a host the doctor will not attest (notgithub.com) proves NOTHING through the reader" \
    '[ -z "$(rs_call _rs_origin_slug "$T/ngh" | cut -f1)" ]'
@@ -882,7 +954,13 @@ printf 'slug=acme/tools-api checkout=%s\nslug=acme-tools/api checkout=%s\n' "$T/
 ck "j10 a TAG collision is refused here, not left for the doctor to refuse after we certify OK" \
    '[ "$(run_reader_rc "$T/tag-collide.conf" check)" = 1 ] && run_reader "$T/tag-collide.conf" check | grep -q "REFUSED set"'
 ck "j11 …and the wrapper never announces a count for it" \
-   'REPO_SET_FILE="$T/tag-collide.conf" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q . ; [ $? -ne 0 ]'
+   'o="$(REPO_SET_FILE="$T/tag-collide.conf" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; [ $? -ne 0 ] && ! grep -q "grading .* repo(s)" <<<"$o"'
+# ⛔ THE COUNT IS ON STDERR, SO `2>/dev/null | grep -q .` COULD NOT SEE IT (review round 40, P2). `_say`
+# writes to stderr (that is how `f3` reads it), and this arm discarded stderr and then asserted stdout was
+# empty — true no matter what the wrapper announced. A mutant that inserted `_say "set: … -> grading 2
+# repo(s)"` before `repo_set_check` printed the false claim, refused anyway, and left the arm GREEN.
+# Both streams are merged now, and the pattern stays specific: the reader's own refusal wording is
+# `REFUSING — N repo(s) named`, which does not match `grading .* repo(s)`.
 # ⛔ THE DANGLING ARM MUST NOT DIAGNOSE A CAUSE `[ ! -e ]` CANNOT ESTABLISH (review round 8, P2):
 # that test is false for EACCES/EPERM and for ELOOP too, and this file's own doctrine says absence can
 # never be PROVEN from inside a sandbox. The CODE (5) is right; the message must not claim "the target
@@ -932,6 +1010,28 @@ ck "j16 with NO python3 on PATH the tag guard still refuses (absolute fallback, 
 printf 'slug=daniel-ospina/tortoise checkout=%s\302\240\n' "$T/decoy" > "$T/trail-nbsp.conf"
 ck "j17 a TRAILING separator truncates a value -> refused (a count cannot see it)" \
    'o="$(run_reader "$T/trail-nbsp.conf" check)"; [ "$(run_reader_rc "$T/trail-nbsp.conf" check)" = 1 ] && grep -q "REFUSED set" <<<"$o"'
+# ⛔ THE SAME FIXTURE UNDER THE LOCALE THIS UNIT EXISTS TO SURVIVE (review round 41, P2 — a measured
+# FAIL-OPEN, so it needs an arm and not a sentence). Under `LC_ALL=POSIX` CPython decodes argv with
+# surrogateescape: the NBSP arrives as `\udcc2\udca0`, `str.strip()` sees no whitespace, and the
+# delegated split/trim guards become no-ops — the reader then returned `OK — 1 repo(s)` at rc 0 for the
+# exact set `j17` above REFUSES at rc 1. Same bytes, opposite verdicts, and the permissive one won on
+# the default locale of the launchd path. The proof runner now sets `PYTHONUTF8=1` on its child, so both
+# locales must agree; this arm pins that they do, and it reddens if either the env prefix or the
+# lenient behaviour ever comes back.
+ck "j17-0 …and the SAME fixture is refused under an ambient POSIX locale (argv must not decode differently from the caller)" \
+   '[ "$(LC_ALL=POSIX PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 run_reader_rc "$T/trail-nbsp.conf" check)" = 1 ] && LC_ALL=POSIX PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 run_reader "$T/trail-nbsp.conf" check | grep -q "REFUSED set"'
+# ⛔ A SEAM THAT NAMES NOTHING MUST NOT BE DIAGNOSED AS A MISSING SIBLING (review round 41, P2).
+# `REPO_SET_DOCTOR` is a test injection point; set to a path that is not a file it makes both whole-set
+# proofs UNASKABLE, and the generic WARN explained that as "pr-doctor.py is not beside this reader, or
+# no python3 resolves" — NEITHER of which is true, so an operator would go looking for a missing sibling
+# that is present. ⛔ What the seam still COSTS is stated rather than changed: unaskable is a WARN by
+# this file's round-4 doctrine (nothing PROVEN, nothing WRONG), so the verdict is `OK` on that path —
+# turning it into a refusal would reverse that decision and block every box carrying the reader without
+# the doctor. The arm pins the CAUSE being named, which is the honest part of the fix.
+ck "j-doctor-seam-a-typo-is-named-as-the-cause-not-as-a-missing-sibling" \
+   'o="$(REPO_SET_DOCTOR="$T/no-such-doctor.py" run_reader "$T/tag-collide.conf" check 2>&1)"; grep -q "REPO_SET_DOCTOR" <<<"$o" && grep -q "not a file" <<<"$o" && ! grep -q "not beside this reader" <<<"$o"'
+ck "j-doctor-seam-empty-is-not-set (an empty seam takes the sibling path, byte-identical to no seam)" \
+   '[ "$(REPO_SET_DOCTOR="" run_reader_rc "$T/tag-collide.conf" check)" = "$(run_reader_rc "$T/tag-collide.conf" check)" ]'
 
 # ⛔ A CONFIG FILE BEHIND A DENIED ANCESTOR IS NOT "ABSENT" (review round 9, P2): `-e` is false for
 # every stat failure, so the plain-file arm read "does not exist" and the box DEGRADED — one repo
@@ -1019,8 +1119,11 @@ ck "j26 a fault on the SECOND entry is reported against entry 2, not entry 1" \
 
 ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
    '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
-ck "j6 check returns 1 for a set that PARSES but whose proof fails (a different fix from a broken file)" \
-   '[ "$(run_reader_rc "$T/proof-wrong-provenance.conf" check)" = 1 ]'
+# ⛔ NO `j6` ARM: IT WAS BYTE-IDENTICAL TO `d-provenance-refusal-does-not-just-warn` (review round 40,
+# P2). Same expression, same fixture, and that fixture is written once and never rewritten in between —
+# so it could not redden independently. Its label claimed the `1`-vs-`5` distinction ("a different fix
+# from a broken file"), which is carried by `d-provenance` (=1) and `j7` (=5) below, each on its own
+# fixture. The distinction is what matters here, not a third copy of one half of it.
 printf 'slug=notaslug checkout=%s\n' "$T/tortoise" > "$T/malformed.conf"
 ck "j7 check PROPAGATES 5 for a genuinely malformed set (it must not fold 3/4/5 into 1)" \
    '[ "$(run_reader_rc "$T/malformed.conf" check)" = 5 ]'
@@ -1043,10 +1146,10 @@ M2="$T/mut2"; mkdir -p "$M2/lib"
 python3 - "$READER" "$M2/lib/repo-set.sh" <<'PY2'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 old = "_rs_lower() { printf '%s' \"${1:-}\" | tr '[:upper:]' '[:lower:]'; }"
 assert t.count(old) == 1, "the case-fold helper moved; the mutation cannot be expressed"
-open(dst, "w").write(t.replace(old, "_rs_lower() { printf '%s' \"${1:-}\"; }"))
+open(dst, "w", encoding='utf-8').write(t.replace(old, "_rs_lower() { printf '%s' \"${1:-}\"; }"))
 PY2
 ck "l0 the mutation really replaced the fold (a mutation that did not apply proves nothing)" \
    '! grep -q "tr .\[:upper:\]. .:lower:.\]" "$M2/lib/repo-set.sh"'
@@ -1114,7 +1217,7 @@ M3="$T/mut3"; mkdir -p "$M3/lib"
 python3 - "$READER" "$M3/lib/repo-set.sh" <<'PY3'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 start = t.index("_rs_state_key() {")
 end = t.index("\n}\n", start) + 3
 round6 = '''_rs_state_key() {
@@ -1126,7 +1229,7 @@ round6 = '''_rs_state_key() {
   printf '%s' "$resolved"
 }
 '''
-open(dst, "w").write(t[:start] + round6 + t[end:])
+open(dst, "w", encoding='utf-8').write(t[:start] + round6 + t[end:])
 PY3
 ck "m10 the mutation really removed the component walk (a mutation that did not apply proves nothing)" \
    '! grep -q "EOF_STATE_KEY" "$M3/lib/repo-set.sh"'
@@ -1210,10 +1313,10 @@ MD="$T/mutdoc"; mkdir -p "$MD"
 python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MD/pr-doctor.py" <<'PYM'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 old = 'items = [s.strip() for s in re.split(r"[,\\s]+", raw)]'
 assert t.count(old) == 1, "the doctor's splitter moved; the mutation cannot be expressed"
-open(dst, "w").write(t.replace(old, 'items = [s.strip() for s in re.split(r"[,\\s;]+", raw)]'))
+open(dst, "w", encoding='utf-8').write(t.replace(old, 'items = [s.strip() for s in re.split(r"[,\\s;]+", raw)]'))
 PYM
 ck "m22 …and when the DOCTOR's splitter learns \`;\`, the reader FOLLOWS it and refuses (delegation, not a copy)" \
    '[ "$(REPO_SET_DOCTOR="$MD/pr-doctor.py" run_reader_rc "$T/semi.conf" check)" = 1 ]'
@@ -1227,9 +1330,9 @@ ME="$T/mutempty"; mkdir -p "$ME"
 python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$ME/pr-doctor.py" <<'PYE'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 t += "\n\n_orig_configured_repos = configured_repos\ndef configured_repos(explicit=(), env=None):\n    return []\n"
-open(dst, "w").write(t)
+open(dst, "w", encoding='utf-8').write(t)
 PYE
 ck "m23 a doctor that yields NO entries is NOT silently \`ok\` — it WARNS WHOLE-SET-PROOFS-SKIPPED" \
    'REPO_SET_DOCTOR="$ME/pr-doctor.py" run_reader "$CONF" check | grep -q "WARN WHOLE-SET-PROOFS-SKIPPED"'
@@ -1243,12 +1346,12 @@ MI="$T/mutmid"; mkdir -p "$MI"
 python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MI/pr-doctor.py" <<'PYI'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 t += ("\n\n_orig_configured_repos = configured_repos\n"
       "def configured_repos(explicit=(), env=None):\n"
       "    parts = (env or {}).get('PR_DOCTOR_REPOS', '').split(',')\n"
       "    return [parts[0], '', parts[1]] if len(parts) > 1 else parts\n")
-open(dst, "w").write(t)
+open(dst, "w", encoding='utf-8').write(t)
 PYI
 # ⛔ THIS ARM MUST ASSERT THE MESSAGE, NOT ONLY THE EXIT CODE (review round 13, P2). It originally
 # checked rc alone — and rc is 1 EITHER WAY, because the entry INDEX keeps the report non-empty even
@@ -1274,9 +1377,9 @@ ck "m26 the CONTROL: two TAG-colliding repos are refused by the shipped doctor (
 python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MT/pr-doctor.py" <<'PYT'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 t = t.replace("def set_tag_collisions(", "def _disabled_set_tag_collisions(", 1)
-open(dst, "w").write(t)
+open(dst, "w", encoding='utf-8').write(t)
 PYT
 ck "m27 …and a sibling WITHOUT \`set_tag_collisions\` WARNS instead of silently certifying the collision" \
    'REPO_SET_DOCTOR="$MT/pr-doctor.py" run_reader "$T/tagcollide.conf" check | grep -q "the tag-collision proof did NOT run"'
@@ -1312,10 +1415,10 @@ M4="$T/mutdotgit"; mkdir -p "$M4/lib"
 python3 - "$READER" "$M4/lib/repo-set.sh" <<'PYD'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 old = '      slug_n="$(_rs_normalize_slug "$slug")"'
 assert t.count(old) == 1, "the provenance normalisation moved; the mutation cannot be expressed"
-open(dst, "w").write(t.replace(old, '      slug_n="$slug"'))
+open(dst, "w", encoding='utf-8').write(t.replace(old, '      slug_n="$slug"'))
 PYD
 ck "m33 …and with that normalisation REVERTED the same fixture is refused (rc 1) — m32 discriminates" \
    '[ "$(REPO_SET_DOCTOR="$REPO_ROOT/scripts/pr-doctor.py" REPO_SET_FILE="$T/dotgit.conf" bash "$M4/lib/repo-set.sh" check >/dev/null 2>&1; echo $?)" = 1 ]'
@@ -1331,9 +1434,9 @@ MN="$T/nonorm"; mkdir -p "$MN"
 python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MN/pr-doctor.py" <<'PYN'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
-t = open(src).read()
+t = open(src, encoding='utf-8').read()
 t += "\n\ndel _normalize_slug\n"
-open(dst, "w").write(t)
+open(dst, "w", encoding='utf-8').write(t)
 PYN
 mk_repo "$T/staleco" acme/stale
 printf 'slug=acme/stale.git checkout=%s state=%s/stalestate\n' "$T/staleco" "$T" > "$T/nonorm.conf"

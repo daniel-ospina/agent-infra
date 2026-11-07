@@ -55,6 +55,22 @@
 # on a Mac and the cell home on a cell (`/tmp/cell-home`), the same root `bringup.env` lives under —
 # so one box, one file, and it sits beside the config an operator already knows.
 #
+# ⛔ THE SECOND SEAM IS `$REPO_SET_DOCTOR`, AND IT IS A TEST INJECTION POINT, NOT AN OPERATOR KNOB
+# (review round 40, P2 — it was undocumented, so nothing in this file said it existed). It names the
+# `pr-doctor.py` that `_rs_doctor_py()` asks the delegated proofs of, overriding the sibling that sits
+# beside this reader. The suite uses it to point at MUTATED doctors; that is what it is for.
+# ⛔ WHAT SETTING IT COSTS — stated here because the cost is the surprise: every whole-set proof (the
+# `configured_repos()` splitter round-trip and `set_tag_collisions`) is DELEGATED, so a seam naming a
+# file that does not exist makes both UNASKABLE, and unaskable is a WARN by this file's own doctrine
+# (nothing is PROVEN, but nothing is WRONG either) — so a set the real doctor beside the wrapper would
+# REFUSE can come back `OK` on the WARN path. An operator who sets this to a typo therefore downgrades
+# two whole-set refusals to warnings. ⛔ THAT IS NOT A BUG TO PATCH BY REFUSING: turning unaskable into
+# a refusal would reverse the round-4 decision that a missing sibling/`python3` must never block a box
+# that carries this file without the doctor. The honest defence is to name the CAUSE — the WARN below
+# says `REPO_SET_DOCTOR names no file` when the seam is what made the proofs unaskable, so an operator
+# is not sent to look for a sibling that is present — and to leave this seam undocumented as a way to
+# change what gets graded, because it is not one.
+#
 # USAGE (executed)
 #   repo-set.sh path            # print the file this box would read, existing or not
 #   repo-set.sh list            # one `slug<TAB>checkout<TAB>state` line per repo
@@ -200,7 +216,15 @@ _rs_stat_kind() {
   local p="${1:-}" py
   py="$(_rs_py_resolve)"
   [ -n "$py" ] || { printf 'unknown'; return 0; }
-  "$py" - "$p" <<'PY_STAT' 2>/dev/null || printf 'unknown'
+  # ⛔ UTF-8 MODE HERE IS SYMMETRY, NOT A MEASURED FIX — said plainly because the first version of this
+  # comment claimed one and was FALSIFIED (round 41). It said a non-ASCII path "decodes to surrogate
+  # escapes that `os.stat` cannot open at all". Measured on this very heredoc: it opens fine. CPython's
+  # `fsencode` re-encodes surrogate escapes back to the original bytes, so `os.stat` round-trips and only
+  # STRING-SEMANTIC operations break — which is why the proof runner next door genuinely needed the
+  # prefix (`str.strip`/`re.split` see an NBSP as a non-space and the guards become no-ops) and this one
+  # does not. The prefix stays because the heredoc below is where a path comparison would one day be
+  # added, and a locale-dependent STRING compare here would fail silently as `unknown`.
+  PYTHONUTF8=1 "$py" - "$p" <<'PY_STAT' 2>/dev/null || printf 'unknown'
 import os, sys
 try:
     os.stat(sys.argv[1])
@@ -487,6 +511,14 @@ repo_set_parse() {
     case "$line" in ''|'#'*) continue ;; esac
 
     slug=""; checkout=""; state=""
+    # ⛔ EMPTINESS IS NOT A "SEEN" FLAG (review round 40, P2). The three duplicate checks used
+    # `[ -z "$var" ]`, so `checkout= checkout=/tmp` — the FIRST occurrence empty — never reported
+    # DUPLICATE-KEY and the LAST value won silently (measured: rc 0, no message, `/tmp` kept; the
+    # mirror shape `checkout=/tmp checkout=` was refused, so the refusal depended on ORDER). A key
+    # given twice is refused because a set that reads differently depending on token order is a set
+    # whose shape an operator cannot see. The empty value itself stays legal ONCE (`checkout=` is how
+    # a line says "no checkout"), which is why the flag and the value are separate.
+    local slug_seen=0 checkout_seen=0 state_seen=0
     local line_bad=0
     local IFS=$' \t'
     for tok in $line; do
@@ -496,9 +528,9 @@ repo_set_parse() {
       esac
       key="${tok%%=*}"; val="${tok#*=}"
       case "$key" in
-        slug)     [ -z "$slug" ]     || { _rs_say 2 "repo-set: DUPLICATE-KEY — $f:$ln: slug= given twice"; line_bad=1; }; slug="$val" ;;
-        checkout) [ -z "$checkout" ] || { _rs_say 2 "repo-set: DUPLICATE-KEY — $f:$ln: checkout= given twice"; line_bad=1; }; checkout="$val" ;;
-        state)    [ -z "$state" ]    || { _rs_say 2 "repo-set: DUPLICATE-KEY — $f:$ln: state= given twice"; line_bad=1; }; state="$val" ;;
+        slug)     [ "$slug_seen" = 0 ]     || { _rs_say 2 "repo-set: DUPLICATE-KEY — $f:$ln: slug= given twice"; line_bad=1; };     slug="$val";     slug_seen=1 ;;
+        checkout) [ "$checkout_seen" = 0 ] || { _rs_say 2 "repo-set: DUPLICATE-KEY — $f:$ln: checkout= given twice"; line_bad=1; }; checkout="$val"; checkout_seen=1 ;;
+        state)    [ "$state_seen" = 0 ]    || { _rs_say 2 "repo-set: DUPLICATE-KEY — $f:$ln: state= given twice"; line_bad=1; };    state="$val";    state_seen=1 ;;
         *) _rs_say 2 "repo-set: UNKNOWN-KEY — $f:$ln: \`$key=\` is not a key this set has (slug, checkout, state)"; line_bad=1 ;;
       esac
     done
@@ -639,7 +671,17 @@ _rs_with_doctor() {
   # not a nicety here; it is the difference between a proof and a silent skip.
   py="$(_rs_py_resolve)"
   [ -n "$py" ] || return 0
-  "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
+  # ⛔ `PYTHONUTF8=1` IS PART OF THE PROOF, NOT A TIDY-UP (review round 41, P2 — measured fail-open).
+  # The value travels on ARGV, and under an ambient `LC_ALL=POSIX` (the launchd/cron default shape this
+  # unit exists to survive) CPython decodes argv with surrogateescape, so a UTF-8 NBSP arrives as
+  # `\udcc2\udca0`: `str.strip()` sees no whitespace, `re.split` sees one part, and the delegated guards
+  # become NO-OPS. Measured end to end on a value with a trailing NBSP separator: `LC_ALL=C.UTF-8` ->
+  # `REFUSED set … a value contains a separator`, rc 1; `LC_ALL=POSIX` -> `repo-set: OK — 1 repo(s)`,
+  # rc 0. Same bytes, opposite verdicts, and the permissive one wins on the box's default locale — a
+  # child that reads the value differently from the caller is not a proof. UTF-8 mode fixes the DECODE
+  # (surrogateescape still applies to invalid bytes, so no path is lost), and it is scoped to this one
+  # child so nothing else inherits it.
+  PYTHONUTF8=1 "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
 import importlib.util, sys
 doc, verb, arg = sys.argv[1], sys.argv[2], sys.argv[3]
 spec = importlib.util.spec_from_file_location("_prd", doc)
@@ -1041,7 +1083,16 @@ EOF
     expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
     diverged="$(_rs_split_divergence "$rendered" "$expected")"
   else
-    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    # ⛔ NAME THE CAUSE, DO NOT RECITE THE CANDIDATES (review round 40, P2). The generic sentence below
+    # lists "not beside this reader, or no python3 resolves". A seam naming a file that does not exist
+    # is NEITHER, so an operator holding that message would go looking for a missing sibling that is
+    # present. The seam is a test injection point (see the header), so this is the one branch where the
+    # reader can say exactly what happened without inspecting anything new.
+    if [ -n "${REPO_SET_DOCTOR:-}" ] && [ ! -f "$REPO_SET_DOCTOR" ]; then
+      printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `REPO_SET_DOCTOR` is set to `%s`, which is not a file, so the proof cannot be asked at all. This is a TEST INJECTION SEAM, not an operator setting: unset it to let the sibling pr-doctor.py answer, or point it at a real one. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n' "$REPO_SET_DOCTOR"
+    else
+      printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+    fi
   fi
   if [ "$diverged" = "__UNASKABLE__" ]; then
     printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `configured_repos()` could not be asked (the sibling pr-doctor.py lacks it, or it raised, or it would not LOAD), so the splitter round-trip did NOT run. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
