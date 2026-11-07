@@ -728,12 +728,13 @@ function declaresTransport(entry: McpServerConfig, field: "url" | "command"): bo
  * stdio base produces an incoherent entry (the label says HTTP while `connectServer` dispatches
  * stdio), and evaluating the DELTA alone would miss it — the delta carries no transport at all.
  *
- * ⛔ THIS FUNCTION DETECTS AND REJECTS NOTHING. It returns a boolean; the one caller
- * (`mergeMcpLayers`) logs a note and then applies the delta anyway. That is deliberate, not an
- * omission: `type` must never disqualify an entry (see `RECOGNISED_TYPES` and the `OVERRIDES:`
- * marker above it), so the incoherent entry is KEPT AS WRITTEN and only reported. Do not "fix"
- * the caller to drop or ignore the delta — that reverses a recorded decision and destroys a
- * config this client runs.
+ * ⛔ THIS FUNCTION DETECTS AND REJECTS NOTHING. It returns a boolean, and its callers only LOG:
+ * twice in `mergeMcpLayers` (the repo-only entry, and the EFFECTIVE/projected entry) and once in
+ * `asMcpJson` (a BASE entry, which the merge copies verbatim and therefore never inspects). The
+ * entry is always KEPT AS WRITTEN. That is deliberate, not an omission: `type` must never
+ * disqualify an entry (see `RECOGNISED_TYPES` and the `OVERRIDES:` marker above it), so an
+ * incoherent entry is reported and kept. Do not "fix" a caller to drop or ignore the entry —
+ * that reverses a recorded decision and destroys a config this client runs.
  */
 function typeDisagrees(entry: McpServerConfig): boolean {
   const type = (entry as Record<string, unknown>).type;
