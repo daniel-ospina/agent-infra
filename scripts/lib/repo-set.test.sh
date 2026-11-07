@@ -613,6 +613,47 @@ ck "m6 …and the control fixtures really are one directory (\`..\` and the syml
    '[ -n "$STATE_INO" ] && [ "$STATE_INO" = "$(ino "$T/state/sub/..")" ] && [ "$STATE_INO" = "$(ino "$T/state-link")" ]'
 ck "m7 …while the two DIFFERENT dirs do not (so m3/m4 are proving identity, not refusing everything)" \
    '[ "$STATE_INO" != "$(ino "$T/state-ai")" ]'
+# Round 7, P2: the SAME collision survives when NEITHER directory exists yet — which is the
+# FIRST-INSTALL state, the one `check` deliberately permits. Before this round `state` vs
+# `state/../state` printed `repo-set: ok` twice and exited 0 with `OK — 2 repo(s)`.
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/nx/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/nx/state/../state\n' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/absentdotdot-state.conf"
+ck "m8 an ABSENT state dir named through \`..\` is the shared-state refusal (the first-install state)" \
+   'run_reader "$T/absentdotdot-state.conf" check | grep -q "is shared with another repo in this set"'
+# …and the repair must be PHYSICAL, not a lexical `..` collapse. `/w/x/../nx/state` with `w/x -> y/z`
+# is `/y/nx/state`; a TEXTUAL collapse would call it `/w/nx/state` and false-PASS this collision.
+mkdir -p "$T/y/z" "$T/w"
+ln -s "$T/y/z" "$T/w/x"
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/y/nx/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/w/x/../nx/state\n' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/linkdotdot-state.conf"
+ck "m9 \`..\` after a SYMLINK resolves PHYSICALLY, so that collision is refused too (not lexical)" \
+   'run_reader "$T/linkdotdot-state.conf" check | grep -q "is shared with another repo in this set"'
+# NON-VACUITY, the (l) convention: revert `_rs_state_key` to the ROUND-6 whole-path form in a COPY,
+# and BOTH fixtures above are accepted again — proving the component walk is what refuses them.
+M3="$T/mut3"; mkdir -p "$M3/lib"
+python3 - "$READER" "$M3/lib/repo-set.sh" <<'PY3'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+start = t.index("_rs_state_key() {")
+end = t.index("\n}\n", start) + 3
+round6 = '''_rs_state_key() {
+  local p="${1:-}" resolved=""
+  if [ -n "$p" ]; then
+    resolved="$( cd -P "$p" 2>/dev/null && pwd -P )"
+  fi
+  [ -n "$resolved" ] || resolved="$(_rs_norm_path "$p")"
+  printf '%s' "$resolved"
+}
+'''
+open(dst, "w").write(t[:start] + round6 + t[end:])
+PY3
+ck "m10 the mutation really removed the component walk (a mutation that did not apply proves nothing)" \
+   '! grep -q "EOF_STATE_KEY" "$M3/lib/repo-set.sh"'
+ck "m11 with round 6 reverted, m8's fixture is ACCEPTED as two repos (rc 0) — m8 discriminates" \
+   '[ "$(REPO_SET_FILE="$T/absentdotdot-state.conf" bash "$M3/lib/repo-set.sh" check >/dev/null 2>&1; echo $?)" = 0 ]'
+ck "m12 …and so is m9's, so the PHYSICAL walk (not just any \`..\` folding) is what refuses it" \
+   '[ "$(REPO_SET_FILE="$T/linkdotdot-state.conf" bash "$M3/lib/repo-set.sh" check >/dev/null 2>&1; echo $?)" = 0 ]'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
