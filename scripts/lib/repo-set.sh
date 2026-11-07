@@ -140,18 +140,26 @@ _rs_nearest_existing_ancestor() {
 # carries its own loop (round 15, P2: `_rs_with_doctor` did; round 16, P2: this line then named only two
 # and omitted `_rs_stat_kind`).
 # ⛔ THE WRAPPER CARRIES THE SAME ORDER IN ITS OWN LINES, AND THAT IS AN ORDERING FACT, NOT A SECOND
-# AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file (its loop is at
-# `:95-103`, the source is `:119`) — it has to, because it refuses with its own message when no
-# interpreter resolves, and it must do that before anything from here exists in its shell. So it cannot
-# call this function at that point, and it resolves the same three candidates in the same order in its
-# own loop (`:95-103`). After the source it never needs to: everything that wants an
-# interpreter goes through `_rs_doctor_available` / `_rs_with_doctor`, which call this one.
+# AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file — it has to,
+# because it refuses with its own message when no interpreter resolves, and it must do that before
+# anything from here exists in its shell. So it cannot call this function at that point, and it resolves
+# the same three candidates in the same order in its own loop. After the source it never needs to: every
+# interpreter it wants is resolved by this one function, through `_rs_doctor_available`,
+# `_rs_with_doctor` or `_rs_stat_kind` (round 19, P2: this line named only the first two and so
+# contradicted the "THREE callers" list nine lines above).
+# ⛔ NO LINE NUMBERS IN THIS PARAGRAPH, DELIBERATELY (round 19, P2). It used to say "the loop is at
+# `:95-103`, the source is `:119`" — and those numbers were wrong twice in two rounds, once because the
+# wrapper moved and once because THIS PR added comment lines above them. A citation that goes stale
+# when an unrelated edit lands above it is not evidence. The authority is the code, found by NAME:
+# `grep -n '\. "$READER"' scripts/pr-doctor-machine.sh` (the source) and the `PY=` resolution above it.
+# (That grep is written so it RUNS: an earlier version of this very sentence double-escaped it, so the
+# "authority" returned nothing and a reader would have concluded the wrapper does NOT source the reader.)
 # ⛔ AND THE WRAPPER SOURCES THIS FILE, DELIBERATELY — because it needs the reader's FUNCTIONS AND
 # THEIR VALUES (the set path, the rendered entry list, the trim, the origin proof, the slug
 # normalisation), not merely a verdict. ⛔ AND THE LIST IS DELIBERATELY NOT ENUMERATED HERE: an earlier
 # revision named them and included one the wrapper never calls (`_rs_slug_ok`, whose verdict reaches it
 # only inside `repo_set_parse`) — the fifth comment in this PR to describe code that is not there. The
-# authority is `grep -n '\\. \"\$READER\"' scripts/pr-doctor-machine.sh` plus the calls that follow it,
+# authority is `grep -n '\. "$READER"' scripts/pr-doctor-machine.sh` plus the calls that follow it,
 # never a prose list.  ⛔ NOT because a subprocess would lose the exit code: the
 # executed path returns `repo_set_check`'s code verbatim, so `bash "$READER" check` answers 3/4/5 for
 # absent/empty/malformed exactly as the sourced form does (measured, and pinned by this suite's own

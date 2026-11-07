@@ -46,7 +46,11 @@
 #                                            a line it cannot parse would grade a shorter set and read
 #                                            exactly like a smaller machine.
 #
-# ⛔ IT TAKES NO ARGUMENTS, AND REFUSES ANY. The unit's argv IS the declaration. A wrapper that
+# ⛔ IT TAKES NO ARGUMENTS, AND REFUSES ANY. THE MACHINE REPO SET IS THE DECLARATION (§4) — NOT this
+# entry point's argv (round 19, P2: this line said "the unit's argv IS the declaration", which is the
+# PRE-#2281 model and the exact thing this PR removes; the shipped plist names no repo, and this file's
+# own arg-refusal text below says "The repo set is the declaration"). An argument here is therefore not
+# a SMALLER declaration, it is a SECOND one. A wrapper that
 # silently ignored an argument would make a future `--dry-run` in a plist look honoured while a real
 # pass ran — the `NOT_A_FLEET_READING` failure pr-doctor.py already guards one layer down.
 #
