@@ -957,9 +957,10 @@ ONCE per remote per pass, that fact is **re-proved against the remote at the mom
 removal** (`remote_holds_recheck`: one targeted `ls-remote --heads <remote> refs/heads/<branch>`,
 same exact refname+sha compare). The snapshot is CLASSIFICATION evidence; a branch auto-deleted on
 merge between the snapshot and the fork would otherwise make "the remote still holds this head"
-false at the instant a checkout with **no backup** is destroyed. The cost is two round trips per
-REMOVAL (classification, then again at the fork — the work the pass exists to do), not per candidate;
-and the second is the decisive one. A failed, timed-out or empty targeted
+false at the instant a checkout with **no backup** is destroyed. The cost is ONE targeted probe per
+`remote-holds` candidate at classification, plus a SECOND at the fork for one that reaches re-check
+#3 — so a removal pays two and a candidate preserved later still pays one; the second is the decisive
+one. A failed, timed-out or empty targeted
 probe at removal time preserves.
 The remote's own `refs/heads/*` are
 read by ONE bounded `git ls-remote --heads <remote>` **per remote per pass** (#3371) and cached for
@@ -981,8 +982,10 @@ PRESERVE — and a TRANSPORT failure is remembered for the rest of the pass so a
 timeout, not one per candidate. ⛔ At **removal** the preserve verdict is different and the operator
 will see it: a `remote-holds` row whose targeted re-probe can no longer re-prove the head is kept as
 **`remote-holds-stale`** (`remote_holds_recheck`, taken twice — at classification and again
-immediately before the fork). Treat that as "the remote moved under us": the checkout is intact, the
-archive is kept, and the commit is what to look at, not the checkout. The row is `remote-holds:<remote>/<branch>`, and — like
+immediately before the fork). Treat that as "the remote moved under us": the checkout is intact, and
+— if the preserve happened at the **fork** — the archive it had just taken is kept too (a
+**classification-time** preserve never entered `remove_one`, so there is no archive to look for).
+The commit is what to look at, not the checkout. The row is `remote-holds:<remote>/<branch>`, and — like
 `remote-only-ref` — it does **NOT** block the end-of-pass prune: a `remote-holds` row is reached
 only when the commit is held by `refs/remotes/<remote>/<branch>` (the probe runs on that very ref),
 so the admin `HEAD` is not the commit's last durable handle, and the F17 window (a record that

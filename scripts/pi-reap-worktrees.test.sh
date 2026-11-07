@@ -3079,12 +3079,18 @@ if [ -n "$_pa_line" ] && [ -n "$_hr_line" ] && [ -n "$_fork_line" ] \
     # P2). Cycle 3 inserted `remote_holds_recheck` — two bounded forks, up to ~40 s — BETWEEN
     # `holder_recheck` and the fork, and this arm stayed GREEN because it only compared three line
     # numbers. That is the exact regression the arm exists to prevent, so the property is pinned now:
-    # nothing but comments, blanks and braces may sit between the liveness probe and the fork.
+    # nothing but comments and blanks may sit between the liveness probe and the fork.
     _between="$(sed -n "$((_hr_line + 1)),$((_fork_line - 1))p" "$REAPER" 2>/dev/null | grep -vE '^[[:space:]]*(#|$)' || true)"
-    if [ -z "$_between" ]; then
+    # ⛔ AND THE REST OF THE PROBE'S OWN LINE (#3371 review cycle 6, P2): `_between` is LINE-granular,
+    # so `holder_recheck …; remote_holds_recheck …` appended to the SAME physical line is invisible to
+    # it. Measured: that rewrite left `_between` empty and the arm still printed "stays the LAST code
+    # line before the fork" while a ~40 s network probe ran after the liveness read. A `};` on this
+    # line means another command follows it, which is the whole defect in one token.
+    _hr_linetext="$(sed -n "${_hr_line}p" "$REAPER" 2>/dev/null)"
+    if [ -z "$_between" ] && ! printf '%s' "$_hr_linetext" | grep -qE '\}[[:space:]]*;'; then
         ok "A21e the post-archive re-check runs BEFORE holder_recheck, which stays the LAST code line before the fork"
     else
-        bad "A21e a probe sits between holder_recheck and the fork, so the last liveness read is no longer last: $(printf '%s' "$_between" | head -2 | tr '\n' ' ')"
+        bad "A21e a probe sits between holder_recheck and the fork (between='$(printf '%s' "$_between" | head -2 | tr '\n' ' ')' line='$_hr_linetext'), so the last liveness read is no longer last"
     fi
 else
     bad "A21e gate ORDER regressed: post-archive=$_pa_line holder_recheck=$_hr_line fork=$_fork_line"

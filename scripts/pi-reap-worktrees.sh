@@ -2445,8 +2445,8 @@ path_ctime() {
 #
 # ⛔ AND IT IS CLASSIFICATION EVIDENCE, NOT REMOVAL EVIDENCE: the snapshot can be minutes old by
 # the time a late row is removed with no backup, so `remote_holds_recheck` re-takes the targeted
-# probe at the moment of the fork (two round trips per REMOVAL — classification and fork — not per
-# candidate).
+# probe at the moment of the fork (one targeted probe per `remote-holds` candidate at classification,
+# plus a second at the fork for one that reaches re-check #3 — never per `remote-only-ref` candidate).
 #
 # ⛔ THE DEAD-REMOTE CACHE IS A FILE, NOT A VARIABLE. This function is called from inside a
 # COMMAND SUBSTITUTION (`refs=$(commits_survive …)`), so nothing it assigns survives the call:
@@ -2618,10 +2618,11 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
 # snapshot and the fork makes that sentence false at the instant it is printed, and the commit then
 # dies on the next `fetch --prune`. So the removal path re-takes the SAME evidence the pre-#3371 code
 # took per candidate: one targeted `ls-remote --heads <remote> refs/heads/<branch>`, exact refname +
-# exactly this sha. ⛔ The cost is TWO round trips per REMOVAL, not one, because the re-proof runs at
-# BOTH ends of remove_one (the classify loop, then again as re-check #3 immediately before the fork —
-# see the note there) — 2x the price the pre-#3371 code paid per candidate, paid only by the rows the
-# pass actually destroys. The classification cost stays at one advertisement per remote.
+# exactly this sha. ⛔ The cost is ONE targeted probe per `remote-holds` CANDIDATE at classification,
+# plus a SECOND at the fork for a candidate that reaches re-check #3 — so a removal pays two and a
+# candidate preserved later (by `clean_gate`, gate (b) or re-check #3) still pays one. The
+# `remote-only-ref` half of the population became free; the `remote-holds` half did not. The
+# classification cost stays at one advertisement per remote.
 # FAIL-CLOSED: an unreadable remote list, a failed/timed-out probe, an unadvertised refname or a
 # different sha all return 2, and 2 is the file's existing "preserved, nothing removed" arm — never
 # an exit 4. (The branch is re-derived from the reason token rather than passed in because the probe
