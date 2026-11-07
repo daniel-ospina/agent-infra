@@ -3928,11 +3928,27 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       return "$AGENT_FORK_REFUSED" ;;
     nodeploy)
       # FAIL CLOSED. 83 is the harness-skew code, because that is what this is: the gate and the
-      # instrument it consumes are not deployed together, so `cp scripts/orchestrator-harness/*.sh $O/`
-      # is the remedy — the same sentence the capability gate publishes for 83, and the same reason
-      # it is not folded into 73 (this box can fork perfectly well).
+      # instrument it consumes are not deployed together, so a VERIFIED redeploy is the remedy — the
+      # same sentence the capability gate publishes for 83 (the `usage)` case's `_pf_remedy` below;
+      # QUOTED, not line-numbered: a citation rots, and round-5 review of #3645 opened the previous
+      # `:4293` and found an unrelated comment line), and the same reason it is not
+      # folded into 73 (this box can fork perfectly well).
+      # ⛔ NOT `cp scripts/orchestrator-harness/*.sh $O/` (fresh review of #3231, P1; #3508 retired it):
+      # that glob is depth-1 and unverified, so it silently skips the harness's OWN subdirectories —
+      # `gh-limit/`, `gh-rest/`, `retired/`, `fixtures/` (measured: those four and no other at maxdepth 1) —
+      # and leaves a PARTIAL deploy that this very gate then refuses. `gh-rest/`
+      # is the load-bearing omission, not a footnote: `deploy-harness.sh` says its recursive walk exists so
+      # `gh-rest/gh`, `gh-limit/gh` and `retired/*.sh` are deployed, and a missing `$O/gh-rest/gh` leaves
+      # every harness `gh` call unserialised and unbounded. (This enumeration is DIRECTORY READ, not
+      # remembered — the first draft named a `fleet/` that has never been in this tree, which is the same
+      # claim-versus-tree failure the rest of this change is about.) ⛔ THE SWEEP WAS UNDONE, IT WAS NOT
+      # MISSED (#3508 vs #3231) — round-13 review of #3645: at #3508's own sweep (`fd5af7b0`) this file carried
+      # ZERO occurrences of the glob, i.e. it was swept CLEAN; #3231's merge (`8d9a936b`) then put it back at
+      # four sites — this comment plus the three messages below. So `origin/main` carries all four, and a reader
+      # who greps main finds them and concludes this change rewrites what #3508 already fixed. It is the
+      # reverse: #3508's 7-site table could not cover lines a LATER merge re-introduced.
       AGENT_STARTED=0
-      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the pair: cp scripts/orchestrator-harness/*.sh \$O/ (or redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)." >> "$log"
+      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the helper pair with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
       return "$AGENT_HARNESS_SKEW_REFUSED" ;;
     unknown)
       echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. The instrument RAN and could not measure, which is a reading about the box rather than a deploy fault, so this spawn proceeds (an unmeasurable box is not a refusal). If lanes here stall, start from this line." >> "$log" ;;
@@ -4646,7 +4662,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # operator to restart a box that can fork perfectly well.
   if [ "$rc" = "$AGENT_HARNESS_SKEW_REFUSED" ]; then
     AGENT_STARTED=0
-    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed; the [pi-gate] line above names the paths it searched. Sync the helper pair (cp scripts/orchestrator-harness/*.sh \$O/); do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
+    # ⛔ NO BACKTICKS IN THIS MESSAGE: it is a DOUBLE-QUOTED `echo`, so a backticked span is a COMMAND
+    # SUBSTITUTION — `mod=…` is a valid variable ASSIGNMENT, which succeeds silently and deletes the words
+    # from the log (round-11 review of #3645, P2 — measured: the line logged "it can name the file it read
+    # (, possibly INCOMPLETE or non-numeric)" and "if it says ."). The sibling `[pi-gate]` message below is a
+    # SINGLE-quoted printf and is safe; this one is not, so the tokens are plain. Anything added here that
+    # needs markup has to be escaped or the message loses exactly the reading it exists to hand over.
+    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed. The [pi-gate] line above is the authority on WHICH: it can name the file it read (mod=…, possibly INCOMPLETE or non-numeric), the dirs it searched, or both — so follow it, not a guess: redeploy over the named file, or into one of the listed dirs, or re-source the pair if it says mod=preloaded. Sync the helper pair with a VERIFIED redeploy where reviewers run (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O); where that launcher exports no O, use a listed dir instead. Do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
     return "$AGENT_HARNESS_SKEW_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
@@ -5225,7 +5247,7 @@ pi_shim_main() {
     # cannot be established" as "capacity is available", which is the one inference an admission
     # gate may never make. The operator rescue is the real pi by absolute path.
     printf '[pi-gate] REFUSED fork headroom UNREADABLE: %s. NO pi was started and nothing was consumed.\n' "$_fdetail" >&2
-    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: sync the pair into one of the searched dirs (cp scripts/orchestrator-harness/*.sh <dir>), fix the fork-floor knob named above, or redeploy the harness (deploy-harness.sh --repo . --o <O>). Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
+    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box. The detail above is the authority on WHICH — it can name the file it read (`mod=…`), the dirs it searched (a `searched:` list), or both, and the shapes are not exclusive: a copy that is present but TRUNCATED, or whose arithmetic yields a non-numeric headroom, is rejected even though the file is there. So follow the detail, not a guess: if it names a file, redeploy over THAT file; if it lists dirs, place the pair in ONE of them; if it names CAP_MIN_FORK_HEADROOM, that knob is the malformed input — fix it; if it says `mod=preloaded`, the module came from the calling shell, so re-source the pair. The population this arm exists for is the launcher that never exported `O`, whose resolvable home is ~/orchestrator. Either way use a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <the dir holding the pair>. Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
     pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
     exit "$AGENT_HARNESS_SKEW_REFUSED"
   fi

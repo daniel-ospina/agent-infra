@@ -967,7 +967,14 @@ no_comment; ck $? "no comment posted"
 # moved to 84. A fixture that hardcodes the number under test cannot notice either.
 _mem_gate_rc="$(bash -c '. "$1" >/dev/null 2>&1; printf %s "${PI_GATE_MEM_REFUSED:-}"' _ \
   "$ROOT/scripts/orchestrator-harness/spawn-gate.sh" 2>/dev/null)"
-[ -n "$_mem_gate_rc" ] || _mem_gate_rc=84
+# ⛔ AN EMPTY READ IS A RED, NOT A SILENT 84 (round-13 review of #3645, P2). This line used to be
+# `[ -n "$_mem_gate_rc" ] || _mem_gate_rc=84` — the same silent-default derivation §O3 fixes a few lines
+# below, failing the same way: rename `PI_GATE_MEM_REFUSED` in `spawn-gate.sh` and this arm keeps exercising
+# 84 against a seam that now emits another code, and stays GREEN, because the fallback fed the FIXTURE
+# instead of the declaration. So the read is ASSERTED first; the literal survives only to keep the section
+# runnable once a reshape has already been counted and printed as a red (`ck` returns, it does not abort).
+[ -n "$_mem_gate_rc" ]; ck $? "the MEMORY-gate code is READABLE from spawn-gate.sh's declaration (got '${_mem_gate_rc:-<none>}') — a reshape must red here, not fall back to a literal"
+_mem_gate_rc="${_mem_gate_rc:-84}"
 echo; echo "§O2 spawn-point MEMORY refusal (rc=$_mem_gate_rc) => exit 81, named as a capacity event"
 reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC="$_mem_gate_rc"
 run "$SRC" 2284
@@ -975,6 +982,45 @@ run "$SRC" 2284
 err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
 err_has "MEMORY gate"; ck $? "…naming the MEMORY gate, not the load one (the load wording is not universal)"
 err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
+no_comment; ck $? "no comment posted"
+
+# ── §O3 the spawn point's HELPER/SYNC refusal is not a reviewer crash either (agent-infra#3231) ──
+# The spawn point exits `AGENT_HARNESS_SKEW_REFUSED` when the gate and the `capacity.sh` it consumes were
+# not deployed together — nothing ran, nothing was paid for, and the remedy is a VERIFIED redeploy. Without
+# its own arm that code fell into the rc!=0 branch, which names a crashed/killed reviewer and tells the
+# operator to RE-RUN — straight back into a sync fault no re-run can clear.
+# ⛔ WHAT THIS ARM DOES AND DOES NOT DO (round-2 review of #3645, P2 — the previous comment overstated it):
+# the CODE comes out of `spawn-gate.sh`'s own declaration, so a collision that moves it reds here instead of
+# passing silently. The REMEDY is a literal `deploy-harness.sh` substring assertion (`err_has`, below) — it is
+# NOT read out of the harness, and no file here reads `deploy-harness.sh`. Both halves were mutation-checked:
+# `exit 83` → `exit 1` reds the rc assertion; reverting the sentence to the retired `cp ... *.sh` glob reds the
+# `deploy-harness.sh` and `err_not_has` assertions.
+_skew_decl="$(sed -n 's/^AGENT_HARNESS_SKEW_REFUSED=\([0-9][0-9]*\)$/\1/p' \
+  "$ROOT/scripts/orchestrator-harness/spawn-gate.sh" 2>/dev/null | head -1)"
+# ⛔ A DERIVATION THAT SILENTLY DEFAULTS IS NOT A DERIVATION (round-3 review of #3645, P2 — measured). This
+# block used to be `[ -n "$_skew_rc" ] || _skew_rc=83`, so a declaration the anchor cannot READ — `export
+# AGENT_HARNESS_SKEW_REFUSED=84`, or the value with a trailing comment — fell through to the literal 83 and the
+# whole arm stayed GREEN against a code that had moved. That is the fail-open the header of
+# `spawn-gate.test.sh` records as measured for this very `^NAME=` anchor (the note about `grep`ping a
+# declaration with an anchor it did not anticipate) — quoted, not line-numbered, for the reason this PR
+# keeps re-learning. So the read is ASSERTED separately, and the literal fallback below runs ONLY AFTER that
+# assertion has already RED. That distinction is the whole point, so state it exactly (round-11 review of
+# #3645, P3 — the earlier wording claimed the value was "used verbatim" while `:-83` still stood on the next
+# line): `ck` counts a red and RETURNS, it does not abort — this file is `set -uo pipefail`, with no `-e` — so
+# §O3 still EXECUTES against the literal instead of the suite stopping at a reshape. The old silent default
+# could buy a GREEN; this fallback can only ever FOLLOW a red that has already been counted and printed.
+[ -n "$_skew_decl" ]; ck $? "the skew code is READABLE from spawn-gate.sh's declaration (got '${_skew_decl:-<none>}') — a reshape must red here, not fall back to a literal"
+_skew_rc="${_skew_decl:-83}"
+echo; echo "§O3 spawn-point HELPER/SYNC refusal (rc=$_skew_rc) => exit $_skew_rc, named as a harness fault"
+reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC="$_skew_rc"
+run "$SRC" 2284
+[ "$(rc_of)" = "$_skew_rc" ]; ck $? "exit $_skew_rc (its own code) not 6/75 and NOT the file's own rc=2 (rc=$(rc_of))"
+err_has "NOT STARTED"; ck $? "…saying the reviewer never started"
+err_has "HELPER/SYNC"; ck $? "…naming the HELPER/SYNC fault, not the load gate's wording"
+err_has "deploy-harness.sh"; ck $? "…with the VERIFIED redeploy remedy #3508 kept, not the retired cp glob"
+err_not_has 'cp scripts/orchestrator-harness/*.sh'; ck $? "…and NOT the retired depth-1 glob that leaves a partial deploy"
+err_has "Nothing was consumed"; ck $? "…and that nothing was paid for"
+no_record; ck $? "no record written"
 no_comment; ck $? "no comment posted"
 
 # ── §P a prompt too large for one argv drops the diff instead of dying ──────
