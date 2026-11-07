@@ -187,9 +187,11 @@ machine's pi instance.
     `url`/`command` alone and never reads `type`, so an unrecognised `type` (even
     `sse`) only earns a warning — a self-hosted entry spelling `type: "sse"` for
     its own daemon WORKS, and both `pi-bootstrap/lib/merge-mcp.py` and
-    `pi-bootstrap/cell-install.sh` rule on that explicitly. A non-string
-    `url`/`command`, or a name outside `[A-Za-z0-9_-]`, makes the entry invalid —
-    it is dropped rather than stringified into a live request.
+    `pi-bootstrap/cell-install.sh` rule on that explicitly. A non-string or
+    **empty** `url`/`command`, or a name outside `[A-Za-z0-9_-]`, makes the entry
+    invalid — it is dropped rather than stringified into a live request. An empty
+    value is refused because the client dispatches on whether `url` is *truthy*,
+    so `url: ""` would silently fall through to `command`.
   - Never declare both transports in one entry. It is ambiguous, and the client
     resolves it to `url` (that is the order it dispatches in):
     - as a **repo delta** over a server the base already declares, the delta is

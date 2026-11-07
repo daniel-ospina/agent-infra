@@ -783,10 +783,21 @@ export function mergeMcpLayers(
       continue;
     }
     const carry = { ...inherited } as Record<string, unknown>;
-    if (repoDeclaresHttp || repoDeclaresStdio) {
-      // The base's `type` describes the base's transport; the repo's own `type`, if any, arrives with
-      // `...entry` below. Keeping a stale one would contradict the entry it now describes.
-      delete carry.type;
+    // The base's `type` describes the base's transport, so it must not outlive a SWITCH: keeping it
+    // beside the new transport produced `{type:"http", command:…}` — a stale label contradicting the
+    // entry it now describes. A SAME-transport delta KEEPS it, because there it still describes the
+    // entry: the contract is that the repo wins every field it SETS and inherits every field it OMITS
+    // (`SETUP-NEW-MACHINE.md`), and an identical `url` restatement silently lost the operator's own
+    // label. Compared by transport CLASS (url first, the order `connectServer` dispatches in), not by
+    // "did the repo declare something".
+    {
+      const baseTransport = hasField(inherited, "url")
+        ? "http"
+        : hasField(inherited, "command")
+          ? "stdio"
+          : "none";
+      const effectiveTransport = repoDeclaresHttp ? "http" : repoDeclaresStdio ? "stdio" : baseTransport;
+      if (baseTransport !== "none" && baseTransport !== effectiveTransport) delete carry.type;
     }
     if (repoDeclaresHttp) {
       for (const field of STDIO_TRANSPORT_FIELDS) delete carry[field];
@@ -893,16 +904,21 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       continue;
     }
     // A transport that is not a string is a config TYPO, and a dangerous one: `connectServer` reads
-    // `if (config.url)` and would STRINGIFY an array into a real request. The merge's own destination
-    // guard DOES fire for it (it is keyed on field PRESENCE — `hasField`), but rejecting it at the layer
-    // read means the entry never reaches the merge or the client at all. Both, deliberately.
+    // `if (config.url)` and would STRINGIFY an array into a real request. An EMPTY STRING is the same
+    // class of typo from the other side, and it makes the both-transports warning LIE: that `if`
+    // dispatches on TRUTHINESS, so `url: ""` does not select HTTP — it falls through to `command`
+    // (measured), the opposite of "it will run over url". An empty value cannot work as either
+    // transport (an empty URL is `Invalid URL`; an empty command cannot spawn), so it is dropped with
+    // the same message as a wrong type rather than dispatched on a guess.
     const typed = entry as Record<string, unknown>;
     const badTransport = (["url", "command"] as const).find(
-      field => typed[field] !== undefined && typeof typed[field] !== "string"
+      field =>
+        typed[field] !== undefined && (typeof typed[field] !== "string" || typed[field] === "")
     );
     if (badTransport) {
       console.log(
-        `[mcp-client] WARN: ${label} entry "${name}" has a non-string "${badTransport}" — dropped. ` + suffix
+        `[mcp-client] WARN: ${label} entry "${name}" has a non-string or empty "${badTransport}" — dropped. ` +
+          suffix
       );
       continue;
     }

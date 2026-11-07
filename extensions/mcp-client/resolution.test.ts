@@ -831,16 +831,99 @@ await test("a `__proto__` key cannot poison the merged map's prototype", () => {
   ok(merged.real, "and ordinary servers still merge");
 });
 
-await test("a `type`-only delta on a stdio base is APPLIED (it cannot veto a working entry)", () => {
+await test("a `type`-only delta on a stdio base is APPLIED (it cannot veto a working entry)", async () => {
   // Checking the delta alone let `{"type": "http"}` be applied to a stdio base, producing exactly the
-  // incoherent entry the check exists to reject.
-  const merged = mergeMcpLayers(
-    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
-    { mcpServers: { g: { type: "http" } } } as never,
-  );
+  // incoherent entry the check exists to reject — which is why the check runs on the PROJECTION. The
+  // warning is the only thing the operator gets, so it is asserted here: a mutant switching the guard to
+  // `typeDisagrees(entry)` (the delta alone) used to leave the whole suite green.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+      { mcpServers: { g: { type: "http" } } } as never,
+    );
+  });
   const g = merged.g as Record<string, unknown> | undefined;
   equal(g?.type, "http", "the delta applies");
   equal(g?.command, "npx", "and the transport the client dispatches on is untouched");
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `the incoherent projection must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a REPO-ONLY entry with a contradicting `type` is reported too (no base entry to project over)", async () => {
+  // The third emission site: a repo-only entry never reaches the projection branch — it takes the
+  // `if (!inherited)` path — so its warning is separately implementable and separately breakable.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { g: { type: "stdio", url: "https://x/mcp" } } } as never,
+    );
+  });
+  const g = merged.g as Record<string, unknown> | undefined;
+  equal(g?.url, "https://x/mcp", "`type` must never disqualify an entry — it is kept");
+  ok(
+    logs.some(l => l.includes("disagrees with its transport")),
+    `a repo-only contradiction must be reported — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a SAME-transport delta INHERITS the base's `type` (a delta declares what it changes, not what it drops)", () => {
+  // `delete carry.type` fired whenever the repo declared a transport, so restating the SAME url — or
+  // setting only `args` on an identical launch — silently dropped a field the repo never touched, with
+  // nothing logged. That contradicts "the repo wins every field it SETS and inherits every field it
+  // OMITS" (SETUP-NEW-MACHINE.md) for a field this client does not act on but does carry forward.
+  const sameUrl = mergeMcpLayers(
+    { mcpServers: { t: { type: "http", url: "https://api.example/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+    { mcpServers: { t: { url: "https://api.example/mcp/" } } } as never,
+  );
+  equal((sameUrl.t as Record<string, unknown>)?.type, "http", "an unchanged destination keeps the base's `type`");
+
+  const sameLaunch = mergeMcpLayers(
+    { mcpServers: { s: { type: "stdio", command: "npx", args: ["-y", "@good/mcp"], lazy: true } } } as never,
+    { mcpServers: { s: { timeout: 30 } } } as never,
+  );
+  equal((sameLaunch.s as Record<string, unknown>)?.type, "stdio", "a pure delta keeps it too");
+
+  // …and a real SWITCH still drops it, because there the label would contradict the new transport.
+  const switched = mergeMcpLayers(
+    { mcpServers: { w: { type: "http", url: "https://api.example/mcp/", lazy: true } } } as never,
+    { mcpServers: { w: { command: "/bin/sh" } } } as never,
+  );
+  equal((switched.w as Record<string, unknown>)?.type, undefined, "a transport SWITCH still drops the stale `type`");
+});
+
+await test("an EMPTY-string `url` is refused at the layer read (connectServer dispatches on TRUTHINESS)", async () => {
+  // `if (config.url)` makes `url: ""` fall through to `command` — so the both-transports warning ("it
+  // will run over url") was false for this shape, and an entry that cannot work as either transport
+  // reached the client. Non-string `url` was already refused for the same reason (stringification).
+  const repoDir = tempDir("mcp-emptyurl-repo-");
+  const homeDir = tempDir("mcp-emptyurl-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: {
+      ghost: { url: "", command: "/bin/false", lazy: true },
+      fine: { url: "https://fine/mcp", lazy: true },
+    },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: {} });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(!("ghost" in cfg.mcpServers), "an empty `url` must not reach the client — got it dispatched as a command instead");
+  ok("fine" in cfg.mcpServers, "and a valid sibling still loads");
+  ok(
+    logs.some(l => l.includes("non-string or empty") && l.includes("ghost")),
+    `the drop must be reported — got:\n${logs.join("\n")}`
+  );
 });
 
 await test("`args: []` vs absent `args` is the SAME launch, so the base's env survives", () => {
