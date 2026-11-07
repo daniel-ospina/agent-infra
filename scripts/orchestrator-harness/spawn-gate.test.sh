@@ -4259,7 +4259,13 @@ ck "STRUCTURAL: review-pr.sh's 83 arm sits BEFORE its non-zero-exit fallthrough 
 # 83. A bare-variable exit IS the defect shape, so both 83 arms are pinned BY NAME in both directions: no bare
 # `exit "$VAR"`, and at least one tolerant `exit "${VAR:-83}"` in each file. Still a grep — driving these two
 # arms behaviourally needs a whole reviewer/repo rig, and naming that limit is better than implying it away.
-_bare="$(grep -F 'exit "$AGENT_HARNESS_SKEW_REFUSED"' "$HERE/merge-one.sh" "$HERE/../review-pr.sh")"
+# ⛔ COMMENTS ARE STRIPPED BEFORE THE MATCH (round-13 review of #3645, P3). The pins below (the retired-glob one
+# and the `deploy-harness.sh` count) already strip comment lines; this one did not, so the NATURAL way to record
+# the defect — a comment in one of these files saying "never exit the bare variable here" — REDDED it while
+# changing nothing executable. That is the "a pin that false-reds on prose buys a deletion" hazard this block
+# already declares for the glob pin, and it bites a pin that QUOTES the defect verbatim hardest of all.
+# A comment cannot run, so stripping loses no coverage.
+_bare="$(grep -nF 'exit "$AGENT_HARNESS_SKEW_REFUSED"' "$HERE/merge-one.sh" "$HERE/../review-pr.sh" 2>/dev/null | grep -v ':[[:space:]]*#')"
 [ -z "$_bare" ]; rc=$?
 ck "STRUCTURAL: neither 83 arm exits the BARE \$AGENT_HARNESS_SKEW_REFUSED (unset under set -u => rc 1; set-but-empty => rc 2; NEITHER is 83)${_bare:+ — found: $_bare}" $rc
 _mt="$(grep -c -F 'exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"' "$HERE/merge-one.sh")"
