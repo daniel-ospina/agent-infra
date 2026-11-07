@@ -92,10 +92,10 @@ FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 #     reads as a stale flag, and the next reader would delete it.
 #   * `ci.yml`'s `bash-suites` and `ci-main.yml`'s `script-validate` BOTH export
 #     BASH_SHARD_SLICE=<i>/<n> per step, and the runner now STRIPS that contract before every shard it
-#     starts (`shard_exec`, `scripts/run-bash-shards.sh:926`, agent-infra#3415) — so CI's own shards are
-#     scrubbed twice and this suite does NOT inherit the slice in CI today. What stays exposed is a
-#     DIRECT invocation of this file that exports the slice, where an inherited value would make every
-#     fixture run 1/n of its staged shards.
+#     starts — `shard_exec`, the `env -u` wrapper in `scripts/run-bash-shards.sh` (agent-infra#3415) —
+#     so CI's own shards are scrubbed twice and this suite does NOT inherit the slice in CI today.
+#     What stays exposed is a DIRECT invocation of this file that exports the slice, where an
+#     inherited value would make every fixture run 1/n of its staged shards.
 #   * `SHARD_BOUND` is the variable this suite EXISTS to test, so it is the one a reader reproducing a
 #     bound bug is most likely to have exported — and §3's default-bound arm deliberately runs the
 #     runner with it ABSENT to pin the 1800 s default. Every other call site names its own bound, so
@@ -179,9 +179,9 @@ stage_fixture() {
 # (BASH_SHARDS_BUDGET_SECS=7800) and is now a SLICED lane like `bash-suites`, because the runner refuses
 # the BUDGET+SLICE pairing outright (`exit 2`). So BOTH lanes now export BASH_SHARD_SLICE=<i>/<n>, and
 # the unset below is load-bearing for any DIRECT invocation of this suite. (In CI itself neither lane's
-# value reaches a fixture twice over: the runner strips its whole env contract in `shard_exec`
-# (`scripts/run-bash-shards.sh:926`, agent-infra#3415) before every shard, and this suite's own `unset`
-# drops it again — defence in depth, measured in the guard at the top.)
+# value reaches a fixture twice over: the runner strips its whole env contract in `shard_exec` — the
+# `env -u` wrapper in `scripts/run-bash-shards.sh`, agent-infra#3415 — before every shard, and this
+# suite's own `unset` drops it again — defence in depth, measured in the guard at the top.)
 # The arm itself is unchanged — only the pollution source it names.
 # (A third variable, SHARD_BOUND, is the same class and was measured after review: an inherited bound
 # reddens §3's default-bound arm. All three of the runner's env contract are cleared above and probed

@@ -30,9 +30,10 @@
 #   suite's subject is the runner's WHOLE-LIST recap over a THREE-shard fixture list, where a slice of
 #   8 over 3 entries has nothing to run and the runner refuses (rc 2).
 #   ⛔ BUT THAT SLICE NO LONGER REACHES A SHARD AT ALL, so this is NOT a CI-lane red in either lane
-#   today: `shard_exec` strips the runner's whole env contract before every shard it starts
-#   (`scripts/run-bash-shards.sh:926`, agent-infra#3415), and the paragraph below at the `unset`
-#   records the same fact from the other side. What stays exposed is a DIRECT invocation of this file
+#   today: `shard_exec` — the `env -u` wrapper in `scripts/run-bash-shards.sh`, agent-infra#3415 —
+#   strips the runner's whole env contract before every shard it starts, and the paragraph below at
+#   the `unset` records the same fact from the other side. What stays exposed is a DIRECT invocation
+#   of this file
 #   (a repro shell that exports the slice and runs the suite rather than the runner) and a tree where
 #   that strip is removed — which is why the `unset` is defence in depth and not the only defence.
 #   This arm is the MUTATION control pinning the HAZARD and the runner's refusal contract: the same
@@ -88,9 +89,10 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # not just the one that reddened first (review of this change, cycle 2, P1). ⛔ THE TWO-LANE PICTURE
 # IS NOT WHAT IT WAS: `ci.yml`'s `bash-suites` and `ci-main.yml`'s `script-validate` both export the
 # SAME knob now — `BASH_SHARD_SLICE`, at step level — so exactly ONE of the three is a knob a lane
-# really exports today. It is also the one the RUNNER strips before every shard (`shard_exec`,
-# `scripts/run-bash-shards.sh:926`, agent-infra#3415), so the leak this defends against is NOT CI's
-# own shards: it is a DIRECT invocation of this file, and any tree where that strip is removed. The
+# really exports today. It is also the one the RUNNER strips before every shard (`shard_exec` — the
+# `env -u` wrapper in `scripts/run-bash-shards.sh`, agent-infra#3415), so the leak this defends
+# against is NOT CI's own shards: it is a DIRECT invocation of this file, and any tree where that
+# strip is removed. The
 # other two are cleared so the suite is hermetic to the CONTRACT, not to today's single exported name:
 #   * `BASH_SHARDS_BUDGET_SECS` is HISTORY, carried so the unset cannot read as a stale flag: main's
 #     lane USED to export it (`BASH_SHARDS_BUDGET_SECS: '7800'` in `script-validate`'s bash-shards
@@ -192,7 +194,7 @@ rm -f "$SLOW_SHARD_MARKER"
 # shard returned — an hour later on the real job. GitHub terminates the process GROUP on a timeout.
 # ⛔ THE FIXTURE MUST NOT INHERIT THE CALLER'S DISPATCH DECISION — and this `env -u` is the half of
 # that contract which sits at the SPAWN SITE. `run-bash-shards.sh` scrubs the identical three names at
-# its own `shard_exec` (:926), but that guard protects a shard the RUNNER spawns; it cannot reach the
+# its own `shard_exec`, but that guard protects a shard the RUNNER spawns; it cannot reach the
 # runner when a TEST spawns it, and this suite spawns `runner-narrow.sh` DIRECTLY. The narrowed list is
 # THREE shards, so a child handed the outer job's slice REFUSES — `❌ BASH_SHARD_SLICE asks for 8
 # slice(s) of 3 listed shard(s)` (run-bash-shards.sh:432, rc 2) — and every arm below would then read a
