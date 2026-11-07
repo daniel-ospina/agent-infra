@@ -3119,7 +3119,17 @@ kill "$pid19m" 2>/dev/null; sleep 1
 # lock's own reclaim). Driven in-process so the window is deterministic — `os.rename` is wrapped to
 # install the competitor's record immediately before the move, which is exactly the interleaving the
 # [VGATE] pass reproduced with real kernel ops.
-out19n="$(python3 - "$SCHED" "$T/s19n" "$L19/n" "$$" <<'PY19N' 2>&1
+# ⛔ THE HERE-DOC LIVES IN A FUNCTION BODY, NOT IN A `$( )` (bash 3.2, #2930/#2248).
+#    bash 3.2's `$( )` scanner does not know about here-documents: it walks the body as CODE,
+#    so an APOSTROPHE in this body's prose opens a single-quoted string that never closes and
+#    desynchronises the parse state for the REST OF THE FILE. Measured at f05c057d6 (#3615,
+#    which introduced this arm): `bash -n` under bash 3.2.57 reports "syntax error near
+#    unexpected token `('" at the `ok` message in the 19u arm, ~230 lines BELOW this body, so
+#    `check-bash32-parse.sh` (#2930) REDS on every PR. On a stock Mac `/bin/bash` IS 3.2, so
+#    `install.sh`'s `bash -n` sweep would `die` and the harness could not be installed at all.
+#    bash 5 parses it fine, which is why this suite stayed green and only the gate went red.
+#    #2248's remedy: the substitution carries a FUNCTION CALL and no here-doc.
+_out19n_probe() { python3 - "$1" "$2" "$3" "$4" <<'PY19N' 2>&1
 import importlib.util, json, os, sys
 spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
 m = importlib.util.module_from_spec(spec)
@@ -3154,7 +3164,8 @@ except Exception:
 print("CLAIM %r" % (got,))
 print("SURVIVOR %r" % (survivor,))
 PY19N
-)"
+}
+out19n="$(_out19n_probe "$SCHED" "$T/s19n" "$L19/n" "$$")"
 grep -q "CLAIM None" <<<"$out19n" \
   && bad "19n the reclaim STOLE a live claim published inside its own window (claim returned None = 'I hold the box')" \
   || ok "19n the reclaim did not steal a live claim published inside its window"
