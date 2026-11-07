@@ -43,12 +43,17 @@
          returns SKIP from the placeholder loop), so on a box that resolves no tortoise
          checkout this job is SKIPPED at rc 0 and the target check never runs at all.
          ⛔ AND THAT IS A REAL LIMIT OF THIS CHANGE, RECORDED HERE RATHER THAN LEFT IMPLIED:
-         the wrapper is the ONLY consumer of the repo set, so on a box serving other repos
-         (agent-infra plus a second repo — the shape §1 of #2281 is about) creating
-         `repos.conf` changes nothing until a doctor unit exists for THAT box. The unit that
-         serves it is owed, and it must not be gated on a tortoise checkout. Until it lands
-         the set is correct and unread on those boxes — an installed-but-inert state this
-         file would rather name than hide.
+         the wrapper is the ONLY consumer of the repo set, so on a box that resolves NO tortoise
+         checkout — the gate above SKIPs this unit there — creating `repos.conf` changes nothing
+         until a doctor unit exists for THAT box. The unit that serves it is owed, and it must
+         not be gated on a tortoise checkout. Until it lands the set is correct and unread on
+         those boxes — an installed-but-inert state this file would rather name than hide.
+         ⛔ SCOPE THIS CORRECTLY, because the mistake is expensive (review round 28, P2: this
+         paragraph named "a box serving other repos (agent-infra plus a second repo — the shape
+         §1 of #2281 is about)", which is BACKWARDS — that box serves tortoise too, so
+         TORTOISE_REPO resolves, this unit installs, and creating `repos.conf` DOES change what
+         is graded, exactly as the paragraph ~100 lines below says). The limit is about a box
+         with NO TORTOISE CHECKOUT, not about a box whose other repos matter.
          WHERE THE PLACEHOLDER DOES RESOLVE, install-launchd.sh hard-fails a job whose
          target does not resolve, and that check is deliberately NOT defeated here: a bare
          `install-launchd.sh` after a farm that did not deliver FAILs this job instead of
