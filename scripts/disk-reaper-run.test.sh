@@ -21,7 +21,8 @@
 #      so no `main-checkout` guard of its own) matched no reference at all and was preserved only by
 #      `reason=gitless-cap`, a rate limit (#3278, 2026-11-06). That is fixed in the DELEGATE, by a local
 #      `CELL_HOME_DEFAULT` the guard loop reads.
-#   2. `load_pin` (`:332`) wants NO value it did not already have: it reads
+#   2. `load_pin` (named, not line-numbered — the old `:332` went stale and pointed at `acquire_lock`)
+#      wants NO value it did not already have: it reads
 #      `"${CELL_HOME}/orchestrator/.agent-infra-stamp.json"` then `"${HOME}/.pi/orchestrator/…"` with
 #      FIRST-MATCH-WINS and a `break`, so the list is a SUBSTITUTION, not a union. Exporting CELL_HOME
 #      on a box whose two stamps disagree — exactly the `HOME=/home/cmux` vs `CELL_HOME=/tmp/cell-home`
