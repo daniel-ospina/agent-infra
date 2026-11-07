@@ -7933,19 +7933,31 @@ assert_eq "$_badbt" "" "20h48 no echo/printf message anywhere in the recorder ex
 #        strips trailing comments through a small quote-state machine (so `# only \`x\` is RED`
 #        is not a hit, while a backtick in a LABEL argument is).
 # ⛔ AND THE SCANNER ITSELF CARRIES A CONTROL (round 4, P2). Without one, a scanner that
-#    silently stopped SEEING the straddling case would print "" and PASS — the very false PASS
-#    this sweep exists to prevent, asserted by the sweep. The fixture is generated with
-#    `printf '\140'` so THIS file holds no live backtick of its own, and its four lines pin the
-#    four contexts: line 1 must be RED (an apostrophe inside `"..."` does not shield a backtick),
-#    line 2 must be GREEN (single-quoted content is literal), line 3 must be GREEN (ONE backslash
-#    escapes it) and line 4 must be RED (an even run leaves it executable — measured: bash prints
-#    `double backslash \EXECUTED runs`, so `(?<!\\)` was wrong by parity).
+#    silently stopped SEEING a case would print "" and PASS — the very false PASS this sweep
+#    exists to prevent, asserted by the sweep. The fixture is generated with `printf '\140'` so
+#    THIS file holds no live backtick of its own, and its EIGHT lines pin the lexical rules the
+#    scanner models, each one measured against bash rather than assumed:
+#      1 RED   an apostrophe inside "..." is a literal, it does not shield a backtick
+#      2 GREEN single-quoted content is literal
+#      3 GREEN ONE backslash escapes it
+#      4 RED   an EVEN run leaves it executable (`double backslash \EXECUTED runs`)
+#      5 RED   `#` comments only at a WORD START: `a#`echo X`` prints `a#X` (man bash, COMMENTS)
+#      6 RED   ...and a closing quote leaves you MID-WORD: `"x"#`echo X`` prints `x#X`
+#      7 RED   an unquoted backslash escapes the NEXT char: `it\'s `echo X`` runs X, so `\'`
+#              does not open a quote (man bash, QUOTING)
+#      8 GREEN ...so `\"` opens nothing either, and the `#` after it IS a comment
+#    Lines 5-8 exist because the first cut of this control pinned only 1-4 and the scanner
+#    was still blind to them — a false CLEAN on 5-7 and a false RED on 8, all four measured.
 _bt="$(printf '\140')"
 {
   printf '%s\n' "_x=\"the grader's ${_bt}n_authored${_bt} isn't 0\""
   printf '%s\n' "_y='literal ${_bt}x${_bt}'"
   printf '%s\n' "_z=\"escaped \\${_bt}x\\${_bt} is literal\""
   printf '%s\n' "_w=\"double backslash \\\\${_bt}x\\\\${_bt} runs\""
+  printf '%s\n' "echo a#${_bt}echo EXEC5${_bt}"
+  printf '%s\n' "echo \"x\"#${_bt}echo EXEC6${_bt}"
+  printf '%s\n' "echo it\\'s the ${_bt}echo EXEC7${_bt} that moved"
+  printf '%s\n' "echo \\\"a # only ${_bt}echo NOTEXEC${_bt} is a comment"
 } > "$T/btctrl.sh"
 _badbt2="$(python3 - "$T/btctrl.sh" "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")" <<'PY48B'
 import re, sys
@@ -7959,23 +7971,36 @@ targets = sys.argv[2:]
 # a false PASS on the exact class this sweep claims to bound. Single-quoted content
 # is now dropped BY the machine (q == "'"), where the context is known, and
 # apostrophes inside "..." are kept literal.
+# ⛔ AND IT MUST MODEL BASH'S LEXER, NOT ITS OWN INTUITION (round 5, P2) — the
+# first cut treated ANY unquoted `#` as a comment and consumed NO unquoted
+# backslash, which gave a false CLEAN on `a#`echo X``, `"x"#`echo X`` and
+# `it\'s `echo X``, and a false RED on `\"a # ... `x`` (all four measured):
+#   * man bash, COMMENTS: "a WORD BEGINNING WITH #" — so `a#b`, `${x#a}` and a
+#     `#` after a CLOSING quote are mid-word and comment nothing.
+#   * man bash, QUOTING: a non-quoted backslash preserves the literal value of
+#     the next character — so `\'` is an apostrophe, not a quote opener.
+_WORDSTART=set(' \t;|&()<>')
 def scan(s):
-    out=[]; q=None; i=0
+    out=[]; q=None; i=0; last=None
     while i < len(s):
         c=s[i]
         if q == '"':
             if c=='\\':
-                out.append(c); out.append(s[i+1:i+2]); i+=2; continue
+                out.append(c); out.append(s[i+1:i+2]); last=c; i+=2; continue
             if c=='"': q=None
-            out.append(c)
+            out.append(c); last=c
         elif q == "'":
-            if c=="'": q=None
+            if c=="'": q=None; last=c
             # content inside single quotes is literal: dropped, never tested
         else:
-            if c=='"': q='"'; out.append(c)
-            elif c=="'": q="'"
-            elif c=='#': break
-            else: out.append(c)
+            if c=='\\':
+                # an UNQUOTED backslash consumes the next character: `\'` is literal
+                out.append(c); out.append(s[i+1:i+2]); last=c; i+=2; continue
+            if c=='"': q='"'; out.append(c); last=c
+            elif c=="'": q="'"; last=c
+            elif c=='#' and (last is None or last in _WORDSTART):
+                break          # a comment: a word BEGINNING with `#`
+            else: out.append(c); last=c
         i+=1
     return ''.join(out)
 def has_live_backtick(s):
@@ -7999,8 +8024,8 @@ out=[]
 try:
     seen=[i for i,l in enumerate(open(ctrl),1)
           if l.strip() and not l.strip().startswith('#') and has_live_backtick(scan(l.strip()))]
-    if seen != [1,4]:
-        out.append("SCANNER-SELF-TEST: control hits %r, expected exactly [1, 4] (1=straddled, 2=single-quoted, 3=escaped, 4=even backslash run)" % (seen,))
+    if seen != [1,4,5,6,7]:
+        out.append("SCANNER-SELF-TEST: control hits %r, expected exactly [1, 4, 5, 6, 7] (red: straddled, even-run, mid-word #, quoted-#, escaped-apostrophe; green: single-quoted, one-backslash, escaped-quote-comment)" % (seen,))
     for path in targets:
         for i,l in enumerate(open(path),1):
             st=l.strip()
@@ -8012,7 +8037,7 @@ except Exception as e:
 print("\n".join(out))
 PY48B
 )"
-assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder; the scanner is pinned by its own 4-line control, and a crash is a hit)"
+assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder; the scanner is pinned by its own 8-line control, and a crash is a hit)"
 # 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
 #       commit that descends from `from` while being neither an ancestor NOR a descendant of the
 #       attested head is the one shape a narrowing endpoint can actually take — and no shipped vector
