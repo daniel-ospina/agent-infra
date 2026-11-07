@@ -1517,7 +1517,7 @@ PY
           # was reviewed and the review found blocking issues, so nothing in the fleet may re-buy that
           # verdict and the rail can never land it (check (c) accepts clean only). Publishing it is what
           # makes a PR that is blocked ON ITS OWN REVIEW readable instead of looking like a PR nobody has
-          # looked at — and it is idempotent by (state, head), so it costs one comment per head.
+          # looked at — and it is idempotent by (state, head, basis), so it costs one comment per head.
           if [ "$_att" = rejected ]; then
             publish_review_state "$repo" "$pr" review-found-issues "$head" record
             log_line "$repo #$pr REVIEW-REJECTED at $head — a head-bound record EXISTS and its verdict is not one the gate accepts (not-clean), so the rail cannot land this revision and no second review is bought; the fix is a NEW head, which is a new key"
