@@ -917,21 +917,22 @@ GH_PROBE_CAUSE=""
 # byte-wise — `printf 'aéb' | cut -c1-2` yields `a\xc3`), and `provision_fail` spends 52 of them on
 # `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
 # `] — no candidate can be judged from this box`. MEASURED, byte for byte, on the rc=75 arm: the
-# prefix and the fixed `answer=` + `question=` half cost 306 bytes before the evidence starts, so the
-# evidence gets the remaining 94 of the 400 — while `scripts/gh-shim/gh`'s own note is 244 bytes.
-# 245 of fixed clause + 9 for `evidence=` + 244 of note is 498 against 348 of window (the suffix only
-# survives when nothing is cut), so SOMETHING is always clipped here, and the only real decision is
-# WHICH part yields. Round 2 answered "the verdict", and MEASURED on the real record that is the wrong
-# half: leading with the evidence ends the beat line INSIDE the verdict (`… the budget was tested, so
-# NEI`), so an operator reads a severed claim and never sees `NOT auth and NOT an outage`, nor which
-# question was asked. The verdict and the question are FIXED-SIZE (245 bytes together, whatever the
-# stderr says); the evidence is the only variable-length part, AND the record keeps it whole — the cap
-# below bounds the clause at 320, well clear of the 244-byte note. So the verdict leads and the
-# evidence closes, and once the evidence is long enough to reach the cut (over ~94 bytes, which every
-# real refusal is) the severed tail is evidence and its loss costs nothing the record does not already
-# hold. Below that, the cut falls in `provision_fail`'s own trailing sentence instead, which is
-# boilerplate the `[dispatch] BLOCKED` line repeats anyway — it is not the verdict, and that is the
-# invariant this ordering buys.
+# prefix and the fixed `answer=` + `question=` half cost 308 bytes before the evidence VALUE starts
+# (52 of prefix + 245 of fixed clause + 11 for `; evidence=`), so the evidence gets the remaining 92 of
+# the 400 — and `scripts/gh-shim/gh`'s own note is 244 bytes, of which `rc=75: ` alone spends 7 of the
+# 92. 245 + 11 + 251 = 507 bytes of clause against a 348-byte window (the 46-byte suffix survives only
+# when nothing is cut), so SOMETHING is always clipped here, and the only real decision is WHICH part
+# yields. Round 2 answered "the verdict", and MEASURED on the real record that is the wrong half:
+# leading with the evidence ends the beat line INSIDE the verdict (`… — nothing was sent, so NEI`), so
+# an operator reads a severed claim and never sees `NOT auth and NOT an outage`, nor which question was
+# asked. The verdict and the question are FIXED-SIZE (245 bytes together, whatever the stderr says);
+# the evidence is the only variable-length part, AND the record keeps it whole — the cap below bounds
+# the clause at 320, well clear of the 244-byte note. So the verdict leads and the evidence closes, and
+# once the evidence is long enough to reach the cut (over 92 bytes, i.e. a note of 86 bytes or more —
+# which every real refusal is) the severed tail is evidence and its loss costs nothing the record does
+# not already hold. Below that the cut falls in `provision_fail`'s own trailing consequence sentence
+# instead — not the verdict, and still whole in the record and on the `[refresh] FAILED` log line —
+# which is the only invariant this ordering buys and the one `(g7)` pins.
 # `refresh-provision.test.sh`'s `(g7)` drives the REAL `refresh_cause_brief` and pins both halves:
 # every other arm reads `rec why`, which is unbounded, so they all stay green while the beat cuts.
 GH_PROBE_CAUSE_MAX=320

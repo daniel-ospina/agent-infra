@@ -1073,7 +1073,7 @@ ck "(g6) …and does NOT reuse another arm's verdict (no REJECTED, no NON-ANSWER
 # `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
 # `] — no candidate can be judged from this box`. So a suite that reads only the record stays GREEN
 # while the beat prints half a sentence — which is exactly what happened: the round-2 ordering ended
-# the beat line inside "… the budget was tested, so NEI" and dropped `question=` entirely.
+# the beat line inside "… — nothing was sent, so NEI" and dropped `question=` entirely.
 # The invariant pinned here: the cut may land inside the EVIDENCE (variable-length, and whole in the
 # record), never inside the VERDICT (fixed-size, and the thing that names the precondition).
 LOOP="${LOOP:-$HERE/orch-loop.sh}"
@@ -1101,9 +1101,10 @@ if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut 
   # row above must not be passing on a clause short enough to fit whole. The beat loses the clause's
   # trailing "no candidate can be judged" sentence when the cut fires, so its absence IS the proof.
   # ⛔ NOTE THE COUPLING (review round 4, observation): this row is only reachable while the shim's note
-  # stays longer than ~94 bytes, which is what makes the cut land in the EVIDENCE. If the shim ever
-  # shortens its note below that, the cut stops firing legitimately and THIS row reds — with a message
-  # about truncation — while the real cause is fixture drift, so the message names that possibility too.
+  # stays over 85 bytes, which is what makes the cut land in the EVIDENCE (92 bytes of evidence room
+  # minus the 7 `rc=75: ` spends). If the shim ever shortens its note below that, the cut legitimately
+  # stops severing the evidence and THIS row reds — with a message about truncation — while the real
+  # cause is fixture drift, so the message names that possibility too.
   ck "(g7) …with the cut genuinely FIRED (the clause's own tail is outside the window — if this reds, check whether the shim's note was shortened rather than assuming the ordering regressed)" \
      "$(case "$GBEAT" in *'no candidate can be judged from this box'*) echo 1 ;; *) echo 0 ;; esac)"
   # ⛔ AND THE CUT LANDS IN THE EVIDENCE — the assertion is the PAIR, so neither half can pass vacuously:
