@@ -1,0 +1,38 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-42-1794058518-p481352-0dff10dd",
+  "_sha": "92ae73b1f1890541802c9baa7aba1f8d0bf789b3",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.MLFJEXk17b/fix.log"
+    },
+    {
+      "kind": "sha",
+      "value": "9af704f04f4f059c30fe5c386c9398bcef6291c2"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/afix/tree/.worktrees/review"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 15,
+  "ended_at": 1794058533,
+  "exit_code": 0,
+  "heartbeat_at": 1794058533,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794058518-p481352-0dff10dd",
+  "lease_until": 1794059138,
+  "pid": 481352,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794058518,
+  "state": "DONE",
+  "tag": "42",
+  "worktree": "/tmp/afix/tree/.worktrees/review"
+}
