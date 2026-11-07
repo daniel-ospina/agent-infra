@@ -952,6 +952,13 @@ bash "$GATE" --check "$TMP/pwplus-canon.txt" lane 0 "$HW/work" >/dev/null 2>&1; 
 { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-none.txt"; printf '\nWIP:       none\n'; } >> "$TMP/pwplus-none.txt" 2>/dev/null || { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-none.txt"; printf '\nWIP:       none\n' >> "$TMP/pwplus-none.txt"; }
 bash "$GATE" --check "$TMP/pwplus-none.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H25) a trailing UNKEYED 'WIP: none' does not exempt the keyed claim above it (got $rc)"
+# ⛔ (H25b) ASSERTS THE TOKEN, NOT JUST rc (review of #3621, P2 — VERIFIED by reproduction). rc alone is
+# 80 EITHER WAY: with last-wins restored the contradicting-ref token VANISHES while rc stays 80, because
+# the trailing unkeyed `none` is refused on its OWN account. So an rc-only arm DESCRIBED this carrier and
+# could not fail — a revert of the every-value reader re-opened the fail-open with (H25) still green.
+# Measured both ways: shipped token=1, last-wins token=0, rc=80 in both.
+miss="$(bash "$GATE" --missing "$TMP/pwplus-none.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H25b) …and the CONTRADICTED token is what refuses it — rc alone is 80 under last-wins too"
 { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-bare.txt"; printf '\nWIP:\n' >> "$TMP/pwplus-bare.txt"; }
 bash "$GATE" --check "$TMP/pwplus-bare.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
 [ "$rc" -eq 80 ]; ck $? "(H26) a BARE 'WIP:' label does not exempt it either (got $rc)"
@@ -1206,14 +1213,29 @@ grep -q '_v\[++_n\] = t' "$MUT_PW3"; rc=$?
 [ "$rc" -ne 0 ]; ck $? "(H42b) …and the old collector is GONE (a mutant that kept it would not be last-wins either)"
 bash -n "$MUT_PW3"; ck $? "(H43) …and it still parses"
 # ⛔ NOT EVERY CARRIER FLIPS UNDER THIS MUTANT, and asserting one that cannot would be its own
-# vacuous arm: (H5) has a SINGLE `WIP:` line (last-wins == every-value, so nothing changes) and the
-# trailing line in (H16) is UNKEYED (the key check still refuses it). The two that flip are the ones
-# whose LAST line is a keyed, ref-naming claim — exactly the paste-back this mutant restores.
-for pair in "pwplus-canon.txt:H24" "pwplus-other.txt:H27"; do
+# vacuous arm — so each carrier is named by what it ACTUALLY does, MEASURED. (Review of #3621, P2: the
+# first version of this comment mis-cited both arms it named — (H5) is the `--wip-refs` explicit-repo
+# arm and has NO `WIP:` line at all (:868), and (H16) is the named-ref arm, which is ADMITTED with a
+# single `WIP:` line and therefore has no trailing line — while (H25), the carrier it described, was not
+# named at all.)
+# ⛔ FLIP — the mutant ADMITS them, so `rc -eq 0` below is the claim: (H24) a pasted canonical block,
+# (H27) a keyed line for another issue, and (H26) a BARE `WIP:`, whose last value is EMPTY, so last-wins
+# collects nothing and the key check has nothing to refuse.
+# ⛔ DO NOT FLIP ON rc — (H25) a trailing UNKEYED `WIP: none`. Last-wins collects the value `none` off an
+# unkeyed line, which is refused on its OWN account, so rc stays 80 while the contradicting-ref token
+# DISAPPEARS. Its discriminator is therefore the TOKEN, asserted by (H25b) and by (H44b) below; an
+# rc-only assertion cannot fail here and is exactly the non-discriminating shape this suite forbids.
+for pair in "pwplus-canon.txt:H24" "pwplus-other.txt:H27" "pwplus-bare.txt:H26"; do
   f="${pair%%:*}"; lab="${pair#*:}"
   bash "$MUT_PW3" --check "$TMP/$f" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
   [ "$rc" -eq 0 ]; ck $? "(H44) MUTATION: ${lab} now FAILS — with last-wins restored that brief is ADMITTED (rc=$rc)"
 done
+# (H44b) THE TOKEN-GONE HALF: for the carrier that does NOT flip rc, the token IS the discriminator —
+# under last-wins the contradicted ref is never inspected, so it vanishes. This is what makes (H25b)
+# non-vacuous WITHOUT relying on rc, which cannot move here.
+miss3="$(bash "$MUT_PW3" --missing "$TMP/pwplus-none.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss3"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H44b) MUTATION: (H25b) now FAILS — with last-wins restored the contradicting-ref token is GONE (rc stays 80, so only the token can catch this)"
 MUT_PW2="$TMP/mutant-pw2.sh"
 sed 's|^  if (!pwsec) print "PREVIOUS-WORK-SECTION"$|  # MUTANT: no section token|' "$GATE" > "$MUT_PW2"
 diff -q "$GATE" "$MUT_PW2" >/dev/null 2>&1; rc=$?
