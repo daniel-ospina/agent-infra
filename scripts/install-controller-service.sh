@@ -254,6 +254,15 @@ git_checkout_unproven() {
     return 1
 }
 
+# linked_worktree_root <resolved supervisor> — "<root>|branch", "<root>|detached", a REASON sentence, or nothing.
+# ⛔ A LINKED WORKTREE IS NOT AUTOMATICALLY A LANE'S — THE HARNESS PIN *IS* ONE (review-3 P1, the finding that
+# makes this a rule about the BRANCH). `cloud-cell-bringup.sh` creates every cell's pin with
+# `git worktree add --detach <pin-dir>/<sha> <sha>`, so a rule that refuses every linked worktree refuses the
+# very shape this installer calls CORRECT and the alternative its own refusal message recommends — an operator
+# with no farm is in a loop. What makes the #2697 shape wrong is not "worktree": it is a worktree checked out
+# ON A BRANCH, i.e. unmerged code a lane removes when it lands. A DETACHED worktree is a pin at a commit. Git
+# answers this directly (`symbolic-ref -q HEAD` errors on a detached HEAD), so the rule stays name-free, and the
+# durability question is still decided afterwards by the temporary-root/declared-root test.
 linked_worktree_root() {
     local d dirs top
     d="$(dirname "${1:-}")"
@@ -277,7 +286,13 @@ linked_worktree_root() {
         printf 'it is inside a LINKED GIT WORKTREE that git reported but could not name (its git-dir and common-dir already disagreed, and `rev-parse --show-toplevel` then failed) — a lane checkout removed when the lane ends'
         return 0
     fi
-    printf '%s\n' "$top"
+    # ⛔ THE BRANCH, NOT THE WORKTREE (review-3 P1). A detached HEAD is the shape the cells' pin has; a symbolic
+    # HEAD is a branch — unmerged work a lane removes when it lands.
+    if GIT_OPTIONAL_LOCKS=0 git -C "$d" symbolic-ref -q HEAD >/dev/null 2>&1; then
+        printf '%s|branch\n' "$top"
+    else
+        printf '%s|detached\n' "$top"
+    fi
     return 0
 }
 
@@ -352,10 +367,16 @@ scratch_supervisor_reason() {
         return 0
     fi
     d="$(linked_worktree_root "$p")"
-    if [ -n "$d" ]; then
-        printf 'it lives in the LINKED GIT WORKTREE %s — a lane checkout that is removed when that lane ends, and whose branch is merged nowhere' "$d"
-        return 0
-    fi
+    case "$d" in
+        '') ;;                       # not in any git work tree at all (a farmed copy): nothing to refuse here
+        *'|detached') ;;             # a PIN at a commit: admissible here, and the temporary-root test below applies
+        *'|branch')
+            printf 'it lives in the LINKED GIT WORKTREE %s, which is checked out on a BRANCH — a lane checkout that is removed when that lane ends, and whose branch is merged nowhere (a pin is DETACHED at a commit; a branch is unmerged work)' "${d%|branch}"
+            return 0 ;;
+        *)                           # a REASON sentence from linked_worktree_root (unproven, or linked-but-unnamed)
+            printf '%s' "$d"
+            return 0 ;;
+    esac
     root="$(transient_root_of "$p")"
     [ -n "$root" ] || return 1      # not under any temporary root: durable wherever it is
     # ⛔ A DECLARATION IS NOT A SIGNATURE (re-review P1). A reviewer measured the escape: the bring-up passes

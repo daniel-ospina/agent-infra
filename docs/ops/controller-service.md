@@ -82,17 +82,29 @@ alone cannot be the rule without blocking every cell bring-up. The refusal names
 alternatives (the farmed `$HOME/.pi/agent/scripts/…`, `$AGENT_INFRA_PATH/scripts/…`, or the harness pin)
 and writes **nothing** — the preview verb refuses too.
 
-⛔ **"Lane worktree" is decided by GIT, not by the path's spelling.** A name list cannot be the guard
-(the measured shape was `/tmp/wt-2433-fu`; the next lane picks the next name, and a copy nested one
-directory deeper matches no pattern). In a **linked** worktree `git rev-parse --absolute-git-dir`
-answers `<main>/.git/worktrees/<name>` while `--git-common-dir` still answers `<main>/.git`; in the
-**main** clone the two are the same directory. So every linked worktree is refused wherever it lives
-(`/tmp/wt-x`, `$HOME/wt-x`, `<repo>/.worktrees/x`), a **primary** clone under `/tmp` (`/tmp/cell-ai`,
-the cells' own checkout) is untouched, and **no declaration launders one**: a caller that names its own
-worktree as `AGENT_INFRA_PATH` does not get to admit it. The fleet's scratch shapes
-(`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`) are refused as well, and that list is
-the **same** list `scripts/install-repair-service.sh` uses — the suite asserts the two are equal, so a
-second hand-kept copy cannot drift.
+⛔ **"Lane worktree" is decided by GIT — and by the BRANCH, not by being a worktree.** A name list cannot
+be the guard (the measured shape was `/tmp/wt-2433-fu`; the next lane picks the next name, and a copy
+nested one directory deeper matches no pattern). In a **linked** worktree `git rev-parse
+--absolute-git-dir` answers `<main>/.git/worktrees/<name>` while `--git-common-dir` still answers
+`<main>/.git`; in the **main** clone the two are the same directory.
+
+⛔ **NOT EVERY LINKED WORKTREE IS A LANE'S — the cell's harness pin is one too.** The bring-up creates the
+pin with `git worktree add --detach <pin>/<sha> <sha>`, so a rule that refused every linked worktree
+refused the very shape this document calls correct, and the alternative its own refusal message
+recommends: a loop for an operator with no farm. What makes the #2697 shape wrong is a worktree checked
+out **on a branch** — unmerged code a lane removes when it lands — and git answers that directly
+(`symbolic-ref -q HEAD` succeeds on a branch, fails on a detached HEAD). So a linked worktree **on a
+branch** is refused wherever it lives (`/tmp/wt-x`, `$HOME/wt-x`, `<repo>/.worktrees/x`); a **detached**
+one is a pin at a commit and is then merely subject to the temporary-root/declared-root rule above; a
+**primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is untouched; and **no declaration
+launders a branch checkout**: a caller that names its own worktree as `AGENT_INFRA_PATH` does not get to
+admit it. When git cannot identify the checkout at all (a `.git` entry it refuses to read — dubious
+ownership, an exported `GIT_DIR`, an unreadable directory), the answer is **cannot prove**, and it is
+refused rather than admitted.
+
+The fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`) are refused
+by name as well, and that list is the **same** list `scripts/install-repair-service.sh` uses — the suite
+extracts both `case` statements and compares them, so a second hand-kept copy cannot drift.
 
 Two callers, two strengths, one owner of the rule:
 

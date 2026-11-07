@@ -2976,15 +2976,40 @@ fi
 # bring-up (`check_controller_service` runs `--install`).
 say_case 'the harness pin under the cell home — the shape cell-3 measured as CORRECT — is ADMITTED'
 PIN="$(arm_root pin)"; mk_systemctl "$PIN/bin" "$PIN/state" "$PIN/sc.log"; mk_tmux "$PIN/bin" "$PIN/tmux.log"
-PIN_SHA="d4ccaf6ee8e6db52a60e1507b47099f06ae20df2"
-PIN_SUP="$PIN/home/harness/$PIN_SHA/scripts"
-mkdir -p "$PIN_SUP"; cp "$SUP" "$PIN_SUP/cloud-cell-supervisor.sh"
-PIN_RC=0; PIN_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_SUP/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_RC=$?
-[ "$PIN_RC" -eq 0 ] && ok '§P4: the pin path installs (a cell home under /tmp is a DECLARED root, not scratch)' \
-                    || bad "§P4: refused the cell-3 shape — this guard would block every cell bring-up: $PIN_OUT"
-grep -qxF "ExecStart=/bin/bash $PIN_SUP/cloud-cell-supervisor.sh start" "$PIN/units/eldato-orchestrator.service" 2>/dev/null \
-  && ok '§P4: and the unit names the pin, which is what cell-3 already runs' \
-  || bad '§P4: the installed unit does not name the pin path'
+# ⛔ AND IT MUST BE THE **REAL PIN**, NOT A LOOKALIKE (review-3 P2). This arm used to `cp` the supervisor into
+# `$home/harness/<sha>/scripts` — a plain directory no cell has. The bring-up creates the pin with
+# `git worktree add --detach <pin>/<sha> <sha>` (`cloud-cell-bringup.sh`), and a plain copy passed while the
+# real thing was REFUSED: the arm certified a shape that does not exist and hid a P1. The fixture now builds
+# the pin the way the bring-up does, and refuses to call the arm covered if it cannot.
+PIN_REPO="$PIN/home/agent-infra"; mkdir -p "$PIN_REPO/scripts"
+cp "$SUP" "$PIN_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PIN_REPO" 2>/dev/null
+git -C "$PIN_REPO" add -A >/dev/null 2>&1
+git -C "$PIN_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PIN_SHA="$(git -C "$PIN_REPO" rev-parse HEAD 2>/dev/null)"
+PIN_DIR="$PIN/home/harness/$PIN_SHA"
+PIN_SUP="$PIN_DIR/scripts"
+if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PIN_SHA" >/dev/null 2>&1; then
+  PIN_RC=0; PIN_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_SUP/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_RC=$?
+  [ "$PIN_RC" -eq 0 ] && ok '§P4: the DETACHED pin worktree the bring-up really creates installs (a cell home under /tmp is a DECLARED root)' \
+                      || bad "§P4: refused the cell-3 shape — this guard would block every cell bring-up: $PIN_OUT"
+  grep -qxF "ExecStart=/bin/bash $PIN_SUP/cloud-cell-supervisor.sh start" "$PIN/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P4: and the unit names the pin, which is what cell-3 already runs' \
+    || bad '§P4: the installed unit does not name the pin path'
+  # ⛔ THE CONTROL THAT MAKES §P4 ABOUT THE BRANCH, NOT ABOUT WORKTREES: the SAME location, the same git
+  # checkout, but the worktree checked out ON A BRANCH — a lane's shape at a pin's address. Must be refused.
+  rm -f "$PIN/units/eldato-orchestrator.service"
+  PIN_BR="$PIN/home/harness/lane-at-pin-address"
+  if git -C "$PIN_REPO" worktree add -q -b lane2697 "$PIN_BR" "$PIN_SHA" >/dev/null 2>&1; then
+    PIN_BR_RC=0; PIN_BR_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_BR/scripts/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_BR_RC=$?
+    [ "$PIN_BR_RC" -ne 0 ] && ok "§P4: a BRANCH worktree at a pin's own address is REFUSED (the branch is the rule, not 'worktree')" \
+                          || bad "§P4: a lane's branch checkout was armed just because it sat where a pin goes: $PIN_BR_OUT"
+  else
+    bad '§P4: the fixture could not create the branch-worktree control, so that arm did not run'
+  fi
+else
+  bad '§P4: the fixture could not create the detach pin worktree, so §P4 did not run on the shape it names'
+fi
 # …and the same path under a temp root that NO root declares is refused, so §P4 is not a blanket pass.
 PINB="$(arm_root pinb)"; mk_systemctl "$PINB/bin" "$PINB/state" "$PINB/sc.log"; mk_tmux "$PINB/bin" "$PINB/tmux.log"
 PINB_SUP="$T/harness/$PIN_SHA/scripts"; mkdir -p "$PINB_SUP"; cp "$SUP" "$PINB_SUP/cloud-cell-supervisor.sh"
