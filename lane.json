@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-11429-1794070918-p1237746-652a7539",
+  "_sha": "3e3ac7e7279e9acecdd4924246ba36b2fa280d00",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11429.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/9567-d8-ci-drill-leg"
+    },
+    {
+      "kind": "sha",
+      "value": "2d1fab1cd755abaf53966adf4e5fe4efc51903af"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/prd-11429"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7217,
+  "ended_at": 1794078135,
+  "exit_code": 143,
+  "heartbeat_at": 1794078135,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11429-1794070918-p1237746-652a7539",
+  "lease_until": 1794085935,
+  "pid": 1237746,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794070918,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-11429",
+  "worktree": "/home/cmux/tortoise/.worktrees/prd-11429"
+}
