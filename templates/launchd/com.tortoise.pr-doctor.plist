@@ -96,17 +96,24 @@
          WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
          $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
          .../pr-doctor.status.json. In the multi-repo (`all-repos`) mode this wrapper
-         runs, those two names are NOT written at all: the log and the verdict MOVE to
-         `pr-doctor.<owner>-<name>.log` and `pr-doctor.<owner>-<name>.status.json`, one
-         pair per repo, so one repo's verdict cannot stand in for another's.
-         ⛔ SAY "MOVE", NOT "ALSO". The first version of this paragraph said each repo
-         "ALSO gets" a pair "beside them", which tells an operator the canonical pair
-         still exists — and two readers open it BY NAME: `scripts/heartbeat-loop.sh` and
-         `scripts/lib/fleet-inventory.sh`'s `_fleet_pr_doctor_bound`. On a box whose only
-         launcher is this unit, those readers now read a file nothing writes, and the
-         sentence was the reason nobody would look. (Measured: `apply_repo(multi=True)`
-         REASSIGNS the doctor's module-level log/status names rather than adding to
-         them.) The launchd capture below is the third surface and
+         runs, each repo ALSO gets `pr-doctor.<owner>-<name>.log` and
+         `pr-doctor.<owner>-<name>.status.json`, one pair per repo, so one repo's
+         verdict cannot stand in for another's — AND after the last repo the canonical
+         pair is written with the SET's aggregate verdict (a `repos` list, `rc` = the
+         worst of the set), which is the record `scripts/heartbeat-loop.sh` and
+         `scripts/lib/fleet-inventory.sh`'s `_fleet_pr_doctor_bound` read BY NAME.
+         ⛔ SAY "ALSO … AND THE AGGREGATE", NOT "MOVE" (review round 44, P1 — measured).
+         An intermediate version of this paragraph said the canonical pair is "NOT
+         written at all" and that the names MOVE to the per-repo ones. That is false,
+         and it inverts the failure it was meant to fix: `run_all_repos()` ends by
+         calling `canonical_paths()`, which points STATUS and LOG back at the canonical
+         names, and `record_exit` writes the AGGREGATE into them. Measured on
+         `python3 scripts/pr-doctor.py` in `all-repos` mode over a two-repo set: all six
+         files appear, and `pr-doctor.status.json` carries `repo = "acme/alpha,acme/beta"`,
+         the worst `rc`, and a two-row `repos` list. Telling an operator those files are
+         never written makes a live aggregate verdict read as a phantom, which is the
+         same "operator looks in the wrong place" failure, inverted. The launchd
+         capture below is the third surface and
          the one its own code names — a pass that dies before it can write either
          still leaves its crash text here (a launchd job's stderr is the only place
          an interpreter-level death lands), which is what makes an import error

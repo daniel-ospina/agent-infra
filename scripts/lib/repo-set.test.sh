@@ -100,15 +100,23 @@ slug=daniel-ospina/agent-infra checkout=$T/agent-infra state=$T/state-ai
 EOF
 
 # run_reader <conf> <verb...> — REPO_SET_FILE pinned per call, never inherited.
-# ⛔ EVERY READER CALL GOES THROUGH A WALL-CLOCK BOUND, AND NOT VIA `timeout` (review-instrumented round
-# 44). Three measured reasons, all from this round:
+# ⛔ EVERY CALL THROUGH `run_reader*` GOES THROUGH A WALL-CLOCK BOUND, AND NOT VIA `timeout`
+# (review-instrumented round 44). Three measured reasons, all from this round:
 #  1. `timeout` IS NOT ON macOS — it is coreutils, not a BSD tool — and this suite is run by the operator
 #     of a launchd unit. An arm leaning on it reds on `command not found`, i.e. on the HARNESS, where the
 #     arm exists to prove BEHAVIOUR (the same trap `set -u` is placed after the resolutions for).
 #  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION: the ancestor walk used to LOOP (a
 #     slash-less parent never shortens) and the first absent-path arm to run is `b1`, which had no bound —
 #     so a re-regression WEDGED the shard for its whole CI timeout instead of reddening. Bounding the
-#     helper bounds every arm; `124` is `timeout`'s own code, so the arms' arithmetic is unchanged.
+#     helper bounds every arm THAT CALLS IT; `124` is `timeout`'s own code, so the arms' arithmetic is
+#     unchanged.
+#     ⛔ THAT IS A SCOPE, NOT A COVERAGE CLAIM (review round 44, P2 — measured). The four `run_reader*`
+#     helpers below are the ONLY bounded call sites: the `bash "$W/pr-doctor-machine.sh"` wrapper arms and
+#     the direct `bash "$READER"` arms invoke the reader themselves and are UNBOUNDED, and the two fixture
+#     arms added by this round (`j-emptyrender`, `j16f`) call a reader COPY at their own site — those two
+#     are bounded explicitly THERE (`_rs_bound 30`), so the arms closest to this round's regression (the
+#     `check` ancestor walk) do not depend on the helper. Do not read a green run as "every call is
+#     bounded": it says "every call through the helpers is".
 #  3. ⛔ IT MUST KILL THE WHOLE TREE, NOT `$!` — and the first cut did not, which made it INERT exactly
 #     where it was needed. Measured: with the walk broken, `_rs_bound` returned 124 at 30.9 s and the
 #     calling `$( )` STILL BLOCKED past 60 s, because the killed reader left children whose stdout IS the
@@ -1250,7 +1258,7 @@ assert s.count(old) == 1, s.count(old)
 open(p, "w", encoding='utf-8').write(s.replace(old, "  :", 1))
 PYER
 ck "j-emptyrender an EMPTY render with a NON-EMPTY parse is INCOMPLETE (WARN), never a refusal on a false cause" \
-   'o="$(REPO_SET_FILE="$CONF" bash "$WER/lib/repo-set.sh" check 2>&1)"; rc=$?; [ "$rc" = 0 ] && grep -q "WARN WHOLE-SET-PROOFS-SKIPPED" <<<"$o" && grep -q "OK — 2 repo(s)" <<<"$o" && ! grep -q "REFUSED set" <<<"$o"'
+   'o="$(REPO_SET_FILE="$CONF" _rs_bound 30 bash "$WER/lib/repo-set.sh" check 2>&1)"; rc=$?; [ "$rc" = 0 ] && grep -q "WARN WHOLE-SET-PROOFS-SKIPPED" <<<"$o" && grep -q "OK — 2 repo(s)" <<<"$o" && ! grep -q "REFUSED set" <<<"$o"'
 # ⛔ `dirname` WAS THE LAST UNGUARDED EXTERNAL, AND ITS ABSENCE DISARMED THE ABSENCE PROOF (review round 44,
 # P2 — measured). It is gone from the code now (`${d%/*}` is the same parent with no process), and this arm
 # is what makes that more than a tidy-up: with a reader whose interpreter candidates cannot resolve AND a
@@ -1278,7 +1286,7 @@ PYNID
   mkdir -p "$T/den2/den"
   printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/den2/den/repos.conf"
   chmod 000 "$T/den2/den"
-  _o_dn="$(REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/repo-set.sh" check 2>&1)"; _rc_dn=$?
+  _o_dn="$(REPO_SET_FILE="$T/den2/den/repos.conf" _rs_bound 30 env PATH="$ND" /bin/bash "$NI/repo-set.sh" check 2>&1)"; _rc_dn=$?
   chmod 755 "$T/den2/den"
   ck "j16f no \`dirname\` must not disarm the absence proof (rc 5 INVALID, never the rc 3 the wrapper degrades on)" \
      '[ "$_rc_dn" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn"'

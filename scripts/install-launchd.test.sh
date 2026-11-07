@@ -561,6 +561,20 @@ done
 # worktree-hygiene #2047), and the result was a RED `bash-suites` on main that had nothing to do with any
 # PR that touched it. Keep this list in step with `grep -l '{{TORTOISE_REPO}}' templates/launchd/*.plist`.
 assert_eq "$GATED_TEMPLATES1" "4" "the {{TORTOISE_REPO}}-gated inventory is accounted for (branch-reaper #1787 + worktree-reaper #1311 + worktree-hygiene #2047 + pr-doctor #2303)"
+# ⛔ THE OUTPUT-LOCATION PARAGRAPH HAS BEEN INVERTED TWICE, SO IT GETS A SENSOR AND NOT A THIRD CORRECTION
+# (agent-infra#2281 review round 44, P1 — measured). The prose is operator-facing: it says where a live
+# verdict is written, and two readers (`heartbeat-loop.sh`, `lib/fleet-inventory.sh`'s
+# `_fleet_pr_doctor_bound`) open the canonical pair BY NAME. Round 44 "fixed" it by asserting the
+# canonical pair is never written at all — FALSE, because `run_all_repos()` ends by calling
+# `canonical_paths()` and `record_exit` writes the SET's aggregate there. Measured in `all-repos` mode
+# over two repos: all six files appear, and `pr-doctor.status.json` carries `repo = "acme/alpha,acme/beta"`
+# plus a two-row `repos` list. So the true facts are pinned PRESENT and both false forms pinned ABSENT —
+# a prose claim this wrong twice is a claim, not a comment.
+_PRD_TPL="$(cat "$REPO_TEMPLATES/com.tortoise.pr-doctor.plist")"
+assert_contains "$_PRD_TPL" "each repo ALSO gets" "pr-doctor template: per-repo pairs are ADDITIONAL, not a replacement"
+assert_contains "$_PRD_TPL" "the SET's aggregate verdict" "pr-doctor template: names the AGGREGATE landing in the canonical pair"
+assert_contains "$_PRD_TPL" '_fleet_pr_doctor_bound` read BY NAME' "pr-doctor template: names the reader that opens the canonical pair"
+assert_not_contains "$_PRD_TPL" "the log and the verdict MOVE to" "pr-doctor template: does NOT claim the canonical pair moves away (round 44's inversion)"
 # A visible checkout whose resolution produced NOTHING is a regression, not a host without one. Ask
 # the same three candidates install-launchd.sh:76-82 asks (the fixture's HOME is the fake one the run
 # used, so §13/§14's seeded checkouts cannot make this look resolved).
