@@ -327,18 +327,21 @@
 #     until the per-worktree loop begins: enumeration/ps/lsof already have their
 #     own watchdogs, and charging their latency to the budget made a slow host
 #     defer EVERY worktree on every pass — a reaper that silently never reaps.
-#   * `git ls-remote` (#3041) is the ONE probe that can cross a network: it is
-#     watchdosed by REAP_WT_GIT_TIMEOUT, runs at most once per candidate, and a
-#     TRANSPORT failure is remembered per remote for the rest of the pass (a dead
-#     remote must not spend the whole budget on N candidates). ⛔ IT IS CHARGED TO
-#     THE BUDGET, so it is NOT free: a remote that answers slowly spends up to one
-#     timeout per candidate that reaches it, which can DEFER the rest of the
-#     listing — and a deferred pass removed nothing, which is exactly what the
-#     pass verdict judges (`reap-ineffective` counts EXAMINED records, not decided
-#     ones, so a deferral-heavy pass on a full box cannot read as `idle`). The
-#     population that reaches the probe is small by construction (only records
-#     whose sole holder is a remote-tracking ref), and the dead-remote cache
-#     collapses a transport failure to ONE timeout.
+#   * `git ls-remote` (#3041) is the ONE probe that can cross a network. TWO different calls, and
+#     they no longer share a cost model: the ADVERTISEMENT (`ls-remote --heads <remote>`) runs at
+#     most ONCE PER REMOTE PER PASS since #3371 and is CLASSIFICATION evidence only; the RE-PROOF
+#     (`remote_holds_recheck`) is one TARGETED `ls-remote --heads <remote> refs/heads/<branch>` at
+#     the moment of a removal. So the classification cost is per REMOTE — bounded — rather than per
+#     `remote-only-ref` ROW, which is not, and only the destructive act pays the old per-REMOVAL
+#     price (measured on cmux/cell-3, 2026-11-07: 0.55 s per targeted probe, 7.54 s for 12
+#     candidates, versus 0.55 s for the remote's whole 2,111-head advertisement). A TRANSPORT
+#     failure is remembered per remote for the rest of the pass (a dead remote must not spend the
+#     whole budget on N candidates) and collapses to ONE timeout. ⛔ IT IS STILL CHARGED TO THE
+#     BUDGET, so it is NOT free: a remote that answers slowly can DEFER the rest of the listing —
+#     and a deferred pass removed nothing, which is exactly what the pass verdict judges
+#     (`reap-ineffective` counts EXAMINED records, not decided ones, so a deferral-heavy pass on a
+#     full box cannot read as `idle`). The population that reaches the probe is small by
+#     construction (only records whose sole holder is a remote-tracking ref).
 #   * no `find`, `rg -r`, `du`, `lsof +D`, or recursive glob is executed
 #   * the removal path re-runs the clean gate TWICE (remove_one): both runs are
 #     `status` probes bounded by REAP_WT_STATUS_TIMEOUT, so the TOCTOU re-check
@@ -2507,11 +2510,30 @@ remote_advertise() { # <remote> -> 0 when that remote's `refs/heads/*` snapshot 
         remote_mark_dead "$remote"
         return 1
     fi
-    # `A <remote> <sha> <refname>` per advertised head. A write that fails leaves the marker
-    # unwritten, so the next candidate re-reads rather than trusting a partial snapshot.
-    awk -v r="$remote" 'NF >= 2 { printf "A %s %s %s\n", r, $1, $2 }' "$GIT_OUT" \
-        >>"$REMOTE_ADV_FILE" 2>/dev/null || return 1
-    printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null || return 1
+    # `A <remote> <sha> <refname>` per advertised head.
+    # ⛔ THE COMPLETION MARKER IS WRITTEN FIRST, THEN THE LINES (#3371 review cycle 2, P3). The
+    # reverse order means a failed `awk` leaves the marker unwritten, so the next candidate RE-READS
+    # — and because that retry APPENDS, a partial snapshot would then accumulate a SECOND set of `A`
+    # lines for the same refnames. That is not unsafe (`n == 1` below then answers nothing, i.e.
+    # PRESERVE) but it POISONS the entry for the rest of the pass: every later candidate pays a
+    # fresh full advertisement and still preserves, so the #3371 cost fix silently vanishes in
+    # exactly the ENOSPC condition this reaper exists for, while the code reads as if the cache
+    # recovered. Marker-first makes a failed write leave an INCOMPLETE snapshot and NO retry, and
+    # incomplete is the safe direction: a missing refname, a truncated refname and a truncated sha
+    # all fail the exact match below.
+    if ! printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null; then
+        # Nothing was appended above, so there is nothing to roll back. Answer "no snapshot" — the
+        # caller PRESERVES.
+        return 1
+    fi
+    if ! awk -v r="$remote" 'NF >= 2 { printf "A %s %s %s\n", r, $1, $2 }' "$GIT_OUT" \
+            >>"$REMOTE_ADV_FILE" 2>/dev/null; then
+        # A partial snapshot now sits behind a COMPLETED marker, so it is never retried. That is the
+        # safe direction (see above) and it is the state that costs least on a full disk: one
+        # advertisement, no retry storm. Recorded so the next reader does not mistake "no retry"
+        # for "nothing was written".
+        return 0
+    fi
     return 0
 }
 
@@ -4855,6 +4877,8 @@ run() {
     # every early fail-closed exit.
     # The trap owns EVERY scratch file a pass can mint, from BOTH sides of this merge:
     #   · `$STASH_OUT` / `$REMOTE_DEAD_FILE` — the #2541/#3041 probes (origin/main);
+    #   · `$REMOTE_ADV_FILE` — the #3371 per-pass remote head advertisement (the SUCCESS side of the
+    #     same cache pattern `$REMOTE_DEAD_FILE` is the failure side of);
     #   · `$CLAIM_MAP` — the registry scratch this pass builds (claims_load), which used to be the ONE
     #     scratch file the trap did not own, so every launchd-scheduled pass left one behind
     #     (agent-infra#2102 review, minor). Guarded because the pass may exit before the registry was
