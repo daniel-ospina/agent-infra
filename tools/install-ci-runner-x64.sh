@@ -172,7 +172,7 @@ is_uint "$COUNT" || { err "cannot-measure why=count-not-a-positive-integer value
 
 # ⛔ THE POOL TOOL MUST BE READABLE, and its absence is never a silent success. This is the failure
 # mode that started it all: a provisioner path that does not resolve, on a box whose caller then
-# believes it provisioned. ⛔ rc 6, NOT rc 2 (`RC_CONFIG`, see contract fact 4): a missing pool tool
+# believes it provisioned. ⛔ rc 6, NOT rc 2 (see contract fact 4): a missing pool tool
 # is THIS BOX being misconfigured, not a capacity answer, so the caller must surface it as a failure
 # in `problems`/`actions` instead of reporting `provisioner-refused` with an exit code of 0.
 if [ ! -r "$POOL_TOOL" ]; then

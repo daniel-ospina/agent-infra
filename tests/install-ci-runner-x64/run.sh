@@ -240,6 +240,15 @@ check "a dry run does not report a provision" 0 "$rc" "would-provision slot=2" "
 out=$(RUNNER_AUTOSCALE_BASE=$TMP/elsewhere/gh-runner-x64 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "base outside the caller's root -> configuration error" 6 "$rc" "why=base-outside-root" "$out"
 
+# 13b. ⛔ A RELATIVE BASE IS ITS OWN ARM, and it is NOT covered by 13/14: both of those pass an
+# ABSOLUTE path, so the `*)` arm of the `case "$BASE" in /*)` guard is never reached and a revert of
+# that `exit 6` back to 2 left this suite at pass=50 fail=0 (fresh-context review, round 14 — measured
+# by reverting it on a copy). It is reachable from an operator shell
+# (`RUNNER_AUTOSCALE_BASE=gh-runner-x64`), and the whole point of rc 6 here is that rc 2 would be read
+# by the caller as a CAPACITY ANSWER and exit 0 over a permanently un-provisionable box.
+out=$(RUNNER_AUTOSCALE_BASE=gh-runner-x64 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
+check "a RELATIVE base -> configuration error (rc 6, not the caller's rc-2 answer)" 6 "$rc" "why=base-not-absolute" "$out"
+
 # 14. a base that does not start with `gh-runner` is invisible to `discover()` — refused
 out=$(RUNNER_AUTOSCALE_BASE=$RUNNER_ROOT/pi-runner-x64 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "base not discoverable as gh-runner* -> configuration error" 6 "$rc" "why=base-not-discoverable" "$out"
