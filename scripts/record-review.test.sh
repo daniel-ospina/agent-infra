@@ -7959,7 +7959,15 @@ _bt="$(printf '\140')"
   printf '%s\n' "echo it\\'s the ${_bt}echo EXEC7${_bt} that moved"
   printf '%s\n' "echo \\\"a # only ${_bt}echo NOTEXEC${_bt} is a comment"
 } > "$T/btctrl.sh"
-_badbt2="$(python3 - "$T/btctrl.sh" "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")" <<'PY48B'
+# ⛔ THE HERE-DOC LIVES IN A FUNCTION BODY, NOT IN A `$( )` (bash 3.2, #2930/#2248).
+#    bash 3.2's `$( )` scanner does not know about here-documents: it walks the body as CODE,
+#    so a body carrying an UNBALANCED quote desynchronises the parse state for the REST OF THE
+#    FILE — and this body quotes live backticks as PROSE. Measured at 7666f34b3: `bash -n`
+#    under bash 3.2.57 reported "unexpected EOF while looking for matching `\"'" at the body
+#    and "syntax error: unexpected end of file" ~550 lines below, so `check-bash32-parse.sh`
+#    (#2930) REDS — on a stock Mac `/bin/bash` is 3.2 and install.sh's `bash -n` sweep dies.
+#    The remedy is #2248's: the substitution now carries a FUNCTION CALL, no here-doc.
+_badbt2_sweep() { python3 - "$1" "$2" "$3" <<'PY48B'
 import re, sys
 ctrl = sys.argv[1]
 targets = sys.argv[2:]
@@ -8059,7 +8067,8 @@ except Exception as e:
     out.append("SCANNER-SELF-TEST: the sweep could not run (%r) — an empty answer here is a FAILED sweep, not a clean one" % (e,))
 print("\n".join(out))
 PY48B
-)"
+}
+_badbt2="$(_badbt2_sweep "$T/btctrl.sh" "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")")"
 assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder; the scanner is pinned by its own 8-line control, and a crash is a hit)"
 # 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
 #       commit that descends from `from` while being neither an ancestor NOR a descendant of the
