@@ -163,43 +163,32 @@ from pathlib import Path
 #: ``path`` group stays anchored, and the tail admits only
 #: ``[A-Za-z0-9_\[\]\-.:/]`` — no whitespace, no tab, no empty tail, no missing ``::``.
 #:
-#: ⛔ KNOWN RESIDUAL, deliberately NOT closed here — and NEVER to be written as a
-#: list. `rest` is an allowlist: alnum, ``_``, ``[``, ``]``, ``.``, ``:``, ``-``,
-#: ``/``. ANY real id carrying a character outside it is dropped from MAIN's rate
-#: table, and the IDENTICAL BLOCK survives for it. **That set is OPEN-ENDED.**
-#: Measured on this repo's collected population:
-#: 1543 ids, 47 dropped by this door, 10 of them carrying characters (raw ``#``,
-#: ``(``, ``)``, ``@``, ``|``, ``<``, ``>``) that no earlier draft of this comment
-#: named. If a real id is dropped, ask WHICH DOOR and WHY — not whether it fits a
-#: list; every list written here was measurably short.
+#: ⛔ KNOWN RESIDUAL — never write it as a list, and do not close #3691 on a
+#: whitespace-only fix. `rest` is an allowlist (alnum, ``_``, ``[``, ``]``, ``.``,
+#: ``:``, ``-``, ``/``). Any real id outside it is dropped from MAIN's rate table and
+#: the silent-drop → "absent from main's failure set" → permanent BLOCK follows.
+#: The set is open-ended; every list written here was measurably short.
 #:
-#: WHAT pytest ESCAPES — both halves measured. A PARAM is escaped when needed
-#: (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]`` — backslash sequences, no raw byte), so for
-#: that class the character to admit is ``\``; a test/class NAME is NOT escaped
-#: (``def test_café`` emits the raw UTF-8 bytes ``c3 a9``), so that class needs a
-#: non-ASCII RANGE and admitting ``\`` does not help it.
+#: pytest escapes PARAMS when needed (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]`` — backslash
+#: sequences, no raw byte) but does NOT escape a test/class NAME (``def test_café``
+#: emits the raw UTF-8 bytes ``c3 a9``). So the character to admit for the first is
+#: ``\``; the second needs a non-ASCII range, which ``\`` does not cover.
 #:
-#: WHICH DOOR, precisely — and for a WHITESPACE id there are THREE, not one.
-#: ``_RATES_RE``'s nodeid group is ``\S+``, so it refuses the row; but the row is
-#: ALSO rewritten upstream, before this module ever sees it: the table is built at
-#: ``scripts/ci-failure-set.sh`` by ``sort | uniq -c | awk '{ c=$1; $1=""; ... }'``,
-#: and ``$1 = ""`` REBUILDS ``$0`` joined by OFS, so every whitespace RUN inside the
-#: id collapses to one space. This is NARROWER than it sounds, and the distinction
-#: matters: a SINGLE-space id passes the producer verbatim; only a RUN is rewritten.
-#: Measured on this repo's 47 dropped ids: 43 carry whitespace and 22 are not present
-#: verbatim in the produced table, so 21 of the 43 are rewritten and the rest are
-#: untouched. A fix widening both doors therefore repairs the single-space rows and
-#: leaves the run-bearing ones unjoined — for those the producer is the third door.
-#: This module already records the mangling where it matters for guard keys — see
-#: the ``uniq -c | awk`` note further down; this is the same fact for nodeids.
-#: Every other offending character is ``\S``, so ``_RATES_RE`` matches those rows
-#: and the drop is ``rest`` ALONE. Do not send a fixer to ``_RATES_RE`` for a
-#: comma; it is not involved.
+#: WHICH DOOR. A whitespace id has THREE, not one: ``_RATES_RE``'s nodeid group is
+#: ``\S+`` so it refuses the row, AND the table is rewritten upstream before this
+#: module sees it — ``scripts/ci-failure-set.sh`` builds it with
+#: ``sort | uniq -c | awk '{ c=$1; $1=""; ... }'``, and ``$1 = ""`` REBUILDS ``$0``
+#: joined by OFS, so a whitespace RUN collapses to one space (a SINGLE space passes
+#: verbatim). Widening both doors repairs the single-space rows and leaves the
+#: run-bearing ones unjoined; for those the producer is the third door. This module
+#: already records that mangling for guard keys — see its ``uniq -c | awk`` note.
+#: Every other offending character is ``\S``, so ``_RATES_RE`` matches those rows and
+#: the drop is ``rest`` ALONE — do not send a fixer to ``_RATES_RE`` for a comma.
 #:
 #: The module's own
 #: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins
 #: ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, so this is
-#: live, not hypothetical. Filed as agent-infra#3691.
+#: live, not hypothetical. Tracked by agent-infra#3691.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"

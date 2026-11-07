@@ -3071,15 +3071,12 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     before this change, so `test_x[a` was and remains admitted. Pinning it would pin
     a narrowing the door never had.
 
-    ⛔ TWO DOORS, AND A KNOWN RESIDUAL. `rest` is an allowlist (alnum, `_`, `[`, `]`,
-    `.`, `:`, `-`, `/`). An id outside it is dropped from MAIN's rate table and the
-    silent-drop → "absent from main's failure set" → permanent BLOCK follows.
-    **That set is open-ended; do not enumerate it.** Measured on this tree:
-    `pytest tests/ --collect-only -q` collects 1543 ids, this door drops 47, and 10
-    of those carry characters no earlier draft of these comments named. The full
-    discussion — which door, why a whitespace id has THREE of them, and what pytest
-    escapes — lives in `scripts/ci_exemption.py`'s `_NODEID_RE` block; it is NOT
-    duplicated here, because two copies of "measured" prose drift.
+    ⛔ TWO DOORS, AND A KNOWN RESIDUAL. `rest` is an allowlist; an id outside it
+    is dropped from MAIN's rate table and BLOCKs. The set is open-ended — do not
+    enumerate it. The whole discussion (which door, why a whitespace id has three,
+    what pytest escapes) lives in `scripts/ci_exemption.py`'s `_NODEID_RE` block;
+    it is NOT restated here, because two copies of "measured" prose drift — the
+    first draft of this pair already disagreed with itself on the character set.
     """
     # ── genuinely NOT ids: refused for a STRUCTURAL reason, not by the alphabet ──
     for junk in (
