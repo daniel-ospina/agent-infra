@@ -763,9 +763,11 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
   ident="$(proc_ident "$pid")"
   # A SEPARATE `bash` (not a backgrounded function): it must survive this script's death,
   # and a fork inherits this script's EXIT trap — see rail-guard.sh's header.
-  # `$$` is THIS shell's pid and is correct for every call site here (all top-level, verified);
-  # a future call from inside `$( )` or another subshell would hand the guard the wrong
-  # supervisor, and the guard would then only be able to fire on its limit arm.
+  # `$$` is THIS SUITE's pid — in bash it does NOT change inside `( )` or `$( )` (measured: main,
+  # subshell and command-substitution all report the same `$$`, while `$BASHPID` advances), so a
+  # future call from a subshell still hands the guard the right supervisor, and this stays correct
+  # as written. `$BASHPID` would NOT: from a subshell it names a process that dies first, and the
+  # guard's supervisor arm would fire while the suite is alive.
   bash "$GUARD" "$$" "$limit" "$pid" "$ident" &
   gpid=$!
   # ⛔ WAIT ON THE GUARD FIRST, NOT ON THE RAIL. The guard is the ONLY thing here with a bound,
@@ -1622,6 +1624,51 @@ rc=$?
 [ "$rc" -eq 125 ] \
   && pass "an unrepresentable limit is refused, not silently inert" \
   || fail "expected rc 125 for an oversized limit, got $rc"
+
+# ═══ 7j. a malformed PID is REFUSED, not acted on (#3622 review, P2) ════
+# The guard validated `<limit>` by value and then ACTED on `<pid>` and `<supervisor-pid>` without
+# reading them at all. Three measured consequences, one per wrong answer a program can give:
+# a kill it must not perform (`kill -9 0` is the WHOLE PROCESS GROUP — reproduced: a `setsid`
+# probe ran `rail-guard.sh <sup> 5 0` and its own shell, its victim and the guard all died), a
+# kill of the wrong target (`kill -0 not-a-pid` answers FALSE, so the SUPERVISOR arm fires on the
+# first poll and a HEALTHY rail is reaped), and a FALSE PASS (a non-numeric pid makes `still_ours`
+# false, the loop is never entered, `exit 0` — "the rail stopped on its own" — over nothing).
+# ⛔ The third arm is why the victim below must be a REAL live process: without the refusal there
+# is nothing to observe on the first two, and the third would print a tick with no rail at all.
+echo "── 7j. a malformed <pid>/<supervisor> is refused, and no live process is signalled"
+new_scen bad-pids
+bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-pid"
+_bvictim="$(cat "$SCEN/victim-pid" 2>/dev/null)"
+if [ -z "$_bvictim" ] || ! is_running "$_bvictim"; then
+  fail "7j fixture: the victim is not running, so 'not signalled' would be vacuously true"
+else
+  _bvident="$(proc_ident "$_bvictim")"
+  bash "$GUARD" "$$" 30 0 2>"$SCEN/bp-pid0"
+  _rc=$?
+  [ "$_rc" -eq 2 ] \
+    && pass "pid 0 is REFUSED (rc 2) instead of signalling the whole process group" \
+    || fail "expected rc 2 for pid 0, got $_rc"
+  grep -q "whole process group" "$SCEN/bp-pid0" 2>/dev/null \
+    && pass "the pid-0 refusal names the process-group hazard" \
+    || fail "the pid-0 refusal did not name its reason ($(tail -1 "$SCEN/bp-pid0" 2>/dev/null))"
+  bash "$GUARD" "$$" 30 not-a-pid 2>"$SCEN/bp-badpid"
+  _rc=$?
+  [ "$_rc" -eq 2 ] \
+    && pass "a non-numeric pid is REFUSED (rc 2), not answered with a false 'the rail stopped'" \
+    || fail "expected rc 2 for a non-numeric pid, got $_rc (0 would be a false PASS)"
+  # The destructive direction: an unreadable supervisor reads as GONE, so the supervisor arm fires
+  # on the FIRST poll. Before the refusal this reaped the rail at once, with the limit nowhere
+  # near expiry — i.e. a typo in argv killed the thing the guard exists to protect.
+  bash "$GUARD" not-a-pid 30 "$_bvictim" "$_bvident" 2>"$SCEN/bp-badsup"
+  _rc=$?
+  [ "$_rc" -eq 2 ] \
+    && pass "a non-numeric supervisor is REFUSED (rc 2), not read as 'gone'" \
+    || fail "expected rc 2 for a non-numeric supervisor, got $_rc"
+  is_running "$_bvictim" \
+    && pass "the live victim was NOT signalled by any of the three refusals" \
+    || fail "a refusal SIGNALLED the live victim — the guard killed what it could not read"
+  reap_pid "$_bvictim" "$_bvident"
+fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
 echo "── 8. --dry-run mutates nothing"
