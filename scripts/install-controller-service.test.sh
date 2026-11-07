@@ -1670,7 +1670,14 @@ HW="$(arm_root hw)"; mk_systemctl "$HW/bin" "$HW/state" "$HW/sc.log"
 : > "$HW/units/eldato-orchestrator.service"; : > "$HW/state/enabled"
 printf '#!/bin/bash\ncase "${1:-}" in\n  has-session) exit 0 ;;\n  *) exit 0 ;;\nesac\n' > "$HW/bin/tmux"
 chmod +x "$HW/bin/tmux"
-HW_RC=0; HW_OUT="$(SUP_EXTRA_ENV="ORCH_FOREGROUND=1 CONTROLLER_HANDOVER_TIMEOUT=4" sup hw start 2>&1)" || HW_RC=$?
+# ⛔ BOTH BOUNDS, AND THE ORPHAN ONE IS THE ONE THAT APPLIES HERE (measured while landing #2697). The arm's
+# tmux stub answers `has-session` with NO owner, so `start` takes the ORPHAN wait — not the handover wait this
+# arm used to set — and the orphan default is 60 s. The suite bounds every call at 90 s, so on a LOADED box
+# (lanes running, ~16 load average measured) the 60 s wait plus startup crossed the bound: `timeout` SIGTERMed
+# the supervisor, the rc was non-zero, and the message this arm asserts had never been printed — a false RED
+# whose cause was the harness bound, not the behaviour. Bounding the orphan wait too keeps the arm about what
+# it is about.
+HW_RC=0; HW_OUT="$(SUP_EXTRA_ENV="ORCH_FOREGROUND=1 CONTROLLER_HANDOVER_TIMEOUT=4 CONTROLLER_ORPHAN_TIMEOUT=4" sup hw start 2>&1)" || HW_RC=$?
 [ "$HW_RC" -ne 0 ] && ok 'start: a session that is not provably this state dir is REFUSED, not waited on forever' \
                    || bad "start: waited/returned 0 over a session it could not attribute — $HW_OUT"
 case "$HW_OUT" in
