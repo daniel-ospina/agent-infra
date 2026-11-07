@@ -985,6 +985,41 @@ ck "m33 …and with that normalisation REVERTED the same fixture is refused (rc 
 # suite green. Asserted on the operator-facing line itself, where the defect was visible.
 ck "m34 a refusal renders 'REFUSED <slug> — <reason>' with NO doubled '—;' separator" \
    'o="$(run_reader "$T/proof-shared-state.conf" check)"; printf "%s" "$o" | grep -q "— state=" && ! printf "%s" "$o" | grep -q "—;"'
+# Round 30, P2: the round-29 fixes had no arms — a mutated copy that reverted either the `norm`
+# call-time guard or the UNPROVEN warn arm reproduced the defect and left the suite green. The class is
+# "a sibling that LOADS but lacks `_normalize_slug`", which every earlier stale-sibling arm misses:
+# m29-m31 use an UNLOADABLE module, which fails at exec_module, not at the call.
+MN="$T/nonorm"; mkdir -p "$MN"
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MN/pr-doctor.py" <<'PYN'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+t += "\n\ndel _normalize_slug\n"
+open(dst, "w").write(t)
+PYN
+mk_repo "$T/staleco" acme/stale
+printf 'slug=acme/stale.git checkout=%s state=%s/stalestate\n' "$T/staleco" "$T" > "$T/nonorm.conf"
+printf 'slug=acme/other.git checkout=%s state=%s/stalestate2\n' "$T/staleco" "$T" > "$T/nonorm-wrong.conf"
+ck "m35 a sibling that LOADS but lacks _normalize_slug makes the proof UNPROVEN — WARN, not a false refusal" \
+   'o="$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check)"; [ "$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader_rc "$T/nonorm.conf" check)" = 0 ] && printf "%s" "$o" | grep -q "UNPROVEN"'
+ck "m36 …and it says why, naming the missing helper (not \`is not an owner/name slug\`)" \
+   'REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check | grep -q "could not be normalised"'
+ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
+   '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
+ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \
+   'o="$(run_reader "$T/nonorm.conf" check)"; [ "$(run_reader_rc "$T/nonorm.conf" check)" = 0 ] && ! printf "%s" "$o" | grep -q "UNPROVEN"'
+# ⛔ m35/m36 DO NOT PIN THE `norm` CALL-TIME GUARD, and their comment must not pretend they do
+# (round 30, P2). With the try/except reverted the answer is "" rather than the sentinel, and the
+# case arm is `''|'__UNASKABLE__')` — so an EMPTY answer lands in the SAME WARN branch and both arms
+# stay green. Measured: reverting the guard left 162 passed / 0 failed. The only surface that
+# distinguishes the two is the WRAPPER's diagnosis TEXT: both states exit 2, so no rc assertion can
+# carry it. m39 pins the text, through a farm-shaped copy of the wrapper.
+MW="$T/wraponorm"; mkdir -p "$MW/lib"
+cp "$READER" "$MW/lib/repo-set.sh"
+cp "$WRAPPER" "$MW/pr-doctor-machine.sh"
+cp "$MN/pr-doctor.py" "$MW/pr-doctor.py"
+ck "m39 a sibling that LOADS but lacks _normalize_slug makes the WRAPPER say 'could not be normalised', not 'is not an owner/name slug'" \
+   'o="$(HOME="$T" OR=acme/stale bash "$MW/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "could not be normalised" && ! printf "%s" "$o" | grep -q "is not an owner/name slug"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the

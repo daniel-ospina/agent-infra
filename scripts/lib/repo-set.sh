@@ -901,9 +901,11 @@ repo_set_check() {
       # to one arm and "a different repo" to another. Measured: `slug=acme/alpha.git` over a checkout
       # whose origin proves `acme/alpha` was REFUSED with "is a checkout of acme/alpha, not
       # acme/alpha.git" (rc 1, wrapper exit 2) while the doctor would have graded it — the
-      # "reader refuses a pass the doctor runs" class. An unnormalisable answer (sentinel or empty)
-      # falls back to the raw slug, i.e. the previous behaviour, so an unaskable sibling changes
-      # nothing here.
+      # "reader refuses a pass the doctor runs" class. ⛔ AN UNNORMALISABLE ANSWER MAKES THE COMPARISON
+      # UNPROVEN, AND THIS ARM WARNS INSTEAD OF COMPARING (round 29) — it does NOT fall back to a raw
+      # comparison. (Round 25's note here said it did, which round 29 made false; the `slug_n="$slug"`
+      # assignment that implemented the old behaviour is gone too, because the only branch that reads
+      # `slug_n` is the `elif`, which runs precisely when nothing set `norm_why`.)
       local slug_n norm_why=""
       slug_n="$(_rs_normalize_slug "$slug")"
       case "$slug_n" in
@@ -915,8 +917,7 @@ repo_set_check() {
           # `.git` case, undoing round 25's fix in exactly the state (a loadable-but-stale sibling) it
           # was most likely to be needed. Measured before: that pair printed `REFUSED … is a checkout of
           # acme/alpha, not acme/alpha.git` — a false proof claim.
-          norm_why="the declared slug could not be normalised (the sibling pr-doctor.py lacks _normalize_slug, or it raised), so whether this checkout proves it is UNPROVEN"
-          slug_n="$slug" ;;
+          norm_why="the declared slug could not be normalised (the sibling pr-doctor.py lacks _normalize_slug, or it raised), so whether this checkout proves it is UNPROVEN" ;;
       esac
       if [ -n "$norm_why" ]; then
         printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves %s; %s\n' "$slug" "$checkout" "$proof" "$norm_why"
