@@ -2922,16 +2922,15 @@ def parse_rotation_runs(text: str) -> RotationRuns:
     be re-parsed as ONE giant id per run, which is a second, quieter way to
     blind E5.
 
-    ⛔ BUT THE FALLBACK DOES **NOT** KEEP OLD INPUT MEANING WHAT IT ALWAYS MEANT
-    (review cycle 6, P1 — that sentence stood here and was false). It keeps the
-    PARSE the same and flips the VERDICT: for a space-carrying id the old world
-    BLOCKED it — through the #3686 ASYMMETRY (the PR door admitted it, MAIN's rate
-    door dropped its row, so `mr is None`), not through both doors agreeing — while
-    this world — where the id
-    is representable on the rate side — would EXEMPT it, because the shredded
-    identity is invisible to E5. So the counts ride back with the sets (see
-    :class:`RotationRuns`) and ``decide`` refuses to exempt a
-    whitespace-carrying id when any line took this branch.
+    ⛔ BUT THE FALLBACK DOES **NOT** KEEP OLD INPUT MEANING WHAT IT ALWAYS
+    MEANT (review cycle 6, P1 — that sentence stood here and was false). It
+    keeps the PARSE the same and flips the VERDICT: for a space-carrying id the
+    old world BLOCKED it — through the #3686 ASYMMETRY (the PR door admitted it,
+    MAIN's rate door dropped its row, so `mr is None`), not through both doors
+    agreeing — while this world, where the id IS representable on the rate side,
+    would EXEMPT it, because the shredded identity is invisible to E5. So the
+    counts ride back with the sets (see :class:`RotationRuns`) and ``decide``
+    refuses to exempt a whitespace-carrying id when any line took this branch.
     """
     runs: list[frozenset[str]] = []
     legacy_lines = 0
