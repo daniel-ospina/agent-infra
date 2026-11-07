@@ -6,7 +6,8 @@
 # `$HOME/.config/orchestrator/bringup.env`), and `--reseed` writes one pair. So every consumer that
 # needs "the repos this machine serves" invents its own answer: the doctor's `PR_DOCTOR_REPOS` has
 # **no default set at all** — deliberately (agent-infra#2280), because there was no authoritative
-# machine list to read — and the shipped `com.tortoise.pr-doctor` unit names ONE repo in argv. On a
+# machine list to read — and the `com.tortoise.pr-doctor` unit NAMED ONE REPO IN ARGV, as it shipped
+# before this change (it names none now, which is exactly what this file makes possible). On a
 # box whose controllers serve tortoise AND agent-infra, the second repo is simply not enumerated by
 # anything, so its share of the box's capacity is zero and nothing says so.
 #
@@ -618,7 +619,17 @@ elif verb == "split":
     # normalized key are already refused upstream as DUPLICATE-SLUG.
     sys.stdout.write("\n".join(mod.configured_repos([], {"PR_DOCTOR_REPOS": arg})))
 elif verb == "tags":
-    sys.stdout.write(mod.set_tag_collisions(arg.split(",") if arg else []))
+    # ⛔ A MISSING OR RAISING `set_tag_collisions` MUST NOT LOOK LIKE "NO COLLISION" (round 16, P2).
+    # Only MODULE-LOAD failure is caught above; this verb's own failure made python exit non-zero with
+    # stdout suppressed, so `_rs_tag_collision` returned "" — byte-identical to the legitimate
+    # no-collision answer — and the reader certified a colliding set. Measured with a sibling doctor
+    # whose `set_tag_collisions` was deleted, and again with one that raised: the colliding two-repo set
+    # (`acme/tools-api` + `acme-tools/api`) printed `OK — 2 repo(s)` at rc 0 with NO warning, against
+    # rc 1 with the shipped doctor. Same sentinel the `split` verb already uses for exactly this shape.
+    try:
+        sys.stdout.write(mod.set_tag_collisions(arg.split(",") if arg else []))
+    except Exception:
+        sys.stdout.write("__UNASKABLE__")
 elif verb == "norm":
     sys.stdout.write(mod._normalize_slug(arg))
 else:
@@ -944,7 +955,13 @@ EOF
 
   local tagwhy
   tagwhy="$(_rs_tag_collision "$rendered")"
-  if [ -n "$tagwhy" ]; then
+  if [ "$tagwhy" = "__UNASKABLE__" ]; then
+    # ⛔ "COULD NOT ASK" IS NOT "NO COLLISION" (round 16, P2). The tag guard's failure mode is SHARED
+    # STATE — one register, one worker name, one cooldown for two repos — so a silent pass here is
+    # strictly worse than a loud one. It WARNS rather than refuses, the same rule as the splitter
+    # round-trip: a broken/absent sibling is not a fact about the set.
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — `set_tag_collisions()` could not be asked (the sibling pr-doctor.py lacks it, or it raised), so the tag-collision proof did NOT run; a TAG collision between repos in this set would go undetected. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+  elif [ -n "$tagwhy" ]; then
     printf 'repo-set: REFUSED set — %s\n' "$tagwhy"
     bad=1
   fi
