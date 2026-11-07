@@ -154,11 +154,18 @@ sleep 2
 # `refs/wip/*` lives on ORIGIN, so archiving is what turns "the work was on that box" into "the work is
 # still there".
 #
-# ARMED (`--apply`), and that is a deliberate departure from the #1678 rule that a tool acting on a box
-# ships dry-run: that rule governs DELETION, where the default must be safe. This ADDS data to origin
-# and touches nothing locally (a throwaway index, no branch move, no working-tree write), and a
-# dry-run-by-default hook on the path that destroys the disk would archive nothing for ever while
-# reading as a safeguard — the inert-enforcer shape.
+# ARMED (`--apply`), and ⛔ THAT IS **NOT** A DEPARTURE FROM #1678 — it is that rule applied by its own
+# owner. #1678 says a tool acting on a box ships dry-run; `wip-sweep.sh` honours it exactly (`DRY_RUN=1`
+# is its default, `scripts/wip-sweep.sh:150`), and the ARMING DECISION lives here, in the CALLER's command
+# line, which is where the rule puts it — the same split `pi-reap-worktrees.sh`'s contract uses. So no
+# `OVERRIDES:` line is owed on either artifact, and the reason this note is worth the ink is that an
+# earlier draft of it called this "a deliberate departure … that rule governs DELETION, where the default
+# must be safe": that characterisation was FALSE, and a false departure is worse than none — the next
+# reader who trusts it either writes an `OVERRIDES:` line for a ruling nobody departed from, or "restores"
+# dry-run as the default on the one path where the disk stops existing, which would archive nothing for
+# ever while reading as a safeguard (the inert-enforcer shape). The sweep's own justification for adding
+# data to origin still stands and is not a concession: it ADDS data (`refs/wip/*`), touches nothing
+# locally (a throwaway index, no branch move, no working-tree write).
 #
 # ⛔ THE FAILURE IS LOUD AND IT IS NOT SWALLOWED, BUT IT DOES NOT STOP SUPERVISION BEING RESTORED.
 # Aborting here would leave the cell with ZERO controllers — a worse state than the one this script

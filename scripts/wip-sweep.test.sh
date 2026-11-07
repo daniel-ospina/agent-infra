@@ -554,7 +554,21 @@ has "$O_U2" 'UNMEASURED' \
   && ok "U2d …and it SAYS so, naming the worktree whose state is unknown" \
   || bad "U2d the failure is silent: $O_U2"
 grep -q 'nothing-at-risk' "$T/state-cln/wip-sweep.tsv" 2>/dev/null \
-  && ok "H3 the index records the clean verdict" || bad "H3 the index has no clean row"grep -q '^seen=1$' "$T/state-cln/wip-sweep.status" 2>/dev/null \
+  && ok "H3 the index records the clean verdict" || bad "H3 the index has no clean row"
+# ⛔ H4 IS ITS OWN COMMAND, AND THE LINE BREAK ABOVE IS LOAD-BEARING (measured 2026-11-07).
+# `ok()` and `bad()` BOTH end in `echo`, so both return 0 (`:40-41`). Joined onto H3's `bad` call as
+# `… row"grep -q '^seen=1$' …`, the whole thing is ONE `bad` invocation whose last argument happens to
+# be a filename: its `echo` still returns 0, so the `&&` below fired on EVERY run and **H4 could not
+# fail** — and in the H3-failing direction the `grep` never ran at all. Nothing else asserts `seen=1` in
+# the positive direction (`Q4`/`Q7` want 0, and `J6`'s identity is satisfied by `0 == 0+0+0+0`), so a
+# regression that stopped counting examinations read as a fully green suite: a false PASS on the rescue
+# path, which is the class this whole file exists to close.
+# ⛔ NOT VACUOUS — measured on a `seen=0` mutant of `wip-sweep.sh`, same fixtures:
+#     joined (as shipped): PASS=198 FAIL=1, H4 ✅  (only J6 red)
+#     split  (this text) : PASS=197 FAIL=2, H4 ❌  (`the record does not show the worktree was examined`)
+# and on the HEALTHY sweep this text is PASS=199 FAIL=0 — so the break buys the arm its teeth without
+# trading a false-green for a false-red. Do not re-join it.
+grep -q '^seen=1$' "$T/state-cln/wip-sweep.status" 2>/dev/null \
   && ok "H4 seen=1 — the pass EXAMINED the main worktree (a zero-examined pass is a failure)" \
   || bad "H4 the record does not show the worktree was examined"
 
