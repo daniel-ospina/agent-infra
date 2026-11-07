@@ -134,6 +134,14 @@ LAYOUT = {
     # `tortoise_graph_client.py` from the same directory, so a partial farm would ship a script
     # whose interpreter is missing.
     "graph_srcs": "scripts",
+    # #3486: `lane_registry.py` lives in `scripts/orchestrator-harness/` but is farmed FLAT into
+    # `$DEST/scripts/` on purpose — that flat path is one of the candidate locations the MCP
+    # server's own `_candidate_paths` searches. A `src` one directory down with a flat `dest` is the
+    # reason it is its own array and not a `fleet_srcs` member, so the DEST here is `scripts` and
+    # NOT the source dir. (Omitting it was a real red: the reader exited
+    # "declares array(s) this suite does not know: mcp_harness_srcs", which silently stopped the
+    # retirement check covering the whole declaration.)
+    "mcp_harness_srcs": "scripts",
 }
 
 src = open(setup_path).read()
