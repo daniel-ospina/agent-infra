@@ -851,6 +851,17 @@ export interface OrphanWatchdogHooks {
    * the same reason as the others: tests assert the recorded set without
    * owning real grandchildren. */
   enumerateKillTargets: () => number[];
+  /** Derive the row/line identity (dispatch nonce + child session id). A seam
+   * for the same reason as the others: the sequence must survive a throw here
+   * (`fireSequence` runs as `void` from `poll`, so an escape rejects the promise
+   * and NO kill and NO exit(137) happen), and that guard needs a throw arm a
+   * test can actually reach. */
+  identityGetter: () => { dispatchId: string | null; childSessionId: string | null };
+  /** Build the settle row. A seam so the "the LOG LINE keeps its join key even
+   * when the ROW could not be built" property is assertable: with no seam, a
+   * row build that throws is unreachable from a test, and reverting the line to
+   * `row?.dispatchId` stayed green. */
+  buildSettleRow: (input: OrphanSettleInput) => DispatchOutcomeRow;
   /** Write the durable settle row. Defaults to the shared
    * `recordDispatchOutcome`; a seam so the record's CONTENT and its ordering
    * (before the kill) are assertable without touching the operator's ledger. */
@@ -995,6 +1006,29 @@ export interface OrphanSettleInput {
 }
 
 /**
+ * The dispatch identity a CHILD-side settle can know: the parent's nonce
+ * (`TASK_HEARTBEAT_NONCE`, inherited through env) and the child's OWN session
+ * id (its `--session-id` arg vector — the source of truth for what was
+ * spawned, the same helper the parent side uses).
+ *
+ * ⛔ EXTRACTED SO THERE IS EXACTLY ONE DERIVATION, USED TWICE. The settle ROW
+ * and the ATTRIBUTION LINE must carry the same join key, and the line must
+ * carry it even when the row could not be built or written — that is the
+ * failure the line exists for. Deriving it here (independently of the row)
+ * is what keeps `dispatch_id=`/`session_id=` from rendering `-` exactly when
+ * the record failed. */
+export function orphanSettleIdentity(
+  env: Record<string, string | undefined> = process.env,
+  argv: string[] = process.argv.slice(1),
+): { dispatchId: string | null; childSessionId: string | null } {
+  const nonce = env.TASK_HEARTBEAT_NONCE?.trim();
+  return {
+    dispatchId: nonce ? nonce : null,
+    childSessionId: sessionArgFromArgs(argv, "--session-id"),
+  };
+}
+
+/**
  * Resolve the cwd WITHOUT ever throwing.
  *
  * `process.cwd()` THROWS (`ENOENT`) when the directory has been deleted, and a
@@ -1063,17 +1097,16 @@ export function safeCwd(getCwd: (() => string) | undefined = undefined): string 
 export function buildOrphanSettleRow(input: OrphanSettleInput): DispatchOutcomeRow {
   const env = input.env ?? process.env;
   const argv = input.argv ?? process.argv.slice(1);
-  const nonce = env.TASK_HEARTBEAT_NONCE?.trim();
+  const { dispatchId, childSessionId } = orphanSettleIdentity(env, argv);
   const rawAttempt = Number(env.TASK_DISPATCH_ATTEMPT);
   const attempt = Number.isFinite(rawAttempt) && rawAttempt >= 1 ? Math.floor(rawAttempt) : 1;
-  const childSessionId = sessionArgFromArgs(argv, "--session-id");
   const childSessionDir = sessionArgFromArgs(argv, "--session-dir");
   return buildDispatchOutcomeRow(
     {
       // The row's writer, not the dispatch path: `extension` is the contract's
       // discriminator for exactly this case (a row from another writer).
       extension: "task-heartbeat",
-      dispatchId: nonce ? nonce : null,
+      dispatchId,
       parentSessionId: null,
       childSessionId,
       attempt,
@@ -1108,6 +1141,8 @@ export const orphanWatchdogHooks: OrphanWatchdogHooks = {
   }) as (code: number) => void,
   appendLog: defaultAppendLog,
   enumerateKillTargets: defaultEnumerateKillTargets,
+  identityGetter: () => orphanSettleIdentity(),
+  buildSettleRow: (input: OrphanSettleInput) => buildOrphanSettleRow(input),
   recordSettle: (row: DispatchOutcomeRow) => recordDispatchOutcome(row),
 };
 
@@ -1177,15 +1212,51 @@ async function fireSequence(originalPpid: number, curPpid: number, uptimeMs: num
   const exitProcess = orphanWatchdogHooks.exitProcess;
   const appendLog = orphanWatchdogHooks.appendLog;
   const enumerateKillTargets = orphanWatchdogHooks.enumerateKillTargets;
+  const identityGetter = orphanWatchdogHooks.identityGetter;
+  const buildSettleRow = orphanWatchdogHooks.buildSettleRow;
   const recordSettle = orphanWatchdogHooks.recordSettle;
 
-  // ── 1. SETTLE: name who dies and why, durably, BEFORE signalling anything.
+  // ── 0. PROBES. Every statement from here to the kill is BEST-EFFORT and
+  // individually guarded, because `poll` invokes this sequence as `void
+  // fireSequence(...)`: an exception escaping BEFORE the `try/finally` below
+  // rejects an unobserved promise, so the descendant tree is never reaped AND
+  // the process never exits 137 AND nothing is recorded — the three-way
+  // indistinguishability this whole sequence exists to remove, with the `fired`
+  // latch already set so it never retries.
+  //
+  // Identity is derived from env + argv, NOT from `row` — see
+  // `orphanSettleIdentity`. A row build that throws must not blank the line's
+  // join key, which is the one field the line exists to carry.
+  let identity: { dispatchId: string | null; childSessionId: string | null } = {
+    dispatchId: null,
+    childSessionId: null,
+  };
+  let identityNote = "";
+  try {
+    identity = identityGetter();
+  } catch (err) {
+    identityNote = ` identity=FAILED ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  // ── 1a. ENUMERATE — its OWN try. This is ATTRIBUTION (a list of pids), not
+  // identity, so it must never be able to take the row down with it: a row
+  // whose `killedPids` is `[]` beats no row at all, and the row is the whole
+  // deliverable. Sharing one try with the row build meant a throwing probe
+  // discarded reason, parentPid and the entire identity — the pre-fix
+  // silence plus a note, on the population the record exists for.
   let killedPids: number[] = [];
+  let probeNote = "";
+  try {
+    killedPids = enumerateKillTargets();
+  } catch (err) {
+    probeNote = ` enumerate=FAILED ${err instanceof Error ? err.message : String(err)}`;
+  }
+
+  // ── 1b. SETTLE: name who dies and why, durably, BEFORE signalling anything.
   let row: DispatchOutcomeRow | null = null;
   let settleNote = "settle=unrecorded";
   try {
-    killedPids = enumerateKillTargets();
-    row = buildOrphanSettleRow({ parentPid: originalPpid, killedPids });
+    row = buildSettleRow({ parentPid: originalPpid, killedPids });
     const result = recordSettle(row);
     settleNote = result.ok
       ? `settle=recorded path=${result.path}`
@@ -1204,8 +1275,8 @@ async function fireSequence(originalPpid: number, curPpid: number, uptimeMs: num
   const logLine =
     `[task-heartbeat] orphan_watchdog parent=${originalPpid} ppid=${curPpid} uptime_ms=${uptimeMs} pid=${process.pid}` +
     ` status=${ORPHAN_KILLED_REASON} killed_pids=${killedPids.length > 0 ? killedPids.join(",") : "-"}` +
-    ` dispatch_id=${row?.dispatchId ?? "-"} session_id=${row?.childSessionId ?? "-"} ${settleNote}` +
-    ` — self-terminating`;
+    ` dispatch_id=${identity.dispatchId ?? "-"} session_id=${identity.childSessionId ?? "-"}` +
+    ` ${settleNote}${probeNote}${identityNote} — self-terminating`;
 
   try {
     try {
