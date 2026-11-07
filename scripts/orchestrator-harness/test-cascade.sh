@@ -688,6 +688,8 @@ ESCBLK="$TMP/escape-blk.sh"
 awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(f) exit}' "$ORCH" > "$ESCBLK"
 ck "the [drain-escape] block was FOUND in orch-loop.sh (a marker rename would otherwise skip 14e)" \
    "$([ -s "$ESCBLK" ] && grep -q 'pl_escape_open' "$ESCBLK" && echo yes || echo no)" "yes"
+ck "…and it does NOT execute its own words: no double-quoted echo in the block contains a backtick" \
+   "$(grep -q 'echo "[^"]*`' "$ESCBLK" && echo yes || echo no)" "no"
 ck "…and it carries the SLOT GRANT (the fix; without it the escape records what it cannot spend)" \
    "$(grep -q 'DRAIN ESCAPE GRANTS' "$ESCBLK" && echo yes || echo no)" "yes"
 # The block is shipped shell, so it must PARSE before it is driven: a stray `fi` would abort the
@@ -732,8 +734,10 @@ ck "…HALVED, not min(room,BATCH): room=9 grants 4, because one issue costs two
    "$(esc_pair 2 9 0 0 99)" "4 record"
 ck "…with a FLOOR of 1 when the box has room (a lane that parks early never attaches its chain)" \
    "$(esc_pair 3 1 0 0 99)" "1 record"
-ck "…an UNSET backlog does not cap the grant (the rig/older-caller contract)" \
-   "$(esc_pair 4 5 0 0)" "2 record"
+ck "…an UNSET/empty backlog is COERCED to 0 like the allocator, so the grant produces nothing" \
+   "$(esc_pair 4 5 0 0)" "0 none"
+ck "…and a NON-NUMERIC backlog is coerced too (the allocator answers 0 there, so the grant must)" \
+   "$(esc_pair 12 5 0 0 abc)" "0 none"
 ck "a cascade that ALREADY granted 3 is not re-granted upward" \
    "$(esc_pair 5 5 3 0 10)" "3 record"
 ck "NO ROOM still withholds the escape (cycle 2's ruling is KEPT, not reverted)" \
@@ -1015,7 +1019,11 @@ awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(
 ( set +e
   O="$d"; LOG="$d/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
   DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
-  CASCADE_ROOM=5; CASCADE_ISSUE_SLOTS=0; CASCADE_UPN_UNREADABLE=0; BATCH=2
+  CASCADE_ROOM=5; CASCADE_ISSUE_SLOTS=0; CASCADE_UPN_UNREADABLE=0; CASCADE_CAN=1; BATCH=2
+  # ⛔ THE BACKLOG MUST BE NUMERIC HERE (review round 6): the grant now COERCES a non-numeric backlog to
+  # 0 exactly as the allocator does, so leaving it unset makes this probe's own scenario unreachable —
+  # "a level HOLDS the room" is only a stall when there ARE candidates to queue.
+  CASCADE_BACKLOG=10
   . "$FIX/pair-blk.sh"
   [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] && [ -s "$d/state/drain-escape" ] && echo yes || echo no ) 2>/dev/null
 PEOF
@@ -1024,6 +1032,28 @@ PEOF
 export MODP="$HERE/pr-owner-liveness.sh"
 mut "M19 the escape opens the issue path WITHOUT granting the slots it spends (the level-holds no-op restored)" \
     's/^    if \[ "${CASCADE_ROOM:-1}" -ge 1 \] 2>\/dev\/null && \[ "${CASCADE_UPN_UNREADABLE:-0}" = "0" \] && \[ "${CASCADE_CAN:-1}" = "1" \] && \[ "${CASCADE_ISSUE_SLOTS-1}" -le 0 \] 2>\/dev\/null; then$/    if false; then/' "$TMP/p-pair.sh"
+
+# ⛔ THE COERCED BACKLOG, DRIVEN (review round 6, P2): `cascade_issue_slots` does
+# `is_num "${bl:-}" || bl=0`, so an UNSET/empty/non-numeric backlog answers **0** there. A grant that
+# caps only when the value IS numeric records an escape over a queue it never measured — the same
+# false-PASS direction the backlog=0 arm closes. Driven on the extracted block, so the mutant is graded
+# on its own text.
+cat > "$TMP/p-blgcoerce.sh" <<'PEOF'
+. "$ORCH_FNS"; . "$STUB"; . "$MODP"
+d="$FIX/e-blgc"; rm -rf "$d"; mkdir -p "$d/state"
+pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
+pl_note_pass "$d/state" 0 2 >/dev/null 2>&1
+awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(f) exit}' "$TGT" > "$FIX/blgc-blk.sh"
+( set +e
+  O="$d"; LOG="$d/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
+  DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
+  CASCADE_ROOM=5; CASCADE_ISSUE_SLOTS=0; CASCADE_UPN_UNREADABLE=0; CASCADE_CAN=1; BATCH=2
+  unset CASCADE_BACKLOG
+  . "$FIX/blgc-blk.sh"
+  [ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] && echo no || { [ -s "$d/state/drain-escape" ] && echo no || echo yes; } ) 2>/dev/null
+PEOF
+mut "M22 the grant caps the backlog ONLY when it is numeric (unset/empty/non-numeric grants anyway, the allocator answers 0)" \
+    's/^      is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=0$/      is_num "${CASCADE_BACKLOG:-}" || CASCADE_BACKLOG=999/' "$TMP/p-blgcoerce.sh"
 
 # ── 12b-M. MUTANTS FOR THE LEVEL-1 STATE PINS ────────────────────────────────
 # ⛔ `mut`/`mutlo` only ever mutate `$ORCH`/`$LO` and grade FUNCTIONS. The 12b pins are SOURCE facts
@@ -1055,7 +1085,6 @@ n="$(grep -vE '^[[:space:]]*#' "$TGT" 2>/dev/null | grep -o 'FIX_MAIN' | wc -l |
 PEOF
 mutfile "M20 an ACTOR is added for level 1 (a spawn keyed on FIX_MAIN) -> the 'no actor' pin goes RED" \
     "$ORCH" 's/^    1) echo FIX_MAIN ;;$/    1) echo FIX_MAIN ;; spawn_main_repair "FIX_MAIN"/' "$TMP/p-l1actor.sh"
-
 # (c) the repair pattern widened to accept the auto-filed title — the pin must catch that too, in the
 # OTHER direction from the control half above (widening makes the gap vanish and the pin go RED).
 cat > "$TMP/p-l1pattern.sh" <<'PEOF'
