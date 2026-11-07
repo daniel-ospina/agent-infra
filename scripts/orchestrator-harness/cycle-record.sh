@@ -48,7 +48,7 @@
 # to "is the controller alive" is no, and the fix (start it) is different from the fix for a live but
 # fork-starved box (restart or drain the BOX from outside — nothing inside it can be cleaned up).
 #
-# USAGE (CLI)   bash cycle-record.sh status|history [--last N] [--interval S] [--dir O]
+# USAGE (CLI)   bash cycle-record.sh status|history|stages [--last N] [--interval S] [--dir O]
 # EXIT          0 HEALTHY · 1 DEGRADED/FORK-STARVED · 2 ABSENT/UNREADABLE (cannot answer — never a pass)
 
 CR_FILE_NAME="${CR_FILE_NAME:-cycles}"
@@ -83,6 +83,119 @@ cr_san() {
   local _cs_plain=""
   cr_san_vars _cs_plain "${1:-}" || return 1
   printf '%s' "$_cs_plain"
+}
+
+# ── THE STAGE FIELD: `stages=<name>:<secs|ns>,<name>:<secs|ns>,…` ────────────────────────────────
+# WHY. A cycle record's `start=`/`end=` gives ONE number: how long the cycle took. Measured
+# 2026-11 cycles of 2, 17, 131, 145 and 161 minutes against a designed 240s interval proved that
+# number does NOT track work (the 161-minute cycle spawned ZERO workers), so the total cannot say
+# WHICH part of the body consumed the time — and the body is unbounded while `CYC` bounds only the
+# nap. The stage field is what makes the total ATTRIBUTABLE instead of merely observable.
+#
+# THE GRAMMAR, and it is deliberately narrow so the record stays ONE space-separated `k=v` line:
+#   stages=<name>:<secs>,…      name = [A-Za-z0-9_]+, secs = non-negative integer, or the literal
+#                               `ns` = the stage was REGISTERED but never sampled this cycle.
+# ⛔ NO SPACES ANYWHERE IN THE VALUE. `cr_san_vars` maps a space to `_`, so a value built with
+# spaces would be rewritten into an unparseable blob by the writer rather than rejected — the field
+# is a comma-separated list for exactly that reason.
+# ⛔ `ns` IS NOT `0`, AND THE DIFFERENCE IS THE POINT. `0` is a MEASUREMENT ("this stage ran and
+# cost nothing"); `ns` is an ABSENCE ("nothing sampled this stage"). A registered stage that was
+# never instrumented must never read as a measured zero-cost stage — that is how a stage silently
+# vanishes from a record while still appearing in it.
+#
+# WHICH STAGES EXIST IS NOT DECIDED HERE. The stage SET lives in exactly ONE place — orch-loop.sh's
+# `STG_REGISTRY` block — so a stage added there appears in every subsequent record without a second
+# edit, and this library must never grow a list of its own (two lists is how a stage vanishes).
+# This code owns only the GRAMMAR and the READ.
+#
+# ⛔ BACKWARDS COMPATIBILITY IS A REQUIREMENT, NOT A NICETY. Records written before this field
+# existed carry no `stages=` token at all, and `/orchestrator/state/cycles` is APPEND-ONLY and never
+# rewritten — so old and new lines coexist in one file FOREVER. Every reader therefore answers
+# "absent" (rc 1) for a record without the field, and never an error: readers are
+#   • cycle_verdict / cycle_history (this file)  — prefix-search one field each, so an unknown token
+#     is ignored; they do not read `stages=` at all and are unaffected by it being present.
+#   • bin/harness `status` / `status --json` / `history` — pass the record through verbatim (the JSON
+#     arm escapes it as a string), so a new field flows through with no change.
+#   • cycle_stage_get / cycle_stages_valid (this file) — the only field-aware readers, and both
+#     answer rc 1 (absent) rather than failing on an old line.
+#   • the other bash suites build their OWN old-format fixtures (capacity-placement.test.sh,
+#     landing-read.test.sh) and must keep working — ⛔ but cycle-stages.test.sh does NOT invoke them:
+#     §7 builds its own OLD/NEW fixtures, so "those suites are pinned by §7" is NOT true and must not
+#     be claimed. A change that breaks their fixtures is caught only by those suites, which CI runs as
+#     shards — this file cannot speak for them.
+CR_STAGES_FIELD="stages"
+
+# cycle_stage_get <record> <stage> -> "<secs>" | "ns" on stdout; rc 1 when the record has no
+# `stages=` field or the field does not name <stage>. Never errors on an old-format record.
+cycle_stage_get() {
+  local _sg_rec="${1:-}" _sg_want="${2:-}" _sg_rest _sg_f _sg_val="" _sg_v
+  # ⛔ THE WANTED NAME IS VALIDATED BEFORE IT IS USED AS A `case` PATTERN (below), AND THAT IS DEFENCE
+  # IN DEPTH RATHER THAN THE THING THAT SAVES US — the correction matters, because the earlier text here
+  # claimed the opposite. The patterns below are QUOTED (`"${_sg_want}:"`, `"${_sg_want}:"*`), so a glob
+  # stays LITERAL: measured with this guard deleted, `*`, `?`, `[bs]oot` and `boot*` are all still
+  # refused. The validation is kept because it refuses a name that could never be a stage at all —
+  # cheaply, before the walk — and because a future edit that drops the quoting would make the glob real
+  # in exactly the way the earlier text described.
+  case "$_sg_want" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+  case "$_sg_rec" in *"${CR_STAGES_FIELD}="*) ;; *) return 1 ;; esac
+  # ⛔ A HAND-ROLLED TOKEN WALK, NOT `for _f in $_rec`. Word splitting would also GLOB: the
+  # sanitiser strips quotes but not `*`/`?`/`[`, and `disk=` carries bracketed text, so an unquoted
+  # expansion could be pathname-expanded against the CWD. The walk below splits on the literal space
+  # and never touches the filesystem.
+  _sg_rest="$_sg_rec "
+  while [ -n "$_sg_rest" ]; do
+    _sg_f="${_sg_rest%% *}"; _sg_rest="${_sg_rest#* }"
+    case "$_sg_f" in "${CR_STAGES_FIELD}="*) _sg_val="${_sg_f#*"${CR_STAGES_FIELD}="}"; break ;; esac
+  done
+  [ -n "$_sg_val" ] || return 1
+  _sg_rest="${_sg_val},"
+  while [ -n "$_sg_rest" ]; do
+    _sg_f="${_sg_rest%%,*}"; _sg_rest="${_sg_rest#*,}"
+    [ -n "$_sg_f" ] || continue
+    case "$_sg_f" in
+      "${_sg_want}:")
+        # A stage named with NO value at all is not a measurement.
+        return 1 ;;
+      "${_sg_want}:"*)
+        _sg_v="${_sg_f#*:}"
+        # ⛔ THE VALUE IS VALIDATED, NOT MERELY RETURNED (fresh-context review, P2). A corrupt field
+        # used to answer with whatever bytes followed the first colon — `a:1:2` returned `1:2` and
+        # `a:` returned the empty string, BOTH with rc 0 — so a caller could not tell a corrupt value
+        # from a measurement, which defeats the one property this field exists to have. Only digits or
+        # the literal `ns` is a reading; anything else is answered as ABSENT (rc 1), the same polarity
+        # the record's own read-side CLI uses when it calls the field malformed.
+        if [ "$_sg_v" = "ns" ]; then printf '%s' 'ns'; return 0; fi
+        case "$_sg_v" in ''|*[!0-9]*) return 1 ;; esac
+        printf '%s' "$_sg_v"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# cycle_stages_valid <value> — rc 0 when the value matches the grammar above.
+# ⛔ IT IS A READ-SIDE GUARD, NOT A WRITER GATE, AND THE EARLIER TEXT HERE CLAIMED OTHERWISE
+# (fresh-context review, P1). It said this "keeps a malformed field from entering the record file in the
+# first place"; `cycle_record_write` never calls it, so that guarantee did not exist. The writer is
+# deliberately NOT the place to enforce it: `state/cycles` is append-only, and the writer runs on the
+# fork-starved path where refusing a line would DELETE the record the starved box needs to leave. A
+# malformed field must therefore be VISIBLE and unrepairable-by-deletion, not silently dropped — so the
+# grammar is enforced where it is READ (the `stages` CLI verb refuses a malformed field and says so)
+# and at the emitter, which can only ever produce `<registry-name>:<digits|ns>` (see `stg_field`).
+cycle_stages_valid() {
+  local _sv_val="${1:-}" _sv_rest _sv_f _sv_name _sv_v
+  [ -n "$_sv_val" ] || return 1
+  _sv_rest="${_sv_val},"
+  while [ -n "$_sv_rest" ]; do
+    _sv_f="${_sv_rest%%,*}"; _sv_rest="${_sv_rest#*,}"
+    case "$_sv_f" in '') return 1 ;; esac          # a double or trailing comma
+    case "$_sv_f" in *:*) ;; *) return 1 ;; esac   # no separator at all
+    _sv_name="${_sv_f%%:*}"; _sv_v="${_sv_f#*:}"
+    case "$_sv_name" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
+    # ⛔ A SECOND COLON CANNOT HIDE IN THE NAME (`${_f%%:*}` takes the FIRST field), so `a:1:2`
+    # fails on the VALUE test below — where the `:` is a non-digit — rather than needing its own arm.
+    if [ "$_sv_v" != "ns" ]; then case "$_sv_v" in ''|*[!0-9]*) return 1 ;; esac; fi
+  done
+  return 0
 }
 
 # cycle_record_write <O> <k=v ...> — append ONE cycle line. rc 1 (with the reason on stdout) when the
@@ -217,9 +330,55 @@ cr_cli() {
     history)
       if ! cycle_history "$O" "$last"; then printf 'ABSENT why=no_cycle_record path=%s\n' "$(cr_path "$O")"; return 2; fi
       return 0 ;;
+    stages)
+      # The operator-facing read of the stage field: one `name<TAB>secs` line per stage of the newest
+      # record, and an explicit UNKNOWN for a record that predates the field or whose field is
+      # malformed. ⛔ IT DOES NOT CLASSIFY (no "tiled" vs "cascade" grouping, no total, no ordering
+      # of its own): the stage SET and its order live in orch-loop.sh's registry, and a second opinion
+      # here is the duplicate-contract defect this file's header refuses.
+      local _sf _rec _val _rest
+      _sf="$(cr_path "$O")"
+      if [ ! -s "$_sf" ]; then printf 'ABSENT why=no_cycle_record path=%s\n' "$_sf"; return 2; fi
+      # ⛔ `[ -s ]` IS A STAT, NOT A READ, AND THAT INVERTED THIS MODULE'S OWN EXIT CONTRACT
+      # (fresh-context review, P2 — measured). A NON-EMPTY record this process cannot read (mode 000,
+      # or a DIRECTORY at `state/cycles`) passed the size test, `tail`'s error was swallowed by
+      # `2>/dev/null`, and the empty `_rec` was indistinguishable from a pre-field line — so it took the
+      # `NO-STAGE-FIELD … (this is NOT an error)` branch below and answered **rc 0** for a record it
+      # never read, while `status`/`history` answered `UNREADABLE` **rc 2** on the same directory. The
+      # header's EXIT contract says `2 ABSENT/UNREADABLE (cannot answer — never a pass)`, and the old
+      # message also named the WRONG CAUSE (the file may well be new-format). `tail`'s own rc is what
+      # separates "no field in a readable line" from "no readable line at all".
+      if ! _rec="$(tail -n 1 "$_sf" 2>/dev/null)"; then
+        printf 'UNREADABLE why=newest_record_unreadable path=%s (the newest record could not be READ — a permission or a non-file at that path, NOT a pre-field record)\n' "$_sf"
+        return 2
+      fi
+      if [ -z "${_rec:-}" ]; then
+        printf 'UNREADABLE why=newest_record_unparseable path=%s (the newest line is empty — there is no record to attribute)\n' "$_sf"
+        return 2
+      fi
+      _val=""
+      case "$_rec" in *"${CR_STAGES_FIELD}="*) ;; *)
+        printf 'NO-STAGE-FIELD the newest record predates the %s= field (this is NOT an error — the file\n              is append-only and old lines stay old); nothing to attribute\n' "$CR_STAGES_FIELD"
+        return 0 ;; esac
+      _rest="$_rec "
+      while [ -n "$_rest" ]; do
+        _sf="${_rest%% *}"; _rest="${_rest#* }"
+        case "$_sf" in "${CR_STAGES_FIELD}="*) _val="${_sf#*"${CR_STAGES_FIELD}="}"; break ;; esac
+      done
+      if ! cycle_stages_valid "$_val"; then
+        printf 'UNREADABLE why=malformed_%s_field value=%s\n' "$CR_STAGES_FIELD" "$_val"
+        return 2
+      fi
+      _rest="${_val},"
+      while [ -n "$_rest" ]; do
+        _sf="${_rest%%,*}"; _rest="${_rest#*,}"
+        [ -n "$_sf" ] || continue
+        printf '%s\t%s\n' "${_sf%%:*}" "${_sf#*:}"
+      done
+      return 0 ;;
     ''|help|-h|--help)
       sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//' ;;
-    *) printf 'cycle-record: unknown command %s (try: status|history)\n' "$v" >&2; return 2 ;;
+    *) printf 'cycle-record: unknown command %s (try: status|history|stages)\n' "$v" >&2; return 2 ;;
   esac
 }
 
