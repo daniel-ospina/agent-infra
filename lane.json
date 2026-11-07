@@ -1,0 +1,34 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-bgdelivery-1794068879-p1884186-7e8bcd78",
+  "_sha": "acb78088954c1d3e04431e3b4ef4fe0907d77305",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.ncYt0Hnluz/bg-o/bg/bgdelivery.log"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/tmp.ncYt0Hnluz/wt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "duration_s": 12,
+  "ended_at": 1794068891,
+  "exit_code": 0,
+  "heartbeat_at": 1794068891,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-bgdelivery-1794068879-p1884186-7e8bcd78",
+  "lease_until": 1794069511,
+  "pid": 1884186,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1794068879,
+  "state": "DONE",
+  "tag": "bgdelivery",
+  "worktree": "/tmp/tmp.ncYt0Hnluz/wt"
+}
