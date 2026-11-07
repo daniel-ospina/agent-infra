@@ -870,6 +870,35 @@ await test("a REPO-ONLY entry with a contradicting `type` is reported too (no ba
   );
 });
 
+await test("a base `type` describing NO transport is dropped when the repo declares one (it must not brand the new transport)", async () => {
+  // `baseTransport !== "none"` kept a label that described nothing: base `{type:"http"}` (no url, no
+  // command) + repo `{command}` produced `{type:"http", command:…}` — the exact contradiction the
+  // deletion exists to prevent — and the note then blamed the REPO for a `type` only the base wrote.
+  let toStdio: Record<string, unknown> = {};
+  const logsToStdio = await withCapturedLogs(async () => {
+    toStdio = mergeMcpLayers(
+      { mcpServers: { t: { type: "http", lazy: true } } } as never,
+      { mcpServers: { t: { command: "/bin/echo" } } } as never,
+    );
+  });
+  const stdio = toStdio.t as Record<string, unknown> | undefined;
+  equal(stdio?.type, undefined, "a `type` that described no base transport must not survive onto stdio");
+  equal(stdio?.command, "/bin/echo", "the repo's transport applies");
+  ok(
+    !logsToStdio.some(l => l.includes("repo entry") && l.includes("disagrees with its transport")),
+    `the repo wrote no \`type\`, so it must not be blamed — got:\n${logsToStdio.join("\n")}`
+  );
+
+  let toHttp: Record<string, unknown> = {};
+  await withCapturedLogs(async () => {
+    toHttp = mergeMcpLayers(
+      { mcpServers: { u: { type: "stdio", lazy: true } } } as never,
+      { mcpServers: { u: { url: "https://x/mcp" } } } as never,
+    );
+  });
+  equal((toHttp.u as Record<string, unknown>)?.type, undefined, "and the same in the other direction");
+});
+
 await test("a SAME-transport delta INHERITS the base's `type` (a delta declares what it changes, not what it drops)", () => {
   // `delete carry.type` fired whenever the repo declared a transport, so restating the SAME url — or
   // setting only `timeout` on an identical launch — silently dropped a field the repo never touched,
