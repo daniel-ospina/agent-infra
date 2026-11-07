@@ -11,24 +11,35 @@
       },
       "lazy": true,
       "idleTimeoutMs": 900000,
-      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder — ~$0.005/query flat, never the $5-40 chat models",
+      "purpose": "Perplexity Search API + SERP + GSC + HubSpot + Places (24 tools). RUNG 1 of the research skill's tool ladder \u2014 ~$0.005/query flat, never the $5-40 chat models",
       "whenToLoad": "research/search tasks FIRST (prefer over web_search); also GSC, SERP, Places and HubSpot tasks. NOTE: requires a one-time `npm install` in mcp-servers/seo-intelligence per checkout, or the entry fails to spawn",
       "cost": "~$0.005/query flat; zero cost while sleeping (lazy)"
     },
     "tortoise": {
-      "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
-      "args": [
-        "-m",
-        "tortoise.mcp_server"
-      ],
-      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-      "env": {
-        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@127.0.0.1:16379/tortoise"
+      "_comment": "HOSTED Tortoise MCP over HTTP. This replaced the legacy stdio entry (${TORTOISE_HOME}/.venv/bin/python3 -m tortoise.mcp_server + a local TORTOISE_DB_URI=docker://...:16379) that needed a tortoise checkout, a venv AND a local FalkorDB — none of which exists on a cmux cloud cell, which is why pi-bootstrap/cell-install.sh refused to install this file on cells at all and every fleet lane on a cell ran with ZERO MCP servers, writing GRAPH-UNREACHABLE into its report. The DB target is resolved SERVER-SIDE (FALKORDB_CLOUD_URI), so a client needs only the endpoint and the key. Auth is env-indirect: ${TORTOISE_MCP_API_KEY} is the STANDARD name (skills/research/SKILL.md; #5153/#5343) and TORTOISE_API_KEY is the legacy alias, which the fallback script still reads (MCP first, then the alias) but this entry does NOT — point the header at ONE name, because a plain ${VAR} expands to the EMPTY STRING when unset and the server then answers 401 instead of failing loudly. lazy=true is deliberate: the hosted server's cold handshake routinely exceeds pi's default MCP connect budget, and this entry now lands on memory-constrained cells where a core server would block every session start. Self-host users point url at their own daemon instead (http://localhost:8000/mcp — docs/quickstart-selfhosted.md).",
+      "type": "http",
+      "url": "https://api.premiselabs.co/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"
       },
-      "purpose": "Memory graph (Tortoise) — cross-session knowledge",
-      "whenToLoad": "always (core)",
-      "cost": "one python process (venv has fastmcp)"
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "timeoutMs": 60000,
+      "purpose": "Memory graph (Tortoise, hosted) — read before you derive, write what you learn",
+      "whenToLoad": "any lane: graph read before research, write-back after (`mcp_load tortoise`)",
+      "cost": "one HTTP session; lazy, so nothing is paid while it sleeps"
+    },
+    "orchestrator": {
+      "command": "python3",
+      "args": [
+        "${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py"
+      ],
+      "cwd": "${AGENT_INFRA_PATH}",
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Fleet/orchestrator surface — 11 tools / 12 MCP names (agent-infra#3382): lane.list, lane.show, lane.artifact, fleet.census, pr.queue, claim.check, lane.dispatch, box.exec, pr.review_record, pr.closure_audit, fleet.reminder, fleet.beat_checkpoint. EIGHT are reads; lane.dispatch, box.exec, fleet.reminder and fleet.beat_checkpoint MUTATE, so this entry is NOT read-only — launch it with --read-only (or ORCH_MCP_READ_ONLY=1) to refuse every mutating tool. box.exec is destructiveHint/openWorldHint and runs allowlisted ARGV commands on cells.",
+      "whenToLoad": "whenever the question is 'did this lane finish?' / 'which lanes are running?' / 'what expired?' — i.e. any beat's lane census — plus PR review state (pr.review_record), closure audits and claim checks. NOT a substitute for tools/fleet/liveness.py (the one liveness verdict): the registry answers about the RECORD, liveness answers about the process.",
+      "cost": "zero while sleeping (lazy); 1 python process per call plus the wrapped CLI's own cost (1 git fetch for lane reads, 1+ gh call for pr/claim reads, 1 cmux exec for box.exec)"
     },
     "playwright-browser": {
       "command": "npx",

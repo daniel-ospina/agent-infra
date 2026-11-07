@@ -121,7 +121,7 @@ run_pass() {
     HARNESS_PIN="$d/home/.pi/agent/state/HARNESS-PIN" HARNESS_PIN_FILE="$d/home/.harness-path" \
     HARNESS_PIN_DIR="$d/home/harness" CELL_HOME="${CELL_HOME_P:-$d/home}" O="$d/home/orchestrator" \
     HARNESS_APPLY_SYNC_CMD="${HARNESS_APPLY_SYNC_CMD:-$T/sync-stub.sh}" \
-    bash "$PASS_SH" "$@"
+    bash "${PASS_UNDER_TEST:-$PASS_SH}" "$@"
 }
 
 mkdir -p "$T/home-directory"   # so $T itself is never an unset-HOME fallback
@@ -1393,6 +1393,125 @@ assert_contains "$OUT" "and 8 more row(s)" "T24 control: while the row excerpt s
 # words as a row ("A STALE file is a copy …"), so a whole-line match reported 3 real rows as 7
 # (review round 8). 20 stub rows + 2 prose lines must still read as 20.
 assert_contains "$OUT" "20 row(s)" "T24 control: the row count counts ROWS, not the instrument's class prose"
+
+# ── T26: the materialiser is TOLD which cell home to pin into (agent-infra#3593) ─────────────────
+# MEASURED on the `cmux` cell, 2026-11-06: this pass resolves CELL_HOME from $HOME (pass:195) and the
+# pin records from it, then invoked the materialiser with NONE of them. The materialiser resolves the
+# same names from ITS defaults — `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` (cloud-cell-supervisor.sh:139),
+# `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it (:1774-1775) — so the pin advanced into /tmp, the re-read
+# below saw no move, and the pass recorded rc=25 "nothing moved this box": rc=25 is raised BEFORE
+# predicate 4, so the farm grade could never be emitted on any box in that state. The suite had no
+# fixture for this because every materialiser stub here reads the seam the PASS sets explicitly.
+say_case "T26 the materialiser inherits the pass's CELL_HOME and pin paths (agent-infra#3593)"
+# A materialiser stub that reproduces the REAL defaulting (that is the defect): it resolves from its OWN
+# environment, and `$STUB_CELL_HOME_FALLBACK` stands in for `/tmp/cell-home` so a pre-fix run cannot
+# write outside this suite's temp dir. It writes the PATH record exactly where it resolved it.
+write_t26_materialiser() {
+    cat >"$T/t26/materialiser.sh" <<'MAT'
+#!/usr/bin/env bash
+CELL_HOME="${CELL_HOME:-$STUB_CELL_HOME_FALLBACK}"
+HARNESS_PIN_DIR="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+_r="${HARNESS_REPO:+inherited}"
+echo "  stub materialiser: cell-home=$CELL_HOME pin-dir=$HARNESS_PIN_DIR pin-file=$HARNESS_PIN_FILE repo=${_r:-derived} ref=${HARNESS_REF:-default}"
+want="$(git -C "${HARNESS_REPO:-$STUB_REPO}" rev-parse --verify --quiet "${HARNESS_REF:-origin/main}^{commit}")" || exit 1
+dir="$HARNESS_PIN_DIR/$(printf '%s' "$want" | cut -c1-12)"
+mkdir -p "$HARNESS_PIN_DIR" || exit 1
+rm -rf "$dir"
+git -C "${HARNESS_REPO:-$STUB_REPO}" worktree add --detach "$dir" "$want" >/dev/null 2>&1 || exit 1
+mkdir -p "$dir/scripts/orchestrator-harness" || exit 1
+printf '%s\n' "$dir/scripts/orchestrator-harness" >"$HARNESS_PIN_FILE" || exit 1
+exit 0
+MAT
+    chmod +x "$T/t26/materialiser.sh"
+}
+# ⛔ THE ENVIRONMENT IS THE FIXTURE, and it must be the UNIT's, not run_pass's. `run_pass` injects
+# CELL_HOME/HARNESS_PIN_FILE/HARNESS_PIN_DIR into the pass's OWN environment, so the child inherits them
+# even pre-fix and the defect is invisible (measured: the first cut of this case passed on an unfixed
+# pass). The shipped systemd template sets HOME and NOT CELL_HOME, so `env -i` gives the pass exactly
+# that — it must RESOLVE the pin paths and (post-fix) hand them to the child. HARNESS_APPLY_DRIFT_CHECK=0
+# is the suite's own posture (header): without it this arm would scan the developer's real $HOME.
+# `run_pass_unit <case-dir>` — the pass under the rendered unit's environment.
+run_pass_unit() {
+    local d="$1"; shift
+    local -a e=( HOME="$d/home" PATH="$PATH" TMPDIR="${TMPDIR:-/tmp}"
+                 HARNESS_APPLY_REPO="$REPO_P" HARNESS_APPLY_REF=origin/main HARNESS_APPLY_MODE=
+                 HARNESS_APPLY_STATE_DIR="$d/state" HARNESS_APPLY_DRIFT_CHECK=0 HARNESS_FETCH=1
+                 HARNESS_APPLY_SYNC_CMD="$T/sync-stub.sh"
+                 HARNESS_MATERIALISER="${MATERIALISER_P:-}"
+                 STUB_REPO="$REPO_P" STUB_CELL_HOME_FALLBACK="${FALLBACK_P:-}" )
+    [ -z "${FARM_CHECKER_P:-}" ] || e+=( HARNESS_APPLY_FARM_CHECKER="$FARM_CHECKER_P" )
+    env -i "${e[@]}" bash "${PASS_UNDER_TEST:-$PASS_SH}" "$@"
+}
+# t26_case <dir> — one box: a pin TREE at the old commit plus the two records that name it.
+t26_case() {
+    mkdir -p "$1/home/.pi/agent/state"
+    git -C "$CLONE" worktree add --detach "$1/pin" "$OLD26" >/dev/null 2>&1
+    mkdir -p "$1/pin/scripts/orchestrator-harness"
+    printf '%s\n' "$OLD26" >"$1/home/.pi/agent/state/HARNESS-PIN"
+    printf '%s\n' "$1/pin/scripts/orchestrator-harness" >"$1/home/.harness-path"
+}
+mk_origin t26; mk_clone t26
+REPO_P="$CLONE"; MODE_P=pin
+OLD26="$(git -C "$CLONE" rev-parse HEAD)"
+WANT26="$(advance_origin t26 A.txt "upstream for the cell-home case")"
+git -C "$CLONE" fetch -q origin main >/dev/null 2>&1
+SHORT26="$(printf '%s' "$WANT26" | cut -c1-12)"
+mkdir -p "$T/t26"; write_t26_materialiser
+PIN26="$T/t26/home/harness/$SHORT26/scripts/orchestrator-harness"
+t26_case "$T/t26"
+MATERIALISER_P="$T/t26/materialiser.sh"; FALLBACK_P="$T/t26/fallback"; FARM_CHECKER_P=""
+OUT="$(PASS_UNDER_TEST="$PASS_SH" run_pass_unit "$T/t26" 2>&1)"; RC=$?
+assert_eq "$RC" "10" "T26 the advance succeeds against a materialiser that resolves the pin from its own env"
+assert_contains "$OUT" "cell-home=$T/t26/home" "T26 and the child was TOLD the box's cell home (not its own default)"
+assert_contains "$OUT" "pin-dir=$T/t26/home/harness" "T26 and the pin ROOT it resolved is this box's, not a scratch path"
+assert_contains "$OUT" "repo=inherited" "T26 and the repo is passed, not left to the child's own derivation"
+assert_contains "$OUT" "ref=origin/main" "T26 and the ref too"
+if [ -d "$PIN26" ]; then ok "T26 the pin tree lands under the pin root THIS PASS re-reads";
+else bad "T26 the pin tree lands under the pin root THIS PASS re-reads (missing dir: $PIN26)"; fi
+assert_eq "$(cat "$T/t26/home/.harness-path" 2>/dev/null)" "$PIN26" \
+    "T26 and the PATH RECORD names the tree that was just materialised"
+if [ -e "$T/t26/fallback" ]; then bad "T26 nothing was written under the scratch-style default ($T/t26/fallback) — the defect's own footprint";
+else ok "T26 nothing was written under the scratch-style default (the /tmp/cell-home shape)"; fi
+# ⛔ THE PRE-FIX CONTROL, on its own box: the same stub against the pass with the export REMOVED. Without
+# it this case would pass on a tree whose stub ignored its environment — the assertion would be about
+# the stub, not about the pass. The `cmp` guard makes a reversion that silently fails to apply LOUD,
+# because a no-op sed would otherwise present an identical pass as a passing control. (`\&` is escaped
+# in the replacement: an unescaped `&` there expands to the whole match and mangles the copy.)
+PASS_PRE="$T/t26/pass-pre-fix.sh"
+sed 's|OUT="\$(CELL_HOME=.*bash "\$MATERIALISER" apply --force --pin-only 2>&1)"|OUT="$(bash "$MATERIALISER" apply --force --pin-only 2>\&1)"|' \
+    "$PASS_SH" >"$PASS_PRE"
+if cmp -s "$PASS_SH" "$PASS_PRE"; then
+    bad "T26 control: the reverted copy is IDENTICAL to the pass — the reversion did not apply, so this control proves nothing"
+else
+    ok "T26 control: the reverted copy really drops the export"
+fi
+t26_case "$T/t26p"
+MATERIALISER_P="$T/t26/materialiser.sh"; FALLBACK_P="$T/t26p/fallback"; FARM_CHECKER_P=""
+OUT="$(PASS_UNDER_TEST="$PASS_PRE" run_pass_unit "$T/t26p" 2>&1)"; RC=$?
+assert_eq "$RC" "25" "T26 control: the PRE-FIX pass reports rc=25 — the measured defect, reproduced"
+assert_contains "$OUT" "nothing moved this box" "T26 control: with the false account the issue quotes"
+assert_contains "$OUT" "cell-home=$T/t26p/fallback" "T26 control: because the child fell back to its own default"
+if [ -d "$T/t26p/fallback/harness/$SHORT26/scripts/orchestrator-harness" ]; then
+    ok "T26 control: and pinned into the scratch path instead of the box's"
+else
+    bad "T26 control: and pinned into the scratch path instead of the box's (missing: $T/t26p/fallback/harness/$SHORT26)"
+fi
+# ⛔ THE CONSEQUENCE, not just the symptom: rc=25 is raised BEFORE predicate 4, so on a box in this
+# state the farm grade cannot be emitted AT ALL. Same drift on both sides; only the pass differs.
+printf '#!/usr/bin/env bash\nprintf "pr-doctor.py | aaaa | bbbb | STALE\\n"\nprintf "   Next: re-farm from a ref-consistent checkout\\n"\nexit 1\n' >"$T/t26/farm-drift.sh"
+chmod +x "$T/t26/farm-drift.sh"
+mkdir -p "$T/t26f/home/.pi/agent/scripts" "$T/t26pf/home/.pi/agent/scripts"
+t26_case "$T/t26f"; t26_case "$T/t26pf"
+MATERIALISER_P="$T/t26/materialiser.sh"; FALLBACK_P="$T/t26f/fallback"; FARM_CHECKER_P="$T/t26/farm-drift.sh"
+OUT="$(PASS_UNDER_TEST="$PASS_SH" run_pass_unit "$T/t26f" 2>&1)"; RC=$?
+assert_eq "$RC" "24" "T26 the pass ADVANCES and then reaches predicate 4 (rc=24 on farm drift, not rc=25)"
+assert_contains "$OUT" "farm: DRIFT" "T26 and the farm grade is the verdict, naming the file"
+assert_contains "$OUT" "pr-doctor.py" "T26 including the file that stalled every PR-repair dispatch"
+MATERIALISER_P="$T/t26/materialiser.sh"; FALLBACK_P="$T/t26pf/fallback"; FARM_CHECKER_P="$T/t26/farm-drift.sh"
+OUT="$(PASS_UNDER_TEST="$PASS_PRE" run_pass_unit "$T/t26pf" 2>&1)"; RC=$?
+assert_eq "$RC" "25" "T26 control: the PRE-FIX pass never reaches predicate 4 (25, not 24) with the same drift"
+assert_absent "$OUT" "farm: DRIFT" "T26 control: so the farm grade this feature exists to emit is never printed"
 
 echo
 echo "────────────────────────────────────────────────────────"

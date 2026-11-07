@@ -255,6 +255,13 @@ let wtIsPlaceholderPathspec: (p: unknown) => boolean = () => false;
 // the piped-code arms over-claim, and must not silently widen them either.
 let wtPipelineFeedsShell: (cmd: string) => boolean =
   (cmd: string) => /\|\s*(?:\S*\/)?(?:bash|sh|zsh|dash|ksh)\s*$/.test(String(cmd ?? ""));
+// #3243 — the pipeline SPLIT, quote/extglob-aware. Fail-safe default = the old
+// blind `split("|")` (it can only OVER-report, i.e. stay fail-closed).
+let wtSplitPipeline: (cmd: string) => string[] = (cmd: string) => String(cmd ?? "").split("|");
+// #3243 — is a command-position word shaped like a PATH (rather than a program's
+// text that happens to contain a `/`)? Fail-safe default `true` preserves the
+// previous over-blocking behaviour if the classifier import degrades.
+let wtIsPathShapedScriptWord: (word: unknown) => boolean = () => true;
 let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean; at?: number }[] =
   // FAIL-SAFE fallback, not inert: a stale/partial classify-git.mjs (the export
   // missing while `classifierLoaded` is still true) must not silently delete the
@@ -274,6 +281,12 @@ let wtShellInlinePayloads: (cmd: string) => { text: string; opaque: boolean; at?
   };
 let joinContinuations: (cmd: string) => string = (c: string) => String(c ?? "");
 let ansiTranslate: (s: string) => string = (s: string) => String(s ?? "");
+// #3444: the REMOTE-EXEC boundary (cmux vm exec <vm> -- … / ssh <host> … /
+// docker exec <c> …). Fail-safe default = IDENTITY: a stale/partial
+// classify-git.mjs must leave every local gate exactly as strict as it is today
+// rather than letting an undefined call throw inside the tool hook (which aborts
+// the bash call) — the same skew contract as the #709/#627 bindings above.
+let maskRemoteExecPayloads: (command: string) => string = (c: string) => String(c ?? "");
 // #437 (C): bash-write gate for TRACKED hub files in a DISORDERED hub (pure
 // intersect of bash-write candidates with index-tracked rels). Fail-safe
 // default: inert (null) — a failed import NEVER false-blocks (same contract
@@ -329,7 +342,13 @@ try {
   resolveInvocationTarget = _m5.resolveInvocationTarget;
   if (typeof _m5.wtIsPlaceholderPathspec === "function") wtIsPlaceholderPathspec = _m5.wtIsPlaceholderPathspec;
   if (typeof _m5.wtPipelineFeedsShell === "function") wtPipelineFeedsShell = _m5.wtPipelineFeedsShell;
+  if (typeof _m5.wtSplitPipeline === "function") wtSplitPipeline = _m5.wtSplitPipeline;
+  if (typeof _m5.wtIsPathShapedScriptWord === "function") wtIsPathShapedScriptWord = _m5.wtIsPathShapedScriptWord;
   if (typeof _m5.wtShellInlinePayloads === "function") wtShellInlinePayloads = _m5.wtShellInlinePayloads;
+  // #3444: the remote-exec mask. Namespace read + typeof guard for the same
+  // skew reason as #709/#627 — a stale module leaves the IDENTITY default, which
+  // keeps today's (strict) behaviour instead of throwing in the hook.
+  if (typeof _m5.maskRemoteExecPayloads === "function") maskRemoteExecPayloads = _m5.maskRemoteExecPayloads;
   if (typeof _m5.joinContinuations === "function") joinContinuations = _m5.joinContinuations;
   if (typeof _m5.ansiTranslate === "function") ansiTranslate = _m5.ansiTranslate;
   // #1919: read from the namespace for the same reason as #709/#627 above — the
@@ -2701,8 +2720,19 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   // /tmp/*|/private/tmp/*) …` made every script that contains such a pattern
   // false-block (review cycle-2, B12a/B8i). An extglob operator keeps the word
   // a candidate even though it carries `(`/`)`.
+  //
+  // ⛔ …and a candidate must be PATH-SHAPED (#3243). The `[|&;()<>]` deny above
+  // was the whole shape test, so a PROGRAM'S TEXT that happened to carry a `/`
+  // and a `$` was claimed as an executed script path: the awk program
+  // `/^tree=/{t=$2}` (an ARGUMENT to `awk`) and the sed expression
+  // `s/[[:space:]]*$//` each refused the entire script containing them, with the
+  // message "the script path contains a shell-expansion form" about a path that
+  // was literal. `wtIsPathShapedScriptWord` is a POSITIVE grammar (expansion
+  // forms are placeholders; what remains must be path components), so a real
+  // expanded path is still a candidate and data cannot become one.
+  const pathShaped = (w: string): boolean => wtIsPathShapedScriptWord(w);
   const directish = (w: string): boolean =>
-    (w.includes("/") || w.startsWith("~")) && (!/[|&;()<>]/.test(w) || /[?*+@!]\(/.test(w));
+    (w.includes("/") || w.startsWith("~")) && (!/[|&;()<>]/.test(w) || /[?*+@!]\(/.test(w)) && pathShaped(w);
   const unq = (w: string): string => w.replace(/^["']|["']$/g, "");
   const sp = extractScriptPath(text);
   const words = String(text).trim().split(/\s+/);
@@ -2721,9 +2751,26 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   const firstIsShellLike = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|env|nice|nohup|command|sudo|doas|setsid|stdbuf|time|timeout|exec|ionice|busybox|xargs|find|eval)$/.test(
     unqFirst.replace(/^.*\//, ""),
   );
-  if (sp && _wtPathNeedsExpansion(sp)) {
+  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp))) {
     // Interpreter operand (`bash ./undo*.sh`, `sudo bash …`), or a bare path
     // that IS the first word (direct execution, `./undo*.sh`).
+    //
+    // ⛔ `pathShaped(sp)` HERE IS #3243 REVIEW CYCLE-1 F3. This branch had NO shape
+    // test, so when a segment's FIRST word was program TEXT it was claimed as an
+    // executed script — the very misattribution this arm exists to stop, one branch
+    // over from where it was fixed: `/^tree=/{t=$2}` (an awk program, refused in
+    // `scripts/orchestrator-harness/nonblocking-dispatch.sh`) and `~520` (a prose
+    // byte count) are both returned by `extractScriptPath` when they lead a segment,
+    // and `pathShaped` was never consulted. Not a regression (identical before this
+    // change) — an incomplete narrowing.
+    //
+    // The `$`-rooted carve-out is deliberate and load-bearing: a BARE `$VAR`
+    // operand has no path shape at all (`bash "$REAPER"`) and must STAY refused —
+    // that is the #1228 fail-closed residual pinned by B14g — while program text
+    // that happens to start a segment must not be. Every real expanded spelling is
+    // either path-shaped (`./undo*.sh`, `~/undo.sh`, `$(pwd)/x.sh` → placeholder +
+    // path) or `$`-rooted (`$NB`, `"$REAPER"`, `${DIR}/x.sh`), so nothing unreadable
+    // is lost by the test.
     if (firstIsShellLike || unqFirst === spUnq) return sp;
   }
   // EXTGROUP (`shopt -s extglob`, or `bash -O extglob -c …`) truncates the
@@ -2734,16 +2781,28 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   // end in `)`).
   if (sp !== null && spUnq !== null) {
     for (const w of words) {
-      if (unq(w).startsWith(spUnq) && /[?*+@!]\(/.test(w) && (firstIsShellLike || !w.endsWith(")"))) return w;
+      // #3243: a program's TEXT is not a script path — see `directish`. The
+      // extglob operator must still be present, and `startsWith(spUnq)` is kept
+      // (the operand `extractScriptPath` reports can stop anywhere inside the
+      // group, so an "operator immediately after the prefix" test was too
+      // strict and let `bash ./undo@(-g|).sh` through — caught by B13).
+      if (unq(w).startsWith(spUnq) && /[?*+@!]\(/.test(w) && pathShaped(w) && (firstIsShellLike || !w.endsWith(")"))) return w;
     }
   }
   if (!assignmentFirst && directish(first) && _wtPathNeedsExpansion(first)) return first;
   // EXTGROUP on a directly-executed word (`./undo@(-g|).sh`) — only a word that
   // IS the command, never an argument (`git add src/@(a|b).ts`), and never a
   // `case` pattern, which ends in `)`.
+  //
+  // #3243: "IS the command" is the rule this loop states and did NOT implement —
+  // it walked EVERY word of the segment. On a whole script BODY that made any
+  // argument containing `+(`/`@(` etc. an executed path (`env HOME=… ` followed
+  // by a `$REAPER` operand, `sed -n 's/.*(+\([0-9]\...'`); on the body's first
+  // word it made the `#!` SHEBANG line a "directly-executed path", which opened
+  // the whole word list to the same hunt. Both are data, not the command.
   if (!assignmentFirst && directish(first)) {
     for (const w of words) {
-      if (directish(w) && /[?*+@!]\(/.test(w) && !w.endsWith(")")) return w;
+      if (unq(w) === unqFirst && directish(w) && /[?*+@!]\(/.test(w) && !w.endsWith(")")) return w;
     }
   }
   return null;
@@ -2780,7 +2839,12 @@ function _wtExpandedPipedProducer(text: string): string | null {
   // separator — `"… | bash\n"` failed the consumer test and the producer was
   // skipped. The newline is not part of the pipeline's identity.
   const s = String(text ?? "").trim();
-  const segs = s.split("|");
+  // #3243 — the split must be quote-aware (see `wtSplitPipeline`): `split("|")`
+  // read the `|` INSIDE a quoted grep alternation / sed expression / markdown
+  // table as a pipeline, and then reported an arbitrary word of the "producer"
+  // as "the piped producer … contains a shell-expansion form". A real pipeline's
+  // `|` is unquoted, so the arm still fires on every form it was built for.
+  const segs = wtSplitPipeline(s);
   if (segs.length < 2 || !wtPipelineFeedsShell(s)) return null;
   for (const raw of wtShellWords(segs.slice(0, -1).join("|"))) {
     const tok = _dequoteShellWord(raw);
@@ -2788,6 +2852,54 @@ function _wtExpandedPipedProducer(text: string): string | null {
     if (_wtPathNeedsExpansion(tok)) return tok;
   }
   return null;
+}
+
+/** #3243 — the refusal line when the expansion-shaped token was found in a
+ *  script's BODY, not in the command's own path.
+ *
+ *  The two observations are NOT the same and must not share a sentence. `bash
+ *  ./undo*.sh` really does spell an expanded PATH. A body finding is a NESTED
+ *  invocation — `bash "$NB"` on line 256 of a file whose path is perfectly
+ *  literal — and the old text (`_WT_EXPANDED_SCRIPT_REASON`) told the operator
+ *  "the script path contains a shell-expansion form" plus the remedy "pass the
+ *  path literally (e.g. `bash ./tools/your-script.sh`)", which they had ALREADY
+ *  done. Measured six times in one day on this box (#3243): an unsatisfiable
+ *  remedy reads as a broken gate, and the cheapest way out is to claim the suite
+ *  is green without running it. The verdict is unchanged — only the observation,
+ *  its LOCATION, and the remedy are now true.
+ * @param scriptPath the file whose body was read
+ * @param hit the observed nested shape
+ * @param text the RAW text the hit was found in, for the line number. It is NOT
+ *   prepared: the body-preparation hunk was measured and is not landed (see
+ *   `_expRefusalForBody`), so a comment line is still in this text and a hit can
+ *   still be reported at a comment's line — that is the recorded residual, and it
+ *   is why the message names the token instead of promising the path is the cause.
+ */
+function _wtBodyExpandedReason(scriptPath: string, hit: _WtExpandedHit, text: string): string {
+  const shown = String(scriptPath ?? "(script)");
+  // ⛔ THE LINE IS ONLY CLAIMED WHEN IT IS UNAMBIGUOUS (#3243 review c2, note 4).
+  // `indexOf` returns the FIRST occurrence, so a token that also appears earlier —
+  // in a comment, in a string — reported a line that is not the invocation, in a
+  // message whose whole purpose is honest attribution (`hit` carries no offset,
+  // and threading one through the detection path is a change to load-bearing code
+  // for a cosmetic gain). When the token is not unique, name the file and the
+  // token and claim nothing about where.
+  const first = text.indexOf(hit.token);
+  const unique = first >= 0 && text.indexOf(hit.token, first + 1) < 0;
+  const line = unique ? text.slice(0, first).split("\n").length : 0;
+  const where = line > 0 ? `line ${line} of ${shown}` : `in ${shown}`;
+  const observed =
+    hit.kind === "producer"
+      ? `its piped producer ${JSON.stringify(hit.token)} is fed to a shell as a script (${where})`
+      : `${JSON.stringify(hit.token)} is invoked as a script (${where})`;
+  return (
+    `the body of ${shown} cannot be fully read — ${observed}, and that path is ` +
+    "not statically resolvable as spelled (a `$`, a backtick or a glob is resolved " +
+    "by the shell at run time), so the file it would execute cannot be read; an " +
+    "unreadable script may discard uncommitted work in ANY checkout. Pass the " +
+    `SHELL ITSELF a literal path (e.g. \`bash ./tools/your-script.sh\`), or spell the ` +
+    `nested path literally IN ${shown} so the file it runs can be read and verified`
+  );
 }
 
 /** The refusal reason for an expansion-shaped piped producer — one wording for
@@ -3006,10 +3118,38 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
   // invariant `_expRefusal` itself states two lines above — and leaves the reported defect
   // (a framework script, including the mandated rail, unrunnable by a false block) alive on
   // the spellings that go through the other readers.
-  const _expRefusalForBody = (scriptPath: string, body: string): string | null =>
-    _isAuditedSanctionedScript(resolve(execCwd, scriptPath), _sha256OfBody(body))
-      ? null
-      : _expRefusal(body);
+  const _expRefusalForBody = (scriptPath: string, body: string): string | null => {
+    if (_isAuditedSanctionedScript(resolve(execCwd, scriptPath), _sha256OfBody(body))) return null;
+    // ⛔ #3243 — THE BODY IS SCANNED AS THE RAW TEXT, AND A PREPARATION HUNK WAS MEASURED AND
+    // REJECTED. The draft of this fix ran the body through `stripHeredocData` first (the
+    // preparation `extractWorkingTreeDiscards` has always used: `#` comments removed
+    // quote-aware, heredoc DATA blanked). It is CORRECT in principle — a comment's apostrophe
+    // desynced the segment quote state for the rest of the file (#1949's class, on this arm),
+    // so `scripts/install-harness-apply-timer.sh` was refused over the piped producer
+    // `"boxs clock, on BOTH platforms\n# …"`, a COMMENT paragraph — and it is NOT LANDED,
+    // because its measured effect on the defect it was meant to fix is a net loss:
+    //
+    //   preparation ON : 22 committed scripts newly RUN, 21 newly REFUSED (11 of them CI
+    //                    suites — claim-reaper.test.sh, live-ownership.test.sh,
+    //                    worktree-disk-probe.test.sh, run-bash-shards.recap.test.sh, …)
+    //   preparation OFF: 17 committed scripts newly RUN,  0 newly REFUSED (73 of the 373
+    //                    refused before this change, 56 after — measured in ONE environment;
+    //                    see the README section for why the pair must not be mixed)
+    //
+    // (373 committed `*.sh`, this handler, the `pi -p` child env; the census is reproduced in
+    // README's #3243 section.) Removing the comment artefact does not only delete DATA — it
+    // also makes the arm REACH real `$VAR` operands it had been missing (`bash "$SW" stop`,
+    // `bash "$REAPER"`), which is the deliberate over-block #3243 is about. An arm that
+    // refuses 21 more suites than it did is the wrong direction for THIS issue; the
+    // preparation is recorded on #3243 with these numbers instead of being landed here.
+    const hit = _wtExpandedScriptShape(body);
+    if (!hit) return null;
+    return _worktreeDiscardBlockReason(
+      { form: "script-indirection", scope: "all", pathspecs: [] },
+      execCwd,
+      _wtBodyExpandedReason(scriptPath, hit, body),
+    );
+  };
 
   // Executable-shebang script (`./undo.sh`, `/tmp/undo.sh`): extractScriptPath
   // only recognises interpreter WORDS (`bash x.sh`), so a directly-executed
@@ -3449,13 +3589,15 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
       // set filter is what drops them), and the nested-script descent below is NOT skipped
       // — the audited-bytes claim is about THIS file only, so whatever its body names is
       // still walked.
-      if (!_isAuditedSanctionedScript(real, _sha256OfBody(content))) {
-        // #1228: a script we DID read runs an EXPANDED path — same unreadable-script hole
-        // one level down, as a direct operand or as a piped producer; fail closed before the
-        // walk silently skips it.
-        const expNested = _expRefusal(content);
-        if (expNested) return expNested;
-      }
+      // #1228: a script we DID read runs an EXPANDED path — same unreadable-script hole
+      // one level down, as a direct operand or as a piped producer; fail closed before the
+      // walk silently skips it. #3243: through `_expRefusalForBody`, so the digest-keyed
+      // sanctioned stand-down and the honest attribution are the SAME as every other body
+      // reader (this site duplicated the stand-down). The BODY ITSELF is scanned exactly as
+      // it was before this change — the body-preparation hunk was measured and is NOT
+      // landed (see `_expRefusalForBody`), so nothing about this call prepares it.
+      const expNested = _expRefusalForBody(real, content);
+      if (expNested) return expNested;
       p = extractScriptPath(content) ?? seeds.shift() ?? null;
     }
     // #1885 — the SECOND, independently bounded walk: every command-position script the
@@ -3487,11 +3629,9 @@ function _worktreeDiscardBlock(command: string, hatchActive = false): string | n
         // Same digest-keyed stand-down as the walk above — ONE predicate, both walks (a
         // sanctioned script reached through the command-position queue must not be gated by
         // a rule its sibling walk already exempts it from). The nested-script push below is
-        // NOT skipped, for the same reason.
-        if (!_isAuditedSanctionedScript(real, _sha256OfBody(content))) {
-          const expNested = _expRefusal(content);
-          if (expNested) return expNested;
-        }
+        // NOT skipped, for the same reason. #3243: `_expRefusalForBody` (see the sibling walk).
+        const expNested = _expRefusalForBody(real, content);
+        if (expNested) return expNested;
         const nested = extractScriptPath(content);
         if (nested && !seen.has(String(nested)) && !cpQueue.includes(nested)) cpQueue.push(nested);
       }
@@ -5000,12 +5140,25 @@ export default function (pi: ExtensionAPI) {
     if (!_isAllowMainEdits()) {
       if (isBash) {
         const command = (event.input as { command?: string }).command ?? "";
+        // #3444 — REMOTE-EXEC BOUNDARY. `cmux vm exec <vm> -- …`, `ssh <host> …`
+        // and `docker exec <c> …` run the remainder of the command on ANOTHER
+        // box, which this guard cannot see and does not protect. Every gate in
+        // this block resolves PATHS and HUB STATE against the LOCAL checkout, so
+        // a remote payload must not be judged by them (measured 2026-11-04:
+        // `cmux vm exec cell -- sh -c 'git worktree add <rel>'` was refused by
+        // #1919 with the LOCAL path named, and a remote `git checkout`/`git pull`
+        // by #1484/#1144 — ~87 idle lanes on four cells, unusable from the hub).
+        // The mask removes ONLY the payload text; a trailing local segment, a
+        // local redirection target and a locally-executed substitution all stay
+        // visible, so the local guarantees are unchanged (see
+        // classify-git.mjs maskRemoteExecPayloads).
+        const localCommand = maskRemoteExecPayloads(command);
         // #347: execution-cwd-aware backdoor (script path + content gating
         // resolve against the command's cd-target, not the session cwd).
-        const execCwd = commandExecutionCwd(command, process.cwd()) ?? undefined;
-        const backdoor = _backdoorBlock(command, execCwd);
+        const execCwd = commandExecutionCwd(localCommand, process.cwd()) ?? undefined;
+        const backdoor = _backdoorBlock(localCommand, execCwd);
         if (backdoor) return { block: true, reason: backdoor };
-        const nestedWt = _nestedWorktreeBlock(command);
+        const nestedWt = _nestedWorktreeBlock(localCommand);
         if (nestedWt) return { block: true, reason: nestedWt };
         const st = _hubState();
         // #618/#621: the tracked bash-write gate runs for EVERY non-hatched bash
@@ -5027,7 +5180,7 @@ export default function (pi: ExtensionAPI) {
         // marker is an audited solo-session recovery hatch, not a license to
         // write other hubs).
         const markerOn = readAllowMarkerState(_markerPath(), _currentSessionId(_ctx));
-        const bashWrite = _hubBashTrackedWrite(command, st.disorder, markerOn);
+        const bashWrite = _hubBashTrackedWrite(localCommand, st.disorder, markerOn);
         if (bashWrite) return { block: true, reason: _hubBashWriteBlockReason(bashWrite) };
         if (st.disorder) {
           // #437 (C): bash writes to TRACKED hub files while the hub is
@@ -5060,8 +5213,8 @@ export default function (pi: ExtensionAPI) {
           // destroyed a foreign checkout's uncommitted work with M4 classifying
           // recovery and M5 never consulted. Wiring the hatch to the shape (not
           // just to the window) makes M4 refuse those forms exactly as main does.
-          const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(command);
-          const gate = evaluateHubGateWithTargets(command, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
+          const escapeActive = (_isAllowMainEdits() || markerOn) && /^\s*git\s/.test(localCommand);
+          const gate = evaluateHubGateWithTargets(localCommand, st.branch, resolve(process.cwd()), checkedOutNames, st, { escapeActive, hatchActive: _currentHatchActive });
           if (gate.exempted) {
             // #347 code-review: audit worktree exemptions — a deliberate gate
             // relaxation must be observable (the 2026-08-18 incident was a
@@ -5087,7 +5240,7 @@ export default function (pi: ExtensionAPI) {
             // this early-return swallow a push: fall through to the
             // ownership/M2 path below (which allows the session's OWN branch
             // and blocks foreign ones, incl. bare/`HEAD`/remote-only pushes).
-            const pushDet = classifyGitCommandDetailed(command);
+            const pushDet = classifyGitCommandDetailed(localCommand);
             const gateablePush = pushDet?.verdict === "block:push" ||
               pushDet?.verdict === "block:force-push" ||
               pushDet?.verdict === "block:push-delete";
@@ -5105,7 +5258,7 @@ export default function (pi: ExtensionAPI) {
               // Round 15: the MESSAGE needs the hatch itself, not the shape-gated
               // `escapeActive` — passing the latter told a hatched lane (refused for
               // being compound/wrapped) to stamp the marker it already holds.
-              const discardReason = _worktreeDiscardBlock(command, _currentHatchActive);
+              const discardReason = _worktreeDiscardBlock(localCommand, _currentHatchActive);
               if (discardReason) return { block: true, reason: discardReason };
               return undefined; // sanctioned recovery / read-only / non-push — done
             }
@@ -5219,18 +5372,26 @@ export default function (pi: ExtensionAPI) {
     }
     if (isBash) {
       const command = (event.input as { command?: string }).command ?? "";
+      // #3444 — the SAME remote-exec mask the M4 block above uses. This block
+      // feeds M5 (the effect-keyed discard gate), the degradation classifier and
+      // the full M3/M2/ownership/#1144 decision from ONE string, so masking here
+      // is what stops a REMOTE `git pull`/`git checkout`/`git reset` being judged
+      // by the LOCAL tree state (measured: #1144 refused a remote pull inside a
+      // compound because the local hub had no baseline and the local tree was
+      // dirty). The tail AFTER the remote command stays verbatim and gated.
+      const localCommand = maskRemoteExecPayloads(command);
       // ── M5 (#709): effect-keyed working-tree-discard gate ──
       // Runs BEFORE the degradation/full classifier arms and BEFORE the
       // worktree exemptions below, so a discard is caught whether or not
       // branch-ownership loaded, and in a linked worktree as well as the hub.
       // It sits AFTER the env/marker hatch return above, so both hatches
       // bypass it unchanged.
-      const discardBlock = _worktreeDiscardBlock(command, false);
+      const discardBlock = _worktreeDiscardBlock(localCommand, false);
       if (discardBlock) return { block: true, reason: discardBlock };
       // #350: hub-WIP discipline prompts (never block) — bash-write detection
       // (heredoc/tee/python into the hub) + the throttled periodic hub-hygiene
       // scan (once per 5 min — never per-command).
-      _maybeWarnBashWrite(command);
+      _maybeWarnBashWrite(localCommand);
       _periodicHubHygieneCheck();
 
       // ── Degradation fallback (branch-ownership OR detailed classifier
@@ -5238,7 +5399,7 @@ export default function (pi: ExtensionAPI) {
       // bypass. No repo exemption — agent-infra degrades identically (#615). ──
       if (!branchOwnership || !classifierLoaded) {
         if (_isAllowMainEdits()) return undefined;
-        const verdict = classifyGitCommand(command);
+        const verdict = classifyGitCommand(localCommand);
         // #443 clean-hub parity: the FROZEN legacy classifier reports
         // `block:push-delete` for the exact `--delete`/`:branch` spellings
         // only, so the documented `-d` short form and `--del`-style
@@ -5256,7 +5417,7 @@ export default function (pi: ExtensionAPI) {
         // keep its existing generic block below — an unrelated legacy block
         // must never be swallowed by the coordinated-delete arm's
         // allow-when-no-sibling-checkout return.
-        const rawDeleteNames = extractPushDeleteBranch(command) ?? [];
+        const rawDeleteNames = extractPushDeleteBranch(localCommand) ?? [];
         // `allow-non-git` is intentionally absent: a non-empty extractor
         // requires a literal `git push` token, so the legacy verdict for any
         // such command is `allow` or a `block:*` — never `allow-non-git`.
@@ -5302,7 +5463,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── Full branch-ownership path (#265) ──
-      const det = classifyGitCommandDetailed(command);
+      const det = classifyGitCommandDetailed(localCommand);
       // P2 (cycle 3): resolve the effective repo against the STATE-mutating
       // invocation — `git -C <wt> status && git checkout main` must gate on the
       // main checkout, not the worktree the first invocation pointed at.
@@ -5334,7 +5495,7 @@ export default function (pi: ExtensionAPI) {
         // boundary-aware → its hints are the reference truth.
         eff = branchOwnership.resolveRepoFromInv(det.stateHints, process.cwd());
       } else {
-        eff = branchOwnership.resolveEffectiveRepo(command, process.cwd(), det.verb, 0);
+        eff = branchOwnership.resolveEffectiveRepo(localCommand, process.cwd(), det.verb, 0);
       }
       const allowActive = _isAllowMainEdits();
 
@@ -5586,7 +5747,7 @@ export default function (pi: ExtensionAPI) {
           // base decision — a `git pull origin main && git push origin -d b`
           // compound is an origin/main parity gap (the pull allowance already
           // swallowed it before #443), out of this push-spelling scope.
-          const wcDeletes = wholeCommandDeleteTargets(det.verdict, command);
+          const wcDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
           const baselineBranch = baseline?.branch ?? null;
           // Unknown baseline (no way to tell own from foreign) → keep the
           // allowance's base decision exactly as before.
@@ -5624,7 +5785,7 @@ export default function (pi: ExtensionAPI) {
         return admitAfterM3(); // foreign deletes with no checked-out targets — allowed (today's behavior)
       }
       if (det.verdict === "block:push" || det.verdict === "block:force-push") {
-        const laterDeletes = wholeCommandDeleteTargets(det.verdict, command);
+        const laterDeletes = wholeCommandDeleteTargets(det.verdict, localCommand);
         if (laterDeletes.length > 0) {
           const blocked = _coordinatedDeleteBlock(laterDeletes);
           if (blocked) return blocked;

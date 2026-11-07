@@ -579,6 +579,66 @@ def render_report(
     return "\n".join(lines)
 
 
+# ── the dispatch population (wired, not just shipped alongside) ────────────
+# #1178's rule is about PREDICATES. The cmux population above cannot contain an
+# orchestrator lane (`pi -p`, no workspace, no hook record) BY CONSTRUCTION, and
+# a report that lists a population without naming what it cannot see lets its
+# silence read as "nothing is running" (#1777). So the dispatch population is
+# REPORTED here too — enumerated from durable transcripts by
+# `tools/fleet/fleet_snapshot.py` (never a second copy of the enumeration, and
+# never a second verdict: every row is `liveness.evaluate`'s). It is
+# REPORT-ONLY on purpose: its `dead` is unreachable by design (no durable fenced
+# incarnation), so it must never reach the escalation policy above.
+def dispatch_rows(**kw):
+    """``(rows, declaration)`` for the dispatch population, or ``([], why)``.
+
+    Imported lazily: this driver is farmed BOTH files (``liveness.py`` beside it)
+    and an older farm may not carry the snapshot module yet. A missing sibling is
+    an UNMEASURED declaration rendered into the report — never a silent zero.
+    """
+    try:
+        import fleet_snapshot  # noqa: E402
+    except ImportError as exc:  # pragma: no cover - farm dependent
+        return [], {"population": "dispatch",
+                    "state": "UNMEASURED(fleet_snapshot.py not farmed beside this driver: %s)" % exc}
+    try:
+        return fleet_snapshot.dispatch_lanes(**kw)
+    except Exception as exc:  # pragma: no cover - never fail the cmux report
+        return [], {"population": "dispatch",
+                    "state": "UNMEASURED(dispatch enumeration failed: %s)" % exc.__class__.__name__}
+
+
+def render_dispatch_section(rows, decl) -> str:
+    """The dispatch population as its own section, with its limits declared."""
+    lines = ["", "### Dispatch lanes (`pi -p`, no cmux workspace)", ""]
+    if decl.get("state"):
+        lines.append("**%s** — this population was NOT measured on this box." % decl["state"])
+        return "\n".join(lines)
+    counts: Dict[str, int] = {}
+    for r in rows:
+        counts[str(r["state"])] = counts.get(str(r["state"]), 0) + 1
+    summary = " · ".join("%d %s" % (counts[s], s) for s in STATE_ORDER if counts.get(s)) or "none"
+    lines.append("**%d lane(s):** %s. Source: %s. Binding: %s."
+                 % (len(rows), summary, decl.get("source", "?"), decl.get("binding", "?")))
+    lines.append("")
+    lines.append("`dead` is **unreachable** in this population: %s."
+                 % decl.get("dead_note", "no durable fenced incarnation"))
+    if decl.get("withheld_stale"):
+        lines.append("")
+        lines.append("%d transcript(s) withheld as retired — last write older than %.0fh "
+                     "(the reaper's own idle proof; a stale flag is never repeated as current)."
+                     % (decl["withheld_stale"], decl.get("window_h", 24)))
+    if rows:
+        lines.append("")
+        lines.append("| lane | session | state | reason | evidence |")
+        lines.append("|---|---|---|---|---|")
+        for r in rows:
+            lines.append("| `%s` | `%s` | **%s** | `%s` | `%s` |"
+                         % (_md_cell(r["lane"]), _md_cell(r["sid"][:8]), _md_cell(r["state"]),
+                            _md_cell(r["reason"]), _md_cell(r.get("evidence") or "—")))
+    return "\n".join(lines)
+
+
 # ── escalation (mirrors scripts/fleet-cost-weekly.sh) ────────────────────
 def escalate(repo: str, title: str, body: str, gh_bin: str) -> str:
     """One OPEN `lane-liveness escalation` issue → comment; else create.
@@ -691,6 +751,9 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     body = render_report(ts, pairs, host=host, escalate_states=ESCALATE_STATES,
                          population_source=population_source)
+    disp, disp_decl = dispatch_rows(sessions_dir=ns.sessions_dir, store_path=ns.store,
+                                   task_sessions=ns.task_sessions, now_ms=now_ms, lib=lib)
+    body += "\n" + render_dispatch_section(disp, disp_decl)
     dead = [(lane, v, ev) for lane, v, ev in pairs if escalatable(v, ev)]
     counts = {}
     for _lane, v, _ev in pairs:
@@ -704,6 +767,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                        "escalatable": escalatable(v, ev), **v.to_dict()}
                       for lane, v, ev in pairs],
             "counts": counts,
+            "dispatch_lanes": disp,
+            "dispatch_declaration": disp_decl,
             "coverage_gaps": list(COVERAGE_GAPS),
         }, sort_keys=True))
 

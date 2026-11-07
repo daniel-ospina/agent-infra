@@ -116,8 +116,20 @@ git -C "$AI_MAIN" fetch -q origin main 2>/dev/null || true
 REV="$(git -C "$AI_MAIN" rev-parse --short "$SRC_REF" 2>/dev/null)"
 [ -n "$REV" ] || { log "FATAL: cannot resolve $SRC_REF in $AI_MAIN"; exit 1; }
 rm -rf "$STAGE"; mkdir -p "$STAGE"
-git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness scripts/lib/lane-ceiling.sh | tar -x -C "$STAGE" || {
+git -C "$AI_MAIN" archive "$SRC_REF" scripts/orchestrator-harness | tar -x -C "$STAGE" || {
   log "FATAL: could not extract the harness from $SRC_REF"; exit 1; }
+# ⛔ `scripts/lib/lane-ceiling.sh` RIDES IN ITS OWN `git archive` CALL, AND ONLY WHEN THE REF HAS IT.
+# `git archive` fails the ENTIRE invocation when ANY pathspec matches nothing (`fatal: pathspec …
+# did not match any files`, then tar's `This does not look like a tar archive`), so naming it as a
+# second pathspec beside the harness made an older ref FATAL here — directly contradicting the phase-A
+# branch below, whose whole purpose is the opposite ("A ref that predates the library is not a FATAL:
+# the installer then takes its NAMED 'report unavailable' branch, which is loud"). Measured: from
+# 94ae4cab this reddened `harness-provenance.test.sh` §4 for every ref without the library, because
+# the tolerance branch was UNREACHABLE — the archive died first.
+if git -C "$AI_MAIN" cat-file -e "$SRC_REF:scripts/lib/lane-ceiling.sh" 2>/dev/null; then
+  git -C "$AI_MAIN" archive "$SRC_REF" scripts/lib/lane-ceiling.sh | tar -x -C "$STAGE" || {
+    log "FATAL: $SRC_REF has scripts/lib/lane-ceiling.sh but it could not be extracted"; exit 1; }
+fi
 H="$STAGE/scripts/orchestrator-harness"
 [ -f "$H/claims.sh" ] || { log "FATAL: $SRC_REF has no claims.sh — refusing to deploy"; exit 1; }
 [ -f "$H/orch-loop.sh" ] || { log "FATAL: $SRC_REF has no orch-loop.sh"; exit 1; }

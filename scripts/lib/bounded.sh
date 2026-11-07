@@ -122,30 +122,132 @@ tb_watchdogs_reap() {
 }
 
 # tb_watchdog <secs> <cmd...> — run <cmd> with a SIGKILL timer; 124 when the timer fired.
+#
+# ⛔ THE TIMER KILLS THE PROCESS **GROUP**, NOT JUST THE DIRECT CHILD (review of PR #3399, P2 —
+# REPRODUCED). `kill -9 "$pid"` reaps the command itself, but a command that FORKS a transport helper
+# leaves the grandchild alive — and because every caller captures this function's output
+# (`out="$(tb_timeout … 2>&1)"`, the shape this file's own tb_timeout note documents), the orphan keeps
+# the capture PIPE open and the command substitution blocks on it for as long as the orphan lives. The
+# bound then holds in SPELLING only: measured `tb_timeout 3` over a command that backgrounds a
+# `sleep 8` → **8 s** when captured, 3 s when redirected. In the fleet that is `git push` against a
+# black-holed transport hanging a dying lane for the full TCP connect timeout (measured 131 s against a
+# declared 15 s) on exactly the hosts this file exists for — macOS, which has no GNU `timeout` to signal
+# the group. Linux runners masked it, which is why only the internal path could see it.
+# ⛔ SO THE JOB GETS ITS OWN PROCESS GROUP (`set -m`) AND THE TIMER SIGNALS `-pgid`, which is what GNU
+# `timeout` does and why it never had this defect. The group is assigned at FORK, so job control is
+# restored immediately after both launches — the caller's `set -m` state is left exactly as it was found
+# (the same discipline `run_agent` records for its own `set -m`), and the negative-pid kill still reaches
+# the group afterwards. A shell that refuses `set -m` falls back to the direct-child kill, so this is a
+# strict improvement on every host rather than a new dependency.
+# ⛔ ONE SHAPE THIS FIX DOES **NOT** BOUND, STATED BECAUSE THE PARAGRAPH ABOVE MEASURES IT (cycle-21
+# verification of a reviewer's finding — REPRODUCED ON BOTH SIDES of this change, so it is NOT a
+# regression of it). The timer only fires while `wait "$pid"` is still running. A command that FORKS a
+# helper and then EXITS 0 without waiting for it returns from `wait` at once, so nothing here ever signals
+# that group: the helper keeps the caller's capture pipe open and the `out="$(…)"` shape blocks for the
+# helper's whole lifetime. Measured: `tb_timeout 2` over `bash -c 'sleep 30 & exit 0'` returns rc=0 in
+# ~2 ms, while the CAPTURED form does not return for 30 s — and the same measurement is identical on the
+# pre-fix helper (`origin/main`) and under GNU `timeout 2` (which has the same property). Closing it
+# requires a group signal AFTER the direct child has been reaped, i.e. against a pid the shell has
+# already released to reuse; that trade is not made here. The pre-fix paragraph's measurement still
+# holds for the shape it names — a command that IS still running when the timer fires, where the
+# direct-child kill left the transport helper alive — and that shape is what this change fixes.
+# ⛔ THE GUARANTEE IS THE COMMAND'S OWN PROCESS GROUP, AND IT IS NOT TRANSITIVE (review cycle 20, P2 —
+# MEASURED). A command that itself calls `tb_timeout` enables job control in ITS shell too, so the inner
+# command is a NEW group leader and is not a member of the group this timer signals: measured
+# `tb_timeout 2 bash -c '. bounded.sh; tb_timeout 30 bash -c "sleep 8 & sleep 8"'` returns at 8 s, not
+# 2 s (identical before and after this fix). So the bound bounds the DIRECT command and everything that
+# stays in its group — it does NOT bound a nested `tb_timeout`. No in-tree caller nests today (the
+# reaper's delegates and `conflict-rebase-timer.sh`'s python do not re-enter it), so no caller currently
+# reads a guarantee it does not hold; the residue is tracked rather than glossed.
+# ⛔ AND THE GROUP IS A HANDLE THE **CALLER** KEEPS, NOT A PRISON (review of PR #3399, P1 — REPRODUCED).
+# The first cut forked the command AND its watchdog under `set -m`, so BOTH became group leaders and the
+# fleet's termination discipline could no longer reach either one: a lane is reaped with
+# `kill -TERM -- "-$pgid"` (spawn-gate.sh, cell-lane-preflight.sh) precisely so nothing is left resident
+# for the census to account for, and measured under `setsid` a caller group-TERM left the bounded command
+# alive at ppid 1 until its own bound expired — the bound had become a floor. Only the COMMAND is
+# ungrouped (it must be: that is what lets the timer reach a transport helper the command forked). The
+# WATCHDOG is forked with job control OFF so it stays in the CALLER's group, where the caller's group
+# signal reaches it, and its trap FORWARDS that TERM to the command's group — GNU `timeout`'s behaviour,
+# which is what the header above says this replicates.
+# ⛔ AND THE FORWARDED TERM IS ESCALATED, BECAUSE THE TWO-STAGE REAP IS THE FLEET'S CONTRACT (review of PR
+# #3399, P2 — REPRODUCED). A reaper sends `kill -TERM -- -<pgid>`, waits a grace, then `kill -KILL --
+# -<pgid>`. Ungrouping the command — which is what lets the TIMER reach a transport helper — means the
+# second stage no longer has that command in the caller's group, so a command that IGNORES TERM would
+# survive the whole reap. The watchdog survives a TERM (it traps it) and is still in the caller's group, so
+# it is what carries the escalation: forward TERM, wait a bounded grace, then SIGKILL the command's group.
+# The grace is deliberately short (2 s) so it lands inside the fleet's 5 s TERM→KILL gaps
+# (`merge-one.sh`, `fix-one.sh`); `lane-reap.sh`'s 1 s gap may close first, and that residue is STATED
+# below rather than glossed. ⛔ THE ONE RESIDUE NOTHING CAN CARRY: a KILL-ONLY reap — the watchdog is
+# SIGKILLed with the group before any trap can run, so the command is left to its own bound. GNU `timeout`
+# has the identical property, which is why the fleet reaps in two stages.
 tb_watchdog() {
     local secs="$1"; shift
-    local pid wd="" s rc=0 sentinel="" done_flag=""
+    local pid wd="" s rc=0 sentinel="" done_flag="" was_m=0 g=0
     TB_BOUND_N=$((TB_BOUND_N + 1))
-    if tb_bound_tmp; then
-        sentinel="$TB_BOUND_TMP/s.$TB_BOUND_N"
-        done_flag="$TB_BOUND_TMP/d.$TB_BOUND_N"
-    fi
-    "$@" &
+    was_m=0; case $- in *m*) was_m=1 ;; esac
+    # ⛔ THE FALLBACK IS THE `|| kill -9 "$pid"` AT EACH KILL SITE, NOT A FLAG.
+    # `set -m` is best-effort: a shell that refuses it leaves the command in the CALLER's group, where the
+    # negative-pid kill reaches nothing and the direct-child kill does the job — a strict improvement on
+    # every host, with no new dependency. There used to be a `jobctl` variable recording whether `set -m`
+    # took, assigned and NEVER READ, which invited a future reader to believe the fallback was gated on it.
+    set -m 2>/dev/null || true
+    # ⛔ STDIN IS REDIRECTED, SO THE BOUND DOES NOT GAIN AN INPUT. bash gives a background job `/dev/null`
+    # as stdin only when job control is OFF; with `set -m` in effect (one line up) it INHERITS the caller's
+    # stdin, so a bounded `cat` or an interactive `gh` would silently consume a pipe meant for the caller.
+    # The redirection restores exactly the behaviour every existing caller had before `set -m` existed.
+    "$@" </dev/null &
     pid=$!
+    # ⛔ THE SENTINEL IS NAMED FROM THE COMMAND'S OWN PID, NOT FROM A SHELL COUNTER (review round 4, P2 —
+    # MEASURED). `TB_BOUND_N` lives in the shell, but a CAPTURED bounded call runs this whole function in a
+    # command-substitution SUBSHELL whose increment is discarded — so two concurrent calls in one shell both
+    # minted `s.1`/`d.1`: one call's `done_flag` was visible to the other's timer (which then exited 0 and
+    # SKIPPED ITS SIGKILL, i.e. the bound was defeated) and its `rm -f` could clear the other's flag. Latent
+    # today — no in-tree caller runs two at once — but it is a fail-OPEN shape in the one mechanism every
+    # caller trusts. `$pid` is unique per call in this shell AND across subshells, and costs no fork, which
+    # a `mktemp` per sentinel would (fork economy is credited as a correctness property above). The counter
+    # stays as a record only. It is named here, after the fork, because before it the command has no pid.
+    if tb_bound_tmp; then
+        sentinel="$TB_BOUND_TMP/s.$pid"
+        done_flag="$TB_BOUND_TMP/d.$pid"
+    fi
+    # ⛔ JOB CONTROL OFF FOR THIS FORK, ON PURPOSE (see the paragraph above the function): the watchdog must
+    # stay in the caller's group to receive the caller's group signal.
+    set +m 2>/dev/null
     (
-        # TERM means the parent finished with this probe: kill the timer and leave without signalling
-        # anything. No orphaned `sleep`, so no `pkill -P` sweep is needed.
-        trap 'kill "$s" 2>/dev/null; exit 0' TERM INT
+        # TERM means the caller is finished with this probe — either the parent reaped the command, or the
+        # CALLER's own group-TERM arrived (the lane reaper's shape). Kill the timer; and when the command is
+        # still running, FORWARD the TERM to its group, or a group-killed lane leaves the bounded command
+        # resident for up to its whole bound — the very resident this function exists to not create.
+        # ⛔ `done_flag` IS THE DISCRIMINATOR, NOT `kill -0` (which is the narrow fallback for the degraded
+        # full-disk shape where no scratch dir could be made): the parent writes it BEFORE it signals this
+        # watchdog, so its presence means "the command already finished — forward nothing", which also
+        # closes the reap window in which `$pid` could have been reused by an unrelated process.
+        # ⛔ AND THE FORWARD IS ESCALATED (see the paragraph above the function): TERM, a bounded 2 s grace,
+        # then SIGKILL to the same group — otherwise a command that ignores TERM outlives a two-stage reap,
+        # because it is no longer in the caller's group for the KILL stage to reach.
+        trap 'kill "$s" 2>/dev/null
+              if { [ -z "$done_flag" ] || [ ! -e "$done_flag" ]; } && kill -0 "$pid" 2>/dev/null; then
+                  kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+                  g=0
+                  while [ "$g" -lt 10 ] && kill -0 "$pid" 2>/dev/null; do sleep 0.2 2>/dev/null || break; g=$((g + 1)); done
+                  if kill -0 "$pid" 2>/dev/null; then kill -9 "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null; fi
+              fi
+              exit 0' TERM INT
         sleep "$secs" &
         s=$!
         wait "$s" 2>/dev/null
         [ -n "$done_flag" ] && [ -e "$done_flag" ] && exit 0
         if kill -0 "$pid" 2>/dev/null; then
             [ -n "$sentinel" ] && : >"$sentinel"
-            kill -9 "$pid" 2>/dev/null
+            # ⛔ THE GROUP FIRST, THE CHILD AS THE FALLBACK. A grandchild (git's transport helper) is what
+            # holds a caller's capture pipe open; killing only `$pid` leaves it writing into that pipe.
+            kill -9 "-$pid" 2>/dev/null || kill -9 "$pid" 2>/dev/null
         fi
     ) >/dev/null 2>&1 &
     wd=$!
+    # The caller's job-control state is restored EXACTLY as it was found, after BOTH forks — so a caller
+    # that runs with `set -m` gets it back for everything it runs while this probe is in flight.
+    [ "$was_m" = "1" ] && set -m 2>/dev/null
     TB_WATCHDOGS="$TB_WATCHDOGS $wd"
     wait "$pid" 2>/dev/null || rc=$?
     if [ -n "$wd" ]; then

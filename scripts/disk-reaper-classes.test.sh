@@ -90,6 +90,14 @@ export HOME="$T/home"; mkdir -p "$HOME"
 # checkouts instead of the fixture.
 unset CELL_HOME REAP_AW_STAMP REAP_AW_DIRTY REAP_DI_MARKERS REAP_DI_UNIT_DIRS \
       DISK_REAPER_REPOS REPO TORTOISE_REPO AGENT_INFRA_PATH 2>/dev/null || true
+# ⛔ THE RUNNER `_work` CLASS'S GLOBS ARE PINNED INTO THE FIXTURE, exactly as REAP_AW_ROOTS/
+# REAP_DI_ROOTS are: every case here passes `--only`, but a mutant entry point with an arm deleted can
+# run a class the case did not ask for, and the default globs include `/opt/gh-runner*/_work` — 19 G of
+# live CI checkout on a cell. Absolute-path fixture, created so it is a MEASURED empty population rather
+# than an explicit-unmatched refusal.
+mkdir -p "$T/rw/gh-runner-fixture/_work"
+DISK_REAPER_RUNNER_GLOBS="$T/rw/gh-runner*/_work"
+export DISK_REAPER_RUNNER_GLOBS
 
 # ── fixtures ────────────────────────────────────────────────────────────────────────────────────
 # newbase <letter> — a UNIQUE fixture dir per invocation. Every case runs TWICE (real + mutant) and a

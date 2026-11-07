@@ -59,6 +59,11 @@ mkdir -p "$T/home" "$T/o/logs" "$T/repo" "$T/bin" "$T/tmux/panes" "$T/tmux/clien
 # an empty enumeration is cannot-verify (rc=3) by design, so a plain directory makes every hygiene arm
 # here assert against a pass that abstained instead of deciding (agent-infra#2573).
 git init -q "$T/repo" 2>/dev/null || true
+# ⛔ AND IT NEEDS AN ORIGIN, BECAUSE THE DOCTOR NOW WALKS IT (agent-infra#3521). The identity pass adds the
+# cell's own `$REPO`/`$WORKDIR` to the trees it checks, and a checkout with NO readable `origin` is an
+# UNVERIFIED identity (rc 3) by doctrine — a box that cannot exist on a cell, so leaving the fixture
+# origin-less made every `.desired`-less doctor arm here assert against a pass that abstained.
+git -C "$T/repo" remote add origin https://github.com/daniel-ospina/agent-infra.git 2>/dev/null || true
 
 # ⛔ THE HYGIENE ROLE'S NEW SINKS ARE STUBBED IN THIS FIXTURE (agent-infra#2573). The doctor now reaps
 # stale `cloud-cell-*` dirs under $TMPDIR and prunes IDLE docker images/volumes, and a suite that left
@@ -311,6 +316,13 @@ export PATH="$T/bin:$PATH"
 
 # ── shared environment ──────────────────────────────────────────────────────────────────────────
 export CELL_HOME="$T/home" O="$T/o" REPO="$T/repo" OR="daniel-ospina/agent-infra"
+# The identity walk is hermetic here for the same reason every other external dependency is: its SHIPPED
+# roots are the cell home, `/tmp/cell-ai` and `/tmp/cell-home`, and this suite must never grade the
+# machine that runs it. `ident-ok` holds one honest checkout, so an ordinary pass folds to 0.
+mkdir -p "$T/ident-ok/agent-infra"
+git init -q "$T/ident-ok/agent-infra" >/dev/null 2>&1
+git -C "$T/ident-ok/agent-infra" remote add origin https://github.com/daniel-ospina/agent-infra.git >/dev/null 2>&1
+export DOCTOR_REPO_IDENTITY_ROOTS="$T/ident-ok"
 export SESSION="orch" DOCTOR_SESSION="cell-doctor"
 export DOCTOR_TMUX_BIN="$T/bin/tmux" DOCTOR_PS_BIN="$T/bin/ps" DOCTOR_GH_BIN="$T/bin/gh"
 export DOCTOR_SLEEP_BIN="$T/bin/sleep"

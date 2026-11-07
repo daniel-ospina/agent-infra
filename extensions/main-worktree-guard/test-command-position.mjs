@@ -443,19 +443,34 @@ async function partC() {
     expectTrue("D4b control: the same prose without the shell words → ALLOWED (so D4 is the rejoin + that arm)",
       allowed(await bash("bash scripts/prose2.sh")), "was blocked");
 
-    // D5 (#1158 / analysis new class 6). `wtPipelineFeedsShell` splits on `|`
-    // with NO quote model, so a quoted `grep -n "bash\|sh -x"` alternation is read
-    // as a pipeline into `sh`; the glob on the producer side then fails closed.
-    // KNOWN-FALSE, unfixed (the quote model exists in the same file but this path
-    // does not use it).
+    // D5 (#1158 / analysis new class 6) — FIXED by #3243. `wtPipelineFeedsShell`
+    // used to split on `|` with NO quote model, so a quoted `grep -n "bash\|sh -x"`
+    // alternation was read as a pipeline into `sh` and the glob on the producer
+    // side then failed closed. The pin is FLIPPED here on purpose: this file's
+    // Part D contract is that a KNOWN-FALSE pin is "deliberately NOT fixed here" and
+    // "fixing any of them means narrowing a recogniser to a provable effect" — the
+    // narrowing is `wtSplitPipeline` (classify-git.mjs), and the mutation arms below
+    // prove the arm still fires on a REAL pipeline.
     writeFileSync(join(hub, "scripts", "alt1.mjs"), "export const a = 1;\n");
     const d5 = await bash('grep -n "bash\\|sh -x" scripts/*.mjs | head -2');
-    expectTrue("D5  KNOWN-FALSE: quoted `\\|` alternation is read as a pipe into a shell",
-      blocked(d5) && /#709/.test(why(d5)), `got: ${why(d5)}`);
+    expectTrue("D5  FIXED (#3243): a QUOTED `\\|` alternation is data, not a pipe into a shell",
+      allowed(d5), `was blocked: ${why(d5)}`);
     // The control the analysis measured: the SAME command without the quoted
-    // alternation is allowed — so D5 is the `\|`, not the pipeline.
+    // alternation is allowed — so D5 was the `\|`, not the pipeline.
     expectTrue("D5b control: the same pipeline without a quoted alternation → ALLOWED",
       allowed(await bash('grep -n "sh" scripts/*.mjs | head -2')), "was blocked");
+    // D5c/D5d are the PROTECTION side of the narrowing: an UNQUOTED `|` into a
+    // shell is still a pipeline, and an expansion-shaped producer still fails
+    // closed. Without these the flip above would be indistinguishable from the
+    // arm going quiet.
+    writeFileSync(join(hub, "scripts", "undo-alt.sh"), "git checkout -- clean.txt\n");
+    const d5c = await bash("cat ./scripts/undo-alt*.sh | bash", hub);
+    expectTrue("D5c PROTECTION (#3243): an UNQUOTED pipeline into a shell with an expansion-shaped producer is STILL refused",
+      blocked(d5c) && /#709/.test(why(d5c)), `got: ${why(d5c)}`);
+    const d5d = await bash("cat ./scripts/undo-alt.sh | bash", hub);
+    expectTrue("D5d control: the LITERAL pipeline into a shell is still GATED on the file's effect (this one discards nothing that is dirty → allowed)",
+      allowed(d5d), `was blocked: ${why(d5d)}`);
+    rmSync(join(hub, "scripts", "undo-alt.sh"), { force: true });
   } finally {
     for (const [k, v] of savedEnv) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
     rmSync(home, { recursive: true, force: true });

@@ -776,6 +776,25 @@ else
   kill -9 "$M2_PID" 2>/dev/null; wait "$M2_PID" 2>/dev/null
 fi
 
+echo "-- (g2) the shipped DEFAULT_MAX_REVIEW agrees with the loop (agent-infra#3441)"
+# ⛔ THE THIRD READER OF ONE NUMBER, AND THE ONLY ONE NOTHING PINNED (round 2 review, P2).
+# `MAX_REVIEW` is now BOTH the reviewer-concurrency cap and the per-PR review-ROUND ceiling, and it has
+# three fallbacks: `orch-loop.sh`/`install.sh` (pinned equal by `selftest.sh`) and TWO consumer copies —
+# `pr-doctor.py` (pinned by `test_pr_doctor.py`, which extracts the loop default) and THIS file. Every
+# case above supplies `MAX_REVIEW` explicitly through the plist/env fixture, so reverting this fallback
+# to the old 4 kept the whole suite green while a box with no plist silently throttled the drain against
+# a documented 10 — the exact divergence the file's own comment forbids. This is the same extraction
+# `test_pr_doctor.py` uses, so the two pins cannot disagree about what "the loop default" is.
+WS_DEFAULT="$(sed -n 's/^DEFAULT_MAX_REVIEW=\([0-9][0-9]*\)$/\1/p' "$HERE/worker-supply.sh" | head -1)"
+# the loop's assignment carries a trailing `# keep in sync …` comment, so the extraction cannot be
+# anchored at end-of-line; take the `:-` default out of the first MAX_REVIEW assignment.
+LOOP_DEFAULT="$(grep -m1 '^MAX_REVIEW=' "$HERE/orch-loop.sh" | sed -n 's/.*:-\([0-9][0-9]*\)}.*/\1/p')"
+if [ -n "$WS_DEFAULT" ] && [ "$WS_DEFAULT" = "$LOOP_DEFAULT" ]; then
+  ok "-- DEFAULT_MAX_REVIEW=$WS_DEFAULT matches orch-loop.sh's shipped default (one number, three readers)"
+else
+  bad "-- DEFAULT_MAX_REVIEW='${WS_DEFAULT:-<not found>}' != orch-loop.sh's '${LOOP_DEFAULT:-<not found>}' — a box with no plist would budget a different number than the loop runs"
+fi
+
 # ── (h) THE WALL-CLOCK BOUND ──────────────────────────────────────────────────────────────────────────
 # ⛔ THIS IS A TEST, NOT A COMMENT. The first attempt at this fix died inside its own suite: 45 minutes
 # and no result, so the fix never shipped. An unbounded test is a defect in the deliverable, so the

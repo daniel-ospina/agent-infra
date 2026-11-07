@@ -618,6 +618,49 @@ def _pid_alive(pid) -> bool:
         return True       # exists but is not ours: ALIVE is the fail-closed reading
 
 
+def _claim_message_bytes(repo_path: Path, rev: str) -> str:
+    """The claim message from `git cat-file commit`, as TEXT WITH ITS NUL AND CR BYTES INTACT.
+
+    ⛔ THE VERB IS THE ORACLE'S TOO (review round 19, agent-infra#3203). `git log -1 --format=%B` is a
+    PRETTY-PRINTER: it stops the message at the first NUL byte, while `_lease_of` reads
+    `git cat-file commit` into `$( )` and **bash DELETES NULs from a command substitution**, so digits
+    FUSE across a NUL exactly as they fuse across a CR. One datum, two byte streams, and three measured
+    rows where this reader answered FREE while the shell held the claim or abstained — the `"none"` its
+    `decide()` reads as the gate PASSING:
+        `lease_until=1<NUL>lease_until=1792009999`  shell fuses ⇒ UNPARSEABLE/abstain ; log ⇒ `1` ⇒ FREE
+        `lease_until=17<NUL>9999999999`             shell fuses ⇒ 179999999999 = LIVE  ; log ⇒ FREE
+        `lease_until=1<NUL>2`                       shell fuses ⇒ 12 = expired        ; log ⇒ 1 = FREE
+    (`git commit-tree` refuses a NUL; `git fast-import` and `git hash-object --literally` do not, and a
+    plain `git push` accepts the result.) So: `cat-file commit`, take the body after the first blank
+    line, and delete NULs BEFORE the CRs, which is what bash does.
+    ⛔ `run()` uses `text=True`, and `text=True` means `newline=None` — PYTHON'S UNIVERSAL NEWLINES. It
+    translates every lone `\r` into `\n` AT DECODE, so the `.replace("\r", "")` this file's reader
+    performs was a NO-OP on the real datum (review round 16, agent-infra#3203; measured: a claim whose
+    fields are CR-separated read as TWO lines here and as ONE token to `_lease_of`, which DELETES the CR
+    with `tr -d '\r'`). ⛔ AND THAT ONE TOKEN IS USUALLY INVALID, NOT LIVE (review round 17 — the first
+    draft of this comment said "the last digits win", which is only true when the CR sits INSIDE a digit
+    run): `lease_until=A\rlease_until=9999999999` fuses into `lease_until=Alease_until=9999999999`,
+    which `_lease_of`'s anchored token test rejects ⇒ UNPARSEABLE ⇒ ABSTAIN. The pre-fix reader split at
+    the CR, took line 1's `A` and answered `expired`/`"none"` — FREE. (The genuinely-LIVE CR case is a CR
+    inside the digits: `1792009999\r1` ⇒ `17920099991`.) Reading the bytes and decoding ourselves keeps
+    the CR until the caller removes it the way the shell does.
+    """
+    try:
+        p = subprocess.run(["git", "-C", str(repo_path), "cat-file", "commit", rev],
+                           capture_output=True, timeout=15, env=git_env())
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    if p.returncode != 0:
+        return ""
+    text = (p.stdout or b"").decode("utf-8", "replace")
+    _headers, sep, body = text.partition("\n\n")
+    if not sep:
+        return ""
+    # bash's `$( )` deletes NULs; delete them here, then the CRs (the caller does the CR), so the fusion
+    # semantics are byte-for-byte the oracle's.
+    return body.replace("\x00", "")
+
+
 def claim_state(o: Path, repo_path: Path, pr: int, head: str) -> tuple[str, str]:
     """-> (state, detail). state: none | <holder> | UNREADABLE.
 
@@ -676,38 +719,92 @@ def claim_state(o: Path, repo_path: Path, pr: int, head: str) -> tuple[str, str]
     rc, _, _ = run(["git", "-C", str(repo_path), "fetch", "--no-tags", "origin",
                     f"{ref}:{tmp_ref}"], timeout=60)
     if rc == 0:
-        rc2, out_msg, _ = run(["git", "-C", str(repo_path), "log", "-1", "--format=%B", tmp_ref],
-                              timeout=15)
-        if rc2 == 0:
-            msg = out_msg or ""
+        msg = _claim_message_bytes(repo_path, tmp_ref)
     run(["git", "-C", str(repo_path), "update-ref", "-d", tmp_ref], timeout=15)
     if msg:
         # ⛔ THE SHAPE IS `claims.sh`'s, NOT AN INVENTED ONE: one line,
         # `claim owner=<x> lease_until=<epoch-seconds> nonce=<...>`, parsed with the same
-        # non-anchored patterns `_lease_of` uses — a claim minted by the real writer must be
+        # ANCHORED, space/TAB-only patterns `_lease_of` uses (anchored since round 10 of this
+        # change: a token is a whole word that IS the field, never a prefix and never a
+        # mid-word match) — a claim minted by the real writer must be
         # readable here, or every claim reads as lease-less and none can ever expire.
-        m_owner = re.search(r"\bowner=([^\s]+)", msg)
-        m_lease = re.search(r"\blease_until=([^\s]+)", msg)
+        # ⛔ THE FIRST NON-EMPTY LINE ONLY, exactly as `claims.sh`'s `_lease_of` reads it (review
+        # round 13, agent-infra#3203). A whole-body search finds a `lease_until=` on a LATER line than
+        # the shell reads, so a claim the shell calls unparseable (ABSTAIN, rc 1, ref untouched) was
+        # answered "expired, reclaimable" here — and this file's `"none"` is the value `decide()`
+        # treats as the claim gate PASSING. The shell is the writer and the oracle.
+        # ⛔ THE SHELL'S WORD CLASS, NOT PYTHON'S (review round 14, agent-infra#3203). `\s`/`\S` are
+        # UNICODE: NBSP (\xa0), VT, FF and U+2003 all satisfy `(?<!\S)`, so a claim whose first line
+        # separates its fields with one of those was answered "expired ⇒ reclaimable" HERE while every
+        # shell reader — which splits on `tr ' \t'` — saw a single word, found no `lease_until=` field,
+        # and ABSTAINED. `decide()` treats `"none"` as the claim gate PASSING, so that is a GO minted
+        # against a claim the fleet refuses. Space and TAB only, in both directions.
+        # ⛔ AND THE LINE SPLITTER IS UNICODE TOO (review round 15, agent-infra#3203). `str.splitlines()`
+        # breaks on VT \v, FF \f, FS/GS/RS \x1c-\x1e, NEL \u0085, LS \u2028 and PS \u2029 — the shell
+        # breaks on `\n` alone (`_lease_of` pipes through `sed`/`tail`/`tr -d '\r'`). So a claim whose
+        # `lease_until` token is terminated by VT was `expired`/`reclaimable` HERE (the gate PASSING)
+        # and unparseable ⇒ ABSTAIN to every shell reader. Split on `\n` only, after dropping `\r` the
+        # way the shell does; every other control or Unicode space stays CONTENT.
+        _first = ""
+        for _cand in (msg or "").replace("\r", "").split("\n"):
+            if _cand.strip(" \t"):
+                _first = _cand
+                break
+        # ⛔ NO `.strip()` ON THE CAPTURES (review round 17, agent-infra#3203). An argument-less
+        # `str.strip()` strips EVERY Unicode whitespace and line-break — VT, FF, NEL, NBSP, LS, PS,
+        # U+2028 — so `lease_until=1<VT> ` came back as a pure `1` and passed the shape gate as a PAST
+        # term ⇒ `expired` ⇒ `"none"`, the value `decide()` reads as the claim gate PASSING. The shell
+        # splits words on space/TAB only, so `1<VT>` is ONE word that is not all digits ⇒ UNPARSEABLE
+        # ⇒ abstain (`_lease_of`: `sed -n 's/^lease_until=\([0123456789][0123456789]*\)$/…'`, which
+        # no VT survives). Round 14 fixed the REGEX to `[^ \t]` and this line put the Unicode class
+        # straight back. The regex already excludes space and TAB, so the capture IS already the
+        # shell's word — there is nothing to trim.
+        # ⛔ THE FIRST **VALID** TOKEN, NOT "THE FIRST WORD, THEN VALIDATE IT" (review round 18,
+        # agent-infra#3203). `_lease_of` is
+        #   `tr ' \t' '\n\n' | sed -n 's/^lease_until=\([0123456789][0123456789]*\)$/\1/p' | head -n 1`
+        # — it rejects a non-digit token and CONTINUES to the next one. `re.search(prefix)` stops at the
+        # first word that merely STARTS with `lease_until=` and then shape-tests it, so
+        # `lease_until=HAVOC lease_until=1791000000` was UNPARSEABLE here and EXPIRED to the shell and
+        # to `claim_lanes` (which already uses the anchored findall). Measured, all three ways. The
+        # direction was over-block, not a grant — but a reader that refuses what the registry calls free
+        # is the churn `claim_state`'s own docstring exists to prevent, and "the FIRST match" is only
+        # meaningful when both tokens are valid.
+        m_owner = re.search(r"(?<![^ \t])owner=([^ \t]+)", _first)
+        m_lease_tokens = re.findall(r"(?<![^ \t])lease_until=([0-9]+)(?=[ \t]|$)", _first)
+        lease_until = m_lease_tokens[0] if m_lease_tokens else ""
         extra = []
         if m_owner:
-            extra.append(f"owner={m_owner.group(1).strip()}")
-        if m_lease:
-            lease_until = m_lease.group(1).strip()
+            extra.append(f"owner={m_owner.group(1)}")
+        if lease_until:
             extra.append(f"lease_until={lease_until}")
         if extra:
             holder = f"{ref}@({', '.join(extra)})"
     if lease_until:
         # `lease_until` is EPOCH SECONDS (claims.sh: "an EPOCH SECOND, which is 10 digits TODAY");
-        # an ISO stamp is tolerated for an older writer. ⛔ AN UNPARSEABLE LEASE IS LIVE, NEVER FREE,
+        # an ISO stamp is tolerated for an older writer. ⛔ AN UNPARSEABLE LEASE IS NEVER FREE — and,
+        # since #3203, never REPORTED as live either (claims.sh calls it `unreadable` and ABSTAINS;
+        # `claim_prune` reaps it past CLAIM_UNREADABLE_LEASE_MAX_AGE) —
         # which includes the `0` SENTINEL: claims.sh's `_lease_unparseable` treats `'' | 0 | non-digit`
-        # (and 19+ digits) as unparseable, `_lease_is_live` then answers LIVE, and test-claims.sh pins
-        # "`lease_until=0` reads as UNPARSEABLE => LIVE (rc=1)". Reading 0 as an expired epoch here
+        # (and 19+ digits) as unparseable, `_lease_is_live` then answers "not expired", and test-claims.sh pins
+        # "lease_until=$L reads as UNPARSEABLE => ABSTENTION (rc=1, never stolen)" for L in 0 and -5. Reading 0 as an expired epoch here
         # would be a FIFTH polarity about the same fact — and it would steal a live claim.
         lease_ts = None
-        if re.fullmatch(r"\d{1,18}", lease_until) and int(lease_until) != 0:
+        # ⛔ A LEADING-ZERO LEASE IS UNPARSEABLE TOO (review, agent-infra#3203). `claims.sh`'s
+        # `_lease_unparseable` rejects `0?*`, because `[` compares DECIMALLY there and a planted
+        # `0000009999` would read as a 1970 window; `int()` does the same thing here, so accepting it
+        # would make this reader disagree with the shell in the FREE direction — it would pass a claim
+        # gate the shell ABSTAINS on. One datum, one answer.
+        # ⛔ `[0-9]`, NOT `\d` (review, agent-infra#3203): Python's `\d` matches UNICODE decimal
+        # digits while `[1-9]` is ASCII-only, so `17٩2000000` (U+0669 in the middle) passed the shape
+        # gate and `float()` — which normalises Unicode decimals — returned 1792000000.0 ⇒ FREE, while
+        # the shell says `unreadable` and claim_lanes.py says `unknown`. Same datum, one answer.
+        if re.fullmatch(r"[1-9][0-9]{0,17}", lease_until):
             lease_ts = float(lease_until)
-        elif _ts(lease_until) is not None:
-            lease_ts = _ts(lease_until)
+        # ⛔ NO ISO FALLBACK (review round 10, agent-infra#3203). `claims.sh` mints an EPOCH SECOND and
+        # its `_lease_of` now ANCHORS the token, so `lease_until=2026-01-01T00:00:00Z` is `unreadable`
+        # to every shell reader — while an ISO fallback here parsed it and answered "expired,
+        # reclaimable", i.e. FREE. The shell is the writer AND the oracle: a shape it cannot parse is
+        # not a shape this reader may interpret. `lease_ts = None` is the existing abstention.
         if lease_ts is not None and lease_ts < time.time():
             # ⛔ AN EXPIRED CLAIM IS FREE. `claims.sh` (`_lease_is_live`) and the lander this gate
             # feeds (`merge-one.sh`'s CAS reclaim) both say so. Refusing on a dead lease is the
