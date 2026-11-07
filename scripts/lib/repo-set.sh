@@ -582,12 +582,16 @@ _rs_doctor_py() {
 
 # _rs_with_doctor <verb> <arg> — run ONE question against pr-doctor.py's own functions, so the reader
 # and the doctor cannot disagree about a remote, a slug, a tag set or the set's own splitting.
-# Prints the answer, or "" when nothing could be asked. ⛔ THE EXCEPTION IS THE SENTINEL: a verb whose
-# answer cannot legitimately be empty (`tags`, and `split` via `_rs_split_entries`) prints
-# `__UNASKABLE__` rather than "", because "" is a MEANINGFUL answer for them ("no tag collision", "no
-# divergence") and the caller cannot tell the two apart. `load` answers "OK" only when the module
-# actually executed. Keep this list true when adding a verb — a stale contract line here is how the
-# `tags` guard went a whole round reading a dead sibling as agreement.
+# Prints the answer, or "" when nothing could be asked. ⛔ THE EXCEPTION IS THE SENTINEL: the verbs
+# whose empty answer is MEANINGFUL print `__UNASKABLE__` instead, because the caller cannot tell
+# "nothing to report" from "could not ask":
+#   tags  — "" means no collision          -> sentinel emitted here
+#   strip — "" means "nothing to trim"     -> sentinel emitted here
+#   norm  — "" means "not a slug"         -> sentinel emitted here
+#   split — "" means "no divergence"      -> sentinel applied by `_rs_split_entries`
+# (origin needs none: it already reports "no python3, or it would not load" textually.)
+# Keep this list true when adding a verb — a stale contract line here is how the `tags` guard went a
+# whole round reading a dead sibling as agreement.
 #
 # ⛔ THE VERB LIST IS PART OF THE CONTRACT — KEEP IT TRUE (review round 12, P2). It said `origin` or
 # `norm` long after three more verbs had been added, so a reader could believe the whole-set guards
@@ -626,6 +630,8 @@ except Exception:
     # a meaningful empty answer is told here instead:
     #   tags  — "" means no collision          -> sentinel
     #   strip — "" means "nothing to trim"     -> sentinel, and the wrapper's `_trim` falls back on it
+    #   norm  — "" means "not a slug"         -> sentinel, and the wrapper's rank checks read it as
+    #                                               "could not be normalised", not "invalid slug"
     #   split — mapped shell-side by `_rs_split_entries`
     #   origin— already reports "no python3, or it would not load"
     # The `raise` stays UNCONDITIONAL, so every other verb keeps its exact pre-fix bytes.
