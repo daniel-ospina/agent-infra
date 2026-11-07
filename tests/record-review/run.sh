@@ -2339,12 +2339,13 @@ if [ -d "$DELTA_REPO" ]; then
   # feature silently INERT — while this suite stayed green: (33a)/(33a2) never look at
   # `carry_arm`, and (33f2) only proves the reader agrees about a record nothing should produce.
   # It is the PAIR that is asserted, not the word: `--check-carry` requires `carry_arm` AND
-  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:3776-3785, the
-  # `case "${CC_MINT:-}" in` arm) BEFORE it head-binds at :3811, so a delta record missing
+  # `evidence` of a `mint:"delta"` record (scripts/record-review.sh:4319-4328, the
+  # `case "${CC_MINT:-}" in` arm) BEFORE it head-binds at :4354, so a delta record missing
   # either is a no-record for the gate. Each citation also carries its own ANCHOR string:
-  # these numbers move whenever record-review.sh moves (on main the same three sites read
-  # :2407-2418 / :2443 / :1268-1274), and a re-derivation that was not re-checked at the
-  # head has already landed here wrong once. The anchor is what stays true.
+  # these numbers move whenever record-review.sh moves, and a re-derivation that was not
+  # re-checked at the head has already landed here wrong twice. The anchor is what stays
+  # true — `grep -n 'case "${CC_MINT:-}" in' scripts/record-review.sh` and
+  # `grep -n 'CC_HEAD" = "$CC_LIVE_HEAD' scripts/record-review.sh` re-derive both in one step.
   D_REC_A6="$(cat "$DR_HOME/.pi/agent/reviews/fixture-repo-7101.json" 2>/dev/null)"
   CC_RC_A6=0
   CC_OUT_A6="$( cd "$DELTA_REPO" || exit 9
@@ -2545,12 +2546,13 @@ INNERPY
   # at all), so deleting `|| [ "$DELTA" -eq 1 ]` from the one-verb guard — or dropping the
   # `[ "$DELTA" -eq 1 ] && [ "${#POSITIONAL[@]}" -gt 2 ]` arity guard, or the delta arm of the
   # `--evidence/--force-stale/--expect-head` refusal — reddened NOTHING while restoring exactly
-  # the false PASS the guard comment at `:2241-2245` (`--delta IS A MINTING VERB TOO`)
+  # the false PASS the guard comment at `:2784-2788` (`--delta IS A MINTING VERB TOO` —
+  # `grep -n 'IS A MINTING VERB TOO' scripts/record-review.sh` re-derives it)
   # says was MEASURED (`--delta
   # --print-diff-hash` exited 0 with the record untouched; `--delta --check-carry` answered
   # `fresh … run the code-review skill`, i.e. the paid re-review the verb exists to remove).
   # The in-repo standard for this guard class already existed — `--recover-body`'s combinations
-  # are pinned assertion-per-combo in `scripts/record-review.test.sh:3358-3371`, the
+  # are pinned assertion-per-combo in `scripts/record-review.test.sh:3369-3373`, the
   # `for _combo in --print-diff-hash --print-tier` loop — so this section
   # meets that standard instead of describing it.
   #

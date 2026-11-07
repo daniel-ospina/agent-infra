@@ -2956,9 +2956,9 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:4703 at this head — RE-DERIVE it, do not trust the number: a bare
-#      line citation here rotted once already, :4174 -> :4210, and this comment is not what makes
-#      the assertion true). One command answers it:
+#      (scripts/record-review.sh:6324 at this head — RE-DERIVE it, do not trust the number: a bare
+#      line citation here has rotted before, and this comment is not what makes
+#      the assertion true). One command answers it (origin/main bd1b205d is :6225):
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
 printf '{"pr":424920,"head_sha":"%s","diff_sha256":"%s","mint":"delta","carried_from":"%s","delta":{"from":"%s","to":"%s","proved":"lane","arm":"lane"},"verdict":"clean","repo":"%s","reviewed_at":"2026-11-03T01:05:33Z"}\n' \
     "$CC_SHA" "$CC_D64" "$CC_STALE" "$CC_STALE" "$CC_SHA" "$CC_REPO" > "$CC_FILE-424920.json"
@@ -5143,13 +5143,15 @@ fi
 #     PART OF THE PIN — and it was WRONG twice before this correction (#3168 re-review
 #     finding 2), so state it exactly: THIS DIFF ANCHORS **NO** SITE in the recorder.
 #     All four `grep -qxF` sites are ALREADY anchored on main
-#     (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
-#     → :1939 :3643 :5956 :6068) and the same four are at head
-#     (`grep -n 'grep -qxF' scripts/record-review.sh` → :2003 :3729 :6056 :6201):
-#     the only diff hunk at `post_marker()` (:1995-2005) ADDS A COMMENT — the
-#     predicate line beside it is CONTEXT, not a change.
+#     (`git show bd1b205d:scripts/record-review.sh | grep -n 'grep -qxF'` — the sha is NAMED because
+#     `origin/main` moves and a bare "main :NNNN" rots the moment it does
+#     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
+#     same four PREDICATE sites are at head
+#     (`grep -n 'grep -qxF' scripts/record-review.sh` → :2546 :4272 :6625 :6770, plus a comment
+#     mention at :2415): the only diff hunk at `post_marker()` (:2524) ADDS A COMMENT — the
+#     predicate line beside it (:2546) is CONTEXT, not a change.
 #     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
-#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`, main :4643 / head :6056). It is a
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`, bd1b205d :6501 / head :6625). It is a
 #     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
 #     main-regression pin for the same reason. Keeping them is right (main's
 #     anchoring should not silently regress); calling them evidence about this diff
@@ -5394,8 +5396,9 @@ assert_eq "$RECORD_RC" "5" "14.1d …but a comment that did NOT land is still a 
 assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and does not claim an ABSENCE it cannot know (a previous run's comment may carry it)"
 # ⛔ THE RETIRED PHRASINGS BELONG TO *THIS* ARM, NOT THE PATCH ARM (#3168 review
 #    cycle 4). "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message
-#    (`git show origin/main:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
-#    → :4630), so pinning its absence against the PATCH arm's stderr (14.10a3)
+#    (`git show bd1b205d:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
+#    → :6483 — the sha is NAMED because `origin/main` moves and a bare "main :NNNN" rots), so pinning
+#    its absence against the PATCH arm's stderr (14.10a3)
 #    guarded an arm the phrase was never in — restoring it HERE kept the suite GREEN
 #    (measured). The assertions above prove this variable is populated before these
 #    negatives run, so none of them can pass on an empty capture.
@@ -5409,7 +5412,7 @@ assert_not_contains "$RECORD_ERR" "already admits the evidence" \
     "14.1d …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
 # 14.1d(h) ⛔ THE EXIT-5 NOUN (#3168 re-review, latest comment, P2). Both exit-5
 #      messages said "the signed marker" — but BOTH arms are reachable with
-#      `MARKER_SIGNED=0` (:4831-4834: no gate key warns and CONTINUES), so the
+#      `MARKER_SIGNED=0` (:6537-6549: no gate key warns and CONTINUES), so the
 #      adjective named a property those bytes need not have. These
 #      two vectors drive that exact conjunction (key unset + a refused body GET / a
 #      refused body PATCH) and are placed HERE, inside §14, because a fresh CLEAN
@@ -5440,6 +5443,45 @@ assert_contains "$RECORD_ERR" "the marker for daniel-ospina/agent-infra#$UNC_PR2
     "14.1d(h) …its exit-5 message still names the marker (capture is live)"
 assert_not_contains "$RECORD_ERR" "the signed marker for daniel-ospina/agent-infra#$UNC_PR2 could NOT be PATCHed" \
     "14.1d(h) …and does NOT call it 'the signed marker' on the PATCH-failure arm either"
+
+# 14.1d(i) ⛔ THE PERSIST RESULT DECIDES THE REMEDY (#3168 review P2). The exit-0
+#      message used to assert the marker "is also kept in <pending file>" — and to
+#      offer `--flush-pending` as the remedy — even when the persist ABOVE it had just
+#      failed and warned that that remedy "WILL FIND NOTHING". Two sentences in one
+#      arm cannot both be true, and the one an operator ACTS on is the remedy.
+#      Reaching the persist-failure sub-path needs the pending DIRECTORY to be
+#      un-makeable: a regular FILE is put where the directory belongs, so the
+#      `mkdir -p` inside `marker_pending_write` fails. BOTH body-read arms are
+#      driven here (comment landed ⇒ exit 0; comment failed too ⇒ exit 5), because
+#      both used to print the same unconditional claim.
+#      RED pre-fix: every `assert_not_contains` below, on a capture the
+#      `assert_contains` beside it proves is live.
+PEND_CONF_DIR="$F_HOME/.pi/agent/reviews"
+mkdir -p "$PEND_CONF_DIR"
+rm -rf "$PEND_CONF_DIR/pending"     # earlier vectors left a real DIRECTORY here
+: > "$PEND_CONF_DIR/pending"        # a FILE where the pending DIR must be
+PERSIST_PR=424362
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' \
+    run_record_633 "$PERSIST_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "0" \
+    "14.1d(i) a persist-FAILED body-read run whose comment landed is still a success (rc 0) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "could NOT persist the pending marker" \
+    "14.1d(i) …the failed persist is reported (positive-first: the capture is live)"
+assert_not_contains "$RECORD_ERR" "The marker is also kept in" \
+    "14.1d(i) …and the exit-0 message does NOT claim the marker is on disk — the 'NOT ON DISK' branch fires instead"
+assert_contains "$RECORD_ERR" "THE BODY COPY IS ON NO CHANNEL AND NOT ON DISK" \
+    "14.1d(i) …naming the real state and pointing at the reproduced bytes, not at a flush that would find nothing"
+PERSIST_PR2=424363
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FAIL=1 \
+    run_record_633 "$PERSIST_PR2" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(i) …and with the comment failing too the arm is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_not_contains "$RECORD_ERR" "The marker is kept in" \
+    "14.1d(i) …whose exit-5 message does NOT offer --flush-pending as a remedy for bytes that were never persisted"
+assert_contains "$RECORD_ERR" "NOTHING IS ON DISK EITHER" \
+    "14.1d(i) …but names the real state instead"
+rm -f "$PEND_CONF_DIR/pending"
+mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body was the only copy of the verdict that

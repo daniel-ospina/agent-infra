@@ -3797,7 +3797,7 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   # a tier chosen from a list that may be incomplete.
   #
   # The count is over the NEW path only, exactly as clean_low_shape_ok counts it
-  # (its DISTINCT `$2` count, :548) — GitHub counts a rename as ONE changed file while the compare row
+  # (its DISTINCT `$2` count — `:643` here, `:634` on origin/main; re-derive with `grep -n '^  count="$(printf' scripts/record-review.sh`) — GitHub counts a rename as ONE changed file while the compare row
   # carries the old path too, so counting both ends would report truncation for
   # any diff containing a rename. The CLASSIFICATION below still reads BOTH ends
   # (a rename out of a rail must not slip through); only the parity arithmetic is
@@ -5793,7 +5793,8 @@ fi
 #           "review evidence posted to … as a durable comment"
 #
 # Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
-# reviewer ran — delta mode REFUSES --evidence, :1590), the prior record's
+# reviewer ran — delta mode REFUSES --evidence, `:2837` here / `:2761` on origin/main; re-derive
+# with `grep -n 'delta re-binds the record' scripts/record-review.sh`), the prior record's
 # `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
 # and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
 # because that gate is keyed on `VERDICT = clean`, and `clean-micro`/`clean-low`
@@ -6564,9 +6565,25 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     #     comment arm) and this run is a success.
     # Exit 5 is therefore named for the state that actually remains: the marker
     # reached NEITHER channel, so CI cannot see the record.
-    marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy this arm prints below WILL FIND NOTHING and will report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
+    # ⛔ ONE PERSIST RESULT DECIDES EVERY SENTENCE BELOW THAT OFFERS THE FLUSH REMEDY
+    # (#3168 review P2). The exit-0 message used to assert the marker "is also kept in
+    # <pending file>" UNCONDITIONALLY — printed three lines after THIS site's own
+    # warning that a failed persist means the bytes are NOT on disk and that
+    # `--flush-pending` "WILL FIND NOTHING and will report success". Two sentences in
+    # one arm cannot both be true, and the one an operator ACTS on is the remedy, so
+    # the result is captured here and both remedy sentences branch on it.
+    BODY_READ_PERSISTED=1
+    marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || { BODY_READ_PERSISTED=0
+    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy this arm prints below WILL FIND NOTHING and will report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
+    }
     if post_review_evidence_comment "$MARKER" "$REPO" "$PR"; then
-      echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. The marker is also kept in $(marker_pending_file "$REPO" "$PR") for the body copy: record-review.sh --flush-pending $PR $REPO (idempotent, no new review)." >&2
+      if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
+        echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. The marker is also kept in $(marker_pending_file "$REPO" "$PR") for the body copy: record-review.sh --flush-pending $PR $REPO (idempotent, no new review)." >&2
+      else
+        # ⛔ NO PENDING-FILE CLAIM WHEN THE PERSIST FAILED: the remedy offered here
+        # is the one the persist warning above just said would find nothing.
+        echo "⚠️ record-review: could not read the PR body of $REPO#$PR (transient API failure / throttled token), so the BODY marker was NOT posted — but the #1224 evidence COMMENT WAS, and that is the copy the required check reads on a runner with no record store. The signed record at $FILE is unaffected. ⛔ THE BODY COPY IS ON NO CHANNEL AND NOT ON DISK: the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable (the durable comment is already the admitted evidence, so what is owed is the body copy and the 'edited' re-trigger, not the verdict)." >&2
+      fi
       exit 0
     fi
     # ⛔ THE DIAGNOSIS MUST MATCH WHAT HAPPENED (review round 2 finding 5). With
@@ -6580,7 +6597,14 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     fi
     # ^ Whether that remedy can find anything is decided by the persist warning ABOVE: if it
     #   appeared, nothing is on disk and `--flush-pending` answers "nothing pending" over lost bytes.
-    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (⛔ this line does NOT assert WHICH cause — the error text is discarded, so a transient API failure, a throttled token and a permanent 404 all land here), and $_unposted_why — the record is saved but CI CANNOT SEE IT. The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers it WITHOUT a new review." >&2
+    #   Since #3168 review P2 the line SAYS which of the two happened instead of leaving the
+    #   operator to reconcile two contradictory sentences.
+    if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
+      _unposted_remedy="The marker is kept in $(marker_pending_file "$REPO" "$PR") and a later: record-review.sh --flush-pending $PR $REPO — delivers it WITHOUT a new review."
+    else
+      _unposted_remedy="⛔ NOTHING IS ON DISK EITHER — the ⚠️ body-marker persist line above says the pending file could NOT be written, so --flush-pending would find NOTHING and would answer 'nothing pending' over lost bytes. That line reproduces the marker between its >>> markers — paste it into the PR body by hand once gh is reachable."
+    fi
+    echo "⛔ body-marker-unposted: could not read the PR body of $REPO#$PR (⛔ this line does NOT assert WHICH cause — the error text is discarded, so a transient API failure, a throttled token and a permanent 404 all land here), and $_unposted_why — the record is saved but CI CANNOT SEE IT. $_unposted_remedy" >&2
     exit 5
   fi
   # Idempotent append — post even when the body is EMPTY (an empty body must
