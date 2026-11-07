@@ -951,9 +951,15 @@ cost (pi-cell-4, 2026-10-29): `examined=52 classified=52 remove=0 preserved=52`,
 at **0 bytes free**, both repair loops at `cap: 0`, no cell able to dispatch for ~13 h;
 an operator then reclaimed 62 clean checkouts (7.7 GB) by hand, losing no commits.
 
-So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when a
-bounded `git ls-remote --heads <remote> refs/heads/<branch>` answers with **exactly this
-HEAD sha**. The advertised refname is matched literally and exactly once (⚠️ because `ls-remote`
+So a tip held only by `refs/remotes/<remote>/<branch>` is remove-eligible **only** when the
+remote advertises **exactly this HEAD sha** at that branch. The remote's own `refs/heads/*` are
+read by ONE bounded `git ls-remote --heads <remote>` **per remote per pass** (#3371) and cached for
+that pass, so the cost no longer grows with the number of candidates: a targeted probe is one
+network round trip each, which is what made a large `remote-only-ref` population unable to finish a
+pass (measured on cmux/cell-3, 2026-11-07: 0.55 s per targeted probe, 7.5 s for 12 candidates,
+versus 0.55 s for the remote's whole 2,111-head advertisement). The cached advertisement is the same
+evidence — the remote's advertised heads at one instant, a superset of any single targeted answer —
+and the advertised refname is still matched literally and exactly once against it (⚠️ because `ls-remote`
 matches a pattern against the ref's **tail, from any slash separator**, so `refs/heads/<b>` also selects
 an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
 rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
