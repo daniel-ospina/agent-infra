@@ -250,7 +250,7 @@ case "$_rc" in
         # delegated, so a sibling that is present but will not LOAD answers nothing — and this branch
         # used to call that "not an owner/name slug", sending an operator who had already done everything
         # right at the wrong defect. `norm` carries the sentinel for exactly this.
-        _why_not="PR_DOCTOR_REPO='$_seam' could not be normalised: the sibling pr-doctor.py is present but does not LOAD, or no python3 resolves"
+        _why_not="PR_DOCTOR_REPO='$_seam' could not be normalised: the sibling pr-doctor.py is present but lacks or raises _normalize_slug, or no python3 resolves"
         _seam_n=""
       elif [ -z "$_seam_n" ]; then
         _why_not="PR_DOCTOR_REPO='$_seam' is not an owner/name slug"
@@ -272,7 +272,7 @@ case "$_rc" in
       _decided=1
       _or_n="$(_rs_normalize_slug "$_or")"
       if [ "$_or_n" = "__UNASKABLE__" ]; then
-        _why_not="OR='$_or' could not be normalised: the sibling pr-doctor.py is present but does not LOAD, or no python3 resolves"
+        _why_not="OR='$_or' could not be normalised: the sibling pr-doctor.py is present but lacks or raises _normalize_slug, or no python3 resolves"
         _or_n=""
       elif [ -z "$_or_n" ]; then
         _why_not="OR='$_or' is not an owner/name slug"

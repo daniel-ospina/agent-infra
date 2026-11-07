@@ -673,7 +673,19 @@ elif verb == "tags":
     except Exception:
         sys.stdout.write("__UNASKABLE__")
 elif verb == "norm":
-    sys.stdout.write(mod._normalize_slug(arg))
+    # ⛔ A MISSING OR RAISING `_normalize_slug` MUST NOT LOOK LIKE "NOT A SLUG" (round 29, P2). The
+    # `tags` guard above covers only its own verb; this one had none, so a sibling that LOADS but
+    # predates the helper raised AttributeError AT CALL TIME, stdout was suppressed, and every caller
+    # read "" as the MEANINGFUL answer "not a slug". Measured with a sibling that loads and simply
+    # lacks the function: a VALID `OR=daniel-ospina/agent-infra` made the wrapper print "is not an
+    # owner/name slug" and refuse (rc 2), sending the operator to fix a slug that was already right;
+    # and `slug=acme/alpha.git` over a checkout proving `acme/alpha` was REFUSED, undoing round 25's
+    # normalisation fix. Reachable via a stale farmed sibling — the class `check-farm-drift.sh` exists
+    # for — and fail-closed, which is why it is a diagnosis defect rather than a false pass.
+    try:
+        sys.stdout.write(mod._normalize_slug(arg))
+    except Exception:
+        sys.stdout.write("__UNASKABLE__")
 else:
     slug, why = mod._origin_slug(arg)
     sys.stdout.write(("%s\t" % slug) if slug else ("\t%s" % why))
@@ -892,10 +904,23 @@ repo_set_check() {
       # "reader refuses a pass the doctor runs" class. An unnormalisable answer (sentinel or empty)
       # falls back to the raw slug, i.e. the previous behaviour, so an unaskable sibling changes
       # nothing here.
-      local slug_n
+      local slug_n norm_why=""
       slug_n="$(_rs_normalize_slug "$slug")"
-      case "$slug_n" in ''|'__UNASKABLE__') slug_n="$slug" ;; esac
-      if [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug_n")" ]; then
+      case "$slug_n" in
+        ''|'__UNASKABLE__')
+          # ⛔ AN UNNORMALISABLE DECLARED SLUG MAKES THE COMPARISON UNPROVEN, SO IT WARNS (round 29, P2).
+          # The proof says `acme/alpha`; the declared slug is `acme/alpha.git`; without normalisation we
+          # cannot tell "same repo, different spelling" from "different repo" — and "only a PROVEN fault
+          # refuses" is a recorded decision in this file. Falling back to a RAW comparison refused the
+          # `.git` case, undoing round 25's fix in exactly the state (a loadable-but-stale sibling) it
+          # was most likely to be needed. Measured before: that pair printed `REFUSED … is a checkout of
+          # acme/alpha, not acme/alpha.git` — a false proof claim.
+          norm_why="the declared slug could not be normalised (the sibling pr-doctor.py lacks _normalize_slug, or it raised), so whether this checkout proves it is UNPROVEN"
+          slug_n="$slug" ;;
+      esac
+      if [ -n "$norm_why" ]; then
+        printf 'repo-set: WARN CHECKOUT-UNVERIFIED — %s: `%s` proves %s; %s\n' "$slug" "$checkout" "$proof" "$norm_why"
+      elif [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug_n")" ]; then
         problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
       fi
     else

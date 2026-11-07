@@ -975,8 +975,7 @@ python3 - "$READER" "$M4/lib/repo-set.sh" <<'PYD'
 import sys
 src, dst = sys.argv[1], sys.argv[2]
 t = open(src).read()
-old = '''      slug_n="$(_rs_normalize_slug "$slug")"
-      case "$slug_n" in ''|'__UNASKABLE__') slug_n="$slug" ;; esac'''
+old = '      slug_n="$(_rs_normalize_slug "$slug")"'
 assert t.count(old) == 1, "the provenance normalisation moved; the mutation cannot be expressed"
 open(dst, "w").write(t.replace(old, '      slug_n="$slug"'))
 PYD
