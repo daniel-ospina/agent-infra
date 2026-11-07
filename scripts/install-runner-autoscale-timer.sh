@@ -42,9 +42,11 @@
 #
 # ⛔ WHAT THIS INSTALLER REFUSES (each would otherwise install a unit that cannot run, or one that
 # silently converges nothing):
-#   * a script path that is not a regular readable file, or one inside a `mktemp` scratch tree (the
-#     measured inert-enforcer: a unit pointing into a directory deleted before the first tick exits 127
-#     on EVERY pass while `list-timers` shows the job scheduled and healthy);
+#   * a script path that is not a regular readable file, or one inside LANE SCRATCH — a `mktemp` tree,
+#     or the repo's own lane-checkout shapes (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`,
+#     `/tmp/base-*`; the same set `scripts/install-repair-service.sh` enforces, #2697). The measured
+#     inert-enforcer: a unit pointing into a directory deleted before the first tick exits 127
+#     on EVERY pass while `list-timers` shows the job scheduled and healthy;
 #   * an interpreter older than 3.12 — the pass refuses itself with exit 2, so the unit would be red
 #     from its first tick for a reason the installer already knew;
 #   * a `--repo` that is not a plain `owner/name` (it is interpolated into the unit's command line);
@@ -197,14 +199,19 @@ is_absolute_path() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
 # /tmp/cell-ai, and refusing those would be a false block on the real target. What is transient by
 # CONSTRUCTION is the `tmp.` + random-suffix name, which is what leaked into the units — PLUS the
 # fleet's own lane-worktree layout (#3469 review).
-# ⛔ THE LANE-WORKTREE LAYOUT IS THE SECOND TRANSIENT SHAPE BY CONSTRUCTION, and it is named in this
-# repo as a defect rather than hypothesized: `templates/systemd/eldato-pr-repair.service:91` records
-# `/tmp/wt-<issue>-<slug>` as the shape a passer-by creates and the reaper removes. Before this change
-# the predicate matched only `mktemp`'s `tmp.????`, so a lane worktree sailed through — and once
-# `tools/install-ci-runner-x64.sh` exists (#3469) such a tree RESOLVES, so `--install` from it pinned a
-# path that is deleted with the lane. The old behaviour was a LOUD failure ("resolves nothing … it can
-# never ADD capacity"); that would have become a silent, doomed pin. See `resolve_provisioner`, which
-# SKIPS such a candidate instead of pinning it, so this is a repair and not a new false block.
+# ⛔ THE LANE-WORKTREE LAYOUT IS THE SECOND TRANSIENT SHAPE BY CONSTRUCTION, and rather than invent a
+# new definition of it this predicate adopts the one this repo ALREADY enforces: the sibling guard
+# `scripts/install-repair-service.sh` refuses to render a unit whose ExecStart lives under
+# `*/.worktrees/* | /tmp/wt-* | /tmp/cell-wt-* | /tmp/base-*` (#2697 — "a unit exec'd from it dies
+# when that lane's worktree is reaped"), and `templates/systemd/eldato-pr-repair.service:91` records
+# `/tmp/wt-<issue>-<slug>` as the measured shape. A provisioner pin has exactly the same fate. Two
+# different definitions of "lane scratch" in one repo would be a second answer to one question, so
+# this is the SAME set. Before this change the predicate matched only `mktemp`'s `tmp.????`, so a lane
+# worktree sailed through — and once `tools/install-ci-runner-x64.sh` exists (#3469) such a tree
+# RESOLVES, so `--install` from it pinned a path that is deleted with the lane. The old behaviour was a
+# LOUD failure ("resolves nothing … it can never ADD capacity"); that would have become a silent,
+# doomed pin. See `resolve_provisioner`, which SKIPS such a candidate instead of pinning it — skipped,
+# not refused, so this is a repair and not a new false block on a lane-worktree install.
 is_transient_scratch() { # is_transient_scratch <path>
     # ⛔ NORMALISE FIRST. macOS sets TMPDIR with a TRAILING SLASH, so `mktemp -d` yields a DOUBLE slash,
     # and a naive prefix test misses the exact install this guard exists to refuse.
@@ -213,14 +220,21 @@ is_transient_scratch() { # is_transient_scratch <path>
     p="$(printf '%s' "$p" | tr -s '/')"
     case "$p" in
         /tmp/tmp.?*|/var/tmp/tmp.?*|/private/tmp/tmp.?*|/private/var/tmp/tmp.?*) return 0 ;;
-        # The fleet's lane-worktree layout (`/tmp/wt-<issue>-<slug>`), which the reaper removes along
-        # with the lane. Anchored on the `/tmp/` prefix and the `wt-` segment so a durable sibling
-        # (`/tmp/cell-ai/.worktrees/…`, a real checkout) is NOT matched. (case is a glob, not a
-        # regex, so `wt-` is literal and `*` stops at `/` only by the explicit patterns below.)
+        # The repo's canonical LANE-SCRATCH set, adopted verbatim from
+        # scripts/install-repair-service.sh (#2697) rather than re-invented here. Anchored on
+        # `/tmp/` + `wt-`/`cell-wt-`/`base-` and on the `/.worktrees/` component, so a durable
+        # sibling (`/tmp/cell-ai`, `/tmp/cell-home`) is NOT matched — a cell legitimately runs with
+        # HOME=/tmp/cell-home and checkouts under /tmp/cell-ai, and refusing those would be a false
+        # block on the real target.
+        */.worktrees/*) return 0 ;;
         /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
+        /tmp/cell-wt-?*|/var/tmp/cell-wt-?*|/private/tmp/cell-wt-?*|/private/var/tmp/cell-wt-?*) return 0 ;;
+        /tmp/base-?*|/var/tmp/base-?*|/private/tmp/base-?*|/private/var/tmp/base-?*) return 0 ;;
         # macOS's OWN temp root is /var/folders/<a>/<b>/T/ — NOT /tmp — so it must be named.
         /var/folders/*/*/T/tmp.?*|/private/var/folders/*/*/T/tmp.?*) return 0 ;;
         /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
+        /var/folders/*/*/T/cell-wt-?*|/private/var/folders/*/*/T/cell-wt-?*) return 0 ;;
+        /var/folders/*/*/T/base-?*|/private/var/folders/*/*/T/base-?*) return 0 ;;
     esac
     for t in "${TMPDIR:-}"; do
         [ -n "$t" ] || continue
@@ -451,7 +465,7 @@ resolve_provisioner() {
         # "can never ADD capacity" warning (`warn_provisioner_reach`) — i.e. the pre-#3469 behaviour,
         # which is the correct one.
         if is_transient_scratch "$cand"; then
-            err "note: skipping TRANSIENT PROVISIONER CANDIDATE $cand (a tree the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
+            err "note: skipping TRANSIENT PROVISIONER CANDIDATE $cand (a lane-scratch tree the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
             continue
         fi
         PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0

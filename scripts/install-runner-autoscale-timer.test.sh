@@ -416,6 +416,22 @@ OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "a /tmp/wt-<issue>-<slug> lane worktree is refused as transient (rc 1)"
 assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
     "and the lane-worktree refusal names the same class, not a scheduler problem"
+# ⛔ AND THE *OTHER* LANE CHECKOUT SHAPE THE REPO ALREADY NAMES. `scripts/install-repair-service.sh`
+# refuses a unit exec'd from `*/.worktrees/* | /tmp/wt-* | /tmp/cell-wt-* | /tmp/base-*` (#2697), and
+# this predicate adopts that set rather than inventing a second definition of "lane scratch". The
+# `.worktrees/` shape is the one this repo's own worktree tooling creates, so it gets its own arm: a
+# predicate that covers one shape and not the other is exactly the kind of partial guard this suite
+# exists to catch. (Placed under $T so it matches ONLY the `*/.worktrees/*` alternative, not `/tmp/wt-*`.)
+WT2="$T/.worktrees/lane"
+mkdir -p "$WT2/.pi/agent/scripts" "$WT2/.pi/agent/state"
+cp "$T/home/converger.py" "$WT2/.pi/agent/scripts/"
+ENVV=(HOME="$WT2" RUNNER_AUTOSCALE_SCRIPT="$WT2/.pi/agent/scripts/converger.py"
+      RUNNER_AUTOSCALE_STATE_DIR="$WT2/.pi/agent/state" RUNNER_AUTOSCALE_ARM_FILE="$WT2/arm"
+      SUDO=false)
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 1 "a */.worktrees/<lane> checkout is refused as transient (rc 1)"
+assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
+    "and that refusal names the same class as the /tmp/wt-* arm"
 
 # ── T6: an old interpreter is refused ─────────────────────────────────────────────────────
 say_case "T6 an interpreter older than 3.12 is refused"

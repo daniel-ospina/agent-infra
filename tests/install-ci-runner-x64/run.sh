@@ -76,10 +76,50 @@ EOF
   printf '%s\n' "$body"
 }
 
-# fake_pool_wedge <rc> — a pool tool that leaves the DIRECTORY on disk with NO `.runner`: the
-# `.runner`-less leftover `_next_free_slot` counts FREE while every pool verb refuses it.
-fake_pool_wedge() {
-  local rc=$1 body=$TMP/fake-pool-wedge.sh
+# fake_pool_preclaimed <rc> — the pool's rc-4 PRE-CLAIM gate (`name-unavailable … already exists (a
+# file, a symlink, or a directory without a .runner registration) — clear it or pick another name`).
+# ⛔ It does NOT create anything: the wedge is the directory that was ALREADY there before the call, so
+# the caller must create it first. (A fixture that creates it during the call models the RACE, not the
+# wedge — the adapter separates them by whether the path existed before, and it should.)
+fake_pool_preclaimed() {
+  local rc=$1 body=$TMP/fake-pool-preclaimed.sh
+  cat > "$body" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/calls.log"
+name=""
+while [ \$# -gt 0 ]; do case "\$1" in --name) shift; name="\${1:-}" ;; esac; shift; done
+[ -n "\$name" ] || { printf 'fake: no --name on argv\n' >&2; exit 99; }
+printf 'name-unavailable name=%s path=%s/\$name already exists (a file, a symlink, or a directory without a .runner registration) — clear it or pick another name\n' "\$name" "\$RUNNER_ROOT" >&2
+exit $rc
+EOF
+  chmod +x "$body"
+  printf '%s\n' "$body"
+}
+
+# fake_pool_registered_dead — the pool's OTHER rc-2 arm, quoted from `scripts/ci_runner_pool.sh::add`:
+# `config.sh` wrote `.runner` (the registration EXISTS), then `start_listener` failed, so it prints
+# `registered=1 listener=dead … run: restart --name …` and returns 2. "Nothing was attempted" and
+# "nothing was added" are both FALSE about this state.
+fake_pool_registered_dead() {
+  local body=$TMP/fake-pool-regdead.sh
+  cat > "$body" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$*" >> "$TMP/calls.log"
+name=""
+while [ \$# -gt 0 ]; do case "\$1" in --name) shift; name="\${1:-}" ;; esac; shift; done
+[ -n "\$name" ] || { printf 'fake: no --name on argv\n' >&2; exit 99; }
+mkdir -p "\$RUNNER_ROOT/\$name" && : > "\$RUNNER_ROOT/\$name/.runner"
+printf 'registered=1 listener=dead name=%s dir=%s/\$name — the registration is in place; run: restart --name %s\n' "\$name" "\$RUNNER_ROOT" "\$name" >&2
+exit 2
+EOF
+  chmod +x "$body"
+  printf '%s\n' "$body"
+}
+
+# fake_pool_race — the pool's rc-4 mkdir-race arm (`… appeared while this add ran (another pass took
+# it) — use restart`): the directory appears DURING the add and the peer may be registering it now.
+fake_pool_race() {
+  local body=$TMP/fake-pool-race.sh
   cat > "$body" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> "$TMP/calls.log"
@@ -87,8 +127,8 @@ name=""
 while [ \$# -gt 0 ]; do case "\$1" in --name) shift; name="\${1:-}" ;; esac; shift; done
 [ -n "\$name" ] || { printf 'fake: no --name on argv\n' >&2; exit 99; }
 mkdir -p "\$RUNNER_ROOT/\$name"
-printf 'name-unavailable name=%s path=%s already exists (a file, a symlink, or a directory without a .runner registration) — clear it or pick another name\n' "\$name" "\$RUNNER_ROOT/\$name" >&2
-exit $rc
+printf 'name-unavailable name=%s path=%s/\$name appeared while this add ran (another pass took it) — use restart\n' "\$name" "\$RUNNER_ROOT" >&2
+exit 4
 EOF
   chmod +x "$body"
   printf '%s\n' "$body"
@@ -215,16 +255,43 @@ else
   bad "precondition: the raced slot really carries .runner"
 fi
 
-# 18. ⛔ BUT rc 4 WITH NO `.runner` IS A WEDGE, NOT A FAILURE: `_next_free_slot` tests only `.runner`,
-# so it asks for this same index forever while `add`/`reclaim` refuse the path and `reconcile` never
-# enumerates it. Nothing repairs it automatically, so it is reported as a REFUSAL naming the path to
-# clear (exit 2 -> ProvisionerRefused) instead of an action-failed every ten minutes.
-out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_wedge 4) bash "$SUT" --count 5 --fallback auto 2>&1); rc=$?
-check "rc 4 without .runner is a REFUSAL, not a failure" 2 "$rc" "guard-refused" "$out"
+# 18. ⛔ BUT rc 4 WITH NO `.runner` ON A PATH THAT WAS ALREADY THERE IS A WEDGE, NOT A FAILURE:
+# `_next_free_slot` tests only `.runner`, so it asks for this same index forever while `add`/`reclaim`
+# refuse the path and `reconcile` never enumerates it. Nothing repairs it automatically, so it is
+# reported as a REFUSAL naming the path to clear (exit 2 -> ProvisionerRefused) instead of an
+# action-failed every ten minutes. The leftover exists BEFORE the call — that is the fact separating
+# it from the race in case 20, and creating it here is the whole arrangement.
+mkdir -p "$RUNNER_ROOT/gh-runner-x64-5"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 5 --fallback auto 2>&1); rc=$?
+check "rc 4 on a PRE-EXISTING path without .runner is a REFUSAL" 2 "$rc" "guard-refused" "$out"
 check "…naming the wedged path to clear" 0 0 "rm -rf '$RUNNER_ROOT/gh-runner-x64-5'" "$out"
 case "$out" in
   *added=1*) bad "a wedged slot never claims to have provisioned";;
   *) ok "a wedged slot never claims to have provisioned";;
+esac
+
+# 19. ⛔ rc 2 IS NOT ONLY "nothing attempted". The pool returns 2 from `add` in TWO states, and one of
+# them is a SUCCESS with a defect: after `config.sh` wrote `.runner` the registration EXISTS and only
+# `start_listener` failed (`registered=1 listener=dead … run: restart --name …`,
+# scripts/ci_runner_pool.sh::add). Mapping that to a refusal made this file print "nothing further
+# attempted" and the caller record `nothing was added` about a registration that is in the pool.
+: > "$TMP/calls.log"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_registered_dead) bash "$SUT" --count 6 --fallback auto 2>/dev/null); rc=$?
+check "rc 2 WITH .runner is a registration, not a refusal" 0 "$rc" \
+  "provisioned slot=6 name=gh-runner-x64-6 root=$RUNNER_ROOT added=1 skipped=0 listener=dead" "$out"
+check "…and the dead listener the pool names is in the record" 0 0 "listener=dead" "$out"
+
+# 20. ⛔ rc 4 WITH NO `.runner` IS TWO FACTS, AND THE REMEDY DIFFERS. Both are refusals (exit 2), but a
+# path that PRE-EXISTED is a wedge a human must clear, while a path that APPEARED during the call is a
+# peer that won the race and may be registering it right now. Printing `rm -rf` for the race would tell
+# an operator to delete a registration in progress.
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_race) bash "$SUT" --count 7 --fallback auto 2>&1); rc=$?
+check "rc 4 race (path appeared during the call) is a refusal" 2 "$rc" "guard-refused" "$out"
+check "…naming the RACE, not a wedge" 0 0 "another pass took this slot while this add ran" "$out"
+check "…and offering the pool's own restart" 0 0 "restart --name gh-runner-x64-7" "$out"
+case "$out" in
+  *"rm -rf"*) bad "the race must NEVER prescribe rm -rf over a peer's in-progress registration";;
+  *) ok "the race does not prescribe rm -rf over a peer's in-progress registration";;
 esac
 
 printf '\n%s\n' "install-ci-runner-x64: pass=$pass fail=$fail"

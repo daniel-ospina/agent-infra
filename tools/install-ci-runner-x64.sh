@@ -6,7 +6,8 @@
 #   runner without one ("improvising a provisioner here is how a second, divergent registration path
 #   is born" — #9639). It looks for exactly this path (candidate 2 of `resolve_provisioner`, then
 #   PINNED into the unit's `Environment=` by `--install-unit`). The path was never committed — `git
-#   log --all -- '*install-ci-runner-x64.sh'` is empty — so on every box the add arm recorded
+#   log --all -- '*install-ci-runner-x64.sh'` was empty on `origin/main` — it returns only the
+#   commits of this very change — so on every box the add arm recorded
 #   `no provisioner` → action-failed on every pass where live < target, and the pool could only ever
 #   shrink back to whatever installs history left behind (measured 2026-11-05: agent-infra#3469,
 #   cells capped at 20-21 slots for 46 open PRs).
@@ -64,6 +65,14 @@
 #      file — mapping only 2 was the bug that recorded a correct memory-floor refusal from a box at
 #      its ceiling (the #3469 shape, the COMMON case) as a hard failure every pass. 5 stays a
 #      failure: a name that could not be registered is a thing the caller's repair path must see.
+#      ⛔ 2 IS NOT ONLY "nothing attempted". The pool returns 2 from `add` in TWO states, and one of
+#      them is a SUCCESS with a defect: after `config.sh` wrote `.runner` the registration EXISTS and
+#      only `start_listener` failed (`registered=1 listener=dead … run: restart --name …`,
+#      ci_runner_pool.sh). Mapping that to a refusal made this file print "nothing further attempted"
+#      and the caller record `nothing was added` about a registration that is in the pool. The
+#      discriminator is the caller's own occupancy predicate: rc 2 WITH `.runner` present → exit 0
+#      with `added=1 listener=dead` accounting (the pool's words already name the restart).
+#      rc 2 or 3 without it is a refusal, as below.
 #      ⛔ 4 IS TWO DIFFERENT FACTS AND IS SPLIT, because one of them is not a failure at all:
 #        · rc 4 AND the slot now holds `.runner` → the box CONVERGED (a peer pass took the same
 #          index, or a registration already existed). The caller asked for a slot that is now
@@ -72,12 +81,21 @@
 #          `<root>/gh-runner-x64-2/.runner` and exited 4, and the pass recorded action-failed
 #          although the runner existed. Two passes adding the same index is a REAL condition here —
 #          the caller takes no inter-pass lock and its own docs note passes racing.
-#        · rc 4 AND the path has no `.runner` → a WEDGE, not a failure: `_next_free_slot` counts
-#          only `.runner` as occupied, so it calls that path FREE and asks for the same index
-#          forever, while every pool verb refuses it (`add`, and `reclaim` too) and `reconcile`
-#          never enumerates it. Nothing repairs it automatically and the remedy is a human `rm -rf`.
-#          Reported as a REFUSAL naming the path to clear (exit 2), so the caller records an ANSWER
-#          instead of a failure on a 10-minute timer.
+#        · rc 4 with NO `.runner` → a refusal, and WHICH refusal depends on whether the path existed
+#          BEFORE this call, because the pool's two rc-4 branches differ exactly there:
+#            – the path pre-existed (`name-unavailable … already exists … clear it or pick another
+#              name`) → a permanent WEDGE: `_next_free_slot` counts only `.runner` as occupied, so
+#              it calls that path FREE and asks for the same index forever, while `add` and
+#              `reclaim` refuse it and `reconcile` never enumerates it. Nothing repairs it
+#              automatically and the remedy is a human `rm -rf`, so the message says so.
+#            – the path APPEARED while this add ran (`… appeared while this add ran (another pass
+#              took it) — use restart`) → a RACE WON BY A PEER, and a live peer may be mid-way
+#              through registering that very directory. ⛔ THE `rm -rf` GUIDANCE MUST NEVER BE
+#              PRINTED HERE — it would tell an operator to delete a registration in progress. The
+#              honest report is "another pass took this slot, retry next pass" plus the pool's own
+#              `restart --name`.
+#          Both are exit 2 (an ANSWER, so the caller records `provisioner-refused` instead of a
+#          failure on a 10-minute timer); only the diagnosis and the remedy differ.
 #
 #   `--fallback auto` is accepted and is the ONLY accepted value: it means "let ci_runner_pool.sh
 #   resolve its own template/kernel/arch", which is what it already does. Passing anything else is
@@ -190,6 +208,13 @@ fi
 
 args=(add --name "$NAME")
 [ "$DRY" -eq 1 ] && args+=(--dry-run)
+# ⛔ WHETHER THE PATH EXISTS IS THE ONLY HONEST DISCRIMINATOR between the pool's two rc-4 facts, and
+# it must be captured BEFORE the call: `add` creates the directory itself, so "it exists afterwards"
+# is true of both. A path that pre-existed is a wedge (`clear it`); a path that appeared during this
+# call is a peer that won a race (`retry next pass`). `-L` too, because the pool's own gate tests
+# `[ -e "$dir" ] || [ -L "$dir" ]` — a dangling symlink is a path an operator put there.
+DIR_EXISTED_BEFORE=0
+if [ -e "$DIR" ] || [ -L "$DIR" ]; then DIR_EXISTED_BEFORE=1; fi
 out=$(bash "$POOL_TOOL" "${args[@]}" 2>&1); rc=$?
 case "$rc" in
   0) ;;
@@ -197,6 +222,17 @@ case "$rc" in
        # gate verdict (memory floor, core-aware ceiling). Both are ANSWERS — propagate the refusal
        # WITH its reading, so the caller's record carries `why=memory-floor value=…`, not a bare rc,
        # and reports `provisioner-refused` instead of a failure on every 10-minute pass.
+       # ⛔ EXCEPT when `.runner` says the registration ALREADY HAPPENED: `add` returns 2 in that
+       # state too (`registered=1 listener=dead … run: restart --name …`), and calling it "nothing was
+       # attempted" is a false statement about a slot that is in the pool. The registration is the
+       # expensive half and it succeeded; the record must say `added=1` and name the dead listener so
+       # the caller's NEXT step repairs it, instead of a refusal it would sit on.
+       if [ -e "$DIR/.runner" ]; then
+         last=$(printf '%s' "$out" | tail -1 | cut -c1-90)
+         printf 'provisioned slot=%s name=%s root=%s added=1 skipped=0 listener=dead pool=%s\n' \
+           "$COUNT" "$NAME" "$RUNNER_ROOT" "$last"
+         exit 0
+       fi
        printf '%s\n' "$out" | tail -3 >&2
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing further attempted)"
        exit 2 ;;
@@ -209,10 +245,17 @@ case "$rc" in
          "$COUNT" "$NAME" "$RUNNER_ROOT"
        exit 0
      fi
-     # No `.runner`: the caller counts this path FREE forever while every pool verb refuses it, and
-     # nothing repairs it automatically. An ANSWER naming the path to clear, not a failure on a timer.
      printf '%s\n' "$out" | tail -3 >&2
-     err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR exists without a .runner registration, so runner_autoscale.py counts it FREE while every pool verb refuses it — clear it (rm -rf '$DIR') or name another slot"
+     if [ "$DIR_EXISTED_BEFORE" -eq 1 ]; then
+       # No `.runner`, and the path was ALREADY there before this call: the caller counts it FREE
+       # forever while every pool verb refuses it, and nothing repairs it automatically.
+       err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR already existed without a .runner registration, so runner_autoscale.py counts it FREE while every pool verb refuses it — clear it (rm -rf '$DIR') or name another slot"
+     else
+       # ⛔ A DIFFERENT FACT, AND IT MUST NOT CARRY THE `rm -rf` ABOVE: the directory APPEARED
+       # during this call, i.e. another pass won the mkdir race and may be registering it right now.
+       # Telling an operator to delete it would delete a registration in progress.
+       err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): another pass took this slot while this add ran — $DIR appeared during the call; retry on the next pass, or run: bash $POOL_TOOL restart --name $NAME"
+     fi
      exit 2 ;;
   *)   # rc 5 (this name could not be registered) and anything unexpected are real failures: the
        # caller's repair/reclaim path must see them, not a refusal it would sit on.
