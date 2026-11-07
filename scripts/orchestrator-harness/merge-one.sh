@@ -2017,8 +2017,10 @@ if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
   # `chain-merge.sh`'s case) all promise 83. That is a FALSE DIAGNOSIS of exactly the class this arm
   # exists to remove, and no test covered the exit value (the structural pins only assert ordering).
   # Every sibling arm in this file that PROPAGATES a code it does not declare uses the same tolerant form
-  # (`:1975`, the memory arm); the arms that exit their OWN codes exit literals (`:1927`, `:1946`, `:1989`),
-  # and that distinction is the rule — not "every arm here".
+  # (`:1975`, the memory arm); the arms that exit their OWN codes exit literals (`exit 75`, `exit 127`,
+  # `exit 80`), and that distinction is the rule — not "every arm here". Cited by their codes, not line
+  # numbers: this file is edited constantly and a line citation rots into a false claim (round-3 review of
+  # #3645 opened `:1927`/`:1946` and found a comment and an `if`, not exits).
   exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"
 fi
 # ⛔ THE ROUND IS SPENT **HERE**, AND THIS FILE IS ITS ONLY WRITER (#3441). It sits BELOW every
