@@ -2514,8 +2514,15 @@ $m"
     # `HEAD@{N}` IS no longer residual (the reason the fourteenth cycle gave for that "matching `{`
     # after a hex run would false-block a hex literal followed by a brace block" is FALSE: a reflog
     # position needs the `@` BEFORE the brace and `deadbeef{2}` has none); `@{upstream}` still is.
+    # ⛔ THE REFLOG TERM IS ANY BRACE TEXT, NOT JUST DIGITS (seventeenth review cycle, P1 — MEASURED
+    # at 059e1e0e4): `@\{[0-9]+\}` matched only a numeric position, so the SAME elder position written
+    # as a date escaped the arm entirely. In the fixture `HEAD@{1}`, `HEAD@{yesterday}` and
+    # `HEAD@{2.weeks.ago}` all resolve to the same elder commit, so `HEAD@{1}..HEAD` was refused (20h55)
+    # while `HEAD@{yesterday}..HEAD` recorded a SIGNED `clean` — one narrowing, two spellings, opposite
+    # verdicts. The term is now `@\{[^}]+\}`, which covers `{N}`, dated positions and `{upstream}`
+    # alike; `@{upstream}` is not a residual any more because it RESOLVES to a commit like any other.
     _tipscan="$_claim"; _tiprel=0
-    while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[0-9]+\})+) ]]; do
+    while [[ "$_tipscan" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})+) ]]; do
       _tref="${BASH_REMATCH[2]}"; _top="${BASH_REMATCH[3]}"
       _tipscan="${_tipscan#*"${BASH_REMATCH[0]}"}"
       _tisref=1
@@ -2532,7 +2539,13 @@ $m"
       [ "$_tisref" = 1 ] || continue
       # An IDENTITY-ONLY chain narrows nothing and must not be refused (20h53/20h53b) — but the test
       # is on the WHOLE chain, so the `continue` can no longer abandon the selector behind a peel.
-      [[ "$_top" =~ ^((~0|@\{0\}|\^0|\^\{[^}/]*\})+)$ ]] && continue
+      # ⛔ GIT'S OWN GRAMMAR, NOT A SPELLING LIST (seventeenth cycle, P2 — MEASURED at 059e1e0e4):
+      # `~0`/`^0`/`@{0}` were the identity but `~00`/`^00`/`@{00}` were not, although
+      # `git rev-parse HEAD^00^{commit}` returns HEAD like any identity. An honest artifact that merely
+      # NAMED one was refused with "RELATIVE TO THE TIP … always NARROWER", which is false about it —
+      # the false-block class this file's own doctrine calls worse than the gap. `0+` states the rule
+      # (a zero count is a zero count) instead of enumerating the spellings that happen to occur.
+      [[ "$_top" =~ ^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue
       case "$_tref" in
         [Hh][Ee][Aa][Dd]|@) _tiprel=1; break ;;
       esac
@@ -2549,8 +2562,17 @@ $m"
     # match, and the ordinary artifact states the HONEST range first — so a single match measured that
     # pair and stopped, and the empty range behind it was never resolved at all. The same "check every
     # occurrence" rule the parser arm above already carries, for the same reason.)
+    # ⛔ THE SEPARATOR IS `..` OR `...`, AND THE IDENTITY CHAIN INCLUDES `~0` (seventeenth cycle, two
+    # P1s — MEASURED at 059e1e0e4). (1) The chain here was `(\^0|\^\{[^}/]*\}|@\{0\})*` while the tip
+    # arm above treats `~0` as the identity, so `HEAD~0..HEAD` matched NO arm and an empty range at the
+    # attested head recorded a signed `clean` — the very payload this arm exists to refuse, and a
+    # direct contradiction of the comment below claiming no endpoint notation is privileged. (2) The
+    # separator was hardcoded `\.\.` while every other range reader in this file accepts `\.{2,3}`, so
+    # `HEAD^0...HEAD` and `HEAD...HEAD` were INVISIBLE to the only arm that can refuse an empty range.
+    # Both are the same lesson as the arm above: a guard that enumerates spellings instead of stating
+    # the grammar leaves a synonym outside it.
     _eranges="$_claim"
-    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((\^0|\^\{[^}/]*\}|@\{0\})*)[[:space:]]*\.\.[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
+    while [[ "$_eranges" =~ (^|[^0-9A-Za-z_])([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)((~0|\^0|\^\{[^}/]*\}|@\{0+\})*)[[:space:]]*\.{2,3}[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
       _elhs="${BASH_REMATCH[2]}${BASH_REMATCH[3]}"; _erhs="${BASH_REMATCH[5]}"
       _eranges="${_eranges#*"${BASH_REMATCH[0]}"}"
       case "${_elhs:0:4}" in

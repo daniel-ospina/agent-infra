@@ -9875,6 +9875,89 @@ I only actually reviewed HEAD^{commit}..HEAD; the rest was not read."
 assert_eq "$RECORD_RC" "3" "20h59b …and the same empty range written with a peel (rc 3)"
 assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h59b the peel does not launder an empty range either"
 [ -f "$(Q2 $EH78)" ] && bad "20h59b no record was written" || ok "20h59b no record was written"
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# 20h61+ THE SEVENTEENTH CYCLE: THE IDENTITY GUARD WAS A SPELLING LIST, AND ONE ARM READ A DIFFERENT
+#        GRAMMAR THAN THE ARM ABOVE IT. A fresh reviewer MEASURED four holes at 059e1e0e4, two of them
+#        re-opening the empty-range fail-open this feature exists to close — while the suite was
+#        PASS=1482 FAIL=0, because no vector spelled the shapes it missed.
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# 20h61 THE EMPTY-RANGE ARM'S LHS CHAIN OMITTED `~0` (P1). The tip arm treats `~0` as the identity;
+#       that arm's chain was `(\^0|\^\{...\}|@\{0\})*`, so `HEAD~0..HEAD` matched NO arm at all and an
+#       empty range at the attested head recorded a SIGNED `clean` — the exact payload this arm
+#       exists to refuse. MEASURED at 059e1e0e4: rc 0, record written.
+EH90=425300; rm -f "$(Q2 $EH90)"
+run_record_delta $EH90 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD~0..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h61 an EMPTY range spelled with \`~0\` on the left (HEAD~0..HEAD) is REFUSED (rc 3)"
+[ -f "$(Q2 $EH90)" ] && bad "20h61 FAIL-OPEN: HEAD~0..HEAD recorded a signed clean over an empty range — the LHS chain skipped the identity" || ok "20h61 no record was written"
+EH91=425302; rm -f "$(Q2 $EH91)"
+run_record_delta $EH91 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD^{commit}~0..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h61b …and the same identity behind a PEEL with \`~0\` (HEAD^{commit}~0..HEAD) (rc 3)"
+# 20h61c/20h61d THE SEPARATOR IS `..` OR `...` (P1). Every other range reader in this file accepts
+#       `\.{2,3}`; this arm hardcoded `\.\.`, so `...` was INVISIBLE to the only arm that can refuse an
+#       empty range. MEASURED at 059e1e0e4: `HEAD^0...HEAD` and `HEAD...HEAD` both rc 0, record written.
+EH92=425304; rm -f "$(Q2 $EH92)"
+run_record_delta $EH92 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD^0...HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h61c an empty range written with THREE dots (HEAD^0...HEAD) is REFUSED (rc 3)"
+[ -f "$(Q2 $EH92)" ] && bad "20h61c FAIL-OPEN: the three-dot separator hid an empty range from the only arm that can refuse it" || ok "20h61c no record was written"
+EH93=425306; rm -f "$(Q2 $EH93)"
+run_record_delta $EH93 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD...HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h61d …and with no chain at all (HEAD...HEAD) (rc 3)"
+EH94=425308; rm -f "$(Q2 $EH94)"
+run_record_delta $EH94 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD^{commit}...HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h61e …and behind a peel with three dots (HEAD^{commit}...HEAD) (rc 3)"
+# 20h62 THE REFLOG TERM WAS NUMERIC-ONLY (P1). `@\{[0-9]+\}` matched `@{1}` but not a DATED position,
+#       so the same elder commit written as a date escaped the arm — one narrowing, two spellings,
+#       opposite verdicts. MEASURED at 059e1e0e4: `HEAD@{1}..HEAD` rc 3 (20h55) while
+#       `HEAD@{yesterday}..HEAD` and `HEAD@{2.weeks.ago}..HEAD` recorded a SIGNED `clean`.
+EH95=425310; rm -f "$(Q2 $EH95)"
+run_record_delta $EH95 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD@{yesterday}..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h62 a narrowing written as a DATED reflog position (HEAD@{yesterday}) is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h62 …by the same meaning-based arm as HEAD@{1}"
+[ -f "$(Q2 $EH95)" ] && bad "20h62 FAIL-OPEN: the date spelling escaped the reflog term that catches the numeric one" || ok "20h62 no record was written"
+EH96=425312; rm -f "$(Q2 $EH96)"
+run_record_delta $EH96 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD@{2.weeks.ago}..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h62b …and a dated position with a unit (HEAD@{2.weeks.ago}) (rc 3)"
+# 20h63 THE IDENTITY TEST WAS STRICTER THAN GIT'S GRAMMAR (P2, a FALSE BLOCK). `~0`/`^0`/`@{0}` were
+#       the identity but `~00`/`^00`/`@{00}` were not, although git returns the SAME commit for them —
+#       so an honest artifact that merely NAMED one was refused with "RELATIVE TO THE TIP … always
+#       NARROWER", which is false about it: the false-block class this file calls worse than the gap.
+#       MEASURED at 059e1e0e4: rc 3, no record, for prose beside a CORRECT range.
+EH97=425314; rm -f "$(Q2 $EH97)"
+run_record_delta $EH97 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The base was re-checked with git rev-parse HEAD^00 before reading.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h63 a leading-zero identity (HEAD^00) is the IDENTITY git says it is — prose, not a narrowing (rc 0)"
+[ -f "$(Q2 $EH97)" ] || bad "20h63 the leading-zero false block survived — \`^00\` is not in the identity chain"
+EH98=425316; rm -f "$(Q2 $EH98)"
+run_record_delta $EH98 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The base was re-checked with HEAD~00 and the reflog position HEAD@{00} before reading.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h63b …and neither is \`~00\` or \`@{00}\` (rc 0)"
+[ -f "$(Q2 $EH98)" ] || bad "20h63b the leading-zero false block survived for ~00 / @{00}"
 # 20h60 THE OPERAND IS A TOKEN, NOT A COLLIDING SUBSTRING (P2). `rev-parse` as a SUFFICIENT test
 #       re-opened the prose false block the fifteenth cycle closed: ANY literal that collides with
 #       a commit prefix refused the artifact. MEASURED at 1f32d7571 with `LIT=${DG_BASE:0:4}`
@@ -10800,14 +10883,14 @@ mut_check "M43 the tip is resolved by the CANONICAL token, not the raw spelling"
 #       peel as a narrowing, which is 2aba1583a again: 20h53's `<sha>^{commit}` — this repo's OWN
 #       rev-parse spelling — is REFUSED. The skipped vector is the ACCEPTANCE half, which is the
 #       direction this rule alone decides.
-MUT="$(mk_mutant nopeelidentity '      [[ "$_top" =~ ^((~0|@\{0\}|\^0|\^\{[^}/]*\})+)$ ]] && continue' '      :')"
+MUT="$(mk_mutant nopeelidentity '      [[ "$_top" =~ ^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$ ]] && continue' '      :')"
 mut_check "M44 a peel/^0/@{0} chain is the IDENTITY, not a narrowing" 425266 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42526701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The base was verified with git rev-parse ${DG_BASE}^{commit} before reading.
 reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M45 — THE CHAIN, NOT ONE SELECTOR (sixteenth cycle, P1). Narrowing the selector group back to a
 #       SINGLE term is the shipped defect: `HEAD^{commit}~1` matches only `HEAD^{commit}` (the
 #       identity), the scan resumes at `~1` with no left operand, and the real narrowing is
 #       ACCEPTED again.
-MUT="$(mk_mutant noselectorchain ')((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[0-9]+\})+)' ')((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[0-9]+\}))')"
+MUT="$(mk_mutant noselectorchain ')((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\})+)' ')((~[0-9]*|\^\{[^}]*\}|\^[0-9]*|@\{[^}]+\}))')"
 mut_check "M45 a peel cannot hide the selector BEHIND it" 425282 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42528301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD^{commit}~1..HEAD; the rest was not read."
 # M46 — THE OPERAND IS A TOKEN (sixteenth cycle, P2). Dropping the leading boundary lets the matcher
@@ -10819,9 +10902,35 @@ reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 # M47 — THE REFLOG POSITION IS A SELECTOR (sixteenth cycle, P2). Dropping `@{N}` from the chain
 #       leaves `HEAD@{1}..HEAD` invisible to this arm — the eleventh cycle's fail-open, one notation
 #       over — so 20h55's narrowing is ACCEPTED again.
-MUT="$(mk_mutant noreflogchain '|\^[0-9]*|@\{[0-9]+\})+)' '|\^[0-9]*)+)')"
+MUT="$(mk_mutant noreflogchain '|\^[0-9]*|@\{[^}]+\})+)' '|\^[0-9]*)+)')"
 mut_check "M47 a reflog position on the tip is a narrowing selector" 425274 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD@{1}..HEAD; the rest was not read."
+# M48 — THE EMPTY-RANGE LHS CHAIN MUST INCLUDE `~0` (seventeenth cycle, P1). Dropping `~0|` restores
+#       059e1e0e4 exactly: `HEAD~0..HEAD` matches no arm, and 20h61 records a SIGNED `clean` over an
+#       empty range. The cell is on the CHAIN, because that is the seam — the tip arm's identity test
+#       is M44's business and it already covered `~0`, which is precisely why the divergence survived.
+MUT="$(mk_mutant nilrangechain '((~0|\^0|\^\{[^}/]*\}|@\{0+\})*)' '((\^0|\^\{[^}/]*\}|@\{0+\})*)')"
+mut_check "M48 the empty-range LHS chain includes \`~0\`, the same identity the tip arm honours" 425300 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD~0..HEAD; the rest was not read."
+# M49 — THE SEPARATOR IS `..` OR `...` (seventeenth cycle, P1). Narrowing it back to `\.\.` makes
+#       `HEAD^0...HEAD` invisible to the only arm that can refuse an empty range, so 20h61c records a
+#       signed `clean`. Anchored WITH the LHS chain so it cannot collide with the parser's `\.{2,3}`.
+MUT="$(mk_mutant tworangedots '@\{0+\})*)[[:space:]]*\.{2,3}[[:space:]]*' '@\{0+\})*)[[:space:]]*\.\.[[:space:]]*')"
+mut_check "M49 the empty-range arm reads the SAME separator grammar as every other range reader" 425304 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42530501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD^0...HEAD; the rest was not read."
+# M50 — THE REFLOG TERM COVERS DATES, NOT JUST DIGITS (seventeenth cycle, P1). Reverting it to
+#       `@\{[0-9]+\}` makes a DATED position invisible while the numeric one is still refused — the
+#       one-narrowing-two-verdicts defect the reviewer measured. 20h62 must then be ACCEPTED.
+MUT="$(mk_mutant numericreflogonly '|@\{[^}]+\})+)' '|@\{[0-9]+\})+)')"
+mut_check "M50 a DATED reflog position is the same narrowing as the numeric one" 425310 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD@{yesterday}..HEAD; the rest was not read."
+# M51 — THE IDENTITY TEST STATES GIT'S GRAMMAR WITH `0+` (seventeenth cycle, P2). Reverting to the
+#       single-zero spelling makes `HEAD^00`/`HEAD~00`/`HEAD@{00}` — which git resolves to the SAME
+#       commit — read as narrowings, so 20h63's honest artifact is REFUSED with a sentence that is
+#       false about it. This is the false-block direction, which this file calls the worse one.
+MUT="$(mk_mutant singlezeroidentity '^((~0+|@\{0+\}|\^0+|\^\{[^}/]*\})+)$' '^((~0|@\{0\}|\^0|\^\{[^}/]*\})+)$')"
+mut_check "M51 a zero COUNT is a zero count: leading-zero identities are not narrowings" 425314 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42531501" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The base was re-checked with git rev-parse HEAD^00 before reading.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
 git checkout -q attr_lane >/dev/null 2>&1 || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
