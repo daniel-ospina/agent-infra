@@ -869,7 +869,27 @@ plist_program_args() {
             # an element after an empty one IS `""`. Leaving `prev` untouched made the fallback keep
             # seeing `--repo` as the preceding element and call the next path `data` — WARNed and
             # INSTALLED a unit the python reader refuses as EXEC (fresh review of #3413, round 4 P2).
-            if (line == "") { prev = line; next }
+            if (line == "") {
+                # ⛔ AN EMPTY ROW *IS* THE FIRST POSITIONAL OF `env`, SO IT CAN END THAT SCAN. The python
+                # reader reaches its `if a.startswith("/")` test, finds `""` relative, and `break`s —
+                # the scan is OVER, so the next absolute element is the SCRIPT that program runs, not a
+                # second program. `next`ing here before the `env` hop left `envmode` set, so the next row
+                # was promoted to LAUNCHER, `$grants` was populated for its tree, and the unit installed
+                # with only a WARN — while `env "" <prog>` exits 127 ENOENT on every tick. Measured:
+                # `[env, "", <TCC binary>]` was SKIPped + DISARMED by python (rc 2) and WARNed +
+                # INSTALLED by this reader (rc 0). A role disagreement IS a verdict difference, and
+                # this one was in the fail-open direction (fresh review of #3413, round 11 P2).
+                # ⛔ THE OTHER TWO PENDING STATES ARE NOT THE SAME CASE, and the python shape is copied
+                # exactly: after a required-value option the empty element is the VALUE of that option
+                # (python marks it `skipped` and keeps scanning), while after `-S` it is the command
+                # LINE (python reads it, finds no tokens, and `break`s). Only those two end the scan.
+                if (envmode) {
+                    if (wantval) wantval = 0
+                    else { wantcmd = 0; envmode = 0 }
+                }
+                prev = line
+                next
+            }
             # ⛔ `Program` WINS, so element 0 is ONLY argv[0] and is not verdicted at all — exactly the
             # python reader (its `skipped.add(0)`). This test comes BEFORE the joined `--opt=` branch,
             # because with `Program` set python emits nothing for a `--script=<TCC>` at argv[0] while

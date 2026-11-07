@@ -1858,6 +1858,44 @@ assert_eq "$RC" "0" "§7c control: a REAL script in the launcher's OWN TCC tree 
 assert_contains "$OUT" "WARN TCC-protected target: $PROBE_DEAD" "§7c …because #1311 measured the launcher's binary holds that grant"
 rm -rf "$PROBE_TCC_DIR"
 
+# (c22k) AN EMPTY ELEMENT INSIDE `env`'s ARGUMENT LIST IS STILL A POSITIONAL, SO IT ENDS THE SCAN.
+# Python reaches its `if a.startswith("/")` test, finds `""` relative, and `break`s: the next absolute
+# element is that program's SCRIPT, not a second program, so it is filed `exec` with no grant → verdict
+# 2. The awk's empty-row arm `next`ed BEFORE the env hop, leaving `envmode` set, so the same element was
+# promoted to LAUNCHER, `$grants` was populated for its tree, and the unit installed with only a WARN —
+# while `env "" <prog>` exits 127 ENOENT on every tick. Python SKIP+disarm (rc 2) vs fallback ARMED
+# (rc 0): a role disagreement is a verdict difference, and this one was in the fail-open direction
+# (fresh review of #3413, round 11 P2 — the 11th mismatch of a 609-case differential, all one root).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "" "$PROBE_TCC_BIN" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: an EMPTY element ends env's scan, so the next absolute is EXEC"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is skipped and disarmed"
+assert_not_contains "$OUT" "installed + loaded" "§7c …and it is NOT armed"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "" "$PROBE_TCC_BIN" 2>&1)"; RC=$?
+set -e
+# ⛔ NOT AN `RC` ROW. Verdict 2 (skip) and verdict 0 (install) are BOTH exit 0, so an exit code cannot
+# see this defect — measured: with the old awk arm all four `RC=0` rows of this case still passed and
+# only the two output rows reddened. The discriminating statement is the SIDE, so it is asserted as one.
+assert_eq "$RC" "0" "§7c fallback: the same empty element ends env's scan (no launcher promotion)"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the two readers agree, instead of arming a unit that exits 127"
+assert_not_contains "$OUT" "installed + loaded" "§7c …and the fallback does not ARM what python disarms"
+# …and the CONTROL: the empty element must NOT swallow a pending option VALUE, or the round-9 fix
+# regresses. `env -C "" <TCC python> <script>`: the empty is the -C value, so the binary IS the program
+# and the unit WARNs and installs on both readers.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -C "" "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: an empty element after a VALUE option is that option's value, not env's program"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the program after it is still promoted"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -C "" "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: the fallback consumes the same empty value and keeps scanning"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the two readers still agree"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and the unit is ARMED, not skipped (the empty was the option value, not the program)"
+
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
 mkdir -p "$PROBE_HOME/Documents/checkout/with space"
