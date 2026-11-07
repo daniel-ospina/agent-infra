@@ -4658,7 +4658,13 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # operator to restart a box that can fork perfectly well.
   if [ "$rc" = "$AGENT_HARNESS_SKEW_REFUSED" ]; then
     AGENT_STARTED=0
-    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed. The [pi-gate] line above is the authority on WHICH: it can name the file it read (`mod=…`, possibly INCOMPLETE or non-numeric), the dirs it searched, or both — so follow it, not a guess: redeploy over the named file, or into one of the listed dirs, or re-source the pair if it says `mod=preloaded`. Sync the helper pair with a VERIFIED redeploy where reviewers run (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O); where that launcher exports no O, use a listed dir instead. Do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
+    # ⛔ NO BACKTICKS IN THIS MESSAGE: it is a DOUBLE-QUOTED `echo`, so a backticked span is a COMMAND
+    # SUBSTITUTION — `mod=…` is a valid variable ASSIGNMENT, which succeeds silently and deletes the words
+    # from the log (round-11 review of #3645, P2 — measured: the line logged "it can name the file it read
+    # (, possibly INCOMPLETE or non-numeric)" and "if it says ."). The sibling `[pi-gate]` message below is a
+    # SINGLE-quoted printf and is safe; this one is not, so the tokens are plain. Anything added here that
+    # needs markup has to be escaped or the message loses exactly the reading it exists to hand over.
+    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed. The [pi-gate] line above is the authority on WHICH: it can name the file it read (mod=…, possibly INCOMPLETE or non-numeric), the dirs it searched, or both — so follow it, not a guess: redeploy over the named file, or into one of the listed dirs, or re-source the pair if it says mod=preloaded. Sync the helper pair with a VERIFIED redeploy where reviewers run (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O); where that launcher exports no O, use a listed dir instead. Do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
     return "$AGENT_HARNESS_SKEW_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
