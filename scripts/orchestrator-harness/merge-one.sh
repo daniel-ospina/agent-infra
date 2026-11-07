@@ -2013,18 +2013,23 @@ if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
   echo "[merge $PR] reviewer NOT started (HELPER/SYNC gate: capacity.sh not resolvable from the spawn gate) — no verdict, NO marker written; this is not a property of this PR or this box: sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever reviewers run, then re-dispatch. Do NOT dispatch the PR elsewhere: every box with these files refuses identically" >> "$L.log"
   echo "[merge $PR] reviewer NOT started (helper/sync refusal) — no verdict, no marker; see $L.log" >&2
   # ⛔ THE EXIT READS THE SAME TOLERANT REFERENCE THE MATCH ABOVE DOES (fresh review of #3231, P1).
-  # `AGENT_HARNESS_SKEW_REFUSED` is DECLARED in `spawn-gate.sh:3473` and never exported, and this file
-  # sources only `gate-policy.sh`, so the bare `$AGENT_HARNESS_SKEW_REFUSED` is EMPTY here: `exit ""` is
-  # a bash usage error, so the arm exited **2** — this file's own "ABORT: no comment id" — while the
-  # match above, the log line above it, and every caller (`lane.sh:927/1000/1067`, `fix-one.sh:880`,
-  # `chain-merge.sh`'s case) all promise 83. That is a FALSE DIAGNOSIS of exactly the class this arm
-  # exists to remove, and no test covered the exit value (the structural pins only assert ordering).
+  # `AGENT_HARNESS_SKEW_REFUSED` is DECLARED in `spawn-gate.sh` (the `AGENT_HARNESS_SKEW_REFUSED=83`
+  # assignment) and never exported, and NONE of the three files this one sources declares it either
+  # (`gate-policy.sh`, `repo-authority.sh`, `$O/claims.sh`), so the bare `$AGENT_HARNESS_SKEW_REFUSED` is
+  # EMPTY here: `exit ""` is a bash usage error, so the arm exited **2** — this file's own "ABORT: no
+  # comment id" — while the match above, the log line above it, and every caller (`lane.sh`'s `skew` case
+  # and its two `_cap_gate=skew` arms, `fix-one.sh`'s skew arm, `chain-merge.sh`'s `skew)` case) all promise
+  # 83. That is a FALSE DIAGNOSIS of exactly the class this arm exists to remove, and no test covered the
+  # exit value (the structural pins only asserted ORDER).
   # Every sibling arm in this file that PROPAGATES a code it does not declare uses the same tolerant form
-  # (`:1975` memory, `:1984` brief — both declared in `spawn-gate.sh`, neither exported); the arms that
-  # exit a code this file publishes itself exit literals (`exit 75`, `exit 127`), and that distinction is
-  # the rule — not "every arm here". The propagating arms are named by their code, never by line number:
-  # a line citation rots into a false claim (round-3 review of #3645 opened the cited `:1927`/`:1946` and
-  # found a comment and an `if`, not exits).
+  # (the memory arm, `AGENT_MEM_REFUSED`; the brief arm, `AGENT_BRIEF_REFUSED` — both declared in
+  # `spawn-gate.sh`, neither exported); the arms that exit a code this file publishes itself exit literals
+  # (`exit 75`, `exit 127`), and that distinction is the rule — not "every arm here".
+  # ⛔ NAMED BY CODE, NEVER BY LINE NUMBER — including this paragraph's own siblings. Three review rounds
+  # of #3645 each corrected a line citation that had moved under the edit that introduced it (one cited
+  # `:1927`/`:1946` for exits that were a comment and an `if`; the next cited the MATCH of an arm as its
+  # exit). A citation that rots is a false claim in the one place a reader is told to check, so cite the
+  # code, the string, or the assignment — something a reader can grep after the lines have moved.
   exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"
 fi
 # ⛔ THE ROUND IS SPENT **HERE**, AND THIS FILE IS ITS ONLY WRITER (#3441). It sits BELOW every
