@@ -79,6 +79,18 @@ O="$TMP/O"; mkdir -p "$O/state" "$O/logs" "$TMP/bin"
 # still a comparison, still a refusal path (driven in spawn-gate.test.sh §12, which owns the floor's
 # arithmetic and asserts the shipped default under `env -u`).
 export MEM_MIN_AVAIL_MB=1
+# ⛔ AND THE BOX ENV FILE IS NEUTRALISED, FOR THE SAME REASON ONE LAYER UP (measured on a real box,
+# 2026-11-07). `lane.sh` sources `lane-env.sh`, which sources `${ENV_FILE:-$HOME/keys.env}` and
+# DOCUMENTS that "the file wins" over the inherited environment — deliberately, because on the
+# controller path the file is read after the environment. The consequence for THIS suite is that a box
+# whose `keys.env` sets any knob an arm pins (`MAX_LOAD=20` on the box that measured this) silently
+# overwrites the arm's own value: §1's LOAD arm passes `MAX_LOAD=0`, nothing refused, and the arm
+# measured the BOX and reported a `land` refusal instead of its subject. That is a false RED which
+# teaches an operator to ignore the suite, and it is not a property of the code under test.
+# ENV_FILE is the seam the shipped code already provides, so nothing is patched or rewritten: the file
+# is still sourced exactly as on the controller path, it just carries nothing. The gate still probes,
+# compares and refuses — this is hermeticity, not a switch.
+ENV_FILE="$TMP/box-env.empty"; : > "$ENV_FILE"; export ENV_FILE
 LANE="$HERE/lane.sh"; CHAIN="$HERE/chain-merge.sh"; ORCH="$HERE/orch-loop.sh"; CLAIMS="$HERE/claims.sh"
 for f in "$LANE" "$CHAIN" "$ORCH" "$CLAIMS"; do
   [ -s "$f" ] || { echo "❌ missing $f"; exit 2; }
@@ -357,8 +369,15 @@ ck "  …and the exported df stub answered (not a real filesystem reading — a 
 # writer folded every code except disk into `load`, so a fork refusal published the LOAD remedy and
 # its remedy line said "load gate" — the two failures the issue names.
 # Driven through the SHIPPED lane.sh: only the headroom SOURCE is faked (10 spare pids against the
-# shipped 200 margin), by exporting the two capacity functions the gate consumes, so the gate, the
+# shipped 200 margin), by exporting the capacity functions the gate consumes, so the gate, the
 # refusal code, the record and the log line are all the real ones.
+# ⛔ ALL THREE OF `SPAWN_GATE_CAP_NEEDS`, NOT TWO (measured 2026-11-07). The gate decides the module is
+# PRELOADED by `_cap_mod_missing`, which walks `cap_procs_pair_vars cap_h_for_vars cap_fork_probe`. This
+# fixture exported only the first two, so the third read as ABSENT, the gate SOURCED capacity.sh from
+# the harness dir, and the real functions REPLACED the fakes — headroom came back ample, the fork arm
+# never fired, and the run fell through to the creation gate's `land` refusal (rc=74). The arm then
+# reported `got 'land'` and read as a fork-gate regression. `cap_fork_probe` only has to EXIST: the
+# headroom comparison (10 < 200) refuses before the two-fork probe is ever reached.
 rm -f "$O/state/capacity-refused-17"
 ( cd "$LANECWD"
   # shellcheck shell=bash
@@ -368,7 +387,8 @@ rm -f "$O/state/capacity-refused-17"
     case "${2:-}" in ''|*[!0-9]*) return 1 ;; esac
     printf -v "$3" '%s' "$(( $2 - $1 ))"
   }
-  export -f cap_procs_pair_vars cap_h_for_vars
+  cap_fork_probe() { return 0; }
+  export -f cap_procs_pair_vars cap_h_for_vars cap_fork_probe
   O="$O" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$TMP" CAPACITY_YIELD_SECS=$LANE_YIELD \
     bash "$LANE" --key-gate-off 17 feat/17-tm daniel-ospina/agent-infra
 ) > "$TMP/lane17.out" 2>&1
