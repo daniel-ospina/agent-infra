@@ -919,6 +919,30 @@ PYI
 # are what discriminate.
 ck "m25 …and an EMPTY ENTRY in the middle is refused and NAMED as \`<empty entry>\` (not a blank field)" \
    'o="$(REPO_SET_DOCTOR="$MI/pr-doctor.py" run_reader "$CONF" check)"; printf "%s" "$o" | grep -q "entry 2 of this set" && printf "%s" "$o" | grep -q "<empty entry>"'
+# Round 16, P2: the TAG guard had no sentinel, so a sibling whose `set_tag_collisions` was missing or
+# raised returned "" — byte-identical to "no collision" — and the reader certified a COLLIDING set.
+# Measured before the sentinel: `OK — 2 repo(s)`, rc 0, no message, on a set the shipped doctor refuses.
+# The tag guard's failure mode is SHARED STATE (one register, one worker name, one cooldown), so the
+# silent pass is the worst shape. It WARNS; it does not refuse, because a broken sibling is not a fact
+# about the set.
+MT="$T/mutnotags"; mkdir -p "$MT"
+mk_repo "$T/tagcol-a" acme/tools-api
+mk_repo "$T/tagcol-b" acme-tools/api
+printf 'slug=acme/tools-api checkout=%s state=%s/tagstate1\nslug=acme-tools/api checkout=%s state=%s/tagstate2\n' \
+  "$T/tagcol-a" "$T" "$T/tagcol-b" "$T" > "$T/tagcollide.conf"
+ck "m26 the CONTROL: two TAG-colliding repos are refused by the shipped doctor (rc 1)" \
+   '[ "$(run_reader_rc "$T/tagcollide.conf" check)" = 1 ]'
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MT/pr-doctor.py" <<'PYT'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+t = t.replace("def set_tag_collisions(", "def _disabled_set_tag_collisions(", 1)
+open(dst, "w").write(t)
+PYT
+ck "m27 …and a sibling WITHOUT \`set_tag_collisions\` WARNS instead of silently certifying the collision" \
+   'REPO_SET_DOCTOR="$MT/pr-doctor.py" run_reader "$T/tagcollide.conf" check | grep -q "the tag-collision proof did NOT run"'
+ck "m28 …and it does not refuse (a broken sibling is not a proven fault about the set)" \
+   '[ "$(REPO_SET_DOCTOR="$MT/pr-doctor.py" run_reader_rc "$T/tagcollide.conf" check)" = 0 ]'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
