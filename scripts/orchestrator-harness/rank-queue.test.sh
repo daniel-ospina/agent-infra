@@ -1168,6 +1168,11 @@ w_sev="$( ( cd "$TMP" && bash skipwhy.sh severity ) 2>/dev/null )"
 w_unc="$( ( cd "$TMP" && bash skipwhy.sh severity-uncounted ) 2>/dev/null )"
 w_emp="$( ( cd "$TMP" && bash skipwhy.sh empty ) 2>/dev/null )"
 w_pri="$( ( cd "$TMP" && bash skipwhy.sh priority-unreadable ) 2>/dev/null )"
+# ⛔ `unranked` IS A STATE TOO, AND IT WAS THE ONE MISSING (review P2, cycle 57). The drive covered five
+# states and `unranked` was not among them, so its clause could be made byte-identical to
+# `priority-unreadable`'s with the whole suite green — and that is the WORST of the two mistakes: the
+# durable record would call an order this pass derived and installed "could NOT be re-derived … UNVERIFIED".
+w_unr="$( ( cd "$TMP" && bash skipwhy.sh unranked ) 2>/dev/null )"
 # an explicit EMPTY argument, not an absent one: the drive now runs under `set -u` (as the shipped code
 # does), where an unset `$1` is a fatal abort — and the state the arm can pass is "" (unrecorded), never
 # "no argument at all".
@@ -1178,9 +1183,11 @@ if grep -q 'the ORDER was re-derived severity-first from the pool' <<<"$w_sev" \
    && grep -q 'nothing was queued, so there was no ORDER to derive' <<<"$w_emp" \
    && grep -q 'the ORDER could NOT be re-derived' <<<"$w_pri" \
    && grep -q "provenance was NOT recorded" <<<"$w_unk" \
-   && [ "$(printf '%s\n%s\n%s\n%s\n%s' "$w_sev" "$w_unc" "$w_emp" "$w_pri" "$w_unk" | sort -u | wc -l)" -eq 5 ]; then rc=0
-else rc=1; echo "      why clauses: severity='$w_sev' uncounted='$w_unc' empty='$w_emp' pri='$w_pri' unknown='$w_unk' (want five DISTINCT clauses, each matching its own state)"; fi
-ck "the skip record's provenance clause is chosen PER STATE — five distinct clauses, each matching its own" $rc
+   && grep -q 'the pool ranked NONE of the queued rows' <<<"$w_unr" \
+   && ! grep -q 'could NOT be re-derived' <<<"$w_unr" \
+   && [ "$(printf '%s\n%s\n%s\n%s\n%s\n%s' "$w_sev" "$w_unc" "$w_emp" "$w_pri" "$w_unk" "$w_unr" | sort -u | wc -l)" -eq 6 ]; then rc=0
+else rc=1; echo "      why clauses: severity='$w_sev' uncounted='$w_unc' empty='$w_emp' pri='$w_pri' unknown='$w_unk' unranked='$w_unr' (want SIX DISTINCT clauses, each matching its own state — and unranked must NOT wear priority-unreadable's sentence)"; fi
+ck "the skip record's provenance clause is chosen PER STATE — six distinct clauses, each matching its own" $rc
 # 12-y3) AND THE ARM ACTUALLY CONSULTS IT WITH THE STATE IT HAS (review P2, cycle 10). 12-y2 drives the
 #        CLAUSE function; it says nothing about the dispatch into it. With the arm's `case` re-mapping the
 #        states (two tables for one thing), swapping `severity`/`empty` THERE left the suite GREEN while a
@@ -1735,6 +1742,45 @@ ck "an ABSENT queue is unmeasured too, and neither the failed redirection nor th
 # not a candidate number). Two drives, one variable: the state word.
 main_handoff garbage-unranked garbage unranked; _mh_u="$MHOUT"
 main_handoff garbage-refused garbage priority-unreadable; _mh_p="$MHOUT"
+# ⛔ AND ONCE WITH THE REAL CLAUSE FUNCTION (review P2, cycle 57). The differential above runs against a stub,
+# so it grades the PLUMBING: a `skip_order_why` whose two clauses were made identical would still produce
+# distinct rows. The two drives below source the SHIPPED function instead, so the distinctness is the
+# product's own.
+REALWHY="$TMP/skipwhy-real.sh"
+awk '/^skip_order_why\(\) \{/{f=1} f{print} f && /^\}$/{exit}' "$REFRESH" > "$REALWHY" 2>/dev/null
+_rw_n="$(wc -l < "$REALWHY" 2>/dev/null | tr -d ' ')"
+if [ -z "$_rw_n" ] || [ "$_rw_n" -lt 5 ]; then
+  rc=1; echo "      the REAL skip_order_why could not be extracted ($_rw_n line(s)) — the check below would grade an empty function"
+else
+  main_handoff_real() {  # <label> <state> -> MHOUT, with the SHIPPED clause function in the drive
+    local d="$TMP/mhr-$1" st="$2"
+    rm -rf "$d"; mkdir -p "$d/o"
+    printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
+    { printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS=""\n' "$st"
+      printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+      printf 'unusable_summary() { printf "none"; }\n'
+      cat "$REALWHY"; printf '\n'
+      for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
+      printf 'O="%s/o"\nSTARVED=0\n' "$d"
+      cat "$MAINDRV"
+      printf 'exit 0\n'
+    } > "$d/drive.sh"
+    ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
+    MHOUT="$(cat "$d/out" 2>/dev/null)"
+  }
+  main_handoff_real real-unranked unranked; _rw_u="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+  main_handoff_real real-refused priority-unreadable; _rw_p="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+  if [ -z "$_rw_u" ] || [ -z "$_rw_p" ]; then
+    rc=1; echo "      the REAL-function drives recorded no handoff row ('${_rw_u:-<none>}' / '${_rw_p:-<none>}')"
+  elif [ "$_rw_u" = "$_rw_p" ]; then
+    rc=1; echo "      the SHIPPED clause function records the SAME row for unranked and priority-unreadable ('$_rw_u')"
+  elif ! grep -q 'UNRANKED, not a priority decision' <<<"$_rw_u"; then
+    rc=1; echo "      the unranked row does not carry its own sentence: '$_rw_u'"
+  elif ! grep -q 'could NOT be re-derived' <<<"$_rw_p"; then
+    rc=1; echo "      the priority-unreadable row does not carry its own sentence: '$_rw_p'"
+  else rc=0; fi
+fi
+ck "against the SHIPPED clause function (not a stub), unranked and priority-unreadable record DIFFERENT rows, each with its own sentence" $rc
 _mh_u_rec="$(printf '%s\n' "$_mh_u" | grep '^RECORD:' | grep 'handed=' | head -1)"
 _mh_p_rec="$(printf '%s\n' "$_mh_p" | grep '^RECORD:' | grep 'handed=' | head -1)"
 if [ -z "$_mh_u_rec" ] || [ -z "$_mh_p_rec" ]; then
@@ -1745,6 +1791,23 @@ elif ! grep -q 'handed_why=WHY:unranked' <<<"$_mh_u_rec" || ! grep -q 'handed_wh
   rc=1; echo "      the rows differ but not in the provenance: unranked '$_mh_u_rec' / refused '$_mh_p_rec' (want handed_why=WHY:unranked / WHY:priority-unreadable)"
 else rc=0; fi
 ck "a 'handed NOTHING' record carries the order's PROVENANCE, so unranked and priority-unreadable never record the same row" $rc
+
+# ⛔ EVERY "HANDED NOTHING" ARM, NOT JUST THE ONE THE DIFFERENTIAL HAPPENS TO REACH (review P3, cycle 57): the
+# field was added to four records and only the measured-depth arm was graded, so deleting it from the other
+# three left both suites green while ARCHITECTURE's "every handoff record carries it" silently went false.
+for _hw in 'drained|empty|backlog=0' 'garbage|garbage|DEPTH is measured' 'dir|dir|queue could NOT be read' 'wcfailg|wcfail-garbage|its DEPTH nor its HEAD'; do
+  _hw_how="${_hw%%|*}"; _rest="${_hw#*|}"; _hw_setup="${_rest%%|*}"; _hw_needle="${_rest#*|}"
+  main_handoff "hw-$_hw_how" "$_hw_setup" severity
+  _hw_rec="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+  if [ -z "$_hw_rec" ]; then
+    rc=1; echo "      the $_hw_how arm recorded no handoff row"
+  elif ! grep -q 'handed_why=WHY:severity' <<<"$_hw_rec"; then
+    rc=1; echo "      the $_hw_how arm's record carries no handed_why= (field missing or not the state's clause): '$_hw_rec'"
+  elif ! grep -qF "$_hw_needle" <<<"$_hw_rec"; then
+    rc=1; echo "      the $_hw_how fixture did not land on the arm it names (want '$_hw_needle' in the row): '$_hw_rec'"
+  else rc=0; fi
+  ck "every 'handed NOTHING' arm records the provenance — the $_hw_how arm ('$_hw_needle')" $rc
+done
 # (c) NON-VACUITY — revert the guarded read to the pre-fix unguarded one (which coerces a failed `wc` to 0)
 # and show fixture (a) goes RED. A guard that survives its own revert is not the thing being graded.
 MHREV="$TMP/main-handoff-rev.sh"
