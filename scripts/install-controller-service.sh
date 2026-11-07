@@ -437,14 +437,46 @@ primary_clone_root() {
 # deployment (`/tmp/cell-ai` on `main` must keep working); a clone on any other branch is unmerged work a
 # lane removes, which is the rule this guard already states in words for every other shape.
 primary_clone_on_lane_branch() {
-    local b def
-    b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || return 1
-    [ -n "$b" ] || return 1                     # detached: no branch to be unmerged at
+    local b def ref rc
+    b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || b=""
+    if [ -z "$b" ]; then
+        # ⛔ A DETACHED CLONE IS NOT THE DEPLOYMENT SHAPE EITHER (cycle-8 P2, MEASURED — a pre-existing
+        # FAIL-OPEN that admitted the #2697 class). The line here used to be `[ -n "$b" ] || return 1` with the
+        # comment "detached: no branch to be unmerged at", so a lane that isolates by CLONING and then detaches
+        # at a PR head (`git clone … && git checkout <pr-head>`) was ADMITTED under a transient root — an
+        # ExecStart naming a path a cleaning removes. A deployment clone is checked out on its default branch;
+        # the fleet's only legitimately detached checkout is the harness PIN, which the bring-up creates with
+        # `git worktree add --detach` (`cloud-cell-bringup.sh:1588`) and which `linked_worktree_root` grades
+        # before this helper is ever consulted — so a detached PRIMARY clone has no admitted deployment shape.
+        # Ancestry is the question that can be asked here because there is no name to grade: contained in the
+        # default ref = the deployment's revision (admitted); not contained = a PR head (refused).
+        # ⛔ AND THE GRADED REF IS NOT "THE DEFAULT BRANCH" — it is the LOCAL `refs/remotes/origin/HEAD` symref,
+        # which `git clone` derives from the remote and the caller can rewrite. This guard is an accident guard
+        # (see docs/ops/controller-service.md), not a boundary against a caller who rewrites its own refs.
+        def="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || def=""
+        def="${def#origin/}"
+        # No default ref to compare against: nothing to prove it against. Named residual, disclosed in the doc.
+        [ -n "$def" ] || return 1
+        ref="refs/remotes/origin/$def"
+        "${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --verify -q "$ref" >/dev/null 2>&1 || return 1
+        rc=0
+        "${GIT_SCRUB[@]}" git -C "${1:-}" merge-base --is-ancestor HEAD "$ref" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 0 ] && return 1                       # contained: the deployment's own revision
+        # ⛔ TRI-STATE, NOT A BOOLEAN. `merge-base --is-ancestor` exits 1 for "no" and 128 for "git could not
+        # answer"; folding 128 into "not an ancestor" would print a confident verdict git never gave. A read that
+        # cannot be made is CANNOT PROVE, and this file's rule for that is refuse, never admit.
+        if [ "$rc" -eq 1 ]; then
+            printf 'detached-at-unmerged|%s\n' "$("${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --short HEAD 2>/dev/null)"
+        else
+            printf 'detached-unproven|%s\n' "$("${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --short HEAD 2>/dev/null)"
+        fi
+        return 0
+    fi
     case "$b" in main|master) return 1 ;; esac
     def="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || def=""
     def="${def#origin/}"
     [ -n "$def" ] && [ "$b" = "$def" ] && return 1
-    printf '%s\n' "$b"
+    printf 'branch|%s\n' "$b"
     return 0
 }
 
@@ -570,9 +602,24 @@ scratch_supervisor_reason() {
         if [ -z "$(transient_root_of "$d")" ] || { primary_clone_root "$d" && ! primary_clone_on_lane_branch "$d" >/dev/null; }; then declared="$d"; break; fi
         # ⛔ A CLONE ON AN UNMERGED BRANCH IS A LANE CHECKOUT (cycle-6 P2, MEASURED — see the helper). This is
         # the one shape the branch rule was not applied to, and the caller can make the declaration itself.
+        # Cycle-8 P2 added the DETACHED shape (`primary_clone_on_lane_branch` prints one of three kinds), and
+        # each kind gets its own sentence: a refusal that names a branch on a DETACHED checkout asserts
+        # something git never said, which is the class of defect this file keeps removing.
         if b="$(primary_clone_on_lane_branch "$d")" && [ -n "$b" ]; then
-            printf 'it is under %s, and the root that declares it is a PRIMARY git clone checked out on the BRANCH %s — a clone at the default branch is a deployment, a clone on any other branch is unmerged work a lane removes (a lane that isolates by cloning instead of `git worktree add` lands here), and being a clone is not being merged' \
-                "$root" "$b"
+            case "$b" in
+                branch\|*)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone checked out on the BRANCH %s — a clone at the default branch is a deployment, a clone on any other branch is unmerged work a lane removes (a lane that isolates by cloning instead of `git worktree add` lands here), and being a clone is not being merged' \
+                        "$root" "${b#branch|}" ;;
+                detached-at-unmerged\|*)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone on a DETACHED HEAD (%s) that its default branch does NOT contain — a deployment clone is checked out on its DEFAULT branch, and a detached checkout at a commit the default branch does not carry is a PR head a lane removes (a lane that isolates by cloning and then detaches lands here); check the clone out on its default branch, or name the farm or the harness pin' \
+                        "$root" "${b#detached-at-unmerged|}" ;;
+                detached-unproven\|*)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone on a DETACHED HEAD (%s) whose containment CANNOT BE PROVEN — git could not answer `merge-base --is-ancestor` against this clone'\''s default ref, and cannot-prove is refused rather than admitted; check the clone out on its default branch, or name the farm or the harness pin' \
+                        "$root" "${b#detached-unproven|}" ;;
+                *)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone holding work a lane removes (%s)' \
+                        "$root" "$b" ;;
+            esac
             return 0
         fi
     done
