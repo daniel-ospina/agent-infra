@@ -3632,11 +3632,18 @@ pidAB="$(cat "$T/s19ab/loop.pid" 2>/dev/null)"; kill "$pidAB" 2>/dev/null; sleep
 # is the bypass the arm above describes: any local uid can plant a `loop.lock` naming a live
 # `fleet-schedule --loop` it runs, and every operator loop then refuses while `--start` exits 0.
 rm -rf "$L19/ab2"
-env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ab2" FLEET_SCHEDULE_LOCK_ROOT="$L19/ab2" \
-    python3 "$SCHED" --start >/dev/null 2>&1
+# ⛔ UNDER A PERMISSIVE UMASK ON PURPOSE. `makedirs`'s mode is umask-filtered and a umask can only
+# CLEAR bits, so the requested mode is what decides the FLOOR: a requested 0o1777 measured 0o1777
+# here under `umask 0` (services, containers and some CI images set exactly that), which is the
+# plant-a-`loop.lock` bypass this arm exists to refuse. `umask 022` would make the arm pass on a
+# world-writable request, i.e. the arm would be green wherever the operator's umask happened to be
+# conservative and the defect would ship.
+( umask 000
+  env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ab2" FLEET_SCHEDULE_LOCK_ROOT="$L19/ab2" \
+      python3 "$SCHED" --start >/dev/null 2>&1 )
 mode19ab2="$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o0002))' "$L19/ab2")"
 [ "$mode19ab2" = "0o0" ] \
-  && ok "19ab a lock root WE created is NOT world-writable (no umask 'correction' widens it)" \
+  && ok "19ab a lock root WE created is NOT world-writable even under umask 000 (requested mode is the floor)" \
   || bad "19ab a created lock root is world-writable ($mode19ab2) — any uid can plant the box's lock"
 pidAB2="$(cat "$T/s19ab2/loop.pid" 2>/dev/null)"; kill "$pidAB2" 2>/dev/null; sleep 1
 
@@ -4004,6 +4011,83 @@ grep -q 'loop already running' <<<"$out19al" \
   && ok "19al ⛔ --install over a RUNNING loop did NOT rewrite the pointer to a set nothing reads" \
   || bad "19al --install rewrote the pointer to a set the loop does not read ($T/tpl19alA -> $(cat "$T/s19al/templates-dir" 2>/dev/null))"
 kill "$pidAL" 2>/dev/null; sleep 1
+
+# 19am — ⛔ A RELATIVE ARMING RECORD MUST REACH THE CHILD RESOLVED TOO, and this one is not academic:
+# `WORKTREE_HYGIENE_ARM_FILE` / `REAP_ORPHAN_ARM_FILE` OVERRIDE the `home/.pi/agent/state/...` default and
+# are then read with `open()`, so a relative override decided `--apply` vs `--dry-run` by the CALLER's cwd.
+# Measured before the fix: one `SCHEDULE VERIFIED` over a marker carrying `wt=--apply` (the parent's inline
+# pass) AND `wt=--dry-run` (the loop child) — on the two shipped templates that carry these placeholders, so
+# the worktree sweeper's dry-run/apply decision differed between what was certified and what runs.
+mkdir -p "$T/bin19am" "$T/tpl19am" "$T/relcwd19am"
+cp "$SCHED" "$T/bin19am/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19am/RETIRED"
+MARK19AM="$T/out/marker19am.log"
+python3 - "$T/tpl19am" "$MARK19AM" <<'PY19AM'
+import os, plistlib, sys
+d = {"Label": "com.test.wt19am",
+     "ProgramArguments": ["/bin/sh", "-c", "echo wt={{WORKTREE_HYGIENE_MODE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.wt19am.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AM
+# The arming record, RELATIVE to the caller's cwd, carrying the two keys `wt_hygiene_mode()` requires.
+printf 'armed-by=test-19am\narmed-date=2026-11-07\n' > "$T/relcwd19am/armed19am"
+out19am="$(cd "$T/relcwd19am" && env -u CELL_HOME WORKTREE_HYGIENE_ARM_FILE=armed19am \
+  TEMPLATES_DIR="$T/tpl19am" FLEET_SCHEDULE_STATE="$T/s19am" FLEET_SCHEDULE_LOCK_ROOT="$L19/am" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19am/fleet-schedule.py" --start 2>&1)"; rc19am=$?
+[ "$rc19am" -eq 0 ] \
+  && ok "19am --start with a RELATIVE arming record exits 0" \
+  || bad "19am --start exited $rc19am: $out19am"
+wait19am=0
+while [ ! -s "$MARK19AM" ] && [ "$wait19am" -lt 25 ]; do sleep 1; wait19am=$((wait19am + 1)); done
+[ -s "$MARK19AM" ] \
+  && ok "19am the loop child RAN the {{WORKTREE_HYGIENE_MODE}} job" \
+  || bad "19am the child never ran the job: $out19am / $(tail -3 "$T/s19am/loop.log" 2>/dev/null)"
+grep -qvx 'wt=--apply' "$MARK19AM" 2>/dev/null \
+  && bad "19am the child rendered a DIFFERENT {{WORKTREE_HYGIENE_MODE}}: $(head -3 "$MARK19AM")" \
+  || ok "19am ⛔ the child resolved the SAME arming record the parent did (--apply, not --dry-run)"
+pidAM="$(cat "$T/s19am/loop.pid" 2>/dev/null)"; kill "$pidAM" 2>/dev/null; sleep 1
+
+# 19an — ⛔ AN `--install` THAT STARTS NOTHING MUST STILL RECORD ITS DECLARATION SET. This is the
+# cell-bringup shape: a second state dir installs while another holds the BOX lock, so `spawn_loop`
+# returns the foreign holder with `started=False` — and the pointer is the ONLY thing the supervisor's
+# bare-env revival (`HOME=$CELL_HOME CELL_HOME=$CELL_HOME … --start`, no INFRA_ROOT/TEMPLATES_DIR) has to
+# find the declarations. Gating the write on `started` (the 19al fix, first cut) silently dropped it here:
+# measured `FAIL: no job declarations found` rc=3, which the supervisor logs as a WARN, so a cell that
+# bring-up had just certified ran with no reap, no liveness detection and no canary. `main`'s arm returned
+# rc=0 in the same shape. The rule is "no loop OF THIS STATE DIR is running", not "this verb started one".
+mkdir -p "$T/tpl19anA" "$T/tpl19anB" "$T/bin19an"
+cp "$GOOD"/*.plist "$T/tpl19anA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19anB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19anA/RETIRED"; printf '# none\n' > "$T/tpl19anB/RETIRED"
+cp "$SCHED" "$T/bin19an/fleet-schedule.py"
+s19 "$T/s19anA" "$T/tpl19anA" --install >/dev/null 2>&1
+pidAN="$(cat "$T/s19anA/loop.pid" 2>/dev/null)"
+[ -n "$pidAN" ] && kill -0 "$pidAN" 2>/dev/null \
+  && ok "19an baseline: home A's loop holds the box" \
+  || bad "19an baseline loop never came up — the arm grades nothing"
+out19an="$(s19 "$T/s19anB" "$T/tpl19anB" --install 2>&1)"; rc19an=$?
+grep -q 'loop already running' <<<"$out19an" \
+  && ok "19an home B's --install started NOTHING (the box lock is held by A — the bring-up shape)" \
+  || bad "19an home B's --install did not take the foreign-holder path: $out19an"
+[ -f "$T/s19anB/templates-dir" ] \
+  && ok "19an ⛔ home B's declaration set WAS recorded even though it started nothing" \
+  || bad "19an home B recorded NO declaration set — a later bare-env --start there cannot find the declarations"
+[ "$(cat "$T/s19anB/templates-dir" 2>/dev/null)" = "$T/tpl19anB" ] \
+  && ok "19an the pointer names HOME B's set, not the holder's" \
+  || bad "19an the pointer names the wrong set: $(cat "$T/s19anB/templates-dir" 2>/dev/null)"
+# ⛔ THE REVIVAL SHAPE ITSELF, from a scratch-dir copy so the child's `here` fallback cannot mask a
+# missing pointer: no INFRA_ROOT, no AGENT_INFRA_PATH, no TEMPLATES_DIR — only what an install recorded.
+out19an2="$(env -u INFRA_ROOT -u AGENT_INFRA_PATH -u TEMPLATES_DIR \
+  FLEET_SCHEDULE_STATE="$T/s19anB" FLEET_SCHEDULE_LOCK_ROOT="$L19" \
+  python3 "$T/bin19an/fleet-schedule.py" --start 2>&1)"; rc19an2=$?
+[ "$rc19an2" -eq 0 ] \
+  && ok "19an a bare-env --start finds the recorded set and exits 0 (the supervisor's revival works)" \
+  || bad "19an a bare-env --start exited $rc19an2 — the cell runs with no scheduled layer: $out19an2"
+grep -q 'no job declarations found' <<<"$out19an2" \
+  && bad "19an the revival reported 'no job declarations found' (rc=3 is only a WARN to the supervisor)" \
+  || ok "19an the revival did NOT report a missing declaration set"
+kill "$pidAN" 2>/dev/null; sleep 1
 
 # 19g — an UNUSABLE lock root must NOT wedge the box: it degrades to the state dir and DISCLOSES it.
 : > "$T/not-a-dir"

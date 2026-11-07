@@ -208,6 +208,14 @@ def absolutize_path_knobs():
       CELL_HOME      `home` — and `WORKTREE_HYGIENE_MODE` / `REAP_ORPHAN_MODE` / `SWARM_ENV_FILE` are
                      all derived from it by `open()`.
       SWARM_ENV_FILE a path read with `open()`.
+      WORKTREE_HYGIENE_ARM_FILE / REAP_ORPHAN_ARM_FILE
+                     the two arming records: each OVERRIDES the `home/.pi/agent/state/...` default and is
+                     then read with `open()`, so a relative override decides `--apply` vs `--dry-run` (and
+                     `0` vs `1` for the reaper) by the CALLER'S cwd — measured end-to-end as a marker
+                     carrying `wt=--apply` from the inline pass and `wt=--dry-run` from the loop child under
+                     one `SCHEDULE VERIFIED`, on the two shipped templates that carry those placeholders.
+                     They are NOT "derived from CELL_HOME" whenever the override is set, which is why the
+                     completeness claim below has to name them explicitly.
       PYTHON_BIN / PI_NODE_BIN  executables: a value WITH a separator is cwd-resolved; a BARE NAME is a
                      PATH lookup and is identical in both processes, so it is left alone (abspath on
                      `python3` would invent a file that does not exist).
@@ -218,7 +226,8 @@ def absolutize_path_knobs():
     still need their explicit handover because they are resolved from DEFAULTS rather than from an env
     value the child would simply re-read.
     """
-    for knob in ("TORTOISE_REPO", "SWARM_ROOT", "CELL_HOME", "SWARM_ENV_FILE"):
+    for knob in ("TORTOISE_REPO", "SWARM_ROOT", "CELL_HOME", "SWARM_ENV_FILE",
+                 "WORKTREE_HYGIENE_ARM_FILE", "REAP_ORPHAN_ARM_FILE"):
         val = os.environ.get(knob, "")
         if val:
             os.environ[knob] = os.path.abspath(val)
@@ -1060,23 +1069,27 @@ def resolve_loop_lock():
         # changes MODE, not OWNERSHIP, so it does nothing about the `st_uid != getuid()` arm below
         # (the [VGATE] pass measured a 1777 root still degrading every operator loop), while it
         # would widen an operator-pinned private `FLEET_SCHEDULE_LOCK_ROOT` to world-writable for no
-        # benefit. So the mode is left entirely to the UMASK, on a created root and a pre-existing one
-        # alike (`makedirs(mode=…)` applies only to what it creates, and the kernel filters it), which
-        # is also `main`'s behaviour — this cut briefly corrected it to a hard 0o1777 and that was a
-        # regression, not a fix. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
+        # benefit — and a `chmod` UP is exactly what the arm below rejects. The mode is therefore left
+        # alone on a pre-existing root, and requested as 0o755 (umask-cleared only, never upwards) on a
+        # root we create. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
         # has no lock root yet leaves it root-owned, and every operator loop then degrades with the
         # NOTE below — tracked as its own follow-up, since the sound fixes are a chown-uid decision.
         # ⛔ AND NO `chmod`, ON *ANY* ROOT — not even one we create. Widening is the bypass, whichever
         # directory it happens to: with `loop.lock` writable by others, ANY local uid can create one
         # naming a live `fleet-schedule --loop` it runs, and every operator loop then refuses while
         # `--start` exits 0 — the box silently unscheduled, through a guard defeated by the mode of
-        # its own directory. The gate this used to carry ("only a directory WE created may be
-        # widened") was measured to WEAKEN a fresh root: `makedirs`'s mode is umask-filtered (0o1755
-        # under 022), so the chmod on the created arm added world-write that was not there before —
-        # and it bought nothing, because the `st_uid != getuid()` arm below refuses a root another
-        # uid owns regardless of mode, so a world-writable root can never be SHARED across uids.
-        # The mode is therefore left to the umask, and a pre-existing root keeps its owner's choice.
-        os.makedirs(root, mode=0o1777, exist_ok=True)
+        # its own directory. A previous cut corrected a pre-existing root to 0o1777; that was measured
+        # to WEAKEN a fresh root (see below) and is reverted.
+        # ⛔ AND THE REQUESTED MODE IS 0o755, NOT 0o1777 — THE DIFFERENCE IS NOT COSMETIC. `makedirs`'s
+        # mode is UMASK-FILTERED, and a umask can only CLEAR bits, so requesting 0o1777 let a permissive
+        # umask produce a world-writable root: measured 0o1777 under `umask 0` (services, containers and
+        # some CI images do exactly that), which is the plant-a-`loop.lock` bypass above with the guard
+        # reporting nothing. Requesting 0o755 makes "not world-writable" TRUE UNDER EVERY UMASK, and it
+        # costs nothing: the `st_uid != getuid()` arm below refuses a root another uid owns whatever its
+        # mode, so a world-writable root could never be SHARED across uids anyway — only attacked. The
+        # mode of a PRE-EXISTING root is still untouched (`makedirs` ignores `mode` when the dir exists),
+        # so an operator's deliberate 0700 pin survives, which is the distinction that matters here.
+        os.makedirs(root, mode=0o755, exist_ok=True)
         # /dev/shm is 1777 and this name is guessable, so a PRE-EXISTING foreign dir must never
         # become our lock dir (the same ownership rule, and the same reason, as disk-reaper.sh's
         # fallback candidates). Only a pre-existing dir can be foreign — an absent one we create.
@@ -2849,13 +2862,45 @@ def cmd_install():
         return 1
 
     # ⛔ THE DECLARATION POINTER IS LOAD-BEARING NOW (`cmd_verify` reads it and grades THAT set), so it
-    # may only be written by an invocation that STARTED this state dir's loop — the same ruling `--start`
-    # already carries. Writing it unconditionally here recorded the CALLER's set for a loop that keeps
-    # reading its own: `--install` with a different `TEMPLATES_DIR` over an already-running loop rewrote
-    # the pointer, after which a second home's `--verify` graded the caller's set, printed "its DECLARATION
-    # set, which is the set that actually runs here" over a set the loop does not read, and left every job
-    # of the loop's REAL set ungraded (measured: pointer tplA -> tplB while `loop.log` still start-named
-    # tplA). That is the same lie 19ad was written to prevent, injected by the sibling entry point.
+    # may only be written by an invocation that is the effective OWNER of this state dir's pointer — and
+    # the rule is "no loop OF THIS STATE DIR is already running", NOT "spawn_loop started one". Gating on
+    # `started` was a REGRESSION: on the cell-bringup shape (a second state dir installing while another
+    # holds the BOX lock) `spawn_loop` returns the foreign holder with started=False, so nothing wrote the
+    # pointer — and the pointer is the only thing `cloud-cell-supervisor.sh`'s bare-env revival
+    # (`HOME=$CELL_HOME CELL_HOME=$CELL_HOME … --start`, no INFRA_ROOT/TEMPLATES_DIR) has to find the
+    # declarations. Measured: `FAIL: no job declarations found` rc=3 there, which the supervisor logs as a
+    # WARN, so a cell that bring-up had just certified ran with no reap, no liveness detection and no
+    # canary. The base wrote it here unconditionally (single call site) and returned rc=0 in that shape.
+    # ⛔ AND IT MUST NOT BE OVERWRITTEN WHEN THIS STATE DIR'S OWN LOOP IS ALREADY RUNNING: that loop keeps
+    # reading its own set, so recording the caller's would make a later `--verify` grade a set nothing runs
+    # and print "the set that actually runs here" over a misdescription (measured: pointer tplA -> tplB
+    # while `loop.log` still start-named tplA — the 19al arm).
+    own_pid = loop_pid()
+    own_alive = bool(own_pid and pid_is_our_loop(own_pid))
+    if own_alive:
+        if not os.path.exists(os.path.join(STATE, TEMPLATES_POINTER)):
+            # ⛔ NAME IT INSTEAD OF GUESSING A SET. Writing the caller's here could certify a set the
+            # loop does not read; writing nothing leaves the next bare-env `--start` with no pointer. The
+            # state is answerable by the operator, so it is SAID rather than resolved by a coin flip.
+            print(
+                "  NOTE   a loop for this state dir is running but no declaration set is recorded in "
+                "%s — a later `--start` from an environment without INFRA_ROOT/TEMPLATES_DIR will not "
+                "find the declarations; record it with: %s --install from the loop's own environment"
+                % (STATE, os.path.basename(sys.argv[0])),
+                file=sys.stderr,
+            )
+    else:
+        try:
+            remember_templates_dir()
+        except OSError as exc:
+            # A state dir we cannot write the pointer into must not fail an install; it degrades a later
+            # bare-env `--start` on this home, so it is SAID.
+            print(
+                "  NOTE   could not record the declaration set in %s (%s) — a later `--start` from an "
+                "environment without INFRA_ROOT/TEMPLATES_DIR will not find the declarations"
+                % (STATE, exc),
+                file=sys.stderr,
+            )
 
     # The first pass is run INLINE, before the loop exists, so that `--install` ends with EVIDENCE
     # (a stamp and a log line per runnable job) rather than with a pid. "A unit that loads and
@@ -2937,17 +2982,6 @@ def cmd_install():
         # delivery path could be beside it" message. Found by the [VGATE] pass.
         if started:
             print("loop started (pid %d, tick %ds)" % (pid, TICK))
-            try:
-                remember_templates_dir()
-            except OSError as exc:
-                # A state dir we cannot write the pointer into must not fail an install that just
-                # started the loop; it degrades a later second-home grade, so it is SAID.
-                print(
-                    "  NOTE   could not record the declaration set in %s (%s) — a scheduler for "
-                    "another state dir on this box will grade ITS OWN declarations against this "
-                    "loop's stamps" % (STATE, exc),
-                    file=sys.stderr,
-                )
     return cmd_verify()
 
 
