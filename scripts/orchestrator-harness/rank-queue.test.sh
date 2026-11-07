@@ -2047,7 +2047,15 @@ sat_out="$(cat "$TMP/sat/out-sat" 2>/dev/null)"
 # file that does not exist — and this check still passed (measured: 149/0, with the only red coming from
 # the mutation gate several hundred lines below, whose message names an anchor drift it did not measure).
 # A predicate that enumerates failures has to be re-enumerated when a failure is split.
+# ⛔ AND THE CLIP POLARITY IN PROSE IS A FAILURE TOO (review P2, cycle 67). The enumeration above named the
+# TOKEN and the record-shape clauses; a no-clip state could still APPEND the clip sentence in prose ("a tier window
+# ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool") and every suite
+# stayed green — measured: appending it to the severity and WARN arms left the suite at 155/0, on the ORDINARY
+# pass where no `.pool-sat` exists at all. Two spellings plus the paraphrase, so a re-worded claim cannot ride
+# along: the token, the short form, and the sentence's own distinctive words.
 if [ -n "$sat_ctl" ] && ! grep -q 'windows=TRUNCATED' <<<"$sat_ctl" \
+   && ! grep -q 'tier window was clipped' <<<"$sat_ctl" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$sat_ctl" \
    && ! grep -q 'could not be READ' <<<"$sat_ctl" \
    && ! grep -qF 'is NOT A REGULAR FILE' <<<"$sat_ctl" \
    && ! grep -q 'carried no tier name this code recognises' <<<"$sat_ctl" \
@@ -2447,8 +2455,19 @@ if [ "$_bis_skipped" = "1" ]; then
   rc=0; echo "      (skipped: this user can read a 000 file — running as root?)"
 elif grep -qi 'permission denied' <<<"$_x14"; then
   rc=1; echo "      the shell's own message reached the operator line '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
+# ⛔ THE BRANCH ASSERTS ITS OWN NO-CLIP POLARITY, SO THAT CLAIM IS GRADED POSITIVELY (review P2, cycle 67).
+# Forbidding `windows=TRUNCATED` left the sentence "… so this pass measured no clip and asserts none" free to be
+# flipped to "measured a clipped tier window" with the suite at 155/0 — a clip claimed from a file that was
+# never read. ⛔ AND THE TWO CAUSES ARE SAID APART IN BOTH DIRECTIONS (review P3, cycle 67): cycle 43 split this
+# sentence from the not-opened one so the line says WHICH cause happened, and the neighbouring fixtures forbid
+# "could not be READ" on the not-opened shapes — nothing forbade the reverse, so this line could carry BOTH
+# causes, on the one line whose purpose is that they are kept apart.
 elif grep -q 'could not be READ' <<<"$_x14" \
      && grep -q 'tier-window record could not be USED' <<<"$_x14" \
+     && grep -q 'measured no clip and asserts none' <<<"$_x14" \
+     && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_x14" \
+     && ! grep -q 'tier window was clipped' <<<"$_x14" \
+     && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_x14" \
      && ! grep -q 'windows=TRUNCATED' <<<"$_x14" \
      && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_x14"; then rc=0
 else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
@@ -2469,8 +2488,11 @@ _y14="$(cat "$_d14d/out" 2>/dev/null)"
 # gone with the unreachable arm that printed it, so it is no longer asserted either way.
 if grep -q 'is NOT A REGULAR FILE, so this pass did NOT open it' <<<"$_y14" \
    && grep -q 'tier-window record could not be USED' <<<"$_y14" \
+   && grep -q 'and measured no clip' <<<"$_y14" \
    && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_y14" \
    && ! grep -q 'could not be READ' <<<"$_y14" \
+   && ! grep -q 'tier window was clipped' <<<"$_y14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_y14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_y14" && ! grep -qi 'is a directory' <<<"$_y14"; then rc=0
 else rc=1; echo "      directory record '$(printf '%s' "$_y14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) a window-record PATH that is not a regular file is reported as NOT OPENED (not as unread, not as empty)" $rc
@@ -2504,7 +2526,10 @@ ln -s /dev/null "$_d14f/o/.pool-sat"
 ( cd "$_d14f" && HOME="$_d14f" bash drive.sh "$_d14f/o" ) > "$_d14f/out" 2>&1
 _v14="$(cat "$_d14f/out" 2>/dev/null)"
 if grep -q 'is NOT A REGULAR FILE, so this pass did NOT open it' <<<"$_v14" \
+   && grep -q 'and measured no clip' <<<"$_v14" \
    && ! grep -q 'could not be READ' <<<"$_v14" \
+   && ! grep -q 'tier window was clipped' <<<"$_v14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_v14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_v14"; then rc=0
 else rc=1; echo "      non-regular record '$(printf '%s' "$_v14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) a NON-REGULAR window record (a device symlink) is reported as NOT OPENED — never as unread, never opened" $rc
@@ -2705,7 +2730,9 @@ if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said
   _wit_e="$(_dwit "$_d/trace-ctl" '' "$_n_c")"
   if [ -z "$_wit_e" ] || ! grep -qF "$_wit_e" "$_d/trace-mut" 2>/dev/null; then
     rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
-  elif grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+  elif grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null \
+       || grep -q 'tier window was clipped' "$_d/out-mut" 2>/dev/null \
+       || grep -qiE 'ended FULL|NEWEST members' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window (token or prose) — the check grades the file, not the code"; else rc=0; fi
 fi
 ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappears (the checks can fail)" $rc
 
