@@ -1266,6 +1266,14 @@ ck "8z50 a PIN of an unshipped provider under a scheme-less baseUrl REFUSES (rc=
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-provider-dropped" "8z51 …as a DELETED provider, which is what pi does there"
 has "$OUT" 'Unknown provider' "8z52 …quoting that sentence rather than an unbuildable URL"
+# …and the SHIPPED half of the same shape is the URL failure, not a deleted provider (measured `Invalid URL`): the
+# pin site's two branches are ordered for exactly this, so an inversion would send the operator to the wrong file field.
+HSP="$(mkset pin_badbase_noapi_shipped "$RG_NOAPI_JSON" '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HSP" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
+ck "8z53 a PIN of a SHIPPED provider with an api-less definition under a scheme-less baseUrl REFUSES (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "8z54 …with the URL reason, because pi composes an api and then cannot build the URL"
+hasnt "$OUT" "reason=models-json-provider-dropped" "8z55 …not the deleted-provider reason, which pi does not print here"
 HMY="$(mkset pin_myprov '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
 OUT="$(run_box_at "$HMY" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
 ck "8z43 a PIN of an UNSHIPPED provider with an unbuildable definition is REFUSED (rc=${rc:-<none>})" \
