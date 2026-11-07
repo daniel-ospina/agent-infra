@@ -175,13 +175,39 @@ from pathlib import Path
 #:
 #: The class is still DELIBERATELY not ``[^\t]+``: the strict/loose split exists
 #: because a key wrongly ADMITTED here enters the exemption allowlist (see the
-#: stakes in :func:`is_failure_key`), so it is widened to the parameter space our
-#: own suites actually PRODUCE — ``/``, space, and the pytest punctuation around
-#: them — rather than collapsed into the loose form. A parameter carrying some
-#: OTHER character is still rejected, and rejection is REPORTED (``rejected`` in
-#: :class:`RatesResult`, printed as ``NOTE  : rejected main rate row:``), never
-#: silently dropped: that is how a third gap would be MEASURED rather than
-#: discovered as a deadlock.
+#: stakes in :func:`is_failure_key`), so it is widened to the characters the two
+#: reported gaps were MEASURED on — ``/`` and space, plus the punctuation that
+#: surrounds them inside an id (``[ ] - . : _``) — rather than collapsed into the
+#: loose form.
+#:
+#: ⛔ THAT IS NOT THE WHOLE PARAMETER SPACE, AND THE REMAINDER IS MEASURED, NOT
+#: ASSUMED. An earlier version of this comment said the class covers "the
+#: parameter space our own suites actually PRODUCE", which was FALSE. Collecting
+#: this repo's shipped suites (``pytest tests/ scripts/test_pr_doctor.py
+#: --collect-only`` → 1891 ids, 2026-11-07) leaves **10** collected ids this form
+#: rejects while the loose form accepts: 3 in ``scripts/test_pr_doctor.py``, which
+#: ``ci.yml``'s ``test`` job runs — ``…test_capacity_rejects_a_bad_value_and_uses_the_default[+12]``,
+#: ``…[sleeps, then writes to stdout and stderr]``, ``…[writes at once, then sleeps]``
+#: — and 7 in ``test_no_runner_or_hook_wrapper_is_ever_an_identity``'s wrapper
+#: parametrization (``##[error]Bash exited with code '1'.`` …). The characters
+#: implicated are ``+ , ' # @``, plus ``( ) " \\`` among the 9 further ids under
+#: ``tests/fixtures/`` that no CI job collects.
+#:
+#: ⛔ FOR THOSE IDS #3686 IS STILL OPEN, in the shape it was reported in: main's
+#: rate row is dropped, a ``NOTE  : rejected main rate row:`` is printed beside
+#: ``BLOCK … absent from main's failure set``, and the id is unexemptible forever.
+#: Rejection is REPORTED (``rejected`` in :class:`RatesResult`), never silently
+#: dropped, which is why this remainder is MEASURED instead of being discovered
+#: as a deadlock a third time — and
+#: ``tests/test_ci_exemption.py::test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS``
+#: pins the consequence, so this paragraph cannot drift away from the code.
+#:
+#: Widening to whatever punctuation those suites happen to print was REJECTED as
+#: the remedy (agent-infra#3687 review, 2026-11-07): it is a moving target that
+#: tracks the suites rather than a character class pytest guarantees, and every
+#: character admitted HERE can purchase an exemption — the stakes #3686's scoping
+#: artifact states. Closing the remainder is a decision for #3686, not a quiet
+#: widening at the guard that decides merges.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
     r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/ ]+)$"

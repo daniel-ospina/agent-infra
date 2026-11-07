@@ -1002,14 +1002,32 @@ def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
     covers `/` and space rather than every character, and why the split must survive a
     future lane taking the tempting shortcut named in #3686's own scoping artifact.
 
-    So this pins the DIRECTION: an id carrying parameter punctuation neither our
-    suites nor #3686 produce is rejected by the strict form and accepted by the loose
-    one. Deleting the narrowness reddens HERE, by name, instead of shipping silently.
+    ⛔ THIS PINS THE DIRECTION, NOT A CLOSURE CLAIM. An earlier version of this
+    docstring justified the split with "an id carrying parameter punctuation
+    neither our suites nor #3686 produce" — FALSE, and measurably so: collecting
+    this repo's shipped suites leaves 10 collected ids the strict form rejects and
+    the loose one accepts, 3 of them in `scripts/test_pr_doctor.py` (`[+12]`, and
+    two carrying `,`) and 7 in
+    `test_no_runner_or_hook_wrapper_is_ever_an_identity` (`#` and `'`). Those ids
+    are permanently BLOCKed: **#3686 is OPEN for them, not closed**, and
+    `test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS` pins that
+    consequence so no lane can read this split as the end of the work.
+
+    What the loop below asserts is what the predicates must keep doing: an id
+    carrying punctuation the strict form does not admit is rejected by it and
+    accepted by the loose one — so deleting the narrowness reddens HERE, by name,
+    instead of shipping silently (measured: collapsing `rest` to `[^\t]+` reds
+    this test and the residual leg below, which notices that closure) — while the
+    characters this change really did add to the strict class are accepted by BOTH
+    sides.
     """
     for loose_only in (
-        "tests/test_a.py::t[a,b]",      # a comma — pytest allows it in a parameter
-        "tests/test_a.py::t[a{b}]",     # braces
-        "tests/test_a.py::t[a'b]",      # a quote
+        # a comma: pytest allows it, and this repo's own suites really print it
+        "tests/test_a.py::t[a,b]",
+        # braces: the ONLY shape-only vector here — no suite in this repo emits one
+        "tests/test_a.py::t[a{b}]",
+        # a quote: produced by the wrapper annotations (…Bash exited with code '1'.)
+        "tests/test_a.py::t[a'b]",
     ):
         assert not is_failure_key(loose_only), (
             f"the STRICT form ADMITTED {loose_only!r} — `_NODEID_RE` has been widened "
@@ -1022,6 +1040,83 @@ def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
     # narrow where it must be and equal where it must be. That pair is the whole claim.
     for shared in _PARAM_SPACE_CORPUS:
         assert is_failure_key(shared) and is_failure_key_loose(shared), shared
+
+
+#: ⛔ THE MEASURED **OPEN** REMAINDER OF #3686 — a pin on a HOLE, not a virtue.
+#:
+#: Every id below was COLLECTED from this repo's shipped suites (``pytest tests/
+#: scripts/test_pr_doctor.py --collect-only``), never invented, and every one is
+#: accepted by the PR-side predicate and rejected by the strict one. These three
+#: plus 7 siblings (the third ``scripts/test_pr_doctor.py`` id above and 6 more
+#: wrapper annotations) are the measured 10; 9 further ids live under
+#: ``tests/fixtures/``, which no CI job collects.
+_STRICT_FORM_RESIDUAL_IDS = (
+    # a `+` — and `ci.yml`'s `test` job runs this file
+    "scripts/test_pr_doctor.py::test_capacity_rejects_a_bad_value_and_uses_the_default[+12]",
+    # a `,` plus spaces in ONE parameter value
+    "scripts/test_pr_doctor.py::test_dispatch_returns_promptly_whatever_the_worker_does"
+    "[sleeps, then writes to stdout and stderr]",
+    # a `#`, a `'`, parentheses and a `.` — a real @pytest.mark.parametrize value
+    "tests/test_ci_exemption.py::test_no_runner_or_hook_wrapper_is_ever_an_identity"
+    "[##[error]Bash exited with code '1'.]",
+)
+
+
+def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
+    """⛔ THIS LEG PINS A DEFECT THAT IS STILL THERE. DELETE IT WHEN #3686 CLOSES.
+
+    The strict form gates MAIN's rate table and still does not admit `+ , ' # @`,
+    so for an id carrying one of them main's row is dropped, the PR-side failure
+    reads PR-unique, and `decide` BLOCKS it forever — #3686's reported symptom
+    with the operator-facing sentences produced here rather than quoted from the
+    issue. The pin exists for ONE reason: the direction leg above used to justify
+    the split by asserting our suites produce no such id, which was false and
+    would have taught the next lane that the class was closed.
+
+    So this leg reds in BOTH directions it must:
+
+    * a lane WIDENING `rest` to admit one of these characters → the first
+      assertion below fails, which is #3686 being CLOSED: delete this test and the
+      "NOT THE WHOLE PARAMETER SPACE" paragraph in `_NODEID_RE`'s comment, and
+      record the closure on #3686;
+    * a lane NARROWING the strict form further, or re-opening the `_RATES_RE` door
+      → `main.rejected` no longer holds the row, so the deadlock these ids pin has
+      moved and the measurement here is stale.
+
+    MUTATION: add `+` to `_NODEID_RE`'s `rest` class → the `[+12]` id stops being
+    blocked and this leg reds on the `not is_failure_key` assertion (measured:
+    `1 failed, 229 passed`).
+    """
+    for nodeid in _STRICT_FORM_RESIDUAL_IDS:
+        assert is_failure_key_loose(nodeid), nodeid
+        assert not is_failure_key(nodeid), (
+            f"{nodeid!r} is no longer a strict-form residual — `_NODEID_RE` has "
+            "been widened. If that was deliberate, DELETE this leg and the "
+            "residual paragraph in its comment, and record the closure on #3686"
+        )
+        row = f"{nodeid}\t3\t26"
+        main = parse_rates(f"{row}\n")
+        assert main.rejected == [row], (
+            "main's row for this id is no longer REJECTED, so the deadlock this "
+            f"leg pins has moved: rates={main.rates!r}"
+        )
+        pr = parse_failure_rows(f"{row}\tsg-residual\n").failures
+        assert nodeid in pr, (
+            "the PR-side parser dropped the row, so this leg would be vacuous"
+        )
+        decision = decide(
+            pr, main.rates, main_signatures={}, k_pr=26, rate_tolerance=1.5
+        )
+        assert [v.nodeid for v in decision.blocked] == [nodeid], (
+            "the residual is no longer BLOCKED, so #3686 may have closed for "
+            f"these ids: exempt={[v.nodeid for v in decision.exempt]}"
+        )
+        assert decision.blocked[0].line.startswith("BLOCK : "), (
+            "the operator-facing sentence changed shape, so the claim this leg "
+            "pins — a rejected main rate row beside an absent-from-failure-set "
+            "BLOCK — may no longer be what a lane reads: "
+            + decision.blocked[0].line
+        )
 
 
 def test_a_path_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
