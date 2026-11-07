@@ -513,7 +513,15 @@ ck "…so level 5 is reachable ONLY at zero un-owned PRs (the pole, stated as a 
 # inert streak). The expected level is `-` (never measured): a parked PR is not work for any level.
 ck "a PR the count has EXCLUDED (UPN_WORK=0 — parked at this head) must NOT hold the room" \
    "$(drive_block 1 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	RED
-' - - 0)" "10 0 0 -"
+' - - 0)" "10 0 0 5"
+# ⛔ LEVEL 1 DOES NOT DEPEND ON THE UN-OWNED COUNT, AND THE ARM ORDER IS THE ASSERTION (review P2,
+# 2026-11-06). The zero-un-owned short-circuit sits AFTER the main-red verdict for exactly this state:
+# a RED main with NO un-owned PRs must still resolve level 1 and hold the room. When the two guards
+# were the other way round, this state read "no level", the issue path opened, and §6's statement that
+# "a red main closes the issue path" was false in the state where it reads worst. Nothing pinned it.
+ck "a RED MAIN still holds when there are ZERO un-owned PRs (the short-circuit must not bypass level 1)" \
+   "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
+' - 'RED:verify' 0)" "0 1 0 1"
 ck "levels 1-4 empty -> the issue batch gets the leftover room (10 slots, pr_waiting=0)" \
    "$(drive_block 0 2 25 10 1 '9001:shaA:fix/a' '9001	shaA	GREEN
 ' 9001 - 1)" "10 0 0 5"
@@ -1064,7 +1072,7 @@ awk '/^  # \[cascade:begin\]/{f=1} f{print} /^  # \[cascade:end\]/{if(f) exit}' 
 [ "$CASCADE_ISSUE_SLOTS" = 0 ] && echo yes || echo no
 PEOF
 mut "M12 a higher level no longer HOLDS the room (an issue is dispatched while a merge waits)" \
-    's/^                 CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;$/                 CASCADE_LEVEL_HOLDS=1 ;;/' "$TMP/p-hold.sh"
+    's/^               CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;$/               CASCADE_LEVEL_HOLDS=1 ;;/' "$TMP/p-hold.sh"
 
 cat > "$TMP/p-unmeas.sh" <<'PEOF'
 . "$ORCH_FNS"
