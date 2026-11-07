@@ -820,6 +820,43 @@ if [ -f "$HERE/gh-rest/gh" ]; then
   else
     warn "gh-limit.py missing from the shipped set — gh calls will NOT be serialised or backed off (#1988)"
   fi
+  # ── the credential layer (#3429) ─────────────────────────────────────────────
+  # `gh-limit.py` resolves `gh-cred.py` as a SIBLING, so a box that gets the limit layer must get this
+  # too or every read falls back to the user bucket with the named arm `no-helper` — i.e. the fleet
+  # silently returns to the state #3429 measured (`core` at `0/5000` three times in one day). Same
+  # parse gate and same stage-then-rename as `gh-limit.py`, and for the same reason: it is executed by
+  # every gh call.
+  if [ -f "$HERE/gh-cred.py" ]; then
+    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-cred.py" 2>/dev/null \
+      || die "gh-cred.py does not parse"
+    _tmpc="$O/.seed-gh-cred.py.$$"
+    cp "$HERE/gh-cred.py" "$_tmpc" || { rm -f "$_tmpc"; die "cannot stage gh-cred.py into $O"; }
+    chmod 0755 "$_tmpc"             || { rm -f "$_tmpc"; die "cannot chmod gh-cred.py"; }
+    mv -f "$_tmpc" "$O/gh-cred.py"   || { rm -f "$_tmpc"; die "cannot install $O/gh-cred.py"; }
+    # The operator's name for it. `gh-app-token --status` / `--refresh` is the surface the operator
+    # note tells them to reach for, so it is installed beside it. That note lives in
+    # docs/ops/gh-rate-limits.md ("Which credential", "Blast radius") — an operator following the
+    # one warning they get must not be sent to a separate page that does not exist (caught in review:
+    # this comment and the warning below both named one).
+    if [ -f "$HERE/gh-app-token" ]; then
+      _tmpa="$O/.seed-gh-app-token.$$"
+      cp "$HERE/gh-app-token" "$_tmpa" || { rm -f "$_tmpa"; die "cannot stage gh-app-token into $O"; }
+      chmod 0755 "$_tmpa"               || { rm -f "$_tmpa"; die "cannot chmod gh-app-token"; }
+      mv -f "$_tmpa" "$O/gh-app-token"   || { rm -f "$_tmpa"; die "cannot install $O/gh-app-token"; }
+    fi
+    # ⛔ THE PRIVATE KEY IS NOT PART OF THE SHIPPED SET, AND MUST NEVER BE. `deploy-harness.sh`
+    # copies every file under this source tree; the key lives at `~/.pi/agent/gh-app.pem`, outside
+    # every checkout, so no deploy can propagate it to a cell. That is the owner's "do not copy the
+    # private key per lane or per cell" constraint enforced by layout rather than by convention —
+    # see docs/ops/gh-rate-limits.md §Blast radius.
+    if [ -r "${HOME:-/nonexistent}/.pi/agent/gh-app.pem" ]; then
+      ok "gh credential layer installed (App key present — reads use the installation bucket)"
+    else
+      warn "gh credential layer installed but ~/.pi/agent/gh-app.pem is ABSENT — every read stays on the user bucket (arm=no-key). See docs/ops/gh-rate-limits.md §Which credential"
+    fi
+  else
+    warn "gh-cred.py missing from the shipped set — every gh read falls back to the user credential (arm=no-helper, #3429)"
+  fi
   # ⛔ Route the PATH entry through add_dir, NOT a bare assignment: add_dir applies the TCC guard
   # (a physical path under ~/Documents is EPERM for launchd) that no install-time probe can see.
   add_dir "$O/gh-rest"
