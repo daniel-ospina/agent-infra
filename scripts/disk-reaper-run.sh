@@ -42,21 +42,6 @@ if [ -z "${HOME:-}" ] || [ ! -d "${HOME:-}" ]; then
     fi
 fi
 export HOME
-# ⛔ AND CELL_HOME MUST REACH THE CHILD. It is computed above (and used as the HOME fallback), but the
-# assignment is a SHELL variable: a child process never received it. The delegate's `home-or-state`
-# guard compares a candidate against `"${HOME}" "${CELL_HOME}" "${REAP_AW_STATE_DIR}"`, so on the
-# unit's path — `Environment=HOME=/home/cmux`, which IS a real directory, so the fallback above never
-# substitutes — the guard compared against `/home/cmux` only and `/tmp/cell-home` matched none of the
-# three references. MEASURED (#3278, 2026-11-06): on an armed pass `/tmp/cell-home` (a live ~20 GB
-# operative home holding the cell's `.pi` state, and with no `.git` so no `main-checkout` guard of its
-# own) was preserved by `reason=gitless-cap` — a rate limit, not a named gate — and reached no other
-# guard. Exporting it here makes the guard live on the path where nothing else protects that tree.
-# SCOPE: this fixes the systemd entry point, which is the path the measurement came from. The darwin
-# plist invokes `disk-reaper.sh` directly
-# (`templates/launchd/reaper/com.eldato.disk-reaper.plist:103`) and is covered by the delegate's own
-# default instead (`reap-abandoned-worktrees.sh`, the `home-or-state` loop), so neither caller depends
-# on this export — it exists so the value a scheduler resolved is the value the whole chain sees.
-export CELL_HOME
 
 # The cell's keys/env (PATH, provider keys). Optional: absent on a box that does not use one.
 if [ -r "$HOME/keys.env" ]; then
