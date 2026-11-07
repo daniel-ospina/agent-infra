@@ -996,8 +996,12 @@ _skew_decl="$(sed -n 's/^AGENT_HARNESS_SKEW_REFUSED=\([0-9][0-9]*\)$/\1/p' \
 # whole arm stayed GREEN against a code that had moved. That is the fail-open the header of
 # `spawn-gate.test.sh` records as measured for this very `^NAME=` anchor (the note about `grep`ping a
 # declaration with an anchor it did not anticipate) — quoted, not line-numbered, for the reason this PR
-# keeps re-learning. So the read is ASSERTED separately and the value is used verbatim:
-# a reshape reds "the derivation could not read the declaration" instead of quietly testing a stale number.
+# keeps re-learning. So the read is ASSERTED separately, and the literal fallback below runs ONLY AFTER that
+# assertion has already RED. That distinction is the whole point, so state it exactly (round-11 review of
+# #3645, P3 — the earlier wording claimed the value was "used verbatim" while `:-83` still stood on the next
+# line): `ck` counts a red and RETURNS, it does not abort — this file is `set -uo pipefail`, with no `-e` — so
+# §O3 still EXECUTES against the literal instead of the suite stopping at a reshape. The old silent default
+# could buy a GREEN; this fallback can only ever FOLLOW a red that has already been counted and printed.
 [ -n "$_skew_decl" ]; ck $? "the skew code is READABLE from spawn-gate.sh's declaration (got '${_skew_decl:-<none>}') — a reshape must red here, not fall back to a literal"
 _skew_rc="${_skew_decl:-83}"
 echo; echo "§O3 spawn-point HELPER/SYNC refusal (rc=$_skew_rc) => exit $_skew_rc, named as a harness fault"
