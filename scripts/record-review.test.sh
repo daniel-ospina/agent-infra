@@ -122,6 +122,21 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #                                   `-X GET` exits 1 (real gh → POST → 404).
 #   PATCH (-X PATCH … --input -)  → swallow stdin; exit 1 when STUB_PATCH_FAIL=1
 #   rerun (-X POST … /rerun)      → 201; exit 1 when STUB_RERUN_FAIL=1
+#   comments (… /issues/<n>/comments) → the DURABLE comment channel (#3168):
+#                                   READ (--paginate … --jq) prints
+#                                   ${STUB_COMMENT_BODIES:-} verbatim, or — when
+#                                   the ENVELOPE fixture ${STUB_COMMENT_JSON:-} is
+#                                   set — applies the caller's OWN --jq
+#                                   expression to it with the real `jq` (so the
+#                                   recorder's frame expression — the delimiter
+#                                   strip and the record terminator — is EXECUTED,
+#                                   not merely present in the source), or a
+#                                   NON-EMPTY error body on STDOUT with exit 1
+#                                   when STUB_COMMENT_FAIL=1 (the `gh api`
+#                                   shape that must never be read as "no
+#                                   comment"); POST (-X POST … --input -)
+#                                   captures stdin to ${STUB_COMMENT_CAPTURE:-}
+#                                   and exits 1 when STUB_COMMENT_POST_FAIL=1
 mkdir -p "$T/bin"
 cat > "$T/bin/gh" <<'STUB'
 #!/usr/bin/env bash
@@ -171,14 +186,66 @@ if [ "$1" = "api" ]; then
     #                           markers, for the idempotency pin).
     #   STUB_COMMENTS_FAIL=1  → a transient READ failure: the comment post must
     #                           then be SKIPPED, not duplicated.
+    #   STUB_COMMENT_POST_FAIL=1 → the POST is refused (the 403 / spent-token arm).
+    #                           ⛔ MODELLED IN THIS ARM TOO (#3168 merge resolution):
+    #                           the producer reads with `--jq`, so THIS is the arm a
+    #                           real run hits both for the read and for the write. A
+    #                           stub that only failed the POST in the other arm left
+    #                           the failure path unreachable and its vector green.
     #   STUB_COMMENT_CAPTURE  → sink for a POST body, so the suite can assert the
     #                           COMMENT really carries the marker.
+    # ⛔ ONE ARM, BOTH READS (#3168 re-review P2). This arm was previously followed by
+    # a SECOND `…/issues/<n>/comments` arm carrying the ENVELOPE / FAILURE / BODIES
+    # behaviour. The two matched the SAME regex and THIS one `exit 0`s in every branch,
+    # so the second was UNREACHABLE: `STUB_COMMENT_JSON`, `STUB_COMMENT_FAIL` and
+    # `STUB_COMMENT_BODIES` were inert knobs the header above advertised as live, and a
+    # later author following that header would have written a vector testing nothing
+    # (measured: driving the stub with an envelope printed the raw `STUB_COMMENTS`
+    # frame and the caller's `--jq` was never applied). Folded in HERE, so there is one
+    # read path and no arm can shadow another again.
+    # ⛔ NARROW: `…/issues/<n>/comments` is the PR's comment LIST; `…/issues/comments/<id>`
+    # is the SINGLE-comment read used by `--evidence comment:<id>` and must keep
+    # falling through to the generic tail. An unanchored `/comments` match swallowed
+    # the evidence read and reddened §13h.
     if grep -qE -- "/issues/[0-9]+/comments" <<<"$*"; then
         if grep -qF -- "--jq" <<<"$*"; then
             [ "${STUB_COMMENTS_FAIL:-0}" = "1" ] && exit 1
+            # ⛔ THE FAILURE ARM IS THE LOAD-BEARING ONE: `gh api` writes a NON-EMPTY
+            # JSON error body to STDOUT *and* exits non-zero, so a producer that
+            # captured stdout without testing the exit status would read
+            # `{"message": "API rate limit exceeded"}` as comment text and could
+            # conclude the marker is already posted when it is not.
+            if [ "${STUB_COMMENT_FAIL:-0}" = "1" ]; then
+                printf '%s\n' '{"message":"API rate limit exceeded","status":"403"}'
+                exit 1
+            fi
+            # ⛔ MODEL --jq, DO NOT IGNORE IT. When a JSON ENVELOPE fixture is supplied,
+            # apply the CALLER'S OWN expression to it with the real jq — the same shape
+            # real `gh` has. Without this the recorder's frame expression (the
+            # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator at
+            # scripts/record-review.sh:1901-1902) is executed by NO vector at all: every
+            # other fixture supplies the frame PRE-BUILT through $STUB_COMMENTS, so
+            # deleting either half of the expression left the suite GREEN. §14.1d(b4)
+            # is the vector that now reddens when the strip is removed.
+            if [ -n "${STUB_COMMENT_JSON:-}" ]; then
+                _cjq="" _cprev=""
+                for _carg in "$@"; do
+                    if [ "$_cprev" = "--jq" ]; then _cjq="$_carg"; break; fi
+                    _cprev="$_carg"
+                done
+                if [ -n "$_cjq" ]; then
+                    jq -r "$_cjq" <<<"$STUB_COMMENT_JSON" || exit 1
+                    exit 0
+                fi
+            fi
+            if [ -n "${STUB_COMMENT_BODIES:-}" ]; then
+                printf '%s\n' "${STUB_COMMENT_BODIES}"
+                exit 0
+            fi
             printf '%s' "${STUB_COMMENTS:-}"
             exit 0
         fi
+        [ "${STUB_COMMENT_POST_FAIL:-0}" = "1" ] && exit 1
         if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then cat >"$STUB_COMMENT_CAPTURE"; else cat >/dev/null; fi
         printf '{}\n'
         exit 0
@@ -2889,7 +2956,7 @@ fi
 #      evidence, so the refusal must come from the missing PROOF, not from the mint word:
 #      a real delta record DOES write top-level `carry_arm` and `evidence`, so naming the mint
 #      alone buys nothing. The write is the `CARRY_FIELDS="\"carry_arm\":\"$CARRY_ARM\","` line
-#      (scripts/record-review.sh:4226 at this head — RE-DERIVE it, do not trust the number: a bare
+#      (scripts/record-review.sh:4703 at this head — RE-DERIVE it, do not trust the number: a bare
 #      line citation here rotted once already, :4174 -> :4210, and this comment is not what makes
 #      the assertion true). One command answers it:
 #        grep -n 'CARRY_FIELDS=.*carry_arm' scripts/record-review.sh
@@ -2909,8 +2976,8 @@ unset CC_OUT CC_RC CC_REPO CC_RDIR CC_HEAD CC_STALE CC_DIFF CC_DIFF_B CC_SHA CC_
 # 11.14 #2872 — `--recover-body`: rebuild a MISSING record from the PR body's
 #       SIGNED marker.
 # ─────────────────────────────────────────────────────────────────────────
-# WHY THIS EXISTS. The record file is PER BOX; the signed marker in the PR body
-# is the only copy of the verdict that TRAVELS with the PR. Measured 2026-10-26:
+# WHY THIS EXISTS. The record file is PER BOX; the signed marker in the PR body was
+# the only copy of the verdict that TRAVELLED until #1224 added the comment copy. Measured 2026-10-26:
 # of 45 open PRs, 12 carried a marker whose `diff=` equalled the PR's live diff
 # with no record file on the merging box, and the registry covered 2 of them —
 # so 10 lanes were being told to run a second 20-40 minute review for a verdict
@@ -4965,12 +5032,12 @@ assert_eq "$_probe_rc" "3" "13o2 T17 positive control: a run that reached its su
 # of the check-runs read, and fail-soft on every failure stage.
 run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
     local pr="$1" sha="$2" cruns="$3"; shift 3
-    local rcfile="$T/rc633" errfile="$T/err633" cap="$T/cap633"
+    local rcfile="$T/rc633" errfile="$T/err633" cap="$T/cap633" outfile="$T/out633"
     # RR633_SCRIPT lets a mutation pin run the SAME vector against a mutated copy
     # of the recorder (the #10177 pin needs it: a rule that cannot be removed in a
     # copy cannot be shown to be load-bearing).
     local rec="${RR633_SCRIPT:-$RECORD}"
-    : > "$LOG"; : > "$cap"; rm -f "$errfile"
+    : > "$LOG"; : > "$cap"; : > "$outfile"; rm -f "$errfile"
     (
         export HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG"
         export STUB_BODY="${STUB_BODY:-PR body}"
@@ -4980,6 +5047,20 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         export STUB_CHECK_RUNS_FAIL="${STUB_CHECK_RUNS_FAIL:-0}"
         export STUB_RERUN_FAIL="${STUB_RERUN_FAIL:-0}"
         export STUB_PATCH_FAIL="${STUB_PATCH_FAIL:-0}"
+        # agent-infra#3168: the durable comment channel's knobs. Passed through so a
+        # vector can serve an admitted comment set, model the `gh api` read failure
+        # (a NON-EMPTY error body on STDOUT plus a non-zero exit), and capture the
+        # posted comment body for the idempotency vector.
+        export STUB_COMMENT_BODIES="${STUB_COMMENT_BODIES:-}"
+        # #3168 re-review P3: the ENVELOPE fixture the stub applies the caller's own
+        # `--jq` to. Without it the admission constant could only be pinned as SOURCE
+        # TEXT (measured: the drop-the-filter mutant stayed GREEN).
+        export STUB_COMMENT_JSON="${STUB_COMMENT_JSON:-}"
+        export STUB_COMMENT_FAIL="${STUB_COMMENT_FAIL:-0}"
+        export STUB_COMMENT_POST_FAIL="${STUB_COMMENT_POST_FAIL:-0}"
+        export STUB_COMMENT_CAPTURE="${STUB_COMMENT_CAPTURE:-}"
+        export STUB_BODY_FAIL="${STUB_BODY_FAIL:-0}"
+        export STUB_BODY_FAIL_TEXT="${STUB_BODY_FAIL_TEXT:-}"
         # Review finding 3: an UNSIGNED marker (no key) must not fire the rerun.
         # The runner passes the caller's gate key through so a vector can unset
         # it (the suite exports a deterministic key at the top).
@@ -4988,12 +5069,17 @@ run_record_633() { # <pr> <sha> <check-runs-json> [extra record args…]
         export AI_REVIEW_GATE_CHECK_NAME="${AI_REVIEW_GATE_CHECK_NAME-}"
         [ -n "${STUB_HEAD_SHA:-}" ] && export STUB_HEAD_SHA
         rc=0
-        bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" || rc=$?
+        bash "$rec" "$pr" "$sha" clean "daniel-ospina/agent-infra" "$@" $EV_ARGS 2>"$errfile" 1>"$outfile" || rc=$?
         printf '%s' "$rc" > "$rcfile"
     ) 2>/dev/null || true
     RECORD_RC="$(cat "$rcfile" 2>/dev/null || echo 99)"
     RECORD_ERR="$(cat "$errfile" 2>/dev/null || true)"
     RECORD_CAP633="$(cat "$cap" 2>/dev/null || true)"
+    # STDOUT, captured separately (#3168 review cycle 4). The durable channel's
+    # SUCCESS line goes to stdout and NOTHING inspected it — so restoring the old
+    # "(body mirror retained: …)" tail, which asserts a body-channel state this
+    # function cannot know, left the suite at PASS=936 FAIL=0.
+    RECORD_OUT633="$(cat "$outfile" 2>/dev/null || true)"
 }
 
 # The "marker already present" state is PRODUCED, not hand-built: run once on a
@@ -5051,6 +5137,342 @@ if grep -q -- ' -f ' <<<"$(grep -E 'commits/.*/check-runs' "$LOG" || true)"; the
     fi
 else
     ok "14.1b the check-runs read carries its parameters in the query string (transport)"
+fi
+
+# 14.1c THE LINE-ANCHORED PRESENCE PREDICATE (agent-infra#3168). ⛔ THE ATTRIBUTION IS
+#     PART OF THE PIN — and it was WRONG twice before this correction (#3168 re-review
+#     finding 2), so state it exactly: THIS DIFF ANCHORS **NO** SITE in the recorder.
+#     All four `grep -qxF` sites are ALREADY anchored on main
+#     (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
+#     → :1939 :3643 :5956 :6068) and the same four are at head
+#     (`grep -n 'grep -qxF' scripts/record-review.sh` → :2003 :3729 :6056 :6201):
+#     the only diff hunk at `post_marker()` (:1995-2005) ADDS A COMMENT — the
+#     predicate line beside it is CONTEXT, not a change.
+#     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`, main :4643 / head :6056). It is a
+#     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
+#     main-regression pin for the same reason. Keeping them is right (main's
+#     anchoring should not silently regress); calling them evidence about this diff
+#     was not. It matches
+#     the gate's own `^…$` admission of a body marker. A body that merely
+#     CITES the marker mid-line is the discriminating case: unanchored `-qF` read
+#     it as PRESENT, so the recorder PATCHed nothing and set MARKER_PRESENT=1 on
+#     a line the gate rejects — the evidence never reached the channel the gate
+#     reads, and the stale pre-evidence run was not re-run either, so a correctly
+#     reviewed PR stayed red with its verdict nowhere admissible. 14.1 is this
+#     vector's NEGATIVE CONTROL (the marker alone on its line ⇒ no PATCH): the two
+#     differ ONLY in anchoring, so a revert to `-qF` reddens 14.1c while 14.1
+#     stays green — which is what makes the pair pin the predicate rather than
+#     the fixture. The marker text is SEEDED from the recorder's own post (never
+#     hand-written) so its diff=/sig= contract cannot drift from the script's.
+QB_PR=424339
+QB_SEED="$(seed_marker_body "$QB_PR")"
+QB_LINE=""
+if [ -n "$QB_SEED" ]; then
+    QB_LINE="$(printf '%s\n' "$QB_SEED" | grep -E '^review recorded: ' | head -1 || true)"
+fi
+if [ -n "$QB_LINE" ]; then
+    ok "14.1c the seed produced a marker line to quote (prerequisite)"
+else
+    bad "14.1c no marker line in the seeded body — the anchor vector would judge a fixture, not the predicate"
+fi
+# Same bytes, NOT alone on their line: a lane citing the attestation in prose.
+QB_BODY="A lane cited the attestation inline: $QB_LINE — see above.
+"
+STUB_BODY="$QB_BODY" run_record_633 "$QB_PR" "$SHA" \
+    '[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":901}]'
+if grep -qF -- "-X PATCH" "$LOG"; then
+    ok "14.1c a mid-line marker does not suppress the append (anchored presence test)"
+else
+    bad "14.1c a mid-line marker SUPPRESSED the append — the unanchored -qF is back (log: $(cat "$LOG"))"
+fi
+QB_NEWBODY="$(printf '%s' "$RECORD_CAP633" | jq -r '.body // empty' 2>/dev/null || true)"
+if [ -n "$QB_LINE" ] && grep -qxF -- "$QB_LINE" <<<"$QB_NEWBODY"; then
+    ok "14.1c …and the posted body carries the marker on a line of its OWN (gate-admissible)"
+else
+    bad "14.1c the posted body carries no anchored marker line (capture: $QB_NEWBODY)"
+fi
+# The OTHER half of the same predicate: MARKER_PRESENT is re-read from the body
+# AFTER the post (BODY_NOW). ⛔ THIS PINS THE RE-READ, NOT A HAZARD — say what was
+# MEASURED: the anchoring of the MARKER_PRESENT site cannot be discriminated by
+# ANY fixture here. A successful ANCHORED append always leaves `$MARKER` alone on
+# a line in BODY_NOW, and the pre-fix `-qF` is strictly MORE permissive, so
+# reverting ONLY that site keeps this vector green (measured: PASS=908 FAIL=0 with
+# that one site reverted) — the same reason 14.1 above cannot catch a one-sided
+# revert either; assertions 1–2 are what pin the append decision, which is the one
+# that can lose evidence. What this assertion does catch is the re-read being
+# dropped: without `BODY_NOW="$NEWBODY"` the marker is posted and the recorder
+# still believes it absent, so the #633 rerun is skipped on a head that has it.
+if grep -qF -- "actions/jobs/901/rerun" "$LOG"; then
+    ok "14.1c MARKER_PRESENT sees the appended line — the stale run is re-run, not skipped"
+else
+    bad "14.1c the re-read did not see the appended marker ⇒ the stale run was never re-run (log: $(cat "$LOG"))"
+fi
+
+# 14.1d THE DURABLE COMMENT CHANNEL (agent-infra#1224 producer half, #3168).
+#      NO assertion pinned this channel: neutering the POST left the suite at
+#      PASS=908 FAIL=0, so the two arms that can LOSE or DUPLICATE the evidence —
+#      the dedup read and the read-FAILURE arm — were unpinned. Each vector below
+#      reddens when its arm is removed, and each asserts the TRANSPORT (a POST in
+#      the stub log), never the exit code alone.
+# ⛔ ONE PRODUCER (merge resolution). The channel has exactly ONE writer —
+# `post_review_evidence_comment` — so every fixture below feeds it in the GATE'S
+# OWN FRAME `<assoc>\x1f<body>\x1e` (`STUB_COMMENTS`), which is what its `--jq`
+# admission predicate consumes. A bare-body fixture never reaches that predicate:
+# measured, it posted anyway and the idempotency pin passed for the wrong reason.
+DC_PR=424341
+DC_CRUNS='[{"name":"ai-review-gate","status":"completed","conclusion":"failure","id":902}]'
+dc_posts() { command grep -cF -- "-X POST repos/daniel-ospina/agent-infra/issues/$1/comments" "$LOG" 2>/dev/null || true; }
+# (a) a signed record publishes the marker to the comment channel exactly once.
+STUB_COMMENT_BODIES="" STUB_COMMENT_CAPTURE="$T/ccap_a" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d a signed record posts the marker to the durable comment channel exactly once"
+DC_MARKER="$(jq -r '.body // empty' "$T/ccap_a" 2>/dev/null || true)"
+if [ -n "$DC_MARKER" ]; then
+    ok "14.1d the posted comment carries a body (prerequisite for the idempotency vector)"
+else
+    bad "14.1d the comment POST captured no body — the idempotency vector would judge a fixture, not the code"
+fi
+# (b) IDEMPOTENCY: an admitted comment already carrying this exact marker ⇒ no POST.
+STUB_COMMENTS="OWNER"$'\037'"$DC_MARKER"$'\036' STUB_COMMENT_CAPTURE="$T/ccap_b" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marker is NOT duplicated (idempotency)"
+# (b2) ⛔ THE DEDUP DEMANDS THE **WHOLE BODY** — and (b) CANNOT see it (fresh-review
+#      finding 1). (b) serves the marker as the WHOLE comment body, which satisfies both
+#      whole-body equality and a substring test, so (b) alone cannot discriminate.
+#      ⛔ THE MUTANT NAMED HERE USED TO BE WRONG (#3168 re-review finding 2): this row
+#      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
+#      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
+#      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
+#      (scripts/record-review.sh:1925), so that mutant does not exist and could not
+#      have been measured. The mutant that actually makes (b2) meaningful is replacing
+#      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
+#      reddens (b2) — which expects 1 POST and would get 0.
+#      That is not a style flag: under a substring test, any admitted comment that
+#      merely CITES or QUOTES the marker mid-line satisfies the dedup on EVERY later
+#      run, so the channel never posts again — the durable copy is permanently dead —
+#      and nothing reds. It is the same asymmetry the BODY channel is pinned for at
+#      14.10f (which is likewise a MAIN-regression pin), on the durable channel.
+#      The gate admits a comment only when the marker is ALONE IN THE BODY, so the
+#      producer must not treat a quoting comment as "already posted".
+# ⛔ SAME PR AS (b), ON PURPOSE. The marker embeds `reviews/<pr>.json`, so a body
+#    quoting ANOTHER PR's marker cannot match this run's marker under EITHER flag —
+#    that vector passes while proving nothing (measured: the first draft of this
+#    very arm used $DC_PR+1 and stayed GREEN under the `-qF` mutant). Reusing
+#    $DC_PR makes (b) and (b2) a non-vacuous PAIR on one PR and one marker: the
+#    same run that posts 0 for an EXACT whole-body match must post 1 for a body
+#    that merely CONTAINS the marker, so neither arm can pass on a short-circuit.
+STUB_COMMENTS="OWNER"$'\037'"see the record below — $DC_MARKER — and that is all"$'\036' \
+    STUB_COMMENT_CAPTURE="$T/ccap_b2" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "1" \
+    "14.1d a comment that merely QUOTES the marker mid-line does NOT satisfy the dedup (line-anchored, like the gate's admission)"
+if [ -s "$T/ccap_b2" ]; then
+    ok "14.1d …and the post it makes carries a body (the vector is not judging an empty capture)"
+else
+    bad "14.1d the anchored-dedup vector captured no POST body — it would pass on a post that never happened"
+fi
+# (b4) ⛔ THE FRAME EXPRESSION IS **EXECUTED**, NOT MERELY PRESENT (#3168 re-review P2).
+#      The read hands the gate's own expression to `--jq`:
+#        .[] | "<assoc>\u001f<body | gsub("[\u001e\u001f]"; "")>" + "\u001e"
+#      BOTH halves are load-bearing: the strip because an UNSTRIPPED body can FORGE the
+#      frame (the recorder's own comment at :1894-1895 names the measured exploit), the
+#      `\u001e` because it is how records are split. NO OTHER VECTOR EXERCISES EITHER —
+#      every other fixture feeds the frame PRE-BUILT through $STUB_COMMENTS, so the
+#      recorder's expression is never evaluated and deleting the strip left the suite
+#      GREEN. This one serves a JSON ENVELOPE (the shape real `gh api` returns) and
+#      asserts through the POST COUNT.
+#      ⛔ NON-VACUITY (measured): at head the strip removes the delimiters smuggled in the
+#      body, the forged record never forms, and this run is UNAFFECTED by an unadmitted
+#      author's comment ⇒ 1 POST. With `gsub(...)` deleted the smuggled
+#      `\u001eOWNER\u001f<marker>` survives the split as its own record, the dedup matches
+#      it, and the channel is suppressed for ever by a drive-by comment ⇒ 0 POST —
+#      exactly the state the strip exists to prevent.
+if [ -n "$DC_MARKER" ]; then
+    _dcj_body="$(printf 'drive-by note\036OWNER\037%s' "$DC_MARKER")"
+    _dcj_forged="$(jq -nc --arg b "$_dcj_body" '[{author_association:"NONE", body:$b}]')"
+    STUB_COMMENT_JSON="$_dcj_forged" STUB_COMMENT_CAPTURE="$T/ccap_b4" \
+        run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+    assert_eq "$(dc_posts "$DC_PR")" "1" \
+        "14.1d(b4) a FORGED record smuggled inside a comment body does not satisfy the dedup (the delimiter strip is executed)"
+    if [ -s "$T/ccap_b4" ] && command grep -qF -- "$DC_MARKER" "$T/ccap_b4"; then
+        ok "14.1d(b4) …and the post it makes carries the real marker (the envelope reached the recorder, not a fixture)"
+    else
+        bad "14.1d(b4) the envelope vector did not post the marker — the ENVELOPE fixture never reached the caller's --jq"
+    fi
+else
+    bad "14.1d(b4) vector SKIPPED — the marker fixture is empty; the frame-expression pin did NOT run"
+fi
+# (b3) ⛔ THE SUCCESS LINE'S SCOPE (#3168 review cycle 4). This line reports only what
+#      the producing function observed — it created a comment — and it must NOT assert
+#      the state of the BODY mirror, which FOUR of its five call sites reach unsaved.
+#      The old tail "(body mirror retained: it is what re-triggers the gate)" was
+#      deleted by this PR and nothing pinned its absence (measured: restoring it left
+#      the suite at PASS=936 FAIL=0). The POSITIVE assertion comes first on purpose —
+#      a negative alone passes on an EMPTY variable and would prove nothing.
+assert_contains "$RECORD_OUT633" "as a COMMENT (#1224" \
+    "14.1d the success line names the durable copy it created (stdout capture is live)"
+assert_not_contains "$RECORD_OUT633" "body mirror retained" \
+    "14.1d …and does not assert the BODY mirror's state, which this function cannot know"
+assert_not_contains "$RECORD_OUT633" "re-triggers the gate" \
+    "14.1d …nor re-assert the retired claim about what re-triggers the gate"
+# (c) READ-FAILURE: `gh api` writes a NON-EMPTY error body to STDOUT and exits
+#     non-zero. The durable post must be SKIPPED (never read as "no comment" ⇒
+#     post), the warning must name it, and the record must still succeed.
+STUB_COMMENTS_FAIL=1 STUB_COMMENT_CAPTURE="$T/ccap_c" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a FAILED comment read does not post (an error body is not 'no comment exists')"
+assert_contains "$RECORD_ERR" "could not READ the PR comments" "14.1d …and the failure is reported loudly, not swallowed"
+# ⛔ AND IT PROMISES NO RETRY IT CANNOT HONOUR (#3168 review cycle 4). "The verb that
+#    produced this message has to be re-run to retry" is FALSE outright at ONE call site:
+#    --recover-body refuses once a record exists. ⛔ THE FLUSH IS NOT THE SAME SHAPE and the
+#    line must not flatten them (#3168 round-15): flush_pending_markers removes its pending
+#    marker only when its body post SUCCEEDS, so a FAILED post IS retried by a second
+#    --flush-pending — the message now states the conditional, not a flat denial.
+assert_not_contains "$RECORD_ERR" "has to be re-run to retry" \
+    "14.1d …and does not promise a verb-agnostic retry (false outright only at the recover-body site)"
+assert_not_contains "$RECORD_ERR" "the body copy above is unaffected" \
+    "14.1d …nor resurrect the old false claim that the body copy is unaffected"
+assert_eq "$RECORD_RC" "0" "14.1d …and a failed comment read never fails the record [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+# (d) UNSIGNED-ONLY: the gate can never accept an unsigned marker, and a comment is
+#     permanent, so it must never be published to that channel.
+AI_REVIEW_GATE_KEY="" STUB_COMMENT_CAPTURE="$T/ccap_d" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d an UNSIGNED marker is never published as a comment"
+# (d-g) THE ADMISSION RULE IS PINNED **BEHAVIOURALLY** (#3168 re-review finding 3,
+#       cycle 2). It is the ONLY author filter on a permanent public channel AND the
+#       predicate the dedup matches against. A first version of this pin asserted the
+#       rule's TEXT in the recorder's source, which is not the behaviour. The pin is a
+#       pair that discriminates: the SAME marker, ALONE AS THE WHOLE BODY, from authors
+#       on either side of the filter, must produce OPPOSITE POST counts. Per-association
+#       runs, so dropping any ONE association from the filter reddens exactly that run
+#       instead of hiding behind the others.
+# ⛔ EVERY run below reuses $DC_PR, ON PURPOSE. The marker embeds `reviews/<pr>.json`,
+#    so a fixture built from PR N's marker can never match a run on PR M — a first
+#    draft used fresh PR numbers and posted 1 for every admitted vector (measured).
+if [ -n "$DC_MARKER" ]; then
+    for ADM_ASSOC in OWNER MEMBER COLLABORATOR; do
+        STUB_COMMENTS="$ADM_ASSOC"$'\037'"$DC_MARKER"$'\036' \
+            STUB_COMMENT_CAPTURE="$T/ccap_g_$ADM_ASSOC" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+        assert_eq "$(dc_posts "$DC_PR")" "0" \
+            "14.1d(g) an ADMITTED $ADM_ASSOC comment already carrying the marker suppresses the duplicate"
+    done
+    STUB_COMMENTS="NONE"$'\037'"$DC_MARKER"$'\036'"FIRST_TIMER"$'\037'"$DC_MARKER"$'\036' \
+        STUB_COMMENT_CAPTURE="$T/ccap_g_driveby" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+    assert_eq "$(dc_posts "$DC_PR")" "1" \
+        "14.1d(g) …while an UNADMITTED author's comment carrying the SAME marker does NOT suppress it (drop-the-filter mutant: 0)"
+    if [ -s "$T/ccap_g_driveby" ]; then
+        ok "14.1d(g) …and the post it makes carries a body (the vector is not judging an empty capture)"
+    else
+        bad "14.1d(g) the drive-by vector captured no POST body — it would pass on a post that never happened"
+    fi
+else
+    bad "14.1d(g) vector SKIPPED — the marker fixture is empty (14.1d's first vector captured nothing)"
+fi
+# (d-f) THE POST-FAILURE ARM (#3168 re-review finding 4). Nothing exercised it:
+#       `STUB_COMMENT_POST_FAIL` was defined by the stub and exported by the harness
+#       but NO vector ever set it, so swapping the failure line for the SUCCESS line
+#       left the suite GREEN — a false-PASS-shaped mutant that tells an operator the
+#       durable copy exists during exactly the 403 / spent-token window this arm
+#       exists to report. Both halves are asserted: the failure is NAMED on stderr,
+#       and the success line is NOT printed on stdout.
+CPF_PR=424345
+: > "$LOG"
+STUB_COMMENT_POST_FAIL=1 STUB_COMMENT_CAPTURE="$T/ccap_f" run_record_633 "$CPF_PR" "$SHA" "$DC_CRUNS"
+assert_contains "$RECORD_ERR" "could not post the #1224 review-evidence comment" \
+    "14.1d(f) a FAILED comment POST is reported on stderr"
+assert_not_contains "$RECORD_OUT633" "as a COMMENT (#1224" \
+    "14.1d(f) …and the run does NOT claim a durable copy it failed to create (the false-PASS message)"
+# (e) THE READ-FAILURE ARM'S EXIT CODE IS A TWO-VALUED ANSWER, and that IS the merge
+#     resolution (ONE PRODUCER, main's semantics): the arm exits 0 ONLY when the durable
+#     comment VERIFIABLY landed — a comment IS evidence the required check admits — and
+#     exits 5 when the marker reached NEITHER channel. Both halves are driven here, so
+#     "posted" and "swallowed" cannot collapse into one another again: collapsing them
+#     is defect A reopened on the second channel.
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENT_CAPTURE="$T/ccap_e" \
+    run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$(dc_posts "$DC_PR")" "1" "14.1d a failed body read still ATTEMPTS the durable comment — the channel exists for exactly this failure"
+assert_eq "$RECORD_RC" "0" "14.1d …and a comment that LANDED makes the run a success (a posted comment IS admitted evidence)"
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FAIL=1 \
+    STUB_COMMENT_CAPTURE="$T/ccap_e2" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+assert_eq "$RECORD_RC" "5" "14.1d …but a comment that did NOT land is still a NAMED failure (rc 5) — neither channel carries the marker [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_not_contains "$RECORD_ERR" "nothing carries the marker yet" "14.1d …and does not claim an ABSENCE it cannot know (a previous run's comment may carry it)"
+# ⛔ THE RETIRED PHRASINGS BELONG TO *THIS* ARM, NOT THE PATCH ARM (#3168 review
+#    cycle 4). "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message
+#    (`git show origin/main:scripts/record-review.sh | grep -n 'CI CANNOT SEE IT'`
+#    → :4630), so pinning its absence against the PATCH arm's stderr (14.10a3)
+#    guarded an arm the phrase was never in — restoring it HERE kept the suite GREEN
+#    (measured). The assertions above prove this variable is populated before these
+#    negatives run, so none of them can pass on an empty capture.
+assert_contains "$RECORD_ERR" "CI CANNOT SEE IT" \
+    "14.1d …and, when NOTHING landed, it DOES say CI cannot see the record — the claim is true on the only arm that emits it"
+assert_not_contains "$RECORD_ERR" "currently INVISIBLE" \
+    "14.1d …nor that the evidence is invisible"
+assert_not_contains "$RECORD_ERR" "attempted on the line above" \
+    "14.1d …nor claim a comment post it cannot know happened (the unsigned and read-failure arms post none)"
+assert_not_contains "$RECORD_ERR" "already admits the evidence" \
+    "14.1d …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
+# 14.1d(h) ⛔ THE EXIT-5 NOUN (#3168 re-review, latest comment, P2). Both exit-5
+#      messages said "the signed marker" — but BOTH arms are reachable with
+#      `MARKER_SIGNED=0` (:4831-4834: no gate key warns and CONTINUES), so the
+#      adjective named a property those bytes need not have. These
+#      two vectors drive that exact conjunction (key unset + a refused body GET / a
+#      refused body PATCH) and are placed HERE, inside §14, because a fresh CLEAN
+#      mint needs a verifiable --evidence artifact: at the end of the file §20 has
+#      left `EV_REF` on a NOT-CLEAN comment, so the mint is refused at rc 3 and never
+#      reaches the body channel at all — green for the wrong reason (measured on the
+#      first draft of these vectors).
+#      The positive assertion comes FIRST in each pair so the negative cannot pass on
+#      an empty capture. RED pre-fix: "so the signed marker was NOT written into the
+#      PR body" / "the signed marker for … could NOT be PATCHed".
+UNC_PR=424360
+AI_REVIEW_GATE_KEY="" STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' \
+    run_record_633 "$UNC_PR" "$SHA" '[]'
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(h) an UNKEYED run whose body READ fails is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "body-marker-unposted" \
+    "14.1d(h) …its exit-5 message still carries the NAMED state (capture is live)"
+assert_contains "$RECORD_ERR" "UNSIGNED" \
+    "14.1d(h) …and blames UNSIGNEDNESS, not the API — the comment channel was never attempted, BY POLICY"
+assert_not_contains "$RECORD_ERR" "the signed marker was NOT written" \
+    "14.1d(h) …and does NOT call these bytes 'the signed marker' — this arm is reached with MARKER_SIGNED=0"
+UNC_PR2=424361
+AI_REVIEW_GATE_KEY="" STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    run_record_633 "$UNC_PR2" "$SHA" '[]'
+assert_eq "$RECORD_RC" "5" \
+    "14.1d(h) an UNKEYED run whose body PATCH fails is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
+assert_contains "$RECORD_ERR" "the marker for daniel-ospina/agent-infra#$UNC_PR2 could NOT be PATCHed" \
+    "14.1d(h) …its exit-5 message still names the marker (capture is live)"
+assert_not_contains "$RECORD_ERR" "the signed marker for daniel-ospina/agent-infra#$UNC_PR2 could NOT be PATCHed" \
+    "14.1d(h) …and does NOT call it 'the signed marker' on the PATCH-failure arm either"
+
+# 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
+#      The recovery verb exists BECAUSE the body was the only copy of the verdict that
+#      travelled — until #1224, when this recorder began posting a durable comment copy too.
+#      Handing the recovered marker back into that same MUTABLE field, with the comment
+#      channel as the only durable twin, would still leave a later body edit able to erase the
+#      copy of what the run had just restored. This vector reddens when the call is
+#      removed, and it reddens through BOTH of its durable-channel assertions —
+#      the `assert_eq` label `14.1e …and publishes the recovered marker to the durable
+#      comment channel` (got: 0, want: 1) and the `bad` label `14.1e the durable comment
+#      did not carry the recovered marker line` — which is the same discriminator shape
+#      as 14.1d(e). ⛔ The counts are named as ASSERTIONS, not quoted as `PASS=n FAIL=m`
+#      (#3168 review P3): the numbers that used to sit here had already rotted, and
+#      §20.11 of this file states the same rule for its own count.
+DC_RB_PR=424951
+rb_clear
+RB_M_E="$(rb_marker "$DC_RB_PR" "review recorded: reviews/${DC_RB_PR}.json verdict=clean @ $RB_HEAD diff=$RB_DIFF ($RB_REPO)")" \
+  || bad "fixture: rb_marker could not be BUILT — the 14.1e arm would otherwise fail on a MISSING marker"
+STUB_COMMENT_BODIES=""
+STUB_COMMENT_CAPTURE="$T/ccap_14e"
+STUB_BODY="PR body carrying a recovered verdict.
+
+$RB_M_E"
+export STUB_BODY STUB_COMMENT_BODIES STUB_COMMENT_CAPTURE
+: >"$LOG"
+run_recover "$DC_RB_PR" "$RB_REPO"
+assert_eq "$RB_RC" "0" "14.1e --recover-body still restores the record (exit 0)"
+assert_eq "$(dc_posts "$DC_RB_PR")" "1" "14.1e …and publishes the recovered marker to the durable comment channel"
+DC_RB_BODY="$(jq -r '.body // empty' "$T/ccap_14e" 2>/dev/null || true)"
+if [ -n "$DC_RB_BODY" ] && grep -qxF -- "$RB_M_E" <<<"$DC_RB_BODY"; then
+    ok "14.1e …carrying the RECOVERED marker line verbatim, alone on its line (gate-admissible)"
+else
+    bad "14.1e the durable comment did not carry the recovered marker line (capture: $DC_RB_BODY)"
 fi
 
 # 14.2 Fresh record (marker absent) with a stale FAILURE on the head: posts the
@@ -5162,6 +5584,36 @@ assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10 the failure has a NA
 PEND14="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424329.marker"
 [ -f "$PEND14" ] && ok "14.10 the signed marker is KEPT for retry (durable pending file)" || bad "14.10 no durable pending marker — the evidence would be lost"
 if grep -qF 'review recorded:' "$PEND14" 2>/dev/null; then ok "14.10 …and it holds the marker line verbatim"; else bad "14.10 the pending file does not hold the marker line"; fi
+# 14.10a2 THE DURABLE CHANNEL IN THE PATCH-FAILURE ARM (fresh-review finding 2;
+#       the ONE arm #2983's single producer left out — agent-infra#3363).
+#       The channel's producer is called just BEFORE this arm's `exit 5`, and nothing
+#       asserted it: deleting the call left BOTH suites green (measured: PASS=921
+#       FAIL=0 and 190/190). This is the arm with the MEASURED real-world trigger
+#       (the 403/spent-token window behind tortoise#10677) — and the two channels
+#       need different scopes (`pull-requests:write` for the body, `issues:write`
+#       for the comment), so this is exactly the run where the body fails and the
+#       comment could still have delivered. A revert of that one line re-opens
+#       "exits 5 having published nothing to the channel it exists for".
+assert_eq "$(dc_posts 424329)" "1" \
+    "14.10a2 the PATCH-failure arm still publishes the durable comment (the arm the channel exists for)"
+# 14.10a3 THE EXIT-5 MESSAGE'S SCOPE (#3168 review cycle 3). Three review cycles in a
+#        row found these operator messages asserting more than the emitting code can
+#        know — "CI CANNOT SEE IT", "a durable comment was attempted on the line above",
+#        "ai-review-gate already admits the evidence". Every one of those was FALSE at a
+#        reachable arm, and NOTHING pinned the text, so any of them could come back with
+#        a green suite. These assertions are the pin: the message scopes itself to the
+#        BODY channel and does not resurrect the discredited claims.
+#        ⛔ THE NEGATIVES FOR THE *READ* ARM LIVE IN 14.1d (#3168 review cycle 4):
+#        "CI CANNOT SEE IT" shipped on main in the BODY-READ-failure message, so
+#        asserting it here — against the PATCH arm's stderr — guarded an arm the
+#        phrase never occupied. It is kept below as defence in depth for the PATCH
+#        message, but 14.1d is where it is load-bearing.
+assert_contains "$RECORD_ERR" "body-marker-unposted" "14.10a3 the exit-5 failure still has its NAMED state"
+assert_contains "$RECORD_ERR" "COVERS THE PR BODY ONLY" "14.10a3 …and scopes itself to the body channel (the only thing it can assert)"
+assert_not_contains "$RECORD_ERR" "CI CANNOT SEE IT" "14.10a3 …it must NOT assert that CI cannot see the evidence (a posted comment IS admitted by the gate)"
+assert_not_contains "$RECORD_ERR" "currently INVISIBLE" "14.10a3 …nor that the evidence is invisible"
+assert_not_contains "$RECORD_ERR" "attempted on the line above" "14.10a3 …nor claim a comment post it cannot know happened (the unsigned and read-failure arms post none)"
+assert_not_contains "$RECORD_ERR" "already admits the evidence" "14.10a3 …nor derive ADMISSION from a POST 2xx (author_association decides admission, see residual 1)"
 if grep -qF -- "actions/jobs/" "$LOG"; then
     bad "14.10 no rerun without a posted marker (log: $(cat "$LOG"))"
 else
@@ -5179,6 +5631,70 @@ FL_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$F
 # ⛔ DELIVERY, NOT DELETION (fresh-review P2): `rm -f` + exit 0 satisfied every
 # other assertion here, and the empty-pending-file mutant did exactly that.
 if grep -qF -- "-X PATCH" "$LOG"; then ok "14.10b the flush actually PATCHed the body (transport, not just an exit code)"; else bad "14.10b the flush exited 0 without a PATCH — deletion is not delivery (log: $(cat "$LOG"))"; fi
+# 14.10b2 THE DURABLE CHANNEL IN THE FLUSH (fresh-review finding 2).
+#       `flush_pending_markers` calls the durable channel's single producer BEFORE
+#       `post_marker`, so a body-side failure cannot short-circuit the durable copy —
+#       and deleting that call left both suites green. The flush is the run that
+#       DELIVERS a marker whose body channel already failed once, so it is the second
+#       place the durable copy must appear, not an optimization. Asserted by DELTA on
+#       the shared log, which `run_record_633`/this arm truncate first, so the count is
+#       this run's alone. ⛔ NO `MARKER_SIGNED` on this path — that global is set only in
+#       the MINT — so this vector also pins the producer's local `sig=` re-verify.
+assert_eq "$(dc_posts 424329)" "1" \
+    "14.10b2 --flush-pending also publishes the durable comment (not just the body PATCH)"
+# 14.10b3 THE FLUSH ORDERING IS LOAD-BEARING, SO PIN IT (#3168 re-review finding 5).
+#       The code says the durable call is "Placed before post_marker() so a body-side
+#       failure cannot short-circuit it", but 14.10b2 above only exercises a
+#       SUCCESSFUL PATCH — so MOVING the call inside that branch left the suite at
+#       PASS=1005 FAIL=0 (measured with the ordering inverted). The flush exists for
+#       the run whose BODY channel already failed once, so the discriminating case is
+#       a flush whose PATCH fails AGAIN: the durable copy must still be attempted.
+#       That is the whole reason the call sits above the `if post_marker`.
+FL2_PR=424344
+STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' run_record_633 "$FL2_PR" "$SHA" '[]'
+PEND14B="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$FL2_PR.marker"
+if [ -f "$PEND14B" ]; then ok "14.10b3 fixture: the failed body read left a pending marker to flush"; else bad "14.10b3 fixture missing — nothing pending, so the vector would judge nothing"; fi
+: > "$LOG"
+FL2_RC=0
+FL2_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_PATCH_FAIL=1 \
+    STUB_BODY="PR body — no review evidence yet" \
+    bash "$RECORD" --flush-pending "$FL2_PR" daniel-ospina/agent-infra 2>&1)" || FL2_RC=$?
+assert_eq "$(dc_posts "$FL2_PR")" "1" \
+    "14.10b3 the flush publishes the durable comment even when its body PATCH FAILS (ordering, not luck)"
+assert_contains "$FL2_OUT" "as a COMMENT (#1224" \
+    "14.10b3 …and says so, so the operator can tell the two channels apart [out: $(printf '%s' "$FL2_OUT" | tr '\n' ' ')]"
+# 14.10b4 NO SIGNEDNESS CLAIM ON THE FLUSH SUCCESS LINE (#3168 re-review P3). The
+#        marker is signed BEFORE it is persisted, so a KEYED run's pending file does
+#        carry a `sig=` — but both body-channel arms are reachable with MARKER_SIGNED=0
+#        (no gate key, or openssl producing nothing: a warning then CONTINUES), so an
+#        unsigned marker is exactly what a flush can be holding. This line said "the
+#        pending signed marker", the same false noun the two exit-5 arms were corrected
+#        for. Same class, third site, and it was the one the PR's own prose quotes.
+#        Driven through the CLI on an UNSIGNED pending marker (produced by a key-less
+#        run whose body PATCH failed, i.e. the production shape), and asserted as a PAIR:
+#        the honest noun is present, the false one is absent — so a revert reddens the
+#        negative instead of passing on an empty capture.
+FL3_PR=424351
+AI_REVIEW_GATE_KEY="" STUB_PATCH_FAIL=1 run_record_633 "$FL3_PR" "$SHA" '[]'
+PEND14C="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-$FL3_PR.marker"
+if [ -f "$PEND14C" ]; then
+    if grep -qF -- " sig=" "$PEND14C"; then
+        bad "14.10b4 fixture is SIGNED — this vector would not test the noun (pending file carries a sig=)"
+    else
+        ok "14.10b4 fixture: a key-less body-PATCH failure left an UNSIGNED pending marker"
+    fi
+    : > "$LOG"; FL3_RC=0
+    FL3_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" \
+        STUB_BODY="PR body — no review evidence yet" \
+        bash "$RECORD" --flush-pending "$FL3_PR" daniel-ospina/agent-infra 2>&1)" || FL3_RC=$?
+    assert_contains "$FL3_OUT" "delivered the pending marker" \
+        "14.10b4 the flush success line names the pending marker it delivered [out: $(printf '%s' "$FL3_OUT" | tr '\n' ' ')]"
+    assert_not_contains "$FL3_OUT" "pending signed marker" \
+        "14.10b4 …and does NOT call an unsigned marker 'signed' (the noun the exit-5 arms were corrected for)"
+    assert_eq "$FL3_RC" "0" "14.10b4 …and the flush still succeeds (the wording change is not a behaviour change)"
+else
+    bad "14.10b4 vector SKIPPED — no pending marker was written; the noun pin did NOT run"
+fi
 assert_contains "$(cat "$FL_CAP" 2>/dev/null)" "review recorded: reviews/424329.json" "14.10b the delivered body carries the marker line"
 # 14.10q A BODY THAT ONLY *QUOTES* THE MARKER IS NOT DELIVERY (review round 2
 #       finding 3). `post_marker` tested the marker with `grep -qF` — a SUBSTRING
@@ -5259,6 +5775,15 @@ if declare -F run_record_no_gh >/dev/null 2>&1; then
     run_record_no_gh clean-micro "daniel-ospina/agent-infra" 424332 || true
     assert_eq "$RECORD_RC" "5" "14.10e with gh missing the record is written but the exit is a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
     assert_contains "$RECORD_ERR" "gh CLI is missing" "14.10e …and the message names the cause"
+    # ⛔ AND IT MUST NOT CALL IT SIGNED (#3168 re-review, cycle 2): no gate key means
+    #   nothing was signed, and MARKER is built inside the gh-available block, so on
+    #   THIS arm no marker exists at all — "the signed marker" was false twice over.
+    #   Pinned on the vector that already drives the arm, so the third instance of
+    #   the class cannot come back unnoticed.
+    assert_not_contains "$RECORD_ERR" "the signed marker" \
+        "14.10e …and does not call a marker it never built 'the signed marker'"
+    assert_contains "$RECORD_ERR" "so no marker for daniel-ospina/agent-infra#424332 was posted" \
+        "14.10e …saying instead that no marker was posted (the honest state on this arm)"
     if [ -e "$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424332.marker" ]; then
         bad "14.10e the gh-missing arm persisted a pending marker (it cannot have built one — MARKER is set inside the gh block)"
     else
@@ -5273,19 +5798,72 @@ fi
 assert_eq "$FL_RC" "0" "14.10b --flush-pending delivers the pending marker (rc 0) [out: $(printf '%s' "$FL_OUT" | tr '\n' ' ')]"
 if [ -f "$PEND14" ]; then bad "14.10b the pending file survives a SUCCESSFUL flush (a retry would re-post forever)"; else ok "14.10b a successful flush clears the pending file"; fi
 assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json")" "14.10b the flush does NOT re-record (the verdict and its reviewed_at are untouched)"
+# 14.10f THE RECOVERY PATH'S PRESENCE PREDICATE — a **MAIN-REGRESSION** pin, not this
+#       diff's fix (#3168 re-review finding 2). The behaviour it protects: a body that
+#       merely CITES the marker mid-line must not read as "already present", because
+#       then the flush PATCHes NOTHING, `rm -f`s the pending file, and the caller prints
+#       "delivered the pending signed marker" — silent destruction of the only BODY copy
+#       of the signed bytes, reported as success, reached not just by --flush-pending but
+#       by EVERY later minting run.
+#       ⛔ WHAT THIS ROW DOES **NOT** PROVE: that this PR anchored `post_marker()`. It did
+#       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
+#       (`git show origin/main:scripts/record-review.sh | sed -n 1939p`), and the diff
+#       hunk at scripts/record-review.sh:1995-2005 only ADDS A COMMENT above it — the
+#       predicate line is CONTEXT. Reverting this PR leaves this vector GREEN; it is kept
+#       because main's anchoring should not silently regress, and it is labelled so the
+#       next reader does not mistake it for evidence about this diff. The predicate must
+#       match the gate's line-anchored `^…$` admission, exactly like the three other
+#       sites already anchored on main (`:1939`, `:3643`, `:5956`, `:6068`).
+#       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
+#       mutant also exited 0.
+if [ -n "${QB_LINE:-}" ]; then
+    PEND14F="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424340.marker"
+    printf '%s\n' "$QB_LINE" > "$PEND14F"
+    : > "$LOG"; F_CAP="$T/flushcap14f"; : > "$F_CAP"
+    F_RC=0
+    F_OUT="$(HOME="$F_HOME" PATH="$T/bin:$PATH" GH_STUB_LOG="$LOG" STUB_CAPTURE="$F_CAP" \
+        STUB_BODY="A lane cited the attestation inline: $QB_LINE — see above." \
+        bash "$RECORD" --flush-pending 424340 daniel-ospina/agent-infra 2>&1)" || F_RC=$?
+    if grep -qF -- "-X PATCH" "$LOG"; then
+        ok "14.10f flush: a body that only CITES the marker still gets the PATCH (anchored predicate)"
+    else
+        bad "14.10f flush: a mid-line marker SUPPRESSED the PATCH — a main regression to the unanchored -qF in post_marker()"
+    fi
+    if command grep -qxF -- "$QB_LINE" <<<"$(jq -r '.body // empty' "$F_CAP" 2>/dev/null)"; then
+        ok "14.10f …and the delivered body carries the marker on a line of its OWN (gate-admissible)"
+    else
+        bad "14.10f the delivered body carries no anchored marker line"
+    fi
+    assert_eq "$F_RC" "0" "14.10f the flush succeeds (rc 0) [out: $(printf '%s' "$F_OUT" | tr '\n' ' ')]"
+    if [ -f "$PEND14F" ]; then
+        bad "14.10f a DELIVERED marker's pending file survives (a retry would re-post forever)"
+    else
+        ok "14.10f …and the delivered pending file is cleared"
+    fi
+else
+    bad "14.10f vector SKIPPED — no seeded marker line; the main-regression post_marker() anchoring pin did NOT run"
+fi
 # 14.10c MUTATION PIN — the exit-5 rule must be load-bearing. With it reverted to
 #       the old `exit 0`, a failed post reads as success again, which is exactly
 #       the invisible-record state defect A reported.
 FL_MUT="$T/record-review-a-mutant.sh"
 cp "$RECORD" "$FL_MUT"
-if grep -qF 'body-marker-unposted: the signed marker for $REPO#$PR could NOT be PATCHed' "$FL_MUT"; then
+# ⛔ THE ANCHOR NAMES THE BRANCH, NOT THE ADJECTIVE (#3168 re-review, latest comment,
+#   P2). It used to require the literal `the signed marker for … could NOT be
+#   PATCHed`, so dropping the word "signed" from that message — correct, because this
+#   arm is reachable with MARKER_SIGNED=0 — broke a MUTATION PIN that has nothing to do
+#   with the adjective: a wording change must not be able to silently disarm a
+#   behavioural pin, and re-anchoring it by hand every time is exactly the treadmill
+#   this comment exists to avoid. `.*` spans the noun phrase; "could NOT be PATCHed
+#   into the PR body" is unique to THIS arm (the body-READ arm says "was NOT written").
+if grep -qE 'body-marker-unposted: .*could NOT be PATCHed into the PR body' "$FL_MUT"; then
     # The mutant restores the pre-fix behaviour on THAT branch only: warn and exit 0.
     # ⛔ ANCHORED TO THE BRANCH, AND THE SCOPE IS ASSERTED (fresh-review P2): two
     # lines in the script carry exactly six spaces before `exit 5` (this one and
     # --recover-body's refusal), so an address-free `s/^      exit 5$/…/` mutates
     # BOTH — a mutant wider than its declaration, whose extra change could mask a
     # fail-closed regression in later assertions.
-    sed -i.bak '/body-marker-unposted: the signed marker for \$REPO#\$PR could NOT be PATCHed/,/^      exit 5$/ s/^      exit 5$/      exit 0/' "$FL_MUT"
+    sed -i.bak '/body-marker-unposted: .*could NOT be PATCHed into the PR body/,/^      exit 5$/ s/^      exit 5$/      exit 0/' "$FL_MUT"
     rm -f "$FL_MUT.bak"
     if cmp -s "$RECORD" "$FL_MUT"; then
         bad "14.10c the mutant is byte-identical to the script — the exit-5 sed did not apply (re-anchor it)"
