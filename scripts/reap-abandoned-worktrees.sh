@@ -92,7 +92,51 @@
 #   REAP_AW_LOCK_STALE_SECONDS  a stale lock is reclaimed after this (default 1800)
 #   REAP_AW_STAMP           the pin file (default: $CELL_HOME/orchestrator/.agent-infra-stamp.json,
 #                           then $HOME/.pi/orchestrator/.agent-infra-stamp.json; absent = no pin)
-#   REAP_AW_BUDGET_SECONDS  wall-clock budget for the probe+removal loop (default 300)
+#   REAP_AW_BUDGET_SECONDS  the PER-ROOT TIME bound (default 300) — `deadline` is assigned inside
+#                           `sweep_root`, so a two-root pass permits two budgets, the same scoping the
+#                           count ceiling below has. This is the real guard, for BOTH ARMS: it gates
+#                           every EXPENSIVE per-candidate step (the live-pid census,
+#                           `git status`, the re-probe, removal). Cheap eligibility (the structural
+#                           rejections and the age floor) still runs for the whole population, so an
+#                           over-budget pass classifies what it saw and preserves the rest — on the
+#                           GITLESS arm it never spends the census on a tree the age floor rejects,
+#                           because that floor precedes the census there. ⚠️ NOT so on the LINKED arm:
+#                           its age floor sits AFTER the census (a linked worktree's own proof order is
+#                           unchanged, and moving the bound above the census is the only change to
+#                           that order), so a YOUNG linked worktree does spend one census before the
+#                           floor rejects it. ⛔ AND AN EXHAUSTED
+#                           CEILING SHORT-CIRCUITS THE SCAN (see REAP_AW_GITLESS_MAX below), so past it a
+#                           tree costs one integer compare rather than the ~6 forks the
+#                           canonical/keep/state guards need.
+#                           It bounds the PER-CANDIDATE work, not the whole class: the eligibility scan
+#                           is proportional to the population. The caller (`disk-reaper.sh`) invokes this
+#                           delegate ONCE PER ROOT under its own DISK_REAPER_CLASS_TIMEOUT (1800), so an
+#                           N-root pass is bounded by N x 1800 — not by 1800.
+#   REAP_AW_GITLESS_MAX     the gitless arm's count ceiling (default 10), applied PER ROOT — the
+#                           counter is reset inside each `sweep_root`, and `ROOTS` is colon-separated,
+#                           so a two-root pass permits two ceilings — and charged PER AGED CANDIDATE:
+#                           the unit is taken only after the age floor accepts a tree, so a tree the
+#                           floor preserves costs no slot (#3278 P1). ⛔ AND AN EXHAUSTED CEILING
+#                           SHORT-CIRCUITS THE SCAN, not only the census: it is one integer compare at
+#                           the top of the branch, and without it a capped pass still paid ~6 forks per
+#                           entry to print rows that all say `gitless-cap` — measured on a 300-entry
+#                           fixture with the census isolated: 0.60 s on `2c18ff89a`, 8.98 s with the
+#                           check downstream of the scan, byte-identical pass record. Raising or
+#                           removing the ceiling is #3278's P3, an OWNER decision, and is deliberately
+#                           NOT done here.
+#   REAP_AW_CELL_HOME_DEFAULT  the cell home the gitless guard protects when nothing exports
+#                           `CELL_HOME` (default /tmp/cell-home; a TEST SEAM, and only that). It exists
+#                           so the fallback has a BEHAVIOURAL test: a fixture cannot live at
+#                           /tmp/cell-home, so without this seam reverting the guard loop's reference
+#                           left every case green while the real cell home became reapable. It is a
+#                           DEFAULT, NOT A SECOND SOURCE OF TRUTH, and it is a SUBSTITUTION, not a
+#                           union — the same shape as `load_pin` below, and for the same reason: an
+#                           exported `CELL_HOME` still wins, and a WRONG value protects a different
+#                           directory **and drops `/tmp/cell-home`**. Measured (review round 9): the same
+#                           aged tree is PRESERVED when the seam names it, and becomes `remove` when the
+#                           seam names something else. That is the trade an operator already makes by
+#                           setting `CELL_HOME` — which is why this seam is TEST-ONLY and must never be
+#                           set by the unit, the launcher, or any scheduled artifact.
 #   REAP_AW_PROC_ROOT       the process table root (default /proc; a test seam — pointing it at a
 #                           missing dir makes the census UNREADABLE, which must skip the sweep)
 #   REAP_AW_LIVE_PATHS      the census library (default: lib/live-paths.sh beside this script, then
@@ -126,17 +170,53 @@ INCLUDE_GITLESS=0
 # never candidates. `/tmp/actions-runner` is the CI runner install on every cell — removing it
 # breaks every job on the box, which is a worse outcome than the space it holds.
 GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
-# ⛔ AND THE CLASS IS BOUNDED PER PASS (measured on cell-3: the unbounded first cut ran >17 min on
-# 487 top-level dirs, overran the entry point's class timeout and left the HOURLY REAPER RED — a
-# scheduled actuator that cannot finish is not a fix, whatever it removes on the way). The cap is a
-# deliberate throughput limit, not a safety rule: successive hourly passes make progress, and the
-# standing population on this box (4,594 MB / 453 trees) clears inside one pass.
-# 10, not 40: the binding cost is REMOVAL I/O, measured on cell-3 at 20-60 s per tree
-# (`08:38:24 - 08:39:41` for three trees on a 126 GB disk at 95 %), so 40 candidates is 15-25 min of
-# removing and overruns the class bound. 10 keeps a pass inside it while still clearing the standing
-# population (26 candidates when this landed) in ~3 hours of hourly passes.
+# ⛔ THE CLASS'S EXPENSIVE PER-CANDIDATE WORK IS BOUNDED, PER ROOT, BY **ELAPSED TIME**
+# (`REAP_AW_BUDGET_SECONDS`, default 300; the eligibility scan over the whole population is NOT budgeted
+# — classifying every entry is the product — and the entry point's `DISK_REAPER_CLASS_TIMEOUT=1800`
+# bounds each PER-ROOT invocation, not the whole pass) **AND** by the operator's ceiling on how many
+# AGED trees one root may classify per pass (`REAP_AW_GITLESS_MAX`, default 10).
+#
+# WHY THE CEILING'S UNIT MOVED — AND WHY THE CEILING ITSELF DID NOT (#3278 P1). The count was a
+# throughput throttle sized for a standing population of **26 candidates**; the box it runs on now
+# holds **thousands**. The damage was not the number, it was WHERE the unit was charged: BEFORE the age
+# floor was consulted, so ~89 % of those ten slots went to trees the age test would have preserved
+# anyway — a dry run over 3,314 top-level entries classified 10 and printed `gitless-cap` for **3,137**
+# of them, and the aged population was never reachable at all. Charging the unit after the age floor (and
+# before the census) hands the same ceiling to the population it was calibrated against, which is the
+# ~10× throughput lever with **no policy change**.
+#
+# ⛔ RAISING OR REMOVING THE CEILING IS #3278's **P3** — AN OWNER DECISION — AND IS NOT TAKEN HERE. P3
+# reserves that axis in the issue's plan comment (`issues/comments/6698790753`) verbatim: "This is
+# destructive against trees a `rm -rf` cannot recover … so it is the owner's call, and it should land
+# after P1 and P2." P2 (`scripts/scratch-dir.sh`) has not landed, so the default stays 10: this change
+# removes the STARVATION, not the ceiling. An operator who wants a different ceiling for one pass sets
+# the seam; the time bound below is what makes any ceiling cheap to honour, because the loop no longer
+# buys a full census for every tree it is about to preserve.
 GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"
 ROOTS="${REAP_AW_ROOTS:-/tmp}"
+# ⛔ THE CELL HOME THE `home-or-state` GUARD PROTECTS EVEN WHEN NOTHING EXPORTS `CELL_HOME`.
+# MEASURED (#3278, 2026-11-06, owner, on a cell): the unit renders `Environment=HOME=/home/cmux`, which
+# IS a real directory, so `disk-reaper-run.sh`'s fallback never substituted and its `CELL_HOME=` was
+# never exported — so the guard compared against `/home/cmux` alone and `/tmp/cell-home` (a live ~20 GB
+# operative home holding the cell's `.pi` state, with no `.git` and therefore no `main-checkout` guard
+# of its own) matched NONE of the three references. On the armed pass it survived as
+# `reason=gitless-cap` — a rate limit, not a gate.
+#
+# ⛔ IT IS RESOLVED HERE, NOT BY EXPORTING `CELL_HOME` UPSTREAM — that was tried and measured WRONG.
+# `load_pin` (defined BELOW — cite it by name, not by a line number; a stale `:332` sent a reader into
+# `acquire_lock`) reads the same variable with FIRST-MATCH-WINS and a `break`
+# (`${CELL_HOME}/orchestrator/…` then `${HOME}/.pi/orchestrator/…`), so its list is a SUBSTITUTION, not
+# a union: exporting would make one of the two stamps stop being read, i.e. a tree the other stamp
+# pinned becomes a candidate and `rm -rf` takes it. A local fallback is additive; an exported variable
+# is not. This value touches only the guard loop.
+# ⛔ `REAP_AW_CELL_HOME_DEFAULT` EXISTS SO THE FALLBACK ITSELF CAN BE EXERCISED. A fixture cannot live at
+# `/tmp/cell-home` on a real box, so without this seam the fallback had a *resolution* test
+# (`--print-config`) and no behavioural one: reverting the guard loop's reference to a raw
+# `"${CELL_HOME:-}"` left every case GREEN while `/tmp/cell-home` became reapable on the unit's path —
+# the exact shape #3278 measured (review round 7). It is a DEFAULT, not a second source of truth: an
+# exported `CELL_HOME` still wins, and a deliberately wrong value protects a different directory — the
+# same trade an operator already makes by setting `CELL_HOME`, so it adds no new hazard class.
+CELL_HOME_DEFAULT="${CELL_HOME:-${REAP_AW_CELL_HOME_DEFAULT:-/tmp/cell-home}}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
 GIT_TIMEOUT="${REAP_AW_GIT_TIMEOUT:-60}"
@@ -147,7 +227,19 @@ ROOTS_GIVEN=0
 log_line() { printf '%s\n' "$*"; }
 log() { printf '%s %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >>"$LOG" 2>/dev/null || true; }
 die() { printf '%s: %s\n' "$SCRIPT_NAME" "$*" >&2; exit 2; }
-num() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; *) return 0 ;; esac; }
+num() {
+    case "${1:-}" in ''|*[!0-9]*) return 1 ;; 0) return 0 ;; 0*) return 1 ;; esac
+    # ⛔ AND IT MUST FIT THE SHELL'S INTEGER — a digit check is NOT enough. `[ "$a" -ge "$b" ]` returns
+    # **2** ("integer expression expected") on a value ≥ 2^63, and a `[ ]` failure inside an `if` reads as
+    # FALSE, so an unrepresentable seam does not clamp — it INVERTS the guard it feeds:
+    # `REAP_AW_GITLESS_MAX` would never fire (the destructive ceiling silently ABSENT — exactly #3278's
+    # P3 shape this PR does not ship), and `REAP_AW_AGED_MINUTES` would make EVERY tree read as AGED.
+    # 18 digits is < 2^63 by construction, so no value that passes here can reach that error.
+    # ⛔ THE PREVIOUS REVISION CHECKED THE DIGIT SHAPE ONLY while its comment claimed this class was
+    # closed; it was not (review round 8, measured: a 20-digit ceiling gave `12 removable, 0 capped`,
+    # rc=0, and a green SUMMARY — the ceiling gone with no refusal and no log line saying so).
+    [ "${#1}" -le 18 ]
+}
 
 usage() {
     awk 'NR==1{next} /^set -uo pipefail$/{exit} {sub(/^# ?/,""); print}' "${BASH_SOURCE[0]}" 2>/dev/null \
@@ -164,7 +256,7 @@ while [ $# -gt 0 ]; do
                    if [ "$ROOTS_GIVEN" = 1 ]; then ROOTS="$ROOTS:$2"; else ROOTS="$2"; ROOTS_GIVEN=1; fi
                    shift 2 ;;
         --aged-minutes) [ $# -ge 2 ] || die "--aged-minutes needs a number"
-                        num "$2" || die "--aged-minutes must be a number (got '$2')"
+                        num "$2" || die "--aged-minutes must be a decimal number of at most 18 digits (got '$2')"
                         AGED_MINUTES="$2"; shift 2 ;;
         --dirty)   [ $# -ge 2 ] || die "--dirty needs keep|reap"
                    case "$2" in keep|reap) DIRTY_MODE="$2" ;; *) die "--dirty must be keep|reap (got '$2')" ;; esac
@@ -180,15 +272,31 @@ while [ $# -gt 0 ]; do
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
-num "$AGED_MINUTES" || die "REAP_AW_AGED_MINUTES must be a number (got '$AGED_MINUTES')"
+num "$AGED_MINUTES" || die "REAP_AW_AGED_MINUTES must be a decimal number of at most 18 digits (got '$AGED_MINUTES')"
 case "$DIRTY_MODE" in keep|reap) ;; *) die "REAP_AW_DIRTY must be keep|reap (got '$DIRTY_MODE')" ;; esac
-num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a number"
-num "$LOCK_STALE_SECONDS" || die "REAP_AW_LOCK_STALE_SECONDS must be a number"
+num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a decimal number of at most 18 digits (got '$BUDGET')"
+# ⛔ THE CEILING IS VALIDATED, NEVER COERCED. A typo must not silently become "no count bound" (the
+# fail-open the pre-#3278 `:-0` spelling would have been) and must not silently become "cap reached"
+# for every tree either — `num` refuses both. ⛔ AND "A TYPO" INCLUDES ONE THAT IS ALL DIGITS BUT TOO
+# LARGE TO COMPARE: `num` bounds the value to the shell's integer range for that reason, because
+# `[ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]` returning 2 reads as FALSE and the ceiling stops existing.
+# The same bound protects `REAP_AW_AGED_MINUTES`, `REAP_AW_BUDGET_SECONDS` and `REAP_AW_LOCK_STALE_SECONDS`,
+# which are validated by this same function.
+if [ -n "$GITLESS_MAX" ]; then num "$GITLESS_MAX" || die "REAP_AW_GITLESS_MAX must be a decimal number of at most 18 digits (got '$GITLESS_MAX') — a value that cannot be COMPARED would silently remove the ceiling instead of raising it"; fi
+num "$LOCK_STALE_SECONDS" || die "REAP_AW_LOCK_STALE_SECONDS must be a decimal number of at most 18 digits (got '$LOCK_STALE_SECONDS')"
 
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'roots=%s\n' "$ROOTS"
     printf 'aged_minutes=%s\n' "$AGED_MINUTES"
     printf 'dirty=%s\n' "$DIRTY_MODE"
+    # The EFFECTIVE bounds, so the caller can record what the pass was allowed to do: the time bound,
+    # the count ceiling (per root, charged per AGED candidate — 10 by default), and the cell home the
+    # guard compares against.
+    printf 'budget_seconds=%s\n' "$BUDGET"
+    printf 'gitless_max=%s\n' "${GITLESS_MAX:-none}"
+    # The cell home the guard will protect even with `CELL_HOME` unset (the unit's shape). Reported
+    # like the other effective bounds: a pass record must not hide what the guard was comparing.
+    printf 'cell_home_default=%s\n' "$CELL_HOME_DEFAULT"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
 fi
@@ -218,6 +326,21 @@ fi
 . "$LIVE_PATHS_LIB" || { printf 'SKIP reason=library-unreadable path=%s\n' "$LIVE_PATHS_LIB"; exit 3; }
 
 now() { date +%s; }
+# budget_spent <deadline-epoch> — rc 0 when the pass's TIME bound is spent (#3278).
+# ONE named predicate, so the bound is a single thing a test can mutate. The count cap it replaced was
+# charged in ONE place and BEFORE the age floor (`GITLESS_DONE=$((GITLESS_DONE + 1))` at `:605` on
+# 2c18ff89a, with the cap test at `:587`), which is why ~89 % of its ten slots went to trees the floor
+# preserves anyway. That ordering — not a second check site — is what MUT_ORDER pins.
+budget_spent() { [ "$(now)" -ge "$1" ]; }
+# budget_before_removal <deadline-epoch> — the LAST gate above the destructive call, kept as its OWN
+# named predicate rather than a second `budget_spent` line. It answers a different question from the
+# pre-census gate ("did the census I just ran consume the budget?") and, unlike that gate, it is
+# UNREACHABLE from the `--dry-run` path and from any `BUDGET=0` fixture — which is exactly how it went
+# untested until review round 11: deleting it left all 20 cases green because the pre-census gate had
+# already fired for every candidate (agent-infra#3442). A named predicate is the shape this file already
+# uses for `budget_spent` ("ONE named predicate, so the bound is a single thing a test can mutate"), and
+# a test reverts exactly this one.
+budget_before_removal() { budget_spent "$1"; }
 # file_mtime <path> — epoch mtime, portable across GNU (stat -c %Y) and BSD (stat -f %m).
 file_mtime() {
     local m
@@ -581,14 +704,36 @@ sweep_root() { # <root>
             if [ "$INCLUDE_GITLESS" != 1 ]; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=not-a-worktree (no .git; --include-gitless is off)"; continue
             fi
-            # ⛔ BOTH LIMITS ARE CHECKED BEFORE ANY PER-TREE WORK. The budget check used to sit AFTER
-            # `git_below` and canonicalisation, so the expensive part of an over-budget arm still ran
-            # to the end of the root (measured: 17+ min, class timeout, rc=3 every hour).
-            if [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} candidates this pass; the remainder is PRESERVED for the next run)"; continue
-            fi
-            if [ "$(now)" -ge "$deadline" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed trees are PRESERVED)"; continue
+            # ⛔ THE TWO BOUNDS ARE **NOT** HERE ANY MORE (#3278). They used to be checked here, BEFORE
+            # the age floor — so a tree the floor would preserve still consumed a cap unit, and on a
+            # root with thousands of young trees the ten slots went to trees that could never be
+            # removed (measured: 89 % of them). ⛔ TWO DIFFERENT THINGS MOVED, and conflating them is
+            # what makes this block read as its own contradiction: the CHARGE (`GITLESS_DONE++` below)
+            # moved after the age floor, so a young tree still costs no slot; the REFUSAL did NOT move
+            # with it — it is the O(1) check at the TOP of this branch, ahead of the structural
+            # rejections and of everything that forks or walks (see the next block). The TIME bound is a
+            # separate pre-census gate further down. Cheap structural rejections are the only per-entry
+            # work that legitimately precedes the age test.
+            # ⛔ THE COUNT CEILING SHORT-CIRCUITS THE SCAN (#3278 P1, completed in review round 11).
+            # It needs NO per-entry work — one integer compare — so it sits ABOVE everything that forks
+            # or walks. That is the difference between the ceiling being a bound and only a label:
+            # with the check downstream of the scan, an exhausted ceiling still paid ~6 forks per entry
+            # (`git_below`'s two-level walk, `lp_canon`, the home-or-state loop, the keep list, `pinned`)
+            # to print rows that all say `gitless-cap`. MEASURED on a 300-entry fixture with the census
+            # isolated behind a synthetic `/proc`: 8.98 s here versus 0.60 s on `2c18ff89a`, for a
+            # BYTE-IDENTICAL pass record (`candidates=10 kept=290`); on the 3,314-entry root #3278
+            # measured that is ~104 s of the 1800 s class timeout spent classifying trees the ceiling had
+            # already refused, against a population growing ~48.8 trees/hour. `2c18ff89a` carried exactly
+            # this shape and recorded why: "BOTH LIMITS ARE CHECKED BEFORE ANY PER-TREE WORK … the
+            # expensive part of an over-budget arm still ran to the end of the root (measured: 17+ min,
+            # class timeout, rc=3 every hour)". The charge stays where P1 put it — after the age floor —
+            # so a young tree still costs no slot; what changes is that a tree the *ceiling* refuses now
+            # costs one `stat`-free compare instead of the whole scan.
+            # ⛔ SO PAST THE CEILING THE ROW NAMES THE CEILING, not the tree's own reason: this arm did
+            # not look, and `gitless-cap` is the true statement about why the tree was preserved. Every
+            # outcome here is a PRESERVE.
+            if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root ceiling, default 10, and it counts AGED candidates only)"; continue
             fi
             if git_below "$d"; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=git-below (a .git lives inside the tree, so a git arm owns it)"; continue
@@ -601,8 +746,10 @@ sweep_root() { # <root>
             # ⛔ THE HOME/STATE GUARD IS NOT HERE — it runs on the CANONICAL path below (review of
             # #3278 round 2: comparing the raw `$d` let `--root /tmp/` — `/tmp//cell-home` — delete the
             # cell HOME in an armed pass; the same spelling bug the keep list had).
+            # ⛔ `GITLESS_DONE` IS NOT INCREMENTED HERE. Charging the count unit at STRUCTURAL
+            # classification — before the age floor — is what spent 89 % of the old cap on trees that
+            # could not be removed; the increment sits after the age test, with the bounds it serves.
             gitless=1
-            GITLESS_DONE=$((GITLESS_DONE + 1))
         fi
         canon="$(lp_canon "$d")" || canon=""
         base="$(basename "$d")"
@@ -620,8 +767,12 @@ sweep_root() { # <root>
         # with each reference canonicalised too (review of #3278 round 2, measured: a non-canonical
         # `--root` spelling reaped /tmp/cell-home, which holds ~9.8 GB of `.pi` / `.venvs` here, and the
         # structural guard — the stamp's ancestor-pin — is absent on the scheduled path).
+        # ⛔ AND `CELL_HOME_DEFAULT` CARRIES THE CELL HOME ITSELF, because the guard must not depend on
+        # its callers getting the environment right (see its assignment above for the measurement and
+        # for why it is NOT fixed by exporting `CELL_HOME`). Resolving it here covers every caller —
+        # the systemd unit, the darwin launcher, a manual run — instead of trusting each to export it.
         if [ "$gitless" = 1 ]; then
-            for _ref in "${HOME:-}" "${CELL_HOME:-}" "${REAP_AW_STATE_DIR:-}"; do
+            for _ref in "${HOME:-}" "$CELL_HOME_DEFAULT" "${REAP_AW_STATE_DIR:-}"; do
                 [ -n "$_ref" ] || continue
                 _refc="$(lp_canon "$_ref" 2>/dev/null)" || _refc=""
                 [ -n "$_refc" ] || _refc="${_ref%/}"
@@ -648,6 +799,40 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=pinned (the .agent-infra-stamp.json pin protects it; age=${age}m)"
             continue
         fi
+        # ⛔ CHEAP ELIGIBILITY BEFORE THE EXPENSIVE SCAN — FOR THE GITLESS ARM ONLY (#3278).
+        # The age floor is the most selective gate this script has and it costs one `stat`; the live-pid
+        # census costs SECONDS PER CANDIDATE on a loaded box (3,813 rows, measured 2026-11-07:
+        # `lp_path_held` 3.6 s + `lp_path_named` 8.1 s). Running the census first meant every tree the
+        # floor was about to preserve still paid for it — so a pass spent its entire budget proving age
+        # on thousands of trees it would never remove. `systemd-tmpfiles` orders it the same way: the
+        # age field decides what is a candidate, and nothing else is asked about a non-candidate.
+        # ⛔ THE LINKED ARM KEEPS ITS ORDER (its census runs first, so a young-and-held checkout reports
+        # the WITNESS that preserved it rather than `young` — the property `disk-reaper.test.sh` T2
+        # asserts). Its population is tens of trees; the thousands are gitless. Changing its reporting
+        # precedence would be a behaviour change with no measured cost behind it.
+        if [ "$gitless" = 1 ]; then
+            if [ "$age" -lt "$AGED_MINUTES" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
+                continue
+            fi
+            # ⛔ THE UNIT IS CHARGED BELOW, after this floor and before the census — that position is
+            # #3278's P1, and a young tree costs no slot because of it. There is deliberately NO ceiling
+            # TEST in this block: the refusal is the O(1) check at the TOP of the branch, and a second
+            # test here could never fire (`GITLESS_DONE` has not moved since the top of this iteration),
+            # so it would be an inert guard that reads like protection — the class this PR deletes.
+        fi
+        # ⛔ THE TIME BOUND IS THE REAL GUARD, FOR BOTH ARMS, AND IT SITS BEFORE THE EXPENSIVE WORK.
+        # The census, `git status` and the re-probe are what it exists to bound; an unprocessed
+        # candidate is PRESERVED, so stopping here can only fail SAFE. (Before #3278 this check was
+        # after the census, so the pass overran its budget by one FULL census per remaining candidate —
+        # minutes, on a box with dozens of linked worktrees. Moving it above the census is the only
+        # change to the linked arm's order, and it is observable only on a pass that has already spent
+        # its budget: `reason=budget` instead of `reason=young`/`reason=live-cwd`. Every one of those
+        # outcomes PRESERVES.)
+        if budget_spent "$deadline"; then
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed trees are PRESERVED)"; continue
+        fi
+        if [ "$gitless" = 1 ]; then GITLESS_DONE=$((GITLESS_DONE + 1)); fi
         if lp_path_named "$CENSUS" "$canon"; then
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=argv-named ($LP_NAME_WHY; age=${age}m)"
             continue
@@ -656,17 +841,12 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=live-cwd ($LP_HOLD_WHY; age=${age}m)"
             continue
         fi
+        # the LINKED arm's age floor, in its original position (after the census) — see above.
         if [ "$age" -lt "$AGED_MINUTES" ]; then
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
             continue
         fi
         if [ "$gitless" = 1 ]; then repo=""; else repo="$(repo_root_of "$d")" || repo=""; fi
-        if [ "$(now)" -ge "$deadline" ]; then
-            # ⛔ THE BUDGET BOUNDS THE CLASSIFICATION TOO. `git status` per candidate is exactly the
-            # unbounded per-record fork the budget exists for; an unprocessed candidate is PRESERVED.
-            log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
-            KEPT=$((KEPT + 1)); continue
-        fi
         # ⛔ ONLY A LINKED WORKTREE IS ASKED FOR ITS TREE STATE. For a gitless tree `head_state` is
         # three bounded git forks on a directory git rejects — charged against the budget that exists
         # to bound exactly this — and its answer is discarded anyway (review of #3278).
@@ -694,7 +874,7 @@ sweep_root() { # <root>
             log_line "         age=${age}m $out"
             continue
         fi
-        if [ "$(now)" -ge "$deadline" ]; then
+        if budget_before_removal "$deadline"; then
             log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi
@@ -772,7 +952,7 @@ while IFS= read -r r; do
     sweep_root "$r" || SWEEP_RC=3
 done <<<"$(printf '%s\n' "$ROOTS" | tr ':' '\n')"
 
-log_line "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m dirty=$DIRTY_MODE"
+log_line "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m dirty=$DIRTY_MODE budget=${BUDGET}s gitless_max=${GITLESS_MAX:-none}"
 log "SUMMARY mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED"
 
 [ "$FAILED" -gt 0 ] && exit 4

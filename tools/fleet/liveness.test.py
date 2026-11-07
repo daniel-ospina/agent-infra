@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/liveness.test.py — the #1178 acceptance suite.
 
-57 tests with 112 paired mutations: every mutation re-
+58 tests with 113 paired mutations: every mutation re-
 introduces the defect its test exists to catch, so "the test fails without the
 fix" is an EXECUTED claim rather than an asserted one. Two prior artifacts in
 this repo claimed mutation evidence they did not have; this file makes the
@@ -21,8 +21,8 @@ outside it abstains on a call-free message (`turn-unknown:<value>`) instead of
 defaulting to resting (a call-carrying message is decided by the call-carrying
 rule first).
 
-    python3 tools/fleet/liveness.test.py                # the 57 tests, green
-    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (112)
+    python3 tools/fleet/liveness.test.py                # the 58 tests, green
+    python3 tools/fleet/liveness.test.py --mutations     # each mutation, RED (113)
 
 `--mutations` writes a mutated copy of the module (or of the identity library)
 to a temp dir and runs the paired test against it in a subprocess — the real

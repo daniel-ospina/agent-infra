@@ -2730,37 +2730,49 @@ _strip_probe="$(printf '%s\n' 'A=1;# stale' '(echo hi)# stale' 'C=3|# stale' 'D=
   "R=\$\$\$'it\\'s' # stale" 'S=1 # elevenchr' \
   "T=\\$'a\\' # stale" | _strip_comments)"
 _strip_bad=""
-# ⛔ ONE PROBE PER COMMENT LENGTH, GENERATED (review P2, cycle 34). A single hand-written probe cannot
-# grade a BAND: probe `S` (an 11-character tail) redded a rule keeping 11-19 characters as data, but a
-# rule keeping 12-19 — or any band that excludes 11 — passed the whole suite, measured GREEN with a real
-# comment back in the graded view (\`# thirteenchr\`). A rule change applied to BOTH copies is invisible to
-# the reference equality by construction, so the lengths have to be covered by construction instead: one
-# probe per tail length from 1 to 19, each required to be cut.
+# ⛔ THE LENGTH PROBES MUST NOT BE A FUNCTION OF THE RULE UNDER TEST (review P2, cycles 34-37). Three forms
+# failed in exactly that direction. `seq 1 19` graded only the lengths someone thought of, and a band
+# starting at 20 kept 85 real writer comments green. Deriving the lengths from `_strip_ref`'s own removals
+# let the check DELETE ITS OWN PROBES: a band applied to BOTH copies shrank the population 108 -> 94 and
+# this block still printed "no length band can hide" (191 comments rejoined the graded view; the writer's
+# longest tail read 100 while it was 165). So: EVERY integer in the range 0.._LEN_CAP is probed, and
+# _LEN_CAP is derived from the writer's longest RAW line — a ceiling no rule change can lower, because a
+# comment tail can never be longer than its own line. `_content_lines_max` uses only awk/tr/printf, all in
+# the preflight; there is no `seq`, `sort` or `tail` here, and the probe count is CHECKED against the cap
+# rather than typed.
+# ⛔ DEFINED BEFORE USE: bash resolves functions top-down, and this one is consumed a few lines
+# below by the length-probe range (the helper sat 90 lines lower and the cap read empty).
+_content_lines() { grep -c '[^[:space:]]' || true; }
+_content_lines_max() { awk '{ if (length($0) > m) m = length($0) } END { print m + 0 }'; }
+# ⛔ THE COUNTER IS INCREMENTED BY THE COMPARISON, NOT BY THE LOOP (review P2, cycle 38). It used to be
+# `_n_len=$((_n_len + 1))` as the loop's first statement, which makes `_n_len -eq _LEN_CAP + 1` a TAUTOLOGY:
+# measured, wrapping the grading in `if (( _L % 2 )); then … fi` graded 535 of 1070 lengths and the suite
+# still printed "EVERY tail length … 1070 contiguous probes" and exited 0. Both `case` arms now increment,
+# so a length whose comparison was SKIPPED leaves the count short and the guard below fires naming it.
 _strip_len_bad=""; _n_len=0
-# ⛔ THE LENGTH POPULATION MUST NOT BE A FUNCTION OF THE RULE UNDER TEST (review P2, cycle 36). Two earlier
-# forms failed in that direction. `seq 1 19` graded only the lengths someone thought of, and a band starting
-# at 20 kept 85 real writer comments green. Deriving the lengths from `_strip_ref`'s own removals then let
-# the check DELETE ITS OWN PROBES: a band applied to BOTH copies shrank the population from 108 lengths to
-# 94 and this block still printed "no length band can hide". The range is therefore FROZEN and CONTIGUOUS,
-# 0.._LEN_CAP, built by brace expansion (no `seq`, `sort` or `tail` — none of the three is in the tool
-# preflight), and the writer's own longest comment tail is checked against the cap so the constant cannot
-# go stale silently: a longer comment fails here and names the constant to raise.
-_LEN_CAP=200
-for _L in {0..200}; do
-  _n_len=$((_n_len + 1))
+_raw_maxline="$(_content_lines_max < "$REFRESH")"
+if [ "${_raw_maxline:-0}" -lt 40 ]; then
+  _LEN_CAP=200
+else
+  _LEN_CAP=$(( _raw_maxline + 5 ))
+fi
+for (( _L = 0; _L <= _LEN_CAP; _L++ )); do
   _tail="$(printf '%*s' "$_L" '' | tr ' ' x)"
   _got="$(printf '%s\n' "V=$_L # $_tail" | _strip_comments)"
-  [ "$_got" = "V=$_L " ] || _strip_len_bad="$_strip_len_bad $_L"
+  case "$_got" in
+    "V=$_L ") _n_len=$((_n_len + 1)) ;;
+    *) _strip_len_bad="$_strip_len_bad $_L"; _n_len=$((_n_len + 1)) ;;
+  esac
 done
 _len_max="$(_strip_ref 1 < "$REFRESH" | awk -F'\001' 'NF > 1 && $2 != "" { n = length($2) - 2; if (n < 0) n = 0; if (n > max) max = n } END { print max + 0 }')"
-if [ "${_n_len:-0}" -lt 101 ]; then
-  bad "pin/writer: only ${_n_len:-<unreadable>} length probe(s) ran (want 201, one per integer 0..$_LEN_CAP) — the loop did not run, so its silence would mean nothing"
-elif [ "${_len_max:-x}" = "x" ] || [ "${_len_max:-0}" -gt "$_LEN_CAP" ]; then
-  bad "pin/writer: the writer's longest comment tail is ${_len_max:-<unreadable>} characters, past the frozen probe range 0..$_LEN_CAP — raise _LEN_CAP so the band starting there is graded (the range is a CONSTANT on purpose: deriving it from the strip let a band delete its own probes)"
+if [ "${_n_len:-0}" -ne "$(( _LEN_CAP + 1 ))" ]; then
+  bad "pin/writer: $_n_len length probe(s) ran but the range 0..$_LEN_CAP holds $(( _LEN_CAP + 1 )) — the loop and the cap disagree, so part of the range is ungraded (this count is derived, never typed)"
+elif [ "${_raw_maxline:-0}" -lt 1 ]; then
+  bad "pin/writer: the writer's longest RAW line could not be measured (got '${_raw_maxline:-<unreadable>}'), so 0..$_LEN_CAP is not known to cover every comment tail the writer can carry"
 elif [ -z "$_strip_len_bad" ]; then
-  ok "pin/writer: a comment is cut at EVERY tail length in the frozen range 0..$_LEN_CAP (201 contiguous probes; the writer's longest tail is $_len_max) — no length band can hide a class of comments, including one changed in BOTH copies"
+  ok "pin/writer: a comment is cut at EVERY tail length in the range 0..$_LEN_CAP ($_n_len contiguous probes; the writer's longest line is $_raw_maxline, its longest comment tail $_len_max) — the bound comes from the raw bytes, so no length band can hide a class of comments, including one changed in BOTH copies"
 else
-  bad "pin/writer: a comment tail of length(s)$_strip_len_bad was NOT cut (contiguous frozen probes 0..$_LEN_CAP) — a length rule is keeping that band as DATA, so those comments are graded as code"
+  bad "pin/writer: a comment tail of length(s)$_strip_len_bad was NOT cut (contiguous probes 0..$_LEN_CAP, $_n_len of them) — a length rule is keeping that band as DATA, so those comments are graded as code"
 fi
 for _want in 'A=1;' '(echo hi)' 'C=3|' 'D=4&&' 'E=5(' 'F=6<' 'I=7>' $'J=8\t' \
               'K="head #5 is data"  ' 'L="${OR##*/}"' 'M=${#arr[@]}' "N=9\\'x " 'O="a\"b" ' \
@@ -2830,7 +2842,6 @@ case "$_d2" in
     esac ;;
   *) bad "pin/writer: _diff_first returned '$_d2' for a divergence in the last character of a 105-column line (want a window starting 'at col 105: ') — an unbounded-left excerpt prints two IDENTICAL strings for two long lines that differ near the end, which is the shape a long writer comment has" ;;
 esac
-_content_lines() { grep -c '[^[:space:]]' || true; }
 # how many comments a marked pass removes, and the first one it removes
 _removed_n() {  awk -F'\001' 'NF > 1 && $2 != "" { n++ } END { print n + 0 }'; }
 _removed_first() { awk -F'\001' 'NF > 1 && $2 != "" { print $2; exit }'; }
@@ -2876,11 +2887,47 @@ else
   # STARTS with the pinned one (`_strip_comments_legacy`), and a `#` inside quotes (a comment-truncating
   # `sed` cut the real call out of view). The body cannot be spoofed by any of those, so the body is what
   # is graded; the assignment is graded with a word boundary, no truncation, no `sed`.
+  # ⛔ GRADE THE FUNCTION THAT IS THE RULE, WORD-BOUNDED (review P2, cycle 37). `_strip_comments` is a
+  # one-line WRAPPER, so matching it graded the wrapper: a delegation BELOW it (`_strip_marked() {
+  # _strip_ref \"$@\"; }`) and a callee whose name merely STARTS with the pinned token both stayed GREEN, with
+  # the equality then a tautology over every removal. Both bodies are read, the name matches are
+  # word-bounded, and ANY mention of the reference in either body fails.
   _wcode_body="$(declare -f _strip_comments 2>/dev/null || true)"
-  case "$_wcode_body" in
-    *_strip_ref*) _wpin=0; _wref=1 ;;
-    *_strip_marked*) _wpin=1; _wref=0 ;;
-    *) _wpin=0; _wref=0 ;;
+  _wmarked_body="$(declare -f _strip_marked 2>/dev/null || true)"
+  _wpin=0; _wref=0
+  { printf '%s' "$_wcode_body"; printf '%s' "$_wmarked_body"; } \
+    | grep -qE '(^|[^[:alnum:]_])_strip_ref([^[:alnum:]_]|$)' && _wref=1
+  printf '%s' "$_wcode_body" | grep -qE '(^|[^[:alnum:]_])_strip_marked([^[:alnum:]_]|$)' && _wpin=1
+  [ -n "$_wmarked_body" ] || _wpin=0
+  # ⛔ AND THE DEPENDENCY IS GRADED AS A PROPERTY, NOT AS A SPELLING (review P2, cycle 38). Two rounds of
+  # textual matching were each defeated by delegating one level deeper than the names it looked at — the
+  # last one by a helper BETWEEN the stripper and the reference, which stayed GREEN with the graded view
+  # literally BEING the reference (the "unify the copies" mistake, made transitive). So the reference is
+  # replaced by a SENTINEL and the strip must produce the same bytes: a delegation that SUCCEEDS prints
+  # `REF-USED` and is caught, whatever its depth, because the stub is what answers.
+  # Residual, stated rather than implied (two, both deliberate): RENAMING the reference and moving every
+  # call site defeats this, since no test can see a name it never reads; and a delegation whose OUTPUT is
+  # DISCARDED (into `/dev/null`, a captured-but-unused variable, or a helper that swallows it) leaves no
+  # sentinel in the graded bytes and is therefore out of scope — the check grades the BYTES the view is
+  # built from, not every call the shell could make.
+  # ⛔ A SENTINEL STUB, NOT A REMOVAL (review P2, cycle 39). `unset -f` only reddens a delegation whose
+  # FAILURE changes the bytes: a helper that prefers the reference and falls back to an equivalent copy
+  # caught the `command not found` and produced identical output, so the property held while the graded
+  # view literally WAS the reference — measured GREEN, with the ok line asserting a dependence that
+  # existed. Replacing the reference with a stub makes a SUCCESSFUL delegation visible (it emits
+  # `REF-USED`), while a failed one still cannot hide.
+  # ⛔ BOTH SIDES CAPTURED THE SAME WAY (review P3, cycle 40). `_WCODE` takes stdout only, so merging
+  # stderr here (`2>&1`) would make ANY benign warning from the strip look like a changed view and print
+  # "it reaches `_strip_ref` somewhere the names above did not" — a false accusation. The sentinel goes to
+  # stdout, so nothing is lost by comparing like with like.
+  _wcode_nodep="$({ _strip_ref() { printf 'REF-USED\n'; }; _strip_comments < "$REFRESH"; })"
+  case "$_wcode_nodep" in
+    *'REF-USED'*) bad "pin/writer: the strip CALLS \`_strip_ref\` — the reference answered with a sentinel, so the graded view is the REFERENCE and every predicate below it is a tautology" ;;
+    *) if [ "$_wcode_nodep" = "$_WCODE" ]; then
+         ok "pin/writer: the strip produces IDENTICAL output when \`_strip_ref\` is replaced by a SENTINEL STUB — the graded view is not built from the reference, so the byte-equality below is not a comparison of the reference with itself (a delegation whose output is discarded is out of scope; said above)"
+       else
+         bad "pin/writer: the strip's output CHANGES when the reference is stubbed — it reaches \`_strip_ref\` somewhere the names above did not: '$(_diff_first "$_WCODE" "$_wcode_nodep")'"
+       fi ;;
   esac
   _wline="$(grep -E '^_WCODE=' "$_PINFILE" | awk 'END { print }')"
   printf '%s' "$_wline" | grep -qE '\$\([^)]*_strip_comments[[:space:]<]' || _wpin=0
