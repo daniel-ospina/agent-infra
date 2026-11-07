@@ -786,6 +786,71 @@ else
   bad "N4 the row does not attribute the failure to the rescue: $(sed -n '$p' "$T/state-rto/wip-sweep.tsv" 2>/dev/null)"
 fi
 
+# ⛔ N5 — THE `budget_exhausted` GATE ON THE CLASSIFY CALL (review finding, cycle 6). A 124/137 on the
+# CLASSIFY call is a deferral ONLY when the budget is actually spent; otherwise the classifier timed out on
+# its own bound and the worktree was NEVER MEASURED. The gate had no arm: deleting `&& budget_exhausted`
+# left this suite at PASS=151 FAIL=0 (measured). Under the mutant a worktree nobody classified is reported
+# as "never got its turn" with the whole budget still available, exit 1 (`incomplete`, retryable) replaces
+# exit 3 (`failed`, a human must look) — and this runs on the quiesce path, where nobody retries.
+mk_fixture n5 fix/3485-n5 || { echo "❌ fixture failed (n5)"; exit 1; }
+printf 'uncommitted edit\n' >> "$T/n5/wt/base.txt"
+# Answers the USABILITY probe (so the rescuer is accepted), then hangs on a REAL path — the shape that
+# produces a 124 from the classify call while the pass budget is untouched.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
+  'esac' \
+  'sleep 30' \
+  'echo "verdict=clean paths=0 branch=x slug=x issue=-"' \
+  'exit 0' > "$T/stub-classify-hang.sh"
+chmod +x "$T/stub-classify-hang.sh"
+O_N5="$(WIP_SWEEP_RESCUE="$T/stub-classify-hang.sh" WIP_SWEEP_STATUS_TIMEOUT=2 \
+  WIP_SWEEP_STATE_DIR="$T/state-n5" bash "$SW" --apply --repo "$T/n5/wt" 2>&1)"; RC_N5=$?
+[ "$RC_N5" -eq 3 ] \
+  && ok "N5 a classify timeout with the budget UNSPENT is a FAILURE (exit 3), not a deferral" \
+  || bad "N5 a classify timeout answered $RC_N5 (want 3): $O_N5"
+grep -qx 'unmeasured=1' "$T/state-n5/wip-sweep.status" 2>/dev/null \
+  && ok "N5b unmeasured=1 — the worktree is counted as NOT MEASURED" \
+  || bad "N5b the classify timeout was not counted as unmeasured: $(cat "$T/state-n5/wip-sweep.status" 2>/dev/null | tr '\n' ' ')"
+grep -qx 'deferred=0' "$T/state-n5/wip-sweep.status" 2>/dev/null \
+  && ok "N5c deferred=0 — nothing was deferred, because the budget was never spent" \
+  || bad "N5c the classify timeout was mis-filed as a budget deferral"
+if grep -q 'deferred-pass-budget' "$T/state-n5/wip-sweep.tsv" 2>/dev/null; then
+  bad "N5d the index carries a deferred-pass-budget row over an unspent budget"
+else
+  ok "N5d no deferred-pass-budget row — the misdiagnosis the gate exists to prevent"
+fi
+
+# ⛔ N6/N6b — THE VERDICT ALLOW-LIST FALLBACK (review finding, cycle 6). `case "$verdict:$vrc"` accepts
+# exactly three pairs; EVERYTHING else must land in `cannot-verify`. That fallback is the last thing
+# standing between "the classifier could not classify" and "clean", and it had no arm: replacing it with
+# `*) verdict="clean"` left this suite at PASS=151 FAIL=0 (measured). A rescuer that passes the usability
+# probe and then answers a REAL path with no verdict line (or with a word this script has never seen) is
+# exactly the 127 / word-exit-mismatch shape the comment names.
+for _n6case in noverdict banana; do
+  mk_fixture "n6$_n6case" "fix/3485-n6$_n6case" || { echo "❌ fixture failed (n6$_n6case)"; exit 1; }
+  printf 'uncommitted edit\n' >> "$T/n6$_n6case/wt/base.txt"
+  if [ "$_n6case" = banana ]; then _n6out='echo "verdict=banana paths=1 branch=x slug=x issue=-"; exit 0';
+  else _n6out='echo "wip-sweep-ish: delegate exploded" >&2; exit 3'; fi
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case " $* " in' \
+    '  *"/nonexistent-wip-sweep-usability-probe"*) echo "verdict=cannot-verify"; exit 2 ;;' \
+    'esac' \
+    "$_n6out" > "$T/stub-v-$_n6case.sh"
+  chmod +x "$T/stub-v-$_n6case.sh"
+  O_N6="$(WIP_SWEEP_RESCUE="$T/stub-v-$_n6case.sh" WIP_SWEEP_STATE_DIR="$T/state-n6$_n6case" \
+    bash "$SW" --apply --repo "$T/n6$_n6case/wt" 2>&1)"; RC_N6=$?
+  [ "$RC_N6" -eq 3 ] \
+    && ok "N6 a '$_n6case' answer is NOT a verdict — the pass FAILS (exit 3)" \
+    || bad "N6 a '$_n6case' answer from the classifier exited $RC_N6 (want 3): $O_N6"
+  # The classifier's own `branch=` wins the branch column (the stub says `x`), so the row is selected by
+  # the WORKTREE PATH ($2) — which is what identifies this fixture — rather than by the branch.
+  _n6col="$(awk -F'\t' -v m="n6$_n6case" '$2 ~ m {print $6; exit}' "$T/state-n6$_n6case/wip-sweep.tsv" 2>/dev/null)"
+  [ "$_n6col" = "cannot-verify" ] \
+    && ok "N6b ('$_n6case') the index row's verdict column is cannot-verify, NOT clean" \
+    || bad "N6b ('$_n6case') the row recorded verdict='$_n6col' — the allow-list let it through to clean"
+done
+
 # ── O) AN ENV-BOUND REFUSAL MARKS THE PASS; AN ARGUMENT ERROR DOES NOT ─────────────────────────────
 echo; echo "── O. an env-bound refusal (exit 2) marks the pass, an argument error does not ──"
 # ⛔ THE DOC USED TO SAY "a usage error (exit 2) comes earlier and deliberately does not touch the
