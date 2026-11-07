@@ -98,10 +98,13 @@
 #   its direction) in the `list_main_baseline` block: over-alarm only, never a
 #   false clean.
 #   --per-run <file>          (--commit-rows) write one line per FAILING run with
-#                             that run's failing ids, whitespace-separated — the
+#                             that run's failing ids, TAB-separated — the
 #                             per-run id sets `decide()` consumes for REQUIRED
 #                             class E5 (a class red across runs with a MOVING id is
 #                             UNATTRIBUTABLE, neither PR-unique nor exempt).
+#                             ⛔ TAB, not a space (#3686): a pytest parameter may
+#                             carry a space, and a space join shredded such an id
+#                             so E5 could not see it at all.
 #   --repo <owner/repo>       repo for the gh calls (default: gh's own resolution)
 #   --workflow <file|name>    restrict the run listing to ONE workflow (default
 #                             `python-ci.yml`, or $CI_FAILURE_SET_WORKFLOW).
@@ -1231,9 +1234,19 @@ collect_union_rates() {
   collect_union_truncated "$truncated" "$examined" "$extracted" "$report" "$completed" "$tested" "$pending" "$truncated_id" || { rm -f "$tmp_all"; return 1; }
   # No tested runs -> emit NOTHING. An empty rate table must never be read as
   # "main never fails anything", which would exempt every PR failure.
+  #
+  # ⛔ THE ID IS RECOVERED BY `sub` ON THE RECORD, NOT BY FIELD REBUILDING
+  # (#3686 second door). The old form was `$1 = ""; sub(/^ +/,"")` — ASSIGNING a
+  # field makes awk rebuild `$0` from the fields joined by OFS, which COLLAPSES a
+  # run of two or more spaces inside a pytest parameter (`…[a  b]` -> `…[a b]`).
+  # The row then carries a key the PR side can never equal, so the id reads
+  # PR-unique forever — the #3686 deadlock — and it did so with NO rejection note,
+  # because the row was never malformed, just re-keyed. `sub` edits the record in
+  # place, so the id reaches the reader byte-for-byte as pytest printed it.
+  # (`_RATES_RE` delimits that id on the TAB, never on whitespace.)
   if [ "$tested" -gt 0 ]; then
     sort "$tmp_all" | uniq -c \
-      | awk -v k="$tested" '{ c = $1; $1 = ""; sub(/^ +/, ""); print $0 "\t" c "\t" k }'
+      | awk -v k="$tested" '{ c = $1; sub(/^ *[0-9]+ +/, ""); print $0 "\t" c "\t" k }'
   fi
   rm -f "$tmp_all"
 }
@@ -1417,7 +1430,15 @@ collect_union_rows() {
         extracted=$((extracted + 1))
         printf '%s\n' "$ids" >> "$tmp_ids"
         if [ -n "$per_run" ]; then
-          printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
+          # ⛔ TAB-JOINED, NOT SPACE-JOINED (#3686 second door). A pytest parameter may
+          # carry a SPACE (`…[argv14-at the EDGE]`), so a space join SHREDS such an id into
+          # fragments; `parse_rotation_runs` then never sees the real id and the E5
+          # rotating-identity guard is INERT for it — a rotating identity would be
+          # EXEMPTED instead of UNATTRIBUTABLE, the one class the rail may never merge.
+          # A tab is the one delimiter an id cannot contain, and `tr` turns each line's
+          # terminator into one, so every emitted line carries a tab — which is how the
+          # reader tells this form from the pre-#3686 space-joined one it still accepts.
+          printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' '\t')" >> "$per_run"
         fi
       fi
       # ⛔ NOTHING TO DO IN AN `else`, and the absent branch is stated rather than assumed:
@@ -1461,7 +1482,15 @@ collect_union_rows() {
       extracted=$((extracted + 1))
       printf '%s\n' "$ids" >> "$tmp_ids"
       if [ -n "$per_run" ]; then
-        printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' ' ')" | sed 's/ *$//' >> "$per_run"
+        # ⛔ TAB-JOINED, NOT SPACE-JOINED (#3686 second door). A pytest parameter may
+        # carry a SPACE (`…[argv14-at the EDGE]`), so a space join SHREDS such an id into
+        # fragments; `parse_rotation_runs` then never sees the real id and the E5
+        # rotating-identity guard is INERT for it — a rotating identity would be
+        # EXEMPTED instead of UNATTRIBUTABLE, the one class the rail may never merge.
+        # A tab is the one delimiter an id cannot contain, and `tr` turns each line's
+        # terminator into one, so every emitted line carries a tab — which is how the
+        # reader tells this form from the pre-#3686 space-joined one it still accepts.
+        printf '%s\n' "$(printf '%s\n' "$ids" | tr '\n' '\t')" >> "$per_run"
       fi
       # No shape guard here any more (#3756 defect 1): `failed_ids_from_log` has
       # ALREADY dropped, counted and reported every candidate that is not a test

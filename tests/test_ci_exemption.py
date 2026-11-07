@@ -63,6 +63,7 @@ parse_failed_ids = ci_exemption.parse_failed_ids
 parse_failure_rows = ci_exemption.parse_failure_rows
 parse_pr_failure_text = ci_exemption.parse_pr_failure_text
 parse_rates = ci_exemption.parse_rates
+parse_rotation_runs = ci_exemption.parse_rotation_runs
 parse_signature_rows = ci_exemption.parse_signature_rows
 
 ID = "tests/test_dr_endpoints.py::TestDrDrill::test_restores_to_scratch"
@@ -1057,6 +1058,107 @@ def test_a_SPACE_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED():
     )
     assert _SPACE_PARAM_ID in {v.nodeid for v in decision.exempt}, (
         "the id was neither blocked nor exempted, so the verdict never saw it"
+    )
+
+
+def test_a_SPACE_PARAMETRIZED_ROTATING_identity_is_UNATTRIBUTABLE_not_EXEMPT():
+    r"""⛔ THE FAIL-OPEN THIS CHANGE COULD HAVE OPENED (#3686 second door, P1).
+
+    Un-blocking a space-parametrized id is only safe if the E5 rotating-identity
+    guard can still SEE it. The per-run wire format used to be space-joined, so a
+    spacey id was shredded into fragments: the real id appeared in NO run set,
+    `detect_rotating_identity` could not see it, and `decide` EXEMPTED an identity
+    that provably MOVED between runs — the one class the rail states may never
+    merge. Un-blocking without this is a silent exemption, i.e. strictly worse
+    than the refusal it replaced.
+
+    MUTATION: restore `raw.split()` in `parse_rotation_runs` → both ids shred into
+    fragments, the class is still reported rotating with the WRONG ids, the guard
+    misses the real id, and this test fails on `unattributable`.
+    """
+    moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
+    moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    stable = "tests/other.py::test_y"
+
+    # The producer's wire format: one line per failing run, ids TAB-joined.
+    runs = parse_rotation_runs(f"{stable}\t{moved_a}\n{stable}\t{moved_b}\n")
+    assert any(moved_b in s for s in runs), (
+        "the per-run reader SHREDDED a space-parametrized id, so E5 is blind to "
+        f"it: {runs}"
+    )
+
+    rotating = detect_rotating_identity(runs)
+    assert moved_b in rotating.get("tests/test_x.py::TestK", frozenset())
+
+    sig = "sg-3686-rotate"
+    main = parse_rates(f"{moved_b}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved_b}\t3\t26\t{sig}\n").failures
+    decision = decide(
+        pr,
+        main.rates,
+        main_signatures={moved_b: frozenset({sig})},
+        rotating=rotating,
+        k_pr=26,
+        rate_tolerance=1.5,
+    )
+
+    assert [v.nodeid for v in decision.unattributable] == [moved_b], (
+        "a MOVING identity was not classified UNATTRIBUTABLE: "
+        f"{decision.report()}"
+    )
+    assert moved_b not in {v.nodeid for v in decision.exempt}, (
+        "a rotating identity on a space-parametrized id was EXEMPTED — the "
+        "fail-open #3686's second door opened in the E5 guard"
+    )
+
+
+def test_the_ROTATION_reader_still_accepts_the_PRE_3686_space_joined_form():
+    """The tab-free form must keep meaning what it always meant.
+
+    `ADMIN_MERGE_FAILURE_SET_SH` can point the rail at another producer, and an
+    older one space-joins. Parsing its line as ONE giant id would blind E5 a second
+    way — quietly, since no assertion would fire. A tab-free line is therefore read
+    the old way, which is exactly why the producer emits a tab on EVERY line (even a
+    single-id run): "no tab" unambiguously identifies the old form.
+    """
+    runs = parse_rotation_runs("tests/a.py::t1 tests/a.py::t2\n")
+
+    assert runs == [frozenset({"tests/a.py::t1", "tests/a.py::t2"})]
+
+
+def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format():
+    """The cross-language half: the SHIPPED producer, executed, not quoted.
+
+    `parse_rotation_runs` is pinned above by behaviour, but nothing there stops
+    `ci-failure-set.sh` from reverting to a space join — two languages, one wire
+    format, and the Python suite is the part every change runs. So this leg reads
+    the producer's own awk program OUT OF THE SCRIPT and executes it, which pins
+    the script's real text with no second copy to drift.
+    """
+    src = (Path(__file__).resolve().parent.parent / "scripts" / "ci-failure-set.sh").read_text()
+
+    # (1) the RATE table: the id must reach the reader byte-for-byte.
+    prog = re.search(r'awk -v k="\$tested" \'(\{ c = \$1;.*?\})\'', src)
+    assert prog, "the rate-table awk program moved — update this pin"
+    nodeid = "tests/test_pages_bindings.py::t[a  b]"
+    proc = subprocess.run(
+        ["awk", "-v", "k=40", prog.group(1)],
+        input=f"      3 {nodeid}\n", capture_output=True, text=True, check=True,
+    )
+    assert proc.stdout == f"{nodeid}\t3\t40\n", (
+        "the rate-table builder RE-KEYED the id (awk rebuilt $0 from its fields, "
+        f"collapsing interior spacing): {proc.stdout!r}"
+    )
+    assert '$1 = ""' not in prog.group(1), (
+        "field assignment rebuilds $0 and collapses runs of spaces — the #3686 "
+        "second door's silent re-keying"
+    )
+
+    # (2) the per-run sets: TAB-joined, never space-joined.
+    assert "tr '\\n' '\\t'" in src, "the per-run producer is no longer TAB-joined"
+    assert src.count("| tr '\\n' ' '") == 0, (
+        "a per-run write is SPACE-joined again — a space-parametrized id would be "
+        "shredded and E5 blinded"
     )
 
 

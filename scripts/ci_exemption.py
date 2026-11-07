@@ -1450,13 +1450,15 @@ def _signature_from(e_line: str | None, exc: str | None) -> str:
 #     with no FAILED line) into a "guard-step" id, i.e. exactly the fail-closed
 #     refusal this change must PRESERVE. It is excluded, and a step carrying
 #     ONLY it stays unattributable.
-#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE. The main RATE
-#     table is built with `uniq -c | awk` and is whitespace-delimited (the count
-#     is field 1, the id field 2), so a key containing a space is mangled there;
-#     and the comparison needs the same identity on both trees despite an orphan
-#     COUNT that changes every run. So the step is slugged into the key and the
-#     error SHAPE rides the key tail AND the signature column the decision
-#     already carries.
+#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE — and ⛔ NOT
+#     because the rate table cannot carry a space. It CAN: the main rate table's
+#     nodeid is delimited by the TAB (`_RATES_RE`), and #3686's second door is
+#     exactly the bug that made a space unrepresentable there. The guard key
+#     stays whitespace-free because it is a SLUG over a step name and an error
+#     shape, and because the comparison needs the same identity on both trees
+#     despite an orphan COUNT that changes every run. So the step is slugged into
+#     the key and the error SHAPE rides the key tail AND the signature column the
+#     decision already carries.
 
 #: The one prefix no pytest nodeid can produce, so a guard key cannot collide
 #: with a test id.
@@ -2773,12 +2775,30 @@ def parse_signature_rows(text: str) -> dict[str, frozenset[str]]:
 
 
 def parse_rotation_runs(text: str) -> list[frozenset[str]]:
-    """Per-run id sets, one run per non-blank line, ids whitespace-separated."""
+    """Per-run id sets, one run per non-blank line, ids TAB-separated.
+
+    ⛔ TAB, NOT WHITESPACE (#3686 second door). A pytest parameter legitimately
+    carries a SPACE — ``…[argv14-at the EDGE]`` is a real id from a shipped suite
+    — so a whitespace split SHREDS it into fragments. Measured before this
+    change: the real id is in NO run set, ``detect_rotating_identity`` therefore
+    cannot see it, and ``decide``'s E5 guard (the class that may never merge) is
+    INERT for exactly the ids #3686 un-blocked. That turns a permanent BLOCK into
+    a silent EXEMPT for a rotating identity, i.e. it is the fail-open direction
+    of the fix, not a cosmetic wire-format detail. A tab is the one delimiter an
+    id cannot contain — the same delimiting the rate and signature tables use.
+
+    The pre-#3686 producer space-joined the ids and emitted NO tab, so a line
+    carrying no tab is still read the old way. That is deliberate: an older
+    producer (or ``ADMIN_MERGE_FAILURE_SET_SH`` pointing at one) would otherwise
+    be re-parsed as ONE giant id per run, which is a second, quieter way to
+    blind E5. The fallback keeps old input meaning what it always meant.
+    """
     runs: list[frozenset[str]] = []
     for raw in text.splitlines():
         if not raw.strip():
             continue
-        runs.append(frozenset(raw.split()))
+        ids = raw.split("\t") if "\t" in raw else raw.split()
+        runs.append(frozenset(i for i in ids if i))
     return runs
 
 
@@ -3091,7 +3111,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     dec.add_argument(
         "--rotation",
-        help="per-run id sets, one run per line (feeds detect_rotating_identity)",
+        help=("per-run id sets, one run per line, ids TAB-separated "
+              "(feeds detect_rotating_identity); a tab-free line is read as the "
+              "pre-#3686 whitespace-joined form"),
     )
     dec.add_argument("--rate-tolerance", type=float, default=1.5)
     dec.add_argument("--min-runs", type=int, default=3)
