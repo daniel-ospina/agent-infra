@@ -913,21 +913,27 @@ GH_PROBE_CAUSE=""
 # a `--paginate` refusal can replay a whole error body, and `why=` is a single-line key in a file every
 # beat reads — so the first non-empty line, whitespace-collapsed, truncated.
 # ⛔ AND THE CLAUSE PUTS ITS FIXED-SIZE VERDICT FIRST AND ITS EVIDENCE LAST (#3701 review round 3,
-# P2). `refresh_cause_brief` prints `why=` cut at 400 BYTES (`orch-loop.sh:2558`; GNU `cut -c` is
+# P2). `refresh_cause_brief` prints `why=` cut at 400 BYTES (`orch-loop.sh:2559`; GNU `cut -c` is
 # byte-wise — `printf 'aéb' | cut -c1-2` yields `a\xc3`), and `provision_fail` spends 52 of them on
 # `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
-# `] — no candidate can be judged from this box` — leaving ~302 bytes for a clause that has to carry
-# the 244-byte verbatim note `scripts/gh-shim/gh` writes. SOMETHING is therefore always clipped, and
-# the only real decision is WHICH part yields. Round 2 answered "the verdict", and MEASURED on the real
-# record that is the wrong half: leading with the evidence ends the beat line INSIDE the verdict
-# (`… the budget was tested, so NEI`), so an operator reads a severed claim and never sees
-# `NOT auth and NOT an outage`, nor which question was asked. The verdict and the question are
-# FIXED-SIZE (~220 bytes together, whatever the stderr says); the evidence is the only variable-length
-# part, AND the record keeps it whole — the cap below bounds the clause at 320, well clear of the
-# 244-byte note. So the verdict leads and the evidence closes, and the beat's cut can then only land
-# inside the evidence, where the severed tail costs nothing the record does not already hold.
-# `refresh-provision.test.sh`'s `(g7)` drives the REAL `refresh_cause_brief` and pins that: every other
-# arm reads `rec why`, which is unbounded, so they all stay green while the beat severs the line.
+# `] — no candidate can be judged from this box`. MEASURED, byte for byte, on the rc=75 arm: the
+# prefix and the fixed `answer=` + `question=` half cost 306 bytes before the evidence starts, so the
+# evidence gets the remaining 94 of the 400 — while `scripts/gh-shim/gh`'s own note is 244 bytes.
+# 245 of fixed clause + 9 for `evidence=` + 244 of note is 498 against 348 of window (the suffix only
+# survives when nothing is cut), so SOMETHING is always clipped here, and the only real decision is
+# WHICH part yields. Round 2 answered "the verdict", and MEASURED on the real record that is the wrong
+# half: leading with the evidence ends the beat line INSIDE the verdict (`… the budget was tested, so
+# NEI`), so an operator reads a severed claim and never sees `NOT auth and NOT an outage`, nor which
+# question was asked. The verdict and the question are FIXED-SIZE (245 bytes together, whatever the
+# stderr says); the evidence is the only variable-length part, AND the record keeps it whole — the cap
+# below bounds the clause at 320, well clear of the 244-byte note. So the verdict leads and the
+# evidence closes, and once the evidence is long enough to reach the cut (over ~94 bytes, which every
+# real refusal is) the severed tail is evidence and its loss costs nothing the record does not already
+# hold. Below that, the cut falls in `provision_fail`'s own trailing sentence instead, which is
+# boilerplate the `[dispatch] BLOCKED` line repeats anyway — it is not the verdict, and that is the
+# invariant this ordering buys.
+# `refresh-provision.test.sh`'s `(g7)` drives the REAL `refresh_cause_brief` and pins both halves:
+# every other arm reads `rec why`, which is unbounded, so they all stay green while the beat cuts.
 GH_PROBE_CAUSE_MAX=320
 gh_probe_evidence() {  # <rc> — the measured answer, one line, or a named non-answer
   local rc="${1:-?}" line
@@ -1142,7 +1148,7 @@ gh_probe_env() {
   # the common case.
   case "$prc" in
     75) GH_PROBE_CAUSE="answer=REFUSED LOCALLY by the gh layer (rc=75 EX_TEMPFAIL — nothing was sent, so NEITHER the credential NOR the budget was tested): NOT auth and NOT an outage; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")" ;;
-    *)  GH_PROBE_CAUSE="answer=NO — the call failed, and neither auth nor an outage until its evidence says so; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")" ;;
+    *)  GH_PROBE_CAUSE="answer=NO — the call failed; read its evidence before calling this auth or an outage; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")" ;;
   esac
   echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'

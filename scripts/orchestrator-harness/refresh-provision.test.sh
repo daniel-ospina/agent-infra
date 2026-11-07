@@ -80,7 +80,7 @@
 #   (g6) the OTHER default shape — rc=1/403 with a real rate-limit stderr, the arm #3584's own
 #        measured scenario took. Without this row that arm's interpolation could be deleted green;
 #   (g7) THE BEAT'S OWN LINE — not just the record. `refresh_cause_brief` cuts `why=` at 400 BYTES
-#        (`orch-loop.sh:2558`), so a clause can be complete in the record and still reach the operator
+#        (`orch-loop.sh:2559`), so a clause can be complete in the record and still reach the operator
 #        severed. This arm drives the REAL `refresh_cause_brief` and pins the invariant the clause is
 #        now ordered by: the cut may land inside the EVIDENCE, never inside the verdict.
 #   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
@@ -1068,7 +1068,7 @@ ck "(g6) …and does NOT reuse another arm's verdict (no REJECTED, no NON-ANSWER
 
 # ── (g7) THE BEAT'S 400-BYTE CUT MUST NOT SEVER THE VERDICT (#3701 review round 3, P2) ────────────
 # ⛔ EVERY ROW ABOVE READS `rec why`, AND `why=` IS UNBOUNDED — `refresh_record_write` writes it whole.
-# The line an OPERATOR sees is `refresh_cause_brief`'s, which cuts it at 400 BYTES (`orch-loop.sh:2558`;
+# The line an OPERATOR sees is `refresh_cause_brief`'s, which cuts it at 400 BYTES (`orch-loop.sh:2559`;
 # `cut -c1-400`, byte-wise), and `provision_fail` has already spent 52 of those on
 # `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
 # `] — no candidate can be judged from this box`. So a suite that reads only the record stays GREEN
@@ -1100,7 +1100,11 @@ if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut 
   # ⛔ NON-VACUITY, AND THE REASON THIS ARM IS NOT A TAUTOLOGY: the cut must GENUINELY HAVE FIRED, and the
   # row above must not be passing on a clause short enough to fit whole. The beat loses the clause's
   # trailing "no candidate can be judged" sentence when the cut fires, so its absence IS the proof.
-  ck "(g7) …with the cut genuinely FIRED (the clause's own tail is outside the window)" \
+  # ⛔ NOTE THE COUPLING (review round 4, observation): this row is only reachable while the shim's note
+  # stays longer than ~94 bytes, which is what makes the cut land in the EVIDENCE. If the shim ever
+  # shortens its note below that, the cut stops firing legitimately and THIS row reds — with a message
+  # about truncation — while the real cause is fixture drift, so the message names that possibility too.
+  ck "(g7) …with the cut genuinely FIRED (the clause's own tail is outside the window — if this reds, check whether the shim's note was shortened rather than assuming the ordering regressed)" \
      "$(case "$GBEAT" in *'no candidate can be judged from this box'*) echo 1 ;; *) echo 0 ;; esac)"
   # ⛔ AND THE CUT LANDS IN THE EVIDENCE — the assertion is the PAIR, so neither half can pass vacuously:
   # the beat KEEPS the evidence's head and LOSES its tail, while the RECORD keeps both.
