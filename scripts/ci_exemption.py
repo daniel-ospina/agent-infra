@@ -149,12 +149,14 @@ from pathlib import Path
 #: for no gain") — the ``/`` in ``rest`` is ADMITTED, because that rationale's own
 #: premise, "for no gain", is measurably false. A pytest parameter legitimately
 #: carries a PATH (``::test_x[tools/cache_evict.py]``), and the ``rest`` class
-#: already admitted ``[``/``]``/``.``/``:``/``-`` — the parameter space — so omitting
+#: already admitted ``[``/``]``/``.``/``:``/``-`` — the parameter-SYNTAX characters,
+#: NOT the whole parameter space (see the residual below) — so omitting
 #: ``/`` dropped main's rate row for EVERY such id. The consequence is not a
 #: formatting nicety, it is the exact failure mode :func:`is_failure_key`'s own
 #: docstring forbids: "a dropped main-side row makes the PR-side failure look
 #: unique, which BLOCKS". Measured on tortoise#11365: main's table carries all 10
-#: ``test_entry_point_python_guard.py`` rows (3/25, 3/25, 1/25, 2/25, 2/25) and
+#: ``test_entry_point_python_guard.py`` rows — 3/25, 3/25, 1/25, 2/25, 2/25 PER ARM,
+#: five tools each, so ten rows across the two arms — and
 #: ``parse_rates`` rejected all 10, so a PR that touches none of those files was
 #: BLOCKed as "introduced" while the 11 non-path-parameterized main-reds on the
 #: same run were correctly EXEMPT.

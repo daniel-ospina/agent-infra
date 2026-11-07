@@ -2979,7 +2979,8 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # THE DEFECT. A pytest parameter legitimately carries a PATH —
 # `tests/test_entry_point_python_guard.py` is parametrized over `tools/<name>.py`,
 # so its ids read `::test_...[tools/cache_evict.py]`. `_NODEID_RE.rest` admitted
-# `[`/`]`/`.`/`:`/`-` — the parameter space — but NOT `/`. So `is_failure_key`
+# `[`/`]`/`.`/`:`/`-` — the parameter-SYNTAX characters, NOT the whole parameter
+# space — but NOT `/`. So `is_failure_key`
 # (which gates `parse_rates`, i.e. MAIN's table) rejected every such id, while the
 # PR side's `is_failure_key_loose` accepted it.
 #
@@ -2994,8 +2995,17 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # whose diff touches none of those files (they are byte-identical to origin/main,
 # and the same ten tests fail on origin/main itself), while the eleven
 # non-path-parameterized main-reds on the SAME run were correctly EXEMPT. The
-# required `python-ci-gate` then reds, which deadlocks the very PR that repairs
-# the trunk (tortoise#11262 / tortoise#11255 is the same class).
+# required `python-ci-gate` then reds, which permanently BLOCKs any PR that
+# touches none of those files.
+#
+# ⛔ NOT the trunk repair. The sentence here used to read that this "deadlocks the
+# very PR that repairs the trunk (tortoise#11262 / tortoise#11255 is the same
+# class)". That is FALSE and was removed after measurement. tortoise#11262 ADDS
+# the missing interpreter guards, so these ten ids PASS on its head and the
+# predicate has nothing to adjudicate: none of its four heads carries a
+# `ci-introduced-failure` or `python-ci-gate` check-run AT ALL, and its only red
+# is `ai-review-gate`. The cost is the inverse of the claim — this defect blocks
+# PRs that never touch those files, while the trunk repair itself is unaffected.
 
 _PATH_PARAM_IDS = (
     "tests/test_entry_point_python_guard.py"
