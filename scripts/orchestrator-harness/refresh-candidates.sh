@@ -3915,7 +3915,7 @@ rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written,
   # `300` and wrote `0 2 -` — i.e. the reorder would have INSTALLED pool rows into candidates.txt,
   # adding membership, the one thing "order, never membership" forbids. `FILENAME == ARGV[1]` is the
   # file's IDENTITY: it cannot be true for the pool, whatever the queue did or failed to read.
-  awk -v cntf="$cnt" '
+  RQ_CNTF="$cnt" awk '
     # `qseen` collapses a DUPLICATE queue row (review P2 — the tail is emitted from this array). At the
     # main call site the queue was already deduped by the `awk !seen` above, so this is belt-and-braces;
     # it never drops a DISTINCT row, which is what "order, never membership" is about.
@@ -3926,8 +3926,8 @@ rank_queue_by_pool() {  # <pool> <queue> <out> <countfile> -> rc 0 on a written,
     END { for (i = 1; i <= nq; i++) {
             n = qorder[i]
             if (!(n in done)) { print n; unranked++ } }
-          printf "%d %d %s\n", ranked + 0, unranked + 0, (head == "" ? "-" : head) > cntf
-          close(cntf) }' \
+          printf "%d %d %s\n", ranked + 0, unranked + 0, (head == "" ? "-" : head) > ENVIRON["RQ_CNTF"]
+          close(ENVIRON["RQ_CNTF"]) }' \
     "$queue" "$pool" > "$out" || return 1
   [ -s "$out" ] || return 1
   # ⛔ THE COUNT FILE IS PART OF THE PRODUCT, NOT A NICETY (review P2). It is what tells the caller
@@ -4329,8 +4329,8 @@ product_queue_follow() {
   # IDENTITY, so an empty or unreadable queue cannot make the product file's own records pass for the
   # queue's (with `NR == FNR` a zero-record first file would re-emit the product rows THROUGH the
   # queue branch, i.e. a re-sequence derived from the wrong file).
-  if ! awk -v pf="$pf" '
-        BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+  if ! RQ_PF="$pf" awk '
+        BEGIN { while ((getline l < ENVIRON["RQ_PF"]) > 0) prod[l] = 1 }
         FILENAME == ARGV[1] { if (($0 in prod) && !($0 in out)) { out[$0] = 1; print } next }
         { if (!($0 in out)) { out[$0] = 1; print } }
       ' "$o/candidates.txt" "$pf" > "$tmp" 2>/dev/null; then
@@ -5937,12 +5937,12 @@ write_product_queues() { # <O> <OR> <PRODUCT_REPOS> -> writes the two queues; ec
     # harness side was the untested half.) Success is now gated on the ARTEFACT: both paths are regular
     # files AND both counts are numeric. `-f` is what refuses a directory; the numeric check refuses an
     # unreadable file whose `wc` failure would otherwise be read as a zero.
-    if awk -v hf="$o/.harness-issues" '
-      BEGIN { while ((getline l < hf) > 0) skip[l] = 1 }
+    if RQ_HF="$o/.harness-issues" awk '
+      BEGIN { while ((getline l < ENVIRON["RQ_HF"]) > 0) skip[l] = 1 }
       !($0 in skip) { print }' "$o/candidates.txt" > "$o/.product.tmp" 2>/dev/null \
       && mv -f "$o/.product.tmp" "$o/candidates.product.txt" 2>/dev/null \
-      && awk -v pf="$o/candidates.product.txt" '
-      BEGIN { while ((getline l < pf) > 0) prod[l] = 1 }
+      && RQ_PF2="$o/candidates.product.txt" awk '
+      BEGIN { while ((getline l < ENVIRON["RQ_PF2"]) > 0) prod[l] = 1 }
       !($0 in prod) { print }' "$o/candidates.txt" > "$o/.harness.tmp" 2>/dev/null \
       && mv -f "$o/.harness.tmp" "$o/candidates.harness.txt" 2>/dev/null \
       && [ -f "$o/candidates.product.txt" ] && [ -f "$o/candidates.harness.txt" ]; then
@@ -6089,8 +6089,8 @@ write_emergency_queue() { # <O> <OR> <PRODUCT_REPOS> -> writes candidates.emerge
     fi
     # Derived as a subset of `candidates.txt` and left in the BACKLOG's own (severity) order, so the first
     # emergency the dispatch side can see is the one that would have gone first anyway.
-    if awk -v ef="$o/.emergency-issues" '\
-        BEGIN { while ((getline l < ef) > 0) p0[l] = 1 }\
+    if RQ_EF="$o/.emergency-issues" awk '\
+        BEGIN { while ((getline l < ENVIRON["RQ_EF"]) > 0) p0[l] = 1 }\
         ($0 in p0) { print }' "$o/candidates.txt" > "$o/.emergency.tmp" 2>/dev/null \
        && mv -f "$o/.emergency.tmp" "$o/candidates.emergency.txt" 2>/dev/null \
        && [ -f "$o/candidates.emergency.txt" ]; then
