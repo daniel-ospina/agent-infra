@@ -4279,11 +4279,14 @@ ck "STRUCTURAL: the retired cp-glob redeploy survives only in COMMENTS, never in
 # ⛔ THE THRESHOLD IS THE MEASURED COUNT, NOT A ROUND NUMBER (round-4 review of #3645, P2 — measured). `-ge 3`
 # let all three rewritten remedies be reverted to wording naming NEITHER the glob NOR `deploy-harness.sh` and
 # stay green (478/6, the control's own red set), so the assertion's own description — "deleting a remedy reds
-# here" — was false. Pin at the present count: 7 non-comment lines at this head (`:3939`, `:4297`, `:4331`,
-# `:4338`, `:4558`, `:4653`, `:5232`). ⛔ RE-SET IT FROM A MEASURED COUNT whenever a message is legitimately
-# added or removed: it is a tripwire, not a coverage claim — the same idiom, and the same caveat, as
-# `tests/review-pr/run.sh`'s own `>= 891 assertions` pin (a DIFFERENT suite — round-5 review of #3645
-# caught the earlier wording claiming it was this one's, which has no such pin).
+# here" — was false. Pin at the present count: 7 non-comment lines at this head. ⛔ RE-DERIVE IT WITH THIS
+# EXACT COMMAND rather than from a list, because the list rots: the first cut of this comment enumerated the 7
+# by line number and two rounds later all seven were stale (the edit that added them had shifted them), so a
+# maintainer following it opened comments and `esac` lines — the count was right and the citation was not:
+#   grep 'deploy-harness.sh' scripts/orchestrator-harness/spawn-gate.sh | grep -vc '^[[:space:]]*#'
+# ⛔ RE-SET IT whenever a message is legitimately added or removed: it is a tripwire, not a coverage claim —
+# the same idiom, and the same caveat, as `tests/review-pr/run.sh`'s own `>= 891 assertions` pin (a DIFFERENT
+# suite — round-5 review of #3645 caught the earlier wording claiming it was this one's, which has no such pin).
 _dhn="$(grep 'deploy-harness.sh' "$HERE/spawn-gate.sh" | grep -vc '^[[:space:]]*#')"
 [ "$_dhn" -ge 7 ]; rc=$?
 ck "STRUCTURAL: the file still PRESCRIBES the verified redeploy in >=7 non-comment places ($_dhn) — a remedy replaced by prose reds here" $rc
