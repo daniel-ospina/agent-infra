@@ -3126,7 +3126,9 @@ kill "$pid19m" 2>/dev/null; sleep 1
 #    which introduced this arm): `bash -n` under bash 3.2.57 reports "syntax error near
 #    unexpected token `('" at the `ok` message in the 19u arm, ~230 lines BELOW this body, so
 #    `check-bash32-parse.sh` (#2930) REDS on every PR. On a stock Mac `/bin/bash` IS 3.2, so while
-#    this defect was live the suite could not RUN there at all, and the gate redded every PR.
+#    this defect was live the suite never COMPLETED there: bash 3.2 executes command-by-command, so
+#    every arm above 19n ran and then the desync aborted the run at the reported line with exit 2 —
+#    it produced no verdict rather than refusing to start. The gate redded every PR either way.
 #    ⚠️ WHAT IT WAS NOT, measured rather than assumed: a refused install. `install.sh`'s `*.test.sh`
 #    case arm (731-739) deliberately WARNs on a test suite's parse error and CONTINUES — `die` is
 #    reserved for runtime scripts, which crash-loop under KeepAlive — and that carve-out landed in
