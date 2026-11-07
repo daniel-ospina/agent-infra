@@ -5118,7 +5118,7 @@ OUT="$(FAKE_ADV_LINE="$A26G5_SHA	refs/heads/feat/a26g5" GIT_BIN_OVERRIDE="$T/bin
 assert_contains "$(row_for "$OUT" "$T/$ENV-det")" "reason=remote-holds:upstream/feat/a26g5" \
     "A26g5 the row is classified from the START-OF-PASS advertisement (the snapshot is real evidence for a CLASSIFICATION)"
 assert_contains "$OUT" "remote-holds-stale" \
-    "A26g5 …and the removal is refused by the targeted re-probe at CLASSIFICATION (this shim answers every targeted probe with nothing, so remove_one is never entered — the fork arm is the declared residual, not what this line measures)"
+    "A26g5 …and the removal is refused by the targeted re-probe at CLASSIFICATION (this shim answers every targeted probe with nothing, so remove_one is never entered — the FORK arm is A26g6's, not what this line measures)"
 if [ -d "$T/$ENV-det" ]; then
     ok "A26g5 the checkout is STILL ON DISK — a stale snapshot never destroys the last durable handle"
 else
@@ -5126,6 +5126,76 @@ else
 fi
 assert_contains "$OUT" "removed=0" \
     "A26g5 …and the pass reports no removal"
+
+# ── A26g6: the auto-delete lands BETWEEN classification and the fork (#3371 review cycle 8, P1) ──
+# A26g5 fails EARLY: its shim answers every targeted probe with nothing, so the classification-time
+# re-probe refuses and `remove_one` is never entered — which means A26g5 cannot see the fork arm at
+# all. Measured at c52503df2: deleting `remove_one`'s four-line fork re-probe left the WHOLE suite at
+# 858 passed / 0 failed, because A26a only needs the call to SUCCEED (which a deleted call also
+# yields) and A21e pins the ORDERING of `holder_recheck`, not the existence of the call above it.
+# That is the one thing this PR buys — a re-proof AT the fork — with no arm, on a no-backup
+# destructive path. So: phase-aware. The advertisement and the FIRST targeted probe answer with the
+# head (the branch is still there when the row is classified); the SECOND answers nothing (the
+# squash-merge + auto-delete landed while gate (b)'s archive and the evidence ladder ran). Delete
+# the fork arm and the checkout is REMOVED on a dead warrant => RED.
+cat >"$T/bin/git-lsremote-forkstale" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26g6: the remote as it was at CLASSIFICATION (the advertisement AND the first
+# targeted re-probe both answer with the head) and as it is at the FORK (the second targeted
+# re-probe answers nothing — the auto-delete-on-merge window, made deterministic). Counting the
+# TARGETED probes in a file is the point: the two call sites are what must both exist.
+seen_lsremote=0
+for a in "$@"; do [ "$a" = "ls-remote" ] && seen_lsremote=1; done
+if [ "$seen_lsremote" = 1 ]; then
+    pattern=0
+    for a in "$@"; do case "$a" in refs/heads/*) pattern=1 ;; esac; done
+    if [ "$pattern" = 0 ]; then printf '%s\n' "${FAKE_ADV_LINE:-}"; exit 0; fi
+    c=0
+    [ -n "${FAKE_TARGETED_COUNTER:-}" ] && [ -f "$FAKE_TARGETED_COUNTER" ] && c="$(cat "$FAKE_TARGETED_COUNTER")"
+    c=$((c + 1))
+    [ -n "${FAKE_TARGETED_COUNTER:-}" ] && printf '%s\n' "$c" >"$FAKE_TARGETED_COUNTER"
+    [ "$c" -le 1 ] && printf '%s\n' "${FAKE_TARGETED_LINE:-}"
+    exit 0
+fi
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-lsremote-forkstale"
+ENV=A26g6; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26g6
+commit_in_wt "$REPO" "$OLD_DATE" "a26g6"
+A26G6_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g6:refs/heads/feat/a26g6"
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26g6 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det" "$A26G6_SHA"
+assert_contains "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26G6_SHA" --format='%(refname)')" \
+    "refs/remotes/upstream/feat/a26g6" "A26g6 precondition: the only local holder is a remote-tracking ref"
+assert_absent "$("$REAL_GIT" -C "$REPO" for-each-ref --contains="$A26G6_SHA" --format='%(refname)')" \
+    "refs/heads/" "A26g6 precondition: no LOCAL branch holds it"
+assert_eq "$("$REAL_GIT" -C "$BARE" rev-parse refs/heads/feat/a26g6)" "$A26G6_SHA" \
+    "A26g6 precondition: the REMOTE advertises exactly this HEAD at classification time"
+A26G6_CNT="$T/$ENV/cnt"; rm -f "$A26G6_CNT"
+OUT="$(FAKE_ADV_LINE="$A26G6_SHA	refs/heads/feat/a26g6" \
+    FAKE_TARGETED_LINE="$A26G6_SHA	refs/heads/feat/a26g6" \
+    FAKE_TARGETED_COUNTER="$A26G6_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-forkstale" \
+    run_reaper $ENV --apply --repo "$REPO")"
+assert_eq "$(cat "$A26G6_CNT" 2>/dev/null)" "2" \
+    "A26g6 a removal pays TWO targeted probes — one at classification, one at the fork"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det")" "reason=remote-holds:upstream/feat/a26g6" \
+    "A26g6 the row is classified remote-holds from the FIRST targeted answer (so the fixture really reaches the fork)"
+assert_contains "$OUT" "remote-holds-stale" \
+    "A26g6 …and the FORK re-probe refuses the removal — the auto-delete landed after classification"
+if [ -d "$T/$ENV-det" ]; then
+    ok "A26g6 the checkout is STILL ON DISK — the fork re-probe, not just the classification one, guards the delete"
+else
+    bad "A26g6 the checkout was REMOVED after the remote stopped advertising it — remove_one's fork re-probe (remote_holds_recheck at re-check #3) is missing or not wired to the PRESERVE path"
+fi
+assert_contains "$OUT" "removed=0" \
+    "A26g6 …and the pass reports no removal"
 
 # ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
 # This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:

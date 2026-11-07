@@ -960,19 +960,20 @@ merge between the snapshot and the fork would otherwise make "the remote still h
 false at the instant a checkout with **no backup** is destroyed. The cost is ONE targeted probe per
 `remote-holds` candidate at classification, plus a SECOND at the fork for one that reaches re-check
 #3 — so a removal pays two, a preserve by `clean_gate`/gate (b)/the ladder pays one, and a preserve
-**at the fork** has already paid two; the second is the decisive one. A failed, timed-out or empty targeted
-probe at removal time preserves.
-The remote's own `refs/heads/*` are
-read by ONE bounded `git ls-remote --heads <remote>` **per remote per pass** (#3371) and cached for
-that pass, so the cost no longer grows with the number of candidates: a targeted probe is one
+**at the fork** has already paid two; the second is the decisive one. A failed, timed-out or empty
+targeted probe at removal time preserves.
+
+The remote's own `refs/heads/*` are read by ONE bounded `git ls-remote --heads <remote>` **per remote
+per pass** (#3371) and cached for that pass. That is what took the per-candidate round trip out of
+the **classification**: it used to cost ONE targeted `ls-remote` per `remote-only-ref` candidate, one
 network round trip each, which is what made a large `remote-only-ref` population unable to finish a
 pass (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each), versus
 0.56 s for the remote's whole 2,111-head advertisement). The cached advertisement is the same
 evidence **for the CLASSIFICATION only** — the remote's advertised heads at one instant, a superset
 of any single targeted answer *at t0* is not evidence of anything at the removal, which is exactly
 why `remote_holds_recheck` re-takes it — and the advertised refname is still matched literally and
-exactly once against it (⚠️ because `ls-remote`
-matches a pattern against the ref's **tail, from any slash separator**, so `refs/heads/<b>` also selects
+exactly once against it (⚠️ because `ls-remote` matches a pattern against the ref's **tail, from any
+slash separator**, so `refs/heads/<b>` also selects
 an advertised `refs/heads/x/refs/heads/<b>` — ⛔ *not* because of glob metacharacters: `check-ref-format`
 rule 5 forbids `?`, `*` and `[` in a refname, so no branch name can widen the match that way), and the
 remote is the **longest configured remote name** prefixing the ref, not the first path
