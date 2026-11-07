@@ -3587,7 +3587,6 @@ export function wtIsPathShapedScriptWord(word) {
       // 44 ms for the previous cut. `e >= 0` is semantics-preserving (a `lastIndexOf` can only beat a
       // negative `e` by returning an index below `i`, which `if (e > i)` discards anyway), and the `/`
       // scan now runs only for a `[[:` that actually has a closer to fold toward.
-      const sl = LAST_CLOSE > i ? s.indexOf("/", i + 1) : -1;
       let e = LAST_CLOSE > i ? s.indexOf("]", i + 1) : -1;
       // ⛔ THE ONE DEPARTURE FROM MAIN'S JUMP IS NARROWER THAN "a closer inside the component": it is a
       // POSIX CHARACTER CLASS, `[[:…:]]`, which is the ONLY shape that needs folding — a class is one
@@ -3597,9 +3596,21 @@ export function wtIsPathShapedScriptWord(word) {
       // `false` here and `true` on `origin/main` — the same fail-open class once more. Keyed on `[[:`
       // and on a `/` existing to the right, the fold cannot reach a separator and cannot skip a quote
       // opener that a POSIX class would contain.
-      if (e >= 0 && sl >= 0 && s.startsWith("[[:", i)) {
-        const inComponent = s.lastIndexOf("]", sl);
-        if (inComponent > e) e = inComponent;
+      // ⛔ A POSIX CLASS IS RECOGNISED BY ITS GRAMMAR, NOT BY ITS PREFIX (#3333 review cycle-6, F1 —
+      // measured, and it was a P1 FAIL-OPEN with real uncommitted-work loss). Keying on
+      // `s.startsWith("[[:", i)` was too loose: a word starting `[[:]` is NOT a class, so the fold
+      // jumped past a BACKTICK OPENER, left its partner unbalanced, and the refusal above deleted the
+      // word — `false` here, `true` on `origin/main`; through the real handler the same spelling went
+      // ALLOW where main BLOCKed, with `dirty.txt` reverting from uncommitted to committed. A class name
+      // is `[a-z]+` between two `:`, so test THAT. The lookahead is sliced to 16 bytes and the `/` scan
+      // now runs only inside this branch, which also bounds the cost (#3333 review cycle-5, F2): a `]`
+      // can exist with no `/` to the right, and re-scanning the whole word per group cost 4.13 s at 1.5 MB.
+      if (e >= 0 && /^\[\[:[a-z]{1,10}:\]\]/.test(s.slice(i, i + 16))) {
+        const sl = s.indexOf("/", i + 1);
+        if (sl >= 0) {
+          const inComponent = s.lastIndexOf("]", sl);
+          if (inComponent > e) e = inComponent;
+        }
       }
       out += PH; if (e > i) i = e; continue;
     }
@@ -3621,10 +3632,14 @@ export function wtIsPathShapedScriptWord(word) {
   //       Exactly TWO other rules run on the same placeholder path and also return false: the
   //       component-final `$` END-ANCHOR in the loop above (`a$/undo.sh` execs, `s/[[:space:]]*$//`
   //       does not), which this head's own mutation pair proves is load-bearing, and the PLAIN
-  //       ALPHABET loop in (c) below. (The prologue's `!s` / `needs / or ~` early-outs, and the
-  //       unbalanced-quote/group refusals (lines 3420, 3423, 3480, 3485, 3486), reject BEFORE any
-  //       placeholder exists, so they are not rules on this path — the function carries EIGHT code
-  //       `return false` sites in total, and these three are the ones a placeholder can reach.)
+  //       ALPHABET loop in (c) below. ⛔ THE UNBALANCED-QUOTE/GROUP REFUSALS ARE ON THIS PATH TOO — this
+  //       comment claimed they were not (#3333 review cycle-6, F3, measured): `a*`x/undo.sh`,
+  //       `a[b`x/undo.sh`, `a*x${y/undo.sh` and `a*x$(y/undo.sh` all reach the backtick and `${`/`$(`
+  //       refusals with a PG/PH already emitted, i.e. MID-WORD. Their verdicts match `origin/main`, so
+  //       nothing is broken by them — but dismissing them as "reject BEFORE any placeholder exists" is
+  //       what let the F1 fold defect sit unexamined, so do not restore that sentence. The function
+  //       carries EIGHT code `return false` sites in total (3420, 3423, 3480, 3485, 3486, plus these
+  //       three), and ALL of them can be reached on the placeholder path.
   //       What is SINGULAR here is only that this is the one rule keyed on a byte's POSITION within
   //       the raw word.
   //   (c) THE PLAIN ALPHABET — every byte a filename may carry in a component body, `,` `:` `=`

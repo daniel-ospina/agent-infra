@@ -1980,6 +1980,17 @@ async function partB() {
       expectTrue(`B13d: F1 the \`[\` jump is main's FIRST closer, so a real path survives (${b})`,
         cg.wtIsPathShapedScriptWord(b) === true);
     }
+    // ⛔ THE POSIX FOLD'S OWN FAIL-OPEN (#3333 review cycle-6, F1 — measured, and it shipped for two
+    // cycles). Keying the fold on the PREFIX `[[:` folded words that merely start that way, so the jump
+    // skipped a BACKTICK OPENER and left its partner unbalanced: `[[:]`]`/undo.sh` was `false` here and
+    // `true` on `origin/main`, and through the real handler it went ALLOW where main BLOCKed with
+    // `dirty.txt` reverting to committed. A POSIX class is `[[:name:]]` — `[[:]` is not one — so the
+    // fold must key on the GRAMMAR. These spellings are the pin; `s/[[:space:]]*$//` above stays the
+    // control that the fold still happens where it should.
+    for (const pf of ["[[:]`]`/undo.sh", "[[:x]`]`/undo.sh", "[[:]`]`/u.sh"]) {
+      expectTrue(`B13d: F1 a word that merely PREFIXES like a POSIX class is not folded (${pf})`,
+        cg.wtIsPathShapedScriptWord(pf) === true);
+    }
     // ⛔ THE POSITIVE CONTROLS the fail-open class needs: the LITERAL spellings stay gated by their
     // EFFECT (#709), so the arms above are not "everything under these directories is refused", and
     // the two program-text exclusions this rule exists for are still non-paths.
@@ -2939,6 +2950,9 @@ if (process.argv.includes("--mutations")) {
       false,
       "a real `$`-terminated directory addressed through a glob goes blind again",
     ],
+    // (No separate pair for the POSIX-class FOLD's `/`-bound: reverting the DEFAULT to `LAST_CLOSE` —
+    // the pair immediately above — reintroduces the old unbounded jump, and that is the only way this
+    // code can still cross a separator. The FOLD itself is structurally bounded by `sl`, so a pair
     // aimed at it could not fail. It is pinned by its own pair above (the sed exclusion).)
     [
       // ⛔ THE F1 PAIR (#3333 review cycles 2 and 4 — this rule has now been wrong TWICE, in opposite
