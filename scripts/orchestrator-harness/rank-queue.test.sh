@@ -181,14 +181,14 @@ if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
     # `return` prints "can only 'return' from a function or sourced script" and the script CONTINUES (measured); an
     # interior `return` leaves the function, not the shell. Both used to write `E` and win. `exit` still does, and the
     # depth field keeps a subshell's record out of the verdict.
-    # AND A DRIVER THAT REPLACES THE EXIT TRAP IS STILL OBSERVED (review P3, cycle 99): `trap ... EXIT` discards the
-    # hook end record, so a CORRECT protected fixture that installs its own cleanup trap and falls off the end was
-    # false-blocked as NO RECORD (measured). The `trap` arm below therefore writes a `T` snapshot when such a command
-    # runs — and `T` is NOT an end state: the driver may `set -u`/`set +u` AFTER the trap command, so `_opts_for` answers
-    # from `E`/`D` only and never falls back to `T`. That snapshot grades ONLY where the textual parser AGREES with it;
-    # on disagreement the exec sweep names the script UNOBSERVABLE rather than letting either source decide (the rule
-    # is stated in full at `T` RECORDS ARE NOT A VERDICT, below). NO RECORD stays reserved for a shell that neither
-    # exited, exec'd, nor ran any `trap` command whose text names `EXIT` — no record at all, of any tag.
+    # AND A DRIVER THAT REPLACES THE EXIT TRAP IS STILL GRADED (review P3, cycle 99) — BUT ONLY WHERE THE PARSER AGREES:
+    # `trap ... EXIT` discards the hook end record, so a CORRECT protected fixture that installs its own cleanup trap and
+    # falls off the end was false-blocked as NO RECORD (measured). The `trap` arm below therefore writes a `T` snapshot
+    # when such a command runs — and `T` is NOT an end state: the driver may `set -u`/`set +u` AFTER the trap command,
+    # so `_opts_for` answers from `E`/`D` only and never falls back to `T`. That snapshot grades ONLY where the textual
+    # parser AGREES with it; on disagreement the exec sweep names the script UNOBSERVABLE rather than letting either
+    # source decide (the rule is stated in full at `T` RECORDS ARE NOT A VERDICT, below). NO RECORD is reserved for a
+    # shell that neither exited, exec'd, nor ran any `trap` command whose text names `EXIT` — no DEPTH-0 record at all.
     # (Comments here must stay OUTSIDE the trap string: an apostrophe inside it ends the quoting.)
     trap 'case "$BASH_COMMAND" in
             exec[[:space:]]*) printf "%s\t%s\t%s\t%s\n" "D" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
@@ -3751,13 +3751,16 @@ while IFS= read -r _ex; do
   # 172 executed paths, 172 with a record, 0 without.
   if [ -z "$(_opts_for "$_ex")" ]; then
     # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two sources answering the
-    # same question: agreement is evidence FOR THE TEXTUAL-FLIP CLASS, and disagreement means the state is NOT observable
-    # and must be named rather than decided by whichever source happens to be consulted first.
-    # RESIDUAL, declared: agreement is not proof. Both sources are blind to a NON-TEXTUAL flip — measured, with `set -u`
-    # / `trap ': cleanup' EXIT` / `f() { eval "set +u"; }` / `f` the only record is `T` = nounset, `_setu` reads the
-    # top-level `set -u` and AGREES, and the driver's real end state is bare with its unbound read passing (rc=0), so it
-    # grades PROTECTED. Closing that needs a real end state (the `exit 0` the UNOBSERVABLE advice below recommends) —
-    # stated here so the next lane does not read "agreement" as "proved".
+    # same question: agreement is evidence for the flips `_setu` CAN SEE, and disagreement means the state is NOT
+    # observable and must be named rather than decided by whichever source happens to be consulted first.
+    # RESIDUAL, declared: agreement is not proof, because both sources are blind to any flip the parser cannot read and
+    # the trap-time snapshot predates. Measured, with only `T` = nounset recorded and `_setu` agreeing from the
+    # top-level `set -u` while the real end state is BARE and the unbound read passes (rc=0, graded PROTECTED) — in TWO
+    # shapes, and the second is text the parser still cannot see:
+    #   `f() { eval "set +u"; }` / `f`                        (the flip is not text at all);
+    #   `case "$x" in` / `  u) set +u ;;` / `esac`            (it IS text; `_setu` skips a `u)` statement — see :3645).
+    # Closing either needs a real end state (the `exit 0` the UNOBSERVABLE advice below recommends), so the residual
+    # stands; it is stated here so the next lane does not read "agreement" as "proved".
     _tu="$(_trapopts_for "$_ex")"
     if [ -n "$_tu" ]; then
       _snap=0; case "$_tu" in *u*) _snap=1 ;; esac
@@ -3779,7 +3782,7 @@ if [ -n "$exec_unobs" ]; then
   echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script ran a \`trap\` command naming \`EXIT\` (installing, REMOVING, or ignoring the hook's EXIT trap), so no end state was recorded; add an explicit \`exit 0\` so the shell's own end state is observable"
 fi
 if [ -n "$exec_norecord" ]; then
-  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no record AT ALL does this — e.g. it replaces the hook's EXIT trap with a \`trap … 0\` whose TEXT names no \`EXIT\` and falls off the end; a \`trap\` command naming \`EXIT\` — an install, a removal, or a handler that merely names it — writes a \`T\` and lands in the agreement test above, not here)"
+  echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that writes no DEPTH-0 record AT ALL does this — e.g. it replaces the hook's EXIT trap with a \`trap … 0\` whose TEXT names no \`EXIT\` and falls off the end; a DEEPER record cannot answer either; and a \`trap\` command naming \`EXIT\` — an install, a removal, or a handler that merely names it — writes a \`T\` and lands in the agreement test above, not here)"
 fi
 if [ -n "$exec_foreign" ]; then
   echo "      OUTSIDE \$TMP: the hook recorded an execution this sweep cannot grade —${exec_foreign} — a body run from outside the sandbox is outside the population the check names"
