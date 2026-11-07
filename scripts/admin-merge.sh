@@ -106,7 +106,12 @@
 # `bash-suites (<n>)` covers ONLY while (a) both lanes' `matrix.shard` WIDTHS are EQUAL and (b) both
 # lanes DERIVE their list from the one runner. (a) is now ASSERTED rather than assumed: the width is
 # a hand-kept number in two files, so `scripts/check-ci-lane-parity.mjs` REFUSES two lanes whose
-# widths differ, with mutant rows in `tests/ci-lane-parity/run.sh` §13. (b) is asserted at the CALL
+# widths differ, with mutant rows in `tests/ci-lane-parity/run.sh` §13. ⛔ AND IT ASSERTS THE WIDTH
+# MAIN REALLY PUBLISHES, not one matrix key (review of #3392 at a4fbb733): each lane's slice is
+# `matrix.shard`/`strategy.job-total`, and GitHub counts JOB-TOTAL *after* `matrix.include:`/
+# `exclude:` are applied, so the guard REFUSES either key beside a shard axis (§13g/§13h) —
+# `exclude: [{shard: 8}]` would otherwise leave both `shard` LENGTHS at 8 while main published seven
+# `script-validate (<n>)` checks, i.e. equal widths asserted about unequal slices. (b) is asserted at the CALL
 # SITE by the same guard (each lane's step must BE the bare runner call, which is what makes the
 # list one list) — and the part NO CHECK CAN SEE is the positional shift that follows: the per-slice
 # sizes are DERIVED, so adding or removing ONE suite re-partitions BOTH lanes at unchanged widths,
@@ -284,7 +289,9 @@
 # run the same runner, whose per-slice sizes are DERIVED from the list it discovers — so a commit
 # that adds or removes ONE suite shifts the numbering under both widths at once and no workflow edit
 # occurs for a check to see. The width half (b) is asserted by
-# `scripts/check-ci-lane-parity.mjs`; this half is unassertable by construction, because the same
+# `scripts/check-ci-lane-parity.mjs` — equal `matrix.shard` lengths, with `matrix.include:`/`exclude:`
+# REFUSED because they change `strategy.job-total` without changing that length; this half is
+# unassertable by construction, because the same
 # derived list is what makes the two lanes one list. It is stated so a later reader does not
 # mistake equal widths for a guarantee of equal shard SETS.
 # ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
@@ -1826,7 +1833,7 @@ declared_base_equivalent() {
 # ⛔ NO EXIT STATUS MEANS "NOT BASE-OWNED", exactly like `declared_base_equivalent`:
 # the answer is stdout, so a caller can never mistake an empty answer for a failure.
 base_owned_check() {
-  local name="${1:-}" names_file="${2:-}" mapped="" cand=""
+  local name="${1:-}" names_file="${2:-}" cand=""
   [ -n "$name" ] && [ -s "$names_file" ] || return 0
   if grep -Fxq -e "$name" -- "$names_file" 2>/dev/null; then
     printf '%s\n' "$name"
@@ -1892,7 +1899,7 @@ EOF_BASE_OWNED_CANDS
 named_unattributable_runs() {
   local unattributed="${1:-}" base="${2:-}" expected="${3:-}" line runref run_id names name kind
   local mapped mapped_kind base_reds base_status base_total red_names named_count
-  local kind_rc mapped_rc
+  local kind_rc mapped_rc _mapped_cand _mk
   # ⛔ NO EARLY `-s` RETURN HERE (#2610 review, cycle 6). It used to sit above, and it
   # answered the ONE anomaly the completeness cross-check below exists to catch with total
   # silence: this function is only reachable from `pr_extracted < pr_examined`, so
@@ -2034,6 +2041,12 @@ named_unattributable_runs() {
             # space (`script-validate (5)`), which is exactly what a `for` over `$(…)` would break.
             while IFS= read -r _mapped_cand; do
               [ -n "$_mapped_cand" ] || continue
+              # ⛔ THE STATUS IS PER CANDIDATE, not cumulative. It used to be cleared once above the
+              # loop, so a candidate whose `awk` failed left the flag non-zero even after the NEXT
+              # candidate resolved cleanly — and the caller's `elif` then narrated the lookup as
+              # FAILED where the true answer was "no counterpart" (non-exempting either way, so no
+              # gate changed; recorded by #3392's round-6 review).
+              mapped_rc=0
               _mk=""
               _mk="$(NR_NAME="$_mapped_cand" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }' <<< "$base_reds")" || mapped_rc=$?
               if [ -n "$_mk" ]; then mapped="$_mapped_cand"; mapped_kind="$_mk"; break; fi

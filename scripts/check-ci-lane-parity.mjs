@@ -207,6 +207,19 @@ function deepForbiddenKeys(node, path, out) {
  * this reader (scalar types are deliberately not resolved), and `shard:` is a parsed array. A
  * `strategy:`/`matrix:`/`shard:` this reader cannot resolve to a value is REFUSED rather than
  * assumed: an unreadable width is not a matched width, and an unreadable `fail-fast` is not a false.
+ *
+ * ⛔ `matrix.include:`/`matrix.exclude:` ARE REFUSED, because they make `shard.length` the WRONG
+ * number (review of #3392 at a4fbb733). The width above is only the slice count while the matrix
+ * generates exactly one job per `shard` entry. GitHub generates the jobs from the matrix and THEN
+ * applies `exclude` (dropping matching combinations) and `include` (extending a combination, or
+ * adding a job when it cannot merge), so `strategy.job-total` — the denominator each lane's own step
+ * builds its slice from (`${{ matrix.shard }}/${{ strategy.job-total }}`) — is the count AFTER those
+ * rules, while `shard.length` is the count BEFORE them. `exclude: [{shard: 8}]` then gives main 7
+ * per-slice checks while its `shard.length` still reads 8, so this guard would certify EQUAL widths
+ * for lanes that publish a different number of slices — the same fail-open / #2610-false-absence pair
+ * the width assertion exists to prevent, reached with one key the assertion could not see. A KEY-NAME
+ * assertion on the parsed node (the `refusalKeys()` idiom) is the honest form: this reader does not
+ * MODEL include/exclude semantics, it refuses a matrix whose width cannot be read off `shard` alone.
  */
 const isMapping = (n) => n !== null && typeof n === "object" && !Array.isArray(n);
 
@@ -237,6 +250,16 @@ function shardAxis(label, file, jobName, job) {
     refuse(
       `${label} lane job '${jobName}' in ${file} has an EMPTY 'matrix.shard' axis — a matrix with no slice runs nothing while reading as a matrix that ran; exiting 2`
     );
+  }
+  // ⛔ SEE THE HEADER: `include:`/`exclude:` change the number of GENERATED jobs without changing
+  // `shard.length`, so they make the width below the wrong slice count — and the width is what the
+  // rail's slice-to-slice `≡` rests on. Refused by KEY NAME on the parsed node, like `refusalKeys()`.
+  for (const k of ["include", "exclude"]) {
+    if (Object.prototype.hasOwnProperty.call(matrix, k)) {
+      refuse(
+        `${label} lane job '${jobName}' in ${file} carries a 'matrix.shard' axis (length ${shard.length}) AND a 'matrix.${k}:' — the slice count this guard asserts is 'strategy.job-total', which GitHub computes AFTER ${k} is applied, so 'shard' length is NOT the number of '${jobName} (<n>)' checks the lane publishes and the two lanes could agree here while publishing a different number of slices (a base red reported as having no counterpart, or a PR-introduced red excluded as base-owned). Refusing to read a width this matrix cannot state; exiting 2`
+      );
+    }
   }
   const width = shard.length;
   const hasKey = Object.prototype.hasOwnProperty.call(strategy, "fail-fast");

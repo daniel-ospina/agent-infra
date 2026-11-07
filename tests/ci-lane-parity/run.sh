@@ -2278,6 +2278,12 @@ echo "13. THE SLICE-TO-SLICE PREMISES — equal matrix widths, and fail-fast: fa
 #       the same drift in list terms — the per-slice sizes are DERIVED, so one added suite re-partitions
 #       both lanes' slices at unchanged widths. The width half is what a guard can see.
 #
+#       ⛔ AND THE WIDTH THAT MATTERS IS `strategy.job-total`, NOT `matrix.shard.length` (review of
+#       #3392 at a4fbb733). GitHub applies `matrix.exclude:`/`matrix.include:` AFTER generating jobs and
+#       `job-total` counts the result, so `exclude: [{shard: 8}]` leaves length 8 while publishing only
+#       7 per-slice checks — equal lengths, different slice sets, the same two defects. 13g/13h pin the
+#       refusal by KEY NAME; without them a fixture that reads `shard.length` looks asserted and is not.
+#
 #   (b) `strategy.fail-fast: false` MUST BE THERE. At GitHub's default TRUE one failing slice CANCELS
 #       the queued and in-progress siblings, those legs report `cancelled` (NON-RED to the rail), and
 #       the runner's per-slice coverage assertion never executes in them — all but one slice of the
@@ -2378,6 +2384,51 @@ if [ "$RC" -eq 0 ] && grep -q 'slice width 8 in both lanes' <<<"$OUT"; then
   pass "(13f) control: the shipped lanes are an 8-wide shard matrix in both lanes, green, with the width read from the documents"
 else
   fail "(13f) control: the shipped tree did not report an agreed 8-wide slice (rc $RC): $OUT"
+fi
+
+# 13g. THE WIDTH IS `strategy.job-total`, NOT `matrix.shard.length` — a `matrix.exclude:` leaves the
+#      `shard` length alone while REMOVING generated jobs (main then publishes 7 per-slice checks
+#      against the PR lane's 8), so a guard reading length alone certifies equal widths for a lane
+#      that no longer has them: a PR red on `bash-suites (8)` maps to a `script-validate (8)` no base
+#      publishes (#2610's false absence), and a shared `(<5>)` is a different shard SET on each side
+#      (the fail-open direction). Refused by KEY NAME — length cannot state this matrix's width.
+awk '
+  /^  script-validate:$/ { injob = 1 }
+  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
+    print; print "        exclude:"; print "          - shard: 8"; injob = 0; next
+  }
+  { print }
+' "$MAIN" >"$TMP/ci-main-exclude.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-exclude.yml"; then
+  fail "(13g) the matrix-exclude mutation did not change ci-main.yml — this arm would measure nothing"
+else
+  guard_rc "$TMP/ci-main-exclude.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'matrix.exclude' <<<"$OUT"; then
+    pass "(13g) a 'matrix.exclude:' beside the shard axis is REFUSED (rc 2, naming the key) — length is not the slice count"
+  else
+    fail "(13g) 'exclude: [{shard: 8}]' on main's matrix returned rc $RC (want 2, naming matrix.exclude): $OUT"
+  fi
+fi
+
+# 13h. ...and the additive spelling, on the PR lane: an `include:` that cannot merge ADDS a job, so it
+#      breaks the same premise from the other side. Mirror arm, so neither key is covered only by
+#      accident of which lane the fixture was cut from.
+awk '
+  /^  bash-suites:$/ { injob = 1 }
+  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
+    print; print "        include:"; print "          - shard: 9"; injob = 0; next
+  }
+  { print }
+' "$PR" >"$TMP/ci-pr-include.yml"
+if cmp -s "$PR" "$TMP/ci-pr-include.yml"; then
+  fail "(13h) the matrix-include mutation did not change ci.yml — this arm would measure nothing"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-include.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'matrix.include' <<<"$OUT"; then
+    pass "(13h) a 'matrix.include:' beside the shard axis is REFUSED (rc 2, naming the key), on the PR lane too"
+  else
+    fail "(13h) 'include: [{shard: 9}]' on the PR lane's matrix returned rc $RC (want 2, naming matrix.include): $OUT"
+  fi
 fi
 
 echo ""
