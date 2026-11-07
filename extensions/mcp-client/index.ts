@@ -655,8 +655,11 @@ function isValidServerName(name: string): boolean {
  * unrecognised `type` only earns a warning, never a drop.
  *
  * ⛔ OVERRIDES: pi's `sse`-rejection and skip-invalid-entries rules — `docs/mcp.md:79` ("`sse` is
- * rejected") and `:80` ("Invalid entries are reported and skipped without preventing other servers
- * from connecting") — this client WARNS and KEEPS such an entry instead of rejecting or skipping it.
+ * rejected") and `docs/mcp.md:82` ("Invalid entries are reported and skipped without preventing other
+ * servers from connecting") — this client WARNS and KEEPS such an entry instead of rejecting or skipping
+ * it. Both citations are FULL paths on purpose: a bare `:80` pointed at "`command` is one executable and
+ * `args` contains its arguments", i.e. at a line about `args`, so a reader checking the marker's own
+ * citation found no such rule and could only conclude the marker was wrong.
  * ⛔ Do not cite `:78` as the default being overridden: that line says "A `command` selects stdio and
  * a `url` selects streamable HTTP", i.e. pi dispatches on `url`/`command` exactly as this client does,
  * so the two agree there and a reader who follows a `:78` citation concludes the override is overstated.
