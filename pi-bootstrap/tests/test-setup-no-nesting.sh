@@ -536,6 +536,24 @@ farm_source_dir() { # <array-name> -> the repo dir its entries are read from
     *)           printf 'scripts' ;;
   esac
 }
+# The DESTINATION KIND a farm array writes into — the other half of the fact `farm_source_dir` carries,
+# and the one the delivery ladder needs. Read BY NAME from `FARM_ARRAYS` (see `delivered_flat`), so a
+# new flat array is consulted the moment it joins the list — which the root-set floor below already
+# requires of every array setup.sh declares.
+# ⛔ EACH KIND IS READ OFF setup.sh's OWN COPY LINES, not guessed: `flat` is what `fleet_srcs` (`:647`),
+# `mcp_harness_srcs` (`:692`), `merge_gate_srcs` (`:959`) and `graph_srcs` (`:1001`) all write
+# (`$DEST/scripts/$base`); `lib_srcs` writes `$DEST/scripts/lib/$base` (`:760`); `fleet_tools` writes
+# `$DEST/scripts/fleet/$base` (`:852`).
+# The DEFAULT is `flat` deliberately: a future array with a destination no arm here knows then
+# false-BLOCKS loudly (`DELIVERED BY NOTHING`) instead of reading as delivered — fail-closed. The
+# opposite default is the false PASS this whole gate exists to refuse.
+farm_dest_kind() { # <array-name> -> flat | lib | fleet
+  case "$1" in
+    lib_srcs)    printf 'lib' ;;
+    fleet_tools) printf 'fleet' ;;
+    *)           printf 'flat' ;;
+  esac
+}
 # The arrays setup.sh actually declares (a destination-agnostic floor for the list above).
 declared_farm_arrays() { # <repo-root>
   # NO end anchor: a declaration WRAPPED across lines is still a declaration, and an anchored regex
@@ -705,6 +723,24 @@ farm_declares() { # <array-name> <entry> [<repo-root>|<setup.sh>] -> 0 when the 
   fi
   [ -n "$line" ] || return 1
   printf '%s\n' "$line" | tr -s ' ' '\n' | sed '/^$/d' | grep -Fxq -- "$entry"
+}
+# Is <entry> delivered FLAT into `$DEST/scripts/` by ANY array in `FARM_ARRAYS`? The ladder the `script)`
+# disposition branch consults — a FUNCTION so it is probeable on a synthetic tree, and DRIVEN BY
+# `FARM_ARRAYS` so that "a future flat array cannot reintroduce the gap" is a property of the CODE.
+# ⛔ IT WAS A HAND LIST OF FIVE NAMES until the 2026-11-07 review of this PR: correct on that day and
+# silently wrong the day a sixth flat array landed (exactly the false block that made the
+# `cloud-cell-doctor.sh` exemption look necessary). A comment promising enumeration while the code
+# hand-lists is the class the next lane quotes back as authority.
+# ⛔ PROBED, not merely asserted: `ladder-probe` below declares `zz_flat_srcs`, a name NO hand list
+# could contain, and asserts a member of it is delivered. Replace this loop with any fixed list and
+# that probe reddens.
+delivered_flat() { # <entry> <repo-root>
+  local entry="$1" root="${2:-$ROOT}" a
+  for a in $FARM_ARRAYS; do
+    [ "$(farm_dest_kind "$a")" = flat ] || continue
+    farm_declares "$a" "$entry" "$root" && return 0
+  done
+  return 1
 }
 # A repo-relative path as a population entry.
 producer_kind_of() { # <scripts/... path>
@@ -979,13 +1015,13 @@ check_producer_farm_declared() { # <label> <derived-population>
         # `agent/scripts/<n>` location every other arm here is testing for. Before this arm existed the
         # gate refused the CORRECT remedy for `cloud-cell-doctor.sh` — farm it, drop the #3530
         # exemption — with `DELIVERED BY NOTHING`, over a file `setup.sh` then wrote; the documented
-        # remedy for a false block is to widen the exemption list, i.e. to WEAKEN the gate. Enumerate
-        # the array by NAME, from `FARM_ARRAYS`, so a future flat array cannot reintroduce the gap
-        # (the root-set floor below already refuses an unread array).
-        if farm_declares fleet_srcs "$name" "$root" || farm_declares lane_root_srcs "$name" "$root" \
-           || farm_declares merge_gate_srcs "$name" "$root" \
-           || farm_declares graph_srcs "$name" "$root" \
-           || farm_declares mcp_harness_srcs "$name" "$root"; then
+        # remedy for a false block is to widen the exemption list, i.e. to WEAKEN the gate.
+        # ⛔ The arrays are enumerated BY NAME from `FARM_ARRAYS` (`delivered_flat`), NOT re-listed here.
+        # A hand list would make the guarantee manual: the root-set floor above refuses an array that
+        # setup.sh declares and `FARM_ARRAYS` omits, but it knows nothing about THIS ladder, so a sixth
+        # flat array in both places would pass the floor, pass the derivation, and still read
+        # `DELIVERED BY NOTHING` over a file setup.sh then writes. `ladder-probe` proves the enumeration.
+        if delivered_flat "$name" "$root"; then
           delivered=$((delivered+1)); continue
         fi
         # The fleet directory IS a real deployed location (`setup.sh` mkdirs `$DEST/scripts/fleet/`), so
@@ -1296,6 +1332,32 @@ if [ "$(producer_probe check_farm_arrays "$PROBE_FLOOR" "floor-probe")" -gt 0 ];
   echo "ok: a farm array the derivation does NOT read trips the root-set floor (#1899)"
 else
   fail "an unread farm array did NOT trip the root-set floor — an unscanned array means invisible producers (#1899)"
+fi
+# DELIVERY-LADDER PROBE — the `script)` branch must consult `FARM_ARRAYS` BY NAME, never a hand list.
+# A fixed list can only be as right as the day it was typed; this probe declares an array
+# (`zz_flat_srcs`) that NO list in this file contains, adds it to `FARM_ARRAYS` the way setup.sh
+# requires, and asserts a member of it is delivered. Two controls keep the green meaningful: an array
+# absent from `FARM_ARRAYS` is NOT consulted (so the first assertion is about the enumeration and not
+# about "everything reads delivered"), and a `lib_srcs` member is NOT flat (it lands at
+# `$DEST/scripts/lib/<n>`, so calling `script:<n>` delivered would be a false PASS of exactly the
+# kind the missing `mcp_harness_srcs` arm produced in the other direction).
+PROBE_LADDER="$TMP/producer-ladder"
+mkdir -p "$PROBE_LADDER/pi-bootstrap"
+printf 'fleet_srcs=(flat-x.sh)\nlib_srcs=(lib-x.sh)\nmerge_gate_srcs=()\ngraph_srcs=()\nmcp_harness_srcs=()\nzz_flat_srcs=(zz-flat-producer.sh)\n' > "$PROBE_LADDER/pi-bootstrap/setup.sh"
+if ( FARM_ARRAYS="$FARM_ARRAYS zz_flat_srcs"; delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
+  echo "ok: the delivery ladder enumerates FARM_ARRAYS BY NAME — a flat array no hand list names still delivers its producer (#1899)"
+else
+  fail "the delivery ladder does not consult FARM_ARRAYS by name — a sixth flat array reads DELIVERED BY NOTHING over a file setup.sh writes, i.e. the false block whose documented remedy weakens the gate (#1899)"
+fi
+if ( delivered_flat zz-flat-producer.sh "$PROBE_LADDER" ); then
+  fail "the delivery ladder delivers from an array FARM_ARRAYS does NOT name — the root-set floor is the only thing enforcing membership, so a member of an unread array reads as delivered (#1899)"
+else
+  echo "ok: an array absent from FARM_ARRAYS is NOT consulted (positive control for the ladder probe) (#1899)"
+fi
+if ( delivered_flat lib-x.sh "$PROBE_LADDER" ); then
+  fail "the delivery ladder reports a lib_srcs member as FLAT-delivered — it lands at \$DEST/scripts/lib/<n>, so a script:<n> consumer still finds nothing, which is a false PASS (#1899)"
+else
+  echo "ok: a lib_srcs member is NOT flat-delivered (farm_dest_kind is consulted, not bypassed) (#1899)"
 fi
 # DRIFT PIN — a population that cannot be built, or that shrank, substituted or GREW, must never read
 # as clean. The GROWTH case is #1899's own defect: an exec site no farm array delivers.
