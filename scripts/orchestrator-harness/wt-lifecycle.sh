@@ -293,12 +293,112 @@ wt_rollback() {
     return 0
 }
 
+# ── disk admission: the ONE predicate, asked BEFORE a worktree is created (agent-infra#3395) ────
+# THE DEFECT THIS EXISTS FOR (measured, cell-3, 98% used / 3.5 GB free):
+#   dispatch -> fatal: cannot create directory at 'tools/ts': No space left on device
+# The gate that should have refused existed and was correct — it just ran INSIDE `run_agent`, one
+# step AFTER this file had already called `git worktree add`. So a full volume presented as a dead
+# lane instead of a named refusal, and the dispatcher that produced it (an ad-hoc pusher) printed a
+# `df` reading and asserted nothing, because nothing existed for it to call.
+#
+# ⛔ NOT A SECOND PREDICATE. `disk_admit` is spawn-gate.sh's, and it reads through the same
+# `disk_free_mb` / `disk_readable` / `disk_worktree_terms` / `disk_worktree_need` the live arm's
+# `disk_lane_costs` / `disk_lane_need` are built on; this file only decides WHEN to ask it (before the
+# write) and how to surface the answer (WT_RESULT + rc 4). ⚠️ The two seams feed the same `disk_lane_need`
+# with different TERMS: the live arm CLASSIFIES the checkout and charges the marginal `tree` while the
+# shared cache holds, and this one charges `self` — the stated worst case — plus the cell reserve,
+# because at this point the install step the brief will ask for is not known yet (a `tree` the operator
+# states for the cell is honoured on both sides, which is what keeps the bounds identical, review
+# round 5 P2). Same functions, same bound, different — stated — term.
+#
+# ⛔ THE SOURCE IS LAZY, AND THAT IS MEASURED, NOT STYLISTIC (#1702). spawn-gate.sh derives
+# `_NCPU`/`MAX_LOAD` at SOURCE time from `sysctl`/`nproc`/`getconf`. This file is sourced EARLY by
+# every caller (dispatch-merge.sh, fix-one.sh, adopt-fix.sh, lane.sh) — before some of them finish
+# setting PATH — so sourcing the gate here would pin `_NCPU=4`/`MAX_LOAD=40` on a box that has not
+# yet exported the PATH those probes need, and the LOAD gate would then refuse every spawn on a
+# busy cell. At the call site, PATH is whatever the dispatch runs with, and the probe is where the
+# dispatch is.
+#
+# ⛔ AND A MISSING GATE IS A REFUSAL, NEVER A SKIP. A `$O` seeded file-by-file can carry this file
+# without spawn-gate.sh; the unverifiable direction must be the safe one (the #2033 skew rule: a
+# caller that cannot complete the check must not create anything). WT_RESULT carries the reason, so
+# the operator sees a named UNKNOWN rather than a worktree that appeared anyway.
+WTL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || WTL_DIR=""
+
+# wt_disk_admit <repo-checkout> <worktree-path> -> 0 ADMITTED · 1 REFUSED (WT_RESULT says which arm)
+# The checkout is accepted for its SIGNATURE (this is the seam every creation path shares) even though
+# the seam's bound does not vary by checkout: see `disk_admit`'s note and README §7.2i — the bound is
+# the lane's worst case, stated once, rather than a per-repo guess that the cache can invalidate.
+wt_disk_admit() {
+    local repo="$1" path="$2" rc=0
+    WT_RESULT=""
+    if ! command -v disk_admit >/dev/null 2>&1; then
+        if [ -n "$WTL_DIR" ] && [ -f "$WTL_DIR/spawn-gate.sh" ]; then
+            # shellcheck source=/dev/null
+            . "$WTL_DIR/spawn-gate.sh" || :
+        fi
+    fi
+    if ! command -v disk_admit >/dev/null 2>&1; then
+        # ⛔ SANITISE THE HOSTNAME FALLBACK TOO (review cycle 10, P2 — MEASURED). `disk_box_id`
+        # REPLACES an illegal box id with UNIDENTIFIED (`spawn-gate.sh`), but this arm cannot call it —
+        # by definition `spawn-gate.sh` is the file that is MISSING or TOO OLD to carry the predicate —
+        # so it used a bare `hostname -s`
+        # and emitted a nodename containing a space or a comma verbatim, splitting `box=` into two
+        # tokens in a line whose contract says that cannot happen, and stashing it in `WT_RESULT`,
+        # which all three callers quote into their own logs. Same rule, applied inline: an id with a
+        # character outside the legal set is REPLACED, never printed raw, and never merely defaulted.
+        _wtl_box="$(hostname -s 2>/dev/null || printf '')"
+        case "$_wtl_box" in ''|*[!A-Za-z0-9._:-]*) _wtl_box="UNIDENTIFIED" ;; esac
+        # ⛔ NAME BOTH CAUSES (review, P2 — MEASURED). This arm is reached whenever `disk_admit` is not
+        # callable, which is NOT the same state as "the file is absent": a `spawn-gate.sh` that PREDATES
+        # #3395 defines `disk_free_mb` and still has no `disk_admit`, so a `[ -f ]` probe says the file is
+        # there. Saying "is missing" sent the operator to a check a stale-but-present file PASSES, i.e. the
+        # #2721 wrong-cause class this seam exists to remove, one file over. A depth-1 `cp` that drops a
+        # file and discards its rc is a documented real mechanism (README §7.2e, cloud-cell-quiesce.sh).
+        WT_RESULT="REFUSED-UNKNOWN disk-admit(free=?, need=?, box=$_wtl_box): ${WTL_DIR:-<unresolved>}/spawn-gate.sh is missing OR PREDATES the disk predicate (it does not define disk_admit), so the ONE disk predicate cannot be loaded and this worktree's headroom CANNOT be verified — refusing to create $path on an unverifiable volume. Nothing was created (fail-closed; a box whose state dir is missing the disk gate, or carries a copy too old to define it, cannot be trusted to have room)"
+        wt_log provision "$WT_RESULT"
+        return 1
+    fi
+    disk_admit "$path" "worktree $(basename "$path")" || rc=$?
+    if [ "$rc" != 0 ]; then
+        # `disk_admit` already printed its named line; WT_RESULT carries the same text so the CALLER's
+        # log (a different file) can quote it without the reader having to join two logs.
+        WT_RESULT="${DISK_ADMIT_LINE:-}"
+        # ⛔ AN UN-NAMED REFUSAL IS `REFUSED-UNKNOWN`, NOT `REFUSED-DISK` (review round 6, P3 —
+        # MEASURED). ALL THREE callers choose their remedy from THIS token (`fix-one.sh`,
+        # `adopt-fix.sh` and `dispatch-merge.sh` match `*REFUSED-UNKNOWN*`, everything else gets
+        # "reclaim space"), so labelling the one branch that exists BECAUSE the measurement is
+        # unavailable as a DISK refusal sent the operator to reclaim space for a probe failure or a
+        # version skew — the #2721 wrong-cause class, arriving through the fallback this time.
+        # ⛔ THE COUNT IN THIS COMMENT IS LOAD-BEARING (review round 8, P2 — MEASURED). It said "Both
+        # callers", so when the remedy was made verdict-selected it was fixed in the two files the
+        # comment named and `dispatch-merge.sh` — a real `wt_provision` caller, listed as one in this
+        # PR's own description — kept hardcoding "reclaim space" for a version skew. A comment that
+        # states a POPULATION must name it exhaustively or derive it.
+        # ⛔ AND THE FIRST VERSION OF THIS NOTE POINTED AT THE WRONG GUARD (review cycle 9, P2 —
+        # MEASURED). It said `disk-admission.test.sh`'s "arm I" derives this population. Arm I is the
+        # `DISK_LANE_*_MB` neutralisation census: it reads no caller and no remedy selector. What
+        # actually guards this, and what to keep in step, are three surfaces: arm H's `arm_of` token
+        # census (`AGENT_DISK_REFUSED` / `exit 77` / the arm terminator), the DERIVED
+        # `arm_selects_remedy` census over `census_pop`'s output that reds on any caller whose rc-4
+        # arm does not mention `REFUSED-UNKNOWN`, and the two behaviour-driven selector blocks plus
+        # H3 that execute the shipped selector with `$WT_RESULT` injected. A pointer to a guard that
+        # does not exist is worse than none: it is what stops the next reviewer looking.
+        [ -n "$WT_RESULT" ] || WT_RESULT="REFUSED-UNKNOWN(free=?, need=?, box=$(disk_box_id 2>/dev/null || printf 'UNIDENTIFIED')): disk_admit refused without naming its numbers — a gate that refuses without stating what it measured is indistinguishable from a bug, so the caller is told the measurement is MISSING (and is NOT told to reclaim space: an unmeasured volume is not a full one)"
+        wt_log provision "$WT_RESULT"
+        return 1
+    fi
+    return 0
+}
+
 # ── provisioning ────────────────────────────────────────────────────────────────────────────────
 # wt_provision <repo> <worktree-path> <branch> [base]
 #   0 = a USABLE worktree exists at <path> on <branch>           (WT_RESULT says which way)
 #   1 = nothing was created and nothing was left behind          (WT_RESULT says why)
 #   2 = a pre-existing state this function refuses to touch      (nothing changed)
 #   3 = ROLLBACK FAILED — residue remains, and the caller must surface it (WT_RESULT names it)
+#   4 = REFUSED-DISK — the volume cannot hold one lane, so nothing was ATTEMPTED: no `worktree add`,
+#       no branch ref, no directory (WT_RESULT is the named refusal line, agent-infra#3395)
 # Idempotent: a second call for the same (path, branch) is a no-op.
 wt_provision() {
     local repo="$1" path="$2" br="$3" base="${4:-${WT_BASE:-origin/main}}"
@@ -386,7 +486,29 @@ wt_provision() {
         return 2
     fi
 
-    # 3. Branch present?
+    # 3. DISK ADMISSION, BEFORE ANY CREATION (agent-infra#3395) ───────────────────────────────
+    # This is the seam the measured failure went through. It sits after the reuse answers (which create
+    # nothing) and BEFORE the first step that CREATES or CONSUMES space — the ghost-branch CAS delete
+    # and the `worktree add` below:
+    #
+    #   git worktree add -> fatal: cannot create directory at 'tools/ts': No space left on device
+    #
+    # ⛔ THE `interrupted add` / `unusable worktree` ARMS ABOVE ALREADY MUTATED THE TREE, AND THE
+    # REFUSAL TEXT MUST NOT PRETEND OTHERWISE (review round 1, P2). They call `wt_rollback`, which
+    # unlocks, force-removes and prunes residue. That is the RIGHT order — a repair RELEASES space, so
+    # running it before the admission can only help later lanes — but the line therefore says
+    # "nothing was CREATED by this attempt" rather than "nothing was created": the reader of a refusal
+    # must be able to trust it, and the earlier wording asserted more than this function can know.
+    #
+    # A dispatch that dies in the add costs a whole cycle and leaves nothing to attribute: the harness's
+    # own disk gate lives inside `run_agent`, i.e. AFTER this function has already materialised the
+    # checkout, so on a full volume it was never reached. The predicate is spawn-gate.sh's (one
+    # implementation); what is new is only that it is asked BEFORE the write instead of after.
+    # An admission that is not taken cannot be undone, so the refusal consumes nothing: no branch, no
+    # directory, no claim held (callers release it on a non-zero rc).
+    wt_disk_admit "$repo" "$path" || return 4
+
+    # 3b. Branch present?
     oid="$(wt_branch_oid "$repo" "$br")"
     if [ -n "$oid" ]; then
         ahead="$(wt_ahead_count "$repo" "$base" "$oid")"

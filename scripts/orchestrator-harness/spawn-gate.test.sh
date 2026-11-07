@@ -25,6 +25,13 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # arms are the assertion that the gate runs at all; delete this line and the whole file turns the gate
 # back on, which is how you prove the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE LANE STATE REGISTRY IS OFF FOR THE SAME REASON (agent-infra#3382). `run_agent` now writes a
+# state record around every spawn, and its remote resolves from `$AGENT_INFRA_PATH` or the cwd — which in
+# these arms is a checkout whose origin is the REAL agent-infra. Left on, every arm that drives `run_agent`
+# would attempt a `git push` of a fixture lane into this repository (and spend the push bound doing it).
+# The registry's own arms re-enable it explicitly with their own isolated state root and their own bare
+# origin — so the switch is load-bearing and its arms are the assertion that the leg runs at all.
+export LANE_REGISTRY=0
 PASS=0; FAIL=0
 ck() { # ck <name> <0|1>
   if [ "$2" -eq 0 ]; then printf '  ✅ %s\n' "$1"; PASS=$((PASS+1));
@@ -32,6 +39,923 @@ ck() { # ck <name> <0|1>
 }
 TMP="$(mktemp -d)"; trap 'rm -rf "$TMP"' EXIT
 GATE="$HERE/spawn-gate.sh"
+
+# ══ THE REFUSAL-CODE NAMESPACE: ONE SCANNER, AND IT FAILS CLOSED ════════════════════════════════
+# ⛔ WHY THIS EXISTS (review of PR #3237, findings 1 and 2). The first cut of the code checks below
+# read the codes with `sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1 \2/p'` on
+# `spawn-gate.sh` ONLY, and both of those choices fail OPEN in the direction that matters:
+#   • the `^NAME=` anchor is blind to any declaration form it did not anticipate — measured: appending
+#     `export AGENT_NEW_GATE_REFUSED=83` (a REAL duplicate of the skew code) left the duplicate check
+#     GREEN, while the un-prefixed spelling of the same constant was RED. A verdict that depends on
+#     how a constant was SPELLED is not a guard, and it is exactly how 81 got double-claimed: a reader
+#     that cannot see a constant it did not expect reports "nothing found", which reads as "clean".
+#   • one file is not the deploy unit. `brief-gate.sh:60` declares `BRIEF_GATE_REFUSED=80` and
+#     `adopt-fix.sh` defers under 79 — codes no single-file scan can see, in a class that has ALREADY
+#     fired cross-file twice (74 and 80).
+# So: ONE scanner over every shipped helper of the deploy unit (`cp …/orchestrator-harness/*.sh $O/`
+# — the files that ship TOGETHER, the only set in which a collision can actually happen), and NOTHING
+# is skipped in silence. TWO stated limits, both named here so the population claim is checkable
+# rather than absolute:
+#   (1) the `*.test.sh` fixtures inside that glob, which declare codes ON PURPOSE (a stale-helper arm)
+#       — the scanner's first line;
+#   (2) the NAMING CONVENTION: the claim scan is over the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED`
+#       namespace, because a gate constant in this deploy unit is written that way (`AGENT_LAND_BACKLOG`
+#       and `ADOPT_DEFERRED` are the two that would look like exceptions and are not). LIMIT (2) IS
+#       NOT MERELY STATED (review of PR #3237, finding 1, measured): a convention nobody checks is the
+#       same hope as the `^NAME=` anchor this scanner replaced, so the parse also emits a `foreign`
+#       row for ANY declaration-position UPPERCASE `NAME=<70..89>` literal outside the namespace, and
+#       a foreign row is a RED. Measured before that arm existed: `AGENT_MEM_GATE=81` — a real
+#       duplicate of the memory gate's code under a name this scan does not know — produced 0 rows and
+#       a GREEN verdict. The namespace is now the CLAIM path, never a blind spot.
+#       ⛔ "NEVER A BLIND SPOT" IS A CLAIM ABOUT THE VALUE, NOT A GUARANTEE ABOUT EVERY PUNCTUATION,
+#       and the two review cycles it took to get here are the reason it is stated that way (both P2,
+#       measured): the net first matched only a BARE two-digit operand (`="81"`, `='81'`, `=081`,
+#       `=+81` all GREEN with 0 rows), then read the operand of `NAME=`/`NAME+=` only, so
+#       `AGENT_MEM_GATE[0]=81`, `[0]+=81`, `printf -v AGENT_MEM_GATE %d 81`,
+#       `(( AGENT_MEM_GATE = 81 ))`, `: "${AGENT_MEM_GATE:=81}"` and `declare -A M=([k]=81)` were all
+#       GREEN with 0 rows. Both axes are now driven as tables (`_foreign_decl`), and the operand goes
+#       through ONE reader (`codeval`) rather than a shape list — so the remaining stated limit is the
+#       TRUE one: the net resolves a LITERAL code value, and a declaration whose value is computed
+#       (`FOO=$bar`, `printf -v FOO %d $x`) declares no code it can name and stays silent. A declaration in the family that the scanner
+# cannot read as a 70..89 code is a RED naming the file and the constant, unless it is declared in
+# `_codes_noncode` with a reason (an `unparseable` row is NEVER sanctionable — it names file:line).
+# An absent or unreadable required declarer is a RED. A scan that yields NO claim at all is a RED — the
+# "the parse matched nothing" case, which in the first cut read as a clean pass.
+# ⛔ AND (review round 2, P0) THE PARSE MUST CLASSIFY, NOT DISCARD. The scanner above still had a
+# `next` that DROPPED any line it had not anticipated, so the annotation ``NOTHING is skipped in
+# silence'' was false about the one place it mattered: `: "${AGENT_NEW_GATE_REFUSED:=83}"`, `local
+# AGENT_NEW_GATE_REFUSED=83` and `if true; then AGENT_NEW_GATE_REFUSED=83; fi` all read as GREEN with
+# 0 rows for that name while a real 83 duplicate sat in a scanned file — and the SHAPE it drops is not
+# hypothetical: `: "${VAR:=…}"` is already live in the scanned set (`refresh-candidates.sh:133`,
+# `: "${UV_CACHE_DIR:=$cand/.cache/uv}"`), so the next gate code written that way would have been
+# invisible — measured, no family token uses `:=` TODAY, which is luck, not a property. One parse feeds
+# EVERY reader here (the chain table, the coverage verdict, the arm table), so one blind spot was
+# every reader's blind spot. The parse therefore now CLASSIFIES every family token that carries an
+# assignment operator, in any of the shapes below, and REFUSES (never drops) a declaration-shaped
+# line it cannot classify:
+#   claim       X=… · export X=… · declare/readonly/typeset [-flags] X=… · local X=… · X+=… ·
+#               after `;` `&&` `||` `then` `do` `else` `{` `(` `)` (a case-branch body) ·
+#               ${X:=…} and ${X=…} (assign-if-unset) · declare/readonly X=(83) (an ARRAY LITERAL —
+#               the parenthesis is part of the operand, not of the value) · printf -v X %d 83 (a
+#               declaration with NO `=` at all, when its value is readable)
+#   fallback    ${X:-…} ${X-…} ${X:+…} — a READ default. It cannot declare a code, but a default
+#               that DISAGREES with the declaration silently mislabels every refusal that hits it, so
+#               it must equal the declared code (a mismatch is a RED naming file:line). A QUOTED
+#               operand (`${X:-"81"}`) and an operand that cannot be read are refused too: the first
+#               cut cut at the leading quote and folded both into `${X:-}`, i.e. a false PASS.
+#   unknown     an assignment in the family that is not a 70..89 code (sanctionable by name, above)
+#   unparseable an assignment-shaped declaration of a family token this parse cannot classify. FOUR
+#               shapes, all RED, all named `unparseable declaration: <file>:<line>`, none
+#               sanctionable (an escape hatch here would restore the drop):
+#                 • an assignment OPERATOR outside a declaration position — `echo "AGENT_X_REFUSED=83"`;
+#                 • an operand that cannot be read at all — `X=$(( 70 + 13 ))`;
+#                 • an ARRAY SUBSCRIPT completed by an assignment — `X[0]=83`, `X[0]+=83`, `X[k]=83`,
+#                   `${X[0]:=83}` (the P1: these produced NO ROW and read GREEN, measured);
+#                 • an assignment BUILTIN whose value this scanner cannot know — `read -r X`,
+#                   `mapfile X` — or a `printf -v X …` whose format it cannot read. The GLUED option
+#                   form `printf -vX %d 83` is the same declaration and is normalised before the scan
+#                   (review cycle 3, P2: it matched the family token from the `v`, so the name was
+#                   `vX` in a position neither `cmdpos` nor `residual` recognised, and it produced NO
+#                   ROW of any class — the third instance of "a shape the author did not think of").
+#                   A subscript containing its own `=` (`X[a==b]=83`) is refused by the same arm, and
+#                   that arm is now gated on DECLARATION POSITION, so an element COMPARISON
+#                   (`[ $X[0] = 83 ]`) is silent whether or not the element is quoted — before this it
+#                   was red when unquoted and silent when quoted, i.e. punctuation deciding a verdict.
+# STATED LIMIT (and it is now TRUE, which it was not before): a family token with NO assignment
+# operator and no assignment builtin writing it is a READ, not a declaration (`exit "$AGENT_X_REFUSED"`,
+# `${X}`, `${X[0]}`, `[ "$X" = 83 ]`), and is not reported — the scan is about declarations. That
+# sentence used to be false as written: `printf -v AGENT_X_REFUSED %d 83` IS a declaration with no
+# operator, and it read GREEN with 0 rows. A COMMENT line is documentation, not a declaration, so a
+# commented-out declaration is not claimed (the required-declarer rule is what catches a helper that
+# stops declaring its code).
+# The scan is computed ONCE per directory and every reader in this file uses it (`codes_for_name`
+# for a value, `$CODE_ROWS` for the claim list): a second parser is a second way to fail open.
+cat > "$TMP/refusal-codes.awk" <<'REFUSAL_AWK'
+BEGIN { OFS = "\t" }
+function basename(path,   p, n) { n = split(path, p, "/"); return p[n] }
+function iscode(v) { return (v ~ /^[0-9]+$/ && v + 0 >= 70 && v + 0 <= 89) }
+# Is everything to the left of the token a place a command can START? Separators, the compound
+# keywords that introduce one, and a declaration keyword (with its own flags).
+function cmdpos(pre,   p) {
+  p = pre
+  gsub(/[ \t"']+$/, "", p)
+  if (p == "") return 1
+  if (p ~ /(^|[;&|({})])[ \t"']*$/) return 1
+  # ⛔ `let` AND `time` ARE ASSIGNMENT POSITIONS (review round 6, P3 — measured): `let X=81` and
+  # `time X=81` both assign 81 into `X` (`bash -c 'time X=81'` prints 81 on the next read), yet the
+  # foreign net emitted no row while the FAMILY net refused the same line. `time` takes its one POSIX
+  # flag, so `time -p X=81` must match too — measured silent before this arm existed.
+  if (p ~ /(^|[;&|({})])[ \t"']*(if|then|else|elif|while|until|do|!|let|time([ \t]+-[A-Za-z]+)*)$/) return 1
+  if (p ~ /(^|[;&|({})])[ \t"']*(export|local|declare|readonly|typeset|int|integer)([ \t]+-[A-Za-z]+)*$/) return 1
+  # ⛔ `printf -v NAME` IS A DECLARATION POSITION (review cycle 2, P2). The name is being ASSIGNED, so
+  # the name token sits where a command may start — same shape as `local NAME`. Without this arm,
+  # `printf -v AGENT_MEM_GATE %d 81` reached the foreign net with `cmdpos` FALSE and produced no row.
+  if (p ~ /(^|[;&|({})])[ \t"']*printf[ \t]+-v$/) return 1
+  return 0
+}
+function forkw(p,   q) {
+  # ⛔ A LOOP KEYWORD IS AN ASSIGNMENT ONLY IN COMMAND POSITION (review round 3, P2 — measured). The
+  # first cut tested `(^|[ \t;&|({])(for|select)$`, whose space alternative makes ANY word `for`
+  # qualify: `echo for AGENT_MEM_GATE in 81` claimed a `foreign` 81 for a phrase bash never executes
+  # as a loop, while the same sentence QUOTED stayed silent — punctuation deciding a verdict, the
+  # defect this file criticises elsewhere. Template it on `cmdpos` instead: strip the keyword, then
+  # the prefix must end at start-of-command (a separator or nothing), never merely at a space.
+  q = p
+  gsub(/[ \t"']+$/, "", q)
+  if (!sub(/(for|select)$/, "", q)) return 0
+  return (q ~ /(^|[;&|({})])[ \t"']*$/)
+}
+# ⛔ ARITHMETIC CONTEXT IS A PROPERTY OF THE LINE, NOT OF THE TOKEN'S IMMEDIATE LEFT (review round 5,
+# P2 — measured). `(( (X[0] = 83) ))` and `(( 1 && (X[0] = 83) ))` ASSIGN 83 (`bash -c 'unset X;
+# (( 1 && (X[0] = 83) )); echo $X'` → 83), and a test anchored at the token (`\(\([^()]*$`) sees only
+# the parens it happens to stand behind — one paren deeper it matches nothing and the line reads GREEN
+# with 0 rows. Count DEPTH instead: an UNBALANCED run of `(` that CONTAINS a `((` is a context still
+# open at the token. `while (( i < n )); do X[0] = 83` is correctly OUTSIDE it (the `))` closed), and
+# `(( a[0] = 83 )) && (( b[0] = 83 ))` correctly inside it on BOTH tokens — the case a naive
+# "has `((` and no `))`" test would fail OPEN on. A closed `((` in an earlier statement therefore
+# cannot silence a later declaration, which is the property that makes depth right and a substring
+# test wrong. The string case (`echo "(( "`) only makes this more eager — a FALSE RED, the visible
+# direction this file deliberately chooses over a silent drop.
+function arithctx(p,   i, depth, st, ch) {
+  depth = 0
+  st = 0
+  for (i = 1; i <= length(p); i++) {
+    ch = substr(p, i, 1)
+    if (ch == "(") { depth++; if (substr(p, i, 2) == "((") st = 1 }
+    # ⛔ DEPTH MUST NOT GO NEGATIVE (review round 6, P2 — measured). An UNCLAMPED decrement lets two
+    # stray `)` to the LEFT of a real declaration drive depth to 0 and return false, so BOTH arms fall
+    # out of the fail-closed branch with NO row — the silent drop `residual()` exists to make
+    # impossible: `msg="1) x 2) y"; (( X = 83 ))` and `case x in a) :;; b) :;; esac; (( X[0] = 83 ))`
+    # both ASSIGN 83 (`bash -c 'msg="1) x 2) y"; (( X = 83 )); echo $X'` → 83) and both read GREEN.
+    # A `)` with nothing open is not a closing parenthesis; it is a character in a string or a `case`
+    # pattern, and it must leave the count alone.
+    else if (ch == ")" && depth > 0) depth--
+  }
+  return (st && depth > 0)
+}
+# ⛔ ONE PREFIX-ASSIGNMENT OPERAND IS A COMMAND BOUNDARY (review round 5, P2 — measured). The foreign
+# net asked `cmdpos || decl_operand` of the text before the name, and `FOO=1 ` is neither — so
+# `FOO=1 AGENT_MEM_GATE=81` bound 81 into the variable and emitted NO ROW, while the FAMILY net refused
+# the identical `FOO=1 AGENT_NEW_GATE_REFUSED=83` (0 rows vs RED, decided by the name's namespace — the
+# asymmetry `residual()` already records as fixed on its own path). A pure `WORD=value …` prefix list
+# is a command position. It is NOT a licence for `echo AGENT_MEM_GATE=81`: the whole remainder must be
+# assignment tokens, so the leading command name fails the test.
+# ⛔ THE PREFIX OPERAND MAY BE QUOTED OR ESCAPED (review round 6, P3 — measured). `[^ \t]*` cannot
+# cross a space, so a prefix list holding `FOO="a b"` or `FOO=a\ b` failed to match at all and the
+# name after it got NO row — while bash durably assigns it (`bash -c 'FOO="a b" X=81; echo $X'` → 81)
+# and the FAMILY mirror of the same line is refused. Quote- and escape-aware, but still ONE operand:
+# the whole remainder must be `WORD=value` tokens, so `echo FOO=1 …` still fails the test.
+function prefixonly(q,   t) {
+  if (q == "") return 0
+  # ⛔ THE TRAILING SEPARATOR IS PART OF THE SHAPE — never `gsub` it away (measured: stripping it made
+  # `FOO=1` the whole operand and the `[ \t]+` that proves "this token ended" had nothing to match, so
+  # the arm silently never fired).
+  t = q
+  return (t ~ /(^|[;&|({})])[ \t"']*([A-Za-z_][A-Za-z0-9_]*=("[^"]*"|'[^']*'|([^ \t\\]|\\[ \t])*)[ \t]+)+$/)
+}
+# The value: everything up to the first character that can end it (`X=$y`, `X=83;`, `X=83 # note`,
+# `${X:-83}`), or up to the matching quote when the operand is QUOTED (`${X:-"81"}`, `X='83'`). The
+# quoted form is not decoration: cutting at the leading quote turned `${X:-"81"}` into an EMPTY value,
+# which the caller then read as `${X:-}` (a bare read) — a stale default passing as clean, measured.
+function valof(v,   out, q, i) {
+  out = v
+  # ⛔ AN ARRAY LITERAL IS AN OPERAND (#P1 review of 87b8d708b, body/parse disagreement): the body
+  # table listed `readonly -a X=(83)` as a claim while the parse cut at the leading `)` and produced
+  # `(83`, i.e. an `unknown` row naming a value that is not in the file. `declare -a X=(83)` IS a
+  # declaration of 83 at index 0 (`${X}` is 83), so the parenthesis is part of the OPERAND, not of
+  # the value: drop it and let the ordinary value rules read what is inside. `X=()` still reads as
+  # the empty value, i.e. `unknown` — a RED, which is the correct answer for a declaration with no code.
+  if (out ~ /^\(/) out = substr(out, 2)
+  if (out ~ /^\$["']/) out = substr(out, 2)             # `$'83'` / `$"83"`: the `$` is a quoting PREFIX
+  if (out ~ /^["']/) {
+    q = substr(out, 1, 1)
+    out = substr(out, 2)
+    i = index(out, q)
+    return (i > 0) ? substr(out, 1, i - 1) : out      # unclosed quote: hand back what there is
+  }
+  sub(/[ \t;#\\)}"'\/].*$/, "", out)
+  gsub(/^["']|["']$/, "", out)
+  return out
+}
+# ── A DECLARATION WITH NO ASSIGNMENT OPERATOR, AND ITS VALUE ────────────────────────────────────
+# ⛔ `printf -v NAME <fmt> [arg]` DECLARES THE CODE and carries no `=`, so the operator chain cannot
+# see it at all: measured on the reviewed head, `printf -v AGENT_X_REFUSED %d 83` produced NO ROW and
+# the duplicate check stayed GREEN. It is classified as a claim when its value is READABLE (a single
+# conversion and a single literal integer argument) and REFUSED otherwise — never left silent, which
+# is the defect this whole scanner exists to close.
+function printfval(t,   a, n, fmt, v) {
+  sub(/^[ \t]+/, "", t)
+  n = split(t, a, /[ \t]+/)
+  if (n != 2) return ""                       # a multi-conversion / multi-arg format: unreadable
+  fmt = a[1]
+  gsub(/^["']|["']$/, "", fmt)
+  if (fmt !~ /^[^%]*%[dis][^%]*$/) return ""   # exactly one `%d`/`%i`/`%s`, no other conversion
+  v = a[2]
+  gsub(/^["']|["']$/, "", v)
+  return (v ~ /^[0-9]+$/) ? v : ""
+}
+# ── THE VALUE DECLARED INTO A NAME, WHATEVER SHAPE THE DECLARATION TAKES ─────────────────────
+# ⛔ THE FOREIGN NET USED TO READ ONLY ONE SHAPE (review cycle 2, P2 at head `cfc7a3a4`). It matched
+# `NAME=` / `NAME+=` and then read the operand, so the same invisible duplicate moved one axis over:
+# every declaration SHAPE the family chain classifies had NO arm on the foreign path. Measured through
+# the shipped program on a copy of the deploy unit, one appended line each — 0 rows, 0 `foreign`, 0
+# `unparseable`, verdict GREEN — while bash executes every one of them as a declaration of 81:
+#     AGENT_MEM_GATE[0]=81        AGENT_MEM_GATE[0]+=81       printf -v AGENT_MEM_GATE %d 81
+#     (( AGENT_MEM_GATE = 81 ))   : "${AGENT_MEM_GATE:=81}"    declare -A M=([k]=81)
+#     bash -c 'A[0]=81; printf -v B %d 81; C=0; (( C = 81 )); D=""; : "${D:=81}"; echo $A $B $C $D'
+#     → 81 81 81 81
+# The fix is NOT a second shape whitelist — a list can only reach the shapes its author thought of,
+# which is how this file's `residual()` came to exist. It is one operand READER that strips whatever
+# introduces the value (`=`, `+=`, `:=`, `[<idx>]=`, a leading `(`, a leading `printf -v` format) and
+# hands the rest to the SAME `valof`, so a new shape that still reaches its value through one of those
+# introducers is read without anybody adding an arm. Returns the code it declares, or EMPTY when what
+# it declares is not a code — EMPTY covers both "a read" and "not a code", which is why the caller
+# must never treat EMPTY as safe and a code as the only thing that REDs.
+function codeval(t,   v, i) {
+  sub(/^[ \t]+/, "", t)
+  sub(/^:=/, "", t)
+  sub(/^\+?=/, "", t)
+  for (;;) {                                       # `[idx]=`, `([k]=`, in any order and any depth
+    sub(/^[ \t]+/, "", t)
+    if (t ~ /^\[/) {
+      i = index(t, "]")
+      if (i == 0) return ""                        # an unreadable subscript declares nothing we can name
+      t = substr(t, i + 1)
+      sub(/^[ \t]*:?\+?=/, "", t)
+      continue
+    }
+    if (t ~ /^\(/) { t = substr(t, 2); continue }
+    break
+  }
+  sub(/^[ \t]+/, "", t)
+  # ⛔ THE FORMAT ITSELF MAY BE QUOTED (review round 7, P3 — measured). `sub(/^%[a-zA-Z]+[ \t]+/)` did
+  # not tolerate the quotes, so `printf -v AGENT_MEM_GATE '%d' 81` produced NO ROW while the FAMILY
+  # path classified the identical shape as a `claim` — spelling, not behaviour, deciding whether a
+  # declaration is seen. That is NOT the STATED LIMIT above: the limit scopes out a COMPUTED value,
+  # and here the value is the literal 81 and only the FORMAT is quoted. It is also the dominant form in
+  # the tree (`printf -v "$3" '%s' …`), so the gap is reachable in house style, not only in theory.
+  sub(/^["']?%[a-zA-Z]+["']?[ \t]+/, "", t)          # `printf -v NAME %d 81` / `NAME '%d' 81`
+  v = valof(t)
+  sub(/^\+/, "", v)
+  sub(/^0+/, "", v)
+  return iscode(v) ? v : ""
+}
+# ⛔ THE RESIDUAL ARM: FAIL CLOSED ON WHAT THE OPERATOR CHAIN DID NOT CLASSIFY (P1, review of
+# 87b8d708b — the BLOCKING finding). The chain above is a WHITELIST, and it used to end by DROPPING
+# any residual text it had not anticipated: `X[0]=83` leaves `tail` beginning with `[`, matches no
+# arm, and produced NO ROW — GREEN, 0 rows for the name — while bash treats it as a genuine
+# assignment (`bash -c 'X[0]=83; echo "${X}"'` prints 83). Measured drops on the reviewed head:
+# `X[0]=83`, `X[0]+=83`, `X[0]="83"`, `X[k]=83`, `declare -a X[0]=83`, `X[0]=83; exit "${X}"`.
+# Adding `[` to the chain would fix today's instance and leave the CLASS alive, because the arm list
+# IS the safety property. So the chain is now an OPTIMISATION and this is the safety property: after
+# the chain, any residual that still DECLARES the token is REFUSED (`unparseable`, RED, named
+# file:line) instead of skipped. Two residual shapes are DECLARATION-shaped:
+#   • an ARRAY SUBSCRIPT completed by an assignment — `[<any>]=`, `[<any>]+=`, `[<any>]:=`;
+#   • an assignment BUILTIN that writes its value INTO the name — `printf -v`, `read`/`mapfile`/
+#     `readarray` (a value this scanner cannot know, so it cannot claim a code).
+# A residual that only READS the token (`${X}`, `${X#*=}`, `X[0]`, `[ "$X" = 83 ]`) is untouched: a
+# read declares nothing, and turning reads into REDs would be the over-block that makes a scanner
+# ignored. The subscript test is anchored at the OPERATOR being GLUED TO THE `]`: `X[0]=83` is an
+# assignment, `X[0] =83` is not (`bash: X[0]: command not found`) and `[ $X[0] = 83 ]` is a
+# comparison, so the operator's position — not the presence of a quote — is what separates them.
+function decl_operand(p,   q) {
+  # ⛔ A DECLARATION BUILTIN WRITES EVERY OPERAND, NOT JUST THE FIRST (review round 3, P2 — measured).
+  # `cmdpos` recognises only the operand IMMEDIATELY after `export`/`local`/`declare`/`readonly`/
+  # `typeset`, so every later one was skipped in silence by the foreign net: `export AGENT_DEBUG=1
+  # AGENT_MEM_GATE=81` produced no row and a GREEN verdict, while the same code in the FIRST slot
+  # (`export AGENT_MEM_GATE=81 E1=1`) was caught — position deciding a verdict. The family net never
+  # had the gap. Multi-operand `local` is house style, so a code landing in a later slot is a
+  # realistic edit. Strip trailing simple `WORD=value` operands; what remains must END at the builtin.
+  q = p
+  gsub(/[ \t"']+$/, "", q)
+  while (q ~ /[ \t][A-Za-z_][A-Za-z0-9_]*=[^ \t]*$/) {
+    sub(/[ \t][A-Za-z_][A-Za-z0-9_]*=[^ \t]*$/, "", q)
+  }
+  return (q ~ /(^|[;&|({})])[ \t"']*(export|local|declare|readonly|typeset)([ \t]+-[A-Za-z]+)*$/)
+}
+function residual(pre, tail, s, name, f, ln,   p, t2, v, _r, _arith) {
+  # ⛔ A SUBSCRIPT MAY CONTAIN BRACKETS OF ITS OWN (`X[a[0]]=83`) — `[^]]*` stopped at the INNER `]`,
+  # matched no arm, and the form read GREEN with 0 rows (review of PR #3237, finding 2, measured).
+  # Scan to the ASSIGNMENT instead of to the first bracket. A COMPARISON on an element still stays
+  # silent, because its `=` comes after a QUOTE, which `[ \t]*:?\+?=` cannot bridge — that is the
+  # reason the subscript test is anchored at the `]` in the first place.
+  # ⛔ AND THE SUBSCRIPT ITSELF MAY CONTAIN AN `=` (`X[a==b]=83`) — `[^=]*` cannot cross it, so that
+  # form matched no arm and fell through the fail-closed branch in silence: measured, 0 rows, verdict
+  # GREEN, while `bash -c 'X[a==b]=83'` assigns element 83. `.*` scans to the `]` that is actually
+  # followed by the assignment operator (POSIX awk takes the longest match, so a NESTED subscript
+  # still ends at its own closing `]`).
+  # ⛔ AND THE GATE ON DECLARATION POSITION WAS WRONG (review round 2, P2 — the fix above carried it,
+  # measured): `cmdpos(pre)` is FALSE for a prefix-assignment position, so `FOO=1 X[0]=83` fell through
+  # in SILENCE (0 rows, verdict GREEN) while the identical `FOO=1 X=83` was refused — the same
+  # position test giving opposite verdicts on two spellings, with the silent one a real assignment
+  # (`bash -c 'FOO=1 X[0]=83; echo ${X[0]}'` → 83). The operator's POSITION does the work instead:
+  # an assignment operator is GLUED to the `]`, so `X[0]=83` / `X[0]+=83` / `${X[0]:=83}` / a nested
+  # `X[a[0]]=83` / an `=`-bearing `X[a==b]=83` all match, while a comparison never does — it has a
+  # space or a quote between the bracket and the `=`.
+  # ⛔ EXCEPT IN ARITHMETIC CONTEXT, WHERE POSITION DISTINGUISHES NOTHING (review round 4, P1 —
+  # measured). Inside `(( ))` spaces around `=` are INSIGNIFICANT, so the glued-operator rule inverts
+  # the verdict twice on the same class: `(( X[0] = 83 ))` and `(( X[0] += 83 ))` ASSIGN 83
+  # (`bash -c 'unset X; (( X[0] = 83 )); echo $X'` → 83) and read GREEN with 0 rows, while
+  # `(( X[0]==83 ))`, which declares nothing, was REFUSED — a fail-open AND a false RED, one space
+  # apart. `==` must stay a comparison (`[^=]` after the `=`), and the bare `X[0] =83` — NOT an
+  # assignment, `bash: X[0]: command not found` — is untouched because it is not arithmetic.
+  # ⛔ AND `==` IS A COMPARISON IN EVERY SPELLING — the glued test lacked the guard too (review round
+  # 4, P1 — measured). `[0]==83` satisfies "an operator GLUED to the `]`" while declaring nothing, so
+  # `(( X[0]==83 ))` was REFUSED as an `unparseable` declaration: a false RED on a comparison, made
+  # while the real assignment `(( X[0] = 83 ))` one space away read GREEN. `[^=]` after the `=` is the
+  # same exclusion the sibling `^=([^=]|$)` arm already uses; `[^=]` still matches every operand that
+  # declares a code (`=83`, `="83"`, `:=83`, `+=83`), so nothing is lost on the fail-closed side.
+  _arith = arithctx(pre)
+  if (tail ~ /^\[.*\][:]?\+?=([^=]|$)/ || (_arith && tail ~ /^\[.*\][ \t]*:?[+]?=([^=]|$)/)) {
+    print "unparseable", name, s, f, ln; return
+  }
+  # ⛔ A QUOTED OPERAND IS STILL THE SAME BUILTIN: `printf -v "X" %d 83` and `read -r -d "" X`. The
+  # anchors below required a TRAILING SPACE, so a quoted argument between the builtin and the name
+  # defeated them and the declaration again read GREEN with 0 rows (finding 2). Strip trailing quotes
+  # AND spaces with the same rule `cmdpos` uses, then anchor at end-of-token.
+  p = pre
+  gsub(/[ \t"']+$/, "", p)
+  # ⛔ A `for`/`select` LOOP VARIABLE IS AN ASSIGNMENT (review round 3, P2 — measured):
+  # `for AGENT_X_REFUSED in 83; do …; done` binds 83 into the name exactly as `X=83` does
+  # (`bash -c 'for AGENT_X_REFUSED in 83; do exit "$AGENT_X_REFUSED"; done'` → 83), yet the operator
+  # chain saw no `=` and this residual arm matched none of its shapes, so the line produced NO ROW
+  # and the verdict stayed GREEN over a real duplicate of the skew code. It is NOT covered by the
+  # STATED LIMIT above: that scopes out a token with "NO assignment operator AND NO ASSIGNMENT BUILTIN
+  # writing it", and a loop binding is a write. The keyword must be in COMMAND position (`forkw`), so
+  # an ordinary argument that merely CONTAINS the token stays silent — measured: `echo for
+  # AGENT_MEM_GATE in 81` binds nothing and must not claim one.
+  if (forkw(p) && tail ~ /^[ \t]+in[ \t]/) {
+    t2 = tail
+    sub(/^[ \t]+in[ \t]+/, "", t2)
+    v = valof(t2)
+    # ONE literal operand, QUOTED OR BARE. The first cut required a bare `[0-9]+`, so `for X in "83"`
+    # — which binds 83 exactly like the bare form — was `unparseable` instead of a COLLIDING claim:
+    # red, but never NAMING the duplicate, which is the property this check exists for. Strip what
+    # `valof` read and require a terminator next, so a multi-value list is still REFUSED (the loop
+    # variable does not durably hold one code).
+    _r = t2
+    sub(/^["']/, "", _r)
+    _r = substr(_r, length(v) + 1)
+    if (iscode(v) && _r ~ /^["']?[ \t]*([;&]|$)/) row("claim", name, v, f, ln)
+    else                                          print "unparseable", name, s, f, ln
+    return
+  }
+  # ⛔ THE OPERAND MAY BE ON THE NEXT PHYSICAL LINE. `for X` + newline + `in 83; do …; done` is legal
+  # bash and needs NO backslash, so the continuation join never sees it (measured: it binds 83 while
+  # the scanner emitted no row and stayed GREEN). An unreadable operand here is REFUSED, never
+  # dropped — the same rule the backslash spelling is already held to.
+  if (forkw(p) && tail ~ /^[ \t]*$/) {
+    print "unparseable", name, s, f, ln
+    return
+  }
+  if (p ~ /(^|[ \t;&|({])printf[ \t]+-v$/) {
+    # The NAME may be QUOTED (`printf -v "X" %d 83`), in which case `tail` begins with the CLOSING
+    # quote and `printfval` sees three fields instead of two (review of PR #3237, finding 2 — this
+    # shape read as `unparseable`, which is red but for the wrong reason: the value IS readable and a
+    # duplicate must COLLIDE, that being the property this namespace check exists for).
+    t2 = tail
+    sub(/^["']/, "", t2)
+    v = printfval(t2)
+    if (v != "") row("claim", name, v, f, ln)
+    else         print "unparseable", name, s, f, ln
+    return
+  }
+  # `getopts` writes the OPTION CHARACTER into the name (and the index into OPTIND), so it is the same
+  # class as `read`: a value this scanner cannot know (finding 2).
+  # ⛔ ANY ARGUMENT BETWEEN THE BUILTIN AND THE NAME KEEPS IT THE SAME BUILTIN (review round 2, P2).
+  # The anchor used to enumerate `-[A-Za-z]+` or a QUOTED string and nothing else, so a flag with a
+  # SEPARATE OPERAND matched nothing and the declaration read GREEN with 0 rows — measured on this
+  # head: `read -u 3 X`, `read -rt 5 X`, `read -r -p "gate: " X`, `mapfile -t -s 1 X` and
+  # `getopts "a:" X` all produced 0 rows. The table only drove the forms that happened to work (`read
+  # -r`, `read -r -d ""` — the one quoted operand the trailing-quote strip survives — and `getopts ""`),
+  # which is how the gap survived the arm written for it. What sits between them is an ARGUMENT LIST,
+  # not a command boundary, so it accepts anything up to a separator.
+  if (p ~ /(^|[ \t;&|({])(read|mapfile|readarray|getopts)([ \t]+[^;&|(){}<>]*)?[ \t]*$/) {
+    print "unparseable", name, s, f, ln
+    return
+  }
+  # AN ARITHMETIC ASSIGNMENT (`(( X = 83 ))`) DECLARES the code with no `=` in a declaration position.
+  # The arm is reached because `tail` begins with WHITESPACE, which `^=` / `^:?[-+]` cannot match — it
+  # used to say the parenthesised context made `cmdpos` false, which is MEASURED FALSE (cmdpos("(( ") =
+  # 1); the behaviour was right and the stated cause was wrong, which matters because that sentence is
+  # the reason the arm exists. `(( X == 83 ))` must stay SILENT (a comparison, not a declaration).
+  # ⛔ AND THE VALUE MUST BE ONE LITERAL (review round 2, P2): `valof` cuts at the first space, so
+  # `(( X = 70 + 13 ))` claimed **70** while bash assigns **83** — the skew gate's own code — giving a
+  # fail-open past the collision check (`(( X = 84 - 1 ))` claimed 84). The same value written as
+  # `X=$(( 70 + 13 ))` is already refused, so the two paths disagreed. Claim only a single literal;
+  # anything computed is `unparseable`.
+  if (arithctx(p) && tail ~ /^[ \t]*(:|\+)?=([^=]|$)/) {
+    t2 = tail
+    sub(/^[ \t]+/, "", t2)
+    sub(/^(:|\+)?=/, "", t2)      # the OPERATOR is the declaration, not the value
+    sub(/^[ \t]+/, "", t2)
+    v = valof(t2)
+    # ONE LITERAL, and the rest of the expression must be nothing but the closing parens: a computed
+    # right-hand side is REFUSED rather than claimed as its first term.
+    if (t2 ~ /^[0-9]+[ \t]*\)*[ \t]*$/ && v != "") row("claim", name, v, f, ln)
+    else                                     print "unparseable", name, s, f, ln
+    return
+  }
+}
+# ⛔ `X="${X:-83}"` IS A DECLARATION OF 83 WHEN UNSET (review round 2, P2 — measured), and it is the
+# HOUSE IDIOM for a defaulted constant: `scripts/pi-reap-worktrees.sh:851` declares
+# `REAP_WT_PRESERVE_KEEP_DAYS="${REAP_WT_PRESERVE_KEEP_DAYS:-14}"` exactly that way, and that is the
+# very declaration the registry row in this PR is about. The scanner read the right-hand side as an
+# operand it could not resolve and emitted `unknown` — a RED naming no duplicate, with a message a
+# reader cannot act on ("unparseable declaration: spawn-gate.sh:AGENT_X_REFUSED") — while its OWN
+# fallback pass read the same value as `83`. A future gate constant written the way the rest of the
+# repo writes constants would have been a false red. Recognised ONLY when the operand is exactly
+# `${<the same name><operator><literal>}`, so nothing else is reinterpreted; a computed self-default
+# (`${X:-$y}`) stays `unknown`/RED, and an operand naming a DIFFERENT constant is not a claim here.
+function selfdefault(nm, rhs,   m, head) {
+  m = rhs
+  sub(/^["']/, "", m)
+  sub(/["'][ \t]*$/, "", m)
+  sub(/[ \t]+$/, "", m)
+  head = "${" nm
+  if (substr(m, 1, length(head)) != head) return ""
+  m = substr(m, length(head) + 1)
+  if      (m ~ /^:-/) m = substr(m, 3)
+  else if (m ~ /^:=/) m = substr(m, 3)
+  else if (m ~ /^=/)  m = substr(m, 2)
+  else if (m ~ /^-/)  m = substr(m, 2)
+  else if (m ~ /^\+/) m = substr(m, 2)
+  else return ""
+  if (m !~ /^[0-9]+\}[ \t]*$/) return ""
+  sub(/\}.*$/, "", m)
+  return iscode(m) ? m : ""
+}
+# ⛔ THERE IS NO INLINE-COMMENT MODEL, AND THAT IS THE FIX — four attempts to write one each opened a
+# new FAIL-OPEN on the exact thing this scanner exists to catch (a duplicate gate code reading GREEN).
+# The history, each measured through this predicate, is the argument:
+#   1. `sub(/[ \t]#.*$/, ...)` — no quote model. A `#` inside `"…"` cut the line, and the declaration
+#      after it vanished: GREEN, 0 rows, over a real duplicate of the skew code.
+#   2. a per-line quote state — closed `$'it\'s'` at the escaped quote, took a BACKTICK's inner `#` as
+#      this line's comment, and forgot a quote opened on the previous line. Three shapes, all GREEN.
+#   3. a nesting-aware stack carried across lines, with no notion of a HEREDOC — and a heredoc body of
+#      prose (`it's a thing`) leaves the stack inside a quote for the REST OF THE FILE, so every later
+#      `#` reads as quoted and is stripped. Measured: `true && echo "a # b" && AGENT_NEW_GATE_REFUSED=83`
+#      appended to `fix-one.sh` read GREEN with 0 rows while bash assigns 83 — a regression on the head
+#      before it, and it also turned this file's own `true # …=83` control into a false RED in that file.
+#   4. the same stack plus heredocs — defeated by `$(…)`, which opens a NESTING quoting context: in
+#      `deploy-harness.sh:752` the `"` inside `$(sed -n 's/.*"payloadSha256"…')` closed and reopened the
+#      OUTER double quote, an odd count left the file in a bogus `sq`, and stripping silently switched
+#      itself off for the remaining 70 lines.
+# Each attempt was strictly harder than the last and each was defeated by the next construct down. That
+# is the signal: deciding "is this `#` a comment" requires a real bash parser, and a scanner that is
+# only PROBABLY right about comments is a scanner that can be made to lose a declaration.
+# SO NO TEXT IS DISCARDED. Whole-line comments (`^#`) are still skipped — bash never executes one, so
+# they cannot hide a declaration — and an INLINE `#` is simply scanned like any other text. An inline
+# comment that happens to name a family token therefore reads as an `unparseable`/foreign RED, which is
+# a FALSE RED and the one direction that is visible to a reader. It is the deliberate trade: refuse a
+# documented declaration rather than risk silently claiming nothing.
+# MEASURED before choosing it, not assumed — and stated WITH ITS COMMAND, because a count a reader cannot
+# reproduce is the class this file spent four rounds eliminating. Over the exact population the scan
+# reads (`scripts/orchestrator-harness/*.sh`, excluding `*.test.sh`), counting non-whole-line-comment
+# lines that carry a word-start `#` (`(^|[ \t;(])#`) and asking whether a family token appears from that
+# `#` onward:
+#   python3 -c "import re,glob;fam=re.compile(r'[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)');n=hits=0
+#   for f in sorted(glob.glob('scripts/orchestrator-harness/*.sh')):
+#     if f.endswith('.test.sh'): continue
+#     for line in open(f,errors='replace'):
+#       s=line.rstrip(chr(10))
+#       if s.lstrip(' \t').startswith('#'): continue
+#       m=re.search(r'(^|[ \t;(])#',s)
+#       if not m: continue
+#       n+=1
+#       if fam.search(s[m.start():]): hits+=1
+#   print(n,hits)"
+#   → 1161 0
+# ZERO. So this costs the real tree NOTHING, and the real-tree scan is byte-identical (`claims=15`,
+# `unparseable: none`, RC=0). A model would have bought nothing it did not also risk.
+# This SUPERSEDES the earlier "an inline comment is documentation too" rule, which was added to silence
+# a false RED and is what produced fail-opens 1-4 above. A false RED is cheaper than a missed duplicate.
+function row(kind, name, v, f, ln) {
+  if (iscode(v)) print kind, name, v + 0, f, ln
+  else           print "unknown", name, v, f, ln
+}
+# ⛔ A BACKSLASH-NEWLINE IS A LINE CONTINUATION, SO THE "LINE" awk SEES IS NOT THE LINE bash RUNS
+# (review of `da2e2480`, P1 — three measured fail-opens). awk is line-based, so
+#   AGENT_NEW_GATE_REFUSED\      <- physical line 1
+#   =83                          <- physical line 2
+# gave the name no operator and the operator no name: 0 rows, RC=0 GREEN, while bash assigns 83. Same for
+# `X\` + `+=83`, and for a CALLER's stale default split the same way (`_c="${AGENT_HARNESS_SKEW_REFUSED\`
+# + `:-81}"`), which is the regression this whole namespace exists to catch. The mirror spelling
+# (`NAME=\` then `83`) WAS red, so the verdict turned on WHICH SIDE of the break the operator landed on —
+# the spelling-dependence this file says is not a guard.
+# So a logical line is JOINED before it is scanned. This discards NOTHING — it is a text-preserving join,
+# not the comment model that four earlier rounds had to remove — and it reports the FIRST physical line,
+# so a row still points a reader at the declaration's own start.
+function odd_trailing_bs(s,   n, k) {
+  n = length(s); k = 0
+  while (n - k >= 1 && substr(s, n - k, 1) == "\\") k++
+  return (k % 2)
+}
+# ── ONE LOGICAL LINE = the physical lines bash joins with a backslash-newline ─────────────────────
+# The whole-line-comment test is applied to the unit's FIRST physical line, BEFORE the join: in bash a
+# `#` comment ends at the NEWLINE, so a comment line ending in `\` does NOT continue into the next line
+# and the next line really executes. Joining first and then testing `^#` swallowed it — measured, `# note
+# \` followed by `AGENT_NEW_GATE_REFUSED=83` read GREEN with 0 rows while bash assigned 83.
+# And a unit left DANGLING at end of file is SCANNED, not dropped: bash discards the trailing backslash
+# and runs the line, so `AGENT_NEW_GATE_REFUSED=83\` as a file's last line assigns 83 (measured). The
+# accumulator is therefore flushed from END and before the per-file reset, through the SAME function the
+# main rule uses — one scanner, so a unit can never be treated differently according to where it sits.
+{
+  if (FILENAME ~ /\.test\.sh$/) next          # fixtures declare codes ON PURPOSE (a stale-helper arm)
+  if (FNR == 1) { flush_unit(); ACC = ""; ACCFNR = 0; ACCFILE = "" }
+  if (ACC == "" && $0 ~ /^[ \t]*#/) next       # documentation — decided on the FIRST physical line
+  # ⛔ THE FILE IS REMEMBERED WITH THE LINE, not read at flush time. `flush_unit()` also runs at this
+  # very `FNR == 1` boundary — the moment `FILENAME` has already advanced to the file being OPENED —
+  # so a unit dangling at the end of a NON-last file was attributed to the file AFTER it (P1, review of
+  # `7d65a618`; measured: `AGENT_NEW_GATE_REFUSED=83\` at `brief-gate.sh:274` emitted
+  # `claim … key-gate.sh  274`, a file holding zero occurrences of that name).
+  if (ACC == "") { s = $0; ACCFNR = FNR; ACCFILE = FILENAME } else { s = ACC $0 }
+  # ⛔ THE JOIN DROPS BOTH THE BACKSLASH AND THE NEWLINE — it does NOT insert a space (measured on the
+  # first cut: joining with " " turned `NAME\`+`=83` into `NAME =83`, which parses as neither an
+  # assignment nor the original, so the fix left the fail-open in place AND reddened nothing).
+  if (odd_trailing_bs(s)) { ACC = substr(s, 1, length(s) - 1); next }
+  ACC = ""
+  scan_unit(s, ACCFNR, ACCFILE)
+}
+END { flush_unit() }
+
+# flush_unit() — scan whatever the accumulator still holds, then clear it.
+function flush_unit() {
+  if (ACC == "") return
+  _fu = ACC; _ful = ACCFNR; _fuf = ACCFILE
+  ACC = ""
+  if (_fu ~ /^[ \t]*#/) return                # a comment unit declares nothing
+  scan_unit(_fu, _ful, _fuf)
+}
+
+# scan_unit(s, ln, fl) — scan ONE logical line. `ln`/`fl` are its FIRST physical line and THE FILE THAT
+# LINE LIVES IN, so every row points a reader at the declaration's own start rather than into the middle
+# of a continuation or at whichever file happens to be open now. (`fl` is passed, never derived from
+# `FILENAME`: see the `ACCFILE` note in the main rule. Three dead statements lived here — a `LN = ln`
+# immediately overwritten by `LN = ACCFNR`, and this `basename(FILENAME)` / `sub()` pair repeated — and
+# they are the mechanism of that wrong-file row, not cosmetic.)
+function scan_unit(s, ln, fl,   f, rest, name, pre, tail, raw, v, _nm, _p, _fr, _vv, _e, _t2) {
+  LN = ln                                     # rows report the declaration's FIRST physical line
+  f = basename(fl)
+  sub(/^[ \t]+/, "", s)
+  # ⛔ `return`, NOT `next` — `next` is ILLEGAL INSIDE A FUNCTION in awk (GNU awk
+  # accepts it as an extension; mawk rejects it at PARSE time). The CI runner's
+  # `awk` is mawk, so `next` here made the whole program unrunnable there: every
+  # arm below then read `claims=0` and 44 arms went red while the SAME file was
+  # green under gawk on a dev box. The two call sites make it equivalent —
+  # `scan_unit(...)` is the LAST statement of the main rule and of `flush_unit()`,
+  # so returning, or skipping to the next record, leaves the record finished
+  # either way. A comment unit declares nothing, which is what both mean here.
+  if (s ~ /^#/) return                        # documentation, never a declaration
+  # ⛔ A GLUED `printf -vNAME` IS THE SAME DECLARATION (review cycle 3, P2 — measured). bash accepts
+  # the option and its operand joined (`printf -vAGENT_X %d 83` assigns 83 into AGENT_X), and the
+  # token scan then found the family token ONE CHARACTER to the right of where it belongs: it matched
+  # from the `v`, so the name was `vAGENT_X_REFUSED` and `pre` was `printf -`, a position NEITHER
+  # `cmdpos` nor `residual` recognises (both anchor at `-v$`). The line fell through the one arm meant
+  # to fail closed: measured through the shipped scanner on a copy of the deploy unit,
+  # `printf -vAGENT_NEW_GATE_REFUSED %d 83` produced 0 rows of ANY class, the claim count stayed at
+  # 14 and the verdict was GREEN over a genuine duplicate of 83.
+  # Normalised on a COPY (`scan`), never on `s`: a row still reports the source as written, and
+  # `printf -v` followed by a space is the same command as the glued form, so nothing else moves.
+  scan = s
+  gsub(/printf[ \t]+-v/, "printf -v ", scan)
+  # ⛔ NO INLINE COMMENT IS STRIPPED — see the block above `row()` for the four measured fail-opens
+  # that each attempt to strip one produced. Discarding no text is what makes "nothing with an `=` can
+  # vanish" true by construction rather than by a model of bash that has to be right about `$'…'`,
+  # backticks, heredoc bodies, quotes spanning lines, and `$(…)` nesting — it was defeated by the
+  # fifth construct every time. The consequence, accepted deliberately: an inline comment naming a
+  # family token reads as a RED (a false red, the visible direction). Measured: 0 such lines exist in
+  # the shipped tree, so the real-tree scan is unchanged.
+  # ⛔ THE NAMING CONVENTION IS ASSERTED, NOT ASSUMED (review of PR #3237, finding 1). The claim scan
+  # below is anchored on the `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED` namespace, so a gate code
+  # declared under ANY OTHER NAME is invisible to it — measured: `AGENT_MEM_GATE=81`, a real duplicate
+  # of `AGENT_MEM_REFUSED`'s code, produced 0 rows and a GREEN verdict, while the file still
+  # contributed its other claims (so the required-declarer rule did not notice either). Reporting the
+  # convention as a STATED LIMIT would leave exactly the class this PR exists to close. So every
+  # declaration-position UPPERCASE `NAME=<70..89>` literal OUTSIDE the namespace is a `foreign` row,
+  # and `codes_verdict` REDs on it. Two filters keep it precise: the token must be in assignment
+  # position (`cmdpos`), and the OPERAND must READ AS a 70..89 code — so `MEM_BUDGET_PCT=75` in prose,
+  # `rc=75` lowercase, `FOO=$bar` and the like never appear. Measured on this tree it yields EXACTLY
+  # the 15 family claims and nothing else. ⛔ No arm pins that COUNT (`_cv_n` is only compared to 0),
+  # so this line is a MEASUREMENT, not an assertion — re-measure it when the deploy unit changes. It
+  # said 14 for one review round because nothing caught the drift, which is why the distinction is
+  # written down instead of the number being trusted.
+  # ⛔ THE OPERAND IS READ WITH `valof`, NOT MATCHED BARE (review of PR #3237, P2 at head 5e6ab20c).
+  # The first cut's regex required a BARE two-digit literal, so the SAME declaration red or green
+  # depending on how it was SPELLED — measured through the shipped predicate on a copy of the deploy
+  # unit, one appended line each:
+  #     AGENT_MEM_GATE=81        → RED   (foreign: spawn-gate.sh:AGENT_MEM_GATE=81)
+  #     AGENT_MEM_GATE="81"      → GREEN, 0 rows      ← a real duplicate of the memory gate's code
+  #     AGENT_MEM_GATE='81'      → GREEN, 0 rows
+  #     AGENT_MEM_GATE=081       → GREEN, 0 rows
+  #     AGENT_MEM_GATE=+81       → GREEN, 0 rows
+  # That is the exact class this file's header says was closed ("a verdict that depends on how a
+  # constant was SPELLED is not a guard"), left alive one filter deeper — so the operand now goes
+  # through the SAME reader the family path uses, with the numeric normalisation a shell applies to a
+  # value (`+81` and `081` ARE 81). STATED LIMIT (and it is TRUE): the foreign net resolves LITERALS
+  # only. An operand whose value is computed (`AGENT_MEM_GATE=$y`, `${OTHER:-81}`) reads as no code
+  # here — the family path can REFUSE such an operand because its name says a code belongs there, but
+  # applying that rule to every uppercase assignment in the tree would redden ordinary variables and
+  # buy a scanner nobody can run. The names that matter are in the family, where a computed operand
+  # is already `unknown`/RED. Likewise an operand that merely BEGINS with a code (`X=81abc`) is a
+  # STRING, not a declaration of a code, so the foreign net stays silent on it — under a FAMILY name
+  # the same operand is an `unknown` row and RED (measured: `AGENT_X_REFUSED=81abc` → `unknown`),
+  # which is where the fail-closed rule belongs. The one shape this narrowing drops, measured: the
+  # old regex reddened `X=81abc` as `foreign 81`; that was a side effect of its `([^0-9]|$)`
+  # terminator, not a code claim.
+  _fr = scan
+  _off = 0
+  while (match(_fr, /[A-Z_][A-Z0-9_]*/)) {
+    # ⛔ THE RESOLVED VALUE MUST NOT SURVIVE AN ITERATION (review round 4, P2 — measured). `_vv` is a
+    # function local assigned only on the paths that RESOLVE a value, so when a later name's operand
+    # is unreadable the PREVIOUS name's code is still in it and the `foreign` row below names a
+    # declaration that does not exist: `for A_GATE_MEM in 81; do :; done; for B_GATE_MEM in "$LIST";
+    # do :; done` reported `B_GATE_MEM=81`, while bash binds `B_GATE_MEM=a b`. A false claim about a
+    # SPECIFIC constant is worse than a generic red — a reader acting on it sanctions a name that
+    # declares nothing.
+    _vv = ""
+    _nm  = substr(_fr, RSTART, RLENGTH)
+    # ⛔ THE PREFIX MUST BE ABSOLUTE, NOT LOCAL TO THE REMAINDER (review round 4, measured). `_p`
+    # relative to the CURRENT `_fr` is the whole line only for the FIRST name; for a later one it is
+    # the text since the previous name (`=1 ` in `export A=1 B=81`), which no position test can
+    # recognise — so the multi-operand arm below could never fire. The offset makes every name be
+    # judged against the line as written.
+    _p   = substr(scan, 1, _off + RSTART - 1)
+    _off = _off + RSTART + RLENGTH - 1
+    _fr  = substr(_fr, RSTART + RLENGTH)
+    # ⛔ THE SKIP MUST BE THE *SAME* TEST THE CLAIM SCAN USES (review cycle 2, P2). A bare suffix test
+    # (`/_(REFUSED|…)$/`) skipped `_REFUSED` itself, while the claim scan's pattern requires a
+    # character BEFORE the suffix — so a name that IS the suffix fell out of BOTH nets: measured,
+    # `_REFUSED=81` → 0 rows, verdict GREEN (bash: `_REFUSED=81; exit "$_REFUSED"` → 81). One
+    # population, one predicate.
+    if (_nm ~ /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)$/) continue
+    if (forkw(_p) && _fr ~ /^[ \t]+in[ \t]/) {
+      # ⛔ THE FOREIGN NET WAS BLIND TO THE SAME SHAPE (review round 3, P2 — measured): the loop
+      # binding carries no `=`, and `cmdpos("for ")` is false, so `for AGENT_MEM_GATE in 81` emitted
+      # no row at all — the same code declared under a name outside the family, invisible. Read the
+      # operand from `in`, so the two nets see one population. ONE literal only: a LIST
+      # (`for N in 83 84`) does not durably hold a single code and must not be read as a declaration
+      # of its first element (that was a false RED, measured).
+      _t3 = _fr
+      sub(/^[ \t]+in[ \t]+/, "", _t3)
+      _t4 = valof(_t3)
+      _t5 = _t3
+      sub(/^["']/, "", _t5)
+      _t5 = substr(_t5, length(_t4) + 1)
+      if (iscode(_t4) && _t5 ~ /^["']?[ \t]*([;&]|$)/) _vv = _t4
+    } else {
+      if (!cmdpos(_p) && !decl_operand(_p) && !prefixonly(_p)) continue
+      _vv = codeval(_fr)
+    }
+    if (_vv != "") print "foreign", _nm, _vv + 0, f, LN
+  }
+  rest = scan
+  while (match(rest, /[A-Za-z_][A-Za-z0-9_]*_(REFUSED|BACKLOG|UNAVAILABLE|DEFERRED)/)) {
+    name = substr(rest, RSTART, RLENGTH)
+    # ⛔ A LONGER IDENTIFIER IS NOT THIS NAME (review of `8af952e0`, P2 — measured). The pattern above
+    # matches a PREFIX and has no name boundary after the suffix, so `AGENT_NEW_GATE_REFUSED_CHOICE`
+    # was read as a family token and refused as `unparseable declaration: <file>:<line>` — a false RED
+    # naming a variable that is not in the family at all. A name character immediately after the match
+    # means the token is LONGER than the family name, so the whole identifier is stepped over and the
+    # scan resumes after it (NOT at the match end, which would re-match an overlapping suffix and could
+    # skip a real declaration later on the same line).
+    if (substr(rest, RSTART + RLENGTH, 1) ~ /[A-Za-z0-9_]/) {
+      _e = RSTART
+      while (substr(rest, _e, 1) ~ /[A-Za-z0-9_]/) _e++
+      rest = substr(rest, _e)
+      continue
+    }
+    pre  = substr(rest, 1, RSTART - 1)
+    tail = substr(rest, RSTART + RLENGTH)
+    if (pre ~ /\$\{[ \t"']*$/) {               # inside ${...}
+      # Each operator is matched WHOLE, because its length differs and an off-by-one here silently
+      # reads `=83` as `83` on one spelling and as `=83` on another — measured on the first cut: the
+      # `${X=…}` form (no colon) came out `unknown` while `${X:=…}` was read correctly.
+      if      (tail ~ /^:=/)  row("claim", name, valof(substr(tail, 3)), f, LN)
+      else if (tail ~ /^=/)   row("claim", name, valof(substr(tail, 2)), f, LN)
+      else if (tail ~ /^:[-+]/ || tail ~ /^[-+]/) {
+        raw = (tail ~ /^:[-+]/) ? substr(tail, 3) : substr(tail, 2)
+        v = valof(raw)
+        if (v == "") {
+          # `${X:-}` has NO default — that is a bare read (lane.sh does exactly this), not a claim.
+          # But an operand that IS there and cannot be read must be REFUSED, not folded into that
+          # case: the first cut folded both, and `${X:-"81"}` passed as clean.
+          if (raw !~ /^}/ && raw !~ /^["']["']/) print "unparseable", name, s, f, LN
+        } else row("fallback", name, v, f, LN)
+      } else {
+        # A plain read inside braces (`${X}`, `${X#*=}`) — UNLESS it is a declaration shape this
+        # chain did not classify (`${X[0]:=83}`), which the residual arm REFUSES rather than drops.
+        residual(pre, tail, s, name, f, LN)
+      }
+    } else if (tail ~ /^\+=/) {
+      if (cmdpos(pre)) row("claim", name, valof(substr(tail, 3)), f, LN)
+      else             print "unparseable", name, s, f, LN
+    } else if (tail ~ /^=([^=]|$)/) {
+      # ⛔ `==` IS A COMPARISON, NOT A DECLARATION (review of `da2e2480`, P2 — measured). This arm took
+      # `((X==83))` because the tail begins with `=` and the value read as `=83` → an `unknown` RED. The
+      # arithmetic arm below already guarded this with `=([^=]|$)`; this one did not, so the SPACED form
+      # `(( X == 83 ))` was silent and the UNSPACED form was refused — the verdict held only by
+      # whitespace, and "`(( X == 83 ))` stays silent" was asserted by prose with no arm behind it.
+      # The exclusion is in the ARM CONDITION, not a `next`: `next` would skip the REST OF THE LINE and
+      # silently drop a second declaration on it, which is the fail-open class this scanner exists for.
+      if (cmdpos(pre)) {
+        v = selfdefault(name, substr(tail, 2))   # `X="${X:-83}"` — the house default idiom
+        if (v != "") row("claim", name, v, f, LN)
+        else          row("claim", name, valof(substr(tail, 2)), f, LN)
+      }
+      else             print "unparseable", name, s, f, LN
+    } else if (tail ~ /^:?[-+]/) {
+      print "unparseable", name, s, f, LN
+    } else {
+      # ⛔ NOT A FALL-THROUGH ANY MORE. This `else` used to be absent, and its absence is the P1: the
+      # line was dropped in silence, so the name read GREEN with no row while the code it declares
+      # collided with a sibling. See `residual` for the two shapes it now REFUSES.
+      residual(pre, tail, s, name, f, LN)
+    }
+    rest = tail
+  }
+}
+REFUSAL_AWK
+
+# The files that DECLARE a gate code in this deploy unit. Presence is not enough: each must actually
+# contribute a parsed claim, so this list cannot rot into naming a file that stopped declaring one,
+# and a file that vanishes from a `$O` copy is a RED rather than a quietly smaller scan.
+_codes_required="spawn-gate.sh brief-gate.sh adopt-fix.sh repo-target.sh key-gate.sh"
+# ⛔ `key-gate.sh` IS REQUIRED BECAUSE IT IS THE ONLY DECLARER OF 82 (#3331), and it arrived on main
+# while this branch was open. Without it in this list the "a vanished declarer is a RED" property was
+# FALSE for the newest code in the deploy unit: measured on the head a fresh review measured, deleting
+# `key-gate.sh` from a copy left `RC=0 claims=14 absent: none` — a CLEAN report over a code whose only
+# declarer was gone. (`lane.sh:274` FATALs if the file is missing, so no live lane misread it; the
+# defect is that the guard's stated population was not the population it checked.)
+# A declaration in the family that is NOT a 70..89 exit code, named EXACTLY, with its reason. Anything
+# not listed here is a RED: a new non-code in the family needs its own deliberate line. (The scanner
+# now READS the bookkeeping assignments it used to drop, so the four names below are the full set it
+# finds on this tree — each is a 0/1 or a status STRING, and nothing compares a shell status against
+# any of them. An `unparseable` row is deliberately NOT listable: no escape hatch from that one.)
+# ⛔ AND THE SET IS RE-DERIVED, NOT REMEMBERED. This list said "the three names below are the full
+# set" while `watchdog-loop.sh:RESTART_REFUSED` was already on the tree: the sentence was a
+# measurement nobody re-took, and nothing forced it to be. ⛔ THE RED WAS VISIBLE, NOT HIDDEN — a
+# first draft of this comment claimed "bash-shards never run on a main push", and that is FALSE:
+# `.github/workflows/ci-main.yml` runs this same shard list on every main push (`bash
+# scripts/run-bash-shards.sh`), and it reported these shards red — main run 42225299527 on cf3c46c6d
+# names `spawn-gate.test.sh`, `test-gates.sh`, `tests/ci-trigger-scope/run.sh` and
+# `tests/record-review/run.sh`. So the gap was never the signal; it was that a prose COUNT in a
+# list is a claim nobody re-derives. The next editor re-derives it in one command (the `REFUSAL_AWK`
+# heredoc above, over the deploy unit), which prints every family-shaped declaration whose value is
+# not a 70..89 code — i.e. exactly the population this list must name:
+#   awk '/^cat > "\$TMP\/refusal-codes.awk" <<.REFUSAL_AWK.$/{f=1;next} /^REFUSAL_AWK$/{f=0} f' \
+#     scripts/orchestrator-harness/spawn-gate.test.sh > /tmp/refusal-codes.awk
+#   awk -f /tmp/refusal-codes.awk scripts/orchestrator-harness/*.sh \
+#     | awk -F'\t' '$1=="unknown"'
+#   refresh-candidates.sh:SKIP_CHECKED_DEFERRED — a 0/1 bookkeeping flag that shares the spelling, not
+#   an exit code; nothing compares a shell status against it.
+#   refresh-candidates.sh:CHECKED_DEFERRED — the refresh funnel's own `deferred` COUNTER field (a
+#   number, a `-`, or the empty string), printed into the funnel line; not an exit code.
+#   refresh-candidates.sh:CHECKED_REFUSED — the funnel's `refused` field, which carries a WORD
+#   (`claim-registry-absent`) or `none`; not an exit code either.
+#   watchdog-loop.sh:RESTART_REFUSED — the watchdog's per-pass VERDICT FLAG (0/1), set wherever the
+#   pass declined to issue a restart verb and read at the one place that decides whether `main`
+#   restates that verdict (#1986). It never leaves the process as a status: nothing assigns it to a
+#   command's `$?` and every read is `-eq 1`. Measured on the tree that added the required-declarer
+#   rule for `key-gate.sh`: with it unlisted the scan emitted its 0/1 rows as `unknown` and the whole
+#   deploy-unit check read RED over a flag that declares no code.
+_codes_noncode="refresh-candidates.sh:SKIP_CHECKED_DEFERRED refresh-candidates.sh:CHECKED_DEFERRED refresh-candidates.sh:CHECKED_REFUSED watchdog-loop.sh:RESTART_REFUSED"
+# A declaration-position UPPERCASE `NAME=<70..89>` OUTSIDE the family namespace, named EXACTLY with its
+# reason (`file:NAME=code`). Empty on this tree, and that is ASSERTED below rather than assumed: the
+# derived filter yields exactly the family claims today, so the namespace costs nothing — and a future
+# non-gate numeric assignment written in declaration position must add its own deliberate line here
+# instead of silently widening the net. NEVER a blanket allowance, for the same reason
+# `_codes_sanctioned` is an equality.
+_codes_foreign_ok=""
+# The ONLY permitted shared codes, asserted as an EQUALITY so the table cannot rot into a blanket
+# allowance — a share that DISAPPEARS is red too, because it means an alias broke:
+#   78 = the cannot-verify pair (#2258): `PI_FORK_REFUSED` and `BRIEF_GATE_UNAVAILABLE` both mean
+#        "this run could not be verified".
+#   80 = ONE gate under two names: `BRIEF_GATE_REFUSED` is the code `brief-gate.sh` EXITS with and
+#        `AGENT_BRIEF_REFUSED` is the constant callers compare against. brief-gate.sh cannot source
+#        spawn-gate.sh (the helper is a spawn point, not a library), so the alias is kept by hand —
+#        and this line is what makes it a declared alias instead of a second collision.
+_codes_sanctioned="78=BRIEF_GATE_UNAVAILABLE,PI_FORK_REFUSED 80=AGENT_BRIEF_REFUSED,BRIEF_GATE_REFUSED"
+
+# ⛔ A FAILED SCAN IS NOT AN EMPTY ONE (review of `aab646c5`, P2 — measured). This was
+# `awk … 2>/dev/null`: awk's status was discarded and its diagnostics suppressed, so a file it could not
+# open (`chmod 000`, say) aborted the scan mid-list and the verdict came back `RC=0 claims=14
+# unparseable: none` — a CLEAN report over a population it had not read. The contract above is that an
+# unreadable declaration fails CLOSED; this is the same rule for an unreadable FILE. So the status is
+# checked and the diagnostic is left visible; a non-zero awk is an `unreadable` row that `codes_verdict`
+# reds on, never a quietly smaller scan.
+refusal_codes() {
+  _rc_out="$(awk -f "$TMP/refusal-codes.awk" "$1"/*.sh 2>"$TMP/refusal-codes.err")"
+  _rc_st=$?
+  if [ "$_rc_st" -ne 0 ]; then
+    printf 'unreadable\tawk\t(exit %s)\t%s\t0\n' \
+      "$_rc_st" "$(tr '\n\t' '  ' < "$TMP/refusal-codes.err" | sed -e 's/  */ /g' -e 's/^ //' -e 's/ $//' | cut -c1-200)"
+  fi
+  printf '%s\n' "$_rc_out"
+}
+
+# codes_for_name <NAME> — the code a claim declares, or EMPTY when nothing here declares that name.
+# EMPTY therefore means "forward-declared", never "I could not read it": an unreadable declaration is
+# an `unknown` row and a RED, so the two can never be confused.
+codes_for_name() { printf '%s\n' "$CODE_ROWS" | awk -F'\t' -v n="$1" '$1=="claim" && $2==n{print $3; exit}'; }
+
+# codes_verdict <dir> -> CODE_RC (0 = green), CODE_MSG (one line naming everything it read),
+#                        CODE_ROWS (the raw scanner output, reused by every other check here).
+codes_verdict() {
+  CODE_ROWS="$(refusal_codes "$1")"
+  _cv_claims="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="claim"')"
+  _cv_n="$(printf '%s\n' "$_cv_claims" | awk -F'\t' 'NF{n++} END{print n+0}')"
+  _cv_absent=""
+  for _cv_f in $_codes_required; do
+    [ -r "$1/$_cv_f" ] || { _cv_absent="$_cv_absent $_cv_f(absent)"; continue; }
+    printf '%s\n' "$_cv_claims" | awk -F'\t' -v f="$_cv_f" '$4==f{n++} END{exit !(n>0)}' \
+      || _cv_absent="$_cv_absent $_cv_f(declares no code)"
+  done
+  # ⛔ A SCAN THAT COULD NOT RUN IS NOT A CLEAN SCAN (review of `aab646c5`, P2 — measured). `refusal_codes`
+  # reports a non-zero awk as an `unreadable` row; without this reader that row was simply ignored and the
+  # verdict came back GREEN over a population it had not read (`chmod 000` on a file sorting last was
+  # measured to do exactly that). Same rule as an unreadable declaration: fail CLOSED, and name it.
+  # ONE item, taken whole: the diagnostic is prose with spaces, so a `for` over it would word-split the
+  # message into one "scan-unreadable:" per word (measured on the first cut).
+  _cv_unread=""
+  _cv_ur="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unreadable"{print $3" "$4; exit}')"
+  [ -n "$_cv_ur" ] && _cv_unread=" scan-unreadable:$_cv_ur"
+  _cv_unknown=""
+  for _cv_u in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unknown"{print $4":"$2}' | sort -u); do
+    case " $_codes_noncode " in *" $_cv_u "*) : ;; *) _cv_unknown="$_cv_unknown $_cv_u" ;; esac
+  done
+  # A declaration-shaped line the parser could NOT classify: RED and named with its LINE, and it has
+  # no sanction list on purpose (see the scanner's contract above) — the drop it replaces was exactly
+  # this case reported as nothing.
+  _cv_unparsed=""
+  for _cv_l in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="unparseable"{print $4":"$5}' | sort -u); do
+    _cv_unparsed="$_cv_unparsed unparseable declaration: $_cv_l"
+  done
+  # A reader's `${X:-N}` default must EQUAL the code declared for X: a default that lags the
+  # declaration mislabels every refusal that takes it, and it is invisible to a claims-only scan
+  # because it declares nothing itself. An UNDECLARED name is not a mismatch — that is a forward
+  # reference to a helper that is not in this copy (the same case `codes_for_name`'s EMPTY means).
+  # TWO PASSES, AND THE SECOND ONE IS THE ONLY REASON THIS CHECK CAN SEE A CALLER (blocking finding,
+  # review of `3a94b3b`, REPRODUCED before it was fixed). `refusal_codes()` emits rows in GLOB order,
+  # so every CALLER's fallback (`fix-one.sh`, `lane.sh`, `adopt-fix.sh`) is emitted BEFORE the
+  # `claim` row that declares it, because the declaration lives in `spawn-gate.sh` and sorts last. A
+  # single pass met each caller default while `decl` was still EMPTY, took the `!($2 in decl)`
+  # branch, and DROPPED the row: measured on the reviewed head, appending
+  # `true && _c="${AGENT_HARNESS_SKEW_REFUSED:-81}"` to `fix-one.sh` — the exact regression this
+  # check exists to catch — left the verdict GREEN with no `stale-defaults:` entry, while the SAME
+  # line appended to `spawn-gate.sh` (where the claim happens to precede it) went RED. So the rows
+  # are COLLECTED first and compared in `END`, once every claim has been read.
+  _cv_stale="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '
+    $1=="claim"    { decl[$2] = $3; next }
+    $1=="fallback" { _n++; _fn[_n] = $2; _fc[_n] = $3; _ff[_n] = $4; _fl[_n] = $5; next }
+    END {
+      for (_i = 1; _i <= _n; _i++)
+        if ((_fn[_i] in decl) && (decl[_fn[_i]] != _fc[_i]))
+          printf "%s:%s:%s=%s(want %s)\n", _fn[_i], _ff[_i], _fl[_i], _fc[_i], decl[_fn[_i]]
+    }
+  ' | sort | tr '\n' ' ')"
+  _cv_stale="${_cv_stale% }"
+  # A `NAME=<70..89>` in declaration position that is NOT in the family namespace: the claim scan
+  # cannot see it, so it is the blind spot the convention would otherwise hide (review of PR #3237,
+  # finding 1). Red unless sanctioned BY NAME above.
+  _cv_foreign=""
+  for _cv_g in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="foreign"{print $4":"$2"="$3}' | sort -u); do
+    case " $_codes_foreign_ok " in *" $_cv_g "*) : ;; *) _cv_foreign="$_cv_foreign $_cv_g" ;; esac
+  done
+  _cv_shared=""
+  for _cv_c in $(printf '%s\n' "$_cv_claims" | awk -F'\t' '{print $3}' | sort -un); do
+    _cv_ns="$(printf '%s\n' "$_cv_claims" | awk -F'\t' -v c="$_cv_c" '$3==c{print $2}' | sort -u | tr '\n' ',')"
+    _cv_ns="${_cv_ns%,}"
+    case "$_cv_ns" in *,*) _cv_shared="$_cv_shared $_cv_c=$_cv_ns" ;; esac
+  done
+  _cv_shared="${_cv_shared# }"
+  # ONE NAME, TWO CODES — THE MIRROR OF THE COLLISION, AND IT WAS GREEN (P1, review of `dcb499b7`).
+  # The rule above catches one CODE under two names; nothing caught one NAME under two codes, and its
+  # two readers then disagreed about which one is real: `codes_for_name` returns the FIRST claim row
+  # (`{print $3; exit}`), while the `_cv_stale` pass keeps the LAST (`decl[$2] = $3` overwrites) — and
+  # neither is necessarily the value the shipped shell ends up with after the second assignment runs.
+  # Measured on the reviewed head: appending `PI_GATE_REFUSED=85` after the live `PI_GATE_REFUSED=76`
+  # left the verdict at RC=0 with a clean `shared:` line, and `codes_for_name`/`_cv_stale` then
+  # disagreed with the runtime value. A single pass is correct HERE, unlike `_cv_stale` above: this
+  # compares claim to claim, so it does not depend on which file is read first.
+  _cv_conf="$(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '
+    $1=="claim" { if (($2 in decl) && (decl[$2] != $3)) printf "%s:%s:%s,%s\n", $2, $4, decl[$2], $3
+                  decl[$2] = $3 }
+  ' | sort | tr '\n' ' ')"
+  _cv_conf="${_cv_conf% }"
+  if [ -n "$_cv_absent$_cv_unknown$_cv_unparsed$_cv_stale$_cv_foreign$_cv_conf$_cv_unread" ] \
+     || [ "$_cv_shared" != "$_codes_sanctioned" ] || [ "$_cv_n" -eq 0 ]; then
+    CODE_RC=1
+  else
+    CODE_RC=0
+  fi
+  CODE_MSG="claims=$_cv_n absent:${_cv_absent:- none}${_cv_unread:+ $_cv_unread} unparseable:${_cv_unknown:- none}${_cv_unparsed:+ rejected:$_cv_unparsed}${_cv_stale:+ stale-defaults: $_cv_stale}${_cv_foreign:+ foreign:$_cv_foreign}${_cv_conf:+ conflicting-declarations: $_cv_conf} shared:${_cv_shared:- none}"
+}
+
+# Computed here so every reader below shares ONE parse: the chain gate table, the coverage verdict,
+# the uniqueness check and the arm table. Asserted where each property belongs (§ the class section).
+codes_verdict "$HERE"
+
 mkdir -p "$TMP/bin" "$TMP/O/state"
 LOG="$TMP/log"; PROMPT="$TMP/prompt"; PI_LOG="$TMP/pi.log"; MERGE_LOG="$TMP/merge.log"
 # ⛔ THE FIXTURE IS A REAL BRIEF NOW (agent-infra#2258). `run_agent` refuses a brief that carries no
@@ -48,6 +972,19 @@ bash "$HERE/brief-gate.sh" --check "$PROMPT" lane 2>/dev/null \
   || { echo "  ❌ the suite's own fixture brief is REFUSED by the gate — the fixture is not a brief" >&2; exit 1; }
 
 echo "==> spawn-gate self-test ($HERE)"
+
+# ── the MEMORY gate's neutraliser (agent-infra#2387) ───────────────────────────
+# EVERY arm in this suite except section 12 wants the memory gate out of the way, for exactly the
+# reason the disk arms pin `DISK_MIN_FREE_MB=1` below: a spawn assertion must be decided by its
+# SUBJECT, not by THIS HOST's free RAM. Without this, a memory-tight CI box would answer `81` to a
+# load-gate arm and the suite would report "load-gate regressions" that are not regressions. (`81`,
+# NOT `73`: 73 is `AGENT_FORK_REFUSED` on main. That literal is the one the review of #2591 caught in
+# `adopt-fix.sh`, and this file's §10 arms now drive both codes separately.) It is
+# exported once rather than repeated at fourteen call sites, and it is a FLOOR, not a switch: there
+# is still a comparison, still a probe and still a refusal path — section 12 drives all three, and
+# the DEFAULT floor is asserted there under `env -u MEM_MIN_AVAIL_MB` (the same idiom the disk arm
+# uses to prove the shipped default rather than a repaired constant).
+export MEM_MIN_AVAIL_MB=1
 
 # ── 1) the helper exists, parses, and is SOURCED (never executed) by its callers ─
 [ -s "$GATE" ] && bash -n "$GATE"; rc=$?
@@ -157,11 +1094,20 @@ scan_pi() { # scan_pi <pathspec...>  → space-separated repo-relative paths
   # rebasing this branch onto current `main`: `got_pi` carried `harness-refresh.sh`, i.e. a fourth
   # instance of the exact class this list exists for — a census that reddens on PROSE teaches the next
   # lane to ignore it. Excluded by name, with its own non-launcher assertion below.
+  # ⛔ `key-gate.sh` IS THE FIFTH OF THAT CLASS (#3443), and its prose is the one that CANNOT be reworded
+  # away: it is a CREDENTIAL assertion that launches nothing (it reads pi's own config files in
+  # python3), but #3443's remedy — the finding that actually worked on a cell — IS the model flag, so the
+  # file now PRINTS the working invocation (`pi -p --no-session --provider %s --model %s`) in its refusal
+  # prose and quotes it in its header. That string is the deliverable, not decoration, so declaring the
+  # file in EXPECTED_PI instead would assert the opposite of the truth (a census of launch paths does not
+  # contain a file with none). Found RED while landing #3443: `got_pi` carried `key-gate.sh`, so both
+  # EQUALITY arms below failed — a fix whose whole subject is one diagnostic line would have shipped a red
+  # bash shard. Excluded by name, with its own non-launcher assertions below.
   local p found="" FLAG
   FLAG='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
   while IFS= read -r p; do
     case "$p" in
-      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh) continue ;; esac
+      */retired/*|*/testdata/*|*.test.*|*/selftest.sh|*.md|*.txt|*.json|*.env|*/pi-done-not-exited.py|*/ai-drainer.sh|*/orphaned-harness.sh|*/harness-refresh.sh|*/key-gate.sh) continue ;; esac
     grep -qE -e "$FLAG" "$ROOT/$p" 2>/dev/null || continue
     grep -qF -e '--no-session' "$ROOT/$p" 2>/dev/null || continue
     found="$found $p"
@@ -252,6 +1198,24 @@ ck "the excluded orphaned-harness.sh is a NON-launcher (no spawn primitive; its 
 # a real `pi` launch added to it brings `exec pi`/`run_agent`/`nohup` with it and this arm goes RED.
 if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' "$HERE/harness-refresh.sh" 2>/dev/null; then rc=1; else rc=0; fi
 ck "the excluded harness-refresh.sh is a NON-launcher (no spawn primitive; its '-p' is 'ps -p'), so its census exclusion hides no launch path" $rc
+
+# …and the same proof for key-gate.sh, the fifth file of that class (#3443), in TWO arms because this
+# one's prose is CODE: the pair lives in `printf` FORMAT STRINGS, so stripping comments alone cannot
+# tell it from a launch (and stripping `#` first leaves an unmatched quote wherever the string contains
+# `#3443`, which truncates the line and makes a clean file read as a launcher — the order below is
+# deliberate). Arm 1 is the detector's own predicate over the file's CODE: comments AND single-quoted
+# strings stripped, pair absent. Arm 2 is the spawn-primitive form the two arms above use, over the
+# SAME stripped code because `run_agent`/`nohup` appear in this file's comments by design. Either arm
+# going RED means the file grew a launch path and must come back into the census. STATED LIMIT, the same
+# one the detector carries: a launch whose COMMAND NAME is assembled at runtime, and one written inside a
+# multi-line quoted string (which the line-oriented strip cannot close), are outside a grep's reach — the
+# runtime `run_agent` contract, not this census, is what covers those.
+_kg_flag='(^|[^[:alnum:]_-])(-p|--print)([^[:alnum:]_-]|$)'
+_kg_code="$(sed -e "s/'[^']*'//g" -e 's/#.*//' "$HERE/key-gate.sh" 2>/dev/null)"
+if grep -qE -e "$_kg_flag" <<<"$_kg_code" && grep -qF -- '--no-session' <<<"$_kg_code"; then rc=1; else rc=0; fi
+ck "the excluded key-gate.sh is a NON-launcher in CODE (the pi token pair lives in its printf remedy strings, so what matched is prose), so its census exclusion hides no launch path" $rc
+if grep -qE 'run_agent|nohup|subprocess|Popen|exec pi' <<<"$_kg_code"; then rc=1; else rc=0; fi
+ck "the excluded key-gate.sh carries no spawn primitive, so its census exclusion hides no launch path" $rc
 
 # ... and the ported callers must have no spawn logic of their own left behind.
 for f in lane.sh fix-one.sh; do
@@ -512,7 +1476,7 @@ chmod +x "$TMP/bin/pi"
 # ── 8) the gate RE-READS at the spawn, and a refusal is not a `pi` exit status ───
 # This is the whole point of the port: a chain-<N> worker dispatched on a quiet box may open its PR
 # 90 minutes later, and the reading that governs is the one taken at the spawn.
-got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+got="$(PATH="$TMP/bin:$PATH" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   MAX_LOAD=10
@@ -536,7 +1500,7 @@ ck "a spawn re-reads load (quiet dispatch, spiked spawn -> refused: '${got:-<non
 mkdir -p "$TMP/bin75"
 printf '#!/bin/sh\nexit 75\n' > "$TMP/bin75/pi"
 chmod +x "$TMP/bin75/pi"
-got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
+got="$(PATH="$TMP/bin75:$TMP/bin:$PATH" O="$TMP/O" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "0"; }
@@ -615,8 +1579,8 @@ printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # ── THE FORK INSTRUMENT, SEEDED INTO THIS RIG (agent-infra#2293 / #2843) ────────────────────────
 # ⛔ A RIG THAT SEEDS THE CALLERS BUT NOT THEIR INSTRUMENT IS A HALF-DEPLOYED BOX, and since the fork
-# floor became a REFUSAL (81 `AGENT_HARNESS_SKEW_REFUSED`) instead of a per-launch WARN, every arm
-# below that drives a caller with `O="$RO"` answers 81 — the SPREAD OF THE INSTRUMENT, not the load or
+# floor became a REFUSAL (83 `AGENT_HARNESS_SKEW_REFUSED`) instead of a per-launch WARN, every arm
+# below that drives a caller with `O="$RO"` answers 83 — the SPREAD OF THE INSTRUMENT, not the load or
 # disk gate those arms name. That is the same class this file already fights (round 3's HOME fix, the
 # §9 `_rigmiss` loop): a verdict decided by the host's configuration rather than by the code under
 # test. Locally `O`/`AGENT_INFRA_PATH`/`~/orchestrator` can supply the file from the AMBIENT box, so
@@ -626,7 +1590,7 @@ chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
 # its own suite (`capacity-placement.test.sh`); here the instrument only has to be PRESENT and HEALTHY.
 # ⛔ ONE DEFINITION, EVERY RIG THAT COPIES THE GATE (§11's `$RES` is the second caller). The `$RES` rig
 # copies `spawn-gate.sh` into a directory that holds no harness, drives the REAL `run_agent`, and seeds
-# its validator — but NOT this instrument. With the floor as a refusal, that copy answers 81 (nodeploy)
+# its validator — but NOT this instrument. With the floor as a refusal, that copy answers 83 (nodeploy)
 # BEFORE the capability resolver the arm exists to exercise ever runs, so the arm reported the SPREAD OF
 # THE INSTRUMENT as a capability-gate behaviour. It read green on a box whose ambient `AGENT_INFRA_PATH`
 # or `~/orchestrator` happened to supply the file and red on the runner, which is the same host-decides
@@ -641,9 +1605,9 @@ CAPEOF
   [ -f "$1/capacity.sh" ]
 }
 # …and assert it, so a future edit that drops the seed fails HERE naming the file, instead of
-# resurfacing as a bogus 81 two hundred lines later (the `_rigmiss` idiom, applied to the instrument).
+# resurfacing as a bogus 83 two hundred lines later (the `_rigmiss` idiom, applied to the instrument).
 seed_capacity_instrument "$RO"; rc=$?
-ck "the rig carries the fork instrument (a rig without it answers 81 for every load/disk arm)" $rc
+ck "the rig carries the fork instrument (a rig without it answers 83 for every load/disk arm)" $rc
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
 # ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
 # because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
@@ -739,16 +1703,12 @@ cp "$HERE/fix-one.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/gate-po
 # the validator is the same class as its dependency on spawn-gate.sh.
 cp "$HERE/fix-one.sh" "$RIG/stale/"
 cp "$HERE/brief-gate.sh" "$RIG/stale/"
-# ⛔ AND THE DELIVERY RENDERER, FOR THE SAME REASON AND WITH EVIDENCE (#2981). fix-one.sh now
-# HARD-REQUIRES `reviewer-preflight.sh --delivery-brief` and resolves it from `$SELF`, then
-# `$AGENT_INFRA_PATH`, then `~/.pi/agent` — so a rig that seeds `fix-one.sh` without it does not
-# exercise the refund at all: it falls through to an AMBIENT home. Measured on a clean clone of main
-# (709dfb06): the ambient checkout answered `--delivery-brief` with a usage line and the arm read
-# `rc=78, fixcount=2` — a "STALE helper" red that is really a half-seeded rig. On a CI runner, whose
-# HOME and `$AGENT_INFRA_PATH` hold no harness scripts, the same rig returns 78 for a second reason.
-# Neither is the behaviour under test, so the renderer travels with the fixture and the arm can no
-# longer pass or fail on what the box happens to have installed. What is meant to be stale here is
-# `spawn-gate.sh`'s refusal CONSTANTS, nothing else.
+# ⛔ AND THE DELIVERY-BRIEF RENDERER (agent-infra#2981), for the same reason one line up: main added it
+# as a HARD requirement of fix-one.sh (a missing renderer is 78, cannot run), so without it this stale
+# fixture exited 78 BEFORE reaching the gate and the arm read "the stale helper refused" while the
+# stale helper had never run. Measured at the merge: rc=78, fixcount left at 2. It is ALSO AMBIENTLY
+# reachable on a developer box (`$AGENT_INFRA_PATH`, then `~/.pi/agent`), so without seeding it the arm
+# would pass or fail on what the box happens to have installed — not on the stale constant it is about.
 cp "$HERE/reviewer-preflight.sh" "$RIG/stale/"
 sed -e 's/^AGENT_DISK_REFUSED=77$/# STALE PRE-#1765 HELPER: this constant does not exist/' \
     -e 's/return "\$AGENT_DISK_REFUSED"/return 77/' \
@@ -780,6 +1740,23 @@ grep -q 'fixer NOT started (disk gate' "$RO/logs/fix-7.log"; rc=$?
 ck "fix-one.sh NAMES the disk gate on a disk refusal (not the load gate)" $rc
 { [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "a disk-refused fixer starts no agent and does NOT re-run the merge chain" $rc
+
+# ... and the MEMORY refusal through the same caller (#2387). 81, refunded the same way, and NAMED as
+# memory: the third remedy is neither "wait for load" nor "reclaim disk" (a lane must FINISH), so a
+# caller that folds it into either sends the operator to a reading that will never move.
+fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; mrc=$?
+mgot="$(cat "$RO/state/fixcount-7" 2>/dev/null)"
+# ⛔ 81, NOT 73: 73 is `AGENT_FORK_REFUSED` on main, so this literal is the renumbered caller-facing
+# memory code. A test that pins the draft's number pins a code the gate no longer returns.
+{ [ "$mrc" -eq 81 ] && [ "$mgot" = "1" ]; }; rc=$?
+ck "fix-one.sh --argv on a MEMORY refusal exits 81 and REFUNDS the attempt (rc=$mrc, fixcount=${mgot:-<gone>})" $rc
+grep -q 'fixer NOT started (memory gate' "$RO/logs/fix-7.log"; rc=$?
+ck "fix-one.sh NAMES the memory gate on a memory refusal (not the load or disk one)" $rc
+{ [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
+ck "a memory-refused fixer starts no agent and does NOT re-run the merge chain" $rc
 
 # ... and the MANUAL path must refund NOTHING: it never incremented the counter, so refunding would
 # hand the controller a free attempt and the count would drift down forever.
@@ -861,7 +1838,7 @@ sleep 300 & LANDER_PID=$!
 printf '%s\n' "$LANDER_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
 rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc=$?
 [ "$plrc" -eq 0 ]; rc=$?
 ck "a fixer DEFERS (rc=0) when the LANDER holds the PR-owner lock (rc=$plrc) — contention is not a failure" $rc
@@ -887,7 +1864,7 @@ kill "$LANDER_PID" 2>/dev/null; wait "$LANDER_PID" 2>/dev/null
 sleep 0.05 & STALE_PID=$!; wait "$STALE_PID" 2>/dev/null
 printf '%s\n' "$STALE_PID" > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2=$?
 { [ "$plrc2" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q PI_SAW_LOCK "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG" && grep -q 'RECLAIMED a STALE claim' "$RO/logs/fix-7.log"; }; rc=$?
 ck "a STALE claim is TAKEN OVER, not refused: the fixer runs holding it and the chain re-runs (rc=$plrc2)" $rc
@@ -959,7 +1936,7 @@ ck "an unrestorable displacement is reported as its OWN outcome (rc=2 + a WARNIN
 # mid-claim. The fixer must treat it as LIVE: defer, and leave it exactly as it found it.
 : > "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc2b=$?
 { [ "$plrc2b" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an EMPTY claim record is treated as LIVE and DEFERS (rc=$plrc2b, no agent) — a lander mid-claim is not a dead one" $rc
@@ -985,7 +1962,7 @@ aged_empty() { # <writer> -> installs an AGED record at the fixer's lock path
 run_fixer() { # one fixer run against whatever record is installed; leaves PI_LOG/MERGE_LOG/log fresh
   fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
   rm -f "$RO/state/fixbail-7-"*
-  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+  ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
       PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1
 }
 aged_empty ': > "$PRLOCK7"'
@@ -1021,7 +1998,7 @@ ck "(9b-orphan) ...and the garbled record is left EXACTLY as found" $rc
 rm -f "$PRLOCK7"
 
 # ⛔ EVERY `prlock_defer` CAUSE IS MAPPED BY `adopt-fix.sh`, AND A REWORD SILENTLY UNMAPS IT (review of
-# #3096, P2 + the same class recorded at `fix-one.sh:411-414`). `adopt-fix.sh` matches the CAUSE TOKEN on
+# #3096, P2 + the same class recorded at `fix-one.sh:442-445`). `adopt-fix.sh` matches the CAUSE TOKEN on
 # the `[fix <PR>] DEFERRED: <cause>` line and maps each to an operator line + exit 79; a cause it does not
 # recognise gets NO line and exit 0 — SUCCESS reported for a run that pushed nothing. The orphan arm's two
 # new deferrals originally began `state/mergeclaim-…`, matching no arm at all. This pins the invariant
@@ -1044,7 +2021,7 @@ ck "(9b-orphan) …and no deferral is spelled with the raw lock path as its caus
 rm -f "$PRLOCK7"; mkdir -p "$PRLOCK7"
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"
 rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc4=$?
 { [ "$plrc4" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an UNUSABLE lock path (a directory) refuses before any agent runs (rc=$plrc4)" $rc
@@ -1064,7 +2041,7 @@ rmdir "$PRLOCK7" 2>/dev/null || rm -rf "$PRLOCK7"
 # exists for.
 RO3="$RIG/O3"; rm -rf "$RO3"; mkdir -p "$RO3/logs"; : > "$RO3/state"
 : > "$PI_LOG"; : > "$MERGE_LOG"
-( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO3" CIQ_STATE_DIR="$RO/state" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$RO3/state/mergeclaim-7.lock" bash "$HERE/fix-one.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; plrc5=$?
 { [ "$plrc5" -eq 0 ] && [ ! -s "$PI_LOG" ] && [ ! -s "$MERGE_LOG" ]; }; rc=$?
 ck "an UNWRITABLE state dir refuses before any agent runs (rc=$plrc5) — the second non-refundable arm" $rc
@@ -1078,7 +2055,7 @@ ck "...and names the CAUSE it measured (the create failed on an absent path), no
 # (otherwise merge-one.sh takes the same lock first and exits "already owns this PR", skipping the
 # fixer's own re-review — #2132's strand).
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/fix-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1; plrc3=$?
 { [ "$plrc3" -eq 0 ] && grep -q PI_RAN "$PI_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
 ck "POSITIVE CONTROL: with no lander the fixer RUNS and the chain is re-run (rc=$plrc3)" $rc
@@ -1104,7 +2081,7 @@ PI_STOP="$TMP/pi.stop"; rm -f "$PI_STOP"
 pi() { echo PI_RAN >> "$PI_LOG"; [ -n "${PRLOCK_PATH:-}" ] && [ -f "$PRLOCK_PATH" ] && echo PI_SAW_LOCK >> "$PI_LOG"; i=0; while [ "$i" -lt 600 ]; do [ -f "${PI_STOP:-/nonexistent}" ] && return 0; sleep 0.1; i=$((i+1)); done; return 0; }
 export -f pi
 fix_argv; printf '2\n' > "$RO/state/fixcount-7"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=60 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     PI_STOP="$PI_STOP" PRLOCK_PATH="$PRLOCK7" bash "$HERE/fix-one.sh" --argv "$RIG/argv7" ) >/dev/null 2>&1 & fixpid=$!
 i=0; while ! grep -q PI_RAN "$PI_LOG" 2>/dev/null && [ $i -lt 300 ]; do sleep 0.1; i=$((i+1)); done
 held="$(cat "$PRLOCK7" 2>/dev/null)"
@@ -1141,7 +2118,8 @@ export -f pi
 # ⛔ AND EVERY MODULE THE FIXER HARD-REQUIRES, NOT JUST THE TWO THE ARM IS ABOUT (review, P1).
 # `fix-one.sh` `exit 78`s without each of spawn-gate.sh (L54), brief-gate.sh (L62, resolved from
 # `$SELF` here, because spawn-gate.sh's `brief_gate_lib` prefers the script's OWN directory),
-# repo-target.sh (L69) and gate-policy.sh (L73). This rig seeded only four of the five, so the arm
+# repo-target.sh (L69), gate-policy.sh (L73) and — since #2981 — reviewer-preflight.sh (L75). This rig
+# seeded only four of the five it knew about, so the arm
 # returned 78 — a HALF-DEPLOYED BOX — and its assertions read as "the cross-box refusal is broken"
 # when the refusal was never reached (measured: `got 78`, on this tree and in CI). The two modules
 # this comment once left to luck are copied explicitly; the fallbacks `brief_gate_lib` also consults
@@ -1166,7 +2144,7 @@ done
 ck "the §9 rig carries every module fix-one.sh hard-requires (a rig missing one asserts a HALF-DEPLOYED refusal, not the claim refusal)" $rc
 printf '#!/bin/sh\nclaim_acquire() { CLAIM_RESULT="another box owns this head (test stub)"; return 1; }\n' > "$RO/claims.sh"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; rm -f "$RO/state/fixbail-7-"*
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arccb=$?
 [ "$arccb" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a CROSS-BOX claim refusal as 79 (got $arccb) — not SUCCESS for a run that pushed nothing" $rc
@@ -1184,7 +2162,7 @@ unset -f gh; unset 'BASH_FUNC_gh%%'
 # ⛔ AND DRIVE MORE THAN ONE CODE (P2, review round 2026-10-15, second pass). A 75-only assertion is
 # satisfied by a wrapper that HARDCODES 75 — which would report a crash as a load refusal and make the
 # controller re-dispatch for ever. The property under test is PROPAGATION, so 0 and 1 are driven too.
-cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$RO/"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" "$HERE/chain-merge.sh" "$HERE/adopt-fix.sh" "$HERE/gate-policy.sh" "$HERE/reviewer-preflight.sh" "$RO/"
 # …and the brief validator, because fix-one.sh now HARD-REQUIRES it (#2258): `brief_gate_lib` prefers
 # `$O/brief-gate.sh`, so a rig without it makes every code below come back 78 (cannot verify) instead
 # of the 75/77/0 the assertions are about. Same class as `spawn-gate.sh` on this line.
@@ -1200,21 +2178,66 @@ cp "$HERE/brief-gate.sh" "$RO/"
 # would be worse than none: the propagation arms invoke `bash "$HERE/chain-merge.sh"`, never
 # `$RO/chain-merge.sh`, so its only reachable outcome is a RED that no arm's behaviour earned.
 cp "$HERE/reviewer-preflight.sh" "$RO/"
-# chain-merge.sh waits up to 90 min for a PR, so `gh pr list` must answer on the FIRST poll.
+# ⛔ THE STUB MUST LIVE IN `$O/gh-limit/`, NOT IN `$RIG/bin` (P1, review of `87b8d708b`, finding 3 —
+# "§10's gh stub is inert", REPRODUCED before it was fixed). `chain-merge.sh:7` runs
+# `export PATH=/opt/homebrew/bin:/usr/local/bin:$PATH` and only THEN re-prepends `$O/gh-limit` /
+# `$O/gh-rest` — so a stub the RIG prepends is outranked by a real `/opt/homebrew/bin/gh` on every host
+# that has one. Measured on the reviewed head with an INSTRUMENTED stub: the stub log stayed EMPTY,
+# the real `gh` was called, no PR was ever found, and the wait fell through to the chain's OWN
+# "no PR appeared" `exit 1` — so `want=1` read a FALSE PASS (the chain's timeout code IS 1, the number
+# the row asserts) while `0` and `75` read reds that say nothing about the wrapper at all. That is the
+# instrument false positive under a comment diagnosing a verdict decided by the HOST's configuration.
+# `$O/gh-limit` is the production seam the chain ITSELF guarantees outranks the tool dirs (it is how
+# #1988's adapter is installed), so the arm uses it — and the stub LOGS, because a stub that is never
+# called is exactly the inert layer #1988 exists to prevent, and silence is how this arm rotted.
+GH_LOG="$TMP/ghstub.log"
+# …`$RIG/bin/gh` is kept for the arms that do NOT prepend the tool dirs (adopt-fix and the fixers);
+# it is NOT what `chain-merge.sh` resolves, which is the whole point of the seam below.
 printf '#!/bin/sh\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/gh"
+mkdir -p "$RO/gh-limit"
+printf '#!/bin/sh\necho "GH_STUB: $*" >> "%s"\ncase "$1 $2" in "pr list") echo 7 ;; *) exit 1 ;; esac\n' "$GH_LOG" > "$RO/gh-limit/gh"
+chmod +x "$RO/gh-limit/gh"
 # ⛔ THE STUB'S STATUS IS A DELIBERATE STAND-IN, NOT A CLAIM ABOUT merge-one.sh: the shipped
 # merge-one.sh ends on a reporting `echo` and contains no `exit 75` (0 hits), so it returns 0 on the
 # paths that reach its end. Its early guards DO exit 1/2/3/4, and those propagate through this wrapper
 # today; the 75 arm is forward-looking until the blocked #8521 half lands in merge-one.sh. That
 # residual is recorded in port-provenance.txt — this check pins the WRAPPER, which is what changed.
+# ⛔ AND THE ARM ASSERTS THE PATH WAS TRAVELLED, not just the number returned: the stub must be CALLED
+# and merge-one.sh must have RUN. Without that pair a future PATH change silently restores the inert
+# stub, and `want=1` goes back to being indistinguishable from the chain's own timeout.
+# ⛔ AND BOTH WAITS ARE BOUNDED HERE, because finding the PR is what UNLOCKS them (P1 follow-up,
+# measured; corrected by the review of `3a94b3b`, which measured the premise below to be FALSE). Once
+# the stub answers, `chain-merge.sh` no longer exits on its own no-PR timeout — it runs the REAL path,
+# and that path has TWO waits, neither of which these rows are about (they assert PROPAGATION):
+#   1. the PHASE wait (`chain-merge.sh:389`, `while [ ! -f "$PR_PHASE" ] && … PHASE_GRACE`). The rig has
+#      NO `lanemerge-<PR>.phase` marker (`$RO/state` is empty of one: this file mentions `.phase`
+#      nowhere else), so the loop is not skipped — it spins out the DEFAULT `PHASE_GRACE=90` at
+#      `CHAIN_POLL=1s`. That is ~90 s PER ARM, ~4.5 min for the three. Measured on `3a94b3b`: the
+#      three arms finished at 03:12:47, 03:14:27 and 03:16:02 — ~95-100 s each.
+#   2. the HANDOFF wait (`chain-merge.sh:422`, `while [ "$waited" -lt "$HANDOFF_WAIT" ]`) — reachable
+#      only when a marker DOES exist; bounded
+#      anyway so a future fixture that plants one cannot make the arm unbounded.
+# `LANE_PHASE_GRACE=1` bounds the first (the one that actually burns today) and `LANE_HANDOFF_WAIT=1`
+# the second — the same class of bound as `CHAIN_POLLS=1` below, stated for the same reason: an arm
+# that hangs is an arm nobody runs. ⛔ The earlier comment here claimed the rig "carries a
+# `lanemerge-<PR>.phase` marker from the earlier arms" and that the bound covered "one 1s tick"; both
+# were false, which is why the arm stayed the slowest thing in the suite while asserting a bound that
+# did not exist.
 for want in 0 1 75; do
-  : > "$MERGE_LOG"
-  ( cd "$RREPO" && O="$RO" MERGE_RC="$want" PATH="$RIG/bin:$PATH" \
+  : > "$MERGE_LOG"; : > "$GH_LOG"
+  # ⛔ `MERGE_LOG` IS PASSED IN ON PURPOSE: the merge-one stub is written in SINGLE quotes, so it reads
+  # `$MERGE_LOG` from the ENVIRONMENT at run time (that is how every other arm here drives it) — an
+  # arm that asserts on its output without exporting the path asserts on nothing.
+  ( cd "$RREPO" && O="$RO" MERGE_RC="$want" CHAIN_POLLS=1 CHAIN_POLL_SECS=1 CHAIN_POLL=1 \
+      LANE_PHASE_GRACE=1 LANE_HANDOFF_WAIT=1 MERGE_LOG="$MERGE_LOG" PATH="$RIG/bin:$PATH" \
       bash "$HERE/chain-merge.sh" "$RREPO" "daniel-ospina/agent-infra" 7 work ) >/dev/null 2>&1; crc=$?
-  [ "$crc" -eq "$want" ]; rc=$?
-  ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — not a constant" $rc
+  { [ "$crc" -eq "$want" ] && grep -q 'GH_STUB: pr list' "$GH_LOG" && grep -q MERGE_ONE_RAN "$MERGE_LOG"; }; rc=$?
+  ck "chain-merge.sh propagates merge-one.sh's status $want (got $crc) — its gh stub was actually CALLED and merge-one.sh really RAN, so this is propagation and not the chain's own timeout" $rc
 done
+# ...and the seam is removed again: `$O/gh-limit` is on the chain's PATH for EVERY gh call, so leaving
+# it behind would divert the adopt-fix arms below onto a stub written for this one arm.
+rm -rf "$RO/gh-limit"
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=0 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc=$?
@@ -1239,7 +2262,7 @@ ck "adopt-fix.sh reports 0 when the fixer RAN and succeeded (got $arc0) — not 
 sleep 300 & ADOPT_LANDER=$!
 printf '%s\n' "$ADOPT_LANDER" > "$RO/state/mergeclaim-7.lock"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79=$?
 [ "$arc79" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS for a run that pushed nothing" $rc
@@ -1247,7 +2270,7 @@ ck "adopt-fix.sh reports a PR-OWNER deferral as 79 (got $arc79) — not SUCCESS 
 # who reads only adopt-<PR>.log unless this wrapper names it.
 rm -f "$RO/state/mergeclaim-7.lock"; mkdir -p "$RO/state/mergeclaim-7.lock"
 : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
-( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
     bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arc79b=$?
 [ "$arc79b" -eq 79 ]; rc=$?
 ck "adopt-fix.sh reports an UNUSABLE PR-owner lock as 79 (got $arc79b) — not SUCCESS" $rc
@@ -1270,6 +2293,58 @@ printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO
 ck "adopt-fix.sh propagates the DISK refusal 77 (got $arc2) — not normalised to a load refusal" $rc
 grep -q 'DISK gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "adopt-fix.sh names the DISK gate on a disk refusal" $rc
+# ⛔ THE MEMORY AND FORK ARMS (review of #2591, P1 — THE ARM THIS SUITE NEVER DROVE). The 75 and 77
+# arms above were green while `adopt-fix.sh` keyed its MEMORY branch on the literal `73`, which is
+# AGENT_FORK_REFUSED on main: a box out of PROCESSES was reported as "memory" (the OPPOSITE remedy —
+# wait for lanes to finish, on a box that cannot start the retry), and a REAL memory refusal (81)
+# matched no arm and wrote no line into `adopt-<PR>.log`, the one log the manual operator reads
+# (#1720). Neither code was ever driven here, which is exactly why it passed. Both are driven now, and
+# each asserts BOTH directions: its own gate is named, AND the other's is not.
+#
+# 81 (the memory gate). `MEM_MIN_AVAIL_MB=999999999` refuses the floor arm on any host — the mem gate is
+# a FLOOR, so an impossible floor is a deterministic refusal rather than a reading-dependent one, and
+# it runs BEFORE the load gate, so `MAX_LOAD=999999999` keeps this arm from being a load refusal.
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arcm=$?
+[ "$arcm" -eq 81 ]; rc=$?
+ck "adopt-fix.sh propagates the MEMORY refusal 81 (got $arcm) — not normalised to a load refusal" $rc
+grep -q 'fixer NOT started (MEMORY gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the MEMORY gate on a memory refusal (81 was silent without this arm)" $rc
+grep -q 'FORK gate' "$RO/logs/adopt-7.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and does NOT report the memory refusal as a FORK refusal (each code has its own remedy)" $rc
+# 73 (the fork gate). A genuinely starved box cannot be manufactured on a CI host, so the fork gate's
+# INSTRUMENT is what is stubbed, not its verdict: `spawn_fork_state` consumes
+# `cap_procs_pair_vars`/`cap_h_for_vars` from `capacity.sh`, and `spawn_gate_load_capacity` searches
+# `$O` FIRST — so a copy at `$RO` is the gate's own documented seam, and what is still being driven is
+# the real `run_agent` -> real fork arm -> real `fix-one.sh` `exit "$ar"` -> real `adopt-fix.sh`.
+cat > "$RO/capacity.sh" <<'CAPSTUB'
+cap_procs_pair_vars() { printf -v "$1" '%s' 15840; printf -v "$2" '%s' 15841; printf -v "$3" '%s' fixture; return 0; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( ${2:-0} - ${1:-0} ))"; return 0; }
+# ⛔ THE THIRD REQUIRED FUNCTION (merge onto main): `SPAWN_GATE_CAP_NEEDS` demands all three, so this
+# rig — added by #2591 while this branch was open, and therefore unseen by the sweep that seeded every
+# OTHER fork-driver fixture — went INCOMPLETE, and an incomplete module is `nodeploy` (83), not the fork
+# refusal (73) these three arms assert. Seeding it is the same correction, one fixture further out.
+cap_fork_probe() { return 0; }
+CAPSTUB
+printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
+( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
+    DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 MEM_MIN_AVAIL_MB=1 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+    bash "$HERE/adopt-fix.sh" "$RREPO" "daniel-ospina/agent-infra" 7 adoptbranch ) >/dev/null 2>&1; arcf=$?
+[ "$arcf" -eq 73 ]; rc=$?
+ck "adopt-fix.sh propagates the FORK refusal 73 (got $arcf) — it is a capacity code of its own" $rc
+grep -q 'fixer NOT started (FORK gate)' "$RO/logs/adopt-7.log"; rc=$?
+ck "adopt-fix.sh NAMES the FORK gate on a fork refusal" $rc
+grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
+grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
+ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
+rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
 
 : > "$MERGE_LOG"
 
@@ -1304,6 +2379,25 @@ ck "lane.sh NAMES the load gate on a load refusal" $rc
 ck "lane.sh on a DISK refusal exits 77 (got $lrc2) — not reported as a load refusal" $rc
 grep -q 'DISK gate refused' "$RO/logs/lane-9999.log"; rc=$?
 ck "lane.sh NAMES the disk gate on a disk refusal" $rc
+# ... and the MEMORY arm: 81 propagates out of lane.sh, the refusal line NAMES the memory gate, and
+# the capacity record carries `gate=mem`. That last field is not decoration: chain-merge.sh reads it
+# to decide whether a peer box may take the issue, and `mem` is TRANSFERABLE (a peer with free RAM can
+# run this work) while `land` is not — so collapsing it into `load` would be right by luck and
+# collapsing it into `disk` would hold the issue for a whole yield window on a peer that is fine.
+: > "$PI_LOG"; : > "$RO/logs/lane-9999.log"; rm -f "$RO/state/capacity-refused-9999"
+# ⛔ FROM THE WORKTREE ON `work` TOO — the same defect the note above says was fixed for the load and
+# disk arms, left in this third one (measured at the merge: rc=72, the BRANCH assertion, so the memory
+# arm asserted a gate it never reached). `$RREPO`'s HEAD is `main`; lane.sh is told `work`.
+( cd "$RREPO/.worktrees/fix-7" && O="$RO" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 \
+    PATH="$RIG/bin:$PATH" PI_LOG="$PI_LOG" \
+    bash "$HERE/lane.sh" 9999 work daniel-ospina/agent-infra ) >/dev/null 2>&1; lrc3=$?
+[ "$lrc3" -eq 81 ]; rc=$?
+ck "lane.sh on a MEMORY refusal exits 81 (got $lrc3) — not reported as a load or disk refusal" $rc
+grep -q 'MEMORY gate refused' "$RO/logs/lane-9999.log"; rc=$?
+ck "lane.sh NAMES the MEMORY gate on a memory refusal" $rc
+capgate="$(cut -f3 "$RO/state/capacity-refused-9999" 2>/dev/null)"
+[ "$capgate" = "mem" ]; rc=$?
+ck "the capacity record carries gate=mem, not load/disk (read by chain-merge.sh: '${capgate:-<none>}')" $rc
 
 # ── THE CAPABILITY GATE (agent-infra#2935) — the wiring, not the probe ───────────────────────
 # The probe's own arms live in `cell-lane-preflight.test.sh` (stub `pi`: answer+return, answer+never
@@ -1412,7 +2506,7 @@ ck "a probe that produced NO verdict at all with rc=1 WARNS and dispatches (rc=$
 # CALLER refuses on it, so the two halves cannot drift apart in either direction.
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 LANE_PREFLIGHT_BOUND=45s CELL_PREFLIGHT_SH="$HERE/cell-lane-preflight.sh"
-{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+{ [ "$CRC" -eq 83 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
 ck "an UNREADABLE usage path (bad \$LANE_PREFLIGHT_BOUND) is REFUSED, not dispatched (rc=$CRC)" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and the remedy names what a usage error actually is — helper/consumer skew, not the extension set" $rc
@@ -1444,17 +2538,37 @@ ck "a GENUINE why=no-answer still WARNS and dispatches (rc=$CRC) even with a hos
 # 3300 s slot this gate exists to protect. Reachable in the version-skew direction the probe's own
 # header names as the production cause (a NEW caller against an OLD deployed helper: a rejected
 # `--bound` exits 2 printing nothing) and from a truncated/corrupt copy (`bash <file>` on broken syntax
-# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 81 (not 71: 71 sends the
+# exits 2 with no stdout). Both are the HELPER PAIR, so it refuses under 83 (not 71: 71 sends the
 # operator to repair the BOX and then to dispatch the item to a peer that runs the same pair).
 mkfake '' 2
 : > "$LOG"
 cap_run LANE_PREFLIGHT=1 CELL_PREFLIGHT_SH="$TMP/fake-preflight.sh"
-{ [ "$CRC" -eq 81 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
-ck "a probe that RAN and exited 2 with NO verdict is REFUSED 81 and starts NO agent (rc=$CRC)" $rc
+{ [ "$CRC" -eq 83 ] && [ ! -s "$PI_LOG" ]; }; rc=$?
+ck "a probe that RAN and exited 2 with NO verdict is REFUSED 83 and starts NO agent (rc=$CRC)" $rc
 grep -q 'rc=2 with NO verdict' "$LOG"; rc=$?
 ck "...and the log names the rc=2 reading, so the operator is not left with an unexplained refusal" $rc
 grep -q 'VERSION SKEW' "$LOG"; rc=$?
 ck "...and names the pair as the cause (skew/corrupt copy), not the box's pi or credential" $rc
+# (g5) ⛔ NO COMMENT ON A SKEW ARM MAY STATE A STALE CODE (review of PR #3237, finding 4). Two
+# comments on the very branches that now `return $AGENT_HARNESS_SKEW_REFUSED` still said the skew
+# refusal "is 81", nine days after 81 was taken by the memory gate. A comment is a CONTRACT to the next
+# reader: the lane that republishes the remedy takes the number from it, so a stale one re-ships the
+# collision this change exists to end — and nothing could see it, because the CODE was right and only
+# the prose was wrong. The check is DERIVED from the constant (a renumber follows it automatically)
+# and it matches the ASSERTION, not the digits — `:818` and the constant's own "83, NOT 81" rationale
+# do not trip it. The region is the whole capability gate from the reason table to the skew return, so
+# BOTH stale sites are inside ONE range; the range is asserted non-empty AND asserted to contain a
+# numeric claim, because a range that matched nothing (or a rewording that split the number from
+# `EXITS`) would otherwise report "no stale code" over nothing at all.
+_skewcode="$(codes_for_name AGENT_HARNESS_SKEW_REFUSED)"
+_sarm="$(sed -n '/case "\$_pf_reason" in/,/return "\$AGENT_HARNESS_SKEW_REFUSED"/p' "$GATE")"
+_skewclaims="$(printf '%s\n' "$_sarm" | grep -oE '(EXITS|REFUSE under|refuses under) [0-9][0-9]' | grep -oE '[0-9][0-9]$' | sort -u | tr '\n' ' ')"
+_stalecodes=""
+for _sn in $_skewclaims; do
+  [ "$_sn" = "$_skewcode" ] || _stalecodes="$_stalecodes $_sn"
+done
+{ [ -n "$_skewcode" ] && [ -n "$_sarm" ] && [ -n "${_skewclaims// /}" ] && [ -z "$_stalecodes" ]; }; rc=$?
+ck "no comment on a SKEW arm states a code other than the constant's ($_skewcode; arm region: $(printf '%s' "$_sarm" | wc -l | tr -d ' ') lines; numeric claims read: [${_skewclaims}] ; stale:${_stalecodes:- none})" $rc
 # (h) A REFUSAL RESTORES THE CALLER'S JOB CONTROL. `set -m` is turned on above the gate and restored
 # after the launch, so the early return was the one path that left the caller with job control ON —
 # and with it on, an async command in the caller no longer gets its stdin from /dev/null (#2163).
@@ -1490,12 +2604,28 @@ cp "$HERE/brief-gate.sh" "$RES/brief-gate.sh"
 # ⛔ AND THE FORK INSTRUMENT, FOR EXACTLY THE SAME REASON (measured 2026-11-04: this arm alone went red
 # on the runner while the whole file was green locally). Same class as the `$3042` note above and the
 # `$RO` seeder: `run_agent` reads the fork floor BEFORE it reaches the capability probe, and since that
-# floor REFUSES when its instrument is unresolvable, a gate copy in a bare directory answers 81 and the
-# resolver under test never runs. The arm then asserts 71 against 81 — a verdict about the SPREAD of
+# floor REFUSES when its instrument is unresolvable, a gate copy in a bare directory answers 83 and the
+# resolver under test never runs. The arm then asserts 71 against 83 — a verdict about the SPREAD of
 # `capacity.sh`, not about the resolver. It passed on any box whose ambient `AGENT_INFRA_PATH` or
 # `~/orchestrator` supplied the file and failed on a bare runner, so the host decided it.
 seed_capacity_instrument "$RES"; rc=$?
-ck "the resolver rig carries the fork instrument too (a bare gate copy answers 81 before the probe runs)" $rc
+ck "the resolver rig carries the fork instrument too (a bare gate copy answers 83 before the probe runs)" $rc
+# ⛔ AND A CREDENTIAL, BECAUSE THE PROBE REFUSES BEFORE IT MEASURES WITHOUT ONE (#3237). This is the
+# ONLY arm that runs the REAL `cell-lane-preflight.sh`, and that helper gates on the provider key
+# BEFORE it spawns `pi` (`why=keys-unreadable`, exit 2 → the caller's 71). Every other arm presets
+# `CELL_PREFLIGHT_SH` with a canned verdict line, so this rig inherited its key from the HOST: a
+# developer box carries `DEEPSEEK_API_KEY` or `$CELL_HOME/keys.env`, a CI runner carries neither — so
+# the arm read the box's credential INVENTORY instead of the resolver, reddened every PR with `rc=71`
+# and NO `why=no-return` (the arm's own assertion), and the probe it exists to prove never ran.
+# Measured 2026-11-04 on run 41812409320 / job 126514662405: `(rc=71)`, red. Reproduced locally by
+# unsetting CELL_HOME and DEEPSEEK_API_KEY: `LANE_CAPABILITY=refused why=keys-unreadable path=<none>`.
+# The subject is still the CAPABILITY resolver, so the credential that gates it travels with the rig
+# for the same reason the validator above does — and the ambient copies are DROPPED for the same
+# reason `unset -f pi` below drops the suite's stub: a key that wins from the host puts the host back
+# into the measurement. The two names are the shipped default's leg (`provider=deepseek model=
+# deepseek-flash`) and the documented cold-class leg (`docs/providers.md` §8); a THIRD leg becoming
+# the default reddens this arm loudly instead of letting it pass for a box's sake.
+printf 'DEEPSEEK_API_KEY=sk-rig-not-a-credential\nVENICE_API_KEY=sk-rig-not-a-credential\n' > "$RES/keys.env"
 cat > "$RES/bin/pi" <<'PIHANG'
 #!/bin/sh
 case "$1" in --version) echo 9.9.9-stub; exit 0 ;; esac
@@ -1503,8 +2633,9 @@ sleep 600
 PIHANG
 chmod +x "$RES/bin/pi"
 : > "$LOG"
-env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
-  LANE_PREFLIGHT_BOUND=2 \
+env -u CELL_PREFLIGHT_SH -u CELL_PREFLIGHT_BOUND -u CELL_HOME -u DEEPSEEK_API_KEY -u VENICE_API_KEY \
+  PATH="$RES/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 KIND=fixer LANE_PREFLIGHT=1 \
+  LANE_PREFLIGHT_BOUND=2 LANE_PREFLIGHT_KEYS="$RES/keys.env" \
   bash -c '
     . "$1"
     LOG="$2"; PROMPT="$3"
@@ -1623,11 +2754,11 @@ chain_probe() { # <gate-word> -> sets CHAIN_RC and CHAIN_REMEDY (the gate the ch
 }
 # `<gate-word>:<CONSTANT-NAME>` — the value is read from the helper, so a RENUMBER here is followed
 # rather than pinned twice, and an absent constant shows up as an empty `want` (red), not as a pass.
-_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED"
+_gate_expected="capability:AGENT_CAPABILITY_REFUSED fork:AGENT_FORK_REFUSED load:AGENT_LOAD_REFUSED land:AGENT_LAND_BACKLOG disk:AGENT_DISK_REFUSED skew:AGENT_HARNESS_SKEW_REFUSED key:KEY_GATE_REFUSED mem:AGENT_MEM_REFUSED"
 _seen=""; _exercised=""
 for _pair in $_gate_expected; do
   _g="${_pair%%:*}"; _c="${_pair##*:}"
-  _want="$(sed -n "s/^${_c}=//p" "$GATE" | head -1)"
+  _want="$(codes_for_name "$_c")"
   chain_probe "$_g"
   [ -n "$_want" ] && [ "$CHAIN_RC" = "$_want" ]; rc=$?
   ck "chain-merge reports a '$_g' refusal as its own code (want=$_want got=$CHAIN_RC)" $rc
@@ -1636,6 +2767,182 @@ done
 _dups="$(printf '%s\n' $_seen | sort | uniq -d | tr '\n' ' ')"
 [ -z "${_dups// /}" ]; rc=$?
 ck "no two gates share an exit code at the chain (codes:${_seen}; duplicates:${_dups:- none})" $rc
+
+# ⛔ THE POPULATION IS DERIVED TOO, NOT REMEMBERED (P2, review of `dcb499b7`). The rows above are
+# correct, but until this arm existed nothing FAILED when a caller gained a gate WORD without a row:
+# `chain-merge.sh` normalises an unrecognised word to `load` (`*) _cap_rc=75`, the documented
+# corruption fallback), so a sixth gate would be published with the load remedy to the operator, and
+# no check noticed — precisely the hand-maintained-list defect the preamble names as a root cause.
+# The set is derived from the CALLERS' own assignments: `lane.sh` is the ONLY writer of the record's
+# third field (`:955` — `lane_standdown_write "$_cap_gate" …` — writes it into `state/capacity-refused-<N>`) and `chain-merge.sh` is
+# its only consumer, so `_cap_gate=<word>` over those two files is the population. Both directions
+# are required (a word with no row is unchecked; a row with no word is a dead assertion), and the
+# non-vacuity clause is what stops an EMPTY derivation from passing as equality.
+# ⛔ BUT `_cap_gate=<word>` IS NOT THE ONLY SEAM A GATE WORD ARRIVES THROUGH (P1, fresh review of
+# `1f45677f`). #3331 landed `key` on main while this branch was open and records it through
+# `lane_standdown_write key …` (`lane.sh:827`), NOT through a `_cap_gate=key` arm — so a derivation built
+# only from `_cap_gate=` saw SIX words while the deploy unit carried SEVEN, and `_gate_expected` had six
+# too. The two sides agreed by AGREEING TO SAY NOTHING: measured on that head, the arm read
+# `derived: 'capability disk fork land load skew'` and the duplicate check's `codes:` list was
+# `71 73 75 74 77 83` — **82 did not appear anywhere**, so `key` could have been published with the load
+# remedy and no check would have noticed. That is this section's own defect, re-instantiated by the
+# newest code in the tree. So the population is derived from every seam that can PRODUCE a word:
+#   1. `_cap_gate=<word>`             — lane.sh's code-classification arms
+#   2. `lane_standdown_write <word>`  — a literal word passed straight to the record writer (#3331's form)
+#   3. `printf '<word>'` in `cap_refusal_gate` — the chain's own normaliser arm for that word
+# A new gate must arrive through one of them to be recordable at all, and arriving through one of them
+# with a LITERAL word — bare, single- or double-quoted, digits and underscores included — puts it in
+# this set, where a missing row is RED.
+# ⛔ THE LIMIT OF A STATIC DERIVATION, STATED BECAUSE THE UNIVERSAL FORM OF THIS SENTENCE WAS FALSE
+# (P3, fifth fresh review of `af50e80c`). An operand written as a SUBSTITUTION is treated as a REPLAY
+# and is NOT resolved: `_cap_gate=$(gate_word_for "$rc")`, `_cap_gate=$(echo land2)`,
+# `_cap_gate="${X:-land2}"`, `_cap_gate=$'land2'` and `_cap_gate=$gate_word` all RECORD a word at run
+# time, and all of them are invisible here — the derived set stays identical to baseline and the
+# equality above passes. That is deliberate and not closable by another exclusion: the one operand this
+# MUST keep out is `_cap_gate="$(cap_refusal_gate)"` (`chain-merge.sh:259`, a genuine replay, excluded
+# as intended), and it is TEXTUALLY INDISTINGUISHABLE from `_cap_gate=$(echo land2)`. A rule that keeps
+# the real replay out absorbs the substituting gate; a rule that admits the substitution reds the
+# shipped seam. So the derivation covers LITERAL spellings only, and the honest boundary is stated here
+# rather than claimed away. ⛔ THIS IS NOT A LIVE DEFECT: every gate word in the deploy unit is a bare
+# literal (`fork disk land skew capability load` on `_cap_gate=`, `key` on the standdown call), so the
+# population is exactly the seven rows. The durable form — classify-or-REFUSE, the way
+# `refusal-codes.awk` above already does it: emit a `replay` row for every unresolvable operand and RED
+# any that is not on a declared, reasoned list — is recorded on #3238 with this evidence, because it is
+# a change to the guard's design and not a sixth rule.
+# ⛔ THE WORD CLASS MUST BE ABLE TO REPRESENT A GATE WORD, OR THE SEAM ABSORBS IT (P3, second fresh
+# review of `b0b65af5`). `[a-z][a-z-]*` stops at the first character outside it, so a word ending in a
+# digit does not vanish — it TRUNCATES INTO A DIFFERENT WORD: measured on the reviewed head,
+# `_cap_gate=land2` derived as `… land …` (baseline identical), so `land2` had no row, its arm was never
+# driven, and the equality above passed GREEN over a word in NEITHER side of the comparison — the same
+# shape as the `key` fail-open this commit fixes, one character class further out. Every gate word in
+# the tree is alphabetic today, so there is no live instance; the convention "gate words are [a-z-]" was
+# also stated nowhere, which made the universal claim below wider than the code under it.
+# ⛔ AND THEN THE SAME CLASS AGAIN, ONE STEP OUT (P3, third fresh review of `048f9d5e`): ANY left-anchored
+# class still ABSORBS rather than reports — `_cap_gate=land.2` truncated to `land`, and `GPU`, `2fa`,
+# `_internal`, `landX`, `load:2` were dropped entirely, each leaving the derived set byte-identical to the
+# baseline so `derived == rows` passed with the word in NEITHER side. Widening the class again would be
+# the same mistake a third time. So the derivation imposes NO class on the word at all: it captures the
+# whole OPERAND and classifies the forms that are not a word (a quoted VARIABLE or command substitution
+# is a REPLAY, not a claim — see the preamble's stated limit). A LITERAL word the table has no row for
+# then arrives as ITSELF — bare or quoted, digits and underscores included — and REDS the equality
+# instead of vanishing into a neighbour.
+_gatewords_derived_from() { # <dir> -> the gate words THIS deploy unit can record, space-separated
+  {
+    # ⛔ A SEAM WHOSE INPUT CANNOT BE READ MUST NOT CONTRIBUTE SILENTLY (P2, review of `7d65a618` —
+    # measured on the shipped head). Every probe is a `grep … 2>/dev/null` in a pipeline whose status
+    # belongs to `sed`/`awk`, and the only non-vacuity guard above is `[ -n "$_capwords_derived" ]` —
+    # so a MISSING input is indistinguishable from an input with nothing to say. With `lane.sh` absent,
+    # seams 1 and 2 contributed nothing, seam 3 alone supplied all seven words from `chain-merge.sh`,
+    # and the equality still passed GREEN (`capability disk fork key land load skew`, byte-identical to
+    # expected) while two of the three seams were never read. The sentinel survives the filters below
+    # and the equality, so an unreadable input REDS the arm instead of leaving it green over a
+    # population it did not read — the same rule `refusal_codes` already applies to its own awk.
+    for _gwf in lane.sh chain-merge.sh; do
+      [ -r "$1/$_gwf" ] || printf '!unread:%s\n' "$_gwf"
+    done
+    # Seam 1: the operand after `_cap_gate=`, to the end of the word. NO character class on the value.
+    grep -ohE '_cap_gate=[^[:space:];)]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | sed 's/^_cap_gate=//'
+    # Seam 2: a LITERAL word only — `lane_standdown_write "$_cap_gate"` (the replay of an
+    # already-classified refusal) is not a new word, and that form is excluded below with the same rule
+    # as seam 1. The function's own definition line does not match either (it is followed by `()`).
+    grep -ohE 'lane_standdown_write [^[:space:];)]*' "$1/lane.sh" "$1/chain-merge.sh" 2>/dev/null | awk '{print $2}'
+    # Seam 3: the chain's normaliser — one `printf '<word>'` arm per word it passes through as itself.
+    # Already quote-delimited, so the quotes are the boundary; the value itself is unrestricted.
+    sed -n '/^cap_refusal_gate()/,/^}/p' "$1/chain-merge.sh" 2>/dev/null \
+      | grep -oE "printf '[^']*'" | sed "s/^printf '//; s/'$//"
+  } | sed -e "s/^[\"']//" -e "s/[\"']$//" \
+    | awk 'NF && $0 !~ /^[$()]/' | sort -u | tr '\n' ' '
+}
+_capwords_derived="$(_gatewords_derived_from "$HERE")"
+_capwords_derived="${_capwords_derived% }"
+_capwords_expected="$(printf '%s\n' $_gate_expected | cut -d: -f1 | sort -u | tr '\n' ' ')"
+_capwords_expected="${_capwords_expected% }"
+{ [ -n "$_capwords_derived" ] && [ "$_capwords_derived" = "$_capwords_expected" ]; }; rc=$?
+ck "the gate words the callers can RECORD and the rows above are the same set, derived from the callers themselves (derived: '${_capwords_derived:-<EMPTY>}'; rows: '${_capwords_expected:-<EMPTY>}') — a new word without a row would otherwise be published as a load refusal" $rc
+
+# ⛔ THE DERIVATION MUST SEE THE SEAM #3331 USED (P1, fresh review of `1f45677f`). The equality above is
+# worthless if BOTH sides are blind to the same word — which is exactly what happened: `key` was in
+# neither. These two arms pin the correction from the side that failed, so the class cannot come back
+# through that seam. The first is the live instance; the second is the GENERAL shape (a gate landed the
+# way `key` landed, with the word arriving through the standdown call and no `_cap_gate=` arm at all).
+case " $_capwords_derived " in *" key "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the derivation SEES #3331's seam — \`key\` is recorded through \`lane_standdown_write key\`, not \`_cap_gate=key\`, so a \`_cap_gate=\`-only derivation read six words for a seven-gate unit (derived: '${_capwords_derived:-<EMPTY>}')" $rc
+_gw_dir="$TMP/gatewords"; rm -rf "$_gw_dir"; mkdir -p "$_gw_dir"
+cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw_dir/"
+printf '\nlane_standdown_write mystery "$CAPACITY_YIELD_SECS"\n' >> "$_gw_dir/lane.sh"
+_gw_after="$(_gatewords_derived_from "$_gw_dir")"; _gw_after="${_gw_after% }"
+case " $_gw_after " in *" mystery "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a NEW gate landed through that SAME seam is SEEN, so the row/word equality is a real claim rather than two lists agreeing to say nothing (before: '$_capwords_derived'; after: '${_gw_after:-<EMPTY>}')" $rc
+[ "$_gw_after" != "$_capwords_derived" ]; rc=$?
+ck "...and the derived set CHANGES for it, so an unseen gate cannot pass the equality above (the fail-open this arm exists for read GREEN: 82 appeared in no side of the comparison)" $rc
+# …and the ARM ABOVE IS ONLY WORTH ANYTHING IF BOTH SEAMS ARE ACTUALLY READ. Driven from the failing
+# side: `lane.sh` absent, `chain-merge.sh` present — the exact state in which seams 1 and 2 read nothing
+# and seam 3 alone reproduced all seven words, leaving the equality GREEN over a population two of its
+# three seams never touched (P2, review of `7d65a618`; measured).
+_gw_unread="$TMP/gatewords-unread"; rm -rf "$_gw_unread"; mkdir -p "$_gw_unread"
+cp "$HERE/chain-merge.sh" "$_gw_unread/"
+_gw_unread_after="$(_gatewords_derived_from "$_gw_unread")"; _gw_unread_after="${_gw_unread_after% }"
+case " $_gw_unread_after " in *"!unread:lane.sh"*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a derivation INPUT that cannot be read is REPORTED, not silently skipped — with \`lane.sh\` absent the other seam still yields all seven words, so the equality above read GREEN while two of its three seams were never read (derived: '${_gw_unread_after:-<EMPTY>}')" $rc
+# ⛔ AND A WORD THE CLASS CANNOT REPRESENT MUST NOT BE ABSORBED (P3, second fresh review of `b0b65af5`).
+# `[a-z][a-z-]*` TRUNCATED at a digit, so `land2` derived as the existing word `land`: no row, no arm,
+# equality GREEN — the `key` fail-open one character class further out. `land2` is chosen because it
+# collides with a word that IS in the table, which is the case a truncating class hides; `zzz2` would
+# have gone RED under a mangled name and looked healthy. Both are driven.
+_gw2="$TMP/gatewords2"; rm -rf "$_gw2"; mkdir -p "$_gw2"
+cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw2/"
+printf '\n_cap_gate=land2\n' >> "$_gw2/lane.sh"
+_gw2_after="$(_gatewords_derived_from "$_gw2")"; _gw2_after="${_gw2_after% }"
+case " $_gw2_after " in *" land2 "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a DIGIT-bearing gate word arrives as ITSELF, not truncated into an existing word (\`land2\` must appear, else it absorbs into \`land\`: derived: '${_gw2_after:-<EMPTY>}')" $rc
+[ "$_gw2_after" != "$_capwords_derived" ]; rc=$?
+ck "...so it CHANGES the derived set and a missing row is RED rather than an equality that passes over it" $rc
+_gw3="$TMP/gatewords3"; rm -rf "$_gw3"; mkdir -p "$_gw3"
+cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw3/"
+printf '\nlane_standdown_write zzz2 "$CAPACITY_YIELD_SECS"\n' >> "$_gw3/lane.sh"
+_gw3_after="$(_gatewords_derived_from "$_gw3")"; _gw3_after="${_gw3_after% }"
+case " $_gw3_after " in *" zzz2 "*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the same for a word whose alpha prefix is NOT in the table (\`zzz2\`), which a truncating class reddened under a name that is not in the file: derived: '${_gw3_after:-<EMPTY>}'" $rc
+# ⛔ NO CHARACTER CLASS ON THE WORD (P3, third fresh review of `048f9d5e`). Three separate left-anchored
+# classes each ABSORBED a conforming-looking-but-different word (`land2` → `land`, then `land.2` → `land`,
+# and `GPU` / `2fa` / `_internal` / `landX` / `load:2` dropped) with the set UNCHANGED and the equality
+# GREEN. Widening the class was the wrong instrument twice; the derivation now captures the OPERAND and
+# classifies the forms that are NOT a word. So the property is: every LITERAL spelling a caller can use
+# — bare, quoted, digits and underscores included — reaches the set as ITSELF, and the ROW is what has to
+# match it. Driven over the words a character class cannot represent, plus a control that the replay
+# form is still excluded.
+_gw4="$TMP/gatewords4"
+_gw4_bad=""
+for _gw4_w in land.2 GPU 2fa _internal landX load:2; do
+  rm -rf "$_gw4"; mkdir -p "$_gw4"; cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw4/"
+  printf '\n_cap_gate=%s\n' "$_gw4_w" >> "$_gw4/lane.sh"
+  _gw4_out="$(_gatewords_derived_from "$_gw4")"
+  case " $_gw4_out " in *" $_gw4_w "*) : ;; *) _gw4_bad="$_gw4_bad $_gw4_w" ;; esac
+done
+[ -z "$_gw4_bad" ]; rc=$?
+ck "...and the derivation imposes NO class on the word — every non-conforming spelling (\`land.2\` \`GPU\` \`2fa\` \`_internal\` \`landX\` \`load:2\`) reaches the set as ITSELF, so the ROW has to match it rather than the word vanishing into a neighbour (silent:${_gw4_bad:- none})" $rc
+rm -rf "$_gw4"; mkdir -p "$_gw4"; cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw4/"
+printf '\n_cap_gate="$(cap_refusal_gate)"\n' >> "$_gw4/lane.sh"
+_gw4_out="$(_gatewords_derived_from "$_gw4")"
+[ "${_gw4_out% }" = "$_capwords_derived" ]; rc=$?
+ck "...while a REPLAY (\`_cap_gate=\"\$(...)\"\`, chain-merge.sh:259's own form) is still excluded, so the seam does not invent words (derived: '${_gw4_out:-<EMPTY>}')" $rc
+# ⛔ AND A QUOTED LITERAL IS NOT A REPLAY (P3, fourth fresh review of `9ede5e24`). The exclusion's first
+# cut dropped ANY quoted operand, so `_cap_gate="land2"` — which records the identical three-field line
+# as the unquoted form — was ABSORBED (derived byte-identical to baseline, equality GREEN) while the
+# unquoted spelling changed the set. Both spellings and both seams are driven here, because the natural
+# way to write the next seam-2 call is `lane_standdown_write "key" "$CAPACITY_YIELD_SECS"`.
+_gw5="$TMP/gatewords5"
+_gw5_bad=""
+for _gw5_case in 'seam1-dq|_cap_gate="land2"|land2' "seam1-sq|_cap_gate='land2'|land2" 'seam2-dq|lane_standdown_write "zzz2" "$CAPACITY_YIELD_SECS"|zzz2' 'seam2-sq|lane_standdown_write '\''zzz3'\'' "$CAPACITY_YIELD_SECS"|zzz3'; do
+  _gw5_tag="${_gw5_case%%|*}"; _gw5_rest="${_gw5_case#*|}"
+  _gw5_line="${_gw5_rest%%|*}"; _gw5_want="${_gw5_rest##*|}"
+  rm -rf "$_gw5"; mkdir -p "$_gw5"; cp "$HERE/lane.sh" "$HERE/chain-merge.sh" "$_gw5/"
+  printf '\n%s\n' "$_gw5_line" >> "$_gw5/lane.sh"
+  _gw5_out="$(_gatewords_derived_from "$_gw5")"
+  case " $_gw5_out " in *" $_gw5_want "*) : ;; *) _gw5_bad="$_gw5_bad $_gw5_tag($_gw5_want)" ;; esac
+done
+[ -z "$_gw5_bad" ]; rc=$?
+ck "...and a QUOTED LITERAL is seen as the word it records, in both quote styles and on both seams — it is not a replay, so excluding it absorbed a gate the unquoted spelling would have caught (absorbed:${_gw5_bad:- none})" $rc
 # The operator-facing half: the load REMEDY must not be printed for a capability refusal.
 chain_probe capability
 [ "$CHAIN_REMEDY" = "refused at the capability gate" ]; rc=$?
@@ -1645,14 +2952,19 @@ chain_probe load
 ck "...while a load refusal still names the load gate (read: '${CHAIN_REMEDY:-<nothing>}')" $rc
 
 # ── the COVERAGE verdict: defined − (named in CODE ∪ exercised above) must be empty ─────────────
+# The code set is the SCANNER's, not a `sed` on the helper: a constant declared with `export`, or in
+# brief-gate.sh rather than spawn-gate.sh, is still a code a caller may compare against and must be
+# accounted for (review of PR #3237, findings 1 and 2). Derived from $CODE_ROWS so there is ONE parse;
+# a name the scanner could not read at all is already a RED in `unparseable:` above, and a scan that
+# produced nothing is a RED there too — neither can arrive here disguised as an empty list.
 _named=""
-for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GATE" | sort -u); do
+for _code in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="claim" && $2 ~ /^AGENT_.*_REFUSED$/{print $2}' | sort -u); do
   for _f in lane.sh fix-one.sh chain-merge.sh adopt-fix.sh nonblocking-dispatch.sh; do
     strip_comments "$HERE/$_f" | grep -q "$_code" && _named="$_named $_code"
   done
 done
 _unread=""
-for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GATE" | sort -u); do
+for _code in $(printf '%s\n' "$CODE_ROWS" | awk -F'\t' '$1=="claim" && $2 ~ /^AGENT_.*_REFUSED$/{print $2}' | sort -u); do
   case " $_named $_exercised " in
     *" $_code "*) : ;;
     *) _unread="$_unread $_code" ;;
@@ -1660,6 +2972,924 @@ for _code in $(sed -n 's/^\(AGENT_[A-Z_]*_REFUSED\)=\([0-9][0-9]*\).*/\1/p' "$GA
 done
 [ -z "$_unread" ]; rc=$?
 ck "every AGENT_*_REFUSED code is ACCOUNTED FOR — named in a caller's CODE or reached by the table (unread:${_unread:- none})" $rc
+
+# ══ THE CLASS: TWO GATES MUST NOT CLAIM ONE CODE, AND EVERY ARM MUST BE REACHED ══════════════════
+# ⛔ WHY THIS SECTION EXISTS (measured 2026-11-01 on the merged tree of PR #2591, parents 317cf6286 +
+# 951e4c821). `AGENT_HARNESS_SKEW_REFUSED` was added at 81 by #3035 (2026-11-01) — nine days AFTER
+# `AGENT_MEM_REFUSED` (#2387, 2026-10-23) had claimed 81 on a branch that had not merged. Nothing
+# detected it, and the reason is that BOTH things that could have were SPOT LISTS, not derivations:
+#   • `_gate_expected` above is a hand-written list of the gates that existed when it was authored, so
+#     a NEW constant needs a row nobody was required to add — #2591's memory gate never got one, and
+#     the chain was therefore never asked to prove its arm reachable;
+#   • the distinctness assertions elsewhere are spot checks too (`capacity-placement.test.sh`: "fork 73,
+#     distinct from land 74, disk 77 and load 75") — a list, so it cannot see a code added after it.
+# The consequence was not cosmetic: callers classify a refusal BY CODE and in ARM ORDER, so with skew
+# at 81 and the skew arm FIRST in `fix-one.sh` (:795 on that tree, the memory arm at :818), every
+# MEMORY refusal exited 81 under the "HARNESS/MISMATCH gate" label and the memory arm was UNREACHABLE.
+# One red out of 113 checks, and only because #2591 happened to write an arm that drove the memory
+# refusal through the fixer.
+# So the properties below are DERIVED from the shipped files and from the caller's own references,
+# never from a list a future author has to remember to extend:
+#   (0) the POPULATION of the table above is derived: every `<word>` the callers can record — a
+#       `_cap_gate=<word>` arm in `lane.sh`/`chain-merge.sh`, a literal `lane_standdown_write <word>`
+#       call (#3331's seam), or a `printf '<word>'` arm in `cap_refusal_gate` — must have a row and every
+#       row must have a word. Without it a sixth gate was published as a load refusal with nothing
+#       failing. ⛔ THE THREE SEAMS ARE NAMED BECAUSE ONE OF THEM WAS MISSED: `key` (82) arrives through
+#       the standdown call, so a `_cap_gate=`-only derivation and this table's rows agreed on SIX words
+#       while the unit had seven; the equality passed, and 82 appeared in neither the derived set nor
+#       the duplicate check's code list (P1, fresh review of `1f45677f`).
+#   (1) two gates may not claim one code — and the claim list comes from a SCANNER OVER THE WHOLE
+#       DEPLOY UNIT that fails closed (an unreadable declaration, an absent declarer or an empty scan
+#       is a RED), because the first cut parsed `spawn-gate.sh` alone with a `^NAME=` anchor: it was
+#       measured GREEN on `export AGENT_NEW_GATE_REFUSED=83` and blind to `brief-gate.sh`'s 80 and
+#       `adopt-fix.sh`'s 79, which is precisely how a unique code stops being unique; the same
+#       verdict also refuses ONE NAME declared under TWO codes (`conflicting-declarations`), because
+#       `codes_for_name` reads the FIRST such row while the stale-default pass reads the LAST;
+#   (2) every gate the fixer CLASSIFIES is DRIVEN, and must NAME ITSELF. A new constant that fix-one.sh
+#       reads but this table does not declare is a RED ("undeclared"), so the table cannot fall behind
+#       the helper silently — the blind spot that let 81 be claimed twice. The table's own accounting
+#       (`_armseen`) is read and asserted, so "every row was driven" is falsifiable rather than stated.
+# ⛔ WHAT IS STILL A LIST, stated so this preamble cannot rot into the claim it warns about: the
+# `<word>:<CONSTANT>` PAIRING in `_gate_expected` is hand-written (its POPULATION is derived), so a
+# change to which constant a word means is not caught here — the arm drive is what catches that.
+
+# (1) THE CODES ARE UNIQUE ACROSS THE WHOLE DEPLOY UNIT, not just the helper. This is the verdict of
+# the ONE scanner defined at the top of this file, and $CODE_MSG carries its readings so a red says
+# WHICH of the three ways it failed: a required declarer absent or silent, a declaration it could not
+# read as a code, or a shared-code group that is not exactly the sanctioned table.
+ck "no two refusal gates claim the SAME code across the deploy unit — the only sanctioned shares are 78's cannot-verify pair and 80's one-gate-two-names alias ($CODE_MSG)" $CODE_RC
+
+# ── THE MUTATIONS: the guard must go RED on each way a parse can MISS a claim ───────────────────
+# ⛔ THESE ARE THE FINDING, NOT DECORATION (review of PR #3237, findings 1 and 2). The first cut read
+# the codes with a `^NAME=`-anchored `sed` on spawn-gate.sh, so `export AGENT_NEW_GATE_REFUSED=83` — a
+# real duplicate — left the check GREEN (measured: the same constant un-prefixed was RED), and a code
+# declared in a sibling helper was not in the scanned set at all. Each arm drives the REAL predicate
+# over a copy of the code-declaring helpers, so what is proven is the shipped scanner, not a
+# description of it. The CONTROL arm comes first: without it, a red could be an artefact of the
+# copying, and every arm below would be evidence of nothing.
+_codemut() { # _codemut <tag> -> a fresh copy of the code-declaring helpers; echoes its path
+  rm -rf "$TMP/codemut-$1"; mkdir -p "$TMP/codemut-$1"
+  for _cm_f in $_codes_required; do cp "$HERE/$_cm_f" "$TMP/codemut-$1/"; done
+  printf '%s\n' "$TMP/codemut-$1"
+}
+_codemut_dir="$(_codemut control)"
+codes_verdict "$_codemut_dir"
+ck "(mutation CONTROL) an unmutated copy of the code-declaring helpers is GREEN — so every red below is the MUTATION, not the copying ($CODE_MSG)" $CODE_RC
+
+# (a) FINDING 1. The spelling that defeated the old parser: a real duplicate of the skew code, which
+# the `^NAME=` anchor could not see. RED, and the message must name the 83 collision — a red for some
+# other reason would not prove the exported form was READ.
+_codemut_dir="$(_codemut export)"
+printf '\nexport AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation a) an EXPORTed duplicate (\`export AGENT_NEW_GATE_REFUSED=83\`) is REFUSED and NAMED — the first cut read this as GREEN (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (b) FINDING 1, the fail-closed half: a constant the parser cannot read as a code must be a RED
+# naming the raw text — never a skip. A skip is what "the parse matched nothing" looks like.
+_codemut_dir="$(_codemut unreadable)"
+printf '\nAGENT_NEW_GATE_REFUSED=$(( 70 + 13 ))\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"unparseable: spawn-gate.sh:AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation b) a declaration the parser CANNOT read (\`AGENT_NEW_GATE_REFUSED=\$(( 70 + 13 ))\`) is REFUSED and names the file+constant (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (c) FINDING 2. The cross-file collision, driven in the sibling that holds the other half of 80: with
+# brief-gate.sh declaring 76, PI_GATE_REFUSED (spawn-gate.sh) is double-claimed and the 80 alias is
+# gone. Both are reds; the message must name the 76 collision, because that is the one a 1-file scan
+# cannot see.
+_codemut_dir="$(_codemut crossfile)"
+sed -i.bak 's/^BRIEF_GATE_REFUSED=80$/BRIEF_GATE_REFUSED=76/' "$_codemut_dir/brief-gate.sh"
+rm -f "$_codemut_dir/brief-gate.sh.bak"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"76=BRIEF_GATE_REFUSED,PI_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation c) a code re-declared from a SIBLING helper (brief-gate.sh:80->76) is REFUSED — a 1-file scan cannot see this class (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d) FINDING 2, the absent half: a required declarer that is missing from the deploy unit is a RED,
+# not a smaller scan. This is the `$O` copy that lost a file — the state in which a real collision in
+# that file would be silently invisible.
+_codemut_dir="$(_codemut absent)"
+rm -f "$_codemut_dir/brief-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"absent: brief-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation d) an ABSENT required declarer (brief-gate.sh) is REFUSED and named, not skipped (rc=$CODE_RC; $CODE_MSG)" $rc
+# ⛔ (d2) THE SAME PROPERTY FOR THE NEWEST CODE IN THE UNIT (P2, fresh review of `1f45677f`). `82` has
+# exactly ONE declarer — `key-gate.sh:72 KEY_GATE_REFUSED=82` — and that file arrived on main while this
+# branch was open, so it was outside `_codes_required`. Measured on the reviewed head: deleting it from
+# a copy left `RC=0 claims=14 absent: none`, i.e. the absent-declarer property this arm above proves was
+# FALSE for 82, and the tolerant `${KEY_GATE_REFUSED:-82}` in `chain-merge.sh` kept the tree readable and
+# silent about it. A required-list that does not name the only declarer of a code is a population claim
+# that is not the population checked.
+_codemut_dir="$(_codemut absent-key)"
+rm -f "$_codemut_dir/key-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"absent: key-gate.sh(absent)"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation d2) the ONLY declarer of 82 (key-gate.sh) is REFUSED when absent — it fell outside the required set, so its loss scanned CLEAN (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d3) A LOOP VARIABLE IS A DECLARATION (review round 3, P2 — measured). `for X in 83` binds 83 exactly
+# as `X=83` does. Neither net saw it: the operator chain needs an `=`, and `cmdpos("for ")` is false,
+# so the line produced 0 rows and a GREEN verdict over a real duplicate of the skew code. Both nets are
+# exercised — the FAMILY name must COLLIDE on 83, and a NON-family name must be a `foreign` row, since
+# the same code under a different constant is still one code.
+for _loopshape in for select; do
+  _codemut_dir="$(_codemut "loop-$_loopshape")"
+  printf '\n%s AGENT_NEW_GATE_REFUSED in 83; do echo x; done\n' "$_loopshape" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+  ck "(loop/$_loopshape) a \`$_loopshape\` LOOP VARIABLE over the skew code COLLIDES — a loop binding is a declaration, not a read (rc=$CODE_RC; $CODE_MSG)" $rc
+  _codemut_dir="$(_codemut "loopforeign-$_loopshape")"
+  printf '\n%s AGENT_MEM_GATE in 81; do echo x; done\n' "$_loopshape" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
+  ck "(loop/$_loopshape) a \`$_loopshape\` LOOP VARIABLE outside the family is a \`foreign\` row — the foreign net was blind for the same reason (rc=$CODE_RC; $CODE_MSG)" $rc
+done
+
+# (d4) THE FOUR SHAPES AROUND THE LOOP ARM (review round 3, P2 — each measured). Every one of these
+# failed before this round: the first two dropped a REAL declaration in silence, the last two are the
+# CONTROLS that keep the fix from becoming the over-claim it replaced (a word `for` in an ordinary
+# argument is not a loop, and a multi-value list does not durably hold one code).
+_codemut_dir="$(_codemut loop-newline)"
+printf '\nfor AGENT_NEW_GATE_REFUSED\nin 83; do echo x; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"rejected: unparseable declaration: spawn-gate.sh:"*) rc=0 ;; *) rc=1 ;; esac
+ck "(loop/newline) a \`for\` header SPLIT across two physical lines is REFUSED, not dropped — bash binds it and needs no backslash (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut loop-quoted)"
+printf '\nfor AGENT_NEW_GATE_REFUSED in "83"; do echo x; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(loop/quoted) a QUOTED literal operand binds the same 83 and COLLIDES by NAME — not merely 'unparseable', which would red without naming the duplicate (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut loop-not-a-loop)"
+printf '\necho for AGENT_MEM_GATE in 81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign:"*|*"rejected:"*) rc=1 ;; *) rc=0 ;; esac
+ck "(loop/not-a-loop) a word \`for\` inside an ORDINARY ARGUMENT is SILENT — bash binds nothing there, and claiming it is the over-claim the space-inclusive match produced (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut loop-list)"
+printf '\nfor AGENT_MEM_GATE in 83 84; do echo x; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(loop/list) a MULTI-VALUE list is not a declaration of its first element — no \`foreign\` row, which would be a false RED (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d5) EVERY OPERAND OF A DECLARATION BUILTIN IS A DECLARATION (review round 3, P2 — measured).
+# `cmdpos` recognises only the operand immediately after the builtin, so a code in a LATER slot was
+# skipped in silence: `export AGENT_DEBUG=1 AGENT_MEM_GATE=81` read GREEN while the same code in the
+# FIRST slot was caught. Multi-operand `local` is house style, so this is a realistic edit.
+_codemut_dir="$(_codemut decl-second-operand)"
+printf '\nexport AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
+ck "(decl/second-operand) a code in the SECOND operand of \`export\` is still a \`foreign\` row — position must not decide the verdict (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d6) A RESOLVED VALUE MUST NOT LEAK INTO THE NEXT NAME (review round 4, P2 — measured). The foreign
+# net's `_vv` was assigned only on the paths that RESOLVE a value, so a later name whose operand is
+# unreadable inherited the PREVIOUS name's code and was published as `foreign B_GATE_MEM=81` — a
+# claim about a specific constant that bash never binds (`for B_GATE_MEM in "$LIST"` binds `a b`).
+# A false NAMED claim is worse than a generic red: a reader acting on it would sanction a name that
+# declares nothing.
+_codemut_dir="$(_codemut loop-stale-value)"
+printf '\nfor A_GATE_MEM in 81; do :; done; for B_GATE_MEM in "$LIST"; do :; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:B_GATE_MEM"*) rc=1 ;; *) rc=0 ;; esac
+ck "(loop/stale-value) an UNREADABLE loop operand does not inherit the PREVIOUS name's code — no \`foreign: …B_GATE_MEM\` row naming a declaration that does not exist (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d7) A PREFIX-ASSIGNMENT LIST IS A COMMAND BOUNDARY (review round 5, P2 — measured). The foreign net
+# required `cmdpos || decl_operand` of the text before the name, and `FOO=1 ` is neither, so
+# `FOO=1 AGENT_MEM_GATE=81` bound 81 into the variable and emitted NO ROW — while the FAMILY net
+# refused the identical `FOO=1 AGENT_NEW_GATE_REFUSED=83`. Namespace deciding whether a declaration is
+# seen is the asymmetry this file records as fixed on the family path; it was still alive here.
+_codemut_dir="$(_codemut prefix-assignment)"
+printf '\nFOO=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=0 ;; *) rc=1 ;; esac
+ck "(prefix-assignment) a code after a \`FOO=1\` prefix assignment is a \`foreign\` row — the family net already refused the same shape, so the namespace must not decide whether a declaration is seen (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d9) SPELLING MUST NOT DECIDE WHETHER A DECLARATION IS SEEN (review round 7, P3 — measured). The
+# printf-format strip did not tolerate quotes, so the FOREIGN net dropped `printf -v X '%d' 81` while
+# the family net classified the identical line as a `claim` — and the quoted format is the dominant
+# form in the tree (`printf -v "$3" '%s' …`). `$'83'` was dropped the same way. Not the STATED LIMIT:
+# that scopes out a COMPUTED value, and these values are literals.
+_codemut_dir="$(_codemut quoted-spelling)"
+printf "\nprintf -v AGENT_MQ_GATE '%%d' 81\nprintf -v AGENT_MD_GATE \"%%d\" 81\nAGENT_DOLLAR_GATE=\$'83'\n" >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+_missing=""
+for _want in AGENT_MQ_GATE AGENT_MD_GATE AGENT_DOLLAR_GATE; do
+  case "$CODE_MSG" in *"spawn-gate.sh:$_want"*) : ;; *) _missing="$_missing $_want" ;; esac
+done
+[ -z "$_missing" ]; rc=$?
+ck "(quoted-spelling) a QUOTED printf FORMAT (single and double) and an ANSI-C \`\$'…'\` operand are all \`foreign\` rows — the family net already read the same spellings, so punctuation must not decide (missing:${_missing:- none}; rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut quoted-not-code)"
+printf "\nprintf -v AGENT_PLAIN_GATE '%%s' abc\nAGENT_STR_GATE=\$'abc'\n" >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_PLAIN_GATE"*|*"AGENT_STR_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) the same QUOTED spellings carrying NO code stay SILENT — the widened reader must not turn a string into a declaration (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (d8) THE PREFIX OPERAND MAY BE QUOTED OR ESCAPED, AND `let`/`time` ARE COMMAND POSITIONS (review
+# round 6, P3 — each measured). `[^ \t]*` could not cross a space, so `FOO="a b" X=81` matched no
+# operand and got NO row; and `let X=81` / `time X=81` / `time -p X=81` assign 81 yet read silent while
+# the FAMILY mirrors of the same lines were refused. The control keeps the widening honest: the same
+# text after `echo` declares nothing and must stay silent.
+_codemut_dir="$(_codemut prefix-quoted)"
+printf '\nFOO="a b" AGENT_MEM_GATE=81\nFOO=a\\ b AGENT_ESC_GATE=81\nlet AGENT_LET_GATE=81\ntime -p AGENT_TIME_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+_missing=""
+for _want in AGENT_MEM_GATE=81 AGENT_ESC_GATE=81 AGENT_LET_GATE=81 AGENT_TIME_GATE=81; do
+  # ⛔ The `foreign: ` prefix is printed ONCE, before the FIRST row — matching it on every row would
+  # fail for every row after the first, which is how this arm's first cut reported three false misses.
+  case "$CODE_MSG" in *"spawn-gate.sh:$_want"*) : ;; *) _missing="$_missing $_want" ;; esac
+done
+[ -z "$_missing" ]; rc=$?
+ck "(prefix-quoted) a QUOTED prefix operand, an ESCAPED one, \`let\` and \`time -p\` are all \`foreign\` rows — a space in the value, or a keyword, must not make the declaration invisible (missing:${_missing:- none}; rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut where-let-is-not)"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) the same words after \`echo\` stay SILENT — \`let\`/\`time\` are command positions only in command position (rc=$CODE_RC; $CODE_MSG)" $rc
+
+_codemut_dir="$(_codemut decl-not-builtin)"
+printf '\necho AGENT_DEBUG=1 AGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE"*) rc=1 ;; *) rc=0 ;; esac
+ck "(decl/not-builtin) the same text after \`echo\` is SILENT — the multi-operand rule is scoped to declaration builtins, not to any command (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (e) FINDING 1, the root case: a population the scan CANNOT READ. ⛔ This is NOT the `claims=0`
+# branch: with an empty directory the glob does not expand, awk cannot open the literal `*.sh`, and
+# the arm reds on `absent:` + `scan-unreadable:` (exit 2). `_cv_n -eq 0` cannot decide on its own — an
+# empty `absent:` list requires one row from EACH required declarer, so `_cv_n >= 5` whenever the
+# other terms are clean. What this arm therefore proves is the two fail-closed rules it actually
+# exercises — a required declarer that is ABSENT is REFUSED, and a scan that CANNOT RUN is REFUSED —
+# and it must not be described as the third, which the absent-declarer rule already implies.
+rm -rf "$TMP/codemut-nothing"; mkdir -p "$TMP/codemut-nothing"
+codes_verdict "$TMP/codemut-nothing"
+[ "$CODE_RC" -eq 1 ]; rc=$?
+ck "(mutation e) a population the scan CANNOT READ is REFUSED (absent declarers + an unreadable scan), never a clean pass (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# ══ AND THE PARSE MUST CLASSIFY, NOT DISCARD (review round 2, the BLOCKING finding) ═══════════════
+# ⛔ WHAT WAS MEASURED ON THE HEAD BEFORE THIS SECTION (the shipped predicate, driven directly):
+# `: "${AGENT_NEW_GATE_REFUSED:=83}"`, `local AGENT_NEW_GATE_REFUSED=83` and `if true; then
+# AGENT_NEW_GATE_REFUSED=83; fi` were all "GREEN, 0 rows" while a real 83 duplicate sat in a scanned
+# file — one `next` in the parser dropped every shape it had not anticipated, and because that ONE
+# parse feeds every reader here (the chain table, the coverage verdict, the arm table), one blind spot
+# was every reader's blind spot. The SHAPE is live in the scanned set today (`: "${VAR:=…}"` at
+# `refresh-candidates.sh:133`); no FAMILY token uses `:=` yet, which is luck rather than a property.
+# So every assignment-OPERATOR shape the parser is supposed to read is DRIVEN here, with TWO arms each,
+# because the two can fail for different reasons and only one of them is about the subject:
+#   • the PARSE arm proves the scanner READ the line as a claim of that code — it reddens the moment
+#     the classification is disabled, even if the verdict happened to red for an unrelated reason;
+#   • the VERDICT arm proves the duplicate is then NAMED as the 83 collision, so a red produced by the
+#     copying, the fixture or a required-declarer artefact cannot pass as coverage of the shape.
+# A shape missing from the parser is a RED here, never a silent gap in the list.
+_codeshapes="plain|AGENT_NEW_GATE_REFUSED=83
+export|export AGENT_NEW_GATE_REFUSED=83
+declare|declare -r AGENT_NEW_GATE_REFUSED=83
+readonly|readonly AGENT_NEW_GATE_REFUSED=83
+typeset|typeset -i AGENT_NEW_GATE_REFUSED=83
+local|local AGENT_NEW_GATE_REFUSED=83
+assign-if-unset|: \"\${AGENT_NEW_GATE_REFUSED:=83}\"
+assign-if-unset-bare|: \"\${AGENT_NEW_GATE_REFUSED=83}\"
+in-if-then|if true; then AGENT_NEW_GATE_REFUSED=83; fi
+after-andand|true && AGENT_NEW_GATE_REFUSED=83
+before-semicolon|AGENT_NEW_GATE_REFUSED=83; true
+array-literal|readonly -a AGENT_NEW_GATE_REFUSED=(83)"
+_shape_unread=""; _shape_unred=""
+while IFS='|' read -r _shtag _shline; do
+  [ -n "$_shtag" ] || continue
+  # PARSE arm: ONE line, ONE file, read by the SHIPPED scanner (no verdict, no other helpers).
+  rm -rf "$TMP/shape-$_shtag"; mkdir -p "$TMP/shape-$_shtag"
+  printf '%s\n' "$_shline" > "$TMP/shape-$_shtag/shape.sh"
+  refusal_codes "$TMP/shape-$_shtag" | awk -F'\t' -v n=AGENT_NEW_GATE_REFUSED \
+    '$1=="claim" && $2==n && $3==83{n++} END{exit !(n==1)}' || _shape_unread="$_shape_unread $_shtag"
+  # VERDICT arm: the same line appended to a real copy of the code-declaring helpers.
+  _codemut_dir="$(_codemut shape-$_shtag)"
+  printf '\n%s\n' "$_shline" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in
+    *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) : ;;
+    *) _shape_unred="$_shape_unred $_shtag" ;;
+  esac
+done <<< "$_codeshapes"
+_shape_n="$(printf '%s\n' "$_codeshapes" | awk 'NF{n++} END{print n+0}')"
+# ⛔ THE COUNT IS ASSERTED, NOT ONLY PRINTED (P1, review of `7d65a618` — measured). Every arm below
+# is a loop over a TABLE, and an EMPTY table drives ZERO iterations, leaves its accumulator empty, and
+# satisfies `[ -z "$_unread" ]` — so the arm goes GREEN having read NOTHING. Measured with
+# `_codeshapes=""`: "CLASSIFIES all 0 declaration shapes … (unread: none)" PASSED, which is precisely
+# the silent-gap class this list exists to close, reproduced inside the arm that closes it. The
+# `_armdriven`/`_armrows` accounting below already solves this for the arm table; these three shape
+# tables (shape, residual, foreign) get the same non-vacuity guard on BOTH of their arms.
+[ "$_shape_n" -gt 0 ] && [ -z "${_shape_unread// /}" ]; rc=$?
+ck "the scanner CLASSIFIES all $_shape_n declaration shapes as a claim of the code they carry (unread:${_shape_unread:- none}) — the parser this replaces reported 0 rows for each of them" $rc
+[ "$_shape_n" -gt 0 ] && [ -z "${_shape_unred// /}" ]; rc=$?
+ck "...and EVERY one of them REDDENS the duplicate check as the 83 collision, not for some other reason (green:${_shape_unred:- none})" $rc
+
+# ⛔ THE P1 THE LIST ITSELF COULD NOT SEE (review of `87b8d708b`, BLOCKING). The list above is a
+# WHITELIST and the mutation arms ARE that list, so no arm in it can catch a shape its author did not
+# think of — that is why this block is NOT another row appended to the list. Measured through the
+# shipped scanner on the reviewed head, every shape below was GREEN with **0 rows for the name**,
+# while bash treats it as a genuine assignment (`bash -c 'AGENT_X_REFUSED[0]=83; echo "${AGENT_X_REFUSED}"'`
+# prints `83`):
+#   AGENT_X_REFUSED[0]=83 · [0]+=83 · [0]="83" · [k]=83 · declare -a X[0]=83 · X[0]=83; exit "${X}"
+# The cause is the shape of the chain, not a missing spelling: every arm keys off the text IMMEDIATELY
+# after the token, a tail beginning with `[` matches none of them, and the chain then FELL THROUGH with
+# no row — the same "`next` drops what it did not anticipate" defect this PR already fixed twice.
+# Two residual declarations therefore had no home at all:
+#   • an ARRAY SUBSCRIPT completed by an assignment (`[<any>]=`, `[<any>]+=`, `[<any>]:=`) — the P1;
+#   • an assignment BUILTIN that writes into the name: `printf -v X %d 83` (a DECLARATION with no
+#     `=` — measured GREEN with 0 rows, which falsifies the old "no operator ⇒ it is a READ" sentence),
+#     and `read -r X` / `mapfile X` (a value this scanner cannot know).
+# The fix is the INVERSION, not a longer chain: what the chain does not classify is now REFUSED by the
+# residual arm (`residual()` in the awk), so `unparseable` is the destination for ANY future shape and
+# the whitelist becomes an optimisation instead of the safety property. Each row below carries the
+# classification the scanner MUST produce, and drives it twice for the same two reasons as above —
+# the PARSE arm fails if the shape vanishes again, the VERDICT arm fails if it reddens for some other
+# reason (a copy artefact, a required declarer, an unrelated collision).
+_residshapes="array-idx0|unparseable|AGENT_NEW_GATE_REFUSED[0]=83
+array-idx0-plus|unparseable|AGENT_NEW_GATE_REFUSED[0]+=83
+array-idx0-quoted|unparseable|AGENT_NEW_GATE_REFUSED[0]=\"83\"
+array-idxvar|unparseable|AGENT_NEW_GATE_REFUSED[k]=83
+array-declare-idx0|unparseable|declare -a AGENT_NEW_GATE_REFUSED[0]=83
+array-readonly-idx0|unparseable|readonly -a AGENT_NEW_GATE_REFUSED[0]=83
+array-braced-assign|unparseable|: \"\${AGENT_NEW_GATE_REFUSED[0]:=83}\"
+array-then-exit|unparseable|AGENT_NEW_GATE_REFUSED[0]=83; exit \"\${AGENT_NEW_GATE_REFUSED}\"
+printf-v|claim|printf -v AGENT_NEW_GATE_REFUSED %d 83
+read-builtin|unparseable|read -r AGENT_NEW_GATE_REFUSED
+read-dash-d|unparseable|read -r -d \"\" AGENT_NEW_GATE_REFUSED
+printf-v-quoted|claim|printf -v \"AGENT_NEW_GATE_REFUSED\" %d 83
+getopts-builtin|unparseable|getopts \"\" AGENT_NEW_GATE_REFUSED
+arith-assign|claim|(( AGENT_NEW_GATE_REFUSED = 83 ))
+array-nested-subscript|unparseable|AGENT_NEW_GATE_REFUSED[a[0]]=83
+printf-v-glued|claim|printf -vAGENT_NEW_GATE_REFUSED %d 83
+array-subscript-eq|unparseable|AGENT_NEW_GATE_REFUSED[a==b]=83
+arith-array-spaced|unparseable|(( AGENT_NEW_GATE_REFUSED[0] = 83 ))
+arith-array-pluseq|unparseable|(( AGENT_NEW_GATE_REFUSED[0] += 83 ))
+arith-array-nested|unparseable|(( (AGENT_NEW_GATE_REFUSED[0] = 83) ))
+arith-array-and|unparseable|(( 1 && (AGENT_NEW_GATE_REFUSED[0] = 83) ))
+arith-array-empty|unparseable|AGENT_NEW_GATE_REFUSED[0]=
+arith-negative-depth|claim|msg=\"1) x 2) y\"; (( AGENT_NEW_GATE_REFUSED = 83 ))
+arith-negative-depth-sub|unparseable|case x in a) :;; b) :;; esac; (( AGENT_NEW_GATE_REFUSED[0] = 83 ))
+subscript-prefix-assign|unparseable|FOO=1 AGENT_NEW_GATE_REFUSED[0]=83
+arith-computed|unparseable|(( AGENT_NEW_GATE_REFUSED = 70 + 13 ))
+read-flag-operand|unparseable|read -u 3 AGENT_NEW_GATE_REFUSED
+read-p-prompt|unparseable|read -r -p \"gate: \" AGENT_NEW_GATE_REFUSED
+mapfile-flag-operand|unparseable|mapfile -t -s 1 AGENT_NEW_GATE_REFUSED
+getopts-optstring|unparseable|getopts \"a:\" AGENT_NEW_GATE_REFUSED
+self-default|claim|AGENT_NEW_GATE_REFUSED=\"\${AGENT_NEW_GATE_REFUSED:-83}\""
+_resid_unread=""; _resid_unred=""
+while IFS='|' read -r _rtag _rkind _rline; do
+  [ -n "$_rtag" ] || continue
+  # PARSE arm: ONE line, ONE file, read by the SHIPPED scanner — no verdict, no other helpers.
+  rm -rf "$TMP/resid-$_rtag"; mkdir -p "$TMP/resid-$_rtag"
+  printf '%s\n' "$_rline" > "$TMP/resid-$_rtag/shape.sh"
+  refusal_codes "$TMP/resid-$_rtag" | awk -F'\t' -v nm=AGENT_NEW_GATE_REFUSED -v k="$_rkind" \
+    '$2==nm && $1==k { if (k != "claim" || $3 == 83) c++ } END{exit !(c==1)}' \
+    || _resid_unread="$_resid_unread $_rtag"
+  # VERDICT arm: the same line appended to a real copy of the code-declaring helpers.
+  _codemut_dir="$(_codemut resid-$_rtag)"
+  printf '\n%s\n' "$_rline" >> "$_codemut_dir/spawn-gate.sh"
+  _rwantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+  codes_verdict "$_codemut_dir"
+  case "$_rkind" in
+    # A readable `printf -v` is a CLAIM, so it must redden as the 83 COLLISION — the property the whole
+    # namespace check exists for — not as a refusal that happens to be red.
+    claim) case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) : ;;
+                               *) _resid_unred="$_resid_unred $_rtag" ;; esac ;;
+    *)     case "$CODE_MSG" in *"unparseable declaration: spawn-gate.sh:$_rwantline"*) : ;;
+                               *) _resid_unred="$_resid_unred $_rtag" ;; esac ;;
+  esac
+done <<< "$_residshapes"
+_resid_n="$(printf '%s\n' "$_residshapes" | awk 'NF{n++} END{print n+0}')"
+# …and the same non-vacuity guard as the shape table above: an empty residual table must be a RED.
+[ "$_resid_n" -gt 0 ] && [ -z "${_resid_unread// /}" ]; rc=$?
+ck "the scanner CLASSIFIES all $_resid_n RESIDUAL declaration shapes (array subscripts, printf -v, read) — the reviewed head reported 0 rows for every one of them (unread:${_resid_unread:- none})" $rc
+[ "$_resid_n" -gt 0 ] && [ -z "${_resid_unred// /}" ]; rc=$?
+ck "...and EVERY one of them REDDENS the code check as a NAMED collision or 'unparseable declaration: file:line' — a shape that vanishes again fails HERE (green:${_resid_unred:- none})" $rc
+# (f1c) THE ANTIDOTE — a guard that reddens everything detects NOTHING, and every arm above would then
+# pass for the wrong reason. These lines are token-bearing or declaration-SHAPED and declare no code: an
+# element COMPARISON (which was red when unquoted and silent when quoted — punctuation deciding a
+# verdict), a `${X#*=}` strip, and a bare `exit "$X"`.
+_codemut_dir="$(_codemut residual-control)"
+printf '\n[ "$AGENT_NEW_GATE_REFUSED[0]" = 83 ]\n[ $AGENT_NEW_GATE_REFUSED[0] = 83 ]\necho "${AGENT_NEW_GATE_REFUSED[0]} ${AGENT_NEW_GATE_REFUSED#*=}"\nexit "$AGENT_NEW_GATE_REFUSED"\n(( AGENT_NEW_GATE_REFUSED[0]==83 ))\n(( AGENT_NEW_GATE_REFUSED[0] == 83 ))\n(( AGENT_NEW_GATE_REFUSED[0] != 83 ))\nwhile (( _i < 3 )); do AGENT_NEW_GATE_REFUSED[0] = 83; done\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) READS and element COMPARISONS (quoted AND unquoted), a \`\${X#*=}\` strip, a bare exit \"\$X\", and an ARITHMETIC \`==\` in BOTH spellings all stay SILENT — an arm that reddens these is not a guard (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1c2) ⛔ AN INLINE COMMENT NAMING A FAMILY TOKEN IS NOW REFUSED, AND THAT IS DELIBERATE. This is the
+# arm that stops the strip from coming back. Four attempts to model "is this `#` a comment" each failed
+# OPEN (see the block above `row()`), so no text is discarded any more — and the price is that a
+# commented-out declaration reads as a RED instead of being silently ignored. It is the visible
+# direction, and it costs the shipped tree nothing: measured ZERO — re-run the command above `row()`
+# and the count is however many inline comments the tree has on the day you read it. Two DIVERGENT
+# integers for one measurement (this arm said 1132 while the header said 1149) is the class this file
+# spent four rounds eliminating, so the integer lives in ONE place, with its command, and this arm
+# states only the property that actually justifies the trade. A future "helpful" re-introduction of
+# the strip fails HERE, by name.
+_codemut_dir="$(_codemut inline-comment-decl)"
+printf '\ntrue # AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+# An `unparseable` row is named `unparseable declaration: <file>:<line>` (the contract's own form), not by
+# constant — assert THAT, since a red for some other reason would not prove this line was the one read.
+case "$CODE_MSG" in *"rejected: unparseable declaration: spawn-gate.sh:"*) rc=0 ;; *) rc=1 ;; esac
+[ "$CODE_RC" -eq 1 ] || rc=1
+ck "(no comment model) an INLINE COMMENT carrying a declaration is REFUSED as an unparseable declaration, not silently ignored — the deliberate cost of discarding no text at all (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1d) ⛔ THE COMMENT STRIP MUST KNOW WHAT A QUOTE IS (review of `8af952e0`, P1 — measured). The strip
+# was `sub(/[ \t]#.*$/, ...)`, a first-whitespace-then-`#` cut with NO quoting model — so a `#` inside a
+# QUOTED STRING truncated the line and a genuine declaration AFTER it vanished: 0 rows for the name and
+# RC=0 GREEN over a real duplicate of the skew code. That is the exact defect this scanner was rewritten
+# to close, reintroduced by the arm written to stop a false red, so it gets both directions pinned —
+# each alone is satisfiable by a strip that is simply wrong:
+#   1. a declaration AFTER a quoted `#` must still be READ (RED, naming the 83 collision);
+#   2. a quoted `#` with no declaration after it must still stay SILENT (the false red the strip exists
+#      for) — `echo "a # b"` and `echo 'a # b'`.
+_codemut_dir="$(_codemut comment-quote)"
+printf '\ntrue && echo "a # b" && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote-blind comment) a declaration AFTER a quoted \`#\` is still READ and collides — a strip that cuts at the quoted \`#\` reads this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-quote-control)"
+printf "\necho \"a # b\"\necho 'a # b'\n" >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(quoted-# control) a \`#\` inside \"…\" or '…' that names no family token stays SILENT — the other direction of the same arm (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1e) ⛔ A LONGER IDENTIFIER IS NOT A FAMILY TOKEN (review of `8af952e0`, P2 — measured). The claim
+# scan matches a PREFIX of the identifier and had no name boundary after the suffix, so
+# `AGENT_NEW_GATE_REFUSED_CHOICE` was read as the family name and refused as an `unparseable
+# declaration` — a false RED naming a variable that is not in the family at all. Pinned in BOTH
+# directions, because a boundary that simply stopped scanning would pass the first row and lose the
+# declaration on the second.
+_codemut_dir="$(_codemut longer-identifier)"
+printf '\nread -r AGENT_NEW_GATE_REFUSED_CHOICE\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(name boundary) a LONGER identifier that merely ENDS in a family suffix (\`AGENT_NEW_GATE_REFUSED_CHOICE\`) is not the family token and stays SILENT — no name boundary read it as an unparseable declaration (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut after-longer-identifier)"
+printf '\nread -r AGENT_NEW_GATE_REFUSED_CHOICE; AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(name boundary, other direction) a real declaration AFTER a longer identifier on the same line is still READ and collides — stepping over the identifier must not stop the scan (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1f) ⛔ THESE THREE CONSTRUCTS EACH DEFEATED A SUCCESSIVE ATTEMPT AT A COMMENT MODEL (review of
+# `f756d31b` and `aab646c5`, P1 — each measured through this predicate and confirmed against the shell).
+# In every row a real duplicate of 83 read GREEN with 0 rows while bash assigns 83:
+#   1. ANSI-C quoting `$'…\'…'` — `\'` IS an escape inside `$'…'`, so a quote-local model closed early;
+#   2. a BACKTICK substitution — a `#` in it comments the INNER command only, and the outer line goes on;
+#   3. a quote OPENED on one line and CLOSED on the next — awk is line-based.
+# There is no comment model any more (see the block above `row()`), so all three are READ for the trivial
+# reason that nothing is discarded. They stay as arms because they are the regression test FOR that
+# decision: re-introducing any strip that can lose text turns one of them GREEN and fails here.
+_codemut_dir="$(_codemut comment-ansi-c)"
+# A quoted heredoc, so the fixture is the LITERAL line bash would run — no printf escaping to get wrong.
+cat >> "$_codemut_dir/spawn-gate.sh" <<'PR_ANSI_C_ARM'
+true && echo $'it\'s # here' && AGENT_NEW_GATE_REFUSED=83
+PR_ANSI_C_ARM
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote model: ANSI-C) a declaration after a \$'...' string that contains an ESCAPED QUOTE and a \`#\` is still READ — a quote-local model closes the quote at the escaped one and reads this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-backtick)"
+printf '\nX=`printf %%s 83 # c` && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote model: backtick) a declaration after a BACKTICK substitution carrying a \`#\` is still READ — that \`#\` comments the INNER command only, so stripping here deletes code that runs (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-multiline-quote)"
+printf 'echo "usage: x\nb # c" && AGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(quote model: across lines) a declaration after a quote CLOSED on that line, when the quote was OPENED on the previous one, is still READ — awk is line-based, so per-line state read this GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1h) ⛔ A BACKSLASH-NEWLINE SPLITS THE NAME FROM ITS OPERATOR (review of `da2e2480`, P1 — three
+# measured fail-opens). awk is line-based, so `AGENT_NEW_GATE_REFUSED\` + `=83` gave the name no
+# operator and the operator no name: 0 rows, RC=0 GREEN, while bash assigns 83. Same for the `+=` form
+# and for a CALLER's stale default split that way — the very regression this namespace exists to catch.
+# The mirror spelling (operator first, value on the next line) WAS red, so the verdict turned on WHICH
+# SIDE of the break the operator landed on. Logical lines are joined now, and the arms below drive all
+# three shapes; each is GREEN if the join is ever removed.
+_codemut_dir="$(_codemut cont-eq)"
+printf '\nAGENT_NEW_GATE_REFUSED\\\n=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a declaration whose \`=\` sits on the NEXT line is READ and collides — awk is line-based, so an unjoined scan gives the name no operator and reads this GREEN (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut cont-plus-eq)"
+printf '\nAGENT_NEW_GATE_REFUSED\\\n+=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) the \`+=\` form split the same way is READ and collides (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut cont-stale-caller)"
+printf '\n_c="${AGENT_HARNESS_SKEW_REFUSED\\\n:-81}"\n' >> "$_codemut_dir/fix-one.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:fix-one.sh:"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a CALLER's stale \`:-81\` default split across lines is still caught as a stale default — the check this PR chiefly guards (rc=$CODE_RC; $CODE_MSG)" $rc
+# (f1j) ⛔ THE JOIN ITSELF HAD TWO FAIL-OPENS, BOTH MEASURED, BOTH REGRESSIONS (review of `424fafd7`,
+# P1). Joining before the whole-line-comment test swallowed the line after a comment ending in `\` —
+# bash ends a comment at the NEWLINE, so the next line executes. And an accumulator never flushed at EOF
+# dropped a declaration on a file's last line ending in `\` — bash discards the trailing backslash and
+# runs the line. Each is driven here; each reads GREEN if the fix is removed.
+_codemut_dir="$(_codemut comment-continuation)"
+printf '\n# gate note \\\nAGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a COMMENT line ending in \`\\\` does NOT swallow the declaration below it — bash ends a comment at the newline and runs the next line, so joining before the \`^#\` test read this GREEN (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut comment-block-continuation)"
+printf '\n# a \\\n# b \\\nAGENT_NEW_GATE_REFUSED=83\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a whole COMMENT BLOCK whose every line ends in \`\\\` does not swallow the declaration below it (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut dangling-last-line)"
+# NO trailing newline: the file's LAST byte is the backslash, which is the case bash still executes.
+printf '\nAGENT_NEW_GATE_REFUSED=83\\' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(continuation) a declaration on the file's LAST line ending in \`\\\` (no trailing newline) is READ — an accumulator that is never flushed at EOF drops it silently (rc=$CODE_RC; $CODE_MSG)" $rc
+# ⛔ AND THE SAME UNIT MUST BE ATTRIBUTED TO THE FILE IT IS IN (P1, review of `7d65a618` — measured).
+# `flush_unit()` is also called from the `FNR == 1` boundary, where `FILENAME` is already the file being
+# OPENED — so a unit dangling at the end of a NON-last file took the NEXT file's name. Measured on the
+# shipped scanner: `AGENT_NEW_GATE_REFUSED=83\` appended to `brief-gate.sh:274` emitted
+# `claim … key-gate.sh  274`, and `key-gate.sh` holds ZERO occurrences of that name. Only the LINE
+# number survived (both sides read `ACCFNR`), which is what made the wrong file hard to see. The arm
+# above cannot catch it: it appends to `spawn-gate.sh`, which sorts LAST in `*.sh` glob order, so the
+# EOF flush happens to name the right file. This one appends to a file that sorts in the MIDDLE, and
+# asserts the ROW (the artefact an operator acts on), not just that the verdict reddened.
+_codemut_dir="$(_codemut dangling-mid-file)"
+printf '\nAGENT_NEW_GATE_REFUSED=83\\' >> "$_codemut_dir/brief-gate.sh"
+_dmf_line="$(awk 'END{print NR}' "$_codemut_dir/brief-gate.sh")"
+_dmf_row="$(refusal_codes "$_codemut_dir" | awk -F'\t' -v n=AGENT_NEW_GATE_REFUSED '$1=="claim" && $2==n{print $4":"$5; exit}')"
+[ "$_dmf_row" = "brief-gate.sh:$_dmf_line" ]; rc=$?
+ck "(continuation) a dangling \`\\\` on the LAST line of a file that is NOT last in scan order is attributed to ITS OWN file (want: brief-gate.sh:$_dmf_line; got:${_dmf_row:- none}) — a unit flushed at the \`FNR == 1\` boundary named the file being OPENED, sending an operator to a file that does not contain the declaration (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1i) and the other direction: `==` is a COMPARISON, in both spellings. The spaced form was silent and
+# the UNSPACED form was refused, so the verdict held only by whitespace.
+_codemut_dir="$(_codemut arith-compare-tight)"
+printf '\n((AGENT_NEW_GATE_REFUSED==83))\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"AGENT_NEW_GATE_REFUSED"*) rc=1 ;; *) rc=0 ;; esac
+ck "(comparison) \`((X==83))\` UNSPACED is a comparison, not a declaration, and stays SILENT — the spaced form already did, so punctuation decided this one (rc=$CODE_RC; $CODE_MSG)" $rc
+_codemut_dir="$(_codemut arith-assign-tight)"
+printf '\n((AGENT_NEW_GATE_REFUSED=83))\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"83=AGENT_HARNESS_SKEW_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;; *) rc=1 ;; esac
+ck "(comparison) \`((X=83))\` UNSPACED is still an ASSIGNMENT and collides — the control for the row above (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1g) ⛔ A SCAN THAT COULD NOT RUN IS NOT A CLEAN SCAN (review of `aab646c5`, P2 — measured). The
+# scan was `awk … 2>/dev/null` with its status discarded, so a file awk could not open aborted the scan
+# mid-list and the verdict came back `RC=0 claims=14 unparseable: none` — a CLEAN report over a
+# population it had not read. Pointed at a directory that does not exist, the glob does not expand, awk
+# fails, and the verdict must be a RED that NAMES the failure rather than an empty-claim red that says
+# nothing about the scan. (Root-proof: no chmod involved, which a root CI runner would defeat.)
+_codemut_dir="$TMP/no-such-scan-dir"
+rm -rf "$_codemut_dir"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"scan-unreadable:"*) rc=0 ;; *) rc=1 ;; esac
+[ "$CODE_RC" -eq 1 ] || rc=1
+ck "(scan integrity) a scan that could NOT run reports \`scan-unreadable\` and reds — it must never read as a clean, quietly smaller scan (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f) THE FAIL-CLOSED HALF: an assignment OPERATOR on a family token that is NOT in a declaration
+# position cannot be classified, so it must be RED and NAMED WITH ITS LINE — never dropped. This is the
+# shape a quoting bug produces, and it is the one that reads identically to "nothing there" if the
+# parser is allowed to skip.
+_codemut_dir="$(_codemut unparseable)"
+printf '\necho "AGENT_NEW_GATE_REFUSED=83"\n' >> "$_codemut_dir/spawn-gate.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"unparseable declaration: spawn-gate.sh:$_wantline"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation f) a declaration-shaped line the parser CANNOT classify is REFUSED and named with its FILE:LINE (want 'spawn-gate.sh:$_wantline') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (f1) THE NAMESPACE IS NOT A BLIND SPOT (review of PR #3237, finding 1). The whole claim scan is
+# anchored on `*_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED`, so a gate code declared under another name
+# produced NO row and a GREEN verdict — measured before this arm existed: appending `AGENT_MEM_GATE=81`
+# (a real duplicate of the memory gate's code) to a copy left the verdict at RC=0 with
+# `absent: none unparseable: none`. The naming convention is a REAL constraint on this deploy unit, not
+# an assumption about the future, so it is asserted on BOTH sides: a foreign declaration is a RED, and
+# the shipped tree reports none.
+_codemut_dir="$(_codemut foreign-code)"
+printf '\nAGENT_MEM_GATE=81\n' >> "$_codemut_dir/spawn-gate.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign: spawn-gate.sh:AGENT_MEM_GATE=81"*) rc=0 ;; *) rc=1 ;; esac
+ck "(mutation f1) a code declared OUTSIDE the family namespace (\`AGENT_MEM_GATE=81\`, line $_wantline) is REFUSED and named — the claim scan is namespace-anchored, so this was GREEN with 0 rows (rc=$CODE_RC; $CODE_MSG)" $rc
+# (f1b) ⛔ NEITHER SPELLING NOR SHAPE MAY DECIDE THE VERDICT (review cycles 1 and 2 of PR #3237, P2).
+# Two blind spots were measured here, in this order — the first fix exposed the second:
+#   cycle 1 (head `5e6ab20c`): the net matched a BARE two-digit operand, so `AGENT_MEM_GATE=81` was RED
+#     while `="81"` / `='81'` / `=081` / `=+81` were GREEN with 0 rows.
+#   cycle 2 (head `cfc7a3a4`): the net then read the operand of `NAME=`/`NAME+=` only, so every
+#     declaration SHAPE the family chain classifies had no arm here — `AGENT_MEM_GATE[0]=81`,
+#     `[0]+=81`, `printf -v AGENT_MEM_GATE %d 81`, `(( AGENT_MEM_GATE = 81 ))`,
+#     `: "${AGENT_MEM_GATE:=81}"`, `declare -A M=([k]=81)` all read GREEN with 0 rows, and bash
+#     executes every one of them as a declaration of 81. `_REFUSED=81` was a third: the foreign skip
+#     tested a bare suffix while the claim scan needs a character BEFORE it, so a name that IS the
+#     suffix fell out of both nets.
+# Driven as a TABLE over BOTH axes, because the arm above catches exactly the one spelling of the one
+# shape it was written with — that is how each gap survived the arm that preceded it.
+_foreign_decl="$(printf '%s\n' \
+  'AGENT_MEM_GATE=81' \
+  'AGENT_MEM_GATE="81"' \
+  "AGENT_MEM_GATE='81'" \
+  'AGENT_MEM_GATE=081' \
+  'AGENT_MEM_GATE=+81' \
+  'AGENT_MEM_GATE[0]=81' \
+  'AGENT_MEM_GATE[0]+=81' \
+  'printf -v AGENT_MEM_GATE %d 81' \
+  '(( AGENT_MEM_GATE = 81 ))' \
+  ': "${AGENT_MEM_GATE:=81}"' \
+  'declare -A M=([k]=81)' \
+  '_REFUSED=81')"
+_unred_spell=""; _fsi=0
+while IFS= read -r _fsp; do
+  [ -n "$_fsp" ] || continue
+  _fsi=$((_fsi+1))
+  _codemut_dir="$(_codemut "foreign-shape-$_fsi")"
+  printf '\n%s\n' "$_fsp" >> "$_codemut_dir/spawn-gate.sh"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in *"foreign:"*) : ;; *) _unred_spell="$_unred_spell [$_fsp]" ;; esac
+done <<< "$_foreign_decl"
+# …and the non-vacuity guard: `_fsi` counts the forms actually DRIVEN, so an emptied table is a RED
+# here rather than a green sentence that names zero spellings it never checked.
+[ "$_fsi" -gt 0 ] && [ -z "${_unred_spell// /}" ]; rc=$?
+ck "...and EVERY spelling AND SHAPE of that foreign declaration is REFUSED ($_fsi forms: bare, quoted ×2, leading zero, plus-sign, array subscript, +=, printf -v, arithmetic, :=, associative literal, and the bare-suffix NAME) — a verdict that depends on how a constant was SPELLED is not a guard (unred:${_unred_spell:- none})" $rc
+# ... and the precision half: the net reads the VALUE A DECLARATION GIVES, not every uppercase
+# assignment, so widening the reader must not start reddening ordinary variables. Each line below is
+# declaration-SHAPED but declares no code: a computed value, an out-of-range number, a string that
+# merely begins with a code, a comparison, a printf whose value is a variable, and an array element
+# assigned from a variable. A net that reddened on shape alone would make all six foreign rows.
+_codemut_dir="$(_codemut foreign-noncode)"
+printf '\nFOO_NOTE="$bar"\nRC_TOKEN=812\nX_STR=81abc\n[ "$RC" = 81 ] && true\nprintf -v FOO %d $x\nFOO_A[0]=$v\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in *"foreign:"*) rc=1 ;; *) rc=0 ;; esac
+ck "(control) a declaration that carries NO CODE stays OUT of the foreign net — computed values, an out-of-range number, a string beginning with a code, a comparison, a printf of a variable and an array element from a variable are not gate declarations (rc=$CODE_RC; $CODE_MSG)" $rc
+# ... and the control for the other direction: the SAME code under FAMILY names is caught by the
+# COLLISION rule and reported as a collision, never as foreign — otherwise this arm could be the thing
+# reddening every duplicate and the namespace rule itself would be untested.
+_codemut_dir="$(_codemut foreign-control)"
+printf '\nAGENT_MEM_REFUSED=81\nAGENT_NEW_GATE_REFUSED=81\n' >> "$_codemut_dir/spawn-gate.sh"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"81=AGENT_MEM_REFUSED,AGENT_NEW_GATE_REFUSED"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(control) the same code under FAMILY names is caught as a COLLISION, not as foreign — the namespace arm and the duplicate arm measure different things (want '81=AGENT_MEM_REFUSED,AGENT_NEW_GATE_REFUSED') (rc=$CODE_RC; $CODE_MSG)" $rc
+case "$CODE_MSG" in *"foreign:"*) rc=1 ;; *) rc=0 ;; esac
+ck "...and that control reports NO foreign row — a family-named declaration is claimed, so the namespace arm cannot be what catches it (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (g) A READER DEFAULT (\`${X:-N}\`) IS READ, AND MUST AGREE WITH THE DECLARATION. It was another
+# dropped shape, and a stale one is not cosmetic: `fix-one.sh` LABELS a refusal from it, so a default
+# of 81 under the skew name relabels every skew refusal as the memory gate — the collision this PR
+# exists to end, reinstated by one digit and invisible to a claims-only scan because a default
+# declares nothing.
+_codemut_dir="$(_codemut stale-default)"
+printf '\ntrue && _c="${AGENT_HARNESS_SKEW_REFUSED:-81}"\n' >> "$_codemut_dir/spawn-gate.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(mutation g) a reader default that DISAGREES with the declaration is REFUSED and named (want 'AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (g0) THE ORDERING HALF, AND IT IS A SEPARATE ARCHETYPE (blocking finding, review of `3a94b3b`).
+# (g) above appends to the DECLARING file, where the claim happens to precede the default — so it
+# passes on a single-pass comparison and proves nothing about a CALLER. Every real caller
+# (`fix-one.sh`, `lane.sh`) sorts BEFORE `spawn-gate.sh`, so its fallback row is emitted before the
+# claim that gives it meaning; a single pass drops it and reports GREEN. Measured on `3a94b3b`: the
+# identical stale default appended to `fix-one.sh` left the verdict at RC=0 with no
+# `stale-defaults:` entry. `adopt-fix.sh` is used because it is the file in the mutant set that sorts
+# FIRST — the ORDERING is the property under test, not which caller the line lands in.
+_codemut_dir="$(_codemut stale-default-caller)"
+printf '\ntrue && _c="${AGENT_HARNESS_SKEW_REFUSED:-81}"\n' >> "$_codemut_dir/adopt-fix.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/adopt-fix.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:adopt-fix.sh:$_wantline=81(want 83)"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(mutation g0) a stale default in a CALLER file — emitted BEFORE the declaring file — is REFUSED too, so the comparison is two-pass and not glob-order luck (want 'AGENT_HARNESS_SKEW_REFUSED:adopt-fix.sh:$_wantline=81(want 83)') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (g3) ONE NAME UNDER TWO CODES — the MIRROR of the collision this section exists to end, and it was
+# GREEN (P1, review of `dcb499b7`). A name declared 79 in one helper and 84 in another passes both
+# rules above (each code is unique; each default may still agree), and its two readers then disagree
+# about which value is real — `codes_for_name` takes the FIRST row, `_cv_stale` the LAST — so a tree
+# whose runtime value is the second one is published as the first. Appended to `repo-target.sh`,
+# which sorts AFTER `adopt-fix.sh`, so this also pins that the LAST declaration is not silently
+# preferred over the first: the row names BOTH values and the file of the second one.
+_codemut_dir="$(_codemut redeclared)"
+printf '\nADOPT_DEFERRED=84\n' >> "$_codemut_dir/repo-target.sh"
+_wantline="$(awk 'END{print NR}' "$_codemut_dir/repo-target.sh")"
+codes_verdict "$_codemut_dir"
+case "$CODE_MSG" in
+  *"conflicting-declarations: ADOPT_DEFERRED:repo-target.sh:79,84"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck "(mutation g3) a name declared TWICE with different codes is REFUSED and names both values (want 'conflicting-declarations: ADOPT_DEFERRED:repo-target.sh:79,84') (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (g1, g2) A QUOTED DEFAULT IS STILL A DEFAULT — and this pair was a FALSE PASS (review round 3, P1,
+# REPRODUCED before it was fixed). `valof` cut the operand at its leading quote, the empty result was
+# read as `${X:-}` (a bare read, which legitimately declares nothing), so `${X:-"81"}` reddened
+# NOTHING while bash took 81 as the value — a stale default silently passing in the exact class this
+# block says is caught. Both quote styles, because the fix has to consume the CLOSING quote rather
+# than drop the character a regex happened to stop on.
+for _qtag in dq sq; do
+  _codemut_dir="$(_codemut quoted-default-$_qtag)"
+  if [ "$_qtag" = dq ]; then
+    cat >> "$_codemut_dir/spawn-gate.sh" <<'QDEF_DQ'
+true && _c="${AGENT_HARNESS_SKEW_REFUSED:-"81"}"
+QDEF_DQ
+  else
+    cat >> "$_codemut_dir/spawn-gate.sh" <<'QDEF_SQ'
+true && _c="${AGENT_HARNESS_SKEW_REFUSED:-'81'}"
+QDEF_SQ
+  fi
+  _wantline="$(awk 'END{print NR}' "$_codemut_dir/spawn-gate.sh")"
+  codes_verdict "$_codemut_dir"
+  case "$CODE_MSG" in
+    *"stale-defaults: AGENT_HARNESS_SKEW_REFUSED:spawn-gate.sh:$_wantline=81(want 83)"*) rc=0 ;;
+    *) rc=1 ;;
+  esac
+  ck "(mutation g/$_qtag) a QUOTED reader default that disagrees is REFUSED too — the first cut read it as \`\${X:-}\`, i.e. as clean (want line $_wantline) (rc=$CODE_RC; $CODE_MSG)" $rc
+done
+
+# (h) THE OTHER DIRECTION — a guard that reddens everything detects nothing. A default that AGREES
+# (bare AND quoted), a `${X:-}` with no default at all (a bare read: `lane.sh` does this), and a plain
+# READ with no assignment operator (`exit "$AGENT_X_REFUSED"`) are legitimate code and must stay GREEN,
+# or "fails closed" would just mean "always red".
+_codemut_dir="$(_codemut consistent-default)"
+cat >> "$_codemut_dir/spawn-gate.sh" <<'CONSIST'
+true && _c="${AGENT_HARNESS_SKEW_REFUSED:-83}"
+true && _q="${AGENT_HARNESS_SKEW_REFUSED:-"83"}"
+[ -n "${AGENT_LOAD_REFUSED:-}" ] && :
+exit "$AGENT_HARNESS_SKEW_REFUSED"
+_c="${AGENT_HARNESS_SKEW_REFUSED[0]}"
+_e="$(printf '%s' "${AGENT_HARNESS_SKEW_REFUSED#*=}")"
+if [ "$AGENT_HARNESS_SKEW_REFUSED" = 83 ]; then :; fi
+CONSIST
+codes_verdict "$_codemut_dir"
+ck "(control) a reader default that AGREES (:-83 and :-\"83\"), a \${X:-} bare read, a plain \$AGENT_HARNESS_SKEW_REFUSED READ, an ARRAY-ELEMENT read (\${X[0]}), a \${X#*=} strip and a \`[ \"\$X\" = 83 ]\` COMPARISON are ALL GREEN — the parse reddens what it cannot classify, not legitimate code, and the residual arm did not turn READS into reds (rc=$CODE_RC; $CODE_MSG)" $CODE_RC
+
+# Restore the real verdict for every reader below (the arms above drove copies).
+codes_verdict "$HERE"
+# ... and the REAL deploy unit must be clean in the two dimensions the arms above introduce: nothing
+# unparseable, nothing stale. Without this, a parser that reddened every copy (and every real tree)
+# would satisfy the arms above while telling the operator nothing.
+case "$CODE_MSG" in
+  *"rejected:"*|*"stale-defaults:"*|*"foreign:"*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck "the REAL deploy unit reports NOTHING unparseable, NO stale reader default and NO foreign code declaration — the fail-closed parse is not reddening the tree it ships on, and the namespace rule costs nothing on it (rc=$CODE_RC; $CODE_MSG)" $rc
+
+# (2) THE ARM TABLE. `<CONSTANT>:<wording the fixer's own log must carry>`. A row may PRECEDE its
+# gate (#2387's memory gate is declared here before main defines it): the moment that constant lands,
+# this row drives it, so the collision cannot be merged into main a second time without a red.
+_fixer_arms="AGENT_BRIEF_REFUSED:BRIEF gate
+AGENT_CAPABILITY_REFUSED:CAPABILITY gate
+AGENT_FORK_REFUSED:fork gate
+AGENT_LOAD_REFUSED:load gate
+AGENT_DISK_REFUSED:disk gate
+AGENT_HARNESS_SKEW_REFUSED:HARNESS/MISMATCH gate
+AGENT_MEM_REFUSED:memory gate"
+_armdecl=" $(printf '%s\n' "$_fixer_arms" | cut -d: -f1 | tr '\n' ' ')"
+# Completeness, in the direction that matters: every gate the FIXER CLASSIFIES must have a row.
+# Derived from fix-one.sh itself, so adding a `${AGENT_X_REFUSED:-…}` arm there without declaring it
+# here is a red rather than an unchecked arm.
+# ⛔ TWO PROPERTIES, NOT ONE (review of PR #3237, finding 3). The derivation used to be
+# `grep -o 'AGENT_[A-Z_]*_REFUSED'`, which was narrower than the scanner in TWO independent ways: it
+# could not see a `_BACKLOG`/`_DEFERRED`/`_UNAVAILABLE` gate (a fixer arm on the land gate, a LIVE
+# code at 74, would have been added with no row and reported `undeclared: none`), and it read
+# COMMENT text as if it were an arm. Both are fixed by the same step: strip comments, then take the
+# scanner's own four-suffix namespace, then SPLIT the population by what the fixer actually does with
+# the name — a gate the classifier COMPARES against is an arm and needs a row; one it merely `exit`s
+# with (the repo-target refusal, 72, which fires before the classifier is ever reached) is not an arm
+# and must be named as such instead of silently widening the table. Today the two sets are
+# {BRIEF,CAPABILITY,DISK,FORK,HARNESS_SKEW} and {REPO_TARGET_REFUSED}.
+# ⛔ WHOLE-LINE COMMENTS ONLY — THE INLINE STRIP WAS THE SAME FAIL-OPEN THE SCANNER JUST REMOVED (review of
+# `da2e2480`, P2 — measured). `sub(/[ \t]#.*/, "")` deleted the rest of any line carrying a ` #`, so a NEW
+# gate classified on such a line appeared in NEITHER the derived arm table NOR the declared set, and both
+# completeness checks passed over it. Measured: `true && echo "a # b" && _new="${AGENT_NEW_ARM_REFUSED:-85}"`
+# appended to a `fix-one.sh` copy left the derived set unchanged. Whole-line-only stripping yields the
+# IDENTICAL set on the real tree, so this costs nothing.
+_fixer_code="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$HERE/fix-one.sh")"
+# ⛔ AND THE FIX IS PINNED (review of `424fafd7`, P2). The derivation above is only ever run against the
+# SHIPPED `fix-one.sh`, so re-introducing the inline `sub(/[ \t]#.*/, "")` would pass every existing arm
+# in silence — the exact failure the comment above records as measured. This drives the DERIVATION over a
+# mutated copy instead: a new gate classified on a line that carries a ` #` must reach the classified set.
+_armut="$TMP/armut"; rm -rf "$_armut"; mkdir -p "$_armut"
+{ cat "$HERE/fix-one.sh"; printf '\ntrue && echo "a # b" && _new="${AGENT_NEW_ARM_REFUSED:-85}"\n'; } > "$_armut/fix-one.sh"
+_armut_cls="$(awk '{ sub(/^[ \t]*#.*/, ""); print }' "$_armut/fix-one.sh" \
+  | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u | tr '\n' ' ')"
+case " $_armut_cls " in *" AGENT_NEW_ARM_REFUSED "*) rc=0 ;; *) rc=1 ;; esac
+ck "(arm derivation) a gate classified on a line carrying a \` #\` REACHES the derived set — with an inline comment strip it appears nowhere and both completeness checks pass over it ($_armut_cls)" $rc
+_arm_nonclassifier="REPO_TARGET_REFUSED"   # exited at fix-one.sh:228, never compared
+_arm_cls=""; _arm_other=""
+for _ac in $(printf '%s\n' "$_fixer_code" \
+    | grep -oE '[A-Za-z_][A-Za-z0-9_]*(_REFUSED|_BACKLOG|_UNAVAILABLE|_DEFERRED)' | sort -u); do
+  # ⛔ A HERE-STRING, NOT `printf … | grep -q` (sigpipe-grep gate, #841/#864). ⛔ THE SHAPE IS BANNED
+  # UNCONDITIONALLY; IT WAS NOT A LIVE FALSE NEGATIVE HERE, AND SAYING SO MATTERS (P2, review of
+  # `dcb499b7`, which measured both halves). The race needs `set -o pipefail` in the INVOKING shell
+  # and a payload above the ~64 KiB pipe buffer after the match; this file sets only `set -u`
+  # (`:16`), a `bash <script>` child does not inherit a parent's `pipefail`, and the payload
+  # (`fix-one.sh` with comments stripped) is ~25 KB. Driven both ways on that head: the old and new
+  # forms returned the SAME `_arm_cls`. So this is the house form, not a repair of a measured
+  # failure — but the shape is one `set -o pipefail` (or one larger `fix-one.sh`) away from the
+  # false negative below, which is why `check-no-sigpipe-grep.sh` refuses it unconditionally.
+  # ⛔ AND THAT FAILURE IS MEASURED, not theoretical (the guard's own header: PR #751, 2026-09-12,
+  # where `pipeline-compliance` blocked a compliant PR): with pipefail on, a `grep -q` that matches
+  # early closes the pipe, the writer takes SIGPIPE, the pipeline's status becomes 141, and THIS test
+  # reads "not an arm" exactly when the name DID match — the same silently-unchecked-arm class the
+  # derivation exists to close. Driven with pipefail over this very payload: the old form classified
+  # 2 of the 5 arms.
+  if grep -qE "=[[:space:]]*\"\\\$\\{?${_ac}" <<<"$_fixer_code"; then
+    _arm_cls="$_arm_cls $_ac"
+  else
+    _arm_other="$_arm_other $_ac"
+  fi
+done
+_armmissing=""
+for _ac in $_arm_cls; do
+  case "$_armdecl" in *" $_ac "*) : ;; *) _armmissing="$_armmissing $_ac" ;; esac
+done
+[ -z "${_armmissing// /}" ]; rc=$?
+ck "every gate fix-one.sh CLASSIFIES has an arm-table row (undeclared:${_armmissing:- none}) — a new arm cannot be added without proving it is reachable" $rc
+# ... and the OTHER half of the same derivation: a family-named gate the fixer does not CLASSIFY must
+# be named in `_arm_nonclassifier`, so "it has no row" is always a decision rather than an oversight.
+_armstray=""
+for _ac in $_arm_other; do
+  case " $_arm_nonclassifier " in *" $_ac "*) : ;; *) _armstray="$_armstray $_ac" ;; esac
+done
+[ -z "${_armstray// /}" ]; rc=$?
+ck "every family-named gate fix-one.sh does NOT classify is DECLARED as a non-classifier (stray:${_armstray:- none}) — a gate that is exited rather than classified is a stated exclusion, not a silent one" $rc
+# The derivation must not be VACUOUS: a regex that stopped matching would make both arms above pass
+# by asserting nothing.
+[ -n "${_arm_cls// /}" ]; rc=$?
+ck "the arm derivation found at least one CLASSIFIED gate (\"${_arm_cls# }\") — a derivation that matches nothing proves nothing" $rc
+
+# The fixture: the shipped fix-one.sh beside the SHIPPED helper with ONE function APPENDED and
+# overridden — `run_agent`, whose RETURN VALUE is the classifier's whole input. Deriving the fixture
+# from the helper (rather than re-implementing a helper that returns a code) is what keeps this from
+# proving only that a `case` statement exists: every constant, every guard and every other function in
+# the fixture is the shipped code, and the prefix identity is asserted below so an edit to the
+# derivation cannot quietly diverge.
+_armdir="$RIG/armtable"; mkdir -p "$_armdir"
+cp "$HERE/fix-one.sh" "$HERE/spawn-gate.sh" "$HERE/repo-target.sh" "$HERE/repo-slug.sh" \
+   "$HERE/gate-policy.sh" "$HERE/brief-gate.sh" "$HERE/reviewer-preflight.sh" "$_armdir/"
+cat >> "$_armdir/spawn-gate.sh" <<'ARMTABLE_OVERRIDE'
+
+# ── FIXTURE OVERRIDE (spawn-gate.test.sh's arm table) ───────────────────────────────────────────
+# The fixer's classifier keys on run_agent's RETURN VALUE, so the return value is what is forced here;
+# nothing else in this helper is touched. Appended LAST so this definition wins at source time.
+run_agent() { AGENT_STARTED=0; return "${FIXTURE_GATE_RC:-75}"; }
+ARMTABLE_OVERRIDE
+head -n "$(wc -l < "$GATE" | tr -d ' ')" "$_armdir/spawn-gate.sh" | diff -q - "$GATE" >/dev/null; rc=$?
+ck "the arm-table fixture differs from the shipped helper ONLY by the appended run_agent override" $rc
+grep -q '^run_agent() { AGENT_STARTED=0; return "\${FIXTURE_GATE_RC:-75}"; }$' "$_armdir/spawn-gate.sh"; rc=$?
+ck "...and the override really is there (a derived fixture that silently dropped it would drive the real gate)" $rc
+
+# ⛔ `_armseen` IS READ, AND IT DECIDES THE VERDICT BELOW (review of PR #3237, finding 3). It used to
+# be written three times and read NOWHERE, so "every row was driven" was a claim with no assertion
+# behind it — a status that read better than reality, in a section whose entire subject is exactly
+# that. Every row now RECORDS its own outcome here, and the check after the loop requires the record
+# to account for every declared row AND requires at least one row to have been DRIVEN: a table whose
+# rows had all become forward-declarations would otherwise pass while proving nothing.
+_armseen=""
+# ⛔ `fix_argv` IS RE-BUILT BEFORE EVERY ROW, NOT ONCE: `fix-one.sh --argv` CONSUMES the file
+# (`rm -f "$ARGV"` at its own :10), so a single build would drive row 1 and leave rows 2..n asserting
+# on "missing argv file" — measured on the first cut of this section, where only the first gate passed.
+# ⛔ ITERATED PER LINE, NOT PER WORD (review of PR #3237, finding 3 — found by the accounting check
+# below on its first run). `for _row in $_fixer_arms` word-splits on whitespace, so a row whose wording
+# contains a space (`AGENT_BRIEF_REFUSED:BRIEF gate`) became TWO iterations: the real one, plus a bogus
+# `gate` row whose "constant" is the word `gate`. The bogus rows are inert, so every arm still PASSED
+# and the table drove only half of itself — a defect no arm-level assertion could see, because each arm
+# was individually correct. A here-string loop runs in THIS shell (no subshell), so `_armseen` survives.
+while IFS= read -r _row; do
+  [ -n "$_row" ] || continue
+  _ac="${_row%%:*}"; _aw="${_row#*:}"
+  # The VALUE comes from the one scanner. A name that is DECLARED but unreadable is never mistaken for
+  # an absent one: that case is an `unknown` row and a RED in the mutation arms above.
+  _av="$(codes_for_name "$_ac")"
+  # A forward-declared row (the gate is not on this tree yet) is inert, not vacuous: it fires the day
+  # the constant lands, which is the whole point of declaring it early.
+  [ -n "$_av" ] || { _armseen="$_armseen ${_ac}=forward-declared"; continue; }
+  fix_argv
+  : > "$RO/logs/fix-7.log"; printf '2\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"
+  ( cd "$RREPO" && O="$RO" FIXTURE_GATE_RC="$_av" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 \
+      DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 PATH="$RIG/bin:$PATH" \
+      PI_LOG="$PI_LOG" MERGE_LOG="$MERGE_LOG" \
+      bash "$_armdir/fix-one.sh" --argv "$RIG/argv7" ) >"$_armdir/arm-$_ac.out" 2>&1; _arc=$?
+  if grep -q "fixer NOT started ($_aw" "$RO/logs/fix-7.log" 2>/dev/null && [ "$_arc" = "$_av" ]; then rc=0; else rc=1; fi
+  _armgot="$(grep -o 'fixer NOT started ([^:)]*' "$RO/logs/fix-7.log" 2>/dev/null | head -1 | sed 's/.*(//')"
+  # On a red, the fixture's OWN output is quoted: a label that says only "no refusal line" hides
+  # whether the arm missed the classifier, the derivation, or the fixture.
+  _armwhy=""
+  [ "$rc" -eq 0 ] || _armwhy=" | fixer said: $(tail -2 "$_armdir/arm-$_ac.out" 2>/dev/null | tr '\n' ' ' | cut -c1-240)"
+  ck "fix-one.sh NAMES '$_aw' when the gate returns $_ac ($_av) and REPUBLISHES that code (read: '${_armgot:-<no refusal line>}', rc=$_arc)$_armwhy" $rc
+  _armseen="$_armseen ${_ac}=driven"
+done <<< "$_fixer_arms"
+# The assertion `_armseen` exists for. One token per row, so `wc -w` counts rows; a row that falls
+# through the loop without recording itself (a future `continue`, a `break`) is a RED here even though
+# no individual arm failed, which is the only way "every row was driven" can be FALSIFIABLE.
+_armrows="$(printf '%s\n' "$_fixer_arms" | awk 'NF{n++} END{print n+0}')"
+_armacct="$(printf '%s' "$_armseen" | wc -w | tr -d ' ')"
+# ⛔ THE PATTERN IS `=driven`, NOT ` driven` — the entries are `NAME=driven`, so a search for the
+# word alone with a leading SPACE matched nothing and this check failed on a full green table
+# (measured on the first full run of this section, 7 of 7 rows driven and still red).
+case " $_armseen " in *"=driven "*) _armdriven=1 ;; *) _armdriven=0 ;; esac
+{ [ "$_armacct" -eq "$_armrows" ] && [ "$_armdriven" -eq 1 ]; }; rc=$?
+ck "every arm-table row is ACCOUNTED FOR after the drive — driven or explicitly forward-declared, and at least ONE driven (rows: $_armrows, accounted: $_armacct —$_armseen)" $rc
 
 # ── 11) the DISK gate (#1765) ─────────────────────────────────────────────
 # The measured incident: pi-lane-1 hit 100% twice — 2026-10-15 (`/dev/root 32G, 30G used, 0 avail`,
@@ -1883,8 +4113,8 @@ cp "$GATE" "$ND/gate/pi"
 # stub at `$TMP/bin/pi` appends one line per invocation, so an EMPTY file is proof it never ran.
 nd_out="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PI_LOG="$PI_LOG" PATH="$TMP/bin:/usr/bin:/bin" \
           bash "$ND/gate/pi" -p noop 2>&1)"; nd_rc=$?
-[ "$nd_rc" -eq 81 ]; rc=$?
-ck "the spawn point REFUSES (81) when capacity.sh is unresolvable — it does not WARN and launch (rc=$nd_rc)" $rc
+[ "$nd_rc" -eq 83 ]; rc=$?
+ck "the spawn point REFUSES (83) when capacity.sh is unresolvable — it does not WARN and launch (rc=$nd_rc)" $rc
 [ ! -s "$PI_LOG" ]; rc=$?
 ck "...and the stub pi was NOT invoked (its log is empty) — 'the fork floor is off' is no longer a launch" $rc
 case "$nd_out" in *'fork headroom UNREADABLE'*'searched: '*) rc=0 ;; *) rc=1 ;; esac
@@ -1915,7 +4145,27 @@ nd4="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/nonum" HOME="$ND/home" PATH="$
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 case "$nd4" in *'state=nodeploy'*'NO USABLE NUMBER'*) rc=0 ;; *) rc=1 ;; esac
 ck "a NON-NUMERIC headroom REFUSES (nodeploy) instead of skipping the test and answering ok [$nd4]" $rc
-nd5="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$(dirname "$cap_abspath")" CAP_MIN_FORK_HEADROOM=abc HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+# ⛔ THE KNOB'S OWN VALIDATION IS DRIVEN THROUGH A MODULE THAT DOES NOT REWRITE IT (merge onto main,
+# after `#3479`). Both `nd5` and `nd9` below set a BAD `CAP_MIN_FORK_HEADROOM` and require the GATE to
+# refuse it. On this branch's base that worked against the shipped `capacity.sh`; `c3839eb7` (#3479)
+# then gave `capacity.sh` its own sanitising seam —
+#   CAP_MIN_FORK_HEADROOM="$(cap_int_seam CAP_MIN_FORK_HEADROOM "${CAP_MIN_FORK_HEADROOM:-200}" 200)"
+# — so the bad value is replaced by 200 BEFORE the gate's `is_limit` arm can see it, and the arm read
+# `state=ok` on a tree where nothing had regressed. That is not a weakening of the arm and not a
+# behaviour change: the GATE's refusal is what protects a spawn whose module is an OLDER deployed copy
+# (no sanitising seam) — the exact skew this whole change is about — so the arms point `O` at a
+# complete module with no knob handling and keep their assertions verbatim. The shipped pair's own
+# behaviour (a typo silently becoming 200) is a separate observation, recorded on the PR rather than
+# asserted here.
+mkdir -p "$ND/knob"
+cat > "$ND/knob/capacity.sh" <<'PIKNOB'
+# Hermetic COMPLETE module with NO `CAP_*` handling: the gate's own knob validation must be the thing
+# under test, so this copy deliberately neither defaults nor sanitises anything.
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 401; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( ${2:-0} - ${1:-0} ))"; return 0; }
+cap_fork_probe() { :; }
+PIKNOB
+nd5="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/knob" CAP_MIN_FORK_HEADROOM=abc HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 case "$nd5" in *'state=nodeploy'*'CAP_MIN_FORK_HEADROOM'*) rc=0 ;; *) rc=1 ;; esac
 ck "...and a NON-NUMERIC CAP_MIN_FORK_HEADROOM REFUSES too, naming the knob (no silent \`[: integer expression expected\`) [$nd5]" $rc
@@ -1933,7 +4183,7 @@ nd8="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/huge" HOME="$ND/home" PATH="$T
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 case "$nd8" in *'state=nodeploy'*'NO USABLE NUMBER'*) rc=0 ;; *) rc=1 ;; esac
 ck "a headroom BEYOND INTMAX REFUSES — [ -lt ] above intmax is a FALSE condition, so it used to answer ok and launch [$nd8]" $rc
-nd9="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$(dirname "$cap_abspath")" CAP_MIN_FORK_HEADROOM=999999999999999999999999 HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+nd9="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/knob" CAP_MIN_FORK_HEADROOM=999999999999999999999999 HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
        bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
 case "$nd9" in *'state=nodeploy'*'not a usable number'*) rc=0 ;; *) rc=1 ;; esac
 ck "...and a BEYOND-INTMAX CAP_MIN_FORK_HEADROOM REFUSES rather than silently disabling the floor [$nd9]" $rc
@@ -1970,18 +4220,18 @@ nd2="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home2" PATH="$TMP/bin:
        bash -c '. "$1"; if spawn_gate_load_capacity; then echo RESOLVED; else echo UNREACHABLE; fi' _ "$ND/gate/pi" 2>&1)"
 case "$nd2" in *RESOLVED*) rc=0 ;; *) rc=1 ;; esac
 ck "with O UNSET the instrument is still FOUND in \$HOME/orchestrator — the floor enforces itself where it is installed as pi ($nd2)" $rc
-# ⛔ STRUCTURAL, AND SAID SO: the two 81 arms added for cycle-1 P1/P2 are ordered before the code that
+# ⛔ STRUCTURAL, AND SAID SO: the two 83 arms added for cycle-1 P1/P2 are ordered before the code that
 # would swallow them. This is a grep, not a drive — a behavioural fixture for `merge-one.sh`/`review-pr.sh`
 # needs a whole reviewer/repo rig, and claiming one here would be worse than naming the limit.
-m81="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-81' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+m83="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-83' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
 m80="$(grep -n 'AGENT_BRIEF_REFUSED:-80' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
 mex="$(grep -n 'THE EXTRACTOR MUST ADMIT' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
-[ -n "$m81" ] && [ -n "$m80" ] && [ -n "$mex" ] && [ "$m81" -gt "$m80" ] && [ "$m81" -lt "$mex" ]; rc=$?
-ck "STRUCTURAL: merge-one.sh's 81 arm sits AFTER 80 and BEFORE the verdict extractor ($m80 < $m81 < $mex)" $rc
-r81="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-81' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
+[ -n "$m83" ] && [ -n "$m80" ] && [ -n "$mex" ] && [ "$m83" -gt "$m80" ] && [ "$m83" -lt "$mex" ]; rc=$?
+ck "STRUCTURAL: merge-one.sh's 83 arm sits AFTER 80 and BEFORE the verdict extractor ($m80 < $m83 < $mex)" $rc
+r83="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-83' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
 rnn="$(grep -n 'THE EXIT STATUS IS THE SIGNAL' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
-[ -n "$r81" ] && [ -n "$rnn" ] && [ "$r81" -lt "$rnn" ]; rc=$?
-ck "STRUCTURAL: review-pr.sh's 81 arm sits BEFORE its non-zero-exit fallthrough ($r81 < $rnn)" $rc
+[ -n "$r83" ] && [ -n "$rnn" ] && [ "$r83" -lt "$rnn" ]; rc=$?
+ck "STRUCTURAL: review-pr.sh's 83 arm sits BEFORE its non-zero-exit fallthrough ($r83 < $rnn)" $rc
 
 # END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
 # code (74, not 77/75), and the log says why.
@@ -2505,7 +4755,329 @@ ck "a NON-NUMERIC reading fails OPEN like an empty one — it is not a claim tha
 grep -q 'disk-gate.*WARN.*could not read free space' "$LOG"; rc=$?
 ck "...and a NON-NUMERIC reading is ANNOUNCED too — the predicates call it unreadable, so the log must agree" $rc
 
-# ── 12) a lane killed at its CAP keeps its work (#2045) ─────────────────────────────
+# ── 12) the MEMORY gate (agent-infra#2387) ───────────────────────
+# THE DEFECT: this file gated on load, disk and the land ratio and consulted NO memory probe, on a box
+# whose OOM killer was taking lanes. MEASURED 2026-10-23 on cell-4 (16 GB): six `dmesg` "killed
+# process" events inside two hours while the controller kept dispatching, and the dead runs included
+# the P0 capstone lane. Every one of those spawns passed the load gate and the disk floor.
+#
+# ⛔ WHAT IS PROVEN HERE, AND THE ONE THING THAT IS NOT. The gate is driven END TO END through the
+# SHIPPED `run_agent` and the SHIPPED `mem_avail_mb`, in BOTH directions, and the same for the shim's
+# translation arm. What is NOT proven is that the shipped DEFAULT floor would have refused the exact
+# cell-4 snapshot — it would not (`available=8379 MB` clears a 2048 MB floor), and the README says so
+# in as many words rather than implying otherwise. The default's job is to remove the STRUCTURAL gap
+# (a spawn path that reads no memory figure cannot be bounded by any floor) and to refuse the
+# documented cell-3 reading (`653 MB`). The two arms below that matter for vacuity: a FABRICATED low
+# reading must REFUSE and a FABRICATED high reading must ALLOW through the same shipped code path,
+# and separately the REAL probe must drive both verdicts through its floor — a gate whose verdict is
+# constant (always refuse, or always allow) fails one of each pair.
+
+drive_mem() { # drive_mem <fake-reading|UNREADABLE> <floor-mb>
+  local reading="$1" floor="$2"
+  : > "$PI_LOG"
+  PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 \
+  MEM_MIN_AVAIL_MB="$floor" MEM_FAKE="$reading" bash -c '
+    . "$1"
+    cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
+    # THE PROBE IS THE SEAM, exactly as `drive()` re-declares `load1` and the way every box supplies
+    # its own reading in production. Only the READING is replaced: the verdict, the refusal line, the
+    # ledger row, the exit code and the ordering are all the shipped file.
+    mem_avail_mb() { [ "$MEM_FAKE" = "UNREADABLE" ] && return 1; printf "%s" "$MEM_FAKE"; }
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "mem gate test" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"
+  ' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO"
+}
+
+# ── the PARSER, against fabricated /proc/meminfo files in the SHIPPED format ─────────────────────
+# ⛔ NOT A STUBBED PARSER: `mem_avail_mb` is given a FILE (its documented test seam, the same idiom as
+# `load1`'s), so this drives the real awk that runs on a cell. The numbers are the incident's:
+# cell-3 read `MemAvailable: 653 MB`; on the same box `MemFree` reads ~180 MB while ~9 GB of page
+# cache sits in `Cached`, which is the whole reason the probe must read `MemAvailable`.
+LOWMEM="$TMP/meminfo-low"; HIGHMEM="$TMP/meminfo-high"; NOCACHE="$TMP/meminfo-old-kernel"
+printf 'MemTotal:       16331136 kB\nMemFree:          180000 kB\nMemAvailable:     668672 kB\nBuffers:           12000 kB\nCached:          9000000 kB\n' > "$LOWMEM"
+printf 'MemTotal:       16331136 kB\nMemFree:         4194304 kB\nMemAvailable:   12582912 kB\nCached:          5000000 kB\n' > "$HIGHMEM"
+# A kernel too old to expose MemAvailable (pre-3.14): only MemFree + Cached.
+printf 'MemTotal:       16331136 kB\nMemFree:          180000 kB\nCached:           6100000 kB\n' > "$NOCACHE"
+read_mem() { bash -c '. "$1"; mem_avail_mb "$2"' _ "$GATE" "$1" 2>/dev/null; }
+
+prc=1; got="$(read_mem "$LOWMEM")"
+[ "$got" = "653" ] && prc=0
+ck "POSITIVE CONTROL: mem_avail_mb parses a real /proc/meminfo shape (668672 kB -> ${got:-<empty>}MB, want 653)" $prc
+got="$(read_mem "$HIGHMEM")"
+[ "$got" = "12288" ]; rc=$?
+ck "...and a HIGH reading comes back as itself (12582912 kB -> ${got:-<empty>}MB, want 12288)" $rc
+# ⛔ MemAvailable, NEVER MemFree: the file above says MemFree=180000 kB (175 MB) and Cached=9000000 kB.
+# A probe built on either single field answers 175 or ~8800 and the gate is wrong in the direction that
+# matters (175 refuses healthy spawns; MemFree+Cached on a modern kernel OVER-reports headroom).
+got="$(read_mem "$LOWMEM")"
+{ [ "$got" != "175" ] && [ "$got" != "8967" ]; }; rc=$?
+ck "...and it reads MemAvailable, not MemFree (175MB) and not MemFree+Cached — page cache makes MemFree a lie (got ${got}MB)" $rc
+got="$(read_mem "$NOCACHE")"
+[ "$got" = "6132" ]; rc=$?
+ck "a kernel with no MemAvailable line FALLS BACK to MemFree+Cached (got ${got:-<empty>}MB, want 6132)" $rc
+# A readable file with NO usable field must fail (rc!=0, empty) — that is the input UNREADABLE is for.
+# (A MISSING file cannot prove it: the probe legitimately falls through to vm_stat there.)
+printf 'Nothing: 1\n' > "$TMP/meminfo-empty"
+got="$(read_mem "$TMP/meminfo-empty")"; mrc=$?
+{ [ "$mrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "an unparseable meminfo FAILS (rc=$mrc, '${got:-<empty>}') — it is not a reading, so it cannot default to one" $rc
+
+# ⛔ A FIELD THAT IS PRESENT BUT NOT A NUMBER IS **NOT A READING** (review, blocking). The pre-fix
+# parser tested only `a != ""`, so `MemAvailable: notanumber kB` reached `printf "%d"` and awk
+# COERCED it to 0 with exit 0 — measured `probe rc=0 out=0`. Three consequences, all of them wrong
+# artifacts rather than wrong messages: the refusal took the LOW arm (so the operator was told to wait
+# for resident lanes while the real cause was a broken probe), `state/mem-avail.tsv` recorded `0` as a
+# measurement in the series an incident is diagnosed from, and the UNREADABLE arm in `mem_gate_verdict`
+# became unreachable from the only caller. The arm below fails on that code and passes on a parser that
+# `exit 1`s like it does for an absent field.
+printf 'MemTotal: 1000 kB\nMemAvailable: notanumber kB\n' > "$TMP/meminfo-badfield"
+got="$(read_mem "$TMP/meminfo-badfield")"; mrc=$?
+{ [ "$mrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "a PRESENT-but-NON-NUMERIC MemAvailable FAILS (rc=$mrc, '${got:-<empty>}') — awk coercion must not turn a broken probe into the number 0" $rc
+# …and the same input driven END TO END must reach the UNREADABLE remedy, not the LOW one — and must
+# never write a fabricated `0` into the durable series. The reading is taken by the SHIPPED parser
+# (below) and then handed to the shipped `run_agent` through the same probe seam every other arm uses.
+# ⛔ THIS READ `meminfo-badfield2` — A PATH NOTHING WROTE (found by running this suite on a Darwin host
+# while fixing #2591). A MISSING file is not the input under test: `read_mem` legitimately falls through
+# to the live probe there, so the run took a REAL reading (`avail=1028`), the two assertions below
+# reddened on a host the gate was fine on — and, worse, the one above PASSED for the wrong reason (a
+# LOW reading refuses 81 exactly like an UNREADABLE one, so "REFUSES as UNREADABLE" was satisfied by a
+# refusal that never said UNREADABLE). One path, written once, used twice.
+bad_avail="$(read_mem "$TMP/meminfo-badfield")"
+res="$(drive_mem "${bad_avail:-UNREADABLE}" 2048)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "…and end to end that input REFUSES as UNREADABLE rather than as a LOW reading ($res)" $rc
+grep -q '\[mem-gate\] REFUSED .*UNREADABLE' "$LOG"; rc=$?
+ck "…with the UNREADABLE line, so the remedy names the broken PROBE and not resident lanes" $rc
+bf="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null | cut -f4)"
+{ [ "$bf" = "UNREADABLE" ] || [ -z "$bad_avail" ]; }; rc=$?
+ck "…and the durable series never records a fabricated 0 for it (avail='${bf:-<none>}')" $rc
+
+# ⛔ THE macOS PAGE SIZE IS REQUIRED, NOT DEFAULTED (review, P3). `if (ps=="") ps=16384` made the ONE
+# arm of this otherwise fail-closed gate read FAIL-OPEN on a 4 KiB-page host: an unparseable header
+# substituted a 4x-larger page size and still returned a number, i.e. an ALLOW on a box below the
+# floor. Both shapes are driven through a fake `vm_stat` (the probe falls through to it whenever the
+# meminfo path is unreadable, which is exactly what a Darwin host looks like):
+#   (a) NO header at all — the 16384 default;
+#   (b) a header whose size field is not a number.
+VSTUB="$TMP/vmstat"; mkdir -p "$VSTUB"
+printf '#!/bin/sh\nprintf "Mach Virtual Memory Statistics: (page size of %%s bytes)\\nPages free: 100000.\\nPages inactive: 200000.\\n" "16K"\n' > "$VSTUB/vm_stat"
+chmod +x "$VSTUB/vm_stat"
+got="$(PATH="$VSTUB:$PATH" bash -c '. "$1"; mem_avail_mb /nonexistent-proc-meminfo' _ "$GATE" 2>/dev/null)"; vrc=$?
+{ [ "$vrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "(a) a NON-NUMERIC page size is UNREADABLE, not a coerced 16 (rc=$vrc, '${got:-<empty>}')" $rc
+printf '#!/bin/sh\nprintf "Mach Virtual Memory Statistics:\\nPages free: 100000.\\nPages inactive: 200000.\\n"\n' > "$VSTUB/vm_stat"
+chmod +x "$VSTUB/vm_stat"
+got="$(PATH="$VSTUB:$PATH" bash -c '. "$1"; mem_avail_mb /nonexistent-proc-meminfo' _ "$GATE" 2>/dev/null)"; vrc=$?
+{ [ "$vrc" -ne 0 ] && [ -z "$got" ]; }; rc=$?
+ck "(b) a MISSING page-size header is UNREADABLE, not the 16384 default that over-reports 4x and ALLOWS (rc=$vrc, '${got:-<empty>}')" $rc
+# POSITIVE CONTROL for both arms: a well-formed vm_stat is still read (so the two failures above are
+# not "vm_stat never works").
+printf '#!/bin/sh\nprintf "Mach Virtual Memory Statistics: (page size of 16384 bytes)\\nPages free: 1000.\\nPages inactive: 2000.\\n"\n' > "$VSTUB/vm_stat"
+chmod +x "$VSTUB/vm_stat"
+got="$(PATH="$VSTUB:$PATH" bash -c '. "$1"; mem_avail_mb /nonexistent-proc-meminfo' _ "$GATE" 2>/dev/null)"
+[ "$got" = "46" ]; rc=$?
+ck "POSITIVE CONTROL: a well-formed vm_stat is still read (3000 pages x 16384 B -> ${got:-<empty>}MB, want 46)" $rc
+
+# ⛔ THE TWO PROBES MUST NOT DRIFT APART (agent-infra#1732 read it for the controller, #2387 for the
+# spawn). orch-loop.sh and this file each carry ONE `mem_avail_mb`, and two readers that disagree
+# would let the controller authorise a dispatch the spawn point then refuses — with two different
+# numbers in the two logs. Pinned as a TEXT EQUALITY of the function bodies, so editing either alone
+# is red (and the fix is one edit in both, as the comment in spawn-gate.sh says).
+mb_a="$(sed -n '/^mem_avail_mb()/,/^}/p' "$GATE")"
+mb_b="$(sed -n '/^mem_avail_mb()/,/^}/p' "$HERE/orch-loop.sh")"
+{ [ -n "$mb_a" ] && [ "$mb_a" = "$mb_b" ]; }; rc=$?
+ck "the spawn gate's mem_avail_mb is BYTE-IDENTICAL to orch-loop.sh's — two readers, one reading ($(printf '%s' "$mb_a" | wc -l | tr -d ' ') lines)" $rc
+
+# ── the FLOOR's arithmetic ──────────────────────────────────────────────────────
+dfl="$(env -u MEM_MIN_AVAIL_MB bash -c '. "$1"; printf "%s/%s/%s" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$dfl" = "2048/1024/2" ]; rc=$?
+ck "the shipped DEFAULT floor is DERIVED and reproduces: mem_min_avail_mb/reserve/lanes = $dfl (want 2048/1024/2)" $rc
+# A 0 floor can never refuse (`[ "$mb" -lt 0 ]` is false for every reading) — the no-op gate
+# shape this file refuses everywhere else. Repaired at source time, like DISK_MIN_FREE_MB.
+z="$(MEM_MIN_AVAIL_MB=0 bash -c '. "$1"; printf "%s" "$MEM_MIN_AVAIL_MB"' _ "$GATE")"
+[ "$z" = "2048" ]; rc=$?
+ck "a 0 floor is REPAIRED to the derived default, not honoured — a gate that can never refuse is not a gate (got '$z')" $rc
+# The derived floor must stay inside the range its own predicate accepts: `is_limit` takes 9 digits, so
+# the product of two 9-digit factors could be 10+ digits, and the guard that 'repairs an out-of-range
+# value' would then accept one. Assert the INVARIANT, not one magic value — the disk band's rule.
+ov="$(MEM_LANE_RESERVE_MB=999999999 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '
+  . "$1"
+  if [ "${#MEM_MIN_AVAIL_MB}" -le 9 ] && [ "$MEM_MIN_AVAIL_MB" -ge 1 ]; then echo ok;
+  else echo "out-of-range floor=$MEM_MIN_AVAIL_MB (len=${#MEM_MIN_AVAIL_MB})"; fi' _ "$GATE")"
+[ "$ov" = "ok" ]; rc=$?
+ck "an absurd reserve is REPAIRED so the derived floor stays inside is_limit's range ($ov)" $rc
+# ⛔ AND EACH FACTOR IS REPAIRED AT SOURCE, NOT ONLY BECAUSE THE PRODUCT FAILED LATER (review, P2).
+# The reserve carried an upper guard and the LANE FACTOR did not, so an absurd lane factor was caught
+# one level down: the 13-digit product failed `is_limit`, the FLOOR was repaired to 2048, and the
+# factor an operator reads stayed at 999999999 — a value the gate silently does not use, which is the
+# "accepted value must be the used value" contract broken in the other direction. Both factors now
+# repair to their shipped defaults, and the assertion is on the FACTOR because that is the input.
+lf="$(MEM_LANE_RESERVE_MB=1024 MEM_SPAWN_RESERVE_LANES=999999999 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lf" = "2" ]; rc=$?
+ck "an absurd LANE FACTOR is REPAIRED to the shipped default at source (got '${lf:-<empty>}', want 2) — not merely masked by the floor's own range net" $rc
+lz="$(MEM_SPAWN_RESERVE_LANES=0 bash -c '. "$1"; printf "%s" "$MEM_SPAWN_RESERVE_LANES"' _ "$GATE")"
+[ "$lz" = "2" ]; rc=$?
+ck "…and a zeroed lane factor is repaired too (got '$lz') — a 0x floor is the no-op gate" $rc
+
+# ── the VERDICT, end to end through the SHIPPED run_agent: FABRICATED readings ────────────────────
+# POSITIVE CONTROL FIRST (this file's rule): the same driver, a high reading, the agent must RUN —
+# otherwise the refusal below proves only that a refuse-everything gate refuses.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem 12288 2048)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "POSITIVE CONTROL: MemAvailable=12288M >= 2048M ALLOWS — the agent starts ($res)" $rc
+grep -q PI_RAN "$PI_LOG"; rc=$?
+ck "...and the model really was invoked on that reading (proven live, so the refusal below is not vacuous)" $rc
+
+: > "$LOG"; : > "$PI_LOG"
+rows_w0=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w0="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+res="$(drive_mem 653 2048)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "a FABRICATED low reading (653M) REFUSES: rc=81, AGENT_STARTED=0 ($res)" $rc
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "no model was invoked on a memory refusal (~proven live by the control above)" $rc
+# THE REFUSAL MUST BE AUDITABLE: the reading, the floor, the arithmetic that produced it, and the
+# remedy (a lane must FINISH — waiting for load is not it). An operator who cannot recompute the
+# number against the box cannot tell this apart from a policy someone typed.
+grep -q '\[mem-gate\] REFUSED .*MemAvailable=653M < mem_min_avail_mb=2048M (= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2' "$LOG"; rc=$?
+ck "the refusal names the gate, the MEASURED reading, the floor AND the arithmetic (reserve x lanes)" $rc
+grep -q 'clears when resident lanes FINISH' "$LOG"; rc=$?
+ck "...and names the remedy as RESIDENT LANES FINISHING, not 'wait for load to fall' — the remedies differ" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "a memory refusal is NOT reported as a load refusal (a box at its memory floor can have load 2)" $rc
+rows_w1=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_w1="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+[ "$rows_w1" = "$rows_w0" ]; rc=$?
+ck "a memory refusal appends NO walltime row — no agent ran, so a row would fabricate a zero sample ($rows_w1 vs $rows_w0)" $rc
+# ... but it DOES append a mem-avail row, with the reading and the floor: the series that answers "how
+# close did we get", which is the measurement that would have caught this incident early.
+mrow="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null)"
+mf4="$(printf '%s' "$mrow" | cut -f4)"; mf5="$(printf '%s' "$mrow" | cut -f5)"; mnf="$(printf '%s' "$mrow" | awk -F'\t' '{print NF}')"
+{ [ "$mnf" = "5" ] && [ "$mf4" = "653" ] && [ "$mf5" = "2048" ]; }; rc=$?
+ck "a refusal records the MEASURED reading + floor in mem-avail.tsv (nf=$mnf, avail='${mf4:-<none>}', floor='${mf5:-<none>}')" $rc
+
+# ⛔ THE LINE MUST NOT PRINT A FALSE EQUATION (review P3). `MEM_MIN_AVAIL_MB` is a first-class knob, so
+# an operator who sets it directly would otherwise read `4096M (= mem_lane_reserve_mb=1024M x
+# mem_spawn_reserve_lanes=2)` — i.e. `4096 = 2048` — in the one line whose whole purpose is to let the
+# reader recompute the floor. Drive a deliberately operator-set floor and require it to SAY so.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem 653 4096)"
+{ [ "$res" = "rc=81 started=0" ] && grep -q 'mem_min_avail_mb=4096M (SET BY THE OPERATOR' "$LOG" && ! grep -q '4096M (=' "$LOG"; }; rc=$?
+ck "an OPERATOR-SET floor says so and does NOT print '4096M (= 1024M x 2)' — a false equation teaches the reader to distrust the line ($res)" $rc
+
+# ── UNREADABLE: FAIL CLOSED, and say the word ─────────────────────────────────────────────────────
+# The divergence from the disk gate is deliberate and has to be provable: an unreadable probe is NOT
+# "ample". A default here would be a reading that reads as data, which is the class this file's
+# headers exist to prevent.
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem UNREADABLE 2048)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "an UNREADABLE probe REFUSES (fail-CLOSED, unlike the disk and load probes): rc=81, started=0 ($res)" $rc
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "...and no agent was started for a probe that could not answer" $rc
+grep -q '\[mem-gate\] REFUSED .*UNREADABLE' "$LOG"; rc=$?
+ck "...and the refusal carries the word UNREADABLE, with its reason — never a default that reads as data" $rc
+uf="$(tail -1 "$TMP/O/state/mem-avail.tsv" 2>/dev/null | cut -f4)"
+[ "$uf" = "UNREADABLE" ]; rc=$?
+ck "...and the durable series records UNREADABLE rather than a number the probe never produced ('${uf:-<none>}')" $rc
+
+# ── the REAL probe, BOTH verdicts, through its floor ───────────────────────────────
+# This is the arm that kills a constant verdict: the reading is this box's OWN, so a gate that always
+# refused would fail the allow arm, one that always allowed would fail the refuse arm, and the refusal
+# must quote the value the probe itself returns.
+real_avail="$(bash -c '. "$1"; mem_avail_mb' _ "$GATE")"
+case "$real_avail" in ''|*[!0-9]*) rr=1 ;; *) [ "$real_avail" -gt 0 ]; rr=$? ;; esac
+ck "POSITIVE CONTROL: the shipped probe reads THIS box's available memory (${real_avail:-<empty>}MB) — a real reading, not a default" $rr
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem "$real_avail" 1)"
+[ "$res" = "rc=0 started=1" ]; rc=$?
+ck "the REAL reading ALLOWS at floor 1 ($res)" $rc
+: > "$LOG"; : > "$PI_LOG"
+res="$(drive_mem "$real_avail" 999999999)"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "the SAME REAL reading REFUSES at floor 999999999 ($res) — the verdict follows the reading, not a constant" $rc
+grep -q "MemAvailable=${real_avail}M < mem_min_avail_mb=999999999M" "$LOG"; rc=$?
+ck "...and the refusal quotes the probe's own value (${real_avail}MB), so the log can be checked against the box" $rc
+
+# ── the ORDERING, both edges ─────────────────────────────────────────────────────
+# Disk still outranks memory (un-clearable first — the #1765 rule), and memory outranks load (its
+# consequence is a dead lane, not a slow one). A gate that reported the wrong one would send the
+# operator to a reading that cannot move: this is exactly the class lane.sh/fix-one.sh name for disk.
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 DISK_GATE_PATH="$TMP" \
+  DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=999999999 bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "ordering" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "MEMORY outranks a simultaneous LOAD refusal — the reading whose consequence is a dead lane is reported ($res)" $rc
+grep -q 'load-gate' "$LOG"; rc=$?
+[ "$rc" -ne 0 ]; rc=$?
+ck "...and the load refusal is not what the operator is told in that case" $rc
+: > "$LOG"; : > "$PI_LOG"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=0 DISK_GATE_PATH="$TMP" \
+  DISK_MIN_FREE_MB=9999999 MEM_MIN_AVAIL_MB=999999999 bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "ordering" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
+[ "$res" = "rc=77 started=0" ]; rc=$?
+ck "a DISK refusal STILL outranks a simultaneous MEMORY refusal — the un-clearable one wins ($res)" $rc
+
+# ── the SPAWN POINT's memory refusal, TRANSLATED (84 -> 81) ─────────────────────────
+# Without this arm a shim memory refusal reaches every caller as "the agent ran and failed" or as a
+# LOAD refusal — and a reviewer/ fixer that never ran then spends a MAX_REVIEW_TRIES attempt or, worse,
+# authorises a fixer (the #1716/#1720 class the load translation already exists for).
+# ⛔ A SHELL FUNCTION, NOT A PATH STUB, AND FOR THE REASON SECTION 9 ALREADY STATES: the suite exports
+# `pi` as a function so a caller's `export PATH=…` cannot shadow it, and a FUNCTION beats any PATH
+# lookup — so a file stub here would be shadowed by the suite's own. The function below is what
+# reproduces the installed shim's behaviour that matters to run_agent: `pi` exiting 84.
+: > "$LOG"
+rows_t0=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_t0="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+res="$(PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" MAX_LOAD=999999999 \
+  DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    pi() { return "$PI_GATE_MEM_REFUSED"; }
+    LOG="$2"; PROMPT="$3"
+    run_agent 1 "$LOG" "$PROMPT" "shim mem" >/dev/null 2>&1
+    printf "rc=%s started=%s" "$?" "$AGENT_STARTED"' _ "$GATE" "$LOG" "$PROMPT" "$FIXREPO")"
+[ "$res" = "rc=81 started=0" ]; rc=$?
+ck "a pi spawn point exiting 84 (its MEMORY refusal) is translated to AGENT_MEM_REFUSED 81 ($res)" $rc
+grep -q '\[mem-gate\] REFUSED .*pi spawn point refused the launch for MEMORY' "$LOG"; rc=$?
+ck "...and the translation NAMES memory, not load — a load refusal here would point at a fine reading" $rc
+rows_t1=0; [ -s "$TMP/O/state/walltime.tsv" ] && rows_t1="$(wc -l < "$TMP/O/state/walltime.tsv" | tr -d ' ')"
+[ "$rows_t1" = "$rows_t0" ]; rc=$?
+ck "...and a spawn-point memory refusal appends NO walltime row ($rows_t1 vs $rows_t0)" $rc
+# ⛔ THE WHOLE CODE TABLE, PAIRWISE DISTINCT — not just the two the arm above happens to compare.
+# MEASURED CAUSE: this PR first claimed 73 for memory and 72 for the spawn point, and by the time it
+# met main BOTH were taken (73 = `AGENT_FORK_REFUSED`, 72 = `REPO_TARGET_REFUSED`). Nothing redded:
+# every reader compares a VARIABLE, so the aliased arm simply became UNREACHABLE while the surviving
+# one labelled the other event — a fork refusal reported with the memory remedy. A per-pair assertion
+# cannot catch that class (the pair it compared was fine), so this one reads EVERY code the file
+# declares and fails on any duplicate. That is the guard the defect deserved.
+codes_tbl="$(bash -c '. "$1"; for v in AGENT_LOAD_REFUSED AGENT_FORK_REFUSED AGENT_CAPABILITY_REFUSED \
+    AGENT_DISK_REFUSED AGENT_LAND_BACKLOG AGENT_MEM_REFUSED AGENT_BRIEF_REFUSED \
+    PI_GATE_REFUSED PI_GATE_MEM_REFUSED PI_FORK_REFUSED; do printf "%s=%s\\n" "$v" "${!v}"; done' _ "$GATE")"
+dupes="$(printf '%s\n' "$codes_tbl" | sed 's/.*=//' | sort | uniq -d | tr '\n' ' ')"
+[ -z "${dupes// /}" ]; rc=$?
+ck "EVERY gate code in the file is a DISTINCT integer (duplicates: '${dupes:-none}')" $rc
+# …and the memory pair must stay OUT of the band main already owns. Listed explicitly because these
+# live in SIBLING files that this suite does not read: 71 capability, 72 repo-target, 73 fork,
+# 74 land, 75 load, 76 the spawn point, 77 disk, 78 the cannot-verify pair, 79 adopt-fix.sh,
+# 80 the brief gate. A memory code in that set is a collision with a live gate by definition.
+taken_band="$(bash -c '. "$1"; for v in 71 72 73 74 75 76 77 78 79 80; do
+    if [ "$AGENT_MEM_REFUSED" = "$v" ] || [ "$PI_GATE_MEM_REFUSED" = "$v" ]; then printf "%s " "$v"; fi
+  done' _ "$GATE")"
+[ -z "${taken_band// /}" ]; rc=$?
+ck "…and neither memory code lands in the band main already assigns to another gate (collides: '${taken_band:-none}')" $rc
+
+# ── 13) a lane killed at its CAP keeps its work (#2045) ─────────────────────────────
 # THE MEASURED DEFECT (2026-10-18): eight background lanes dispatched, THREE produced nothing, and
 # one was killed at its 35-minute cap MID-WORK — 269,237 characters of transcript, seven MODIFIED
 # files in its worktree, no report file, no `.rc`, and the launcher reported
@@ -3171,8 +5743,7 @@ ck "…and a cap kill it could NOT snapshot reports WORK NOT PRESERVED ($st2)" $
 case "$st2" in *"nothing was lost"*) nl=1 ;; *) nl=0 ;; esac
 ck "…and that line never claims 'nothing was lost' over work only the worktree still holds" $nl
 unset -f pi
-
-# ── 13) a suite nothing RUNS is not a gate ──────────────────────────────
+# ── 14) a suite nothing RUNS is not a gate ──────────────────────────────
 # ⛔ THIS SUITE IS NOW A REGISTERED CI SHARD (review round 2, P1). It was not, and the block that
 # stood here said `scripts/run-bash-shards.sh` was "held by concurrent lanes (PR #1769/#1730), so the
 # entry cannot be added from here". #1769 is MERGED (a5fa100, an ancestor of this head) — and, more to
@@ -3215,6 +5786,171 @@ unwired="${unwired# }"
 [ "$unwired" = "test-claims.sh test-crossbox.sh" ]; rc=$?
 [ "$rc" -eq 0 ] || echo "      unwired suites: [${unwired:-<none>}]"
 ck "the orchestrator-harness suites NOT executed by run-bash-shards.sh are exactly the two documented non-loop ones [$unwired]" $rc
+
+# ── the LANE STATE REGISTRY leg (agent-infra#3382) ────────────────────────────────────────────────
+# ⛔ WHAT THESE ARMS EXIST TO CATCH, in the order the failures actually happen:
+#   R1  the leg OFF by default in a fixture (above) writes NO record and cannot fail a spawn — the
+#       kill switch is load-bearing, not decorative
+#   R2  with the leg ON, a completed lane leaves a DONE record naming its artifacts — the exact
+#       question the fleet could not answer on 2026-11-04
+#   R3  a lane ended by the BOUND leaves FAILED, never DONE. A bound-killed lane recorded as DONE is
+#       the FALSE-DEATH defect in reverse: the fleet would stop re-dispatching a lane that produced
+#       nothing
+#   R4  a REGISTRY THAT CANNOT BE REACHED does not change the lane's exit code. A registry hiccup must
+#       never re-run a lane
+# ⛔ THE FIXTURE IS HERMETIC FOR THE REGISTRY AND EXPLICIT FOR THE OTHER GATES: its own state root, its
+# own bare `origin`, and `LANE_REGISTRY_REPO` pinned to that fixture — so nothing here can reach this
+# repository's refs, which is what makes `LANE_REGISTRY=0` above a belt rather than the only brace. The
+# CWD stays `$FIXREPO` (the GitHub-origin fixture the creation back-pressure gate reads, #2409): without
+# it every arm above answers 74 LAND-BACKLOG and would appear to be testing the registry.
+RREG="$TMP/registry"; mkdir -p "$RREG/state"
+git init -q --bare "$RREG/origin.git"
+git init -q "$RREG/work"
+git -C "$RREG/work" remote add origin "$RREG/origin.git"
+# ⛔ NOTHING TO chmod: the registry is invoked as `python3 <path>`, so an executable bit is not needed —
+# and the guard that used to sit here (`[ -x "$HERE/../lane_registry.py" ]`, i.e. `scripts/lane_registry.py`,
+# which does not exist) was always false, i.e. a setup line that silently no-ops in the very block whose
+# R4 comment condemns them.
+[ -f "$HERE/lane_registry.py" ] || { echo "FIXTURE: lane_registry.py missing beside this suite"; exit 1; }
+git -C "$RREG/work" config user.email lane@test
+git -C "$RREG/work" config user.name lane-test
+
+# ⛔ THE WALL IS 60s HERE, NOT THE 1s THE LOAD ARMS USE, AND THAT IS THE POINT OF R2/R3. A lane that
+# exits 0 having hit its cap is FAILED (correctly — the cap is what ended it), so a 1s cap makes every
+# completion arm report `cap-hit` and the DONE arm would test the cap, not the registry.
+rdrive() { # rdrive <label> <registry:0|1> [<cap seconds>] -> "rc=… started=…"
+  local label="$1" on="$2" cap="${3:-60}" extra=""
+  env PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" O="$TMP/O" DISK_MIN_FREE_MB=1 \
+      DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
+      LANE_REGISTRY="$on" \
+      LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+      LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+      $extra \
+      bash -c '
+    BOUND="${8:-}"
+    CAP="${9:-60}"
+    . "$1"
+    cd "$7" || exit 2
+    LOAD="$2"; MAX_LOAD="$3"; LOG="$4"; PROMPT="$5"; LABEL="$6"
+    load1() { printf "%s" "$LOAD"; }
+    if [ -n "$BOUND" ]; then AGENT_BOUND_VERDICT="$BOUND"; fi
+    run_agent "$CAP" "$LOG" "$PROMPT" "$LABEL" >/dev/null 2>&1
+    rc=$?
+    printf "rc=%s started=%s" "$rc" "$AGENT_STARTED"
+  ' _ "$GATE" 0 10 "$LOG" "$PROMPT" "$label" "$FIXREPO" "${BOUND_VERDICT:-}" "$cap"
+}
+
+rlist() { # the registry's own reader, against the fixture origin only
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/origin.git" --json 2>/dev/null
+}
+
+cat > "$TMP/bin/pi" <<'PI'
+#!/bin/sh
+echo "PI_RAN" >> "$PI_LOG"
+exit 0
+PI
+chmod +x "$TMP/bin/pi"
+
+# R1 — the switch. Leg off: no record may appear anywhere.
+# ⛔ `rc=$?` HERE READ THE DRIVER'S STATUS, NOT THE LANE'S: `rdrive`'s last command is `printf`, so the
+# check could never fail and only the `grep` half was falsifiable. The lane's own rc is parsed out of the
+# driver's output (`rc=… started=…`) instead.
+: > "$RREG/state/lanes.log"
+res="$(rdrive "registry-off" 0)"
+lanerc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
+started="$(sed -n 's/.*started=\([0-9]*\).*/\1/p' <<<"$res")"
+lanes="$(rlist)"
+ck "R1 LANE_REGISTRY=0 leaves the spawn working and writes NO record [$(printf '%s' "$res")]" \
+   $([ "${lanerc:-x}" = "0" ] && [ "${started:-x}" = "1" ] && ! grep -q 'lane_id' <<<"$lanes" && echo 0 || echo 1)
+
+# R2 — a completed lane is DONE, with artifacts (this is the question the fleet could not ask).
+# ⛔ NOT `rc=$?` (R1's comment one arm up records why): `rdrive`'s last command is `printf`, so the
+# assignment always succeeds and the captured value is the DRIVER's status. The lane's own rc is parsed
+# out of the driver's output, and asserted — an arm that cannot fail is decoration.
+res="$(rdrive "registry-on" 1)"
+lanerc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
+lanes="$(rlist)"
+state="$(python3 -c 'import json,sys
+try: d=json.load(sys.stdin)
+except Exception: print("UNREADABLE"); raise SystemExit
+rows=[r for r in d.get("lanes",[]) if r["state"]!="RUNNING"]
+print(rows[0]["state"] if rows else "NONE")' <<<"$lanes" 2>/dev/null)"
+arts="$(python3 -c 'import json,sys
+d=json.load(sys.stdin); rows=[r for r in d.get("lanes",[]) if r["state"]!="RUNNING"]
+print(len(rows[0].get("artifacts") or []) if rows else 0)' <<<"$lanes" 2>/dev/null)"
+ck "R2 a completed lane leaves a DONE record naming its artifacts ($state artifacts=$arts lane rc=${lanerc:-?})" \
+   $([ "${lanerc:-x}" = "0" ] && [ "$state" = "DONE" ] && [ "${arts:-0}" -ge 1 ] && echo 0 || echo 1)
+
+# R5 — the record names the REPO it was about (cross-repo visibility, §3.2).
+# ⛔ THIS ARM EXISTS BECAUSE THE FIELD WAS DEAD: `lane_registry_begin` computed `repo` twice and threw
+# both away, so every record shipped with no `repo` at all and `lane.list --repo owner/name` could never
+# match anything — a filter against a field nothing wrote. The fixture's origin is
+# `https://github.com/owner/repo.git`, so the record must say `owner/repo` or this reds.
+res="$(rdrive "registry-repo" 1)"
+lanerc="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
+repo_field="$(rlist | python3 -c 'import json,sys
+rows=[r for r in json.load(sys.stdin).get("lanes",[]) if r["state"]!="RUNNING"]
+print(rows[-1].get("repo") or "EMPTY")' 2>/dev/null)"
+ck "R5 the terminal record names its repo ($repo_field, want owner/repo, lane rc=${lanerc:-?})" \
+   $([ "${lanerc:-x}" = "0" ] && [ "$repo_field" = "owner/repo" ] && echo 0 || echo 1)
+
+# R3 — THE TERMINAL DECISION TABLE, driven at `lane_registry_end` directly.
+# ⛔ WHY NOT THROUGH A WHOLE SPAWN: the two inputs it reads (`AGENT_BOUND_VERDICT`, `AGENT_CAP_HIT`) are
+# set by code ABOVE it that `run_agent` itself RESETS at entry, so a fixture that pre-set them would be
+# testing `lane-bound.sh`. What is under test here is the MAPPING — a lane the bound ended, or one that
+# never started, must be FAILED and must say why; only a lane that really started, really exited 0 and
+# was ended by neither bound is DONE.
+r_end() { # r_end <started> <bound> <cap> <rc> -> "state reason"
+  env LANE_REGISTRY=1 LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+      LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+      STARTED="$1" BOUND="$2" CAP="$3" RCX="$4" \
+      bash -c '
+    . "$1"
+    cd "$4" || exit 2
+    LOG="$3"
+    [ "$BOUND" = "-" ] && BOUND=""      # the spec table spells "no bound" as - so it survives `set --`
+    AGENT_STARTED="$STARTED"; AGENT_BOUND_VERDICT="$BOUND"; AGENT_CAP_HIT="$CAP"
+    LANE_ID="$(python3 "$2" start --kind lane --tag 77 --pid $$ 2>>"$LOG" | tail -1)"
+    [ -n "$LANE_ID" ] || { echo "NONE no-id"; exit 0; }
+    lane_registry_end "$LANE_ID" "$RCX" "r3" "$LOG"
+    python3 "$2" show --lane-id "$LANE_ID" --json 2>/dev/null > "$LOG.show"
+    python3 - "$LOG.show" <<PY
+import json, sys
+d = json.load(open(sys.argv[1]))
+print(d["state"], (d.get("reason") or "-"))
+PY
+  ' _ "$GATE" "$HERE/lane_registry.py" "$LOG" "$FIXREPO"
+}
+
+for spec in "1 stalled 0 0" "0 - 0 74" "1 - 1 143" "1 - 0 0" "1 - 0 7"; do
+  set -- $spec
+  rm -rf "$RREG/state/lanes" "$RREG/state/work.git"
+
+  out="$(r_end "$1" "$2" "$3" "$4")"
+  case "$spec" in
+    "1 stalled 0 0") want="FAILED bound:stalled" ;;
+    "0 - 0 74")      want="FAILED agent-never-started:rc=74" ;;
+    "1 - 1 143")     want="FAILED cap-hit:rc=143" ;;
+    "1 - 0 0")       want="DONE -" ;;
+    *)               want="FAILED exit:7" ;;
+  esac
+  [ "$out" = "$want" ]; rc3=$?
+  ck "R3 terminal-record mapping [started=$1 bound=$2 cap=$3 rc=$4] -> $out (want '$want')" $rc3
+done
+
+# R4 — an unreachable registry must not change the lane's exit code.
+# ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
+# so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
+# test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
+# that does not exist, with this box's local witness removed so no fallback can answer either.
+git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
+rm -rf "$RREG/state/lanes"
+res="$(rdrive "registry-unreachable" 1)"; rc=$?
+rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
+unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
+   $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo
 echo "================ RESULT: $PASS passed, $FAIL failed ================"
