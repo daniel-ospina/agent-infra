@@ -9697,6 +9697,111 @@ run_record_delta $EH64 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42526501" \
     STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE:0:6}..${DG_HEAD}; no issues found."
 assert_eq "$RECORD_RC" "0" "20h52d the CORRECT range stated with a 6-char start is parsed and accepted (rc 0)"
 [ -f "$(Q2 $EH64)" ] || bad "20h52d the parser's 4-floor refused an honest 6-char start"
+# 20h52e THE TIP'S CASE VARIANTS MUST RESOLVE, NOT JUST PARSE (fifteenth review cycle, P2 —
+#       MEASURED at 2aba1583a: the arm ACCEPTS sixteen spellings of the tip (`[Hh][Ee][Aa][Dd]`)
+#       but resolved the RAW one, and git ref names are case-sensitive — `rev-parse 'HEAD^{commit}'`
+#       rc 0 against `'head^{commit}'` / `'Head^{commit}'` rc 128 "Needed a single revision". So an
+#       honest `BASE..head` parsed, failed to resolve, fell through `_ok=0`, and was refused as
+#       "states a DIFFERENT range" — a false block whose only remedy is re-wording an evidence
+#       comment that must postdate the head. The set the arm ACCEPTS and the set it can RESOLVE
+#       have to be the same set; 20h52a exercised `..HEAD` only, which is why the split was
+#       invisible. Both non-canonical cases are pinned here.
+EH71=425278; rm -f "$(Q2 $EH71)"
+run_record_delta $EH71 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..head; no issues found."
+assert_eq "$RECORD_RC" "0" "20h52e an honest range with the tip spelled 'head' is ACCEPTED (rc 0)"
+[ -f "$(Q2 $EH71)" ] || bad "20h52e the raw-spelling resolution false-blocked a lowercase tip"
+EH72=425280; rm -f "$(Q2 $EH72)"
+run_record_delta $EH72 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42528101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..Head; no issues found."
+assert_eq "$RECORD_RC" "0" "20h52f …and with 'Head' (rc 0): every case the arm accepts, it can resolve"
+[ -f "$(Q2 $EH72)" ] || bad "20h52f a mixed-case tip was falsely blocked by its own spelling"
+
+# ═══════════════════════════════════════════════════════════════════════════════════════
+# 20h53+ THE FIFTEENTH CYCLE: THE SHAPE TEST WAS NOT YET A CLAIM TEST. The fourteenth cycle
+#       replaced a literal list with `[~^]` — which closed two fail-opens and opened three
+#       defects of its own, two of them FALSE BLOCKS on the vocabulary this very file is
+#       written in. A `^{…}` PEEL and `^0` resolve to the SAME commit and narrow nothing; a
+#       pure-decimal run that resolves to no commit is prose (`1024^2`, `1351~1450`); and the
+#       token scan's exclusion is the 4-6 WINDOW, never "any pure-decimal run".
+# 20h53 THE PEEL DIRECTION — this repo's own `git rev-parse <sha>^{commit}` must NOT be read as
+#       a narrowing. MEASURED at 2aba1583a: refused with "RELATIVE TO THE TIP … always NARROWER",
+#       which is false (a peel is the SAME object), and that spelling appears throughout this
+#       recorder and this suite.
+EH65=425266; rm -f "$(Q2 $EH65)"
+run_record_delta $EH65 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42526701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The base was verified with git rev-parse ${DG_BASE}^{commit} before reading.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h53 a <sha>^{commit} PEEL is not a tip-relative narrowing (rc 0)"
+[ -f "$(Q2 $EH65)" ] || bad "20h53 the repo's own rev-parse spelling was falsely blocked"
+EH66=425268; rm -f "$(Q2 $EH66)"
+run_record_delta $EH66 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42526901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="the tree is ${DG_HEAD}^{tree}; the identity is ${DG_HEAD}^0.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h53b …and neither is a ^{tree} peel or the ^0 identity (rc 0)"
+[ -f "$(Q2 $EH66)" ] || bad "20h53b a peel or the identity was falsely blocked"
+# 20h54 THE OPERAND'S DIRECTION — a `~`/`^` whose left side RESOLVES TO NO COMMIT is prose, which is
+#       the doctrine this file already states for `1351`/`2024`/`4000` twenty lines above the arm.
+#       MEASURED at 2aba1583a: `0xFF00 ^ 0x0FF0`, `caps at 1024^2 bytes` and `PASS=1351~1450` were
+#       all refused as tip-relative narrowings.
+EH67=425270; rm -f "$(Q2 $EH67)"
+run_record_delta $EH67 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The mask 0xFF00 ^ 0x0FF0 is computed once; caps at 1024^2 bytes; PASS=1351~1450 checks.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h54 hex/decimal literals before ~ or ^ that resolve to no commit are PROSE (rc 0)"
+[ -f "$(Q2 $EH67)" ] || bad "20h54 numeric prose was falsely blocked by the tip-relative arm"
+# 20h54b THE REFUSAL DIRECTION IS UNCHANGED (the resolution test must not weaken what the arm is
+#        FOR): a `<sha>~1..<sha>` narrowing beside the honest range still reds.
+#        The narrowing is written against the HEAD SHA (not against an ancestor) for the same reason
+#        M41 does: the token scan SKIPS a run equal to `to`, so the tip arm is the ONLY layer that can
+#        see this pair — which is what makes the assertion about THIS arm and not about the scan
+#        behind it (measured: written against an ancestor sha the refusal arrives from the token
+#        scan, so a message assertion on this arm is not a measurement of it).
+EH68=425272; rm -f "$(Q2 $EH68)"
+run_record_delta $EH68 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ${DG_HEAD}~1..${DG_HEAD}; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h54b a RESOLVABLE <sha>~1 narrowing is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h54b …through the same arm, by the meaning of its operator"
+[ -f "$(Q2 $EH68)" ] && bad "20h54b no record was written" || ok "20h54b no record was written"
+# 20h55 THE REFLOG POSITION — the fourteenth cycle declared `HEAD@{N}` a residual on the grounds
+#       that "matching `{` after a hex run would false-block a hex literal followed by a brace
+#       block", and THAT REASON IS FALSE: a reflog position requires the `@` before the brace, so it
+#       is matched on its own and `deadbeef{2}` can never reach it. `@{N}` IS a revision expression
+#       git resolves, so a narrowing written with one is the same claim in another notation.
+EH69=425274; rm -f "$(Q2 $EH69)"
+run_record_delta $EH69 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD@{1}..HEAD; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h55 a narrowing written as a REFLOG position is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h55 and it reaches the same meaning-based arm"
+[ -f "$(Q2 $EH69)" ] && bad "20h55 no record was written" || ok "20h55 no record was written"
+EH70=425276; rm -f "$(Q2 $EH70)"
+run_record_delta $EH70 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="the literal deadbeef{2} is a brace block with no @ before it.
+reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h55b …while a brace block with NO @ before it is not a reflog position (rc 0)"
+[ -f "$(Q2 $EH70)" ] || bad "20h55b the reflog test false-blocked a plain brace block"
+# 20h56 THE TOKEN SCAN'S EXCLUSION IS A WINDOW, NOT AN ALPHABET TEST (fifteenth cycle, P1).
+#       MEASURED regression: the fourteenth cycle shipped `grep -E '[a-fA-F]'`, which drops a
+#       PURE-DECIMAL run of ANY length — so a real 7-char all-decimal sha (`3273726` here resolves
+#       to 3273726111e3…) became invisible, although the pre-fix 7-floor covered it, and the
+#       declared residual said "4-6". Pinned on the recorder's own discriminator because a fixture
+#       commit cannot be GROUND to an all-decimal prefix without the result depending on how many
+#       commits the grind took. Both halves are asserted: the window that was argued for, and the
+#       alphabet filter that silently widened it.
+_scan_src="$(command grep 'command grep -oE .\[0-9a-fA-F\]{4,40}.' "$SCRIPT_DIR/record-review.sh")"
+assert_contains "$_scan_src" "grep -vE '^[0-9]{4,6}\$'" "20h56 the token scan excludes the 4-6 decimal WINDOW it declared"
+assert_not_contains "$_scan_src" "grep -E '[a-fA-F]'" "20h56 …and NOT an alphabet filter, which also drops a real 7-char all-decimal sha"
+
 git -C "$DG" checkout -q "$_prevbr" >/dev/null 2>&1 || true
 
 # ── 20i — THE DELTA PATH'S REPLACE/GRAFT POSTURE (review of this change, P1) ─────────
@@ -10314,7 +10419,7 @@ mut_check "M20 the stated range is REQUIRED, no alphabet-dependent fallback" 425
 # ⛔ TWO ANCHORS, NOT ONE: the scan line and the rc check that now guards it. Replacing only the
 #       scan leaves `_tok_rc` 0 and the mutant would still refuse on the token rule's real answer —
 #       the mutation has to restore the pre-fix "empty means nothing to check" shape.
-MUT="$(mk_mutant novalley '    _toks="$(printf '\''%s\n'\'' "$_claim" | command grep -oE '\''[0-9a-fA-F]{4,40}'\'' | command grep -E '\''[a-fA-F]'\'' | command tr '\''A-F'\'' '\''a-f'\'' | command sort -u)" || _tok_rc=$?' '    _toks=""; _tok_rc=0')"
+MUT="$(mk_mutant novalley '    _toks="$(printf '\''%s\n'\'' "$_claim" | command grep -oE '\''[0-9a-fA-F]{4,40}'\'' | command grep -vE '\''^[0-9]{4,6}$'\'' | command tr '\''A-F'\'' '\''a-f'\'' | command sort -u)" || _tok_rc=$?' '    _toks=""; _tok_rc=0')"
 mut_check "M21 every resolvable commit in the claim is checked" 425204 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
 # M22 — THE TIP-RELATIVE ARM (20h33). Disabling it re-accepts `HEAD~1..HEAD` beside the decoy,
@@ -10327,7 +10432,11 @@ Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
 # ⛔ RE-ANCHORED (fourteenth cycle): the arm is no longer a `case` enumeration, it is a shape
 #       test, so the anchor must be the WHOLE `if [[ … ]]` line — an anchor naming `case "$_claim" in`
 #       no longer exists, and the cell reported "mother anchor missing" until it was re-cut.
-MUT="$(mk_mutant relativehead '    if [[ "$_claim" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*[~^] ]]; then' '    if false; then')"
+# ⛔ RE-CUT (fifteenth cycle): the arm is no longer a single `if [[ … [~^] ]]`. It is a scan that
+#       CLASSIFIES the operator (a peel and `^0` are identity, not narrowing) and RESOLVES the
+#       operand, so the anchor is the scan's own first line. An anchor naming the old one-liner no
+#       longer exists and the cell reports "mother anchor missing" rather than passing vacuously.
+MUT="$(mk_mutant relativehead '    _tipscan="$_claim"; _tiprel=0' '    _tipscan=""; _tiprel=0')"
 mut_check "M22 a tip-relative range is refused" 425210 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed HEAD~1..HEAD."
 # M23 — THE EXCLUSION IS THE ROWS, NOT THE SECTION (20h34, 20h37). Skipping every line of the
@@ -10561,7 +10670,7 @@ mut_check "M40 the tip spelling on the right of a parsed range" 425258 "$DG_HEAD
 # M41 — THE TIP-RELATIVE SHAPE. Narrowing the shape test back to the literal `HEAD`/`head`/`@`
 #       list restores the pre-fix state exactly, so 20h50's `<head-sha>~1..<head-sha>` must be
 #       ACCEPTED again — which is what an enumerated-spelling guard does to the next spelling.
-MUT="$(mk_mutant tipshape '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*[~^]' '([Hh][Ee][Aa][Dd]|@)[[:space:]]*[~^]')"
+MUT="$(mk_mutant tipshape '([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*(~[0-9]*' '([Hh][Ee][Aa][Dd]|@)[[:space:]]*(~[0-9]*')"
 mut_check "M41 the tip-relative arm tests the SHAPE, not a literal list" 425250 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42525101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed ${DG_HEAD}~1..${DG_HEAD}; the rest was not read."
 # M42 — THE TOKEN SCAN'S FLOOR. Putting the 7-floor back leaves 20h51's 6-char en-dash pair
@@ -10569,6 +10678,13 @@ I only actually reviewed ${DG_HEAD}~1..${DG_HEAD}; the rest was not read."
 MUT="$(mk_mutant tokfloor "command grep -oE '[0-9a-fA-F]{4,40}'" "command grep -oE '[0-9a-fA-F]{7,40}'")"
 mut_check "M42 the token scan's floor is the parser's, not 7" 425254 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42525501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
 I only actually reviewed ${DG_A1:0:6}–${DG_HEAD:0:6}; the rest was not read."
+# M43 — THE TIP'S RESOLUTION SET (fifteenth cycle P2). Restoring the pre-fix "resolve the RAW
+#       spelling" line leaves the accepted-but-unresolvable case exactly as it shipped, and 20h52e's
+#       HONEST `BASE..head` — which the parser accepts on purpose — is REFUSED: the direction that
+#       alone governs is acceptance, because the shipped vector's whole point is that this arm must
+#       not false-block a correct artifact.
+MUT="$(mk_mutant rawtip 'verify '\''HEAD^{commit}'\''' 'verify "${_straw}^{commit}"')"
+mut_check "M43 the tip is resolved by the CANONICAL token, not the raw spelling" 425278 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42527901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..head; no issues found."
 git checkout -q attr_lane >/dev/null 2>&1 || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no

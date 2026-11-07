@@ -2237,9 +2237,17 @@ $m"
     while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
-      # ⛔ THE RAW SPELLING IS KEPT FOR RESOLUTION (fourteenth cycle): `HEAD` is a CASE-SENSITIVE
-      # ref name, so resolving the lower-cased copy this loop made would make `head^{commit}` fail and
-      # every honest `BASE..HEAD` artifact refuse. Only the MESSAGE gets the normalised form.
+      # ⛔ THE RAW SPELLING IS KEPT FOR THE MESSAGE ONLY — NEVER FOR RESOLUTION (fifteenth review
+      # cycle, P2 — MEASURED at 2aba1583a: the arm accepts the SIXTEEN case variants of the tip
+      # (`[Hh][Ee][Aa][Dd]`), but resolved the RAW spelling, and git ref names are case-sensitive —
+      # `rev-parse 'HEAD^{commit}'` rc 0, `'head^{commit}'` and `'Head^{commit}'` BOTH rc 128 with
+      # "Needed a single revision". So an honest `reviewed delta:<BASE>..head` fell through to
+      # `_ok=0` and was refused as "states a DIFFERENT range", whose only remedy is re-wording an
+      # evidence comment that must postdate the head — i.e. the full re-review the seventh cycle's
+      # P2 names as worse than the gap. The spelling it ACCEPTS and the spelling it can RESOLVE were
+      # two different sets; a case arm that widens one without widening the other is a false block
+      # generator. Resolution therefore uses the CANONICAL token, and the raw spelling survives only
+      # in the refusal message (where quoting the artifact verbatim is the point).
       _straw="${BASH_REMATCH[3]}"
       _st="$(printf '%s' "$_straw" | command tr 'A-F' 'a-f')"
       # Advance PAST this match so the next iteration cannot re-match a suffix of it.
@@ -2252,7 +2260,8 @@ $m"
       # range … the body quotes …..Head" (measured while writing 20h52a, which is why that control
       # exists). The test is on the CASE-INSENSITIVE spelling instead.
       case "$_stcmp" in
-        [Hh][Ee][Aa][Dd]|@) _stcmp="$(delta_git "$root" rev-parse --verify "${_straw}^{commit}" 2>/dev/null || true)" ;;
+        [Hh][Ee][Aa][Dd]) _stcmp="$(delta_git "$root" rev-parse --verify 'HEAD^{commit}' 2>/dev/null || true)" ;;
+        @) _stcmp="$(delta_git "$root" rev-parse --verify '@^{commit}' 2>/dev/null || true)" ;;
       esac
       if [ -n "$_stcmp" ]; then
         case "$to" in "$_stcmp"*) _ok=1 ;; esac
@@ -2380,7 +2389,14 @@ $m"
     # exists to catch, reached through the guard itself: "the claim names no commits" and "nothing
     # scanned the claim" must not be one value. rc 1 stays a pass; rc >= 2 refuses.
     _toks=""; _tok_rc=0
-    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{4,40}' | command grep -E '[a-fA-F]' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
+    # ⛔ THE EXCLUSION IS THE 4-6 WINDOW, NOT "EVERY PURE-DECIMAL RUN" (fifteenth review cycle, P1 —
+    # MEASURED: the fourteenth cycle's filter was `grep -E '[a-fA-F]'`, which drops a PURE-DECIMAL
+    # run of ANY length — so a real 7-char all-decimal sha (`3273726` here resolves to
+    # 3273726111e3…) became invisible to this scan, although the pre-fix 7-floor had covered it.
+    # That is a NEW fail-open in the arm that exists to stop fail-opens, and it contradicted the
+    # residual declared in the comment above, which says "A 4-6 char abbreviation that is genuinely
+    # all digits". The exclusion is therefore written as the WINDOW it was argued for.
+    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{4,40}' | command grep -vE '^[0-9]{4,6}$' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
     if [ "$_tok_rc" -gt 1 ]; then
       echo "   delta: the commit-token scan FAILED (rc $_tok_rc) — a scan that did not run is not evidence that the claim names no commits, so the range is not verified. Retry rather than record." >&2
       return 1
@@ -2460,12 +2476,38 @@ $m"
     # `clean`. The declared residual below covers SYMBOLIC refs (`main..HEAD`), and `sha~N` is not
     # symbolic: it resolves, it is fully evaluable, and it is the same claim in another spelling. A
     # guard that enumerates spellings fails open on the first one nobody listed — for the seventh
-    # time in this arm — so the arm now tests the SHAPE: any ref (hex abbreviation, HEAD, @) followed
-    # by `~` or `^` is a revision expression, which is what makes a range tip-relative.
-    # `HEAD@{N}` (a reflog position) stays in the declared residual: it is not resolved by this arm,
-    # and matching `{` after a hex run would FALSE-BLOCK a hex literal followed by a brace block.
-    if [[ "$_claim" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*[~^] ]]; then
-        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (<ref>~N / <ref>^N / @~N) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
+    # time in this arm — so the arm tests the SHAPE, not a list of spellings.
+    # ⛔ BUT A SHAPE IS NOT A CLAIM: OPERATOR AND OPERAND ARE BOTH CLASSIFIED (fifteenth review cycle,
+    # two P1s — BOTH are FALSE BLOCKS the fourteenth cycle's bare `[~^]` introduced, MEASURED at
+    # 2aba1583a). (1) `git rev-parse <BASE>^{commit}` — this repo's OWN vocabulary, spelled throughout
+    # this file and its suite — was refused as "RELATIVE TO THE TIP … always NARROWER", although
+    # `^{…}` PEELS to the SAME commit and narrows nothing, and `^0` is the identity for the same
+    # reason. (2) `0xFF00 ^ 0x0FF0`, `caps at 1024^2 bytes` and `PASS=1351~1450` were all refused,
+    # although none of those runs resolves to a commit — the exact doctrine stated twenty lines
+    # above for `1351`/`2024`/`4000`, broken by the arm that quotes it. So an operator is
+    # tip-relative only when it SELECTS A PARENT/ANCESTOR — not a peel, not `^0` — and an operand is
+    # a ref only when it RESOLVES: `HEAD`/`@` by name, a hex run only when `rev-parse` finds it (the
+    # same authority the parser arm above already uses).
+    # ⛔ `HEAD@{N}` IS A REVISION EXPRESSION AND IS COVERED HERE, so it is no longer the residual the
+    # fourteenth cycle declared — the reason given for that residual ("matching `{` after a hex run
+    # would FALSE-BLOCK a hex literal followed by a brace block") is FALSE: a reflog position needs
+    # the `@` BEFORE the brace, and `deadbeef{2}` has none. It is tested on its own, so no
+    # hex-literal shape can reach it. `@{upstream}` stays residual (it is not tip-relative).
+    _tipscan="$_claim"; _tiprel=0
+    while [[ "$_tipscan" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*(~[0-9]*|\^\{[^}]*\}|\^[0-9]*) ]]; do
+      _tref="${BASH_REMATCH[1]}"; _top="${BASH_REMATCH[2]}"
+      _tipscan="${_tipscan#*"${BASH_REMATCH[0]}"}"
+      case "$_top" in '^{'*|'^0') continue ;; esac
+      case "$_tref" in
+        [Hh][Ee][Aa][Dd]|@) _tiprel=1; break ;;
+      esac
+      delta_git "$root" rev-parse --verify "${_tref}^{commit}" >/dev/null 2>&1 && { _tiprel=1; break; }
+    done
+    if [[ "$_claim" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd])?@\{[0-9]+\} ]]; then
+      _tiprel=1
+    fi
+    if [ "$_tiprel" = 1 ]; then
+        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (<ref>~N / <ref>^N / <ref>@{N}) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
         echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
         return 1
     fi
