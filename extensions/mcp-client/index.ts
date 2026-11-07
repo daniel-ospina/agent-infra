@@ -665,10 +665,12 @@ function isValidServerName(name: string): boolean {
  *
  * ⛔ THE DEPARTURE IS THE HANDLING OF A BAD `type`, NOT THE DISPATCH RULE. pi dispatches on `url`/
  * `command` exactly as this client does ("A `command` selects stdio and a `url` selects streamable
- * HTTP", the FIRST sentence of `docs/mcp.md:78`); what it adds is the second sentence of that same
- * line, enforced by rejection. Do not read the shared dispatch rule as agreement on `type`, and do not
- * cite `docs/mcp.md:78` for only half of what it says — that half-reading is what let an earlier
- * revision of this marker claim the two clients agreed here.
+ * HTTP" — the SECOND of the three sentences on `docs/mcp.md:78`, the first being "`type` is optional");
+ * what it adds is the THIRD, "When present, `type` must be `stdio`, `http`, or `streamable-http`",
+ * enforced by rejection. ⛔ Never cite this line by ORDINAL alone: an earlier revision of this marker
+ * called the dispatch rule the "first sentence" and pi's enforcement the "second", and a reader who
+ * checked it landed on "`type` is optional" and could only conclude the marker overstated pi — the
+ * exact failure it exists to prevent. Quote the sentence, or give the full path and line.
  *
  * Citations are FULL paths on purpose: a bare `:80` once pointed at "`command` is one executable and
  * `args` contains its arguments", i.e. at a line about `args`, so a reader checking the marker's own

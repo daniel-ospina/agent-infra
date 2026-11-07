@@ -48,6 +48,17 @@ function section(name: string) {
 // logged `ok:443`, `ok.example:443`, `fine:443`), and an `ok(eager.length === 0)` per test still misses
 // the `PI_MCP_SERVERS` forced-eager path. So count the ONE call that can dial anything instead: if any
 // fixture reaches `connectServer`, this records it and the end-of-suite assertion below goes red.
+//
+// ⛔ THE GUARD MUST NOT BE DISARMABLE BY THE CALLER'S ENVIRONMENT. `connectAll` filters by
+// `getAllowedServers()` BEFORE it reads `cfg.lazy`, so with `PI_MCP_SERVERS` exported an eager fixture
+// is excluded instead of dialled, nothing reaches `connectServer`, and the end-of-suite assertion is
+// VACUOUSLY green — measured: `PI_MCP_SERVERS=none` + `lazy` deleted from `fine` stayed 64/0 green,
+// while the same edit is 63/1 red with the variable unset. A guard that a shell variable can silence is
+// the false-PASS shape this file already fixed twice (see the explicit `undefined` allowlists passed to
+// `classifyServers` below). No test in this file depends on the variable being SET — the one test that
+// cares clears it and restores it — so it is cleared here, for the whole run, and restored at cleanup.
+const PREV_PI_MCP_SERVERS = process.env.PI_MCP_SERVERS;
+delete process.env.PI_MCP_SERVERS;
 const CONNECT_CALLS: string[] = [];
 const realConnectServer = (McpServerManager.prototype as unknown as Record<string, unknown>)
   .connectServer as (...args: unknown[]) => unknown;
@@ -729,10 +740,12 @@ await test("neither layer → both null (nothing invented)", () => {
 // assertion that depends on the runner's resolver or proxy is not hermetic. A NEW fixture here that
 // CONSTRUCTS a manager and declares a truthy `url`/`command` MUST carry `lazy: true` — and that is now
 // ENFORCED FOR EVERY TEST IN THIS FILE, not just the fixtures annotated below: the `CONNECT_CALLS` guard
-// installed at the top counts every `connectServer` call and the end-of-suite assertion fails if any
-// fixture reached one, so deleting `lazy` from ANY manager-driven fixture goes RED instead of silently
-// restoring live traffic (verified: it stays green if only `broken`/`sseType` were pinned). A test that
-// only inspects the MERGED config (or the layer read) never reaches `connectServer` and needs no `lazy`.
+// installed at the top counts every `connectServer` call, the end-of-suite assertion fails if any
+// fixture reached one, and the guard CLEARS `PI_MCP_SERVERS` for the run so the `connectAll` allowlist
+// cannot exclude an eager fixture before it is counted (without that, the assertion was vacuously green
+// with the variable exported — measured). So deleting `lazy` from ANY manager-driven fixture goes RED
+// instead of silently restoring live traffic. A test that only inspects the MERGED config (or the layer
+// read) never reaches `connectServer` and needs no `lazy`.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 section("connectAllLayers — the layer→argument binding and its failure modes");
 
@@ -1422,6 +1435,8 @@ await test("non-`mcpServers` top-level keys survive from BOTH layers (base is no
 
 // ── Cleanup + summary (LAST — after every fixture is created) ────────────
 (McpServerManager.prototype as unknown as Record<string, unknown>).connectServer = realConnectServer;
+if (PREV_PI_MCP_SERVERS === undefined) delete process.env.PI_MCP_SERVERS;
+else process.env.PI_MCP_SERVERS = PREV_PI_MCP_SERVERS;
 await test("no fixture in this suite reached `connectServer` (every manager-driven fixture is `lazy`)", () => {
   deepEqual(
     CONNECT_CALLS,
