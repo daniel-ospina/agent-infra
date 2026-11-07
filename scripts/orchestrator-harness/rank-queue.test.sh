@@ -1223,8 +1223,8 @@ ck "the shipped floor_order is extracted WHOLE (the consumer this check drives)"
 # `( … ) 2>/dev/null | head -1`: stdout truncated at the first row, STDERR thrown away — so a sentence printed by the
 # shipped `floor_order` was graded by NOTHING here. Measured at the review: a claim appended to `floor_order` (on
 # stdout and on stderr) left this suite at 177/0 while `product-floor.test.sh` reddened. Its stdout is the dispatch
-# batch, so prose there is not cosmetic either. The run now lands in `$TMP/floor/out` (pinned by `_out_map`) and the
-# head is read from the FILE.
+# batch, so prose there is not cosmetic either. The run lands in `$TMP/floor-<label>/out` (ONE per drive, pinned by
+# `_out_map`) and the head is read from the FILE.
 # ⛔ ONE CAPTURE PER DRIVE, NOT ONE FILE FOR ALL OF THEM (review P2, cycle 80). `$3` is the drive's LABEL: with a single
 # `$TMP/floor/out` every call TRUNCATED the previous one, so only the LAST drive's bytes were pinned and the first
 # drive's stdout from row 2 onward — plus ALL of its stderr — reached no CRC. Measured: a stderr claim firing only in
@@ -3383,7 +3383,11 @@ elif [ "$_out_late" = "$_out_late_pin" ]; then rc=0
 elif [ "$(printf '%s\n' "$_out_late" | LC_ALL=C sort)" = "$(printf '%s\n' "$_out_late_pin" | LC_ALL=C sort)" ]; then
   rc=1; echo "      every pinned capture is present at the END of the run with its pinned CRC and only the MAP SEQUENCE differs — this check's own ordering, not the code under test"
 else
-  rc=1; echo "      the pinned population differs at the END of the run — a case directory or capture that appeared after the snapshot cannot hide:"
+  # ⛔ THE HEADER NAMES THE WHOLE BRANCH, NOT ONE OF ITS LEAVES (review P3, cycle 85). It said "a case directory or
+  # capture that APPEARED after the snapshot", but its own arms also report VANISHED, NEVER CAPTURED, CHANGED and
+  # "already differed" — so the line introducing the detail contradicted it (measured: `VANISHED …` under an
+  # "appeared" header). The sibling check above enumerates all three verbs for exactly this reason.
+  rc=1; echo "      a capture changed, appeared, or disappeared between the first snapshot and the END of the run — nothing created or removed after the snapshot can hide:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
   # PROMISED list was empty, because `for x in $( … )` split its key on the space and matched nothing.
   # ⛔ EVERY LOOKUP HERE READS THE KEY FIELD, NEVER A PREFIX (review P3, cycles 79 and 81): `grep -m1x` was parsed as
@@ -3419,7 +3423,7 @@ else
 $(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
 fi
-ck "the pinned population is UNCHANGED at the END of the run — a case directory or capture created after the snapshot cannot hide" $rc
+ck "the pinned population is UNCHANGED at the END of the run — a capture changed, appeared or disappeared after the snapshot and was named above" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
