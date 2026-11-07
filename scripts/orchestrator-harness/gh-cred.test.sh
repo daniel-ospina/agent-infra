@@ -671,7 +671,76 @@ print(0 if ok else 1)
 PY
 )"
 
+# ── §10 the argv-attribution family, ENUMERATED ─────────────────────────────────────────────────
+echo "§10 the argv-attribution family — an enumerated cross-product, not one-off rows"
+# ⛔ THREE REVIEW CYCLES FOUND THREE SPELLINGS OF THE SAME BUG: a flag before `graphql`; `-t graphql`
+# as a flag VALUE tripping `api_is_mutating`'s `graphql = True` shortcut; a query string on `rate_limit`
+# defeating the meter pin. One-off rows never close a family — an enumeration does, and it is the
+# method the reviewers used, so it belongs here rather than in a review transcript.
+cat >"$TMP/enumerate.py" <<'EN'
+import importlib.util, itertools, sys
+spec = importlib.util.spec_from_file_location("gh_limit", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+
+prefixes = [[], ["-H", "Accept: x"], ["--hostname", "api.github.com"], ["--"], ["--paginate"],
+            ["-q", "."], ["-t", "graphql"], ["-i"], ["--silent"], ["-p", "x"],
+            ["--cache", "60m"], ["-H", "Accept: x", "-H", "Y: z"]]
+gql_endpoints = [["graphql"], ["/graphql"], ["GRAPHQL"], ["graphql?x=1"], ["graphql#f"]]
+rest_endpoints = [["repos/o/r/issues"], ["/repos/o/r/issues/"]]
+write_payloads = [
+    ["-f", "query=mutation{addComment(input:{body:\"x\"}){clientMutationId}}"],
+    ["-f", "query=subscription{onEvent}"],
+    ["-f", "operationName=M", "-f", "query=query Q{a} mutation M{b}"],
+    ["-F", "query=@/tmp/m.graphql"],
+    ["-f", "query=MUTATION M{addComment(input:{body:\"x\"}){clientMutationId}}"],
+]
+rest_writes = [["-f", "title=x"], ["-F", "body=@/tmp/b"], ["--input", "/tmp/b"],
+               ["-X", "PATCH"], ["--method=DELETE"]]
+
+bypass = []
+checked = 0
+for pre, ep, pl in itertools.product(prefixes, gql_endpoints, write_payloads):
+    argv = ["api"] + pre + ep + pl
+    checked += 1
+    if m.cred_kind(argv) == "read":
+        bypass.append(" ".join(argv))
+for pre, ep, pl in itertools.product(prefixes, rest_endpoints, rest_writes):
+    argv = ["api"] + pre + ep + pl
+    checked += 1
+    if m.cred_kind(argv) == "read":
+        bypass.append(" ".join(argv))
+# And the meter pin, under the same spellings.
+meter_bad = []
+for pre in prefixes:
+    for ep in (["rate_limit"], ["/rate_limit"], ["RATE_LIMIT"], ["rate_limit?x=1"], ["rate_limit#f"]):
+        argv = ["api"] + pre + ep
+        checked += 1
+        if m.cred_purpose(argv) != "meter":
+            meter_bad.append(" ".join(argv))
+# ⛔ AND THE ENUMERATION MUST NOT BE ALL-REFUSALS. If every shape answered `unproven`, the loop above
+# would pass while the fix was useless — so legitimate reads must still classify `read`.
+reads_ok = 0
+for pre, ep in itertools.product(prefixes, [["graphql"], ["/repos/o/r/pulls"]]):
+    argv = ["api"] + pre + ep + (["-f", "query=query{viewer{login}}"] if "graphql" in ep else [])
+    checked += 1
+    if m.cred_kind(argv) == "read":
+        reads_ok += 1
+
+sys.stdout.write("checked=%d bypass=%d meter_bad=%d reads_ok=%d\n"
+                 % (checked, len(bypass), len(meter_bad), reads_ok))
+for b in bypass[:5]:
+    sys.stdout.write("  BYPASS: %s\n" % b)
+for b in meter_bad[:5]:
+    sys.stdout.write("  METER: %s\n" % b)
+sys.exit(0 if (not bypass and not meter_bad and reads_ok > 0) else 1)
+EN
+_enum="$(python3 "$TMP/enumerate.py" "$LIMIT" 2>&1)"; _enum_rc=$?
+ck "no enumerated write shape classifies as a read, and the meter pin holds ($(printf '%s' "$_enum" | head -1))" "$(ok "$_enum_rc")"
+printf '%s\n' "$_enum" | sed -n 's/^  /     /p' | head -6
+
 echo
 printf '%s\n' "----------------------------------------"
 printf 'gh-cred: %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ] || exit 1
+

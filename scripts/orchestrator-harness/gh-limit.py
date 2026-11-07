@@ -1157,8 +1157,8 @@ def cred_purpose(argv):
     if argv[:1] == ["auth"]:
         return "introspect"
     if argv[:1] == ["api"]:
-        ep = api_endpoint(argv)
-        if ep is not None and ep.strip("/").lower() == "rate_limit":
+        # ⛔ NORMALISED: `rate_limit?x=1` / `rate_limit#frag` / `/rate_limit/` are all the meter.
+        if _api_endpoint_norm(argv) == "rate_limit":
             return "meter"
     return "request"
 
@@ -1197,6 +1197,56 @@ READ_SUBCOMMANDS = frozenset((
 READ_BARE = frozenset(("status", "browse", "search"))
 
 
+def _api_endpoint_norm(argv):
+    """The `api` endpoint, normalised for the credential question — query string and fragment stripped.
+
+    ⛔ `rate_limit?x=1` AND `rate_limit#frag` ARE THE METER. `cred_purpose` compared the raw endpoint,
+    so those spellings fell through to `request` + `read` and the pace layer's own meter would have
+    been answered from the INSTALLATION's remaining — the inverse of the pin's stated purpose (review
+    cycle 4). The file already strips a query string one function away (`ep.split("?")[0]`)."""
+    ep = api_endpoint(argv)
+    if ep is None:
+        return None
+    return ep.strip().strip("/").lower().split("?")[0].split("#")[0]
+
+
+def _api_has_write_shape(argv):
+    """Does this `gh api` argv CARRY A WRITE, decided WITHOUT `api_is_mutating()`'s pacing shortcut.
+
+    ⛔ THIS EXISTS BECAUSE `api_is_mutating()` IS NOT SOUND FOR THE CREDENTIAL QUESTION, and the
+    disagreement is narrow enough to be easy to miss: it sets `graphql = True` for ANY argv token
+    equal to `graphql` — including a FLAG'S VALUE — and then returns False before the data->POST
+    inference. So `api repos/o/r/issues -f title=x -t graphql` (where `-t` is `gh api --template`, a
+    POST-PROCESSING flag that `conditional_plan` lists and that sends the request first) came out
+    `api_is_mutating() == False`, my REST fall-through answered `read`, and the write went to the
+    installation token — T1 falsified through a spelling no test named (review cycle 4: 360 of 540
+    enumerated shapes).
+
+    The credential question asks "does this argv carry data or a non-GET method", full stop. It must
+    not inherit a predicate whose documented bias is to under-report mutations because a false one
+    costs the PACING layer a one-second gap."""
+    method = None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--input" or a.startswith("--input="):
+            return True                     # a body from a file IS data
+        if a in METHOD_FLAGS and i + 1 < len(argv):
+            method = argv[i + 1].upper()
+            i += 2
+            continue
+        if a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
+        elif a.startswith("-X") and len(a) > 2:
+            method = a[2:].upper()
+        elif _data_flag_value(a)[0]:
+            return True
+        i += 1
+    if method:
+        return method not in ("GET", "HEAD")
+    return False
+
+
 def cred_kind(argv):
     """`read` ONLY when the call is provably a read; `write` when it is provably a write; `unproven`
     for everything else. BOTH non-read answers keep the user credential (#3429).
@@ -1228,12 +1278,14 @@ def cred_kind(argv):
         # core invariant). `api_endpoint()` already exists for precisely this: it consumes flag VALUES,
         # it is what `cred_purpose` and `flight_eligible` use, and its own comment records this exact
         # `-H`-before-`graphql` shape as measured. One argv parser for one argv question.
-        ep = api_endpoint(argv)
+        ep = _api_endpoint_norm(argv)
         if ep is None:
             return "unproven"          # an argv we cannot attribute is NOT provably a read
-        if ep.strip("/").lower() == "graphql":
+        if ep == "graphql":
             return "read" if _graphql_query_is_read(argv) else "unproven"
-        return "read"                  # a REST GET: no method flag, no data
+        # ⛔ A REST CALL IS A READ ONLY WHEN ITS ARGV CARRIES NO DATA AND NO NON-GET METHOD — asked
+        # here directly, NOT inherited from `api_is_mutating()` (see `_api_has_write_shape`).
+        return "write" if _api_has_write_shape(argv) else "read"
     if argv[0] in READ_BARE:
         return "read"
     if len(argv) >= 2 and (argv[0], argv[1]) in READ_SUBCOMMANDS:
