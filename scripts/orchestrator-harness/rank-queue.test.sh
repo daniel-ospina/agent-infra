@@ -413,6 +413,50 @@ if [ ! -s "$TMP/empty/o/candidates.txt" ] && grep -q 'the queue is EMPTY' "$TMP/
 else rc=1; echo "      out: $(tr '\n' '|' < "$TMP/empty/out" 2>/dev/null | head -c 300)"; fi
 ck "an EMPTY queue reports 'the queue is EMPTY' — not the failure word, and the file stays empty" $rc
 
+# ⛔ AND THE DRAINED ARM'S SILENCE IS GRADED, NOT ONLY DOCUMENTED (review P3, cycle 66). README §2, ARCHITECTURE's
+# `refresh-candidates.sh` row and the code comment all state that the DRAINED arm is the ONE arm that prints no
+# tier-window clause — and nothing asserted it: appending `$_sat_said` to the drained echo left rank-queue,
+# refresh-quota, product-floor and refresh-provision all green. The state is reachable, not hypothetical: every
+# queued row dispatched while a tier window is still clipped. The arm is driven WITH a recognised clip record
+# present, and both directions are required — its own sentence, and NO clause of any kind on that line.
+_ed="$TMP/arm-drained-clip"; rm -rf "$_ed"; mkdir -p "$_ed/o"
+: > "$_ed/o/candidates.txt"; printf '200\n300\n' > "$_ed/o/.pool"
+printf 'P2-moderate\n' > "$_ed/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_ed/drive.sh"
+( cd "$_ed" && HOME="$_ed" bash drive.sh "$_ed/o" ) > "$_ed/out" 2>&1
+_e14="$(cat "$_ed/out" 2>/dev/null)"
+if grep -q 'STATE=empty' <<<"$_e14" \
+   && grep -q 'the queue is EMPTY' <<<"$_e14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_e14" \
+   && ! grep -q 'tier window was clipped' <<<"$_e14" \
+   && ! grep -q 'could not be USED' <<<"$_e14" \
+   && ! grep -q 'carried no tier name this code recognises' <<<"$_e14"; then rc=0
+else rc=1; echo "      drained+clip '$(printf '%s' "$_e14" | tr '\n' '|' | head -c 340)' (want STATE=empty and NO tier-window clause of any kind: a drained queue has no row that a clipped window could have pushed behind a lower tier, and no order for a record to qualify)"; fi
+ck "the DRAINED arm carries NO tier-window clause even with a clip record present (nothing can be inverted in an empty queue)" $rc
+# ⛔ NON-VACUITY: append `$_sat_said` to the drained echo and the check above must redden — and ASK FOR THE ECHO
+# FIRST, so a changed sentence is reported as itself instead of as a drifted anchor (the construction §14c,
+# §14d-quinquies and the `.pool`-shape gate use).
+_ed_gate='echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"'
+_ed_cause=""
+_mut_ed="$TMP/fns-drained-mut.sh"
+if ! grep -qF "$_ed_gate" "$FNS" 2>/dev/null; then
+  _ed_cause="the drained arm's echo is not in the shipped function as spelled — its sentence changed, so this half grades nothing"
+else
+  awk -v g="$_ed_gate" '{ if (index($0, g)) sub(/"[[:space:]]*$/, "$" "_sat_said\""); print }' "$FNS" > "$_mut_ed"
+  cmp -s "$FNS" "$_mut_ed" 2>/dev/null && _ed_cause="the drained-arm mutation did not apply (the sentence IS present, so the mutation is what drifted) — this non-vacuity half grades nothing"
+fi
+if [ -n "$_ed_cause" ]; then
+  rc=1; echo "      $_ed_cause"
+else
+  _edm="$TMP/arm-drained-clip-mut"; rm -rf "$_edm"; mkdir -p "$_edm/o"
+  : > "$_edm/o/candidates.txt"; printf '200\n300\n' > "$_edm/o/.pool"; printf 'P2-moderate\n' > "$_edm/o/.pool-sat"
+  { drive_prologue; cat "$_mut_ed"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_edm/drive.sh"
+  ( cd "$_edm" && HOME="$_edm" bash drive.sh "$_edm/o" ) > "$_edm/out" 2>&1
+  if grep -q 'windows=TRUNCATED' "$_edm/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      with the tier-window clause appended to the drained echo the arm did NOT disclose a clip — the check above is not grading the arm's silence: $(tr '\n' '|' < "$_edm/out" | head -c 320)"; fi
+fi
+ck "non-vacuity: appending the tier-window clause to the DRAINED arm reddens the silence check" $rc
+
 # ── 6) A FAILED REORDER LEAVES THE QUEUE INTACT AND SAYS SO ──────────────────
 # No `.pool` at all: the rank cannot be derived. The queue must stay byte-identical and the state must be
 # named — a failed write that silently left arrival order in place is the defect this arm exists for.
@@ -2280,8 +2324,16 @@ printf 'P2-moderate\n' > "$_d14/o/.pool-sat"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14/drive.sh"
 ( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unranked" 2>&1
 _u14="$(cat "$_d14/out-unranked" 2>/dev/null)"
+# ⛔ AND THE CAUSE CLAUSES ARE FORBIDDEN HERE TOO (review P2, cycle 66). This arm is a RECOGNISED clip: the
+# record was READ (that is how the tier was named), so any "could not be USED" / "could not be READ" /
+# "NOT A REGULAR FILE" wording on the same line contradicts the half that just measured the clip — and both
+# `_why_none` and `$_sat_said` write to that one line. Measured: appending "could not be USED" to
+# `_why_none`'s clip branch left the suite at 153/0.
 if grep -q 'unranked:' <<<"$_u14" && grep -q 'P2-moderate tier window was clipped' <<<"$_u14" \
-   && grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_u14"; then rc=0
+   && grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_u14" \
+   && ! grep -q 'could not be USED' <<<"$_u14" \
+   && ! grep -q 'could not be READ' <<<"$_u14" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_u14"; then rc=0
 else rc=1; echo "      (a) unranked+clip '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) the UNRANKED arm names a RECOGNISED clipped tier (and carries windows=TRUNCATED)" $rc
 
@@ -2310,9 +2362,21 @@ else rc=1; echo "      unranked-absent '$(printf '%s' "$_u14" | tr '\n' '|' | he
 ck "(14d) an ABSENT window record makes the UNRANKED arm claim NO clip and NO unreadable record — the plain clause, nothing else" $rc
 # ⛔ NON-VACUITY: make `_why_none`'s absent branch claim a clip and the check above must redden.
 _mut_ud="$TMP/fns-unranked-mut.sh"
-sed 's@^            _why_none="no P0-blocker/P1-severe/P2-moderate row matched"$@            _why_none="no ranked row was left for this queue — a tier window was clipped, so its newest members were never ranked at all"@' "$FNS" > "$_mut_ud" 2>/dev/null
-if cmp -s "$FNS" "$_mut_ud" 2>/dev/null; then
-  rc=1; echo "      the _why_none mutation did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+# ⛔ ASK FOR THE SENTENCE FIRST (review P3, cycle 66). `cmp` cannot tell "the anchor drifted" from "the shipped
+# sentence changed" — and the second IS the regression this half exists to catch (measured: restoring the
+# cycle-38 "record could not be USED" wording produced "the sed anchor drifted", sending the maintainer to the
+# fixture). Same construction as `_mut_cause` and `_pg_cause`; a THIRD gate added in the old shape is exactly how
+# a pattern that was just fixed comes back.
+_ud_gate='            _why_none="no P0-blocker/P1-severe/P2-moderate row matched"'
+_ud_cause=""
+if ! grep -qF "$_ud_gate" "$FNS" 2>/dev/null; then
+  _ud_cause="the _why_none ABSENT-RECORD sentence is not in the shipped function as spelled (its text changed) — that regression must redden the check above, not this mutation gate"
+else
+  sed 's@^            _why_none="no P0-blocker/P1-severe/P2-moderate row matched"$@            _why_none="no ranked row was left for this queue — a tier window was clipped, so its newest members were never ranked at all"@' "$FNS" > "$_mut_ud" 2>/dev/null
+  cmp -s "$FNS" "$_mut_ud" 2>/dev/null && _ud_cause="the _why_none mutation did not apply (the sentence IS present, so the sed anchor is what drifted) — this non-vacuity half grades nothing"
+fi
+if [ -n "$_ud_cause" ]; then
+  rc=1; echo "      $_ud_cause"
 else
   _udm="$TMP/arm-unranked-absent-mut"; rm -rf "$_udm"; mkdir -p "$_udm/o"
   printf 'aaa\nbbb\n' > "$_udm/o/candidates.txt"; printf '200\n' > "$_udm/o/.pool"
@@ -2331,8 +2395,17 @@ _r14="$(cat "$_d14/out-unrec" 2>/dev/null)"
 # clip claim only by `! grep windows=TRUNCATED` / `! grep 'tier window was clipped'` catches one spelling
 # and misses its paraphrase — measured: a re-claim in prose passed all four predicates. The honest clause
 # is asserted positively ("NO clip is asserted"), so replacing it with any claim of a clip fails.
+# ⛔ AND THE TWO RECORD-SHAPE CAUSES ARE FORBIDDEN ON THIS LINE TOO (review P2, cycle 66). A record whose LINES
+# were read and classified as junk proves the READ SUCCEEDED, so "it EXISTED but could not be READ" or "is NOT A
+# REGULAR FILE, so this pass did NOT open it" is a cause this pass demonstrably did not hit. Measured: adding
+# either to the `unrecognised` branch of `$_sat_said` left the whole suite at 153/0 — the absent-record control
+# forbids them, but it drives the SEVERITY arm, which never reaches this state. The enumeration is per-arm, and
+# this arm had only its CLIP polarity graded.
 if grep -q 'unranked:' <<<"$_r14" && grep -q 'names no tier this code recognises' <<<"$_r14" \
    && grep -q 'NO clip is asserted and no tier is repeated here' <<<"$_r14" \
+   && ! grep -q 'could not be READ' <<<"$_r14" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_r14" \
+   && ! grep -q 'could not be USED' <<<"$_r14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_r14" && ! grep -q 'tier window was clipped' <<<"$_r14"; then rc=0
 else rc=1; echo "      (b) unranked+unrecognised '$(printf '%s' "$_r14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) an UNRECOGNISED window record is NOT reported as a clip this pass measured (no windows=TRUNCATED clause at all)" $rc

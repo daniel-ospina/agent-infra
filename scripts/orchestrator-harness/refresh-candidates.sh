@@ -4196,13 +4196,18 @@ queue_order_from_pool() {
     # `_r + _u != _rows_now` and returned above, and an unreadable one is caught by the `-z "$_rows_now"`
     # arm. So that state is covered by THE TOTALS CHECK, which is the guard to redden in a test — not by
     # a shape test here. (Kept as a named absence: an enforcer that can never fire is worse than none.)
-    # ⛔ AND THE CLIP IS DELIBERATELY NOT DISCLOSED HERE (review P3, cycle 63). Every other arm carries
-    # `$_sat_said`; this one has no row to carry it about. An EMPTY queue holds nothing, so no row from a
-    # clipped tier can be sitting behind a lower tier — the inversion the clause exists to disclose cannot
-    # exist — and printing it would cry wolf on every drained pass, which is the routine state after a good
-    # one. Stated here, in `rank-queue.test.sh` §14f's header and in ARCHITECTURE's `candidates.txt` row,
-    # because an ARM THAT IS SILENT is indistinguishable from an arm that FORGOT unless the silence is written
-    # down.
+    # ⛔ AND `$_sat_said` IS DELIBERATELY SUPPRESSED HERE — ALL OF ITS CLAUSES, NOT ONLY THE CLIP (review
+    # P3, cycles 63+66). Every other arm carries it; this one has no ROW to carry it about. (1) The CLIP
+    # clause: an EMPTY queue holds nothing, so no row from a clipped tier can be sitting behind a lower tier —
+    # the inversion the clause exists to disclose cannot exist. (2) The three RECORD-SHAPE clauses
+    # (`unrecognised`, NOT A REGULAR FILE, could not be READ) say what this pass could learn about the RECORD;
+    # with no rows there is no order for a record to qualify, so a reader can act on none of them — and
+    # printing them would cry wolf on the routine state after a good pass, which is when this arm fires.
+    # ⛔ AND THE SILENCE IS GRADED, NOT MERELY DOCUMENTED (review P3, cycle 66): `rank-queue.test.sh` drives
+    # this arm WITH a recognised clip record present and requires both its own sentence and the absence of
+    # every clause, with a non-vacuity half that appends `$_sat_said` and reddens. Written down here, in
+    # §14f's header and in ARCHITECTURE's `candidates.txt` row, because an ARM THAT IS SILENT is
+    # indistinguishable from an arm that FORGOT unless the silence is written down AND asserted.
     QUEUE_ORDER_STATE="empty"
     echo "[refresh] queue order: the queue is EMPTY — there is nothing to order"
     return 0
