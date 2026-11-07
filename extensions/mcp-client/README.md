@@ -89,8 +89,13 @@ Two files are merged, base first: the hub's machine-local
 nobody) and then the repo's own `.mcp.json`. **A repo entry is a DELTA per
 field**, not a whole-entry replacement — it wins every field it sets and inherits
 every field it omits, so `{"timeoutMs": 40000}` keeps the base's `url` and
-`lazy`. Transport is atomic (a repo `url` or `command` drops the base's fields for
-the other transport), and the base's credentials (`headers`/`oauth`) and `env`
+`lazy`. Two rulings sit OUTSIDE that rule, and neither is an oversight: a delta
+that declares BOTH transports is ambiguous and is ignored whole, so it wins
+NOTHING it set and the base's entry is kept as written; and a delta that changes
+the transport CLASS drops the base's `type` instead of inheriting it, because a
+stale label describing the old transport is worse than an absent one. Transport
+is otherwise atomic (a repo `url` or `command` drops the base's fields for the
+other transport), and the base's credentials (`headers`/`oauth`) and `env`
 follow only an UNCHANGED destination and an UNCHANGED launch.
 
 ⛔ **These guards are NOT a security boundary, and a repo's `.mcp.json` is
