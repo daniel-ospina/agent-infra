@@ -5943,11 +5943,24 @@ done
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
 # that does not exist, with this box's local witness removed so no fallback can answer either.
+# ⛔ AND THE WITNESS THAT HAD TO GO IS NOT `$RREG/state/lanes` — THAT WAS THE VACUITY ONE ARM OVER.
+# `lane_registry.py` resolves its own state root from `CELL_HOME`, then `HOME` (its `_home()`), NOT from
+# this fixture's `LANE_REGISTRY_STATE`; removing the fixture's directory therefore removed nothing the
+# probe reads, and on a box with a populated local state dir (a real fleet box — 1,740 records when this
+# was measured) the tool answered rc=0 from its DOCUMENTED local fallback, so the probe reported the
+# BOX's state instead of the SUBJECT's and the arm reddened on a healthy tree. `CELL_HOME` is the sharp
+# one: it WINS over `HOME` and a cell sets only the former. The probe is now HERMETIC — every ambient
+# state root is unset and HOME is a scratch dir — so "no local witness can answer" is a property of the
+# fixture rather than of the host: the same defect class this suite's header names (a fixture that
+# inherits ambient env cannot make a claim about isolation).
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
+mkdir -p "$TMP/no-witness"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+unreachable="$(env -u CELL_HOME -u LANE_REGISTRY_STATE -u LANE_REGISTRY_LOCAL -u LANE_REGISTRY_GIT \
+  HOME="$TMP/no-witness" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
