@@ -27,6 +27,13 @@
 #                 forfeits the protection and the reap still proceeds — reaping is this
 #                 process's whole job, and the caller has no other arm that runs on a schedule.
 #
+#   <supervisor-pid>, <pid>  both must be POSITIVE integers (> 1), and are REFUSED (exit 2) when
+#                 they are not: `kill -9 0` is the whole process group, `kill -9 1` is init, a
+#                 non-numeric supervisor makes `kill -0` answer FALSE (so the supervisor arm
+#                 fires at once on a healthy rail), and a non-numeric pid makes this script exit
+#                 0 — "the rail stopped on its own" — over nothing at all. The guard's answers
+#                 to a caller error are a kill it must not perform, or a false PASS.
+#
 # ⛔ THE EXIT STATUS, NOT A SENTINEL FILE, CARRIES THE VERDICT. An earlier cut had the guard write
 # a sentinel into the scenario dir and the caller read it; measured: `: >"$file" 2>/dev/null` does
 # NOT suppress the redirection's own failure, so on a deleted scratch dir (or ENOSPC) the sentinel
@@ -125,24 +132,6 @@ if [ "$#" -lt 3 ]; then
   exit 2
 fi
 sup="$1"; limit="$2"; pid="$3"; ident="${4:-}"
-# ⛔ THE TWO PIDS GET A VALUE-CHECK, because a NEGATIVE pid here is not an argument error — it
-# is a SIGNAL TARGET. `kill -0 -1` succeeds ("every process I may signal") and
-# `ps -o stat= -p -1` ERRORS, so `is_running -1` answers ALIVE and `still_ours -1` is TRUE;
-# the guard would poll to its limit and then execute `kill -9 -1` — SIGKILL to every process
-# this user owns (on a fleet box: the orchestrator and every other lane). Measured 2026-11-07
-# (#3622 review round 6, P2): `is_running -1` → rc 0. Symmetrically a negative `sup` makes the
-# supervisor arm silently ALWAYS-true (`kill -0 -1`), which is the inert-enforcer shape this
-# change exists to remove. The shipped caller always passes a real `$!`, so this is
-# defence-in-depth for the SEPARATELY-INVOCABLE use the header advertises (7g/7h drive it).
-for _p in "$sup" "$pid"; do
-  case "$_p" in
-    ''|*[!0-9]*) echo "rail-guard: <supervisor-pid> and <pid> must be positive integers (got '$sup', '$pid')" >&2; exit 2 ;;
-  esac
-  # Value-by-range for the same reason as the limit below: a literal too wide makes `[ -gt 0 ]`
-  # ERROR, and a failing `[` is FALSE — which would refuse a valid pid, so refuse it BY NAME.
-  [ "$_p" -gt 0 ] 2>/dev/null \
-    || { echo "rail-guard: pid '$_p' is not a positive process id" >&2; exit 2; }
-done
 case "$limit" in ''|*[!0-9]*) echo "rail-guard: the limit must be a non-negative integer" >&2; exit 2 ;; esac
 # ⛔ VALUE AND SPELLING, not shape alone. `0` is the ONE spelling of "no time limit"; `00` is
 # all digits and is NOT the string `0`, and `[ "$limit" -gt 0 ]` below is FALSE for it — so a
@@ -158,6 +147,27 @@ if [ "$limit" != "0" ]; then
   [ "$limit" -ge 1 ] 2>/dev/null && [ "$limit" -le 86400 ] 2>/dev/null \
     || { echo "rail-guard: the limit must be 0, or 1..86400 seconds (got '$limit')" >&2; exit 2; }
 fi
+# ⛔ AND THE TWO PIDS, BY VALUE, for the same reason the limit is validated — because this script
+# ACTS on them. `kill -9 0` signals the WHOLE PROCESS GROUP (measured 2026-11-07: a `setsid`
+# probe ran `rail-guard.sh <sup> 5 0`, and the probe shell, the victim it had started AND the
+# guard itself were all SIGKILLed — the caller's own suite would go with it), and `kill -9 1` is
+# init. Both are caller errors the guard could answer with, and neither answer is one it may
+# give: a non-numeric `<sup>` is worse still, because `kill -0 not-a-pid` answers FALSE, so the
+# SUPERVISOR arm fires on the first poll and this script reaps a HEALTHY rail. The third wrong
+# answer is the quiet one: a non-numeric `<pid>` makes `still_ours` false, the loop is never
+# entered, and the script exits 0 — "the rail stopped on its own" — which is a false PASS.
+# So: refuse (2), exactly like the limit, rather than kill the wrong thing or report a false 0.
+for _pair in "supervisor=$sup" "pid=$pid"; do
+  _name="${_pair%%=*}"; _val="${_pair#*=}"
+  case "$_val" in
+    ''|*[!0-9]*)
+      echo "rail-guard: the $_name must be a positive integer (got '$_val')" >&2; exit 2 ;;
+  esac
+  # `-gt 1` also rejects a literal too wide for `[` (a failing `[` is FALSE) — nothing that large
+  # is a pid, and the same overflow trick that disarms the limit arm must not land here.
+  [ "$_val" -gt 1 ] 2>/dev/null \
+    || { echo "rail-guard: refusing $_name '$_val' — 0 is the whole process group and 1 is init" >&2; exit 2; }
+done
 
 started="$SECONDS"
 why=""
