@@ -5789,18 +5789,17 @@ while true; do
           # operator to re-record evidence that already existed. merge-one.sh is the single writer of
           # `needsreview-*`; this arm only READS it, and the log line says only what is known here.
           _rgs="$(review_gate_state "$PR" "${HEAD_N:-}")"
-          # ⛔ SETTLE LEVEL 3 HERE, AND THAT LINE IS THE WHOLE FIX (fresh-context review of this
-          # fix round, P1 — the first attempt was INERT and this is the measured reason). The
-          # `FAILED:*` arm opened level 3 fifty lines above this point (it charges the HEAD re-read
-          # and the check classification to the red-tree repair, correctly), and `stg_lvl_start`
-          # only settles at the NEXT open — so deleting the `stg_lvl_start l3_fix` that used to sit
-          # here changed NOTHING: level 3 was already open and nothing closed it. Driven end-to-end
-          # on this path (`FAILED:…ai-review-gate` → NEEDS-REVIEW → AT-HEAD), the emitted field was
-          # BYTE-IDENTICAL with and without that deletion (`l3_fix:1, l4_review:ns`) — a cycle whose
-          # only PR work was waiting on a re-record still reading "fixing". The settle is what makes
-          # the three fix-side opens below load-bearing: the remedy is decided AFTER the classifier
-          # reads `_rgs`, and only the branches that actually fix re-open level 3. The review side
-          # opens level 4 (its dispatch arm) or no level, which the record can express
+          # SETTLE ANY OPEN LEVEL HERE, SO THE REVIEW-SIDE BRANCHES BELOW CANNOT INHERIT ONE.
+          # ⛔ THIS COMMENT USED TO NARRATE A DIFFERENT ARRANGEMENT, AND IT WAS WRONG FOR THIS CODE
+          # (fresh-context review, P3 — verified inert). It said "the `FAILED:*` arm opened level 3 fifty
+          # lines above this point"; the arm NO LONGER OPENS A LEVEL HERE AT ALL — see the note at its
+          # head — so on today's path `STG_OPEN_LVL` is always empty by the time this runs and the call
+          # returns at its first test. The property it was written for is delivered by the
+          # `[redfix:end]` close, which is the one graded by `_redfix_close`. Kept as a LOCAL assertion
+          # (cheap, idempotent, and graded): deleting it reddens the arm that names it, and a future edit
+          # that re-opens a level above here would be caught by this settle rather than silently charging
+          # the review branches to a fix. Only the branches that actually fix re-open level 3; the review
+          # side opens level 4 (its dispatch arm) or no level, which the record can express
           # (`sum(l1..l4) < sweep` = no cascade level was the active work).
           stg_lvl_settle || :
           if [ "$_rgs" = "NEEDS-FIX" ]; then
@@ -8016,12 +8015,19 @@ PY
   # spawns, and on a box out of pids that spawn is the one that kills the controller (measured: bash
   # exits on a failed fork, and launchd's relaunch needs the same fork). `fork_free_sleep` blocks in
   # `read -t` on the FIFO opened at startup — no child at all.
+  # ⛔ ONE PRE-NAP SAMPLE FOR BOTH NAP BRANCHES, TAKEN ABOVE THE `if` (fresh-context review, P1 —
+  # measured). There used to be a sample INSIDE each branch, and the guard's walk latched "a sample was
+  # seen" once for the whole site — so either branch's sample could be deleted, or MOVED AFTER its nap,
+  # and the suite stayed green at 119/0 while `prev_wait` became the controller's whole uptime (measured
+  # 2003358 µs for a 1 s nap) or a fabricated `0` (measured 140 µs) on EVERY cycle. Hoisting the sample
+  # above the branch is semantically identical — both branches nap, and nothing between here and the
+  # `stg_nap_mark` touches `STG_WAIT_T0` — and it makes the site SINGLE, which is the shape the walk
+  # actually grades. ⛔ Do not "tidy" it back into the branches.
+  stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
   if [ "${FORK_STARVED:-0}" = "1" ]; then
-    stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
     fork_free_sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) \
       || sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) 2>/dev/null
   else
-    stg_now_us_vars STG_WAIT_T0 || STG_WAIT_T0=0
     sleep $(( 10#${CYC} - JIT + RANDOM % (2 * JIT + 1) )) & wait $!
   fi
   # ⛔ THE GAP IS MEASURED HERE AND CARRIED INTO THE **NEXT** RECORD, as `prev_wait`. It cannot be in

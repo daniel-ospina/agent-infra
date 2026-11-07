@@ -665,6 +665,23 @@ case " $_main_marks " in *" disk "*) : ;; *) _mmmiss="$_mmmiss disk" ;; esac
 ck "  …and the MAIN-PATH mark survives for a doubly-marked stage, so a stage that ran cannot read 'ns' (got '${_main_marks:- none}')${_mmmiss:+ — missing:$_mmmiss}" \
    "$(if [ -z "$_mmmiss" ]; then echo 0; else echo 1; fi)"
 
+# ⛔ AND THE **BODY ORDER** OF THE TILED MARKS, WHICH NOTHING GRADED (fresh-context review, P2 — measured).
+# `stg_mark X` closes the preceding span INTO `X`, so the ORDER is what makes the attribution correct — and
+# every arm above grades existence, not order. Measured: swapping `claims`↔`caches`, swapping
+# `reap`↔`refresh`, swapping the MAIN-PATH `boot`↔`disk`, and moving `stg_mark gate` up beside the per-PR
+# `sweep` ALL left the suite at 119/0. The last is the damaging shape: the entire fleet-placement /
+# CI-queue / gate-vector block was booked to `l5_issue`, reproducing the `sweep`/`gate` misattribution this
+# PR exists to fix with one line moved — and because every stage still reads a NUMBER (never `ns`), no other
+# arm can see it. The expected sequence is the shipped one: the fork-starved arm's `boot`, then the
+# main path `boot disk reap refresh`, then the listing `sweep` (a deliberate second site, ahead of
+# `claims`), then `claims caches sweep gate l5_issue`, then the record block's `record`.
+_tiled_order="$(printf '%s\n' "$_loop_nc" | grep -oE '^[[:space:]]*stg_mark [a-z0-9_]+' | awk '{print $2}' | tr '\n' ' ' | sed 's/ *$//')"
+_tiled_want="boot boot disk disk reap refresh authority sweep claims caches sweep gate l5_issue record"
+ck "the TILED marks appear in BODY ORDER (order is what makes the attribution right; every arm above grades only existence)" \
+   "$(if [ "$_tiled_order" = "$_tiled_want" ]; then echo 0; else echo 1; fi)"
+ck "  …order actually read: '${_tiled_order:- none}'" \
+   "$(if [ -n "$_tiled_order" ]; then echo 0; else echo 1; fi)"
+
 # 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
 _nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
 _loop_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*(fork_free_sleep|sleep) ')"
