@@ -78,7 +78,7 @@ ck()  { # ck <name> <0|1> — the shared vocabulary the sibling suites use
 # A suite that cannot get the code under test must never report green. Fail ONCE, by name, instead of
 # leaving 10 cryptic assertion failures that read as "the reorder is broken".
 MISSING=""
-for t in awk sed grep sort cksum mktemp wc tr; do
+for t in awk sed grep sort cksum cmp mktemp wc tr; do
   command -v "$t" >/dev/null 2>&1 || MISSING="$MISSING $t"
 done
 if [ -n "$MISSING" ]; then
@@ -137,6 +137,21 @@ fi
 # the shipped code runs in (`QUEUE_ORDER_STATE` is initialised here for the same reason the shipped
 # script initialises it above the definitions: the functions read it before any pass has decided).
 drive_prologue() { printf 'set -u\nQUEUE_ORDER_STATE=""\n'; }
+# ⛔ THE TRACING PROLOGUE SETS `PS4` INSIDE THE SCRIPT, NOT IN THE ENVIRONMENT (measured, cycle 49). A
+# `PS4=… bash -x …` prefix is DROPPED when the shell runs as root — the trace then reads `+ echo '…'`
+# with no function name, so every witness check would red for the wrong reason on a root host. Set on
+# the script's own first lines, it is honoured for every uid.
+# ⛔ AND THE PREFIX CARRIES A PER-RUN NONCE (review P3, cycle 52). The anchored matcher proves a TEXT SHAPE
+# on the trace stream, and ANY line written to FD 2 can wear that shape — measured: a heredoc body whose line
+# begins `+queue_order_from_pool echo '[refresh] …'` is accepted by the anchored regex with no echo
+# executed. The nonce is generated per drive and written ONLY into that drive's `PS4`, so data that does not
+# carry THIS run's value cannot name a witness; a forgery would have to read the drive file that invoked it
+# (residual, stated). `_dwit` requires the nonce, and one probe grades BOTH directions.
+_xtrace_nonce() { printf 'n%d' "$RANDOM$RANDOM"; }
+drive_xtrace_prologue() {
+  local _n="${1:-}"; [ -n "$_n" ] || _n="$(_xtrace_nonce)"
+  printf '%s\n' 'set -u' 'QUEUE_ORDER_STATE=""' "PS4='+\${FUNCNAME[0]:-main} [${_n}] '" 'set -x'
+}
 
 drive() {
   local label="$1" src="$2" q="$3" pool="$4" how="${5:-call}"
@@ -671,6 +686,54 @@ else
 fi
 ck "an ABSENT or NON-REGULAR queue is 'priority-unreadable' with NOTHING written — never a drained queue, never pool rows installed" $rc
 
+# ⛔ AND THE POOL'S SHAPE GUARD, THE ONE THE SAME PARAGRAPH PROMISES (review P3, cycle 62). `[ -f "$pool" ] &&
+# `[ -r "$pool" ] || return 1` is what makes README/ARCHITECTURE's "a `.pool` that is missing OR UNREADABLE
+# refuses the reorder" true. No case reached it with a NON-REGULAR pool: `drive nopool` passes with the guard
+# deleted, because *awk* itself fails on a missing file — it grades awk, not the guard. With the guard gone a
+# DIRECTORY at `.pool` is read by awk as "skipped, no rows", so the pass prints the `unranked` sentence —
+# "the pool ranked NONE of the 2 queued candidate(s) (no P0-blocker/… row matched)" — a MEASUREMENT it never
+# took, over a pool it never read. Both shapes are driven here, and both must refuse.
+GP="$TMP/poolguards"; rm -rf "$GP"; mkdir -p "$GP/dir-o/.pool" "$GP/mode000-o"
+printf '300\n9\n' > "$GP/dir-o/candidates.txt"
+printf '200\n300\n' > "$GP/mode000-o/.pool"; chmod 000 "$GP/mode000-o/.pool"
+printf '300\n9\n' > "$GP/mode000-o/candidates.txt"
+{
+  drive_prologue
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'
+} > "$GP/drive.sh"
+( cd "$GP" && HOME="$GP" bash drive.sh "$GP/dir-o" ) > "$GP/dir.log" 2>&1
+pg_dir_rc=$?
+# the mode-000 shape is sampled WHILE it holds (a root host would read it): both arms are asserted below,
+# and the skip-if-readable case says so instead of passing silently
+( cd "$GP" && HOME="$GP" bash drive.sh "$GP/mode000-o" ) > "$GP/m000.log" 2>&1
+pg_m_rc=$?
+pg_dir_rows="$(tr '\n' ' ' < "$GP/dir-o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+pg_dir_awk=0; grep -q 'is a directory' "$GP/dir.log" 2>/dev/null && pg_dir_awk=1
+pg_dir_unranked=0; grep -q 'the pool ranked NONE' "$GP/dir.log" 2>/dev/null && pg_dir_unranked=1
+pg_m_unranked=0; grep -q 'the pool ranked NONE' "$GP/m000.log" 2>/dev/null && pg_m_unranked=1
+if [ "$pg_dir_rc" -ne 0 ] && [ "$pg_dir_rows" = "300 9" ] \
+   && grep -q 'STATE=priority-unreadable' "$GP/dir.log" 2>/dev/null \
+   && [ "$pg_dir_unranked" -eq 0 ] && [ "$pg_dir_awk" -eq 0 ] \
+   && { [ ! -r "$GP/mode000-o/.pool" ] && [ "$pg_m_rc" -ne 0 ] && grep -q 'STATE=priority-unreadable' "$GP/m000.log" 2>/dev/null && [ "$pg_m_unranked" -eq 0 ] || [ -r "$GP/mode000-o/.pool" ]; }; then rc=0
+else rc=1; echo "      pool-shape: dir rc=$pg_dir_rc rows='$pg_dir_rows' unranked-claim=$pg_dir_unranked awk-warning=$pg_dir_awk | mode000 rc=$pg_m_rc unranked-claim=$pg_m_unranked (want: both refuse as priority-unreadable, rows intact, NO 'the pool ranked NONE' claim, no awk directory warning)"; fi
+chmod 644 "$GP/mode000-o/.pool" 2>/dev/null || true
+ck "a NON-REGULAR or UNREADABLE .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take" $rc
+# ⛔ NON-VACUITY: delete the pool-shape guard and the case above must redden.
+PGMUT="$TMP/poolguard-mut.sh"
+sed 's@^  \[ -f "\$pool" \] && \[ -r "\$pool" \] || return 1$@  :@' "$FNS" > "$PGMUT" 2>/dev/null
+if cmp -s "$FNS" "$PGMUT" 2>/dev/null; then
+  rc=1; echo "      the pool-guard deletion did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+else
+  GPM="$TMP/poolguards-mut"; rm -rf "$GPM"; mkdir -p "$GPM/dir-o/.pool"
+  printf '300\n9\n' > "$GPM/dir-o/candidates.txt"
+  { drive_prologue; cat "$PGMUT"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$GPM/drive.sh"
+  ( cd "$GPM" && HOME="$GPM" bash drive.sh "$GPM/dir-o" ) > "$GPM/out" 2>&1
+  if grep -q 'the pool ranked NONE' "$GPM/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      with the pool-shape guard DELETED the directory pool did not produce the 'pool ranked NONE' claim — the check above is not grading the guard: $(tr '\n' '|' < "$GPM/out" | head -c 240)"; fi
+fi
+ck "non-vacuity: deleting the .pool shape guard makes a directory pool print a 'pool ranked NONE' measurement the pass never took" $rc
+
 # ── 10) A REWRITE IS REPORTED AS A REWRITE ──────────────────────────────────
 # The ranked-none arm CAN write: `qseen` collapses a DUPLICATE row, so `300 9 300` comes out `300 9` and
 # the install runs. The message must then say it rewrote — "byte-identical" was a typed claim about a
@@ -710,17 +773,62 @@ chmod +x "$SH/bin/cmp"
 {
   drive_prologue
   cat "$FNS"
-  printf 'queue_order_from_pool "$1"\nexit $?\n'
+  printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'
 } > "$SH/drive.sh"
 ( cd "$SH" && HOME="$SH" PATH="$SH/bin:$PATH" PRUNE_SEED="$SH/seed" PRUNE_QUEUE="$SH/o/candidates.txt" bash drive.sh "$SH/o" ) > "$SH/out" 2>&1
 race_rc=$?
 race_rows="$(tr '\n' ' ' < "$SH/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+# ⛔ AND THE STATE IT RECORDS (review P3, cycle 54): `queue_order_refuse`'s single line is what the durable
+# `why=`/`handed_why=` copy, and deleting it left the suite green — a refused install would then be recorded
+# as "provenance NOT recorded" while the log said `priority-unreadable`.
 if [ "$race_rc" -ne 0 ] && [ "$race_rows" = "111 222" ] \
-   && grep -q 'priority-unreadable' "$SH/out" 2>/dev/null \
+   && grep -q 'STATE=priority-unreadable' "$SH/out" 2>/dev/null \
    && ! grep -q 'the queue is EMPTY' "$SH/out" 2>/dev/null \
    && [ ! -e "$SH/o/.cand.ranked" ]; then rc=0
 else rc=1; echo "      rc=$race_rc rows='$race_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH/out" 2>/dev/null | head -c 300)"; fi
 ck "a prune that refills the queue between the read and the install is REFUSED — the rows survive, no 'EMPTY' is reported" $rc
+
+# ⛔ AND THE EMPTY-REORDER CLAUSE ON ITS OWN (review P3, cycle 56). That guard has TWO clauses; deleting the
+# first (`[ ! -s ranked ] && [ -s candidates.txt ]`) left the suite at 133/0, because the row-set clause
+# catches the same state whenever `sort` works. Its independent value is exactly the case where `sort -u`
+# CANNOT run: both substitutions then yield "", the sets compare EQUAL, the row-set clause goes silent — and
+# the emptied-reorder clause is the last thing between a torn read and a zero-byte install.
+SH2="$TMP/prunerace-empty"; rm -rf "$SH2"; mkdir -p "$SH2/o" "$SH2/bin"
+printf '111\n222\n' > "$SH2/seed"
+printf '200\n300\n' > "$SH2/o/.pool"
+: > "$SH2/o/candidates.txt"
+cat > "$SH2/bin/cmp" <<'SHIM'
+#!/usr/bin/env bash
+cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
+exec /usr/bin/cmp "$@"
+SHIM
+chmod +x "$SH2/bin/cmp"
+cat > "$SH2/bin/sort" <<'SHIM'
+#!/usr/bin/env bash
+# `sort -u` is the ROW-SET clause's tool: make it fail so that clause cannot decide, leaving the
+# emptied-reorder clause alone on the path (the ranker's own `sort -k1,1n` is untouched).
+case " $* " in *' -u '*) exit 1 ;; esac
+exec /usr/bin/sort "$@"
+SHIM
+chmod +x "$SH2/bin/sort"
+{ drive_prologue
+  cat "$FNS"
+  printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'
+} > "$SH2/drive.sh"
+( cd "$SH2" && HOME="$SH2" PATH="$SH2/bin:$PATH" PRUNE_SEED="$SH2/seed" PRUNE_QUEUE="$SH2/o/candidates.txt" bash drive.sh "$SH2/o" ) > "$SH2/out" 2>&1
+race2_rc=$?
+race2_rows="$(tr '\n' ' ' < "$SH2/o/candidates.txt" 2>/dev/null | sed 's/ *$//')"
+# the shim must really have blinded the row-set clause, else this fixture grades nothing
+sort_u_blind=0
+( PATH="$SH2/bin:$PATH"; [ "$(LC_ALL=C sort -u "$SH2/o/candidates.txt" 2>/dev/null)" = "$(LC_ALL=C sort -u "$SH2/o/.cand.ranked" 2>/dev/null)" ] ) && sort_u_blind=1
+if [ "$sort_u_blind" -ne 1 ]; then
+  rc=1; echo "      the sort shim did NOT blind the row-set clause (the two substitutions still differ) — this fixture grades nothing"
+elif [ "$race2_rc" -ne 0 ] && [ "$race2_rows" = "111 222" ] \
+   && grep -q 'STATE=priority-unreadable' "$SH2/out" 2>/dev/null \
+   && grep -q 'the queue changed between this pass' "$SH2/out" 2>/dev/null \
+   && [ ! -e "$SH2/o/.cand.ranked" ]; then rc=0
+else rc=1; echo "      rc=$race2_rc rows='$race2_rows' (want '111 222'); out: $(tr '\n' '|' < "$SH2/out" 2>/dev/null | head -c 300)"; fi
+ck "the EMPTY-REORDER clause refuses an emptied reorder even when the row-set clause CANNOT decide (sort -u blind)" $rc
 
 # ── 12) THE PRODUCT FLOOR'S FILE FOLLOWS THE ORDER THIS PASS INSTALLED ───────────────────────
 # `orch-loop.sh`'s `floor_order` walks `candidates.product.txt` in ITS OWN order and takes up to
@@ -865,8 +973,13 @@ printf '200\n300\n' > "$PQ/o/candidates.product.txt"
 ( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log" 2>&1
 prod_a="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
 head_a="$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt")"
-if [ "$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')" = "300 200" ] && [ "$prod_a" = "300 200" ] && [ "$head_a" = "300" ]; then rc=0
-else rc=1; echo "      queue '$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')' product '$prod_a' floor-head '$head_a' (want 300 200 / 300 200 / 300 — the queue ARRIVED '200 300', so the reorder must really run; a numeric sort would leave the product at '200 300' and the head at 200)"; fi
+# ⛔ AND IT MUST SAY SO (review P3, cycle 54): the only report that the product file was re-sequenced (and
+# how many rows it now holds) could be deleted with the suite green, while all four of its FAILURE lines were
+# pinned. The success sentence is asserted here, on the fixture that emits it.
+pf_said="$(grep -c 'candidates.product.txt re-sequenced onto the queue' "$PQ/log" 2>/dev/null || true)"
+if [ "$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')" = "300 200" ] && [ "$prod_a" = "300 200" ] && [ "$head_a" = "300" ] \
+   && [ "${pf_said:-0}" -ge 1 ]; then rc=0
+else rc=1; echo "      queue '$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')' product '$prod_a' floor-head '$head_a' said='${pf_said:-0}' (want 300 200 / 300 200 / 300 and a 're-sequenced onto the queue' line — the queue ARRIVED '200 300', so the reorder must really run; a numeric sort would leave the product at '200 300' and the head at 200)"; fi
 ck "a SKIPPED pass re-sequences candidates.product.txt onto the queue's order, so the floor slot takes the queue's head (200 -> 300)" $rc
 # B) NO NEEDLESS REWRITE: an already-aligned product file keeps its INODE (same reasoning as check 8 —
 #    a swap races a reader for no gain). Positive pair: A above really did move bytes.
@@ -1156,6 +1269,11 @@ w_sev="$( ( cd "$TMP" && bash skipwhy.sh severity ) 2>/dev/null )"
 w_unc="$( ( cd "$TMP" && bash skipwhy.sh severity-uncounted ) 2>/dev/null )"
 w_emp="$( ( cd "$TMP" && bash skipwhy.sh empty ) 2>/dev/null )"
 w_pri="$( ( cd "$TMP" && bash skipwhy.sh priority-unreadable ) 2>/dev/null )"
+# ⛔ `unranked` IS A STATE TOO, AND IT WAS THE ONE MISSING (review P2, cycle 57). The drive covered five
+# states and `unranked` was not among them, so its clause could be made byte-identical to
+# `priority-unreadable`'s with the whole suite green — and that is the WORST of the two mistakes: the
+# durable record would call an order this pass derived and installed "could NOT be re-derived … UNVERIFIED".
+w_unr="$( ( cd "$TMP" && bash skipwhy.sh unranked ) 2>/dev/null )"
 # an explicit EMPTY argument, not an absent one: the drive now runs under `set -u` (as the shipped code
 # does), where an unset `$1` is a fatal abort — and the state the arm can pass is "" (unrecorded), never
 # "no argument at all".
@@ -1166,9 +1284,11 @@ if grep -q 'the ORDER was re-derived severity-first from the pool' <<<"$w_sev" \
    && grep -q 'nothing was queued, so there was no ORDER to derive' <<<"$w_emp" \
    && grep -q 'the ORDER could NOT be re-derived' <<<"$w_pri" \
    && grep -q "provenance was NOT recorded" <<<"$w_unk" \
-   && [ "$(printf '%s\n%s\n%s\n%s\n%s' "$w_sev" "$w_unc" "$w_emp" "$w_pri" "$w_unk" | sort -u | wc -l)" -eq 5 ]; then rc=0
-else rc=1; echo "      why clauses: severity='$w_sev' uncounted='$w_unc' empty='$w_emp' pri='$w_pri' unknown='$w_unk' (want five DISTINCT clauses, each matching its own state)"; fi
-ck "the skip record's provenance clause is chosen PER STATE — five distinct clauses, each matching its own" $rc
+   && grep -q 'the pool ranked NONE of the queued rows' <<<"$w_unr" \
+   && ! grep -q 'could NOT be re-derived' <<<"$w_unr" \
+   && [ "$(printf '%s\n%s\n%s\n%s\n%s\n%s' "$w_sev" "$w_unc" "$w_emp" "$w_pri" "$w_unk" "$w_unr" | sort -u | wc -l)" -eq 6 ]; then rc=0
+else rc=1; echo "      why clauses: severity='$w_sev' uncounted='$w_unc' empty='$w_emp' pri='$w_pri' unknown='$w_unk' unranked='$w_unr' (want SIX DISTINCT clauses, each matching its own state — and unranked must NOT wear priority-unreadable's sentence)"; fi
+ck "the skip record's provenance clause is chosen PER STATE — six distinct clauses, each matching its own" $rc
 # 12-y3) AND THE ARM ACTUALLY CONSULTS IT WITH THE STATE IT HAS (review P2, cycle 10). 12-y2 drives the
 #        CLAUSE function; it says nothing about the dispatch into it. With the arm's `case` re-mapping the
 #        states (two tables for one thing), swapping `severity`/`empty` THERE left the suite GREEN while a
@@ -1424,6 +1544,7 @@ if [ "$SDRC" -eq 0 ] && grep -q 'the queue is empty (0 rows)' <<<"$SDOUT" \
    && ! grep -q 'could NOT be READ' <<<"$SDOUT"; then rc=0
 else rc=1; echo "      skip/empty: rc=$SDRC out '$(printf '%s' "$SDOUT" | tr '\n' '|' | head -c 260)' (a MEASURED empty queue: 'the queue is empty (0 rows)' + backlog=0 + queue_readable=1)"; fi
 ck "SKIP arm: a MEASURED empty queue says so, with backlog=0 (driven)" $rc
+
 skip_drive withhead rows
 if [ "$SDRC" -eq 0 ] && grep -q 'head #300' <<<"$SDOUT" \
    && grep -q 'handed=300' <<<"$SDOUT" \
@@ -1526,8 +1647,8 @@ _mh_n="$(wc -l < "$MAINDRV" 2>/dev/null | tr -d ' ')"
 if [ -n "$_mh_n" ] && [ "$_mh_n" -gt 12 ] && grep -q 'handed to dispatch' "$MAINDRV" 2>/dev/null; then rc=0
 else rc=1; echo "      MAIN handoff extraction failed ($_mh_n line(s)) — the drive below would grade an empty file"; fi
 ck "the MAIN handoff's depth-read-and-arms region is extracted from the shipped file" $rc
-main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
-  local d="$TMP/mh-$1" how="$2" st="${3:-severity}"
+main_handoff() {  # <label> <queue-setup> [state] [queued-this-pass] -> sets MHRC/MHOUT
+  local d="$TMP/mh-$1" how="$2" st="${3:-severity}" qp="${4-}"
   rm -rf "$d"; mkdir -p "$d/o"
   case "$how" in
     dir)   mkdir -p "$d/o/candidates.txt" ;;          # unreadable AS A FILE: a directory
@@ -1551,8 +1672,11 @@ main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
     mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
   esac
   {
-    printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS=""\n' "$st"
+    printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS="%s"\n' "$st" "$qp"
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+    # the provenance clause the "handed NOTHING" records compose is stubbed as its own MARKER, so a record
+    # that drops the field (or a state the arm forgot to pass) is visible in the row rather than silently ""
+    printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
     printf 'unusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
     printf 'O="%s/o"\nSTARVED=0\n' "$d"
@@ -1706,12 +1830,117 @@ if [ "$MHRC" -eq 0 ] && grep -q 'established NO priority order' <<<"$MHOUT" \
    && ! grep -q 'pool-ordered' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      unranked handoff: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a priority-unreadable pass may NOT describe its head as 'the highest-ranked CLEAN entry' / 'pool-ordered')"; fi
 ck "an UNRANKED pass never describes its head as 'the highest-ranked CLEAN entry in the pool-ordered queue'" $rc
+# ⛔ AND THE ARM'S OWN WORDS ARE ASSERTED, POSITIVELY (review P3, cycle 60). The check above is a NEGATIVE — any
+# wording other than the severity clause satisfies it — so making the `unranked` arm wear
+# `priority-unreadable`'s text (or `empty`'s) left every suite green, while `handed_why=` in
+# `state/refresh-last` would then claim "this pass established NO priority order" over a pass that DID
+# install one: exactly the false durable claim the arm was added to prevent.
+main_handoff unranked-own rows unranked
+_u1="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+# and the same arm with the head judged BY THIS PASS, so its prefix is exercised too
+main_handoff unranked-judged rows unranked '300 '
+_u2="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+if [ -z "$_u1" ] || [ -z "$_u2" ]; then
+  rc=1; echo "      the unranked drives recorded no handoff row ('${_u1:-<none>}' / '${_u2:-<none>}')"
+elif ! grep -q 'the pool ranking NONE of its rows' <<<"$_u1"; then
+  rc=1; echo "      the unranked arm does not name the ranked-none fact: '$_u1'"
+elif grep -q 'established NO priority order' <<<"$_u1" || grep -q 'read an empty queue' <<<"$_u1"; then
+  rc=1; echo "      the unranked arm wears another state's words (priority-unreadable / empty): '$_u1'"
+elif ! grep -q 'judged CLEAN by THIS pass' <<<"$_u2" || ! grep -q 'the pool ranking NONE of its rows' <<<"$_u2"; then
+  rc=1; echo "      the unranked arm does not compose the judged prefix with its own clause: '$_u2'"
+elif grep -q 'carried over from an earlier pass' <<<"$_u2"; then
+  rc=1; echo "      a head this pass JUDGED is recorded as 'carried over from an earlier pass': '$_u2'"
+else rc=0; fi
+ck "the UNRANKED arm names the ranked-none fact in its own words (and composes the judged prefix when it judged the head)" $rc
 main_handoff absent none
 if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
    && ! grep -q 'No such file or directory' <<<"$MHOUT" \
    && ! grep -q 'integer expression expected' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      absent queue: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 340)' (an ABSENT queue is unreadable, and neither the redirection nor the depth gate may leak stderr)"; fi
 ck "an ABSENT queue is unmeasured too, and neither the failed redirection nor the depth gate leaks stderr" $rc
+
+# ⛔ THE PROVENANCE ON A "HANDED NOTHING" ARM (review P3, cycle 56). These four records omitted `handed_why=`,
+# so an `unranked` pass and a `priority-unreadable` pass — states whose operator answers are OPPOSITE — wrote
+# BYTE-IDENTICAL durable rows over the same measured depth (driven below: the `garbage` queue, whose head is
+# not a candidate number). Two drives, one variable: the state word.
+main_handoff garbage-unranked garbage unranked; _mh_u="$MHOUT"
+main_handoff garbage-refused garbage priority-unreadable; _mh_p="$MHOUT"
+# ⛔ AND ONCE WITH THE REAL CLAUSE FUNCTION (review P2, cycle 57). The differential above runs against a stub,
+# so it grades the PLUMBING: a `skip_order_why` whose two clauses were made identical would still produce
+# distinct rows. The two drives below source the SHIPPED function instead, so the distinctness is the
+# product's own.
+REALWHY="$TMP/skipwhy-real.sh"
+awk '/^skip_order_why\(\) \{/{f=1} f{print} f && /^\}$/{exit}' "$REFRESH" > "$REALWHY" 2>/dev/null
+_rw_n="$(wc -l < "$REALWHY" 2>/dev/null | tr -d ' ')"
+if [ -z "$_rw_n" ] || [ "$_rw_n" -lt 5 ]; then
+  rc=1; echo "      the REAL skip_order_why could not be extracted ($_rw_n line(s)) — the check below would grade an empty function"
+else
+  main_handoff_real() {  # <label> <state> -> MHOUT, with the SHIPPED clause function in the drive
+    local d="$TMP/mhr-$1" st="$2"
+    rm -rf "$d"; mkdir -p "$d/o"
+    printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
+    { printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS=""\n' "$st"
+      printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
+      printf 'unusable_summary() { printf "none"; }\n'
+      cat "$REALWHY"; printf '\n'
+      for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
+      printf 'O="%s/o"\nSTARVED=0\n' "$d"
+      cat "$MAINDRV"
+      printf 'exit 0\n'
+    } > "$d/drive.sh"
+    ( cd "$d" && HOME="$d" bash drive.sh ) > "$d/out" 2>&1
+    MHOUT="$(cat "$d/out" 2>/dev/null)"
+  }
+  main_handoff_real real-unranked unranked; _rw_u="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+  main_handoff_real real-refused priority-unreadable; _rw_p="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+  if [ -z "$_rw_u" ] || [ -z "$_rw_p" ]; then
+    rc=1; echo "      the REAL-function drives recorded no handoff row ('${_rw_u:-<none>}' / '${_rw_p:-<none>}')"
+  elif [ "$_rw_u" = "$_rw_p" ]; then
+    rc=1; echo "      the SHIPPED clause function records the SAME row for unranked and priority-unreadable ('$_rw_u')"
+  elif ! grep -q 'UNRANKED, not a priority decision' <<<"$_rw_u"; then
+    rc=1; echo "      the unranked row does not carry its own sentence: '$_rw_u'"
+  elif ! grep -q 'could NOT be re-derived' <<<"$_rw_p"; then
+    rc=1; echo "      the priority-unreadable row does not carry its own sentence: '$_rw_p'"
+  else rc=0; fi
+fi
+ck "against the SHIPPED clause function (not a stub), unranked and priority-unreadable record DIFFERENT rows, each with its own sentence" $rc
+_mh_u_rec="$(printf '%s\n' "$_mh_u" | grep '^RECORD:' | grep 'handed=' | head -1)"
+_mh_p_rec="$(printf '%s\n' "$_mh_p" | grep '^RECORD:' | grep 'handed=' | head -1)"
+if [ -z "$_mh_u_rec" ] || [ -z "$_mh_p_rec" ]; then
+  rc=1; echo "      neither drive recorded a handoff row (unranked '${_mh_u_rec:-<none>}' / refused '${_mh_p_rec:-<none>}')"
+elif [ "$_mh_u_rec" = "$_mh_p_rec" ]; then
+  rc=1; echo "      an unranked pass and a priority-unreadable pass recorded the SAME durable row ('$_mh_u_rec') — the record cannot say which of the two happened"
+elif ! grep -q 'handed_why=WHY:unranked' <<<"$_mh_u_rec" || ! grep -q 'handed_why=WHY:priority-unreadable' <<<"$_mh_p_rec"; then
+  rc=1; echo "      the rows differ but not in the provenance: unranked '$_mh_u_rec' / refused '$_mh_p_rec' (want handed_why=WHY:unranked / WHY:priority-unreadable)"
+else rc=0; fi
+ck "a 'handed NOTHING' record carries the order's PROVENANCE, so unranked and priority-unreadable never record the same row" $rc
+
+# ⛔ EVERY "HANDED NOTHING" ARM, NOT JUST THE ONE THE DIFFERENTIAL HAPPENS TO REACH (review P3, cycle 57): the
+# field was added to four records and only the measured-depth arm was graded, so deleting it from the other
+# three left both suites green while ARCHITECTURE's "every handoff record carries it" silently went false.
+# ⛔ EACH ARM IS DRIVEN UNDER **TWO** STATES (review P2, cycle 58). With one state per arm, a single hardcoded
+# state word in the arm (`$(skip_order_why severity)`) satisfied every check, so a `priority-unreadable` pass
+# would have recorded "the ORDER was re-derived severity-first from the pool" — the exact false durable claim
+# this PR exists to close — and both suites stayed green. Two states per arm make the arm's CONSULTATION of
+# the state observable: the second drive must carry the second state's clause.
+# ⛔ AND EACH NEEDLE IDENTIFIES ITS ARM (review P3, cycle 58): `backlog=0` also matches the rows-no-head arm
+# whenever its measured depth is 0, so the drained arm's needle is its sentence, not its count.
+for _hw in 'drained|empty|the queue is empty' 'garbage|garbage|DEPTH is measured' 'dir|dir|queue could NOT be read' 'wcfailg|wcfail-garbage|its DEPTH nor its HEAD'; do
+  _hw_how="${_hw%%|*}"; _rest="${_hw#*|}"; _hw_setup="${_rest%%|*}"; _hw_needle="${_rest#*|}"
+  _hw_bad=0
+  for _hw_st in severity priority-unreadable; do
+    main_handoff "hw-$_hw_how-$_hw_st" "$_hw_setup" "$_hw_st"
+    _hw_rec="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+    if [ -z "$_hw_rec" ]; then
+      _hw_bad=1; echo "      the $_hw_how arm ($_hw_st) recorded no handoff row"
+    elif ! grep -qF "handed_why=WHY:$_hw_st" <<<"$_hw_rec"; then
+      _hw_bad=1; echo "      the $_hw_how arm ($_hw_st) does not carry ITS OWN state's clause in handed_why= (the arm typed a word instead of consulting the state, or the field is gone): '$_hw_rec'"
+    elif ! grep -qF "$_hw_needle" <<<"$_hw_rec"; then
+      _hw_bad=1; echo "      the $_hw_how arm ($_hw_st) did not land on the arm it names (want '$_hw_needle' in the row): '$_hw_rec'"
+    fi
+  done
+  ck "every 'handed NOTHING' arm consults the STATE and records its clause — the $_hw_how arm ('$_hw_needle', driven under two states)" $_hw_bad
+done
 # (c) NON-VACUITY — revert the guarded read to the pre-fix unguarded one (which coerces a failed `wc` to 0)
 # and show fixture (a) goes RED. A guard that survives its own revert is not the thing being graded.
 MHREV="$TMP/main-handoff-rev.sh"
@@ -1746,7 +1975,13 @@ sat_ctl="$(cat "$TMP/sat/out" 2>/dev/null)"
 printf 'P1-severe\n' > "$TMP/sat/o/.pool-sat"
 ( cd "$TMP/sat" && HOME="$TMP/sat" bash drive.sh "$TMP/sat/o" ) > "$TMP/sat/out-sat" 2>&1
 sat_out="$(cat "$TMP/sat/out-sat" 2>/dev/null)"
+# ⛔ THE POLARITY IS GRADED, NOT JUST THE CLIP (review P3, cycle 42). Dropping the exists-gate made
+# every ORDINARY pass (no truncation, so no record) print "the tier-window record EXISTED but could not
+# be READ" — a claim about a file that does not exist — and this check stayed green because it only
+# forbade the clip. An absent record must print NEITHER clause.
 if [ -n "$sat_ctl" ] && ! grep -q 'windows=TRUNCATED' <<<"$sat_ctl" \
+   && ! grep -q 'could not be READ' <<<"$sat_ctl" \
+   && ! grep -q 'carried no tier name this code recognises' <<<"$sat_ctl" \
    && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$sat_out"; then rc=0
 else rc=1; echo "      control (no .pool-sat) '$(printf '%s' "$sat_ctl" | tr '\n' '|' | head -c 200)' / saturated '$(printf '%s' "$sat_out" | tr '\n' '|' | head -c 260)'"; fi
 ck "a TRUNCATED tier window is NAMED on the order line, and the clause is ABSENT when no tier was clipped" $rc
@@ -1756,22 +1991,522 @@ ck "a TRUNCATED tier window is NAMED on the order line, and the clause is ABSENT
 printf 'EVIL;rm -rf /tmp/x\nP2-moderate\n' > "$TMP/sat/o/.pool-sat"
 ( cd "$TMP/sat" && HOME="$TMP/sat" bash drive.sh "$TMP/sat/o" ) > "$TMP/sat/out-junk" 2>&1
 junk_out="$(cat "$TMP/sat/out-junk" 2>/dev/null)"
+# ⛔ AND THE DISCLOSURE IS GRADED (review P3, cycle 54): only the "never repeated" half was pinned, so the
+# sentence that tells an operator a junk line was SEEN could be deleted with the suite green.
 if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$junk_out" \
+   && grep -q 'the window record also carried a line that is not a tier name' <<<"$junk_out" \
    && ! grep -q 'EVIL' <<<"$junk_out"; then rc=0
 else rc=1; echo "      junk fixture '$(printf '%s' "$junk_out" | tr '\n' '|' | head -c 260)'"; fi
 ck "the truncated-tier name is SANITISED (a foreign line in .pool-sat is not repeated into the log)" $rc
 
+# ⛔ THE DRIVE'S OWN WITNESS IS PROVEN BY EXECUTION, NOT BY TEXT (review P2, cycles 45-49). The
+# anti-vacuity checks below need proof that the MUTATED driver actually RAN — otherwise a dead driver
+# satisfies "the clause is absent" for the wrong reason. Three textual attempts each failed the same way,
+# because a heredoc BODY is printed data that reads exactly like an arm's line: filtering comments did not
+# exclude bodies; excluding bodies still left the witness resolved by grepping STDOUT, which the body
+# fills; and a body can even be printed (`cat <<A <<B`) after the tracker had already stopped looking. So
+# the witness is now taken from an XTRACE with a function-attributed, NONCE-carrying PS4: a traced echo reads
+# `+<fn> [<nonce>] echo '…'` — the function the line came from, and a value only THIS run's `PS4` holds.
+# Printed data cannot wear that shape unless it reproduces the run's nonce (measured: a body line opening
+# `+queue_order_from_pool echo` used to be accepted; with the nonce it names nothing, without it, it does —
+# both directions are asserted by the `forge.sh` probe). `_dwit` reads that trace and returns the printed PREFIX (up to the first `:`), which is text the
+# drive really produced, so it can be searched for in stdout without guessing at quoting.
+_dwit() {  # _dwit <xtrace-file> [function-name] [nonce] -> the prefix of the first echo EXECUTED in that fn
+  # ⛔ THE MATCH IS ANCHORED TO THE TRACE'S COMMAND POSITION (review P2, cycle 51). A substring match on
+  # `fn` + ` echo ` accepted ANY line carrying both tokens — measured: an assignment that traces a heredoc
+  # body verbatim (`_d="$(cat <<'Z' … Z"`) yields `+queue_order_from_pool _d='queue_order_from_pool echo
+  # '''[refresh] …'`, which named a witness with no echo executed at all. With `PS4='+${FUNCNAME[0]:-main} '`
+  # the traced command starts at the FIRST token after the `+`-run (a nested `$()` adds one more `+`), so the
+  # regex `^\++<fn> echo ` is exact and the assignment line cannot match it.
+  awk -v fn="${2:-queue_order_from_pool}" -v nx="${3:-}" '
+    BEGIN { np = (nx == "" ? "" : " \\[" nx "\\]") }
+    $0 ~ ("^\\++" fn np " echo ") {
+      e = index($0, " echo "); if (e == 0) next
+      s = substr($0, e + 6)
+      i = index(s, "["); if (i == 0) next
+      s = substr(s, i)
+      j = index(s, ":"); if (j == 0) next
+      print substr(s, 1, j - 1); exit
+    }' "$1"
+}
+# The same run, again, with the trace on: this is the ONLY reading that can distinguish "the arm echoed"
+# from "something printed the same text".
+_base="$TMP/witness"; rm -rf "$_base"; mkdir -p "$_base/o"; _n_base="$(_xtrace_nonce)"
+printf '300\n9\n200\n' > "$_base/o/candidates.txt"; printf '200\n300\n' > "$_base/o/.pool"
+{ drive_xtrace_prologue "$_n_base"; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_base/drive.sh"
+( cd "$_base" && HOME="$_base" bash drive.sh "$_base/o" ) > "$_base/out" 2>"$_base/trace"
+_wit_base="$(_dwit "$_base/trace" '' "$_n_base")"
+ck "an echo INSIDE queue_order_from_pool is EXECUTED by the unmutated drive ('${_wit_base:-<none>}')" "$([ -n "$_wit_base" ] && echo 0 || echo 1)"
+if [ -n "$_wit_base" ] && grep -qF "$_wit_base" "$_base/out" 2>/dev/null; then rc=0
+else rc=1; echo "      the witness named by the trace ('${_wit_base:-<none>}') is not in the drive's own STDOUT"; fi
+ck "the witness the trace names is text this drive actually PRINTED" $rc
+
+# ⛔ AND THE PARSER IS GRADED IN BOTH DIRECTIONS (review P3, cycle 49). The previous tracker was graded by a
+# one-off manual experiment and deleting it left the suite green. These two probes are the red and green
+# paths, permanently: printed DATA inside the function must yield NO witness, and a real `echo` must.
+_dwp="$TMP/wit-parse"; rm -rf "$_dwp"; mkdir -p "$_dwp"; _n_p="$(_xtrace_nonce)"
+# The body CARRIES THE TOKEN PAIR on purpose: a body without it proves nothing about the matcher (it would
+# have failed even the weakest predicate). `_dwit` must still name nothing, because no `echo` ran.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  'queue_order_from_pool() {' \
+  "  cat <<'ZZZ'" \
+  "  queue_order_from_pool echo '[refresh] decoy order: printed DATA'" \
+  'ZZZ' \
+  '  return 0' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/decoy.sh"
+( cd "$_dwp" && bash decoy.sh ) > "$_dwp/decoy.out" 2>"$_dwp/decoy.trace"
+# ⛔ AND THE BODY MUST HAVE REACHED THE STREAM (review P3, cycle 52): `set -v` is the ONLY reason the body is on
+# FD 2, and an absence assertion over a stream the body never reached passes for ANY matcher — measured:
+# deleting `set -v` left the suite at 131/0 with the pre-fix substring matcher still in place.
+if ! grep -qF "queue_order_from_pool echo '[refresh] decoy order" "$_dwp/decoy.trace" 2>/dev/null; then
+  rc=1; echo "      the heredoc body is NOT in the trace stream — 'set -v' did not take effect, so the absence proves nothing"
+elif [ -n "$(_dwit "$_dwp/decoy.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      the body NAMED a witness ('$(_dwit "$_dwp/decoy.trace" '' "$_n_p")') — printed data is not an executed echo"
+else rc=0; fi
+ck "a heredoc body carrying the TOKEN PAIR names NO witness (printed data is not an executed echo)" $rc
+
+# ⛔ AND THE ASSIGNMENT SHAPE, which traces the body INSIDE the assignment rather than as a command — the
+# exact line a substring matcher accepted (review P2, cycle 51).
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  'queue_order_from_pool() {' \
+  "  _d=\"\$(cat <<'ZZZ'" \
+  "queue_order_from_pool echo '[refresh] assign order: body traced inside an assignment'" \
+  'ZZZ' \
+  ')"' \
+  '  : "$_d"' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/assign.sh"
+( cd "$_dwp" && bash assign.sh ) > "$_dwp/assign.out" 2>"$_dwp/assign.trace"
+ck "a heredoc traced INSIDE an assignment names NO witness (the match is anchored to the command position)" \
+   "$([ -z "$(_dwit "$_dwp/assign.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+
+# ⛔ THE ` echo ` CONJUNCT, graded on its own: a function whose only command is a `printf` carrying the same
+# text must name nothing — drop that conjunct and this fixture becomes a witness.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  'queue_order_from_pool() {' \
+  "  printf '%s\\n' '[refresh] printf order: not an echo'" \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/printf.sh"
+( cd "$_dwp" && bash printf.sh ) > "$_dwp/printf.out" 2>"$_dwp/printf.trace"
+ck "a PRINTF in the function names NO witness (an echo is required, not merely a line of text)" \
+   "$([ -z "$(_dwit "$_dwp/printf.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+
+# ⛔ AND THE `fn` CONJUNCT: an echo in ANOTHER function must not be attributed to the one under test.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  'other_function() { echo "[refresh] other order: a different function"; }' \
+  'queue_order_from_pool() { other_function; }' \
+  'queue_order_from_pool' > "$_dwp/other.sh"
+( cd "$_dwp" && bash other.sh ) > "$_dwp/other.out" 2>"$_dwp/other.trace"
+# ⛔ AND THE FORGERY ITSELF (review P3, cycle 52): a body whose line WEARS the trace prefix. The NONCE is what
+# refuses it, and both directions are asserted — with the nonce it names nothing, WITHOUT it the same stream
+# names the forgery. Delete the nonce from the matcher and this check reddens instead of quietly weakening.
+# (Residual, stated: data that reproduces THIS run's nonce would still match — it would have to read the drive
+# file that invoked it.)
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  'queue_order_from_pool() {' \
+  "  cat <<'ZZZ' >/dev/null" \
+  "+queue_order_from_pool echo '[refresh] forged order: X'" \
+  'ZZZ' \
+  '  return 0' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/forge.sh"
+( cd "$_dwp" && bash forge.sh ) > "$_dwp/forge.out" 2>"$_dwp/forge.trace"
+if ! grep -qF "+queue_order_from_pool echo '[refresh] forged order" "$_dwp/forge.trace" 2>/dev/null; then
+  rc=1; echo "      the FORGED line never reached the trace stream — the fixture proves nothing"
+elif [ -n "$(_dwit "$_dwp/forge.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      a printed line wearing the trace prefix NAMED a witness ('$(_dwit "$_dwp/forge.trace" '' "$_n_p")') — the nonce is not being required"
+elif [ "$(_dwit "$_dwp/forge.trace" '' '')" != '[refresh] forged order' ]; then
+  rc=1; echo "      the forgery is not a forgery: WITH THE NONCE DROPPED the same stream names '$(_dwit "$_dwp/forge.trace" '' '')' instead of '[refresh] forged order' — so this check proves nothing about the nonce"
+else rc=0; fi
+ck "a printed line WEARING the trace prefix names NO witness (the per-run nonce refuses it — and, with the nonce dropped, DOES)" $rc
+
+# ⛔ AND THE ANCHOR ITSELF (review P3, cycle 53): every fixture above is refused by a conjunct OTHER than the
+# anchor — the `fn` conjunct (`other.sh`), the ` echo ` conjunct (`printf.sh`), or the nonce (the rest) — so
+# deleting `^\++` left the suite at 132/0: the anchor was claimed by a check's NAME and graded by nothing.
+# This fixture puts the WHOLE `fn [nonce] echo ` sequence MID-LINE: the nonce cannot refuse it, only the
+# requirement that the sequence starts the traced command can.
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' 'set -v' \
+  'queue_order_from_pool() {' \
+  "  cat <<'ZZZ' >/dev/null" \
+  "zzz queue_order_from_pool [${_n_p}] echo '[refresh] midline order: sequence mid-line'" \
+  'ZZZ' \
+  '  return 0' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/midline.sh"
+( cd "$_dwp" && bash midline.sh ) > "$_dwp/midline.out" 2>"$_dwp/midline.trace"
+if ! grep -qF "queue_order_from_pool [${_n_p}] echo '[refresh] midline order" "$_dwp/midline.trace" 2>/dev/null; then
+  rc=1; echo "      the mid-line sequence never reached the trace stream — the fixture proves nothing"
+elif [ -n "$(_dwit "$_dwp/midline.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      a mid-line sequence NAMED a witness ('$(_dwit "$_dwp/midline.trace" '' "$_n_p")') — the match is not anchored to the command position"
+else rc=0; fi
+ck "a mid-line «fn [nonce] echo» sequence names NO witness (the match must START the traced command)" $rc
+
+ck "an echo in a DIFFERENT function names NO witness for the function under test" \
+   "$([ -z "$(_dwit "$_dwp/other.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+printf '%s\n' \
+  "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
+  'queue_order_from_pool() {' \
+  '  echo "[refresh] queue order: severity-first from the pool — head #1"' \
+  '}' \
+  'queue_order_from_pool' > "$_dwp/real.sh"
+( cd "$_dwp" && bash real.sh ) > "$_dwp/real.out" 2>"$_dwp/real.trace"
+ck "an executed arm echo DOES name a witness, and it is the prefix the drive printed" \
+   "$([ "$(_dwit "$_dwp/real.trace" '' "$_n_p")" = '[refresh] queue order' ] && echo 0 || echo 1)"
+
 # 14c) NON-VACUITY — drop the `.pool-sat` read (the pre-signal shape) and the check above must redden.
 MUT_NOSAT="$TMP/fns-nosat.sh"
-sed 's/if \[ -s "\$o\/.pool-sat" \]; then/if false; then/' "$FNS" > "$MUT_NOSAT"
-if cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null; then rc=1; echo "      the .pool-sat mutation did not apply — the sed anchor drifted"; else
-  d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"
+# The anchor is the READ itself, so it survives a change of guard shape (it has drifted twice, from
+# `[ -s ]` to the read-status form). ⛔ `@` IS THE DELIMITER ON PURPOSE (review P2, cycle 43): the pattern
+# contains `||`, so a `|`-delimited `s///` made sed die with "unknown option to `s'" and left a 0-BYTE
+# mutant — which `cmp` reported as "applied", and the check then passed on `command not found`. The
+# mutation is now required to have sed's own success AND to leave the function under test present.
+# `_mut_ok` is its OWN flag, never the previous check's `rc`: an earlier failure must not be able to
+# stand in for "the mutation was applied".
+_mut_ok=1
+sed 's@^  if \[ -e "\$o/.pool-sat" \] || \[ -L "\$o/.pool-sat" \]; then@  if false; then@' "$FNS" > "$MUT_NOSAT" 2>"$TMP/.mut-sed-err" || _mut_ok=0
+grep -q '^queue_order_from_pool() {' "$MUT_NOSAT" 2>/dev/null || _mut_ok=0
+cmp -s "$FNS" "$MUT_NOSAT" 2>/dev/null && _mut_ok=0
+if [ "$_mut_ok" = "0" ]; then
+  rc=1; echo "      the .pool-sat mutation could not be applied whole (sed: '$(tr '\n' ' ' < "$TMP/.mut-sed-err" 2>/dev/null | head -c 120)', mutant bytes '$(wc -c < "$MUT_NOSAT" 2>/dev/null)') — the anchor drifted"
+else
+  d="$TMP/sat-mut"; rm -rf "$d"; mkdir -p "$d/o"; _n_m="$(_xtrace_nonce)"
   printf '300\n9\n200\n' > "$d/o/candidates.txt"; printf '200\n300\n' > "$d/o/.pool"; printf 'P1-severe\n' > "$d/o/.pool-sat"
-  { drive_prologue; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
-  ( cd "$d" && HOME="$d" bash drive.sh "$d/o" ) > "$d/out" 2>&1
-  if grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+  { drive_xtrace_prologue "$_n_m"; cat "$MUT_NOSAT"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$d/drive.sh"
+  ( cd "$d" && HOME="$d" bash drive.sh "$d/o" ) > "$d/out" 2>"$d/trace"
+  # ⛔ AND THE MUTANT MUST HAVE RUN (review P2, cycle 44). The three application gates observe that the
+  # mutation was WRITTEN, never that the mutated driver EXECUTED: a syntactically broken replacement passes
+  # all three, the drive dies, and the only predicate (absence of the clause) is satisfied by the failure —
+  # the same "green on `command not found`" the drift guard was hardened for. The drive's own line is the
+  # witness (measured: the correct mutation prints exactly one, a syntax-error mutant zero).
+  # ⛔ THE WITNESS COMES FROM THIS DRIVE'S OWN TRACE (review P2, cycle 49): an `echo` executed INSIDE
+  # `queue_order_from_pool` is what proves the mutated function ran its arm. Reading a control's stdout
+  # instead let printed DATA stand in for an executed statement.
+  _wit_c="$(_dwit "$d/trace" '' "$_n_m")"
+  if [ -z "$_wit_c" ]; then
+    rc=1; echo "      NO echo was executed inside queue_order_from_pool — the mutant did not run, so the absence of the clause proves nothing"
+  elif ! grep -qF "$_wit_c" "$d/out" 2>/dev/null; then
+    rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
+  elif grep -q 'windows=TRUNCATED' "$d/out" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
 fi
 ck "non-vacuity: with the .pool-sat read removed the truncated-window clause disappears (the check can fail)" $rc
+
+# ── 14d) EVERY INSTALLED ARM CARRIES THE CLIP (review P2, cycle 39) ────────────────────────────────
+# WHY THIS EXISTS. Cycle 38 appended `$_sat_said` to two arms of `queue_order_from_pool` and made the
+# `unranked` parenthetical name the clip instead of claiming "no P0-blocker/P1-severe/P2-moderate row
+# matched". Nothing graded any of it: reverting BOTH hunks left every suite green (measured 106/0,
+# 299/0, 31/0, 215/0), so the false cause was free to come back. The three drives below cover the two
+# arms that changed plus the `unrecognised` record, which must NOT be reported as a measured clip:
+#   (a) `unranked` (nothing ranked) + a RECOGNISED tier  -> names the clip AND windows=TRUNCATED(<tier>)
+#   (b) `unranked` + an UNRECOGNISED record              -> names no cause, never "was clipped"
+#   (c) ranked head that is NOT a plain issue number     -> still carries windows=TRUNCATED(<tier>)
+_d14="$TMP/arm-clip"; rm -rf "$_d14"; mkdir -p "$_d14/o"
+printf 'aaa\nbbb\n' > "$_d14/o/candidates.txt"; printf '200\n' > "$_d14/o/.pool"
+printf 'P2-moderate\n' > "$_d14/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14/drive.sh"
+( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unranked" 2>&1
+_u14="$(cat "$_d14/out-unranked" 2>/dev/null)"
+if grep -q 'unranked:' <<<"$_u14" && grep -q 'P2-moderate tier window was clipped' <<<"$_u14" \
+   && grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_u14"; then rc=0
+else rc=1; echo "      (a) unranked+clip '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) the UNRANKED arm names a RECOGNISED clipped tier (and carries windows=TRUNCATED)" $rc
+
+printf 'EVIL-not-a-tier\n' > "$_d14/o/.pool-sat"
+( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unrec" 2>&1
+_r14="$(cat "$_d14/out-unrec" 2>/dev/null)"
+# ⛔ A POSITIVE ASSERTION, NOT ONLY TWO NEGATIONS (review P2, cycle 41). `names no tier this code
+# recognises` is `_why_none`'s wording; the `_sat_said` clause says "carried no tier NAME". Grading the
+# clip claim only by `! grep windows=TRUNCATED` / `! grep 'tier window was clipped'` catches one spelling
+# and misses its paraphrase — measured: a re-claim in prose passed all four predicates. The honest clause
+# is asserted positively ("NO clip is asserted"), so replacing it with any claim of a clip fails.
+if grep -q 'unranked:' <<<"$_r14" && grep -q 'names no tier this code recognises' <<<"$_r14" \
+   && grep -q 'NO clip is asserted and no tier is repeated here' <<<"$_r14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_r14" && ! grep -q 'tier window was clipped' <<<"$_r14"; then rc=0
+else rc=1; echo "      (b) unranked+unrecognised '$(printf '%s' "$_r14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) an UNRECOGNISED window record is NOT reported as a clip this pass measured (no windows=TRUNCATED clause at all)" $rc
+
+_d14b="$TMP/arm-clip-head"; rm -rf "$_d14b"; mkdir -p "$_d14b/o"
+# ⛔ ONE ROW, ON PURPOSE (review P2, cycle 40). With a second queued row the WARN arm (`_u > 0 && _r > 0`)
+# printed the SAME `windows=TRUNCATED(P1-severe)` token, so deleting `$_sat_said` from the head arm alone
+# left this check green — it graded the WARN line, not its own subject. One row gives `_u = 0`, the WARN
+# cannot fire, and the token can only come from the arm under test. Measured: shipped source prints the
+# token once, the arm-dropped mutant zero times.
+printf 'bbb\n' > "$_d14b/o/candidates.txt"; printf 'bbb\n' > "$_d14b/o/.pool"
+printf 'P1-severe\n' > "$_d14b/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14b/drive.sh"
+( cd "$_d14b" && HOME="$_d14b" bash drive.sh "$_d14b/o" ) > "$_d14b/out-head" 2>&1
+_h14="$(cat "$_d14b/out-head" 2>/dev/null)"
+if grep -q 'HEAD cannot be named here' <<<"$_h14" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_h14"; then rc=0
+else rc=1; echo "      (c) non-numeric head '$(printf '%s' "$_h14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) the HEAD-NOT-NUMERIC arm still carries windows=TRUNCATED (it used to drop the clause)" $rc
+
+# 14d-bis) AN UNREADABLE RECORD IS ITS OWN STATE (review P3, cycle 40). Without a `[ -r ]` guard the
+# shell's own `Permission denied` leaked onto stderr and the blocked read was classified as
+# `unrecognised` — "no tier was clipped" asserted from a file that was never opened. Both halves are
+# graded: the operator line must SAY the record could not be read, and the shell's message must not be
+# what a reader sees. Skipped when the file cannot be made unreadable (running as root).
+_d14c="$TMP/arm-clip-unread"; rm -rf "$_d14c"; mkdir -p "$_d14c/o"
+printf 'aaa\nbbb\n' > "$_d14c/o/candidates.txt"; printf '200\n' > "$_d14c/o/.pool"
+printf 'P1-severe\n' > "$_d14c/o/.pool-sat"; chmod 000 "$_d14c/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14c/drive.sh"
+( cd "$_d14c" && HOME="$_d14c" bash drive.sh "$_d14c/o" ) > "$_d14c/out" 2>&1
+_x14="$(cat "$_d14c/out" 2>/dev/null)"
+# ⛔ THE SKIP IS DECIDED WHILE THE FILE IS STILL 000 (review P2, cycle 41). Testing `[ -r ]` AFTER the
+# restore asked "is it unreadable now", which is false for the owner on every host — the advertised skip
+# could never fire, and on a host where `chmod 000` does not bind the check graded a run that never took
+# the unread branch. Readability is sampled before the restore, the way `mandate-preflight.test.sh` and
+# `claim-reaper.test.sh` do it.
+if [ -r "$_d14c/o/.pool-sat" ]; then _bis_skipped=1; else _bis_skipped=0; fi
+chmod 644 "$_d14c/o/.pool-sat" 2>/dev/null || true
+if [ "$_bis_skipped" = "1" ]; then
+  rc=0; echo "      (skipped: this user can read a 000 file — running as root?)"
+elif grep -qi 'permission denied' <<<"$_x14"; then
+  rc=1; echo "      the shell's own message reached the operator line '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
+elif grep -q 'could not be READ' <<<"$_x14" \
+     && grep -q 'tier-window record could not be USED' <<<"$_x14" \
+     && ! grep -q 'windows=TRUNCATED' <<<"$_x14" \
+     && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_x14"; then rc=0
+else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) an UNREADABLE window record asserts NO clip (both clauses) and leaks no shell 'Permission denied'" $rc
+
+# 14d-ter) A RECORD THAT EXISTS BUT CANNOT BE OPENED IS THE SAME STATE (review P3, cycle 41). `[ -s ]` and
+# `[ -r ]` are both TRUE for a directory, so a test-shaped guard let it through unread and reported "held
+# nothing this code could classify" over zero bytes. The guard must classify it as NOT OPENED — which is
+# a different fact from "could not be READ", and the check below forbids that wording.
+_d14d="$TMP/arm-clip-dir"; rm -rf "$_d14d"; mkdir -p "$_d14d/o/.pool-sat"
+printf 'aaa\nbbb\n' > "$_d14d/o/candidates.txt"; printf '200\n' > "$_d14d/o/.pool"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14d/drive.sh"
+( cd "$_d14d" && HOME="$_d14d" bash drive.sh "$_d14d/o" ) > "$_d14d/out" 2>&1
+_y14="$(cat "$_d14d/out" 2>/dev/null)"
+# ⛔ THE `_why_none` CLAUSE IS GRADED HERE, because this shape is unreadable for EVERY uid while the
+# chmod-000 fixture skips on root (review P2, cycle 42): deleting that branch left the suite green for
+# the one environment the author measured. The dead "held nothing this code could classify" wording is
+# gone with the unreachable arm that printed it, so it is no longer asserted either way.
+if grep -q 'is NOT A REGULAR FILE, so this pass did NOT open it' <<<"$_y14" \
+   && grep -q 'tier-window record could not be USED' <<<"$_y14" \
+   && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_y14" \
+   && ! grep -q 'could not be READ' <<<"$_y14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_y14" && ! grep -qi 'is a directory' <<<"$_y14"; then rc=0
+else rc=1; echo "      directory record '$(printf '%s' "$_y14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a window-record PATH that is not a regular file is reported as NOT OPENED (not as unread, not as empty)" $rc
+
+# 14d-quater) A RECORD WHOSE LAST LINE HAS NO TRAILING NEWLINE (review P3, cycle 42). The pre-fix read
+# used `done < file`, whose LOOP CONDITION is the `read`'s EOF status — a one-line record written without
+# its newline yielded `unrecognised` and the order line then asserted "NO clip is asserted" for the
+# false cause this whole PR removes. Reachable: the writer emits `"P1-severe\n"` in one chunk and a
+# concurrent read can see the bytes before the newline. `<<<"$_sat_raw"` appends the newline; nothing
+# asserted the difference, so reverting to the file redirect was 0 red.
+_d14e="$TMP/arm-clip-nonl"; rm -rf "$_d14e"; mkdir -p "$_d14e/o"
+printf 'aaa\nbbb\n' > "$_d14e/o/candidates.txt"; printf '200\n' > "$_d14e/o/.pool"
+printf 'P2-moderate' > "$_d14e/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14e/drive.sh"
+( cd "$_d14e" && HOME="$_d14e" bash drive.sh "$_d14e/o" ) > "$_d14e/out" 2>&1
+_n14="$(cat "$_d14e/out" 2>/dev/null)"
+if grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_n14" && ! grep -q 'carried no tier name' <<<"$_n14"; then rc=0
+else rc=1; echo "      no-trailing-newline record '$(printf '%s' "$_n14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a record with NO trailing newline still names its clipped tier (the read does not lose the line)" $rc
+
+# 14d-quinquies) A NON-REGULAR RECORD IS NEVER OPENED (review P3, cycle 42). `cat` on a FIFO or a
+# `/dev/zero` symlink is UNBOUNDED — no timeout exists on this path — and `-s` was false for both, so the
+# previous test-shaped guard never opened them while a bare `cat` would hang the pass. A `/dev/null`
+# symlink is the safe witness: `cat` succeeds with ZERO bytes, so without the `[ -f ]` guard it reads as
+# "empty record, no clip" while WITH the guard it is an unread state. It is also the only shape in this
+# section that can distinguish the guard from the read.
+_d14f="$TMP/arm-clip-devnull"; rm -rf "$_d14f"; mkdir -p "$_d14f/o"
+printf 'aaa\nbbb\n' > "$_d14f/o/candidates.txt"; printf '200\n' > "$_d14f/o/.pool"
+ln -s /dev/null "$_d14f/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14f/drive.sh"
+( cd "$_d14f" && HOME="$_d14f" bash drive.sh "$_d14f/o" ) > "$_d14f/out" 2>&1
+_v14="$(cat "$_d14f/out" 2>/dev/null)"
+if grep -q 'is NOT A REGULAR FILE, so this pass did NOT open it' <<<"$_v14" \
+   && ! grep -q 'could not be READ' <<<"$_v14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_v14"; then rc=0
+else rc=1; echo "      non-regular record '$(printf '%s' "$_v14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a NON-REGULAR window record (a device symlink) is reported as NOT OPENED — never as unread, never opened" $rc
+
+# 14d-sexies) A NUL IN THE RECORD IS DATA, NOT A SHELL WARNING (review P3, cycle 42). `cat` alone made
+# bash print `warning: command substitution: ignored null byte in input` onto the log above the honest
+# line — the same class §14d-bis forbids for `permission denied`. The tier still has to be recognised.
+_d14g="$TMP/arm-clip-nul"; rm -rf "$_d14g"; mkdir -p "$_d14g/o"
+printf 'aaa\nbbb\n' > "$_d14g/o/candidates.txt"; printf '200\n' > "$_d14g/o/.pool"
+printf 'P1-severe\000\n' > "$_d14g/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14g/drive.sh"
+( cd "$_d14g" && HOME="$_d14g" bash drive.sh "$_d14g/o" ) > "$_d14g/out" 2>&1
+_u14g="$(cat "$_d14g/out" 2>/dev/null)"
+if grep -q 'NO clip is asserted and no tier is repeated here' <<<"$_u14g" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_u14g" && ! grep -qi 'null byte' <<<"$_u14g"; then rc=0
+else rc=1; echo "      NUL-bearing record '$(printf '%s' "$_u14g" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a NUL-bearing record is JUNK — no clip is invented from bytes it cannot classify (and no shell warning)" $rc
+
+# 14d-septies) A NUL MID-TIER MUST NOT BE PROMOTED TO A TIER (review P3, cycle 43). Deleting the NUL (the
+# previous shape) turned `P0-blo\0cker` into `P0-blocker` — a measured clip asserted from corrupted bytes.
+# A record of ONLY NULs must likewise not fold into "empty" and print nothing: it is junk, and says so.
+_d14h="$TMP/arm-clip-nulmid"; rm -rf "$_d14h"; mkdir -p "$_d14h/o"
+printf 'aaa\nbbb\n' > "$_d14h/o/candidates.txt"; printf '200\n' > "$_d14h/o/.pool"
+printf 'P0-blo\000cker\n' > "$_d14h/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14h/drive.sh"
+( cd "$_d14h" && HOME="$_d14h" bash drive.sh "$_d14h/o" ) > "$_d14h/out" 2>&1
+_w14="$(cat "$_d14h/out" 2>/dev/null)"
+if ! grep -q 'windows=TRUNCATED' <<<"$_w14" && grep -q 'NO clip is asserted' <<<"$_w14" \
+   && ! grep -qi 'null byte' <<<"$_w14"; then rc=0
+else rc=1; echo "      NUL mid-tier '$(printf '%s' "$_w14" | tr '\n' '|' | head -c 320)'"; fi
+ck "(14d) a NUL INSIDE a tier name is not promoted to a recognised tier" $rc
+
+# 14f) EVERY ARM THAT CAN CARRY THE CLIP DOES — INCLUDING THE ONES A NON-RACING PASS NEVER REACHES
+#      (review P2, cycle 45). §14d grades the two arms a normal pass reaches, so deleting `$_sat_said` from
+#      the severity / severity-uncounted / totals / head arms left EVERY suite green: four disclosures the
+#      product promises and no test could miss. The counts the function reads back come from
+#      `rank_queue_by_pool`, so a pass cannot be made to land in a degraded arm without a race — unless the
+#      count is SHIMMED, which is what `_arm14` below does. The shim renames the shipped ranker, calls it,
+#      then writes the count the arm needs (`-` = remove the file). Nothing in the product changes.
+_arm14() {  # _arm14 <label> <count-content|-> -> print the drive's output
+  _ad="$TMP/arm14-$1"; rm -rf "$_ad"; mkdir -p "$_ad/o"
+  printf '200\n300\n' > "$_ad/o/candidates.txt"; printf '200\n300\n' > "$_ad/o/.pool"
+  printf 'P1-severe\n' > "$_ad/o/.pool-sat"
+  sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_ad/fns-shim.sh"
+  # ⛔ THE RENAME MUST HAVE HAPPENED (review P3, cycle 52), AND THE GATE MUST BE A POSITIVE MEASUREMENT (review
+  # P3, cycle 53). Ungated, a drifted anchor means `_rq_real` never exists, the drive takes
+  # `priority-unreadable`, NO arm's sentence is in either stream — and the branch below reported that as a
+  # PRODUCT defect. `cmp -s` cannot carry the gate on its own: it is a DIFFERENCE test, so it answers "applied"
+  # for every non-zero exit including 127 (`cannot execute`) and 2 (`cannot read`) — a fail-open gate — and it
+  # cannot tell "the rename landed" from "some other byte changed". So the gate ASKS FOR THE RENAME ITSELF.
+  # The verdict is the first output line because this function runs inside a command substitution.
+  if grep -q '^_rq_real() {' "$_ad/fns-shim.sh" 2>/dev/null; then printf '__SHIM__rename=ok\n'; else printf '__SHIM__rename=noop\n'; fi
+  # (no nonce is passed: these checks grep the trace for a MARKER as execution proof and resolve no witness)
+  { drive_xtrace_prologue; cat "$_ad/fns-shim.sh"
+    printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; '
+    if [ "$2" = "-" ]; then printf 'rm -f "$4"'; else printf 'printf "%%s\\n" "%s" > "$4"' "$2"; fi
+    printf '; return $_rq_rc; }\n'
+    printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
+  } > "$_ad/drive.sh"
+  # ⛔ ONE RUN, TWO ARTEFACTS (review P2, cycle 49). The marker these checks search for is text an arm
+  # PRINTS, and printed DATA can produce the same string; the TRACE is what separates "an arm echoed it" from
+  # "something printed it". Capturing both from a single run keeps them describing the same execution — two
+  # runs would let the first one's reorder change what the second one takes.
+  ( cd "$_ad" && HOME="$_ad" bash drive.sh "$_ad/o" ) > "$_ad/out" 2>"$_ad/trace"
+  cat "$_ad/out"
+}
+
+for _arm14_case in \
+  'severity|2 0 200|severity-first from the pool' \
+  'uncounted|-|COUNT could not be read back' \
+  'totals|1 0 200|does not add up to the queue' \
+  'head|2 0 999|names head #999'; do
+  _al="${_arm14_case%%|*}"; _rest="${_arm14_case#*|}"
+  _ac="${_rest%%|*}"; _am="${_rest#*|}"
+  _ao="$(_arm14 "$_al" "$_ac")"
+  _shim_ren=noop
+  case "$_ao" in '__SHIM__rename=ok'*) _shim_ren=ok; _ao="$(printf '%s\n' "$_ao" | sed '1d')" ;; esac
+  if [ "$_shim_ren" != ok ]; then
+    rc=1; echo "      the shim RENAME did not apply for the $_al arm — the sed anchor drifted, so '_rq_real' never exists, the drive takes priority-unreadable and NO arm behaviour is graded (a FIXTURE defect)"
+  elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null && ! grep -qF "$_am" <<<"$_ao"; then
+    rc=1; echo "      the $_al arm's echo did not run at all — neither stream carries its sentence (the shim's rename and count injection were verified to apply, so the arm is unreachable or its echo is gone)"
+  elif ! grep -qF "$_am" "$TMP/arm14-$_al/trace" 2>/dev/null; then
+    rc=1; echo "      the $_al arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the sentence proves nothing"
+  elif grep -qF "$_am" <<<"$_ao" && grep -q 'windows=TRUNCATED(P1-severe)' <<<"$_ao"; then rc=0
+  else rc=1; echo "      the $_al arm '$(printf '%s' "$_ao" | tr '\n' '|' | head -c 340)'"; fi
+  ck "the $_al arm of the order line carries the clip (its sentence is '$_am')" $rc
+done
+
+# 14f-bis) NON-VACUITY, PER ARM — strip `$_sat_said` from ONE arm's echo line and that arm's check must
+# redden while the others stay green (the shim makes each arm independently reachable, so a global
+# `sed` over all of them would not prove attribution).
+_arm14_mut() {  # _arm14_mut <label-to-break> <needle identifying its echo line> -> drive output
+  _amd="$TMP/arm14mut-$1"; rm -rf "$_amd"; mkdir -p "$_amd/o"
+  printf '200\n300\n' > "$_amd/o/candidates.txt"; printf '200\n300\n' > "$_amd/o/.pool"
+  printf 'P1-severe\n' > "$_amd/o/.pool-sat"
+  sed 's/^rank_queue_by_pool() {/_rq_real() {/' "$FNS" > "$_amd/fns-ren.sh"
+  # Both gates travel on ONE first line (`rename=` and `strip=`), same subshell reason as `_arm14`. Both are
+  # POSITIVE measurements (review P3, cycle 53): the rename is proven by the renamed function EXISTING, and
+  # the strip by the clip's occurrence count DECREASING. `cmp -s` would report "applied" whenever it cannot run.
+  if grep -q '^_rq_real() {' "$_amd/fns-ren.sh" 2>/dev/null; then _shim_ren=ok; else _shim_ren=noop; fi
+  # `sub(/[$]_sat_said/, "")` — the `[$]` bracket keeps the `$` out of the regex as an anchor, and the
+  # VARIABLE is deleted while the closing quote is left standing, so the echo stays valid shell. (A
+  # replacement string spelled `"\""` is a syntax error in this awk: measured, it silently produced a
+  # 0-line shim and the drive then died on `command not found`.)
+  awk -v needle="$2" '{ if (index($0, needle) && index($0, "$" "_sat_said")) sub(/[$]_sat_said/, ""); print }' \
+    "$_amd/fns-ren.sh" > "$_amd/fns-shim.sh"
+  # ⛔ THE STRIP MUST HAVE HAPPENED (review P3, cycle 47). On a source that ALREADY lacks the clip on this
+  # arm the substitution is a no-op, and the check would report "✅ the clause disappears" for a strip it
+  # never performed — the false pass `§14c` gates against with `_mut_ok`. One byte comparison.
+  # ⛔ THE VERDICT IS A LINE OF THE OUTPUT, NOT A VARIABLE (review P3, cycle 47): this function runs inside
+  # a command substitution, i.e. a SUBSHELL, so a flag it sets never reaches the caller — measured: all four
+  # per-arm checks reported "the strip did NOT apply" for four successful strips. The first output line is
+  # the verdict; the drive's own output follows it.
+  _clips_before="$(grep -cF '$_sat_said' "$_amd/fns-ren.sh" 2>/dev/null)"; _clips_before="${_clips_before:-0}"
+  _clips_after="$(grep -cF '$_sat_said' "$_amd/fns-shim.sh" 2>/dev/null)"; _clips_after="${_clips_after:-0}"
+  if [ "$_clips_after" -lt "$_clips_before" ]; then _shim_strip=ok; else _shim_strip=noop; fi
+  printf '__SHIM__strip=%s,rename=%s,clips=%s-%s\n' "$_shim_strip" "$_shim_ren" "$_clips_before" "$_clips_after"
+  # (no nonce: this helper greps the trace for a MARKER — it resolves no witness)
+  { drive_xtrace_prologue; cat "$_amd/fns-shim.sh"
+    printf 'rank_queue_by_pool() { _rq_real "$@"; _rq_rc=$?; printf "%%s\\n" "%s" > "$4"; return $_rq_rc; }\n' "$3"
+    printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'
+  } > "$_amd/drive.sh"
+  ( cd "$_amd" && HOME="$_amd" bash drive.sh "$_amd/o" ) > "$_amd/out" 2>"$_amd/trace"
+  cat "$_amd/out"
+}
+# The tuple is `arm|SOURCE-needle|count|OUTPUT-marker`: the needle locates the echo line in the SCRIPT
+# (`names head #$_h`), the marker is that line once RENDERED (`names head #999`). Using the rendered text as
+# the needle silently matched nothing, and the "mutant" was a no-op that reddened nothing (measured).
+for _arm14m in \
+  'severity|severity-first from the pool|2 0 200|severity-first from the pool' \
+  'uncounted|COUNT could not be read back|-|COUNT could not be read back' \
+  'totals|does not add up to the queue|1 0 200|does not add up to the queue' \
+  'head|names head #$_h|2 0 999|names head #999'; do
+  _ml="${_arm14m%%|*}"; _rest="${_arm14m#*|}"; _mn="${_rest%%|*}"; _rest="${_rest#*|}"
+  _mc="${_rest%%|*}"; _mm="${_rest#*|}"
+  _mo="$(_arm14_mut "$_ml" "$_mn" "$_mc")"
+  # ⛔ THE VERDICT CARRIES TWO INDEPENDENT MEASUREMENTS, SO IT IS READ AS TWO (review P3, cycle 53). Collapsing them
+  # into one boolean (`strip=ok,rename=ok`) made the strip-specific branch DEAD by construction and made the
+  # surviving sentence report `rename=no` for a rename it had measured `ok` — a false cause, on the very check
+  # family that exists to catch false causes.
+  _mstrip='?'; _mren='?'; _mclips='?'
+  case "$_mo" in '__SHIM__'*)
+    _mo_raw="$(printf '%s\n' "$_mo" | head -1)"
+    _mo="$(printf '%s\n' "$_mo" | sed '1d')"
+    _mstrip="${_mo_raw#__SHIM__strip=}"; _mstrip="${_mstrip%%,*}"
+    _mclips="${_mo_raw#*clips=}"; _mren="${_mo_raw##*rename=}"; _mren="${_mren%%,*}"
+  ;; esac
+  if [ "$_mren" != ok ]; then
+    rc=1; echo "      the shim RENAME did not apply for the $_ml arm (rename=$_mren) — the sed anchor drifted, so '_rq_real' never exists and NO arm behaviour is graded (a FIXTURE defect)"
+  elif [ "$_mstrip" != ok ]; then
+    rc=1; echo "      the STRIP did not apply to the $_ml arm (strip=$_mstrip, clip occurrences before-after=$_mclips) — the awk needle drifted or the arm already lacks the clip, so this check would report a mutation it never made"
+  elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null && ! grep -qF "$_mm" <<<"$_mo"; then
+    rc=1; echo "      the $_ml arm's echo did not run at all — neither stream carries its sentence (the shim's rename AND strip were verified to apply, so the arm is unreachable or its echo is gone)"
+  elif ! grep -qF "$_mm" "$TMP/arm14mut-$_ml/trace" 2>/dev/null; then
+    rc=1; echo "      the $_ml arm's echo was NEVER EXECUTED (its text is in the output but not in the trace) — the absence of the clause proves nothing"
+  elif grep -qF "$_mm" <<<"$_mo" && ! grep -q 'windows=TRUNCATED' <<<"$_mo"; then rc=0
+  else rc=1; echo "      stripped-$_ml '$(printf '%s' "$_mo" | tr '\n' '|' | head -c 340)'"; fi
+  ck "non-vacuity: with the clip stripped from the $_ml arm ALONE its clause disappears" $rc
+done
+
+# 14e) NON-VACUITY — remove the clause from the arms and the checks above must redden.
+MUT_NOSAT2="$TMP/fns-nosat2.sh"
+sed -e 's/\$_sat_said"$/"/' -e 's/^\$_sat_said$//' "$FNS" > "$MUT_NOSAT2"
+if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said mutation did not apply — the sed anchor drifted"; else
+  _d="$_d14b"
+  # ⛔ ITS OWN CONTROL FIRST (review P2, cycle 48): this fixture lands on the HEAD-NOT-NUMERIC arm, not on the
+  # severity arm §14c drives, so the witness has to be resolved against an unmutated run of THIS fixture.
+  _n_c="$(_xtrace_nonce)"
+  { drive_xtrace_prologue "$_n_c"; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-ctl.sh"
+  ( cd "$_d" && HOME="$_d" bash drive-ctl.sh "$_d/o" ) > "$_d/out-ctl" 2>"$_d/trace-ctl"
+  { drive_xtrace_prologue; cat "$MUT_NOSAT2"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d/drive-mut.sh"
+  ( cd "$_d" && HOME="$_d" bash drive-mut.sh "$_d/o" ) > "$_d/out-mut" 2>"$_d/trace-mut"
+  # ⛔ AND THE MUTANT MUST HAVE RUN HERE TOO (review P3, cycle 45). This check had exactly the defect §14c
+  # was hardened for one commit earlier: a dead driver satisfies "the clause is absent" for the wrong
+  # reason. Same witness, derived the same way.
+  _wit_e="$(_dwit "$_d/trace-ctl" '' "$_n_c")"
+  if [ -z "$_wit_e" ] || ! grep -qF "$_wit_e" "$_d/trace-mut" 2>/dev/null; then
+    rc=1; echo "      the mutated drive printed NO queue-order line — the mutant did not run, so the absence of the clause proves nothing"
+  elif grep -q 'windows=TRUNCATED' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window — the check grades the file, not the code"; else rc=0; fi
+fi
+ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappears (the checks can fail)" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -3962,7 +3962,7 @@ queue_order_refuse() {
 # ⛔ A FUNCTION, for the same reason `floor_choose_order` is one: the WRITE is the part that can go
 # silently inert, and a caller that skipped it would leave every assertion here green.
 queue_order_from_pool() {
-  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_said
+  local o="${1:-}" _r _u _h _sat _sat_junk _sat_tier _sat_raw _sat_said _sat_unread _sat_notopen _why_none
   [ -n "$o" ] || return 1
   rm -f "$o/.queue-rank" "$o/.cand.ranked" 2>/dev/null
   if ! rank_queue_by_pool "$o/.pool" "$o/candidates.txt" "$o/.cand.ranked" "$o/.queue-rank"; then
@@ -4008,14 +4008,13 @@ queue_order_from_pool() {
   # `orch-loop.sh:6614` skips any id in `dispatched.txt` (`grep -qx "$ISS" … && continue`) — so the
   # worst case is one wasted row that the walker ignores, not duplicate work. Stated here with the
   # pointer so the next reader can check the claim instead of trusting it.
-  if [ ! -s "$o/.cand.ranked" ] && [ -s "$o/candidates.txt" ]; then
-    queue_order_refuse "$o" "the reorder produced an EMPTY queue while $o/candidates.txt holds rows — the queue changed under this pass (a concurrent prune truncated and refilled it); NOTHING was installed, so the queue keeps its rows and its order is UNVERIFIED"
-    return 1
-  fi
-  if [ "$(LC_ALL=C sort -u "$o/candidates.txt" 2>/dev/null)" != "$(LC_ALL=C sort -u "$o/.cand.ranked" 2>/dev/null)" ]; then
-    queue_order_refuse "$o" "the reorder's ROW SET differs from the one $o/candidates.txt holds NOW — the queue changed under this pass (a concurrent prune, or a torn read); NOTHING was installed and the queue is untouched"
-    return 1
-  fi
+  # ⛔ ONE GUARD FAMILY, AND IT IS THE GRADED ONE (review P3, cycle 54). Two PRE-INSTALL guards used to live
+  # here — "the reorder produced an EMPTY queue while candidates.txt holds rows" and "the ROW SET differs
+  # from the one candidates.txt holds NOW" — testing exactly the conditions the adjacent re-check below tests
+  # at the moment of the `mv`, so the only difference they could make was WHICH sentence an operator reads,
+  # and neither sentence was graded: deleting them (together or one at a time, measured) left the suite at
+  # 133/0. The re-check below IS graded (`rank-queue.test.sh` §11, the prune-race fixture), so it owns the
+  # state and the sentence now.
   _wrote=0
   if cmp -s "$o/.cand.ranked" "$o/candidates.txt"; then
     rm -f "$o/.cand.ranked" 2>/dev/null
@@ -4060,16 +4059,20 @@ queue_order_from_pool() {
   case "${_u:-}" in ''|*[!0-9]*) _u="" ;; esac
   case "${_h:-}" in ''|*[!0-9]*) _h="" ;; esac
   # ⛔ WHETHER THE BYTES MOVED IS REPORTED, NOT TYPED (review P3, cycle 10). Every arm below runs after EITHER
-  # the `mv` OR the byte-identical `cmp` branch, so "INSTALLED" is false half the time — and the ranked-none
-  # arm forty lines up already uses `_wrote` for exactly this reason ("whether the bytes moved is reported,
-  # not assumed"). One sentence, decided by the write that actually happened.
+  # the `mv` OR the byte-identical `cmp` branch, so "INSTALLED" is false half the time. `_wrote` is the
+  # witness: initialised to 0 BEFORE the `cmp`/`mv` branch — unconditionally, it is not a condition on the
+  # nothing-written path — and set to 1 only on the `mv` branch. BOTH readers use it for the same reason
+  # ("whether the bytes moved is reported, not assumed"): the `_inst_said` derivation immediately below and
+  # the `unranked` arm. One sentence, decided by the write that actually happened — never by which branch
+  # the reader assumes was taken.
   if [ "${_wrote:-0}" -eq 1 ]; then
     _inst_said="the reorder was DERIVED AND INSTALLED"
   else
     _inst_said="the reorder was DERIVED and the queue already held exactly those bytes (nothing was written)"
   fi
   # ⛔ A TRUNCATED TIER WINDOW IS NAMED ON THE ORDER LINE (review cycle 33, P2). `.pool-sat` is written by
-  # THE TIER READ (three lines above `queue_order_from_pool`'s caller): a tier whose window ended FULL
+  # THE TIER READ (the `rest_list` block that writes `.pool`, `.pool-read` and `.pool-sat`): a tier whose
+  # window ended FULL
   # with a next page still advertised did not list its whole tier. With the oldest-first order the tier's
   # NEWEST members are the ones missing, so any of them that is queued lands in the unranked TAIL — behind
   # every ranked row of every LOWER tier, which is a severity inversion the order line otherwise reports as
@@ -4077,24 +4080,77 @@ queue_order_from_pool() {
   # ⛔ SANITISED, NOT ECHOED: only the three tier names are ever repeated, so a foreign or corrupt file
   # cannot inject text into an operator-facing line. An unreadable mix is disclosed as such rather than
   # printed. Absent file = no tier was truncated (the normal case) and no clause is added.
-  _sat=""; _sat_junk=0; _sat_tier=""
-  if [ -s "$o/.pool-sat" ]; then
-    while IFS= read -r _sat_tier; do
-      case "$_sat_tier" in
-        P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
-        "") : ;;
-        *) _sat_junk=1 ;;
-      esac
-    done < "$o/.pool-sat" 2>/dev/null
-    [ -n "$_sat" ] || _sat="unrecognised"
-  fi
-  _sat_said=""
-  if [ -n "$_sat" ]; then
-    _sat_said=" — windows=TRUNCATED($_sat): a tier window ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool and any of them that is queued sits in the unranked TAIL, behind every ranked row of every LOWER tier"
-    if [ "$_sat_junk" -eq 1 ]; then
-      _sat_said="$_sat_said (the window record also carried a line that is not a tier name — it is NOT repeated here)"
+  _sat=""; _sat_junk=0; _sat_tier=""; _sat_unread=0; _sat_notopen=0
+  # ⛔ FOUR THINGS THIS READ HAS TO GET RIGHT, each one a defect this PR shipped and fixed:
+  # 1. AN EXISTENCE GATE BEFORE ANY READING. Absent is the NORMAL case (no tier was clipped) and must print
+  #    nothing; without the gate every ordinary pass would claim an unreadable record.
+  # 2. THE SHAPE IS DECIDED BEFORE THE READ, AND A FAILING READ IS A SECOND, SEPARATE TEST. Testing
+  #    readability instead (`[ -r ]`) is a TOCTOU: a directory passes it AND `[ -s ]`, is never read, and
+  #    was then reported over zero bytes. Only a REGULAR file is read, so nothing here can block on a FIFO
+  #    or drain a device (there is no timeout anywhere on this path). A non-regular shape is NOT OPENED.
+  # 3. THE READ'S OWN FAILURE IS BOTH OBSERVABLE AND SILENT. `tr ... < "$o/.pool-sat"` puts the redirect
+  #    BEFORE any `2>/dev/null` on the same command, so a failure there still printed the shell's own
+  #    `Permission denied` above the honest line — the mechanism the `.queue-rank` read documents. Wrapping
+  #    the read in a brace group whose stderr is discarded covers the redirect AND still lets the command
+  #    substitution carry the failing status, which is what the branch tests.
+  # 4. A NUL IS RE-PLACED, NOT DELETED. Deleting it cleaned `P0-blo\0cker` into the `P0-blocker` tier —
+  #    a clip asserted from corrupted bytes — and folded a NUL-only record into "empty". Re-placed, the
+  #    byte survives as data: no line carrying it can equal a tier name, so the record is JUNK, and the
+  #    shell still emits no "ignored null byte" warning.
+  # ⛔ TWO FAILURES, TWO SENTENCES (review P3, cycle 43). "Not a regular file, so this pass did NOT open
+  # it" and "it EXISTS but could not be READ" are different facts, and the old single sentence asserted the
+  # second for the first — false for the very shape the device fixture uses, where a read would HAVE
+  # succeeded (`/dev/null` yields zero bytes). `_sat_notopen` and `_sat_unread` are kept apart so the line
+  # says which one happened.
+  if [ -e "$o/.pool-sat" ] || [ -L "$o/.pool-sat" ]; then
+    if [ ! -f "$o/.pool-sat" ]; then
+      _sat_notopen=1
+    elif _sat_raw="$( { tr '\000' '\001' < "$o/.pool-sat"; } 2>/dev/null )"; then
+      # ⛔ A NUL IS RE-PLACED, NOT DELETED (review P3, cycle 43). `tr -d` made a record of `P0-blo\0cker`
+      # MATCH the `P0-blocker` tier — asserting a measured clip from bytes this code cannot classify — and
+      # made a NUL-only record indistinguishable from an EMPTY one, so it printed no clause at all. Mapped
+      # to `\001` the byte SURVIVES as data: no line containing it can equal a tier name, so the record is
+      # JUNK (the no-clip sentence), and the shell still emits no "ignored null byte" warning.
+      if [ -n "$_sat_raw" ]; then
+        while IFS= read -r _sat_tier; do
+          case "$_sat_tier" in
+            P0-blocker|P1-severe|P2-moderate) _sat="${_sat:+$_sat,}$_sat_tier" ;;
+            "") : ;;
+            *) _sat_junk=1 ;;
+          esac
+        done <<<"$_sat_raw"
+        [ -n "$_sat" ] || _sat="unrecognised"
+      fi
+    else
+      _sat_unread=1
     fi
   fi
+  _sat_said=""
+  # ⛔ `unrecognised` DOES NOT ASSERT A CLIP (review P2, cycle 40). Cycle 39 moved the clip out of the
+  # `unranked` parenthetical but left `$_sat_said` on the SAME operator line still saying "a tier window
+  # ended FULL ... so that tier's NEWEST members are NOT in .pool" — a MEASURED clip, on the state whose
+  # whole meaning is "no recognised tier was recorded". Two distinct states share that word: junk lines
+  # in the record, and a record that could not be read at all. Neither may claim a clip, and the
+  # unreadable one may not be reduced to "no clip" either.
+  # ⛔ THE SHAPE IT CANNOT DISTINGUISH, STATED (review P2, cycle 42): a record already written and then
+  # REMOVED by a concurrent pass's entry `rm -f` is indistinguishable from one that was never written, so
+  # it reads as "no tier was clipped" — the normal case. Detecting it would need a second durable marker
+  # (`-e` is false for a file that is gone), and the producer's writes are a PIPELINE SUBSHELL, so no
+  # in-process flag survives either. That is a residual, not a claim: the docs say the same.
+  case "$_sat" in
+    "") if [ "$_sat_notopen" -eq 1 ]; then
+          _sat_said=" — the tier-window record EXISTS but is NOT A REGULAR FILE, so this pass did NOT open it (reading a FIFO or a device is unbounded) and measured no clip"
+        elif [ "$_sat_unread" -eq 1 ]; then
+          _sat_said=" — the tier-window record EXISTED but could not be READ, so this pass measured no clip and asserts none"
+        fi ;;
+    unrecognised)
+      # A non-empty record that matched no tier ALWAYS has at least one unrecognised line, so the former
+      # non-junk arm here was unreachable (review P3, cycle 42): a record of blank lines reads as empty,
+      # and an empty or absent record prints no clause at all — which is the truth for it.
+      _sat_said=" — the tier-window record carried no tier name this code recognises, so NO clip is asserted and no tier is repeated here" ;;
+    *) _sat_said=" — windows=TRUNCATED($_sat): a tier window ended FULL with a next page still advertised, so that tier's NEWEST members are NOT in .pool and any of them that is queued sits in the unranked TAIL, behind every ranked row of every LOWER tier"
+       [ "$_sat_junk" -eq 1 ] && _sat_said="$_sat_said (the window record also carried a line that is not a tier name — it is NOT repeated here)" ;;
+  esac
   if [ -z "$_r" ] || [ -z "$_u" ]; then
     # ⛔ THE ORDER WAS DERIVED AND INSTALLED — ONLY THE COUNTS ARE UNKNOWN (review P2, cycle 10). This arm
     # said `priority-unreadable`, whose word for the ORDER is "UNVERIFIED (whatever the PREVIOUS pass
@@ -4166,7 +4222,12 @@ queue_order_from_pool() {
     # pool `bbb` → rows `bbb aaa`, and the durable `why=` said the order "could NOT be re-derived").
     # The rank COUNT is the witness of what happened; the head is only a witness of WHICH row leads.
     QUEUE_ORDER_STATE="severity"
-    echo "[refresh] queue order: the reorder WAS derived from the pool — $_inst_said: $_r ranked, $_u unranked, so the rows in $o/candidates.txt now lead with the pool-ranked ones; the HEAD cannot be named here because the count read back a head that is not a plain issue number"
+    # ⛔ AND THE CLIP IS PART OF THIS ANSWER TOO (review P3, cycle 38). Five of the seven installed arms
+    # carry `$_sat_said`; this one and the `unranked` arm below did not — and the WARN that would have
+    # carried it is gated on `_r > 0` for the second. The block head says the fact is "printed here"
+    # because "nothing else in the answer carries" it, so an arm that drops it leaves a truncated tier
+    # window invisible in the one line a reader gets.
+    echo "[refresh] queue order: the reorder WAS derived from the pool — $_inst_said: $_r ranked, $_u unranked, so the rows in $o/candidates.txt now lead with the pool-ranked ones; the HEAD cannot be named here because the count read back a head that is not a plain issue number$_sat_said"
   else
     # Not a silent degradation: nothing in the queue is ranked by the pool, so the ORDER MEANS NOTHING.
     # ⛔ AND IT IS NOT "ARRIVAL ORDER" EITHER (review P2). This arm rewrites the file with the rows in
@@ -4188,7 +4249,23 @@ queue_order_from_pool() {
     else
       _wrote_said="candidates.txt was left UNTOUCHED (byte-identical; the sequence was not re-derived here, and is NOT this pass's arrival order either)"
     fi
-    echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) (no P0-blocker/P1-severe/P2-moderate row matched), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\""
+    # ⛔ AND THE CAUSE IS NOT NAMED WHEN A TIER WAS CLIPPED (review P3, cycle 38): "no … row matched" is
+    # FALSE precisely when the row DID match and its own tier window clipped it — reachable whenever a
+    # truncated tier's rows are not the queued ones. The parenthetical only claims what was measured.
+    # ⛔ `unrecognised` IS NOT "A TIER WAS CLIPPED" (review P3, cycle 39): `_sat` carries that literal
+    # when `.pool-sat` EXISTS but holds no tier name this code knows — the state whose whole meaning is
+    # "the pass could not tell WHICH tier was clipped". Asserting a clip there is a claim the pass did not
+    # take, on a corrupt/foreign record. Only a RECOGNISED tier name makes the clip a fact.
+    case "$_sat" in
+      "") if [ "$_sat_unread" -eq 1 ] || [ "$_sat_notopen" -eq 1 ]; then
+            _why_none="no ranked row was left for this queue, and its tier-window record could not be USED (it was not a regular file, or it could not be read), so no cause is asserted"
+          else
+            _why_none="no P0-blocker/P1-severe/P2-moderate row matched"
+          fi ;;
+      unrecognised) _why_none="no ranked row was left for this queue, and its window record names no tier this code recognises, so no cause is asserted" ;;
+      *) _why_none="no ranked row was left for this queue — the $_sat tier window was clipped, so its newest members were never ranked at all" ;;
+    esac
+    echo "[refresh] unranked: the pool ranked NONE of the $(( _r + _u )) queued candidate(s) ($_why_none), so this pass established NO priority order — $_wrote_said: read it as UNRANKED, never as \"severity-ordered\"$_sat_said"
   fi
   if [ "$_u" -gt 0 ] && [ "$_r" -gt 0 ]; then
     echo "[refresh] WARN queue order: $_u queued candidate(s) are not ranked by the pool at all (label removed, now assigned, or outside a tier's --limit window) — they sit at the TAIL and dispatch only after every pool-ranked entry$_sat_said"
@@ -6207,13 +6284,13 @@ elif [ -n "$_backlog_n" ] && [ "$_backlog_n" -eq 0 ]; then
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue is empty and no candidate this pass was usable" \
-    "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=0" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 elif [ -n "$_backlog_n" ]; then
   echo "[refresh] handed to dispatch: NONE — this pass queued nothing usable, and the queue holds $_backlog_n row(s) but its HEAD could not be read as a candidate number, so this pass cannot say WHICH one dispatch takes next — the depth is MEASURED, the head is UNKNOWN, and this is NOT an empty queue (judged $judged: $V_QUEUED CLEAN, $V_COLLISION peer-owned, $V_LANDED landed, $V_UNJUDGED unusable)"
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed but handed NOTHING to dispatch: the queue holds $_backlog_n row(s) and its head could not be read, so the DEPTH is measured and the HEAD is unknown (this is not an empty queue)" \
-    "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=$_backlog_n" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 elif [ "$_q_readable" -eq 0 ]; then
   # ⛔ THE THIRD ARM (review P2, cycle 11): the queue could not be READ, so its depth is UNKNOWN — never
   # the success word, and never a `backlog=0` the durable record would be asserting as a measurement.
@@ -6221,7 +6298,7 @@ elif [ "$_q_readable" -eq 0 ]; then
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed; the queue could NOT be read, so the depth and the head are UNKNOWN and nothing was handed" \
-    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 else
   # ⛔ READABLE, BUT NEITHER NUMBER CAME BACK (review P2, cycle 15): the file WAS read (the guard above
   # proved it), the depth read failed, and the head is not a plain number. Saying "not a readable regular
@@ -6231,5 +6308,5 @@ else
   REFRESH_RECORDED=1
   refresh_record_write ok handoff 0 \
     "pass completed; the queue WAS readable but neither its DEPTH nor its HEAD could be measured, so both are UNKNOWN and nothing was handed (this is not an empty queue)" \
-    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
+    "judged=$judged" "queued=$QUEUED" "backlog=UNKNOWN" "handed=" "handed_why=$(skip_order_why "${QUEUE_ORDER_STATE:-}")" "queue_readable=$_q_readable" "unusable=$(unusable_summary)"
 fi
