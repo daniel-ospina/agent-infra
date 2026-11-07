@@ -704,8 +704,10 @@ PY
 # This exists because the wait bound can fail by HANGING rather than by
 # returning: `--poll 0` makes a nominal poll-count bound unreachable (#1395 item
 # 1), so a guard for that class must be able to kill the rail it is guarding.
-# macOS has no `timeout`, hence the explicit poll-and-kill. 124 = the watchdog
-# fired, i.e. the rail was still running past the limit.
+# macOS has no `timeout`, hence the explicit poll-and-kill. 124 = the watchdog FIRED and
+# PROVED the rail is gone — it does NOT mean "the rail was still running past the limit":
+# the gate's supervisor-death arm returns 124 with the limit nowhere near expiry (7g drives
+# exactly that with a 120s limit). See the function's own docstring for the full contract.
 #
 # The rail is launched through `rail_exec` directly (NOT `( run_rail ... ) &`) so
 # that `$!` is the RAIL: killing a wrapper subshell would leave the rail
@@ -779,6 +781,10 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
       # `wait` would block with nothing left to bound it — one last attempt, then refuse.
       echo "⚠️ watchdog: the guard fired but the rail pid $pid SURVIVED SIGKILL" >&2
       reap_pid "$pid" "$ident" || return 125
+      # ⛔ AND NEVER `wait` ON A LIVE PID WITH NOTHING LEFT TO BOUND IT. `reap_pid` answers 0
+      # for "gone" AND for "provably NOT ours" (an unreadable identity included), so its
+      # success is not on its own a licence to block (#3622 review round 3, P2).
+      if is_running "$pid"; then return 125; fi
       wait "$pid" 2>/dev/null || rc=$?
       return 125
       ;;
@@ -787,7 +793,13 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
       # Died or refused (2 refusal/usage, 127 unable to run, a signal): nothing was bounding
       # the rail while it lived, so no result of the rail's can be reported as bounded.
       echo "⚠️ watchdog: the guard exited $grc — nothing was bounding the rail" >&2
-      if is_running "$pid"; then reap_pid "$pid" "$ident" || return 125; fi
+      if is_running "$pid"; then
+        reap_pid "$pid" "$ident" || return 125
+        # ⛔ AND NEVER `wait` ON A LIVE PID WITH NOTHING LEFT TO BOUND IT. `reap_pid` answers
+        # 0 for "gone" AND for "provably NOT ours" (an unreadable identity included), so
+        # its success is not on its own a licence to block (#3622 review round 3, P2).
+        if is_running "$pid"; then return 125; fi
+      fi
       wait "$pid" 2>/dev/null || rc=$?
       return 125
       ;;

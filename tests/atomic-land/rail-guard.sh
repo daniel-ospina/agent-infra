@@ -14,7 +14,10 @@
 #                 first iteration — a caller that reads "0 seconds" as "no patience" would get
 #                 the opposite of what it expects. No caller passes 0 today; both meanings are
 #                 stated so the next one cannot guess wrong.)
-#   <ident>       the rail's start stamp (`proc_ident`), so a RECYCLED pid is never signalled.
+#   <ident>       the rail's start stamp (`proc_ident`). A CAPTURED stamp makes a recycled pid
+#                 not-ours, so THAT pid is never signalled; a BLANK stamp (the capture failed)
+#                 forfeits the protection and the reap still proceeds — reaping is this
+#                 process's whole job, and the caller has no other arm that runs on a schedule.
 #
 # ⛔ THE EXIT STATUS, NOT A SENTINEL FILE, CARRIES THE VERDICT. An earlier cut had the guard write
 # a sentinel into the scenario dir and the caller read it; measured: `: >"$file" 2>/dev/null` does
