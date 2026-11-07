@@ -3235,7 +3235,12 @@ ck "the EMITTED text of every driven case is pinned (a claim reached the operato
 # The witness drives the SAME fixture §1 uses (pool '200,300' over queue '300,9,200': both ranked, so the
 # severity arm — the one that prints `$_inst_said` and the head — is the arm under test), with a mutated copy of
 # the shipped function text, and compares the emitted bytes against the PINNED crc for that case.
-_rank_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | grep -m1 '^rank/out=' | cut -d= -f2)"
+# ⛔ THE ANCHOR IS READ BY ITS OWN KEY, LIKE EVERY OTHER LOOKUP ABOVE (review P3, cycle 82). This was the one map key
+# still resolved by LITERAL PREFIX plus the field after the FIRST `=` — `grep -m1 '^rank/out=' | cut -d= -f2` — so the
+# day a re-pin records any other `rank/out=…` entry (a fixture capturing to `out=1` in the rank case dir) the anchor
+# silently became THAT capture's CRC (`_rank_pin='1'`), and every witness below it reddened for the wrong reason while
+# the map assertion stayed green. `_out_kv` + an exact key match cannot do that.
+_rank_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | _out_kv | awk -F'\t' '$1=="rank/out" { print $2; exit }')"
 _outred2() { # $1=mutated source -> 0 when the emitted text differs from the pinned 'rank' case
   _om_d="$TMP/outpin-mut"; rm -rf "$_om_d"; mkdir -p "$_om_d/o"
   printf '300\n9\n200\n' > "$_om_d/o/candidates.txt"
