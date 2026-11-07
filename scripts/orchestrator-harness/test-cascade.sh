@@ -637,12 +637,22 @@ ck "…while the SAME hold on an INERT PR path DOES trip it at the bound (the co
 # `\${CASCADE_MAIN_RED` only, so the very shape its comment above QUOTES — `[ "$CASCADE_MAIN_RED" = 1 ]`
 # — did not match, and an actor written that way left both pins green (measured: appending that line
 # kept the count at 1). Both spellings are counted now, and the actor line takes it to 2.
-# ⛔ COUNTED AS **OCCURRENCES**, NOT LINES (review round 9, P2) — the same rule the sibling name pin eight
-# lines below already states, and for the same measured reason: an actor appended to the consumer's OWN
-# line (`if [ "${CASCADE_MAIN_RED:-0}" = "1" ]; then spawn_main_repair "$CASCADE_MAIN_RED"; fi`) is a
-# second CONSUMER on ONE line, so `grep -c` answered 1 and both tripwires stayed green over a live actor.
+# ⛔ ONE DEFINITION, BECAUSE A MUTANT CANNOT MUTATE THIS SUITE (review round 10, P2). `mut`/`mutfile`
+# only ever mutate `$ORCH`/`spawn-gate.sh` — never a test file — so a probe that RE-IMPLEMENTS the
+# pattern inline grades its own private copy: reverting the shipped pin to `grep -c`, or to the
+# braced-only pattern, left every assertion green while M23 still reported `shipped=yes, mutant=no`
+# (measured: three weakened forms, suite 165/0 every time). The pattern AND the pipeline now live in one
+# exported function used by BOTH the assertion and the probe — so weakening either weakens precisely the
+# thing the mutant measures, the mutant then reports `mutant=yes`, and the suite goes RED. This is the
+# suite's own contract ("every function under test is EXTRACTED FROM THE SHIPPED SCRIPT, never
+# re-implemented here: a mirror would grade itself") applied to a pin rather than to a function.
+MRPAT='\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)'
+export MRPAT
+mainred_consumers() { grep -vE '^[[:space:]]*#' "$1" 2>/dev/null | grep -oE "$MRPAT" | wc -l | tr -d ' '; }
+# bash 3.2 (the model CI runs) supports `export -f`; guard so a hostile shell cannot abort the suite.
+export -f mainred_consumers 2>/dev/null || true
 ck "…and CASCADE_MAIN_RED is CONSUMED exactly once (a second consumer is where an actor would live)" \
-   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -oE '\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)' | wc -l | tr -d ' ')" "1"
+   "$(mainred_consumers "$ORCH")" "1"
 # ⛔ DECLARED LIMIT OF THIS PIN, so it is not read as a proof it does not give: it is NAME-based. It
 # fires when an actor is added KEYED ON THE LEVEL'S NAME (`FIX_MAIN`), which is how a level branch is
 # written in this file (`cascade_level_name` is the one map every other consumer uses) — it cannot
@@ -1189,7 +1199,8 @@ mutfile "M20 an ACTOR is added for level 1 (a spawn keyed on FIX_MAIN) -> the 'n
 # mutant is the shape the pin exists for — an actor written against the UNBRACED variable, APPENDED TO
 # THE CONSUMER'S OWN LINE (a second consumer on one line, which is what `grep -c` could not see).
 cat > "$TMP/p-mainred-consumer.sh" <<'PEOF'
-n="$(grep -vE '^[[:space:]]*#' "$TGT" 2>/dev/null | grep -oE '\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)' | wc -l | tr -d ' ')"
+# Grades the SHIPPED definition (`mainred_consumers`, exported above) — never a copy of it.
+n="$(mainred_consumers "$TGT")"
 [ "$n" = "1" ] && echo yes || echo no
 PEOF
 mutfile "M23 an actor consumes the UNBRACED \$CASCADE_MAIN_RED on the consumer's own line -> the pin goes RED" \
