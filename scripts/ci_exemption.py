@@ -143,9 +143,27 @@ from pathlib import Path
 
 #: A pytest nodeid: ``path/to/test_x.py::[Class::]name`` (params allowed).
 #: Deliberately anchored and narrow — anything else is REJECTED, not guessed.
+#:
+#: Used by :func:`parse_rates` (MAIN's rate table). ⛔ ``/`` BELONGS IN THE
+#: ``rest`` CLASS, and its absence was #3686. The ``path`` group has always
+#: admitted ``/``; the PARAMETER SPACE did not, so a parametrized id whose
+#: parameter is itself a path was admitted by the PR-side parser
+#: (:func:`is_failure_key_loose`) and DROPPED here. That is the REAL shape
+#: ``tests/test_entry_point_python_guard.py`` produces for every ``tools/**/*.py``
+#: entry point it censuses --
+#: ``…::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]``
+#: -- so an entire class of main-side rows could never become a rate.
+#:
+#: A dropped main-side row makes the PR-side failure look unique, which BLOCKS
+#: it forever: the exact asymmetry :func:`is_failure_key`'s own docstring forbids
+#: ("the same predicate must gate :func:`parse_rates`, or main's rate row is
+#: dropped and every such failure reads as PR-unique forever"). Measured
+#: 2026-11-07: main's table carried ``…[tools/cache_evict.py]\t3\t26`` and the
+#: verdict still reported the id as "absent from main's failure set". Pinned by
+#: ``tests/test_ci_exemption.py::test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors``.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
-    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:]+)$"
+    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"
 )
 
 #: The tokens that open a failure record. One list, so the shell can never

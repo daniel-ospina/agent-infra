@@ -900,6 +900,104 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
     assert "rates" in decision.report().lower() or "BLOCK" in decision.report()
 
 
+# ── #3686 · a path-VALUED PARAMETER must survive BOTH doors ────────────────
+# `_NODEID_RE` admitted `/` in the `path` group and NOT in the parameter space,
+# so `parse_rates` (main's table) silently dropped a row that
+# `parse_failure_rows` (the PR's table) accepted. The consequence is not a
+# mis-grade, it is a permanent BLOCK: the id has a PR failure and no main rate,
+# which is `decide`'s "absent from main's failure set … not exempt" path.
+#
+# MEASURED 2026-11-07 on tortoise PR #11362 (run 42340742360): six ids blocked,
+# every one of this shape, each with a REAL main row printed in the same verdict
+# as `NOTE : rejected main rate row: …[tools/cache_evict.py]\t3\t26`, while the
+# same ids were failing on main's own run 42320870743. The chain that matters:
+# `tests/test_entry_point_python_guard.py` parametrizes over `tools/**/*.py`, so
+# an ENTIRE FILE of the census can never be exempted — and while main is red with
+# several independent classes, no repair PR that fixes only some of them can be
+# certified. That is a deadlock, not an over-block.
+
+
+#: Real ids from the shipped suites, not invented ones. The first family is the
+#: `tools/**/*.py` census (`/` in the parameter); the rest are the other
+#: characters a pytest parameter can carry, so a future narrowing of `rest`
+#: cannot pass by covering only the shape #3686 was reported for.
+_PARAM_SPACE_CORPUS = (
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
+    "tests/test_entry_point_python_guard.py::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/gen_placement_table.py]",
+    "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/longmem_eval/run.py]",
+    "tests/test_ci_selection.py::test_surface[tools/ci_selection.py]",
+    "tests/test_a.py::test_param[a/b:c-d.e]",
+    "tests/test_a.py::test_param[cache_evict]",
+    "tests/test_a.py::TestK::test_param[x]-",
+    "tests/test_a.py::TestK::test_param",
+)
+
+
+def test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors():
+    """THE #3686 INVARIANT: the two predicates must agree on this corpus.
+
+    `is_failure_key` gates MAIN's rate table and `is_failure_key_loose` gates the
+    PR's failure table. If the strict form rejects what the loose form accepts,
+    main's row vanishes and the failure is unexemptible forever — the exact
+    asymmetry `is_failure_key`'s docstring forbids.
+    """
+    disagreements = [k for k in _PARAM_SPACE_CORPUS if not is_failure_key(k)]
+    assert not disagreements, (
+        "`is_failure_key` rejects id(s) the PR-side parser ACCEPTS, so main's "
+        "rate row for them is dropped and every such failure reads as "
+        f"PR-unique forever (#3686): {disagreements}"
+    )
+    # The loose form must also accept this corpus — the point is AGREEMENT, and
+    # asserting only the strict side would pass a narrowing of the loose one.
+    loose_disagreements = [k for k in _PARAM_SPACE_CORPUS if not is_failure_key_loose(k)]
+    assert not loose_disagreements, (
+        f"`is_failure_key_loose` rejects corpus id(s): {loose_disagreements}"
+    )
+
+
+def test_a_path_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
+    """The row must survive `parse_rates`, not merely the shape predicate.
+
+    The shape check is one gate inside the parser; this drives the WIRE format
+    the shell emits, so a second rejection on the parse path cannot hide behind a
+    green predicate.
+    """
+    nodeid = _PARAM_SPACE_CORPUS[0]
+    r = parse_rates(f"{nodeid}\t3\t26\n")
+    assert r.rejected == [], (
+        f"parse_rates DROPPED main's row for a path-parametrized id (#3686): {r.rejected}"
+    )
+    assert r.rates[nodeid] == Rate(3, 26)
+
+
+def test_a_path_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED():
+    """End to end: main red 3/26 on the id, the PR red 3/26 with the same sig.
+
+    This is the shape that deadlocked 2026-11-07. With the parameter space
+    repaired, `decide` must EXEMPT it — the same verdict any other main-red id
+    gets. Asserting only the parser would leave the verdict's own path unpinned.
+    """
+    nodeid = _PARAM_SPACE_CORPUS[0]
+    sig = "sg-3686"
+    main = parse_rates(f"{nodeid}\t3\t26\n")
+    pr = parse_failure_rows(f"{nodeid}\t3\t26\t{sig}\n").failures
+    assert pr, "the PR-side parser dropped the row, so this leg would be vacuous"
+    decision = decide(
+        pr,
+        main.rates,
+        main_signatures={nodeid: frozenset({sig})},
+        k_pr=26,
+        rate_tolerance=1.5,
+    )
+    assert [v.nodeid for v in decision.blocked] == [], (
+        "a path-parametrized id main already fails is still BLOCKED — the "
+        f"#3686 deadlock: {[v.line for v in decision.blocked]}"
+    )
+    assert nodeid in {v.nodeid for v in decision.exempt}, (
+        "the id was neither blocked nor exempted, so the verdict never saw it"
+    )
+
+
 def test_the_total_failure_blocks_through_the_real_wire_format():
     """The closed residual, driven through the table the shell actually emits.
 
