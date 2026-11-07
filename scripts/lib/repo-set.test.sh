@@ -695,6 +695,41 @@ ck "m11 with round 6 reverted, m8's fixture is ACCEPTED as two repos (rc 0) — 
    '[ "$(REPO_SET_FILE="$T/absentdotdot-state.conf" bash "$M3/lib/repo-set.sh" check >/dev/null 2>&1; echo $?)" = 0 ]'
 ck "m12 …and so is m9's, so the PHYSICAL walk (not just any \`..\` folding) is what refuses it" \
    '[ "$(REPO_SET_FILE="$T/linkdotdot-state.conf" bash "$M3/lib/repo-set.sh" check >/dev/null 2>&1; echo $?)" = 0 ]'
+# Round 9, P2: a component that is PRESENT but cannot be ENTERED (EACCES/EPERM/ELOOP — a mode-000
+# dir, a denied ancestor, launchd without Full Disk Access) is NOT "absent". Measured before this fix:
+# with `a/link -> tgt` and `tgt` mode 000, `realpath(a/link/../b)` and `realpath(b)` are ONE
+# directory, yet the reader printed `ok` for BOTH and `OK — 2 repo(s)` at rc 0 with NO message; the
+# same fixture with `tgt` traversable REFUSES. A false PASS produced by a permission bit is the
+# worst shape, because nothing on the box looks different.
+#
+# The fix does not REFUSE ("only a PROVEN fault refuses", "existence stays UNREQUIRED"): it makes the
+# identity unprovable, which must be LOUD — WARN STATE-UNVERIFIED, never silent assent.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip m13-m14 (running as root: mode 000 is still traversable)\n'
+else
+  mkdir -p "$T/eaccs/a" "$T/eaccs/tgt" "$T/eaccs/b"
+  ln -s "$T/eaccs/tgt" "$T/eaccs/a/link"
+  printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/eaccs/b\nslug=daniel-ospina/agent-infra checkout=%s state=%s/eaccs/a/link/../b\n' \
+    "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/eaccs-state.conf"
+  chmod 000 "$T/eaccs/tgt"
+  ck "m13 a state dir under an UNENTERABLE component is NOT silently \`ok\` — it WARNS STATE-UNVERIFIED" \
+     'run_reader "$T/eaccs-state.conf" check | grep -q "WARN STATE-UNVERIFIED"'
+  ck "m14 …and it does NOT refuse (a permission denial is not a proven fault about the set)" \
+     '[ "$(run_reader_rc "$T/eaccs-state.conf" check)" = 0 ]'
+  chmod 755 "$T/eaccs/tgt"
+  ck "m15 …while the SAME fixture with the component traversable IS refused — m13/m14 measure the fix" \
+     'run_reader "$T/eaccs-state.conf" check | grep -q "is shared with another repo in this set"'
+fi
+# Round 9, P2: `_dupkey` was assigned without `local`, so it leaked into the shell of every consumer
+# that SOURCES this file (n1/n2 make caller-shell purity a named defect class here).
+DUPKEY_LEAK="$(REPO_SET_FILE="$CONF" bash -c '. "$1" >/dev/null 2>&1; repo_set_parse >/dev/null 2>&1; repo_set_check >/dev/null 2>&1; printf "%s" "${_dupkey-UNSET}"' _ "$READER")"
+ck "m16 sourcing the reader and running parse+check leaves no \`_dupkey\` in the caller's shell" \
+   '[ "$DUPKEY_LEAK" = UNSET ]'
+# Round 9, P2: `_rs_norm_path` is no longer on the shipped path, but the non-vacuity mutation (m10)
+# expresses the round-6 fallback with it. Pin its presence so a future cleanup cannot quietly turn
+# m11/m12 into an assertion about an undefined command — the "mutation that cannot apply" trap.
+ck "m17 \`_rs_norm_path\` is still defined (the m10 mutation depends on it; deleting it must be deliberate)" \
+   '[ -n "$(rs_call _rs_norm_path //a/./b/)" ]'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
