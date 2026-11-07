@@ -251,22 +251,25 @@ is_transient_scratch() { # is_transient_scratch <path>
 # under the cell home: `scripts/orchestrator-harness/repo-slug.sh:486-487` calls
 # `git worktree add $HOME/wt-<slug>` "the fleet's OWN recipe" and measures 8 such trees under
 # `/tmp/cell-home/wt-*`. Those are lane scratch by this repo's own definition —
-# `scripts/pi-reap-worktrees.sh:676-682` keys `REAP_WT_SCRATCH_GLOB="wt-*|cell-wt-*"` on the BASENAME AT
-# ANY DEPTH` and says so again at `:1243-1252` — so `wt-<slug>`/`cell-wt-<slug>` as ANY path component is
-# the same fact, and the prefix-only set left the guard inert on exactly the platform #3469 is about:
+# `scripts/pi-reap-worktrees.sh:680` ships `REAP_WT_SCRATCH_GLOB="wt-*|cell-wt-*"` and `:1249-1251`
+# applies it to the BASENAME of each `git worktree list` entry — so the prefix-only set left the guard
+# inert on exactly the platform #3469 is about:
 # `--install` from `/tmp/cell-home/wt-<slug>` (candidate 1) was PINNED instead of skipped, so the pin
 # died with the lane, every tick recorded `no provisioner`, and the "can never ADD capacity" warning was
 # suppressed because a pin DID resolve — the inert enforcer, with a green install.
-# ⛔ `*/wt-?*/*`, NOT `*/wt-*/*`, AND THE DIFFERENCE IS WRITTEN DOWN HONESTLY: `?` is exactly ONE
-# character, so the only name this excludes is a bare `wt-` (no character after the dash). A directory
-# named `wt-docs` or `wt-prod` DOES match — and that is the correct answer, not an accident: these
-# patterns are `pi-reap-worktrees.sh`'s own glob (`wt-*|cell-wt-*`, matched on the basename at any
-# depth) transcribed, so a durable directory whose name begins `wt-` is deleted by that same rule and a
-# pin into it is doomed for exactly the reason this predicate exists. The trailing `/*` keeps the
-# WORKTREE ROOT itself out while matching everything a provisioner path can actually be. (An earlier
-# revision of this comment claimed `wt-docs` was excluded; measured, it is not.)
+# ⛔ `*/wt-?*/*` WAS THE FIRST ATTEMPT AND IT WAS TOO BROAD (agent-infra#3469 review, round 3). The rule
+# it claims to transcribe is a BASENAME rule applied to `git worktree list` entries —
+# `scripts/pi-reap-worktrees.sh:1249-1251` does `base="${1%/}"; base="${base##*/}"` — so a `wt-…`
+# component anywhere in the path is NOT the same fact: `/srv/wt-prod/agent-infra/tools/…` is never reaped
+# by that pass, and classifying it as lane scratch would refuse a working configuration while telling its
+# operator to use "a durable path" they already have. So the shape is recognised by the FACT the reaper
+# actually keys on: the component IS a linked worktree. `git worktree add` writes a `.git` FILE at the
+# worktree root (never a directory — that marker is what distinguishes a linked tree from a clone), so an
+# ancestor named `wt-<slug>`/`cell-wt-<slug>` that carries one is exactly a tree the reaper will delete.
+# That covers the CELL recipe (`git worktree add $HOME/wt-<slug>`, `repo-slug.sh:486-487`) without
+# swallowing a durable directory that merely starts with those letters.
 is_lane_scratch() { # is_lane_scratch <path>
-    local p="${1:-}"
+    local p="${1:-}" d
     [ -n "$p" ] || return 1
     is_transient_scratch "$p" && return 0
     p="$(printf '%s' "$p" | tr -s '/')"
@@ -275,12 +278,20 @@ is_lane_scratch() { # is_lane_scratch <path>
         /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
         /tmp/cell-wt-?*|/var/tmp/cell-wt-?*|/private/tmp/cell-wt-?*|/private/var/tmp/cell-wt-?*) return 0 ;;
         /tmp/base-?*|/var/tmp/base-?*|/private/tmp/base-?*|/private/var/tmp/base-?*) return 0 ;;
-        # the CELL lane-worktree shape, at any depth (`pi-reap-worktrees.sh`'s own basename rule)
-        */wt-?*/*|*/cell-wt-?*/*) return 0 ;;
         /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
         /var/folders/*/*/T/cell-wt-?*|/private/var/folders/*/*/T/cell-wt-?*) return 0 ;;
         /var/folders/*/*/T/base-?*|/private/var/folders/*/*/T/base-?*) return 0 ;;
     esac
+    # the CELL lane-worktree shape: an ANCESTOR that is a linked worktree named `wt-<slug>`/`cell-wt-<slug>`
+    d="${p%/*}"
+    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+        case "${d##*/}" in
+            wt-?*|cell-wt-?*)
+                # `-f`, because a linked worktree's `.git` is a FILE and a clone's is a directory
+                [ -f "$d/.git" ] && return 0 ;;
+        esac
+        case "$d" in */*) d="${d%/*}" ;; *) d="" ;; esac
+    done
     return 1
 }
 

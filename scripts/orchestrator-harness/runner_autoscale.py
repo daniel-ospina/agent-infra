@@ -2965,7 +2965,13 @@ def resolve_provisioner() -> tuple[str | None, str]:
 
 
 def provision(target_count: int, repo: str = "", root: str = "") -> str:
-    """Create/extend the install so that runners 1..target_count exist — via the ONE installer.
+    """Add AT MOST ONE install, at slot `target_count` — via the ONE installer.
+
+    ⛔ NOT A SWEEP, AND THE WORDING IS THE CONTRACT: it used to read "Create/extend the install so that
+    runners 1..target_count exist", which is the "ensure 1..N" sweep the installer explicitly refuses
+    (`tools/install-ci-runner-x64.sh` contract fact 2) because it fills slots this file's per-step
+    memory/disk re-read never budgeted — the over-fill `_next_free_slot`'s comment below describes
+    (#9639). `target_count` is a SLOT INDEX in this file's own numbering, not a count.
 
     ⛔ This file never downloads a runner binary and never builds a `config.sh` argv for a NEW
     install: download + sha256 verification + the headroom/arch guards are

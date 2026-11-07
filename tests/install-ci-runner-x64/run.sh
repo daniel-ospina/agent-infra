@@ -237,7 +237,8 @@ check "base outside the caller's root -> refusal" 2 "$rc" "why=base-outside-root
 out=$(RUNNER_AUTOSCALE_BASE=$RUNNER_ROOT/pi-runner-x64 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "base not discoverable as gh-runner* -> refusal" 2 "$rc" "why=base-not-discoverable" "$out"
 
-# 15. the root FOLLOWS the caller when only the caller's knob is set (`provision()` passes no root)
+# 15. the root FOLLOWS the caller when only the caller's knob is set (`provision()` passes it as
+# `RUNNER_AUTOSCALE_RUNNER_ROOT` in the child env — it used to pass no root at all)
 out=$(env -u RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT=$TMP/root2 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "root follows RUNNER_AUTOSCALE_RUNNER_ROOT" 0 "$rc" "root=$TMP/root2 added=1" "$out"
 

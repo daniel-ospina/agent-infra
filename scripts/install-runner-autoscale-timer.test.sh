@@ -440,7 +440,11 @@ assert_contains "$OUT" "PROVISIONER=$WT2/inst.sh" "…and that refusal names the
 # suppressed because a pin DID resolve. ⛔ FIXTURED UNDER $T, NOT UNDER /tmp: the predicate must match the
 # SHAPE (`wt-<slug>` as a path component), not one hard-coded root — a second `/tmp/...` arm would pass
 # against a prefix-only predicate and prove nothing about the deployment.
+# ⛔ THE FIXTURE IS A REAL LINKED WORKTREE, NOT MERELY A DIRECTORY WITH THE RIGHT NAME: the predicate
+# keys on the `.git` FILE `git worktree add` writes, because that is the fact `pi-reap-worktrees.sh`
+# actually reaps on (`:1249-1251` applies its glob to the basename of each `git worktree list` entry).
 CW="$T/cellfixture/wt-9307"; mkdir -p "$CW"
+printf 'gitdir: /somewhere/.git/worktrees/wt-9307\n' >"$CW/.git"
 printf '#!/bin/sh\n' >"$CW/inst.sh"; chmod +x "$CW/inst.sh"
 D="$T/cwt2b"; fresh "$D"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$CW/inst.sh" SUDO=false)
@@ -448,11 +452,24 @@ OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "a provisioner pinned at a CELL lane worktree (<cellhome>/wt-<slug>) is REFUSED (rc 1)"
 assert_contains "$OUT" "PROVISIONER=$CW/inst.sh" "…and names the value it judged"
 CWC="$T/cellfixture/cell-wt-12"; mkdir -p "$CWC"
+printf 'gitdir: /somewhere/.git/worktrees/cell-wt-12\n' >"$CWC/.git"
 printf '#!/bin/sh\n' >"$CWC/inst.sh"; chmod +x "$CWC/inst.sh"
 D="$T/cwt2c"; fresh "$D"
 ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$CWC/inst.sh" SUDO=false)
 OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 1 "…and the cell-wt-<n> spelling of the same shape is refused too"
+# ⛔ AND THE FALSE BLOCK THAT A NAME-ONLY RULE WOULD INTRODUCE (review round 3). A durable checkout whose
+# ANCESTOR happens to be called `wt-prod` is never reaped: `pi-reap-worktrees.sh` matches the BASENAME of
+# each `git worktree list` entry, and a plain directory is not one. Classifying it as lane scratch refused
+# a working configuration while telling its operator to use "a durable path" they already had.
+WTP="$T/wt-prod/agent-infra"; mkdir -p "$WTP/tools"
+printf '#!/bin/sh\n' >"$WTP/tools/install-ci-runner-x64.sh"; chmod +x "$WTP/tools/install-ci-runner-x64.sh"
+D="$T/cwt2e"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WTP/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a durable path under a 'wt-'-named ANCESTOR is NOT refused (it is not a worktree)"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$WTP/tools/install-ci-runner-x64.sh" \
+    "…and the pin is rendered, not dropped as lane scratch"
 # ⛔ AND THE *CANDIDATE* DIRECTION, WHICH NOTHING ELSE IN THIS FILE EXERCISES (review P2). Every other
 # provisioner arm sets `RUNNER_AUTOSCALE_PROVISIONER`, and A NAMED PIN IS THE WHOLE LIST — so the candidate
 # loop never runs and the `skipping LANE-SCRATCH PROVISIONER CANDIDATE` note was reachable by nothing.
@@ -460,6 +477,7 @@ assert_eq "$RC" 1 "…and the cell-wt-<n> spelling of the same shape is refused 
 # loop, this arm removes the seam AND relocates INFRA_ROOT (candidate 1 and, with no `.git`, candidate 2)
 # into a cell lane worktree, so the next durable candidate can only be `$AGENT_INFRA_PATH`.
 LANE_WT="$T/cellfixture/wt-9307-lane"; mkdir -p "$LANE_WT/scripts" "$LANE_WT/tools"
+printf 'gitdir: /somewhere/.git/worktrees/wt-9307-lane\n' >"$LANE_WT/.git"
 cp "$INST" "$LANE_WT/scripts/install-runner-autoscale-timer.sh"
 printf '#!/bin/sh\n' >"$LANE_WT/tools/install-ci-runner-x64.sh"; chmod +x "$LANE_WT/tools/install-ci-runner-x64.sh"
 DURINFRA="$T/durable-infra"; mkdir -p "$DURINFRA/tools"
