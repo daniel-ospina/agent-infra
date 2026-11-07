@@ -1074,6 +1074,12 @@ def resolve_loop_lock():
         # root we create. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
         # has no lock root yet leaves it root-owned, and every operator loop then degrades with the
         # NOTE below — tracked as its own follow-up, since the sound fixes are a chown-uid decision.
+        # Second residual, named for the same reason: `makedirs` IGNORES `mode` on a directory that
+        # already exists, so a root created by a pre-#3615 run under `umask 022` keeps its 0o1755 and
+        # is never widened — a second uid on a shared box therefore keeps degrading until that
+        # directory is recreated by hand. That is the right trade (widening a directory we did not
+        # create is exactly the bypass rejected above), and it is stated here rather than left as the
+        # one consequence of the no-chmod rule that a reader has to infer.
         # ⛔ AND NO `chmod`, ON *ANY* ROOT — not even one we create. Widening is the bypass, whichever
         # directory it happens to: with `loop.lock` writable by others, ANY local uid can create one
         # naming a live `fleet-schedule --loop` it runs, and every operator loop then refuses while
@@ -1417,8 +1423,18 @@ def claim_loop_lock():
                         except OSError:
                             pass
                         continue
-                    except OSError:
-                        pass
+                    except OSError as create_exc:
+                        # ⛔ THE DISCLOSURE MUST NAME THE ERROR THAT ACTUALLY STOPPED US. This arm is
+                        # reached when the CREATE fails, but `exc` here is still the LINK error (the
+                        # one that selected the fallback), so using it reported a misdiagnosis: a
+                        # full disk or an unwritable root was disclosed as `Operation not permitted`
+                        # — the link errno — and an operator was sent to the wrong cause on the exact
+                        # failure this fallback exists to survive. Bind the create's own exception,
+                        # and leave the `exc`-based message below to the LINK failure it describes.
+                        return _permit_without_lock(
+                            "cannot create the box lock at %s (%s: %s)"
+                            % (LOOP_LOCK, type(create_exc).__name__, create_exc)
+                        )
                     else:
                         # ⛔ PUBLISH IS NOT COMPLETE UNTIL THE FILE AT `LOOP_LOCK` IS STILL OURS.
                         # `O_EXCL` makes only the CREATE atomic; the write that follows is a window,
@@ -1448,9 +1464,12 @@ def claim_loop_lock():
                         # disclosed permit if the root stays unusable. Returning a permit straight
                         # from here would run this pass beside a scheduler that just beat us.
                         continue
-                # The lock root vanished or became unwritable under us (ENOSPC/EDQUOT/EACCES).
+                # ⛔ THIS IS THE *LINK* FAILURE, and the message says so. `errno` not in the
+                # fallback set means `os.link` itself was refused (EROFS/EACCES/ENOSPC on the link),
+                # so calling it a create failure named a syscall that never ran. The create's own
+                # failure is disclosed above, from `create_exc`.
                 return _permit_without_lock(
-                    "cannot create the box lock at %s (%s: %s)"
+                    "cannot link the box lock into place at %s (%s: %s)"
                     % (LOOP_LOCK, type(exc).__name__, exc)
                 )
             return None

@@ -4198,6 +4198,50 @@ else
   bad "19k could not build the start-time mutant (that line moved) — the mutation arm did not run"
 fi
 
+# 19aq — THE FALLBACK'S DISCLOSURE NAMES THE ERROR THAT ACTUALLY STOPPED IT. `os.link` refusing is
+# what SELECTS the `O_EXCL` fallback; the create is a SECOND syscall and can fail on its own
+# (ENOSPC/EDQUOT/EACCES). The permit message was built from the link exception in both arms, so a
+# full disk or an unwritable lock root was disclosed as the LINK's errno — measured at the pre-fix
+# head as `cannot create the box lock at … (OSError: [Errno 95] Operation not supported)` while the
+# create had actually failed with ENOSPC. An operator reading the one line this file emits on the
+# permit path was sent to the wrong cause, on the failure the fallback exists to survive (#2890).
+# Both syscalls are driven in-process so the two errnos cannot coincide.
+out19aq="$(python3 - "$SCHED" "$T/state19aq" <<'PY19AQ' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_19aq", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+os.makedirs(state, exist_ok=True)
+fs.STATE = state
+fs.LOOP_LOCK = os.path.join(state, "loop.lock")
+real_link, real_open = os.link, os.open
+def no_link(src, dst):
+    raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+def full_disk(path, flags, mode=0o777):
+    raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+os.link = no_link
+os.open = full_disk
+try:
+    verdict = fs.claim_loop_lock()
+finally:
+    os.link, os.open = real_link, real_open
+print("VERDICT", verdict)
+PY19AQ
+)"
+grep -q 'VERDICT None' <<<"$out19aq" \
+  && ok "19aq a create failure on a link-refusing root still PERMITS (the box is not left unscheduled)" \
+  || bad "19aq the create failure did not permit: $out19aq"
+grep -q 'No space left on device' <<<"$out19aq" \
+  && ok "19aq ⛔ the disclosure names the CREATE's own failure (ENOSPC), not the link's" \
+  || bad "19aq the disclosure did not name the create error (ENOSPC): $out19aq"
+grep -q 'Operation not supported' <<<"$out19aq" \
+  && bad "19aq the disclosure reported the LINK errno for a CREATE failure: $out19aq" \
+  || ok "19aq the link errno is NOT reported for a create failure (attribution is per-syscall)"
+grep -q 'cannot create the box lock' <<<"$out19aq" \
+  && ok "19aq the create path is still NAMED as the create path" \
+  || bad "19aq the create failure was not named: $out19aq"
+
 
 echo
 echo "───────────────────────────────────────────────────────────────"
