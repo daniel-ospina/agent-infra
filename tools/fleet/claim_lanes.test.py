@@ -774,13 +774,15 @@ def l30_committer_acceptance():
     # ⛔ ONE DATUM, ONE ANSWER — in the field the bounded reap is MEASURED FROM (review round 18,
     # agent-infra#3203). `claims.sh`'s `_claim_commit_time` takes the LAST `committer `-prefixed header
     # line (`sed -n '/^committer /p' | tail -n 1`, round 24), parses THAT line with
-    # `sed -n 's/^committer .*> \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — anchored on
-    # `> `, the IDENT's end, so the accepted stamp is the field git reads and a second `digits +dddd`
-    # tail cannot forge it (round 22) — NOTHING may follow the tz digits — and then rejects a stamp
-    # longer than 12 digits as UNMEASURABLE
-    # (`case … |?????????????*`), which is what keeps `now - ct` out of a wrapped negative. This
-    # reader allowed `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and
-    # a fresh/aged stamp here.
+    # `sed -n 's/^committer .*>[[:blank:]]*\([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p'`
+    # — anchored on the LAST `>` (the IDENT's split point, NOT the first `<`…`>` span) plus git's own
+    # blank class, so the accepted stamp is the field git reads and a second `digits +dddd` tail cannot
+    # forge it (rounds 22, 27, 28; a bare `> ` abstains on `>  1 +0000`, `>1 +0000` and `>\t1 +0000`,
+    # which git dates 1 — the REAP-turned-HOLD that A93–A95 exist to pin) — NOTHING may follow the tz
+    # digits — and then rejects a stamp longer than 12 digits as UNMEASURABLE (`[ "${#ct}" -le 12 ]`, a
+    # separate arm), which is what keeps `now - ct` out of a wrapped negative. This reader allowed
+    # `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and a fresh/aged
+    # stamp here.
     def obj(headers, body="claim owner=c lease_until=9999999999 nonce=x"):
         # a commit object is `<headers>\n\n<body>`; `_commit_time` reads the header block only
         return "tree " + "0" * 39 + "\n" + headers + "\n\n" + body + "\n"
@@ -791,7 +793,7 @@ def l30_committer_acceptance():
         (ok + "\t", None),
         ("committer a <a@b> 17000000000 +0000", 17000000000),   # 11 digits: accepted by both
         ("committer a <a@b> 170000000000 +0000", 170000000000), # 12 digits: still accepted
-        ("committer a <a@b> 1700000000000 +0000", None),        # 13+ ⇒ `?????????????*`: UNMEASURABLE
+        ("committer a <a@b> 1700000000000 +0000", None),        # 13+ ⇒ `[ ${#ct} -le 12 ]`: UNMEASURABLE
         # ⛔ THE THIRD REJECTION ARM (review round 20): `_claim_commit_time` also rejects `0?*`, because a
         # leading-zero operand aborts `$(( now - ct ))` as OCTAL. Round 19 added the arm here and no case
         # pinned it — a mutant that deletes it left the whole suite green.
