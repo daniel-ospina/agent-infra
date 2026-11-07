@@ -437,6 +437,35 @@ test("says what it could NOT see: the prompt, i.e. which failed dispatch was the
     "a gate that reads a spawn RESULT must not claim to know the dispatch's intent");
 });
 
+test("names the VERB the ledger actually holds — a task_status-only ledger is not told a `task` dispatch was attempted (#3155)", () => {
+  // #3155 turned a literal into a false claim: a TERMINAL `task_status` reap can be the ledger's
+  // only row, and every headline arm used to assert "a `task`/`subagent` dispatch WAS ATTEMPTED" —
+  // a dispatch this gate never observed (#2349: a refusal says what it read).
+  const statusOnly: SpawnAttempt[] = [{ tool: "task_status", outcome: "cut", evidence: "killed=true reason=cut" }];
+  const t = render(statusOnly);
+  const headline = t.split("\n")[1]; // the fault-class sentence; the ATTEMPTS list below it is the raw ledger
+  ok(/a `task_status` dispatch WAS ATTEMPTED/.test(headline), `the observed verb is named: ${headline}`);
+  ok(!/`task`\/`subagent`/.test(headline), "and the verbs it did NOT observe are not asserted");
+
+  // The derived form is not a licence to invent one: an unknown tool falls back to the generic
+  // noun IN THE CLAIM. (The ATTEMPTS list still prints the producer's own tool name verbatim —
+  // that is the ledger, not a claim about it.)
+  const unknownTool: SpawnAttempt[] = [{ tool: "some-future-tool", outcome: "cut", evidence: "x" }];
+  const u = render(unknownTool);
+  const unknownHeadline = u.split("\n")[1];
+  ok(/a sub-agent dispatch WAS ATTEMPTED/.test(unknownHeadline), `unrecognised verb ⇒ generic noun: ${unknownHeadline}`);
+  ok(!/some-future-tool/.test(unknownHeadline), "an unknown tool name is never asserted as the dispatch that was attempted");
+
+  // POSITIVE CONTROL: a ledger holding two observed verbs still names both.
+  const mixed: SpawnAttempt[] = [
+    { tool: "task", outcome: "cut", evidence: "killed=true reason=cut" },
+    { tool: "task_collect", outcome: "failed", evidence: "status=failed" },
+  ];
+  const m = render(mixed);
+  // SORTED, so the sentence is stable regardless of the order the ledger recorded them in.
+  ok(/a `task_collect`\/`task` dispatch WAS ATTEMPTED/.test(m.split("\n")[1]), `both observed verbs are named: ${m.split("\n")[1]}`);
+});
+
 test("does not claim the reviewer IDENTITY it cannot see (the review of #2665 caught this)", () => {
   const t = render(ATTEMPTS);
   // The gate reads a spawn RESULT, not its prompt. "A reviewer WAS dispatched" is a claim about

@@ -154,11 +154,73 @@ SH
 d="$(cd "$(dirname "$0")" && pwd)"
 if [ "$1" = api ] && [ "$2" = -i ]; then
   shift 2
+  printf '%s\n' "$*" >> "$d/gh.argv"
   out="$("$d/gh.body" api "$@" 2>"$d/.gh.err")"; rc=$?
   [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
   rm -f "$d/.gh.err"
   [ "$rc" -eq 0 ] || exit "$rc"
   printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n%s\n' "$out"
+  exit 0
+fi
+exec "$d/gh.body" "$@"
+SH
+  chmod +x "$d/bin/gh"
+  shell_valid "$d/bin/gh"
+}
+
+# mk_gh_sat <case-dir> — a `gh` stub whose TIER listings answer a FULL page (100 rows) with a
+# `link: … rel="next"` header, so `rest_list` ends the window FULL with more still advertised and sets
+# `REST_WINDOW_FILLED=1` — the exact condition the `.pool-sat` writer records.
+# ⛔ EVERY ROW CARRIES AN ASSIGNEE, so the shared `POOL_JQ` drops all of them: the POOL stays empty (the
+# reorder is not what §7 grades) while the WINDOW is genuinely truncated. The URL decides whether the
+# Link header is sent — only `labels=` listings are tiers; `/issues?` keeps its no-Link shape so the
+# reaper's `.open_iss` read is not turned into a spurious "0 rows but a next page" refusal.
+# ⛔ The bodies are DELIBERATELY quoted heredocs (`<<'SH'`) and derive `d` from `$0`, so nothing is
+# interpolated: this file's own header warns that an interpolating heredoc can serve empty bodies while
+# still parsing. §7 grades a WRITER, so a stub bug must redden an assertion, never silently write nothing.
+mk_gh_sat() {
+  local d="$1"
+  cat > "$d/bin/gh.body" <<'SH'
+#!/bin/bash
+# ⛔ THE CASE DIR IS THE PARENT OF bin/ (the wrapper in bin/ sets ITS `d` to bin/). Deriving it as
+# `dirname "$0"` here pointed `core` at bin/core: the budget then read 0 and the pass refused
+# "remaining=0 cannot buy one candidate", which reddened the positive case for a fixture reason.
+d="$(cd "$(dirname "$0")/.." && pwd)"
+charge() { local c; c="$(cat "$d/core")"; c=$(( c - $1 )); [ "$c" -lt 0 ] && c=0; printf '%s' "$c" > "$d/core"; }
+rows_page() {  # 100 ASSIGNED rows: POOL_JQ drops every one, so only the WINDOW is exercised
+  local i out="["
+  for i in $(seq 1 100); do
+    [ "$i" -gt 1 ] && out="$out,"
+    out="$out{\"number\":$((500+i)),\"title\":\"assigned $i\",\"assignees\":[{\"login\":\"someone\"}]}"
+  done
+  printf '%s]' "$out"
+}
+case "$*" in
+  "auth token") exit 0 ;;
+  "api rate_limit") printf '{"resources":{"core":{"remaining":%s},"graphql":{"remaining":4990}}}\n' "$(cat "$d/core")" ;;
+  *"labels=P0-blocker"*|*"labels=P1-severe"*|*"labels=P2-moderate"*) charge 1; rows_page ;;
+  *"/pulls?"*) charge 1; printf '[]\n' ;;
+  *"/issues?"*) charge 1; printf '[]\n' ;;
+  *) printf '[]\n' ;;
+esac
+SH
+  chmod +x "$d/bin/gh.body"
+  shell_valid "$d/bin/gh.body"
+  cat > "$d/bin/gh" <<'SH'
+#!/bin/bash
+d="$(cd "$(dirname "$0")" && pwd)"
+if [ "$1" = api ] && [ "$2" = -i ]; then
+  shift 2
+  printf '%s\n' "$*" >> "$d/gh.argv"
+  out="$("$d/gh.body" api "$@" 2>"$d/.gh.err")"; rc=$?
+  [ -s "$d/.gh.err" ] && cat "$d/.gh.err" >&2
+  rm -f "$d/.gh.err"
+  [ "$rc" -eq 0 ] || exit "$rc"
+  # The `-i` framing, with a `Link` header on TIER listings ONLY (a tier is the query that carries
+  # `labels=`). Emitted by separate printf calls so the escapes are the FORMAT's, not -v's.
+  printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n'
+  case "$*" in *labels=*) printf 'link: <https://api.github.com/x?page=2>; rel="next"\r\n' ;; esac
+  printf '\r\n%s\n' "$out"
   exit 0
 fi
 exec "$d/gh.body" "$@"
@@ -380,6 +442,132 @@ case "$OUT" in
   *"could not be read"*) ok "no-probe: the unreadable budget is REPORTED, not silently assumed" ;;
   *) bad "no-probe: the unreadable budget is not reported — output: $OUT" ;;
 esac
+
+# ── 6) EVERY TIER WINDOW IS ASKED OLDEST-FIRST (agent-infra#2019, review cycle 1 P1) ───────────#
+# ⛔ WHY THIS ARM EXISTS. The provider's default order is created-DESCENDING, so an unqualified
+# `--limit N` keeps the NEWEST N. The pool ranks AGE-SECOND (oldest-first inside a tier) and, since
+# #2019, the queue's ORDER is derived from `.pool` — so an unsorted window made the oldest queued
+# members of an over-capacity tier read as "unranked" and pinned them to the TAIL on every pass,
+# forever, while the pass still claimed `severity-first`. The tier IS over capacity in production
+# (open `P2-moderate` 450 against the 200 bound, 2026-11-05), so this is the live shape, not a
+# hypothetical. Asking oldest-first makes truncation lose the NEWEST members — the end the ranking
+# does not need, and the one that makes the unranked TAIL the ordering `age-second` actually asks for.
+# This pins the QUESTION the helper puts to the provider — a stub cannot emulate the provider's order,
+# so pinning the returned rows would prove nothing. The complementary half — that pool-unranked rows
+# land at the TAIL in queue order — is pinned in `rank-queue.test.sh`.
+# ⛔ THIS ARM'S COMMENT PROSE TRIPPED A GUARD ONCE. A reviewer measured this file REFUSED before its
+# first assertion with an unpaired parenthesis in the comment above, and 28/0 with it removed; on this
+# box the refusal then outlived the removal and is keyed to this file's PATH rather than its bytes — the
+# same bytes under another name run 28/0 (agent-infra#3528). Recorded here so the next lane does not
+# read the refusal as this suite failing.
+mk_case order-dir 1000   # the reserve is 300: a 100-call budget refuses before the pool is built
+mk_gh "$D" "$(rows 6)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+for _tier in P0-blocker P1-severe P2-moderate; do
+  _url="$(grep -F "labels=$_tier" "$D/bin/gh.argv" 2>/dev/null | head -1)"
+  if [ -z "$_url" ]; then
+    bad "tier-order: no listing was made for $_tier at all (the assertion below would pass by vacuity)"
+    continue
+  fi
+  case "$_url" in
+    *"sort=created"*)  ok "tier-order: $_tier is asked with sort=created" ;;
+    *) bad "tier-order: $_tier listing has no sort=created — the window keeps the NEWEST rows, the opposite end from the pool's oldest-first rank: $_url" ;;
+  esac
+  case "$_url" in
+    *"direction=asc"*) ok "tier-order: $_tier is asked direction=asc (the window keeps the OLDEST, so truncation loses the newest)" ;;
+    *) bad "tier-order: $_tier listing has no direction=asc — a truncated tier would lose its OLDEST members: $_url" ;;
+  esac
+done
+
+# ── 7) A CLIPPED TIER WINDOW IS RECORDED BY THE WRITER, NOT ONLY READ BACK (review cycle 36, P2) ──
+# ⛔ WHY THIS ARM EXISTS — MEASURED, NOT IMAGINED. The `.pool-sat` READER and its SANITISER are pinned in
+# `rank-queue.test.sh` §14b/§14c, but those cases HAND-WRITE the fixture (`printf 'P1-severe\n' >
+# …/.pool-sat`), so they grade the consumer. Deleting the three `>> "$O/.pool-sat"` lines from the SHIPPED
+# tier block left `rank-queue` at 106/0 and this suite at 28/0 — i.e. the ONLY disclosure this change has
+# for the cross-tier truncation residual (a clipped `P1` landing behind every ranked `P2`) could go inert
+# without a single red, while the order line went on printing a clean `severity-first`. A signal whose
+# producer is untested is a signal that can vanish quietly; that is this repo's "an enforcer whose red path
+# has never been executed" class.
+# This arm drives the shipped tier block: a FULL page with `rel="next"` is exactly `REST_WINDOW_FILLED=1`.
+mk_case sat-writer 1000
+mk_gh_sat "$D"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+# ⛔ ONE ASSERTION PER TIER, NOT ONE FOR THE SET (review cycle 37, P2 — MEASURED). Matching only
+# `*P0-blocker*` left the OTHER TWO writer lines deletable-green: removing just the `P1-severe` line from
+# the shipped script gave this suite 31 passed, 0 failed, and `rank-queue` stayed 106/0 (its §14b/§14c
+# hand-write the fixture). `P2-moderate` is the tier this suite itself documents as over capacity in
+# production (450 open against a 200 window), so an ungraded P2 line is the one that matters most.
+# #3481's standard is one named mutant per new assertion; a single wildcard match cannot satisfy it.
+SAT="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+for _satt in P0-blocker P1-severe P2-moderate; do
+  case "$SAT" in
+    *"$_satt"*) ok "truncation-writer: $_satt is RECORDED in .pool-sat for a FULL window with a next page still advertised" ;;
+    *) bad "truncation-writer: .pool-sat does NOT name $_satt (got '${SAT:-<absent>}') — that tier's writer line can be deleted green, so the windows=TRUNCATED() disclosure loses that tier silently" ;;
+  esac
+done
+# ⛔ NON-VACUITY, PER WRITER LINE: delete ONE tier's writer from a copy of the SHIPPED script and the
+# assertion for THAT tier must be the one that reddens. A single "delete all three" mutation cannot
+# satisfy this — it deletes whatever remains, so a pre-deleted line just shrinks the deletion set and the
+# mutant's record still comes out empty, which the old arm read as "the writer is what produces it".
+for _satt in P0-blocker P1-severe P2-moderate; do
+  mk_case "sat-writer-mut-$_satt" 1000
+  mk_gh_sat "$D"
+  mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+  MUT_SAT="$T/mut-sat-$_satt/refresh-candidates.sh"; mkdir -p "$T/mut-sat-$_satt"
+  sed "s|\[ \"\${REST_WINDOW_FILLED:-0}\" = \"1\" \] && echo \"$_satt\" >> \"\\\$O/\\.pool-sat\"||" \
+    "$REFRESH" > "$MUT_SAT"
+  if cmp -s "$REFRESH" "$MUT_SAT" 2>/dev/null; then
+    bad "truncation-writer: the $_satt writer-deletion mutation did not apply — the sed anchor drifted, so the non-vacuity check for that tier would pass by vacuity"
+    continue
+  fi
+  REFRESH_SAVED="$REFRESH"
+  REFRESH="$MUT_SAT"; rf "$D" refresh; REFRESH="$REFRESH_SAVED"
+  MUT_SAT_REC="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+  # ⛔ ABSENCE IS NOT EVIDENCE — AND THIS ARM HAD THE EXACT HOLE IT FIXES FOUR LINES BELOW (review cycle 38,
+  # P2 — MEASURED). Asserting only "the mutated tier is absent" passed on a mutant that produced NOTHING:
+  # replacing the `sed` above with `printf '#!/bin/bash\nexit 7\n' > "$MUT_SAT"` — a script that mutates
+  # nothing and writes no `.pool-sat` — still gave 35 passed, 0 failed, with all three arms reporting
+  # "deleting ONLY the X writer line removes X". A mutant that never ran is indistinguishable from a writer
+  # that really was the producer, which is the one thing these arms exist to tell apart. So the mutant's pass
+  # must COMPLETE and its record must still name the two tiers it did NOT mutate: the survivors are the
+  # witness that a record was produced at all, and the third is the tier whose line was deleted.
+  _satsurv=1
+  [ "$RC" -eq 0 ] || { _satsurv=0; bad "truncation-writer: the $_satt mutant's pass did not complete (rc=$RC) — 'removes $_satt' would then hold on a pass that wrote nothing: $OUT"; }
+  for _sat_other in P0-blocker P1-severe P2-moderate; do
+    [ "$_sat_other" = "$_satt" ] && continue
+    case "$MUT_SAT_REC" in
+      *"$_sat_other"*) ;;
+      *) _satsurv=0; bad "truncation-writer: deleting ONLY the $_satt writer line also dropped $_sat_other (got '${MUT_SAT_REC:-<absent>}') — the mutant produced nothing, so 'removes $_satt' would grade an empty file rather than the writer" ;;
+    esac
+  done
+  case "$MUT_SAT_REC" in
+    *"$_satt"*) bad "truncation-writer: with the $_satt writer DELETED the record still names it ('$MUT_SAT_REC') — the fixture, not that writer line, is producing it" ;;
+    *) if [ "$_satsurv" -eq 1 ]; then ok "truncation-writer: deleting ONLY the $_satt writer line removes $_satt from .pool-sat while the other two tiers SURVIVE (each of the three writers is graded, not just the set)"; fi ;;
+  esac
+done
+# And the NEGATIVE: an ordinary short listing (no full window, no next page) records NOTHING, so the
+# clause cannot appear on the routine path where no tier was clipped.
+# ⛔ AND THE ABSENCE IS GATED ON THE PASS HAVING ACTUALLY LISTED (review cycle 37, P2 — MEASURED). Asserting
+# only "`.pool-sat` is absent" passed on a REFUSED pass: with the case budget dropped to 20 the pass refused
+# at the core-reserve gate (`remaining=0 cannot buy one candidate`), made ZERO `labels=` listings, and the
+# arm still reported "the clause is not emitted for a tier that fit" — absence of evidence read as evidence.
+# §6 above already sets this precedent (`tier-order: no listing was made for $_tier at all (the assertion
+# below would pass by vacuity)`); this arm had no equivalent.
+mk_case sat-writer-none 1000
+mk_gh "$D" "$(rows 2)"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+NEG_OK=1
+[ "$RC" -eq 0 ] || { NEG_OK=0; bad "truncation-writer: the unsaturated case's pass did not complete (rc=$RC) — the absence assertion below would pass without a pass: $OUT"; }
+if ! grep -q 'labels=' "$D/bin/gh.argv" 2>/dev/null; then
+  NEG_OK=0; bad "truncation-writer: the unsaturated case made NO tier listing at all — 'no .pool-sat' would pass by vacuity rather than because the window fit"
+fi
+if [ "$NEG_OK" -eq 1 ]; then
+  [ ! -s "$D/o/.pool-sat" ] && ok "truncation-writer: an UNSATURATED listing (tier listings made, pass complete) writes no .pool-sat (the clause is not emitted for a tier that fit)" \
+                            || bad "truncation-writer: .pool-sat exists for an unsaturated listing ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the signal would fire on every pass and stop meaning anything"
+fi
 
 echo
 echo "  $PASS passed, $FAIL failed"

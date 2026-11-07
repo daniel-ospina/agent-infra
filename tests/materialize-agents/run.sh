@@ -924,6 +924,38 @@ done
 #   * a heading written as a list item is not detected — under-detection
 #   * a consumer that overrides MD026's `punctuation` is not modelled
 #   * non-ASCII final characters are reported (awk has no Unicode properties)
+#
+# ⛔ PORTABILITY, MEASURED: the ATX test below is TWO patterns, not
+# `/^#{1,6}([ \t]|$)/`. mawk — the `awk` on ubuntu-latest, i.e. this suite's own CI
+# runner — PANICS on that pattern:
+#   REcompile() - panic: values still on machine stack for ^#{1,6}([ \t]|$)
+#   (exit 100)
+# so the scan could not run at all and this gate reported `NOT a clean result` on a
+# healthy tree for EVERY pull request. The split form below is equivalent to the
+# original and both awks accept it.
+#
+# The trigger is NOT the `$` and NOT the alternation: it is an INTERVAL EXPRESSION
+# ({m} {m,} {,n} {m,n}) IMMEDIATELY FOLLOWED BY AN OPENING PARENTHESIS. Measured in mawk
+# 1.3.4 with `echo ab | mawk -v re=… 'BEGIN{r=re} $0 ~ r'`:
+#   PANIC rc=100   ^a{1,6}(b)   ^a{1,}(b)   ^a{,6}(b)   ^a{2}(b)   ^{1,6}(b)   a{1,6}(b)
+#   FINE  rc=0     ^a{1,6}$   ^a{1,6}[bc]   (a{1,6})(b)   ^a{1,6} (b)   ^a+(b)
+# Interval-then-`(` is NECESSARY BUT NOT SUFFICIENT — measured, the group body must also be
+# non-empty and not reducible to optional, so these are FINE despite matching the shape:
+#   FINE  rc=0     ^a{1,6}()   ^a{1,6}(|)   ^a{1,6}(|b)   ^a{1,6}(b|)   ^a{1,6}(())
+# So do NOT read this as a mawk grammar law and do not "explain" a panic from it: the
+# mechanism is mawk's business, and a rule narrower than reality has already cost two
+# review rounds here. What a maintainer needs is only this:
+#   (i)  `^a{1,6}$` is FINE while `^a{1,6}(b)` dies — never "fix" a panic by deleting `$`;
+#   (ii) if the panic is real it FAILS CLOSED anyway (`md026_rc -ne 0` is a hard `fail`,
+#        never an empty stdout read as clean), so the cost of a re-introduction is a red
+#        gate, not a false PASS; and
+#   (iii) any `{…}` followed by `(` is suspect until BOTH awks agree — run the check below.
+#
+# Verify any rewrite against BOTH awks over the same input; the two must agree on
+# every line, and mawk must not print an REcompile panic:
+#   printf '## H.\n' | mawk '{ if ($0 ~ /^#{1,6}[ \t]/ || $0 ~ /^#{1,6}$/) print "ok" }'
+#   printf '## H.\n' | gawk '{ if ($0 ~ /^#{1,6}([ \t]|$)/)                 print "ok" }'
+#
 # The safe set is ASCII alphanumerics plus `_` `)` `?`, a backtick, and `*`.
 # If a legitimate heading trips this, widen the set in `md026_scan` — do NOT
 # narrow the class of reported characters back into a deny-list.
@@ -955,7 +987,9 @@ md026_scan() {
 
         t = substr(line, ind + 1)
         while (t ~ /^>/) sub(/^>[ \t]?/, "", t)
-        if (t ~ /^#{1,6}([ \t]|$)/) {
+        # TWO patterns, never `/^#{1,6}([ \t]|$)/` — mawk panics on that (see the
+        # portability note in the header of this file). Equivalent, and portable.
+        if (t ~ /^#{1,6}[ \t]/ || t ~ /^#{1,6}$/) {
           sub(/^#{1,6}[ \t]*/, "", t)
           sub(/[ \t]+#+[ \t]*$/, "", t)       # closing sequence is not heading text
         } else {

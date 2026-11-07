@@ -891,6 +891,118 @@ grep -q 'attempt 2' "$TMP/gate-429-out" \
   && pass "  …and stdout of the retried attempt is what the caller sees" \
   || fail "  …but the retried attempt's stdout was lost: $(cat "$TMP/gate-429-out")"
 
+# (c2) THE BUDGET LINE (#gh-quota). A refusal is the ONE moment the gate KNOWS the account
+#      is at zero, and that knowledge used to die with the process: the next beat saw a rail
+#      exit 1 and read it as a PRODUCT fault (2026-11-03 — `gh run list` 403 for user id
+#      81560491 while ~20 lanes each suspected their own PR). The window the gate already
+#      writes to `cooldown.*` IS the budget, so it is published in ONE cheap read: no API
+#      call, and no second predicate — `remaining=0` means exactly "this gate is holding the
+#      box out of calls until resets_at".
+GDIR="$(gate_dir budgetline)"; rm -f "$TMP/gate-budget-count"
+GREAL="$TMP/gate-real-budget"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+echo "API rate limit exceeded for user ID 12345." >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_NO_WAIT=1 GCOUNT="$GCOUNT" \
+  bash "$SHIM" api graphql -f query=x >/dev/null 2>&1
+if [ -f "$GDIR/budget" ] && grep -qE '^GH-BUDGET\(remaining=0, resets_at=[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z\)$' "$GDIR/budget"; then
+  pass "a refusal publishes the budget in one cheap read: $(cat "$GDIR/budget")"
+else
+  fail "no readable budget line after a refusal: $(cat "$GDIR/budget" 2>/dev/null || echo '<absent>')"
+fi
+# ⛔ AND IT MUST NOT OUTLIVE ITS WINDOW. A stale `remaining=0` is a lie the next beat acts on,
+# so the reader that prunes expired windows prunes this too.
+_until=$(( $(date +%s) * 1000 - 5000 ))
+# The FIRST call's refusal left a LIVE 60 s window; clear it, so this arm tests the
+# expired-window path rather than "some other window is still running".
+rm -f "$GDIR"/cooldown.*
+printf '%s\n' "$_until" > "$GDIR/cooldown.$_until.$$"
+printf '%s\n' 'GH-BUDGET(remaining=0, resets_at=2026-01-01T00:00:00Z)' > "$GDIR/budget"
+# The two files travel together: `budget.until` is the deadline the line was written
+# for, and it is what decides removal (a glob snapshot of `cooldown.*` cannot).
+printf '%s\n' "$_until" > "$GDIR/budget.until"
+# A call that SUCCEEDS: a refusal here would legitimately write a NEW window (and its
+# budget line), which would make the assertion below vacuous.
+GOK="$TMP/gate-real-ok"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$GOK"; chmod +x "$GOK"
+AGENT_GH_REAL="$GOK" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_NO_WAIT=1 AGENT_GH_GATE_RETRY_MAX=1 \
+  bash "$SHIM" api user >/dev/null 2>&1
+[ -f "$GDIR/budget" ] \
+  && fail "a budget line outlived its window — the next beat would read remaining=0 as current" \
+  || pass "  …and it is removed once no window is live (a stale remaining=0 cannot be read as current)"
+
+# ⛔ AND THE PROTECTIVE HALF: a budget line whose OWN deadline is still in the future
+# must SURVIVE a read that sees no live `cooldown.*` file. That is the stale-glob case
+# the prune's `budget.until` check exists for; without this arm, reverting to "delete
+# whenever the glob shows nothing" would keep the suite green.
+GDIR="$(gate_dir budgetkeep)"
+rm -f "$GDIR"/cooldown.* "$GDIR/budget" "$GDIR/budget.until"
+_future=$(( $(date +%s) * 1000 + 600000 ))
+printf '%s\n' "$_future" > "$GDIR/budget.until"
+printf '%s\n' "GH-BUDGET(remaining=0, resets_at=2030-01-01T00:00:00Z)" > "$GDIR/budget"
+GOK2="$TMP/gate-real-ok2"
+printf '#!/usr/bin/env bash\nexit 0\n' > "$GOK2"; chmod +x "$GOK2"
+AGENT_GH_REAL="$GOK2" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_NO_WAIT=1 bash "$SHIM" api user >/dev/null 2>&1
+[ -f "$GDIR/budget" ] \
+  && pass "  …and a line whose OWN deadline is still ahead SURVIVES a read with no live cooldown.* (the prune reads budget.until, not a glob snapshot)" \
+  || fail "a live budget line was deleted because no cooldown.* file was visible — the prune is reading a stale glob"
+
+# ⛔ AND THE PRIMARY/SECONDARY DISTINCTION MUST BE PINNED, not merely implemented: the
+# positive arm above passes whether or not `budget_signature` exists, so without this
+# arm the whole "only the BUDGET publishes remaining=0" claim could be deleted and the
+# suite would stay green (measured: a secondary refusal at `used: 541` of 5000 would
+# then publish remaining=0).
+GDIR="$(gate_dir budgetsecondary)"; rm -f "$TMP/gate-secondary-count"
+GREAL="$TMP/gate-real-secondary"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+echo "You have exceeded a secondary rate limit. Please wait a few minutes before you try again." >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_NO_WAIT=1 \
+  bash "$SHIM" api graphql -f query=x >/dev/null 2>&1
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && pass "  …a SECONDARY/concurrency refusal still parks the box (the shared window is written)" \
+  || fail "  …a secondary refusal wrote no shared window — the gate stopped pacing"
+[ -f "$GDIR/budget" ] \
+  && fail "a SECONDARY-limit refusal published GH-BUDGET(remaining=0) — the account's budget was not measured" \
+  || pass "  …but it does NOT publish remaining=0: a concurrency limit is not budget exhaustion"
+
+# ⛔ THE MEASURED SECONDARY SPELLING, which no arm pinned: GitHub's concurrency refusal is
+# "API rate limit ALREADY exceeded for user ID …" — the phrase this fleet has recorded as
+# SECONDARY (`gh-limit.py` SECONDARY_PHRASES, `pr-doctor.py`, `docs/ops/gh-rate-limits.md`:
+# "while the primary counter reads healthy", measured at 4999/5000). A `budget_signature`
+# that treats `already` as an optional part of the PRIMARY phrase publishes exhaustion on
+# it — the exact misdiagnosis the line exists to prevent.
+GDIR="$(gate_dir budgetsecondary2)"; rm -f "$TMP/gate-secondary2-count"
+GREAL="$TMP/gate-real-secondary2"
+cat > "$GREAL" <<'GHEOF'
+#!/usr/bin/env bash
+echo "GraphQL: API rate limit already exceeded for user ID 81560491." >&2
+exit 1
+GHEOF
+chmod +x "$GREAL"
+AGENT_GH_REAL="$GREAL" AGENT_GH_GATE_DIR="$GDIR" AGENT_GH_GATE_INTERVAL_MS=0 \
+  AGENT_GH_GATE_NO_WAIT=1 \
+  bash "$SHIM" api graphql -f query=x >/dev/null 2>&1
+# The POSITIVE half: it must still be recognised as a rate limit (a shared window, i.e.
+# pacing preserved). Without this, an implementation that stopped matching the spelling
+# AT ALL would pass the absence assertion below while pacing nothing.
+ls "$GDIR"/cooldown.* >/dev/null 2>&1 \
+  && pass "  …and it is still PACED (the shared window is written): classified secondary, not unclassified" \
+  || fail "  …not recognised as a rate limit at all — the absence assertion below proves nothing"
+[ -f "$GDIR/budget" ] \
+  && fail "the MEASURED secondary spelling ('already exceeded for user ID') published remaining=0 — a healthy primary budget was reported as exhausted" \
+  || pass "  …and the MEASURED secondary spelling ('already exceeded for user ID') does not publish it either"
+
 # (d) NO `retry-after` → the documented >=60 s, not an immediate retry. A 60 s sleep cannot
 #     be waited out in a suite, so this pins the ANNOUNCED wait (the number the gate would
 #     sleep) by intercepting the call after the announcement: the shim is stopped while it

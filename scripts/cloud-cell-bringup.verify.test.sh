@@ -265,28 +265,76 @@ sed '/^case ".*1:-status.*in$/,$d' "$SUP" > "$SUPLIB"
 grep -q '^start_doctor_loop()' "$SUPLIB" && ! grep -q '^  merge)' "$SUPLIB" \
   || bad "fixture: could not load the shipped supervisor functions"
 cp "$HERE/orchestrator-harness/cloud-cell-doctor.sh" "$T/"   # so doctor_path() finds a shipped doctor
-mkdir -p "$T/o6/state/roles" "$T/stub6"
+# ⛔ THE FOREIGN DIR MUST **EXIST** FOR THIS ARM TO MEAN ANYTHING (#2315). The case asserts the
+# REFUSAL branch, and that branch is selected by `doctor_session_orphaned_foreign()`: a foreign
+# session whose named state dir does NOT exist is a DEAD peer (a retired pin root / removed cell
+# home), and since 6b6daa49 the supervisor REPLACES it deliberately rather than dying — with no way
+# to clear a dead one, `start` could never succeed again. So the peer state dir created below must
+# EXIST here: it does, therefore the supervisor must refuse and print the remedy. The fixture used
+# to hard-code the path /other/cell/orchestrator and never create it, which put the arm on the
+# pre-#2315 branch and made it red on a correct supervisor.
+#
+# ⛔ KEEP THE APOSTROPHES IN THIS BLOCK PAIRED — WITHIN ONE LINE. `main-worktree-guard` tokenises a
+# script it must read, splitting command segments on a newline only outside a quote
+# (`_wtCommandSegments`, extensions/main-worktree-guard/index.ts): a single-quote or double-quote
+# character TOGGLES the quoting state. An UNPAIRED one therefore turns quoting on and merges the rest
+# of the file into one quoted run, so a command after it can no longer be resolved statically and the
+# guard fails closed BEFORE executing it — a lane asked to re-verify #3514 gets a refusal instead of a
+# result. A pair is harmless, and this block carries several (the heredoc tag, the FOREIGN_O default,
+# the cell-doctor argument — each quoted); a pair that STRADDLES a newline is not harmless, because
+# that newline is inside the quote and two command segments merge. The rule is pairing, not absence:
+# this comment used to say "NO APOSTROPHES IN THIS BLOCK" over a block holding eight of them, which
+# is the kind of prose a reader acts on. (These comment lines are part of the text the tokeniser
+# reads, so an unpaired apostrophe HERE counts too — which is why this paragraph names no quoted
+# token and contains none.)
+#
+# Note what does NOT discriminate here: the "message carries the state dir" arm is
+# content-sensitive (it reddens when the message stops naming the dir) but it is green on BOTH
+# branches, because `doctor_session_orphaned_foreign()` and the refusal `die` print the same
+# `doctor_session_state_dir` parse. Branch discrimination is carried by the rc, the remedy-text and
+# the killed-nothing arms below.
+mkdir -p "$T/o6/state/roles" "$T/stub6" "$T/peer6"
 cat > "$T/stub6/tmux" <<'EOF'
 #!/bin/sh
 case "$1" in
   has-session) exit 0 ;;
-  list-panes) echo "bash -c O='/other/cell/orchestrator' exec cell-doctor"; exit 0 ;;
+  list-panes) echo "bash -c O='${FOREIGN_O:?}' exec cell-doctor"; exit 0 ;;
   kill-session) echo "KILLED $*" >> "${TMUX_STUB_LOG:-/dev/null}"; exit 0 ;;
 esac
 exit 0
 EOF
 chmod +x "$T/stub6/tmux"
-OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6" OR=daniel-ospina/tortoise \
+OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6" FOREIGN_O="$T/peer6" OR=daniel-ospina/tortoise \
         O="$T/o6" HOME="$T" CELL_HOME="$T" ENV_FILE="$T/keys6.env" \
         bash -c '. "$1"; start_doctor_loop' _ "$SUPLIB" 2>&1 )"; RC=$?
 [ "$RC" -ne 0 ] && ok "red/fatal: a FOREIGN doctor session -> REFUSED (rc=$RC)" \
                || bad "a foreign doctor session was accepted (rc=$RC): $OUT"
 case "$OUT" in *"tmux kill-session -t 'cell-doctor'"*) ok "message carries the exact remedy (tmux kill-session -t …)" ;;
                 *) bad "message does not carry the remedy — $OUT" ;; esac
-case "$OUT" in *"/other/cell/orchestrator"*) ok "message carries the state dir it belongs to" ;;
+case "$OUT" in *"$T/peer6"*) ok "message carries the state dir it belongs to" ;;
                 *) bad "message does not name the owning state dir — $OUT" ;; esac
 [ -s "$T/kills6" ] && bad "message-only: the supervisor KILLED the foreign session" \
                   || ok "message-only: nothing was killed (the remedy is printed, never executed)"
+
+# ⛔ AND THE OTHER BRANCH OF THE SAME PREDICATE IS DRIVEN HERE, BECAUSE THIS FIX MOVED THE ARM OFF IT.
+# The refusal above is selected by `doctor_session_orphaned_foreign()` returning nothing, i.e. the
+# foreign dir EXISTS. The complement — a foreign session whose named state dir is GONE — is the #2315
+# ruling: the supervisor REPLACES it, because with no way to clear a dead one, `start` could never
+# succeed again. Pinning only the refusal left that behaviour with no arm: a regression making the
+# dead-peer case fatal again would have left both this suite and the supervisor suite green
+# (cloud-cell-supervisor.test.sh pins the PREDICATE, never start_doctor_loop use of it). Same stub,
+# same library, one differing fact: the peer state dir does not exist.
+mkdir -p "$T/o6b/state/roles"
+OUT="$( PATH="$T/stub6:$PATH" TMUX_STUB_LOG="$T/kills6b" FOREIGN_O="$T/peer6-gone" OR=daniel-ospina/tortoise \
+        O="$T/o6b" HOME="$T" CELL_HOME="$T" ENV_FILE="$T/keys6b.env" \
+        bash -c '. "$1"; start_doctor_loop' _ "$SUPLIB" 2>&1 )"; RC=$?
+[ "$RC" -eq 0 ] && ok "a foreign session whose state dir is GONE is REPLACED, not fatal (rc=$RC)" \
+                || bad "a retired foreign state dir was treated as fatal (rc=$RC), which is #2315 reopened: $OUT"
+case "$OUT" in *"$T/peer6-gone"*"no longer exists"*|*"no longer exists"*"$T/peer6-gone"*) \
+     ok "message names the retired state dir and says it no longer exists" ;;
+  *) bad "the replacement message does not name the retired state dir — $OUT" ;; esac
+[ -s "$T/kills6b" ] && ok "the dead peer session was REPLACED (a kill was issued)" \
+                    || bad "the dead peer session was never cleared, so start could not succeed again (#2315)"
 
 # the controller half: a leftover inner-chain member is NAMED with its state dir
 PEER="$T/fakecell/orchestrator"; mkdir -p "$PEER"

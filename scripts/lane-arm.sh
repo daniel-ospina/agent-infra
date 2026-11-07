@@ -12,7 +12,7 @@
 #
 # WHAT WAS MISSING IS A PRODUCER THAT DOES NOT DEPEND ON THE THING IT WATCHES.
 #   state/NEEDS-ACTION.md is written by `lane-actions.py`, whose ONLY live callers are the heartbeat
-#   tick (`heartbeat-loop.sh:585`) and its detached fallback (`lane-scan-fallback.sh:105`) -- and the
+#   tick (`heartbeat-loop.sh:585`) and its detached fallback (`lane-scan-fallback.sh:110`) -- and the
 #   fallback is itself launched BY the tick (`heartbeat-loop.sh:613`). So when the heartbeat dies, the
 #   classifier's input freezes: measured on this box, the heartbeat log stopped 2026-10-26T01:47 and
 #   FOUR artefacts froze together (`NEEDS-ACTION.md` 6810 min, `lane-status.last.json` 6816 min,

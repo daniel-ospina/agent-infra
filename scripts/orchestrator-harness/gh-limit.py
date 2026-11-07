@@ -93,6 +93,33 @@
 # `events.log`; only a FINAL FAILURE (where the call is already non-zero and the caller already
 # prints stderr) is written to stderr.
 #
+# ⛔ WHICH CREDENTIAL (#3429) — THIS LAYER CHOOSES IT, AND ONLY HERE. Everything above bounds HOW
+# MUCH this box spends; none of it changed WHERE the spend lands, and the whole fleet's reads landed
+# on ONE 5,000/hour budget (REST `core`, per USER) that the landing rail also needs. Measured on
+# #3429: `core` reached `0/5000` at 06:10Z, 07:10Z and 07:20Z on one day (2609 → 0 in 40 minutes,
+# ~65 calls/min) while GraphQL still held 4,321; #3584 is what that costs — `provision` failed, the
+# board came back unparsable, the claim gate went INCOMPLETE, dispatch stopped, `DRAIN DEADLOCK — no
+# PR merged in 360m`.
+#
+# A GitHub App INSTALLATION token has its OWN bucket, so reads stop competing with the rail's writes.
+# `gh-cred.py` (beside this file) is the ONE decision function: given an operation it answers WHICH
+# credential and WHY, as a NAMED arm. `run()` below — the single place this layer executes the real
+# `gh` — applies that answer to the child's `GH_TOKEN`, so no call site can be forgotten and none
+# can opt out.
+#
+# ⛔ WHAT THIS CHANGE DELIBERATELY DOES NOT DO. #3429 keeps the two-bucket PACING decision function
+# as future work and never claims the App replaces it, so NOTHING below is relaxed: the core floor,
+# the budget gates, the single-flight/box lock, the documented backoff, the ETag and pass caches,
+# and the failover all behave exactly as they did. The App changes the CREDENTIAL, never the pacing.
+# Two pinned consequences make that concrete:
+#   * `purpose=meter` — `gh api rate_limit`, the probe the pacing layer reads to decide whether the
+#     ACCOUNT is out — ALWAYS uses the USER credential. Served from the app it would report the
+#     app's remaining and tell this layer the user bucket is healthy, i.e. it would disarm the very
+#     guard #3429 landed.
+#   * every arm that is not `app` is NAMED and COUNTED (`gh-cred.py --stats`), and a READ served by
+#     the user credential with no arm behind it is counted as a DEFECT — that is the regression
+#     assertion for this change, because "a read on the user bucket" is exactly the bug.
+#
 # USAGE (both entry points call this; neither reimplements it)
 #   gh-limit.py --real-gh <path>   -- <gh argv…>     # the Mac REST adapter resolves gh itself
 #   gh-limit.py --self <this shim> -- <gh argv…>     # the cell-side wrapper (`--self` is skipped
@@ -116,6 +143,31 @@ import tempfile
 import time
 
 REENTRANCY_ENV = "GH_LIMIT_LOCK_HELD"
+
+# ── the credential decision (#3429) ──────────────────────────────────────────────────────────────
+# The helper is a SIBLING, because both are deployed into ONE runtime dir by `deploy-harness.sh`
+# (`$O/gh-limit.py` and `$O/gh-cred.py`), and the same relative shape holds in `scripts/`.
+CRED_HELPER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gh-cred.py")
+# The credential CLASS that produced the answer this process is about to cache. It is stamped into
+# every cache ENTRY (`cred:`), and `_cred_class_ok` refuses an entry from the other class — that is
+# what stops a body or a 404 fetched with one credential from being replayed to the other.
+#
+# ⛔ IT IS **NOT** PART OF THE CACHE KEY. `_cred_digest()` stays a pure function of the environment,
+# because `cache_key`/`flight_key` must be computable from an invocation ALONE (mixing the served arm
+# in was the first attempt and gh-limit.test.sh caught it: three assertions plant a flight claim
+# out-of-process by computing `flight_key(argv)`, and an arm that only exists after `main()` runs made
+# the key unreproducible, so the takeover/orphan-reclaim arms silently stopped being exercised).
+#
+# ⛔ AND IT HAS A MODULE-LEVEL DEFAULT (review P2). It used to be bound only by `main()` and by
+# `run()` via `global`, so every consumer (`_cred_class_ok`, `cache_put`, `pass_cache_put`,
+# `flight_publish`, `read_cache_put`) raised `NameError` if reached before either had run — and neither
+# `cache_put`'s `except OSError` nor `cache_get`'s `except (OSError, ValueError, binascii.Error)`
+# catches that. No production path reached it, but the PR's own §7 test had to plant the attribute by
+# hand (`m._CRED_CLASS = "app"`), which is the same defect seen from the other side: a guard with no
+# default. `user` is also the correct label for an unlabelled entry — it predates the layer.
+_CRED_CLASS = "user"
+_CRED_CACHE = {}
+_CRED_MOD = [None]
 
 # ── configuration (env is the operator's seam; tests replace the CLOCK and the SLEEP, not the logic) ──
 def cfg(name, default):
@@ -1063,10 +1115,253 @@ class Result(object):
         self.rc, self.out, self.err, self.status = rc, out, err, status
 
 
-def run(real_gh, argv, extra=None, timeout=None):
-    cmd = [real_gh] + list(argv) + list(extra or [])
-    env = dict(os.environ)
-    env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
+# ── the credential decision, applied at the ONE place a real gh is executed (#3429) ─────────────
+def cred_helper():
+    """The `gh-cred` module, or None when it is not installed.
+
+    ⛔ A MISSING HELPER IS NAMED, NEVER SILENT. Without it every read stays on the user bucket —
+    exactly the state #3429 measured — so the arm is `no-helper`, it is logged to events.log on
+    every call, and `gh-cred.py --stats` cannot report clean because it cannot report at all. The
+    alternative (refusing the call) would take the fleet down for a missing optimisation, which is
+    a worse trade than a loud, attributable fallback.
+    """
+    if _CRED_MOD[0] is not None:
+        return _CRED_MOD[0] if _CRED_MOD[0] is not False else None
+    mod = False
+    try:
+        if os.path.isfile(CRED_HELPER):
+            import importlib.util
+            spec = importlib.util.spec_from_file_location("gh_cred", CRED_HELPER)
+            loaded = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(loaded)
+            mod = loaded
+    except Exception as exc:                      # a broken helper must not break the shim
+        log_event("gh-cred load failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+        mod = False
+    if mod is False:
+        log_event("gh-cred MISSING at %s — every call falls back to the user credential (arm=no-helper)"
+                  % CRED_HELPER)
+    _CRED_MOD[0] = mod
+    return mod if mod else None
+
+
+def cred_purpose(argv):
+    """`meter` / `introspect` / `request` — WHICH QUESTION this invocation is asking (#3429).
+
+    ⛔ THE METER IS PINNED TO THE USER CREDENTIAL, DELIBERATELY. `gh api rate_limit` is what the
+    pacing layer reads to decide whether the ACCOUNT is out; served from the installation token it
+    would report the APP's remaining, and `mark_marker_stale`/`record_recovery` would then clear a
+    live user-bucket limit — the guard disarming itself through the fix. `gh auth …` is the same
+    class in the other direction: those verbs INTROSPECT the credential on disk, so substituting a
+    token would make `gh auth token` lie."""
+    if argv[:1] == ["auth"]:
+        return "introspect"
+    if argv[:1] == ["api"]:
+        # ⛔ NORMALISED: `rate_limit?x=1` / `rate_limit#frag` / `/rate_limit/` are all the meter.
+        if _api_endpoint_norm(argv) == "rate_limit":
+            return "meter"
+    return "request"
+
+
+# ⛔ A POSITIVE READ ALLOW-LIST, BECAUSE `is_mutating()` IS THE WRONG POLARITY FOR THIS QUESTION.
+# `is_mutating()` answers "may the PACING layer treat this as a mutation" from `MUTATING_PAIRS`, which
+# is a partial table and says so: an unlisted verb (`gh issue lock`, `gh run delete`, `gh workflow
+# disable`, `gh secret set`, `gh repo create`) reads there as a read, and the budget question's safe
+# default is the other way (an unknown argv is ASSUMED to spend the pool — see `reaches_api`).
+#
+# Served a credential, the table's gaps are not a lost second of pacing, they are the WRONG CREDENTIAL:
+# measured in review, `issue lock 42`, `run delete 5`, `workflow disable ci.yml` and `issue pin 3`
+# were ALL sent to the installation token, and `gh-cred.py --which` answered "user" for the same
+# argv — the operator's diagnostic contradicting production. Nothing in this code checks that the
+# installation is read-only (that is a DEPLOYMENT assumption), so an install carrying ANY write
+# permission would have executed those mutations as the App bot, unattributable, on the rail's own
+# surfaces.
+#
+# So the question is inverted: a call is served by the app only when it is PROVABLY a read, and
+# everything else keeps the user credential. The cost of a miss is a read that stays on the user
+# bucket — visible as the arm `not-provably-read` in `--stats`, and fixed by adding the verb here.
+# The cost of the other direction is an unattributable write, which no retry can undo.
+READ_SUBCOMMANDS = frozenset((
+    ("pr", "view"), ("pr", "list"), ("pr", "diff"), ("pr", "checks"), ("pr", "status"),
+    ("issue", "view"), ("issue", "list"),
+    ("run", "view"), ("run", "list"), ("run", "download"),
+    ("release", "view"), ("release", "list"),
+    ("repo", "view"), ("repo", "list"),
+    ("label", "list"), ("workflow", "list"), ("workflow", "view"),
+    ("cache", "list"), ("secret", "list"), ("variable", "list"),
+    ("gist", "view"), ("gist", "list"),
+    ("project", "view"), ("project", "list"), ("project", "field-list"),
+    ("org", "list"), ("extension", "list"),
+))
+# Bare verbs that take no subcommand and never write.
+READ_BARE = frozenset(("status", "browse", "search"))
+
+
+def _api_endpoint_norm(argv):
+    """The `api` endpoint, normalised for the credential question — query string and fragment stripped.
+
+    ⛔ `rate_limit?x=1` AND `rate_limit#frag` ARE THE METER. `cred_purpose` compared the raw endpoint,
+    so those spellings fell through to `request` + `read` and the pace layer's own meter would have
+    been answered from the INSTALLATION's remaining — the inverse of the pin's stated purpose (review
+    cycle 4). The file already strips a query string one function away (`ep.split("?")[0]`).
+
+    ⛔ AND THE QUERY/FRAGMENT IS SPLIT **BEFORE** THE SLASHES ARE STRIPPED (review). The other order
+    left `rate_limit/` behind for any endpoint carrying BOTH a trailing slash and a query/fragment, so
+    `/rate_limit/?x=1`, `rate_limit/#f`, `rate_limit/?x=1#f` and `/RATE_LIMIT/?x=1` still answered
+    `request` — and `decide()` pins only NON-`request` purposes to the user credential, so the meter
+    was answered from the INSTALLATION's remaining: the exact inversion the pin exists to prevent,
+    reached by COMBINING two spellings the enumeration varied separately. When a family is closed
+    per-axis, the cross-product is where it survives."""
+    ep = api_endpoint(argv)
+    if ep is None:
+        return None
+    return ep.strip().split("?")[0].split("#")[0].strip("/").lower()
+
+
+def _api_has_write_shape(argv):
+    """Does this `gh api` argv CARRY A WRITE, decided WITHOUT `api_is_mutating()`'s pacing shortcut.
+
+    ⛔ THIS EXISTS BECAUSE `api_is_mutating()` IS NOT SOUND FOR THE CREDENTIAL QUESTION, and the
+    disagreement is narrow enough to be easy to miss: it sets `graphql = True` for ANY argv token
+    equal to `graphql` — including a FLAG'S VALUE — and then returns False before the data->POST
+    inference. So `api repos/o/r/issues -f title=x -t graphql` (where `-t` is `gh api --template`, a
+    POST-PROCESSING flag that `conditional_plan` lists and that sends the request first) came out
+    `api_is_mutating() == False`, my REST fall-through answered `read`, and the write went to the
+    installation token — T1 falsified through a spelling no test named (review cycle 4: 360 of 540
+    enumerated shapes).
+
+    The credential question asks "does this argv carry data or a non-GET method", full stop. It must
+    not inherit a predicate whose documented bias is to under-report mutations because a false one
+    costs the PACING layer a one-second gap."""
+    method = None
+    i = 1
+    while i < len(argv):
+        a = argv[i]
+        if a == "--input" or a.startswith("--input="):
+            return True                     # a body from a file IS data
+        if a in METHOD_FLAGS and i + 1 < len(argv):
+            method = argv[i + 1].upper()
+            i += 2
+            continue
+        if a.startswith("--method="):
+            method = a.split("=", 1)[1].upper()
+        elif a.startswith("-X") and len(a) > 2:
+            method = a[2:].upper()
+        elif _data_flag_value(a)[0]:
+            return True
+        i += 1
+    if method:
+        return method not in ("GET", "HEAD")
+    return False
+
+
+def cred_kind(argv):
+    """`read` ONLY when the call is provably a read; `write` when it is provably a write; `unproven`
+    for everything else. BOTH non-read answers keep the user credential (#3429).
+
+    `gh api` is decided by `api_is_mutating()`, which already defaults the safe way for `api` (any
+    non-GET method, any `-f/-F/--field/--raw-field/--input`, or POST-inferring data is a mutation;
+    `api graphql` is a read unless spelled otherwise). Every subcommand verb must be NAMED in
+    `READ_SUBCOMMANDS` to be served by the app; `unproven` exists so the amount left on the user
+    bucket is a NUMBER an operator can read and act on (`--stats`, arm `not-provably-read`) instead of
+    an invisible wish."""
+    if not argv:
+        return "unproven"
+    if argv[0] == "api":
+        if api_is_mutating(argv):
+            return "write"             # a non-GET method, or data on a REST call: PROVEN a write
+        # ⛔ AND GRAPHQL IS NOT DECIDED BY `api_is_mutating`. That predicate returns FALSE for EVERY
+        # `gh api graphql` call — deliberately, and it says so: for PACING the cheap direction is to
+        # treat a GraphQL payload as a read (a false mutation costs a 1 s gap). Served a CREDENTIAL
+        # that reasoning inverts, exactly as it does under coalescing: `-f query='mutation{…}'`
+        # classified as a read and was handed to the read-only installation token (review cycle 2).
+        #
+        # ⛔ AND THE ENDPOINT IS ATTRIBUTED WITH `api_endpoint()`, NEVER BY LOOKING AT `argv[1]`. The
+        # first repair of the cycle-2 finding wrote `any(a == "graphql" … for a in argv[1:2])` — a
+        # SECOND-TOKEN scan — so any flag before the endpoint hid it, the correct
+        # `_graphql_query_is_read() == False` answer was discarded, and the fall-through returned
+        # `read`: `api -H 'Accept: …' graphql -f query='mutation{…}'`, `api --hostname … graphql …`,
+        # `api -- graphql …` and `api -H … graphql --input=…` were ALL served by the installation
+        # token (162 of 231 enumerated write-payload shapes, review cycle 3 — a P0 on the change's own
+        # core invariant). `api_endpoint()` already exists for precisely this: it consumes flag VALUES,
+        # it is what `cred_purpose` and `flight_eligible` use, and its own comment records this exact
+        # `-H`-before-`graphql` shape as measured. One argv parser for one argv question.
+        ep = _api_endpoint_norm(argv)
+        if ep is None:
+            return "unproven"          # an argv we cannot attribute is NOT provably a read
+        if ep == "graphql":
+            return "read" if _graphql_query_is_read(argv) else "unproven"
+        # ⛔ A REST CALL IS A READ ONLY WHEN ITS ARGV CARRIES NO DATA AND NO NON-GET METHOD — asked
+        # here directly, NOT inherited from `api_is_mutating()` (see `_api_has_write_shape`).
+        return "write" if _api_has_write_shape(argv) else "read"
+    if argv[0] in READ_BARE:
+        return "read"
+    if len(argv) >= 2 and (argv[0], argv[1]) in READ_SUBCOMMANDS:
+        return "read"
+    return "unproven"
+
+
+def credential_for(argv):
+    """The `gh-cred` Decision for this argv. Cached per (kind, purpose) — one mint per process."""
+    mod = cred_helper()
+    if mod is None:
+        return _NoCred()
+    kind = cred_kind(argv)
+    purpose = cred_purpose(argv)
+    key = (kind, purpose)
+    if key not in _CRED_CACHE:
+        try:
+            _CRED_CACHE[key] = mod.resolve(kind, purpose, argv)
+        except Exception as exc:                  # never let a credential bug fail a gh call
+            log_event("gh-cred resolve failed: %s: %s" % (type(exc).__name__, str(exc)[:160]))
+            _CRED_CACHE[key] = _NoCred()
+    return _CRED_CACHE[key]
+
+
+class _NoCred(object):
+    arm = "no-helper"
+    credential = "user"
+    token = None
+
+
+# ⛔ AN APP-SERVED FAILURE FALLS BACK, AND THE TEST IS "IT FAILED", NEVER A TEXT ALLOWLIST.
+# The first version gated this on five literal substrings. Measured on review: an installation token's
+# REAL failures — `API rate limit exceeded for installation ID <id>. (HTTP 403)` and `Not Found (HTTP
+# 404)` for a repo the installation is not granted — match NONE of them, so the fallback never fired,
+# the `app-dry` arm was DEAD CODE, `note_app_refusal()` (its only caller) never ran, and a read hung
+# through four backoff attempts and then failed. That is worse than before the layer existed, on the
+# box that holds the key. Wording is not a contract; `rc != 0` is. The cost of the broad rule is ONE
+# extra request when a genuine 404 is retried on the user credential, which returns the same 404.
+
+def _app_failed(res):
+    """The app served this call and the call did not succeed. Fall back on the user credential."""
+    return res.rc != 0
+
+
+def _app_dry(res):
+    """Was the app's failure its OWN bucket being empty? Recorded so the NEXT call takes the `floor`
+    arm, and the caller still gets a real answer because the retry uses the user credential.
+
+    ⛔ THIS IS THE ONLY WRITER of the app budget outside a mint, so it must run on EVERY app failure
+    and not only on a rate limit — `note_app_refusal` is what turns "the installation is dry" into
+    the `floor` arm for the rest of the hour. A non-rate-limit failure simply does not."""
+    blob = (res.err or b"") + (res.out or b"")
+    txt = blob.decode("utf-8", "replace").lower()
+    if "rate limit" not in txt and "abuse" not in txt and "quota" not in txt:
+        return False
+    mod = cred_helper()
+    try:
+        reset = None
+        m = re.search(r"reset[=:\s]+(\d{9,})", txt)
+        if m:
+            reset = int(m.group(1))
+        mod.note_app_refusal(0, reset)
+    except Exception:
+        pass
+    return True
+
+
+def _run_child(cmd, env, timeout):
     try:
         p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env,
                            timeout=timeout)
@@ -1078,6 +1373,73 @@ def run(real_gh, argv, extra=None, timeout=None):
         # call (rc 124, `timeout`'s own code), which every caller already treats as "no measurement".
         return Result(124, b"", ("gh-limit: the call did not finish within %ss\n" % timeout).encode())
     return Result(p.returncode, p.stdout, p.stderr)
+
+
+def run(real_gh, argv, extra=None, timeout=None):
+    cmd = [real_gh] + list(argv) + list(extra or [])
+    env = dict(os.environ)
+    env[REENTRANCY_ENV] = "1"       # a gh child that re-enters this helper must not deadlock on our lock
+    cred = credential_for(list(argv))
+    # ⛔ THE CLASS THE CACHE WRITERS STAMP IS SET PER CALL, and it must be set HERE — not only in
+    # `main()`. `run()` can be called more than once per process (the dispatch retry loop calls it per
+    # attempt) and the fallback below mutates it, so leaving it on the previous call's value meant a
+    # LATER app-served call wrote its bytes into the shared caches stamped `cred: user` — a narrower
+    # app-side answer replayed as a HIT with rc 0 to user-credentialed callers, i.e. T3 failing in the
+    # reverse direction (found in review cycle 2). All four writers (`cache_put`, `read_cache_put`,
+    # `pass_cache_put`, `flight_publish`) run AFTER `run()` returns, so this is what they read.
+    global _CRED_CLASS
+    _CRED_CLASS = "app" if cred.credential == "app" else "user"
+    if cred.token:
+        # The app token is injected into the CHILD's env only. `os.environ` is left alone on purpose:
+        # `_cred_digest()` and any nested child see the box's own credential, so the identity of the
+        # cache key cannot flip depending on which arm happened to serve a call.
+        # ⛔ ALL FOUR NAMES, not `GH_TOKEN` alone. On a non-`github.com` host `gh` ignores `GH_TOKEN`
+        # and reads `GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` — a precedence this file's own
+        # `_cred_digest` docstring states and which `cache_key`/`GH_CRED_API` contemplate. Setting one
+        # name would have served such a box from the USER credential while the arm, `_CRED_CLASS` and
+        # `--stats` all said `app`: a false PASS of this change's own regression assertion (found in
+        # review).
+        for _name in ("GH_TOKEN", "GITHUB_TOKEN", "GH_ENTERPRISE_TOKEN", "GITHUB_ENTERPRISE_TOKEN"):
+            env[_name] = cred.token
+    env["GH_CRED_SERVED_ARM"] = cred.arm
+    res = _run_child(cmd, env, timeout)
+    if cred.credential == "app" and cred_purpose(list(argv)) == "request" and _app_failed(res):
+        # ARM 4/6 (#3429): the app served the call and it did not succeed — a dry installation bucket,
+        # a repo the installation is not granted (a 404, which is what GitHub returns outside an
+        # installation's scope), a revoked token. Retry ONCE on the user credential and say which arm
+        # fired. Bounded to a single retry and to reads (a write never reaches here: `cred_kind` keeps
+        # the user credential for anything not PROVABLY a read), so the rail's merge path can never be
+        # silently re-issued under a different credential.
+        # ⛔ AND THE APP'S OWN REFUSAL NEVER REACHES THE BOX-WIDE MARKER. Because this returns the
+        # RETRY's result, `classify()`/`record_limit()` see the user credential's outcome: without
+        # that, an INSTALLATION-bucket 403 was published as box/account pacing state (`bucket=graphql
+        # status=403` in `last-limit`), i.e. the credential layer moved the pacing it promised not to.
+        arm = "app-dry" if _app_dry(res) else "app-refused"
+        log_event("credential fallback arm=%s — the application credential failed (rc=%s); retrying "
+                  "once on the user credential (#3429)" % (arm, res.rc))
+        # ⛔ NEVER MUTATE THE CACHED DECISION. `credential_for()` caches it per (kind, purpose), so
+        # `cred.arm = arm` rewrote a SHARED object: the next `run()` in the same process (the dispatch
+        # retry loop calls it per attempt) injected `GH_CRED_SERVED_ARM=app-dry` for a call the app
+        # actually served — a successful, app-served attempt attributed as a fallback (review cycle 3).
+        # The arm for THIS call rides the child env and the counter, which is all it is for.
+        # ⛔ AND THE ANSWER THAT COMES BACK WAS PRODUCED BY THE USER CREDENTIAL, so the class the
+        # cache writers stamp must say so. It did not, and the result was the one case where the two
+        # credentials PROVABLY differ in visibility (the app was refused, the user could see it) being
+        # cached as `cred: app` and replayed to app-served callers — threat T3 defeated on the exact
+        # path it exists for (found in review cycle 1). The writers all run AFTER `run()` returns.
+        _CRED_CLASS = "user"
+        retry_env = dict(os.environ)
+        retry_env[REENTRANCY_ENV] = "1"
+        retry_env["GH_CRED_SERVED_ARM"] = arm
+        res2 = _run_child(cmd, retry_env, timeout)
+        try:
+            mod = cred_helper()
+            if mod is not None:
+                mod.count(arm, "read")
+        except Exception:
+            pass
+        return res2
+    return res
 
 
 # ── conditional REST (the polling half) ────────────────────────────────────────────────────────
@@ -1175,10 +1537,27 @@ def _cred_digest():
     """A digest of the credential this call will use — never the secret itself.
 
     ⛔ ALL FOUR credential names: `gh` reads the ENTERPRISE pair for a non-github.com host, and a key
-    on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced)."""
+    on GH_TOKEN alone shared an entry between two enterprise credentials (reproduced).
+
+    ⛔ DELIBERATELY UNCHANGED BY THE CREDENTIAL LAYER (#3429). This digest stays a PURE function of
+    the environment, because `cache_key`/`flight_key` must be computable from an invocation alone.
+    Mixing the served arm in here was the FIRST attempt and gh-limit.test.sh caught it: three
+    assertions plant a flight claim by computing `flight_key(argv)` out-of-process, and an arm that
+    only exists after `main()` runs made the key unreproducible — the planted claim landed on a
+    different path and the takeover/orphan-reclaim arms silently stopped being exercised. Cross-
+    credential safety is enforced per ENTRY instead (`_CRED_CLASS`)."""
     tok = (os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
            or os.environ.get("GH_ENTERPRISE_TOKEN") or os.environ.get("GITHUB_ENTERPRISE_TOKEN") or "")
     return hashlib.sha256(tok.encode("utf-8")).hexdigest()[:16] if tok else "-"
+
+
+def _cred_class_ok(entry):
+    """Was this cached answer produced by the credential THIS process serves calls with?
+
+    A missing `cred` means the entry predates the credential layer, i.e. the user credential — which
+    is what an unlabelled entry correctly is. A MISS here costs exactly one re-fetch, and it can only
+    ever move an answer toward the caller's own visibility, never away from it."""
+    return (entry.get("cred") or "user") == _CRED_CLASS
 
 
 def cache_key(plan):
@@ -1212,11 +1591,15 @@ def cache_get(key):
     """The cached entry, with its body as BYTES. Base64, not a decoded string: a 304 replay must
     reproduce the 200 body EXACTLY, and any text decoding (`utf-8`, `replace`) silently corrupts a
     body that is not UTF-8 — a `gh api` of a contents/binary endpoint would come back mangled while
-    the caller believed it had the unchanged resource."""
+    the caller believed it had the unchanged resource.
+
+    ⛔ AND AN ENTRY FROM THE OTHER CREDENTIAL IS A MISS (#3429): see `_CRED_CLASS`."""
     try:
         with open(cache_path(key)) as fh:
             d = json.load(fh)
         if isinstance(d, dict) and d.get("etag") and isinstance(d.get("body_b64"), str):
+            if not _cred_class_ok(d):
+                return None
             d["body"] = base64.b64decode(d["body_b64"].encode("ascii"))
             return d
     except (OSError, ValueError, binascii.Error):
@@ -1276,7 +1659,8 @@ def cache_put(key, etag, body):
     try:
         os.makedirs(os.path.dirname(p), mode=0o700, exist_ok=True)
         with open(tmp, "w") as fh:
-            json.dump({"etag": etag, "body_b64": base64.b64encode(body).decode("ascii")}, fh)
+            json.dump({"etag": etag, "cred": _CRED_CLASS,
+                       "body_b64": base64.b64encode(body).decode("ascii")}, fh)
         os.replace(tmp, p)
     except OSError:
         try:
@@ -1403,6 +1787,8 @@ def pass_cache_get(gh_argv):
         out = base64.b64decode(e["out_b64"].encode("ascii"))
         err = base64.b64decode(e["err_b64"].encode("ascii"))
         rc = int(e["rc"])
+        if not _cred_class_ok(e):
+            return None                 # produced by the OTHER credential — ask GitHub (#3429)
     except (OSError, ValueError, KeyError, TypeError, binascii.Error):
         return None
     if rc != 0:
@@ -1427,7 +1813,7 @@ def pass_cache_put(gh_argv, out, err, rc):
     tmp = p + ".tmp-%d" % os.getpid()
     try:
         with open(tmp, "w") as fh:
-            json.dump({"rc": rc,
+            json.dump({"rc": rc, "cred": _CRED_CLASS,
                        "out_b64": base64.b64encode(out).decode("ascii"),
                        "err_b64": base64.b64encode(err).decode("ascii")}, fh)
         os.replace(tmp, p)
@@ -1864,6 +2250,7 @@ def flight_publish(key, meta, rc, out, err):
     tmp = path + ".tmp-%d" % os.getpid()
     rec = {"flight": meta.get("flight") or "%d@%.3f" % (meta["pid"], meta["started_at"]),
            "request": meta.get("request", ""),
+           "cred": _CRED_CLASS,
            "started_at": meta["started_at"], "finished_at": _now(), "rc": rc,
            "out_b64": base64.b64encode(out).decode("ascii"),
            "err_b64": base64.b64encode(err).decode("ascii")}
@@ -1882,9 +2269,18 @@ def flight_publish(key, meta, rc, out, err):
 
 def flight_result(d, key):
     """The last PUBLISHED outcome for `key`, with its completion time, or None. A corrupt or
-    half-written entry is a miss, never an error."""
+    half-written entry is a miss, never an error.
+
+    ⛔ AND AN OUTCOME PUBLISHED BY THE OTHER CREDENTIAL IS A MISS (#3429). Coalescing exists to share
+    ONE request between callers of the SAME argv, and two boxes can decide differently for that argv
+    (one has the App, one does not). Replaying the App's answer to a user-credentialed caller is the
+    same cross-credential body replay the ETag/read/pass caches now refuse — the waiters simply take
+    the key over and run the call themselves, which is already the honest degradation for an entry
+    too large to share."""
     rec = _read_json(os.path.join(d, key + ".json"))
     if rec is None:
+        return None
+    if not _cred_class_ok(rec):
         return None
     try:
         return {"rc": int(rec["rc"]),
@@ -2377,6 +2773,8 @@ def read_cache_get(key, ttl):
             e = json.load(fh)
         if int(e["rc"]) != 0:
             return None            # never trust a stored failure (see the exclusion list)
+        if not _cred_class_ok(e):
+            return None            # produced by the OTHER credential — ask GitHub (#3429)
         if clock() - float(e["at"]) > ttl:
             return None            # too old for THIS class: ask GitHub
         if float(e["at"]) > clock() + 60:
@@ -2416,7 +2814,7 @@ def read_cache_put(key, rc, out, err):
     tmp = p + ".tmp-%d" % os.getpid()
     try:
         with open(tmp, "w") as fh:
-            json.dump({"at": clock(), "rc": rc,
+            json.dump({"at": clock(), "rc": rc, "cred": _CRED_CLASS,
                        "out_b64": base64.b64encode(out).decode("ascii"),
                        "err_b64": base64.b64encode(err).decode("ascii")}, fh)
         os.replace(tmp, p)
@@ -3266,6 +3664,15 @@ def main(argv):
     gh_argv = list(argv[i:])
     if real_gh is None:
         real_gh = os.environ.get("GH_LIMIT_REAL_GH") or resolve_real_gh(self_path)
+    # ⛔ RESOLVE THE CREDENTIAL ONCE HERE, BEFORE any cache ENTRY is written (#3429). `_CRED_CLASS` is
+    # stamped into every entry (`cred:`) and `run()` re-derives it per call; resolving here too bounds
+    # minting to one call per process. It is NOT part of the cache KEY — `_cred_digest()` stays a pure
+    # function of the ENVIRONMENT (see the module-level note on `_CRED_CLASS`).
+    global _CRED_CLASS
+    if gh_argv and cred_purpose(gh_argv) == "request":
+        _CRED_CLASS = "app" if credential_for(gh_argv).credential == "app" else "user"
+    else:
+        _CRED_CLASS = "user"          # the meter and introspection are pinned to the user credential
     if budget:
         snap = probe_budget(real_gh) if real_gh and os.path.isfile(real_gh) else None
         if snap is None:

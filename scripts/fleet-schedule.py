@@ -111,6 +111,10 @@ TEMPLATES_DIR = ""
 STATE = ""
 TICK = 0
 JOB_TIMEOUT = 0
+# The BOX's loop mutex, resolved in main(). ⛔ Not under $STATE, and not keyed on $HOME/$CELL_HOME
+# or the uid — see resolve_loop_lock(). Empty means "not resolved" (a unit test importing this
+# module, or a mode that never reaches a loop).
+LOOP_LOCK = ""
 
 # The placeholder set — the SAME names `scripts/install-launchd.sh` renders, whose own
 # PLIST_PLACEHOLDERS array is the contract. A name added there and not here turns every cell's
@@ -964,6 +968,365 @@ def pid_alive(pid):
         return exc.errno == errno.EPERM
 
 
+# ─────────────────────────────────── one scheduler loop per BOX, not per state dir (#2890)
+
+
+def resolve_loop_lock():
+    """Set LOOP_LOCK: ONE path every scheduler on this box derives IDENTICALLY.
+
+    ⛔ NOT keyed on `$STATE`, `$HOME`/`$CELL_HOME` or the uid — those are precisely the inputs that
+    DIFFER between two delivery paths on one box, and a lock whose NAME depends on them is a lock
+    those two do not share. Measured on cell-4 (2026-11-06, recorded on #2890): **7 concurrent
+    `--loop` instances on one box**, resolving five different `$STATE` dirs (a cell home, the
+    operator's home, three lane-worktree homes, a stale cloud-cell fixture home). Each was
+    internally correct — the loop's own guard is scoped to `$STATE` and held — and every one of
+    them ran the SAME box-level job set (`ci-runner-gate`, `controller-watchdog`, `pr-doctor`)
+    against the same machine. The resource being guarded is the BOX, so the guard's scope must be
+    the box.
+
+    This is `scripts/disk-reaper.sh`'s CANONICAL_LOCK_DIR rule (#2443) applied here: *"ONE
+    CANONICAL LOCK PATH, DERIVED FROM THE TMPFS ROOT ALONE … one name cannot drift."* The realm is
+    the same too — `--loop` never executes on Darwin (main() delegates to install-launchd.sh
+    first), so the Linux tmpfs root is always the right place for it.
+
+    Engagements, both STATED rather than silent:
+      * `FLEET_SCHEDULE_LOCK_ROOT` — the hermetic suites' seam, and the operator's pin. Every suite
+        that starts a loop MUST set it (fleet-schedule.test.sh and cloud-cell-bringup.test.sh do),
+        or it would contend with the box's own production scheduler — which is the very defect this
+        guard exists to prevent.
+      * `FLEET_SCHEDULE_TMPFS_ROOT` — the root's parent, mirroring disk-reaper.sh's knob.
+
+    A root that cannot be used does NOT wedge the box: it degrades to `$STATE/loop.lock` (still an
+    atomic `O_EXCL` claim, so strictly better than the plain pidfile it also keeps) and says so on
+    stderr. Same arm, same reason, as #2898's recorded decision for an unwritable `$STATE` —
+    refusing would take the box's only alarm offline exactly when the box is broken.
+    """
+    global LOOP_LOCK
+    root = os.environ.get("FLEET_SCHEDULE_LOCK_ROOT") or os.path.join(
+        os.environ.get("FLEET_SCHEDULE_TMPFS_ROOT") or "/dev/shm", "fleet-schedule"
+    )
+    why = ""
+    try:
+        # ⛔ A PRIVILEGED VERB MUST NOT SQUAT THIS ROOT — and `chmod` IS NOT THE ANSWER. `chmod`
+        # changes MODE, not OWNERSHIP, so it does nothing about the `st_uid != getuid()` arm below
+        # (the [VGATE] pass measured a 1777 root still degrading every operator loop), while it
+        # would widen an operator-pinned private `FLEET_SCHEDULE_LOCK_ROOT` to world-writable for no
+        # benefit. So the root is created world-writable (the same 0o1777 shape `/dev/shm` itself
+        # has, which is what the DEFAULT root needs) and an EXISTING root's mode is left exactly as
+        # its owner set it. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
+        # has no lock root yet leaves it root-owned, and every operator loop then degrades with the
+        # NOTE below — tracked as its own follow-up, since the sound fixes are a chown-uid decision.
+        os.makedirs(root, mode=0o1777, exist_ok=True)
+        # /dev/shm is 1777 and this name is guessable, so a PRE-EXISTING foreign dir must never
+        # become our lock dir (the same ownership rule, and the same reason, as disk-reaper.sh's
+        # fallback candidates). Only a pre-existing dir can be foreign — an absent one we create.
+        if not os.access(root, os.W_OK):
+            why = "not writable"
+        elif os.stat(root).st_uid != os.getuid():
+            why = "owned by uid %d" % os.stat(root).st_uid
+    except OSError as exc:
+        why = exc.strerror or type(exc).__name__
+    if why:
+        LOOP_LOCK = os.path.join(STATE, "loop.lock")
+        print(
+            "  NOTE   the box lock root %s is unusable (%s) — this scheduler can only exclude "
+            "against another pass that resolved the SAME state dir, so a second delivery path on "
+            "this box would run the same jobs beside it (#2890). Set FLEET_SCHEDULE_LOCK_ROOT to "
+            "a writable directory to restore the box-wide guard." % (root, why),
+            file=sys.stderr,
+        )
+    else:
+        LOOP_LOCK = os.path.join(root, "loop.lock")
+    return LOOP_LOCK
+
+
+def proc_start_time(pid):
+    """The process's OWN start time — the second half of an identity, not a liveness reading.
+
+    `/proc/<pid>/stat` field 22 (starttime, in clock ticks since boot). Everything after the LAST
+    ')' is parsed: `comm` is parenthesised and may itself contain spaces and ')', so a naive
+    whitespace split misreads every field after it (field 3 is the first post-comm field, and
+    starttime is field 22, hence index 19).
+
+    Returns None when it cannot be read (a non-Linux box, or a pid that vanished between the two
+    reads) — an ABSENT datum, which the callers must treat as "not proof", never as a match.
+    """
+    try:
+        with open("/proc/%d/stat" % pid, "rb") as fh:
+            raw = fh.read().decode("utf-8", "replace")
+    except (OSError, ValueError, OverflowError):
+        return None
+    tail = raw[raw.rfind(")") + 2:].split()
+    if len(tail) < 20:
+        return None
+    return tail[19]
+
+
+def read_loop_lock(path=None):
+    """(pid, start, state) recorded in the box lock at `path` (default: the lock), or None.
+
+    ⛔ JSON, NOT WHITESPACE-SEPARATED FIELDS — and the difference is a measured fail-open, caught by
+    this file's own suite (§19f). The lock's `start` field is legitimately EMPTY when /proc could not
+    be read, and `"%d %s %s" % (pid, "", state)` collapses to `"<pid> <state>"`: the reader then took
+    the state PATH as the start time, the identity comparison failed, `loop_holder()` answered "no
+    holder", and a second scheduler JOINED the live one — the guard disabled by its own record
+    format. Named keys cannot shift.
+
+    ⛔ Everything is caught for the same reason `loop_pid()` catches it (#3340): this is a RECOVERY
+    path, and a 0-byte, truncated or hand-edited lock file must answer "nobody READABLE holds this",
+    never raise out of `--start`/`--install`/`--verify`/`--loop` and leave the cell with no
+    scheduler and no way back.
+    """
+    path = path or LOOP_LOCK
+    if not path:
+        return None
+    try:
+        with open(path) as fh:
+            rec = json.load(fh)
+        if not isinstance(rec, dict):
+            return None
+        pid = int(rec.get("pid"))
+    except (OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
+        # A corrupt record is "no readable holder", which RECLAIMS (see `loop_holder`). It never
+        # raises, and it never silently keeps a lock nobody can explain.
+        # ⛔ `OverflowError` IS NOT A `ValueError` — the same trap `pid_alive` documents. JSON parses
+        # `1e400` as `inf`, and `int(inf)` raises it, so a lock record of `{"pid": 1e400}` made
+        # `--loop`, `--start`, `--install` AND `--verify` die with `OverflowError: cannot convert
+        # float infinity to integer` instead of reclaiming — the cell left with no scheduler and its
+        # own repair verb refusing. (`{"pid": NaN}` raises ValueError and was already caught, which
+        # is what made the gap invisible.) Found by the [VGATE] pass.
+        return None
+    if not pid_alive(pid):
+        return None
+    start = str(rec.get("start") or "")
+    state = str(rec.get("state") or "")
+    return pid, start, state
+
+
+def loop_holder():
+    """The LIVE loop holding this box's lock, as (pid, start, state) — or None.
+
+    ⛔ LIVENESS IS NOT IDENTITY (#1985), and this is the arm that keeps this guard from becoming
+    that defect: a recycled pid read as "the holder is alive" BOTH stops the box and blocks its own
+    recovery, because a start that defers to a wrong pid can never repair the lock it defers to.
+    So the pid must be alive, its command line must be a `fleet-schedule --loop`, AND its own start
+    time must equal the one the lock recorded. A missing start time (a lock written on a box with
+    no /proc) is an absent datum, so the command-line check alone decides — which is still strictly
+    more than a bare pid.
+    """
+    rec = read_loop_lock()
+    if rec is None:
+        return None
+    pid, start, _state = rec
+    if not pid_is_our_loop(pid):
+        return None
+    if start:
+        observed = proc_start_time(pid)
+        if observed is not None and observed != start:
+            return None
+    return rec
+
+
+def same_state_dir(a, b):
+    """Two spellings of one state dir are the SAME state dir.
+
+    `STATE` comes straight from the environment, so a trailing slash, a `..` segment or a symlinked
+    home makes ONE directory read as TWO. Both directions of that mistake are defects: a loop
+    deferring to "another" state dir that is really its own is a false NOTE on a normal box, and a
+    genuinely different dir read as ours would make `--verify` certify a state dir with no loop.
+    """
+    if not a or not b:
+        return False
+    try:
+        return os.path.realpath(a) == os.path.realpath(b)
+    except (OSError, ValueError):
+        return os.path.normpath(a) == os.path.normpath(b)
+
+
+def describe_holder(holder):
+    pid, _start, owner = holder
+    return "pid %d%s" % (pid, ", $STATE=%s" % owner if owner else "")
+
+
+def claim_loop_lock():
+    """Take the box's loop lock atomically. Returns None when WE hold it, else the live holder.
+
+    `O_CREAT|O_EXCL` is the claim: the kernel decides the winner, so there is no read-then-write
+    window. That is exactly what the pidfile check further down is NOT — it reads `loop.pid` and
+    then writes it, so two starts in the same instant can both pass the check.
+
+    A lock whose holder is provably gone is RECLAIMED BY RENAME, never by unlink-then-create:
+    between an unlink and the next `O_EXCL` two starters can both create the file and both win
+    (#3353's class, measured there on this file's job lock). A rename is atomic, so the NAME is
+    never absent for a third party to fill.
+
+    ⛔ WHAT THIS RECLAIM DOES **NOT** PROVE, stated because the first two cuts of it claimed more.
+    A path-based mutex with stale takeover cannot be made race-free by patching: the staleness
+    decision precedes the rename, so a claim published inside that window is moved aside, and if a
+    THIRD starter takes the freed name before the restore, the moved claim cannot be put back. The
+    file therefore never deletes a record it did not judge stale (`moved == judged` is required
+    before any unlink), and when the restore fails it KEEPS the displaced record and says so loudly
+    — a silent two-loop outcome is not acceptable, an evidenced one is survivable. The real fix is a
+    kernel lock on a persistent file, which is #3353's scope and a reopen of #469's `flock` ruling,
+    not something this change may adopt quietly.
+    """
+    if not LOOP_LOCK:
+        return None
+    payload = json.dumps(
+        {"pid": os.getpid(), "start": proc_start_time(os.getpid()) or "", "state": STATE}
+    ) + "\n"
+    # ⛔ THE RECORD IS PUBLISHED COMPLETE OR NOT AT ALL — `os.open(O_EXCL)` alone is atomic only in
+    # the file's EXISTENCE, not in its CONTENT: the file is 0 bytes until `os.write` runs, so a
+    # second claimant landing in that window read a JSONDecodeError, concluded "no readable holder",
+    # and reclaimed a claim that was live — BOTH loops ran. (Measured by the [VGATE] pass, which
+    # widened only that window; the window is microseconds but is exactly what a descheduled or
+    # GC-paused creator on a loaded cell produces.) Writing the payload to a private temp name and
+    # `os.link`-ing it into place makes existence and content arrive together, and `os.link` fails
+    # with EEXIST when somebody got there first — the same publish `write_stamp` uses.
+    staged = "%s.%d.tmp" % (LOOP_LOCK, os.getpid())
+    try:
+        with open(staged, "w") as fh:
+            fh.write(payload)
+    except OSError as exc:
+        return _permit_without_lock(
+            "cannot stage the box lock beside %s (%s: %s)" % (LOOP_LOCK, type(exc).__name__, exc)
+        )
+    try:
+        for _ in range(3):
+            try:
+                os.link(staged, LOOP_LOCK)
+            except FileExistsError:
+                # ⛔ `judged` IS THE RECORD WE WILL VERIFY AFTER THE RENAME. The STALENESS decision
+                # is `loop_holder()`'s own (second) read, and the two can disagree — which is exactly
+                # what the `moved != judged` arm below exists to survive.
+                judged = read_loop_lock()
+                holder = loop_holder()
+                if holder is not None:
+                    return holder
+                # Stale: no live holder. Take it aside under OUR OWN name first, so two reclaimers
+                # cannot both unlink the same file and then both create it.
+                # ⛔ UNIQUE PER ATTEMPT, not per pid: a later reclaim by the SAME pid used to
+                # `rename` straight over a record the previous attempt had preserved for evidence.
+                aside = "%s.reclaim.%d.%d" % (LOOP_LOCK, os.getpid(), time.time_ns())
+                try:
+                    os.rename(LOOP_LOCK, aside)
+                except OSError:
+                    # Somebody else moved or removed it between our read and our rename. Re-loop
+                    # and let `os.link` decide against whatever is there now.
+                    continue
+                # ⛔ VERIFY WHAT WE ACTUALLY MOVED, AND PUT IT BACK IF IT IS NOT WHAT WE JUDGED.
+                # The staleness decision happens BEFORE the rename, so a competitor that completed
+                # ITS reclaim in the window has its LIVE claim renamed away — and if we then deleted
+                # it, both starters would conclude they hold the box: the #2890 defect re-created by
+                # the lock's own reclaim. Measured by the [VGATE] pass with real kernel ops.
+                moved = read_loop_lock(aside)
+                if moved == judged:
+                    # The record we judged stale is the record we moved: a normal reclaim.
+                    try:
+                        os.unlink(aside)
+                    except OSError:
+                        pass
+                    continue
+                # NOT ours to destroy. Restore it WITHOUT clobbering a third party — `link` succeeds
+                # only while the name is still free, unlike `rename`, which overwrites.
+                try:
+                    os.link(aside, LOOP_LOCK)
+                except OSError:
+                    # ⛔ AND IF EVEN THAT FAILS, THE DISPLACED CLAIM IS THE ONLY COPY. Deleting it
+                    # would erase the evidence and leave two unguarded loops with nothing in any log
+                    # — the silent dual-run `_permit_without_lock` exists to make impossible. So the
+                    # file is KEPT (one per contended pid, never read back) and the outcome is
+                    # DISCLOSED, in the same terms as the permit path.
+                    _permit_without_lock(
+                        "a reclaim moved a claim aside at %s that was not the stale record it judged "
+                        "(%r vs %r) and could not restore it — that claim's record is preserved "
+                        "there; a second scheduler may be running beside this one"
+                        % (aside, moved, judged)
+                    )
+                    continue
+                try:
+                    os.unlink(aside)
+                except OSError:
+                    pass
+                continue
+            except OSError as exc:
+                # ⛔ A LOCK ROOT THAT CANNOT HARD-LINK IS NOT A BROKEN BOX. A FUSE/tmpfs mount may
+                # refuse `link(2)` while allowing `open(O_EXCL)`; permitting there would silently
+                # disable a guard that worked before this change. Fall back to the create, which is
+                # atomic in the file's EXISTENCE (only the content window returns, and a contender
+                # that reads an empty file now simply reclaims and re-publishes — it cannot outrun
+                # the `read_loop_lock(aside) != judged` check above for longer than that window).
+                if exc.errno in (errno.EPERM, errno.EOPNOTSUPP, errno.ENOSYS):
+                    try:
+                        fd = os.open(LOOP_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+                    except FileExistsError:
+                        continue
+                    except OSError:
+                        pass
+                    else:
+                        try:
+                            os.write(fd, payload.encode())
+                        finally:
+                            os.close(fd)
+                        return None
+                # The lock root vanished or became unwritable under us (ENOSPC/EDQUOT/EACCES).
+                return _permit_without_lock(
+                    "cannot create the box lock at %s (%s: %s)"
+                    % (LOOP_LOCK, type(exc).__name__, exc)
+                )
+            return None
+        # Three contended attempts and no verdict: either the box's lock is churning, or somebody
+        # keeps reclaiming ours. Fall back to the probe — a HOLDER refuses, and a genuinely empty
+        # lock permits with the disclosure below rather than looping for ever.
+        holder = loop_holder()
+        if holder is not None:
+            return holder
+        return _permit_without_lock(
+            "the box lock at %s stayed contended across 3 attempts" % LOOP_LOCK
+        )
+    finally:
+        try:
+            os.unlink(staged)
+        except OSError:
+            pass
+
+
+def _permit_without_lock(why):
+    """Run WITHOUT the box lock, and say so where an operator can see it.
+
+    ⛔ LOUDLY, NOT SILENTLY — this is the disclosure the permit path owes. Two decisions meet here
+    and only one of them is about the schedule: refusing takes the box's only alarm (reapers,
+    liveness, pr-doctor) offline exactly when the box is in trouble (#2898's recorded arm), so we
+    PERMIT; but a permit that says nothing is the same silent fail-open `acquire_lock` already rules
+    out in this file — measured there, the disk-full cause "never appeared in the log at all".
+    """
+    print(
+        "  WARN   ONE-LOOP-PER-BOX GUARD OFF: %s — running the pass WITHOUT the box lock, so a "
+        "second delivery path on this box could run the same jobs beside it (#2890)"
+        % why,
+        file=sys.stderr,
+    )
+    return None
+
+
+def release_loop_lock():
+    """Release ONLY if the lock still records US — an exiting loop must never delete a
+    successor's lock (the same ownership-checked release as ai-drainer.sh's GUARD 1)."""
+    if not LOOP_LOCK:
+        return
+    try:
+        with open(LOOP_LOCK) as fh:
+            pid = int(json.load(fh).get("pid"))
+    except (OSError, ValueError, TypeError, OverflowError, json.JSONDecodeError):
+        return
+    if pid != os.getpid():
+        return
+    try:
+        os.unlink(LOOP_LOCK)
+    except OSError:
+        pass
+
+
 def pid_is_our_loop(pid):
     """A pid alone is not the loop: a recycled pid makes a dead scheduler read as running.
 
@@ -1476,6 +1839,21 @@ def cmd_loop():
     if theirs and theirs != os.getpid() and pid_is_our_loop(theirs):
         log("loop: already running (pid %d) — this instance exits" % theirs)
         return 0
+    # ⛔ ONE LOOP PER BOX (#2890), checked BEFORE the pass and above the pidfile write. The check
+    # above is scoped to $STATE, so it is structurally blind to a second delivery path on the same
+    # box resolving a DIFFERENT home (measured: 7 instances on cell-4 across five state dirs, all
+    # running this one job set). This arm is the box's mutex, and it is idempotent by construction:
+    # a start that loses the race writes NOTHING into the holding loop's state dir, and says which
+    # pid holds it plus where that loop keeps its state. The refusal line goes to THIS state dir's
+    # own log on purpose — unlike a heartbeat tick, the two instances do not share a state dir, so
+    # this log is the only channel an operator can read afterwards.
+    holder = claim_loop_lock()
+    if holder is not None:
+        msg = ("loop: this box already has a scheduler (%s) — one loop per box, so this instance "
+               "exits without running or writing anything (#2890)" % describe_holder(holder))
+        log(msg)
+        print(msg, flush=True)
+        return 0
     # ⛔ ATOMIC, AND GUARDED — this file is the cell's ONLY evidence that a loop is running, and the
     # old `open(pidfile, "w")` TRUNCATED it before writing. On ENOSPC (this PR's own trigger) the
     # write raised, the process died, and the truncated 0-byte pidfile made every recovery command
@@ -1497,6 +1875,9 @@ def cmd_loop():
             os.unlink(pidfile)
         except OSError:
             pass
+        # ⛔ Ownership-checked: a TERM'd loop must not delete the lock of the loop that replaced it
+        # (`kickstart -k` SIGTERMs and starts the successor immediately).
+        release_loop_lock()
         raise SystemExit(0)
 
     for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
@@ -1600,12 +1981,29 @@ def cmd_loop():
         os.unlink(pidfile)
     except OSError:
         pass
+    release_loop_lock()
     return 0
 
 
 def spawn_loop():
+    """Start the box's loop. Returns (pid, started) — `started` False when a verified holder on this
+    box already had it, so callers do not print "loop started" over a loop they did not start.
+    """
     log_path = os.path.join(STATE, "loop.log")
     os.makedirs(STATE, exist_ok=True)
+    # ⛔ IF THIS BOX ALREADY HAS A SCHEDULER, THE TRUTH IS "STARTED" — not a spawn we then wait on.
+    # Without this, the child we are about to spawn correctly refuses the box lock (#2890), the poll
+    # below times out, and `--install`/`--start` report "the scheduler loop did not come up" over a
+    # box whose schedule is running fine under another state dir — a false FAIL, and the shape that
+    # bricks a cell's bring-up (#3029). The holder is IDENTITY-verified (pid + start time + command
+    # line) by `loop_holder()`, so this is not the blind pidfile adoption the comment below forbids.
+    holder = loop_holder()
+    if holder is not None:
+        # ⛔ NEUTRAL WORDING ON PURPOSE: the holder may be THIS state dir's own loop (its pidfile
+        # went missing, a documented state). Saying "this state dir starts none" there was a false
+        # report to the operator, and `cmd_start` had already been told the truth by its own check.
+        print("loop already running (%s)" % describe_holder(holder))
+        return holder[0], False
     with open(log_path, "a") as out:
         subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--loop"],
@@ -1638,8 +2036,17 @@ def spawn_loop():
             # 1 s of slack: the tick is stamped with this process's clock, and a tick older than
             # the spawn instant belongs to the incarnation that came before.
             if age is not None and age <= (time.time() - spawned_at) + 1.0:
-                return pid
-    return None
+                return pid, True
+    # The child may have lost a race for the box lock to a THIRD scheduler that appeared since the
+    # pre-check above. Report that holder rather than "did not come up": the box IS scheduled.
+    holder = loop_holder()
+    if holder is not None:
+        print(
+            "loop already running (%s) — one loop per box, so this state dir starts none (#2890)"
+            % describe_holder(holder)
+        )
+        return holder[0], False
+    return None, False
 
 
 # ──────────────────────────────────────────────────────────────── reporting
@@ -1850,9 +2257,34 @@ def cmd_status():
 
 def cmd_verify():
     """The gate. Every failure is named; a SKIP is named and counted, never hidden."""
+    global STATE
     failures = []
     jobs = load_jobs()
     now = time.time()
+
+    # ⛔ ONE LOOP PER BOX MEANS ONE STATE DIR CARRIES THE BOX'S EVIDENCE (#2890). When this box's
+    # lock is held by a loop over ANOTHER state dir, the honest question is not "does THIS dir have a
+    # loop" (it must not) but "is the loop that does have it working". So this verification is
+    # conducted against the HOLDER's state dir — its pidfile, its tick, its per-job stamps, its
+    # zero-live rule.
+    # ⛔ SKIPPING THOSE ARMS INSTEAD IS A FALSE PASS, and an earlier cut did exactly that: it printed
+    # a friendly `SCHEDULE VERIFIED` for a holder whose tick was 3 hours old, which
+    # `cloud-cell-bringup.sh` turns into `CELL READY` on a cell with no reaping and no liveness
+    # detection — the #1864 false PASS, disabled on every two-home box (cell-4 measured five state
+    # dirs). Reproduced by the [VGATE] pass with the holder stopped: the holder's own `--verify`
+    # failed `the loop tick is 10800s old` while the second home's `--verify` said VERIFIED.
+    # Rebinding rather than forking the checks keeps ONE code path, so a new arm added later is
+    # graded for a two-home box for free.
+    # `STATE` is NOT restored: every caller returns straight out of the process from here.
+    holder = loop_holder()
+    if holder is not None and holder[2] and not same_state_dir(holder[2], STATE):
+        print(
+            "  NOTE   this box's scheduler runs under a DIFFERENT state dir (%s) — one loop per box "
+            "(#2890), so the checks below grade THAT loop's evidence, not this state dir's"
+            % describe_holder(holder),
+            flush=True,
+        )
+        STATE = holder[2]
 
     # ⛔ A STAGED COPY THAT IS NOT THE CHECKOUT IS A FAILURE HERE, not a note: a cell runs
     # $CELL_HOME/.pi/agent/scripts/fleet-schedule.py, so when it differs from the checkout this cell
@@ -1875,6 +2307,28 @@ def cmd_verify():
         )
 
     pid = loop_pid()
+    if pid and not pid_is_our_loop(pid):
+        # ⛔ A STALE-BUT-ALIVE PID IN *loop.pid* IS NOT THE LOOP, AND THE BOX LOCK OUTRANKS IT.
+        # `loop_pid()` answers "is that pid alive", so once the pid was recycled onto an unrelated
+        # process the refusal below fired over a box whose scheduler was passing — including when the
+        # recycled pid sits in the HOLDER's own dir, which `cmd_loop` itself documents as reachable
+        # ("the previous pidfile, if any, was left intact" when a pidfile write fails). The box lock
+        # is identity-verified (pid + command line + start time), so it settles the question the
+        # pidfile cannot.
+        # ⛔ NOT A BLANKET RESCUE: with no verified holder this arm changes nothing, so the existing
+        # refusal for a dead scheduler behind a stale pid still fires (case 4b pins it).
+        holder_pid = loop_holder()
+        if holder_pid is not None and same_state_dir(holder_pid[2], STATE):
+            pid = holder_pid[0]
+    if not pid:
+        # ⛔ A HOLDER OVER *THIS* STATE DIR WHOSE PIDFILE WENT MISSING IS NOT A DEAD SCHEDULER —
+        # liveness and identity are proven by the box lock, and failing here would refuse a box that
+        # is passing. (A holder over ANOTHER state dir was already handled by the rebinding above, so
+        # it never reaches this arm — including when THIS dir's stale `loop.pid` holds a recycled
+        # pid, which used to make a correctly-scheduled box fail to bring up.)
+        holder_pid = loop_holder()
+        if holder_pid is not None and same_state_dir(holder_pid[2], STATE):
+            pid = holder_pid[0]
     if not pid:
         failures.append("the scheduler loop is NOT RUNNING (no live pid at %s/loop.pid)" % STATE)
     elif not pid_is_our_loop(pid):
@@ -2043,6 +2497,14 @@ def cmd_verify():
     if failures:
         print("SCHEDULE NOT VERIFIED — %d problem(s) above" % len(failures), file=sys.stderr)
         return 1
+    # ⛔ `pid` IS PROVABLY NOT None HERE. The foreign-holder case does NOT return early any more: it
+    # REBINDS `STATE` to the holder's dir at the top of this function and is graded inline by every
+    # arm below (that is what closed the false PASS). So this line is reachable only after the
+    # liveness arms above passed, which requires a real pid. That is deliberate: an earlier cut formatted `pid` with `%d` while the
+    # foreign-holder arm could leave it None, so `--install`/`--verify` died with
+    # `TypeError: %d format: a real number is required` on exactly the two-home box the arm exists to
+    # un-brick (#3029) — reproduced by the [VGATE] pass. Keeping the failure and this line
+    # structurally disjoint is the fix; a formatting guard would only hide the next such arm.
     print(
         "SCHEDULE VERIFIED — %d job(s) live on this machine (loop pid %d, last tick %s), "
         "%d skipped for a named reason" % (ran, pid, fmt_age(age), len(skipped))
@@ -2107,8 +2569,19 @@ def cmd_install():
     # scheduler — the identical closed feedback loop as the ENOSPC death, reintroduced one line
     # above the guard that exists to prevent it. Per-job and NAMED, exactly as the loop does it:
     # one unusable stamp skips that job and the rest of the set still installs and runs.
+    # ⛔ THE INLINE FIRST PASS IS THE BOX-LEVEL JOB SET, so it needs the SAME box-holder check the
+    # loop takes — and it must come BEFORE the pass, not after it. `--install` is the verb bring-up
+    # runs, and on a two-home box it used to execute the due jobs inline while another home's loop
+    # ran the same jobs beside it (measured by the [VGATE] pass: one job, two runs, one box), which
+    # is exactly the invariant this change claims to establish. Skipping the pass here is not a
+    # weaker proof: the holder IS the proof that this box's job set runs, and `cmd_verify` below
+    # still grades this state dir's stamps.
+    foreign_holder = None
+    holder = loop_holder()
+    if holder is not None and not same_state_dir(holder[2], STATE):
+        foreign_holder = holder
     first = []
-    for j in jobs:
+    for j in ([] if foreign_holder is not None else jobs):
         if j.skip or j.error:
             continue
         try:
@@ -2121,7 +2594,13 @@ def cmd_install():
             continue
         if due:
             first.append(j)
-    if first:
+    if foreign_holder is not None:
+        print(
+            "loop already running (%s) — one loop per box, so the inline first pass is SKIPPED: "
+            "that loop is the proof this box's job set runs (#2890)"
+            % describe_holder(foreign_holder)
+        )
+    elif first:
         print("running the %d due job(s) now (the first pass IS the proof):" % len(first))
     for job in first:
         # ⛔ THIS PASS IS UNGUARDED ELSEWHERE AND IT MUST NOT BE ABLE TO ABORT `--install`.
@@ -2146,11 +2625,16 @@ def cmd_install():
     if pid and pid_is_our_loop(pid):
         print("loop already running (pid %d)" % pid)
     else:
-        pid = spawn_loop()
+        pid, started = spawn_loop()
         if not pid:
             print("FAIL: the scheduler loop did not come up (see %s/loop.log)" % STATE, file=sys.stderr)
             return 1
-        print("loop started (pid %d, tick %ds)" % (pid, TICK))
+        # ⛔ "loop started" IS A CLAIM ABOUT AN ACT. When the box's lock is held by another state
+        # dir, `spawn_loop` returns that holder's pid and started NOTHING — printing "loop started
+        # (pid N)" there reported a pid this verb never created, one line after the honest "a second
+        # delivery path could be beside it" message. Found by the [VGATE] pass.
+        if started:
+            print("loop started (pid %d, tick %ds)" % (pid, TICK))
     return cmd_verify()
 
 
@@ -2194,14 +2678,32 @@ def cmd_start():
             file=sys.stderr,
         )
         return 1
+    # ⛔ THE BOX'S HOLDER IS CHECKED BEFORE THE OFF SWITCH IS CLEARED. Clearing it first was the
+    # worse half of the same defect: on a box scheduled under another state dir this verb starts
+    # nothing, but it would still delete an operator's deliberate OFF. A start that started nothing
+    # must not change anything.
+    # ⛔ ONLY a holder in ANOTHER state dir may short-circuit. A holder over THIS state dir is our
+    # own loop, whose pidfile went missing (a documented state), and returning early there left the
+    # operator's OFF switch in place: the loop then exited at its next check and the box had no
+    # scheduler — while `--start`, the revival verb, answered 0. So an own-state holder falls
+    # THROUGH: the OFF is cleared (the operator said "on"), and `spawn_loop` refuses to add a second
+    # loop because it sees the same verified holder.
+    holder = loop_holder()
+    if holder is not None and not same_state_dir(holder[2], STATE):
+        print(
+            "loop already running (%s) — one loop per box, so this state dir starts none (#2890)"
+            % describe_holder(holder)
+        )
+        return 0
     off = os.path.join(STATE, "OFF")
     if os.path.exists(off):
         os.unlink(off)  # --start is the operator saying "on"; the OFF switch is cleared on purpose
-    pid = spawn_loop()
+    pid, started = spawn_loop()
     if not pid:
         print("FAIL: the scheduler loop did not come up (see %s/loop.log)" % STATE, file=sys.stderr)
         return 1
-    print("loop started (pid %d, tick %ds)" % (pid, TICK))
+    if started:
+        print("loop started (pid %d, tick %ds)" % (pid, TICK))
     return 0
 
 
@@ -2313,13 +2815,17 @@ def main(argv):
         return 2
 
     INFRA_ROOT = resolve_infra_root()
-    STATE = os.environ.get("FLEET_SCHEDULE_STATE") or os.path.join(
+    # ⛔ ABSOLUTE, because the state dir's SPELLING is compared against the box lock's record
+    # (`same_state_dir`): a relative `FLEET_SCHEDULE_STATE` would resolve against the CALLER's cwd,
+    # so the same dir spelled relatively and absolutely would read as two — a false "another state
+    # dir holds the box". A no-op for the shipped absolute defaults and for a pinned absolute value.
+    STATE = os.path.abspath(os.environ.get("FLEET_SCHEDULE_STATE") or os.path.join(
         os.environ.get("CELL_HOME") or os.environ.get("HOME", ""),
         ".pi",
         "agent",
         "state",
         "fleet-schedule",
-    )
+    ))
     TEMPLATES_DIR = os.environ.get("TEMPLATES_DIR") or (
         os.path.join(INFRA_ROOT, "templates", "launchd") if INFRA_ROOT else ""
     )
@@ -2353,6 +2859,14 @@ def main(argv):
             print("FAIL: no agent-infra checkout found (set INFRA_ROOT or AGENT_INFRA_PATH)", file=sys.stderr)
             return 1
         return cmd_darwin(mode)
+
+    # The BOX's loop mutex (#2890), resolved ONLY on the platform that has a loop and ONLY for the
+    # verbs that can reach one. `--loop` needs it before its first write; `--start`/`--install`/
+    # `--verify` must answer "is this box already scheduled" with the SAME path the loop claims
+    # with. Resolution creates nothing and never raises — a degraded root is disclosed there, and
+    # `--status`/`--check` stay silent because they never touch the lock.
+    if mode in ("--loop", "--start", "--install", "--verify"):
+        resolve_loop_lock()
 
     if not TEMPLATES_DIR and mode != "--stop":
         print(

@@ -37,6 +37,7 @@
 #   DRAINER_STATE      the drainer's state dir ($AI)                   default: $HOME/orchestrator-ai
 #   DRAINER_REPO_SLUG  owner/name the brief names                      default: daniel-ospina/agent-infra
 #   DRAINER_SEED_REPO  checkout the lane's worktree is branched from    default: $HOME/agent-infra-main
+#   DRAINER_FLEET_REPO checkout whose origin carries refs/boxes/*      default: $DRAINER_SEED_REPO
 #   MAX_LANES          CPU-side ceiling of the lane target. RENDERED BLANK by default, so the unit
 #                      carries no pin and the drainer DERIVES it from this box's cores on every tick
 #                      (floor(ncpu x 5/2), the fleet's 2026-10-17 ruling) — a value rendered here is a
@@ -71,6 +72,16 @@ DRAINER_O="${DRAINER_O:-$HOME_DIR/orchestrator}"
 DRAINER_STATE="${DRAINER_STATE:-$HOME_DIR/orchestrator-ai}"
 DRAINER_REPO_SLUG="${DRAINER_REPO_SLUG:-daniel-ospina/agent-infra}"
 DRAINER_SEED_REPO="${DRAINER_SEED_REPO:-$HOME_DIR/agent-infra-main}"
+# The queue repo whose origin carries `refs/boxes/*`. Rendered into the unit so the fleet line can say
+# WHICH channel it read (`chan=`). The seed checkout is the default because it carries the same origin
+# on this fleet — and ⛔ AN INSTALLED UNIT DOES NOT RE-CHECK THAT (fresh review round 12, P2; the
+# comment that stood here claimed the opposite). The drainer's seed-origin guard runs ONLY while
+# `FLEET_REPO` is EMPTY (`ai-drainer.sh`: `[ -z "$FLEET_REPO" ] && [ -n "${SEED_REPO:-}" ] …`), and this
+# installer always renders `Environment=FLEET_REPO={{FLEET_REPO}}`, so on every unit it writes that
+# guard is DEAD CODE. What the installed path does get is ATTRIBUTION: `chan=` stamps the channel it
+# actually read, so a wrong-but-readable seed reports `published=0 INELIGIBLE=N … chan=<that repo>` —
+# named, not silent. Override `DRAINER_FLEET_REPO` when the seed checkout is not the fleet's channel.
+DRAINER_FLEET_REPO="${DRAINER_FLEET_REPO:-$DRAINER_SEED_REPO}"
 SYSTEMCTL="${SYSTEMCTL:-}"
 SUDO="${SUDO:-sudo -n}"
 
@@ -142,6 +153,7 @@ render() { # <template> <dest>
         -e "s|{{AI}}|$DRAINER_STATE|g" \
         -e "s|{{REPO_SLUG}}|$DRAINER_REPO_SLUG|g" \
         -e "s|{{SEED_REPO}}|$DRAINER_SEED_REPO|g" \
+        -e "s|{{FLEET_REPO}}|$DRAINER_FLEET_REPO|g" \
         -e "s|{{MAX_LANES}}|${MAX_LANES:-}|g" \
         -e "s|{{MIN_SWAP_MB}}|${MIN_SWAP_MB:-700}|g" \
         -e "s|{{LANE_TIMEOUT}}|${LANE_TIMEOUT:-$DRAINER_LANE_TIMEOUT}|g" \

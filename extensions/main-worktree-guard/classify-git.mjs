@@ -3301,13 +3301,182 @@ export function joinContinuations(command) {
  * @param {string} command
  * @returns {boolean}
  */
+/**
+ * Quote-, escape- and extglob-aware split of a command on the PIPELINE operator
+ * `|` (#3243).
+ *
+ * `String.split("|")` has NO quote model, so a `|` inside a QUOTED word was read
+ * as a pipeline: `grep -n "bash\|sh -x" f | head -2` split into `… grep -n "bash\`
+ * and `sh -x" f `, the second segment's head read as the interpreter `sh`, and
+ * the whole command was refused as "piped into a shell" — the scanner reading
+ * DATA as code. That is the false positive `test-command-position.mjs` pins as
+ * KNOWN-FALSE D5, and the one that refused a read-only `grep -E "(bash|sh)" | head`
+ * on 2026-11-02. The `|` of an extglob group (`./undo@(-g|).sh`) and the `||`
+ * logical operator are not pipelines either; a REAL pipeline's `|` is unquoted,
+ * so this narrowing cannot hide one.
+ * @param {string} command
+ * @returns {string[]} the pipeline segments (a one-element array when there is
+ *   no unquoted `|`)
+ */
+export function wtSplitPipeline(command) {
+  const s = String(command ?? "");
+  const out = [];
+  let cur = "";
+  let quote = null;
+  let globDepth = 0; // inside an extglob group `@( … | … )`
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    if (quote) {
+      cur += ch;
+      // A backslash inside DOUBLE quotes escapes only `$`, backtick, `\` and
+      // newline (same rule as `wtShellWords`) — otherwise the quote after it
+      // really closes the word.
+      if (ch === "\\" && quote === '"' && '"$`\\\n'.includes(s[i + 1] ?? "")) { cur += s[i + 1] ?? ""; i++; continue; }
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === "\\") { cur += ch + (s[i + 1] ?? ""); i++; continue; }
+    if (ch === "'" || ch === '"') { quote = ch; cur += ch; continue; }
+    if (ch === "(" && /[?*+@!]$/.test(cur)) { globDepth++; cur += ch; continue; }
+    if (globDepth > 0) { if (ch === ")") globDepth--; cur += ch; continue; }
+    if (ch === "|") {
+      if (s[i + 1] === "|") { cur += "||"; i++; continue; } // logical OR
+      out.push(cur); cur = ""; continue;
+    }
+    cur += ch;
+  }
+  // ⛔ AN UNTERMINATED QUOTE MEANS THE MODEL CANNOT BE TRUSTED PAST IT (#3243
+  // review cycle-1, F1). A quote left open at the end of the text is not a valid
+  // shell word sequence — it is a COMMENT apostrophe (`# don't touch the copy`), a
+  // HERE-DOCUMENT body, or ANSI-C `$'…'` quoting (whose `\'` IS an escape while a
+  // plain `'…'` has none, so the model closes or opens the wrong one). Past that
+  // point every later `|` is read as DATA, and a real `cat ./undo*.sh | bash`
+  // became ALLOWED where the pre-#3243 blind `split("|")` refused it — a
+  // fail-OPEN regression, measured on four shapes (top-level ANSI-C, a comment
+  // apostrophe, a here-doc data apostrophe, an ANSI-C `printf`). The fallback is
+  // therefore the BLIND split: it has no quote state and can only OVER-report,
+  // which is this arm's fail-closed direction. A well-formed command never reaches
+  // it, so the narrowing that removes the D5 false positive still holds.
+  //
+  // ⛔ AND THE SAME HOLDS FOR THE OTHER STATE VARIABLE (#3243 review cycle-2, F1).
+  // `quote` is not the only thing this model tracks: `globDepth` is stranded
+  // exactly the same way by an UNTERMINATED extglob group (`# it is *(broken`,
+  // `regex: a+(b|c` — a comment or heredoc line that is DATA, inert in a real
+  // shell). While `globDepth > 0`, EVERY `|` and every `'`/`"` is swallowed as
+  // data, so a real unquoted pipeline merges into one segment and
+  // `wtPipelineFeedsShell` cannot see the consumer. Testing only `quote` left
+  // `cat ./undo*.sh | bash` ALLOWED on five measured shapes where the base
+  // BLOCKS — the F1 regression one state variable over, and it also falsified
+  // this function's own claim that "a REAL pipeline's `|` is unquoted, so this
+  // narrowing cannot hide one". Both desync sources take the blind split, which
+  // can only OVER-report.
+  if (quote !== null || globDepth > 0) return s.split("|");
+  out.push(cur);
+  return out;
+}
+
+/**
+ * Is this command-position WORD shaped like a PATH at all? (#3243)
+ *
+ * The #1228 arm exists to refuse a script path the SHELL resolves at runtime, so
+ * the expansion forms themselves (`$`, backtick, `*`, `?`, `[...]`, `{…}`,
+ * extglob, a leading `~`) are ALLOWED here — refusing them is the arm's job.
+ * What a path is not is a PROGRAM'S TEXT. `awk '/^tree=/{t=$2}'`, a sed
+ * expression `s/[[:space:]]*$//` and a grep alternation were each read as an
+ * executed script path, which refused the ENTIRE script that contains them
+ * (measured 2026-11-02 on `scripts/orchestrator-harness/nonblocking-dispatch.sh`,
+ * `pi-bootstrap/tests/test-farm-unfarm.sh`, `scripts/worktree-hygiene-sweep.sh`,
+ * `scripts/pi-cache-reap.test.sh`).
+ *
+ * The rule is POSITIVE, not a deny list of the programs seen so far: replace
+ * every expansion form with a placeholder and require what REMAINS to be a plain
+ * path — components over `[A-Za-z0-9._+@!%~-]` joined by `/`.
+ *
+ * ⛔ BUT A POSITIVE GRAMMAR IS USED AS A **FILTER ON A PATH THE SHELL EXECUTES**,
+ * so every byte it REJECTS is a script this arm can no longer see — a rejection
+ * does not "prove the word is data", it DELETES the candidate (#3243 review
+ * cycle-2, F2). The first cut of this function also rejected `\`, `,`, `:`, `=`,
+ * `^` and `#`, on the stated grounds that a shell would not run a path carrying
+ * them. That is false: `,`, `:`, `=`, `^` and a non-leading `#` are ordinary
+ * FILENAME bytes, and `\` spells a LITERAL (escaped) byte in a path. Measured,
+ * each spelling below really executes the destructive script and the pre-#3243
+ * arm refused it, while the first cut of this change ALLOWED it —
+ * `./undo,2-*.sh`, `./undo2-\*.sh`, `./undo^*X.sh`, `./undo=1*.sh`,
+ * `./undo:1*.sh`, `./undo#1*.sh`. This is the same lesson the `?` branch below
+ * records ("a shape test that drops a glob is a fail-OPEN"), applied to every
+ * other byte.
+ *
+ * The terminal test is therefore TWO-ORed ACCEPTS, both of which can only ADD a
+ * candidate: a remaining word over the plain alphabet, OR a word with an
+ * EXPLICIT path prefix (`./`, `../`, `~/`) whatever bytes follow it. Program text
+ * — `awk '/^tree=/{t=$2}'`, the sed expression `s/[[:space:]]*$//` — carries no
+ * such prefix, so the #3243 false positives stay false.
+ * @param {unknown} word
+ * @returns {boolean}
+ */
+export function wtIsPathShapedScriptWord(word) {
+  let s = String(word ?? "").trim();
+  if ((s.startsWith('"') && s.endsWith('"')) || (s.startsWith("'") && s.endsWith("'"))) s = s.slice(1, -1);
+  if (!s) return false;
+  // A path carries a separator or a leading `~`; a bare word resolves through
+  // PATH, not through this arm (same rule `directish` states).
+  if (!/[\/~]/.test(s)) return false;
+  const PH = "\u0000";
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const ch = s[i];
+    // ⛔ QUOTING IS SHELL SYNTAX, NOT A PATH CHARACTER — and it may be MID-WORD
+    // (#3243 review cycle-1, F2). Rejecting every quote made `"$TOOLS"/undo.sh`
+    // and `./run"$S".sh` fail this grammar, so the arm stopped seeing a REAL
+    // runtime-resolved script path that the pre-#3243 `directish` (which had no
+    // shape test at all) refused: measured BLOCK on the base, ALLOW on the first
+    // cut of this change, and both spellings really execute the file. Quoting a
+    // path is ordinary shell (`"$DIR"/x.sh`), so the quotes are skipped and the
+    // rest of the word is judged on its own. Skipping can only ADD candidates,
+    // never remove one, so it cannot open anything the old test caught.
+    if (ch === '"' || ch === "'") continue;
+    // An ESCAPE spells one LITERAL byte (`./undo2-\*.sh` is the file whose name
+    // contains a `*`), so it is a path character, not a disqualifier (#3243
+    // review cycle-2, F2). Placeholder it: the byte is present and it is not an
+    // expansion form, which is exactly what the later arms need to know.
+    if (ch === "\\") { out += PH; i++; continue; }
+    if (ch === "`") {
+      const end = s.indexOf("`", i + 1);
+      if (end < 0) return false; // unbalanced — prose, not a substitution
+      out += PH; i = end; continue;
+    }
+    if (ch === "$") {
+      let j = i + 1;
+      if (s[j] === "{") { const e = s.indexOf("}", j); if (e < 0) return false; j = e + 1; }
+      else if (s[j] === "(") { const e = s.indexOf(")", j); if (e < 0) return false; j = e + 1; }
+      else while (j < s.length && /[A-Za-z0-9_]/.test(s[j])) j++;
+      out += PH; i = j - 1; continue;
+    }
+    if (ch === "*") { out += PH; continue; }
+    // ⛔ `?` IS A GLOB, and it is named in this function's own contract above — it
+    // was simply not implemented, so `./undo-1228?.sh` failed the grammar and the
+    // arm went BLIND on a real single-character glob (caught by B13 the moment the
+    // `sp` branch started consulting this predicate). A shape test that drops a
+    // glob is a fail-OPEN, which is why it is pinned by an arm in both directions.
+    if (ch === "?") { out += PH; continue; }
+    if (ch === "[") { const e = s.indexOf("]", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "{") { const e = s.indexOf("}", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    if (ch === "(") { const e = s.indexOf(")", i + 1); if (e < 0) return false; out += PH; i = e; continue; }
+    out += ch;
+  }
+  // TWO-ORed ACCEPTS — see the contract above: a rejection here deletes the
+  // candidate and blinds the arm, so the only safe direction is to accept more.
+  if (/^[A-Za-z0-9._+@!%~\u0000/-]+$/.test(out) && /[\/~]/.test(out)) return true;
+  return /^(?:\.{1,2}|~)\//.test(s);
+}
+
 export function wtPipelineFeedsShell(command) {
   const STDIN_ALIAS = /^(?:-|\/dev\/stdin|\/dev\/fd\/0|\/proc\/self\/fd\/0)$/;
   // A REDIRECTION is not an operand either (`… | bash 2>/dev/null` executes the
   // pipe as code; treating `2>/dev/null` as a script operand silently disabled
   // the whole arm — reviewer round-11 P0).
   const REDIRECT = /^[0-9]*(?:>>?|<<?|<>|>&|<&|&>)/;
-  return String(command ?? "").split("|").slice(1).some((seg) => {
+  return wtSplitPipeline(command).slice(1).some((seg) => {
     const head = _wtHeadInterpreter(seg);
     if (head === null) return false;
     const base = basename(String(head));
@@ -10138,4 +10307,748 @@ function _expandMarkerToken(token, home) {
   else if (t.startsWith("~/")) t = join(home, t.slice(2));
   t = t.replace(/\$\{HOME\}|\$HOME\b/g, home);
   return t;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// #3444 — REMOTE-EXEC CONTEXT BOUNDARY
+//
+// The guards in index.ts resolve PATHS and HUB STATE against the LOCAL
+// checkout. That is right for a command that runs here, and wrong for one whose
+// execution target is another box: `cmux vm exec <vm> -- …`, `ssh <host> …` and
+// `docker exec <c> …` run the remainder of the command somewhere the guard
+// cannot see. Measured 2026-11-04 (#3444), from a hub-rooted session:
+//   • `cmux vm exec cell -- sh -c 'git worktree add rev-3168'` → #1919 resolved
+//     the RELATIVE target against the LOCAL hub and printed the local path;
+//   • `… -- sh -c 'cd /srv/repo && git checkout feat/x'` → #1484's hub-state
+//     gate (and, on a clean hub, M3) judged the LOCAL checkout;
+//   • `… -- sh -c 'cd /srv/repo && git pull --ff-only && make test'` → #1144's
+//     sync allowance read the LOCAL tree state;
+//   • an opaque payload fed to a REMOTE shell → the M4 unverifiable-content arm
+//     failed closed on content that never runs here.
+// ~87 idle lanes on four cells were unusable from the hub because of it.
+//
+// This does NOT weaken a local guard: it MASKS the remote payload so the
+// downstream gates see only the text that can actually run locally. The mask is
+// deliberately conservative in the fail-closed direction:
+//   • it ENDS at the first top-level separator (`;`, `&&`, `||`, `|`, `&`,
+//     newline) — a trailing LOCAL segment stays fully gated;
+//   • a REDIRECTION stays visible with its target, so `cmux vm exec … > <hub
+//     file>` is still gated as the local write it is — and a redirect in the
+//     OPERAND position (`ssh <host> > <file>`) is not a boundary at all, because
+//     it truncates a LOCAL file and hands ssh no command;
+//   • a substitution that RUNS LOCALLY is never masked: a backtick region
+//     (unquoted or double-quoted) is ONE local token and is kept WHOLE, and an
+//     unquoted/double-quoted `$(…)` is kept with its token. (An earlier revision
+//     kept only the token that OPENED the backtick, which left `` `git `` visible
+//     and masked `reset --hard` — a local invocation hidden by the mask; #3478
+//     review P0.) A single-quoted spelling does not run locally and is masked
+//     with the rest of the payload. An UNQUOTED `$(`/`((` is a top-level
+//     separator for this scanner, so it ENDS the mask and the remainder is gated
+//     exactly as before the fix (fail-closed, documented rather than modelled);
+//   • a heredoc BODY is masked with the payload it belongs to (`sh -s <<'EOF'`
+//     is how a lane ships a script to a cell) while its TERMINATOR line and the
+//     REST OF THE DELIMITER LINE are kept — they are structure and LOCAL text
+//     (`… <<'EOF'; cmd`, `… <<'EOF' > f`), and masking them made the next local
+//     command read as body data. Plain `<<` requires the terminator at column 0;
+//     `<<-` strips tabs. A heredoc with no payload word (`ssh cell <<'EOF'`) is
+//     itself the payload;
+//   • the replacement is ONE inert word, so nothing downstream can mistake it
+//     for an invocation or a path;
+//   • a shape this scan cannot PROVE is left unmasked (today's gating): a
+//     non-bare or quoted transport word, a transport name redefined earlier
+//     (`ssh() { … }`, `alias`, `eval`/`source`/`.`), a wrapper head (`sudo`,
+//     `env`), a scan that ends INSIDE a quote, and two heredocs on one command
+//     line;
+//   • a payload piped INTO a local shell (`cmux vm exec … | bash -s`) is left
+//     unmasked: the pipe is built here and the remote stdout runs as a local
+//     script, which is exactly the case the #709 arm refuses. The stage head is
+//     read through decorations (`|&`, `| (bash)`, `| { bash; }`) and an
+//     unreadable head (a quote, a `$`, an empty stage) also counts as a shell —
+//     fail closed, so an unmodelled spelling re-gates rather than slips past.
+// ─────────────────────────────────────────────────────────────────────────
+
+/** ssh(1) options whose VALUE is the next word (`-p 22`, `-o K=V`, `-i key`). */
+const _RB_SSH_VALUE_FLAGS = new Set([
+  "-B", "-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i", "-J", "-L", "-l",
+  "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w",
+]);
+/** `docker exec` options whose VALUE is the next word. */
+const _RB_DOCKER_EXEC_VALUE_FLAGS = new Set([
+  "-e", "--env", "--env-file", "-u", "--user", "-w", "--workdir", "--detach-keys",
+]);
+/** Tokens that START (or end) a shell command in the walk below. */
+const _RB_SEPARATORS = new Set([";", ";;", "&&", "||", "|", "&", "\n", "(", ")"]);
+/** A redirection operator token (`>`, `>>`, `2>`, `>&`, `<<`, `<<-`, `<<<`, …). */
+const _RB_REDIRECT_RE = /^(?:\d*(?:>>|>&|>\||<<<|<<-?|<&|<|>)|&>>|&>)/;
+/** The one inert word a masked remote payload is replaced with. */
+export const REMOTE_PAYLOAD_PLACEHOLDER = "_remote_payload_";
+
+/** #3444 — quote-aware word/operator tokens carrying their SOURCE offsets, so a
+ *  caller can mask ranges without re-spelling the text it keeps.
+ *
+ *  Two shapes here are not cosmetic, because the mask must never disagree with
+ *  what the SHELL will run (review #3478 cycle 2, both measured fail-opens):
+ *   • a `#` at the START of a word begins a comment, and the shell discards the
+ *     rest of that LINE — including any quote character in it. Quote-scanning a
+ *     comment let `# don't` open a quote region that swallowed the newline, so
+ *     the NEXT (genuinely local) line was masked away;
+ *   • `$'…'` is ANSI-C quoting, where `\'` is an ESCAPE and does not close the
+ *     string. Reading it as a plain `'…'` closed the region early, re-opened
+ *     another, and again swallowed the newline.
+ *  `unterminated` reports a word scan that ended INSIDE a quote. A valid command
+ *  cannot do that except inside a comment, so the caller leaves the command
+ *  unmasked (fail-closed) rather than trust its own reading of it.
+ *  @returns {{tokens: Array<{start:number,end:number,text:string,op:boolean,redirect?:boolean,localSubst?:boolean}>, unterminated: boolean}} */
+function _rbTokens(s) {
+  const out = [];
+  let i = 0;
+  let unterminated = false;
+  const n = s.length;
+  while (i < n) {
+    const ch = s[i];
+    if (ch === " " || ch === "\t" || ch === "\r") { i++; continue; }
+    if (ch === "\\" && s[i + 1] === "\n") { i += 2; continue; }
+    if (ch === "\n") { out.push({ start: i, end: i + 1, text: "\n", op: true }); i++; continue; }
+    if (ch === "&" || ch === "|" || ch === ";" || ch === "(" || ch === ")") {
+      const two = s.slice(i, i + 2);
+      const text = two === "&&" || two === "||" || two === ";;" ? two : ch;
+      out.push({ start: i, end: i + text.length, text, op: true });
+      i += text.length;
+      continue;
+    }
+    if (ch === "<" || ch === ">") {
+      const m = _RB_REDIRECT_RE.exec(s.slice(i));
+      if (m) {
+        out.push({ start: i, end: i + m[0].length, text: m[0], op: true, redirect: true });
+        i += m[0].length;
+        continue;
+      }
+    }
+    // A `#` that STARTS a word is a comment to end-of-line. It is one opaque
+    // token and is NOT quote-scanned: its text is discarded by the shell, so a
+    // quote inside it must not change how the next line is read.
+    if (ch === "#") {
+      const nl = s.indexOf("\n", i);
+      const end = nl < 0 ? n : nl;
+      out.push({ start: i, end, text: s.slice(i, end), op: false, comment: true });
+      i = end;
+      continue;
+    }
+    const start = i;
+    let text = "";
+    let quote = null;   // null | "'" | '"' | "$'"
+    let localSubst = false;
+    while (i < n) {
+      const c = s[i];
+      // ANSI-C: `\x` is an escape, so `$'don\'t'` is ONE region.
+      if (quote === "$'") {
+        text += c;
+        if (c === "\\" && i + 1 < n) { text += s[i + 1]; i += 2; continue; }
+        if (c === "'") quote = null;
+        i++;
+        continue;
+      }
+      if (quote === "'") { text += c; if (c === "'") quote = null; i++; continue; }
+      if (quote === '"') {
+        // An unescaped backtick inside DOUBLE quotes still runs in the LOCAL
+        // shell. The WHOLE region it opens belongs to this token — masking the
+        // words after the opening backtick split `\`git` / `reset` / `--hard\``
+        // into a visible `` `git `` and a masked rest, so the local invocation
+        // vanished (review #3478 P0).
+        if (c === "`") { localSubst = true; i = _rbBacktickRegionEnd(s, i); text = s.slice(start, i); continue; }
+        if (c === "$" && s[i + 1] === "(") localSubst = true;
+        if (c === "\\" && i + 1 < n) { text += c + s[i + 1]; i += 2; continue; }
+        text += c; if (c === '"') quote = null; i++;
+        continue;
+      }
+      if (c === "\\") { text += c + (s[i + 1] ?? ""); i += 2; continue; }
+      if (c === "$" && s[i + 1] === "'") { quote = "$'"; text += "$'"; i += 2; continue; }
+      if (c === "'" || c === '"') { quote = c; text += c; i++; continue; }
+      // #3444 review (#3478 P0): an UNQUOTED backtick region is ONE word. Taking
+      // only the opening token let the region's remaining words fall into the
+      // mask, and `` `git reset --hard` `` is executed by THIS shell.
+      if (c === "`") { localSubst = true; i = _rbBacktickRegionEnd(s, i); text = s.slice(start, i); continue; }
+      if (c === "$" && s[i + 1] === "(") localSubst = true;
+      if (c === " " || c === "\t" || c === "\r" || c === "\n" || c === "&" || c === "|" || c === ";"
+          || c === "(" || c === ")" || c === "<" || c === ">") break;
+      text += c;
+      i++;
+    }
+    if (quote !== null) unterminated = true;
+    out.push({ start, end: i, text, op: false, localSubst });
+  }
+  return { tokens: out, unterminated };
+}
+
+/** The first index AFTER the backtick region opening at `from` (a lone opening
+ *  backtick runs to end-of-string, exactly as the shell would). */
+function _rbBacktickRegionEnd(s, from) {
+  const close = s.indexOf("`", from + 1);
+  return close < 0 ? s.length : close + 1;
+}
+
+/** SHELL QUOTE REMOVAL for a heredoc delimiter word: `'EOF'` / `"EOF"` /
+ *  `$'EOF'` / `$"EOF"` / `E"OS"` / `\EOF` → `EOF` (the word the shell compares a
+ *  terminator against). This is quote REMOVAL, not expansion: bash leaves
+ *  `$X`, `${X}`, `` `…` `` and `~` LITERAL in a delimiter (measured), and the
+ *  remover agrees.
+ *
+ *  ⛔ It must be real quote removal, not a pair of `slice(1, -1)` calls: `<<$'EOS'`
+ *  and `<<E"OS"` used to keep their quotes, so the terminator never matched, the
+ *  mask ran to end-of-string and every LOCAL command after the real terminator
+ *  was hidden (review #3478 cycle 4 P0).
+ *  @returns {string|null} null when the word holds a construct this remover
+ *    cannot resolve — the caller then leaves the command UNMASKED (fail-closed). */
+function _rbUnquoteDelim(word) {
+  const t = String(word ?? "").trim();
+  // ⛔ A `\r` (CRLF line ending) is part of a bash WORD — it is not IFS whitespace
+  // and not a metacharacter — so `<<'EOS'\r` has the delimiter `EOS\r`. The
+  // tokenizer trims it, which would compute `EOS`, find no terminator and mask to
+  // end-of-string, dropping every LOCAL command after the real terminator (review
+  // #3478 cycle 5 P0). A word carrying a CR is therefore UNRESOLVED.
+  if (t.includes("\r")) return null;
+  const ANSI = { n: "\n", t: "\t", r: "\r", a: "\x07", b: "\b", f: "\f", v: "\v", e: "\x1b", "\\": "\\", "'": "'", '"': '"', "?": "?" };
+  let out = "";
+  let i = 0;
+  while (i < t.length) {
+    const c = t[i];
+    if (c === "'") {                                  // single quotes: literal
+      const e = t.indexOf("'", i + 1);
+      if (e < 0) return null;
+      out += t.slice(i + 1, e);
+      i = e + 1;
+      continue;
+    }
+    if (c === '"') {                                  // double quotes: \ only for $ ` " \ and newline
+      i++;
+      let closed = false;
+      while (i < t.length) {
+        if (t[i] === "\\" && t[i + 1] === "\n") { i += 2; continue; }   // bash DELETES `\`+newline
+        if (t[i] === "\\" && i + 1 < t.length && '$`"\\'.includes(t[i + 1])) { out += t[i + 1]; i += 2; continue; }
+        if (t[i] === '"') { closed = true; i++; break; }
+        out += t[i++];
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (c === "$" && t[i + 1] === "'") {              // ANSI-C quoting
+      i += 2;
+      let closed = false;
+      while (i < t.length) {
+        if (t[i] === "\\" && i + 1 < t.length) {
+          const nx = t[i + 1];
+          // ⛔ bash DECODES a character-code escape here (`\101`, `\x41`, `\u00e9`,
+          // `\cA`, `\E`). This remover does not, and a WRONG delimiter is worse than
+          // no mask at all: it never matches the real terminator, so the mask runs to
+          // end-of-string and hides every LOCAL command after it (review #3478 cycle 5
+          // P0). Unresolved ⇒ the whole command is left unmasked.
+          if (/[0-7xuUcE]/.test(nx)) return null;
+          // A KNOWN simple escape maps; an unknown one KEEPS its backslash, exactly
+          // as bash does (`$'\d'` is `\d`).
+          out += Object.prototype.hasOwnProperty.call(ANSI, nx) ? ANSI[nx] : "\\" + nx;
+          i += 2;
+          continue;
+        }
+        if (t[i] === "'") { closed = true; i++; break; }
+        out += t[i++];
+      }
+      if (!closed) return null;
+      continue;
+    }
+    if (c === "$" && t[i + 1] === '"') { i++; continue; }   // $"…": the `"` branch handles the body
+    if (c === "\\") {
+      if (i + 1 >= t.length) return null;
+      // A `\`+newline is DELETED by bash, not turned into a newline: emitting the
+      // newline computed a delimiter the shell never uses, so no terminator matched
+      // and the mask ran to end-of-string (review #3478 cycle 6 P2).
+      if (t[i + 1] === "\n") { i += 2; continue; }
+      out += t[i + 1]; i += 2; continue;
+    }
+    out += c;
+    i++;
+  }
+  return out;
+}
+
+/** The source range of a heredoc folded around `delim`: `bodyStart` is the first
+ *  character of the BODY (the caller supplies it from the TOKEN stream — the first
+ *  top-level newline token — because a `\`+newline continuation or a quote that
+ *  spans a newline joins the LOGICAL line, and cutting at the first PHYSICAL
+ *  newline dropped the joined remainder of a local command; review #3478 cycle 4
+ *  P0), `termStart` the first character of the TERMINATOR line and `afterTerm`
+ *  the newline that ends it (or end-of-string when the terminator never appears —
+ *  the shell would swallow the rest of the input too). The terminator line is NOT
+ *  part of the body: masking it would leave a heredoc no downstream parser can
+ *  close, and the next local command would be swallowed as body data (a
+ *  fail-open).
+ *  `stripTabs` mirrors `<<-` (leading TABS are ignored) — plain `<<` requires the
+ *  terminator at column 0, and accepting an indented one would end the mask
+ *  early and expose the rest of the remote script as local text. */
+function _rbHeredocBodyRange(s, bodyStart, delim, stripTabs = false) {
+  if (!delim) return { bodyStart, termStart: bodyStart, afterTerm: bodyStart };
+  const body = Math.max(0, Math.min(bodyStart, s.length));
+  let lineStart = body;
+  while (lineStart <= s.length) {
+    const end = s.indexOf("\n", lineStart);
+    const line = end < 0 ? s.slice(lineStart) : s.slice(lineStart, end);
+    const candidate = stripTabs ? line.replace(/^\t+/, "") : line;
+    if (candidate === delim) {
+      return { bodyStart: body, termStart: lineStart, afterTerm: end < 0 ? s.length : end };
+    }
+    if (end < 0) break;
+    lineStart = end + 1;
+  }
+  return { bodyStart: body, termStart: s.length, afterTerm: s.length };
+}
+
+/** Could `prefix` REDEFINE a transport name — or build a definition no text scan
+ *  can read? `ssh() { … }; ssh host cmd` resolves the NAME locally and runs `cmd`
+ *  HERE; `eval '…'` / `source file` / POSIX `.` construct the definition from text
+ *  this scan never sees. Either way the boundary proof is void, so the command is
+ *  left UNMASKED (today's gating). Over-matching only re-gates — fail closed. */
+function _rbMayRedefineTransport(prefix) {
+  const s = String(prefix ?? "");
+  if (!s) return false;
+  return /(?:^|[;&|(){}\s'"$])(?:function\s+)?(?:cmux|ssh|docker)\s*\(\s*\)/.test(s)
+    || /\bfunction\s+(?:cmux|ssh|docker)\b/.test(s)
+    || /\balias\s+(?:-[A-Za-z]+\s+)*(?:cmux|ssh|docker)\s*=/.test(s)
+    || /(?:^|[;&|(){}\s])(?:eval|source)\s/.test(s)
+    || /(?:^|[;&|])\s*\.\s+\S/.test(s);
+}
+
+/** The token index where the FIRST remote payload of this command starts, or
+ *  null when the command has no remote-exec invocation at all.
+ *
+ *  Recognised boundaries (the command word must stand at COMMAND POSITION and be
+ *  the BARE word — so `grep 'cmux vm exec'` is an operand, and `./ssh`/`/usr/bin/ssh`
+ *  is a LOCAL file that runs its own argv HERE, not a boundary):
+ *    • `cmux vm exec … <vm> -- <payload…>`  (the `--` is the marker)
+ *    • `ssh [options] <host> [payload…]`
+ *    • `docker exec [options] <container> [payload…]`
+ *  @param {{start:number,op:boolean,text:string}[]} tokens
+ *  @param {string} source the command text the tokens came from (for the
+ *    transport-redefinition proof; the tokens alone cannot see it) */
+function _rbRemotePayloadStart(tokens, source) {
+  const s = String(source ?? "");
+  const word = (t) => (t && !t.op ? String(t.text) : null);
+  for (let k = 0; k < tokens.length; k++) {
+    const tk = tokens[k];
+    if (!tk || tk.op) continue;
+    const prev = tokens[k - 1];
+    const atCommandPos = !prev || (prev.op && _RB_SEPARATORS.has(prev.text));
+    if (!atCommandPos) continue;
+    // ⛔ The transport must be the BARE word. A PATH-QUALIFIED token (`./ssh`,
+    // `/usr/bin/ssh`) or a quoted one (`"ssh"`) is a LOCAL file/shape that can
+    // run the same argv HERE — the boundary proof does not hold. Cost: such a
+    // spelling is gated as before (declared residual, fail closed).
+    const head = String(tk.text);
+    if (head !== "cmux" && head !== "ssh" && head !== "docker") continue;
+    // ⛔ An ARRAY LITERAL is not command position: `arr=(ssh cell 'x')` stores the
+    // words, it runs nothing (review #3478 cycle 5 P2). `(` follows a `name=` word.
+    if (prev && prev.op && prev.text === "(") {
+      const before = tokens[k - 2];
+      if (before && !before.op && /=$|\+=$/.test(String(before.text))) continue;
+    }
+    // ⛔ And nothing BEFORE it may have been able to redefine the name
+    // (`ssh() { … }`, `alias ssh=…`, `eval`/`source`/`.`), or the "remote"
+    // segment executes locally.
+    if (_rbMayRedefineTransport(s.slice(0, tk.start))) continue;
+    if (head === "cmux") {
+      if (word(tokens[k + 1]) !== "vm" || word(tokens[k + 2]) !== "exec") continue;
+      let p = -1;
+      for (let j = k + 3; j < tokens.length; j++) {
+        const t = tokens[j];
+        if (t.op) { if (_RB_SEPARATORS.has(t.text)) break; continue; }
+        if (t.text === "--") { p = j + 1; break; }
+      }
+      if (p < 0) continue;                    // no `--` marker → no command was handed over
+      // The payload must BEGIN at a word. A redirect here (`cmux vm exec c -- >
+      // a.txt`) performs the write LOCALLY, so the target is not payload (review
+      // #3478 P0): no payload → no mask.
+      if (p >= tokens.length || tokens[p].op) continue;
+      return p;
+    }
+    const isDockerExec = head === "docker" && word(tokens[k + 1]) === "exec";
+    if (head !== "ssh" && !isDockerExec) continue;
+    const flags = head === "ssh" ? _RB_SSH_VALUE_FLAGS : _RB_DOCKER_EXEC_VALUE_FLAGS;
+    let j = k + (head === "ssh" ? 1 : 2);
+    let operand = -1;
+    while (j < tokens.length) {
+      const t = tokens[j];
+      if (t.op) { if (_RB_SEPARATORS.has(t.text)) break; j++; continue; }
+      if (t.text === "--") { j++; continue; }
+      if (/^-[^\s]/.test(t.text)) {
+        // A value flag consumes the NEXT word only when it has no attached value:
+        // `-o ProxyCommand=x` takes one, but `-p22` / `-L8080:host:80` / `-oK=V`
+        // carry it, and consuming the next word there swallowed the HOST — the
+        // boundary was then lost entirely and a remote command stayed gated
+        // (review #3478 cycle 3 P2, fail-closed but a real gap).
+        const flag = t.text.startsWith("--") ? t.text.split("=")[0] : t.text.slice(0, 2);
+        const attached = t.text.startsWith("--") ? t.text.includes("=") : t.text.length > 2;
+        j += flags.has(flag) && !attached ? 2 : 1;
+        continue;
+      }
+      operand = j;
+      break;
+    }
+    if (operand < 0) continue;                // no host/container operand → nothing runs remotely
+    // The payload must BEGIN at a word, immediately after the operand. A
+    // REDIRECT there (`ssh cell-a > a.txt`) is a LOCAL truncating write — its
+    // target is not remote payload (review #3478 P0), and `2>/dev/null` before
+    // the command is an unmodelled shape (gated as before). The ONE exception is
+    // a HEREDOC (`ssh cell <<'EOS'`): that is how a lane ships a script to a
+    // cell, and there is no payload WORD to find — the body is the payload
+    // (review #3478 cycle 3 P2).
+    const p = operand + 1;
+    if (p >= tokens.length) continue;                    // `ssh <host>` alone
+    if (tokens[p].op) {
+      if (tokens[p].redirect && /^<<-?$/.test(tokens[p].text)) return p;
+      continue;                                          // redirect-only form
+    }
+    return p;
+  }
+  return null;
+}
+
+/**
+ * #3444 — replace every REMOTE-EXEC payload in `command` with one inert word, so
+ * the local gates downstream see only text that can run on THIS box.
+ *
+ * A command with no remote-exec boundary is returned UNCHANGED (identity), which
+ * is what makes this safe to run on every bash call: the local guards are not
+ * relaxed by a byte unless a boundary is actually present, and the tail after
+ * the boundary is left exactly as written.
+ * @param {string} command
+ * @returns {string}
+ */
+export function maskRemoteExecPayloads(command) {
+  const s = String(command ?? "");
+  if (!s) return s;
+  const { tokens, unterminated } = _rbTokens(s);
+  // A word scan that ended INSIDE a quote means this masker did not understand
+  // the command (in valid bash that only happens inside a comment). Leave it
+  // alone: today's gating is the safe reading.
+  if (unterminated) return s;
+  const start = _rbRemotePayloadStart(tokens, s);
+  if (start === null) return s;
+  // ⛔ TWO heredocs on one command line make the body ORDER depend on source
+  // position, not token order — a shape this masker cannot prove. Leave the
+  // command UNMASKED (today's gating) rather than mask the wrong lines.
+  const heredocOps = tokens.filter((t) => t.op && /^<<-?$/.test(t.text)).length;
+  if (heredocOps > 1) return s;
+  let out = "";
+  let last = 0;            // source offset already emitted
+  let masking = false;     // inside a masked payload run
+  let payloadEmitted = false; // the placeholder has been written at least once
+  let localSubstMasked = false; // a local substitution was found INSIDE a masked run
+  let verbatimNextWord = null; // true | "heredoc" — the redirect operand is text, not payload
+  const verbatimTo = (end) => {
+    if (end > last) out += s.slice(last, end);
+    if (end > last) last = end;
+  };
+  const maskTo = (start, end) => {
+    if (!masking) {
+      // Emit everything BEFORE the run verbatim — a local command ahead of the
+      // remote call must never be dropped by the mask (`git x && cmux vm exec …`).
+      if (start > last) { out += s.slice(last, start); last = start; }
+      out += ` ${REMOTE_PAYLOAD_PLACEHOLDER}`;
+      masking = true;
+      payloadEmitted = true;
+    }
+    if (end > last) last = end;
+  };
+  const endMask = () => { masking = false; };
+  let k = start;
+  while (k < tokens.length) {
+    const tk = tokens[k];
+    if (tk.end <= last) { k++; continue; }   // already consumed (heredoc body, redirect operand)
+    if (tk.op) {
+      if (tk.redirect) {
+        verbatimTo(tk.end);
+        endMask();
+        // `<<-` strips leading TABS from the terminator; plain `<<` requires it at
+        // column 0. Carrying the distinction keeps an INDENTED `EOF` from being
+        // read as the terminator (which ended the mask early and exposed the rest
+        // of the remote script as local text — review #3478 P2).
+        verbatimNextWord = /^<<-?$/.test(tk.text) ? (tk.text === "<<-" ? "heredoc" : "heredoc-exact") : true;
+        k++;
+        continue;
+      }
+      if (_RB_SEPARATORS.has(tk.text)) {
+        // The remote command ENDS here: everything after it can run LOCALLY.
+        endMask();
+        verbatimTo(tk.end);
+        k++;
+        // The separator may be the LAST token (`… -- ls ;`, a trailing newline):
+        // `tokens[k]` is then undefined and dereferencing it threw a TypeError
+        // that escaped the hook and aborted the whole bash call (review #3478 P1).
+        const rest = tokens.slice(k);
+        const nextStart = rest.length > 0 ? _rbRemotePayloadStart(rest, s.slice(rest[0].start)) : null;
+        if (nextStart === null) break;
+        k += nextStart;
+        verbatimNextWord = null;
+        continue;
+      }
+      endMask();
+      verbatimTo(tk.end);
+      k++;
+      continue;
+    }
+    if (verbatimNextWord) {
+      endMask();
+      verbatimTo(tk.end);
+      if (verbatimNextWord === "heredoc" || verbatimNextWord === "heredoc-exact") {
+        // The BODY is the payload's script (masked), but the TERMINATOR LINE is
+        // kept: it is structure, not payload, and without it the next local
+        // command reads as heredoc data to every downstream parser (fail-open).
+        // ⛔ The REST OF THE DELIMITER LINE is LOCAL text, not payload: bash
+        // discards everything from `#` and otherwise runs `cmd <<'EOS'; foo` /
+        // `… && foo` / `… | tee f` / `… > f` HERE after the body is consumed. That
+        // tail used to be DROPPED (not masked — dropped), so `cmux vm exec c --
+        // sh -s <<'EOS'; git worktree add loc` and `… <<'EOS' > a.txt` went from
+        // BLOCKED to ALLOWED (review #3478 cycle 3 P0).
+        // ⛔ And the body starts after the LOGICAL line, not the first PHYSICAL
+        // newline: a `\`+newline continuation or a quote spanning a newline joins
+        // the command line, and cutting at the physical newline dropped the joined
+        // remainder — a local write, hidden (review #3478 cycle 4 P0). The token
+        // stream already absorbs both, so the first `\n` OP token is the boundary.
+        const delim = _rbUnquoteDelim(tk.text);
+        if (delim === null) return s;    // unreadable delimiter word ⇒ gate as before
+        // ⛔ A `\r` right after the word means the WORD ITSELF carries the CR (bash
+        // does not treat CR as IFS whitespace: `<<'EOS'` + CRLF has the delimiter
+        // `EOS\r`). The tokenizer trims it, so the computed word would never match
+        // the real terminator and the mask would run past every LOCAL command after
+        // it (review #3478 cycle 5 P0). Leave the command unmasked.
+        if (s[tk.end] === "\r") return s;
+        let nlAt = -1;
+        let depth = 0;
+        for (let j = k + 1; j < tokens.length; j++) {
+          const t = tokens[j];
+          if (t.op && (t.text === "(" || t.text === "(" || t.text === ")")) {
+            // ⛔ `(` and `)` are separator tokens, so a NEWLINE INSIDE an unquoted
+            // `$( … )` / `$(( … ))` on the delimiter line is not the body start:
+            // bash starts the body after the LOGICAL line, and taking the inner
+            // newline dropped the substitution's remainder — a local command
+            // (review #3478 cycle 5 P0). Only a depth-0 newline ends the line.
+            depth += t.text === ")" ? -1 : 1;
+            if (depth < 0) break;
+            continue;
+          }
+          // A heredoc's body ALWAYS begins after the next newline — separators on
+          // the delimiter line (`;`, `&&`, `|`, `>`) do not move it, they are that
+          // line's LOCAL tail. Do not stop at them.
+          if (t.op && t.text === "\n") {
+            if (depth === 0) { nlAt = t.start; break; }
+            continue;
+          }
+        }
+        if (nlAt < 0) {                  // no logical newline ⇒ no body: not payload
+          verbatimTo(s.length);
+          endMask();
+          verbatimNextWord = null;
+          k++;
+          continue;
+        }
+        const body = _rbHeredocBodyRange(s, nlAt + 1, delim, verbatimNextWord === "heredoc");
+        if (nlAt > last) { out += s.slice(last, nlAt); last = nlAt; }   // delimiter-line tail: LOCAL
+        // The heredoc can be the payload ITSELF (`ssh cell <<'EOS'` — no payload
+        // word), in which case the placeholder has not been emitted yet. It goes
+        // where the BODY was, on its own line, so the heredoc stays parseable.
+        const needPlaceholder = !payloadEmitted;
+        if (body.termStart > last) last = body.termStart;                       // body: masked
+        // The newline that separated the delimiter word from the body is gone with
+        // it. Keep ONE: without it the terminator line would fuse onto the
+        // delimiter word (`<<'EOS'EOS`), no downstream parser could close the
+        // heredoc, and the following LOCAL command would read as body text.
+        out += needPlaceholder ? `\n ${REMOTE_PAYLOAD_PLACEHOLDER}\n` : "\n";
+        if (needPlaceholder) payloadEmitted = true;
+        if (body.afterTerm > last) { out += s.slice(body.termStart, body.afterTerm); last = body.afterTerm; }
+        // A heredoc operator ends its simple command; what follows is LOCAL text.
+        endMask();
+      }
+      verbatimNextWord = null;
+      k++;
+      continue;
+    }
+    if (tk.localSubst) {                     // runs in THIS shell — never masked
+      // ⛔ Keeping the token verbatim is necessary but NOT sufficient: a local
+      // substitution that sits INSIDE the run being masked (`sh -c "echo $(git
+      // worktree add loc)"` — double quotes do not stop substitution) loses the
+      // `sh -c` SPAWNER wrapper that #1919 walks, so the surviving text reads as
+      // inert. origin/main refused that command; the mask turned it into an allow
+      // (review #3478 cycle 7 P1). Record it and leave the whole command unmasked.
+      if (masking) localSubstMasked = true;
+      endMask();
+      verbatimTo(tk.end);
+      k++;
+      continue;
+    }
+    maskTo(tk.start, tk.end);
+    k++;
+  }
+  if (!masking && last < s.length) out += s.slice(last);
+  // ⛔ A pipe that FEEDS A LOCAL SHELL is the #709 arm's case: `cmux vm exec … --
+  // printf '…' | bash -s` builds the pipe in THIS shell and runs the remote
+  // stdout as a local script. Masking the seed left the arm with nothing to
+  // inspect, so a piped payload that was refused became allowed (review #3478
+  // cycle 2, P1). Return the command UNMASKED — the pre-fix refusal stands.
+  if (out !== s && _rbFeedsLocalShell(out)) return s;
+  // ⛔ A PROCESS SUBSTITUTION (`<(…)`, `>(…)`, `< <(…)`) hands the masked payload
+  // to a command THIS shell runs — `bash <(cmux vm exec c -- printf '…')` executes
+  // the remote stdout locally, and #709 refused it before this mask existed (review
+  // #3478 cycle 5 P0). `_rbFeedsLocalShell` only inspects `|` stages, so bail here:
+  // a false bail only re-gates, a false allow EXECUTES.
+  if (out !== s && /[<>]\(/.test(out)) return s;
+  // ⛔ A local substitution INSIDE the masked run: the spawner wrapper that made
+  // it detectable is gone, so the command is left unmasked (review #3478 cycle 7 P1).
+  if (localSubstMasked) return s;
+  // \u26d4 A substitution whose body is the payload runs the remote stdout HERE.
+  if (out !== s && _rbSubstFeedsShell(out)) return s;
+  return out;
+}
+
+// Commands that consume stdin (or an argument) as DATA and cannot run it as a
+// program. ONE list, shared by the pipe bail and the substitution bail.
+const _RB_DATA_CONSUMERS = new Set([
+  "grep", "egrep", "fgrep", "rg", "ag", "ack", "cat", "tac", "tee", "head", "tail",
+  "wc", "sort", "uniq", "cut", "tr", "nl", "jq", "base64", "base32", "xxd", "od", "hexdump",
+  "split", "diff", "comm", "paste", "join", "fold", "fmt", "expand", "columns", "column",
+  "md5sum", "sha1sum", "sha256sum", "sha512sum", "cksum", "strings", "zcat", "gunzip",
+  "bzcat", "xzcat", "rev", "seq", "numfmt", "csvtool", "yq",
+]);
+const _rbIsDataConsumer = (w) =>
+  _RB_DATA_CONSUMERS.has(String(w).includes("/") ? String(w).slice(String(w).lastIndexOf("/") + 1) : String(w));
+
+/** The source index just past the substitution region opening at `from` (`$(` or a
+ *  backtick). Depth-counts parentheses, skipping single/double-quoted spans, so a
+ *  nested `$(` inside does not end it early. Returns end-of-string when unclosed. */
+function _rbSubstEnd(s, from) {
+  if (s[from] === "\u0060") {
+    const close = s.indexOf("\u0060", from + 1);
+    return close < 0 ? s.length : close + 1;
+  }
+  let depth = 0;
+  for (let i = from + 1; i < s.length; i++) {
+    const c = s[i];
+    if (c === "'") { const e = s.indexOf("'", i + 1); if (e < 0) return s.length; i = e; continue; }
+    if (c === '"') { i++; while (i < s.length && s[i] !== '"') { if (s[i] === "\\") i++; i++; } continue; }
+    if (c === "\\") { i++; continue; }
+    if (c === "(") depth++;
+    else if (c === ")") { if (depth === 0) return i + 1; depth--; }
+  }
+  return s.length;
+}
+
+/** \u26d4 A COMMAND SUBSTITUTION whose body IS the remote boundary hands the remote
+ *  stdout to a command THIS shell runs: `bash -c $(cmux vm exec \u2026)`, `sh -c \u2026`,
+ *  or a bare `$(cmux \u2026)` at COMMAND POSITION. `_rbFeedsLocalShell` only inspects
+ *  `|` stages and the process-substitution bail only `<(`/`>(`, so this shape was
+ *  masked while `origin/main` refused it (#1919) \u2014 a local execution hidden by the
+ *  mask (review #3478 cycle 6 P0).
+ *
+ *  Polarity is the same CLOSED one: bail unless the substitution's enclosing
+ *  command word is a proven data consumer. An ASSIGNMENT (`x=$(cmux \u2026 )`) has no
+ *  command word \u2014 nothing consumes it here \u2014 so it stays masked; the two-step
+ *  `x=\u2026; eval \$x` is beyond any single-string scan (documented residual, same
+ *  class as `bash /tmp/f`).
+ *  @returns {boolean} true \u21d2 do NOT mask. */
+function _rbSubstFeedsShell(text) {
+  const ph = REMOTE_PAYLOAD_PLACEHOLDER;
+  const s = String(text ?? "");
+  for (let i = 0; i < s.length; i++) {
+    const open = s[i] === "$" && s[i + 1] === "(";
+    if (!open && s[i] !== "\u0060") continue;
+    const region = s.slice(i, _rbSubstEnd(s, i));
+    if (!region.includes(ph)) continue;
+    // The enclosing simple command: back to the previous top-level separator.
+    const prefix = s.slice(0, i);
+    const cut = Math.max(prefix.lastIndexOf(";"), prefix.lastIndexOf("&&"), prefix.lastIndexOf("||"),
+      prefix.lastIndexOf("|"), prefix.lastIndexOf("\n"), prefix.lastIndexOf("("),
+      // `&` backgrounds the consumer, so the NEXT word is a command again
+      // (`grep x & bash -c $(…)`) — not cutting there let a data consumer hide a
+      // real executor (review #3478 cycle 7 P2).
+      prefix.lastIndexOf("&"));
+    const seg = prefix.slice(cut + 1).trim();
+    if (!seg) return true;                            // command position ⇒ EXECUTES
+    const words = seg.split(/\s+/).filter(Boolean);
+    const nonAssign = words.filter((w) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+    if (nonAssign.length === 0) continue;              // pure assignment ⇒ stays masked
+    let j = 0;
+    while (j < words.length) {
+      const w = words[j];
+      if (w === "!") { j++; continue; }
+      if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) { j++; continue; }
+      if (/^\d*[<>]|^&>/.test(w)) {
+        const takesNext = !/^\d*(?:>&|<&)\d+$/.test(w) && !/^\d*>>?\S/.test(w);
+        j += takesNext ? 2 : 1;
+        continue;
+      }
+      break;
+    }
+    if (j >= words.length) return true;
+    let head = words[j].replace(/^[!({]/, "").replace(/[)}]*$/, "");
+    if (!head || /["'\u0060$]/.test(head)) return true;
+    if (!_rbIsDataConsumer(head)) return true;
+  }
+  return false;
+}
+
+/** Does `text` pipe a masked placeholder into a command that may RUN what it
+ *  reads? Those are the shapes where the payload would be executed by THIS shell,
+ *  so the mask must not hide it.
+ *
+ *  ⛔ POLARITY: this is a CLOSED allow-list of consumers that cannot execute their
+ *  stdin, and everything else BAILS (leaves the command unmasked ⇒ today's
+ *  gating). A shell allow-list was tried first and lost three times, because a
+ *  head can be decorated (`|& bash`, `| (bash)`, `| { bash; }`), carry a variable
+ *  (`| "$SHELL"`, `| { S=bash; $S -s; }`), be launcher-wrapped (`| timeout 5
+ *  bash`), sit behind its own redirection (`| > /tmp/f bash -s`), or continue on
+ *  the next line (`|<NL> bash`) — an open list can never be complete, and every
+ *  miss was a local execution the #709 arm could not see (review #3478 cycles 3-4).
+ *  A false bail only re-gates a command; a false allow EXECUTES it.
+ *  @returns {boolean} true ⇒ do NOT mask. */
+function _rbFeedsLocalShell(text) {
+  const ph = REMOTE_PAYLOAD_PLACEHOLDER;
+  // A pipeline continued on the next line is ONE pipeline — do not split there.
+  const joined = text.replace(/\|&?\s*\n/g, "|");
+  // `|&` is a PIPE, not a background job — normalise it before splitting on `&`,
+  // or `… |& bash -s` splits into `… |` and `bash` and the stage head vanishes.
+  const cmdText = joined.replace(/\|&/g, "|");
+  // ⛔ `&` is a job separator ONLY when it is not part of a REDIRECTION
+  // (`2>&1`, `>&2`, `&>`, `&>>`). Splitting on a redirection `&` cut the segment
+  // between the payload and its pipe, so `… printf '…' 2>&1 | bash -s` was masked
+  // again — the exact #709-class fail-open this bail exists to prevent (review
+  // #3478 cycle 8 P1). The lookaround keeps the redirection forms whole.
+  for (const cmd of cmdText.split(/;|&&|\|\||\n|(?<![<>])&(?!>)/)) {
+    if (!cmd.includes(ph)) continue;
+    const stages = cmd.split(/\|&?/);
+    for (let idx = 1; idx < stages.length; idx++) {
+      if (!stages.slice(0, idx).some((st) => st.includes(ph))) continue;
+      const words = stages[idx].trim().split(/\s+/).filter(Boolean);
+      let j = 0;
+      // Skip leading assignments / `!`. A REDIRECTION here also swallows its
+      // TARGET word (`| > /tmp/f bash -s` used to resolve its head to `/tmp/f`).
+      while (j < words.length) {
+        const w = words[j];
+        if (w === "!") { j++; continue; }
+        if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w)) { j++; continue; }
+        if (/^\d*[<>]|^&>/.test(w)) {
+          // `> file` / `2> file` / `&> file` take the next word; `>&N` / `>|f` do not.
+          const takesNext = !/^\d*(?:>&|<&)\d+$/.test(w) && !/^\d*>>?\S/.test(w);
+          j += takesNext ? 2 : 1;
+          continue;
+        }
+        break;
+      }
+      if (j >= words.length) continue;              // dangling `|` — nothing runs there
+      let head = words[j];
+      head = head.replace(/^[!({]/, "").replace(/[)}]*$/, "");
+      if (!head) return true;
+      // De-decorated command words only — a quote, `$`, or a path prefix means
+      // this scan cannot tell what runs (`"$SHELL"`, `$(which bash)`, `/tmp/x`).
+      if (/["'`$]/.test(head)) return true;
+      if (!_rbIsDataConsumer(head)) return true;
+    }
+  }
+  return false;
 }
