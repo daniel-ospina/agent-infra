@@ -2552,7 +2552,7 @@ INNERPY
   # --print-diff-hash` exited 0 with the record untouched; `--delta --check-carry` answered
   # `fresh … run the code-review skill`, i.e. the paid re-review the verb exists to remove).
   # The in-repo standard for this guard class already existed — `--recover-body`'s combinations
-  # are pinned assertion-per-combo in `scripts/record-review.test.sh:3369-3382`, the
+  # are pinned assertion-per-combo in `scripts/record-review.test.sh:3371-3384`, the
   # `for _combo in --print-diff-hash --print-tier` loop — so this section
   # meets that standard instead of describing it.
   #

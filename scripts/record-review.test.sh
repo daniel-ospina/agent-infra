@@ -223,8 +223,8 @@ if [ "$1" = "api" ]; then
             # apply the CALLER'S OWN expression to it with the real jq — the same shape
             # real `gh` has. Without this the recorder's frame expression (the
             # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator —
-            # `git show bd1b205d:scripts/record-review.sh | grep -n 'gsub(\['` → :2386; head
-            # `grep -n 'gsub(\[' scripts/record-review.sh` → :2445) is executed by NO vector at
+            # `git show bd1b205d:scripts/record-review.sh | grep -nF 'gsub("[\u001e\u001f]"; "")'` → :2386; head
+            # `grep -nF 'gsub("[\u001e\u001f]"; "")' scripts/record-review.sh` → :2445) is executed by NO vector at
             # all: every
             # other fixture supplies the frame PRE-BUILT through $STUB_COMMENTS, so
             # deleting either half of the expression left the suite GREEN. §14.1d(b4)
@@ -5569,7 +5569,7 @@ assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
 PATCH_FAIL_PR=424365
 STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
     run_record_633 "$PATCH_FAIL_PR" "$SHA" "$DC_CRUNS"
-assert_contains "$RECORD_ERR" "NO PENDING COPY FOR THIS RUN IS ON DISK EITHER" \
+assert_contains "$RECORD_ERR" "NO PENDING COPY FROM THIS ATTEMPT IS ON DISK" \
     "14.1d(j) the PATCH arm's comment-visible message names the real state when its own persist failed"
 assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"

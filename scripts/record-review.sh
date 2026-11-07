@@ -6609,8 +6609,8 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     else
       _unposted_why="the marker is UNSIGNED (no AI_REVIEW_GATE_KEY on this box), so it was NOT published as a comment — by policy, because a comment cannot be retracted and an unsigned marker is never evidence"
     fi
-    # ^ Whether that remedy can find anything is decided by the persist warning ABOVE: if it
-    #   appeared, nothing is on disk and `--flush-pending` answers "nothing pending" over lost bytes.
+    # ^ Whether that remedy can find anything is decided by the persist warning ABOVE: if it appeared,
+    #   THIS RUN's marker is not on disk: `--flush-pending` delivers whatever the file holds (an OLDER marker) or answers "nothing pending".
     #   Since #3168 review P2 the line SAYS which of the two happened instead of leaving the
     #   operator to reconcile two contradictory sentences.
     if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
@@ -6672,7 +6672,7 @@ ${MISSING}"
       # without re-recording (which would dilute the evidence).
       PATCH_PERSISTED=1
       marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MISSING" || { PATCH_PERSISTED=0
-      echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy printed below WILL FIND NOTHING FOR THE MARKER THIS RUN OWED — it can only deliver an OLDER pending marker for this PR, or answer 'nothing pending … Nothing was written' (exit 0) when none is pending, and neither delivers these bytes. The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand. >>> $MISSING <<<" >&2
+      echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THIS ATTEMPT'S BYTES ARE NOT ON DISK, so NO --flush-pending remedy is offered below for them: that flush delivers whatever the pending file holds — a marker an EARLIER ATTEMPT in this run wrote, or an OLDER marker from an earlier run — or answers 'nothing pending … Nothing was written' (exit 0) when the file is absent, and it cannot deliver bytes that no attempt managed to write. Which of those holds is not observable here, so the marker is reproduced HERE: paste the line between the >>> markers into the PR body by hand. >>> $MISSING <<<" >&2
       }
       # ⛔ THE DURABLE CHANNEL IS ATTEMPTED HERE, BEFORE THE exit 5 (agent-infra#3168
       # review P2; this arm is the ONE the #2983 arms left out — see #3363). The PATCH
@@ -6698,7 +6698,7 @@ ${MISSING}"
         if [ "$PATCH_PERSISTED" -eq 1 ]; then
           echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. Re-run the recorder at this head, or post the body copy with --flush-pending, to fire the \`edited\` event that re-runs the gate." >&2
         else
-          echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. ⛔ NO PENDING COPY FOR THIS RUN IS ON DISK EITHER (the ⚠️ body-marker persist line above says so), so --flush-pending would find NOTHING for the marker this run owed — it can only deliver an OLDER pending marker for this PR, or answer 'nothing pending' when none is pending, and neither fires the \`edited\` event for THESE bytes: copy the marker text that line reproduced and PATCH it into the PR body by hand once gh is reachable." >&2
+          echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. ⛔ NO PENDING COPY FROM THIS ATTEMPT IS ON DISK (the ⚠️ body-marker persist line above says so), so whether the \`edited\` event ever fires for THESE bytes is not observable here: --flush-pending delivers whatever the pending file holds — a marker an EARLIER ATTEMPT in this run wrote, or an OLDER marker from an earlier run — and answers 'nothing pending' only when the file is absent. Copy the marker text that line reproduced and PATCH it into the PR body by hand once gh is reachable." >&2
         fi
       else
         # ⛔ NO ABSENCE CLAIM (#3168, the same class the read-failure arm was corrected
