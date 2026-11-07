@@ -449,6 +449,80 @@ ck "f35 no python3 on the box is a NAMED refusal at exit 2, never a grading clai
 # commit — that happened twice in this PR's own review trail. The red SET is stable; the totals are not.
 ck "f36 no interpreter: neither entry state announces a pass the missing interpreter would silently void" \
    '[ "$_rc_np" = 2 ] && ! grep -q "Grading the ONE repo" <<<"$_o_np" && ! grep -q "grading .* repo(s)" <<<"$_o_np"'
+# ⛔ THE RETURN-CODES TABLE IS A CONTRACT FOR EVERY VERB, NOT JUST `check` (sweep at `bc83af08`, P1).
+# `repo_set_slugs` and `repo_set_doctor_repos` are DERIVED from `repo_set_parse`, and each carries
+# `[ "$rc" = 0 ] || return "$rc"` for exactly the reason the header gives: "ONE TABLE, AND IT IS THE
+# SAME FOR A VERB AND FOR THE FUNCTION IT CALLS". Deleting EITHER reddened NOTHING (181 passed / 0
+# failed) and turned a malformed / empty / absent set into **rc 0 with an empty list** — "no repos, and
+# that is fine" for a box whose declaration is broken. `doctor-repos` is the worse half: it is the SOLE
+# producer of `PR_DOCTOR_REPOS`, so a caller's `|| REFUSING … rendered no entry list` guard and its
+# `awk -F, '{print NF}'` both read an empty string as a live set.
+_c_mal="$T/severbad.conf"; printf 'slug=notaslug checkout=%s\n' "$T/tortoise" > "$_c_mal"
+_c_empty="$T/severbad-empty.conf"; printf '# only comments\n\n' > "$_c_empty"
+_c_absent="$T/severbad-absent.conf"
+ck "f37 slugs PROPAGATES 5 for a malformed set — never rc 0 with an empty list" \
+   '[ "$(run_reader_rc "$_c_mal" slugs)" = 5 ]'
+ck "f38 …4 for an empty set" \
+   '[ "$(run_reader_rc "$_c_empty" slugs)" = 4 ]'
+ck "f39 …and 3 for an absent one" \
+   '[ "$(run_reader_rc "$_c_absent" slugs)" = 3 ]'
+ck "f40 doctor-repos PROPAGATES 5 for a malformed set — it is the sole producer of PR_DOCTOR_REPOS" \
+   '[ "$(run_reader_rc "$_c_mal" doctor-repos)" = 5 ]'
+ck "f41 …4 for an empty set" \
+   '[ "$(run_reader_rc "$_c_empty" doctor-repos)" = 4 ]'
+ck "f42 …and 3 for an absent one" \
+   '[ "$(run_reader_rc "$_c_absent" doctor-repos)" = 3 ]'
+# ⛔ AND AN UNKNOWN VERB IS A USAGE ERROR, NOT A SILENT SUCCESS (sweep at `bc83af08`, P1). `_rs_main`'s
+# `*)` arm sits one line below the `''|-h|--help` arm that IS pinned, and deleting it reddened nothing:
+# `repo-set.sh ckeck` then exited **0 with no output**, so a typo in a caller reads as "the set is empty
+# and fine" — the same false-PASS shape as the two above, in the dispatch table itself.
+ck "f43 an unknown verb is rc 2, never a silent exit 0" \
+   '[ "$(run_reader_rc "$_c_mal" ckeck)" = 2 ] && [ "$(run_reader_rc "$_c_mal" bogus-verb)" = 2 ]'
+# ⛔ THE WRAPPER'S OWN `*)` ARM IS THE ONE THAT COULD EXIT **0** IN SILENCE (sweep at `bc83af08`, P1).
+# `case "$_rc"` names 0 and 3; everything else — 4 empty, 5 malformed, 5 unresolvable path — lands in
+# `*)`. Deleting it reddened nothing, and a broken set then made the shipped unit exit **rc 0 with
+# NOTHING on stdout or stderr**: it grades nothing, dispatches nothing and reports success, which is
+# `#2281`'s "a shorter set would read exactly like a smaller machine" with the alarm removed. The parse
+# report is consumed by the `>/dev/null 2>&1` probe above, so this arm is the ONLY surface that turns a
+# non-0/3 code into a refusal.
+ck "f44 a MALFORMED set makes the wrapper REFUSE at rc 2, never exit 0 in silence" \
+   '[ "$(REPO_SET_FILE="$_c_mal" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+ck "f45 …and it says what it proved, with no grading claim" \
+   'o="$(REPO_SET_FILE="$_c_mal" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; grep -q "REFUSING — no usable repo set at" <<<"$o" && ! grep -q "grading .* repo(s)" <<<"$o"'
+ck "f46 …an EMPTY set (code 4) also refuses, rather than passing" \
+   '[ "$(REPO_SET_FILE="$_c_empty" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+ck "f47 …and an UNRESOLVABLE set path (HOME unset, code 5) refuses too" \
+   'o="$(env -u HOME REPO_SET_FILE= bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; [ "$rc" = 2 ] && ! grep -q "grading .* repo(s)" <<<"$o"'
+# ⛔ THE ABSENCE PROOF'S "NEAREST EXISTING ANCESTOR" STEP DECIDES WHETHER THAT PROOF MAY RUN (sweep at
+# `bc83af08`, P1). It is reachable only when the reader cannot ask python3 for the errno
+# (`_rs_stat_kind` -> `unknown`), so the interpreter candidates are rewritten in a COPY — the same
+# technique `f35`/`f36` use. Deleting the `[ -e "$d" ]` early return makes the walk always answer `/`
+# (traversable), so the proof becomes unconditional and a file that EXISTS behind a denial is reported
+# ABSENT:
+#     HEAD     rc 5 INVALID      … is not visible from here (nearest existing: …/den)
+#     mutant   rc 3 NO-REPO-SET  … does not exist …   Create it, one repo per line
+# Code 3 is the one the WRAPPER DEGRADES on, and "create a file that is already there" is the
+# wrong-cause sentence this reader's own header forbids twice.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip f48 (running as root: mode 000 does not deny)\n'
+else
+  NA="$T/nointerp"; mkdir -p "$NA" "$T/denparent/den"
+  cp "$READER" "$NA/repo-set.sh"
+python3 - "$NA/repo-set.sh" <<'PYNA'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
+PYNA
+  printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/denparent/den/repos.conf"
+  chmod 000 "$T/denparent/den"
+  _o_na="$(REPO_SET_FILE="$T/denparent/den/repos.conf" bash "$NA/repo-set.sh" check 2>&1)"; _rc_na=$?
+  chmod 755 "$T/denparent/den"
+  ck "f48 a set beyond an UNTRAVERSABLE ancestor is INVALID (5), never 'does not exist' (3)" \
+     '[ "$_rc_na" = 5 ] && ! grep -q "does not exist" <<<"$_o_na" && ! grep -q "Create it, one repo per line" <<<"$_o_na"'
+fi
 # ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
 # The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
 # `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
