@@ -272,7 +272,14 @@ inst() {
   # its HOME, or `$AGENT_INFRA_PATH`. An ambient `AGENT_INFRA_PATH` (every cell exports one; this box has one)
   # would therefore decide a §P verdict from OUTSIDE the fixture. Pinned to a path that does not exist, so the
   # only roots in play are the fixture's own — exactly what a hermetic arm needs.
-  bnd env SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
+  # ⛔ AND THE PIN RECORD IS PINNED TOO (review-5 P2, measured). #2697's guard now reads `HARNESS_PIN_FILE` /
+  # `HARNESS_PIN_DIR`, and EVERY cell hands those to its children (`cloud-cell-supervisor.sh`,
+  # `launchd-controller.sh`), so a lane running this suite ON A CELL had the box's real pin ambient: measured
+  # `HARNESS_PIN_FILE=<a foreign record> bash this-suite` → `passed=358 failed=2`, both §P4, i.e. green in CI
+  # and RED on the fleet. Same class as `AGENT_INFRA_PATH` above: an ambient seam decides a §P verdict from
+  # outside the fixture, so both are unset and each arm opts in via EXTRA_ENV when it wants one.
+  bnd env -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR \
+      SYSTEMCTL="$r/bin/systemctl" SYSTEMD_UNIT_DIR="$r/units" \
       CONTROLLER_SYSTEM_UNIT_DIR="$r/units" CONTROLLER_USER_UNIT_DIR="$r/nouser" CONTROLLER_ALLOW_ROOT=1 \
       TEMPLATES_DIR="${TPL_DIR:-$(dirname "$TPL")}" HOME="$r/home" CELL_HOME="$r/home" \
       AGENT_INFRA_PATH="$r/layer" \
@@ -283,7 +290,8 @@ inst() {
 # is the fixture's, so an arm can never read or touch this box's real units.
 sup() {
   local r="$T/$1"; shift
-  bnd env -u OR SYSTEMCTL="$r/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
+  bnd env -u OR -u HARNESS_PIN_FILE -u HARNESS_PIN_DIR \
+      SYSTEMCTL="$r/bin/systemctl" CONTROLLER_SYSTEM_UNIT_DIR="$r/units" \
       CONTROLLER_USER_UNIT_DIR="$r/nouser" PATH="$r/bin:$PATH" HOME="$r/home" CELL_HOME="$r/home" \
       ENV_FILE="$r/home/keys.env" O="$r/o" REPO="$r/repo" SCOPE=own HARNESS="$r/harness" \
       HARNESS_REPO="$HARNESS_SRC" HARNESS_FETCH=0 HARNESS_REF="$HARNESS_REF_SHA" \
@@ -2752,10 +2760,17 @@ P_OUT=""; P_RC=0
 P_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P_RC=$?
 [ "$P_RC" -ne 0 ] && ok '§P: a scratch-root supervisor (a temp root no declaration covers) is REFUSED' \
                   || bad "§P: installed a unit whose ExecStart a tmp cleaner removes — the #2697 defect, re-shipped: $P_OUT"
-case "$P_OUT" in
-  *"$SCRATCH_P/cloud-cell-supervisor.sh"*) ok '§P: the refusal NAMES the offending path (an operator can see what was rejected)' ;;
-  *) bad "§P: the refusal does not name the rejected path — $P_OUT" ;;
-esac
+# ⛔ GATED ON THE REFUSAL, NOT ON THE OUTPUT ALONE (review-5 P3). A SUCCESSFUL install prints
+# `exec:    /bin/bash <path> start`, which contains the path — so with the guard deleted this arm read a
+# success report as a refusal that named what it rejected.
+if [ "$P_RC" -ne 0 ]; then
+  case "$P_OUT" in
+    *"$SCRATCH_P/cloud-cell-supervisor.sh"*) ok '§P: the refusal NAMES the offending path (an operator can see what was rejected)' ;;
+    *) bad "§P: the refusal does not name the rejected path — $P_OUT" ;;
+  esac
+else
+  bad "§P: no refusal happened, so 'names the offending path' is untested — $P_OUT"
+fi
 case "$P_OUT" in
   *'.pi/agent/scripts/cloud-cell-supervisor.sh'*) ok '§P: the refusal names the durable alternative (the farm)' ;;
   *) bad "§P: the refusal does not say where a DURABLE supervisor would be — an operator is left with no remedy: $P_OUT" ;;
@@ -2939,10 +2954,14 @@ ln -s "$PS/home/scripts/cloud-cell-supervisor.sh" "$PS/home/scripts/good.sh" # d
 PS_RC=0; PS_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PS/home/scripts/alias.sh" inst ps --install 2>&1)" || PS_RC=$?
 [ "$PS_RC" -ne 0 ] && ok '§P2: a symlink whose TARGET is scratch is REFUSED (resolution, not spelling)' \
                    || bad "§P2: a durable-looking symlink into a scratch tree was ADMITTED — the #2666 escape, re-shipped: $PS_OUT"
-case "$PS_OUT" in
-  *"$PS_SCRATCH/cloud-cell-supervisor.sh"*) ok '§P2: the refusal names the RESOLVED path, so the operator can see the real target' ;;
-  *) bad "§P2: the refusal names the spelling instead of the resolved target — $PS_OUT" ;;
-esac
+if [ "$PS_RC" -ne 0 ]; then   # ⛔ same gate: a success report also carries the resolved path (review-5 P3)
+  case "$PS_OUT" in
+    *"$PS_SCRATCH/cloud-cell-supervisor.sh"*) ok '§P2: the refusal names the RESOLVED path, so the operator can see the real target' ;;
+    *) bad "§P2: the refusal names the spelling instead of the resolved target — $PS_OUT" ;;
+  esac
+else
+  bad "§P2: no refusal happened, so 'names the resolved target' is untested — $PS_OUT"
+fi
 PS2_RC=0; PS2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PS/home/scripts/good.sh" inst ps --install 2>&1)" || PS2_RC=$?
 [ "$PS2_RC" -eq 0 ] && ok '§P2: a symlink onto a durable tree is still ADMITTED (no blanket refusal of links)' \
                    || bad "§P2: refused a durable symlinked supervisor — false block: $PS2_OUT"
@@ -3048,6 +3067,12 @@ PIN_SHA="$(git -C "$PIN_REPO" rev-parse HEAD 2>/dev/null)"
 PIN_DIR="$PIN/home/harness/$PIN_SHA"
 PIN_SUP="$PIN_DIR/scripts"
 if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PIN_SHA" >/dev/null 2>&1; then
+  # ⛔ AND THE BOX\'S OWN PIN RECORD IS WRITTEN, SO THE RECORD BRANCH IS WHAT RUNS (review-5 P2). Without
+  # `.harness-path` this arm was admitted by the FALLBACK (`${HARNESS_PIN_DIR:-$CELL_HOME/harness}`), so a
+  # regression in the record parsing would leave it green while every cell\'s bring-up died. This is the record
+  # the bring-up writes (`printf "%s\n" "$dir/scripts/orchestrator-harness"`), and the trailing-slash spelling
+  # is included because that spelling used to be read as a pin ROOT and refused the box\'s real pin.
+  printf '%s\n' "$PIN_DIR/scripts/orchestrator-harness/" > "$PIN/home/.harness-path"
   PIN_RC=0; PIN_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PIN_SUP/cloud-cell-supervisor.sh" inst pin --install 2>&1)" || PIN_RC=$?
   [ "$PIN_RC" -eq 0 ] && ok '§P4: the DETACHED pin worktree the bring-up really creates installs (a cell home under /tmp is a DECLARED root)' \
                       || bad "§P4: refused the cell-3 shape — this guard would block every cell bring-up: $PIN_OUT"

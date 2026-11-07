@@ -101,8 +101,10 @@ recommends: a loop for an operator with no farm. What makes the #2697 shape wron
 out **on a branch** — unmerged code a lane removes when it lands — and git answers that directly
 (`symbolic-ref -q HEAD` succeeds on a branch, fails on a detached HEAD). So a linked worktree **on a
 branch** is refused wherever it lives (`/tmp/wt-x`, `$HOME/wt-x`, `<repo>/.worktrees/x`); a **detached**
-one is admitted ONLY when it is the pin this box records — `$CELL_HOME/.harness-path`, or the bring-up's
-default `$CELL_HOME/harness` — because detached is also the shape the fleet's **drainer** gives a lane's
+one is admitted ONLY when it is the pin TREE this box records — the path in `$CELL_HOME/.harness-path`
+(override: `HARNESS_PIN_FILE`), or, when no record exists yet, under the bring-up's pin root
+`$CELL_HOME/harness` (override: `HARNESS_PIN_DIR`) — because detached is also the shape the fleet's
+**drainer** gives a lane's
 scratch checkout (`ai-drainer.sh`: `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with
 `worktree remove --force` when the lane ends), and that one lives under `$HOME`; **every** other detached
 worktree is refused. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
