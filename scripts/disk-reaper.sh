@@ -10,11 +10,25 @@
 #   /tmp/wt-pr-8839 = 291 MB (merged) · /tmp/cell-home = 524 MB
 #   earlier on cell-3, ~/.cache/uv alone was 7.1 GB; clearing it freed 6-7 GB
 #
-# THE FLEET ALREADY HAD A POLICY OWNER FOR EACH CLASS — and no one thing that ran them. Four
-# ad-hoc reaps existed: `cloud-cell-supervisor.sh prune`, the hourly cache pass inside
-# `orch-loop.sh`, `pi-reap-worktrees-launchd.py`, and `cleanup-worktree.sh` at merge time. This
-# script is the CONSOLIDATION, not a fourth policy: it OWNS NO DELETION RULE of its own. It
-# resolves, schedules and accounts for the three owners:
+# THE FLEET ALREADY HAD A POLICY OWNER FOR EACH CLASS — and no one thing that ran them. SEVERAL
+# scheduled ad-hoc reaps existed, among them `cloud-cell-supervisor.sh prune`, the hourly cache
+# pass inside `orch-loop.sh`, `pi-reap-worktrees-launchd.py` (macOS only), and the per-owner
+# launchd units in `templates/launchd/` (`pi-cache-reap` hourly, `worktree-hygiene` every 6 h).
+# NO COUNT is claimed: the point is not how many there were, it is that none of them answered
+# "is this box being reaped, and how much did the last pass free?". This script is the
+# CONSOLIDATION, not another policy: it OWNS NO DELETION RULE of its own. It resolves, schedules
+# and accounts for the class owners below:
+#
+# ⛔ NOT one of those triggers, and never was an automation: `scripts/cleanup-worktree.sh` "at
+# merge time". NOTHING invokes it — `merge-one.sh` does no worktree removal and `admin-merge.sh`
+# removes only its own scratch worktree; an index-bounded `git grep -n 'cleanup-worktree'
+# origin/main` finds its only operational CALLER in a MANUAL step,
+# `skills/commit-workflow/workflow/05-cleanup.md:20`, which a lane has to remember to run (every
+# other hit is a comment, a scoping doc, or a guard test asserting it is REFUSED). This
+# pass neither schedules nor accounts for merge-time teardown (agent-infra#3278 plan comment §4:
+# the mass a merge hook cannot reach is `no-pr`/`open-pr`, which by definition have not merged). The
+# automated merge trigger that DOES exist is `pi-reap-worktrees.sh` rule 4 — inside the
+# `worktree` class below, not a merge hook.
 #
 #   class      owner (the single source of the delete rule)      what it reclaims
 #   ---------  -------------------------------------------------  --------------------------------

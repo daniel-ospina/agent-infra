@@ -367,19 +367,34 @@ rm -rf /tmp/venv-shared-py312                                       # 5,844 MB, 
 
 ### R4 — lane scratch copies (the only bucket that scales)
 ```bash
-# dry-run: name them, size them, prove no live holder
-find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +4320 \
+# dry-run: name them, size them, prove no live holder.
+# The age floor is 180 min — the scratch arm's OWN floor (`reap-abandoned-worktrees.sh:117`,
+# `AGED_MINUTES=180`), not 72 h. At 72 h the dirs this selects total ~5 MB (`du -xsc`) on a
+# box holding ~76 GB of scratch, which reads as "nothing to do" and stops anyone asking why.
+find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +180 \
      ! -name 'cell-*' ! -name 'actions-runner' ! -name 'venv-shared*' \
      ! -name 'G-*' ! -name '.pytest_cache' ! -name 'systemd-*' -print0 |
   xargs -0 du -xsh 2>/dev/null | sort -h | tail -20
 # every candidate must then pass: no .git dir/file, no /proc cwd/exe/argv inside it
 ```
-* **Expected:** the 3–7 day band is **18,292 MB (cell 3)** / **20,423 MB (cell 4)**; the 7–14 day band
-  adds 7,959 MB on cell 3.
-* **Guard (all must hold):** age ≥ 72 h **and** not a git checkout (`.git` present ⇒ skip) **and** no
-  live process holds it **and** the run is a dry-run whose count matches on a second read. Never take
-  this from a single `find | head` — a first-match reading is exactly the artifact class in
-  `AGENTS.md`.
+* **Expected:** measured on `cmux` (252 GB volume, 2026-11-06), the same command at two floors —
+  `du -xsc` total across the filtered dirs, so the number is directly comparable:
+
+  | floor | total | dirs |
+  |---|---|---|
+  | `-mmin +4320` (the old 72 h) | **5,008 KB — 4.9 MB** | 8 |
+  | `-mmin +180` (this one) | **80,155,676 KB — ~76.4 GB** | 3,124 |
+
+  `/tmp` totalled **94 GB** (`du -xsm /tmp` → `96,310`), so the 3 h–72 h band is essentially the
+  whole scratch population: **a 72 h floor reports 0.006% of that 76.4 GB population** (0.005% of
+  all of `/tmp`), and the directory count grows each time it is re-run (a tree joins the set the
+  moment it crosses 180 min). Its top-20 rows are ordinary mutation/review copies (`/tmp/muth`
+  1.4 G, `/tmp/revX` 2.4 G, `/tmp/tt_s80isga_` 1.6 G, `/tmp/wt-prefix-11211` 1.2 G …), which is
+  what the bucket is *for*.
+* **Guard (all must hold):** age ≥ 180 min — the arm's own floor, not a second number — **and** not a
+  git checkout (`.git` present ⇒ skip) **and** no live process holds it **and** the run is a dry-run
+  whose count matches on a second read. Never take this from a single `find | head` — a first-match
+  reading is exactly the artifact class in `AGENTS.md`.
 * ⚠️ These copies carry unlanded review/mutation evidence; this is a **deliberate** trade of evidence
   for headroom. Prefer R1/R2/R5 first, which trade nothing.
 
