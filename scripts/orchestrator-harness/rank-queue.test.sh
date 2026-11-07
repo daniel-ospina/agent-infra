@@ -91,7 +91,12 @@ if [ ! -s "$REFRESH" ]; then
 fi
 
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNOT-RUN: mktemp failed" >&2; exit 1; }
-trap 'rm -rf "$TMP"' EXIT
+# ⛔ THE TRAP MUST NOT FIRE IN A SUBSHELL. Every component of a PIPELINE (`printf ... | grep -q`) runs in a
+# forked subshell that INHERITS this trap, and bash runs it on that subshell's exit — which would `rm -rf` the
+# whole sandbox mid-run. The symptom is every drive after that point reporting `queue_order_from_pool: command
+# not found` while the same suite run earlier reads 174 green. Guard on BASHPID: in a subshell it differs from
+# `$$` (the parent's pid), so only the shell that created the sandbox removes it.
+trap 'if [ "$BASHPID" = "$$" ]; then rm -rf "$TMP"; fi' EXIT
 
 # ── EXTRACT THE SHIPPED FUNCTIONS ─────────────────────────────────────────────
 # Start at `rank_queue_by_pool() {` and stop at the comment that opens the block AFTER
@@ -578,22 +583,15 @@ FNR == NR {
   next
 }
 { line = $0; sub(/^[ \t]+/, "", line) }
-# ⛔ A `#` LINE IS A COMMENT ONLY WHEN IT STARTS OUTSIDE A QUOTE (review P2, cycle 71): inside a multi-line quoted
-# string a line can begin with `#` and STILL be emitted, so a blanket `^#` skip exempted a record claim sitting on
-# the second physical line of an echo. Quote state is tracked across lines (both quote characters, backslash
-# escapes honoured) and the skip applies only when the line BEGINS outside every quote. Only DOUBLE quotes are
-# tracked: an apostrophe inside comment prose is not a quote, and counting it made shipped comments look like they
-# began inside a string. Residual, stated: a `#` line inside a multi-line SINGLE-quoted string is still skipped —
-# the shapes this test guards are echo/double-quoted prose.
-{ raw = $0; _startq = _inq; _cur = _inq; _i = 1; _n = length(raw)
-  while (_i <= _n) {
-    _c = substr(raw, _i, 1)
-    if (_cur == 1 && _c == "\\") { _i += 2; continue }
-    if (_c == "\"") _cur = 1 - _cur
-    _i++
-  }
-  _inq = _cur }
-line ~ /^#/ && _startq == 0 { _inq = 0; next }
+# ⛔ A `#` LINE IS SKIPPED WHOLESALE, AND THAT SCOPE IS STATED (review P2, cycles 71-72). A record name can ride
+# the SECOND physical line of a multi-line quoted string — a line that begins with `#` and IS emitted. Classifying
+# that here needs quote tracking across lines, and every version of it was a source-shape heuristic that either
+# desynced on a legitimate line (`IFS`, an apostrophe in prose) or had to be exempted where it mattered. This rule
+# therefore grades SOURCE lines outside comments, full stop; text emitted from inside a quoted string is graded by
+# the OUTPUT PIN, which is where it actually reaches the operator. Witness (E) in the OUTPUT PIN section below
+# drives exactly that shape and requires the PIN to red, so the residual is covered by the half that cannot be
+# outrun — and the coverage of every capture in that pin is what makes the transfer legitimate.
+line ~ /^#/ { next }
 line !~ /pool-sat|tier-window|tier window|window record/ { next }
 line ~ /^(if|elif) \[/ {
   if (!_r1s || FNR < _r1s) print "before-read " FNR ": " substr(line, 1, 70)
@@ -632,12 +630,6 @@ if ! cmp -s "$FNS" "$_m_e" 2>/dev/null && _regred "$_m_e"; then rc=0
 else rc=1; echo "      a record-naming cat INSIDE the region did not red the names rule (cycle 70 exempted it by position alone)"; fi
 ck "non-vacuity: a record-naming PRINT inside the region reds the names rule (position alone is not an exemption)" $rc
 
-_m_i="$TMP/fns-region-cont.sh"
-# the mutation is TWO physical lines inside the arm's quoted string: the second one STARTS with `#` and IS emitted
-awk '{ print; if (index($0, "does not add up to the queue")) { print "      \"and the tier window record says a tier was"; print "# clipped\"" } }' "$FNS" > "$_m_i"
-if ! cmp -s "$FNS" "$_m_i" 2>/dev/null && _regred "$_m_i"; then rc=0
-else rc=1; echo "      a record name on a '#…'-starting CONTINUATION line of a quoted string did not red the names rule"; fi
-ck "non-vacuity: a record name on a '#…'-starting CONTINUATION line reds the names rule (a quoted '#' is not a comment)" $rc
 
 _m_j="$TMP/fns-region-substr.sh"
 awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  cat <<< \x27[refresh] queue order: _why_none=\" the tier-window record was clipped\x27" }' "$FNS" > "$_m_j"
@@ -3020,6 +3012,9 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 # SCOPE, STATED (so this is not a claim it cannot keep):
 #   * it covers every case THIS SUITE DRIVES — §14 and §6 drive each state arm and each refusal;
 #   * it does not red a source edit that changes no output, which is correct: a reformat cannot mislead an operator;
+#   * it pins EVERY REGULAR FILE a case leaves behind, except the deny-list below — so a fixture's INPUTS (`pool`,
+#     `q`, `seed`, `cnt`, a generated `*.awk`) are pinned too. That is deliberate: a fixture whose input silently
+#     changes grades a different scenario than the one this suite claims to drive;
 #   * four captures are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
 #     running this suite twice (once as cmux, once as root) with an EMPTY exclusion list: `arm-clip-unread/out`,
 #     `mh-mode000/out`, `poolguards/m000.log`, `sa-unreadable/out`. Root can read a mode-000 file, so those fixtures
@@ -3034,19 +3029,37 @@ _out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI
 # stay graded by the assertions above; the pin stays silent about them rather than turning "you ran as root" into a
 # false red. Every OTHER case — including any fixture added later — is pinned.
 _out_uid_excluded='arm-clip-unread/out mh-mode000/out poolguards/m000.log sa-unreadable/out'
-# ⛔ EVERY CAPTURE FILE COUNTS, NOT ONLY `out` (review P1, cycle 71): several fixtures write their arm's output to
-# a `log` beside the drive instead of `out` — `$GQ/absent.log`, `$GQ/dir.log`, `$PQ/log`, `$PQ/log2`, `$PQ/log3` —
-# and those ARE operator-facing output. A pin that scanned only `out` would have claimed coverage it did not have;
-# measured: a claim appended to the `product_queue_follow` re-sequenced sentence stayed 172/0 until `log*` was
-# scanned. Each capture is keyed `<case>/<file>`. WHAT IS NOT A CAPTURE, deliberately: `drive*.sh` (the fixture's
-# own source — input, not something an operator reads) and the witness intermediates (`out-ctl`, `out-mut`,
-# `trace*`), which exist to compare a mutant against its control inside their own check.
-_out_map() { # the pinned population: "<case>/<capture>=<crc>" per driven capture, sorted
+# ⛔ A CAPTURE IS EVERY FILE THE FIXTURE LEAVES BEHIND — NOT A SET OF FILENAMES (review P1+P2, cycle 72). Cycle
+# 71 scanned `out` plus `log*`; a reviewer then showed `sat/out-junk` — a fixture's PRIMARY output, holding the
+# `_sat_junk` clause — was never pinned, because its name is not on the list, and that a brand-new fixture capturing
+# to `err` or `capture.txt` would be invisible too. A list of output FILENAMES has exactly the defect a list of
+# claim WORDINGS has. So the rule is inverted: every regular file at the TOP LEVEL of a case directory is pinned,
+# EXCEPT two short deny-lists of things that are not the operator's output —
+#   * by NAME (`order`, `rc`, `out-ctl`, `out-mut`, `mutlog`) — the queue's post-run bytes, the drive's exit
+#     status, and witness intermediates, each compared inside its own check;
+#   * by GLOB (`*.sh`, `trace*`, `*.trace`, in the `case` just below) — the fixture's own driver/helper scripts (input, never emitted) and
+#     its XTRACE intermediates. `*.trace` also carries the per-run XTRACE NONCE, which differs on every run:
+#     pinning it would make this gate red for a reason that is not the shipped code.
+# The two mechanisms are kept apart because they are not interchangeable: the NAME list is a `case` WORD
+# comparison, which does NOT glob — a `*.sh` entry there would match nothing and read as coverage — and a GLOB
+# expansion in a `case` pattern position is not a pattern list (the `|` inside a variable's value stays literal),
+# so the globs are written out literally below rather than through a variable.
+# Everything else — `out`, `out-*`, `log`, `log<N>`, `*.log`, `err`, and a fixture's own inputs and record
+# files — is pinned, keyed `<case>/<file>`. A new fixture is therefore visible whatever it names its capture.
+_out_not_capture='order rc out-ctl out-mut mutlog'
+_out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, sorted
   for _od in "$TMP"/*/; do
     _on="${_od%/}"; _on="${_on##*/}"
-    for _of in "${_od}out" "${_od}"log "${_od}"log[0-9]* "${_od}"*.log; do
+    for _of in "${_od}"*; do
       [ -f "$_of" ] || continue
-      _okey="$_on/$(basename "$_of")"
+      _ob="$(basename "$_of")"
+      case " $_out_not_capture " in
+        *" $_ob "*) continue ;;
+      esac
+      case "$_ob" in
+        *.sh|trace*|*.trace) continue ;;
+      esac
+      _okey="$_on/$_ob"
       case " $_out_uid_excluded " in *" $_okey "*) continue ;; esac
       # ⛔ A ZERO-BYTE CAPTURE IS PINNED AS `EMPTY`, NOT SKIPPED (review P3, cycle 71): `continue` made three
       # shipped cases invisible (`rank-prefix`, `rankfmt`, `rankfmt2`), so "a new fixture is always visible" was
@@ -3056,16 +3069,23 @@ _out_map() { # the pinned population: "<case>/<capture>=<crc>" per driven captur
     done
   done | LC_ALL=C sort
 }
-_out_show() { # $1=<case>/<capture> -> a one-line preview, naming an EMPTY capture as such
-  if [ -s "$TMP/$1" ]; then head -3 "$TMP/$1" 2>/dev/null | tr '\n' '|' | head -c 300; else printf '(EMPTY capture - pinned as EMPTY, so a case that used to capture nothing now does)'; fi
-}
 _out_unique() { # the map above, deduped by content (many fixtures share an arm)
   _out_map | cut -d= -f2 | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
+# ⛔ THE DIAGNOSTICS NAME A CAPTURE, SO THEY MUST BE ABLE TO SHOW IT (cycle 73). `_out_show` was CALLED by three
+# failure messages and DEFINED NOWHERE: the substitution expanded to an empty string (a `command not found` on
+# stderr, invisible in the captured log), so the gate reddened with "…produces: " and no text — a red that tells
+# its reader nothing and looks like an empty capture. A key that does not resolve says so instead of printing air.
+_out_show() { # $1="<case>/<file>" -> the emitted text (paths folded), first 6 lines, '|'-joined
+  _os_f="$TMP/$1"
+  if [ ! -f "$_os_f" ]; then printf '<no such capture: %s>' "$1"; return 0; fi
+  if [ ! -s "$_os_f" ]; then printf '<EMPTY>'; return 0; fi
+  printf '"%s"' "$(_out_norm "$_os_f" | head -6 | tr '\n' '|' | sed 's/|$//')"
+}
 # ⛔ THE PIN. `case=crc` for every driven case, and the deduped set of distinct outputs, which is the coarse half:
 # a NEW case whose output duplicates an existing one cannot hide, and a sentence change moves the distinct set.
-_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|dupnone/out=2058117218|empty/out=3865464101|guards/absent.log=1657602827|guards/dir.log=2497213199|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/out=882446226|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace/out=1567885012|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out=4021605358|tail/out=2809272230|witness/out=4021605358'
-_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1102770011 1151312335 1187418021 1228480870 1296039546 132483589 1334011946 1334591389 1334787953 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1506249713 1531456368 1567885012 1657602827 1686707371 1806709770 1840396944 1943905615 1954371651 2014644524 2058117218 2163807204 2215093811 2241773645 2380626246 2467777652 2497213199 2561788194 2620396432 2632535107 263720862 2645416213 273058056 2755054736 2763562739 2809272230 2810210006 286439349 2928806463 2928854713 3025506656 3086333297 3104242257 3123583493 3178247719 3325294582 3363606256 3407422058 3512885538 3598440741 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4092273942 4111658287 4222849383 4245042416 4253467874 4272221706 4292339760 468363226 55288939 605356615 632953760 657909655 882446226 90999151 964254667 982395898 EMPTY'
+_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-head/out-head=1078605162|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-clip/out-unranked=3407422058|arm-clip/out-unrec=4222849383|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-refuse-rowset/seed=2566848085|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|countguard/cnt-good=527657959|countguard/out-bad=44744305|countguard/out-good=44744305|countguard/pool=2793652360|countguard/q=44744305|dupnone/out=2058117218|empty/out=3865464101|file-identity/cnt-empty=3504554043|file-identity/cnt-mut=1123651361|file-identity/empty=EMPTY|file-identity/out-empty=EMPTY|file-identity/pool=1752088521|file-identity/rank-nrfnr.awk=4062769569|file-identity/rank.awk=2321255770|guards/absent.log=1657602827|guards/dir.log=2497213199|guards/pool=1752088521|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/cnt=1552948430|mut-member/out=882446226|mut-member/pool=882446226|mut-member/q=2173392615|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace-empty/seed=2566848085|prunerace/out=1567885012|prunerace/seed=2566848085|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out-junk=3228248317|sat/out-sat=3190065530|sat/out=4021605358|tail/out=2809272230|wit-parse/assign.out=EMPTY|wit-parse/decoy.out=3004694436|wit-parse/forge.out=EMPTY|wit-parse/midline.out=EMPTY|wit-parse/other.out=2943144574|wit-parse/printf.out=1142707169|wit-parse/real.out=3673505914|witness/out=4021605358'
+_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1078605162 1102770011 1123651361 1142707169 1151312335 1187418021 1228480870 1296039546 132483589 1334011946 1334591389 1334787953 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1506249713 1531456368 1552948430 1567885012 1657602827 1686707371 1752088521 1806709770 1840396944 1943905615 1954371651 2014644524 2058117218 2163807204 2173392615 2215093811 2241773645 2321255770 2380626246 2467777652 2497213199 2561788194 2566848085 2620396432 2632535107 263720862 2645416213 273058056 2755054736 2763562739 2793652360 2809272230 2810210006 286439349 2928806463 2928854713 2943144574 3004694436 3025506656 3086333297 3104242257 3123583493 3178247719 3190065530 3228248317 3325294582 3363606256 3407422058 3504554043 3512885538 3598440741 3673505914 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4062769569 4092273942 4111658287 4222849383 4245042416 4253467874 4272221706 4292339760 44744305 468363226 527657959 55288939 605356615 632953760 657909655 882446226 90999151 964254667 982395898 EMPTY'
 _out_got="$(_out_map)"
 _out_distinct="$(_out_unique)"
 if [ "${RANK_QUEUE_PIN_REPORT:-0}" = "1" ]; then
@@ -3081,20 +3101,32 @@ elif [ "$_out_distinct" != "$_out_distinct_pin" ]; then
     _oc_crc="$(printf '%s' "$_out_got" | grep -m1 "^$_oc=" | cut -d= -f2)"
     printf '%s\n' $_out_distinct_pin | grep -qx "$_oc_crc" || echo "        capture $_oc emits an output no pinned case produces: $(_out_show "$_oc")"
   done
-elif [ "$(printf '%s\n' "$_out_got" | LC_ALL=C sort)" != "$(printf '%s' "$_out_pin" | tr '|' '\n' | LC_ALL=C sort)" ]; then
-  # ORDER-ONLY DIFFERENCE: every capture is present with the same CRC and only the sequence differs. That is a
-  # collation bug in this check, not prose reaching an operator — name it as such instead of claiming a change.
-  rc=1; echo "      the pinned captures are all present but the MAP SEQUENCE differs — this check's own collation, not the code under test (both sides are now compared under LC_ALL=C)" 
-  rc=1; echo "      a driven case's operator output changed:"
-  while IFS= read -r _oline; do
-    _oc="${_oline%%=*}"
-    printf '%s\n' "$(printf '%s' "$_out_pin" | tr '|' '\n')" | grep -qx "$_oline" && continue
-    echo "        capture $_oc: $(_out_show "$_oc")"
-  done <<EOF
-$_out_got
-EOF
-  echo "        (pin cases: $(printf '%s' "$_out_pin" | tr '|' ' ' | head -c 200)…)"
-else rc=0; fi
+else
+  # ⛔ THE MAP COMPARISON IS THE ELIF, NOT THE FALLTHROUGH (cycle 73). With the distinct sets equal, an `else` that
+  # reds UNCONDITIONALLY turns every green run red and names nothing — a gate that fails for a reason it never
+  # measured. Only a map that actually differs may red, and it must name the captures that differ.
+  _got_sorted="$(printf '%s\n' "$_out_got" | LC_ALL=C sort)"
+  _pin_sorted="$(printf '%s' "$_out_pin" | tr '|' '\n' | LC_ALL=C sort)"
+  if [ "$_got_sorted" = "$_pin_sorted" ] && [ "$_out_got" != "$(printf '%s' "$_out_pin" | tr '|' '\n')" ]; then
+    rc=1; echo "      every pinned capture is present with its pinned CRC and only the MAP SEQUENCE differs — this check's own collation, not the code under test (both sides are compared under LC_ALL=C below)"
+  elif [ "$_got_sorted" != "$_pin_sorted" ]; then
+    rc=1; echo "      a driven case's operator output changed, appeared, or disappeared:"
+  # ⛔ THE UNION OF BOTH SIDES (review P2, cycle 72): looping over the CURRENT map only meant a capture that
+  # DISAPPEARED was compared against nothing and named nowhere — the pin would red without saying what was lost.
+    for _okk in $(printf '%s\n' "$_out_got" $(printf '%s' "$_out_pin" | tr '|' '\n' | cut -d= -f1) | cut -d= -f1 | LC_ALL=C sort -u); do
+      _old="$(printf '%s' "$_out_pin" | tr '|' '\n' | grep -m1 "^$_okk=" | cut -d= -f2)"
+      _new="$(printf '%s' "$_out_got" | grep -m1 "^$_okk=" | cut -d= -f2)"
+      [ "$_old" = "$_new" ] && continue
+      if [ -z "$_new" ]; then
+        echo "        capture $_okk DISAPPEARED (pinned $_old)"
+      elif [ -z "$_old" ]; then
+        echo "        capture $_okk is NEW: $(_out_show "$_okk")"
+      else
+        echo "        capture $_okk CHANGED: $(_out_show "$_okk")"
+      fi
+    done
+  fi
+fi
 ck "the EMITTED text of every driven case is pinned (a claim reached the operator by SOME mechanism, or none did)" $rc
 
 # ⛔ NON-VACUITY for the output pin — the mechanisms that beat every source predicate, each required to red.
@@ -3166,6 +3198,20 @@ awk '{ if (index($0, "severity-first from the pool")) print "    _say_clip() { e
 if ! cmp -s "$FNS" "$_m_d" 2>/dev/null && _outred2 "$_m_d"; then rc=0
 else rc=1; echo "      a claim printed by a helper function did not red the output pin"; fi
 ck "non-vacuity: a claim printed by a HELPER FUNCTION reds the output pin" $rc
+
+# (E) a claim on the SECOND PHYSICAL LINE of the arm's quoted string, that line starting with `#`. The names rule
+# skips `#` lines wholesale (it grades source SHAPE, and a comment is not a claim), so the half that must catch a
+# claim EMITTED from inside a quoted string is this one: the bytes reaching the operator, whatever the source line
+# looked like. Two-state: the shipped source must reproduce the pin, the mutated one must leave it.
+_m_cont="$TMP/fns-outpin-contline.sh"
+awk '{ print; if (index($0, "severity-first from the pool")) { print "      \"and the tier window record says a tier was"; print "# clipped\"" } }' "$FNS" > "$_m_cont"
+if cmp -s "$FNS" "$_m_cont" 2>/dev/null; then
+  rc=1; echo "      the continuation-line mutation did not apply — its anchor drifted"
+elif ! grep -qx "$_rank_pin" <<< "$(printf '%s\n' $_out_distinct_pin)"; then
+  rc=1; echo "      the shipped 'rank' output is not among the pinned ones — the witness is not wired to the pin"
+elif _outred2 "$_m_cont"; then rc=0
+else rc=1; echo "      a record claim on a '#…'-starting CONTINUATION line changed the emitted text and the output pin did not see it"; fi
+ck "non-vacuity: a record claim on a '#…'-starting CONTINUATION line (which the names rule skips) REDS THE OUTPUT PIN" $rc
 
 # ⛔ AND THE PIN IS NOT OVER-BROAD: a source reformat that changes NO output must stay green. This is the other
 # half of the property — a pin that reds on whitespace would block correct work, which is how a gate gets bypassed.
