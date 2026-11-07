@@ -25,8 +25,10 @@
          ⛔ IT IS NOT AN ALWAYS-INSTALLABLE JOB, AND THIS PARAGRAPH USED TO SAY IT WAS
          (review round 22, P1). It is a `{{TORTOISE_REPO}}`-GATED template — like
          branch-reaper, worktree-reaper and worktree-hygiene, and UNLIKE pi-reap-orphans,
-         pi-cache-reap and lane-liveness, which name no placeholder and really are always
-         installed. The placeholder gate fires BEFORE `verify_targets` (`install-launchd.sh`
+         pi-cache-reap and lane-liveness, which carry no placeholder that can resolve EMPTY
+         and really are always installed. (They do name placeholders — HOME and PATH — and
+         naming one is not what gates a template; a name that can be UNSET is.) The gate fires
+         BEFORE `verify_targets` (`install-launchd.sh`
          returns SKIP from the placeholder loop), so on a box that resolves no tortoise
          checkout this job is SKIPPED at rc 0 and the target check never runs at all.
          ⛔ AND THAT IS A REAL LIMIT OF THIS CHANGE, RECORDED HERE RATHER THAN LEFT IMPLIED:
@@ -44,8 +46,15 @@
          The interpreter is resolved BY THE WRAPPER (`python3` on PATH, then
          /usr/bin/python3, then /usr/local/bin/python3), because this unit's
          ProgramArguments names `/bin/bash` + the farmed wrapper and launchd gives a job
-         no PATH of its own. The installer's {{PYTHON_BIN}} placeholder is not used here —
+         no PATH of its own. The installer's PYTHON_BIN placeholder is not used here —
          it belongs to the units whose argv[0] IS the interpreter.
+         ⛔ AND THAT NAME IS DELIBERATELY UN-BRACED (review round 23, P1). `install-launchd.sh`'s
+         placeholder gate greps the RAW template — COMMENTS INCLUDED — so writing a braced
+         placeholder token anywhere in this file, even while explaining that the placeholder
+         is NOT used, ADDS IT AS A SKIP GATE: measured, the braced form made the installer print
+         `SKIP com.tortoise.pr-doctor: unresolved placeholder(s) — is this a swarm host?` on a
+         box whose only missing name was the one this unit does not need. Every placeholder
+         named in prose in this file must stay unbraced, or `grep -o` it before committing.
          (An earlier version of this paragraph justified that by claiming the placeholder
          points at a non-existent venv on a non-swarm box; `install-launchd.sh` actually
          falls back to `command -v python3` when the venv is absent, so that install would
