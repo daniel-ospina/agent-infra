@@ -276,18 +276,22 @@ is_lane_scratch() { # is_lane_scratch <path>
     p="$(printf '%s' "$p" | tr -s '/')"
     case "$p" in
         */.worktrees/*) return 0 ;;
-        /tmp/wt-?*|/var/tmp/wt-?*|/private/tmp/wt-?*|/private/var/tmp/wt-?*) return 0 ;;
-        /tmp/cell-wt-?*|/var/tmp/cell-wt-?*|/private/tmp/cell-wt-?*|/private/var/tmp/cell-wt-?*) return 0 ;;
-        /tmp/base-?*|/var/tmp/base-?*|/private/tmp/base-?*|/private/var/tmp/base-?*) return 0 ;;
-        /var/folders/*/*/T/wt-?*|/private/var/folders/*/*/T/wt-?*) return 0 ;;
-        /var/folders/*/*/T/cell-wt-?*|/private/var/folders/*/*/T/cell-wt-?*) return 0 ;;
-        /var/folders/*/*/T/base-?*|/private/var/folders/*/*/T/base-?*) return 0 ;;
     esac
-    # the CELL lane-worktree shape: an ANCESTOR that is a linked worktree named `wt-<slug>`/`cell-wt-<slug>`
-    d="${p%/*}"
+    # ⛔ NO NAME-ONLY PREFIX ARMS. A NAME alone over-blocks, and it was MEASURED: `/tmp/wt-prod/
+    # agent-infra/tools/…` — a durable checkout whose FIRST component merely starts with `wt-` — matched
+    # the old `/tmp/wt-?*` arm and was refused as lane scratch, while the comment above claimed it was
+    # not; the suite could not see it because its own false-block fixture sits under a mktemp dir, never
+    # at a top-level `/tmp/wt-…` (fresh-context review round 17). `pi-reap-worktrees.sh` keys its glob on
+    # the BASENAME of each `git worktree list` entry, and a plain directory is not one.
+    #
+    # So EVERY shape below is decided by THE MARKER, never by the name: `git worktree add` writes a
+    # `.git` FILE at the worktree root (never a directory — that marker is what distinguishes a linked
+    # tree from a clone). It is checked on the path itself and on every ancestor, so a lane worktree at
+    # ANY depth is caught, and a durable directory that merely shares the prefix is not.
+    d="$p"
     while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
         case "${d##*/}" in
-            wt-?*|cell-wt-?*)
+            wt-?*|cell-wt-?*|base-?*)
                 # `-f`, because a linked worktree's `.git` is a FILE and a clone's is a directory
                 [ -f "$d/.git" ] && return 0 ;;
         esac
@@ -2058,9 +2062,25 @@ refuse_transient_installed_artifact() { # rc belongs to the CALLER: return 1 and
     is_lane_scratch "${v#*=}" && bad="${bad:+$bad; }$v"
     [ -n "$bad" ] || return 0
     err "the installed artifact points into TRANSIENT SCRATCH SPACE: $bad"
-    err "That tree is removed before the first tick, so every pass exits 127 while the scheduler lists the"
-    err "job as scheduled — the inert-enforcer shape the writing verbs REFUSE TO CREATE. Re-install from"
-    err "the box's real HOME (a login shell or cloud-cell-bringup.sh)."
+    # ⛔ THE CONSEQUENCE AND THE REMEDY ARE PER-FIELD, because they are different failures (fresh-context
+    # review round 17). A doomed SCRIPT/HOME/STATE_DIR makes systemd fail the unit before the tool runs —
+    # exit 127 every tick. A doomed PROVISIONER does NOT: the pass runs fine and records `no provisioner`,
+    # so the 127 sentence and its "re-install from your real HOME" remedy are false for it — the box is
+    # simply unable to ADD capacity, which is the warning `--install` prints in its own words elsewhere.
+    # Saying 127 here would send the operator to fix the wrong value (and, on a box whose HOME is fine,
+    # to re-install into a home that was never the problem).
+    local why=""
+    case "$bad" in
+        *SCRIPT=*|*HOME=*|*STATE_DIR=*)
+            why="every pass exits 127 while the scheduler lists the job as scheduled" ;;
+    esac
+    case "$bad" in
+        *PROVISIONER=*)
+            why="${why:+$why, and }every pass records 'no provisioner' and the box can never ADD capacity" ;;
+    esac
+    err "That tree is removed before the first tick, so $why — the inert-enforcer shape the writing verbs"
+    err "REFUSE TO CREATE. Re-install from a durable checkout (a login shell, cloud-cell-bringup.sh, or the"
+    err "box's real HOME); for a provisioner, a durable path or a repointed RUNNER_AUTOSCALE_PROVISIONER."
     return 1
 }
 

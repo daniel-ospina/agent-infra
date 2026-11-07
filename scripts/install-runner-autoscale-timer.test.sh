@@ -63,6 +63,10 @@ cleanup() {
         /tmp/wt-runnerautoscale.*) rm -rf "$WT" ;;
         *) : ;;
     esac
+    case "${WTP2:-}" in
+        /tmp/wt-prod.*) rm -rf "${WTP2%/agent-infra}" ;;
+        *) : ;;
+    esac
 }
 trap cleanup EXIT
 
@@ -410,7 +414,13 @@ assert_contains "$OUT" "127" "the refusal names the measured consequence (127 ev
 # legitimate test"), so the wider lane-checkout predicate is applied to the PROVISIONER only. A
 # provisioner's whole job is to still exist at the first tick; a converger copy is a legitimate thing
 # to schedule. The shapes are adopted verbatim from `scripts/install-repair-service.sh` (#2697).
+# ⛔ THE FIXTURE IS A REAL LINKED WORKTREE, NOT A DIRECTORY WITH THE RIGHT NAME (`git worktree add` WRITES
+# THE `.git` FILE). The predicate keys on that marker precisely so a durable `/tmp/wt-prod/…` checkout is
+# not swallowed — the over-block measured in fresh-context review round 17, and pinned by the negative arm
+# below. A fixture without `.git` now proves only that the name is ignored, which is the opposite of what
+# this arm is for.
 WT="/tmp/wt-runnerautoscale.$$"; mkdir -p "$WT"
+printf 'gitdir: /somewhere/.git/worktrees/wt-runnerautoscale\n' >"$WT/.git"
 printf '#!/bin/sh\n' >"$WT/inst.sh"; chmod +x "$WT/inst.sh"
 # A real fixture target, so the judgement under test is the PROVISIONER's and not "no scheduler available".
 D="$T/cwt1"; fresh "$D"; rm -f "$ARM"
@@ -420,6 +430,15 @@ assert_eq "$RC" 1 "a provisioner pinned under /tmp/wt-<issue>-<slug> is REFUSED 
 assert_contains "$OUT" "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE" \
     "…naming the class it would create, with the pin it judged"
 assert_contains "$OUT" "PROVISIONER=$WT/inst.sh" "…and the value it judged"
+# ⛔ AND THE CONSEQUENCE NAMED IS THE PROVISIONER'S OWN, NOT `127` (fresh-context review round 17). A
+# doomed pin does not fail the unit before the tool runs — the pass runs fine and records `no
+# provisioner`, so the box simply can never ADD capacity. The 127 sentence belongs to SCRIPT/HOME/
+# STATE_DIR; printing it here sent the operator to fix a HOME that was never the problem.
+case "$OUT" in
+  *127*) bad "a PROVISIONER-only scratch pin must not claim 'exit 127 every tick' — a doomed pin still runs, it just cannot ADD";;
+  *) ok "a PROVISIONER-only scratch pin names its own consequence, not the 127 one";;
+esac
+assert_contains "$OUT" "no provisioner'" "…and names the consequence it does have (every pass records 'no provisioner')"
 # ⛔ AND THE *OTHER* LANE CHECKOUT SHAPE THE REPO ALREADY NAMES, because a predicate that covers one
 # shape and not the other is exactly the partial guard this suite exists to catch. Placed under $T so it
 # matches ONLY the `*/.worktrees/*` alternative and not `/tmp/wt-*`.
@@ -471,6 +490,19 @@ OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
 assert_eq "$RC" 0 "a durable path under a 'wt-'-named ANCESTOR is NOT refused (it is not a worktree)"
 assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$WTP/tools/install-ci-runner-x64.sh" \
     "…and the pin is rendered, not dropped as lane scratch"
+# ⛔ AND THE SAME PATH AT A TOP-LEVEL `/tmp/wt-…`, WHICH IS THE SHAPE THAT ACTUALLY OVER-BLOCKED. The arm
+# above is under `$T` (a mktemp dir), so it never matched the old `/tmp/wt-?*` NAME arm and could not see
+# the defect: measured `/tmp/wt-prod/agent-infra/tools/…` → MATCH → refused as lane scratch, while the
+# message told a working operator their durable path "is deleted with its lane". Requiring the `.git`
+# marker is what makes the name irrelevant; this arm is the one that would go red if it came back.
+WTP2="/tmp/wt-prod.$$/agent-infra"; mkdir -p "$WTP2/tools"
+printf '#!/bin/sh\n' >"$WTP2/tools/install-ci-runner-x64.sh"; chmod +x "$WTP2/tools/install-ci-runner-x64.sh"
+D="$T/cwt2e2"; fresh "$D"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WTP2/tools/install-ci-runner-x64.sh" SUDO=false)
+OUT="$(run_install Linux "$D" --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a durable top-level /tmp/wt-<name>/ checkout is NOT refused (the name alone is not the fact)"
+assert_contains "$(cat "$D/$UNIT_NAME.service")" "RUNNER_AUTOSCALE_PROVISIONER=$WTP2/tools/install-ci-runner-x64.sh" \
+    "…and that pin is rendered too"
 # ⛔ AND THE *CANDIDATE* DIRECTION, WHICH NOTHING ELSE IN THIS FILE EXERCISES (review P2). Every other
 # provisioner arm sets `RUNNER_AUTOSCALE_PROVISIONER`, and A NAMED PIN IS THE WHOLE LIST — so the candidate
 # loop never runs and the `skipping LANE-SCRATCH PROVISIONER CANDIDATE` note was reachable by nothing.

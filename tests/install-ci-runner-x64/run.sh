@@ -319,7 +319,7 @@ fi
 # `_next_free_slot` tests only `.runner`, so it asks for this same index forever while `add`/`reclaim`
 # refuse the path and `reconcile` never enumerates it. Nothing repairs it automatically, so it is a
 # FAILURE the caller must see (exit 6 -> ActionFailed -> `problems`, exit 3). ⛔ IT WAS `exit 2` UNTIL
-# REVIEW ROUND 16: `ci_runner_pool.sh`'s EXIT block (:175-176) calls rc 4 a NAME verdict ("that name is
+# REVIEW ROUND 16: `ci_runner_pool.sh`'s EXIT block (:174-175) calls rc 4 a NAME verdict ("that name is
 # taken … try another name"), not a capacity verdict — so exit 2 put a leftover DIRECTORY into the
 # caller's answer channel, where it became `GUARD CONFLICT … a human must decide which number is wrong`
 # on a box with disk headroom and `provisioner-refused` -> **exit 0** without, i.e. a box that can never

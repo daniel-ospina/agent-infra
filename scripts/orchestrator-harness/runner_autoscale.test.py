@@ -5614,7 +5614,14 @@ def t58_provisioner_receives_repo_and_root():
         try:
             box.provisioner(rc=0, out="provisioned slot=2 name=gh-runner-x64-2 added=1")
             box.apply()
-            ra.provision(2, repo="o/other", root=box.root)
+            # ⛔ THE ROOT MUST BE A VALUE NO AMBIENT SEAM CAN SUPPLY. `Box.apply()` puts
+            # `RUNNER_AUTOSCALE_RUNNER_ROOT=<box.root>` into `os.environ`, and `provision()` spawns with
+            # `os.environ.copy()` — so asserting `== box.root` was satisfied by INHERITANCE ALONE and the
+            # root half of this case could not fail (fresh-context review round 17, measured: deleting
+            # `if root: child_env[...]` left the whole suite PASS=61 FAIL=0). A distinct path proves the
+            # ARGUMENT travelled, which is the whole `--root X` false PASS this arm exists for.
+            child_root = os.path.join(box.dir, "r58-child-root")
+            ra.provision(2, repo="o/other", root=child_root)
             env = {}
             for line in box.calls("provisioner-env.log"):
                 k, _, v = line.partition("=")
@@ -5624,8 +5631,9 @@ def t58_provisioner_receives_repo_and_root():
                 f"the caller's repo must reach the child, got {env.get('RUNNER_AUTOSCALE_REPO')!r}",
             )
             check(
-                env.get("RUNNER_AUTOSCALE_RUNNER_ROOT") == box.root,
-                f"the caller's root must reach the child, got {env.get('RUNNER_AUTOSCALE_RUNNER_ROOT')!r}",
+                env.get("RUNNER_AUTOSCALE_RUNNER_ROOT") == child_root,
+                "the caller's root must reach the child — an INHERITED ambient value is not the "
+                f"argument travelling, got {env.get('RUNNER_AUTOSCALE_RUNNER_ROOT')!r}",
             )
             # The adapter (the JOIN) is what translates this into the pool tool's own variable; the
             # caller must NOT name a variable that belongs to the tool on the other side of the join.

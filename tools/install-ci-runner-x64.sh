@@ -106,7 +106,9 @@
 #      discriminator is the caller's own occupancy predicate: rc 2 or 3 WITH `.runner` present → exit 0
 #      (`added=1 listener=dead`, or `added=0 skipped=1` when a peer wrote it), which is checked BEFORE
 #      the code split below.
-#      ⛔ 4 IS TWO DIFFERENT FACTS AND IS SPLIT, because one of them is not a failure at all:
+#      ⛔ 4 IS TWO DIFFERENT CODES, because one of its facts is not a failure at all. The pool's EXIT
+#      block (:174-175) calls rc 4 a NAME verdict — "that name is taken; nothing changed, try another
+#      name" — so it is never a capacity answer either way:
 #        · rc 4 AND the slot now holds `.runner` → the box CONVERGED (a peer pass took the same
 #          index, or a registration already existed). The caller asked for a slot that is now
 #          filled, so it is the SAME success as the idempotent skip above — exit 0. Treating this
@@ -114,18 +116,24 @@
 #          `<root>/gh-runner-x64-2/.runner` and exited 4, and the pass recorded action-failed
 #          although the runner existed. Two passes adding the same index is a REAL condition here —
 #          the caller takes no inter-pass lock and its own docs note passes racing.
-#        · rc 4 with NO `.runner` → a refusal, and the message must NOT tell anyone to delete the path.
-#          `ci_runner_pool.sh::add` creates the directory, copies the template, runs `config.sh` and
-#          only THEN writes `.runner`, so "directory exists without `.runner`" is the NORMAL state of
-#          a peer's in-flight add for its whole window, not a synonym for a stale leftover. The
-#          pre-call capture can tell "appeared during this call" from "was already there", but it
-#          CANNOT tell "a peer started just before my call" from "a residual wedge" — the bytes are
-#          identical. So every rc-4 refusal names the state and both possible causes, and offers only
-#          NON-DESTRUCTIVE remedies (`retry next pass`, `restart --name`); a human clears a path that
-#          persists. ⛔ THIS FILE PRESCRIBES `rm -rf` NOWHERE.
-#        · a symlinked `.runner` whose target is gone is its own refusal: the pool answers `already
-#          registered — use restart` while the caller's `Path.exists()` answers FREE, so `live` never
-#          moves. The message names the disagreement instead of picking a side.
+#        · rc 4 with NO `.runner` and NOTHING CAN REPAIR IT → exit 6, a FAILURE. `_next_free_slot` tests
+#          only `.runner`, so a leftover directory or a dangling link makes the caller re-ask this same
+#          index for ever and `live` never moves. Two sub-states: a path that PRE-EXISTED (a stale
+#          leftover never heals; it may also be a peer's add mid-flight, which does — a transient
+#          failure on one pass is cheaper than a permanent silent green) and a `.runner` SYMLINK with
+#          no target (the pool's `[ -e ] || [ -L ]` says REGISTERED, the caller's `Path.exists()`
+#          follows the link and says FREE, so the two tools disagree about the same bytes and only a
+#          human can break the tie).
+#        · rc 4 with NO `.runner` because the path APPEARED during this call → exit 2, a REFUSAL. That
+#          genuinely is another pass's answer about the same slot, and the next pass retries it.
+#      ⛔ AND THE MESSAGE PRESCRIBES `rm -rf` FOR NONE OF THEM. `ci_runner_pool.sh::add` creates the
+#      directory, copies the template, runs `config.sh` and only THEN writes `.runner`, so "directory
+#      exists without `.runner`" is the NORMAL state of a peer's in-flight add for its whole window,
+#      not a synonym for a stale leftover; the pre-call capture can tell "appeared during this call"
+#      from "was already there" but CANNOT tell "a peer started just before my call" from "a residual
+#      wedge" — the bytes are identical. So every rc-4 message names the state and both possible
+#      causes and offers only NON-DESTRUCTIVE remedies (`retry next pass`, `restart --name`); a human
+#      clears a path that persists. ⛔ THIS FILE PRESCRIBES `rm -rf` NOWHERE.
 #
 #   `--fallback auto` is accepted and is the ONLY accepted value: it means "let ci_runner_pool.sh
 #   resolve its own template/kernel/arch", which is what it already does. Passing anything else is
@@ -341,7 +349,7 @@ case "$rc" in
      # what this file's own header forbids. Report the state, name BOTH possible causes, and give only
      # the non-destructive remedy: the adapter never deletes a directory it did not create.
      # ⛔ AND THE CODE SPLIT IS THE SAME ONE rc 2/rc 3 GETS, **because rc 4 is not a capacity verdict
-     # either**: `ci_runner_pool.sh`'s EXIT block (:175-176) classifies it as "name not available (that
+     # either**: `ci_runner_pool.sh`'s EXIT block (:174-175) classifies it as "name not available (that
      # name is taken; nothing changed, try another name)". The box did not answer a capacity question;
      # SOMETHING IS SITTING ON THE SLOT THE CALLER WILL ASK FOR AGAIN NEXT PASS. `_next_free_slot`
      # tests only `.runner`, so a wedge or a dangling link makes the caller re-ask the SAME index for
