@@ -1167,12 +1167,17 @@ grep -qF 'continue' <<<"$(grep -A2 -F 'log_line "$repo #$pr review $_rstate at $
 # ⛔ COUNT STATEMENTS, NOT DOCUMENTATION (review round 12, P2, MEASURED): the count was taken over the raw
 # file, so a COMMENT mentioning `_rdispatched=0` added a phantom second reset and RED-ed the suite on a
 # comment — a false block, and the opposite of the doctrine the hand-off arms in this same file state
-# ("two anchors separated by documentation are still adjacent"). Comments and blank lines are dropped first.
+# ("two anchors separated by documentation are still adjacent"). Comments and blank lines are dropped first —
+# ⛔ AND BY *BOTH* ARMS (review round 13, P2, MEASURED): the increment arm kept its `"$SUT"` FILE OPERAND, so
+# its `printf | grep` pipeline was DEAD — grep read the file and the filter never ran. A comment above the
+# increment that merely NAMED the expression then counted as a second increment and red-ed the suite on a
+# comment, with a message asserting two increments where the file has one. The sentence above claimed the
+# filtering happened; that operand made the claim false for half the block.
 _rd_stmt=$(grep -vE '^[[:space:]]*(#|$)' "$SUT")
 _rd_zero=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*0([^0-9]|$)' | wc -l | tr -d ' ')
 [ "$_rd_zero" = 1 ] \
   || bad "the per-pass review counter must be SET TO ZERO exactly once per pass (found ${_rd_zero:-0} zeroing assignment(s)) — a reset after the increment, however it is written (bare, '&&', arithmetic, export, inside an if), blinds review_should_defer and disables REVIEW_PER_PASS"
-_rd_inc=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*\$\(\(|\(\([[:space:]]*_rdispatched[[:space:]]*=[[:space:]]*_rdispatched' "$SUT" | wc -l | tr -d ' ')
+_rd_inc=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*\$\(\(|\(\([[:space:]]*_rdispatched[[:space:]]*=[[:space:]]*_rdispatched' | wc -l | tr -d ' ')
 [ "$_rd_inc" = 1 ] \
   || bad "the per-pass review counter must have exactly one increment (found ${_rd_inc:-0}) — two increments spend the cap twice as fast, and none makes the cap inert"
 grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
@@ -1416,8 +1421,8 @@ _pin_once "$_RATTRE" "the loop must read the attempt count FROM THE HEAD-KEYED L
 _pin_once "$_RAGERE" "the age must be taken by review_dispatch_age ALONE, on its own line (_rage=\$(review_dispatch_age \"\$_rout\"); _rage_rc=\$?)"
 _pin_once "$_RACTRE" "the loop must pass the three measured values into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"; _ract=\$?')"
 _pin_once "$_RACTIFRE" "the loop must branch on review_action's OWN result ('if [ \"\$_ract\" -eq 0 ]; then')"
-_pin_next "$_ROUTAS" "$_RATTAS" "the record path must be followed by the attempt-ledger path as the VERY NEXT STATEMENT — a `_rout=<decoy>` inserted here is aged instead of the record the loop acts on, and a fresh-epoch decoy reads as age 0 = WAIT for ever"
-_pin_next "$_RATTAS" "$_RSTRE" "the attempt-ledger path must be followed by the state read as the VERY NEXT STATEMENT — a `_ratt=/dev/null` inserted here makes review_attempts return 0, so the attempt bound is always true and EXHAUSTED is unreachable"
+_pin_next "$_ROUTAS" "$_RATTAS" "the record path must be followed by the attempt-ledger path as the VERY NEXT STATEMENT — an inserted \`_rout=<decoy>\` here is aged instead of the record the loop acts on, and a fresh-epoch decoy reads as age 0 = WAIT for ever"
+_pin_next "$_RATTAS" "$_RSTRE" "the attempt-ledger path must be followed by the state read as the VERY NEXT STATEMENT — an inserted \`_ratt=/dev/null\` here makes review_attempts return 0, so the attempt bound is always true and EXHAUSTED is unreachable"
 _pin_next "$_RSTRE" "$_RATTRE" "the review state must be followed by the attempt count as the VERY NEXT STATEMENT — an inserted \`_rstate=clean\` makes review_action return 2, which publishes a false 'a record exists' claim and buys no review at all, while every other arm stays green"
 _pin_next "$_RATTRE" "$_RAGERE" "the attempt count must be followed by the age read as the VERY NEXT STATEMENT — a statement inserted between them can ZERO the count (measured: \`_rattn=0\`), which makes review_action's attempt bound always true, leaves EXHAUSTED unreachable and buys one PAID dispatch on every pass while the suite stays green"
 _pin_next "$_RAGERE" "$_RACTRE" "the age must reach review_action as the VERY NEXT STATEMENT — a statement before the call on that line, or a line in between, can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the age call itself still matches its pin"
