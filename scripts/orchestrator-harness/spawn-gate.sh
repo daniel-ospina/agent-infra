@@ -3941,8 +3941,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       # `gh-rest/gh`, `gh-limit/gh` and `retired/*.sh` are deployed, and a missing `$O/gh-rest/gh` leaves
       # every harness `gh` call unserialised and unbounded. (This enumeration is DIRECTORY READ, not
       # remembered — the first draft named a `fleet/` that has never been in this tree, which is the same
-      # claim-versus-tree failure the rest of this change is about.) Applied here by the merge with #3508:
-      # these three lines did not exist on main, so #3508's 7-site table could not have covered them.
+      # claim-versus-tree failure the rest of this change is about.) ⛔ THE SWEEP WAS UNDONE, IT WAS NOT
+      # MISSED (#3508 vs #3231) — round-13 review of #3645: at #3508's own sweep (`fd5af7b0`) this file carried
+      # ZERO occurrences of the glob, i.e. it was swept CLEAN; #3231's merge (`8d9a936b`) then put it back at
+      # four sites — this comment plus the three messages below. So `origin/main` carries all four, and a reader
+      # who greps main finds them and concludes this change rewrites what #3508 already fixed. It is the
+      # reverse: #3508's 7-site table could not cover lines a LATER merge re-introduced.
       AGENT_STARTED=0
       echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the helper pair with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
       return "$AGENT_HARNESS_SKEW_REFUSED" ;;
