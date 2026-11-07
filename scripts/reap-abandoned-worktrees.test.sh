@@ -367,7 +367,7 @@ case_g() { # <owner-script>
     OUT="$(HOME="$root/a-home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
            REAP_AW_PROC_ROOT="$FB/proc" bash "$owner" --root "$root" --include-gitless 2>&1)"; OUT_RC=$?
     case_check "$(grep -qF "PRESERVED($root/a-home, home-or-state)" <<<"$OUT" && echo 0 || echo 1)" \
-               "the cell HOME is never a candidate, even AGED and sitting inside the root (preserved:home-or-state)"
+               "HOME (the reference, NOT CELL_HOME) is never a candidate, even AGED and inside the root (preserved:home-or-state)"
     case_check "$(grep -q '^remove .*a-home' <<<"$OUT" && echo 1 || echo 0)" \
                "and it is not reported removable either"
     OUT="$(HOME="$FB/home" CELL_HOME="$root/a-cellhome" REAP_AW_STATE_DIR="$FB/state" REAP_AW_LOG="$FB/state/log" \
