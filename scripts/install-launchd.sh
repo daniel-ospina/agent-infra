@@ -631,11 +631,21 @@ if launchers and launchers[-1].rsplit("/", 1)[-1] == "env":
                         # promoted the VALUE to launcher, verdicted the real program as a TARGET, and
                         # SKIPped + DISARMED a grant-holding unit that the awk reader installed
                         # (review of #3413, round 9 P1).
-                        if tok in ENV_VALUE_OPTIONS:
-                            seen_val_opt = True
-                            continue
+                        # ⛔ AND THE PENDING VALUE IS CONSUMED **BEFORE** THE OPTION TABLE IS TESTED, the
+                        # order the space form gets from its atomic `i += 2` and the one classify_cmd
+                        # already used. Testing ENV_VALUE_OPTIONS first re-armed the pending value
+                        # whenever the VALUE ITSELF spelled -u/-C/-P/--unset/--chdir: for
+                        # `-S '-u -C <TCC binary> <TCC script>'` the real program was eaten as the
+                        # value, the SCRIPT was promoted to launcher, the binary got no verdict at all,
+                        # and the unit was SKIPped + `launchctl bootout`ed + `rm -f`ed while the awk
+                        # reader installed it — the round-12 P2, on the `-S` arm (measured 2026-11-07,
+                        # differential shape 14; real env semantics agree with the fix, since `-u`
+                        # takes the next argument verbatim and so `-u -C` unsets a variable named -C).
                         if seen_val_opt:
                             seen_val_opt = False
+                            continue
+                        if tok in ENV_VALUE_OPTIONS:
+                            seen_val_opt = True
                             continue
                         if tok.startswith("-") or ("=" in tok and not tok.startswith("/")):
                             continue
@@ -908,12 +918,39 @@ plist_program_args() {
             # then installed ARMED AND DEAD, the one direction this change exists to close (fresh
             # review of #3413, round 6 P2).
             if (envmode && idx >= 1) {
+                # THE VALUE OF A REQUIRED-VALUE OPTION IS CONSUMED ATOMICALLY, so this test runs BEFORE
+                # every other arm. The python reader carries no pending-value state at all: it does
+                # skipped.add(i + 1); i += 2. Deciding VALUE_OPTS first re-armed the pending value when
+                # the VALUE ITSELF spelled one of -u/-C/-P/--unset/--chdir, so the real program was
+                # swallowed as the value and the element AFTER it was promoted to LAUNCHER: for
+                # `env -u -C <TCC binary> <TCC script>` the fallback named the SCRIPT launcher, never
+                # saw the BINARY grant, filed the script exec with no grant, and answered verdict 2 —
+                # `launchctl bootout` plus `rm -f` of a working, grant-holding unit, while python
+                # installed it (fresh review of #3413, round 12 P2). classify_cmd already had this
+                # order; the env block was the arm disagreeing with its own sibling.
+                if (wantval) { wantval = 0; prev = line; next }
                 if (wantcmd) { wantcmd = 0; classify_cmd(line); envmode = 0; prev = line; next }
                 if (line == "-S" || line == "--split-string") { wantcmd = 1; prev = line; next }
                 if (line ~ /^--split-string=/) { classify_cmd(substr(line, 16)); envmode = 0; prev = line; next }
                 if (line ~ /^-S/) { classify_cmd(substr(line, 3)); envmode = 0; prev = line; next }
                 if (line in VALUE_OPTS) { wantval = 1; prev = line; next }
-                if (wantval) { wantval = 0; prev = line; next }
+
+                # THE JOINED --opt=<path> SPELLING IS EXECUTED CODE IN A PRE-PROGRAM POSITION TOO. The
+                # python reader drops a joined name that is in ENV_VALUE_OPTIONS (so the emission pass
+                # cannot split --chdir=/tmp into exec /tmp) and emits every OTHER joined absolute
+                # value. This block only ever dropped, so a joined spelling such as --script=<TCC
+                # script> inside the env argument list got NO verdict at all: python skipped and
+                # disarmed the unit, the fallback installed it (round 12 P2, same table, other
+                # direction). `env` itself rejects an unknown --script=, so that unit is dead either
+                # way — the invariant pinned here is that the two readers cannot DISAGREE about it.
+                if (line ~ /^--/ && index(line, "=") > 0) {
+                    name = substr(line, 1, index(line, "=") - 1)
+                    val = substr(line, index(line, "=") + 1)
+                    if (!(name in VALUE_OPTS) && val ~ /^\//)
+                        printf "%s\t%s\n", (name == "--repo" || name == "--root") ? "data" : "exec", val
+                    prev = line
+                    next
+                }
 
                 # an option or a NAME=VALUE is not the program and does not end the search
                 if (line ~ /^-/ || (index(line, "=") > 0 && line !~ /^\//)) { prev = line; next }

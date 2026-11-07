@@ -1896,6 +1896,67 @@ assert_eq "$RC" "0" "§7c control: the fallback consumes the same empty value an
 assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the two readers still agree"
 assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and the unit is ARMED, not skipped (the empty was the option value, not the program)"
 
+# (c22l) TWO SHAPES THAT PUT AN OPTION-SPELLED TOKEN WHERE THE SCAN MUST ACCEPT IT AS DATA.
+#
+# (1) The VALUE of a required-value option is consumed ATOMICALLY: python does `i += 2` with no
+# pending-value state, so the value is that option's value EVEN WHEN IT SPELLS ANOTHER OPTION.
+# `env -u -C <TCC binary> <TCC script>` unsets a variable named `-C` and runs the binary. The awk
+# decided `VALUE_OPTS` BEFORE its pending-value state, re-armed the pending value on `-C`, swallowed
+# the BINARY as "the value", and promoted the SCRIPT to launcher — so the binary grant was never
+# seen, the script was filed `exec` with no grant, and `install_job` answered 2 with `launchctl
+# bootout` + `rm -f` of a WORKING unit, while python installed it (fresh review of #3413, round 12
+# P2). The direction is destructive, which is why the discriminating assertions name the SIDE and the
+# LAUNCHER, not the exit code (verdict 2 and verdict 0 are both rc 0).
+#
+# (2) The joined spelling: python skips a joined name in `ENV_VALUE_OPTIONS` and emits every OTHER
+# joined absolute value; the fallback dropped ALL of them, so `--script=<TCC script>` got no verdict.
+# `env` rejects an unknown `--script=`, so that unit is dead either way — the invariant under test is
+# that the two readers cannot DISAGREE about it.
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -u -C "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: a required-value option consumes its VALUE even when the value spells an option"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the BINARY is the launcher, not the script after it"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the working unit is not skipped, disarmed and deleted"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -u -C "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -u -C <bin> <script> — the two readers agree on the verdict"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and on the same launcher"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env --chdir=/tmp "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: the JOINED --chdir=<dir> is dropped, so it is never split into exec <dir>"
+assert_not_contains "$OUT" "unreadable or not a regular file: /tmp" "§7c …and a directory option value cannot abort the install"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "--script=$PROBE_DEAD" /bin/bash "$PROBE_FARM" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: a JOINED absolute value inside the env args gets a verdict"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "--script=$PROBE_DEAD" /bin/bash "$PROBE_FARM" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c python reader: …and the two agree on that side too"
+
+# …THE SAME RULE ON THE `-S` STRING ARM. The python `-S` scanner tested `ENV_VALUE_OPTIONS` BEFORE its
+# pending-value flag — the inverse of the space form (atomic `i += 2`) and of classify_cmd — so a value
+# that itself spelled an option was re-armed as an option, the real program was eaten as that value, and
+# the element after it was promoted to launcher. `-S '-u -C <TCC binary> <TCC script>'` named the SCRIPT
+# launcher, gave the BINARY no verdict, and answered verdict 2 (SKIP + `launchctl bootout` + `rm -f`) on
+# the python reader while the fallback installed the working unit (measured 2026-11-07, differential
+# shape 14 — the round-12 P2 on the last arm of the table that still held the old order).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "-u -C $PROBE_TCC_BIN $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -S consumes a value that spells an option, as env does"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the BINARY is the launcher, not the script after it"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the working unit is not skipped, disarmed and deleted"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "-u -C $PROBE_TCC_BIN $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: the same -S command line lands on the same launcher"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and the fallback names the same launcher as the python reader"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and neither disarms it"
+
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
 mkdir -p "$PROBE_HOME/Documents/checkout/with space"
