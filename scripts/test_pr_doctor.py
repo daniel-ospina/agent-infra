@@ -7904,8 +7904,12 @@ def test_the_SHIPPED_plist_names_the_repo_the_armed_job_grades(tmp_path, monkeyp
     assert argv[1].endswith("pr-doctor-machine.sh"), argv
     assert "--repo" not in argv, "the shipped job must name no repo: %r" % (argv,)
     assert "pr-doctor.py" not in " ".join(argv), "the unit targets the WRAPPER: %r" % (argv,)
-    # ⛔ `GH_REPO` IS NOT EVIDENCE (#2235) — dropped from this unit in the same change, and this
-    # arm exists to keep it dropped.
+    # ⛔ `GH_REPO` IS NOT EVIDENCE (#2235) — it was dropped from this unit by #2280, NOT by the
+    # agent-infra#2281 change that retargeted the argv above (measured: `origin/main`'s
+    # EnvironmentVariables is already `PATH`/`HOME`/`REPO`). So this arm is a standing INVARIANT pin,
+    # not a pin on #2281 — and it is kept because re-adding `GH_REPO` would make the job look armed
+    # while grading a box-global repo. Say which change did what: a comment that credits the wrong
+    # change is the stale-prose class this PR has spent several rounds removing.
     assert "GH_REPO" not in spec["EnvironmentVariables"], spec["EnvironmentVariables"]
 
     co = _checkout(tmp_path, "co-tortoise", _REPO_B)
