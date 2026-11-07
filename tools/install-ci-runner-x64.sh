@@ -33,8 +33,13 @@
 #      NUMBER. "Occupied" is `.runner` present, not the path existing, precisely so that "one call =
 #      one addition" holds for the ceiling arithmetic. So this file adds AT MOST ONE install: the one
 #      `N` names. Sweeping a range would put several runners on a box whose per-step memory/disk
-#      re-read the caller performs between calls was budgeted for one; filling gaps is `reconcile`'s
-#      job, not this adapter's.
+#      re-read the caller performs between calls was budgeted for one; filling a GAP between
+#      installed slots is `reconcile`'s job, not this adapter's.
+#      ⛔ THAT IS TRUE OF A GAP, NOT OF A WEDGE, and the difference is the whole point of the rc-4
+#      arm below: an installed slot is one holding `.runner`, and a leftover DIRECTORY at the next
+#      free index is counted FREE by the caller (`_next_free_slot` tests `.runner`) while `add`
+#      refuses the path. That is not a gap `reconcile` fills — it sees only registered dirs — so
+#      this file reports it as a refusal naming the path to clear rather than leaving it silent.
 #
 #   3. THE INSTALL MUST BE VISIBLE TO THE CALLER: `discover()` enumerates `<root>/gh-runner*` holding
 #      a `.runner`, `--root` defaults to `/opt` (or `RUNNER_AUTOSCALE_RUNNER_ROOT`), and the numbering
@@ -57,8 +62,22 @@
 #      floor and the core-aware ceiling), rc 2 for `cannot-measure`/`cannot-act`, rc 4 for a taken
 #      name, rc 5 for a name that could not be registered. So BOTH 2 AND 3 are refusals to this
 #      file — mapping only 2 was the bug that recorded a correct memory-floor refusal from a box at
-#      its ceiling (the #3469 shape, the COMMON case) as a hard failure every pass. 4 and 5 stay
-#      failures: a box state and a name condition are things the caller's repair path must see.
+#      its ceiling (the #3469 shape, the COMMON case) as a hard failure every pass. 5 stays a
+#      failure: a name that could not be registered is a thing the caller's repair path must see.
+#      ⛔ 4 IS TWO DIFFERENT FACTS AND IS SPLIT, because one of them is not a failure at all:
+#        · rc 4 AND the slot now holds `.runner` → the box CONVERGED (a peer pass took the same
+#          index, or a registration already existed). The caller asked for a slot that is now
+#          filled, so it is the SAME success as the idempotent skip above — exit 0. Treating this
+#          as a failure is the rc 3 defect one code over: measured, the pool created
+#          `<root>/gh-runner-x64-2/.runner` and exited 4, and the pass recorded action-failed
+#          although the runner existed. Two passes adding the same index is a REAL condition here —
+#          the caller takes no inter-pass lock and its own docs note passes racing.
+#        · rc 4 AND the path has no `.runner` → a WEDGE, not a failure: `_next_free_slot` counts
+#          only `.runner` as occupied, so it calls that path FREE and asks for the same index
+#          forever, while every pool verb refuses it (`add`, and `reclaim` too) and `reconcile`
+#          never enumerates it. Nothing repairs it automatically and the remedy is a human `rm -rf`.
+#          Reported as a REFUSAL naming the path to clear (exit 2), so the caller records an ANSWER
+#          instead of a failure on a 10-minute timer.
 #
 #   `--fallback auto` is accepted and is the ONLY accepted value: it means "let ci_runner_pool.sh
 #   resolve its own template/kernel/arch", which is what it already does. Passing anything else is
@@ -181,8 +200,22 @@ case "$rc" in
        printf '%s\n' "$out" | tail -3 >&2
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing further attempted)"
        exit 2 ;;
-  *)   # rc 4 (name taken), rc 5 (this name could not be registered) and anything unexpected are real
-       # failures: the caller's repair/reclaim path must see them, not a refusal it would sit on.
+  4) # The name is taken. WHICH fact that is decides whether this is success or a refusal — the
+     # pool tool's own rc-4 message says which, but the filesystem is the durable test: the caller's
+     # occupancy predicate is `.runner`, so if it is there now, the slot the caller asked for is
+     # FILLED and the box converged. That is the idempotent-skip success, not a failure (#3469).
+     if [ -e "$DIR/.runner" ]; then
+       printf 'provisioned slot=%s name=%s root=%s added=0 skipped=1 already-registered-elsewhere\n' \
+         "$COUNT" "$NAME" "$RUNNER_ROOT"
+       exit 0
+     fi
+     # No `.runner`: the caller counts this path FREE forever while every pool verb refuses it, and
+     # nothing repairs it automatically. An ANSWER naming the path to clear, not a failure on a timer.
+     printf '%s\n' "$out" | tail -3 >&2
+     err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR exists without a .runner registration, so runner_autoscale.py counts it FREE while every pool verb refuses it — clear it (rm -rf '$DIR') or name another slot"
+     exit 2 ;;
+  *)   # rc 5 (this name could not be registered) and anything unexpected are real failures: the
+       # caller's repair/reclaim path must see them, not a refusal it would sit on.
        printf '%s\n' "$out" | tail -5 >&2
        err "pool tool failed for slot $COUNT name=$NAME rc=$rc"
        exit "$rc" ;;
