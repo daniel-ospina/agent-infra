@@ -823,6 +823,14 @@ export function mergeMcpLayers(
     let strippedTransports = 0;
     for (const field of ["url", "command"] as const) {
       if (delta[field] !== undefined && !delta[field]) {
+        // The strip is reported HERE now, not in the layer read (#3628 review round 9): a repo entry is
+        // left as written by `asMcpJson` so this merge can rule on it with BOTH layers in view, and the
+        // operator must still be told the field was ignored rather than honoured.
+        console.log(
+          `[mcp-client] WARN: repo entry "${name}" has an empty "${field}" — that field is removed. ` +
+            `A falsy value cannot select a transport (the client dispatches on whether the field is ` +
+            `set to a value), so it is ignored rather than treated as a declared transport.`
+        );
         delete delta[field];
         strippedTransports += 1;
       }
@@ -1066,23 +1074,37 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       );
       continue;
     }
-    const deadTransports = (["url", "command"] as const).filter(
-      field => typed[field] !== undefined && !typed[field]
-    );
-    if (deadTransports.length > 0) {
-      for (const field of deadTransports) {
-        console.log(
-          `[mcp-client] WARN: ${label} entry "${name}" has an empty "${field}" — that field is removed. ` +
-            `A falsy value cannot select a transport (the client dispatches on whether the field is ` +
-            `set to a value), so it is ignored rather than treated as a declared transport.`
-        );
-        delete typed[field];
-      }
-      if (typed.url === undefined && typed.command === undefined) {
-        console.log(
-          `[mcp-client] WARN: ${label} entry "${name}" declares no usable transport — dropped. ` + suffix
-        );
-        continue;
+    // ⛔ A REPO ENTRY IS A DELTA — the strip and the entry-level drop below are rulings only the MERGE
+    // can make (#3628 review round 9). `asMcpJson` runs PER LAYER and sees ONE file, so it cannot know
+    // whether a base entry supplies the transport this one omits. Making that ruling here made the two
+    // readers disagree about exactly the input `mergeMcpLayers` advertises as one the readers "cannot
+    // disagree about": a repo `{"url": "", "timeoutMs": 90000}` over an http base was dropped WHOLE
+    // by this reader, so the merge never saw it and the operator's `timeoutMs` never applied — while
+    // the warning claimed the entry "declares no usable transport", which is false for a delta (the
+    // base's transport is inherited). Measured: production kept the base's 60000, the merge alone
+    // applied the repo's 90000. So a REPO entry is left EXACTLY as written; the merge performs the SAME
+    // strip above BOTH its branches and drops only a repo-ONLY entry left with no transport.
+    // A BASE entry is different in kind: the merge copies base entries VERBATIM and never inspects
+    // them, so its strip and drop must happen here or nowhere.
+    if (label.startsWith("base")) {
+      const deadTransports = (["url", "command"] as const).filter(
+        field => typed[field] !== undefined && !typed[field]
+      );
+      if (deadTransports.length > 0) {
+        for (const field of deadTransports) {
+          console.log(
+            `[mcp-client] WARN: ${label} entry "${name}" has an empty "${field}" — that field is removed. ` +
+              `A falsy value cannot select a transport (the client dispatches on whether the field is ` +
+              `set to a value), so it is ignored rather than treated as a declared transport.`
+          );
+          delete typed[field];
+        }
+        if (typed.url === undefined && typed.command === undefined) {
+          console.log(
+            `[mcp-client] WARN: ${label} entry "${name}" declares no usable transport — dropped. ` + suffix
+          );
+          continue;
+        }
       }
     }
     // An unrecognised `type` is NOT an error here (see RECOGNISED_TYPES) — but it is worth saying out

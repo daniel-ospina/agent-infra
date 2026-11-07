@@ -1375,6 +1375,77 @@ await test("an EMPTY-string `url` is removed, not the whole ENTRY (connectServer
   );
 });
 
+await test("an EMPTY-string `url` DELTA keeps the repo's other fields — the layer read must not drop the entry", async () => {
+  // The layer read runs PER FILE, so it cannot know whether a base entry supplies the transport a repo
+  // delta omits. It used to resolve the falsy field and then DROP THE WHOLE ENTRY ("declares no usable
+  // transport") — so the merge never saw the delta and every other field the repo set was silently
+  // lost, while the warning asserted a reason that is false for a delta (the base's transport is
+  // inherited). Measured before this test: production merged the base's `timeoutMs: 60000`, while
+  // `mergeMcpLayers` alone applied the repo's `90000` — the two readers disagreeing about one config,
+  // which `mergeMcpLayers`' own comment claims cannot happen. The fix is that a REPO entry is left as
+  // written and the MERGE rules; a BASE entry still gets its strip+drop in the layer read, because the
+  // merge copies base entries verbatim and would never catch it (pinned separately below).
+  const repoDir = tempDir("mcp-falsydelta-repo-");
+  const homeDir = tempDir("mcp-falsydelta-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: { tortoise: { url: "", timeoutMs: 90000 } } });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: {
+      tortoise: {
+        url: "https://api.example/mcp/",
+        headers: { Authorization: "Bearer K" },
+        lazy: true,
+        timeoutMs: 60000,
+      },
+    },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  const t = cfg.mcpServers.tortoise as Record<string, unknown> | undefined;
+  ok(t, "the deltas' server must still be in effect");
+  equal(t?.timeoutMs, 90000, "the repo's `timeoutMs` DELTA must apply, not be lost with a dropped entry");
+  equal(t?.url, "https://api.example/mcp/", "and the base's working transport still carries the entry");
+  equal(
+    (t?.headers as Record<string, unknown> | undefined)?.Authorization,
+    "Bearer K",
+    "the destination is unchanged after the strip, so the base's credentials are inherited"
+  );
+  // The two readers must agree on this input — that is the invariant the merge advertises.
+  const belt = mergeMcpLayers(
+    {
+      mcpServers: {
+        tortoise: {
+          url: "https://api.example/mcp/",
+          headers: { Authorization: "Bearer K" },
+          lazy: true,
+          timeoutMs: 60000,
+        },
+      },
+    } as never,
+    { mcpServers: { tortoise: { url: "", timeoutMs: 90000 } } } as never,
+  );
+  equal(
+    (belt.tortoise as Record<string, unknown>).timeoutMs,
+    t?.timeoutMs,
+    "the layer read and the merge must reach the SAME entry for one config"
+  );
+  ok(
+    logs.some(l => l.includes('has an empty "url"') && l.includes("tortoise")),
+    `the ignored field must still be reported — got:\n${logs.join("\n")}`
+  );
+  ok(
+    !logs.some(l => l.includes("declares no usable transport")),
+    `a DELTA over a base that supplies the transport must NOT be called transport-less — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("an EMPTY-string `url` does not make a repo entry look AMBIGUOUS (the merge must agree with the layer read)", async () => {
   // `mergeMcpLayers` is exported and is called directly with raw JSON, so its presence tests are part of
   // the contract: counting `""` as a declared transport made a repo-only entry warn "will run over url"
