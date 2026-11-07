@@ -137,13 +137,29 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 # refuse (two controllers on one `.orch.lock`). The repo already treats this class as real:
 # `check-farm-drift.sh` normalises `//` and `.` after a measured incident.
 _rs_norm_path() {
-  local out="" comp
+  local comp
+  local -a parts=()
   while IFS= read -r comp; do
-    case "$comp" in ''|.) continue ;; esac
-    out="$out/$comp"
+    case "$comp" in
+      ''|.) continue ;;
+      # ⛔ `..` IS COLLAPSED LEXICALLY (review round 9, P2). It used to survive, and `_rs_state_key`
+      # falls back to THIS function for a state dir that does not exist yet — so a set naming
+      # `/srv/s` and `/srv/s/new/..` was GREEN until the controller's own `mkdir -p` made the
+      # directory exist and the two collapsed to one inode, at which point the same byte-identical
+      # config refused. A verdict must not flip on a filesystem fact. Lexical collapse is safe here
+      # because the caller resolves symlinks for real (`cd -P`) whenever the path exists; where it
+      # does not, no symlink inside it can have an effect the operator would not also get from `cd`.
+      ..)
+        if [ "${#parts[@]}" -gt 0 ]; then unset "parts[$(( ${#parts[@]} - 1 ))]"; fi
+        continue ;;
+    esac
+    parts[${#parts[@]}]="$comp"
   done <<EOF_NORM
 $(printf '%s' "${1:-}" | tr '/' '\n')
 EOF_NORM
+  local out=""
+  local i=0
+  while [ "$i" -lt "${#parts[@]}" ]; do out="$out/${parts[$i]}"; i=$(( i + 1 )); done
   [ -n "$out" ] || out="/"
   printf '%s' "$out"
 }
@@ -272,11 +288,25 @@ repo_set_parse() {
     _rs_say 2 "repo-set:   link loops. Check the target; creating the file would REPLACE the link."
     return 5
   fi
+  # ⛔ ABSENCE IS ONLY PROVEN WHEN WE CAN SEE THE DIRECTORY THAT WOULD HOLD IT (review round 9, P2).
+  # `-e` is false for EVERY stat failure, so a readable config behind a `chmod 000` ancestor — the
+  # macOS TCC shape, one level up from the symlink arm above — read as "does not exist", the box got
+  # code 3, and the wrapper DEGRADED: the machine graded ONE repo while the operator was told to create
+  # a file that is already there. `-e` false + a traversable parent IS proof of absence (we can list the
+  # directory); `-e` false + an untraversable parent is UNRESOLVABLE, which is the broken state.
   if [ ! -e "$f" ]; then
-    _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
-    _rs_say 2 "repo-set:   Create it, one repo per line:"
-    _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
-    return 3
+    local pdir; pdir="$(dirname "$f")"
+    if [ -d "$pdir" ] && [ -r "$pdir" ] && [ -x "$pdir" ]; then
+      _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
+      _rs_say 2 "repo-set:   Create it, one repo per line:"
+      _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
+      return 3
+    fi
+    _rs_say 2 "repo-set: INVALID — $f cannot be READ: it is not visible from here and neither is"
+    _rs_say 2 "repo-set:   $pdir. That is the broken state, not the absent one — this box may well have"
+    _rs_say 2 "repo-set:   named its repos and this process cannot see them (launchd has no Full Disk"
+    _rs_say 2 "repo-set:   Access under ~/Documents). Do not create the file; check its location and mode."
+    return 5
   fi
   # ⛔ `-e` IS TESTED FIRST. The absent arm used `[ ! -f ]`, so a DIRECTORY at the config path read as
   # "this box names no repo" (code 3) and the wrapper DEGRADED on it — while telling the operator the
@@ -447,7 +477,12 @@ try:
     spec.loader.exec_module(mod)
 except Exception:
     raise SystemExit(0)
-if verb == "splitcount":
+if verb == "strip":
+    sys.stdout.write(arg.strip())
+elif verb == "split":
+    import re as _re
+    sys.stdout.write("\n".join([x for x in _re.split(r"[,\s]+", arg) if x]))
+elif verb == "splitcount":
     import re as _re
     sys.stdout.write(str(len([x for x in _re.split(r"[,\s]+", arg) if x])))
 elif verb == "tags":
@@ -500,10 +535,51 @@ _rs_tag_collision() {
 # `grading 1 repo(s)`, and the doctor split it into a TRUNCATED real entry plus a phantom repo it then
 # refused. Round-tripping the rendered list through the doctor's own splitter is the check that cannot
 # drift: any future separator it learns is covered the day the doctor learns it.
+_rs_split_entries() {
+  local entries="${1:-}"
+  [ -n "$entries" ] || return 0
+  _rs_with_doctor split "$entries"
+  return 0
+}
+
 _rs_split_count() {
   local entries="${1:-}"
   [ -n "$entries" ] || { printf '0'; return 0; }
   _rs_with_doctor splitcount "$entries"
+  return 0
+}
+
+# _rs_split_divergence <rendered> <expected-newline-joined> — "" when the doctor's own splitter
+# reproduces EXACTLY the entries we meant to render, else the first entry that differs.
+#
+# ⛔ BY ENTRIES, NOT BY COUNT (review round 9, P2). The count-only round-trip could not see a separator
+# at the END of a value: `repo_set_doctor_repos` joins with `,`, so `/x/decoy ` + `,` is one `[,\s]+` run
+# and the count stayed `n` — the value was silently TRUNCATED to `/x/decoy` (the doctor strips it
+# again), so `check` returned 0 on a set whose checkout proved a DIFFERENT repo. Comparing the actual
+# entries to the intended ones catches truncation, insertion and reordering alike.
+_rs_split_divergence() {
+  local rendered="${1:-}" expected="${2:-}" got
+  got="$(_rs_split_entries "$rendered")"
+  if [ "$got" = "$expected" ]; then return 0; fi
+  local i=1 line want
+  while IFS= read -r line; do
+    want="$(printf '%s\n' "$expected" | sed -n "${i}p")"
+    if [ "$line" != "$want" ]; then printf '%s' "$line"; return 0; fi
+    i=$(( i + 1 ))
+  done <<EOF_GOT
+$got
+EOF_GOT
+  printf '%s' "(the doctor yields a different number of entries)"
+  return 0
+}
+
+# _rs_strip <value> — `str.strip()` exactly as `resolve_repo()` applies it to all four seams. The sed
+# form the wrapper used does not strip a NON-ASCII space, so a single trailing U+00A0 in `REPO` made the
+# wrapper refuse a pass the doctor ran (review round 9, P2).
+_rs_strip() {
+  local v="${1:-}"
+  [ -n "$v" ] || return 0
+  _rs_with_doctor strip "$v"
   return 0
 }
 
@@ -651,11 +727,13 @@ EOF
   # the doctor's OWN splitter. Anything that adds or removes one — a separator the reader does not
   # enumerate, a value that splits — makes the graded set different from the validated one, which is the
   # "a shorter set reads like a smaller machine" failure in the other direction.
-  local rendered splitn
+  local rendered expected diverged
   rendered="$(repo_set_doctor_repos 2>/dev/null)"
-  splitn="$(_rs_split_count "$rendered")"
-  if [ -n "$splitn" ] && [ "$splitn" != "$n" ]; then
-    printf 'repo-set: REFUSED set — the doctor would split this set into %s entr(y/ies) but %s were named: a value contains a separator the list format cannot carry (a `,` or any whitespace, including a non-ASCII space)\n' "$splitn" "$n"
+  expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
+  diverged="$(_rs_split_divergence "$rendered" "$expected")"
+  if [ -n "$diverged" ]; then
+    printf 'repo-set: REFUSED set — the doctor would read this set as an entry the list format cannot carry: it yields `%s` where `%s` was named. A value contains a separator `configured_repos()` splits on (a `,` or any whitespace, including a non-ASCII space).\n' \
+      "$diverged" "$(printf '%s\n' "$expected" | sed -n '1p')"
     bad=1
   fi
 

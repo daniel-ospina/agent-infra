@@ -384,6 +384,8 @@ ck "f30 a declared-but-unprovable REPO -> the cwd note is NOT printed (rank 4 ra
    'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! printf "%s" "$o" | grep -q "CURRENT DIRECTORY"'
 ck "f31 the refusal never says a repo is UNDECLARED when the line above says one IS (no self-contradiction)" \
    'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "no USABLE repo" && ! printf "%s" "$o" | grep -q "no repo is DECLARED"'
+ck "f32 a REPO padded with a NON-ASCII space still RUNS (the trim is the doctor str.strip)" \
+   'REPO_SET_FILE="$nofile" REPO="$T/tortoise"$(printf "\302\240") HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
@@ -577,6 +579,40 @@ for b in bash sed tr awk grep printf id dirname cat cut wc head mv rm mkdir ln c
 done
 ck "j16 with NO python3 on PATH the tag guard still refuses (absolute fallback, like the wrapper)" \
    'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$NODIR" /bin/bash "$READER" check 2>&1)"; printf "%s" "$o" | grep -q "REFUSED set"'
+
+# ⛔ THE ROUND-TRIP IS BY ENTRIES, NOT BY COUNT (review round 9, P2): a separator at the END of a value
+# is adjacent to the join comma, so the count stayed n and a TRUNCATED checkout passed `check` — a set
+# whose checkout proved a DIFFERENT repo returned rc 0.
+printf 'slug=daniel-ospina/tortoise checkout=%s\302\240\n' "$T/decoy" > "$T/trail-nbsp.conf"
+ck "j17 a TRAILING separator truncates a value -> refused (a count cannot see it)" \
+   'o="$(run_reader "$T/trail-nbsp.conf" check)"; [ "$(run_reader_rc "$T/trail-nbsp.conf" check)" = 1 ] && printf "%s" "$o" | grep -q "REFUSED set"'
+
+# ⛔ A CONFIG FILE BEHIND A DENIED ANCESTOR IS NOT "ABSENT" (review round 9, P2): `-e` is false for
+# every stat failure, so the plain-file arm read "does not exist" and the box DEGRADED — one repo
+# graded, and the operator told to create a file that is already there.
+if [ "$(id -u)" != 0 ]; then
+  mkdir -p "$T/deep/locked"
+  printf 'slug=o/n checkout=%s\n' "$T/tortoise" > "$T/deep/locked/repos.conf"
+  chmod 000 "$T/deep/locked"
+  ck "j18 a set behind a denied ancestor is INVALID (5, broken), NOT NO-REPO-SET (3, absent)" \
+     '[ "$(run_reader_rc "$T/deep/locked/repos.conf" list)" = 5 ]'
+  ck "j19 …and it says the file is unreadable rather than telling the operator to create it" \
+     'run_reader "$T/deep/locked/repos.conf" list | grep -q "cannot be READ"'
+  chmod 755 "$T/deep/locked" 2>/dev/null
+fi
+
+# ⛔ A VERDICT MUST NOT FLIP ON A FILESYSTEM FACT (review round 9, P2): `_rs_state_key` falls back to
+# the pure-spelling norm for a dir that does not exist yet, and that fallback did not collapse `..`, so
+# the SAME config was green until the controller's own `mkdir -p` collapsed the two to one inode.
+ST="$T/state-flip"
+mkdir -p "$ST/s"
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/s\nslug=daniel-ospina/agent-infra checkout=%s state=%s/s/new/..\n' \
+  "$T/tortoise" "$ST" "$T/agent-infra" "$ST" > "$T/state-flip.conf"
+ck "j20 a state dir reached via a NOT-YET-CREATED dir's `..` is refused BEFORE it exists" \
+   '[ "$(run_reader_rc "$T/state-flip.conf" check)" = 1 ]'
+mkdir -p "$ST/s/new"
+ck "j21 …and the same verdict AFTER it exists (no flip)" \
+   '[ "$(run_reader_rc "$T/state-flip.conf" check)" = 1 ]'
 
 ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
    '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
