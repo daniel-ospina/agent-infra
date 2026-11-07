@@ -597,8 +597,501 @@ HRGM="$(mkhome radius_grant_models "$RG_MJSON")"
 # a CUSTOM gateway: the grant's baseline catalog is empty, so an `api`-less model definition deletes the provider
 RG_CUSTOM_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example/v1","models":[{"id":"ZZDIFF"}]}}}'
 OUT="$(run_gate "$HRGM" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+# ⛔ THESE TWO ASSERT *HRGM*'s RUN, SO THEY MUST PRECEDE ANY BLOCK THAT REASSIGNS `OUT`/`RC` (round 35 review, P2,
+# measured): the `/v1` block below was inserted between this assignment and its assertions, so `3z15y15`/`y16`
+# silently asserted the `/v1` fixture instead and the plain-gateway run was asserted NOWHERE — an arm that reported
+# checking something it no longer checked, which is the exact class this PR is about.
 eqv "${RC:-none}" "0" "3z15y15 a granted provider with a model definition and no api is NOT refused on RADIUS_API_KEY (rc=${RC:-none})"
 has "$OUT" "check=ok var=RADIUS_API_KEY" "3z15y16 …the answer stays the grant's variable"
+# ⛔ AND THE VENDOR STRIPS A TRAILING `/v1` BEFORE IT NORMALIZES (round 35, P1, measured):
+# `configureRadiusProviders` passes `config.baseUrl.replace(/\/v1\/?$/u, "")` (`model-runtime.js:130`), so a gateway
+# written `https://radius.pi.dev/v1` is the DEFAULT one and its baseline catalog applies — measured, `pi -p` reached
+# the gateway (401). A test that only stripped trailing slashes called it custom and refused 82 with "the provider was
+# deleted" over a box that runs.
+RG_V1_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
+HRGV1="$(mkhome radius_grant_v1 "$RG_V1_JSON")"
+OUT="$(run_gate "$HRGV1" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y18 a \`/v1\` gateway spelling is the DEFAULT gateway, so the box is not refused (rc=${RC:-none})"
+hasnt "$OUT" "models-json-provider-dropped" "3z15y19 …and never reported as a deleted provider"
+# ⛔ AND A SCHEME-LESS GATEWAY IS NOT THE DEFAULT ONE (round 36, P1, measured): the scheme fallback that stood here
+# made the two arms above pass by treating `radius.pi.dev/v1` as `https://radius.pi.dev` — but `radiusProvider`
+# normalizes only its OWN config URL, while the composed model inherits the RAW `baseUrl` and pi builds the request from
+# it. Measured: `pi -p --provider deepseek --model deepseek-flash` answers `Invalid URL` and exits 1 having sent nothing,
+# so the box is refused, with a reason of its own (the provider is not deleted — the URL cannot be built) and the
+# failure pi actually prints quoted, because a refusal's evidence is what the operator will go and check.
+# ⛔ AND THE TEST IS PER DEFINITION, NOT PER PROVIDER BODY (round 37, P1/P2, measured — the first cut of this fix
+# refused on the body alone, which was a false block: pi only reaches the bad URL through `modelFromJson`,
+# `definition.baseUrl ?? providerConfig.baseUrl ?? defaults?.baseUrl` (`provider-composer.js:88`), so a grant with NO
+# `models` array, or a definition carrying its own `baseUrl`, runs — measured 401 and 404 from the gateway). The
+# fixture therefore carries `api` AND no model-level `baseUrl`: that is the one shape that inherits the raw value.
+RG_NOURL_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HRGNOURL="$(mkhome radius_grant_nourl "$RG_NOURL_JSON")"
+OUT="$(run_gate "$HRGNOURL" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y20 a definition inheriting a scheme-less \`baseUrl\` REFUSES (rc=${RC:-none}) — pi dies \`Invalid URL\`" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y21 …with its own reason, not the deleted-provider one"
+has "$OUT" "Invalid URL" "3z15y22 …quoting the failure pi actually prints there"
+# ⛔ AND THE NEGATIVE ARM IS ON THE REASON, NOT ON THE PHRASE (round 39, P2): the `-no-api` variant of this refusal
+# legitimately NAMES the other measured outcome (`Error: Unknown provider`) so the operator is not sent to the wrong file
+# field, so `hasnt "Unknown provider"` now fails against a CORRECT message. What the arm is actually about is that pi does
+# not delete the provider here, and that is the reason token.
+hasnt "$OUT" "reason=models-json-provider-dropped" "3z15y23 …and NOT the deleted-provider reason, which is a different fact"
+# …and the NOTHING-inherits shapes PASS, because pi runs: measured 401 (no `models` array — the gateway normalizes
+# its own config URL) and 404 (definition carries its own absolute baseUrl, which wins at :88). A refusal on either is
+# a false 82 on a provisioned box, printed with evidence that box never produced.
+RG_NOMODELS_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1"}}}'
+HRGNM="$(mkhome radius_grant_nomodels "$RG_NOMODELS_JSON")"
+OUT="$(run_gate "$HRGNM" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y24 a scheme-less gateway with NO models array is NOT refused — pi runs (rc=${RC:-none})"
+has "$OUT" "check=ok var=RADIUS_API_KEY" "3z15y25 …on the grant’s variable"
+RG_OWNBASE_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages","baseUrl":"https://radius.pi.dev"}]}}}'
+HRGOB="$(mkhome radius_grant_ownbase "$RG_OWNBASE_JSON")"
+OUT="$(run_gate "$HRGOB" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+eqv "${RC:-none}" "0" "3z15y26 a definition with its OWN baseUrl is NOT refused (rc=${RC:-none}) — it wins over the body"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y27 …and the URL reason never fires"
+# …and a scheme-less baseUrl is NOT a grant-only problem (round 37, P2, measured): an ordinary provider whose
+# definition inherits it dies `Invalid URL` too, and `check=ok` there is the false PASS this issue is about — a shipped
+# provider AND an unshipped one, because the credential is irrelevant to a URL that cannot be built.
+NGB_JSON='{"providers":{"deepseek":{"baseUrl":"gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HNG="$(mkhome nongrant_badbase "$NGB_JSON")"
+OUT="$(run_gate "$HNG" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y28 a NON-grant provider with a scheme-less baseUrl REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y29 …the same URL-level fact, not a credential answer"
+NGBM_JSON='{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1","api":"pi-messages"}]}}}'
+HNGM="$(mkhome nongrant_badbase_unshipped "$NGBM_JSON")"
+OUT="$(run_gate "$HNGM" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y30 …and so does an UNSHIPPED one with an \`api\` (rc=${RC:-none}) — pi dies Invalid URL there too" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y31 …URL reason, because the provider composes and the request does not"
+# ⛔ AND THE `-no-api` SPLIT FOLLOWS THE PROVIDER, NOT THE FILE (round 37, P2, measured): a definition with no `api`
+# under a scheme-less baseUrl dies `Invalid URL` when pi ships the provider (it composes an api and inherits the URL)
+# and `Error: Unknown provider` when it does not (the composer throws first, on the custom gateway).
+# ⛔ `3z15y35`-`37` DO **NOT** DISCRIMINATE THE SCHEME-LESS FACT AND MUST NOT BE READ AS IF THEY DID (round 39, P3,
+# measured by mutation): with the scheme test disabled entirely they stay GREEN, because an `api`-less definition under an
+# unshipped provider reaches `provider-dropped` through the `no-api` arm alone. The arms that actually pin the split are
+# `3z15y30`/`31` (unshipped WITH `api` → the URL reason) and `3z15y33`/`34` (shipped → `Invalid URL`); these three pin the
+# neighbouring verdict, which is worth having and is simply not evidence for this one.
+RG_NOAPI_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
+HRNA="$(mkhome radius_grant_nourl_noapi "$RG_NOAPI_JSON")"
+OUT="$(run_gate "$HRNA" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y32 an \`api\`-less definition under a scheme-less baseUrl REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "Invalid URL" "3z15y33 …quoting Invalid URL, because this provider IS shipped and composes an api"
+hasnt "$OUT" "reason=models-json-provider-dropped" "3z15y34 …not the deleted-provider reason, which pi does not print here"
+NGNA_JSON='{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1"}]}}}'
+HNGNA="$(mkhome nongrant_badbase_noapi "$NGNA_JSON")"
+OUT="$(run_gate "$HNGNA" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y35 …while an UNSHIPPED one is the deleted provider (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y36 …with the reason pi’s actual failure belongs to"
+has "$OUT" 'Unknown provider' "3z15y37 …quoting Unknown provider, the sentence pi prints on that box"
+# ⛔ TWO FALSE PASSES THIS FIX STILL HAD, AND ONE FALSE BLOCK IT CREATED (round 39, P1, all four measured). Each of these
+# is a box where `pi -p` and the gate DISAGREED before this round; without an arm per shape the fix can be reverted and
+# the suite stays green.
+# (a) A definition carrying its OWN scheme-less `baseUrl` on the DEFAULT gateway: `definition.baseUrl` wins at :88 whatever
+#     the gateway is, and `_grant_default` used to return BEFORE the loop ran — measured `pi -p` → `Invalid URL`, gate ok.
+OWNBAD_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev","models":[{"id":"deepseek-flash","api":"pi-messages","baseUrl":"gw.example/v1"}]}}}'
+HOWB="$(mkhome grant_default_ownbadbase "$OWNBAD_JSON")"
+OUT="$(run_gate "$HOWB" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y38 a definition's OWN scheme-less baseUrl REFUSES on the DEFAULT gateway too (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y39 …because \`definition.baseUrl\` wins at :88 whatever the gateway is"
+# (b) A NON-radius provider body with a scheme-less `baseUrl` and NO `models` array: `config.baseUrl` is mapped onto every
+#     base model (`provider-composer.js:168`) — measured `pi -p` → `Invalid URL`, gate ok. A GRANT with no `models` array is
+#     the exemption (`3z15y24`/`25`, measured 401), so this arm is what tells the two apart.
+NBODY_JSON='{"providers":{"deepseek":{"baseUrl":"gw.example/v1"}}}'
+HNB="$(mkhome nongrant_badbase_nomodels "$NBODY_JSON")"
+OUT="$(run_gate "$HNB" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y40 a NON-grant body with a scheme-less baseUrl and NO models array REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y41 …because every base model inherits \`config.baseUrl\`"
+# (c) …and the test is "would `new URL()` THROW", so the spellings the vendor NORMALISES must NOT be refused: measured
+#     `pi -p` REACHED the network (`fetch failed`) on both, while a `^https?://` regex refused 82 and quoted `Invalid URL`
+#     for a box that never printed it — a false block carrying a false measurement.
+#     ⛔ MEASURED WHICH MUTANT EACH ARM DISCRIMINATES (round 39): `3z15y42`/`43` redden when the scheme test is replaced by
+#     the hand-rolled `^https?://`, and `3z15y44`/`45` redden only when the `strip()` is removed as well — so the
+#     whitespace pair pins the TRIM, not the scheme grammar. Both are part of this fix and both are stated as what they are.
+SP1_JSON='{"providers":{"deepseek":{"baseUrl":"https:/gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSP1="$(mkhome spell_oneslash "$SP1_JSON")"
+OUT="$(run_gate "$HSP1" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y42 a ONE-SLASH scheme (\`https:/host\`) is NOT refused (rc=${RC:-none}) — \`new URL\` normalises it, so pi runs" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y43 …and the URL reason never fires for it"
+SP2_JSON='{"providers":{"deepseek":{"baseUrl":" https://gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSP2="$(mkhome spell_leading_ws "$SP2_JSON")"
+OUT="$(run_gate "$HSP2" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y44 leading WHITESPACE in baseUrl is NOT refused (rc=${RC:-none}) — \`new URL\` trims it, so pi runs" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y45 …and the URL reason never fires for it either"
+# ── 3z15y46-53: THE AUTHORITY IS PART OF "WOULD `new URL()` THROW" ────────────────────────────────────────────────
+# ⛔ FOUR SHAPES MEASURED ON THE INSTALLED pi (round 40, P1), because the scheme-presence test passed two boxes pi refuses:
+#   `https://:8080/v1`         → `Invalid URL`        (a bare port is not a host)
+#   `https:// gw.example/v1`   → `Invalid URL`        (whitespace inside the authority)
+#   `https:///gw.example/v1`   → `fetch failed`       (three slashes are normalised — pi SENT the request)
+#   `https://`                 → `fetch failed`       (pi strips the trailing slashes, so `https:/messages` parses
+#                                                      against the literal host `messages` and a request is sent)
+# So the two `Invalid URL` shapes must be REFUSED (they were `check=ok`, the false PASS this issue is about) and the two
+# `fetch failed` shapes must NOT be (refusing them refuses a box pi runs, quoting a failure it never printed).
+# ⛔ MEASURED BY MUTATION: `3z15y46`-`49` redden when `_buildable`'s authority test is removed (the scheme-presence body),
+# and `3z15y50`-`53` redden when the authority is read as "the text up to the first `/`" or via `urlsplit` — both of
+# which call `https:///host` hostless. The two pairs pin opposite directions, so neither can be "fixed" by widening the
+# other.
+AUTH_PORT_JSON='{"providers":{"deepseek":{"baseUrl":"https://:8080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HAUTHP="$(mkhome bad_authority_port "$AUTH_PORT_JSON")"
+OUT="$(run_gate "$HAUTHP" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y46 a BARE PORT instead of a host REFUSES (rc=${RC:-none}) — \`pi -p\` answers \`Invalid URL\` there" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y47 …as the URL-level fact, not a credential answer"
+AUTH_WS_JSON='{"providers":{"deepseek":{"baseUrl":"https:// gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HAUTHW="$(mkhome bad_authority_whitespace "$AUTH_WS_JSON")"
+OUT="$(run_gate "$HAUTHW" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y48 WHITESPACE inside the authority REFUSES (rc=${RC:-none}) — \`pi -p\` answers \`Invalid URL\` there too" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y49 …the same URL-level fact"
+# …and the two spellings `new URL` ACCEPTS must stay accepted. These are REGRESSION GUARDS, not falsifiers: they are green
+# on the pre-fix predicate too (it also refused nothing here), and they exist so an authority test cannot be written as
+# "the text up to the first `/`" — which would refuse both of these boxes pi runs.
+AUTH_TRIPLE_JSON='{"providers":{"deepseek":{"baseUrl":"https:///gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HAUTHT="$(mkhome spell_three_slashes "$AUTH_TRIPLE_JSON")"
+OUT="$(run_gate "$HAUTHT" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y50 a THREE-SLASH spelling is NOT refused (rc=${RC:-none}) — \`new URL\` normalises it, so \`pi -p\` SENDS a request" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y51 …and the URL reason never fires for it"
+AUTH_SCHEME_JSON='{"providers":{"deepseek":{"baseUrl":"https://","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HAUTHS="$(mkhome spell_scheme_only "$AUTH_SCHEME_JSON")"
+OUT="$(run_gate "$HAUTHS" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y52 a BARE SCHEME is NOT refused (rc=${RC:-none}) — pi builds \`https:/messages\` and dies \`fetch failed\`, not \`Invalid URL\`" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y53 …so the URL refusal never quotes a failure that box never printed"
+# ── 3z15y54-57: THE GATEWAY NORMALISATION IS THE VENDOR'S, AND IT REWRITES NO SCHEME ───────────────────────────────
+# ⛔ `normalizeRadiusGatewayUrl` (`pi-ai/dist/providers/radius-config.js`) prefixes `https://` ONLY when `/^https?:\/\//iu`
+# does not match, then strips trailing slashes — it NEVER rewrites a scheme it was given. So `http://radius.pi.dev` and
+# `https:/radius.pi.dev` (one slash) are CUSTOM gateways: `radiusProvider`'s baseline catalog is then EMPTY
+# (`radius.js:21-24`), `findModelDefaults` finds nothing, `modelFromJson` throws and `recomposeProvider` DELETES the
+# provider. Measured on the installed pi, an api-less definition under each: `Error: Unknown provider "deepseek".`
+# The old normaliser collapsed any http(s) spelling to `https://…`, called both the DEFAULT gateway and printed
+# `check=ok var=RADIUS_API_KEY` — a false PASS on a box pi cannot resolve at all.
+# ⛔ AND THE PAIR IS ONE FIX, NOT TWO (round 40, P2, measured): the vendor-faithful normaliser alone reddens the ELEVEN
+# arms that depend on the effective-`baseUrl` test running BEFORE the default-gateway return (`3z15y20/21/22`, `32/33`,
+# `38/39`, `8z47/48`, `8z53/54`), because it makes the SCHEME-LESS gateway (`radius.pi.dev`) the default one and that
+# return then skips the test. That is why the effective test was hoisted above the return in the same commit; un-hoisting
+# it alone reddens exactly those eleven and nothing else (measured).
+GW_HTTP_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"http://radius.pi.dev","models":[{"id":"deepseek-flash"}]}}}'
+HGWHTTP="$(mkhome gateway_http "$GW_HTTP_JSON")"
+OUT="$(run_gate "$HGWHTTP" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y54 an \`http://\` gateway is CUSTOM, so an api-less definition DROPS the provider (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y55 …naming the deleted provider, which is what \`pi -p\` prints"
+hasnt "$OUT" "check=ok" "3z15y56 …and never the green line the scheme-collapsing normaliser printed"
+GW_ONESLASH_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https:/radius.pi.dev","models":[{"id":"deepseek-flash"}]}}}'
+HGWOS="$(mkhome gateway_oneslash "$GW_ONESLASH_JSON")"
+OUT="$(run_gate "$HGWOS" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y57 a ONE-SLASH gateway is NOT the default one either (rc=${RC:-none}) — the vendor only ADDS a scheme" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+# ── 3z15y58-62: THE URL IS PER REQUEST, SO ONLY THE PINNED DEFINITION DECIDES IT ───────────────────────────────────
+# ⛔ MEASURED ON THE INSTALLED pi (round 40, P3): `new URL(…/messages)` is built per REQUEST (`api/pi-messages.js:251`)
+# and `modelFromJson` never parses a URL, so a SIBLING definition with an unbuildable `baseUrl` composes fine and is never
+# reached — pinned `deepseek-flash` beside `{id:other, baseUrl:"broken.example/v1"}` RAN (`fetch failed`), while the gate
+# refused 82 naming the healthy pin. Pinned `other` answers `Invalid URL`, so the refusal must follow the PIN.
+# ⛔ THE `api`/`baseUrl` STRUCTURAL TESTS STAY PER DOCUMENT (they are composer-level: `provider-composer.js:173-181`
+# composes EVERY definition and one throw discards the whole models.json), which is why only the URL loop was restricted.
+TWO_DEF_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"},{"id":"other","api":"pi-messages","baseUrl":"broken.example/v1"}]}}}'
+HTWO="$(mkhome two_definitions "$TWO_DEF_JSON")"
+OUT="$(run_gate "$HTWO" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y58 a SIBLING definition's unbuildable baseUrl does not refuse the PINNED model (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+has "$OUT" "check=ok var=DEEPSEEK_API_KEY" "3z15y59 …it keeps the verdict pi's own run supports (\`fetch failed\`, i.e. it RAN)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y60 …and the URL reason never fires for a definition this lane does not use"
+OUT="$(run_gate "$HTWO" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=other)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y61 …but PINNING that definition REFUSES (rc=${RC:-none}) — \`pi -p --model other\` answers \`Invalid URL\`" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y62 …with the URL reason, naming the model the pin actually uses"
+# …and a pin that matches NO definition falls back to every definition (the pre-existing answer), so the restriction can
+# not be widened into "check the pin and nothing else".
+OUT="$(run_gate "$HTWO" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=ZZDIFF)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y63 a pin matching NO definition still tests EVERY definition (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+# ── 3z15y64-68: THE VENDOR'S GATEWAY NORMALISER DOES **NOT** TRIM WHITESPACE ──────────────────────────
+# ⛔ MEASURED ON THE INSTALLED pi (round 41, P1): `normalizeRadiusGatewayUrl` is
+# `/^https?:\/\//iu.test(value) ? value : `https://${value}`` then `.replace(/\/+$/u, "")` — there is no `.trim()` on
+# that path, and `model-runtime.js:130` hands it `config.baseUrl.replace(/\/v1\/?$/u, "")` with no trim either. So a
+# PADDED default gateway is NOT the default one, its baseline catalog is empty, `modelFromJson` throws and
+# `recomposeProvider` DELETES the provider — measured, `pi -p` on either padded spelling + an api-less definition answers
+# `Error: Unknown provider "deepseek"`. A `.strip()` in the normaliser made both equal to the default, fired the
+# `_grant_default` return and printed `check=ok var=RADIUS_API_KEY` over exactly those boxes.
+# ⛔ MEASURED BY MUTATION: both pairs below redden when the normaliser\x27s `.strip()` is restored (the round-41 defect)
+# — measured, that mutant reddens exactly `3z15y64`-`68` and nothing else in the suite, so these arms pin the TRIM, not
+# the scheme grammar or the `/v1` strip, which `3z15y18/19` and `3z15y54`-`57` already pin.
+# ⛔ NOTE THE ASYMMETRY IS DELIBERATE, AND `3z15y44`/`45` PIN THE OTHER SIDE: `_buildable` strips because the WHATWG
+# parser trims, the normaliser does not because the vendor function does not. "Making them agree" breaks one of the two.
+GW_LEAD_WS_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":" https://radius.pi.dev","models":[{"id":"deepseek-flash"}]}}}'
+HGWLEAD="$(mkhome gateway_leading_ws "$GW_LEAD_WS_JSON")"
+OUT="$(run_gate "$HGWLEAD" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y64 a LEADING-SPACE default gateway is NOT the default one, so the box REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y65 …naming the provider pi deletes, which is what \`pi -p\` prints"
+GW_TRAIL_WS_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev ","models":[{"id":"deepseek-flash"}]}}}'
+HGWTRAIL="$(mkhome gateway_trailing_ws "$GW_TRAIL_WS_JSON")"
+OUT="$(run_gate "$HGWTRAIL" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y66 a TRAILING-SPACE default gateway is not the default one either (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+# ⛔ AND THE TWO PADDED SPELLINGS ARE REFUSED FOR DIFFERENT REASONS, WHICH IS THE CORRECT ANSWER (round 46, measured
+# ON THE INSTALLED pi): the parser TRIMS a LEADING C0-or-space of the whole string, so `" https://radius.pi.dev"` is a
+# buildable URL whose api-less definition is the deleted provider (3z15y65); it does NOT trim a TRAILING one, so
+# `"https://radius.pi.dev "` puts the space INSIDE the host — but for a RADIUS GRANT that URL is NEVER BUILT.
+# `configureRadiusProviders` (`model-runtime.js:119-132`) runs before any request, the non-default gateway gives
+# `radiusProvider` an EMPTY baseline catalog, `findModelDefaults` finds nothing and `modelFromJson` throws, so
+# `recomposeProvider` DELETES the provider — measured on pi: `Error: Unknown provider "deepseek". Use --list-models`,
+# NOT `Invalid URL`. ⛔ SO THIS ARM ASSERTS `provider-dropped`, AND AN EARLIER DRAFT OF THIS COMMENT WAS WRONG (round 46,
+# P2): it claimed pi answers `Invalid URL` here and moved the arm to the URL reason, which sends the operator to a
+# remedy that does not clear the box. The code was fixed instead — the URL test now skips an api-less definition on a
+# non-default grant gateway so the `no-api` branch can answer (see `_url_models` in key-gate.sh).
+has "$OUT" "reason=models-json-provider-dropped" "3z15y67 …and a GRANT's trailing-space gateway is the DELETED provider, because compose throws before any URL is built"
+hasnt "$OUT" "check=ok" "3z15y68 …and never the green line the trimming normaliser printed"
+# ── 3z15y69-76: THE AUTHORITY'S PORT IS PART OF "WOULD `new URL()` THROW" ──────────────────────────────
+# ⛔ MEASURED ON node, on the vendor's own URL construction (round 41, P1): `new URL("<baseUrl>/messages")` THROWS
+# `ERR_INVALID_URL` for `host:abc`, `host:+80`, `host:-1`, `host:1e3`, `host:65536` and `host:80:90`, and PARSES
+# `host:`, `host:0`, `host:080`, `host:65535`, `user:pass@host` and `[::1]:8080`. `pi-messages.js:251` builds that URL
+# per request, so every throwing spelling is `Invalid URL` before anything is sent — the failure
+# `reason=models-json-bad-gateway` exists to quote. The earlier test caught a BARE `:port` authority and nothing else,
+# so a typo\x27d or out-of-range port printed `check=ok` over a lane that cannot start.
+# ⛔ MEASURED BY MUTATION, and the two directions were measured SEPARATELY because they are not the same mutant:
+# `3z15y69`-`72` redden when `_port_ok` is dropped from `_buildable`; `3z15y73`/`74`/`76` redden on "refuse any authority
+# containing `:`", and `3z15y75` reddens on the narrower "run the port test on the WHOLE authority, userinfo included".
+# They are what stops this fix from becoming a false block on boxes `pi -p` runs (a valid port, an IPv6 literal and
+# userinfo all PARSE), and each control was confirmed to redden under the mutant it names rather than assumed to.
+PORT_BAD_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:abc/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPBAD="$(mkhome port_nonnumeric "$PORT_BAD_JSON")"
+OUT="$(run_gate "$HPBAD" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y69 a NON-NUMERIC port REFUSES (rc=${RC:-none}) — \`pi -p\` answers \`Invalid URL\` there" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y70 …as the URL-level fact"
+PORT_RANGE_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:99999/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPRANGE="$(mkhome port_out_of_range "$PORT_RANGE_JSON")"
+OUT="$(run_gate "$HPRANGE" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y71 an OUT-OF-RANGE port REFUSES too (rc=${RC:-none}) — the parser rejects anything above 65535" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y72 …the same URL-level fact"
+PORT_OK_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:8080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPOK="$(mkhome port_valid "$PORT_OK_JSON")"
+OUT="$(run_gate "$HPOK" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y73 a VALID port is NOT refused (rc=${RC:-none}) — \`new URL\` parses it, so \`pi -p\` runs" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y74 …and the URL reason never fires for it"
+PORT_USERINFO_JSON='{"providers":{"deepseek":{"baseUrl":"https://user:pass@gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPUI="$(mkhome port_userinfo "$PORT_USERINFO_JSON")"
+OUT="$(run_gate "$HPUI" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y75 USERINFO before the host is NOT refused (rc=${RC:-none}) — a port test applied to the whole authority would read \`pass@host\` as the port" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+PORT_V6_JSON='{"providers":{"deepseek":{"baseUrl":"https://[::1]:8080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPV6="$(mkhome port_ipv6 "$PORT_V6_JSON")"
+OUT="$(run_gate "$HPV6" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y76 an IPv6 literal with a port is NOT refused (rc=${RC:-none}) — the colons inside \`[::1]\` are not a port" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+# ── 3z15y77-80: THE PORT CONVERSION IS BOUNDED, AND LEADING ZEROS ARE THE VALUE ────────────────────
+# ⛔ MEASURED (round 42, P2): an UNBOUNDED `int(port)` raises `ValueError` above sys.get_int_max_str_digits()
+# (4300 here), the exception kills the whole compose payload, `key_gate_compose` runs the interpreter with
+# `2>/dev/null`, and the gate therefore printed `check=ok` on a box whose `new URL()` THROWS
+# `ERR_INVALID_URL` — while the PRE-FIX gate refused it 82. A crash that silently deletes every compose-level
+# refusal is the fail-open direction this file\x27s header forbids, so the arm below is a REGRESSION GUARD on the
+# fix, not on the old code: it is RED on the unbounded version and green once the conversion is bounded.
+# ⛔ AND THE OBVIOUS FIX IS WRONG IN THE OTHER DIRECTION: node PARSES leading zeros — measured, `host:` + 5000
+# zeros is port 0 and `host:0000080` is port 80, both VALID — so a `len(port) <= 5` guard refuses boxes `pi -p`
+# RUNS. `3z15y79`/`80` pin that direction; the fix strips zeros BEFORE it bounds the length.
+PORT_HUGE="$(printf '%04301d' 0 | tr '0' '9')"
+PORT_HUGE_JSON="{\"providers\":{\"deepseek\":{\"baseUrl\":\"https://gw.example:${PORT_HUGE}/v1\",\"models\":[{\"id\":\"deepseek-flash\",\"api\":\"pi-messages\"}]}}}"
+HPHUGE="$(mkhome port_huge "$PORT_HUGE_JSON")"
+OUT="$(run_gate "$HPHUGE" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y77 a 4301-DIGIT port REFUSES (rc=${RC:-none}) — \`new URL\` throws, and an uncaught conversion error must never become \`check=ok\`" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y78 …the same URL-level fact, not a lost diagnosis"
+PORT_ZEROS_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:0000080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HPZERO="$(mkhome port_leading_zeros "$PORT_ZEROS_JSON")"
+OUT="$(run_gate "$HPZERO" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y79 a ZERO-PADDED port is NOT refused (rc=${RC:-none}) — \`new URL\` parses \`0000080\` as port 80, so a plain length bound would false-block this box" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y80 …and the URL reason never fires for it"
+# ── 3z15y81-92: THE AUTHORITY IS READ THE WAY THE PARSER READS IT ───────────────────────────────────
+# ⛔ MEASURED (round 43, P2). `_buildable` claimed to answer "would `new URL()` throw" and did not, in BOTH
+# directions — one false BLOCK this diff introduced (no URL test existed on main), and several false PASSes.
+# Each shape below was measured on node against the vendor's own construction, and the arms are split by the
+# DIRECTION they protect, because a fix in one direction is exactly how the other gets broken.
+# ⛔ THE FALSE BLOCK (3z15y81/82): WHATWG REMOVES ASCII TAB/NEWLINE/CR ANYWHERE, so `https://ho<TAB>st/v1` PARSES to
+# host `ho st`→`host` and `pi -p` SENDS a request — while `re.search(r"\s", auth)` refused it 82 quoting `Invalid URL`,
+# a failure that box never prints. That branch was NEW in this PR, so this is a regression the PR itself introduced.
+# ⛔ AND `\\` IS A PATH SEPARATOR for the special schemes (3z15y91/92): `https://gw.example:8080\foo/v1` parses with
+# host `gw.example` and port `8080`, so the authority ends at the backslash. Leaving it in reads `8080\foo` as the port
+# and refuses the box. ⛔ THE FIXTURE CARRIES A PORT FOR EXACTLY THAT REASON (measured): without one, both the fixed and
+# the unfixed code accept `https://gw.example\foo/v1` and the arm is VACUOUS — it was, until the port was added.
+# ⛔ THE FALSE PASSES (3z15y83-96): a `<`/`>`/`^`/`|` in the host, a `%` escape that is not two hex digits or that
+# DECODES to a forbidden code point, a `form` of userinfo with an EMPTY host, a DEL (U+007F), and a `\u00a0`-prefixed
+# value are all `ERR_INVALID_URL` in node and were accepted here.
+# ⛔ MEASURED BY MUTATION, PER MUTANT, WITH THE OBSERVED ARM SET (not assumed — and one claim below was corrected by
+# running it): removing the tab/NL/CR strip reddens 81/82; removing `\\` from the authority split and the leading lstrip
+# reddens 91/92; dropping the empty-host test reddens 85/86; restoring python\x27s `.strip()` reddens 89/90; and dropping
+# the ONE decoded-host check reddens 48/49, 83/84, 93/94, 95/96 and 103/104 together — NOT 87/88 — measured, and the set is stated in
+# full, because an incomplete one inside a block headed OBSERVED is what a later lane reasons from, which an earlier draft of this comment claimed
+# (round 46, P3, measured): since the byte-decode rewrite a mid-host `%zz` returns False at the `int()`
+# `ValueError` BEFORE the class is reached, so it no longer rides this mutant. `87/88` are still real — skipping
+# escapes entirely reddens them — they are simply not pinned by THIS one. ⛔ THAT LAST SET IS THE HONEST
+# SHAPE OF THIS FIX: the raw-class and `%`-syntax checks that used to sit beside it were REDUNDANT — measured by
+# re-adding BOTH at once, which changes no arm’s verdict — and while they existed a mutant removing EITHER stayed GREEN — half the guard was unfalsifiable. They were
+# deleted, so one check now answers to one mutant, and `3z15y97/98` are the other direction: refusing every escape
+# (rather than only those that decode to a forbidden code point) reddens them, because `%41`/`%2E` are `A` and `.`,
+# which the parser accepts. No arm here is vacuous — each was observed red under its own mutant.
+# ⛔ THE RESIDUAL IS DECLARED, NOT HIDDEN: the IPV6 INTERIOR is not validated (`[zzz]`, `[:::]` throw in node and pass
+# here), the IPv4-number rule and the IDNA/punycode pipeline, so the residual is a false PASS and never a false
+# BLOCK. Measured, not assumed: three independent fuzz passes against node (~72,000 generated authorities) found ZERO
+# false blocks, with every false pass on that unemulated surface.
+SP_TAB_JSON='{"providers":{"deepseek":{"baseUrl":"https://ho\tst/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPTAB="$(mkhome spell_tab_authority "$SP_TAB_JSON")"
+OUT="$(run_gate "$HSPTAB" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y81 a TAB inside the authority is NOT refused (rc=${RC:-none}) — \`new URL\` REMOVES it, so \`pi -p\` sends a request" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y82 …and the URL reason never quotes an \`Invalid URL\` that box never printed"
+SP_PLACEHOLDER_JSON='{"providers":{"deepseek":{"baseUrl":"https://<host>/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPPH="$(mkhome spell_placeholder "$SP_PLACEHOLDER_JSON")"
+OUT="$(run_gate "$HSPPH" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y83 an unfilled \`<host>\` PLACEHOLDER REFUSES (rc=${RC:-none}) — \`new URL\` throws on \`<\` in the host" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y84 …as the URL-level fact"
+SP_NOHOST_JSON='{"providers":{"deepseek":{"baseUrl":"https://user@:8080/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPNH="$(mkhome spell_userinfo_nohost "$SP_NOHOST_JSON")"
+OUT="$(run_gate "$HSPNH" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y85 USERINFO with an EMPTY host REFUSES (rc=${RC:-none}) — \`new URL\` throws there" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y86 …the same URL-level fact"
+SP_PCT_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw%zz.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPPCT="$(mkhome spell_bad_percent "$SP_PCT_JSON")"
+OUT="$(run_gate "$HSPPCT" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y87 a BAD %-ESCAPE in the host REFUSES (rc=${RC:-none}) — \`%zz\` is not two hex digits, so \`new URL\` throws" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y88 …the same URL-level fact"
+SP_NBSP_JSON='{"providers":{"deepseek":{"baseUrl":"\u00a0https://gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPNBSP="$(mkhome spell_nbsp_prefix "$SP_NBSP_JSON")"
+OUT="$(run_gate "$HSPNBSP" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y89 a NO-BREAK-SPACE prefix REFUSES (rc=${RC:-none}) — the vendor trims C0-or-space only, so this is not the scheme" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+hasnt "$OUT" "check=ok" "3z15y90 …and never the green line python's wider \`.strip()\` produced"
+SP_BACKSLASH_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example:8080\\foo/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPBS="$(mkhome spell_backslash_path "$SP_BACKSLASH_JSON")"
+OUT="$(run_gate "$HSPBS" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y91 a BACKSLASH ends the authority, PORT INCLUDED (rc=${RC:-none}) — it is a path separator, so the port is \`8080\` and the text after it is not" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y92 …so the text after it is never read as a port"
+# ── 3z15y93-98: A CODE POINT THE DOMAIN PIPELINE REJECTS, RAW OR PERCENT-DECODED ────────────────────
+# ⛔ MEASURED (round 43, P2): the host check tested a HAND-WRITTEN class and the `%` test looked at escape SYNTAX
+# only, so a DEL character and an escape that DECODES to a forbidden code point were both accepted while node
+# throws `ERR_INVALID_URL` on every one. Measured over all 256 `%XX` escapes: node PARSES 81 and THROWS 175, whose
+# decoded forms are exactly the C0 range, space, `# % / : < > ? @ [ \ ] ^ |` and DEL — so the decoded check is the
+# measured THROW set, not a guess.
+# ⛔ THE PAIR 3z15y97/98 IS THE FALSE-BLOCK GUARD: `%41` decodes to `A` and `%2E` to `.`, both of which node PARSES, so
+# a "refuse any escape" fix would false-block them. Each arm here was observed red under its own mutant: dropping DEL
+# reddens 93/94, dropping the decoded check reddens 95/96, refusing every escape reddens 97/98.
+SP_DEL_JSON='{"providers":{"deepseek":{"baseUrl":"https://ho\u007fst/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPDEL="$(mkhome spell_del_host "$SP_DEL_JSON")"
+OUT="$(run_gate "$HSPDEL" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y93 a DEL (U+007F) in the host REFUSES (rc=${RC:-none}) — it is a forbidden host code point" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y94 …as the URL-level fact"
+SP_ESCDEC_JSON='{"providers":{"deepseek":{"baseUrl":"https://h%2Fost/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPESC="$(mkhome spell_escaped_slash "$SP_ESCDEC_JSON")"
+OUT="$(run_gate "$HSPESC" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y95 an escape that DECODES to a forbidden code point REFUSES (rc=${RC:-none}) — \`%2F\` is a slash the domain pipeline rejects" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y96 …the same URL-level fact"
+SP_ESCOK_JSON='{"providers":{"deepseek":{"baseUrl":"https://h%41st%2Eexample/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPESCOK="$(mkhome spell_escaped_ok "$SP_ESCOK_JSON")"
+OUT="$(run_gate "$HSPESCOK" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y97 a DECODABLE escape is NOT refused (rc=${RC:-none}) — \`%41\`/\`%2E\` are \`A\` and \`.\`, which the parser accepts" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y98 …so refusing every escape would be the false block this pair prevents"
+# ── 3z15y99-106: THE DECODE IS BYTES-THEN-UTF-8, AND THE TRAILING TRIM IS NOT MIRRORED ──────────────
+# ⛔ MEASURED (round 45, P1): decoding an escape with `chr(int(g,16))` emits ONE LATIN-1 CHARACTER PER BYTE, so a
+# multi-byte UTF-8 sequence is split and `\s` matches a CONTINUATION byte. `https://caf%C3%A0.example/v1` (`\u00e0` =
+# C3 A0) was REFUSED 82 while node PARSES it to `xn--caf-cla.example` — and the SAME host written raw was accepted,
+# one host with two verdicts, and 599 of 692 percent-encoded IDN hosts the parser accepts were refused. That is a
+# false BLOCK introduced by the previous round's own fix, i.e. the worst direction, so the decode is the parser’s:
+# collect BYTES (an escape is one byte, a literal character its UTF-8 encoding) and decode the buffer STRICTLY.
+# ⛔ INVALID UTF-8 IS A THROW, NOT A PASS (3z15y101/102): node refuses `%80`, `%A0`, `%C2%41` and `%C0%AF` (measured), so
+# a lenient decode (`"replace"`/`"ignore"`) would be the false PASS mirror of the same mistake. Malformed escapes
+# (`%zz`, `%4`) reach `int()` as non-hex or truncated and return False on the same path.
+# ⛔ AND THE TRAILING TRIM IS DELIBERATELY **NOT** MIRRORED (3z15y103-106, round 45 P3, measured): the vendor appends
+# `/messages` FIRST and the parser trims only the ends of THAT string, so a trailing space lands INSIDE the host when
+# the baseUrl has no path — `https://gw.example ` and `https://gw.example:8080 ` both THROW — while `https://gw.example/v1 `
+# PARSES because the space lands in the path. Trimming the baseUrl before appending accepted all three.
+# ⛔ EACH PAIR IS ONE DIRECTION’S OWN GUARD, AND THE CROSS-REFERENCES ARE MEASURED (not assumed): restoring the
+# `chr()`-per-byte decode reddens 99/100 AND 101/102; a lenient (`errors="replace"`) decode reddens 101/102;
+# restoring the trailing trim reddens 67 AND 103/104; and removing the LEADING trim reddens the pre-existing leading-
+# whitespace arms 44/45 and the leading-space gateway arm 65 — not this block, because 105/106 is a TRAILING space on a
+# value with a path, which neither trim affects. An earlier draft of this comment claimed 105/106 and was wrong.
+SP_IDN_JSON='{"providers":{"deepseek":{"baseUrl":"https://caf%C3%A0.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPIDN="$(mkhome spell_idn_escaped "$SP_IDN_JSON")"
+OUT="$(run_gate "$HSPIDN" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y99 a percent-encoded IDN host is NOT refused (rc=${RC:-none}) — \`%C3%A0\` is ONE letter, not two bytes \`new URL\` splits" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y100 …so the URL reason never quotes \`Invalid URL\` for a host the parser accepts"
+SP_BADUTF_JSON='{"providers":{"deepseek":{"baseUrl":"https://ho%C2%41st/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPBADUTF="$(mkhome spell_invalid_utf8 "$SP_BADUTF_JSON")"
+OUT="$(run_gate "$HSPBADUTF" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y101 INVALID UTF-8 in the host REFUSES (rc=${RC:-none}) — \`%C2%41\` is not a letter and node throws it" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y102 …the same URL-level fact"
+SP_TRAILSP_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example ","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPTS="$(mkhome spell_trailing_space_nopath "$SP_TRAILSP_JSON")"
+OUT="$(run_gate "$HSPTS" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y103 a TRAILING space with NO path REFUSES (rc=${RC:-none}) — the vendor appends \`/messages\` first, so it lands in the host" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y104 …the same URL-level fact"
+SP_TRAILPATH_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example/v1 ","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPTP="$(mkhome spell_trailing_space_path "$SP_TRAILPATH_JSON")"
+OUT="$(run_gate "$HSPTP" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y105 the same space WITH a path is NOT refused (rc=${RC:-none}) — it lands in the path, which \`new URL\` accepts" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y106 …so the URL reason never fires on the control this pair needs"
+# ── 3z15y107-108: AN UNENCODABLE CODE POINT IS A THROW, AND MUST NEVER CRASH THE PAYLOAD ───────────────
+# ⛔ MEASURED (round 46, P1): a LONE SURROGATE (`\ud800`) is accepted by python\u2019s `json` inside a string and is NOT
+# UTF-8-encodable, and `buf.extend(_c.encode("utf-8"))` sat OUTSIDE any handler \u2014 so the interpreter DIED, the caller
+# runs it with `2>/dev/null`, and the gate printed `check=ok var=DEEPSEEK_API_KEY` over a box node refuses
+# (`ERR_INVALID_URL`) while the PREVIOUS commit refused it 82. This is the same failure mode the `int()` guard exists
+# for: an exception escaping the compose payload loses EVERY compose-level refusal in the document, not just this one.
+# \u26d4 THE FIXTURE ALSO CARRIES A BAD PORT ON PURPOSE: without the guard the surrogate kills the payload and the port is
+# never diagnosed, so a green `check=ok` here means the crash swallowed a real refusal \u2014 which is what the arm detects.
+# MEASURED BY MUTATION: removing the `UnicodeEncodeError` handler reddens both arms.
+SP_SURR_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw\ud800.example:abc/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPSSURR="$(mkhome spell_surrogate_host "$SP_SURR_JSON")"
+OUT="$(run_gate "$HSPSSURR" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y107 a LONE SURROGATE in the host REFUSES (rc=${RC:-none}) — an unencodable code point must return False, never crash the payload" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y108 \u2026and the refusal it swallowed comes back, so the crash is not silently green"
+# ── 3z15y109-112: THE PAYLOAD'S OWN OUTPUT MUST NEVER BE THE THING THAT KILLS IT ──────────────────────
+# ⛔ MEASURED (round 47, P1): a THIRD crash site, this time in the DIAGNOSTIC half. `print("no-api:" + str(_m.get("id")) + …)`
+# interpolates USER DATA, so a lone surrogate in a model id — or an ordinary non-ASCII id under `PYTHONIOENCODING=ascii`
+# — raised `UnicodeEncodeError`, the payload died, `drop` came back EMPTY, and the gate printed `check=ok` over a box pi
+# cannot start. ⛔ IT WAS ROUTED HERE BY THE ROUND-46 ORDERING FIX, so on the granted api-less shape this WAS a
+# regression: before it, the URL test spoke first and refused 82. Guarding the two prints that failed would leave the
+# hole at the NEXT field-interpolating print, so the fix is ONE place — stdout is reconfigured with
+# `errors="backslashreplace"` at the top of the payload, so whatever it cannot encode is ESCAPED rather than raised and
+# the verdict is unaffected. The `why=` token below therefore carries the escaped id, which is the point: a diagnostic
+# token must never become a verdict.
+# MEASURED BY MUTATION: removing the `reconfigure` line reddens both pairs.
+SP_ID_SURR_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example:abc/v1","models":[{"id":"deepseek\ud800"}]}}}'
+HSPIDS="$(mkhome spell_id_surrogate "$SP_ID_SURR_JSON")"
+OUT="$(run_gate "$HSPIDS" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y109 a LONE SURROGATE in the model id still REFUSES (rc=${RC:-none}) — a diagnostic print must never be the failure" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y110 …with the reason the box earns, so the refused box is still refused"
+SP_ID_UTF8_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example:abc/v1","models":[{"id":"caf\u00e9"}]}}}'
+HSPIDU="$(mkhome spell_id_nonascii "$SP_ID_UTF8_JSON")"
+OUT="$(run_gate "$HSPIDU" PYTHONIOENCODING=ascii RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y111 an ASCII-ONLY stdout encoding does not turn a refusal into \`check=ok\` (rc=${RC:-none}) — the 2nd, non-exotic trigger measured" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y112 …the same reason, with the id escaped rather than raised"
+
+
+
+
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
 # fail (measured: the mutant that restored the old order stayed green). The token count is the observable fact.
@@ -607,7 +1100,7 @@ composeat() {
     bash -c 'set -u; . "$KG_GATE" || exit 99; key_gate_compose "$KG_HOME" "$KG_PROV" "$KG_MODEL" "$PWD"' 2>&1
 }
 eqv "$(composeat "$HRGM" deepseek deepseek-flash)" "radius-grant" \
-    "3z15y17 the granted box with a model definition answers with the GRANT line only \u2014 one bounded read, one token"
+    "3z15y17 the granted box with a model definition answers with the GRANT line only — one bounded read, one token"
 # …and the mirror: a provider whose variable ALONE reaches it is CERTAIN, so it must refuse when the variable is absent.
 # ⛔ `google-vertex` IS NOT THAT PROVIDER ANY MORE (round 31, P2, measured): its key is accepted by pi and REJECTED by
 # the API (401 "API keys are not supported by this API"), so it sits in the uncertain table with its ADC path. The
@@ -677,15 +1170,70 @@ hasnt "$(printf '%s\n' "$OUT" | grep -F 'REFUSED')" "var=MYK" \
 # warn is therefore conditional, and the built-in half is the arm that keeps it from crying wolf.
 HY2="$(mkhome dropped_custom '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
 OUT="$(run_gate "$HY2" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
-ck "3y8 an unbuildable model definition refuses nothing (rc=$(rc_of "$OUT"))" \
-   "$([ "$(rc_of "$OUT")" = "0" ] && echo 0 || echo 1)"
-has "$OUT" "check=warn reason=models-json-provider-dropped why=no-api:m1" \
-    "3y9 …it warns that pi DELETES this provider"
-has "$OUT" "check=ok var=MYV" "3y10 …and the credential assertion still stands for a provider that composes"
+# ⛔ AND AN UNSHIPPED PROVIDER IS REFUSED, NOT WARNED ABOUT (round 35, P1, measured): there is no base model for the
+# composer to fall back on, so `recomposeProvider` DELETES it — measured, `pi -p --provider myprov --model m1` answers
+# `Error: Unknown provider "myprov".` — while the earlier cut warned and then printed `check=ok var=MYV`. No credential
+# can rescue that box, so the verdict is about the FILE. (3y8-3y10 pinned the opposite polarity until this round.)
+ck "3y8 an unbuildable model definition on an UNSHIPPED provider is REFUSED (rc=$(rc_of "$OUT"))" \
+   "$([ "$(rc_of "$OUT")" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" \
+    "3y9 …with the file-level reason, because pi deletes the provider"
+hasnt "$OUT" "check=ok" "3y10 …and never a green line over a box pi cannot use"
+# ⛔ THE PROVIDER NAME IS PART OF THE ASSERTION (round 43, P3, measured): `has "Unknown provider"` passes on
+# `Unknown provider ""` too, so deleting the message\x27s 11th `printf` argument — the exact round-35 defect, which
+# rendered a swapped `--provider`/`--model` pair and an empty name — left the whole suite GREEN. The arm now
+# asserts the quoted NAME, so a re-shortened argument list reddens here.
+has "$OUT" 'Unknown provider "myprov"' "3y10b …quoting the sentence pi prints there, NAME included"
+# ⛔ AND THE `no-api` HALF OF THE DIAGNOSIS IS ASSERTED POSITIVELY TOO (round 43, P3, measured): 3y8d pins the
+# `no-baseurl` wording, but the `no-api` branch had only a `hasnt` — so blanking ITS `drop_why` left the whole suite
+# green while the refusal printed the double comma (`is not a provider pi ships, , so there is no base model`). This
+# arm reads the SAME `OUT` as 3y8 above (the `myprov` / `{"id":"m1"}` refusal), which is the branch that emits the
+# clause; placing it beside 3y8d would have asserted another fixture’s line, which is this PR’s own defect class.
+has "$OUT" "declares neither \`api\` nor \`baseUrl\`" \
+    "3y10c …and this branch NAMES its own missing fields, which a hasnt alone cannot see vanish"
+hasnt "$OUT" "is not a provider pi ships, ," \
+    "3y10d …so the clause slot is never an empty double comma"
 HY3="$(mkhome builtin_noapi '{"providers":{"deepseek":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
 OUT="$(run_gate "$HY3" MYV=sk_myv KG_PROV=deepseek KG_MODEL=m1)"
 hasnt "$OUT" "reason=models-json-provider-dropped" \
     "3y11 a BUILT-IN provider with the same shape is NOT reported as dropped — pi composes it (measured: m1 registered, \$MYV used)"
+# ⛔ AN UNREADABLE BUILT-IN TABLE IS CANNOT-SAY, NEVER "pi DOES NOT SHIP THIS PROVIDER" (round 36 review, P1, measured).
+# This is the HEADLINE polarity of the round-35 fix, and it had NO arm at all: reverting `key_gate_builtin_unshipped`
+# to the pre-fix `[ -z "$(key_gate_builtin "…")" ]` (and dropping the `bkind_rc` guard) left this whole suite GREEN
+# — 768 passed — so the false block could return unnoticed. Driven with a STUB `python3` that fails ONLY in `builtin`
+# mode, because no fixture makes the real reader fail; on a SHIPPED provider (`deepseek`) the pre-fix code then
+# refused 82 with "`deepseek` is not a provider pi ships" over a box the unmutated gate answers `check=ok` on.
+mkdir -p "$T/stubkg/bin"
+printf '#!/bin/sh\nfor a in "$@"; do [ "$a" = builtin ] && exit 3; done\nexec %s "$@"\n' "$(command -v python3)" > "$T/stubkg/bin/python3"
+chmod +x "$T/stubkg/bin/python3"
+# ⛔ `mkhome`, not `mkset`: this block is placed with the other 3y arms, ABOVE `mkset`'s definition (line ~1016),
+# so `mkset` is not yet a function here — it returned NOTHING, `$HKG` was empty, and the arm below happily asserted
+# "not refused" about a box that did not exist (measured: the suite stayed green with the discriminator reverted).
+HKG="$(mkhome builtin_unread '{"providers":{"deepseek":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}')"
+printf '%s\n' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}' > "$HKG/.pi/agent/settings.json"
+KG_UNREAD_LANE="$(env -i PATH="$T/stubkg/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HKG" KG_GATE="$KG" KG_HOME="$HKG" KG_PROV=deepseek MYV=sk_myv \
+  bash -c 'set -u; . "$KG_GATE" || exit 99; out="$(key_gate_assert test "$KG_HOME" "${KG_PROV:-}" "${KG_MODEL:-}" 2>&1)"; rc=$?; printf "RC=%s\n%s\n" "$rc" "$out"' 2>&1)"
+KG_UNREAD_RC="$(printf '%s\n' "$KG_UNREAD_LANE" | sed -n 's/^RC=//p' | head -1)"
+ck "3y3e a SHIPPED provider is not refused when the built-in table could not be READ (rc=${KG_UNREAD_RC:-<none>})" \
+   "$([ "${KG_UNREAD_RC:-0}" = "82" ] && echo 1 || echo 0)"
+hasnt "$KG_UNREAD_LANE" "is not a provider pi ships" \
+    "3y3f …and never claims pi does not ship it over a table it did not read"
+KG_UNREAD_PIN="$(env -i PATH="$T/stubkg/bin:/usr/bin:/bin:/usr/sbin:/sbin" HOME="$HKG" KG_GATE="$KG" KG_HOME="$HKG" MYV=sk_myv \
+  bash -c 'set -u; . "$KG_GATE" || exit 99; out="$(key_gate_box_default_assert box "$KG_HOME" refused "$PWD" 2>&1)"; rc=$?; printf "RC=%s\n%s\n" "$rc" "$out"' 2>&1)"
+KG_UNREAD_PIN_RC="$(printf '%s\n' "$KG_UNREAD_PIN" | sed -n 's/^RC=//p' | head -1)"
+ck "3y3g …and the PIN path answers the same cannot-say (rc=${KG_UNREAD_PIN_RC:-<none>})" \
+   "$([ "${KG_UNREAD_PIN_RC:-0}" = "82" ] && echo 1 || echo 0)"
+# ⛔ AND "IN NO ENV TABLE" IS NOT "UNSHIPPED" (round 36 review, P1, measured): `openai-codex` is an OAUTH-ONLY
+# provider pi ships — it is in `OAUTH_PROVIDERS`, and `8S4i`'s own text says "pi ships that handler" — but it has no
+# `envApiKeys` entry, so every env table answers NOTHING for it. Reading that empty answer as "not shipped" refused
+# 82 a box `origin/main` answers `check=warn` + `check=ok` on: a NEW false block, in the PR that fixed one.
+HCODX="$(mkhome shipped_oauth_only '{"providers":{"openai-codex":{"apiKey":"$MYV","models":[{"id":"gpt-5-codex"}]}}}')"
+OUT="$(run_gate "$HCODX" MYV=sk_myv KG_PROV=openai-codex)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3y3h an OAUTH-ONLY shipped provider (openai-codex) is NOT refused as unshipped (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 1 || echo 0)"
+hasnt "$OUT" "is not a provider pi ships" \
+    "3y3i …and the sentence is never printed about a provider pi ships"
+
 # ⛔ AND THE `no-baseurl` HALF OF THE COMPOSER MIRROR IS ITS OWN SHAPE (round 29, P3, measured): a model definition that
 # declares `api` but no `baseUrl`, under a provider that declares neither, throws `"baseUrl" is required when defining
 # custom models` — and the old prose described it as "declares neither `api` nor `baseUrl`", which that document
@@ -694,10 +1242,24 @@ HY5="$(mkhome dropped_nobase '{"providers":{"myprov":{"apiKey":"$MYV","models":[
 OUT="$(run_gate "$HY5" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"
 has "$OUT" "reason=models-json-provider-dropped why=no-baseurl:m1" \
     "3y8b a model with \`api\` but NO \`baseUrl\` is reported as that, not as \"declares neither\""
+# ⛔ AND THE CLAUSE ITSELF IS ASSERTED POSITIVELY (round 36 review, P3, measured): the round-35 commit swapped the
+# positive `has` for the `hasnt` below, so the field-level diagnosis — the whole point of the message — could be
+# deleted (`drop_why=''`) with every arm still green. A `hasnt` proves a wrong sentence is absent; only a `has`
+# proves the right one is present.
 has "$OUT" "declares \`api\` but no \`baseUrl\`" \
-    "3y8c …and the sentence names the field that is actually missing"
+    "3y8d …and NAMES the field that is actually missing (a hasnt alone cannot see the clause vanish)"
 hasnt "$OUT" "declares neither \`api\` nor \`baseUrl\`" \
-    "3y8d …never the wrong description, which this document would falsify"
+    "3y8c …never the wrong description, which this document would falsify"
+# \u26d4 AND AN UNSHIPPED PROVIDER WITH `oauth` BUT NO `baseUrl` IS REFUSED, NOT "cannot-say" (round 35, P1, measured): the
+# composer throws on that shape and there is no built-in base to fall back on, so the provider is DELETED \u2014 measured
+# `Error: Unknown provider "myprov"`. The shipped-provider half of this arm (deepseek) keeps its cannot-say, because pi
+# really does run there on the built-in variable.
+HMYL="$(mkhome dropped_oauth_myprov '{"providers":{"myprov":{"apiKey":"$MYV","oauth":"radius"}}}')"
+OUT="$(run_gate "$HMYL" MYV=sk_myv KG_PROV=myprov KG_MODEL=m1)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3y18 an UNSHIPPED provider with oauth and no baseUrl is REFUSED (rc=${RC:-<none>})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped why=oauth-no-baseurl" \
+    "3y18b …naming the shape, because the remedy is the baseUrl"
 # ⛔ AN `oauth` PROVIDER'S BASE IS REPLACED, SO A VENDOR BUILT-IN IS **NOT** AUTOMATICALLY UNAFFECTED (round 29, P2,
 # measured): `configureRadiusProviders` swaps the built-in catalog for a gateway provider that is EMPTY until a refresh,
 # so `findModelDefaults` has nothing to compose from, the throw deletes the config, and `pi -p` answers `Unknown
@@ -1035,6 +1597,25 @@ OUT="$(run_box_at "$HPINFED" "$T/nocwd" ANTHROPIC_FEDERATION_RULE_ID=r ANTHROPIC
 eqv "$(rc_of "$OUT")" "0" "8z24b the federation-provisioned PIN passes in refused mode (rc=$(rc_of "$OUT"))"
 has "$OUT" "check=ok box_default=claude-sonnet-4-5" "8z24c …on the \`certain\` arm's own path line"
 has "$OUT" "path=anthropic-federation" "8z24d …naming the path that answered"
+# ⛔ AND THE COMPANION ABSTAINS ON A BAD GATEWAY IN `warn` MODE, BECAUSE `warn` IS THE LANE'S COMPANION LINE (round 38,
+# P2, measured): `key_gate_assert` runs `key_gate_box_default_assert … warn` BEFORE `key_gate_assert_main`, so a refusal
+# here puts a SECOND `result=REFUSED` line in one lane log for one box (the duplicate-noise class #3331 was filed about).
+# The lane still refuses — `key_gate_assert_main` owns that verdict — and `--probe --box-default` drives this function in
+# `refused` mode, so the refusal is reported by exactly one line in every real caller. Without an arm that actually
+# REACHES this branch with `quiet=1`, the guard can be deleted with the suite green — which is the class this PR exists to
+# remove. `mkset` (not `mkhome`) because without a `settings.json` PIN the function returns at its `status != "pin"` gate,
+# ~85 lines above the arm, and the assertion then passes vacuously on EMPTY output (measured: that is exactly how the
+# first cut of these arms certified a guard it never exercised).
+HWNB="$(mkset warn_badbase '{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(warnrun "$HWNB" "$T/nocwd" RADIUS_API_KEY=rk)"
+hasnt "$OUT" "result=REFUSED" \
+    "8z24e warn mode does NOT print a second REFUSED line for a definition inheriting a scheme-less baseUrl"
+eqv "$(rc_of "$OUT")" "0" "8z24f …refusing nothing (rc=$(rc_of "$OUT")) — the lane's own verdict carries it"
+HOOB="$(mkset warn_ownbase '{"providers":{"deepseek":{"baseUrl":"gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}' '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(warnrun "$HOOB" "$T/nocwd" DEEPSEEK_API_KEY=dk)"
+hasnt "$OUT" "result=REFUSED" \
+    '8z24g …and not for a NON-grant provider with one either, the shape `_grant` used to miss'
+eqv "$(rc_of "$OUT")" "0" "8z24h …refusing nothing (rc=$(rc_of "$OUT"))"
 # ⛔ …AND A PIN WITH NO VARIABLE AND NO PATH IS STILL **SILENT** IN WARN MODE, BECAUSE VERTEX IS `uncertain`
 # (round 31, measured): the companion speaks on exactly one arm — a POSITIVELY absent credential — and an uncertain
 # provider's absence is not a verdict (the same reason `azure` and `cloudflare-*` pins are silent). What must NOT happen
@@ -1094,6 +1675,56 @@ OUT="$(run_box_at "$HRGMD" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
 ck "8z41 a granted PIN whose model definition cannot compose is REFUSED (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-provider-dropped" "8z42 …with the model-level reason, not a variable to export"
+# \u26d4 AND THE PIN PATH NEEDS THE UNSHIPPED-PROVIDER RULE TOO (round 35, P1, measured): it ignored `no-api`/`no-baseurl`
+# entirely, so `--probe --box-default` printed `check=ok var=MYV` for a `myprov` pin whose bare `pi -p` answers
+# `No API key found for the selected model.` / `Error: Unknown provider "myprov"`.
+# ⛔ AND THE PIN PATH NEEDS THE SCHEME-LESS-GATEWAY REFUSAL TOO (round 36, P1, measured): its own code path would
+# otherwise fall through to the discarded-catalog refusal and quote `Unknown provider`, which is not what pi does here.
+HRGNP="$(mkset pin_radius_grant_nourl "$RG_NOURL_JSON" '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HRGNP" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
+ck "8z47 a PIN of a granted provider with a scheme-less gateway REFUSES (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "8z48 …with the URL-level reason, not the deleted-provider one"
+hasnt "$OUT" "reason=models-json-provider-dropped" "8z49 …and not the deleted-provider reason, because pi fails to build the URL here"
+# \u26d4 and the PIN of the `-no-api`/unshipped shape names the failure pi prints there (round 37, P2, measured): its own
+# code path, so the lane-site split says nothing about it.
+HNP="$(mkset pin_badbase_noapi_unshipped '{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
+OUT="$(run_box_at "$HNP" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
+ck "8z50 a PIN of an unshipped provider under a scheme-less baseUrl REFUSES (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "8z51 …as a DELETED provider, which is what pi does there"
+has "$OUT" 'Unknown provider' "8z52 …quoting that sentence rather than an unbuildable URL"
+# …and the SHIPPED half of the same shape is the URL failure, not a deleted provider (measured `Invalid URL`): the
+# pin site's two branches are ordered for exactly this, so an inversion would send the operator to the wrong file field.
+HSP="$(mkset pin_badbase_noapi_shipped "$RG_NOAPI_JSON" '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HSP" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
+ck "8z53 a PIN of a SHIPPED provider with an api-less definition under a scheme-less baseUrl REFUSES (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "8z54 …with the URL reason, because pi composes an api and then cannot build the URL"
+hasnt "$OUT" "reason=models-json-provider-dropped" "8z55 …not the deleted-provider reason, which pi does not print here"
+# ⛔ AND THE PIN PATH NEEDS THE VENDOR'S GATEWAY NORMALISATION AND THE PINNED-DEFINITION SCOPE (round 40, P2/P3): its own
+# code path reads the same compose token, so a fix at the lane site says nothing about it — measured `check=ok
+# box_default=deepseek-flash` for an `http://` gateway, and a REFUSAL naming a healthy pin because of an unused sibling.
+GWP_HTTP_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"http://radius.pi.dev","models":[{"id":"deepseek-flash"}]}}}'
+HGWP="$(mkset pin_gateway_http "$GWP_HTTP_JSON" '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HGWP" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
+ck "8z56 a PIN under an \`http://\` gateway is the DELETED provider (rc=${rc:-<none>}) — \`pi -p\` says \`Unknown provider\`" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "8z57 …with the file-level reason, not the green line the old normaliser printed"
+HTWOP="$(mkset pin_two_definitions "$TWO_DEF_JSON" '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HTWOP" "$T/nocwd" DEEPSEEK_API_KEY=dk)"; rc="$(rc_of "$OUT")"
+eqv "${rc:-none}" "0" "8z58 the PIN path ignores an UNUSED sibling definition (rc=${rc:-none}) — pi only builds the pinned model's URL"
+has "$OUT" "check=ok box_default=deepseek-flash" "8z59 …on the pass line for the pin it measured"
+HMY="$(mkset pin_myprov '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
+OUT="$(run_box_at "$HMY" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
+ck "8z43 a PIN of an UNSHIPPED provider with an unbuildable definition is REFUSED (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "8z44 …with the file-level reason, because pi deletes the provider"
+HMY2="$(mkset pin_myprov_oauth '{"providers":{"myprov":{"apiKey":"$MYV","oauth":"radius"}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
+OUT="$(run_box_at "$HMY2" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
+ck "8z45 …and so is one whose provider sets oauth with no baseUrl (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "why=oauth-no-baseurl" "8z46 …naming that shape, so the remedy is the baseUrl"
 # A provider whose credential needs more than one value warns: the pin is NOT refused, because a false 82 on a box
 # that would run costs a lane and this gate cannot tell.
 HSB3="$(mkset boxazure ABSENT '{"defaultProvider":"azure","defaultModel":"gpt-4o"}')"
@@ -1734,9 +2365,25 @@ ck "8S4f …still refused with the provider key EXPORTED, which is the shadowing
 HOOA="$(mkset oauth_live "$ANTH_JSON" ABSENT)"
 printf '{"anthropic":{"type":"oauth","access":"a","refresh":"r"}}\n' > "$HOOA/.pi/agent/auth.json"
 OUT="$(run_gate "$HOOA" KG_PROV=anthropic KG_MODEL=claude-sonnet-4-5)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+# ⛔ THESE TWO ASSERT *HOOA*'s RUN (`anthropic`), SO THEY MUST PRECEDE THE HANDLER LOOP (round 35 review, P2,
+# measured): the loop below was inserted between this assignment and its assertions, so `8S4g`/`8S4h` asserted the
+# loop's LAST iteration (`openai`) instead — `HOOA` was computed and discarded, and the two arms duplicated
+# `8S4i`/`8S4j`. The comment above `HOOA` states this fixture's purpose; without these arms it IS asserted nowhere.
 eqv "${RC:-none}" "0" "8S4g the same oauth shape on a HANDLER provider is not refused (rc=${RC:-<none>})"
 hasnt "$OUT" "auth-store-oauth-unusable" \
     "8S4h …and never carries the no-handler reason"
+# ⛔ ONE ARM PER ID IN THE TABLE, NOT PER ID THAT HAPPENS TO BE CONVENIENT (round 35 review, P2, measured): this loop
+# covered `radius openai` only, so deleting any of the other SEVEN ids from `OAUTH_PROVIDERS` still left the suite
+# fully green — `remove "xai"` -> 756 passed, 0 FAILED, the same polarity inversion the round-35 fix was FOR. Every id
+# in `OAUTH_PROVIDERS` is now asserted: the eight below need no model, and `anthropic` is covered by `8S4g`/`8S4h`
+# on the pinned `HOOA` fixture above.
+for _op in radius openai github-copilot kimi-coding meta openai-codex openrouter xai; do
+  HROP="$(mkset "oauth_$_op" "{\"providers\":{\"$_op\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}" ABSENT)"
+  printf '{"%s":{"type":"oauth","access":"a","refresh":"r"}}\n' "$_op" > "$HROP/.pi/agent/auth.json"
+  OUT="$(run_gate "$HROP" KG_PROV="$_op")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+  eqv "${RC:-none}" "0" "8S4i a stored oauth entry for $_op is not refused — pi ships that handler (rc=${RC:-none})"
+  hasnt "$OUT" "auth-store-oauth-unusable" "8S4j …so the no-handler reason never fires for $_op"
+done
 # `key: null` is PRESENT, and pi dies on it before any lookup (measured: `Credential store read failed for
 # <provider>: Cannot read properties of null (reading \x27startsWith\x27)`), so it is store-invalid rather than the
 # key-absent cannot-say.
