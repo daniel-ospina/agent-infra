@@ -4,8 +4,13 @@
 #   rail-guard.sh <supervisor-pid> <limit-secs|0> <pid> [ident]
 #
 #   exit 0    the rail stopped on its own — nothing was done
-#   exit 124  the guard FIRED and reaped a live rail (the caller reports a watchdog timeout)
-#   exit 125  the guard fired but the rail SURVIVED SIGKILL — NOT a clean reap
+#   exit 124  the guard FIRED and the rail is VERIFIABLY GONE (the caller reports a watchdog
+#             timeout). ⛔ 124 is a claim about the OUTCOME, so it is only used after
+#             re-checking: `reap_pid` answers 0 both for "killed and proved gone" AND for
+#             "positively read as a DIFFERENT (recycled) process, so never signalled", and the
+#             second is not a reap — it exits 125 instead.
+#   exit 125  the guard fired but the rail SURVIVED SIGKILL, or it declined to signal a pid it
+#             could not prove belongs to the rail — NOT a clean reap either way
 #   exit 2    usage/argument error, or a REFUSAL (its own library is missing / did not load)
 #
 #   <limit-secs>  the wall-clock bound on the rail. `0` means NO TIME LIMIT — the guard then
@@ -24,8 +29,9 @@
 # NOT suppress the redirection's own failure, so on a deleted scratch dir (or ENOSPC) the sentinel
 # was silently ABSENT and the caller reported the rail's SIGKILL status (137) as a bounded stop —
 # the exact confusion the sentinel existed to prevent. A process's exit status cannot be lost, and
-# it also carries the one distinction a bare sentinel never could: 124 = fired and PROVED the reap,
-# 125 = fired but the rail survived. A sentinel proved an INTENT; these codes prove the OUTCOME.
+# it also carries the one distinction a bare sentinel never could: 124 = fired and the rail is
+# VERIFIABLY GONE, 125 = fired but the rail survived (or was not provably ours, so not signalled).
+# A sentinel proved an INTENT; these codes prove the OUTCOME.
 #
 # WHY THIS IS A SEPARATE PROCESS AND NOT A FUNCTION IN run.sh.
 # The suite's watchdog used to be a poll loop inside `run.sh`. `$!` was already the rail
@@ -135,6 +141,15 @@ while still_ours "$pid" "$ident"; do
     # signalled — a bound that lies about what it did).
     still_ours "$pid" "$ident" || exit 0
     if reap_pid "$pid" "$ident"; then
+      # ⛔ reap_pid's 0 IS TWO OUTCOMES, and only one of them is a reap. Its "provably NOT ours"
+      # path (a readable identity mismatch — the pid was recycled) signals NOTHING and still
+      # returns 0. Reporting that as 124 would tell the caller "the rail stopped" and let it
+      # `wait` on a live pid with no bound left (#3622 review round 5, P2, measured: a lying
+      # 124 keeps the caller blocked past any bound). So re-read the fact instead of the intent.
+      if is_running "$pid"; then
+        echo "rail-guard: pid $pid is STILL RUNNING after reap_pid answered 0 — it was not provably ours, so nothing was signalled ($why)" >&2
+        exit 125
+      fi
       echo "rail-guard: reaped pid $pid — $why" >&2
       exit 124
     fi
