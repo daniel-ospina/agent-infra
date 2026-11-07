@@ -12,13 +12,16 @@
 # The judgement under test is the BOUND — not the deletion predicate, whose gates the sibling suites
 # own one at a time. Five things are asserted, and each has its own mutation:
 #
-#   (a) DEFAULT = NO COUNT CAP. The fixture from #3278: twelve YOUNG gitless trees, then the AGED
-#       thirteenth in sort order. Under the pre-#3278 code the cap unit was charged BEFORE the age
-#       floor, so the twelve young trees spent ten slots and the thirteenth printed `gitless-cap` and
-#       could never be reached — the permanent starvation measured on a real box (a dry run over 3,314
-#       top-level entries classified 10 and printed `gitless-cap` for **3,137**).
-#   (b) AND THE CAP IS GONE FOR AGED TREES TOO, not merely reordered. Thirteen aged trees must ALL be
-#       classified; a default of 10 that counts correctly still starves a population of thousands.
+#   (a) THE UNIT IS CHARGED TO CANDIDATES, NOT CLASSIFICATIONS. The fixture from #3278: twelve YOUNG
+#       gitless trees, then the AGED thirteenth in sort order. Under the pre-#3278 code the cap unit was
+#       charged BEFORE the age floor, so the twelve young trees spent ten slots and the thirteenth
+#       printed `gitless-cap` and could never be reached — the permanent starvation measured on a real
+#       box (a dry run over 3,314 top-level entries classified 10 and printed `gitless-cap` for 3,137).
+#   (b) AND THE CEILING ITSELF IS UNCHANGED — still 10 AGED trees per root. Removing or raising it is
+#       #3278's P3, which the issue's plan comment reserves as an OWNER decision ("destructive against
+#       trees a `rm -rf` cannot recover … the owner's call"), and P3 is sequenced after P2, which has
+#       not landed. So case C pins the ceiling at the operator-calibrated 10 AND pins that the young
+#       trees ahead of them spend none of it: under the old order the ceiling reached ZERO aged trees.
 #   (c) THE TIME BOUND IS THE REAL GUARD. A pass whose budget is already spent PRESERVES every
 #       candidate, removes nothing, and says `reason=budget` — asserted in `--apply` too, because a
 #       bound that stops only the reporting is not a bound.
@@ -30,9 +33,9 @@
 #       has already spent its budget — so it needs a LINKED fixture, which no other suite supplies
 #       (`disk-reaper.test.sh` drives this delegate through a `/nonexistent` stub).
 #
-# Plus: the cap survives as an OPT-IN override (an operator ceiling that silently stopped working
-# would be the same defect in mirror image), a non-numeric seam is REFUSED rather than read as
-# "unbounded" or as "cap reached", and every safety gate this arm carries is re-asserted as a
+# Plus: the ceiling is honoured EXACTLY (10 aged candidates, then `gitless-cap` — an operator ceiling
+# that silently stopped working would be the same defect in mirror image), a non-numeric seam is
+# REFUSED rather than read as "unbounded" or as "cap reached", and every safety gate this arm carries is re-asserted as a
 # regression: the symlink refusal, `preserved:main-checkout`, `preserved:home-or-state` (each of the
 # guard's THREE references — HOME, CELL_HOME, the pass state dir), the keep list, `git-below`, the
 # bare-repo refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
@@ -163,14 +166,18 @@ build_12_young_1_aged() {
     age_path "$root/b13-aged" 400
 }
 
-# build_13_aged <root> — thirteen AGED gitless trees: the population that a correctly-counted default
-# cap of 10 still starves, which the ordered-cap fixture above cannot see.
-build_13_aged() {
+# build_12_young_13_aged <root> — the DEFAULT-ceiling fixture: the twelve young trees that used to
+# consume the whole ceiling, followed by thirteen AGED ones. Under the pre-#3278 order the ten slots
+# went to the young trees and NO aged tree was reachable; under the fixed order all ten slots go to
+# aged trees (and three remain `gitless-cap`). It is the only fixture that sees both halves at once.
+build_12_young_13_aged() {
     local root="$1" i
+    for i in 01 02 03 04 05 06 07 08 09 10 11 12; do mk_gitless "$root" "a$i-young" >/dev/null; done
     for i in 01 02 03 04 05 06 07 08 09 10 11 12 13; do
-        mk_gitless "$root" "a$i-aged" >/dev/null
-        age_path "$root/a$i-aged" 400
+        mk_gitless "$root" "b$i-aged" >/dev/null
+        age_path "$root/b$i-aged" 400
     done
+    for i in 01 02 03 04 05 06 07 08 09 10 11 12; do age_path "$root/a$i-young" 0; done
 }
 
 apply_mutation() { # <src> <dest> <sed-args...> — FAIL LOUDLY when the mutation changed nothing
@@ -208,8 +215,8 @@ case_a() { # <owner-script>
     cfg="$(HOME="$FB/home" CELL_HOME="" REAP_AW_STATE_DIR="$FB/state" bash "$owner" --print-config 2>&1)"
     case_check "$(grep -q '^budget_seconds=300$' <<<"$cfg" && echo 0 || echo 1)" \
                "print-config reports the time bound (budget_seconds=300)"
-    case_check "$(grep -q '^gitless_max=none$' <<<"$cfg" && echo 0 || echo 1)" \
-               "and that NO count ceiling is in force by default (gitless_max=none)"
+    case_check "$(grep -q '^gitless_max=10$' <<<"$cfg" && echo 0 || echo 1)" \
+               "and that the operator ceiling is UNCHANGED at 10 aged candidates per root (gitless_max=10)"
     # ⛔ THE CELL HOME THE GUARD WILL PROTECT is an EFFECTIVE BOUND too, and it is the one the measured
     # `rm -rf /tmp/cell-home` defect turned on. With `CELL_HOME` unset/empty (the unit's shape) it must
     # resolve to the cell home, not to nothing — a guard reference of `""` is skipped by
@@ -241,20 +248,28 @@ case_b() { # <owner-script>
     return $((CASE_FAIL > 0))
 }
 
-# ── C: no count cap for a population of aged trees either ────────────────────────────────────
+# ── C: the DEFAULT ceiling — 10 AGED candidates per root; young trees spend none of it ─────────
 case_c() { # <owner-script>
-    local owner="$1" n
+    local owner="$1" n capped
     UNDER_TEST="$owner"
     newfixture c || { case_check 1 "fixture could not be built"; return 1; }
-    build_13_aged "$FB/root"
+    build_12_young_13_aged "$FB/root"
     pass "$FB" --include-gitless
     n="$(grep -c '^remove ' <<<"$OUT")"
+    capped="$(grep -c 'reason=gitless-cap' <<<"$OUT")"
     [ -n "${AW_DEBUG:-}" ] && printf '%s\n' "$OUT" >&2
-    case_check "$([ "$n" = 13 ] && echo 0 || echo 1)" \
-               "THIRTEEN aged trees are ALL classified as removable (got $n) — a cap of 10 would starve the rest"
-    case_check "$(grep -q 'reason=gitless-cap' <<<"$OUT" && echo 1 || echo 0)" "and none is reportable as gitless-cap"
-    case_check "$(grep -q '^SUMMARY .*candidates=13 ' <<<"$OUT" && echo 0 || echo 1)" \
-               "the SUMMARY counts all thirteen (candidates=13)"
+    # ⛔ THE NON-VACUITY ASSERTION FOR THE CEILING. Under the pre-#3278 order the twelve young trees
+    # spend the ten slots here and this count is ZERO; under the fixed order they spend none and it is 10.
+    case_check "$([ "$n" = 10 ] && echo 0 || echo 1)" \
+               "the default ceiling of 10 is spent on AGED trees (got $n removable) — the old order reached none"
+    case_check "$([ "$capped" = 3 ] && echo 0 || echo 1)" \
+               "and the three aged trees past it are REPORTED as gitless-cap, not silently dropped (got $capped)"
+    case_check "$([ "$(grep -c 'reason=young' <<<"$OUT")" = 12 ] && echo 0 || echo 1)" \
+               "the twelve young trees are classified young, at no cost to the ceiling"
+    case_check "$(grep -q '^SUMMARY .*candidates=10 reaped=0 kept=15 ' <<<"$OUT" && echo 0 || echo 1)" \
+               "the SUMMARY accounts for ten candidates and fifteen keeps (12 young + 3 capped)"
+    case_check "$(grep -q 'gitless_max=10' <<<"$OUT" && echo 0 || echo 1)" \
+               "and it states the ceiling it ran under (gitless_max=10)"
     return $((CASE_FAIL > 0))
 }
 
@@ -442,7 +457,7 @@ printf '\nreap-abandoned-worktrees.test.sh — the gitless BOUND (#3278)\n\n'
 
 expect_pass "A the #3278 fixture: the 13th (aged) tree is classified, not capped" case_a "$OWNER"
 expect_pass "B --apply removes the 13th and leaves all twelve young trees" case_b "$OWNER"
-expect_pass "C thirteen AGED trees are all classified (no default ceiling)" case_c "$OWNER"
+expect_pass "C the default ceiling of 10 reaches AGED trees (the young ones spend no slot)" case_c "$OWNER"
 expect_pass "D the TIME bound stops the pass and preserves everything" case_d "$OWNER"
 expect_pass "E a young tree costs no cap unit (the ordering half of the bound)" case_e "$OWNER"
 expect_pass "F the count cap survives as an operator override; a bad seam is refused" case_f "$OWNER"
@@ -450,19 +465,22 @@ expect_pass "G the safety gates this arm carries are unchanged" case_g "$OWNER"
 expect_pass "H the LINKED arm's time bound precedes its census, not just the gitless arm's" case_h "$OWNER"
 
 # ═══ mutations — one per half of the change ══════════════════════════════════════════════════
-# MUT_CAP restores the REPLACED DEFAULT. If A and C survive it, the suite is not checking it.
-MUT_CAP='s|^GITLESS_MAX="${REAP_AW_GITLESS_MAX:-}"|GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"|'
+# MUT_CAP removes the ceiling entirely (the #3278 P3 shape this PR deliberately does NOT ship). If case
+# C survives it, the suite is not checking that the ceiling still exists.
+MUT_CAP='s|^GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"|GITLESS_MAX="${REAP_AW_GITLESS_MAX:-}"|'
 if apply_mutation "$OWNER" "$T/mut-cap/reap-abandoned-worktrees.sh" -e "$MUT_CAP"; then
-    expect_fail "MUT_CAP the default cap of 10 restored — case C must go RED" case_c "$T/mut-cap/reap-abandoned-worktrees.sh"
+    expect_fail "MUT_CAP the ceiling removed — case C must go RED" case_c "$T/mut-cap/reap-abandoned-worktrees.sh"
 else
-    bad "MUT_CAP could not be applied — the default is not being checked any more"
+    bad "MUT_CAP could not be applied — the ceiling is not being checked any more"
 fi
 
-# MUT_CAPPRE restores the PRE-#3278 code path exactly: the default AND the unit charged before the age
-# floor. That is the shape that measured 89 % waste, and the #3278 fixture is built to see it.
+# MUT_ORDER restores the unit's PRE-#3278 position: charged before the age floor, i.e. it counts
+# CLASSIFICATIONS. With the unchanged default of 10 that IS the pre-#3278 shape exactly, so both
+# fixtures must see it — the #3278 one (case A) and the default-ceiling one (case C).
 MUT_ORDER='s|^            gitless=1$|            gitless=1; GITLESS_DONE=$((GITLESS_DONE + 1))|'
-if apply_mutation "$OWNER" "$T/mut-cappre/reap-abandoned-worktrees.sh" -e "$MUT_CAP" -e "$MUT_ORDER"; then
-    expect_fail "MUT_CAPPRE default cap charged before the age floor — case A must go RED" case_a "$T/mut-cappre/reap-abandoned-worktrees.sh"
+if apply_mutation "$OWNER" "$T/mut-cappre/reap-abandoned-worktrees.sh" -e "$MUT_ORDER"; then
+    expect_fail "MUT_CAPPRE unit charged before the age floor (the pre-fix shape) — case A must go RED" case_a "$T/mut-cappre/reap-abandoned-worktrees.sh"
+    expect_fail "MUT_CAPPRE pre-fix shape — case C must go RED too (the ceiling reaches no aged tree)" case_c "$T/mut-cappre/reap-abandoned-worktrees.sh"
 else
     bad "MUT_CAPPRE could not be applied — the #3278 fixture is not checking the pre-fix shape"
 fi

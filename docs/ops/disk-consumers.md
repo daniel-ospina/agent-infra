@@ -302,15 +302,17 @@ would otherwise be a false state claim.** #3272 (`f2d40ef8`) added
 `DISK_REAPER_GITLESS=0` as the off-switch — so a `/tmp/<name>` tree with **no `.git` at all** is a
 candidate once the liveness witness this section asks for answers (a live-pid cwd/exe census; a live
 lane preserves the tree with `reason=live-cwd`). It carries a keep list (`REAP_AW_GITLESS_KEEP`,
-default `/tmp/actions-runner:/tmp/venv-shared*`) and is bounded by a **wall-clock budget**
-(`REAP_AW_BUDGET_SECONDS`, default 300 s). #3278 **removed #3272's per-pass count cap as the default**
-(`REAP_AW_GITLESS_MAX`, default 10) because it was sized for a standing population of 26 and, on a
-population of thousands, starved the class permanently — a dry run classified 10 of 3,314 entries and
-printed `gitless-cap` for 3,137. The seam survives as an OPT-IN operator ceiling; unset means no count
-bound.
+default `/tmp/actions-runner:/tmp/venv-shared*`), is bounded by a **wall-clock budget**
+(`REAP_AW_BUDGET_SECONDS`, default 300 s), and keeps #3272's **count ceiling** (`REAP_AW_GITLESS_MAX`,
+default 10 per root). #3278 changed **when that ceiling is charged**, not its size: the unit is now
+taken after the age floor and before the live-pid census, so the ten slots go to AGED trees instead of
+being spent on the young ones the floor preserves anyway — that mis-charging was what starved the class
+(a dry run classified 10 of 3,314 entries and printed `gitless-cap` for 3,137, ~89 % of the slots
+having gone to trees the floor would have kept). **Raising or removing the ceiling is #3278's P3, an
+owner decision, and has not been taken.**
 **#3043's remaining scope** is therefore the trees a `.git`-owned arm claims (they keep their own
-`open-pr`/`dirty`/`main-checkout` proofs) plus whatever the pass's time bound leaves for the next run —
-not "everything under `/tmp`".
+`open-pr`/`dirty`/`main-checkout` proofs) plus whatever the ceiling and the pass's time bound leave for
+the next run — not "everything under `/tmp`".
 
 ## Age distribution — the disk is a rolling 7-day window, not a rot
 
@@ -444,7 +446,7 @@ diagnosis only. What a follow-up PR would touch, per finding:
 | **G3** uv bound unclaimable on a busy cell | `scripts/pi-cache-reap.sh` — a deferral that recurs on N consecutive passes cannot stay a silent `deferral`; it needs a named escalation (raise the bound deliberately, or report `bound-unclaimed-for=…` in the status record) plus a test. Two-arm change, not one line. |
 | **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:602`) already names both delegates, so the list is not the defect. Needs its own test. |
 | **G8** the runner `_work` sink had no class | **shipped** (2026-10-28): `scripts/reap-runner-work.sh` + `class=runner-work` in `scripts/disk-reaper.sh`, pinned in both scheduled artifacts and in the farm list. A class an operator has to remember to enable is the hole it closes, so it is in the DEFAULT `--only` list — and its globs are in `DISK_REAPER_RUNNER_GLOBS`, so an explicit-but-unmatched layout is a refusal rather than a measured zero. |
-| **G9** stale `/tmp` | **gitless scratch trees are swept** (merged base 2026-11-03, #3272: `--include-gitless`, live-pid census, keep list; #3278 replaced the 10-per-pass count cap with a wall-clock budget, `REAP_AW_BUDGET_SECONDS` default 300 s); the remainder — `.git`-owned trees and whatever the time bound leaves for the next run — is filed as **#3043** and needs an owner ruling on what scratch counts as evidence; an exclusion set is already in place (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`). |
+| **G9** stale `/tmp` | **gitless scratch trees are swept** (merged base 2026-11-03, #3272: `--include-gitless`, live-pid census, keep list, ceiling 10 per root per pass); #3278 charges that ceiling to **AGED candidates** (the unit moved after the age floor, which was spending ~89 % of it on trees the floor preserves) and bounds the pass with a wall-clock budget (`REAP_AW_BUDGET_SECONDS` default 300 s); the remainder — `.git`-owned trees and whatever the ceiling and the time bound leave for the next run — is filed as **#3043** and needs an owner ruling on what scratch counts as evidence; an exclusion set is already in place (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`). |
 | **G5** `/tmp` swept only at 30 d | policy (`/etc/tmpfiles.d/`), one owner decision; no repo change. |
 | **G6** cell 4's `cell-reclaim.service` failing since 02:09 | not yet diagnosed — the message (`no PR surface readable`) is *correct* fail-closed behaviour; the open question is why that read fails while `gh pr list` succeeds from the same `HOME`. Needs a read-only repro before any patch. |
 | **G7** one transient `gh` failure costs a repo's pass | `#2036` territory (exit-code semantics already split); the recoverable half is a bounded retry inside `pi-reap-worktrees.sh`'s gh probe, with a test that a second failure still fails closed. |
