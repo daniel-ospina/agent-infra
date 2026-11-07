@@ -779,8 +779,9 @@ run_is_unexpanded() {
 # return 1 — the caller then refuses exactly as it did before this change.
 #
 # The slug is `[A-Za-z0-9_.-]` (whitespace-free, matching `_GUARD_KEY_RE`'s
-# charset) so the key survives the `uniq -c | awk` rate table, and it is a pure
-# function of the JOB NAME so a PR and main slug the same job to the same key.
+# charset), so the key is a SLUG identity — that, not the table's delimiting, is why
+# it is whitespace-free (the rate table is TAB-delimited since #3686) — and it is a
+# pure function of the JOB NAME so a PR and main slug the same job to the same key.
 # Runs of punctuation collapse to ONE dash and the ends are trimmed, so the
 # matrix job `test (d)` reads as `job-unreadable::test-d` rather than `test--d-`.
 # Two distinct job names CAN collide after slugging (`test (d)` / `test-d`); that

@@ -1069,10 +1069,19 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 
 # A LOOSE nodeid: the file/class part stays strict, the ``::`` tail is allowed
 # to carry spaces/brackets because pytest parameter ids legitimately do
-# (``::test_x[chromium-Claude Desktop]``). ``_NODEID_RE`` stays narrow for the
-# RATE/UNION parsers; widening it there would loosen their fail-closed check for
-# no gain. Dropping a real id here would be fail-OPEN (an undecided id is an
-# unblocked id), which is why this path is deliberately the permissive one.
+# (``::test_x[chromium-Claude Desktop]``). ⛔ ``_NODEID_RE`` IS WIDER THAN IT USED
+# TO BE, ON PURPOSE, AND RE-NARROWING IT IS THE #3686 DEADLOCK. This comment used
+# to say the opposite — that `_NODEID_RE` "stays narrow for the RATE/UNION parsers"
+# and that widening it "would loosen their fail-closed check for no gain". The gain
+# turned out to be the whole point: the RATE table reads MAIN's rows, so a
+# character the strict form rejects is a rate row that never exists, and the PR-side
+# failure which the loose form admits then reads PR-unique FOREVER. The strict form
+# now admits the parameter characters our suites actually produce (``/`` and space)
+# while staying deliberately NARROWER than ``[^\t]+`` — because a key wrongly
+# ADMITTED enters the exemption allowlist — so neither predicate is a synonym and
+# neither may be silently swapped for the other. Dropping a real id here would be
+# fail-OPEN (an undecided id is an unblocked id), which is why this path is
+# deliberately the permissive one.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
 # A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
@@ -1527,7 +1536,9 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: the signature gate fails CLOSED on an empty overlap, so a job-level key can
 #: never buy an exemption — it converts an unreadable refusal into a named,
 #: attributable block. The slug charset is exactly `_slug`'s, so the key stays
-#: whitespace-free for the `uniq -c | awk` rate table.
+#: whitespace-free — for the SLUG identity's own sake, not because the rate table
+#: could not carry a space (#3686 retired that rationale: the rate table's nodeid is
+#: TAB-delimited, and a space in one is the second door this change fixed).
 #:
 #: `bash-shard::<path>` (#2643) is a bash SHARD's own identity, and
 #: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and both are admitted on a
@@ -1928,7 +1939,9 @@ _EXIT_TRUNCATED_CAPTURE = 4
 #: dropping — that asymmetry is the whole rule.
 
 #: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
-#: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free.
+#: key's constraint is WHITESPACE-FREE (a slug identity), not slash-free. (⛔ The rate table is
+#: TAB-delimited since #3686 — a space in a nodeid is exactly the second door that issue names —
+#: so "whitespace-free" is a property of this token, not of the table it travels through.)
 #:
 #: ⛔ THE TOKEN IS ENCODED HERE, NOT BY `quote()`, and that is deliberate. urllib's ALWAYS-safe set
 #: includes `~`, so `quote` never escapes it: a path containing `~` produced
@@ -2205,8 +2218,9 @@ _PIPELINE_CHECK_RE = re.compile(
 _SHA_LIKE_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 #: The CLI's whitespace-free key, and the ONLY shape `is_failure_key` admits for
-#: this family. The charset is exactly `_slug`'s, so the key survives the
-#: `uniq -c | awk` rate table and the provenance files.
+#: this family. The charset is exactly `_slug`'s — a slug identity, which is why the
+#: key is whitespace-free — so the key survives the TAB-delimited rate table (#3686)
+#: and the provenance files.
 _PIPELINE_KEY_RE = re.compile(
     r"^pipeline-compliance::(?P<letter>[a-z]{1,4})::(?P<subject>[A-Za-z0-9_.\-]+)$"
 )
