@@ -119,34 +119,6 @@ _rs_say() { local s="$1"; shift; printf '%s\n' "$*" >&"$s"; }
 # smaller machine" failure this file exists to prevent.
 _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
-# _rs_norm_path <path> — the canonical SPELLING of a path, without touching the filesystem:
-# repeated separators collapsed, `.` components dropped, trailing `/` removed. It is not a realpath
-# (no symlink or `..` resolution), and it does not fold case.
-#
-# ⛔ THIS IS LOAD-BEARING — IT IS THE STATE ARM'S SPELLING AXIS (round 10). Round 9's note in this
-# spot said it was "no longer on the shipped path"; that was true when written and became FALSE when
-# the shared-state guard grew a second axis. `repo_set_check` calls it for the SPELLING check, so two
-# state dirs identical after folding `//`, `.`, a trailing `/` (and case, via `_rs_lower`) still refuse
-# when an unenterable ancestor leaves the IDENTITY unprovable. Deleting this as "the unused spelling
-# primitive" would remove the mechanism m18/m19 pin and re-open the false PASS those arms cover.
-#
-# ⛔ IT IS NOT THE IDENTITY AUTHORITY — do not promote it to one. It deliberately does NOT fold `..`
-# and never touches the filesystem (that is what makes it usable for a dir that does not exist yet),
-# so `_rs_state_key` stays the single authority for `..`, symlinks, and a case-differing spelling of a
-# directory this process CAN enter. The two are complementary by design: SPELLING is proof on its own
-# (identical text is one path, whatever the permission bits), IDENTITY is proof only when resolvable.
-# A textual `..` fold here would be a NEW false pass — `/a/link/../b` with `/a/link -> /c` is
-# physically `/b`, and text would call it `/a/b`.
-#
-# It is ALSO used by the suite's non-vacuity mutation, which expresses the ROUND-6 fallback with it, so
-# removing it would additionally turn m11/m12 into assertions about an undefined command — a mutation
-# that cannot apply, which is the "proves nothing" trap those arms exist to avoid.
-#
-# ⛔ WHY IT IS NEEDED, MEASURED IN REVIEW ROUND 3 (P2): `/srv/state` and `/srv//state` and
-# `/srv/./state` are ONE DIRECTORY. The shared-state guard compared raw spellings, so a set that named
-# the same state dir two ways returned OK — on exactly the silent-sharing failure the guard exists to
-# refuse (two controllers on one `.orch.lock`). The repo already treats this class as real:
-# `check-farm-drift.sh` normalises `//` and `.` after a measured incident.
 # _rs_nearest_existing_ancestor <path> — the first path component that EXISTS, walking up from the
 # given path's directory; "" when nothing (not even /) answers. It is the whole basis of the
 # absence proof above: `-e` false under a TRAVERSABLE existing ancestor is proof of absence, and under
@@ -161,8 +133,6 @@ _rs_nearest_existing_ancestor() {
   return 0
 }
 
-# _rs_doctor_available — can the sibling `pr-doctor.py` be asked at all? The delegated proofs need BOTH
-# the file and an interpreter, and "could not ask" must never be read as "the proof held".
 # _rs_py_resolve — the interpreter, resolved the same way the wrapper resolves it (`command -v python3`,
 # then the two absolute paths launchd needs when it has no PATH of its own). ONE home for that order.
 _rs_py_resolve() {
@@ -173,6 +143,8 @@ _rs_py_resolve() {
   return 0
 }
 
+# _rs_doctor_available — can the sibling `pr-doctor.py` be asked at all? The delegated proofs need BOTH
+# the file and an interpreter, and "could not ask" must never be read as "the proof held".
 _rs_doctor_available() {
   [ -n "$(_rs_doctor_py)" ] || return 1
   [ -n "$(_rs_py_resolve)" ] || return 1
@@ -206,6 +178,34 @@ else:
 PY_STAT
 }
 
+# _rs_norm_path <path> — the canonical SPELLING of a path, without touching the filesystem:
+# repeated separators collapsed, `.` components dropped, trailing `/` removed. It is not a realpath
+# (no symlink or `..` resolution), and it does not fold case.
+#
+# ⛔ THIS IS LOAD-BEARING — IT IS THE STATE ARM'S SPELLING AXIS (round 10). Round 9's note in this
+# spot said it was "no longer on the shipped path"; that was true when written and became FALSE when
+# the shared-state guard grew a second axis. `repo_set_check` calls it for the SPELLING check, so two
+# state dirs identical after folding `//`, `.`, a trailing `/` (and case, via `_rs_lower`) still refuse
+# when an unenterable ancestor leaves the IDENTITY unprovable. Deleting this as "the unused spelling
+# primitive" would remove the mechanism m18/m19 pin and re-open the false PASS those arms cover.
+#
+# ⛔ IT IS NOT THE IDENTITY AUTHORITY — do not promote it to one. It deliberately does NOT fold `..`
+# and never touches the filesystem (that is what makes it usable for a dir that does not exist yet),
+# so `_rs_state_key` stays the single authority for `..`, symlinks, and a case-differing spelling of a
+# directory this process CAN enter. The two are complementary by design: SPELLING is proof on its own
+# (identical text is one path, whatever the permission bits), IDENTITY is proof only when resolvable.
+# A textual `..` fold here would be a NEW false pass — `/a/link/../b` with `/a/link -> /c` is
+# physically `/b`, and text would call it `/a/b`.
+#
+# It is ALSO used by the suite's non-vacuity mutation, which expresses the ROUND-6 fallback with it, so
+# removing it would additionally turn m11/m12 into assertions about an undefined command — a mutation
+# that cannot apply, which is the "proves nothing" trap those arms exist to avoid.
+#
+# ⛔ WHY IT IS NEEDED, MEASURED IN REVIEW ROUND 3 (P2): `/srv/state` and `/srv//state` and
+# `/srv/./state` are ONE DIRECTORY. The shared-state guard compared raw spellings, so a set that named
+# the same state dir two ways returned OK — on exactly the silent-sharing failure the guard exists to
+# refuse (two controllers on one `.orch.lock`). The repo already treats this class as real:
+# `check-farm-drift.sh` normalises `//` and `.` after a measured incident.
 _rs_norm_path() {
   local out="" comp
   while IFS= read -r comp; do
@@ -670,7 +670,7 @@ _rs_split_entries() {
 # reproduces EXACTLY the entries we meant to render, a non-empty `index<TAB>got<TAB>want` report for the
 # first entry that differs, or the `__UNASKABLE__` sentinel (the question could not be answered).
 #
-# ⛔ "/" IS RESERVED FOR "NO DIVERGENCE", AND AN EMPTY FIELD IS NOT A LEGIBLE DIFFERENCE (review
+# ⛔ "" IS RESERVED FOR "NO DIVERGENCE", AND AN EMPTY FIELD IS NOT A LEGIBLE DIFFERENCE (review
 # round 12, P2). ⚠️ THIS IS ABOUT THE MESSAGE, NOT THE VERDICT — and the comment must say which, because
 # the two were the SAME bug only in the pre-index shape. There, the report was `printf … "$line" …`,
 # so a divergence whose `$line` was empty printed NOTHING and the caller's `[ -n "$diverged" ]` read
@@ -684,12 +684,15 @@ _rs_split_entries() {
 # finding. With it: `the doctor reads it as <empty entry> where o/b=… was named`.
 # ⛔ KNOWN RESIDUAL, DOCUMENTED RATHER THAN PROMISED AWAY: a TRAILING empty entry is invisible here,
 # because `got="$(…)"` strips trailing newlines — `['e1','e2','']` captures as `e1\ne2` and compares
-# equal. A LEADING or MIDDLE empty entry IS caught (measured). It is unreachable with the shipped
-# doctor — `configured_repos()` does `.strip()` then splits on `[,\s]+` (pr-doctor.py:724-727), so it
-# cannot emit a trailing empty for the env path — but it is a real hole in the forward-compat promise
-# below, and closing it needs the count to travel across the seam rather than be recovered from a
-# newline-stripped capture. ("Could not ask" is a DIFFERENT case, handled above by `__UNASKABLE__`:
-# one sentinel, not two.)
+# equal. A LEADING or MIDDLE empty entry IS caught (measured). It is unreachable on the SHIPPED path —
+# not because `configured_repos()` cannot emit a trailing empty (it CAN: `raw.strip()` strips
+# whitespace, not the join comma, so `PR_DOCTOR_REPOS="a=1,b=2,"` yields a trailing empty entry —
+# pr-doctor.py:724-727), but because the READER never renders a trailing separator to ask about:
+# `repo_set_doctor_repos` comma-joins with no trailing `,`, and a value cannot contain one
+# (`SEPARATOR-IN-VALUE`). So the hole is in the guard's coverage of a shape the doctor could describe,
+# not in the question the reader actually asks — closing it needs the entry COUNT to travel across the
+# delegation seam rather than be recovered from a newline-stripped capture. ("Could not ask" is a
+# DIFFERENT case, handled above by `__UNASKABLE__`: one sentinel, not two.)
 #
 # ⛔ BY ENTRIES, NOT BY COUNT (review round 9, P2). The count-only round-trip could not see a separator
 # at the END of a value: `repo_set_doctor_repos` joins with `,`, so `/x/decoy ` + `,` is one `[,\s]+` run
