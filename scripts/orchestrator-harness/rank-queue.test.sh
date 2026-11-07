@@ -3661,10 +3661,10 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # ⛔ `T` RECORDS ARE NOT A VERDICT (review P2, cycle 100). The `trap` arm snapshots the options at the moment a `trap`
 # command whose TEXT names `EXIT` runs — an install, a REMOVAL (`trap - EXIT`), or a `trap … 0` whose handler merely
 # names it (all three measured to write `T`) — and the script may `set -u`/`set +u` after that, so a `T` record must
-# never be read as an end state (measured:
-# `set -u; trap; set +u` was graded PROTECTED from it, a false PASS where the previous cycle said NO RECORD, and
-# `trap; set -u` was graded bare, naming a correct fixture). `_opts_for` therefore answers from `E`/`D` only;
-# `_trapopts_for` exposes the `T` snapshot separately for the agreement test in the exec sweep.
+# never be read as an end state (measured in the arm's first form: `set -u; trap; set +u` was graded PROTECTED
+# from it, a false PASS where the cycle before the arm said NO RECORD, and `trap; set -u` was graded bare, naming a
+# correct fixture). `_opts_for` therefore answers from `E`/`D` only, and `_trapopts_for` exposes the `T` snapshot
+# separately for the agreement test in the exec sweep.
 _opts_for() { RQ_P="$1" awk -F'\t' '
   { p = $4; for (i = 5; i <= NF; i++) p = p "\t" $i }
   p==ENVIRON["RQ_P"] && ($3=="" || $3=="0") { if ($1=="E") e=$2; else if ($1=="D") d=$2 }
@@ -3744,11 +3744,12 @@ while IFS= read -r _ex; do
   # the graded population is now exactly the logged one.
   exec_total=$(( exec_total + 1 ))
   # ⛔ AN EXECUTED SCRIPT THAT LEFT NO END STATE IS NAMED, NOT PARSED (review P2, cycle 98). A driver that installs its
-  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end leaves NO END-STATE record (before cycle 100 it
-  # left no record of any kind), so `_setu_verdict` would silently fall back to the textual parser — and the parser
-  # grades a `case` arm or an uncalled `fin()` wrongly in BOTH directions (measured: a bare driver of that shape printed
-  # ✅, and a genuinely protected one was named). "Executed but unobservable" must never read as clean. Measured today:
-  # 172 executed paths, 172 with a record, 0 without.
+  # OWN EXIT trap (`trap ': cleanup' EXIT`) and then falls off the end leaves NO END-STATE record — and when the arm
+  # first shipped (cycle 99) it wrote a `D` for that shape, which `_opts_for` read as an END state; before the arm (cycle
+  # 98) it wrote no record of any kind. Either way `_setu_verdict` would silently fall back to the textual parser, and
+  # the parser grades a `case` arm or an uncalled `fin()` wrongly in BOTH directions (measured: a bare driver of that
+  # shape printed ✅, and a genuinely protected one was named). "Executed but unobservable" must never read as clean.
+  # Measured today: 172 executed paths, 172 with a record, 0 without.
   if [ -z "$(_opts_for "$_ex")" ]; then
     # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two sources answering the
     # same question: agreement is evidence for the flips `_setu` CAN SEE, and disagreement means the state is NOT
@@ -3756,9 +3757,9 @@ while IFS= read -r _ex; do
     # RESIDUAL, declared: agreement is not proof, because both sources are blind to any flip the parser cannot read and
     # the trap-time snapshot predates. Measured, with only `T` = nounset recorded and `_setu` agreeing from the
     # top-level `set -u` while the real end state is BARE and the unbound read passes (rc=0, graded PROTECTED) — in TWO
-    # shapes, and the second is text the parser still cannot see:
-    #   `f() { eval "set +u"; }` / `f`                        (the flip is not text at all);
-    #   `case "$x" in` / `  u) set +u ;;` / `esac`            (it IS text; `_setu` skips a `u)` statement — see :3645).
+    # shapes, and BOTH are text `_setu` cannot read, for the same reason (the flip is not a statement's command word):
+    #   `f() { eval "set +u"; }` / `f`                        (the command word is `eval`);
+    #   `case "$x" in` / `  u) set +u ;;` / `esac`            (the first word is `u)` — the blind spot at :3645).
     # Closing either needs a real end state (the `exit 0` the UNOBSERVABLE advice below recommends), so the residual
     # stands; it is stated here so the next lane does not read "agreement" as "proved".
     _tu="$(_trapopts_for "$_ex")"
