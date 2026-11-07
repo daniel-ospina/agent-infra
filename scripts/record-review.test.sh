@@ -7042,7 +7042,7 @@ EH2B=4251315; rm -f "$(Q2 $EH2B)"
 #    and the ONLY authored thing in the range is the merge's conflict resolution.
 run_record_delta $EH2B "$DG_EV_HEAD" "delta:$DG_EV_P1..$DG_EV_HEAD" STUB_BASE_SHA="$DG_EV_P2"
 assert_eq "$RECORD_RC" "3" "20h2b a range that is ONLY an evil merge, with no cover, is refused (rc 3)"
-assert_contains "$RECORD_ERR" "holds authored content in a MERGE" "20h2b the refusal names the MERGE as the authored content — \`n_authored\` is legitimately 0 here"
+assert_contains "$RECORD_ERR" "holds authored content in a MERGE" "20h2b the refusal names the MERGE as the authored content — `n_authored` is legitimately 0 here"
 assert_not_contains "$RECORD_ERR" "(0 commit(s))" "20h2b the refusal does NOT print the self-contradicting (0 commit(s)) count"
 # ⛔ ASSERT THE HEAD, NOT THE FILE: this vector plants a prior record at A (that is
 # what makes the merge-only arm reachable at all), so "no file" would be false even
@@ -7934,29 +7934,49 @@ assert_eq "$_badbt" "" "20h48 no echo/printf message anywhere in the recorder ex
 #        is not a hit, while a backtick in a LABEL argument is).
 _badbt2="$(python3 - "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")" <<'PY48B'
 import re, sys
-def strip_comment(s):
+# ⛔ ONE STATE MACHINE, NOT TWO (round 4, P2). The first cut stripped comments in a
+# quote-state machine and then removed single-quoted spans with a REGEX on the
+# result — outside that state. Inside a DOUBLE-quoted string an apostrophe is a
+# literal character, not a quote opener, so a pair straddling a backtick
+# ("the grader's `n_authored` isn't 0") deleted the backtick before it was tested:
+# a false PASS on the exact class this sweep claims to bound. Single-quoted content
+# is now dropped BY the machine (q == "'"), where the context is known, and
+# apostrophes inside "..." are kept literal.
+def scan(s):
     out=[]; q=None; i=0
     while i < len(s):
         c=s[i]
-        if q:
-            if c=='\\' and q=='"':
+        if q == '"':
+            if c=='\\':
                 out.append(c); out.append(s[i+1:i+2]); i+=2; continue
-            if c==q: q=None
+            if c=='"': q=None
             out.append(c)
+        elif q == "'":
+            if c=="'": q=None
+            # content inside single quotes is literal: dropped, never tested
         else:
-            if c in '"\'': q=c; out.append(c)
+            if c=='"': q='"'; out.append(c)
+            elif c=="'": q="'"
             elif c=='#': break
             else: out.append(c)
         i+=1
     return ''.join(out)
+def has_live_backtick(s):
+    # ⛔ BACKSLASH PARITY, NOT `(?<!\\)`: one preceding backslash is not "escaped",
+    # because the shell consumes them in pairs — `\\\\` before a backtick leaves it
+    # executable (measured).
+    for m in re.finditer('`', s):
+        j=m.start()-1; n=0
+        while j >= 0 and s[j]=='\\':
+            n+=1; j-=1
+        if n % 2 == 0: return True
+    return False
 out=[]
 for path in sys.argv[1:]:
     for i,l in enumerate(open(path),1):
         st=l.strip()
         if not st or st.startswith('#'): continue
-        body=strip_comment(st)
-        body=re.sub(r"'[^']*'","",body)
-        if re.search(r'(?<!\\)`', body):
+        if has_live_backtick(scan(st)):
             out.append("%s:%d: %s" % (path, i, st[:90]))
 print("\n".join(out))
 PY48B
