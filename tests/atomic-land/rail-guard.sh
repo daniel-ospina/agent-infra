@@ -107,11 +107,15 @@ fi
 # shellcheck source=/dev/null
 . "$HERE/reap-lib.sh"
 # Belt-and-braces: a library that EXISTS but does not define the rules (a truncated write, a bad
-# merge) must also refuse rather than fail open on a 127.
-if ! command -v still_ours >/dev/null 2>&1 || ! command -v reap_pid >/dev/null 2>&1; then
-  echo "rail-guard: reap-lib.sh did not define still_ours/reap_pid — refusing" >&2
-  exit 2
-fi
+# merge) must also refuse rather than fail open on a 127. ⛔ ALL FOUR, because the loop body's
+# `still_ours` merely CALLS `is_running`: a missing `is_running` makes `still_ours` itself exit
+# 127, which a `while` condition reads as FALSE, and this script then falls through to `exit 0`
+# — "the rail stopped on its own" — over a LIVE rail (measured). Checking only the two names the
+# loop mentions would have left exactly that hole.
+for _need in is_running proc_ident still_ours reap_pid; do
+  command -v "$_need" >/dev/null 2>&1 \
+    || { echo "rail-guard: reap-lib.sh did not define $_need — refusing to pretend the rail is bounded" >&2; exit 2; }
+done
 
 if [ "$#" -lt 3 ]; then
   echo "usage: rail-guard.sh <supervisor-pid> <limit-secs|0> <pid> [ident]" >&2
@@ -119,6 +123,11 @@ if [ "$#" -lt 3 ]; then
 fi
 sup="$1"; limit="$2"; pid="$3"; ident="${4:-}"
 case "$limit" in ''|*[!0-9]*) echo "rail-guard: the limit must be a non-negative integer" >&2; exit 2 ;; esac
+# ⛔ VALUE, not shape: `[ "$limit" -gt 0 ]` below is FALSE for `00` (all digits, not the string
+# 0) and ERRORS for a literal too wide, and a failing `[` is FALSE — either way the limit arm
+# goes silently inert and only supervisor-death bounds the rail. Refuse both instead.
+[ "$limit" -le 86400 ] 2>/dev/null \
+  || { echo "rail-guard: the limit must be 0..86400 seconds (got '$limit')" >&2; exit 2; }
 
 started="$SECONDS"
 why=""

@@ -60,19 +60,27 @@ RAIL="${ATOMIC_LAND_SUITE_RAIL:-$ROOT/scripts/atomic-land.sh}"
 GUARD="${ATOMIC_LAND_GUARD:-$ROOT/tests/atomic-land/rail-guard.sh}"
 REAP_LIB="$ROOT/tests/atomic-land/reap-lib.sh"
 # ⛔ PREFLIGHT BEFORE THE SOURCE, and before anything can assert on it. `set -uo pipefail` does
-# NOT abort on a failed `.`: a missing reap-lib.sh leaves `is_running` UNDEFINED, and every
-# "the watchdog left no survivor behind" assertion then reports ✅ on a 127 — a false PASS of
-# exactly the class this change exists to remove. A missing guard is worse: `bash "$GUARD"`
-# exits 127, the watchdog is a silent no-op, and a rail regression becomes a hang instead of a
-# named failure. `[ -f "$RAIL" ]` below has always had this shape; these are its siblings.
+# NOT abort on a failed `.`: a missing reap-lib.sh leaves the primitives UNDEFINED, and a call
+# that cannot resolve exits 127 — which `if is_running …` reads as FALSE, so every survivor and
+# last-resort re-check is skipped and the suite `wait`s on a live pid (measured: unbounded) or
+# reports a rail stopped that is still running. That is the fail-open class this change exists
+# to remove, one level in. `[ -f "$RAIL" ]` below has always had this shape; these are its
+# siblings. A missing GUARD is now a NAMED failure (the `*)` arm returns 125), but starting
+# without it would mean never measuring the reaper at all.
 [ -f "$GUARD" ] || { echo "❌ missing $GUARD"; exit 1; }
 [ -f "$REAP_LIB" ] || { echo "❌ missing $REAP_LIB"; exit 1; }
 # shellcheck source=/dev/null
 . "$REAP_LIB"
-# The second half of the preflight above: the lib can be PRESENT and still not define its
-# primitives (a truncated file, a rename), which is the same silence one level in.
-command -v reap_pid >/dev/null 2>&1 \
-  || { echo "❌ $REAP_LIB did not load (reap_pid is undefined)"; exit 1; }
+# ⛔ EVERY PRIMITIVE THIS FILE CALLS, not just the one that was easiest to name. A lib can be
+# PRESENT and still not define them (a truncated write, a rename, a bad merge), and a missing
+# `is_running` is the worst of the four: the guard calls it from `still_ours`, so the guard
+# would `exit 0` — "the rail stopped on its own" — over a LIVE rail (measured), and this file's
+# four re-check arms would all skip. Listing only `reap_pid` was a preflight that asserted it
+# had a defence it did not have.
+for _p in is_running proc_ident still_ours reap_pid; do
+  command -v "$_p" >/dev/null 2>&1 \
+    || { echo "❌ $REAP_LIB did not define $_p (truncated or renamed library)"; exit 1; }
+done
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/atomic-land-suite.XXXXXX")"
 checks=0
 failures=0
@@ -505,8 +513,10 @@ new_scen() {
   # #1845: the guard's per-scenario evidence files. Each spawn truncates its own (`2>"$SCEN/…"`),
   # so this `rm` is belt-and-braces for a scenario that reuses a dir; it is not what protects
   # against a stale read. The list is exactly what the watchdog scenarios write.
-  rm -f "$SCEN/guard-why" "$SCEN/limit-why" "$SCEN/wd-err" "$SCEN/wd-err0" \
-    "$SCEN/victim-pid" 2>/dev/null || true
+  rm -f "$SCEN/guard-why" "$SCEN/limit-why" "$SCEN/victim-pid" \
+    "$SCEN/wd-err-g-couldnotrun.sh" "$SCEN/wd-err-g-lies124.sh" \
+    "$SCEN/wd-err-g-survived.sh" "$SCEN/wd-err-g-lost.sh" \
+    "$SCEN/wd-err0" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
   rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
@@ -735,8 +745,18 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
   # failed" code, so no caller can mistake this for the rail's own outcome.
   case "$limit" in
     ''|*[!0-9]*) echo "⚠️ watchdog: the limit must be a positive integer (got '$limit')" >&2; return 125 ;;
-    0) echo "⚠️ watchdog: limit 0 leaves this function's own wait unbounded — pass a positive limit" >&2; return 125 ;;
+    # ⛔ VALUE, not just SHAPE. `00`/`0000` are all-digits and are not the string `0`, and the
+    # guard's limit arm is `[ "$limit" -gt 0 ]` — false for them — so the bound would be off
+    # while this function's own `wait` was unbounded (measured: never returned). Require at
+    # least one non-zero digit.
+    *[1-9]*) : ;;
+    *) echo "⚠️ watchdog: limit '$limit' is zero — the caller's wait would be unbounded" >&2; return 125 ;;
   esac
+  # ⛔ AND VALUE-BY-RANGE. A literal too wide for `[ … -gt 0 ]` makes that test ERROR, and a
+  # failing `[` is FALSE, so the limit arm goes silently inert (measured: `[: 999…: integer
+  # expression expected` every poll). The cap is far above any real bound and far below overflow.
+  [ "$limit" -le 86400 ] 2>/dev/null \
+    || { echo "⚠️ watchdog: the limit must be 1..86400 seconds (got '$limit')" >&2; return 125; }
   local rc=0 grc=0 gpid ident
   rail_exec "$@" >"$SCEN/out" 2>"$SCEN/err" &
   local pid=$!
@@ -1584,9 +1604,24 @@ rc=$?
 [ "$rc" -eq 125 ] \
   && pass "limit 0 is refused (rc 125), so the watchdog cannot be switched off by its caller" \
   || fail "expected rc 125 for a limit of 0, got $rc"
-grep -q "limit 0 leaves this function's own wait unbounded" "$SCEN/wd-err0" 2>/dev/null \
+grep -q "is zero — the caller's wait would be unbounded" "$SCEN/wd-err0" 2>/dev/null \
   && pass "the refusal says WHY 0 is not allowed here" \
   || fail "the limit-0 refusal did not name its reason"
+# ⛔ VALUE, not shape: `00` is all-digits and is not the string `0`, and the guard's limit arm
+# (`[ "$limit" -gt 0 ]`) is false for it — so the bound would be off while this function's own
+# `wait` was unbounded (measured: never returned).
+run_rail_watchdog 00 42 --repo "$REPO" --poll 0 --wait-timeout 2 2>"$SCEN/wd-err00"
+rc=$?
+[ "$rc" -eq 125 ] \
+  && pass "limit 00 is refused too (an all-digit zero is still zero)" \
+  || fail "expected rc 125 for a limit of 00, got $rc"
+# A literal too wide for `[ … -gt 0 ]` makes that test ERROR, and a failing `[` is FALSE — the
+# limit arm goes inert with no message.
+run_rail_watchdog 999999999999999999999 42 --repo "$REPO" --poll 0 --wait-timeout 2 2>"$SCEN/wd-errbig"
+rc=$?
+[ "$rc" -eq 125 ] \
+  && pass "an unrepresentable limit is refused, not silently inert" \
+  || fail "expected rc 125 for an oversized limit, got $rc"
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
 echo "── 8. --dry-run mutates nothing"

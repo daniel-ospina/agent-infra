@@ -10,9 +10,10 @@
 # unreported narrower reap is still reported to the caller as a PROVEN one (#3622 review,
 # P3). `pkill` ships with macOS and procps, so this is a slim-container case.
 #
-# Sourced by `run.sh` (the survivor assertions) and by `rail-guard.sh` (the watchdog's
-# reaper, which runs as its own process so it outlives the suite — #1845). Two copies of
-# these rules is how one of them drifts into a false answer, so they live here.
+# Sourced by `run.sh` (its last-resort reaps, the `proc_ident` capture it hands the guard, and
+# the barrier that sees a leaked rail) and by `rail-guard.sh` (the watchdog's reaper, which runs
+# as its own process so it outlives the suite — #1845). Two copies of these rules is how one of
+# them drifts into a false answer, so they live here.
 #
 # Sourced only: no side effects, no shell options, no policy. The CALLER decides what a
 # still-running process means. Bash 3.2-safe (macOS `/bin/bash`), POSIX tools only.
