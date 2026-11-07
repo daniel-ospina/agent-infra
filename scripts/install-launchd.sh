@@ -740,7 +740,11 @@ plist_program_args() {
             if (line == "" && $0 !~ /^[[:space:]]*(Arg)?[0-9]+[[:space:]]*=/) next
             seen = 1
             idx++
-            if (line == "") next
+            # ⛔ AND `prev` IS UPDATED TO THE EMPTY VALUE — python takes `prev = argv[i - 1]`, which for
+            # an element after an empty one IS `""`. Leaving `prev` untouched made the fallback keep
+            # seeing `--repo` as the preceding element and call the next path `data` — WARNed and
+            # INSTALLED a unit the python reader refuses as EXEC (fresh review of #3413, round 4 P2).
+            if (line == "") { prev = line; next }
             # ⛔ `Program` WINS, so element 0 is ONLY argv[0] and is not verdicted at all — exactly the
             # python reader (its `skipped.add(0)`). This test comes BEFORE the joined `--opt=` branch,
             # because with `Program` set python emits nothing for a `--script=<TCC>` at argv[0] while

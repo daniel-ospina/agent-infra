@@ -1150,6 +1150,42 @@ assert_contains "$OUT" "TCC-protected target: $PROBE_ALIGN_BIN" "§7c an element
 assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …so it is verdict-2, not excused as a launcher (a BINARY would have been WARNed+installed)"
 assert_not_contains "$OUT" "installed + loaded" "§7c …and the unit is not installed"
 
+# (c12c) an EMPTY element in the MIDDLE, which is the OTHER half of the same alignment rule: python takes
+# `prev = argv[i - 1]`, so after an empty element `prev` IS `""` and the next absolute path is EXEC, not
+# the value of the `--repo` before the gap. An awk that skipped the empty row without updating `prev`
+# still saw `--repo`, called that path `data`, and WARNed + INSTALLED a unit python refuses (fresh review
+# of #3413, round 4 P2). RED if the empty row leaves `prev` untouched.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>--repo</string>
+        <string></string>
+        <string>$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c an element after a MID-LIST empty one is EXEC, not the --repo value before the gap"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …so it is not WARNed as DATA (the empty row clears prev)"
+assert_not_contains "$OUT" "installed + loaded" "§7c …and the unit is not installed"
+
 # (c13) launchd's `Program` key IS the executed binary: `ProgramArguments[0]` is only argv[0]. A
 # `Program` pointing into a TCC tree is armed-and-dead even when every argument is farmed and readable
 # (review P3, round 5 — the reader modelled argv[0] only).
