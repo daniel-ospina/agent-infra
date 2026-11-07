@@ -2404,10 +2404,59 @@ _n16=$(wc -l < "$COMMENTS")
 publish_review_state acme/widget 42 review-in-flight "$_H16" d1700099999
 [ "$(wc -l < "$COMMENTS")" = "$_n16" ] \
   || bad "a repeat of the SAME dispatch must stay idempotent (added $(( $(wc -l < "$COMMENTS") - _n16 )) comment(s)) — the epoch key exists to let a new dispatch speak, not to re-post every pass"
-# …and BOTH head-bound claims must actually CARRY that key (the drive above proves the function honours it;
-# this ties the mechanism to the loop, or the fix lives in the library and never reaches a PR).
-[ "$(grep -cE 'publish_review_state "\$repo" "\$pr" (review-in-flight|awaiting-review) "\$head" "\$_rdisp"' "$SUT")" = 2 ] \
-  || bad "both head-bound dispatch claims must pass the per-dispatch key (found $(grep -cE 'publish_review_state "\$repo" "\$pr" (review-in-flight|awaiting-review) "\$head" "\$_rdisp"' "$SUT"), want 2) — with \"\$head\" alone the tag already exists after the first dispatch, so a re-dispatch at the same head can never be published"
+# ⛔ THE OTHER ARM: A REPEAT *REFUSAL* AT ONE HEAD MUST ADD NOTHING, AND A RE-DISPATCH AFTER AN EXHAUSTED
+# CLAIM MUST STILL SPEAK (review round 18, P2, measured end-to-end on the shipped functions). This is the pair
+# that the round-16 key broke: `refused` retries on TIME ALONE and spends nothing, so keying its claim by the
+# dispatch epoch posted a new byte-identical comment on every cycle (measured: 3 cycles at one head = 3
+# markers), and the naive fix — dropping the epoch — re-created the round-16 defect on the same arm (measured:
+# awaiting-review → exhausted → awaiting-review left ONE marker, newest = the exhausted text). Both halves are
+# therefore pinned here, together, so neither can be traded for the other.
+_H18=$(printf 'b%.0s' $(seq 40))
+: > "$COMMENTS"; : > "$POSTED"
+publish_review_state acme/widget 42 awaiting-review "$_H18"          # dispatch 1: refused, nothing spent
+_n18=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 awaiting-review "$_H18"          # dispatch 2: refused again, same head
+[ "$(wc -l < "$COMMENTS")" = "$_n18" ] \
+  || bad "a SECOND refusal at the same head must add NOTHING (added $(( $(wc -l < "$COMMENTS") - _n18 )) comment(s)) — a refusal retries on time alone and spends nothing, and its text is identical every cycle, so a per-dispatch key here is one duplicate comment per COOLDOWN_TRANSIENT_S for ever"
+publish_review_state acme/widget 42 review-retries-exhausted "$_H18"
+publish_review_state acme/widget 42 awaiting-review "$_H18"          # the window rolled; a dispatch followed
+[ "$(grep -cF "auto-rail-review:awaiting-review:$_H18" "$COMMENTS")" = 2 ] \
+  || bad "a refusal AFTER an exhausted claim must be able to speak over it (found $(grep -cF "auto-rail-review:awaiting-review:$_H18" "$COMMENTS") awaiting-review marker(s), want 2: the first refusal and the one after the exhausted window rolled) — the exhausted text says the window rolls BY ITSELF, so the loop DOES dispatch again at that head; with the exhaustion left out of the positional comparison the new claim is suppressed by its own pre-exhaustion tag and the PR keeps 'not dispatching another review at this revision' while reviews are bought"
+_case_a18=$(grep -oF "auto-rail-review:awaiting-review:$_H18" <<<"$(tail -1 "$COMMENTS")" || true)
+[ -n "$_case_a18" ] \
+  || bad "the claim that follows a rolled exhaustion window must be the NEWEST marker on the PR (newest is: $(tail -1 "$COMMENTS")) — a correction that posts but is buried under the exhausted claim has not corrected anything"
+_n18b=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 awaiting-review "$_H18"
+[ "$(wc -l < "$COMMENTS")" = "$_n18b" ] \
+  || bad "the post-exhaustion claim must not become a per-pass duplicate (added $(( $(wc -l < "$COMMENTS") - _n18b )) comment(s)) — ONE correction per exhaustion, not one per pass"
+# …and the SAME comparison must let a dispatch that FAILED TO START correct an exhausted claim. On its own fresh
+# head, so nothing above can satisfy it: left out, the PR keeps 'not dispatching another review at this
+# revision' while the loop is actually trying and failing to start one.
+_H18B=$(printf 'c%.0s' $(seq 40))
+publish_review_state acme/widget 42 review-retries-exhausted "$_H18B"
+publish_review_state acme/widget 42 review-dispatch-failed "$_H18B"
+[ "$(grep -cF "auto-rail-review:review-dispatch-failed:$_H18B" "$COMMENTS")" = 1 ] \
+  || bad "a rolled-back dispatch AFTER an exhausted claim must be able to correct it (found $(grep -cF "auto-rail-review:review-dispatch-failed:$_H18B" "$COMMENTS") dispatch-failed marker(s), want 1) — otherwise the PR keeps 'not dispatching another review at this revision' while the loop is actually trying and failing to start one"
+# …and BOTH head-bound claims must carry the key their OWN text is keyed by: the in-flight claim the
+# dispatch epoch (its text carries that dispatch's timestamp), the awaiting-review claim NOTHING (its text is
+# byte-identical on every refusal). ⛔ THE ROUND-16 KEY WAS APPLIED TO BOTH AND THAT IS THE DEFECT (review
+# round 18, P2, measured on the shipped function): three refusal cycles at ONE head posted THREE identical
+# `awaiting-review` comments, because `refused` retries on time alone and spends nothing, so the epoch key
+# made a per-event key out of a per-subject claim — unbounded duplication (one comment per
+# COOLDOWN_TRANSIENT_S per PR) on a state that told the operator nothing new, and every
+# `publish_review_state` call re-reads the whole comment list, so each one inflated every later marker read.
+[ "$(grep -cE 'publish_review_state "\$repo" "\$pr" review-in-flight "\$head" "\$_rdisp"' "$SUT")" = 1 ] \
+  || bad "the in-flight claim must pass the per-dispatch key (found $(grep -cE 'publish_review_state "\$repo" "\$pr" review-in-flight "\$head" "\$_rdisp"' "$SUT"), want 1) — its text names the dispatch's own timestamp, so a re-dispatch at the same head is new truth that must be able to be published"
+# ⛔ AND THE REFUSED ARM MUST NOT PASS ONE (review round 18, P2, measured — see the arms below). Pinned as the
+# WHOLE STATEMENT inside the review branch, so re-adding the epoch (or any third argument) reddens: the tag
+# then already exists for that dispatch and a repeat refusal posts again, for ever. `[|]` and `\)` are the
+# portable spellings — `\|` under `grep -E` is a GNU extension, not POSIX ERE.
+_RAREA='^[[:space:]]*refused[|]retry\) publish_review_state "\$repo" "\$pr" awaiting-review "\$head" ;;$'
+_pin_once "$_RAREA" "the 'refused|retry' arm must publish 'awaiting-review' keyed by (state, head) ONLY ('refused|retry) publish_review_state \"\$repo\" \"\$pr\" awaiting-review \"\$head\" ;;') — keyed by the dispatch epoch every retry cycle posts a NEW byte-identical 'review needed' comment, and a refusal retries on time alone (spending nothing), so the duplication is unbounded: one comment per COOLDOWN_TRANSIENT_S per PR"
+[ "$(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")" = 0 ] \
+  || bad "no head-bound 'awaiting-review' call may pass a per-dispatch key (found $(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")) — that key is per-EVENT and the comment is not: it re-posts the same text every retry cycle"
+[ "$(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")" = 0 ] \
+  || bad "no head-bound 'awaiting-review' call may pass a per-dispatch key (found $(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")) — that key is per-EVENT and the comment is not: it re-posts the same text every retry cycle"
 # ⛔ THE KEY MUST BE DRIVEN, AND NOTHING MAY OVERRIDE IT (review round 17, P2, measured): the literal/whole-file
 # pins above are satisfied by the shipped TEXT, so a statement INSERTED after the key's assignment — `_rdisp=`
 # or `_rdisp=d1700000000` — leaves every arm green (measured on the round-16 head: rc=0, 0 FAIL) while every

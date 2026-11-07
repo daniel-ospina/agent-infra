@@ -993,9 +993,12 @@ review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; p
 # the corrective family below, which supersedes BY POSITION: `review-in-flight` ↔
 # `review-dispatch-failed`, and `awaiting-review` when a caller passes a head (a dispatch that finished
 # WITHOUT a verdict corrects the in-flight claim). For those, "is my tag already present" is the wrong
-# question — the stale tag outlives its truth, so the newest of the family wins. `awaiting-review` with NO
-# head is the cap-deferral publish: it says "no owner yet" about the PR rather than a revision, and it
-# stays plain presence.
+# question — the stale tag outlives its truth, so the newest of the family wins. `review-retries-exhausted`
+# is NOT positional itself (nothing supersedes it, and a repeat exhaustion at one head must stay a no-op),
+# but it IS compared against: it is newer truth about this head than any claim posted before it, and the
+# dispatch that follows its rolled window has to be able to say so. `awaiting-review` with NO head is the
+# cap-deferral publish: it says "no owner yet" about the PR rather than a revision, and it stays plain
+# presence.
 publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
   local repo=$1 pr=$2 state=$3 head=${4:-} basis=${5:-} tag seen text _ratt_basis _ratt_tail
   # ⛔ THE BASIS IS PART OF THE KEY (review round 10, P2, measured). This state is presence-keyed, and a
@@ -1145,7 +1148,16 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     # claim is keyed by the DISPATCH (`_d<epoch>` basis, see the call sites), so an exact-form match would
     # stop counting every such marker the moment one carried a basis — the pair would then never correct
     # each other. The head is a 40-char sha, so a `:$_o:$head` prefix cannot collide with another revision.
-    for _o in review-in-flight review-dispatch-failed awaiting-review; do
+    # ⛔ AND `review-retries-exhausted` IS PART OF WHAT A DISPATCH CLAIM MUST BE ABLE TO CORRECT (review round
+    # 18, P2, measured). It is deliberately NOT positional itself — nothing supersedes it, and a repeat
+    # exhaustion at one head must stay a no-op — but it IS newer truth about this head than a claim posted
+    # before it: after its window rolls BY ITSELF the loop dispatches again at the SAME head, and the claim
+    # that follows ("review in flight", or "awaiting review" for a dispatch that was refused) has to speak
+    # over it. Left out of this comparison, that claim was suppressed by its own pre-exhaustion tag and the
+    # PR kept "not dispatching another review at this revision" as its newest comment while the loop bought
+    # up to REVIEW_MAX_ATTEMPTS more reviews. Measured on the shipped function: awaiting-review → exhausted →
+    # awaiting-review left ONE marker, newest = the exhausted text.
+    for _o in review-in-flight review-dispatch-failed awaiting-review review-retries-exhausted; do
       [ "$_o" = "$state" ] && continue
       _on=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_o:$head" 'index($0,t){n=NR} END{print n+0}')
       [ "${_on:-0}" -gt "$_other_last" ] && _other_last=$_on
@@ -1661,15 +1673,28 @@ PY
         # pass, so nothing is published for it here.
         # position, not presence — see `publish_review_state`: a success after a rolled-back dispatch must be
         # able to correct that notice.
-        # ⛔ KEYED BY THE DISPATCH, NOT JUST BY THE HEAD (review round 16, P2): the exhausted state is not in
-        # the positional family and its window rolls, so a re-dispatch at the SAME head must be able to say so
-        # on the PR. The epoch of THIS dispatch is the key — one comment per dispatch, and a repeat of the
-        # same dispatch is still a no-op. Computed BEFORE the case, because a case body cannot hold statements.
+        # ⛔ KEYED BY WHAT THE COMMENT ACTUALLY CLAIMS — THE TWO ARMS ARE NOT THE SAME FACT (review round 18,
+        # P2, measured), SO THEY DO NOT CARRY THE SAME KEY.
+        #  - `review-in-flight` IS a per-dispatch claim: its text carries the dispatch's OWN timestamp
+        #    ("dispatched … at $(date -u …)"), so a second dispatch is new truth and must be able to say so.
+        #    The exhausted state is not positional and its window rolls BY ITSELF, so without a per-dispatch
+        #    key the claim following a rolled window reuses a tag posted BEFORE the exhaustion and is
+        #    suppressed for ever (round 16). The epoch of THIS dispatch is that key.
+        #  - `awaiting-review` is NOT: its text is byte-identical on every refusal, because nothing in it is
+        #    per-event. Keyed by the epoch, EVERY retry cycle posted a new identical "review needed" comment,
+        #    and `refused` retries on TIME ALONE and spends nothing — so that is unbounded: measured, one
+        #    comment per COOLDOWN_TRANSIENT_S per PR (≈4/hour) for a state that told the operator nothing new,
+        #    and `publish_review_state` re-reads the comment list with `--paginate` on every call, so each one
+        #    inflated every later marker read on the shared budget this actuator exists to protect. It is keyed
+        #    by (state, head) again — and the round-16 outcome is PRESERVED, not traded away: the positional
+        #    rule now compares against `review-retries-exhausted` too, so the claim that follows a rolled
+        #    exhaustion window is newer truth and posts, while a repeat refusal at the same head is a no-op.
+        # Computed BEFORE the case, because a case body cannot hold statements.
         _rdisp="d$(review_dispatched_at "$_rout")"
         case "$_rdisp" in d) _rdisp=;; esac
         case "$(review_state "$_rout")" in
           pending) publish_review_state "$repo" "$pr" review-in-flight "$head" "$_rdisp" ;;
-          refused|retry) publish_review_state "$repo" "$pr" awaiting-review "$head" "$_rdisp" ;;
+          refused|retry) publish_review_state "$repo" "$pr" awaiting-review "$head" ;;
         esac
         _rdispatched=$(( _rdispatched + 1 ))
         continue
