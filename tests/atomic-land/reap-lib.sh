@@ -13,14 +13,26 @@
 # still-running process means. Bash 3.2-safe (macOS `/bin/bash`), POSIX tools only.
 
 is_running() { # <pid> — ALIVE, not merely present: a killed child of ours is a ZOMBIE
-  # `kill -0` answers TRUE for a zombie, so a liveness test built on it alone cannot prove
-  # a reap — it would report a leak as "gone" (or, worse here, keep killing a corpse).
-  # `ps -o stat=` answers existence AND state in one read, so it is used INSTEAD of
-  # `kill -0` rather than beside it.
-  local st
-  st="$(ps -o stat= -p "$1" 2>/dev/null)"
-  [ -n "$st" ] || return 1
-  case "$st" in *Z*) return 1 ;; esac
+  # ⛔ TWO PROBES, AND THE ORDER IS THE FIX (#3622 review round 2, P1).
+  # `ps` MUST NOT BE ABLE TO DISARM THE BOUND. An empty `ps -o stat=` means "`ps` could not
+  # answer" — a slim container has no `ps`, and busybox' `ps` rejects `-o stat= -p` — NOT
+  # "the process is gone". Reading it as gone made the guard's loop never run, so the guard
+  # exited 0 ("the rail stopped on its own") and the caller fell through to `wait "$pid"` on
+  # a hanging rail: pre-#1845 restored one level up. Measured with a `ps` shim (`exit 0`, no output) over a
+  # live pid: below returns GONE while the kernel still has the pid and `kill -0` says
+  # ALIVE. This repo has already measured that same misread in a bound and fixed it the
+  # same way — `scripts/run-bash-shards.sh:702-716`: "reading it as 'not a timeout' made the
+  # bound INERT while the run still printed ✅".
+  # So `kill -0` — a builtin, which cannot fail for want of a binary — answers EXISTENCE, and
+  # `ps` is asked only the question it alone can answer: is this a ZOMBIE? An unreadable
+  # state therefore falls through to ALIVE: fail-closed.
+  # (EPERM reads as gone, both here and in `rail-guard.sh`'s supervisor probe; the reaper
+  # family only ever targets same-user processes, and an unconfirmable target must not be
+  # signalled anyway — see `reap_pid`'s identity rule.)
+  kill -0 "$1" 2>/dev/null || return 1
+  case "$(ps -o stat= -p "$1" 2>/dev/null)" in
+    *Z*) return 1 ;;   # a corpse is not running: only `ps` can tell us that
+  esac
   return 0
 }
 
