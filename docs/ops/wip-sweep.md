@@ -182,7 +182,20 @@ into a doc goes stale silently.) The typed version of this, and the ref-naming r
 ```
 status=ok|incomplete|failed   rc=…  ts=…  mode=apply|dry-run
 seen=… clean=… skipped=… dirty=… archived=… deferred=… unmeasured=… failed=… no_issue=… repos=… watchdog=…
+unpushed_worktrees=… unpushed_unmeasured=…
 ```
+
+⛔ **`unpushed_unmeasured` IS NOT A CURIOSITY — a reader that destroys the box must refuse on it.**
+`unpushed_worktrees` counts worktrees whose commits no remote has; `unpushed_unmeasured` counts the
+worktrees where that count **could not be taken** (`rev-list` timed out or errored). The second is not
+zero and must never be read as zero: a pass that could not tell whether commits exist only on this disk
+has not answered the question the quiesce asks. Such a pass is `failed` (exit 3), so the quiesce refuses
+`DONE` by exit code — and the field makes the failure attributable instead of a bare `failed=1`.
+⛔ **And this is the one place where an unreadable datum is a FAILURE rather than a deferral**, which is
+a deliberate departure from the rule below that a budget-cut call is `deferred`, not failed. The reason
+is the reader: `deferred` promises a later pass, and on the quiesce path there is no later pass — the box
+is reclaimed. So a datum the destructive decision rests on, whose absence cannot be retried, cannot be
+spelled `deferred`.
 
 `seen = clean + skipped + dirty + unmeasured` holds **over the worktrees examined**, and **`skipped`
 is not folded into `clean`**. A bare repo and a record git itself calls `prunable` were *not examined*;
@@ -333,8 +346,14 @@ cannot be misread as "nothing was at risk".
   commits is a separate capability and is not claimed here.
   ⛔ **On a quiesce those commits are now a REFUSED `DONE`**, not merely a line above it: the hook reads
   `unpushed_worktrees=` and exits non-zero (`NOT DONE`) when it is non-zero. The sweep still exits 0 for
-them — it cannot archive commits, so failing its own pass would be a lie about its capability — which is
+  them — it cannot archive commits, so failing its own pass would be a lie about its capability — which is
   exactly why the reader that DOES destroy the box must read the count rather than the exit code.
+  ⛔ **And that refusal is scoped to the worktrees the pass EXAMINED**, which is what the count means.
+  A branch with no worktree at all is never enumerated (`git worktree remove` keeps its branch,
+  `pi-reap-worktrees.sh:997-998` says so), so commits reachable only from such a branch are counted
+  nowhere and do NOT make a quiesce refuse. That is a declared gap, not a coverage claim: closing it
+  needs a bounded per-repo `rev-list --count --all --not --remotes` cross-check, which changes this
+  counter's unit from worktrees to refs and belongs with **#3484**'s typed index.
 - **It never deletes, and it changes no working tree.** It adds commits to `refs/wip/<slug>` on
   ORIGIN; inside the examined worktree's own repository it writes two refs — the local pin
   `refs/wip-local/<slug>`, and the fetched copy of origin's snapshot `refs/wip-remote/<slug>` that the
