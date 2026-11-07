@@ -685,7 +685,7 @@ composeat() {
     bash -c 'set -u; . "$KG_GATE" || exit 99; key_gate_compose "$KG_HOME" "$KG_PROV" "$KG_MODEL" "$PWD"' 2>&1
 }
 eqv "$(composeat "$HRGM" deepseek deepseek-flash)" "radius-grant" \
-    "3z15y17 the granted box with a model definition answers with the GRANT line only \u2014 one bounded read, one token"
+    "3z15y17 the granted box with a model definition answers with the GRANT line only — one bounded read, one token"
 # …and the mirror: a provider whose variable ALONE reaches it is CERTAIN, so it must refuse when the variable is absent.
 # ⛔ `google-vertex` IS NOT THAT PROVIDER ANY MORE (round 31, P2, measured): its key is accepted by pi and REJECTED by
 # the API (401 "API keys are not supported by this API"), so it sits in the uncertain table with its ADC path. The
