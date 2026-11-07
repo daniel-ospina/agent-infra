@@ -60,6 +60,19 @@
 #                records: one stderr warning turned a successful read into a rejected value.)
 #        rc 2  → `ProvisionerRefused` — "GUARD REFUSED, nothing attempted". An ANSWER, reported as
 #                the box's own deliberate no, not as a failure on a 10-minute timer.
+#        rc 6  → `ActionFailed`. THIS FILE'S OWN CONFIGURATION ERRORS, and they are NOT rc 2.
+#                ⛔ rc 2 IS THE CALLER'S "CAPACITY ANSWER" CHANNEL, and a misconfigured seam is not
+#                an answer about capacity. Measured: with two disagreeing repo seams the caller
+#                recorded `GUARD CONFLICT … the two guards DISAGREE about whether capacity can be
+#                added here, and a human must decide which number is wrong (#9672)` — i.e. it sent
+#                a human to audit capacity arithmetic over what was an environment mistake — and on
+#                a box whose DISK arm also declined it landed in `provisioner-refused`, whose exit
+#                code is 0, so a permanently un-provisionable box reported a clean pass. Every
+#                `cannot-measure why=…` below (bad --count, unreadable pool tool, root/base/repo
+#                disagreement) therefore exits 6, which the caller turns into `ActionFailed` and
+#                prints in `problems`/`actions`. rc 2 is spent ONLY on a verdict the POOL returned
+#                (its rc 2/3 gate refusals), where "nothing was attempted, and that is an answer"
+#                is true.
 #        other → `ActionFailed`, with this file's output as the reason.
 #      The pool tool reports its gate verdicts as rc 3 (`REFUSED add … nothing added`: the memory
 #      floor and the core-aware ceiling), rc 2 for `cannot-measure`/`cannot-act`, rc 4 for a taken
@@ -119,8 +132,11 @@ usage: install-ci-runner-x64.sh --count <N> --fallback auto [--dry-run]
   --dry-run        report what would be added, change nothing
 Root/base default to the caller's own (RUNNER_AUTOSCALE_RUNNER_ROOT or /opt; RUNNER_AUTOSCALE_BASE
 or <root>/gh-runner-x64) because that is where runner_autoscale.py looks for installs.
-exit 2 is a GUARD REFUSAL (nothing attempted), not a failure — see the header of
+exit 2 is a POOL GUARD REFUSAL (nothing attempted, and that is an answer) — see the header of
 scripts/ci_runner_pool.sh for the predicates that decline.
+exit 6 is THIS SCRIPT'S OWN configuration error (bad --count, unreadable pool tool, disagreeing
+root/base/repo seams). It is deliberately NOT 2: the caller records a 2 as a capacity answer and
+exits 0, so a misconfiguration would read as a clean pass.
 EOF
   exit 1
 }
@@ -150,24 +166,25 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$COUNT" ] || { err "--count is required"; usage; }
-is_uint "$COUNT" || { err "cannot-measure why=count-not-a-positive-integer value=${COUNT}"; exit 2; }
+is_uint "$COUNT" || { err "cannot-measure why=count-not-a-positive-integer value=${COUNT}"; exit 6; }
 [ -n "$FALLBACK" ] || { err "--fallback is required (only 'auto' is accepted)"; usage; }
 [ "$FALLBACK" = auto ] || { err "unsupported --fallback '$FALLBACK' (only 'auto')"; usage; }
 
-# ⛔ THE POOL TOOL MUST BE READABLE, and its absence is a REFUSAL, never a silent success. This is
-# the failure mode that started it all: a provisioner path that does not resolve, on a box whose
-# caller then believes it provisioned. Exit 2 puts it in the caller's `provisioner-refused` arm with
-# this sentence as the reason, so the next reader sees WHICH path was missing.
+# ⛔ THE POOL TOOL MUST BE READABLE, and its absence is never a silent success. This is the failure
+# mode that started it all: a provisioner path that does not resolve, on a box whose caller then
+# believes it provisioned. ⛔ rc 6, NOT rc 2 (`RC_CONFIG`, see contract fact 4): a missing pool tool
+# is THIS BOX being misconfigured, not a capacity answer, so the caller must surface it as a failure
+# in `problems`/`actions` instead of reporting `provisioner-refused` with an exit code of 0.
 if [ ! -r "$POOL_TOOL" ]; then
   err "cannot-measure why=pool-tool-unreadable path=$POOL_TOOL (point CI_RUNNER_POOL_TOOL at scripts/ci_runner_pool.sh)"
-  exit 2
+  exit 6
 fi
 
 # ── the root: the CALLER's, or the install is invisible (contract fact 3) ────────────────────────
 ROOT_CALLER=${RUNNER_AUTOSCALE_RUNNER_ROOT:-/opt}
 if [ -n "${RUNNER_ROOT:-}" ] && [ "${RUNNER_ROOT%/}" != "${ROOT_CALLER%/}" ]; then
   err "cannot-measure why=root-disagreement RUNNER_ROOT=$RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT=$ROOT_CALLER — the caller inventories <root>/gh-runner*, so an install under one root while the caller reads the other can never be counted; set both to the same path (or unset one)"
-  exit 2
+  exit 6
 fi
 RUNNER_ROOT=${RUNNER_ROOT:-$ROOT_CALLER}
 RUNNER_ROOT=${RUNNER_ROOT%/}; [ -n "$RUNNER_ROOT" ] || RUNNER_ROOT=/
@@ -180,17 +197,17 @@ BASE=${RUNNER_AUTOSCALE_BASE:-$RUNNER_ROOT/gh-runner-x64}
 BASE=${BASE%/}
 case "$BASE" in
   /*) ;;
-  *) err "cannot-measure why=base-not-absolute base=$BASE (RUNNER_AUTOSCALE_BASE must be an absolute path)"; exit 2 ;;
+  *) err "cannot-measure why=base-not-absolute base=$BASE (RUNNER_AUTOSCALE_BASE must be an absolute path)"; exit 6 ;;
 esac
 BASE_PARENT=${BASE%/*}; [ -n "$BASE_PARENT" ] || BASE_PARENT=/
 [ "$BASE_PARENT" = "$RUNNER_ROOT" ] || {
   err "cannot-measure why=base-outside-root base=$BASE root=$RUNNER_ROOT — the caller inventories <root>/gh-runner*, so an install outside that root is uncountable; set RUNNER_AUTOSCALE_BASE under RUNNER_ROOT"
-  exit 2
+  exit 6
 }
 BASE_NAME=${BASE##*/}
 case "$BASE_NAME" in
   gh-runner*) ;;
-  *) err "cannot-measure why=base-not-discoverable base=$BASE — the caller inventories <root>/gh-runner* (discover()), so an install named '$BASE_NAME' would never be counted; name it gh-runner-<something>"; exit 2 ;;
+  *) err "cannot-measure why=base-not-discoverable base=$BASE — the caller inventories <root>/gh-runner* (discover()), so an install named '$BASE_NAME' would never be counted; name it gh-runner-<something>"; exit 6 ;;
 esac
 
 # ── the repo: the CALLER's, or the registration lands in the wrong pool (contract fact 3, its twin) ──
@@ -212,7 +229,7 @@ if [ -n "${RUNNER_AUTOSCALE_REPO:-}" ]; then
     # declared repos that disagree mean this install would register a runner for one pool while the
     # caller counts it against another; picking a side here is how the false PASS gets written.
     err "cannot-measure why=repo-disagreement RUNNER_POOL_REPO=$RUNNER_POOL_REPO RUNNER_AUTOSCALE_REPO=$RUNNER_AUTOSCALE_REPO — the pool tool registers into RUNNER_POOL_REPO and the caller counts RUNNER_AUTOSCALE_REPO; a runner registered for one and counted against the other makes the pass report converged with zero capacity. Set them to the same repo (or unset one)"
-    exit 2
+    exit 6
   fi
   export RUNNER_POOL_REPO="$RUNNER_AUTOSCALE_REPO"
 fi

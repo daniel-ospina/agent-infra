@@ -30,7 +30,13 @@ trap 'rm -rf "$TMP"' EXIT
 pass=0 fail=0
 
 # The host's own runner environment must not decide the outcome of a test.
-unset RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT RUNNER_AUTOSCALE_BASE RUNNER_NAME_PREFIX
+# ⛔ THIS LIST IS THE WHOLE SEAM SET THE ADAPTER READS, AND IT WAS SHORT. It stopped at the four
+# root/base seams while the adapter ALSO refuses on a `repo-disagreement` between
+# `RUNNER_AUTOSCALE_REPO` and `RUNNER_POOL_REPO` — so on a box whose shell exports both (differently)
+# this suite went `pass=21 fail=29` against a correct adapter, which is the ambient-env class of
+# #3226. A suite that a shell variable can red is not measuring the code.
+unset RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT RUNNER_AUTOSCALE_BASE RUNNER_NAME_PREFIX \
+      RUNNER_AUTOSCALE_REPO RUNNER_POOL_REPO
 
 ok()   { pass=$((pass+1)); printf '  ok   %s\n' "$1"; }
 bad()  { fail=$((fail+1)); printf '  FAIL %s\n' "$1"; }
@@ -149,15 +155,16 @@ check "missing --count is a usage error" 1 "$rc" "usage:" "$out"
 
 # 2. leading-zero count is refused, not silently re-read as octal or as false
 out=$(bash "$SUT" --count 08 --fallback auto 2>&1); rc=$?
-check "leading-zero count -> refusal" 2 "$rc" "cannot-measure why=count-not-a-positive-integer" "$out"
+check "leading-zero count -> configuration error (rc 6, not the caller's rc-2 capacity answer)" 6 "$rc" "cannot-measure why=count-not-a-positive-integer" "$out"
 
 # 3. a strategy other than auto is refused rather than ignored
 out=$(bash "$SUT" --count 2 --fallback manual 2>&1); rc=$?
 check "unsupported --fallback refused" 1 "$rc" "unsupported --fallback" "$out"
 
-# 4. an unreadable pool tool is a REFUSAL (the original defect, in its smallest form)
+# 4. an unreadable pool tool is a REFUSAL TO ACT (the original defect, in its smallest form) — and a
+# CONFIGURATION error, so rc 6: the caller records a 2 as a capacity answer and exits 0.
 out=$(CI_RUNNER_POOL_TOOL=$TMP/nope.sh bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
-check "unreadable pool tool -> refusal naming the path" 2 "$rc" "why=pool-tool-unreadable" "$out"
+check "unreadable pool tool -> configuration error naming the path" 6 "$rc" "why=pool-tool-unreadable" "$out"
 
 # 5. the pool tool's rc=2 (cannot-measure / cannot-act) propagates as a REFUSAL
 : > "$TMP/calls.log"
@@ -231,11 +238,11 @@ check "a dry run does not report a provision" 0 "$rc" "would-provision slot=2" "
 
 # 13. a base OUTSIDE the root is uncountable by `discover()` — refused, not installed blind
 out=$(RUNNER_AUTOSCALE_BASE=$TMP/elsewhere/gh-runner-x64 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
-check "base outside the caller's root -> refusal" 2 "$rc" "why=base-outside-root" "$out"
+check "base outside the caller's root -> configuration error" 6 "$rc" "why=base-outside-root" "$out"
 
 # 14. a base that does not start with `gh-runner` is invisible to `discover()` — refused
 out=$(RUNNER_AUTOSCALE_BASE=$RUNNER_ROOT/pi-runner-x64 CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
-check "base not discoverable as gh-runner* -> refusal" 2 "$rc" "why=base-not-discoverable" "$out"
+check "base not discoverable as gh-runner* -> configuration error" 6 "$rc" "why=base-not-discoverable" "$out"
 
 # 15. the root FOLLOWS the caller when only the caller's knob is set (`provision()` passes it as
 # `RUNNER_AUTOSCALE_RUNNER_ROOT` in the child env — it used to pass no root at all)
@@ -244,7 +251,7 @@ check "root follows RUNNER_AUTOSCALE_RUNNER_ROOT" 0 "$rc" "root=$TMP/root2 added
 
 # 16. two different roots is a box that provisions what the caller cannot count — refused
 out=$(RUNNER_ROOT=$TMP/root RUNNER_AUTOSCALE_RUNNER_ROOT=$TMP/other CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
-check "disagreeing roots -> refusal" 2 "$rc" "why=root-disagreement" "$out"
+check "disagreeing roots -> configuration error" 6 "$rc" "why=root-disagreement" "$out"
 
 # 17. ⛔ rc 4 WITH the slot now holding `.runner` IS SUCCESS — the box converged, and reporting it as
 # a failure is the rc-3 defect one code over. Measured before this case: the pool created
@@ -374,7 +381,7 @@ check "…and the adapter invents no repo of its own (whole-line, empty value)" 
 # guard above takes, for the same reason: picking a side is how the false PASS gets written.
 out=$(RUNNER_AUTOSCALE_REPO=o/other RUNNER_POOL_REPO=o/third CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
       env -u RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22c" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
-check "two disagreeing repos are a refusal (rc 2)" 2 "$rc" "repo-disagreement" "$out"
+check "two disagreeing repos are a configuration error (rc 6, not rc 2)" 6 "$rc" "repo-disagreement" "$out"
 check "…naming both values" 0 0 "RUNNER_POOL_REPO=o/third RUNNER_AUTOSCALE_REPO=o/other" "$out"
 out=$(RUNNER_AUTOSCALE_REPO=o/same RUNNER_POOL_REPO=o/same CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
       env -u RUNNER_ROOT RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22d" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?

@@ -3010,11 +3010,17 @@ def provision(target_count: int, repo: str = "", root: str = "") -> str:
         env=child_env,
     )
     if rc == 2:
-        # `install-ci-runner-x64.sh` publishes 2 as "GUARD REFUSED — nothing was attempted". That
-        # is its own headroom guard declining, not this tool failing: reported as a REFUSAL in its
-        # own words, so a scheduled pass does not cry failure every 10 minutes over a deliberate
+        # `install-ci-runner-x64.sh` publishes 2 as "A POOL GUARD REFUSED — nothing was attempted".
+        # That is the headroom/gate verdict declining, not this tool failing: reported as a REFUSAL in
+        # its own words, so a scheduled pass does not cry failure every 10 minutes over a deliberate
         # no — and so the two predicates that disagree (its 2 GB+4 GB reserve vs this file's
         # measured 1.5 GB+2 GB, #9672) stay visible instead of being averaged away.
+        # ⛔ AND THE ADAPTER'S **OWN** CONFIGURATION ERRORS ARE DELIBERATELY NOT 2 (they are 6, which
+        # falls through to `ActionFailed` below): a bad `--count`, an unreadable pool tool, or
+        # disagreeing root/base/repo seams are not an answer about capacity, and recording one as a
+        # refusal sent a human to audit capacity arithmetic (`GUARD CONFLICT … a human must decide
+        # which number is wrong`) over what was an environment mistake — or, on a box whose disk arm
+        # also declined, exited 0 and reported a permanently un-provisionable box as clean.
         raise ProvisionerRefused(f"rc=2 {out[-300:]}")
     if rc != 0:
         raise ActionFailed(f"provisioner --count {target_count} rc={rc}: {out[-400:]}")

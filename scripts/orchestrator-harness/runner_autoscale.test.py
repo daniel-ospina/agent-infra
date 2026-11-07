@@ -379,7 +379,8 @@ exit 0
 """
 
 PROVISIONER_STUB = r"""#!/usr/bin/env bash
-# `install-ci-runner-x64.sh`'s contract: 0 = did it, 2 = ITS OWN GUARD REFUSED, anything else = fail.
+# `install-ci-runner-x64.sh`'s contract: 0 = did it, 2 = A POOL GUARD REFUSED (an answer),
+# 6 = THE ADAPTER'S OWN config error (a failure), anything else = fail.
 FIX="__FIX__"
 printf '%s\n' "$*" >> "$FIX/provisioner-calls.log"
 # ⛔ A SEPARATE LOG, NEVER AN EXTRA LINE IN `provisioner-calls.log`: that file is asserted
@@ -2331,6 +2332,59 @@ def t25_guard_conflict():
             check(
                 "blocked" not in record2["verdict"],
                 "a refusal must never read as a failure",
+            )
+        finally:
+            box.destroy()
+
+
+@test("T59 the adapter's OWN config error is an ACTION FAILURE — never a capacity answer")
+def t59_adapter_config_error_is_a_failure():
+    """`tools/install-ci-runner-x64.sh` spends exit 2 on a POOL gate refusal, which is the caller's
+    "capacity answer" channel: it is recorded as `provisioner-refused` and the pass **exits 0**. The
+    adapter used to spend 2 on its OWN configuration errors too (bad `--count`, unreadable pool tool,
+    disagreeing root/base/repo seams). Two measured consequences, both recorded:
+
+      · with two disagreeing repo seams the caller wrote `GUARD CONFLICT … the two guards DISAGREE
+        about whether capacity can be added here, and a human must decide which number is wrong
+        (#9672)` — a capacity-arithmetic page for what was an ENVIRONMENT mistake; and
+      · on a box whose DISK arm also declined, the same error became `provisioner-refused`, whose
+        exit code is 0 — a permanently un-provisionable box reporting a CLEAN pass.
+
+    The adapter now exits 6 for those, so this arm pins that 6 reaches `problems`/`actions` and is
+    never re-labelled as a refusal or a conflict. It is discriminating in the JOIN, not in this file:
+    the adapter side (`tests/install-ci-runner-x64/run.sh`) is what changed 2 → 6."""
+    with Env():
+        box = Box("config-error")
+        try:
+            box.install("gh-runner-x64", "r-1")
+            box.alive([box.installs["gh-runner-x64"]])
+            box.pool([("r-1", "online", False, ["self-hosted-x64", ra.FALLBACK_LABEL])])
+            box.disk(36_864)  # room for one more by THIS tool's arm — so no legitimate refusal exists
+            box.footprint({"gh-runner-x64": 2000})
+            box.provisioner(
+                rc=6,
+                out="cannot-measure why=repo-disagreement RUNNER_POOL_REPO=o/third "
+                "RUNNER_AUTOSCALE_REPO=o/other",
+            )
+            record = converge(box, nproc="8", want=3)
+            check(
+                record["verdict"] == "action-failed",
+                f"a configuration error is a FAILURE, not an answer: {record['verdict']}",
+            )
+            check(
+                record.get("problem_kind") not in ("refusal", "guard-conflict"),
+                "…and it must not be re-labelled as a capacity refusal or a guard conflict: "
+                f"{record.get('problem_kind')!r}",
+            )
+            check(
+                any("repo-disagreement" in p for p in record["problems"]),
+                f"the adapter's own words must reach `problems`: {record['problems']}",
+            )
+            code, out = cli(box, "--want", "3")
+            check(
+                code == 3,
+                "the shipped pass must exit non-zero for it (3 = action-failed) — exit 0 here is "
+                f"the silent green this case exists for, got {code}: {out}",
             )
         finally:
             box.destroy()
@@ -5540,8 +5594,19 @@ def t58_provisioner_receives_repo_and_root():
     (repo-agnostic) counted them, so the pass reported `converged`, exit 0, with zero capacity for this
     repo; on a `--root X` box the install landed where `discover()` never looks and the pass recorded
     `NO install appeared`. Both are FALSE PASSes, so both facts are asserted where the child can see
-    them — and asserted EMPTY on a plain call, because a value that only arrives when someone happens to
-    have it in their shell is not a seam (agent-infra#3469 review P2)."""
+    them — plus the third fact that keeps the JOIN a join: the caller must NOT speak the pool tool's
+    private variable name, so `RUNNER_POOL_REPO` is asserted EMPTY on a call that DOES carry a repo.
+
+    ⛔ AN EARLIER VERSION OF THIS DOCSTRING PROMISED ONE MORE ARM — "and asserted EMPTY on a plain
+    call" — that the body never had. A fresh-context reviewer (round 13) read it as a missing case
+    and asked for a `ra.provision(2)` with no knobs, asserting BOTH variables empty. That arm would
+    assert the OPPOSITE OF THE DESIGN and was FALSIFIED here rather than adopted: an ambient
+    `RUNNER_AUTOSCALE_REPO`/`RUNNER_AUTOSCALE_RUNNER_ROOT` is this tool's OWN documented seam
+    (`--repo`/`--root` default from them, the header documents both), and `provision()` copying
+    `os.environ` into the child is exactly how a scheduled unit's `Environment=` reaches the adapter.
+    Under a `Box` the fixture env SETS `RUNNER_AUTOSCALE_RUNNER_ROOT`, so the proposed arm fails by
+    construction — measured `got '/tmp/runnerauto-join-env-plain-…/root'`. The sentence is corrected
+    here so the next reader does not re-derive the same false finding (agent-infra#3469 review P2)."""
     with Env():
         for seam in ("RUNNER_AUTOSCALE_REPO", "RUNNER_AUTOSCALE_RUNNER_ROOT", "RUNNER_POOL_REPO"):
             os.environ.pop(seam, None)
