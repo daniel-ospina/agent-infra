@@ -87,7 +87,7 @@ and *is* automated is `pi-reap-worktrees.sh` rule 4 (a checkout whose PR `MERGED
 at that exact head, exempt from the 7-day floor) — and it is one of the scheduled
 passes above, not a merge hook.
 
-Adding a fourth copy of a delete rule would have been the easy path and is
+Adding another copy of a delete rule would have been the easy path and is
 explicitly refused: `disk-reaper.sh` contains **no `rm` on a filesystem path** (its
 only recursive delete is its own lock), and the test suite pins that
 (`disk-reaper.test.sh` T6).
