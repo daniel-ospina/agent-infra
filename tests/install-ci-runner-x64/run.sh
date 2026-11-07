@@ -295,6 +295,12 @@ case "$out" in
   *) ok "a disagreement about occupancy never claims a provision";;
 esac
 rm -f "$W/.runner"
+# ⛔ ITS OWN FIXTURE, BECAUSE THE CASE ABOVE ALREADY PINNED `$out`: a second `case` over the SAME unchanged
+# string is a strict subset of the first and can never produce its own `bad` — it reported `ok`
+# unconditionally, so a reader counting it as evidence for the wedged slot was over-reading the suite.
+# The wedge is exercised again here, on its own run, with the link removed first.
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 8 --fallback auto 2>&1); rc=$?
+check "a wedged slot (link cleared) is still a refusal, not a claim of provisioning" 2 "$rc" "existed before this pass without a .runner registration" "$out"
 case "$out" in
   *added=1*) bad "a wedged slot never claims to have provisioned";;
   *) ok "a wedged slot never claims to have provisioned";;
@@ -358,7 +364,12 @@ check "…and the pool child is told THAT repo" 0 0 "RUNNER_POOL_REPO=o/other" "
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
       env -u RUNNER_ROOT -u RUNNER_POOL_REPO -u RUNNER_AUTOSCALE_REPO RUNNER_AUTOSCALE_RUNNER_ROOT="$TMP/r22b" bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
 check "a call with NO caller repo still provisions on the pool tool's own default" 0 "$rc" "" "$out"
-check "…and the adapter invents no repo of its own" 0 0 "RUNNER_POOL_REPO=" "$(cat "$TMP/pool-env.log")"
+# ⛔ ANCHORED ON THE WHOLE LINE. `check` uses `grep -qF`, and `fake_pool` ALWAYS writes the literal
+# prefix `RUNNER_POOL_REPO=` — so a substring check matches an empty value AND every non-empty one, and
+# "the adapter invents a repo of its own" would pass green. Measured: an adapter mutant that exports
+# `RUNNER_POOL_REPO=o/invented` when no caller repo is set kept the suite at pass=49 fail=0.
+_grep_repo=$(grep -c '^RUNNER_POOL_REPO=$' "$TMP/pool-env.log" || true)
+check "…and the adapter invents no repo of its own (whole-line, empty value)" 1 "$_grep_repo"
 # ⛔ AND TWO DECLARED REPOS THAT DISAGREE ARE REFUSED, NOT ARBITRATED — the same direction the `RUNNER_ROOT`
 # guard above takes, for the same reason: picking a side is how the false PASS gets written.
 out=$(RUNNER_AUTOSCALE_REPO=o/other RUNNER_POOL_REPO=o/third CI_RUNNER_POOL_TOOL=$(fake_pool 0) \
