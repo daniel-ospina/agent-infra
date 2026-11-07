@@ -506,7 +506,10 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
         # treated as an absence claim, which is the fail-closed direction.
         after="${nval#*-<}"
         inner="${after%%>*}"
-        case "$after" in *">"*) tail="${after#*>}" ;; *) tail="" ;; esac
+        # `after` always contains a `>` here — the arm was entered on `head`, which already held one, and
+        # `head` is a prefix of `nval` — so this needs no fallback branch (review of #3621, cycle 9: the
+        # `*) tail=""` arm was unreachable, and saying so is cheaper than a reader re-deriving it).
+        tail="${after#*>}"
         num="$(printf '%s' "$inner" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
         case "$head" in
           # ── WHAT THIS ARM DECIDES, ONCE (review of #3621, cycle 6: an earlier draft of this comment said
@@ -518,13 +521,14 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
           #    refuse its own advice). The coverage limit is therefore "no digit inside the key's first
           #    bracket", not "no number anywhere in the value" — a number OUTSIDE the bracket (`issue-<x>
           #    4242`) leaves the key unparsable and the value is treated as the slot.
-          # 3. The number is joined to the tail WITH A SEPARATOR. Measured, so the next reader does not have
-          #    to re-derive it (review of #3621, cycles 7-8): reverting the SEPARATOR alone changes nothing
-          #    (0 differences over 636 observations). Reverting `tail` to the cycle-4 `"${nval#*>"}"` is NOT
-          #    inert — but only because it discards the claim for an ARROW-LESS bracket key, which is a
-          #    different bug (`tail` now follows the bracket close, cycle 8). For every value whose claim
-          #    follows an arrow, the two lines together are what H61 pins: either alone leaves the key read
-          #    as `4242` and H61 green, and only BOTH reconstruct `42424242` and admit it.
+          # 3. The number is joined to the tail WITH A SEPARATOR, and it IS load-bearing at this head
+          #    (review of #3621, cycle 9 corrected this paragraph; cycle 8's "the separator alone changes
+          #    nothing" was written against the OLD tail derivation and is false now): `tail` keeps
+          #    `4242> -> none (…)`, so without the separator the key really is `42424242` and H61 reddens
+          #    (measured: base 80 → separator-revert 0). The two lines are a PAIR — the same revert of
+          #    `tail` alone is inert here (`${nval#*>}` ≡ `${after#*>}`, since `after` always holds the
+          #    bracket close), and the shape that motivates both is the cycle-4/5 one, where `tail` was
+          #    derived from `head` and threw away an ARROW-LESS claim (H62 pins that).
           issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
           *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
