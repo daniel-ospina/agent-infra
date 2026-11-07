@@ -3157,8 +3157,9 @@ cascade_main_probe() {
   # would dispatch and level 1 zeroes. What level 1 DOES when it holds is an OWNER DECISION (dispatch
   # the main repair, or narrow this input to what the merge rail itself measures); neither is
   # implemented here, and the documented state — with the evidence — is
-  # `docs/ops/self-healing-contract.md` §6, "LEVEL 1 CAN HOLD WITHOUT AN ACTOR". `test-cascade.sh`
-  # pins that state rather than pre-empting the decision.
+  # `docs/ops/self-healing-contract.md` §6, "OPEN OWNER DECISION — A LEVEL HOLDS ON A COUNT, NOT ON
+  # ACTIONABILITY, AND LEVEL 1 HAS NO ACTOR AT ALL". `test-cascade.sh` pins that state rather than
+  # pre-empting the decision.
   # Payload: one TSV row per ATTEMPT via `--jq` (that is what makes `--paginate` concatenable — `gh`
   # emits one JSON object PER PAGE, and a naive `json.load` reads only the first).
   # ⛔ `gh` IS READ FIRST, INTO A VARIABLE, SO ITS FAILURE CANNOT READ AS GREEN. Piping `gh` straight
@@ -3302,8 +3303,11 @@ cascade_level() {
     esac
   done
   CASCADE_N_UNOWNED=$n_u; CASCADE_N_MERGE=$n_m; CASCADE_N_FIX=$n_f; CASCADE_N_REVIEW=$n_r
-  # ⛔ THE FILL ORDER, IN ONE PLACE. The first level with actionable work wins and nothing below it
-  # is consulted — that is what makes this a cascade and not four independent gates.
+  # ⛔ THE FILL ORDER, IN ONE PLACE. The first level with a NON-ZERO COUNT wins and nothing below it
+  # is consulted — that is what makes this a cascade and not four independent gates. A COUNT, not
+  # "actionable work" (review round 8, P2): `state/prclass.tsv` carries CHECK STATE only, so a level
+  # holds whether or not a lane could spend the room. The doc discloses the gap; this header must not
+  # restate a criterion the code does not implement.
   if   [ "$n_m" -gt 0 ]; then CASCADE_LEVEL=2
   elif [ "$n_f" -gt 0 ]; then CASCADE_LEVEL=3
   elif [ "$n_r" -gt 0 ]; then CASCADE_LEVEL=4

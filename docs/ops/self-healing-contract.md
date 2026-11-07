@@ -1016,8 +1016,9 @@ still where the next cut should start.
     make a level with work stop withholding the room, and `test-cascade.sh` now pins the pole (level 5
     only at zero un-owned PRs) so this is read as measurement, not as a promise.
   - **⛔ OPEN OWNER DECISION — A LEVEL HOLDS ON A COUNT, NOT ON ACTIONABILITY, AND LEVEL 1 HAS NO
-    ACTOR AT ALL.** `cascade_level`'s own header says "the first level with ACTIONABLE work wins", but
-    the classification is a check-state count (`state/prclass.tsv` carries check state only — no
+    ACTOR AT ALL.** The header of `cascade_level` now says what it measures — "the first level with a
+    NON-ZERO COUNT wins" — and that is the gap named here: a COUNT is not actionability, and the
+    classification is a check-state count (`state/prclass.tsv` carries check state only — no
     mergeability, no review state), so a level holds whether or not a lane could spend the room. Two
     measured consequences, both pinned in `test-cascade.sh`:
     - A GREEN-but-unreviewed PR counts as `MERGE` work even though the rail will not merge it, so
