@@ -426,24 +426,40 @@ primary_clone_root() {
     return 1
 }
 
-# primary_clone_on_lane_branch <dir> — prints the branch name when <dir> is a primary clone checked out on a
-# branch that is NOT the clone's default. Empty output + rc 1 when it is on the default (or detached).
+# primary_clone_on_lane_branch <dir> — prints a description when <dir> is a primary clone whose HEAD holds
+# UNMERGED work; empty + rc 1 when its HEAD is already contained in the clone's default branch (identical
+# durability) or when there is nothing to compare it against.
 # ⛔ BEING A CLONE IS NOT BEING MERGED (cycle-6 P2, MEASURED). `primary_clone_root` is git's main-vs-linked
 # arithmetic only — it never asks the branch question that `linked_worktree_root` applies to linked
 # worktrees — so a lane that isolates by CLONING instead of `git worktree add` was admitted under a transient
 # root, and `cloud-cell-bringup.sh` injects `AGENT_INFRA_PATH=$LAYER_ROOT` itself, so the declaration could be
-# the caller's own clone. Reproduced: `/tmp/<fixture>/lane-clone` on `master`-less `lane/x` with
-# `AGENT_INFRA_PATH` naming it rendered an ExecStart into it, rc=0. A clone at the DEFAULT branch is a
-# deployment (`/tmp/cell-ai` on `main` must keep working); a clone on any other branch is unmerged work a
-# lane removes, which is the rule this guard already states in words for every other shape.
+# the caller's own clone.
+# ⛔ AND THE CONDITION IS ANCESTRY, NOT A BRANCH NAME (cycle-7 P2, MEASURED — a FALSE BLOCK). Grading the
+# NAME refused a clone left on `chore/x` whose tip is already contained in `origin/main` (durability identical
+# to `main`, and bring-up would then die at `check_controller_service`), while still admitting `main` with
+# unmerged local commits. When a default ref resolves, the question asked is the one that matters — is HEAD
+# contained in it (`merge-base --is-ancestor`) — which also settles the detached case correctly: a clone
+# detached at a merged commit is admitted, one detached at a PR head is refused. The NAME test remains only
+# as the fallback when no default ref resolves (a fixture clone with no `origin`, which is how every §P7 arm
+# builds one).
 primary_clone_on_lane_branch() {
-    local b def
-    b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || return 1
-    [ -n "$b" ] || return 1                     # detached: no branch to be unmerged at
-    case "$b" in main|master) return 1 ;; esac
+    local b def ref
+    b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || b=""
     def="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || def=""
     def="${def#origin/}"
-    [ -n "$def" ] && [ "$b" = "$def" ] && return 1
+    if [ -n "$def" ]; then
+        ref="refs/remotes/origin/$def"
+        if "${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --verify -q "$ref" >/dev/null 2>&1; then
+            "${GIT_SCRUB[@]}" git -C "${1:-}" merge-base --is-ancestor HEAD "$ref" 2>/dev/null && return 1
+            printf '%s\n' "${b:-a DETACHED HEAD}"
+            return 0
+        fi
+    fi
+    # No default ref to compare against. A DETACHED clone is admitted here and that is a NAMED RESIDUAL: with
+    # no default ref there is nothing to prove it against, and refusing every detached clone would false-block
+    # a cell pinned at a commit. See docs/ops/controller-service.md.
+    [ -n "$b" ] || return 1
+    case "$b" in main|master) return 1 ;; esac
     printf '%s\n' "$b"
     return 0
 }
@@ -571,7 +587,7 @@ scratch_supervisor_reason() {
         # ⛔ A CLONE ON AN UNMERGED BRANCH IS A LANE CHECKOUT (cycle-6 P2, MEASURED — see the helper). This is
         # the one shape the branch rule was not applied to, and the caller can make the declaration itself.
         if b="$(primary_clone_on_lane_branch "$d")" && [ -n "$b" ]; then
-            printf 'it is under %s, and the root that declares it is a PRIMARY git clone checked out on the BRANCH %s — a clone at the default branch is a deployment, a clone on any other branch is unmerged work a lane removes (a lane that isolates by cloning instead of `git worktree add` lands here), and being a clone is not being merged' \
+            printf 'it is under %s, and the root that declares it is a PRIMARY git clone whose HEAD (%s) is NOT contained in that clone'\''s default branch — a clone whose HEAD is merged (or on the default branch) is a deployment, but a clone holding unmerged work is what a lane that isolates by cloning instead of `git worktree add` leaves behind, and being a clone is not being merged' \
                 "$root" "$b"
             return 0
         fi

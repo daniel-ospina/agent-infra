@@ -2927,12 +2927,34 @@ if [ -d "$PG_CLONE/.git" ]; then
       && bad "§P7: a PRIMARY clone checked out on the branch lane/x was ARMED — being a clone is not being merged: $PG_B2_OUT" \
       || ok '§P7: a PRIMARY clone checked out on a LANE branch is REFUSED (being a clone is not being merged)'
     case "$PG_B2_OUT" in
-      *'BRANCH lane/x'*) ok '§P7: and the refusal names the unmerged branch it found' ;;
+      *'unmerged'*|*'lane/x'*) ok '§P7: and the refusal names the unmerged branch it found' ;;
       *) bad "§P7: the lane-branch clone refusal does not name the branch — $PG_B2_OUT" ;;
     esac
     rm -f "$PG/units/eldato-orchestrator.service"
   else
     bad '§P7: the fixture could not build the lane-branch clone, so that arm did NOT run'
+  fi
+  # (b3) A CLONE LEFT ON A BRANCH WHOSE TIP IS ALREADY MERGED IS NOT UNMERGED WORK (cycle-7 P2, MEASURED — the
+  # FALSE BLOCK the first version of (b2) introduced). The condition is ANCESTRY, not a branch NAME: this clone
+  # sits on `chore/x` but its tip is contained in `origin/main`, so its durability is `main`'s and it must
+  # INSTALL. Grading the name refused it, and bring-up would then die at `check_controller_service`.
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_MERGED="$T/merged-clone"; mkdir -p "$PG_MERGED/scripts"
+  cp "$SUP" "$PG_MERGED/scripts/cloud-cell-supervisor.sh"
+  if git init -q "$PG_MERGED" 2>/dev/null \
+     && git -C "$PG_MERGED" add -A >/dev/null 2>&1 \
+     && git -C "$PG_MERGED" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1 \
+     && git -C "$PG_MERGED" update-ref refs/remotes/origin/main HEAD 2>/dev/null \
+     && git -C "$PG_MERGED" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main 2>/dev/null \
+     && git -C "$PG_MERGED" checkout -q -b chore/x >/dev/null 2>&1; then
+    PG_B3_RC=0
+    PG_B3_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_MERGED/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_MERGED" inst pg --install 2>&1)" || PG_B3_RC=$?
+    grep -qxF "ExecStart=/bin/bash $PG_MERGED/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+      && ok '§P7: a clone on a NON-DEFAULT branch whose tip IS merged into the default branch still installs (the condition is ancestry, not the name)' \
+      || bad "§P7: a clone at a merged commit was refused — that is a false block on a durable deployment: $PG_B3_OUT"
+    rm -f "$PG/units/eldato-orchestrator.service"
+  else
+    bad '§P7: the fixture could not build the merged-branch clone, so that arm did NOT run'
   fi
   # (c) a LINKED worktree of that same clone, under a DURABLE root and with a name no pattern matches
   rm -f "$PG/units/eldato-orchestrator.service"
