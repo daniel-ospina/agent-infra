@@ -222,6 +222,21 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
 ADMIN_MERGE_LOCK_ROOT="$TMP/rail-locks"
 export ADMIN_MERGE_LOCK_ROOT
 mkdir -p "$ADMIN_MERGE_LOCK_ROOT"
+# ⛔ THE SUITE MUST NOT INHERIT THE HARNESS'S ACTION-PROOF TOKEN EITHER (#3392 review 5, measured).
+# `admin-merge.sh`'s hold-proof at the ACTION site (#2867) runs whenever `CLAIM_ACTION_CLAIMS_SH` is
+# non-empty — it is the harness's own env, exported into every lane, orchestrator child and reviewer
+# on a fleet box. A fixture that inherits it enters that branch with no claim to present and the rail
+# correctly REFUSES (`reason=no-claim`), so on such a box 46 arms of this suite red out while the tree
+# is fine — measured here: 46 false reds with the harness env, 2057/2057 green with it cleared, and the
+# diff between the two runs is NOTHING (the rail's bytes are identical; the only variable is ambient
+# env). A real regression would then be indistinguishable from those 46, which is the false PASS this
+# suite exists to prevent — so the token is cleared, not left to the caller.
+# ⛔ NO ARM HERE TESTS THE HOLD-PROOF (`grep -c CLAIM_ACTION` over this file is 0 before this line), so
+# clearing it removes inheritance without removing a single assertion; a future arm that wants to
+# exercise the proof must SET the three variables itself, which is the only honest way to test it.
+# `unset` rather than `=`, matching `scripts/run-bash-shards.recap.test.sh` and
+# `tests/run-bash-shards-bound/run.sh` §0: the rail reads PRESENCE, so an empty value is not "absent".
+unset CLAIM_ACTION_CLAIMS_SH CLAIM_ACTION_HEAD_TOKEN CLAIM_ACTION_REPO
 checks=0
 failures=0
 # The two new windows default to "one observation, no waiting" for the WHOLE
