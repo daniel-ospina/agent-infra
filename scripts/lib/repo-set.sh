@@ -99,7 +99,14 @@
 # runs. Nothing in this file needs `-u`: every expansion is `${x:-}`-guarded.
 
 repo_set_file() {
-  printf '%s\n' "${REPO_SET_FILE:-$HOME/.config/orchestrator/repos.conf}"
+  # ⛔ `${HOME:-}` — THE GUARD THE HEADER PROMISES (round 32, P2). It was the ONE unguarded expansion
+  # in this file, and it broke the file's own contract: "every expansion is `${x:-}`-guarded". Measured
+  # with `env -u HOME`: `path` died with `HOME: unbound variable` (rc 1), and `check` — because the
+  # kill happens inside the `$(repo_set_file)` SUBSHELL — survived with an EMPTY path and reported
+  # `NO-REPO-SET —  does not exist`, i.e. code 3, which is exactly the code the wrapper DEGRADES on. A
+  # box that names two repos would grade one and be told to create a file at an empty path; 5 (broken)
+  # is the honest class, and `repo_set_parse` now returns it for "no home to resolve".
+  printf '%s\n' "${REPO_SET_FILE:-${HOME:-}/.config/orchestrator/repos.conf}"
 }
 
 # _rs_say <stream> <text...> — one prefixed line. Kept as one helper so every consumer's output is
@@ -426,6 +433,13 @@ repo_set_parse() {
       return 5
     fi
     if [ "$kind" = absent ] || { [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; }; then
+      # ⛔ "NO HOME TO RESOLVE" IS BROKEN (5), NOT ABSENT (3) (round 32, P2). With `HOME` unset the path
+      # above is EMPTY, and calling that "this machine has named no repo" degrades the wrapper on a box
+      # that may well have named several — the opposite of what code 3 means. Name it instead.
+      if [ -z "${REPO_SET_FILE:-}" ] && [ -z "${HOME:-}" ]; then
+        _rs_say 2 "repo-set: INVALID — HOME is unset or empty and REPO_SET_FILE names nothing, so the set path cannot be resolved; set REPO_SET_FILE=<absolute path>"
+        return 5
+      fi
       _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
       _rs_say 2 "repo-set:   Create it, one repo per line:"
       _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
