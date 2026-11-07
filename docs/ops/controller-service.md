@@ -108,11 +108,18 @@ one is admitted ONLY when it is the pin TREE this box records — the path in `$
 scratch checkout (`ai-drainer.sh`: `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with
 `worktree remove --force` when the lane ends), and that one lives under `$HOME`; **every** other detached
 worktree is refused. The pin tree corroborates itself: its directory basename must be a prefix of the
-commit it actually holds, so a scratch named with an unrelated commit id is refused. **Named residual:**
-`HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` are how a box relocates its pin, so an operator who deliberately
-declares a scratch as its own pin root can still arm it — this is an accident guard (`#2697` was an
-install from a lane worktree with nothing exported), not a boundary against an operator who declares the
-scratch deliberately, who can write the unit anyway. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
+commit it actually holds, so a scratch named with an unrelated commit id is refused. A **primary clone**
+under a transient root is admitted only when it is checked out on its **default** branch: a clone on any
+other branch is unmerged work a lane removes, so a lane that isolates by cloning instead of
+`git worktree add` is refused exactly like a linked worktree on a branch, while `/tmp/cell-ai` on `main`
+keeps installing.
+
+**Named residual:** the pin has three locators — `HARNESS_PIN_DIR`, `HARNESS_PIN_FILE`, and the record
+itself (`$CELL_HOME/.harness-path`) — and all three are how a real box relocates its pin, so a caller that
+deliberately declares a scratch as its own pin root (or writes a record naming one) can still arm it. This
+is an **accident guard** (`#2697` was an install from a lane worktree with nothing exported), not a
+boundary against an operator who declares the scratch deliberately, who can write the unit anyway. The
+record is box state, not a credential. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
 untouched; and **no declaration launders a lane checkout**: a caller that names its own worktree as
 `AGENT_INFRA_PATH` does not get to admit it. When git cannot identify the checkout at all (a `.git` entry
 it refuses to read — dubious ownership, an unreadable directory), the answer is **cannot prove**, and it
