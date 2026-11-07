@@ -135,8 +135,9 @@ _rs_nearest_existing_ancestor() {
 
 # _rs_py_resolve — the interpreter, resolved the same way the wrapper resolves it (`command -v python3`,
 # then the two absolute paths launchd needs when it has no PATH of its own). ⛔ ONE HOME FOR THAT ORDER
-# IN THIS FILE — `_rs_doctor_available` and `_rs_with_doctor` both call this; neither carries its own
-# loop (round 15, P2: `_rs_with_doctor` did, which made this doc's "one home" claim false).
+# IN THIS FILE — THREE callers, `_rs_doctor_available`, `_rs_stat_kind` and `_rs_with_doctor`; none
+# carries its own loop (round 15, P2: `_rs_with_doctor` did; round 16, P2: this line then named only two
+# and omitted `_rs_stat_kind`).
 # ⛔ THE WRAPPER CARRIES THE SAME ORDER IN ITS OWN LINES, AND THAT IS AN ORDERING FACT, NOT A SECOND
 # AUTHORITY. `scripts/pr-doctor-machine.sh` resolves `$PY` BEFORE it sources this file (its loop is at
 # `:95-103`, the source is `:110`) — it has to, because it refuses with its own message when no
@@ -144,9 +145,13 @@ _rs_nearest_existing_ancestor() {
 # call this function at that point, and it resolves the same three candidates in the same order in its
 # own eleven lines (`:93-103`). After the source it never needs to: everything that wants an
 # interpreter goes through `_rs_doctor_available` / `_rs_with_doctor`, which call this one.
-# ⛔ AND THE WRAPPER SOURCES THIS FILE, DELIBERATELY — because it needs the FUNCTIONS below as values
-# (`repo_set_file`, `repo_set_doctor_repos`, `_rs_strip`, `_rs_slug_ok`, `_rs_origin_slug`,
-# `_rs_normalize_slug`), not merely a verdict. ⛔ NOT because a subprocess would lose the exit code: the
+# ⛔ AND THE WRAPPER SOURCES THIS FILE, DELIBERATELY — because it needs the reader's FUNCTIONS AND
+# THEIR VALUES (the set path, the rendered entry list, the trim, the origin proof, the slug
+# normalisation), not merely a verdict. ⛔ AND THE LIST IS DELIBERATELY NOT ENUMERATED HERE: an earlier
+# revision named them and included one the wrapper never calls (`_rs_slug_ok`, whose verdict reaches it
+# only inside `repo_set_parse`) — the fifth comment in this PR to describe code that is not there. The
+# authority is `grep -n '\\. \"\$READER\"' scripts/pr-doctor-machine.sh` plus the calls that follow it,
+# never a prose list.  ⛔ NOT because a subprocess would lose the exit code: the
 # executed path returns `repo_set_check`'s code verbatim, so `bash "$READER" check` answers 3/4/5 for
 # absent/empty/malformed exactly as the sourced form does (measured, and pinned by this suite's own
 # `run_reader_rc`, which IS that subprocess). A comment claiming otherwise — in either file — describes
