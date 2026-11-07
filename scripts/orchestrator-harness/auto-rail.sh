@@ -927,9 +927,16 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # of it with nobody's help) and FALSE of the CAP case, which is exactly the case this basis exists for:
   # `review_attempts` returns the cap on its unreadable path WITHOUT computing `cut` or consulting the clock,
   # so no window exists to roll — the ledger stays unreadable on every future pass and waiting changes
-  # nothing. `review-retries-exhausted` is deliberately NOT in the positional family (nothing supersedes it),
-  # so a "no action required" there is a PERMANENT false instruction on the operator's only visible surface.
-  # Same class as the round-2 defect this file already carries: a false claim on the PR that nothing corrects.
+  # nothing. So a "no action required" under this basis is a PERMANENT false instruction on the operator's
+  # only visible surface. Same class as the round-2 defect this file already carries: a false claim on the
+  # PR that nothing corrects.
+  # ⛔ AND THIS STATE IS POSITIONAL TOO (review round 8, P2, reproduced — see `publish_review_state`). It
+  # used to be presence-keyed on the premise that "nothing supersedes it", and that premise is false: the
+  # dispatch tail publishes `awaiting-review:<head>` after a retry that finished without a verdict, so a
+  # later re-exhaustion of the SAME head was silently suppressed for ever and the PR kept the newer
+  # "a reviewer is dispatched as soon as this repo has a free slot" claim — which nothing corrects —
+  # for the rest of the attempt window. Re-publishing is the correct direction: the cap-tail instructions
+  # below ("repair or remove that file" / "push a new head") are exactly what should win at that point.
   if [ "$basis" = cap ]; then
     _ratt_basis="its ATTEMPT LEDGER could not be read, so it is held fail-closed as if ${REVIEW_MAX_ATTEMPTS} dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count)"
     _ratt_tail="That is NOT a window that rolls by itself: the ledger file is present but UNREADABLE, so every pass reads the same fail-closed value and waiting changes nothing. Repair or remove that file, or push a new head — a new head is a new review."
@@ -974,10 +981,11 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # in-flight claim as the permanent last word; and both-positional WITH the in-flight publish before the
   # launch alternated two comments per pass on a broken path. The loop now publishes in-flight only for a
   # launch it PROVED started, so exactly one of the pair is published per real transition and positional
-  # converges: each transition adds one comment, a repeated no-op adds none. (The family has THREE
-  # members once `awaiting-review` carries a head — see below — so "newer than its partner" is computed
-  # against the newest of all of them, never against one.) Every other state keeps plain
-  # presence — nothing corrects it, so one marker IS the truth.
+  # converges: each transition adds one comment, a repeated no-op adds none. (The family has FOUR
+  # members once `awaiting-review` carries a head and `review-retries-exhausted` is included — see below —
+  # so "newer than its partner" is computed against the newest of all of them, never against one.)
+  # `review-found-issues`, `review-record-unbound` and the HEADLESS `awaiting-review` keep plain
+  # presence: nothing corrects those, so one marker IS the truth.
   # ⛔ AND `awaiting-review` JOINS THAT FAMILY WHEN IT CARRIES A HEAD (review round 6, P2, measured): a
   # dispatch that finished WITHOUT a verdict corrects an in-flight marker by publishing it, and
   # presence-keyed it could only ever do that ONCE — a later `review-in-flight:H` (posted when the record
@@ -987,11 +995,11 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # says "no owner yet" about the PR, not about a revision.
   local _pos=0 _o _on _mine_last _other_last
   case "$state" in
-    review-in-flight|review-dispatch-failed) _pos=1 ;;
+    review-in-flight|review-dispatch-failed|review-retries-exhausted) _pos=1 ;;
     awaiting-review) [ -n "$head" ] && _pos=1 ;;
   esac
   if [ "$_pos" = 1 ]; then
-    # ⛔ THE FAMILY HAS THREE MEMBERS, SO "newer than the ONE other state" IS WRONG (review round 7, P2,
+    # ⛔ THE FAMILY HAS FOUR MEMBERS, SO "newer than the ONE other state" IS WRONG (review round 7, P2,
     # measured). `awaiting-review:<head>` joined at the top of this function, and comparing each state
     # against a single partner let a NEWER awaiting-review suppress both halves of the pair for ever: with
     # `refused` fast-finish posting awaiting-review and the record removed on the next rolled-back launch,
@@ -1001,8 +1009,12 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
     # happened, and (dispatch-failed, awaiting-review:H, dispatch-failed) left ONE dispatch-failed notice
     # while the reviewer path stayed broken — the false claim standing indefinitely, which is the exact
     # reason this family exists. Compare against the NEWEST of the other members instead.
+    # ⛔ `review-retries-exhausted` IS ONE OF THEM (review round 8, P2, reproduced): leaving it out let a
+    # NEWER EXHAUSTED notice be ignored while publishing `awaiting-review`, so a stale "dispatched as soon
+    # as this repo has a free slot" could be re-posted over an exhausted head — the same false-claim
+    # direction, one member over. The family is compared as a SET or it is not compared at all.
     _other_last=0
-    for _o in review-in-flight review-dispatch-failed awaiting-review; do
+    for _o in review-in-flight review-dispatch-failed awaiting-review review-retries-exhausted; do
       [ "$_o" = "$state" ] && continue
       _on=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_o:$head -->" 'index($0,t){n=NR} END{print n+0}')
       [ "${_on:-0}" -gt "$_other_last" ] && _other_last=$_on

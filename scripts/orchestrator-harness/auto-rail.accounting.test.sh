@@ -1459,6 +1459,51 @@ publish_review_state acme/widget 42 review-record-unbound "$_H2"
   || bad "a NEW head must be able to publish its own EXHAUSTED marker (got $(_marker_count 'review-retries-exhausted'), want 2) — head-keyed state is what stops a marker outliving the revision it describes"
 [ "$(_marker_count 'review-record-unbound')" = 2 ] \
   || bad "a NEW head must be able to publish its own unbound-record marker (got $(_marker_count 'review-record-unbound'), want 2)"
+# ⛔ A HEAD THAT IS EXHAUSTED, RETRIED, AND EXHAUSTED AGAIN MUST BE ABLE TO SAY SO (review round 8, P2,
+# reproduced). `review-retries-exhausted` was presence-keyed on the premise that "nothing supersedes it",
+# and the shipped dispatch tail falsifies that premise: a retry that starts and finishes WITHOUT a verdict
+# publishes `awaiting-review:<head>`, so the head's own older EXHAUSTED tag suppressed every later
+# re-publish — for ever — and the PR kept the NEWER "a reviewer is dispatched as soon as this repo has a
+# free slot" claim, which nothing corrects, for the rest of the attempt window. Driven through the shipped
+# `publish_review_state` (nothing here asserts the rule; it measures the comments that come out).
+# NON-VACUOUS BY CONSTRUCTION: presence-keyed, the third call returns early and the count stays 1.
+_H3=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+_marker_count_head() { grep -cF -- "<!-- auto-rail-review:$1:$2 -->" "$POSTED" 2>/dev/null || true; }
+_last_marker() { grep -o 'auto-rail-review:[a-z-]*' "$POSTED" | tail -1; }
+publish_review_state acme/widget 42 review-retries-exhausted "$_H3"
+publish_review_state acme/widget 42 awaiting-review "$_H3"
+[ "$(_marker_count_head review-retries-exhausted "$_H3")" = 1 ] \
+  || bad "the first EXHAUSTED notice must post once (got $(_marker_count_head review-retries-exhausted "$_H3"))"
+[ "$(_marker_count_head awaiting-review "$_H3")" = 1 ] \
+  || bad "a verdict-less retry after exhaustion must still be able to publish awaiting-review (got $(_marker_count_head awaiting-review "$_H3")) — it is a REAL transition, so the corrective direction must not be blocked"
+publish_review_state acme/widget 42 review-retries-exhausted "$_H3"
+[ "$(_marker_count_head review-retries-exhausted "$_H3")" = 2 ] \
+  || bad "a head exhausted AGAIN after a verdict-less retry must be able to say so (got $(_marker_count_head review-retries-exhausted "$_H3"), want 2) — presence-keyed it was suppressed for ever by its own older tag, leaving the newer 'a reviewer is dispatched as soon as this repo has a free slot' claim standing on a head that is buying no further reviews and that nothing corrects"
+[ "$(_last_marker)" = 'auto-rail-review:review-retries-exhausted' ] \
+  || bad "the RE-EXHAUSTED notice must be the PR's NEWEST marker (got '$(_last_marker)') — positional repair is only worth anything if the corrected state is the one an operator reads last"
+# …AND IT STILL CONVERGES: a repeat in the same state adds nothing (the property presence-keying was
+# chosen for is kept, so the fix cannot reintroduce a per-pass comment).
+publish_review_state acme/widget 42 review-retries-exhausted "$_H3"
+[ "$(_marker_count_head review-retries-exhausted "$_H3")" = 2 ] \
+  || bad "re-running in the RE-EXHAUSTED state must add nothing (got $(_marker_count_head review-retries-exhausted "$_H3"), want 2) — a positional family that also re-posts its own newest marker is a per-pass duplicate"
+# ⛔ AND AN EXHAUSTED NOTICE IS ONE OF THE STATES THE OTHERS CORRECT AGAINST (review round 8, P2,
+# reproduced). Leaving `review-retries-exhausted` OUT of the compared set makes every OTHER member compare
+# only against its old partners: a re-reached `review-in-flight` whose own tag is already newer than the
+# in-flight/dispatch-failed/awaiting members but OLDER than a newer EXHAUSTED notice is then SUPPRESSED —
+# and the PR keeps "auto-rail is not dispatching another review at this revision" as its last word while a
+# reviewer is in fact running, which is the false-claim direction this family exists to remove. The family
+# is compared as a SET or it is not compared at all. NON-VACUOUS: drop EXHAUSTED from that `for` list and
+# the third call below posts nothing.
+_H4=cccccccccccccccccccccccccccccccccccccccc
+publish_review_state acme/widget 42 review-in-flight "$_H4"
+publish_review_state acme/widget 42 review-retries-exhausted "$_H4"
+[ "$(_last_marker)" = 'auto-rail-review:review-retries-exhausted' ] \
+  || bad "the EXHAUSTED notice must be able to supersede an older in-flight claim (got '$(_last_marker)') — otherwise a spent head keeps reading as 'review in flight' for ever"
+publish_review_state acme/widget 42 review-in-flight "$_H4"
+[ "$(_marker_count_head review-in-flight "$_H4")" = 2 ] \
+  || bad "a dispatch reached AGAIN after exhaustion must be able to say 'review in flight' over it (got $(_marker_count_head review-in-flight "$_H4"), want 2) — compared only against the pair it used to belong to, its own older tag already outranks them and the re-post is suppressed, leaving EXHAUSTED's 'not dispatching another review at this revision' as the PR's last word while a reviewer runs"
+[ "$(_last_marker)" = 'auto-rail-review:review-in-flight' ] \
+  || bad "the re-reached in-flight claim must be the NEWEST marker (got '$(_last_marker)') — a correction that is not the last thing an operator reads has not corrected anything"
 # ⛔ A REVIEWER THAT DIES AT ONCE STILL LEAVES AN OUTCOME. `bash /nonexistent` exits 127; without the
 # unconditional exit line the state would be `pending` for ever and the head would never be retried.
 _r5="$_rdir/r5.out"; run_review /nonexistent/reviewer.sh 42 acme/widget "$_r5"
@@ -1631,8 +1676,10 @@ if chmod 000 "$_UL2" 2>/dev/null && [ ! -r "$_UL2" ]; then
   # environmental cause … needs no action at all". That holds only for a COUNTED window (a clock ages the head
   # out of it with nobody's help). In the CAP case it is false BY CONSTRUCTION: `review_attempts` returns the
   # cap on its unreadable path without computing `cut` or consulting the clock, so no window exists to roll and
-  # the ledger never becomes readable by waiting — and `review-retries-exhausted` is deliberately NOT in the
-  # positional family, so nothing supersedes the marker. The instruction is therefore PERMANENT, on the only
+  # the ledger never becomes readable by waiting — and for the rest of the attempt window nothing corrects that
+  # instruction. (The marker IS positional now, which is what lets a RE-exhaustion win its own head back; it
+  # does not repair this case, because the basis is not part of the tag — see the note in
+  # `publish_review_state`. The point here stands either way: the tail is PERMANENT, on the only
   # surface an operator reads, about a head that will never be reviewed again. Same class as the round-2
   # defect this whole step exists to close (a false claim on the PR that nothing corrects).
   case "$(sed -n "$(( _b0 + 1 )),\$p" "$POSTED")" in
