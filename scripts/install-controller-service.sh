@@ -56,17 +56,21 @@ fi
 # Env seams (tests + unusual cells):
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
-#                          ⛔ REFUSED when it resolves into a lane worktree, or under a temporary root that no
-#                          deployment root declares (agent-infra#2697): a unit whose ExecStart a cleaning
-#                          removes retries a 127 for ever while every surface reads supervised. The refusal
-#                          names the durable alternatives (the farm, $AGENT_INFRA_PATH/scripts, the harness pin)
+#                          ⛔ REFUSED when it resolves into a lane worktree — any LINKED git worktree, whatever
+#                          the name, or the fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, …) — or under
+#                          a temporary root that no deployment root declares (agent-infra#2697): a unit whose
+#                          ExecStart a cleaning removes retries a 127 for ever while every surface reads
+#                          supervised. The refusal names the durable alternatives (the farm,
+#                          $AGENT_INFRA_PATH/scripts, the harness pin)
 #   ORCH_SUPERVISOR_PREFER a CALLER's preference (cloud-cell-bringup.sh names the layer checkout it just
 #                          installed). A non-durable one is SKIPPED with a loud note and the next candidate is
 #                          used — a preference never silently becomes the boot entry point, and it never
 #                          withholds the unit a durable candidate can supply
 #   AGENT_INFRA_PATH       the checkout this box declares as its deployment surface — one of the roots the
 #                          ExecStart refusal accepts under a temporary root (the cells keep their home under
-#                          /tmp, so "under /tmp" alone cannot be the rule)
+#                          /tmp, so "under /tmp" alone cannot be the rule). ⛔ IT DOES NOT LAUNDER A WORKTREE:
+#                          a linked worktree is refused before any declaration is consulted, and it finds
+#                          templates too (see TEMPLATES_DIR below)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
 #   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 60; a whole number, and one that fits
 #                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install).
@@ -171,13 +175,66 @@ help_text() {
 # `runner_autoscale.py` records against a blanket refusal ("refusing would make --install-unit unusable ON
 # THE BOXES IT EXISTS FOR"), and this guard must not reintroduce it. So: a path under a temporary root is
 # accepted only while it is inside a root THIS BOX DECLARES as its deployment surface (its cell home, its
-# home, the checkout `$AGENT_INFRA_PATH` names), and a lane worktree (`/.worktrees/`) is refused wherever it
-# lives, because that is the directory a lane removes when it ends.
+# home, the checkout `$AGENT_INFRA_PATH` names), and a lane worktree is refused wherever it lives, because
+# that is the directory a lane removes when it ends.
 # ⛔ THE TEMPORARY-ROOT LIST IS THE ONE `scripts/orchestrator-harness/runner_autoscale.py` ALREADY USES for
 # the same judgement (`TRANSIENT_UNIT_PREFIXES`). Two lists would drift, and the copy that stays un-updated
 # would be the one that admits the next measured shape. `$TMPDIR` joins it because a fixture — or a box with
 # a relocated temp — is under whatever it says.
 TRANSIENT_ROOTS="/tmp /var/tmp /run /dev/shm /var/folders /private/tmp /private/var/tmp /private/var/folders"
+
+# lane_scratch_shape <resolved path> — the lane-scratch SHAPE this path matches, or nothing.
+# ⛔ ONE LIST, MIRRORED FROM `scripts/install-repair-service.sh` (its `case "$SCRIPTS_DIR"` in `render()`,
+# which refuses these same shapes for the repair unit) — and the SUITE asserts the two lists are equal (§P6),
+# because a second hand-kept copy is exactly what drifts.
+lane_scratch_shape() {
+    case "${1:-}" in
+        */.worktrees/*)  printf '%s' '*/.worktrees/*' ;;
+        /tmp/wt-*)       printf '%s' '/tmp/wt-*' ;;
+        /tmp/cell-wt-*)  printf '%s' '/tmp/cell-wt-*' ;;
+        /tmp/base-*)     printf '%s' '/tmp/base-*' ;;
+    esac
+}
+
+# linked_worktree_root <resolved supervisor> — the LINKED git worktree this path lives in, or nothing.
+# ⛔ A NAME LIST CANNOT BE THIS GUARD (re-review P1 of #2697). The measured shape was `/tmp/wt-2433-fu`, and
+# a copy nested one fixture deeper (`/tmp/r2697d/wt-2433-fu/…`) matches neither of those patterns nor the
+# `/tmp/wt-*` shape — and the next lane picks the next name. What MAKES a lane checkout a lane checkout is
+# not its spelling: git records it. In the MAIN clone `--absolute-git-dir` and `--git-common-dir` are the
+# same directory; in a LINKED worktree the git dir is `<main>/.git/worktrees/<name>` while the common dir is
+# still `<main>/.git`. So the test is git's own arithmetic, and it holds for `/tmp/wt-x`, `$HOME/wt-x`,
+# `<repo>/.worktrees/x` and every name after them — while a PRIMARY clone under /tmp (`/tmp/cell-ai`, the
+# cells' own checkout) is untouched, which is the shape three cells must keep.
+# ⛔ IT IS UNCONDITIONAL: no declared root excuses it. `cloud-cell-bringup.sh` passes the LAYER checkout as
+# `AGENT_INFRA_PATH`, and that layer MAY BE the lane's own worktree — so "the caller declared it" is the
+# escape this closes, not a reason to admit it.
+git_dirs() { # <dir> — prints "<absolute-git-dir> <git-common-dir>", both resolved, or nothing
+    command -v git >/dev/null 2>&1 || return 0
+    local d="${1:-}" gitdir common
+    gitdir="$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+    common="$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    [ -n "$gitdir" ] && [ -n "$common" ] || return 0
+    # ⛔ `--git-common-dir` ANSWERS A RELATIVE PATH IN A MAIN CLONE (`.git`) AND AN ABSOLUTE ONE IN A LINKED
+    # WORKTREE. Compared raw, a primary clone's two answers differ by SPELLING and every primary clone would
+    # read as linked — a false block on `/tmp/cell-ai`, the cell's own checkout. Both are resolved here, once.
+    case "$common" in /*) ;; *) common="$d/$common" ;; esac
+    common="$(canon_dir "$common")"
+    case "$common" in "$CANON_UNRESOLVED"*) return 0 ;; esac
+    gitdir="$(canon_dir "$gitdir")"
+    case "$gitdir" in "$CANON_UNRESOLVED"*) return 0 ;; esac
+    [ "${gitdir%/}" = "${common%/}" ] && { printf '%s %s main\n' "$gitdir" "$common"; return 0; }
+    printf '%s %s linked\n' "$gitdir" "$common"
+}
+
+linked_worktree_root() {
+    local d dirs
+    d="$(dirname "${1:-}")"
+    dirs="$(git_dirs "$d")"
+    [ -n "$dirs" ] || return 0
+    case "$dirs" in *' linked') ;; *) return 0 ;; esac
+    GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --show-toplevel 2>/dev/null
+    return 0
+}
 
 # path_under <path> <root> — true when <path> IS <root> or inside it. Both already resolved by canon_dir.
 path_under() {
@@ -205,28 +262,75 @@ canon_file() {
     printf '%s/%s\n' "${d%/}" "$(basename "$f")"
 }
 
-# scratch_supervisor_reason <resolved supervisor> — prints WHY this path is not boot-durable, or nothing
-# when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
-# refused for the same reason the #2666 unit-dir guard resolves before it grades.
-scratch_supervisor_reason() {
-    local p="${1:-}" d root="" declared=""
-    case "$p" in
-        */.worktrees/*)
-            printf 'it is inside a lane worktree (%s), which is removed when that lane ends — the branch it names is not merged anywhere' "${p%%/.worktrees/*}/.worktrees"
-            return 0 ;;
-    esac
-    for d in $TRANSIENT_ROOTS ${TMPDIR:-}; do
+# transient_root_of <resolved path> — the temporary root this path is under, or nothing.
+# ⛔ `$TMPDIR` IS GRADED ON ITS OWN AND QUOTED, NEVER CONCATENATED INTO THE LOOP (re-review P3). Appended to
+# `$TRANSIENT_ROOTS` it was WORD-SPLIT, so a temp root containing a space (a user-chosen TMPDIR is the common
+# case on macOS) became two bogus roots that resolve nowhere and are `continue`d — leaving the box's real temp
+# root ungraded by the one rule that exists to grade it. A fail-open on the list itself.
+transient_root_of() {
+    local p="${1:-}" d root=""
+    for d in $TRANSIENT_ROOTS; do
         [ -n "$d" ] || continue
         d="$(canon_dir "$d")"
         case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
         path_under "$p" "$d" && { root="$d"; break; }
     done
+    if [ -z "$root" ] && [ -n "${TMPDIR:-}" ]; then
+        d="$(canon_dir "$TMPDIR")"
+        case "$d" in
+            "$CANON_UNRESOLVED"*) ;;
+            *) path_under "$p" "$d" && root="$d" ;;
+        esac
+    fi
+    [ -n "$root" ] && printf '%s\n' "$root"
+    return 0
+}
+
+# primary_clone_root <dir> — true when <dir> is the MAIN checkout of a git work tree (not a linked worktree):
+# the shape a deployment has, and the shape `/tmp/cell-ai` has on every cell.
+primary_clone_root() {
+    local dirs
+    dirs="$(git_dirs "${1:-}")"
+    [ -n "$dirs" ] || return 1
+    case "$dirs" in *' main') return 0 ;; esac
+    return 1
+}
+
+# scratch_supervisor_reason <resolved supervisor> — prints WHY this path is not boot-durable, or nothing
+# when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
+# refused for the same reason the #2666 unit-dir guard resolves before it grades.
+scratch_supervisor_reason() {
+    local p="${1:-}" d root="" declared="" shape=""
+    shape="$(lane_scratch_shape "$p")"
+    if [ -n "$shape" ]; then
+        printf 'it matches the lane-scratch shape %s — a checkout a lane removes when it ends, whose branch is merged nowhere' "$shape"
+        return 0
+    fi
+    d="$(linked_worktree_root "$p")"
+    if [ -n "$d" ]; then
+        printf 'it lives in the LINKED GIT WORKTREE %s — a lane checkout that is removed when that lane ends, and whose branch is merged nowhere' "$d"
+        return 0
+    fi
+    root="$(transient_root_of "$p")"
     [ -n "$root" ] || return 1      # not under any temporary root: durable wherever it is
+    # ⛔ A DECLARATION IS NOT A SIGNATURE (re-review P1). A reviewer measured the escape: the bring-up passes
+    # `AGENT_INFRA_PATH=$LAYER_ROOT`, and the layer may BE the lane's own checkout, so a caller could declare
+    # the scratch path it wanted armed (`/tmp/<fixture>/wt-2433-fu/…` matches no name pattern, and a plain
+    # copy is not a git worktree, so neither of the checks above sees it). Only the two roots that ARE the
+    # box's persistent surface may declare a temporary path unconditionally: `HOME` and `CELL_HOME` — the
+    # cells' `/tmp/cell-home` is exactly that, recreated by bring-up. Any OTHER declared root (today that is
+    # `AGENT_INFRA_PATH`, the cell's `/tmp/cell-ai` checkout) must itself be durable, or be a PRIMARY git
+    # clone: a clone is a deployment, a loose directory of copied scripts under /tmp is a lane's scratch.
+    local ch hm
+    ch="$(canon_dir "$CELL_HOME")"; case "$ch" in "$CANON_UNRESOLVED"*) ch="" ;; esac
+    hm="$(canon_dir "$HOME")";      case "$hm" in "$CANON_UNRESOLVED"*) hm="" ;; esac
     for d in "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:-}"; do
         [ -n "$d" ] || continue
         d="$(canon_dir "$d")"
         case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
-        path_under "$p" "$d" && { declared="$d"; break; }
+        path_under "$p" "$d" || continue
+        if [ "$d" = "$ch" ] || [ "$d" = "$hm" ]; then declared="$d"; break; fi
+        if [ -z "$(transient_root_of "$d")" ] || primary_clone_root "$d"; then declared="$d"; break; fi
     done
     [ -z "$declared" ] || return 1
     printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries 10 days after they are last touched), and it is under none of the deployment roots this box declares (CELL_HOME=%s, HOME=%s%s)' \
@@ -271,7 +375,7 @@ resolve_supervisor() {
                 err "  and nothing pages — while the fleet believes this box has a supervisor."
                 err "  Name a DURABLE supervisor instead, any one of:"
                 err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm: bash pi-bootstrap/setup.sh)"
-                err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh"
+                err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone — not a worktree)"
                 err "    $CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh   (the harness pin)"
                 err "  …or pass one explicitly: ORCH_SUPERVISOR=<that path> bash $0 --install"
                 return 1
@@ -306,6 +410,10 @@ resolve_supervisor() {
 # ⛔ IT IS AN OBSERVATION, NOT A GATE: a supervisor outside any git work tree (a farmed copy, an unpacked
 # tarball) is legitimate and records `unknown@unknown`. Refusing it would be a false block on the shape the
 # farm actually produces, and this installer must never withhold a supervisor over a diagnostic.
+# ⛔ AND IT IS THE REVISION THE UNIT WILL **BOOT**, NOT A CLAIM ABOUT A LIVE PROCESS (re-review P2). `--install`
+# re-renders but deliberately does not restart a healthy unit (see do_install), so after a checkout advances
+# this value names the bytes the NEXT start executes; a running controller can still be on the previous ones
+# until it restarts. Read it as "what this box will boot", which is what it measures.
 SUPERVISOR_PIN=""
 supervisor_pin() {
     local dir repo="" sha=""
@@ -1202,9 +1310,18 @@ do_status() {
     # ⛔ WHICH REVISION BOOTS THIS BOX, read off the INSTALLED artifact (agent-infra#2697). Informational
     # only: a unit rendered before the pin existed prints `absent`, and that is exactly the fact an operator
     # needs (re-render to record it) — it never moves the verdict, because supervision is not the pin.
+    # ⛔ AND IT ONLY SPEAKS ABOUT A UNIT THAT EXISTS HERE (re-review P3). Printed unconditionally after
+    # `unit=…`, the `absent` line claimed a unit had been "rendered before the pin was recorded" even when
+    # nothing was installed at this path, or when the copy present belongs to ANOTHER state dir (which this
+    # verb disowns two lines down) — an assertion about an artifact that was not there. The fact is reported
+    # only for our own file; otherwise the line says what is true.
     local _pin=""
-    _pin="$(sed -n 's|^Environment=ORCH_SUPERVISOR_PIN=||p' "$UNIT_DIR/$UNIT_NAME" 2>/dev/null | head -1)"
-    log_line "supervisor_pin=${_pin:-absent (rendered before the pin was recorded — re-render with --install)}"
+    if [ -f "$UNIT_DIR/$UNIT_NAME" ] && unit_is_ours "$UNIT_DIR/$UNIT_NAME"; then
+        _pin="$(sed -n 's|^Environment=ORCH_SUPERVISOR_PIN=||p' "$UNIT_DIR/$UNIT_NAME" 2>/dev/null | head -1)"
+        log_line "supervisor_pin=${_pin:-absent (rendered before the pin was recorded — re-render with --install)}"
+    else
+        log_line "supervisor_pin=none (no unit of this state dir is installed here)"
+    fi
     # ⛔ NAME A COPY THAT IS NOT THIS STATE DIR'S, INSTEAD OF ANSWERING FOR IT (review P1, #2402). Silence
     # here is what made this verb's rc 0 readable as "my cell is supervised" on a box whose only unit belongs
     # to another state dir. It is reported on its own line and never addressed: the manager answers about the
