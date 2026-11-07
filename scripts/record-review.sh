@@ -2222,14 +2222,41 @@ $m"
     # requirement the ninth cycle added, which is exactly what the skip's own comment promises it
     # does not do ("it is skipped, never silently accepted as a range"). 20h41 could not see it:
     # there a REAL range is stated beside the prose, so it takes the other branch.
-    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}) ]]; do
+    # ⛔ THE RIGHT-HAND ENDPOINT MAY BE THE TIP SPELLED AS A WORD (fourteenth review cycle, P1 —
+    # MEASURED: the body `reviewed delta:<BASE>..<HEAD>; … I only actually reviewed c8a0e0..HEAD`
+    # recorded rc 0 and minted a SIGNED `clean` over the wide range. `HEAD` is not hex, so this
+    # regex matched nothing; `c8a0e0` is 6 chars, so the token scan below never saw it either; and
+    # the 7-floor skip in this loop means the pair was never even a candidate. Both layers missed
+    # the same pair, in concert — the shape the third cycle named.) A tip spelling is RESOLVED here
+    # and compared against the head being attested, which is the only reading under which
+    # `BASE..HEAD` is an honest statement of a range that ends at B. `HEAD` that does not resolve in
+    # this checkout REFUSES: an endpoint this code cannot evaluate is not a verified endpoint, and a
+    # stated range that cannot be checked is the fail-open this arm exists to stop. A symbolic ref
+    # (`main..HEAD`) is still NOT interpreted — that remains the declared residual below, because
+    # resolving prose nouns would refuse honest artifacts.
+    while [[ "$_scan" =~ ([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@) ]]; do
       _sf="$(printf '%s' "${BASH_REMATCH[1]}" | command tr 'A-F' 'a-f')"
       _ss="${BASH_REMATCH[2]}"
-      _st="$(printf '%s' "${BASH_REMATCH[3]}" | command tr 'A-F' 'a-f')"
+      # ⛔ THE RAW SPELLING IS KEPT FOR RESOLUTION (fourteenth cycle): `HEAD` is a CASE-SENSITIVE
+      # ref name, so resolving the lower-cased copy this loop made would make `head^{commit}` fail and
+      # every honest `BASE..HEAD` artifact refuse. Only the MESSAGE gets the normalised form.
+      _straw="${BASH_REMATCH[3]}"
+      _st="$(printf '%s' "$_straw" | command tr 'A-F' 'a-f')"
       # Advance PAST this match so the next iteration cannot re-match a suffix of it.
       _scan="${_scan#*"${BASH_REMATCH[0]}"}"
       _ok=0
-      case "$to" in "$_st"*) _ok=1 ;; esac
+      _stcmp="$_st"
+      # ⛔ THE TIP CHECK CANNOT KEY ON THE `tr`'d COPY. `tr 'A-F' 'a-f'` above maps E/A/D but NOT
+      # `H` (it is outside A-F), so `HEAD` normalises to `Head` — a `case` arm written `head|@`
+      # matched NOTHING and every honest `BASE..HEAD` artifact was refused with "states a DIFFERENT
+      # range … the body quotes …..Head" (measured while writing 20h52a, which is why that control
+      # exists). The test is on the CASE-INSENSITIVE spelling instead.
+      case "$_stcmp" in
+        [Hh][Ee][Aa][Dd]|@) _stcmp="$(delta_git "$root" rev-parse --verify "${_straw}^{commit}" 2>/dev/null || true)" ;;
+      esac
+      if [ -n "$_stcmp" ]; then
+        case "$to" in "$_stcmp"*) _ok=1 ;; esac
+      fi
       _sfs="$(delta_git "$root" rev-parse --verify "${_sf}^{commit}" 2>/dev/null || true)"
       # ⛔ ONLY A TOKEN THAT SURVIVED THE SKIP COUNTS AS A STATED RANGE.
       if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
@@ -2245,7 +2272,7 @@ $m"
         fi
       fi
       if [ "$_ok" -ne 1 ]; then
-        stated_from="$_sf"; stated_sep="$_ss"; stated_to="$_st"
+        stated_from="$_sf"; stated_sep="$_ss"; stated_to="$_straw"
         _all_ok=0
         break
       fi
@@ -2311,10 +2338,26 @@ $m"
     # construction, and a commit LATER than A is refused as a narrowing in whatever notation it
     # was written. Unresolvable runs are prose, not commits, and are ignored (a sha that is not
     # in this repo cannot narrow this range). Alphabet-independent, and it does not need to know the
-    # word "through". Its length floor is 7 for a PROSE token (4-6 hex runs are ordinary words), and
-    # that is not a gap: a dots-adjacent 4-6 run is handled by the parser above at the SAME floor,
-    # which is where a typed abbreviation actually appears (ninth cycle, P1 — the two layers' floors
-    # used to be 12 and 7, leaving 4-6 invisible to both).
+    # word "through".
+    # ⛔ ITS FLOOR IS THE SAME AS THE PARSER'S, AND FOR THE SAME REASON (fourteenth review cycle, P1 —
+    # the sentence here claimed the 4-6 hole was covered "by the parser above at the SAME floor", and
+    # that was TRUE ONLY FOR THE DOTS SPELLING: MEASURED at the previous head, `I only actually
+    # reviewed c65758–a31889` (en dash) and `c65758 through a31889` both recorded rc 0, because a
+    # non-dot separator is not the parser's shape and a 6-char run was below this scan's floor — the
+    # SAME pair invisible to both layers, which is the ninth cycle's P1 one spelling over. A false
+    # sentence is worse than no sentence: it is the sentence a later reader uses to close the hole as
+    # already-covered. So the floor is carried by ONE discriminator for both layers — a 4-40 hex run
+    # is a commit claim when it RESOLVES here — and a run that does not resolve is prose, as before.
+    # ⛔ A PURELY DECIMAL RUN IS NOT AN ABBREVIATED SHA, and it is the one exclusion kept (stated
+    # rather than silent): `1351`, `2024`, `4000` are counts, years and shard indices, every one of
+    # which appears in ordinary review artifacts, and each is a 4-char hex-lookalike whose chance of
+    # colliding with SOME commit prefix in a repo this size is a few percent. Treating those as
+    # commit claims would FALSE-BLOCK honest artifacts — the failure mode the seventh cycle's P2
+    # names as worse than the gap, because its only remedy is the full re-review this feature exists
+    # to avoid. A 4-6 char abbreviation that is genuinely all digits still escapes this scan; that is
+    # the declared residual, and it is the same conservative/gap tradeoff the ambiguous-prefix
+    # residual above already makes. The `rev-parse` discriminator is still the authority: a mixed
+    # run that does not resolve is prose.
     # ⛔ THE UNRELATED-LINEAGE HALF IS NOT SLACK, IT IS THE BOUND OF THE RULE (seventh review
     # cycle, P2 — MEASURED: the sixth cycle refused a commit reachable from NEITHER endpoint, so
     # an artifact quoting another PR's sha, or a base tip that is not in this branch's history,
@@ -2337,7 +2380,7 @@ $m"
     # exists to catch, reached through the guard itself: "the claim names no commits" and "nothing
     # scanned the claim" must not be one value. rc 1 stays a pass; rc >= 2 refuses.
     _toks=""; _tok_rc=0
-    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{7,40}' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
+    _toks="$(printf '%s\n' "$_claim" | command grep -oE '[0-9a-fA-F]{4,40}' | command grep -E '[a-fA-F]' | command tr 'A-F' 'a-f' | command sort -u)" || _tok_rc=$?
     if [ "$_tok_rc" -gt 1 ]; then
       echo "   delta: the commit-token scan FAILED (rc $_tok_rc) — a scan that did not run is not evidence that the claim names no commits, so the range is not verified. Retry rather than record." >&2
       return 1
@@ -2411,12 +2454,21 @@ $m"
     # nouns are claims is the spelling-enumeration failure in a new costume. The residual is
     # bounded by the fact that such a ref must still be WRITTEN as a range by the artifact
     # author, and it is named here so a later reader can tell it from an oversight.
-    case "$_claim" in
-      *HEAD~*|*HEAD^*|*head~*|*head^*|*"@~"*|*"@^*")
-        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (HEAD~N / HEAD^N / @~N) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
+    # ⛔ THE PROPERTY IS NOTATION-INDEPENDENT, SO THE TEST MUST BE TOO (fourteenth review cycle, P1 —
+    # MEASURED: this was a LITERAL list of `HEAD`/`head`/`@`, so the SAME narrowing written with the
+    # head's own sha — `<head>~1..<head>` and `<head>^..<head>` — recorded rc 0 and minted a signed
+    # `clean`. The declared residual below covers SYMBOLIC refs (`main..HEAD`), and `sha~N` is not
+    # symbolic: it resolves, it is fully evaluable, and it is the same claim in another spelling. A
+    # guard that enumerates spellings fails open on the first one nobody listed — for the seventh
+    # time in this arm — so the arm now tests the SHAPE: any ref (hex abbreviation, HEAD, @) followed
+    # by `~` or `^` is a revision expression, which is what makes a range tip-relative.
+    # `HEAD@{N}` (a reflog position) stays in the declared residual: it is not resolved by this arm,
+    # and matching `{` after a hex run would FALSE-BLOCK a hex literal followed by a brace block.
+    if [[ "$_claim" =~ ([0-9a-fA-F]{4,40}|[Hh][Ee][Aa][Dd]|@)[[:space:]]*[~^] ]]; then
+        echo "   delta: the covering artifact '$cover' states a range RELATIVE TO THE TIP (<ref>~N / <ref>^N / @~N) — that is always NARROWER than ${from:0:12}…..${to:0:12}…, so the record would assert a range the artifact excludes. Nothing was written." >&2
         echo "   → the claim must state the range it read as delta:${from:0:12}..${to:0:12}." >&2
-        return 1 ;;
-    esac
+        return 1
+    fi
     fi
   fi
   DELTA_FROM="$from"; DELTA_TO="$to"; DELTA_BASE="$base_sha"
