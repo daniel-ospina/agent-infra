@@ -939,7 +939,8 @@ ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 # — a POINTER into the log, written into `state/refresh-last`, which is the artifact `orch-loop.sh`
 # builds `[dispatch] BLOCKED: refresh failed — stage=provision` from. (`.refresh-blocked` is a SEPARATE
 # surface: it quotes the LOG, never this file — `orch-loop.sh:8801` greps `$LOG` for `NOT
-# PROVISIONABLE`, and it is written only on rc=3; see `refresh-candidates.sh`'s own paragraph.) A reader
+# PROVISIONABLE`, and it is written on the rc=3 and rc=78 arms only; see `refresh-candidates.sh`'s own
+# paragraph.) A reader
 # of the RECORD therefore got no cause at all: "refused
 # because auth", "refused because the gh layer would not let the call out" and "refused because the
 # box could not reach GitHub" were indistinguishable in the one sentence an operator reads. That is
@@ -970,8 +971,8 @@ mk_case gh_budget
 # budget-read notes as hand-typed literals would leave the two lines that ACTUALLY reach the record
 # undrifted by nothing — a reword of `gh:1479` would change no row — so they are extracted with the same
 # grep/sed as the verdict line, with only the runtime figures substituted (`$(( (rem + 999) / 1000 ))`
-# → `5`, `${WAIT_BUDGET_MS}` → `1000` / `120000`, `$GATE_DIR` → `/gate`). A residual `$` in ANY of the
-# three is a FAILURE, not a silently stale fixture.
+# → `5`, `${WAIT_BUDGET_MS}` → `1000` in BOTH notes, `$GATE_DIR` → `/gate`). A residual `$` in ANY of
+# the three is a FAILURE, not a silently stale fixture.
 # ⛔ TWO THINGS THIS GOT WRONG FIRST TIME, both caught by the rows below rather than by reading:
 #   * `gate_note`'s `gh-gate: ` prefix is added by `gate_note` ITSELF (`gh:679`), so it is NOT part of the
 #     extracted argument — the first two capture lines were built without it while the third had it;
@@ -982,14 +983,18 @@ shim_note_line() {  # <grep-anchor> <sed-expr>… — the gate_note ARGUMENT, fr
   grep -m1 "^ *gate_note \"$anchor" "$SHIM" \
     | sed -e 's/^ *gate_note "//' -e 's/"$//' "$@"
 }
-# ⛔ ONE gh CALL HAS ONE `WAIT_BUDGET_MS` (#3701 review round 10, P2). `scripts/gh-shim/gh:1764` assigns
-# it once per call and BOTH notes interpolate that same value, so a capture showing `(budget 1000ms)` on
-# line 1 and `120000ms wait budget` on line 3 is a shape no single call can emit — the same defect class
-# as emitting the wrong line. 1000 is also the value that makes this arm REACHABLE: a wait budget below
+# ⛔ ONE gh CALL HAS ONE `WAIT_BUDGET_MS`, AND IT IS ONE VARIABLE HERE (#3701 review rounds 10-11, P2).
+# `scripts/gh-shim/gh:1764` assigns it once per call and BOTH notes interpolate that same value, so a
+# capture showing `(budget 1000ms)` on line 1 and `120000ms wait budget` on line 3 is a shape no single
+# call can emit — the same defect class as emitting the wrong line. The round-10 fix wrote `1000` in two
+# places by hand, which is HOW the divergence happened, and nothing asserted the two agreed: reverting
+# one of them left the suite green. So the figure is a single variable, and a row below compares the two
+# rendered figures against it. 1000 is also the value that makes this arm REACHABLE: a wait budget below
 # the probe's 20 s bound is the only way the 75 arm is hit at all.
-SHIM_NOTE="$(shim_note_line 'gh-contended' -e 's/\${WAIT_BUDGET_MS}/1000/')"
+SHIM_WAIT_MS=1000
+SHIM_NOTE="$(shim_note_line 'gh-contended' -e "s/\${WAIT_BUDGET_MS}/$SHIM_WAIT_MS/")"
 SHIM_PACE="$(shim_note_line 'the account is in a shared rate-limit window — waiting' \
-  -e 's/\$(( (rem + 999) \/ 1000 ))/5/' -e 's/\${WAIT_BUDGET_MS}/1000/')"
+  -e 's/\$(( (rem + 999) \/ 1000 ))/5/' -e "s/\${WAIT_BUDGET_MS}/$SHIM_WAIT_MS/")"
 SHIM_BUDGET="$(shim_note_line 'if the account BUDGET is what refused' -e 's|\$GATE_DIR|/gate|')"
 # every line is `gh-gate: ` + its argument, which is what `flush_notes` cats to stderr
 SHIM_CAPTURE="$(printf '%s\n%s\n%s' "gh-gate: $SHIM_PACE" "gh-gate: $SHIM_BUDGET" "gh-gate: $SHIM_NOTE")"
@@ -1006,6 +1011,14 @@ esac
 ck "(g) the stub emits production's 3-note capture, ALL derived from the shim" \
    "$([ -z "$SHIM_BAD" ]; echo $?)"
 [ -n "$SHIM_BAD" ] && bad "(g) …could not be derived: $SHIM_BAD (a hand-typed copy is what these rows exist to stop)"
+# ⛔ AND THE TWO NOTES MUST AGREE ON THE BUDGET FIGURE — the property the round-10 commit fixed and
+# nothing pinned (#3701 review round 11, P2): with one hand-written `1000` in each, reverting either
+# left the suite green on the exact shape that commit calls impossible.
+cap_budget_shown() { printf '%s' "$1" | sed -n 's/.*(budget \([0-9]*\)ms).*/\1/p'; }
+cap_budget_waited() { printf '%s' "$1" | sed -n "s/.*outlived this call's \([0-9]*\)ms wait budget.*/\1/p"; }
+ck "(g) …and ONE wait budget: line 1's (budget N ms) and line 3's N ms agree, both $SHIM_WAIT_MS" \
+   "$([ "$(cap_budget_shown "$SHIM_PACE")" = "$SHIM_WAIT_MS" ] \
+      && [ "$(cap_budget_waited "$SHIM_NOTE")" = "$SHIM_WAIT_MS" ]; echo $?)"
 ck "(g) …in production's order: pacing, budget-read, gh-contended (line count=$(printf '%s' "$SHIM_CAPTURE" | grep -c ''))" \
    "$([ "$(printf '%s' "$SHIM_CAPTURE" | grep -c '')" -eq 3 ] \
       && [ "$(printf '%s' "$SHIM_CAPTURE" | sed -n 1p)" = "gh-gate: $SHIM_PACE" ] \

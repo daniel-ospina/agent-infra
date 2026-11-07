@@ -2245,7 +2245,8 @@ refresh_record_write running provision 0 \
 # `refresh_fail` writes the WHOLE cause to stdout (:607), which `orch-loop.sh` sends to `$LOG`. So an
 # rc=3 refusal now lands in that marker as the measured clause, where before it landed as the pointer.
 # ⛔ THE LIMITS, so neither surface is over-claimed: a rc=1 (TRANSIENT) refusal writes NO
-# `.refresh-blocked` at all — `orch-loop.sh:8790-8801` writes it only under `if [ "$rc" -eq 3 ]` — so
+# `.refresh-blocked` at all — `orch-loop.sh` writes that file on the rc=3 arm (`:8804`) and, separately,
+# on the rc=78 config-refusal arm (`:8817`), never on the TRANSIENT path — so
 # the `why=TRANSIENT:` shape quoted above has the RECORD as its sole surface; and the marker reads the
 # log, never the record file. Both derived surfaces therefore name the precondition on the rc=3 path;
 # only the TRANSIENT path has one surface.
