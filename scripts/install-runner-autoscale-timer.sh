@@ -42,11 +42,19 @@
 #
 # ⛔ WHAT THIS INSTALLER REFUSES (each would otherwise install a unit that cannot run, or one that
 # silently converges nothing):
-#   * a script path that is not a regular readable file, or one inside LANE SCRATCH — a `mktemp` tree,
-#     or the repo's own lane-checkout shapes (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`,
-#     `/tmp/base-*`; the same set `scripts/install-repair-service.sh` enforces, #2697). The measured
-#     inert-enforcer: a unit pointing into a directory deleted before the first tick exits 127
-#     on EVERY pass while `list-timers` shows the job scheduled and healthy;
+#   * a script path that is not a regular readable file, or one inside a `mktemp` scratch tree (the
+#     measured inert-enforcer: a unit pointing into a directory deleted before the first tick exits 127
+#     on EVERY pass while `list-timers` shows the job scheduled and healthy);
+#   * a PROVISIONER pin inside LANE SCRATCH — a `mktemp` tree, or the repo's own lane-checkout shapes
+#     (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`, and the cell shape
+#     `<cellhome>/wt-<slug>`; the same set `scripts/install-repair-service.sh` enforces, #2697).
+#     ⛔ SCOPED TO THE PROVISIONER, AND DELIBERATELY NOT TO THE SCRIPT — an earlier revision of this
+#     header listed the lane shapes under the SCRIPT bullet, which this installer does NOT do: a branch's
+#     converger copy is a legitimate thing to SCHEDULE (`resolve_script`: "a worktree path is SAID OUT
+#     LOUD, NOT REFUSED"), and a suite arm asserts that install still succeeds. A false "refused" here
+#     is an invitation to turn that warning into a refusal and reverse the recorded decision. The two
+#     values differ because a provisioner's whole job is to still exist at the first tick, while a
+#     converger copy may legitimately be a branch under test;
 #   * an interpreter older than 3.12 — the pass refuses itself with exit 2, so the unit would be red
 #     from its first tick for a reason the installer already knew;
 #   * a `--repo` that is not a plain `owner/name` (it is interpolated into the unit's command line);
@@ -249,10 +257,14 @@ is_transient_scratch() { # is_transient_scratch <path>
 # `--install` from `/tmp/cell-home/wt-<slug>` (candidate 1) was PINNED instead of skipped, so the pin
 # died with the lane, every tick recorded `no provisioner`, and the "can never ADD capacity" warning was
 # suppressed because a pin DID resolve — the inert enforcer, with a green install.
-# ⛔ `*/wt-?*/*`, NOT `*/wt-*/*`: the `?` requires a character after the dash, so a name that merely
-# STARTS with `wt-` and nothing else (or a plausible directory like `wt-docs`) is not swept in by
-# accident, and the trailing `/*` keeps the WORKTREE ROOT itself out while matching everything a
-# provisioner path can actually be.
+# ⛔ `*/wt-?*/*`, NOT `*/wt-*/*`, AND THE DIFFERENCE IS WRITTEN DOWN HONESTLY: `?` is exactly ONE
+# character, so the only name this excludes is a bare `wt-` (no character after the dash). A directory
+# named `wt-docs` or `wt-prod` DOES match — and that is the correct answer, not an accident: these
+# patterns are `pi-reap-worktrees.sh`'s own glob (`wt-*|cell-wt-*`, matched on the basename at any
+# depth) transcribed, so a durable directory whose name begins `wt-` is deleted by that same rule and a
+# pin into it is doomed for exactly the reason this predicate exists. The trailing `/*` keeps the
+# WORKTREE ROOT itself out while matching everything a provisioner path can actually be. (An earlier
+# revision of this comment claimed `wt-docs` was excluded; measured, it is not.)
 is_lane_scratch() { # is_lane_scratch <path>
     local p="${1:-}"
     [ -n "$p" ] || return 1

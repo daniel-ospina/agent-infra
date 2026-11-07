@@ -3399,8 +3399,11 @@ def converge(
             record["actions"].append(f"repair {c['name']} FAILED: {exc}")
 
     # 6. FILL — one install at a time, at the NEXT FREE SLOT, and measured ---------------------
-    # THE PROVISIONER DOES NOT PROMISE "ADD ONE". `install-ci-runner-x64.sh --count N` means
-    # "ensure slots 1..N exist", where a slot is `$BASE`, `$BASE-2`, `$BASE-3`, … — REPO-AGNOSTIC.
+    # THE PROVISIONER ADDS AT MOST THE ONE INDEX IT WAS ASKED FOR. `install-ci-runner-x64.sh --count N`
+    # names a SLOT INDEX in this file's own numbering (`$BASE`, `$BASE-2`, `$BASE-3`, …) and adds that
+    # slot, or nothing — it does not sweep 1..N (its header states that as contract fact 2, and a suite
+    # arm pins "exactly one add"). An earlier revision of this comment said "ensure slots 1..N exist",
+    # which is the sweep the adapter refuses precisely because it causes the over-fill below.
     # Three consequences, each learned from a real miss:
     #   * the index must be the next FREE SLOT in that numbering, not the install COUNT: this box
     #     carries an ad-hoc `gh-runner-cell4-x64` beside the numbered pair, so a count said 3 while

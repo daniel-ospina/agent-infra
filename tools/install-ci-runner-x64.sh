@@ -44,10 +44,12 @@
 #
 #   3. THE INSTALL MUST BE VISIBLE TO THE CALLER: `discover()` enumerates `<root>/gh-runner*` holding
 #      a `.runner`, `--root` defaults to `/opt` (or `RUNNER_AUTOSCALE_RUNNER_ROOT`), and the numbering
-#      base is `RUNNER_AUTOSCALE_BASE` or `<root>/gh-runner-x64`. `provision()` passes NO root, so
-#      this file must land on the same root AND the same base the caller reads. A different root, or
-#      a name outside `gh-runner*`, is a FALSE PASS: every pass reports `provisioned …` while `live`
-#      never moves and the box never grows. (Also why `RUNNER_ROOT` is EXPORTED below: the pool tool
+#      base is `RUNNER_AUTOSCALE_BASE` or `<root>/gh-runner-x64`. ⛔ `provision()` NOW PASSES THE
+#      CALLER'S ROOT AND REPO (`RUNNER_AUTOSCALE_RUNNER_ROOT`, `RUNNER_AUTOSCALE_REPO`), so this file
+#      must still land on the same root AND the same base the caller reads — the seam is passed, not
+#      assumed. A different root, or a name outside `gh-runner*`, is a FALSE PASS: every pass reports
+#      `provisioned …` while `live` never moves and the box never grows. (Also why `RUNNER_ROOT` is
+#      EXPORTED below: the pool tool
 #      is a child and reads it from its env.)
 #
 #   4. EXIT CODES, in the caller's own words — and the pool tool's are NOT this file's:

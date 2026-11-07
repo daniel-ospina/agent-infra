@@ -208,8 +208,17 @@ esac
 # 11. IDEMPOTENCY: an existing install is skipped, not added a second time (the #9639 over-fill)
 mkdir -p "$RUNNER_ROOT/gh-runner-x64"; : > "$RUNNER_ROOT/gh-runner-x64/.runner"
 : > "$TMP/calls.log"
-out=$(CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>&1); rc=$?
+# ⛔ STDERR IS CAPTURED SEPARATELY, NOT MERGED. The caller records the LAST line of the MERGED
+# stdout+stderr stream, so a stray stderr line on a SUCCESS path silently replaces the accounting —
+# asserting a substring of a merged stream cannot see it. Every success path is pinned this way.
+: > "$TMP/err11.txt"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool 0) bash "$SUT" --count 1 --fallback auto 2>"$TMP/err11.txt"); rc=$?
 check "existing slot skipped, still exit 0" 0 "$rc" "provisioned slot=1 name=gh-runner-x64 root=$RUNNER_ROOT added=0 skipped=1" "$out"
+if [ -s "$TMP/err11.txt" ]; then
+  bad "the idempotent-skip success path writes nothing to stderr: $(cut -c1-120 "$TMP/err11.txt")"
+else
+  ok "the idempotent-skip success path writes nothing to stderr"
+fi
 calls=$(wc -l < "$TMP/calls.log" | tr -d ' ')
 check "no add beside an existing install" 0 "$calls"
 
@@ -296,10 +305,15 @@ esac
 # scripts/ci_runner_pool.sh::add). Mapping that to a refusal made this file print "nothing further
 # attempted" and the caller record `nothing was added` about a registration that is in the pool.
 : > "$TMP/calls.log"
-out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_registered_dead) bash "$SUT" --count 6 --fallback auto 2>/dev/null); rc=$?
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_registered_dead) bash "$SUT" --count 6 --fallback auto 2>"$TMP/err_reg.txt"); rc=$?
 check "rc 2 WITH .runner is a registration, not a refusal" 0 "$rc" \
   "provisioned slot=6 name=gh-runner-x64-6 root=$RUNNER_ROOT added=1 skipped=0 listener=dead" "$out"
 check "…and the dead listener the pool names is in the record" 0 0 "listener=dead" "$out"
+if [ -s "$TMP/err_reg.txt" ]; then
+  bad "the rc-2 registration success path writes nothing to stderr: $(cut -c1-120 "$TMP/err_reg.txt")"
+else
+  ok "the rc-2 registration success path writes nothing to stderr"
+fi
 
 # 20. ⛔ rc 4 WITH NO `.runner` IS TWO FACTS, AND THE REMEDY DIFFERS. Both are refusals (exit 2), but a
 # path that PRE-EXISTED is a wedge a human must clear, while a path that APPEARED during the call is a
