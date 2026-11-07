@@ -459,79 +459,34 @@ jobs:
         echo "✅ All extension tests passed"
     secrets: inherit
 
-  script-validate:
+  script-validate-gates:
+    # ⛔ THE GUARDS MOVE OUT OF THE MATRIX, AND THE REASON IS STRUCTURAL — they have no shard dimension.
+    # `script-validate` is now a shard matrix (see the comment there), so every step left in it runs
+    # EIGHT times; these three are whole-tree checks (node syntax over `scripts/*`, the lane-parity
+    # guard, and that guard's own mutation self-test) that would each produce the SAME verdict 8 times.
+    # ⚠ THE COST OF THAT DUPLICATION IS SMALL AND IS NOT THE ARGUMENT — measured in the run this PR
+    # cites (run 41693024926, job 126116214764, step timeline): node check ≈ 0.8 s, parity guard ≈ 0.5 s,
+    # self-test ≈ 35 s, i.e. ≈ 36 s total, ≈ 5 runner-minutes if duplicated 8×. An earlier draft of this
+    # comment cited the steps' `timeout-minutes` (5 and 15) as if they were runtimes and claimed ~30
+    # runner-minutes × 8; that was wrong by ~50×, and it is corrected here rather than deleted so the
+    # next reader does not re-derive it. The split stands on the structural reason: one verdict, once.
+    # This mirrors ci.yml, which splits its sweep (`bash-suites`) from its guards (`bash-suites-gate`)
+    # for exactly this reason (#1369).
     runs-on: ubuntu-latest
-    # ⛔ #3131 — `merge-reminder.test.sh` §27b is the SECOND ambient-ref reader on this matrix. It
-    # requires `box-status.sh` to print `ref: origin/main=<sha>`, a line emitted ONLY when
-    # `git -C "$REPO" rev-parse --verify origin/main` resolves; an unresolvable ref produces no
-    # `ref:` line at all (and no diagnostic — `REF_WHY` is set only on a refusal), so the grep
-    # simply misses. A push to a non-main branch checks out ONE ref, so `origin/main` does not exist
-    # and the job reds for a reason unrelated to the tree. MEASURED on the batch matrix: the shard
-    # failed on `integration/batch-*` while the same file passes on `main`, and it was the ONLY new
-    # shard against main's own run (§27b was the sole failing assertion; a controlled experiment with
-    # content held constant flipped exactly that assertion by deleting only `refs/remotes/origin/main`).
-    #   So the ref is materialized here too, under the same two conditions as the `extension-tests`
-    # preamble, with the same no-`|| true` rule.
-    #   ⚠ THIS IS A WORKAROUND, AND IT MUST NOT BE SILENTLY REMOVED: the real fix is #3160 — §27b is
-    # about the SUBDIRECTORY rule and should point its candidate at the suite's own fixture repo (which
-    # carries its own `origin/main`) instead of the ambient checkout. That fixture change is in flight
-    # on the batch branch, NOT in this PR, so this step stays until #3160 lands; removing it earlier
-    # would reinstate the false red on every `integration/**` run.
-    # #2055: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the one
-    # runner below, UNSHARDED (main runs once per merge, so the queue a hang would starve is
-    # smaller than the PR lane's 80 open PRs), and it also runs the parity guard plus its mutation
-    # self-test.
-    #
-    # ⛔ THE 38m41s SELF-TEST FIGURE THIS COMMENT USED TO CARRY IS STALE, and the bound that was
-    # sized from it (70 min on a step that now runs in ~6-9 s) was protecting nothing. That
-    # measurement is PR #2412's (job 120365087427, 2026-10-23T10:25Z) and predates #2529
-    # (`00814821`, 16:09Z same day), which stopped the self-test's fixture re-running the real
-    # shard list. MEASURED AFTER #2529 (2026-10-24, this job, 8 successful main runs pulled from the
-    # Actions API): step 6, the self-test, **6-9 s**. The PR lane's equivalent step, 17 runs sampled:
-    # 6-12 s with one 17 s outlier.
-    #
-    # ⛔ STEP 7 (THE SHARDS) IS **6468 s = 107.8 min**, NOT the 46m38s-54m32s this header used to
-    # quote (#3174): that range described the ~80-shard list BEFORE #2609 made the list a DERIVATION
-    # and #3114 added an 891 s suite by it. Quoting it here contradicted the step's own comment
-    # below and made 150 min read as 2.75x over-provisioned instead of 1.39x. What remains expensive
-    # here is the SHARDS step — that is what the 150 min bound below is sized for, and what sharding
-    # main (the separate change named below) would cut.
-    #
-    # ⛔ A bound BELOW the measured run is worse than no bound: it false-blocks main on every merge
-    # cycle, and a red that is not a defect is how a gate loses its authority. This bound is sized
-    # only to catch a HANG (which, before this line, could hold a runner indefinitely — #2055);
-    # the real fix for the main lane's duration is sharding it like the PR lane, which is a
-    # separate change (it needs its own parity-guard review: `check-ci-lane-parity` asserts THIS
-    # job makes the bare call).
-    #
-    # ⛔ THE JOB BOUND IS A PURE BACKSTOP; THE BLOCKING BOUNDS ARE ON THE STEPS BELOW. A job that
-    # trips `jobs.<id>.timeout-minutes` is reported `cancelled` — the service cancels the job, the
-    # job-cancellation callback sets `jobContext.Result = TaskResult.Canceled`
-    # (`StepsRunner.cs:149-155`, the `Canceled` arm at :154), and a step still running then takes
-    # `TaskResult.Canceled` (`StepsRunner.cs:331-336`). `JobRunner.cs` has NO timeout handling — its
-    # `TaskResult.Canceled` at :198 is the *initialize* cancel path, not this one.
-    # `cancelled` is NON-RED to this repo's rail (`scripts/admin-merge.sh` NON_RED_CONC) — so a
-    # job-only bound on MAIN would let a hang certify as a non-red and the tree's only unsharded
-    # sweep would silently stop gating. A STEP bound is `TaskResult.Failed` (`StepsRunner.cs:324-329`)
-    # = `failure` = red.
-    #
-    # ⛔ AND THE JOB BOUND SITS ABOVE THE SUM OF THE STEP BOUNDS, so it can never pre-empt a step:
-    # 10 (checkout) + 10 (node) + 10 (node --check) + 5 (parity) + 15 (self-test) + 150 (shards) =
-    # 200 < 230. Below the sum, the non-red job-level `cancelled` could win instead of the red
-    # step-level `failure` — the whole defect this block exists to close, re-entering through the
-    # backstop. 230 also stays ~1.53x the 150 min shard step it backstops, so it cannot
-    # false-block.
-    timeout-minutes: 230
+    # ⛔ THE SAME NON-RED ARITHMETIC AS THE MATRIX JOB, because it is the same hazard: a job-level
+    # timeout reports `cancelled`, which this repo's rail treats as NON-RED, so the job bound must sit
+    # ABOVE the sum of the step bounds or the non-red one can win.
+    #   10 (checkout) + 10 (setup-node) + 10 (node --check) + 5 (parity) + 15 (self-test) = 50 < 60
+    # A step bound raised by 11 min would silently convert a red into a non-red — re-check this sum
+    # whenever one of those bounds moves.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
         timeout-minutes: 10
-      # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
-      # see ci.yml's `search-cost` job). ci.yml's `bash-suites` carries the identical pin, so the two
-      # lanes run the same list under the same runtime.
       - uses: actions/setup-node@v4
-        timeout-minutes: 10
         with:
           node-version: '22'
+        timeout-minutes: 10
       - name: Validate Node.js scripts
         timeout-minutes: 10
         run: |
@@ -557,6 +512,88 @@ jobs:
         # old 70 min was sized from a measurement taken before #2529 and could not fail fast.
         timeout-minutes: 15
         run: bash tests/ci-lane-parity/run.sh
+
+  script-validate:
+    runs-on: ubuntu-latest
+    # ⛔ THE SWEEP IS A MATRIX HERE TOO (measured 2026-11-03). This job ran `run-bash-shards.sh`
+    # UNSLIPPED over all 158 shards: 130 min measured (main run 41693024926, job 126116214764), on
+    # EVERY merge, while the PR lane runs the SAME script as an 8-way matrix whose slowest shard is
+    # 41 min. Same work, ~3x the wall, and ~130 runner-minutes per merge is what starves the PR lane
+    # — the queue every merge then waits behind. Slicing is the PR lane's own mechanism (agent-infra
+    # #1369/#2483): the list stays in `scripts/run-bash-shards.sh`, this job only says which slice.
+    strategy:
+      # ⛔ `fail-fast: false`, FOR THE REASON ci.yml RECORDS FOR `bash-suites` AND THIS CHANGE MUST NOT
+      # DROP: one failing slice otherwise CANCELS the in-progress and QUEUED siblings, those legs report
+      # `cancelled` — which the rail treats as NON-RED (`NON_RED_CONC`) — and the runner's per-slice
+      # coverage assertion never executes in them. A single red shard would then silently leave ~7/8 of
+      # the list never executed and never asserted for that sha, while the job still reads as "the
+      # matrix ran". Every slice must report its own verdict.
+      fail-fast: false
+      # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+      # hand-kept number). Width 8 mirrors ci.yml's `bash-suites`; the per-slice sizes are DERIVED
+      # by the runner, so adding a suite shifts them with no workflow edit.
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    # ⛔ #3131 — `merge-reminder.test.sh` §27b is the SECOND ambient-ref reader on this matrix. It
+    # requires `box-status.sh` to print `ref: origin/main=<sha>`, a line emitted ONLY when
+    # `git -C "$REPO" rev-parse --verify origin/main` resolves; an unresolvable ref produces no
+    # `ref:` line at all (and no diagnostic — `REF_WHY` is set only on a refusal), so the grep
+    # simply misses. A push to a non-main branch checks out ONE ref, so `origin/main` does not exist
+    # and the job reds for a reason unrelated to the tree. MEASURED on the batch matrix: the shard
+    # failed on `integration/batch-*` while the same file passes on `main`, and it was the ONLY new
+    # shard against main's own run (§27b was the sole failing assertion; a controlled experiment with
+    # content held constant flipped exactly that assertion by deleting only `refs/remotes/origin/main`).
+    #   So the ref is materialized here too, under the same two conditions as the `extension-tests`
+    # preamble, with the same no-`|| true` rule.
+    #   ⚠ THIS IS A WORKAROUND, AND IT MUST NOT BE SILENTLY REMOVED: the real fix is #3160 — §27b is
+    # about the SUBDIRECTORY rule and should point its candidate at the suite's own fixture repo (which
+    # carries its own `origin/main`) instead of the ambient checkout. That fixture change is in flight
+    # on the batch branch, NOT in this PR, so this step stays until #3160 lands; removing it earlier
+    # would reinstate the false red on every `integration/**` run.
+    # #2055/#2483: the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job calls the
+    # one runner below, now as an 8-WAY SLICE of the same derived list (`BASH_SHARD_SLICE`, the same
+    # seam the PR lane uses) rather than unsharded. Measured before the change: 130 min for the whole
+    # list on every merge (run 41693024926, job 126116214764) against the PR lane's 41-min worst
+    # slice — ~3x the wall for identical work, and ~130 runner-minutes per merge is what starved the
+    # PR lane. The three whole-tree guards that used to be steps here (`node --check`, the lane-parity
+    # guard, its mutation self-test) are now the separate `script-validate-gates` job: they have no
+    # shard dimension, so inside a matrix they would each run 8x to produce one verdict.
+    #
+    # ⛔ THE BOUNDS, RESTATED FOR THE SLICED SHAPE. A job that trips `jobs.<id>.timeout-minutes` is
+    # reported `cancelled` — the service cancels the job and a step still running then takes
+    # `TaskResult.Canceled` (`StepsRunner.cs:149-155`, :154; `:331-336`) — and `cancelled` is NON-RED
+    # to this repo's rail (`scripts/admin-merge.sh` NON_RED_CONC). A STEP bound is
+    # `TaskResult.Failed` (`StepsRunner.cs:324-329`) = `failure` = red. So the RED bound must be the
+    # step's, and the job bound must sit above the sum of the step bounds or the non-red one can win:
+    #   checkout 10 + setup-node 10 + shards 70 = 90 < 100 (job)
+    # 70 min is ~1.7x the measured worst slice (41 min), so it cannot false-block a slow-but-healthy
+    # slice, and the runner's own per-shard `SHARD_BOUND` (default 1800 s, killed by process group and
+    # NAMED) bounds any single hung shard well below it.
+    # ⚠ STATED RESIDUAL, not a hidden one: the `Materialize origin/main` step carries no bound, so the
+    # 90 < 100 arithmetic above does not include it. It is a fetch, it was unbounded before this change
+    # too, and it is the one place the non-red `cancelled` path is still reachable — named here so the
+    # invariant this block proves is not read as covering a step it does not.
+    #
+    # ⛔ AND THE WHOLE-LIST CAPACITY VERDICT IS GONE FROM BOTH LANES WITH THIS CHANGE — a real loss,
+    # recorded rather than glossed. `BASH_SHARDS_BUDGET_SECS` produced the named
+    # `❌ SHARD BUDGET EXCEEDED … NOT a suite failure` line (#3174), and a sliced job cannot carry it:
+    # the runner REFUSES that pairing outright (rc 2 — a whole-list deadline measured against one
+    # slice's share of the work is ~8x too lenient and would never fire). The per-shard `SHARD_BOUND`
+    # does not replace it — it bounds ONE shard, so 20 shards x 30 min can still consume a slice and
+    # end as the platform's opaque step-timeout `failure`, with shards unrun and no recap. What is
+    # lost is the NAMING, not the bounding; a derived per-slice budget would restore it and is the
+    # follow-up, not this change.
+    timeout-minutes: 100
+    steps:
+      - uses: actions/checkout@v4
+        timeout-minutes: 10
+      # Node is pinned because the shards below include `tests/search-cost/run.sh` (Node >= 22.13 —
+      # see ci.yml's `search-cost` job). ci.yml's `bash-suites` carries the identical pin, so the two
+      # lanes run the same list under the same runtime.
+      - uses: actions/setup-node@v4
+        timeout-minutes: 10
+        with:
+          node-version: '22'
       - name: Materialize origin/main so checkout-keyed assertions are judgeable (#3131)
         # ⛔ NO `if:` on this step: `scripts/check-ci-lane-parity.sh` refuses a conditional step around the
         # shard call ("a step that may not run, whose failure cannot fail the run"), so the condition
@@ -575,42 +612,27 @@ jobs:
         # sentinel, a failure-recording sentinel) fail the step if its arms are disabled.
         # Bare call, one step: a shard failure must fail the RUN, not just a counter.
         #
-        # ⛔ THE BOUND IS SIZED FROM A MEASURED LIST, NOT FROM A GUESS, AND NOT FROM A MEASUREMENT OF A
-        # DIFFERENT LIST (agent-infra#3174). The figure this comment used to carry (46m38s-54m32s,
-        # 8 main runs on 2026-10-24) described about 80 shards; the derived list is 147 today, so
-        # "110 min is ~2.0x the top of that range" was arithmetic about a list that no longer existed.
-        # MEASURED 2026-10-31 from the job's OWN per-suite rows (`▸ <secs> <path>`, run 41240886978,
-        # job 124654357365): 147 listed suites summing 6468 s = 107.8 min of shard work, with the job
-        # itself ending at 108.2 min wall. Against the 110 min step bound that was a 132 s MARGIN —
-        # 98.0 % of the bound — so the list had already outrun its bound in every sense that matters
-        # and 13 of the measured suites are each larger than it — the 891 s suite added the same day
-        # by 4bc7f759 / #3114 is ONE OF THEM and is INSIDE the 6468 s, so it is not extra (a first
-        # draft of this comment charged it twice). No ambiguity about which end was the
-        # defect: the SUITES ARE LEGITIMATE GATES (wired by DERIVATION — a file matching SUITE_GLOBS
-        # joins the list with no workflow edit), and the CONSTANT was sized from an older list.
-        #
-        #   147 suites · 6468 s measured · 110 min bound · +132 s margin (98.0 % of bound)
-        #
-        # 150 min = 9000 s = 1.39x the measured 6468 s: 2532 s (42.2 min) of headroom, which is 2.8x
-        # the largest measured suite (`tests/atomic-land/run.sh`, 899 s = 15.0 min) and 1.5x it even
-        # measured against the runner's 7800 s budget. So the bound survives ANY one more suite of
-        # tonight's largest class without a workflow edit (6468 + 899 = 7367 s < 7800 s budget < 9000 s
-        # step bound) — while still failing fast against the ~2h46m hang that #2055 recorded.
-        #
-        # ⛔ AND THE OVERRUN IS NOW A NAMED RED, NOT AN OPAQUE ONE. `BASH_SHARDS_BUDGET_SECS` below is
-        # the runner's OWN deadline at 7800 s (130 min = 1.20x measured), 20 min INSIDE this platform
-        # bound, so the runner reaches its verdict first and says which defect it is:
-        # `❌ SHARD BUDGET EXCEEDED` (the LIST outran the bound — capacity) versus
-        # `❌ failing shard(s): <paths>` (a suite failed — attributed by name and `::error::`
-        # annotation). Before this, both were the same `failure` with nothing distinguishing them.
-        # 150 also keeps the job bound a pure backstop: 10 + 10 + 10 + 5 + 15 + 150 = 200 < 230.
+        # ⛔ THIS JOB NOW RUNS A SLICE, NOT THE LIST (measured 2026-11-03). It used to run all ~158
+        # shards serially: 130 min measured (main run 41693024926, job 126116214764), on EVERY
+        # merge, while ci.yml's `bash-suites` runs the same script as an 8-way matrix whose slowest
+        # shard is 41 min. Same work, ~3x the wall, and ~130 runner-minutes per merge is what
+        # starves the PR lane — the queue every merge then waits behind. So the slice arrives in
+        # `BASH_SHARD_SLICE` exactly as the PR lane does it, and the LIST still lives in exactly one
+        # place (the runner).
+        # ⛔ THE OLD 150-min STEP BOUND AND THE 7800 s `BASH_SHARDS_BUDGET_SECS` ARE GONE ON PURPOSE,
+        # and neither is a weakening: `run-bash-shards.sh` REFUSES that pairing with a slice (rc 2 —
+        # "the two do not compose"), because a whole-list deadline measured against one slice's share
+        # of the work is ~8x too lenient. What bounds THIS unit is the runner's own per-shard
+        # `SHARD_BOUND` (default 1800 s, killed by process group and NAMED) plus this step's 70 min —
+        # itself ~1.7x the measured worst slice (41 min), so it cannot false-block a slow-but-healthy
+        # slice. The list-wide deadline belongs to a lane that runs the whole list.
         env:
-          # Whole seconds; must stay BELOW `timeout-minutes` here so the named verdict wins. The
-          # runner refuses a non-numeric value, and refuses SET-but-EMPTY (an unset CI variable
-          # expands to empty, and treating that as "no deadline" would be a fail-open). Unsetting the
-          # var is the documented "no deadline" spelling, as is 0.
-          BASH_SHARDS_BUDGET_SECS: '7800'
-        timeout-minutes: 150
+          # <index>/<count>; count = strategy.job-total (this matrix's own size — never a second
+          # hand-kept number). The slice arrives in the STEP's env, never as an argument, so the
+          # bare `run:` call below is unchanged — which is what scripts/check-ci-lane-parity.sh
+          # asserts about BOTH lanes.
+          BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}
+        timeout-minutes: 70
         run: bash scripts/run-bash-shards.sh
 
   skill-lint:
@@ -733,7 +755,13 @@ jobs:
 
   auto-file-on-failure:
     runs-on: ubuntu-latest
-    needs: [extension-tests, script-validate, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
+    # ⛔ `script-validate-gates` IS LISTED BESIDE `script-validate`, NOT INSTEAD OF IT: the three
+    # guards (node --check, the lane-parity guard, its mutation self-test) moved into that job when
+    # the sweep became a matrix, and `needs:` is the ONLY list this filer reads — so omitting it
+    # makes a red guard unfilable while the filer looks complete. `tests/actionlint/run.sh` Case 4
+    # asserts exactly that, so the omission reds the PR lane too. (Same class as
+    # `sigpipe-grep-guard`, which the suite's own header records as a previous instance.)
+    needs: [extension-tests, script-validate, script-validate-gates, skill-lint, cost-config-guard, pi-config-extensions-guard, sigpipe-grep-guard, bash32-parse-guard, python-ci]
     if: failure() && github.ref == 'refs/heads/main'
     # ⛔ BOTH CLAUSES ARE LOAD-BEARING (#3131), in DIFFERENT directions.
     #   `failure()` must stay: the steps derive the failing set from `needs`, and the

@@ -87,8 +87,19 @@
 # does not say so answers "NO BASE COUNTERPART FOR THIS CHECK" about a red that is
 # the base's own, and that false absence is what reads as "unattributable".
 #
-#   script-validate        (on the BASE — .github/workflows/ci-main.yml)
-#     ⊇ bash-suites (<n>)  (on the PR   — .github/workflows/ci.yml)
+#   script-validate (<n>)  (on the BASE — ci-main.yml, ONE CHECK PER SLICE — the primary)
+#     ≡ bash-suites (<n>)  (on the PR   — .github/workflows/ci.yml, the SAME shard set)
+#
+#   script-validate        (the PRE-MATRIX base's single whole-list check — the FALLBACK)
+#     ⊇ bash-suites (<n>)
+#
+# ⛔ THE ORDER IS PART OF THE STATEMENT. `declared_base_equivalent` prints the slice pair FIRST
+# and the bare name second, and a reader takes the FIRST candidate the base actually publishes:
+# main is a matrix too now (agent-infra#2483, same width, same derived list, same
+# `BASH_SHARD_SLICE` seam), so slice-to-slice is an equivalence of the same shards, while the
+# bare name is only what an older base sha still calls the whole list. Stating the pair as
+# `⊇ script-validate` ALONE — as this block did until #3392's review — describes the fallback
+# and hides the arm the code prefers.
 #
 # WHY IT IS TRUE — the repo says it about itself. ⚠️ EVERY ci.yml COORDINATE BELOW IS
 # ANCHORED BY ITS QUOTED TEXT, and the quotes are the authority: ci.yml is a busy file
@@ -103,8 +114,20 @@
 #     `bash-suites (1)` … `bash-suites (N)`, one check per slice, and each slice's step is
 #     `run: bash scripts/run-bash-shards.sh`;
 #   * ci-main.yml — "the main lane runs the SAME sweep as ci.yml's `bash-suites` — this job
-#     calls the one runner below, UNSHARDED", and that call is the step
-#     `bash scripts/run-bash-shards.sh`; main publishes ONE check named `script-validate`;
+#     calls the one runner below" and that call is the step
+#     `bash scripts/run-bash-shards.sh`. ⛔ MAIN IS A MATRIX TOO NOW (agent-infra#2483): it publishes
+#     `script-validate (1)` … `script-validate (N)`, one check per slice, over the SAME derived list
+#     and with the SAME `BASH_SHARD_SLICE` seam. So the counterpart of `bash-suites (<n>)` is
+#     `script-validate (<n>)` — the same shard SET — and the bare `script-validate` remains as the
+#     fallback name for a base sha that predates the matrix. `declared_base_equivalent` prints both,
+#     slice first, and the caller takes the first that the base actually publishes; printing only the
+#     slice form would make the mapping silently useless on an older base, and printing only the bare
+#     form would make it silently useless on a current one — either way `NO BASE COUNTERPART` about a
+#     red the base owns, which is the false absence this whole block exists to abolish.
+#   * ci-main.yml — the three whole-tree guards that used to be steps of `script-validate` now live in
+#     a SEPARATE job, `script-validate-gates`. That is NOT part of this pair (it does not run the shard
+#     list), so a `bash-suites-gate` PR red maps to nothing here — see the residual note below, which
+#     this split changes from "main has no such job" to "main has one under a third name".
 #   * ci.yml — "ci-main.yml's `script-validate`: one runtime for the list, in both lanes",
 #     and "today — ci-main.yml's script-validate job runs bash shards only". ⛔ NOT the block
 #     that is the HISTORY of the pre-#1369 split ("while main's `script-validate` ran the bash
@@ -114,12 +137,12 @@
 #   base reports this program under the other lane's name.
 #
 # ⛔ CONTAINMENT, NOT EQUALITY — and the difference is load-bearing. Main's
-# `script-validate` job has SEVEN steps: four validation steps (the `node --check` syntax
-# pass, the lane-parity guard, that guard's mutation self-test, and the shard list), the two
-# setup steps (`actions/checkout`, `actions/setup-node`), and the `Materialize origin/main`
-# fetch step added by #3131/#3139 — while a `bash-suites (<n>)` slice runs only the shard
-# list. So a red under that name may be the shard list's red — or ANY other step's,
-# including setup or the fetch. The equivalence therefore establishes that the base RUNS
+# `script-validate` job (the matrix) has FOUR steps: `actions/checkout`, `actions/setup-node`, the
+# `Materialize origin/main` fetch added by #3131/#3139, and the shard list — while a
+# `bash-suites (<n>)` slice runs only the shard list. The three whole-tree guards (`node --check`,
+# the lane-parity guard, its mutation self-test) are now their own job, `script-validate-gates`, and
+# are deliberately NOT part of this pair. So a red under `script-validate (<n>)` may be the shard
+# list's red — or the fetch's, or setup's. The equivalence therefore establishes that the base RUNS
 # this program and carries A red under its name; it can never establish that the base's red
 # is this suite's. That is why the answer is phrased as a candidate (`base-caused via`) and
 # why the paragraph under it says so out loud.
@@ -158,9 +181,14 @@
 #
 # ── A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE (#3322) ────────────
 # THE DEFECT. This repo splits its suites by trigger: `ci.yml` is `pull_request`-only
-# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep
-# UNSHARDED, as `script-validate` (cited in ci-main.yml's own comment). Main is red on
-# `script-validate`; every PR is red on the shards. The probe below correctly calls
+# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep under
+# the other lane's name (cited in ci-main.yml's own comment). ⛔ THE NAME MAIN PUBLISHES IS NOT
+# A CONSTANT, AND THAT IS THE TRAP: at the measurement below (2026-11-05) main's
+# `script-validate` was ONE unsharded check, so main was red on `script-validate` while every
+# PR was red on the shards; since agent-infra#2483 main is an 8-way matrix too, so the SAME
+# defect now arrives as `script-validate (1)` … `script-validate (8)`. BOTH shapes must be
+# matched — which is why `declared_base_equivalent` answers slice-first with the bare name as
+# the pre-matrix fallback, and why every reader tries both candidates. The probe below correctly calls
 # main's red NOT-PR-EVALUABLE (#6807) and reports it without blocking — and that left
 # it in NO set the rail could use. §4.5 then read the PR's own tree, saw the shards
 # red, and refused with "a red still here means the repair is incomplete" for a red no
@@ -174,9 +202,10 @@
 #       base ref, not taken from a caller flag — carries a RED whose workflow declares
 #       no `pull_request`/`pull_request_target` trigger (the #6807 class: no PR can
 #       ever attach a check to a head sha for it); and
-#   (ii) that base red's NAME is this tree check's name, or the name
-#       `declared_base_equivalent` declares for it (the one cited pair,
-#       `bash-suites (<n>)` == `script-validate`).
+#   (ii) that base red's NAME is this tree check's name, or one of the names
+#       `declared_base_equivalent` declares for it (the one cited pair: the SLICE
+#       `script-validate (<n>)` first, since main is a matrix too, with the bare
+#       `script-validate` as the pre-matrix fallback).
 # So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
 # main is red on that suite at read time. Every fail-closed path holds:
 #   * an UNREADABLE or PARTIAL base read excuses NOTHING, but not because the set is empty:
@@ -218,12 +247,19 @@
 #     family, where a base-side reproduction — never a name match — is the only evidence that
 #     could exist.
 # That is a refusal with a reason, never a silent pass.
-# ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
-# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
-# check `script-validate`, so while main is red on it, EVERY shard is excluded — including
-# a shard failure THIS PR introduced, whose cause is on no base. Per-shard attribution is
-# not available from base-side evidence (main publishes the sweep as ONE job-level red),
-# and inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
+# ⛔ THE SECOND RESIDUAL, NAMED: WHERE THE BASE IS STILL UNSHARDED THE EXCLUSION IS
+# LANE-GRANULAR, NOT SHARD-GRANULAR — AND THAT IS NOW THE FALLBACK CASE ONLY.
+# `declared_base_equivalent` answers slice-to-slice FIRST (`bash-suites (<n>)` →
+# `script-validate (<n>)`), and since main is a matrix too (agent-infra#2483) a current base
+# publishes one check per slice — so against a CURRENT base the exclusion is SHARD-GRANULAR:
+# a base red on `script-validate (5)` excludes `bash-suites (5)` and leaves the other shards
+# blocking. The lane-granular reading survives only on a PRE-MATRIX base sha, where the bare
+# `script-validate` fallback matches EVERY `bash-suites (<n>)` — so while such a base is red on
+# its one whole-list check, EVERY shard is excluded, including a shard failure THIS PR
+# introduced whose cause is on no base. (That was the shape at #3322's measurement, 2026-11-05,
+# when main published the sweep as a single whole-list check.) ⛔ EVEN THERE it is not a
+# per-shard attribution: a base-side red under ONE name cannot say WHICH shard is at fault, so
+# inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
 # the guard for an ATTRIBUTABLE failure is deliberately NOT this rule and is untouched by
 # it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
 # reproduction still runs the residual on a pristine base worktree and refuses anything
@@ -1675,13 +1711,24 @@ fetch_run_failed_job_names() {
 # failure the log was fetched for; every NAMED non-red is excluded for the same reason.
 
 # declared_base_equivalent <pr-check-name> — THE DECLARED LANE EQUIVALENCE (#2610):
-# print the BASE-side check NAME this PR-side check is equivalent to, or nothing when
-# there is none. TWO readers, one question (see the header): `named_unattributable_runs`
-# names with it and exempts nothing; `base_owned_check` (#3322) uses it to decide a §4.5
-# exclusion, and only together with the base's own MEASURED red. The pair, its reason
-# and its citations are in the header ("THE ONE
-# DECLARED LANE EQUIVALENCE"); this is the ONE implementation, and a SECOND name-keyed
-# map is the drift the rail's one-derivation rule forbids.
+# print ZERO OR MORE candidate BASE-side check NAMES this PR-side check may be equivalent to, ONE PER
+# LINE, strongest first — or nothing when there is none. ⛔ A caller MUST try every line: the first is
+# the precise counterpart (slice-to-slice, since main publishes one check per slice), and the later one
+# is the LEGACY name a pre-matrix base still uses. Reading only the first line would restore the false
+# absence on every older base sha.
+#
+# TWO readers, one question (see the header), and ⛔ BOTH MUST TRY EVERY LINE: `named_unattributable_runs`
+# (step 1c) names with it and exempts nothing; `base_owned_check` (#3322) uses it to decide a §4.5
+# exclusion, and only together with the base's own MEASURED red. The pair, its reason and its citations
+# are in the header ("THE ONE DECLARED LANE EQUIVALENCE"); this is the ONE implementation, and a SECOND
+# name-keyed map is the drift the rail's one-derivation rule forbids.
+#
+# ⛔ A MULTI-LINE ANSWER IS THE WHOLE POINT OF THE SPLIT, SO A READER THAT NEEDS ONE NAME MUST PICK ONE.
+# The function answers "what MIGHT this be called on the base", plural because a matrix base and a
+# pre-matrix base disagree; a reader that prints or records a name owes exactly ONE. Handing the raw
+# multi-line string to a single-name consumer puts a raw newline inside a TAB-delimited
+# `MAIN_HEALTH_ALL_REDS` record (`<job>\t<kind>`), splitting one record into two and garbling the
+# operator message — so each reader resolves the candidate it actually matched, per line.
 #
 # ⛔ STRUCTURAL, NOT A PREFIX, AND DELIBERATELY NARROW. Every arm is a specific,
 # cited pair. A rule that read "a shell suite failed" as an equivalence would make
@@ -1695,10 +1742,10 @@ fetch_run_failed_job_names() {
 # stale the day the matrix widens. A shard number that does not exist cannot appear
 # on any surface, so the un-bounded form cannot manufacture a counterpart.
 #
-# ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED. Main has NO
-# `bash-suites-gate` JOB (`grep -c bash-suites-gate ci-main.yml` = 0): on main the two
-# programs that PR job runs — the lane-parity guard and its mutation self-test — are
-# STEPS inside `script-validate` (named, not line-cited: see the note there). So a
+# ⚠️ THE `bash-suites-gate` RESIDUAL, STATED RATHER THAN IMPLIED — AND RESTATED SINCE THE SPLIT.
+# Main has NO job NAMED `bash-suites-gate` (`grep -c bash-suites-gate ci-main.yml` = 0), but since
+# agent-infra#2483 the two programs that PR job runs — the lane-parity guard and its mutation
+# self-test — are STEPS inside `script-validate-gates`, a third name this ONE pair does not map. So a
 # `bash-suites-gate` red
 # ALSO has a base counterpart under that name, and this ONE pair does not map it: that
 # refusal keeps today's unqualified absence answer, which is a KNOWN RESIDUAL (a
@@ -1706,6 +1753,18 @@ fetch_run_failed_job_names() {
 # it would be a second pair with its own fixture, and the brief for this change is
 # explicitly one pair.
 #
+# ⛔ TWO CANDIDATES, SLICE FIRST, BECAUSE MAIN IS NOW A MATRIX TOO (measured 2026-11-03).
+# Until this change main published ONE check named `script-validate`; it now publishes one per
+# slice — `script-validate (1)` … `script-validate (N)` — because it runs the same 8-way slice the
+# PR lane does (`BASH_SHARD_SLICE`, same runner, same derived list). So the precise counterpart of
+# `bash-suites (<n>)` is `script-validate (<n>)` — the SAME slice, i.e. the same shards — and the
+# bare name is the FALLBACK for a base sha that predates the matrix. Printing only the bare name
+# would keep the mapping correct for old bases and silently useless for new ones: the lookup would
+# miss and the rail would print its unqualified "NO BASE COUNTERPART" about a base red that IS the
+# base's own (#2610's false absence, reintroduced by a naming change).
+# ⛔ THE ORDER IS THE STATEMENT: slice-to-slice is an EQUIVALENCE OF THE SAME SHARD SET (stronger
+# than the old containment), and the bare name is the weaker legacy candidate. The caller takes the
+# FIRST candidate that actually appears in the base's red list, so an old base still matches.
 # No exit status is used to mean "no equivalence": an empty stdout is the answer, so a
 # caller can never mistake "not mapped" for a failure of the mapping.
 declared_base_equivalent() {
@@ -1717,6 +1776,8 @@ declared_base_equivalent() {
       case "$shard" in
         ''|*[!0-9]*) return 0 ;;
       esac
+      # slice-to-slice first (the same shard set), then the pre-matrix single check
+      printf '%s\n' "script-validate (${shard})"
       printf '%s\n' 'script-validate'
       ;;
   esac
@@ -1729,7 +1790,6 @@ declared_base_equivalent() {
 # MEASURED surface (one failing check name per line, restricted to the ones whose
 # workflow declares no PR trigger) — so this function only matches; it never decides
 # what main fails.
-#
 # ⛔ A MISSING OR EMPTY FILE ADMITS NOTHING. An unreadable base surface, a clean base,
 # and a base whose only reds are PR-evaluable all produce an empty file, and all three
 # must leave the red blocking (see "A CHECK MAIN ITSELF FAILS" in the header). A
@@ -1741,17 +1801,29 @@ declared_base_equivalent() {
 # ⛔ NO EXIT STATUS MEANS "NOT BASE-OWNED", exactly like `declared_base_equivalent`:
 # the answer is stdout, so a caller can never mistake an empty answer for a failure.
 base_owned_check() {
-  local name="${1:-}" names_file="${2:-}" mapped=""
+  local name="${1:-}" names_file="${2:-}" mapped="" cand=""
   [ -n "$name" ] && [ -s "$names_file" ] || return 0
   if grep -Fxq -e "$name" -- "$names_file" 2>/dev/null; then
     printf '%s\n' "$name"
     return 0
   fi
-  mapped="$(declared_base_equivalent "$name")"
-  [ -n "$mapped" ] || return 0
-  if grep -Fxq -e "$mapped" -- "$names_file" 2>/dev/null; then
-    printf '%s\n' "$mapped"
-  fi
+  # ⛔ ONE CANDIDATE AT A TIME, AND ONLY THE ONE THAT MATCHED IS PRINTED. `declared_base_equivalent`
+  # answers with BOTH the slice-to-slice name and the legacy bare name; echoing that whole answer here
+  # would emit "script-validate (3)\nscript-validate" into `base_owned`, which the caller interpolates
+  # into a TAB-delimited `MAIN_HEALTH_ALL_REDS` record and into the operator's message — one record
+  # becomes two lines and the message reads 'the base itself fails 'script-validate (3) <newline>
+  # script-validate''. Read line-by-line, NOT word-split: a check name carries a space
+  # (`script-validate (5)`), which is exactly what a `for` over `$(…)` would break — the same reason
+  # `named_unattributable_runs` iterates this way. First candidate the base actually publishes wins.
+  while IFS= read -r cand; do
+    [ -n "$cand" ] || continue
+    if grep -Fxq -e "$cand" -- "$names_file" 2>/dev/null; then
+      printf '%s\n' "$cand"
+      return 0
+    fi
+  done <<EOF_BASE_OWNED_CANDS
+$(declared_base_equivalent "$name")
+EOF_BASE_OWNED_CANDS
   return 0
 }
 
@@ -1926,24 +1998,54 @@ named_unattributable_runs() {
             # thing this refusal must never print.
             # ⛔ THE MAPPED NAME GOES OUT OF BAND TOO (same reason as P3-3 above): it is
             # a constant today, but a future pair must not inherit an `awk -v` hole.
-            mapped="$(declared_base_equivalent "$name")"
+            mapped=""
             mapped_kind=""
             mapped_rc=0
-            if [ -n "$mapped" ]; then
-              # Same here-string reason as the same-name lookup above (cycle 7, P2).
-              mapped_kind="$(NR_NAME="$mapped" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }' <<< "$base_reds")" || mapped_rc=$?
-            fi
+            # ⛔ EVERY CANDIDATE IS TRIED, IN ORDER, AND THE FIRST THAT THE BASE ACTUALLY PUBLISHES
+            # WINS. `declared_base_equivalent` prints the slice-to-slice name first and the legacy
+            # bare name second, so this answers correctly on a matrix base (slice) AND on a base sha
+            # that predates the matrix (bare) — while a name that hits NEITHER keeps today's
+            # unqualified absence answer. Read line-by-line, not word-split: a check name carries a
+            # space (`script-validate (5)`), which is exactly what a `for` over `$(…)` would break.
+            while IFS= read -r _mapped_cand; do
+              [ -n "$_mapped_cand" ] || continue
+              _mk=""
+              _mk="$(NR_NAME="$_mapped_cand" awk -F'\t' '$1 == ENVIRON["NR_NAME"] { print $2; exit }' <<< "$base_reds")" || mapped_rc=$?
+              if [ -n "$_mk" ]; then mapped="$_mapped_cand"; mapped_kind="$_mk"; break; fi
+            done <<EOF_MAPPED_CANDS
+$(declared_base_equivalent "$name")
+EOF_MAPPED_CANDS
             if [ -n "$mapped_kind" ]; then
               say_err "       base: base-caused via ${mapped} ≡ ${name} (${mapped_kind})"
               say_err "       DECLARED LANE EQUIVALENCE, not an identity and not an exemption: the two"
-              say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
-              say_err "       scripts/run-bash-shards.sh UNSHARDED as ONE of its steps"
-              say_err "       (.github/workflows/ci-main.yml, step 'Bash shards'), and '${name}' is one"
-              say_err "       shard of that same list on a PR (.github/workflows/ci.yml, one runtime in both"
-              say_err "       lanes). The base therefore carries a red under a name that RUNS this list — but"
-              say_err "       that job has SIX other steps (checkout, setup-node, node --check, the lane-parity"
-              say_err "       guard, its self-test, and the origin/main materialization that #3131 added), so the"
-              say_err "       base's red may be this suite's or any of theirs. A CANDIDATE counterpart, not"
+              case "$mapped" in
+                'script-validate ('*')')
+                  # THE SLICE-FORM ANSWER: main publishes one check per slice (#2483), so this names
+                  # the SAME shard SET as the PR's shard — the strongest form of this equivalence.
+                  say_err "       lanes run ONE list under TWO names — main's '${mapped}' is the SAME"
+                  say_err "       SLICE of it as '${name}' (agent-infra#2483: main is a matrix too, same"
+                  say_err "       width, same derived list, so slice <n> covers the same shards). The base"
+                  say_err "       therefore carries a red under a name that RUNS these shards — but that"
+                  say_err "       job also runs checkout, setup-node and the origin/main materialization"
+                  say_err "       (#3131), so the base's red may be this suite's or any of theirs."
+                  ;;
+                *)
+                  # THE LEGACY ANSWER: a bare 'script-validate' is by definition a PRE-MATRIX base,
+                  # which ran the list UNSHARDED — so it is the whole list, not a slice. Saying
+                  # "a SLICE of it" here (as an earlier draft did) contradicted the very next clause.
+                  say_err "       lanes run ONE list under TWO names — main's '${mapped}' calls"
+                  say_err "       scripts/run-bash-shards.sh UNSHARDED over the WHOLE list (this is the"
+                  say_err "       pre-matrix base name; since agent-infra#2483 a current base publishes"
+                  say_err "       '${mapped%% *} (<n>)' per slice instead, which this mapping prefers),"
+                  say_err "       and '${name}' is one shard of that same list on a PR"
+                  say_err "       (.github/workflows/ci.yml, one runtime in both lanes). The base therefore"
+                  say_err "       carries a red under a name that RUNS this list — but that job has THREE"
+                  say_err "       other steps (checkout, setup-node, and the origin/main materialization"
+                  say_err "       that #3131 added), so the base's red may be this suite's or any of"
+                  say_err "       theirs."
+                  ;;
+              esac
+              say_err "       A CANDIDATE counterpart, not"
               say_err "       an established identity: no identity was produced, so nothing here is"
               say_err "       comparable yet"
             elif [ "$mapped_rc" -ne 0 ]; then

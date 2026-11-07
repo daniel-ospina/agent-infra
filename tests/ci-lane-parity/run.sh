@@ -1,5 +1,5 @@
 #!/bin/bash
-# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
+# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate-gates`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
 # tests/ci-lane-parity/run.sh — #1369 regression suite for scripts/check-ci-lane-parity.sh
 # and the one-runner design it asserts.
 #
