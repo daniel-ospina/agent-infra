@@ -145,15 +145,27 @@ TMP="$(cd "$TMP" && pwd)" || { echo "❌ SKIP-CANNOT-RUN: cannot canonicalise $T
 cat > "$TMP/.boothook" <<'BOOTHOOK'
 if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
   case "$0" in
-    bash|-bash) printf "inline\n" >> "${RANK_QUEUE_INLINELOG:-/dev/null}" 2>/dev/null || : ;;
     /*)         _b="$0" ;;
     *)          _b="$PWD/$0" ;;
   esac
-  if [ -n "${_b:-}" ] && [ -f "$_b" ]; then
+  # ⛔ AND AN UNRESOLVABLE `$0` IS COUNTED, NOT DROPPED (review P2, cycle 97). `bash -c "$(cat body)" NAME` and
+  # `bash /dev/stdin < body` are executions the hook cannot resolve to a case-dir file: the first leaves `$0` = NAME
+  # (not a file), the second leaves a file OUTSIDE `$TMP`. Both were invisible — measured: three different unprotected
+  # bodies ran and the suite printed ✅ with `logged=1 inline=0`, `bootlog_hits=0`, or `bootlog=/dev/stdin` dropped by
+  # the sweep's `*) continue`. Anything that is not a regular file AT ALL is now counted like the literal-`bash` form.
+  if [ ! -f "$_b" ]; then
+    printf "inline\n" >> "${RANK_QUEUE_INLINELOG:-/dev/null}" 2>/dev/null || :
+  else
     printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null || :
     set -T
-    trap 'printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
-    trap 'case "$BASH_COMMAND" in exec[[:space:]]*) printf "%s\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;; esac' DEBUG
+    trap 'printf "%s\tE\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || :' EXIT
+    # ⛔ EVERY RECORD IS TAGGED WITH THE TRAP THAT WROTE IT (review P2/P3, cycle 97): `E` = an END state (this EXIT trap,
+    # or an `exit`/`return` about to run), `D` = a point-in-time state taken for `exec`. See `_opts_for` for why the
+    # distinction is load-bearing.
+    trap 'case "$BASH_COMMAND" in
+            exec[[:space:]]*) printf "%s\tD\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
+            exit|exit[[:space:]]*|return|return[[:space:]]*) printf "%s\tE\t%s\n" "$_b" "$-" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
+          esac' DEBUG
   fi
 fi
 BOOTHOOK
@@ -3582,7 +3594,15 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # a `TMP` containing a backslash made EVERY lookup miss its own record and the channel quietly collapsed back to the
 # textual `_setu` — i.e. cycle 93's P2 false PASS returned in silence, on the one code path added to retire it. The
 # pin section has required `ENVIRON[]` for exactly this reason since cycle 83; this is the same rule, same file.
-_opts_for() { RQ_P="$1" awk -F'\t' '$1==ENVIRON["RQ_P"] { o = $2 } END { print o }' "$TMP/.optlog" 2>/dev/null; }
+# ⛔ THE LAST **END** RECORD WINS, NOT THE LAST RECORD (review P2, cycle 97). `set -T` extends the DEBUG trap into
+# BACKGROUND subshells, so `( sleep 0.5; exec /bin/true ) &` writes its FORK-time `$-` after the parent's EXIT record:
+# measured, a driver that backgrounds a subshell and then does `set -u` was graded BARE (false red) and one that
+# backgrounds it and then does `set +u` was graded PROTECTED (false pass) — the verdict was the state at fork. An `E`
+# record is an end state (the EXIT trap, or an `exit`/`return` about to run); a `D` record is a point-in-time snapshot
+# taken for `exec`, used only when the script left no end record at all.
+_opts_for() { RQ_P="$1" awk -F'\t' '
+  $1==ENVIRON["RQ_P"] { if ($2=="E") e=$3; else d=$3 }
+  END { print (e != "" ? e : d) }' "$TMP/.optlog" 2>/dev/null; }
 _setu_verdict() { # $1=script -> 0 when it RUNS under nounset (empirical when possible)
   _o="$(_opts_for "$1")"
   if [ -n "$_o" ]; then case "$_o" in *u*) return 0 ;; *) return 1 ;; esac; fi
@@ -3636,10 +3656,13 @@ while IFS= read -r _il; do
 done <<EOF2
 $(sed '/^$/d' "$TMP/.inlinelog" 2>/dev/null)
 EOF2
-exec_total=0; exec_bare=""; exec_missing=""
+exec_total=0; exec_bare=""; exec_missing=""; exec_foreign=""
 while IFS= read -r _ex; do
   [ -n "$_ex" ] || continue
-  case "$_ex" in "$TMP"/*) : ;; *) continue ;; esac
+  # ⛔ A LOGGED PATH OUTSIDE `$TMP` IS NAMED, NOT DROPPED (review P2, cycle 97). `bash /dev/stdin < body` logs
+  # `/dev/stdin`; `*) continue` discarded it and the body ran ungraded while the assertion claimed "the graded
+  # population is now exactly the logged one". Measured: such a body ran without nounset and the suite printed ✅.
+  case "$_ex" in "$TMP"/*) : ;; *) exec_foreign="$exec_foreign $_ex"; continue ;; esac
   # ⛔ A LOGGED PATH THAT NO LONGER EXISTS REDS (review P3, cycle 90). `|| continue` let a script that ran and then
   # removed itself simply leave the population — measured: an executed, self-deleting driver left the sweep at 177/0
   # with the same count. The absence is a fact about the run, so it is named, not skipped.
@@ -3654,10 +3677,13 @@ while IFS= read -r _ex; do
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
+if [ -n "$exec_foreign" ]; then
+  echo "      OUTSIDE \$TMP: the hook recorded an execution this sweep cannot grade —${exec_foreign} — a body run from outside the sandbox is outside the population the check names"
+fi
 if [ "$inline_total" -ne 0 ]; then
   echo "      INLINE: $inline_total bod$([ "$inline_total" -eq 1 ] && echo y || echo ies) ran through \`bash -c\`/a heredoc feed with no FILE to grade — nothing about their \`set -u\` state could be observed, so extract each into a case dir and run it as a file"
 fi
-if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$exec_foreign" ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
 else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, no shim exemption); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
 ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
