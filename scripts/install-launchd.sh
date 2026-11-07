@@ -1116,6 +1116,22 @@ verify_targets() {
                     # derives `data` for them), so what lands here is an absolute element at a
                     # genuinely undecidable position — an `env` program, a script handed to an
                     # interpreter, a second positional — and the conservative arm is the right one.
+                    # ⛔ BUT IT STILL CONSULTS THE GRANT, exactly as the `exec` arm below does. The
+                    # fallback derives the LAUNCHER role now, so `$grants` is populated on this path:
+                    # without this branch, `[<TCC-root BINARY>, <script in the SAME TCC root>]` — the
+                    # shape the two `com.tortoise.*` reapers render whenever the farmed entry resolves
+                    # into the tree — was WARNed and installed by the python reader and SKIPped +
+                    # DISARMED here, i.e. a working unit silently removed from the box (fresh review of
+                    # #3413, round 7 P2).
+                    root="$(tcc_protected_root "$arg")"
+                    case "$grants" in
+                        *" $root "*)
+                            echo "    WARN TCC-protected target: $arg" >&2
+                            echo "        inside $root, the SAME tree this unit's launcher holds a" >&2
+                            echo "        grant for (#1311) — installing, not skipping." >&2
+                            continue
+                            ;;
+                    esac
                     echo "    TCC-protected target: $arg" >&2
                     echo "        the role cannot be derived without python3, so this is treated as" >&2
                     echo "        EXECUTED: launchd cannot read it (#427) and arming it would exit 126." >&2

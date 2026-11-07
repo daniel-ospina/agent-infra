@@ -1687,6 +1687,24 @@ OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "--split-string=/bin/ba
 set -e
 assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: --split-string=<cmd> is split, not dropped"
 
+# (c22h) THE GRANT APPLIES TO THE `unknown` ROLE TOO. `[<TCC-root BINARY>, <script in the SAME TCC
+# root>]` is what the two `com.tortoise.*` reapers render whenever the farmed entry resolves into the
+# tree: the launcher is a BINARY, which #1311 measured DOES hold the grant for that tree, so the
+# python reader WARNs and INSTALLS. The `unknown` arm set `tcc_exec=1` without consulting `$grants` —
+# which the fallback now populates, because it derives the launcher role — so the same unit was
+# SKIPped AND DISARMED there: a working unit silently removed (fresh review of #3413, round 7 P2).
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: an executed target in the launcher's OWN TCC tree WARNS (the binary holds the grant)"
+assert_contains "$OUT" "WARN TCC-protected target: $PROBE_DEAD" "§7c …and says it is the same tree, as the python reader does"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the reaper is not skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit is installed"
+else
+    bad "§7c …and the unit is installed"
+fi
+
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
 mkdir -p "$PROBE_HOME/Documents/checkout/with space"
