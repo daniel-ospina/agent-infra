@@ -5150,7 +5150,7 @@ fi
 #     → :2482 :4186 :6501 :6613, plus a comment mention at :2356) and the
 #     same four PREDICATE sites are at head
 #     (`grep -n 'grep -qxF' scripts/record-review.sh` prints all four PREDICATE lines at head —
-#     CITE-CHECK: :2546 :4272 :6639 :6796, plus a comment mention at :2415; `14.1c-CITE` below
+#     CITE-CHECK: :2546 :4272 :6639 :6813, plus a comment mention at :2415; `14.1c-CITE` below
 #     re-derives these numbers, so they cannot rot silently): the only diff hunk at
 #     `post_marker()` (:2524) ADDS A COMMENT — the
 #     predicate line beside it (:2546) is CONTEXT, not a change.
@@ -5533,8 +5533,8 @@ assert_contains "$RECORD_ERR" "NO PENDING MARKER FOR THIS RUN IS ON DISK EITHER"
 # exists, which this arm cannot see — so both captures must say WHICH bytes they mean.
 assert_contains "$RECORD_ERR" "for the marker this run owed" \
     "14.1d(i) …and the exit-5 remedy scopes 'would find NOTHING' to the marker THIS RUN owed (a stale earlier marker for the same PR is still in the pending file)"
-assert_contains "$RECORD_ERR" "can only deliver an OLDER pending marker" \
-    "14.1d(i) …and says what the flush WOULD do in that state, so the second clause is not itself an unscoped prediction"
+assert_contains "$RECORD_ERR" "it cannot deliver THESE BYTES" \
+    "14.1d(i) …and states the INVARIANT (the flush cannot carry bytes no attempt wrote) instead of enumerating its outputs, which omitted the EMPTY-file and refusal arms"
 assert_not_contains "$RECORD_ERR" "and would answer 'nothing pending'" \
     "14.1d(i) …never the unscoped form, which predicts the flush's OUTPUT and is false whenever an earlier marker is pending"
 # ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
@@ -5569,12 +5569,54 @@ assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
 PATCH_FAIL_PR=424365
 STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
     run_record_633 "$PATCH_FAIL_PR" "$SHA" "$DC_CRUNS"
-assert_contains "$RECORD_ERR" "NO PENDING COPY FROM THIS ATTEMPT IS ON DISK" \
-    "14.1d(j) the PATCH arm's comment-visible message names the real state when its own persist failed"
+assert_contains "$RECORD_ERR" "NO PENDING COPY OF THIS RUN'S MARKER IS ON DISK" \
+    "14.1d(j) the PATCH arm's comment-visible message names the real state when BOTH of its persist attempts failed"
 assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"
 rm -f "$PEND_CONF_DIR/pending"
 mkdir -p "$PEND_CONF_DIR/pending"   # restore the real directory for later vectors
+
+# ⛔ 14.1d(j2) A FAILED *RETRY* DOES NOT MAKE THE BYTES ABSENT (#3712 review round 6, P2).
+# The arm writes the pending file TWICE: once BEFORE the PATCH (so a shell killed mid-PATCH
+# leaves a recoverable copy) and again as a RETRY when the PATCH is refused. Both write the
+# same $MISSING to the same (repo,PR)-keyed path, and `marker_pending_write` returns 1 WITHOUT
+# unlinking the target — so when the retry fails after the first write succeeded, this run's
+# bytes ARE on disk and `--flush-pending` WOULD deliver them. Reading the state off the retry
+# alone told an operator the opposite …and withdrew a remedy that worked. This vector drives
+# exactly that window with a counting `mv` stub: the FIRST pending-marker move succeeds, the
+# SECOND fails. ⛔ The stub keys on the DESTINATION — the 3rd argument of `mv -f`, which is the
+# shape `marker_pending_write` uses — because keying on the 2nd would test the `.tmp` SOURCE,
+# which never ends in `.marker` and so never fires (measured: an earlier draft of this stub
+# matched nothing and the vector passed VACUOUSLY with counter 0). It is scoped to
+# `*/pending/*.marker`, so the recorder's other `mv` (:3501, into a mktemp path) is unaffected.
+rm -f "$T/bin/mv"
+_MV_REAL="$(command -v mv)"
+_MV_COUNT="$T/mvcount-pending"
+printf '0' > "$_MV_COUNT"
+cat > "$T/bin/mv" <<MVSTUB
+#!/usr/bin/env bash
+# marker_pending_write runs "command mv -f <src> <dst>", so the DESTINATION is the 3rd
+# argument. Matching the 2nd would test the .tmp SOURCE, which never ends in .marker.
+case "\${3:-}" in
+  */pending/*.marker)
+    n=\$(cat "$_MV_COUNT" 2>/dev/null || echo 0); n=\$((n+1)); printf '%s' "\$n" > "$_MV_COUNT"
+    if [ "\$n" -ge 2 ]; then exit 1; fi ;;
+esac
+exec "$_MV_REAL" "\$@"
+MVSTUB
+chmod +x "$T/bin/mv"
+PEND_RETRY_PR=424366
+STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
+    run_record_633 "$PEND_RETRY_PR" "$SHA" "$DC_CRUNS"
+rm -f "$T/bin/mv"
+assert_eq "$(cat "$_MV_COUNT" 2>/dev/null || echo 0)" "2" \
+    "14.1d(j2) NON-VACUITY: the pending-marker move ran twice and the SECOND one failed (the window below is REACHED, not assumed)"
+assert_not_contains "$RECORD_ERR" "NO PENDING COPY OF THIS RUN'S MARKER IS ON DISK" \
+    "14.1d(j2) …a failed RETRY makes NO absence claim — the pre-PATCH copy is still on disk"
+assert_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
+    "14.1d(j2) …so the WORKING flush remedy is still offered, instead of the hand-PATCH a false absence claim demands"
+assert_not_contains "$RECORD_ERR" "⚠️ body-marker: could NOT persist" \
+    "14.1d(j2) …and no persist warning is printed at all: the bytes ARE on disk, so there is nothing to warn about"
 
 # 14.1e THE DURABLE CHANNEL IN `--recover-body` (#3168 fresh-review finding 1).
 #      The recovery verb exists BECAUSE the body was the only copy of the verdict that
@@ -5950,7 +5992,7 @@ assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agen
 #       next reader does not mistake it for evidence about this diff. The predicate must
 #       match the gate's line-anchored `^…$` admission, exactly like the three other
 #       sites already anchored on main (bd1b205d :4186 :6501 :6613) — the same four that the grep
-#       above prints at head, CITE-CHECK: :4272 :6639 :6796 (`14.1c-CITE` re-derives the triple).
+#       above prints at head, CITE-CHECK: :4272 :6639 :6813 (`14.1c-CITE` re-derives the triple).
 #       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
 #       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
