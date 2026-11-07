@@ -945,6 +945,29 @@ for _seam in "WIP_SWEEP_BUDGET=abc" "WIP_SWEEP_MAX=abc" "WIP_SWEEP_RESCUE=$T/no-
   fi
 done
 
+# ⛔ R4 — THE USABILITY PROBE ITSELF MUST BE BOUNDED (#3588 review, cycle 5). `rescue_usable` EXECUTES the
+# rescuer to see whether it can answer, and it ran with NO watchdog — while every other subprocess in the
+# file is clamped. Measured before the fix: a rescuer that sleeps on `--verdict` was still blocked after
+# 8 s with `WIP_SWEEP_STATUS_TIMEOUT=1` (the outer `timeout` fired, rc=124), i.e. the hang was unbounded.
+# This is the call that runs AFTER the kill sweep and BEFORE the restart on the quiesce path, so a hang
+# there leaves the cell with zero controllers. A probe that cannot answer in time is NOT usable — the
+# refusal direction, never a green one.
+printf '%s\n' '#!/usr/bin/env bash' \
+  'case " $* " in' \
+  '  *" --verdict "*) sleep 30; echo "verdict=clean paths=0 branch=x slug=x issue=-"; exit 0 ;;' \
+  'esac' 'exit 0' > "$T/hang-rescuer.sh"
+chmod +x "$T/hang-rescuer.sh"
+_T0="$(date +%s)"
+O_R4="$(env WIP_SWEEP_RESCUE="$T/hang-rescuer.sh" WIP_SWEEP_STATUS_TIMEOUT=1 WIP_SWEEP_BUDGET=1 \
+        WIP_SWEEP_STATE_DIR="$T/state-r4" bash "$SW" --dry-run --repo "$T/vclean/wt" 2>&1)"; RC_R4=$?
+_ELAPSED=$(( $(date +%s) - _T0 ))
+has "$O_R4" 'not a USABLE' \
+  && ok "R4 a rescuer that HANGS on --verdict is REFUSED (the probe is watchdog-bounded)" \
+  || bad "R4 a hanging rescuer was not refused (rc=$RC_R4): $O_R4"
+[ "$_ELAPSED" -lt 15 ] \
+  && ok "R4b …within the bound (${_ELAPSED}s against a 30 s hang — previously unbounded)" \
+  || bad "R4b the usability probe was UNBOUNDED: ${_ELAPSED}s elapsed with STATUS_TIMEOUT=1"
+
 # ⛔ THE UNMEASURED MESSAGE'S BACKTICKS, PINNED (#3588 review). `err "UNMEASURED — `git worktree list`
 # answered …"` was a LIVE COMMAND SUBSTITUTION inside double quotes: bash ran it and spliced its output into
 # the warning. Restoring the backticks left the suite fully green, so the fix was unpinned.

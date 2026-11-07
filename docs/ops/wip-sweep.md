@@ -94,7 +94,13 @@ wip-sweep.sh [--repo PATH]... [--apply] [--max N] [--print-status]
   rescue-phase bounds, not `scripts/lib/bounded.sh`. There is no unbounded call that can reach the
   network; such a hang is the failure this pass cannot survive, because it is what the quiesce runs
   before the box goes. (`mktemp`, `date`, `sed` and the record write run outside the watchdog: a local
-  syscall, not a hang surface.) What the cap defers is **named** (`deferred=N`,
+  syscall, not a hang surface.) **The ONE remaining call the watchdog cannot cover is the usability probe
+  that FINDS the watchdog** (`bounded_lib_path` sources each candidate library in a subshell and asks it
+  to resolve its own timer — chicken-and-egg, so `tb_timeout` does not exist yet). It reads a local file
+  and starts no subprocess, so it cannot reach the network; a candidate that hangs *there* is a broken
+  install, and is named here rather than implied away. The sibling probe that executes the RESCUER
+  (`rescue_usable`) runs after the library is resolved and is bounded by `WIP_SWEEP_STATUS_TIMEOUT`, so a
+  rescuer that hangs is a REFUSAL (it cannot answer), never a hung pass. What the cap defers is **named** (`deferred=N`,
   `status=incomplete`, exit `1`), never silently dropped.
   ⛔ **A `124`/`137` IS NOT ONE FACT, AND ONLY ONE OF THEM IS A DEFERRAL.** The pass budget expiring is a
   deferral (`deferred-pass-budget`, exit 1). The RESCUE hitting its own `WIP_SWEEP_RESCUE_TIMEOUT` — a

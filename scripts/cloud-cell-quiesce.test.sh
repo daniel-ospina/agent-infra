@@ -227,6 +227,77 @@ grep -q '^supervisor:start' "$D/events" \
   && ok "E4 supervision is still restored with no sweep present" \
   || bad "E4 the quiesce stopped before restoring supervision"
 
+# ── E5/E6: a sweep that EXISTS BUT CANNOT RUN ──────────────────────────────────────────────────────
+# ⛔ EXISTS IS NOT RUNS, AND THE GUARD FOR IT WAS UNPINNED (review finding, cycle 5). `[ -f ]` selected a
+# 0-BYTE `wip-sweep.sh`; `bash <empty> --apply` exits 0, so the hook printed "every dirty worktree … is
+# archived on origin" and `DONE`, rc=0, having archived NOTHING — the false PASS this hook exists to
+# prevent, on the one path where the disk stops existing. The guard now requires `-s` AND `bash -n`, but
+# E1-E4 only covered a MISSING candidate, so reverting the guard to `[ -f ]` left this suite at PASS=19
+# FAIL=0 (measured). These arms cover PRESENT-BUT-UNUSABLE.
+# ⛔ AND A 0-BYTE STUB CANNOT LOG ITS OWN INVOCATION — so "it was never invoked" is NOT observable on it
+# (measured: `[ -f ]` reddens E5a/E5b/E5c but leaves any "invocation count" arm green, because the empty
+# file does nothing when bash runs it). E5e therefore proves SKIPPING the only way it can be proven: a
+# USABLE stubbed candidate further down the list must be the one that runs. Under `[ -f ]` the empty first
+# candidate wins, nothing logs, and E5e reddens.
+mk_world e5 || { echo "❌ fixture failed (e5)"; exit 1; }
+D="$T/e5"
+: > "$D/repo/scripts/wip-sweep.sh"          # 0 bytes: the interrupted `cp -f` shape
+chmod +x "$D/repo/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+run_quiesce e5 0; RC=$?
+grep -q 'FATAL: wip-sweep' "$D/out" \
+  && ok "E5a a 0-BYTE sweep is refused, with a FATAL naming it" \
+  || bad "E5a a 0-byte sweep was accepted: $(tail -2 "$D/out")"
+grep -q 'WORK ON THIS BOX WILL NOT BE ARCHIVED' "$D/out" \
+  && ok "E5b …and it says the work will NOT be archived" \
+  || bad "E5b the 0-byte-sweep message does not state the consequence"
+[ "$RC" -ne 0 ] && ok "E5c a 0-byte sweep exits non-zero (rc=$RC)" || bad "E5c a 0-byte sweep exited 0 — a false green over an empty archive"
+NINV="$(grep -c '^sweep:' "$D/events" 2>/dev/null || true)"
+[ "${NINV:-0}" -eq 0 ] \
+  && ok "E5d nothing was invoked on the all-unusable fixture (its only candidate was the empty one)" \
+  || bad "E5d a sweep ran on a fixture with no usable candidate (${NINV:-?} invocation(s))"
+
+# E5e: THE SKIP ITSELF, OBSERVABLY. The empty candidate is FIRST; a USABLE logging stub sits later in the
+# list (`${HOME}/.pi/agent/scripts/wip-sweep.sh`, with HOME stubbed to `$D/home`). A correct guard skips
+# the empty one, reaches the usable one, and IT logs. `[ -f ]` stops at the empty one: nothing logs.
+mk_world e5e || { echo "❌ fixture failed (e5e)"; exit 1; }
+D="$T/e5e"
+: > "$D/repo/scripts/wip-sweep.sh"          # first candidate: 0 bytes — unusable, and it CANNOT log
+chmod +x "$D/repo/scripts/wip-sweep.sh"
+mkdir -p "$D/home/.pi/agent/scripts"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'echo "sweep:$*" >> "'"$D"'/events"' \
+  'exit 0' > "$D/home/.pi/agent/scripts/wip-sweep.sh"
+chmod +x "$D/home/.pi/agent/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+run_quiesce e5e 0; RC=$?
+grep -q '^sweep:' "$D/events" \
+  && ok "E5e a 0-byte FIRST candidate is SKIPPED — the usable candidate after it is the one that runs" \
+  || bad "E5e the empty candidate was taken: nothing was invoked (a bare -f guard stops at it)"
+[ "$RC" -eq 0 ] \
+  && ok "E5e2 …and the run still succeeds, so one truncated farm copy does not disable the hook" \
+  || bad "E5e2 the run exited $RC although a usable candidate existed: $(tail -2 "$D/out")"
+
+mk_world e6 || { echo "❌ fixture failed (e6)"; exit 1; }
+D="$T/e6"
+printf '%s\n' 'if ( then' > "$D/repo/scripts/wip-sweep.sh"   # non-empty, does NOT parse
+chmod +x "$D/repo/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+run_quiesce e6 0; RC=$?
+grep -q 'FATAL: wip-sweep' "$D/out" \
+  && ok "E6a a NON-PARSING sweep is refused (non-empty defeats a bare -s)" \
+  || bad "E6a a non-parsing sweep was accepted: $(tail -2 "$D/out")"
+[ "$RC" -ne 0 ] && ok "E6b a non-parsing sweep exits non-zero (rc=$RC)" || bad "E6b a non-parsing sweep exited 0"
+# ⛔ E6c IS THE ARM THAT DISCRIMINATES `-s`-ONLY (a guard that checks the file is non-empty but does not
+# parse it). A bare invocation claim CANNOT: bash fails to parse a broken file too, so both guards end at
+# FATAL/rc≠0 and "was it invoked" is not observable through a stub that cannot run. What DOES differ is
+# whether the candidate was RESOLVED at all: a `-s`-only guard resolves it and the `step` line names the
+# path, while a `-s` + `bash -n` guard leaves `SWEEP` empty and the hook says work will NOT be archived —
+# which is the load-bearing statement, because it is what a reader acts on.
+grep -q 'WORK ON THIS BOX WILL NOT BE ARCHIVED' "$D/out" \
+  && ok "E6c the non-parsing candidate was NOT RESOLVED — the hook says the work will not be archived" \
+  || bad "E6c the hook resolved a non-parsing candidate: $(grep -m1 'wip-sweep:' "$D/out")"
+
 # ── the success arm (exit code is only judgeable where /proc exists) ─────────────────────────────────
 echo; echo "── F. the success path ──"
 mk_world f || { echo "❌ fixture failed (f)"; exit 1; }
