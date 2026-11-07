@@ -3107,7 +3107,9 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 # one of these CRCs; a colour change alone does not (measured: the same line with and without `\033[31m`/`\033[0m`
 # both cksum to 2405737011 — the terminal styling of a claim is not the claim).
 # SCOPE, STATED (so this is not a claim it cannot keep):
-#   * it covers every case THIS SUITE DRIVES — §14 and §6 drive each state arm and each refusal;
+#   * it covers every case THIS SUITE DRIVES THAT CAPTURES TO A FILE — §14 and §6 drive each state arm and each
+#     refusal. The one driven case that does NOT appear in the pin is named rather than implied away: `mapdrive`
+#     (§12-y1) captures to shell variables and is graded by exact match on all five states at its own check;
 #   * it does not red a source edit that changes no output, which is correct: a reformat cannot mislead an operator;
 #   * it pins EVERY REGULAR FILE AT THE TOP LEVEL of a case directory, except the deny-list below — so a fixture's
 #     top-level INPUTS (`pool`, `q`, `seed`, `cnt`, a generated `*.awk`) are pinned too. That is deliberate: a
@@ -3299,7 +3301,11 @@ EOF
   else rc=0
   fi
 fi
-ck "the EMITTED text of every driven case is pinned (a claim reached the operator by SOME mechanism, or none did)" $rc
+# ⛔ THE POPULATION IS NAMED, BECAUSE ONE DRIVEN CASE IS NOT IN IT (review P3, cycle 92). The pin covers every driven
+# case that CAPTURES TO A FILE; `mapdrive` (§12-y1, five drives at ~1699) captures to shell VARIABLES and is graded by
+# exact match there (`severity`/`severity-uncounted`/`empty`/`priority-unreadable`/`unrecorded-state`), so it leaves
+# no top-level file and contributes no key. That was true and unstated: the name said "every driven case".
+ck "the EMITTED text of every driven case that captures to a file is pinned (a claim reached the operator by SOME mechanism, or none did) — the cases graded by exact match in place, not by a capture, are named in this section's scope note" $rc
 
 
 # ⛔ NON-VACUITY for the output pin — the mechanisms that beat every source predicate, each required to red.
@@ -3473,21 +3479,38 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # RESIDUAL, stated: a `set -u` inside quoted data still counts if it appears on a line that STARTS with `set` (only a
 # quoted-heredoc body indented under `set` is told apart); the witnesses' own `bash -n` + claim checks are the place
 # that class is separated, not here.
-# ⛔ AND IT READS THE WHOLE `set` COMMAND, NOT ONE LINE (review P3, cycle 91): a `set -e \` continued with `-u` on
-# the next physical line is real protection and was FALSE-BLOCKED (measured: the driver aborts on an unbound
-# variable, and the sweep still called it "WITHOUT a `set -u` flag"). Continuations are joined, then the text is
-# split into statements at `;`, braces, parens and `&&`/`||` so `fin() { set -u; }` counts and a `set` that is not a
-# command word does not. The declared residual is unchanged: a `set -u` inside quoted DATA still counts.
-_setu() { # $1=script -> 0 when a `set` command enables `u`
+# ⛔ AND IT READS THE `set` COMMAND'S WORDS, WITH FOUR ROWS THAT CYCLE 91 GOT WRONG (review P2/P3, cycle 92). The
+# predicate asks one question — "does this file put the shell in nounset state at top level?" — and each of the four
+# corrections below was measured as a WRONG VERDICT in one direction or the other:
+#   1. `(` and `)` are NOT statement separators. `( set -u; : )` runs in a SUBSHELL: the parent never gets the flag
+#      (measured: such a file reads an unbound variable and completes, while cycle 91 graded it PROTECTED). Braces
+#      `{ … }` and `;` keep their role, so `fin() { set -u; }` still counts.
+#   2. `nounset` counts only as the ARGUMENT OF `-o`; `set +o nounset` TURNS IT OFF and used to be graded protected
+#      (measured: the file does not abort on an unbound read). A `+`-prefixed cluster clears the flag for the same
+#      reason `set +u` is not protection.
+#   3. The command word can follow a control keyword: `if …; then set -u; fi` is real protection (measured: it
+#      aborts) and was FALSE-BLOCKED. Leading `then|do|else|elif|if|while|until|for|in` are skipped.
+#   4. A COMMENT ending in `\` does not continue (bash does not join it), so the joiner is skipped on comment lines;
+#      joining them swallowed the next line and lost a real `set -u` (measured false block).
+# RESIDUAL, declared and unchanged: a `set -u` inside quoted DATA still counts (only a comment line is told apart);
+# separating data from code is the witnesses' `bash -n` + claim-check job, not this predicate's.
+_setu() { # $1=script -> 0 when a top-level `set` command enables `u`
   awk '
-    { _l = $0
+    { if ($0 ~ /^[ \t]*#/) next
+      _l = $0
       while (_l ~ /\\[ \t]*$/) { sub(/\\[ \t]*$/, " ", _l); if ((getline _n) <= 0) break; _l = _l _n }
-      _nst = split(_l, _st, /[;{}()]|&&|\|\|/)
+      _nst = split(_l, _st, /[;{}]|&&|\|\|/)
       for (_i = 1; _i <= _nst; _i++) {
         _nw = split(_st[_i], _w, /[ \t]+/); _j = 1
         if (_nw >= 1 && _w[1] == "") _j = 2
+        while (_j <= _nw && _w[_j] ~ /^(then|do|else|elif|if|while|until|for|in)$/) _j++
         if (_j > _nw || _w[_j] != "set") continue
-        for (_k = _j + 1; _k <= _nw; _k++) { if (_w[_k] ~ /^-[A-Za-z]*u/) f = 1; if (_w[_k] == "nounset") f = 1 }
+        for (_k = _j + 1; _k <= _nw; _k++) {
+          if (_w[_k] ~ /^-[A-Za-z]*u/) f = 1
+          else if (_w[_k] ~ /^\+[A-Za-z]*u/) f = 0
+          else if (_w[_k] == "nounset" && _k > _j + 1 && _w[_k - 1] == "-o") f = 1
+          else if (_w[_k] == "nounset" && _k > _j + 1 && _w[_k - 1] == "+o") f = 0
+        }
       } }
     END { exit !f }' "$1" 2>/dev/null
 }
