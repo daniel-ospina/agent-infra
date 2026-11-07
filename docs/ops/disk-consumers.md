@@ -402,8 +402,11 @@ find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +180 \
   72 h window is empty on every box.
 * **Guard (all must hold):** age ≥ 180 min — the arm's own floor, not a second number — **and** not a
   git checkout (`.git` present ⇒ skip) **and** no live process holds it **and** the run is a dry-run
-  whose count matches on a second read. Never take this from a single `find | head` — a first-match
-  reading is exactly the artifact class in `AGENTS.md`.
+  and the SET you then act on is re-measured at apply time. An exact-count equality is **not** the
+  test, and the paragraph above is why: this population gains a tree every time a tree crosses 180
+  min, so two reads minutes apart legitimately differ. What must NOT happen is a set that SHRINKS
+  between reads without a removal — that is a broken reading. Never take this from a single
+  `find | head` — a first-match reading is exactly the artifact class in `AGENTS.md`.
 * ⚠️ These copies carry unlanded review/mutation evidence; this is a **deliberate** trade of evidence
   for headroom. Prefer R1/R2/R5 first, which trade nothing.
 
