@@ -49,11 +49,15 @@ templates — `com.eldato.pi-cache-reap.plist:89`,
 argument plus an `install-launchd.sh` re-run; `worktree-hygiene` instead renders
 `--apply` only on an armed box, `--dry-run` otherwise, from
 `{{WORKTREE_HYGIENE_MODE}}`, which `install-launchd.sh` resolves from
-`~/.pi/agent/state/worktree-hygiene.armed`. So on a default install only the
-`prune` path reclaims anything and the rest merely report, which is the
-distinction this page exists to stop blurring. No single one answered *"is this
-box being reaped, and how much did the last pass free?"* — and
-**no count is claimed here**, because a count is the claim
+`~/.pi/agent/state/worktree-hygiene.armed`. So **of those legacy passes**, on a
+default install only the `prune` path reclaims anything and the rest merely
+report, which is the distinction this page exists to stop blurring. That is not
+a statement about this page's own pass: on a cell the consolidated timer is
+installed with `--apply` (`install-disk-reaper-timer.sh:108`, run
+unconditionally by `cloud-cell-bringup.sh:2240`), so *it* does reclaim — the
+scoped clause above is the legacy enumeration, not this script. No single one
+answered *"is this box being reaped, and how much did the last pass free?"* —
+and **no count is claimed here**, because a count is the claim
 that made this page wrong in the first place: the point is not how many triggers
 existed, it is that none of them could answer that question. This is the
 consolidation: one scheduled pass, one pass record, one status line, and the

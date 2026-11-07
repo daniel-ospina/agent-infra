@@ -19,8 +19,11 @@
 # `worktree-hygiene` every 6 h). MOST SHIPPED DISARMED (#1678): both unit templates hardcode
 # `--dry-run` (com.eldato.pi-cache-reap.plist:89, com.tortoise.worktree-reaper.plist:129; arming =
 # edit that argument + re-run `install-launchd.sh`), and `worktree-hygiene` renders `--dry-run`
-# unless the box is armed (`~/.pi/agent/state/worktree-hygiene.armed`). On a default install only
-# `prune` reclaims and the rest merely report, so this header must not credit them with reaping.
+# unless the box is armed (`~/.pi/agent/state/worktree-hygiene.armed`). So OF THOSE LEGACY PASSES,
+# on a default install only `prune` reclaims and the rest merely report, so this header must not
+# credit them with reaping. This pass is a DIFFERENT case: a cell installs its timer `--apply`
+# (install-disk-reaper-timer.sh:108, run unconditionally by cloud-cell-bringup.sh:2240), so it DOES
+# reclaim on a default cell. The clause above scopes the legacy enumeration, not this script.
 # NO COUNT is claimed: the point is not how many there were, it is that none of them answered
 # "is this box being reaped, and how much did the last pass free?". This script is the
 # CONSOLIDATION, not another policy: it OWNS NO DELETION RULE of its own. It resolves, schedules
