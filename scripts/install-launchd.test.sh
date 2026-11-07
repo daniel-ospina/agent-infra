@@ -1621,6 +1621,72 @@ else
     bad "§7c …and the unit installs, as it does on the python path"
 fi
 
+# A helper for the fallback-arm cases below: the same probe plist as `_probe_install`, but with an
+# unparseable `StartInterval` (so python3 refuses and the PlistBuddy seam is taken) and with the seam
+# pinned. Kept next to its users rather than in the shared helper block, which every OTHER §7c case
+# drives through the python reader on purpose.
+probe_install_fallback() { # <home> <program-argument>... -> installer stdout+stderr through the seam
+    local home="$1" a body=""; shift
+    for a in "$@"; do body="$body        <string>$a</string>"$'\n'; done
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+$body    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+    rm -f "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+
+# (c22g) THE `env` HOP ON THE FALLBACK READER. `env` execs its first POSITIONAL, and `-S` /
+# `--split-string` carries a WHOLE COMMAND LINE inside one element, so neither is a path. Without the
+# mirror the fallback had three divergent forms (fresh review of #3413, round 6 P2):
+#   `-S "<ok cmd>"`            → the string became ONE path → "broken target" → verdict 1: the WHOLE
+#                                install aborted, where python installs;
+#   `-S "<cmd with TCC>"`      → same abort, where python SKIPs that one unit;
+#   `-S<joined>` / `--split-string=<cmd>` → the element starts with `-S`, is not absolute, and got NO
+#                                verdict at all → the unit installed ARMED AND DEAD.
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: env -S with a readable command line INSTALLS (the string is not one path)"
+assert_not_contains "$OUT" "broken target" "§7c …so the whole string is not filed as a single target"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c fallback: env -S with a TCC-tree script in the string is VERDICTED, not aborted"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and that one unit is SKIPPED, as the python reader does"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "-S/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: the JOINED -S<cmd> spelling gets a verdict (it used to get none)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and the unit is not left armed"
+else
+    ok "§7c …and the unit is not left armed"
+fi
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "--split-string=/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: --split-string=<cmd> is split, not dropped"
+
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
 mkdir -p "$PROBE_HOME/Documents/checkout/with space"

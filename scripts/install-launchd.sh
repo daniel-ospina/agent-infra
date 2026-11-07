@@ -486,8 +486,12 @@ plist_python() {
 # below: `--repo`, `--root`). `--script <path>` is deliberately NOT one of them \u2014 the reaper launcher
 # OPENS that path and pipes it to `bash -s`, so the value IS the executed code and a TCC-protected one
 # is a dead unit rather than dead work. Everything else absolute is EXECUTED. The asymmetry is the
-# point: a data argument misread as `exec` costs a loud SKIP of one unit (friction), while an executed
-# script misread as `data` arms a unit launchd cannot start \u2014 the exact defect this guard exists for.
+# point: an executed script misread as `data` arms a unit launchd cannot start — the exact defect this
+# guard exists for. The OTHER direction is not cheap either, and its cost is stated as MEASURED rather
+# than as hoped: a data value misread as `exec` costs a whole-install ABORT (not "a loud SKIP") when it
+# is a non-TCC DIRECTORY, because the file-type arm fails it and `sync.sh` then dies under `set -e`
+# before its cost-config and parity gates — the #3413 P1-A failure this file already paid for once,
+# which is exactly why `--repo`/`--root` are derived as `data` by BOTH readers (#3413 review, round 6).
 # Two cheaper rules were falsified in review: "before the first `-`" filed `/bin/bash -e <script>` as
 # data, and "the first non-option token is the script" filed `python3 -W error <script>` and
 # `bash -o pipefail <script>` as data, because an option's VALUE looked like the script. No positional
@@ -722,8 +726,57 @@ plist_program_args() {
     # the launcher), so an absent/empty array is only unusable when there is no `Program` either.
     [ -n "$raw" ] || [ -n "$prog" ] || return 1
     out="$(printf '%s\n' "$raw" | awk -v prog="$prog" '
+        # env -S own grammar: whitespace separates, BACKSLASH escapes the next char and `\\_` is a
+        # literal space (env documented way to embed one). Mirrors the python `env_split`.
+        function env_split(s,   n, i, c, cur) {
+            n = 0; i = 1; cur = ""
+            while (i <= length(s)) {
+                c = substr(s, i, 1)
+                if (c == "\\" && i < length(s)) {
+                    c = substr(s, i + 1, 1)
+                    cur = cur ((c == "_") ? " " : c)
+                    i += 2
+                    continue
+                }
+                if (c == " " || c == "\t" || c == "\r") {
+                    if (cur != "") { SPLIT[++n] = cur; cur = "" }
+                    i += 1
+                    continue
+                }
+                cur = cur c
+                i += 1
+            }
+            if (cur != "") SPLIT[++n] = cur
+            return n
+        }
+        # The three rules of the argv loop, applied to the tokens of an `env -S` command line.
+        function classify_cmd(cmd,   n, j, tok, prv, seenp, nm, val) {
+            n = env_split(cmd)
+            seenp = 0
+            for (j = 1; j <= n; j++) {
+                tok = SPLIT[j]
+                if (tok == "") continue
+                if (!seenp) {
+                    if (tok ~ /^-/ || (index(tok, "=") > 0 && tok !~ /^\//)) continue
+                    seenp = 1
+                    if (tok ~ /^\//) printf "launcher\t%s\n", tok
+                    continue
+                }
+                if (tok ~ /^--/ && index(tok, "=") > 0) {
+                    nm = substr(tok, 1, index(tok, "=") - 1)
+                    val = substr(tok, index(tok, "=") + 1)
+                    if (val ~ /^\//)
+                        printf "%s\t%s\n", (nm == "--repo" || nm == "--root") ? "data" : "exec", val
+                    continue
+                }
+                if (tok !~ /^\//) continue
+                prv = (j > 1) ? SPLIT[j - 1] : ""
+                printf "%s\t%s\n", (prv == "--repo" || prv == "--root") ? "data" : "exec", tok
+            }
+        }
         BEGIN {
-            seen = 0; prev = ""; idx = -1
+            seen = 0; prev = ""; idx = -1; envmode = 0; wantcmd = 0
+            if (prog ~ /(^|\/)env$/) envmode = 1
             # The launcher is emitted BEFORE the argument walk, as the python reader does: the exec
             # arm consults the grant this record establishes, so an order flip changes its verdict.
             if (prog != "") { printf "launcher\t%s\n", prog; seen = 1 }
@@ -756,6 +809,29 @@ plist_program_args() {
             # because with `Program` set python emits nothing for a `--script=<TCC>` at argv[0] while
             # the fallback used to emit `exec` there and SKIP a unit python installs (round 3 P2).
             if (idx == 0 && prog != "") { prev = line; next }
+            # ⛔ THE `env` HOP, MIRRORED FROM THE PYTHON READER (`:565-641`). It is not decoration: the
+            # first POSITIONAL after `env` is the program launchd execs, and `-S` / `--split-string`
+            # carries a WHOLE COMMAND LINE inside one element. Without this the fallback classified
+            # `-S "/bin/bash <script>"` as one path ("broken target: /bin/bash /x.sh" -> verdict 1, the
+            # whole install aborts) and DROPPED the `-S<joined>` spelling entirely (the element starts
+            # with `-S`, is not absolute, so it got no verdict at all) — a TCC-tree script inside it
+            # then installed ARMED AND DEAD, the one direction this change exists to close (fresh
+            # review of #3413, round 6 P2).
+            if (envmode && idx >= 1) {
+                if (wantcmd) { wantcmd = 0; classify_cmd(line); envmode = 0; prev = line; next }
+                if (line == "-S" || line == "--split-string") { wantcmd = 1; prev = line; next }
+                if (line ~ /^--split-string=/) { classify_cmd(substr(line, 16)); envmode = 0; prev = line; next }
+                if (line ~ /^-S/) { classify_cmd(substr(line, 3)); envmode = 0; prev = line; next }
+                # an option or a NAME=VALUE is not the program and does not end the search
+                if (line ~ /^-/ || (index(line, "=") > 0 && line !~ /^\//)) { prev = line; next }
+                # the FIRST positional is the env program: a LAUNCHER, exactly what the space form
+                # promotes at argv[1]. An absolute one is emitted; a relative one is resolved through
+                # PATH and cannot be checked, so it is consumed without a record.
+                if (line ~ /^\//) printf "launcher\t%s\n", line
+                envmode = 0
+                prev = line
+                next
+            }
             # `--opt=<path>` carries its value INSIDE the token (python splits it at `:649-654`);
             # dropping it made a `--script=<TCC>` install with no verdict at all.
             if (line ~ /^--/ && index(line, "=") > 0) {
@@ -769,6 +845,7 @@ plist_program_args() {
             if (line ~ /^\//) {
                 if (idx == 0) {
                     printf "launcher\t%s\n", line
+                    envmode = (line ~ /(^|\/)env$/) ? 1 : 0
                 } else if (prev == "--repo" || prev == "--root") {
                     printf "data\t%s\n", line
                 } else {
