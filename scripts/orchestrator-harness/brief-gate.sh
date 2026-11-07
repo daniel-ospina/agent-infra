@@ -589,7 +589,7 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
       # (`keyless<CR>` 80 → 0) while the bare-`keyless` row alone cannot kill it (80 → 80, measured).
       keyless*)
         rest="${nval#keyless}"
-        case "$rest" in [[:space:]]*[![:space:]]*) : ;; *) unkeyed=1 ;; esac ;;
+        case "$rest" in [[:space:]]*) : ;; *) unkeyed=1 ;; esac ;;
       *) unkeyed=1 ;;
     esac
     [ -n "$issue" ] || continue
