@@ -46,6 +46,12 @@
 #       /tmp" rule would block every cell bring-up. §P2 grades the RESOLVED path (a symlink onto a
 #       scratch tree is refused, one onto a durable tree is not), and §P3 pins the revision the unit
 #       runs into its environment so `merged ≠ running` is readable from `systemctl show`/`--status`.
+#       §P6 asserts the lane-scratch shape list is IDENTICAL to install-repair-service.sh's (two copies
+#       would drift), §P7 proves a lane worktree is decided by GIT (a LINKED worktree is refused under a
+#       durable root and with a name no pattern matches, a caller cannot launder one by declaring its
+#       own root, and a PRIMARY clone under /tmp — the cells' `/tmp/cell-ai` — still installs), and §P5
+#       pins the two seam strengths (a caller's preference is skipped loudly, an operator's requirement
+#       is refused).
 #
 # Hermetic: temp HOME/state/unit dirs, stub `systemctl`/`tmux` that RECORD their argv (so "did it call
 # start/stop" is answered by evidence, not by the absence of an error), a stub supervisor built from
@@ -2761,7 +2767,7 @@ P3_RC=0; P3_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$WT_P/cloud-cell-supervisor.sh" in
 [ "$P3_RC" -ne 0 ] && ok '§P: a .worktrees/ supervisor is REFUSED even inside the cell home' \
                    || bad "§P: installed from a lane worktree — the measured #2697 shape, one directory deeper: $P3_OUT"
 case "$P3_OUT" in
-  *'lane worktree'*) ok '§P: and the refusal says it is a lane worktree (not merely "under /tmp")' ;;
+  *'lane-scratch shape'*) ok '§P: and the refusal says it is a lane-scratch shape (not merely "under /tmp")' ;;
   *) bad "§P: the .worktrees refusal does not name the reason — $P3_OUT" ;;
 esac
 # ⛔ THE PREVIEW VERB REFUSES TOO: `--dry-run` is how an operator inspects a render before arming it, so a
@@ -2772,6 +2778,72 @@ P5_RC=0; P5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.s
                    || bad "§P: --dry-run printed a scratch ExecStart without refusing — $P5_OUT"
 [ ! -f "$P/units/eldato-orchestrator.service" ] \
   && ok '§P: and the dry run wrote nothing' || bad '§P: --dry-run wrote a unit'
+
+# ── §P6 — the lane-scratch shape list is ONE list, asserted, because two copies drift ────────────
+# `scripts/install-repair-service.sh` refuses the same shapes for the repair unit. The installer mirrors it
+# (with a pointer), and this arm is what keeps the mirror honest: a shape added on one side and not the other
+# is exactly the drift that admits the next measured path.
+say_case 'the lane-scratch shape list is identical in this installer and in install-repair-service.sh'
+REPAIR_SH="$(dirname "$INST")/install-repair-service.sh"
+for _sh in '*/.worktrees/*' '/tmp/wt-*' '/tmp/cell-wt-*' '/tmp/base-*'; do
+  grep -qF -- "$_sh" "$INST" \
+    && ok "§P6: the installer refuses the fleet shape $_sh" \
+    || bad "§P6: the installer does not refuse $_sh — install-repair-service.sh does, so the two lists have drifted"
+done
+if [ -f "$REPAIR_SH" ]; then
+  for _sh in '*/.worktrees/*' '/tmp/wt-*' '/tmp/cell-wt-*' '/tmp/base-*'; do
+    grep -qF -- "$_sh" "$REPAIR_SH" \
+      || bad "§P6: install-repair-service.sh no longer names $_sh — the installer's mirror is now the only copy, so re-derive both"
+  done
+fi
+
+# ── §P7 — "lane worktree" is decided by GIT, and no declaration launders one ─────────────────────
+# ⛔ THE ESCAPE A REVIEWER MEASURED (re-review P1). The guard accepts a temporary-root path when a DEPLOYMENT
+# ROOT declares it, and `cloud-cell-bringup.sh` declares its layer (`AGENT_INFRA_PATH=$LAYER_ROOT`) — but the
+# layer IS `self_root` whenever a lane runs the bring-up from its own checkout, so a caller could declare the
+# very scratch checkout it was arming. A name list cannot be this rule either: the measured path was
+# `/tmp/wt-2433-fu`, and a copy nested one fixture deeper (`/tmp/<x>/wt-2433-fu/…`) matches no pattern. What
+# MAKES a lane checkout one is that git records it as a LINKED worktree, so the test is git's own arithmetic
+# — and the control that a PRIMARY clone under /tmp (the cells' `/tmp/cell-ai`) is still admitted is the arm
+# that keeps this from becoming a false block on every cell.
+say_case 'a declared root cannot launder a lane worktree, and a primary clone under /tmp still installs'
+PG="$(arm_root pg)"; mk_systemctl "$PG/bin" "$PG/state" "$PG/sc.log"; mk_tmux "$PG/bin" "$PG/tmux.log"
+PG_SCRATCH="$T/r2697d/wt-2433-fu/scripts"; mkdir -p "$PG_SCRATCH"
+cp "$SUP" "$PG_SCRATCH/cloud-cell-supervisor.sh"
+# (a) the caller declares the scratch tree itself — the measured escape
+PG_A_RC=0; PG_A_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_SCRATCH/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$T/r2697d" inst pg --install 2>&1)" || PG_A_RC=$?
+[ "$PG_A_RC" -ne 0 ] && ok '§P7: declaring the scratch tree as AGENT_INFRA_PATH does NOT admit it (a declaration is not a signature)' \
+                     || bad "§P7: a caller laundered a scratch ExecStart by declaring its own root — the #2697 defect, now with the guard reporting it durable: $PG_A_OUT"
+[ ! -f "$PG/units/eldato-orchestrator.service" ] \
+  && ok '§P7: and nothing was armed for it' || bad '§P7: the laundering attempt still wrote a unit'
+# (b) the control: a PRIMARY clone under /tmp — `/tmp/cell-ai`, the cells' own checkout — does declare
+PG_CLONE="$T/cell-ai"; mkdir -p "$PG_CLONE/scripts"
+cp "$SUP" "$PG_CLONE/scripts/cloud-cell-supervisor.sh"
+git init -q "$PG_CLONE" 2>/dev/null
+git -C "$PG_CLONE" add -A >/dev/null 2>&1
+git -C "$PG_CLONE" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -d "$PG_CLONE/.git" ]; then
+  PG_B_RC=0; PG_B_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_CLONE/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_CLONE" inst pg --install 2>&1)" || PG_B_RC=$?
+  grep -qxF "ExecStart=/bin/bash $PG_CLONE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+    && ok '§P7: a PRIMARY clone under /tmp (the /tmp/cell-ai shape) still installs — the rule is not a blanket /tmp refusal' \
+    || bad "§P7: refused the cells' own /tmp checkout — this guard would block cell bring-up: $PG_B_OUT"
+  # (c) a LINKED worktree of that same clone, under a DURABLE root and with a name no pattern matches
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_WT="$PG/home/lane-checkout"
+  if git -C "$PG_CLONE" worktree add -q "$PG_WT" 2>/dev/null; then
+    mkdir -p "$PG_WT/scripts"; cp "$SUP" "$PG_WT/scripts/cloud-cell-supervisor.sh"
+    PG_C_RC=0; PG_C_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_C_RC=$?
+    [ "$PG_C_RC" -ne 0 ] && ok '§P7: a LINKED worktree is refused even under the cell home and even with a name no shape matches' \
+                         || bad "§P7: armed a unit from a linked git worktree — git recorded it as a worktree and the guard did not read it: $PG_C_OUT"
+    case "$PG_C_OUT" in
+      *'LINKED GIT WORKTREE'*) ok '§P7: and the refusal says GIT reported it as a linked worktree (not "under /tmp")' ;;
+      *) bad "§P7: the refusal does not name the git-worktree reason — $PG_C_OUT" ;;
+    esac
+  else
+    bad '§P7: the fixture could not create a linked worktree, so the git-arithmetic arm did not run'
+  fi
+fi
+
 
 # ── §P2 — a SYMLINK is a spelling, and the guard grades what it resolves to ───────────────────────
 # ⛔ THE MEASURED ESCAPE THIS ARM EXISTS FOR IS #2666's: `ln -s <refused dir> $T/alias` was ADMITTED by a
@@ -2815,7 +2887,10 @@ PP_SHA="$(git -C "$PP_REPO" rev-parse HEAD 2>/dev/null)"
 PP_TOP="$(git -C "$PP_REPO" rev-parse --show-toplevel 2>/dev/null)"
 PP_RC=0; PP_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PP_REPO/scripts/cloud-cell-supervisor.sh" inst pp --install 2>&1)" || PP_RC=$?
 if [ -z "$PP_SHA" ]; then
-  ok '§P3: skipped — the fixture git checkout could not be created, so the pin has no premise (the arm above covers the refusal)'
+  # ⛔ A SKIP IS NOT A PASS (re-review P3). A green tick over an arm that asserted nothing is the vacuity shape
+  # this section's header is about; if the fixture cannot make a git checkout, the arms cannot run and the
+  # operator must see that as a red, not as coverage.
+  bad '§P3: the fixture git checkout could not be created — the pin arms did not run, so §P3 is NOT covered on this box'
 elif [ "$PP_RC" -ne 0 ]; then
   bad "§P3: could not install from the fixture repo, so the pin arms cannot run — $PP_OUT"
 else
@@ -2874,8 +2949,7 @@ PINB_RC=0; PINB_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PINB_SUP/cloud-cell-superviso
 [ "$PINB_RC" -ne 0 ] && ok '§P4: the same pin SHAPE outside every declared root is still refused (the root decides, not the shape)' \
                     || bad "§P4: a pin-shaped path under no declared root was admitted — the control proves §P4 passes everything: $PINB_OUT"
 
-# ── §P5 — a CALLER's preference is skipped, not obeyed and not fatal ──────────────────────────────
-# ⛔ THE SECOND CALL SITE (agent-infra#2697). `cloud-cell-bringup.sh` names the LAYER's supervisor because it
+# ── §P5 — a CALLER's preference is skipped, not obeyed and not fatal ──────────────────────────────# ⛔ THE SECOND CALL SITE (agent-infra#2697). `cloud-cell-bringup.sh` names the LAYER's supervisor because it
 # wants the unit to run the code the layer install just put there — but `self_root` IS a lane worktree when a
 # lane runs the bring-up from its own checkout, and refusing there would kill the bring-up on the one shape
 # a lane can produce (measured: 23 red arms in cloud-cell-bringup.test.sh). So a PREFERENCE that cannot
@@ -2901,14 +2975,22 @@ PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-superv
 # …and when NOTHING durable exists, the preference does not rescue the install either: fail closed, naming
 # the durable roots, instead of arming whatever was beside the installer.
 PREFB="$(arm_root prefb)"; mk_systemctl "$PREFB/bin" "$PREFB/state" "$PREFB/sc.log"; mk_tmux "$PREFB/bin" "$PREFB/tmux.log"
-rm -f "$(farmed_sup "$PREFB")"    # no farm, so the only remaining candidate is "beside the installer" (a worktree)
+rm -f "$(farmed_sup "$PREFB")"    # no farm
+# ⛔ THE FOURTH CANDIDATE IS THE COPY BESIDE THIS INSTALLER, SO THIS ARM WOULD BE LOCATION-DEPENDENT
+# (re-review P1). Run from a DURABLE checkout — which is what CI checks out — that copy is durable and the
+# install legitimately succeeds, so an arm asserting a refusal went red on the PR lane and on `main`. The
+# fixture therefore runs a COPY of the installer inside $T with a transient supervisor BESIDE IT, which is
+# the same "nothing durable exists" premise on every box.
+mkdir -p "$PREFB/side"
+cp "$INST" "$PREFB/side/install-controller-service.sh"
+cp "$SUP"  "$PREFB/side/cloud-cell-supervisor.sh"
 PREFB_RC=0
 PREFB_OUT="$(bnd env SYSTEMCTL="$PREFB/bin/systemctl" SYSTEMD_UNIT_DIR="$PREFB/units" \
     CONTROLLER_SYSTEM_UNIT_DIR="$PREFB/units" CONTROLLER_USER_UNIT_DIR="$PREFB/nouser" CONTROLLER_ALLOW_ROOT=1 \
     TEMPLATES_DIR="$(dirname "$TPL")" HOME="$PREFB/home" CELL_HOME="$PREFB/home" \
     AGENT_INFRA_PATH="$PREFB/layer" ENV_FILE="$PREFB/home/keys.env" O="$PREFB/o" \
     PATH="$PREFB/bin:$PATH" ELDATO_PLATFORM=Linux \
-    ORCH_SUPERVISOR_PREFER="$SCRATCH_P/cloud-cell-supervisor.sh" bash "$INST" --install 2>&1)" || PREFB_RC=$?
+    ORCH_SUPERVISOR_PREFER="$SCRATCH_P/cloud-cell-supervisor.sh" bash "$PREFB/side/install-controller-service.sh" --install 2>&1)" || PREFB_RC=$?
 [ "$PREFB_RC" -ne 0 ] && ok '§P5: with no durable candidate at all the pref does not rescue it — refused, not armed' \
                     || bad "§P5: installed from a scratch preference when no durable candidate existed: $PREFB_OUT"
 case "$PREFB_OUT" in

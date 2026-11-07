@@ -2439,12 +2439,17 @@ check_controller_service() {
   # through to the farm. `ORCH_SUPERVISOR` there is a hard requirement and would have refused instead.
   [ -n "$layer_sup" ] && cenv+=("ORCH_SUPERVISOR_PREFER=$layer_sup")
   # ⛔ NAME THE LAYER ROOT TO THE INSTALLER, IF IT IS NOT ON THE PROFILE'S PATH (agent-infra#2697). The
-  # installer now REFUSES to render an ExecStart under a temporary root that no deployment root declares,
-  # and a cell's checkout lives under /tmp (`/tmp/cell-ai`). $AGENT_INFRA_PATH is what pi-bootstrap writes
-  # into the profile, so it usually names this same checkout already — but this function's whole premise is
-  # that the layer came from `--check-operational-layer`'s TRUSTED pick, which can differ from the profile
-  # (an `INFRA_ROOT=` declaration, the cell-home checkout). Without this line that trusted layer is a false
-  # block that kills the bring-up at this check; with it, the refusal is about genuinely scratch paths only.
+  # installer REFUSES to render an ExecStart under a temporary root that no deployment root declares, and a
+  # cell's checkout lives under /tmp (`/tmp/cell-ai`). $AGENT_INFRA_PATH is what pi-bootstrap writes into the
+  # profile, so it usually names this same checkout already — but this function's whole premise is that the
+  # layer came from `--check-operational-layer`'s TRUSTED pick, which can differ from the profile (an
+  # `INFRA_ROOT=` declaration, the cell-home checkout). Without this line that trusted layer is a false block
+  # that kills the bring-up at this check.
+  # ⛔ IT CANNOT LAUNDER A LANE'S OWN WORKTREE (re-review P1). This declaration is exactly the escape a
+  # reviewer measured: with the layer being `self_root` — a LANE worktree — declaring it made the installer
+  # admit the very unmerged-code ExecStart #2697 is about. The installer now decides "is this a lane
+  # worktree" by GIT (a LINKED worktree, whatever its name, is refused before any declaration is consulted),
+  # so this line keeps its real job — a cell's PRIMARY clone under /tmp — and cannot admit a worktree.
   [ -n "${LAYER_ROOT:-}" ] && cenv+=("AGENT_INFRA_PATH=$LAYER_ROOT")
 
   rc=0

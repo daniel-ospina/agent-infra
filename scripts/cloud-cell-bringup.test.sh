@@ -574,21 +574,29 @@ case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eld
 
 esac
 
-# ⛔ AND WITH NO FARM THERE IS NOTHING DURABLE LEFT, SO THE RUN MUST **REFUSE** RATHER THAN ARM THE WORKTREE.
+# ⛔ AND WITH NO FARM THE RUN MUST EITHER REFUSE OR ARM SOMETHING DURABLE — NEVER A TRANSIENT PATH.
 # This is the discriminating half of the arm above: a fixture that always has a farm would pass on pre-#2697
 # code too (the pre-fix installer ignores ORCH_SUPERVISOR_PREFER and picks the farm), while the shape this
 # fleet actually hit — install from a lane worktree with no farm — is exactly where the old code armed
-# `/tmp/wt-*` as the boot entry point. Measured before the fix: this run exits 0 with a worktree ExecStart.
+# `/tmp/wt-*` as the boot entry point.
+# ⛔ AND IT IS NOT THE LITERAL "MUST REFUSE" (re-review P1). The installer's fourth candidate is the copy
+# BESIDE ITSELF, so on a DURABLE checkout — which is what CI checks out (`/home/runner/work/…`) — that
+# candidate is legitimately durable and the install must succeed; an arm asserting a refusal would go red on
+# every PR and on `main`. The invariant that holds on every box is the one that matters here: with no farm,
+# a unit may be armed only from a path that survives a cleaning.
 FARMED_SUP="$T/home/.pi/agent/scripts/cloud-cell-supervisor.sh"
 mv -f "$FARMED_SUP" "$FARMED_SUP.aside" 2>/dev/null
 rm -f "$T/systemd-units/eldato-orchestrator.service"
 printf '%s\n' "$TOK_BODY" > "$TOK"
 br ok normal --check
-[ "$BR_RC" -ne 0 ] && ok "with no farm the bring-up REFUSES to supervise the controller from a transient checkout (rc=$BR_RC)" \
-                   || bad "the bring-up installed a controller unit with no durable supervisor available — the #2697 defect, re-shipped"
 if [ -f "$T/systemd-units/eldato-orchestrator.service" ]; then
-  bad "a refused controller check still left a unit behind — a boot-armed path a cleaning removes: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")"
+  case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eldato-orchestrator.service" 2>/dev/null | head -1)" in
+    */.worktrees/*|/tmp/wt-*|/tmp/cell-wt-*|/tmp/base-*|/tmp/*|/var/tmp/*|/run/*|'') bad "with no farm the bring-up armed an ExecStart a cleaning removes — the #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
+    *) ok "with no farm the bring-up armed only a DURABLE path (this checkout is durable, so the beside-the-layer candidate is real)" ;;
+  esac
 else
+  [ "$BR_RC" -ne 0 ] && ok "with no farm the bring-up REFUSED to supervise the controller from a transient checkout (rc=$BR_RC)" \
+                     || bad "the bring-up returned 0 with no controller unit installed and no durable supervisor — an unsupervised controller"
   ok "…and it wrote NO unit (fail-closed, never a half-install)"
 fi
 mv -f "$FARMED_SUP.aside" "$FARMED_SUP" 2>/dev/null
