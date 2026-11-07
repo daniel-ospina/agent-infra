@@ -578,7 +578,22 @@ FNR == NR {
   next
 }
 { line = $0; sub(/^[ \t]+/, "", line) }
-line ~ /^#/ { next }
+# ⛔ A `#` LINE IS A COMMENT ONLY WHEN IT STARTS OUTSIDE A QUOTE (review P2, cycle 71): inside a multi-line quoted
+# string a line can begin with `#` and STILL be emitted, so a blanket `^#` skip exempted a record claim sitting on
+# the second physical line of an echo. Quote state is tracked across lines (both quote characters, backslash
+# escapes honoured) and the skip applies only when the line BEGINS outside every quote. Only DOUBLE quotes are
+# tracked: an apostrophe inside comment prose is not a quote, and counting it made shipped comments look like they
+# began inside a string. Residual, stated: a `#` line inside a multi-line SINGLE-quoted string is still skipped —
+# the shapes this test guards are echo/double-quoted prose.
+{ raw = $0; _startq = _inq; _cur = _inq; _i = 1; _n = length(raw)
+  while (_i <= _n) {
+    _c = substr(raw, _i, 1)
+    if (_cur == 1 && _c == "\\") { _i += 2; continue }
+    if (_c == "\"") _cur = 1 - _cur
+    _i++
+  }
+  _inq = _cur }
+line ~ /^#/ && _startq == 0 { _inq = 0; next }
 line !~ /pool-sat|tier-window|tier window|window record/ { next }
 line ~ /^(if|elif) \[/ {
   if (!_r1s || FNR < _r1s) print "before-read " FNR ": " substr(line, 1, 70)
@@ -617,11 +632,12 @@ if ! cmp -s "$FNS" "$_m_e" 2>/dev/null && _regred "$_m_e"; then rc=0
 else rc=1; echo "      a record-naming cat INSIDE the region did not red the names rule (cycle 70 exempted it by position alone)"; fi
 ck "non-vacuity: a record-naming PRINT inside the region reds the names rule (position alone is not an exemption)" $rc
 
-_m_i="$TMP/fns-region-hash.sh"
-awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  cat <<< \"[refresh] queue order: a tier was clipped\\n# the tier-window record says so\"" }' "$FNS" > "$_m_i"
+_m_i="$TMP/fns-region-cont.sh"
+# the mutation is TWO physical lines inside the arm's quoted string: the second one STARTS with `#` and IS emitted
+awk '{ print; if (index($0, "does not add up to the queue")) { print "      \"and the tier window record says a tier was"; print "# clipped\"" } }' "$FNS" > "$_m_i"
 if ! cmp -s "$FNS" "$_m_i" 2>/dev/null && _regred "$_m_i"; then rc=0
-else rc=1; echo "      a record name behind a quoted '# the tier-window record' did not red the names rule"; fi
-ck "non-vacuity: a record name inside a quoted '#…' line reds the names rule (a comment ESCAPE is not a comment)" $rc
+else rc=1; echo "      a record name on a '#…'-starting CONTINUATION line of a quoted string did not red the names rule"; fi
+ck "non-vacuity: a record name on a '#…'-starting CONTINUATION line reds the names rule (a quoted '#' is not a comment)" $rc
 
 _m_j="$TMP/fns-region-substr.sh"
 awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  cat <<< \x27[refresh] queue order: _why_none=\" the tier-window record was clipped\x27" }' "$FNS" > "$_m_j"
@@ -1232,6 +1248,46 @@ if [ "$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')" = "300 200" ] && 
    && [ "${pf_said:-0}" -ge 1 ]; then rc=0
 else rc=1; echo "      queue '$(tr '\n' ' ' < "$PQ/o/candidates.txt" | sed 's/ *$//')' product '$prod_a' floor-head '$head_a' said='${pf_said:-0}' (want 300 200 / 300 200 / 300 and a 're-sequenced onto the queue' line — the queue ARRIVED '200 300', so the reorder must really run; a numeric sort would leave the product at '200 300' and the head at 200)"; fi
 ck "a SKIPPED pass re-sequences candidates.product.txt onto the queue's order, so the floor slot takes the queue's head (200 -> 300)" $rc
+# ⛔ THE THREE WARN ARMS OF `product_queue_follow` HAD NO FIXTURE AT ALL (review P1, cycle 71: mutating each one
+# stayed 172/0). They are the states the floor's head can go stale in, so each gets its own drive, captured to `out`
+# and therefore pinned: (1) the product path EXISTS but is not a readable regular file, (2) the re-sequence command
+# itself fails, (3) the MOVE fails. Each shim fails only for the product path, so the fixture cannot pass by never
+# reaching the arm.
+_pfw_un="$TMP/pfw-unread"; rm -rf "$_pfw_un"; mkdir -p "$_pfw_un/o/candidates.product.txt"
+printf '300\n' > "$_pfw_un/o/candidates.txt"; printf '300\n' > "$_pfw_un/o/.pool"
+{ drive_prologue; cat "$FNS"; printf 'product_queue_follow "$1"\nexit 0\n'; } > "$_pfw_un/drive.sh"
+( cd "$_pfw_un" && HOME="$_pfw_un" bash drive.sh "$_pfw_un/o" ) > "$_pfw_un/out" 2>&1
+if grep -q 'EXISTS but is not a readable regular file' "$_pfw_un/out" 2>/dev/null; then rc=0
+else rc=1; echo "      unreadable product path said '$(tr '\n' '|' < "$_pfw_un/out" 2>/dev/null | head -c 240)' (want the WARN naming the path as not a readable regular file)"; fi
+ck "product_queue_follow: an UNREADABLE product path is NAMED (the floor head is whatever that path holds, not this pass)" $rc
+
+_pfw_awk="$TMP/pfw-awkfail"; rm -rf "$_pfw_awk"; mkdir -p "$_pfw_awk/o" "$_pfw_awk/bin"
+printf '300\n200\n' > "$_pfw_awk/o/candidates.txt"; printf '300\n200\n' > "$_pfw_awk/o/candidates.product.txt"
+cat > "$_pfw_awk/bin/awk" <<'SHIM'
+#!/usr/bin/env bash
+exit 2
+SHIM
+chmod +x "$_pfw_awk/bin/awk"
+{ drive_prologue; cat "$FNS"; printf 'product_queue_follow "$1"\nexit 0\n'; } > "$_pfw_awk/drive.sh"
+( cd "$_pfw_awk" && HOME="$_pfw_awk" PATH="$_pfw_awk/bin:$PATH" bash drive.sh "$_pfw_awk/o" ) > "$_pfw_awk/out" 2>&1
+if grep -q 'could NOT be re-sequenced this pass' "$_pfw_awk/out" 2>/dev/null; then rc=0
+else rc=1; echo "      a failing re-sequence command said '$(tr '\n' '|' < "$_pfw_awk/out" 2>/dev/null | head -c 240)' (want the WARN that the product file keeps the PREVIOUS pass order)"; fi
+ck "product_queue_follow: a FAILED re-sequence is NAMED (the product floor head may come from a sequence the queue no longer has)" $rc
+
+_pfw_mv="$TMP/pfw-mvfail"; rm -rf "$_pfw_mv"; mkdir -p "$_pfw_mv/o" "$_pfw_mv/bin"
+# the product order must DIFFER from the queue's, or the re-sequence is byte-identical and the move never happens
+printf '200\n300\n' > "$_pfw_mv/o/candidates.txt"; printf '300\n200\n' > "$_pfw_mv/o/candidates.product.txt"
+cat > "$_pfw_mv/bin/mv" <<'SHIM'
+#!/usr/bin/env bash
+exit 1
+SHIM
+chmod +x "$_pfw_mv/bin/mv"
+{ drive_prologue; cat "$FNS"; printf 'product_queue_follow "$1"\nexit 0\n'; } > "$_pfw_mv/drive.sh"
+( cd "$_pfw_mv" && HOME="$_pfw_mv" PATH="$_pfw_mv/bin:$PATH" bash drive.sh "$_pfw_mv/o" ) > "$_pfw_mv/out" 2>&1
+if grep -q 'could not be re-sequenced (the move failed)' "$_pfw_mv/out" 2>/dev/null; then rc=0
+else rc=1; echo "      a failed MOVE said '$(tr '\n' '|' < "$_pfw_mv/out" 2>/dev/null | head -c 240)' (want the WARN that the floor head may be stale)"; fi
+ck "product_queue_follow: a FAILED MOVE is NAMED (the floor head is read as possibly stale)" $rc
+
 # B) NO NEEDLESS REWRITE: an already-aligned product file keeps its INODE (same reasoning as check 8 —
 #    a swap races a reader for no gain). Positive pair: A above really did move bytes.
 printf '300\n200\n9\n' > "$PQ/o/candidates.txt"
@@ -2665,6 +2721,29 @@ elif grep -q 'could not be READ' <<<"$_x14" \
 else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) an UNREADABLE window record asserts NO clip (both clauses) and leaks no shell 'Permission denied'" $rc
 
+# ⛔ 14d-quater) THE `_sat_unread` CLAUSE NEEDS A FIXTURE THAT DOES NOT DEPEND ON THE CALLER`S UID (review P1,
+# cycle 71). The only fixture that reached it was the chmod-000 one, and that is EXCLUDED from the output pin
+# because root can read a 000 file — so a claim appended to this sentence was graded by nothing at all (measured:
+# `EXISTED but could not be READ (a tier was clipped)` stayed 172/0 and PRINTED). A `tr` shim that fails only for
+# the `.pool-sat` read (`tr '\000' '\001'`, a signature no other caller in these functions uses) reaches the same
+# branch for EVERY uid, so the sentence is now emitted by a pinned case.
+_d14u="$TMP/arm-clip-trshim"; rm -rf "$_d14u"; mkdir -p "$_d14u/o" "$_d14u/bin"
+printf 'aaa\nbbb\n' > "$_d14u/o/candidates.txt"; printf '200\n' > "$_d14u/o/.pool"; printf 'P1-severe\n' > "$_d14u/o/.pool-sat"
+cat > "$_d14u/bin/tr" <<'SHIM'
+#!/usr/bin/env bash
+[ "${1:-}" = '\000' ] && exit 1
+exec /usr/bin/tr "$@"
+SHIM
+chmod +x "$_d14u/bin/tr"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_d14u/drive.sh"
+( cd "$_d14u" && HOME="$_d14u" PATH="$_d14u/bin:$PATH" bash drive.sh "$_d14u/o" ) > "$_d14u/out" 2>&1
+_u14="$(cat "$_d14u/out" 2>/dev/null)"
+if grep -q 'tier-window record EXISTED but could not be READ' <<<"$_u14" \
+   && grep -q 'measured no clip and asserts none' <<<"$_u14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_u14"; then rc=0
+else rc=1; echo "      unreadable-by-tr-shim record '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 320)' (want the EXISTED-but-unreadable sentence and NO clip — this arm is uid-independent, so it is the one the output pin keeps)"; fi
+ck "(14d-quater) an UNREADABLE record reached WITHOUT chmod (a failing tr) says EXISTED-but-could-not-be-READ and asserts no clip" $rc
+
 # 14d-ter) A RECORD THAT EXISTS BUT CANNOT BE OPENED IS THE SAME STATE (review P3, cycle 41). `[ -s ]` and
 # `[ -r ]` are both TRUE for a directory, so a test-shaped guard let it through unread and reported "held
 # nothing this code could classify" over zero bytes. The guard must classify it as NOT OPENED — which is
@@ -2941,11 +3020,12 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 # SCOPE, STATED (so this is not a claim it cannot keep):
 #   * it covers every case THIS SUITE DRIVES — §14 and §6 drive each state arm and each refusal;
 #   * it does not red a source edit that changes no output, which is correct: a reformat cannot mislead an operator;
-#   * three cases are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
-#     running this suite twice (once as cmux, once as root): arm-clip-unread, mh-mode000, sa-unreadable. Root can read a mode-000 file, so those
-#     fixtures take a different branch; they stay graded by the assertions above, and excluding them here keeps the
-#     pin from turning "you ran as root" into a false red. A `case` count difference still reds, so a NEW fixture is
-#     always visible even if its output happens to duplicate a pinned one.
+#   * four captures are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
+#     running this suite twice (once as cmux, once as root) with an EMPTY exclusion list: `arm-clip-unread/out`,
+#     `mh-mode000/out`, `poolguards/m000.log`, `sa-unreadable/out`. Root can read a mode-000 file, so those fixtures
+#     take a different branch; they stay graded by the assertions above, and excluding them here keeps the pin from
+#     turning "you ran as root" into a false red. A capture-count difference still reds, so a NEW fixture is always
+#     visible even if its output happens to duplicate a pinned one.
 _out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI dropped)
   sed -e "s|$TMP/[A-Za-z0-9._-]*|ROOT|g" -e "s|$TMP|ROOT|g" -e 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null
 }
@@ -2953,24 +3033,39 @@ _out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI
 # read a mode-000 file, so these fixtures take a different branch and their text is legitimately different. They
 # stay graded by the assertions above; the pin stays silent about them rather than turning "you ran as root" into a
 # false red. Every OTHER case — including any fixture added later — is pinned.
-_out_uid_excluded='arm-clip-unread mh-mode000 sa-unreadable'
-_out_map() { # the pinned population: "<case>=<crc>" per driven case, sorted
+_out_uid_excluded='arm-clip-unread/out mh-mode000/out poolguards/m000.log sa-unreadable/out'
+# ⛔ EVERY CAPTURE FILE COUNTS, NOT ONLY `out` (review P1, cycle 71): several fixtures write their arm's output to
+# a `log` beside the drive instead of `out` — `$GQ/absent.log`, `$GQ/dir.log`, `$PQ/log`, `$PQ/log2`, `$PQ/log3` —
+# and those ARE operator-facing output. A pin that scanned only `out` would have claimed coverage it did not have;
+# measured: a claim appended to the `product_queue_follow` re-sequenced sentence stayed 172/0 until `log*` was
+# scanned. Each capture is keyed `<case>/<file>`. WHAT IS NOT A CAPTURE, deliberately: `drive*.sh` (the fixture's
+# own source — input, not something an operator reads) and the witness intermediates (`out-ctl`, `out-mut`,
+# `trace*`), which exist to compare a mutant against its control inside their own check.
+_out_map() { # the pinned population: "<case>/<capture>=<crc>" per driven capture, sorted
   for _od in "$TMP"/*/; do
     _on="${_od%/}"; _on="${_on##*/}"
-    [ -s "$_od/out" ] || continue
-    case " $_out_uid_excluded " in *" $_on "*|*" $_on "*) continue ;; esac
-    _out_norm "$_od/out" | awk -v n="$_on" 'BEGIN { } { printf "%s\n", $0 }' > "$TMP/.outnorm.$$.$_on" 2>/dev/null || continue
-    printf '%s=%s\n' "$_on" "$(cksum < "$TMP/.outnorm.$$.$_on" | cut -d' ' -f1)"
-    rm -f "$TMP/.outnorm.$$.$_on"
-  done | sort
+    for _of in "${_od}out" "${_od}"log "${_od}"log[0-9]* "${_od}"*.log; do
+      [ -f "$_of" ] || continue
+      _okey="$_on/$(basename "$_of")"
+      case " $_out_uid_excluded " in *" $_okey "*) continue ;; esac
+      # ⛔ A ZERO-BYTE CAPTURE IS PINNED AS `EMPTY`, NOT SKIPPED (review P3, cycle 71): `continue` made three
+      # shipped cases invisible (`rank-prefix`, `rankfmt`, `rankfmt2`), so "a new fixture is always visible" was
+      # false for a fixture that captures nothing. The POPULATION is pinned, not only its text.
+      if [ -s "$_of" ]; then _ocrc="$(_out_norm "$_of" | cksum | cut -d' ' -f1)"; else _ocrc="EMPTY"; fi
+      printf '%s=%s\n' "$_okey" "$_ocrc"
+    done
+  done | LC_ALL=C sort
 }
-_out_unique() { # the same map over the DRIVER-BUILT outputs only, deduped by content (many fixtures share an arm)
+_out_show() { # $1=<case>/<capture> -> a one-line preview, naming an EMPTY capture as such
+  if [ -s "$TMP/$1" ]; then head -3 "$TMP/$1" 2>/dev/null | tr '\n' '|' | head -c 300; else printf '(EMPTY capture - pinned as EMPTY, so a case that used to capture nothing now does)'; fi
+}
+_out_unique() { # the map above, deduped by content (many fixtures share an arm)
   _out_map | cut -d= -f2 | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 # ⛔ THE PIN. `case=crc` for every driven case, and the deduped set of distinct outputs, which is the coarse half:
 # a NEW case whose output duplicates an existing one cannot hide, and a sentence change moves the distinct set.
-_out_pin='arm-clip-devnull=132483589|arm-clip-dir=132483589|arm-clip-nonl=3407422058|arm-clip-nul=4222849383|arm-clip-nulmid=4222849383|arm-drained-clip-mut=1359919113|arm-drained-clip=273058056|arm-refuse-clip=1503384811|arm-refuse-mv=3598440741|arm-refuse-rowset=1567885012|arm-unranked-absent-mut=3696837072|arm-unranked-absent=1943905615|arm14-head=55288939|arm14-severity=1039870059|arm14-totals=2163807204|arm14-uncounted=1336462602|arm14-warn=3086333297|arm14mut-head=1296039546|arm14mut-severity=2810210006|arm14mut-totals=10164873|arm14mut-uncounted=2763562739|arm14mut-warn=3325294582|count-bad-totals=1102770011|count-bad=3104242257|count-drained=273058056|count-foreign-head=3025506656|count-foreign-zero=1053290514|count-gone=3104242257|count-good=1017492502|count-identical=4111658287|count-satcount-gone-mut=3104242257|count-satcount-gone=1187418021|count-satcount-head-mut=3025506656|count-satcount-head=657909655|count-satcount-totals-mut=1102770011|count-satcount-totals=1954371651|count-state-bad-totals=1102770011|count-state-drained=273058056|count-state-foreign-head=3025506656|count-state-foreign-zero=1053290514|count-state-gone=3104242257|count-state-good=1017492502|count-state-none=1943905615|count-state-rev=3123583493|dupnone=2058117218|empty=3865464101|member=1400623074|mh-absent=4029380213|mh-coerce=1460607088|mh-drained=964254667|mh-garbage-refused=105719062|mh-garbage-rev=1840396944|mh-garbage-unranked=2380626246|mh-garbage=1151312335|mh-hw-dir-priority-unreadable=2561788194|mh-hw-dir-severity=4029380213|mh-hw-drained-priority-unreadable=468363226|mh-hw-drained-severity=964254667|mh-hw-garbage-priority-unreadable=105719062|mh-hw-garbage-severity=1151312335|mh-hw-wcfailg-priority-unreadable=2467777652|mh-hw-wcfailg-severity=632953760|mh-revert=605356615|mh-rows=1686707371|mh-unranked-judged=4272221706|mh-unranked-own=2620396432|mh-unranked=3363606256|mh-unreadable=4029380213|mh-wcfail2=1334011946|mh-wcfail=1334011946|mh-wcfailg=632953760|mh-witrev=2241773645|mhr-real-refused=2215093811|mhr-real-unranked=1531456368|mut-droptail=2645416213|mut-member=882446226|mut-nocount=4056022816|nonnum2=3178247719|nonnum=1407898517|nopool=4092273942|norank2=2755054736|norank=2755054736|poolguards-mut=2928854713|prunerace-empty=1567885012|prunerace=1567885012|rank=4021605358|ranked=4245042416|rowset=3718680511|sa-absent=1025215466|sa-coerce=3512885538|sa-dir=1025215466|sa-drained=4253467874|sa-garbage=90999151|sa-headkey=4292339760|sa-unreadable-depth=4292339760|sa-wcfail=263720862|sa-withhead=286439349|sat-mut=4021605358|sat=4021605358|tail=2809272230|witness=4021605358'
-_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1102770011 1151312335 1187418021 1296039546 132483589 1334011946 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1531456368 1567885012 1686707371 1840396944 1943905615 1954371651 2058117218 2163807204 2215093811 2241773645 2380626246 2467777652 2561788194 2620396432 263720862 2645416213 273058056 2755054736 2763562739 2809272230 2810210006 286439349 2928854713 3025506656 3086333297 3104242257 3123583493 3178247719 3325294582 3363606256 3407422058 3512885538 3598440741 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4092273942 4111658287 4222849383 4245042416 4253467874 4272221706 4292339760 468363226 55288939 605356615 632953760 657909655 882446226 90999151 964254667'
+_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|dupnone/out=2058117218|empty/out=3865464101|guards/absent.log=1657602827|guards/dir.log=2497213199|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/out=882446226|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace/out=1567885012|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out=4021605358|tail/out=2809272230|witness/out=4021605358'
+_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1102770011 1151312335 1187418021 1228480870 1296039546 132483589 1334011946 1334591389 1334787953 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1506249713 1531456368 1567885012 1657602827 1686707371 1806709770 1840396944 1943905615 1954371651 2014644524 2058117218 2163807204 2215093811 2241773645 2380626246 2467777652 2497213199 2561788194 2620396432 2632535107 263720862 2645416213 273058056 2755054736 2763562739 2809272230 2810210006 286439349 2928806463 2928854713 3025506656 3086333297 3104242257 3123583493 3178247719 3325294582 3363606256 3407422058 3512885538 3598440741 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4092273942 4111658287 4222849383 4245042416 4253467874 4272221706 4292339760 468363226 55288939 605356615 632953760 657909655 882446226 90999151 964254667 982395898 EMPTY'
 _out_got="$(_out_map)"
 _out_distinct="$(_out_unique)"
 if [ "${RANK_QUEUE_PIN_REPORT:-0}" = "1" ]; then
@@ -2984,14 +3079,17 @@ elif [ "$_out_distinct" != "$_out_distinct_pin" ]; then
   rc=1; echo "      the set of DISTINCT operator outputs changed ($_want pinned, $_have now) — prose reached the operator:"
   for _oc in $(printf '%s' "$_out_got" | cut -d= -f1); do
     _oc_crc="$(printf '%s' "$_out_got" | grep -m1 "^$_oc=" | cut -d= -f2)"
-    printf '%s\n' $_out_distinct_pin | grep -qx "$_oc_crc" || echo "        case $_oc emits an output no pinned case produces: $(head -3 "$TMP/$_oc/out" 2>/dev/null | tr '\n' '|' | head -c 300)"
+    printf '%s\n' $_out_distinct_pin | grep -qx "$_oc_crc" || echo "        capture $_oc emits an output no pinned case produces: $(_out_show "$_oc")"
   done
-elif [ "$_out_got" != "$(printf '%s' "$_out_pin" | tr '|' '\n')" ]; then
+elif [ "$(printf '%s\n' "$_out_got" | LC_ALL=C sort)" != "$(printf '%s' "$_out_pin" | tr '|' '\n' | LC_ALL=C sort)" ]; then
+  # ORDER-ONLY DIFFERENCE: every capture is present with the same CRC and only the sequence differs. That is a
+  # collation bug in this check, not prose reaching an operator — name it as such instead of claiming a change.
+  rc=1; echo "      the pinned captures are all present but the MAP SEQUENCE differs — this check's own collation, not the code under test (both sides are now compared under LC_ALL=C)" 
   rc=1; echo "      a driven case's operator output changed:"
   while IFS= read -r _oline; do
     _oc="${_oline%%=*}"
     printf '%s\n' "$(printf '%s' "$_out_pin" | tr '|' '\n')" | grep -qx "$_oline" && continue
-    echo "        case $_oc: $(head -3 "$TMP/$_oc/out" 2>/dev/null | tr '\n' '|' | head -c 300)"
+    echo "        capture $_oc: $(_out_show "$_oc")"
   done <<EOF
 $_out_got
 EOF
@@ -3003,7 +3101,7 @@ ck "the EMITTED text of every driven case is pinned (a claim reached the operato
 # The witness drives the SAME fixture §1 uses (pool '200,300' over queue '300,9,200': both ranked, so the
 # severity arm — the one that prints `$_inst_said` and the head — is the arm under test), with a mutated copy of
 # the shipped function text, and compares the emitted bytes against the PINNED crc for that case.
-_rank_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | grep -m1 '^rank=' | cut -d= -f2)"
+_rank_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | grep -m1 '^rank/out=' | cut -d= -f2)"
 _outred2() { # $1=mutated source -> 0 when the emitted text differs from the pinned 'rank' case
   _om_d="$TMP/outpin-mut"; rm -rf "$_om_d"; mkdir -p "$_om_d/o"
   printf '300\n9\n200\n' > "$_om_d/o/candidates.txt"
