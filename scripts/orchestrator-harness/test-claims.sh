@@ -1296,22 +1296,25 @@ echo "  TTL_MAX=999999999 resolves to: $outP4FLOORCAP"
 ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 9-digit term cannot raise the ceiling with it" "^2592000$" "$outP4FLOORCAP"
 # ...and the cap is the DECISION, not just the value: a 2-year-old claim is REAPED at the ceiling, so a
 # deleted cap shows up as a KEPT claim, not as a number.
-# ⛔ AND THIS SEED IS ASSERTED, NOT SWALLOWED (review round 30, agent-infra#3203) — the same rule round 25
-# wrote at A70a above. `pr-3236` is NOT the only swallowed seed in this block — 13 of them are planted with
-# `p4_seed … >/dev/null` — but it is the only one whose UNIQUE hazard is an ABSENCE assertion: every other
-# swallowed seed sits above an assertion that needs its ref to have existed (A30 `:920` names
-# `pruned … refs/claims/pr-3209`; A84 below names `pruned … refs/claims/pr-3236`). A85 asserts the ref is
-# ABSENT, which is exactly what a NEVER-PLANTED fixture looks like, so a seed that failed inside the
-# redirect read `✅ "it is really gone"` over a ref that never existed — a verifier PASSing an unverified
-# artifact — while A84's red blamed the 30-day CEILING cap for a fault that was in the fixture instead.
-# Asserting the minted sha (p4_seed prints the commit it pushed, :800) gives the run a row that NAMES the
-# seed and reddens it.
-# ⛔ HONESTY ABOUT THE MECHANISM (review round 31). This suite is `set -u`, NOT `set -e`, and `ck` only
-# increments FAIL — so a failed seed does NOT stop execution, and A84/A85 still RUN. What the row changes is
-# the VERDICT and its ATTRIBUTION: the run is RED (it could previously be GREEN), and the red now names the
-# seed instead of leaving A84 to blame the ceiling cap and A85 to certify an absence it never observed. It
-# does not make A84/A85 measure a proven fixture by itself — the suite-level guarantee this buys is that an
-# ABSENT FIXTURE CAN NO LONGER PRODUCE A GREEN RUN.
+# ⛔ AND THIS SEED IS ASSERTED, NOT SWALLOWED (review rounds 30–32, agent-infra#3203) — the same rule round
+# 25 wrote at A70a above. `pr-3236` is one of 13 seeds this P4 block still plants with
+# `p4_seed … >/dev/null`, and it is the only one whose PAIRED assertion is an ABSENCE: A85 reads
+# `p4_has pr-3236 && … || P4CAPK=1` and asserts `^1$`, and `p4_has` (:806) cannot tell "pruned" from
+# "never planted" — both answer 1. So a seed that failed inside the redirect read `✅ "it is really gone"`
+# over a ref that never existed: a ROW passing an unverified artifact.
+# ⛔ WHAT THIS ROW BUYS, STATED NARROWLY — three earlier drafts of this paragraph claimed more, so the
+# bounds are written down rather than left to the next reader.
+#   * It does NOT change the run's polarity. An absent fixture was ALREADY a red run: A84 greps the prune
+#     output for the literal `pruned … refs/claims/pr-3236`, which a never-planted ref cannot produce, so
+#     A84 was the run-level red all along (`[ "$FAIL" -eq 0 ]`, :1947).
+#   * It does NOT stop A84/A85 running. The suite is `set -u`, NOT `set -e` (:69), and `ck` only increments
+#     FAIL (:275-282) — there is no early exit, so both rows still execute.
+#   * It DOES move the failure to a SETUP row whose message NAMES the seed, instead of surfacing as an A84
+#     red that reads like a 30-day-CEILING-cap regression. Attribution is the whole purchase: a red that
+#     names the wrong cause costs a diagnosis.
+# (A previous draft added "every other swallowed seed sits above a ref-dependent assertion" — that
+# universal is FALSE: `pr-3214` (:967) is referenced by no assertion at all. The census that holds, and is
+# all this paragraph needs, is 13 swallowed seeds and exactly one paired with an ABSENCE.)
 ck "A84a (setup) a 2-YEAR-old unparseable-lease claim is MINTED for the ceiling-cap case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3236 weird3203 HAVOC 63072000 2>/dev/null )"
 outP4CAPB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
                   CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
