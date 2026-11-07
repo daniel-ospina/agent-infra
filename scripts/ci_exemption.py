@@ -181,12 +181,20 @@ from pathlib import Path
 #: (``def test_café`` emits the raw UTF-8 bytes ``c3 a9``), so that class needs a
 #: non-ASCII RANGE and admitting ``\`` does not help it.
 #:
-#: WHICH DOOR, precisely: ``_RATES_RE``'s nodeid group is ``\S+``, so it ALSO refuses
-#: a row whose id carries whitespace (space is the practical case) — a
-#: reader-side refusal, not a table property (the producer emits the row intact).
+#: WHICH DOOR, precisely — and for a WHITESPACE id there are THREE, not one.
+#: ``_RATES_RE``'s nodeid group is ``\S+``, so it refuses the row; but the row is
+#: ALSO rewritten upstream, before this module ever sees it: the table is built at
+#: ``scripts/ci-failure-set.sh`` by ``sort | uniq -c | awk '{ c=$1; $1=""; ... }'``,
+#: and ``$1 = ""`` REBUILDS ``$0`` joined by OFS, so every whitespace RUN inside the
+#: id collapses to one space. Measured on this repo's own 47 dropped ids: 22 of the
+#: 47 rows are NOT present verbatim in the produced table (``[   ]`` -> ``[ ]``).
+#: So a whitespace fix needs the PRODUCER fixed too, or the PR id and main's row
+#: never joined and the BLOCK survives a "both doors widened" change. This module
+#: already records the mangling where it matters for guard keys — see the
+#: ``uniq -c | awk`` note further down; this is the same fact for nodeids.
 #: Every other offending character is ``\S``, so ``_RATES_RE`` matches those rows
 #: and the drop is ``rest`` ALONE. Do not send a fixer to ``_RATES_RE`` for a
-#: comma; it is not involved. A whitespace fix needs BOTH widened.
+#: comma; it is not involved.
 #:
 #: The module's own
 #: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins

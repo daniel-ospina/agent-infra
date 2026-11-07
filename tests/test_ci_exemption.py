@@ -3088,7 +3088,8 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     memory. `pytest tests/ --collect-only -q` on this tree collects 1543 ids; the
     strict door drops **47** of them, and **10** of those carry offending characters
     (raw `#`, `(`, `)`, `@`, `` ` ``, `|`, `<`, `>`) that no earlier enumeration
-    named. Examples that are real ids in this very file:
+    named. Two real examples from the collected population — the first lives in
+    THIS file, the second in a drift fixture (``tests/fixtures/drift/current/...``):
 
         tests/test_ci_exemption.py::test_no_runner_or_hook_wrapper_is_ever_an_identity[##[error]Bash exited with code '1'.]
         ...test_queue_dispatch.py::test_an_unreadable_roster_still_aborts[None--(timeout)]
@@ -3110,11 +3111,19 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     `_RATES_RE`'s nodeid group is `\S+`, so it ALSO refuses a row whose id contains
     whitespace (space is the practical case): the row is IN the table and
     `_RATES_RE` declines to match it — a reader-side refusal, not a property of the
-    table (the producer's `sort | uniq -c | awk` emits the row intact). Every other
-    offending character — punctuation, escapes, raw non-ASCII — is `\S`, so
-    `_RATES_RE` matches those rows fine and the drop is `is_failure_key` / `rest`
-    ALONE. Do not send a future fixer to `_RATES_RE` for a comma; it is not
-    involved. A whitespace fix needs BOTH widened.
+    table — a reader-side refusal. Every other offending character — punctuation,
+    escapes, raw non-ASCII — is `\S`, so `_RATES_RE` matches those rows fine and
+    the drop is `is_failure_key` / `rest` ALONE. Do not send a future fixer to
+    `_RATES_RE` for a comma; it is not involved.
+
+    ⛔ BUT A WHITESPACE ID HAS THREE DOORS, NOT TWO — the third is UPSTREAM. The
+    table is built at `scripts/ci-failure-set.sh` by
+    `sort | uniq -c | awk '{ c=$1; $1=""; ... }'`, and `$1 = ""` REBUILDS `$0`
+    joined by OFS, so every whitespace RUN inside the id collapses to one space.
+    Measured on this repo's own 47 dropped ids: **22 of 47** rows are not present
+    verbatim in the produced table (`[   ]` -> `[ ]`). Widening both doors still
+    leaves the PR's id and main's row unjoined and the BLOCK survives. Do not
+    record "both doors" as the whitespace fix; the producer is the first one.
 
     The module's own
     `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
@@ -3138,25 +3147,29 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     # silently declared fixed and CANNOT be mistaken for correct behaviour.
     # Space is a real id (the module pins `[chromium-Claude Desktop]`), so it does
     # NOT belong in the junk loop above — asserting "must not buy a rate row" about
-    # a real id asserts that a live BLOCK is right. It is asserted here as a KNOWN,
-    # TRACKED defect instead: if #3691 closes, this block reds and the fixer
-    # deletes it deliberately rather than discovering it as a surprise.
-    for residual in (
-        "tests/test_a.py::test_x[a b]",       # real id; dropped (space)
-        "tests/test_a.py::test_x[a,b]",       # real id; dropped (comma)
-        "tests/test_a.py::test_x[a;b]",       # real id; dropped (semicolon)
-        r"tests/test_a.py::test_x[a\tb]",     # real id as pytest emits it (escaped tab)
+    # a real id asserts that a live BLOCK is right.
+    #
+    # ⛔ EACH CLASS IS ITS OWN ENTRY, checked in its OWN assertion. A single block
+    # for all four, with one "delete this block when #3691 closes" message, would
+    # let a SPACE-ONLY fix delete the guards for comma, semicolon and the escape
+    # family — three independent silent-drop → permanent-BLOCK classes that no
+    # issue covers — and their re-introduction would then be silent. Each entry
+    # therefore fails alone and says which class it is.
+    for residual, why in (
+        ("tests/test_a.py::test_x[a b]", "SPACE — tracked as agent-infra#3691"),
+        ("tests/test_a.py::test_x[a,b]", "COMMA — no issue yet; needs its own"),
+        ("tests/test_a.py::test_x[a;b]", "SEMICOLON — no issue yet; needs its own"),
+        (r"tests/test_a.py::test_x[a\tb]", "ESCAPED TAB — no issue yet; needs its own"),
     ):
-        assert not is_failure_key(residual), (
-            f"{residual!r} is now ACCEPTED by the strict door — if agent-infra#3691 "
-            "closed the residual, delete this block; if not, the alphabet changed"
-        )
         assert is_failure_key_loose(residual), (
             f"{residual!r} must be a REAL id (the loose/PR door names it), else it "
             "belongs in the junk loop above, not here"
         )
-
-
+        assert not is_failure_key(residual), (
+            f"RESIDUAL CLOSED for {why}: {residual!r} is now ACCEPTED by the strict "
+            "door. Remove THIS entry only — the other three classes are separate and "
+            "are not fixed by closing this one."
+        )
 
 
 def test_6798_the_row_door_admits_EVERY_produced_key_prefix():
