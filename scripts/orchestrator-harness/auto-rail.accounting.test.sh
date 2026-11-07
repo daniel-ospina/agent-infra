@@ -1319,6 +1319,29 @@ grep -qF 'REVIEW-LEDGER-UNPARSEABLE' "$LOG" \
   || bad "a corrupt ledger must SAY SO in the log (no REVIEW-LEDGER-UNPARSEABLE line) — a silent cap is indistinguishable from the defect it replaces"
 review_ledger_unreadable "$_led" \
   || bad "review_ledger_unreadable must answer the SAME question as the counter for a corrupt ledger — otherwise the CAP wording (which exists so no comment asserts an unmeasured count) is skipped for exactly the record whose count was never measured"
+# ⛔ "EXISTS BUT IS NOT A REGULAR FILE" IS NOT "NOTHING HAS BEEN SPENT" (review cycle 2, P2, measured).
+# `[ -f "$f" ]` alone answered a DIRECTORY at the ledger path with 0 dispatches — a FREE slot — while the
+# append in `launch_review` to that same path FAILS, so the count was pinned at 0 for ever: one full paid
+# review per COOLDOWN_TRANSIENT_S at that head, no EXHAUSTED state, and `review_ledger_unreadable` calling
+# it "readable" so the CAP wording was skipped too. Both arms below are driven on the SHIPPED functions.
+_leddir="$_rdir/ledger-is-a-dir.attempts"
+rm -rf "$_leddir"; mkdir -p "$_leddir"
+[ "$(review_attempts "$_leddir")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a DIRECTORY at the ledger path must FAIL CLOSED (got '$(review_attempts "$_leddir")', want the cap $REVIEW_MAX_ATTEMPTS) — reading 'not a regular file' as 0 dispatches is a free slot whose append can never succeed, so the head is charged nothing for ever"
+review_ledger_unreadable "$_leddir" \
+  || bad "a DIRECTORY at the ledger path must be reported UNREADABLE by review_ledger_unreadable (rc $?) — its content cannot be counted, which is exactly what that contract promises"
+rm -rf "$_leddir"
+# …and the over-blocking control: an ABSENT path and an EMPTY regular file are still 0 / readable, so the
+# `-e` test above did not turn "nothing spent yet" into a permanent EXHAUSTED head.
+[ "$(review_attempts "$_rdir/never-created.attempts")" = 0 ] \
+  || bad "an ABSENT ledger must still read 0 attempts (got '$(review_attempts "$_rdir/never-created.attempts")') — the fail-closed arm must not make a first-ever head un-reviewable"
+review_ledger_unreadable "$_rdir/never-created.attempts" \
+  && bad "an ABSENT ledger must still answer 'readable' (rc 0) — the CAP wording exists for a record whose count could not be MEASURED, not for one that was never written"
+: > "$_rdir/empty-regular.attempts"
+[ "$(review_attempts "$_rdir/empty-regular.attempts")" = 0 ] \
+  || bad "an EMPTY regular ledger must still read 0 attempts (got '$(review_attempts "$_rdir/empty-regular.attempts")') — a fresh head has spent nothing, and the fail-closed split must not touch that"
+review_ledger_unreadable "$_rdir/empty-regular.attempts" \
+  && bad "an EMPTY regular ledger must still answer 'readable' — otherwise every fresh head publishes the CAP as if its count were unmeasured"
 printf '%s\n' "$(( _now - REVIEW_ATTEMPT_WINDOW_S - 1 ))" > "$_led"
 [ "$(review_attempts "$_led")" = 0 ] \
   || bad "a ledger whose entries are ALL outside the window must read 0 attempts (got '$(review_attempts "$_led")') — otherwise a head is EXHAUSTED by history alone"
@@ -2163,6 +2186,32 @@ for _term in 'a review record exists that the gate cannot bind' 'review attempts
     *) bad "the HEADLESS 'awaiting-review' must name the terminal state '$_term' — review_action answers TERMINAL for it at a head the body cannot show, so omitting it promises a reviewer that will never be dispatched, in a marker nothing can supersede" ;;
   esac
 done
+# ⛔ NAMING THE STATES IS NOT ENOUGH — EACH MUST CARRY ITS OWN OUTCOME (review cycle 2, P2, measured). The
+# three classes were named together and then handed ONE shared consequence ("no reviewer is coming: that
+# verdict is in the reviewer's own comment or in that record"), which is FALSE for two of the three:
+#   * `review_action`'s rc 3 is EXHAUSTED WITHIN THE WINDOW — "terminal until the window rolls, NOT for
+#     ever" — so for a spent counter a reviewer IS coming, and this file's own `review-retries-exhausted`
+#     text says the window "rolls BY ITSELF". Telling the operator to push a NEW head contradicted it.
+#   * a spent counter has NO verdict at all (the state is "the reviewer is not producing a verdict"), so
+#     "that verdict is in the reviewer's own comment or in that record" pointed at a document that does not
+#     exist.
+# The arms below are the discrimination: the shared consequence must be GONE, the roll-by-itself fact and the
+# unreadable-ledger remedy must be PRESENT, and restoring the collapsed text must redden at least one.
+case "$_cap" in
+  *'no reviewer is coming'*) bad "the HEADLESS 'awaiting-review' still carries the shared consequence 'no reviewer is coming' — it is false for a SPENT attempt counter (review_action rc 3 is EXHAUSTED WITHIN THE WINDOW: terminal until the window rolls, not for ever) and it collapses three different facts into one remedy" ;;
+esac
+case "$_cap" in
+  *'rolls BY ITSELF'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must state that a SPENT attempt counter's window 'rolls BY ITSELF' — without it the comment's only reading is 'push a new head', which contradicts the sibling review-retries-exhausted text for the same class" ;;
+esac
+case "$_cap" in
+  *'repairing or removing'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must give the UNREADABLE-ledger subclass its OWN remedy ('repairing or removing') — that is the only state of the three that does not heal by itself, and the old '(including when …)' parenthetical hid it behind the spent-counter case" ;;
+esac
+case "$_cap" in
+  *'NO verdict'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must say a spent counter left NO verdict, instead of pointing at 'the reviewer's own comment or that record' — for that class no such document exists" ;;
+esac
 _b5=$(wc -l < "$POSTED")
 publish_review_state acme/widget 42 awaiting-review 5656565656565656565656565656565656565656
 _hk=$(sed -n "$(( _b5 + 1 )),\$p" "$POSTED")

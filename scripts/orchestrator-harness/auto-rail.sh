@@ -744,10 +744,21 @@ review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or 
 # for ever (review round 3 — see the knob's comment).
 review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window dispatch count
   local f=$1 n cut
-  # ⛔ `-f` FIRST: `wc`/`awk < missing` is BASH failing to open the redirect, not the tool failing, so a
-  # `2>/dev/null` on the tool does not silence it — the suite printed "No such file or directory" for a
+  # ⛔ `-e`/`-f` FIRST: `wc`/`awk < missing` is BASH failing to open the redirect, not the tool failing, so
+  # a `2>/dev/null` on the tool does not silence it — the suite printed "No such file or directory" for a
   # question it asked on purpose.
-  [ -f "$f" ] || { printf '0\n'; return 0; }
+  # ⛔ `-e` BEFORE `-f` (review cycle 2, P2, measured): `-f` ALONE answers "not a regular file" with 0
+  # dispatches, i.e. "nothing has been spent" — the one fail-open direction this block exists to forbid. A
+  # DIRECTORY at the ledger path (an interrupted state-dir create, a restored archive, a mistyped path) is
+  # therefore reported as a FREE SLOT, while the append in `launch_review` to that same path FAILS — so the
+  # count is pinned at 0 FOR EVER and the loop buys one full PAID review per COOLDOWN_TRANSIENT_S at that
+  # head, with no EXHAUSTED state and no diagnostic. "The path exists but is not a ledger this file can
+  # read" is the SAME fact as an unreadable ledger, never the same fact as "nothing has been spent".
+  [ -e "$f" ] || { printf '0\n'; return 0; }
+  [ -f "$f" ] || {
+    log_line "$f REVIEW-LEDGER-UNREADABLE: the attempt ledger path exists but is not a regular file, so this head's spend cannot be counted — treating it as EXHAUSTED (fail-closed: an uncountable counter is not a free slot, and the append would fail while every pass read 0)"
+    printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0
+  }
   cut=$(( $(date +%s) - REVIEW_ATTEMPT_WINDOW_S ))
   # ⛔ AN UNREADABLE LEDGER IS NOT A FREE SLOT (review round 6, P2, measured). "No file" means nothing has
   # been spent, so 0 is right — but a file that EXISTS and cannot be read (`awk` exits 2: mode 0200, a
@@ -798,7 +809,12 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
 # published comment keeps asserting the CAP as a measured count. rc 0 = exists and cannot be read.
 review_ledger_unreadable() {  # $1 = attempt ledger; rc 0 = exists but its content cannot be counted
   local f=$1 bad
-  [ -f "$f" ] || return 1
+  # ⛔ THE SAME `-e`/`-f` SPLIT AS `review_attempts` (review cycle 2, P2): a directory at the ledger path IS
+  # "exists but its content cannot be counted" — exactly what this contract promises, and exactly what the
+  # old `-f` test answered "readable" for. One classifier, two consumers, so the two must agree on every
+  # input or the CAP wording is skipped for the one record whose count was never measured.
+  [ -e "$f" ] || return 1
+  [ -f "$f" ] || return 0
   # ⛔ SAME QUESTION AS `review_attempts` (review round 8, P3): this used to test only that awk could RUN,
   # so a readable ledger of garbage answered "readable" here while the count it produces is meaningless —
   # and the CAP wording (which exists so the published comment never asserts an unmeasured count) would then
@@ -1010,7 +1026,20 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
         # publish. Naming only the rc=7 class left the other two reading "a reviewer is coming" for a head
         # the loop will never dispatch — and this marker is presence-keyed, so nothing later can supersede
         # it. The text names all of them.
-        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot — and if the review at that head has ALREADY run and found blocking issues, OR a review record exists that the gate cannot bind, OR this head's review attempts are spent (including when its attempt ledger cannot be read), then no reviewer is coming: that verdict is in the reviewer's own comment or in that record, auto-rail records nothing itself, and the fix is \`record-review.sh\` or a NEW head. **It is not waiting on a lane.**"
+        #
+        # ⛔ AND EACH TERMINAL STATE NAMES ITS OWN OUTCOME, NEVER A SHARED ONE (review cycle 2, P2, measured):
+        # the three classes were named together and then given ONE consequence ("no reviewer is coming: that
+        # verdict is in the reviewer's own comment or in that record"), which is false for two of them. (a)
+        # `review_action`'s rc 3 is EXHAUSTED WITHIN THE WINDOW — "terminal until the window rolls, NOT for
+        # ever" — and this file's own `review-retries-exhausted` text says so ("That window rolls BY
+        # ITSELF"), so for a spent counter a reviewer IS coming and telling the operator to push a NEW head
+        # is the opposite of the sibling text. (b) A spent counter has NO verdict: the state is defined as
+        # "the reviewer is not producing a verdict", so pointing at "the reviewer's own comment or that
+        # record" describes a document that does not exist. (c) The fail-closed cap of an UNREADABLE ledger
+        # is the one subclass that does NOT roll by itself (nothing was measured), so lumping it in behind
+        # "(including when …)" hid the only remedy that applies to it. Each class now states what is true of
+        # it, and the text claims nothing the code did not measure — the whole point of claim 3.
+        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot. It does NOT dispatch when one of these is already true — and each names a DIFFERENT fact, so read the one that applies: **(1)** the review at that head has ALREADY run and found blocking issues — the verdict is in that reviewer's own comment, and a NEW head is what gets a new review; **(2)** a review record exists that the gate cannot bind — re-running \`record-review.sh\` at the same head re-posts its marker, and no second review is bought; **(3)** this head's review attempts are spent — a reviewer that ran and left NO verdict, so there is none to read: that window rolls BY ITSELF and needs no action at all, UNLESS the attempt ledger cannot be read, in which case nothing was measured and that file needs repairing or removing. auto-rail records nothing itself. **It is not waiting on a lane.**"
       fi;;
     review-in-flight)
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
