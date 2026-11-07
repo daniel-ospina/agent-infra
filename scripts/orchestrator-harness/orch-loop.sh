@@ -1013,16 +1013,13 @@ stg_is_tiled() {
   return 1
 }
 
-# stg_is_registered <name> — is <name> one of the FOUR registry groups' names? (emittable at all)
-# Kept as the one membership question `stg_mark` and `stg_lvl_start` narrow FROM: an overlay name is a
-# legitimate member of the registry but a WRONG `stg_mark` argument (see `stg_is_tiled`), so the two
-# questions must stay distinct rather than be collapsed into one over-broad test.
-stg_is_registered() {
-  local _ir_n="${1:-}"
-  case "$_ir_n" in ''|*[!A-Za-z0-9_]*) return 1 ;; esac
-  case " $STG_REGISTRY " in *" $_ir_n "*) return 0 ;; esac
-  return 1
-}
+# ⛔ NO `stg_is_registered` HERE (fresh-context review, P3 — verified): it was defined, documented as
+# "the one membership question `stg_mark` and `stg_lvl_start` narrow FROM", and CALLED BY NOTHING —
+# `stg_mark` narrows from `stg_is_tiled` and `stg_lvl_start` from `stg_lvl_named`. Dead code under a
+# docstring that sends a reader to the wrong function is the same "false justification" class the earlier
+# review rounds were raised for, and worse here: a future `stg_mark` that "reused" it would re-open the
+# overlay-accumulation defect `stg_is_tiled` exists to close. The two named predicates above ARE the
+# membership tests; there is deliberately no third.
 
 # stg_lvl_named <name> — is <name> one of the declared CASCADE LEVELS?
 # A level must be in `STG_REGISTRY_LVL` to be emittable. An unknown level is REFUSED rather than queued

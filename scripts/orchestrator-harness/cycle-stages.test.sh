@@ -644,6 +644,26 @@ case " $_arm_marks " in *" boot "*) : ;; *) _mkmiss="$_mkmiss boot" ;; esac
 case " $_arm_marks " in *" disk "*) : ;; *) _mkmiss="$_mkmiss disk" ;; esac
 ck "each EARLY-EXIT arm marks the stage it actually ran, ADJACENT to its own stg_field call (got '${_arm_marks:- none}')${_mkmiss:+ — missing:$_mkmiss}" \
    "$(if [ -z "$_mkmiss" ]; then echo 0; else echo 1; fi)"
+# ⛔ AND THE **MAIN-PATH** MARK IS ITS OWN ARM (fresh-context review, P2 — measured). The two arms above
+# grade "a site exists per stage" (satisfied by an early-exit arm's mark alone) and "each early-exit arm
+# marks its own stage" (satisfied by the main path) — so the MAIN-PATH mark of a doubly-marked stage was
+# invisible. Measured: deleting `stg_mark boot` (the fork probe, on the normal cycle path) or `stg_mark
+# disk` (the disk-floor gate and its reclaim pass) left the suite at 118/0, while the emitted field became
+# `boot:ns, disk:2` or `disk:ns, reap:2` — a stage that DID run labelled "never sampled" and its seconds
+# charged to its neighbour. That is the identical vacuity shape the comment above documents catching in
+# the OTHER direction. A "main-path" mark is one whose next non-blank stripped line is NOT the arm's own
+# `stg_field`, i.e. not the mark consumed by an early-exit arm.
+_main_marks="$(printf '%s\n' "$_loop_nc" | awk '
+  /^[[:space:]]*stg_mark ([A-Za-z0-9_]+)[[:space:]]*$/ { pending=$2; next }
+  /^[[:space:]]*stg_field STG_FIELD[[:space:]]*$/ { pending=""; next }
+  /^[[:space:]]*$/ { next }
+  { if ($0 !~ /^[[:space:]]*(fi|then|do|else)$/) { if (pending != "") out = out " " pending; pending="" } }
+  END { print out }')"
+_mmmiss=""
+case " $_main_marks " in *" boot "*) : ;; *) _mmmiss="$_mmmiss boot" ;; esac
+case " $_main_marks " in *" disk "*) : ;; *) _mmmiss="$_mmmiss disk" ;; esac
+ck "  …and the MAIN-PATH mark survives for a doubly-marked stage, so a stage that ran cannot read 'ns' (got '${_main_marks:- none}')${_mmmiss:+ — missing:$_mmmiss}" \
+   "$(if [ -z "$_mmmiss" ]; then echo 0; else echo 1; fi)"
 
 # 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
 _nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
