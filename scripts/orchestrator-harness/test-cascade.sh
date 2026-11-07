@@ -633,8 +633,12 @@ ck "…while the SAME hold on an INERT PR path DOES trip it at the bound (the co
 # pinned too: `CASCADE_MAIN_RED` is CONSUMED exactly once, and that one site is the level walk that
 # decides 1-vs-the-rest. A second consumer is where an actor would appear. (This is still a tripwire
 # on the likely shapes, not a termination proof — but it is now a tripwire on BOTH of them.)
+# ⛔ AND THE TRIPWIRE MUST SEE THE UNBRACED SPELLING TOO (review round 8, P2): the first version grepped
+# `\${CASCADE_MAIN_RED` only, so the very shape its comment above QUOTES — `[ "$CASCADE_MAIN_RED" = 1 ]`
+# — did not match, and an actor written that way left both pins green (measured: appending that line
+# kept the count at 1). Both spellings are counted now, and the actor line takes it to 2.
 ck "…and CASCADE_MAIN_RED is CONSUMED exactly once (a second consumer is where an actor would live)" \
-   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -c '\${CASCADE_MAIN_RED' | tr -d ' ')" "1"
+   "$(grep -vE '^[[:space:]]*#' "$ORCH" | grep -cE '\$\{CASCADE_MAIN_RED|\$CASCADE_MAIN_RED([^A-Z_]|$)' | tr -d ' ')" "1"
 # ⛔ DECLARED LIMIT OF THIS PIN, so it is not read as a proof it does not give: it is NAME-based. It
 # fires when an actor is added KEYED ON THE LEVEL'S NAME (`FIX_MAIN`), which is how a level branch is
 # written in this file (`cascade_level_name` is the one map every other consumer uses) — it cannot
