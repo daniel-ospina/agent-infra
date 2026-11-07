@@ -720,9 +720,24 @@ done
 # to `scripts/orchestrator-harness → scripts`, so a cell gets it too. Measured 2026-11-07.
 # ⚠️ What farming flat does NOT carry is the doctor's OPTIONAL harness siblings (`lane-reap.sh`,
 # `rail-refusal.sh`, `repo-slug.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still
-# absent on a farm-only box. But `doctor_path()` prefers `$O` and the checkout's
-# `orchestrator-harness/` BEFORE this flat copy, so the farmed one is the last resort: previously
-# ABSENT (a dead consumer), now PRESENT with degraded optionals.
+# absent on a farm-only box, where they degrade rather than die.
+# ⛔ THE CANDIDATE ORDER IS NOT "FARMED COPY LAST", and an earlier version of this comment said it
+# was. `doctor_path()`'s loop (`cloud-cell-supervisor.sh`) tries, in order: `$O/cloud-cell-doctor.sh`,
+# `$(dirname "$SUP_SELF")/orchestrator-harness/cloud-cell-doctor.sh`,
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh`, `${HARNESS:-}/scripts/orchestrator-harness/...`,
+# `${HARNESS_PIN_DIR:-}/scripts/orchestrator-harness/...`. `$(dirname "$SUP_SELF")` IS `$DEST/scripts`
+# for the farmed supervisor, so this entry lands THIRD OF FIVE — ahead of BOTH pinned-harness
+# candidates, not behind them.
+# ⚠️ THE ACCEPTED EFFECT, named rather than hidden: on an UNSEEDED cell (`$O` not yet populated) with
+# a pinned harness holding a different doctor, the farmed copy now WINS over the pinned one — it
+# SHADOWS it. That is acceptable here because (a) `$O`, the seed the provenance record describes,
+# still wins on a started cell, which is every merge/doctor run that matters; and (b) the flat copy is
+# rewritten by every `setup.sh` run, so divergence means the harness was updated without re-running
+# the installer — a state the farm is supposed to be the authority on. ⛔ This is therefore NOT a
+# reason to reorder `doctor_path()`: that order encodes #2306 (the pinned harness must be consulted at
+# all) and reordering it is a design change, not a comment fix.
+# Before this entry candidate 3 was simply ABSENT on a farm-only box, so nothing shadowed — and the
+# supervisor's every role `die`d.
 mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'

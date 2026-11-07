@@ -682,9 +682,17 @@ other:orchestrator-harness/capacity.sh other:orchestrator-harness/cloud-cell-doc
 #     is DELETED — it would now read STALE;
 #   · `admin-merge.sh` → `merge_gate_srcs` (flat `$DEST/scripts/`). Its independent corroboration is
 #     `record-review.sh`'s always-review-the-full-surface list, which carries `scripts/admin-merge.sh`
-#     BY NAME (:719, `review_full_surface_path`) — ⛔ NOT "beside `verify-admin-merge-evidence.sh`":
+#     BY NAME (`review_full_surface_path`) — ⛔ NOT "beside `verify-admin-merge-evidence.sh`":
 #     that string does not occur in `record-review.sh` at all (`grep -c` = 0), and the pair shares no
 #     list. The rail is genuinely exec'd by a farmed consumer, which is what justifies the farm entry.
+#     (No line number here on purpose — an earlier version of this block cited `:719` and the real
+#     line had moved to `:729`, which is the very defect this file's P3 fix removes. Cite the
+#     function and let `grep -n admin-merge.sh scripts/record-review.sh` find it.)
+#     ⛔ THAT SAME LIST IS THE CORROBORATION FOR THE RAIL'S HELPER TRIO: it names
+#     `scripts/ci-failure-set.sh` and, two comments below it, "Rail-exec'd decision modules:
+#     `admin-merge.sh` execs BOTH of these" — `ci_exemption.py` and `ci-workflow-pr-evaluable.sh`.
+#     So `record-review.sh` ALREADY graded all three as rail-owning files; `merge_gate_srcs` was the
+#     only list that had not caught up, which is why the rail was farmed without them.
 # The remaining FOUR were already DELIVERED and are a pure re-pin: `fleet-schedule.py`,
 # `pi-cache-reap.sh`, `reap-lane-venvs.sh`, `registry-sync.sh` (all members of `fleet_srcs`).
 # The closure already scanned the three cell scripts as producers, so farming them adds no new
