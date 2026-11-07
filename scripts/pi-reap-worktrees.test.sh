@@ -5196,6 +5196,47 @@ else
 fi
 assert_contains "$OUT" "removed=0" \
     "A26g6 …and the pass reports no removal"
+# MUTANT — a pin is only a pin if a mutant actually REDDENS it, and that measurement must not live
+# only in a commit message: an out-of-suite mutation proves the arm once, and nothing re-checks it
+# afterwards, so the day an edit makes the fixture unable to redden, the suite is green again with
+# the guard gone. This leg deletes exactly `remove_one`'s four fork-probe lines (`:4688-4691`; the
+# classification call and its `"at classification"` phase token are untouched) and asserts the SAME
+# fixture LOSES the checkout — the destructive outcome, not a log line — and pays ONE targeted
+# probe instead of two.
+MUT6="$T/$ENV/pi-reap-worktrees.mutant-fork-recheck.sh"
+awk '
+    /if ! remote_holds_recheck "\$path" "\$sha" "\$why"; then/ { skip = 3; next }
+    skip > 0 { skip--; next }
+    { print }
+' "$REAPER" >"$MUT6"
+if cmp -s "$REAPER" "$MUT6"; then
+    bad "A26g6 the FORK-TIME MUTANT DID NOT APPLY — the pin is unverified"
+else
+    ok "A26g6 mutant applied: remove_one's four fork-probe lines are gone, the classification call is untouched"
+fi
+ENV2=A26g6m; REPO2="$(mk_repo $ENV2)"
+BARE2="$T/$ENV2/remote.git"
+"$REAL_GIT" init -q --bare "$BARE2"
+"$REAL_GIT" -C "$REPO2" remote add upstream "$BARE2"
+"$REAL_GIT" -C "$REPO2" checkout -q -b tmp-a26g6m
+commit_in_wt "$REPO2" "$OLD_DATE" a26g6m
+A26G6M_SHA="$("$REAL_GIT" -C "$REPO2" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO2" push -q upstream "tmp-a26g6m:refs/heads/feat/a26g6m"
+"$REAL_GIT" -C "$REPO2" checkout -q main
+"$REAL_GIT" -C "$REPO2" branch -D tmp-a26g6m >/dev/null
+"$REAL_GIT" -C "$REPO2" fetch -q upstream
+"$REAL_GIT" -C "$REPO2" worktree add -q --detach "$T/$ENV2-det" "$A26G6M_SHA"
+A26G6M_CNT="$T/$ENV2/cnt"; rm -f "$A26G6M_CNT"
+OUTM="$(REAPER_OVERRIDE="$MUT6" FAKE_ADV_LINE="$A26G6M_SHA	refs/heads/feat/a26g6m" \
+    FAKE_TARGETED_LINE="$A26G6M_SHA	refs/heads/feat/a26g6m" \
+    FAKE_TARGETED_COUNTER="$A26G6M_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-forkstale" \
+    run_reaper $ENV2 --apply --repo "$REPO2")"
+assert_nodir "$T/$ENV2-det" \
+    "A26g6 MUTANT GOES RED: without the fork re-probe the checkout IS removed on a warrant the remote had already invalidated"
+assert_contains "$OUTM" "removed=1" \
+    "A26g6 …and the mutant pass reports the removal it should never have taken"
+assert_eq "$(cat "$A26G6M_CNT" 2>/dev/null)" "1" \
+    "A26g6 …and the mutant paid ONE targeted probe, not two — the fork probe is what the arm counts"
 
 # ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
 # This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
