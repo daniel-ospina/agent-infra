@@ -1296,13 +1296,13 @@ echo "  TTL_MAX=999999999 resolves to: $outP4FLOORCAP"
 ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 9-digit term cannot raise the ceiling with it" "^2592000$" "$outP4FLOORCAP"
 # ...and the cap is the DECISION, not just the value: a 2-year-old claim is REAPED at the ceiling, so a
 # deleted cap shows up as a KEPT claim, not as a number.
-# ⛔ AND THIS SEED IS ASSERTED, NOT SWALLOWED (review rounds 30–32, agent-infra#3203) — the same rule round
-# 25 wrote at A70a above. `pr-3236` is one of 13 seeds this P4 block still plants with
-# `p4_seed … >/dev/null`, and it is the only one whose PAIRED assertion is an ABSENCE: A85 reads
+# ⛔ AND THIS SEED IS ASSERTED, NOT SWALLOWED (review rounds 30–33, agent-infra#3203) — the same rule round
+# 25 wrote at A70a above. `pr-3236` WAS one of 14 seeds this P4 block planted with `p4_seed … >/dev/null` —
+# 13 others still are — and it was the only one OF THOSE 14 whose PAIRED assertion is an ABSENCE: A85 reads
 # `p4_has pr-3236 && … || P4CAPK=1` and asserts `^1$`, and `p4_has` (:806) cannot tell "pruned" from
 # "never planted" — both answer 1. So a seed that failed inside the redirect read `✅ "it is really gone"`
 # over a ref that never existed: a ROW passing an unverified artifact.
-# ⛔ WHAT THIS ROW BUYS, STATED NARROWLY — three earlier drafts of this paragraph claimed more, so the
+# ⛔ WHAT THIS ROW BUYS, STATED NARROWLY — four earlier drafts of this paragraph claimed more, so the
 # bounds are written down rather than left to the next reader.
 #   * It does NOT change the run's polarity. An absent fixture was ALREADY a red run: A84 greps the prune
 #     output for the literal `pruned … refs/claims/pr-3236`, which a never-planted ref cannot produce, so
@@ -1313,9 +1313,16 @@ ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 
 #   * It DOES move the failure to a SETUP row whose message NAMES the seed, instead of surfacing as an A84
 #     red that reads like a 30-day-CEILING-cap regression. Attribution is the whole purchase: a red that
 #     names the wrong cause costs a diagnosis.
-# (A previous draft added "every other swallowed seed sits above a ref-dependent assertion" — that
-# universal is FALSE: `pr-3214` (:967) is referenced by no assertion at all. The census that holds, and is
-# all this paragraph needs, is 13 swallowed seeds and exactly one paired with an ABSENCE.)
+# ⛔ THE COUNTS ARE TWO DIFFERENT SETS, AND CONFLATING THEM IS HOW THE PREVIOUS DRAFT WENT WRONG (review
+# round 33). HISTORY: 14 swallowed seeds, of which `pr-3236` was the only absence-paired one. NOW: 13
+# swallowed seeds, and `pr-3236` is NOT among them — A84a plants it with `2>/dev/null` INSIDE the asserted
+# `ck`, which is the whole point of this paragraph. So at this head NONE of the 13 swallowed seeds is
+# absence-paired, and the one absence-paired seed of the original 14 is the asserted one. Citing the 13 by
+# NAME, not by line, for the reason the pointer above records: they are `p4-young`, `p4-future`,
+# `p4-expired`, `pr-3205`, `pr-3206`, `pr-3209`, `pr-3299`, `pr-3213`, `pr-3214`, `pr-3217`, `issue-9001`
+# (twice) and `$P4BGR`. Of those, `pr-3214` is planted and read by NO assertion at all, so its seed can
+# fail silently; that is dead weight rather than a false PASS, it feeds no absence assertion, and it is
+# PRE-EXISTING on `main` — a follow-up (`p4_has pr-3214` beside A39) rather than this change.
 ck "A84a (setup) a 2-YEAR-old unparseable-lease claim is MINTED for the ceiling-cap case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3236 weird3203 HAVOC 63072000 2>/dev/null )"
 outP4CAPB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
                   CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
