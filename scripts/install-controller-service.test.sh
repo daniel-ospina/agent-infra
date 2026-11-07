@@ -2982,31 +2982,69 @@ if [ -d "$PG_CLONE/.git" ]; then
       #   (i)   HARNESS_PIN_DIR=$HOME  + a scratch at `$HOME/<40-hex>`  — the hex BASENAME alone won;
       #   (ii)  HARNESS_PIN_DIR=<the scratch itself>                   — the equality arm alone won;
       #   (iii) a pin RECORD naming `<scratch>/scripts/orchestrator-harness` — any directory a record named won.
-      # The tree now corroborates itself exactly as the bring-up corroborates a pin (`cloud-cell-bringup.sh`
-      # refuses a pin tree without `scripts/orchestrator-harness/orch-loop.sh`). That is a property of the TREE,
-      # so no naming or declaration can manufacture it, and every real pin already satisfies it.
+      # ⛔ CORRECTION (cycle-5 P1/P2, MEASURED): the paragraph above overclaimed. Carrying
+      # `scripts/orchestrator-harness/orch-loop.sh` is necessary but NOT sufficient — every real checkout of
+      # this repo carries it, and a lane/drainer scratch IS such a checkout, so a missing-file test corroborated
+      # nothing while the fixture (which lacked the file) made every arm below go red for the wrong reason.
+      # The corroboration that discriminates is the one asserted below: the tree's NAME must be a prefix of the
+      # commit it actually HOLDS. The flat-pin case has no commit name, and its residual is asserted explicitly.
       rm -f "$PG/units/eldato-orchestrator.service"
       PG_L_TREE="$PG/home/$PG_HSHA"
       if [ -n "$PG_HSHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG_L_TREE" "$PG_HSHA" >/dev/null 2>&1; then
-        mkdir -p "$PG_L_TREE/scripts"; cp "$SUP" "$PG_L_TREE/scripts/cloud-cell-supervisor.sh"
-        PG_L1_RC=0
-        PG_L1_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L1_RC=$?
-        [ "$PG_L1_RC" -ne 0 ] && ok '§P7: a scratch NAMED with a commit id under an exported pin root is REFUSED (a name is not a pin)' \
-                             || bad "§P7: a drainer scratch named with a commit id was armed — the pin test graded the NAME: $PG_L1_OUT"
-        rm -f "$PG/units/eldato-orchestrator.service"
-        PG_L2_RC=0
-        PG_L2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG_L_TREE ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L2_RC=$?
-        [ "$PG_L2_RC" -ne 0 ] && ok '§P7: a declaration that names the scratch as the pin root is REFUSED (a declaration is not a pin)' \
-                             || bad "§P7: an exported pin root naming the scratch itself armed it: $PG_L2_OUT"
-        rm -f "$PG/units/eldato-orchestrator.service"
-        printf '%s\n' "$PG_L_TREE/scripts/orchestrator-harness" > "$PG/home/.harness-path"
+        # ⛔ THE FIXTURE MUST CARRY THE HARNESS TREE (cycle-5 P2, MEASURED). Copying only the supervisor left
+        # this tree WITHOUT `scripts/orchestrator-harness/orch-loop.sh`, so every arm below went red on the
+        # MISSING-HARNESS branch and never on the laundering each one names — they certified a property they
+        # could not see, which is exactly why the hole these arms now cover shipped green. A lane/drainer
+        # scratch IS a real checkout of this repo and therefore DOES carry the harness tree; so must the fixture.
+        mkdir -p "$PG_L_TREE/scripts/orchestrator-harness"
+        cp "$SUP" "$PG_L_TREE/scripts/cloud-cell-supervisor.sh"
+        : > "$PG_L_TREE/scripts/orchestrator-harness/orch-loop.sh"
+        # (1) THE NAME MUST AGREE WITH THE TREE IT NAMES (cycle-5 P1). A scratch named with a commit id that is
+        # NOT the commit it holds is refused; a real pin is created as `<pin dir>/<sha>`, so its name IS its
+        # HEAD. Without this arm, being-hex counted as corroboration and `$HOME/<40-hex>` armed for any commit.
+        PG_FOREIGN="0123456789abcdef0123456789abcdef01234567"
+        PG_F_TREE="$PG/home/$PG_FOREIGN"
+        if git -C "$PG_CLONE" worktree add -q --detach "$PG_F_TREE" "$PG_HSHA" >/dev/null 2>&1; then
+          mkdir -p "$PG_F_TREE/scripts/orchestrator-harness"
+          cp "$SUP" "$PG_F_TREE/scripts/cloud-cell-supervisor.sh"
+          : > "$PG_F_TREE/scripts/orchestrator-harness/orch-loop.sh"
+          PG_L1_RC=0
+          PG_L1_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_F_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L1_RC=$?
+          [ "$PG_L1_RC" -ne 0 ] && ok '§P7: a scratch NAMED with a commit id that is NOT the commit it holds is REFUSED (the name must corroborate the tree)' \
+                               || bad "§P7: a scratch named with a FOREIGN commit id was armed — the pin test graded the SPELLING, not the tree: $PG_L1_OUT"
+          rm -f "$PG/units/eldato-orchestrator.service"
+        else
+          bad '§P7: the fixture could not create the foreign-named scratch, so the corroboration arm did NOT run'
+        fi
+        # (2) A drainer-shaped name (a lane name, not a commit id) is refused even when its PARENT is exported
+        # as the pin root — the real fleet scratch shape (`ai-drainer.sh` makes `wt-drainer-<name>`).
+        PG_DRAIN="$PG/home/wt-drainer-lane7"
+        if git -C "$PG_CLONE" worktree add -q --detach "$PG_DRAIN" "$PG_HSHA" >/dev/null 2>&1; then
+          mkdir -p "$PG_DRAIN/scripts/orchestrator-harness"
+          cp "$SUP" "$PG_DRAIN/scripts/cloud-cell-supervisor.sh"
+          : > "$PG_DRAIN/scripts/orchestrator-harness/orch-loop.sh"
+          PG_L2_RC=0
+          PG_L2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_DRAIN/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L2_RC=$?
+          [ "$PG_L2_RC" -ne 0 ] && ok '§P7: the drainer scratch shape (a lane name) is REFUSED even under an exported pin root' \
+                               || bad "§P7: a drainer scratch was armed: $PG_L2_OUT"
+          [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+            && ok '§P7: and neither laundering route armed a unit' || bad '§P7: a laundered pin still wrote a unit'
+          rm -f "$PG/units/eldato-orchestrator.service"
+        else
+          bad '§P7: the fixture could not create the drainer scratch, so that arm did NOT run'
+        fi
+        # (3) NAMED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR CLOSED (cycle-5 P1). The pin root is the
+        # BOX locator and these two variables are how a real cell relocates its pin, so a caller that declares
+        # a scratch AS its pin root still arms it. That is an ACCIDENT guard, not a boundary against an operator
+        # who declares the scratch deliberately (who can write the unit anyway) — stated in the installer and
+        # `docs/ops/controller-service.md`. This arm PINS the documented behaviour, so changing it is a visible
+        # decision rather than silent drift in either direction.
         PG_L3_RC=0
-        PG_L3_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L3_RC=$?
-        rm -f "$PG/home/.harness-path"
-        [ "$PG_L3_RC" -ne 0 ] && ok '§P7: a pin RECORD naming the scratch is REFUSED (a record is not a pin)' \
-                             || bad "§P7: a record naming the drainer scratch armed it — any directory a record named became the pin: $PG_L3_OUT"
-        [ ! -f "$PG/units/eldato-orchestrator.service" ] \
-          && ok '§P7: and none of the three laundering routes armed a unit' || bad '§P7: a laundered pin still wrote a unit'
+        PG_L3_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG_L_TREE ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L3_RC=$?
+        grep -qxF "ExecStart=/bin/bash $PG_L_TREE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+          && ok '§P7: RESIDUAL (documented): a caller that declares a scratch AS its pin root IS admitted — the pin locators belong to the operator' \
+          || bad "§P7: the documented residual changed — a declared pin root no longer admits its own tree (rc=$PG_L3_RC): $PG_L3_OUT"
+        rm -f "$PG/units/eldato-orchestrator.service"
       else
         bad '§P7: the fixture could not create the hex-named scratch, so the name/declaration arms did NOT run'
       fi
