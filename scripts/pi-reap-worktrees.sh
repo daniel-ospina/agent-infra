@@ -333,8 +333,8 @@
 #     (`remote_holds_recheck`) is one TARGETED `ls-remote --heads <remote> refs/heads/<branch>` at
 #     the moment of a removal. So the classification cost is per REMOTE — bounded — rather than per
 #     `remote-only-ref` ROW, which is not, and only the destructive act pays the old per-REMOVAL
-#     price (measured on cmux/cell-3, 2026-11-07: 0.55 s per targeted probe, 7.54 s for 12
-#     candidates, versus 0.55 s for the remote's whole 2,111-head advertisement). A TRANSPORT
+#     price (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each),
+#     versus 0.56 s for the remote's whole 2,111-head advertisement). A TRANSPORT
 #     failure is remembered per remote for the rest of the pass (a dead remote must not spend the
 #     whole budget on N candidates) and collapses to ONE timeout. ⛔ IT IS STILL CHARGED TO THE
 #     BUDGET, so it is NOT free: a remote that answers slowly can DEFER the rest of the listing —
@@ -2511,28 +2511,31 @@ remote_advertise() { # <remote> -> 0 when that remote's `refs/heads/*` snapshot 
         return 1
     fi
     # `A <remote> <sha> <refname>` per advertised head.
-    # ⛔ THE COMPLETION MARKER IS WRITTEN FIRST, THEN THE LINES (#3371 review cycle 2, P3). The
-    # reverse order means a failed `awk` leaves the marker unwritten, so the next candidate RE-READS
-    # — and because that retry APPENDS, a partial snapshot would then accumulate a SECOND set of `A`
-    # lines for the same refnames. That is not unsafe (`n == 1` below then answers nothing, i.e.
-    # PRESERVE) but it POISONS the entry for the rest of the pass: every later candidate pays a
-    # fresh full advertisement and still preserves, so the #3371 cost fix silently vanishes in
-    # exactly the ENOSPC condition this reaper exists for, while the code reads as if the cache
-    # recovered. Marker-first makes a failed write leave an INCOMPLETE snapshot and NO retry, and
-    # incomplete is the safe direction: a missing refname, a truncated refname and a truncated sha
-    # all fail the exact match below.
+    # ⛔ A FAILED WRITE MUST SUPPRESS THE REMOTE, NOT MERELY SKIP THE MARKER (#3371 review cycle 2,
+    # P1). Two failure shapes, handled identically:
+    #   · the MARKER write fails — without suppression the next candidate re-reads, so a pass that
+    #     has run out of disk pays a WHOLE network advertisement per candidate, for ever (the retry
+    #     storm, on exactly the ENOSPC box this reaper exists for);
+    #   · the `A` append fails — `awk`'s append is BLOCK-BUFFERED, so a short write can seal a
+    #     TRUNCATED refname behind its own newline. ⛔ AN EARLIER DRAFT OF THIS COMMENT CLAIMED THAT
+    #     TRUNCATION ALWAYS FAILS THE EXACT MATCH, AND THAT IS FALSE: a truncation landing exactly on
+    #     another advertised branch's name (`refs/heads/feat/x` cut to `refs/heads/feat`) DOES match
+    #     `$4 == want` for a candidate whose branch IS `feat` at the SAME sha — the sha field is
+    #     written before the refname, so it survives intact — and the `n == 1` guard never sees it,
+    #     because the truncated line is not a duplicate of `want`. That is a FABRICATED
+    #     `remote-holds`, i.e. a NO-BACKUP removal on a torn record.
+    # So BOTH arms call `remote_mark_dead`, the file's durable per-pass suppression: the CURRENT
+    # candidate returns 1 (caller PRESERVES) and every later candidate for that remote short-circuits
+    # at `remote_is_dead` BEFORE the matcher, so the poisoned snapshot is never read again.
+    # ⛔ `remote_mark_dead` is a per-pass "unusable this pass" record — NOT a claim the remote is gone.
     if ! printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null; then
-        # Nothing was appended above, so there is nothing to roll back. Answer "no snapshot" — the
-        # caller PRESERVES.
+        remote_mark_dead "$remote"
         return 1
     fi
     if ! awk -v r="$remote" 'NF >= 2 { printf "A %s %s %s\n", r, $1, $2 }' "$GIT_OUT" \
             >>"$REMOTE_ADV_FILE" 2>/dev/null; then
-        # A partial snapshot now sits behind a COMPLETED marker, so it is never retried. That is the
-        # safe direction (see above) and it is the state that costs least on a full disk: one
-        # advertisement, no retry storm. Recorded so the next reader does not mistake "no retry"
-        # for "nothing was written".
-        return 0
+        remote_mark_dead "$remote"
+        return 1
     fi
     return 0
 }
@@ -2604,7 +2607,7 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
 # an exit 4. (The branch is re-derived from the reason token rather than passed in because the probe
 # that minted it ran inside a command substitution, so its globals never reach this point.)
 remote_holds_recheck() { # <path> <sha> <reason>
-    local path="$1" sha="$2" why="$3" rest remote branch best out
+    local path="$1" sha="$2" why="$3" rest remote branch best out rc
     case "$why" in remote-holds:*) ;; *) return 0 ;; esac
     [ -n "$sha" ] || return 2
     rest="${why#remote-holds:}"
@@ -2622,7 +2625,18 @@ remote_holds_recheck() { # <path> <sha> <reason>
     branch="${rest#"$best"/}"
     [ -n "$branch" ] || return 2
     run_bounded "$REAP_WT_GIT_TIMEOUT" "$GIT_OUT" "$GIT_BIN" -C "$REPO_CANON" \
-        ls-remote --heads "$best" "refs/heads/$branch" || return 2
+        ls-remote --heads "$best" "refs/heads/$branch"
+    # ⛔ A TRANSPORT FAILURE IS REMEMBERED, exactly as the classification probe remembers it (#3371
+    # review cycle 2, P2). Without this a remote that dies mid-pass costs REAP_WT_GIT_TIMEOUT (20 s)
+    # PER `remote-holds` REMOVAL — fifteen of which are the whole REAP_WT_BUDGET_SECONDS=300, so the
+    # tail DEFERs, PRUNE_BLOCKED=1, and an armed pass reclaims nothing: the F7/#3371 state this file
+    # argues against. ⛔ ONLY a non-zero rc marks it dead: a branch DELETED on the remote answers rc 0
+    # with an empty advertisement, which is a legitimate "not advertised" => preserve, never "dead".
+    rc=$?
+    if [ "$rc" != 0 ]; then
+        remote_mark_dead "$best"
+        return 2
+    fi
     out="$(awk -v want="refs/heads/$branch" -v sha="$sha" '
         NF >= 2 && $2 == want { n++; if ($1 == sha) hit = 1 }
         END { if (n == 1 && hit == 1) print "yes" }' "$GIT_OUT" 2>/dev/null)"
@@ -4613,6 +4627,15 @@ remove_one() {
     # uncovered — the largest part of the window, by this file's own reasoning for re-check #2.
     # ⛔ AND IT STAYS LAST (#3405 review, P2): gate (b) above runs BEFORE it for exactly this reason.
     holder_recheck "$path" "$sha" || { rm -f "$out"; return 2; }
+    # ⛔ AND THE NETWORK WARRANT IS RE-TAKEN HERE TOO (#3371 review cycle 2, P1). A `remote-holds`
+    # row is removed with NO BACKUP on the warrant "the remote still advertises this head", and the
+    # classify-loop call is up to a whole remove_one away from this line: `clean_gate` #1 (20 s), the
+    # ephemeral `rm` loop (up to REAP_WT_REMOVE_TIMEOUT=120 s each), `clean_gate` #2, then this. So
+    # the fact warranting the destruction could be ~2.5 min and several forks stale — the same
+    # auto-delete-on-merge window, narrowed and NOT closed. Exactly as `holder_recheck` is called
+    # twice for this reason, the EARLY call (classify loop) saves the wasted archive work and THIS one
+    # is the decisive read. rc=2 preserves and keeps the archive.
+    remote_holds_recheck "$path" "$sha" "$why" || { rm -f "$out"; return 2; }
 
     run_bounded "$REAP_WT_REMOVE_TIMEOUT" "$out" "$GIT_BIN" -C "$REPO_CANON" worktree remove "$path"
     rc=$?
@@ -4875,7 +4898,9 @@ run() {
     # it owns the probe scratch dir, the watchdog timers, the probe output files
     # and the lock. Installing it later (as it was) leaked the scratch dir on
     # every early fail-closed exit.
-    # The trap owns EVERY scratch file a pass can mint, from BOTH sides of this merge:
+    # The trap owns every PASS-SCOPED scratch file the pass mints BEFORE the worktree loop, from BOTH
+    # sides of this merge (`$PRUNE_START_TMP`/`$PRUNE_NOW_TMP` are minted later and cleared by their
+    # own region, so they are deliberately NOT in this list — do not read this as "every file"):
     #   · `$STASH_OUT` / `$REMOTE_DEAD_FILE` — the #2541/#3041 probes (origin/main);
     #   · `$REMOTE_ADV_FILE` — the #3371 per-pass remote head advertisement (the SUCCESS side of the
     #     same cache pattern `$REMOTE_DEAD_FILE` is the failure side of);
