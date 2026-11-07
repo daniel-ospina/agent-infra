@@ -115,8 +115,10 @@
          `apply_repo(multi=True)` REASSIGNS the module-level names per repo, and
          `run_all_repos()` then calls `canonical_paths()` before recording, so the set's
          aggregate lands back on the canonical names. The inversion is worse than the
-         omission it replaced, because two readers open those canonical files BY NAME:
-         `scripts/heartbeat-loop.sh` and `scripts/lib/fleet-inventory.sh`'s
+         omission it replaced, because THREE readers open those canonical files BY NAME:
+         `scripts/heartbeat-loop.sh`, `scripts/objective.py`'s `pr_doctor_last_run`
+         (which renders the same record into the beat) and
+         `scripts/lib/fleet-inventory.sh`'s
          `_fleet_pr_doctor_bound`. A paragraph asserting the canonical files are never
          created makes a live aggregate read as a phantom — the same "operator looks in
          the wrong place" failure this paragraph exists to prevent, pointing the other

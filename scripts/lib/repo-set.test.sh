@@ -113,11 +113,18 @@ EOF
 #     (`j-emptyrender`, `j16f`), which call it directly; `124` is `timeout`'s own code, so the arms'
 #     arithmetic is unchanged.
 #     ⛔ BUT IT DOES NOT COVER EVERY ARM, AND SAYING IT DID WAS A FALSE COVERAGE CLAIM (round 44 review,
-#     P2). Two populations bypass the helper and stay unbounded: the 44 `bash "$W/pr-doctor-machine.sh"`
-#     wrapper arms, and the ~18 direct `bash "$READER"` / `/bin/bash "$READER"` arms — the PATH-scoped
-#     fault-injection fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) and the `HOME`-unset arms. Those set
-#     `PATH=` for the CHILD, and the helper itself needs `ps` and `sleep` from the AMBIENT path, so they
-#     cannot simply wrap it (the two new arms below scope `PATH` with `env` for exactly this reason).
+#     P2). Three populations bypass the helper and stay unbounded, and they are NAMED rather than counted
+#     on purpose — the counts in the first version of this paragraph were wrong (this file's `f11f`
+#     lesson, one arm over), which is what a count in a comment reliably becomes.
+#       (a) The `bash "$W/pr-doctor-machine.sh"` wrapper arms.
+#       (b) The direct `bash "$READER"` / `/bin/bash "$READER"` arms — the PATH-scoped fault-injection
+#           fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) and the `HOME`-unset arms. Those set `PATH=`
+#           for the CHILD, and the helper itself needs `ps` and `sleep` from the AMBIENT path, so they
+#           cannot simply wrap it. The two round-44 arms below show the shape that DOES work: route the
+#           CHILD's environment through `env` (`REPO_SET_FILE` in both, plus `PATH` in `j16f`) and leave
+#           the helper on the ambient path.
+#       (c) The COPY/MUTANT reader arms (`bash "$M/lib/repo-set.sh"` and the `$NA`/`$ND`/`$NODOC`/`$M2`/
+#           `$M3`/`$M4` siblings), which run a rewritten reader instead of the shipped one.
 #     Nothing hangs there today — every one of those passes an absolute set path, or an empty `HOME` that
 #     shortens to `/` — but a future walk that hangs on an ABSOLUTE path still wedges the shard from those
 #     arms, because absolute is precisely what every pre-round-44 fixture passes.
