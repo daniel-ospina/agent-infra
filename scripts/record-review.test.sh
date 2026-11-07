@@ -7932,36 +7932,87 @@ assert_eq "$_badbt" "" "20h48 no echo/printf message anywhere in the recorder ex
 #        The scan covers BOTH files, strips single-quoted regions (a backtick there is literal) and
 #        strips trailing comments through a small quote-state machine (so `# only \`x\` is RED`
 #        is not a hit, while a backtick in a LABEL argument is).
-_badbt2="$(python3 - "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")" <<'PY48B'
+# ⛔ AND THE SCANNER ITSELF CARRIES A CONTROL (round 4, P2). Without one, a scanner that
+#    silently stopped SEEING the straddling case would print "" and PASS — the very false PASS
+#    this sweep exists to prevent, asserted by the sweep. The fixture is generated with
+#    `printf '\140'` so THIS file holds no live backtick of its own, and its four lines pin the
+#    four contexts: line 1 must be RED (an apostrophe inside `"..."` does not shield a backtick),
+#    line 2 must be GREEN (single-quoted content is literal), line 3 must be GREEN (ONE backslash
+#    escapes it) and line 4 must be RED (an even run leaves it executable — measured: bash prints
+#    `double backslash \EXECUTED runs`, so `(?<!\\)` was wrong by parity).
+_bt="$(printf '\140')"
+{
+  printf '%s\n' "_x=\"the grader's ${_bt}n_authored${_bt} isn't 0\""
+  printf '%s\n' "_y='literal ${_bt}x${_bt}'"
+  printf '%s\n' "_z=\"escaped \\${_bt}x\\${_bt} is literal\""
+  printf '%s\n' "_w=\"double backslash \\\\${_bt}x\\\\${_bt} runs\""
+} > "$T/btctrl.sh"
+_badbt2="$(python3 - "$T/btctrl.sh" "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")" <<'PY48B'
 import re, sys
-def strip_comment(s):
+ctrl = sys.argv[1]
+targets = sys.argv[2:]
+# ⛔ ONE STATE MACHINE, NOT TWO (round 4, P2). The first cut stripped comments in a
+# quote-state machine and then removed single-quoted spans with a REGEX on the
+# result — outside that state. Inside a DOUBLE-quoted string an apostrophe is a
+# literal character, not a quote opener, so a pair straddling a backtick
+# ("the grader's `n_authored` isn't 0") deleted the backtick before it was tested:
+# a false PASS on the exact class this sweep claims to bound. Single-quoted content
+# is now dropped BY the machine (q == "'"), where the context is known, and
+# apostrophes inside "..." are kept literal.
+def scan(s):
     out=[]; q=None; i=0
     while i < len(s):
         c=s[i]
-        if q:
-            if c=='\\' and q=='"':
+        if q == '"':
+            if c=='\\':
                 out.append(c); out.append(s[i+1:i+2]); i+=2; continue
-            if c==q: q=None
+            if c=='"': q=None
             out.append(c)
+        elif q == "'":
+            if c=="'": q=None
+            # content inside single quotes is literal: dropped, never tested
         else:
-            if c in '"\'': q=c; out.append(c)
+            if c=='"': q='"'; out.append(c)
+            elif c=="'": q="'"
             elif c=='#': break
             else: out.append(c)
         i+=1
     return ''.join(out)
+def has_live_backtick(s):
+    # ⛔ BACKSLASH PARITY, NOT `(?<!\\)`: one preceding backslash is not "escaped",
+    # because the shell consumes them in pairs — `\\\\` before a backtick leaves it
+    # executable (measured).
+    for m in re.finditer('`', s):
+        j=m.start()-1; n=0
+        while j >= 0 and s[j]=='\\':
+            n+=1; j-=1
+        if n % 2 == 0: return True
+    return False
 out=[]
-for path in sys.argv[1:]:
-    for i,l in enumerate(open(path),1):
-        st=l.strip()
-        if not st or st.startswith('#'): continue
-        body=strip_comment(st)
-        body=re.sub(r"'[^']*'","",body)
-        if re.search(r'(?<!\\)`', body):
-            out.append("%s:%d: %s" % (path, i, st[:90]))
+# ⛔ THE CONTROL COMES FIRST, AND A CRASH IS A HIT — NOT AN EMPTY ANSWER. Without the
+#    try/except a missing control fixture or an unreadable target aborts python, and its
+#    empty stdout satisfies `assert_eq "$_badbt2" ""` — the sweep passing BECAUSE its
+#    machinery failed, which is the same false PASS one level up.
+#    A scanner that cannot see line 1 (a false PASS) or that flags lines 2-3 (a false
+#    RED) is likewise reported AS A HIT, so the sweep cannot pass by having gone blind —
+#    the failure mode the straddling-apostrophe version shipped.
+try:
+    seen=[i for i,l in enumerate(open(ctrl),1)
+          if l.strip() and not l.strip().startswith('#') and has_live_backtick(scan(l.strip()))]
+    if seen != [1,4]:
+        out.append("SCANNER-SELF-TEST: control hits %r, expected exactly [1, 4] (1=straddled, 2=single-quoted, 3=escaped, 4=even backslash run)" % (seen,))
+    for path in targets:
+        for i,l in enumerate(open(path),1):
+            st=l.strip()
+            if not st or st.startswith('#'): continue
+            if has_live_backtick(scan(st)):
+                out.append("%s:%d: %s" % (path, i, st[:90]))
+except Exception as e:
+    out.append("SCANNER-SELF-TEST: the sweep could not run (%r) — an empty answer here is a FAILED sweep, not a clean one" % (e,))
 print("\n".join(out))
 PY48B
 )"
-assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder)"
+assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder; the scanner is pinned by its own 4-line control, and a crash is a hit)"
 # 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
 #       commit that descends from `from` while being neither an ancestor NOR a descendant of the
 #       attested head is the one shape a narrowing endpoint can actually take — and no shipped vector
