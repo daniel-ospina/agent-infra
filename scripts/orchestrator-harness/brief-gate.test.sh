@@ -1092,14 +1092,29 @@ done
 # a key that does not exist (`42421234`) and ADMITTED the claim it should refuse.
 for v in 'issue-<#4242 (prev attempt #1234)>' 'issue-<4242, 5555>' 'issue-<4242 attempt 2>'; do
   sed "s|^WIP:.*|WIP:       $v -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-firstrun.txt"
-  bash "$GATE" --check "$TMP/pw-firstrun.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-  [ "$rc" -eq 80 ]; ck $? "(H59['$v']) the FIRST digit run is the key — a second number in the bracket does not move it (got $rc)"
+  miss="$(bash "$GATE" --missing "$TMP/pw-firstrun.txt" lane 0 "$HW/work" 2>/dev/null)"
+  grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H59['$v']) the FIRST digit run is the key — a second number in the bracket does not move it (token asserted, not just rc)"
 done
 # ── AN UNTERMINATED BRACKET IS STILL KEYED AND STILL CHECKED (review of #3621, cycle 4, P2): dropping the
 # closing `>` used to fall through to the unfilled-slot arm and go UNCHECKED.
+# ⛔ AND THE ARM MUST NAME WHICH 80 IT IS (review of #3621, cycle 5, P3): rc alone cannot tell "checked and
+# contradicted" from "never checked" — deleting the whole arm still yields 80 through the unkeyed branch.
+# The token is the discriminator.
 sed 's|^WIP:.*|WIP:       issue-<4242 - none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-unterm.txt"
-bash "$GATE" --check "$TMP/pw-unterm.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(H60) an UNTERMINATED bracket ('issue-<4242 - none') is still CHECKED (got $rc)"
+miss="$(bash "$GATE" --missing "$TMP/pw-unterm.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H60) an UNTERMINATED bracket ('issue-<4242 - none') is still KEYED and MEASURED (the token proves the lookup, rc alone would not)"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H60b) …and it is not refused as merely UNKEYED — the number was read, not discarded"
+# ⛔ THE SLOT SENTINEL IS NOT A PREFIX (review of #3621, cycle 5, P3): `issue-slot*` matched `issue-slot4242`,
+# an author-spellable route to the unchecked arm WITH a number in it. Both of these measured rc 0 there.
+# ⛔ A BRACKET WITH NO DIGITS IS THE SLOT (documented), so the escapes tested here are the ones that DO
+# carry a number in the key part: a prefix collision, and a number glued after the closing bracket.
+for v in 'issue-slot4242' 'issue-<4242>4242>' 'issue-<x4242>'; do
+  sed "s|^WIP:.*|WIP:       $v -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-slotescape.txt"
+  bash "$GATE" --check "$TMP/pw-slotescape.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(H61['$v']) a slot-LOOKING spelling carrying a number cannot reach the unchecked arm (got $rc)"
+done
 # ── `WIP_:` IS NOT A `wip` LABEL TO THE SHAPE PARSER (`_label` folds only space/hyphen), and the reader
 # no longer collects it either: ONE verdict, fail-closed, from both readers. The READER half is only
 # observable in the TOKEN set, so this is an absence fixture and the assertion is on the tokens — `rc`

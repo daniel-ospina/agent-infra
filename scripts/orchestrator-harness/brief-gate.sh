@@ -56,10 +56,12 @@
 # author READ the ref, and the next actor still has to read it.
 #
 # ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN THREE WAYS.
-#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number. The canonical
-#       block ships the slot `issue-<N>`, so a brief that still carries the slot is admitted by SHAPE —
-#       exactly as the research contract admits its own `<…>` slots. This is a presence-and-shape gate,
-#       and the number is the one field it cannot invent for the author.
+#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number. A key with NO
+#       NUMBER in it — the canonical slot `issue-<N>`, or any bracket spelling with no digits inside —
+#       is the UNFILLED slot and is admitted: the canonical block ships that shape and the gate cannot
+#       refuse its own advice, exactly as the research contract admits its own `<…>` slots. Every form
+#       that DOES carry a number is measured (plain, bracketed, dashed/bolded labels, and case-folded
+#       keys), so the limit is precisely "no number", not a list of exempt spellings.
 #   (b) MEASUREMENT: it needs a repository and a reachable `origin`. With neither, the gate says so on
 #       stderr (the word `UNVERIFIED`, naming the issue) and ADMITS the brief, because refusing
 #       every dispatch on a moment's network failure converts a memory gap into a fleet-wide outage.
@@ -455,7 +457,7 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
 # ⇒ a claim of absence, which is then CHECKED. No word list to defeat, no measurement note that can
 # switch it off, and a GLOB is not a ref.
 brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
-  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val vlow tag claim rest issue ref
+  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val vlow tag claim rest issue ref nval inner tail num head
   local unkeyed=0 issues="" evidence=""
   values="$(awk "$BRIEF_GATE_WIP_AWK" "$f" 2>/dev/null)"
   [ -n "$values" ] || return 0            # no WIP line at all: the SHAPE token already refuses
@@ -479,34 +481,52 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     # ⛔ AND THE NUMBER IS THE FIRST DIGIT RUN, NOT EVERY DIGIT (review of #3621, cycle 4, P1): deleting
     # all non-digits CONCATENATED them, so `issue-<#4242 (prev attempt #1234)> -> none` was measured as
     # `42421234` — a key that does not exist, which ADMITTED the very claim it should refuse.
+    # ⛔ THE KEY PART IS CUT AT THE ARROW BEFORE THE BRACKET IS LOOKED FOR (review of #3621, cycle 5). The
+    # bracket search must not see the `-` AND `>` of the arrow: with the whole value in hand, the canonical
+    # `issue-<N> -> refs/wip/<ref>` was read as a CLOSED bracket whose content is `n` — i.e. malformed —
+    # and the gate refused its own canonical block. Everything before the first arrow is the key.
     nval="$vlow"
-    case "$nval" in
+    head="${nval%%->*}"
+    head="${head%%→*}"
+    case "$head" in
       issue-"<"*">"*|pr-"<"*">"*)
-        inner="${nval#*-<}"; inner="${inner%%>*}"
-        tail="${nval#*>}"
+        inner="${head#*-<}"; inner="${inner%%>*}"
+        tail="${nval#"$head"}"
         num="$(printf '%s' "$inner" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
-        case "$nval" in
-          issue-*) nval="issue-${num:-slot}${tail}" ;;
-          *)       nval="pr-${num:-slot}${tail}" ;;
+        case "$head" in
+          # ⛔ THE NUMBER AND THE TAIL ARE JOINED WITH A SEPARATOR (review of #3621, cycle 5, P3): gluing
+          # them rebuilt the cycle-4 concatenation one layer down (`issue-<4242>4242>` became the key
+          # `42424242`, a key that does not exist, and the claim was ADMITTED).
+          # ⛔ AND A CLOSED BRACKET WITH NO DIGITS IS NOT THE SLOT: the canonical slot has no closing
+          # bracket, so this is malformed and is refused as unkeyed rather than waved through.
+          # ⛔ A BRACKET WITH NO DIGITS IN IT IS THE SLOT, whichever bracket is used: the canonical block
+          # ships `issue-<N>` (a closed bracket with no number), and the gate cannot refuse its own advice.
+          # The coverage limit is therefore stated exactly: a key that carries NO NUMBER is unchecked.
+          # ⛔ AND THE NUMBER AND THE TAIL ARE JOINED WITH A SEPARATOR: gluing them rebuilt the cycle-4
+          # concatenation one layer down (`issue-<4242>4242>` became the key `42424242`, and the claim was
+          # ADMITTED against a key that does not exist).
+          issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
+          *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
       issue-"<"*|pr-"<"*)
         # an UNTERMINATED bracket still carries a number: key it, and treat the rest as an ABSENCE claim
         # (we cannot parse a named ref out of it reliably, and refusing is the fail-closed direction).
-        num="$(printf '%s' "${nval#*-<}" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
-        case "$nval" in
-          issue-*) nval="issue-${num:-slot} ->" ;;
-          *)       nval="pr-${num:-slot} ->" ;;
+        num="$(printf '%s' "${head#*-<}" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
+        case "$head" in
+          issue-*) if [ -n "$num" ]; then nval="issue-$num ->"; else nval="issue-slot"; fi ;;
+          *)       if [ -n "$num" ]; then nval="pr-$num ->";    else nval="pr-slot";    fi ;;
         esac ;;
     esac
     issue=""
     case "$nval" in
-      issue-[0-9]*)  issue="${nval#issue-}"; issue="${issue%%[!0-9]*}" ;;
-      # `issue-slot`/`pr-slot` is the UNFILLED slot (`issue-<N>`), which the canonical block ships and
-      # the gate cannot refuse — the same reason the research contract admits `<…>`. It is the ONLY
-      # unchecked form, and it is spelled `slot` here so it can never be mistaken for a number.
-      issue-slot*)   : ;;
-      pr-slot*)      case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
-      pr-[0-9]*)     case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      issue-[0-9]*) issue="${nval#issue-}"; issue="${issue%%[!0-9]*}" ;;
+      # ⛔ THE SLOT SENTINEL IS MATCHED EXACTLY, NOT AS A PREFIX (review of #3621, cycle 5, P3). `issue-slot*`
+      # also matched `issue-slot4242` — an author-spellable route to the unchecked arm WITH a number in it,
+      # i.e. the hole this whole file exists to close, two lines after a comment promising it cannot be
+      # reached. Only the bare sentinel, which no `issue-<digits>`/bracket form can normalise to, is a slot.
+      issue-slot)  : ;;
+      pr-slot)     case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
+      pr-[0-9]*)   case "$role" in fixer|reviewer) : ;; *) unkeyed=1 ;; esac ;;
       keyless*)
         rest="${nval#keyless}"
         case "$rest" in ' '?*) : ;; *) unkeyed=1 ;; esac ;;
