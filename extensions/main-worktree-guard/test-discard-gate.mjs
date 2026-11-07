@@ -2950,10 +2950,26 @@ if (process.argv.includes("--mutations")) {
       false,
       "a real `$`-terminated directory addressed through a glob goes blind again",
     ],
-    // (No separate pair for the POSIX-class FOLD's `/`-bound: reverting the DEFAULT to `LAST_CLOSE` —
-    // the pair immediately above — reintroduces the old unbounded jump, and that is the only way this
-    // code can still cross a separator. The FOLD itself is structurally bounded by `sl`, so a pair
-    // aimed at it could not fail. It is pinned by its own pair above (the sed exclusion).)
+    [
+      // ⛔ THE FOLD'S `/`-BOUND PAIR (#3333 review cycle-7, F1 — and the note that used to sit here was
+      // FALSE, measured: it claimed "a pair aimed at it could not fail". It can, and this is it.)
+      // `sl` is the ONLY thing stopping the fold from swallowing a separator, which is what the code
+      // comment says ("it can only ever swallow bytes up to the next `/`"), so it is a pinnable
+      // property, not a structural guarantee. Reverting `lastIndexOf("]", sl)` to `lastIndexOf("]")`
+      // (unbounded) drops a real folded path — `[[:lower:]]x/undo[x].sh` really expands to
+      // `ax/undox.sh` and really executes — while every other arm stays green, which is exactly why it
+      // needs its own pair. (Note the mutant lands on `origin/main`'s answer, not on a new one: head is
+      // the fail-CLOSED side here. The pair pins head's behaviour, not a divergence from main.)
+      "the POSIX fold cannot cross the first `/` — it binds to `sl` (#3333 c7)",
+      [[
+        String.raw`          const inComponent = s.lastIndexOf("]", sl);`,
+        String.raw`          const inComponent = s.lastIndexOf("]");`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("[[:lower:]]x/undo[x].sh"),
+      true,
+      false,
+      "a real folded path goes blind again",
+    ],
     [
       // ⛔ THE F1 PAIR (#3333 review cycles 2 and 4 — this rule has now been wrong TWICE, in opposite
       // directions, and each cut moved the hole instead of closing it).

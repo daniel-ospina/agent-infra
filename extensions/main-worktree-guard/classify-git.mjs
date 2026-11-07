@@ -3639,7 +3639,9 @@ export function wtIsPathShapedScriptWord(word) {
   //       nothing is broken by them — but dismissing them as "reject BEFORE any placeholder exists" is
   //       what let the F1 fold defect sit unexamined, so do not restore that sentence. The function
   //       carries EIGHT code `return false` sites in total (3420, 3423, 3480, 3485, 3486, plus these
-  //       three), and ALL of them can be reached on the placeholder path.
+  //       three). The SIX after the prologue can all be reached on the placeholder path; the first two
+  //       (`!s`, and "no `/` and no `~`") run on the RAW word before `out` exists, so no placeholder can
+  //       be present there by construction. Do not write "all eight".
   //       What is SINGULAR here is only that this is the one rule keyed on a byte's POSITION within
   //       the raw word.
   //   (c) THE PLAIN ALPHABET — every byte a filename may carry in a component body, `,` `:` `=`
