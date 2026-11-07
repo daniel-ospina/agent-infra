@@ -92,7 +92,15 @@
 #   REAP_AW_LOCK_STALE_SECONDS  a stale lock is reclaimed after this (default 1800)
 #   REAP_AW_STAMP           the pin file (default: $CELL_HOME/orchestrator/.agent-infra-stamp.json,
 #                           then $HOME/.pi/orchestrator/.agent-infra-stamp.json; absent = no pin)
-#   REAP_AW_BUDGET_SECONDS  wall-clock budget for the probe+removal loop (default 300)
+#   REAP_AW_BUDGET_SECONDS  the pass's TIME bound (default 300). This is the gitless arm's real
+#                           guard: it gates every EXPENSIVE per-candidate step (the live-pid census,
+#                           `git status`, the re-probe, removal). Cheap eligibility (the structural
+#                           rejections and the age floor) still runs for the whole population, so an
+#                           over-budget pass classifies what it saw and preserves the rest — it never
+#                           spends the budget on trees the age floor rejects anyway.
+#   REAP_AW_GITLESS_MAX     OPT-IN count ceiling for the gitless arm (default: UNSET = none). A
+#                           count is a stale proxy for the cost the time bound already measures; set
+#                           this only when a hard ceiling is wanted for its own sake.
 #   REAP_AW_PROC_ROOT       the process table root (default /proc; a test seam — pointing it at a
 #                           missing dir makes the census UNREADABLE, which must skip the sweep)
 #   REAP_AW_LIVE_PATHS      the census library (default: lib/live-paths.sh beside this script, then
@@ -126,16 +134,28 @@ INCLUDE_GITLESS=0
 # never candidates. `/tmp/actions-runner` is the CI runner install on every cell — removing it
 # breaks every job on the box, which is a worse outcome than the space it holds.
 GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
-# ⛔ AND THE CLASS IS BOUNDED PER PASS (measured on cell-3: the unbounded first cut ran >17 min on
-# 487 top-level dirs, overran the entry point's class timeout and left the HOURLY REAPER RED — a
-# scheduled actuator that cannot finish is not a fix, whatever it removes on the way). The cap is a
-# deliberate throughput limit, not a safety rule: successive hourly passes make progress, and the
-# standing population on this box (4,594 MB / 453 trees) clears inside one pass.
-# 10, not 40: the binding cost is REMOVAL I/O, measured on cell-3 at 20-60 s per tree
-# (`08:38:24 - 08:39:41` for three trees on a 126 GB disk at 95 %), so 40 candidates is 15-25 min of
-# removing and overruns the class bound. 10 keeps a pass inside it while still clearing the standing
-# population (26 candidates when this landed) in ~3 hours of hourly passes.
-GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"
+# ⛔ THE CLASS IS BOUNDED BY **ELAPSED TIME**, NOT BY A CANDIDATE COUNT (`REAP_AW_BUDGET_SECONDS`,
+# default 300; the entry point's `DISK_REAPER_CLASS_TIMEOUT=1800` stays the outer bound).
+#
+# WHY THE COUNT CAP WAS REMOVED AS A DEFAULT (#3278). The cap was a throughput throttle sized for a
+# standing population of **26 candidates**; the box it runs on now holds **thousands**, so the same
+# 10 deleted per pass went from "clears in an afternoon" to a permanent starvation — a dry run over
+# 3,314 top-level entries classified 10 and printed `gitless-cap` for **3,137** of them. And because
+# the cap unit was spent BEFORE the age floor was consulted, ~89 % of those ten slots went to trees
+# the age test would have preserved anyway.
+#
+# A count is the wrong dial for this, not merely a badly tuned one. `systemd-tmpfiles` — the
+# reference implementation of temp-dir reaping — has **no count bound anywhere in its model**: a file
+# is deleted when it is older than the age field, exclusions are pattern-based (`x`/`X` lines), and a
+# pass is bounded by **when it runs next**, never by how many entries it may consider (`tmpfiles.d(5)`,
+# "Age"). The safety dials live in the eligibility rules; a throughput budget must be measured in the
+# resource that actually costs (wall clock), because a count is a stale proxy for it — the same 10
+# trees are seconds on one box and 25 minutes on another.
+#
+# ⛔ `REAP_AW_GITLESS_MAX` SURVIVES AS AN **OPT-IN OVERRIDE** — an operator who wants a hard ceiling
+# still gets one. **UNSET IS THE DEFAULT AND MEANS "NO COUNT BOUND"**: absence must never silently
+# re-impose the starvation, so the comparison is skipped entirely when the seam is empty.
+GITLESS_MAX="${REAP_AW_GITLESS_MAX:-}"
 ROOTS="${REAP_AW_ROOTS:-/tmp}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
@@ -183,12 +203,21 @@ done
 num "$AGED_MINUTES" || die "REAP_AW_AGED_MINUTES must be a number (got '$AGED_MINUTES')"
 case "$DIRTY_MODE" in keep|reap) ;; *) die "REAP_AW_DIRTY must be keep|reap (got '$DIRTY_MODE')" ;; esac
 num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a number"
+# ⛔ AN OPERATOR-SET CEILING IS VALIDATED; AN UNSET ONE IS THE DEFAULT (no count bound). A typo must
+# not silently become "unbounded" — that is the same fail-open the empty-seam default would be if it
+# were spelled `:-0`.
+if [ -n "$GITLESS_MAX" ]; then num "$GITLESS_MAX" || die "REAP_AW_GITLESS_MAX must be a number (got '$GITLESS_MAX'); unset it for no count bound"; fi
 num "$LOCK_STALE_SECONDS" || die "REAP_AW_LOCK_STALE_SECONDS must be a number"
 
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'roots=%s\n' "$ROOTS"
     printf 'aged_minutes=%s\n' "$AGED_MINUTES"
     printf 'dirty=%s\n' "$DIRTY_MODE"
+    # The EFFECTIVE bounds, so the caller can record what the pass was allowed to do. `gitless_max=none`
+    # is the default and is printed as such: an operator reading a pass record must be able to tell
+    # "no count ceiling" from "a ceiling nobody set".
+    printf 'budget_seconds=%s\n' "$BUDGET"
+    printf 'gitless_max=%s\n' "${GITLESS_MAX:-none}"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
 fi
@@ -218,6 +247,10 @@ fi
 . "$LIVE_PATHS_LIB" || { printf 'SKIP reason=library-unreadable path=%s\n' "$LIVE_PATHS_LIB"; exit 3; }
 
 now() { date +%s; }
+# budget_spent <deadline-epoch> — rc 0 when the pass's TIME bound is spent (#3278).
+# ONE named predicate, so the bound is a single thing a test can mutate: the count cap it replaced was
+# checked in two places and the ordering bug was that neither of them sat after the age floor.
+budget_spent() { [ "$(now)" -ge "$1" ]; }
 # file_mtime <path> — epoch mtime, portable across GNU (stat -c %Y) and BSD (stat -f %m).
 file_mtime() {
     local m
@@ -581,15 +614,12 @@ sweep_root() { # <root>
             if [ "$INCLUDE_GITLESS" != 1 ]; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=not-a-worktree (no .git; --include-gitless is off)"; continue
             fi
-            # ⛔ BOTH LIMITS ARE CHECKED BEFORE ANY PER-TREE WORK. The budget check used to sit AFTER
-            # `git_below` and canonicalisation, so the expensive part of an over-budget arm still ran
-            # to the end of the root (measured: 17+ min, class timeout, rc=3 every hour).
-            if [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} candidates this pass; the remainder is PRESERVED for the next run)"; continue
-            fi
-            if [ "$(now)" -ge "$deadline" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed trees are PRESERVED)"; continue
-            fi
+            # ⛔ THE TWO BOUNDS ARE **NOT** HERE ANY MORE (#3278). They used to be checked here, BEFORE
+            # the age floor — so a tree the floor would preserve still consumed a cap unit, and on a
+            # root with thousands of young trees the ten slots went to trees that could never be
+            # removed (measured: 89 % of them). The cheap structural rejections below are the only
+            # thing that belongs ahead of the age test; the count ceiling and the TIME bound are both
+            # applied after it, where the expensive work actually starts.
             if git_below "$d"; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=git-below (a .git lives inside the tree, so a git arm owns it)"; continue
             fi
@@ -601,8 +631,10 @@ sweep_root() { # <root>
             # ⛔ THE HOME/STATE GUARD IS NOT HERE — it runs on the CANONICAL path below (review of
             # #3278 round 2: comparing the raw `$d` let `--root /tmp/` — `/tmp//cell-home` — delete the
             # cell HOME in an armed pass; the same spelling bug the keep list had).
+            # ⛔ `GITLESS_DONE` IS NOT INCREMENTED HERE. Charging the count unit at STRUCTURAL
+            # classification — before the age floor — is what spent 89 % of the old cap on trees that
+            # could not be removed; the increment sits after the age test, with the bounds it serves.
             gitless=1
-            GITLESS_DONE=$((GITLESS_DONE + 1))
         fi
         canon="$(lp_canon "$d")" || canon=""
         base="$(basename "$d")"
@@ -648,6 +680,41 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=pinned (the .agent-infra-stamp.json pin protects it; age=${age}m)"
             continue
         fi
+        # ⛔ CHEAP ELIGIBILITY BEFORE THE EXPENSIVE SCAN — FOR THE GITLESS ARM ONLY (#3278).
+        # The age floor is the most selective gate this script has and it costs one `stat`; the live-pid
+        # census costs SECONDS PER CANDIDATE on a loaded box (3,813 rows, measured 2026-11-07:
+        # `lp_path_held` 3.6 s + `lp_path_named` 8.1 s). Running the census first meant every tree the
+        # floor was about to preserve still paid for it — so a pass spent its entire budget proving age
+        # on thousands of trees it would never remove. `systemd-tmpfiles` orders it the same way: the
+        # age field decides what is a candidate, and nothing else is asked about a non-candidate.
+        # ⛔ THE LINKED ARM KEEPS ITS ORDER (its census runs first, so a young-and-held checkout reports
+        # the WITNESS that preserved it rather than `young` — the property `disk-reaper.test.sh` T2
+        # asserts). Its population is tens of trees; the thousands are gitless. Changing its reporting
+        # precedence would be a behaviour change with no measured cost behind it.
+        if [ "$gitless" = 1 ]; then
+            if [ "$age" -lt "$AGED_MINUTES" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
+                continue
+            fi
+            # the OPT-IN count ceiling (`REAP_AW_GITLESS_MAX`). SKIPPED ENTIRELY WHEN UNSET — an empty
+            # seam means "no count bound"; comparing against an empty string would be a bash error, and
+            # the looser read (`-ge` on a non-number) must never become "cap reached" for every tree.
+            if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified this pass; the remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is an operator ceiling, not a default)"; continue
+            fi
+        fi
+        # ⛔ THE TIME BOUND IS THE REAL GUARD, FOR BOTH ARMS, AND IT SITS BEFORE THE EXPENSIVE WORK.
+        # The census, `git status` and the re-probe are what it exists to bound; an unprocessed
+        # candidate is PRESERVED, so stopping here can only fail SAFE. (Before #3278 this check was
+        # after the census, so the pass overran its budget by one FULL census per remaining candidate —
+        # minutes, on a box with dozens of linked worktrees. Moving it above the census is the only
+        # change to the linked arm's order, and it is observable only on a pass that has already spent
+        # its budget: `reason=budget` instead of `reason=young`/`reason=live-cwd`. Every one of those
+        # outcomes PRESERVES.)
+        if budget_spent "$deadline"; then
+            KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed trees are PRESERVED)"; continue
+        fi
+        if [ "$gitless" = 1 ]; then GITLESS_DONE=$((GITLESS_DONE + 1)); fi
         if lp_path_named "$CENSUS" "$canon"; then
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=argv-named ($LP_NAME_WHY; age=${age}m)"
             continue
@@ -656,17 +723,12 @@ sweep_root() { # <root>
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=live-cwd ($LP_HOLD_WHY; age=${age}m)"
             continue
         fi
+        # the LINKED arm's age floor, in its original position (after the census) — see above.
         if [ "$age" -lt "$AGED_MINUTES" ]; then
             KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
             continue
         fi
         if [ "$gitless" = 1 ]; then repo=""; else repo="$(repo_root_of "$d")" || repo=""; fi
-        if [ "$(now)" -ge "$deadline" ]; then
-            # ⛔ THE BUDGET BOUNDS THE CLASSIFICATION TOO. `git status` per candidate is exactly the
-            # unbounded per-record fork the budget exists for; an unprocessed candidate is PRESERVED.
-            log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
-            KEPT=$((KEPT + 1)); continue
-        fi
         # ⛔ ONLY A LINKED WORKTREE IS ASKED FOR ITS TREE STATE. For a gitless tree `head_state` is
         # three bounded git forks on a directory git rejects — charged against the budget that exists
         # to bound exactly this — and its answer is discarded anyway (review of #3278).
@@ -694,7 +756,7 @@ sweep_root() { # <root>
             log_line "         age=${age}m $out"
             continue
         fi
-        if [ "$(now)" -ge "$deadline" ]; then
+        if budget_spent "$deadline"; then
             log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi
@@ -772,7 +834,7 @@ while IFS= read -r r; do
     sweep_root "$r" || SWEEP_RC=3
 done <<<"$(printf '%s\n' "$ROOTS" | tr ':' '\n')"
 
-log_line "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m dirty=$DIRTY_MODE"
+log_line "SUMMARY class=abandoned-worktree mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED census=ok rows=$LP_CENSUS_ROWS pids=$LP_CENSUS_PIDS aged=${AGED_MINUTES}m dirty=$DIRTY_MODE budget=${BUDGET}s gitless_max=${GITLESS_MAX:-none}"
 log "SUMMARY mode=$MODE_TEXT candidates=$CAND reaped=$REAPED kept=$KEPT failed=$FAILED"
 
 [ "$FAILED" -gt 0 ] && exit 4
