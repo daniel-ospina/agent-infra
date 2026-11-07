@@ -85,34 +85,47 @@ merge_models() {
 merge_mcp() {
   # Base MCP config (#104): install templates/.mcp.base.json → ~/.pi/agent/.mcp.json
   # so every pi session gets MCP servers even in repos without a local .mcp.json.
-  # Source wins per server key; local extra servers survive re-syncs.
+  #
+  # ⛔ THE MERGE RULES LIVE IN `pi-bootstrap/lib/merge-mcp.py`, SHARED WITH cell-install.sh.
+  # The two callers used to merge inline and had already drifted into the same bug: a plain
+  # `{**dst, **src}` source-wins merge silently REPOINTS a self-hosted `tortoise` url at the
+  # hosted endpoint on every re-sync — and the base template's own `_comment` tells self-host
+  # users to set exactly that url. On a machine with no hosted key the repointed entry then sends
+  # `Bearer ` (empty), the server answers 401, and the failure reads as an auth error rather than
+  # the silent repoint it is. One implementation is how the rule stops being obeyed on one
+  # platform only. The lib also carries the `exa` migration (#419 reversed by the owner
+  # 2026-10-31) and the "unusable entry is replaced, never preserved" rule.
   [ -f "$INFRA_ROOT/templates/.mcp.base.json" ] || { echo "    .mcp.base.json missing - skipping MCP config"; return 0; }
+  if [ ! -f "$INFRA_ROOT/pi-bootstrap/lib/merge-mcp.py" ]; then
+    echo "    ERROR: pi-bootstrap/lib/merge-mcp.py is missing from $INFRA_ROOT — refusing to merge" >&2
+    echo "    .mcp.json with a second, private implementation (a wrong merge here repoints a" >&2
+    echo "    self-hosted tortoise url at the hosted endpoint on every sync)." >&2
+    return 1
+  fi
   if command -v python3 >/dev/null 2>&1; then
-    python3 - "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json" << 'PY'
-import json, os, sys
-src = json.load(open(sys.argv[1]))
-dst = json.load(open(sys.argv[2])) if os.path.exists(sys.argv[2]) else {}
-src_servers = src.get("mcpServers", {})
-dst_servers = dst.get("mcpServers", {})
-# ⛔ THE ONE DELIBERATE EXCEPTION TO "local extras preserved" (#419 reversed by the
-# owner, 2026-10-31: "exa should be uninstalled because I never wanted it. external
-# research should be perplexity"). `exa` is NOT a local extra to carry forward — it
-# was a BASE server, and the merge below is `{**dst_servers, **src_servers}`, which
-# preserves any key that already exists in dst. So dropping it from the TEMPLATE
-# alone would leave every ALREADY-PROVISIONED machine still loading it: the new
-# template wins on the keys it still has, and exa is not one of them, so dst's copy
-# is what survives. That is the opposite of what the operator expects from a
-# bring-up, and it is invisible (the merge prints "local extras preserved" either
-# way). This pop IS the migration.
-if dst_servers.pop("exa", None) is not None:
-    print("    exa removed from .mcp.json (owner ruling 2026-10-31 — uninstalled, not configured)")
-merged = {**dst, **src, "mcpServers": {**dst_servers, **src_servers}}
-json.dump(merged, open(sys.argv[2], "w"), indent=2)
-print("    .mcp.json merged (base servers win; local extras preserved)")
-PY
+    if ! python3 "$INFRA_ROOT/pi-bootstrap/lib/merge-mcp.py" "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json"; then
+      echo "    ERROR: .mcp.json merge failed — the previous config is untouched" >&2
+      return 1
+    fi
   else
+    # A plain copy CLOSES over a self-hosted tortoise url and drops every local server. It is kept
+    # only because a machine with no python3 cannot merge at all, and it is loud.
+    #
+    # ⛔ IT ALSO KEEPS THE BYTES IT REPLACES (#3374 review, round 10 P2). Every other replace path in
+    # this change keeps operator content — `merge-mcp.py`'s `_keep_backup()` runs for an unparseable or
+    # wrong-shaped container — so this was the ONE path that told the operator their config had been
+    # destroyed at the moment it became unrecoverable, on the ONE box with no python3 to reconstruct
+    # it. A warning without a backup is a receipt, not a remedy.
+    echo "    WARNING: python3 not found — copying .mcp.json wholesale (any local server and any" >&2
+    echo "    self-hosted tortoise url is LOST). Install python3 and re-run to merge properly." >&2
+    if [ -f "$DEST/.mcp.json" ]; then
+      if cp -f "$DEST/.mcp.json" "$DEST/.mcp.json.bak"; then
+        echo "    the replaced file is kept at $DEST/.mcp.json.bak" >&2
+      else
+        echo "    ⚠️  could not write $DEST/.mcp.json.bak — the replaced config is about to be LOST" >&2
+      fi
+    fi
     cp "$INFRA_ROOT/templates/.mcp.base.json" "$DEST/.mcp.json"
-    echo "    .mcp.json copied (python3 not found - plain copy)"
   fi
 }
 merge_settings() {
@@ -172,7 +185,15 @@ PY
     echo "    models-store.json copied (python3 not found - plain copy)"
   fi
 }
-merge_mcp
+# ⛔ A FAILED `.mcp.json` MERGE MUST NOT TAKE THE WHOLE LAYER WITH IT (#3374 review P1). This call
+# used to be BARE under `set -e`, so an unusable template aborted setup.sh AT THE CONFIG STEP —
+# measured with this script at 3db7779f4: rc=1 and `~/.pi/agent` was LITERALLY EMPTY (no extensions,
+# no skills, no agents, and no farm — so not even record-review.sh, the tool the merge rail needs),
+# while the only message was "the previous config is untouched". A refusal belongs to the CONFIG, not
+# to the machine: the layer is installed, the previous `.mcp.json` is kept byte-identical, the error
+# is named loudly, and this script STILL exits non-zero (below) so a bring-up cannot call it success.
+_mcp_merge_failed=0
+merge_mcp || _mcp_merge_failed=1
 merge_settings
 merge_models
 merge_models_store
@@ -567,7 +588,11 @@ fi
 # whose `$O` is the flat `scripts/orchestrator-harness/*` payload (the file lives one directory ABOVE
 # that) and whose launcher does not export `$AGENT_INFRA_PATH` (launchd reads no shell profile):
 # without it every at-risk lane recorded `rescue=UNAVAILABLE`, i.e. the rescue was loud and inert.
-# ⛔ THE GRAPH CLIENT IS FARMED HERE, AND THIS ARRAY IS THE ONLY DELIVERY OF IT (agent-infra#3253).
+# ⛔ THE GRAPH CLIENT IS FARMED BY `graph_srcs` (below), AND THAT ARRAY IS THE ONLY DELIVERY OF IT
+# (agent-infra#3253). ⛔ It is NOT also listed in `fleet_srcs`: #3253 first put the pair there, #3374
+# gave the hosted-graph fallback its own array (with a farm loop that reports a MISSING entry loudly),
+# and a pair declared in BOTH is copied twice and appears twice in `farm_declared_rel` — a duplicate
+# declaration is not extra safety, it is two answers to "who delivers this file".
 # The owner's mandate (2026-11-02) — read the hosted Tortoise graph before researching, confirm
 # direction in it before implementing, write the learning after — was UNEXECUTABLE on every box but
 # the one it was written on, because `~/.pi/agent/scripts/tortoise-graph.sh` existed on no cell and
@@ -577,10 +602,10 @@ fi
 # fresh box would not have it either. A hand-copy is not a deployment (#3253; the same class as the
 # hand-copied harness §11 in cloud-cell-bringup.sh).
 #   * `tortoise_graph_client.py` is the EXECUTED half: `tortoise-graph.sh` runs it as the SIBLING
-#     `$(dirname "$0")/tortoise_graph_client.py`. Both farm FLAT into $DEST/scripts/, which is the
-#     layout that resolution needs — farming the .sh alone yields a client whose first call dies with
-#     `can't open file`, a loud failure but a needless one (the same sibling contract as
-#     lib_srcs/merge_gate_srcs above).
+#     `$(dirname "$0")/tortoise_graph_client.py`. Both farm FLAT into $DEST/scripts/ (the
+#     `graph_srcs` array), which is the layout that resolution needs — farming the .sh alone yields
+#     a client whose first call dies with `can't open file`, a loud failure but a needless one (the
+#     same sibling contract as lib_srcs/merge_gate_srcs above).
 #   * The CREDENTIAL IT NEEDS IS NOT DELIVERED BY THIS FILE, and saying so is part of the fix: the
 #     fleet has no secret store wired to it — `keys.env` on a cell and `pi-keys.env` on a Mac are
 #     PUSHED BY HAND. So `TORTOISE_MCP_API_KEY` must be present there for the mandate to run, and
@@ -609,7 +634,7 @@ fi
 # is not itself farmed; the unit names the checkout copy, which is the artifact #2877 landed and the
 # path this installer verifies before rendering. It ships DISARMED: `--install` renders a dry-run
 # unit and timer, and `--arm` (a dated owner step) is what lets the pass ACT.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh cloud-cell-supervisor.sh install-controller-service.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh tortoise-graph.sh tortoise_graph_client.py)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh cloud-cell-supervisor.sh install-controller-service.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -627,6 +652,33 @@ for base in "${fleet_srcs[@]}"; do
   cp -f "$f" "$dest"
   chmod +x "$dest" 2>/dev/null || true
   fleet_copied=$((fleet_copied+1))
+done
+
+# ── the orchestrator MCP's own harness module ────────────────────────────────────────────────
+# `lane_registry.py` lives in `scripts/orchestrator-harness/` but is farmed FLAT into
+# `$DEST/scripts/` deliberately: that flat path is one of the candidate locations the MCP server
+# itself searches (`_candidate_paths` in mcp-servers/orchestrator/server.py), so the install
+# layout and the server's own lookup cannot drift.
+# ⛔ It is NOT a member of `fleet_srcs`. That array resolves every source as
+# `$INFRA_ROOT/scripts/$base`, so listing a file that lives one directory DOWN made the install
+# treat it as missing, exit 1, and take the whole farm — guards, skills, every assertion after it —
+# down with it. Measured on #3486: `FAIL: install exited 1`, then `GUARD MISSING: …` × 6.
+# A `src` subdirectory with a flat `dest` is exactly what the installer's own reader models, so the
+# test's independent expectation stays a superset of this declaration with no change in semantics.
+mcp_harness_srcs=(lane_registry.py)
+for base in "${mcp_harness_srcs[@]}"; do
+  farm_declared_rel+="scripts/$base"$'\n'
+  f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
+  if [ ! -f "$f" ]; then
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then
+    rm -f "$dest"
+  fi
+  cp -f "$f" "$dest"
+  chmod +x "$dest" 2>/dev/null || true
 done
 echo "    scripts fleet farm: $fleet_copied copied (fleet cadence, #373 + runner gate, #1719)"
 
@@ -869,6 +921,15 @@ fi
 # its own location and fails CLOSED without it, so shipping one without the other produces a gate
 # that refuses EVERY admin merge.
 merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh admin-merge.sh)
+# The hosted-graph FALLBACK half (graph-mcp-provision). The MCP entry in
+# templates/.mcp.base.json is the PRIMARY path; this script is what a lane can still use when
+# the MCP client is unavailable from inside the session (#10605: ${TORTOISE_MCP_API_KEY} expanded
+# at process start, so the client sends an EMPTY Bearer while the same key authenticates a
+# direct POST). It existed only as a hand-written file on two boxes and in no repo, so a
+# rebuilt machine lost it silently — farming it is what makes it durable.
+# Keep this array ONE LINE: pi-bootstrap/cell-install.sh parses every top-level `name=(...)`
+# array in this file as a FARM and dies on one it cannot map (FARM_LAYOUT).
+graph_srcs=(tortoise-graph.sh tortoise_graph_client.py)
 mkdir -p "$DEST/scripts"
 merge_gate_copied=0
 merge_gate_names=""
@@ -903,6 +964,34 @@ done
 # DERIVED from the array, never hard-coded: a summary that omits a name it farmed misreports the
 # farm, and the suite pins every declared entry against this line (#1897 precedent).
 echo "    scripts merge-gate farm: $merge_gate_copied copied (${merge_gate_names:-none} — #562, #984, #2287)"
+
+# ── the hosted-graph FALLBACK farm (graph-mcp-provision) ─────────────────────
+# `tortoise-graph.sh` (+ its python client) is what a lane falls back to when the MCP client
+# cannot reach the graph from inside the session (#10605). It was hand-written on two boxes and
+# existed in NO repo, so a rebuild lost it in silence — the first fleet-wide attempt to put the
+# MCP on the cells found it absent on two of three. Farmed here so it is DELIVERED, not remembered.
+# Same real-copy + chmod discipline as the merge-gate farm above, and the same reason: the
+# documented invocation TYPES the path, so a copy without `x` is a seam nobody can run.
+graph_copied=0
+graph_names=""
+for base in "${graph_srcs[@]}"; do
+  farm_declared_rel+="scripts/$base"$'\n'
+  f="$INFRA_ROOT/scripts/$base"
+  if [ ! -f "$f" ]; then
+    echo "    scripts graph farm: MISSING $f — the hosted-graph fallback would not land" >&2
+    farm_missing+="scripts/$base"$'\n'
+    continue
+  fi
+  dest="$DEST/scripts/$base"
+  if [ -L "$dest" ]; then rm -f "$dest"; fi
+  if cp -f "$f" "$dest" && chmod +x "$dest" 2>/dev/null; then
+    graph_copied=$((graph_copied+1)); graph_names+="${graph_names:+, }$base"
+  else
+    echo "    scripts graph farm: COPY FAILED for $f" >&2
+    farm_missing+="scripts/$base (copy/chmod failed)"$'\n'
+  fi
+done
+echo "    scripts graph farm: $graph_copied copied (${graph_names:-none} — hosted-graph fallback, graph-mcp-provision)"
 
 # ── the pi spawn-point gate (#1884) ──────────────────────────────────────────
 # Installed as `pi` — not as a farmed script — because that is the whole point: `spawn-gate.sh` is
@@ -1035,10 +1124,13 @@ else
 fi
 echo "    shell profile wired: AGENT_INFRA_PATH + AGENT_SYNC_MODE"
 
-# MCP base config needs TORTOISE_HOME for the local tortoise MCP server.
-# Detect a checkout in standard locations (sibling of the agent-infra clone
-# first, then common layouts) and wire it into the shell profile when the var
-# is unset and not already present (idempotent, mirrors AGENT_INFRA_PATH).
+# TORTOISE_HOME — for LOCAL / self-hosted tortoise tooling only.
+# ⛔ The BASE MCP entry no longer uses it (graph-mcp-provision): templates/.mcp.base.json
+# declares the HOSTED server (`https://api.premiselabs.co/mcp/`, `Bearer ${TORTOISE_MCP_API_KEY}`),
+# which needs no checkout, no venv and no local FalkorDB. This probe is kept because other
+# local tooling still reads the variable and removing a variable the fleet may use is a bigger
+# change than this one — but the message below must not be allowed to imply the graph is wired
+# because TORTOISE_HOME exists. The graph needs TORTOISE_MCP_API_KEY in ~/keys.env.
 TORTOISE_HOME_SET=0
 if [ -n "${TORTOISE_HOME:-}" ]; then
   TORTOISE_HOME_SET=1
@@ -1055,9 +1147,9 @@ else
   done
 fi
 if [ "$TORTOISE_HOME_SET" -eq 1 ]; then
-  echo "    MCP: tortoise will use TORTOISE_HOME for its local MCP server"
+  echo "    TORTOISE_HOME wired (LOCAL/self-hosted tortoise tooling) — the graph MCP itself is the HOSTED server and needs TORTOISE_MCP_API_KEY in ~/pi-keys.env (interactive shells) or ~/keys.env (lanes a controller spawns)"
 else
-  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — tortoise MCP server unavailable until set"
+  echo "    note: TORTOISE_HOME not set and no tortoise checkout found — local/self-hosted tortoise tooling unavailable (the base MCP entry does not need it; it needs TORTOISE_MCP_API_KEY in ~/pi-keys.env for an interactive shell, or ~/keys.env for lanes)"
 fi
 
 # Launchd agents (idempotent, #304): install the versioned plist templates
@@ -1135,6 +1227,15 @@ if [ -f "$INFRA_ROOT/scripts/check-farm-drift.sh" ]; then
 else
   echo ""
   echo "    ⚠️  farm drift NOT verified — $INFRA_ROOT/scripts/check-farm-drift.sh is absent"
+fi
+
+if [ "$_mcp_merge_failed" -ne 0 ]; then
+  echo ""
+  echo "⛔ .mcp.json WAS NOT MERGED — the template declares a tortoise entry no lane could use, or"
+  echo "   the merge could not run (the FATAL/ERROR line above names which). The rest of the pi"
+  echo "   layer IS installed and usable; your existing .mcp.json is byte-identical to before this"
+  echo "   run, so the graph is whatever it already was. Fix templates/.mcp.base.json, then re-run."
+  exit 1
 fi
 
 echo ""

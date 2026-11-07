@@ -550,6 +550,46 @@ def _reaper_is_scheduled():
     return False
 
 
+def _class_note(kv):
+    """The per-class verdicts that are NOT an ordinary reading, appended to the record line.
+
+    ⛔ A FIELD THE READER DOES NOT PRINT DOES NOT EXIST — the same rule this repo's
+    `cloud-cell-supervisor.sh` states for `delegate_verdict_worktree`. `verdict_runner_work=abstained`
+    and `=partial` are the class's ONLY "could not measure" outcomes, and this reader used to drop
+    them: the record answered `ok=1 rc=0` (correct — an abstention is not a failure of the pass), the
+    `detail` that names the abstention was thrown away in the `ok == "1"` branch, and the class verdict
+    was never read at all — so a cell whose runner `_work` sink was filling behind a permission mismatch
+    read HEALTHY here for ever, which is the exact state `docs/ops/disk-reaper.md` claims was removed.
+
+    ⛔ IT IS PRINTED, NOT ALARMED, AND THAT IS A RECORDED DECISION, NOT AN OVERSIGHT. The abstention is
+    deliberately rc 0 with the RECORD as the alarm channel (``docs/ops/disk-reaper.md`` — an hourly red
+    for a permission mismatch is the alarm-fatigue shape this family forbids); alarming here on any
+    non-`ok` verdict would reverse that decision in the one reader that runs fleet-wide. Visibility is
+    the half this function owes: a human scanning fleet health must SEE the word.
+
+    Benign spellings stay silent (`ok`, `not-run`, `?`, absent) so a healthy cell gains no noise; every
+    other spelling is printed — FAIL-LOUD on an unrecognised one, the same polarity as `_dclass`.
+
+    ⛔ ONLY `runner_work` PUBLISHES THE TALLY (#3057 review, measured). `disk-reaper.sh` writes
+    `unmeasurable_runner_work=` — its owner answers `unmeasurable=` — and writes NO
+    `unmeasurable_duplicate_install=`, because that owner has no such field. Looking the tally up for
+    every class made the `duplicate-install` clause unrenderable: a `⚠️ duplicate-install=partial`
+    could never be followed by a count, so the operator it was written for ("one unreadable root or
+    fifty?") got nothing, and the sentence above implied a guarantee the record does not carry. The
+    VERDICT loop stays over both classes — both verdict fields are written — and the tally is gated on
+    the classes that actually publish it.
+    """
+    tally_classes = ("runner_work",)
+    out = ""
+    for cls in ("runner_work", "duplicate_install"):
+        verdict = kv.get(f"verdict_{cls}", "")
+        if verdict in ("", "ok", "not-run", "?"):
+            continue
+        unm = kv.get(f"unmeasurable_{cls}", "") if cls in tally_classes else ""
+        out += f" ⚠️ {cls.replace('_', '-')}={verdict}" + (f" unmeasurable={unm}" if unm else "")
+    return out
+
+
 def disk_reaper_record():
     """Return (detail, alarm) from the pass record. Absence/unreadability/staleness is an alarm."""
     try:
@@ -593,9 +633,22 @@ def disk_reaper_record():
         return (f"record is STALE: last pass {age}s ago (bound {stale}s) — the job is scheduled but is not running",
                 True)
     if ok == "1":
+        # ⛔ THE CAUSE IS NOT DERIVED FROM `freed_mb_unmeasured=` (#3057 review, P2). That field answers
+        # WHOSE reclaim was not measured; the REASON is split in the pass's own `detail=`
+        # (`df could not measure …` vs `owner never answered its ledger …`), because a cut-short sweep has
+        # a mount that DID answer. Synthesising "df could not measure" from the list here re-asserted the
+        # exact false cause the record had just stopped claiming — one reader over.
+        # ⛔ SO THE REASON IS PRINTED FROM THE FIELD THAT HOLDS IT — and printed HERE, because this branch
+        # used to drop `detail=` entirely while every sibling branch prints it. That was not cosmetic:
+        # `ok=1` beside an unmeasured class IS reachable (measured: `DF_BIN=/nonexistent/df --apply --only
+        # venv` records `ok=1 rc=0 freed_mb=unmeasured detail=df could not measure the reclaim for: venv`),
+        # so dropping detail left the fleet panel naming the CLASS and losing the CAUSE. A benign pass
+        # (`detail=ok`) still gains no noise, the same polarity `_class_note` uses for class verdicts.
         unm = kv.get("freed_mb_unmeasured", "")
+        det = kv.get("detail", "") or ""
+        why = f" detail={det}" if det and det != "ok" else ""
         return (f"record ok=1 rc={kv.get('rc', '?')} freed_mb={kv.get('freed_mb', '?')}"
-                f"{f' (df could not measure: {unm})' if unm else ''} age={age}s", False)
+                f"{f' freed_mb_unmeasured={unm}' if unm else ''}{why} age={age}s{_class_note(kv)}", False)
     # ⛔ A ROUTINE OUTCOME IS NOT A FLEET ALARM. rc 6 (a delegate DEFERRED the pass because the box is
     # busy — the lock was held, or a live tool holds the cache) and rc 5 (a DRY RUN that found work it
     # would do) are the states the runbook tells operators to EXPECT on a healthy busy cell; alarming on
@@ -607,7 +660,7 @@ def disk_reaper_record():
     if rc_field in ("5", "6"):
         return (f"record ok=0 rc={rc_field} (expected on a busy cell) detail={kv.get('detail', '?')} age={age}s",
                 False)
-    return (f"record ok={ok or 'MISSING'} rc={rc_field} detail={kv.get('detail', '?')} age={age}s", True)
+    return (f"record ok={ok or 'MISSING'} rc={rc_field} detail={kv.get('detail', '?')} age={age}s{_class_note(kv)}", True)
 
 
 def _tortoise_repo_resolved():

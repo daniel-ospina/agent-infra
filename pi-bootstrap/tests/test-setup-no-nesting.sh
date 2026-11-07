@@ -510,11 +510,15 @@ LAUNCHD_ENTRY_PRODUCERS="heartbeat-loop.sh"
 # entry list exists to pin), and (b) `pi-bootstrap/cell-install.sh`'s own `lane_srcs`/`FARM_LAYOUT`,
 # which is a DIFFERENT installer with its own destination layout. A producer exec'd only from one of
 # those is not in this population; extending here means teaching `farm_source_dir` that destination.
-FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs"
+FARM_ARRAYS="fleet_srcs merge_gate_srcs fleet_tools lane_root_srcs lib_srcs graph_srcs mcp_harness_srcs"
 farm_source_dir() { # <array-name> -> the repo dir its entries are read from
   case "$1" in
     lib_srcs)    printf 'scripts/lib' ;;
     fleet_tools) printf 'tools/fleet' ;;
+    # #3486 farms `lane_registry.py` FLAT into `$DEST/scripts/` from the harness subdirectory, so its
+    # SOURCE dir is one down even though its destination is not — the reason it is its own array and
+    # not a `fleet_srcs` member (that array resolves every source as `$INFRA_ROOT/scripts/$base`).
+    mcp_harness_srcs) printf 'scripts/orchestrator-harness' ;;
     *)           printf 'scripts' ;;
   esac
 }
@@ -601,16 +605,20 @@ other:orchestrator-harness/cloud-cell-doctor.sh"
 # #1552/#1899 shape). It is DELIVERED — `fleet_srcs` is what puts it at $DEST/scripts/disk-reaper-run.sh
 # — so this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry.
 #
-# `script:tortoise_graph_client.py` joined on 2026-11-03 (agent-infra#3253): `tortoise-graph.sh` — the
-# ONE way a lane reads/writes the hosted graph — execs it as the SIBLING
-# `$(dirname "$0")/tortoise_graph_client.py`, and BOTH are now declared in `fleet_srcs`, so a fresh
-# $DEST/scripts gets a client whose second half exists. It is DELIVERED — that array is what puts it at
-# $DEST/scripts/tortoise_graph_client.py — so this is a re-pin of the derived population, NOT a
-# `LANE_PRODUCERS_EXEMPT` entry. Verified against the CODE (#1899): the exec site is
-# `scripts/tortoise-graph.sh`'s `exec python3 "$(dirname "$0")/tortoise_graph_client.py"`.
-# Measured 2026-11-03 on the cmux box, which carried a HAND-COPIED (never farmed) client at
-# /tmp/cell-home/.pi/agent/scripts: `check-farm-drift.sh` reported both files STALE and NOT
-# farm-declared, exit 3 (a deploy cannot fix it) — the state this declaration removes.
+# `script:tortoise_graph_client.py` joined on 2026-11-03 (agent-infra#3253, PR #3374):
+# `tortoise-graph.sh` — the ONE way a lane reads/writes the hosted graph — execs it as the SIBLING
+# `$(dirname "$0")/tortoise_graph_client.py`, so a farm that carried the wrapper alone would ship a
+# script whose interpreter is missing. Both are DELIVERED by `pi-bootstrap/setup.sh`'s `graph_srcs`,
+# flat into $DEST/scripts — the array that puts them at $DEST/scripts/tortoise_graph_client.py — so
+# this is a re-pin of the derived population, NOT a `LANE_PRODUCERS_EXEMPT` entry. Verified against
+# the CODE (#1899): the exec site is `scripts/tortoise-graph.sh`'s
+# `exec python3 "$(dirname "$0")/tortoise_graph_client.py"`. Measured 2026-11-03 on the cmux box,
+# which carried a HAND-COPIED (never farmed) client at /tmp/cell-home/.pi/agent/scripts:
+# `check-farm-drift.sh` reported both files STALE and NOT farm-declared, exit 3 (a deploy cannot fix
+# it) — the state this declaration removes. ⛔ ONE declaration, not two: #3253 landed the pair in
+# `fleet_srcs` and #3374 landed the dedicated `graph_srcs` (a farm loop that reports a MISSING entry
+# loudly, the same class `merge_gate_srcs` uses); declaring them in both would copy each file twice
+# and make `farm_declared_rel` list it twice, so the pair lives in `graph_srcs` ONLY.
 #
 # `script:record-review.sh` joined on 2026-10-21 (PR #2288, #2287): `review-pr.sh` is now farmed by
 # the SAME `merge_gate_srcs` array and EXECS it, so the derivation sees the recorder as a producer
@@ -937,7 +945,8 @@ check_producer_farm_declared() { # <label> <derived-population>
         # Every FLAT array counts: `lane_root_srcs` is absent on this tree until #1553 (the membership
         # branch simply goes false), and `merge_gate_srcs` also lands in `$DEST/scripts/`.
         if farm_declares fleet_srcs "$name" "$root" || farm_declares lane_root_srcs "$name" "$root" \
-           || farm_declares merge_gate_srcs "$name" "$root"; then
+           || farm_declares merge_gate_srcs "$name" "$root" \
+           || farm_declares graph_srcs "$name" "$root"; then
           delivered=$((delivered+1)); continue
         fi
         # The fleet directory IS a real deployed location (`setup.sh` mkdirs `$DEST/scripts/fleet/`), so
@@ -2467,6 +2476,12 @@ check_fix_markers "$DEST/extensions" "run6"
 # gate must sit where `pi` is born, not where a caller remembers to source it. Pinned BY ARTIFACT and
 # BY BEHAVIOUR (a byte comparison alone would pass on a copy that cannot run): the INSTALLED file is
 # driven as `pi`, with MAX_LOAD=0 as the deterministic refusal lever and a fake real pi behind it.
+# ⛔ MEM_MIN_AVAIL_MB=1 NEUTRALISES THE MEMORY ARM (#2387), and the exit code is ASSERTED — both
+# because of the same defect, measured here: the shim now checks MEMORY BEFORE load, so on a
+# memory-tight box the refusal arm "passed" on a MEMORY refusal (it only asserted that the real `pi`
+# did not run — no exit code at all) while the positive control FAILED. A green refusal over a red
+# control is the false-pass shape this suite exists to remove, so the arm now pins 76 AND the floor
+# is pinned out of the way.
 # The defect this exists for: a hand-written runner that sourced nothing started lanes on a box at
 # load 258 against its own ceiling of 100, with no refusal, no log line and no count.
 echo "== the pi spawn-point gate (#1884)"
@@ -2486,13 +2501,23 @@ mkdir -p "$TMP/gate-real"
 printf '#!/usr/bin/env bash\nprintf RAN > "%s"\n' "$TMP/gate-ran" > "$TMP/gate-real/pi"
 chmod +x "$TMP/gate-real/pi"
 rm -f "$TMP/gate-ran"
-HOME="$HOME_DIR" MAX_LOAD=0 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
-if [ ! -e "$TMP/gate-ran" ]; then
-  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 (the real pi never ran)"
+# ⛔ THE REFUSAL IS THE EXPECTED OUTCOME, SO IT MUST NOT TRIP `set -e` (line 23). Written as
+# `pi … ; _grc=$?` the shell ABORTED on the gate's own 76 before `_grc` was ever assigned — the suite
+# exited 76 with 239 log lines and no recap, so the two real FAILs below were never reported and the
+# arm read as a harness crash. Capture the status the way the positive control below already does.
+_grc=0
+HOME="$HOME_DIR" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || _grc=$?
+if [ "$_grc" -eq 76 ] && [ ! -e "$TMP/gate-ran" ]; then
+  echo "ok: the installed gate REFUSED a spawn at MAX_LOAD=0 with the LOAD code 76 (the real pi never ran)"
+elif [ ! -e "$TMP/gate-ran" ]; then
+  # ⛔ A REFUSAL FOR ANOTHER CAUSE IS NOT THIS ARM'S SUBJECT (review, P2). Without the code check a
+  # memory (the gate's own PI_GATE_MEM_REFUSED) or fork (78) refusal satisfied a LOAD assertion, and the positive control below then
+  # failed — the suite reporting its own subject as broken on a box where nothing was wrong with it.
+  fail "the installed gate refused at MAX_LOAD=0 for some OTHER cause (rc=$_grc, expected 76) — the load arm cannot be asserted over it"
 else
   fail "the installed gate allowed a spawn at MAX_LOAD=0 — 'spawn nothing' is not enforced"
 fi
-HOME="$HOME_DIR" MAX_LOAD=999999999 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
+HOME="$HOME_DIR" MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 PATH="$DEST/bin:$TMP/gate-real:$PATH" pi -p "gate probe" >/dev/null 2>&1 || true
 if [ -e "$TMP/gate-ran" ]; then
   echo "ok: POSITIVE CONTROL — below the ceiling the installed gate EXECs the real pi"
 else

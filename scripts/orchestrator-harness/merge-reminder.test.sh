@@ -46,7 +46,8 @@
 #       quoted, and `--uninstall-timer` REMOVES it — the arm install can create;
 #   §22 ABSENCE IS NOT GREEN and partial pages are not quiet: an EMPTY check surface refuses, a
 #       combined status state=failure with no failing entry read is UNREADABLE, and `lease_until=0`
-#       is LIVE (claims.sh's sentinel) rather than expired;
+#       is NEVER FREE (claims.sh's sentinel: it ABSTAINS — since #3203 reported as `unreadable`, not
+#       live) rather than expired;
 #   §23 the DEPLOY arm's own bound: an unattainable target is attempted, RECORDED, then a WAIT, then
 #       a REFUSE by count — never a restart every cycle — and a box our own failed activation left
 #       STOPPED is reported as our damage;
@@ -560,6 +561,52 @@ PYMOD
 ck "§14h an unreadable origin/main refuses the deploy arm instead of restarting the fleet" \
    "$(_py_s14h_unreadable_main)"
 
+# ⛔ TWO SHAPES THE SHELL CANNOT PARSE, AND THIS READER MUST NOT EITHER (review rounds 9–10,
+# agent-infra#3203): `17٩2000000` (Python's `\d` is Unicode and `float()` normalises it) and
+# `2026-01-01T00:00:00Z` (an ISO fallback this reader kept while `claims.sh`'s anchored `_lease_of`
+# calls the same message unparseable). Both were answered FREE — "past its lease, reclaimable" — on a
+# claim every shell reader refuses: the FREE direction, which is the bug this PR exists to remove.
+# The helper takes the WANTED polarity, so the same fixture also proves the assertion is not vacuous
+# (`none` for a genuinely expired epoch lease).
+_py_lease_verdict() { python3 - "$SUT" "$TMP" "$1" "$2" <<'PYMOD'
+import importlib.util, subprocess, sys, tempfile
+from pathlib import Path
+spec = importlib.util.spec_from_file_location("mr", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = Path(tempfile.mkdtemp(dir=sys.argv[2]))
+org, src = d / "origin.git", d / "src"
+def g(*a, **k):
+    return subprocess.run(["git", "-C", str(src), *a], check=True, capture_output=True, text=True, **k)
+subprocess.run(["git", "init", "-q", "--bare", str(org)], check=True, capture_output=True)
+subprocess.run(["git", "init", "-q", str(src)], check=True, capture_output=True)
+g("config", "user.email", "a@b"); g("config", "user.name", "a")
+(src / "f").write_text("x\n")
+g("add", "f"); g("commit", "-qm", "base")
+g("remote", "add", "origin", str(org)); g("push", "-q", "origin", "HEAD:refs/heads/main")
+tree = g("rev-parse", "HEAD^{tree}").stdout.strip()
+_v = sys.argv[3]
+if _v.startswith("NUL:"):
+    # ⛔ A REAL NUL IN THE OBJECT (review round 19, agent-infra#3203). BASH CANNOT PASS A NUL THROUGH
+    # `$( )` — the substitution DELETES it — so a fixture built by shell concatenation silently tests the
+    # pre-fused string and says nothing about the NUL. `git commit-tree -m` refuses a NUL in argv too.
+    # `hash-object --literally -w --stdin` writes the bytes, and a plain push accepts the result; that is
+    # how a peer mints this object (`git fast-import` is the other way).
+    raw = ('tree %s\nauthor a <a@b> 1 +0000\ncommitter a <a@b> 1 +0000\n\n%s\n'
+           % (tree, _v[len("NUL:"):].replace("<NUL>", "\x00")))
+    sha = subprocess.run(["git", "-C", str(src), "hash-object", "-t", "commit", "--literally",
+                          "-w", "--stdin"], input=raw.encode(), check=True,
+                         capture_output=True).stdout.decode().strip()
+else:
+    msg = _v[len("RAW:"):] if _v.startswith("RAW:") else ("claim owner=cell-2 lease_until=%s nonce=probe" % _v)
+    sha = g("commit-tree", "-m", msg, tree).stdout.strip()
+g("push", "-q", "origin", sha + ":refs/claims/pr-42")
+(d / "o" / "state").mkdir(parents=True)
+state, detail = m.claim_state(d / "o", src, 42, "0" * 12)
+want_free = (sys.argv[4] == "none")
+print(0 if (state == "none") == want_free else 1)
+PYMOD
+}
+
 # ═══ §15 NON-VACUITY: the gates are what refuses, not a coincidence ═════════════════════════════
 echo "-- §15 mutation controls"
 mut="$(mktemp -d "$TMP/mut.XXXXXX")"
@@ -908,20 +955,155 @@ ck "§22b combined state=failure with no failing entry read is UNREADABLE" \
    "$(qF 'combined commit-status state is' "$out" && qF 'REFUSE(UNREADABLE)' "$out" && echo 0 || echo 1)"
 ck "§22b nothing was dispatched" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
 
-# ── the `0` lease sentinel: claims.sh says UNPARSEABLE => LIVE, so it must NOT read as expired ──
+# ── the `0` lease sentinel: claims.sh says an unparseable lease is NEVER FREE (it ABSTAINS; since
+# ── #3203 it is reported as `unreadable`, not live), so it must NOT read as expired ──
 write_baseline; reset_o
 git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
 printf 'claim owner=cell-2 lease_until=0 nonce=zero\n' > "$TMP/claimmsg-zero"
 ZERO_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-zero")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
 git -C "$REPO_SRC" push --quiet origin "$ZERO_SHA:refs/claims/pr-42" 2>/dev/null
 out="$(run_sut)"; rc=$?
-ck "§22c lease_until=0 is LIVE (claims.sh's sentinel), so the claim still refuses" \
+ck "§22c lease_until=0 ABSTAINS (never free), so the claim still refuses" \
    "$(q 'REFUSE(claim=refs/claims/pr-42' "$out" && echo 0 || echo 1)"
-ck "§22c nothing was dispatched on a claim every other reader calls live" \
+ck "§22c nothing was dispatched on a claim no reader may steal" \
    "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
 git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
 
-# The three documented ABSTENTIONS, each driven so the string is not merely printed somewhere.
+# ── and the shape's sibling: a LEADING-ZERO lease is the same class (agent-infra#3203). The shell
+# ── rejects it (`[` compares decimally, so `0…9` would read as a 1970 window); `int()` here would do
+# ── the same, so the reader must refuse the shape BEFORE converting or the two readers disagree in the
+# ── FREE direction — this gate would dispatch a rail on a claim claims.sh abstains over.
+write_baseline; reset_o
+printf 'claim owner=cell-2 lease_until=0%s nonce=leadzero\n' "${NOW:-$(date +%s)}" > "$TMP/claimmsg-lead"
+LEAD_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-lead")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
+git -C "$REPO_SRC" push --quiet origin "$LEAD_SHA:refs/claims/pr-42" 2>/dev/null
+out="$(run_sut)"; rc=$?
+ck "§22c2 a LEADING-ZERO lease ABSTAINS too, matching claims.sh's own class" \
+   "$(q 'REFUSE(claim=refs/claims/pr-42' "$out" && echo 0 || echo 1)"
+ck "§22c2 nothing was dispatched on it" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+
+# ── and its Unicode sibling (review round 9): Python's `\d` matches UNICODE decimal digits while
+# ── `[1-9]` is ASCII-only, so `17٩2000000` passed the shape gate and `float()` — which normalises
+# ── Unicode decimals — returned 1792000000.0 ⇒ FREE ⇒ a rail dispatched on a claim claims.sh calls
+# ── `unreadable`. One datum, one answer.
+write_baseline; reset_o
+printf 'claim owner=cell-2 lease_until=17%s2000000 nonce=unidigit\n' "$(printf '\u0669')" > "$TMP/claimmsg-uni"
+UNI_SHA="$(git -C "$REPO_SRC" commit-tree -m "$(cat "$TMP/claimmsg-uni")" "$(git -C "$REPO_SRC" rev-parse HEAD^{tree})")"
+git -C "$REPO_SRC" push --quiet origin "$UNI_SHA:refs/claims/pr-42" 2>/dev/null
+out="$(run_sut)"; rc=$?
+ck "§22c3 a lease with a NON-ASCII digit ABSTAINS (Python's \\d is Unicode; the shape is ASCII)" \
+   "$(q 'REFUSE(claim=refs/claims/pr-42' "$out" && echo 0 || echo 1)"
+ck "§22c3 nothing was dispatched on it" "$([ ! -e "$FX/rail-argv.txt" ] && echo 0 || echo 1)"
+# ⛔ AND THE READER ITSELF, directly: §22c3 alone cannot discriminate this arm, because the shell gate
+# in claims.sh refuses the same claim first and the rail never reaches this file's verdict (measured:
+# the mutant that restores `\d` leaves §22c3 GREEN). So pin the verdict, not only the dispatch.
+ck "§22c3b the reader's OWN verdict on that claim is not FREE" \
+   "$(_py_lease_verdict "17$(printf '\u0669')2000000" held)"
+ck "§22c3c neither is an ISO-stamped lease the shell calls unparseable" \
+   "$(_py_lease_verdict "2026-01-01T00:00:00Z" held)"
+ck "§22c3d (control) a genuinely EXPIRED epoch lease still reads FREE — so the two above can go RED" \
+   "$(_py_lease_verdict "1000000000" none)"
+# ⛔ AND A LEASE TOKEN ON A *LATER LINE* IS NOT THE CLAIM'S TERM (review round 13, agent-infra#3203).
+# `claims.sh`'s `_lease_of` reads the FIRST non-empty line only, so this shape is an ABSTENTION there
+# (rc 1, ref untouched) — while a whole-body scan here answers "expired, reclaimable", and THIS file's
+# `"none"` is the value `decide()` treats as the claim gate PASSING: a rail dispatched on a claim every
+# shell reader refuses. `RAW:` passes the message verbatim (the helper otherwise mints the standard
+# one-line form).
+# ⛔ AND THE DATUM MUST NOT BE EXPLAINED BY THE WORDBOUNDARY (review round 19, agent-infra#3203). A
+# token at a LINE START (`\nlease_until=1`) is refused by `(?<![^ \t])` whether or not the first-line
+# rule exists — measured: the pre-round-13 whole-body mutant stayed GREEN on it. The discriminating
+# datums put a SPACE-PRECEDED token on line 2, bare and in the full `claim …` form.
+ck "§22c3e a lease token on a later line ABSTAINS, as the shell's first-line read does" \
+   "$(_py_lease_verdict "RAW:claim owner=cell-2 nonce=1
+lease_until=1" held)"
+ck "§22c3e2 a SPACE-PRECEDED lease token on line 2 ABSTAINS too (the datum a whole-body scan reads)" \
+   "$(_py_lease_verdict "RAW:claim owner=cell-2 nonce=1
+ lease_until=1" held)"
+ck "§22c3e3 a full second \`claim ...\` line contributes neither field (shell reads line 1 only)" \
+   "$(_py_lease_verdict "RAW:claim owner=cell-2 nonce=1
+claim owner=otherbox lease_until=1 nonce=2" held)"
+# ⛔ AND AN NBSP IS NOT A WORD BOUNDARY (review round 14, agent-infra#3203): the shell splits the line
+# on space/TAB, so `owner=…\u00a0lease_until=1` is ONE word — no lease field, ABSTAIN. Python's
+# `\s`/`(?<!\S)` treated the NBSP as a boundary and answered "expired, reclaimable", which `decide()`
+# reads as the claim gate PASSING: a GO minted against a claim every shell reader refuses.
+ck "§22c3f an NBSP-separated field is not a field (space/TAB are the shell's word class)" \
+   "$(_py_lease_verdict "RAW:claim owner=cell-2$(printf '\u00a0')lease_until=1 nonce=x" held)"
+# ⛔ AND THE WHOLE SEPARATOR CLASS (review round 15, agent-infra#3203): Python's `splitlines()` breaks on
+# VT, FF, FS/GS/RS, NEL, LS and PS; the shell breaks on `\n` alone. Each of those was therefore
+# `expired ⇒ reclaimable` here — the value `decide()` reads as the claim gate PASSING — while every shell
+# reader abstains. One assertion per character, driven through this reader's own verdict.
+for SEP in "$(printf '\v')" "$(printf '\f')" "$(printf '\034')" "$(printf '\035')" "$(printf '\036')" \
+           "$(printf '\u0085')" "$(printf '\u2028')" "$(printf '\u2029')" "$(printf '\u2003')"; do
+  ck "§22c3g a lease token terminated by '$(printf '%s' "$SEP" | od -An -c | tr -d ' \n')' is not a term" \
+     "$(_py_lease_verdict "RAW:claim owner=cell-2 lease_until=1${SEP}nonce=x" held)"
+  # ⛔ THE TERMINATOR SHAPE — the one the line above CANNOT catch (review round 17, agent-infra#3203).
+  # `[^ \t]+` swallows `${SEP}nonce=x` above, so the shape gate fails for an unrelated reason. Here the
+  # SEP ENDS the token (a space follows it), which is exactly what an argument-less `.strip()` used to
+  # repair: `1<VT>` became a pure `1`, passed the shape gate as a PAST term, and `claim_state` answered
+  # `none` — the value `decide()` reads as the claim gate PASSING — while `_lease_of` saw one word that
+  # is not all digits and ABSTAINED.
+  # ⛔ WHAT THIS PINS, EXACTLY (review round 19 — the first draft of this comment overclaimed): it
+  # catches the PRE-FIX COMBINATION (`[^ \t]+` capture **and** `.strip()`), which is mutant A. It does
+  # NOT independently pin "no `.strip()`": with the ANCHORED capture a bare `.strip()` is already a
+  # no-op, so restoring only the strip leaves every datum green (measured). The anchor is what makes the
+  # trim harmless — two changes, one property, and this assertion guards the combination.
+  ck "§22c3g2 a lease token TERMINATED by '$(printf '%s' "$SEP" | od -An -c | tr -d ' \n')' is not a term either" \
+     "$(_py_lease_verdict "RAW:claim owner=cell-2 lease_until=1${SEP} nonce=x" held)"
+done
+# ⛔ AND CR, WHICH THE SHELL *DELETES* (review round 16, agent-infra#3203). `_lease_of` ends with
+# `tr -d '\r'`, so a CR inside the claim line does not split it. TWO shapes, and their answers are
+# OPPOSITE (review round 17: the first draft of this block said "the last digits win, i.e. LIVE" for
+# BOTH, which is wrong for the first and would have let a "take the LAST token" implementation pass):
+#   · `lease_until=1<CR>lease_until=9999999999` FUSES into one invalid token ⇒ UNPARSEABLE ⇒ ABSTAIN;
+#   · `lease_until=1793975986<CR>1` fuses into `17939759861` ⇒ ONE VALID term ⇒ LIVE.
+# Pre-fix, `text=True` had already decoded the CR as a LINE BREAK, so this reader took line 1's value
+# in BOTH cases — `"none"` for the first (the value `decide()` reads as the gate PASSING) and a PAST
+# term for the second. The messages are minted with a REAL CR (printf), not a Python escape.
+# ⛔ AN INVALID TOKEN BEFORE A VALID ONE (review round 18, agent-infra#3203). `_lease_of` REJECTS the
+# non-digit token and continues — `sed -n 's/^lease_until=\(ASCII-DIGITS\)$/\1/p' | head -n 1` — so
+# `lease_until=HAVOC lease_until=<past>` is EXPIRED/free to the shell and to `claim_lanes` (whose
+# anchored `findall` skips it). A reader that stops at the first word STARTING with `lease_until=` and
+# then shape-tests it answers UNPARSEABLE ⇒ `held`, refusing what the registry calls free. The reverse
+# direction from this round's P1, and the same root: "the first token" means the first VALID one.
+ck "§22c3i a non-digit lease token is SKIPPED, not terminal — a later VALID past term still expires" \
+   "$(_py_lease_verdict "RAW:claim owner=peerbox:7 lease_until=HAVOC lease_until=1791000000 nonce=n" none)"
+ck "§22c3i2 the same message with only the invalid token still ABSTAINS (the skip must not invent a term)" \
+   "$(_py_lease_verdict "RAW:claim owner=peerbox:7 lease_until=HAVOC nonce=n" held)"
+# ⛔ AND A PREFIX IS NOT A VALUE (review round 19): `lease_until=HAVOC` has NO digits, so a
+# prefix-extracting reader (round 10's defect) is invisible on it. `1junk` is the discriminating datum —
+# the shell's anchored `sed` takes nothing, a prefix match takes `1` ⇒ past ⇒ FREE. Pinned in
+# `claim_lanes.test.py:450` and in test-claims A55–A57 for the shell; this file had no such case.
+ck "§22c3i3 a TRUNCATED term ('1junk') ABSTAINS — a prefix is not a value (a prefix reader says FREE)" \
+   "$(_py_lease_verdict "RAW:claim owner=peerbox:7 lease_until=1junk nonce=n" held)"
+ck "§22c3i4 ...and a truncated term does not supply a skip-target for a later valid one either" \
+   "$(_py_lease_verdict "RAW:claim owner=peerbox:7 lease_until=1junk lease_until=1791000000 nonce=n" none)"
+
+# ⛔ AND A NUL, WHICH BASH *DELETES* (review round 19, agent-infra#3203). `_lease_of` reads the object
+# through `$( )`, and a command substitution DROPS NUL bytes — so tokens either side of a NUL FUSE, and
+# `git log --format=%B` (a pretty-printer) instead TRUNCATES at the first NUL. Three measured rows where
+# that difference answered FREE while the shell held or abstained; `git commit-tree` refuses a NUL but
+# `git fast-import` / `git hash-object --literally` do not, and a plain `git push` accepts the result.
+ck "§22c3j a NUL-FUSED line is ONE INVALID token to the shell ⇒ abstain (a truncating reader says FREE)" \
+   "$(_py_lease_verdict "NUL:claim owner=cell-2 lease_until=1<NUL>lease_until=1792009999 nonce=x" held)"
+ck "§22c3j2 a NUL INSIDE the digits fuses into ONE VALID LIVE term (a truncating reader says FREE)" \
+   "$(_py_lease_verdict "NUL:claim owner=cell-2 lease_until=17<NUL>9999999999 nonce=x" held)"
+ck "§22c3j3 ...and a NUL inside the digits that fuses into a PAST term still EXPIRES (fusion, not refusal)" \
+   "$(_py_lease_verdict "NUL:claim owner=cell-2 lease_until=1<NUL>2 nonce=x" none)"
+
+CR_FUSE="$(printf 'claim owner=cell-2 lease_until=1\rlease_until=9999999999 nonce=x')"
+ck "§22c3h a CR-FUSED line is one INVALID token to the shell ⇒ abstain (decoded as a break: FREE)" \
+   "$(_py_lease_verdict "RAW:${CR_FUSE}" held)"
+# ⛔ AND THE SECOND CR SHAPE MUST DISCRIMINATE THE *POLARITY*, NOT MERELY "not free" (review round 18).
+# The first draft asserted "want held" for a shape it described as LIVE — and "held" is what a reader
+# that REFUSES the fused digits also answers, so the assertion could not see its own claim (measured: a
+# shape-gate mutant stayed green). This shape makes the two readings OPPOSITE:
+#   · the shell/this reader DELETE the CR: `17<CR>9999999999` fuses to `179999999999` = LIVE ⇒ held;
+#   · universal newlines SPLIT it: line 1's `17` is a PAST term ⇒ `"none"` = the gate PASSING.
+CR_JOIN="$(printf 'claim owner=cell-2 lease_until=17\r9999999999 nonce=x')"
+ck "§22c3h2 a CR INSIDE the digits does NOT split the line: the fused LIVE term governs (a split reader answers FREE)" \
+   "$(_py_lease_verdict "RAW:${CR_JOIN}" held)"
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
+git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
 write_baseline; reset_o
 printf '[{"number":42,"title":"closed","state":"closed","draft":false,"mergeable":true,\n  "updated_at":"2026-10-23T04:00:00Z","head":{"sha":"%s"}}]\n' "$HEAD" > "$FX/pulls.json"
 out="$(run_sut)"; rc=$?
@@ -977,7 +1159,7 @@ ck "§22h pending contradicted by a failing entry is UNREADABLE" \
 
 # ⛔ THE CLAIM IS READ FROM A PRIVATE REF, NOT FETCH_HEAD. One FETCH_HEAD per .git is rewritten by ANY
 # concurrent fetch, and reading it made a LIVE claim eligible to be reported as EXPIRED. Here the
-# remote claim is EXPIRED while FETCH_HEAD names a ZERO-lease (LIVE) commit: a reader of FETCH_HEAD
+# remote claim is EXPIRED while FETCH_HEAD names a ZERO-lease (never-free) commit: a reader of FETCH_HEAD
 # refuses, a reader of the private ref dispatches.
 write_baseline; reset_o
 git -C "$REPO_SRC" push --quiet origin :refs/claims/pr-42 2>/dev/null
@@ -2925,16 +3107,31 @@ ck "§27b box-status REFUSES the same shape and names the pointer as the reason"
 # ⛔ `GIT_COMMON_DIR` IS OBSERVABLE ONLY ON AN **ACCEPTED** CANDIDATE (round-9 review, measured): on a repo the
 # marker test already refuses it changes nothing, so a pin there is vacuous. The read it corrupts is the
 # RELATION — git takes OBJECTS from the inherited common dir, so a pin that is not an object in THIS repo is
-# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history. Asserted
-# against `$HERE_TOP`, which IS the harness repo.
+# reported `[diverged]` instead of `[unknown]`, i.e. a claim that the box ran a rewritten history.
 # The pin is a commit that EXISTS in the FOREIGN repo and NOT in this one: an inherited common dir makes
 # `cat-file -e` succeed for it, which is what turns `[unknown]` into `[diverged]`. A synthetic zero sha would
 # be absent from both repos and the case would pass for the wrong reason.
+# ⛔ THE CANDIDATE MUST BE A FIXTURE HERE TOO (#3512 review, P2). This arm asserted against
+# `$HERE_TOP` — the checkout the suite happens to run in — and on a CI-shaped checkout that made it
+# VACUOUS rather than flaky: `box-status.sh` computes `relation` only when `origin/main` RESOLVES, so
+# with no such ref the value keeps its initial "unknown" and the assertion is satisfied by
+# construction — a regression that re-admits `GIT_COMMON_DIR` hijacking shipped GREEN on every
+# PR/batch run, and only the main lane (which materialises `origin/main`, #3131) could catch it.
+# `$REPO_SRC` is this suite's own harness fixture: it tracks the marker, so the candidate is ACCEPTED
+# (which this arm requires — on a REFUSED candidate the pin changes nothing and the arm is vacuous by
+# design), and it has its own `origin/main`, so the relation is actually computed.
+# ⛔ AND THE ASSERTION PINS THE ACCEPTANCE ITSELF (#3512 review, cycle 2, P2). `harness: … [unknown]`
+# alone cannot tell "accepted candidate, relation computed, no hijack" from "candidate REFUSED, relation
+# never computed" — the refusal path still prints the pin, so both look identical and the arm would pass
+# on a broken reader. The `ref: origin/main=` conjunct (the shape the subdirectory arm above already
+# uses) is what makes "the relation was actually computed" an assertion rather than an assumption, and
+# it also protects the arm if this fixture ever loses its `origin/main`.
 git -C "$PLAIN" rev-parse HEAD > "$TMP/pin-foreign"
 out="$(env REPO= HARNESS_PIN="$TMP/pin-foreign" GIT_COMMON_DIR="$PLAIN/.git" HOME="$TMP/home" FIXTURE="$FX" \
-  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$HERE_TOP" 2>&1)"
+  PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$TMP/o" --repo "$REPO_SRC" 2>&1)"
 ck "§27b box-status is not hijacked by an inherited GIT_COMMON_DIR (an absent pin stays [unknown])" \
-   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" && echo 0 || echo 1)"
+   "$(grep -q 'harness: .*\[unknown\]' <<<"$out" && ! grep -q '\[diverged\]' <<<"$out" \
+      && grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"
 
 # ⛔ A **TRACKED SYMLINK** AT THE MARKER PATH IS NOT THE HARNESS (round-4 review follow-up, BLOCKING-adjacent:
 # measured that `git ls-files --error-unmatch` is satisfied by a mode-120000 index entry, so a repo that
@@ -3177,7 +3374,14 @@ ck "§27b harness_repo_of REFUSES the same directory-at-marker-path shape" \
 # refused — i.e. a regression to a literal-path marker shipped green).
 # `harness-refresh.sh` and `check-deployed-drift.sh` accept a subdir for `HARNESS_REPO`; a reader that
 # tested the literal path would refuse it and the deploy probe would read CANNOT VERIFY forever.
-out="$(env REPO= HARNESS_REPO="$HERE_TOP/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
+# ⛔ AND THE CANDIDATE MUST BE A FIXTURE, NOT THE AMBIENT CHECKOUT (#3160). This arm used
+# `$HERE_TOP/scripts` — the checkout the suite happens to run in — and then grepped for a `ref:`
+# line, which requires `origin/main` to RESOLVE there. `actions/checkout` fetches one ref (or
+# `refs/remotes/pull/N/merge`), so on every PR/batch checkout `origin/main` does not exist, no ref
+# line is printed at all, and the arm reds for a reason that has nothing to do with
+# subdirectory-acceptance. `$REPO_SRC` is this suite's own fixture: it tracks the marker and has its
+# own `origin/main` (`git push --quiet origin main` above), so the assertion tests the RESOLVER.
+out="$(env REPO= HARNESS_REPO="$REPO_SRC/scripts" HOME="$TMP/homeplain" FIXTURE="$FX" HARNESS_PIN="$TMP/nopin" \
   PATH="$TMP:/usr/bin:/bin:/usr/local/bin" bash "$TMP/flat/box-status.sh" --o "$PLAIN" 2>&1)"
 ck "§27b box-status ACCEPTS a SUBDIRECTORY candidate of the harness repo" \
    "$(grep -q '^ref: origin/main=' <<<"$out" && echo 0 || echo 1)"

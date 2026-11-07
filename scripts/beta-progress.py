@@ -32,7 +32,25 @@ import traceback
 import urllib.parse
 import urllib.request
 
-REPO = "daniel-ospina/tortoise"
+DEFAULT_REPO = "daniel-ospina/tortoise"
+REPO = DEFAULT_REPO
+# ⛔ `--repo` EXISTS BECAUSE `fleet_census(repos)` CANNOT BE A WRAPPER OF A MODULE THAT TAKES NO
+# ARGUMENTS (#3382 row 4, docs/ops/orchestrator-mcp-inventory.md §5.0 V4 / §7.7). It is a PARAMETER on
+# the existing derivation, never a second one: `compute()` still owns every P0/P1/coverage rule and
+# reads this global. Defaulted to the same repo, so the beat's call (which passes no argv) is unchanged.
+#
+# ⛔ AND `--repo` MUST NOT BE ABLE TO RELABEL ANOTHER REPO'S NUMBERS. The cache is one file on one box
+# and the payload it stores used to carry no repo identity at all, while the render stamped
+# `payload["repo"] = REPO` on whatever it read. So for the whole TTL (~15 beats of 16) a
+# `--repo owner/other` call returned the CACHED tortoise figures labelled `owner/other` — a figure
+# attributed to a repo it was never measured on — and, in the other direction, a missing call wrote
+# other-repo numbers into the shared file that the no-arg beat then rendered as tortoise's `DELIVERY:`
+# line. `mcp-servers/orchestrator/server.py::_census` is exactly that caller: it fans out over
+# `repos` with `["--repo", repo, "--json"]`. Three things make it impossible: the payload NAMES the
+# repo it measured, a cache whose `repo` does not match is a MISS, and the file is keyed per repo.
+# ⛔ (a duplicate `REPO = "daniel-ospina/tortoise"` stood here after the merge — identical
+# value, so no behaviour changed, but two definitions of one name is how a future edit changes one and
+# not the other, and `_cache_path()` keys off `REPO == DEFAULT_REPO`.)
 # ⛔ THE TRACKER IS NOT THE ONLY REPO A FIX LANDS IN (tortoise#10951). `REPO` is where the ISSUES
 # live; it is not where every fix is written. This backlog is worked by the harness, whose PRs are
 # under `agent-infra`, so a single-repo PR read cannot see the PR a fix actually lives in. This
@@ -61,7 +79,39 @@ REPO = "daniel-ospina/tortoise"
 # ⛔ `open_prs` keeps its old meaning (the TRACKER's open PRs) — the extra repos feed `covered()`
 # ONLY, so widening the gap count cannot silently move the headline number.
 FIX_REPOS = (REPO, "daniel-ospina/agent-infra")
+# ⛔ DERIVED, NOT FROZEN (merge of #3382's `--repo` with #10951's FIX_REPOS). `FIX_REPOS` is built from
+# `REPO` at import, and `--repo` reassigns `REPO` at runtime — so without this, `--repo owner/other`
+# would keep reading FIX-REPO PRs for tortoise while labelling them `owner/other`: exactly the
+# attribution failure the `--repo` comment above exists to make impossible. `main()` re-derives it.
+_FIX_REPOS_TAIL = "daniel-ospina/agent-infra"
+
+
+def _derive_fix_repos(repo):
+    """Repos a fix for <repo>'s issues may land in.
+
+    ⛔ THE EXTRA SEPARATE REPO IS TORTOISE-BACKLOG-SPECIFIC (review cycle 7, P2). Re-deriving only the
+    HEAD kept a hardcoded tail, so `--repo owner/other` returned `('owner/other',
+    'daniel-ospina/agent-infra')` — counting agent-infra PRs as coverage for ANOTHER repo's issues,
+    which is the attribution failure this module's `--repo` comment exists to forbid, relocated. The
+    tail applies only when the tracker IS the one the tail was measured for.
+    """
+    if repo == DEFAULT_REPO:
+        return (repo, _FIX_REPOS_TAIL)
+    return (repo,)
 CACHE = os.path.expanduser("~/.pi/agent/state/beta-progress.json")
+
+
+def _cache_path():
+    """The cache file for the CURRENT `REPO`.
+
+    The DEFAULT repo keeps the historical path byte-for-byte, because that file has other READERS
+    (`scripts/merge-queue.py` opens it directly) and the beat that writes it passes no `--repo`. Any
+    other repo gets its own file, so a fan-out cannot overwrite the beat's state.
+    """
+    if REPO == DEFAULT_REPO:
+        return CACHE
+    root, ext = os.path.splitext(CACHE)
+    return "%s.%s%s" % (root, REPO.replace("/", "__"), ext or ".json")
 TTL = 1800  # was 3600; halved so the worst-case lag is 30m, at ~2x the API cost (still cheap)
 # ⛔ A CACHE `ts` MAY NOT BE IN THE FUTURE. Clock skew between the writer and the reader is real,
 # so a little is allowed and no more; see the validator in `main()` for why the bound is not
@@ -909,7 +959,8 @@ def _compute():
                 return True
         return False
 
-    out = {"ts": int(time.time()), "open_prs": len(openpr), "merged_today": merged_today}
+    out = {"ts": int(time.time()), "repo": REPO,
+           "open_prs": len(openpr), "merged_today": merged_today}
     for tier, label in (("p0", "P0-blocker"), ("p1", "P1-severe")):
         # ⛔ STILL GRAPHQL, and NOT covered by the fallback above: where the layer's REST adapter
         # is absent (#1978 -- the cells) a refusal here returns None and the WHOLE line still
@@ -938,10 +989,48 @@ def _compute():
     return out
 
 
-def main():
+def main(argv=None):
+    """ONE line by default; `--json` emits the SAME object the render reads.
+
+    ⛔ TWO SURFACES, ONE DERIVATION (#3382 invariant-by-construction): `--json` does not compute
+    anything. It emits `payload`, which is the exact dict the prose branch renders from — so a caller
+    cannot get a figure from the JSON that the operator's line does not show, or the other way round.
+    `--json` also carries `age_m`/`stamp` **computed here, at render time, from `ts`** (#3382 invariant
+    4), so every figure in it has a measurement time and a correctly-computed age, and a future stamp
+    is clamped by the same rule the prose uses rather than by a second one.
+
+    Exit is 0 in every case except a USAGE error (2), because this runs on the beat and a metrics
+    failure must never take it down (module header). `--json` says `unavailable` in the payload.
+    """
+    global REPO
+    # ⛔ `None` MEANS "NO ARGUMENTS", and the CLI passes them explicitly at the trailer. Reading
+    # `sys.argv[1:]` here made every in-process caller — the tests, and anything that imports this
+    # module — inherit ITS OWN argv, so a pytest run turned pytest's arguments into a usage error.
+    argv = list(argv or [])
+    as_json = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--json":
+            as_json = True
+        elif a == "--repo":
+            if i + 1 >= len(argv) or "/" not in argv[i + 1]:
+                sys.stderr.write("beta-progress: --repo needs owner/name\n")
+                return 2
+            REPO = argv[i + 1]
+            globals()["FIX_REPOS"] = _derive_fix_repos(REPO)   # see the note beside FIX_REPOS
+            i += 1
+        elif a in ("-h", "--help"):
+            print(__doc__)
+            return 0
+        else:
+            sys.stderr.write("beta-progress: unknown argument %r\n" % a)
+            return 2
+        i += 1
     data = None
+    _cache_path_now = _cache_path()
     try:
-        with open(CACHE) as fh:
+        with open(_cache_path_now) as fh:
             cached = json.load(fh)
         # ⛔ A CACHE THIS VERSION CANNOT RENDER IS NOT A CACHE. The cache-hit path is the one
         # taken on ~15 beats out of 16 (TTL 1800 s, heartbeat every ~2 min), and it is ABOVE the
@@ -977,7 +1066,16 @@ def main():
                           for tier in ("p0", "p1"))):
             cached = None
         if cached is not None and time.time() - cached.get("ts", 0) < TTL:
-            data = cached
+            # ⛔ A CACHE THAT NAMES A DIFFERENT REPO IS NEVER THIS REPO'S ANSWER. And an UNLABELLED
+            # cache is only this repo's when it is the BASE file (`REPO == DEFAULT_REPO`), which is
+            # the one path the label-less writer ever used — so that inference is provable, not
+            # hopeful. Any other repo reads its own repo-keyed file (`_cache_path()`), so it can
+            # never inherit the beat's figures.
+            _cr = cached.get("repo")
+            if (_cr is not None and _cr != REPO) or (_cr is None and REPO != DEFAULT_REPO):
+                cached = None
+            else:
+                data = cached
     except Exception as exc:
         # ⛔ NOT SILENT (#2142 review). The beat discards stderr, so this costs nothing where it
         # matters and is the ONLY reason an operator hand-running the script gets -- a genuine
@@ -1009,10 +1107,17 @@ def main():
             sys.stderr.write("beta-progress: compute failed:\n%s" % traceback.format_exc())
             data = None
         if data is None:
+            if as_json:
+                print(json.dumps({"repo": REPO, "readable": False, "measured_at": int(time.time()),
+                                  "unmeasured": "UNMEASURED(gh issue/pr list --repo %s + metrics "
+                                                "read failed: no P0/P1 figure is known, and unknown "
+                                                "is not zero)" % REPO},
+                                 indent=2, sort_keys=True))
+                return 0
             print("DELIVERY: unavailable (metrics read failed)")
             return 0
         try:
-            with open(CACHE, "w") as fh:
+            with open(_cache_path_now, "w") as fh:
                 json.dump(data, fh)
         except Exception:
             pass
@@ -1037,11 +1142,26 @@ def main():
                    p1["open"], p1["with_pr"], p1["without"],
                    data["open_prs"], data["merged_today"]))
     except Exception:
+        if as_json:
+            print(json.dumps({"repo": REPO, "readable": False, "measured_at": int(time.time()),
+                              "unmeasured": "UNMEASURED(render of the cached payload + unrenderable "
+                                            "shape: no figure is reported rather than a guess)"},
+                             indent=2, sort_keys=True))
+            return 0
         print("DELIVERY: unavailable (metrics read failed)")
+        return 0
+    if as_json:
+        payload = dict(data)
+        payload["repo"] = REPO
+        payload["readable"] = True
+        payload["measured_at"] = int(ts) if ts else None
+        payload["age_m"] = age_m
+        payload["stamp"] = stamp
+        print(json.dumps(payload, indent=2, sort_keys=True))
         return 0
     print(line)
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(main(sys.argv[1:]))

@@ -74,7 +74,7 @@ command_not_found_handle() {
 [ -x "$CHECK" ] || { echo "  ❌ the checker is not executable: $CHECK"; echo "PASS=0 FAIL=1"; exit 1; }
 
 FILES="disk-reaper.sh disk-reaper-run.sh pi-cache-reap.sh reap-lane-venvs.sh pi-reap-worktrees.sh
-reap-abandoned-worktrees.sh reap-duplicate-installs.sh lib/bounded.sh lib/live-paths.sh"
+reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh lib/bounded.sh lib/live-paths.sh"
 
 # ⛔ ONE EXIT TRAP CLEANS EVERYTHING THIS SUITE CREATES (review of #3422, P3). It leaked two ways: the
 # undefined-command record (a trap was removed here without a replacement) and every per-fixture temp
@@ -106,12 +106,18 @@ mk_env
 OUT="$(run --stamp --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
 eq "$RC" "0" "D1 --stamp exits 0"
 has "$OUT" "STAMPED" "D1 --stamp says what it did"
+# ⛔ THE COUNT IS DERIVED FROM `FILES`, NOT SPELLED. A literal 9 here is a second copy of the pinned set,
+# so adding a file to the checker reddens D1 for a reason that has nothing to do with the checker's
+# behaviour (measured: adding the delete-policy owner produced two reds whose message was "missing:
+# SUMMARY deployed ok (9 files)"). The assertion this case is FOR is "the summary counts EVERY pinned
+# file", which a derived count asserts and a literal cannot.
+NFILES="$(printf '%s\n' $FILES | wc -l | tr -d ' ')"
 OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
 eq "$RC" "0" "D1 a fresh stamp VERIFIES (control: the cases below are not red by default)"
-has "$OUT" "SUMMARY deployed ok (9 files" "D1 the summary counts every pinned file"
+has "$OUT" "SUMMARY deployed ok ($NFILES files" "D1 the summary counts every pinned file ($NFILES)"
 OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
 eq "$RC" "0" "D1 …and it verifies against the checkout it was stamped from"
-has "$OUT" "SUMMARY deployed ok (9 files; matches $T/src)" "D1 the source is named in the summary"
+has "$OUT" "SUMMARY deployed ok ($NFILES files; matches $T/src)" "D1 the source is named in the summary"
 
 # ── D2: ONE BYTE changed in one delegate => DRIFT, named ─────────────────────────
 printf '#!/bin/bash\n# pi-reap-worktrees.sh v2\n' >"$T/deployed/pi-reap-worktrees.sh"
@@ -161,6 +167,25 @@ rm -f "$T/src/scripts/reap-duplicate-installs.sh"
 OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
 eq "$RC" "1" "D6 a checkout that does not carry the file is drift, never a silent pass"
 has "$OUT" "reap-duplicate-installs.sh — $T/src/scripts does not have it" "D6 …and it says the checkout cannot explain it"
+
+# ── D13: reap-runner-work.sh is IN the pinned set (review at #3057's head, P1) ──────────
+# ⛔ THIS CASE IS ABOUT THE `rm -rf` OWNER BEING UNHASHABLE, and it is written so that REMOVING the name
+# from `FILES` reddens it — a case that only asserted "the file is in FILES" would pass for a checker
+# whose record silently skipped it. Both units pin `RUNNER_WORK_REAPER=…/reap-runner-work.sh`, and this
+# file holds the delete policy for the runners' `_work` sink; `grep -c reap-runner-work` in the checker
+# was 0 at that head, so a cell still carrying an EARLIER farmed copy (one revision of which deleted a
+# LIVE job's `_work/_temp`) was a live delete-policy no instrument reported — the check exited 0 with
+# `same …` for every file it knew. Deleting it from the deployed dir must therefore be DRIFT, named.
+mk_env
+run --stamp --dir "$T/deployed" --record "$REC" --source "$T/src" >/dev/null 2>&1
+OUT="$(run --dir "$T/deployed" --record "$REC" --source "$T/src")"; RC=$?
+eq "$RC" "0" "D13 control: a complete stamp over the set including reap-runner-work.sh verifies"
+has "$(cat "$REC")" "  reap-runner-work.sh" "D13 the record CARRIES reap-runner-work.sh — it is inside the check, not beside it"
+mv "$T/deployed/reap-runner-work.sh" "$T/deployed/.gone"
+OUT="$(run --dir "$T/deployed" --record "$REC")"; RC=$?
+eq "$RC" "1" "D13 the delete-policy owner MISSING from the deployed set is drift (exit 1), never ok"
+has "$OUT" "reap-runner-work.sh — MISSING" "D13 …and it is NAMED, so the unhashable file cannot be the quiet one"
+mv "$T/deployed/.gone" "$T/deployed/reap-runner-work.sh"
 
 # ── D7/D8: an unproven deployment is exit 3, never 0 ────────────────────────────
 mk_env

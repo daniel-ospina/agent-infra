@@ -31,7 +31,9 @@
 #
 # ROLES (each idempotent; each writes its own last-pass record under `$O/state/roles/`)
 #   reap      one wedged-session pass (the safety core; see REAP below)
-#   doctor    reap + controller supervision (restart the dispatcher when its session is gone)
+#   doctor    reap + REPO IDENTITY (does any checkout on this box lie about which repo it is? #3521 —
+#             the same verdict the bring-up refuses on, so a box that drifts afterwards is not silent)
+#             + controller supervision (restart the dispatcher when its session is gone)
 #   merge     land PRs that have a clean attestation at head, through the standard rail
 #   hygiene   package cache + worktree-root caches + stale worktrees + the cross-box review-record
 #             registry (`registry-sync.sh union`, hourly, best-effort — a failed sync LOGS and the pass
@@ -80,6 +82,58 @@ fi
 # No startup warning here on purpose: `log()` is defined further down, and a message emitted before
 # it exists would be a bare "command not found" on the operator's terminal. The degraded state is
 # named at the REFUSAL instead (see the merge role), which is the moment it costs something.
+
+# ── the SHARED slug parser + repo-identity walker (agent-infra#3521) ────────────────────────────
+# A cell can carry MORE THAN ONE checkout of a repo, and a checkout whose DIRECTORY NAME names a
+# different repo than its `origin` (measured 2026-11-05: `/home/cmux/agent-infra` was a tortoise
+# checkout, and every lane told to `cd` there worked the wrong repository silently). The bring-up
+# refuses that at provisioning time; this is the SAME verdict in the self-healing path, so a box that
+# drifts after bring-up does not go unnoticed until the next re-provision.
+#
+# ⛔ THE IMPLEMENTATION IS SHARED, NOT COPIED. `repo-slug.sh` (the one place that turns a checkout into
+# `owner/name`) carries both the parser and the walker, and it is already seeded into `$O` — so the
+# doctor and the bring-up cannot form a second opinion about one box. Resolved from `$O` first (the
+# tree this cell actually EXECUTES), then beside this file (a harness checkout running the doctor by
+# hand). Absent from both = CANNOT-VERIFY, never silence (see `repo_identity_report`).
+# ⛔ `check-deployed-drift.sh --surface` is NOT used here: it enumerates HARNESS dirs and compares their
+# `*.sh` bytes against a git ref (it needs a resolvable `$REF` and a `--repo`), and it is silent about a
+# checkout whose NAME lies. Two walkers for two questions; ONE parser, which is what both share.
+REPO_SLUG_LIB=""
+REPO_SLUG_LIB_STALE=""
+# `DOCTOR_REPO_SLUG_LIB` is the resolver SEAM (one per external dependency, like DOCTOR_PS_BIN): it
+# REPLACES the candidate list, so a suite can drive the cannot-verify path without depending on
+# whether the checkout running it happens to carry a current copy. Production leaves it unset.
+if [ -n "${DOCTOR_REPO_SLUG_LIB:-}" ]; then
+  _rsl_list="$DOCTOR_REPO_SLUG_LIB"
+else
+  _rsl_list="${O%/}/repo-slug.sh $SELF_DIR/repo-slug.sh"
+fi
+for _rsl in $_rsl_list; do
+  [ -n "$_rsl" ] && [ -f "$_rsl" ] || continue
+  # shellcheck source=/dev/null
+  . "$_rsl"
+  # ⛔ `$O` IS THE HARNESS THE LAST RELEASE DEPLOYED, so on a cell that has not applied the current
+  # one, sourcing succeeds and `repo_identity_scan` simply does not exist — every doctor pass would then
+  # record rc=3 "the identity walker returned rc=127" forever (a cannot-verify that never clears, on
+  # every cell, which is how a real alarm gets muted). A candidate without the walker is therefore not
+  # used: keep looking, and if none has it, say UNVERIFIED and NAME the stale copy.
+  if command -v repo_identity_scan >/dev/null 2>&1; then REPO_SLUG_LIB="$_rsl"; break; fi
+  [ -n "$REPO_SLUG_LIB_STALE" ] || REPO_SLUG_LIB_STALE="$_rsl"
+done
+# The roots the walker scans: the cell's one home, the bring-up checkout, and the legacy
+# `/tmp/cell-home` a re-install or a reboot leaves behind. Overridable so a suite never grades the
+# machine that runs it (the same seam as SYSTEMD_UNIT_DIR / SWAP_PROC / DOCTOR_PS_BIN).
+# ⛔ AND THE ACCOUNT'S OWN HOME, when it is not the cell home (review finding, P2). The doctor runs with
+# `HOME=$CELL_HOME`, so `${HOME}` alone would stop at the cell home — but a cell can carry a second real
+# home one level up (`docs/ops/disk-consumers.md` records `/home/cmux` on cells 3 and 4 holding tortoise
+# checkouts with worktrees), and the measured incident's directory was `/home/cmux/agent-infra`. The
+# passwd record is the honest source; where `getent` does not exist (macOS) the list is unchanged, which
+# is the same coverage as before rather than a claim of more.
+_os_home=""
+if command -v getent >/dev/null 2>&1; then
+  _os_home="$(getent passwd "$(id -un 2>/dev/null)" 2>/dev/null | cut -d: -f6)"
+fi
+DOCTOR_REPO_IDENTITY_ROOTS="${DOCTOR_REPO_IDENTITY_ROOTS:-${CELL_HOME:-${HOME:-}} ${_os_home:-} /tmp/cell-ai /tmp/cell-home}"
 
 # The PROCESS reaper (#2163), resolved ONCE. It is the lane-reap.sh shipped beside this file (or
 # seeded into $O, which is what a running cell executes). It is deliberately NOT a second
@@ -2473,6 +2527,68 @@ service_controller_present() {
   return 0
 }
 
+# ── REPO IDENTITY: does any directory on this box lie about which repo it is? (agent-infra#3521) ─
+# The bring-up REFUSES a mislabelled checkout; this reports the same verdict on a running cell, so a
+# box that drifts after provisioning is not silent. READ-ONLY: it names, and changes nothing — moving a
+# checkout is a human decision (the measured tree held three worktrees whose commits existed nowhere
+# else, plus an unmerged branch).
+#
+# rc: 0 = nothing fatal (a `warn` verdict does NOT change the pass — a declared exception, a quarantine
+# or several legitimate trees would otherwise redden a healthy cell), 1 = a directory's NAME claims one
+# repo while its origin IS another (the measured defect; the pass must not read clean), 3 = the identity
+# could not be VERIFIED for at least one line: the shared parser is not on this box, a checkout's origin
+# is unreadable or is not a slug, a generic cell-checkout name with no declared repo, an empty
+# population, or a verdict this build cannot classify (cannot-verify is never a pass).
+# ⛔ A LINKED WORKTREE IS NOT ONE OF THOSE (it answers `ok`): its name is a BRANCH, so there is nothing
+# the check failed to measure, and treating it as unverified put every busy cell — where the fleet's own
+# launcher leaves 8 `wt-*` trees — into a permanent cannot-verify that could never clear.
+#
+# The verdicts come from `repo_identity_scan`, the SAME function the bring-up calls, so the two paths
+# cannot disagree about one box.
+repo_identity_report() {
+  local out v m rc=0 seen_fatal=0 seen_unverified=0
+  if [ -z "$REPO_SLUG_LIB" ]; then
+    if [ -n "$REPO_SLUG_LIB_STALE" ]; then
+      log "[identity] CANNOT-VERIFY: the only repo-slug.sh on this box ($REPO_SLUG_LIB_STALE) predates this check (no repo_identity_scan in it) — it is the harness the LAST release deployed, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#3521)"
+    else
+      log "[identity] CANNOT-VERIFY: repo-slug.sh is not at ${O%/}/ nor beside the doctor, so no checkout's name could be checked against its origin (an unanswered identity is not a pass; agent-infra#3521)"
+    fi
+    return 3
+  fi
+  # shellcheck disable=SC2086  # the roots are a declared, space-separated list
+  out="$(repo_identity_scan $DOCTOR_REPO_IDENTITY_ROOTS)" || rc=$?
+  while IFS="$(printf '\t')" read -r v m; do
+    [ -n "$v" ] || continue
+    case "$v" in
+      fatal) seen_fatal=1; log "[identity] ⛔ FATAL: $m" ;;
+      # ⛔ AN UNANSWERED IDENTITY IS NOT A CLEAN PASS (review finding, P2). These used to arrive as `warn`
+      # and fold to rc=0, so `status` printed a green pass over a box where "does any checkout lie about
+      # its repo" was explicitly NOT answered — while the bring-up called the same box PARTIALLY verified.
+      # The walker's verdict now says so, and this role answers cannot-verify (3), the same way it does
+      # for every other dependency it could not measure.
+      unverified) seen_unverified=1; log "[identity] warn: $m" ;;
+      warn)  log "[identity] warn: $m" ;;
+      ok)    log "[identity] ok: $m" ;;
+      # ⛔ AN UNRECOGNISED VERDICT IS CANNOT-VERIFY, NEVER SILENT (review finding, P2). This role prefers
+      # `$O/repo-slug.sh` — the DEPLOYED copy, which can be NEWER than this doctor — so a fifth verdict is
+      # a live compatibility case, not a hypothetical one. Dropping it would leave `seen_*` at 0 and the
+      # pass green over a line nothing classified.
+      *)     seen_unverified=1; log "[identity] warn: UNRECOGNISED VERDICT '$v' from the identity walker — this doctor cannot classify it, so the identity is not verified (agent-infra#3521): $m" ;;
+    esac
+  done <<< "$out"
+  # FAIL-CLOSED on a non-zero rc with no readable `fatal` line: an unreadable verdict is not a pass.
+  if [ "$rc" -ne 0 ] && [ "$seen_fatal" -eq 0 ]; then
+    log "[identity] CANNOT-VERIFY: the identity walker returned rc=$rc without naming a directory — whether any checkout on this box lies about its repo is unknown (agent-infra#3521)"
+    return 3
+  fi
+  [ "$seen_fatal" -eq 0 ] || return 1
+  if [ "$seen_unverified" -eq 1 ]; then
+    log "[identity] CANNOT-VERIFY: at least one checkout on this box could not have its name checked against its origin (see the lines above) — an unanswered identity is never a pass (agent-infra#3521)"
+    return 3
+  fi
+  return 0
+}
+
 run_doctor() {
   begin_pass
   # ${1:-}: NO mode means a LIVE pass (an empty string never equals `--dry-run`). An ABSENT or
@@ -2485,15 +2601,37 @@ run_doctor() {
   # and could both decide the same session is wedged (two kills, one corpse — the double-act the
   # lock exists to prevent). A lock held elsewhere makes this a logged SKIP, and the reap state is
   # then the sibling pass's record, which is the truth either way.
-  local rrc=0 src_rc=0
+  local rrc=0 src_rc=0 irc=0
   run_role_pass reap "$dry" >/dev/null || rrc=$?
   # ⛔ A POLICY VERDICT FROM THE NESTED REAP IS NOT A FAILURE OF THIS PASS (#2163 review r8, P1).
   # `rrc=4` says the reaper judged nothing because its ancestry policy refuses every lane on this
   # surface (§11.4) — that fact is recorded in the REAP row, and this pass's own work (supervision)
   # is unaffected. Carrying 4 into the doctor's record would make the row read `INERT` for a doctor
   # that restarted the controller correctly. It collapses to 0 HERE, not into a failure.
+  # ⛔ AND IT COLLAPSES BEFORE THE IDENTITY VERDICT IS FOLDED IN (review finding, this change). 4 is the
+  # POLICY-INERT STEADY STATE of a Linux cell, so folding first meant `[ "$irc" -eq 3 ] && [ "$rrc" -eq 0 ]`
+  # never fired, the 4 was then collapsed to 0, and a repo identity that could NOT be verified recorded
+  # `last_rc=0` with a `last_result` saying "repo identity cannot-verify" — the fail-open pair the
+  # file's own doctrine forbids, on every cell whose `$O` lags. `src_rc` is folded after this line for
+  # exactly the same reason.
   [ "$rrc" -eq 4 ] && rrc=0
-  result="reap: $(state_get reap last_result | cut -c1-160)"
+  # ── THE BOX'S REPO IDENTITY, MEASURED BEFORE ANYTHING ELSE ────────────────────────────────────
+  # Not behind the "is the cell started" guard below: a directory that lies about which repo it is is a
+  # property of the BOX, and this pass must not go quiet about it on a cell somebody stopped (that is
+  # exactly when a human is deciding what to repair). Read-only.
+  repo_identity_report || irc=$?
+  # Folded in HERE, so every exit below carries it — including the `not started` return.
+  if [ "$irc" -eq 1 ]; then
+    rrc=1
+  elif [ "$irc" -eq 3 ] && [ "$rrc" -eq 0 ]; then
+    rrc=3
+  fi
+  case "$irc" in
+    1) result="repo identity FATAL";;
+    3) result="repo identity cannot-verify";;
+    *) result="";;
+  esac
+  result="${result}${result:+; }reap: $(state_get reap last_result | cut -c1-160)"
   if [ ! -f "$DESIRED" ]; then
     log "[doctor] cell is not started (no $DESIRED) — supervising nothing; reap still ran"
     # The nested reap's rc travels with the record: "not started" is not a licence to pair rc=0 with
@@ -2514,9 +2652,16 @@ run_doctor() {
   if [ "$csp" -eq 3 ]; then
     log "[doctor] CANNOT-VERIFY: the controller session '$SESSION' could not be read — NOT restarting (a restart decided from a failed read answers a question nobody asked); the reap above and the independent merge role continue"
     result="$result; controller cannot-verify (the tmux read failed)"
-    state_write doctor 3 "$result"
+    # ⛔ A KNOWN FAILURE OUTRANKS A READ WE COULD NOT TAKE (review finding, this change). `3` was
+    # HARDCODED here, so a pass that had already established a real failure — a repo-identity FATAL
+    # (a directory lying about which repo it is), or a nested reap that recorded cannot-verify — had
+    # that verdict overwritten by the softer "I could not read tmux" and the record said 3. The
+    # dominant-failure rule this file states for `src_rc` applies to every half of the pass.
+    local krc=3
+    [ "$rrc" -eq 1 ] && krc=1
+    state_write doctor "$krc" "$result"
     log "[doctor] $result"
-    return 3
+    return "$krc"
   fi
   if [ "$csp" -eq 0 ]; then
     controller_heartbeat_verdict "tmux '$SESSION'"

@@ -38,7 +38,8 @@
 #       `$4: unbound variable` (a release that errors leaves the claim held to the lease), and
 #       `claim_issue_release` with two arguments raised `$3:`; both must reach the documented
 #       refusal instead. This is the incidental defect the #1850 verification found.
-#   I6  claim_issue_status reports the lease; an UNREADABLE lease reads as LIVE; a claim ref whose
+#   I6  claim_issue_status reports the lease; an UNREADABLE lease is an ABSTENTION (never reported
+#       CLEAN, never reported as live, never stolen — #3203); a claim ref whose
 #       lease cannot be read is never stolen and never reported CLEAN by the pre-flight
 #   I7  an abandoned claim DECAYS — claim_prune reaps the expired issue ref (the release path for a
 #       box that died mid-lane)
@@ -85,7 +86,7 @@ rm -rf "$A" "$B" "$SNAP" 2>/dev/null
 mkdir -p "$A" "$B"
 git -C "$A" init -q && git -C "$A" remote add origin "$ORIGIN_URL"
 git -C "$B" init -q && git -C "$B" remote add origin "$ORIGIN_URL"
-cleanup_boxes() { rm -rf "$A" "$B" "$SNAP" "${CWD_TMP:-}" 2>/dev/null; }
+cleanup_boxes() { rm -rf "$A" "$B" "$SNAP" "${CWD_TMP:-}" "${P4ORIG:-}" "${P4BOX:-}" 2>/dev/null; }
 # ⛔ Remote refs are NOT inside the temp dirs. This suite writes claim refs to LIVE origin on purpose
 # (a CAS needs a genuinely shared ref), and a Ctrl-C/kill/abort used to leave them orphaned there —
 # the EXIT trap cleaned local dirs only. Delete the remote refs best-effort (fenced), and cover INT
@@ -690,9 +691,10 @@ done
 
 echo
 echo "=== P2d. an OVERFLOWING ttl is CLAMPED at the arithmetic site, not written as a lease ==="
-# `until=$(( now + ttl ))` wraps NEGATIVE at or above 2**63; `_lease_of`'s `[0-9]*` cannot parse the
-# minus sign, an unparseable lease is read as LIVE forever, and `claim_prune` can never reap it — so
-# the head is frozen across ALL boxes with no automatic recovery. The shipped callers now validate
+# `until=$(( now + ttl ))` wraps NEGATIVE at or above 2**63; `_lease_of`'s anchored ASCII-digit match cannot parse the
+# minus sign, an unparseable lease can no longer be reaped on its own term, so the head would be
+# frozen across ALL boxes (before #3203, with no automatic recovery at all) — and even now it would
+# wait out CLAIM_UNREADABLE_LEASE_MAX_AGE. The shipped callers now validate
 # their tunables with `is_limit`, and the PRIMITIVE clamps too (defence in depth: no caller can mint
 # a lease this module is unable to read back). Pre-fix the acquire echoes a negative lease_until.
 huge_lease() { # <box-dir>
@@ -711,14 +713,14 @@ case "$hlv" in
   *) if [ "${#hlv}" -le 10 ] && [ "$hlv" -gt 0 ]; then hlb=1; else hlb=0; fi ;;
 esac
 if [ "$hlb" = "1" ]; then echo "  ✅ the overflowing ttl was clamped — the lease parses ($hlv)"; PASS=$((PASS+1));
-else echo "  ❌ lease_until='$hlv' is absent/negative/oversized — unparseable, so read as LIVE forever"; FAIL=$((FAIL+1)); fi
+else echo "  ❌ lease_until='$hlv' is absent/negative/oversized — unparseable, so read as never-expired and never reapable before #3203"; FAIL=$((FAIL+1)); fi
 cleanup_ref
 
 echo
-echo "=== P3e. a FOREIGN oversized (>=2**63) lease is treated as LIVE, not STOLEN ==="
+echo "=== P3e. a FOREIGN oversized (>=2**63) lease is an ABSTENTION, not STOLEN ==="
 # `[ "$now" -le "$held_until" ]` ERRORS (rc=2, and an errored test is FALSE) at or above 2**63, so
-# control fell through to the RECLAIM CAS and STOLE a claim this code means to treat as live; the
-# "unparseable = live" branch covered an ABSENT lease but not an oversized-but-numeric one. The seed
+# control fell through to the RECLAIM CAS and STOLE a claim this code means to treat as NOT EXPIRED; the
+# "unparseable = never expired" branch covered an ABSENT lease but not an oversized-but-numeric one. The seed
 # is a real claim commit with lease_until = 9223372036854775808 (exactly 2**63 — the smallest value
 # at which `[` errors; 2**63-1 is still an in-range integer). Not reachable from the shipped writers
 # (they clamp), so this is defence in depth against a foreign or older writer. RED pre-fix: the
@@ -733,7 +735,7 @@ cleanup_ref
 EH="$(seed_huge)"; echo "  seeded an oversized-lease claim: $EH"
 outH=$(runA claim_acquire "$A" $PR "$SHA"); rcH=$?
 echo "  rc=$rcH :: $outH"
-ck "an oversized (>=2**63) lease reads as UNPARSEABLE => LIVE (rc=1)" "^1$" "$rcH"
+ck "an oversized (>=2**63) lease reads as UNPARSEABLE => ABSTENTION (rc=1, never stolen)" "^1$" "$rcH"
 ck "the refusal says it cannot parse the lease" "no parseable lease" "$outH"
 stillH="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
 if [ -n "$EH" ] && [ "$stillH" = "$EH" ]; then
@@ -742,9 +744,9 @@ else echo "  ❌ the claim was STOLEN or the seed failed ($stillH vs seed '$EH')
 cleanup_ref
 
 echo
-echo "=== P3f. a foreign UNREADABLE lease (0, and the -5 that collapses to it) is LIVE, not STOLEN ==="
+echo "=== P3f. a foreign UNREADABLE lease (0, and the -5 that collapses to it) ABSTAINS, not STOLEN ==="
 # claim_acquire's unparseable branch is `[ -z "$held_until" ] || [ "$held_until" = "0" ]`: a claim
-# whose commit message carries `lease_until=0` (or a negative, which _lease_of's `[0-9]*` cannot match
+# whose commit message carries `lease_until=0` (or a negative, which _lease_of's anchored ASCII-digit match cannot match
 # and therefore collapses to `0`) means "a claim EXISTS whose lease is unreadable". Reading it as dead
 # would let a box STEAL it. This is the datum claim_live() must AGREE with (selftest §14's `0` case),
 # and the class the fifth review round closed on the reader side. RED pre-fix is on the READER; this
@@ -760,7 +762,7 @@ for L in 0 -5; do
   EL="$(seed_lease "$L")"; echo "  seeded lease_until=$L: $EL"
   outL=$(runA claim_acquire "$A" $PR "$SHA"); rcL=$?
   echo "  rc=$rcL :: $outL"
-  ck "lease_until=$L reads as UNPARSEABLE => LIVE (rc=1)" "^1$" "$rcL"
+  ck "lease_until=$L reads as UNPARSEABLE => ABSTENTION (rc=1, never stolen)" "^1$" "$rcL"
   ck "the refusal for lease_until=$L says it cannot parse the lease" "no parseable lease" "$outL"
   stillL="$(git -C "$A" ls-remote origin "$REF" | awk '{print $1}')"
   if [ -n "$EL" ] && [ "$stillL" = "$EL" ]; then
@@ -768,6 +770,492 @@ for L in 0 -5; do
   else echo "  ❌ the lease_until=$L claim was STOLEN or the seed failed ($stillL vs seed '$EL')"; FAIL=$((FAIL+1)); fi
 done
 cleanup_ref
+
+echo
+echo "=== P4. an UNPARSEABLE lease is an ABSTENTION with a BOUNDED expiry, never a live claim (#3203) ==="
+# ⛔ THE DEFECT THIS PINS, MEASURED (agent-infra#3203): a claim whose lease no reader can parse was
+# unreclaimable AND unprunable — `_lease_unparseable` -> `_lease_is_live` answered LIVE (rc 1),
+# `_claim_acquire_at` returned before its orphan arm, and `claim_prune` skipped the ref on BOTH arms
+# (expiry said "live", and the orphan arm had an explicit `_lease_unparseable` continue). The only
+# cure was a human `git push origin :refs/claims/<key>`: the #8175 shape, and a batch that folds N
+# PRs inherits it N times. The fix must hold in BOTH directions at once, so this section asserts both
+# and a mutant for each is quoted in the PR:
+#   (i)  it must NOT hold forever -> `claim_prune` reaps it once the claim's own COMMIT is older than
+#        CLAIM_UNREADABLE_LEASE_MAX_AGE (18000s = CLAIM_ISSUE_TTL, the longest shipped lease);
+#   (ii) it must NOT silently grant the claim -> every READER still refuses while the ref exists —
+#        never CLEAN, never `claim-held`, never rc 0 — and STILL refuses past that bound, because
+#        the bound is the REAPER's schedule, not a reader's licence. The state change is a DELETION
+#        that names the fault, never the passage of time.
+P4NOW="$(date +%s)"
+# ⛔ FULLY HERMETIC (a bare origin created for this section), and NOT the live registry. Two reasons,
+# both measured: (1) this section DELETES refs, and a mistake here must never reap a claim on the
+# shared origin; (2) the live-origin arms of this suite are the historical source of its flakiness
+# (a transient `ls-remote` reads as "absent"), and an assertion whose fixture depends on the network
+# cannot discriminate a mutant from a hiccup. The issue's own measurement used a fresh
+# `git init --bare` origin for the same reason.
+P4ORIG="/tmp/xb-claims-3203-orig.$$"; P4BOX="/tmp/xb-claims-3203-box.$$"
+rm -rf "$P4ORIG" "$P4BOX"
+git init -q --bare "$P4ORIG"; git init -q "$P4BOX"; git -C "$P4BOX" remote add origin "$P4ORIG"
+p4_run() { ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" && "$@" ); }
+p4_seed() { # <ref-name> <owner> <lease> <age-seconds-ago> -> prints the commit it pushed
+  local c
+  c="$( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" && GIT_COMMITTER_DATE="@$(( P4NOW - $4 )) +0000" _claim_commit "$2" "$3" )"
+  ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" && _git push -q origin "$c:refs/claims/$1" ) || return 1
+  printf '%s' "$c"
+}
+p4_has() { [ -n "$(git -C "$P4BOX" ls-remote origin "refs/claims/$1" 2>/dev/null)" ]; }
+p4_prune() { ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" && claim_prune ) 2>&1; }
+p4_verdict() { # <ref-name> -> "RC=<n> WORD=<word>" from a FRESH snapshot of the hermetic origin
+  # ⛔ `;` AFTER THE SNAPSHOT, NOT `&&`: the verdict legitimately returns 1 for the abstention this
+  # section is asserting, and an `&&` chain would swallow the very output the assertion reads (that
+  # is how the first draft of A10 reported an empty string instead of a red verdict).
+  ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+    && claim_snapshot "$P4BOX/snap3203" >/dev/null 2>&1; \
+    claim_snapshot_verdict "$P4BOX/snap3203" "refs/claims/$1" >/dev/null 2>&1
+    printf 'RC=%s\nWORD=%s' "$?" "${CLAIM_VERDICT:-}" ) 2>/dev/null
+}
+# ── (ii) THE READERS. `pr-3203` is ALSO older than the reap bound, so A4 is the "never granted by
+# age" assertion: a "fix" that let a reader expire an unparseable lease by its commit age reddens it.
+P4C="$(p4_seed pr-3203 weird3203 HAVOC 40000)"; echo "  seeded an unparseable-lease claim (lease_until=HAVOC, commit 40000s old): $P4C"
+outP4=$(p4_run claim_pr_acquire "" 3203); rcP4=$?
+echo "  acquire rc=$rcP4 :: $outP4"
+ck "A1 [RED→GREEN] an unparseable lease is NOT stolen (rc=1)" "^1$" "$rcP4"
+ck "A2 [RED→GREEN] ...and the refusal names the ABSTENTION token, not a live holder" "held-by-unreadable-lease" "$outP4"
+case "$outP4" in *held-by-live*) P4HL=0 ;; *) P4HL=1 ;; esac
+ck "A3 [RED→GREEN] ...and does NOT claim the lease is live (no held-by-live token)" "^1$" "$P4HL"
+P4TIP="$(git -C "$P4BOX" ls-remote origin refs/claims/pr-3203 | awk '{print $1}')"
+# BOTH halves: the ref is untouched AND the refusal never became an acquisition. `rcP4` is part of the
+# assertion because "nothing was stolen" is exactly the pair (the tip did not move, and the caller was
+# told no) — a mutant that only flips the return code moves no ref and would otherwise pass here.
+[ -n "$P4C" ] && [ "$P4TIP" = "$P4C" ] && [ "$rcP4" = "1" ] && P4KEEP=0 || P4KEEP=1
+ck "A4 [RED→GREEN] PAST the reap bound the ref is untouched AND still refuses (the bound is the reaper's schedule, never a reader's licence)" "^0$" "$P4KEEP"
+# The SNAPSHOT verdict word: the reader the controller's sweep and its spawn guard share. Before the
+# fix it published `claim-held` — "a live, non-orphaned window" — for a window nobody could read.
+P4SNAP="$A/state-snap3203"
+printf '#claim-snapshot\t%s\tok\t1\nrefs/claims/3203-ffffffffffff\tweird3203:9\tHAVOC\n' "$P4NOW" > "$P4SNAP"
+P4V="$( cd "$A" && . "$CLAIMS_SH" && claim_snapshot_verdict "$P4SNAP" refs/claims/3203-ffffffffffff >/dev/null 2>&1
+       printf 'RC=%s\nWORD=%s\nWHY=%s' "$?" "${CLAIM_VERDICT:-}" "${CLAIM_VERDICT_WHY:-}" )"
+echo "  snapshot verdict: $(printf '%s' "$P4V" | tr '\n' ' ')"
+ck "A5 [RED→GREEN] the snapshot verdict is the ABSTENTION word claim-lease-unreadable" "^claim-lease-unreadable$" "$(printf '%s\n' "$P4V" | sed -n 's/^WORD=//p')"
+case "$P4V" in *"WORD=claim-held"*) P4W=0 ;; *) P4W=1 ;; esac
+ck "A6 [RED→GREEN] ...and is NOT published as claim-held (a live, non-orphaned window)" "^1$" "$P4W"
+ck "A7 [RED→GREEN] ...it still BLOCKS (rc=1): an abstention is never freedom" "^1$" "$(printf '%s\n' "$P4V" | sed -n 's/^RC=//p')"
+ck "A8 [RED→GREEN] ...and its reason names the bounded reap that will end the block" "claim_prune reaps it" "$(printf '%s' "$P4V" | sed -n 's/^WHY=//p')"
+# ── (i) THE BOUNDED EXPIRY, on the same hermetic origin ────────────────────────────────────────
+p4_seed p4-young   weird3203 HAVOC 0      >/dev/null
+p4_seed p4-future  weird3203 HAVOC -40000 >/dev/null
+p4_seed p4-expired oldbox    1000000000 0 >/dev/null
+p4_has pr-3203 && p4_has p4-young && p4_has p4-future && p4_has p4-expired; P4SETUP=$?
+ck "A9 (setup) an aged (pr-3203), a young, a future-dated and an EXPIRED claim are all planted on the hermetic origin" "^0$" "$P4SETUP"
+P4PRE="$(p4_verdict pr-3203)"
+echo "  pre-prune read of the AGED key: $(printf '%s' "$P4PRE" | tr '\n' ' ')"
+ck "A10 [RED→GREEN] before the reap the aged key still ABSTAINS (rc=1, never claim-held)" "^RC=1 WORD=claim-lease-unreadable$" "$(printf '%s' "$P4PRE" | tr '\n' ' ')"
+P4OUT="$(p4_prune)"
+echo "  prune output:"; printf '%s\n' "$P4OUT" | sed 's/^/    /'
+ck "A11 [RED→GREEN] claim_prune REAPS the unparseable-lease claim once its commit is past the bound" "pruned unreadable-lease refs/claims/pr-3203" "$P4OUT"
+p4_has pr-3203 && P4GONE=1 || P4GONE=0
+ck "A12 [RED→GREEN] ...and the ref is really GONE from the origin (the eternal block ended)" "^0$" "$P4GONE"
+p4_has p4-young && P4YOUNG=0 || P4YOUNG=1
+ck "A13 [RED→GREEN] a YOUNG unparseable claim is NOT reaped (the bound gates the arm; it is not reap-everything)" "^0$" "$P4YOUNG"
+ck "A14 [RED→GREEN] ...and the pass NAMES it as kept, with its age (an abstention reaches the operator)" "kept unreadable-lease refs/claims/p4-young" "$P4OUT"
+p4_has p4-future && P4FUT=0 || P4FUT=1
+ck "A15 [RED→GREEN] a FUTURE-dated claim commit KEEPS its claim: an unmeasurable age is not evidence of expiry" "^0$" "$P4FUT"
+ck "A16 [RED→GREEN] ...and says why, instead of dropping it silently" "AHEAD of this box's clock" "$P4OUT"
+ck "A17 [PINNED] the EXPIRED arm still reaps (the new arm did not displace it)" "pruned expired refs/claims/p4-expired" "$P4OUT"
+P4POST="$(p4_verdict pr-3203)"
+echo "  post-prune read of the AGED key: $(printf '%s' "$P4POST" | tr '\n' ' ')"
+ck "A18 [RED→GREEN] after the DELETION the key reads free (claim-absent, rc=0) — the state change is the reap, not the clock" "^RC=0 WORD=claim-absent$" "$(printf '%s' "$P4POST" | tr '\n' ' ')"
+# ── the bound's own guard rails: a garbage tunable, and an UNREADABLE local clock ──
+# Both are the arm's silent-failure modes: a garbage bound is not validated before it is used (and an
+# unvalidated `-le` ERRORS, which is FALSE, i.e. it reaps on a value nobody checked), and an EMPTY
+# `date` used to be read as epoch 0 and reported as clock SKEW — the wrong cause for a clock this box
+# could not read at all. (The `12:34:56` shape, whose arithmetic error aborts the pass, is guarded by
+# the same top-of-function check; these assertions pin the two that are reachable through the test seam.)
+p4_seed pr-3205 weird3203 HAVOC 40000 >/dev/null
+outP4BG=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=abc \
+              && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+ck "A21 [RED→GREEN] a GARBAGE CLAIM_UNREADABLE_LEASE_MAX_AGE is clamped to the shipped 18000s (asserted on the bound the line NAMES: unclamped, the -le test ERRORS on 'abc', an errored test is FALSE, and the arm reaps on a value it never validated — the fail-OPEN direction)" "PAST the 18000s bound" "$outP4BG"
+p4_seed pr-3206 weird3203 HAVOC 40000 >/dev/null
+# A NON-EMPTY, NON-NUMERIC CLOCK ("12:34:56") IS THE DISCRIMINATING SEAM. An empty one is caught by
+# the `[ -z "$now" ]` branch even WITHOUT the top-of-function normalisation; a value that is invalid
+# arithmetic syntax makes the age arithmetic a SYNTAX ERROR that kills the subshell, so the pass stops
+# at the first unparseable ref and every later ref is never examined. Asserting a line for BOTH seeded
+# refs is what pins "the pass completed", which an empty clock cannot discriminate.
+outP4CK=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+              && date() { printf '12:34:56\n'; } && claim_prune ) 2>&1 )
+ck "A22 [RED→GREEN] an UNREADABLE local clock reaps nothing and names the CLOCK (not clock skew)" "the LOCAL CLOCK is unreadable" "$outP4CK"
+case "$outP4CK" in *"AHEAD of this box's clock"*) P4CK=0 ;; *) P4CK=1 ;; esac
+ck "A23 [RED→GREEN] ...and does NOT misblame clock SKEW for a clock it could not read" "^1$" "$P4CK"
+p4_has pr-3206 && P4CKEEP=0 || P4CKEEP=1
+ck "A24 [RED→GREEN] ...and the past-bound claim SURVIVES that pass: no age, no reap (fail-closed)" "^0$" "$P4CKEEP"
+# ── THE WRITER SIDE: no lease is MINTED on a clock this box cannot read ────────────────────────
+# ⛔ MEASURED FAIL-OPEN (review, agent-infra#3203): with `date` broken, `until=$(( now + ttl ))` is
+# `0 + ttl`, so the acquire pushed a claim stamped `lease_until=1800` (epoch 1970) — which `_lease_is_live`
+# reads EXPIRED, so any peer may STEAL the claim this box just acquired. An agent must not be able to
+# defeat the registry by breaking the clock, so the mint is refused.
+outP4AC=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+             && date() { return 3; } && claim_pr_acquire "" 3207 ) 2>/dev/null ); rcP4AC=$?
+echo "  acquire with an UNREADABLE CLOCK rc=$rcP4AC :: $outP4AC"
+ck "A25 [RED→GREEN] a WRITER refuses to mint a lease on an unreadable clock (never an epoch-0 term)" "held-by-unreadable-clock" "$outP4AC"
+ck "A26 [RED→GREEN] ...and the refusal is REFUSED (rc 1), never the INFRA code rc 2 that makes every PR-claim consumer proceed" "^1$" "$rcP4AC"
+p4_has pr-3207 && P4ACMINT=1 || P4ACMINT=0
+ck "A27 [RED→GREEN] ...and NOTHING was pushed: no claim exists to be stolen as already-expired" "^0$" "$P4ACMINT"
+# AND WITH A CLAIM ALREADY HELD (review, agent-infra#3203 — the P1): the answer must still be a
+# REFUSAL. If this path answered rc 2, merge-one.sh/fix-one.sh would read it as "registry unavailable"
+# and proceed WITHOUT the cross-box exclusion — a broken clock would drop the gate.
+P4PEER="$(p4_seed pr-3208 peerbox "$(( P4NOW + 3600 ))" 0)"
+outP4PK=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+             && date() { return 3; } && claim_pr_acquire "" 3208 ) 2>/dev/null ); rcP4PK=$?
+echo "  acquire over a PEER claim with an UNREADABLE CLOCK rc=$rcP4PK :: $outP4PK"
+ck "A28 [RED→GREEN] a broken clock still REFUSES a peer-held claim (rc 1, never the infra rc 2)" "^1$" "$rcP4PK"
+P4PKTIP="$(git -C "$P4BOX" ls-remote origin refs/claims/pr-3208 | awk '{print $1}')"
+[ -n "$P4PEER" ] && [ "$P4PKTIP" = "$P4PEER" ] && P4PKK=0 || P4PKK=1
+ck "A29 [RED→GREEN] ...and the peer claim is untouched (a refusal is not a release)" "^0$" "$P4PKK"
+# THE CEILING (review, agent-infra#3203): a 9-digit override (~31 years) would re-create the eternal
+# block as "configuration". 700000s is past the 7-day ceiling and short of 999999999, so a clamped arm
+# REAPS and an unclamped one KEEPS — the only fixture that distinguishes the two.
+p4_seed pr-3209 weird3203 HAVOC 700000 >/dev/null
+outP4CE=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 \
+              && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+ck "A30 [RED→GREEN] a ~31-year override is clamped to the 7-day ceiling, so the bound stays a BOUND" "pruned unreadable-lease refs/claims/pr-3209" "$outP4CE"
+# AN UNMEASURABLE AGE MUST NOT BECOME A FABRICATED ONE (review, agent-infra#3203 — T3). A ref that
+# points at a NON-COMMIT object has no committer stamp: _claim_commit_time returns rc 1, so the age is
+# unmeasurable. Without the `-z "$ct"` guard the arithmetic invents an age from nothing and REAPS.
+( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+  && b="$(printf 'not a claim commit' | _git hash-object -w --stdin)" && _git push -q --force origin "$b:refs/claims/pr-3210" ) 2>/dev/null
+p4_has pr-3210 && P4BLOBSEED=0 || P4BLOBSEED=1
+ck "A31a (setup) a claim ref pointing at a NON-COMMIT object is planted" "^0$" "$P4BLOBSEED"
+outP4BL=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+ck "A31 [RED→GREEN] a claim whose commit time cannot be read is NAMED as unmeasurable, not reaped on a fabricated age" "AGE IS UNMEASURABLE" "$outP4BL"
+p4_has pr-3210 && P4BLOBKEEP=0 || P4BLOBKEEP=1
+ck "A32 [RED→GREEN] ...and the ref SURVIVES (no stamp, no age, no reap)" "^0$" "$P4BLOBKEEP"
+# A STAMP THAT IS ALL DIGITS BUT NOT A TIME (review, agent-infra#3203 — P1). `0000009999` passes a
+# digit-shape check but `$(( now - ct ))` reads a LEADING-ZERO operand as OCTAL, so it aborted the
+# arithmetic with `value too great for base` — a fatal error that killed the prune subshell. Every ref
+# sorting after the crafted one was then never examined, nothing was named, and the pass exited 0: the
+# eternal block, restored. `git hash-object` refuses such a date, but `git fast-import` writes it with
+# no flags, so a peer CAN land one. The fixture ALSO seeds an aged unparseable claim that sorts AFTER
+# it (`pr-3299` > `pr-3211`), because "the pass completed" is the half a single-ref fixture cannot see.
+( cd "$P4BOX" && printf 'commit refs/heads/crafted\ncommitter a <a@b> 0000009999 +0000\ndata <<MSG\nclaim owner=weird3203 lease_until=HAVOC nonce=crafted\nMSG\nM 100644 inline f\ndata 2\nx\n' \
+    | git fast-import --quiet ) 2>/dev/null
+( cd "$P4BOX" && git push -q --force origin refs/heads/crafted:refs/claims/pr-3211 ) 2>/dev/null
+p4_has pr-3211 && P4CRAFT=0 || P4CRAFT=1
+ck "A33a (setup) a claim commit with a LEADING-ZERO committer stamp is planted" "^0$" "$P4CRAFT"
+p4_seed pr-3299 weird3203 HAVOC 40000 >/dev/null
+outP4CZ=$( p4_prune )   # NOTE: no `date` seam here — the crafted stamp alone must not stop the pass
+echo "  prune output (crafted stamp):"; printf '%s\n' "$outP4CZ" | sed 's/^/    /'
+ck "A33 [RED→GREEN] a leading-zero committer stamp is refused as unmeasurable, so the pass never dies on it" "kept unreadable-lease refs/claims/pr-3211" "$outP4CZ"
+ck "A34 [RED→GREEN] ...and the pass COMPLETES: the aged ref that sorts AFTER the crafted one is still reaped" "pruned unreadable-lease refs/claims/pr-3299" "$outP4CZ"
+p4_has pr-3211 && P4CZ=0 || P4CZ=1
+ck "A35 [RED→GREEN] ...and the crafted ref itself survives (unmeasurable age is not evidence of expiry)" "^0$" "$P4CZ"
+# THE CHEAPEST FABRICATED CLOCKS (review, agent-infra#3203 — shape is not enough). A `date` shim that
+# prints `0` mints `until=ttl` (epoch 1970), which every peer then reclaims as EXPIRED; a leading-zero
+# clock aborts the age arithmetic as OCTAL, truncating the pass exactly as the crafted-stamp case did.
+# One ref per bad-clock shape, or the first iteration's (illegal) push would make the second look failed
+# for the wrong reason.
+P4ZREF=3212
+for P4BAD in 0 0000009999 18446744073709551616 99999999999999999999; do
+  outP4Z=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+              && date() { printf '%s\n' "$P4BAD"; } && claim_pr_acquire "" "$P4ZREF" ) 2>/dev/null ); rcP4Z=$?
+  echo "  acquire with date='$P4BAD' rc=$rcP4Z :: $outP4Z"
+  ck "A36 [RED→GREEN] a clock that answers '$P4BAD' is unreadable: the mint is REFUSED (rc 1), never an epoch-0 term" "^1$" "$rcP4Z"
+  p4_has "pr-$P4ZREF" && P4ZM=1 || P4ZM=0
+  ck "A37 [RED→GREEN] ...and nothing was pushed for that shape (no already-expired claim to be stolen)" "^0$" "$P4ZM"
+  P4ZREF=$(( P4ZREF + 1 ))
+done
+p4_seed pr-3213 weird3203 HAVOC 40000 >/dev/null
+p4_seed pr-3214 weird3203 HAVOC 0      >/dev/null
+outP4OC=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+             && date() { printf '0000009999\n'; } && claim_prune ) 2>&1 )
+echo "  prune with a LEADING-ZERO clock:"; printf '%s\n' "$outP4OC" | sed 's/^/    /'
+ck "A38 [RED→GREEN] a leading-zero clock is unreadable: the pass NAMES a ref instead of dying as OCTAL" "LOCAL CLOCK is unreadable" "$outP4OC"
+# ⛔ AND AN OVERSIZED CLOCK IS UNREADABLE, NOT A WRAPPED ONE (review, agent-infra#3203). A 20-digit clock
+# WRAPS through `$(( ))`, and a wrapped `now` makes a 5-SECOND-old claim look astronomically old — so the
+# arm REAPS on a fabricated time base. Shape-checking alone does not catch this: the value is all digits.
+p4_seed pr-3217 weird3203 HAVOC 5 >/dev/null
+outP4MAG=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+              && date() { printf '99999999999999999999\n'; } && claim_prune ) 2>&1 )
+ck "A46 [RED→GREEN] an OVERSIZED (wrapping) clock is named as unreadable, never used as a time base" "LOCAL CLOCK is unreadable" "$outP4MAG"
+p4_has pr-3217 && P4MAGK=0 || P4MAGK=1
+ck "A47 [RED→GREEN] ...so a 5-SECOND-old claim is NOT reaped on its wrap-around" "^0$" "$P4MAGK"
+p4_has pr-3213 && P4OCK=0 || P4OCK=1
+ck "A39 [RED→GREEN] ...and nothing in the class was reaped on it (fail-closed)" "^0$" "$P4OCK"
+# A PEER-PLANTED TERM OF THE SAME SHAPE (leading zero) must be UNPARSEABLE, not decimal 9999 — else the
+# acquire reclaims it, claim_prune deletes it, and the snapshot says claim-expired so a controller SPAWNS.
+P4LEAD="$(p4_seed pr-3215 peerbox 0000009999 0)"
+outP4LZ=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+             && claim_pr_acquire "" 3215 ) 2>/dev/null ); rcP4LZ=$?
+echo "  acquire over a LEADING-ZERO lease rc=$rcP4LZ :: $outP4LZ"
+ck "A40 [RED→GREEN] a lease_until='0000009999' is UNPARSEABLE (abstention, held-by-unreadable-lease)" "held-by-unreadable-lease" "$outP4LZ"
+ck "A41 [RED→GREEN] ...so the peer claim is REFUSED, not reclaimed as a 1970 window" "^1$" "$rcP4LZ"
+P4LZTIP="$(git -C "$P4BOX" ls-remote origin refs/claims/pr-3215 | awk '{print $1}')"
+[ -n "$P4LEAD" ] && [ "$P4LZTIP" = "$P4LEAD" ] && P4LZK=0 || P4LZK=1
+ck "A42 [RED→GREEN] ...and its ref is untouched (never stolen)" "^0$" "$P4LZK"
+# ⛔ A NON-ASCII DIGIT IS NOT A DIGIT, AND AN ERRORED COMPARISON IS NOT A VERDICT (review,
+# agent-infra#3203 — a P1 for six rounds). Two independent fail-open paths in the SAME line:
+#   (a) POSIX bracket RANGES are COLLATION-based, so under a UTF-8 locale `[!0-9]` does not exclude
+#       U+0663 ARABIC-INDIC THREE — `lease_until=1٣` walked past `_lease_unparseable`, then
+#       `[ "$now" -le "1٣" ]` ERRORED, `if` read the error as FALSE, and the answer was `expired`
+#       ⇒ the acquire RECLAIMED a peer's claim. Measured on the shipped file under en_US.UTF-8.
+#   (b) an all-digit clock above 2**63 also ERRORs `[`, and errored-as-FALSE is `expired` ⇒ FREE.
+# `[!0123456789]` is the enumerated class (locale-proof), and the state reader now reads `$?` so a
+# comparison that cannot be performed answers `unknown` instead of either polarity.
+outP4AR=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL=en_US.UTF-8 && . "$CLAIMS_SH" \
+             && _claim_lease_state "1$(printf '\u0663')" "$P4NOW" ) 2>&1 )
+ck "A48 [RED→GREEN] a locale-collated NON-ASCII digit lease is unreadable, not 'expired'" "unreadable" "$outP4AR"
+outP4HU=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+             && _claim_lease_state "$(( P4NOW + 900 ))" "20000000000000000000" ) 2>&1 )
+ck "A49 [RED→GREEN] a clock ABOVE 2**63 that ERRORS the comparison answers unknown, never expired" "unknown" "$outP4HU"
+# TWO `committer` HEADERS (review, agent-infra#3203): git dates a commit from the LAST one, so a crafted
+# commit can carry `committer … 1 +0000` then `committer … <now> +0000` — a `head -n 1` reader dates it
+# 1970 and REAPS a claim that is seconds old, while `git log` says it is fresh. `git hash-object -t commit
+# --literally` writes such an object and a plain push lands it (`git fsck --strict` still accepts it).
+P4TWO="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> 1 +0000\ncommitter a <a@b> %s +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=two\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4TWO:refs/claims/pr-3216" ) 2>/dev/null
+p4_has pr-3216 && P4TWOOK=0 || P4TWOOK=1
+ck "A43a (setup) a claim commit carrying TWO committer headers is planted" "^0$" "$P4TWOOK"
+ck "A43 [RED→GREEN] the reaper dates it from the LAST committer header, like git does" "^${P4NOW}$" "$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+     && c="$( _git ls-remote origin refs/claims/pr-3216 | awk '{print $1}' )" && _git fetch -q origin "+refs/claims/pr-3216:$CLAIM_TMP_NS/two3203" && _claim_commit_time "$CLAIM_TMP_NS/two3203" ) 2>/dev/null )"
+outP4TW=$( p4_prune )
+ck "A44 [RED→GREEN] ...so a SECONDS-OLD claim with a forged first header is NOT reaped as ancient" "kept unreadable-lease refs/claims/pr-3216" "$outP4TW"
+p4_has pr-3216 && P4TWZ=0 || P4TWZ=1
+ck "A45 [RED→GREEN] ...and it survives the pass" "^0$" "$P4TWZ"
+# ⛔ THE AGE COMES FROM THE HEADER, NOT THE MESSAGE (review, agent-infra#3203). `cat-file commit`
+# returns headers AND body, and the body is peer-writable: a message line shaped like
+# `committer Evil <e@x> 1 +0000` was picked up by the parse while git dates the commit from the
+# header — so a claim `git log --format=%ct` calls SECONDS OLD was reaped as ancient (a future-dated
+# message line pinned it past the bound for ever). Same commit, two readers, two answers: this pins
+# the one that matches git.
+P4HDR="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> %s +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=msg\ncommitter Evil <e@x> 1 +0000\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4HDR:refs/claims/pr-3218" ) 2>/dev/null
+ck "A50a (setup) a claim commit carrying a 'committer' line in its MESSAGE is planted" "0" "$( p4_has pr-3218 && echo 0 || echo 1 )"
+# ONE comparison, two readers: the reaper's age input and git's own answer must be the SAME number
+# (and it must be the header's, not the message's forged `1`).
+P4HDRCT="$(git -C "$P4BOX" log -1 --format='%ct' "$P4HDR" 2>/dev/null)"
+P4REAPCT="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+             && _git fetch -q origin "+refs/claims/pr-3218:$CLAIM_TMP_NS/msg3203" 2>/dev/null \
+             && _claim_commit_time "$CLAIM_TMP_NS/msg3203" ) 2>/dev/null )"
+echo "  header stamp: git=$P4HDRCT reaper=$P4REAPCT (the message line forged 1)"
+ck "A50 [RED→GREEN] ...and the age is read from the HEADER stamp, exactly the number git reports" "^${P4HDRCT}$" "$P4REAPCT"
+ck "A50b [RED→GREEN] ...which is NOT the forged message stamp (the value a body-wide parse returns)" "^0$" "$([ "$P4REAPCT" = "1" ] && echo 1 || echo 0)"
+outP4MSG=$( p4_prune )
+ck "A51 [RED→GREEN] ...so a SECONDS-OLD claim with a forged message line is NOT reaped" "kept unreadable-lease refs/claims/pr-3218" "$outP4MSG"
+# ⛔ AND THE STEAL ITSELF, END TO END (review, agent-infra#3203): the reviewer reclaimed a peer's claim
+# through `claim_pr_acquire` with `lease_until=1٣` under a UTF-8 locale and showed `rc=0
+# reclaimed expired claim`. The unit asserts the CLASS; this asserts that no caller can act on it.
+P4NON="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" && GIT_COMMITTER_DATE="@$(( P4NOW - 10 )) +0000" _claim_commit peerbox "1$(printf '\u0663')" ) 2>/dev/null )"
+( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" && LC_ALL=en_US.UTF-8 _git push -q origin "$P4NON:refs/claims/pr-3219" ) 2>/dev/null
+outP4NS=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA LC_ALL=en_US.UTF-8 && . "$CLAIMS_SH" \
+             && claim_pr_acquire "" 3219 ) 2>/dev/null ); rcP4NS=$?
+echo "  acquire over a NON-ASCII lease rc=$rcP4NS :: $outP4NS"
+ck "A52 [RED→GREEN] a non-ASCII lease cannot be RECLAIMED (the reviewer's steal, closed)" "^1$" "$rcP4NS"
+ck "A53 [RED→GREEN] ...and it is named as the abstention, not as an expiry" "held-by-unreadable-lease" "$outP4NS"
+P4NSTIP="$(git -C "$P4BOX" ls-remote origin refs/claims/pr-3219 | awk '{print $1}')"
+[ -n "$P4NON" ] && [ "$P4NSTIP" = "$P4NON" ] && P4NSK=0 || P4NSK=1
+ck "A54 [RED→GREEN] ...and the peer's ref is untouched" "^0$" "$P4NSK"
+# ⛔ AN ANCHORED TRAILER, NOT A DIGIT PREFIX (review rounds 9). `_lease_of`'s unanchored `[0-9]*`
+# captured the PREFIX and discarded the rest, so a peer-planted `lease_until=1junk` became `1` — a
+# parseable, long-expired term — and every reader answered FREE (measured: `acquired`/`reclaimed
+# expired claim … (was until 1)`). Two shapes, because they fail through different mechanisms: a
+# SUFFIX the digit run does not cover, and a NON-ASCII digit INSIDE the run (which the exhaustive
+# ASCII class must reject while an unanchored `[0-9]*` prefix-matched around it).
+P4JREF=3220
+for P4JUNK in "1junk" "1$(printf '\u0669')2000000" "junk1"; do
+  P4JSEED="$(p4_seed "pr-$P4JREF" peerbox "$P4JUNK" 10)"
+  outP4J=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA LC_ALL=en_US.UTF-8 && . "$CLAIMS_SH" \
+              && claim_pr_acquire "" "$P4JREF" ) 2>/dev/null ); rcP4J=$?
+  echo "  acquire over lease_until='$P4JUNK' rc=$rcP4J :: $outP4J"
+  ck "A55 [RED→GREEN] a truncated/garbled term ('$P4JUNK') is UNPARSEABLE, so the claim is not reclaimed" "^1$" "$rcP4J"
+  ck "A56 [RED→GREEN] ...and it is named as the abstention" "held-by-unreadable-lease" "$outP4J"
+  P4JTIP="$(git -C "$P4BOX" ls-remote origin "refs/claims/pr-$P4JREF" | awk '{print $1}')"
+  ck "A57 [RED→GREEN] ...and the peer's ref is untouched (never stolen)" "^1$" "$([ "$P4JTIP" = "$P4JSEED" ] && echo 1 || echo 0)"
+# ⛔ AND THE OTHER TWO CLOCK GUARDS AGREE WITH THIS ONE (review round 10, agent-infra#3203). Both were
+# SHAPE-ONLY, so `date` printing a leading zero reached `$(( ))`, bash read it as OCTAL, aborted, and
+# the arm answered with NO WORD, NO REASON and NO TOKEN — an abstention nobody can act on (measured:
+# `claim_snapshot_verdict` rc=1 word= why="", and `claim_issue_preflight` with empty output) — and a
+# 20-digit clock WRAPPED into a negative "s left". Fail-closed either way; the NAME is the product.
+P4SNAPCLK="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+                && date() { printf '01792000000\n'; } && claim_snapshot "$P4BOX/snapclk3203" >/dev/null 2>&1; \
+                claim_snapshot_verdict "$P4BOX/snapclk3203" refs/claims/pr-3203 >/dev/null 2>&1
+                printf '%s|%s' "$?" "${CLAIM_VERDICT:-}" ) 2>/dev/null )"
+echo "  snapshot verdict with a LEADING-ZERO clock: $P4SNAPCLK"
+# The verdict WORD is the product: before the magnitude arm the same clock produced rc=1 with an EMPTY
+# word (bash aborted the `$(( ))` as octal and neither the fresh nor the stale test fired).
+ck "A58 [RED→GREEN] a leading-zero clock leaves the snapshot verdict NAMED, not empty" "^2|claim-unreadable" "$P4SNAPCLK"
+# the preflight's clock guard sits BEHIND a found claim, so seed one — otherwise the arm returns "no
+# claim" and proves nothing (measured: an earlier draft asserted against exactly that empty answer).
+p4_seed issue-9001 peerbox 9999999999 10 >/dev/null
+P4PRE="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+           && date() { printf '99999999999999999999\n'; } && claim_issue_preflight 9001 ) 2>/dev/null )"
+echo "  preflight with a 20-DIGIT clock: $P4PRE"
+ck "A59 [RED→GREEN] ...and a wrapping clock is NAMED by the preflight, never used as a time base" "clock is unreadable" "$P4PRE"
+p4_seed issue-9001 peerbox 9999999999 10 >/dev/null
+P4PRELZ="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+             && date() { printf '0000009999\n'; } && claim_issue_preflight 9001 ) 2>/dev/null )"
+echo "  preflight with a LEADING-ZERO clock: $P4PRELZ"
+ck "A60 [RED→GREEN] ...and so is a leading-zero one (no silent empty answer, no octal abort)" "clock is unreadable" "$P4PRELZ"
+# ⛔ AND THE BRANCH GUARD — THE THIRD READER WITH ITS OWN CLOCK ARM (review round 11,
+# agent-infra#3203). Shape only meant `0` and a 20-digit clock fell through to `_lease_is_live` →
+# `_claim_lease_state` → `unknown`, which this guard published as `reason=held-by-live` — a nominal
+# LIVE holder for a window nobody can judge, with the remedy "wait for the lease to expire", a remedy
+# that can never fire. Every sibling names the clock; so must this one.
+# the arm sits BEHIND "a claim exists", so mint one held by a PEER (a claim we own would take the
+# `held-by-you` early return and never reach the clock at all — an earlier draft of this assertion
+# measured exactly that empty path).
+P4BGR="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" && claim_branch_ref boxa-topic ) 2>/dev/null )"
+p4_seed "$(printf '%s' "$P4BGR" | sed 's#^refs/claims/##')" peerbox 9999999999 10 >/dev/null
+for P4BG in 0 99999999999999999999 0000009999; do
+  outP4BG=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+               && date() { printf '%s\n' "$P4BG"; } && claim_branch_guard boxa-topic ) 2>&1 )
+  echo "  branch guard with clock='$P4BG' :: $(printf '%s' "$outP4BG" | head -1 | cut -c1-110)"
+  ck "A61 [RED→GREEN] the branch guard NAMES an unreadable clock ('$P4BG'), never a nominal live holder" "reason=clock-unreadable" "$outP4BG"
+done
+# ⛔ ONE LINE IN, ONE ANSWER OUT (review round 11, agent-infra#3203). A claim commit carries ONE
+# `claim owner=… lease_until=… nonce=…` line, so a second one is peer-planted junk. `_lease_of` must
+# read the FIRST line for BOTH fields: with the lease taking the first match and the owner printing
+# one line per match, a two-line message produced a MULTI-LINE owner (`owner` came back as
+# "peerbox\njunkbox") beside a first-line lease — the two halves of one answer from different lines.
+# `claim_lanes.py` reads the FIRST too (L10b pins the Python side; this pins the shell side).
+P4TWO2="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> %s +0000\n\nclaim owner=peerbox lease_until=9999999999 nonce=1\nclaim owner=junkbox lease_until=1 nonce=2\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4TWO2:refs/claims/pr-3223" ) 2>/dev/null
+P4LEASEOUT="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+                && _git fetch -q origin "+refs/claims/pr-3223:$CLAIM_TMP_NS/two2" 2>/dev/null \
+                && printf '%s' "$( _lease_of "$CLAIM_TMP_NS/two2" )" ) 2>/dev/null | cat -A | tr '\n' '|' )"
+echo "  _lease_of over a TWO-LINE claim message: $P4LEASEOUT"
+ck "A62 [RED→GREEN] the lease extraction takes the FIRST claim line" "^peerbox\^I9999999999$" "$P4LEASEOUT"
+outP4TWOV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA && . "$CLAIMS_SH" \
+               && claim_pr_acquire "" 3223 ) 2>/dev/null ); rcP4TWOV=$?
+echo "  acquire over the two-line claim rc=$rcP4TWOV :: $(printf '%s' "$outP4TWOV" | head -1 | cut -c1-100)"
+ck "A63 [RED→GREEN] ...and the reader below it agrees with the FIRST line (LIVE ⇒ not stolen)" "^1$" "$rcP4TWOV"
+ck "A64 [RED→GREEN] ...naming the live window, not an expiry" "held-by-live" "$outP4TWOV"
+# ⛔ AND THE SAME FIELD TWICE ON ONE LINE (review round 12, agent-infra#3203). A greedy `.*` prefix in
+# the old extraction bound the LAST token while both Python readers take the FIRST — so
+# `lease_until=9999999999 … lease_until=1` read EXPIRED (FREE) in the shell and LIVE in Python. The
+# extraction is field-based now: FIRST non-empty line, FIRST faithful token of each field.
+P4TWOF="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> %s +0000\n\nclaim owner=peerbox lease_until=9999999999 lease_until=1 nonce=x\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4TWOF:refs/claims/pr-3224" ) 2>/dev/null
+P4TWOFV="$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+             && _git fetch -q origin "+refs/claims/pr-3224:$CLAIM_TMP_NS/twof" 2>/dev/null \
+             && _lease_of "$CLAIM_TMP_NS/twof" ) 2>/dev/null | cat -A )"
+echo "  _lease_of over a repeated on-line token: $P4TWOFV"
+ck "A65 [RED→GREEN] a repeated on-line lease token resolves to the FIRST one, as both Python readers do" "^peerbox\^I9999999999$" "$P4TWOFV"
+# ⛔ THE ONE CLOCK GUARD THAT COULD KILL ITS CALLER (review round 12, agent-infra#3203).
+# `claim_snapshot_verdict` is called DIRECTLY by orch-loop.sh's claim_selection_verdict (no subshell),
+# and its `now` guard was shape-only, so `date +%s` printing a leading zero made bash abort the
+# `$(( now - read_at ))` as OCTAL and take the CONTROLLER down mid-sweep; a 20-digit clock wrapped and
+# silently skipped the CLAIM_SNAPSHOT_MAX_AGE bound. A58 passed only because its shim also poisoned
+# `read_at` — this one keeps `read_at` clean and shims ONLY the clock.
+# ⛔ THE WRITER'S OWN HEADER FORMAT (`\t`-separated: `#claim-snapshot<TAB><read_at><TAB>ok|failed<TAB>n`).
+# An earlier draft wrote `#claim-snapshot read_at=…`, which the reader cannot parse — so it answered
+# `claim-unreadable` for THAT reason and the clock arm was never reached: the mutant stayed green and
+# the assertion proved nothing.
+{ printf '#claim-snapshot\t%s\tok\t1\n' "$(( P4NOW - 30 ))"
+  printf 'refs/claims/pr-3225\t%s:4242\t%s\n' peerbox "$(( P4NOW + 900 ))"; } > "$P4BOX/snapclean3203"
+for P4BADC in 01792000000 99999999999999999999; do
+  outP4SV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+               && date() { printf '%s\n' "$P4BADC"; } && claim_snapshot_verdict "$P4BOX/snapclean3203" refs/claims/pr-3225
+               printf 'rc=%s word=%s' "$?" "${CLAIM_VERDICT:-}" ) 2>&1 | tail -1 )
+  echo "  snapshot verdict, CLEAN read_at, clock='$P4BADC' :: $outP4SV"
+  ck "A66 [RED→GREEN] a clean snapshot with an unreadable clock ('$P4BADC') NAMES it instead of aborting the caller" "rc=2 word=claim-unreadable" "$outP4SV"
+done
+  P4JREF=$(( P4JREF + 1 ))
+done
+# ⛔ THE BELT IS PINNED, NOT MERELY PRESENT (review round 19, agent-infra#3203). `_claim_lease_state`'s
+# `case "$?"` arm is UNREACHABLE while both guards hold — an unparseable lease and an unreadable clock
+# are each rejected before the comparison, so `[ "$now" -le "$lease" ]` can never return 2. That made
+# it look DEAD: replacing the dispatch with a plain `if … then live; else expired; fi` left this whole
+# suite GREEN (242 passed, 0 failed), while the arm is in fact the ONLY thing that answers if a future
+# loosening of either guard lets a non-integer reach the comparison — which is exactly how the P1 it
+# closes arrived. A belt nobody can observe is indistinguishable from a dead guard, so this drives it
+# directly: `_lease_unparseable` is stubbed to ACCEPT the term, reproducing the state such a loosening
+# would create, and the comparison is then handed `1junk` so `[` really does error.
+outP4BELT=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+              && _lease_unparseable() { return 1; } \
+              && _claim_lease_state "1junk" "$P4NOW" ) 2>/dev/null | tail -1 )
+echo "  _claim_lease_state with the guard stubbed open, over '1junk': $outP4BELT"
+ck "A67 [PINNED] a comparison that cannot be performed answers 'unknown', never 'expired' (the belt behind the guards)" "^unknown$" "$outP4BELT"
+# ⛔ THE CEILING HAS A TWIN (review round 19, agent-infra#3203). The ceiling stops a ~31-year override
+# from re-creating the eternal block. Without a FLOOR the same knob does the opposite and far worse
+# thing: `CLAIM_UNREADABLE_LEASE_MAX_AGE=1` makes the unattended hourly `claim_prune` delete an
+# unparseable-lease claim SECONDS after it was minted — a peer's LIVE claim, removed on a schedule, i.e.
+# the steal direction this arm exists to refuse.
+# ⛔ AND THE FLOOR IS CALIBRATED ON THE LONGEST MINTABLE TERM (review round 20, agent-infra#3203):
+# `CLAIM_BRANCH_TTL` and `CLAIM_TTL_MAX` are each overrides that can be raised PAST `CLAIM_ISSUE_TTL`,
+# and a floor nailed to 18000 would then fire INSIDE a live 40000 s branch term — the same steal, one
+# knob over. Both arms are pinned below, so a future simplification back to one knob goes RED.
+outP4FLOOR=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
+                && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  CLAIM_UNREADABLE_LEASE_MAX_AGE=1 resolves to: $outP4FLOOR"
+ck "A68 [RED→GREEN] a sub-lease bound is clamped UP to the longest mintable term, never below it" "^18000$" "$outP4FLOOR"
+outP4FLOORB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
+                   CLAIM_BRANCH_TTL=40000 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  ...and with CLAIM_BRANCH_TTL=40000 it resolves to: $outP4FLOORB"
+ck "A69 [RED→GREEN] ...and the floor FOLLOWS a raised branch term, so it cannot fire inside a live branch claim" "^40000$" "$outP4FLOORB"
+# The VALUE clamp is not the behaviour it exists for, so the decision itself is asserted: a 2-SECOND-old
+# unparseable claim under a bound of 1 must be KEPT and NAMED — not deleted. This is the literal
+# measurement behind the floor, promoted to a gate: a future refactor that hoists the bound into a local
+# before the clamp, or gives a reader its own default, keeps the value assertions above green while
+# restoring the scheduled steal.
+# ⛔ AND THE SEED IS ASSERTED, NOT SWALLOWED (review round 25). The mint used to be
+# `p4_seed … >/dev/null`, so a seed that failed (a non-fast-forward against a ref an earlier pass left
+# behind, a transport failure) reported nothing and the assertions below measured a STALE object — or
+# an absent one — while reading green. The suite's own A76a sets the pattern: a fixture that is not
+# proven to exist is not a fixture.
+ck "A70a (setup) a 2 s-old unparseable claim is MINTED for the floor case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3231 weird3203 HAVOC 2 2>/dev/null )"
+outP4FB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
+              && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+echo "  prune with CLAIM_UNREADABLE_LEASE_MAX_AGE=1 over a 2s-old unparseable claim:"; printf '%s\n' "$outP4FB" | sed 's/^/    /'
+ck "A70 [RED→GREEN] a sub-lease bound does not make the reaper DELETE a peer's 2-SECOND-old claim (it is KEPT and NAMED)" "kept unreadable-lease refs/claims/pr-3231" "$outP4FB"
+p4_has pr-3231 && P4FBK=0 || P4FBK=1
+ck "A71 [RED→GREEN] ...and the ref is really still there (the bound is a bound, not a message)" "^0$" "$P4FBK"
+# ⛔ THE CEILING KNOB IS THE SAME STEAL FROM THE OTHER SIDE (review round 20, agent-infra#3203). The floor
+# above is applied BEFORE the ceiling clamp, so a CEILING set below the floor wins and the bound lands
+# below the longest mintable term — measured on the shipped file: `MAXAGE=1 CEIL=1` resolved the bound
+# to 1 s and `claim_prune` DELETED a 2-SECOND-old claim, and `CEIL=3600` alone reaped a 4000 s-old claim
+# that the shipped defaults keep. `CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL` appeared ZERO times in this suite
+# before these assertions, so nothing could go red on the knob itself. Note they assert the KEEP, not a
+# message: the clamps value is the last line of defence and it has to be observed.
+outP4CEIL1=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
+                 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=1 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  MAXAGE=1 CEIL=1 resolves to: $outP4CEIL1"
+ck "A72 [RED→GREEN] a CEILING below the floor term cannot undercut it (a sub-term ceiling is a scheduled steal)" "^18000$" "$outP4CEIL1"
+outP4CEIL2=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=3600 \
+                 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  CEIL=3600 alone resolves to: $outP4CEIL2"
+ck "A73 [RED→GREEN] ...and it cannot undercut the DEFAULT bound either (3600 s is inside a 18000 s lease)" "^18000$" "$outP4CEIL2"
+ck "A72a (setup) a 2 s-old unparseable claim is MINTED for the ceiling case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3232 weird3203 HAVOC 2 2>/dev/null )"
+outP4CEILB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA CLAIM_UNREADABLE_LEASE_MAX_AGE=1 \
+                  CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=1 && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+echo "  prune with MAXAGE=1 CEIL=1 over a 2s-old unparseable claim:"; printf '%s\n' "$outP4CEILB" | sed 's/^/    /'
+ck "A74 [RED→GREEN] ...so the 2-SECOND-old claim is KEPT, not deleted at a 1 s ceiling" "kept unreadable-lease refs/claims/pr-3232" "$outP4CEILB"
+p4_has pr-3232 && P4CEILK=0 || P4CEILK=1
+ck "A75 [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4CEILK"
+# ⛔ THE LAST `committer` LINE IS OUTPUT FIRST, THEN PARSED (review round 20, agent-infra#3203). The age
+# parse used to be ONE anchored `sed` piped to `tail -n 1`, i.e. "the last line that MATCHES". Git dates
+# the object from the last `committer` header whatever else that line carries, so a newest header with a
+# trailing token is filtered out by the `$` anchor and `tail` returns an EARLIER committer line —
+# measured: a claim `git log --format=%ct` dates as 1 s old was reaped with `the claim commit is
+# 1793991810s old, PAST the 18000s bound`. A newest header this parser cannot read must make the age
+# UNMEASURABLE (kept and NAMED), never fall back to older text the attacker wrote.
+P4JUNK="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> 1 +0000\ncommitter a <a@b> %s +0000 junk\n\nclaim owner=weird3203 lease_until=HAVOC nonce=junk\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4JUNK:refs/claims/pr-3233" ) 2>/dev/null
+ck "A76a (setup) a claim commit whose LAST committer header carries a trailing token is planted" "0" "$( p4_has pr-3233 && echo 0 || echo 1 )"
+P4JUNKRC=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+               && c="$( _git ls-remote origin refs/claims/pr-3233 | awk '{print $1}' )" \
+               && _git fetch -q origin "+refs/claims/pr-3233:$CLAIM_TMP_NS/junk3203" \
+               && _claim_commit_time "$CLAIM_TMP_NS/junk3203" >/dev/null 2>&1; printf '%s' "$?" ) 2>/dev/null | tail -1 )
+echo "  _claim_commit_time over a newest committer line with a trailing token: rc=$P4JUNKRC"
+ck "A76 [RED→GREEN] a newest committer header this parser cannot read is UNMEASURABLE (rc=1), never an older line" "^1$" "$P4JUNKRC"
+outP4JUNKP=$( p4_prune )
+ck "A77 [RED→GREEN] ...so the claim is KEPT and NAMED (an unmeasurable age is not evidence of expiry)" "kept unreadable-lease refs/claims/pr-3233" "$outP4JUNKP"
+p4_has pr-3233 && P4JUNKK=0 || P4JUNKK=1
+ck "A78 [RED→GREEN] ...and it survives the pass instead of being reaped on an earlier forged header" "^0$" "$P4JUNKK"
+rm -rf "$P4ORIG" "$P4BOX"
 
 echo
 echo "=== I1. TWO BOXES, ONE ISSUE, **NOTHING PUSHED**: the second box must NOT read CLEAN (#1850) ==="
@@ -880,9 +1368,11 @@ case "$outIR2" in
   *) echo "  ✅ claim_issue_release does not abort under set -u"; PASS=$((PASS+1)) ;;
 esac
 
-# I6. AN UNREADABLE LEASE IS LIVE, NOT FREE (and never CLEAN). The same polarity as claim_acquire
-# and orch-loop's claim_live: `lease_until=0` means "a claim EXISTS whose lease this reader cannot
-# parse". Reading it as free would let a peer steal a live claim.
+# I6. AN UNREADABLE LEASE ABSTAINS — NOT FREE, AND NOT CALLED LIVE (agent-infra#3203). The ANSWER is
+# the same one claim_acquire and orch-loop's claim_live give (`lease_until=0` means "a claim EXISTS
+# whose lease this reader cannot parse" — reading it as free would let a peer steal a live claim);
+# what changed is the CLASSIFICATION: the reason now names the abstention (`held-by-unreadable-lease`)
+# instead of asserting a live holder the reader cannot see.
 seed_issue_lease() { # <lease-string> -> prints the commit it pushed
   local c
   c="$( cd "$A" && . "$CLAIMS_SH" && _claim_commit foreignbox "$1" )"
@@ -893,8 +1383,9 @@ cleanup_issue_ref
 E0="$(seed_issue_lease 0)"; echo "  seeded an issue claim with lease_until=0: $E0"
 outU=$(runB claim_issue_preflight "$ISSUE"); rcU=$?
 echo "  pre-flight rc=$rcU :: $outU"
-ck "an UNREADABLE issue lease reads as LIVE (rc=1)" "^1$" "$rcU"
+ck "an UNREADABLE issue lease ABSTAINS (rc=1, never CLEAN)" "^1$" "$rcU"
 ck "...and says so" "lease unreadable" "$outU"
+ck "...naming the abstention token, so the class is greppable" "held-by-unreadable-lease" "$outU"
 outU2=$(runB claim_issue_acquire "$B" "$ISSUE"); rcU2=$?
 ck "an UNREADABLE issue lease is NOT stolen (acquire rc=1)" "^1$" "$rcU2"
 stillU=$(git -C "$A" ls-remote origin "$ISSUE_REF" | awk '{print $1}')

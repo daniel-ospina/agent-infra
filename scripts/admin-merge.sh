@@ -142,12 +142,104 @@
 #   * it applies ONLY on the base side (base -> PR). A PR check with no declared
 #     counterpart keeps the unqualified `NO BASE COUNTERPART` answer: this is one
 #     pair, not a policy that shell failures are probably fine.
-#   * it does not touch §4.5. The PR's own evaluated tree still BLOCKS on a red
-#     there, base-shared or not — that gate exists for the repair direction, which
-#     requires the red to be GONE from the PR's tree (#1261).
+#   * it does NOT exempt a §4.5 tree red by name alone. The gate exists for the
+#     repair direction, which requires the red to be GONE from the PR's tree (#1261),
+#     so a name match buys nothing there. (The SEPARATE #3322 exclusion below is keyed
+#     on the BASE's own measured red, not on this name map alone.)
 #
-# The value lives in `declared_base_equivalent`, its ONE implementation; the ONE
-# reader is the step-1c named refusal (`named_unattributable_runs`).
+# The value lives in `declared_base_equivalent`, its ONE implementation, and it has
+# TWO readers, both of which consult it for the SAME question — "is there a base-side
+# checker for this PR-side check?":
+#   1. the step-1c named refusal (`named_unattributable_runs`), which names the base
+#      red it found and exempts nothing; and
+#   2. `base_owned_check` (#3322), which EXCLUDES a PR-side red from the §4.5 required
+#      surface when the base itself is measurably RED under the equivalent name on a
+#      workflow no PR can run. See "A CHECK MAIN ITSELF FAILS" below.
+#
+# ── A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE (#3322) ────────────
+# THE DEFECT. This repo splits its suites by trigger: `ci.yml` is `pull_request`-only
+# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep
+# UNSHARDED, as `script-validate` (cited in ci-main.yml's own comment). Main is red on
+# `script-validate`; every PR is red on the shards. The probe below correctly calls
+# main's red NOT-PR-EVALUABLE (#6807) and reports it without blocking — and that left
+# it in NO set the rail could use. §4.5 then read the PR's own tree, saw the shards
+# red, and refused with "a red still here means the repair is incomplete" for a red no
+# PR can ever clear: main fails the suite, so the PR CANNOT make it pass. Measured
+# 2026-11-05: three unrelated PRs (#3478 guard, #3168 attestation, #3486 MCP) were red
+# on the IDENTICAL nine checks, and #3478 had ZERO unique reds.
+#
+# THE RULE, and it is narrow on purpose. A red on the PR's evaluated tree is EXCLUDED
+# from the required surface iff BOTH hold:
+#   (i) the BASE's own check surface — read from GitHub by `check_surface_probe` on the
+#       base ref, not taken from a caller flag — carries a RED whose workflow declares
+#       no `pull_request`/`pull_request_target` trigger (the #6807 class: no PR can
+#       ever attach a check to a head sha for it); and
+#   (ii) that base red's NAME is this tree check's name, or the name
+#       `declared_base_equivalent` declares for it (the one cited pair,
+#       `bash-suites (<n>)` == `script-validate`).
+# So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
+# main is red on that suite at read time. Every fail-closed path holds:
+#   * an UNREADABLE or PARTIAL base read excuses NOTHING, but not because the set is empty:
+#     step 2c `exit 1`s on BOTH (a base the rail could not read is not a certificate, and
+#     4.6/4.7 are both gated on the base being RED), and that exit comes AFTER the name file
+#     is seeded — so the set may well be non-empty and §4.5 simply never consults it. An
+#     UNMEASURED base (0 checks, 0 statuses) writes no `exempt:` row at all, so there the set
+#     IS empty and §4.5 refuses as before. Nothing is excused on any of the three paths;
+#   * the base read is CLEAN -> no set -> the PR's red is its own and blocks, which is
+#     the #1261 incident (a lint red main does NOT carry) and every real regression;
+#   * the base red is on a workflow that DOES declare a PR trigger -> it is a BLOCKING
+#     base red, deliberately NOT in the set: that is the repair direction, where §4.5
+#     must keep insisting the red be GONE from the PR's tree;
+#   * a tree red with NO base counterpart does not match and blocks.
+# ⛔ IT IS NOT A BLANKET EXEMPTION AND IT IS NOT KEYED ON THE CHECK'S NAME ALONE. A
+# PR-side red named `bash-suites (3)` on a base whose `script-validate` is GREEN stays
+# blocking; deleting the base measurement from the rule would make every shell red
+# base-caused — the blanket excuse the #2610 mapping's own requirements forbid.
+# ⛔ THE DECLARED RESIDUAL. A check NAME main never publishes cannot be shown to be "a check
+# main itself fails", so there is no evidence to exclude it and it keeps blocking. Measured on
+# this repo: `ci.yml` declares a `verify` job; `ci-main.yml` declares NO `verify` job at all
+# (`grep -rn '^  verify:' .github/workflows/` → `ci.yml:371` only), so main can never publish
+# that NAME and this rule can never fire for it.
+# ⛔ NO ENUMERATION OF THE BASE'S JOBS BELONGS HERE, and this line is the scar: an earlier
+# revision listed them and MISSED `bash32-parse-guard` — a pattern that does not admit digits
+# skips it — which is the same "absence asserted without resolving coverage" mistake the
+# paragraph below warns about, committed inside the paragraph. Name the ONE fact that carries
+# the argument and let a reader run the grep.
+# ⛔ THE UNIT HERE IS THE NAME, NOT THE PROGRAM, and the difference decides which fix is owed.
+# Many of the programs the `verify` job runs DO run on main — some named literally in
+# ci-main.yml, others picked up by the `extension-tests` job's globs — but under OTHER JOB
+# names (`extension-tests / …`) that `declared_base_equivalent` has no arm for. It is also NOT
+# a clean split by "appears in the file", because a glob match is invisible to a text search:
+# do not restate this as a count without resolving the globs. So the residual is two things,
+# and neither is excused here:
+#   • a program main DOES run under an UNMAPPED job name needs a MAPPING arm — the
+#     `bash-suites-gate`-shaped residual stated in `declared_base_equivalent`'s docblock;
+#   • a program main truly never runs is #3415's "base-owned but unmeasurable from the base"
+#     family, where a base-side reproduction — never a name match — is the only evidence that
+#     could exist.
+# That is a refusal with a reason, never a silent pass.
+# ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
+# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
+# check `script-validate`, so while main is red on it, EVERY shard is excluded — including
+# a shard failure THIS PR introduced, whose cause is on no base. Per-shard attribution is
+# not available from base-side evidence (main publishes the sweep as ONE job-level red),
+# and inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
+# the guard for an ATTRIBUTABLE failure is deliberately NOT this rule and is untouched by
+# it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
+# reproduction still runs the residual on a pristine base worktree and refuses anything
+# the base does NOT reproduce. A PR-caused failure inside a shared shard is therefore
+# refused for its OWN reason — and it is refused BEFORE this exclusion is ever reached, since
+# both attribution legs run ahead of §4.5. The exclusion is a statement about a
+# NAME the base already fails; it is never a licence for a NEW failure inside that name.
+# ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
+# "blocked by the decision -> re-run" leg is not entered and §4.5 is the SOLE blocker in
+# every scenario. §80 therefore pins the intended property — an inherited red no longer
+# refuses at §4.5, and the exclusion is named in BOTH stderr and the durable evidence —
+# and NOT an end-to-end merge in the shape #3322 measured (a tree red on both an inherited
+# shard and its own id-level residual). That second shape is decided by the attribution
+# legs above, which this change does not touch. §80(f) closes the last untested arm of
+# the rule itself: a NON-CODE tree red must stay excluded from the exclusion even when its
+# name matches a base-owned red.
 #
 # ── THE PR'S EVALUATED TREE (#1261) ───────────────────────────────────────
 # The incident, exactly. PR #4589 (commit ebe4e7e8f) landed three ruff
@@ -683,6 +775,14 @@
 #                                         ADMIN_MERGE_POLL_INTERVAL paces the OTHER
 #                                         waits). One `run list` + one Jobs read
 #                                         per pending run per poll.
+#   ADMIN_MERGE_FIRST_CHECKS_POLL_MAX    the CEILING that interval backs off towards
+#                                         while a poll observes NO change (default
+#                                         300). The fleet shares ONE 5000/h API
+#                                         bucket, so a silent surface re-read every
+#                                         60s by every lane is what exhausts it;
+#                                         this bounds that, and can never shorten a
+#                                         wait (the stall/ceiling clocks are
+#                                         seconds, not poll counts).
 #   ADMIN_MERGE_MERGE_REF_WAIT           window (seconds, default 90) on the
 #                                         MERGE-REF wait: GitHub computes
 #                                         mergeable/refs/pull/<N>/merge in a
@@ -917,6 +1017,7 @@ RERUN_MAX_ATTEMPTS="${ADMIN_MERGE_RERUN_MAX_ATTEMPTS:-3}"
 # CEILING is never reported as a claim that the run STALLED (return 2, not 1).
 RERUN_TIMEOUT_CLAMPED=0
 
+
 # ── THE FIRST-CHECKS WAIT IS PROGRESS-AWARE, NOT A FIXED WINDOW (#2481) ──
 # The head's lane runs must APPEAR and reach status=completed before §1b may
 # compare — the fresh-PR race (no run yet) and the #2090 shape (a run still
@@ -974,6 +1075,82 @@ FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-$FAILSAFE_RERUN_TIMEOUT}"
 FIRST_CHECKS_STALL="${ADMIN_MERGE_FIRST_CHECKS_STALL:-8760}"
 FIRST_CHECKS_CEILING="${ADMIN_MERGE_FIRST_CHECKS_CEILING:-18064}"
 FIRST_CHECKS_POLL="${ADMIN_MERGE_FIRST_CHECKS_POLL:-60}"
+#   FIRST_CHECKS_POLL_MAX the CEILING the interval doubles towards while a poll
+#                        observes NO change (see THE GEOMETRIC BACKOFF below).
+#                        The reason is the FLEET, not the lane: this account's
+#                        5000/h bucket is shared by every lane on every box, and
+#                        ~20 lanes each re-asking the same unanswered question
+#                        every 60 s is what exhausts it. Measured 2026-11-03:
+#                        five rails' logs held 85/75/56/54 FIRST-CHECKS polls on
+#                        heads whose runs never advanced (one run `queued`, 4
+#                        jobs at step 0/0), and the account hit remaining=0 with
+#                        `gh run list` answering 403 to the whole fleet. 300 s is
+#                        the SAME ceiling the MERGE-REF window's own interval
+#                        uses; it is a floor on how often a silent surface is
+#                        re-read, never a shortening of any wait.
+FIRST_CHECKS_POLL_MAX="${ADMIN_MERGE_FIRST_CHECKS_POLL_MAX:-300}"
+
+# ── THE WHOLE-ATTEMPT DEADLINE — a bound on the ACTUATION, not on one wait ─────
+# #3223's framing, unchanged and still true: "A bound on each wait is not a bound
+# on the ATTEMPT." Every wait below carries its own bound and they are all
+# honest; nothing bounded their SUM, so a rail could cross four waits each
+# inside its own bound and spend hours proving it. Measured 2026-11-02 on the mac
+# box: five agent-infra rails live for 32:46-59:09 (`ZERO-PROGRESS(5/5)`,
+# agent-infra#3287 comment 6582780730), one actuator holding five of its eight
+# slots.
+#
+# ⛔ WHY THE OBVIOUS DEFAULT IS A NO-OP, STATED AS ARITHMETIC. #3287's diff sets
+# `RAIL_DEADLINE = FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT` =
+# `18064 + 4 x 3900 = 33664s` (9h21m04s). The bounds it is the sum OF are the
+# bounds that actually fire: FIRST_CHECKS_CEILING ends a first-checks wait at
+# 18064s, RERUN_BUDGET ends the re-run phase at 1800s, the MERGE-REF window at
+# 90s. A rail cannot legitimately REACH 33664s, because every phase that could
+# carry it there is already bounded well below it — so the deadline is dead code
+# that reads as protection. That is the SAME defect `lane-merge.sh:116-122`
+# records and fixed in its own sizing ("the two sides EQUAL ... an instrument
+# that only fires for a lane that could not exist"): a bound whose value is
+# unreachable is not a bound. It is also 1.36x the 6h53m rail #3223 was written
+# against, so it would not have fired on the case that motivated it either.
+#
+# ⛔ SO THE NUMBER IS THE REACHABLE ONE, DERIVED FROM THE PHASE BOUNDS:
+#     RAIL_DEADLINE = FIRST_CHECKS_CEILING + RERUN_BUDGET + 2 x SELF_EDIT_WAIT + MERGE_REF_WAIT
+#                   = 18064 + 1800 + 2 x 300 + 90 = 20554s  (5h42m34s)
+# i.e. ONE full-length first-checks wait (18064s = 2 x the 9032s slowest measured
+# green run, the rail's own worst-case honest run), one re-run phase (1800s), the
+# self-edit wait (2 x 300s — it has two live call sites per attempt) and the
+# merge-ref window (90s) — and no more. The ceiling is the SUM of the phase bounds
+# this guard supervises, computed by `rail_deadline_default`, so it is never short
+# of what it claims to cover. That is above the worst-case HEALTHY
+# landing this rail knows about (one slow run, one flake re-run), and below
+# #3287's 33664s by 41%, where it actually terminates something. Raising the
+# number is NOT the fix (`:855`): an override above the reachable ceiling is
+# CLAMPED to it and the clamp is DISCLOSED, so the reported bound is never a
+# number the rail did not use.
+#
+# ⛔ FALSE-POSITIVE RISK, DECLARED (this is an ELAPSED bound, not a stall claim).
+# A genuinely healthy attempt needing TWO consecutive near-ceiling first-checks
+# waits would be refused here at 20554s instead of at 2 x 18064s. No such
+# landing is represented in any measurement this rail holds (the observed
+# population at this scale is STUCK, not healthy), and the outcome is exit 1 —
+# a parked head that the next invocation re-runs — never a false green, and never
+# a merge that would otherwise have happened. It is operator-overridable. This is
+# deliberately NOT a progress-liveness bound: the rail ALREADY rejected
+# job/step-transition progress as a stall signal for exactly this wait
+# (`:6256-6261`: `updatedAt` is frozen for a whole long step), so a
+# progress-resetting clock here would fire on a legitimate silent step — the
+# false stall §39 pins out.
+# ⛔ THE VALUES ARE COMPUTED AT CALL TIME, NOT HERE. Two of the four phase bounds
+# this deadline must cover (SELF_EDIT_WAIT, MERGE_REF_WAIT) are declared LATER in
+# this file, so a load-time sum would either crash under `set -u` or silently omit
+# them (see `rail_deadline_default` below). They are also left UNSET until
+# `rail_attempt_start` validates them: an UNVALIDATED non-integer makes `[ -ge ]`
+# ERROR, and under `set -u` without `-e` that SKIPS the guard — a fail-open
+# (`validate_timing_knobs`'s own rule, `:1880-1885`). So the knob is refused BY
+# NAME at start, exactly like every other timing knob, and never merely defaulted.
+RAIL_DEADLINE=""
+RAIL_DEADLINE_CEILING=0
+RAIL_DEADLINE_CLAMPED=0
+RAIL_STARTED_AT=0
 # CHECK_UNRESOLVED_BOUND — the bound on ONE thing the FIRST-CHECKS wait never
 # bounded: a check whose NEWEST attempt has no conclusion (`status=queued`/
 # `in_progress`, `conclusion=null`) because the job behind it never got a runner.
@@ -1499,9 +1676,12 @@ fetch_run_failed_job_names() {
 
 # declared_base_equivalent <pr-check-name> — THE DECLARED LANE EQUIVALENCE (#2610):
 # print the BASE-side check NAME this PR-side check is equivalent to, or nothing when
-# there is none. The pair, its reason and its citations are in the header ("THE ONE
-# DECLARED LANE EQUIVALENCE"); this is the ONE implementation and
-# `named_unattributable_runs` is its ONLY reader.
+# there is none. TWO readers, one question (see the header): `named_unattributable_runs`
+# names with it and exempts nothing; `base_owned_check` (#3322) uses it to decide a §4.5
+# exclusion, and only together with the base's own MEASURED red. The pair, its reason
+# and its citations are in the header ("THE ONE
+# DECLARED LANE EQUIVALENCE"); this is the ONE implementation, and a SECOND name-keyed
+# map is the drift the rail's one-derivation rule forbids.
 #
 # ⛔ STRUCTURAL, NOT A PREFIX, AND DELIBERATELY NARROW. Every arm is a specific,
 # cited pair. A rule that read "a shell suite failed" as an equivalence would make
@@ -1540,6 +1720,38 @@ declared_base_equivalent() {
       printf '%s\n' 'script-validate'
       ;;
   esac
+  return 0
+}
+
+# base_owned_check <pr-check-name> <base-owned-names-file> — #3322's matcher: print the
+# BASE-side check name that makes this PR-side red BASE-OWNED, or nothing when it is
+# not. `<base-owned-names-file>` is written by the caller from the BASE probe's own
+# MEASURED surface (one failing check name per line, restricted to the ones whose
+# workflow declares no PR trigger) — so this function only matches; it never decides
+# what main fails.
+#
+# ⛔ A MISSING OR EMPTY FILE ADMITS NOTHING. An unreadable base surface, a clean base,
+# and a base whose only reds are PR-evaluable all produce an empty file, and all three
+# must leave the red blocking (see "A CHECK MAIN ITSELF FAILS" in the header). A
+# matcher that treated "no evidence" as "no red on main" — or as "red on main" — would
+# turn the exclusion into the blanket pass it exists not to be.
+# ⛔ THE MATCH IS EXACT (`grep -F -x`), never a prefix: `bash-suites-gate` is NOT
+# `bash-suites (n)` and `script-validate` is not `extension-tests / script-validate`.
+# The declared mapping is the ONLY widening, and it is one cited pair.
+# ⛔ NO EXIT STATUS MEANS "NOT BASE-OWNED", exactly like `declared_base_equivalent`:
+# the answer is stdout, so a caller can never mistake an empty answer for a failure.
+base_owned_check() {
+  local name="${1:-}" names_file="${2:-}" mapped=""
+  [ -n "$name" ] && [ -s "$names_file" ] || return 0
+  if grep -Fxq -e "$name" -- "$names_file" 2>/dev/null; then
+    printf '%s\n' "$name"
+    return 0
+  fi
+  mapped="$(declared_base_equivalent "$name")"
+  [ -n "$mapped" ] || return 0
+  if grep -Fxq -e "$mapped" -- "$names_file" 2>/dev/null; then
+    printf '%s\n' "$mapped"
+  fi
   return 0
 }
 
@@ -2095,6 +2307,29 @@ validate_timing_knobs() {
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL='${FIRST_CHECKS_POLL}' — beyond the usable"
     say_err "   range (max ${POLL_INTERVAL_MAX}s)."
+  fi
+  # The backoff ceiling. Same two-stage discipline as the interval it bounds: a
+  # non-numeric or leading-zero value is REFUSED rather than silently coerced,
+  # because it decides how long a silent surface goes unread.
+  if counter_has_leading_zero "$FIRST_CHECKS_POLL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${FIRST_CHECKS_POLL_MAX}' — a LEADING ZERO"
+    say_err "   is ambiguous: bash ARITHMETIC reads it as OCTAL while 'sleep' sleeps it as DECIMAL."
+  elif ! counter_is_positive "$FIRST_CHECKS_POLL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${FIRST_CHECKS_POLL_MAX}' — the backoff"
+    say_err "   ceiling must be a POSITIVE integer number of seconds."
+  elif counter_exceeds_max "$FIRST_CHECKS_POLL_MAX" "$POLL_INTERVAL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${FIRST_CHECKS_POLL_MAX}' — beyond the usable"
+    say_err "   range (max ${POLL_INTERVAL_MAX}s)."
+  elif counter_is_positive "$FIRST_CHECKS_POLL" \
+     && [ "$((10#$FIRST_CHECKS_POLL_MAX))" -lt "$((10#$FIRST_CHECKS_POLL))" ]; then
+    # Not a refusal: a ceiling below the base interval simply means the interval
+    # never grows. Say so once, so nobody reads that as "the backoff is broken".
+    say_err "admin-merge: note — ADMIN_MERGE_FIRST_CHECKS_POLL_MAX (${FIRST_CHECKS_POLL_MAX}s) is below"
+    say_err "   ADMIN_MERGE_FIRST_CHECKS_POLL (${FIRST_CHECKS_POLL}s), so the FIRST-CHECKS interval never backs"
+    say_err "   off. Legal (it is the operator's ceiling), and what the rail's own suite may use."
   fi
   # The MERGE-REF window. 0 is legal and means "one observation, no waiting".
   if counter_has_leading_zero "$MERGE_REF_WAIT"; then
@@ -2943,6 +3178,7 @@ resolve_merge_ref() {
     info "admin-merge: … MERGE-REF wait: GitHub is still computing mergeability (mergeable=${state:-<empty>}; ${waited}s of the ${MERGE_REF_WAIT}s window, attempt $attempt) — waiting."
     adv=$((10#$step))
     [ "$adv" -gt $((MERGE_REF_WAIT - waited)) ] && adv=$((MERGE_REF_WAIT - waited))
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     [ "$adv" -gt 0 ] && sleep "$adv"
     waited=$((waited + adv))
   done
@@ -3055,6 +3291,243 @@ refuse_rerun_budget() {
     say_err "   KNOWN to be slow. A larger --rerun-attempts would NOT help: the wall clock is the bound."
   fi
   say_err "   No merge."
+}
+
+# _rail_knob — sanitise ONE phase bound for the ceiling arithmetic. A non-numeric
+# or leading-zero value is 0 HERE and is refused BY NAME moments later by
+# `validate_timing_knobs`; the point is that a bad operator value must not turn
+# load-time arithmetic into an "unbound variable"/octal crash before the rail can
+# name the knob (review P2, verified: a non-numeric RERUN_BUDGET used to abort
+# with `line 980: <value>: unbound variable` and no message naming it).
+_rail_knob() {
+  case "${1:-}" in ''|*[!0-9]*) printf 0 ;; 0*) printf 0 ;; *) printf '%s' "$1" ;; esac
+}
+
+# rail_deadline_default — the REACHABLE whole-attempt ceiling, derived from every
+# phase bound `rail_guard_poll` supervises. Computed at CALL time because
+# SELF_EDIT_WAIT and MERGE_REF_WAIT are declared later in this file than
+# FIRST_CHECKS_CEILING/RERUN_BUDGET; a load-time sum would omit them (review P2:
+# omitting them made the stated derivation 390s short of the sum it claimed).
+# 2 x SELF_EDIT_WAIT, not 1 x: `settle_self_edit_generation` has TWO live call
+# sites in the §1b loop (:8323 and :8346) and the first deliberately resets
+# `pr_self_edit_retry=0` so the probe runs AGAIN on the re-read, so a single
+# invocation may legitimately spend that bound twice (review cycle 4, P2). The
+# ceiling must be the sum of what the guard actually supervises, or it refuses a
+# healthy attempt with its own phase bounds still unspent — the defect this
+# comment block was written to fix, one term over.
+rail_deadline_default() {
+  printf '%s' "$(( $(_rail_knob "${FIRST_CHECKS_CEILING:-0}") + $(_rail_knob "${RERUN_BUDGET:-0}") + 2 * $(_rail_knob "${SELF_EDIT_WAIT:-0}") + $(_rail_knob "${MERGE_REF_WAIT:-0}") ))"
+}
+
+# rail_now — the attempt clock's only source of time. NO ambient override: an
+# injectable "now" was a bypass in review (a frozen clock makes `elapsed` negative
+# and the guard never fires), and no arm needs it — the START is the driven quantity.
+rail_now() { date +%s; }
+
+# rail_attempt_start — start the whole-attempt clock, and VALIDATE the knob.
+# Idempotent: the FIRST start wins, so a re-entrant path cannot reset the
+# attempt's age (a deadline a caller can restart is not a deadline).
+rail_attempt_start() {
+  [ "${RAIL_STARTED_AT:-0}" -gt 0 ] 2>/dev/null && return 0
+  RAIL_DEADLINE_CEILING="$(rail_deadline_default)"
+  [ -n "${RAIL_DEADLINE:-}" ] || RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$RAIL_DEADLINE_CEILING}"
+  # ⛔ REFUSED BY NAME, NOT DEFAULTED SILENTLY. `[ -ge ]` on a non-integer ERRORS,
+  # and under `set -u` without `-e` an erroring `if` body is SKIPPED — so an
+  # unvalidated typo does not weaken the bound, it DELETES it. Verified in review:
+  # `ADMIN_MERGE_RAIL_DEADLINE=10m` let a 600s-aged attempt proceed. The branches
+  # below are `validate_timing_knobs`' rule (`:1880-1907`) applied to the one
+  # timing knob that was not wired into it.
+  # ORDER IS LOAD-BEARING (review cycle 2, P2): non-numeric and OVER-RANGE are
+  # tested BEFORE any `[ -ge ]`/`[ -le ]`, because an out-of-range all-digit value
+  # makes those comparisons print a raw "integer expression expected" BEFORE any
+  # named refusal — the exact complaint this validation exists to answer. `0` gets
+  # its OWN message: the leading-zero branch used to catch it and tell the operator
+  # to drop a leading zero it did not have.
+  case "${RAIL_DEADLINE:-}" in
+    ''|*[!0-9]*)
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — it must be a POSITIVE integer number of seconds."
+      say_err "   A non-numeric bound makes the deadline's own comparison ERROR, which SKIPS the guard"
+      say_err "   instead of enforcing it (fail-open). Omit it to use the derived ${RAIL_DEADLINE_CEILING}s."
+      exit 2 ;;
+  esac
+  if [ "${#RAIL_DEADLINE}" -gt 9 ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — beyond the usable integer range."
+    say_err "   An all-digit value past the shell's range makes the comparison error out, SKIPPING the guard."
+    exit 2
+  fi
+  if [ "$RAIL_DEADLINE" -eq 0 ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='0' — a zero bound refuses EVERY attempt at its first poll."
+    say_err "   That parks every merge in the fleet instead of bounding a stuck one. Omit it for ${RAIL_DEADLINE_CEILING}s."
+    exit 2
+  fi
+  case "${RAIL_DEADLINE}" in
+    0*)
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — a LEADING ZERO is ambiguous."
+      say_err "   Write it without the leading zero (e.g. '19864', not '019864')."
+      exit 2 ;;
+  esac
+  # TEST SEAM, and it is fail-safe BECAUSE IT IS CLAMPED: an injected start can
+  # only make the attempt OLDER, never younger (review P1: passing a future stamp
+  # made the rail evade its own deadline). A live rail cannot use it to escape.
+  # ⛔ THE CLOCK IS AN INPUT TOO. `rail_now` is the guard's only external
+  # dependency and it was the one value with NO validation: with a `date` that
+  # fails, `[ -lt ]`/`[ -ge ]` errored, the erroring body was SKIPPED (set -u, no
+  # -e), and a 600s-aged attempt under a 60s bound EXITED 0 — an inert enforcer,
+  # the exact class this change removes (review cycle 4, P2). An unreadable clock
+  # REFUSES (exit 1): a deadline that cannot read time must not report success.
+  if [ -n "${ADMIN_MERGE_RAIL_STARTED_AT:-}" ]; then
+    # THE SEAM GETS THE SAME LADDER AS THE KNOB (review cycle 2, P1: an all-digit
+    # 23-digit stamp made `[ -lt ]` ERROR, the erroring `if` body was SKIPPED under
+    # `set -u` without `-e`, and the attempt's age was silently CANCELLED — the
+    # young direction the clamp exists to forbid. A LEADING ZERO was worse than
+    # silent: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL and
+    # the rail refused a healthy attempt with a 1.5-billion-second elapsed).
+    case "$ADMIN_MERGE_RAIL_STARTED_AT" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_STARTED_AT='${ADMIN_MERGE_RAIL_STARTED_AT}' — not an integer epoch."
+        exit 2 ;;
+    esac
+    if [ "${#ADMIN_MERGE_RAIL_STARTED_AT}" -gt 12 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_STARTED_AT='${ADMIN_MERGE_RAIL_STARTED_AT}' — beyond the usable integer range."
+      exit 2
+    fi
+    case "$ADMIN_MERGE_RAIL_STARTED_AT" in
+      0*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_STARTED_AT='${ADMIN_MERGE_RAIL_STARTED_AT}' — a LEADING ZERO is ambiguous (octal vs decimal)."
+        exit 2 ;;
+    esac
+    _real_now="$(rail_now)"
+    case "$_real_now" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:clock-unreadable, ${PR:-?})"
+        say_err "   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline"
+        say_err "   cannot be evaluated. Refusing rather than proceeding with an unenforceable bound."
+        exit 1 ;;
+    esac
+    if [ "$ADMIN_MERGE_RAIL_STARTED_AT" -lt "$_real_now" ]; then
+      RAIL_STARTED_AT="$ADMIN_MERGE_RAIL_STARTED_AT"
+    else
+      # DISCLOSED, so the clamp is on the record and an arm can DISCRIMINATE it
+      # from "the guard was never reached" (cycle 2 P1: the old p4 asserted only
+      # the ABSENCE of a refusal, which the broken code also produced).
+      say_err "admin-merge: note — ADMIN_MERGE_RAIL_STARTED_AT=${ADMIN_MERGE_RAIL_STARTED_AT} is not in the past; CLAMPED to now (${_real_now}). The attempt clock can only be made OLDER, never younger."
+      RAIL_STARTED_AT="$_real_now"
+    fi
+  else
+    RAIL_STARTED_AT="$(rail_now)"
+  fi
+  # THE CLAMP IS DISCLOSED AT START, so the bound the rail actually uses is on
+  # the record from the first poll — not only in a refusal that may never print.
+  if [ "$RAIL_DEADLINE" -gt "$RAIL_DEADLINE_CEILING" ]; then
+    RAIL_DEADLINE_CLAMPED=1
+    say_err "admin-merge: note — ADMIN_MERGE_RAIL_DEADLINE=${RAIL_DEADLINE}s CLAMPED to the reachable ${RAIL_DEADLINE_CEILING}s (FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + RERUN_BUDGET ${RERUN_BUDGET}s + 2 x SELF_EDIT_WAIT ${SELF_EDIT_WAIT:-0}s + MERGE_REF_WAIT ${MERGE_REF_WAIT:-0}s). A deadline ABOVE the sum of the phase bounds it supervises can never fire — every phase that could carry the attempt there is bounded below it — so an unreachable number is refused rather than trusted."
+    RAIL_DEADLINE="$RAIL_DEADLINE_CEILING"
+  fi
+
+  # ⛔ NAMED, NOT SILENT — the one half of #3287's "deadline must EXCEED
+  # FIRST_CHECKS_CEILING" relation that still applies. The relation cannot be a REFUSAL
+  # here: #3294's reviewed contract deliberately ACCEPTS an override below the reachable
+  # ceiling (its `(p1)` 60s and `(p6)` 500s arms pin the bound IN FORCE), and the clamp
+  # above already rejects the dangerous direction (a bound that can never fire). But an
+  # override below FIRST_CHECKS_CEILING still fires in the middle of a first-checks wait
+  # this rail itself declares legal, and #3287 refused it BY NAME at startup precisely so
+  # the operator learned immediately rather than after a wasted attempt. Keep that: name it
+  # on stderr, do not exit. Skipped when the start seam is in use — the seam can only make
+  # the attempt OLDER, so it is how a short bound is driven on purpose.
+  if [ -z "${ADMIN_MERGE_RAIL_STARTED_AT:-}" ] \
+     && [ "$RAIL_DEADLINE" -le "${FIRST_CHECKS_CEILING:-0}" ]; then
+    say_err "admin-merge: note — ADMIN_MERGE_RAIL_DEADLINE=${RAIL_DEADLINE}s is BELOW ADMIN_MERGE_FIRST_CHECKS_CEILING=${FIRST_CHECKS_CEILING}s, so this attempt bound fires DURING a first-checks wait the rail itself declares legal. Every invocation will refuse part-way through a legal wait. Raise it above the ceiling (the derived reachable bound is ${RAIL_DEADLINE_CEILING}s) unless a short bound is exactly what you want."
+  fi
+  # ── THE LEASE TTL IS DERIVED FROM THE RESOLVED BOUND (#3287's relation, #3294's clock) ──
+  # ⛔ THE RELATION IS ENFORCED HERE, NOT IN `validate_rail_bounds`, because it is a
+  # relation between TWO RESOLVED values and the resolution happens on this line — a
+  # load-time derivation cannot express it any more. It is still LOAD-BEARING: a lease
+  # must outlive the attempt that holds it, or a rail still running inside its own
+  # deadline can have its lease stolen and two rails would then hold the same PR.
+  # The +3600 offset is preserved from #3287 so an operator override keeps its meaning.
+  RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$(( RAIL_DEADLINE + 3600 ))}"
+  case "${RAIL_LOCK_TTL}" in
+    ''|*[!0-9]*)
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."
+      exit 2 ;;
+  esac
+  # 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent: a
+  # SIGKILLed rail's lease whose pid was reused by a long-lived fleet process is never
+  # reclaimable and the head is parked.
+  if [ "$RAIL_LOCK_TTL" -le 0 ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."
+    exit 2
+  fi
+  if [ "$RAIL_LOCK_TTL" -le "$RAIL_DEADLINE" ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' with ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the lease TTL must EXCEED the whole-attempt bound, or a rail still running inside its own deadline can have its lease stolen and two rails would then hold the same PR."
+    exit 2
+  fi
+}
+
+# refuse_rail_deadline <elapsed> — the WHOLE-ATTEMPT refusal, one spelling.
+# Terminal and GREPPABLE (`REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)`) and
+# exit 1, so the next supervisor sees a FAILED ACTUATION instead of a live
+# process holding a slot. It never claims the run stalled: the bound that
+# expired is a policy bound on the attempt, and the merge decision is untouched.
+refuse_rail_deadline() {
+  local elapsed="$1"
+  say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s, ${PR:-?})"
+  if [ "${RAIL_DEADLINE_CLAMPED:-0}" -eq 1 ]; then
+    say_err "   The deadline in force was CLAMPED to the reachable ceiling: ${RAIL_DEADLINE_CEILING}s"
+  fi
+  say_err "   The WHOLE-ATTEMPT deadline is ADMIN_MERGE_RAIL_DEADLINE (currently ${RAIL_DEADLINE}s)."
+  say_err "   It exists because a bound on each wait is not a bound on the ATTEMPT: measured 2026-11-02,"
+  say_err "   five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's bound."
+  say_err "   This is NOT a stall claim and NOT a verdict on any run: no merge decision is made here,"
+  say_err "   nothing is cleared green, and the head is parked for the next invocation to re-run."
+  if [ "${RAIL_DEADLINE}" -ge "${RAIL_DEADLINE_CEILING}" ] 2>/dev/null; then
+    # AT THE CEILING THE OLD REMEDY WAS IMPOSSIBLE: "raise it up to the ceiling" is
+    # a no-op when it already IS the ceiling, and following it reproduces the same
+    # refusal after another full attempt (review cycle 2, P2).
+    say_err "   The bound is ALREADY at its reachable ceiling (${RAIL_DEADLINE_CEILING}s = the sum of the"
+    say_err "   phase bounds this guard supervises), so raising ADMIN_MERGE_RAIL_DEADLINE cannot help."
+    say_err "   Raising it means raising a PHASE bound (FIRST_CHECKS_CEILING / RERUN_BUDGET / SELF_EDIT_WAIT"
+    say_err "   / MERGE_REF_WAIT) and saying why — or accepting that this head needs an operator look."
+  else
+    say_err "   Raise it (ADMIN_MERGE_RAIL_DEADLINE) only up to ${RAIL_DEADLINE_CEILING}s — beyond that it cannot fire."
+  fi
+  exit 1
+}
+
+# rail_guard_poll — called at the head of EVERY poll iteration. One clock, one
+# comparison, one exit, so the attempt's age cannot drift between wait loops
+# (`lane-merge.sh:130`: "ONE absolute operation deadline ... instead of
+# resetting a fresh timeout at each phase").
+rail_guard_poll() {
+  local now elapsed
+  rail_attempt_start
+  now="$(rail_now)"
+  case "$now" in
+    ''|*[!0-9]*)
+      say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:clock-unreadable, ${PR:-?})"
+      say_err "   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline"
+      say_err "   cannot be evaluated. Refusing rather than proceeding with an unenforceable bound."
+      exit 1 ;;
+  esac
+  elapsed=$(( now - RAIL_STARTED_AT ))
+  if [ "$elapsed" -ge "${RAIL_DEADLINE:-0}" ]; then
+    refuse_rail_deadline "$elapsed"
+  fi
+  # ── #3287's terminal-state re-read, preserved through #3294's clock ──────────
+  # It is ORTHOGONAL to the deadline: it stops a rail early when the PR itself reached
+  # a terminal state (MERGED/CLOSED), where the deadline stops an attempt that outlived
+  # its own bounds. Both were added to this same function on different bases, so the
+  # integration keeps BOTH rather than picking a side.
+  # Throttled on ELAPSED TIME, not tick count: a spinning silent branch polls every ~1s
+  # while a FIRST-CHECKS poll is every 60s, so a tick-based throttle is ~6s in one loop
+  # and ~6min in the other — wrong in both directions. 60s is the value the comment claims.
+  RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
+  if [ -n "${RAIL_LOCK_PR:-}" ] \
+     && [ $((now - RAIL_LAST_TERMINAL_CHECK)) -ge "$RAIL_TERMINAL_CHECK_EVERY" ]; then
+    RAIL_LAST_TERMINAL_CHECK=$now
+    rail_stop_if_pr_terminal
+  fi
+  return 0
 }
 
 # fetch_run_jobs <run-id> → the raw jobs JSON on stdout. The API rather than
@@ -4715,10 +5188,29 @@ PY
 wait_for_first_checks() {
   local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs cr_slug scan_rc scan_out
-  local max_step_run fp_run summary_run read_ok n_lines idx
-  local stall_bound ceiling_bound signal_ok poll_step remaining adv wait_word expired
+  local max_step_run fp_run summary_run read_ok n_lines idx cached
+  local stall_bound ceiling_bound signal_ok poll_step poll_max backoff_step remaining adv wait_word expired
   local rederive_left lane_filter_active head_checks
-  local -a jobs_files=() pending_ids=()
+  local -a jobs_files=() pending_ids=() fetched_ids=()
+  # ── THE PER-RUN OBSERVATION CACHE ──────────────────────────────────────
+  # `status.<id>` is the RUN-level status from this poll's run list (the cheap
+  # call, always made); `line.<id>` is that run's last observed Jobs digest line.
+  # They exist so a run that CANNOT advance is not re-read — see the skip in the
+  # probe loop below.
+  # ⛔ FILES, NOT `local -A`. This script runs under `#!/usr/bin/env bash`, and
+  # macOS still ships bash 3.2, where `local -A` is an ERROR: the arrays would be
+  # left undeclared (a stray `local: -A: invalid option` on the rail's stderr) and
+  # a non-numeric id would then become a `bad array subscript`. A directory of
+  # one-line files has no version floor and no subscript arithmetic.
+  # ⛔ NEVER BUILD A PATH TO `rm -rf` FROM AN UNGUARDED VARIABLE — AND NEVER REPAIR THE
+  # GLOBAL TO DO IT. `TMP` is assigned from `mktemp -d` without a `|| exit`, so a failed
+  # mktemp leaves it EMPTY and `$TMP/fc-cache` would be `/fc-cache`. Reassigning `TMP`
+  # here would be worse: the exit trap is `trap 'rm -rf "${TMP:-}"' EXIT` — SINGLE
+  # quoted, so it expands at TRAP time, i.e. after this function ran, and a fallback
+  # written here would turn the trap into `rm -rf /tmp`. Keep both the substitution and
+  # the scope LOCAL.
+  local fcdir="${TMP:-${TMPDIR:-/tmp}}/fc-cache"
+  rm -rf "$fcdir" 2>/dev/null; mkdir -p "$fcdir" 2>/dev/null
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_QUIET=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""
   FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
@@ -4730,6 +5222,12 @@ wait_for_first_checks() {
   poll_step="$FIRST_CHECKS_POLL"
   [ "$poll_step" -gt 0 ] 2>/dev/null || poll_step=1
   poll_step=$((10#$poll_step))
+  # The backoff ceiling never starts BELOW the base interval (see the knob note).
+  poll_max="$FIRST_CHECKS_POLL_MAX"
+  [ "$poll_max" -gt 0 ] 2>/dev/null || poll_max="$poll_step"
+  poll_max=$((10#$poll_max))
+  [ "$poll_max" -lt "$poll_step" ] && poll_max="$poll_step"
+  backoff_step="$poll_step"
   # ── THE 0 SEAM. `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` means "one observation, no
   # waiting" (the pre-#2090 instant refusal, and the rail suite's default). It
   # keeps that meaning for the WHOLE wait: when the legacy window is 0 AND no
@@ -4782,6 +5280,7 @@ wait_for_first_checks() {
         total=$((total + 1))
         [ "$status" = "completed" ] && continue
         pending_ids+=("$id")
+        printf '%s\n' "$status" 2>/dev/null > "$fcdir/status.$id"
         [ -n "$obs" ] && obs="$obs; "
         obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
       done < <(printf '%s\n' "$out" | awk -F'\t' '{ printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
@@ -4847,11 +5346,46 @@ wait_for_first_checks() {
     max_step=0
     if [ "$total" -gt 0 ]; then
       if [ "${#pending_ids[@]}" -gt 0 ] && [ "${#pending_ids[@]}" -le "$FIRST_CHECKS_JOBS_MAX" ]; then
-        jobs_files=()
+        jobs_files=(); fetched_ids=()
         read_ok=1
         for id in "${pending_ids[@]}"; do
+          # ── THE ZERO-STEP GUARD (#gh-quota): a `queued` run's job steps CANNOT
+          # advance, so a Jobs read for it can only re-observe the value already
+          # cached. No runner has picked the run up; every job sits at step 0/0.
+          # The RUN LIST above is the status oracle that tells this wait when the
+          # run actually starts, so the per-run read is spent ONCE per queued
+          # spell and then withheld until the status LEAVES `queued` — which
+          # fails this condition and re-probes. Nothing is assumed about the
+          # surface: the cached line is the real observation, and the fingerprint
+          # it feeds is unchanged, so the stall clock keeps advancing exactly as
+          # it does on a re-read of an unchanged run.
+          #
+          # MEASURED (2026-11-03): five rails' logs on this box held 85 / 75 / 56 /
+          # 54 FIRST-CHECKS polls on heads whose runs never advanced — the 85-poll
+          # one waited ~5185 s on a single `queued` run with 4 jobs at step 0/0,
+          # paying 1 run list + 1 Jobs read per poll, and the account reached
+          # remaining=0 while `gh run list` answered 403 to the whole fleet. The
+          # zero-JOB exclusion (#1623) still gets its ONE read: the first probe
+          # establishes the count, and a run PROVEN to have no jobs is dropped by
+          # the same `jobs == 0` arm as before.
+          cached="$fcdir/line.$id"
+          if [ -f "$cached" ] && [ "$(cat "$fcdir/status.$id" 2>/dev/null)" = "queued" ]; then
+            # ⛔ ONLY A LINE THAT MEASURED SOMETHING IS REUSABLE. `first_checks_digest`
+            # emits `unknown\t0\t\t` when it could not parse the document and
+            # `0\t0\t\t` for a run GitHub never expanded. Both are NON-EMPTY, so
+            # testing "is there a line" alone would make a TRANSIENT unreadable
+            # surface permanent for the whole queued spell (disabling #2481(g), the
+            # fail-then-recover case) and would keep a still-`queued` run that DID
+            # expand excluded forever — which can clear the wait on `pending == 0`
+            # while a run is pending, the pre-#2481 false-clear. A positive job
+            # COUNT is the only thing that proves an observation.
+            case "$(cut -f1 "$cached" 2>/dev/null)" in
+              ''|*[!0-9]*|0) : ;;              # unknown / 0 → re-probe
+              *) continue ;;
+            esac
+          fi
           if fetch_run_jobs "$id" > "$TMP/fc-jobs-$id.json" 2>/dev/null && [ -s "$TMP/fc-jobs-$id.json" ]; then
-            jobs_files+=("$TMP/fc-jobs-$id.json")
+            jobs_files+=("$TMP/fc-jobs-$id.json"); fetched_ids+=("$id")
           else
             rm -f "$TMP/fc-jobs-$id.json"
             read_ok=0
@@ -4863,47 +5397,42 @@ wait_for_first_checks() {
         # unreadable surface.
         [ "$read_ok" -eq 1 ] || pending="${#pending_ids[@]}"
         if [ "$read_ok" -eq 1 ]; then
-          digest="$(first_checks_digest "${jobs_files[@]}")"
-          n_lines="$(printf '%s\n' "$digest" | grep -c . || true)"
-          if [ "$n_lines" -eq "${#pending_ids[@]}" ]; then
-            signal_ok=1
+          # ONE parser call for every run actually read this poll; each line is
+          # filed against its OWN run id, so the skipped (cached) runs keep the
+          # line they were last observed with and the two kinds cannot be paired
+          # with the wrong run.
+          if [ "${#jobs_files[@]}" -gt 0 ]; then
+            digest="$(first_checks_digest "${jobs_files[@]}")"
             idx=0
-            for id in "${pending_ids[@]}"; do
+            for id in "${fetched_ids[@]}"; do
               idx=$((idx + 1))
-              line="$(printf '%s\n' "$digest" | sed -n "${idx}p")"
-              IFS=$'\t' read -r jobs max_step_run fp_run summary_run <<< "$line"
-              jobs="${jobs:-unknown}"
-              max_step_run="${max_step_run:-0}"
-              case "$max_step_run" in ''|*[!0-9]*) max_step_run=0 ;; esac
-              # A run PROVEN to have zero jobs is not in flight (#1623): GitHub
-              # never expanded it, so it must not hold this wait. An UNREADABLE
-              # count is not zero — it stays pending, fail-closed.
-              [ "$jobs" = "0" ] && continue
-              [ "$jobs" = "unknown" ] && signal_ok=0
-              pending=$((pending + 1))
-              [ "$max_step_run" -gt "$max_step" ] && max_step="$max_step_run"
-              [ -n "$fp" ] && fp="$fp || "
-              fp="${fp}run:${id} ${fp_run}"
-              [ -n "$summary" ] && summary="$summary | "
-              summary="${summary}run ${id}: ${summary_run}"
+              printf '%s\n' "$(printf '%s\n' "$digest" | sed -n "${idx}p")" 2>/dev/null > "$fcdir/line.$id"
             done
-          else
-            # ⛔ A SHORT (or empty) DIGEST IS NOT "NO PENDING RUNS" EITHER. The
-            # guarantee two lines up — an unreadable surface can never fall
-            # through to `pending == 0` and CLEAR the wait — has to hold for the
-            # digest as well as for the fetch, because `first_checks_digest` is
-            # `… 2>/dev/null || true`: a parser that dies mid-list (an
-            # unparseable step number the inner handlers do not catch, an
-            # interpreter that cannot run) leaves PARTIAL stdout and no error
-            # anyone sees. Counting that against `pending` read it as "every run
-            # terminal", cleared the wait, and §1b then refused with a false
-            # diagnosis ("the wait CLEARED (the lane was terminal), but a NEW run
-            # appeared") — the pre-#2481 "gave up before classifying" shape.
-            # Same remedy as the failed-read arm: every run stays pending and the
-            # signal is marked missing.
-            pending="${#pending_ids[@]}"
-            signal_ok=0
           fi
+          signal_ok=1
+          for id in "${pending_ids[@]}"; do
+            # A run with NO line at all is one the parser did not answer for: a
+            # SHORT (or empty) digest is not "no pending runs" either. It stays
+            # pending and marks the signal missing, exactly as the previous
+            # whole-digest length check did.
+            line="$(cat "$fcdir/line.$id" 2>/dev/null)"
+            if [ -z "$line" ]; then signal_ok=0; pending=$((pending + 1)); continue; fi
+            IFS=$'\t' read -r jobs max_step_run fp_run summary_run <<< "$line"
+            jobs="${jobs:-unknown}"
+            max_step_run="${max_step_run:-0}"
+            case "$max_step_run" in ''|*[!0-9]*) max_step_run=0 ;; esac
+            # A run PROVEN to have zero jobs is not in flight (#1623): GitHub
+            # never expanded it, so it must not hold this wait. An UNREADABLE
+            # count is not zero — it stays pending, fail-closed.
+            [ "$jobs" = "0" ] && continue
+            [ "$jobs" = "unknown" ] && signal_ok=0
+            pending=$((pending + 1))
+            [ "$max_step_run" -gt "$max_step" ] && max_step="$max_step_run"
+            [ -n "$fp" ] && fp="$fp || "
+            fp="${fp}run:${id} ${fp_run}"
+            [ -n "$summary" ] && summary="$summary | "
+            summary="${summary}run ${id}: ${summary_run}"
+          done
         fi
       elif [ "${#pending_ids[@]}" -gt "$FIRST_CHECKS_JOBS_MAX" ]; then
         pending="${#pending_ids[@]}"
@@ -5098,11 +5627,38 @@ wait_for_first_checks() {
       unobservable)  [ $((FIRST_CHECKS_WAIT - missing)) -lt "$remaining" ] && remaining=$((FIRST_CHECKS_WAIT - missing)) ;;
       *)             [ $((FIRST_CHECKS_WAIT - waited)) -lt "$remaining" ] && remaining=$((FIRST_CHECKS_WAIT - waited)) ;;
     esac
-    adv="$poll_step"
+    # ── THE GEOMETRIC BACKOFF (#gh-quota) ──────────────────────────────────
+    # A poll that observed NO change doubles the interval, up to
+    # FIRST_CHECKS_POLL_MAX; the first observed TRANSITION snaps it back to the
+    # base. WHY (measured, not assumed): this account's 5000/h bucket is shared by
+    # every lane on every box, and a fixed 60 s interval makes ~20 lanes pay the
+    # full rate to re-learn that a silent run is still silent — the common case
+    # (a `queued` head waiting for a runner; one 4380 s step).
+    # ⛔ THIS SHORTENS NO WAIT AND SOFTENS NO VERDICT. The stall clock (`quiet`),
+    # the legacy window (`missing`) and the ceiling are all `$SECONDS` deltas, not
+    # poll counts, so a coarser poll moves WHEN a verdict is reached by at most one
+    # interval and cannot change WHETHER it is reached. The sleep is still clamped
+    # to the remaining room below, so a backoff step can never overshoot a bound.
+    # ⛔ THE STEP IS DRIVEN BY "THIS POLL PRODUCED NO NEW OBSERVATION", NOT BY `quiet`
+    # ALONE. `quiet` advances only in the still-running/same-fingerprint arm; the
+    # `unreadable` (the run list itself refused) and `unobservable` arms advance
+    # `missing` instead. Keying the step on `quiet` alone therefore left a lane that
+    # started during a 403 storm — this change's own incident — paying a full-rate
+    # run-list call for its entire window, while a lane that got one good observation
+    # first backed off: an inconsistency between lanes in the same storm.
+    # The RESET is still the observed transition: `quiet == 0` AND nothing missing.
+    if [ "$quiet" -eq 0 ] && [ "$missing_streak" -eq 0 ]; then
+      backoff_step="$poll_step"
+    else
+      backoff_step=$((backoff_step * 2))
+      [ "$backoff_step" -gt "$poll_max" ] && backoff_step="$poll_max"
+    fi
+    adv="$backoff_step"
     [ "$adv" -gt "$remaining" ] && adv="$remaining"
     # A non-positive remaining is a BUG in the verdict table above, not a reason to
     # spin: floor it at one second (the loop's own bound still applies next poll).
     [ "$adv" -gt 0 ] || adv=1
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     sleep "$adv"
   done
 }
@@ -5431,6 +5987,7 @@ settle_self_edit_generation() {
     step="$POLL_INTERVAL"
     [ "$step" -gt 0 ] 2>/dev/null || step=1
     [ "$step" -gt $((SELF_EDIT_WAIT - waited)) ] && step=$((SELF_EDIT_WAIT - waited))
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     [ "$step" -gt 0 ] && sleep "$step"
     waited=$((waited + step))
   done
@@ -5766,15 +6323,25 @@ lane_has_no_head_run() {
   return 0
 }
 
-# check_surface_probe <ref> <label> [<exempt-noncode-events>] — measure EVERY
-# workflow's check runs and commit statuses attached to <ref> (a branch name OR a
-# sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in the
-# summary lines, so a probe of the PR's evaluated tree never claims to be about
+# check_surface_probe <ref> <label> [<exempt-noncode-events>] [<base-owned-names-file>] —
+# measure EVERY workflow's check runs and commit statuses attached to <ref> (a branch
+# name OR a sha), into the MAIN_HEALTH_* scratch set. The `label` names the surface in
+# the summary lines, so a probe of the PR's evaluated tree never claims to be about
 # main. <exempt-noncode-events> is 1 ONLY for the BASE surface (the
 # `schedule`/`issues`/`issue_comment` exemption); the PR's evaluated tree passes 0
 # and BLOCKS on them — the third argument is explicit so the exemption can never
 # drift back onto the surface that gates the merge. Callers snapshot the scratch
 # into their own prefix (BASE_* / TREE_*) immediately; see step 2c and step 4.5.
+#
+# <base-owned-names-file> (#3322) is supplied ONLY for the PR's evaluated tree, and
+# only by §4.5. It holds the base-side check NAMES the base itself is measurably
+# failing on a workflow no PR can run; a tree red matching one (directly or via
+# `declared_base_equivalent`) is EXCLUDED from the required surface and reported
+# under its own heading rather than silently dropped. Omitted/empty = nothing is
+# excluded, which is the fail-closed direction: the base measurement is the ONLY
+# thing that can admit an exclusion, so a caller that forgets to pass it over-blocks
+# (a false block), never passes (a false PASS). See "A CHECK MAIN ITSELF FAILS" in
+# the header.
 #
 # A NON-CODE EVENT IS EXEMPT BY SURFACE, NOT BY EVENT (#1353). "Does this lane
 # measure a revision?" is a property of the EVENT; "would refusing this red
@@ -5782,10 +6349,10 @@ lane_has_no_head_run() {
 # appears on — the BASE. On the TREE the exemption can only ever exempt an
 # anomaly, because a default-branch run cannot attach to a PR head sha.
 check_surface_probe() {
-  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}"
-  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable
+  local ref="$1" label="${2:-main}" allow_noncode="${3:-0}" base_owned_file="${4:-}"
+  local slug cr_json st_json map_file py_out sha rc=0 line tag job app concl url wf ev run_id ok_rest started_iso started_epoch red_note red_note_suffix noncode blocking_reason one wf_path pr_evaluable base_owned
   local map_sel=()
-  local blocking=0 other=0 other_noneval=0
+  local blocking=0 other=0 other_noneval=0 baseowned=0
   local repo_args=()
   [ -n "${REPO:-}" ] && repo_args=(--repo "$REPO")
   MAIN_HEALTH_STATUS=""
@@ -5809,8 +6376,17 @@ check_surface_probe() {
   # this NAME?" needs the wider set: on agent-infra main's only red is `script-validate`
   # on a `push` run from ci-main.yml, which the probe correctly calls not-PR-evaluable —
   # so a reader built on RED_TS alone would answer "no such red" about the one red that
-  # exists. ONE probe, one extra accumulator: not a second reader.
+  # exists. TWO readers now consume that classification: `named_unattributable_runs`
+  # (which names a base counterpart) and step 2c's #3322 extraction (which turns the
+  # `exempt: this workflow declares no PR trigger` rows into the base-owned name list
+  # §4.5 excludes against). ONE probe, one extra accumulator: not a second reader.
   MAIN_HEALTH_ALL_REDS=""
+  # #3322: tree reds EXCLUDED because the BASE is measurably failing the same
+  # suite under its own lane's name, on a workflow no PR can run. Its own
+  # accumulator + its own display set, so an exclusion can never be mistaken for a
+  # red the surface did not carry (a silent drop) or for a red that blocked.
+  MAIN_HEALTH_REDS_BASEOWNED=""
+  MAIN_HEALTH_RED_BASEOWNED=0
   # The surface's own last-production time (max completed_at over its completed
   # checks) and that time as epoch seconds. Empty when the surface has no
   # completed check at all.
@@ -6219,7 +6795,31 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
         if [ "$noncode" -eq 1 ]; then
           blocking_reason=" — NOT EXEMPT ON THIS SURFACE: a non-code event on the PR's evaluated tree is an ANOMALY, so BLOCKING"
         fi
-        if [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
+        # ── #3322: A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE ───────
+        # The base probe runs FIRST (step 2c) and leaves the base's own
+        # not-PR-evaluable reds on disk as names (`base_owned_file`). A red on
+        # the TREE whose name — or whose declared equivalent name — is one of
+        # them is the same suite under the other lane's name, already measured
+        # red on the base, and NO PR can make it pass. Excluding it is the
+        # difference between "the PR is red" and "the repo is red", and the
+        # defect this closes refused a merge over an inherited red that no diff
+        # could clear.
+        # ⛔ TREE ONLY (`allow_noncode=0`) and ⛔ NEVER A NON-CODE RED: on the base
+        # the #6807 arm above already owns this class, and a `schedule`/`issues`
+        # red on the tree is an ANOMALY, not an inherited defect.
+        # ⛔ NOTHING IS EXCLUDED WITHOUT THE BASE MEASUREMENT. An empty file (base
+        # unread, base clean, base reds all PR-evaluable) matches nothing.
+        base_owned=""
+        if [ "$allow_noncode" -eq 0 ] && [ "$noncode" -eq 0 ]; then
+          base_owned="$(base_owned_check "$job" "$base_owned_file")"
+        fi
+        if [ -n "$base_owned" ]; then
+            [ -n "$MAIN_HEALTH_REDS_BASEOWNED" ] && MAIN_HEALTH_REDS_BASEOWNED="${MAIN_HEALTH_REDS_BASEOWNED}"$'\n'
+            MAIN_HEALTH_REDS_BASEOWNED="${MAIN_HEALTH_REDS_BASEOWNED}   • ${job} — ${concl}${red_note_suffix} — the base itself fails '${base_owned}' on a workflow that declares no PR trigger, so NO PR can make this pass; this check is that suite under the PR lane's name — ${url}"
+            [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
+            MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}${job}"$'\t'"exempt: base-owned — the base itself fails '${base_owned}', which no PR can run"
+            baseowned=$((baseowned + 1))
+        elif [ "$allow_noncode" -eq 1 ] && [ "$pr_evaluable" -eq 0 ]; then
             [ -n "$MAIN_HEALTH_REDS_OTHER" ] && MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}"$'\n'
             MAIN_HEALTH_REDS_OTHER="${MAIN_HEALTH_REDS_OTHER}   • ${job} — workflow '${wf}' — event '${ev:-(unresolved)}' — ${concl}${red_note_suffix} — NOT pull-request-evaluable (this workflow declares no pull_request/pull_request_target trigger, so no PR can attach its checks to a head sha), so NOT blocking — ${url}"
             [ -n "$MAIN_HEALTH_ALL_REDS" ] && MAIN_HEALTH_ALL_REDS="${MAIN_HEALTH_ALL_REDS}"$'\n'
@@ -6301,6 +6901,13 @@ sys.stdout.write("COUNTS\t%d\t%d\t%d\t%d\n" % (total, len(reds), len(pend), tota
   if [ "$other_noneval" -gt 0 ]; then
     MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $other_noneval further red check(s) on workflows that declare NO pull_request/pull_request_target trigger — NOT pull-request-evaluable, so reported, not blocking (no PR can attach their checks to a head sha, so no PR could ever measure them; #6807)"
   fi
+  # #3322: an EXCLUSION is stated in the summary the evidence carries, never left
+  # to a display block a caller might not print. `MAIN_HEALTH_RED_BASEOWNED` is the
+  # count the §4.5 disclosure and the posted evidence read.
+  MAIN_HEALTH_RED_BASEOWNED="$baseowned"
+  if [ "$baseowned" -gt 0 ]; then
+    MAIN_HEALTH_SUMMARY="$MAIN_HEALTH_SUMMARY; $baseowned red check(s) EXCLUDED as BASE-OWNED — the base itself fails the same suite under its own lane's name, on a workflow no PR can run, so no PR can make them pass (#3322)"
+  fi
   return 0
 }
 
@@ -6352,7 +6959,7 @@ wait_for_run() {
     # OBSERVABLE identity of the re-run we requested.
     # shellcheck disable=SC2086
     line="$($GH run view "$run_id" ${repo_args[@]+"${repo_args[@]}"} \
-      --json status,attempt --jq '"\(.status)\t\(.attempt // "")' 2>/dev/null || true)"
+      --json status,attempt --jq '"\(.status)\t\(.attempt // "")"' 2>/dev/null || true)"
     IFS=$'\t' read -r status attempt <<< "$line"
     RERUN_WAIT_LAST="status=${status:-<unreadable>} attempt=${attempt:-<unreadable>}"
     # "Could not read the run" is NOT "the run exceeded its bound". A gh failure
@@ -6364,6 +6971,7 @@ wait_for_run() {
     if [ -z "$status" ] || [ "$status" = "unknown" ]; then
       adv=$((10#$step))
       [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+      rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
       [ "$adv" -gt 0 ] && sleep "$adv"
       unobs=$((unobs + adv)); waited=$((waited + adv)); continue
     fi
@@ -6387,6 +6995,7 @@ wait_for_run() {
     fi
     adv=$((10#$step))
     [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     [ "$adv" -gt 0 ] && sleep "$adv"
     waited=$((waited + adv))
   done
@@ -6488,9 +7097,27 @@ print_bounds() {
   # runs being waited on. It is a floor on patience, never a claim that a shorter
   # silence means a wedged run.
   printf 'first-checks-stall=%s\n' "$FIRST_CHECKS_STALL"
+  # THE BOUND IN FORCE, NOT THE DEFAULT — AND NOT THE RAW KNOB EITHER (cycle 3,
+  # P2 x2). The guard runs ABOVE this function, so `RAIL_DEADLINE` is already
+  # resolved and already CLAMPED; reading `$ADMIN_MERGE_RAIL_DEADLINE` here
+  # reproduced the very fault this line exists to prevent (one invocation printed
+  # `rail-deadline=33664` beside `CLAMPED to the reachable 20254s`). There is no
+  # INVALID arm: a bad knob exits 2 in `rail_attempt_start` before this function
+  # runs, so such an arm could never execute and a comment claiming it would
+  # misdescribe the code.
+  printf 'rail-deadline=%s%s\n' "${RAIL_DEADLINE:-$(rail_deadline_default)}" \
+    "$([ "${RAIL_DEADLINE_CLAMPED:-0}" -eq 1 ] && printf ' (CLAMPED from %s)' "${ADMIN_MERGE_RAIL_DEADLINE:-}" || printf ' (in force)')"
+  printf 'rail-deadline-source=CEILING over the WHOLE ATTEMPT = FIRST_CHECKS_CEILING %ss + RERUN_BUDGET %ss + SELF_EDIT_WAIT %ss + MERGE_REF_WAIT %ss — the SUM of the phase bounds the guard supervises, so a value above it can never fire and is CLAMPED; an attempt may spend one full-length first-checks wait and one re-run phase, and no more.\n' "$(_rail_knob "${FIRST_CHECKS_CEILING:-0}")" "$(_rail_knob "${RERUN_BUDGET:-0}")" "$(_rail_knob "${SELF_EDIT_WAIT:-0}")" "$(_rail_knob "${MERGE_REF_WAIT:-0}")"
   printf 'first-checks-ceiling=%s\n' "$FIRST_CHECKS_CEILING"
   printf 'first-checks-window=%s\n' "$FIRST_CHECKS_WAIT"
   printf 'first-checks-poll=%s\n' "$FIRST_CHECKS_POLL"
+  # ⛔ NAMED `first-checks-poll-ceiling`, NOT `…-poll-max`: a bounds key ending in
+  # `max=<n>` collides with the rail suite's own anchored check that a truncated
+  # shard duration (`max=300s`) never leaks into this table — its grep is a bare
+  # substring, so a second `…max=300` key makes that assertion pass for the wrong
+  # input and the suite red. The value is a CEILING on the interval, which is what
+  # the rest of this table calls one.
+  printf 'first-checks-poll-ceiling=%s\n' "$FIRST_CHECKS_POLL_MAX"
   printf 'first-checks-source=STALL = 2 × the longest MEASURED single step (4380s, "Bash shards"); CEILING = 2 × the slowest MEASURED green run (9032s); STALL is promoted at runtime to 2 × the longest COMPLETED step on the runs being waited on; WINDOW bounds only the states with no progress to observe (no run yet, or an unreadable surface).\n'
 }
 
@@ -6760,7 +7387,7 @@ PYTEST_REPRO_ID_RE="${SHARD_REPRO_ID_RE}|${NON_LOCAL_REPRO_ID_RE}"
 # ⛔ THE SHARD ARM'S "THE RUNNER NEVER STARTED" SENTINEL (#3415 review 3, P1).
 # The shard arm's verdict IS the exit status, so every non-zero status that is not
 # the bound's (142) is read as "the base fails this shard". A LAUNCH failure has
-# no verdict at all — `cd "$cmd_dir"` failing because the worktree was reaped
+# no verdict at all — `cd "$shard_dir"` failing because the worktree was reaped
 # mid-loop, or because $TMP vanished — and it must not be mistaken for one; that
 # is how a PR-caused red would be CLEARED by an infrastructure fault. 99 is chosen
 # because it cannot collide with a shard's own `exit`: it is the status the
@@ -6957,7 +7584,11 @@ repro_shard_path() {
 # RETURN: 0 = at least one arm ran (the capture was read; `$out` may be empty) ·
 # 1 = NO arm could run, so the caller clears NOTHING. "Found nothing" is NEVER
 # reported as "could not run", and one arm that could not run never suppresses
-# the other arm's measurement.
+# the other arm's measurement. ⛔ An arm that cannot get the BASE WORKTREE it needs
+# (#3415 review 4) is one of the ways an arm "could not run" — but it is a per-arm
+# condition, not a whole-function one: a SEAM arm still runs, so the other arm's
+# measurement survives, while a PRODUCTION arm that needs the tree is refused
+# rather than run against the PR's own checkout.
 reproduce_residual_on_base() {
   local residual="$1" out="$2" base="${3:-}"
   : > "$out"
@@ -7042,31 +7673,68 @@ reproduce_residual_on_base() {
   # measurement, because turning "one family could not run" into "nothing ran"
   # is the false block #3715 exists to remove. Nothing is cleared by an arm that
   # did not run: `$out` is only ever the intersection with what was measured.
-  local cmd_dir="$PWD" used_worktree=0 need_tree=0
-  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then need_tree=1; fi
-  if [ -n "$shards" ] && [ -z "${ADMIN_MERGE_REPRO_SHARD_CMD:-}" ]; then need_tree=1; fi
+  #
+  # ⛔ EACH ARM OWNS ITS OWN DIRECTORY (#3415 review 4, P2). ONE shared directory
+  # variable made the SHARD arm's need for a worktree silently RELOCATE the PYTEST
+  # arm into it, contradicting the `ADMIN_MERGE_REPRO_CMD` contract documented above
+  # ("when set, no worktree is created and the command runs in `$PWD`") and breaking
+  # any seam command written relative to `$PWD`. Worse, a worktree that could not be
+  # created `return`ed BEFORE arm 1 ran, so one arm's missing tree suppressed the
+  # other arm's measurement — the exact false block the paragraph above promises
+  # not to produce. The PRODUCTION path still measures the SAME tree for both arms;
+  # only a SEAM arm stays in `$PWD`.
+  #
+  # ⛔ AND A PRODUCTION ARM DOES NOT RUN WITHOUT THAT TREE (#3415 review 4, P1).
+  # Both dirs fall back to `$PWD`, which is the PR'S OWN CHECKOUT. An arm that ran
+  # anyway after a failed `git worktree add` would answer "does the PR fail this?"
+  # while the code promises "does the BASE fail it?" — and every residual id is one
+  # the PR IS failing, so a PR-caused red would be cleared off an artifact nothing
+  # measured on the base. That is strictly worse than the early `return` it
+  # replaced, so EACH production arm is gated on `tree_ok` below.
+  local pytest_dir="$PWD" shard_dir="$PWD" used_worktree=0 need_tree=0
+  local nodeid_tree=0 shard_tree=0 tree_ok=0
+  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ -z "${ADMIN_MERGE_REPRO_CMD:-}" ]; then nodeid_tree=1; need_tree=1; fi
+  if [ -n "$shards" ] && [ -z "${ADMIN_MERGE_REPRO_SHARD_CMD:-}" ]; then shard_tree=1; need_tree=1; fi
   if [ "$need_tree" -eq 1 ]; then
     # PRODUCTION PATH: a pristine base worktree. No base ref, not a git repo, or a
-    # worktree that cannot be created -> clear NOTHING (fail closed).
-    [ -n "$base" ] || return 1
-    git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 || return 1
-    if ! git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+    # worktree that cannot be created -> the arm that NEEDS the tree clears NOTHING
+    # (fail closed) — but a SEAM arm still runs, because one arm without a tree is
+    # not the other arm's measurement.
+    if [ -n "$base" ] \
+       && git -C "$PWD" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+       && git -C "$PWD" worktree add --detach --force "$work/tree" "$base" >/dev/null 2>&1; then
+      tree_ok=1; used_worktree=1
+    else
       say_err "admin-merge: (reproduction) could not materialise the base '$base' as a worktree — the"
-      say_err "   residual is NOT reproduced and the rail blocks as before (fail closed)."
-      return 1
+      say_err "   residual is NOT reproduced there and the rail blocks as before (fail closed). A SEAM"
+      say_err "   arm still runs in \$PWD; a PRODUCTION arm that needs the base tree is REFUSED below."
     fi
-    cmd_dir="$work/tree"; used_worktree=1
+    if [ "$tree_ok" -eq 1 ]; then
+      if [ "$nodeid_tree" -eq 1 ]; then pytest_dir="$work/tree"; fi
+      if [ "$shard_tree" -eq 1 ]; then shard_dir="$work/tree"; fi
+    fi
   fi
 
   local reproduced_all="$work/reproduced.all" arms_ran=0
   : > "$reproduced_all"
 
   # ── ARM 1 — THE PYTEST NODEIDS (#3715) ───────────────────────────────────
-  if [ "${#nodeid_arr[@]}" -gt 0 ]; then
+  if [ "${#nodeid_arr[@]}" -gt 0 ] && [ "$nodeid_tree" -eq 1 ] && [ "$tree_ok" -ne 1 ]; then
+    # ⛔ THE PRODUCTION PYTEST ARM NEEDS THE TREE TOO (#3415 review 4, P1). `pytest_dir`
+    # falls back to the PR's own checkout, so an arm 1 that ran anyway after a failed
+    # `git worktree add` would select `uv run --frozen pytest` against the PR tree,
+    # recover the residual nodeids from ITS capture and CLEAR them — measured: a
+    # PR-caused nodeid cleared with no base ever measured, while stderr claimed the
+    # rail "blocks as before". Only a SEAM arm (caller-supplied runner, explicit
+    # `$PWD` contract) runs without the tree.
+    say_err "admin-merge: (reproduction) the pytest arm needs the base worktree and there is none — the"
+    say_err "   nodeids are NOT reproduced here (running them in this checkout would measure the PR, not"
+    say_err "   the base) and none is cleared (fail closed)."
+  elif [ "${#nodeid_arr[@]}" -gt 0 ]; then
     local -a runner=()
     if [ -n "${ADMIN_MERGE_REPRO_CMD:-}" ]; then
       runner=(bash -c "$ADMIN_MERGE_REPRO_CMD")
-    elif command -v uv >/dev/null 2>&1 && [ -f "$cmd_dir/uv.lock" ]; then
+    elif command -v uv >/dev/null 2>&1 && [ -f "$pytest_dir/uv.lock" ]; then
       runner=(uv run --frozen pytest "${nodeid_arr[@]}" -q -p no:cacheprovider)
     else
       say_err "admin-merge: (reproduction) no runnable lane runner (no ADMIN_MERGE_REPRO_CMD and no uv.lock)"
@@ -7075,7 +7743,7 @@ reproduce_residual_on_base() {
     if [ "${#runner[@]}" -gt 0 ]; then
       local raw="$work/repro.raw" run_rc=0 reproduced="" ids_rc=0
       (
-        cd "$cmd_dir" || exit 1
+        cd "$pytest_dir" || exit 1
         printf '%s\n' "$nodeids" > "$work/nodeids.txt"
         perl -e 'alarm shift; exec @ARGV' "$timeout_s" "${runner[@]}" < "$work/nodeids.txt"
       ) > "$raw" 2> "$work/repro.err" || run_rc=$?
@@ -7149,7 +7817,20 @@ reproduce_residual_on_base() {
   # MEASUREMENT of the base: the token names a LISTED shard, that shard exists in
   # the base tree, its resolved path is inside it, and the run itself returned a
   # verdict (not the bound's, not the launcher's). Everything else refuses.
-  if [ -n "$shards" ]; then
+  # ⛔ THE ARM THAT NEEDS THE TREE DOES NOT RUN WITHOUT IT (#3415 review 4, P1).
+  # `shard_dir` falls back to `$PWD`, which is the PR'S OWN CHECKOUT — so an arm
+  # that ran anyway when the base worktree could not be materialised would answer
+  # "does the PR fail this shard?" while the comment above promises "does the BASE
+  # fail it?". Every residual shard is one the PR IS failing, so a PR-caused red
+  # would be cleared off an artifact nothing measured on the base: fail-open, and
+  # strictly worse than the pre-change `return 1`, which cleared nothing. The SEAM
+  # arm is different — its runner is supplied by the caller and its `$PWD`
+  # contract is explicit — so it keeps running; only the PRODUCTION arm is gated.
+  if [ -n "$shards" ] && [ "$shard_tree" -eq 1 ] && [ "$tree_ok" -ne 1 ]; then
+    say_err "admin-merge: (reproduction) the shard arm needs the base worktree and there is none — no shard"
+    say_err "   is executed here (running one in the PR checkout would measure the WRONG tree and"
+    say_err "   clear a red the PR caused), and none is cleared (fail closed)."
+  elif [ -n "$shards" ]; then
     local token spath sraw s_rc=0 shard_seam="${ADMIN_MERGE_REPRO_SHARD_CMD:-}" shard_n=0
     local tree_real="" leaf_real="" shard_list="" shard_list_ok=0
     # THE ARM'S TOTAL BOUND (#3415 review 3). `timeout_s` bounds ONE shard, so a
@@ -7170,11 +7851,11 @@ reproduce_residual_on_base() {
       # BEFORE its live-cell placement guard, so it stays readable everywhere,
       # including the operator cells the lanes run on). Unreadable or EMPTY list ->
       # NOTHING is executed: the refusal stands exactly as before #3415.
-      if [ ! -d "$cmd_dir" ]; then
-        say_err "admin-merge: (reproduction) the base worktree '$cmd_dir' is not a directory — no shard"
+      if [ ! -d "$shard_dir" ]; then
+        say_err "admin-merge: (reproduction) the base worktree '$shard_dir' is not a directory — no shard"
         say_err "   can be measured on it, and nothing is cleared (fail closed)."
         shard_list_ok=0
-      elif shard_list="$(cd "$cmd_dir" 2>/dev/null && bash scripts/run-bash-shards.sh --list 2>/dev/null)" \
+      elif shard_list="$(cd "$shard_dir" 2>/dev/null && bash scripts/run-bash-shards.sh --list 2>/dev/null)" \
            && [ -n "$shard_list" ]; then
         shard_list_ok=1
       else
@@ -7200,7 +7881,7 @@ reproduce_residual_on_base() {
         # is separate from the verdict. Checked BEFORE membership so the refusal
         # names the true fact for an added shard (the base does not HAVE it) instead
         # of the weaker "it is not in the base's list".
-        if [ ! -f "$cmd_dir/$spath" ]; then
+        if [ ! -f "$shard_dir/$spath" ]; then
           say_err "admin-merge: (reproduction) the base tree has no '$spath' — a shard this PR ADDS"
           say_err "   cannot be measured on the base, and 'absent there' is never 'fails there'. It"
           say_err "   stays refused (fail closed)."
@@ -7227,8 +7908,8 @@ reproduce_residual_on_base() {
         # unresolved `abs_path` would refuse every shard instead of checking it.
         # The resolved path must be inside the checked-out base; a path that cannot
         # be resolved is refused, because unresolvable is not a measurement either.
-        if [ -z "$tree_real" ]; then tree_real="$(cd "$cmd_dir" && pwd -P)"; fi
-        leaf_real="$(perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$cmd_dir/$spath" 2>/dev/null)" || leaf_real=""
+        if [ -z "$tree_real" ]; then tree_real="$(cd "$shard_dir" && pwd -P)"; fi
+        leaf_real="$(perl -MCwd -e 'print Cwd::abs_path($ARGV[0])' "$shard_dir/$spath" 2>/dev/null)" || leaf_real=""
         case "$leaf_real" in
           "$tree_real"/*) ;;
           *) say_err "admin-merge: (reproduction) '$spath' resolves OUTSIDE the base worktree"
@@ -7255,16 +7936,16 @@ reproduce_residual_on_base() {
       }
       if [ -n "$shard_seam" ]; then
         (
-          cd "$cmd_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          cd "$shard_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
           perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash -c "$shard_seam" admin-merge-shard "$token"
         ) > "$sraw" 2>&1 || s_rc=$?
       else
         (
-          cd "$cmd_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
+          cd "$shard_dir" || exit "$REPRO_LAUNCH_FAILED_RC"
           perl -e 'alarm shift; exec @ARGV' "$shard_budget" bash "$spath"
         ) > "$sraw" 2>&1 || s_rc=$?
       fi
-      # ⛔ THE LAUNCH IS NOT THE VERDICT (#3415 review 3, P1). `cd "$cmd_dir"`
+      # ⛔ THE LAUNCH IS NOT THE VERDICT (#3415 review 3, P1). `cd "$shard_dir"`
       # failing (the worktree removed mid-run by a reaper, a $TMP that vanished)
       # exits with the sentinel, and without this arm that status was READ AS "the
       # base fails this shard" — clearing a red the PR caused. The pytest arm has
@@ -7276,13 +7957,31 @@ reproduce_residual_on_base() {
         say_err "   refused (fail closed)."
         continue
       fi
-      # ⛔ 142 = SIGALRM (128+14): THE BOUND KILLED IT, so the exit status is the
-      # BOUND's verdict and not the shard's. Reading it as "the base fails this
-      # shard" would clear a PR-caused red because main is slow — the fail-open
-      # direction, and the same rule the pytest arm applies above.
-      if [ "$s_rc" -eq 142 ]; then
-        say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' was KILLED by the ${shard_budget}s bound"
-        say_err "   (SIGALRM) — a run that could not finish is not a measurement that the base fails it."
+      # ⛔ A STATUS THAT DID NOT COME FROM THE SHARD IS NOT THE SHARD'S VERDICT
+      # (#3415 review 4, P1). This arm's verdict IS the status, so every status that
+      # is not an exit decision has to be excluded — and 142 is the MEMBER of a class,
+      # not the class. 128+N is death by signal N: the run was KILLED, never finished,
+      # and produced no verdict. Treating only 142 as special left every other signal
+      # death reading as "the base fails this shard": an OOM SIGKILL (137) on a loaded
+      # box, or a reaper's/operator's SIGTERM (143) mid-arm, would CLEAR a red the PR
+      # caused — a false PASS on an artifact nothing measured — while the pytest arm
+      # is fail-closed for the same event by construction (a killed run recovers no
+      # ids). 142 keeps its own message because the rail's own `${shard_budget}s`
+      # bound is the commonest cause and naming it is the actionable diagnostic.
+      # ⛔ NOT a catch-all: a status <= 128 IS the shard's own exit decision and stays
+      # the verdict. 124 in particular is a shard's OWN internal bound (the convention
+      # `run-bash-shards.sh` documents), i.e. a real failure on the base, so it must
+      # keep clearing — widening this past signals would restore the false block #3415
+      # exists to remove.
+      if [ "$s_rc" -gt 128 ]; then
+        if [ "$s_rc" -eq 142 ]; then
+          say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' was KILLED by the ${shard_budget}s bound"
+          say_err "   (SIGALRM) — a run that could not finish is not a measurement that the base fails it."
+        else
+          say_err "admin-merge: (reproduction) '$SHARD_REPRO_ID_PREFIX$token' DIED ON SIGNAL $((s_rc - 128)) (status $s_rc)"
+          say_err "   — a killed run never reached the shard's own verdict, so its status is not a measurement"
+          say_err "   that the base fails it."
+        fi
         say_err "   It stays refused (fail closed)."
         continue
       fi
@@ -7935,51 +8634,24 @@ RAIL_LOCK_ROOT="${ADMIN_MERGE_LOCK_ROOT:-${HOME}/.pi/agent/state/rail-locks}"
 RAIL_LOCK_HELD=0
 RAIL_LOCK_PATH=""
 RAIL_LOCK_PR=""
-RAIL_STARTED_AT="$(date +%s)"
 RAIL_POLL_TICKS=0
-# ONE ABSOLUTE BOUND FOR THE WHOLE ATTEMPT.
-# ⛔ IT MUST EXCEED EVERY WAIT THE RAIL IS *ALLOWED* TO TAKE, or it becomes a second,
-# tighter gate that false-blocks healthy PRs (review finding 7). A rail legitimately
-# inside `wait_for_first_checks` may spend the FIRST-CHECKS CEILING (18064s by default)
-# and then still owe a RE-RUN wait (derived per shard, >= the fail-safe 3900s) and a
-# re-collection. So the attempt bound is the ceiling plus BOTH fail-safe per-wait
-# bounds, and an expired deadline can only fire on an attempt that has genuinely
-# outlived every window the rail itself declared.
-# ⛔ THE DEFAULT MUST EXCEED WHAT THE RAIL IS ALLOWED TO SPEND, or this becomes a second,
-# tighter gate that false-blocks healthy PRs (cycle-2 finding 3; cycle-3 finding 1 caught
-# the first attempt at this being TIGHTER than the formula it replaced, and still below
-# FIRST_CHECKS_CEILING + one fail-safe re-run wait = 21964s, so a queue-bound PR spending
-# its declared ceiling plus one re-run would have been refused and its head PARKED).
-# The arithmetic it must cover: `wait_for_first_checks` may spend FIRST_CHECKS_CEILING, and
-# the re-run wait is taken ONCE PER FAILING RUN with a bound of max(RERUN_FLOOR, 2 x
-# green_max) that is NOT clamped to the fail-safe. So the default is the ceiling plus FOUR
-# fail-safe re-run waits, and it is EXPRESSED IN TERMS OF THE KNOBS so that raising
-# ADMIN_MERGE_FIRST_CHECKS_CEILING raises the deadline with it (cross-checked in
-# `validate_rail_bounds`).
-# ⛔ SOURCE-TIME ARITHMETIC MUST NOT READ AN UNVALIDATED KNOB (#1690's class, re-hit here).
-# The two lines below run when the file is SOURCED, but `validate_timing_knobs` only runs
-# inside `main()` — so the derivation would be the first thing to touch a knob nobody has
-# validated yet. `018064` is a fine DECIMAL to the validator and ILLEGAL OCTAL to the
-# arithmetic, so the shell died with `value too great for base` at this line instead of
-# emitting the validator's NAMED refusal. Measured on the composed head: the `(P1-18)` arms
-# for ADMIN_MERGE_FIRST_CHECKS_CEILING and ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK both reddened,
-# the message naming a line number instead of a knob.
-# So an operand that is not a plain positive decimal yields 0 here, and the derived default
-# becomes 0. That value is never USED: `validate_timing_knobs` refuses the malformed knob BY
-# NAME and exits before any rail logic runs, and a genuinely-0 deadline (an operator-supplied
-# junk ADMIN_MERGE_RAIL_DEADLINE) is then refused BY NAME by `validate_rail_bounds`.
-_as_dec_or_zero() {
-  case "$1" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
-  if counter_has_leading_zero "$1"; then printf '0'; return 0; fi
-  printf '%s' "$1"
-}
-RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$(( $(_as_dec_or_zero "$FIRST_CHECKS_CEILING") + $(_as_dec_or_zero "$FAILSAFE_RERUN_TIMEOUT") * 4 ))}"
-# TTL is DERIVED from the deadline so the two can never cross: a lease must outlive the
-# attempt that holds it, or a rail still running inside its own deadline could have its
-# lease stolen and two rails would then hold the same PR. `validate_rail_bounds` enforces
-# the relation for any operator override. The +3600 goes through the same guard, so a junk
-# ADMIN_MERGE_RAIL_DEADLINE cannot crash the derivation either.
-RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$(( $(_as_dec_or_zero "$RAIL_DEADLINE") + 3600 ))}"
+# ⛔ THE OPERATOR OVERRIDE IS VISIBLE AT LOAD TIME EVEN THOUGH THE DERIVED VALUE IS NOT.
+# The lease machinery (`rail_lock_acquire`) is exercised STANDALONE by its own harness,
+# with no attempt started, so a TTL that existed only inside `rail_attempt_start` would be
+# invisible there and an explicitly-supplied `ADMIN_MERGE_LOCK_TTL` would silently not
+# expire a lease. The DERIVED default (deadline + 3600) still needs the resolved bound and
+# is set in `rail_attempt_start`; an EMPTY value here means "derive it there".
+RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-}"
+# ONE ABSOLUTE BOUND FOR THE WHOLE ATTEMPT — AND IT IS RESOLVED AT CALL TIME, NOT HERE.
+# ⛔ THIS BLOCK USED TO DERIVE `RAIL_DEADLINE` AND `RAIL_LOCK_TTL` WHEN THE FILE WAS
+# SOURCED (`ADMIN_MERGE_RAIL_DEADLINE:-FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT`
+# = 33,664s), and to stamp `RAIL_STARTED_AT` here as well. Both are now owned by
+# `rail_attempt_start` (#3294's REACHABLE bound): a load-time default of 33,664s sits
+# ABOVE every phase bound that could carry the attempt there, so it can never fire, and
+# a load-time `RAIL_STARTED_AT` made the idempotent start a no-op that silently skipped
+# the seam and the validation. The reachable ceiling is the SUM of the phase bounds this
+# guard supervises, which are declared LATER in this file — so it can only be computed at
+# call time. See `rail_deadline_default` / `rail_attempt_start`.
 # How many 50ms slices a rail waits for an incumbent lease to publish its pid before it
 # decides. 40 = 2s; the publish gap is microseconds, so this only ever absorbs the gap.
 RAIL_LOCK_PUBLISH_WAIT="${ADMIN_MERGE_LOCK_PUBLISH_WAIT:-40}"
@@ -8040,6 +8712,16 @@ rail_lock_restore() {
 
 rail_lock_acquire() {
   local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0 _m sage _t
+  # ⛔ THE TTL MUST EXIST ON EVERY PATH THAT REACHES THIS FUNCTION, INCLUDING THE STANDALONE
+  # ONE. `rail_attempt_start` derives it from the RESOLVED deadline, but this function is
+  # also called directly by a harness (and by any future caller) with no attempt started —
+  # where the derived value has not been set yet. Leaving it EMPTY is not harmless: the age
+  # comparisons below are `[ "$RAIL_LOCK_TTL" -gt 0 ]`, which on an empty operand ERRORS and
+  # takes the false branch, silently DISABLING the age bound — the "PR blocked forever
+  # behind a recycled pid" defect the TTL exists to prevent, with only a raw bash
+  # `integer expression expected` as the signal. Measured on this tree before the fix.
+  # The fallback is the same derivation `rail_attempt_start` uses, so the two cannot drift.
+  RAIL_LOCK_TTL="${RAIL_LOCK_TTL:-$(( $(rail_deadline_default) + 3600 ))}"
   RAIL_LOCK_PR="${key##*-}"
   # ⛔⛔ OFF BY DEFAULT — NOT SHIPPED AS A GATE (review cycle 6, MEASURED).
   # The per-PR lease is NOT CERTIFIED and must not hold a merge back until it is. Six
@@ -8258,34 +8940,15 @@ rail_stop_if_pr_terminal() {
 # self-edit wait, the RE-RUN wait, and main's #1417 re-read pass.
 # It is NOT on the two ATTEMPT-bounded retry loops (the head read at :2193 and
 # `poll_merge_artifact`'s attempt loop): those stop after a fixed number of attempts and a
-# deadline check there would add nothing. That distinction is the accurate claim (review
-# finding 9). It decides no verdict:
+# deadline check there would add nothing. It decides no verdict:
 #   1. the whole-attempt deadline (REFUSED(rail-deadline:…) then EXIT);
 #   2. the terminal-state re-read, throttled on ELAPSED TIME (ADMIN_MERGE_TERMINAL_CHECK_EVERY,
-#      default 60s) — NOT on a tick count, which would be ~6s in a wait that polls every
-#      second and ~6min in one that polls every 60s.
-rail_guard_poll() {
-  RAIL_POLL_TICKS=$((RAIL_POLL_TICKS + 1))
-  local now elapsed
-  now="$(date +%s)"
-  elapsed=$((now - RAIL_STARTED_AT))
-  # The terminal re-read is throttled on ELAPSED TIME, not tick count (review finding 8):
-  # a spinning silent branch polls every ~1s while a FIRST-CHECKS poll is every 60s, so a
-  # tick-based throttle is ~6s in one loop and ~6min in the other — wrong in both
-  # directions. 60s is the value the comment claims.
-  RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
-  if [ "${RAIL_DEADLINE:-0}" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge "$RAIL_DEADLINE" ]; then
-    say_err "admin-merge: ✗ REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s) — the rail has spent its whole-attempt bound (ADMIN_MERGE_RAIL_DEADLINE, default FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + 4 x the fail-safe per-wait bound ${FAILSAFE_RERUN_TIMEOUT}s, i.e. ${RAIL_DEADLINE}s - i.e. every window the rail itself declares). Every individual wait in this rail DOES bound itself; the ATTEMPT is what was unbounded, and it is bounded now. This is a refusal to keep holding the merge slot, NOT a verdict about the PR: no check was made green, widened, skipped or muted, and the head-bound review evidence is untouched. Re-run the rail when the runs are readable — it re-evaluates from scratch."
-    rail_lock_release
-    exit 1
-  fi
-  if [ -n "${RAIL_LOCK_PR:-}" ] \
-     && [ $((now - RAIL_LAST_TERMINAL_CHECK)) -ge "$RAIL_TERMINAL_CHECK_EVERY" ]; then
-    RAIL_LAST_TERMINAL_CHECK=$now
-    rail_stop_if_pr_terminal
-  fi
-  return 0
-}
+#      default 60s) — NOT on a tick count.
+# ⛔ THERE IS EXACTLY ONE DEFINITION OF THIS FUNCTION, and it lives near the deadline
+# machinery it depends on. #3287 (landed on main) and #3294 both ADDED a whole-attempt
+# deadline to different bases; the textual merge kept BOTH definitions, so the later one
+# silently shadowed the other and #3294's reachable bound became dead code. The single
+# surviving definition below implements BOTH concerns.
 validate_rail_bounds() {
   # ⛔ THE TWO NEW KNOBS ARE VALIDATED BEFORE ANYTHING READS THEM (finding 2, cycle 2,
   # MEASURED: `ADMIN_MERGE_RAIL_DEADLINE=7h` made `[ "$RAIL_DEADLINE" -gt 0 ]` error out, so
@@ -8293,26 +8956,62 @@ validate_rail_bounds() {
   # `ADMIN_MERGE_TERMINAL_CHECK_EVERY=60s` never fired. A typo silently restoring the very
   # hang this bound exists to end is the exact defect this file already refuses for every
   # other timing knob, so these two get the same refusal instead of a quiet no-op.
-  case "${RAIL_DEADLINE}" in
-    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the whole-attempt bound must be a positive integer NUMBER OF SECONDS; a non-numeric value makes the deadline comparison error out and silently removes the bound this exists to impose."; exit 2 ;;
-  esac
-  [ "$RAIL_DEADLINE" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — 0 is not 'unlimited', it is a refusal to bound the attempt at all. Set a positive number of seconds."; exit 2; }
-  case "${RAIL_LOCK_TTL}" in
-    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."; exit 2 ;;
-  esac
-  # ⛔ 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent (finding 4,
-  # cycle 3): `[ "$RAIL_LOCK_TTL" -gt 0 ]` goes false, so a SIGKILLed rail's lease whose pid
-  # was reused by a long-lived fleet process is never reclaimable and the head is parked.
-  # Same refusal as RAIL_DEADLINE=0, for the same reason.
-  [ "$RAIL_LOCK_TTL" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."; exit 2; }
-  # ⛔ THE TTL MUST OUTLIVE THE ATTEMPT, or a live rail can have its own lease stolen
-  # mid-run by a later rail. Cross-check, matching this file's existing CEILING-vs-STALL rule.
-  [ "$RAIL_LOCK_TTL" -gt "$RAIL_DEADLINE" ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' with ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the lease TTL must EXCEED the whole-attempt bound, or a rail still running inside its own deadline can have its lease stolen and two rails would then hold the same PR."; exit 2; }
-  # ⛔ THE DEADLINE MUST NOT FIRE BEFORE A WAIT THE RAIL DECLARES MAY LEGALLY FINISH
-  # (cycle-3 finding 1, secondary). Without this, raising ADMIN_MERGE_FIRST_CHECKS_CEILING —
-  # a documented knob — leaves the deadline behind, and the rail refuses DURING a wait it
-  # itself declared legal.
-  [ "$RAIL_DEADLINE" -gt "$FIRST_CHECKS_CEILING" ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — it must EXCEED ADMIN_MERGE_FIRST_CHECKS_CEILING='${FIRST_CHECKS_CEILING}', or the whole-attempt bound fires in the middle of a first-checks wait the rail itself declares legal."; exit 2; }
+  # ⛔ THIS VALIDATES THE **RAW OPERATOR KNOBS**, NOT THE RESOLVED BOUNDS — and that split
+  # is load-bearing after the #3287/#3294 integration, so do not "simplify" it back.
+  #   · A harness (and an operator) calls this function STANDALONE, with no attempt started,
+  #     so `RAIL_DEADLINE`/`RAIL_LOCK_TTL` are still EMPTY here. Validating the RESOLVED
+  #     values made EVERY invocation refuse — including the valid one.
+  #   · The resolved bound (reachable ceiling, clamp, TTL relation) is owned by
+  #     `rail_attempt_start`, which resolves at CALL TIME because two of the four phase
+  #     bounds it sums are declared later in this file than this function runs.
+  # These knobs are refused BY NAME for the same reason as every other timing knob here:
+  # `[ -ge ]` on a non-integer makes the guard's comparison ERROR, and under `set -u`
+  # without `-e` an erroring body is SKIPPED — so a typo DELETES the bound (measured:
+  # `ADMIN_MERGE_RAIL_DEADLINE=7h` ran with NO bound at all).
+  local _raw_deadline="${ADMIN_MERGE_RAIL_DEADLINE:-}"
+  if [ -n "$_raw_deadline" ]; then
+    case "$_raw_deadline" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — the whole-attempt bound must be a positive integer NUMBER OF SECONDS; a non-numeric value makes the deadline comparison error out and silently removes the bound this exists to impose."
+        exit 2 ;;
+    esac
+    # LENGTH BEFORE ANY ARITHMETIC: an all-digit value past the shell's integer range makes
+    # the comparison print a raw overflow instead of a NAMED refusal.
+    if [ "${#_raw_deadline}" -gt 9 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — beyond the usable integer range. An all-digit value past the shell's range makes the comparison error out, SKIPPING the guard."
+      exit 2
+    fi
+    if [ "$_raw_deadline" -eq 0 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — 0 is not 'unlimited', it is a refusal to bound the attempt at all. Set a positive number of seconds."
+      exit 2
+    fi
+    case "$_raw_deadline" in
+      0*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — a LEADING ZERO is ambiguous. Write it without the leading zero (e.g. '19864', not '019864')."
+        exit 2 ;;
+    esac
+  fi
+  # ⛔ 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent: a
+  # SIGKILLed rail's lease whose pid was reused by a long-lived fleet process is never
+  # reclaimable and the head is parked. The relation to the deadline (a TTL must EXCEED it,
+  # or a live rail can have its own lease stolen mid-run) is enforced in
+  # `rail_attempt_start`, where BOTH operands are resolved.
+  local _raw_ttl="${ADMIN_MERGE_LOCK_TTL:-}"
+  if [ -n "$_raw_ttl" ]; then
+    case "$_raw_ttl" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${_raw_ttl}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."
+        exit 2 ;;
+    esac
+    if [ "${#_raw_ttl}" -gt 9 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${_raw_ttl}' — beyond the usable integer range, so the expiry comparison would error out and never expire."
+      exit 2
+    fi
+    if [ "$_raw_ttl" -eq 0 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${_raw_ttl}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."
+      exit 2
+    fi
+  fi
   case "${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}" in
     ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_TERMINAL_CHECK_EVERY='${ADMIN_MERGE_TERMINAL_CHECK_EVERY}' — it must be a positive integer NUMBER OF SECONDS, or the terminal-state exit never fires."; exit 2 ;;
   esac
@@ -8697,6 +9396,14 @@ main() {
   # which repo's timings were measured and reported — the same leak, one symptom over (§2235
   # review P1: the arm exits ~20 lines before the resolver, and no test covers it because
   # every `--print-bounds <run-id>` arm in the suite passes `--repo`).
+
+  # ⛔ THE ATTEMPT CLOCK STARTS, AND IS CHECKED, BEFORE THE FIRST API CALL — AND
+  # before the repo resolver, which is itself a `gh` call on its fallback arm
+  # (review cycle 2, P2: the guard used to sit BELOW `resolve_rail_repo`, so a
+  # knob/deadline fault was reported as "the repo could not be resolved"). A
+  # deadline wired only into the poll loops bounds nothing on a rail that never
+  # reaches one, and an expired rail must spend no API budget proving it.
+  rail_guard_poll
   resolve_rail_repo "$REPO" || exit 2
   REPO="$RAIL_REPO"
   # ⛔ (c) PER-PR EXCLUSION — before ANY CI work, comment or merge (#3194).
@@ -8724,6 +9431,7 @@ main() {
   case "$PR" in *[!0-9]*) say_err "admin-merge: PR must be numeric (got '$PR')"; exit 2 ;; esac
   [ -x "$CFS" ] || [ -f "$CFS" ] || { say_err "admin-merge: parser not found at $CFS"; exit 1; }
   BASH="${BASH:-bash}"
+
 
   # ── 0. THE REPO IS DECIDED BY EVIDENCE, BEFORE ANY API CALL (#2235) ──────
   # (The resolution itself runs ABOVE `--print-bounds` — see the note there; this is the
@@ -9664,10 +10372,56 @@ main() {
   # say whether the base is itself red — which is what makes a repair PR a repair —
   # but it NEVER blocks. It was the BLOCKING source in the previous revision, and
   # that is precisely what refused the PR that repairs a red main.
-  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH
+  local BASE_STATUS BASE_SUMMARY BASE_REDS BASE_REDS_OTHER BASE_TOTAL BASE_RED BASE_RED_OTHER BASE_PENDING BASE_REF BASE_SHA BASE_RED_TS BASE_MAX_COMPLETED BASE_MAX_COMPLETED_EPOCH BASE_ALL_REDS BASE_OWNED_REDS
   check_surface_probe "$base_ref" "the base branch '$base_ref'" 1
   BASE_STATUS="$MAIN_HEALTH_STATUS"; BASE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   BASE_REDS="$MAIN_HEALTH_REDS"; BASE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  # ── #3322: WHAT MAIN ITSELF FAILS, TAKEN FROM ITS OWN MEASURED SURFACE ────────
+  # The #6807 bucket above already decided which base reds NO PR CAN EVER RUN
+  # (workflow declares no pull_request/pull_request_target). Those reds are
+  # reported and not counted against the PR — and, until this line, they were also
+  # dropped on the floor, so §4.5 had no way to know that the PR's red on the SAME
+  # suite is the base's red carried forward. Materialise their NAMES once, here, and
+  # hand them to the tree probe.
+  # ⛔ THE CLASS IS NARROW ON PURPOSE: `exempt: this workflow declares no PR trigger`
+  # ONLY. A BLOCKING base red is deliberately not in this set — it is PR-evaluable,
+  # so §4.5/§4.6 must keep insisting the repair PR clear it (#1261). A NON-code
+  # event is not in it either: that red is noise from a cron lane, and a PR red
+  # that merely shares its name is not the same measurement.
+  # ⛔ EMPTY IS THE FAIL-CLOSED ANSWER and it is the common one: an UNMEASURED base (0 checks,
+  # 0 statuses), a clean base, and a base whose only reds are PR-evaluable all leave this file
+  # empty, which admits no exclusion at all. An UNREADABLE or PARTIAL base ALSO seeds nothing
+  # usable in effect — not because this file stays empty (step 2c seeds it and then `exit 1`s
+  # before §4.5 reads it), but because the rail never gets that far.
+  BASE_ALL_REDS="$MAIN_HEALTH_ALL_REDS"
+  BASE_OWNED_REDS="$TMP/base-owned-reds.txt"
+  : > "$BASE_OWNED_REDS"
+  if [ -n "$BASE_ALL_REDS" ]; then
+    # ⛔ THE SET IS NOT A FLAT NAME LIST. Two conditions, both fail-closed, both load-bearing:
+    #   (1) A NAME THAT ALSO HAS A `blocking:` ROW IS NOT EMITTED. The base can publish one
+    #       check NAME from two different apps/workflows — exempt on a push-only lane and
+    #       BLOCKING on a PR-evaluable one. Taking the name from the exempt row and ignoring
+    #       the blocking row would exclude a PR red on evidence the base contradicts (the
+    #       header: "the base red is on a workflow that DOES declare a PR trigger -> it is a
+    #       BLOCKING base red, deliberately NOT in the set").
+    #   (2) NEITHER NAMELESS PLACEHOLDER IS EMITTED. `(unnamed check)` / `(unnamed status)` are
+    #       the identities the probe gives a row with no name — they are not the NAME of
+    #       anything, so matching them would let ONE unnamed base red excuse ANY unnamed tree
+    #       red (#1353's "an unnamed red must never vanish", inverted into a waiver).
+    # Both are pinned by §80(g)/(h); the awk is the ONE place either rule lives.
+    printf '%s\n' "$BASE_ALL_REDS" \
+      | awk -F'\t' '
+          $2 ~ /^blocking:/ { blocked[$1] = 1 }
+          { row[$1] = row[$1] "\n" $2 }
+          END {
+            for (n in row) {
+              if (blocked[n]) continue
+              if (n == "(unnamed check)" || n == "(unnamed status)") continue
+              if (row[n] ~ /exempt: this workflow declares no PR trigger, so a PR can never run it/) print n
+            }
+          }' \
+      | sort -u > "$BASE_OWNED_REDS"
+  fi
   BASE_TOTAL="$MAIN_HEALTH_TOTAL"; BASE_RED="$MAIN_HEALTH_RED"; BASE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   BASE_PENDING="$MAIN_HEALTH_PENDING"; BASE_REF="$MAIN_HEALTH_REF"; BASE_SHA="$MAIN_HEALTH_SHA"
   # The base's BLOCKING reds with their start times, and the base surface's own
@@ -10166,10 +10920,13 @@ main() {
   # PROCEEDS on UNMEASURED (a surface with no checks certifies nothing, but is
   # not a refusal — same rule as before) and REFUSES on UNREADABLE (failing to
   # look is never a green).
-  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH
-  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0
+  local TREE_STATUS TREE_SUMMARY TREE_REDS TREE_REDS_OTHER TREE_TOTAL TREE_RED TREE_RED_OTHER TREE_PENDING TREE_PENDINGS TREE_REF TREE_SHA TREE_MAX_COMPLETED TREE_MAX_COMPLETED_EPOCH TREE_REDS_BASEOWNED TREE_RED_BASEOWNED
+  # #3322: the base's own not-PR-evaluable failing check names (step 2c). Passed here
+  # and ONLY here — the tree is the one surface where an inherited red is a false block.
+  check_surface_probe "$head" "the PR's evaluated tree (head $head)" 0 "$BASE_OWNED_REDS"
   TREE_STATUS="$MAIN_HEALTH_STATUS"; TREE_SUMMARY="$MAIN_HEALTH_SUMMARY"
   TREE_REDS="$MAIN_HEALTH_REDS"; TREE_REDS_OTHER="$MAIN_HEALTH_REDS_OTHER"
+  TREE_REDS_BASEOWNED="$MAIN_HEALTH_REDS_BASEOWNED"; TREE_RED_BASEOWNED="$MAIN_HEALTH_RED_BASEOWNED"
   TREE_PENDING="$MAIN_HEALTH_PENDING"; TREE_PENDINGS="$MAIN_HEALTH_PENDINGS"
   TREE_TOTAL="$MAIN_HEALTH_TOTAL"; TREE_RED="$MAIN_HEALTH_RED"; TREE_RED_OTHER="$MAIN_HEALTH_RED_OTHER"
   TREE_REF="$MAIN_HEALTH_REF"; TREE_SHA="$MAIN_HEALTH_SHA"
@@ -10208,6 +10965,14 @@ main() {
       if [ -n "${TREE_PENDINGS:-}" ]; then
         info "admin-merge:    in flight on this tree (reported, NOT blocking — a check still running is not a red):"
         printf '%s\n' "$TREE_PENDINGS"
+      fi
+      # #3322: an exclusion that is only an ABSENCE is indistinguishable from a
+      # silent drop, so every excluded red is printed with the base check that
+      # owns it. This is the arm the fix is read from — silence here means the
+      # rail did not exclude anything, which is a different claim entirely.
+      if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+        say_err "admin-merge:    EXCLUDED from the required surface (#3322) — the base itself fails the same suite, under its own lane's name, on a workflow no PR can run:"
+        printf '%s\n' "$TREE_REDS_BASEOWNED" | sed 's/^/      /' >&2
       fi ;;
     unmeasured)
       info "admin-merge: ⚠️  evaluated tree ${TREE_SUMMARY}" ;;
@@ -10224,6 +10989,14 @@ main() {
         say_err "   (Also red on NON-code events — reported, not blocking here; a PR surface"
         say_err "    is not expected to carry one, so this is an anomaly:)"
         printf '%s\n' "$TREE_REDS_OTHER" >&2
+      fi
+      # #3322: the excluded reds are named even when the tree STILL refuses, so a
+      # mixed surface says which reds were inherited and which are the PR's own.
+      if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+        say_err "   EXCLUDED from the required surface (#3322) — the base itself fails the same suite,"
+        say_err "   under its own lane's name, on a workflow that declares no PR trigger, so no PR"
+        say_err "   can make it pass. These are NOT among the failures below:"
+        printf '%s\n' "$TREE_REDS_BASEOWNED" >&2
       fi
       say_err "   BASE CONTEXT: $BASE_SUMMARY"
       say_err "   If the base is red and THIS PR is the repair, the red should already be GONE"
@@ -10464,6 +11237,15 @@ Base check surface (every workflow and app on head of '$base_ref'): ${BASE_STATU
     health_line="$health_line
 Base red(s) reported but NOT blocking:
 $BASE_REDS_OTHER"
+  fi
+  # #3322: an EXCLUDED tree red is a decision this rail made about the PR's required
+  # surface, so it belongs in the durable record for the same reason the #6807 bucket
+  # does — otherwise the posted evidence shows a green tree with no trace of the red it
+  # set aside, and a reviewer cannot tell "the PR is clean" from "the repo is already red".
+  if [ -n "${TREE_REDS_BASEOWNED:-}" ]; then
+    health_line="$health_line
+Tree red(s) EXCLUDED from the required surface (#3322) — ${TREE_RED_BASEOWNED} check(s) the base itself fails under its own lane's name, on a workflow that declares no PR trigger, so no PR can ever make them pass:
+$TREE_REDS_BASEOWNED"
   fi
   analyzed="$analyzed
 $health_line"

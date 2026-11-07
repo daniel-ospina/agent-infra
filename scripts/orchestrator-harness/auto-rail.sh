@@ -614,7 +614,7 @@ launch_rail() {  # $1 = repo, $2 = PR, $3 = head, $4 = verdict file; rc 0 = an a
   row="$pr	$head	$(date +%s)"
   printf '%s\n' "$row" >> "$TRIED"
   log_line "$repo #$pr GREEN+terminal -> launching rail (head $head)"
-  RAIL_SCRIPT="$RAIL_SCRIPT" nohup bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra > "$out" 2>&1 &
+  RAIL_SCRIPT="$RAIL_SCRIPT" nohup bash "$RAIL_SCRIPT" "$pr" --repo "$repo" $extra < /dev/null > "$out" 2>&1 &
   pid=$!
   sleep "$LAUNCH_VERIFY_S"
   if kill -0 "$pid" 2>/dev/null || [ -s "$out" ]; then return 0; fi
@@ -695,6 +695,28 @@ review_state() {  # $1 = the review's output file; prints none|pending|clean|iss
 }
 # The dispatch epoch, from the record the PARENT wrote — never the file's mtime, which a reviewer that
 # keeps writing output would keep refreshing and which would therefore never age out.
+# ⛔ THE AGE OF A DISPATCH WITHOUT AN EPOCH (review round 7, P3, measured). `review_dispatched_at` prints
+# nothing when the record has no dispatch line (a record written by an older auto-rail, a foreign/truncated
+# record), and the loop then used `0` — which is BOTH "no measurement" and a legitimate value — so a
+# `retry`/`refused` record with an exit line but no epoch reported "dispatched 0m ago, within its 900s
+# window" on every pass and waited FOR EVER: never retried, never exhausted, never published again. The
+# file's own mtime is a real, conservative measurement (it is at least as new as the dispatch, so the age
+# it yields is never larger than the truth), so it is used as the fallback and named as such in the log.
+# rc 0 = epoch, 1 = mtime fallback, 2 = nothing measurable.
+review_age() {  # $1 = the review's output file
+  local f=$1 ep mt
+  ep=$(review_dispatched_at "$f")
+  case "${ep:-}" in
+    ''|*[!0-9]*) ;;
+    *) printf '%s\n' "$ep"; return 0;;
+  esac
+  [ -f "$f" ] || return 2
+  mt=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null)
+  case "${mt:-}" in
+    ''|*[!0-9]*) return 2;;
+  esac
+  printf '%s\n' "$mt"; return 1
+}
 review_dispatched_at() {  # $1 = the review's output file; prints the epoch, or nothing
   head -1 "$1" 2>/dev/null | sed -n 's/^REVIEW-DISPATCHED at=\([0-9][0-9]*\).*/\1/p'
 }
@@ -710,9 +732,40 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
   # question it asked on purpose.
   [ -f "$f" ] || { printf '0\n'; return 0; }
   cut=$(( $(date +%s) - REVIEW_ATTEMPT_WINDOW_S ))
-  n=$(awk -v cut="$cut" '$1 ~ /^[0-9]+$/ && $1 > cut {c++} END {printf "%d", c+0}' "$f" 2>/dev/null)
-  case "${n:-}" in ''|*[!0-9]*) printf '0\n'; return 0;; esac
+  # ⛔ AN UNREADABLE LEDGER IS NOT A FREE SLOT (review round 6, P2, measured). "No file" means nothing has
+  # been spent, so 0 is right — but a file that EXISTS and cannot be read (`awk` exits 2: mode 0200, a
+  # root-owned leftover after a sudo run, a corrupted path under the state dir) is the opposite fact: the
+  # head may have spent its whole budget and the append still succeeds, so `>>` grows the ledger while
+  # every pass reads 0 — one full PAID review per review-duration, for ever, with no EXHAUSTED state and
+  # no diagnostic (the log prints the same 0). Every neighbouring counter in this file already fails
+  # CLOSED on an unreadable source (`rails_for_repo` → COUNTER-FAILED, `rail_already_running` → rc 2,
+  # `publish_review_state` → MARKER-UNREADABLE); this is the one that must too.
+  if ! n=$(awk -v cut="$cut" '$1 ~ /^[0-9]+$/ && $1 > cut {c++} END {printf "%d", c+0}' "$f" 2>/dev/null); then
+    log_line "$f REVIEW-LEDGER-UNREADABLE: the per-head attempt ledger exists but could not be read — treating this head as EXHAUSTED (fail-closed: an unreadable counter is not a free slot, and the append would otherwise grow a ledger nothing can count)"
+    # ⛔ THE VALUE RETURNED HERE IS THE CAP, NOT A COUNT — so whoever PUBLISHES it must not present it as a
+    # measurement. That cannot be signalled from here: the loop calls this function in `$( … )`, which is a
+    # SUBSHELL, so no variable set in this body reaches the caller (measured — a flag here left the
+    # published text claiming "3 dispatch(es)" as fact, with the suite green because its arms set the flag
+    # by hand). `review_ledger_unreadable` exists for the caller to ask the question DIRECTLY instead.
+    printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"
+    return 0
+  fi
+  # An empty file counts as 0 (nothing spent yet); only a non-numeric answer is a failure, and it is the
+  # same failure as "could not read": fail closed.
+  case "${n:-}" in
+    '') printf '0\n'; return 0;;
+    *[!0-9]*) log_line "$f REVIEW-LEDGER-UNPARSEABLE ('$n'): treating this head as EXHAUSTED (fail-closed)"; printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0;;
+  esac
   printf '%s\n' "$n"
+}
+# Can this ledger be READ? Asked DIRECTLY by the caller, never through `$( )` — see the note inside
+# `review_attempts`: a subshell cannot hand a variable back, so a flag set there is silently inert and the
+# published comment keeps asserting the CAP as a measured count. rc 0 = exists and cannot be read.
+review_ledger_unreadable() {  # $1 = attempt ledger
+  local f=$1
+  [ -f "$f" ] || return 1
+  awk '$1 ~ /^[0-9]+$/ {c++} END {printf "%d", c+0}' "$f" >/dev/null 2>&1 || return 0
+  return 1
 }
 # ── FORGIVING A REFUSAL, PRECISELY ───────────────────────────────────────────────────────────────
 # ⛔ THE WINDOW DOES NOT MAKE THIS UNNECESSARY, AND DELETING IT WAS WRONG (review round 3, verifier).
@@ -723,15 +776,28 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
 # and both are needed: this one keeps a free dispatch out of the budget at all, and the window covers the
 # classes auto-rail cannot see (rc=3/9 have pre-review paths too, so their state is `retry` and they DO
 # consume — there is no state that could tell those apart from a paid failure).
-# ⛔ IT DROPS ONE LINE — THE REFUSAL'S OWN. `launch_review` appends exactly one line per verified
-# dispatch and this runs only when the LAST dispatch is the refusal, so `sed '$d'` is exact. An earlier
-# version truncated the WHOLE ledger, which forgave paid attempts too (two paid failures + one refusal
-# reset the budget and bought three more paid reviews); the one-line form is what keeps that closed.
+# ⛔ IT DROPS ONE LINE — AND ONLY WHEN THAT LINE IS PROVABLY THE REFUSAL'S OWN. An earlier version
+# truncated the WHOLE ledger, which forgave paid attempts too (two paid failures + one refusal reset the
+# budget and bought three more paid reviews); the one-line form closed that. The caller cannot see the
+# ledger's history, though — it acts on the STATE alone, and `launch_review` logs REVIEW-ATTEMPT-UNRECORDED
+# when its own append fails, in which case the newest line belongs to a PAID dispatch. So the drop is
+# gated on an EPOCH MATCH against the refusal's own dispatch (`$2`), not on "the last dispatch must have
+# been the refusal": see the guard in the body.
 # A failure here leaves the refusal counted — TIGHTER than intended, i.e. fail-closed, the right
 # direction for a bound.
-review_forgive_refusal() {  # $1 = attempt ledger; drops the newest entry if there is one
-  local f=$1 n tmp
+review_forgive_refusal() {  # $1 = attempt ledger, $2 = the refusal's own dispatch epoch; drops that entry
+  local f=$1 want=${2:-} n tmp last
   [ -f "$f" ] || return 0
+  # ⛔ IT MUST DROP THE REFUSAL'S LINE, NOT WHATEVER IS NEWEST (review round 6, P3, measured): the caller
+  # runs this on the STATE alone, and `launch_review` logs REVIEW-ATTEMPT-UNRECORDED when its append
+  # fails — in which case the newest line is a PAID dispatch and an unguarded `sed '$d'` forgives MONEY,
+  # the exact defect the one-line form exists to keep closed. So the caller passes the refusal's dispatch
+  # epoch (the record's `at=`, written from the same variable the ledger line uses) and the drop happens
+  # only on an exact match. No match → nothing dropped → the refusal stays counted: fail-closed, which is
+  # the right direction for a bound.
+  [ -n "$want" ] || { log_line "$f REVIEW-FORGIVE-SKIPPED: no dispatch epoch was supplied, so the refusal stays counted (fail-closed)"; return 0; }
+  last=$(tail -1 "$f" 2>/dev/null)
+  [ "$last" = "$want" ] || { log_line "$f REVIEW-FORGIVE-SKIPPED: the newest ledger entry ('${last:-none}') is not this refusal's dispatch ('$want') — nothing dropped, fail-closed"; return 0; }
   n=$(wc -l < "$f" 2>/dev/null | tr -d ' ')
   case "${n:-}" in ''|*[!0-9]*) return 0;; esac
   [ "$n" -gt 0 ] || return 0
@@ -839,27 +905,51 @@ review_candidate_arm() {  # $1 = candidate kind (green|red), $2 = attestation; p
 # ⛔ A COMMENT, NEVER A BODY EDIT: the body is where the attestation marker lives, and an edit after a
 # record wipes the proof the gate reads (agent-infra#1224). `review-pr.sh` refuses to PATCH a body for
 # the same reason.
-# ⛔ IDEMPOTENCE IS BY KEY, NOT BY HOPE. The hidden tag names the state AND the head, so re-running the
-# loop in the same state adds NOTHING (a second `review-in-flight` marker for one head is a duplicate
-# this cannot emit), while a real transition — in-flight → found-issues — adds exactly one new marker
-# instead of rewriting history. `awaiting-review` carries NO head: it is published where the head is
-# not yet read (a cap deferral), and it says "no owner yet" about the PR, not about a revision.
+# ⛔ IDEMPOTENCE IS BY KEY, NOT BY HOPE. The hidden tag names the state (and the head, when the caller
+# supplies one), so re-running the loop in the same state adds NOTHING, while a real transition —
+# in-flight → found-issues — adds exactly one new marker instead of rewriting history. The EXCEPTION is
+# the corrective family below, which supersedes BY POSITION: `review-in-flight` ↔
+# `review-dispatch-failed`, and `awaiting-review` when a caller passes a head (a dispatch that finished
+# WITHOUT a verdict corrects the in-flight claim). For those, "is my tag already present" is the wrong
+# question — the stale tag outlives its truth, so the newest of the family wins. `awaiting-review` with NO
+# head is the cap-deferral publish: it says "no owner yet" about the PR rather than a revision, and it
+# stays plain presence.
 publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 = present (or just posted)
-  local repo=$1 pr=$2 state=$3 head=${4:-} tag seen text
+  local repo=$1 pr=$2 state=$3 head=${4:-} basis=${5:-} tag seen text _ratt_basis _ratt_tail
   tag="<!-- auto-rail-review:${state}${head:+:$head} -->"
+  # ⛔ WHAT MAY BE SAID ABOUT THE COUNT (review round 6, P3): when the attempt ledger could not be READ, the
+  # count the loop acted on is the CAP, not a measurement — so the comment says that instead of asserting
+  # "3 dispatch(es)" as a fact. The caller passes `cap` for that case (a global flag cannot work: the count
+  # is fetched in `$( … )`, and a subshell cannot write back).
+  # ⛔ AND THE TAIL IS PART OF THAT CLAIM, NOT BOILERPLATE (review round 7, P2, reproduced). The sentence after
+  # the basis used to be shared: "… until that window rolls — which it does BY ITSELF, so an environmental
+  # cause needs no action at all". That is TRUE of the counted case (the window is a clock, and a head ages out
+  # of it with nobody's help) and FALSE of the CAP case, which is exactly the case this basis exists for:
+  # `review_attempts` returns the cap on its unreadable path WITHOUT computing `cut` or consulting the clock,
+  # so no window exists to roll — the ledger stays unreadable on every future pass and waiting changes
+  # nothing. `review-retries-exhausted` is deliberately NOT in the positional family (nothing supersedes it),
+  # so a "no action required" there is a PERMANENT false instruction on the operator's only visible surface.
+  # Same class as the round-2 defect this file already carries: a false claim on the PR that nothing corrects.
+  if [ "$basis" = cap ]; then
+    _ratt_basis="its ATTEMPT LEDGER could not be read, so it is held fail-closed as if ${REVIEW_MAX_ATTEMPTS} dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count)"
+    _ratt_tail="That is NOT a window that rolls by itself: the ledger file is present but UNREADABLE, so every pass reads the same fail-closed value and waiting changes nothing. Repair or remove that file, or push a new head — a new head is a new review."
+  else
+    _ratt_basis="${REVIEW_MAX_ATTEMPTS} dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s"
+    _ratt_tail="That window rolls BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review."
+  fi
   case "$state" in
     awaiting-review)
-      text="🔎 **auto-rail: review needed.** This PR is mergeable and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot. **It is not waiting on a lane.**";;
+      text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot and the environment allows it. **It is not waiting on a lane.**";;
     review-in-flight)
-      text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ). auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
+      text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
     review-found-issues)
       text="⛔ **auto-rail: the review found blocking issues** at \`${head:0:12}\`. No attestation was recorded, and auto-rail will NOT re-review this head — the findings are in the reviewer's own comment. This head needs a fix; a new head gets a new review.";;
     review-retries-exhausted)
-      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${REVIEW_MAX_ATTEMPTS} dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s. No attestation exists, and auto-rail is not dispatching another review at this revision until that window rolls — which it does BY ITSELF, so an environmental cause (a rate-limit or auth window, a loaded box) needs no action at all. If this head genuinely cannot be reviewed, push a new head: a new head is a new review.";;
+      text="⛔ **auto-rail: the reviewer is not producing a verdict** at \`${head:0:12}\` — ${_ratt_basis}. No attestation exists, and auto-rail is not dispatching another review at this revision. ${_ratt_tail}";;
     review-record-unbound)
       text="⚠️ **auto-rail: a review record exists at \`${head:0:12}\` but the PR body carries no marker this loop can bind.** Re-running \`record-review.sh\` for this PR re-posts the signed marker at the same head (that write is idempotent). auto-rail never writes records, so it cannot do this itself — and it is deliberately NOT buying a second review, which would not help. **It is not waiting on a lane.**";;
     review-dispatch-failed)
-      text="⚠️ **auto-rail: the reviewer was announced but never started** at \`${head:0:12}\` — the dispatch was rolled back (nothing ran, and no attempt was spent). This corrects the in-flight marker posted before the launch. The head is retried on a later pass; if this state persists, the actuator's reviewer path is broken and the log has the \`REVIEW-LAUNCH-FAILED\` line for it. **Nothing is reviewing this PR right now.**";;
+      text="⚠️ **auto-rail: the reviewer was announced but never started** at \`${head:0:12}\` — the dispatch was rolled back (nothing ran, and no attempt was spent), so no \`review in flight\` marker was posted for it: this state is published only for a launch that failed to start, and in-flight only for one that did. The head is retried on a later pass; if this state persists, the actuator's reviewer path is broken and the log has the \`REVIEW-LAUNCH-FAILED\` line for it. **Nothing is reviewing this PR right now.**";;
     *) text="auto-rail: review state \`${state}\`.";;
   esac
   # ⛔ A FAILED READ IS NOT "NO MARKER": this script has no `pipefail`, so a `gh` that cannot run would
@@ -872,7 +962,56 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   # posted. `--paginate` reads every page.
   seen=$(gh api "repos/$repo/issues/$pr/comments?per_page=100" --paginate --jq '.[].body' 2>/dev/null) \
     || { log_line "$repo #$pr MARKER-UNREADABLE: could not read the PR's comments to check for an existing review marker — NOT posting (a blind post is a duplicate on every pass)"; return 1; }
-  case "$seen" in *"$tag"*) return 0;; esac
+  # ⛔ IDEMPOTENCE IN THE RIGHT DIRECTION: A STATE POSTS UNLESS IT IS ALREADY THE NEWEST TRUTH.
+  # `review-in-flight` and `review-dispatch-failed` each CORRECT the other — in-flight after a failure
+  # notice (so the PR stops saying "nothing is reviewing this" while something is), and dispatch-failed
+  # when the review that WAS announced has since been retried and the retry's launch never started (so it
+  # stops saying a review is running when nothing is; that is the sequence in-flight → failure → in-flight
+  # → failure, which positional repair would otherwise suppress with its own older tag). For those two,
+  # "does my tag already exist" is the WRONG question: the stale tag outlives its truth, so the correction
+  # is suppressed for ever. Measured all three ways (review rounds 4 and 5): presence-only let a failure
+  # notice outlive its retry; one-way positional let a retry that ALSO rolled back leave the re-posted
+  # in-flight claim as the permanent last word; and both-positional WITH the in-flight publish before the
+  # launch alternated two comments per pass on a broken path. The loop now publishes in-flight only for a
+  # launch it PROVED started, so exactly one of the pair is published per real transition and positional
+  # converges: each transition adds one comment, a repeated no-op adds none. (The family has THREE
+  # members once `awaiting-review` carries a head — see below — so "newer than its partner" is computed
+  # against the newest of all of them, never against one.) Every other state keeps plain
+  # presence — nothing corrects it, so one marker IS the truth.
+  # ⛔ AND `awaiting-review` JOINS THAT FAMILY WHEN IT CARRIES A HEAD (review round 6, P2, measured): a
+  # dispatch that finished WITHOUT a verdict corrects an in-flight marker by publishing it, and
+  # presence-keyed it could only ever do that ONCE — a later `review-in-flight:H` (posted when the record
+  # was still `pending` at the verify window, then rc=75 a second later) stayed the newest comment for
+  # ever, because `refused` retries on time alone and never posts another state. Position is the only
+  # rule that both corrects and converges. The headless call (cap deferral) stays plain presence: it
+  # says "no owner yet" about the PR, not about a revision.
+  local _pos=0 _o _on _mine_last _other_last
+  case "$state" in
+    review-in-flight|review-dispatch-failed) _pos=1 ;;
+    awaiting-review) [ -n "$head" ] && _pos=1 ;;
+  esac
+  if [ "$_pos" = 1 ]; then
+    # ⛔ THE FAMILY HAS THREE MEMBERS, SO "newer than the ONE other state" IS WRONG (review round 7, P2,
+    # measured). `awaiting-review:<head>` joined at the top of this function, and comparing each state
+    # against a single partner let a NEWER awaiting-review suppress both halves of the pair for ever: with
+    # `refused` fast-finish posting awaiting-review and the record removed on the next rolled-back launch,
+    # the state returns to `none` and every later pass publishes `review-dispatch-failed` — which was
+    # compared only against in-flight, found newer awaiting-review irrelevant, and posted. Measured
+    # sequence (in-flight, awaiting-review:H, in-flight) left ONE in-flight marker where two transitions
+    # happened, and (dispatch-failed, awaiting-review:H, dispatch-failed) left ONE dispatch-failed notice
+    # while the reviewer path stayed broken — the false claim standing indefinitely, which is the exact
+    # reason this family exists. Compare against the NEWEST of the other members instead.
+    _other_last=0
+    for _o in review-in-flight review-dispatch-failed awaiting-review; do
+      [ "$_o" = "$state" ] && continue
+      _on=$(printf '%s\n' "$seen" | awk -v t="<!-- auto-rail-review:$_o:$head -->" 'index($0,t){n=NR} END{print n+0}')
+      [ "${_on:-0}" -gt "$_other_last" ] && _other_last=$_on
+    done
+    _mine_last=$(printf '%s\n' "$seen" | awk -v t="$tag" 'index($0,t){n=NR} END{print n+0}')
+    [ "${_mine_last:-0}" -gt 0 ] && [ "${_mine_last:-0}" -ge "${_other_last:-0}" ] && return 0
+  else
+    case "$seen" in *"$tag"*) return 0;; esac
+  fi
   gh pr comment "$pr" --repo "$repo" --body "$(printf '%s\n\n%s' "$text" "$tag")" >/dev/null 2>>"$LOG" \
     || { log_line "$repo #$pr MARKER-FAILED: could not post the review-state marker ($state) — this loop knows the state and GitHub does not"; return 1; }
   log_line "$repo #$pr review state published on the PR: $state"
@@ -910,7 +1049,12 @@ launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file, $5 = attemp
   # the value a real fresh dispatch carries), so `review_action pending 0 …` answers WAIT on every pass
   # for ever: no dispatch, no publication, no exhaustion, and a log line that says a review is running.
   # `rm -f` here is the same rollback the verify-failure path below already performs.
-  printf 'REVIEW-DISPATCHED at=%s head=%s repo=%s pr=%s\n' "$(date +%s)" "$head" "$repo" "$pr" > "$out" \
+  # ⛔ ONE EPOCH FOR BOTH RECORDS (review round 6, P3): the record's `at=` and the ledger line are the
+  # same dispatch, and the forgiver now MATCHES them — two separate `date +%s` calls can straddle a
+  # second boundary, so a mismatch would silently disable forgiveness (or, worse, match a previous paid
+  # line). Captured once, used twice.
+  local _ep; _ep=$(date +%s)
+  printf 'REVIEW-DISPATCHED at=%s head=%s repo=%s pr=%s\n' "$_ep" "$head" "$repo" "$pr" > "$out" \
     || { rm -f "$out" 2>/dev/null; log_line "$repo #$pr REVIEW-LAUNCH-FAILED: cannot write the review record at $out — nothing was dispatched, no cooldown was consumed, and the truncated record was removed (a zero-byte record reads as a review in flight for ever)"; return 1; }
   nohup bash -c 'run_review "$@"' _ "$REVIEW_SCRIPT" "$pr" "$repo" "$out" >> "$LOG" 2>&1 < /dev/null &
   pid=$!
@@ -922,7 +1066,7 @@ launch_review() {  # $1 = repo, $2 = PR, $3 = head, $4 = state file, $5 = attemp
     # `nohup` failures would read as three paid reviews and mark the head EXHAUSTED without one ever
     # having run. Only verified dispatches are money, so only verified dispatches are counted.
     if [ -n "$led" ]; then
-      printf '%s\n' "$(date +%s)" >> "$led" 2>/dev/null \
+      printf '%s\n' "$_ep" >> "$led" 2>/dev/null \
         || log_line "$repo #$pr REVIEW-ATTEMPT-UNRECORDED: could not append to $led — this dispatch is running but is NOT counted against REVIEW_MAX_ATTEMPTS, so the per-head bound is weaker than it says"
     fi
     return 0
@@ -1093,6 +1237,14 @@ for p in prs:
     # A DRAFT CAN NEVER MERGE: the rail refuses it in one line ("PR is a DRAFT").
     if p.get("isDraft"):
         continue
+    # ⛔ A HEAD THAT CANNOT LAND MUST NOT BUY A REVIEW (review round 5, P2, measured): `mergeable` was
+    # fetched here and never read, so a green-but-CONFLICTING head — checks pass, then `main` moves under
+    # the PR and the rollup stays green — was dispatched a PAID review whose verdict nothing can use (the
+    # rail refuses a conflicted head), and the rebase that fixes it is a NEW head, which buys a second one.
+    # Only a DEFINITE `CONFLICTING` is skipped: GitHub computes `mergeable` lazily and reports `UNKNOWN` on
+    # a fresh head, and skipping that would stall exactly the heads this loop exists to review.
+    if str(p.get("mergeable") or "").upper() == "CONFLICTING":
+        continue
     g={}
     for c in p.get("statusCheckRollup") or []:
         k=c.get("name") or c.get("context")
@@ -1247,8 +1399,11 @@ PY
         _ratt="$RAIL_DIR/review-$(printf '%s' "$repo" | tr '/' '-')-$pr-$head.attempts"
         _rstate=$(review_state "$_rout")
         _rattn=$(review_attempts "$_ratt")
-        _rdat=$(review_dispatched_at "$_rout")
-        case "${_rdat:-}" in ''|*[!0-9]*) _rage=0;; *) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;; esac
+        _rdat=$(review_age "$_rout"); _rage_rc=$?
+        case "$_rage_rc" in
+          0|1) _rage=$(( $(date +%s) - _rdat )); [ "$_rage" -ge 0 ] || _rage=0;;
+          *)   _rage=0;;   # nothing measurable: the WAIT path below is the safe direction (it costs a pass)
+        esac
         review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?
         if [ "$_ract" -eq 0 ]; then
           # ⛔ THE WINDOW IN THE LOG MUST BE THE ONE THE PREDICATE USED (review round 3, P3): `_ract` is 0
@@ -1259,7 +1414,14 @@ PY
             pending) _rwin=$REVIEW_COOLDOWN_S;;
             *)       _rwin=$COOLDOWN_TRANSIENT_S;;
           esac
-          log_line "$repo #$pr review $_rstate at $head — dispatched $(( _rage / 60 ))m ago, within its ${_rwin}s window for this state; waiting, not re-dispatching (a slow review is not a stuck one)"
+          # ⛔ STATE THE BASIS OF THE AGE (review round 7, P3): "dispatched 0m ago" was printed for a record
+          # with NO epoch, so the operator's primary instrument asserted a measurement that did not exist.
+          case "$_rage_rc" in
+            0) _rage_txt="dispatched $(( _rage / 60 ))m ago";;
+            1) _rage_txt="the record carries NO dispatch epoch, so the age is ${_rage}s measured from the record file's own mtime";;
+            *) _rage_txt="the record carries NO dispatch epoch and its mtime could not be read, so the age is UNKNOWN";;
+          esac
+          log_line "$repo #$pr review $_rstate at $head — ${_rage_txt}, within its ${_rwin}s window for this state; waiting, not re-dispatching (a slow review is not a stuck one)"
           continue
         fi
         if [ "$_ract" -eq 3 ]; then
@@ -1267,8 +1429,15 @@ PY
           # has no verdict, so dispatching again buys the same failure at review prices. Publishing it
           # is what keeps the PR from reading as "a lane is working on it" — the rest of this step only
           # exists to keep that from happening.
-          publish_review_state "$repo" "$pr" review-retries-exhausted "$head"
-          log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s (cap $REVIEW_MAX_ATTEMPTS, last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
+          # ⛔ THE COUNT AND THE COMMENT MUST AGREE, AND NEITHER MAY OVERSTATE WHAT WAS MEASURED: when the
+          # ledger cannot be read, `_rattn` is the CAP, so the published comment AND the log say that.
+          if review_ledger_unreadable "$_ratt"; then _rbasis=cap; else _rbasis=; fi
+          publish_review_state "$repo" "$pr" review-retries-exhausted "$head" "$_rbasis"
+          if [ "$_rbasis" = cap ]; then
+            log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — the attempt ledger could not be read, so this head is held fail-closed as if $REVIEW_MAX_ATTEMPTS dispatches inside ${REVIEW_ATTEMPT_WINDOW_S}s had been spent (that is the CAP, not a count; last state $_rstate, record $_rout, ledger $_ratt); that window will NOT roll by itself — an unreadable ledger reads the same value on every pass, so repair or remove that file. A new head is a new key and gets a review immediately"
+          else
+            log_line "$repo #$pr REVIEW-RETRIES-EXHAUSTED at $head — $_rattn dispatch(es) inside ${REVIEW_ATTEMPT_WINDOW_S}s (cap $REVIEW_MAX_ATTEMPTS, last state $_rstate, record $_rout, ledger $_ratt); not dispatching again until the window rolls. A new head is a new key and gets a review immediately"
+          fi
           continue
         fi
         if [ "$_ract" -eq 2 ]; then
@@ -1299,17 +1468,35 @@ PY
         # the window bounds how long damage lasts but would still let three load refusals exhaust the
         # FIRST real review's retries. `review_forgive_refusal` drops exactly that one line, and only when
         # the last dispatch is the refusal — never a paid entry.
-        [ "$_rstate" = refused ] && review_forgive_refusal "$_ratt"
-        publish_review_state "$repo" "$pr" review-in-flight "$head"
-        # ⛔ A ROLLED-BACK DISPATCH MUST CORRECT THE MARKER IT JUST POSTED (review round 3, P2). The
-        # in-flight publish is deliberately BEFORE the launch (a dispatched review must never be
-        # invisible), so when the launch is proven not to have started the comment is already on the PR
-        # claiming "a fresh-context reviewer was dispatched". The record is removed, so every later pass
-        # reads `none` and re-publishes the SAME tag — a no-op — leaving a PR that reads `review in flight`
-        # with nothing running and no attestation coming: the "indistinguishable from a lane" disguise this
-        # PR exists to remove, and the log line even claims the opposite.
+        [ "$_rstate" = refused ] && review_forgive_refusal "$_ratt" "$(review_dispatched_at "$_rout")"
+        # ⛔ THE IN-FLIGHT MARKER IS PUBLISHED ONLY ONCE THE LAUNCH IS PROVEN TO HAVE STARTED (review
+        # round 5, measured on the real functions). Both orderings were tried and both lie or thrash:
+        #  - BEFORE the launch: a rolled-back dispatch has already told the PR "a reviewer was
+        #    dispatched", so every later pass must either re-post in-flight (the failure notice outlives
+        #    its retry) or re-post the failure (the in-flight claim outlives ITS truth) — and with both
+        #    corrected positionally a permanently broken reviewer path posts TWO comments PER PASS, for
+        #    ever, which is the duplicate-marker thrash these arms exist to forbid.
+        #  - AFTER it: a dispatch that never started says nothing at all, the failure notice is the
+        #    last word AND the truth, a successful retry re-posts in-flight exactly once (it is newer than
+        #    the failure), and a quiet repeat adds nothing. No alternation, no thrash.
+        # The few seconds between launch and this line do not hide a running review: the record that
+        # `launch_review` wrote already says DISPATCHED, and the state machine reads the record.
         launch_review "$repo" "$pr" "$head" "$_rout" "$_ratt" \
           || { publish_review_state "$repo" "$pr" review-dispatch-failed "$head"; continue; }
+        # ⛔ A SUCCESS MEANS THE LAUNCH STARTED — NOT THAT A REVIEW IS STILL RUNNING (review round 5, P2,
+        # measured). `launch_review` also accepts a child that started AND FINISHED inside LAUNCH_VERIFY_S,
+        # and `review-pr.sh` exits 4/9/75 in about a second on a loaded box or a missing `pi` — so this
+        # point is reached with the record already carrying an outcome. Publishing "review in flight" then
+        # is a false claim on the PR that NOTHING ever corrects: the outcome state is `refused`/`retry`, and
+        # `refused` retries on time alone and publishes nothing, so the marker would outlive the review for
+        # ever. Say what the record says. A verdict (clean/issues) is published by its own path on the next
+        # pass, so nothing is published for it here.
+        # position, not presence — see `publish_review_state`: a success after a rolled-back dispatch must be
+        # able to correct that notice.
+        case "$(review_state "$_rout")" in
+          pending) publish_review_state "$repo" "$pr" review-in-flight "$head" ;;
+          refused|retry) publish_review_state "$repo" "$pr" awaiting-review "$head" ;;
+        esac
         _rdispatched=$(( _rdispatched + 1 ))
         continue
       fi

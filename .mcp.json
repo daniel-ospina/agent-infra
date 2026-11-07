@@ -55,17 +55,30 @@
       "cost": "one npx process"
     },
     "tortoise": {
-      "command": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}/.venv/bin/python3",
+      "_comment": "HOSTED tortoise MCP (graph-mcp-provision). A repo-local .mcp.json is what mcp-client resolves FIRST for a lane working in this repo, so this tracked copy must carry the same entry the installed base does — otherwise an agent-infra lane on a cell spawns the legacy stdio server (a checkout + venv + local FalkorDB a cell does not have) while `cell-install.sh --verify` reports the base config LAYER VERIFIED. Keep this entry byte-identical in shape to templates/.mcp.base.json's. Auth is env-indirect (${TORTOISE_MCP_API_KEY}, the STANDARD name per skills/research/SKILL.md and #5153/#5343) so no key is ever committed; the credential comes from ~/keys.env (0600), sourced by the lane launcher.",
+      "type": "http",
+      "url": "https://api.premiselabs.co/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"
+      },
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "timeoutMs": 60000,
+      "purpose": "Memory graph (Tortoise, hosted) — read before you derive, write what you learn",
+      "whenToLoad": "any lane: graph read before research, write-back after (`mcp_load tortoise`)",
+      "cost": "one HTTP session; lazy, so nothing is paid while it sleeps"
+    },
+    "orchestrator": {
+      "command": "python3",
       "args": [
-        "-m",
-        "tortoise.mcp_server"
+        "${AGENT_INFRA_PATH}/mcp-servers/orchestrator/server.py"
       ],
-      "cwd": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-      "env": {
-        "PYTHONPATH": "${TORTOISE_HOME:-${HOME}/Documents/GitHub/tortoise}",
-        "TORTOISE_DB_URI": "docker://:@127.0.0.1:16379/tortoise",
-        "TORTOISE_API_KEY": ""
-      }
+      "cwd": "${AGENT_INFRA_PATH}",
+      "lazy": true,
+      "idleTimeoutMs": 900000,
+      "purpose": "Fleet/orchestrator surface — 11 tools / 12 MCP names (agent-infra#3382): lane.list, lane.show, lane.artifact, fleet.census, pr.queue, claim.check, lane.dispatch, box.exec, pr.review_record, pr.closure_audit, fleet.reminder, fleet.beat_checkpoint. EIGHT are reads; lane.dispatch, box.exec, fleet.reminder and fleet.beat_checkpoint MUTATE, so this entry is NOT read-only — launch it with --read-only (or ORCH_MCP_READ_ONLY=1) to refuse every mutating tool. box.exec is destructiveHint/openWorldHint and runs allowlisted ARGV commands on cells.",
+      "whenToLoad": "whenever the question is 'did this lane finish?' / 'which lanes are running?' / 'what expired?' — i.e. any beat's lane census — plus PR review state (pr.review_record), closure audits and claim checks. NOT a substitute for tools/fleet/liveness.py (the one liveness verdict): the registry answers about the RECORD, liveness answers about the process.",
+      "cost": "zero while sleeping (lazy); 1 python process per call plus the wrapped CLI's own cost (1 git fetch for lane reads, 1+ gh call for pr/claim reads, 1 cmux exec for box.exec)"
     }
   }
 }
