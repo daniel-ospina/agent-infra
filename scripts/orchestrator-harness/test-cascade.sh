@@ -134,7 +134,7 @@ ck "…its live fix lane too"                              "$(case "$WORKING_PR_
 ck "…and its live merge lane"                            "$(case "$WORKING_PR_SET" in *' 9003 '*) echo yes;; *) echo no;; esac)" "yes"
 ck "a DEAD record is NOT ownership (the census proves the death)" "$(case "$WORKING_PR_SET" in *' 9004 '*) echo yes;; *) echo no;; esac)" "no"
 ck "a live lane-<N> is in INFLIGHT_ISSUE_SET (the pass's dedup input)" "$(case "$INFLIGHT_ISSUE_SET" in *' 77 '*) echo yes;; *) echo no;; esac)" "yes"
-ck "…and an `unknown` worker counts ALIVE (a probe failure must not free a slot)" "$(case "$INFLIGHT_ISSUE_SET" in *' 78 '*) echo yes;; *) echo no;; esac)" "yes"
+ck "…and an \`unknown\` worker counts ALIVE (a probe failure must not free a slot)" "$(case "$INFLIGHT_ISSUE_SET" in *' 78 '*) echo yes;; *) echo no;; esac)" "yes"
 ck "THE MEASURED CASE: 3 of the 4 open PRs are owned, so unowned=1, not 4" "$(unowned_pr_count 4)" "1"
 ck "…and pr_owned() answers the SAME question the spawn arms ask" "$(pr_owned 9001 shaA fix/9001-a && echo owned || echo unowned)" "owned"
 # The count and the spawn guard must not disagree about the same PR (the #3096 shape, one level up).
@@ -782,7 +782,7 @@ echo "=== 14. an UNSET cascade input means 'older caller', never 'no room' ==="
 # The rule is the terse-minus one the escape block already uses one place over.
 ckin "the batch guard treats an UNSET slot count as 'pre-change', not as 0" \
    "$SRC" '[ "${CASCADE_ISSUE_SLOTS-1}" -ge 1 ] 2>/dev/null || break'
-ckni "…and the `:-0` form is GONE from that guard (it is the CI red)" \
+ckni "…and the \`:-0\` form is GONE from that guard (it is the CI red)" \
    "$SRC" '[ "${CASCADE_ISSUE_SLOTS:-0}" -ge 1 ] 2>/dev/null || break'
 
  echo "=== 14b. the interval is still spent when the census gives no baseline ==="
@@ -911,6 +911,18 @@ ckin "a LEVEL-HOLD deferral says a higher level holds the room" "$(sel13 holds)"
 ckni "…and does not claim there is no room" "$(sel13 holds)" "no room left"
 ckin "an UNREADABLE count says the count could not be read" "$(sel13 unreadable)" "the count could not be read"
 ckin "the default (no cause given) keeps the original sentence" "$(sel13 '')" "no room left after it"
+# ⛔ THE ZERO-UN-OWNED HOLD, ASSERTED — NOT ONLY MUTATED (review 2026-11-07, P2). The probe added for
+# `M24` discarded stdout, so it pinned the CHOICE but not the LINE the arm exists to print: gutting the
+# arm's `issues_why` to name the wrong cause (`DISPATCH (… in backlog)`, or the "no room left after it"
+# misattribution repaired once already) left all 168 assertions green. So the state is asserted here as
+# a `ck`, and the mutant probes below share the same state. `unowned=0`, `prw=1`, no cap ⇒ the funnel
+# must DEFER **and** name the hold, because `CASCADE_ISSUE_SLOTS` is 0 and the batch's first guard
+# would break — a printed DISPATCH over a batch that queues nothing.
+selz() { ( . "$FNS"; lo_select 0 0 0 0 3 "" 10 1 2 ok 1 1 2>/dev/null ) }
+ckin "a LEVEL-HOLD with ZERO un-owned PRs DEFERS and NAMES the hold (level 1 owns the room)" \
+   "$(selz)" "a higher level is holding the room"
+ck "…and its choice is none, never a DISPATCH over a batch that queues nothing" \
+   "$( ( . "$FNS"; lo_select 0 0 0 0 3 "" 10 1 2 ok 1 1 >/dev/null 2>&1; printf '%s' "$LO_CHOICE" ) )" "none"
 
 # ── MUTANTS: every assertion above must be able to FAIL ────────────────────────────────────────
 echo
@@ -1014,10 +1026,25 @@ mutlo "M5 the funnel ignores arg 12 and re-closes the issue path" \
 # `prw=1`, no cap, room to give ⇒ `DEFERRED`, because `CASCADE_ISSUE_SLOTS` is 0 and the batch's own
 # first guard would break (a printed DISPATCH over a batch that queues nothing).
 cat > "$TMP/p-selz.sh" <<'PEOF'
-. "$ORCH_FNS"; lo_select 0 0 0 0 3 "" 10 1 2 ok 1 1 >/dev/null 2>&1; [ "$LO_CHOICE" = "none" ] && echo yes || echo no
+# Grades the SHIPPED arm: the CHOICE and the LINE it prints. (A probe that discarded stdout pinned only
+# the branch, and let the arm be gutted to a string naming the wrong cause with the suite green.)
+# ⛔ `LO_CHOICE` MUST BE READ INSIDE THE SAME SUBSHELL (measured): `lo_select` sets it in the shell that
+# runs it, so a `$( … )` that only calls it leaves the PARENT's copy unset — the first form of this probe
+# tested `[ "$LO_CHOICE" = "none" ]` on the outside and printed `no` for the shipped module too, which
+# made M24 and M25 inert assertions that could never go green (`shipped=[no] mutant=[no]`). Both facts
+# therefore travel OUT of the subshell in one string.
+out="$( . "$ORCH_FNS"; lo_select 0 0 0 0 3 "" 10 1 2 ok 1 1 2>/dev/null; printf '|CHOICE=%s' "$LO_CHOICE" )"
+case "$out" in
+  *"a higher level is holding the room"*"|CHOICE=none") echo yes ;;
+  *) echo no ;;
+esac
 PEOF
 mutlo "M24 the funnel drops the ZERO-un-owned hold arm -> it prints DISPATCH over a batch that queues nothing" \
     's/^  elif \[ "${prw:-}" = "1" \]; then$/  elif false; then/' "$TMP/p-selz.sh"
+# ⛔ AND THE ARM'S OWN SENTENCE MUST BE PINNED SEPARATELY: `M24` kills the whole arm, so it would still
+# "discriminate" if the arm survived while its message were replaced with a cause it never measured.
+mutlo "M25 the ZERO-un-owned hold prints the WRONG CAUSE (a DISPATCH string over a deferring branch)" \
+    's/^    issues_why="DEFERRED (a higher level is holding the room this pass: ${unowned} un-owned PR(s))"$/    issues_why="DISPATCH ($backlog in backlog)"/' "$TMP/p-selz.sh"
 
 cat > "$TMP/p-cap.sh" <<'PEOF'
 grep -qF '[ "$K" -ge "${CASCADE_ISSUE_SLOTS:-${BATCH:-2}}" ] && break' "$TGT" && echo yes || echo no
