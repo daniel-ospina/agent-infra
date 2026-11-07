@@ -1916,6 +1916,58 @@ async function partB() {
     expectTrue("B13c control: the LITERAL spelling of the same file is read and gated by the effect (#709)",
       blocked(alphaLiteral) && /#709/.test(blockReason1228(alphaLiteral)),
       `reason=${JSON.stringify(blockReason1228(alphaLiteral)).slice(0, 240)}`);
+
+    // ── B13d (#3333 review cycle-2, P1-1 + P1-2): two byte rules that DELETED a real executed path ──
+    // Both were NEW fail-opens this head introduced against `origin/main`, and BOTH were invisible to
+    // every suite: the predicate returned `false`, so no arm ever formed a candidate, and the tests that
+    // looked like they covered the position (`./`-prefixed spellings) passed for a different reason.
+    // These arms drive the REAL handler and assert BLOCK, so a re-widening reds here at the level the
+    // user actually hits rather than only at the predicate.
+    //
+    // ⛔ THE FIXTURES ARE NAMED SO THE SPELLING IS THE THING UNDER TEST: `stage1$` is a directory whose
+    // name ends in `$` (spelled `st*$/undo.sh` — the glob is on a LITERAL component), and `q0w` holds
+    // `undox.sh` (spelled `q[0]w/undo[x].sh` — two bracket GROUPS with a `/` between them).
+    const dollarDir = join(wt, "stage1$");
+    mkdirSync(dollarDir, { recursive: true });
+    write(join(dollarDir, "undo.sh"), "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${JSON.stringify(join(dollarDir, "undo.sh"))}`);
+    const bracketDir = join(wt, "q0w");
+    mkdirSync(bracketDir, { recursive: true });
+    write(join(bracketDir, "undox.sh"), "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${JSON.stringify(join(bracketDir, "undox.sh"))}`);
+    const deleted1228 = [
+      ["P1-1 a `$`-terminated component addressed through a glob, after a separator", "true && st*$/undo.sh"],
+      ["P1-1 …as a `-c` payload", "bash -c 'st*$/undo.sh'"],
+      ["P1-1 …through `eval`", "eval 'st*$/undo.sh'"],
+      ["P1-1 …absolute", `true && '${join(wt, "st*$/undo.sh")}'`],
+      ["P1-1 …a `?` glob on a literal component", "true && sta?e1$/undo.sh"],
+      ["P1-2 two bracket groups with a `/` between them, after a separator", "true && q[0]w/undo[x].sh"],
+      ["P1-2 …as a `-c` payload", "bash -c 'q[0]w/undo[x].sh'"],
+      ["P1-2 …through `eval`", "eval 'q[0]w/undo[x].sh'"],
+      ["P1-2 …absolute", `true && '${join(wt, "q[0]w/undo[x].sh")}'`],
+    ];
+    for (const [why, cmd] of deleted1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(cmd, wt);
+      expectTrue(`B13d: ${why} → BLOCKED (${cmd})`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+    }
+    // ⛔ THE POSITIVE CONTROLS the fail-open class needs: the LITERAL spellings stay gated by their
+    // EFFECT (#709), so the arms above are not "everything under these directories is refused", and
+    // the two program-text exclusions this rule exists for are still non-paths.
+    for (const [why, lit] of [
+      ["the `$` directory, spelled literally", join(wt, "stage1$/undo.sh")],
+      ["the bracket directory, spelled literally", join(wt, "q0w/undox.sh")],
+    ]) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(`bash '${lit}'`, wt);
+      expectTrue(`B13d control: ${why} is read and gated by the effect (#709)`,
+        blocked(r) && /#709/.test(blockReason1228(r)),
+        `reason=${JSON.stringify(blockReason1228(r)).slice(0, 240)}`);
+    }
+    expectTrue("B13d control: the sed expression #3243 was filed for is STILL not a path `s/[[:space:]]*$//`",
+      cg.wtIsPathShapedScriptWord("s/[[:space:]]*$//") === false);
+    expectTrue("B13d control: the awk program is STILL not a path `/^tree=/{t=$2}`",
+      cg.wtIsPathShapedScriptWord("/^tree=/{t=$2}") === false);
     // Documented fail-closed COST, not a bug: an expansion-shaped path is
     // refused WITHOUT reading it, so a glob that happens to match only a clean
     // script blocks too. That is the accepted price of the fix — resolving
@@ -2829,16 +2881,67 @@ if (process.argv.includes("--mutations")) {
     [
       "the component-final `$` END-ANCHOR rule (#3243 c9) is load-bearing",
       // The sed expression #3243 was FILED for is excluded by exactly one rule: a `$` that follows a
-      // raw glob operator. Drop that rule and it must become a script path again — otherwise the
-      // exclusion is an accident of some other byte rule and the next widening will re-admit it.
+      // glob operator applied to an EXPANSION GROUP. Drop that rule and it must become a script path
+      // again — otherwise the exclusion is an accident of some other byte rule and the next widening
+      // will re-admit it.
       [[
-        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PG)) return false;`,
+        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PH + PG)) return false;`,
         String.raw`      else if (false) return false;`,
       ]],
       (m) => m.wtIsPathShapedScriptWord("s/[[:space:]]*$//"),
       false,
       true,
       "the sed expression #3243 was filed for becomes a script path again",
+    ],
+    [
+      // ⛔ THE P1-1 PAIR (#3333 review cycle-2). The rule above shipped keyed on `out.endsWith(PG)`
+      // alone — any `$` after ANY raw glob — and that DELETED real `$`-terminated directories a shell
+      // expands and execs: `a*$/undo.sh`, `st*$/undo.sh`, `/tmp/*$/undo.sh` were ALLOW at that head and
+      // BLOCK on `origin/main`, through the real handler. Narrowing the test to `PH + PG` (a glob on a
+      // GROUP) is what restores them, so this pair RE-WIDENS the rule and demands the fail-open back.
+      // Without it, the fix is unpinned and the next widening re-admits the class silently.
+      "the `$` END-ANCHOR applies only to a glob on a GROUP, never to a glob on a literal byte (#3333 c2 P1-1)",
+      [[
+        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PH + PG)) return false;`,
+        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PG)) return false;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("a*$/undo.sh"),
+      true,
+      false,
+      "a real `$`-terminated directory addressed through a glob goes blind again",
+    ],
+    [
+      // ⛔ THE P1-2 PAIR (#3333 review cycle-2). `LAST_CLOSE` is the LAST `]` in the WHOLE word, so a
+      // word with two bracket groups swallowed everything between them — including the `/` that
+      // separates two real components — into ONE placeholder. `q[0]w/undo[x].sh`, `a[b]c/d[e]` and
+      // `x[b]y/z[c]` were ALLOW at that head and BLOCK on `origin/main`. Bounding the jump to a closer
+      // inside the current component is the fix; removing the bound reproduces the fail-open.
+      "the `[` closer hunt is bounded to the CURRENT component, so it cannot swallow a `/` (#3333 c2 P1-2)",
+      [[
+        String.raw`      if (sl >= 0 && e > sl) e = s.lastIndexOf("]", sl);`,
+        String.raw`      if (false) e = s.lastIndexOf("]", sl);`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("q[0]w/undo[x].sh"),
+      true,
+      false,
+      "the `/` between two bracket groups is swallowed into one placeholder again",
+    ],
+    [
+      // ⛔ THE P2-1 PAIR (#3333 review cycle-2, measured): the prologue accept was the cycle-7 P0 fix
+      // and NOTHING pinned it — every guard suite stayed green with the line deleted. An unpinned fix
+      // is a fix the next simplification silently reverts, so it gets a pair of its own. The probe is
+      // an unbalanced-backtick spelling: the loop's backtick branch `return false`s on it, so the
+      // prologue is the ONLY thing that rescues it (a `./a[b/undo*.sh` probe would pass either way,
+      // because the terminal test rescues that one — which is why this spelling and not that one).
+      "the explicit-prefix accept cannot be pre-empted by a byte rule's `return false` (#3333 c2 P2-1)",
+      [[
+        String.raw`  if (/^(?:\.{1,2}|~)\//.test(s)) return true;`,
+        String.raw`  if (false) return true;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./a`b/undo.sh"),
+      true,
+      false,
+      "a `./`-prefixed real path with an unbalanced backtick is deleted by the loop again",
     ],
   ];
   for (const [label, reverts, probe, wantBefore, wantAfter, why] of PREDICATE_PAIRS) {

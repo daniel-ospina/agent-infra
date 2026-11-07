@@ -3509,7 +3509,20 @@ export function wtIsPathShapedScriptWord(word) {
       // emitted a placeholder" also rejected an escaped byte and a bracket GROUP (cycle 10), and keying
       // on the raw character also rejected an ESCAPED `*`/`?` (cycle 11, measured BLOCK → ALLOW
       // through the handler).
-      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PG)) return false;
+      // ⛔ …AND THE GLOB MUST BE APPLYING TO AN EXPANSION GROUP, NOT TO A LITERAL BYTE (#3333 review
+      // cycle-2, P1-1 — measured, and it was a fail-OPEN this head introduced). Keying on
+      // `out.endsWith(PG)` alone rejected EVERY `$` that follows a raw glob, which includes real
+      // filenames a shell expands and execs: `a*$/undo.sh`, `a?$/undo.sh`, `st*$/undo.sh`,
+      // `/tmp/*$/undo.sh`, `x*$/y/undo.sh` all went **ALLOW at this head while `origin/main` BLOCKed
+      // them**, through the real handler (`true && st*$/undo.sh`, `bash -c '…'`, `eval '…'`, a nested
+      // body). A glob after LITERAL bytes globs a `$`-terminated component NAME (`stage1$`); only a
+      // glob applied to a GROUP is the regex text (`[[…]]*$`, sed's `s/[[:space:]]*$//`) the rule is
+      // for. So the test is `PH + PG` — a group placeholder immediately followed by a glob operator.
+      // ⛔ NAMED RESIDUAL (measured, not chased): a `$` following a glob applied to a GROUP
+      // (`q[0]*$/undo.sh`) is still dismissed as an end-anchor. It is the same fail-open class at a
+      // smaller radius, and closing it needs a way to tell a bracket group that is regex text from one
+      // that is a filename, which no byte-level rule has — tracked with #3341.
+      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PH + PG)) return false;
       else { out += ch; continue; }
       out += PH; i = j - 1; continue;
     }
@@ -3529,7 +3542,21 @@ export function wtIsPathShapedScriptWord(word) {
     // scans to the LAST `]` so a POSIX class (`[[:space:]]`) is ONE group; a leaked `]` used to be
     // the only thing keeping the sed expression out, which made that rejection an accident instead
     // of a rule — `$` (below) is now the named reason.
-    if (ch === "[") { const e = LAST_CLOSE; out += PH; if (e > i) i = e; continue; }
+    // ⛔ THE `[` CLOSER HUNT MUST NOT JUMP OVER A `/` (#3333 review cycle-2, P1-2 — measured, and it
+    // was a second fail-OPEN this head introduced). `LAST_CLOSE` is the LAST `]` in the WHOLE word, so
+    // a word with two bracket groups swallowed everything between them into ONE placeholder — including
+    // the `/` that separates two real components. `q[0]w/undo[x].sh`, `a[b]c/d[e]`, `x[b]y/z[c]` all
+    // returned false at this head and **true on `origin/main`**, and through the real handler
+    // (`true && q[0]w/undo[x].sh`, `bash -c '…'`, `eval '…'`, a nested body) they went ALLOW where main
+    // BLOCKed — a bash glob really expands `q[0]w/undo[x].sh` to `q0w/undox.sh`. So the jump is bounded
+    // to a closer INSIDE THE CURRENT COMPONENT: the last `]` before the next `/`. `[[:space:]]` still
+    // folds to ONE group (it carries no `/`), which is what `LAST_CLOSE` was introduced for.
+    if (ch === "[") {
+      const sl = s.indexOf("/", i + 1);
+      let e = LAST_CLOSE;
+      if (sl >= 0 && e > sl) e = s.lastIndexOf("]", sl);
+      out += PH; if (e > i) i = e; continue;
+    }
     if (ch === "{") { const e = LAST_BRACE > i ? s.indexOf("}", i + 1) : -1; out += PH; if (e > i) i = e; continue; }
     if (ch === "(") { const e = LAST_PAREN > i ? s.indexOf(")", i + 1) : -1; out += PH; if (e > i) i = e; continue; }
     out += ch;
