@@ -885,7 +885,12 @@ fi
 if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
   err "$PROG: the reviewer was NOT STARTED — the spawn point could not resolve its fork instrument (rc=$AGENT_RC, AGENT_HARNESS_SKEW_REFUSED). Nothing was consumed: no review was paid for, no comment posted, NO record written."
   err "  This is a HELPER/SYNC fault, not a code verdict and not a box capacity event: sync the pair (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever reviewers run, then re-run. Do NOT dispatch the PR elsewhere — every box with these files refuses identically."
-  exit 83
+  # ⛔ AND IT EXITS THE SAME TOLERANT REFERENCE IT MATCHED ON (round-2 review of #3645, P2). The match two
+  # lines up already reads `${AGENT_HARNESS_SKEW_REFUSED:-83}`; a literal here is the SAME defect shape the
+  # merge in #3231 shipped one file over (an arm that matches a tolerant code and then exits something
+  # else), and it is only invisible because nothing in this file declares the variable. Behaviourally equal
+  # TODAY, latent tomorrow — the caller that declares it is `spawn-gate.sh`.
+  exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"
 fi
 # ⛔ THE EXIT STATUS IS THE SIGNAL, NOT A STRING IN THE TRANSCRIPT (P3, fresh review of #2288). This
 # arm used to ALSO match `^\[pi-gate\] REFUSED` anywhere in the log, so a reviewer that QUOTED the

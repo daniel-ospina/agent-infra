@@ -3928,11 +3928,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
       return "$AGENT_FORK_REFUSED" ;;
     nodeploy)
       # FAIL CLOSED. 83 is the harness-skew code, because that is what this is: the gate and the
-      # instrument it consumes are not deployed together, so `cp scripts/orchestrator-harness/*.sh $O/`
-      # is the remedy — the same sentence the capability gate publishes for 83, and the same reason
-      # it is not folded into 73 (this box can fork perfectly well).
+      # instrument it consumes are not deployed together, so a VERIFIED redeploy is the remedy — the
+      # same sentence the capability gate publishes for 83 (`:4293`), and the same reason it is not
+      # folded into 73 (this box can fork perfectly well).
+      # ⛔ NOT `cp scripts/orchestrator-harness/*.sh $O/` (fresh review of #3231, P1; #3508 retired it):
+      # that glob is depth-1 and unverified, so it silently skips `gh-limit/`, `fleet/`, `retired/` and
+      # leaves a PARTIAL deploy that this very gate then refuses. Applied here by the merge with #3508:
+      # these three lines did not exist on main, so #3508's 7-site table could not have covered them.
       AGENT_STARTED=0
-      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the pair: cp scripts/orchestrator-harness/*.sh \$O/ (or redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)." >> "$log"
+      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the helper pair with a VERIFIED redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O" >> "$log"
       return "$AGENT_HARNESS_SKEW_REFUSED" ;;
     unknown)
       echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. The instrument RAN and could not measure, which is a reading about the box rather than a deploy fault, so this spawn proceeds (an unmeasurable box is not a refusal). If lanes here stall, start from this line." >> "$log" ;;
@@ -4646,7 +4650,7 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # operator to restart a box that can fork perfectly well.
   if [ "$rc" = "$AGENT_HARNESS_SKEW_REFUSED" ]; then
     AGENT_STARTED=0
-    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed; the [pi-gate] line above names the paths it searched. Sync the helper pair (cp scripts/orchestrator-harness/*.sh \$O/); do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
+    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed; the [pi-gate] line above names the paths it searched. Sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O); do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
     return "$AGENT_HARNESS_SKEW_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
@@ -5225,7 +5229,7 @@ pi_shim_main() {
     # cannot be established" as "capacity is available", which is the one inference an admission
     # gate may never make. The operator rescue is the real pi by absolute path.
     printf '[pi-gate] REFUSED fork headroom UNREADABLE: %s. NO pi was started and nothing was consumed.\n' "$_fdetail" >&2
-    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: sync the pair into one of the searched dirs (cp scripts/orchestrator-harness/*.sh <dir>), fix the fork-floor knob named above, or redeploy the harness (deploy-harness.sh --repo . --o <O>). Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
+    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: place the pair in the dir the search above actually resolved (the candidate this arm exists for is the one whose launcher never exported `O`), with a VERIFIED redeploy there — bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o <that dir> — and set O to it, or fix the CAP_MIN_FORK_HEADROOM knob named above if the detail names one. Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
     pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
     exit "$AGENT_HARNESS_SKEW_REFUSED"
   fi
