@@ -530,6 +530,15 @@ refuses 'an ExecStart naming a payload this run does not place' "$(doctor_rw exe
 # or `chroot(2)` — so a path that is not a live-cell invariant is `200/CHDIR` with a different syscall.
 # MEASURED rc=0, unit installed, "ONE actuator" printed.
 refuses 'a RootDirectory= (systemd enters it before the payload)' "$(doctor rootdir 'RootDirectory=/srv/harness-current')" "$T/u29" 'never began'
+# ⛔ AND THE MOUNT-REDIRECTION MEMBERS OF THAT SAME CLASS (round-19 review, P1). The root-directory arm
+# closed the CHROOT route and left the BIND route open: `BindPaths=/srv/evil:<the verified pass>` makes the
+# unit exec bytes no rule in this file has ever read, at a path that EXISTS, so there is no 203/EXEC to turn
+# it into a RED — the pin runs attacker-chosen code with the timer enabled and every surface green.
+# MEASURED rc=0 before this arm. The reason is name-based, so the value below is deliberately realistic but
+# not load-bearing; `TemporaryFileSystem=` is the third member (it replaces a path with an empty tmpfs) and
+# is refused by the same arm, so neither can be re-opened without reddening a leg here.
+refuses 'a BindPaths= (a mount puts different bytes over the verified ExecStart)' "$(doctor bindpaths 'BindPaths=/srv/evil:/srv/payload/cell-self-pin.sh')" "$T/u29b" 'mounts into'
+refuses 'a TemporaryFileSystem= (a mount replaces a path in the unit view)' "$(doctor tmpfs 'TemporaryFileSystem=/srv/harness-current')" "$T/u29c" 'mounts into'
 # ⛔ AND `%` IS A SPECIFIER, NOT A CHARACTER. Both `Environment=` values and the `ExecStart=` command line
 # are %-specifier-expanded by the manager (`%h` = the manager user's home), so a base that CONTAINS `%` is
 # verified as that literal string and RUNS expanded — the unit's effective CELL_HOME stops being the value
@@ -953,6 +962,8 @@ elif [[ $out == *'provisioning clone'* ]]; then
 else bad "refused an out-of-unit-dir drop-in for the WRONG reason: $out"; fi
 refuses_dropin 'lives in the TYPE-LEVEL drop-in dir (service.d)' "$(dropin_doctor typedir 'ConditionPathExists=/srv/nope' 'service.d')" 'ConditionPathExists='
 refuses_dropin 'declares a RootDirectory= (systemd enters it before the payload)' "$(dropin_doctor rootdir 'RootDirectory=/srv/harness-current')" 'never began'
+# …and the BIND members of that same class, in the file systemd merges OVER the artifact this run verified.
+refuses_dropin 'declares a BindPaths= (a mount over the verified payload)' "$(dropin_doctor bindpaths 'BindPaths=/srv/evil:/srv/payload/cell-self-pin.sh')" 'mounts into'
 refuses_dropin 'declares a DynamicUser= (an allocated identity cannot pin the tree)' "$(dropin_doctor dynamicuser 'DynamicUser=yes')" 'DynamicUser='
 # ⛔ AND THE TIMER'S DROP-INS ARE A SEPARATE SET, WHICH NOTHING READ. `dropin_dirs` enumerates what systemd
 # merges FOR THE NAME IT IS GIVEN, and `--install` verified only `cell-self-pin.service` — so

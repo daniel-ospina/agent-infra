@@ -42,7 +42,7 @@
 #   base       ${CELL_HOME:-$HOME}                — the expression this file, the unit's rendered
 #                                                   `Environment=CELL_HOME=` and every sibling installer
 #                                                   agree on. ⛔ Note the SUPERVISOR's own fallback is
-#                                                   `/tmp/cell-home` (cloud-cell-supervisor.sh:134), NOT
+#                                                   `/tmp/cell-home` (its own `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"`), NOT
 #                                                   `$HOME`; that is why the unit renders CELL_HOME
 #                                                   EXPLICITLY rather than trusting the manager's HOME.
 #   record     ${HARNESS_PIN_FILE}                — default $CELL_HOME/.harness-path: the file
@@ -110,7 +110,7 @@
 set -u
 
 # ⛔ REMEMBERED BEFORE IT IS DEFAULTED, because the DEFAULT IS THE DEFECT. `cloud-cell-supervisor.sh`'s own
-# fallback is `/tmp/cell-home` (measured: cloud-cell-supervisor.sh:134), NOT `$HOME` — so an install run
+# fallback is `/tmp/cell-home` (measured: its own `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` default), NOT `$HOME` — so an install run
 # with CELL_HOME unset would render `Environment=CELL_HOME=$HOME` into a unit whose reader is looking
 # somewhere else, i.e. the pin pass reads `$HOME/.harness-path` while the controller reads
 # `$CELL_HOME/.harness-path`: the #2215 skew this whole change exists to remove, installed permanently
@@ -164,8 +164,8 @@ ref_fetch_branch() { # the REMOTE branch to fetch for $HARNESS_REF — 1 when th
 }
 # ⛔ THE DECISION READS A REF THIS RUN OWNS, NOT `FETCH_HEAD`. `FETCH_HEAD` is an ordinary mutable file in
 # the worktree, bound to no run: any other git process in the SAME tree that fetches between our fetch and
-# our read is read as OUR result. That is not hypothetical here — `cloud-cell-supervisor.sh:1698`/`:2116`
-# run `git fetch origin main` in this very repository, and bring-up re-arms `eldato-harness-apply.timer`
+# our read is read as OUR result. That is not hypothetical here — `cloud-cell-supervisor.sh` has TWO `git … fetch --quiet origin main` sites that run in this very repository
+# (`classify_harness` and `harness_apply`), and bring-up re-arms `eldato-harness-apply.timer`
 # beside this unit by design, so two actors fetch in one tree. MEASURED: with the record at main's tip, a
 # coexisting `git fetch origin main` made `--status` print a MAIN commit under the label `origin/rel` and
 # answer `current` + exit 0 — a foreign fetch greening a stale layer.
@@ -329,9 +329,10 @@ mend_record() {
 # They are two facts, and for a spelling that names a LOCAL ref they are DIFFERENT facts — so the pass could
 # never converge, and the failure was neither silent nor honest:
 #   · `apply --force --pin-only` runs `cloud-cell-supervisor.sh::harness_apply`, which fetches `origin main`
-#     (HARDCODED, `:2115`) and then pins `$(git rev-parse "$HARNESS_REF^{commit}")` (`:2118`) — a LOCAL read;
+#     (HARDCODED — its own `fetch --quiet origin main` inside `harness_apply`) and then pins
+#     `$(git rev-parse "$HARNESS_REF^{commit}")` (that function's `want=` line) — a LOCAL read;
 #   · a fetch of `main` moves `refs/remotes/origin/main` and NEVER `refs/heads/main`, so `HARNESS_REF=main`
-#     (or `refs/heads/main`) pins this repo's local branch, the record does not move, and `:387`'s containment
+#     (or `refs/heads/main`) pins this repo's local branch, the record does not move, and `do_pass`'s containment
 #     test REDs with STALE-RECORD — every ten minutes, for ever, while the box is in fact behind;
 #   · the remedy the STALE-RECORD line prints (`git fetch origin main && apply --force --pin-only`) cannot
 #     change the outcome either, because that fetch does not move the local branch it pins. An UNHEALABLE RED
@@ -346,7 +347,7 @@ check_pin_resolution() { # <layer repo> <target commit> — 0 when the pin verb'
   if [ -z "$local_target" ]; then
     loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} resolves to no commit in ${repo}, and 'apply' pins what IT resolves locally, so the record could never advance. Use the remote spelling: HARNESS_REF=origin/<branch>"
   fi
-  loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} resolves LOCALLY to ${local_target} in ${repo}, but this run fetched ${target} — 'apply' pins the LOCAL ref (cloud-cell-supervisor.sh:2118), so the record could never advance and every tick would re-apply for ever. Use the remote spelling: HARNESS_REF=origin/<branch>"
+  loud 2 ref-spelling "HARNESS_REF=${HARNESS_REF} resolves LOCALLY to ${local_target} in ${repo}, but this run fetched ${target} — 'apply' pins the LOCAL ref (the `want=` `rev-parse` in `cloud-cell-supervisor.sh`'s `harness_apply`), so the record could never advance and every tick would re-apply for ever. Use the remote spelling: HARNESS_REF=origin/<branch>"
 }
 
 do_pass() {
@@ -416,7 +417,8 @@ do_pass() {
   if [ -z "$applied" ]; then
     log "no readable pin record at ${HARNESS_PIN_FILE} -- applying (a pin nobody can read is not a pin)"
   # ⛔ ONE CONVERGENCE RULE, ONE PREDICATE (#1178) — and it has to hold on the DECISION, not just on the
-  # read-back. This arm decided `current` by EQUALITY while the POST-apply rule below (:484) decides by
+  # read-back. This arm decided `current` by EQUALITY while the POST-apply rule below (`do_pass`'s
+  # `merge-base --is-ancestor "$target" "$now"`) decides by
   # CONTAINMENT, so ONE state gave TWO verdicts: a record that legitimately sits AHEAD of the ref tip took
   # the mutating path here (`DRIFT … -- applying`) and read `current` + exit 0 from `--status`. Whichever
   # side you call correct, deciding them by different predicates is the third drift dialect this file
@@ -880,7 +882,8 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
   # section-blind `directive` therefore grades text systemd discards — measured in review: two
   # `Environment=` lines moved under a trailing `[Unit]` head passed the count rule, the value rule and
   # the allow-list, `--install` printed "installed", and `systemd-analyze verify` reported BOTH lines as
-  # ignored, so the installed unit ran with NO `CELL_HOME` and fell back to `${CELL_HOME:-$HOME}` (:111)
+  # ignored, so the installed unit ran with NO `CELL_HOME` and fell back to `${CELL_HOME:-$HOME}` (this file's
+  # top-level `CELL_HOME=` assignment)
   # — a different pin record than the controller reads, which is #2215's skew made permanent in
   # /etc/systemd/system. `verify_timer` was made section-aware for exactly this class; this is the same
   # fix on the service, and it uses the same helper.
@@ -1031,7 +1034,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
     bad "the rendered unit's Environment=CELL_HOME='${home_val}' is not the cell home '${CELL_HOME}' — the pass would derive its base from a value the controller never read, so it pins a different record"; return 1
   fi
   # ⛔ THE ARTIFACT'S IDENTITY WAS THE ONE PROPERTY NOTHING ASSERTED. `print_unit` derives `User=` from
-  # the owner of `$CELL_HOME` (:704) because `User=root` was MEASURED to break the pin — this file's own
+  # the owner of `$CELL_HOME` `print_unit`'s `user="$(cell_home_owner)"`) because `User=root` was MEASURED to break the pin — this file's own
   # comment quotes the fleet's drop-in: "running as root makes git refuse the fetch (dubious ownership) so
   # the unit could never pin anything" — but no rule read the value back off the rendered artifact, so a
   # template carrying `User=root`, or a second `User=` line (systemd is LAST-WINS for a single-valued
@@ -1094,6 +1097,19 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
         # `WorkingDirectory=`, just one syscall over (and `EnvironmentFile=` was the sibling this file
         # already refused). MEASURED rc=0 before this arm. The pass resolves its own layer instead.
         bad "the rendered unit declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant turns the pin into a unit that never began (the 200/CHDIR class); the pass resolves its own layer instead"; return 1 ;;
+      BindPaths|BindReadOnlyPaths|TemporaryFileSystem)
+        # ⛔ THE MOUNT-REDIRECTION MEMBERS OF THE SAME CLASS, WHICH THE ROOT-DIRECTORY ARM LEFT OPEN
+        # (round-19 review, P1). `systemd.exec(5)`: `BindPaths=`/`BindReadOnlyPaths=` bind-mount a source
+        # OVER a path in the unit's view before any line of the payload runs, and `TemporaryFileSystem=`
+        # replaces a path with an empty tmpfs. So `BindPaths=/srv/evil:<the verified ExecStart>` makes the
+        # unit execute bytes NO rule in this file has ever read, at a path that EXISTS (no 203/EXEC to turn
+        # it into a RED), with the timer enabled and every surface green — the payload-identity class the
+        # `$expect` rule above closes, reached one directive over. MEASURED before this arm: rc=0, the unit
+        # installed, "ONE actuator" printed. The reason below is true for EVERY value because this
+        # verification reads no mount at all, so nothing it approved survives the unit's own filesystem
+        # view; grading the VALUE would mean re-implementing systemd's mount resolution, and the pin unit
+        # needs no mounts of its own.
+        bad "the rendered unit declares ${_c}= — systemd mounts into the unit's filesystem view BEFORE the payload runs, so the ExecStart this verification read is not necessarily the file that executes (BindPaths=/BindReadOnlyPaths= can put different bytes over it; TemporaryFileSystem= can replace it with an empty tmpfs), and nothing here reads a mount; the pin unit needs no mounts of its own — remove the line"; return 1 ;;
     esac
   done
   # ⛔ NOTHING HERE IS GREEN ON A READING IT COULD NOT TAKE. 0 is ALWAYS a successful exit for a unit
@@ -1317,7 +1333,7 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   # exists to refuse. A latch over `directive` cannot see that: it finds the earlier non-blank value and
   # returns success. MEASURED in review with `OnUnitActiveSec=…` followed by `OnCalendar=` and then
   # `OnBootSec=3min`: `--install` printed "installed", rc=0, effective clock = one-shot.
-  # The replay below is the SAME shape the `SuccessExitStatus=` rule already uses (:1036) — an empty
+  # The replay below is the SAME shape the `SuccessExitStatus=` rule already uses (its own `awk` replay) — an empty
   # assignment is a LIST RESET for every list-shaped directive, so the lesson is applied once, here.
   # ⛔ AND THE VALUE MUST BE ONE THE MANAGER CAN PARSE — "non-blank" is not "effective". A rule that asks
   # only whether a value is PRESENT grades text, and systemd DISCARDS a value it cannot parse: `Failed to
@@ -1701,6 +1717,14 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
           # before the payload runs. Refused in the drop-in path too, because a drop-in is merged OVER the
           # unit and an operator reading the unit will never see it.
           bad "the installed drop-in ${f} declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant is a unit that never began; remove ${f}"; return 1 ;;
+        BindPaths|BindReadOnlyPaths|TemporaryFileSystem)
+          # ⛔ THE SAME MOUNT-REDIRECTION CLASS AS `RootDirectory=`, ONE STEP CLOSER (round-19 review, P1).
+          # `systemd.exec(5)` mounts these into the unit's own view before the payload runs, so a drop-in can
+          # bind different bytes over the exact `ExecStart` path the rendered artifact was verified against
+          # — the payload-identity rule this gate exists for, reached through the file systemd merges OVER
+          # that artifact (and which an operator reading the unit will never see). True for every value:
+          # this verification reads no mount, so nothing it approved survives the unit's view.
+          bad "the installed drop-in ${f} declares ${_c}= — systemd mounts into the unit's filesystem view BEFORE the payload runs, so the drop-in can put different bytes over the ExecStart the rendered unit was verified with (or replace that path with an empty tmpfs); remove ${f}"; return 1 ;;
         Exec*)
           bad "the installed drop-in ${f} declares ${_c}= — an executable directive this verification does not read, which systemd RUNS anyway; the pass needs exactly ONE executable directive, ExecStart="; return 1 ;;
         SuccessExitStatus)
@@ -1796,7 +1820,7 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
 # before any unit lookup), while `systemd-run --system` fails the same way.
 # READS STAY BARE (`is-enabled` needs no privilege), so the guard's verdicts never depend on privilege;
 # only the two MUTATIONS escalate, and the escalation is the one the sibling installer already relies on
-# (`install-harness-apply-timer.sh:390`: `[ -z "${SUDO+x}" ] && sudo -n true` → `sudo -n systemctl`).
+# (`install-harness-apply-timer.sh:389`: `[ -z "${SUDO+x}" ] && sudo -n true` → `sudo -n systemctl`).
 # `CELL_SELF_PIN_SYSTEMCTL` is the seam that keeps this testable: the suite pins it to the fake manager so
 # no leg can ever reach the host's real one, and the escalation leg (a fake `sudo`) exercises the probe.
 systemctl_system() { # <args…> — the SYSTEM manager, escalated only when escalation is PROVEN to work
@@ -1977,7 +2001,7 @@ restore_actuator() {
 # ⛔ WHY THIS EXISTS AT ALL. `do_pass` retires the shipped actuator immediately before the ONE mutation it
 # makes, so a failure AFTER that point leaves the shipped timer disabled AND stopped while this unit goes on
 # failing every ten minutes — ZERO pin actuators, nothing advancing the layer, which is exactly the state
-# #3194 is about. `do_install` already refuses to end there (`:1345`, "Zero actuators is WORSE than two");
+# #3194 is about. `do_install` already refuses to end there (its "Zero actuators is WORSE than two" arm);
 # the tick had no equivalent, so following this change's own migration could reach #3194's own shape.
 # EVERY terminal SUCCESS path in `do_pass` clears `PASS_RETIRED` first (`current`, `applied`, and the `mended`
 # exit 11), so a non-empty value here means the tick failed — including a `loud 2 …` that exits from inside
