@@ -2751,27 +2751,68 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
   const firstIsShellLike = /^(?:bash|sh|zsh|dash|ksh|ash|mksh|oksh|fish|csh|tcsh|source|env|nice|nohup|command|sudo|doas|setsid|stdbuf|time|timeout|exec|ionice|busybox|xargs|find|eval)$/.test(
     unqFirst.replace(/^.*\//, ""),
   );
-  if (sp && _wtPathNeedsExpansion(sp) && (pathShaped(sp) || /^["']?\$/.test(sp))) {
-    // Interpreter operand (`bash ./undo*.sh`, `sudo bash …`), or a bare path
+  // ⛔ THE SHAPE TEST MUST NOT DISARM A WRAPPER'S OPERAND (#3333 review, P0 — measured, and it is a
+  // NEW fail-OPEN, not a narrowing). It shipped as `pathShaped(sp) || /^["']?\$/.test(sp)` on BOTH
+  // positions of this branch, and `wtIsPathShapedScriptWord` rejects every word with no `/` and no
+  // leading `~` (that is `directish`'s rule, and it is correct for a COMMAND word: a bare command
+  // resolves through PATH). For an INTERPRETER OPERAND it is false: `bash undo*.sh` resolves the
+  // operand against the CWD and execs it, so `extractScriptPath` returning `undo*.sh` was already the
+  // right answer and the shape test then DELETED it. The word fell through the operand branch, failed
+  // the extglob loop's own `pathShaped(w)`, could not reach `directish("bash")` (no `/`), and the
+  // command was ALLOWED with an unreadable script that may `git checkout --` uncommitted work:
+  // `bash undo*.sh`, `bash undo?.sh`, `bash undo[0-9].sh`, `bash undo{1}.sh`, `sh undo?.sh`,
+  // `bash -x undo*.sh`, `bash undo?.sh arg`, `sudo bash undo*.sh`, `env A=1 bash undo*.sh`.
+  //
+  // So `firstIsShellLike` is an UNCONDITIONAL pass again, exactly as it was before #3243: a wrapper is
+  // by definition followed by its OPERAND, and `extractScriptPath` returns that operand as `sp`. The
+  // grammar stays where the position is genuinely AMBIGUOUS — a word that IS the segment's first word,
+  // where program text and a real path are indistinguishable — which is all #3243 cycle-1 F3 ever
+  // needed to narrow. ⛔ TWO OF THE THREE SPELLINGS THIS COMMENT USED TO CREDIT WITH THAT ARE NOT
+  // SHAPED AS CLAIMED (#3333 review P1, measured — an unverified "all three stay ALLOW" would send
+  // the next reader to write a failing arm, or to "fix" a correct refusal):
+  //   • `/^tree=/{t=$2}` — `pathShaped` FALSE, so as a segment's first word it is program text and
+  //     stays non-path. ALLOW inside a body, ALLOW as an `awk` program argument.
+  //   • `s/[[:space:]]*$//` — `pathShaped` FALSE too, but the HANDLER still BLOCKs it standalone on
+  //     both builds (a different arm). Predicate-level non-path, handler-level refusal.
+  //   • `~520` — NOT a non-path: `pathShaped('~520')` is TRUE on both builds, and it is refused on
+  //     both, which is what test-discard-gate.mjs B15h-i says ("`~520` still blocks (it IS a valid
+  //     tilde expansion spelling)"). Only the program-text shape is pinned there.
+  // The narrowing is intact either way — no spelling became newly blocked — but do not re-assert the
+  // old sentence without re-measuring it.
+  //
+  // The `$`-rooted carve-out is kept as a DEFENSIVE belt, NOT as the load-bearing half — a claim this
+  // comment made and a review measured false (#3333 review, P2). It changes NO verdict across 46
+  // spellings (`$NB`, `"$NB"`, `${X}`, `$1`, `"$@"`, `$SCRIPT`, `${DIR}/x.sh`, `$(pwd)/x.sh`, each as
+  // the first word, after `&&` and after `if`), because a bare `$VAR` never reaches this function at
+  // all: `extractScriptPath('"$REAPER"')` is `null`. The #1228 fail-closed residual this comment used
+  // to credit it with is held by a DIFFERENT arm, so do not look for it here.
+  //
+  // NAMED RESIDUAL (measured, pre-existing on both builds, #3333 review P2) — THREE mechanisms, and the
+  // difference between the first two decides what a future fix has to touch (the third is not a
+  // wrapper problem at all):
+  //   (a) `operandPosition` is a NAME list, so a wrapper the set does not name leaves the operand in
+  //       `sp` where it blocks only on THAT test — `. undo*.sh` (POSIX dot-source is missing while
+  //       `source` is present), `runuser -u root -- bash undo*.sh`, `chroot / bash undo*.sh`,
+  //       `flock /tmp/l bash undo*.sh`, `strace -f bash undo*.sh`, `watch -n1 bash undo*.sh`,
+  //       `systemd-run --user bash undo*.sh`, `unbuffer bash undo*.sh`. Widening the name set closes
+  //       these.
+  //   (b) `extractScriptPath` returns NULL, so there is no operand to block at all — `"$BASH" undo*.sh`,
+  //       `$BASH undo*.sh`, `"$SHELL" undo*.sh`. Widening `firstIsShellLike` does NOT touch these.
+  //   (c) AND THE SAME CLASS ONE SPELLING OVER: a BARE direct-execution glob (`undo*.sh`, `undo?.sh`,
+  //       `undo[0-9].sh`, `undo{1}.sh` as the FIRST WORD) is ALLOW on BOTH builds — `extractScriptPath`
+  //       yields null and `directish` requires `/` or `~`, so no candidate is ever formed. Not a
+  //       wrapper-naming problem at all; `./undo*.sh` IS blocked (the prefix forms a candidate).
+  // All of the above are pre-existing on both builds. Recorded, not chased: each is a fail-closed
+  // change of its own and none of them is what this arm is about (#3341).
+  const operandPosition = firstIsShellLike || unqFirst === spUnq;
+  // ⛔ THE SHAPE TEST STAYS INSIDE THE `sp &&` SHORT-CIRCUIT: `sp` is `string | null`, so hoisting it
+  // into a `const` would call `pathShaped(null)` on every segment (runtime-safe — the predicate does
+  // `String(word ?? "")` — but a narrowing hole the moment a typecheck exists).
+  if (sp && _wtPathNeedsExpansion(sp) && operandPosition &&
+    (firstIsShellLike || pathShaped(sp) || /^["']?\$/.test(sp))) {
+    // Interpreter operand (`bash ./undo*.sh`, `bash undo*.sh`, `sudo bash …`), or a bare path
     // that IS the first word (direct execution, `./undo*.sh`).
-    //
-    // ⛔ `pathShaped(sp)` HERE IS #3243 REVIEW CYCLE-1 F3. This branch had NO shape
-    // test, so when a segment's FIRST word was program TEXT it was claimed as an
-    // executed script — the very misattribution this arm exists to stop, one branch
-    // over from where it was fixed: `/^tree=/{t=$2}` (an awk program, refused in
-    // `scripts/orchestrator-harness/nonblocking-dispatch.sh`) and `~520` (a prose
-    // byte count) are both returned by `extractScriptPath` when they lead a segment,
-    // and `pathShaped` was never consulted. Not a regression (identical before this
-    // change) — an incomplete narrowing.
-    //
-    // The `$`-rooted carve-out is deliberate and load-bearing: a BARE `$VAR`
-    // operand has no path shape at all (`bash "$REAPER"`) and must STAY refused —
-    // that is the #1228 fail-closed residual pinned by B14g — while program text
-    // that happens to start a segment must not be. Every real expanded spelling is
-    // either path-shaped (`./undo*.sh`, `~/undo.sh`, `$(pwd)/x.sh` → placeholder +
-    // path) or `$`-rooted (`$NB`, `"$REAPER"`, `${DIR}/x.sh`), so nothing unreadable
-    // is lost by the test.
-    if (firstIsShellLike || unqFirst === spUnq) return sp;
+    return sp;
   }
   // EXTGROUP (`shopt -s extglob`, or `bash -O extglob -c …`) truncates the
   // operand at `(`, so `extractScriptPath` returns a PREFIX and
@@ -2786,7 +2827,11 @@ function _wtExpandedScriptTokenIn(text: string): string | null {
       // (the operand `extractScriptPath` reports can stop anywhere inside the
       // group, so an "operator immediately after the prefix" test was too
       // strict and let `bash ./undo@(-g|).sh` through — caught by B13).
-      if (unq(w).startsWith(spUnq) && /[?*+@!]\(/.test(w) && pathShaped(w) && (firstIsShellLike || !w.endsWith(")"))) return w;
+      // ⛔ AND, LIKE THE OPERAND BRANCH ABOVE, THE SHAPE TEST DOES NOT APPLY TO A WRAPPER'S OPERAND
+      // (#3333 review, P0). `bash undo@(-g|).sh` is the extglob spelling of the same bare-relative
+      // class — it has no `/` and no `~`, so `pathShaped(w)` deleted it and the command ran unread.
+      // The grammar is consulted only for the ambiguous direct-execution position.
+      if (unq(w).startsWith(spUnq) && /[?*+@!]\(/.test(w) && (firstIsShellLike || pathShaped(w)) && (firstIsShellLike || !w.endsWith(")"))) return w;
     }
   }
   if (!assignmentFirst && directish(first) && _wtPathNeedsExpansion(first)) return first;

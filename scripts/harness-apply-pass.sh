@@ -1329,7 +1329,9 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
         # `SYMLINK` IS printed (`check-farm-drift.sh:485`, "SYMLINK (graded via its target)") but that
         # row is INFORMATIONAL — a healthy link — so matching the bare token would name a good file as
         # drift the moment the anchor is relaxed (#10114 review round 2).
-        FARM_NAMED="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/ {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$1); print $1}' | head -6 | paste -sd, -)"
+        # (A `FARM_NAMED` short list was computed here and never read — the row extraction below owns
+        # the predicate, so it was dead code plus a redundant `awk|head|paste` subprocess on the red
+        # path. Removed in batch-ai2 review cycle 2, F7.)
         case "$FARM_RC" in
             0)
                 log_line "farm: ok — $FARM_DEST matches $REF" ;;
@@ -1353,7 +1355,8 @@ if [ "$FARM_CHECK_ON" = "1" ]; then
                 # ⛔ MATCH THE FINAL COLUMN, NOT THE WHOLE LINE. The instrument prints four unconditional
                 # CLASS-PROSE lines ("A STALE file is a copy launchd/systemd will EXECUTE…"), so a
                 # whole-line grep counts prose as file rows — 3 real rows measured as "7 row(s)"
-                # (#10114 review round 8). `FARM_NAMED` above uses the same predicate; reuse it.
+                # (#10114 review round 8). The predicate below is the ONLY row extraction — there is no
+                # second copy to keep in step.
                 FARM_ROWS="$(printf '%s\n' "$FARM_OUT" | awk -F'|' '$NF ~ /(^|[[:space:]])(STALE|UNSOURCED|NOT-EXECUTABLE|DECLARED-BUT-ABSENT)[[:space:]]*$/')"
                 FARM_NROWS="$(printf '%s' "$FARM_ROWS" | grep -c .)"
                 # ⛔ THE REMEDY IS A BLOCK, NOT A LINE. Two of the instrument's three remedies are TWO
