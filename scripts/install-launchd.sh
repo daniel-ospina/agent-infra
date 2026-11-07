@@ -671,12 +671,14 @@ plist_program_args() {
         fi
         # rc=3/4 (unparseable / no usable key) → try the other guaranteed reader before giving up.
     fi
-    # ⛔ THE FALLBACK CANNOT KNOW MOST ROLES, so it emits `unknown` and says so: without python3 there
-    # is no `env` hop. `unknown` still carries the TCC verdict (a unit launchd cannot read must never
-    # be armed) but NOT the file-type verdict — a directory-valued `--repo` is legitimate, and calling
-    # it an "unreadable executed target" aborted the whole install on a PlistBuddy-only host, which is
-    # the #3413 P1-A failure all over again. The cost of `unknown` is a false SKIP there (a unit that
-    # might have installed is skipped loudly).
+    # ⛔ THE FALLBACK CANNOT KNOW MOST ROLES, so for the residue it emits `unknown` and says so: there
+    # is no `env` hop. On the TCC axis `unknown` is treated as EXECUTED (a unit launchd cannot read
+    # must never be armed); on the file-type axis it is held to the SAME regular-file rule the python
+    # reader applies to `exec`. Both arms are conservative in the SKIP/FAIL direction. There is NO
+    # directory exemption: an earlier version had one, written when this reader could not name
+    # `--repo`/`--root` and a directory-valued `--repo` aborted the whole install on a PlistBuddy-only
+    # host (the #3413 P1-A failure). Those values are `data` now and never reach the escape, so it
+    # protected nothing and only ARMED a directory at an executed position (review of #3413, round 5 P2).
     # ⛔ THE THREE ROLES IT **CAN** DERIVE, AND MUST — every one of them is a POSITIONAL FACT, not
     # python knowledge, so there is no reason for the two readers to disagree:
     #   1. `launcher` — `Program` when that key exists (`Print :Program`), else element 0. launchd
@@ -695,7 +697,11 @@ plist_program_args() {
     # working units on the fallback path is the same fail-open/fail-wrong family as `[ -e ]`.
     # WHAT IS STILL `unknown`: an absolute element that is neither the launcher nor a data-option's
     # value (an interpreter's script argument, an `env` program, a second positional). Those keep the
-    # TCC verdict and the directory escape — conservative in the SKIP direction, never in the arm one.
+    # TCC verdict AND the file-type one — a DIRECTORY there fails the install exactly as the python
+    # reader's `exec` arm does, because a directory at an executed position is not a data value in any
+    # reading and `bash <dir>` exits 126 EISDIR on every tick. (An EARLIER version excused it "in the
+    # skip direction"; that was only true while this reader could not name `--repo`/`--root`, and it
+    # armed the unit instead — review of #3413, round 5 P2.)
     # ⛔ THE DATA_OPTIONS TABLE IS DUPLICATED IN THE PYTHON READER ABOVE (`DATA_OPTIONS = {"--repo",
     # "--root"}`) and this awk cannot share it, so the two must be edited together. Pinned by §7c:
     # (c22b) the data role, (c22c) the launcher role, (c22d) `Program`-only legality and (c22e) the
@@ -1114,12 +1120,15 @@ verify_targets() {
                 # NON-TCC executed target: the file-type/readability guarantee applies here (existence
                 # is not readability). A TCC one was already verdicted above.
                 if ! is_tcc_protected "$arg"; then
-                    # `unknown` (no python3) + a DIRECTORY: a directory cannot be executed, so this is
-                    # a data value the fallback could not name. Failing it aborted the whole install on
-                    # a PlistBuddy-only host (the #3413 P1-A failure again). Narrowed, not widened: an
-                    # `--repo`/`--root` value is derived as `data` by the fallback now, so it no longer
-                    # relies on this escape (fresh review of #3413, P2).
-                    if [ "$kind" = "unknown" ] && [ -d "$arg" ]; then continue; fi
+                    # ⛔ NO DIRECTORY ESCAPE FOR `unknown`. One used to live here, on the argument that
+                    # a directory is "a data value the fallback could not name" — true only while the
+                    # fallback could not name `--repo`/`--root`. It can now (they are `data`, and the
+                    # `data` arm above returns before this one), so the escape no longer protects the
+                    # class it was written for and only ARMED a directory at an executed position on
+                    # the fallback path while the python reader REFUSED it — measured on this head:
+                    # py rc=1 nothing installed / fallback rc=0 `installed + loaded`, then `bash`
+                    # exits 126 EISDIR every tick. That is the armed-and-dead state this change
+                    # exists to remove (fresh review of #3413, round 5 P2).
                     if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
                         echo "    unreadable or not a regular file: $arg" >&2
                         echo "        launchd would start this unit and the interpreter would die" >&2

@@ -1325,6 +1325,44 @@ set -e
 assert_eq "$RC" "1" "§7c a DIRECTORY at an executed position fails the install (not a regular file)"
 assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why"
 
+# (c19b) THE SAME SHAPE ON THE FALLBACK READER. `unknown` used to be excused when it was a directory —
+# written when the fallback could not name `--repo`/`--root` and a directory-valued `--repo` aborted the
+# install. Once those are `data`, the escape protects nothing and only ARMS a directory at an executed
+# position that the python reader refuses: measured on the previous head, py rc=1 / fallback rc=0 with
+# `installed + loaded`, then `bash` exits 126 EISDIR every tick. RED if the escape comes back.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c the FALLBACK reader also fails the install on a DIRECTORY at an executed position"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why, exactly as the python reader does"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and the unit is not armed"
+else
+    ok "§7c …and the unit is not armed"
+fi
+
 # (c20) a `chmod 000` executed target OUTSIDE any TCC root: readable-only-inside-TCC was the last
 # surviving form of "existence is not readability".
 PROBE_NOREAD="$PROBE_HOME/.pi/agent/scripts/noread.sh"
