@@ -1067,7 +1067,11 @@ gh_probe_env() {
   # outage as a credential failure and latches the permanent marker a human must clear (#1853 review).
   # PRESENCE is `gh auth token`: an OFFLINE lookup of the stored credential (hosts.yml / the keyring),
   # so its exit status is cause-independent. ⛔ ITS STDOUT IS THE TOKEN — it is discarded below and the
-  # captured stream is STDERR ONLY (`2>&1 >/dev/null`), so no token can reach the log.
+  # captured stream is STDERR ONLY. The real idiom is `>/dev/null 2>"$GH_PROBE_ERR"` (stdout to
+  # /dev/null, stderr to the capture file); ⛔ NOT `2>&1 >/dev/null`, which this comment used to name
+  # and which would duplicate stderr onto the CURRENT stdout — the log — while capturing nothing.
+  # (Pre-existing comment defect — blame 5a378bac5d — corrected here because this PR is what made the
+  # `gh auth token` stream carry load; the CODE was always safe, only the sentence was wrong.)
   # ⛔ BOUNDED, STDIN CLOSED, AND A NON-ANSWER IS NOT AN ABSENCE (TOKEN_HANG_FIX). See the block above
   # `gh_probe_bounded`. MEASURED rc=142: an unbounded capture here is what stalled the funnel forever.
   if [ -z "$presence" ]; then
@@ -1144,7 +1148,7 @@ gh_probe_env() {
   # verdict is fixed-size, the evidence is not, and only the evidence survives whole in the record.
   # ⛔ rc=75 IS NAMED OFF THE EXIT CODE, AND THE CLAUSE CLAIMS ONLY WHAT 75 MEANS (#3701 review, P1).
   # 75 is gh-limit.py's / scripts/gh-shim/gh's EX_TEMPFAIL: "refused LOCALLY, nothing was sent". It
-  # is NOT "the account is out of quota" — `gh-limit.py:3446` states that exact inversion as a defect
+  # is NOT "the account is out of quota" — `gh-limit.py:3439` states that exact inversion as a defect
   # it fixed ("A CONTENDED VERDICT IS NOT A LIMIT … That says 'I could not ask', NOT 'the account is
   # out of quota'"), and the same code is BUSY_EXIT for single-flight contention. So the clause says
   # what is TRUE — nothing was sent, so neither the credential nor the budget was tested — and lets

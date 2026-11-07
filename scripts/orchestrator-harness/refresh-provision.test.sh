@@ -980,7 +980,7 @@ ck "(g) …and the record carries the GH LAYER'S OWN refusal line, verbatim (gh-
    "$(case "$G_WHY" in *'gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ AND IT MUST NOT CLAIM A CAUSE 75 DOES NOT ESTABLISH (#3701 review, P1). 75 is EX_TEMPFAIL —
 # "refused LOCALLY, nothing was sent" — which is ALSO single-flight BUSY and the shared-window verdict;
-# `gh-limit.py:3446` records "a contended verdict is NOT a limit" as a defect it fixed. A clause saying
+# `gh-limit.py:3439` records "a contended verdict is NOT a limit" as a defect it fixed. A clause saying
 # "quota" here would publish, in the one sentence this change exists to make true, a diagnosis the
 # evidence beside it contradicts.
 ck "(g) …and claims NO quota/budget exhaustion that rc=75 does not establish" \
@@ -1165,6 +1165,29 @@ ck "(g9) …and the RECORD carries the captured stderr, not just the log" \
    "$(case "$GBE_WHY" in *'connection reset by peer'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(g9) …and the VERDICT still leads the evidence, so the beat can never cut it" \
    "$(case "$GBE_WHY" in *'NON-ANSWER'*'evidence='*) echo 0 ;; *) echo 1 ;; esac)"
+
+# ── (g10) THE OTHER TIMEOUT ARM CARRIES ITS EVIDENCE TOO (#3701 round 5, P2) ───────────────────────┐
+# (g9) drives only the `gh api rate_limit` timeout arm — its stub answers `auth token` with exit 0 —
+# so the `gh auth token` timeout arm's interpolation was pinned by NOTHING, and deleting it left the
+# suite at 177/0. That arm is the one whose `fix:` line names a hung gpg/keyring helper as the usual
+# cause, so the dropped stderr is exactly the diagnosis an operator needs. The stub hangs on the
+# credential lookup itself and writes its stderr first.
+mk_case gh_token_bound_evidence
+cat > "$D/bin/gh" <<'SH'
+#!/bin/bash
+case "$1 $2" in
+  "auth token") printf 'gh: gpg: decryption failed: No secret key\n' >&2; sleep 5; exit 1 ;;
+  *) printf '[]\n' ;;
+esac
+SH
+chmod +x "$D/bin/gh"
+rp "$D" "" GH_PROBE_TIMEOUT=1
+GBT_WHY="$(rec why)"
+ck "(g10) a hung credential LOOKUP is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g10) …and the RECORD carries the stderr naming the hung helper" \
+   "$(case "$GBT_WHY" in *'No secret key'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g10) …and names the question it could NOT answer (presence, not validity)" \
+   "$(case "$GBT_WHY" in *'gh auth token'*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here
