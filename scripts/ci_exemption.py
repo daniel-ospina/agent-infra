@@ -831,8 +831,12 @@ def decide(
       ``RotationRuns``) rather than ``rotating=`` and this is DERIVED for you;
       passing ``rotating=`` alone means ``rotation_legacy`` defaults to False, which
       is the FAIL-OPEN value, so a caller doing that on tab-free evidence re-opens
-      the class (measured — see
-      ``test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id``).
+      the class — a DECLARED RESIDUAL of the explicit-flag surface, measured
+      (``rotating=detect_rotating_identity(<tab-free runs>)`` with no ``rotation=``
+      EXEMPTS the spacey id) and deliberately NOT pinned: the composition leg pins
+      the SAFE path (``rotation=``), and a test that asserted this fail-open would
+      have to be inverted the day someone closes it. Treat ``rotating=``-without-
+      ``rotation=`` as unsupported on tab-free evidence.
     * id ABSENT from main's failure set -> **BLOCK** (nothing shows it pre-exists).
       The baseline is FAILURE-ONLY, so a test main runs and passes leaves no row, which
       makes this neither "known new" nor "unmeasured" — the reason must claim NEITHER.
@@ -935,7 +939,10 @@ def decide(
         # containing a space — the space split shreds it, so the real id is in no
         # run set and the test five lines below is structurally blind to it. That
         # is a limit of the WIRE FORM, not of the id, and before #3686 it did not
-        # matter (both doors rejected such an id). Now that the id is
+        # matter — NOT because "both doors rejected such an id" (they did not: the PR
+        # door admitted it and MAIN's rate door dropped the row, which is #3686
+        # itself) but because that ASYMMETRY meant `mr is None`, so the id came out
+        # BLOCKED. Now that the id is
         # representable on the rate side, falling through to the rate comparison
         # would EXEMPT an identity that may have MOVED — the fail-open direction.
         # UNATTRIBUTABLE is the only correct verdict for evidence that cannot see
@@ -2863,8 +2870,10 @@ class RotationRuns(list):
     real id sits in NO run set and :func:`detect_rotating_identity` can never
     report it.
 
-    Before #3686 that was harmless, because both doors REJECTED such an id, so it
-    could not be exempted either way. After it, the id is representable on the
+    Before #3686 that was harmless, because such an id could not be exempted either
+    way: the PR-side door ADMITTED it and MAIN's rate door DROPPED its row (which is
+    #3686 itself), so `mr is None` and the verdict was BLOCK — fail-CLOSED through an
+    asymmetry, not through agreement. After it, the id is representable on the
     RATE side — so a shredded rotation line turns a previously fail-CLOSED
     refusal (BLOCK, absent from main's set) into a silent EXEMPT for an identity
     that provably MOVED, which is the one class the rail states may never merge.
@@ -2916,7 +2925,9 @@ def parse_rotation_runs(text: str) -> RotationRuns:
     ⛔ BUT THE FALLBACK DOES **NOT** KEEP OLD INPUT MEANING WHAT IT ALWAYS MEANT
     (review cycle 6, P1 — that sentence stood here and was false). It keeps the
     PARSE the same and flips the VERDICT: for a space-carrying id the old world
-    BLOCKED it (both doors rejected the shape), while this world — where the id
+    BLOCKED it — through the #3686 ASYMMETRY (the PR door admitted it, MAIN's rate
+    door dropped its row, so `mr is None`), not through both doors agreeing — while
+    this world — where the id
     is representable on the rate side — would EXEMPT it, because the shredded
     identity is invisible to E5. So the counts ride back with the sets (see
     :class:`RotationRuns`) and ``decide`` refuses to exempt a

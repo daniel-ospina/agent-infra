@@ -1172,7 +1172,9 @@ def test_a_LEGACY_TAB_FREE_rotation_line_cannot_license_a_spacey_EXEMPT():
 
     Keeping the tab-free parse was justified as "old input keeps meaning what it
     always meant". It does not: the PARSE is the same, the VERDICT is not. Before
-    #3686 a spacey id was BLOCKED (both doors rejected the shape); after it the id
+    #3686 a spacey id was BLOCKED — through the #3686 ASYMMETRY (the PR door
+    admitted it, MAIN's rate door dropped its row, so it had no rate and `decide`
+    refused it), NOT through both doors agreeing — after it the id
     is representable on the rate side, so a tab-free per-run line — which shreds
     the id and leaves E5 structurally blind to it — would EXEMPT an identity that
     may have MOVED, the one class the rail may never merge.
@@ -1267,8 +1269,11 @@ def test_an_EMPTY_rotating_map_cannot_SUPPRESS_the_E5_map_derived_from_rotation(
     non-empty map is UNIONED with the derived one (review cycle 10), so an incomplete or
     unrelated map can only ADD ids to the E5 signal — never subtract evidence.
 
-    MUTATION: `if not rotating:` → `if rotating is None:` → this id is EXEMPTED and the
-    first assertion reddens.
+    MUTATION: trust the caller's map whenever it is not None (i.e. `if rotating is
+    not None: rotating = rotating`) → a falsy map stops being re-derived, this id is
+    EXEMPTED and the first assertion reddens. ⛔ The OLD note here named `if not
+    rotating:` → `if rotating is None:`; cycle 10 replaced that branch with a per-class
+    UNION, so the note had gone stale (the named edit no longer reddened this test).
     """
     moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
     moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
@@ -1365,8 +1370,10 @@ def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format(tmp_path)
     was outside both the assertion and the execution, and the pin stayed green:
     `| sed 's/\t40$//'` deletes the runs column (every rate row then fails to parse,
     a permanent BLOCK for every PR), and `| sed 's/\t$//'` makes a single spacey id
-    emit a TAB-FREE per-run line (the reader takes its legacy fallback, the id
-    shreds, and E5 EXEMPTS a rotating identity), each with a zero-red suite. An
+    emit a TAB-FREE per-run line — which TODAY means the reader counts it as the
+    legacy form (`RotationRuns.has_legacy_lines`), so EVERY spacey id comes out
+    UNATTRIBUTABLE and #3686's deadlock returns (⛔ it is NOT an exemption any more:
+    that was the pre-cycle-6 consequence, and cycle 6 closed it). An
     enforcer that cannot see the edit it advertises is inert, so both statements
     are now bound END TO END and RUN with their own redirection/stream.
     """
