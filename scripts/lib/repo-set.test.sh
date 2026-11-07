@@ -123,6 +123,18 @@ ck "b4 path reports the file a box would read, existing or not" \
    '[ "$(REPO_SET_FILE=$nofile bash "$READER" path)" = "$nofile" ]'
 ck "b5 the default path is \$HOME/.config/orchestrator/repos.conf (beside the config an operator knows)" \
    '[ "$(HOME=$T bash -c "unset REPO_SET_FILE; bash \"$READER\" path")" = "$T/.config/orchestrator/repos.conf" ]'
+# Round 33, P2: the round-32 `$HOME` fix shipped with NO arm — this file's own convention is that a fix
+# without one is a regression channel. The point is that the three codes stay DISTINCT: 5 = the path
+# cannot be resolved (BROKEN), 3 = resolved but nothing is named (ABSENT). Collapsing 5 into 3 is what
+# silently un-served a multi-repo box, because 3 is the code the wrapper DEGRADES on.
+ck "b6 an UNSET \$HOME still resolves a path (rc 0) instead of dying on an unbound variable" \
+   '[ -n "$(env -u HOME bash "$READER" path 2>/dev/null)" ] && env -u HOME bash "$READER" path >/dev/null 2>&1'
+ck "b7 an UNSET \$HOME with no REPO_SET_FILE is BROKEN (5), never ABSENT (3) — 3 is what the wrapper degrades on" \
+   '[ "$(env -u HOME -u REPO_SET_FILE bash "$READER" check >/dev/null 2>&1; echo $?)" = 5 ]'
+ck "b8 …and it says so by name, rather than claiming the machine names no repo" \
+   'env -u HOME -u REPO_SET_FILE bash "$READER" check 2>&1 | grep -q "HOME is unset or empty"'
+ck "b9 …while \$HOME set and no file is still ABSENT (3) — the real first-install case is unchanged" \
+   '[ "$(HOME=$T bash -c "unset REPO_SET_FILE; bash \"$READER\" check >/dev/null 2>&1; echo \$?")" = 3 ]'
 
 # ── (c) a set that exists and is broken — one NAMED refusal per line ──────────────────────────
 # Each arm is a separate fixture with exactly ONE fault, so a passing arm cannot be satisfied by a

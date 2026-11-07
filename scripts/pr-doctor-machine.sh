@@ -316,7 +316,12 @@ case "$_rc" in
     ;;
   *)
     repo_set_parse 1>&2
-    _say "REFUSING — $(repo_set_file) exists and is not a usable repo set (see the report above)."
+    # ⛔ DO NOT ASSERT THE FILE EXISTS HERE (round 33, P2). This arm handles every non-0/3 parse code,
+    # and one of them — the `HOME`-unset refusal added this round — is exactly a state where NOTHING
+    # exists: the reader says "the set path cannot be resolved" and this line used to answer "…exists
+    # and is not a usable repo set", so the summary contradicted the report directly above it. Say what
+    # the reader proved (a set that is not usable), not what it did not.
+    _say "REFUSING — no usable repo set at $(repo_set_file) (see the report above)."
     _say "  Nothing was graded and nothing was dispatched: a shorter set would read exactly like a"
     _say "  smaller machine."
     exit 2
