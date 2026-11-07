@@ -352,6 +352,17 @@ ck "f10 the wrapper takes NO arguments (a plist flags nobody reads is the NOT_A_
    'REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" --dry-run >/dev/null 2>&1; [ $? = 2 ]'
 ck "f11 a missing sibling reader is a NAMED farm gap, not a silent one-repo box" \
    'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; grep -q "lib_srcs.*declares it" <<<"$o"'   # bash-ok
+# ⛔ SOURCED IS NOT LOADED (round 35, P2): the round-34 fix shipped with NO arm, and a mutated copy that
+# deleted the guard left the suite at 167/0. An EXISTING but unsourceable reader — a truncated or
+# mode-000 farm copy, the drift class `check-farm-drift.sh` exists for — used to reach the `*)` arm and
+# print `no usable repo set at` with an EMPTY path plus `command not found` lines.
+# ⛔ AND THE GUARD MUST PROBE EVERY FUNCTION THE ARMS CALL, not one: probing only `repo_set_parse` let a
+# copy truncated between `repo_set_check` and `repo_set_doctor_repos` through, and the refusal then named
+# the SET ("is not a usable repo set") instead of the reader. Both shapes are pinned here.
+ck "f11b an UNSOURCEABLE sibling reader (truncated) is refused BY NAME, with no 'command not found' noise" \
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "could not be SOURCED" <<<"$o" && ! grep -q "command not found" <<<"$o" && ! grep -q "is not a usable repo set" <<<"$o"'
+ck "f11c …and a mode-000 reader is refused the same way (unreadable, not unparsable)" \
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; cp "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; chmod 000 "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; chmod 644 "$W/lib/repo-set.sh"; mv -f "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "could not be SOURCED" <<<"$o" && ! grep -q "command not found" <<<"$o"'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in

@@ -132,7 +132,10 @@ fi
 # the `*)` arm printed `no usable repo set at` followed by an EMPTY path plus two `command not found`
 # lines — the round-33 defect one layer down: a summary naming a file it could not name. Refuse by name
 # here, where the fact is known.
-if ! command -v repo_set_parse >/dev/null 2>&1; then
+if ! command -v repo_set_parse >/dev/null 2>&1 \
+   || ! command -v repo_set_check >/dev/null 2>&1 \
+   || ! command -v repo_set_file >/dev/null 2>&1 \
+   || ! command -v repo_set_doctor_repos >/dev/null 2>&1; then
   _say "REFUSING — $READER exists but could not be SOURCED (unreadable, truncated, or not shell); nothing ran."
   _say "  Repair the farm: re-run pi-bootstrap/setup.sh — its \`lib_srcs\` declares repo-set.sh."
   exit 2
