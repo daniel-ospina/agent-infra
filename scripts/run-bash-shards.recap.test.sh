@@ -25,24 +25,29 @@
 # ARM 2 — HAPPY PATH. A COMPLETE run prints the recap WITHOUT the marker. Without this arm the trap
 #   could fire on every run and arm 1 would still pass, making the marker noise.
 # ARM 3 — THE OUTER JOB'S SLICE MUST NOT REACH THE FIXTURE (#3452). BOTH lanes' jobs now export
-#   `BASH_SHARD_SLICE=<i>/<n>` for the WHOLE step — `ci.yml`'s `bash-suites` always did, and as of
-#   #2483 `ci-main.yml`'s `script-validate` is the SAME 8-way slice — so every shard either lane runs
-#   inherits it, and this suite's subject is the runner's WHOLE-LIST recap over a THREE-shard fixture
-#   list. Inherited, a slice of 8 over 3 entries has nothing to run and the runner refuses (rc 2), so
-#   this shard reddens in BOTH lanes — on every PR and on `main` — a red no diff can cause. (It used
-#   to be a PR-lane-only red because `main` was unsharded; that asymmetry is GONE, and with it the
-#   reason this hazard could be mistaken for a PR-introduced one.) The suite therefore runs its
-#   fixtures unsliced (stated, never silent), and this arm is the MUTATION control pinning the HAZARD
-#   and the runner's refusal contract: the same fixture WITH the slice must still refuse with the
-#   runner's own message, so a changed refusal wording, a changed rc, or a weakened runner reds it.
+#   `BASH_SHARD_SLICE=<i>/<n>` for the WHOLE step — `ci.yml`'s `bash-suites` always did, and since
+#   #3174 (landed as PR #3235) `ci-main.yml`'s `script-validate` is the SAME 8-way slice — and this
+#   suite's subject is the runner's WHOLE-LIST recap over a THREE-shard fixture list, where a slice of
+#   8 over 3 entries has nothing to run and the runner refuses (rc 2).
+#   ⛔ BUT THAT SLICE NO LONGER REACHES A SHARD AT ALL, so this is NOT a CI-lane red in either lane
+#   today: `shard_exec` — the `env -u` wrapper in `scripts/run-bash-shards.sh`, agent-infra#3415 —
+#   strips the runner's whole env contract before every shard it starts, and the paragraph below at
+#   the `unset` records the same fact from the other side. What stays exposed is a DIRECT invocation
+#   of this file
+#   (a repro shell that exports the slice and runs the suite rather than the runner) and a tree where
+#   that strip is removed — which is why the `unset` is defence in depth and not the only defence.
+#   This arm is the MUTATION control pinning the HAZARD and the runner's refusal contract: the same
+#   fixture WITH the slice must still refuse with the runner's own message, so a changed refusal
+#   wording, a changed rc, or a weakened runner reds it.
 #   The drop above clears the runner's WHOLE env contract (`BASH_SHARD_SLICE`,
-#   `BASH_SHARDS_BUDGET_SECS`, `SHARD_BOUND`) because the SAME leak would otherwise arrive from both
-#   lanes — see the block at the `unset`.
+#   `BASH_SHARDS_BUDGET_SECS`, `SHARD_BOUND`) because either lane's step-level value would otherwise
+#   arrive by a direct invocation — see the block at the `unset`.
 #   ⛔ WHAT THIS ARM DOES NOT PIN, stated so nobody reads it as more than it is: it sets its own
 #   slice, so it is independent of the `unset` above and CANNOT see the mitigation disappear. That
-#   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while the
-#   SLICED run (the CI shape) reds 9 arms. So the discrimination is the sliced lane's, and a box
-#   that only ever runs unsliced cannot see it. Pinning the `unset` itself needs a hermetic-probe
+#   is measured, not assumed — delete the `unset` and an UNSLICED run is still green, while a run
+#   that DOES carry a slice reds 9 arms. So the discrimination belongs to a sliced invocation —
+#   which is what a DIRECT invocation can be, NOT what CI hands a shard — and a box that only
+#   ever runs unsliced cannot see it. Pinning the `unset` itself needs a hermetic-probe
 #   mutant — the pattern `tests/run-bash-shards-bound/run.sh` §0 already uses (it strips its own
 #   `unset` into a copy and requires the probe to then see the leaked value). That is not built
 #   here because it needs a probe mode this suite does not have, and a self-copying mutant without
@@ -83,20 +88,22 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # ⛔ AND IT IS NOT THE ONLY NAME THAT LEAKS — this line clears the runner's WHOLE env contract,
 # not just the one that reddened first (review of this change, cycle 2, P1). ⛔ THE TWO-LANE PICTURE
 # IS NOT WHAT IT WAS: `ci.yml`'s `bash-suites` and `ci-main.yml`'s `script-validate` both export the
-# SAME knob now — `BASH_SHARD_SLICE`, per shard, inherited unchanged by every shard the job starts
-# (`shard_run_bounded` hands a shard its environment unmodified) — so ONE of the three is a knob a
-# lane really exports today, and it is the one whose leak is real on BOTH lanes. The other two are
-# cleared so the suite is hermetic to the CONTRACT, not to today's single exported name:
+# SAME knob now — `BASH_SHARD_SLICE`, at step level — so exactly ONE of the three is a knob a lane
+# really exports today. It is also the one the RUNNER strips before every shard (`shard_exec` — the
+# `env -u` wrapper in `scripts/run-bash-shards.sh`, agent-infra#3415), so the leak this defends
+# against is NOT CI's own shards: it is a DIRECT invocation of this file, and any tree where that
+# strip is removed. The other two are cleared so the suite is hermetic to the CONTRACT, not to
+# today's single exported name:
 #   * `BASH_SHARDS_BUDGET_SECS` is HISTORY, carried so the unset cannot read as a stale flag: main's
 #     lane USED to export it (`BASH_SHARDS_BUDGET_SECS: '7800'` in `script-validate`'s bash-shards
-#     step env). It no longer does (#2483), because the runner now REFUSES the BUDGET+SLICE pairing
-#     outright (`scripts/run-bash-shards.sh`, `rc 2`) and main became the 8-way slice, so the budget
-#     had to go. It still matters here for the same reason the slice does: the runner refuses the
-#     pair BY NAME, so an inherited budget makes a sliced ARM 3 meet THAT refusal instead of the
-#     slice one it pins. On the pre-fix head (`9b7ed763`, no `env -u` on the child) that reddened
-#     ARM 3: `PASS 12 · FAIL 1` with only `BASH_SHARDS_BUDGET_SECS=7800` inherited. Recorded rather
-#     than dropped — an unset whose stated pollution source no longer exists reads as a stale flag,
-#     and the next reader would delete it.
+#     step env). It no longer does (#3174, landed as PR #3235), because the runner now REFUSES the
+#     BUDGET+SLICE pairing outright (`scripts/run-bash-shards.sh`, `rc 2`) and main became the 8-way
+#     slice, so the budget had to go. It still matters here for the same reason the slice does: the
+#     runner refuses the pair BY NAME, so an inherited budget makes a sliced ARM 3 meet THAT refusal
+#     instead of the slice one it pins. On the pre-fix head (`9b7ed763`, no `env -u` on the child)
+#     that reddened ARM 3: `PASS 12 · FAIL 1` with only `BASH_SHARDS_BUDGET_SECS=7800` inherited.
+#     Recorded rather than dropped — an unset whose stated pollution source no longer exists reads as
+#     a stale flag, and the next reader would delete it.
 #   * a SET-but-EMPTY budget is REFUSED by the runner as a missing value, not read as "no deadline".
 #     Hence the test below is PRESENCE (`+set`), never non-emptiness — but for the NOTICE's sake,
 #     not the runner's: the `unset` is unconditional, so the value is dropped under either spelling
@@ -110,8 +117,10 @@ bad() { FAIL=$((FAIL + 1)); printf '  ❌ %s\n' "$1"; }
 # `unset`, and the `env -u` on that child. The `env -u` is what makes the arm answer ONE variable;
 # it is not the only thing standing between the budget and the arm, and this comment must not be
 # read as claiming it is. `tests/run-bash-shards-bound/run.sh` §0 clears the identical set;
-# `tests/ci-lane-parity/run.sh` uses this same `env -u` spelling per invocation (e.g. `:998`,
-# `:1661`) — two different files, cited separately on purpose.
+# `tests/ci-lane-parity/run.sh` uses this same `env -u BASH_SHARD_SLICE -u BASH_SHARDS_BUDGET_SECS`
+# spelling per invocation — two different files, cited separately on purpose. (Formerly cited by two
+# line numbers; one of them had already rotted onto an `else`, which is the failure mode the guard
+# below names, so both are gone.)
 if [ "${BASH_SHARD_SLICE+set}" = set ] || [ "${BASH_SHARDS_BUDGET_SECS+set}" = set ] || [ "${SHARD_BOUND+set}" = set ]; then
   echo "  · inherited runner config dropped for the fixtures — BASH_SHARD_SLICE='${BASH_SHARD_SLICE-<unset>}' BASH_SHARDS_BUDGET_SECS='${BASH_SHARDS_BUDGET_SECS-<unset>}' SHARD_BOUND='${SHARD_BOUND-<unset>}'. They are the OUTER job's, over the REAL list; the fixture's 3-shard list is not that list, so the fixtures run with none of them set (#3452; ARM 3 pins the HAZARD and the runner's refusal, NOT this drop — see the header). A bare dash (not colon-dash) is used in this echo for the same reason the test above is +set: a SET-but-EMPTY value must print as '' and an ABSENT one as <unset>, or the two are indistinguishable in the log this notice exists for."
 fi
@@ -187,7 +196,7 @@ rm -f "$SLOW_SHARD_MARKER"
 # shard returned — an hour later on the real job. GitHub terminates the process GROUP on a timeout.
 # ⛔ THE FIXTURE MUST NOT INHERIT THE CALLER'S DISPATCH DECISION — and this `env -u` is the half of
 # that contract which sits at the SPAWN SITE. `run-bash-shards.sh` scrubs the identical three names at
-# its own `shard_exec` (:926), but that guard protects a shard the RUNNER spawns; it cannot reach the
+# its own `shard_exec`, but that guard protects a shard the RUNNER spawns; it cannot reach the
 # runner when a TEST spawns it, and this suite spawns `runner-narrow.sh` DIRECTLY. The narrowed list is
 # THREE shards, so a child handed the outer job's slice REFUSES — `❌ BASH_SHARD_SLICE asks for 8
 # slice(s) of 3 listed shard(s)` (run-bash-shards.sh:432, rc 2) — and every arm below would then read a
@@ -197,9 +206,12 @@ rm -f "$SLOW_SHARD_MARKER"
 #
 # ⛔ WHAT THIS GUARD IS **NOT**, stated so the comment is not over-read: it is NOT claiming that CI's
 # `bash-suites` lane leaks today — it does not, and it is covered twice over. `bash-suites` exports
-# `BASH_SHARD_SLICE=<i>/<n>` for the whole step (`.github/workflows/ci.yml:1384`), but every SHARD is
-# already scrubbed by `shard_exec` before this file runs, and the script-wide `unset` in the notice
-# block above (#3452) drops it again for everything below. Both halves are MUTUALLY SUFFICIENT —
+# `BASH_SHARD_SLICE=<i>/<n>` for the whole step, as
+#   `BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}`
+# in its shard step — cited by QUOTE and not by line number, which is ci-main.yml's own rule for its
+# citations: "a citation that rots is worse than none". But every SHARD is already scrubbed by
+# `shard_exec` before this file runs, and the script-wide `unset` in the notice block above (#3452)
+# drops it again for everything below. Both halves are MUTUALLY SUFFICIENT —
 # measured on the merged tree with `BASH_SHARD_SLICE=5/8`, the value a real `bash-suites (<n>)` job
 # hands its shards:
 #   · `unset` KEPT,   `env -u` REMOVED  ->  PASS 13 · FAIL 0   (#3452 alone covers the CI lane)

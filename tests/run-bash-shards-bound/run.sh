@@ -75,24 +75,27 @@ FIXTURE_LIVE_ROOTS=; export FIXTURE_LIVE_ROOTS
 # The fixtures below run the REAL runner, so every variable that runner reads is inherited input. Its
 # env contract is exactly three variables (scripts/run-bash-shards.sh): BASH_SHARD_SLICE, SHARD_BOUND,
 # BASH_SHARDS_BUDGET_SECS — so ALL THREE are cleared here. ⛔ THE REASON, RESTATED FOR WHAT CI EXPORTS
-# TODAY (agent-infra#2483): the workflows export exactly ONE of the three, `BASH_SHARD_SLICE`, in BOTH
-# lanes (ci-main.yml's `script-validate` is an 8-way slice now; ci.yml's `bash-suites` always was), and a
-# CALLER may export `SHARD_BOUND` — while two arms below need particular ones ABSENT (the third
-#     bullet records the history of the one CI no longer exports at all):
+# TODAY (agent-infra#3174, landed as PR #3235): the workflows export exactly ONE of the three,
+# `BASH_SHARD_SLICE`, in BOTH lanes (ci-main.yml's `script-validate` is an 8-way slice now; ci.yml's
+# `bash-suites` always was), and a CALLER may export `SHARD_BOUND` — while two arms below need
+# particular ones ABSENT (the third bullet records the history of the one CI no longer exports at all):
 #   * `SHARD_BOUND` must be absent for the default-bound arm (§3), which asserts the DEFAULT is used;
 #   * `BASH_SHARD_SLICE` is set by the slice arm itself, per call site (`1/1`), so an inherited value
 #     would silently override it.
 #   * HISTORY, carried so the unset cannot read as a stale flag: `script-validate` USED TO export
 #     BASH_SHARDS_BUDGET_SECS=7800 in its bash-shards
-#     STEP env. It no longer does (agent-infra#2483): main is an 8-way slice now, and the runner REFUSES
-#     the BUDGET+SLICE pairing outright (`scripts/run-bash-shards.sh`, `exit 2`), so the budget had to
-#     go. That does NOT relax this arm: the slice arm below still sets BASH_SHARD_SLICE=1/1 itself, and
-#     BOTH lanes now export BASH_SHARD_SLICE, so clearing it is load-bearing on both. Recorded rather
-#     than dropped — an unset whose stated pollution source no longer exists reads as a stale flag, and
-#     the next reader would delete it.
-#   * `ci.yml`'s `bash-suites` matrix exports BASH_SHARD_SLICE=<i>/<n> per shard and `shard_run_bounded`
-#     hands the shard its env unmodified, so an inherited slice makes every fixture run 1/n of its
-#     staged shards.
+#     STEP env. It no longer does (agent-infra#3174, landed as PR #3235): main is an 8-way slice now,
+#     and the runner REFUSES the BUDGET+SLICE pairing outright (`scripts/run-bash-shards.sh`, `exit 2`),
+#     so the budget had to go. That does NOT relax this arm: the slice arm below still sets
+#     BASH_SHARD_SLICE=1/1 itself, so clearing it is load-bearing for any DIRECT invocation of this
+#     file. Recorded rather than dropped — an unset whose stated pollution source no longer exists
+#     reads as a stale flag, and the next reader would delete it.
+#   * `ci.yml`'s `bash-suites` and `ci-main.yml`'s `script-validate` BOTH export
+#     BASH_SHARD_SLICE=<i>/<n> per step, and the runner now STRIPS that contract before every shard it
+#     starts — `shard_exec`, the `env -u` wrapper in `scripts/run-bash-shards.sh` (agent-infra#3415) —
+#     so CI's own shards are scrubbed twice and this suite does NOT inherit the slice in CI today.
+#     What stays exposed is a DIRECT invocation of this file that exports the slice, where an
+#     inherited value would make every fixture run 1/n of its staged shards.
 #   * `SHARD_BOUND` is the variable this suite EXISTS to test, so it is the one a reader reproducing a
 #     bound bug is most likely to have exported — and §3's default-bound arm deliberately runs the
 #     runner with it ABSENT to pin the 1800 s default. Every other call site names its own bound, so
@@ -171,10 +174,14 @@ stage_fixture() {
 # suite reddened `1 of 52` on EVERY run for four runs — read as flake, repaired by nobody — while a
 # laptop stayed 52/52. The failure was never in CI's environment; it was that this suite's verdict
 # DEPENDED on it.
-# ⛔ WHAT IT INHERITED HAS SINCE CHANGED SHAPE (agent-infra#2483), so this rationale is restated rather
-# than left to rot: `script-validate` was the only BUDGET lane (BASH_SHARDS_BUDGET_SECS=7800) and is now
-# a SLICED lane like `bash-suites`, because the runner refuses the BUDGET+SLICE pairing outright (`exit
-# 2`). So BOTH lanes now export BASH_SHARD_SLICE=<i>/<n>, and the unset below is load-bearing on both.
+# ⛔ WHAT IT INHERITED HAS SINCE CHANGED SHAPE (agent-infra#3174, landed as PR #3235), so this
+# rationale is restated rather than left to rot: `script-validate` was the only BUDGET lane
+# (BASH_SHARDS_BUDGET_SECS=7800) and is now a SLICED lane like `bash-suites`, because the runner refuses
+# the BUDGET+SLICE pairing outright (`exit 2`). So BOTH lanes now export BASH_SHARD_SLICE=<i>/<n>, and
+# the unset below is load-bearing for any DIRECT invocation of this suite. (In CI itself neither lane's
+# value reaches a fixture twice over: the runner strips its whole env contract in `shard_exec` — the
+# `env -u` wrapper in `scripts/run-bash-shards.sh`, agent-infra#3415 — before every shard, and this
+# suite's own `unset` drops it again — defence in depth, measured in the guard at the top.)
 # The arm itself is unchanged — only the pollution source it names.
 # (A third variable, SHARD_BOUND, is the same class and was measured after review: an inherited bound
 # reddens §3's default-bound arm. All three of the runner's env contract are cleared above and probed
@@ -243,10 +250,11 @@ probe_shard() { # <root> — add a shard that reports the runner env it was hand
 }
 if stage_fixture "$ENVFIX" 0; then
   probe_shard "$ENVFIX"
-  # A whole-list slice (`1/1`) is a REAL slice this runner accepts, and it is the harshest input: the
-  # value reaches every shard unchanged today, so the probe reports it verbatim when the handover is
-  # restored. `SHARD_BOUND=0` rides along because it is the third member of the same env contract and
-  # `0` is legitimate runner config, so a set-but-meaningful value is what a shard would have inherited.
+  # A whole-list slice (`1/1`) is a REAL slice this runner accepts, and it is the harshest input: with
+  # the plain `bash "$1"` handover it reached every shard unchanged, so the probe reports it verbatim
+  # when that handover is restored (the mutant at the end of this arm does exactly that).
+  # `SHARD_BOUND=0` rides along because it is the third member of the same env contract and `0` is
+  # legitimate runner config, so a set-but-meaningful value is what a shard would have inherited.
   # ⛔ AND `BASH_SHARDS_BUDGET_SECS=0` IS SET FOR THE SAME REASON (review of this arm, P3): with it
   # merely `unset` in the parent, the probe reports `<unset>` whether or not `shard_exec` clears it, so
   # the budget clause was pinned by nothing — measured: dropping `-u BASH_SHARDS_BUDGET_SECS` from
