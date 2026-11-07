@@ -391,7 +391,6 @@ await test("TRANSPORT IS ATOMIC: a repo `url` drops the base's command/args/env/
     { mcpServers: { t: { command: "/usr/bin/python3", args: ["-m", "x"], env: { SECRET: "s" }, cwd: "/tmp" } } } as never,
     { mcpServers: { t: { url: "https://self.example/mcp" } } } as never,
   );
-  const t = merged.tortoise as Record<string, unknown> | undefined;
   const entry = merged.t as Record<string, unknown> | undefined;
   equal(entry?.url, "https://self.example/mcp");
   for (const field of ["command", "args", "env", "cwd"]) {
@@ -399,12 +398,63 @@ await test("TRANSPORT IS ATOMIC: a repo `url` drops the base's command/args/env/
   }
 });
 
-await test("an entry declaring BOTH transports is REFUSED, not guessed at", () => {
+await test("an entry declaring BOTH transports keeps the BASE entry — an ambiguous delta is not a removal", () => {
+  // Dropping the merged entry removed the hub's memory graph from that repo, while the warning said
+  // the entry was "ignored" and the documented invariant says a repo cannot REMOVE a base server.
   const merged = mergeMcpLayers(
-    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/" } } } as never,
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
     { mcpServers: { t: { url: "https://self.example/mcp", command: "/bin/sh" } } } as never,
   );
-  ok(!("t" in merged), "an ambiguous entry is dropped rather than silently resolved to `url`");
+  const t = merged.t as Record<string, unknown> | undefined;
+  ok(t, "the base server must SURVIVE an ambiguous repo entry");
+  equal(t?.url, "https://api.premiselabs.co/mcp/", "and it is the BASE entry, untouched");
+  equal(t?.command, undefined, "the ambiguous delta is not applied");
+});
+
+await test("a `type` that contradicts the declared transport keeps the BASE entry", () => {
+  // `type` is the schema's transport selector, and connectServer dispatches on url/command — so
+  // `{"type":"http","command":…}` would silently run over stdio.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", lazy: true } } } as never,
+    { mcpServers: { t: { type: "http", command: "/bin/sh" } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.url, "https://api.premiselabs.co/mcp/", "the base entry stands");
+  equal(t?.command, undefined, "the contradictory delta is not applied");
+});
+
+await test("a NORMALISED restatement of the same url still inherits the base's credentials", () => {
+  // Raw string equality stripped the credentials for a host-case or trailing-space difference, with
+  // nothing logged — a bare 401 with no diagnostic.
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" } } } } as never,
+    { mcpServers: { t: { url: "https://API.PREMISELABS.CO/mcp/" } } } as never,
+  );
+  const t = merged.t as Record<string, unknown> | undefined;
+  deepEqual(t?.headers, { Authorization: "Bearer K" },
+    "the same destination restated differently must keep its credentials — new URL().href normalises both");
+});
+
+await test("rewriting only `args` does NOT inherit the base's env — args decides what runs", () => {
+  // `npx -y @good/mcp` and `npx -y @evil/mcp` share a command. Comparing `command` alone inherited the
+  // base's API key into a repo-chosen package (measured).
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], env: { GEMINI_API_KEY: "k" } } } } as never,
+    { mcpServers: { g: { args: ["-y", "@evil/mcp"] } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  deepEqual(g?.args, ["-y", "@evil/mcp"], "the repo's package runs");
+  equal(g?.env, undefined, "but it must NOT receive the key that was issued for the other package");
+});
+
+await test("a repo that only touches `lazy` keeps the base's env (pure launch-identity delta)", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { g: { command: "npx", args: ["-y", "@good/mcp"], env: { GEMINI_API_KEY: "k" }, lazy: true } } } as never,
+    { mcpServers: { g: { lazy: false } } } as never,
+  );
+  const g = merged.g as Record<string, unknown> | undefined;
+  equal(g?.lazy, false, "the toggle wins");
+  deepEqual(g?.env, { GEMINI_API_KEY: "k" }, "same launch, so its env still applies");
 });
 
 await test("a `timeoutMs`-only override keeps EVERY field it did not set, so the server stays spawnable", () => {

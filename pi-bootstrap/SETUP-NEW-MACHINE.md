@@ -170,23 +170,35 @@ machine's pi instance.
   `lazy` and headers — a whole-entry override used to leave the entry with no
   `command` and no `url`, i.e. permanently unspawnable.
 
-  **Credentials do NOT follow a repo to a new destination, and the transport is
-  atomic.** These two rules exist because `.mcp.json` is a TRACKED file, so any PR
-  or cloned repo can edit it:
+  **The merge never inherits a secret into a different destination, and the transport
+  is atomic.** Neither rule is a security boundary — see the warning below.
 
-  - Changing `url` gives you `lazy`, `timeoutMs`, `type` and the catalog metadata,
-    but **not** the base's `headers`/`oauth` — otherwise a repo file could point
-    at its own endpoint and collect the fleet's bearer token. If the new endpoint
-    needs auth, **restate `headers` yourself** (one explicit, reviewable line).
-    A `lazy`-only override does not change the destination, so it keeps the
-    base's auth.
-  - Declaring `command` drops the base entry's `url`/`headers`/`oauth` (and its
-    `env` unless the command is unchanged); declaring `url` drops the base's
-    `command`/`args`/`env`/`cwd`. Never both — an entry declaring both transports
-    is refused with a warning, because it would silently resolve to `url`.
+  - Changing `url` keeps `lazy`, `timeoutMs` and the catalog metadata, but **does
+    not inherit** the base's `headers`/`oauth`: the base's credentials belong to the
+    base's own endpoint. A `lazy`-only override does not change the destination,
+    so it keeps them. URLs are compared normalised, so restating the same endpoint
+    is still the same destination.
+  - Declaring `command` drops the base's `url`/`headers`/`oauth`; declaring `url`
+    drops the base's `command`/`args`/`env`/`cwd`. The base's `env` is inherited
+    only when the same thing is LAUNCHED — `command` **and** `args` **and** `cwd`,
+    because `args` decides what actually runs.
+  - Never declare both transports (or a `type` contradicting the one you declare):
+    such an entry is ambiguous, so it is IGNORED with a warning and the base's
+    entry is kept. Silently it would resolve to `url`, because that is what the
+    client tests first.
+
+  ⛔ **A repo's `.mcp.json` is TRUSTED INPUT.** These rules stop a repo from
+  *accidentally* inheriting the hub's credentials. They do **not** sandbox one: a
+  repo-authored entry can still write `"Authorization": "Bearer
+  ${TORTOISE_MCP_API_KEY}"` and the client resolves it from the environment — so
+  **never restate a fleet secret's env-var name in a repo file**, and treat a
+  cloned repo's `.mcp.json` as executable configuration. Every stdio server also
+  inherits the parent's whole `process.env`. pi gates project config behind
+  project trust; this client does not (yet).
 
   There is **no way to REMOVE a base server** from a repo layer (`"<name>": null`
-  is ignored, with a warning) — see #3612 for the `disabled` tombstone that would
+  is ignored, with a warning, and an ambiguous entry leaves the base entry in
+  place) — see #3612 for the `disabled` tombstone that would
   add one. The base is
   machine-local and is never shipped, so this is also how an INTERNAL server reaches
   every repo without being written into a product repo's tracked config. Base servers: brave-search,

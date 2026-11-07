@@ -574,20 +574,31 @@ function expandExpr(str: string): string {
  *
  * ⛔ BUT A NAIVE PER-FIELD SPREAD IS WORSE, IN TWO WAYS THIS FUNCTION NOW GUARDS AGAINST.
  *
- * 1. **CREDENTIALS MUST NEVER TRAVEL TO A REPO-CHOSEN DESTINATION.** `.mcp.json` is a TRACKED file,
+ * 1. **NO SECRET IS INHERITED INTO A DIFFERENT DESTINATION.** `.mcp.json` is a TRACKED file,
  *    modifiable by any PR and present in any cloned repo. Inheriting `headers` into a repo entry that
- *    changes `url` hands the fleet's bearer token to whatever that file names (measured: a repo entry
+ *    changes `url` handed the base's bearer token to whatever that file named (measured: a repo entry
  *    `{"url": "http://127.0.0.1:PORT/collect"}` received `Authorization: Bearer <the real key>`);
- *    inheriting `env` into an entry that changes `command` hands `GEMINI_API_KEY` &c. to a
- *    repo-chosen process. So base `headers`/`oauth` are inherited ONLY when the destination is
- *    unchanged, and base `env` ONLY when the command is unchanged. A repo that wants auth at a new
- *    destination restates it — an explicit, reviewable line, rather than a silent inheritance.
+ *    inheriting `env` into an entry that changed `command` did the same for a spawned child. So base
+ *    `headers`/`oauth` are inherited ONLY when the destination is unchanged (compared NORMALISED, so
+ *    a restated URL is still the same destination), and base `env` ONLY when the same thing is
+ *    LAUNCHED (`command` + `args` + `cwd` — `args` decides what runs, so comparing `command` alone
+ *    left `npx -y @evil/mcp` able to inherit the key of `npx -y @good/mcp`).
+ *
+ *    ⛔ THIS IS NOT A SECURITY BOUNDARY, AND MUST NOT BE DESCRIBED AS ONE. It prevents ACCIDENTAL
+ *    inheritance only. A repo-authored entry can still write `"Authorization": "Bearer
+ *    ${TORTOISE_MCP_API_KEY}"` itself and `expandEnvVars` will resolve it from the environment
+ *    (measured: the repo-chosen destination received the real key), and every stdio child already
+ *    inherits the parent's whole `process.env` via `buildMcpServerEnv` regardless of this function.
+ *    A repo's `.mcp.json` is therefore TRUSTED INPUT — the real boundary is a project-trust gate on
+ *    reading it, which pi has (`docs/mcp.md`: "Project configuration is read only after project trust
+ *    is granted") and this extension does not. Filed as #3634; do not mistake these guards for it.
  *
  * 2. **TRANSPORT IS ATOMIC.** `connectServer` tests `url` BEFORE `command`, so a merged entry
  *    carrying both silently ignores the repo's `command` (measured: a repo switching the base's
  *    hosted server to its own stdio daemon kept talking to the base URL, with no warning). Base
- *    fields of the OTHER transport are therefore dropped when the repo declares one, and an entry
- *    declaring both is ambiguous, so it is refused with a warning rather than guessed at.
+ *    fields of the OTHER transport are therefore dropped when the repo declares one; an entry
+ *    declaring both, or a `type` contradicting the transport it declares, is ambiguous — the DELTA
+ *    is ignored and the BASE entry is kept, because a repo cannot remove a base server either.
  *
  * ⛔ OVERRIDES: pi's replace-on-transport rule for a project entry — `docs/mcp.md` says "A project
  * entry replaces a user-level entry with the same name", and its "keeps the rest, including env,
@@ -601,12 +612,12 @@ function expandExpr(str: string): string {
  */
 
 /** Fields that only mean anything for an HTTP transport (dropped when a repo declares stdio). */
-const HTTP_TRANSPORT_FIELDS = ["url", "headers", "oauth", "type"] as const;
-/** Of those, the ones that carry a SECRET, so may not follow a repo to a new destination. */
+const HTTP_TRANSPORT_FIELDS = ["url", "headers", "oauth"] as const;
+/** Of those, the ones that carry a SECRET, so may not follow a repo to a different destination. */
 const HTTP_CREDENTIAL_FIELDS = ["headers", "oauth"] as const;
 /** Fields that only mean anything for a stdio transport (dropped when a repo declares HTTP). */
 const STDIO_TRANSPORT_FIELDS = ["command", "args", "env", "cwd"] as const;
-/** Of those, the one that carries secrets destined for a spawned process. */
+/** Of those, the one that carries secrets declared for a spawned process. */
 const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
 
 function isServerEntry(value: unknown): value is McpServerConfig {
@@ -619,8 +630,49 @@ function declares(entry: McpServerConfig, field: "url" | "command"): boolean {
   return typeof value === "string" && value.length > 0;
 }
 
-function same(value: unknown, other: unknown): boolean {
-  return typeof value === "string" && value === other;
+/**
+ * `type` is the schema's transport selector (`stdio` / `http` / `streamable-http`), so a repo entry
+ * can name a transport WITHOUT naming `url` or `command`. An entry whose `type` contradicts the
+ * transport it declares is incoherent — `connectServer` dispatches on `url`/`command` and would
+ * silently ignore the `type` the operator wrote (measured: `{"type":"http","command":…}` ran over
+ * stdio).
+ */
+function typeContradicts(entry: McpServerConfig): boolean {
+  const type = (entry as Record<string, unknown>).type;
+  if (typeof type !== "string") return false;
+  const saysHttp = type === "http" || type === "streamable-http" || type === "sse";
+  const saysStdio = type === "stdio";
+  if (saysHttp && declares(entry, "command") && !declares(entry, "url")) return true;
+  if (saysStdio && declares(entry, "url") && !declares(entry, "command")) return true;
+  return false;
+}
+
+/**
+ * Are two destinations the same server? A URL is compared NORMALISED (via `new URL().href`), because
+ * a repo restating the same endpoint with a different host case or a trailing space is the SAME
+ * destination, and a raw string compare would silently strip its credentials with no diagnostic.
+ */
+function sameDestination(a: unknown, b: unknown): boolean {
+  if (typeof a !== "string" || typeof b !== "string") return false;
+  const normalise = (value: string): string => {
+    try {
+      return new URL(value).href;
+    } catch {
+      return value;
+    }
+  };
+  return normalise(a) === normalise(b);
+}
+
+/**
+ * Is this the same LAUNCH? What a stdio child runs is the `(command, args, cwd)` triple, not the
+ * command alone: `npx -y @good/mcp` and `npx -y @evil/mcp` share a command and run different code,
+ * so comparing only `command` left the base's `env` reachable by rewriting `args` (measured).
+ */
+function sameLaunch(a: McpServerConfig, b: McpServerConfig): boolean {
+  if (a.command !== b.command) return false;
+  if ((a.cwd ?? "") !== (b.cwd ?? "")) return false;
+  return JSON.stringify(a.args ?? null) === JSON.stringify(b.args ?? null);
 }
 
 export function mergeMcpLayers(
@@ -655,26 +707,59 @@ export function mergeMcpLayers(
       // (connectServer tests it first) and ignore the command the operator actually wrote.
       console.log(
         `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — the entry is ` +
-          `ambiguous, so it is IGNORED. Declare one transport; a repo cannot remove the base's other one.`
+          `ambiguous, so it is IGNORED and the base's entry is kept. Declare ONE transport.`
       );
-      delete merged[name];
+      continue;
+    }
+    if (typeContradicts(entry)) {
+      console.log(
+        `[mcp-client] WARN: repo entry "${name}" declares a "type" that contradicts its transport — ` +
+          `the entry is IGNORED and the base's entry is kept.`
+      );
       continue;
     }
 
     const carry = { ...inherited } as Record<string, unknown>;
+    if (repoDeclaresHttp || repoDeclaresStdio) {
+      // The base's `type` describes the base's transport; the repo's own `type`, if any, arrives with
+      // `...entry` below. Keeping a stale one would contradict the entry it now describes.
+      delete carry.type;
+    }
     if (repoDeclaresHttp) {
       for (const field of STDIO_TRANSPORT_FIELDS) delete carry[field];
-      // Credentials follow the SERVER, not the URL: only inherit them when the destination is the
-      // one they were issued for.
-      if (!same(inherited.url, entry.url)) {
-        for (const field of HTTP_CREDENTIAL_FIELDS) delete carry[field];
-      }
     } else if (repoDeclaresStdio) {
       for (const field of HTTP_TRANSPORT_FIELDS) delete carry[field];
-      if (!same(inherited.command, entry.command)) {
-        for (const field of STDIO_CREDENTIAL_FIELDS) delete carry[field];
+    }
+
+    // ⛔ THE GUARD IS EVALUATED ON THE **EFFECTIVE** ENTRY, not on what the repo happened to restate.
+    // A repo can reach a base secret WITHOUT naming the transport or the destination: `{"args": ["-y",
+    // "@evil/mcp"]}` changes what launches while `command` stays the base's, and a guard keyed on "did
+    // the repo set command/url?" misses it entirely (measured: the base's API key reached the
+    // repo-named package). So project the merged entry first, then compare it to the base's.
+    const projected = { ...carry, ...entry } as unknown as McpServerConfig;
+    if (declares(projected, "command")) {
+      if (!sameLaunch(inherited, projected)) {
+        const dropped = STDIO_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
+        for (const field of dropped) delete carry[field];
+        if (dropped.length > 0) {
+          console.log(
+            `[mcp-client] note: repo entry "${name}" changes what it LAUNCHES (command/args/cwd), so ` +
+              `the base's ${dropped.join("/")} ${dropped.length === 1 ? "is" : "are"} NOT inherited.`
+          );
+        }
+      }
+    } else if (declares(projected, "url") && !sameDestination(inherited.url, projected.url)) {
+      const dropped = HTTP_CREDENTIAL_FIELDS.filter(field => carry[field] !== undefined);
+      for (const field of dropped) delete carry[field];
+      if (dropped.length > 0) {
+        console.log(
+          `[mcp-client] note: repo entry "${name}" changes the destination, so the base's ` +
+            `${dropped.join("/")} ${dropped.length === 1 ? "is" : "are"} NOT inherited — ` +
+            `the base's credentials belong to the base's own endpoint.`
+        );
       }
     }
+
     merged[name] = { ...carry, ...entry };
   }
   return merged;
@@ -714,7 +799,11 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       // (#3612), so say why the entry was dropped instead of crashing the session.
       console.log(
         `[mcp-client] WARN: ${label} entry "${name}" is not an object — dropped. ` +
-          `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`
+          (label.startsWith("base")
+            ? // A base entry is the machine's own config: the "removal" sentence below is about a REPO
+              // layer and would be nonsense here, in the one message a user reads while debugging.
+              `Fix that entry in the base config; it is skipped, and its servers are unavailable.`
+            : `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`)
       );
       continue;
     }
