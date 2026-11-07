@@ -1304,8 +1304,14 @@ ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 
 # ABSENT, which is exactly what a NEVER-PLANTED fixture looks like, so a seed that failed inside the
 # redirect read `✅ "it is really gone"` over a ref that never existed — a verifier PASSing an unverified
 # artifact — while A84's red blamed the 30-day CEILING cap for a fault that was in the fixture instead.
-# Asserting the minted sha (p4_seed prints the commit it pushed, :800) moves the failure to this row, where
-# the message names the seed, and leaves A84/A85 measuring a claim that is proven to exist.
+# Asserting the minted sha (p4_seed prints the commit it pushed, :800) gives the run a row that NAMES the
+# seed and reddens it.
+# ⛔ HONESTY ABOUT THE MECHANISM (review round 31). This suite is `set -u`, NOT `set -e`, and `ck` only
+# increments FAIL — so a failed seed does NOT stop execution, and A84/A85 still RUN. What the row changes is
+# the VERDICT and its ATTRIBUTION: the run is RED (it could previously be GREEN), and the red now names the
+# seed instead of leaving A84 to blame the ceiling cap and A85 to certify an absence it never observed. It
+# does not make A84/A85 measure a proven fixture by itself — the suite-level guarantee this buys is that an
+# ABSENT FIXTURE CAN NO LONGER PRODUCE A GREEN RUN.
 ck "A84a (setup) a 2-YEAR-old unparseable-lease claim is MINTED for the ceiling-cap case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3236 weird3203 HAVOC 63072000 2>/dev/null )"
 outP4CAPB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
                   CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
