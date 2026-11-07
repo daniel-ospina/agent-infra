@@ -3078,7 +3078,7 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     it is NOT restated here, because two copies of "measured" prose drift — the
     first draft of this pair already disagreed with itself on the character set.
     """
-    # ── genuinely NOT ids: refused for a STRUCTURAL reason, not by the alphabet ──
+    # ── genuinely NOT ids — never emitted, so no door should name them ──
     for junk in (
         "tests/test_a.py::",                  # empty tail
         "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
