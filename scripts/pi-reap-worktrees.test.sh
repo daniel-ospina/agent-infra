@@ -4999,6 +4999,111 @@ assert_eq "$(printf '%s\n' "$OUT" | grep -c 'reason=remote-holds:upstream/feat/a
 assert_contains "$OUT" "examined=4 classified=4" \
     "A26g3 non-vacuity: the main checkout plus all three detached records were classified"
 
+# ── A26g4: the cache's IDENTITY — one remote's snapshot must never answer another's (#3371) ──
+# `remote_advertise` keys the cache by remote name and the matcher filters on it, and BOTH of those
+# terms were unpinned: every other remote fixture probes exactly ONE remote, so deleting either one
+# left the whole suite green. The trap is concrete — a remote name may be a PREFIX of another
+# (`up` / `upstream`), and a shared `R <remote>` marker matched without `-x` lets `R upstream` answer
+# for `up`. So this fixture has two remotes whose names prefix each other, advertising the SAME
+# branch name at DIFFERENT shas, and asserts both rows still come back `remote-holds` with their OWN
+# sha:
+#   · drop the `-x` on the marker -> `up` short-circuits onto upstream's snapshot, finds no `A up …`
+#     line, and its row PRESERVEs => `reason=remote-holds:up/…` missing => RED;
+#   · drop the `$2 == r` term -> two `A … refs/heads/feat/a26g4` lines match, `n == 2`, and the row
+#     PRESERVEs => RED.
+ENV=A26g4; REPO="$(mk_repo $ENV)"
+BARE_UPSTREAM="$T/$ENV/upstream.git"; BARE_UP="$T/$ENV/up.git"
+"$REAL_GIT" init -q --bare "$BARE_UPSTREAM"
+"$REAL_GIT" init -q --bare "$BARE_UP"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE_UPSTREAM"
+"$REAL_GIT" -C "$REPO" remote add up "$BARE_UP"
+A26G4_SHA=""
+for _g in 1 2; do
+    "$REAL_GIT" -C "$REPO" checkout -q -b "tmp-a26g4$_g"
+    commit_in_wt "$REPO" "$OLD_DATE" "a26g4$_g"
+    _gsha="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+    if [ "$_g" = 1 ]; then
+        "$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g4$_g:refs/heads/feat/a26g4"
+    else
+        "$REAL_GIT" -C "$REPO" push -q up "tmp-a26g4$_g:refs/heads/feat/a26g4"
+        A26G4_SHA="$_gsha"
+    fi
+    "$REAL_GIT" -C "$REPO" checkout -q main
+    "$REAL_GIT" -C "$REPO" branch -D "tmp-a26g4$_g" >/dev/null
+done
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$REPO" fetch -q up
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det-1" "$("$REAL_GIT" -C "$BARE_UPSTREAM" rev-parse refs/heads/feat/a26g4)"
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det-2" "$A26G4_SHA"
+assert_eq "$("$REAL_GIT" -C "$BARE_UPSTREAM" rev-parse refs/heads/feat/a26g4)" \
+    "$("$REAL_GIT" -C "$REPO" rev-parse refs/remotes/upstream/feat/a26g4)" \
+    "A26g4 precondition: upstream's tracking ref is upstream's own head"
+assert_eq "$("$REAL_GIT" -C "$BARE_UP" rev-parse refs/heads/feat/a26g4)" \
+    "$("$REAL_GIT" -C "$REPO" rev-parse refs/remotes/up/feat/a26g4)" \
+    "A26g4 precondition: up advertises the SAME branch name at a DIFFERENT sha"
+A26G4_CNT="$T/$ENV/cnt"; rm -f "$A26G4_CNT"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G4_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G4_CNT" 2>/dev/null)" "2" \
+    "A26g4 two remotes cost two advertisements — one each, and no more"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det-1")" "reason=remote-holds:upstream/feat/a26g4" \
+    "A26g4 the row held by 'upstream' is proved against 'upstream'"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det-2")" "reason=remote-holds:up/feat/a26g4" \
+    "A26g4 …and the row held by 'up' is proved against 'up': a marker matched without -x, or a matcher without the remote term, PRESERVEs it instead (the 'up'/'upstream' prefix trap)"
+
+# ── A26g5: the snapshot is CLASSIFICATION evidence — the REMOVAL re-proves it (#3371 review, P1) ──
+# The advertisement is taken once per pass, so a late row reads a snapshot that can be minutes old,
+# and this class is removed with NO backup on the warrant "the remote still advertises this head".
+# A branch auto-deleted on merge between the snapshot and the fork would make that warrant false at
+# the instant the checkout is destroyed. The fixture is that window, made deterministic: the shim
+# answers the ADVERTISEMENT with the branch at the right sha and answers every TARGETED re-probe
+# with nothing (the remote no longer holds it). The row must still CLASSIFY as `remote-holds`, and
+# `--apply` must remove NOTHING. Delete `remote_holds_recheck` and the checkout is deleted => RED.
+cat >"$T/bin/git-lsremote-advonce" <<'SHIM'
+#!/usr/bin/env bash
+# GIT_BIN shim for A26g5: the remote as it was when the pass STARTED (an advertisement) and as it
+# is at REMOVAL time (a targeted probe for one refname) — the auto-delete-on-merge window.
+seen_lsremote=0
+for a in "$@"; do [ "$a" = "ls-remote" ] && seen_lsremote=1; done
+if [ "$seen_lsremote" = 1 ]; then
+    pattern=0
+    for a in "$@"; do case "$a" in refs/heads/*) pattern=1 ;; esac; done
+    if [ "$pattern" = 0 ]; then printf '%s\n' "${FAKE_ADV_LINE:-}"; fi
+    exit 0
+fi
+exec "${REAL_GIT_BIN:-git}" "$@"
+SHIM
+chmod +x "$T/bin/git-lsremote-advonce"
+ENV=A26g5; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+"$REAL_GIT" -C "$REPO" checkout -q -b tmp-a26g5
+commit_in_wt "$REPO" "$OLD_DATE" "a26g5"
+A26G5_SHA="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+"$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g5:refs/heads/feat/a26g5"
+"$REAL_GIT" -C "$REPO" checkout -q main
+"$REAL_GIT" -C "$REPO" branch -D tmp-a26g5 >/dev/null
+"$REAL_GIT" -C "$REPO" fetch -q upstream
+"$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det" "$A26G5_SHA"
+# the remote DELETES the branch (the auto-delete this arm is about) — the local tracking ref stays
+"$REAL_GIT" -C "$BARE" update-ref -d refs/heads/feat/a26g5
+assert_eq "$("$REAL_GIT" -C "$BARE" for-each-ref refs/heads | wc -l | tr -d ' ')" "0" \
+    "A26g5 precondition: the remote no longer advertises the branch"
+OUT="$(FAKE_ADV_LINE="$A26G5_SHA	refs/heads/feat/a26g5" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-advonce" \
+    run_reaper $ENV --apply --repo "$REPO")"
+assert_contains "$(row_for "$OUT" "$T/$ENV-det")" "reason=remote-holds:upstream/feat/a26g5" \
+    "A26g5 the row is classified from the START-OF-PASS advertisement (the snapshot is real evidence for a CLASSIFICATION)"
+assert_contains "$OUT" "remote-holds-stale" \
+    "A26g5 …and the removal is refused at the fork, because the targeted re-probe no longer finds the head"
+if [ -d "$T/$ENV-det" ]; then
+    ok "A26g5 the checkout is STILL ON DISK — a stale snapshot never destroys the last durable handle"
+else
+    bad "A26g5 the checkout was REMOVED on a snapshot the remote had already invalidated — the removal path must re-prove it (remote_holds_recheck)"
+fi
+assert_contains "$OUT" "removed=0" \
+    "A26g5 …and the pass reports no removal"
+
 # ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
 # This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
 #   · block it, and a long-lived PRESERVE row (`no-pr`/`too-recent`/`too-young` rows carry
