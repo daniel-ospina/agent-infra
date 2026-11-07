@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "exit_code": null,
+  "heartbeat_at": 1794070093,
+  "host": "cmux",
+  "issue": 16,
+  "kind": "lane",
+  "lane_id": "cmux.klane-16-1794070093-p2124968-266c91b3",
+  "lease_until": 1794077893,
+  "pid": 2124968,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794070093,
+  "state": "RUNNING",
+  "tag": "16",
+  "worktree": "/opt/ai-runner-cell2-x64-2/_tmp/wt-lifecycle-test.1voTVc/L7/repo/.worktrees/tm-16"
+}
