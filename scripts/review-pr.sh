@@ -224,6 +224,28 @@ if ! command -v "$PI_BIN" >/dev/null 2>&1; then
   die "$E_NOPI" "reviewer binary '$PI_BIN' is not executable/on PATH — no review was attempted (set REVIEW_PR_PI to override only in fixtures)"
 fi
 
+# ── THE REVIEWER'S MODEL, RESOLVED THE SAME WAY spawn-gate.sh's `run_agent` DOES ────────────────
+#
+# MEASURED 2026-11-03T02:10Z on the orchestrator box. This line used to hardcode
+# `--provider deepseek --model deepseek-v4-flash`. `deepseek-v4-flash` is now a LEGACY alias, and on
+# this box it answers NOTHING: the reviewer session came up, loaded all 48 extensions, took the
+# [gate] #2148 preflight, and then produced ZERO assistant turns — `[reflect-hook] Skipped — empty
+# session`, `elapsed=7s rc=0` — so this script's own verdict reader correctly refused with
+# `no verdict from the reviewer`. Two runs, 24 s apart, identical.
+#
+# The SAME argv with `--model deepseek-flash` answers on the first try (measured, both directions).
+# So the seam was not broken by the reviewer's prompt, the auth, or the wall clock: it was broken by
+# a model-name pin, and it failed in the one shape a gate must never fail in — rc=0 with no verdict,
+# indistinguishable from a clean run to anything that reads only the exit code.
+#
+# ⛔ `merge-one.sh`'s `run_agent` was fixed for exactly this (agent-infra#2208) and its comment states
+# the invariant: "Keep the two defaults IDENTICAL: a lane must not run a different model than its
+# reviewer." Only the sibling was changed, so the divergence survived in the highest-value reviewer
+# on the box. This resolves both names from the same `PI_LANE_*` pair, with the same defaults, so the
+# invariant is now enforced by construction rather than by a comment on one of the two files.
+LANE_PROVIDER="${PI_LANE_PROVIDER:-deepseek}"
+LANE_MODEL="${PI_LANE_MODEL:-deepseek-flash}"
+
 RECORDER="${REVIEW_PR_RECORD_SH:-}"
 if [ -z "$RECORDER" ]; then
   SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -800,7 +822,7 @@ run_reviewer() { # <secs> <log> <prompt-file>
   # markers. `merge-one.sh` fixes this at the box level, but the seam should not depend on a
   # redaction extension being installed. `gh` reads are unaffected — the child still gets
   # GH_TOKEN/GH_REPO, which is all the verification it does.
-  ( cd "$RUN_DIR" && exec env -u AI_REVIEW_GATE_KEY "$PI_BIN" -p --provider deepseek --model deepseek-v4-flash --no-session "$(cat "$pf")" ) >> "$log" 2>&1 &
+  ( cd "$RUN_DIR" && exec env -u AI_REVIEW_GATE_KEY "$PI_BIN" -p --provider "$LANE_PROVIDER" --model "$LANE_MODEL" --no-session "$(cat "$pf")" ) >> "$log" 2>&1 &
   pid=$!
   # ⛔ A KILLED SEAM MUST NOT LEAK A PAID REVIEWER (P3, fresh review of #2288 — measured): only an
   # EXIT trap was installed, so SIGTERM to this script left the `pi -p` child ALIVE (child ppid =
@@ -2303,7 +2325,7 @@ if [ "$VERDICT" = clean ]; then
     printf '## Code review — %s#%s @ `%s`\n\n' "$REPO" "$PR" "${HEAD:0:12}"
     printf '**Verdict:** CLEAN — no blocking findings.\n\n'
     printf '| | |\n|---|---|\n'
-    printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (deepseek-v4-flash, `--no-session`) — no shared context with the author |\n| Produced by | `scripts/review-pr.sh %s` |\n\n' "$REPO" "$HEAD" "$PR"
+    printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (%s/%s, `--no-session`) — no shared context with the author |\n| Produced by | `scripts/review-pr.sh %s` |\n\n' "$REPO" "$HEAD" "$LANE_PROVIDER" "$LANE_MODEL" "$PR"
     # `**Outcome: clean**`: record-review.sh's explicit-outcome anchor is
     # `(^|[*[:space:]])outcome:` against the body it receives, and the leading `*` satisfies it
     # even when the body arrives mid-string (P3, eleventh fresh review).
@@ -2356,7 +2378,7 @@ else
     printf '## Code review — %s#%s @ `%s`\n\n' "$REPO" "$PR" "${HEAD:0:12}"
     printf '**Verdict:** ISSUES (%s) — this revision has NOT been recorded as reviewed clean.\n\n' "${ISSUE_N:-?}"
     printf '| | |\n|---|---|\n'
-    printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (deepseek-v4-flash, `--no-session`) |\n\n' "$REPO" "$HEAD"
+    printf '| Repo | `%s` |\n| Head | `%s` |\n| Reviewer | fresh-context `pi -p` (%s/%s, `--no-session`) |\n\n' "$REPO" "$HEAD" "$LANE_PROVIDER" "$LANE_MODEL"
     printf '**Outcome: not-clean**\n\n'
     printf '### Findings\n\n'
     if [ -n "$FINDINGS" ]; then printf '%s\n' "$FINDINGS"; else

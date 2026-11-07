@@ -73,6 +73,13 @@ assert_contains() { # <haystack> <needle> <label>
 assert_not_contains() {
     if grep -qF -- "$2" <<<"$1"; then bad "$3 (unexpected: $2)"; else ok "$3"; fi
 }
+# assert_line <haystack> <ERE> <label> — for a claim that must hold of a WHOLE line. `grep -F` cannot
+# express "a TCC REFUSAL, not a WARN about one": "TCC-protected target" is a substring of
+# "WARN TCC-protected target", so a bare contains-assert passed on the line it exists to exclude
+# (measured, review P3 round 5). The installer prints refusals with four leading spaces.
+assert_line() {
+    if grep -qE -- "$2" <<<"$1"; then ok "$3"; else bad "$3 (no line matching: $2)"; fi
+}
 
 # ── scaffold ──────────────────────────────────────────────────────────────
 T="$(mktemp -d /tmp/install-launchd-test.XXXXXX)"
@@ -112,23 +119,31 @@ SHIM
 chmod +x "$T/bin/dscl"
 
 # Fake HOME with a farmed scripts dir + a swarm checkout.
+# mkstub <path> — a NON-EMPTY executable stub. `touch` is not enough: the guard refuses a 0-byte
+# executed target (execve gives ENOEXEC, the 126/127 class this change exists for), so a fixture that
+# models a farmed script must carry a byte.
+mkstub() { printf '#!/bin/bash\nexit 0\n' > "$1"; chmod +x "$1"; }
 mkfakehome() { # $1 = home dir
+    # #2413-audit — the three jobs whose templates name the FARMED copy. On a real box they pointed
+    # at `{{AGENT_INFRA_PATH}}/scripts/…` (inside ~/Documents) and launchd exited 126 on every tick
+    # under TCC (#427); the farmed path is the only target it can READ, so the fixture must carry it
+    # or the broken-target guard refuses the whole §1 install and every section after it.
+    mkdir -p "$1/.pi/agent/scripts/orchestrator-harness"
+    for f in objective-reminder.sh orchestrator-harness/worker-supply.sh orchestrator-harness/watchdog-loop.sh; do
+        mkstub "$1/.pi/agent/scripts/$f"
+    done
     mkdir -p "$1/.pi/agent/scripts/checkout-hygiene"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
-    touch "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"  # #476 poller
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
-    chmod +x "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"
+    mkstub "$1/.pi/agent/scripts/checkout-hygiene/corruption_canary.py"
+    mkstub "$1/.pi/agent/scripts/checkout-hygiene/provider-latency-tripwire.sh"
+    mkstub "$1/.pi/agent/scripts/checkout-hygiene/deepseek-balance-watch.sh"  # #476 poller
     # #373 fleet-cadence farm + #469 pi-session-reaper + #476 balance-watch
     # (setup.sh copies these to the scripts root): the weekly plist's driver +
     # its sibling report/watch/parser AND the reaper/balance-watch drivers must
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
-        touch "$1/.pi/agent/scripts/$f"
-        chmod +x "$1/.pi/agent/scripts/$f"
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py worktree-hygiene-sweep.sh cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
+        mkstub "$1/.pi/agent/scripts/$f"
     done
     # #1719 — the gate job's plist target. Its farm entry is `fleet_srcs` (setup.sh copies it to
     # scripts/), so it must resolve here or the broken-target guard refuses the install.
@@ -144,8 +159,7 @@ mkfakehome() { # $1 = home dir
     # outside the TCC-protected tree, so it must SURVIVE the filter. Mirrors install.sh:add_dir(),
     # whose blanket `*/.pi/*` exclusion would wrongly drop it here.
     mkdir -p "$1/.pi/agent/bin"
-    touch "$1/.pi/agent/bin/rg"
-    chmod +x "$1/.pi/agent/bin/rg"
+    mkstub "$1/.pi/agent/bin/rg"
     # #1719 (review D2-3) — a PATH entry containing `&`, the sed replacement's "whole match" token.
     # Without escaping, `render` turns it into a corrupted entry with a literal {{PATH}} left in the
     # middle of it, and nothing downstream notices (verify_targets inspects ProgramArguments only).
@@ -163,20 +177,16 @@ mkfakehome() { # $1 = home dir
     # not resolve), so its presence in a rendered plist means the fix was reverted.
     mkdir -p "$1/.pi/agent/cdpath/cdpathphantom"
     mkdir -p "$1/.pi/agent/scripts/lib"
-    touch "$1/.pi/agent/scripts/lib/pid-identity.sh"
-    chmod +x "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    mkstub "$1/.pi/agent/scripts/lib/pid-identity.sh"
     # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
     # the driver + its sibling classifier under scripts/fleet/ (the broken-target
     # guard refuses the install when they are absent). NOT tools/fleet/: pi's
     # startup scan blocks interactive boot on any non-fd/rg entry there (#1277).
     mkdir -p "$1/.pi/agent/scripts/fleet"
-    touch "$1/.pi/agent/scripts/fleet/lane_liveness.py"
-    touch "$1/.pi/agent/scripts/fleet/liveness.py"
-    chmod +x "$1/.pi/agent/scripts/fleet/lane_liveness.py"
-    chmod +x "$1/.pi/agent/scripts/fleet/liveness.py"
+    mkstub "$1/.pi/agent/scripts/fleet/lane_liveness.py"
+    mkstub "$1/.pi/agent/scripts/fleet/liveness.py"
     mkdir -p "$1/swarm/.venv/bin"
-    touch "$1/swarm/.venv/bin/python"
-    chmod +x "$1/swarm/.venv/bin/python"
+    mkstub "$1/swarm/.venv/bin/python"
     mkdir -p "$1/Library/LaunchAgents"
 }
 
@@ -304,6 +314,39 @@ DBW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.deepseek-balance-watch.pli
 ORPHANS_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.pi-reap-orphans.plist"
 HUB_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.hub-state-check.plist"
 ORACLE_RETIRED="$HOME1/Library/LaunchAgents/com.eldato.skill-lint-oracle.plist"
+# #2413 audit — the three units that were ARMED AND DEAD now point at the FARMED copy, and NOTHING
+# pinned those three TEMPLATES (P2-C of the #3413 review): `mkfakehome` carries both candidate paths
+# and neither is under the fixture's `~/Documents`, so `verify_targets` passed either way and
+# reverting `com.eldato.worker-supply.plist` or `com.eldato.controller-watchdog.plist` to
+# `{{AGENT_INFRA_PATH}}` left the whole suite green — on the two units with `runs=1766` and the 126
+# deaths this change is about. Both directions are asserted: the farmed path is PRESENT and the
+# checkout path is ABSENT, so neither half of a revert can hide.
+WS_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.worker-supply.plist"
+CW_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.controller-watchdog.plist"
+OR_INSTALLED="$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist"
+# ⛔ READ THE RENDERED ProgramArguments VALUE, never the whole file (the same E2-3 lesson
+# `installed_path` below records): these plists legitimately carry `AGENT_INFRA_PATH` in
+# `EnvironmentVariables`, so a whole-file `assert_not_contains` reds on a CORRECT unit — a false RED
+# that invites weakening the assertion instead of the template.
+installed_program_args() { # $1 = installed plist → its ProgramArguments <string> values, one per line
+    awk '
+        /<key>ProgramArguments<\/key>/ { inargs = 1; next }
+        inargs && /<\/array>/          { inargs = 0; next }
+        inargs && /<string>/           { sub(/.*<string>/, ""); sub(/<\/string>.*/, ""); print }
+    ' "$1" 2>/dev/null || true
+}
+assert_contains "$(installed_program_args "$WS_INSTALLED")" "$HOME1/.pi/agent/scripts/orchestrator-harness/worker-supply.sh" \
+    "worker-supply plist execs the FARMED copy, still NESTED (#427/#2413)"
+assert_not_contains "$(installed_program_args "$WS_INSTALLED")" "$AGENT_INFRA_PATH/scripts/" \
+    "…and does NOT exec the checkout path (the ~/Documents form that exits 126, #427/#2413)"
+assert_contains "$(installed_program_args "$CW_INSTALLED")" "$HOME1/.pi/agent/scripts/orchestrator-harness/watchdog-loop.sh" \
+    "controller-watchdog plist execs the FARMED copy, still NESTED (#427/#2413)"
+assert_not_contains "$(installed_program_args "$CW_INSTALLED")" "$AGENT_INFRA_PATH/scripts/" \
+    "…and does NOT exec the checkout path (#427/#2413)"
+assert_contains "$(installed_program_args "$OR_INSTALLED")" "$HOME1/.pi/agent/scripts/objective-reminder.sh" \
+    "objective-reminder plist execs the FARMED copy (#427/#2413)"
+assert_not_contains "$(installed_program_args "$OR_INSTALLED")" "$AGENT_INFRA_PATH/scripts/" \
+    "…and does NOT exec the checkout path (#427/#2413)"
 assert_contains "$(cat "$CANARY_INSTALLED")" "$HOME1/swarm/.venv/bin/python" "canary plist rendered PYTHON_BIN"
 assert_contains "$(cat "$CANARY_INSTALLED")" "--root" "canary plist keeps --root"
 assert_contains "$(cat "$CANARY_INSTALLED")" "agent-infra-plist-version: 0.1.0" "canary template carries version marker"
@@ -385,6 +428,7 @@ assert_contains "$(cat "$DBW_INSTALLED")" "agent-infra-plist-version: 0.1.0" "ba
 assert_contains "$(cat "$DBW_INSTALLED")" "<integer>900</integer>" "balance-watch runs every 15min (StartInterval 900)"
 assert_not_contains "$(cat "$DBW_INSTALLED")" "StartCalendarInterval" "balance-watch is interval-scheduled, not calendar"
 assert_contains "$(cat "$DBW_INSTALLED")" "<key>PATH</key>" "balance-watch plist carries an explicit PATH env"
+# #1719 — the runner-label gate: the repo's copy must be the one launchd executes, on the SAME
 # #1719 — the runner-label gate: the repo's copy must be the one launchd executes, on the SAME
 # label the hand-made duplicate occupied, and it must never be handed the shim dir.
 GATE_INSTALLED="$HOME1/Library/LaunchAgents/com.tortoise.ci-runner-gate.plist"
@@ -652,6 +696,1449 @@ assert_contains "$OUT" "broken target" "broken target named"
 assert_contains "$OUT" "FAIL" "broken target refuses install"
 BOOTSTRAP_COUNT4="$(grep -c 'launchctl bootstrap' "$LOG" || true)"  # grep -c exits 1 on ZERO matches; `set -e` would kill the run here
 assert_eq "$BOOTSTRAP_COUNT4" "$((BOOTSTRAP_COUNT3 + 1))" "no bootstrap for a refused job (count frozen after test 6's failed reload)"
+echo "── 7b. TCC-protected target refusal (#427 / #2413 audit) ─────────"
+# MEASURED 2026-11-03 on the orchestrator box: four jobs were loaded, ran (1766 / 44 / 2 times) and
+# exited 126/2 because their ProgramArguments named a script inside ~/Documents — a tree macOS TCC
+# denies to every launchd-spawned process. `verify_targets` tested EXISTENCE only, so it PASSED them
+# and the installer armed a unit that could never start. This section pins the fix: a target inside a
+# TCC-protected root is refused BY NAME and nothing is bootstrapped for it.
+#
+# The guard reads $HOME at install time, so the case is built under the fixture HOME — never the
+# operator's real ~/Documents.
+mkdir -p "$HOME1/Documents/checkout/scripts"
+touch "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
+chmod +x "$HOME1/Documents/checkout/scripts/tcc-dead.sh"
+sed -i.bak \
+    -e 's#<string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>#<string>{{HOME}}/Documents/checkout/scripts/tcc-dead.sh</string>#' \
+    "$TEMPLATES/com.eldato.objective-reminder.plist" \
+    && rm -f "$TEMPLATES/com.eldato.objective-reminder.plist".bak || true
+rm -f "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist"
+BOOTSTRAP_OBJ_BEFORE="$(grep -c 'bootstrap.*com\.eldato\.objective-reminder' "$LOG" || true)"
+set +e
+OUT="$(run_installer "$HOME1" 2>&1)"
+RC=$?
+set -e
+# The verdict is a SKIP of THIS unit, not a failed install — `RC` here is 1 for the tripwire job §7
+# broke, so it proves nothing about this case; what is asserted is the UNIT's own verdict. Both
+# directions are pinned: `SKIP` present (it is not installed, and not armed) and `FAIL` absent (it does
+# not take the whole install down with it, which is the #3413 P1-A consequence `sync.sh` died of).
+assert_contains "$OUT" "SKIP com.eldato.objective-reminder" "TCC-protected unit is SKIPPED by name"
+assert_not_contains "$OUT" "FAIL com.eldato.objective-reminder" "TCC-protected unit does not FAIL the install (sync.sh would die)"
+assert_line "$OUT" '^    TCC-protected target: ' "TCC-protected target named"
+assert_contains "$OUT" "Operation not permitted" "the 126 symptom is named in the refusal"
+# The whole point: the guard must not merely WARN — the unit is absent, not half-installed. The file
+# check can only catch a regression that INSTALLS anyway (the `rm -f` above made it absent); the
+# bootstrap count is the other half, because a half-installed unit is `mv`'d into place BEFORE
+# `launchctl bootstrap`. Reported with bad/ok, NOT `exit 1`: aborting here would preempt the count
+# assertion below in exactly the mutation it exists to catch (review P3).
+if [ -e "$HOME1/Library/LaunchAgents/com.eldato.objective-reminder.plist" ]; then
+    bad "the TCC-protected unit is absent afterwards (it was installed anyway)"
+else
+    ok "the TCC-protected unit is absent afterwards"
+fi
+assert_eq "$(grep -c 'bootstrap.*com\.eldato\.objective-reminder' "$LOG" || true)" "$BOOTSTRAP_OBJ_BEFORE" "no bootstrap for the skipped TCC-protected unit"
+# Restore the template + fixture so later sections install cleanly.
+# ⛔ NO VERSION-BUMP SED HERE (#3413 review P3). An earlier draft rewrote `agent-infra-plist-version`
+# to force a reinstall and rewrote it back; the `rm -f` above already forces that, and the pairs
+# hardcoded `0.2.0`, so the next template bump would have made them silent no-ops.
+sed -i.bak \
+    -e 's#<string>{{HOME}}/Documents/checkout/scripts/tcc-dead.sh</string>#<string>{{HOME}}/.pi/agent/scripts/objective-reminder.sh</string>#' \
+    "$TEMPLATES/com.eldato.objective-reminder.plist" \
+    && rm -f "$TEMPLATES/com.eldato.objective-reminder.plist".bak || true
+
+echo "── 7c. verify_targets: WHICH argument may refuse, and which resolutions are load-bearing ──"
+# §7b proves the WHOLE-installer refusal through a real template. This section proves the rules the
+# guard is built on, one ProgramArguments array at a time, by pointing the installer at a
+# single-template directory — so a failure here names the rule, not "an install failed".
+#
+# ⛔ WHY EACH CASE EXISTS (the first five were live holes found in review of the previous revisions;
+# the last two are the empty-as-PASS that #1743 named and this change fixes):
+#   * SYMLINKED farm entry — `is_tcc_protected` used to resolve only the target's DIRECTORY, so a
+#     farm copy that is itself a symlink into ~/Documents was read as a clean path and the dead unit
+#     was armed. This case is RED when the physical-target resolution is dropped.
+#   * HOME REACHED VIA A SYMLINK — the roots are built from `$HOME`, so when `$HOME` is itself a
+#     symlink the LITERAL root never prefixes a physical target. This case is RED when the
+#     physical-ROOT comparison is dropped (it is the only case that reaches that block).
+#   * `/usr/bin/env bash <script>` — the script sits at argv[2], so a fixed "argv[0..1] are the
+#     command" index rule would file it as DATA and merely warn. RED if the classification is
+#     replaced by an index.
+#   * `/bin/bash -e <script>` — RED if the command prefix is closed at the first option instead of
+#     found by locating the script the interpreter READS (the first revision warned here and armed
+#     the dead unit).
+#   * `{{TORTOISE_REPO}}/.venv/bin/python` at argv[0] — the two shipped `com.tortoise.*` reapers, and
+#     the documented default checkout IS a TCC root. RED if an `exec` target is ever reported as a
+#     DATA argument (install proceeds, dead unit armed), and RED if it is turned back into a failed
+#     install instead of a SKIP of that one unit (the #3413 P1-A consequence: installer exit 1 →
+#     `sync.sh` under `set -e` dies before its cost-config and parity gates).
+#   * DATA argument under a TCC root — `--repo ~/Documents/GitHub/tortoise` is the DOCUMENTED DEFAULT
+#     of three shipped templates (plus `--root {{SWARM_ROOT}}` on the canary). RED if data arguments
+#     are refused again.
+#   * unreadable plist / no absolute target — RED if either becomes a pass.
+PROBE_DIR="$T/probe-templates"
+PROBE_HOME="$T/probe-home"
+probe_install() { # <home> <program-argument>... → installer stdout+stderr; rc is the installer's
+    _probe_install 1 "$@"
+}
+# Same, but it LEAVES a previously installed probe plist in place — the state every real box is in,
+# and the only way to see whether a SKIP disarms what an earlier run armed.
+probe_install_keep_installed() { _probe_install 0 "$@"; }
+_probe_install() { # <clear-installed:0|1> <home> <program-argument>...
+    local clear="$1" home="$2" a body=""; shift 2
+    for a in "$@"; do body="$body        <string>$a</string>"$'\n'; done
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+$body    </array>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+</dict>
+</plist>
+PLIST
+    [ "$clear" = "1" ] && rm -f "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      # No {{…}} placeholders in the probe plist, so none of the job env is needed; clearing it keeps
+      # an ambient TORTOISE_REPO out of a fixture that is about ProgramArguments only.
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+# Same, but the unit carries launchd's `Program` key instead of a ProgramArguments array — the shape
+# whose launcher the guard must file-type-check as well as TCC-check.
+probe_install_program() { # <home> <program-path> → installer stdout+stderr; rc is the installer's
+    local home="$1" prog="$2"
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>$prog</string>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+    rm -f "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+mkfakehome "$PROBE_HOME"
+mkdir -p "$PROBE_HOME/Documents/checkout/scripts"
+PROBE_DEAD="$PROBE_HOME/Documents/checkout/scripts/tcc-dead.sh"
+# ⛔ `mkstub`, NOT `touch`. This fixture models a SCRIPT in the checkout, and the guard refuses a
+# 0-byte executed target (execve gives ENOEXEC) — see `mkstub`'s own comment above. It was left empty
+# here, which made every "same tree, installing" row below bless an INERT unit without anyone deciding
+# to: the fixture's emptiness was incidental to what those rows test (the grant verdict), and it hid
+# the hole (c22h2) pins.
+mkstub "$PROBE_DEAD"
+mkstub "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
+# the two `com.tortoise.*` reapers exec the CHECKOUT's own interpreter; §7c (c3) reproduces that shape
+mkdir -p "$PROBE_HOME/Documents/checkout/.venv/bin"
+# a BINARY (magic bytes that are not `#!`): a zero-byte placeholder would be "unreadable/empty", which
+# the guard now treats as CANNOT-HOLD-A-GRANT, and the launcher case would flip to a SKIP (correctly).
+printf '\177ELF\002\001\001\000' > "$PROBE_HOME/Documents/checkout/.venv/bin/python"
+chmod +x "$PROBE_HOME/Documents/checkout/.venv/bin/python"
+
+# control — a clean argv installs, so the refusals below are not "everything fails on this host".
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" --loop 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: a farmed exec target + a relative data arg installs"
+
+# ── the guard's own functions, driven directly ────────────────────────────────────────────────
+# Going through the installer cannot reach two facts at all: (1) CASE, because a case-varied path
+# does not EXIST on a case-sensitive filesystem, so the broken-target check fires first on Linux and
+# the TCC branch is never taken; (2) a path that need not exist. Both matter (a case-blind guard is a
+# fail-open on every default Mac volume), so the functions are EXTRACTED from the shipped file and
+# driven in a subshell exactly as the installer calls them. The extraction is asserted non-empty: a
+# silent empty `$GUARD_LIB` would make every probe below vacuously "ok".
+GUARD_LIB="$T/guard-lib.sh"
+sed -n '/^tcc_protected_roots()/,/^}/p;/^physical_path()/,/^}/p;/^tcc_protected_root()/,/^}/p;/^is_tcc_protected()/,/^}/p' \
+    "$INSTALLER" > "$GUARD_LIB"
+if grep -q '^is_tcc_protected()' "$GUARD_LIB" && grep -q '^physical_path()' "$GUARD_LIB" \
+   && grep -q '^tcc_protected_root()' "$GUARD_LIB" && grep -q '^tcc_protected_roots()' "$GUARD_LIB"; then
+    ok "§7d the guard's functions extract from the shipped installer (a probe below is not vacuous)"
+else
+    bad "§7d could not extract tcc_protected_root/is_tcc_protected/physical_path/tcc_protected_roots — every probe below would be vacuous"
+fi
+guard() { # <home> <path> → "protected" | "ok"
+    ( HOME="$1"; . "$GUARD_LIB"; if is_tcc_protected "$2"; then echo protected; else echo ok; fi )
+}
+assert_eq "$(guard /h /h/Documents/x)" "protected" "§7d a literal Documents path is protected"
+# ⛔ THE CASE VARIANTS ARE THE MACOS FAIL-OPEN: APFS is case-insensitive, so ALL THREE of these are
+# the same directory to the kernel. RED if `nocasematch` is dropped.
+assert_eq "$(guard /h /h/documents/x)" "protected" "§7d …and its lowercase spelling (/h/documents/x IS /h/Documents/x on APFS)"
+assert_eq "$(guard /h /h/DOCUMENTS/x)" "protected" "§7d …and its uppercase spelling"
+assert_eq "$(guard /h /h/Desktop/x)" "protected" "§7d Desktop is a root too"
+assert_eq "$(guard /h /h/Projects/x)" "ok" "§7d a path outside every root is NOT protected (no blanket refusal)"
+# (i) the physical-TARGET resolution, at function level: the file is a symlink into the tree.
+T_DOCS="$T/guardhome"; rm -rf "$T_DOCS"; mkdir -p "$T_DOCS/Documents/real" "$T_DOCS/other"
+: > "$T_DOCS/Documents/real/dead.sh"
+ln -sfn "$T_DOCS/Documents/real/dead.sh" "$T_DOCS/other/alias.sh"
+assert_eq "$(guard "$T_DOCS" "$T_DOCS/other/alias.sh")" "protected" "§7d a symlink whose TARGET is inside the tree is protected (physical target)"
+# the reverse direction: a symlink whose target is ALSO outside the tree must NOT be refused — the
+# physical-target resolution must not turn into a blanket refusal of every symlinked path.
+: > "$T_DOCS/other/ok.sh"
+ln -sfn "$T_DOCS/other/ok.sh" "$T_DOCS/other/alias-out.sh"
+assert_eq "$(guard "$T_DOCS" "$T_DOCS/other/alias-out.sh")" "ok" "§7d a symlink whose TARGET is outside the tree is NOT refused (no blanket)"
+# (ii) $HOME itself reached through a symlink: only the physical ROOT matches.
+ln -sfn "$T_DOCS" "$T/linkhome"
+assert_eq "$(guard "$T/linkhome" "$T_DOCS/Documents/real/dead.sh")" "protected" "§7d a physical target under a SYMLINKED \$HOME is protected (physical ROOT)"
+assert_eq "$(guard "$T/linkhome" "$T_DOCS/other/nope-anywhere")" "ok" "§7d …and an unrelated path under it is not (the root match is not a blanket)"
+
+# (a) the farm ENTRY is a symlink into the protected tree → the physical TARGET is what TCC gates.
+# A TCC-protected EXEC target is verdict 2: this ONE unit is skipped and the install still exits 0
+# (a failed install is what killed `sync.sh`). Both halves are asserted — the SKIP and the exit code.
+ln -sfn "$PROBE_DEAD" "$PROBE_HOME/.pi/agent/scripts/farm-alias.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/farm-alias.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a TCC-protected exec target SKIPS the unit and does not fail the install (#3413 P1-A)"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c a farm entry that SYMLINKS into ~/Documents is named as TCC-protected (physical TARGET)"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and that unit is SKIPPED by name, not installed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and nothing is installed for it (an armed unit that exits 126 is the defect)"
+else
+    ok "§7c …and nothing is installed for it (an armed unit that exits 126 is the defect)"
+fi
+
+# (b) $HOME is reached through a symlink, target passed PHYSICALLY: only the physical ROOT matches.
+PROBE_LINK="$T/probe-homelink"; ln -sfn "$PROBE_HOME" "$PROBE_LINK"
+set +e
+OUT="$(probe_install "$PROBE_LINK" /bin/bash "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c a physical target under a SYMLINKED \$HOME is caught (physical ROOT)"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …by the same verdict-2 SKIP"
+
+# (c) `/usr/bin/env bash <script>`: the script is argv[2], and it is still a COMMAND, not data.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env bash "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c /usr/bin/env bash <TCC script> is an EXEC target (argv order, not an index)"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is not misfiled as data"
+
+# (c2) `/bin/bash -e <script>`: the script comes AFTER an option, and is still the executed command.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash -e "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c /bin/bash -e <TCC script> is an EXEC target (the prefix is found by locating the script)"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is not misfiled as data"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so nothing is installed for it"
+else
+    ok "§7c …so nothing is installed for it"
+fi
+
+# (c6) an interpreter option that takes a SEPARATE VALUE (`-o pipefail`, `-W error`): the value is
+# not the script. A "first non-option token is the script" rule files the real script as data and
+# arms the dead unit (review P3, cycle 2) — this is RED under that rule.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash -o pipefail "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c /bin/bash -o pipefail <TCC script> is an EXEC target (an option value is not the script)"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is not misfiled as data"
+
+# (c7) no INTERPRETER ALLOW-LIST: `…/python3.11` executes a script just like `…/python3` does, and a
+# name-based list misses it (review P3, cycle 2) — the classification does not depend on the name.
+mkdir -p "$PROBE_HOME/.pi/agent/bin"
+touch "$PROBE_HOME/.pi/agent/bin/python3.11"; chmod +x "$PROBE_HOME/.pi/agent/bin/python3.11"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_HOME/.pi/agent/bin/python3.11" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …/python3.11 <TCC script> is an EXEC target (no allow-list to fall outside of)"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is not misfiled as data"
+
+# (c8) `bash -- <script>` and `bash --noprofile <script>`: `--` is the POSIX END OF OPTIONS and
+# `--noprofile` takes no value, so in both the NEXT token is the script the shell will READ. Treating
+# "preceded by a `--…` token" as data armed the dead unit (review P2, cycle 3).
+for _probe_opt in -- --noprofile; do
+    set +e
+    OUT="$(probe_install "$PROBE_HOME" /bin/bash "$_probe_opt" "$PROBE_DEAD" 2>&1)"; RC=$?
+    set -e
+    assert_line "$OUT" '^    TCC-protected target: ' "§7c /bin/bash $_probe_opt <TCC script> is an EXEC target (no value is introduced)"
+    assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and $_probe_opt does not turn the script into data"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c …so nothing is installed for it ($_probe_opt)"
+    else
+        ok "§7c …so nothing is installed for it ($_probe_opt)"
+    fi
+done
+
+# (c9) the `--opt=<path>` form: the value is INSIDE the token, so a reader that only looks at
+# elements STARTING with "/" never sees it at all (review P3, cycle 3). `--repo=<TCC dir>` is data
+# (installs + WARN); `--script=<TCC script>` is EXECUTED code (SKIP) — the launcher opens it and
+# feeds it to `bash -s`, which is why it is not in the data class.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" "--repo=$PROBE_HOME/Documents/checkout" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c --repo=<TCC dir> installs (the = form carries the same value as the space form)"
+assert_contains "$OUT" "WARN TCC-protected data argument" "§7c …and the = form is classified as DATA, not invisible"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" "--script=$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c --script=<TCC script> is EXECUTED code, so it verdicts 2"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is not filed as data"
+
+# (c10) a SHEBANG SCRIPT at argv[0] inside a TCC root is DEAD: the kernel hands it to its interpreter,
+# so the binary that reads it is /bin/bash -- the one #427 measured is denied. Only a BINARY launcher
+# can hold the grant (#1311 measured the checkout interpreter). RED if the launcher arm stops checking
+# the magic bytes (review P2, round 4).
+PROBE_SH="$PROBE_HOME/Documents/checkout/shebang-probe.sh"
+printf '#!/bin/bash\nexit 0\n' > "$PROBE_SH"; chmod +x "$PROBE_SH"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_SH" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a shebang launcher inside a TCC root does not fail the install (one dead unit)"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c a SHEBANG SCRIPT at argv[0] in a TCC root is refused as a target (its interpreter is the denied bash)"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …and is NOT excused by the launcher arm (that arm is for BINARIES)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so it is not installed"
+else
+    ok "§7c …so it is not installed"
+fi
+
+# (c11) the launcher's grant is PER TREE: Documents and Desktop are separate Files-and-Folders grants,
+# so a TCC binary launcher under Documents does NOT vouch for a script under Desktop. RED if the check
+# compares a bare boolean instead of the matched root (review P3, round 4).
+mkdir -p "$PROBE_HOME/Desktop"
+PROBE_DESK="$PROBE_HOME/Desktop/desktop-dead.sh"
+printf 'exit 0\n' > "$PROBE_DESK"; chmod +x "$PROBE_DESK"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_HOME/Documents/checkout/.venv/bin/python" "$PROBE_DESK" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a TCC launcher does not fail the install for a target in ANOTHER TCC tree"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c a target in a DIFFERENT TCC tree is refused, not excused by the launcher"
+assert_not_contains "$OUT" "inside the SAME TCC tree" "§7c …and the message does not claim a shared tree"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so it is not installed"
+else
+    ok "§7c …so it is not installed"
+fi
+
+# (c12) the PlistBuddy FALLBACK reader (review P3, round 4: no test reached it on Linux, and it could
+# disagree with the python reader about which element is argv[0]). The seam makes it drivable: a
+# rendered plist python3 refuses (`<integer>not-a-number</integer>` is well-formed XML but not a plist
+# integer) is read by the shim, which prints PlistBuddy's own `Array { idx = val }` format.
+FAKE_PB="$T/bin/fake-plistbuddy"
+cat > "$FAKE_PB" <<'SHIM'
+#!/usr/bin/env bash
+# PlistBuddy-style output for ProgramArguments, WITHOUT python3 -- this reader is the fallback for a
+# host whose python3 cannot parse the plist. Real invocation is `-c CMD <plist>`.
+#
+# ⛔ THE COMMAND IS HONOURED, because real PlistBuddy is key-scoped: `Print :Program` on a plist with
+# no such key EXITS NON-ZERO (the installer reads that as "no Program", not "cannot read"). A shim
+# that printed the array for every command made `Program` look present on every fixture, so the
+# launcher rule could not be tested at all (fresh review of #3413, P1/P2).
+case "$2" in
+    *:ProgramArguments*)
+        echo "Array {"
+        awk '
+            /<key>ProgramArguments<\/key>/ { inside = 1; next }
+            inside && /<\/array>/          { inside = 0 }
+            inside && /<string>/            {
+                gsub(/.*<string>/, ""); gsub(/<\/string>.*/, "")
+                printf "    %d = %s\n", n++, $0
+                found = 1
+            }
+            END { if (!found) exit 1 }
+        ' "$3" || exit 1
+        echo "}"
+        ;;
+    *:Program*)
+        # The key and its <string> may share a LINE (`<key>Program</key><string>/x</string>`), so the
+        # whole file is matched as one buffer rather than walked line by line -- a line-walker that
+        # `next`s on the key line never sees a same-line value (measured: it made every fixture look
+        # like it had no Program at all).
+        awk '
+            { buf = buf $0 "\n" }
+            END {
+                if (match(buf, /<key>Program<\/key>[[:space:]]*<string>[^<]*<\/string>/)) {
+                    s = substr(buf, RSTART, RLENGTH)
+                    gsub(/.*<string>/, "", s); gsub(/<\/string>.*/, "", s)
+                    print s; found = 1
+                }
+                if (!found) exit 1
+            }
+        ' "$3" || exit 1
+        ;;
+    *)
+        exit 1
+        ;;
+esac
+SHIM
+chmod +x "$FAKE_PB"
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c the PlistBuddy fallback reader classifies argv[1] as an EXEC target (same rule as python)"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …and does not mistake a later element for argv[0]"
+assert_not_contains "$OUT" "cannot read ProgramArguments" "§7c …and an unparseable-by-python plist is still READ by the fallback, not refused"
+
+# (c12b) READER AGREEMENT on an EMPTY element: python counts every element (enumerate), so the element
+# AFTER an empty one is argv[1]; an awk that skipped the empty row without advancing would call it
+# argv[0] and excuse it as a LAUNCHER instead of verdicting it. Synthetic (a real plist has no empty
+# element) and driven through the same seam, because this is the only way the fallback reader is
+# exercised on Linux. RED if the awk stops advancing on an empty row.
+# ⛔ THE FIXTURE IS A BINARY-INSIDE-A-TCC-ROOT ON PURPOSE. An earlier version put the `#!/bin/bash`
+# script `$PROBE_DEAD` here, and BOTH roles (launcher / exec) land in a TCC refusal for a script, so the
+# assertions passed whether or not the row advanced — the test claimed a pin it did not have, and that
+# is what hid the fail-open it was written to catch (fresh review of #3413, round 3 P2). A BINARY holds
+# the grant (#1311), so the two roles give OPPOSITE outcomes: argv[1] → refusal, argv[0] → WARN+install.
+PROBE_ALIGN_BIN="$PROBE_HOME/Documents/checkout/.venv/bin/python"
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string></string>
+        <string>$PROBE_ALIGN_BIN</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_contains "$OUT" "TCC-protected target: $PROBE_ALIGN_BIN" "§7c an element AFTER an empty one is still argv[1] (the two readers advance alike)"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …so it is verdict-2, not excused as a launcher (a BINARY would have been WARNed+installed)"
+assert_not_contains "$OUT" "installed + loaded" "§7c …and the unit is not installed"
+
+# (c12c) an EMPTY element in the MIDDLE, which is the OTHER half of the same alignment rule: python takes
+# `prev = argv[i - 1]`, so after an empty element `prev` IS `""` and the next absolute path is EXEC, not
+# the value of the `--repo` before the gap. An awk that skipped the empty row without updating `prev`
+# still saw `--repo`, called that path `data`, and WARNed + INSTALLED a unit python refuses (fresh review
+# of #3413, round 4 P2). RED if the empty row leaves `prev` untouched.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>--repo</string>
+        <string></string>
+        <string>$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c an element after a MID-LIST empty one is EXEC, not the --repo value before the gap"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …so it is not WARNed as DATA (the empty row clears prev)"
+assert_not_contains "$OUT" "installed + loaded" "§7c …and the unit is not installed"
+
+# (c13) launchd's `Program` key IS the executed binary: `ProgramArguments[0]` is only argv[0]. A
+# `Program` pointing into a TCC tree is armed-and-dead even when every argument is farmed and readable
+# (review P3, round 5 — the reader modelled argv[0] only).
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>$PROBE_HOME/Documents/checkout/shebang-probe.sh</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+    </array>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c a Program= key pointing into a TCC root is the LAUNCHER and verdicts 2 (not invisible)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and the unit is not installed"
+else
+    ok "§7c …and the unit is not installed"
+fi
+
+# (c14) a `Program`-ONLY unit is a VALID launchd unit — it must not be refused for having no
+# ProgramArguments array (the mirror error of (c13)).
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+    <key>StartInterval</key><integer>3600</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a Program-ONLY unit installs (a valid launchd unit, not 'no ProgramArguments')"
+assert_not_contains "$OUT" "cannot read ProgramArguments" "§7c …and is not refused as unreadable"
+
+# (c15) an UNREADABLE launcher cannot hold a grant: "cannot read" must resolve to the refusal
+# direction, never to "is a binary" (review P2, round 5 — a chmod 000 re-opened the fail-open).
+PROBE_UNREADABLE="$PROBE_HOME/Documents/checkout/unreadable.sh"
+printf '#!/bin/bash\nexit 0\n' > "$PROBE_UNREADABLE"
+chmod 000 "$PROBE_UNREADABLE"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_UNREADABLE" 2>&1)"; RC=$?
+set -e
+# the launcher is INSIDE the tree, so the TCC verdict wins (skip, disarm) — what matters is that
+# "cannot read" is NOT read as "is a binary that holds the grant" (fresh review of #3413, P2).
+assert_eq "$RC" "0" "§7c an UNREADABLE launcher inside a TCC root is skipped, not failed (a FAIL would kill sync.sh)"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …verdict 2, never excused as a grant-holding binary"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …cannot-read is NOT treated as a binary grant"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and the unit is not installed"
+else
+    ok "§7c …and the unit is not installed"
+fi
+chmod 755 "$PROBE_UNREADABLE"
+
+# (c16) the same binary must be judged the same at argv[0] and after `env`: `env <TCC binary> <script>`
+# used to be SKIPped (and DISARMED) while the identical argv[0] form installed (review P3, round 5).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "$PROBE_HOME/Documents/checkout/.venv/bin/python" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env <TCC binary> <script> does not fail the install"
+assert_contains "$OUT" "WARN TCC-root launcher" "§7c …because env's program IS the launcher, and it is a binary that holds the grant"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is not skipped (same verdict as argv[0])"
+
+# (c17) a `#!` launcher whose INTERPRETER is a binary inside the tree DOES hold the grant (the
+# interpreter is what reads the file), so it installs with a WARN — the mirror of (c10). The message
+# must name the ROOT the grant came from, which is what makes "same tree" a comparison and not a
+# guess (review P3, rounds 4-5).
+PROBE_INTERP="$PROBE_HOME/Documents/checkout/via-python.sh"
+printf '#!%s\n' "$PROBE_HOME/Documents/checkout/.venv/bin/python" > "$PROBE_INTERP"
+chmod +x "$PROBE_INTERP"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_INTERP" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a shebang launcher whose interpreter is a TCC BINARY does not fail the install"
+assert_contains "$OUT" "RUNS a binary from inside $PROBE_HOME/Documents" "§7c …because the grant is the INTERPRETER's, named by root"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so it is not skipped"
+
+# (c18) `env -S '<cmd>'` / `env --split-string=<cmd>`: the value is a COMMAND LINE, so its absolute
+# tokens are executed and must be classified. Treating it as an option value installed a unit whose
+# script lives in a TCC tree with NO verdict at all (fresh review of #3413, P3).
+for _probe_s in -S --split-string; do
+    if [ "$_probe_s" = "-S" ]; then
+        set +e
+        OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+        set -e
+    else
+        set +e
+        OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "--split-string=/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+        set -e
+    fi
+    assert_line "$OUT" '^    TCC-protected target: ' "§7c env $_probe_s '<cmd with a TCC script>' is classified (the string is a command line, not an option value)"
+    # ⛔ AND THE RUN MUST NOT FAIL: the verdict is a SKIP, and a mis-read of the string shows up as a
+    # "broken target" FAIL (rc=1) that would take `sync.sh` with it. Without this the "nothing is
+    # installed" arm below is satisfied by the BUG (fresh review of #3413, P3).
+    assert_eq "$RC" "0" "§7c …and the install does not FAIL (the verdict is a SKIP, not a broken target)"
+    assert_not_contains "$OUT" "broken target" "§7c …with no bogus path emitted from the command string"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c …so nothing is installed for it ($_probe_s)"
+    else
+        ok "§7c …so nothing is installed for it ($_probe_s)"
+    fi
+done
+
+# (c19) a DIRECTORY at an executed position: existence alone armed it (`[ -e ]` is satisfied, and the
+# interpreter dies 126/127). This is the PR's own premise applied to every path, not only a TCC one.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c a DIRECTORY at an executed position fails the install (not a regular file)"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why"
+
+# (c19b) THE SAME SHAPE ON THE FALLBACK READER. `unknown` used to be excused when it was a directory —
+# written when the fallback could not name `--repo`/`--root` and a directory-valued `--repo` aborted the
+# install. Once those are `data`, the escape protects nothing and only ARMS a directory at an executed
+# position that the python reader refuses: measured on the previous head, py rc=1 / fallback rc=0 with
+# `installed + loaded`, then `bash` exits 126 EISDIR every tick. RED if the escape comes back.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c the FALLBACK reader also fails the install on a DIRECTORY at an executed position"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why, exactly as the python reader does"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and the unit is not armed"
+else
+    ok "§7c …and the unit is not armed"
+fi
+
+# (c20) a `chmod 000` executed target OUTSIDE any TCC root: readable-only-inside-TCC was the last
+# surviving form of "existence is not readability".
+PROBE_NOREAD="$PROBE_HOME/.pi/agent/scripts/noread.sh"
+printf '#!/bin/bash\nexit 0\n' > "$PROBE_NOREAD"; chmod 000 "$PROBE_NOREAD"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_NOREAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c an unreadable executed target OUTSIDE a TCC root fails the install"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …so 'existence is not readability' holds for every path"
+chmod 755 "$PROBE_NOREAD"
+
+# (c21) a symlink that lives under a TCC root but RESOLVES OUTSIDE it is READABLE, so it must install —
+# matching the literal spelling as well as the physical one skipped AND DISARMED a unit that starts
+# (fresh review of #3413, P2).
+mkstub "$PROBE_HOME/.pi/agent/scripts/live-outside.sh"
+ln -sfn "$PROBE_HOME/.pi/agent/scripts/live-outside.sh" "$PROBE_HOME/Documents/checkout/alias-out.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/Documents/checkout/alias-out.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a \$HOME/Documents symlink that RESOLVES outside the tree is readable and installs"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …it is NOT skipped (matching the literal spelling disarmed a working unit)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+
+# (c22) the PlistBuddy FALLBACK cannot know roles, so it must not claim `exec` for everything: a
+# DIRECTORY-valued `--repo` is legitimate, and calling it an unreadable executed target aborted the
+# whole install on a host whose python3 cannot parse the plist (fresh review of #3413, P2).
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+        <string>--repo</string>
+        <string>$PROBE_HOME/.pi/agent/scripts</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback reader does not FAIL on a DIRECTORY-valued --repo (role is unknown, not exec)"
+assert_not_contains "$OUT" "unreadable or not a regular file" "§7c …so no false 'unreadable executed target'"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit installs"
+else
+    bad "§7c …and the unit installs"
+fi
+
+# (c22b) READER AGREEMENT on the OTHER role the fallback can and must derive: the VALUE of a `--repo` /
+# `--root` (`DATA_OPTIONS`) sits in the element AFTER the option, so it is a PRECEDING-ELEMENT fact, not
+# python knowledge. Emitting `unknown` there made the two readers disagree on the same argv — python
+# emitted `data` (a TCC-root value WARNS and the unit installs), the fallback emitted `unknown`
+# (`tcc_exec=1` → verdict 2 → `launchctl bootout` + `rm -f` of an ALREADY-INSTALLED unit, exit 0). On the
+# documented default box that reached five shipped units, and it is reachable on any Mac whose
+# `/usr/bin/python3` shim is executable but exits non-zero (no Command Line Tools). RED if the awk
+# fallback loses its DATA_OPTIONS table (the same argv then goes back to SKIP + disarm).
+# The PREVIOUS install is left in place ON PURPOSE: the disarm is the failure mode, and only an
+# installed unit can show whether this run took it off the box.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR" "$PROBE_HOME/Documents/GitHub/tortoise"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+        <string>--repo</string>
+        <string>$PROBE_HOME/Documents/GitHub/tortoise</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+PROBE_TCC_DATA="$PROBE_HOME/Documents/GitHub/tortoise"
+printf 'PREVIOUS INSTALL\n' > "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the PlistBuddy fallback reads a TCC-root --repo value as DATA (agrees with the python reader)"
+assert_contains "$OUT" "WARN TCC-protected data argument: $PROBE_TCC_DATA" "§7c …so it WARNS like the python reader does"
+assert_not_contains "$OUT" "TCC-protected target: $PROBE_TCC_DATA" "§7c …and never as an EXEC refusal"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is not SKIPped"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ] &&
+   ! grep -q 'PREVIOUS INSTALL' "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"; then
+    ok "§7c …and the unit is REINSTALLED over the previous one, not disarmed and removed"
+else
+    bad "§7c …and the unit is REINSTALLED over the previous one, not disarmed and removed"
+fi
+
+# (c22c) THE LAUNCHER ROLE, which the fallback also derives from POSITION: `Program`, else element 0.
+# The two `com.tortoise.*` reapers exec `{{TORTOISE_REPO}}/.venv/bin/python`, a BINARY inside a TCC root,
+# and #1311 measured that such a binary DOES hold the grant. Emitting `unknown` for it made the fallback
+# SKIP-and-DISARM a working unit while python WARNed and installed — measured on this head (fresh review
+# of #3413, P1), same defect class as (c22b). RED if the `idx == 0` launcher rule is dropped.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+PROBE_TCC_BIN="$PROBE_HOME/Documents/checkout/.venv/bin/python"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PROBE_TCC_BIN</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+printf 'PREVIOUS INSTALL\n' > "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the PlistBuddy fallback derives the LAUNCHER role from argv[0] (a TCC-root binary holds a grant)"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so it WARNS like the python reader instead of refusing"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and the reaper is not SKIPped"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ] &&
+   ! grep -q 'PREVIOUS INSTALL' "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"; then
+    ok "§7c …and the unit is REINSTALLED over the previously installed one, not disarmed and removed"
+else
+    bad "§7c …and the unit is REINSTALLED over the previously installed one, not disarmed and removed"
+fi
+
+# (c22d) `Program`-ONLY unit: launchd execs the `Program` key and there is no argument array at all.
+# The python reader accepts it (`argv = []`, the absolute `Program` is the launcher); the fallback used
+# to give up with "cannot read ProgramArguments" — verdict 1, which FAILS the whole install (fresh
+# review of #3413, P2). RED if `Print :Program` is dropped or an absent array stops being legal.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback reads the Program key, so a Program-only unit installs instead of FAILing"
+assert_not_contains "$OUT" "cannot read ProgramArguments" "§7c …and an absent ProgramArguments array is not 'cannot read'"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the Program-only unit is installed"
+else
+    bad "§7c …and the Program-only unit is installed"
+fi
+
+# (c22e) THE JOINED `--opt=<value>` SPELLING carries its value INSIDE the token, and the fallback used
+# to drop it silently — a `--script=<TCC>` then installed armed-and-dead with NO verdict at all, while
+# python split it and refused. RED if the `index(line, "=")` split is dropped.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>--script=$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback splits the JOINED --opt=value spelling (verdict 2 is a skip, not a failed install)"
+assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c …so a --script=<TCC> gets a verdict at all"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and the unit is SKIPPED loudly"
+
+# (c22f) `Program` WINS, so `ProgramArguments[0]` is ONLY argv[0] and carries no verdict — including a
+# `--script=<TCC>` at that position, which python IGNORES (index 0 is in its `skipped` set). The joined
+# `--opt=` branch used to run BEFORE that skip, so the fallback emitted `exec` for an element python
+# never reads and SKIPped (and disarmed) a unit python installs (fresh review of #3413, round 3 P2).
+# A false SKIP rather than a fail-open, but still a reader disagreement in the new code.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>Program</key><string>/bin/bash</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>--script=$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the fallback skips element 0 when Program wins (agrees with the python reader)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so a --script=<TCC> at argv[0] under Program does not skip the unit"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit installs, as it does on the python path"
+else
+    bad "§7c …and the unit installs, as it does on the python path"
+fi
+
+# (c22k) `argv[0]` IS NEVER AN OPTION — in EITHER reader, in BOTH `Program` shapes. With `Program` set,
+# `ProgramArguments[0]` is only the argv[0] NAME launchd passes, and `--repo` is a legal name; without
+# `Program` it is a relative program name. Neither is an option, so neither may supply the `prev`
+# option-context for the element AFTER it. Both readers took `prev = argv[i - 1]` UNCONDITIONALLY, so an
+# argv[0] of `--repo` made the REAL argument at index 1 — an EXECUTED TCC-tree script — read as that
+# option's VALUE: `data` → WARN → INSTALL, i.e. the armed-and-dead unit this whole change exists to
+# remove. MEASURED both directions: `Program=/bin/bash` + `(--repo <TCC script>)` went verdict 2 →
+# verdict 0 (python AND awk — they SHARED the rule, so no differential case could see it).
+# No shipped template carries a `Program` key, so this is a latent hole a future template can walk into
+# (fresh review of #3413, round 10 P2). RED if either reader loses the exemption: the python arm pins
+# `i >= 2`, the `Program` arm pins awk `idx == 0 && prog != ""` → `prev = ""`, and the noprogram arm
+# pins the fallback's bottom `prev = (idx == 0) ? "" : line` (which is also what keeps the two readers
+# in AGREEMENT on the noprogram shape: python's `i >= 2` exempts the same element).
+for _reader in python fallback; do
+  for _shape in program noprogram; do
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    if [ "$_reader" = python ]; then _interval='<integer>300</integer>'
+    else _interval='<integer>not-a-number</integer>'; fi
+    if [ "$_shape" = program ]; then _progkey='    <key>Program</key><string>/bin/bash</string>'
+    else _progkey=''; fi
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+$_progkey
+    <key>ProgramArguments</key>
+    <array>
+        <string>--repo</string>
+        <string>$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key>$_interval
+</dict>
+</plist>
+PLIST
+    rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    set +e
+    OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+            TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+            INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+            unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+            bash "$INSTALLER" 2>&1 ) )"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§7c ($_reader/$_shape) a --repo argv[0] does not turn the real argv[1] into DATA"
+    assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c ($_reader/$_shape) …the EXECUTED argument is verdicted as a TARGET"
+    assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c ($_reader/$_shape) …and never as the argv[0] option data value"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c ($_reader/$_shape) …so the unit is not left armed on the box"
+    else
+        ok "§7c ($_reader/$_shape) …so the unit is not left armed on the box"
+    fi
+  done
+done
+
+# A helper for the fallback-arm cases below: the same probe plist as `_probe_install`, but with an
+# unparseable `StartInterval` (so python3 refuses and the PlistBuddy seam is taken) and with the seam
+# pinned. Kept next to its users rather than in the shared helper block, which every OTHER §7c case
+# drives through the python reader on purpose.
+probe_install_fallback() { # <home> <program-argument>... -> installer stdout+stderr through the seam
+    local home="$1" a body=""; shift
+    for a in "$@"; do body="$body        <string>$a</string>"$'\n'; done
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+$body    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+    rm -f "$home/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    ( export HOME="$home"
+      export PATH="$T/bin:$PATH"
+      export FAKE_LAUNCHCTL_LOG="$LOG"
+      export TEMPLATES_DIR="$PROBE_DIR"
+      export AGENTS_DIR="$home/Library/LaunchAgents"
+      export INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB"
+      export ELDATO_ALLOW_TEST_HOME=1
+      unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+      bash "$INSTALLER" 2>&1 )
+}
+
+# (c22g) THE `env` HOP ON THE FALLBACK READER. `env` execs its first POSITIONAL, and `-S` /
+# `--split-string` carries a WHOLE COMMAND LINE inside one element, so neither is a path. Without the
+# mirror the fallback had three divergent forms (fresh review of #3413, round 6 P2):
+#   `-S "<ok cmd>"`            → the string became ONE path → "broken target" → verdict 1: the WHOLE
+#                                install aborted, where python installs;
+#   `-S "<cmd with TCC>"`      → same abort, where python SKIPs that one unit;
+#   `-S<joined>` / `--split-string=<cmd>` → the element starts with `-S`, is not absolute, and got NO
+#                                verdict at all → the unit installed ARMED AND DEAD.
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: env -S with a readable command line INSTALLS (the string is not one path)"
+assert_not_contains "$OUT" "broken target" "§7c …so the whole string is not filed as a single target"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c fallback: env -S with a TCC-tree script in the string is VERDICTED, not aborted"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and that one unit is SKIPPED, as the python reader does"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "-S/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: the JOINED -S<cmd> spelling gets a verdict (it used to get none)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and the unit is not left armed"
+else
+    ok "§7c …and the unit is not left armed"
+fi
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env "--split-string=/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c fallback: --split-string=<cmd> is split, not dropped"
+
+# (c22i) env OPTIONS THAT TAKE A VALUE (`-u NAME`, `-C DIR`, `-P DIR`, `--block-signal SIG`, …) in the
+# SPACE form. Skipping only the OPTION left its VALUE as the first positional, so the VALUE was promoted
+# to launcher and the real program was classified as a TARGET: `env -u PYTHONPATH <TCC venv python>
+# <script>` went from verdict 0 to verdict 2, and `install_job` answers 2 with `launchctl bootout` +
+# `rm -f` of an INSTALLED, grant-holding unit (fresh review of #3413, round 8 P2). Both readers carried
+# the same defect, so no differential test could see it — hence a case per reader.
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -u PYTHONPATH "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: env -u NAME consumes its VALUE, so the real program is still the launcher"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and the program is a LAUNCHER, not a target"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the reaper is not skipped and disarmed"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -u PYTHONPATH "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -u NAME consumes its VALUE too (the two agree)"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …and promotes the program the same way"
+
+# (c22j) THE VALUE OF A REQUIRED-VALUE OPTION MUST ALSO BE **SKIPPED**, not just dropped from the scan:
+# the emission loop re-read `/tmp` as a target, so `env -C /tmp /bin/bash <farm>` was verdict 1 — the
+# WHOLE install aborted — and a TCC-root value was SKIPped + DISARMED, while the reader that really
+# drops it installed. Same for the JOINED spelling, which the `--opt=<value>` arm split into
+# `exec /tmp`. And the GNU signal options take an OPTIONAL argument, so listing them consumed the
+# PROGRAM instead (fresh review of #3413, round 9 P1/P1/P2 — three shapes, one table).
+PROBE_FARM="$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -C /tmp /bin/bash "$PROBE_FARM" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -C DIR consumes the DIRECTORY, which is not a target"
+assert_not_contains "$OUT" "unreadable or not a regular file: /tmp" "§7c …so the option value is not verdict-ed as an executed target"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env --chdir=/tmp /bin/bash "$PROBE_FARM" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: the JOINED --chdir=<dir> spelling is skipped, not split into exec <dir>"
+# The signal options take an OPTIONAL argument, so the PROGRAM follows directly. The discriminator is
+# WHICH token is promoted to launcher: the binary, or (buggy) the script after it.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env --ignore-signal "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: --ignore-signal takes an OPTIONAL argument, so the PROGRAM is not swallowed"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …the BINARY is the promoted launcher, not the script after it"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env --ignore-signal "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: --ignore-signal does not swallow the program either"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …same launcher on both readers"
+assert_contains "$OUT" "installed + loaded" "§7c …and the unit installs"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "-u PYTHONPATH $PROBE_TCC_BIN $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c python reader: env -S honours a required-value option INSIDE the string"
+assert_contains "$OUT" "WARN TCC-root launcher: $PROBE_TCC_BIN" "§7c …so the value is not promoted to launcher inside -S"
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" /usr/bin/env -S "-u PYTHONPATH $PROBE_TCC_BIN $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: same for the -S form (the two readers agree)"
+
+# (c22h) THE GRANT APPLIES TO THE `unknown` ROLE TOO. `[<TCC-root BINARY>, <script in the SAME TCC
+# root>]` is what the two `com.tortoise.*` reapers render whenever the farmed entry resolves into the
+# tree: the launcher is a BINARY, which #1311 measured DOES hold the grant for that tree, so the
+# python reader WARNs and INSTALLS. The `unknown` arm set `tcc_exec=1` without consulting `$grants` —
+# which the fallback now populates, because it derives the launcher role — so the same unit was
+# SKIPped AND DISARMED there: a working unit silently removed (fresh review of #3413, round 7 P2).
+set +e
+OUT="$(probe_install_fallback "$PROBE_HOME" "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c fallback: an executed target in the launcher's OWN TCC tree WARNS (the binary holds the grant)"
+assert_contains "$OUT" "WARN TCC-protected target: $PROBE_DEAD" "§7c …and says it is the same tree, as the python reader does"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the reaper is not skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit is installed"
+else
+    bad "§7c …and the unit is installed"
+fi
+
+# (c22h2) ⛔ THE GRANT PROVES READABILITY, NOT THAT THE ARGUMENT IS USABLE — the other half of (c22h).
+# `$grants` says the launcher can READ the tree; it says NOTHING about whether the value handed on is a
+# file. `--script <DIR>` in the launcher's OWN TCC tree is a KNOWN-executed target, and `bash <dir>` is
+# 126 EISDIR on every tick whatever tree it lives in — yet it installed as `installed + loaded` with only
+# a WARN. That is the armed-and-dead state this change exists to remove, on the one branch that ARMS the
+# unit; the remedy (a re-farm, a chmod) IS an install step, so it FAILS, which is verdict 1's own
+# definition and the same call the `launcher` arm made for the x bit in round 9. BOTH READERS, because
+# python derives `exec` for this value and the fallback derives `unknown`, so a predicate on one arm only
+# is a reader divergence (fresh review of #3413, round 10 P2).
+PROBE_TCC_DIR="$PROBE_HOME/Documents/checkout/scripts/a-directory"
+rm -rf "$PROBE_TCC_DIR"; mkdir -p "$PROBE_TCC_DIR"
+PROBE_TCC_EMPTY="$PROBE_HOME/Documents/checkout/scripts/tcc-empty.sh"
+: > "$PROBE_TCC_EMPTY"; chmod +x "$PROBE_TCC_EMPTY"
+for _probe_shape in "$PROBE_TCC_DIR" "$PROBE_TCC_EMPTY"; do
+    _probe_shape_name="$( [ -d "$_probe_shape" ] && echo DIRECTORY || echo 0-byte )"
+    set +e
+    OUT="$(probe_install "$PROBE_HOME" "$PROBE_TCC_BIN" --script "$_probe_shape" 2>&1)"; RC=$?
+    set -e
+    assert_eq "$RC" "1" "§7c python reader: a $_probe_shape_name executed target in the launcher's OWN TCC tree FAILS the install"
+    assert_contains "$OUT" "unreadable or not a regular file: $_probe_shape" "§7c …and names it, instead of WARNing and arming a dead unit"
+    set +e
+    OUT="$(probe_install_fallback "$PROBE_HOME" "$PROBE_TCC_BIN" --script "$_probe_shape" 2>&1)"; RC=$?
+    set -e
+    assert_eq "$RC" "1" "§7c fallback: the same verdict for a $_probe_shape_name target in the granted tree"
+    assert_contains "$OUT" "unreadable or not a regular file: $_probe_shape" "§7c …so the two readers still agree"
+done
+# POSITIVE CONTROL — the arm must not become a blanket refusal of every same-tree target: a REAL script
+# there is exactly what (c22h) and the two `com.tortoise.*` reapers are, and it must still install.
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_TCC_BIN" --script "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: a REAL script in the launcher's OWN TCC tree still WARNS and installs"
+assert_contains "$OUT" "WARN TCC-protected target: $PROBE_DEAD" "§7c …because #1311 measured the launcher's binary holds that grant"
+rm -rf "$PROBE_TCC_DIR"
+
+# (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
+# together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
+mkdir -p "$PROBE_HOME/Documents/checkout/with space"
+printf 'exit 0\n' > "$PROBE_HOME/Documents/checkout/with space/tcc-dead.sh"
+chmod +x "$PROBE_HOME/Documents/checkout/with space/tcc-dead.sh"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "bash $PROBE_HOME/Documents/checkout/with\\ space/tcc-dead.sh" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c env -S keeps an ESCAPED space inside the path (env's own grammar) and still classifies the script"
+
+# (c24) a 0-BYTE executed target outside any TCC root: existence is not readability, and execve gives
+# ENOEXEC (126/127) — the class this change exists for, on the direction that is NOT about TCC.
+PROBE_EMPTY="$PROBE_HOME/.pi/agent/scripts/empty-target.sh"
+: > "$PROBE_EMPTY"; chmod +x "$PROBE_EMPTY"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_EMPTY" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c a 0-BYTE executed target fails the install (execve gives ENOEXEC)"
+assert_contains "$OUT" "unreadable or not a regular file" "§7c …and says why"
+
+# (c25) the LAUNCHER is `execve`d too, so the same file-type guarantee must apply to it — and it must
+# additionally be EXECUTABLE, because launchd hands this path to the kernel rather than to an
+# interpreter. Without this arm a `Program` that is a DIRECTORY, a 0-byte file, or a readable
+# non-executable file installed as `installed + loaded` and died 126/127 on every tick: the same
+# category-A false PASS, on the one argument class the TCC model was newly taught to read (review of
+# #3413, round 8 — measured on the previous head at rc=0 / `installed + loaded` for all four shapes).
+PROBE_LAUNCH_DIR="$PROBE_HOME/.pi/agent/scripts"   # a DIRECTORY: exists, but execve gives EACCES
+PROBE_LAUNCH_EMPTY="$PROBE_HOME/.pi/agent/scripts/empty-launcher"
+: > "$PROBE_LAUNCH_EMPTY"; chmod +x "$PROBE_LAUNCH_EMPTY"
+PROBE_LAUNCH_NOX="$PROBE_HOME/.pi/agent/scripts/noexec-launcher.sh"
+mkstub "$PROBE_LAUNCH_NOX"; chmod 644 "$PROBE_LAUNCH_NOX"
+for _probe_l in "$PROBE_LAUNCH_DIR" "$PROBE_LAUNCH_EMPTY" "$PROBE_LAUNCH_NOX"; do
+    set +e
+    OUT="$(probe_install_program "$PROBE_HOME" "$_probe_l" 2>&1)"; RC=$?
+    set -e
+    assert_eq "$RC" "1" "§7c a non-executable-file launcher FAILS the install ($(basename "$_probe_l"))"
+    assert_contains "$OUT" "unreadable or not an executable regular file" "§7c …and names the launcher, not a target (no verdict-2 skip)"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c …so it is NOT installed ($(basename "$_probe_l"))"
+    else
+        ok "§7c …so it is NOT installed ($(basename "$_probe_l"))"
+    fi
+done
+chmod 755 "$PROBE_LAUNCH_NOX"
+# POSITIVE CONTROL — the arm must not become a blanket refusal of every launcher.
+set +e
+OUT="$(probe_install_program "$PROBE_HOME" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: an EXECUTABLE regular-file launcher still installs"
+assert_not_contains "$OUT" "unreadable or not an executable regular file" "§7c …with no launcher complaint"
+
+# (c26) `env -S '<cmd>'` must classify with the SAME rules as the space form, in BOTH directions.
+# A bare `startswith("/")` test made the two disagree: `--script=<TCC>` got no verdict at all (the
+# unit installed — fail-open), and a `--repo <TCC>` value was filed as EXEC (the unit was skipped and
+# DISARMED, while the space form warns and installs — a false refusal of a runnable unit). Both
+# measured on the previous head against the space form (review of #3413, round 8).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "/bin/bash --script=$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '--script=<TCC>' does not fail the install"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …env -S '--script=<TCC>' is EXECUTED code, as in the space form (no longer invisible)"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is SKIPPED, not installed with no verdict"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and nothing is installed for it (the fail-open this closes)"
+else
+    ok "§7c …and nothing is installed for it (the fail-open this closes)"
+fi
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "/bin/bash $PROBE_HOME/.pi/agent/scripts/probe-ok.sh --repo $PROBE_HOME/Documents/checkout" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '--repo <TCC dir>' does not fail the install"
+assert_contains "$OUT" "WARN TCC-protected data argument" "§7c …env -S '--repo <TCC>' is DATA, as in the space form (not a false refusal)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so a runnable unit is NOT skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+
+# (c27) the executable-file requirement must hold INSIDE a TCC root too. It was enforced only in the
+# non-TCC arm, so a readable file with no x bit named by `Program` installed with a WARN whenever its
+# path happened to land in the tree — the same category-A false PASS, on the half of the branch the
+# round-8 fix did not reach. The x bit is a verdict-1 FAILURE in both arms, because the remedy (a
+# chmod, or a re-farm) is an install step (review of #3413, round 9).
+PROBE_TCC_NOEXEC="$PROBE_HOME/Documents/checkout/notes.txt"
+printf 'not a program\n' > "$PROBE_TCC_NOEXEC"; chmod 644 "$PROBE_TCC_NOEXEC"
+set +e
+OUT="$(probe_install_program "$PROBE_HOME" "$PROBE_TCC_NOEXEC" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c a non-executable launcher INSIDE a TCC root fails the install (not a WARN+install)"
+assert_contains "$OUT" "unreadable or not an executable regular file" "§7c …and names the x bit, not the TCC tree"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …and is not excused as a grant-holding binary"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so it is NOT installed (arming it is the false PASS)"
+else
+    ok "§7c …so it is NOT installed (arming it is the false PASS)"
+fi
+# …and the same rule at the INTERPRETER hop: a `#!` launcher that IS executable still cannot run if
+# the interpreter the kernel hands it to is not. `launcher_grant_root` requires the x bit per hop, so
+# this resolves to no grant → verdict 2 (skip + disarm), never a WARN+install.
+PROBE_TCC_INTERP_NX="$PROBE_HOME/Documents/checkout/.venv/bin/python-noexec"
+printf '\177ELF\002\001\001\000' > "$PROBE_TCC_INTERP_NX"; chmod 644 "$PROBE_TCC_INTERP_NX"
+PROBE_VIA_NX="$PROBE_HOME/Documents/checkout/via-noexec-interp.sh"
+printf '#!%s\n' "$PROBE_TCC_INTERP_NX" > "$PROBE_VIA_NX"; chmod +x "$PROBE_VIA_NX"
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_VIA_NX" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a launcher whose TCC INTERPRETER has no x bit does not fail the install (skip)"
+assert_not_contains "$OUT" "WARN TCC-root launcher" "§7c …a non-executable interpreter is NOT treated as a granting binary"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …so the unit is NOT installed (launchd would exit 126)"
+else
+    ok "§7c …so the unit is NOT installed (launchd would exit 126)"
+fi
+
+# (c28) `env -S` must promote env's FIRST POSITIONAL token to LAUNCHER, exactly as the space form
+# promotes argv[1]. Without it the two forms disagreed on a TCC binary launcher (SKIP+disarm vs
+# WARN+install) and on a non-executable program (installed vs refused) — the third rule the split
+# loop was missing (review of #3413, round 9).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "$PROBE_HOME/Documents/checkout/.venv/bin/python $PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env -S '<TCC binary> <script>' does not fail the install"
+assert_contains "$OUT" "WARN TCC-root launcher" "§7c …because the split string's program is the LAUNCHER, as in the space form"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so a runnable unit is not skipped and disarmed"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+PROBE_NOEXEC_PROG="$PROBE_HOME/.pi/agent/scripts/probe-noexec.sh"
+mkstub "$PROBE_NOEXEC_PROG"; chmod 644 "$PROBE_NOEXEC_PROG"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -S "$PROBE_NOEXEC_PROG --loop" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c env -S '<readable non-executable program>' fails the install (as the space form does)"
+assert_contains "$OUT" "unreadable or not an executable regular file" "§7c …because the promoted launcher is file-type checked"
+chmod 755 "$PROBE_NOEXEC_PROG"
+
+# (c29) getopt's JOINED spelling `-S'<cmd>'` is the same option as `-S '<cmd>'`. Unmatched, the string
+# fell into the generic option branch, was dropped, and the unit installed with NO verdict (review of
+# #3413, round 9).
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env "-S/bin/bash $PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c env '-S<cmd>' (joined) does not fail the install"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …and its command line IS classified, as in the two-token spelling"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is SKIPPED, not installed with no verdict"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and nothing is installed for it (the joined-spelling fail-open)"
+else
+    ok "§7c …and nothing is installed for it (the joined-spelling fail-open)"
+fi
+
+# (c4) `env -i bash <script>`: an option AND env's program hop both sit before the script.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /usr/bin/env -i bash "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_line "$OUT" '^    TCC-protected target: ' "§7c env -i bash <TCC script> is an EXEC target (the env program hop is skipped)"
+assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c …and is not misfiled as data"
+
+# (c5) a POSITIONAL TCC value that no long option introduced: the conservative direction is to treat
+# it as executed, so the unit is SKIPPED rather than armed. This is a deliberate cost, stated: the
+# guard cannot tell a positional value from an inline program's script, and arming a unit launchd
+# cannot start is the defect this exists for, so the doubt resolves to "do not install".
+printf 'data\n' > "$PROBE_HOME/Documents/checkout/positional-data.txt"
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash -c 'echo hi' "$PROBE_HOME/Documents/checkout/positional-data.txt" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a positional TCC value does not fail the install"
+assert_line "$OUT" '^    TCC-protected target: ' "§7c …and resolves to a SKIP, not an armed unit (doubt goes to do-not-install)"
+
+# (c3) the shipped reaper shape: the checkout's own interpreter at argv[0] (`{{TORTOISE_REPO}}` is
+# inside `~/Documents` on the documented box). #1311 MEASURED that interpreter runs from there
+# (WORKTREES=454 / GH=ok) and #427 measured that a launchd `bash` cannot READ such a path — TCC is
+# PER-BINARY. So the LAUNCHER is the discriminator: this unit INSTALLS with a loud WARN. It must not
+# be skipped, and it must not be disarmed: taking a working daily reaper off the box every sync would
+# be a worse defect than the one this guard fixes (review P2, cycle 3).
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_HOME/Documents/checkout/.venv/bin/python" "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" --repo "$PROBE_HOME/Documents/checkout" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a reaper-shaped unit (TCC launcher) does not fail the install"
+assert_contains "$OUT" "WARN TCC-root launcher" "§7c …and the TCC-root LAUNCHER is named (#1311 measured it holds the access)"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and the unit is NOT skipped (that would delete a working reaper)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and it really is installed"
+else
+    bad "§7c …and it really is installed"
+fi
+# (c3b) the LAUNCHER inside the tree AND the script inside it: the launcher reads the script itself
+# (pi-reap-worktrees-launchd.py pipes it to `bash -s` for exactly this reason), so it installs too.
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_HOME/Documents/checkout/.venv/bin/python" "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a TCC script under a TCC LAUNCHER installs (the launcher holds the read)"
+assert_contains "$OUT" "WARN TCC-protected target" "§7c …naming the target, as a WARN not a SKIP"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …and it is not skipped"
+
+# (a2) a SKIP must DISARM what an earlier run ARMED (review P2, cycle 2). REACHABLE BY CONSTRUCTION:
+# the box this PR measured was running the PREVIOUS installer, which armed worker-supply /
+# objective-reminder / controller-watchdog from `{{AGENT_INFRA_PATH}}` (inside ~/Documents) — they
+# stayed loaded and exited 126 for 7 hours. Any template edit that points a bash-launched script back
+# into the tree lands in that state, and returning before the install/remove path left it loaded while
+# the run said "nothing is installed for it". (The two `com.tortoise.*` reapers are NOT this case —
+# their launcher is a BINARY in the tree, which §7c (c3) pins as installed.)
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" 2>&1)"; RC=$?
+set -e
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c (a2) precondition: the unit is ARMED by a clean run"
+else
+    bad "§7c (a2) precondition: the unit is ARMED by a clean run"
+fi
+BOOTOUT_BEFORE="$(grep -c 'bootout.*com\.eldato\.tccprobe' "$LOG" || true)"
+set +e
+OUT="$(probe_install_keep_installed "$PROBE_HOME" /bin/bash "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c (a2) the TCC verdict still exits 0"
+assert_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c (a2) …and skips the unit"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c (a2) …and DISARMS the plist the previous run installed (it was left armed)"
+else
+    ok "§7c (a2) …and DISARMS the plist the previous run installed"
+fi
+assert_eq "$(grep -c 'bootout.*com\.eldato\.tccprobe' "$LOG" || true)" "$((BOOTOUT_BEFORE + 1))" "§7c (a2) …with a real launchctl bootout for that label (not just rm)"
+
+# (d) a DATA argument under a TCC root WARNS and the unit still installs — the #3413 regression.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh" --repo "$PROBE_HOME/Documents/checkout" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c a TCC-protected DATA argument does not refuse the install (--repo under ~/Documents is the documented default)"
+assert_contains "$OUT" "WARN TCC-protected data argument" "§7c the dead-work data argument is named loudly"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    ok "§7c …and the unit really was installed (the WARN was not folded into the refusal)"
+else
+    bad "§7c …and the unit really was installed (the WARN was not folded into the refusal)"
+fi
+
+# (g) VERDICT 1 WINS OVER VERDICT 2 (review P3, cycle 2): a MISSING target is fixable by re-running
+# setup.sh, so it must FAIL the install — never be absorbed into the permanent SKIP that a TCC
+# TARGET produces. Without this case, swapping the two returns leaves the whole suite green.
+set +e
+OUT="$(probe_install "$PROBE_HOME" /bin/bash "$PROBE_DEAD" --repo "$PROBE_HOME/does-not-exist" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c (g) a MISSING target FAILS the install even beside a TCC-protected target (verdict 1 wins)"
+assert_contains "$OUT" "FAIL com.eldato.tccprobe" "§7c (g) …reported as FAIL, not absorbed into a SKIP"
+
+# (e) a plist that cannot be READ is a refusal, not an empty target list (#1743 / review P2-E).
+# Both readers are defeated: this host may have python3 AND PlistBuddy, so the file is made
+# unparseable for BOTH by being plain text rather than by removing a reader.
+printf 'this is not a plist\n' > "$PROBE_DIR/com.eldato.tccprobe.plist"
+rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c an UNPARSEABLE plist refuses the install instead of verifying nothing (#1743)"
+assert_contains "$OUT" "cannot read ProgramArguments" "§7c the unreadable plist is named (not an empty pass)"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+    bad "§7c …and no unit was installed from it"
+else
+    ok "§7c …and no unit was installed from it"
+fi
+
+# (f) a ProgramArguments array with no ABSOLUTE entry verifies nothing → refusal, same rule.
+# This is the ITERATION-COUNT half: the feeder returns 0 on a readable plist that names no absolute
+# entry, so deleting the count gate is what this case catches (the unreadable case above is the
+# feeder's own return code).
+set +e
+OUT="$(probe_install "$PROBE_HOME" bash self-relative.sh 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "1" "§7c ProgramArguments with no absolute target refuses (nothing was verified)"
+assert_contains "$OUT" "no absolute ProgramArguments entry was verified" "§7c …and says so, rather than passing on an empty loop"
+
+# Restore the shared fixture: §8+ install through $TEMPLATES, not the probe dir, and $LOG keeps
+# growing for the bootstrap-count assertions.
+rm -rf "$PROBE_DIR"
+
 # Restore the farmed script so later tests install cleanly
 mkfakehome "$HOME1"
 
@@ -783,7 +2270,7 @@ echo "── 13. worktree-reaper installs under the TCC-holding interpreter (#13
 # that lets the template resolve and install.
 HOME3="$T/home3"; mkfakehome "$HOME3"
 mkdir -p "$HOME3/tortoise/.venv/bin" "$HOME3/tortoise/.git"
-touch "$HOME3/tortoise/.venv/bin/python"; chmod +x "$HOME3/tortoise/.venv/bin/python"
+mkstub "$HOME3/tortoise/.venv/bin/python"
 WT_INSTALLED="$HOME3/Library/LaunchAgents/com.tortoise.worktree-reaper.plist"
 (
     export HOME="$HOME3"
