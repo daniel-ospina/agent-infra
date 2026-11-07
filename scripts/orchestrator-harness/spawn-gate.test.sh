@@ -5944,12 +5944,27 @@ done
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
 # that does not exist, with this box's local witness removed so no fallback can answer either.
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
-rm -rf "$RREG/state/lanes"
+rm -rf "$RREG/state/lanes"; mkdir -p "$RREG/state/lanes"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+# ⛔ THE PROBE MUST CARRY THE FIXTURE'S OWN REGISTRY ENV, or it is not about this fixture at all. Run
+# with the ambient environment, `list` falls back to THIS BOX's write-through witness
+# (`$HOME/.pi/agent/state/lanes`) — a witness this suite does not own and cannot empty — and answers
+# exit 0 `source=local` for the SAME unreachable remote. MEASURED: 1,484 local records on this box made
+# the arm red here while it is green on a pristine one, which is the “a fixture that inherits ambient
+# state cannot make a claim about isolation” defect this suite records elsewhere (record-review.test.sh,
+# #3442). With the fixture's state root pinned, the documented answer for an unreachable remote with an
+# EMPTY local witness is exit 3 — `list` reporting “0 lanes” there is the false-clean #3382 invariant 1
+# forbids (“an empty local witness is NOT an empty fleet”), and that is what this half pins.
+unreachable="$(env LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+                   LANE_REGISTRY_GIT="$RREG/state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+                   python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json \
+                   2>"$RREG/state/probe.err" >"$RREG/state/probe.json"; echo "rc=$?")"
+probe_json="$(cat "$RREG/state/probe.json" 2>/dev/null || true)"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+ck "R4 …and the registry's own answer is UNMEASURED (readable=false), never a list of zero lanes" \
+   $(grep -qF '"readable": false' <<<"$probe_json" && grep -qF 'UNMEASURED(' <<<"$probe_json" && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo
