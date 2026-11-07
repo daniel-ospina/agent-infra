@@ -1034,7 +1034,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
     bad "the rendered unit's Environment=CELL_HOME='${home_val}' is not the cell home '${CELL_HOME}' — the pass would derive its base from a value the controller never read, so it pins a different record"; return 1
   fi
   # ⛔ THE ARTIFACT'S IDENTITY WAS THE ONE PROPERTY NOTHING ASSERTED. `print_unit` derives `User=` from
-  # the owner of `$CELL_HOME` `print_unit`'s `user="$(cell_home_owner)"`) because `User=root` was MEASURED to break the pin — this file's own
+  # the owner of `$CELL_HOME` (`print_unit`'s `user="$(cell_home_owner)"`) because `User=root` was MEASURED to break the pin; this file's own
   # comment quotes the fleet's drop-in: "running as root makes git refuse the fetch (dubious ownership) so
   # the unit could never pin anything" — but no rule read the value back off the rendered artifact, so a
   # template carrying `User=root`, or a second `User=` line (systemd is LAST-WINS for a single-valued
@@ -1097,7 +1097,7 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
         # `WorkingDirectory=`, just one syscall over (and `EnvironmentFile=` was the sibling this file
         # already refused). MEASURED rc=0 before this arm. The pass resolves its own layer instead.
         bad "the rendered unit declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant turns the pin into a unit that never began (the 200/CHDIR class); the pass resolves its own layer instead"; return 1 ;;
-      BindPaths|BindReadOnlyPaths|TemporaryFileSystem)
+      BindPaths|BindReadOnlyPaths|TemporaryFileSystem|MountImages|ExtensionImages|ExtensionDirectories)
         # ⛔ THE MOUNT-REDIRECTION MEMBERS OF THE SAME CLASS, WHICH THE ROOT-DIRECTORY ARM LEFT OPEN
         # (round-19 review, P1). `systemd.exec(5)`: `BindPaths=`/`BindReadOnlyPaths=` bind-mount a source
         # OVER a path in the unit's view before any line of the payload runs, and `TemporaryFileSystem=`
@@ -1109,7 +1109,14 @@ verify_unit() { # <rendered service> [expected ExecStart payload] — the proper
         # verification reads no mount at all, so nothing it approved survives the unit's own filesystem
         # view; grading the VALUE would mean re-implementing systemd's mount resolution, and the pin unit
         # needs no mounts of its own.
-        bad "the rendered unit declares ${_c}= — systemd mounts into the unit's filesystem view BEFORE the payload runs, so the ExecStart this verification read is not necessarily the file that executes (BindPaths=/BindReadOnlyPaths= can put different bytes over it; TemporaryFileSystem= can replace it with an empty tmpfs), and nothing here reads a mount; the pin unit needs no mounts of its own — remove the line"; return 1 ;;
+        # ⛔ AND THE OVERLAY MEMBERS (round-20 review, P2), the same class one layer down.
+        # `ExtensionImages=`/`ExtensionDirectories=` set up a read-only OverlayFS on top of `/usr/` and `/opt/`
+        # (`/etc/` for confext) — `systemd.exec(5)`. The payload lives under `$CELL_HOME` and is not reachable
+        # that way, but the INTERPRETER is: `ExecStart=` is `/bin/bash`, which on a merged-`/usr` host is
+        # `/usr/bin/bash`, so an extension image shadows the shell that executes the verified pass. Different
+        # bytes still reach the exec, so it is closed here rather than argued about; MEASURED accepted (rc=0)
+        # by `systemd-analyze verify` on a plain oneshot. The pin unit needs no mounts of any kind.
+        bad "the rendered unit declares ${_c}= — systemd mounts into the unit's filesystem view BEFORE the payload runs, so the ExecStart this verification read is not necessarily the file that executes (BindPaths=/BindReadOnlyPaths= can put different bytes over it; TemporaryFileSystem= can replace it with an empty tmpfs; ExtensionImages=/ExtensionDirectories= overlay /usr and can shadow the INTERPRETER), and nothing here reads a mount; the pin unit needs no mounts of its own — remove the line"; return 1 ;;
     esac
   done
   # ⛔ NOTHING HERE IS GREEN ON A READING IT COULD NOT TAKE. 0 is ALWAYS a successful exit for a unit
@@ -1282,7 +1289,7 @@ verify_timer() { # <rendered timer> [expected Unit= target]
   for _c in $(directive_names "$body"); do
     case "$_c" in
       Condition*) bad "the rendered timer declares ${_c}= — a failed condition SKIPS the timer and leaves it GREEN, so the pin never runs and nothing reds; a missing layer must be a RED payload exit, not a skip"; return 1 ;;
-      RootDirectory|RootImage|WorkingDirectory)
+      RootDirectory|RootImage|WorkingDirectory|BindPaths|BindReadOnlyPaths|TemporaryFileSystem|MountImages|ExtensionImages|ExtensionDirectories)
         # ⛔ THE ARM IS RIGHT AND THE REASON THIS FILE GAVE FOR IT WAS FALSE — corrected rather than removed,
         # because a directive a render BELIEVES it configured is the false-PASS class this whole file is
         # about, whether or not systemd acts on it. The old text cited `EXIT_CHDIR / 203`, which is a
@@ -1703,7 +1710,7 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
       # times, and a new service-only arm added later is covered without another review.
       if [ "$is_timer" -eq 1 ]; then
         case "$_c" in
-          WorkingDirectory|RootDirectory|RootImage|Exec*|SuccessExitStatus|DynamicUser|User|Environment|EnvironmentFile|UnsetEnvironment|PassEnvironment)
+          WorkingDirectory|RootDirectory|RootImage|BindPaths|BindReadOnlyPaths|TemporaryFileSystem|MountImages|ExtensionImages|ExtensionDirectories|Exec*|SuccessExitStatus|DynamicUser|User|Environment|EnvironmentFile|UnsetEnvironment|PassEnvironment)
             bad "the installed drop-in ${f} declares ${_c}= in a TIMER drop-in — that directive is [Service]-only, so systemd IGNORES it in a [Timer] section (measured: \"Unknown key name '…' in section 'Timer', ignoring.\") and no value of it can change what the pin does; the line has NO effect and reads as configuration the manager discards — remove ${f}"; return 1 ;;
         esac
       fi
@@ -1717,7 +1724,12 @@ verify_dropin_file() { # <drop-in .conf> [unit-name] — one file's rules; split
           # before the payload runs. Refused in the drop-in path too, because a drop-in is merged OVER the
           # unit and an operator reading the unit will never see it.
           bad "the installed drop-in ${f} declares ${_c}= — systemd enters that root BEFORE the payload runs, so a path that is not a live-cell invariant is a unit that never began; remove ${f}"; return 1 ;;
-        BindPaths|BindReadOnlyPaths|TemporaryFileSystem)
+        ExtensionImages|ExtensionDirectories)
+          # Same class as the bind members below, one layer down: the overlay lands on `/usr/`+`/opt/`
+          # (`/etc/` for confext), so it shadows the INTERPRETER (`/bin/bash` → `/usr/bin/bash` on a merged
+          # host) rather than the payload itself — different bytes still reach the exec, so it is refused.
+          bad "the installed drop-in ${f} declares ${_c}= — systemd overlays that image/directory over the unit's /usr and /opt view BEFORE the payload runs, so it can shadow the INTERPRETER that executes the verified pass (/bin/bash is /usr/bin/bash on a merged host); the pin unit needs no extension images — remove ${f}"; return 1 ;;
+        BindPaths|BindReadOnlyPaths|TemporaryFileSystem|MountImages)
           # ⛔ THE SAME MOUNT-REDIRECTION CLASS AS `RootDirectory=`, ONE STEP CLOSER (round-19 review, P1).
           # `systemd.exec(5)` mounts these into the unit's own view before the payload runs, so a drop-in can
           # bind different bytes over the exact `ExecStart` path the rendered artifact was verified against
