@@ -761,10 +761,11 @@ fi
 DUPKEY_LEAK="$(REPO_SET_FILE="$CONF" bash -c '. "$1" >/dev/null 2>&1; repo_set_parse >/dev/null 2>&1; repo_set_check >/dev/null 2>&1; printf "%s" "${_dupkey-UNSET}"' _ "$READER")"
 ck "m16 sourcing the reader and running parse+check leaves no \`_dupkey\` in the caller's shell" \
    '[ "$DUPKEY_LEAK" = UNSET ]'
-# Round 9, P2: `_rs_norm_path` is no longer on the shipped path, but the non-vacuity mutation (m10)
-# expresses the round-6 fallback with it. Pin its presence so a future cleanup cannot quietly turn
-# m11/m12 into an assertion about an undefined command — the "mutation that cannot apply" trap.
-ck "m17 \`_rs_norm_path\` is still defined (the m10 mutation depends on it; deleting it must be deliberate)" \
+# Round 10, P2: `_rs_norm_path` is the state arm's SPELLING axis (it is on the shipped path), AND the
+# non-vacuity mutation (m10) expresses the round-6 fallback with it. Pin its presence so a future
+# cleanup cannot quietly remove the spelling axis or turn m11/m12 into an assertion about an
+# undefined command — the "mutation that cannot apply" trap.
+ck "m17 \`_rs_norm_path\` is still defined (the spelling axis and the m10 mutation both depend on it)" \
    '[ -n "$(rs_call _rs_norm_path //a/./b/)" ]'
 # Round 10, P2: the round-9 remedy dropped an entry whose IDENTITY was unprovable, and that ALSO
 # discarded the class which needs NO filesystem at all: two spellings identical after folding `//`,

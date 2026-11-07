@@ -123,13 +123,24 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 # repeated separators collapsed, `.` components dropped, trailing `/` removed. It is not a realpath
 # (no symlink or `..` resolution), and it does not fold case.
 #
-# ⛔ IT IS NO LONGER ON THE SHIPPED PATH — DO NOT DELETE IT ON THAT BASIS (round 9, P2). `_rs_state_key`
-# replaced its last caller when the state key became an identity walk (it must fold `..` and follow
-# symlinks, which this cannot). It is RETAINED because the suite's non-vacuity mutation expresses the
-# ROUND-6 fallback with it (`repo-set.test.sh`'s injected `_rs_state_key` body), so removing it turns
-# m11/m12 into an assertion about an undefined command — a mutation that cannot apply, which is the
-# "proves nothing" trap those arms exist to avoid. It is also the documented spelling primitive for
-# any future consumer that needs a path normalised without touching the filesystem.
+# ⛔ THIS IS LOAD-BEARING — IT IS THE STATE ARM'S SPELLING AXIS (round 10). Round 9's note in this
+# spot said it was "no longer on the shipped path"; that was true when written and became FALSE when
+# the shared-state guard grew a second axis. `repo_set_check` calls it for the SPELLING check, so two
+# state dirs identical after folding `//`, `.`, a trailing `/` (and case, via `_rs_lower`) still refuse
+# when an unenterable ancestor leaves the IDENTITY unprovable. Deleting this as "the unused spelling
+# primitive" would remove the mechanism m18/m19 pin and re-open the false PASS those arms cover.
+#
+# ⛔ IT IS NOT THE IDENTITY AUTHORITY — do not promote it to one. It deliberately does NOT fold `..`
+# and never touches the filesystem (that is what makes it usable for a dir that does not exist yet),
+# so `_rs_state_key` stays the single authority for `..`, symlinks, and a case-differing spelling of a
+# directory this process CAN enter. The two are complementary by design: SPELLING is proof on its own
+# (identical text is one path, whatever the permission bits), IDENTITY is proof only when resolvable.
+# A textual `..` fold here would be a NEW false pass — `/a/link/../b` with `/a/link -> /c` is
+# physically `/b`, and text would call it `/a/b`.
+#
+# It is ALSO used by the suite's non-vacuity mutation, which expresses the ROUND-6 fallback with it, so
+# removing it would additionally turn m11/m12 into assertions about an undefined command — a mutation
+# that cannot apply, which is the "proves nothing" trap those arms exist to avoid.
 #
 # ⛔ WHY IT IS NEEDED, MEASURED IN REVIEW ROUND 3 (P2): `/srv/state` and `/srv//state` and
 # `/srv/./state` are ONE DIRECTORY. The shared-state guard compared raw spellings, so a set that named
