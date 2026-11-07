@@ -563,10 +563,11 @@ graph_credential_note() {
 }
 
 # verify_graph_mcp — checks the config this script INSTALLS ($DEST/.mcp.json), on the artifact.
-# ⛔ It does NOT claim to describe what pi resolves: mcp-client takes the FIRST `.mcp.json` found
-# walking up from the lane's cwd (then falls back to $DEST/.mcp.json), so a lane working inside a
-# repo that carries its own `.mcp.json` uses THAT file. This is why the tracked repo configs must
-# carry the hosted entry too — a stale repo-local copy wins over a correctly installed base.
+# ⛔ It does NOT claim to describe what pi resolves: mcp-client MERGES $DEST/.mcp.json (the base)
+# with the nearest `.mcp.json` walking up from the lane's cwd, and the REPO entry wins a name
+# collision (#3612). So a lane working inside a repo that carries its own `.mcp.json` uses THAT
+# entry for a shared name — which is why the tracked repo configs must carry the hosted entry too:
+# a stale repo-local copy still shadows a correctly installed base.
 verify_graph_mcp() {
   local f="$DEST/.mcp.json"
   if [ ! -f "$f" ]; then

@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv } from "./index.js";
+import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, McpServerManager, expandEnvVars, buildMcpServerEnv } from "./index.js";
 
 let passed = 0;
 let failed = 0;
@@ -176,9 +176,9 @@ await test("parses as valid config with the expected server set", () => {
   // stdio is caught by CI rather than by a fleet of lanes writing GRAPH-UNREACHABLE.
   equal(tortoise.type, "http", "tortoise is the hosted HTTP server");
   equal(tortoise.url, "https://api.premiselabs.co/mcp/", "tortoise points at the hosted endpoint");
-  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS for every agent-infra lane: mcp-client takes
-  // the FIRST `.mcp.json` walking up from the lane's cwd (then falls back to ~/.pi/agent/.mcp.json),
-  // so this file decides what an agent-infra lane connects to. Its own `_comment` claims a
+  // ⛔ THE REPO'S OWN `.mcp.json` IS THE COPY THAT WINS for every agent-infra lane: mcp-client merges
+  // the hub base config with the repo's own and the REPO entry wins a name collision (#3612), so this
+  // file decides what an agent-infra lane connects to for that name. Its own `_comment` claims a
   // byte-identical shape to the template's — and NOTHING checked that, so a revert here would
   // return agent-infra lanes to the legacy server while `cell-install --verify` still certified the
   // base config. Asserted for the fields a lane actually needs.
@@ -360,6 +360,82 @@ await test("neither layer → both null (nothing invented)", () => {
     if (origHome === undefined) delete process.env.HOME;
     else process.env.HOME = origHome;
   }
+});
+
+
+// ⛔ THE RUNTIME PATH, NOT JUST THE PARTS. `connectAllLayers` is the ONLY code that applies the merge
+// at run time, and these two arms are what makes the PR's "pinned by a test" claim true: without them a
+// revert to repo-only (the very bug #3612 exists to fix) and a removal of the unreadable-layer skip both
+// left the suite green — measured by the reviewer.
+class RecordingManager extends McpServerManager {
+  public attempted: string[] = [];
+  public configs: Record<string, unknown> = {};
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  protected async connectServer(name: string, cfg: any): Promise<void> {
+    this.attempted.push(name);
+    this.configs[name] = cfg;
+  }
+}
+
+function layersDir(prefix: string): { dir: string; basePath: string; repoPath: string } {
+  const dir = tempDir(prefix);
+  const basePath = join(dir, "base.json");
+  const repoPath = join(dir, "repo.json");
+  return { dir, basePath, repoPath };
+}
+
+await test("connectAllLayers merges BOTH layers and the repo wins a collision", async () => {
+  const { basePath, repoPath } = layersDir("mcp-layers-runtime-");
+  writeFileSync(basePath, JSON.stringify({ mcpServers: { shared: { command: "base-cmd" }, onlyBase: { command: "b" } } }));
+  writeFileSync(repoPath, JSON.stringify({ mcpServers: { shared: { command: "repo-cmd" } } }));
+
+  const mgr = new RecordingManager();
+  const savedAllow = process.env.PI_MCP_SERVERS;
+  delete process.env.PI_MCP_SERVERS;          // a lane exports `none`, which would empty the allowlist
+  try {
+    await mgr.connectAllLayers({ base: basePath, repo: repoPath });
+  } finally {
+    if (savedAllow === undefined) delete process.env.PI_MCP_SERVERS;
+    else process.env.PI_MCP_SERVERS = savedAllow;
+  }
+
+  ok(mgr.attempted.includes("onlyBase"), "the BASE's server is attempted — this is the fix");
+  equal(mgr.configs.shared?.command, "repo-cmd", "and the REPO's entry wins the collision");
+  equal(mgr.attempted.length, 2, "no duplicates, nothing invented");
+});
+
+await test("an UNREADABLE layer is skipped without losing the other one", async () => {
+  const { basePath, repoPath } = layersDir("mcp-layers-broken-");
+  writeFileSync(basePath, "{ not json");               // unparseable base
+  writeFileSync(repoPath, JSON.stringify({ mcpServers: { repoOnly: { command: "r" } } }));
+
+  const mgr = new RecordingManager();
+  const savedAllow2 = process.env.PI_MCP_SERVERS;
+  delete process.env.PI_MCP_SERVERS;
+  try {
+    await mgr.connectAllLayers({ base: basePath, repo: repoPath });
+  } finally {
+    if (savedAllow2 === undefined) delete process.env.PI_MCP_SERVERS;
+    else process.env.PI_MCP_SERVERS = savedAllow2;
+  }
+
+  ok(mgr.attempted.includes("repoOnly"),
+    "a broken BASE does not take the repo's servers down with it");
+
+  // …and the mirror: a broken REPO must not lose the base's servers either
+  const second = layersDir("mcp-layers-broken2-");
+  writeFileSync(second.basePath, JSON.stringify({ mcpServers: { baseOnly: { command: "b" } } }));
+  writeFileSync(second.repoPath, "{{");               // unparseable repo
+  const mgr2 = new RecordingManager();
+  const savedAllow3 = process.env.PI_MCP_SERVERS;
+  delete process.env.PI_MCP_SERVERS;
+  try {
+    await mgr2.connectAllLayers({ base: second.basePath, repo: second.repoPath });
+  } finally {
+    if (savedAllow3 === undefined) delete process.env.PI_MCP_SERVERS;
+    else process.env.PI_MCP_SERVERS = savedAllow3;
+  }
+  ok(mgr2.attempted.includes("baseOnly"), "and a broken REPO does not take the BASE's servers down");
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

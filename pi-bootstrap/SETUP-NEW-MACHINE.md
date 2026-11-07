@@ -161,7 +161,7 @@ machine's pi instance.
   recorded calls was removed by one sync). If a run ever would drop a live entry it now
   **refuses to write** and names the entries instead.
 - **MCP servers:** pi loads MCP servers from the first `.mcp.json` found walking
-  up from your working directory to the repo's git top-level, AND the base config
+  up from your working directory to the repo's git top-level, PLUS the base config
   at `~/.pi/agent/.mcp.json` — **both** are read and **merged**, so a repo's
   `.mcp.json` is a DELTA on the base, not a replacement for it. On a name
   collision the **repo's entry wins** (it may pin a different URL or command for
@@ -169,8 +169,8 @@ machine's pi instance.
   this is also how an INTERNAL server reaches every repo without being written
   into a product repo's tracked config. Base servers: brave-search,
   playwright-browser, gemini, tortoise (`seo-intelligence`, the Perplexity
-  research server) and `orchestrator` (the fleet's own MCP — internal, why it
-  lives here and not in a repo). **`exa` is not among them** — it was uninstalled by owner
+  research server) and `orchestrator` — the fleet's own MCP: internal tooling, so it belongs in
+  the machine-local base rather than in a product repo's tracked config. **`exa` is not among them** — it was uninstalled by owner
   ruling (2026-10-31); do not re-add it.
 - **Tortoise MCP server:** the base config declares the **HOSTED** server —
   `type: http`, `url: https://api.premiselabs.co/mcp/`, `Authorization: Bearer

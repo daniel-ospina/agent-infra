@@ -563,17 +563,18 @@ function expandExpr(str: string): string {
 }
 
 /**
- * Resolve the .mcp.json path for the current session (#104).
+ * Resolve BOTH config layers, and the single-path convenience over them.
  *
- * Resolution order:
- *  1. Walk UP from `startDir` (default process.cwd()), stopping at the git
- *     top-level when one is resolvable (same `git rev-parse --show-toplevel`
- *     logic as reflect-hook / main-worktree-guard). Non-git directories walk
- *     to the filesystem root. First `.mcp.json` found wins — this lets a
- *     per-repo config override the base config.
- *  2. Fallback: `~/.pi/agent/.mcp.json` (the bootstrapped base config
- *     installed by pi-bootstrap/setup.sh from templates/.mcp.base.json).
- *  3. null → no config anywhere; the caller logs a clear zero-servers message.
+ *  1. The REPO layer: walk UP from `startDir` (default process.cwd()), stopping at the git
+ *     top-level when one is resolvable (same `git rev-parse --show-toplevel` logic as
+ *     reflect-hook / main-worktree-guard). Non-git directories walk to the filesystem root.
+ *     The NEAREST `.mcp.json` wins — a nested config beats the repo's top-level one.
+ *  2. The BASE layer: `~/.pi/agent/.mcp.json`, the bootstrapped shared config installed by
+ *     pi-bootstrap/setup.sh from templates/.mcp.base.json. It is resolved WHETHER OR NOT a repo
+ *     file was found: the two are MERGED (`mergeMcpLayers`, repo last so the repo wins a
+ *     collision). Treating the base as a fallback made the hub's shared layer inert in every
+ *     repo that carries its own config (#3612).
+ *  3. Neither → the caller logs a clear zero-servers message.
  *
  * Exported (named) for unit tests; the default export stays the extension hook.
  */
@@ -1429,9 +1430,9 @@ export class McpServerManager {
 export default async function (pi: ExtensionAPI) {
   const manager = new McpServerManager();
 
-  // #104: resolve .mcp.json with an upward search (cwd → git top-level) and
-  // a ~/.pi/agent/.mcp.json fallback, instead of cwd-only. Log the search
-  // path at warn level so a zero-server session is diagnosable at a glance.
+  // #104/#3612: resolve BOTH layers — the repo's `.mcp.json` by an upward search (cwd → git
+  // top-level) AND the hub's base config — and merge them, repo winning a collision. Log both
+  // so a zero-server session is diagnosable at a glance.
   const searchedDir = process.cwd();
   const layers = resolveMcpConfigPaths(searchedDir);
   if (layers.repo || layers.base) {
