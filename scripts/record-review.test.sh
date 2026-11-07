@@ -692,6 +692,17 @@ assert_contains "$RECORD_ERR" "without a repo" "repo-less refusal names the reme
 run_record_verdict clean-micro "" 424244
 [ -f "$L" ] && ok "repo-less record at legacy key (clean-micro path)" || bad "repo-less record at legacy key ($L)"
 if grep -q '"repo"' "$L"; then bad "repo-less record has no repo field"; else ok "repo-less record has no repo field"; fi
+# ⛔ AND IT MUST PARSE, WITH ITS SLOTS ALIGNED. The record printf has TWO branches
+# (repo / no-repo) whose slot counts differ, and the no-repo branch is reachable in
+# production — a lane with no repo context mints here. "a file exists and it has no
+# repo key" is satisfied by a record whose fields have SHIFTED one slot: MEASURED, in
+# review of this merge, by dropping `"$DELTA_FIELDS"` from the no-repo argument list —
+# BOTH suites stayed green while the minted record did not parse, which is the #3400
+# "an unparseable record is NO RECORD" shape arriving on a successful exit. Asserting
+# the parse is what makes the slot count actually covered rather than counted by eye.
+python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); assert d["verdict"]=="clean-micro", d.get("verdict"); assert d["pr"]==424244, d.get("pr"); assert "head_sha" in d' "$L" 2>/dev/null \
+    && ok "repo-less record PARSES with verdict/pr slots aligned (no-repo printf branch covered)" \
+    || bad "repo-less record is MALFORMED or misaligned: $(cat "$L" 2>/dev/null)"
 
 echo "── 5. Unparseable legacy (formatted JSON) is never deleted ─────"
 UNPARSEABLE="$F_HOME/.pi/agent/reviews/424245.json"
@@ -6700,18 +6711,22 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
-        # ⛔ #3442 — EVERY COVER HERE MUST CARRY $VACUITY_BLOCK, for the reason 20e states one
-        # screen down: since agent-infra#3442 a FRESH `clean` mint is REFUSED when its artifact
-        # carries no `## MUTATION ATTRIBUTION` block, and that arm runs inside
-        # `verify_review_evidence` BEFORE the delta arm under test can answer. Without it every
-        # §20 COVER arm was refused by the NON-VACUITY arm — measured 2026-11-07 on base: the
-        # run reddened 44 assertions, and after the dead-call fix 33 remained, every one of them
-        # this arm ("carries no MUTATION ATTRIBUTION block"), reading as "the delta direction is
-        # broken" when the delta arm was never reached.
-        # APPENDED, never substituted, and appended AFTER the VAR=VAL loop so an arm that pins the
-        # body's OWN range claim (20h12/20h15/M12/M14) still states exactly the range it means to.
-        export STUB_EVIDENCE_BODY="${STUB_EVIDENCE_BODY}
-${VACUITY_BLOCK}"
+        # ⛔ AND IT MUST CARRY THE #3442 BLOCK. `verify_review_evidence` now refuses a FRESH
+        # `clean` verdict over an artifact with no `## MUTATION ATTRIBUTION` table, and every
+        # vector in this section mints one — so without the block EVERY arm below refused at 3
+        # for a reason unrelated to what it pins (the unrelated-row trap #3442's own fixture
+        # note names). Applied AFTER the caller's overrides so a vector's own body is
+        # byte-unchanged up to the blank line: the delta arms below SCAN that body for stated
+        # ranges, and the block must not be the thing they compare. A vector that deliberately
+        # omits the block opts out with DELTA_NO_VACUITY_BLOCK=1 rather than relying on order.
+        if [ "${DELTA_NO_VACUITY_BLOCK:-0}" != 1 ]; then
+            case "$STUB_EVIDENCE_BODY" in
+                *"MUTATION ATTRIBUTION"*) : ;;
+                *) STUB_EVIDENCE_BODY="$STUB_EVIDENCE_BODY
+
+$VACUITY_BLOCK"; export STUB_EVIDENCE_BODY ;;
+            esac
+        fi
         rc=0
         # shellcheck disable=SC2086  # EXTRA_ARGS is intentionally word-split (one flag)
         bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" ${EXTRA_ARGS:-} 2>"$errfile" || rc=$?
@@ -6817,12 +6832,6 @@ assert_contains "$RECORD_ERR" "could not read the PR's BASE" "20d4 the refusal n
 # for the shape it exists to pin, which made 20e red for a reason it does not
 # measure. The clean shapes are what backward compat means here.
 EE=425108; rm -f "$(Q2 $EE)"
-# ⛔ #3442 — EACH VECTOR APPENDS $VACUITY_BLOCK. 20e's SUBJECT is the comment:/review: SHAPE, not
-# non-vacuity, and since agent-infra#3442 a FRESH `clean` mint is REFUSED when its artifact carries no
-# `## MUTATION ATTRIBUTION` block. Without the block these two vectors are refused by the NON-VACUITY
-# arm and would report on a rule they do not pin — the unrelated-row trap #3442 rule 2 names, and the
-# same fixture-contract change main's own default body and its §13l/§13q vectors already carry. The
-# behaviour asserted below is unchanged: a plain `comment:<id>` / `review:<id>` artifact still records.
 EV_REF="comment:42510801" run_record_ev $EE STUB_EVIDENCE_BODY="**Outcome: CLEAN — verified, no issues.**
 
 $VACUITY_BLOCK"
@@ -7008,9 +7017,33 @@ printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-i
 run_record_delta $EH2 "$DG_EV_HEAD" "delta:$DG_EV_L..$DG_EV_HEAD"
 assert_eq "$RECORD_RC" "3" "20h2 an EVIL MERGE (hand-resolved conflict) is refused (rc 3)"
 for _m2 in "NOT a clean merge of its parents" "does NOT merge cleanly"; do
-    case "$RECORD_ERR" in *"$_m2"*) ok "20h2 the refusal names the conflict resolution"; break ;; esac
+    case "$RECORD_ERR" in *"$_m2"*) ok "20h2 the refusal names the conflict resolution"; _named2=1; break ;; esac
 done
+# ⛔ A LOOP WITH NO FAILURE BRANCH IS AN ASSERTION THAT STOPS EXISTING WHEN THE WORDING MOVES:
+#    if neither phrasing appears, neither `ok` nor `bad` used to fire and the arm silently
+#    vanished (agent-infra#3475). The assertion now has a red half.
+[ "${_named2:-0}" = 1 ] || bad "20h2 the refusal does NOT name the conflict resolution (err='$RECORD_ERR')"
 assert_contains "$RECORD_ERR" "authored content" "20h2 the evil merge is classified AUTHORED, not merge-only"
+# ⛔ 20h2b — THE MERGE-ONLY AUTHORED SENTENCE. An EVIL MERGE whose range holds NO non-merge
+#    commit is `authored` with `n_authored = 0` — the shape whose diagnostic used to read
+#    "contains authored content (0 commit(s))", contradicting itself on the one bypass this
+#    feature exists to close. 20h2's own range carries one non-merge commit, so it takes the
+#    COUNT form and the merge sentence was pinned by NOTHING (measured: inverting its condition
+#    left the suite green). Here `A` is the merge's FIRST PARENT, so `--no-merges A..B` is empty.
+DG_EV_P1="$(git -C "$DG" rev-parse "$DG_EV_HEAD^1")"
+DG_EV_P2="$(git -C "$DG" rev-parse "$DG_EV_HEAD^2")"
+printf '%s\n' '2025-10-01T00:00:00Z' > "$T/dates/$DG_EV_P1"
+EH2B=4251315; rm -f "$(Q2 $EH2B)"
+# ⛔ THE BASE MUST BE THE MERGE'S SECOND PARENT, not the default fixture base. Otherwise the
+#    second branch's own commit is not reachable from `--not base`, it enters the walk as an
+#    authored commit, and the range takes the COUNT form — the very branch this vector exists to
+#    reach. With base = p2 the real-world shape is modelled exactly: the lane merged the base tip
+#    (p2) into its branch and hand-resolved a conflict, so `--no-merges A..B --not base` is EMPTY
+#    and the ONLY authored thing in the range is the merge's conflict resolution.
+run_record_delta $EH2B "$DG_EV_HEAD" "delta:$DG_EV_P1..$DG_EV_HEAD" STUB_BASE_SHA="$DG_EV_P2"
+assert_eq "$RECORD_RC" "3" "20h2b a range that is ONLY an evil merge, with no cover, is refused (rc 3)"
+assert_contains "$RECORD_ERR" "holds authored content in a MERGE" "20h2b the refusal names the MERGE as the authored content — \`n_authored\` is legitimately 0 here"
+assert_not_contains "$RECORD_ERR" "(0 commit(s))" "20h2b the refusal does NOT print the self-contradicting (0 commit(s)) count"
 # ⛔ ASSERT THE HEAD, NOT THE FILE: this vector plants a prior record at A (that is
 # what makes the merge-only arm reachable at all), so "no file" would be false even
 # on a correct refusal.
@@ -7195,7 +7228,16 @@ EH14=425154; rm -f "$(Q2 $EH14)"
 run_record_delta $EH14 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" \
     STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
 assert_eq "$RECORD_RC" "3" "20h12 an authored delta whose cover does NOT name the range is refused (rc 3)"
-assert_contains "$RECORD_ERR" "does not NAME the range" "20h12 the refusal names the missing range claim"
+# ⛔ The FIFTH cycle moved which arm refuses this vector. The bare-needle fallback is gone for an
+# authored range (20h25), so a cover that names nothing is now stopped by the required-stated-range
+# arm with "does not STATE the range". ⚠️ CORRECTION (sixth cycle, P2): the earlier version of this
+# note claimed the old post-loop "does not NAME the range" check was "still reached by the
+# MERGE-ONLY arm and pinned by 20h16". It was NOT: that check was DEAD CODE — the merge-only arm
+# either sets body_claim or returns before it, and the authored arm now returns or sets it too —
+# and 20h16 pins the merge-only arm's own, different message. The dead block has been deleted and
+# this note no longer points at a pin that does not exist. (`rg 'does not NAME the range'` matches
+# only this comment, which is how the claim was falsified.)
+assert_contains "$RECORD_ERR" "does not STATE the range" "20h12 the refusal names the missing range claim"
 [ -f "$(Q2 $EH14)" ] && bad "20h12 no record was written" || ok "20h12 no record was written"
 
 # 20h13 A MODIFY/DELETE CONFLICT resolved git's own way. `merge-tree --write-tree`
@@ -7214,12 +7256,22 @@ GIT_COMMITTER_DATE='2025-05-02T00:00:00Z' GIT_AUTHOR_DATE='2025-05-02T00:00:00Z'
 DG_MDA="$(git rev-parse HEAD)"
 git checkout -q -b mdmain "$DG_MDX" >/dev/null 2>&1
 git rm -q del.txt >/dev/null 2>&1
+# ⛔ A SECOND, NON-CONFLICTING BASE-SIDE EDIT. Without it the resolution keeps the lane's
+# version of `del.txt`, so A's tree and B's tree are IDENTICAL, `git diff A..B` is EMPTY, and
+# the recorder refuses at the EMPTY-DIFF arm — further down — so neither the merge-tree
+# STATUS nor the evil-merge classification is ever reached. That is why this cell shipped
+# UNMEASURED (fifth review cycle, P2): it asserted a refusal it was not actually measuring.
+# With one unrelated file added on the base side, the range's diff is non-empty while the
+# resolution tree still equals merge-tree's output, so the STATUS is the only remaining
+# signal — which is what this fixture exists to isolate.
+printf 'unrelated\n' > other.txt; git add other.txt
 GIT_COMMITTER_DATE='2025-05-03T00:00:00Z' GIT_AUTHOR_DATE='2025-05-03T00:00:00Z' git commit -qm 'main deletes del.txt'
 DG_MDM="$(git rev-parse HEAD)"
 git checkout -q mdlane >/dev/null 2>&1
 git -c core.editor=true merge --no-ff mdmain -m 'merge main (CONFLICT modify/delete)' >/dev/null 2>&1 || true
 git add del.txt >/dev/null 2>&1
-git -c core.editor=true commit -qm 'resolve by keeping the modified file' >/dev/null 2>&1 || true
+GIT_COMMITTER_DATE='2025-05-05T00:00:00Z' GIT_AUTHOR_DATE='2025-05-05T00:00:00Z' \
+    git -c core.editor=true commit -qm 'resolve by keeping the modified file' >/dev/null 2>&1 || true
 DG_MDB="$(git rev-parse HEAD)"
 printf '%s\n' '2025-05-02T00:00:00Z' > "$T/dates/$DG_MDA"
 printf '%s\n' '2025-05-03T00:00:00Z' > "$T/dates/$DG_MDM"
@@ -7230,6 +7282,13 @@ if [ -n "$W13" ] && [ "$W13" = "$A13" ]; then
 else
     bad "20h13 fixture: the trees differ, so the vector would not test the status arm (want=$W13 actual=$A13)"
 fi
+# ⛔ AND THE RANGE MUST NOT BE EMPTY, or this vector stops at the EMPTY-DIFF arm and the status
+# arm is never reached — the vacuity that made M13 report "UNMEASURED" for four cycles.
+if git -C "$DG" diff --quiet "$DG_MDA" "$DG_MDB" 2>/dev/null; then
+    bad "20h13 fixture: the range's diff is EMPTY, so the vector stops at the EMPTY-DIFF arm and never measures the merge-tree STATUS arm"
+else
+    ok "20h13 fixture: the range's diff is NON-EMPTY, so the merge-tree STATUS is what decides"
+fi
 # A is the attested head the merge-only premise needs.
 EPM=425160; rm -f "$(Q2 $EPM)"
 printf '{"pr":%d,"head_sha":"%s","verdict":"clean","repo":"daniel-ospina/agent-infra","reviewed_at":"2025-05-04T00:00:00Z"}\n' \
@@ -7238,12 +7297,13 @@ EH15=425161; rm -f "$(Q2 $EH15)"
 run_record_delta $EH15 "$DG_MDB" "delta:$DG_MDA..$DG_MDB" \
     STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_MDM" STUB_BASE_REF=main
 assert_eq "$RECORD_RC" "3" "20h13 a modify/delete conflict resolved by hand is REFUSED (rc 3)"
-# ⛔ REFUSAL ONLY, and the mrc arm itself is NOT mutation-measured: in this harness
-# the range classifies AUTHORED for a reason this vector could not isolate (the
-# refusal is real and the record is not written, but removing the `mrc` test does not
-# flip the outcome), so M13 was deleted rather than left claiming coverage it does
-# not have. Declared as UNMEASURED on the PR; the fix mirrors lane_dimension_carry's
-# clause (D), which checks the same status for the same reason.
+# ⛔ ASSERT THE MESSAGE, NOT JUST THE EXIT CODE. Both the empty-diff arm and the status arm
+# refuse, so `rc 3` alone cannot tell them apart — the message is what proves the vector
+# reached the merge-tree STATUS classification rather than stopping further down.
+assert_contains "$RECORD_ERR" "does NOT merge cleanly" "20h13 the refusal is the merge-tree STATUS verdict, not a downstream refusal"
+assert_contains "$RECORD_ERR" "merge-tree rc=" "20h13 the refusal quotes the merge-tree exit status that decided it"
+# (M13 — the merge-tree EXIT STATUS — is defined with the other mutation cells, after the
+#  matrix helpers: invoking `mut_check` here would be too early in the file.)
 [ -f "$(Q2 $EH15)" ] && bad "20h13 no record was written at the conflicted merge" ||
     ok "20h13 no record was written at the conflicted merge"
 
@@ -7292,6 +7352,1060 @@ EH20=425169; rm -f "$(Q2 $EH20)"
 run_record_delta $EH20 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42516901" \
     STUB_EVIDENCE_AT="2025-05-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
 assert_eq "$RECORD_RC" "3" "20h16 a cover naming A but PREDATING A is still refused (rc 3)"
+
+# 20h17 THE RANGE NOTATION MUST NOT CHANGE THE ANSWER. 20h15 pins that a NARROWER stated
+#       range is refused, and that arm is an ANTI-FAIL-OPEN check — so a one-character
+#       difference in the ARTIFACT must not be able to route around it. As first written the
+#       parser read `\.\.` ONLY: the IDENTICAL body in this repo's own three-dot compare
+#       notation (`gh api compare/<base>...<head>`) did not match, `stated_to` stayed empty,
+#       and control fell through to the bare-needle fallback — which is satisfied by a body
+#       naming B ALONE. The range was then never checked at all, and the record asserted a
+#       `delta_range` its own artifact contradicted, which is what that arm's message says it
+#       prevents. Both notations must refuse. (Found in review at PR #3401; ported here with
+#       the source fix rather than left as a known bypass.)
+EH21=425174; rm -f "$(Q2 $EH21)"
+run_record_delta $EH21 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42517501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:$DG_A1...$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h17 a body stating a NARROWER range in THREE-DOT form is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h17 the three-dot body reaches the RANGE arm, not the bare-needle fallback"
+assert_contains "$RECORD_ERR" "delta:${DG_A1:0:12}...${DG_HEAD:0:12}" "20h17 the refusal quotes the notation the ARTIFACT used, not the two-dot form misquoted back"
+[ -f "$(Q2 $EH21)" ] && bad "20h17 no record was written" || ok "20h17 no record was written"
+
+# 20h18 A TOLERATED SPELLING IS PARSED, NOT FALLEN PAST. The matcher must accept the
+#       range with spaces around the colon/separator (an artifact may wrap or pad it),
+#       and the answer must be the RANGE arm's — "states a DIFFERENT range" — because a
+#       refusal that says "cannot parse" would mean the widening regressed and the
+#       comparison never happened. Asserting the MESSAGE (not just rc 3) is what
+#       discriminates: both paths refuse, so rc alone cannot tell them apart.
+EH22=425180; rm -f "$(Q2 $EH22)"
+run_record_delta $EH22 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta: $DG_A1 .. $DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h18 a padded (but parseable) NARROWER range is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h18 the padded range is PARSED and compared, not written off as unparseable"
+[ -f "$(Q2 $EH22)" ] && bad "20h18 no record was written" || ok "20h18 no record was written"
+
+# 20h19 AN UNPARSEABLE `delta:` RANGE FAILS **CLOSED**. This is the fail-open the second
+#       review cycle found, and it is in the FALL-THROUGH rather than in the separator:
+#       the regex pinned an exact spelling, so ANY tolerance gap (here: short shas) left
+#       `stated_to` empty and control reached the bare-needle fallback — which is satisfied
+#       by a body naming B ALONE. The body below carries the unparseable token AND the full
+#       head, so the fallback WOULD accept it: only the explicit refuse-on-unparseable arm
+#       stops the record asserting a range its artifact never stated.
+EH23=425182; rm -f "$(Q2 $EH23)"
+run_record_delta $EH23 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:abc1234..def5678 at $DG_HEAD; no issues found."
+assert_eq "$RECORD_RC" "3" "20h19 an UNPARSEABLE delta: range is REFUSED (rc 3), never fallen past"
+# ⚠️ RE-ANCHORED (ninth cycle): the range parser's floor is now 4 rather than 12, so `abc1234..def5678`
+# IS parsed and the RANGE COMPARISON is what refuses it — a stronger arm than "cannot parse", and the
+# vector's fail-closed intent is unchanged. The `cannot parse` message still decides the shapes this
+# code genuinely cannot parse (a non-hex separator: 20h20's `delta: A1 till HEAD`).
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h19 the unparseable range is PARSED and compared (rc 3), never written off as prose"
+[ -f "$(Q2 $EH23)" ] && bad "20h19 no record was written" || ok "20h19 no record was written"
+
+# 20h20/20h21 THE TOKEN'S SPELLING MUST NOT DISABLE THE GUARD. The third review cycle found
+#       the SAME P1 again, and the reason is the lesson: the first attempt made detection
+#       independent of the REGEX but both still opened with the lower-case literal `delta:`,
+#       so `Delta:`, `DELTA:` and `delta :` turned detection OFF and failed the parse AT THE
+#       SAME TIME — two guards sharing a literal share a blind spot, so the refusal arm was
+#       never reached and the body fell to the bare needle. `Delta:` beginning a sentence is
+#       ordinary reviewer prose, not a contrived spelling. Both layers are now
+#       case-insensitive with optional padding, so these must reach the RANGE arm.
+EH24=425184; rm -f "$(Q2 $EH24)"
+run_record_delta $EH24 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed Delta: $DG_A1..$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h20 a CAPITALISED narrower token is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h20 the capitalised token is PARSED and compared, not disabled into the fallback"
+[ -f "$(Q2 $EH24)" ] && bad "20h20 no record was written" || ok "20h20 no record was written"
+EH25=425186; rm -f "$(Q2 $EH25)"
+run_record_delta $EH25 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta : $DG_A1..$DG_HEAD only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h21 a token padded BEFORE the colon is refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h21 the padded token is PARSED and compared, not disabled into the fallback"
+[ -f "$(Q2 $EH25)" ] && bad "20h21 no record was written" || ok "20h21 no record was written"
+# 20h22 …AND THE TOLERANCE IS NOT A FALSE RED. The widened token must still ACCEPT an
+#       artifact that states the EXACT recorded range in a padded/capitalised spelling —
+#       otherwise the fix would block correct reviewers, which is its own defect.
+EH26=425188; rm -f "$(Q2 $EH26)"
+run_record_delta $EH26 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42518901" \
+    STUB_EVIDENCE_BODY="reviewed Delta: $DG_BASE .. $DG_HEAD; no issues found."
+assert_eq "$RECORD_RC" "0" "20h22 a padded CAPITALISED spelling of the RECORDED range still records clean (rc 0)"
+assert_contains "$(cat "$(Q2 $EH26)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h22 the accepted record is the normal one, not a special case"
+
+# 20h23 THE RANGE CLAIM MUST NOT NEED THE WORD `delta:` TO ARM. Fourth review cycle,
+#       finding (a): the guard armed on the TOKEN, so an artifact stating "Reviewed only
+#       A1...HEAD" — an ordinary reviewer sentence — was invisible to BOTH layers and fell
+#       to the bare needle, which it satisfies by naming B. MEASURED: that body recorded
+#       rc 0 with `delta_range=BASE..HEAD`, marking the authored commit as reviewed on the
+#       strength of a range the artifact never quoted. The arm now keys on the RANGE SHAPE,
+#       so a stated range is compared whatever word introduces it; M18 restores the
+#       word-keyed arm, which is the exact pre-fix state.
+EH27=425190; rm -f "$(Q2 $EH27)"
+run_record_delta $EH27 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed only ${DG_A1}...${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h23 a narrower range stated WITHOUT the word delta: is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h23 the stated range is reached and compared, not passed over as bare prose"
+[ -f "$(Q2 $EH27)" ] && bad "20h23 no record was written" || ok "20h23 no record was written"
+
+# 20h24 EVERY STATED RANGE IS CHECKED, NOT JUST THE FIRST. Fourth review cycle, finding
+#       (b): `=~` is a LEFTMOST match, so parsing ONE range made the arm ORDER-DEPENDENT —
+#       a body quoting the wide range first and the narrower one it actually read SECOND was
+#       accepted on the first, while the mirror order refused. Order-dependence is not
+#       containment, and a reviewer quoting the brief's range before their own is ordinary
+#       prose. The body below states the RECORDED range first (it passes every clause) and
+#       the narrower range it actually read second, so only an exhaustive scan refuses it.
+EH28=425192; rm -f "$(Q2 $EH28)"
+run_record_delta $EH28 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="delta:${DG_BASE}..${DG_HEAD} is the brief; I read delta:${DG_A1}...${DG_HEAD} only; no issues found."
+assert_eq "$RECORD_RC" "3" "20h24 a NARROWER range stated SECOND is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "states a DIFFERENT range" "20h24 the arm is order-independent — a first passing range does not end the check"
+assert_contains "$RECORD_ERR" "EVERY range the artifact states is checked" "20h24 the refusal says the scan is exhaustive"
+[ -f "$(Q2 $EH28)" ] && bad "20h24 no record was written" || ok "20h24 no record was written"
+
+# 20h25 THE SEPARATOR ALPHABET, i.e. the SAME P1 A FIFTH TIME (fifth review cycle). The
+#       arm keyed the range on `\.{2,3}` — ASCII dots — and on the WORD `delta`. Every other
+#       way a reviewer writes the same claim (an en dash, U+2026 as macOS/Word auto-substitutes
+#       for `...`, the word "through") matched NEITHER layer, so `_any` and `_delta_tok` were
+#       both 0 and control reached the bare-needle fallback — satisfied by a body naming B
+#       ALONE. MEASURED on the shipped code: this exact sentence with `–` recorded rc 0 with
+#       `delta_range=BASE..HEAD`, while the identical sentence with `..` refused at 3.
+#       The lesson across all five cycles is the same and is now stated once, structurally:
+#       a guard that enumerates SPELLINGS re-opens on the next spelling. So the fallback is
+#       GONE for an authored range — a stated range is now REQUIRED, and no alphabet can be
+#       silently absent from a requirement. (20h27 pins the fallback's own case, and 20a is
+#       unaffected: it is the MERGE-ONLY arm, which has its own name-A requirement.)
+EH29=425194; rm -f "$(Q2 $EH29)"
+run_record_delta $EH29 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h25 a narrower range stated with an EN DASH is refused (rc 3)"
+assert_contains "$RECORD_ERR" "does not STATE the range" "20h25 the en-dash body reaches the range arm, not the bare-needle fallback"
+[ -f "$(Q2 $EH29)" ] && bad "20h25 no record was written" || ok "20h25 no record was written"
+EH30=425196; rm -f "$(Q2 $EH30)"
+run_record_delta $EH30 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed only ${DG_A1} through ${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h26 a narrower range stated as prose ('through') is refused (rc 3)"
+[ -f "$(Q2 $EH30)" ] && bad "20h26 no record was written" || ok "20h26 no record was written"
+# 20h27 THE FALLBACK'S OWN CASE, PINNED IN THE NEW DIRECTION. A body that names B and states
+#       no range must be REFUSED for an AUTHORED delta: naming the head is not a statement that
+#       the reviewer covered A..B, and it is the shape every one of the five bypasses landed in.
+#       What it does NOT cost: the same review is still recordable at B with plain
+#       `--evidence comment:<id>` — which asserts exactly what the artifact says (a review at
+#       the head) without asserting a range it never stated. That is why removing the fallback
+#       loses no capability, and the refusal message says so.
+EH31=425198; rm -f "$(Q2 $EH31)"
+run_record_delta $EH31 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed ${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h27 a body naming ONLY the head is refused for an AUTHORED delta (rc 3)"
+assert_contains "$RECORD_ERR" "plain --evidence comment:" "20h27 the refusal names the form that CAN record it (the plain comment attestation at B)"
+[ -f "$(Q2 $EH31)" ] && bad "20h27 no record was written" || ok "20h27 no record was written"
+# 20h28 THE SEPARATOR TOLERANCE, IN THE DIRECTION THAT STILL DECIDES. Removing the bare-needle
+#       fallback (20h25) means an unparseable three-dot range is refused either way — so what the
+#       tolerance now decides is whether an HONEST reviewer who writes this repo's own compare
+#       idiom (`gh api compare/<base>...<head>`) is ACCEPTED or falsely blocked. Three dots must
+#       still record the CORRECT range. (M15 mutates the tolerance and must REFUSE this.)
+EH32=425200; rm -f "$(Q2 $EH32)"
+run_record_delta $EH32 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}...${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h28 the CORRECT range stated in THREE-DOT form is accepted (rc 0)"
+assert_contains "$(cat "$(Q2 $EH32)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h28 the accepted record is the normal authored one"
+# 20h29 THE WORD IS IRRELEVANT IN THE ACCEPTANCE DIRECTION TOO. With the fallback gone, arming on
+#       the WORD `delta:` no longer causes a bypass — it causes a FALSE BLOCK: an artifact that
+#       states the correct range without that word would be refused, and "Reviewed only A..B" is
+#       ordinary reviewer prose. (M18 mutates the shape arm back to the word and must REFUSE this.)
+EH33=425202; rm -f "$(Q2 $EH33)"
+run_record_delta $EH33 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed only ${DG_BASE}..${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "0" "20h29 the CORRECT range without the word delta: is accepted (rc 0)"
+assert_contains "$(cat "$(Q2 $EH33)" 2>/dev/null || true)" '"delta_kind":"authored"' "20h29 the accepted record is the normal authored one"
+# 20h30 THE CONTRADICTION LAYER WAS STILL AN ENUMERATION OF SPELLINGS (sixth cycle, P1).
+#       Requiring a stated range does not stop a CONTRADICTING one, because the comparison only
+#       saw `hex dots hex`. This feature's own refusal messages TEACH reviewers to quote
+#       `delta:<A>..<B>`, so an artifact can carry that acceptably-spelled decoy AND a narrower
+#       claim in any other notation — and the decoy satisfies every parsed check. MEASURED on
+#       the previous head: the body below recorded rc 0 with `delta_range=BASE..HEAD`.
+#       The rule no longer asks what the notation IS, it asks what the artifact MEANS: every
+#       resolvable commit the CLAIM names must be the head or an ancestor of the range start.
+EH34=425204; rm -f "$(Q2 $EH34)"
+run_record_delta $EH34 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
+assert_eq "$RECORD_RC" "3" "20h30 a NARROWER range in another notation, beside a passing decoy, is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h30 the refusal names the contradicting commit, not the decoy"
+[ -f "$(Q2 $EH34)" ] && bad "20h30 no record was written" || ok "20h30 no record was written"
+# 20h31 THE SAME RULE MUST NOT DEPEND ON ABBREVIATION LENGTH EITHER — `git log --oneline`
+#       shas are 7-8 hex, below the parser's 12-char floor, and were invisible to both layers.
+EH35=425206; rm -f "$(Q2 $EH35)"
+run_record_delta $EH35 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+Actually reviewed only ${DG_A1:0:8}..${DG_HEAD:0:8}."
+assert_eq "$RECORD_RC" "3" "20h31 a narrower range in 8-char shas is REFUSED (rc 3)"
+[ -f "$(Q2 $EH35)" ] && bad "20h31 no record was written" || ok "20h31 no record was written"
+# 20h32 THE MANDATORY KILL TABLE IS NOT A CLAIM (sixth cycle, P2). `## MUTATION ATTRIBUTION`
+#       is required in every fresh clean artifact (#3442) and its rows quote ranges as a matter
+#       of course — a row describing a mutant "pinned to A1..B" was compared as if it were the
+#       reviewer's own claim, refusing a CORRECT artifact because of its kill table. The scan
+#       reads the claim; the table is not a statement about what was reviewed.
+EH36=425208; rm -f "$(Q2 $EH36)"
+run_record_delta $EH36 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 20h30 the decoy beside a narrowed claim is caught | re-point this cell at delta:${DG_A1}..${DG_HEAD} | 20h30 | rc 3 |"
+assert_eq "$RECORD_RC" "0" "20h32 a range quoted inside the #3442 kill table does not refuse a CORRECT artifact (rc 0)"
+[ -f "$(Q2 $EH36)" ] || bad "20h32 no record was written for a correct artifact"
+# 20h33 A RANGE RELATIVE TO THE TIP IS ALWAYS A NARROWING (sixth cycle, P1 continuation).
+#       `HEAD~1..HEAD` carries no hex token at all, so the meaning rule above cannot see it —
+#       and beside an acceptably-spelled decoy it recorded rc 0. There is no innocent reading
+#       of a tip-relative range in an artifact offered as evidence that A..B was covered.
+EH37=425210; rm -f "$(Q2 $EH37)"
+run_record_delta $EH37 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD~1..HEAD."
+assert_eq "$RECORD_RC" "3" "20h33 a tip-relative range beside a passing decoy is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "RELATIVE TO THE TIP" "20h33 the refusal names the tip-relative notation"
+[ -f "$(Q2 $EH37)" ] && bad "20h33 no record was written" || ok "20h33 no record was written"
+# 20h34 THE KILL-TABLE EXCLUSION MUST BE THE BLOCK, NOT THE REGION AFTER IT (seventh cycle, P1).
+#       The sixth cycle ended the skip only at the next `## ` heading, so ANY prose between the
+#       table and the next level-2 heading was dropped from the claim — including a `### `
+#       subsection. MEASURED on that head: the body below recorded rc 0 with
+#       `delta_range=BASE..HEAD`, minting a signed `clean` over the range's only authored commit
+#       while the artifact said in words that it had not been read. The mirror false block (a
+#       body whose only range statement follows the table) is refused by the same fix.
+EH38=425212; rm -f "$(Q2 $EH38)"
+run_record_delta $EH38 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 20h34 a narrowing after the table is caught | re-point this cell at delta:${DG_A1}..${DG_HEAD} | 20h34 | rc 3 |
+
+### Scope caveat
+I only actually reviewed ${DG_A1}–${DG_HEAD}; the base-side merge was not read."
+assert_eq "$RECORD_RC" "3" "20h34 a narrowing in a ### subsection AFTER the kill table is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h34 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH38)" ] && bad "20h34 no record was written" || ok "20h34 no record was written"
+# and the MIRROR direction: prose that follows the table is scanned, so a body whose only
+# range statement sits there is ACCEPTED — the fix must not turn the exclusion into a region.
+EH39=425214; rm -f "$(Q2 $EH39)"
+run_record_delta $EH39 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="No issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+The range I read was delta:${DG_BASE}..${DG_HEAD}."
+assert_eq "$RECORD_RC" "0" "20h34 the range stated AFTER the kill table is still found (rc 0, no region-wide skip)"
+[ -f "$(Q2 $EH39)" ] || bad "20h34 no record was written for a correct artifact"
+# 20h35 THE MERGE-ONLY ARM MUST READ THE CLAIM TOO (seventh cycle, P2). The sixth cycle applied
+#       "the kill table is not a claim" to the authored arm only, so the merge-only arm's
+#       "names A" needle was satisfied by a kill-table ROW naming A — while that arm's own
+#       comment says the table cannot be the statement the record relies on. A merge-only delta
+#       EXTENDS an attestation, so its cover must BE the verdict at A.
+EH40=425216; rm -f "$(Q2 $EH40)"
+printf '%s\n' '2025-06-01T00:00:00Z' > "$T/dates/$DG_A1"
+run_record_delta $EH40 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42521701" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" \
+    STUB_EVIDENCE_BODY="No issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | the row that reddens delta:${DG_A1}..${DG_HEAD} | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h35 a merge-only cover naming A ONLY in the kill table is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "does not name" "20h35 the refusal is the merge-only needle, not a later arm"
+[ -f "$(Q2 $EH40)" ] && bad "20h35 no record was written" || ok "20h35 no record was written"
+# control: the SAME body with A named in the prose records clean — the arm still works.
+EH41=425218; rm -f "$(Q2 $EH41)"
+run_record_delta $EH41 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42521901" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" \
+    STUB_EVIDENCE_BODY="Reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "0" "20h35 a merge-only cover naming A in the PROSE still records clean (rc 0)"
+# 20h36 ONLY A LATER COMMIT CAN NARROW (seventh cycle, P2). A commit reachable from NEITHER
+#       endpoint cannot narrow A..B at all — refusing it is a false block over prose, and the
+#       only remedy for a false block here is the full re-review this feature exists to avoid.
+#       MEASURED before the fix: quoting an unrelated commit (another PR's head) refused.
+DG_UNREL="$(git -C "$DG" commit-tree "$(git -C "$DG" rev-parse "$DG_BASE^{tree}")" -m 'unrelated root' 2>/dev/null || true)"
+EH42=425220; rm -f "$(Q2 $EH42)"
+run_record_delta $EH42 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+For context, the other PR's head was ${DG_UNREL} and it is unrelated to this range."
+if [ -n "$DG_UNREL" ] && ! git -C "$DG" merge-base --is-ancestor "$DG_UNREL" "$DG_BASE" 2>/dev/null && ! git -C "$DG" merge-base --is-ancestor "$DG_BASE" "$DG_UNREL" 2>/dev/null; then
+    ok "20h36 fixture: the quoted commit is on an UNRELATED lineage (neither ancestor nor descendant)"
+else
+    bad "20h36 fixture: DG_UNREL is not unrelated — the vector would not test the unrelated-lineage arm"
+fi
+assert_eq "$RECORD_RC" "0" "20h36 a commit on an UNRELATED lineage does not refuse the claim (rc 0)"
+[ -f "$(Q2 $EH42)" ] || bad "20h36 no record was written for a correct artifact"
+# 20h37 THE BLOCK'S PREAMBLE AND INTER-ROW PROSE ARE SCANNED (eighth cycle, P1 — the seventh
+#       cycle's exclusion was a LINE SPAN from the heading to its last row, so every non-row line
+#       INSIDE it was dropped from the claim: the block's preamble, and prose between its rows.
+#       MEASURED on that head: the body below recorded rc 0 with `delta_range=BASE..HEAD`. It is
+#       the shape a reviewer actually produces — the #3442 block is appended to a verdict, and the
+#       sentence above the table is where they say what they read. A span is a REGION in a shorter
+#       costume; the exclusion is now a LINE predicate (heading + table rows only).
+EH43=425222; rm -f "$(Q2 $EH43)"
+run_record_delta $EH43 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+The verdict I am extending actually read delta:${DG_A1}–${DG_HEAD}.
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h37 a narrowing in the block's PREAMBLE is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h37 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH43)" ] && bad "20h37 no record was written" || ok "20h37 no record was written"
+# and the same shape BETWEEN two rows, which the span also dropped.
+EH44=425224; rm -f "$(Q2 $EH44)"
+run_record_delta $EH44 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| one | y | z | rc 3 |
+
+Only delta:${DG_A1}..${DG_HEAD} was actually read.
+
+| two | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h37 a narrowing BETWEEN two kill-table rows is REFUSED (rc 3)"
+[ -f "$(Q2 $EH44)" ] && bad "20h37 no record was written" || ok "20h37 no record was written"
+# 20h38 THE HEADING IS RECOGNISED BY brief-gate.sh's CONTRACT, NOT A SECOND ONE (eighth cycle,
+#       P2). #3442's validator accepts ANY case, ANY `#` depth, indent <= 3 and
+#       `mutation[ -]attribution`; this matcher knew only the canonical spelling, so a fully valid
+#       artifact was not excluded, its row was compared as the reviewer's claim, and it was
+#       refused with a FALSE ACCUSATION. Both spellings below pass brief-gate's own arm.
+EH45=425226; rm -f "$(Q2 $EH45)"
+run_record_delta $EH45 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+### Mutation-Attribution
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| the verdict covers ${DG_A1} | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "0" "20h38 a ### Mutation-Attribution heading (brief-gate-valid) is EXCLUDED (rc 0)"
+[ -f "$(Q2 $EH45)" ] || bad "20h38 no record was written for a valid artifact"
+# and the validator really does accept that spelling — otherwise this vector proves nothing.
+if printf '### Mutation-Attribution\n\n| assertion | mutant | reddened row | observed |\n|---|---|---|---|\n| a | b | c | d |\n' \
+    | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --mutation-missing - >/dev/null 2>&1; then
+    ok "20h38 brief-gate accepts the non-canonical heading (the vector is not vacuous)"
+else
+    bad "20h38 brief-gate did NOT accept the non-canonical heading — the vector would prove nothing"
+fi
+# 20h39 THE HEADING LINE IS NOT DROPPED WHOLE (ninth cycle, P1). The exclusion removes the section
+#       NAME; anything a reviewer writes on the heading line is prose. MEASURED on the eighth
+#       cycle's head: the body below recorded rc 0 over the WIDE range, because the entire heading
+#       line went into the bin and the stated narrowing with it. (Control: move the same sentence one
+#       line down — 20h37 already pins that direction.)
+EH46=425228; rm -f "$(Q2 $EH46)"
+run_record_delta $EH46 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION — I also only read ${DG_A1}–${DG_HEAD}
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h39 a narrowing ON the kill-table heading line is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h39 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH46)" ] && bad "20h39 no record was written" || ok "20h39 no record was written"
+# 20h40 A SECOND MUTATION-ATTRIBUTION SECTION IS STILL A KILL TABLE (ninth cycle, P2). The eighth
+#       cycle located ONE heading/end pair, so a second block's rows fell outside the exclusion and
+#       were read as the reviewer's claim: an artifact built as an addendum (the ordinary shape) was
+#       refused for a row it is entitled to carry. brief-gate's own parser re-opens the section on
+#       every matching heading, and this mirrors it.
+EH47=425230; rm -f "$(Q2 $EH47)"
+BODY40='reviewed delta:'"$DG_BASE"'..'"$DG_HEAD"'; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| one | y | z | rc 3 |
+
+## MUTATION ATTRIBUTION (addendum, same verdict)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| two | the row that reddens delta:'"$DG_A1"'..'"$DG_HEAD"' | two | rc 3 |'
+run_record_delta $EH47 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="$BODY40"
+assert_eq "$RECORD_RC" "0" "20h40 a SECOND kill-table block's rows are excluded too (rc 0)"
+[ -f "$(Q2 $EH47)" ] || bad "20h40 no record was written for a valid two-block artifact"
+if printf '%s' "$BODY40" | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --mutation-missing - >/dev/null 2>&1; then
+    ok "20h40 brief-gate accepts the two-block artifact (the vector is not vacuous)"
+else
+    bad "20h40 brief-gate did NOT accept the two-block artifact — the vector would prove nothing"
+fi
+# 20h41 THE FLOOR BELOW 7 (ninth cycle, P1). git resolves a 4-6 char unique prefix, and the two
+#       scans' floors were 12 (dots parser) and 7 (token rule) — so a narrowing written with a
+#       6-char start was invisible to BOTH and recorded rc 0 over the wide range. 20h31's 8-char
+#       vector is what made the gap look covered.
+EH48=425232; rm -f "$(Q2 $EH48)"
+run_record_delta $EH48 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ${DG_A1:0:6}..${DG_HEAD:0:6}; the rest was not read."
+assert_eq "$RECORD_RC" "3" "20h41 a narrowing in 6-char abbreviations is REFUSED (rc 3)"
+[ -f "$(Q2 $EH48)" ] && bad "20h41 no record was written" || ok "20h41 no record was written"
+# and the SHORT-UNRESOLVABLE form is PROSE, not a range claim: a hex-looking pair beside dots (a
+# review of hex literals) must not be refused as a contradicting range.
+EH49=425234; rm -f "$(Q2 $EH49)"
+run_record_delta $EH49 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+The literals 0xdead..0xbeef and f00d..babe are unrelated to this range."
+assert_eq "$RECORD_RC" "0" "20h41 unresolvable short hex beside dots reads as PROSE (rc 0)"
+[ -f "$(Q2 $EH49)" ] || bad "20h41 a hex-literal pair falsely blocked a correct artifact"
+# 20h42 THE BLOCK'S OWN TABLE ENDS (tenth cycle, P1). The ninth cycle closed `ins` only on a HEADING,
+#       so from the block's heading to the next level-2 heading every table row was excluded — and the
+#       #3442 block is normally the LAST section, so a narrowing written in a table row AFTER it was
+#       dropped and a signed `clean` was minted over commits the artifact said were not read.
+#       MEASURED on that head: the body below recorded rc 0 with `delta_range=BASE..HEAD`. The
+#       exclusion is now bounded structurally: the block's header (assertion+mutant+redden) opens its
+#       table, CONTIGUOUS rows continue it, and a blank line or prose ends it for good.
+EH50=425236; rm -f "$(Q2 $EH50)"
+run_record_delta $EH50 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+| what I actually reviewed | ${DG_A1} | not the rest | rc 3 |"
+assert_eq "$RECORD_RC" "3" "20h42 a narrowing in a table row AFTER the block is REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "also names commit" "20h42 the refusal names the contradicting commit"
+[ -f "$(Q2 $EH50)" ] && bad "20h42 no record was written" || ok "20h42 no record was written"
+# 20h43 THE ROW RECOGNITION MIRRORS brief-gate's (tenth cycle, P2). A GFM table need not have OUTER
+#       PIPES (`assertion | mutant | reddened | observed` renders as one), and brief-gate strips a
+#       bullet and blockquote markers before counting cells — so an artifact it certifies valid was
+#       NOT excluded here, its row was read as the reviewer's claim, and a correct record was refused
+#       with a false accusation. Both spellings are below, and the validator is run to prove the body
+#       is valid (otherwise the vector proves nothing).
+EH51=425238; rm -f "$(Q2 $EH51)"
+BODY43="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+assertion | mutant (reverts the fix) | reddened row | observed
+---|---|---|---
+x | sed s/rc=80/rc=0/ | A (i) | rc=0
+- the guard added at ${DG_A1} | revert it | B (ii) | row red"
+run_record_delta $EH51 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523901" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="$BODY43"
+assert_eq "$RECORD_RC" "0" "20h43 a no-outer-pipe / bulleted kill table is EXCLUDED (rc 0)"
+[ -f "$(Q2 $EH51)" ] || bad "20h43 no record was written for a valid artifact"
+if printf '%s' "$BODY43" | bash "$SCRIPT_DIR/orchestrator-harness/brief-gate.sh" --mutation-missing - >/dev/null 2>&1; then
+    ok "20h43 brief-gate accepts the no-outer-pipe table (the vector is not vacuous)"
+else
+    bad "20h43 brief-gate did NOT accept the no-outer-pipe table — the vector would prove nothing"
+fi
+# 20h44 A SKIPPED TOKEN IS NOT A STATED RANGE (eleventh cycle, P1). The prose skip exists so a
+#       hex-LOOKING pair (`0xdead..0xbeef`) is not refused as a contradicting range, and its own
+#       comment promises it is "skipped, never silently accepted as a range". But `_any` was set
+#       BEFORE the skip, so the skipped token still marked the body as having STATED a range:
+#       `_all_ok` stayed 1 (so the containment refusal could not fire) and `_any` stayed 1 (so the
+#       "a stated range is REQUIRED" refusal could not fire either) — the two arms cancelled and
+#       the body sailed through the very requirement the ninth cycle added. MEASURED: the body
+#       below states no range at all and recorded rc 0 with a `delta_range` derived from DATES,
+#       which is the case arm (10a) says "dates cannot settle". 20h41's vector could not see it
+#       because it takes the OTHER branch (a real range is stated beside the prose).
+EH52=425240; rm -f "$(Q2 $EH52)"
+run_record_delta $EH52 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524101" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="The literals 0xdead..0xbeef and f00d..babe are unrelated to this change.
+No issues found; the port handling is correct."
+assert_eq "$RECORD_RC" "3" "20h44 a body whose ONLY dots-token is PROSE has not stated a range (rc 3)"
+assert_contains "$RECORD_ERR" "does not STATE the range" "20h44 the refusal names the missing range statement"
+[ -f "$(Q2 $EH52)" ] && bad "20h44 no record was written" || ok "20h44 no record was written"
+# 20h45 THE REFUSAL MUST NAME WHAT ACTUALLY HAPPENED (eleventh cycle, P2). The arm refuses an
+#       artifact that names a commit LATER than A — a DECLARED residual, kept deliberately (see the
+#       note above it), because telling an innocent reference from a narrowing endpoint means
+#       enumerating notations. What was wrong is the DIAGNOSIS: for an artifact that states the
+#       CORRECT range and additionally LISTS the commits it read — the ordinary reviewer artifact,
+#       and what `skills/code-review/SKILL.md` asks a reviewer to return — the message asserted a
+#       "narrower range … written in a notation this code does not parse" when the artifact narrowed
+#       nothing and the token was a plain sha. The rule stays; the sentence now distinguishes a
+#       commit INSIDE the range from a narrowing endpoint.
+EH53=425242; rm -f "$(Q2 $EH53)"
+run_record_delta $EH53 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524301" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## What I reviewed
+
+| commit | subject |
+|---|---|
+| ${DG_A1} | the lane commit |
+| ${DG_HEAD} | the forward merge |"
+assert_eq "$RECORD_RC" "3" "20h45 naming a commit INSIDE the range is still refused (declared residual)"
+assert_contains "$RECORD_ERR" "INSIDE the range" "20h45 the refusal says INSIDE the range"
+assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h45 and does NOT accuse the artifact of an unparseable narrowing"
+# 20h46 THE THIRD LOCATION: A COMMIT AFTER THE HEAD (twelfth cycle, P2). The eleventh cycle's fix
+#       split the refusal in two and its own comment claimed a token that is not INSIDE the range
+#       "can only be a narrowing endpoint written in a notation the parser did not tokenise". That is
+#       FALSE: a commit whose PARENT is the attested head reaches the same message and was told it
+#       had written an unparseable narrowing — a narrowing is BELOW the range, a descendant of B is
+#       ABOVE it, and no notation is involved in either. The refusal is right (a verdict naming a
+#       commit that did not exist at B is not a verdict at B); the diagnosis was not. This vector is
+#       the only one that reaches that branch, which is why the wording was never exercised before.
+EH54=425244; rm -f "$(Q2 $EH54)"
+_b46="$(printf 'later\n' | git -C "$DG" hash-object -w --stdin)"
+_t46="$(printf '100644 blob %s\tlater.txt\n' "$_b46" | git -C "$DG" mktree)"
+DG_AFTER="$(git -C "$DG" commit-tree "$_t46" -p "$DG_HEAD" -m 'later work')"
+run_record_delta $EH54 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524501" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found. The head later moved to ${DG_AFTER}."
+assert_eq "$RECORD_RC" "3" "20h46 a commit AFTER the attested head is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "AFTER" "20h46 the refusal says AFTER the attested head"
+assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h46 and does NOT accuse the artifact of an unparseable narrowing"
+# 20h46b THE MESSAGE MUST NOT EXECUTE ITS OWN BACKTICKS (thirteenth cycle, P2). The refusal above was
+#        written with a RAW `` `clean` `` inside a double-quoted `echo`, so bash ran `clean` as a
+#        COMMAND SUBSTITUTION: stderr carried `line NNNN: clean: command not found` and the sentence
+#        printed `a  record` with the word missing. Measured on the shipped head, and it is not
+#        cosmetic on a box where a `clean` executable exists on PATH — the message executes it. The
+#        rule and the exit code were unaffected, which is exactly why nothing caught it.
+assert_not_contains "$RECORD_ERR" "command not found" "20h46b the refusal does not RUN its own backticked word"
+assert_contains "$RECORD_ERR" 'a `clean` record' "20h46b the backticked word is PRINTED, not run"
+# 20h48 THE WHOLE SCRIPT, NOT JUST ONE SENTENCE (thirteenth cycle, P2). The same defect already
+#        pre-existed on the carry arm's `empty` message, so a vector per sentence cannot bound it —
+#        the class is "an echo/printf message that executes its own backticks". This is the sweep:
+#        every `echo`/`printf` LINE in the recorder is scanned, escaped backticks excepted. It reds
+#        on a reintroduction anywhere in the file rather than only where someone thought to test.
+_badbt="$(python3 - "$SCRIPT_DIR/record-review.sh" <<'PY48'
+import re, sys
+out = []
+for i, l in enumerate(open(sys.argv[1]), 1):
+    st = l.strip()
+    if not (st.startswith('echo ') or st.startswith('printf ')):
+        continue
+    if re.findall(r'(?<!\\)`', st):
+        out.append("%d: %s" % (i, st[:90]))
+print("\n".join(out))
+PY48
+)"
+assert_eq "$_badbt" "" "20h48 no echo/printf message anywhere in the recorder executes its own backticks"
+# 20h48b THE SAME CLASS IN THE SUITE'S OWN LABELS (round 3, P2). 20h48 scans only the RECORDER, so
+#        a label in this file was invisible to it — and one carried unescaped backticks, so the
+#        suite EXECUTED `n_authored` as a command at test time and printed the label with the word
+#        deleted ("—  is legitimately 0 here"). Not cosmetic by 20h46b's own reasoning: on a box
+#        with a `clean` executable on PATH, a message that executes its own backticks runs it.
+#        The scan covers BOTH files, strips single-quoted regions (a backtick there is literal) and
+#        strips trailing comments through a small quote-state machine (so `# only \`x\` is RED`
+#        is not a hit, while a backtick in a LABEL argument is).
+# ⛔ AND THE SCANNER ITSELF CARRIES A CONTROL (round 4, P2). Without one, a scanner that
+#    silently stopped SEEING a case would print "" and PASS — the very false PASS this sweep
+#    exists to prevent, asserted by the sweep. The fixture is generated with `printf '\140'` so
+#    THIS file holds no live backtick of its own, and its EIGHT lines pin the lexical rules the
+#    scanner models, each one measured against bash rather than assumed:
+#      1 RED   an apostrophe inside "..." is a literal, it does not shield a backtick
+#      2 GREEN single-quoted content is literal
+#      3 GREEN ONE backslash escapes it
+#      4 RED   an EVEN run leaves it executable (`double backslash \EXECUTED runs`)
+#      5 RED   `#` comments only at a WORD START: `a#`echo X`` prints `a#X` (man bash, COMMENTS)
+#      6 RED   ...and a closing quote leaves you MID-WORD: `"x"#`echo X`` prints `x#X`
+#      7 RED   an unquoted backslash escapes the NEXT char: `it\'s `echo X`` runs X, so `\'`
+#              does not open a quote (man bash, QUOTING)
+#      8 GREEN ...so `\"` opens nothing either, and the `#` after it IS a comment
+#    Lines 5-8 exist because the first cut of this control pinned only 1-4 and the scanner
+#    was still blind to them — a false CLEAN on 5-7 and a false RED on 8, all four measured.
+_bt="$(printf '\140')"
+{
+  printf '%s\n' "_x=\"the grader's ${_bt}n_authored${_bt} isn't 0\""
+  printf '%s\n' "_y='literal ${_bt}x${_bt}'"
+  printf '%s\n' "_z=\"escaped \\${_bt}x\\${_bt} is literal\""
+  printf '%s\n' "_w=\"double backslash \\\\${_bt}x\\\\${_bt} runs\""
+  printf '%s\n' "echo a#${_bt}echo EXEC5${_bt}"
+  printf '%s\n' "echo \"x\"#${_bt}echo EXEC6${_bt}"
+  printf '%s\n' "echo it\\'s the ${_bt}echo EXEC7${_bt} that moved"
+  printf '%s\n' "echo \\\"a # only ${_bt}echo NOTEXEC${_bt} is a comment"
+} > "$T/btctrl.sh"
+# ⛔ THE HERE-DOC LIVES IN A FUNCTION BODY, NOT IN A `$( )` (bash 3.2, #2930/#2248).
+#    bash 3.2's `$( )` scanner does not know about here-documents: it walks the body as CODE,
+#    so a body carrying an UNBALANCED quote desynchronises the parse state for the REST OF THE
+#    FILE — and this body quotes live backticks as PROSE. Measured at 7666f34b3: `bash -n`
+#    under bash 3.2.57 reported "unexpected EOF while looking for matching `\"'" at the body
+#    and "syntax error: unexpected end of file" ~550 lines below, so `check-bash32-parse.sh`
+#    (#2930) REDS — on a stock Mac `/bin/bash` is 3.2 and install.sh's `bash -n` sweep dies.
+#    The remedy is #2248's: the substitution now carries a FUNCTION CALL, no here-doc.
+_badbt2_sweep() { python3 - "$1" "$2" "$3" <<'PY48B'
+import re, sys
+ctrl = sys.argv[1]
+targets = sys.argv[2:]
+# ⛔ ONE STATE MACHINE, NOT TWO (round 4, P2). The first cut stripped comments in a
+# quote-state machine and then removed single-quoted spans with a REGEX on the
+# result — outside that state. Inside a DOUBLE-quoted string an apostrophe is a
+# literal character, not a quote opener, so a pair straddling a backtick
+# ("the grader's `n_authored` isn't 0") deleted the backtick before it was tested:
+# a false PASS on the exact class this sweep claims to bound. Single-quoted content
+# is now dropped BY the machine (q == "'"), where the context is known, and
+# apostrophes inside "..." are kept literal.
+# ⛔ WHAT THIS MODELS, AND WHAT IT DOES NOT (round 5, P2) — stated because the earlier
+# wording claimed a bash lexer and this is not one. It is a SINGLE-LINE classifier:
+#   MODELLED       unquoted `\` escapes the next char, `'...'` is literal, `"..."` keeps
+#                  apostrophes literal, an even backslash run leaves a backtick live (parity
+#                  falls out of pair-consumption), `#` comments only at a WORD START, and
+#                  `$'...'`/`${...}`/`$(...)` do not exist for it.
+#   NOT MODELLED   a quoted string that SPANS LINES (a `#`-leading continuation line reads as
+#                  a comment), `$'...'` ANSI-C quoting, a `#` inside `${...}`, and heredoc
+#                  bodies. All four were MEASURED as false CLEANs on hand-built lines
+#                  (round 6), and NONE of them occurs in either target: all 19 backtick-bearing
+#                  lines that are not WHOLE-LINE comments (13 recorder, 6 suite) carry their
+#                  backticks escaped `\``, single-quoted, or after a trailing `#` comment —
+#                  three benign categories, and the classifier agrees on all 19 (round 7).
+# ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
+# Carrying quote state across lines is the only way to close the multi-line hole, and on the
+# REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
+# the awk program at record-review.sh:1680 ends a line inside a single-quoted string, and a
+# state machine that does not model `$(` re-opens a quote mid-program and flags the awk
+# comments at 1685-1734 as live backticks — 26 false REDs across 12 lines (that region plus a
+# second desync at 4331-4354) on the recorder. Modelling `$(`,
+# `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
+# project from this vector. So the scope is DECLARED here instead of over-claimed: this
+# sweep bounds the shipped defect (a `"..."` message that runs its own backticks) on every
+# line of both files, exactly, and it is a BELT — the artifact's own refusals (20h46b) are
+# the gate.
+# ⛔ WITHIN THAT SCOPE IT MUST MODEL THE RULES, NOT ITS OWN INTUITION (round 5, P2) — the
+# first cut treated ANY unquoted `#` as a comment and consumed NO unquoted backslash, which
+# gave a false CLEAN on `a#`echo X``, `"x"#`echo X`` and `it\'s `echo X``, and a false RED on
+# `\"a # ... `x`` (all four measured):
+#   * man bash, COMMENTS: "a WORD BEGINNING WITH #" — so `a#b` is mid-word and comments nothing.
+#   * man bash, QUOTING: a non-quoted backslash preserves the literal value of the next char.
+_WORDSTART=set(' \t;|&()<>')
+def scan(s):
+    out=[]; q=None; i=0; last=None
+    while i < len(s):
+        c=s[i]
+        if q == '"':
+            if c=='\\':
+                out.append(c); out.append(s[i+1:i+2]); last=c; i+=2; continue
+            if c=='"': q=None
+            out.append(c); last=c
+        elif q == "'":
+            if c=="'": q=None; last=c
+            # content inside single quotes is literal: dropped, never tested
+        else:
+            if c=='\\':
+                # an UNQUOTED backslash consumes the next character: `\'` is literal
+                out.append(c); out.append(s[i+1:i+2]); last=c; i+=2; continue
+            if c=='"': q='"'; out.append(c); last=c
+            elif c=="'": q="'"; last=c
+            elif c=='#' and (last is None or last in _WORDSTART):
+                break          # a comment: a word BEGINNING with `#`
+            else: out.append(c); last=c
+        i+=1
+    return ''.join(out)
+def has_live_backtick(s):
+    # ⛔ BACKSLASH PARITY, NOT `(?<!\\)`: one preceding backslash is not "escaped",
+    # because the shell consumes them in pairs — `\\\\` before a backtick leaves it
+    # executable (measured).
+    for m in re.finditer('`', s):
+        j=m.start()-1; n=0
+        while j >= 0 and s[j]=='\\':
+            n+=1; j-=1
+        if n % 2 == 0: return True
+    return False
+out=[]
+# ⛔ THE CONTROL COMES FIRST, AND A CRASH IS A HIT — NOT AN EMPTY ANSWER. Without the
+#    try/except a missing control fixture or an unreadable target aborts python, and its
+#    empty stdout satisfies `assert_eq "$_badbt2" ""` — the sweep passing BECAUSE its
+#    machinery failed, which is the same false PASS one level up.
+#    A scanner that cannot see line 1 (a false PASS) or that flags lines 2-3 (a false
+#    RED) is likewise reported AS A HIT, so the sweep cannot pass by having gone blind —
+#    the failure mode the straddling-apostrophe version shipped.
+try:
+    seen=[i for i,l in enumerate(open(ctrl),1)
+          if l.strip() and not l.strip().startswith('#') and has_live_backtick(scan(l.strip()))]
+    if seen != [1,4,5,6,7]:
+        out.append("SCANNER-SELF-TEST: control hits %r, expected exactly [1, 4, 5, 6, 7] (red: straddled, even-run, mid-word #, quoted-#, escaped-apostrophe; green: single-quoted, one-backslash, escaped-quote-comment)" % (seen,))
+    for path in targets:
+        for i,l in enumerate(open(path),1):
+            st=l.strip()
+            if not st or st.startswith('#'): continue
+            if has_live_backtick(scan(st)):
+                out.append("%s:%d: %s" % (path, i, st[:90]))
+except Exception as e:
+    out.append("SCANNER-SELF-TEST: the sweep could not run (%r) — an empty answer here is a FAILED sweep, not a clean one" % (e,))
+print("\n".join(out))
+PY48B
+}
+_badbt2="$(_badbt2_sweep "$T/btctrl.sh" "$SCRIPT_DIR/record-review.sh" "$SCRIPT_DIR/$(basename "$0")")"
+assert_eq "$_badbt2" "" "20h48b no double-quoted string in the recorder OR this suite executes its own backticks (labels included — 20h48 scans only the recorder; the scanner is pinned by its own 8-line control, and a crash is a hit)"
+# 20h47 THE THIRD BRANCH IS REACHABLE, AND ITS WORDING IS THE NARROWING ONE (twelfth cycle, P2). A
+#       commit that descends from `from` while being neither an ancestor NOR a descendant of the
+#       attested head is the one shape a narrowing endpoint can actually take — and no shipped vector
+#       reached it (M24's token is skipped by the unrelated-lineage arm), so the third message was
+#       dead text. Here it is measured, so a later edit that collapses the three branches reds.
+EH55=425246; rm -f "$(Q2 $EH55)"
+_b47="$(printf 'sibling\n' | git -C "$DG" hash-object -w --stdin)"
+_t47="$(printf '100644 blob %s\tsib.txt\n' "$_b47" | git -C "$DG" mktree)"
+DG_SIB="$(git -C "$DG" commit-tree "$_t47" -p "$DG_BASE" -m 'sibling work')"
+run_record_delta $EH55 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524701" \
+    STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" \
+    STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I also reviewed up to ${DG_SIB} on the side branch, which is where the real work happened."
+assert_eq "$RECORD_RC" "3" "20h47 a commit on a PARALLEL lineage is refused (rc 3)"
+assert_contains "$RECORD_ERR" "PARALLEL lineage" "20h47 and the refusal says the lineage it cannot tell apart"
+assert_not_contains "$RECORD_ERR" "notation this code does not parse" "20h47 and does NOT assert a narrowing the artifact never wrote (thirteenth cycle)"
+
+# ── 20i — THE DELTA PATH'S REPLACE/GRAFT POSTURE (review of this change, P1) ─────────
+# `delta_git` is the ONE line that disables `refs/replace/*` and the grafts FILE for every object
+# read the delta arms make (`rev-list`, `merge-tree`, `rev-parse`, `git diff`). It had NO vector
+# anywhere: `GIT_NO_REPLACE_OBJECTS` appeared ZERO times in this suite, and
+# `tests/record-review/run.sh` (12)/(13) mutate the CARRY walk's `local -x` export — a DIFFERENT
+# site — so the pin could be deleted and every vector here stayed green.
+#
+# WHAT A MISSING PIN BUYS, and why 20h2's fixture cannot show it: the attack needs a merge whose
+# tree was HAND-EDITED while its parents still merge CLEANLY. Then `merge-tree` answers rc 0 with
+# the AUTOMATIC tree, so a replacement object carrying that tree makes the hand-edited merge
+# compare EQUAL to the automatic one — the classifier calls it a clean merge, the range becomes
+# merge-only, the cover requirement degrades to "a comment naming A", and `clean` is minted over
+# lines nobody reviewed. 20h2's parents CONFLICT, so its `merge-tree` exits 1 and the rc check
+# alone refuses; the forgery is unreachable there.
+git checkout -q -b hidlane "$DG_A1" >/dev/null 2>&1
+printf 'lane h1\n' > h1.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'lane: h1'
+DG_HI_L="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_HI_L"
+git checkout -q -b hidbase "$DG_A1" >/dev/null 2>&1
+printf 'base h2\n' > h2.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: h2'
+DG_HI_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_HI_B"
+git checkout -q hidlane >/dev/null 2>&1 || true
+git -c core.editor=true merge --no-ff --no-commit "$DG_HI_B" >/dev/null 2>&1 || true
+# the hand edit lives ONLY in the merge commit — the state a reviewer never saw
+printf 'HAND EDIT nobody reviewed\n' >> h1.txt
+git add -A
+GIT_COMMITTER_DATE='2025-09-01T00:00:00Z' GIT_AUTHOR_DATE='2025-09-01T00:00:00Z' \
+    git commit -qm 'merge base (tree hand-edited after a CLEAN merge)'
+DG_HI_H="$(git rev-parse HEAD)"
+printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_HI_H"
+# BOTH premises are ASSERTED, or the vector silently stops testing the arm it was written for.
+if [ "$(git rev-list --merges "$DG_HI_L..$DG_HI_H" --not "$DG_HI_B" 2>/dev/null | wc -l | tr -d ' ')" = "1" ]; then
+    ok "20i1 fixture: the range's only new MERGE is the merge commit"
+else
+    bad "20i1 fixture: the range does not hold exactly one merge — the vector would not test the classifier"
+fi
+# ⛔ THE PREMISE THE VECTOR ACTUALLY NEEDS IS "NO LANE-AUTHORED (NON-MERGE) COMMIT IN THE RANGE", and
+#    the merge count above does not measure it (review of this change: the range legitimately also
+#    holds the base-side commit, so a LABEL saying "the only new commit is the merge" stayed green
+#    while the property it advertises was gone). Asserted separately, on the excluded walk the
+#    classifier itself uses.
+if [ -z "$(git rev-list --no-merges "$DG_HI_L..$DG_HI_H" --not "$DG_HI_B" 2>/dev/null)" ]; then
+    ok "20i1 fixture: NO lane-authored commit is in the range — the merge is the only thing it holds"
+else
+    bad "20i1 fixture: the range holds a non-merge commit, so it is authored regardless of the driver or the forge — this vector would certify nothing"
+fi
+DG_HI_PAR="$(git rev-list --parents -n1 "$DG_HI_H" 2>/dev/null)" || DG_HI_PAR=""
+read -r _hi_self DG_HI_P1 DG_HI_P2 _hi_rest <<< "$DG_HI_PAR"
+_hi_mtrc=0
+DG_HI_MT="$(git merge-tree --write-tree "$DG_HI_P1" "$DG_HI_P2" 2>/dev/null)" || _hi_mtrc=$?
+DG_HI_MT="${DG_HI_MT%%$'\n'*}"
+if [ "$_hi_mtrc" = "0" ]; then
+    ok "20i1 fixture: the merge is CLEAN (merge-tree rc 0) — the shape a replace ref can forge"
+else
+    bad "20i1 fixture: merge-tree exits $_hi_mtrc, so the rc check would refuse on its own and this vector would certify nothing"
+fi
+if [ -n "$DG_HI_MT" ] && [ "$DG_HI_MT" != "$(git rev-parse "$DG_HI_H^{tree}")" ]; then
+    ok "20i1 fixture: the merge tree is NOT the automatic one (the hand edit is real)"
+else
+    bad "20i1 fixture: the merge tree equals the automatic one — nothing was hand-edited"
+fi
+# A cover dated BETWEEN the lane work (2025-08-01) and the hand-edited merge (2025-09-01): it
+# postdates A, so a recorder that believed a forgery (merge-only ⇒ anchor = A) would ACCEPT it.
+EHI1=425150; rm -f "$(Q2 $EHI1)"
+run_record_delta $EHI1 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515001" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i1 a hand-edited merge that postdates the cover is refused (rc 3)"
+# ⛔ THE ANCHOR IS THE ATTRIBUTION HERE, not the wording of the no-cover sentence: with a cover
+#    named, the refusal is verify_review_evidence's date refusal, and what identifies WHICH commit
+#    the classifier anchored on is the sha it prints. A recorder that believed a forged
+#    (merge-only) range would anchor on A and ACCEPT; this one anchors on the hand-edited merge.
+assert_contains "$RECORD_ERR" "postdates ${DG_HI_H:0:12}" \
+    "20i1 the anchor is the hand-edited MERGE — the classifier read the REAL tree, not the forged one"
+[ ! -f "$(Q2 $EHI1)" ] && ok "20i1 no record written over the hand edit" || bad "20i1 a clean was minted over the hand edit"
+# ⛔ THE FORGERY, PLANTED. The replacement carries the AUTOMATIC tree and the SAME parents, so
+# plain git now answers `<merge>^{tree}` with the tree `merge-tree` produces — the tree-equality
+# test alone cannot catch it, which is exactly why the export exists.
+DG_HI_FAKE="$(git commit-tree "$DG_HI_MT" -p "$DG_HI_P1" -p "$DG_HI_P2" -m 'forged: the automatic merge tree')" || DG_HI_FAKE=""
+git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1 || true
+if [ "$(git rev-parse "$DG_HI_H^{tree}")" = "$DG_HI_MT" ]; then
+    ok "20i1 control: the replace ref is LIVE — the merge now REPORTS the automatic tree"
+else
+    bad "20i1 control: the replace ref did not take, so the fixture is vacuous"
+fi
+if [ "$(GIT_NO_REPLACE_OBJECTS=1 git rev-parse "$DG_HI_H^{tree}")" != "$DG_HI_MT" ]; then
+    ok "20i1 control: under GIT_NO_REPLACE_OBJECTS the REAL tree is still visible"
+else
+    bad "20i1 control: the export is not what makes the difference"
+fi
+EHI2=425151; rm -f "$(Q2 $EHI2)"
+run_record_delta $EHI2 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515101" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i1 WITH the replace ref planted the SAME range is still REFUSED (rc 3)"
+assert_contains "$RECORD_ERR" "postdates ${DG_HI_H:0:12}" \
+    "20i1 …and the anchor is STILL the real merge — the pin made the replacement invisible to every arm"
+git replace -d "$DG_HI_H" >/dev/null 2>&1 || true
+# 20i2 THE GRAFTS FILE is a DIFFERENT mechanism, and `GIT_NO_REPLACE_OBJECTS` does NOT cover it
+#      (`tests/record-review/run.sh` (13) records that lesson for the carry walk). Here the graft
+#      rewrites the merge's PARENTAGE, so plain git stops seeing a merge at all and walks the
+#      commit as ordinary authored content — a classification change a graft-honouring recorder
+#      would report as the COUNT form ("contains authored content (1 commit(s))").
+printf '%s %s\n' "$DG_HI_H" "$DG_HI_L" > "$DG/.git/info/grafts"
+if [ "$(git rev-list --parents -n1 "$DG_HI_H" 2>/dev/null | wc -w | tr -d ' ')" = "2" ]; then
+    ok "20i2 control: the grafts file is LIVE — plain git now sees ONE parent (no merge)"
+else
+    bad "20i2 control: the grafts file did not take, so the fixture is vacuous"
+fi
+# ⛔ COVER-LESS ON PURPOSE. With a cover both classifications refuse on the same DATE sentence,
+#    so the exit code and the message would be identical and the vector would certify nothing.
+#    Without one, the two classifications print DIFFERENT sentences: a recorder that sees the
+#    MERGE says "holds authored content in a MERGE" (n_authored = 0); one that honoured the graft
+#    sees an ordinary authored commit and says "contains authored content (1 commit(s))".
+EHI3=425152; rm -f "$(Q2 $EHI3)"
+run_record_delta $EHI3 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H" STUB_BASE_SHA="$DG_HI_B"
+assert_eq "$RECORD_RC" "3" "20i2 a grafted-away merge is still refused (rc 3)"
+assert_contains "$RECORD_ERR" "holds authored content in a MERGE" \
+    "20i2 the refusal is STILL the evil-merge arm — GIT_GRAFT_FILE made the graft invisible"
+assert_not_contains "$RECORD_ERR" "contains authored content (1 commit(s))" \
+    "20i2 …and NOT the count form a graft-honouring recorder would produce"
+rm -f "$DG/.git/info/grafts"
+
+# 20i3 THE ORACLE ITSELF — AN AMBIENT ATTRIBUTES FILE (cycle-2/3 review, P1; reported with runnable
+#      repros, reproduced here before the fix). `merge-tree` honours merge drivers, and the BUILT-IN
+#      ones (`union`) have NO config key at all — so `merge=union` named from an attributes file
+#      steers the oracle with nothing but a `printf`. Measured in this fixture: the conflict answers
+#      rc 1 with no attributes and rc 0 returning EXACTLY the hand "keep both" tree once the file
+#      exists. The attribute source that matters is the one the DIFF cannot see: an UNTRACKED (or
+#      modified) `.gitattributes` in the worktree, and `.git/info/attributes`. A `.gitattributes`
+#      committed in the merge's own tree is a legitimate repo semantic (tortoise#5373) and stays
+#      accepted.
+git checkout -q -b uni_lane "$DG_A1" >/dev/null 2>&1 || true
+printf 'lane-line\n' > u.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'lane: u'
+DG_UN_L="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_UN_L"
+git checkout -q -b uni_base "$DG_A1" >/dev/null 2>&1 || true
+printf 'base-line\n' > u.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: u'
+DG_UN_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_UN_B"
+git checkout -q uni_lane >/dev/null 2>&1 || true
+git -c core.editor=true merge --no-ff --no-commit "$DG_UN_B" >/dev/null 2>&1 || true
+# the hand resolution is the ordinary "keep both" concatenation — i.e. exactly `merge=union`'s output
+printf 'lane-line\nbase-line\n' > u.txt
+git add -A
+GIT_COMMITTER_DATE='2025-09-01T00:00:00Z' GIT_AUTHOR_DATE='2025-09-01T00:00:00Z' \
+    git commit -qm 'keep both (hand resolution)'
+DG_UN_H="$(git rev-parse HEAD)"
+printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_UN_H"
+_un_mt=0
+DG_UN_MT="$(git merge-tree --write-tree "$DG_UN_L" "$DG_UN_B" 2>/dev/null)" || _un_mt=$?
+DG_UN_MT="${DG_UN_MT%%$'\n'*}"
+if [ "$_un_mt" != "0" ] && [ "$DG_UN_MT" != "$(git rev-parse "$DG_UN_H^{tree}")" ]; then
+    ok "20i3 fixture: WITHOUT the attribute the merge CONFLICTS (rc $_un_mt) and its tree is not the hand one"
+else
+    bad "20i3 fixture: the conflict premise does not hold (rc=$_un_mt) — the vector would certify nothing"
+fi
+printf 'u.txt merge=union\n' > .gitattributes
+_un_mt2=0
+DG_UN_MT2="$(git merge-tree --write-tree "$DG_UN_L" "$DG_UN_B" 2>/dev/null)" || _un_mt2=$?
+DG_UN_MT2="${DG_UN_MT2%%$'\n'*}"
+if [ "$_un_mt2" = "0" ] && [ "$DG_UN_MT2" = "$(git rev-parse "$DG_UN_H^{tree}")" ]; then
+    ok "20i3 control: the UNTRACKED attribute STEERS the oracle — rc 0, tree EQUAL to the hand resolution"
+else
+    bad "20i3 control: the ambient attribute did not steer merge-tree (rc=$_un_mt2), so this vector does not reproduce the bypass"
+fi
+# a cover that POSTDATES A: for a merge-only range that is sufficient, so the ambient attribute is
+# the only thing between this input and a minted `clean`.
+EHI7=425156; rm -f "$(Q2 $EHI7)"
+run_record_delta $EHI7 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515601" \
+    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i3 an AMBIENT .gitattributes is refused (rc 3)"
+assert_contains "$RECORD_ERR" "AMBIENT ATTRIBUTES file steers" "20i3 the refusal names the ambient attribute source"
+assert_contains "$RECORD_ERR" ".gitattributes" "20i3 …and names the file it found"
+[ ! -f "$(Q2 $EHI7)" ] && ok "20i3 no record written" || bad "20i3 a clean was minted from a steered oracle"
+# ⛔ THE ATTRIBUTION IS THE MUTATION CELL (M36), NOT AN IN-VECTOR CONTROL: with the attribute removed
+#    this merge CONFLICTS again, so the range is EVIL and refuses on the anchor regardless of the
+#    refusal under test — a "control" here would refuse for a different reason and certify nothing.
+#    The premise that the attribute really steers the oracle is asserted with git itself, above.
+rm -f .gitattributes
+# 20i6 THE BOX-GLOBAL SOURCES — `core.attributesFile` and the default `$XDG_CONFIG_HOME/git/attributes`
+#      are MACHINE settings, so the oracle read neutralises them instead of refusing (cycle-4
+#      review, P1: `~/.config/git/attributes` steering `merge=union` produced rc 0 + tree-equal while
+#      every ambient scan came back empty). The recorder's HOME here is the suite's FAKE home, which
+#      is exactly where a user-level attribute file lives.
+mkdir -p "$F_HOME/.config/git"
+printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
+_un_g=0
+DG_UN_MT3="$(HOME="$F_HOME" XDG_CONFIG_HOME= git merge-tree --write-tree "$DG_UN_L" "$DG_UN_B" 2>/dev/null)" || _un_g=$?
+DG_UN_MT3="${DG_UN_MT3%%$'\n'*}"
+if [ "$_un_g" = "0" ] && [ "$DG_UN_MT3" = "$(git rev-parse "$DG_UN_H^{tree}")" ]; then
+    ok "20i6 control: a GLOBAL attributes file really steers plain merge-tree (rc 0, tree = the hand resolution)"
+else
+    bad "20i6 control: the global attributes file did not steer merge-tree (rc=$_un_g), so this vector certifies nothing"
+fi
+EHIA=425160; rm -f "$(Q2 $EHIA)"
+run_record_delta $EHIA "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" \
+    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i6 a GLOBAL attributes file does NOT steer the recorder's oracle (rc 3)"
+# ⛔ THE ANCHOR IS THE ATTRIBUTION when a cover is named (the no-cover sentence belongs to the other
+#    branch): a recorder whose oracle HAD been steered would classify merge-only, anchor on A and
+#    ACCEPT. This one still anchors on the hand merge, which is only possible if it saw the conflict.
+assert_contains "$RECORD_ERR" "postdates ${DG_UN_H:0:12}" \
+    "20i6 …the hand resolution is still classified EVIL (the anchor is the merge), because the oracle read neutralised the machine's rule"
+rm -f "$F_HOME/.config/git/attributes"
+# 20i7 THE TRACKED-BUT-DRIFTED `.gitattributes` (cycle-5 review, P0 — the previous commit dropped
+#      `-m` while adding `-o`, which LOST the modified-tracked case it had been catching; the staged
+#      and skip-worktree shapes were never in the population at all). The property is not an index
+#      state: it is whether the file the ORACLE reads differs from the one in the MERGE'S OWN TREE.
+#      All three states below steer `merge-tree` into the hand resolution and are invisible to
+#      `ls-files -o`; the drift read (`git diff <merge> -- <pathspec>`) is what catches the first
+#      two, and the flag scan catches the third because git refuses to compare it at all.
+git checkout -q -b attr_base "$DG_A1" >/dev/null 2>&1 || true
+printf '# fixture, no merge rules\n' > .gitattributes; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'fixture: tracked gitattributes'
+printf 'base-w\n' > w.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: w'
+DG_AT_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_AT_B"
+git checkout -q -b attr_lane "$DG_A1" >/dev/null 2>&1 || true
+printf 'lane-w\n' > w.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'lane: w'
+DG_AT_L="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_AT_L"
+git -c core.editor=true merge --no-ff --no-commit "$DG_AT_B" >/dev/null 2>&1 || true
+printf 'lane-w\nbase-w\n' > w.txt; git add -A
+GIT_COMMITTER_DATE='2025-09-01T00:00:00Z' GIT_AUTHOR_DATE='2025-09-01T00:00:00Z' git commit -qm 'keep both (hand)'
+DG_AT_H="$(git rev-parse HEAD)"
+printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_AT_H"
+_at_mt=0
+DG_AT_MT="$(git merge-tree --write-tree "$DG_AT_L" "$DG_AT_B" 2>/dev/null)" || _at_mt=$?
+DG_AT_MT="${DG_AT_MT%%$'\n'*}"
+if [ "$_at_mt" != "0" ] && [ "$DG_AT_MT" != "$(git rev-parse "$DG_AT_H^{tree}")" ]; then
+    ok "20i7 fixture: the merge CONFLICTS while .gitattributes is untouched (rc $_at_mt)"
+else
+    bad "20i7 fixture: the conflict premise does not hold (rc=$_at_mt)"
+fi
+# the DRIFTED worktree copy: TRACKED, modified, NOT untracked, NOT staged
+printf 'w.txt merge=union\n' > .gitattributes
+_at_mt2=0
+DG_AT_MT2="$(git merge-tree --write-tree "$DG_AT_L" "$DG_AT_B" 2>/dev/null)" || _at_mt2=$?
+DG_AT_MT2="${DG_AT_MT2%%$'\n'*}"
+if [ "$_at_mt2" = "0" ] && [ "$DG_AT_MT2" = "$(git rev-parse "$DG_AT_H^{tree}")" ]; then
+    ok "20i7 control: the DRIFTED tracked attribute steers the oracle (rc 0, tree = the hand resolution)"
+else
+    bad "20i7 control: the drifted attribute did not steer merge-tree (rc=$_at_mt2)"
+fi
+if [ -z "$(git ls-files -o 2>/dev/null)" ]; then
+    ok "20i7 control: the drifted file is NOT untracked — ls-files -o sees nothing, which is why drift is a separate read"
+else
+    bad "20i7 control: the fixture file is untracked, so this vector would test the wrong arm"
+fi
+EHIB=425161; rm -f "$(Q2 $EHIB)"
+run_record_delta $EHIB "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516101" \
+    STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i7 a MODIFIED tracked .gitattributes is refused (rc 3)"
+assert_contains "$RECORD_ERR" "worktree copy differs from merge" "20i7 the refusal names the drift, not an index state"
+# STAGED: same content, now in the index — invisible to `-o` and to `-m`
+git add .gitattributes
+EHIBA=425162; rm -f "$(Q2 $EHIBA)"
+run_record_delta $EHIBA "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516201" \
+    STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i7 a STAGED tracked .gitattributes is refused (rc 3)"
+# SKIP-WORKTREE: git refuses to compare the file, so equality cannot be proven
+git update-index --skip-worktree .gitattributes
+EHIBB=425163; rm -f "$(Q2 $EHIBB)"
+run_record_delta $EHIBB "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516301" \
+    STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i7 a SKIP-WORKTREE .gitattributes is refused (rc 3)"
+git update-index --no-skip-worktree .gitattributes 2>/dev/null || true
+# ⛔ UNSTAGE IT TOO. `git add` above left the union content in the INDEX; leaving it there makes the
+#    later `rm -f .gitattributes` a worktree DELETION relative to the index, which the drift read
+#    reports — so every following cell would refuse for a fixture residue rather than its own reason
+#    (measured: M36 "mutant still refused").
+git reset -q -- .gitattributes 2>/dev/null || true
+git checkout -- .gitattributes 2>/dev/null || true
+# ⛔ LEAVE THE FIXTURE REPO ON A BRANCH THAT HAS NO TRACKED .gitattributes. Later cells (M36) write
+#    an UNTRACKED one to test the untracked arm; with a tracked file still in the checkout that write
+#    would become a MODIFICATION, the drift arm would fire instead, and those cells would go vacuous
+#    (measured: M36 "mutant still refused"). 20i1's `hidlane` is that branch.
+git checkout -q hidlane >/dev/null 2>&1 || true
+rm -f .gitattributes
+# 20i5 THE CONFIG HALF: a CUSTOM driver (which has a config key) steered from an untracked
+#      attribute. Both halves are needed — the built-in drivers have no key, and a custom driver
+#      needs both the key and the attribute — and the refusal must name the scope, because the key
+#      may live in GLOBAL or SYSTEM config where 'record from a pristine checkout' does not help.
+printf 'u.txt merge=hidrv\n' > .gitattributes
+git config merge.hidrv.driver true || true
+EHI9=425158; rm -f "$(Q2 $EHI9)"
+run_record_delta $EHI9 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515801" \
+    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i5 a CUSTOM merge driver declared in config is refused (rc 3)"
+assert_contains "$RECORD_ERR" "DECLARES A MERGE DRIVER" "20i5 the refusal names the config driver"
+assert_contains "$RECORD_ERR" "merge.hidrv.driver" "20i5 …and names the offending config key"
+assert_contains "$RECORD_ERR" "scope" "20i5 …and says the key may live in GLOBAL or SYSTEM scope (the remedy depends on it)"
+[ ! -f "$(Q2 $EHI9)" ] && ok "20i5 no record written" || bad "20i5 a clean was minted from a custom-driver-steered oracle"
+rm -f .gitattributes
+git config --unset merge.hidrv.driver 2>/dev/null || true
+# 20i4 THE TOKEN SCAN'S FAILURE ARM (cycle-2 review, P2). `grep` exits 1 for a legitimate
+#      no-match, but a REAL failure of any pipeline member used to produce the same empty list, so
+#      the population loop silently did not execute. A shim is the only way to reach that state:
+#      `command sort` still resolves through PATH, and `$T/bin` is prepended for the recorder.
+# ⛔ THE SHIM MUST FAIL ONLY THE SCAN'S OWN CALL. A blanket `sort` failure also breaks the
+#    recorder's other `sort` uses (the anchor's `sort -rn`), so the run refused on an unrelated
+#    arm and the vector certified nothing (measured: rc 3 without the scan's sentence). `sort -u`
+#    is what the token scan pipes into; anything else is delegated to the real binary.
+printf '#!/bin/sh\nif [ "$1" = "-u" ]; then exit 2; fi\nexec /usr/bin/sort "$@"\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
+EHI6=425155; rm -f "$(Q2 $EHI6)"
+run_record_delta $EHI6 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515501" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+rm -f "$T/bin/sort"
+assert_eq "$RECORD_RC" "3" "20i4 a token scan that COULD NOT RUN is refused (rc 3)"
+assert_contains "$RECORD_ERR" "the commit-token scan FAILED" \
+    "20i4 …and the refusal says the SCAN failed, instead of reading as a claim about the claim"
+[ ! -f "$(Q2 $EHI6)" ] && ok "20i4 no record written" || bad "20i4 a scan that never ran still minted a clean"
+
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
 # whole suite when an anchor text moves is a footgun: an unrelated edit renames
@@ -7314,6 +8428,12 @@ assert old in text, "mutation anchor not found: %r" % old[:60]
 open(dst, "w").write(text.replace(old, new, 1))
 PY
     [ -s "$d/record-review.sh" ] || return 1
+    # ⛔ A MUTANT THAT DOES NOT PARSE MUST NOT SCORE OK (found in review). `mut_check … refused`
+    # accepts ANY non-zero exit, and bash exits 2 on a syntax error — so a mutation whose
+    # replacement broke the file's syntax would have reported "the guard is load-bearing" from a
+    # script that never ran a single arm. A parse check is the cheapest way to close that for
+    # EVERY cell at once rather than relying on each one's message attribution.
+    bash -n "$d/record-review.sh" 2>/dev/null || return 1
     printf '%s' "$d/record-review.sh"
 }
 mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
@@ -7325,12 +8445,21 @@ mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main STUB_COMMIT_DATES_DIR="$T/dates"
         export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         for kv in "$@"; do export "$kv"; done
-        # ⛔ #3442, the same fixture contract `run_record_delta` states: a mutant's cover must
-        # carry $VACUITY_BLOCK too, or every cell is refused by the non-vacuity arm and the
-        # matrix reports vacuous cells it never reached (measured 2026-11-07: 9 of the 12 cells
-        # were red this way before the block, and the matrix printed MUTATION-MATRIX(3/12)).
-        export STUB_EVIDENCE_BODY="${STUB_EVIDENCE_BODY}
-${VACUITY_BLOCK}"
+        # ⛔ THE MUTATION HARNESS MINTS A FRESH `clean` TOO, so it owes the same #3442 block
+        # (`verify_review_evidence`'s non-vacuity arm) — without it every mutant refused at 3
+        # from a DIFFERENT guard than the one it mutates, which is the exact vacuity this
+        # matrix exists to detect, reported against itself. Applied after the overrides, on
+        # the same terms as `run_record_delta` (a vector may opt out with
+        # DELTA_NO_VACUITY_BLOCK=1), so the body each vector wrote up to the blank line is
+        # what the range-scanning arms below actually see.
+        if [ "${DELTA_NO_VACUITY_BLOCK:-0}" != 1 ]; then
+            case "$STUB_EVIDENCE_BODY" in
+                *"MUTATION ATTRIBUTION"*) : ;;
+                *) STUB_EVIDENCE_BODY="$STUB_EVIDENCE_BODY
+
+$VACUITY_BLOCK"; export STUB_EVIDENCE_BODY ;;
+            esac
+        fi
         rc=0
         bash "$mut" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" >/dev/null 2>"$T/merr" || rc=$?
         printf '%s' "$rc" > "$T/mrc"
@@ -7407,16 +8536,103 @@ MUT="$(mk_mutant anchor '    anchor="$newest"' '    anchor="$to"')"
 mut_check "M5 covering-verdict anchor" 425124 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42512401" accepted STUB_EVIDENCE_AT="2025-01-01T00:00:00Z"
 # M6 — the base-aware classification (the reverse direction: breaking it must
 #      REFUSE the merge-only acceptance vector, or 20a tests nothing).
+# ⛔ THE VECTOR MUST BE 20a'S, COVER INCLUDED (agent-infra#3475). The first version dispatched
+#      `delta:$DG_A1..$DG_HEAD` with NO `+comment:`, and BOTH scripts refused it on DIFFERENT
+#      arms — the mutant on the authored-needs-cover arm (it classified the range authored) and
+#      the shipped code on the merge-only-needs-cover arm — so `mut_check … refused` scored OK
+#      for both and certified nothing about the classifier it names. Dispatching 20a's covered
+#      vector makes the CLASSIFICATION the only thing the mutant changes: shipped accepts it as
+#      merge-only, the mutant calls it authored, moves the anchor past the cover and refuses.
+#      The bare vector is kept as the SECOND cell, so the cover-less path is still measured.
 MUT="$(mk_mutant baseaware 'rev-list --no-merges "$from..$to" --not "$base_sha"' 'rev-list --no-merges "$from..$to"')"
-mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+mut_check "M6 base-aware classification" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42512501" refused STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+# ⛔ ATTRIBUTION, NOT JUST AN EXIT CODE (agent-infra#3475). `mut_check … refused` accepts ANY
+#    non-zero exit, so the cell above is green even if the mutant refused on an arm it does not
+#    mutate. Two assertions make the refusal attributable to the CLASSIFIER: the shipped recorder
+#    must ACCEPT the very same vector, and the mutant's stderr must be the authored classification.
+rm -f "$(Q2 425125)"
+run_record_delta 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42512501" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="reviewed $DG_A1; no issues found."
+assert_eq "$RECORD_RC" "0" "20g M6 the SHIPPED recorder ACCEPTS the same covered vector (rc 0) — so the mutant's refusal is caused by the classifier, not by the cover"
+assert_contains "$(cat "$T/merr" 2>/dev/null || true)" "authored content" \
+    "20g M6 the mutant refused BECAUSE it classified the range as AUTHORED — the arm it mutates — and not on a downstream arm"
+mut_check "M6b base-aware classification (cover-less path)" 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
+# ⛔ M6b IS ATTRIBUTABLE, NOT MERELY GREEN (agent-infra#3475). Dispatched cover-less, BOTH
+#    scripts refuse — the shipped one on the MERGE-ONLY-needs-cover arm and the mutant on the
+#    AUTHORED-needs-cover arm — so `refused` alone would score OK for both and the cell would be
+#    the same vacuous shape it was added to retire. The two assertions below DISTINGUISH the arms:
+#    the shipped refusal must name "holds no lane-authored commit" (merge-only) and the mutant's
+#    must name "contains authored content" (authored). A regression of the classifier moves the
+#    mutant's refusal to the merge-only sentence and reds this cell.
+rm -f "$(Q2 425125)"
+run_record_delta 425125 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD"
+assert_eq "$RECORD_RC" "3" "20g M6b the SHIPPED recorder refuses the cover-less vector"
+assert_contains "$RECORD_ERR" "holds no lane-authored commit" \
+    "20g M6b the shipped refusal is the MERGE-ONLY arm — so the mutant's authored refusal is a DIFFERENT arm, not the same rc 3 twice"
+assert_contains "$(cat "$T/merr" 2>/dev/null || true)" "contains authored content" \
+    "20g M6b the mutant refused at the AUTHORED arm — the classification the cell names is the thing that changed"
 # M7 — the EVIL MERGE in the anchor candidate set. 20h5's cover predates the
 #      hand-resolved merge, so dropping the merges from `cands` must ACCEPT it.
 MUT="$(mk_mutant evilanchor '    if [ -n "$evil_shas" ]; then' '    if false; then')"
 mut_check "M7 evil merge in the anchor set" 425140 "$DG_EV2_HEAD" "delta:$DG_EV_L..$DG_EV2_HEAD+comment:42514001" accepted STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
-# M14 — THE RANGE CONTAINMENT. Removing the ancestry test lets a body that declares a
-#       NARROWER range satisfy the claim for a wider one (20h15).
-MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$stated_from_sha" "$from" 2>/dev/null || sfr=$?' '          sfr=0')"
-mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+# M13 — THE MERGE-TREE EXIT STATUS. `merge-tree --write-tree` PRINTS A TREE ON CONFLICT (exit
+#       1), so a hand resolution that reproduces that tree defeats a tree comparison
+#       completely. Dropping the status term classifies the conflicted merge as CLEAN, the
+#       range as merge-only, and mints `clean` over conflict lines nobody reviewed. This cell
+#       was UNMEASURED for four cycles because its own fixture's range was EMPTY — the vector
+#       stopped at the EMPTY-DIFF arm further down and never reached this classification. The
+#       20h13 fixture now adds one unrelated base-side file (and asserts the diff is
+#       NON-EMPTY, without which the vector stops at the EMPTY-DIFF arm and measures nothing).
+#       M13's vector therefore carries a COVER, which the merge-only arm requires (it has no
+#       local-record shortcut) and dates it BETWEEN A and the merge: the shipped code anchors
+#       the cover on B (authored) and refuses a verdict that predates the hand resolution,
+#       while the mutant anchors on A (merge-only) and accepts it.
+MUT="$(mk_mutant mrcstatus '[ "$mrc" -ne 0 ] || [ -z "$want" ] ||' '[ -z "$want" ] ||')"
+mut_check "M13 the merge-tree EXIT STATUS is load-bearing" 425161 "$DG_MDB" "delta:$DG_MDA..$DG_MDB+comment:42516101" accepted STUB_EVIDENCE_AT="2025-05-04T00:00:00Z" STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_MDM" STUB_BASE_REF=main
+# M14b — THE RANGE CONTAINMENT IS NOW REDUNDANT, and this cell measures that instead of
+#        pretending otherwise (the M1b precedent). The sixth cycle added the token rule (20h30),
+#        which refuses ANY resolvable commit in the claim that is not the head or an ancestor of
+#        the range start — so removing the ancestry test from the parsed-range arm no longer
+#        opens the vector it used to: the same body is refused one layer down. Reported as
+#        REFUSED, which for a mutation cell means "the shipped vector is still refused with this
+#        guard gone" — i.e. the guard is defence in depth, not the sole decider. That is worth
+#        knowing and is exactly what the first version of this matrix got wrong in the other
+#        direction (a cell that claimed coverage it did not have).
+MUT="$(mk_mutant rangecontain '          delta_git "$root" merge-base --is-ancestor "$_sfs" "$from" 2>/dev/null || _r=$?' '          _r=0')"
+mut_check "M14b range containment is REDUNDANT behind the token rule" 425166 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42516701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:$DG_A1..$DG_HEAD only; no issues found."
+# M15 — THE SEPARATOR TOLERANCE, RE-TARGETED BY THE FIFTH CYCLE. This cell used to mutate the
+#       separator AND the refuse-on-unparseable arm so a three-dot body fell through to the
+#       bare needle. That fallback is GONE (20h25), so the same three-dot body is refused either
+#       way and the cell went vacuous — reported honestly as "mutant still refused". The
+#       tolerance still decides something, but only in the ACCEPTANCE direction: an honest
+#       reviewer writing `BASE...HEAD` must not be falsely blocked. So the vector is now 20h28
+#       (the CORRECT range, three-dot) and the mutant must REFUSE it.
+MUT="$(mk_mutant sepdots '(\.{2,3})' '(\.\.)')"
+mut_check "M15 a three-dot statement of the CORRECT range is accepted" 425200 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}...${DG_HEAD}; no issues found."
+# M16 (the refuse-on-unparseable arm) and M17 (the token's case/padding) are RETIRED WITH THEIR
+# ARM, on the M8 precedent: the fifth cycle made a stated range REQUIRED for an authored range
+# (20h25), so a body the matcher cannot parse refuses whether or not the token layer fired. The
+# `_delta_tok` predicate now selects only WHICH message is printed — a verdict-neutral detail that
+# no mutant can turn into a bypass, and a cell that mutates it can only ever report vacuity. The
+# two vectors those cells guarded, 20h19 and 20h20, still assert their refusals; they are "pinned
+# by refusal vectors only, not by a mutant", which the matrix summary line already names.
+# M18 — THE SHAPE ARM (20h23), RE-TARGETED BY THE FIFTH CYCLE to the direction that still decides.
+#       With the bare needle gone, keying on the WORD no longer admits a bypass — it FALSE-BLOCKS
+#       an artifact that states the correct range in ordinary prose. So the vector is 20h29 and
+#       the mutant must REFUSE it. Written as an `if` because the recorder runs under
+#       `set -euo pipefail` — the terse `[ … ] && _scan=…` form returns 1 when no token is present
+#       and would abort the mutant instead of reaching the fall-through it is meant to demonstrate.
+MUT="$(mk_mutant wordkeyed '_scan="$_claim"; _any=0; _all_ok=1' '_scan=""; if [ "$_delta_tok" -eq 1 ]; then _scan="$_claim"; fi; _any=0; _all_ok=1')"
+mut_check "M18 the arm keys on the RANGE SHAPE, not the word" 425202 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed only ${DG_BASE}..${DG_HEAD}; no issues found."
+# M19 — THE EXHAUSTIVE SCAN (20h24). Stopping after the FIRST match is the leftmost-match
+#       behaviour the fourth cycle found: the recorded range satisfies every clause, so the
+#       narrower range the artifact actually read is never examined and the record asserts a
+#       range over commits nobody reviewed.
+# M19b — THE EXHAUSTIVE SCAN IS NOW REDUNDANT for narrow-range detection, on the same terms as
+#        M14b: the token rule refuses the narrowed range wherever it appears in the claim, so
+#        stopping after the first match no longer re-accepts the vector. Reported as REFUSED.
+MUT="$(mk_mutant firstonly '      _scan="${_scan#*"${BASH_REMATCH[0]}"}"' '      _scan=""')"
+mut_check "M19b the exhaustive scan is REDUNDANT behind the token rule" 425192 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519301" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="delta:${DG_BASE}..${DG_HEAD} is the brief; I read delta:${DG_A1}...${DG_HEAD} only; no issues found."
 # M10 — the ANCHOR POPULATION. Re-inserting the `break` on the first non-clean
 #       merge truncates `evil_shas` to the backdated CHILD, so 20h9's cover (which
 #       predates the parent's hand-resolution) is accepted again: the same class as
@@ -7424,45 +8640,265 @@ mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_
 #       population was truncated.
 MUT="$(mk_mutant breakanchor '      : "${evil:=merge ${m:0:12} is NOT a clean merge' '      break; : "${evil:=merge ${m:0:12} is NOT a clean merge')"
 mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" accepted STUB_EVIDENCE_AT="2026-05-01T00:00:00Z"
-# M11 — THE CLAUSE-(E) POLARITY. An unnamed answer from the check-surface read must refuse.
-#       The mutant replaces the read with a status the code does not name (`3` — neither
-#       `0`, the one status meaning "the surface WAS read", nor a verdict token); the
-#       shipped code refuses every non-zero status, and a version that listed only the
-#       named statuses ACCEPTED it and minted `clean` over a head whose checks were
-#       never shown non-red — the enum fall-through the AGENTS.md verification-state
-#       rule forbids. The mutant is the SIMULATION of the drift, so this cell asserts
-#       REFUSED: it reddens precisely when the polarity regresses.
-# ⛔ THE ANCHOR MOVED WITH THE CALL. It pinned `target_head_red "$to" || thr=$?` — a
-#       helper that no longer exists (its deletion left this caller behind, which is
-#       the whole §20 outage). The anchor is now the direct `check_surface_scan` call
-#       that replaced it, so the cell keeps measuring the same thing at the code that
-#       actually runs.
-# ⛔ AND THE VECTOR NEEDS A COVER, OR THE CELL CANNOT SEE THE REGRESSION IT NAMES
-#       (fresh-context review of this change, P1 — verified against 20h1, which runs the
-#       SAME bare `delta:A..B` and asserts a refusal from the MERGE-ONLY cover arm: a
-#       bare range is refused AFTER (4b) by the mandatory-cover arm whenever (4b) does
-#       not itself refuse — which is exactly the state a permissive (4b) creates; a
-#       (4b) that ANSWERS `red` returns first and never reaches that arm, so this
-#       clause is about the fall-through, not about every possible answer).
-#       With no cover, a permissive (4b) — one that fell through an unnamed
-#       status instead of refusing it — would still exit 3 at the cover arm, and this
-#       cell would stay GREEN for exactly the regression it exists to catch. With the
-#       cover, a permissive (4b) continues, the range classifies merge-only, the cover
-#       verifies and the mutant MINTS — so the cell reddens. The PRECONDITION below
-#       MEASURES that reachability instead of asserting it: the same covered ref, run
-#       through the SHIPPED recorder, must RECORD.
-MUT="$(mk_mutant unnamedcheck '  thr=0
-  surf_out="$(check_surface_scan "$to")" || thr=$?' '  thr=3')"
-mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42515301" refused
-EH_M11=425900; rm -f "$(Q2 $EH_M11)"
-run_record_delta $EH_M11 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42515301"
-assert_eq "$RECORD_RC" "0" "20g M11 PRECONDITION: the SAME covered ref RECORDS on the shipped recorder (rc 0), so a permissive (4b) would mint and the cell above can redden"
-assert_contains "$(cat "$(Q2 $EH_M11)" 2>/dev/null || true)" '"delta_kind":"merge-only"' "20g M11 PRECONDITION: …and it records the merge-only classification that permissive path would use"
+# M11 — THE CLAUSE-(E) POLARITY. An UNNAMED answer from the check-surface predicate must
+#       refuse. (#3440) DELETED the `target_head_red` wrapper this cell used to mutate, so
+#       the anchor now targets the LIVE predicate — `check_surface_scan`, called directly by
+#       the delta arm — and injects an answer the `case` does not name (`weird_answer`).
+#       The shipped code refuses it, and a version whose case names only the known-bad
+#       values and lets everything else fall through as "not red" ACCEPTED it and minted
+#       `clean` over a head whose checks were never shown non-red — the enum fall-through
+#       the AGENTS.md verification-state rule forbids. The mutant is the SIMULATION of that
+#       drift, so this cell asserts REFUSED: it reddens precisely when the polarity
+#       regresses. ⛔ Cite the live predicate, never a name that no longer exists in
+#       record-review.sh (the same rule 14.14d states).
+MUT="$(mk_mutant unnamedcheck '  E_OUT=""; E_RC=0
+  E_OUT="$(check_surface_scan "$to")" || E_RC=$?' '  E_OUT="weird_answer"; E_RC=0')"
+# ⛔ THE REF MUST CARRY A COVER (agent-infra#3419). With the bare `delta:$DG_A1..$DG_HEAD`, the
+#    merge-only-needs-cover arm refuses a mutant that skips clause (E) too — both rc 3 — so
+#    emptying the `*)` body left this cell GREEN and the polarity arm was pinned by nothing.
+#    With a cover, clause (E) is the ONLY arm between this mutant and a `clean`, so the cell
+#    reds exactly when the polarity regresses. Attribution is pinned by the two assertions
+#    below: the shipped recorder ACCEPTS the same vector, and the mutant's stderr is clause
+#    (E)'s unreadable-answer refusal (site: scripts/record-review.sh, the `*)` arm's message).
+mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42515301" refused STUB_EVIDENCE_AT="2025-06-05T00:00:00Z"
+rm -f "$(Q2 425153)"
+run_record_delta 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42515301" \
+    STUB_EVIDENCE_AT="2025-06-05T00:00:00Z"
+assert_eq "$RECORD_RC" "0" "20g M11 the SHIPPED recorder ACCEPTS the same covered vector (rc 0) — so clause (E) is the only arm that can refuse the mutant"
+assert_contains "$(cat "$T/merr" 2>/dev/null || true)" "could not be READ (rc 0, answer 'weird_answer')" \
+    "20g M11 the mutant refused AT CLAUSE (E) — the unreadable-answer arm it mutates — and not downstream"
 
 # M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that
 #       never says which range it reviewed — the date-only inference the arm replaced.
-MUT="$(mk_mutant rangeclaim '      for _needle in "$to" "${to:0:12}"; do' '      body_claim=1; for _needle in "$to" "${to:0:12}"; do')"
+# ⛔ RE-TARGETED by the fifth cycle: the bare-needle fallback this cell used to prefix is GONE
+#     for an authored range (20h25/20h27), so the arm that now refuses an unclaimed range is the
+#     required-stated-range arm. The vector is unchanged; only the line that decides it moved.
+MUT="$(mk_mutant rangeclaim '    if [ "$_any" -ne 1 ]; then' '    if false; then')"
 mut_check "M12 an unclaimed range is refused" 425154 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42515501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed the diff; no issues found."
+# M20 — THE REQUIRED STATED RANGE (20h27). Restoring the bare-needle fallback is the shipped
+#       pre-fix state for a body that names ONLY the head: `_any` stays 0, the requirement is
+#       bypassed, and because the body names no OTHER commit the token rule has nothing to catch
+#       — so the body is accepted. (The en-dash vector 20h25 is NOT usable here any more: the
+#       token rule refuses it independently, which would make this cell vacuous — M21 covers the
+#       token rule, and M14b/M19b record that the older arms are now defence in depth.)
+MUT="$(mk_mutant nodigits '    if [ "$_any" -ne 1 ]; then' '    if false; then')"
+mut_check "M20 the stated range is REQUIRED, no alphabet-dependent fallback" 425198 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42519901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="Reviewed ${DG_HEAD}; no issues found."
+# M21 — THE TOKEN RULE (20h30). The structural half of the sixth cycle's fix: with the whole
+#       claim scanned for resolvable commits and the narrowing one caught by MEANING, disabling
+#       the population re-opens exactly the decoy bypass — the parsed range passes, the narrowed
+#       sentence beside it is never examined, and the record is minted over the wider range.
+# ⛔ TWO ANCHORS, NOT ONE: the scan line and the rc check that now guards it. Replacing only the
+#       scan leaves `_tok_rc` 0 and the mutant would still refuse on the token rule's real answer —
+#       the mutation has to restore the pre-fix "empty means nothing to check" shape.
+MUT="$(mk_mutant novalley '    _toks="$(printf '\''%s\n'\'' "$_claim" | command grep -oE '\''[0-9a-fA-F]{7,40}'\'' | command tr '\''A-F'\'' '\''a-f'\'' | command sort -u)" || _tok_rc=$?' '    _toks=""; _tok_rc=0')"
+mut_check "M21 every resolvable commit in the claim is checked" 425204 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520501" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+Reviewed only ${DG_A1}–${DG_HEAD}; no issues found."
+# M22 — THE TIP-RELATIVE ARM (20h33). Disabling it re-accepts `HEAD~1..HEAD` beside the decoy,
+#       which is the one narrowing notation the meaning rule cannot reach (no hex token).
+# ⛔ THE ANCHOR INCLUDES THE PATTERN LINE, NOT JUST THE `case` — the merge-only arm's
+# `case "$_claim" in` is the SAME SUBSTRING one indent deeper, so an anchor of `case "$_claim" in`
+# with four leading spaces matched inside the merge-only line and mutated the WRONG ARM; the cell
+# then reported "mutant still refused" and the tip-relative arm was left UNMEASURED for a cycle.
+# A mutation anchor must be ≥ the whole statement it means to break, not a suffix of another one.
+MUT="$(mk_mutant relativehead '    case "$_claim" in
+      *HEAD~*|*HEAD^*' '    case "" in
+      *HEAD~*|*HEAD^*')"
+mut_check "M22 a tip-relative range is refused" 425210 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed HEAD~1..HEAD."
+# M23 — THE EXCLUSION IS THE ROWS, NOT THE SECTION (20h34, 20h37). Skipping every line of the
+#       block's section is a REGION in a shorter costume: the sixth cycle's region ran to the next
+#       `## ` heading, the seventh cycle's span ran to the last row — both dropped PROSE, and both
+#       re-accepted a narrowing written there. The mutant restores the span shape (skip the whole
+#       section) and 20h34's `### Scope caveat` narrowing is accepted again.
+MUT="$(mk_mutant spanblock '          print line' '          if (!ins) print line')"
+mut_check "M23 the exclusion is the ROWS, not the whole section" 425212 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42521301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+### Scope caveat
+I only actually reviewed ${DG_A1}–${DG_HEAD}; the base-side merge was not read."
+# M26 — THE TABLE ROWS ARE ACTUALLY EXCLUDED (20h32). The other direction of M23: with the row
+#       predicate broken the kill table is compared as the reviewer's own claim, so a CORRECT
+#       artifact is refused because of a row describing a mutant pinned to the range.
+MUT="$(mk_mutant norowskip '            if (rowcells(line) > 0) {' '            if (0) {')"
+mut_check "M26 the kill table's rows ARE excluded from the claim" 425208 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42520901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| 20h30 the decoy beside a narrowed claim is caught | re-point this cell at delta:${DG_A1}..${DG_HEAD} | 20h30 | rc 3 |"
+# M27 — THE HEADING CONTRACT MIRRORS brief-gate.sh (20h38). Recognising only the canonical
+#       spelling leaves a brief-gate-VALID block unexcluded, so its row is read as the claim and a
+#       valid artifact is refused with a false accusation. The mutant restores the canonical-only
+#       matcher; 20h38's `### Mutation-Attribution` then refuses.
+MUT="$(mk_mutant canonhead 'htxt ~ /^[ \t]*mutation[ -]attribution/' 'htxt ~ /^[ \t]*mutation attribution/')"
+mut_check "M27 the heading contract mirrors brief-gate's" 425226 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522701" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+### Mutation-Attribution
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| the verdict covers ${DG_A1} | y | z | rc 3 |"
+# M28 — THE FLOOR BELOW 7 (20h41). Restoring the 12-char floor makes a 6-char narrowing invisible to
+#       both scans again, which is the ninth cycle's P1. The vector is 20h41 and the mutant must
+#       ACCEPT it.
+MUT="$(mk_mutant shortfloor '([0-9a-fA-F]{4,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{4,40})' '([0-9a-fA-F]{12,40})[[:space:]]*(\.{2,3})[[:space:]]*([0-9a-fA-F]{12,40})')"
+mut_check "M28 the range parser's floor is 4, not 12" 425232 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523301" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+I only actually reviewed ${DG_A1:0:6}..${DG_HEAD:0:6}; the rest was not read."
+# M29 — THE HEADING LINE'S TAIL (20h39). Dropping the whole heading line bins whatever a reviewer
+#       wrote on it, so a narrowing stated there is never scanned — the ninth cycle's P1.
+MUT="$(mk_mutant headtail 'if (rest !~ /^[ \t]*$/) print rest' 'if (0) print rest')"
+mut_check "M29 the heading line's prose is scanned" 425228 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522901" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION — I also only read ${DG_A1}–${DG_HEAD}
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |"
+# M30 — EVERY BLOCK, NOT JUST THE FIRST (20h40). Re-opening the section only once leaves a second
+#       block's rows outside the exclusion, so an addendum artifact is refused for a row it may
+#       carry — the ninth cycle's P2.
+MUT="$(mk_mutant secondblock '                ins = 1; depth = nh; hdr = 0; intable = 0' '                opened++; if (opened > 1) { ins = 0 } else { ins = 1; depth = nh; hdr = 0; intable = 0 }')"
+mut_check "M30 every MUTATION-ATTRIBUTION block is excluded" 425230 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| one | y | z | rc 3 |
+
+## MUTATION ATTRIBUTION (addendum, same verdict)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| two | the row that reddens delta:${DG_A1}..${DG_HEAD} | two | rc 3 |"
+# M31 — THE TABLE ENDS (20h42). Never resetting `intable` restores the ninth cycle's unbounded row
+#       exclusion: every row to EOF is dropped, so a narrowing in a row AFTER the block is invisible.
+MUT="$(mk_mutant openended '              intable = 0        # a blank line or prose ENDS the table (and never re-opens it)' '              intable = intable')"
+mut_check "M31 the block's table ENDS at a blank or prose line" 425236 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523701" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | y | z | rc 3 |
+
+| what I actually reviewed | ${DG_A1} | not the rest | rc 3 |"
+# M32 — THE ROW RECOGNITION (20h43). Requiring the pipe to be the FIRST non-blank character is the
+#       tenth cycle's false block: a valid GFM table without outer pipes, or a bulleted row, is read
+#       as the reviewer's claim.
+MUT="$(mk_mutant outerpipe 'if (l2 !~ /\|/) return 0' 'if (l2 !~ /^[ \t>]*\|/) return 0')"
+mut_check "M32 a table without OUTER pipes is still a row" 425238 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42523901" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+assertion | mutant (reverts the fix) | reddened row | observed
+---|---|---|---
+x | sed s/rc=80/rc=0/ | A (i) | rc=0
+- the guard added at ${DG_A1} | revert it | B (ii) | row red"
+# M33 — THE PROSE SKIP DOES NOT SATISFY THE REQUIREMENT (20h44). Putting `_any=1` back before the
+#       4-6-char skip restores the eleventh cycle's P1: both refusals cancel, and a body that stated
+#       no range records rc 0 with a `delta_range` inferred from dates. The mutant must ACCEPT.
+MUT="$(mk_mutant prosenotrange '      if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
+        continue
+      fi
+      _any=1' '      _any=1
+      if [ -z "$_sfs" ] && [ "${#_sf}" -lt 7 ]; then
+        continue
+      fi')"
+mut_check "M33 a PROSE-skipped token is not a stated range" 425240 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42524101" accepted STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="The literals 0xdead..0xbeef and f00d..babe are unrelated to this change.
+No issues found; the port handling is correct."
+# M24 — THE UNRELATED-LINEAGE BOUND (20h36). Dropping the "is it LATER than A" test makes every
+#       resolvable token that is not reviewed history a contradiction, which is the seventh
+#       cycle's false block: an artifact quoting a commit on an UNRELATED lineage is refused for
+#       a commit that cannot narrow A..B at all. The vector is 20h36 and the mutant must REFUSE.
+MUT="$(mk_mutant unrelbound '      delta_git "$root" merge-base --is-ancestor "$from" "$_tsha" 2>/dev/null || _r=$?
+      [ "$_r" -eq 0 ] || continue' '      :')"
+mut_check "M24 only a commit LATER than A can narrow the range" 425220 "$DG_HEAD" "delta:$DG_BASE..$DG_HEAD+comment:42522101" refused STUB_EVIDENCE_AT="2026-02-01T00:00:00Z" STUB_EVIDENCE_BODY="reviewed delta:${DG_BASE}..${DG_HEAD}; no issues found.
+For context, the other PR's head was ${DG_UNREL} and it is unrelated to this range."
+# M25 — THE MERGE-ONLY CLAIM FORM (20h35). Reading the RAW body in the merge-only arm re-accepts
+#       a cover whose only mention of A is a kill-table row — a table is not a claim, and that arm
+#       exists to require the VERDICT at A.
+MUT="$(mk_mutant rawbody '      case "$_claim" in' '      case "$EVIDENCE_BODY" in')"
+mut_check "M25 the merge-only arm reads the CLAIM, not the raw body" 425216 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD+comment:42521701" accepted STUB_EVIDENCE_AT="2025-06-05T00:00:00Z" STUB_EVIDENCE_BODY="No issues found.
+
+## MUTATION ATTRIBUTION (agent-infra#3442)
+
+| assertion | mutant (reverts the fix) | reddened row | observed |
+|---|---|---|---|
+| x | the row that reddens delta:${DG_A1}..${DG_HEAD} | z | rc 3 |"
+# M34 — THE DELTA PATH'S REPLACE PIN (20i1). `delta_git`'s export is a SEPARATE site from the
+#       carry walk's `local -x` export that `tests/record-review/run.sh` (12)/(13) mutate, so
+#       until this cell NOTHING pinned it: the line could be deleted and every delta vector stayed
+#       green. With `GIT_NO_REPLACE_OBJECTS` dropped, the planted replacement is read, the
+#       hand-edited merge compares EQUAL to the automatic one, the range classifies merge-only,
+#       and the vector the shipped recorder REFUSES (20i1) is ACCEPTED.
+git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1 || true
+MUT="$(mk_mutant nodelreplace '  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"' '  GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"')"
+mut_check "M34 the delta path's REPLACE pin" 425150 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515001" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+git replace -d "$DG_HI_H" >/dev/null 2>&1
+# M35 — THE DELTA PATH'S GRAFTS-FILE PIN, measured by ATTRIBUTION because BOTH scripts refuse.
+#       Dropping only `GIT_GRAFT_FILE` leaves the graft readable: the merge stops being a merge,
+#       the commit becomes ordinary AUTHORED content, and the refusal moves from the evil-merge
+#       sentence to the authored COUNT form (20i2). That move IS the proof the export is
+#       load-bearing; `mut_check … refused` could not see it.
+printf '%s %s\n' "$DG_HI_H" "$DG_HI_L" > "$DG/.git/info/grafts"
+MM=$((MM+1))
+MUT="$(mk_mutant nograftfile '  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"' '  GIT_NO_REPLACE_OBJECTS=1 command git -C "$root" "$@"')"
+if [ -s "${MUT:-}" ]; then
+    rm -f "$(Q2 425150)"
+    mut_run "$MUT" 425152 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H" STUB_BASE_SHA="$DG_HI_B"
+    if [ "$RECORD_RC" != "0" ] && command grep -q "contains authored content" "$T/merr" 2>/dev/null; then
+        MM_OK=$((MM_OK+1)); ok "20g M35 the delta path's GRAFTS-FILE pin: with only the replace export the graft is READ, the refusal becomes the authored COUNT form, so GIT_GRAFT_FILE IS load-bearing and is covered here"
+    else
+        bad "20g M35 the grafts-file pin is vacuously green — the mutant's refusal is not the graft-honouring classification (rc=$RECORD_RC)"
+    fi
+else
+    bad "20g M35 the mutant could not be built (mutation anchor missing from the recorder) — this vector was NOT measured"
+fi
+rm -f "$DG/.git/info/grafts"
+# M21b — THE rc CHECK, WHICH M21 DOES NOT MEASURE (cycle-2 review). M21 replaces the SCAN LINE, so
+#        it proves the scan exists, not that a FAILED scan is refused: delete only the rc check and
+#        every vector plus M21 stays green while "no tokens" and "the scan did not run" collapse
+#        back into one value. The sort shim is what makes a pipeline member fail for real.
+printf '#!/bin/sh\nif [ "$1" = "-u" ]; then exit 2; fi\nexec /usr/bin/sort "$@"\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
+MUT="$(mk_mutant norgcheck '    if [ "$_tok_rc" -gt 1 ]; then' '    if false; then')"
+mut_check "M21b the rc check on the token scan" 425155 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515501" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+rm -f "$T/bin/sort"
+# M36 — THE MERGE-DRIVER REFUSAL (20i3). Deleting it re-accepts a checkout whose oracle is steered
+#       by a driver the lane owns, which is the false PASS the arm exists to stop.
+printf 'u.txt merge=union\n' > "$DG/.gitattributes"
+MUT="$(mk_mutant noambientattr '    if [ -n "$_wt_amb" ]; then' '    if false; then')"
+mut_check "M36 the AMBIENT-ATTRIBUTES refusal" 425156 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515601" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+rm -f "$DG/.gitattributes"
+# M37 — THE CONFIG-DRIVER REFUSAL. ⛔ NO AMBIENT ATTRIBUTE IN THIS CELL'S FIXTURE, deliberately: with
+#       one present the mutant would still refuse on the attribute arm and the cell would be vacuous.
+#       Config alone is the over-block this arm accepts (a driver key that no attribute uses), and the
+#       cell measures that it is load-bearing.
+git config merge.hidrv.driver true || true
+MUT="$(mk_mutant nodriver '    if [ -n "$_drivers" ] || [ -n "$_attr_amb" ]; then' '    if [ -n "$_attr_amb" ]; then')"
+mut_check "M37 the CONFIG merge-driver refusal" 425159 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515901" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+git config --unset merge.hidrv.driver 2>/dev/null || true
+# M38 — THE ORACLE NEUTRALISATION (20i6). With the box-global attributes file in place, dropping the
+#       neutralised read lets the MACHINE's `merge=union` decide the answer: the hand resolution
+#       compares equal, the range becomes merge-only, and the cover naming A is enough.
+mkdir -p "$F_HOME/.config/git"
+printf 'u.txt merge=union\n' > "$F_HOME/.config/git/attributes"
+MUT="$(mk_mutant nonneutral '    want="$(delta_git_neutral "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"' '    want="$(delta_git "$root" merge-tree --write-tree "$p1" "$p2" 2>/dev/null)"')"
+mut_check "M38 the neutralised oracle" 425160 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42516001" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+rm -f "$F_HOME/.config/git/attributes"
+# M39 — THE ATTRIBUTES-DRIFT ARM (20i7). Dropping it re-accepts a TRACKED `.gitattributes` whose
+#       worktree copy steers the oracle — the P0 the previous commit introduced by removing `-m`.
+git checkout -q attr_lane >/dev/null 2>&1 || true
+printf 'w.txt merge=union\n' > "$DG/.gitattributes"
+MUT="$(mk_mutant nodrift '    _adrift="$(delta_git "$root" diff --name-only "$m" -- '\''*.gitattributes'\'' '\''.gitattributes'\'' 2>/dev/null)"' '    _adrift=""')"
+mut_check "M39 the attributes-drift arm" 425161 "$DG_AT_H" "delta:$DG_AT_L..$DG_AT_H+comment:42516101" accepted STUB_BASE_SHA="$DG_AT_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+git checkout -- .gitattributes 2>/dev/null || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the

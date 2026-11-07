@@ -34,6 +34,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
 # these arms go red, which is the assertion that the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE LANE'S OWN `WIP_PATH` IS CLEARED FOR §D, WHICH DRIVES A REAL WORKER (measured 2026-11-07,
+# running this suite FROM A FIXER LANE — which is where lanes run it). The worker's exit path roots its
+# rescue at `"${WIP_PATH:-$PWD}"` (spawn-gate.sh), so a caller's `WIP_PATH` OUTRANKS the dispatcher's
+# `cd "$TMP/wt"`: §D's worker rescued THIS lane's worktree, pushed a `refs/wip/*` ref to the REAL
+# origin, and the one arm that watches the worker then missed its 10 s window because the rescue had
+# real work to do — a red that was neither the brief gate's nor the branch's. §D is about the BRIEF and
+# the delivery section, never about the caller's tree, so the envelope is cleared here the same way the
+# capability gate is — declared, not silently `unset` in a helper arms cannot see.
+export WIP_PATH=
 # ⛔ AND THE MEMORY ARM IS NEUTRALISED FOR THE SAME REASON, one gate over (agent-infra#2387). Every arm
 # below drives the SHIPPED `run_agent` with `MAX_LOAD=1000 DISK_MIN_FREE_MB=1` so that a load or disk
 # refusal cannot decide an arm about the BRIEF. `run_agent` now also consults available memory before
@@ -858,52 +867,52 @@ mk_wip() { # mk_wip <refname>
 mk_wip "issue-4242-first-attempt" && mk_wip "fix-4243-other-work" && mk_wip "ai-fork-headroom"
 ck $? "§H fixture: the fixture remote carries refs/wip/* (3 real refs, one with no issue number at all)"
 PW_REFS="$(bash "$GATE" --wip-refs 4242 "$HW/work" 2>/dev/null)"
-grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_REFS"; ck $? "(i) --wip-refs FINDS the ref for its issue (the verb claim-reaper.sh and claims.sh consume)"
+grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_REFS"; ck $? "(H1) --wip-refs FINDS the ref for its issue (the verb claim-reaper.sh and claims.sh consume)"
 grep -q 'refs/wip/fix-4243-other-work' <<<"$PW_REFS"; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(i-b) …and does NOT match a ref belonging to another issue (the matcher discriminates, it is not a firehose)"
+[ "$rc" -ne 0 ]; ck $? "(H2) …and does NOT match a ref belonging to another issue (the matcher discriminates, it is not a firehose)"
 grep -q 'refs/wip/ai-fork-headroom' <<<"$(bash "$GATE" --wip-refs 4243 "$HW/work" 2>/dev/null)"; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(i-c) …and a ref with no issue token in it matches NO issue — which is why bg-rescue-wip.sh now says so out loud"
-[ -z "$(bash "$GATE" --wip-refs 99999 "$HW/work" 2>/dev/null)" ]; ck $? "(i-d) an issue with no ref answers EMPTY and exits 0 (empty is an answer; unreadable is 2)"
+[ "$rc" -ne 0 ]; ck $? "(H3) …and a ref with no issue token in it matches NO issue — which is why bg-rescue-wip.sh now says so out loud"
+[ -z "$(bash "$GATE" --wip-refs 99999 "$HW/work" 2>/dev/null)" ]; ck $? "(H4) an issue with no ref answers EMPTY and exits 0 (empty is an answer; unreadable is 2)"
 bash "$GATE" --wip-refs 99999 "$TMP/no-such-repo" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 2 ]; ck $? "(i-e) …and an EXPLICIT repository that is not one is 2 (UNMEASURED) — no silent fallback to another tree (got $rc)"
+[ "$rc" -eq 2 ]; ck $? "(H5) …and an EXPLICIT repository that is not one is 2 (UNMEASURED) — no silent fallback to another tree (got $rc)"
 
 # ── the shape: five labelled facts, and the absent block is REFUSED.
 sed '/^## PREVIOUS WORK/,$d' "$CANON" > "$TMP/no-pw.txt"
 grep -q '^CONTRADICTION TEST:' "$TMP/no-pw.txt"; ck $? "§H fixture: the no-PW brief is otherwise COMPLETE (research + contradiction test intact)"
-bash "$GATE" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(ii) a brief with NO PREVIOUS WORK section names the block as missing"
+bash "$GATE" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(H6) a brief with NO PREVIOUS WORK section names the block as missing"
 bash "$GATE" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(ii-b) …and is REFUSED with 80, not admitted (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H7) …and is REFUSED with 80, not admitted (got $rc)"
 sed '/^PRIOR:/d' "$CANON" > "$TMP/pw-no-prior.txt"
-bash "$GATE" --missing "$TMP/pw-no-prior.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-PRIOR'; ck $? "(iii) a block missing ONE label names that label (PRIOR), not the whole block"
+bash "$GATE" --missing "$TMP/pw-no-prior.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-PRIOR'; ck $? "(H8) a block missing ONE label names that label (PRIOR), not the whole block"
 bash "$GATE" --check "$TMP/pw-no-prior.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(iii-b) …and is refused (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H9) …and is refused (got $rc)"
 # ⛔ EVERY FIXTURE BELOW IS DERIVED WITH `sed … "$CANON"` — the FILE — not with a pipe from the
 # variable. `printf '%s\n' "$CANON" | sed …` prints the PATH, so the fixture becomes a one-line file
 # holding a filename, and every arm below would then be asserting "a brief with no research section"
 # while claiming to test the WIP line — the vacuous-fixture failure this suite exists to catch.
 sed 's/^WIP:.*/WIP:       none, nothing to see/' "$CANON" > "$TMP/pw-unkeyed.txt"
 grep -qx 'WIP:       none, nothing to see' "$TMP/pw-unkeyed.txt"; ck $? "§H fixture: the unkeyed brief really carries the unkeyed WIP line"
-bash "$GATE" --missing "$TMP/pw-unkeyed.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; ck $? "(iv) an UNKEYED WIP value ('none, nothing to see') is refused — it names no issue to check"
+bash "$GATE" --missing "$TMP/pw-unkeyed.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-WIP'; ck $? "(H10) an UNKEYED WIP value ('none, nothing to see') is refused — it names no issue to check"
 
 # ── the CONTRADICTION: a keyed absence claim against a ref that exists.
 sed 's|^WIP:.*|WIP:       issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06T00:00Z)|' "$CANON" > "$TMP/pw-contradicted.txt"
 grep -qF 'refs/wip/*' "$TMP/pw-contradicted.txt"; ck $? "§H fixture: the absence claim carries a MEASUREMENT NOTE naming refs/wip/* — a note must not be mistaken for a named ref"
 bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(v) a brief claiming 'no WIP for issue 4242' while refs/wip holds one is REFUSED (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H11) a brief claiming 'no WIP for issue 4242' while refs/wip holds one is REFUSED (got $rc)"
 PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" 2>&1)"
 grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$PW_OUT"; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(v-b) …the refusal does not print the raw token at the author (it is translated)"
-grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_OUT"; ck $? "(v-c) …it NAMES the ref that contradicts the claim (a refusal that names nothing sends the author to grep)"
-grep -q 'CONTINUE that work' <<<"$PW_OUT"; ck $? "(v-d) …and says what to do about it, which is the whole point of the handover"
+[ "$rc" -ne 0 ]; ck $? "(H12) …the refusal does not print the raw token at the author (it is translated)"
+grep -q 'refs/wip/issue-4242-first-attempt' <<<"$PW_OUT"; ck $? "(H13) …it NAMES the ref that contradicts the claim (a refusal that names nothing sends the author to grep)"
+grep -q 'CONTINUE that work' <<<"$PW_OUT"; ck $? "(H14) …and says what to do about it, which is the whole point of the handover"
 # …and the SAME brief passes on stdin: two passes read the brief, so a second `-` reader at EOF would
 # silently see no WIP line and the cross-check would be INERT on pane orders (the inline carrier).
 bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(vi) the same contradiction is caught through STDIN (both passes read one materialised body) (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H15) the same contradiction is caught through STDIN (both passes read one materialised body) (got $rc)"
 # …and naming ANY ref satisfies the shape: the gate checks the CONTRADICTION, not whether the ref is
 # the right one — that judgement is the next actor's, and pretending otherwise would manufacture it.
 sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-named.txt"
 bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(vii) a brief that NAMES the rescued ref is ADMITTED — the block is a handover, not a wall (got $rc)"
+[ "$rc" -eq 0 ]; ck $? "(H16) a brief that NAMES the rescued ref is ADMITTED — the block is a handover, not a wall (got $rc)"
 # ── the STATED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR A PASS: an unmeasurable refs/wip ADMITS
 # the brief and says so. The alternative — refusing every dispatch on a network blip — converts a
 # memory gap into a fleet-wide outage, and the claim pre-flight already hard-depends on origin.
@@ -912,9 +921,8 @@ bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$
 # whose `ls-remote` cannot answer (no `origin` at all, or an unreachable one) exercises this arm.
 git init -q "$HW/noremote" 2>/dev/null
 PW_OUT="$(bash "$GATE" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/noremote" 2>&1)"; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(viii) an UNREADABLE refs/wip ADMITS the brief (documented residual) (got $rc)"
-grep -q 'UNVERIFIED' <<<"$PW_OUT"; ck $? "(viii-b) …and says the absence claim is UNVERIFIED on stderr, so the pass is never silent"
-
+[ "$rc" -eq 0 ]; ck $? "(H17) an UNREADABLE refs/wip ADMITS the brief (documented residual) (got $rc)"
+grep -q 'UNVERIFIED' <<<"$PW_OUT"; ck $? "(H18) …and says the absence claim is UNVERIFIED on stderr, so the pass is never silent"
 # ── QUOTED MATERIAL IS NOT A CLAIM (fresh-context review of #3484, P1) ──────────────────────────
 # The first cut's WIP reader took the LAST `WIP:` label anywhere in the section with no fence or indent
 # awareness, so pasting the canonical block as a REFERENCE both satisfied the shape and switched the
@@ -925,42 +933,374 @@ grep -q 'UNVERIFIED' <<<"$PW_OUT"; ck $? "(viii-b) …and says the absence claim
   printf '\nReference (the shape the harness hands you):\n\n```\nWIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n```\n'; } > "$TMP/pw-fenced-after.txt"
 grep -q 'issue-4242 -> none' "$TMP/pw-fenced-after.txt"; ck $? "§H fixture: the LIVE claim is still the absence claim (the fenced copy comes after it)"
 bash "$GATE" --check "$TMP/pw-fenced-after.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(xi) a FENCED quotation of a ref does not switch the cross-check off — the live absence claim is still REFUSED (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H19) a FENCED quotation of a ref does not switch the cross-check off — the live absence claim is still REFUSED (got $rc)"
 { printf '# a brief\n\n```\n'
   sed -n '/^## PREVIOUS WORK/,/^PRIOR:/p' "$CANON"
   printf '```\n'; } > "$TMP/pw-only-fenced.txt"
-bash "$GATE" --missing "$TMP/pw-only-fenced.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(xii) a PREVIOUS WORK block that exists ONLY inside a fence is QUOTED, not claimed — the section is still missing"
+bash "$GATE" --missing "$TMP/pw-only-fenced.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(H20) a PREVIOUS WORK block that exists ONLY inside a fence is QUOTED, not claimed — the section is still missing"
 # …and the four-column carrier, which is the same quote in CommonMark's other spelling.
 awk '{ print "    " $0 }' "$TMP/pw-contradicted.txt" > "$TMP/pw-indented.txt"
-bash "$GATE" --missing "$TMP/pw-indented.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(xiii) …and an INDENTED copy (a code block) is quoted too, so the whole brief is refused as having no section"
+bash "$GATE" --missing "$TMP/pw-indented.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; ck $? "(H21) …and an INDENTED copy (a code block) is quoted too, so the whole brief is refused as having no section"
 # ── THE DIAGNOSTIC VERB MUST AGREE WITH THE GATE (fresh-context review of #3484, P2). `--missing` is
 # what an author iterates with; reading stdin twice made it report "complete, rc=0" for a brief `--check`
 # refuses on the SAME bytes.
 miss="$(bash "$GATE" --missing - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" 2>/dev/null)"
-grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(xiv) --missing on STDIN sees the SAME body --check does (no second EOF reader)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H22) --missing on STDIN sees the SAME body --check does (no second EOF reader)"
 bash "$GATE" --check - lane 0 "$HW/work" < "$TMP/pw-contradicted.txt" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(xiv-b) …and --check on the same bytes refuses it, so (xiv) is not a green over a broken pipe (got $rc)"
+[ "$rc" -eq 80 ]; ck $? "(H23) …and --check on the same bytes refuses it, so (xiv) is not a green over a broken pipe (got $rc)"
+# ── CYCLE-2 P1: EVERY `WIP:` VALUE IS CHECKED, NOT THE LAST ONE (fresh-context review of #3484) ──
+# The shape check accepted ANY keyed `WIP:` line while the cross-check measured only the LAST one, so
+# each carrier below satisfied the shape and made the checker abstain on a line that was never the
+# claim. Measured before the fix, all with a live `issue-4242 -> none` against an EXISTING ref:
+#   E a pasted canonical block (a live, unfenced `issue-<N> -> refs/wip/<ref>` line — the text this
+#     gate itself hands the author), F a trailing `WIP: none`, G a bare `WIP:`, H a keyed line for a
+#     DIFFERENT issue, N `pr-<N>` on a lane. Each was ADMITTED (rc=0); each must now be REFUSED.
+cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-canon.txt"; sed -n '/^## PREVIOUS WORK/,$p' "$CANON" >> "$TMP/pwplus-canon.txt"
+bash "$GATE" --check "$TMP/pwplus-canon.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H24) a pasted canonical block after a live absence claim does NOT switch the check off (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-none.txt"; printf '\nWIP:       none\n'; } >> "$TMP/pwplus-none.txt" 2>/dev/null || { cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-none.txt"; printf '\nWIP:       none\n' >> "$TMP/pwplus-none.txt"; }
+bash "$GATE" --check "$TMP/pwplus-none.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H25) a trailing UNKEYED 'WIP: none' does not exempt the keyed claim above it (got $rc)"
+# ⛔ (H25b) ASSERTS THE TOKEN, NOT JUST rc (review of #3621, P2 — VERIFIED by reproduction). rc alone is
+# 80 EITHER WAY: with last-wins restored the contradicting-ref token VANISHES while rc stays 80, because
+# the trailing unkeyed `none` is refused on its OWN account. So an rc-only arm DESCRIBED this carrier and
+# could not fail — a revert of the every-value reader re-opened the fail-open with (H25) still green.
+# Measured both ways: shipped token=1, last-wins token=0, rc=80 in both.
+miss="$(bash "$GATE" --missing "$TMP/pwplus-none.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H25b) …and the CONTRADICTED token is what refuses it — rc alone is 80 under last-wins too"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-bare.txt"; printf '\nWIP:\n' >> "$TMP/pwplus-bare.txt"; }
+bash "$GATE" --check "$TMP/pwplus-bare.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H26) a BARE 'WIP:' label does not exempt it either (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-other.txt"; printf '\nWIP:       issue-4243 -> refs/wip/fix-4243-other @ 111111111111\n' >> "$TMP/pwplus-other.txt"; }
+bash "$GATE" --check "$TMP/pwplus-other.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H27) a keyed ref for a DIFFERENT issue does not exempt the claim about this one (got $rc)"
+# ⛔ THE ROLE-SCOPING ARM NEEDS A BRIEF THAT IS OTHERWISE CLEAN, or it measures the absence claim it
+# inherited instead of the key rule (measured: built from the contradicted fixture it was 80 for the
+# FIXER too, for the unrelated reason).
+{ cat "$CANON"; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr.txt"
+bash "$GATE" --check "$TMP/pwplus-pr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H28) 'pr-<N>' is NOT a lane/worker key — it is the fixer's and the reviewer's (got $rc)"
+bash "$GATE" --check "$TMP/pwplus-pr.txt" fixer 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H29) …and for a FIXER it is the right key, so the rule is role-scoped and not a blanket ban (got $rc)"
+# ⛔ THE REVIEWER FIXTURE MUST BE THE REVIEWER SECTION (`--section reviewer`): the same file tested as
+# `reviewer` is ALSO refused for the missing MUTATION ATTRIBUTION block, which would make this arm
+# measure the wrong contract (it did, at 80, until the fixture was role-shaped).
+{ bash "$GATE" --section reviewer; printf '\nWIP:       pr-1 -> none\n'; } > "$TMP/pwplus-pr-rev.txt"
+bash "$GATE" --check "$TMP/pwplus-pr-rev.txt" reviewer 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H30) …and for a REVIEWER too (it reviews one PR at a head) (got $rc)"
+# ── THE INDENT RULE'S BEHAVIOUR, ON A LIVE BRIEF (review cycle 2, P2; corrected in review of #3621).
+# ⛔ THESE TWO ARMS ARE CONTROLS, NOT MUTANT-KILLERS: their fixture inherits a LIVE absence claim that
+# refuses on its own, so they stay at 80 with the indent logic deleted (measured). They assert the
+# RULE's behaviour (an indented late line does not change the verdict); the arms that actually redden
+# under `sed 's/^  line = _qskip($0)/  line = $0/'` are H36/H37 below, whose base is a CLEAN claim.
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-ind.txt"; printf '\n    WIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n' >> "$TMP/pwplus-ind.txt"; }
+bash "$GATE" --check "$TMP/pwplus-ind.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H31) a 4-COLUMN INDENTED late WIP line is a code block, so the live absence claim still decides (got $rc)"
+{ cp "$TMP/pw-contradicted.txt" "$TMP/pwplus-tab.txt"; printf '\n\tWIP:       issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111\n' >> "$TMP/pwplus-tab.txt"; }
+bash "$GATE" --check "$TMP/pwplus-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H32) …and the TAB spelling of the same indent (a 4-column stop) too (got $rc)"
+
+# ── CYCLE-3 P1: ONE RECOGNIZER — the shape check called `WIP-:` the `wip` LABEL (`_label` folds
+# `[ \t-]+` into a space) while the reader required `^wip[ \t]*:`, so the reader collected NOTHING, the
+# cross-check abstained, and a claim of absence went UNCHECKED (measured: rc 0 against an existing ref).
+sed 's|^WIP:.*|WIP-:      issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-dashlabel.txt"
+grep -q '^WIP-:' "$TMP/pw-dashlabel.txt"; ck $? "§H fixture: the WIP line really carries the dashed label spelling"
+bash "$GATE" --check "$TMP/pw-dashlabel.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H33) a DASHED label ('WIP-:') is still the wip label — its absence claim is CHECKED, not skipped (got $rc)"
+sed 's|^WIP:.*|WIP --:    issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-dashlabel2.txt"
+bash "$GATE" --check "$TMP/pw-dashlabel2.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H34) …and 'WIP --:' too (one recogniser, every separator the label class folds) (got $rc)"
+# …and the mirror: an honest NAMED ref under the same spelling is ADMITTED, so the fix is not a blanket
+# refusal keyed on the spelling.
+sed 's|^WIP:.*|WIP-:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-dashlabel-named.txt"
+bash "$GATE" --check "$TMP/pw-dashlabel-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H35) …while a NAMED ref under the same spelling is admitted (no false block) (got $rc)"
+
+# ── CYCLE-3 P2: THE QUOTE-SKIP NEEDS A FIXTURE IT CAN ACTUALLY CHANGE. The earlier arms inherited a
+# live absence claim that refuses on its own, so they were green with `_qskip` deleted. This one's live
+# claim is for an issue with NO ref (admitted), and the ONLY thing that can refuse it is a QUOTED
+# `WIP: none` being read as a claim — which is exactly what the indent rule prevents.
+sed 's|^WIP:.*|WIP:       issue-99999 -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-clean.txt"
+bash "$GATE" --check "$TMP/pw-clean.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "§H control: a clean absence claim for an issue with no ref is ADMITTED (got $rc)"
+{ cat "$TMP/pw-clean.txt"; printf '\n    WIP:       none\n'; } > "$TMP/pw-clean-ind.txt"
+bash "$GATE" --check "$TMP/pw-clean-ind.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H36) a 4-COLUMN INDENTED 'WIP: none' is a code block and does NOT become a live unkeyed claim — deleting \`_qskip\` reddens THIS arm (got $rc)"
+{ cat "$TMP/pw-clean.txt"; printf '\n\tWIP:       none\n'; } > "$TMP/pw-clean-tab.txt"
+bash "$GATE" --check "$TMP/pw-clean-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H37) …and the TAB spelling of the same indent (got $rc)"
+
+
+# ── A GLOB IS NOT A REF (review of #3621, P2) ─────────────────────────────────────────────────────────
+# `refs/wip/* is empty` begins with `refs/wip/`, so it was read as "a ref is named" and the check was
+# SWITCHED OFF by the most honest possible statement of having looked. Measured rc 0 with a matching
+# ref on origin, on the merged baseline too.
+sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/* is empty (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-glob.txt"
+bash "$GATE" --check "$TMP/pw-glob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H48) a GLOB claim ('refs/wip/* is empty') is a claim of ABSENCE and is CHECKED (got $rc)"
+sed 's|^WIP:.*|WIP:       issue-4242 -> refs/wip/ — nothing there (measured)|' "$CANON" > "$TMP/pw-barewip.txt"
+bash "$GATE" --check "$TMP/pw-barewip.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H49) …and so is \`refs/wip/\` with no token after it (got $rc)"
+bash "$GATE" --check "$TMP/pw-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H50) …while a CONCRETE ref still satisfies it (no over-block; got $rc)"
+# ── `keyless — <why>` HAD NO ARM AT ALL (review of #3621, P2): the branch that decides it is a single
+# unasserted point whose deletion false-blocks the honest diagnosis-lane form the canonical block hands
+# out. Two rows: the form is ADMITTED, and deleting the branch REFUSES it.
+sed 's|^WIP:.*|WIP:       keyless — a diagnosis lane with no issue or PR key|' "$CANON" > "$TMP/pw-keyless.txt"
+bash "$GATE" --check "$TMP/pw-keyless.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H51) a keyless diagnosis-lane brief is ADMITTED (the third documented form) (got $rc)"
+sed 's|^WIP:.*|WIP:       keyless|' "$CANON" > "$TMP/pw-keyless-bare.txt"
+bash "$GATE" --check "$TMP/pw-keyless-bare.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H51b) …but a bare 'keyless' with no reason is not (got $rc)"
+# ⛔ THE SEPARATOR IS ANY WHITESPACE, NOT JUST A SPACE (cycle 12 review, P2; the citation corrected in
+# cycle 13 — this comment first credited "the shape parser" with a test that no longer exists at this
+# head). On `origin/main` the only key test WAS the shape parser `_rest ~ /^keyless[ \t]+[^ \t]/`, which
+# is whitespace-general; `1519642ff` deleted that test and made the classifier the sole authority, and the
+# arm it introduced required a literal SPACE — so the move narrowed a spelling the base accepted. Measured
+# on byte-identical briefs: `origin/main` rc 0, the cycle-11 head rc 80 (UNKEYED, a diagnostic about the
+# key, for the documented third form). H51c is the row, and it discriminates on its own — it fails against
+# the cycle-11 head.
+# ⛔ H51d IS THE PARITY ROW, AND ITS CARRIER MATTERS — two findings, in two cycles, and the row is
+# only correct because BOTH were applied: the cycle-13 review found this row VACUOUS (its finding 2: the
+# space/tab carrier collapses under the trim and re-asserted H51b, so it discriminated nothing and was
+# deleted), and the cycle-14 delta review found the remedy wrong (its finding 1, P2: CR, VT and FF
+# SURVIVE that trim and do arrive at the arm as whitespace-only). What the row still has to assert: a
+# separator followed by WHITESPACE ONLY is refused, so the "reason" must contain a non-whitespace
+# character. The carrier has to be a byte the value reader's trailing trim KEEPS — that trim is `[ \t]+`
+# (brief-gate.sh:341), so a space/tab-only value collapses to bare `keyless` and re-asserts H51b (the first
+# version of this row did exactly that and was vacuous). CR survives the trim and arrives at the arm as
+# whitespace-only, so the mutant `[[:space:]]*[![:space:]]*` → `[[:space:]]*` is killed by THIS row
+# (`keyless<CR>` 80 → 0) while the bare-`keyless` row alone cannot kill it (80 → 80, measured).
+sed "s|^WIP:.*|WIP:       keyless$(printf '\t')— a diagnosis lane with no issue or PR key|" "$CANON" > "$TMP/pw-keyless-tab.txt"
+bash "$GATE" --check "$TMP/pw-keyless-tab.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H51c) …and a TAB is a separator too — the base admitted this spelling (got $rc)"
+awk -v r="keyless$(printf '\r')" '{ if ($0 ~ /^WIP:/) printf "WIP:       %s\n", r; else print }' "$CANON" > "$TMP/pw-keyless-cr.txt"
+bash "$GATE" --check "$TMP/pw-keyless-cr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H51d) …while a separator + WHITESPACE ONLY is still refused (CR carrier: the trim keeps it) (got $rc)"
+MUT_PW4="$TMP/mutant-pw-nokeyless.sh"
+sed 's|^      keyless\*)$|      keyless-NEVER*)|' "$GATE" > "$MUT_PW4"
+diff -q "$GATE" "$MUT_PW4" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H52) the KEYLESS-BRANCH mutation really changed the file"
+bash "$MUT_PW4" --check "$TMP/pw-keyless.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H52b) MUTATION: H51 now FAILS — with the keyless branch deleted the honest form is refused (rc=$rc)"
+# ── the KEY is case-folded like the label (review of #3621, nit): `Issue-4242 -> none` was refused.
+# ⛔ THE ARM MUST NAME WHICH 80 IT IS (review of #3621, cycle 2, P2). Asserting rc alone was satisfied by
+# the UNFIXED gate for a different reason (the key read as unkeyed), so it could not fail. The TOKEN is
+# the discriminator, plus the named-ref direction, which the unfixed gate rejects as unkeyed.
+sed 's|^WIP:.*|WIP:       Issue-4242 -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-case.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-case.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H53) a case-folded key ('Issue-4242') is the SAME key — it is looked up, and its contradiction is what refuses it"
+sed 's|^WIP:.*|WIP:       Issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-case-named.txt"
+bash "$GATE" --check "$TMP/pw-case-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H53b) …so an honest NAMED ref under the folded key is ADMITTED, not refused as unkeyed (got $rc)"
+# ── A NUMBER IN BRACKETS IS STILL A NUMBER (review of #3621, cycle 2, P2): `issue-<4242> -> none` was
+# keyed-but-UNCHECKED — the doc's "carries a REAL issue number" fail-open, reachable with two brackets —
+# and `pr-<1>` bypassed the role rule the same way.
+sed 's|^WIP:.*|WIP:       issue-<4242> -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-slotnum.txt"
+bash "$GATE" --check "$TMP/pw-slotnum.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H55) 'issue-<4242> -> none' is CHECKED — a bracketed number is still a number (got $rc)"
+sed 's|^WIP:.*|WIP:       issue-<4242> -> refs/wip/* is empty (measured)|' "$CANON" > "$TMP/pw-slotglob.txt"
+bash "$GATE" --check "$TMP/pw-slotglob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H55b) …and the bracketed form cannot smuggle a GLOB claim past H48 either (got $rc)"
+{ cat "$CANON"; printf '\nWIP:       pr-<1> -> none\n'; } > "$TMP/pw-slotpr.txt"
+bash "$GATE" --check "$TMP/pw-slotpr.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H55c) …and 'pr-<1>' does not bypass the role rule on a lane (got $rc)"
+# ⛔ THE REFUSAL DIRECTION IS NOT ENOUGH (review of #3621, cycle 3, P3): a misfix that treated the
+# bracketed number as UNKEYED would keep H55/H55b/H55c green while falsely refusing the honest form.
+# These are the mirror rows, including the BRACKET NAMED-REF path that the optional arrow protects.
+sed 's|^WIP:.*|WIP:       issue-<4242> -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-slot-named.txt"
+bash "$GATE" --check "$TMP/pw-slot-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H55d) a bracketed key with a NAMED ref is ADMITTED (got $rc)"
+# ⛔ THE FIXTURE MUST BE ROLE-SHAPED: testing the LANE section as `reviewer` is ALSO refused for the
+# missing MUTATION ATTRIBUTION block, which would measure the wrong contract (it did, at 80).
+for r in fixer reviewer; do
+  { bash "$GATE" --section "$r"; printf '\nWIP:       pr-<1> -> none\n'; } > "$TMP/pw-slotpr-$r.txt"
+  bash "$GATE" --check "$TMP/pw-slotpr-$r.txt" "$r" 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H55e[$r]) …while 'pr-<1>' IS the right key for a $r (the role rule, not a blanket ban) (got $rc)"
+done
+# ── ANY SPELLING OF A BRACKETED NUMBER IS STILL A NUMBER (review of #3621, cycle 3, P2): requiring a
+# digit immediately after `<` left `issue-<#4242>`, `issue-< 4242>`, `issue-<issue-4242>` UNCHECKED — and
+# `issue #4242` is the natural way to write it.
+for spell in 'issue-<#4242>' 'issue-< 4242>' 'issue-<issue-4242>' 'issue-<+4242>'; do
+  sed "s|^WIP:.*|WIP:       $spell -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-spell.txt"
+  bash "$GATE" --check "$TMP/pw-spell.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(H57['$spell']) a bracketed number in ANY spelling is CHECKED (got $rc)"
+done
+sed 's|^WIP:.*|WIP:       issue-<#4242> -> refs/wip/* is empty (measured)|' "$CANON" > "$TMP/pw-spellglob.txt"
+bash "$GATE" --check "$TMP/pw-spellglob.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H57b) …and it cannot smuggle the GLOB claim past H48 either (got $rc)"
+# ⛔ A REFUSAL-ONLY ARM IS NOT ENOUGH FOR A WIDENED SPELLING (review of #3621, cycle 4, P3): a misfix that
+# marked `<#…>`/`<+…>` UNKEYED keeps every refusal row green while falsely refusing the honest form. One
+# admitted-direction row per spelling kills that mutant.
+for spell in 'issue-<#4242>' 'issue-< 4242>' 'issue-<issue-4242>' 'issue-<+4242>'; do
+  sed "s|^WIP:.*|WIP:       $spell -> refs/wip/issue-4242-first-attempt @ 111111111111|" "$CANON" > "$TMP/pw-spell-named.txt"
+  bash "$GATE" --check "$TMP/pw-spell-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H57c['$spell']) …and the honest NAMED form under that spelling is ADMITTED (no false block) (got $rc)"
+done
+# ── THE FIRST DIGIT RUN, NOT EVERY DIGIT (review of #3621, cycle 4, P1). Concatenating the runs measured
+# a key that does not exist (`42421234`) and ADMITTED the claim it should refuse.
+for v in 'issue-<#4242 (prev attempt #1234)>' 'issue-<4242, 5555>' 'issue-<4242 attempt 2>'; do
+  sed "s|^WIP:.*|WIP:       $v -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-firstrun.txt"
+  miss="$(bash "$GATE" --missing "$TMP/pw-firstrun.txt" lane 0 "$HW/work" 2>/dev/null)"
+  grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H59['$v']) the FIRST digit run is the key — a second number in the bracket does not move it (token asserted, not just rc)"
+done
+# ── AN UNTERMINATED BRACKET IS STILL KEYED AND STILL CHECKED (review of #3621, cycle 4, P2): dropping the
+# closing `>` used to fall through to the unfilled-slot arm and go UNCHECKED.
+# ⛔ AND THE ARM MUST NAME WHICH 80 IT IS (review of #3621, cycle 5, P3): rc alone cannot tell "checked and
+# contradicted" from "never checked" — deleting the whole arm still yields 80 through the unkeyed branch.
+# The token is the discriminator.
+sed 's|^WIP:.*|WIP:       issue-<4242 - none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-unterm.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-unterm.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H60) an UNTERMINATED bracket ('issue-<4242 - none') is still KEYED and MEASURED (the token proves the lookup, rc alone would not)"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H60b) …and it is not refused as merely UNKEYED — the number was read, not discarded"
+# ⛔ THE SLOT SENTINEL IS NOT A PREFIX (review of #3621, cycle 5, P3): `issue-slot*` matched `issue-slot4242`,
+# an author-spellable route to the unchecked arm WITH a number in it. Both of these measured rc 0 there.
+# ⛔ A BRACKET WITH NO DIGITS IS THE SLOT (documented), so the escapes tested here are the ones that DO
+# carry a number in the key part: a prefix collision, and a number glued after the closing bracket.
+for v in 'issue-slot4242' 'issue-<4242>4242>' 'issue-<x4242>'; do
+  sed "s|^WIP:.*|WIP:       $v -> none (measured: git ls-remote refs/wip/* at 2026-11-06)|" "$CANON" > "$TMP/pw-slotescape.txt"
+  bash "$GATE" --check "$TMP/pw-slotescape.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 80 ]; ck $? "(H61['$v']) a slot-LOOKING spelling carrying a number cannot reach the unchecked arm (got $rc)"
+done
+# ── `WIP_:` IS NOT A `wip` LABEL TO THE SHAPE PARSER (`_label` folds only space/hyphen), and the reader
+# no longer collects it either: ONE verdict, fail-closed, from both readers. The READER half is only
+# observable in the TOKEN set, so this is an absence fixture and the assertion is on the tokens — `rc`
+# alone cannot tell the two worlds apart (the shape parser refuses either way).
+sed 's|^WIP:.*|WIP_:      issue-4242 -> none (measured)|' "$CANON" > "$TMP/pw-under-absence.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-under-absence.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss"; ck $? "(H58) 'WIP_:' is not a wip label — the brief is refused for having no WIP line"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H58b) …and the reader did NOT collect it either — no CONTRADICTED token, so the two readers agree (a reader that collected it would add one)"
+sed 's|^WIP:.*|WIP_:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-under.txt"
+bash "$GATE" --check "$TMP/pw-under.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H58c) …so the named form is refused too, and for the same reason (got $rc)"
+# ── A TAB SEPARATOR IS NOT A `wip` LABEL TO EITHER READER (review of #3621 cycle 2, P2). `_label`'s
+# label class is `[A-Za-z][A-Za-z0-9 _-]`, so `WIP<TAB>:` matches NO label — the SHAPE parser refuses
+# the brief for having no `WIP:` line. This gets the same three-way treatment (H58) gives `WIP_:`
+# because the guarantee here is the label CLASS: `_label` folds `[ \t-]+` only AFTER it matches, so
+# teaching it to span `\t` without extending this reader's `[ -]*` would satisfy the shape and leave the
+# reader silent — an ADMITTED absence claim, the #3484 fail-open. The last arm is the CONTROL that makes
+# (H63c) mean something: the SAME brief with a colon is admitted, so a TAB refusal is the label class and
+# not "it named a ref". `tab` is a literal TAB built by printf, because a `\t` in a sed REPLACEMENT is a
+# GNU extension and this suite runs on BSD sed (the cycle-3 portability defect).
+tab="$(printf '\t')"
+sed "s|^WIP:.*|WIP${tab}:      issue-4242 -> none (measured)|" "$CANON" > "$TMP/pw-tab-absence.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-tab-absence.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -qx 'PREVIOUS-WORK-WIP' <<<"$miss"; ck $? "(H63) 'WIP<TAB>:' is not a wip label — the brief is refused for having no WIP line"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H63b) …and the reader did not collect it either — no CONTRADICTED token, so the two readers agree (a reader that spanned TAB would add one)"
+sed "s|^WIP:.*|WIP${tab}:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|" "$CANON" > "$TMP/pw-tab-named.txt"
+bash "$GATE" --check "$TMP/pw-tab-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 80 ]; ck $? "(H63c) …and the NAMED form is refused for the same reason, not for naming a ref (got $rc)"
+sed 's|^WIP:.*|WIP:      issue-4242 -> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-colon-named.txt"
+bash "$GATE" --check "$TMP/pw-colon-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H63d) CONTROL: the same brief with a COLON label is ADMITTED — so (H63c) is the label class, not the named ref (got $rc)"
+
+# ── THE TWO COPIES OF THE QUOTING HELPERS MUST STAY BYTE-IDENTICAL (review of #3621, P3). They are
+# duplicated because the two awk programs are separate single-quoted strings by design (#3442's reason:
+# wrapping two contracts in one END block is how a change to one re-opens the other). That is safe only
+# while the bodies are equal — unequal copies is exactly how the cycle-3 recognizer divergence happened.
+extract_fn() { # <n> <function-name> — the n-th `function <name>(…){…}` block of the gate
+  awk -v want="$1" -v fn="$2" 'BEGIN{n=0;f=0}
+    index($0, "function " fn "(") == 1 {n++; f=(n==want); if (f) print; next}
+    f && /^\}/{print; f=0; next}
+    f {print}' "$GATE"
+}
+for fn in _qskip _fence; do
+  diff <(extract_fn 1 "$fn") <(extract_fn 2 "$fn") >/dev/null 2>&1; ck $? "(H54) the two copies of $fn are IDENTICAL (a divergence is the cycle-3 defect class)"
+  [ "$(extract_fn 1 "$fn" | grep -c '')" -gt 2 ]; ck $? "(H54b) …$fn: the extract is not empty (an empty pair would make 'identical' vacuous)"
+  [ "$(extract_fn 1 "$fn" | grep -c "function $fn")" = "1" ] && [ "$(extract_fn 2 "$fn" | grep -c "function $fn")" = "1" ]; ck $? "(H54c) …$fn: both copies were really found (a missing second copy cannot pass as equal)"
+done
+# ── `--missing` MUST NOT ANSWER CANNOT-VERIFY WITH STATUS 0 (review of #3621, cycle 2, P3): with an
+# unusable TMPDIR it printed GATE-UNAVAILABLE and returned 0, so a consumer's `if ! --missing` read a
+# cannot-verify as SUCCESS. `--check` already answered 78 for the same condition.
+out="$(TMPDIR=/nonexistent-brief-gate-$$ bash "$GATE" --missing - lane 0 "$HW/work" < "$TMP/pw-clean.txt" 2>/dev/null)"; rc=$?
+grep -q 'GATE-UNAVAILABLE' <<<"$out"; ck $? "(H56) an unusable TMPDIR answers GATE-UNAVAILABLE from --missing"
+[ "$rc" -eq 78 ]; ck $? "(H56b) …with status 78 (cannot verify), never 0 (got $rc)"
+
+# ── THE ARROW IS NOT REQUIRED FOR A BRACKET KEY (review of #3621, cycle 8, P2): `issue-<4242>
+# refs/wip/issue-4242-first-attempt` (no arrow) was refused with "read the ref you already named",
+# because the claim was derived from the text after the ARROW and there was none. The claim now follows
+# the BRACKET CLOSE, so both spellings agree.
+sed 's|^WIP:.*|WIP:       issue-<4242> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-noarrow-named.txt"
+bash "$GATE" --check "$TMP/pw-noarrow-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H62) a bracket key with NO ARROW that NAMES its ref is ADMITTED — the claim follows the bracket, not the arrow (got $rc)"
+sed 's|^WIP:.*|WIP:       issue-<4242> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-noarrow-none.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-noarrow-none.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H62b) …while the same shape claiming ABSENCE is measured and contradicted (the mirror, so H62 is not a free pass)"
 
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"
-sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
+# ⛔ THE ANCHOR TRACKS THE CALL SITE (review cycle 2): the reader now takes the ROLE too, and an anchor
+# that stops matching makes the "mutant" byte-identical to the real file — the arm that proves the check
+# is load-bearing then passes for the wrong reason. The diff assertion below is what catches that.
+sed 's|^  pw="\$(brief_gate_previous_work "\$f" "\$repo" "\$role")"$|  pw=""  # MUTANT: no cross-check|' "$GATE" > "$MUT_PW"
 diff -q "$GATE" "$MUT_PW" >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(ix) the cross-check mutation REALLY changed the file (its anchor still matches)"
-bash -n "$MUT_PW"; ck $? "(ix-b) …and the mutant still parses"
+[ "$rc" -ne 0 ]; ck $? "(H38) the cross-check mutation REALLY changed the file (its anchor still matches)"
+bash -n "$MUT_PW"; ck $? "(H39) …and the mutant still parses"
 bash "$MUT_PW" --check "$TMP/pw-contradicted.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 0 ]; ck $? "(ix-c) MUTATION: (v) now FAILS — with the cross-check removed the contradicted brief is admitted (rc=$rc)"
+[ "$rc" -eq 0 ]; ck $? "(H40) MUTATION: (v) now FAILS — with the cross-check removed the contradicted brief is admitted (rc=$rc)"
 bash "$MUT_PW" --check "$TMP/no-pw.txt" lane >/dev/null 2>&1; rc=$?
-[ "$rc" -eq 80 ]; ck $? "(ix-d) …and the SHAPE refusal is untouched by that mutant, so (ii) was not green because of it (rc=$rc)"
+[ "$rc" -eq 80 ]; ck $? "(H41) …and the SHAPE refusal is untouched by that mutant, so (ii) was not green because of it (rc=$rc)"
+# ⛔ THE EVERY-VALUE READER NEEDS ITS OWN MUTANT (review cycle 3, P2). `pw=""` deletes the whole check,
+# which proves nothing about WHICH values are read. This revert restores "the last WIP line wins" — the
+# exact shape cycle 2 found — and the carriers that must notice are named one by one.
+MUT_PW3="$TMP/mutant-pw-lastwins.sh"
+# ⛔ TWO ANCHORS, BOTH PROVEN (review of #3621, P2). The second `sed` expression below spells the source
+# `\n` as `\n`, which GNU sed reads as a NEWLINE \u2014 the pattern then matched nothing, so the "last-wins"
+# mutant left the every-value printer in place, `_n` was never incremented, the reader emitted NOTHING,
+# and H42 was green over a mutant that deletes the reader rather than one that restores last-wins. The
+# two anchors are now asserted SEPARATELY, by grepping the mutant for the text each one writes.
+# ⛔ THE PRINTER ANCHOR IS MATCHED ON ITS STABLE PREFIX, not on the `\t`/`\n` literals: spelling those in
+# a sed PATTERN is where the first attempt went inert (a BRE `\n` is a newline, so the pattern matched
+# nothing and the mutant silently kept the every-value loop). `.` for the escapes, and the replacement
+# writes the two characters back with `\\t`.
+sed -e 's|^    _v\[++_n\] = t$|    val = t|' \
+    -e 's|^END { for (_i = 1.*$|END { if (length(val) > 0) print "V\\t" val }|' \
+    "$GATE" > "$MUT_PW3"
+grep -qx '    val = t' "$MUT_PW3"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H42) the LAST-WINS mutation replaced the COLLECTOR anchor (the file really changed there)"
+grep -q 'if (length(val) > 0) print "V' "$MUT_PW3"; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H42a) …and the PRINTER anchor too — an inert expression leaves the every-value loop in place and the mutant then proves nothing"
+grep -q '_v\[++_n\] = t' "$MUT_PW3"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H42b) …and the old collector is GONE (a mutant that kept it would not be last-wins either)"
+bash -n "$MUT_PW3"; ck $? "(H43) …and it still parses"
+# ⛔ NOT EVERY CARRIER FLIPS UNDER THIS MUTANT, and asserting one that cannot would be its own
+# vacuous arm — so each carrier is named by what it ACTUALLY does, MEASURED. (Review of #3621, P2: the
+# first version of this comment mis-cited both arms it named — (H5) is the `--wip-refs` explicit-repo
+# arm and has NO `WIP:` line at all (:868), and (H16) is the named-ref arm, which is ADMITTED with a
+# single `WIP:` line and therefore has no trailing line — while (H25), the carrier it described, was not
+# named at all.)
+# ⛔ FLIP — the mutant ADMITS them, so `rc -eq 0` below is the claim: (H24) a pasted canonical block,
+# (H27) a keyed line for another issue, and (H26) a BARE `WIP:`, whose last value is EMPTY, so last-wins
+# collects nothing and the key check has nothing to refuse.
+# ⛔ DO NOT FLIP ON rc — (H25) a trailing UNKEYED `WIP: none`. Last-wins collects the value `none` off an
+# unkeyed line, which is refused on its OWN account, so rc stays 80 while the contradicting-ref token
+# DISAPPEARS. Its discriminator is therefore the TOKEN, asserted by (H25b) and by (H44b) below; an
+# rc-only assertion cannot fail here and is exactly the non-discriminating shape this suite forbids.
+for pair in "pwplus-canon.txt:H24" "pwplus-other.txt:H27" "pwplus-bare.txt:H26"; do
+  f="${pair%%:*}"; lab="${pair#*:}"
+  bash "$MUT_PW3" --check "$TMP/$f" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+  [ "$rc" -eq 0 ]; ck $? "(H44) MUTATION: ${lab} now FAILS — with last-wins restored that brief is ADMITTED (rc=$rc)"
+done
+# (H44b) THE TOKEN-GONE HALF: for the carrier that does NOT flip rc, the token IS the discriminator —
+# under last-wins the contradicted ref is never inspected, so it vanishes. This is what makes (H25b)
+# non-vacuous WITHOUT relying on rc, which cannot move here.
+miss3="$(bash "$MUT_PW3" --missing "$TMP/pwplus-none.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss3"; rc=$?
+[ "$rc" -ne 0 ]; ck $? "(H44b) MUTATION: (H25b) now FAILS — with last-wins restored the contradicting-ref token is GONE (rc stays 80, so only the token can catch this)"
 MUT_PW2="$TMP/mutant-pw2.sh"
 sed 's|^  if (!pwsec) print "PREVIOUS-WORK-SECTION"$|  # MUTANT: no section token|' "$GATE" > "$MUT_PW2"
 diff -q "$GATE" "$MUT_PW2" >/dev/null 2>&1; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(x) the section-token mutation really changed the file"
+[ "$rc" -ne 0 ]; ck $? "(H45) the section-token mutation really changed the file"
 # ⛔ THIS MUTANT REMOVES ONE TOKEN, AND THE ARM SAYS EXACTLY THAT. The five LABEL tokens still refuse a
 # brief with no block at all, so asserting "the brief is admitted" would be false; asserting the token
 # is gone is the claim §H(ii) actually rests on.
 bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-SECTION'; rc=$?
-[ "$rc" -ne 0 ]; ck $? "(x-b) MUTATION: (ii) now FAILS — with the token line deleted, no-PW is no longer named as PREVIOUS-WORK-SECTION"
-bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-CLAIM'; ck $? "(x-c) …and the FIVE LABEL tokens still refuse the same brief, so (x-b) removed a token and not the contract"
+[ "$rc" -ne 0 ]; ck $? "(H46) MUTATION: (ii) now FAILS — with the token line deleted, no-PW is no longer named as PREVIOUS-WORK-SECTION"
+bash "$MUT_PW2" --missing "$TMP/no-pw.txt" 2>/dev/null | grep -qx 'PREVIOUS-WORK-CLAIM'; ck $? "(H47) …and the FIVE LABEL tokens still refuse the same brief, so (x-b) removed a token and not the contract"
 
 echo
 echo "§D the WIRING — driven, with a stub pi/cmux: the assertion is that NO AGENT RAN"
@@ -1413,7 +1753,18 @@ mv "$GATE" "$GATE.moved"
 # have is refused for the REPO-IDENTITY reason and never reaches the missing-validator path this arm
 # is about — the assertion then reads as "the fail-closed arm is broken" when the arm had not run. The
 # fixture is born on `init.defaultBranch=fix/research-first-gate` above; one word, same branch.
-( cd "$TMP" && env -u AGENT_INFRA_PATH O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+# ⛔ AND `env -u AGENT_INFRA_PATH` IS *STILL* NOT ENOUGH ON A BOX WITH A `keys.env` — A SIXTH ROOT IS THE
+# BOX'S OWN CREDENTIAL FILE (review cycle 11, MEASURED on a cell). `lane.sh` sources `lane-env.sh`, which
+# dots `${ENV_FILE:-$HOME/keys.env}` at top level under `set -a` BY DESIGN (`lane-env.sh:16-61`: the keys
+# file is authoritative for credentials, exactly as `cloud-cell-supervisor.sh` treats it) — and a real
+# `keys.env` carries `export AGENT_INFRA_PATH=/home/cmux/agent-infra`, which it RE-EXPORTS over the
+# `env -u` above. The resolver then found `/home/cmux/agent-infra/scripts/orchestrator-harness/brief-gate.sh`,
+# ran the REAL validator, and reported `rc=0` — so the arm read as "the fail-closed path is broken" on
+# every cell and dev box while passing on a clean CI runner (which has no keys file), i.e. it reddened
+# exactly where the variable is REAL. `ENV_FILE` is the seam `lane-env.sh` already exposes; pointing it
+# at a path that does not exist is the isolation this arm claims, and it is the same `env -u` reasoning
+# one layer further out: a fixture that inherits ambient state cannot make a claim about isolation.
+( cd "$TMP" && env -u AGENT_INFRA_PATH ENV_FILE="$TMP/fakehome/no-keys.env" O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/research-first-gate daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 mv "$GATE.moved" "$GATE"
 [ "$rc" -eq 78 ]; ck $? "a MISSING validator refuses the LANE with 78 (fail-closed: never a lane nobody asked to look first) (rc=$rc)"
@@ -1492,7 +1843,13 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     filtered out of the scan: a filter on a directory would silently absorb the next caller that happens
 #     to live there, which is the "gate that cannot see the thing it exists for" shape this list exists
 #     to prevent.
-EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+#   * ⛔ `disk-admission.test.sh` (c2b7f2bf0, #3395/#3409) is a REFERENCER, and it was the ONE name that
+#     kept this equality red at this change's base — measured on `2c18ff89a`, `found`=42 vs the 41
+#     declared, the same "red on its own base" condition the paragraph above calls out. Its only
+#     reference is a comment (`:1260`-`:1261`) recording WHY it declined to grow a `--section fixer`
+#     option: the flag belongs to `brief-gate.sh`. It dispatches no `pi` invocation, so it joins this
+#     equality without joining the dispatch population.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
