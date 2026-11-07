@@ -672,34 +672,54 @@ plist_program_args() {
         # rc=3/4 (unparseable / no usable key) → try the other guaranteed reader before giving up.
     fi
     # ⛔ THE FALLBACK CANNOT KNOW MOST ROLES, so it emits `unknown` and says so: without python3 there
-    # is no `env` hop and no `Program` read. `unknown` still carries the TCC verdict (a unit launchd
-    # cannot read must never be armed) but NOT the file-type verdict — a directory-valued `--repo` is
-    # legitimate, and calling it an "unreadable executed target" aborted the whole install on a
-    # PlistBuddy-only host, which is the #3413 P1-A failure all over again. The cost of `unknown` is a
-    # false SKIP there (a unit that might have installed is skipped loudly).
-    # ⛔ ONE ROLE IT **CAN** DERIVE, AND MUST: the `DATA_OPTIONS` table (`--repo`, `--root`) is a PRECEDING
-    # ELEMENT, not python knowledge — PlistBuddy prints the array in order, so the element after `--repo`
-    # is that option's value exactly as the python reader classifies it. Leaving it `unknown` made the
-    # two readers DISAGREE on the same argv: python emitted `data` (a TCC-root `--repo` WARNS and the
-    # unit installs), the fallback emitted `unknown` (tcc_exec=1 → verdict 2 → `launchctl bootout` +
-    # `rm -f` of an ALREADY-INSTALLED unit, exit 0). On the documented default box that reached five
-    # shipped units — `branch-reaper`, `pr-doctor`, `worktree-hygiene`, `worktree-reaper`,
-    # `runner-autoscale` — and it is reachable on any Mac whose `/usr/bin/python3` shim is executable but
-    # exits non-zero (no Command Line Tools), which `plist_python` accepts on `-x` alone. A guard that
-    # silently UNINSTALLS working units on the fallback path is the same fail-open/fail-wrong family as
-    # `[ -e ]` (fresh review of #3413, P1).
-    # ⛔ THE TABLE IS DUPLICATED IN THE PYTHON READER ABOVE (`DATA_OPTIONS = {"--repo", "--root"}`) and
-    # this awk cannot share it, so the two must be edited together. Pinned by §7c (c22b), which drives
-    # the fallback with a TCC-root `--repo` and asserts the WARN-and-install arm.
+    # is no `env` hop. `unknown` still carries the TCC verdict (a unit launchd cannot read must never
+    # be armed) but NOT the file-type verdict — a directory-valued `--repo` is legitimate, and calling
+    # it an "unreadable executed target" aborted the whole install on a PlistBuddy-only host, which is
+    # the #3413 P1-A failure all over again. The cost of `unknown` is a false SKIP there (a unit that
+    # might have installed is skipped loudly).
+    # ⛔ THE THREE ROLES IT **CAN** DERIVE, AND MUST — every one of them is a POSITIONAL FACT, not
+    # python knowledge, so there is no reason for the two readers to disagree:
+    #   1. `launcher` — `Program` when that key exists (`Print :Program`), else element 0. launchd
+    #      execs a BINARY in a TCC root with a grant (#1311), so a reader that called it `unknown`
+    #      skipped-and-DISARMED the two `com.tortoise.*` reapers whose argv[0] is
+    #      `{{TORTOISE_REPO}}/.venv/bin/python` — measured on this head (fresh review of #3413, P1):
+    #      python emitted `launcher` → WARN TCC-root launcher → installed, the fallback emitted
+    #      `unknown` → tcc_exec=1 → verdict 2 → `launchctl bootout` + `rm -f` of a working unit, exit 0.
+    #   2. `data` — the VALUE of a `DATA_OPTIONS` long option in the PRECEDING element (`--repo`,
+    #      `--root`). Leaving it `unknown` did the same to five shipped units on the documented box.
+    #   3. `data`/`exec` for the `--opt=<value>` JOINED spelling, which carries its value inside the
+    #      token — python splits it (`:649-654`) and the fallback used to drop it silently, so a
+    #      `--script=<TCC>` installed armed-and-dead with NO verdict at all.
+    # Reachable on any Mac whose `/usr/bin/python3` shim is executable but exits non-zero (no Command
+    # Line Tools), because `plist_python` accepts it on `-x` alone. A guard that silently UNINSTALLS
+    # working units on the fallback path is the same fail-open/fail-wrong family as `[ -e ]`.
+    # WHAT IS STILL `unknown`: an absolute element that is neither the launcher nor a data-option's
+    # value (an interpreter's script argument, an `env` program, a second positional). Those keep the
+    # TCC verdict and the directory escape — conservative in the SKIP direction, never in the arm one.
+    # ⛔ THE DATA_OPTIONS TABLE IS DUPLICATED IN THE PYTHON READER ABOVE (`DATA_OPTIONS = {"--repo",
+    # "--root"}`) and this awk cannot share it, so the two must be edited together. Pinned by §7c
+    # (c22b) for the data role, (c22c) for the launcher role and (c22d) for the joined spelling.
     # THE SEAM (`INSTALL_LAUNCHD_PLISTBUDDY`) exists so this arm is reachable from a test at all — on
     # Linux `/usr/libexec/PlistBuddy` does not exist, and a branch no test can reach is a branch nobody
     # knows still works.
-    local buddy="${INSTALL_LAUNCHD_PLISTBUDDY:-/usr/libexec/PlistBuddy}" raw
+    local buddy="${INSTALL_LAUNCHD_PLISTBUDDY:-/usr/libexec/PlistBuddy}" raw prog=""
     [ -x "$buddy" ] || return 1
-    raw="$("$buddy" -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 1
-    [ -n "$raw" ] || return 1
-    out="$(printf '%s\n' "$raw" | awk '
-        BEGIN { seen = 0; prev = "" }
+    # `Program` FIRST, and only when it is an absolute path: launchd execs it when the key exists and
+    # ProgramArguments[0] is then only argv[0] — exactly the python reader's rule. A missing key makes
+    # PlistBuddy exit non-zero, which is "no Program", not "cannot read".
+    prog="$("$buddy" -c 'Print :Program' "$plist" 2>/dev/null)" || prog=""
+    case "$prog" in /*) ;; *) prog="" ;; esac
+    raw="$("$buddy" -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || raw=""
+    # A `Program`-only unit is a legal launchd job (python accepts it: `argv = []`, the `Program` is
+    # the launcher), so an absent/empty array is only unusable when there is no `Program` either.
+    [ -n "$raw" ] || [ -n "$prog" ] || return 1
+    out="$(printf '%s\n' "$raw" | awk -v prog="$prog" '
+        BEGIN {
+            seen = 0; prev = ""; idx = -1
+            # The launcher is emitted BEFORE the argument walk, as the python reader does: the exec
+            # arm consults the grant this record establishes, so an order flip changes its verdict.
+            if (prog != "") { printf "launcher\t%s\n", prog; seen = 1 }
+        }
         # PlistBuddy wraps an array in `Array {` / `}` on their own lines.
         /^[[:space:]]*(Array)?[[:space:]]*\{[[:space:]]*$/ { next }
         /^[[:space:]]*\}[[:space:]]*$/ { next }
@@ -710,13 +730,27 @@ plist_program_args() {
             sub(/^(Arg)?[0-9]+[[:space:]]*=[[:space:]]*/, "", line)
             if (line == "") next
             seen = 1
-            # `unknown` = absolute, role NOT derivable without python (no env hop, no `Program`).
-            # `data` = the VALUE of a `DATA_OPTIONS` long option in the PRECEDING element — the one
-            # role this reader derives, and it must agree with the python reader or the same argv
-            # reaches two different verdicts (`data` WARNS and installs; `unknown` SKIPS and disarms).
+            idx++
+            # `--opt=<path>` carries its value INSIDE the token (python splits it at `:649-654`);
+            # dropping it made a `--script=<TCC>` install with no verdict at all.
+            if (line ~ /^--/ && index(line, "=") > 0) {
+                name = substr(line, 1, index(line, "=") - 1)
+                val = substr(line, index(line, "=") + 1)
+                if (val ~ /^\//)
+                    printf "%s\t%s\n", (name == "--repo" || name == "--root") ? "data" : "exec", val
+                prev = line
+                next
+            }
             if (line ~ /^\//) {
-                if (prev == "--repo" || prev == "--root") printf "data\t%s\n", line
-                else printf "unknown\t%s\n", line
+                if (idx == 0 && prog != "") {
+                    # `Program` wins: argv[0] is only argv[0] — the python reader skips it too.
+                } else if (idx == 0) {
+                    printf "launcher\t%s\n", line
+                } else if (prev == "--repo" || prev == "--root") {
+                    printf "data\t%s\n", line
+                } else {
+                    printf "unknown\t%s\n", line
+                }
             }
             prev = line
         }
@@ -978,7 +1012,10 @@ verify_targets() {
             case "$kind" in
                 unknown)
                     # role unknown (PlistBuddy fallback): the TCC verdict applies, the file-type one
-                    # cannot — a directory-valued `--repo` is legitimate.
+                    # cannot. `--repo`/`--root` VALUES are no longer in this class (the fallback
+                    # derives `data` for them), so what lands here is an absolute element at a
+                    # genuinely undecidable position — an `env` program, a script handed to an
+                    # interpreter, a second positional — and the conservative arm is the right one.
                     echo "    TCC-protected target: $arg" >&2
                     echo "        the role cannot be derived without python3, so this is treated as" >&2
                     echo "        EXECUTED: launchd cannot read it (#427) and arming it would exit 126." >&2
@@ -1060,9 +1097,11 @@ verify_targets() {
                 # NON-TCC executed target: the file-type/readability guarantee applies here (existence
                 # is not readability). A TCC one was already verdicted above.
                 if ! is_tcc_protected "$arg"; then
-                    # `unknown` (no python3) + a DIRECTORY: a directory cannot be executed, so this is a
-                    # data value the fallback could not name. Failing it aborted the whole install on a
-                    # PlistBuddy-only host (the #3413 P1-A failure again).
+                    # `unknown` (no python3) + a DIRECTORY: a directory cannot be executed, so this is
+                    # a data value the fallback could not name. Failing it aborted the whole install on
+                    # a PlistBuddy-only host (the #3413 P1-A failure again). Narrowed, not widened: an
+                    # `--repo`/`--root` value is derived as `data` by the fallback now, so it no longer
+                    # relies on this escape (fresh review of #3413, P2).
                     if [ "$kind" = "unknown" ] && [ -d "$arg" ]; then continue; fi
                     if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
                         echo "    unreadable or not a regular file: $arg" >&2
