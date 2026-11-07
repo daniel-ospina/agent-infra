@@ -2937,6 +2937,43 @@ if [ -d "$PG_CLONE/.git" ]; then
         *'NOT the harness pin'*) ok '§P7: and the refusal says why detached was not enough' ;;
         *) bad "§P7: the detached refusal does not name the pin record -- $PG_D_OUT" ;;
       esac
+      # ⛔ AND THE VARIABLE THAT NAMES THE PIN ROOT MUST NOT REDEFINE "THE PIN" TO MEAN ANYTHING (cycle-3 P1,
+      # MEASURED — an ambient-env bypass of the very rule above). `pin_root_of_this_box` falls back to
+      # `HARNESS_PIN_DIR`, so `HARNESS_PIN_DIR=$HOME` made ALL of the fixture home a pin root and re-admitted
+      # exactly the scratch the arm above refuses: measured, refused when unset, ARMED with
+      # `ExecStart=…/wt-drainer-in-home/scripts/cloud-cell-supervisor.sh` when set to that home. A pin TREE is
+      # named for the commit it holds (`<pin dir>/<sha>`, what the bring-up's `git worktree add --detach`
+      # creates) or IS the recorded root; a lane scratch is named for its lane. The TREE is graded now, not
+      # only its prefix, so widening the root cannot widen what counts as a pin.
+      # ⛔ THE SCRATCH IS BUILT **UNDER** THE EXPORTED ROOT, because that is the whole bypass: an arm whose
+      # scratch sat outside it would be refused by the OLD prefix rule and would certify nothing (measured —
+      # the first version of this arm was exactly that, and stayed green on the unfixed installer).
+      rm -f "$PG/units/eldato-orchestrator.service"
+      PG_HW="$PG/home/wt-drainer-in-home"
+      if git -C "$PG_CLONE" worktree add -q --detach "$PG_HW" >/dev/null 2>&1; then
+        mkdir -p "$PG_HW/scripts"; cp "$SUP" "$PG_HW/scripts/cloud-cell-supervisor.sh"
+        PG_H_RC=0
+        PG_H_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home ORCH_SUPERVISOR=$PG_HW/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_H_RC=$?
+        [ "$PG_H_RC" -ne 0 ] && ok '§P7: HARNESS_PIN_DIR=$HOME does not turn every detached worktree UNDER it into a pin (the TREE is graded)' \
+                             || bad "§P7: an exported HARNESS_PIN_DIR=$HOME re-admitted the drainer scratch under it — an ambient env var defeated the pin rule: $PG_H_OUT"
+        [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+          && ok '§P7: and a widened pin root armed nothing' || bad '§P7: the widened pin root still wrote a unit'
+      else
+        bad '§P7: the fixture could not create the in-home detached scratch, so the widened-pin-root arm did NOT run'
+      fi
+      # …and the CONTROL that keeps the arm above from being a blanket refusal of HARNESS_PIN_DIR: a REAL pin
+      # tree named for its commit, under that same exported root, is still admitted.
+      rm -f "$PG/units/eldato-orchestrator.service"
+      PG_HSHA="$(git -C "$PG_CLONE" rev-parse HEAD 2>/dev/null)"
+      if [ -n "$PG_HSHA" ] && git -C "$PG_CLONE" worktree add -q --detach "$PG/home/pins/$PG_HSHA" "$PG_HSHA" >/dev/null 2>&1; then
+        mkdir -p "$PG/home/pins/$PG_HSHA/scripts"; cp "$SUP" "$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh"
+        PG_H2_RC=0
+        PG_H2_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG/home/pins ORCH_SUPERVISOR=$PG/home/pins/$PG_HSHA/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_H2_RC=$?
+        [ "$PG_H2_RC" -eq 0 ] && ok '§P7: control — a REAL pin tree (<pin dir>/<sha>) under the exported root is still ADMITTED' \
+                             || bad "§P7: refused a legitimate pin tree under HARNESS_PIN_DIR — a false block on the cells' shape: $PG_H2_OUT"
+      else
+        bad '§P7: the fixture could not create the <pin dir>/<sha> tree, so the pin-shape control did NOT run'
+      fi
     else
       bad '§P7: the fixture could not create the detached scratch worktree, so that arm did not run'
     fi
@@ -3146,6 +3183,31 @@ if [ -n "$(git -C "$PPQ_REPO" rev-parse HEAD 2>/dev/null)" ]; then
     && ok '§P3: and nothing was armed for a path systemd reads differently' || bad '§P3: a %-bearing path still wrote a unit'
 else
   bad '§P3: the fixture could not create the %-bearing checkout, so the specifier arm did NOT run'
+fi
+# ⛔ AND THE QUOTING META-CHARACTERS ARE A THIRD SPELLING OF THE SAME FALSE PASS (cycle-3 P2, MEASURED). systemd
+# parses the two unquoted lines with its own word splitter, which STRIPS single quotes and interprets `\`: a
+# supervisor under `…/apo's/…` installed with rc=0 and an ExecStart naming `…/apos/…`, which `systemd-analyze
+# verify` then rejected as "not executable" (an unpaired quote: "Unbalanced quoting, ignoring"; a backslash:
+# "Ignoring unknown escape sequences") — the artifact systemd reads differs from the one verify_unit greps.
+PPR="$(arm_root ppr)"; mk_systemctl "$PPR/bin" "$PPR/state" "$PPR/sc.log"; mk_tmux "$PPR/bin" "$PPR/tmux.log"
+PPR_REPO="$PPR/home/apo's"; mkdir -p "$PPR_REPO/scripts"
+cp "$SUP" "$PPR_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPR_REPO" 2>/dev/null
+git -C "$PPR_REPO" add -A >/dev/null 2>&1
+git -C "$PPR_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPR_REPO" rev-parse HEAD 2>/dev/null)" ]; then
+  PPR_RC=0
+  PPR_OUT="$(ORCH_SUPERVISOR="$PPR_REPO/scripts/cloud-cell-supervisor.sh" inst ppr --install 2>&1)" || PPR_RC=$?
+  [ "$PPR_RC" -ne 0 ] && ok '§P3: a supervisor path containing a single quote is REFUSED (systemd strips it, and verify_unit would not notice)' \
+                     || bad "§P3: rendered an ExecStart whose quoted path systemd rewrites — the artifact differs from the one verify_unit greps: $PPR_OUT"
+  case "$PPR_OUT" in
+    *quote*) ok '§P3: and the refusal names the quote as the reason' ;;
+    *) bad "§P3: the quote refusal does not name the reason — $PPR_OUT" ;;
+  esac
+  [ ! -f "$PPR/units/eldato-orchestrator.service" ] \
+    && ok '§P3: and nothing was armed for a path systemd rewrites' || bad '§P3: a quoted path still wrote a unit'
+else
+  bad '§P3: the fixture could not create the quoted checkout, so the quote arm did NOT run'
 fi
 # ⛔ A BARE-CONFIGURED PRIMARY CLONE IS THE CELLS' OWN SHAPE, AND IT HAS NO TOP LEVEL TO NAME (re-review P3).
 # Measured on this fleet: `/tmp/cell-ai` answers `core.bare` → true, so `rev-parse --show-toplevel` FAILS while
