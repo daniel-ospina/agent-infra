@@ -3128,8 +3128,12 @@ root, live = sys.argv[3], int(sys.argv[4])
 os.makedirs(root, exist_ok=True)
 m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(root, "loop.lock")
 # Two stubs, so the interleaving is the only thing under test: every pid reads as alive, and only the
-# COMPETITOR reads as a scheduler loop. The competitor's recorded start time is its REAL one, so the
-# identity check recognises it — otherwise the test would be grading the start arm, not this one.
+# COMPETITOR reads as a scheduler loop. Its recorded start time is the REAL one, so the identity
+# check recognises it — otherwise the test would be grading the start arm, not this one.
+# ⛔ KEEP THE APOSTROPHE COUNT IN THIS BODY EVEN (#3625). The bash 3.2 scanner does not know about
+# here-documents inside a command substitution: it walks the body as code, so one odd single-quote
+# opens a state that never closes and the WHOLE FILE fails `bash -n`, reported far below the defect.
+# Verify with `bash scripts/check-bash32-parse.sh` after any edit in here.
 m.pid_alive = lambda p: True
 m.pid_is_our_loop = lambda p: p == live
 competitor_start = m.proc_start_time(live)
@@ -3689,7 +3693,10 @@ real_link, real_rename, real_write = os.link, os.rename, os.write
 def no_link(a, b, *rest, **kw):
     raise OSError(errno.EOPNOTSUPP, "Operation not supported")
 def takeover_write(fd, data):
-    # attempt 1: the create's content window is lost to a third party that publishes a STALE record
+    # attempt 1: the content window of the create is lost to a third party that publishes a STALE
+    # record. ⛔ KEEP THE APOSTROPHE COUNT IN THIS BODY EVEN (#3625): this here-doc lives inside a
+    # `$( … )`, and the bash 3.2 scanner walks the body as code, so one odd single-quote opens a
+    # state that never closes and the WHOLE FILE fails `bash -n`, far below the defect.
     os.unlink(m.LOOP_LOCK)
     with open(m.LOOP_LOCK, "w") as fh:
         fh.write('{"pid": 999999, "start": "", "state": "/third"}')
