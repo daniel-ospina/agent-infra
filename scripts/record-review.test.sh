@@ -5569,7 +5569,7 @@ assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
 PATCH_FAIL_PR=424365
 STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
     run_record_633 "$PATCH_FAIL_PR" "$SHA" "$DC_CRUNS"
-assert_contains "$RECORD_ERR" "NO PENDING COPY IS ON DISK EITHER" \
+assert_contains "$RECORD_ERR" "NO PENDING COPY FOR THIS RUN IS ON DISK EITHER" \
     "14.1d(j) the PATCH arm's comment-visible message names the real state when its own persist failed"
 assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"

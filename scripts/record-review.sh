@@ -6698,7 +6698,7 @@ ${MISSING}"
         if [ "$PATCH_PERSISTED" -eq 1 ]; then
           echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. Re-run the recorder at this head, or post the body copy with --flush-pending, to fire the \`edited\` event that re-runs the gate." >&2
         else
-          echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. ⛔ NO PENDING COPY IS ON DISK EITHER (the ⚠️ body-marker persist line above says so), so --flush-pending would find NOTHING and cannot fire the \`edited\` event: copy the marker text that line reproduced and PATCH it into the PR body by hand once gh is reachable." >&2
+          echo "   ℹ️  the durable comment copy IS VISIBLE to the gate now (this run posted it, or an admitted comment already carried it), so ai-review-gate can ADMIT this review on its own endpoint and scope. ⛔ NO PENDING COPY FOR THIS RUN IS ON DISK EITHER (the ⚠️ body-marker persist line above says so), so --flush-pending would find NOTHING for the marker this run owed — it can only deliver an OLDER pending marker for this PR, or answer 'nothing pending' when none is pending, and neither fires the \`edited\` event for THESE bytes: copy the marker text that line reproduced and PATCH it into the PR body by hand once gh is reachable." >&2
         fi
       else
         # ⛔ NO ABSENCE CLAIM (#3168, the same class the read-failure arm was corrected
