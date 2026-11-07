@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "exit_code": null,
+  "heartbeat_at": 1794060498,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-bgdelivery2-1794060498-p127423-cb94cce8",
+  "lease_until": 1794061118,
+  "pid": 127423,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1794060498,
+  "state": "RUNNING",
+  "tag": "bgdelivery2",
+  "worktree": "/tmp/tmp.JlzQkU4wj6/wt"
+}
