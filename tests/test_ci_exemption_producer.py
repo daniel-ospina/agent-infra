@@ -570,7 +570,9 @@ def test_cli_decide_LEGACY_tab_free_rotation_marks_a_spacey_id_UNATTRIBUTABLE(tm
     PLUMBING between them, which no unit test covers on its own.
 
     MUTATION: drop ``rotation=rotation`` from ``_cmd_decide`` → the run EXEMPTS and
-    the ``--unattributable-out``/exit assertions RED (measured, 1 failed).
+    the ``--unattributable-out``/exit assertions RED (measured, 2 failed: this leg and
+    ``test_cli_decide_rotation_is_unattributable_and_gates``, whose ``rot`` fixture is
+    itself tab-free space-joined, so dropping the plumbing empties its E5 map too).
     ⛔ NOT a mutation: passing a constant ``rotation_legacy=False`` — that is a
     NO-OP by design, because ``decide`` ORs the flag with the form DERIVED from
     ``rotation=`` (``scripts/ci_exemption.py``, the ``rotation is not None`` arm), so

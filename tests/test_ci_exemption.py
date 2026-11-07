@@ -1264,7 +1264,8 @@ def test_an_EMPTY_rotating_map_cannot_SUPPRESS_the_E5_map_derived_from_rotation(
     the very evidence it was handed — which exempts a TAB-form id that
     `detect_rotating_identity` reports as having MOVED, the one class the rail states
     may never merge. A falsy map is therefore treated as absent and RE-DERIVED; a
-    non-empty map is still honoured, which can only narrow.
+    non-empty map is UNIONED with the derived one (review cycle 10), so an incomplete or
+    unrelated map can only ADD ids to the E5 signal — never subtract evidence.
 
     MUTATION: `if not rotating:` → `if rotating is None:` → this id is EXEMPTED and the
     first assertion reddens.
@@ -1288,6 +1289,41 @@ def test_an_EMPTY_rotating_map_cannot_SUPPRESS_the_E5_map_derived_from_rotation(
     assert [v.nodeid for v in decision.exempt] == [], (
         "an EMPTY `rotating=` map suppressed the E5 map derived from `rotation=`, so "
         f"a MOVING identity was EXEMPTED:\n{decision.report()}"
+    )
+    assert [v.nodeid for v in decision.unattributable] == [moved_b], decision.report()
+
+
+def test_an_INCOMPLETE_rotating_map_cannot_SUBTRACT_the_derived_E5_signal():
+    """⛔ A SUPPLIED MAP IS UNIONED, NEVER SUBSTITUTED (#3686 review cycle 10, P2).
+
+    Cycle 9 stopped a FALSY map from suppressing the derivation; a TRUTHY one still
+    replaced it wholesale, so an unrelated or incomplete map DROPPED the E5 signal the
+    same caller handed in beside it. Measured before this fix: on TAB-form evidence
+    whose class reports a MOVING identity, `rotating={"Other::cls": …}` EXEMPTED the
+    moved id — again the class the rail states may never merge.
+
+    MUTATION: replace the union with `rotating = rotating or derived` (i.e. keep a
+    truthy map as-is) → this id is EXEMPTED and the first assertion reddens.
+    """
+    moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
+    moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    stable = "tests/other.py::test_y"
+    sig = "sg-3686-partial"
+    runs = parse_rotation_runs(f"{stable}\t{moved_a}\n{stable}\t{moved_b}\n")
+
+    main = parse_rates(f"{moved_b}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved_b}\t3\t26\t{sig}\n").failures
+    decision = decide(
+        pr, main.rates,
+        main_signatures={moved_b: frozenset({sig})},
+        # ⛔ a TRUTHY map for an UNRELATED class — the substitution trap
+        rotating={"tests/other.py::Other": frozenset({stable})},
+        rotation=runs,
+        k_pr=26,
+    )
+    assert [v.nodeid for v in decision.exempt] == [], (
+        "an unrelated NON-EMPTY `rotating=` map SUBSTITUTED for the E5 map derived "
+        f"from `rotation=`, so a MOVING identity was EXEMPTED:\n{decision.report()}"
     )
     assert [v.nodeid for v in decision.unattributable] == [moved_b], decision.report()
 
