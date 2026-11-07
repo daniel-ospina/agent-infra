@@ -286,6 +286,7 @@ _slug_from_remote = _real._slug_from_remote
 _normalize_slug = _real._normalize_slug
 _origin_slug = _real._origin_slug
 set_tag_collisions = _real.set_tag_collisions
+configured_repos = _real.configured_repos
 if __name__ == "__main__":
     print("ARGV " + " ".join(sys.argv[1:]))
     print("SET " + (os.environ.get("PR_DOCTOR_REPOS") or "<unset>"))
