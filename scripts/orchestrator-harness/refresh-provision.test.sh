@@ -64,10 +64,12 @@
 #       the cause can never report a "DIFFERENT repo" mismatch it did not measure.
 #
 # #3584 — THE GH PRECONDITION MUST NAME ITSELF IN THE RECORD, one arm each:
-#   (g)  the gh precondition refuses LOCALLY (rc=75, the shim's real `gh-contended` shared-window note)
-#        and the RECORD names the specific precondition plus that evidence, instead of the old pointer
-#        `(the refusal line above names which one)` — and claims NO quota exhaustion that 75 does not
-#        establish;
+#   (g)  the gh precondition refuses LOCALLY (rc=75) and the RECORD names the specific precondition,
+#        instead of the old pointer `(the refusal line above names which one)` — and claims NO quota
+#        exhaustion that 75 does not establish. ⛔ IT QUOTES THE FIRST CAPTURED LINE, which on this arm is
+#        `wait_for_cooldown`'s PACING note, not the `gh-contended` verdict three lines down: production's
+#        capture is three notes and `gh_probe_evidence` takes the first, so the row pins the pacing note
+#        IN and the `gh-contended` line OUT (#3701 review round 7, P2);
 #   (g2) NON-VACUITY: reverting ONLY the call-site interpolation in a copy puts the pointer back and
 #        drops the evidence — so (g) measures the record, not the probe's log line;
 #   (g3) the clause is MEASURED, not constant: a REJECTED credential (HTTP 401) is still rc=3 and is
@@ -85,8 +87,10 @@
 #        now ordered by: the cut may land inside the EVIDENCE, never inside the verdict.
 #   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
 #   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
-#   the label against evidence production cannot emit (#3701 review, P2). The stub's string is
-#   DERIVED from `scripts/gh-shim/gh` itself, so "verbatim" is a fact rather than a transcription.
+#   the label against evidence production cannot emit (#3701 review, P2). ALL THREE captured notes are
+#   DERIVED from `scripts/gh-shim/gh` itself (with only the runtime figures substituted), so "verbatim"
+#   is a fact rather than a transcription — and a reword of any of them reds a row instead of silently
+#   leaving the fixture behind.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -954,30 +958,51 @@ mk_case gh_budget
 #   * round 6: the note WITHOUT `gate_note`'s own `gh-gate: ` prefix (`scripts/gh-shim/gh:679`), which
 #     made the line 253 bytes rather than the 244 of the note alone;
 #   * round 7 (P2): the wrong LINE ENTIRELY. `wait_for_cooldown` appends TWO notes to `$NOTEF` before the
-#     refusal is written — `gh:1477` the shared-window/pacing note, `gh:1485` the budget-read note — and
-#     `flush_notes 75` then cats all three to stderr. `gh_probe_evidence` takes the FIRST non-empty line,
-#     so the record quotes the PACING note and the 244-byte `gh-contended` verdict is line 3, which the
-#     probe never reaches. A fixture emitting only `gh-contended` therefore asserted a shape production
-#     cannot emit for this arm — the same defect class as the round-3 `gh-core-floor` finding, one layer
-#     down. The stub now emits all three lines in production's order.
-# ⛔ The `gh-contended` line is DERIVED from `scripts/gh-shim/gh:1874` so it cannot drift; the two pacing
-# notes carry runtime figures (`waiting Ns`, `budget Nms`), so the fixture pins concrete ones and says so.
-SHIM_NOTE="$(grep -m1 '^ *gate_note "gh-contended' "$HERE/../../scripts/gh-shim/gh" \
-  | sed -e 's/^ *gate_note "//' -e 's/"$//' -e 's/\${WAIT_BUDGET_MS}/120000/')"
-SHIM_PACE='gh-gate: the account is in a shared rate-limit window — waiting 5s before this call (budget 1000ms)'
-SHIM_BUDGET='gh-gate: if the account BUDGET is what refused, one cheap read says so: cat /gate/budget (no API call)'
-SHIM_FIRST="$SHIM_PACE"
-SHIM_CAPTURE="$(printf '%s\n%s\n%s' "$SHIM_PACE" "$SHIM_BUDGET" "gh-gate: $SHIM_NOTE")"
-case "$SHIM_NOTE" in
-  *'gh-contended'*) SHIM_NOTE_NOTE='' ;;
-  *) SHIM_NOTE_NOTE='the shim no longer emits a gh-contended note at this line' ;;
+#     refusal is written — `gh:1479` the shared-window/pacing note, `gh:1485` the budget-read note — and
+#     `flush_notes 75` (`gh:1876`) then cats all three to stderr. `gh_probe_evidence` takes the FIRST
+#     non-empty line, so the record quotes the PACING note and the 244-byte `gh-contended` verdict is
+#     line 3, which the probe never reaches. A fixture emitting only `gh-contended` therefore asserted a
+#     shape production cannot emit for this arm — the same defect class as the round-3 `gh-core-floor`
+#     finding, one layer down. The stub now emits all three lines in production's order.
+# ⛔ ALL THREE ARE DERIVED FROM `scripts/gh-shim/gh` (#3701 review round 8, P2). Pinning the pacing and
+# budget-read notes as hand-typed literals would leave the two lines that ACTUALLY reach the record
+# undrifted by nothing — a reword of `gh:1479` would change no row — so they are extracted with the same
+# grep/sed as the verdict line, with only the runtime figures substituted (`$(( (rem + 999) / 1000 ))`
+# → `5`, `${WAIT_BUDGET_MS}` → `1000` / `120000`, `$GATE_DIR` → `/gate`). A residual `$` in ANY of the
+# three is a FAILURE, not a silently stale fixture.
+# ⛔ TWO THINGS THIS GOT WRONG FIRST TIME, both caught by the rows below rather than by reading:
+#   * `gate_note`'s `gh-gate: ` prefix is added by `gate_note` ITSELF (`gh:679`), so it is NOT part of the
+#     extracted argument — the first two capture lines were built without it while the third had it;
+#   * `gh:1485` interpolates `$GATE_DIR` with NO braces, so a `${GATE_DIR}` pattern matched nothing.
+SHIM="$HERE/../../scripts/gh-shim/gh"
+shim_note_line() {  # <grep-anchor> <sed-expr>… — the gate_note ARGUMENT, from the shipped shim
+  local anchor="$1"; shift
+  grep -m1 "^ *gate_note \"$anchor" "$SHIM" \
+    | sed -e 's/^ *gate_note "//' -e 's/"$//' "$@"
+}
+SHIM_NOTE="$(shim_note_line 'gh-contended' -e 's/\${WAIT_BUDGET_MS}/120000/')"
+SHIM_PACE="$(shim_note_line 'the account is in a shared rate-limit window — waiting' \
+  -e 's/\$(( (rem + 999) \/ 1000 ))/5/' -e 's/\${WAIT_BUDGET_MS}/1000/')"
+SHIM_BUDGET="$(shim_note_line 'if the account BUDGET is what refused' -e 's|\$GATE_DIR|/gate|')"
+# every line is `gh-gate: ` + its argument, which is what `flush_notes` cats to stderr
+SHIM_CAPTURE="$(printf '%s\n%s\n%s' "gh-gate: $SHIM_PACE" "gh-gate: $SHIM_BUDGET" "gh-gate: $SHIM_NOTE")"
+# ⛔ THE CAPTURE'S SHAPE IS ASSERTED, NOT ASSUMED (#3701 review round 8, P2). The rows below are only
+# meaningful if the stub really captures THREE lines in production's order — the round-7 fixture was
+# green under a mutation that dropped both later lines, because nothing counted them.
+SHIM_BAD=''
+case "$SHIM_NOTE" in *'gh-contended'*) ;; *) SHIM_BAD='the shim no longer emits a gh-contended note' ;; esac
+case "$SHIM_PACE" in *'shared rate-limit window'*) ;; *) SHIM_BAD='the shim no longer emits a pacing note' ;; esac
+case "$SHIM_BUDGET" in *'BUDGET is what refused'*) ;; *) SHIM_BAD='the shim no longer emits a budget-read note' ;; esac
+case "$SHIM_NOTE$SHIM_PACE$SHIM_BUDGET" in
+  *'$'*) SHIM_BAD='a derived line still carries an unexpanded shell reference' ;;
 esac
-case "${SHIM_NOTE:-}" in
-  *'${'*) SHIM_NOTE_NOTE='the derived line still carries an unexpanded shell variable' ;;
-esac
-[ -z "${SHIM_NOTE_NOTE:-}" ] \
-  && ok "(g) the stub emits production's 3-note capture, the gh-contended line derived (first line ${#SHIM_FIRST} chars)" \
-  || bad "(g) the shim's gh-contended note could not be derived — ${SHIM_NOTE_NOTE} (a hand-typed copy is what this row exists to stop)"
+ck "(g) the stub emits production's 3-note capture, ALL derived from the shim" \
+   "$([ -z "$SHIM_BAD" ]; echo $?)"
+[ -n "$SHIM_BAD" ] && bad "(g) …could not be derived: $SHIM_BAD (a hand-typed copy is what these rows exist to stop)"
+ck "(g) …in production's order: pacing, budget-read, gh-contended (line count=$(printf '%s' "$SHIM_CAPTURE" | grep -c ''))" \
+   "$([ "$(printf '%s' "$SHIM_CAPTURE" | grep -c '')" -eq 3 ] \
+      && [ "$(printf '%s' "$SHIM_CAPTURE" | sed -n 1p)" = "gh-gate: $SHIM_PACE" ] \
+      && [ "$(printf '%s' "$SHIM_CAPTURE" | sed -n 3p)" = "gh-gate: $SHIM_NOTE" ]; echo $?)"
 mk_gh_budget_stub "$D" 75 "$SHIM_CAPTURE"
 rp "$D"
 G_WHY="$(rec why)"
@@ -1021,8 +1046,12 @@ then
   ck "(g2) with the call-site interpolation reverted the pass STILL refuses (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
   ck "(g2) …and its record falls back to the POINTER, so (g) is not vacuous" \
      "$(case "$GM_WHY" in *'refusal line above names which one'*) echo 0 ;; *) echo 1 ;; esac)"
-  ck "(g2) …and the reverted record loses the gh layer's evidence (the row (g) pins is live)" \
-     "$(case "$GM_WHY" in *'gh-contended'*) echo 1 ;; *) echo 0 ;; esac)"
+  # ⛔ AND IT MUST LOSE WHAT `(g)` ACTUALLY PINS — the PACING note (#3701 review round 8, P2). This row
+  # looked for `gh-contended`, which the reverted record could never contain (the revert drops the whole
+  # interpolation for a fixed literal), so it was inert: it stayed green under a mutation that removed
+  # the gh-contended line from the capture entirely. `(g)` now pins the pacing note, so this checks that.
+  ck "(g2) …and the reverted record loses the gh layer's evidence — the PACING note that (g) pins is live" \
+     "$(case "$GM_WHY" in *'shared rate-limit window'*) echo 1 ;; *) echo 0 ;; esac)"
 else
   bad "(g2) the non-vacuity control could not be produced"
 fi
@@ -1130,11 +1159,10 @@ if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut 
      "$(case "$GBEAT" in *'evidence=rc=75: gh-gate: the account is in a shared rate-limit window'*) echo 0 ;; *) echo 1 ;; esac)"
   ck "(g7) …proving the cut severed the QUOTED line's tail (…(budget 1000ms) is outside the beat)" \
      "$(case "$GBEAT" in *'(budget 1000ms)'*) echo 1 ;; *) echo 0 ;; esac)"
-  # ⛔ AND THIS ROW IS THE FIXTURE'S OWN TRIPWIRE, so its message says so. The quoted tail is the FIXTURE's
-  # pacing literal (`$SHIM_PACE`), which mirrors `scripts/gh-shim/gh:1477` — so if that call is reworded,
-  # this reds while the rows above stay green, and the cause is the fixture's model, not the cut. If what
-  # reds is the row ABOVE instead, the fixture has stopped modelling production's capture order.
-  ck "(g7) …while the RECORD still carries the quoted line WHOLE, so nothing is lost where it is read less often (if THIS reds, check whether scripts/gh-shim/gh:1477 reworded its pacing note before assuming the ordering regressed)" \
+  # ⛔ AND THE RECORD KEEPS THE WHOLE QUOTED LINE. Since round 8 the pacing note is DERIVED from
+  # `scripts/gh-shim/gh:1479`, so a reword there now reds the `(g)` derivation rows first; this row reds
+  # only if the RECORD stops carrying the line the beat severed, which is the property it names.
+  ck "(g7) …while the RECORD still carries the quoted line WHOLE, so nothing is lost where it is read less often" \
      "$(case "$GBEAT_WHY" in *'(budget 1000ms)'*) echo 0 ;; *) echo 1 ;; esac)"
 else
   bad "(g7) the real refresh_cause_brief could not be extracted from $LOOP — the beat's cut is ungraded"

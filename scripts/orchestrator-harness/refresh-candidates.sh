@@ -923,7 +923,7 @@ GH_PROBE_CAUSE=""
 # ⛔ AND WHAT ARRIVES THERE IS NOT THE `gh-contended` LINE (#3701 review round 7, P2). That was this
 # comment's claim and it was false: `gh_probe_evidence` takes the FIRST non-empty captured line
 # (`awk 'NF{print; exit}'`), while `wait_for_cooldown` buffers TWO notes into the same `$NOTEF` before
-# the refusal is even written (`scripts/gh-shim/gh:1477` the shared-window/pacing note, `:1485` the
+# the refusal is even written (`scripts/gh-shim/gh:1479` the shared-window/pacing note, `:1485` the
 # budget-read note) — and `flush_notes 75` (`:1876`) then cats all three to stderr. So the record quotes
 # the PACING note and the `gh-contended` verdict (`:1874`, 244-byte note, 253-byte line) is line 3 and
 # never reaches it. MEASURED on a representative capture (`waiting 5s … budget 1000ms`): the quoted line
