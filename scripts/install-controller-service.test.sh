@@ -2934,6 +2934,55 @@ if [ -d "$PG_CLONE/.git" ]; then
   else
     bad '§P7: the fixture could not build the lane-branch clone, so that arm did NOT run'
   fi
+  # (b4) A DETACHED PRIMARY CLONE IS NOT THE DEPLOYMENT SHAPE EITHER (cycle-8 P2, MEASURED — a pre-existing
+  # FAIL-OPEN). The helper used to read a detached HEAD as "no branch to be unmerged at" and ADMIT it, so a
+  # lane that isolates by CLONING and then detaches at a PR head (`git clone … && git checkout <pr-head>`)
+  # armed a unit at a path a cleaning removes — the #2697 class, re-opened by the shape that had no name.
+  # Ancestry is the only question available once there is no name: contained in the clone's default ref =
+  # the deployment's own revision (admitted); not contained = a PR head (refused). This clone CARRIES origin
+  # refs, which is what puts it on the ancestry path rather than the no-default-ref fallback.
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_DET="$T/detached-clone"; mkdir -p "$PG_DET/scripts"
+  cp "$SUP" "$PG_DET/scripts/cloud-cell-supervisor.sh"
+  if git init -q "$PG_DET" 2>/dev/null \
+     && git -C "$PG_DET" add -A >/dev/null 2>&1 \
+     && git -C "$PG_DET" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm merged >/dev/null 2>&1 \
+     && git -C "$PG_DET" update-ref refs/remotes/origin/main HEAD 2>/dev/null \
+     && git -C "$PG_DET" symbolic-ref refs/remotes/origin/HEAD refs/remotes/origin/main 2>/dev/null \
+     && git -C "$PG_DET" checkout -q --detach refs/remotes/origin/main >/dev/null 2>&1; then
+    # (b4-i) detached AT the commit the default ref carries — admitted (a deployment pinned at its own revision)
+    PG_B4_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_DET" inst pg --install 2>&1)" || true
+    grep -qxF "ExecStart=/bin/bash $PG_DET/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+      && ok '§P7: a clone DETACHED at the commit its default ref carries still installs (containment, not a branch name)' \
+      || bad "§P7: refused a clone detached at its own default revision — a false block on a durable deployment: $PG_B4_OUT"
+    rm -f "$PG/units/eldato-orchestrator.service"
+    # (b4-ii) detached at a commit the default ref does NOT carry — a PR head — REFUSED
+    if git -C "$PG_DET" -c user.email=fixture@example.invalid -c user.name=fixture commit -q --allow-empty -m unmerged >/dev/null 2>&1 \
+       && git -C "$PG_DET" checkout -q --detach HEAD >/dev/null 2>&1; then
+      PG_B5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_DET" inst pg --install 2>&1)" || true
+      grep -qxF "ExecStart=/bin/bash $PG_DET/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+        && bad "§P7: a clone DETACHED at an UNMERGED commit was ARMED — that is a PR head a lane removes: $PG_B5_OUT" \
+        || ok '§P7: a clone DETACHED at a commit its default ref does NOT carry is REFUSED (the #2697 class in a detached checkout)'
+      case "$PG_B5_OUT" in
+        *'DETACHED HEAD'*'does NOT contain'*) ok '§P7: and the refusal says DETACHED and names containment, not a branch it does not have' ;;
+        *) bad "§P7: the detached-clone refusal misdescribes the checkout (a branch it does not have?) — $PG_B5_OUT" ;;
+      esac
+      rm -f "$PG/units/eldato-orchestrator.service"
+      # (b4-iii) RESIDUAL (documented, not a guarantee): with NO default ref to compare against, a detached
+      # clone cannot be proven either way, so it is admitted. Named in docs/ops/controller-service.md.
+      git -C "$PG_DET" symbolic-ref -d refs/remotes/origin/HEAD >/dev/null 2>&1
+      git -C "$PG_DET" symbolic-ref -d refs/remotes/origin/main >/dev/null 2>&1 || git -C "$PG_DET" update-ref -d refs/remotes/origin/main >/dev/null 2>&1
+      PG_B6_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_DET/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_DET" inst pg --install 2>&1)" || true
+      grep -qxF "ExecStart=/bin/bash $PG_DET/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+        && ok '§P7: RESIDUAL (documented): a detached clone with NO default ref is admitted — there is nothing to prove it against' \
+        || bad "§P7: the documented no-default-ref residual changed shape without the doc changing: $PG_B6_OUT"
+      rm -f "$PG/units/eldato-orchestrator.service"
+    else
+      bad '§P7: the fixture could not build the unmerged-detached commit, so those arms did NOT run'
+    fi
+  else
+    bad '§P7: the fixture could not build the detached clone, so those arms did NOT run'
+  fi
   # (c) a LINKED worktree of that same clone, under a DURABLE root and with a name no pattern matches
   rm -f "$PG/units/eldato-orchestrator.service"
   PG_WT="$PG/home/lane-checkout"

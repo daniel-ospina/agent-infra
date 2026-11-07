@@ -114,6 +114,26 @@ other branch is unmerged work a lane removes, so a lane that isolates by cloning
 `git worktree add` is refused exactly like a linked worktree on a branch, while `/tmp/cell-ai` on `main`
 keeps installing.
 
+**And a DETACHED primary clone is graded, not waved through.** A detached HEAD has no branch name to grade,
+so the helper used to read it as "nothing to be unmerged at" and admit it — which armed a unit at a clone a
+lane detaches at a PR head (`git clone … && git checkout <pr-head>`) and then removes, i.e. the #2697 class
+in a checkout that had no name. The question available without a name is containment: a detached clone is
+admitted when its HEAD is contained in the clone's default ref (`git merge-base --is-ancestor HEAD
+refs/remotes/origin/<default>` — the clone is pinned at the revision its own deployment carries) and
+refused when it is not. The fleet's only legitimately detached checkout is the harness **pin**, which the
+bring-up creates with `git worktree add --detach` and which the linked-worktree rule grades before this one
+is consulted, so no deployment shape is lost. `merge-base --is-ancestor` is **tri-state** — 0 yes, 1 no,
+128 git could not answer — and a read that cannot be made is reported as CANNOT PROVE and refused, never
+folded into a confident "not contained". The graded ref is the **local** `refs/remotes/origin/HEAD` symref,
+which `git clone` derives from the remote and a caller can rewrite: this guard is an **accident guard**
+(`#2697` was an install from a lane worktree with nothing exported), not a boundary against a caller who
+rewrites its own refs.
+
+**Named residual (detached clone, no default ref):** when the clone carries no default ref to compare
+against (a fixture clone with no `origin`), containment cannot be asked, so a detached clone is admitted.
+There is no evidence to refuse on, and fabricating a refusal would false-block a clone that is in fact
+pinned at its own deployment's revision; the residual is stated rather than papered over.
+
 **Named residual:** the pin has three locators — `HARNESS_PIN_DIR`, `HARNESS_PIN_FILE`, and the record
 itself (`$CELL_HOME/.harness-path`) — and all three are how a real box relocates its pin, so a caller that
 deliberately declares a scratch as its own pin root (or writes a record naming one) can still arm it. This
