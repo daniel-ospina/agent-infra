@@ -159,6 +159,21 @@ GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
 # re-impose the starvation, so the comparison is skipped entirely when the seam is empty.
 GITLESS_MAX="${REAP_AW_GITLESS_MAX:-}"
 ROOTS="${REAP_AW_ROOTS:-/tmp}"
+# ⛔ THE CELL HOME THE `home-or-state` GUARD PROTECTS EVEN WHEN NOTHING EXPORTS `CELL_HOME`.
+# MEASURED (#3278, 2026-11-06, owner, on a cell): the unit renders `Environment=HOME=/home/cmux`, which
+# IS a real directory, so `disk-reaper-run.sh`'s fallback never substituted and its `CELL_HOME=` was
+# never exported — so the guard compared against `/home/cmux` alone and `/tmp/cell-home` (a live ~20 GB
+# operative home holding the cell's `.pi` state, with no `.git` and therefore no `main-checkout` guard
+# of its own) matched NONE of the three references. On the armed pass it survived as
+# `reason=gitless-cap` — a rate limit, not a gate.
+#
+# ⛔ IT IS RESOLVED HERE, NOT BY EXPORTING `CELL_HOME` UPSTREAM — that was tried and measured WRONG.
+# `load_pin` (`:332`) reads the same variable with FIRST-MATCH-WINS and a `break`
+# (`${CELL_HOME}/orchestrator/…` then `${HOME}/.pi/orchestrator/…`), so its list is a SUBSTITUTION, not
+# a union: exporting would make one of the two stamps stop being read, i.e. a tree the other stamp
+# pinned becomes a candidate and `rm -rf` takes it. A local fallback is additive; an exported variable
+# is not. This value touches only the guard loop.
+CELL_HOME_DEFAULT="${CELL_HOME:-/tmp/cell-home}"
 DRY_RUN="${REAP_AW_DRY_RUN:-1}"
 BUDGET="${REAP_AW_BUDGET_SECONDS:-300}"
 GIT_TIMEOUT="${REAP_AW_GIT_TIMEOUT:-60}"
@@ -220,6 +235,9 @@ if [ "$PRINT_CONFIG" = 1 ]; then
     # "no count ceiling" from "a ceiling nobody set".
     printf 'budget_seconds=%s\n' "$BUDGET"
     printf 'gitless_max=%s\n' "${GITLESS_MAX:-none}"
+    # The cell home the guard will protect even with `CELL_HOME` unset (the unit's shape). Reported
+    # like the other effective bounds: a pass record must not hide what the guard was comparing.
+    printf 'cell_home_default=%s\n' "$CELL_HOME_DEFAULT"
     printf 'mode=%s\n' "$([ "$DRY_RUN" = 1 ] && printf dry-run || printf apply)"
     exit 0
 fi
@@ -654,24 +672,12 @@ sweep_root() { # <root>
         # with each reference canonicalised too (review of #3278 round 2, measured: a non-canonical
         # `--root` spelling reaped /tmp/cell-home, which holds ~9.8 GB of `.pi` / `.venvs` here, and the
         # structural guard — the stamp's ancestor-pin — is absent on the scheduled path).
-        # ⛔ AND `${CELL_HOME}` FALLS BACK TO THE CELL HOME ITSELF, because the guard must not depend on
-        # its callers getting the environment right — MEASURED (#3278, 2026-11-06): the unit renders
-        # `Environment=HOME=/home/cmux`, which IS a directory, so `disk-reaper-run.sh`'s fallback never
-        # substituted, and its `CELL_HOME=` was a shell variable it did not export. The delegate then
-        # compared against `/home/cmux` alone and `/tmp/cell-home` — a live ~20 GB operative home, no
-        # `.git`, so no `main-checkout` guard either — matched NONE of the three references, i.e. the
-        # guard was inert exactly where it is the last thing between an armed pass and
-        # `rm -rf /tmp/cell-home`. Resolving the default HERE covers every caller (the systemd unit, the
-        # darwin launcher, a manual run) instead of trusting each one to export it.
-        # ⛔ AND IT MUST BE RESOLVED **HERE**, NOT BY EXPORTING `CELL_HOME` UPSTREAM. `load_pin` (`:332`)
-        # reads the same variable with FIRST-MATCH-WINS and a `break` — `${CELL_HOME}/orchestrator/…`
-        # then `${HOME}/.pi/orchestrator/…` — so the list is a substitution, not a union. A box whose two
-        # stamps disagree (exactly the `HOME=/home/cmux` vs `CELL_HOME=/tmp/cell-home` divergence above)
-        # would have the HOME stamp silently STOP being read, i.e. a pinned tree becomes a candidate and
-        # `rm -rf` takes it. This default touches only the guard loop and leaves `load_pin`'s input
-        # exactly as it was; a local fallback is additive, an exported variable is not.
+        # ⛔ AND `CELL_HOME_DEFAULT` CARRIES THE CELL HOME ITSELF, because the guard must not depend on
+        # its callers getting the environment right (see its assignment above for the measurement and
+        # for why it is NOT fixed by exporting `CELL_HOME`). Resolving it here covers every caller —
+        # the systemd unit, the darwin launcher, a manual run — instead of trusting each to export it.
         if [ "$gitless" = 1 ]; then
-            for _ref in "${HOME:-}" "${CELL_HOME:-/tmp/cell-home}" "${REAP_AW_STATE_DIR:-}"; do
+            for _ref in "${HOME:-}" "$CELL_HOME_DEFAULT" "${REAP_AW_STATE_DIR:-}"; do
                 [ -n "$_ref" ] || continue
                 _refc="$(lp_canon "$_ref" 2>/dev/null)" || _refc=""
                 [ -n "$_refc" ] || _refc="${_ref%/}"
