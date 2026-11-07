@@ -61,7 +61,7 @@ is not a launcher for a session:
 | `TimeoutStartSec=60`, `Environment=CONTROLLER_ORPHAN_TIMEOUT=60` | `ExecStart` runs the **whole** of `start`, and service mode **waits** for a controller that is already running. The bound is the process's, **not** `TimeoutStartSec`'s: this unit is `Type=simple`, whose start job completes the moment the main process is forked (`systemd.service(5)`), so that directive cannot bound the wait — an earlier revision claimed it did and the real bound was the supervisor's 3600 s default, with the unit reading `active (running)` throughout. `CONTROLLER_ORPHAN_TIMEOUT` is the wait for a session that outlived its loop; an orphan never exits, so this start can never succeed. It must therefore be short enough that `StartLimitBurst` of those attempts **fit inside** `StartLimitIntervalSec` — `3 × (60 + 15) = 225 s < 300 s` — because systemd refuses the start **after** the burst is exceeded: at the old 120 s default the three failures spanned 405 s, the oldest start aged out of the window before the fourth was refused, and the unit restarted forever while every surface read supervised (`ORCH_START_TIMEOUT_SEC` overrides both; the installer refuses any value that does not fit the arithmetic) |
 | `Environment=CONTROLLER_HANDOVER_TIMEOUT=3600` | the wait for a controller this state dir **owns** and that is still running — the **migration** case, where the box being upgraded is landing PRs right now. Long on purpose: a short bound would fail the upgrade instead of adopting the running controller (`ORCH_HANDOVER_TIMEOUT_SEC` overrides; a whole number ≥ 1) |
 | `StandardOutput/Error=journal` | `journalctl -u eldato-orchestrator.service` is the controller's log in service mode |
-| `Environment=ORCH_SUPERVISOR_PIN=<repo>@<sha>` | which revision the unit runs, rendered at install time (#2697). `merged ≠ running` was silent: a farmed copy can be days behind `main` and nothing on the box recorded it, so "which code is this cell executing" was answered by `git -C` guesses at a path the unit merely names. Read it from `systemctl show eldato-orchestrator -p Environment`, or from `--status`'s `supervisor_pin=` row. A supervisor outside any git work tree (a farmed copy) records `unknown@unknown` — this is an observation, never a gate |
+| `Environment=ORCH_SUPERVISOR_PIN=<repo>@<sha>` | which revision the unit **boots**, rendered at install time (#2697). `merged ≠ running` was silent: a farmed copy can be days behind `main` and nothing on the box recorded it, so "which code is this cell executing" was answered by `git -C` guesses at a path the unit merely names. Read it from `systemctl show eldato-orchestrator -p Environment`, or from `--status`'s `supervisor_pin=` row. A supervisor outside any git work tree (a farmed copy) records `unknown@unknown` — this is an observation, never a gate. ⛔ **It is what the NEXT start executes, not a claim about a live process**: `--install` re-renders the unit but deliberately does not restart a healthy controller, so after a checkout advances the two differ until the unit restarts |
 
 ⛔ **The `ExecStart` PATH MUST OUTLIVE THE SHELL THAT RENDERED IT** (#2697). "The file exists at
 render time" is not a property systemd can rely on at boot. Measured on cell-1:
@@ -71,14 +71,26 @@ a 127 for ever, `is-active` reads `activating`, and **nothing pages**. `/tmp` is
 these cells, so the mechanism is `systemd-tmpfiles --clean` (10 days after the entry is last touched),
 not a reboot: the box looks healthy for a while and then fails silently.
 
-So the installer **refuses to render** a supervisor that resolves into a lane worktree (`.worktrees/`),
-or under a temporary root that no deployment root on this box declares. The roots it accepts under a
-temporary root are the cell's own home (`CELL_HOME`), the operator's `HOME`, and
-`$AGENT_INFRA_PATH` — because **the cells keep their home under `/tmp`** (`/tmp/cell-home`) and their
-harness pin under it too (`/tmp/cell-home/harness/<sha>/scripts/…`, the shape cell-3 measured as
-correct), so "under `/tmp`" alone cannot be the rule without blocking every cell bring-up. The refusal
-names the durable alternatives (the farmed `$HOME/.pi/agent/scripts/…`, `$AGENT_INFRA_PATH/scripts/…`,
-or the harness pin) and writes **nothing** — the preview verb refuses too.
+So the installer **refuses to render** a supervisor that resolves into a lane worktree, or under a
+temporary root that no deployment root on this box declares. The roots it accepts under a temporary root
+are the cell's own home (`CELL_HOME`), the operator's `HOME`, and `$AGENT_INFRA_PATH` — because **the
+cells keep their home under `/tmp`** (`/tmp/cell-home`) and their harness pin under it too
+(`/tmp/cell-home/harness/<sha>/scripts/…`, the shape cell-3 measured as correct), so "under `/tmp`"
+alone cannot be the rule without blocking every cell bring-up. The refusal names the durable
+alternatives (the farmed `$HOME/.pi/agent/scripts/…`, `$AGENT_INFRA_PATH/scripts/…`, or the harness pin)
+and writes **nothing** — the preview verb refuses too.
+
+⛔ **"Lane worktree" is decided by GIT, not by the path's spelling.** A name list cannot be the guard
+(the measured shape was `/tmp/wt-2433-fu`; the next lane picks the next name, and a copy nested one
+directory deeper matches no pattern). In a **linked** worktree `git rev-parse --absolute-git-dir`
+answers `<main>/.git/worktrees/<name>` while `--git-common-dir` still answers `<main>/.git`; in the
+**main** clone the two are the same directory. So every linked worktree is refused wherever it lives
+(`/tmp/wt-x`, `$HOME/wt-x`, `<repo>/.worktrees/x`), a **primary** clone under `/tmp` (`/tmp/cell-ai`,
+the cells' own checkout) is untouched, and **no declaration launders one**: a caller that names its own
+worktree as `AGENT_INFRA_PATH` does not get to admit it. The fleet's scratch shapes
+(`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`) are refused as well, and that list is
+the **same** list `scripts/install-repair-service.sh` uses — the suite asserts the two are equal, so a
+second hand-kept copy cannot drift.
 
 Two callers, two strengths, one owner of the rule:
 
@@ -87,8 +99,11 @@ Two callers, two strengths, one owner of the rule:
 | `ORCH_SUPERVISOR` (an operator's requirement) | **refused** — never silently swapped for something else |
 | `ORCH_SUPERVISOR_PREFER` (a caller's preference: `cloud-cell-bringup.sh` names the layer checkout it just installed, so the unit runs the layer's code rather than a possibly-stale farm) | **skipped, loudly**, and the next durable candidate is used; refused only when no durable candidate exists |
 
-Without the preference strength the bring-up would refuse on any lane worktree — `self_root` is the
-lane's own checkout whenever a lane runs it — which is a real shape, and the reason the strength exists.
+Without the preference strength the bring-up would refuse on a lane layer — `self_root` is the lane's own
+checkout whenever a lane runs it — which is a real shape, and the reason the strength exists. The
+preference is a bodyguard, not a hole: a lane's **linked** worktree is refused by the git rule above
+before the preference is consulted, so what the bring-up loses is only the unmerged-code ExecStart it
+must not arm, and it falls through to the farm.
 
 ## Install targets
 

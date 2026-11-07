@@ -60,12 +60,16 @@ Environment=CONTROLLER_UNIT={{UNIT_NAME}}
 # Restart=always within RestartSec) and `start` starts the unit when one is enabled (a tmux controller
 # beside an enabled unit is two dispatchers on one queue, #1761).
 Environment=ORCH_FOREGROUND=1
-# ⛔ WHICH REVISION THIS UNIT RUNS, rendered at install time (agent-infra#2697). `merged ≠ running` was the
-# second silent half of the ExecStart defect: a farmed copy can be days behind `main` and nothing on the box
-# recorded it, so "which code is this cell executing" was answered by `git -C` guesses at a path the unit
-# merely names. Read it with `systemctl show eldato-orchestrator -p Environment` (or `--status`), and note
-# the controller process inherits it. `<repo-toplevel>@<sha>`, or `unknown@unknown` for a supervisor outside
-# any git work tree (a farmed copy) — the installer RECORDS this, it never gates on it.
+# ⛔ WHICH REVISION THIS UNIT **BOOTS**, rendered at install time (agent-infra#2697). `merged ≠ running` was
+# the second silent half of the ExecStart defect: a farmed copy can be days behind `main` and nothing on the
+# box recorded it, so "which code is this cell executing" was answered by `git -C` guesses at a path the unit
+# merely names. Read it with `systemctl show eldato-orchestrator -p Environment` (or `--status`), and note the
+# controller process inherits it. `<repo-toplevel>@<sha>`, or `unknown@unknown` for a supervisor outside any
+# git work tree (a farmed copy) — the installer RECORDS this, it never gates on it.
+# ⛔ IT IS WHAT THE NEXT START WILL EXECUTE, NOT NECESSARILY WHAT AN ALREADY-RUNNING CONTROLLER IS EXECUTING
+# (re-review P2). `--install` re-renders the unit but deliberately does NOT restart a healthy one, so after a
+# checkout advances the two can differ until the unit restarts: this line is the revision the box WILL boot,
+# never a claim about a live process's bytes.
 Environment=ORCH_SUPERVISOR_PIN={{SUPERVISOR_PIN}}
 # ⛔ AND THE PATH ITSELF IS REFUSED WHEN IT CANNOT SURVIVE A CLEANING (agent-infra#2697). A lane worktree, or
 # a temp dir no deployment root declares, is a unit whose ExecStart stops resolving — measured on cell-1:
