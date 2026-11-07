@@ -648,8 +648,9 @@ function isValidServerName(name: string): boolean {
  * `McpServerConfig` has no `type` field and `connectServer` selects the transport from `url`/`command`
  * alone, so `type` is inert here. Two sibling files rule on it explicitly:
  * `pi-bootstrap/lib/merge-mcp.py` ("On a url the operator chose, a non-http `type` is their business
- * and is preserved with the entry (the client never reads `type`)"; a self-hosted `type: "sse"`
- * "WORKS — replacing it would destroy the operator's config") and `pi-bootstrap/cell-install.sh`
+ * and is preserved with the entry (the client never reads `type`; see `usable()`)"; a self-hosted
+ * `type: "sse"` "WORKS — replacing it would destroy the operator's config") and
+ * `pi-bootstrap/cell-install.sh`
  * ("refusing `sse` here would refuse a config that WORKS"). Rejecting an entry for its `type` would
  * therefore reverse that ruling AND zero a self-hosted config the installer certifies — so an
  * unrecognised `type` only earns a warning, never a drop.
@@ -967,7 +968,8 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
     }
     if (!entry || typeof entry !== "object" || Array.isArray(entry)) {
       // `null` is the tempting way to say "not here" — and there is no tombstone in this schema
-      // (#3612), so say why the entry was dropped instead of crashing the session.
+      // (#3692 is the open issue for one), so say why the entry was dropped instead of crashing the
+      // session. Not #3612: that is the CLOSED layering issue and proposes no tombstone.
       console.log(`[mcp-client] WARN: ${label} entry "${name}" is not an object — dropped. ` + suffix);
       continue;
     }
@@ -1308,10 +1310,11 @@ export class McpServerManager {
    * cannot REMOVE a base server, because there is no tombstone in this schema and `McpServerConfig`
    * has no `disabled` field. A base server that is wrong or unspawnable for one repo cannot be vetoed
    * from that repo — #3692 is the open issue for the tombstone (`"<name>": { "disabled": true }`) that
-   * would close this. ⛔ Do not point at #3612 here: it is CLOSED and proposes no tombstone, so a
-   * reader who follows it lands on nothing (that dead end was found in review of this PR, in three
-   * places, and this is the last of them). Writing `"<name>": null` is NOT that: it is dropped with a
-   * warning (see `asMcpJson`), and the base's entry still applies.
+   * would close this. ⛔ Do not point at #3612 for it: that issue is CLOSED and proposes no tombstone, so
+   * a reader who follows it lands on nothing. (That dead end was found in review of this PR, in several
+   * places; grep `#3612` before adding another pointer, and check the issue is still open.) Writing
+   * `"<name>": null` is NOT that: it is dropped with a warning (see `asMcpJson`), and the base's entry
+   * still applies.
    */
   async connectAllLayers(paths: McpConfigPaths): Promise<void> {
     const read = async (p: string | null, layer: "base" | "repo"): Promise<McpJson | null> => {
