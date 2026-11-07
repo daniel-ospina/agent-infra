@@ -457,6 +457,26 @@ lo_select() {
     LO_CHOICE=issue
     prs_why="PR-takeover ran first and took the room it needed (${unowned} un-owned PR(s) remain in flight)"
     issues_why="DISPATCH — CASCADE ($backlog in backlog; the PR path had the first call on capacity and left room)"
+  elif [ "${prw:-}" = "1" ]; then
+    # ⛔ `"${prw:-}" = "1"`, NOT `"$pr_waiting" != "0"` (measured, 2026-11-06). An ABSENT cascade input
+    # is an OLDER CALLER, and `pr_waiting="${prw:-1}"` defaults it to 1 so the pre-change wording stands
+    # — which is right for the arms above, where `unowned -gt 0` also has to hold. Here there is no such
+    # second conjunct, so keying on the DEFAULT would defer for every caller that never reported the
+    # input at all: `live-ownership.test.sh` case (b) (7 positionals, no cascade arg) went from
+    # `DISPATCH` to `DEFERRED`. This arm fires only on a MEASURED hold, which is the same terse-minus
+    # rule the batch guard and the escape block use one file over.
+    # ⛔ A LEVEL CAN HOLD WITH **ZERO** UN-OWNED PRs, AND THE FUNNEL MUST SAY SO (review P1,
+    # 2026-11-06 — measured). `pr_waiting=1` beside `unowned=0` is exactly "a higher level owns the
+    # room": level 1 (`FIX_MAIN`) is measured from MAIN's own check-runs and does not depend on how
+    # many un-owned PRs exist. Every other arm here gates `pr_waiting` behind `unowned -gt 0`, and the
+    # final arm below is hard-wired to DISPATCH — so without this arm the pass printed
+    # `DISPATCH (10 in backlog)` over a batch whose FIRST guard (`issue_slots -ge 1`) broke
+    # immediately: zero issues queued, every pass, while the tail of this same message claimed the
+    # cascade opens "the moment a slot frees". A printed decision that disagrees with the acted-on one
+    # is the defect this whole change exists to remove, and `unowned == 0` is what makes it reachable.
+    LO_CHOICE=none
+    prs_why="no un-owned PR left"
+    issues_why="DEFERRED (a higher level is holding the room this pass: ${unowned} un-owned PR(s))"
   else
     LO_CHOICE=issue
     prs_why="no un-owned PR left"

@@ -1790,7 +1790,12 @@ reap_stale_workers() {
     # A hung reviewer therefore held its PR owned (via the census) AND held a lane slot, for ever: the
     # exact corpse `lane-bound.sh` measured (a `pi` parked in `ep_poll` at 0 bytes / 0 CPU for 3h32m).
     case "$s" in merge-*|lane-*|fix-*|review-*) : ;; *) continue ;; esac
-    f="$O/logs/$(worker_log_name "$s")"
+    # ⛔ THE FALLBACK IS STRUCTURAL, NOT DECORATION (review P3, 2026-11-06). This call has now been
+    # missing from a rig's prelude TWICE, and its failure mode is silent inaction: `$( … )` on an
+    # undefined helper yields an EMPTY string, `f` becomes "$O/logs/" — a DIRECTORY — and
+    # `[ -f "$f" ] || continue` skips every record while the reaper still exits 0. Degrade to the
+    # PRE-CHANGE filename instead, so a missing helper costs reviewer coverage rather than all of it.
+    f="$O/logs/$(worker_log_name "$s" 2>/dev/null || printf '%s.log\n' "$s")"
     [ -f "$f" ] || continue
     # An unreadable mtime means the age is UNKNOWN, and unknown is not evidence of a hang: skip the
     # worker rather than reap it. Never let the probe's failure escape as an arithmetic error — on
@@ -2972,7 +2977,7 @@ park_ctrl() { # park_ctrl <pr> <head> <reason…> — returns non-zero when the 
 # new issue work takes only the capacity the levels above it left free. `mp_reason` therefore produces
 # a PRIORITY LABEL (`MP_PRIORITY`), not a gate: it never assigns `GATE_WHY`, so it can never mask a
 # capacity gate. ⛔ Refined by the owner ruling of 2026-11-04; the 2026-10-18 ruling's ORDER is kept and
-# its absolute BARRIER is dropped (`cascade_issue_slots` below carries the `OVERRIDES:` line).
+# its absolute BARRIER is NOT dropped — only its ability to sit in `GATE_WHY` and mask other gates (`cascade_issue_slots` below carries the `OVERRIDES:` line).
 # These functions hold the rule so it is directly testable (and so a regression cannot hide behind a
 # comment):
 #   mp_reason    -> the ordering label ("N un-owned of M open PR(s) — PRs before issues"), empty if none
@@ -5666,7 +5671,14 @@ while true; do
     # ── the class cache the NEXT cycle's ordering reads (see lo_order) ─────────────
     # Written from the observation this loop just made, one row per PR per cycle; lo_class_compact
     # folds it at the top of the next cycle. It decides ONLY which PR gets a scarce fixer/reviewer
-    # slot — never whether a PR is worked or merged.
+    # slot — never whether a PR is worked or merged. ⛔ THIS PR ADDS TWO CONSUMERS AND THEREFORE BREAKS THAT
+  # SENTENCE (disclosed 2026-11-06, review P2): a `PENDING` row now makes its PR OWNED through
+  # `pr_owned`, so it is not worked; and a class row decides which cascade LEVEL holds the room, so it
+  # does bear on merging. The behavioural consequence is reported (the class file is written inside a
+  # windowed sweep and keeps its last row per head with no age bound, so a PR rotated out of the window
+  # can hold a stale class and drive `UPN_WORK` to 0 early) and is NOT fixed here. The contract above
+  # is the pre-change one and no longer holds as written; it is left in place, named, rather than
+  # silently deleted, because the next reader must be able to see what changed and why.
     case "${V:-}" in
       GREEN)   _cl=GREEN ;; PENDING:*) _cl=PENDING ;; FAILED:*) _cl=RED ;; *) _cl=NOCHECKS ;;
     esac
@@ -6765,12 +6777,13 @@ PY
   else
     echo "[ci-queue] ci-queue.sh is NOT available (looked in \$O and the script directory) — CI capacity is UNMEASURED this cycle, so this arm is INERT; the issue path still has to clear every other gate" >> "$LOG"
   fi
-  # ── MERGE PRIORITY IS A PRIORITY HERE, NOT A BARRIER (owner ruling 2026-11-04) ────────────────
+  # ── MERGE PRIORITY IS A PRIORITY HERE — AND THE BARRIER SURVIVES AS LEVELS 2-4 (owner ruling
+  # 2026-11-04; the "barrier removed" reading of this heading was RETRACTED 2026-11-06) ───────────
   # ⛔ THIS ONE LINE USED TO CLOSE THE ISSUE PATH. `GATE_WHY="$(mp_reason …)"` set the single string
   # that gates the issue batch, so any un-owned PR closed it at any capacity — measured: 0.66% of
   # cycles dispatched anything, 0.054 issues/h against an 8.1/h bound. `MP_PRIORITY` carries the SAME
   # fact and the SAME wording, and the capacity gates below (lanes/load/mem/fork/placement/ci-queue)
-  # are now the ONLY arms that can close the path. The order the owner asked to keep is preserved
+  # are NOT the only arms that can close the path — `CASCADE_ISSUE_SLOTS=0` with `CASCADE_LEVEL_HOLDS=1` does, and this sentence was already retracted 3,700 lines above. The order the owner asked to keep is preserved
   # STRUCTURALLY, not by a promise: the PR sweep ran earlier in this pass and its workers are already
   # in `LANES`, so `cascade_issue_slots` is handed the room that is LEFT after PR work took its slots.
   # ⛔ LEVEL 1 HAS TO BE FED, OR IT IS DECORATION (the inert-enforcer class). The probe reads MAIN's
@@ -6801,9 +6814,11 @@ PY
   is_num "${CASCADE_ISSUE_SLOTS:-}" || CASCADE_ISSUE_SLOTS=0
   # ⛔ POLARITY INHERITED FROM THE BARRIER, AND NOT DROPPED WITH IT. `merge-priority` used to carry
   # two independent things in one string: the ORDERING (PRs before issues — kept) and the BARRIER
-  # (any un-owned PR closes the issue path — removed). A THIRD thing rode along inside the first:
+  # (any un-owned PR closes the issue path — kept, as a LEVEL; only its `GATE_WHY` form is gone, so
+  # "removed" is the wrong word and a reader must not size the change from it). A THIRD thing rode
+  # along inside the first:
   # its fail-closed guard. `mp_reason` turns an UNREADABLE un-owned count into a non-empty reason, so
-  # the barrier closed the path on a rate-limited listing. With the barrier gone, nothing would: a
+  # the barrier closed the path on a rate-limited listing. With the `GATE_WHY` form gone, nothing would: a
   # failed `gh` read would print `un-owned unreadable` and hand the room to the issue batch, i.e. the
   # one condition that should drain hardest would dispatch new work. So the guard moves HERE, where
   # the room is actually granted.

@@ -987,7 +987,8 @@ still where the next cut should start.
   merge-queue scheduler — the fleet decided against a number here, because a gate whose opening
   condition the automation cannot meet is a **drain defect, not a licence to open the gate**
   (measured 2026-10-18: three cells at `52 unowned of 54 open PRs`, `lanes=0`, for HOURS).
-- **⭐ THE PRECEDENCE IS AN ORDER, NOT A BARRIER — and "PRs before issues" survives as a level.**
+- **⭐ THE PRECEDENCE IS AN ORDER — and the BARRIER SURVIVES as levels 2-4, which this bullet must not
+  be read as denying (corrected 2026-11-06; see the correction inside it).**
   Owner ruling 2026-11-04: the controller fills work down a **five-level cascade** — (1) fix main if
   red, (2) merge PRs, (3) fix PRs with post-review findings, (4) the review→findings→fix→re-review
   loop, (5) open new issue work — draining each level before descending, and descending only into the
