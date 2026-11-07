@@ -75,8 +75,10 @@
 #   • REPLACED — D's `^remove ` row, which could NEVER match: case D runs `--apply`, and `remove ` is
 #     printed only under `DRY_RUN=1`, so it was GREEN in the very `MUT_BUDGET` run that reaped the tree.
 #     It is now "the record says candidates=0 reaped=0", which `MUT_BUDGET` reddens.
-#   • DELETED — case H's "and NOT on the age floor (no reason=young)": the fixture's tree is aged into
-#     the linked arm's floor by construction, so `reason=young` is unreachable for it.
+#   • DELETED — case H's "and NOT on the age floor (no reason=young)": the fixture's tree is YOUNG **and
+#     HELD**, and `reason=young` is unreachable for that PAIR — the census reports `live-cwd` when it runs
+#     first, the bound reports `budget` when it does not. The HOLDER is what makes the two orders disagree,
+#     not the age (see `case_h`'s fixture comment for the measured reason this must not be "simplified").
 #   • DELETED — case H's "the bound is REAL in --apply": the fixture REQUIRES a live holder (that is what
 #     makes the census observable) and the holder preserves the tree under every order, so it could not
 #     tell a working bound from an absent one. H's ordering is carried instead by `reason=budget` WITH
@@ -595,9 +597,15 @@ case_h() { # <owner-script>
     UNDER_TEST="$owner"
     newfixture h || { case_check 1 "fixture could not be built"; return 1; }
     # `.git` is a FILE ⇒ a LINKED worktree, so the gitless arm never sees it and the linked arm owns it.
-    # It is deliberately YOUNG: that is what makes the assertion discriminate. Under the fixed order the
-    # bound fires before anything else and the tree reports `budget`; under the pre-#3278 order the
-    # census and then the LINKED arm's age floor run first, and the same tree reports `young`.
+    # ⛔ THE FIXTURE IS YOUNG **AND HELD**, and the HOLDER — not the age — is what makes the two orders
+    # disagree. Under the fixed order the bound fires before anything else and the tree reports `budget`;
+    # under the pre-#3278 order the CENSUS runs first, finds the live pid planted below, and reports
+    # `live-cwd`. NEITHER order can reach `reason=young` here while that holder is present, so
+    # `reason=young` is unreachable for the CENSUS's reason, not an age reason (the mtime is deliberately
+    # 0, i.e. YOUNG — `age_path … 0`; the tree is never aged into the floor).
+    # ⛔ DO NOT DELETE THE HOLDER to "simplify": with nothing holding the tree a census-first order finds
+    # nobody and the bound fires anyway, so `reason=budget` holds under BOTH orders and
+    # `MUT_CENSUS_FIRST` survives the whole suite (measured — review round 7).
     mkdir -p "$FB/root/a-linked"
     printf 'gitdir: %s\n' "$FB/gitdir" >"$FB/root/a-linked/.git"
     age_path "$FB/root/a-linked" 0
@@ -621,10 +629,12 @@ case_h() { # <owner-script>
     case_check "$(grep -qF "KEPT   $FB/root/a-linked reason=budget" <<<"$OUT" && echo 0 || echo 1)" \
                "the LINKED arm stops on the TIME bound (reason=budget)"
     # ⛔ REMOVED at review round 10 (agent-infra#3442 rule 3): `and NOT on the age floor (no
-    # reason=young)`. The fixture's tree is AGED into the linked arm's floor by construction, so
-    # `reason=young` is unreachable for it — MEASURED GREEN under all eight shipped mutants, four
-    # probes and pre-#3278 code. It claimed an ordering it could not observe. The ordering is proven by
-    # the next assertion instead, which is falsifiable because the holder is present.
+    # reason=young)`. The fixture's tree is YOUNG **and HELD**, and `reason=young` is unreachable because
+    # the CENSUS reports `live-cwd` when it runs first while the bound reports `budget` when it does not —
+    # the HOLDER is what makes the two orders disagree, never the age (see the fixture comment above). It
+    # was MEASURED GREEN under all eight shipped mutants, four probes and pre-#3278 code: it claimed an
+    # ordering it could not observe. The ordering is proven by the next assertion instead, which is
+    # falsifiable because the holder is present.
     # ⛔ THE ORDER ITSELF: the tree IS held by a live pid, so a census that ran first would have reported
     #    the witness. `budget` with the holder present is what proves the bound went FIRST.
     case_check "$(grep -q 'reason=live-cwd' <<<"$OUT" && echo 1 || echo 0)" \
