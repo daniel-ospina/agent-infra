@@ -770,7 +770,9 @@ ck "  …and CLOSES it before the per-PR check classifier, so classification is 
 # 9.1d-vii: THE SWEEP'S PAGINATED PR LISTING IS CHARGED TO `sweep`, NOT TO `authority` (P1 — measured).
 # `stg_mark` closes the current interval INTO THE STAGE IT NAMES, so an `authority` mark placed AFTER the
 # listing booked the whole paginated `gh api …/pulls?state=open` sweep (plus `open_pr_count` and the
-# branch-protection read) to `authority` — while the docs called that bucket sub-second. #2028, this
+# branch-protection read) to `authority` — while the doc text shipped beside this change listed
+# `authority` among the "genuinely sub-second stages" (that sentence is THIS PR's own, not `main`'s; it
+# has since been corrected). #2028, this
 # field's own root cause, is rate-limited `gh` calls pinning command substitutions open for 40+ minutes;
 # booking a slow LISTING to a name that describes no listing hides exactly the minutes an operator
 # wants. The marks must bracket the block, and OUTSIDE its extractable `[BEGIN|END]` markers so
@@ -823,6 +825,35 @@ _nf_l3_before="$(awk '
   END { print (bad?"yes":"no") }' <<<"$_loop_tc")"
 ck "the NEEDS-FIX classifier does NOT open level 3 above the fix-eligibility decision (got '${_nf_l3_before:-?}')" \
    "$(if [ "${_nf_l3_before:-yes}" = "no" ]; then echo 0; else echo 1; fi)"
+# ⛔ AND EVERY FIX-SIDE ACTUATOR OUTSIDE THAT CLASSIFIER OPENS LEVEL 3 ITSELF (fresh-context review,
+# P2 — measured). Deleting the `stg_lvl_start l3_fix` that used to sit at the top of the `FAILED:*` arm
+# left the suite at 112/0, which is the same vacuity shape §9.1d-v already documents: §9.3 needs a site
+# SOMEWHERE. Two actuators were then unattributed: the `elif [ -n "$CI_RED" ]` arm (which dispatches the
+# fixer, or reports the fix-lane capacity that refused it) and the python-ci-gate RERUN block (a second
+# actuator that runs after the arm chain). Each must open its own level.
+_cired_open="$(awk '
+  /elif \[ -n "\$CI_RED" \]; then/ { inb=1; next }
+  inb && /^[[:space:]]*stg_lvl_start l3_fix/ { ok=1 }
+  inb && /# ⛔ THE RERUN IS A SECOND ACTUATOR/ { exit }
+  END { print (ok?"opened":"MISSING") }' <<<"$_loop_tc")"
+ck "the CI-RED fixer arm opens level 3 itself, so a CI repair is not attributed to no level (got '${_cired_open:-?}')" \
+   "$(if [ "${_cired_open:-MISSING}" = "opened" ]; then echo 0; else echo 1; fi)"
+_rerun_open="$(awk '
+  /grep -q python-ci-gate <<<"\$V"/ { inb=1; next }
+  inb && /^[[:space:]]*stg_lvl_start l3_fix/ { ok=1 }
+  inb && /RID="\$\(gh pr checks/ { exit }
+  END { print (ok?"opened":"MISSING") }' <<<"$_loop_tc")"
+ck "  …and the python-ci-gate RERUN actuator opens level 3 itself (it runs after the arm chain, so it inherits nothing) (got '${_rerun_open:-?}')" \
+   "$(if [ "${_rerun_open:-MISSING}" = "opened" ]; then echo 0; else echo 1; fi)"
+# ⛔ AND THE `FAILED:*` ARM MUST NOT OPEN IT ABOVE THE REMEDY CHOICE — that open is what leaked into the
+# no-arm and rerun paths and booked a `gh pr checks` lookup and a `gh run rerun` to `l3_fix`.
+_failed_open="$(awk '
+  /^[[:space:]]*FAILED:\*\)/ { inb=1; next }
+  inb && /if \[ "\$_gate_hit" = "1" \]; then/ { decided=1 }
+  inb && /^[[:space:]]*stg_lvl_start l3_fix/ && !decided { bad=1 }
+  END { print (bad?"above":"ok") }' <<<"$_loop_tc")"
+ck "  …and NOT at the top of the FAILED arm, where it leaked across the no-arm and rerun paths (got '${_failed_open:-?}')" \
+   "$(if [ "${_failed_open:-above}" = "ok" ]; then echo 0; else echo 1; fi)"
 _nf_l3_settle="$(awk '
   /_rgs="\$\(review_gate_state/ { inb=1; next }
   inb && /^[[:space:]]*stg_lvl_settle/ && !seen { settle=1 }

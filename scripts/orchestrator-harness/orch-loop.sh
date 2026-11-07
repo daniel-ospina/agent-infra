@@ -838,7 +838,9 @@ if declare -f cycle_record_write cycle_verdict >/dev/null 2>&1; then CYCREC=1; e
 #                          is why no `continue` needs its own mark. Only the LAST window row taking a
 #                          `continue` loses its tail, and that is the disclosed one-row residual.
 #   CARRIED (STG_PREV)   — `prev_wait`, the post-record gap: the `CYC` nap. The async backlog spawn is
-#                          NOT in it — it is launched before the post-nap sample, so its launch and
+#                          NOT in it — it is launched before the gap's START is sampled (the start is
+#                          taken just before the nap, deliberately: a post-nap start would be "the same
+#                          defect wearing the opposite mask", see the sample site), so its launch and
 #                          runtime both fall in the unmeasured tail after `stg_mark record`.
 #                          It CANNOT be in this cycle's number: the record is written BEFORE the nap,
 #                          and it must be (a record stamped at the end would make a HUNG cycle look
@@ -4339,8 +4341,12 @@ while true; do
   # THE STAGE IT NAMES, so with the next mark being `authority` everything between the previous mark
   # and this one — this listing included — was booked to `authority`. That bucket then held the
   # paginated `gh api …/pulls?state=open` sweep (below), the `open_pr_count` listing and
-  # `resolve_required_checks`' protection read, while `fleet-capacity.md` calls `authority`
-  # sub-second. #2028 — this field's own root cause — is *rate-limited `gh` calls pinning command
+  # `resolve_required_checks`' protection read, while the doc text shipped beside this change
+  # listed `authority` among the "genuinely sub-second stages" (fresh-context review, P3: that
+  # sentence is the PR's OWN, not `main`'s — say which revision, so a reader grepping the base commit
+  # does not conclude the citation was invented, and note it has since been corrected). `authority`
+  # still books two `gh` round trips, so it is not sub-second and the docs now say so.
+  # #2028 — this field's own root cause — is *rate-limited `gh` calls pinning command
   # substitutions open for 40+ minutes*, and a rate-limited LISTING booked to a name that describes no
   # listing hides exactly the minutes an operator is looking for. So `authority` closes HERE, on the
   # authority reads only, and the listing is charged to `sweep` — which is what it is: the sweep's read.
@@ -5724,9 +5730,18 @@ while true; do
           disp "$PR" "${HEAD_N:-}" "$V" wait "waiting: checks pending (rail mode — auto-merge deliberately not armed)"
         fi ;;
       FAILED:*)
-        # ⛔ CASCADE LEVEL 3: a red tree is REPAIRED. Its `HEAD_N` re-read and check classification
-        # are part of the level's cost, so the interval opens before them.
-        stg_lvl_start l3_fix || :
+        # ⛔ NO LEVEL OPENS HERE. The earlier justification ("its `HEAD_N` re-read and check
+        # classification are part of the level's cost, so the interval opens before them") was FALSE
+        # (fresh-context review, P3 — verified): `HEAD_N=$(gh pr view …)` is read at the top of the row
+        # and `V=$(gh pr checks …)` before the `case`, both far OUTSIDE this arm. What sits here is the
+        # log line, the red-name IFS loops, `review_gate_state` and the three-way arm choice — all of it
+        # CLASSIFICATION, which is exactly what this field must not charge to a repair. Worse, opening
+        # here leaked across the `elif [ -n "$CI_RED" ]`, the no-arm `else` and the rerun block, so a
+        # `gh pr checks` lookup and a `gh run rerun` were booked to `l3_fix` — the same
+        # network-cost-booked-to-the-wrong-name class this whole change exists to end, and under #2028
+        # (rate-limited `gh` pinning a substitution open for tens of minutes) it could report
+        # `l3_fix:<minutes>` for work that was only a CI re-run. Each actuator below opens level 3
+        # itself, and only when it acts.
         echo "#$PR $V" >>"$LOG"
         # Which red names are REQUIRED checks other than the review gate? Derived from the
         # classifier's own output and from THIS repo's required set ($REQ) — never from a literal
@@ -6054,6 +6069,11 @@ while true; do
             fi
           fi
         elif [ -n "$CI_RED" ]; then
+          # ⛔ CASCADE LEVEL 3 OPENS HERE: a required non-gate check is red and THIS arm dispatches the
+          # fixer that repairs it (or reports the fix-lane capacity that refused). Opening inside the
+          # arm — not at the top of `FAILED:*` — is what keeps the classification above it uncharged and
+          # stops the same open leaking into the no-arm and rerun paths (fresh-context review, P2).
+          stg_lvl_start l3_fix || :
           # CI-red arm (agent-infra#1764: derived from the repo's required set, not a name list)
           # A required check OTHER than the review gate is red — docs lint, a committed conflict
           # marker, legal-e2e, test isolation, or agent-infra's `pipeline-compliance`. Nothing
@@ -6119,6 +6139,12 @@ while true; do
         # already wrote it) — a second `act` row would make the cycle's act count exceed the number
         # of units actually spawned, which is the arithmetic this sidecar exists to keep closed.
         if grep -q python-ci-gate <<<"$V"; then
+          # ⛔ THE RERUN IS A REPAIR ACTUATOR TOO, SO IT OPENS LEVEL 3 ITSELF (fresh-context review,
+          # P2 — verified). It runs AFTER the arm chain and unconditionally for any FAILED carrying
+          # python-ci-gate, so with the old top-of-arm open it inherited whatever level was open — and
+          # now that every arm settles its own, it would have been attributed to NO level at all. Its
+          # `gh pr checks` RID lookup and `gh run rerun` are both CI repair work.
+          stg_lvl_start l3_fix || :
           RID="$(gh pr checks "$PR" --repo "$OR" --json name,link --jq '.[]|select(.name=="python-ci-gate")|.link' 2>/dev/null | sed -nE 's#.*/runs/([0-9]+).*#\1#p')"
           # ⛔ A RERUN IS A CI-SPENDING ACT, so it is gated like one (#2333 review P2). `gh run rerun`
           # enqueues work on the same runners the gate is holding work OUT of — the one surface in
