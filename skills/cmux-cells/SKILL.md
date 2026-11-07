@@ -85,11 +85,16 @@ with a model-level remedy instead of a variable to export. The vendor strips a t
 the gateway, so `https://radius.pi.dev/v1` IS the default one (measured: pi reaches it); and an UNSHIPPED provider
 with an unbuildable definition is refused too, because pi deletes it (`Error: Unknown provider`) — only on a COMPLETED
 read of the table, though: an unread table is cannot-say, and an oauth-only provider pi ships (`openai-codex`) has no
-env entry at all, so neither is mistaken for "pi does not ship it". A `baseUrl` with NO
-scheme is refused as well, for a different measured reason: `radiusProvider` normalizes only its own config URL, while the
-composed model inherits the RAW value and pi builds the request from it, so `pi -p` answers `Invalid URL` and exits 1
-(`reason=models-json-bad-gateway`) - write the gateway as `https://...`. Such a provider also has an oauth handler, so the store
-refusal below never applies to it.
+env entry at all, so neither is mistaken for "pi does not ship it". A model definition whose effective `baseUrl` — its
+own, else the one on the provider body — is not an absolute URL is refused as well, for a different measured reason: the
+composed model carries that raw value and pi builds the request from it, so `pi -p` answers `Invalid URL` and exits 1
+(`reason=models-json-bad-gateway`) — write an absolute `https://...` on the definition or the provider body. ⛔ THE TEST IS
+PER DEFINITION, AND THREE SHAPES ARE DELIBERATELY **NOT** REFUSED because pi runs them (each measured): a grant with NO
+`models` array (the gateway normalizes its own config URL; 401 from Radius), a definition carrying its OWN absolute
+`baseUrl` (it wins), and a NON-radius provider body with no `models` array is refused only when that body's own `baseUrl`
+is unbuildable — because only there does every base model inherit it. The test itself is "would `new URL()` throw", not a
+spelling: `https:/host` and surrounding whitespace are accepted by the vendor, so a `^https?://` test refused boxes that
+run. Such a provider also has an oauth handler, so the store refusal below never applies to it.
 ⛔ **AND ONE STORE SHAPE IS REFUSED, NOT SKIPPED** (measured): an `oauth` entry in `auth.json` for a provider `pi` ships NO
 oauth handler for. The handler set is static — `anthropic github-copilot kimi-coding meta openai-codex openai openrouter radius xai`
 (`pi-ai/dist/providers/`) — and a stored entry SHADOWS the environment, so `pi -p` answers `No API key found for <provider>.` even with the key

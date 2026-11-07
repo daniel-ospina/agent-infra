@@ -631,7 +631,11 @@ ck "3z15y20 a definition inheriting a scheme-less \`baseUrl\` REFUSES (rc=${RC:-
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-bad-gateway" "3z15y21 …with its own reason, not the deleted-provider one"
 has "$OUT" "Invalid URL" "3z15y22 …quoting the failure pi actually prints there"
-hasnt "$OUT" 'Unknown provider' "3z15y23 …and NOT quoting a deleted provider, which is a different fact"
+# ⛔ AND THE NEGATIVE ARM IS ON THE REASON, NOT ON THE PHRASE (round 39, P2): the `-no-api` variant of this refusal
+# legitimately NAMES the other measured outcome (`Error: Unknown provider`) so the operator is not sent to the wrong file
+# field, so `hasnt "Unknown provider"` now fails against a CORRECT message. What the arm is actually about is that pi does
+# not delete the provider here, and that is the reason token.
+hasnt "$OUT" "reason=models-json-provider-dropped" "3z15y23 …and NOT the deleted-provider reason, which is a different fact"
 # …and the NOTHING-inherits shapes PASS, because pi runs: measured 401 (no `models` array — the gateway normalizes
 # its own config URL) and 404 (definition carries its own absolute baseUrl, which wins at :88). A refusal on either is
 # a false 82 on a provisioned box, printed with evidence that box never produced.
@@ -663,6 +667,11 @@ has "$OUT" "reason=models-json-bad-gateway" "3z15y31 …URL reason, because the 
 # ⛔ AND THE `-no-api` SPLIT FOLLOWS THE PROVIDER, NOT THE FILE (round 37, P2, measured): a definition with no `api`
 # under a scheme-less baseUrl dies `Invalid URL` when pi ships the provider (it composes an api and inherits the URL)
 # and `Error: Unknown provider` when it does not (the composer throws first, on the custom gateway).
+# ⛔ `3z15y35`-`37` DO **NOT** DISCRIMINATE THE SCHEME-LESS FACT AND MUST NOT BE READ AS IF THEY DID (round 39, P3,
+# measured by mutation): with the scheme test disabled entirely they stay GREEN, because an `api`-less definition under an
+# unshipped provider reaches `provider-dropped` through the `no-api` arm alone. The arms that actually pin the split are
+# `3z15y30`/`31` (unshipped WITH `api` → the URL reason) and `3z15y33`/`34` (shipped → `Invalid URL`); these three pin the
+# neighbouring verdict, which is worth having and is simply not evidence for this one.
 RG_NOAPI_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
 HRNA="$(mkhome radius_grant_nourl_noapi "$RG_NOAPI_JSON")"
 OUT="$(run_gate "$HRNA" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
@@ -677,6 +686,44 @@ ck "3z15y35 …while an UNSHIPPED one is the deleted provider (rc=${RC:-none})" 
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-provider-dropped" "3z15y36 …with the reason pi’s actual failure belongs to"
 has "$OUT" 'Unknown provider' "3z15y37 …quoting Unknown provider, the sentence pi prints on that box"
+# ⛔ TWO FALSE PASSES THIS FIX STILL HAD, AND ONE FALSE BLOCK IT CREATED (round 39, P1, all four measured). Each of these
+# is a box where `pi -p` and the gate DISAGREED before this round; without an arm per shape the fix can be reverted and
+# the suite stays green.
+# (a) A definition carrying its OWN scheme-less `baseUrl` on the DEFAULT gateway: `definition.baseUrl` wins at :88 whatever
+#     the gateway is, and `_grant_default` used to return BEFORE the loop ran — measured `pi -p` → `Invalid URL`, gate ok.
+OWNBAD_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://radius.pi.dev","models":[{"id":"deepseek-flash","api":"pi-messages","baseUrl":"gw.example/v1"}]}}}'
+HOWB="$(mkhome grant_default_ownbadbase "$OWNBAD_JSON")"
+OUT="$(run_gate "$HOWB" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y38 a definition's OWN scheme-less baseUrl REFUSES on the DEFAULT gateway too (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y39 …because \`definition.baseUrl\` wins at :88 whatever the gateway is"
+# (b) A NON-radius provider body with a scheme-less `baseUrl` and NO `models` array: `config.baseUrl` is mapped onto every
+#     base model (`provider-composer.js:168`) — measured `pi -p` → `Invalid URL`, gate ok. A GRANT with no `models` array is
+#     the exemption (`3z15y24`/`25`, measured 401), so this arm is what tells the two apart.
+NBODY_JSON='{"providers":{"deepseek":{"baseUrl":"gw.example/v1"}}}'
+HNB="$(mkhome nongrant_badbase_nomodels "$NBODY_JSON")"
+OUT="$(run_gate "$HNB" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y40 a NON-grant body with a scheme-less baseUrl and NO models array REFUSES (rc=${RC:-none})" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y41 …because every base model inherits \`config.baseUrl\`"
+# (c) …and the test is "would `new URL()` THROW", so the spellings the vendor NORMALISES must NOT be refused: measured
+#     `pi -p` REACHED the network (`fetch failed`) on both, while a `^https?://` regex refused 82 and quoted `Invalid URL`
+#     for a box that never printed it — a false block carrying a false measurement.
+#     ⛔ MEASURED WHICH MUTANT EACH ARM DISCRIMINATES (round 39): `3z15y42`/`43` redden when the scheme test is replaced by
+#     the hand-rolled `^https?://`, and `3z15y44`/`45` redden only when the `strip()` is removed as well — so the
+#     whitespace pair pins the TRIM, not the scheme grammar. Both are part of this fix and both are stated as what they are.
+SP1_JSON='{"providers":{"deepseek":{"baseUrl":"https:/gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSP1="$(mkhome spell_oneslash "$SP1_JSON")"
+OUT="$(run_gate "$HSP1" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y42 a ONE-SLASH scheme (\`https:/host\`) is NOT refused (rc=${RC:-none}) — \`new URL\` normalises it, so pi runs" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y43 …and the URL reason never fires for it"
+SP2_JSON='{"providers":{"deepseek":{"baseUrl":" https://gw.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSP2="$(mkhome spell_leading_ws "$SP2_JSON")"
+OUT="$(run_gate "$HSP2" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y44 leading WHITESPACE in baseUrl is NOT refused (rc=${RC:-none}) — \`new URL\` trims it, so pi runs" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y45 …and the URL reason never fires for it either"
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
 # fail (measured: the mutant that restored the old order stayed green). The token count is the observable fact.
@@ -1257,7 +1304,7 @@ OUT="$(run_box_at "$HRGNP" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
 ck "8z47 a PIN of a granted provider with a scheme-less gateway REFUSES (rc=${rc:-<none>})" \
    "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-bad-gateway" "8z48 …with the URL-level reason, not the deleted-provider one"
-hasnt "$OUT" 'Unknown provider' "8z49 …because pi does not delete that provider, it fails to build the URL"
+hasnt "$OUT" "reason=models-json-provider-dropped" "8z49 …and not the deleted-provider reason, because pi fails to build the URL here"
 # \u26d4 and the PIN of the `-no-api`/unshipped shape names the failure pi prints there (round 37, P2, measured): its own
 # code path, so the lane-site split says nothing about it.
 HNP="$(mkset pin_badbase_noapi_unshipped '{"providers":{"myprov":{"apiKey":"$MYV","baseUrl":"gw.example/v1","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
