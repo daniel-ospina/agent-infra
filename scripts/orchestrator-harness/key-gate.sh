@@ -186,6 +186,20 @@ print("trusted" if cfg.get("defaultProjectTrust") == "always" else "untrusted")
 _KEY_GATE_PY='
 import json, os, re, sys
 
+# \u26d4 AN UNENCODABLE CHARACTER MUST NEVER KILL THIS PAYLOAD (round 47, P1, measured). `models.json` is USER DATA and
+# every token below interpolates some of it (`no-api:<id>`, `known:<provider>`, a template variable name), so ONE lone
+# surrogate (`\ud800`, which python\x27s `json` ACCEPTS) or one ordinary non-ASCII id under `PYTHONIOENCODING=ascii` made a
+# `print` raise `UnicodeEncodeError` \u2014 the interpreter died, the caller runs it with `2>/dev/null`, `drop` came back
+# EMPTY, and the gate printed `check=ok` over a box pi cannot start: measured, a granted api-less fixture whose model id
+# is `deepseek\ud800` answered `RC=82 models-json-bad-gateway` before the shape was routed here and `RC=0 check=ok`
+# after. Guarding the two prints that failed would leave the same hole at the NEXT one that interpolates a document
+# field, which is why this is ONE place: whatever this payload cannot encode is escaped rather than raised, so a
+# diagnostic token can never become a verdict. ASCII-only output is unchanged.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
 
 def strip_jsonc(txt):
     """R15: mirror pi exactly - dist/utils/json.js strips ONLY line comments and TRAILING COMMAS, leaving string

@@ -930,7 +930,8 @@ hasnt "$OUT" "models-json-bad-gateway" "3z15y80 …and the URL reason never fire
 # ⛔ MEASURED BY MUTATION, PER MUTANT, WITH THE OBSERVED ARM SET (not assumed — and one claim below was corrected by
 # running it): removing the tab/NL/CR strip reddens 81/82; removing `\\` from the authority split and the leading lstrip
 # reddens 91/92; dropping the empty-host test reddens 85/86; restoring python\x27s `.strip()` reddens 89/90; and dropping
-# the ONE decoded-host check reddens 48/49, 83/84, 93/94 and 95/96 together — NOT 87/88, which an earlier draft of this comment claimed
+# the ONE decoded-host check reddens 48/49, 83/84, 93/94, 95/96 and 103/104 together — NOT 87/88 — measured, and the set is stated in
+# full, because an incomplete one inside a block headed OBSERVED is what a later lane reasons from, which an earlier draft of this comment claimed
 # (round 46, P3, measured): since the byte-decode rewrite a mid-host `%zz` returns False at the `int()`
 # `ValueError` BEFORE the class is reached, so it no longer rides this mutant. `87/88` are still real — skipping
 # escapes entirely reddens them — they are simply not pinned by THIS one. ⛔ THAT LAST SET IS THE HONEST
@@ -1064,6 +1065,30 @@ OUT="$(run_gate "$HSPSSURR" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepse
 ck "3z15y107 a LONE SURROGATE in the host REFUSES (rc=${RC:-none}) — an unencodable code point must return False, never crash the payload" \
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
 has "$OUT" "reason=models-json-bad-gateway" "3z15y108 \u2026and the refusal it swallowed comes back, so the crash is not silently green"
+# ── 3z15y109-112: THE PAYLOAD'S OWN OUTPUT MUST NEVER BE THE THING THAT KILLS IT ──────────────────────
+# ⛔ MEASURED (round 47, P1): a THIRD crash site, this time in the DIAGNOSTIC half. `print("no-api:" + str(_m.get("id")) + …)`
+# interpolates USER DATA, so a lone surrogate in a model id — or an ordinary non-ASCII id under `PYTHONIOENCODING=ascii`
+# — raised `UnicodeEncodeError`, the payload died, `drop` came back EMPTY, and the gate printed `check=ok` over a box pi
+# cannot start. ⛔ IT WAS ROUTED HERE BY THE ROUND-46 ORDERING FIX, so on the granted api-less shape this WAS a
+# regression: before it, the URL test spoke first and refused 82. Guarding the two prints that failed would leave the
+# hole at the NEXT field-interpolating print, so the fix is ONE place — stdout is reconfigured with
+# `errors="backslashreplace"` at the top of the payload, so whatever it cannot encode is ESCAPED rather than raised and
+# the verdict is unaffected. The `why=` token below therefore carries the escaped id, which is the point: a diagnostic
+# token must never become a verdict.
+# MEASURED BY MUTATION: removing the `reconfigure` line reddens both pairs.
+SP_ID_SURR_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example:abc/v1","models":[{"id":"deepseek\ud800"}]}}}'
+HSPIDS="$(mkhome spell_id_surrogate "$SP_ID_SURR_JSON")"
+OUT="$(run_gate "$HSPIDS" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y109 a LONE SURROGATE in the model id still REFUSES (rc=${RC:-none}) — a diagnostic print must never be the failure" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y110 …with the reason the box earns, so the refused box is still refused"
+SP_ID_UTF8_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example:abc/v1","models":[{"id":"caf\u00e9"}]}}}'
+HSPIDU="$(mkhome spell_id_nonascii "$SP_ID_UTF8_JSON")"
+OUT="$(run_gate "$HSPIDU" PYTHONIOENCODING=ascii RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y111 an ASCII-ONLY stdout encoding does not turn a refusal into \`check=ok\` (rc=${RC:-none}) — the 2nd, non-exotic trigger measured" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-provider-dropped" "3z15y112 …the same reason, with the id escaped rather than raised"
+
 
 
 
