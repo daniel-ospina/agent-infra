@@ -3070,13 +3070,21 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     `rest` before this change, so `test_x[a` was and remains admitted. Asserting
     otherwise would pin a narrowing the door never had.
 
-    ⛔ SCOPE — what this list does and does not establish. It establishes that the
-    five shapes below are still REFUSED by the new class. It does NOT establish
+    ⛔ SCOPE — what this list does and does not establish. It establishes that
+    every shape below is still REFUSED by the new class. It does NOT establish
     that everything missing from the list is safe: a param carrying a SPACE,
-    comma, quote, `=`, `+`, `&` or a non-ASCII character is STILL dropped (by
-    `_RATES_RE`'s `\S+` nodeid group as well as by this class), and the identical
-    silent-drop → "absent from main's failure set" → permanent BLOCK survives for
-    it. The module's own
+    comma, quote, `=`, `+`, `&` or a non-ASCII character is STILL dropped, and the
+    identical silent-drop → "absent from main's failure set" → permanent BLOCK
+    survives for all of them.
+
+    ⛔ WHICH DOOR DROPS WHICH — measured, because the obvious guess is wrong. SPACE
+    is the only one of these that the rate TABLE cannot carry (`_RATES_RE`'s
+    nodeid group is `\\S+`, so the row does not match at all). Comma, quote, `=`,
+    `+`, `&` and non-ASCII are all `\\S` — `_RATES_RE` matches those rows fine and
+    the drop is `is_failure_key` / `rest` ALONE. Do not tell a future fixer that
+    comma needs `_RATES_RE` widened; it does not.
+
+    The module's own
     `test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id` pins
     `[chromium-Claude Desktop]` as a REAL id the loose door must name, so this is
     a live residual, not a hypothetical. It is filed as its own finding; closing
@@ -3084,8 +3092,11 @@ def test_11365_the_widened_tail_still_fails_closed_on_junk():
     allowlist's shape, not a silence to paper over here.
     """
     for junk in (
-        "tests/test_a.py::test_x[a b]",       # whitespace defeats the table's uniq|awk
-        "tests/test_a.py::test_x[a\tb]",      # a tab is a field separator, never an id
+        # the producer CARRIES a space id fine (the table is tab-separated); it is
+        # `_RATES_RE`'s `\S+` nodeid group that refuses the row — reader-side, and
+        # the same cause as the residual above, not a property of the table.
+        "tests/test_a.py::test_x[a b]",
+        "tests/test_a.py::test_x[a\tb]",      # a tab is the field separator, never an id
         "tests/test_a.py::",                  # empty tail
         "tests/test_a.py:test_x[a/b]",        # no `::` -> not a nodeid
         "tests/test_a.py::test_x[a;b]",       # a shell metacharacter is not an id
