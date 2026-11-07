@@ -89,24 +89,24 @@ if [ "$#" -ne 0 ]; then
   _say "  pass a repo with \`pr-doctor.py --repo\` directly if that is what you meant. Nothing ran."
   exit 2
 fi
-# ⛔ `-r` FOR THE DOCTOR, `-f` FOR THE READER — AND THE DIFFERENCE IS A MEASURED REGRESSION, NOT A TASTE
-# (review round 42, P2). `-f` is EXISTENCE, and an UNREADABLE doctor exists, so a `pr-doctor.py` at mode
-# 000 passed this gate, the wrapper announced `grading N repo(s)`, and the exec died with `can't open file
-# … Permission denied` at rc 2 — the code this header defines as "this wrapper refused to start a pass at
-# all": a PASS CLAIM for a run that never started. The DOCTOR gate is `-r` for that reason.
-# ⛔ THE READER GATE STAYS `-f`, because changing it SHADOWED A BETTER MESSAGE (measured): the reader is
-# SOURCED, so an unreadable one is caught by the probe below with "cannot be used by this wrapper; it
-# does not provide: repo_set_parse …" — a diagnosis of the READER. A `-r` gate here intercepted that
-# with "the farm did not deliver a file", i.e. it told an operator with a mode problem to re-run the
-# farm, and it reddened `f11c` (the arm pinning that message) on a correct tree.
-if [ ! -f "$READER" ]; then
+# ⛔ `-f` AND `-r` BOTH, BECAUSE `-r` IS TRUE FOR A DIRECTORY (review round 43, P2 — measured). Round 42
+# replaced `-f` with `-r` to catch an unreadable doctor, and that swap DROPPED the regular-file test: a
+# DIRECTORY at the doctor path is readable, so the wrapper announced `grading 2 repo(s)` and python died
+# with `can't find '__main__' module in …` at rc 1 — outside this header's whole contract, and the same
+# "pass claim for a run that never started" the round-42 fix was for. Both tests, then.
+# ⛔ AND THE READER GATE IS `-e`, so a DIRECTORY there falls through to the sourced probe below and gets
+# "cannot be used by this wrapper; it does not provide: repo_set_parse" — a diagnosis of the reader. `-f`
+# reported a directory as a missing farm file ("Re-run pi-bootstrap/setup.sh"), and `-r` would have
+# admitted it. `-e` is the one test that sends neither to the wrong place: absent/ dangling link → the
+# farm message; present but unusable → the probe.
+if [ ! -e "$READER" ]; then
   _say "REFUSING — $READER is missing: pi-bootstrap/setup.sh's \`lib_srcs\` declares it, so the farm"
   _say "  did not deliver a file this unit depends on. Nothing ran. Re-run pi-bootstrap/setup.sh."
   exit 2
 fi
-if [ ! -r "$DOCTOR" ]; then
-  _say "REFUSING — $DOCTOR is missing or unreadable (the farm's \`fleet_srcs\` declares pr-doctor.py)."
-  _say "  Nothing ran. An unreadable file is not a missing one: check its mode, do not re-run the farm."
+if [ ! -f "$DOCTOR" ] || [ ! -r "$DOCTOR" ]; then
+  _say "REFUSING — $DOCTOR is missing, unreadable, or not a regular file (the farm's \`fleet_srcs\`"
+  _say "  declares pr-doctor.py). Nothing ran. A mode problem is not a missing file: check the mode."
   exit 2
 fi
 
@@ -138,9 +138,11 @@ fi
 # shellcheck disable=SC1090  # a farmed sibling, resolved above
 . "$READER"
 # ⛔ SOURCED IS NOT THE SAME AS LOADED (round 34, P2), AND LOADED IS NOT THE SAME AS BEING THE READER
-# THIS WRAPPER WAS WRITTEN AGAINST (round 37, P1). `[ -f "$READER" ]` above accepts a reader that
-# EXISTS but produces nothing — mode 000, a truncated or corrupt farmed copy (the drift class
-# `check-farm-drift.sh` exists for). The `.` then defines no functions, the probe below returns 127, and
+# THIS WRAPPER WAS WRITTEN AGAINST (round 37, P1). `[ ! -e "$READER" ]` above is an EXISTENCE test only,
+# so it accepts a reader that EXISTS but produces nothing — mode 000, a DIRECTORY, a truncated or corrupt
+# farmed copy (the drift class `check-farm-drift.sh` exists for). ⛔ The flag named here was `-f` until
+# round 43 changed the gate to `-e` so that a DIRECTORY takes this path instead of the farm message; the
+# sentence's substance was always right, the flag was not. The `.` then defines no functions, the probe below returns 127, and
 # the `*)` arm printed `no usable repo set at` followed by an EMPTY path plus two `command not found`
 # lines — the round-33 defect one layer down: a summary naming a file it could not name.
 #
@@ -221,12 +223,14 @@ case "$_rc" in
     # ⛔ `PYTHONUTF8=1` ON THE DOCTOR TOO — THE ROUND-41 FIX WAS HALF-APPLIED (review round 42, P2, measured).
     # Round 41 forced UTF-8 mode on the reader's PROOF child so a trimmed value and the doctor's own
     # `str.strip()` agreed. The wrapper TRIMMED the same value with that child, then `exec`'d the doctor
-    # with no prefix — so under `LC_ALL=POSIX` the doctor decoded the RAW argv, saw the trailing NBSP as a
-    # character rather than whitespace, and REFUSED a repo the wrapper had just announced as proved:
-    #   wrapper: "Grading the ONE repo REPO proves: acme/one (from /tmp/x/co)"
-    #   doctor : REFUSING: REPO=/tmp/x/co  does not name a repository … rc 2
-    # A child that reads the value differently from the caller is not a proof — true of wrapper-vs-doctor
-    # exactly as it was of reader-vs-doctor. One decode now governs both.
+    # with no prefix — so under `LC_ALL=POSIX` the doctor decoded the RAW argv and REFUSED a repo the
+    # wrapper had just announced as proved. A child that reads the value differently from the caller is not
+    # a proof — true of wrapper-vs-doctor exactly as it was of reader-vs-doctor. One decode now governs both.
+    # ⛔ THIS SITE IS DEFENCE-IN-DEPTH, AND THE MEASURED HALF-APPLICATION WAS THE *OTHER* ONE (review round
+    # 43, P2). Deleting this prefix alone leaves the suite green, and it cannot fail open here: the splitter
+    # round-trip (`_rs_split_divergence`, whose `_rs_with_doctor` child is already UTF-8) refuses any value
+    # the doctor's `configured_repos()` would divide, so `PR_DOCTOR_REPOS` is splitter-clean before it
+    # arrives. The degraded site below — where an operator seam is read raw — is the one `f33b` pins.
     _say "set: $(repo_set_file) -> grading $(printf '%s\n' "$repos" | awk -F, '{print NF}') repo(s)"
     PR_DOCTOR_REPOS="$repos"
     export PR_DOCTOR_REPOS

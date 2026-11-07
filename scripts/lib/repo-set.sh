@@ -411,6 +411,18 @@ _rs_require() {
 }
 
 repo_set_parse() {
+  # ⛔ `tr` IS THE THIRD PIECE OF SUBSTRATE, AND IT WAS THE ONE STILL UNGUARDED (review round 43, P2 —
+  # measured three ways). `_rs_lower` IS `tr`, and every dedupe key and every state/provenance comparison
+  # goes through it. With `tr` off PATH each key folded to the EMPTY string, so:
+  #   · a VALID two-repo set was refused `DUPLICATE-SLUG — … is already named above` at rc 5 (both
+  #     entries keyed to ""), i.e. a false block that names the wrong cause;
+  #   · the wrapper's `"$a" != "$b"` provenance refusal became `"" != ""` = false, so it announced
+  #     `Grading the ONE repo this unit declares in PR_DOCTOR_REPO=…` for a checkout that PROVES a
+  #     different repo — the "claims to grade, grades nothing" shape that branch was rewritten to remove;
+  #   · the state-spelling WARN promised "beyond its own spelling" for a proof whose spelling axis had
+  #     not run at all. The refusal here pre-empts all three with no wrapper edit: the wrapper only enters
+  #     the degraded branch on rc 3, so a named rc-5 refusal stops it first.
+  _rs_require tr "it is the case fold every slug, state and provenance comparison goes through, so without it every dedupe key is EMPTY: a valid set reads as DUPLICATE-SLUG, and two different repos compare as equal." || return 5
   _rs_require sed "it trims a line's surrounding whitespace, so without it every line reads as blank and a set full of repos would be reported EMPTY rather than unreadable." || return 5
   local f; f="$(repo_set_file)"
   # ⛔ `-L` BEFORE `-e`: `-e` FOLLOWS the link, so a DANGLING symlink reads as absent and the box
@@ -533,8 +545,12 @@ repo_set_parse() {
     # DUPLICATE-KEY and the LAST value won silently (measured: rc 0, no message, `/tmp` kept; the
     # mirror shape `checkout=/tmp checkout=` was refused, so the refusal depended on ORDER). A key
     # given twice is refused because a set that reads differently depending on token order is a set
-    # whose shape an operator cannot see. The empty value itself stays legal ONCE (`checkout=` is how
-    # a line says "no checkout"), which is why the flag and the value are separate.
+    # whose shape an operator cannot see. The empty value itself stays legal ONCE, but NOT for
+    # `checkout`: `checkout=` empty is `MISSING-CHECKOUT` (the format table makes checkout REQUIRED).
+    # The optional key is `state=` — that is how a line omits the state dir — which is what the
+    # flag/value split protects. ⛔ This sentence said `checkout=` until round 43 measured it and found
+    # the opposite (review P2); the arm that pins it uses `state=` and always did, so only the prose was
+    # wrong.
     local slug_seen=0 checkout_seen=0 state_seen=0
     local line_bad=0
     local IFS=$' \t'
@@ -1189,6 +1205,11 @@ EOF
 # parser is how a set that validates one way renders another (the two-authorities defect).
 repo_set_slugs() {
   local parsed rc
+  # ⛔ THE ONE `awk` CALL SITE WITH NO GUARD (review round 43, P2 — measured). Its sibling below refused
+  # by name at rc 5; this verb ran `awk` bare, so with `awk` off PATH it printed an empty list and exited
+  # **127** with no `repo-set:` line at all — a code the RETURN CODES table does not define, and a
+  # consumer that reads stdout without re-checking rc reads "this set names no repos".
+  _rs_require awk "it renders the slug list this verb exists to produce; without it the list would be EMPTY, and an empty list reads as a set that names no repos." || return 5
   parsed="$(repo_set_parse)"; rc=$?
   [ "$rc" = 0 ] || return "$rc"
   printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1}'

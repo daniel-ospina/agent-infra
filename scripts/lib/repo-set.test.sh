@@ -171,10 +171,17 @@ arm duplicate-key   DUPLICATE-KEY    "slug=o/n slug=p/q checkout=$T/tortoise"
 # token order. Measured on the pre-fix reader: `checkout= checkout=/tmp` → `o/n<TAB>/tmp`, rc 0.
 arm duplicate-key-empty-first DUPLICATE-KEY "slug=o/n checkout= checkout=$T/tortoise"
 arm duplicate-key-state-empty-first DUPLICATE-KEY "slug=o/n checkout=$T/tortoise state= state=$T/agent-infra"
-# …and the empty value itself must stay legal ONCE (`checkout=` is how a line says "no checkout" in the
-# set's own syntax), or the flag/value split above would have traded one defect for a worse one.
+# …and an empty value must stay legal ONCE for the key that is actually OPTIONAL — `state=`, which is
+# how a line omits the state dir — or the flag/value split would have traded one defect for a worse one.
+# ⛔ NOT `checkout=`: that key is REQUIRED, so `checkout=` empty is `MISSING-CHECKOUT` at rc 5, and the
+# comment here said otherwise until round 43 measured it (review P2). The arm below always used `state=`;
+# only the prose was wrong. Both halves are pinned — `arm missing-checkout` for `slug=o/n` alone.
 ck "c-empty-value-is-legal-once (the duplicate check must not fire on a single empty value)" \
    'printf "slug=o/n checkout=%s state=\n" "$T/tortoise" > "$T/empty-val.conf"; [ "$(run_reader_rc "$T/empty-val.conf" list)" = 0 ]'
+# …and the OTHER half of that statement, so the two cannot drift apart again: an empty `checkout=` is
+# refused, and by the code the format table gives it — not silently accepted as "no checkout".
+ck "c-empty-checkout-is-MISSING-CHECKOUT (the optional key is state=, not checkout=)" \
+   'printf "slug=o/n checkout=\n" > "$T/empty-co.conf"; o="$(run_reader "$T/empty-co.conf" list)"; [ "$(run_reader_rc "$T/empty-co.conf" list)" = 5 ] && grep -q "MISSING-CHECKOUT" <<<"$o"'
 
 ck "c-empty has its own code (4), distinct from an absent file (3)" \
    'printf "# only comments\n\n" > "$T/empty.conf"; [ "$(run_reader_rc "$T/empty.conf" list)" = 4 ]'
@@ -434,8 +441,26 @@ else
   _o_000="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; _rc_000=$?
   chmod 644 "$W/pr-doctor.py"
   ck "f34b an UNREADABLE sibling doctor is refused BY NAME — never a 'grading N repo(s)' claim for a run that cannot start" \
-     '[ "$_rc_000" = 2 ] && grep -q "missing or unreadable" <<<"$_o_000" && ! grep -q "grading .* repo(s)" <<<"$_o_000" && ! grep -qE "Permission denied|can.t open file" <<<"$_o_000"'
+     '[ "$_rc_000" = 2 ] && grep -q "missing, unreadable, or not a regular file" <<<"$_o_000" && ! grep -q "grading .* repo(s)" <<<"$_o_000" && ! grep -qE "Permission denied|can.t open file" <<<"$_o_000"'
 fi
+# ⛔ `-r` IS TRUE FOR A DIRECTORY, SO ROUND 42's `-f` → `-r` DROPPED THE REGULAR-FILE TEST (review round 43,
+# P2 — measured). A directory at the doctor path is readable, so the wrapper announced `grading 2 repo(s)`
+# and python died with `can't find '__main__' module` at rc 1 — outside the header's whole contract, and
+# the same pass-claim-for-a-run-that-never-started shape. Both tests are on the gate now.
+mv "$W/pr-doctor.py" "$W/pr-doctor.py.away"; mkdir -p "$W/pr-doctor.py"
+_o_dir="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; _rc_dir=$?
+rmdir "$W/pr-doctor.py"; mv "$W/pr-doctor.py.away" "$W/pr-doctor.py"
+ck "f34c a DIRECTORY at the doctor path is refused like any other unusable file — not one repo(s) claim" \
+   '[ "$_rc_dir" = 2 ] && grep -q "missing, unreadable, or not a regular file" <<<"$_o_dir" && ! grep -q "grading .* repo(s)" <<<"$_o_dir"'
+# ⛔ AND A DIRECTORY AT THE **READER** PATH IS A READER PROBLEM, NOT A FARM ONE (same review). `-f` sent it
+# to "the farm did not deliver a file … Re-run pi-bootstrap/setup.sh" — the wrong instruction for a path that
+# exists. `-e` lets it fall through to the sourced probe, which diagnoses the reader.
+WR="$T/wreaderdir"; mkdir -p "$WR"
+cp "$WRAPPER" "$WR/pr-doctor-machine.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$WR/pr-doctor.py"
+mkdir -p "$WR/lib/repo-set.sh"
+_o_rdir="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$WR/pr-doctor-machine.sh" 2>&1)"; _rc_rdir=$?
+ck "f34d a DIRECTORY at the READER path is diagnosed as an unusable reader, never as a missing farm file" \
+   '[ "$_rc_rdir" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$_o_rdir" && ! grep -q "did not deliver a file" <<<"$_o_rdir"'
 # ⛔ THE THIRD ARMLESS GUARD, ONE TO THE LEFT OF `f34` (review at `7159ffab`, P1). `[ -z "$PY" ]` is
 # the same shape as the two above and was the remaining guard in this file whose deletion left the
 # suite at ZERO reds: with it gone the wrapper announces `set: … -> grading N repo(s)` and then dies on
@@ -1117,7 +1142,7 @@ ck "j16 with NO python3 on PATH the tag guard still refuses (absolute fallback, 
 #   sed missing → every line reads blank → `NO-ENTRIES … names no repo`, rc 4, for a file naming two;
 #   awk missing → `rendered` and `expected` both empty → the round-trip compares them EQUAL → rc 0 `OK`
 #                 for a set this same reader REFUSES at rc 1. That second one is a FALSE PASS.
-for _t in sed awk; do
+for _t in sed awk tr; do
   _d="$T/no-$_t"; mkdir -p "$_d"
   for b in bash sed awk tr grep printf id dirname cat cut wc head mv rm mkdir ln chmod git date env basename uname python3; do
     [ "$b" = "$_t" ] && continue
@@ -1128,6 +1153,24 @@ ck "j16b no \`sed\` on PATH is a NAMED refusal at rc 5 — never 'NO-ENTRIES' fo
    'o="$(REPO_SET_FILE="$CONF" PATH="$T/no-sed" /bin/bash "$READER" check 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "sed\` is not on PATH" <<<"$o" && ! grep -q "NO-ENTRIES" <<<"$o"'
 ck "j16c no \`awk\` on PATH is a NAMED refusal at rc 5 — the round-trip must not 'pass' with both sides empty" \
    'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$T/no-awk" /bin/bash "$READER" check 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "awk\` is not on PATH" <<<"$o" && ! grep -q "OK — " <<<"$o"'
+# ⛔ `tr` IS `_rs_lower`, AND WITHOUT IT EVERY DEDUPE KEY IS EMPTY (review round 43, P2 — measured three
+# ways, all from the same missing tool). A VALID two-repo set was refused `DUPLICATE-SLUG` at rc 5 (both
+# entries keyed to ""); the wrapper's provenance guard became `"" != ""` = false, so it announced
+# `Grading the ONE repo this unit declares in PR_DOCTOR_REPO=…` for a checkout that PROVES a different
+# repo; and the state-spelling WARN promised a proof that had not run. One guard in `repo_set_parse`
+# pre-empts all three, because the wrapper only enters the degraded branch on rc 3.
+ck "j16d no \`tr\` on PATH is a NAMED refusal at rc 5 — never a false DUPLICATE-SLUG for a valid set" \
+   'o="$(REPO_SET_FILE="$CONF" PATH="$T/no-tr" /bin/bash "$READER" check 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "tr\` is not on PATH" <<<"$o" && ! grep -q "^repo-set: DUPLICATE-SLUG —" <<<"$o"'
+# ⛔ THE NEGATIVE CONJUNCT MUST TARGET A VERDICT, NOT A WORD (review-instrumented round 43). It read
+# `! grep -q "DUPLICATE-SLUG"`, and the refusal's OWN message explains the shape it prevents by naming it —
+# so the arm matched its own prose and reddened on a CORRECT tree. Worse, deleting the `_rs_require tr`
+# guard left the suite at exactly the same count, i.e. the arm was dead for the thing it pins. Anchored to
+# the verdict line (`^repo-set: DUPLICATE-SLUG —`), it can only match an actual refusal.
+# …and the verb that was the one UNGUARDED awk call site: `slugs` used to exit 127 with an empty list and
+# no `repo-set:` line at all — a code the RETURN CODES table does not define, read by any consumer as
+# "this set names no repos" (review round 43, P2).
+ck "j16e no \`awk\` on PATH: the \`slugs\` verb refuses at rc 5, never 127 with an empty list" \
+   'o="$(REPO_SET_FILE="$CONF" PATH="$T/no-awk" /bin/bash "$READER" slugs 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "awk\` is not on PATH" <<<"$o"'
 
 # ⛔ THE ROUND-TRIP IS BY ENTRIES, NOT BY COUNT (review round 9, P2): a separator at the END of a value
 # is adjacent to the join comma, so the count stayed n and a TRUNCATED checkout passed `check` — a set
