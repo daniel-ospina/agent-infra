@@ -71,9 +71,39 @@
 #       1 = the path is not the root of a git worktree
 #       2 = there was work that could NOT be archived or pushed — printed loudly, it is still at risk,
 #           and the printed cause says WHY (workflow scope / auth / network / rejected / unclassified)
+#
+# `--verdict` ASKS THE SAME QUESTION WITHOUT ARCHIVING ANYTHING (agent-infra#3485). It is the ONE
+# classifier, exposed — see §2b. Do not re-implement "is anything at risk" anywhere else: a second
+# copy is a second answer, and the whole point of this file is that a FAILED status is never read as
+# `clean`. Exit in that mode: 0 = clean, 1 = dirty, 2 = CANNOT VERIFY (unmeasured — never "nothing to
+# rescue"), and every path this file cannot resolve is 2 as well, because a worktree it cannot read is
+# unmeasured. ⛔ THE USAGE FAILURES ARE 2 TOO, INCLUDING A MISSING ARGUMENT: `1` in this mode already
+# means `dirty`, so no refusal of any kind may answer with it — an exit-code reader would otherwise read
+# "dirty" (or, worse, 0 = clean) out of an invocation that answered nothing. The ordinary mode keeps its
+# shipped codes untouched: a missing argument there is still the shell's own usage failure, exit 1.
+#
+# `--slug <branch>` and `--verdict` are both READ-ONLY modes that return before any archive work, and
+# they are MUTUALLY EXCLUSIVE: combining them is a usage error (2 under `--verdict`), never a silent
+# answer to the other question at the wrong exit code.
 set -uo pipefail
 
-WT="${1:?usage: bg-rescue-wip.sh <worktree> [note] | bg-rescue-wip.sh --slug <branch>}"
+# Two ADDITIVE read-only modes, each of which returns before any archive work (#3484's `--slug`, and
+# #3485's `--verdict`). They are MUTUALLY EXCLUSIVE and each is parsed once, so neither can silently
+# answer the other's question. Neither moves the ordinary mode's exit codes.
+VERDICT_ONLY=0
+case "${1:-}" in
+  --verdict) VERDICT_ONLY=1; shift ;;
+esac
+
+# A USAGE FAILURE IS 1 IN THE ORDINARY MODE (shipped, must not move) AND 2 UNDER `--verdict`, whose 1
+# already means `dirty`. One helper, so no refusal can answer with a verdict code it does not own.
+usage_fail() {
+  echo "usage: bg-rescue-wip.sh [--verdict] <worktree> [note] | bg-rescue-wip.sh --slug <branch>" >&2
+  [ "$VERDICT_ONLY" -eq 1 ] && exit 2
+  exit 1
+}
+[ -n "${1:-}" ] || usage_fail
+WT="$1"
 NOTE="${2:-a lane hit its cap}"
 
 # ── THE REF SLUG, AND ITS ONE HOME (agent-infra#3484) ───────────────────────────────────
@@ -121,6 +151,10 @@ wip_ref_parts() { # wip_ref_parts <branch>
 # `--slug <branch>`: print the ref component for a branch and nothing else — the ONE derivation, so a
 # reader cannot disagree with the writer about which ref exists.
 if [ "${1:-}" = "--slug" ]; then
+  # ⛔ THE MODES ARE EXCLUSIVE. `--verdict --slug x` used to fall through to this branch (the verdict
+  # shift left `--slug` as $1), answer the SLUG question, and exit 0 — which in verdict mode means
+  # `clean`. A refusal, so it cannot be read as an answer either way.
+  [ "$VERDICT_ONLY" -eq 0 ] || usage_fail
   case "${2:-}" in ''|--*) echo "usage: bg-rescue-wip.sh --slug <branch>" >&2; exit 1 ;; esac
   wip_ref_parts "$2"
   printf '%s\n' "$SLUG"
@@ -168,12 +202,24 @@ loud() {
 # ── 1. The path must be the ROOT of a worktree ───────────────────────────────────────────────────
 # `rev-parse --git-dir` succeeds anywhere INSIDE a repo, so a misrouted path would archive the
 # enclosing checkout and exit 0 claiming a rescue of work it never looked at.
-TOP="$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null)" || { echo "bg-rescue-wip: not a worktree: $WT" >&2; exit 1; }
-HERE_R="$(cd "$WT" 2>/dev/null && pwd -P)" || { echo "bg-rescue-wip: not a directory: $WT" >&2; exit 1; }
+# ⛔ IN VERDICT MODE THERE IS NO `dirty` HERE, ONLY `UNMEASURED`. A path this tool cannot resolve is
+# not a worktree with work in it; reporting it as `dirty` would send a caller to archive nothing and
+# reporting it as `clean` is the data-loss answer this file exists to prevent. Exit 2 = cannot verify.
+# The ORDINARY mode keeps its documented exit 1 for the same three cases — this helper must not move a
+# shipped exit code, so the two modes answer with their own vocabulary.
+vunmeasured() { echo "bg-rescue-wip: $*" >&2; [ "$VERDICT_ONLY" -eq 1 ] && { echo 'verdict=cannot-verify'; exit 2; }; exit 1; }
+
+TOP="$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null)" || vunmeasured "not a worktree: $WT"
+# ⛔ ONE BRANCH, NOT TWO (#3588 review, cycle 8). The old `not a directory` arm was UNREACHABLE: every
+# path that cannot be entered already fails `git -C … rev-parse --show-toplevel` above — a FILE, a missing
+# path and a permission-denied dir all die there (verified with /etc/hostname) — so that arm could never
+# fire and the mutation pass found no arm that could redden it, i.e. it was dead weight in exactly the way
+# an unassertable guard always is. The reachable successor of the same condition is KEPT (and is now
+# graded by V10), so a path we cannot enter still answers UNMEASURED rather than `dirty`.
+HERE_R="$(cd "$WT" 2>/dev/null && pwd -P)" || vunmeasured "not a worktree root: $WT (that path cannot be entered)"
 TOP_R="$(cd "$TOP" 2>/dev/null && pwd -P)"
 if [ "$HERE_R" != "$TOP_R" ]; then
-  echo "bg-rescue-wip: not a worktree root: $WT (that path is inside the worktree at $TOP)" >&2
-  exit 1
+  vunmeasured "not a worktree root: $WT (that path is inside the worktree at $TOP)"
 fi
 
 # ── 2. Is anything at risk? A FAILED status is not a clean tree ──────────────────────────────────
@@ -217,6 +263,35 @@ BR="$(git -C "$WT" branch --show-current 2>/dev/null)"
 [ -z "$BR" ] && BR="detached-$(git -C "$WT" rev-parse --short HEAD 2>/dev/null || echo unborn)"
 
 wip_ref_parts "$BR"   # sets WIP_ISSUE and SLUG — ONE derivation, shared with the reader
+
+# ── 2b. VERDICT MODE (--verdict): the fact, not the archive ───────────────────────────────────────
+# ⛔ WHY THE SWEEP CALLS THIS INSTEAD OF READING `git status` ITSELF (agent-infra#3485). The three
+# verdicts below are the whole safety argument of this file: an EMPTY listing is only `clean` when the
+# status SUCCEEDED and enumerated everything, and a warning that a directory could not be read is
+# `cannot-verify`. A sweeper that re-derived that rule from its own `git status` would be a second
+# implementation of it — and the day one of them drifts, the sweeper silently archives nothing and
+# reports a clean fleet. So there is exactly one classifier and this is its read-only mode.
+# ONE LINE, machine-readable, with the classifier's OWN branch, slug AND ISSUE so a caller never
+# re-derives any of them (`SLUG` is the ref component this file actually pushes under, §6, and
+# `WIP_ISSUE` is what `wip_ref_parts` read out of the branch — the SAME derivation the ref name came
+# from, so the index can never assert a link the ref does not carry). `issue=-` when the branch carries
+# none: the caller reports that, and must not invent a number of its own.
+#
+# `paths=` is deliberately ABSENT on `cannot-verify`: an unenumerated tree has NO path count, and
+# printing 0 there is the exact "empty = clean" confusion this mode exists to remove.
+if [ "$VERDICT_ONLY" -eq 1 ]; then
+  if [ "$AT_RISK" -eq 0 ]; then
+    echo "verdict=clean paths=0 branch=$BR slug=$SLUG issue=${WIP_ISSUE:--}"
+    exit 0
+  fi
+  if [ "$ST_RC" -ne 0 ] || [ "$ENUM_INCOMPLETE" -eq 1 ]; then
+    echo "verdict=cannot-verify branch=$BR slug=$SLUG issue=${WIP_ISSUE:--}"
+    exit 2
+  fi
+  N_VERDICT_PATHS="$(printf '%s\n' "$ST_OUT" | grep -c '' 2>/dev/null || true)"
+  echo "verdict=dirty paths=${N_VERDICT_PATHS:-?} branch=$BR slug=$SLUG issue=${WIP_ISSUE:--}"
+  exit 1
+fi
 
 if [ "$AT_RISK" -eq 0 ]; then
   # Honest about what is NOT covered: a lane that committed locally but never pushed has a clean tree
