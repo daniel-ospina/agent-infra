@@ -128,8 +128,9 @@ SHA="$(printf 'a%.0s' $(seq 1 40))" # 40×a — matches the stub's head answer
 #                                   the ENVELOPE fixture ${STUB_COMMENT_JSON:-} is
 #                                   set — applies the caller's OWN --jq
 #                                   expression to it with the real `jq` (so the
-#                                   admission predicate is tested where it is
-#                                   USED, not where it is defined), or a
+#                                   recorder's frame expression — the delimiter
+#                                   strip and the record terminator — is EXECUTED,
+#                                   not merely present in the source), or a
 #                                   NON-EMPTY error body on STDOUT with exit 1
 #                                   when STUB_COMMENT_FAIL=1 (the `gh api`
 #                                   shape that must never be read as "no
@@ -193,9 +194,54 @@ if [ "$1" = "api" ]; then
     #                           the failure path unreachable and its vector green.
     #   STUB_COMMENT_CAPTURE  → sink for a POST body, so the suite can assert the
     #                           COMMENT really carries the marker.
+    # ⛔ ONE ARM, BOTH READS (#3168 re-review P2). This arm was previously followed by
+    # a SECOND `…/issues/<n>/comments` arm carrying the ENVELOPE / FAILURE / BODIES
+    # behaviour. The two matched the SAME regex and THIS one `exit 0`s in every branch,
+    # so the second was UNREACHABLE: `STUB_COMMENT_JSON`, `STUB_COMMENT_FAIL` and
+    # `STUB_COMMENT_BODIES` were inert knobs the header above advertised as live, and a
+    # later author following that header would have written a vector testing nothing
+    # (measured: driving the stub with an envelope printed the raw `STUB_COMMENTS`
+    # frame and the caller's `--jq` was never applied). Folded in HERE, so there is one
+    # read path and no arm can shadow another again.
+    # ⛔ NARROW: `…/issues/<n>/comments` is the PR's comment LIST; `…/issues/comments/<id>`
+    # is the SINGLE-comment read used by `--evidence comment:<id>` and must keep
+    # falling through to the generic tail. An unanchored `/comments` match swallowed
+    # the evidence read and reddened §13h.
     if grep -qE -- "/issues/[0-9]+/comments" <<<"$*"; then
         if grep -qF -- "--jq" <<<"$*"; then
             [ "${STUB_COMMENTS_FAIL:-0}" = "1" ] && exit 1
+            # ⛔ THE FAILURE ARM IS THE LOAD-BEARING ONE: `gh api` writes a NON-EMPTY
+            # JSON error body to STDOUT *and* exits non-zero, so a producer that
+            # captured stdout without testing the exit status would read
+            # `{"message": "API rate limit exceeded"}` as comment text and could
+            # conclude the marker is already posted when it is not.
+            if [ "${STUB_COMMENT_FAIL:-0}" = "1" ]; then
+                printf '%s\n' '{"message":"API rate limit exceeded","status":"403"}'
+                exit 1
+            fi
+            # ⛔ MODEL --jq, DO NOT IGNORE IT. When a JSON ENVELOPE fixture is supplied,
+            # apply the CALLER'S OWN expression to it with the real jq — the same shape
+            # real `gh` has. Without this the recorder's frame expression (the
+            # `gsub("[…]"; "")` delimiter strip and the `\u001e` record terminator at
+            # scripts/record-review.sh:1901-1902) is executed by NO vector at all: every
+            # other fixture supplies the frame PRE-BUILT through $STUB_COMMENTS, so
+            # deleting either half of the expression left the suite GREEN. §14.1d(b4)
+            # is the vector that now reddens when the strip is removed.
+            if [ -n "${STUB_COMMENT_JSON:-}" ]; then
+                _cjq="" _cprev=""
+                for _carg in "$@"; do
+                    if [ "$_cprev" = "--jq" ]; then _cjq="$_carg"; break; fi
+                    _cprev="$_carg"
+                done
+                if [ -n "$_cjq" ]; then
+                    jq -r "$_cjq" <<<"$STUB_COMMENT_JSON" || exit 1
+                    exit 0
+                fi
+            fi
+            if [ -n "${STUB_COMMENT_BODIES:-}" ]; then
+                printf '%s\n' "${STUB_COMMENT_BODIES}"
+                exit 0
+            fi
             printf '%s' "${STUB_COMMENTS:-}"
             exit 0
         fi
@@ -223,54 +269,6 @@ if [ "$1" = "api" ]; then
                     esac ;;
             esac ;;
     esac
-    # agent-infra#3168: the DURABLE comment channel (repos/…/issues/<n>/comments).
-    # Placed before the generic tail so a comments READ cannot fall through to the
-    # body answer. ⛔ The FAILURE arm is the load-bearing one: `gh api` writes a
-    # NON-EMPTY JSON error body to STDOUT *and* exits non-zero, so a producer that
-    # captured stdout without testing the exit status would read `{"message":
-    # "API rate limit exceeded"}` as comment text and could conclude the marker is
-    # already posted when it is not.
-    # ⛔ NARROW: `…/issues/<n>/comments` is the PR's comment LIST; `…/issues/comments/<id>`
-    # is the SINGLE-comment read used by `--evidence comment:<id>` and must keep
-    # falling through to the generic tail. An unanchored `/comments` match swallowed
-    # the evidence read and reddened §13h.
-    if grep -qE -- '/issues/[0-9]+/comments' <<<"$*"; then
-        if grep -qF -- "-X POST" <<<"$*"; then
-            [ "${STUB_COMMENT_POST_FAIL:-0}" = "1" ] && exit 1
-            if [ -n "${STUB_COMMENT_CAPTURE:-}" ]; then
-                cat >"$STUB_COMMENT_CAPTURE"
-            else
-                cat >/dev/null
-            fi
-            exit 0
-        fi
-        if [ "${STUB_COMMENT_FAIL:-0}" = "1" ]; then
-            printf '%s\n' '{"message":"API rate limit exceeded","status":"403"}'
-            exit 1
-        fi
-        # ⛔ MODEL --jq, DO NOT IGNORE IT (#3168 re-review P3). The dedup read passes
-        # the admission constant as `--jq`, and a stub that printed its fixture
-        # verbatim made every assertion about that constant a pin on SOURCE TEXT:
-        # measured, swapping the read's `--jq "$PR_EVIDENCE_COMMENTS_JQ"` for
-        # `--jq '.[] | .body'` left the suite GREEN with the constant defined-but-dead.
-        # When a JSON ENVELOPE fixture is supplied, apply the CALLER'S OWN expression
-        # to it with the real jq — the same shape real gh has — so the admission set
-        # is exercised where it is USED. STUB_COMMENT_BODIES stays verbatim, so every
-        # vector written before this arm keeps its exact behaviour.
-        if [ -n "${STUB_COMMENT_JSON:-}" ]; then
-            _cjq="" _cprev=""
-            for _carg in "$@"; do
-                if [ "$_cprev" = "--jq" ]; then _cjq="$_carg"; break; fi
-                _cprev="$_carg"
-            done
-            if [ -n "$_cjq" ]; then
-                jq -r "$_cjq" <<<"$STUB_COMMENT_JSON" || exit 1
-                exit 0
-            fi
-        fi
-        [ -n "${STUB_COMMENT_BODIES:-}" ] && printf '%s\n' "${STUB_COMMENT_BODIES}"
-        exit 0
-    fi
     # #2982: the reviewed-diff fetch. Placed FIRST — the request carries no
     # --jq, so it would otherwise fall through to the generic body answer.
     if grep -qF -- "application/vnd.github.v3.diff" <<<"$*"; then
@@ -5131,20 +5129,20 @@ else
 fi
 
 # 14.1c THE LINE-ANCHORED PRESENCE PREDICATE (agent-infra#3168). ⛔ THE ATTRIBUTION IS
-#     PART OF THE PIN: this PR anchors ONE site, `post_marker()` (its presence test).
-#     The recorder's APPEND decision and its MARKER_PRESENT re-read were ALREADY `-qxF`
-#     on main (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
-#     → :4643, :4727 and :4781), so claiming all three "moved from `grep -qF` to `grep -qxF`"
-#     is FALSE — and a false "we changed this" is how a later reader concludes the
-#     older sites need anchoring too, or that this diff is bigger than it is.
-#     WHAT THE VECTOR BELOW ACTUALLY PINS (corrected — #3168 re-review finding 6):
-#     the BODY-APPEND site (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`), which is
-#     ALREADY `-qxF` on main (`git show origin/main:scripts/record-review.sh`
-#     → :4643) and is therefore NOT a site this PR changed. Reverting this PR's fix
-#     leaves 14.1c GREEN; the site this PR really anchors is `post_marker()`'s
-#     presence test, which 14.10f pins. This vector is kept — main's anchoring
-#     should not silently regress — but it is a regression pin for MAIN, and the
-#     earlier wording claimed it was evidence about this diff. It matches
+#     PART OF THE PIN — and it was WRONG twice before this correction (#3168 re-review
+#     finding 2), so state it exactly: THIS DIFF ANCHORS **NO** SITE in the recorder.
+#     All four `grep -qxF` sites are ALREADY anchored on main
+#     (`git show origin/main:scripts/record-review.sh | grep -n 'grep -qxF'`
+#     → :1939 :3643 :5956 :6068) and the same four are at head
+#     (`grep -n 'grep -qxF' scripts/record-review.sh` → :2003 :3729 :6056 :6201):
+#     the only diff hunk at `post_marker()` (:1995-2005) ADDS A COMMENT — the
+#     predicate line beside it is CONTEXT, not a change.
+#     WHAT THE VECTOR BELOW ACTUALLY PINS: the BODY-APPEND site
+#     (`if ! grep -qxF -- "$MARKER" <<<"$BODY"`, main :4643 / head :6056). It is a
+#     MAIN-REGRESSION pin — reverting this PR leaves 14.1c GREEN, and 14.10f is a
+#     main-regression pin for the same reason. Keeping them is right (main's
+#     anchoring should not silently regress); calling them evidence about this diff
+#     was not. It matches
 #     the gate's own `^…$` admission of a body marker. A body that merely
 #     CITES the marker mid-line is the discriminating case: unanchored `-qF` read
 #     it as PRESENT, so the recorder PATCHed nothing and set MARKER_PRESENT=1 on
@@ -5226,15 +5224,23 @@ fi
 # (b) IDEMPOTENCY: an admitted comment already carrying this exact marker ⇒ no POST.
 STUB_COMMENTS="OWNER"$'\037'"$DC_MARKER"$'\036' STUB_COMMENT_CAPTURE="$T/ccap_b" run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
 assert_eq "$(dc_posts "$DC_PR")" "0" "14.1d a comment already carrying the marker is NOT duplicated (idempotency)"
-# (b2) ⛔ THE DEDUP IS LINE-ANCHORED — and (b) CANNOT see it (fresh-review finding 1).
-#      (b) serves the marker as the WHOLE comment body, which matches under both
-#      `-qxF` and the weaker `-qF`, so `-qxF`->`-qF` at the dedup read left the suite
-#      at PASS=921 FAIL=0. That is not a style flag: with `-qF`, any admitted comment
-#      that merely CITES or QUOTES the marker mid-line satisfies the dedup on EVERY
-#      later run, so the channel never posts again — the durable copy is permanently
-#      dead — and nothing reds. It is the same asymmetry the BODY channel was already
-#      pinned for (14.10f), on the durable channel.
-#      The gate admits a comment only when the marker is ALONE ON A LINE, so the
+# (b2) ⛔ THE DEDUP DEMANDS THE **WHOLE BODY** — and (b) CANNOT see it (fresh-review
+#      finding 1). (b) serves the marker as the WHOLE comment body, which satisfies both
+#      whole-body equality and a substring test, so (b) alone cannot discriminate.
+#      ⛔ THE MUTANT NAMED HERE USED TO BE WRONG (#3168 re-review finding 2): this row
+#      previously claimed "`-qxF`->`-qF` at the dedup read left the suite at
+#      PASS=921 FAIL=0". THERE IS NO GREP AT THE DEDUP READ — not anchored, not
+#      unanchored: the loop compares whole bodies with `[ "$_body" = "$marker" ]`
+#      (scripts/record-review.sh:1925), so that mutant does not exist and could not
+#      have been measured. The mutant that actually makes (b2) meaningful is replacing
+#      that equality with a SUBSTRING test (`case "$_body" in *"$marker"*)`): it
+#      reddens (b2) — which expects 1 POST and would get 0.
+#      That is not a style flag: under a substring test, any admitted comment that
+#      merely CITES or QUOTES the marker mid-line satisfies the dedup on EVERY later
+#      run, so the channel never posts again — the durable copy is permanently dead —
+#      and nothing reds. It is the same asymmetry the BODY channel is pinned for at
+#      14.10f (which is likewise a MAIN-regression pin), on the durable channel.
+#      The gate admits a comment only when the marker is ALONE IN THE BODY, so the
 #      producer must not treat a quoting comment as "already posted".
 # ⛔ SAME PR AS (b), ON PURPOSE. The marker embeds `reviews/<pr>.json`, so a body
 #    quoting ANOTHER PR's marker cannot match this run's marker under EITHER flag —
@@ -5251,6 +5257,37 @@ if [ -s "$T/ccap_b2" ]; then
     ok "14.1d …and the post it makes carries a body (the vector is not judging an empty capture)"
 else
     bad "14.1d the anchored-dedup vector captured no POST body — it would pass on a post that never happened"
+fi
+# (b4) ⛔ THE FRAME EXPRESSION IS **EXECUTED**, NOT MERELY PRESENT (#3168 re-review P2).
+#      The read hands the gate's own expression to `--jq`:
+#        .[] | "<assoc>\u001f<body | gsub("[\u001e\u001f]"; "")>" + "\u001e"
+#      BOTH halves are load-bearing: the strip because an UNSTRIPPED body can FORGE the
+#      frame (the recorder's own comment at :1894-1895 names the measured exploit), the
+#      `\u001e` because it is how records are split. NO OTHER VECTOR EXERCISES EITHER —
+#      every other fixture feeds the frame PRE-BUILT through $STUB_COMMENTS, so the
+#      recorder's expression is never evaluated and deleting the strip left the suite
+#      GREEN. This one serves a JSON ENVELOPE (the shape real `gh api` returns) and
+#      asserts through the POST COUNT.
+#      ⛔ NON-VACUITY (measured): at head the strip removes the delimiters smuggled in the
+#      body, the forged record never forms, and this run is UNAFFECTED by an unadmitted
+#      author's comment ⇒ 1 POST. With `gsub(...)` deleted the smuggled
+#      `\u001eOWNER\u001f<marker>` survives the split as its own record, the dedup matches
+#      it, and the channel is suppressed for ever by a drive-by comment ⇒ 0 POST —
+#      exactly the state the strip exists to prevent.
+if [ -n "$DC_MARKER" ]; then
+    _dcj_body="$(printf 'drive-by note\036OWNER\037%s' "$DC_MARKER")"
+    _dcj_forged="$(jq -nc --arg b "$_dcj_body" '[{author_association:"NONE", body:$b}]')"
+    STUB_COMMENT_JSON="$_dcj_forged" STUB_COMMENT_CAPTURE="$T/ccap_b4" \
+        run_record_633 "$DC_PR" "$SHA" "$DC_CRUNS"
+    assert_eq "$(dc_posts "$DC_PR")" "1" \
+        "14.1d(b4) a FORGED record smuggled inside a comment body does not satisfy the dedup (the delimiter strip is executed)"
+    if [ -s "$T/ccap_b4" ] && command grep -qF -- "$DC_MARKER" "$T/ccap_b4"; then
+        ok "14.1d(b4) …and the post it makes carries the real marker (the envelope reached the recorder, not a fixture)"
+    else
+        bad "14.1d(b4) the envelope vector did not post the marker — the ENVELOPE fixture never reached the caller's --jq"
+    fi
+else
+    bad "14.1d(b4) vector SKIPPED — the marker fixture is empty; the frame-expression pin did NOT run"
 fi
 # (b3) ⛔ THE SUCCESS LINE'S SCOPE (#3168 review cycle 4). This line reports only what
 #      the producing function observed — it created a comment — and it must NOT assert
@@ -5750,18 +5787,24 @@ fi
 assert_eq "$FL_RC" "0" "14.10b --flush-pending delivers the pending marker (rc 0) [out: $(printf '%s' "$FL_OUT" | tr '\n' ' ')]"
 if [ -f "$PEND14" ]; then bad "14.10b the pending file survives a SUCCESSFUL flush (a retry would re-post forever)"; else ok "14.10b a successful flush clears the pending file"; fi
 assert_eq "$REC_BEFORE_14B" "$(cat "$F_HOME/.pi/agent/reviews/daniel-ospina-agent-infra-424329.json")" "14.10b the flush does NOT re-record (the verdict and its reviewed_at are untouched)"
-# 14.10f THE RECOVERY PATH'S PRESENCE PREDICATE (agent-infra#3168, fresh-review P1).
-#       post_marker() tested the body with the UNANCHORED `grep -qF`, so a body that
-#       merely CITES the marker mid-line read as "already present": the flush
-#       PATCHed NOTHING, `rm -f`'d the pending file, and the caller printed
-#       "delivered the pending signed marker". That is silent destruction of the
-#       only BODY copy of the signed bytes (since #3168 the flush also posts a durable
-#       comment BEFORE the body PATCH, so a keyed marker survives), reported as success —
-#       reached not just by
-#       --flush-pending but by EVERY later minting run. The predicate must match
-#       the gate's line-anchored `^…$` admission, exactly like the three sites ALREADY
-#       anchored on main (`:4643`, `:4727`, `:4781`). ⛔ ASSERTS THE TRANSPORT (a PATCH was issued),
-#       not the exit code: the destructive mutant also exited 0.
+# 14.10f THE RECOVERY PATH'S PRESENCE PREDICATE — a **MAIN-REGRESSION** pin, not this
+#       diff's fix (#3168 re-review finding 2). The behaviour it protects: a body that
+#       merely CITES the marker mid-line must not read as "already present", because
+#       then the flush PATCHes NOTHING, `rm -f`s the pending file, and the caller prints
+#       "delivered the pending signed marker" — silent destruction of the only BODY copy
+#       of the signed bytes, reported as success, reached not just by --flush-pending but
+#       by EVERY later minting run.
+#       ⛔ WHAT THIS ROW DOES **NOT** PROVE: that this PR anchored `post_marker()`. It did
+#       not. `if command grep -qxF -- "$marker" <<<"$body"` is ALREADY `-qxF` on main
+#       (`git show origin/main:scripts/record-review.sh | sed -n 1939p`), and the diff
+#       hunk at scripts/record-review.sh:1995-2005 only ADDS A COMMENT above it — the
+#       predicate line is CONTEXT. Reverting this PR leaves this vector GREEN; it is kept
+#       because main's anchoring should not silently regress, and it is labelled so the
+#       next reader does not mistake it for evidence about this diff. The predicate must
+#       match the gate's line-anchored `^…$` admission, exactly like the three other
+#       sites already anchored on main (`:1939`, `:3643`, `:5956`, `:6068`).
+#       ⛔ ASSERTS THE TRANSPORT (a PATCH was issued), not the exit code: the destructive
+#       mutant also exited 0.
 if [ -n "${QB_LINE:-}" ]; then
     PEND14F="$F_HOME/.pi/agent/reviews/pending/daniel-ospina__agent-infra-424340.marker"
     printf '%s\n' "$QB_LINE" > "$PEND14F"
@@ -5773,7 +5816,7 @@ if [ -n "${QB_LINE:-}" ]; then
     if grep -qF -- "-X PATCH" "$LOG"; then
         ok "14.10f flush: a body that only CITES the marker still gets the PATCH (anchored predicate)"
     else
-        bad "14.10f flush: a mid-line marker SUPPRESSED the PATCH — the unanchored -qF is back in post_marker()"
+        bad "14.10f flush: a mid-line marker SUPPRESSED the PATCH — a main regression to the unanchored -qF in post_marker()"
     fi
     if command grep -qxF -- "$QB_LINE" <<<"$(jq -r '.body // empty' "$F_CAP" 2>/dev/null)"; then
         ok "14.10f …and the delivered body carries the marker on a line of its OWN (gate-admissible)"
@@ -5787,7 +5830,7 @@ if [ -n "${QB_LINE:-}" ]; then
         ok "14.10f …and the delivered pending file is cleared"
     fi
 else
-    bad "14.10f vector SKIPPED — no seeded marker line; the unanchored-post_marker pin did NOT run"
+    bad "14.10f vector SKIPPED — no seeded marker line; the main-regression post_marker() anchoring pin did NOT run"
 fi
 # 14.10c MUTATION PIN — the exit-5 rule must be load-bearing. With it reverted to
 #       the old `exit 0`, a failed post reads as success again, which is exactly
