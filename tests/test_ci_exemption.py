@@ -2989,23 +2989,42 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # forever. That is the exact asymmetry `is_failure_key`'s own docstring names:
 # "a dropped main-side row makes the PR-side failure look unique, which BLOCKS".
 #
-# MEASURED (tortoise#11365, head 28ea11a4d5ac). `main` was red on all ten
-# `test_entry_point_python_guard.py` ids. `parse_rates` accepted 0 of the 10 rate
-# rows and rejected 10; `VERDICT BLOCK blocked=6` named six of them against a PR
-# whose diff touches none of those files (they are byte-identical to origin/main,
-# and the same ten tests fail on origin/main itself), while the eleven
+# MEASURED (tortoise#11365, head 28ea11a4d5ac). `main`'s rate table carried ten
+# `test_entry_point_python_guard.py` rows — that table is a UNION over 10 runs
+# (five tools × two arms) — and `parse_rates` accepted 0 of the 10 and rejected
+# all 10. `VERDICT BLOCK blocked=6` then named SIX of them against a PR whose
+# diff touches none of those files, while the eleven
 # non-path-parameterized main-reds on the SAME run were correctly EXEMPT. The
 # required `python-ci-gate` then reds, which permanently BLOCKs any PR that
 # touches none of those files.
 #
+# ⛔ SIX ARE NAMED, NOT TEN — do not write "ten tests fail on main". Ten is the
+# RATE-TABLE row count over the union window; the four rows outside the six are
+# carry-over from earlier runs in that window and were not failing on this run.
+# `blocked=6` is the same run's own count of what was actually red. Earlier
+# revisions of this note said "the same ten tests fail on origin/main itself"
+# and cited a `10 failed, 955 passed` worktree run: the second number cannot be
+# this file (521 tests), so the citation was a whole-suite total misread as a
+# per-file one. Deleted rather than reworded.
+#
 # ⛔ NOT the trunk repair. The sentence here used to read that this "deadlocks the
 # very PR that repairs the trunk (tortoise#11262 / tortoise#11255 is the same
-# class)". That is FALSE and was removed after measurement. tortoise#11262 ADDS
-# the missing interpreter guards, so these ten ids PASS on its head and the
-# predicate has nothing to adjudicate: none of its four heads carries a
-# `ci-introduced-failure` or `python-ci-gate` check-run AT ALL, and its only red
-# is `ai-review-gate`. The cost is the inverse of the claim — this defect blocks
-# PRs that never touch those files, while the trunk repair itself is unaffected.
+# class)". That is FALSE and was removed after measurement: NONE of tortoise#11262's
+# four heads (`6c7a15f2a5`, `c8d8c44419`, `b888b9fb33`, `01e8b085ca`) carries a
+# `ci-introduced-failure` or `python-ci-gate` check-run AT ALL — its only red is
+# `ai-review-gate` — so the predicate whose "deadlock" the claim asserted never ran
+# on that PR. The tracked issue #3686 agrees: its table records `#11262 … can land`
+# and names #11217 as the one BLOCKED by this defect. The cost is the INVERSE of
+# the claim — this defect blocks PRs that never touch those files, while #11262 is
+# not blocked by it.
+#
+# ⛔ This note deliberately does NOT say WHICH change landed the corpus guards:
+# #3686's table credits #11262 with "all 3 guards", while #11262's own diff is three
+# files (`tests/test_ci_selection.py`, `tests/test_entry_point_python_guard.py`,
+# `tools/ci_selection.py`) and touches no corpus file, and #11292 is already on
+# main. The two records disagree, so neither claim is restated here — nothing above
+# depends on the answer, and an unverified provenance sentence is exactly the
+# defect this block exists to prevent.
 
 _PATH_PARAM_IDS = (
     "tests/test_entry_point_python_guard.py"
