@@ -597,6 +597,12 @@ HRGM="$(mkhome radius_grant_models "$RG_MJSON")"
 # a CUSTOM gateway: the grant's baseline catalog is empty, so an `api`-less model definition deletes the provider
 RG_CUSTOM_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"https://gw.example/v1","models":[{"id":"ZZDIFF"}]}}}'
 OUT="$(run_gate "$HRGM" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+# ⛔ THESE TWO ASSERT *HRGM*'s RUN, SO THEY MUST PRECEDE ANY BLOCK THAT REASSIGNS `OUT`/`RC` (round 35 review, P2,
+# measured): the `/v1` block below was inserted between this assignment and its assertions, so `3z15y15`/`y16`
+# silently asserted the `/v1` fixture instead and the plain-gateway run was asserted NOWHERE — an arm that reported
+# checking something it no longer checked, which is the exact class this PR is about.
+eqv "${RC:-none}" "0" "3z15y15 a granted provider with a model definition and no api is NOT refused on RADIUS_API_KEY (rc=${RC:-none})"
+has "$OUT" "check=ok var=RADIUS_API_KEY" "3z15y16 …the answer stays the grant's variable"
 # ⛔ AND THE VENDOR STRIPS A TRAILING `/v1` BEFORE IT NORMALIZES (round 35, P1, measured):
 # `configureRadiusProviders` passes `config.baseUrl.replace(/\/v1\/?$/u, "")` (`model-runtime.js:130`), so a gateway
 # written `https://radius.pi.dev/v1` is the DEFAULT one and its baseline catalog applies — measured, `pi -p` reached
@@ -607,8 +613,6 @@ HRGV1="$(mkhome radius_grant_v1 "$RG_V1_JSON")"
 OUT="$(run_gate "$HRGV1" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 eqv "${RC:-none}" "0" "3z15y18 a \`/v1\` gateway spelling is the DEFAULT gateway, so the box is not refused (rc=${RC:-none})"
 hasnt "$OUT" "models-json-provider-dropped" "3z15y19 …and never reported as a deleted provider"
-eqv "${RC:-none}" "0" "3z15y15 a granted provider with a model definition and no api is NOT refused on RADIUS_API_KEY (rc=${RC:-none})"
-has "$OUT" "check=ok var=RADIUS_API_KEY" "3z15y16 …the answer stays the grant's variable"
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
 # fail (measured: the mutant that restored the old order stayed green). The token count is the observable fact.
@@ -1770,20 +1774,25 @@ ck "8S4f …still refused with the provider key EXPORTED, which is the shadowing
 HOOA="$(mkset oauth_live "$ANTH_JSON" ABSENT)"
 printf '{"anthropic":{"type":"oauth","access":"a","refresh":"r"}}\n' > "$HOOA/.pi/agent/auth.json"
 OUT="$(run_gate "$HOOA" KG_PROV=anthropic KG_MODEL=claude-sonnet-4-5)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
-# ⛔ EVERY HANDLER IN THE TABLE NEEDS AT LEAST ONE ARM, OR A DELETED ENTRY IS INVISIBLE (round 35, P3, measured):
-# removing `radius` from `OAUTH_PROVIDERS` left the suite GREEN while inverting polarity — a stored `oauth` entry for
-# `radius` would be refused `auth-store-oauth-unusable` although pi ships that handler (`providers/radius.js:31-34`,
-# measured: pi RAN on a stored oauth entry for `radius`). One arm per id the gate can fixture without a grant.
-for _op in radius openai; do
+# ⛔ THESE TWO ASSERT *HOOA*'s RUN (`anthropic`), SO THEY MUST PRECEDE THE HANDLER LOOP (round 35 review, P2,
+# measured): the loop below was inserted between this assignment and its assertions, so `8S4g`/`8S4h` asserted the
+# loop's LAST iteration (`openai`) instead — `HOOA` was computed and discarded, and the two arms duplicated
+# `8S4i`/`8S4j`. The comment above `HOOA` states this fixture's purpose; without these arms it IS asserted nowhere.
+eqv "${RC:-none}" "0" "8S4g the same oauth shape on a HANDLER provider is not refused (rc=${RC:-<none>})"
+hasnt "$OUT" "auth-store-oauth-unusable" \
+    "8S4h …and never carries the no-handler reason"
+# ⛔ ONE ARM PER ID IN THE TABLE, NOT PER ID THAT HAPPENS TO BE CONVENIENT (round 35 review, P2, measured): this loop
+# covered `radius openai` only, so deleting any of the other SEVEN ids from `OAUTH_PROVIDERS` still left the suite
+# fully green — `remove "xai"` -> 756 passed, 0 FAILED, the same polarity inversion the round-35 fix was FOR. Every id
+# in `OAUTH_PROVIDERS` is now asserted: the eight below need no model, and `anthropic` is covered by `8S4g`/`8S4h`
+# on the pinned `HOOA` fixture above.
+for _op in radius openai github-copilot kimi-coding meta openai-codex openrouter xai; do
   HROP="$(mkset "oauth_$_op" "{\"providers\":{\"$_op\":{\"apiKey\":\"\$KG_CANARY_KEY\"}}}" ABSENT)"
   printf '{"%s":{"type":"oauth","access":"a","refresh":"r"}}\n' "$_op" > "$HROP/.pi/agent/auth.json"
   OUT="$(run_gate "$HROP" KG_PROV="$_op")"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
   eqv "${RC:-none}" "0" "8S4i a stored oauth entry for $_op is not refused \u2014 pi ships that handler (rc=${RC:-none})"
   hasnt "$OUT" "auth-store-oauth-unusable" "8S4j \u2026so the no-handler reason never fires for $_op"
 done
-eqv "${RC:-none}" "0" "8S4g the same oauth shape on a HANDLER provider is not refused (rc=${RC:-<none>})"
-hasnt "$OUT" "auth-store-oauth-unusable" \
-    "8S4h …and never carries the no-handler reason"
 # `key: null` is PRESENT, and pi dies on it before any lookup (measured: `Credential store read failed for
 # <provider>: Cannot read properties of null (reading \x27startsWith\x27)`), so it is store-invalid rather than the
 # key-absent cannot-say.

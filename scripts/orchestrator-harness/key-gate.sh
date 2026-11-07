@@ -1373,14 +1373,42 @@ key_gate_apikind() {
     | sed -n 's/^__KG_ATTR__//p' | head -1
 }
 
+# key_gate_builtin_probe <provider> -> the table answer, AND the READ STATUS: rc 0 = the read COMPLETED and is
+# therefore an ANSWER; rc non-zero = it did not (no python3, a tripped `KEY_GATE_BOUND`, an interpreter error).
+# Empty stdout WITH rc 0 is the ONLY shape that means "pi does not ship this provider".
+# ⛔ THE READ STATUS IS PART OF THE ANSWER (round 35 review, P1, measured). `key_gate_builtin` prints nothing for
+# BOTH "not shipped" and "I could not read the table", and four call sites added in this round read the SAME empty
+# answer as a positive claim and refused 82. Measured: with a `python3` that exits 3 only in `builtin` mode, a
+# shipped `deepseek` pin carrying an `api`-less model flipped `check=ok` -> `REFUSED … is not a provider pi ships`,
+# on BOTH the pin and the lane path — the one polarity this file's header forbids ("a datum we cannot read is not a
+# verdict"; "no python3 … refuses NOTHING"). The vendor prints nothing AND exits 0 only for a provider it does not
+# ship, so the exit status is the discriminator — and reading it here costs no second bounded read.
+key_gate_builtin_probe() {
+  local prov="${1:-}" out rc
+  [ -n "$prov" ] || return 1
+  command -v python3 >/dev/null 2>&1 || return 1
+  out="$(key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" /dev/null builtin "$prov" 2>/dev/null)"; rc=$?
+  # stdout is BYTE-IDENTICAL to the pre-diff function (nothing printed when the table said nothing), so every
+  # pre-existing caller is untouched by this split.
+  [ -n "$out" ] && printf '%s\n' "$out"
+  return "$rc"
+}
+
 # key_gate_builtin <provider> -> `certain:VAR[,VAR...]` | `uncertain:VAR` + `why:` | `noenv:VAR` + `why:` |
-# (nothing = pi does not ship this provider at all)
+# (nothing = pi does not ship this provider, OR the read failed — ask `key_gate_builtin_unshipped` which)
 # pi's OWN table (`dist/env-api-keys.js`), so this is the vendor's answer and not this gate's guess.
+# Every pre-existing caller treats an empty answer as CANNOT-SAY, which stays correct for both shapes.
 key_gate_builtin() {
-  local prov="${1:-}"
-  [ -n "$prov" ] || return 0
-  command -v python3 >/dev/null 2>&1 || return 0
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" /dev/null builtin "$prov" 2>/dev/null
+  key_gate_builtin_probe "${1:-}"
+}
+
+# key_gate_builtin_unshipped <provider> -> rc 0 IFF the read COMPLETED and pi's table has NO entry for it.
+# This is the predicate for "the answer is a REFUSAL": a failed read must keep the pre-existing `warn`, never
+# refuse. Refusing on an unread datum is the false block this file's header forbids.
+key_gate_builtin_unshipped() {
+  local out
+  out="$(key_gate_builtin_probe "${1:-}")" || return 1
+  [ -z "$out" ]
 }
 
 # key_gate_compose <home> <provider> <model> [<cwd>] -> the reason pi's COMPOSER rejects this provider's
@@ -1891,12 +1919,15 @@ key_gate_box_default_assert() {
   # entirely, so `--probe --box-default` printed `check=ok var=MYV` for a `myprov` pin whose bare `pi -p` answers
   # `Error: Unknown provider "myprov".` (a DELETED provider) or `No API key found for the selected model.` A provider pi
   # does not ship has no base to compose from, so the model definition takes it with it.
-  if [ -n "$drop" ] && [ -z "$(key_gate_builtin "$prov")" ] && [ "$drop" != "oauth-no-baseurl" ] && [ "$quiet" != 1 ]; then
+  # ⛔ A PROVIDER pi DOES NOT SHIP, which is a fact about the FILE — but ONLY when the table read COMPLETED (round 35
+  # review, P1, measured): `key_gate_builtin` is empty for an unread table too, and refusing on that turned a healthy
+  # box into `REFUSED … is not a provider pi ships` with a remedy that was not the reason it fired.
+  if [ -n "$drop" ] && key_gate_builtin_unshipped "$prov" && [ "$drop" != "oauth-no-baseurl" ] && [ "$quiet" != 1 ]; then
     printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s box_default=%s provider=%s settings_json=%s - `%s` is not a provider pi ships, so the composer has no base model to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s"`, and a bare `pi -p` on this pin answers `No API key found for the selected model.` No credential answers that; give the model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
       "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov" "$dm" "$prov"
     return "$KEY_GATE_REFUSED"
   fi
-  if [ "$drop" = "oauth-no-baseurl" ] && [ -z "$(key_gate_builtin "$prov")" ] && [ "$quiet" != 1 ]; then
+  if [ "$drop" = "oauth-no-baseurl" ] && key_gate_builtin_unshipped "$prov" && [ "$quiet" != 1 ]; then
     printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=oauth-no-baseurl model=%s box_default=%s provider=%s settings_json=%s - this provider sets `oauth` with no `baseUrl`, which makes the pi composer THROW, and `%s` is not a provider pi ships, so there is no built-in base to fall back on: `recomposeProvider` DELETES the provider (measured: `Error: Unknown provider "%s"`). Add a `baseUrl` to the provider body or drop it (agent-infra#3443)\n' \
       "$label" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov"
     return "$KEY_GATE_REFUSED"
@@ -2176,7 +2207,7 @@ key_gate_assert_main() {
   # `check=skipped reason=cannot-resolve-provider-credential` ("a provisioning detail") on a box where `pi -p`
   # prints `No API key found for deepseek.` and exits. Measured: `models.json` = `{}`, `auth.json` =
   # `{"deepseek":{"key":"sk-legacy-no-type"}}`, DEEPSEEK_API_KEY exported -> gate skipped, pi died.
-  local store_rc=1 grant="" drop="" discarded=0 warn_drop=0 drop_why="" bkind=""
+  local store_rc=1 grant="" drop="" discarded=0 warn_drop=0 drop_why="" bkind="" bkind_rc=1
   # ⛔ THE RADIUS GRANT CHANGES THE CREDENTIAL QUESTION, SO IT IS READ BEFORE THE STORE (round 33, P1, measured): a
   # models.json provider with `oauth: "radius"` + a `baseUrl` is REPLACED by the gateway provider, whose auth is
   # `envApiKeyAuth(["RADIUS_API_KEY"])`, so `$DEEPSEEK_API_KEY` is neither what pi resolves nor proof that it runs.
@@ -2222,7 +2253,7 @@ key_gate_assert_main() {
   # \u26d4 AND `oauth` WITHOUT A `baseUrl` DELETES AN UNSHIPPED PROVIDER TOO (round 35, P1, measured): the composer throws on
   # that shape, and with no built-in base to fall back on the provider is gone \u2014 measured `Error: Unknown provider` \u2014 so
   # the cannot-say the shipped-provider half earns is a false answer here.
-  if [ "$drop" = "oauth-no-baseurl" ] && [ -z "$(key_gate_builtin "$KEY_GATE_PROVIDER")" ]; then
+  if [ "$drop" = "oauth-no-baseurl" ] && key_gate_builtin_unshipped "$KEY_GATE_PROVIDER"; then
     KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
     KEY_GATE_REASON="models-json-provider-dropped"
     printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=oauth-no-baseurl model=%s provider=%s var=%s models_json=%s - this provider sets `oauth` with no `baseUrl`, which makes the pi composer THROW, and `%s` is not a provider pi ships, so there is no built-in base to fall back on: `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s` answers `Error: Unknown provider "%s".` No credential answers that; add a `baseUrl` to the provider body (and an `api`/`baseUrl` to each model) or drop the provider (agent-infra#3443)\n' \
@@ -2485,7 +2516,9 @@ key_gate_assert_main() {
       # answers `Unknown provider "deepseek"`). The `:oauth` suffix on the reason says the base is gone, and it is
       # warned about unconditionally. And `known:` (a vendor provider with no env-var entry, `amazon-bedrock`) is a
       # provider pi ships, so its model IS composed and it must not be reported as dropped.
-      bkind="$(key_gate_builtin "$KEY_GATE_PROVIDER")"
+      # ⛔ the read STATUS comes with the token (round 35 review, P1): `bkind` is empty both when pi does not ship this
+      # provider AND when the table could not be read, and only the FIRST of those is a refusal.
+      bkind="$(key_gate_builtin_probe "$KEY_GATE_PROVIDER")"; bkind_rc=$?
       # the field-level diagnosis, shared by the warn and the refusal
       case "$drop" in
         no-api:*) drop_why='a model definition here declares neither `api` nor `baseUrl`, and the provider body declares neither either' ;;
@@ -2498,14 +2531,22 @@ key_gate_assert_main() {
         # base to compose from, so `recomposeProvider` DELETES it. Measured on a `myprov` fixture: `pi -p --provider
         # myprov --model m1` answers `Error: Unknown provider "myprov".` while this gate printed the warning and then
         # `check=ok var=MYV`. No credential can rescue that box, so the answer is a refusal about the FILE.
-        *) if [ -z "$bkind" ]; then
+        # ⛔ REFUSE ONLY ON A COMPLETED READ THAT SAID "NOT SHIPPED" (round 35 review, P1, measured): the round-35 fix
+        # read the same empty `bkind` an unreadable table produces as a positive claim, so a box that is healthy was
+        # refused 82 with a remedy that was not why it fired. `bkind_rc` separates the two; an unread table falls
+        # through to the pre-existing `warn` below.
+        *) if [ "$bkind_rc" -eq 0 ] && [ -z "$bkind" ]; then
              KEY_GATE_VAR="${KEY_GATE_VAR:-<none>}"
              KEY_GATE_REASON="models-json-provider-dropped"
+             # ⛔ THE 11th ARGUMENT (round 35 review, P2, measured): the format has 11 `%s` and this list had 10, with
+             # `drop_why` in the provider slot — it rendered "`<clause>` is not a provider pi ships, myprov", a
+             # `--provider`/`--model` pair swapped, and `Unknown provider ""`. The sibling pin-path message carries
+             # the same sentence in the right order.
              printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s provider=%s var=%s models_json=%s - `%s` is not a provider pi ships, %s, so there is no base model for the composer to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s".` NO credential can rescue it, so no environment variable is the question. Give this model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
-               "$label" "$drop" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$drop_why" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER"
+               "$label" "$drop" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER" "$drop_why" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER"
              return "$KEY_GATE_REFUSED"
            fi
-           warn_drop=0 ;;
+           if [ -z "$bkind" ]; then warn_drop=1; else warn_drop=0; fi ;;
       esac
       if [ "$warn_drop" = "1" ]; then
         printf '[key-gate] %s check=warn reason=models-json-provider-dropped why=%s provider=%s model=%s var=%s models_json=%s — %s, which makes the pi composer THROW; when the provider is not one pi ships that DELETES the provider (measured: `pi -p --provider <custom> --model <id>` -> `Unknown provider`), so this credential assertion names a variable pi may never consult — check `pi --list-models`. A provider pi ships composes both from its own model instead, EXCEPT when `oauth` is set: pi then swaps the built-in catalog for a gateway provider whose models arrive only after a refresh, so the same throw deletes the config there too (measured: `Unknown provider "deepseek"`)\n' \
