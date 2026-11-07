@@ -880,10 +880,25 @@ def read_oldest_queued_age_s(repo: str) -> float | None:
     function used to send that pair and read row 0 as "the oldest" — which was the NEWEST run on a
     queue still receiving work, i.e. an age near 0 on exactly the starved shape #2875 reported, and
     therefore `starvation="ok"` and exit 0. That is the one direction this bound cannot afford, so
-    the head is derived the way `scripts/ci_runner_gate.sh` derives it (#2904): read a FULL page and
+    the head is derived the way `scripts/ci_runner_gate.sh` derived it at #2904: read a FULL page and
     take `min(created_at)`. A page that cannot hold the whole queue yields only a LOWER BOUND on the
     head age, so it is REFUSED by name rather than certified — same verdict, `Unmeasurable`, as every
     other operand that could not be read.
+
+    ⛔ ⚠️ THE GATE NO LONGER DERIVES IT THIS WAY, AND THIS READ STILL DOES (agent-infra#2344). As of
+    that change the gate takes its head from the OLDEST RUN THAT HAS A JOB IN `queued` status, not
+    from `min(created_at)` over every run GitHub reports as queued: a run whose jobs were never
+    created sits in `status=queued` FOREVER (it cannot be cancelled — 409 — or deleted), and three
+    such records on `daniel-ospina/agent-infra` (created 2026-10-07, zero jobs, still queued 30 days
+    later) made the run-level age 2,612,687 s on a repo whose real demand was hours old. The `--jq`
+    below is still that run-level reading (`[.workflow_runs[].created_at]|min`), so on such a repo THIS
+    function returns the ghost's age and `starvation_eligible`'s age term (`>= STARVATION_QUEUE_AGE_S`)
+    fires on it. That is a KNOWN,
+    RECORDED residual of #2344 — deliberately not fixed here rather than fixed twice, because a second
+    hand-rolled copy of the predicate is exactly the drift this repo keeps paying for; the fix belongs
+    with the decision about who owns the queue-head derivation (this cell-side reader, or the gate's
+    verdict surface). Until then the sentence above is corrected rather than left to claim a
+    derivation this file no longer shares.
 
     ⛔ THAT REFUSAL IS DEFENSIVE, AND ITS RATIONALE IS STATED RATHER THAN IMPLIED (round-13 review,
     2nd round). The age read is only taken when the DEPTH term has not already decided, i.e. when
@@ -3784,8 +3799,11 @@ def converge(
     elif live > ceil:
         record["verdict"] = "over-ceiling"
         record["notes"].append(
-            f"over-ceiling: {live} live against a measured ceiling of {ceil} — {reading}; nothing "
-            "removed (a runner that may be serving is never removed)"
+            f"over-ceiling: {live} live against a measured ceiling of {ceil} "
+            f"(surplus={live - ceil}) — {reading}; nothing removed (a runner that may be serving is "
+            "never removed), and NOTHING HERE CAN REMOVE IT: this verdict is report-only, so the "
+            "box stays above its ceiling until a human drains the surplus — see "
+            "docs/ops/fleet-capacity.md §8.1"
         )
     elif live >= target and record["actions"]:
         record["verdict"] = "converged"

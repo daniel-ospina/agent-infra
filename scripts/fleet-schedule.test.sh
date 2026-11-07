@@ -1217,6 +1217,57 @@ kill -0 "$bystander" 2>/dev/null \
   || bad "--stop did not record the OFF decision"
 kill "$bystander" 2>/dev/null
 
+# ── 13c. an OUT-OF-RANGE pid in loop.pid must not wedge every verb ─────────────────────────────
+# `loop_pid()` parses `int(...)` and hands the result to `pid_alive()`, which caught only
+# `OSError`. `os.kill(10 ** 400, 0)` raises `OverflowError` — an `ArithmeticError`, NOT an
+# `OSError` — so it escaped BOTH recovery callers: `loop_pid()` (used by --status/--verify/--stop/
+# --start/--install/--loop, i.e. every recovery command) and `acquire_lock()`'s probe (which then
+# raises instead of stealing a dead lock, so that job never runs again on any pass). The pidfile
+# is written by a foreign writer / restored state dir / hand-edit — the same producer this file's
+# own comments name for the 0-byte and short-write arms. Measured on the pre-fix tree:
+# `FAIL: --start: OverflowError: Python int too large to convert to C long`, i.e. the cell's only
+# scheduler could never come back.
+case_ "13c. an out-of-range pid in loop.pid is not a live loop and cannot wedge every verb"
+# The PREMISE, asserted rather than assumed: this is the exact exception class the fix is for.
+# Without it the case below could pass for an unrelated reason on some other interpreter.
+premise="$(python3 - <<'PYRANGE'
+import os, sys
+try:
+    os.kill(10 ** 400, 0)
+except OverflowError:
+    print("OverflowError" if not issubclass(OverflowError, OSError) else "WRONG-CLASS")
+except Exception as exc:
+    print(type(exc).__name__)
+PYRANGE
+)"
+[ "$premise" = "OverflowError" ] \
+  && ok "13c premise: an out-of-range pid raises OverflowError, which is NOT an OSError" \
+  || bad "13c premise is wrong on this interpreter (got '$premise') — the case below proves nothing"
+state_reset "$GOOD"
+printf '%s\n' "1000000000000000000000000000000000000000000" > "$FLEET_SCHEDULE_STATE/loop.pid"
+out="$(run "$GOOD" --status)"; rc=$?
+case "$out" in
+  *Traceback*|*OverflowError*) bad "--status died on a corrupt pidfile: $out" ;;
+  *) ok "--status survives an out-of-range pid in loop.pid" ;;
+esac
+out="$(run "$GOOD" --verify)"; rc=$?
+case "$out" in
+  *Traceback*|*OverflowError*) bad "--verify died on a corrupt pidfile: $out" ;;
+  *) ok "--verify survives an out-of-range pid in loop.pid" ;;
+esac
+# …and the recovery that matters: the loop must still be STARTABLE. A verb that merely avoids the
+# traceback but cannot bring the scheduler up leaves the cell just as dead.
+out="$(run "$GOOD" --start)"; rc=$?
+[ "$rc" -eq 0 ] && ok "--start brings the loop up over an out-of-range pid (rc=0)" \
+  || bad "--start could not recover from an out-of-range pid (rc=$rc): $out"
+newpid13c="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$newpid13c" ] && [ "$newpid13c" != "1000000000000000000000000000000000000000000" ] \
+  && ok "loop.pid was rewritten to a REAL pid (the corrupt value did not survive)" \
+  || bad "loop.pid still holds the out-of-range value ($newpid13c)"
+kill -0 "$newpid13c" 2>/dev/null && ok "the loop it started is alive" \
+  || bad "--start claimed a loop that is not alive"
+run "$GOOD" --stop >/dev/null 2>&1
+
 # ── 14. --install must not race the loop's first tick ──────────────────────────────────────
 case_ "14. --install verifies a HEALTHY install whose loop is still in its first pass"
 RACE="$FIX/race"; mkdir -p "$RACE"; cp "$GOOD/RETIRED" "$RACE/RETIRED"
@@ -1326,6 +1377,56 @@ out="$(run_v15 1800)"; rc=$?
   || bad "a marker dated years ahead excused the stale tick (rc=$rc): $out"
 grep -q 'BUSY' <<<"$out" && bad "a future-dated marker was reported as a running job: $out" \
   || ok "no future-dated marker is reported as a running job"
+# ⛔ A NON-FINITE START IS NOT AN EXEMPTION EITHER — AND THIS ONE WAS A FALSE PASS (cycle-5 review,
+# P1). EVERY comparison against NaN is False, so `started=NaN` walked through BOTH guards above
+# (`nan <= 0` did not drop it, `nan > now + slack` did not drop it) and through the clamp, because
+# `min(deadline, nan + …)` returns `deadline` when `nan < deadline` is False. The marker's own
+# SELF-DECLARED deadline therefore survived unclamped, the marker read as LIVE, and `--verify`
+# certified a WEDGED loop `SCHEDULE VERIFIED` rc=0 — exactly the unbounded exemption the two guards
+# above say cannot exist. `json.load` parses `NaN`, and the reachable inputs are the ones this file
+# already names: hand-edit, foreign writer, restored state dir. Dropping it fails CLOSED.
+python3 - "$FLEET_SCHEDULE_STATE" <<'PYNAN'
+import json, os, sys, time
+state = sys.argv[1]
+os.makedirs(os.path.join(state, "busy"), exist_ok=True)
+now = time.time()
+# `deadline` is self-declared and huge; without the finite gate it survives the clamp untouched.
+json.dump({"label": "com.test.echo", "started": float("nan"),
+           "deadline": now + 10 ** 12}, open(os.path.join(state, "busy", "com.test.echo.json"), "w"))
+PYNAN
+out="$(run_v15 1800)"; rc=$?
+[ "$rc" -eq 1 ] && ok "a NaN start is dropped, not an unbounded exemption (rc=1)" \
+  || bad "a NaN start excused the stale tick — --verify certified a wedged loop (rc=$rc): $out"
+grep -q 'BUSY' <<<"$out" && bad "a NaN-started marker was reported as a running job: $out" \
+  || ok "no NaN-started marker is reported as a running job"
+# ⛔ AND A BIG-INT DEADLINE MUST NOT RAISE OUT OF --verify (cycle-5 review, P1). `json.load` returns
+# an arbitrary-precision int for an integer literal, so a marker holding `10**400` made
+# `float(entry["deadline"])` raise OverflowError — an ArithmeticError, NOT a ValueError, so the
+# marker-parsing except tuple did not cover it. It aborted the check for every job after the broken
+# marker instead of naming it: verbatim the defect `_finite` was added for on the stamp arm.
+python3 - "$FLEET_SCHEDULE_STATE" <<'PYBIG'
+import json, os, sys, time
+state = sys.argv[1]
+os.makedirs(os.path.join(state, "busy"), exist_ok=True)
+now = time.time()
+json.dump({"label": "com.test.echo", "started": now - 60, "deadline": 10 ** 400},
+          open(os.path.join(state, "busy", "com.test.echo.json"), "w"))
+PYBIG
+out="$(run_v15 1800)"; rc=$?
+# ⛔ rc ALONE DOES NOT DISCRIMINATE HERE (cycle-6 review, P2). `main()`'s blanket
+# `except Exception` turns the uncaught OverflowError into exit 1 TOO, so a bare `rc -eq 1`
+# passed on the pre-fix tree while `--verify` was dying on a traceback rather than naming the
+# dropped marker. Measured: reverted, this arm read ✅ while its sibling traceback arm read ❌.
+# The stale-tick message is the positive control — it is only reachable if the marker was
+# DROPPED and the tick then read stale, which is the whole point of the fix.
+if [ "$rc" -eq 1 ] && grep -q 'stale after' <<<"$out"; then
+  ok "a big-int busy deadline is dropped (named stale tick), not raised out of --verify"
+else
+  bad "a big-int deadline did not fail closed as a stale tick (rc=$rc): $out"
+fi
+case "$out" in *OverflowError*|*Traceback*) bad "a big-int deadline RAISED out of --verify: $out" ;; *) ok "…and it did not raise a traceback out of the verifier" ;; esac
+grep -q 'BUSY' <<<"$out" && bad "a big-int-deadline marker was reported as a running job: $out" \
+  || ok "no big-int-deadline marker is reported as a running job"
 kill "$fakepid" 2>/dev/null
 
 # ── 16. an annual (multi-entry) calendar must keep a NEXT occurrence ───────────────────────
@@ -1382,6 +1483,496 @@ out="$(cd / && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
 grep -q 'Traceback' <<<"$out" && bad "--stop raised a traceback: $out" || ok "no traceback"
 [ -f "$NOSSTATE/OFF" ] && ok "the OFF switch was created (the decision is recorded)" \
   || bad "no OFF switch was written"
+
+# ── 18. a failed bookkeeping write costs a TICK, never the loop ─────────────────────────────
+# The defect (measured 2026-11-03 on a cmux cell): `mark_tick()` hit ENOSPC on a full disk, the
+# OSError escaped `while True`, and the cell's ONLY scheduler was dead for 3.6 days — taking
+# `eldato-disk-reaper` with it, i.e. the very job that would have freed the space that killed it.
+# A closed feedback loop. `log()` had the same hole from the other side: its file append is
+# guarded but it ends in `print(line, flush=True)`, and when the loop's stdout IS loop.log that
+# print IS the write — so a failure to report the failure was fatal, and the cell's last words
+# were a truncated `OSError: [Errno 28] No space left o`.
+# Both cases drive the SHIPPED code and FAIL if either guard is removed (mutation-tested).
+case_ "18. a failed bookkeeping write costs one tick, never the process"
+
+# 18a — `mark_tick()` cannot write. A DIRECTORY at the tick path raises IsADirectoryError, an
+# OSError of the same family as ENOSPC, hermetically (no full filesystem needed).
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1
+pid="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+before="$(wc -c < "$MARK" 2>/dev/null || echo 0)"
+rm -f "$FLEET_SCHEDULE_STATE/tick"; mkdir -p "$FLEET_SCHEDULE_STATE/tick"
+sleep 12   # > 2 ticks at FLEET_SCHEDULE_TICK=5
+kill -0 "$pid" 2>/dev/null && ok "the loop SURVIVED a failed tick write" \
+  || bad "the loop DIED on a failed bookkeeping write — the cell scheduler is gone"
+after="$(wc -c < "$MARK" 2>/dev/null || echo 0)"
+[ "$after" -gt "$before" ] && ok "it kept running jobs after the failure (the pass continued past the guard)" \
+  || bad "no job ran after the bookkeeping failure — the whole pass was abandoned"
+grep -q 'bookkeeping write failed' "$FLEET_SCHEDULE_STATE/loop.log" 2>/dev/null \
+  && ok "the failure was REPORTED (silence would hide a broken tick)" \
+  || bad "the failure was not reported — an operator would see nothing wrong"
+run "$GOOD" --stop >/dev/null 2>&1; rmdir "$FLEET_SCHEDULE_STATE/tick" 2>/dev/null
+
+# 18b — the report itself cannot be written: writing to our own stdout raises ENOSPC, exactly as
+# it did on the cell. `log()` must swallow it and the caller must keep going.
+# ⚠️ HERMETIC ON PURPOSE. The first version redirected stdout to /dev/full, which exists on Linux
+# and NOT on macOS/BSD — this suite is explicitly run on the Mac (it guards /proc and drives the
+# Darwin branch), so that version reported a permanent false FAIL there blaming `log()` for a
+# missing device node, whose tempting "fix" is to delete the guard under test. An object whose
+# write() raises ENOSPC is the same condition on every platform.
+out18b="$(python3 - "$SCHED" "$T/state18b" <<'PY' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+
+
+class EnospcStdout:
+    """stdout whose every write fails the way a full disk fails."""
+    def write(self, _s):
+        raise OSError(28, "No space left on device")
+    def flush(self):
+        raise OSError(28, "No space left on device")
+
+
+_real_stdout = sys.stdout
+sys.stdout = EnospcStdout()
+try:
+    m.log("hello")      # the print() at the end of log() raises ENOSPC — it must be swallowed
+finally:
+    # Restore it, or the CPython shutdown flush of the fake stdout adds an ignored exception and
+    # a "Traceback" line that this case would then mistake for log() having raised.
+    # ⛔ NO APOSTROPHE IN THIS BODY, and none in any here-doc body nested in a command substitution:
+    # bash 3.2 (macOS) scans such a body as CODE, so an unbalanced quote opens single-quote mode
+    # and desynchronises the parse for the REST of the file — reported far below the defect
+    # (#2930, #2248). scripts/check-bash32-parse.sh is the gate that measures this.
+    sys.stdout = _real_stdout
+sys.stderr.write("SURVIVED\n")
+PY
+)"; rc18b=$?
+# Control reaching the line AFTER log(), with no traceback, is the oracle: rc is NOT usable here
+# (an un-flushable stdout makes CPython exit 120 at shutdown whatever the caller did).
+if [ "$rc18b" -eq 0 ] && grep -q 'SURVIVED' <<<"$out18b" \
+   && [ "$(grep -c 'Traceback' <<<"$out18b")" -eq 0 ]; then
+  ok "log() survived an ENOSPC on its own print (a logging failure is not a process failure)"
+else
+  bad "log() raised on an ENOSPC write and took the caller with it (rc=$rc18b): $out18b"
+fi
+
+# 18d — a logging failure of a NON-OSError kind. `print()` raises UnicodeEncodeError (a ValueError)
+# when the stdout encoding cannot represent the message, and EVERY loop message contains an em dash.
+# Measured with PYTHONIOENCODING=ascii on the guard-narrowed file: both the OFF-switch log line and
+# the new reporter died with a traceback — i.e. the guard added to keep the loop alive was what
+# killed it. An undecodable stdout must cost the line, not the process.
+out18d="$(PYTHONIOENCODING=ascii python3 - "$SCHED" "$T/state18d" <<'PY18D' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+m.log("hello — em dash")                       # UnicodeEncodeError from print()
+m.report_bookkeeping_failure(OSError(28, "No space left on device"))
+sys.stderr.write("SURVIVED\n")
+PY18D
+)"; rc18d=$?
+if [ "$rc18d" -eq 0 ] && grep -q 'SURVIVED' <<<"$out18d" \
+   && [ "$(grep -c 'Traceback' <<<"$out18d")" -eq 0 ]; then
+  ok "an ASCII/undecodable stdout cost the line, not the process (log and report survived)"
+else
+  bad "log()/report raised UnicodeEncodeError and took the caller with it (rc=$rc18d): $out18d"
+fi
+
+# 18e — the report is emitted EXACTLY ONCE. `spawn_loop` merges stderr into stdout, so a reporter
+# that writes to both surfaces doubles every line in the one file an operator reads (~2/ TICK on a
+# persistently broken tick). `_stderr_is_stdout` is the gate; this pins it by COUNT, which the
+# original `grep -q` (presence) could never do — a mutation test showed deleting the gate left the
+# suite green while producing two lines per failure.
+out18e="$(python3 - "$SCHED" "$T/state18e" <<'PY18E' 2>&1
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE = sys.argv[2]
+m.report_bookkeeping_failure(OSError(28, "No space left on device"))
+PY18E
+)"; n18e="$(grep -c 'bookkeeping write failed' <<<"$out18e" || true)"
+[ "${n18e:-0}" -eq 1 ] && ok "the failure was reported exactly ONCE (stderr and stdout merged)" \
+  || bad "the failure was reported ${n18e:-0}x, not once — a duplicate in every merged log: $out18e"
+
+# 18f — a job whose STAMP WRITE FAILS must not be wedged. `write_stamp` sits in run_job's `finally`,
+# which is the ONLY place the lock and busy marker are released: unguarded, an ENOSPC there aborted
+# the block, the lock survived holding the LOOP'S OWN live pid, `acquire_lock` then answered "already
+# running" for ever, and the job never ran again — the same closed feedback loop this change exists
+# to open, with a healthier-looking log line. Measured on the pre-fix file: the marker froze for 80s+
+# after the disk recovered and --verify returned SCHEDULE VERIFIED over a job that never runs.
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1
+pidf="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+state_reset_jobs="$FLEET_SCHEDULE_STATE/jobs"
+if [ "$(id -u)" -eq 0 ]; then
+  skip "running as root — a 500 jobs dir blocks nothing, so the stamp-write arm cannot run here"
+else
+  chmod 500 "$state_reset_jobs" 2>/dev/null || true
+  sleep 8            # at least one tick where a due job runs and its stamp write fails
+  chmod 755 "$state_reset_jobs" 2>/dev/null || true
+  beforef=0; [ -f "$MARK" ] && beforef="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+  sleep 10           # the window in which a wedged job stays frozen
+  afterf=0; [ -f "$MARK" ] && afterf="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+  [ "${afterf:-0}" -gt "${beforef:-0}" ] \
+    && ok "a failed STAMP write did not wedge the job (it kept running after the disk recovered)" \
+    || bad "the job was WEDGED by a failed stamp write ($beforef -> $afterf runs) — the lock outlived the failure"
+fi
+kill -0 "$pidf" 2>/dev/null && ok "the loop survived the failed stamp write" \
+  || bad "the loop died on a failed stamp write"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18g — --verify/--status must NAME unusable stamp/calendar values, not raise. They are the
+# surfaces whose whole job is to DIAGNOSE bad state, and they used to traceback (aborting the check
+# for every job after the broken one) on: a stamp that is not an object, a `started` that is not a
+# finite number, and a calendar value that is not a number.
+# ⚠️ No `rc -eq 1` assertion here: `--verify` fails for many reasons, so that arm could never fail
+# (a mutation test showed it stayed green with the guard removed). The oracle is the absence of a
+# traceback plus a message that NAMES the broken job — both of which disappear with the guard.
+state_reset "$GOOD"
+run "$GOOD" --install >/dev/null 2>&1
+badstamp() { # badstamp <label> <json> <needle>
+  printf '%s\n' "$2" > "$FLEET_SCHEDULE_STATE/jobs/$1.json"
+  local out rc
+  out="$(run "$GOOD" --verify)"; rc=$?
+  if [ "$(grep -c 'Traceback' <<<"$out")" -eq 0 ] && grep -q "$3" <<<"$out"; then
+    ok "--verify names a $3 instead of raising"
+  else
+    bad "--verify did not diagnose '$3' (rc=$rc): $out"
+  fi
+  rm -f "$FLEET_SCHEDULE_STATE/jobs/$1.json"
+}
+badstamp com.test.hourly '[1, 2, 3]' "not a job record"
+badstamp com.test.hourly '{"label": "com.test.hourly", "started": NaN, "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+badstamp com.test.hourly '{"label": "com.test.hourly", "started": 1e999, "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+# ⛔ A BIG-ENOUGH INT IS STILL AN int, and `math.isfinite` RAISES OverflowError on it. So the guard
+# that exists to NAME an unusable `started` was itself a re-raiser for this one value class: a stamp
+# holding `10**400` tracebacked out of `--verify`, aborting the check for every job after it — the
+# defect the guard replaced, one class over (#3340, found by fresh-context review).
+python3 -c 'import json,sys; json.dump({"label":"com.test.hourly","started":10**400,"finished":1,"rc":0,"duration":0}, open(sys.argv[1],"w"))' \
+  "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+out_big="$(run "$GOOD" --verify)"; rc_big=$?
+if [ "$(grep -c 'Traceback' <<<"$out_big")" -eq 0 ] \
+   && grep -q "no usable 'started' value" <<<"$out_big"; then
+  ok "18g --verify NAMES a 10**400 started instead of raising out of math.isfinite"
+else
+  bad "18g --verify raised on a big-int started (rc=$rc_big): $(head -3 <<<"$out_big")"
+fi
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+badstamp com.test.hourly '{"label": "com.test.hourly", "started": "yesterday", "finished": 1, "rc": 0, "duration": 0}' "no usable 'started' value"
+# NaN must not read as "live": every comparison against NaN is False, so an unguarded type check
+# certified it SCHEDULE VERIFIED (rc=0) with zero runs and an empty log — the closed loop again.
+printf '{"label": "com.test.hourly", "started": NaN, "finished": 1, "rc": 0, "duration": 0}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+out_nan="$(run "$GOOD" --verify)"; rc_nan=$?
+[ "$rc_nan" -eq 1 ] && ok "a NaN started FAILS --verify (it is never due, and never runs)" \
+  || bad "a NaN started was certified healthy (rc=$rc_nan): $out_nan"
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+
+# A calendar value that is not a number: load_jobs validates a calendar's SHAPE, not its values.
+BAD_CAL="$FIX/badcal"; mkdir -p "$BAD_CAL"; cp "$GOOD/RETIRED" "$BAD_CAL/RETIRED" 2>/dev/null || true
+cat > "$T/badcal.spec" <<PL
+PLIST = {
+    "Label": "com.test.badcal",
+    "ProgramArguments": ["/bin/sh", "-c", "true"],
+    "StartCalendarInterval": {"Hour": "noon", "Minute": 0},
+}
+PL
+mkplist "$BAD_CAL" com.test.badcal "$T/badcal.spec"
+mkdir -p "$FLEET_SCHEDULE_STATE/jobs"
+printf '{"label": "com.test.badcal", "started": 1, "finished": 2, "rc": 0, "duration": 1}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.badcal.json"
+out_cal="$(TEMPLATES_DIR="$BAD_CAL" python3 "$SCHED" --verify 2>&1)"; rc_cal=$?
+if [ "$(grep -c 'Traceback' <<<"$out_cal")" -eq 0 ] \
+   && grep -qE "unusable value|unusable calendar|calendar has an unusable" <<<"$out_cal"; then
+  ok "--verify names a non-numeric calendar value instead of raising"
+else
+  bad "--verify raised on a non-numeric calendar value (rc=$rc_cal): $out_cal"
+fi
+out_stat="$(TEMPLATES_DIR="$BAD_CAL" python3 "$SCHED" --status 2>&1)"
+if [ "$(grep -c 'Traceback' <<<"$out_stat")" -eq 0 ] && grep -q 'com.test.badcal' <<<"$out_stat"; then
+  ok "--status still prints a row for a job with a non-numeric calendar value"
+else
+  bad "--status tracebacked or dropped the row: $out_stat"
+fi
+rm -rf "$BAD_CAL"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18c — the OTHER two ways a pass can fail escape the loop, both found by fresh-context review and
+# both measured to kill the shipped pre-fix loop (rc=1, every job on the box stopped for good):
+#   (a) load_jobs() reads UNTRUSTED plists: a templates dir that passes `isdir` and then fails
+#       (EACCES/EIO/EMFILE/ESTALE) raised PermissionError out of the old `except ScheduleError`,
+#       and a plist whose ROOT is an array raises AttributeError.
+#   (b) a stamp a hand-edit or foreign writer left malformed ({"started": "yesterday"}) reaches
+#       `float(last)` inside is_due and raises ValueError.
+# The two arms are measured SEPARATELY and in this order, because they interact: while the
+# templates dir is unreadable the loop deliberately keeps the PREVIOUS job set, so a job declared
+# during that window is not in it and cannot be used to prove anything about the pass.
+state_reset "$GOOD"
+rm -f "$MARK" "$MARK.after"
+cat > "$T/zzzafter.spec" <<PL
+PLIST = {
+    "Label": "com.test.zzzafter",
+    "ProgramArguments": ["/bin/sh", "-c", "echo after >> '$MARK.after'"],
+    "StartInterval": 2,
+}
+PL
+# A job that sorts AFTER com.test.hourly: without it this case proves only that SOME job ran, and a
+# mutation test showed that is not the invariant (com.test.echo sorts FIRST, so it wrote the marker
+# even while the rest of the set was abandoned).
+mkplist "$GOOD" com.test.zzzafter "$T/zzzafter.spec"
+run "$GOOD" --install >/dev/null 2>&1
+pidc="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+
+# ── arm (a): the templates dir cannot be read ────────────────────────────────────────────────
+if [ "$(id -u)" -eq 0 ]; then
+  # ⛔ The ASSERTION is inside the skip too. An earlier version skipped only the chmod, so under
+  # root it printed ✅ over a directory that was never made unreadable — and a mutation test showed
+  # the load_jobs guard could be reverted with the suite fully green. A vacuous ✅ is worse than a
+  # missing case: it is the false PASS this whole suite exists to prevent.
+  skip "running as root — chmod 000 blocks nothing, so arm (a) cannot be exercised here"
+else
+  chmod 000 "$GOOD" 2>/dev/null || true
+  sleep 10
+  kill -0 "$pidc" 2>/dev/null && ok "an unreadable templates dir did not kill the loop (previous set kept)" \
+    || bad "an unreadable templates dir killed the loop — one EACCES on the templates dir stops the whole cell"
+  chmod 755 "$GOOD" 2>/dev/null || true
+fi
+
+# ── arm (b): one job's stamp is unparseable ──────────────────────────────────────────────────
+rm -f "$MARK.after"
+printf '{"label": "com.test.hourly", "started": "yesterday", "rc": 0, "duration": 0}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" 2>/dev/null || true
+sleep 12
+kill -0 "$pidc" 2>/dev/null && ok "a malformed stamp did not kill the loop" \
+  || bad "a malformed stamp killed the loop — one bad file on disk stops the whole cell"
+tailran=0; [ -f "$MARK.after" ] && tailran="$(wc -l < "$MARK.after" 2>/dev/null || echo 0)"
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" "$GOOD/com.test.zzzafter.plist" 2>/dev/null || true
+[ "${tailran:-0}" -gt 0 ] && ok "the job sorting AFTER the broken one still ran ($tailran runs) — the set was not abandoned" \
+  || bad "the job after the broken one ran 0x while a stamp was malformed — one bad stamp silently unschedules the rest"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18h — a ZERO-BYTE loop.pid must be recovered, not fatal. The loop truncates the pidfile
+# (`open(pidfile,"w")`) and then writes it; on ENOSPC that write raised and left an empty file — and
+# `loop_pid()` did `"".split()[0]`, an IndexError, which it did not catch. `loop_pid()` is called by
+# EVERY command (--loop/--start/--install/--verify/--status/--stop), so a 0-byte pidfile made all of
+# them die with a traceback and the cell's only scheduler could never come up again, self-
+# perpetuat ingly: each attempt died at the same line before it could rewrite the file. A human
+# `rm loop.pid` was the only way back. Measured on the pre-fix file.
+state_reset "$GOOD"
+run "$GOOD" --install >/dev/null 2>&1
+run "$GOOD" --stop >/dev/null 2>&1
+: > "$FLEET_SCHEDULE_STATE/loop.pid"          # the exact wreckage an ENOSPC-truncated write leaves
+outh="$(run "$GOOD" --verify)"; rch=$?
+[ "$(grep -c 'Traceback' <<<"$outh")" -eq 0 ] && ok "--verify survives a zero-byte loop.pid" \
+  || bad "--verify raised IndexError on a zero-byte loop.pid: $outh"
+# `--start` is the cell's revival path (it also clears the OFF switch a previous --stop set).
+outh2="$(run "$GOOD" --start)"; rc_start=$?
+[ "$rc_start" -eq 0 ] && ok "--start recovers from a zero-byte loop.pid (it can still come up)" \
+  || bad "--start could not recover from a zero-byte loop.pid (rc=$rc_start): $outh2"
+pidd="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$pidd" ] && kill -0 "$pidd" 2>/dev/null && ok "the loop is running again after an empty pidfile" \
+  || bad "no live loop after recovering an empty pidfile"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18i — a ZERO-BYTE lock file must be STOLEN, not fatal. `acquire_lock` creates the lock then writes
+# the pid; a failed write (ENOSPC on a small write) left a 0-byte lock, and the next pass raised
+# IndexError on `"".split()[0]` — a job that NEVER runs again on any pass, with no self-healing path,
+# until a human deletes the lock. That defeats acquire_lock's own documented invariant ("a lock whose
+# pid is GONE is stolen") and, if the job that lost the race is the disk reaper, is the same closed
+# feedback loop this PR opens everywhere else.
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1
+pidi="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+mkdir -p "$FLEET_SCHEDULE_STATE/locks"
+: > "$FLEET_SCHEDULE_STATE/locks/com.test.echo.lock"
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.echo.json"      # make it due on the next pass
+beforei=0; [ -f "$MARK" ] && beforei="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+sleep 12
+afteri=0; [ -f "$MARK" ] && afteri="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+[ "${afteri:-0}" -gt "${beforei:-0}" ] && ok "an empty lock file was STOLEN and the job ran again" \
+  || bad "an empty lock file wedged the job ($beforei -> $afteri runs) — no self-healing path"
+kill -0 "$pidi" 2>/dev/null && ok "the loop survived an empty lock file" \
+  || bad "the loop died on an empty lock file"
+run "$GOOD" --stop >/dev/null 2>&1
+
+# 18j — THE PUBLISH RACE: a lock created by `O_EXCL` is EMPTY until its pid is written, and a racer's
+# probe reads that as an unusable lock, matches the inode (nothing replaced it), and steals it. Then
+# BOTH callers return a lock path and the same job runs twice concurrently — the one invariant
+# `acquire_lock` exists to hold. Measured on the pre-fix file by widening the create→write window:
+# both callers were told they held it. Each leg is fault-injected instead of raced, so the case is
+# deterministic: `os.write` is patched to let a racer steal the empty lock and publish its own.
+out18j="$(python3 - "$SCHED" "$T/state18j" <<'PY18J' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18j", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+os.makedirs(os.path.join(state, "locks"), exist_ok=True)
+fs.STATE = state
+path = os.path.join(state, "locks", "demo.lock")
+real_write = os.write
+def racer(fd, data):
+    # the racer steals our just-created, still-EMPTY lock and publishes its own
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    with open(path, "w") as fh:
+        fh.write("%d\n" % os.getpid())     # a LIVE pid: ours, in this process
+    return real_write(fd, data)
+os.write = racer
+try:
+    got = fs.acquire_lock("demo")
+finally:
+    os.write = real_write
+print("RESULT", "NONE" if got is None else "PATH")
+PY18J
+)"; rc18j=$?
+[ "$rc18j" -eq 0 ] && grep -q 'RESULT NONE' <<<"$out18j" \
+  && ok "a lock stolen while EMPTY is not handed to BOTH callers (the publisher loses, nobody wins twice)" \
+  || bad "both callers were told they hold the same lock after a mid-publish steal: $out18j"
+grep -q 'Traceback' <<<"$out18j" && bad "the publish-race case raised instead of answering: $out18j" || true
+
+# 18k — THE CLEANUP MUST NOT DELETE A RACER'S LOCK. When the pid write fails (ENOSPC on a small
+# write), the create arm removes the file it made — but "we made it, so it is ours" stops being true
+# once a racer can steal an empty lock and publish its own at the same path. Measured on the pre-fix
+# file: the racer's live lock was DELETED by our cleanup (acquire_lock then re-raised, and the job
+# was left with no lock at all while another run held one).
+out18k="$(python3 - "$SCHED" "$T/state18k" <<'PY18K' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18k", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+os.makedirs(os.path.join(state, "locks"), exist_ok=True)
+fs.STATE = state
+path = os.path.join(state, "locks", "demo.lock")
+real_write = os.write
+def failing(fd, data):
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    with open(path, "w") as fh:
+        fh.write("%d\n" % os.getpid())
+    raise OSError(errno.ENOSPC, "No space left on device")
+os.write = failing
+try:
+    fs.acquire_lock("demo")
+    print("RESULT NO-RAISE")
+except OSError as exc:
+    print("RESULT RAISED", exc.errno)
+finally:
+    os.write = real_write
+print("SURVIVED", os.path.exists(path))
+PY18K
+)"; rc18k=$?
+[ "$rc18k" -eq 0 ] && grep -q 'RESULT RAISED' <<<"$out18k" \
+  && grep -q 'SURVIVED True' <<<"$out18k" \
+  && ok "a failed pid write still RE-RAISES the cause, and leaves a racer's lock in place" \
+  || bad "a failed pid write answered wrongly or deleted the racer's lock: $out18k"
+
+# 18l — `--install` READS DUE-NESS BEFORE IT RUNS ANYTHING, and that read is the same untrusted pair
+# (`read_stamp` + `is_due`) the loop guards per job. Measured at this head: one hand-edited stamp
+# (`{"started": "yesterday"}`) made `float(last)` raise out of `cmd_install` — `--install` returned 1
+# with NO `loop.pid`, i.e. the cell was left with no scheduler, one line above the guard whose comment
+# says that outcome must not happen. The malformed job must be NAMED and skipped, and the rest of the
+# set must still run and install.
+state_reset "$GOOD"
+rm -f "$MARK"
+run "$GOOD" --install >/dev/null 2>&1                      # first pass: writes the stamps
+run "$GOOD" --stop >/dev/null 2>&1
+# `--stop` drops the OFF switch, which `--install` deliberately refuses to fight; this case is
+# about a malformed STAMP, not about the switch.
+rm -f "$FLEET_SCHEDULE_STATE/OFF"
+printf '{"label": "com.test.hourly", "started": "yesterday", "rc": 0, "duration": 0}\n' \
+  > "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json"
+beforel=0; [ -f "$MARK" ] && beforel="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+sleep 3        # com.test.echo's interval is 2s: let it be DUE, so the case can see the set survive
+outl="$(run "$GOOD" --install)"; rcl=$?
+[ "$(grep -c 'Traceback' <<<"$outl")" -eq 0 ] \
+  && ok "--install did not raise on a malformed stamp (no traceback)" \
+  || bad "--install died on a malformed stamp: $outl"
+grep -q 'com.test.hourly due-ness unusable' <<<"$outl" \
+  && ok "--install NAMED the unusable job" \
+  || bad "--install did not name the job whose due-ness it could not read: $outl"
+afterl=0; [ -f "$MARK" ] && afterl="$(wc -l < "$MARK" 2>/dev/null || echo 0)"
+[ "${afterl:-0}" -gt "${beforel:-0}" ] \
+  && ok "--install still ran the healthy due job ($beforel -> $afterl) — one bad stamp did not abandon the set" \
+  || bad "--install ran nothing while one stamp was malformed ($beforel -> $afterl)"
+lpidl="$(cat "$FLEET_SCHEDULE_STATE/loop.pid" 2>/dev/null)"
+[ -n "$lpidl" ] && kill -0 "$lpidl" 2>/dev/null \
+  && ok "--install still ended with a RUNNING loop (the cell is not left without a scheduler)" \
+  || bad "--install left the cell with NO scheduler over one malformed stamp"
+run "$GOOD" --stop >/dev/null 2>&1
+rm -f "$FLEET_SCHEDULE_STATE/jobs/com.test.hourly.json" "$FLEET_SCHEDULE_STATE/OFF"
+
+# 18m — a plist whose ROOT is not a dict must be NAMED, not raised. `plistlib.load` returns a LIST for
+# a truncated/hand-edited file and the parse SUCCEEDS, so the `except Exception` around the load does
+# not cover it; `data.get("Label")` then raised AttributeError. `cmd_loop` had to widen its own call
+# site for this input, but `--check`/`--verify`/`--install` call `load_jobs` bare and `main()` caught
+# only ScheduleError — so every one of them died with a traceback out of main(), and `--install` left
+# the cell with no scheduler.
+BADROOT="$FIX/bad-root"; mkdir -p "$BADROOT"; cp "$GOOD/RETIRED" "$BADROOT/RETIRED"
+rm -f "$FLEET_SCHEDULE_STATE/OFF"        # --install must reach the DECLARATIONS, not the switch
+mkplist "$BADROOT" com.test.echo "$T/echo.spec"
+cat > "$BADROOT/com.test.badroot.plist" <<'PL18M'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><array><string>not-a-declaration</string></array></plist>
+PL18M
+for m18 in --check --verify --install; do
+  out18m="$(run "$BADROOT" "$m18")"; rc18m=$?
+  [ "$(grep -c 'Traceback' <<<"$out18m")" -eq 0 ] \
+    && ok "$m18 did not raise on a non-dict plist root (no traceback)" \
+    || bad "$m18 raised a traceback out of main() on a non-dict plist root: $(tail -3 <<<"$out18m")"
+  [ "$rc18m" -ne 0 ] && ok "$m18 REFUSED the unreadable declaration set (rc=$rc18m, not a silent pass)" \
+    || bad "$m18 returned 0 over a declaration set it could not read"
+  grep -q 'com.test.badroot.plist' <<<"$out18m" \
+    && ok "$m18 NAMED the file whose root is unusable" \
+    || bad "$m18 did not name the offending plist: $out18m"
+done
+
+# 18n — a create failure is NOT "somebody else holds it". The create arm re-raises (EACCES/EROFS/
+# ENOSPC on `os.open`), so the caller's per-job guard logs the REAL cause. Answering None here was the
+# measured defect: on the very ENOSPC recovery this change is about, the operator read
+# `SKIP <job>: already running (lock held)` for a job nothing held, and the disk-full cause never
+# reached the log. The assertion is inside the root skip for the same reason case 18c's is.
+if [ "$(id -u)" -eq 0 ]; then
+  skip "running as root — chmod 500 blocks nothing, so the create-failure arm cannot be exercised here"
+else
+  out18n="$(python3 - "$SCHED" "$T/state18n" <<'PY18N' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18n", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+locks = os.path.join(state, "locks")
+os.makedirs(locks, exist_ok=True)
+fs.STATE = state
+os.chmod(locks, 0o500)          # creatable? no: the CREATE itself must fail
+print("RESULT", end=" ")
+try:
+    got = fs.acquire_lock("demo")
+    print("NONE" if got is None else "PATH")
+except OSError as exc:
+    print("RAISED", type(exc).__name__)
+finally:
+    os.chmod(locks, 0o700)
+PY18N
+)"
+  grep -q 'RESULT RAISED' <<<"$out18n" \
+    && ok "an unwritable locks dir RE-RAISES the cause instead of reporting 'already running'" \
+    || bad "an unwritable locks dir answered without naming the real cause: $out18n"
+fi
 
 
 # ── 18. residency is DECLARED, read in every documented form, and refused by name ───────────
@@ -1531,6 +2122,772 @@ out="$(TEMPLATES_DIR="$RES" python3 "$MUTANT" --check 2>&1)"; rc=$?
 grep -qE '^  (ERROR|FAIL) .*com.test.resident-dict' <<<"$out" \
   && ok "the mutation fails ON THE DICT FORM, by name: $(grep -E '^  (ERROR|FAIL) .*resident-dict' <<<"$out" | head -1 | cut -c1-96)" \
   || bad "the mutation reddens something else; the dict-form fixture is not what grades this: $out"
+
+
+# 18o — the two `load_jobs` OSError hardenings are PINNED, not decorative. An earlier revision of
+# this change carried them with NO test: removing BOTH left the suite fully green (PASS=233 FAIL=0),
+# so the guards that headline the commit ("ENOSPC/EACCES can no longer escape load_jobs") graded
+# nothing. Two arms, each a named refusal rather than a traceback, each mutated back to prove the
+# case is what grades it:
+#   (a) RETIRED is unreadable (mode 000) — must be a named ScheduleError, never a raw OSError, and
+#       no verb may die with a traceback (main() catches only ScheduleError).
+#   (b) TEMPLATES_DIR cannot be listed — same requirement.
+# `chmod 000` does not stop root, so both arms SKIP there; a SKIP is honest and visible, a false
+# PASS is not.
+if [ "$(id -u)" = "0" ]; then
+  skip "18o(a) RETIRED unreadable → named refusal (root can read anything)"
+  skip "18o(b) TEMPLATES_DIR unlistable → named refusal (root can read anything)"
+else
+  for arm in retired listdir; do
+    D18O="$T/18o-$arm"
+    mkdir -p "$D18O/tpl"
+    mkplist "$D18O/tpl" com.test.echo "$T/echo.spec"
+    printf '# nothing retired\n' > "$D18O/tpl/RETIRED"
+    MUT18O="$T/mut-18o-$arm.py"
+    python3 - "$SCHED" "$MUT18O" "$arm" <<'PY18O'
+import sys
+src = open(sys.argv[1]).read()
+arm = sys.argv[3]
+# ⛔ THE MUTATION MUST STAY A VALID PROGRAM. Replacing `try:` with `if True:` orphans the
+# `except` clauses the guard sits on, so the mutant was a SyntaxError: it could not emit the named
+# refusal, and the "no named refusal" assertion below is then satisfied by ANY failure — the arm
+# would have stayed green for a script that never ran, i.e. graded nothing. Neutering the HANDLER
+# keeps the file compilable and restores the pre-fix behaviour exactly (the OSError escapes).
+if arm == "retired":
+    old = '    except OSError as exc:\n        # ⛔ A NAMED REFUSAL, NOT A TRACEBACK.'
+    new = '    except RuntimeError as exc:  # the PRE-FIX reading, restored by the mutation\n        # ⛔ A NAMED REFUSAL, NOT A TRACEBACK.'
+else:
+    old = '    except OSError as exc:\n        raise ScheduleError(\n            "cannot list %s: %s: %s"'
+    new = '    except RuntimeError as exc:  # the PRE-FIX reading, restored by the mutation\n        raise ScheduleError(\n            "cannot list %s: %s: %s"'
+
+assert old in src, "the 18o mutation target moved (%s)" % arm
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PY18O
+    # 000 on RETIRED isolates the RETIRED read; 0111 on the DIRECTORY isolates the listdir call —
+    # a dir you may enter but not read lets a KNOWN filename (RETIRED) be opened, so the RETIRED
+    # guard stays green and only `os.listdir` can fail. Using 000 for both made the listdir arm
+    # fire the RETIRED guard instead, i.e. the case graded the wrong guard (caught by its own
+    # mutation).
+    if [ "$arm" = "retired" ]; then
+      chmod 000 "$D18O/tpl/RETIRED"
+    else
+      chmod 0111 "$D18O/tpl"
+    fi
+    out="$(TEMPLATES_DIR="$D18O/tpl" python3 "$SCHED" --check 2>&1)"; rc=$?
+    # restore before ANY assertion so a failure cannot leave an unreadable dir behind
+    [ "$arm" = "retired" ] && chmod 644 "$D18O/tpl/RETIRED" || chmod 755 "$D18O/tpl"
+    grep -q 'cannot read\|cannot list' <<<"$out" \
+      && ok "18o($arm) is a NAMED refusal, not a traceback" \
+      || bad "18o($arm) did not name the failure: rc=$rc $out"
+    grep -q 'Traceback' <<<"$out" \
+      && bad "18o($arm) died with a traceback (main() must catch it): $out" \
+      || ok "18o($arm) never reaches a traceback"
+    [ "$rc" -ne 0 ] && ok "18o($arm) exits non-zero ($rc)" \
+      || bad "18o($arm) exited 0 on an unreadable declaration set"
+    # MUTATION: restore the pre-fix reading and the case must go RED (a traceback, not a name)
+    if [ "$arm" = "retired" ]; then
+      chmod 000 "$D18O/tpl/RETIRED"
+    else
+      chmod 0111 "$D18O/tpl"
+    fi
+    mout="$(TEMPLATES_DIR="$D18O/tpl" python3 "$MUT18O" --check 2>&1)"; mrc=$?
+    [ "$arm" = "retired" ] && chmod 644 "$D18O/tpl/RETIRED" || chmod 755 "$D18O/tpl"
+    # ⛔ THE MUTANT MUST BE SHOWN TO HAVE RUN. An earlier revision made this mutant a SyntaxError
+    # (replacing `try:` orphaned its `except` clauses); it printed NOTHING, and "does not name the
+    # failure" is trivially true of no output — so the arm reported that the case discriminates
+    # while grading a file that never parsed. Two positive requirements now: the mutant must emit a
+    # named refusal AT ALL (a PermissionError naming the path, i.e. main()'s last net caught the
+    # raw OSError the guard used to convert), and it must NOT be the guard's own phrasing.
+    if [ -z "$mout" ]; then
+      bad "18o($arm) MUTATION produced NO OUTPUT — it did not run (a SyntaxError mutant grades nothing): rc=$mrc"
+    elif ! grep -qi 'permission denied\|PermissionError' <<<"$mout"; then
+      bad "18o($arm) MUTATION did not run the pre-fix path either (no PermissionError in its output): $mout"
+    elif grep -q 'cannot read\|cannot list' <<<"$mout"; then
+      bad "18o($arm) MUTATION still produced the guard's named refusal — the case grades nothing: $mout"
+    else
+      ok "18o($arm) MUTATION ran and lost the named refusal (raw OSError surfaced instead, rc=$mrc)"
+    fi
+  done
+fi
+
+
+# 18p — A FAILED STAT ON THE PUBLISH VERIFY IS NOT "SOMEONE ELSE'S LOCK". The publish re-verify
+# (`os.stat` after the pid write) skips the candidate when the file is no longer ours. An
+# `except OSError: continue` conflated "the path is GONE" with "the stat itself failed" (EIO,
+# ESTALE, an EACCES flip landing after the create — the fault 18n already constructs), so a caller
+# ABANDONED a lock it still held, with its OWN LIVE PID inside it. Every later `acquire_lock` then
+# reads a live holder and answers "held": the job logs `SKIP <job>: already running (lock held)`
+# for a lock this very process created, and never runs again until the loop restarts. That is the
+# wedged-job class this change exists to close, so the arm is pinned in both directions:
+#   (a) a transient stat failure  → the caller KEEPS the lock (path returned, our pid inside)
+#   (b) a really-vanished file    → the caller re-examines and re-creates it (never wedged)
+out18p="$(python3 - "$SCHED" "$T/state18p" <<'PY18P' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18p", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+L = os.path.join(d, "locks")
+real_stat, real_unlink = os.stat, os.unlink
+
+# (a) EIO on the FIRST verify stat: we still hold the inode, so the lock must be kept.
+calls = {"n": 0}
+def flaky(path, *a, **k):
+    if str(path).endswith("eio.lock"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = flaky
+r = m.acquire_lock("eio")
+os.stat = real_stat
+pid = None
+p = os.path.join(L, "eio.lock")
+if os.path.exists(p):
+    pid = open(p).read().strip()
+if r and pid == str(os.getpid()):
+    print("RESULT EIO KEPT")
+else:
+    print("RESULT EIO LOST result=%r pid_in_lock=%r" % (r, pid))
+
+# (b) the file really vanishes between close and verify: the retry loop must re-create it.
+calls2 = {"n": 0}
+def vanish(path, *a, **k):
+    if str(path).endswith("gone.lock") and calls2["n"] == 0:
+        calls2["n"] += 1
+        real_unlink(path)
+        raise FileNotFoundError(2, "No such file or directory")
+    return real_stat(path, *a, **k)
+os.stat = vanish
+r2 = m.acquire_lock("gone")
+os.stat = real_stat
+held = None
+p2 = os.path.join(L, "gone.lock")
+if r2 and os.path.exists(p2):
+    held = open(p2).read().strip() == str(os.getpid())
+print("RESULT ENOENT %s" % ("RECREATED" if held else "WEDGED result=%r" % (r2,)))
+PY18P
+)"
+grep -q 'RESULT EIO KEPT' <<<"$out18p" \
+  && ok "18p(a) a transient stat failure keeps the lock we hold (was: abandoned → job wedged)" \
+  || bad "18p(a) abandoned a lock it still held on a transient stat error: $out18p"
+grep -q 'RESULT ENOENT RECREATED' <<<"$out18p" \
+  && ok "18p(b) a really-vanished lock is recreated, not left wedged" \
+  || bad "18p(b) did not recover a vanished lock: $out18p"
+# MUTATION: restore the PRE-FIX `except OSError: continue` and case (a) must REDDEN. Without this
+# the case could pass on an implementation that never abandons anything for any reason.
+MUT18P="$T/mut-18p.py"
+python3 - "$SCHED" "$MUT18P" <<'PYMUT'
+import sys
+src = open(sys.argv[1]).read()
+old = '            except OSError:\n                cur = None\n'
+new = '            except OSError:  # the PRE-FIX reading, restored by the mutation\n                continue\n'
+assert old in src, "the 18p mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUT
+mout18p="$(python3 - "$MUT18P" "$T/state18p-mut" <<'PYMU' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18pmut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+L = os.path.join(d, "locks")
+real_stat = os.stat
+calls = {"n": 0}
+def flaky(path, *a, **k):
+    if str(path).endswith("eio.lock"):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = flaky
+r = m.acquire_lock("eio")
+os.stat = real_stat
+pid = None
+p = os.path.join(L, "eio.lock")
+if os.path.exists(p):
+    pid = open(p).read().strip()
+print("MUTATION %s" % ("STILL-KEPT (case grades nothing)"
+                       if (r and pid == str(os.getpid()))
+                       else "RED result=%r pid_in_lock=%r" % (r, pid)))
+PYMU
+)"
+grep -q 'MUTATION RED' <<<"$mout18p" \
+  && ok "18p MUTATION (pre-fix except OSError) abandons the lock — the case discriminates" \
+  || bad "18p MUTATION stayed green, so the case grades nothing: $mout18p"
+
+
+# 18q — `os.fstat` ON THE CREATE LEG CAN FAIL, AND THE HANDLER READS ITS RESULT. An earlier revision
+# dropped the `own = None` initialiser as "tidiness" and the suite stayed fully green (PASS=244
+# FAIL=0) because nothing injects an fstat fault. A stat failure on a full or dying filesystem
+# (EIO/ESTALE) is exactly this change's fault class, and without the initialiser it became
+# `UnboundLocalError` — a coding error replacing the real cause — raised BEFORE the identity-checked
+# cleanup, so the 0-byte lock the create had just made was left behind. Pinned both ways:
+#   (a) an fstat fault surfaces the REAL OSError (never UnboundLocalError)
+#   (b) the lock left behind is self-healing: the next `acquire_lock` steals it
+out18q="$(python3 - "$SCHED" "$T/state18q" <<'PY18Q' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18q", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+real_fstat = os.fstat
+def bad_fstat(fd):
+    raise OSError(5, "Input/output error")
+os.fstat = bad_fstat
+try:
+    m.acquire_lock("fstatfault")
+    print("RESULT NO-RAISE")
+except UnboundLocalError as exc:
+    print("RESULT UNBOUND %s" % exc)
+except OSError as exc:
+    print("RESULT REAL-OSERROR %s" % exc)
+finally:
+    os.fstat = real_fstat
+print("LOCK-LEFT %s" % os.path.exists(os.path.join(d, "locks", "fstatfault.lock")))
+# (b) the residue must be self-healing, not a wedge
+r = m.acquire_lock("fstatfault")
+print("RESULT SELFHEAL %s" % ("OK" if r else "WEDGED"))
+PY18Q
+)"
+grep -q 'RESULT REAL-OSERROR' <<<"$out18q" \
+  && ok "18q(a) an fstat fault surfaces the real OSError" \
+  || bad "18q(a) an fstat fault did not surface the real cause: $out18q"
+grep -q 'RESULT UNBOUND' <<<"$out18q" \
+  && bad "18q(a) an fstat fault became UnboundLocalError (the initialiser is load-bearing): $out18q" \
+  || ok "18q(a) never becomes UnboundLocalError"
+grep -q 'RESULT SELFHEAL OK' <<<"$out18q" \
+  && ok "18q(b) the lock residue self-heals on the next attempt" \
+  || bad "18q(b) an fstat fault left a wedge: $out18q"
+MUT18Q="$T/mut-18q.py"
+python3 - "$SCHED" "$MUT18Q" <<'PYMUTQ'
+import sys
+src = open(sys.argv[1]).read()
+old = '            own = None\n            try:\n                own = os.fstat(fd)\n'
+new = '            try:\n                own = os.fstat(fd)\n'
+assert old in src, "the 18q mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTQ
+mout18q="$(python3 - "$MUT18Q" "$T/state18q-mut" <<'PYMUQ' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18qmut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+real_fstat = os.fstat
+def bad_fstat(fd):
+    raise OSError(5, "Input/output error")
+os.fstat = bad_fstat
+try:
+    m.acquire_lock("fstatfault")
+    print("MUTATION NO-RAISE")
+except UnboundLocalError:
+    print("MUTATION RED")
+except OSError:
+    print("MUTATION STILL-REAL")
+finally:
+    os.fstat = real_fstat
+PYMUQ
+)"
+grep -q 'MUTATION RED' <<<"$mout18q" \
+  && ok "18q MUTATION (initialiser removed) raises UnboundLocalError — the case discriminates" \
+  || bad "18q MUTATION did not redden, so the case grades nothing: $mout18q"
+
+
+# 18r — "CANNOT STAT" IS NOT "IT IS OURS". 18p(a) pins the wedge (a transient stat failure must not
+# abandon a lock we still hold); this pins the OPPOSITE wrong answer, which `except OSError: return
+# path` gave: `O_EXCL` speaks about CREATE time, not about what now sits at `path`. When the stat
+# failure coincides with the documented steal (a racer reads our zero-byte lock, matches the inode,
+# replaces it and publishes its own live pid), returning the path made us run the job CONCURRENTLY
+# with the racer, and our `finally` then unlinked the RACER's lock by name — after which a third
+# caller acquired it too. So on a stat failure the caller must ask the probe's question: read the
+# file and compare the pid to ours. Ours ⇒ keep (18p). Not ours ⇒ we lost. Unreadable ⇒ fail closed.
+out18r="$(python3 - "$SCHED" "$T/state18r" <<'PY18R' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18r", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+L = os.path.join(d, "locks")
+p = os.path.join(L, "stolen.lock")
+RACER = 4000000 + (os.getpid() % 1000)   # a pid that is NOT us; liveness of it is irrelevant here
+real_stat, real_getpid = os.stat, os.getpid
+state = {"n": 0}
+def racy_stat(path, *a, **k):
+    # the steal lands exactly in the verify window: the file now holds a FOREIGN pid, and the
+    # stat that would have told us that fails. (No apostrophe here — this body is nested in a
+    # command substitution, and bash 3.2 scans it as CODE: an unbalanced quote desynchronises the
+    # whole file. See scripts/check-bash32-parse.sh, #2930/#2248.)
+    if os.path.abspath(str(path)) == os.path.abspath(p) and state["n"] == 0:
+        state["n"] += 1
+        with open(p, "w") as fh:
+            fh.write("%d\n" % RACER)
+        raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = racy_stat
+try:
+    r = m.acquire_lock("stolen")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(p):
+    try:
+        content = open(p).read().strip()
+    except OSError:
+        content = "unreadable"
+if r and content not in (None, str(real_getpid())):
+    print("RESULT DOUBLE-HOLD returned=%r content=%r (MUST NOT HAPPEN)" % (r, content))
+elif r:
+    print("RESULT KEPT-OURS content=%r" % (content,))
+else:
+    print("RESULT LOST-CORRECTLY content=%r" % (content,))
+PY18R
+)"
+grep -q 'RESULT DOUBLE-HOLD' <<<"$out18r" \
+  && bad "18r returned a lock whose content is ANOTHER caller's pid (two holders): $out18r" \
+  || ok "18r a stat failure coinciding with a steal never returns the racer's lock"
+grep -qE 'RESULT (LOST-CORRECTLY|KEPT-OURS)' <<<"$out18r" \
+  && ok "18r resolves to a defensible answer: $(grep -o 'RESULT [A-Z-]*' <<<"$out18r" | head -1)" \
+  || bad "18r produced neither a correct loss nor our own lock: $out18r"
+# MUTATION: restore the blind `except OSError: return path` and 18r must REDDEN.
+MUT18R="$T/mut-18r.py"
+python3 - "$SCHED" "$MUT18R" <<'PYMUTR'
+import sys
+src = open(sys.argv[1]).read()
+old = '            except OSError:\n                cur = None\n'
+new = '            except OSError:  # the PRE-FIX reading, restored by the mutation\n                return path\n'
+assert old in src, "the 18r mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTR
+mout18r="$(python3 - "$MUT18R" "$T/state18r-mut" <<'PYMUR' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18rmut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+p = os.path.join(d, "locks", "stolen.lock")
+RACER = 4000000 + (os.getpid() % 1000)
+real_stat, real_getpid = os.stat, os.getpid
+state = {"n": 0}
+def racy_stat(path, *a, **k):
+    if os.path.abspath(str(path)) == os.path.abspath(p) and state["n"] == 0:
+        state["n"] += 1
+        with open(p, "w") as fh:
+            fh.write("%d\n" % RACER)
+        raise OSError(5, "Input/output error")
+    return real_stat(path, *a, **k)
+os.stat = racy_stat
+try:
+    r = m.acquire_lock("stolen")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(p):
+    try:
+        content = open(p).read().strip()
+    except OSError:
+        content = "unreadable"
+print("MUTATION %s" % ("RED double-hold" if (r and content not in (None, str(real_getpid())))
+                       else "still-correct r=%r content=%r" % (r, content)))
+PYMUR
+)"
+grep -q 'MUTATION RED' <<<"$mout18r" \
+  && ok "18r MUTATION (blind return path) produces two holders — the case discriminates" \
+  || bad "18r MUTATION stayed green, so the case grades nothing: $mout18r"
+
+
+# 18s — EVERY WAY THE CONTENT READ CAN FAIL MUST STILL NOT WEDGE. 18p patches only `os.stat`, so the
+# content read always succeeds there and the arm graded only the sub-case that works. Measured on the
+# revision before this case: a stat failure plus a read that RAISES (EACCES/EIO) or returns b""
+# (no exception at all) abandoned a lock this process had created, leaving it on disk holding OUR
+# OWN LIVE PID — after which every later `acquire_lock` read a live holder and refused, i.e. the job
+# logged `SKIP <job>: already running (lock held)` for a lock we made, for the life of the daemon.
+# The invariant is therefore stated over the FAULT SHAPES, not one of them: a lock this process
+# created must still be usable by this process afterwards, whatever the read did.
+out18s="$(python3 - "$SCHED" "$T/state18s" <<'PY18S' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18s", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = sys.argv[2]
+real_stat, real_open, real_getpid = os.stat, open, os.getpid
+
+class EmptyRead:
+    def __init__(self, fh): self._fh = fh
+    def read(self, n=-1): return b""
+    def fileno(self): return self._fh.fileno()   # the probe fstats the fd it opened
+    def __enter__(self): return self
+    def __exit__(self, *a): return False
+    def close(self): pass
+
+def run(name, read_behaviour):
+    d = os.path.join(base, name); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+    m.STATE = d
+    path = os.path.join(d, "locks", "w.lock")
+    state = {"stat": 0}
+    def bad_stat(p, *a, **k):
+        if os.path.abspath(str(p)) == os.path.abspath(path) and state["stat"] == 0:
+            state["stat"] += 1
+            raise OSError(5, "Input/output error")
+        return real_stat(p, *a, **k)
+    reads = {"n": 0}
+    def bad_open(p, *a, **k):
+        # ⛔ TRANSIENT — the ownership read only. Faulting EVERY open also faulted the PROBE, which
+        # then read b""/EIO, parsed pid=None and STOLE the file: the harness healed exactly what
+        # wedges in production, so this loop passed on the PRE-FIX code as well (a false pass,
+        # measured). One faulted read is both the realistic shape and the discriminating one.
+        if os.path.abspath(str(p)) == os.path.abspath(path) and reads["n"] == 0:
+            reads["n"] += 1
+            if read_behaviour == "eacces":
+                raise PermissionError(13, "Permission denied")
+            if read_behaviour == "eio":
+                raise OSError(5, "Input/output error")
+            if read_behaviour == "empty":
+                fh = real_open(p, *a, **k)
+                return EmptyRead(fh)
+            if read_behaviour == "enoent":
+                # the ONE-SHOT lie a dying mount tells: ENOENT for a file that is still there
+                raise FileNotFoundError(2, "No such file or directory")
+        return real_open(p, *a, **k)
+    import builtins
+    os.stat = bad_stat
+    if read_behaviour != "ok":
+        builtins.open = bad_open
+    try:
+        first = m.acquire_lock("w")
+    finally:
+        os.stat = real_stat
+        builtins.open = real_open
+    # The invariant is a JOB's lifecycle, not "acquire twice in one process" (a second acquire in
+    # the SAME process is correctly refused — the holder is alive, so the lock is not stale). The
+    # wedge is different: a FAILED acquire that leaves the lock on disk holding our own live pid, so
+    # EVERY later pass is refused. So: the acquire must succeed, we release as run_job's `finally`
+    # does, and the next pass must be able to take it again.
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    second = m.acquire_lock("w")
+    held_content = None
+    if os.path.exists(path):
+        try:
+            held_content = real_open(path).read().strip()
+        except OSError:
+            held_content = "unreadable"
+    # ⛔ NOT "the content looks like our pid" — THIS process wrote that pid, so that clause can
+    # never fail and would make the case vacuous (measured: it stayed green on a wedging mutant).
+    # The invariant is the one that matters to a job: this process must still be able to acquire it.
+    # ⛔ `second` IS NOT THE INVARIANT. The harness unlinks the lock first, so re-acquiring is
+    # trivially true and `bool(first) and bool(second)` reduced to `bool(first)` — measured: it was
+    # True in every run, including rows where the code had left a wedge on disk. The invariant that
+    # a job actually feels is "THIS ATTEMPT DID NOT LEAVE ME LOCKED OUT", i.e. the acquire returned a
+    # path; `second` is kept only as a smoke check that the lifecycle still works afterwards.
+    okish = bool(first) and bool(second)   # first is the invariant; second is a smoke check
+    print("%-8s first=%-5s second=%-5s content=%r %s"
+          % (read_behaviour, bool(first), bool(second), held_content,
+             "USABLE" if okish else "WEDGED"))
+
+run("ok", "ok")
+run("eacces", "eacces")
+run("eio", "eio")
+run("empty", "empty")
+run("enoent", "enoent")
+PY18S
+)"
+for shape in ok eacces eio empty enoent; do
+  grep -qE "^$shape .*USABLE" <<<"$out18s" \
+    && ok "18s(stat-fail + read-$shape) leaves the lock USABLE (no wedge)" \
+    || bad "18s(stat-fail + read-$shape) WEDGED the job: $(grep -E "^$shape " <<<"$out18s")"
+done
+# MUTATION: the pre-fix `except OSError: continue` (fail-"closed" to not-ours) must redden the
+# read-failure arms — that is exactly the wedge this case exists to prevent.
+MUT18S="$T/mut-18s.py"
+python3 - "$SCHED" "$MUT18S" <<'PYMUTS'
+import sys
+src = open(sys.argv[1]).read()
+old = '                except OSError:\n                    mine = None       # undeterminable'
+new = '                except OSError:\n                    continue          # the PRE-FIX reading, restored'
+assert old in src, "the 18s mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTS
+mout18s="$(python3 - "$MUT18S" "$T/state18s-mut" <<'PYMUTSR' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18smut", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = sys.argv[2]
+real_stat, real_open, real_getpid = os.stat, open, os.getpid
+d = os.path.join(base, "eio"); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+path = os.path.join(d, "locks", "w.lock")
+state = {"stat": 0}
+def bad_stat(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path) and state["stat"] == 0:
+        state["stat"] += 1
+        raise OSError(5, "Input/output error")
+    return real_stat(p, *a, **k)
+def bad_open(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path):
+        raise OSError(5, "Input/output error")
+    return real_open(p, *a, **k)
+import builtins
+os.stat = bad_stat; builtins.open = bad_open
+try:
+    first = m.acquire_lock("w")
+finally:
+    os.stat = real_stat; builtins.open = real_open
+second = m.acquire_lock("w")
+content = None
+if os.path.exists(path):
+    try: content = real_open(path).read().strip()
+    except OSError: content = "unreadable"
+wedged = not (bool(first) and bool(second))
+print("MUTATION %s first=%s second=%s content=%r" % ("RED wedged" if wedged else "still-usable", bool(first), bool(second), content))
+PYMUTSR
+)"
+grep -q 'MUTATION RED' <<<"$mout18s" \
+  && ok "18s MUTATION (fail-'closed' to not-ours) WEDGES the job — the case discriminates" \
+  || bad "18s MUTATION stayed usable, so the case grades nothing: $mout18s"
+
+
+# 18t — THE TWO GUARDS THAT WERE CORRECT BUT GRADED BY NOTHING. Both were added in the same commit
+# as 18s and neither could redden: the short-write check (no case patched `os.write` to a short
+# count) and the stat-ENOENT re-ask (18p(b) builds a GENUINE deletion, which passes identically with
+# and without the re-ask). A guard no case can fail is the class this file exists to prevent, so
+# each is driven here WITH its own mutation.
+#   (a) a SHORT `os.write` leaves a TRUNCATED pid in a lock we created — "3" parses as a live pid, so
+#       the probe refuses the lock forever. The create leg must raise and leave nothing behind.
+#   (b) a filesystem that answers ENOENT for a file it still holds (ESTALE→ENOENT) must not be
+#       believed on ONE answer; the re-ask keeps our own lock instead of abandoning it.
+out18t="$(python3 - "$SCHED" "$T/state18t" <<'PY18T' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18t", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+base = sys.argv[2]
+real_write, real_stat, real_open = os.write, os.stat, open
+
+def short_write(name):
+    d = os.path.join(base, name); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+    m.STATE = d
+    path = os.path.join(d, "locks", "sw.lock")
+    def one_byte(fd, data):
+        return real_write(fd, data[:1])          # a real short write, not an exception
+    os.write = one_byte
+    try:
+        raised = None
+        try:
+            r = m.acquire_lock("sw")
+        except OSError as exc:
+            raised = exc; r = None
+    finally:
+        os.write = real_write
+    left = os.path.exists(path)
+    content = None
+    if left:
+        try: content = real_open(path).read().strip()
+        except OSError: content = "unreadable"
+    print("SHORTWRITE raised=%s left=%s content=%r result=%r"
+          % (type(raised).__name__ if raised else None, left, content, r))
+
+def enoent_lie(name):
+    d = os.path.join(base, name); os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+    m.STATE = d
+    path = os.path.join(d, "locks", "lie.lock")
+    st = {"n": 0}
+    def lying_stat(p, *a, **k):
+        if os.path.abspath(str(p)) == os.path.abspath(path) and st["n"] == 0:
+            st["n"] += 1
+            raise FileNotFoundError(2, "No such file or directory")   # the lie
+        return real_stat(p, *a, **k)
+    os.stat = lying_stat
+    try:
+        r = m.acquire_lock("lie")
+    finally:
+        os.stat = real_stat
+    content = None
+    if os.path.exists(path):
+        try: content = real_open(path).read().strip()
+        except OSError: content = "unreadable"
+    print("ENOENTLIE result=%s content=%r" % (bool(r), content))
+
+short_write("a")
+enoent_lie("b")
+PY18T
+)"
+grep -qE '^SHORTWRITE raised=OSError left=False' <<<"$out18t" \
+  && ok "18t(a) a short write raises and leaves NO truncated-pid lock" \
+  || bad "18t(a) a short write did not raise-and-clean: $(grep '^SHORTWRITE' <<<"$out18t")"
+grep -q '^ENOENTLIE result=True' <<<"$out18t" \
+  && ok "18t(b) a one-shot ENOENT lie from the stat does not abandon our own lock" \
+  || bad "18t(b) believed a one-shot ENOENT and abandoned the lock: $(grep '^ENOENTLIE' <<<"$out18t")"
+
+# MUTATIONS — each guard removed must redden its own arm.
+MUT18TA="$T/mut-18ta.py"; MUT18TB="$T/mut-18tb.py"
+python3 - "$SCHED" "$MUT18TA" "$MUT18TB" <<'PYMUTT'
+import sys
+src = open(sys.argv[1]).read()
+# (a) drop the short-write check
+a_old = ('                written = os.write(fd, payload)\n'
+         '                if written != len(payload):\n')
+assert a_old in src, "18t(a) mutation target moved"
+a_new = ('                written = os.write(fd, payload)\n'
+         '                if False:\n')
+open(sys.argv[2], "w").write(src.replace(a_old, a_new, 1))
+# (b) trust a single ENOENT from the stat again
+b_old = ('            except FileNotFoundError:\n'
+         '                # Same reasoning: one unreliable filesystem can answer ENOENT for a file it holds.\n')
+assert b_old in src, "18t(b) mutation target moved"
+b_new = ('            except FileNotFoundError:\n'
+         '                continue  # PRE-FIX: trust one ENOENT\n'
+         '                # Same reasoning: one unreliable filesystem can answer ENOENT for a file it holds.\n')
+open(sys.argv[3], "w").write(src.replace(b_old, b_new, 1))
+PYMUTT
+mout18ta="$(python3 - "$MUT18TA" "$T/state18ta" <<'PYMUTTA' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("m18ta", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True); m.STATE = d
+path = os.path.join(d, "locks", "sw.lock")
+real_write, real_open = os.write, open
+os.write = lambda fd, data: real_write(fd, data[:1])
+try:
+    raised = None
+    try: r = m.acquire_lock("sw")
+    except OSError as exc: raised = exc; r = None
+finally: os.write = real_write
+left = os.path.exists(path)
+content = None
+if left:
+    try: content = real_open(path).read().strip()
+    except OSError: content = "unreadable"
+print("MUTATION %s raised=%s left=%s content=%r" % ("RED" if not (raised and not left) else "still-clean",
+      type(raised).__name__ if raised else None, left, content))
+PYMUTTA
+)"
+grep -q 'MUTATION RED' <<<"$mout18ta" \
+  && ok "18t(a) MUTATION (short-write check removed) leaves a truncated-pid lock — discriminates" \
+  || bad "18t(a) MUTATION stayed clean, so the case grades nothing: $mout18ta"
+mout18tb="$(python3 - "$MUT18TB" "$T/state18tb" <<'PYMUTTB' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("m18tb", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True); m.STATE = d
+path = os.path.join(d, "locks", "lie.lock")
+real_stat, real_open = os.stat, open
+st = {"n": 0}
+def lying(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path) and st["n"] == 0:
+        st["n"] += 1
+        raise FileNotFoundError(2, "No such file or directory")
+    return real_stat(p, *a, **k)
+os.stat = lying
+try: r = m.acquire_lock("lie")
+finally: os.stat = real_stat
+print("MUTATION %s result=%s" % ("RED" if not r else "still-holds", bool(r)))
+PYMUTTB
+)"
+grep -q 'MUTATION RED' <<<"$mout18tb" \
+  && ok "18t(b) MUTATION (one ENOENT trusted) abandons our own lock — discriminates" \
+  || bad "18t(b) MUTATION still holds, so the case grades nothing: $mout18tb"
+
+
+# 18u — "UNDETERMINABLE STAT" MUST NOT MEAN "RETURN THE PATH". The stat-ENOENT re-ask's fall-through
+# arm first read `return path`, justified as "anything else resolves to OURS". Measured false: with
+# a RACER's live-pid lock in place (the steal this publish block exists to survive) plus a one-shot
+# ENOENT then EIO, the caller returned a path while the lock on disk named the racer — and
+# `run_job`'s `finally` then unlinked the RACER's lock by name, after which a THIRD caller acquired
+# it: two concurrent runs of one job. The arm must fall through to the pid read (keep only if ours).
+# Nothing in the suite could see this direction — the 18t(b) mutation only reddens the ABANDON
+# direction — so the case is pinned here in its own right, mutated back.
+out18u="$(python3 - "$SCHED" "$T/state18u" <<'PY18U' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_18u", sys.argv[1])
+m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True)
+m.STATE = d
+path = os.path.join(d, "locks", "race.lock")
+RACER = 4000000 + (os.getpid() % 1000)
+real_stat, real_open, real_unlink = os.stat, open, os.unlink
+seq = {"n": 0}
+
+def racy_stat(p, *a, **k):
+    # ⛔ THE STEAL LANDS INSIDE THE STAT WINDOW — the racer replaces our freshly created lock with
+    # one naming ITS OWN pid, with a real unlink+create, and only THEN does the filesystem lie.
+    # (An earlier version of this case interposed on `open`, which the `return path` arm never
+    # calls — so the mutant saw no steal and the case could not redden: the harness was the bug.)
+    if os.path.abspath(str(p)) == os.path.abspath(path):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            try:
+                real_unlink(path)
+            except OSError:
+                pass
+            with real_open(path, "w") as fh:
+                fh.write("%d\n" % RACER)
+            raise FileNotFoundError(2, "No such file or directory")
+        if seq["n"] == 2:
+            raise OSError(5, "Input/output error")
+    return real_stat(p, *a, **k)
+
+os.stat = racy_stat
+try:
+    r = m.acquire_lock("race")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(path):
+    try:
+        content = real_open(path).read().strip()
+    except OSError:
+        content = "unreadable"
+print("RESULT %s contend=%r content=%r"
+      % ("DOUBLE-HOLD" if (r and content != str(os.getpid())) else
+         ("REFUSED" if not r else "HELD-OURS"), bool(r), content))
+PY18U
+)"
+grep -q 'RESULT DOUBLE-HOLD' <<<"$out18u" \
+  && bad "18u returned a lock naming ANOTHER live pid (two holders, then a deleted racer lock): $out18u" \
+  || ok "18u an undeterminable stat never returns a foreign lock: $(grep -o 'RESULT [A-Z-]*' <<<"$out18u")"
+
+MUT18U="$T/mut-18u.py"
+python3 - "$SCHED" "$MUT18U" <<'PYMUTU'
+import sys
+src = open(sys.argv[1]).read()
+old = ('                    # pid, keep only if it is ours.\n'
+       '                    cur = None\n')
+new = ('                    # pid, keep only if it is ours.\n'
+       '                    return path  # the PRE-FIX reading, restored by the mutation\n')
+assert old in src, "the 18u mutation target moved"
+open(sys.argv[2], "w").write(src.replace(old, new, 1))
+PYMUTU
+mout18u="$(python3 - "$MUT18U" "$T/state18u-mut" <<'PYMUTUR' 2>&1
+import importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("m18u", sys.argv[1]); m = importlib.util.module_from_spec(spec); spec.loader.exec_module(m)
+d = sys.argv[2]; os.makedirs(os.path.join(d, "locks"), exist_ok=True); m.STATE = d
+path = os.path.join(d, "locks", "race.lock")
+RACER = 4000000 + (os.getpid() % 1000)
+real_stat, real_open, real_unlink = os.stat, open, os.unlink
+seq = {"n": 0}
+def racy_stat(p, *a, **k):
+    if os.path.abspath(str(p)) == os.path.abspath(path):
+        seq["n"] += 1
+        if seq["n"] == 1:
+            try: real_unlink(path)
+            except OSError: pass
+            with real_open(path, "w") as fh: fh.write("%d\n" % RACER)
+            raise FileNotFoundError(2, "ENOENT")
+        if seq["n"] == 2: raise OSError(5, "EIO")
+    return real_stat(p, *a, **k)
+os.stat = racy_stat
+try: r = m.acquire_lock("race")
+finally:
+    os.stat = real_stat
+content = None
+if os.path.exists(path):
+    try: content = real_open(path).read().strip()
+    except OSError: content = "unreadable"
+print("MUTATION %s contend=%r content=%r" % ("RED double-hold" if (r and content != str(os.getpid())) else "still-refused", bool(r), content))
+PYMUTUR
+)"
+grep -q 'MUTATION RED' <<<"$mout18u" \
+  && ok "18u MUTATION (blind return path) produces two holders — the case discriminates" \
+  || bad "18u MUTATION stayed refused, so the case grades nothing: $mout18u"
 
 
 echo
