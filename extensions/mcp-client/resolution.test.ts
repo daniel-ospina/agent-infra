@@ -1171,10 +1171,11 @@ await test("a FALSY transport is not a delta value — the base's working transp
   // copied the falsy value OVER the base's working one: a repo `{"url": ""}` turned
   // `{url: "https://base/mcp", headers: {Authorization: …}}` into `{url: ""}` — an entry
   // `connectServer` rejects with "has neither 'command' nor 'url'", with the credentials already
-  // dropped and no note about the entry becoming unusable. The LAYER READ resolves the identical input
-  // the other way (`asMcpJson` deletes the falsy field and keeps the base entry), so the two readers
-  // disagreed about one config — and the merge advertises itself as "the belt for a caller that hands
-  // the merge raw JSON".
+  // dropped and no note about the entry becoming unusable. The LAYER READ used to resolve the identical
+  // input the other way (`asMcpJson` deleted the falsy field and kept the base entry), so the two
+  // readers disagreed about one config — and the merge advertises itself as "the belt for a caller that
+  // hands the merge raw JSON". Since review round 9 the layer read strips only a BASE entry and leaves a
+  // REPO entry exactly as written, so this merge is the single ruling authority for a repo config:
   const logs = await withCapturedLogs(async () => {
     const http = mergeMcpLayers(
       { mcpServers: { s: { url: "https://base/mcp", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
@@ -1202,12 +1203,16 @@ await test("a FALSY transport is not a delta value — the base's working transp
   );
 });
 
-await test("a repo-ONLY entry whose only transport is empty is dropped, as the layer read drops it", async () => {
-  // The strip was applied to a repo DELTA but not to a repo-ONLY entry, so the merge's belt still
-  // disagreed with the layer read for one input: `asMcpJson` removes the empty field and then DROPS the
-  // entry ("declares no usable transport"), while the merge kept `{url: ""}` — a server `connectServer`
-  // rejects with "has neither 'command' nor 'url'" on first connect. Measured before the fix:
+await test("a repo-ONLY entry whose only transport is empty is dropped by the MERGE, not left transportless", async () => {
+  // The strip was applied to a repo DELTA but not to a repo-ONLY entry, so the merge's belt kept
+  // `{url: ""}` — a server `connectServer` rejects with "has neither 'command' nor 'url'" on first
+  // connect. Measured before the fix:
   // `mergeMcpLayers({mcpServers:{}}, {mcpServers:{s:{url:""}}})` -> `{"url":""}`.
+  // ⛔ THE DROP IS THIS MERGE'S OWN `continue`, NOT THE LAYER READ'S (review round 9): a REPO entry is
+  // left exactly as written by `asMcpJson` so this merge can rule with BOTH layers in view, because
+  // the layer read sees one file and cannot know whether a base entry supplies the transport. Saying
+  // "as the layer read drops it" is what once invited a reader to reinstate that drop — which is the
+  // 90000→60000 regression the `EMPTY-string url DELTA` test above pins.
   // ⛔ The DISTINCTION that must survive: an entry that declared NO transport at all is not this case —
   // `{lazy: true}` is legitimate at the merge level and the layer read keeps it too.
   const logs = await withCapturedLogs(async () => {

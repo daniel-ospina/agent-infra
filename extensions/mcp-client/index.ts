@@ -687,6 +687,26 @@ function isValidServerName(name: string): boolean {
 const RECOGNISED_TYPES = new Set(["stdio", "http", "streamable-http"]);
 
 /**
+ * An unrecognised `type` (`sse`, or a typo) is INERT in this client — it dispatches on `url`/`command`
+ * — but it is worth saying out loud, because the operator wrote it expecting an effect they never get.
+ * It is never a reason to drop, ignore or rewrite an entry (see `RECOGNISED_TYPES`).
+ *
+ * ⛔ REPORTED BY THE READER THAT CAN SEE THE OUTCOME (#3628 review round 10). A BASE entry is copied
+ * verbatim by `mergeMcpLayers` and never inspected there, so `asMcpJson` reports it. A REPO entry is
+ * ruled on by the merge, which knows whether the entry ends up KEPT, IGNORED (an ambiguous delta over
+ * a base) or DROPPED (nothing to connect to) — the layer read knows none of that, yet it said "the
+ * entry is KEPT as written" about an entry the merge then dropped (measured: `{"url": "", "type":
+ * "sse"}` → the note fired, then the entry was dropped). `type` is inert either way, so the repo-side
+ * message says only that the FIELD has no effect and never claims the entry survived.
+ */
+function hasUnrecognisedType(entry: Record<string, unknown>): boolean {
+  return (
+    entry.type !== undefined &&
+    !(typeof entry.type === "string" && RECOGNISED_TYPES.has(entry.type))
+  );
+}
+
+/**
  * `is`/`are` for a list of field names: agreement follows the NOUN, not the count. `headers` is one
  * field but a plural noun, so keying on `dropped.length` produced "the base's headers is NOT
  * inherited" — machine-sounding text in the one diagnostic an operator reads to understand why auth
@@ -813,9 +833,14 @@ export function mergeMcpLayers(
     // copies the falsy value OVER the base's working one: a repo `{"url": ""}` turned
     // `{url: "https://base/mcp", headers: …}` into `{url: ""}` — an entry `connectServer` rejects with
     // "has neither 'command' nor 'url'", credentials already dropped, and nothing said so.
-    // This is the same strip the LAYER READ performs (`asMcpJson` deletes the falsy field), so the two
-    // readers cannot disagree about one config — including for a REPO-ONLY entry, where the layer read
-    // goes on to DROP the entry as declaring no usable transport while this merge used to keep it.
+    // This is the SAME strip a BASE entry gets from the LAYER READ (`asMcpJson` deletes the falsy
+    // field), so the two readers cannot disagree about one config. A REPO entry is deliberately NOT
+    // stripped there: `asMcpJson` sees ONE file and cannot know whether a base entry supplies the
+    // transport this one omits, so it leaves the entry exactly as written and THIS merge rules. It
+    // strips above BOTH branches below and drops a repo-ONLY entry left with no transport (the
+    // `continue` on `strippedTransports > 0`), which is what keeps a delta's OTHER fields alive:
+    // measured, doing the entry-level ruling in the layer read lost the repo's `timeoutMs` (merged
+    // 60000 in production where this merge alone gave 90000).
     // ⛔ Only DEFINED-but-falsy values are stripped. A present TRUTHY non-string (`{"url": ["…"]}`) is
     // deliberately kept: it is a typo that must still count as a CHANGED destination, so the credential
     // guards below see it rather than reading it as "no transport declared".
@@ -845,8 +870,8 @@ export function mergeMcpLayers(
       // declaring both transports WORKS over `url` (`connectServer` tests it first) and `origin/main`
       // refused nothing — dropping it would zero a working server. Warn and keep.
       // ⛔ EXCEPT when the strip above removed the only transport it declared: that entry has nothing
-      // `connectServer` can dispatch on, so `asMcpJson` drops it ("declares no usable transport") and
-      // keeping it here would hand the client a server that throws on first connect. An entry that
+      // `connectServer` can dispatch on, so THIS MERGE drops it (the `continue` immediately below) and
+      // keeping it would hand the client a server that throws on first connect. An entry that
       // declared NO transport at all (`{lazy: true}`) is not this case and is still kept.
       if (strippedTransports > 0 && delta.url === undefined && delta.command === undefined) {
         console.log(
@@ -876,6 +901,14 @@ export function mergeMcpLayers(
             `this client selects the transport from url/command, so the entry is kept as written.`
         );
       }
+      // An unrecognised `type` is inert but worth reporting — HERE, because only this branch knows the
+      // entry is actually KEPT (`merged[name]` below). See `hasUnrecognisedType`.
+      if (hasUnrecognisedType(delta)) {
+        console.log(
+          `[mcp-client] note: repo entry "${name}" has "type": ${JSON.stringify(delta.type)} — this ` +
+            `client selects the transport from url/command and never reads type, so that field has no effect.`
+        );
+      }
       merged[name] = { ...delta };
       continue;
     }
@@ -895,10 +928,10 @@ export function mergeMcpLayers(
     // `declaresTransport` already refuses to treat `""`/`null` as a declared transport, but the spread
     // below then copied the falsy value OVER the base's working one: a repo `{"url": ""}` turned
     // `{url: "https://base/mcp", headers: …}` into `{url: ""}` — an entry `connectServer` rejects with
-    // "has neither 'command' nor 'url'", credentials already dropped, and nothing said so. That is also
-    // what the LAYER READ does with the identical input (`asMcpJson` deletes the falsy field, keeping
-    // the base entry), and the two readers must not disagree about one config. The strip itself is
-    // computed ABOVE, before the repo-only branch, so both branches agree.
+    // "has neither 'command' nor 'url'", credentials already dropped, and nothing said so. The LAYER
+    // READ performs this same strip for a BASE entry (`asMcpJson` deletes the falsy field, keeping the
+    // base entry); a REPO entry reaches this merge exactly as written and is stripped HERE, above both
+    // branches, so the base's working transport survives either way.
     // ⛔ A stripped delta with no transport left is simply a delta that changes no transport: the base's
     // entry stands, which is the intended reading of `{"url": ""}` against a base that has one.
     const carry = { ...inherited } as Record<string, unknown>;
@@ -944,6 +977,16 @@ export function mergeMcpLayers(
       console.log(
         `[mcp-client] note: repo entry "${name}" declares a "type" that disagrees with its transport — ` +
           `this client selects the transport from url/command, so the entry is kept as written.`
+      );
+    }
+    // An unrecognised `type` on a DELTA is inert but worth reporting, and only the merge can say it
+    // without lying about the outcome: this branch's delta is IGNORED outright when it declares both
+    // transports (the `continue` above), so the layer read's "KEPT as written" was false here too.
+    // See `hasUnrecognisedType`.
+    if (hasUnrecognisedType(delta)) {
+      console.log(
+        `[mcp-client] note: repo entry "${name}" has "type": ${JSON.stringify(delta.type)} — this ` +
+          `client selects the transport from url/command and never reads type, so that field has no effect.`
       );
     }
     // TWO INDEPENDENT GUARDS, not `if/else if`. They defend different things — what LAUNCHES and what
@@ -1109,7 +1152,12 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
     }
     // An unrecognised `type` is NOT an error here (see RECOGNISED_TYPES) — but it is worth saying out
     // loud, because the operator wrote it expecting an effect this client will not give it.
-    if (typed.type !== undefined && !(typeof typed.type === "string" && RECOGNISED_TYPES.has(typed.type))) {
+    // ⛔ BASE ONLY (#3628 review round 10). A base entry is copied verbatim by `mergeMcpLayers` and
+    // never inspected there, so it is reported here or nowhere. A REPO entry is ruled on by the merge,
+    // which is the only reader that knows whether the entry is KEPT, IGNORED or DROPPED — reporting it
+    // here claimed "the entry is KEPT as written" about an entry the merge then dropped (measured:
+    // `{"url": "", "type": "sse"}`).
+    if (label.startsWith("base") && hasUnrecognisedType(typed)) {
       console.log(
         `[mcp-client] note: ${label} entry "${name}" has "type": ${JSON.stringify(typed.type)} — this ` +
           `client selects the transport from url/command and never reads type, so the entry is KEPT as written.`
