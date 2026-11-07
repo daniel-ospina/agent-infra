@@ -5,7 +5,7 @@
     "scripts/check-pipeline-compliance.sh": "a95d557c8ab1941bb1b5d4234367efdd83cff13eb474a841d987a5ee3164fd62",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
-    "scripts/record-review.sh": "35b77d408c8eb3d24b3fe0ba25e7d2dbc096dfeb56ffa051148399c4b37c3e42",
+    "scripts/record-review.sh": "c8e3e4ec1c4414f20ae6d3b731e97d385b038ec4bb18c184b6600fefbb992ea8",
     "scripts/admin-merge.sh": "380f60378dff83c8934e56c6c27ad43bd22445aa6304c15f2bc352a205ac5d0d",
     "scripts/gh-shim/gh": "def5111b8735a6875e7d7b3cd4c76ad75caa42f8f2bdd2b044f1f86df6774be7"
   },
@@ -15,12 +15,12 @@
     "scripts/checkout-hygiene/hub-worktree-refresh-advance.sh": "88bde611c5f53bc75c94d56f97b8d6048d21029b1396cb0db162b082ebb9a643",
     "scripts/checkout-hygiene/hub-worktree-salvage-commit.sh": "f747ad00b5babe4474a625b3564f27d3e6523f05147bef79126ff5e4a5a5c29e",
     "scripts/checkout-hygiene/hub-worktree.sh": "13c74d486851f3edb8f1a94997d7ab07f7da4149fb2a558a67395f867e7f9e0b",
-    "scripts/ci-failure-set.sh": "27db8f37ccfaaacf5ca5cb29aa1fdcad7213566f3fc39f5e1cbabff2ee08a130",
+    "scripts/ci-failure-set.sh": "97072b9fb111030dfec0e45416892bb68ae70428755aa21fc757f86b7a54adfb",
     "scripts/ci-workflow-pr-evaluable.sh": "9db2703be4442e2cd11ccb983d5312cb62934e9cbfd51d20e7fd6fb5c0430bb3",
-    "scripts/ci_exemption.py": "09a127da99d5890a038a02ab7db2183e6a2a115ffc973006910ebff32eff08eb",
+    "scripts/ci_exemption.py": "ec1090e60a6841ef83171e2f1485bd82f41814a29c077c7612e9e6d9d847ac07",
     "scripts/gh-shim/gh": "def5111b8735a6875e7d7b3cd4c76ad75caa42f8f2bdd2b044f1f86df6774be7",
     "scripts/lib/diff-normalize.py": "b62b90d6588dfee446a7034f415c13d0e9a4a366222144db0b89922988febe7c",
-    "scripts/record-review.sh": "35b77d408c8eb3d24b3fe0ba25e7d2dbc096dfeb56ffa051148399c4b37c3e42",
+    "scripts/record-review.sh": "c8e3e4ec1c4414f20ae6d3b731e97d385b038ec4bb18c184b6600fefbb992ea8",
     "scripts/scratch-worktree.sh": "45c8672e2ea2c84a288f89e211577c515cbfeb11c7eb018e875aa0ca97f19db5",
     "scripts/verify-admin-merge-evidence.sh": "cc32da5d99e2a02939d2c4fdf73c1c96c8dd1cc59d447bff13e75ad31d0f5f53"
   }

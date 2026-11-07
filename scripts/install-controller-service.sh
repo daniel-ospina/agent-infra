@@ -32,6 +32,11 @@ fi
 # Restart=always within RestartSec) and `start` starts the unit when one is enabled (a tmux controller
 # beside an enabled unit is two dispatchers on one queue, #1761).
 #
+# ⛔ AND THE UNIT NAMES A PATH THAT OUTLIVES THE SHELL THAT RENDERED IT (agent-infra#2697). `Existing at
+# render time` is not a property systemd can rely on at boot, so the resolved supervisor is refused when it
+# cannot survive a cleaning (see `scratch_supervisor_reason`), and the revision it names is RECORDED in the
+# unit's environment (`ORCH_SUPERVISOR_PIN`) so `merged ≠ running` is a readable fact rather than a guess.
+#
 # INSTALL TARGETS, tried in this order, and the reason is named in the output:
 #   1. a SYSTEM unit via passwordless sudo (/etc/systemd/system) — the cell's normal shape; the service
 #      runs as the invoking user, so the state dir, keys.env and gh auth are the operator's, not root's.
@@ -51,6 +56,30 @@ fi
 # Env seams (tests + unusual cells):
 #   ORCH_SUPERVISOR        the supervisor entry point the unit runs
 #                          (default: $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh, else beside this)
+#                          ⛔ REFUSED when it resolves into a lane worktree — a LINKED git worktree checked
+#                          out on a BRANCH, a DETACHED one that is not this box's recorded harness pin, or the
+#                          fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, …) — or under a temporary root
+#                          that no deployment root declares (agent-infra#2697): a unit whose
+#                          ExecStart a cleaning removes burns its start limit (3 attempts inside 300 s) and
+#                          converges to `failed` in well under a minute — SILENTLY, because nothing pages on
+#                          it, so the fleet still believes the box has a dispatcher. The refusal names the
+#                          durable alternatives (the farm,
+#                          $AGENT_INFRA_PATH/scripts, the harness pin)
+#   ORCH_SUPERVISOR_PREFER a CALLER's preference (cloud-cell-bringup.sh names the layer checkout it just
+#                          installed). A non-durable one is SKIPPED with a loud note and the next candidate is
+#                          used — a preference never silently becomes the boot entry point, and it never
+#                          withholds the unit a durable candidate can supply
+#   AGENT_INFRA_PATH       the checkout this box declares as its deployment surface — one of the roots the
+#                          ExecStart refusal accepts under a temporary root (the cells keep their home under
+#                          /tmp, so "under /tmp" alone cannot be the rule). ⛔ IT DOES NOT LAUNDER A WORKTREE:
+#                          a linked worktree is refused before any declaration is consulted, and it finds
+#                          templates too (see TEMPLATES_DIR below)
+#   HARNESS_PIN_FILE       the record naming THIS box's harness pin (default $CELL_HOME/.harness-path). Used
+#                          only to ADMIT a DETACHED linked worktree — the bring-up creates the pin with
+#                          `git worktree add --detach`, so the refusal cannot reject `linked worktree` as a
+#                          class. A detached worktree the record does not name is refused: the fleet's
+#                          drainer gives a LANE's scratch checkout that same shape under $HOME
+#   HARNESS_PIN_DIR        the pin ROOT accepted while no record exists yet (default $CELL_HOME/harness)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
 #   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 60; a whole number, and one that fits
 #                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install).
@@ -134,18 +163,776 @@ help_text() {
 # ⛔ RESOLVED AND PROVEN TO EXIST BEFORE ANYTHING IS RENDERED. A unit whose ExecStart names a missing file
 # is the inert-enforcer shape: `enable --now` succeeds, `is-active` says active, and every restart is a
 # 127 with no controller — a supervised-looking box that dispatches nothing.
+#
+# ⛔ AND IT MUST STILL RESOLVE AFTER THE BOX STOPS TOUCHING IT (agent-infra#2697). Existing-at-render-time
+# was the ONLY guard on the rendered value, so the installer happily pinned the fleet's dispatcher to
+# whatever checkout the operator happened to run `--install` from. MEASURED on cell-1:
+# `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start`, i.e. a LANE WORKTREE at a
+# branch nobody merged (`fix/2402-fence-and-scope`). Two silent consequences: `/tmp` entries are dropped by
+# `systemd-tmpfiles --clean` once they age out of the window the box's own tmpfiles.d sets — `D /tmp … 30d`
+# on this fleet's Ubuntu/systemd-255 image (`/usr/lib/tmpfiles.d/tmp.conf`), 10d on some others; `/tmp` is
+# not its own mount on these cells, so the CLEANER, not a reboot, is the mechanism. After that the unit's
+# ExecStart cannot resolve; `Restart=always` burns the unit's start limit (3 attempts inside 300 s), systemd
+# converges it to `failed` in well under a minute, and NOTHING PAGES — the box is not "supervised and
+# retrying", it is DEAD, while the fleet still believes it has a dispatcher. And the code
+# the dispatcher runs is a branch nobody merged. Same seam, three cells, three different ExecStart shapes,
+# all of them "whatever was beside the installer". Measured again on cell-4 in the shape a TEST render
+# leaves behind: `ExecStart="/usr/local/bin/python3.12" "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r"
+# --dry-run`, timer enabled and failing every ten minutes since 2026-10-30.
+#
+# ⛔ WHAT IS DURABLE IS DECIDED BY THE ROOT THE PATH RESOLVES INTO, NOT BY ITS SPELLING, AND NOT BY "is it
+# under /tmp". The cells keep their home under `/tmp` (`/tmp/cell-home`) and their harness pin at
+# `/tmp/cell-home/harness/<sha>/…` — the CORRECT ExecStart shape, measured on cell-3 — so a rule that
+# refused `/tmp` outright would refuse every healthy cell install. That is the same false block
+# `runner_autoscale.py` records against a blanket refusal ("refusing would make --install-unit unusable ON
+# THE BOXES IT EXISTS FOR"), and this guard must not reintroduce it. So: a path under a temporary root is
+# accepted only while it is inside a root THIS BOX DECLARES as its deployment surface (its cell home, its
+# home, the checkout `$AGENT_INFRA_PATH` names), and a lane worktree is refused wherever it lives, because
+# that is the directory a lane removes when it ends.
+# ⛔ THE TEMPORARY-ROOT LIST IS THE ONE `scripts/orchestrator-harness/runner_autoscale.py` ALREADY USES for
+# the same judgement (`TRANSIENT_UNIT_PREFIXES`), COPIED here because a farmed installer cannot import the
+# python — and the copy is DRIFT-GATED rather than trusted: `install-controller-service.test.sh` §P8 compares
+# the two lists as sets, so a root added on either side reddens until both agree. Without that gate the copy
+# would be the one that stays un-updated and silently ADMITS the next measured shape. `$TMPDIR` is graded at
+# USE time in `transient_root_of`, separately and quoted (never concatenated into the literal: it is a
+# property of the calling shell, a relocated temp is under whatever it says, and a value containing a space
+# must not split into two bogus roots).
+TRANSIENT_ROOTS="/tmp /var/tmp /run /dev/shm /var/folders /private/tmp /private/var/tmp /private/var/folders"
+
+# ⛔ THE AMBIENT-GIT SCRUB HAS ONE OWNER (re-review P1, measured END-TO-END). Every git read here that
+# answers a question about a DIRECTORY must ignore an exported `GIT_DIR`/`GIT_WORK_TREE` pair: with both set,
+# `git -C <lane worktree> rev-parse --show-toplevel` answers the path THEY name and `symbolic-ref -q HEAD`
+# reads THAT repository's HEAD. Four call sites scrubbed individually and two, in `linked_worktree_root`,
+# did not — so `GIT_DIR=<pin>/.git GIT_WORK_TREE=<pin>` made a BRANCH lane worktree grade "detached at this
+# box's recorded pin" and the installer ARMED `ExecStart=<lane worktree>/scripts/cloud-cell-supervisor.sh`
+# with rc=0: the exact #2697 shape, admitted by two exported variables. Reproduced before the fix (primary
+# clone + detached pin + branch worktree, `ORCH_SUPERVISOR` on the branch worktree): without the pair rc=1
+# "LINKED GIT WORKTREE … checked out on a BRANCH", with it rc=0 and the unit rendered. The list therefore
+# exists ONCE, and `linked_worktree_root` reads its branch/detached answer through the same scrub as
+# `git_dirs` — the two halves of one rule cannot disagree any more.
+GIT_SCRUB=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE GIT_OPTIONAL_LOCKS=0)
+
+# lane_scratch_shape <resolved path> — the lane-scratch SHAPE this path matches, or nothing.
+# ⛔ ONE LIST, MIRRORED FROM `scripts/install-repair-service.sh` (its `case "$SCRIPTS_DIR"` in `render()`,
+# which refuses these same shapes for the repair unit) — and the SUITE asserts the two lists are equal (§P6),
+# because a second hand-kept copy is exactly what drifts.
+lane_scratch_shape() {
+    case "${1:-}" in
+        */.worktrees/*)  printf '%s' '*/.worktrees/*' ;;
+        /tmp/wt-*)       printf '%s' '/tmp/wt-*' ;;
+        /tmp/cell-wt-*)  printf '%s' '/tmp/cell-wt-*' ;;
+        /tmp/base-*)     printf '%s' '/tmp/base-*' ;;
+    esac
+}
+
+# pin_root_of_this_box — the harness-pin root this box records, or `$CELL_HOME/harness` (the bring-up's
+# default) when no record exists yet.
+# ⛔ A DETACHED LINKED WORKTREE IS NOT AUTOMATICALLY A PIN (review-4 P1, measured). Detached is ALSO the shape
+# the fleet's drainer gives a lane's scratch checkout — `ai-drainer.sh` runs
+# `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"` (`SEED_REF` = `origin/main`, i.e. a detached HEAD)
+# under `$HOME`, a DECLARED root — and removes it with `worktree remove --force` when the lane ends. Treating
+# "detached ⇒ pin" therefore re-opened the exact class this guard exists for, one layer below the branch rule
+# that closed it: measured, that path was ADMITTED. What separates a pin from a lane's scratch is not the HEAD
+# state but WHERE the box says its pin lives: `$CELL_HOME/.harness-path` (written by the bring-up) or the
+# bring-up's own default `$CELL_HOME/harness` (`HARNESS_PIN_DIR`). A detached worktree outside that root is
+# refused.
+pin_root_of_this_box() {
+    local f p root="" cr
+    f="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+    if [ -f "$f" ]; then
+        p="$(head -1 "$f" 2>/dev/null)"
+        # ⛔ NORMALISE THE SPELLING BEFORE COMPARING (review-5 P3, measured). Other readers of this record do
+        # (`check-farm-drift.sh`, `pi-reap-worktrees.sh`). A record with a trailing slash — `…/scripts/
+        # orchestrator-harness/` — did not match the `*/scripts/orchestrator-harness` case, so it was taken as
+        # the pin ROOT, compared against the pin TREE, and the box's own pin was refused as foreign.
+        while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+        while [ "${p#//}" != "$p" ]; do p="${p#//}"; done
+        case "$p" in
+            */scripts/orchestrator-harness) root="$(dirname "$(dirname "$p")")" ;;
+            '') ;;
+            *) root="$p" ;;
+        esac
+    fi
+    [ -n "$root" ] || root="${HARNESS_PIN_DIR:-$CELL_HOME/harness}"
+    # ⛔ RESOLVED BEFORE IT IS COMPARED (cycle-2 P1, MEASURED — a FALSE BLOCK on the box's own pin). The caller
+    # compares this root against the git toplevel that `linked_worktree_root` read, and git answers a PHYSICAL
+    # path; `path_under`'s own contract says both arguments are already resolved by `canon_dir` (see the three
+    # declared roots, resolved a few lines below in `scratch_supervisor_reason`). This function normalised
+    # SLASHES only, so a record — or a `CELL_HOME`/`HARNESS_PIN_DIR` — whose spelling passes through a benign
+    # symlink (`/home/op -> /mnt/data/op`, the layout #2666 measures in this same file) compared a resolved
+    # toplevel against an unresolved root, and the box's own harness pin was refused as "NOT the harness pin
+    # this box records" while the refusal named that very path as the remedy. Reproduced end to end: a
+    # symlinked `CELL_HOME` with the bring-up's own `git worktree add --detach` pin and its recorded
+    # `.harness-path` => rc=1; the same tree spelled physically => admitted. `canon_dir` uses `realpath -m`, so
+    # it resolves the existing prefix of a path that does not exist yet; an unresolvable root keeps its raw
+    # spelling (fail-closed: an ungradable root still cannot match, but the message stays readable).
+    cr="$(canon_dir "$root")"
+    case "$cr" in
+        ''|"$CANON_UNRESOLVED"*) printf '%s\n' "$root" ;;
+        *) printf '%s\n' "$cr" ;;
+    esac
+}
+
+# pin_supervisor_of_this_box — the supervisor inside the harness pin this box records, or nothing.
+# ⛔ THE REFUSAL'S OWN SECOND REMEDY WAS NEVER A CANDIDATE (review-8 P1, MEASURED). The refusal text tells an
+# operator to use `$CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh`, and on a cell that file is
+# the ONE durable supervisor that actually exists — yet `resolve_supervisor`'s candidate list never proposed
+# it. The other two candidates cannot supply it on a fresh cell: `cloud-cell-supervisor.sh` is in NO
+# pi-bootstrap array (this file's own refusal text records that, #1938), and `beside` is the SAME farmed
+# directory for the farmed installer the bring-up prefers. So when the bring-up's PREFERENCE was skipped for a
+# lane-owner layer, every remaining candidate was absent and the install refused — killing the bring-up on a
+# cell that HAS a durable supervisor, which is the false block the soft preference exists to prevent. And the
+# doc claimed the loss was only the unmerged-code ExecStart because it "falls through to the farm", a file the
+# farm does not ship. The pin is resolved FIRST from the RECORD (exact: the tree the bring-up materialised this
+# run is the one the record names), so "newest pin" is not guessed by glob order; the `<root>/<sha>` scan is the
+# fallback for a box whose record is absent or names only the root.
+pin_supervisor_of_this_box() {
+    local f p tree root t
+    f="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+    if [ -f "$f" ]; then
+        p="$(head -1 "$f" 2>/dev/null)"
+        while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+        case "$p" in
+            */scripts/orchestrator-harness)
+                tree="$(dirname "$(dirname "$p")")"
+                if [ -f "$tree/scripts/cloud-cell-supervisor.sh" ]; then
+                    printf '%s\n' "$tree/scripts/cloud-cell-supervisor.sh"
+                    return 0
+                fi ;;
+        esac
+    fi
+    root="$(pin_root_of_this_box)"
+    [ -n "$root" ] || return 0
+    # the flat-pin layout the guard also admits: the pin ROOT is itself the worktree
+    if [ -f "$root/scripts/cloud-cell-supervisor.sh" ]; then
+        printf '%s\n' "$root/scripts/cloud-cell-supervisor.sh"
+        return 0
+    fi
+    for t in "$root"/*/; do
+        [ -f "${t%/}/scripts/cloud-cell-supervisor.sh" ] \
+            && printf '%s\n' "${t%/}/scripts/cloud-cell-supervisor.sh"
+    done
+    return 0
+}
+
+# linked_worktree_root <resolved supervisor> — the LINKED git worktree this path lives in, or nothing.
+# ⛔ A NAME LIST CANNOT BE THIS GUARD (re-review P1 of #2697). The measured shape was `/tmp/wt-2433-fu`, and
+# a copy nested one fixture deeper (`/tmp/r2697d/wt-2433-fu/…`) matches neither of those patterns nor the
+# `/tmp/wt-*` shape — and the next lane picks the next name. What MAKES a lane checkout a lane checkout is
+# not its spelling: git records it. In the MAIN clone `--absolute-git-dir` and `--git-common-dir` are the
+# same directory; in a LINKED worktree the git dir is `<main>/.git/worktrees/<name>` while the common dir is
+# still `<main>/.git`. So the test is git's own arithmetic, and it holds for `/tmp/wt-x`, `$HOME/wt-x`,
+# `<repo>/.worktrees/x` and every name after them — while a PRIMARY clone under /tmp (`/tmp/cell-ai`, the
+# cells' own checkout) is untouched, which is the shape three cells must keep.
+# ⛔ IT IS UNCONDITIONAL: no declared root excuses it. `cloud-cell-bringup.sh` passes the LAYER checkout as
+# `AGENT_INFRA_PATH`, and that layer MAY BE the lane's own worktree — so "the caller declared it" is the
+# escape this closes, not a reason to admit it.
+git_dirs() { # <dir> — prints "<absolute-git-dir> <git-common-dir>", both resolved, or nothing
+    command -v git >/dev/null 2>&1 || return 0
+    local d="${1:-}" gitdir common
+    # ⛔ THE AMBIENT GIT_* SELECTION IS SCRUBBED (re-review P2, measured). `GIT_DIR=<hub>/.git git -C <a
+    # linked worktree> rev-parse …` answers the HUB for both questions, so the two agreed and this function
+    # printed "main" for a linked worktree — the whole refusal bypassed by one exported variable (a layout
+    # this fleet invites: `/tmp/cell-ai` is a bare-configured clone). The question here is "what does GIT
+    # say about THIS DIRECTORY", so every variable that redirects git's selection is removed for the call.
+    gitdir="$("${GIT_SCRUB[@]}" git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+    common="$("${GIT_SCRUB[@]}" git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    [ -n "$gitdir" ] && [ -n "$common" ] || return 0
+    # ⛔ `--git-common-dir` ANSWERS A RELATIVE PATH IN A MAIN CLONE (`.git`) AND AN ABSOLUTE ONE IN A LINKED
+    # WORKTREE. Compared raw, a primary clone's two answers differ by SPELLING and every primary clone would
+    # read as linked — a false block on `/tmp/cell-ai`, the cell's own checkout. Both are resolved here, once.
+    case "$common" in /*) ;; *) common="$d/$common" ;; esac
+    common="$(canon_dir "$common")"
+    case "$common" in "$CANON_UNRESOLVED"*) return 0 ;; esac
+    gitdir="$(canon_dir "$gitdir")"
+    case "$gitdir" in "$CANON_UNRESOLVED"*) return 0 ;; esac
+    [ "${gitdir%/}" = "${common%/}" ] && { printf '%s %s main\n' "$gitdir" "$common"; return 0; }
+    printf '%s %s linked\n' "$gitdir" "$common"
+}
+
+# git_checkout_unproven <dir> — true when <dir> sits inside a git checkout (a `.git` entry at itself or an
+# ancestor — a DIRECTORY in a main clone, a FILE in a linked worktree) and git could not answer about it.
+# ⛔ "GIT COULD NOT ANSWER" IS NOT "NOT A WORKTREE" (re-review P2). `git_dirs` prints nothing both when the
+# path is not a repository AND when git refused or failed — and the caller read that emptiness as "durable".
+# Reproduced before this fix: a linked worktree under a declared root, with a `git` that exits 1 (git's own
+# `detected dubious ownership` refusal, which THIS repo's `CONTROLLER_ALLOW_ROOT=1` shape can produce; a
+# wrapper exporting GIT_DIR; or git absent), rendered `ExecStart=…/lane-checkout/scripts/…` and armed it.
+# Every other unresolvable branch in this file fails CLOSED (`canon_file`, the #2666 unit-dir guard), and so
+# does this one now: a checkout we cannot interrogate is an UNPROVEN worktree, never a deployment.
+# A farmed copy (no `.git` anywhere above it) is unaffected, which is the shape this must not block.
+git_checkout_unproven() {
+    local d="${1:-}"
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+        [ -e "$d/.git" ] && return 0
+        d="$(dirname "$d")"
+    done
+    return 1
+}
+
+# linked_worktree_root <resolved supervisor> — "<root>|branch", "<root>|detached", a REASON sentence, or nothing.
+# ⛔ A LINKED WORKTREE IS NOT AUTOMATICALLY A LANE'S — THE HARNESS PIN *IS* ONE (review-3 P1, the finding that
+# makes this a rule about the BRANCH). `cloud-cell-bringup.sh` creates every cell's pin with
+# `git worktree add --detach <pin-dir>/<sha> <sha>`, so a rule that refuses every linked worktree refuses the
+# very shape this installer calls CORRECT and the alternative its own refusal message recommends — an operator
+# with no farm is in a loop. What makes the #2697 shape wrong is not "worktree": it is a worktree checked out
+# ON A BRANCH, i.e. unmerged code a lane removes when it lands. A DETACHED worktree is a pin at a commit. Git
+# answers this directly (`symbolic-ref -q HEAD` errors on a detached HEAD), so the rule stays name-free, and the
+# durability question is still decided afterwards by the temporary-root/declared-root test.
+linked_worktree_root() {
+    local d dirs top
+    d="$(dirname "${1:-}")"
+    dirs="$(git_dirs "$d")"
+    if [ -z "$dirs" ]; then
+        if git_checkout_unproven "$d"; then
+            if command -v git >/dev/null 2>&1; then
+                printf 'it is inside a git checkout (%s) that git itself could not identify — commonly a repository owned by another user (git refuses with "dubious ownership"), a wrapper or environment exporting GIT_DIR, or an unreadable .git — so whether it is a LINKED worktree (a lane checkout removed when the lane ends) cannot be shown' "$d"
+            else
+                printf 'it is inside a git checkout (%s) but git is not on PATH, so whether it is a LINKED worktree (a lane checkout removed when the lane ends) cannot be shown — install git, or point ORCH_SUPERVISOR at a farmed copy outside any checkout' "$d"
+            fi
+            return 0
+        fi
+        return 0
+    fi
+    case "$dirs" in *' linked') ;; *) return 0 ;; esac
+    # ⛔ "LINKED" WITH NO NAME IS STILL LINKED. The two rev-parse calls already disagreed with the plain-clone
+    # arithmetic, so an unnamed top level is a worktree we cannot spell — not a reason to admit it.
+    # ⛔ THE SAME SCRUB AS `git_dirs` (re-review P1). `git_dirs` already decided this is a LINKED worktree with
+    # the ambient selection removed, so the branch/detached question — the one that IS the rule — must be asked
+    # the same way. Unscrubbed, an exported pair redirected both reads to the pin and the guard armed the lane.
+    top="$("${GIT_SCRUB[@]}" git -C "$d" rev-parse --show-toplevel 2>/dev/null)"
+    if [ -z "$top" ]; then
+        printf 'it is inside a LINKED GIT WORKTREE that git reported but could not name (its git-dir and common-dir already disagreed, and `rev-parse --show-toplevel` then failed) — a lane checkout removed when the lane ends'
+        return 0
+    fi
+    # ⛔ THE BRANCH, NOT THE WORKTREE (review-3 P1). A detached HEAD is the shape the cells' pin has; a symbolic
+    # HEAD is a branch — unmerged work a lane removes when it lands.
+    if "${GIT_SCRUB[@]}" git -C "$d" symbolic-ref -q HEAD >/dev/null 2>&1; then
+        printf '%s|branch\n' "$top"
+    else
+        printf '%s|detached\n' "$top"
+    fi
+    return 0
+}
+
+# path_under <path> <root> — true when <path> IS <root> or inside it. Both already resolved by canon_dir.
+path_under() {
+    local p="${1%/}" r="${2%/}"
+    [ -n "$r" ] && [ "$r" != "/" ] || return 1
+    case "$p" in "$r"|"$r"/*) return 0 ;; esac
+    return 1
+}
+
+# canon_file <path> — the physical path of a FILE. `canon_dir` resolves a DIRECTORY (and follows a symlinked
+# leaf through realpath/readlink -f), but its last resort is `cd && pwd -P`, which a file cannot do — so on a
+# box where neither `realpath` nor `readlink -f` answers, canon_dir reports EVERY file as unresolved and this
+# guard would refuse a perfectly durable supervisor. That is a false block, so the fallback resolves the
+# CONTAINING DIRECTORY and re-appends the name.
+# ⛔ AND THE FALLBACK DOES NOT GET TO FAIL OPEN ON A SYMLINKED LEAF. Resolution is what sees through an alias
+# (the measured #2666 escape: `ln -s /etc/systemd/system.control $T/alias` was ADMITTED by a literal match), so
+# when the leaf IS a symlink and nothing here can follow it, the answer is "cannot prove" → the caller refuses.
+canon_file() {
+    local f="${1:-}" out d
+    out="$(canon_dir "$f")"
+    case "$out" in "$CANON_UNRESOLVED"*) ;; *) printf '%s\n' "$out"; return 0 ;; esac
+    [ -L "$f" ] && { printf '%s\n' "$out"; return 0; }
+    d="$(canon_dir "$(dirname "$f")")"
+    case "$d" in "$CANON_UNRESOLVED"*) printf '%s\n' "$out"; return 0 ;; esac
+    printf '%s/%s\n' "${d%/}" "$(basename "$f")"
+}
+
+# transient_root_of <resolved path> — the temporary root this path is under, or nothing.
+# ⛔ `$TMPDIR` IS GRADED ON ITS OWN AND QUOTED, NEVER CONCATENATED INTO THE LOOP (re-review P3). Appended to
+# `$TRANSIENT_ROOTS` it was WORD-SPLIT, so a temp root containing a space (a user-chosen TMPDIR is the common
+# case on macOS) became two bogus roots that resolve nowhere and are `continue`d — leaving the box's real temp
+# root ungraded by the one rule that exists to grade it. A fail-open on the list itself.
+transient_root_of() {
+    local p="${1:-}" d root=""
+    for d in $TRANSIENT_ROOTS; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
+        path_under "$p" "$d" && { root="$d"; break; }
+    done
+    if [ -z "$root" ] && [ -n "${TMPDIR:-}" ]; then
+        d="$(canon_dir "$TMPDIR")"
+        case "$d" in
+            "$CANON_UNRESOLVED"*) ;;
+            *) path_under "$p" "$d" && root="$d" ;;
+        esac
+    fi
+    [ -n "$root" ] && printf '%s\n' "$root"
+    return 0
+}
+
+# primary_clone_root <dir> — true when <dir> is the MAIN checkout of a git work tree (not a linked worktree):
+# the shape a deployment has, and the shape `/tmp/cell-ai` has on every cell.
+primary_clone_root() {
+    local dirs
+    dirs="$(git_dirs "${1:-}")"
+    [ -n "$dirs" ] || return 1
+    case "$dirs" in *' main') return 0 ;; esac
+    return 1
+}
+
+# primary_clone_on_lane_branch <dir> — prints the branch name when <dir> is a primary clone checked out on a
+# branch that is NOT the clone's default. Empty output + rc 1 when it is on the default (or detached).
+# ⛔ BEING A CLONE IS NOT BEING MERGED (cycle-6 P2, MEASURED). `primary_clone_root` is git's main-vs-linked
+# arithmetic only — it never asks the branch question that `linked_worktree_root` applies to linked
+# worktrees — so a lane that isolates by CLONING instead of `git worktree add` was admitted under a transient
+# root, and `cloud-cell-bringup.sh` injects `AGENT_INFRA_PATH=$LAYER_ROOT` itself, so the declaration could be
+# the caller's own clone. Reproduced: `/tmp/<fixture>/lane-clone` on `master`-less `lane/x` with
+# `AGENT_INFRA_PATH` naming it rendered an ExecStart into it, rc=0. A clone at the DEFAULT branch is a
+# deployment (`/tmp/cell-ai` on `main` must keep working); a clone on any other branch is unmerged work a
+# lane removes, which is the rule this guard already states in words for every other shape.
+# ⛔ NAMED RESIDUAL — THIS HELPER IS ONLY ASKED ABOUT A CLONE UNDER A TRANSIENT ROOT (review-9 P2, MEASURED).
+# Both call sites sit AFTER `scratch_supervisor_reason`'s `[ -n "$root" ] || return 1`, which returns "durable"
+# for a path outside every temporary root before any clone rule is consulted. So a PRIMARY clone under a
+# durable root (`~/agent-infra`) checked out on a lane branch is ADMITTED. That is the same walk that keeps
+# linked worktrees refused *wherever* they live, so the asymmetry is deliberate rather than an oversight: a
+# linked worktree is removed with `worktree remove` the moment its lane ends, whereas a durable primary clone
+# is a checkout the operator owns and keeps — the thing #2697 is about is a PATH THAT DISAPPEARS, and a
+# durable path does not. The pin records which revision such a unit then runs. Stated here, and in
+# `docs/ops/controller-service.md`, rather than claimed closed.
+primary_clone_on_lane_branch() {
+    local b def ref rc
+    b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || b=""
+    if [ -z "$b" ]; then
+        # ⛔ A DETACHED CLONE IS NOT THE DEPLOYMENT SHAPE EITHER (cycle-8 P2, MEASURED — a pre-existing
+        # FAIL-OPEN that admitted the #2697 class). The line here used to be `[ -n "$b" ] || return 1` with the
+        # comment "detached: no branch to be unmerged at", so a lane that isolates by CLONING and then detaches
+        # at a PR head (`git clone … && git checkout <pr-head>`) was ADMITTED under a transient root — an
+        # ExecStart naming a path a cleaning removes. A deployment clone is checked out on its default branch;
+        # the fleet's only legitimately detached checkout is the harness PIN, which the bring-up creates with
+        # `git worktree add --detach` (`cloud-cell-bringup.sh:1588`) and which `linked_worktree_root` grades
+        # before this helper is ever consulted — so a detached PRIMARY clone has no admitted deployment shape.
+        # Ancestry is the question that can be asked here because there is no name to grade: contained in the
+        # default ref = the deployment's revision (admitted); not contained = a PR head (refused).
+        # ⛔ AND THE GRADED REF IS NOT "THE DEFAULT BRANCH" — it is the LOCAL `refs/remotes/origin/HEAD` symref,
+        # which `git clone` derives from the remote and the caller can rewrite. This guard is an accident guard
+        # (see docs/ops/controller-service.md), not a boundary against a caller who rewrites its own refs.
+        def="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || def=""
+        def="${def#origin/}"
+        # No default ref to compare against: nothing to prove it against. Named residual, disclosed in the doc.
+        [ -n "$def" ] || return 1
+        ref="refs/remotes/origin/$def"
+        "${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --verify -q "$ref" >/dev/null 2>&1 || return 1
+        rc=0
+        "${GIT_SCRUB[@]}" git -C "${1:-}" merge-base --is-ancestor HEAD "$ref" >/dev/null 2>&1 || rc=$?
+        [ "$rc" -eq 0 ] && return 1                       # contained: the deployment's own revision
+        # ⛔ TRI-STATE, NOT A BOOLEAN. `merge-base --is-ancestor` exits 1 for "no" and 128 for "git could not
+        # answer"; folding 128 into "not an ancestor" would print a confident verdict git never gave. A read that
+        # cannot be made is CANNOT PROVE, and this file's rule for that is refuse, never admit.
+        if [ "$rc" -eq 1 ]; then
+            printf 'detached-at-unmerged|%s\n' "$("${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --short HEAD 2>/dev/null)"
+        else
+            printf 'detached-unproven|%s\n' "$("${GIT_SCRUB[@]}" git -C "${1:-}" rev-parse --short HEAD 2>/dev/null)"
+        fi
+        return 0
+    fi
+    case "$b" in main|master) return 1 ;; esac
+    def="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || def=""
+    def="${def#origin/}"
+    [ -n "$def" ] && [ "$b" = "$def" ] && return 1
+    printf 'branch|%s\n' "$b"
+    return 0
+}
+
+# scratch_supervisor_reason <resolved supervisor> — prints WHY this path is not boot-durable, or nothing
+# when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
+# refused for the same reason the #2666 unit-dir guard resolves before it grades.
+scratch_supervisor_reason() {
+    local p="${1:-}" d root="" declared="" shape="" pin="" tree="" base="" held="" b="" pin_ok=0 name_ok=0
+    shape="$(lane_scratch_shape "$p")"
+    if [ -n "$shape" ]; then
+        printf 'it matches the lane-scratch shape %s — a checkout a lane removes when it ends, whose branch is merged nowhere' "$shape"
+        return 0
+    fi
+    d="$(linked_worktree_root "$p")"
+    case "$d" in
+        '') ;;                       # not in any git work tree at all (a farmed copy): nothing to refuse here
+        *'|detached')
+            # ⛔ DETACHED IS NOT ENOUGH — IT MUST BE THE PIN THIS BOX RECORDS (review-4 P1, measured). The
+            # fleet's drainer builds a lane's scratch as a DETACHED worktree under `$HOME` and deletes it when
+            # the lane ends, so admitting any detached worktree re-opened the #2697 class.
+            # ⛔ AND "UNDER THE PIN ROOT" ALONE IS DEFEATED BY THE VARIABLE THAT NAMES THE ROOT (cycle-3 P1,
+            # MEASURED — an ambient-env bypass, not doc drift). `pin_root_of_this_box` falls back to
+            # `HARNESS_PIN_DIR`, so `HARNESS_PIN_DIR=$HOME` made ALL of `$HOME` a pin root and re-admitted the
+            # ordinary drainer scratch: reproduced on a primary clone with `git worktree add --detach
+            # $HOME/wt-drainer-x`, `ORCH_SUPERVISOR` on it — refused when the variable was unset, ARMED with the
+            # unit naming `ExecStart=…/wt-drainer-x/scripts/cloud-cell-supervisor.sh` when it was `$HOME`. That
+            # contradicts `docs/ops/controller-service.md` ("every other detached worktree is refused"), so the
+            # TREE ITSELF is graded now, not just its prefix: it must be a PIN TREE — `<pin>/<commit>` as
+            # `cloud-cell-bringup.sh` builds it (`git worktree add --detach "$HARNESS_PIN_DIR/$sha"`) — or be
+            # exactly the root this box records (the bring-up also accepts a pin that IS the root, when that
+            # path is already a worktree of the repo).
+            # ⛔ AND A NAME, OR A DECLARATION, IS NOT A PIN (cycle-4 P1, MEASURED — my own previous claim here
+            # was OVERBROAD and is corrected by this). Naming and declaring are both CALLER-CONTROLLED inputs, so
+            # grading them alone defended nothing: measured on a primary clone, the unit was ARMED for
+            #   HARNESS_PIN_DIR=$HOME        + a scratch at `$HOME/<40-hex>`        (the hex basename alone won),
+            #   HARNESS_PIN_DIR=<scratch>    + that scratch                      (the equality arm alone won), and
+            #   HARNESS_PIN_FILE=<a file naming <scratch>/scripts/orchestrator-harness>  (any directory a record
+            #                                                                   names became "the pin").
+            # Every one of those is the drainer scratch #2697 exists to refuse. So the tree must now ALSO
+            # CORROBORATE ITSELF the way the bring-up corroborates a pin — `cloud-cell-bringup.sh` refuses to
+            # call anything its harness pin unless it carries `scripts/orchestrator-harness/orch-loop.sh`
+            # ("this is not a harness tree, and a controller started from it would exit at once"). That is a
+            # property of the TREE, so it cannot be produced by naming a scratch cleverly, and it is exactly
+            # the condition every real pin already satisfies — so it blocks no deployment.
+            # ⛔ CORRECTION TO THE PARAGRAPH ABOVE (cycle-5 P1, MEASURED): carrying `orch-loop.sh` is NECESSARY
+            # AND NOT SUFFICIENT, so on its own it corroborated nothing. Every real checkout of this repo carries
+            # `scripts/orchestrator-harness/orch-loop.sh` — and a lane/drainer scratch IS such a checkout
+            # (`ai-drainer.sh`: `git worktree add -f … "$SEED_REF"`), so the missing-file test admitted exactly the
+            # scratch it was written to reject: with it present, `HARNESS_PIN_DIR=<scratch>` armed the unit. The
+            # discriminating corroboration is the one applied below — the tree's NAME must be a prefix of the
+            # commit the tree actually HOLDS — and the flat-pin arm's residual is stated there.
+            pin="$(pin_root_of_this_box)"
+            tree="${d%|detached}"
+            base="$(basename "$tree")"
+            # ⛔ THE NAME MUST AGREE WITH THE TREE IT NAMES (cycle-5 P1, MEASURED — this is the arm that did not
+            # exist). Being hex was never corroboration: a drainer scratch can be created with any name, and the
+            # hex test therefore admitted `$HOME/<40-hex>` and `<exported pin root>/<40-hex>` for a tree holding
+            # a DIFFERENT commit. A pin is created by the bring-up as `git worktree add --detach "$pin_dir/$sha"`,
+            # so the only thing a real pin guarantees is that its basename is the commit it actually holds. That
+            # is a property of the TREE (it is read from the tree), not of the caller's environment, so no naming
+            # can manufacture it: the name must be a prefix of the `rev-parse HEAD` OF THIS TREE.
+            held="$("${GIT_SCRUB[@]}" git -C "$tree" rev-parse HEAD 2>/dev/null)" || held=""
+            if [ -n "$held" ] && [ "${#base}" -ge 7 ] && [ "${#base}" -le 40 ]; then
+                case "$base" in
+                    *[!0-9a-f]*) ;;           # not a commit id at all: a lane scratch is named by its lane
+                    *) case "$held" in "$base"*) name_ok=1 ;; esac ;;
+                esac
+            fi
+            if [ "$name_ok" -eq 1 ]; then
+                pin_ok=1
+            elif [ "${tree%/}" = "${pin%/}" ]; then
+                # ⛔ THE LEGACY FLAT PIN, AND ITS NAMED RESIDUAL (cycle-5 P1). When the pin ROOT is itself the
+                # worktree (`cloud-cell-bringup.sh`'s `_pin_is_worktree_of "$HARNESS_PIN_DIR"`, the pre-sha
+                # layout) there is no commit name to corroborate, so equality with the pin root is the only
+                # signal. The pin root is located by the box's record and its `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE`
+                # overrides, which a caller CAN set — so a caller that declares its own scratch as the pin root
+                # still arms it. That is accepted, not claimed closed, for the same reason `CELL_HOME`/`HOME`
+                # are trusted below: those overrides are how a real box relocates its pin, and refusing them
+                # would false-block every cell whose pin is not at the default path. It is an ACCIDENT guard
+                # (the #2697 shape was an operator installing from a lane worktree with nothing exported), not
+                # a boundary against an operator who deliberately declares a scratch as its pin — that operator
+                # can write the unit anyway. Stated here so the claim and the code agree.
+                pin_ok=1
+            fi
+            [ "$pin_ok" -eq 1 ] && [ ! -f "$tree/scripts/orchestrator-harness/orch-loop.sh" ] && pin_ok=0
+            if [ "$pin_ok" -ne 1 ] || ! path_under "$tree" "$pin"; then
+                printf 'it lives in a DETACHED GIT WORKTREE %s that is NOT the harness pin this box records (%s) — a pin is a TREE named for the commit it holds (`<pin dir>/<sha>`, what the bring-up creates with `git worktree add --detach`) or the recorded pin root itself, AND it carries `scripts/orchestrator-harness/orch-loop.sh`, which is what the bring-up demands of a pin; this one is named `%s`%s, and the fleet drainer builds a lane scratch checkout exactly like it and removes that with `worktree remove` when the lane ends' "$tree" "$pin" "$base" "$([ -f "$tree/scripts/orchestrator-harness/orch-loop.sh" ] && printf '' || printf ' and carries no harness tree')"
+                return 0
+            fi ;;
+        *'|branch')
+            printf 'it lives in the LINKED GIT WORKTREE %s, which is checked out on a BRANCH — a lane checkout that is removed when that lane ends, and whose branch is merged nowhere (a pin is DETACHED at a commit; a branch is unmerged work)' "${d%|branch}"
+            return 0 ;;
+        *)                           # a REASON sentence from linked_worktree_root (unproven, or linked-but-unnamed)
+            printf '%s' "$d"
+            return 0 ;;
+    esac
+    root="$(transient_root_of "$p")"
+    [ -n "$root" ] || return 1      # not under any temporary root: durable wherever it is
+    # ⛔ A DECLARATION IS NOT A SIGNATURE (re-review P1). A reviewer measured the escape: the bring-up passes
+    # `AGENT_INFRA_PATH=$LAYER_ROOT`, and the layer may BE the lane's own checkout, so a caller could declare
+    # the scratch path it wanted armed (`/tmp/<fixture>/wt-2433-fu/…` matches no name pattern, and a plain
+    # copy is not a git worktree, so neither of the checks above sees it). Only the two roots that ARE the
+    # box's persistent surface may declare a temporary path unconditionally: `HOME` and `CELL_HOME` — the
+    # cells' `/tmp/cell-home` is exactly that, recreated by bring-up. Any OTHER declared root (today that is
+    # `AGENT_INFRA_PATH`, the cell's `/tmp/cell-ai` checkout) must itself be durable, or be a PRIMARY git
+    # clone: a clone is a deployment, a loose directory of copied scripts under /tmp is a lane's scratch.
+    # ⛔ NAMED RESIDUAL (re-review P3): `HOME` and `CELL_HOME` are TRUSTED BY DESIGN, not graded. A caller
+    # that exports `CELL_HOME=/tmp/scratch` can therefore arm a path under it — the same laundering §P7
+    # closes for `AGENT_INFRA_PATH`, one env var over. It is accepted rather than fixed because grading them
+    # would be a FALSE BLOCK on every cell: a cell's home IS `/tmp/cell-home` (transient, not a git clone, not
+    # the passwd home), so any rule that demanded durability of it would refuse every bring-up — the exact
+    # class `runner_autoscale.py` records. A box's own home is the one root where "temporary" is the design,
+    # so the escape is stated here instead of being claimed closed.
+    local ch hm
+    ch="$(canon_dir "$CELL_HOME")"; case "$ch" in "$CANON_UNRESOLVED"*) ch="" ;; esac
+    hm="$(canon_dir "$HOME")";      case "$hm" in "$CANON_UNRESOLVED"*) hm="" ;; esac
+    for d in "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:-}"; do
+        [ -n "$d" ] || continue
+        d="$(canon_dir "$d")"
+        case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
+        path_under "$p" "$d" || continue
+        if [ "$d" = "$ch" ] || [ "$d" = "$hm" ]; then declared="$d"; break; fi
+        if [ -z "$(transient_root_of "$d")" ] || { primary_clone_root "$d" && ! primary_clone_on_lane_branch "$d" >/dev/null; }; then declared="$d"; break; fi
+        # ⛔ A CLONE ON AN UNMERGED BRANCH IS A LANE CHECKOUT (cycle-6 P2, MEASURED — see the helper). This is
+        # the one shape the branch rule was not applied to, and the caller can make the declaration itself.
+        # Cycle-8 P2 added the DETACHED shape (`primary_clone_on_lane_branch` prints one of three kinds), and
+        # each kind gets its own sentence: a refusal that names a branch on a DETACHED checkout asserts
+        # something git never said, which is the class of defect this file keeps removing.
+        if b="$(primary_clone_on_lane_branch "$d")" && [ -n "$b" ]; then
+            case "$b" in
+                branch\|*)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone checked out on the BRANCH %s — a clone at the default branch is a deployment, a clone on any other branch is unmerged work a lane removes (a lane that isolates by cloning instead of `git worktree add` lands here), and being a clone is not being merged' \
+                        "$root" "${b#branch|}" ;;
+                detached-at-unmerged\|*)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone on a DETACHED HEAD (%s) that its default branch does NOT contain — a deployment clone is checked out on its DEFAULT branch, and a detached checkout at a commit the default branch does not carry is a PR head a lane removes (a lane that isolates by cloning and then detaches lands here); check the clone out on its default branch, or name the farm or the harness pin' \
+                        "$root" "${b#detached-at-unmerged|}" ;;
+                detached-unproven\|*)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone on a DETACHED HEAD (%s) whose containment CANNOT BE PROVEN — git could not answer `merge-base --is-ancestor` against this clone'\''s default ref, and cannot-prove is refused rather than admitted; check the clone out on its default branch, or name the farm or the harness pin' \
+                        "$root" "${b#detached-unproven|}" ;;
+                *)
+                    printf 'it is under %s, and the root that declares it is a PRIMARY git clone holding work a lane removes (%s)' \
+                        "$root" "$b" ;;
+            esac
+            return 0
+        fi
+    done
+    [ -z "$declared" ] || return 1
+    printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries once they age out of this box'\''s window — 30 days on the fleet'\''s Ubuntu/systemd-255 image, 10 on others), and none of the deployment roots this box declares ACCEPTS it — a root may declare a temporary path only when it is itself durable or a primary git clone (CELL_HOME=%s, HOME=%s%s)' \
+        "$root" "$CELL_HOME" "$HOME" "${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
+    return 0
+}
+
 SUPERVISOR=""
 resolve_supervisor() {
-    local c
-    for c in "${ORCH_SUPERVISOR:-}" \
-             "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" \
-             "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
-        [ -n "$c" ] && [ -f "$c" ] && { SUPERVISOR="$c"; break; }
+    # ⛔ TWO KINDS OF CANDIDATE, AND THE DIFFERENCE IS WHO DECIDED (agent-infra#2697). `ORCH_SUPERVISOR`
+    # is the OPERATOR's requirement for this box — a non-durable one is REFUSED, never silently swapped for
+    # something else, because the operator named exactly what the unit should run. `ORCH_SUPERVISOR_PREFER`
+    # is a CALLER's preference: `cloud-cell-bringup.sh` names the layer checkout it has just installed, so
+    # the unit runs the layer's code rather than a possibly-stale farm (that call site's recorded reason).
+    # On a durable checkout the preference is honoured unchanged; on a LANE WORKTREE — the measured #2697
+    # shape — it is SKIPPED with a loud note instead of arming a unit at a path a lane reaps. What counts as
+    # durable still has exactly ONE owner (this guard), so the two call sites cannot drift apart.
+    local c r why hard i beside pin_sup
+    local -a cands candk
+    beside="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"
+    # ⛔ THE HARNESS PIN IS THE THIRD KIND OF CANDIDATE, AND IT IS THE ONE THE REFUSAL ALREADY RECOMMENDS
+    # (review-8 P1, MEASURED). Preference strength, like the layer: it is the box's own pinned revision, not an
+    # operator's named requirement, so an unusable pin is skipped loudly rather than aborting. It sits BEFORE
+    # the two farm candidates because a pin is this cell's revision and the farm is a possibly-stale copy of
+    # another box's; it sits AFTER the layer preference because the layer is the code this bring-up just
+    # installed. Placed after `beside` only in the `cands` literal sense — the ORDER of the loop is what
+    # decides, so index 2 is the pin and the two farm paths follow it.
+    pin_sup="$(pin_supervisor_of_this_box 2>/dev/null | head -1)"
+    cands=( "${ORCH_SUPERVISOR:-}" "${ORCH_SUPERVISOR_PREFER:-}" "$pin_sup" \
+            "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" "$beside" )
+    candk=( 1 0 0 0 0 )
+    for i in 0 1 2 3 4; do
+        c="${cands[$i]}"; hard="${candk[$i]}"
+        # ⛔ AN OPERATOR'S REQUIREMENT THAT DOES NOT EXIST IS REFUSED, NEVER SILENTLY SWAPPED (re-review P2).
+        # The candidate loop used to `continue` on a missing path for BOTH strengths, so
+        # `ORCH_SUPERVISOR=<typo or moved checkout>` armed the farmed copy and printed nothing — the
+        # "merged ≠ running" class this seam exists to surface, reintroduced by the fallthrough itself.
+        # A broken symlink and a directory land here too (`-f` is false for both), which is correct: neither
+        # can be the unit's ExecStart.
+        if [ "$hard" = 1 ] && [ -n "$c" ] && [ ! -f "$c" ]; then
+            err "REFUSING: ORCH_SUPERVISOR=$c is not a readable file, so the supervisor the operator named cannot be the unit's ExecStart."
+            err "  It is NOT silently replaced by another copy: a requirement swapped for whatever happened to be farmed is exactly"
+            err "  the merged-not-running class this seam surfaces (agent-infra#2697). Fix the path, or unset ORCH_SUPERVISOR to accept"
+            err "  the defaults (the farm, then beside this installer)."
+            return 1
+        fi
+        [ -n "$c" ] && [ -f "$c" ] || continue
+        # ⛔ THE VALUE THE UNIT NAMES IS THE VALUE THAT WAS GRADED — resolved, not as spelled, for the same
+        # reason `systemd_unit_dir_refusal` grades the resolved unit directory: otherwise the guard and the
+        # ExecStart line can describe two different files whenever either path has a symlink in it.
+        r="$(canon_file "$c")"
+        case "$r" in
+            "$CANON_UNRESOLVED"*)
+                err "REFUSING: cannot resolve '$c' to a physical path, so whether the unit's ExecStart would survive a cleaning cannot be shown — a broken symlink and a directory this user cannot read both look like this. Point ORCH_SUPERVISOR at a readable, resolved path."
+                return 1 ;;
+        esac
+        # ⛔ A PATH THIS TEMPLATE CANNOT CARRY IS REFUSED, NOT RENDERED (re-review P2, measured). The template
+        # renders `Environment=ORCH_SUPERVISOR_PIN=…` and `ExecStart=/bin/bash {{SUPERVISOR}} start` UNQUOTED,
+        # so systemd splits on whitespace: a checkout at `…/home/sp ace` rendered a unit whose pin assignment
+        # systemd DROPPED ("Invalid environment assignment, ignoring: ace@…") and whose ExecStart named a path
+        # that is not there — while `verify_unit`'s exact-line `grep -qxF` PASSED on the raw text. That is the
+        # false-PASS shape this file keeps ruling out, so the render refuses and the operator moves the
+        # checkout instead of silently shipping a unit systemd reads differently than the installer does.
+        # ⛔ AND THE UNQUOTED SPLIT IS NOT THE ONLY WAY SYSTEMD REWRITES THIS LINE (cycle-2 P2, MEASURED). `%`
+        # is a SPECIFIER prefix and `$` starts a VARIABLE EXPANSION in a command line, and both apply to the
+        # rendered text: `systemd-analyze verify` on `Environment=ORCH_SUPERVISOR_PIN=/tmp/a%x/repo@abc`
+        # reports "Failed to resolve specifiers in PIN=/tmp/a%x/repo@abc, ignoring: Invalid slot" — the pin
+        # assignment is DROPPED exactly as the whitespace case drops it — while `verify_unit`'s `grep -qxF`
+        # still passes, and `systemd-analyze` refuses to even grade an ExecStart whose path contains `%`.
+        # A checkout under such a path therefore renders an artifact systemd reads differently than this
+        # installer does, so it is refused for the same reason rather than silently shipped.
+        # ⛔ AND THE QUOTING META‑CHARACTERS ARE A THIRD SPELLING (cycle-3 P2, MEASURED). systemd parses these
+        # two unquoted lines with its own word splitter, which STRIPS single quotes and interprets `\`: a
+        # supervisor under `…/ag'in'fra/…` installed with rc=0 and an ExecStart naming `…/aginfra/…`, which
+        # `systemd-analyze verify` then rejected as "not executable" (an unpaired quote gives "Unbalanced
+        # quoting, ignoring"; a backslash gives "Ignoring unknown escape sequences") — the same false PASS the
+        # whitespace arm closes, one character class over. `verify_unit`'s `grep -qxF` still matches the raw
+        # text either way, so the render refuses them too.
+        case "$r" in
+            *[[:space:]]*|*'"'*|*"'"*|*\\*|*%*|*'$'*)
+                if [ "$hard" = 1 ]; then
+                    err "REFUSING: the supervisor path '$r' contains whitespace, a quote, a backslash, '%' (a systemd specifier) or '$' (variable expansion), and this unit renders its environment and ExecStart UNQUOTED."
+                    err "  systemd would split, strip, expand or drop that value, silently DROP the pin assignment and fail to exec the supervisor (measured:"
+                    err "  'Invalid environment assignment, ignoring: …', 'Failed to resolve specifiers …, ignoring: Invalid slot' and an ExecStart whose quoted path is not executable), while the rendered text still looks right."
+                    err "  Move the checkout to a path without spaces, quotes, a backslash, '%' or '$', or pass a supervisor that has none."
+                    return 1
+                fi
+                err "note: NOT rendering ExecStart from $r — the path contains whitespace, a quote, a backslash, '%' or '$', which this unit renders unquoted and systemd would split, strip, expand or drop."
+                continue ;;
+        esac
+        if why="$(scratch_supervisor_reason "$r")"; then
+            if [ "$hard" = 1 ]; then
+                err "REFUSING to render an ExecStart that will not survive this box: $r"
+                err "  $why."
+                err "  This is the agent-infra#2697 shape, and it fails SILENTLY: once that path is gone the unit's"
+                err "  ExecStart cannot resolve, its start limit (3 attempts inside 300 s) is burned inside a minute,"
+                err "  systemd converges it to 'failed' — and nothing pages. Every surface that asks reads a dead"
+                err "  unit, while the fleet still believes this box has a supervisor."
+                err "  Name a DURABLE supervisor instead, any one of:"
+                # ⛔ THE REMEDY MUST NOT NAME A SHAPE THIS SAME GUARD REFUSES (review-7 P2, measured). Since
+                # `primary_clone_on_lane_branch` landed, "a PRIMARY clone" is not sufficient — a clone on a LANE
+                # branch is refused one branch over. An operator following the old wording landed back in the
+                # refusal it was printed by, with no way to tell which of the two rules refused them.
+                err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone on its DEFAULT branch — not a worktree, and not a clone on a lane branch)"
+                err "    $CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh   (the harness pin)"
+                err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm's PATH — see the warning below)"
+                err "  ⛔ THE FARM DOES NOT DELIVER THIS FILE (re-review P2, measured): 'cloud-cell-supervisor.sh' is in"
+                err "    NO pi-bootstrap array — setup.sh's own comment records it as a named residual owned by #1938 —"
+                err "    so 'bash pi-bootstrap/setup.sh' alone will NOT create the .pi/agent/scripts path above. Copy it"
+                err "    from a clone that has it, or use one of the two entries above."
+                err "  …or pass one explicitly: ORCH_SUPERVISOR=<that path> bash $0 --install"
+                return 1
+            fi
+            # A PREFERENCE, not a requirement: say so loudly and fall through to the next candidate.
+            err "note: NOT rendering ExecStart from $r — $why."
+            err "  Falling through to the next durable candidate (the #2697 refusal, applied to a CALLER's"
+            err "  preference: ORCH_SUPERVISOR_PREFER — an explicit ORCH_SUPERVISOR would have been refused)."
+            continue
+        fi
+        SUPERVISOR="$r"
+        break
     done
     [ -n "$SUPERVISOR" ] || {
-        err "cloud-cell-supervisor.sh not found — looked at \$ORCH_SUPERVISOR, \$HOME/.pi/agent/scripts, and beside this installer. Farm it first: bash pi-bootstrap/setup.sh"
+        err "no DURABLE cloud-cell-supervisor.sh to render — looked at \$ORCH_SUPERVISOR, \$ORCH_SUPERVISOR_PREFER, the harness pin (\$CELL_HOME/harness), \$HOME/.pi/agent/scripts, and beside this installer."
+        err "  A unit whose ExecStart a cleaning removes is not supervised: the start limit burns inside a minute,"
+        err "  systemd converges it to 'failed', and nothing pages (agent-infra#2697). Name a durable copy:"
+        err "    ORCH_SUPERVISOR=${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh bash $0 --install"
+        err "  ⛔ 'bash pi-bootstrap/setup.sh' DOES NOT CREATE \$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh —"
+        err "    the supervisor is in no farm array (setup.sh records the residual; #1938 owns delivery), so the"
+        err "    farmed path is only viable on a box that already has the file there."
+        err "  Durable roots this box declares: CELL_HOME=$CELL_HOME, HOME=$HOME${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
         return 1
     }
+    supervisor_pin
+}
+
+# ⛔ RECORD THE REVISION THE UNIT WILL RUN, NOT JUST THE PATH (agent-infra#2697, third bullet). The other
+# half of the measured defect was that NOTHING recorded which code a box executes: cell-4's farmed copy was
+# sha 9228492e… of Oct 23 while `main` was 1680457a…, and the only way to learn that was `git -C` guessing
+# at a path the unit merely names. Rendered into the unit's ENVIRONMENT it is readable from
+# `systemctl show eldato-orchestrator -p Environment` and from `--status`, and the controller process
+# inherits it, so "which revision is this box running" stops being an inference.
+# ⛔ IT IS AN OBSERVATION, NOT A GATE: a supervisor outside any git work tree (a farmed copy, an unpacked
+# tarball) is legitimate and records `unknown@unknown`. Refusing it would be a false block on the shape the
+# farm actually produces, and this installer must never withhold a supervisor over a diagnostic.
+# ⛔ AND IT IS THE REVISION THE UNIT WILL **BOOT**, NOT A CLAIM ABOUT A LIVE PROCESS (re-review P2). `--install`
+# re-renders but deliberately does not restart a healthy unit (see do_install), so after a checkout advances
+# this value names the bytes the NEXT start executes; a running controller can still be on the previous ones
+# until it restarts. Read it as "what this box will boot", which is what it measures.
+SUPERVISOR_PIN=""
+supervisor_pin() {
+    local dir repo="" sha="" gd named="" dirty="" dirt_rc=0 rel="" want="" got=""
+    dir="$(dirname "$SUPERVISOR")"
+    # ⛔ THE PIN NAMES A REPO THAT ACTUALLY CARRIES THIS FILE (re-review P2, measured). `git -C <dir> rev-parse`
+    # answers the nearest ENCLOSING work tree, whether or not it has anything to do with the supervisor: a farmed
+    # copy under a `$HOME` that is itself a repository (the ordinary dotfiles layout) recorded a confident
+    # `<home>@<sha>` — a PLAUSIBLE WRONG answer to "which code does this unit run", which is worse than none
+    # because it reads as proof. So when git NAMES a top level, that work tree must actually TRACK this file;
+    # otherwise the pin is `unknown@unknown`.
+    if command -v git >/dev/null 2>&1; then
+        # ⛔ THE SAME SCRUB AS `git_dirs` (re-review P2): an exported GIT_DIR would make the pin describe the
+        # HUB instead of the code the unit runs — a diagnostic that lies is worse than none.
+        named="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || named=""
+        if [ -n "$named" ]; then
+            "${GIT_SCRUB[@]}" git -C "$dir" ls-files --error-unmatch -- "$SUPERVISOR" >/dev/null 2>&1 \
+                && repo="$named"
+        else
+            # ⛔ AND A BARE-CONFIGURED PRIMARY CLONE HAS NO TOP LEVEL TO NAME (re-review P3, measured: this
+            # fleet's `/tmp/cell-ai` is `core.bare=true`, so `--show-toplevel` fails while `HEAD` answers). The
+            # documented pin is `<repo>@<sha>` and `unknown@unknown` is reserved for "outside any git work tree",
+            # so falling back to the git dir is the difference between a usable pin and a diagnostic that is
+            # empty precisely on the cells' own shape. `<...>/.git` is stripped when it is a suffix. This arm is
+            # deliberately NOT held to the tracking test above: a `core.bare` clone has no work tree and no
+            # index for `ls-files` to answer from, and §P3 pins that shape's `<repo>@<sha>`.
+            gd="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
+            case "$gd" in
+                */.git) repo="${gd%/.git}" ;;
+                *) repo="$gd" ;;
+            esac
+        fi
+        if [ -n "$repo" ]; then
+            sha="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
+            # ⛔ A DIRTY WORK TREE MAKES THE RECORDED SHA A CONFIDENT WRONG ANSWER (review-7 P2, MEASURED).
+            # `HEAD` describes the COMMIT; it does not describe the BYTES. With the tracked
+            # `scripts/cloud-cell-supervisor.sh` hand-edited in the work tree, the install rendered
+            # `…/repo@<sha>` while the file the unit executes was a different blob — the pin asserting "the
+            # unit boots <sha>" about bytes that are not `<sha>`. That is the same PLAUSIBLE WRONG answer this
+            # function already rejects for the dotfiles case, and the repo holds the opposite rule for exactly
+            # this question: `cloud-cell-supervisor.sh::stamp_write` reads the dirty bit LIVE and refuses to
+            # record a provenance stamp it cannot trust (`agentInfraDirty` exists because "its commit does not
+            # describe its bytes"). So the pin says so.
+            # ⛔ SCOPED TO THE SUPERVISOR FILE, not the whole tree. An unrelated dirty file (the ordinary state
+            # of a working checkout) does not change what this unit executes, and flagging it would make the
+            # pin cry wolf until operators learned to ignore it — the diagnostic would be dead.
+            # ⛔ AND THE CORROBORATION IS OBJECT-LEVEL, NOT A WORK-TREE `status` (review-8 P2, MEASURED — my own
+            # previous version of this block was a FALSE PASS on the shape the fleet actually runs). The dirty
+            # read was guarded by `[ -n "$named" ]`, i.e. it only ran when git NAMED a top level — and this
+            # fleet's `/tmp/cell-ai` is `core.bare=true`, so `--show-toplevel` fails there and the read was
+            # SKIPPED. A hand-edited supervisor on a cell therefore recorded a confident `<repo>@<sha>`, which
+            # is exactly the wrong answer this block exists to stop, on the one checkout operators patch in
+            # place. No arm could see it (`core.bare` was only ever exercised CLEAN).
+            # So the question is asked the way it can always be answered: hash the FILE BYTES and compare them
+            # with the blob `HEAD` holds for that path. That needs no work tree and no index, so it answers
+            # identically on a bare-configured clone, a normal checkout, and one where the file is not tracked
+            # at all (where the tree read fails and the pin degrades — fail-closed).
+            rel="${SUPERVISOR#"$repo"/}"
+            want="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse "HEAD:$rel" 2>/dev/null)" || dirt_rc=1
+            got="$("${GIT_SCRUB[@]}" git -C "$dir" hash-object -- "$SUPERVISOR" 2>/dev/null)" || dirt_rc=1
+            if [ "$dirt_rc" -ne 0 ] || [ -z "$want" ] || [ -z "$got" ]; then
+                dirt_rc=1
+            elif [ "$want" != "$got" ]; then
+                dirty=1
+            fi
+        fi
+    fi
+    case "$sha" in ''|*[!0-9a-f]*) sha="unknown" ;; esac
+    # ⛔ THE DERIVED `<repo>` IS CHARACTER-GRADED TOO (cycle-6 P3, MEASURED — a FALSE PASS in the pin this PR
+    # adds). The reasoning a few lines above holds for `--show-toplevel`, which is always an ANCESTOR of the
+    # already character-checked supervisor path — it does NOT hold for the `--absolute-git-dir` fallback, which
+    # can answer a path outside the tree (a `.git` pointer at a bare gitdir). Measured:
+    # `SUPERVISOR_PIN=[/tmp/<fixture>/bare dir.git@unknown]` rendered as
+    # `Environment=ORCH_SUPERVISOR_PIN=/tmp/<fixture>/bare dir.git@unknown`, which systemd drops as an invalid
+    # assignment — while `verify_unit`'s `grep -qxF` matched the RAW TEXT and passed. So the unit ships with no
+    # pin and the gate that exists to notice says OK. The pin is an OBSERVATION, never a gate, so degrading it
+    # to `unknown@unknown` costs nothing and keeps the diagnostic honest.
+    # ⛔ THE DERIVED `<repo>` NEEDS NO CHARACTER GRADE OF ITS OWN — AND THE ONE THAT USED TO SIT HERE WAS DEAD
+    # CODE THAT ALSO SHIPPED AN UNDOCUMENTED SPELLING (review-9 P2, MEASURED). The cycle-6 grade existed because
+    # `--absolute-git-dir` can answer a path outside the tree; it emptied `repo` and left `sha` holding a valid
+    # `HEAD`, so the artifact read `unknown@<sha>` — a THIRD spelling this comment did not predict and
+    # `docs/ops/controller-service.md` does not document (it promises `<repo>@<sha>` or `unknown@unknown`).
+    # ⛔ AND DELETING IT LOSES NOTHING, because the byte read ABOVE already covers every shape that could reach
+    # it. A `repo` containing whitespace, a quote, a backslash, `%` or `$` is exactly the class
+    # `resolve_supervisor` refuses on the SUPERVISOR PATH, so there are only two cases and both are safe:
+    #   (a) the supervisor lives under that `repo` -> its own path carries the character -> refused before this
+    #       function is ever called;
+    #   (b) it does not -> `rel` ABOVE stays ABSOLUTE, `rev-parse "HEAD:$rel"` fails, `dirt_rc=1`, and the whole
+    #       pin degrades to `unknown@unknown` — the documented spelling.
+    # Measured: an end-to-end fixture (a work tree whose `.git` file points at a bare gitdir under a SPACED path,
+    # so `--show-toplevel` fails and `--absolute-git-dir` answers the spaced path) yields `unknown@unknown` with
+    # the grade, without it, and with only its `repo` half — i.e. the grade never decided anything (an INERT
+    # ENFORCER). §P3 pins that fixture end to end, so a regression that renders a spaced `<repo>` goes RED.
+    [ -n "$repo" ] || repo="unknown"
+    # ⛔ A SHA THAT CANNOT BE CORROBORATED IS NOT A SHA (review-7 P2). If the dirty read failed we cannot say
+    # whether `<sha>` describes the bytes the unit boots, and recording it anyway is the confident-wrong-answer
+    # shape above — so the whole pin degrades rather than shipping an unqualified revision. `+dirty` marks the
+    # case we CAN see: HEAD resolves, but the executed file has local edits, so `<sha>` is the commit it was
+    # forked from and not the code that runs. Both spellings stay parseable by the `--status` reader.
+    if [ "$dirt_rc" -ne 0 ]; then
+        SUPERVISOR_PIN="unknown@unknown"
+    elif [ -n "$dirty" ]; then
+        SUPERVISOR_PIN="${repo}@${sha}+dirty"
+    else
+        SUPERVISOR_PIN="${repo}@${sha}"
+    fi
     return 0
 }
 
@@ -353,6 +1140,7 @@ render() {
         -e "s|{{ENV_FILE}}|$(sed_esc "$ENV_FILE")|g" \
         -e "s|{{PATH}}|$(sed_esc "$PATH")|g" \
         -e "s|{{SUPERVISOR}}|$(sed_esc "$SUPERVISOR")|g" \
+        -e "s|{{SUPERVISOR_PIN}}|$(sed_esc "$SUPERVISOR_PIN")|g" \
         -e "s|{{RESTART_SEC}}|$RESTART_SEC|g" \
         -e "s|{{START_TIMEOUT_SEC}}|$START_TIMEOUT_SEC|g" \
         -e "s|{{HANDOVER_TIMEOUT_SEC}}|$HANDOVER_TIMEOUT_SEC|g" \
@@ -378,6 +1166,7 @@ verify_unit() {
              "Environment=CONTROLLER_ORPHAN_TIMEOUT=$START_TIMEOUT_SEC" \
              "Environment=CONTROLLER_HANDOVER_TIMEOUT=$HANDOVER_TIMEOUT_SEC" \
              "Environment=ORCH_FOREGROUND=1" "Environment=O=$O" \
+             "Environment=ORCH_SUPERVISOR_PIN=$SUPERVISOR_PIN" \
              "Environment=CONTROLLER_UNIT=$UNIT_NAME" \
              "ExecStart=/bin/bash $SUPERVISOR start" "User=$(id -un)" \
              "WantedBy=${WANTED_BY:-multi-user.target}"; do
@@ -1026,6 +1815,21 @@ do_status() {
         fi
     fi
     log_line "unit=$UNIT_NAME target=$TARGET"
+    # ⛔ WHICH REVISION BOOTS THIS BOX, read off the INSTALLED artifact (agent-infra#2697). Informational
+    # only: a unit rendered before the pin existed prints `absent`, and that is exactly the fact an operator
+    # needs (re-render to record it) — it never moves the verdict, because supervision is not the pin.
+    # ⛔ AND IT ONLY SPEAKS ABOUT A UNIT THAT EXISTS HERE (re-review P3). Printed unconditionally after
+    # `unit=…`, the `absent` line claimed a unit had been "rendered before the pin was recorded" even when
+    # nothing was installed at this path, or when the copy present belongs to ANOTHER state dir (which this
+    # verb disowns two lines down) — an assertion about an artifact that was not there. The fact is reported
+    # only for our own file; otherwise the line says what is true.
+    local _pin=""
+    if [ -f "$UNIT_DIR/$UNIT_NAME" ] && unit_is_ours "$UNIT_DIR/$UNIT_NAME"; then
+        _pin="$(sed -n 's|^Environment=ORCH_SUPERVISOR_PIN=||p' "$UNIT_DIR/$UNIT_NAME" 2>/dev/null | head -1)"
+        log_line "supervisor_pin=${_pin:-absent (rendered before the pin was recorded — re-render with --install)}"
+    else
+        log_line "supervisor_pin=none (no unit of this state dir is installed here)"
+    fi
     # ⛔ NAME A COPY THAT IS NOT THIS STATE DIR'S, INSTEAD OF ANSWERING FOR IT (review P1, #2402). Silence
     # here is what made this verb's rc 0 readable as "my cell is supervised" on a box whose only unit belongs
     # to another state dir. It is reported on its own line and never addressed: the manager answers about the
@@ -1506,7 +2310,7 @@ do_uninstall() {
                     "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
             [ -n "$_sup" ] && [ -f "$_sup" ] && break || _sup=""
         done
-        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (farm it: bash pi-bootstrap/setup.sh)"
+        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (from a checkout that still has it — the farm does not create it, see #1938)"
     fi
     log_line "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $_sup start', and note that a tmux controller is NOT restarted by anything (#2402)"
     return 0

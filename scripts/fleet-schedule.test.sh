@@ -3130,10 +3130,12 @@ m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(root, "loop.lock")
 # Two stubs, so the interleaving is the only thing under test: every pid reads as alive, and only the
 # COMPETITOR reads as a scheduler loop. Its recorded start time is the REAL one, so the identity
 # check recognises it — otherwise the test would be grading the start arm, not this one.
-# ⛔ KEEP THE APOSTROPHE COUNT IN THIS BODY EVEN (#3625). The bash 3.2 scanner does not know about
-# here-documents inside a command substitution: it walks the body as code, so one odd single-quote
-# opens a state that never closes and the WHOLE FILE fails `bash -n`, reported far below the defect.
-# Verify with `bash scripts/check-bash32-parse.sh` after any edit in here.
+# ⛔ NO QUOTE OR BACKTICK CHARACTERS IN THIS BODY (agent-infra#3625). The bash 3.2 scanner does not
+# know about here-documents inside a command substitution: it walks the body as code, so one odd
+# single-quote opens a state that never closes and the WHOLE FILE fails `bash -n`, reported far
+# below the defect. Reworded, not escaped — and the count is kept even to zero, so there is no
+# state for the scanner to open. Verify with `bash scripts/check-bash32-parse.sh` after any edit
+# in here.
 m.pid_alive = lambda p: True
 m.pid_is_our_loop = lambda p: p == live
 competitor_start = m.proc_start_time(live)

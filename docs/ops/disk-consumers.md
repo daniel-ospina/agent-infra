@@ -302,10 +302,25 @@ would otherwise be a false state claim.** #3272 (`f2d40ef8`) added
 `DISK_REAPER_GITLESS=0` as the off-switch — so a `/tmp/<name>` tree with **no `.git` at all** is a
 candidate once the liveness witness this section asks for answers (a live-pid cwd/exe census; a live
 lane preserves the tree with `reason=live-cwd`). It carries a keep list (`REAP_AW_GITLESS_KEEP`,
-default `/tmp/actions-runner:/tmp/venv-shared*`) and a per-pass cap (`REAP_AW_GITLESS_MAX`, default 10).
+default `/tmp/actions-runner:/tmp/venv-shared*`), is bounded **per root** by a **wall-clock budget**
+(`REAP_AW_BUDGET_SECONDS`, default 300 s) that gates its **expensive per-candidate work** (the census,
+`git status`, the re-probe, removal) — not the whole class: the eligibility scan is proportional to the
+population, so the caller's outer bound is `DISK_REAPER_CLASS_TIMEOUT=1800` **per root invocation**
+(the caller runs this delegate once per root, each under its own watchdog — an N-root pass is bounded by
+N x 1800, not by 1800) — and keeps #3272's
+**count ceiling** (`REAP_AW_GITLESS_MAX`,
+default 10 per root). #3278 changed **when that ceiling is charged**, not its size: the unit is now
+taken after the age floor and before the live-pid census, so the ten slots go to AGED trees instead of
+being spent on the young ones the floor preserves anyway — that mis-charging was what starved the class
+(a dry run classified 10 of 3,314 entries and printed `gitless-cap` for 3,137, ~89 % of the slots
+having gone to trees the floor would have kept). **An exhausted ceiling short-circuits the eligibility
+scan too**, so the scan is bounded by the ceiling as well as by the class timeout — past the ceiling a
+tree costs one compare, and its row names the ceiling rather than its own reason (the arm did not look;
+the tree is preserved either way). **Raising or removing the ceiling is #3278's P3, an
+owner decision, and has not been taken.**
 **#3043's remaining scope** is therefore the trees a `.git`-owned arm claims (they keep their own
-`open-pr`/`dirty`/`main-checkout` proofs) plus whatever the cap leaves for the next hour — not
-"everything under `/tmp`".
+`open-pr`/`dirty`/`main-checkout` proofs) plus whatever the ceiling and the pass's time bound leave for
+the next run — not "everything under `/tmp`".
 
 ## Age distribution — the disk is a rolling 7-day window, not a rot
 
@@ -367,19 +382,46 @@ rm -rf /tmp/venv-shared-py312                                       # 5,844 MB, 
 
 ### R4 — lane scratch copies (the only bucket that scales)
 ```bash
-# dry-run: name them, size them, prove no live holder
-find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +4320 \
+# dry-run: name them, size them, prove no live holder.
+# The age floor is 180 min — the scratch arm's OWN floor (`reap-abandoned-worktrees.sh:117`,
+# `AGED_MINUTES=180`), not 72 h. On `cmux` the 72 h window is nearly empty (~5 MB of a ~76 GB
+# scratch population), which is what stopped anyone asking why the disk kept filling — but a
+# CELL is not empty at 72 h (see *Expected* and *Age distribution*: the page's own bands).
+find /tmp -maxdepth 1 -mindepth 1 -type d -mmin +180 \
      ! -name 'cell-*' ! -name 'actions-runner' ! -name 'venv-shared*' \
      ! -name 'G-*' ! -name '.pytest_cache' ! -name 'systemd-*' -print0 |
   xargs -0 du -xsh 2>/dev/null | sort -h | tail -20
 # every candidate must then pass: no .git dir/file, no /proc cwd/exe/argv inside it
 ```
-* **Expected:** the 3–7 day band is **18,292 MB (cell 3)** / **20,423 MB (cell 4)**; the 7–14 day band
-  adds 7,959 MB on cell 3.
-* **Guard (all must hold):** age ≥ 72 h **and** not a git checkout (`.git` present ⇒ skip) **and** no
-  live process holds it **and** the run is a dry-run whose count matches on a second read. Never take
-  this from a single `find | head` — a first-match reading is exactly the artifact class in
-  `AGENTS.md`.
+* **Expected:** measured on `cmux` (252 GB volume, 2026-11-06), the same command at two floors —
+  `du -xsc` total across the filtered dirs, so the number is directly comparable:
+
+  | floor | total | dirs |
+  |---|---|---|
+  | `-mmin +4320` (the old 72 h) | **5,008 KB — 4.9 MB** | 8 |
+  | `-mmin +180` (this one) | **80,155,676 KB — ~76.4 GB** | 3,124 |
+
+  `/tmp` totalled **94 GB** (`du -xsm /tmp` → `96,310`), so on this box the 3 h–72 h band is
+  essentially the whole scratch population: **a 72 h floor reports 0.006% of that 76.4 GB
+  population** (0.005% of all of `/tmp`), and the directory count grows each time it is re-run
+  (a tree joins the set the moment it crosses 180 min). Its top-20 rows are ordinary
+  mutation/review copies (`/tmp/muth` 1.4 G, `/tmp/revX` 2.4 G, `/tmp/tt_s80isga_` 1.6 G,
+  `/tmp/wt-prefix-11211` 1.2 G …), which is what the bucket is *for*.
+
+  ⛔ **Those figures are `cmux`'s, and they are NOT a box-wide claim that 72 h finds nothing.**
+  A cell looks different: *Age distribution* above (top-250 `/tmp` children by directory mtime —
+  a different basis, and measured before this recipe's exclusions) puts cell 3's 3–7 d band at
+  **18,292 MB** and its 7–14 d band at 7,959 MB, with cell 4 at 20,423 MB in the 3–7 d band. So
+  a cell at 72 h still has tens of GB on the table, and the floor moved to 180 min because that
+  is the **scratch arm's own floor** — the number this recipe has to agree with — not because a
+  72 h window is empty on every box.
+* **Guard (all must hold):** age ≥ 180 min — the arm's own floor, not a second number — **and** not a
+  git checkout (`.git` present ⇒ skip) **and** no live process holds it **and** the run is a dry-run
+  and the SET you then act on is re-measured at apply time. An exact-count equality is **not** the
+  test, and the paragraph above is why: this population gains a tree every time a tree crosses 180
+  min, so two reads minutes apart legitimately differ. What must NOT happen is a set that SHRINKS
+  between reads without a removal — that is a broken reading. Never take this from a single
+  `find | head` — a first-match reading is exactly the artifact class in `AGENTS.md`.
 * ⚠️ These copies carry unlanded review/mutation evidence; this is a **deliberate** trade of evidence
   for headroom. Prefer R1/R2/R5 first, which trade nothing.
 
@@ -439,7 +481,7 @@ diagnosis only. What a follow-up PR would touch, per finding:
 | **G3** uv bound unclaimable on a busy cell | `scripts/pi-cache-reap.sh` — a deferral that recurs on N consecutive passes cannot stay a silent `deferral`; it needs a named escalation (raise the bound deliberately, or report `bound-unclaimed-for=…` in the status record) plus a test. Two-arm change, not one line. |
 | **G4** `class=duplicate-install` never runs on the cells | `scripts/harness-apply-pass.sh` — a pin advance that leaves a *pinned* delegate absent must fail, not report `deployed=<rev>`. The farm list (`pi-bootstrap/setup.sh:602`) already names both delegates, so the list is not the defect. Needs its own test. |
 | **G8** the runner `_work` sink had no class | **shipped** (2026-10-28): `scripts/reap-runner-work.sh` + `class=runner-work` in `scripts/disk-reaper.sh`, pinned in both scheduled artifacts and in the farm list. A class an operator has to remember to enable is the hole it closes, so it is in the DEFAULT `--only` list — and its globs are in `DISK_REAPER_RUNNER_GLOBS`, so an explicit-but-unmatched layout is a refusal rather than a measured zero. |
-| **G9** stale `/tmp` | **gitless scratch trees are swept** (merged base 2026-11-03, #3272: `--include-gitless`, live-pid census, keep list, cap 10/pass); the remainder — `.git`-owned trees and anything past the cap — is filed as **#3043** and needs an owner ruling on what scratch counts as evidence; an exclusion set is already in place (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`). |
+| **G9** stale `/tmp` | **gitless scratch trees are swept** (merged base 2026-11-03, #3272: `--include-gitless`, live-pid census, keep list, ceiling 10 per root per pass); #3278 charges that ceiling to **AGED candidates** (the unit moved after the age floor, which was spending ~89 % of it on trees the floor preserves) and bounds the pass's **per-candidate work** with a wall-clock budget (`REAP_AW_BUDGET_SECONDS` default 300 s, inside the pass's own `DISK_REAPER_CLASS_TIMEOUT=1800` — the eligibility scan over the whole population is not budgeted); the remainder — `.git`-owned trees and whatever the ceiling and the time bound leave for the next run — is filed as **#3043** and needs an owner ruling on what scratch counts as evidence; an exclusion set is already in place (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`). |
 | **G5** `/tmp` swept only at 30 d | policy (`/etc/tmpfiles.d/`), one owner decision; no repo change. |
 | **G6** cell 4's `cell-reclaim.service` failing since 02:09 | not yet diagnosed — the message (`no PR surface readable`) is *correct* fail-closed behaviour; the open question is why that read fails while `gh pr list` succeeds from the same `HOME`. Needs a read-only repro before any patch. |
 | **G7** one transient `gh` failure costs a repo's pass | `#2036` territory (exit-code semantics already split); the recoverable half is a bounded retry inside `pi-reap-worktrees.sh`'s gh probe, with a test that a second failure still fails closed. |

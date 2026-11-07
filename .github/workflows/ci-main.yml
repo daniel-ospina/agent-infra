@@ -202,6 +202,15 @@ jobs:
         # (`tests/lane-signal-forensics/run.sh`, discovered by run-bash-shards.sh).
         mark "extensions/task-signal-forensics.test.ts"
         npx tsx extensions/task-signal-forensics.test.ts || failures=$((failures+1))
+        # #385 — the orphan watchdog's SETTLE RECORD. Until this suite was wired it
+        # was in NO workflow (docs/plans/2026-09-28-issue-1505-tool-updates-evidence-gate.md
+        # records that gap), so "the kill is recorded" had no reachable regression
+        # gate: the actuator that destroys could stop recording and CI would stay
+        # green. It proves the ORDER (row → kill → exit 137) and spawns a real
+        # parent + grandchild, SIGKILLs the parent, and asserts the durable
+        # `reason: "orphan-killed"` row in a hermetic ledger.
+        mark "extensions/task-heartbeat.orphan.test.ts"
+        npx tsx extensions/task-heartbeat.orphan.test.ts || failures=$((failures+1))
         # #611 — reflect-hook capture attribution: first reflect-hook tests.
         # Zero-dep: stdlib-only; uses dynamic require for env ordering.
         mark "extensions/reflect-hook.test.ts"

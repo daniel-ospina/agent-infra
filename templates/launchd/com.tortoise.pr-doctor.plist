@@ -18,19 +18,70 @@
          REPLACES that hand-made agent with the tracked one — same label, same
          script, now reproducible from source. That replacement is the point.
 
-         THE TARGET IS THE FARMED COPY, like every other always-installable job in
-         this directory (pi-reap-orphans, pi-cache-reap, lane-liveness): setup.sh's
-         fleet-scripts farm copies pr-doctor.py to that path BEFORE the launchd
-         convergence step, which is what makes the `<string>` resolve on a fresh box.
-         install-launchd.sh hard-fails a job whose target does not resolve, and that
-         check is deliberately NOT defeated here: a bare `install-launchd.sh` on a box
-         that never ran the farm FAILs this job instead of installing a dead one, which
-         is the correct verdict and the same one every farmed job gets.
-         The interpreter is `/usr/bin/env python3` — the shape the LIVE job was armed
-         with — and not the installer's PYTHON_BIN placeholder: on a non-swarm box that
-         placeholder is deliberately pointed at a venv that does not exist, so using it
-         would hard-fail this install for a reason that has nothing to do with the
-         doctor.
+         THE TARGET IS THE FARMED WRAPPER. setup.sh's fleet-scripts farm copies
+         pr-doctor-machine.sh (fleet_srcs) and lib/repo-set.sh (lib_srcs) to that path
+         BEFORE the launchd convergence step, which is what makes the `<string>` resolve
+         on a fresh box.
+         ⛔ IT IS NOT AN ALWAYS-INSTALLABLE JOB, AND THIS PARAGRAPH USED TO SAY IT WAS
+         (review round 22, P1). It is a `{{TORTOISE_REPO}}`-GATED template — like
+         branch-reaper, worktree-reaper and worktree-hygiene, and UNLIKE pi-reap-orphans,
+         pi-cache-reap and lane-liveness, whose names all resolve from the INSTALLER'S OWN
+         environment and really are always installed. ⛔ THE REAL TEST IS SIMPLY: CAN THIS NAME
+         RESOLVE EMPTY? (round 24, P2 — an earlier version said these three "carry no placeholder
+         that can resolve EMPTY", which is FALSE: `install-launchd.sh` has a dedicated PATH skip
+         arm, measured to SKIP pi-cache-reap and lane-liveness when every PATH entry is
+         unreadable. Round 25, P2 — a "role vs environment" dichotomy I substituted for it was
+         ALSO wrong: PYTHON_BIN is resolved from the installer's environment and DOES gate — it
+         is argv[0] of corruption-canary, measured to SKIP when neither the swarm venv nor a
+         python3 resolves.) So: names that CAN resolve empty gate the template — TORTOISE_REPO,
+         SWARM_ROOT, AI_*, and PYTHON_BIN when neither the swarm venv nor a python3 resolves —
+         while HOME and PATH are rendered from the installer's own always-present values, so
+         "always installed" holds for those three only while each of their names renders
+         non-empty. This unit is gated on TORTOISE_REPO, which is the gate that matters here.
+         The gate fires BEFORE `verify_targets`
+         (`install-launchd.sh`
+         returns SKIP from the placeholder loop), so on a box that resolves no tortoise
+         checkout this job is SKIPPED at rc 0 and the target check never runs at all.
+         ⛔ AND THAT IS A REAL LIMIT OF THIS CHANGE, RECORDED HERE RATHER THAN LEFT IMPLIED:
+         the wrapper is the ONLY consumer of the repo set, so on a box that resolves NO tortoise
+         checkout — the gate above SKIPs this unit there — creating `repos.conf` changes nothing
+         until a doctor unit exists for THAT box. The unit that serves it is owed, and it must
+         not be gated on a tortoise checkout. Until it lands the set is correct and unread on
+         those boxes — an installed-but-inert state this file would rather name than hide.
+         ⛔ SCOPE THIS CORRECTLY, because the mistake is expensive (review round 28, P2: this
+         paragraph named "a box serving other repos (agent-infra plus a second repo — the shape
+         §1 of #2281 is about)", which is BACKWARDS — that box serves tortoise too, so
+         TORTOISE_REPO resolves, this unit installs, and creating `repos.conf` DOES change what
+         is graded, exactly as the paragraph ~100 lines below says). The limit is about a box
+         with NO TORTOISE CHECKOUT, not about a box whose other repos matter.
+         WHERE THE PLACEHOLDER DOES RESOLVE, install-launchd.sh hard-fails a job whose
+         target does not resolve, and that check is deliberately NOT defeated here: a bare
+         `install-launchd.sh` after a farm that did not deliver FAILs this job instead of
+         installing a dead one, which is the correct verdict and the same one every farmed
+         job gets.
+         The interpreter is resolved BY THE WRAPPER (`python3` on PATH, then
+         /usr/bin/python3, then /usr/local/bin/python3), because this unit's
+         ProgramArguments names `/bin/bash` + the farmed wrapper and launchd gives a job
+         no PATH of its own. The installer's PYTHON_BIN placeholder is not used here —
+         it belongs to the units whose argv[0] IS the interpreter.
+         ⛔ AND THAT NAME IS DELIBERATELY UN-BRACED (review round 23, P1). `install-launchd.sh`'s
+         placeholder gate greps the RAW template — COMMENTS INCLUDED — so writing a braced
+         placeholder token anywhere in this file, even while explaining that the placeholder
+         is NOT used, ADDS IT AS A SKIP GATE: measured, the braced form made the installer print
+         `SKIP com.tortoise.pr-doctor: unresolved placeholder(s) PYTHON-BIN — is this a swarm
+         host?` (the emitted line names PYTHON_BIN in braces there; it is spelled here with a
+         hyphen ON PURPOSE, see below) on a box whose only missing name was the one this unit
+         does not need. ⛔ THE
+         INVARIANT IS NOT "keep prose names unbraced" (round 24, P2 — the TORTOISE_REPO mention
+         above names one braced, legitimately, because this template already requires that name as
+         a value): a braced name in prose is SAFE only when the template already
+         requires that name as a VALUE token, because then it adds no new gate. A name the
+         template does NOT already require must stay unbraced in prose. When in doubt,
+         `grep -o '{{[A-Z_]*}}'` this file and diff it against `origin/main`.
+         (An earlier version of this paragraph justified that by claiming the placeholder
+         points at a non-existent venv on a non-swarm box; `install-launchd.sh` actually
+         falls back to `command -v python3` when the venv is absent, so that install would
+         NOT hard-fail, and the claim was wrong. The reason above is the real one.)
 
          WHY 30 MINUTES. One pass is a real read of every open non-draft PR plus up
          to MAX_FIX/MAX_REVIEW load-gated worker spawns, with each gh call bounded at
@@ -44,46 +95,72 @@
 
          WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
          $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
-         .../pr-doctor.status.json; the launchd capture below is the third surface and
+         .../pr-doctor.status.json; in the multi-repo (`all-repos`) mode the wrapper
+         runs, each repo ALSO gets `pr-doctor.<owner>-<name>.log` and
+         `pr-doctor.<owner>-<name>.status.json` beside them, so one repo's verdict cannot
+         stand in for another's. The launchd capture below is the third surface and
          the one its own code names — a pass that dies before it can write either
          still leaves its crash text here (a launchd job's stderr is the only place
          an interpreter-level death lands), which is what makes an import error
-         distinguishable from an honest RED verdict.
+         distinguishable from an honest RED verdict. The wrapper's own mode line
+         (`set: … grading N repo(s)`, or `DEGRADED — NO-REPO-SET …`) is on the same
+         capture, which is what makes a box with no repo set visible instead of quiet.
 
          GH: PATH carries the fleet's gh-wrapper dir first (rendered by
          install-launchd.sh with the unreadable pi shim dir removed, #1719/#427), and
          HOME stays the real home so the doctor's state dir is the fleet's, not
          launchd's.
 
-         ⛔ THE REPO IS NAMED BY ARGV (the "repo" flag) AND NOT BY `GH_REPO` (agent-infra#2280).
-         This template used to carry `<key>GH_REPO</key><string>daniel-ospina/tortoise</string>`
-         and nothing else, which worked only because the doctor resolved its target from a
-         MODULE CONSTANT that happened to be the same repo. #2280 removed that constant: the
-         doctor now resolves its target by EVIDENCE (the "repo" flag, then `OR`, then `REPO`'s git
-         origin, then the cwd's origin) and REFUSES (exit 2) when none answers, because `GH_REPO`
-         is a box-GLOBAL selector (a pushed `keys.env` once exported
-         `GH_REPO=daniel-ospina/tortoise` and `gh` obeyed it for every command on the box, #2235).
-         A job armed from this template with only `GH_REPO` set would therefore have exited 2 on
-         every tick and dispatched NOTHING, for ever, while looking armed. That is why the change
-         that removed the constant ships this template fix WITH it. The flag is rank 1 (this job's
-         explicit word for THIS invocation); `REPO` below is rank 3 and is only ADOPTED when its
-         own git `origin` PROVES that slug, so the plist cannot make the doctor read another
-         repo's worktrees, and a box whose `{{TORTOISE_REPO}}` does not resolve grades the queue
-         read-only and says so instead of spawning.
+         ⛔ THE REPO IS NOT NAMED HERE AT ALL ANY MORE (agent-infra#2281 §1). This unit used to
+         assert its repo in argv — the literal `repo` flag followed by the tortoise slug —
+         which was correct when the box ran one repo and became the defect the moment it ran two:
+         on a cell whose config declares `OR=daniel-ospina/agent-infra` while its controller was
+         started for tortoise, the doctor logged the repo as sourced from ARGV (its emitted line reads
+         "repo: &lt;slug&gt; (from &lt;source&gt;; checkout &lt;dir&gt;)", where the source for that path is
+         the argv repo flag) on
+         EVERY pass and the second repo's queue was read by nothing. #2280 fixed WHICH repo the
+         resolver picks; it could not give a multi-repo box more than one, because #2280 deliberately
+         shipped `PR_DOCTOR_REPOS` with NO default set — there was no authoritative machine list to
+         read (§4). There is one now: `scripts/lib/repo-set.sh` reads the machine's repo SET, and
+         `scripts/pr-doctor-machine.sh` — what this unit execs — grades EVERY repo in it.
 
-         ⛔ DO NOT RE-ADD `GH_REPO` AS THE SELECTOR. It is not evidence (see above); the doctor
-         pins `GH_REPO` to the repo it resolved, in that direction only, for the children it
-         spawns. -->
+         ⛔ STILL NOT `GH_REPO`. `GH_REPO` is a box-GLOBAL selector (a pushed `keys.env` once
+         exported `GH_REPO=daniel-ospina/tortoise` and `gh` obeyed it for every command on the box,
+         #2235), so it is not evidence and the doctor pins it — in that direction only — for the
+         children it spawns. ⛔ AND NOT THE `repo` FLAG EITHER, for the same class of reason one
+         level up: a flag in one machine-wide plist is a SECOND place that says which repos this box
+         serves, and the whole point of §4 is that there is one. `REPO` below stays as the box's own
+         checkout EVIDENCE, and it is used in TWO places, not one: on the degraded path (no set yet),
+         and — with a set present — as the fallback `_checkout_that_proves()` adopts for an entry whose
+         OWN checkout proves nothing. In both it is adopted only when its git `origin` PROVES the slug
+         being graded, so the plist cannot make the doctor read another repo's worktrees. What the pass
+         then does with an unprovable checkout is the doctor's to say (it may adopt this one and spawn,
+         or grade read-only); on macOS, where launchd cannot read `~/Documents`, the degraded path
+         usually ends in the wrapper's refusal with the file to create — see the next block.
+
+         ⛔ WHAT HAPPENS ON A BOX WITH NO SET (the migration state), IN TWO CASES, and this is the
+         distinction that matters because THIS template's default checkout lives under `~/Documents`:
+           * the wrapper CAN still name a repo (`PR_DOCTOR_REPO`, `OR`, or a `REPO` whose git origin
+             proves one) → it runs the single-repo form and LOGS `DEGRADED — NO-REPO-SET` with the
+             exact file to create;
+           * it CANNOT → it REFUSES (exit 2), naming both fixes.
+         On macOS the launchd job usually lands in the SECOND case without a set, because it has no
+         Full Disk Access under `~/Documents` and so cannot read the checkout's origin. So the
+         accurate statement is not "it keeps working"; it is "it says, every pass, in the launchd
+         capture, exactly what to create". Create the set and the same unit grades every repo in it
+         with no reinstall — which is the whole point, and the reason the refusal names the file.
+
+         ⛔ A SET THAT EXISTS BUT DOES NOT VALIDATE IS A REFUSAL (exit 2, named). Dropping a line the
+         reader cannot parse would grade a shorter set, and a shorter set reads exactly like a
+         smaller machine. -->
     <key>Label</key>
     <string>com.tortoise.pr-doctor</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/env</string>
-        <string>python3</string>
-        <string>{{HOME}}/.pi/agent/scripts/pr-doctor.py</string>
-        <!-- The repo this job grades, as argv (rank-1 evidence in resolve_repo()). -->
-        <string>--repo</string>
-        <string>daniel-ospina/tortoise</string>
+        <!-- The FARMED wrapper (fleet_srcs), which reads the machine repo set (lib_srcs) and grades
+             every repo in it. No repo is named in this argv — see the block above. -->
+        <string>/bin/bash</string>
+        <string>{{HOME}}/.pi/agent/scripts/pr-doctor-machine.sh</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -91,7 +168,11 @@
         <string>{{PATH}}</string>
         <key>HOME</key>
         <string>{{HOME}}</string>
-        <!-- The CHECKOUT (not a slug): adopted only if its `origin` proves the repo above. -->
+        <!-- The CHECKOUT (not a slug), and it is used in BOTH modes — see the block above: as the
+             degraded path's evidence AND as the `_checkout_that_proves()` fallback for a set entry whose
+             own checkout proves nothing. In both, adopted only if its `origin` PROVES the slug. Do not
+             drop it as "degraded-only": that would turn such an entry from spawn-in-this-checkout into
+             read-only. -->
         <key>REPO</key>
         <string>{{TORTOISE_REPO}}</string>
     </dict>
@@ -100,6 +181,13 @@
     <!-- ⛔ /tmp, like every other template in this directory: launchd opens these files BEFORE exec,
          and nothing in install-launchd.sh creates $HOME/.pi/agent/state. A capture path whose parent
          may not exist fails at bootstrap, and the job that loses its only crash surface is this one. -->
+    <!-- Captured to /tmp, not $HOME/.pi/agent/state: launchd opens these files BEFORE exec
+         and nothing creates the state dir for it, so the hand-armed unit's
+         $STATE/pr-doctor.launchd.log is DEAD from the moment this installs.
+         NOTE (review round 22, P2): `heartbeat-loop.sh` still prints that old $STATE path on
+         its launchd arms. The /tmp choice here is a recorded decision with the reason above,
+         so the inconsistency is named rather than reversed: read /tmp/pr-doctor.launchd.log
+         for passes installed by THIS unit. -->
     <key>StandardOutPath</key>
     <string>/tmp/pr-doctor.launchd.log</string>
     <key>StandardErrorPath</key>

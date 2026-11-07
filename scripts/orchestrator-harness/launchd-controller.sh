@@ -2,12 +2,15 @@
 # launchd-controller.sh — the launchd ENTRY POINT for the orchestrator: it supervises the controller
 # as a tmux session, and BLOCKS while that session lives so `KeepAlive` is real supervision.
 #
-# It is what the plist's `ProgramArguments` must point at on a macOS box — the INSTALLED plist on the
-# Mac that carried this defect does point here (`/bin/bash $O/launchd-controller.sh`), while main's
-# `launchd.plist.template` still renders `__O__/orch-loop.sh`; flipping the shipped template is PR
-# #2020's hunk, deliberately not duplicated here. It is shipped from HERE
-# (`scripts/orchestrator-harness/`) and it is the only place that knows how a Mac starts a
-# controller. ⛔ SO ON A FRESH `install.sh` RENDER THIS FILE IS INSTALLED BUT NOT YET SELECTED.
+# It is what the plist's `ProgramArguments` follows on a macOS box. Since agent-infra#3309 the plist
+# execs the STABLE stub `$O/orch-pin-exec.sh`, which resolves the pin's entrypoint (this file when the
+# pin carries it, else `orch-loop.sh`) on every tick — a fresh render no longer names this path
+# directly, because the hash-named pin tree is garbage-collected as the pin advances and launchd reads
+# `ProgramArguments` once at bootstrap. The INSTALLED plist on the Mac that carried this defect still
+# points here (`/bin/bash $O/launchd-controller.sh`); the stub is the shape that replaces it, and this
+# file remains the only place that knows how a Mac starts a controller. It is shipped from HERE
+# (`scripts/orchestrator-harness/`). ⛔ SO ON A FRESH `install.sh` RENDER THIS FILE IS INSTALLED AND
+# SELECTED — through the stub, not by being named in the plist.
 #
 # ⛔ WHY THIS FILE IS IN THE REPO AT ALL (agent-infra#2098, the live-only-overlay class).
 # It lived ONLY in `~/orchestrator` on the Mac for weeks: `git grep -l launchd-controller` found
@@ -145,7 +148,23 @@ _shq() { local s="${1:-}" q="'"; printf "'%s'" "${s//$q/$q\\$q$q}"; }
 # THE PLIST'S KEY SET, VERBATIM. Keep it equal to `EnvironmentVariables` in launchd.plist.template —
 # `launchd-controller.test.sh` asserts that equality in both directions, so a key added to the
 # template cannot silently fail to reach the controller.
-CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE"
+CONTROLLER_ENV="PATH HOME OR REPO O HARNESS_PIN HARNESS_PIN_FILE HARNESS_PIN_DIR HARNESS_REPO HARNESS_MATERIALISER SCOPE MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC UV_CACHE_DIR UV_LINK_MODE ORCH_ENTRY"
+
+# ⛔ `ORCH_ENTRY` IS HERE BECAUSE THE TEMPLATE RENDERS IT — AND FOR THE SHADOWING HALF, NOT BECAUSE
+# THE PANE RE-RESOLVES (`#3243` review cycle-2 F3; the rationale was corrected after a review of #3333
+# measured the original claim FALSE). What is true:
+#   • The deciding hop is launchd → `orch-pin-exec.sh`, which reads `ORCH_ENTRY` from ITS OWN environment
+#     and is the ONLY reader in the tree. That hop is `install.sh:render` plus the stub, both UPSTREAM of
+#     this list — this list does not select a controller, and nothing in the pane re-runs the stub.
+#   • The forwarding is still REQUIRED, for two reasons that are not that one. (1) `launchd-controller.test.sh`
+#     case E asserts this list EQUALS the template's `EnvironmentVariables` in both directions, so a key the
+#     plist renders and this list omits reddens that arm — and the repair direction is always this list,
+#     never the template (the #3108 lesson below: a key dropped here is delivered to the job and dies).
+#     (2) A tmux SERVER outlives any one job, so a pane that inherits the server's environment would see
+#     whatever `ORCH_ENTRY` some EARLIER install exported. Forwarding the rendered value — including the
+#     EMPTY one (see the presence rule below) — shadows that stale value instead of inheriting it.
+# ⛔ The original comment claimed forwarding "keeps a re-resolution inside the cycle naming the entrypoint
+# the job was installed with". No such re-resolution exists; do not restore that sentence.
 
 # ⛔ `UV_CACHE_DIR` / `UV_LINK_MODE` ARE THE HALF #3108 LEFT OUT. That change rendered both keys into
 # `launchd.plist.template` so every box pins uv's cache and link mode (#2159), but this list is the hop

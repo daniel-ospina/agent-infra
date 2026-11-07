@@ -2344,7 +2344,26 @@ grep -q 'MEMORY gate' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and does NOT name it a MEMORY refusal — the P1: 'wait for resident lanes' on a box out of PROCESSES" $rc
 grep -q 'restart or drain the BOX from outside' "$RO/logs/adopt-7.log"; rc=$?
 ck "...and carries the remedy that actually helps (restart/drain the box from OUTSIDE), not 'wait'" $rc
-rm -f "$RO/capacity.sh"   # EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)
+# ⛔ RE-SEED, DO NOT REMOVE (fresh review of #3231, P2 — measured). This line used to `rm` the stub
+# with the rationale "EVERY LATER ARM RUNS ON THE REAL INSTRUMENT (or its documented ABSTAIN)", and
+# both halves of that rationale are now false:
+#   * the stub in `$RO` at this point is not the healthy one — the `adopt-7` arms above install the
+#     FORK-REFUSING `CAPSTUB` (15840/15841, headroom 1), so leaving it makes every later `O="$RO"`
+#     arm answer 73 (fork) instead of the load 75 / disk 77 / mem 81 it names. Measured: 5 arms red.
+#   * an ABSENT instrument is no longer an abstain either: since the fork floor became the 83
+#     `nodeploy` REFUSAL, `rm` hands the decision to the RESOLVER above, whose SECOND candidate is
+#     `$_sgc_here` — the directory holding the gate — and a checkout SHIPS a complete
+#     `scripts/orchestrator-harness/capacity.sh` there. So the deciding copy becomes the repo's own
+#     capacity.sh reading THIS HOST's live process population (then, on a box with no checkout copy, the
+#     ambient `$AGENT_INFRA_PATH`/`~/orchestrator`/`~/.pi/agent/scripts` candidates). Either way the arms
+#     below answer by the host's fork headroom instead of by the code under test: measured, this box reads
+#     `rc=0` on the load arms at one moment and the same suite reads five MORE reds under fork pressure
+#     (see the seeder's own note above: "a busy runner would then refuse 73"). That is the host-decides
+#     class the seeder above exists to end — and note it is NOT cured by having a clean runner.
+# So: restore the HEALTHY stub (present + `ok`, it can decide nothing), and assert it landed, one line
+# that cannot rot the way the comment did.
+seed_capacity_instrument "$RO"; rc=$?
+ck "the fork instrument is re-seeded HEALTHY after the fork-refusal rig (else the 5 arms below answer 73/83)" $rc
 
 : > "$MERGE_LOG"
 
@@ -4232,6 +4251,59 @@ r83="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-83' "$HERE/../review-pr.sh" | head -
 rnn="$(grep -n 'THE EXIT STATUS IS THE SIGNAL' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
 [ -n "$r83" ] && [ -n "$rnn" ] && [ "$r83" -lt "$rnn" ]; rc=$?
 ck "STRUCTURAL: review-pr.sh's 83 arm sits BEFORE its non-zero-exit fallthrough ($r83 < $rnn)" $rc
+# ⛔ THE ORDER WAS PINNED; THE EXIT VALUE WAS NOT (round-2 review of #3645, P2). That gap is exactly how the
+# merge in #3231 shipped `exit "$AGENT_HARNESS_SKEW_REFUSED"` in merge-one.sh — the match was tolerant, the
+# exit was the BARE variable, which nothing on that file's source graph declares or exports, so under that
+# file's `set -u` the expansion aborted and the arm returned **1** (a set-but-empty value would instead have
+# made `exit ""` return 2, that file's own "no comment id") — for a helper/sync refusal every caller promises
+# 83. A bare-variable exit IS the defect shape, so both 83 arms are pinned BY NAME in both directions: no bare
+# `exit "$VAR"`, and at least one tolerant `exit "${VAR:-83}"` in each file. Still a grep — driving these two
+# arms behaviourally needs a whole reviewer/repo rig, and naming that limit is better than implying it away.
+# ⛔ COMMENTS ARE STRIPPED BEFORE THE MATCH (round-13 review of #3645, P3). The pins below (the retired-glob one
+# and the `deploy-harness.sh` count) already strip comment lines; this one did not, so the NATURAL way to record
+# the defect — a comment in one of these files saying "never exit the bare variable here" — REDDED it while
+# changing nothing executable. That is the "a pin that false-reds on prose buys a deletion" hazard this block
+# already declares for the glob pin, and it bites a pin that QUOTES the defect verbatim hardest of all.
+# A comment cannot run, so stripping loses no coverage.
+_bare="$(grep -nF 'exit "$AGENT_HARNESS_SKEW_REFUSED"' "$HERE/merge-one.sh" "$HERE/../review-pr.sh" 2>/dev/null | grep -v ':[[:space:]]*#')"
+[ -z "$_bare" ]; rc=$?
+ck "STRUCTURAL: neither 83 arm exits the BARE \$AGENT_HARNESS_SKEW_REFUSED (unset under set -u => rc 1; set-but-empty => rc 2; NEITHER is 83)${_bare:+ — found: $_bare}" $rc
+_mt="$(grep -c -F 'exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"' "$HERE/merge-one.sh")"
+_rt="$(grep -c -F 'exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"' "$HERE/../review-pr.sh")"
+[ "$_mt" -ge 1 ] && [ "$_rt" -ge 1 ]; rc=$?
+ck "STRUCTURAL: both 83 arms exit the TOLERANT code (merge-one=$_mt, review-pr=$_rt)" $rc
+# ⛔ THE REMEDY SENTENCE IS A BEHAVIOUR TOO (#3442 non-vacuity; round-2 review of #3645, P2): reverting all
+# three rewritten messages to the retired `cp scripts/orchestrator-harness/*.sh` glob left this suite GREEN —
+# nothing asserted the one sentence an operator acts on after a refusal. #3508 retired that glob (depth-1,
+# unverified, a PARTIAL deploy this very gate then refuses), so it is refused BY NAME here, and the verified
+# redeploy is required to be present.
+# ⛔ AND KEYED ON THE SPELLING, NOT ON A SENTENCE (round-3 review of #3645, P2 — measured): the first cut of
+# this pin matched three literal message fragments, so a legitimate REWORD of the "fork floor cannot be enforced
+# for this spawn" message ("cannot be enforced for this spawn" → "can't be enforced at this spawn point") red it
+# with the remedy untouched — and the citation that said so had itself rotted by then, which is the same lesson.
+# A pin that false-reds on prose buys a deletion, not a guarantee. So: the glob is refused
+# wherever it appears outside a comment (that is the actual regression shape, and it catches a revert of ANY of
+# the three), and the positive direction is a COUNT, which no reword can move.
+# DECLARED LIMIT, because it is real: this pin reads spelling, not intent, so a future message that WARNS
+# AGAINST the glob ("do NOT run `cp scripts/orchestrator-harness/*.sh`") would red the first assertion too.
+# Describe a remedy by what replaces it, never by naming the retired command.
+_nc="$(grep -n 'cp scripts/orchestrator-harness/\*\.sh' "$HERE/spawn-gate.sh" | grep -v ':[[:space:]]*#')"
+[ -z "$_nc" ]; rc=$?
+ck "STRUCTURAL: the retired cp-glob redeploy survives only in COMMENTS, never in a message (#3508)${_nc:+ — found: $_nc}" $rc
+# ⛔ THE THRESHOLD IS THE MEASURED COUNT, NOT A ROUND NUMBER (round-4 review of #3645, P2 — measured). `-ge 3`
+# let all three rewritten remedies be reverted to wording naming NEITHER the glob NOR `deploy-harness.sh` and
+# stay green (478/6, the control's own red set), so the assertion's own description — "deleting a remedy reds
+# here" — was false. Pin at the present count: 7 non-comment lines at this head. ⛔ RE-DERIVE IT WITH THIS
+# EXACT COMMAND rather than from a list, because the list rots: the first cut of this comment enumerated the 7
+# by line number and two rounds later all seven were stale (the edit that added them had shifted them), so a
+# maintainer following it opened comments and `esac` lines — the count was right and the citation was not:
+#   grep 'deploy-harness.sh' scripts/orchestrator-harness/spawn-gate.sh | grep -vc '^[[:space:]]*#'
+# ⛔ RE-SET IT whenever a message is legitimately added or removed: it is a tripwire, not a coverage claim —
+# the same idiom, and the same caveat, as `tests/review-pr/run.sh`'s own `>= 891 assertions` pin (a DIFFERENT
+# suite — round-5 review of #3645 caught the earlier wording claiming it was this one's, which has no such pin).
+_dhn="$(grep 'deploy-harness.sh' "$HERE/spawn-gate.sh" | grep -vc '^[[:space:]]*#')"
+[ "$_dhn" -ge 7 ]; rc=$?
+ck "STRUCTURAL: the file still PRESCRIBES the verified redeploy in >=7 non-comment places ($_dhn) — a remedy replaced by prose reds here" $rc
 
 # END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
 # code (74, not 77/75), and the log says why.
@@ -5942,14 +6014,63 @@ done
 # ⛔ THIS ARM USED TO BE VACUOUS: it moved `$RREG/origin2.git`, a path nothing ever created (`mv:` said
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
-# that does not exist, with this box's local witness removed so no fallback can answer either.
+# that does not exist, with a local witness that cannot answer either.
+# ⛔ AND "A LOCAL WITNESS THAT CANNOT ANSWER" NEEDS ITS OWN EMPTY DIRECTORY (measured 2026-11-07,
+# two defects in this one probe):
+#   1. The probe inherited the AMBIENT fallback — `~/.pi/agent/state/lanes` on a real box, over a
+#      thousand records (1,079 here when measured; the count only grows, the defect does not) — so
+#      the registry answered `readable:true … FELL BACK to local` with rc 0 while
+#      the remote WAS unreachable, and the arm reddened on a CORRECT fail-closed registry.
+#   2. Pinning the probe to `$RREG/state/lanes` (the obvious repair) was still wrong, because
+#      `rdrive` above is run with `LANE_REGISTRY=1` and the lane WRITES ITS OWN RECORD into that
+#      directory — the probe then reads the record the lane just wrote and answers rc 0 again. The
+#      `rm -rf` that used to sit before `rdrive` cannot help: it is undone by the run it precedes.
+# So the probe gets a PRIVATE, EMPTY pair of paths that nothing else in this fixture writes, and the
+# FIXTURE's own env on all four vars — the same four `rdrive`/`r_end` pass — so the invocation under
+# test resolves the way its siblings do (#3604). `rc=3` then means exactly what the arm asserts — the
+# remote cannot be reached and NO local witness can answer — instead of a fact about this host or about
+# the lane the arm is measuring. Same defect class the suite's own brief-gate note names: a fixture that
+# inherits ambient (or sibling) state cannot make a claim about isolation.
+# ⛔ AND THE RC IS NOT THE WHOLE CLAIM (#3604). A registry that DEGRADES — answering `readable:true`
+# from this box's own records — is the false-negative the arm exists to catch, and it can degrade with
+# rc 3 the day someone changes the mapping. So the assertion reads the ANSWER as well: `readable` must
+# be `false`, and the source must not name the box-local fallback. Both halves are proved able to fail
+# by the DECOY below, which is the pre-fix condition reproduced hermetically (a witness that HAS a
+# record), rather than by this box's ambient state — which is exactly what made the old arm a function
+# of the measuring machine.
+rprobe() { # rprobe <state-dir> -> sets PROBE_JSON, PROBE_RC
+  PROBE_JSON="$(LANE_REGISTRY_STATE="$1" LANE_REGISTRY_LOCAL="$1/lanes" \
+    LANE_REGISTRY_GIT="$1/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+    python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>/dev/null)"
+  PROBE_RC=$?
+}
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
-rm -rf "$RREG/state/lanes"
+rm -rf "$RREG/probe-state"; mkdir -p "$RREG/probe-state"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+rprobe "$RREG/probe-state"
+unreachable="rc=$PROBE_RC"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
-   $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
+   $([ "${rcval:-x}" = "0" ] && [ "$PROBE_RC" = "3" ] && echo 0 || echo 1)
+# ⛔ THE ANSWER, NOT ONLY THE STATUS. `readable:true` here means the read was answered by SOMETHING, and
+# the only something left is a witness the fixture does not own.
+ck "R4 …and the probe's ANSWER is unreadable, not a fall-back to this box: readable=false, and no local witness named" \
+   $([ "$(grep -c '"readable": *false' <<<"$PROBE_JSON")" -eq 1 ] \
+      && ! grep -q 'FELL BACK to local' <<<"$PROBE_JSON" && echo 0 || echo 1)
+# ⛔ NON-VACUITY, HERMETICALLY. The two assertions above must be able to FAIL on the exact condition
+# they name, and the pre-fix condition is "a local witness that HAS records" — not "this box has run
+# lanes". So the fixture CREATES one (`start` writes a genuine record through the module's own write
+# path, under a state dir of its own) and the SAME probe must then answer readable=true and NAME the
+# fallback. If this arm ever stops flipping, the arms above are measuring nothing.
+rm -rf "$RREG/decoy-state"; mkdir -p "$RREG/decoy-state/lanes"
+LANE_REGISTRY_STATE="$RREG/decoy-state" LANE_REGISTRY_LOCAL="$RREG/decoy-state/lanes" \
+  LANE_REGISTRY_GIT="$RREG/decoy-state/work.git" LANE_REGISTRY_REPO="$RREG/work" \
+  python3 "$HERE/lane_registry.py" start --kind lane --tag 78 --pid $$ >/dev/null 2>&1 || true
+rprobe "$RREG/decoy-state"
+ck "R4 non-vacuity: a witness WITH a record answers readable=true and NAMES the box-local fallback (rc=$PROBE_RC)" \
+   $([ "$PROBE_RC" = "0" ] && ! grep -q '"readable": *false' <<<"$PROBE_JSON" \
+      && grep -q 'FELL BACK to local' <<<"$PROBE_JSON" && echo 0 || echo 1)
+rm -rf "$RREG/decoy-state"
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
 
 echo
