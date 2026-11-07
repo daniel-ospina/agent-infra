@@ -34,6 +34,15 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # escape, declared where it applies — not a silent bypass: unsetting it here turns the gate back on and
 # these arms go red, which is the assertion that the line is load-bearing rather than decorative.
 export LANE_PREFLIGHT=0
+# ⛔ AND THE LANE'S OWN `WIP_PATH` IS CLEARED FOR §D, WHICH DRIVES A REAL WORKER (measured 2026-11-07,
+# running this suite FROM A FIXER LANE — which is where lanes run it). The worker's exit path roots its
+# rescue at `"${WIP_PATH:-$PWD}"` (spawn-gate.sh), so a caller's `WIP_PATH` OUTRANKS the dispatcher's
+# `cd "$TMP/wt"`: §D's worker rescued THIS lane's worktree, pushed a `refs/wip/*` ref to the REAL
+# origin, and the one arm that watches the worker then missed its 10 s window because the rescue had
+# real work to do — a red that was neither the brief gate's nor the branch's. §D is about the BRIEF and
+# the delivery section, never about the caller's tree, so the envelope is cleared here the same way the
+# capability gate is — declared, not silently `unset` in a helper arms cannot see.
+export WIP_PATH=
 # ⛔ AND THE MEMORY ARM IS NEUTRALISED FOR THE SAME REASON, one gate over (agent-infra#2387). Every arm
 # below drives the SHIPPED `run_agent` with `MAX_LOAD=1000 DISK_MIN_FREE_MB=1` so that a load or disk
 # refusal cannot decide an arm about the BRIEF. `run_agent` now also consults available memory before
