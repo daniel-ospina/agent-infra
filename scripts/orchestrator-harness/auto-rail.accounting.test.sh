@@ -1134,6 +1134,21 @@ grep -qF 'continue' <<<"$(grep -A2 -F 'log_line "$repo #$pr review $_rstate at $
 # P2, measured): the loop's call is the ONLY thing that makes `$att` non-zero, so dropping the third
 # argument leaves the predicate's attempt term permanently 0, `return 3` unreachable, and a paid review
 # re-bought on every pass — with the suite green, because `_rattn` is still computed and still logged.
+# ⛔ AND THE PER-PASS BURST COUNTER MAY NOT BE ZEROED AGAIN (review round 10, P3, measured): the positional arms
+# pinned WHERE it is reset and where it is bumped, but nothing pinned HOW OFTEN — a second `_rdispatched=0`
+# after the increment leaves `review_should_defer` seeing 0 for every candidate and makes `REVIEW_PER_PASS`
+# inert (one paid reviewer per mergeable-unattested PR per pass). One reset, one increment, no more.
+# ⛔ COUNT THE ASSIGNMENT, NOT ONE SPELLING OF IT (review round 10 verification, P3, measured): the
+# end-anchored `^[[:space:]]*_rdispatched=0$` missed `_rdispatched=0  # reset again`,
+# `_rdispatched=0; _rdispatched=0`, `(( _rdispatched = 0 ))`, `export _rdispatched=0` and an `if`-wrapped
+# reset — each LIVE, each leaving `review_should_defer` seeing 0 for every later candidate and making
+# `REVIEW_PER_PASS` inert, with the suite green.
+_rd_zero=$(grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*0([^0-9]|$)' "$SUT" | wc -l | tr -d ' ')
+[ "$_rd_zero" = 1 ] \
+  || bad "the per-pass review counter must be SET TO ZERO exactly once per pass (found ${_rd_zero:-0} zeroing assignment(s)) — a reset after the increment, however it is written (bare, '&&', arithmetic, export, inside an if), blinds review_should_defer and disables REVIEW_PER_PASS"
+_rd_inc=$(grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*\$\(\(|\(\([[:space:]]*_rdispatched[[:space:]]*=[[:space:]]*_rdispatched' "$SUT" | wc -l | tr -d ' ')
+[ "$_rd_inc" = 1 ] \
+  || bad "the per-pass review counter must have exactly one increment (found ${_rd_inc:-0}) — two increments spend the cap twice as fast, and none makes the cap inert"
 grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
   || bad "the loop must pass the attempt count into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"') — without it the EXHAUSTED branch is unreachable and the bounded retry is unbounded again"
 # ⛔ THE REMAINING STATE PUBLISHES WERE PINNED BY *TEXT*, NEVER BY A CALL (P1/P2 non-vacuity, measured
@@ -1162,6 +1177,12 @@ _capdef=$(printf '%s\n' "$_capblock" | grep -F 'publish_review_state "$repo" "$p
   || bad "the CAP-DEFERRAL block must still PUBLISH 'awaiting-review' for a deferred candidate — measured: deleting it left the suite GREEN, so the state a mergeable unattested PR is in whenever the box is at MAX existed only in the log. Located INSIDE the 'candidate_deferred' block, so a decoy line elsewhere in the file cannot satisfy this arm (a file-wide grep did, measured)"
 [ "$(printf '%s\n' "$_capdef" | grep -cF 'publish_review_state')" -eq 1 ] \
   || bad "the CAP-DEFERRAL block must hold EXACTLY ONE 'awaiting-review' publish — the assertions below are 'any matching line contains this substring', so a second one inside the same block would let either requirement be satisfied by a line that is not the cap-deferral publish"
+# ⛔ ONE STATEMENT, ANCHORED (review round 10, P3, measured): three independent substrings were satisfied after
+# the gating `&&` was replaced by `;`, which publishes "a reviewer is dispatched as soon as this repo has a
+# free slot" for a not-clean head that will never be dispatched again — the round-7 P2 this arm exists for.
+_CAPRE='^[[:space:]]*\[ "\$_kind" = green \] && \[ "\$_att" != at-head \] && \[ "\$_att" != rejected \] && publish_review_state "\$repo" "\$pr" awaiting-review$'
+grep -qE "$_CAPRE" <<<"$_capdef" \
+  || bad "the cap deferral's gating must stay ONE statement (… [ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ] && [ \"\$_att\" != rejected ] && publish_review_state … awaiting-review) — splitting it with ';' publishes 'awaiting review' for heads no dispatch will ever reach"
 grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]'  <<<"$_capdef" \
   || bad "the CAP-DEFERRAL publish line must still START '[ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ]' — it is the only publish that runs while the box is at MAX, i.e. the COMMON state for a mergeable unattested PR (#3489 on the most common path)"
 grep -qF '[ "$_att" != rejected ]'  <<<"$_capdef" \
