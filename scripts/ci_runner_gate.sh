@@ -242,9 +242,12 @@ ABSORPTION_IN_PROGRESS=""
 ABSORPTION_QUEUED=""
 # ⛔ THE DISCOUNTED COUNT AND THE GHOST COUNT ARE GLOBALS TOO (#2344), and for the same reason
 # `ABSORPTION_QUEUED` is (see below): `queued_demanding`/`QUEUE_GHOSTS` are `local` to `evaluate`, but
-# the healthy reason line — built in `main` — has to quote the operand the LENGTH LEG actually tested.
-# Without them the reason said "queue < 10" while the same verdict line published `queued=10`, i.e. a
-# verdict contradicting itself on any ghost-discounted pass (cycle-4 review, finding 1).
+# the healthy reason line — built in `main` — has to quote the operand the LENGTH LEG actually tested
+# AND the number of records it discounted, so `demand_runs=…`/`ghost_runs=…` are published rather
+# than left in the log. Without them the reason said "queue < 10" while the same verdict line
+# published `queued=10`, i.e. a verdict contradicting itself on any ghost-discounted pass
+# (cycle-4 review, finding 1). ⛔ BOTH ARE READ, by that reason — a global written and never read is
+# dead state with a comment claiming a consumer (cycle-6 review, finding 2).
 ABSORPTION_DEMANDING=""
 ABSORPTION_GHOSTS=""
 
@@ -837,9 +840,11 @@ print(comp, len(inc))
       log "queue HEAD UNIDENTIFIABLE: queued=$queued but the read carried none of the row order, a head run id, or the oldest run's timestamp — FAIL-CLOSED, changing nothing"; return 2
     fi
     # ⛔ A BODY WITH NEITHER THE ROW ORDER NOR A RUN ID STILL GETS A VERDICT, WITH PRE-#2344 SEMANTICS
-    # (review #3, cycle 3). `:746` promises "a two-field body still parses … instead of failing a pass
-    # that needs nothing else from it", and before this change a `count TAB created_at` body DID
-    # produce a verdict: the age came from that timestamp and the demand read simply found no id. Now
+    # (review #3, cycle 3). The field-tolerance paragraph above the queue read promises that extra
+    # fields are "optional" and that an absent field "leaves one question unmeasured instead of
+    # failing a pass that needs nothing else from it" — and before this change a `count TAB
+    # created_at` body DID produce a verdict: the age came from that timestamp and the demand read
+    # simply found no id. Now
     # the discount is impossible on such a body (there is nothing to read jobs for), so the pass says
     # so and falls back to the run-level age — which may include a record with nothing in a
     # schedulable state. The alternative, refusing, would let a shape change turn the fleet's only
@@ -1639,7 +1644,7 @@ if [ "$healthy" = 0 ]; then
     idle-unused|all-offline|unknown)
       reason="GitHub-hosted legs pass BUT CAPACITY NOT CERTIFIED (capacity=$CENSUS_VERDICT: $CENSUS_DETAIL; $absorption)" ;;
     *)
-      reason="GitHub Actions healthy (component operational, no Actions incident, demand_runs=${ABSORPTION_DEMANDING:-unmeasured} < $QUEUE_THRESHOLD, $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)" ;;
+      reason="GitHub Actions healthy (component operational, no Actions incident, demand_runs=${ABSORPTION_DEMANDING:-unmeasured} < $QUEUE_THRESHOLD (raw depth ${ABSORPTION_QUEUED:-unmeasured}, ghost_runs=${ABSORPTION_GHOSTS:-unmeasured}), $absorption; capacity=$CENSUS_VERDICT: $CENSUS_DETAIL)" ;;
   esac
 else
   want="local"
