@@ -107,7 +107,10 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNO
 # ⛔ `$0` IS LOGGED ABSOLUTE: drivers are started as `bash drive.sh` from INSIDE their case dir, so a bare `$0` is a
 # relative name that cannot be matched back to a file (measured: 208 entries logged, all `drive.sh`, and the sweep
 # resolved NONE of them). `$PWD/$0` needs no `readlink -f`, which macOS lacks.
-printf '%s\n' 'if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac; printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null || :; fi' > "$TMP/.boothook"
+# ⛔ AND ONLY A REAL FILE IS LOGGED (review P3, cycle 91): for `bash -c`, `bash -s` and a heredoc feed `$0` is the
+# literal `bash`, so `$PWD/$0` named a file that never existed and the sweep's "executed then GONE" arm reddened a
+# correct driver (measured: `EXECUTED then GONE: rank/bash`). `[ -f ]` inside the hook costs one test per child.
+printf '%s\n' 'if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then case "$0" in /*) _b="$0" ;; *) _b="$PWD/$0" ;; esac; [ -f "$_b" ] && printf "%s\n" "$_b" >> "$RANK_QUEUE_BOOTLOG" 2>/dev/null; fi' > "$TMP/.boothook"
 : > "$TMP/.bootlog"
 export RANK_QUEUE_BOOTLOG="$TMP/.bootlog"
 export BASH_ENV="$TMP/.boothook"
@@ -530,7 +533,7 @@ ck "the PRIORITY-UNREADABLE arm carries NO tier-window clause even with a clip r
 # its own refusal sentence and NO record clause of any kind (these arms return before the `.pool-sat` read).
 _mv="$TMP/arm-refuse-mv"; rm -rf "$_mv"; mkdir -p "$_mv/o" "$_mv/bin"
 printf '300\n9\n' > "$_mv/o/candidates.txt"; printf '9\n300\n' > "$_mv/o/.pool"; printf 'P1-severe\n' > "$_mv/o/.pool-sat"
-printf '#!/usr/bin/env bash\nexit 1\n' > "$_mv/bin/mv"; chmod +x "$_mv/bin/mv"
+printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$_mv/bin/mv"; chmod +x "$_mv/bin/mv"
 { drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_mv/drive.sh"
 ( cd "$_mv" && HOME="$_mv" PATH="$_mv/bin:$PATH" bash drive.sh "$_mv/o" ) > "$_mv/out" 2>&1
 _mv14="$(cat "$_mv/out" 2>/dev/null)"
@@ -550,6 +553,7 @@ printf '111\n222\n' > "$_rs/seed"; printf '200\n300\n' > "$_rs/o/.pool"; printf 
 : > "$_rs/o/candidates.txt"
 cat > "$_rs/bin/cmp" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
 exec /usr/bin/cmp "$@"
 SHIM
@@ -765,6 +769,7 @@ printf '300\n200\n' > "$RANKFMT/o/candidates.txt"
 printf '200\n300\n' > "$RANKFMT/o/.pool"
 cat > "$RANKFMT/bin/cat" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 case "${1:-}" in *.queue-rank) printf 'x 2 -\n'; exit 0 ;; esac
 exec /bin/cat "$@"
 SHIM
@@ -1069,6 +1074,7 @@ printf '200\n300\n' > "$SH/o/.pool"
 : > "$SH/o/candidates.txt"
 cat > "$SH/bin/cmp" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 # model the concurrent prune: refill the queue, THEN compare for real
 cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
 exec /usr/bin/cmp "$@"
@@ -1103,12 +1109,14 @@ printf '200\n300\n' > "$SH2/o/.pool"
 : > "$SH2/o/candidates.txt"
 cat > "$SH2/bin/cmp" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 cp "$PRUNE_SEED" "$PRUNE_QUEUE" 2>/dev/null || true
 exec /usr/bin/cmp "$@"
 SHIM
 chmod +x "$SH2/bin/cmp"
 cat > "$SH2/bin/sort" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 # `sort -u` is the ROW-SET clause's tool: make it fail so that clause cannot decide, leaving the
 # emptied-reorder clause alone on the path (the ranker's own `sort -k1,1n` is untouched).
 case " $* " in *' -u '*) exit 1 ;; esac
@@ -1315,6 +1323,7 @@ _pfw_awk="$TMP/pfw-awkfail"; rm -rf "$_pfw_awk"; mkdir -p "$_pfw_awk/o" "$_pfw_a
 printf '300\n200\n' > "$_pfw_awk/o/candidates.txt"; printf '300\n200\n' > "$_pfw_awk/o/candidates.product.txt"
 cat > "$_pfw_awk/bin/awk" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 exit 2
 SHIM
 chmod +x "$_pfw_awk/bin/awk"
@@ -1329,6 +1338,7 @@ _pfw_mv="$TMP/pfw-mvfail"; rm -rf "$_pfw_mv"; mkdir -p "$_pfw_mv/o" "$_pfw_mv/bi
 printf '200\n300\n' > "$_pfw_mv/o/candidates.txt"; printf '300\n200\n' > "$_pfw_mv/o/candidates.product.txt"
 cat > "$_pfw_mv/bin/mv" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 exit 1
 SHIM
 chmod +x "$_pfw_mv/bin/mv"
@@ -1371,6 +1381,7 @@ printf '300\n200\n' > "$RS/o/candidates.txt"
 printf '200\n300\n' > "$RS/o/candidates.product.txt"
 cat > "$RS/bin/sort" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 # model a concurrent writer touching the product file between the two reads: one EXTRA row appears
 if [ "${!#}" = "$RS_PF" ]; then { /usr/bin/sort "$@"; printf '999999\n'; }; else exec /usr/bin/sort "$@"; fi
 SHIM
@@ -1430,6 +1441,7 @@ count_race() {  # <name> <shim-body> [queue-content] -> sets CROUT / CRR / CRROW
   else printf '200\n300\n' > "$d/o/candidates.txt"; fi
   cat > "$d/bin/${5:-mv}" <<SHIM
 #!/usr/bin/env bash
+set -u
 $2
 exec /usr/bin/${5:-mv} "\$@"
 SHIM
@@ -1820,9 +1832,9 @@ skip_drive() {  # <label> <queue-setup: absent|empty|rows|garbage|dir> -> sets S
     garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt" ;;
     dir)     mkdir -p "$d/o/candidates.txt" ;;
     wcfail)  printf '300\n200\n' > "$d/o/candidates.txt"
-             mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+             mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
     wcfail-garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
-                    mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+                    mkdir -p "$d/bin"; printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
     mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
   esac
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
@@ -1884,7 +1896,7 @@ if cmp -s "$SKIPDRV" "$SDCO" 2>/dev/null; then rc=1; echo "      the coerce-to-z
 else
   d="$TMP/sa-coerce"; rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
   printf '300\n200\n' > "$d/o/candidates.txt"
-  printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
+  printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\n'
     printf 'skip_order_why() { printf "WHY:%%s" "${1:-}"; }\n'
     printf 'unusable_summary() { printf "none"; }\n'
@@ -2018,13 +2030,13 @@ main_handoff() {  # <label> <queue-setup> [state] [queued-this-pass] -> sets MHR
     # unrelated states and the arm must not confuse them; `wc` is the read that can fail alone.
     wcfail) printf '300\n200\n' > "$d/o/candidates.txt"
             mkdir -p "$d/bin"
-            printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+            printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
     # ⛔ READABLE, DEPTH UNMEASURABLE, HEAD UNPARSABLE (review P2, cycle 15): the state that `_q_readable`
     # exists for. Both of the arm's OUTPUTS are empty here, exactly as they are for an unreadable file, so
     # without the witness the pass calls this readable file "not a readable regular file".
     wcfail-garbage) printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
                     mkdir -p "$d/bin"
-                    printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
+                    printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc" ;;
     # ⛔ AND A REGULAR FILE THAT IS NOT READABLE: the `-r` half of the guard, which a directory (`-f`
     # fails first) can never grade.
     mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
@@ -2118,7 +2130,7 @@ if cmp -s "$MAINDRV" "$MHWCF" 2>/dev/null; then rc=1; echo "      the coerce-to-
 else
   d="$TMP/mh-coerce"; rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
   printf '300\n200\n' > "$d/o/candidates.txt"
-  printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
+  printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\nunusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
@@ -2152,7 +2164,7 @@ if cmp -s "$MAINDRV" "$QGREV" 2>/dev/null; then rc=1; echo "      the witness re
 else
   d="$TMP/mh-witrev"; rm -rf "$d"; mkdir -p "$d/o" "$d/bin"
   printf 'garbage-head\n300\n200\n' > "$d/o/candidates.txt"
-  printf '#!/usr/bin/env bash\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
+  printf '#!/usr/bin/env bash\nset -u\nexit 1\n' > "$d/bin/wc"; chmod +x "$d/bin/wc"
   { printf 'set -u\nQUEUE_ORDER_STATE="severity"\nQUEUED_THIS_PASS=""\n'
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\nunusable_summary() { printf "none"; }\n'
     for _n in judged V_QUEUED V_COLLISION V_LANDED V_UNJUDGED QUEUED; do printf ': "${%s:=}"\n' "$_n"; done
@@ -2805,6 +2817,7 @@ _d14u="$TMP/arm-clip-trshim"; rm -rf "$_d14u"; mkdir -p "$_d14u/o" "$_d14u/bin"
 printf 'aaa\nbbb\n' > "$_d14u/o/candidates.txt"; printf '200\n' > "$_d14u/o/.pool"; printf 'P1-severe\n' > "$_d14u/o/.pool-sat"
 cat > "$_d14u/bin/tr" <<'SHIM'
 #!/usr/bin/env bash
+set -u
 [ "${1:-}" = '\000' ] && exit 1
 exec /usr/bin/tr "$@"
 SHIM
@@ -3449,7 +3462,7 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 #   (b) a DECLARED INPUT — a file this suite only feeds to `bash -n` or `cat`s into a driver. The declaration is the
 #       `case` below, and it is the fail-closed direction: an undeclared file reds, so a new input is a visible act
 #       and a new driver is covered by DEFAULT whatever its name.
-# Measured population at this commit: 192 `.sh`, 136 drivers, 56 declared inputs (all `fns*`/`floor-fns.sh`/
+# Measured population at this commit: 192 `.sh`, 135 drivers, 57 declared inputs (all `fns*`/`floor-fns.sh`/
 # `main-handoff*`/`*-rev.sh`/`pf-*`/`skip-arm*`/`skip-inert.sh`/`skipwhy-real.sh`/`poolguard-mut.sh` bodies).
 # ⛔ THE OPTION, NOT ONE LINE OF TEXT (review P3, cycle 90). `grep -qx 'set -u'` (cycle 88) and then
 # `grep -qE '^[[:space:]]*set -[A-Za-z]*u'` (cycle 89) both graded a TEXT LINE, which is wrong in both directions:
@@ -3460,8 +3473,23 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # RESIDUAL, stated: a `set -u` inside quoted data still counts if it appears on a line that STARTS with `set` (only a
 # quoted-heredoc body indented under `set` is told apart); the witnesses' own `bash -n` + claim checks are the place
 # that class is separated, not here.
+# ⛔ AND IT READS THE WHOLE `set` COMMAND, NOT ONE LINE (review P3, cycle 91): a `set -e \` continued with `-u` on
+# the next physical line is real protection and was FALSE-BLOCKED (measured: the driver aborts on an unbound
+# variable, and the sweep still called it "WITHOUT a `set -u` flag"). Continuations are joined, then the text is
+# split into statements at `;`, braces, parens and `&&`/`||` so `fin() { set -u; }` counts and a `set` that is not a
+# command word does not. The declared residual is unchanged: a `set -u` inside quoted DATA still counts.
 _setu() { # $1=script -> 0 when a `set` command enables `u`
-  awk '/^[[:space:]]*set[[:space:]]/ { for (i = 2; i <= NF; i++) { if ($i ~ /^-[A-Za-z]*u/) f = 1; if ($i == "nounset") f = 1 } } END { exit !f }' "$1" 2>/dev/null
+  awk '
+    { _l = $0
+      while (_l ~ /\\[ \t]*$/) { sub(/\\[ \t]*$/, " ", _l); if ((getline _n) <= 0) break; _l = _l _n }
+      _nst = split(_l, _st, /[;{}()]|&&|\|\|/)
+      for (_i = 1; _i <= _nst; _i++) {
+        _nw = split(_st[_i], _w, /[ \t]+/); _j = 1
+        if (_nw >= 1 && _w[1] == "") _j = 2
+        if (_j > _nw || _w[_j] != "set") continue
+        for (_k = _j + 1; _k <= _nw; _k++) { if (_w[_k] ~ /^-[A-Za-z]*u/) f = 1; if (_w[_k] == "nounset") f = 1 }
+      } }
+    END { exit !f }' "$1" 2>/dev/null
 }
 drivers_total=0; drivers_bare=""; inputs_total=0
 while IFS= read -r drv; do
@@ -3478,8 +3506,8 @@ EOF
 # ⛔ AND THE OBSERVED HALF: EVERY SCRIPT BASH ACTUALLY STARTED (review P2, cycle 89). The `.sh` walk above cannot see
 # a driver that does not end in `.sh`, and it waives anything whose NAME matches an input class — so the population
 # that matters (what runs) is read from the `BASH_ENV` log, and each executed script must carry the flag family or be
-# a declared input. `*/bin/*` is the case dirs' own PATH shims (`wc`, `mv`, `cmp`, `sort`, `awk`, `cat`, `tr`), which
-# this suite runs as COMMANDS: declared here by path class, visibly, rather than by a name that can hide a driver.
+# a declared input. There is NO exemption for the case dirs' PATH shims (`wc`, `mv`, `cmp`, `sort`, `awk`, `cat`,
+# `tr`): they carry `set -u` in their own one-line bodies, so a driver can never hide behind one of those names.
 exec_total=0; exec_bare=""; exec_missing=""
 while IFS= read -r _ex; do
   [ -n "$_ex" ] || continue
@@ -3488,18 +3516,18 @@ while IFS= read -r _ex; do
   # removed itself simply leave the population — measured: an executed, self-deleting driver left the sweep at 177/0
   # with the same count. The absence is a fact about the run, so it is named, not skipped.
   [ -f "$_ex" ] || { exec_missing="$exec_missing ${_ex#"$TMP"/}"; continue; }
-  # ⛔ THE SHIMS ARE EXEMPT BY NAME, NOT BY DIRECTORY (review P2, cycle 90). A `*/bin/*` PATH class exempted EVERY
-  # executed script there: measured, an `exp3/bin/expshim` that the suite ran was logged and the count stayed at 133 —
-  # and `arm-clip-trshim/bin/tr`, a multi-line executed shim with no `set -u` on the code's own PATH, is ungraded for
-  # exactly that reason. These seven are the suite's PATH doubles; anything else that runs must carry the flag.
-  case "${_ex##*/}" in wc|mv|cmp|sort|awk|cat|tr) [ "${_ex%/*}" != "${_ex%/*/bin}" ] && continue ;; esac
+  # ⛔ NO EXEMPTION AT ALL (review P2, cycles 90-91). Cycle 90 replaced a `*/bin/*` PATH class with the seven shim
+  # NAMES — and a NAME list is the same hole: measured, an executed driver literally called `cat` (NOT under `bin/`)
+  # was waived and the count did not move, while the identical bytes as `planted-cat` reddened. So the shims carry
+  # `set -u` like everything else (inert in their one-line `exit`/`exec` bodies, which is why it costs nothing) and
+  # the graded population is now exactly the logged one.
   exec_total=$(( exec_total + 1 ))
   _setu "$_ex" || exec_bare="$exec_bare ${_ex#"$TMP"/}"
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
 if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
-else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, plus */bin/* shims); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
+else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, no shim exemption); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
 ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
 _out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
