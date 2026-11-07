@@ -1331,8 +1331,44 @@ rm -rf "$_leddir"; mkdir -p "$_leddir"
 review_ledger_unreadable "$_leddir" \
   || bad "a DIRECTORY at the ledger path must be reported UNREADABLE by review_ledger_unreadable (rc $?) — its content cannot be counted, which is exactly what that contract promises"
 rm -rf "$_leddir"
-# …and the over-blocking control: an ABSENT path and an EMPTY regular file are still 0 / readable, so the
-# `-e` test above did not turn "nothing spent yet" into a permanent EXHAUSTED head.
+# ⛔ `-e` FOLLOWS THE LINK, SO IT CANNOT SEE AN ENTRY THAT DOES NOT RESOLVE (review cycle 2, P2, measured):
+# a symlink loop and a dangling symlink whose target DIRECTORY is gone both answer "absent" to `-e`, so both
+# read 0 dispatches — a free slot — while the append to that path fails. That is the same permanent-0
+# fail-open the directory arm above closes, in the two shapes `-e` cannot reach, and the declared T2 surface
+# names "broken/looping symlink" explicitly.
+_ledloop="$_rdir/ledger-loop.attempts"
+ln -s "$_ledloop" "$_ledloop" 2>/dev/null
+[ -L "$_ledloop" ] && [ ! -e "$_ledloop" ] \
+  || bad "the SYMLINK LOOP fixture did not build (a self-link must exist and must not resolve) — the arm below would then prove nothing"
+[ "$(review_attempts "$_ledloop")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a SYMLINK LOOP at the ledger path must FAIL CLOSED (got '$(review_attempts "$_ledloop")', want the cap $REVIEW_MAX_ATTEMPTS) — `-e` follows the link and answers 'absent', i.e. 0 dispatches, while the append fails: a free slot for ever"
+review_ledger_unreadable "$_ledloop" \
+  || bad "a SYMLINK LOOP must be reported UNREADABLE by review_ledger_unreadable (rc $?) — an entry that does not resolve cannot be counted, which is this function's whole contract"
+rm -f "$_ledloop"
+_leddang="$_rdir/ledger-dangling.attempts"
+ln -s "$_rdir/no-such-dir/ledger" "$_leddang" 2>/dev/null
+[ -L "$_leddang" ] && [ ! -e "$_leddang" ] \
+  || bad "the DANGLING-SYMLINK fixture did not build (a link into a missing directory must exist and must not resolve)"
+[ "$(review_attempts "$_leddang")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a DANGLING symlink whose target directory is gone must FAIL CLOSED (got '$(review_attempts "$_leddang")', want the cap $REVIEW_MAX_ATTEMPTS) — the append cannot create it, so 0 is a charge that can never be collected"
+review_ledger_unreadable "$_leddang" \
+  || bad "a DANGLING symlink must be reported UNREADABLE by review_ledger_unreadable (rc $?) — same contract, same answer"
+rm -f "$_leddang"
+# …and the ANTI-OVER-BLOCK control for that split: a link that DOES resolve to a regular ledger is a normal
+# ledger. Without it, `-L` could be satisfied by shorthand that turns every symlinked store into a permanent
+# false EXHAUSTED — the opposite fail-open, and just as wrong.
+_ledreal="$_rdir/ledger-real.attempts"
+printf '%s\n' "$_now" > "$_ledreal"
+_ledlink="$_rdir/ledger-link.attempts"
+ln -s "$_ledreal" "$_ledlink" 2>/dev/null
+[ "$(review_attempts "$_ledlink")" = 1 ] \
+  || bad "a symlink that RESOLVES to a regular ledger must be COUNTED normally (got '$(review_attempts "$_ledlink")', want 1) — the split must classify what the entry resolves to, never the fact that it is a link"
+review_ledger_unreadable "$_ledlink" \
+  && bad "a symlink that resolves to a regular, readable ledger must answer 'readable' (rc 0) — otherwise every symlinked store publishes the CAP as if its count were unmeasured"
+rm -f "$_ledlink" "$_ledreal"
+# …and the over-blocking control for the `-e`/`-f` split itself: an ABSENT path and an EMPTY regular file are
+# still 0 / readable, so the fail-closed arms above did not turn "nothing spent yet" into a permanent
+# EXHAUSTED head.
 [ "$(review_attempts "$_rdir/never-created.attempts")" = 0 ] \
   || bad "an ABSENT ledger must still read 0 attempts (got '$(review_attempts "$_rdir/never-created.attempts")') — the fail-closed arm must not make a first-ever head un-reviewable"
 review_ledger_unreadable "$_rdir/never-created.attempts" \
@@ -2197,8 +2233,13 @@ done
 #     exist.
 # The arms below are the discrimination: the shared consequence must be GONE, the roll-by-itself fact and the
 # unreadable-ledger remedy must be PRESENT, and restoring the collapsed text must redden at least one.
+# ⛔ THE SUBJECT IS THE CLAIM, NOT ITS CAPITALISATION (review cycle 2, P2, measured): a `case` on the
+# lowercase sentence reads GREEN for "No reviewer is coming" / "NO reviewer is coming" — the two spellings a
+# future editor (and the file's own comment, which quotes it capitalised) would actually write — so the arm
+# advertised a protection it covered one letter-case of. `[Nn][Oo]` is the portable fix; bash 3.2 has
+# `nocasematch` but relying on a `shopt` that a later line could unset is exactly the fragility being fixed.
 case "$_cap" in
-  *'no reviewer is coming'*) bad "the HEADLESS 'awaiting-review' still carries the shared consequence 'no reviewer is coming' — it is false for a SPENT attempt counter (review_action rc 3 is EXHAUSTED WITHIN THE WINDOW: terminal until the window rolls, not for ever) and it collapses three different facts into one remedy" ;;
+  *[Nn][Oo]' reviewer is coming'*) bad "the HEADLESS 'awaiting-review' still carries the shared consequence 'no reviewer is coming' (in any capitalisation) — it is false for a SPENT attempt counter (review_action rc 3 is EXHAUSTED WITHIN THE WINDOW: terminal until the window rolls, not for ever) and it collapses three different facts into one remedy" ;;
 esac
 case "$_cap" in
   *'rolls BY ITSELF'*) ;;
@@ -2223,8 +2264,12 @@ case "$_hk" in
   *'If its current head is reviewable'*) bad "the head-keyed 'awaiting-review' must not carry the headless conditional text — the two publishes state different, measured facts" ;;
 esac
 # …and the text must be chosen by the presence of a head, not always one branch.
-grep -qF 'if [ -n "$head" ]; then' <<<"$(grep -A12 -F 'awaiting-review)' "$SUT" || true)" \
-  || bad "publish_review_state must SPLIT the 'awaiting-review' text on the head ('if [ -n \"\$head\" ]; then') — one text for both publishes is either a promise the cap path cannot keep or a hedge where a fact exists"
+# ⛔ A LINE WINDOW IS NOT A POSITION (review cycle 2, P2, measured): `grep -A12 -F 'awaiting-review)'` sits
+# TWO lines from its limit, so inserting two pure COMMENT lines inside that case arm RED-ed this arm while the
+# split it pins sat there unchanged — the identical false block this file already documents for the `-A2` arm
+# ('a false block on documentation'). The helper that answers "is the next STATEMENT…" is already here; use it.
+_pin_next '^[[:space:]]*awaiting-review\)$' '^[[:space:]]*if \[ -n "\$head" \]; then$' \
+  "publish_review_state must SPLIT the 'awaiting-review' text on the head ('if [ -n \"\$head\" ]; then') — one text for both publishes is either a promise the cap path cannot keep or a hedge where a fact exists"
 
 # ⛔ AND THE DEAD SECOND ARM MUST STAY DELETED (review round 11, P3): the attempt scan always prints
 # "<digits> <digits>", so a `*[!0-9 ]*` case could never fire — an arm advertising a failure mode the code

@@ -754,9 +754,16 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
   # count is pinned at 0 FOR EVER and the loop buys one full PAID review per COOLDOWN_TRANSIENT_S at that
   # head, with no EXHAUSTED state and no diagnostic. "The path exists but is not a ledger this file can
   # read" is the SAME fact as an unreadable ledger, never the same fact as "nothing has been spent".
-  [ -e "$f" ] || { printf '0\n'; return 0; }
+  # ⛔ `-e` DOES NOT SEE AN ENTRY THAT DOES NOT RESOLVE (review cycle 2, P2, measured): `test -e` FOLLOWS the
+  # link, so a symlink loop and a dangling symlink whose target directory is gone both answer "absent" —
+  # while the append in `launch_review` to that same path FAILS — which is the identical fail-open the
+  # `-f` split above removes for a directory, in the two symlink shapes it cannot reach. `-L` is what makes
+  # "a directory ENTRY is here" the question, so an entry that exists and does not resolve is classified
+  # with the other uncountable ones. Deliberately fail-closed for a dangling link whose target COULD be
+  # created: that path cannot be counted either, and "uncountable" is the fact this function reports.
+  [ -e "$f" ] || [ -L "$f" ] || { printf '0\n'; return 0; }
   [ -f "$f" ] || {
-    log_line "$f REVIEW-LEDGER-UNREADABLE: the attempt ledger path exists but is not a regular file, so this head's spend cannot be counted — treating it as EXHAUSTED (fail-closed: an uncountable counter is not a free slot, and the append would fail while every pass read 0)"
+    log_line "$f REVIEW-LEDGER-UNREADABLE: the attempt ledger path exists but is not a regular file (or is a link that does not resolve), so this head's spend cannot be counted — treating it as EXHAUSTED (fail-closed: an uncountable counter is not a free slot, and the append would fail while every pass read 0)"
     printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0
   }
   cut=$(( $(date +%s) - REVIEW_ATTEMPT_WINDOW_S ))
@@ -809,11 +816,12 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
 # published comment keeps asserting the CAP as a measured count. rc 0 = exists and cannot be read.
 review_ledger_unreadable() {  # $1 = attempt ledger; rc 0 = exists but its content cannot be counted
   local f=$1 bad
-  # ⛔ THE SAME `-e`/`-f` SPLIT AS `review_attempts` (review cycle 2, P2): a directory at the ledger path IS
-  # "exists but its content cannot be counted" — exactly what this contract promises, and exactly what the
-  # old `-f` test answered "readable" for. One classifier, two consumers, so the two must agree on every
-  # input or the CAP wording is skipped for the one record whose count was never measured.
-  [ -e "$f" ] || return 1
+  # ⛔ THE SAME `-e`/`-L`/`-f` SPLIT AS `review_attempts` (review cycle 2, P2): `-e` follows the link, so a
+  # non-resolving entry (`-L`) is "exists but its content cannot be counted" — exactly what this contract
+  # promises, and exactly what a bare `[ -e ]` said "absent, therefore readable" about. One classifier, two
+  # consumers, so the two must agree on EVERY input or the CAP wording is skipped for the one record whose
+  # count was never measured.
+  [ -e "$f" ] || [ -L "$f" ] || return 1
   [ -f "$f" ] || return 0
   # ⛔ SAME QUESTION AS `review_attempts` (review round 8, P3): this used to test only that awk could RUN,
   # so a readable ledger of garbage answered "readable" here while the count it produces is meaningless —
