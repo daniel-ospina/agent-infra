@@ -1282,7 +1282,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers="" _gitdir="" _attr_amb="" _wt_amb=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1456,11 +1456,38 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
   # was clean, and this arm's whole value is that proof. Cost is one `git config` read, and only
   # when the range actually holds a merge (with none, `merge-tree` is never consulted).
   if [ -n "$merges_in_range" ]; then
-    _drivers="$(delta_git "$root" config --get-regexp '^merge\..*\.driver$' 2>/dev/null || true)"
-    if [ -n "$_drivers" ]; then
-      echo "   delta: the checkout $root DECLARES A CUSTOM MERGE DRIVER — 'merge-tree' would reproduce that driver's resolution, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified:" >&2
-      printf '%s\n' "$_drivers" | command sed -e 's/^/     /' >&2
-      echo "   A merge driver is read from the checkout's own config, so it never appears in the diff, the record, or the digest. Unset it (git config --unset <key>) or record from a pristine checkout, then retry — a range whose merges cannot be judged is not evidence." >&2
+    # ⛔ CONFIG IS ONLY HALF OF IT (cycle-3 review, P1 — reproduced before widening). The BUILT-IN
+    # drivers have NO config key at all, so `merge=union` named from an attributes file steers the
+    # oracle just as a custom driver does. Measured: a conflict whose hand resolution is the ordinary
+    # "keep both" concatenation answers rc 1 with no attributes and rc 0 returning EXACTLY the hand
+    # tree once `c.txt merge=union` is present — with no `git config` write anywhere.
+    # Which attribute SOURCES may be trusted is the whole question, and the line is the REVIEWED
+    # ARTIFACT: a `.gitattributes` carried in the merge's own tree is part of what merges (and a
+    # tracked `merge=union` is a legitimate repo semantic — tortoise#5373), so it stays accepted. An
+    # UNTRACKED or MODIFIED `.gitattributes` in the worktree, and `.git/info/attributes`, are
+    # AMBIENT: nothing in the diff, the record, or the digest shows them, and a pristine checkout of
+    # the same commit reports the conflict. Those are what this arm refuses.
+    _drivers="$(delta_git "$root" config --show-scope --get-regexp '^merge\..*\.driver$' 2>/dev/null || true)"
+    _gitdir="$(delta_git "$root" rev-parse --absolute-git-dir 2>/dev/null || true)"
+    _attr_amb=""
+    if [ -n "$_gitdir" ] && [ -s "$_gitdir/info/attributes" ]; then
+      _attr_amb="${_gitdir}/info/attributes"
+    fi
+    _wt_amb="$(delta_git "$root" ls-files -o -m --exclude-standard -- '*.gitattributes' '.gitattributes' 2>/dev/null || true)"
+    if [ -n "$_wt_amb" ]; then
+      _attr_amb="${_attr_amb}${_attr_amb:+$'\n'}${_wt_amb}"
+    fi
+    if [ -n "$_drivers" ] || [ -n "$_attr_amb" ]; then
+      if [ -n "$_drivers" ]; then
+        echo "   delta: this box's git config DECLARES A MERGE DRIVER — 'merge-tree' would reproduce that driver's resolution, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified (scope and key are shown, because the key may live in GLOBAL or SYSTEM config rather than the checkout):" >&2
+        printf '%s\n' "$_drivers" | command sed -e 's/^/     /' >&2
+        echo "   Unset it in the scope shown above (git config --<scope> --unset <key>), then retry — 'recording from a pristine checkout' does NOT help, because a global or system key follows you there." >&2
+      fi
+      if [ -n "$_attr_amb" ]; then
+        echo "   delta: an AMBIENT ATTRIBUTES file steers this checkout's merge oracle — 'merge-tree' honours it, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified:" >&2
+        printf '%s\n' "$_attr_amb" | command sed -e 's/^/     /' >&2
+        echo "   These sources are not part of the reviewed artifact (nothing in the diff, the record or the digest shows them), while a gitattributes file COMMITTED in the merge's own tree is legitimate and stays accepted. Remove or commit the file, or run the record from a clean checkout of the same commit, then retry — a range whose merges cannot be judged is not evidence." >&2
+      fi
       return 1
     fi
   fi

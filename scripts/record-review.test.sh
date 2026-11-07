@@ -8211,36 +8211,90 @@ assert_not_contains "$RECORD_ERR" "contains authored content (1 commit(s))" \
     "20i2 …and NOT the count form a graft-honouring recorder would produce"
 rm -f "$DG/.git/info/grafts"
 
-# 20i3 THE ORACLE ITSELF — A MERGE DRIVER (cycle-2 review, P1; reported with a runnable repro and
-#      reproduced here before the fix). `merge-tree` reads `merge.<name>.driver` from the
-#      CHECKOUT'S OWN CONFIG, which the lane owns (`DELTA_GIT_DIR` defaults to its worktree). A
-#      driver that reports success makes a content-dropping resolution look like a CLEAN merge —
-#      the conflict's other side is discarded and nobody reviewed that decision — and the attribute
-#      naming the driver can arrive from the BASE side while the driver definition never appears in
-#      the diff, the record, or the digest. Measured: `merge-tree` exits 1 without the driver and 0
-#      WITH it, returning exactly the hand resolution's tree.
-#      The range here is the SAME hand-edited merge as 20i1, but with a cover that POSTDATES it —
-#      so the ONLY thing between this input and a minted `clean` is the driver refusal.
-EHI4=425153; rm -f "$(Q2 $EHI4)"
+# 20i3 THE ORACLE ITSELF — AN AMBIENT ATTRIBUTES FILE (cycle-2/3 review, P1; reported with runnable
+#      repros, reproduced here before the fix). `merge-tree` honours merge drivers, and the BUILT-IN
+#      ones (`union`) have NO config key at all — so `merge=union` named from an attributes file
+#      steers the oracle with nothing but a `printf`. Measured in this fixture: the conflict answers
+#      rc 1 with no attributes and rc 0 returning EXACTLY the hand "keep both" tree once the file
+#      exists. The attribute source that matters is the one the DIFF cannot see: an UNTRACKED (or
+#      modified) `.gitattributes` in the worktree, and `.git/info/attributes`. A `.gitattributes`
+#      committed in the merge's own tree is a legitimate repo semantic (tortoise#5373) and stays
+#      accepted.
+git checkout -q -b uni_lane "$DG_A1" >/dev/null 2>&1 || true
+printf 'lane-line\n' > u.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'lane: u'
+DG_UN_L="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_UN_L"
+git checkout -q -b uni_base "$DG_A1" >/dev/null 2>&1 || true
+printf 'base-line\n' > u.txt; git add -A
+GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: u'
+DG_UN_B="$(git rev-parse HEAD)"
+printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_UN_B"
+git checkout -q uni_lane >/dev/null 2>&1 || true
+git -c core.editor=true merge --no-ff --no-commit "$DG_UN_B" >/dev/null 2>&1 || true
+# the hand resolution is the ordinary "keep both" concatenation — i.e. exactly `merge=union`'s output
+printf 'lane-line\nbase-line\n' > u.txt
+git add -A
+GIT_COMMITTER_DATE='2025-09-01T00:00:00Z' GIT_AUTHOR_DATE='2025-09-01T00:00:00Z' \
+    git commit -qm 'keep both (hand resolution)'
+DG_UN_H="$(git rev-parse HEAD)"
+printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_UN_H"
+_un_mt=0
+DG_UN_MT="$(git merge-tree --write-tree "$DG_UN_L" "$DG_UN_B" 2>/dev/null)" || _un_mt=$?
+DG_UN_MT="${DG_UN_MT%%$'\n'*}"
+if [ "$_un_mt" != "0" ] && [ "$DG_UN_MT" != "$(git rev-parse "$DG_UN_H^{tree}")" ]; then
+    ok "20i3 fixture: WITHOUT the attribute the merge CONFLICTS (rc $_un_mt) and its tree is not the hand one"
+else
+    bad "20i3 fixture: the conflict premise does not hold (rc=$_un_mt) — the vector would certify nothing"
+fi
+printf 'u.txt merge=union\n' > .gitattributes
+_un_mt2=0
+DG_UN_MT2="$(git merge-tree --write-tree "$DG_UN_L" "$DG_UN_B" 2>/dev/null)" || _un_mt2=$?
+DG_UN_MT2="${DG_UN_MT2%%$'\n'*}"
+if [ "$_un_mt2" = "0" ] && [ "$DG_UN_MT2" = "$(git rev-parse "$DG_UN_H^{tree}")" ]; then
+    ok "20i3 control: the UNTRACKED attribute STEERS the oracle — rc 0, tree EQUAL to the hand resolution"
+else
+    bad "20i3 control: the ambient attribute did not steer merge-tree (rc=$_un_mt2), so this vector does not reproduce the bypass"
+fi
+# a cover that POSTDATES A: for a merge-only range that is sufficient, so the ambient attribute is
+# the only thing between this input and a minted `clean`.
+EHI7=425156; rm -f "$(Q2 $EHI7)"
+run_record_delta $EHI7 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515601" \
+    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i3 an AMBIENT .gitattributes is refused (rc 3)"
+assert_contains "$RECORD_ERR" "AMBIENT ATTRIBUTES file steers" "20i3 the refusal names the ambient attribute source"
+assert_contains "$RECORD_ERR" ".gitattributes" "20i3 …and names the file it found"
+[ ! -f "$(Q2 $EHI7)" ] && ok "20i3 no record written" || bad "20i3 a clean was minted from a steered oracle"
+# ⛔ THE ATTRIBUTION IS THE MUTATION CELL (M36), NOT AN IN-VECTOR CONTROL: with the attribute removed
+#    this merge CONFLICTS again, so the range is EVIL and refuses on the anchor regardless of the
+#    refusal under test — a "control" here would refuse for a different reason and certify nothing.
+#    The premise that the attribute really steers the oracle is asserted with git itself, above.
+rm -f .gitattributes
+# 20i5 THE CONFIG HALF: a CUSTOM driver (which has a config key) steered from an untracked
+#      attribute. Both halves are needed — the built-in drivers have no key, and a custom driver
+#      needs both the key and the attribute — and the refusal must name the scope, because the key
+#      may live in GLOBAL or SYSTEM config where 'record from a pristine checkout' does not help.
+printf 'u.txt merge=hidrv\n' > .gitattributes
 git config merge.hidrv.driver true || true
-run_record_delta $EHI4 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515301" \
-    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
-assert_eq "$RECORD_RC" "3" "20i3 a checkout that DECLARES a merge driver is refused (rc 3)"
-assert_contains "$RECORD_ERR" "DECLARES A CUSTOM MERGE DRIVER" "20i3 the refusal names the merge driver"
-assert_contains "$RECORD_ERR" "merge.hidrv.driver" "20i3 …and names the offending config key"
-[ ! -f "$(Q2 $EHI4)" ] && ok "20i3 no record written" || bad "20i3 a clean was minted from a driver-steered oracle"
-# ⛔ CONTROL: unset it and the SAME input is ACCEPTED. Without this the refusal could be caused by
-#    the hand edit rather than the driver, and the vector would certify the wrong thing.
+EHI9=425158; rm -f "$(Q2 $EHI9)"
+run_record_delta $EHI9 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515801" \
+    STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i5 a CUSTOM merge driver declared in config is refused (rc 3)"
+assert_contains "$RECORD_ERR" "DECLARES A MERGE DRIVER" "20i5 the refusal names the config driver"
+assert_contains "$RECORD_ERR" "merge.hidrv.driver" "20i5 …and names the offending config key"
+assert_contains "$RECORD_ERR" "scope" "20i5 …and says the key may live in GLOBAL or SYSTEM scope (the remedy depends on it)"
+[ ! -f "$(Q2 $EHI9)" ] && ok "20i5 no record written" || bad "20i5 a clean was minted from a custom-driver-steered oracle"
+rm -f .gitattributes
 git config --unset merge.hidrv.driver 2>/dev/null || true
-EHI5=425154; rm -f "$(Q2 $EHI5)"
-run_record_delta $EHI5 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515401" \
-    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
-assert_eq "$RECORD_RC" "0" "20i3 control: with NO driver declared the same covered range is ACCEPTED (rc 0)"
 # 20i4 THE TOKEN SCAN'S FAILURE ARM (cycle-2 review, P2). `grep` exits 1 for a legitimate
 #      no-match, but a REAL failure of any pipeline member used to produce the same empty list, so
 #      the population loop silently did not execute. A shim is the only way to reach that state:
 #      `command sort` still resolves through PATH, and `$T/bin` is prepended for the recorder.
-printf '#!/bin/sh\nexit 2\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
+# ⛔ THE SHIM MUST FAIL ONLY THE SCAN'S OWN CALL. A blanket `sort` failure also breaks the
+#    recorder's other `sort` uses (the anchor's `sort -rn`), so the run refused on an unrelated
+#    arm and the vector certified nothing (measured: rc 3 without the scan's sentence). `sort -u`
+#    is what the token scan pipes into; anything else is delegated to the real binary.
+printf '#!/bin/sh\nif [ "$1" = "-u" ]; then exit 2; fi\nexec /usr/bin/sort "$@"\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
 EHI6=425155; rm -f "$(Q2 $EHI6)"
 run_record_delta $EHI6 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515501" \
     STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
@@ -8710,15 +8764,23 @@ rm -f "$DG/.git/info/grafts"
 #        it proves the scan exists, not that a FAILED scan is refused: delete only the rc check and
 #        every vector plus M21 stays green while "no tokens" and "the scan did not run" collapse
 #        back into one value. The sort shim is what makes a pipeline member fail for real.
-printf '#!/bin/sh\nexit 2\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
+printf '#!/bin/sh\nif [ "$1" = "-u" ]; then exit 2; fi\nexec /usr/bin/sort "$@"\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
 MUT="$(mk_mutant norgcheck '    if [ "$_tok_rc" -gt 1 ]; then' '    if false; then')"
 mut_check "M21b the rc check on the token scan" 425155 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515501" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
 rm -f "$T/bin/sort"
 # M36 — THE MERGE-DRIVER REFUSAL (20i3). Deleting it re-accepts a checkout whose oracle is steered
 #       by a driver the lane owns, which is the false PASS the arm exists to stop.
+printf 'u.txt merge=union\n' > "$DG/.gitattributes"
+MUT="$(mk_mutant noambientattr '    if [ -n "$_wt_amb" ]; then' '    if false; then')"
+mut_check "M36 the AMBIENT-ATTRIBUTES refusal" 425156 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515601" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
+rm -f "$DG/.gitattributes"
+# M37 — THE CONFIG-DRIVER REFUSAL. ⛔ NO AMBIENT ATTRIBUTE IN THIS CELL'S FIXTURE, deliberately: with
+#       one present the mutant would still refuse on the attribute arm and the cell would be vacuous.
+#       Config alone is the over-block this arm accepts (a driver key that no attribute uses), and the
+#       cell measures that it is load-bearing.
 git config merge.hidrv.driver true || true
-MUT="$(mk_mutant nodriver '    if [ -n "$_drivers" ]; then' '    if false; then')"
-mut_check "M36 the merge-driver refusal" 425153 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515301" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+MUT="$(mk_mutant nodriver '    if [ -n "$_drivers" ] || [ -n "$_attr_amb" ]; then' '    if [ -n "$_attr_amb" ]; then')"
+mut_check "M37 the CONFIG merge-driver refusal" 425159 "$DG_UN_H" "delta:$DG_UN_L..$DG_UN_H+comment:42515901" accepted STUB_BASE_SHA="$DG_UN_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
 git config --unset merge.hidrv.driver 2>/dev/null || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
