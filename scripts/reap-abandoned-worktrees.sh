@@ -326,6 +326,15 @@ now() { date +%s; }
 # 2c18ff89a, with the cap test at `:587`), which is why ~89 % of its ten slots went to trees the floor
 # preserves anyway. That ordering — not a second check site — is what MUT_ORDER pins.
 budget_spent() { [ "$(now)" -ge "$1" ]; }
+# budget_before_removal <deadline-epoch> — the LAST gate above the destructive call, kept as its OWN
+# named predicate rather than a second `budget_spent` line. It answers a different question from the
+# pre-census gate ("did the census I just ran consume the budget?") and, unlike that gate, it is
+# UNREACHABLE from the `--dry-run` path and from any `BUDGET=0` fixture — which is exactly how it went
+# untested until review round 11: deleting it left all 20 cases green because the pre-census gate had
+# already fired for every candidate (agent-infra#3442). A named predicate is the shape this file already
+# uses for `budget_spent` ("ONE named predicate, so the bound is a single thing a test can mutate"), and
+# a test reverts exactly this one.
+budget_before_removal() { budget_spent "$1"; }
 # file_mtime <path> — epoch mtime, portable across GNU (stat -c %Y) and BSD (stat -f %m).
 file_mtime() {
     local m
@@ -796,16 +805,11 @@ sweep_root() { # <root>
                 KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
                 continue
             fi
-            # ⛔ THE COUNT CEILING IS CHARGED HERE, AFTER THE AGE FLOOR AND BEFORE THE CENSUS — that
-            # position is #3278's P1: a young tree costs no slot, so the ceiling is spent on trees that
-            # can actually be removed. The O(1) refusal itself is at the TOP of the branch (an exhausted
-            # ceiling must not pay the scan); by construction it cannot fire here, because `GITLESS_DONE`
-            # has not changed since it was read, and a second check site is what made the pre-#3278
-            # ordering ambiguous. The `-n` guard is defensive (the `:-10` default guarantees a value).
-            # Raising or removing the ceiling is #3278's P3 — an OWNER decision — not this change.
-            if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root ceiling, default 10, and it counts AGED candidates only)"; continue
-            fi
+            # ⛔ THE UNIT IS CHARGED BELOW, after this floor and before the census — that position is
+            # #3278's P1, and a young tree costs no slot because of it. There is deliberately NO ceiling
+            # TEST in this block: the refusal is the O(1) check at the TOP of the branch, and a second
+            # test here could never fire (`GITLESS_DONE` has not moved since the top of this iteration),
+            # so it would be an inert guard that reads like protection — the class this PR deletes.
         fi
         # ⛔ THE TIME BOUND IS THE REAL GUARD, FOR BOTH ARMS, AND IT SITS BEFORE THE EXPENSIVE WORK.
         # The census, `git status` and the re-probe are what it exists to bound; an unprocessed
@@ -860,7 +864,7 @@ sweep_root() { # <root>
             log_line "         age=${age}m $out"
             continue
         fi
-        if budget_spent "$deadline"; then
+        if budget_before_removal "$deadline"; then
             log_line "KEPT   $canon reason=budget (the ${BUDGET}s sweep budget is spent; unprocessed worktrees are PRESERVED)"
             KEPT=$((KEPT + 1)); continue
         fi

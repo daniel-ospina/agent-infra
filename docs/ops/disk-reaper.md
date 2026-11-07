@@ -757,12 +757,29 @@ default 10 per root) is still the bound on destructive capacity, and it is now t
 floor and before the live-pid census** — the unit used to be spent BEFORE the floor was consulted, so
 ~89 % of those ten slots went to trees the age test preserved anyway, and on a population of thousands
 the aged trees were never reachable at all (a dry run over 3,314 entries classified 10 and printed
-`gitless-cap` for **3,137**). The pass's **expensive per-candidate work** is additionally bounded, **per
+`gitless-cap` for **3,137**). **An exhausted ceiling also short-circuits the eligibility scan itself**
+(one integer compare, at the top of the gitless branch): with the refusal downstream of the scan a
+capped pass still paid ~6 forks per entry to print rows that say the same thing — measured at 8.98 s
+versus 0.60 s over 300 entries with the census isolated, for a byte-identical pass record. The cost of
+that ordering is a REPORT change, and it is deliberate: past the ceiling a row names the ceiling
+(`gitless-cap`), not the tree's own reason, because the arm did not look. Every outcome there is a
+preserve.
+The pass's **expensive per-candidate work** is additionally bounded, **per
 root**, by a **TIME** bound, `REAP_AW_BUDGET_SECONDS` default 300 s — the eligibility scan over the whole
-population is *not* budgeted (classifying every entry is the product), and `DISK_REAPER_CLASS_TIMEOUT`
-(1800) bounds each **per-root invocation**, not the whole pass.
+population up to the ceiling is *not* budgeted (classifying every entry is the product), and
+`DISK_REAPER_CLASS_TIMEOUT` (1800) bounds each **per-root invocation**, not the whole pass.
 **Raising or removing the ceiling is #3278's P3 — an owner decision, sequenced after P2 — and is not
 part of this change.**
+
+The `home-or-state` guard protects the cell home even when nothing exports `CELL_HOME`: the unit renders
+`Environment=HOME=/home/cmux` (a real directory), so the wrapper's own fallback never fires and
+`/tmp/cell-home` — ~20 GB of live `.pi` state with no `.git` — used to match none of the guard's
+references. The guard now resolves it itself, via `REAP_AW_CELL_HOME_DEFAULT` (default
+`/tmp/cell-home`). ⛔ **That seam is TEST-ONLY: never set it in a systemd unit, a launchd plist, or any
+scheduled artifact.** It is a *substitution*, not an addition — an exported `CELL_HOME` still wins, and
+a wrong value protects a different directory **and drops `/tmp/cell-home`**. It exists so the fallback
+has a behavioural test (a fixture cannot live at `/tmp/cell-home`); it is a default, not a second
+source of truth.
 What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
 `open-pr`/`dirty` proofs) and everything the ceiling and the pass's time bound leave for the next run.
 
