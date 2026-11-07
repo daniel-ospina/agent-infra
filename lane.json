@@ -1,0 +1,21 @@
+{
+  "artifacts": [],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "exit_code": null,
+  "heartbeat_at": 1794036712,
+  "host": "cmux",
+  "issue": 42,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-42-1794036712-p2768242-cb7ff0f9",
+  "lease_until": 1794037317,
+  "pid": 2768242,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794036712,
+  "state": "RUNNING",
+  "tag": "42",
+  "worktree": "/tmp/admin-merge.9DTtJl/repro-base/tree"
+}
