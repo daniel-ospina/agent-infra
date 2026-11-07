@@ -107,8 +107,11 @@ fi
 # `bash "$READER" check` subprocess "collapses 3/4/5 to 0/1" — it does NOT (the executed path returns
 # `repo_set_check`'s code verbatim; measured 3/4/5 for absent/empty/malformed, and this repo's suite
 # asserts exactly that through `bash "$READER"` in `repo-set.test.sh`). What a subprocess cannot give
-# this process is the reader's VALUES: `repo_set_file`, `repo_set_doctor_repos`, `_rs_strip`,
-# `_rs_slug_ok`, `_rs_origin_slug`, `_rs_normalize_slug` — every one of which the branches below CALL.
+# this process is the reader's FUNCTIONS AND THEIR VALUES — the set path, the rendered entry list, the
+# trim, the origin proof, the slug normalisation — which the branches below CALL. ⛔ NAMING THEM ONE BY
+# ONE IS WHAT WENT WRONG HERE THREE TIMES: a list invites a name that is not actually called (`_rs_slug_ok`
+# reaches this process only inside `repo_set_parse`'s verdict). The property is "this process calls the
+# reader's functions", and `grep -n '_rs_' scripts/pr-doctor-machine.sh` is its check.
 # Re-parsing the file here, or scraping a subprocess's stdout for them, would be the two-authorities
 # defect the reader exists to remove. One parser, in-process, so the verdict and the values are the
 # same reader's.
