@@ -918,9 +918,10 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
 # certified. That is a deadlock, not an over-block.
 
 
-#: Real ids from the shipped suites, not invented ones. The first family is the
-#: `tools/**/*.py` census (`/` in the parameter); the rest are the other
-#: characters a pytest parameter can carry, so a future narrowing of `rest`
+#: Real ids from the suite that REPORTED #3686 — the five below are tortoise's
+#: `tools/**/*.py` census and shard ids as its CI printed them, copied verbatim
+#: (`/` and space in the parameter). The next five are explicit SHAPE VECTORS for
+#: parameter characters no shipped id exercises, so a future narrowing of `rest`
 #: cannot pass by covering only the shape #3686 was reported for.
 #:
 #: ⛔ INCLUDING SPACE (#3686 second door). `[argv14-at the EDGE]` is a real id
@@ -1022,9 +1023,10 @@ def test_a_SPACE_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
     is the field delimiter — `_SIG_ROW_RE` already delimits that way — so the
     nodeid group must be `[^\t]+`.
 
-    MUTATION: restore `(?P<nodeid>\S+)` → `parse_rates` rejects the row and the
-    assertion on `r.rates` fails, because a dropped main-side row is exactly the
-    permanent-BLOCK mechanism this issue names.
+    MUTATION: restore `(?P<nodeid>\S+)` → `parse_rates` rejects the row, so the
+    `r.rejected == []` assertion below fails FIRST (measured — `r.rates` is never
+    reached), because a dropped main-side row is exactly the permanent-BLOCK
+    mechanism this issue names.
     """
     r = parse_rates(f"{_SPACE_PARAM_ID}\t3\t26\n")
 
@@ -3334,7 +3336,9 @@ def test_shard_token_is_in_the_row_doors_alphabet_for_every_hostile_path():
     """
     hostile = [
         "scripts/lib/a~b.sh",          # `~` — quote()'s always-safe set, the cycle-4 silent drop
-        "scripts/a b.test.sh",          # whitespace — the rate table is `uniq -c | awk`
+        "scripts/a b.test.sh",          # whitespace — outside this family's charset in
+                                        # `_NON_NODEID_KEY_RE` (the rate table itself is
+                                        # TAB-delimited since #3686, so it is not the reason)
         "scripts/a\tb.sh",              # a tab, which would also break the capture's field split
         "scripts/a%41.sh",             # a literal escape: must be RE-escaped, not passed through
         "scripts/a@b#c.sh",            # characters `_slug` would fold away
@@ -3444,7 +3448,9 @@ def test_bash_shard_identity_is_injective_over_the_listed_shards():
             "can fold two shards onto one identity"
         )
         ids.setdefault(got[0], []).append(path)
-        # …and the key must carry no whitespace (the rate table is `uniq -c | awk`).
+        # …and the key must carry no whitespace: the family's charset in `_NON_NODEID_KEY_RE`
+        # is `[A-Za-z0-9_./%\-]`. The rate table is TAB-delimited since #3686, so the table's
+        # old `uniq -c | awk` constraint is NOT the reason — this charset is.
         assert re.search(r"\s", got[0]) is None, got[0]
     collisions = {k: v for k, v in ids.items() if len(v) > 1}
     assert not collisions, f"distinct shards share one identity: {collisions}"
@@ -3485,7 +3491,7 @@ def test_6798_the_row_door_still_rejects_junk():
         "collect-error::",               # empty path
         "collect-error::tests/a.py::x",  # a nodeid is NOT a collect-error key
         "bash-shard::",                  # empty shard path
-        "bash-shard::a b",               # whitespace defeats the rate table's uniq|awk
+        "bash-shard::a b",               # whitespace is outside _NON_NODEID_KEY_RE's charset
         "runner::",                      # empty job slug
         "bash-shard::x::y",              # a nodeid is not a shard key
     ):
