@@ -1128,13 +1128,19 @@ gh_probe_env() {
     # settings the shim spends 120 s sleeping out a shared throttle window before it ever returns 75,
     # so a probe bounded at 20 s sees THIS arm — and "a shared budget is being slept out" is one of
     # the things a bound here can mean. It establishes a NON-ANSWER, nothing more.
-    # ⛔ AND IT CARRIES ITS EVIDENCE SLOT (#3701 round 4; round 7 corrected WHAT it can say). At
-    # default knobs the shim is SIGKILLed by this probe's bound BEFORE `flush_notes` runs, so the
-    # capture is ZERO bytes and `gh_probe_evidence` renders `rc=142, no stderr written`. That is a
-    # NAMED NON-ANSWER rather than a gh-layer line — the honest maximum on this path, and the reason
-    # the slot is worth wiring: the record says the layer wrote nothing, instead of carrying no
-    # evidence field at all. `(g9)`'s stub writes its stderr BEFORE sleeping, an ordering a SIGKILLed
-    # shim cannot produce, so that row pins the INTERPOLATION, not a production byte count.
+    # ⛔ AND IT CARRIES ITS EVIDENCE SLOT (#3701 round 4; rounds 7-8 corrected WHAT it can say). On
+    # the default path this probe USUALLY kills the call before the shim flushes, so the capture is
+    # often EMPTY and `gh_probe_evidence` renders `rc=142, no stderr written` — a NAMED NON-ANSWER,
+    # not a quote. That is the honest maximum here and the reason the slot is worth wiring: the record
+    # says the layer wrote nothing, instead of having no evidence field at all.
+    # ⛔ BUT NOT ALWAYS, AND THE DIFFERENCE IS WHICH ARM OF `gh_probe_bounded` RAN (#3701 round 8,
+    # P2): its perl arm SIGKILLs (`:975-993`), while its `timeout --kill-after=2` fallback sends
+    # SIGTERM first — and the shim TRAPS term and flushes its buffered notes on exit
+    # (`scripts/gh-shim/gh:1828`, `:740-743`, `:744-749`). Measured on the real shim: perl arm `rc=142`
+    # with 0 bytes of stderr, timeout arm `rc=124` with 233 bytes of notes. So this record says
+    # "nothing was written" on the perl path and QUOTES the pacing note on the timeout path; both are
+    # honest, and neither is a guarantee. `(g9)`'s stub writes stderr BEFORE sleeping, an ordering a
+    # killed shim cannot produce, so that row pins the INTERPOLATION, not a production byte count.
     GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s: a NON-ANSWER, which establishes neither a rejected credential nor anything about the budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")"
     echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
     printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
@@ -2227,14 +2233,18 @@ refresh_record_write running provision 0 \
 # line — which CANNOT refuse this probe's `api rate_limit` call (`gh-limit.py`'s `reaches_api()` is
 # False for the meter, and the floor is gated behind it). The comments now agree with each other and
 # with the code; the arm-by-arm detail is at the `GH_PROBE_CAUSE` definition above.
-# ⛔ AND `.refresh-blocked` IS **NOT** FIXED BY THIS CHANGE — DECLARED, not omitted (#3701 round 7,
-# P1). An earlier version of this comment claimed that marker's "Reason and evidence" was built from
-# the RECORD too. It is not: `orch-loop.sh:8801` writes that section as
-# `tail -n +$((log_mark+1)) "$LOG" | grep 'NOT PROVISIONABLE' | tail -3` — it quotes the LOG, and it
-# keys on `NOT PROVISIONABLE`, which is the rc=3 arm, so this provision-path cause never reaches it at
-# all. What this change DOES fix is the RECORD (`state/refresh-last`) and everything derived from it —
-# `[dispatch] BLOCKED` via `refresh_cause_brief`. The log-quoting surface is deliberately untouched:
-# it already quotes the refresh's own logged refusal, which is the behaviour that marker wants.
+# ⛔ AND `.refresh-blocked` IS FIXED TOO, ON THE rc=3 ARMS — stated this way because an earlier
+# version of this very comment got it BACKWARDS (#3701 round 8, P1). That marker's "Reason and
+# evidence" is `tail -n +$((log_mark+1)) "$LOG" | grep 'NOT PROVISIONABLE' | tail -3`
+# (`orch-loop.sh:8801`), i.e. it quotes the LOG — but the cause reaches that log WITH this clause:
+# `provision_fail` prefixes `NOT PROVISIONABLE: ` when rc is `EXIT_NOT_PROVISIONABLE` (:617-620) and
+# `refresh_fail` writes the WHOLE cause to stdout (:607), which `orch-loop.sh` sends to `$LOG`. So an
+# rc=3 refusal now lands in that marker as the measured clause, where before it landed as the pointer.
+# ⛔ THE LIMITS, so neither surface is over-claimed: a rc=1 (TRANSIENT) refusal writes NO
+# `.refresh-blocked` at all — `orch-loop.sh:8790-8801` writes it only under `if [ "$rc" -eq 3 ]` — so
+# the `why=TRANSIENT:` shape quoted above has the RECORD as its sole surface; and the marker reads the
+# log, never the record file. Both derived surfaces therefore name the precondition on the rc=3 path;
+# only the TRANSIENT path has one surface.
 gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused [${GH_PROBE_CAUSE:-NO CLAUSE RECORDED by gh_probe_env — the specific precondition was not named}] — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
