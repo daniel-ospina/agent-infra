@@ -1358,6 +1358,21 @@ grep -qE "$_RATTRE" "$SUT" \
 # PAID dispatch is bought on every pass for ever — the round-2 defect this whole block exists to prevent,
 # reopened one line below its own pin. A statement pin protects a statement; only adjacency protects the
 # HAND-OFF between two of them.
+# ⛔ AND THE THIRD HAND-OFF — `_rstate` — WAS PINNED BY NOTHING (review round 11, P2, MEASURED): the two
+# arms below protect the age and the count, but the STATE feeding the same predicate had no pin at either
+# end, so a `_rstate=clean` line inserted between the read and the counter made `review_action` return 2
+# (`issues|clean) return 2`) and the loop take the `else` arm — publishing "a review record exists but the
+# PR carries no marker" about a record that does not exist, and NEVER DISPATCHING a review: the #3489
+# permanent-invisibility class, on the operator's own surface, with this whole suite GREEN. Commented out
+# instead, `_rstate` is unbound under `set -u` and the actuator aborts at the review arm on every pass.
+# Pinning a state that is read on one line and consumed two lines later is exactly the mistake this block
+# exists to stop, so it is closed here with the same helper rather than left as the one hole in the family.
+_RSTRE='^[[:space:]]*_rstate=\$\(review_state "\$_rout"\)$'
+grep -qE "$_RSTRE" "$SUT" \
+  || bad "the loop must read the review state from the record ('_rstate=\$(review_state \"\$_rout\")') — commented out it is unbound under set -u and aborts the actuator at the review arm; replaced, every head reads as TERMINAL"
+_rnxt2=$(_after_stmt "$_RSTRE")
+grep -qE "$_RATTRE" <<<"$_rnxt2" \
+  || bad "the review state must be followed by the attempt count as the VERY NEXT STATEMENT (found: '${_rnxt2:-MISSING}') — an inserted \`_rstate=clean\` makes review_action return 2, which publishes a false 'a record exists' claim and buys no review at all, while every other arm stays green"
 _RAGERE='^[[:space:]]*_rage=\$\(review_dispatch_age "\$_rout"\); _rage_rc=\$\?$'
 _RACTRE='^[[:space:]]*review_action "\$_rstate" "\$_rage" "\$_rattn"; _ract=\$\?$'
 _rnxt=$(_after_stmt "$_RATTRE")
