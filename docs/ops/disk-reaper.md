@@ -959,8 +959,8 @@ same exact refname+sha compare). The snapshot is CLASSIFICATION evidence; a bran
 merge between the snapshot and the fork would otherwise make "the remote still holds this head"
 false at the instant a checkout with **no backup** is destroyed. The cost is ONE targeted probe per
 `remote-holds` candidate at classification, plus a SECOND at the fork for one that reaches re-check
-#3 — so a removal pays two and a candidate preserved later still pays one; the second is the decisive
-one. A failed, timed-out or empty targeted
+#3 — so a removal pays two, a preserve by `clean_gate`/gate (b)/the ladder pays one, and a preserve
+**at the fork** has already paid two; the second is the decisive one. A failed, timed-out or empty targeted
 probe at removal time preserves.
 The remote's own `refs/heads/*` are
 read by ONE bounded `git ls-remote --heads <remote>` **per remote per pass** (#3371) and cached for

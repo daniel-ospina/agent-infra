@@ -327,14 +327,18 @@
 #     until the per-worktree loop begins: enumeration/ps/lsof already have their
 #     own watchdogs, and charging their latency to the budget made a slow host
 #     defer EVERY worktree on every pass — a reaper that silently never reaps.
-#   * `git ls-remote` (#3041) is the ONE probe that can cross a network. TWO different calls, and
-#     they no longer share a cost model: the ADVERTISEMENT (`ls-remote --heads <remote>`) runs at
-#     most ONCE PER REMOTE PER PASS since #3371 and is CLASSIFICATION evidence only; the RE-PROOF
-#     (`remote_holds_recheck`) is one TARGETED `ls-remote --heads <remote> refs/heads/<branch>` at
-#     the moment of a removal. So the classification cost is per REMOTE — bounded — rather than per
-#     `remote-only-ref` ROW, which is not, and only the destructive act pays the old per-REMOVAL
-#     price (measured on cmux/cell-3, 2026-11-07: 12 targeted probes = 7.54 s wall (0.63 s each),
-#     versus 0.56 s for the remote's whole 2,111-head advertisement). A TRANSPORT
+#   * `git ls-remote` (#3041) is the ONE probe that can cross a network. THREE cost models, and they
+#     no longer coincide: the ADVERTISEMENT (`ls-remote --heads <remote>`) runs at most ONCE PER
+#     REMOTE PER PASS since #3371 and is CLASSIFICATION evidence only; and `remote_holds_recheck` pays
+#     a TARGETED `ls-remote --heads <remote> refs/heads/<branch>` TWICE for a `remote-holds` row —
+#     once at classification and once at the fork (measured on cmux/cell-3, 2026-11-07: 12 targeted
+#     probes = 7.54 s wall (0.63 s each), versus 0.56 s for the remote's whole 2,111-head
+#     advertisement). ⛔ SO THE `remote-holds` HALF OF THE POPULATION IS PER-ROW AGAIN, in BOTH
+#     phases — an earlier version of this bullet said "only the destructive act pays the old
+#     per-REMOVAL price", which is false: the classification-time targeted probe is paid by rows that
+#     are later preserved by `clean_gate`/gate (b) and never become destructive. What #3371 did buy is
+#     that the `remote-only-ref` half is free, and that the whole remote need not be re-advertised per
+#     candidate. A TRANSPORT
 #     failure is remembered per remote for the rest of the pass (a dead remote must not spend the
 #     whole budget on N candidates) and collapses to ONE timeout. ⛔ IT IS STILL CHARGED TO THE
 #     BUDGET, so it is NOT free: a remote that answers slowly can DEFER the rest of the listing —
@@ -2542,8 +2546,12 @@ remote_advertise() { # <remote> -> 0 when that remote's `refs/heads/*` snapshot 
     # silently. Closing THAT needs the reader not to depend on any write succeeding (a marker written
     # LAST carrying the count of the lines it summarises, so a torn set fails the count and PRESERVEs).
     # Do not read the paragraphs above as a proof immune to a read-only filesystem.
-    # ⛔ And without the mark-dead, truncation alone re-probes once per candidate (the retry storm):
-    # truncate = safe, mark-dead = cheap, and they do not share a failure mode.
+    # ⛔ And the retry storm is only PARTLY closed — say so, because the paragraphs above explain why
+    # `remote_mark_dead` fails on exactly this box (#3371 review cycle 7, P3): on ENOSPC the
+    # mark-dead write fails too, so the suppression does not bind and the truncation has just wiped
+    # every remote's marker, i.e. one full advertisement per remaining candidate. The truncate holds
+    # the SAFETY (nothing torn is read); the COST fix is best-effort on the one condition it was
+    # written for. They are not independent, and calling them independent was the false claim.
     if ! printf 'R %s\n' "$remote" >>"$REMOTE_ADV_FILE" 2>/dev/null; then
         : >"$REMOTE_ADV_FILE" 2>/dev/null || true
         remote_mark_dead "$remote"
@@ -2619,10 +2627,11 @@ remote_holds_probe() { # <sha> <refs/remotes/*-holder> -> "remote-holds:<remote>
 # dies on the next `fetch --prune`. So the removal path re-takes the SAME evidence the pre-#3371 code
 # took per candidate: one targeted `ls-remote --heads <remote> refs/heads/<branch>`, exact refname +
 # exactly this sha. ⛔ The cost is ONE targeted probe per `remote-holds` CANDIDATE at classification,
-# plus a SECOND at the fork for a candidate that reaches re-check #3 — so a removal pays two and a
-# candidate preserved later (by `clean_gate`, gate (b) or re-check #3) still pays one. The
-# `remote-only-ref` half of the population became free; the `remote-holds` half did not. The
-# classification cost stays at one advertisement per remote.
+# plus a SECOND at the fork for a candidate that reaches re-check #3 — so a removal pays two, and a
+# preserve at `clean_gate` #1/#2, gate (b), the evidence ladder or re-check #0's `holder_recheck` pays
+# ONE, while a preserve AT THE FORK (by `remote_holds_recheck` or `holder_recheck` #3) has already paid
+# two. The `remote-only-ref` half of the population became free; the `remote-holds` half did not. The
+# per-remote advertisement is still once per pass.
 # FAIL-CLOSED: an unreadable remote list, a failed/timed-out probe, an unadvertised refname or a
 # different sha all return 2, and 2 is the file's existing "preserved, nothing removed" arm — never
 # an exit 4. (The branch is re-derived from the reason token rather than passed in because the probe
