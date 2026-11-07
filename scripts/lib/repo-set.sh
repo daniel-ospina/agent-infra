@@ -147,6 +147,31 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 # the same state dir two ways returned OK — on exactly the silent-sharing failure the guard exists to
 # refuse (two controllers on one `.orch.lock`). The repo already treats this class as real:
 # `check-farm-drift.sh` normalises `//` and `.` after a measured incident.
+# _rs_nearest_existing_ancestor <path> — the first path component that EXISTS, walking up from the
+# given path's directory; "" when nothing (not even /) answers. It is the whole basis of the
+# absence proof above: `-e` false under a TRAVERSABLE existing ancestor is proof of absence, and under
+# an untraversable one it is proof of nothing.
+_rs_nearest_existing_ancestor() {
+  local d; d="$(dirname "${1:-}")"
+  while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+    if [ -e "$d" ]; then printf '%s' "$d"; return 0; fi
+    d="$(dirname "$d")"
+  done
+  [ -e / ] && { printf '/'; return 0; }
+  return 0
+}
+
+# _rs_doctor_available — can the sibling `pr-doctor.py` be asked at all? The delegated proofs need BOTH
+# the file and an interpreter, and "could not ask" must never be read as "the proof held".
+_rs_doctor_available() {
+  [ -n "$(_rs_doctor_py)" ] || return 1
+  local c
+  for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
+    command -v "$c" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
 _rs_norm_path() {
   local out="" comp
   while IFS= read -r comp; do
@@ -297,18 +322,32 @@ repo_set_parse() {
   # code 3, and the wrapper DEGRADED: the machine graded ONE repo while the operator was told to create
   # a file that is already there. `-e` false + a traversable parent IS proof of absence (we can list the
   # directory); `-e` false + an untraversable parent is UNRESOLVABLE, which is the broken state.
+  # ⛔ ABSENCE IS PROVABLE WHENEVER THE NEAREST **EXISTING** ANCESTOR IS TRAVERSABLE (review round 10,
+  # P1). Round 9 tested only the IMMEDIATE parent, `[ -d ] && [ -r ] && [ -x ]`, which is wrong twice
+  # over:
+  #   * a box that has never created `~/.config/orchestrator` at all — the FIRST-INSTALL / migration
+  #     state this whole change exists to serve — fell to the INVALID branch, so `check` returned 5 and
+  #     the wrapper REFUSED exit 2 and the documented single-repo degraded mode was UNREACHABLE. It also
+  #     told that operator "the file exists" and "do not create the file", both false;
+  #   * `-r` on the parent was never needed: `x` alone makes `stat(<dir>/<file>)` answer honestly, so a
+  #     mode-111 parent was reported broken for no reason.
+  # So: walk UP to the nearest path component that exists. If that component is a traversable
+  # directory, we can see the whole chain below it and `-e` false IS proof of absence (code 3). If it is
+  # not traversable — the macOS TCC shape, `~/Documents` with no Full Disk Access — absence cannot be
+  # proven, and that is the broken state (5).
   if [ ! -e "$f" ]; then
-    local pdir; pdir="$(dirname "$f")"
-    if [ -d "$pdir" ] && [ -r "$pdir" ] && [ -x "$pdir" ]; then
+    local anc; anc="$(_rs_nearest_existing_ancestor "$f")"
+    if [ -n "$anc" ] && [ -d "$anc" ] && [ -x "$anc" ]; then
       _rs_say 2 "repo-set: NO-REPO-SET — $f does not exist, so this machine has named no repo."
       _rs_say 2 "repo-set:   Create it, one repo per line:"
       _rs_say 2 "repo-set:     slug=OWNER/NAME checkout=/abs/checkout [state=/abs/state-dir]"
       return 3
     fi
-    _rs_say 2 "repo-set: INVALID — $f cannot be READ: it is not visible from here and neither is"
-    _rs_say 2 "repo-set:   $pdir. That is the broken state, not the absent one — this box may well have"
-    _rs_say 2 "repo-set:   named its repos and this process cannot see them (launchd has no Full Disk"
-    _rs_say 2 "repo-set:   Access under ~/Documents). Do not create the file; check its location and mode."
+    _rs_say 2 "repo-set: INVALID — $f is not visible from here, and neither is any directory above it"
+    _rs_say 2 "repo-set:   (nearest existing: ${anc:-none}). That is the BROKEN state, not the absent one:"
+    _rs_say 2 "repo-set:   this box may well have named its repos and this process cannot see them (launchd"
+    _rs_say 2 "repo-set:   has no Full Disk Access under ~/Documents). Do not create the file; check the"
+    _rs_say 2 "repo-set:   location and mode of the path above."
     return 5
   fi
   # ⛔ `-e` IS TESTED FIRST. The absent arm used `[ ! -f ]`, so a DIRECTORY at the config path read as
@@ -568,15 +607,18 @@ _rs_split_divergence() {
   local rendered="${1:-}" expected="${2:-}" got
   got="$(_rs_split_entries "$rendered")"
   if [ "$got" = "$expected" ]; then return 0; fi
+  # ⛔ THE INDEX TRAVELS WITH THE ENTRY (review round 10, P2). It used to return only the offending
+  # entry, and the caller paired it with the FIRST expected line — so a fault on line 2 was reported
+  # against line 1, sending the operator to the wrong config line.
   local i=1 line want
   while IFS= read -r line; do
     want="$(printf '%s\n' "$expected" | sed -n "${i}p")"
-    if [ "$line" != "$want" ]; then printf '%s' "$line"; return 0; fi
+    if [ "$line" != "$want" ]; then printf '%s\t%s\t%s' "$i" "$line" "$want"; return 0; fi
     i=$(( i + 1 ))
   done <<EOF_GOT
 $got
 EOF_GOT
-  printf '%s' "(the doctor yields a different number of entries)"
+  printf '%s\t%s\t%s' "$i" "(no entry at this position)" "$(printf '%s\n' "$expected" | sed -n "${i}p")"
   return 0
 }
 
@@ -607,9 +649,10 @@ _rs_normalize_slug() {
 #     The split is the one `resolve_repo()` makes, and the reason is measured twice over: launchd has no Full Disk Access
 #     under `~/Documents` (the default checkout), so refusing there discarded a pass the doctor
 #     completes. "I could not look" must never be reported as "it is wrong".
-#   * the rendered list round-trips through the DOCTOR'S OWN splitter as exactly the declared number of
-#     entries, and the doctor's own `set_tag_collisions` accepts it — the two whole-set proofs the
-#     per-line arms cannot express (both delegated, both hard `rc 1`);
+#   * the rendered list round-trips through the DOCTOR'S OWN splitter as exactly the entries declared,
+#     and the doctor's own `set_tag_collisions` accepts it — the two whole-set proofs the per-line arms
+#     cannot express (both delegated, both hard `rc 1`). ⛔ When the doctor CANNOT be asked they are
+#     SKIPPED WITH A WARN, never silently green — "could not ask" is not "the proof held";
 #   * no two repos share a state dir — the silent-sharing failure `multi-repo-controller.sh` refuses
 #     by name, one level up: two controllers pointed at one state dir fight over ONE `.orch.lock`,
 #     ONE candidates list and ONE worker registry, so each believes it is alone on the box.
@@ -748,13 +791,30 @@ EOF
   # the doctor's OWN splitter. Anything that adds or removes one — a separator the reader does not
   # enumerate, a value that splits — makes the graded set different from the validated one, which is the
   # "a shorter set reads like a smaller machine" failure in the other direction.
-  local rendered expected diverged
-  rendered="$(repo_set_doctor_repos 2>/dev/null)"
-  expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
-  diverged="$(_rs_split_divergence "$rendered" "$expected")"
+  # ⛔ "COULD NOT ASK" IS NOT "THE PROOF HELD" (review round 10, P2). Both delegated whole-set proofs go
+  # quiet when the sibling doctor or an interpreter is missing, and `diverged=""` / `tagwhy=""` then read
+  # as success — a green verdict this reader cannot support. The origin proof already tells the
+  # difference out loud; these two now do the same.
+  # ⛔ AND WHEN IT CANNOT BE ASKED, THE PROOFS ARE SKIPPED — NOT RUN AGAINST AN EMPTY ANSWER. The first
+  # cut of this guard printed the WARN and then still compared, so `_rs_split_entries` returned "" and
+  # the reader refused the set on "the doctor reads it as `` " — i.e. "could not ask" resolved to a
+  # REFUSAL, which is the same false-verdict class in the other direction (measured in review: it killed
+  # two unrelated mutation arms, and would have refused every legitimate set on any consumer that
+  # carries this file without the doctor beside it).
+  local rendered="" expected="" diverged=""
+  if _rs_doctor_available; then
+    rendered="$(repo_set_doctor_repos 2>/dev/null)"
+    expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
+    diverged="$(_rs_split_divergence "$rendered" "$expected")"
+  else
+    printf 'repo-set: WARN WHOLE-SET-PROOFS-SKIPPED — the two set-level proofs (the doctor splitter round-trip and `set_tag_collisions`) could NOT be run: pr-doctor.py is not beside this reader, or no python3 resolves. The per-line arms still ran; this verdict is INCOMPLETE and says so.\n'
+  fi
   if [ -n "$diverged" ]; then
-    printf 'repo-set: REFUSED set — the doctor would read this set as an entry the list format cannot carry: it yields `%s` where `%s` was named. A value contains a separator `configured_repos()` splits on (a `,` or any whitespace, including a non-ASCII space).\n' \
-      "$diverged" "$(printf '%s\n' "$expected" | sed -n '1p')"
+    local dline dgot dwant
+    dline="${diverged%%$'\t'*}"; diverged="${diverged#*$'\t'}"
+    dgot="${diverged%%$'\t'*}"; dwant="${diverged#*$'\t'}"
+    printf 'repo-set: REFUSED set — entry %s of this set does not survive the list format: the doctor reads it as `%s` where `%s` was named. A value contains a separator `configured_repos()` splits on (a `,` or any whitespace, including a non-ASCII space).\n' \
+      "$dline" "$dgot" "$dwant"
     bad=1
   fi
 
