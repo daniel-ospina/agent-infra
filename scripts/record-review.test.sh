@@ -6700,6 +6700,17 @@ run_record_delta() { # <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC $RECORD_ERR
         export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         export STUB_COMMIT_DATES_DIR="$T/dates" STUB_COMMIT_DATE="2030-01-01T00:00:00Z"
         for kv in "$@"; do export "$kv"; done
+        # ⛔ #3442 — EVERY COVER HERE MUST CARRY $VACUITY_BLOCK, for the reason 20e states one
+        # screen down: since agent-infra#3442 a FRESH `clean` mint is REFUSED when its artifact
+        # carries no `## MUTATION ATTRIBUTION` block, and that arm runs inside
+        # `verify_review_evidence` BEFORE the delta arm under test can answer. Without it all
+        # seventeen §20 arms were refused by the NON-VACUITY arm — 45 red assertions reading as
+        # "the delta direction is broken" while the delta direction was never reached (measured
+        # 2026-11-07 on base; the failure text was "carries no MUTATION ATTRIBUTION block").
+        # APPENDED, never substituted, and appended AFTER the VAR=VAL loop so an arm that pins the
+        # body's OWN range claim (20h12/20h15/M12/M14) still states exactly the range it means to.
+        export STUB_EVIDENCE_BODY="${STUB_EVIDENCE_BODY}
+${VACUITY_BLOCK}"
         rc=0
         # shellcheck disable=SC2086  # EXTRA_ARGS is intentionally word-split (one flag)
         bash "$RECORD" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" ${EXTRA_ARGS:-} 2>"$errfile" || rc=$?
@@ -7313,6 +7324,11 @@ mut_run() { # <mutant-script> <pr> <sha> <ref> [VAR=VAL…] → $RECORD_RC
         export STUB_BASE_PAIR=1 STUB_BASE_SHA="$DG_M1" STUB_BASE_REF=main STUB_COMMIT_DATES_DIR="$T/dates"
         export STUB_EVIDENCE_BODY="reviewed ${ref%%+*}; no issues found."
         for kv in "$@"; do export "$kv"; done
+        # ⛔ #3442, the same fixture contract `run_record_delta` states: a mutant's cover must
+        # carry $VACUITY_BLOCK too, or EVERY cell is refused by the non-vacuity arm and the
+        # matrix reports 9 vacuous cells that were never reached (measured 2026-11-07).
+        export STUB_EVIDENCE_BODY="${STUB_EVIDENCE_BODY}
+${VACUITY_BLOCK}"
         rc=0
         bash "$mut" "$pr" "$sha" clean "daniel-ospina/agent-infra" --evidence "$ref" >/dev/null 2>"$T/merr" || rc=$?
         printf '%s' "$rc" > "$T/mrc"
@@ -7406,16 +7422,22 @@ mut_check "M14 a narrower stated range is refused" 425166 "$DG_HEAD" "delta:$DG_
 #       population was truncated.
 MUT="$(mk_mutant breakanchor '      : "${evil:=merge ${m:0:12} is NOT a clean merge' '      break; : "${evil:=merge ${m:0:12} is NOT a clean merge')"
 mut_check "M10 chained evil merges all reach the anchor" 425152 "$EM_CHILD" "delta:$DG_EV_L..$EM_CHILD+comment:42515002" accepted STUB_EVIDENCE_AT="2026-05-01T00:00:00Z"
-# M11 — THE CLAUSE-(E) POLARITY. An unnamed status from target_head_red must refuse.
-#       The mutant replaces the helper's answer with a status the case does not name
-#       (`3`); the shipped code refuses it (only an explicit green rc 1 proceeds),
-#       and a version whose case lists only 0 and 2 ACCEPTED it and minted `clean`
-#       over a head whose checks were never shown non-red — the enum fall-through the
-#       AGENTS.md verification-state rule forbids. The mutant is the SIMULATION of the
-#       drift, so this cell asserts REFUSED: it reddens precisely when the polarity
-#       regresses. It probes a real range (20a's), so the arm is actually reached.
+# M11 — THE CLAUSE-(E) POLARITY. An unnamed answer from the check-surface read must refuse.
+#       The mutant replaces the read with a status the code does not name (`3` — neither
+#       `0`, the one status meaning "the surface WAS read", nor a verdict token); the
+#       shipped code refuses every non-zero status, and a version that listed only the
+#       named statuses ACCEPTED it and minted `clean` over a head whose checks were
+#       never shown non-red — the enum fall-through the AGENTS.md verification-state
+#       rule forbids. The mutant is the SIMULATION of the drift, so this cell asserts
+#       REFUSED: it reddens precisely when the polarity regresses. It probes a real
+#       range (20a's), so the arm is actually reached.
+# ⛔ THE ANCHOR MOVED WITH THE CALL. It pinned `target_head_red "$to" || thr=$?` — a
+#       helper that no longer exists (its deletion left this caller behind, which is
+#       the whole §20 outage). The anchor is now the direct `check_surface_scan` call
+#       that replaced it, so the cell keeps measuring the same thing at the code that
+#       actually runs.
 MUT="$(mk_mutant unnamedcheck '  thr=0
-  target_head_red "$to" || thr=$?' '  thr=3')"
+  surf_out="$(check_surface_scan "$to")" || thr=$?' '  thr=3')"
 mut_check "M11 clause (E) refuses an UNNAMED check status" 425153 "$DG_HEAD" "delta:$DG_A1..$DG_HEAD" refused
 
 # M12 — THE RANGE CLAIM. Deleting the (10a) arm must mint `clean` from a cover that
