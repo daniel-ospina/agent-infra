@@ -1282,8 +1282,8 @@ esac
 RRSPEND_CODE="$(awk '!/^[[:space:]]*#/' "$RRSPEND" 2>/dev/null | c4mc)"
 RR_ATOMIC=0
 if [ -n "$RRSPEND_CODE" ] \
-   && grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' <<<"$RRSPEND_CODE" \
-   && grep -qF 'mv "$_rr_new" "$_rr_f"' <<<"$RRSPEND_CODE"; then
+   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' \
+   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'mv "$_rr_new" "$_rr_f"'; then
   RR_ATOMIC=1
   ok "(c4q) the round book is written to a SIBLING and RENAMED onto the counter — a reader can never observe a torn (empty) book, which both readers would read as 999999999 and park a healthy PR"
 else
