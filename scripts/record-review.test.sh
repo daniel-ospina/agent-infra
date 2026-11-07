@@ -7980,15 +7980,17 @@ targets = sys.argv[2:]
 #   NOT MODELLED   a quoted string that SPANS LINES (a `#`-leading continuation line reads as
 #                  a comment), `$'...'` ANSI-C quoting, a `#` inside `${...}`, and heredoc
 #                  bodies. All four were MEASURED as false CLEANs on hand-built lines
-#                  (round 6), and NONE of them occurs in either target: every one of the 19
-#                  non-comment backtick-bearing lines in the two files (13 recorder, 6 suite)
-#                  is escaped `\`` or single-quoted, and the classifier agrees on all 19.
+#                  (round 6), and NONE of them occurs in either target: all 19 backtick-bearing
+#                  lines that are not WHOLE-LINE comments (13 recorder, 6 suite) carry their
+#                  backticks escaped `\``, single-quoted, or after a trailing `#` comment —
+#                  three benign categories, and the classifier agrees on all 19 (round 7).
 # ⛔ A WHOLE-FILE LEXER WAS BUILT AND REJECTED — with the measurement, not as a preference.
 # Carrying quote state across lines is the only way to close the multi-line hole, and on the
 # REAL recorder it desyncs at `$(` inside a double-quoted string, because `$(` resets quoting:
 # the awk program at record-review.sh:1680 ends a line inside a single-quoted string, and a
 # state machine that does not model `$(` re-opens a quote mid-program and flags the awk
-# comments at 1685-1734 as live backticks — 26 false REDs on the recorder. Modelling `$(`,
+# comments at 1685-1734 as live backticks — 26 false REDs across 12 lines (that region plus a
+# second desync at 4331-4354) on the recorder. Modelling `$(`,
 # `${`, `$'` and heredocs well enough to stay in sync is a bash lexer, which is a different
 # project from this vector. So the scope is DECLARED here instead of over-claimed: this
 # sweep bounds the shipped defect (a `"..."` message that runs its own backticks) on every
