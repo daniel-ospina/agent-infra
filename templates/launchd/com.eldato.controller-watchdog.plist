@@ -35,12 +35,22 @@
                                      ever: MEASURED steady state, 3 initial restarts then one per 4
                                      passes at MAX_CONSEC=3 (~20 min at this 300s cadence).
 
-         ⛔ THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY, so the `<string>` resolves on a
-         FRESH box (install-launchd.sh hard-fails a job whose target does not resolve, and that check
-         must not be defeated). The installer renders it from resolve_infra_main() — this repo's MAIN
-         checkout, worktree-safe — so a passing worktree's teardown cannot leave this job pointing at
-         nothing. (That canary script is farmed to $HOME/.pi/agent/scripts for the CELL, which has no
-         launchd; this Mac job runs the checkout's copy so it moves with the merge, not with a sync.)
+         ⛔ THE TARGET IS THE FARMED COPY, AND THAT IS THE WHOLE POINT. This paragraph used to say the
+         opposite — "THE TARGET IS THE CHECKOUT'S SCRIPT, NOT A FARMED COPY" — on the argument that
+         install-launchd.sh hard-fails an unresolvable target, so a farmed copy that *may* not exist
+         was the riskier choice, and that a checkout copy "moves with the merge, not with a sync".
+         MEASURED 2026-11-03: the checkout is `~/Documents/GitHub/agent-infra` on the documented
+         default box, macOS TCC denies every launchd-spawned process access to `~/Documents`, and
+         this job's first and only run ended `/bin/bash: …: Operation not permitted` — `last exit
+         code=126` — while `launchctl print` read "loaded". A path that exists and cannot be READ is
+         worse than a path that is absent: absence is refused loudly by `verify_targets`, and
+         unreadability was refused by nobody. `{{HOME}}/.pi/agent/scripts/…` is outside the TCC roots
+         and setup.sh's `fleet_srcs` array delivers this file there, NESTED
+         (`orchestrator-harness/…`) because that is the path this plist names.
+         The swap is not free and the cost is stated here rather than hidden: a farmed copy moves with
+         `sync.sh`, not with a merge, so a merged change to watchdog-loop.sh reaches launchd only
+         after the farm runs. That is the trade this file accepts, and `check-farm-drift.sh` is what
+         makes the divergence visible instead of silent.
 
          ⛔ THE BOUNDS ARE IN THE PLIST, NOT INHERITED. A launchd job gets neither the operator's
          shell env nor its rc files, so an unset variable silently keeps the script's default — and

@@ -671,12 +671,26 @@ plist_program_args() {
         fi
         # rc=3/4 (unparseable / no usable key) → try the other guaranteed reader before giving up.
     fi
-    # ⛔ THE FALLBACK CANNOT KNOW ROLES, so it emits `unknown` and says so: without python3 there are
-    # no DATA_OPTIONS, no `env` hop and no `Program` read. `unknown` still carries the TCC verdict (a
-    # unit launchd cannot read must never be armed) but NOT the file-type verdict — a directory-valued
-    # `--repo` is legitimate, and calling it an "unreadable executed target" aborted the whole install
-    # on a PlistBuddy-only host, which is the #3413 P1-A failure all over again. The cost of `unknown`
-    # is a false SKIP there (a unit that might have installed is skipped loudly).
+    # ⛔ THE FALLBACK CANNOT KNOW MOST ROLES, so it emits `unknown` and says so: without python3 there
+    # is no `env` hop and no `Program` read. `unknown` still carries the TCC verdict (a unit launchd
+    # cannot read must never be armed) but NOT the file-type verdict — a directory-valued `--repo` is
+    # legitimate, and calling it an "unreadable executed target" aborted the whole install on a
+    # PlistBuddy-only host, which is the #3413 P1-A failure all over again. The cost of `unknown` is a
+    # false SKIP there (a unit that might have installed is skipped loudly).
+    # ⛔ ONE ROLE IT **CAN** DERIVE, AND MUST: the `DATA_OPTIONS` table (`--repo`, `--root`) is a PRECEDING
+    # ELEMENT, not python knowledge — PlistBuddy prints the array in order, so the element after `--repo`
+    # is that option's value exactly as the python reader classifies it. Leaving it `unknown` made the
+    # two readers DISAGREE on the same argv: python emitted `data` (a TCC-root `--repo` WARNS and the
+    # unit installs), the fallback emitted `unknown` (tcc_exec=1 → verdict 2 → `launchctl bootout` +
+    # `rm -f` of an ALREADY-INSTALLED unit, exit 0). On the documented default box that reached five
+    # shipped units — `branch-reaper`, `pr-doctor`, `worktree-hygiene`, `worktree-reaper`,
+    # `runner-autoscale` — and it is reachable on any Mac whose `/usr/bin/python3` shim is executable but
+    # exits non-zero (no Command Line Tools), which `plist_python` accepts on `-x` alone. A guard that
+    # silently UNINSTALLS working units on the fallback path is the same fail-open/fail-wrong family as
+    # `[ -e ]` (fresh review of #3413, P1).
+    # ⛔ THE TABLE IS DUPLICATED IN THE PYTHON READER ABOVE (`DATA_OPTIONS = {"--repo", "--root"}`) and
+    # this awk cannot share it, so the two must be edited together. Pinned by §7c (c22b), which drives
+    # the fallback with a TCC-root `--repo` and asserts the WARN-and-install arm.
     # THE SEAM (`INSTALL_LAUNCHD_PLISTBUDDY`) exists so this arm is reachable from a test at all — on
     # Linux `/usr/libexec/PlistBuddy` does not exist, and a branch no test can reach is a branch nobody
     # knows still works.
@@ -685,7 +699,7 @@ plist_program_args() {
     raw="$("$buddy" -c 'Print :ProgramArguments' "$plist" 2>/dev/null)" || return 1
     [ -n "$raw" ] || return 1
     out="$(printf '%s\n' "$raw" | awk '
-        BEGIN { seen = 0 }
+        BEGIN { seen = 0; prev = "" }
         # PlistBuddy wraps an array in `Array {` / `}` on their own lines.
         /^[[:space:]]*(Array)?[[:space:]]*\{[[:space:]]*$/ { next }
         /^[[:space:]]*\}[[:space:]]*$/ { next }
@@ -696,10 +710,15 @@ plist_program_args() {
             sub(/^(Arg)?[0-9]+[[:space:]]*=[[:space:]]*/, "", line)
             if (line == "") next
             seen = 1
-            # `unknown` = absolute, role NOT derivable without python (no DATA_OPTIONS, no env hop, no
-            # Program). verify_targets gives it the TCC verdict but not the file-type one: a
-            # directory-valued `--repo` is legitimate, and failing it aborted the whole install.
-            if (line ~ /^\//) printf "unknown\t%s\n", line
+            # `unknown` = absolute, role NOT derivable without python (no env hop, no `Program`).
+            # `data` = the VALUE of a `DATA_OPTIONS` long option in the PRECEDING element — the one
+            # role this reader derives, and it must agree with the python reader or the same argv
+            # reaches two different verdicts (`data` WARNS and installs; `unknown` SKIPS and disarms).
+            if (line ~ /^\//) {
+                if (prev == "--repo" || prev == "--root") printf "data\t%s\n", line
+                else printf "unknown\t%s\n", line
+            }
+            prev = line
         }
         END { if (!seen) exit 1 }
     ')" || return 1

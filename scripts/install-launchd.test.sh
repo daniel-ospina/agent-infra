@@ -1316,6 +1316,55 @@ else
     bad "§7c …and the unit installs"
 fi
 
+# (c22b) READER AGREEMENT on the OTHER role the fallback can and must derive: the VALUE of a `--repo` /
+# `--root` (`DATA_OPTIONS`) sits in the element AFTER the option, so it is a PRECEDING-ELEMENT fact, not
+# python knowledge. Emitting `unknown` there made the two readers disagree on the same argv — python
+# emitted `data` (a TCC-root value WARNS and the unit installs), the fallback emitted `unknown`
+# (`tcc_exec=1` → verdict 2 → `launchctl bootout` + `rm -f` of an ALREADY-INSTALLED unit, exit 0). On the
+# documented default box that reached five shipped units, and it is reachable on any Mac whose
+# `/usr/bin/python3` shim is executable but exits non-zero (no Command Line Tools). RED if the awk
+# fallback loses its DATA_OPTIONS table (the same argv then goes back to SKIP + disarm).
+# The PREVIOUS install is left in place ON PURPOSE: the disarm is the failure mode, and only an
+# installed unit can show whether this run took it off the box.
+rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR" "$PROBE_HOME/Documents/GitHub/tortoise"
+cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$PROBE_HOME/.pi/agent/scripts/probe-ok.sh</string>
+        <string>--repo</string>
+        <string>$PROBE_HOME/Documents/GitHub/tortoise</string>
+    </array>
+    <key>StartInterval</key><integer>not-a-number</integer>
+</dict>
+</plist>
+PLIST
+PROBE_TCC_DATA="$PROBE_HOME/Documents/GitHub/tortoise"
+printf 'PREVIOUS INSTALL\n' > "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+set +e
+OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+        TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+        INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+        unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+        bash "$INSTALLER" 2>&1 ) )"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c the PlistBuddy fallback reads a TCC-root --repo value as DATA (agrees with the python reader)"
+assert_contains "$OUT" "WARN TCC-protected data argument: $PROBE_TCC_DATA" "§7c …so it WARNS like the python reader does"
+assert_not_contains "$OUT" "TCC-protected target: $PROBE_TCC_DATA" "§7c …and never as an EXEC refusal"
+assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the unit is not SKIPped"
+if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ] &&
+   ! grep -q 'PREVIOUS INSTALL' "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"; then
+    ok "§7c …and the unit is REINSTALLED over the previous one, not disarmed and removed"
+else
+    bad "§7c …and the unit is REINSTALLED over the previous one, not disarmed and removed"
+fi
+
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
 mkdir -p "$PROBE_HOME/Documents/checkout/with space"
