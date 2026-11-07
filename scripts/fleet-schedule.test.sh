@@ -3125,12 +3125,12 @@ kill "$pid19m" 2>/dev/null; sleep 1
 #    desynchronises the parse state for the REST OF THE FILE. Measured at f05c057d6 (#3615,
 #    which introduced this arm): `bash -n` under bash 3.2.57 reports "syntax error near
 #    unexpected token `('" at the `ok` message in the 19u arm, ~230 lines BELOW this body, so
-#    `check-bash32-parse.sh` (#2930) REDS on every PR. On a stock Mac `/bin/bash` IS 3.2, so this
-#    suite cannot RUN there at all. ⚠️ NOT a refused install, and the distinction was measured, not
-#    assumed: `install.sh:727-730` deliberately treats a `*.test.sh` parse error as a WARN and
-#    CONTINUES (`die` is reserved for runtime scripts, which crash-loop under KeepAlive), and that
-#    carve-out landed in 914d06574 (#2930) BEFORE this defect existed. The harm is a suite that will
-#    not run on a 3.2 host plus a gate red on every PR — not a harness that cannot be installed.
+#    `check-bash32-parse.sh` (#2930) REDS on every PR. On a stock Mac `/bin/bash` IS 3.2, so while
+#    this defect was live the suite could not RUN there at all, and the gate redded every PR.
+#    ⚠️ WHAT IT WAS NOT, measured rather than assumed: a refused install. `install.sh`'s `*.test.sh`
+#    case arm (731-739) deliberately WARNs on a test suite's parse error and CONTINUES — `die` is
+#    reserved for runtime scripts, which crash-loop under KeepAlive — and that carve-out landed in
+#    914d06574 (#2930) BEFORE this defect existed. Both harms are cleared at this commit.
 #    bash 5 parses it fine, which is why this suite stayed green and only the gate went red.
 #    #2248's remedy: the substitution carries a FUNCTION CALL and no here-doc. RESIDUAL, NOT FIXED
 #    HERE: 22 other here-docs in this file still sit inside a `$( )` and are each one prose apostrophe
