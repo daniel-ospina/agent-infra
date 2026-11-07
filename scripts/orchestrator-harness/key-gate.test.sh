@@ -836,7 +836,13 @@ HGWTRAIL="$(mkhome gateway_trailing_ws "$GW_TRAIL_WS_JSON")"
 OUT="$(run_gate "$HGWTRAIL" RADIUS_API_KEY=rk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 ck "3z15y66 a TRAILING-SPACE default gateway is not the default one either (rc=${RC:-none})" \
    "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
-has "$OUT" "reason=models-json-provider-dropped" "3z15y67 …the same deleted-provider fact"
+# ⛔ AND THE TWO PADDED SPELLINGS ARE REFUSED FOR DIFFERENT REASONS, WHICH IS THE CORRECT ANSWER (round 45, measured):
+# the parser TRIMS a LEADING C0-or-space of the whole string, so `" https://radius.pi.dev"` is still a buildable URL and its
+# api-less definition is the deleted provider (3z15y65); it does NOT trim a TRAILING one, and the vendor appends
+# `/messages` first, so `"https://radius.pi.dev "` puts the space INSIDE the host and the URL cannot be built at all —
+# measured, node THROWS on it and `pi -p` answers `Invalid URL`, so that arm asserts the URL reason. It asserted
+# `provider-dropped` until the trailing trim was removed, i.e. it was pinning this fix’s own false PASS.
+has "$OUT" "reason=models-json-bad-gateway" "3z15y67 …and the TRAILING-space spelling is a URL failure, because the vendor appends \`/messages\` before the parser trims"
 hasnt "$OUT" "check=ok" "3z15y68 …and never the green line the trimming normaliser printed"
 # ── 3z15y69-76: THE AUTHORITY'S PORT IS PART OF "WOULD `new URL()` THROW" ──────────────────────────────
 # ⛔ MEASURED ON node, on the vendor's own URL construction (round 41, P1): `new URL("<baseUrl>/messages")` THROWS
@@ -993,6 +999,49 @@ OUT="$(run_gate "$HSPESCOK" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepse
 ck "3z15y97 a DECODABLE escape is NOT refused (rc=${RC:-none}) — \`%41\`/\`%2E\` are \`A\` and \`.\`, which the parser accepts" \
    "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
 hasnt "$OUT" "models-json-bad-gateway" "3z15y98 …so refusing every escape would be the false block this pair prevents"
+# ── 3z15y99-106: THE DECODE IS BYTES-THEN-UTF-8, AND THE TRAILING TRIM IS NOT MIRRORED ──────────────
+# ⛔ MEASURED (round 45, P1): decoding an escape with `chr(int(g,16))` emits ONE LATIN-1 CHARACTER PER BYTE, so a
+# multi-byte UTF-8 sequence is split and `\s` matches a CONTINUATION byte. `https://caf%C3%A0.example/v1` (`\u00e0` =
+# C3 A0) was REFUSED 82 while node PARSES it to `xn--caf-cla.example` — and the SAME host written raw was accepted,
+# one host with two verdicts, and 599 of 692 percent-encoded IDN hosts the parser accepts were refused. That is a
+# false BLOCK introduced by the previous round's own fix, i.e. the worst direction, so the decode is the parser’s:
+# collect BYTES (an escape is one byte, a literal character its UTF-8 encoding) and decode the buffer STRICTLY.
+# ⛔ INVALID UTF-8 IS A THROW, NOT A PASS (3z15y101/102): node refuses `%80`, `%A0`, `%C2%41` and `%C0%AF` (measured), so
+# a lenient decode (`"replace"`/`"ignore"`) would be the false PASS mirror of the same mistake. Malformed escapes
+# (`%zz`, `%4`) reach `int()` as non-hex or truncated and return False on the same path.
+# ⛔ AND THE TRAILING TRIM IS DELIBERATELY **NOT** MIRRORED (3z15y103-106, round 45 P3, measured): the vendor appends
+# `/messages` FIRST and the parser trims only the ends of THAT string, so a trailing space lands INSIDE the host when
+# the baseUrl has no path — `https://gw.example ` and `https://gw.example:8080 ` both THROW — while `https://gw.example/v1 `
+# PARSES because the space lands in the path. Trimming the baseUrl before appending accepted all three.
+# ⛔ EACH PAIR IS ONE DIRECTION’S OWN GUARD, AND THE CROSS-REFERENCES ARE MEASURED (not assumed): restoring the
+# `chr()`-per-byte decode reddens 99/100 AND 101/102; a lenient (`errors="replace"`) decode reddens 101/102;
+# restoring the trailing trim reddens 67 AND 103/104; and removing the LEADING trim reddens the pre-existing leading-
+# whitespace arms 44/45 and the leading-space gateway arm 65 — not this block, because 105/106 is a TRAILING space on a
+# value with a path, which neither trim affects. An earlier draft of this comment claimed 105/106 and was wrong.
+SP_IDN_JSON='{"providers":{"deepseek":{"baseUrl":"https://caf%C3%A0.example/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPIDN="$(mkhome spell_idn_escaped "$SP_IDN_JSON")"
+OUT="$(run_gate "$HSPIDN" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y99 a percent-encoded IDN host is NOT refused (rc=${RC:-none}) — \`%C3%A0\` is ONE letter, not two bytes \`new URL\` splits" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y100 …so the URL reason never quotes \`Invalid URL\` for a host the parser accepts"
+SP_BADUTF_JSON='{"providers":{"deepseek":{"baseUrl":"https://ho%C2%41st/v1","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPBADUTF="$(mkhome spell_invalid_utf8 "$SP_BADUTF_JSON")"
+OUT="$(run_gate "$HSPBADUTF" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y101 INVALID UTF-8 in the host REFUSES (rc=${RC:-none}) — \`%C2%41\` is not a letter and node throws it" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y102 …the same URL-level fact"
+SP_TRAILSP_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example ","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPTS="$(mkhome spell_trailing_space_nopath "$SP_TRAILSP_JSON")"
+OUT="$(run_gate "$HSPTS" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y103 a TRAILING space with NO path REFUSES (rc=${RC:-none}) — the vendor appends \`/messages\` first, so it lands in the host" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y104 …the same URL-level fact"
+SP_TRAILPATH_JSON='{"providers":{"deepseek":{"baseUrl":"https://gw.example/v1 ","models":[{"id":"deepseek-flash","api":"pi-messages"}]}}}'
+HSPTP="$(mkhome spell_trailing_space_path "$SP_TRAILPATH_JSON")"
+OUT="$(run_gate "$HSPTP" DEEPSEEK_API_KEY=dk KG_PROV=deepseek KG_MODEL=deepseek-flash)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y105 the same space WITH a path is NOT refused (rc=${RC:-none}) — it lands in the path, which \`new URL\` accepts" \
+   "$([ "${RC:-0}" = "0" ] && echo 0 || echo 1)"
+hasnt "$OUT" "models-json-bad-gateway" "3z15y106 …so the URL reason never fires on the control this pair needs"
 
 
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on

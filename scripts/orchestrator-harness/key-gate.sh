@@ -1172,7 +1172,33 @@ if sys.argv[2] == "compose":
         # \u26d4 NON-ASCII DECODED BYTES ARE DELIBERATELY LEFT ACCEPTED: `%C3%BC` decodes to a non-ASCII letter that the
         # punycode stage may well accept, and refusing non-ASCII would false-block a valid IDN host \u2014 the residual
         # stays a false PASS, which is the direction this gate may err in.
-        decoded = re.sub(r"%([0-9A-Fa-f]{2})", lambda mm: chr(int(mm.group(1), 16)), host)
+        # \u26d4 THE ESCAPES DECODE TO **BYTES**, THEN UTF-8 \u2014 NOT ONE CHARACTER PER BYTE (round 45, P1, measured):
+        # `chr(int(g,16))` emits a LATIN-1 character per byte, so a multi-byte UTF-8 sequence is split and `\s` then
+        # matched a CONTINUATION byte (0xA0, or 0x85 for NEL) out of a perfectly valid letter: measured,
+        # `https://caf%C3%A0.example/v1` (\u00e0 = C3 A0) was REFUSED 82 while node PARSES it to `xn--caf-cla.example`, and
+        # the SAME host written raw was accepted \u2014 one host, two verdicts, 599 of 692 percent-encoded IDN hosts the
+        # parser accepts were refused. That is the false-BLOCK direction this file\x27s header forbids, introduced by
+        # this very fix, so the decoding is the parser\x27s: collect BYTES (an escape is one byte, a literal character is
+        # its UTF-8 encoding), then decode the buffer strictly. INVALID UTF-8 IS A THROW, not a pass \u2014 node refuses
+        # `%80`, `%A0`, `%C2%41` and `%C0%AF` too (measured) \u2014 and so is a malformed escape (`%zz` reaches `int()` as
+        # non-hex, `%4` as a truncated pair: both raise, both throw in node, so both refuse here).
+        buf = bytearray()
+        _i = 0
+        while _i < len(host):
+            _c = host[_i]
+            if _c == "%":
+                try:
+                    buf.append(int(host[_i + 1:_i + 3], 16))
+                except ValueError:
+                    return False
+                _i += 3
+            else:
+                buf.extend(_c.encode("utf-8"))
+                _i += 1
+        try:
+            decoded = bytes(buf).decode("utf-8")
+        except UnicodeDecodeError:
+            return False
         if re.search(r"[\s\x00-\x1f\x7f#%/ :<>?@\[\]\\^|]", decoded):
             return False
         return _port_ok(port)
@@ -1187,7 +1213,12 @@ if sys.argv[2] == "compose":
         # it ends the authority exactly like `/`; leaving it in read `pass@host`-style text as a port.
         s = re.sub(r"[\t\n\r]", "", str(v))
         s = re.sub(r"^[\x00-\x20]+", "", s)
-        s = re.sub(r"[\x00-\x20]+$", "", s)
+        # \u26d4 THE TRAILING TRIM IS **NOT** MIRRORED, AND MIRRORING IT WAS A FALSE PASS (round 45, P3, measured): the
+        # vendor appends `/messages` to the baseUrl FIRST, then parses, and the parser trims only the ends of THAT
+        # whole string \u2014 so a trailing space lands INSIDE THE HOST when the baseUrl has no path. Measured:
+        # `https://gw.example ` and `https://gw.example:8080 ` both THROW `ERR_INVALID_URL`, while `https://gw.example/v1 `
+        # PARSES (the space lands in the path) \u2014 and trimming the baseUrl before appending made the gate accept all
+        # three. The LEADING trim stays, because there the parser does see the space at the start of the whole string.
         m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*):(.*)$", s, re.S)
         if not m:
             return False
