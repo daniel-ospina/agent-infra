@@ -99,9 +99,13 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
   6. FILL      while live < target: add ONE runner, printing `mem_available_mb` before and after,
                and stop if the next addition would leave < MEM_RESERVE_MB. A NEW install is
                created by the provisioner (`tools/install-ci-runner-x64.sh`, the one registration
-               path — it downloads and sha256-checks the runner); this file never downloads a
-               binary, and it REFUSES to add when no provisioner is present rather than
-               improvising one.
+               path — which COPIES a pre-unpacked runner from `$RUNNER_ROOT/_template` and refuses
+               with `cannot-act why=runner-template-absent` when that template is not there).
+               ⛔ NOTHING IN THIS REPO DOWNLOADS OR sha256-CHECKS A RUNNER RELEASE — an earlier
+               version of this line said the provisioner did, which the file this change ships
+               contradicts in its own header; a box must be prepared before its first FILL. This
+               file never downloads a binary, and it REFUSES to add when no provisioner is present
+               rather than improvising one.
   7. REFUSE    beyond the ceiling nothing is added and the reading is printed. `--want N` is the
                explicit-request form of the same guard; `--status` is the read-only form.
 
