@@ -195,6 +195,21 @@ ENVV=()
 # RUNNER_AUTOSCALE_SCRIPT is pinned to the stub by default: the real converger would talk to GitHub on
 # the arming preflight, which no test may do (T14 is the one case that resolves it, and it installs
 # only — no preflight).
+#
+# ⛔ THE "NOTHING RESOLVES" SEAM, MADE EXPLICIT AND HERMETIC (#3469).
+# Before this repo shipped tools/install-ci-runner-x64.sh, `resolve_provisioner`'s candidate loop found
+# nothing whenever this suite ran from its own directory, so the adoption/judgement arms below got their
+# precondition — "a re-install that cannot resolve a pin from this shell" — for FREE: from the repo not
+# carrying the file, not from anything the arm arranged. The file now exists (which is the whole point of
+# #3469), so candidate 1 (`$INFRA_ROOT/tools/install-ci-runner-x64.sh`) resolves on EVERY invocation from
+# a checkout, `adopt_installed_provisioner` short-circuits at its first line, and 29 assertions flipped red.
+# They were measuring the repo's contents — exactly the accidental dependency a suite must not have.
+# `RUNNER_AUTOSCALE_PROVISIONER` is the installer's OWN "a named pin is the whole list" seam, so pointing
+# it at a path that does not exist makes resolution fail DETERMINISTICALLY, with no dependence on cwd or on
+# what the repo happens to ship. An arm that wants a REAL pin still passes one through ENVV, which is
+# appended AFTER this default and therefore wins (`env A=1 A=2` -> A=2) — so this default restores the
+# pre-#3469 environment for the arms that relied on it and changes nothing for the arms that pin their own.
+NOWHERE_PROVISIONER="$T/home/absent-provisioner.sh"   # deliberately never created
 run_install() {
     local plat="$1" dir="$2"; shift 2
     local dirmap=()
@@ -213,6 +228,7 @@ run_install() {
         ELDATO_PLATFORM="$plat" \
         SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" LOGINCTL="$T/bin/loginctl" \
         RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
+        RUNNER_AUTOSCALE_PROVISIONER="$NOWHERE_PROVISIONER" \
         ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
 }
@@ -237,6 +253,7 @@ run_install_noseam() {
         ELDATO_PLATFORM="$plat" \
         SYSTEMCTL="$T/bin/systemctl" LAUNCHCTL="$T/bin/launchctl" LOGINCTL="$T/bin/loginctl" \
         RUNNER_AUTOSCALE_SCOPE_SCAN="$T/scopes" \
+        RUNNER_AUTOSCALE_PROVISIONER="$NOWHERE_PROVISIONER" \
         ${dirmap[@]+"${dirmap[@]}"} ${ENVV[@]+"${ENVV[@]}"} \
         bash ./install-runner-autoscale-timer.sh "$@" 2>&1
 }
