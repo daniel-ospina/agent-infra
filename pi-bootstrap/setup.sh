@@ -462,11 +462,21 @@ fi
 # `DECLARED-*` / `SUMMARY:` lines, not this comment, for the current population. `cloud-cell-supervisor.sh`
 # USED TO BE the one NAMED residual here: `cloud-cell-quiesce.sh` execs it through a variable-held
 # prefix, so the derivation could not see that edge, and a fresh farm got the consumer without it.
-# ⛔ THAT RESIDUAL IS CLOSED (#1938): the supervisor is FARMED below in `fleet_srcs`, beside the
-# `cloud-cell-quiesce.sh` that calls it. It reaches the derived population through a DIFFERENT exec
-# site — `install-controller-service.sh`'s `$(pwd)/cloud-cell-supervisor.sh` — which is why pinning it
-# works even though the quiesce leg stays invisible to the scan. The quiesce's own fallback
-# (`supervisor: <none found>`) is therefore no longer the only outcome on a fresh farm.
+# ⛔ THE DELIVERY RESIDUAL IS CLOSED BY THIS LANDING (#1938): the supervisor is FARMED below in
+# `fleet_srcs`, beside the `cloud-cell-quiesce.sh` that calls it. It reaches the derived population
+# through a DIFFERENT exec site — `install-controller-service.sh`'s `$(pwd)/cloud-cell-supervisor.sh` —
+# which is why pinning it works even though the quiesce leg stays invisible to the scan.
+# ⛔ AND THE QUIESCE'S OWN `<none found>` FALLBACK IS UNCHANGED BY THAT ENTRY — an earlier version of
+# this paragraph said it was "no longer the only outcome on a fresh farm", which was FALSE and
+# contradicted the correction recorded in the same series. `cloud-cell-quiesce.sh` tries
+# `$REPO/scripts/…`, `$O/…` and two `/tmp/…/scripts/…` paths — it never looks in `$DEST/scripts/`, and
+# nothing seeds the supervisor into `$O` (`cloud-cell-supervisor.sh`'s `seed_and_stamp` seeds from
+# `$HARNESS`, which holds `orchestrator-harness/`, not the supervisor). So on a farm-only box the
+# quiesce still prints `<none found — will start tmux directly>` in EVERY case, before and after this
+# PR. The residual is the quiesce's CANDIDATE LIST, and it is recorded in
+# `pi-bootstrap/tests/test-setup-no-nesting.sh`'s DECLARED RESIDUALS block. ⛔ Do not restate it here as
+# fixed: two files disagreeing about one outcome is the exact failure this file's own P3 paragraph
+# exists to stop.
 #
 # ⛔ ONE CONSTRAINT HERE IS NOT DERIVED AND MUST BE STATED: `pr-doctor.py` is listed BEFORE
 # `objective.py` (#1872). The driver imports the classifier by path and `SystemExit`s when it finds

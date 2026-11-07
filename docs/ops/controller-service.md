@@ -80,7 +80,7 @@ cells keep their home under `/tmp`** (`/tmp/cell-home`) and their harness pin un
 (`/tmp/cell-home/harness/<sha>/scripts/…`, the shape cell-3 measured as correct), so "under `/tmp`"
 alone cannot be the rule without blocking every cell bring-up. The refusal names the durable
 alternatives (`$AGENT_INFRA_PATH/scripts/…`, the harness pin, and `$HOME/.pi/agent/scripts/…`) and writes
-**nothing** — the preview verb refuses too. ⛔ **The farmed path IS delivered as of #1938's close**:
+**nothing** — the preview verb refuses too. ⛔ **The farmed path IS delivered by this landing (#1938)**:
 `cloud-cell-supervisor.sh` is farmed FLAT by `setup.sh`'s `fleet_srcs`, so `bash pi-bootstrap/setup.sh`
 DOES create `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` and the refusal names it as a durable
 alternative. ⚠️ A box installed by an OLDER `setup.sh` may still lack it — re-run the installer rather
@@ -174,7 +174,7 @@ must not arm, and it falls through to the **harness pin** (`$CELL_HOME/harness/<
 pinned revision — `check_harness_pin` runs before `check_controller_service`, so it exists by then) and
 then to the farm. ⛔ The pin is graded at preference strength and is tried **before** the two farm paths
 because a pin is this cell's revision where the farm is a possibly-stale copy. `cloud-cell-supervisor.sh`
-itself IS farmed flat now (#1938 closed), so on a fresh provisioned cell BOTH the pin and the farm can
+itself IS farmed flat as of this landing (#1938), so on a fresh provisioned cell BOTH the pin and the farm can
 deliver it; the pin still wins, because a copy the cell chose beats a copy the installer last happened to
 write. ⚠️ On a box whose installer predates that entry the farm copy is absent and the pin remains the
 only durable candidate — which is why the pin is content-checked rather than assumed.

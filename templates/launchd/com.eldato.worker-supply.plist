@@ -45,7 +45,7 @@
          path this plist names — `install-launchd.sh` refuses a target that does not resolve. NOT
          because of any `$SELF_DIR`-relative sibling lookup: this job's own script sets `HERE` and
          never reads it. ⛔ The sibling an earlier draft credited (`cloud-cell-supervisor.sh`) is
-         FARMED FLAT now (#1938 closed), so it is present on a provisioned box — but it is not
+         FARMED FLAT as of this landing (#1938), so it is present on a provisioned box — but it is not
          NESTED, so it was never a reason for THIS file's nesting and still is not. A false
          justification outlives the shape it described, which is why the corrected reason is written
          out (fresh review of #3413; re-derived after the supervisor joined `fleet_srcs`).

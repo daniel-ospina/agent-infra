@@ -4854,7 +4854,7 @@ cache_reaper_path() {
   # CHECKOUT — the cell bring-up and the merge lanes do exactly that — because that sibling is a file
   # the lane may be mid-edit on while the hourly bound the operator reads about is a different file.
   # ⛔ THE OLD REASON HERE WAS FALSE: it said "this supervisor is never farmed (pi-bootstrap/setup.sh's
-  # fleet_srcs does not list it)". The supervisor IS farmed flat now (#1938 closed), so for a
+  # fleet_srcs does not list it)". The supervisor IS farmed flat as of this landing (#1938), so for a
   # FARMED supervisor beside-this-script and the farmed copy are the SAME file and the ordering is
   # moot — which makes the checkout case the only one that still needs it, not one of two.
   for cand in "${CACHE_REAPER:-}" \

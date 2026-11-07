@@ -413,7 +413,7 @@ check_fleet_srcs_farmed() {
 #     `"$REPO/scripts/…"`, `"$O/…"` and two `/tmp/<repo>/scripts/…` paths — a variable-held prefix and
 #     a cross-repo path, i.e. residual (1) and residual (4) at once.
 #     ⛔ THE DELIVERY HALF IS NO LONGER THE PROBLEM, AND THE REASON MOVED. `cloud-cell-supervisor.sh`
-#     IS farmed now (`fleet_srcs`, #1938 closed), so a fresh farm DOES receive it at
+#     IS farmed by this landing (`fleet_srcs`, #1938), so a fresh farm DOES receive it at
 #     `$DEST/scripts/cloud-cell-supervisor.sh`. What still fails is the quiesce's OWN CANDIDATE LIST:
 #     it never looks in `$DEST/scripts/`, so on a farm-only box with no clone it still prints
 #     `supervisor: <none found — will start tmux directly>` and falls back to `tmux kill-server`.

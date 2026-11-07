@@ -3678,7 +3678,7 @@ PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-superv
 # ⛔ AND THE HARNESS PIN IS A CANDIDATE, NOT JUST A REMEDY IN THE REFUSAL TEXT (review-8 P1, MEASURED). This is
 # the shape that killed a bring-up: the caller's preference is skipped (a lane-owner layer), and the box's only
 # durable supervisor is the harness pin — which the refusal text RECOMMENDS but the candidate list never
-# proposed. ⛔ THE OTHER TWO CANDIDATES' CASE HAS NARROWED SINCE #1938 CLOSED, and the old wording here said the
+# proposed. ⛔ THE OTHER TWO CANDIDATES' CASE NARROWS WITH THIS LANDING'S `fleet_srcs` ENTRY (#1938), and the old wording here said the
 # opposite: `cloud-cell-supervisor.sh` IS farmed flat by `setup.sh`'s `fleet_srcs`, so a correctly-installed box
 # DOES hold `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` — and `beside` then names THAT SAME directory,
 # because this installer is farmed into it too. The two collapse into ONE candidate. What survives is the case
