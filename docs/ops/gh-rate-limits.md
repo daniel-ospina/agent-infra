@@ -1181,10 +1181,11 @@ checkout. So no deploy can propagate it.
   ⛔ **AND READ THE MEASUREMENT AS AN UPPER BOUND, NOT A COUNT.** `app-refused` is the arm a widened
   grant would shrink, so the `app-refused` count BEFORE and AFTER the grant is what answers "has the
   grant taken effect?". (Note `--stats` is per-ARM and takes no arguments — it cannot slice by argv.
-  `~/.pi/agent/gh-cred/decisions.log` carries one `arm=… kind=… argv=…` row per DECISION, so it splits
-  the **app ATTEMPTS** by argv — which is not the same number as the refusals: a refusal is only
-  counted, under `app-refused`, with no argv recorded. For an issue-only view of attempts use the log;
-  for refusals use the arm count, which cannot be sliced.)
+  `~/.pi/agent/gh-cred/decisions.log` carries one `arm=… kind=… argv=…` row per **REQUEST** decision
+  — `meter`, `introspect` and every `--which` write NO row, since the write is gated on
+  `purpose == "request" and record` — so it splits the **app ATTEMPTS** by argv, which is not the same
+  number as the refusals: a refusal is only counted, under `app-refused`, with no argv recorded. For an
+  issue-only view of attempts use the log; for refusals use the arm count, which cannot be sliced.)
   But `app-refused` deliberately covers EVERY non-rate-limit app failure — a genuine 404 for a
   deleted PR or a bogus path lands there too — so the count is an upper bound on permission refusals,
   not a measure of them. Splitting 404 into its own arm would sharpen it, and is NOT done here: the
