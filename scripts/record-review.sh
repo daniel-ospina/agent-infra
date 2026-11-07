@@ -3797,7 +3797,7 @@ if [ "$PRINT_TIER" -eq 1 ]; then
   # a tier chosen from a list that may be incomplete.
   #
   # The count is over the NEW path only, exactly as clean_low_shape_ok counts it
-  # (its DISTINCT `$2` count — `:643` here, `:634` on origin/main; re-derive with `grep -n '^  count="$(printf' scripts/record-review.sh`) — GitHub counts a rename as ONE changed file while the compare row
+  # (its DISTINCT `$2` count — `:643` here, `:634` on `origin/main` at `bd1b205d`; re-derive with `grep -n '^  count="$(printf' scripts/record-review.sh`) — GitHub counts a rename as ONE changed file while the compare row
   # carries the old path too, so counting both ends would report truncation for
   # any diff containing a rename. The CLASSIFICATION below still reads BOTH ends
   # (a rename out of a rail must not slip through); only the parity arithmetic is
@@ -5793,7 +5793,7 @@ fi
 #           "review evidence posted to … as a durable comment"
 #
 # Three claims that run never made, on a SUCCESSFUL exit: `mint:"fresh"` (no
-# reviewer ran — delta mode REFUSES --evidence, `:2837` here / `:2761` on origin/main; re-derive
+# reviewer ran — delta mode REFUSES --evidence, `:2837` here / `:2761` on `origin/main` at `bd1b205d`; re-derive
 # with `grep -n 'delta re-binds the record' scripts/record-review.sh`), the prior record's
 # `evidence` (the one pointer tortoise#7391/#10177 exist to preserve) is DELETED,
 # and a signed marker is PATCHed. The tortoise#7391 gate below cannot catch it
@@ -6574,7 +6574,7 @@ if command -v gh >/dev/null 2>&1 && [ -n "$REPO" ]; then
     # the result is captured here and both remedy sentences branch on it.
     BODY_READ_PERSISTED=1
     marker_pending_write "$(marker_pending_file "$REPO" "$PR")" "$MARKER" || { BODY_READ_PERSISTED=0
-    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so the --flush-pending remedy this arm prints below WILL FIND NOTHING and will report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
+    echo "⚠️ body-marker: could NOT persist the pending marker at $(marker_pending_file "$REPO" "$PR") — ⛔ THE BYTES ARE NOT ON DISK, so NO --flush-pending remedy is offered below: it WOULD FIND NOTHING and would report success (it answers 'nothing pending … Nothing was written', exit 0). The marker is reproduced HERE so it is not lost: paste the line between the >>> markers into the PR body by hand if gh is throttled. >>> $MARKER <<<" >&2
     }
     if post_review_evidence_comment "$MARKER" "$REPO" "$PR"; then
       if [ "$BODY_READ_PERSISTED" -eq 1 ]; then
