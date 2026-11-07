@@ -656,6 +656,16 @@ function isValidServerName(name: string): boolean {
  */
 const RECOGNISED_TYPES = new Set(["stdio", "http", "streamable-http"]);
 
+/**
+ * `is`/`are` for a list of field names: agreement follows the NOUN, not the count. `headers` is one
+ * field but a plural noun, so keying on `dropped.length` produced "the base's headers is NOT
+ * inherited" — machine-sounding text in the one diagnostic an operator reads to understand why auth
+ * vanished (a bare 401 with no other signal).
+ */
+function fieldVerb(fields: readonly string[]): "is" | "are" {
+  return fields.length > 1 || fields[0] === "headers" ? "are" : "is";
+}
+
 function isServerEntry(value: unknown): value is McpServerConfig {
   return !!value && typeof value === "object" && !Array.isArray(value);
 }
@@ -854,7 +864,7 @@ export function mergeMcpLayers(
         if (dropped.length > 0) {
           console.log(
             `[mcp-client] note: repo entry "${name}" changes what it LAUNCHES (command/args/cwd), so ` +
-              `the base's ${dropped.join("/")} ${dropped.length === 1 ? "is" : "are"} NOT inherited.`
+              `the base's ${dropped.join("/")} ${fieldVerb(dropped)} NOT inherited.`
           );
         }
       }
@@ -865,7 +875,7 @@ export function mergeMcpLayers(
       if (dropped.length > 0) {
         console.log(
           `[mcp-client] note: repo entry "${name}" changes the destination, so the base's ` +
-            `${dropped.join("/")} ${dropped.length === 1 ? "is" : "are"} NOT inherited — ` +
+            `${dropped.join("/")} ${fieldVerb(dropped)} NOT inherited — ` +
             `the base's credentials belong to the base's own endpoint.`
         );
       }

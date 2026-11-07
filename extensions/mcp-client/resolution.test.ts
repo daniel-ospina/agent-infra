@@ -961,6 +961,42 @@ await test("a base `type` describing NO transport is dropped when the repo decla
   equal((toHttp.u as Record<string, unknown>)?.type, undefined, "and the same in the other direction");
 });
 
+await test("an UNRECOGNISED or non-string `type` earns no contradiction note (it cannot disagree with anything)", async () => {
+  // `RECOGNISED_TYPES` gates the note, not just the warning: an unrecognised `type` cannot contradict a
+  // transport this client acts on, so `sse` over stdio is not a contradiction — it is the self-hosted
+  // shape `SETUP-NEW-MACHINE.md` and `merge-mcp.py` both rule WORKS. Without this pin, deleting the
+  // clause fires a spurious operator-facing contradiction on exactly that entry.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: {} } as never,
+      { mcpServers: { a: { type: "sse", command: "/bin/sh" }, b: { type: 7, command: "/bin/sh" } } } as never,
+    );
+  });
+  ok(merged.a, "`sse` over stdio is kept (it WORKS — the transport is selected from command)");
+  ok(merged.b, "a non-string `type` is kept too");
+  ok(
+    !logs.some(l => l.includes("disagrees with its transport")),
+    `an unrecognised/non-string \`type\` cannot disagree — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("the credential-drop note is grammatical for `headers` (agreement follows the noun, not the count)", async () => {
+  // `headers` is ONE field but a plural noun, so keying `is`/`are` on `dropped.length` printed
+  // "the base's headers is NOT inherited" — in the one diagnostic an operator reads to understand why
+  // auth vanished, which is a bare 401 with no other signal.
+  const logs = await withCapturedLogs(async () => {
+    mergeMcpLayers(
+      { mcpServers: { t: { url: "https://a.example/mcp/", headers: { Authorization: "Bearer K" } } } } as never,
+      { mcpServers: { t: { url: "https://a.example/mcp" } } } as never,
+    );
+  });
+  ok(
+    logs.some(l => l.includes("the base's headers are NOT inherited")),
+    `expected grammatical plural — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("a BASE-owned incoherent `type` is not blamed on the repo (the note follows the pen that wrote it)", async () => {
   // The projection can be incoherent because the BASE's label was, and the repo never wrote a `type`.
   // The note used to fire anyway — sending the operator to edit a repo file that does not contain the
