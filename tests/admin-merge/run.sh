@@ -16969,6 +16969,16 @@ if [ "$rd9b_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TM
 else
   fail "(rd9b) an unreadable clock at the guard exited $rd9b_rc and/or did not name clock-unreadable — the guard would be inert"
 fi
+# ⛔ RESTORE THE SUITE'S OWN OPTION SET — this block left `-e` ON, and that silently killed the
+# whole run from the first arm below whose rail call is SUPPOSED to refuse (#3392, measured).
+# The suite's invariant is `set -uo pipefail` (:208) — NOT `-e` — which is exactly why every arm
+# that runs the rail and expects a non-zero exit brackets it with `set +e` / `set -e` (the (rd)
+# arms above, and the sibling pairs earlier in this file). The (rd) block is the last such bracket
+# before §80, so its closing `set -e` leaked into everything after it: measured at this head, the
+# run died INSIDE §80(b)'s rail call, printed no `❌` line at all, and every assertion from there to
+# the end of the file never executed — a suite that reports 2027 ✅ and a bare rc=1 while ~40 arms
+# below it are dead is the false-PASS shape this file exists to prevent, one level up.
+set +e
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
