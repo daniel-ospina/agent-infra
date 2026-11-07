@@ -193,6 +193,19 @@ help_text() {
 # must not split into two bogus roots).
 TRANSIENT_ROOTS="/tmp /var/tmp /run /dev/shm /var/folders /private/tmp /private/var/tmp /private/var/folders"
 
+# ⛔ THE AMBIENT-GIT SCRUB HAS ONE OWNER (re-review P1, measured END-TO-END). Every git read here that
+# answers a question about a DIRECTORY must ignore an exported `GIT_DIR`/`GIT_WORK_TREE` pair: with both set,
+# `git -C <lane worktree> rev-parse --show-toplevel` answers the path THEY name and `symbolic-ref -q HEAD`
+# reads THAT repository's HEAD. Four call sites scrubbed individually and two, in `linked_worktree_root`,
+# did not — so `GIT_DIR=<pin>/.git GIT_WORK_TREE=<pin>` made a BRANCH lane worktree grade "detached at this
+# box's recorded pin" and the installer ARMED `ExecStart=<lane worktree>/scripts/cloud-cell-supervisor.sh`
+# with rc=0: the exact #2697 shape, admitted by two exported variables. Reproduced before the fix (primary
+# clone + detached pin + branch worktree, `ORCH_SUPERVISOR` on the branch worktree): without the pair rc=1
+# "LINKED GIT WORKTREE … checked out on a BRANCH", with it rc=0 and the unit rendered. The list therefore
+# exists ONCE, and `linked_worktree_root` reads its branch/detached answer through the same scrub as
+# `git_dirs` — the two halves of one rule cannot disagree any more.
+GIT_SCRUB=(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE GIT_OPTIONAL_LOCKS=0)
+
 # lane_scratch_shape <resolved path> — the lane-scratch SHAPE this path matches, or nothing.
 # ⛔ ONE LIST, MIRRORED FROM `scripts/install-repair-service.sh` (its `case "$SCRIPTS_DIR"` in `render()`,
 # which refuses these same shapes for the repair unit) — and the SUITE asserts the two lists are equal (§P6),
@@ -257,10 +270,8 @@ git_dirs() { # <dir> — prints "<absolute-git-dir> <git-common-dir>", both reso
     # printed "main" for a linked worktree — the whole refusal bypassed by one exported variable (a layout
     # this fleet invites: `/tmp/cell-ai` is a bare-configured clone). The question here is "what does GIT
     # say about THIS DIRECTORY", so every variable that redirects git's selection is removed for the call.
-    gitdir="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
-        GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
-    common="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
-        GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 0
+    gitdir="$("${GIT_SCRUB[@]}" git -C "$d" rev-parse --absolute-git-dir 2>/dev/null)" || return 0
+    common="$("${GIT_SCRUB[@]}" git -C "$d" rev-parse --git-common-dir 2>/dev/null)" || return 0
     [ -n "$gitdir" ] && [ -n "$common" ] || return 0
     # ⛔ `--git-common-dir` ANSWERS A RELATIVE PATH IN A MAIN CLONE (`.git`) AND AN ABSOLUTE ONE IN A LINKED
     # WORKTREE. Compared raw, a primary clone's two answers differ by SPELLING and every primary clone would
@@ -320,14 +331,17 @@ linked_worktree_root() {
     case "$dirs" in *' linked') ;; *) return 0 ;; esac
     # ⛔ "LINKED" WITH NO NAME IS STILL LINKED. The two rev-parse calls already disagreed with the plain-clone
     # arithmetic, so an unnamed top level is a worktree we cannot spell — not a reason to admit it.
-    top="$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --show-toplevel 2>/dev/null)"
+    # ⛔ THE SAME SCRUB AS `git_dirs` (re-review P1). `git_dirs` already decided this is a LINKED worktree with
+    # the ambient selection removed, so the branch/detached question — the one that IS the rule — must be asked
+    # the same way. Unscrubbed, an exported pair redirected both reads to the pin and the guard armed the lane.
+    top="$("${GIT_SCRUB[@]}" git -C "$d" rev-parse --show-toplevel 2>/dev/null)"
     if [ -z "$top" ]; then
         printf 'it is inside a LINKED GIT WORKTREE that git reported but could not name (its git-dir and common-dir already disagreed, and `rev-parse --show-toplevel` then failed) — a lane checkout removed when the lane ends'
         return 0
     fi
     # ⛔ THE BRANCH, NOT THE WORKTREE (review-3 P1). A detached HEAD is the shape the cells' pin has; a symbolic
     # HEAD is a branch — unmerged work a lane removes when it lands.
-    if GIT_OPTIONAL_LOCKS=0 git -C "$d" symbolic-ref -q HEAD >/dev/null 2>&1; then
+    if "${GIT_SCRUB[@]}" git -C "$d" symbolic-ref -q HEAD >/dev/null 2>&1; then
         printf '%s|branch\n' "$top"
     else
         printf '%s|detached\n' "$top"
@@ -498,6 +512,25 @@ resolve_supervisor() {
                 err "REFUSING: cannot resolve '$c' to a physical path, so whether the unit's ExecStart would survive a cleaning cannot be shown — a broken symlink and a directory this user cannot read both look like this. Point ORCH_SUPERVISOR at a readable, resolved path."
                 return 1 ;;
         esac
+        # ⛔ A PATH THIS TEMPLATE CANNOT CARRY IS REFUSED, NOT RENDERED (re-review P2, measured). The template
+        # renders `Environment=ORCH_SUPERVISOR_PIN=…` and `ExecStart=/bin/bash {{SUPERVISOR}} start` UNQUOTED,
+        # so systemd splits on whitespace: a checkout at `…/home/sp ace` rendered a unit whose pin assignment
+        # systemd DROPPED ("Invalid environment assignment, ignoring: ace@…") and whose ExecStart named a path
+        # that is not there — while `verify_unit`'s exact-line `grep -qxF` PASSED on the raw text. That is the
+        # false-PASS shape this file keeps ruling out, so the render refuses and the operator moves the
+        # checkout instead of silently shipping a unit systemd reads differently than the installer does.
+        case "$r" in
+            *[[:space:]]*|*'"'*)
+                if [ "$hard" = 1 ]; then
+                    err "REFUSING: the supervisor path '$r' contains whitespace or a double quote, and this unit renders its environment and ExecStart UNQUOTED."
+                    err "  systemd would split that value, silently DROP the pin assignment and fail to exec the supervisor (measured:"
+                    err "  'Invalid environment assignment, ignoring: …'), while the rendered text still looks right."
+                    err "  Move the checkout to a path without spaces, or pass a supervisor that has none."
+                    return 1
+                fi
+                err "note: NOT rendering ExecStart from $r — the path contains whitespace or a double quote, which this unit renders unquoted and systemd would split."
+                continue ;;
+        esac
         if why="$(scratch_supervisor_reason "$r")"; then
             if [ "$hard" = 1 ]; then
                 err "REFUSING to render an ExecStart that will not survive this box: $r"
@@ -555,28 +588,38 @@ resolve_supervisor() {
 # until it restarts. Read it as "what this box will boot", which is what it measures.
 SUPERVISOR_PIN=""
 supervisor_pin() {
-    local dir repo="" sha="" gd
+    local dir repo="" sha="" gd named=""
     dir="$(dirname "$SUPERVISOR")"
+    # ⛔ THE PIN NAMES A REPO THAT ACTUALLY CARRIES THIS FILE (re-review P2, measured). `git -C <dir> rev-parse`
+    # answers the nearest ENCLOSING work tree, whether or not it has anything to do with the supervisor: a farmed
+    # copy under a `$HOME` that is itself a repository (the ordinary dotfiles layout) recorded a confident
+    # `<home>@<sha>` — a PLAUSIBLE WRONG answer to "which code does this unit run", which is worse than none
+    # because it reads as proof. So when git NAMES a top level, that work tree must actually TRACK this file;
+    # otherwise the pin is `unknown@unknown`.
     if command -v git >/dev/null 2>&1; then
         # ⛔ THE SAME SCRUB AS `git_dirs` (re-review P2): an exported GIT_DIR would make the pin describe the
         # HUB instead of the code the unit runs — a diagnostic that lies is worse than none.
-        repo="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
-            GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || repo=""
-        # ⛔ AND A BARE-CONFIGURED PRIMARY CLONE HAS NO TOP LEVEL TO NAME (re-review P3, measured: this
-        # fleet's `/tmp/cell-ai` is `core.bare=true`, so `--show-toplevel` fails while `HEAD` answers). The
-        # documented pin is `<repo>@<sha>` and `unknown@unknown` is reserved for "outside any git work tree",
-        # so falling back to the git dir is the difference between a usable pin and a diagnostic that is
-        # empty precisely on the cells' own shape. `<...>/.git` is stripped when it is a suffix.
-        if [ -z "$repo" ]; then
-            gd="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
-                GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
+        named="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse --show-toplevel 2>/dev/null)" || named=""
+        if [ -n "$named" ]; then
+            "${GIT_SCRUB[@]}" git -C "$dir" ls-files --error-unmatch -- "$SUPERVISOR" >/dev/null 2>&1 \
+                && repo="$named"
+        else
+            # ⛔ AND A BARE-CONFIGURED PRIMARY CLONE HAS NO TOP LEVEL TO NAME (re-review P3, measured: this
+            # fleet's `/tmp/cell-ai` is `core.bare=true`, so `--show-toplevel` fails while `HEAD` answers). The
+            # documented pin is `<repo>@<sha>` and `unknown@unknown` is reserved for "outside any git work tree",
+            # so falling back to the git dir is the difference between a usable pin and a diagnostic that is
+            # empty precisely on the cells' own shape. `<...>/.git` is stripped when it is a suffix. This arm is
+            # deliberately NOT held to the tracking test above: a `core.bare` clone has no work tree and no
+            # index for `ls-files` to answer from, and §P3 pins that shape's `<repo>@<sha>`.
+            gd="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse --absolute-git-dir 2>/dev/null)" || gd=""
             case "$gd" in
                 */.git) repo="${gd%/.git}" ;;
                 *) repo="$gd" ;;
             esac
         fi
-        sha="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_COMMON_DIR -u GIT_INDEX_FILE \
-            GIT_OPTIONAL_LOCKS=0 git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
+        if [ -n "$repo" ]; then
+            sha="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse HEAD 2>/dev/null)" || sha=""
+        fi
     fi
     case "$sha" in ''|*[!0-9a-f]*) sha="unknown" ;; esac
     [ -n "$repo" ] || repo="unknown"
