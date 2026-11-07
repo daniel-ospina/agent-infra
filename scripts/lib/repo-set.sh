@@ -151,22 +151,51 @@ EOF_NORM
 # alone on the box. The controls (identical spellings, a trailing `/`) DO refuse, which is what makes
 # it a defect rather than a matter of taste — the refusal was satisfiable by a differently-typed path.
 #
-# So: RESOLVE when the path exists, fall back to the pure-spelling norm when it does not.
+# So: RESOLVE what exists, and fold the rest LEXICALLY.
 #   * `cd -P` collapses `..`, `//`, `.` AND symlinks in one step on macOS and GNU alike — no
 #     `readlink -f` (BSD does not have it) and no `stat -f`/`stat -c` flag divergence to get wrong,
 #     which is the same portability argument this file already makes for `case` over `[[ =~ ]]`.
-#   * the fallback is not an oversight: `check` deliberately does NOT require `state` to exist, and a
-#     set whose state dir the operator creates afterwards must not start failing.
+#   * ⛔ A WHOLE-PATH `cd -P` IS NOT ENOUGH (review round 7, P2 — round 6 closed the EXISTING case and
+#     left the not-yet-created one open). When the dir does not exist the round-6 fallback was
+#     `_rs_norm_path`, which folds `//`, `.` and `/` but NOT `..` — so
+#     `state=/srv/nx/state` vs `state=/srv/nx/state/../state`, neither existing yet, printed
+#     `repo-set: ok` twice and exited 0 with `OK — 2 repo(s)`, on two spellings that become ONE
+#     directory the moment a controller creates it. That is the FIRST-INSTALL state, which is the
+#     state this reader deliberately permits — so the gap sat exactly where the check is most used.
+#   * THE REPAIR IS NOT A LEXICAL `..` COLLAPSE, which would be a NEW false pass: `/a/link/../b`
+#     with `/a/link -> /c` is PHYSICALLY `/b`, and collapsing text would call it `/a/b` — losing the
+#     collision. So walk the path COMPONENT BY COMPONENT from the root, canonicalising each prefix
+#     that exists with `cd -P` (following symlinks), and folding the remainder lexically — valid
+#     because once a prefix does not exist, nothing below it exists either, so no remaining
+#     component can be a symlink and `..` there is pure text.
+#   * existence stays UNREQUIRED: a set whose state dir the operator creates afterwards must not start
+#     failing. That requirement is about existence, NOT about `..`, so closing the `..` gap reopens
+#     nothing.
 #   * case stays the CALLER's fold (`_rs_lower`), because a dir that does not exist cannot be
 #     resolved at all — folding after resolution is the only way the APFS arm (m1) survives when the
 #     fixture (and a real box) has no such directory yet.
 _rs_state_key() {
-  local p="${1:-}" resolved=""
+  local p="${1:-}" whole=""
+  # Fast path: the directory exists, so ONE physical resolution settles it.
   if [ -n "$p" ]; then
-    resolved="$( cd -P "$p" 2>/dev/null && pwd -P )"
+    whole="$( cd -P "$p" 2>/dev/null && pwd -P )"
   fi
-  [ -n "$resolved" ] || resolved="$(_rs_norm_path "$p")"
-  printf '%s' "$resolved"
+  if [ -n "$whole" ]; then printf '%s' "$whole"; return 0; fi
+
+  local out="" comp cand resolved
+  while IFS= read -r comp; do
+    case "$comp" in
+      ''|.) continue ;;
+      '..') if [ -n "$out" ]; then out="${out%/*}"; fi; continue ;;
+    esac
+    cand="$out/$comp"
+    resolved="$( cd -P "$cand" 2>/dev/null && pwd -P )"
+    if [ -n "$resolved" ]; then out="$resolved"; else out="$cand"; fi
+  done <<EOF_STATE_KEY
+$(printf '%s' "$p" | tr '/' '\n')
+EOF_STATE_KEY
+  [ -n "$out" ] || out="/"
+  printf '%s' "$out"
 }
 
 # _rs_slug_ok <s> — `owner/name`, and exactly one `/`. `case` rather than `[[ =~ ]]` so this file
