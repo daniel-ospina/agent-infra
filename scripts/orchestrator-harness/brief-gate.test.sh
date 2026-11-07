@@ -1719,7 +1719,18 @@ mv "$GATE" "$GATE.moved"
 # have is refused for the REPO-IDENTITY reason and never reaches the missing-validator path this arm
 # is about — the assertion then reads as "the fail-closed arm is broken" when the arm had not run. The
 # fixture is born on `init.defaultBranch=fix/research-first-gate` above; one word, same branch.
-( cd "$TMP" && env -u AGENT_INFRA_PATH O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
+# ⛔ AND `env -u AGENT_INFRA_PATH` IS *STILL* NOT ENOUGH ON A BOX WITH A `keys.env` — A SIXTH ROOT IS THE
+# BOX'S OWN CREDENTIAL FILE (review cycle 11, MEASURED on a cell). `lane.sh` sources `lane-env.sh`, which
+# dots `${ENV_FILE:-$HOME/keys.env}` at top level under `set -a` BY DESIGN (`lane-env.sh:16-61`: the keys
+# file is authoritative for credentials, exactly as `cloud-cell-supervisor.sh` treats it) — and a real
+# `keys.env` carries `export AGENT_INFRA_PATH=/home/cmux/agent-infra`, which it RE-EXPORTS over the
+# `env -u` above. The resolver then found `/home/cmux/agent-infra/scripts/orchestrator-harness/brief-gate.sh`,
+# ran the REAL validator, and reported `rc=0` — so the arm read as "the fail-closed path is broken" on
+# every cell and dev box while passing on a clean CI runner (which has no keys file), i.e. it reddened
+# exactly where the variable is REAL. `ENV_FILE` is the seam `lane-env.sh` already exposes; pointing it
+# at a path that does not exist is the isolation this arm claims, and it is the same `env -u` reasoning
+# one layer further out: a fixture that inherits ambient state cannot make a claim about isolation.
+( cd "$TMP" && env -u AGENT_INFRA_PATH ENV_FILE="$TMP/fakehome/no-keys.env" O="$TMP/lane-o2" PATH="$TMP/bin:$PATH" PI_LOG="$PI_LOG" REAP_LANE_VENV_DISABLE=1 LANE_DRY_RUN=1 \
     HOME="$TMP/fakehome" bash "$HERE/lane.sh" 2258 fix/research-first-gate daniel-ospina/agent-infra ) >/dev/null 2>&1; rc=$?
 mv "$GATE.moved" "$GATE"
 [ "$rc" -eq 78 ]; ck $? "a MISSING validator refuses the LANE with 78 (fail-closed: never a lane nobody asked to look first) (rc=$rc)"
@@ -1798,7 +1809,13 @@ found="$(cd "$ROOT" && { grep -rlE 'brief-gate\.sh|brief_gate_(lib|run|verify|se
 #     filtered out of the scan: a filter on a directory would silently absorb the next caller that happens
 #     to live there, which is the "gate that cannot see the thing it exists for" shape this list exists
 #     to prevent.
-EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
+#   * ⛔ `disk-admission.test.sh` (c2b7f2bf0, #3395/#3409) is a REFERENCER, and it was the ONE name that
+#     kept this equality red at this change's base — measured on `2c18ff89a`, `found`=42 vs the 41
+#     declared, the same "red on its own base" condition the paragraph above calls out. Its only
+#     reference is a comment (`:1260`-`:1261`) recording WHY it declined to grow a `--section fixer`
+#     option: the flag belongs to `brief-gate.sh`. It dispatches no `pi` invocation, so it joins this
+#     equality without joining the dispatch population.
+EXPECTED="AGENTS.md scripts/check-farm-drift.sh scripts/cloud-cell-supervisor.sh scripts/orch-send.sh scripts/orchestrator-harness/ARCHITECTURE.md scripts/orchestrator-harness/README.md scripts/orchestrator-harness/ai-drainer.sh scripts/orchestrator-harness/ai-drainer.test.sh scripts/orchestrator-harness/brief-gate.sh scripts/orchestrator-harness/capacity-transfer.test.sh scripts/orchestrator-harness/check-single-source.sh scripts/orchestrator-harness/claim-reaper.sh scripts/orchestrator-harness/claim-reaper.test.sh scripts/orchestrator-harness/claims.sh scripts/orchestrator-harness/disk-admission.test.sh scripts/orchestrator-harness/fix-one.sh scripts/orchestrator-harness/fixtures/mutation-attribution/README.md scripts/orchestrator-harness/fixtures/mutation-attribution/verdict-attribution.md scripts/orchestrator-harness/install.sh scripts/orchestrator-harness/key-gate.sh scripts/orchestrator-harness/lane-bound.test.sh scripts/orchestrator-harness/lane.sh scripts/orchestrator-harness/mandate-preflight.sh scripts/orchestrator-harness/mandate-preflight.test.sh scripts/orchestrator-harness/merge-one.sh scripts/orchestrator-harness/mutation-attribution.test.sh scripts/orchestrator-harness/nonblocking-dispatch.sh scripts/orchestrator-harness/nonblocking-dispatch.test.sh scripts/orchestrator-harness/reviewer-preflight.test.sh scripts/orchestrator-harness/selftest.sh scripts/orchestrator-harness/spawn-gate.sh scripts/orchestrator-harness/spawn-gate.test.sh scripts/orchestrator-harness/wip-rescue-exit.test.sh scripts/pr-doctor.py scripts/record-review.sh scripts/record-review.test.sh scripts/safe-send.sh scripts/test_cmux_payload.py scripts/test_pr_doctor.py templates/AGENTS.base.md templates/LANE-BRIEF.md"
 [ "$found" = "$EXPECTED" ]; crc=$?
 [ "$crc" -eq 0 ] || echo "      found: [$found]"
 ck "$crc" "the files touching the gate are EXACTLY the declared set (a new dispatch path must declare itself)"
