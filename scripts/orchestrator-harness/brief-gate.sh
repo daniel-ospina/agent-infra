@@ -56,14 +56,20 @@
 # author READ the ref, and the next actor still has to read it.
 #
 # ⚠️ STATED RESIDUAL — THE WIP CROSS-CHECK IS BEST-EFFORT, AND DELIBERATELY SO, IN THREE WAYS.
-#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL issue number in its KEY. The limit
-#       is exact, and it is "no digit inside the key's FIRST bracket": the canonical slot `issue-<N>` is a
-#       CLOSED bracket with no digits, and it — like any other digit-free bracket — is admitted, because
-#       the canonical block ships that shape and the gate cannot refuse its own advice (the same licence
-#       the research contract gives its own `<…>` slots). A number OUTSIDE the bracket (`issue-<x> 4242`)
-#       is not a key: the value falls to the slot case and is admitted unchecked. That shape is not a
-#       capability an author needs — the bare slot already admits — but it is the precise limit, stated so
-#       it can be re-measured rather than trusted.
+#   (a) COVERAGE: it bites on a brief whose `WIP:` line carries a REAL ISSUE number in its KEY. Scope, and
+#       nothing broader: an `issue-` key that carries no digit inside its first bracket is the canonical
+#       slot `issue-<N>` (a CLOSED bracket, which the canonical block ships) and is ADMITTED — the gate
+#       cannot refuse its own advice, the same licence the research contract gives its own `<…>` slots.
+#       A number OUTSIDE the bracket (`issue-<x> 4242`) leaves the key unparsable and is admitted as the
+#       slot too; that adds no capability an author needs (the bare slot already admits), and it is named
+#       so the limit can be re-measured rather than trusted. The direction is one-way, not a biconditional:
+#       anything swallowed as the slot carries no digit in its first bracket, but not every digit-free
+#       value is swallowed (`issue-slot4242`, with no bracket at all, is REFUSED as unkeyed).
+#       ⓘ AND A `pr-<digits>` KEY IS NEVER RESOLVED AGAINST `refs/wip/*`: those refs are ISSUE-keyed, so a
+#       `pr-` key is accepted for fixer/reviewer roles and its absence claim is unchecked (measured: a
+#       fixer brief with `pr-<4242> -> none` and a matching `refs/wip/issue-4242-…` on origin is admitted
+#       with no token). That is the same fact this file states later — `issue-<N>` is "the only one the
+#       cross-check can resolve" — and it belongs in the limit, not only in the code.
 #   (b) MEASUREMENT: it needs a repository and a reachable `origin`. With neither, the gate says so on
 #       stderr (the word `UNVERIFIED`, naming the issue) and ADMITS the brief, because refusing
 #       every dispatch on a moment's network failure converts a memory gap into a fleet-wide outage.
@@ -505,9 +511,11 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
           #    refuse its own advice). The coverage limit is therefore "no digit inside the key's first
           #    bracket", not "no number anywhere in the value" — a number OUTSIDE the bracket (`issue-<x>
           #    4242`) leaves the key unparsable and the value is treated as the slot.
-          # 3. The number is joined to the tail WITH A SEPARATOR. `tail` now derives from `head`, so this
-          #    is belt-and-braces rather than the load-bearing fix it was in cycle 5 — but the two lines
-          #    together are what H61 pins, and either one alone reconstructs `42424242`.
+          # 3. The number is joined to the tail WITH A SEPARATOR. MEASURED, so the next reader does not
+          #    have to re-derive it (review of #3621, cycle 7): either line alone is INERT — reverting the
+          #    separator, or reverting `tail` to the cycle-4 `${nval#*>"}`, leaves the key read as `4242`
+          #    and H61 green (0 behavioural differences over 284 probes). Only BOTH together — the
+          #    cycle-4 shape — reconstructs `42424242` and admits it.
           issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
           *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
