@@ -1317,15 +1317,84 @@ ck "A85 [RED→GREEN] ...and it is really gone (the bound is a bound at every kn
 P4NONUTF="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a\377@b> %s +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=byte\n' "$P4NOW" "$P4NOW" \
    | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
 ( cd "$P4BOX" && git push -q --force origin "$P4NONUTF:refs/claims/pr-3237" ) 2>/dev/null
+# ⛔ THE PIN BELOW MUST BE ABLE TO FAIL — A MISSING `en_US.UTF-8` MADE IT INERT (review round 27,
+# agent-infra#3203). A86 relied on `en_US.UTF-8` being INSTALLED: glibc FALLS BACK to `C` when it is not
+# (and the subshell's `2>/dev/null` hid the warning), so `sed` was already byte-oriented and A86/A87 passed
+# with OR without the three `LC_ALL=C` prefixes — a green that measured nothing. Measured with
+# `LC_ALL=xx_YY.UTF-8`: the Q4 mutant is NOT caught, and the pin silently claims a property its box
+# cannot test. So the ambient locale is now the first UTF-8 locale this box actually HAS (`C.UTF-8` is
+# built into modern glibc and is UTF-8 for this purpose), and a box that reports NONE says the pin is
+# inert instead of passing quietly.
+P4UTF8=""
+if command -v locale >/dev/null 2>&1; then
+  while IFS= read -r _p4l; do
+    case "$_p4l" in en_US.UTF-8|en_US.utf8|C.UTF-8|C.utf8) P4UTF8="$_p4l"; break ;; esac
+  done <<<"$(locale -a 2>/dev/null)"
+fi
+if [ -z "$P4UTF8" ]; then
+  P4UTF8=en_US.UTF-8
+  echo "  ⚠️ A86/A87: no en_US/C UTF-8 locale reported by 'locale -a' on this box — the byte-orientation"
+  echo "     pin is INERT here: it would pass with the three LC_ALL=C prefixes removed. Not a failure of the"
+  echo "     fix, but the pin cannot measure it on this box."
+fi
 ck "A86a (setup) a claim commit whose committer NAME carries an invalid UTF-8 byte is planted" "0" "$( p4_has pr-3237 && echo 0 || echo 1 )"
-P4NONUTFV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL=en_US.UTF-8 && . "$CLAIMS_SH" \
+P4NONUTFV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL="$P4UTF8" && . "$CLAIMS_SH" \
                && c="$( _git ls-remote origin refs/claims/pr-3237 | awk '{print $1}' )" \
                && _git fetch -q origin "+refs/claims/pr-3237:$CLAIM_TMP_NS/nonutf3203" \
                && _claim_commit_time "$CLAIM_TMP_NS/nonutf3203" ) 2>/dev/null | tail -1 )
-echo "  _claim_commit_time over a committer name with a 0xFF byte, under a UTF-8 ambient locale: '$P4NONUTFV'"
+echo "  _claim_commit_time over a committer name with a 0xFF byte, under UTF-8 ambient locale '$P4UTF8': '$P4NONUTFV'"
 ck "A86 [RED→GREEN] a non-UTF-8 byte in the committer NAME does not stop the stamp being measured (the parse is byte-oriented)" "^${P4NOW}$" "$P4NONUTFV"
 outP4NONUTFP=$( p4_prune )
 ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 18000s bound" "$outP4NONUTFP"
+# ⛔ `.*>` IS GREEDY — IT BINDS THE **LAST** `>` ON THE LINE, NOT THE IDENT'S END (review round 27,
+# agent-infra#3203). Round 22 replaced the bare greedy `.* ` with `.*> ` and measured it only against a
+# forged tail carrying NO `>` in front of it (A79's `+0000 1 +0000`). One `> ` in front of that same tail
+# puts the steal straight back, because the last `> ` is then the forged one: measured on the round-22
+# file, BOTH shapes below answered `1` while the object is dated `<NOW>` by git, and `claim_prune`
+# DELETED a 0-second-old claim as `<NOW>s old, PAST the 18000s bound` — the same one-push steal #3203 is
+# about, one token over from the shape A79 pins. The span is now git's OWN ident split
+# (`ident.c::split_ident_line`: the FIRST `<`, then the FIRST `>` after it), which is what A90 pins as a
+# CONTROL — the fix must not over-reach into names that legitimately carry `> 1 +0000` BEFORE the span.
+p4_plant_committer() { # <ref-name> <committer-line> -> plants it verbatim, pushes, prints the object id
+  local o
+  o="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\n%s\n\nclaim owner=weird3203 lease_until=HAVOC nonce=forge\n' "$P4NOW" "$2" \
+        | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+  [ -n "$o" ] || return 1
+  ( cd "$P4BOX" && git push -q --force origin "$o:refs/claims/$1" ) 2>/dev/null
+  printf '%s' "$o"
+}
+p4_ct_rc() { # <ref-name> <ns-suffix> -> _claim_commit_time's rc (1 = unmeasurable ⇒ KEPT and NAMED)
+  ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+    && _git fetch -q origin "+refs/claims/$1:$CLAIM_TMP_NS/$2" \
+    && _claim_commit_time "$CLAIM_TMP_NS/$2" >/dev/null 2>&1; printf '%s' "$?" ) 2>/dev/null | tail -1
+}
+p4_ct_val() { # <ref-name> <ns-suffix> -> _claim_commit_time's measured stamp (empty when unmeasurable)
+  ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+    && _git fetch -q origin "+refs/claims/$1:$CLAIM_TMP_NS/$2" \
+    && _claim_commit_time "$CLAIM_TMP_NS/$2" ) 2>/dev/null | tail -1
+}
+P4GREEDY="$(p4_plant_committer pr-3238 "committer a <a@b> $P4NOW +0000 > 1 +0000")"
+ck "A88a (setup) a committer line with a forged '> 1 +0000' tail past the ident is planted" "0" "$( p4_has pr-3238 && echo 0 || echo 1 )"
+ck "A88 [RED→GREEN] the LAST '> ' on the line is not the stamp (a greedy .*> answers 1 here)" "^1$" "$( p4_ct_rc pr-3238 greedy3203 )"
+outP4GREEDY=$( p4_prune )
+ck "A88b [RED→GREEN] ...so a claim git dates as CURRENT is KEPT and NAMED, not reaped as ancient" "kept unreadable-lease refs/claims/pr-3238" "$outP4GREEDY"
+p4_has pr-3238 && P4G1K=0 || P4G1K=1
+ck "A88c [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4G1K"
+P4GREEDYM="$(p4_plant_committer pr-3239 "committer a <a@b> $P4NOW +0000 <c@d> 1 +0000")"
+ck "A89a (setup) the same forgery through a LATER '<c@d>' mail-shaped span is planted" "0" "$( p4_has pr-3239 && echo 0 || echo 1 )"
+ck "A89 [RED→GREEN] ...and it is measured from the FIRST mail span, not the forged later one" "^1$" "$( p4_ct_rc pr-3239 greedy3204 )"
+outP4GREEDYM=$( p4_prune )
+ck "A89b [RED→GREEN] ...so that claim is KEPT and NAMED too" "kept unreadable-lease refs/claims/pr-3239" "$outP4GREEDYM"
+p4_has pr-3239 && P4G2K=0 || P4G2K=1
+ck "A89c [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4G2K"
+# A90 is the CONTROL, not a RED→GREEN: git reads the FIRST `<`…FIRST `>` span, so a NAME carrying
+# `> 1 +0000` before the ident's mail span is a legitimate shape that must still MEASURE. Anchoring on
+# "some `>`" instead of git's span would refuse it, and an over-restrictive parser turns every such
+# claim into an unmeasurable one — the direction the reap bound then never fires from.
+P4NAMETAIL="$(p4_plant_committer pr-3240 "committer a > 1 +0000 <a@b> $P4NOW +0000")"
+ck "A90a (setup) a committer NAME carrying '> 1 +0000' BEFORE the mail span is planted" "0" "$( p4_has pr-3240 && echo 0 || echo 1 )"
+ck "A90 [control] ...and the stamp is still MEASURED from the mail span (the fix must not over-reach)" "^${P4NOW}$" "$( p4_ct_val pr-3240 nametail3203 )"
+[ -n "$P4NAMETAIL" ] || echo "  ⚠️ A90 setup: the control object did not plant — the assertion above cannot discriminate"
 rm -rf "$P4ORIG" "$P4BOX"
 
 echo

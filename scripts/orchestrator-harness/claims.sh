@@ -1209,12 +1209,22 @@ _claim_commit_time() {
   # simply not a match — which lands on rc=1 (unmeasurable, KEPT and NAMED) instead of a forged age.
   # A76-A78 only exercised a token the `$` anchor REJECTS (`+0000 junk`), so they pinned the shape of the
   # fallback and not this: A79 drives a token that PARSES and must still not become the value.
+  # ⛔ `.*>` IS NOT "THE IDENT'S END" — `.*` IS GREEDY, SO IT BINDS THE **LAST** `>` ON THE LINE (review
+  # round 27, agent-infra#3203). The round-22 anchor above was measured only against `+0000 1 +0000` (a
+  # bare token); adding ONE `> ` in front of it put the steal straight back, because the last `> ` is then
+  # the forged one: measured on the round-22 file, `committer a <a@b> <NOW> +0000 > 1 +0000` — and the
+  # `<c@d>` variant — answered `1` while `git log -1 --format=%ct` dates the object at NOW, so
+  # `claim_prune` deleted a 0-second-old claim as `1794013553s old` (A88/A89 pin both shapes). The span is
+  # now git's OWN ident split (`ident.c::split_ident_line`: the FIRST `<`, then the FIRST `>` after it,
+  # then the date field) — `[^<]*<[^>]*>` — so a name legitimately carrying `> 1 +0000` still measures
+  # (A90 is that control), and a line whose mail span is followed by anything but the date field is not a
+  # match at all.
   # ⛔ BOTH PROPERTIES ARE KEPT TOGETHER: byte-orientation (LC_ALL=C) decides WHICH BYTES are examined,
-  # and the `> ` anchor decides WHICH FIELD may become the value. Neither implies the other — a
+  # and the mail-span anchor decides WHICH FIELD may become the value. Neither implies the other — a
   # byte-oriented greedy `.* ` still read a forged second `digits +dddd` tail, and an anchored
   # locale-dependent `.` still answered differently on two boxes for the same object.
   ct="$(printf '%s' "$raw" | LC_ALL=C sed -n '/^$/q;p' | LC_ALL=C sed -n '/^committer /p' | tail -n 1 \
-        | LC_ALL=C sed -n 's/^committer .*> \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
+        | LC_ALL=C sed -n 's/^committer [^<]*<[^>]*> \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
   # ⛔ SELECT THE LAST `committer` LINE *FIRST*, THEN PARSE IT (review round 20, agent-infra#3203). The
   # parse above used to be ONE anchored `sed` piped to `tail -n 1`, which selects "the last line that
   # MATCHES", not "the last committer line". Git dates the object from the last `committer` header

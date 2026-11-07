@@ -856,6 +856,29 @@ def l30_committer_acceptance():
           "a SECOND 'digits +dddd' pair on the committer line must not become the stamp "
           "(the greedy .* read it as '1', dating a 0-second-old claim as ancient); got %r"
           % (cl._commit_time(obj(field_forged)),))
+    # ⛔ AND THE SAME STEAL THROUGH A SECOND `> ` (review round 27, agent-infra#3203). Round 22 replaced
+    # the greedy `.* ` with `.*> ` and measured it only against a tail that had NO `>` in front of it
+    # (`field_forged` above) — but `.*` is still GREEDY, so `.*> ` binds the LAST `>` on the line. One
+    # `> ` (or one `<c@d>`) in front of that same forged tail put round 22's answer straight back:
+    # measured on the round-22 pattern, BOTH shapes below answered `1` while `git log -1 --format=%ct`
+    # dates the object at `1793991810`, so the shell's reaper deleted a claim that was 0 s old. The pattern
+    # is now `ident.c::split_ident_line`'s span (FIRST `<`, then FIRST `>`), so neither shape measures.
+    greedy_forged = "committer a <a@b> 1793991810 +0000 > 1 +0000"
+    check(cl._commit_time(obj(greedy_forged)) is None,
+          "a forged tail after an EXTRA '> ' past the mail span must not become the stamp "
+          "(the greedy .*> read it as '1', dating a 0-second-old claim as ancient); got %r"
+          % (cl._commit_time(obj(greedy_forged)),))
+    greedy_forged_mail = "committer a <a@b> 1793991810 +0000 <c@d> 1 +0000"
+    check(cl._commit_time(obj(greedy_forged_mail)) is None,
+          "a later '<c@d>' mail-shaped span must not become the stamp either; got %r"
+          % (cl._commit_time(obj(greedy_forged_mail)),))
+    # ...and the CONTROL that the fix must not over-reach: a committer NAME legitimately carrying a
+    # forged-LOOKING token BEFORE the mail span is still measured from the span (git reads the first `<`
+    # and the first `>` after it, so this object is dated `1793991810` by git too).
+    name_with_tail = "committer a > 1 +0000 <a@b> 1793991810 +0000"
+    check(cl._commit_time(obj(name_with_tail)) == 1793991810,
+          "a name carrying '> 1 +0000' BEFORE the mail span still measures the span's stamp; got %r"
+          % (cl._commit_time(obj(name_with_tail)),))
     no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
     check(cl._commit_time(no_blank) == 1700000000,
           "with NO blank line the shell prints the whole object, so the stamp is still found; got %r"

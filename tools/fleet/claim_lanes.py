@@ -687,12 +687,17 @@ def _commit_body(obj: str) -> str:
 # matches any run, and the LENGTH rule is a SEPARATE arm below — which is why a 13+ digit stamp rejects the
 # object instead of being skipped in favour of an earlier line. A bounded quantifier here silently changed
 # WHICH line's value is judged.
-# ⛔ ANCHORED ON `> `, THE IDENT'S END — NOT A BARE `.* ` (review round 22, agent-infra#3203). The greedy
-# `.* ` took the LAST `digits [+-]dddd` pair ANYWHERE on the line rather than the ident's timestamp
-# field, so `committer a <a@b> <NOW> +0000 1 +0000` — a 0-second-old claim — answered `1` here, and the
-# shell's reaper answered the same, deleting a claim `git log --format=%ct` dates as current. The two
-# readers must agree on WHICH field is the stamp, not merely on the line it is on.
-_COMMITTER_TIME_RE = re.compile(r"^committer .*> ([0-9]+) [+-][0-9]{4}$", re.M)
+# ⛔ ANCHORED ON THE MAIL SPAN — THE FIRST `<` THEN THE FIRST `>` — NOT `.*> ` (review round 27,
+# agent-infra#3203). `.*` is GREEDY, so `.*>` binds the LAST `>` on the line, not the ident's end: adding
+# one `> ` in front of the forged tail put round-22's steal straight back. Measured on the round-22
+# pattern, `committer a <a@b> <NOW> +0000 > 1 +0000` (and the `<c@d>` variant) answered `1` here while
+# `git log --format=%ct` dates the object at NOW, so the shell's reaper deleted a 0-second-old claim.
+# `[^<]*<[^>]*>` is `ident.c::split_ident_line`'s span verbatim (first `<`, first `>` after it) — the
+# same split git dates the object from — so a name legitimately carrying `> 1 +0000` still measures and
+# a forged tail after the span does not match at all. The two readers must agree on WHICH field is the
+# stamp, not merely on the line it is on — and both are pinned against the same two shapes (the shell
+# side is `test-claims.sh` A88-A90).
+_COMMITTER_TIME_RE = re.compile(r"^committer [^<]*<[^>]*> ([0-9]+) [+-][0-9]{4}$", re.M)
 
 
 def _commit_time(obj: str) -> Optional[int]:
