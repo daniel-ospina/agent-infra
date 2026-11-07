@@ -98,11 +98,12 @@
 #                           rejections and the age floor) still runs for the whole population, so an
 #                           over-budget pass classifies what it saw and preserves the rest — it never
 #                           spends the budget on trees the age floor rejects anyway.
-#   REAP_AW_GITLESS_MAX     OPT-IN count ceiling for the gitless arm (default: UNSET = none), applied
-#                           PER ROOT — the counter is reset inside each `sweep_root`, and `ROOTS` is
-#                           colon-separated, so a two-root pass permits two ceilings. A count is a stale
-#                           proxy for the cost the time bound already measures; set this only when a
-#                           hard ceiling is wanted for its own sake.
+#   REAP_AW_GITLESS_MAX     the gitless arm's count ceiling (default 10), applied PER ROOT — the
+#                           counter is reset inside each `sweep_root`, and `ROOTS` is colon-separated,
+#                           so a two-root pass permits two ceilings — and charged PER AGED CANDIDATE:
+#                           the unit is taken only after the age floor accepts a tree, so a tree the
+#                           floor preserves costs no slot (#3278 P1). Raising or removing the ceiling
+#                           is #3278's P3, an OWNER decision, and is deliberately NOT done here.
 #   REAP_AW_PROC_ROOT       the process table root (default /proc; a test seam — pointing it at a
 #                           missing dir makes the census UNREADABLE, which must skip the sweep)
 #   REAP_AW_LIVE_PATHS      the census library (default: lib/live-paths.sh beside this script, then
@@ -136,28 +137,27 @@ INCLUDE_GITLESS=0
 # never candidates. `/tmp/actions-runner` is the CI runner install on every cell — removing it
 # breaks every job on the box, which is a worse outcome than the space it holds.
 GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
-# ⛔ THE CLASS IS BOUNDED BY **ELAPSED TIME**, NOT BY A CANDIDATE COUNT (`REAP_AW_BUDGET_SECONDS`,
-# default 300; the entry point's `DISK_REAPER_CLASS_TIMEOUT=1800` stays the outer bound).
+# ⛔ THE CLASS IS BOUNDED BY **ELAPSED TIME** (`REAP_AW_BUDGET_SECONDS`, default 300; the entry point's
+# `DISK_REAPER_CLASS_TIMEOUT=1800` stays the outer bound) **AND** by the operator's ceiling on how many
+# AGED trees one root may classify per pass (`REAP_AW_GITLESS_MAX`, default 10).
 #
-# WHY THE COUNT CAP WAS REMOVED AS A DEFAULT (#3278). The cap was a throughput throttle sized for a
-# standing population of **26 candidates**; the box it runs on now holds **thousands**, so the same
-# 10 deleted per pass went from "clears in an afternoon" to a permanent starvation — a dry run over
-# 3,314 top-level entries classified 10 and printed `gitless-cap` for **3,137** of them. And because
-# the cap unit was spent BEFORE the age floor was consulted, ~89 % of those ten slots went to trees
-# the age test would have preserved anyway.
+# WHY THE CEILING'S UNIT MOVED — AND WHY THE CEILING ITSELF DID NOT (#3278 P1). The count was a
+# throughput throttle sized for a standing population of **26 candidates**; the box it runs on now
+# holds **thousands**. The damage was not the number, it was WHERE the unit was charged: BEFORE the age
+# floor was consulted, so ~89 % of those ten slots went to trees the age test would have preserved
+# anyway — a dry run over 3,314 top-level entries classified 10 and printed `gitless-cap` for **3,137**
+# of them, and the aged population was never reachable at all. Charging the unit after the age floor (and
+# before the census) hands the same ceiling to the population it was calibrated against, which is the
+# ~10× throughput lever with **no policy change**.
 #
-# A count is the wrong dial for this, not merely a badly tuned one. `systemd-tmpfiles` — the
-# reference implementation of temp-dir reaping — has **no count bound anywhere in its model**: a file
-# is deleted when it is older than the age field, exclusions are pattern-based (`x`/`X` lines), and a
-# pass is bounded by **when it runs next**, never by how many entries it may consider (`tmpfiles.d(5)`,
-# "Age"). The safety dials live in the eligibility rules; a throughput budget must be measured in the
-# resource that actually costs (wall clock), because a count is a stale proxy for it — the same 10
-# trees are seconds on one box and 25 minutes on another.
-#
-# ⛔ `REAP_AW_GITLESS_MAX` SURVIVES AS AN **OPT-IN OVERRIDE** — an operator who wants a hard ceiling
-# still gets one. **UNSET IS THE DEFAULT AND MEANS "NO COUNT BOUND"**: absence must never silently
-# re-impose the starvation, so the comparison is skipped entirely when the seam is empty.
-GITLESS_MAX="${REAP_AW_GITLESS_MAX:-}"
+# ⛔ RAISING OR REMOVING THE CEILING IS #3278's **P3** — AN OWNER DECISION — AND IS NOT TAKEN HERE. P3
+# reserves that axis in the issue's plan comment (`issues/comments/6698790753`) verbatim: "This is
+# destructive against trees a `rm -rf` cannot recover … so it is the owner's call, and it should land
+# after P1 and P2." P2 (`scripts/scratch-dir.sh`) has not landed, so the default stays 10: this change
+# removes the STARVATION, not the ceiling. An operator who wants a different ceiling for one pass sets
+# the seam; the time bound below is what makes any ceiling cheap to honour, because the loop no longer
+# buys a full census for every tree it is about to preserve.
+GITLESS_MAX="${REAP_AW_GITLESS_MAX:-10}"
 ROOTS="${REAP_AW_ROOTS:-/tmp}"
 # ⛔ THE CELL HOME THE `home-or-state` GUARD PROTECTS EVEN WHEN NOTHING EXPORTS `CELL_HOME`.
 # MEASURED (#3278, 2026-11-06, owner, on a cell): the unit renders `Environment=HOME=/home/cmux`, which
@@ -220,19 +220,19 @@ done
 num "$AGED_MINUTES" || die "REAP_AW_AGED_MINUTES must be a number (got '$AGED_MINUTES')"
 case "$DIRTY_MODE" in keep|reap) ;; *) die "REAP_AW_DIRTY must be keep|reap (got '$DIRTY_MODE')" ;; esac
 num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a number"
-# ⛔ AN OPERATOR-SET CEILING IS VALIDATED; AN UNSET ONE IS THE DEFAULT (no count bound). A typo must
-# not silently become "unbounded" — that is the same fail-open the empty-seam default would be if it
-# were spelled `:-0`.
-if [ -n "$GITLESS_MAX" ]; then num "$GITLESS_MAX" || die "REAP_AW_GITLESS_MAX must be a number (got '$GITLESS_MAX'); unset it for no count bound"; fi
+# ⛔ THE CEILING IS VALIDATED, NEVER COERCED. A typo must not silently become "no count bound" (the
+# fail-open the pre-#3278 `:-0` spelling would have been) and must not silently become "cap reached"
+# for every tree either — `num` refuses both.
+if [ -n "$GITLESS_MAX" ]; then num "$GITLESS_MAX" || die "REAP_AW_GITLESS_MAX must be a number (got '$GITLESS_MAX')"; fi
 num "$LOCK_STALE_SECONDS" || die "REAP_AW_LOCK_STALE_SECONDS must be a number"
 
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'roots=%s\n' "$ROOTS"
     printf 'aged_minutes=%s\n' "$AGED_MINUTES"
     printf 'dirty=%s\n' "$DIRTY_MODE"
-    # The EFFECTIVE bounds, so the caller can record what the pass was allowed to do. `gitless_max=none`
-    # is the default and is printed as such: an operator reading a pass record must be able to tell
-    # "no count ceiling" from "a ceiling nobody set".
+    # The EFFECTIVE bounds, so the caller can record what the pass was allowed to do: the time bound,
+    # the count ceiling (per root, charged per AGED candidate — 10 by default), and the cell home the
+    # guard compares against.
     printf 'budget_seconds=%s\n' "$BUDGET"
     printf 'gitless_max=%s\n' "${GITLESS_MAX:-none}"
     # The cell home the guard will protect even with `CELL_HOME` unset (the unit's shape). Reported
@@ -722,11 +722,14 @@ sweep_root() { # <root>
                 KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
                 continue
             fi
-            # the OPT-IN count ceiling (`REAP_AW_GITLESS_MAX`). SKIPPED ENTIRELY WHEN UNSET — an empty
-            # seam means "no count bound"; comparing against an empty string would be a bash error, and
-            # the looser read (`-ge` on a non-number) must never become "cap reached" for every tree.
+            # ⛔ THE COUNT CEILING (`REAP_AW_GITLESS_MAX`, default 10) — CHARGED HERE, AFTER THE AGE
+            # FLOOR AND BEFORE THE CENSUS, and that position is the fix: a young tree costs no slot, so
+            # the ceiling is spent on trees that can actually be removed. The `-n` guard is defensive
+            # (the `:-10` default guarantees a value): comparing against an empty string would be a
+            # bash error, and the looser read (`-ge` on a non-number) must never become "cap reached".
+            # Raising or removing the ceiling is #3278's P3 — an OWNER decision — not this change.
             if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root operator ceiling, not a default)"; continue
+                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root ceiling, default 10, and it counts AGED candidates only)"; continue
             fi
         fi
         # ⛔ THE TIME BOUND IS THE REAL GUARD, FOR BOTH ARMS, AND IT SITS BEFORE THE EXPENSIVE WORK.
