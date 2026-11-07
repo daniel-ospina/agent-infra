@@ -2527,6 +2527,70 @@ def test_a_land_backlog_refusal_VOIDS_the_row(tmp_path, monkeypatch):
     assert pr.gate_refused("prd-9", 74) is False
 
 
+def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
+    """Exit 81 is a gate refusal, not a launch (agent-infra#2387).
+
+    Same accounting failure as the 74 arm above, and on a box at its memory floor it is not a rare
+    one: EVERY pr-doctor spawn is refused, so an unrecognised code records a "launched" row on every
+    pass -- a 45-min cooldown and a 90-min budget slot each time, for a worker that never started.
+    Both halves again: the code must be in GATE_REFUSALS and the marker must be the gate's own line.
+    ⛔ 81, NOT 73: the memory pair was renumbered when this branch met main, because 73 is
+    `AGENT_FORK_REFUSED` there and 72 is `REPO_TARGET_REFUSED` -- so this test pins the number the
+    gate actually returns, not the one the first draft chose.
+    """
+    assert 81 in pr.GATE_REFUSALS
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-9.rc").write_text("81\n")
+    (d / "bg" / "prd-9.log").write_text(
+        "[mem-gate] REFUSED bg prd-9: LOW MemAvailable=653M < mem_min_avail_mb=2048M "
+        "(= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2) -- no agent was started\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-9", 81) is True
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == ["9"]
+    # The cooldown-KEEPING direction: an agent that exits 81 itself is not a gate refusal.
+    (d / "bg" / "prd-9.log").write_text(
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=81\n")
+    assert pr.gate_refused("prd-9", 81) is False
+
+
+def test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too(tmp_path, monkeypatch):
+    """The other two codes that arrived after GATE_REFUSALS did (agent-infra#2293, #2935).
+
+    ⛔ A CODE WITHOUT ITS MARKER IS INERT, and that is the shape this file keeps producing: the
+    predicate demands BOTH, so a code added to the tuple without the marker leaves the row booked
+    `launched` -- the accounting failure the 74/81 arms exist to prevent, one gate over. Asserted as
+    a loop over both pairs so a third one cannot be added half-way either.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    for code, marker in ((73, "[fork-gate] REFUSED"),
+                         (71, "[capability-gate] REFUSED")):
+        # ⛔ A FRESH ROW PER ITERATION: `void_refused_rows` DELETES the key it voids, so reusing one
+        # dict made the second pair assert `[] == ["9"]` — a vacuous failure that reported the
+        # capability gate as inert when the arm had already consumed the row itself.
+        st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                    "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+        assert code in pr.GATE_REFUSALS, code
+        assert marker in pr.REFUSAL_MARKERS, marker
+        (d / "bg" / "prd-9.rc").write_text("%d\n" % code)
+        (d / "bg" / "prd-9.log").write_text(
+            "%s bg prd-9: no agent was started, nothing was consumed\n" % marker)
+        assert pr.gate_refused("prd-9", code) is True, (code, marker)
+        assert pr.void_refused_rows(st) == ["9"], (code, marker)
+        # …and the cooldown-KEEPING direction for each: a `pi` that exits it itself is not a refusal.
+        (d / "bg" / "prd-9.log").write_text(
+            "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=%d\n" % code)
+        assert pr.gate_refused("prd-9", code) is False, code
+
+
+# ⛔ KEPT FROM main BY THE FORWARD MERGE (#2591 × #3161): main landed its own capability arm while this
+# branch carried the fork+capability pair above. The two overlap on `71` and do not contradict — this
+# one pins the AXIS and the per-axis token, the pair above pins that code and marker must arrive
+# together. Dropping either would lose a distinct pin, so both stay.
 def test_a_capability_refusal_is_the_gates_own_class_and_never_waits(tmp_path, monkeypatch):
     """Exit 71 is the FIFTH gate refusal, and it was the one missing (#3161 round-6 review, P2).
 
@@ -2541,7 +2605,7 @@ def test_a_capability_refusal_is_the_gates_own_class_and_never_waits(tmp_path, m
     ⛔ AND THE REMEDY MUST NOT BE "wait" (#2291's own lesson, restated per axis). `GATE_NEXT_TOKEN` is
     read with `.get(ax, "wait")` at the verdict line, so an axis with no token would default to the
     one remedy that is provably useless here. Both halves are asserted: the code must be recognised,
-    the marker must be the gate's own line, and the token must be neither `wait` nor `repair-chain`.
+    the marker must be the gate's own line, and the token must not be `wait`.
     """
     assert 71 in pr.GATE_REFUSALS
     assert pr.GATE_REFUSAL_BOUND[71] == "capability"
@@ -2560,6 +2624,72 @@ def test_a_capability_refusal_is_the_gates_own_class_and_never_waits(tmp_path, m
     (d / "bg" / "prd-5.log").write_text(
         "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=71\n")
     assert pr.gate_refused("prd-5", 71) is False
+
+
+def test_a_MEMORY_refusal_VOIDS_the_row(tmp_path, monkeypatch):
+    """Exit 81 is a gate refusal, not a launch (agent-infra#2387).
+
+    Same accounting failure as the 74 arm above, and on a box at its memory floor it is not a rare
+    one: EVERY pr-doctor spawn is refused, so an unrecognised 81 records a "launched" row on every
+    pass -- a 45-min cooldown and a 90-min budget slot each time, for a worker that never started.
+    Both halves again: the code must be in GATE_REFUSALS and the marker must be the gate's own line.
+
+    ⛔ 81, NOT 73: the memory pair was renumbered when this branch met main, because 73 is
+    `AGENT_FORK_REFUSED` there and 72 is `REPO_TARGET_REFUSED` -- so this test pins the number the
+    gate actually returns, not the one the first draft chose (main's `spawn-gate.sh` comment records
+    the reservation: "81 was claimed FIRST by AGENT_MEM_REFUSED (#2387)").
+    """
+    assert 81 in pr.GATE_REFUSALS
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    (d / "bg" / "prd-9.rc").write_text("81\n")
+    (d / "bg" / "prd-9.log").write_text(
+        "[mem-gate] REFUSED bg prd-9: LOW MemAvailable=653M < mem_min_avail_mb=2048M "
+        "(= mem_lane_reserve_mb=1024M x mem_spawn_reserve_lanes=2) -- no agent was started\n")
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    assert pr.gate_refused("prd-9", 81) is True
+    st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+    assert pr.void_refused_rows(st) == ["9"]
+    # The cooldown-KEEPING direction: an agent that exits 81 itself is not a gate refusal.
+    (d / "bg" / "prd-9.log").write_text(
+        "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=81\n")
+    assert pr.gate_refused("prd-9", 81) is False
+    # …and the axis resolves to its OWN remedy, never the load one.
+    assert pr.refusal_axis(81) == "memory"
+    assert pr.GATE_NEXT_TOKEN["memory"] != "wait"
+
+
+
+def test_a_FORK_and_a_CAPABILITY_refusal_VOID_the_row_too(tmp_path, monkeypatch):
+    """The other two codes that arrived after GATE_REFUSALS did (agent-infra#2293, #2935).
+
+    ⛔ A CODE WITHOUT ITS MARKER IS INERT, and that is the shape this file keeps producing: the
+    predicate demands BOTH, so a code added to the tuple without the marker leaves the row booked
+    `launched` -- the accounting failure the 74/81 arms exist to prevent, one gate over. Asserted as
+    a loop over both pairs so a third one cannot be added half-way either.
+    """
+    d = tmp_path / "orch"
+    (d / "bg").mkdir(parents=True)
+    monkeypatch.setattr(pr, "ORCH_DIR", str(d))
+    for code, marker in ((73, "[fork-gate] REFUSED"),
+                         (71, "[capability-gate] REFUSED")):
+        # ⛔ A FRESH ROW PER ITERATION: `void_refused_rows` DELETES the key it voids, so reusing one
+        # dict made the second pair assert `[] == ["9"]` — a vacuous failure that reported the
+        # capability gate as inert when the arm had already consumed the row itself.
+        st = {"9": {"action": "failing", "worker": "prd-9", "kind": "spawn", "head": "a" * 40,
+                    "at": "2026-01-01T00:00:00Z", "at_epoch": 0}}
+        assert code in pr.GATE_REFUSALS, code
+        assert marker in pr.REFUSAL_MARKERS, marker
+        (d / "bg" / "prd-9.rc").write_text("%d\n" % code)
+        (d / "bg" / "prd-9.log").write_text(
+            "%s bg prd-9: no agent was started, nothing was consumed\n" % marker)
+        assert pr.gate_refused("prd-9", code) is True, (code, marker)
+        assert pr.void_refused_rows(st) == ["9"], (code, marker)
+        # …and the cooldown-KEEPING direction for each: a `pi` that exits it itself is not a refusal.
+        (d / "bg" / "prd-9.log").write_text(
+            "[timeout] agent pid=42 wall_limit=2400s elapsed=9s rc=%d\n" % code)
+        assert pr.gate_refused("prd-9", code) is False, code
 
 
 def test_the_refusal_markers_are_the_gates_own_lines():
@@ -2780,11 +2910,18 @@ def test_the_agent_ran_marker_is_still_written_after_the_wait():
     assert launch_ln, "spawn-gate.sh no longer launches the agent with `pi -p`"
     launch = min(launch_ln)
     # the `if [ "$rc" = "$PI_GATE_REFUSED" ]` branch: from its guard line to the marker line
+    # ⛔ INCLUDING THE MEMORY GUARD (#2387): the shim has its own refusal branch (`PI_GATE_MEM_REFUSED`,
+    # written after `pi` was launched because the shim IS the `pi`), and `[mem-gate] REFUSED` is echoed
+    # there. Testing only the load guard would force that marker to be treated as evidence of a run.
     gate_branch = [i for i, l in enumerate(lines, 1) if "PI_GATE_REFUSED" in l
                    and l.lstrip().startswith("if ")]
     assert gate_branch, ("spawn-gate.sh no longer has a `PI_GATE_REFUSED` branch -- a spawn-point "
                         "refusal would now read as a real run")
-    guard = min(gate_branch)
+    mem_branch = [i for i, l in enumerate(lines, 1) if "PI_GATE_MEM_REFUSED" in l
+                  and l.lstrip().startswith("if ")]
+    assert mem_branch, ("spawn-gate.sh no longer has a `PI_GATE_MEM_REFUSED` branch -- a memory "
+                        "refusal would now read as a real run")
+    guard = min(gate_branch + mem_branch)
     for marker in pr.REFUSAL_MARKERS:
         sites = [i for i, l in enumerate(lines, 1) if marker in l and l.lstrip().startswith("echo")]
         assert sites, ("%r is no longer echoed by spawn-gate.sh -- gate_refused() would read every "
@@ -3529,13 +3666,7 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     exported = dict(re.findall(r"^(AGENT_[A-Z_]+)=(\d+)$", gate, re.M))
     for const, code in (("AGENT_FORK_REFUSED", 73), ("AGENT_LAND_BACKLOG", 74),
                         ("AGENT_LOAD_REFUSED", 75), ("AGENT_DISK_REFUSED", 77),
-                        # ⛔ AND THE CAPABILITY GATE (#3161 round-6 review, P2): `run_agent`
-                        # returns this code and writes "[capability-gate] REFUSED … no agent was
-                        # started", so it is the SAME class as the four above and was the one
-                        # missing -- measured, it fell through to `EXIT 3 / UNDELIVERED /
-                        # next=repair-chain` for a box its own probe had proved cannot complete a
-                        # call. Pinned here so neither side can renumber or drop it again.
-                        ("AGENT_CAPABILITY_REFUSED", 71)):
+                        ("AGENT_CAPABILITY_REFUSED", 71), ("AGENT_MEM_REFUSED", 81)):
         assert exported.get(const) == str(code), (
             "spawn-gate.sh no longer exports %s=%d -- GATE_REFUSAL_BOUND is stale" % (const, code))
         assert pr.GATE_REFUSAL_BOUND[code], "the gate declares %d and this file does not" % code
@@ -3548,9 +3679,14 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     # operator to "land/fix the open PRs -- this box is healthy", and a land-backlog hold would
     # tell them to restart a healthy box. Derived from the gate's own CONSTANT NAMES, so a
     # renumbering or a rename on either side reddens here.
+    # ⛔ THE LATE ARRIVALS ARE IN THE TABLE TOO (review of #2591, P2). `71: capability` and
+    # `81: memory` are new rows this change adds, and leaving them out reintroduced the very defect
+    # this block was written for on the new rows: a swap of `71 <-> 81` kept every assertion above
+    # green (same keys, both values truthy, same value SET) while an operator with a box at its
+    # MEMORY floor would be told to repair the box and one with a broken box to wait for lanes.
     want = {"AGENT_FORK_REFUSED": "fork", "AGENT_LAND_BACKLOG": "land-backlog",
             "AGENT_LOAD_REFUSED": "load", "AGENT_DISK_REFUSED": "disk",
-            "AGENT_CAPABILITY_REFUSED": "capability"}
+            "AGENT_CAPABILITY_REFUSED": "capability", "AGENT_MEM_REFUSED": "memory"}
     for const, axis in want.items():
         code = int(exported[const])
         assert pr.GATE_REFUSAL_BOUND[code] == axis, (
@@ -3566,6 +3702,23 @@ def test_the_capacity_seams_are_the_gates_own_numbers():
     # reader has to re-derive, which is the property #2710 exists to enforce.
     assert set(pr.GATE_REFUSAL_BOUND.values()) == set(pr.GATE_NEXT_ACTION), (
         pr.GATE_REFUSAL_BOUND, sorted(pr.GATE_NEXT_ACTION))
+    # ⛔ EVERY AXIS NEEDS ITS OWN TOKEN, and until this loop nothing pinned that (fresh review of the
+    # forward merge, P2 — measured). The two 71 arms are redundant with each other, so the invariant
+    # that actually protects the verdict line was unguarded: deleting `"memory": "finish-lanes"`
+    # redded ZERO tests, and the memory axis then fell to `GATE_NEXT_TOKEN.get(ax, "wait")` — the one
+    # remedy this file says is provably wrong for it, since waiting for LOAD does not clear a memory
+    # floor. Derived from the table rather than listed, so a seventh code cannot arrive untokened.
+    # ⛔ `wait` is LOAD's token and load's alone: every other axis refuses for a cause waiting cannot
+    # clear, which is the whole reason each one carries a code. Presence is the pinned property —
+    # an axis absent from the dict gets `"wait"` from the `.get(ax, "wait")` default at the verdict
+    # line, so absence IS the bug, and asserting `!= "wait"` for load would red a correct table.
+    for axis in sorted(set(pr.GATE_REFUSAL_BOUND.values())):
+        assert axis in pr.GATE_NEXT_TOKEN, (
+            "refusal axis %r has no GATE_NEXT_TOKEN entry -- the verdict line would fall back to "
+            "next=wait, which clears only the load refusal" % (axis,))
+        assert (pr.GATE_NEXT_TOKEN[axis] == "wait") == (axis == "load"), (
+            "only the load refusal may be answered with 'wait'; %r answers %r"
+            % (axis, pr.GATE_NEXT_TOKEN[axis]))
 
 
 def test_box_room_reports_capacity_sh_verbatim_and_decides_nothing(tmp_path, monkeypatch):
@@ -5156,24 +5309,29 @@ def test_the_cascade_no_slot_arm_names_the_BINDING_constraint(monkeypatch):
     # (d) THE GENUINELY SATURATED FLEET: shipped caps, EVERY slot held (review P2, round 8). This is
     #     the population round 7's comment described and whose fixture was never built -- so the
     #     opposite word ("spent") had no test either, and a revert to a blanket sentence stayed green.
+    #     ⛔ THE FIXTURE FOLLOWS THE SHIPPED CAPS INSTEAD OF REPEATING THEM (agent-infra#3441). It used
+    #     to hold a literal 3 + 4 rows and assert "4 of 4 slots", which silently pinned MAX_REVIEW to
+    #     4: raising the shipped default to 10 turned the "genuinely saturated" fixture into a
+    #     half-empty one and this arm failed for a reason that had nothing to do with its claim. It is
+    #     driven from the module's own defaults now, so it tracks them wherever they move.
     for _k in ("MAX_FIX", "MAX_REVIEW"):
         monkeypatch.delenv(_k, raising=False)
     _now = pr.now()
     _busy = {}
-    for _i in range(3):
+    for _i in range(pr.DEFAULT_MAX_FIX):
         _busy[str(900 + _i)] = {"action": "fix-ci", "head": "b" * 40,
                                 "at_epoch": _now, "worker": "w%d" % _i}
-    for _i in range(4):
-        _busy[str(910 + _i)] = {"action": "record-review", "head": "b" * 40,
-                                "at_epoch": _now, "worker": "r%d" % _i}
+    for _i in range(pr.DEFAULT_MAX_REVIEW):
+        _busy[str(9100 + _i)] = {"action": "record-review", "head": "b" * 40,
+                                 "at_epoch": _now, "worker": "r%d" % _i}
     _rc, joined, _payload = _drive_pass(
         monkeypatch, [_pr(70)], ("record-review", "why", []), state=_busy)
     casc = [ln for ln in joined.splitlines() if ln.startswith("cascade: ")]
     assert len(casc) == 1, joined
     assert "review->NO SLOT" in casc[0], casc[0]
     assert "no class budget available" in casc[0], casc[0]
-    assert "4 of 4 slots in use" in casc[0], casc[0]
-    assert "3 of 3 slots in use" in casc[0], casc[0]
+    assert ("%d of %d slots in use" % (pr.DEFAULT_MAX_REVIEW, pr.DEFAULT_MAX_REVIEW)) in casc[0], casc[0]
+    assert ("%d of %d slots in use" % (pr.DEFAULT_MAX_FIX, pr.DEFAULT_MAX_FIX)) in casc[0], casc[0]
     assert "the cap is 0" not in casc[0], casc[0]
     assert "aggregate ceiling" not in casc[0], casc[0]
 

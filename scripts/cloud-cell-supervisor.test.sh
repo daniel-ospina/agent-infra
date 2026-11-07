@@ -260,6 +260,23 @@ stub_missing() { # <bin dir> <tool>…
 
 # A temp HOME and a state dir per case, so no case can see another's O.
 mkdir -p "$T/home"
+# ── seed_provider_store <home> — make a FIXTURE home look like a PROVISIONED CELL (agent-infra#2024) ──
+# `check` now refuses a box whose provider CREDENTIAL STORE (`<home>/.pi/agent/auth.json`) holds no
+# credential for the lane provider and whose keys.env carries none to repair it from — because such a
+# box cannot answer a prompt, and pi exits in ~8 s with `No API key found`, which a launch verifier
+# reads as "ran". Every fixture below is meant to be a cell that PASSES some other gate, so a
+# fixture without a provider credential is not "a cell with one fewer concern": it is a cell that
+# would be refused before reaching the gate under test. Seeding the store is what keeps each arm's
+# assertion attributable to its own subject — the same reason the fixtures seed `gh`, `pi`, the
+# record step and $O's workers instead of letting an unrelated precondition decide the arm.
+# (The store-gate ARMS themselves point at homes where they deliberately leave the store empty.)
+seed_provider_store() {
+  local home="${1%/}"
+  mkdir -p "$home/.pi/agent" 2>/dev/null || return 1
+  printf '{"deepseek":{"type":"api_key","key":"sk_fixture_only"}}\n' > "$home/.pi/agent/auth.json"
+  chmod 600 "$home/.pi/agent/auth.json" 2>/dev/null
+}
+seed_provider_store "$T/home"
 # Each case starts with NO doctor session for this suite's pinned name: a session left by an earlier
 # case is indistinguishable by name from this one's (machine-scoped names), and the supervisor now
 # refuses to bless a doctor session it cannot prove is its own (#1989) — so the leftover must be
@@ -703,6 +720,10 @@ fi
 # to be discovered as silence. These cases drive the SHIPPED supervisor against a stub probe.
 say_case "the check gate refuses a repo that cannot provision dispatch (#1736)"
 F="$T/cellcheck"; mkdir -p "$F/home" "$F/o" "$F/bin"
+# A PROVISIONED CELL, which is what every arm below claims to be testing: `check` refuses a box
+# with no usable stored credential and nothing in keys.env, so an unseeded fixture would decide
+# each arm with that refusal instead of its own subject (the store-gate ARMS unseed it again).
+seed_provider_store "$F/home"
 ai_init_repo "$F/repo"
 ai_worktree "$F/harness"
 # Mirror the shipped required-worker set (`cloud-cell-supervisor.sh` cmd_check): claims.sh is a
@@ -775,6 +796,179 @@ case "$CC_OUT" in
   *) bad "check: did not reach the banner on a healthy repo — output: $CC_OUT" ;;
 esac
 
+# ── the provider CREDENTIAL STORE (agent-infra#2024) ───────────────────────────────────────────
+# MEASURED 2026-11-05 on all five cells: `~/.pi/agent/auth.json` was `{}` (2 bytes). pi consults the
+# STORE before the environment, so a box with no stored credential and no `keys.env` key exits in ~8 s
+# with `No API key found for deepseek` — a ~300-byte log and no process, which a launch verifier reads
+# as "ran" (seven lanes on one box were all recorded as launched and all dead, while the controller
+# reported RUNNING). `check` is the last gate before `start`, so a green banner over such a box is the
+# false PASS this file refuses everywhere else. The predicate is EXACTLY "empty AND nothing in
+# keys.env can repair it": a key `$ENV_FILE` carries IS delivered (a lane sources that file itself),
+# so refusing that case would be a false block — it is REPORTED instead, naming the bring-up that
+# makes it durable.
+say_case "check refuses a box that cannot answer a prompt (empty provider store, agent-infra#2024)"
+AUTH="$F/home/.pi/agent/auth.json"
+# (a) The seeded fixture store: a POSITIVE assertion, so the arms below cannot be satisfied by an
+# absence (the idiom this suite already uses: never two absences).
+cellcheck 0
+case "$CC_OUT" in
+  *"the provider store holds a usable 'deepseek' credential"*) ok "check: reads the store and names the credential it found" ;;
+  *) bad "check: never reported the provider store it is supposed to read — output: $CC_OUT" ;;
+esac
+# (b) Empty store, but `keys.env` carries the key: delivered, so the box CAN answer — a WARN, not a
+# refusal (and never silence).
+rm -f "$AUTH"
+printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check PASSES an empty store when \$ENV_FILE carries the key (a lane sources it — no false block)" \
+                   || bad "check FALSE-BLOCKED a cell whose keys.env delivers the provider key (rc=$CC_RC): $CC_OUT"
+case "$CC_OUT" in
+  *"the key comes from"*"keys.env"*) ok "…and says so, naming \$ENV_FILE as the source" ;;
+  *) bad "the env-delivered credential is not stated — an operator cannot tell the two states apart: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) ok "…and still reaches the banner (the box really can answer)" ;;
+  *) bad "an empty-but-repairable store lost the verdict — output: $CC_OUT" ;;
+esac
+# (c) Empty store AND no key in `keys.env`: the box cannot answer, so `check` must REFUSE — and the
+# refusal must name the STORE, not send the operator after the provider.
+rm -f "$AUTH"; : > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a box with no store credential and no keys.env key (rc=$CC_RC)" \
+                   || bad "check certified a box whose lanes would die at pi startup (agent-infra#2024)"
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner over a box that cannot authenticate" ;;
+  *) ok "…and never prints the CELL CAN RUN banner" ;;
+esac
+case "$CC_OUT" in
+  *"CANNOT ANSWER A PROMPT"*"credential store"*) ok "…naming the stored credential as the missing half" ;;
+  *) bad "the refusal does not name the credential store — an operator would chase the provider: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"keys.env"*"repair"*) ok "…and the repair it names is the bring-up materialising the store from keys.env" ;;
+  *) bad "the refusal prescribes no repair, or the wrong one: $CC_OUT" ;;
+esac
+# (d) An UNREADABLE store is CANNOT-VERIFY, and cannot-verify is never a pass here either.
+printf 'not json at all\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a store it cannot read (cannot-verify is not a pass)" \
+                   || bad "check accepted a cell whose credential store it could not read"
+case "$CC_OUT" in
+  *"not a JSON object a lane can parse"*) ok "…and says why, in the terms a LANE experiences it" ;;
+  *) bad "the unreadable-store refusal is not explained: $CC_OUT" ;;
+esac
+# (e) A KEY pi CANNOT READ (`key: 123` makes a lane's `read()` THROW) is not a credential — but it is
+# REPAIRABLE, so with nothing delivered the refusal is the "no usable credential" one, and the box is
+# told to run the bring-up (which rewrites that key field). It must never be read as "present".
+printf '{"deepseek":{"type":"api_key","key":123}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a store entry a lane cannot read (key is not a string)" \
+                   || bad "check counted an unreadable key as a usable credential — a lane throws on that file"
+case "$CC_OUT" in
+  *"has no usable 'deepseek' credential"*) ok "…as \"no usable credential\", not as an unreadable file" ;;
+  *) bad "the refusal does not classify the entry correctly: $CC_OUT" ;;
+esac
+# …and the CLI-invalid entry is ALSO reported: a POSITIVE control for the warn path, which the
+# "an empty store draws NO report" arm below cannot supply (an absence assertion is satisfied by a
+# warning that was deleted outright — the same trap this suite names elsewhere).
+case "$CC_OUT" in
+  *"the pi CLI would reject"*deepseek*) ok "…and the CLI-invalid entry IS reported (a lane is unaffected; 'pi auth' is not)" ;;
+  *) bad "an entry the pi CLI rejects is SILENT in 'check' — the warn path is dead: $CC_OUT" ;;
+esac
+# (e2) …and with the key DELIVERED it is not a refusal at all: the bring-up rewrites that one field.
+printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "…and passes when keys.env delivers the key (the bring-up repairs the field)" \
+                   || bad "check false-blocked a repairable entry on a box whose keys.env carries the key: $CC_OUT"
+rm -f "$F/keys.env"
+# (f) An OAUTH entry WITH an access token is a real credential pi can use (`auth-storage` accepts
+# `{type:"oauth", access, refresh, expires}`), so it must PASS — and it must be reported as an entry
+# pi can use, not refused for having no `key` field.
+printf '{"deepseek":{"type":"oauth","access":"acc","refresh":"ref","expires":9999999999}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check PASSES a store holding an oauth credential for the provider (no false block)" \
+                   || bad "check false-blocked a box whose stored credential is oauth (rc=$CC_RC): $CC_OUT"
+case "$CC_OUT" in
+  *"credential"*) ok "…reporting it as a credential pi can use" ;;
+  *) bad "the oauth entry was not reported as a credential: $CC_OUT" ;;
+esac
+# (g) An entry of a type this file does not know is NOT "cannot judge, pass": nothing here may tell an
+# operator a credential resolves when it has not established that. It is refused, naming the entry as
+# one this check will not judge or replace — the distinction matters, because the remedy is to verify
+# BY EXECUTION, not to hand-edit a file nobody understands.
+printf '{"deepseek":{"type":"some_future_scheme","blob":"x"}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES an entry of an unknown type (not 'cannot judge, pass')" \
+                   || bad "check certified a store entry it never judged (rc=$CC_RC): $CC_OUT"
+case "$CC_OUT" in
+  *"will not judge or replace"*) ok "…and says exactly that, naming execution as the way to settle it" ;;
+  *) bad "the unknown-type refusal does not explain itself: $CC_OUT" ;;
+esac
+# (h) A VALID api_key entry with NO key is a sound file that supplies NOTHING (`read()` yields no key,
+# so the provider falls through to the environment a cell lane does not have). It must not be read as
+# a credential — and it must not be a refusal either when `keys.env` can supply the key.
+printf '{"deepseek":{"type":"api_key","env":{"DEEPSEEK_API_KEY":"from-env-map"}}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check refuses a keyless api_key entry when keys.env carries no key (it is not a credential)" \
+                   || bad "check read an api_key entry with no key as a usable credential (pi's read() yields nothing for it)"
+printf 'DEEPSEEK_API_KEY=sk_fixture_only\n' > "$F/keys.env"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "…and passes it when keys.env delivers the key (the bring-up can merge one in)" \
+                   || bad "check false-blocked a keyless entry on a box whose keys.env carries the key (rc=$CC_RC): $CC_OUT"
+rm -f "$F/keys.env"
+# restore the fixture for every arm after this block
+rm -f "$F/keys.env"; seed_provider_store "$F/home"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "the fixture verifies again once its store is restored (the seed is live, not inert)" \
+                   || bad "the restored fixture still refuses — later arms would measure the wrong state: $CC_OUT"
+# (j) THE KEY-QUESTION IS `read()`'s: a `!command` key is EXECUTED by pi (no environment needed), so
+# it is a credential this check cannot judge — and refusing to guess is not a refusal of the box.
+printf '{"deepseek":{"type":"api_key","key":"!printf %s sk-from-op"}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES a '!command' key it cannot judge offline (not 'cannot judge, pass')" \
+                   || bad "check passed a box on the strength of a command key it never ran"
+case "$CC_OUT" in
+  *"will not judge or replace"*) ok "…naming execution as the way to settle it" ;;
+  *) bad "the command-key refusal does not say what to do: $CC_OUT" ;;
+esac
+# …and a literal key with an unusable `env` map IS a credential: pi never consults `env` for a literal.
+printf '{"deepseek":{"type":"api_key","key":"sk-literal","env":null}}\n' > "$AUTH"
+cellcheck 0
+[ "$CC_RC" -eq 0 ] && ok "check PASSES a literal key with env:null (pi ignores env for literals)" \
+                   || bad "check false-blocked a working literal credential over an env field pi ignores"
+seed_provider_store "$F/home"
+
+# (i0) A STORE WITH NO ENTRIES must never be REPORTED as holding CLI-invalid ones — the warn path
+# once read its own first line off by one, so a fresh cell logged "the pi CLI would reject (empty)".
+rm -f "$AUTH"
+cellcheck 0
+case "$CC_OUT" in
+  *"the pi CLI would reject"*) bad "check reported an EMPTY store as holding CLI-invalid entries: $CC_OUT" ;;
+  *) ok "an absent/empty store draws NO CLI-invalid report" ;;
+esac
+
+# (i) A PROVIDER THIS FILE DOES NOT LIST must still be judged. `PI_LANE_PROVIDER=zai` is a real
+# fixture in this repo (key-gate.test.sh), and an earlier "this file does not know the variable, so
+# NOT VERIFIED" path printed the banner over a box with `{}` and an empty keys.env — the #2024 death,
+# re-opened for every provider outside a four-name table. The variable is DERIVED now, and "no
+# credential at all" is a refusal whatever the provider is called.
+rm -f "$AUTH"
+CC_OUT="$(PROBE_RC=0 TORTOISE_REPO= TORTOISE= CELL_HOME="$F/home" ENV_FILE="$F/keys.env" SESSION="ai2024-zai-$$" \
+          PI_LANE_PROVIDER=zai \
+          O="$F/o" REPO="$F/repo" HARNESS="$F/harness" HARNESS_REPO="$AI" HARNESS_FETCH=0 HARNESS_REF="$CC_REF" \
+          PATH="$F/bin:$PATH" bash "$SUP" check 2>&1)"; CC_RC=$?
+[ "$CC_RC" -ne 0 ] && ok "check REFUSES an UNLISTED lane provider with no stored credential and no keys.env key" \
+                   || bad "check certified a box with no credential for PI_LANE_PROVIDER=zai (rc=$CC_RC)"
+case "$CC_OUT" in
+  *"ZAI_API_KEY"*) ok "…naming the DERIVED variable (ZAI_API_KEY), so the remedy is achievable" ;;
+  *) bad "the refusal does not name the derived variable — the operator cannot act on it: $CC_OUT" ;;
+esac
+case "$CC_OUT" in
+  *"CELL CAN RUN A CONTROLLER"*) bad "check printed the CELL CAN RUN banner over a keyless zai box" ;;
+  *) ok "…and never prints the CELL CAN RUN banner for it" ;;
+esac
+seed_provider_store "$F/home"
+
 # ⛔ Issue 3 (#1748 review): the provisioning probe runs in the OPERATOR's shell, but the controller
 # session gets a tmux-server environment plus a re-source of $ENV_FILE — so an ambient-only
 # TORTOISE_REPO makes `check` pass while the refresh it blesses would resolve no checkout, refuse
@@ -819,6 +1013,7 @@ rm -f "$F/repo/tools/collision_preflight.py"
 say_case "harness provenance: reports, records, refuses and mends (agent-infra#1745)"
 
 P="$T/prov"; mkdir -p "$P/home" "$P/o" "$P/bin" "$P/untracked" "$P/lowbin"
+seed_provider_store "$P/home"
 ai_init_repo "$P/repo"
 seed_site "$LINENO"; for f in $SEED_WORKERS; do
   : > "$P/o/$f"; : > "$P/untracked/$f"
@@ -1787,6 +1982,7 @@ esac
 # describe bytes nobody verified (the likeliest trigger is the full disk this change exists for).
 say_case "check refuses when the harness worktree's cleanliness CANNOT be verified (#1745)"
 E="$T/cannotverify"; mkdir -p "$E/home" "$E/o"
+seed_provider_store "$E/home"
 ai_init_repo "$E/repo"
 ai_worktree "$E/h"
 cp "$E/h/scripts/orchestrator-harness"/*.sh "$E/o/"   # seed $O so cmd_check reaches the provenance gate
@@ -1973,6 +2169,7 @@ cellcheck 0
 # refusal that does not say which repo the machine needs is not a provisioning instruction.
 say_case "the queue target IS the checkout's remote (agent-infra#1901)"
 Q="$T/queue"; mkdir -p "$Q/home" "$Q/bin"
+seed_provider_store "$Q/home"
 QH="$Q/harness"
 ai_worktree "$Q/harness"
 seed_site "$LINENO"; for f in $SEED_WORKERS; do : > "$Q/harness/$f"; done
@@ -3316,6 +3513,38 @@ for _dv_alarm in reap-ineffective unmeasured mixed unlisted-new-verdict; do
     *) bad "status: the ALARM delegate verdict '$_dv_alarm' was swallowed — $OUT" ;;
   esac
 done
+# (3e) ⛔ THE TWO NEWER CLASSES' VERDICTS ARE THE OTHER ROUTE TO A SILENT PASS (#3057 review, P1).
+# `verdict_runner_work` / `verdict_duplicate_install` are `partial`/`abstained` on a pass that EXITS 0 by
+# decision (the RECORD is the alarm channel), so the healthy arm (`_drc -eq 0`) is the ONLY arm that can
+# carry them — and a note built with the WRONG SHELL FORM never prints there at all. This arm was
+# MEASURED MISSING: the first version wrote `$(_dr_cls_all)` — a COMMAND SUBSTITUTION of a VARIABLE — so
+# every `status` on a healthy cell emitted `_dr_cls_all: command not found` and an
+# `unmeasurable_runner_work=1` census reached no operator surface, while the alarm arms further down
+# still looked right (they use `${_dr_rw:-?}`, not this note). ⛔ ASSERT THE NOTE, not just the pass line:
+# a case that only matched `disk reaper: last pass` passes with the note absent, which is exactly how
+# this stayed green.
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\nverdict_runner_work=partial\nunmeasurable_runner_work=1\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"disk reaper: last pass"*"⚠️ runner-work=partial unmeasurable=1"*) \
+    ok "status: the HEALTHY line carries a non-ok runner-work verdict AND its unreadable tally" ;;
+  *) bad "status: a partial runner-work census reached no operator surface — $OUT" ;;
+esac
+case "$OUT" in
+  *"command not found"*) bad "status: the class note runs as a COMMAND, so it never prints — $OUT" ;;
+  *) ok "status: the class note is a variable expansion, so stderr stays clean" ;;
+esac
+# …and the benign spelling stays SILENT, so this is not a note painted onto every pass of every cell
+# (the alarm-fatigue arm (3d) pins for the delegate; the same rule applies to the class verdicts).
+printf 'epoch=%s\niso=2026-10-18T17:00:00Z\nmode=apply\nok=1\nrc=0\nclasses=uv,venv,worktree\nfreed_mb=24\nfreed_mb_uv=0\nfreed_mb_venv=0\nfreed_mb_worktree=24\ncandidates_uv=0\nverdict_uv=ok\nverdict_venv=ok\nverdict_worktree=ok\nverdict_runner_work=ok\nunmeasurable_runner_work=0\ndelegate_verdict_worktree=ok\ndetail=ok\n' "$(date +%s)" \
+  >"$DR/home/.pi/agent/state/disk-reaper.status"
+OUT="$(dr_sup)"
+case "$OUT" in
+  *"runner-work="*) bad "status: an ok runner-work verdict still grew a note — $OUT" ;;
+  *"disk reaper: last pass"*) ok "status: an ok runner-work verdict gains no note (the pass line is still there)" ;;
+  *) bad "status: the healthy pass line vanished for an ok runner-work verdict — $OUT" ;;
+esac
 # ⛔ THE PAIRED ASSERTION LIVES ABOVE, IMMEDIATELY AFTER BLOCK (3)'s OWN `OUT`, and it must stay
 # there: blocks (3b)/(3c) each REWRITE `disk-reaper.status` and reassign `OUT`, so an assertion left
 # down here reads (3c)'s healthy record — which never prints `verdict_worktree=` at all — and the
@@ -3490,6 +3719,7 @@ kill -KILL "$INNOCENT" 2>/dev/null || true
 # `$P` (whose pin root already holds other revisions' entries).
 say_case "pin-dir conformance: check refuses a non-pin entry and accepts an 8-hex pin (#1852)"
 Q="$T/pincheck"; mkdir -p "$Q/home/.pi/agent/scripts/lib" "$Q/o" "$Q/bin" "$Q/pin"
+seed_provider_store "$Q/home"
 ai_init_repo "$Q/repo"
 ai_worktree "$Q/harness"
 QH="$Q/harness/scripts/orchestrator-harness"
@@ -4068,6 +4298,7 @@ echo
 # sessions or leftover controller processes decide it.
 say_case "#1989: stop/start fence, verb-path configuration, doctor idempotency"
 W2="$T/wk2"; rm -rf "$W2"; mkdir -p "$W2/bin" "$W2/stub" "$W2/o/state/roles" "$W2/home"
+seed_provider_store "$W2/home"
 ai_init_repo "$W2/repo"
 ai_worktree "$W2/harness"
 # The harness a cell seeds is the worker DIRECTORY: the required set must be at its root (a fixture
@@ -4225,6 +4456,7 @@ rm -f "$W2/o/state/roles/.stop-generation"
 # orphan from `stop`/`status`.
 say_case "start does not spawn a second doctor when the loop SURVIVES without its session (#1989)"
 LA="$W2/loopalive"; rm -rf "$LA"; mkdir -p "$LA/o/state/roles" "$LA/home" "$LA/st" "$LA/h"
+seed_provider_store "$LA/home"
 # ⛔ Its OWN harness, not the section's. `start` refuses when a live `<shell> <harness>/orch-loop.sh` is
 # on the box and is not provably this state dir's, and the section's `$W2/harness` path is shared with
 # every other case here — a leftover fixture controller from an earlier one made THIS case report a

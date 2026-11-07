@@ -111,6 +111,133 @@ export function resolveGhShimDir(): string | null {
 }
 
 /**
+ * The sentinel every entry point of the quota layer carries, in its FIRST 8 KiB (#1988).
+ * `gh-limit.py`'s `is_harness_shim` and the shim's own `_is_harness_layer` both identify a layer
+ * this way, and NOT by the sibling helper — see `isGhLimitLayer`.
+ */
+const GH_LIMIT_MARKER = "harness-gh-shim-marker";
+
+/**
+ * How the QUOTA wrapper names its own delegation to the helper: `exec python3 "$HELPER" --self …`.
+ * Its header states the contract — "`--self` makes the helper skip THIS file while walking PATH`. It
+ * is what separates `gh-limit/gh` from the `gh-rest/gh` adapter, which carries the same marker and
+ * the same sibling helper but never passes `--self` (see `isGhLimitLayer`).
+ */
+const GH_LIMIT_SELF_TOKEN = "--self";
+
+/**
+ * Is `<dir>/gh` THE QUOTA WRAPPER — present, executable, and carrying the layer's own sentinel?
+ *
+ * ⛔ IDENTITY BY SENTINEL, NEVER BY THE SIBLING HELPER. The first draft of this function accepted
+ * "a regular+executable `gh` beside a `../gh-limit.py`", and `gh-limit.py:3296` records that exact
+ * predicate as a MEASURED bypass: "a sibling `../gh-limit.py` was accepted too, which SILENTLY
+ * SKIPPED any other `gh` sitting in such a directory — measured with the tree's own admin-merge
+ * guard (`scripts/gh-shim/gh`) placed beside the helper: `gh pr merge --admin` then reached the
+ * real gh UNGUARDED, i.e. the layer defeated #984's gate." A wrong directory here is worse than a
+ * missing one: it is prepended AHEAD of the guard, so an unrecognised `gh` would run the command
+ * while `ghShimWillEnforce` still reports the guard armed.
+ *
+ * The window is 8 KiB because that is what BOTH existing consumers read. It is also what makes the
+ * chain work: `scripts/gh-shim/gh` keeps its marker at byte 26405 deliberately (outside the
+ * window), so the quota layer resolves the argv guard as its CHILD instead of skipping it — which
+ * is why `gh-limit → gh-shim → real gh` is the correct order rather than a hopeful one.
+ *
+ * ⛔ THE MARKER ALONE IS NOT THE LAYER'S IDENTITY — IT IS THE HARNESS' (#3477 review round 2).
+ * `harness-gh-shim-marker` is carried by EVERY entry point of this family, `gh-rest/gh` included
+ * (bytes 2602 and 5988 — inside the same window), and `gh-rest/gh` also sits beside a
+ * `../gh-limit.py` (`LIMIT_HELPER=…`). A predicate keyed on those two facts alone accepts the REST
+ * adapter as the quota layer — and that is a GUARD BYPASS, because `gh-rest/gh:77` skips harness
+ * layers by a WHOLE-FILE marker grep, so it skips `~/.pi/agent/shims/gh` and execs the real `gh`:
+ * `gh pr merge --admin` would then run unguarded while the extension still reported the #984 layer
+ * armed. The layer's own delegating contract is the discriminator — `gh-limit/gh` execs
+ * `python3 "$HELPER" --self "$SELF_REAL"` (byte 6156, inside the window) and says so in its header
+ * ("`--self` makes the helper skip THIS file while walking PATH"); `gh-rest/gh` contains no
+ * `--self` at all. Require it.
+ *
+ * The sibling helper is still required, as a THIRD condition: the wrapper resolves it as
+ * `$SELF_DIR/../gh-limit.py` and, without it, takes a fail-open arm that runs the plain `gh` while
+ * the box believes the cache is in force. Present-and-genuine is the only state worth prepending.
+ */
+function isGhLimitLayer(dir: string): boolean {
+  try {
+    const p = resolvePath(dir, "gh");
+    // A regular file, because the shell only runs a regular file (same rule as `isExecutableShim`).
+    if (!fs.statSync(p).isFile()) return false;
+    fs.accessSync(p, fs.constants.X_OK);
+    if (!fs.existsSync(resolvePath(dir, "..", "gh-limit.py"))) return false;
+    const fd = fs.openSync(p, "r");
+    try {
+      const buf = Buffer.alloc(8192);
+      const n = fs.readSync(fd, buf, 0, buf.length, 0);
+      const head = buf.subarray(0, n);
+      // BOTH tokens, not either: the marker proves it is a harness entry point (as `gh-rest/gh` is),
+      // and `--self` proves it is the quota wrapper that delegates to the helper (which `gh-rest/gh`
+      // never does). See the doc-comment for the measured bypass this closes.
+      return head.includes(GH_LIMIT_MARKER) && head.includes(GH_LIMIT_SELF_TOKEN);
+    } finally {
+      fs.closeSync(fd);
+    }
+  } catch {
+    return false; // absent, unreadable, unexecutable or not a regular file: not a layer
+  }
+}
+
+/**
+ * The QUOTA layer's directory — `$O/gh-limit`, the cell's `gh` serialiser/cache (#1988,
+ * #2243, #2342).
+ *
+ * WHY IT IS RESOLVED HERE (#3477). The layer exists and is good: TTL read cache per class,
+ * single-flight coalescing of identical concurrent reads, an ETag conditional-REST cache, the
+ * account budget partition, and a `--stats` instrument. MEASURED 2026-11-05 on cell `cmux`:
+ * 11 of 12 live lane `pi` processes did NOT have it on PATH, so they resolved
+ * `~/.pi/agent/shims/gh` and then the real `gh`, bypassing all of it — while the same box's
+ * `gh-limit` events log recorded 839 `gh-core-floor … read refused` events and ZERO
+ * `read-cache hit`, ZERO `single-flight: shared`, ZERO `conditional: 304`.
+ * `--stats` said `averted=0`. The bucket was exhausted (`core 0/5000`) with `graphql 4159/5000`.
+ * The log line is `read-cache: <class> hit — within its <n>s TTL`, so `rg -c 'read-cache: .* hit'`
+ * is the re-verification — the literal string `read-cache hit` is never emitted.
+ *
+ * The cause is compositional, not logical: `lane.sh:83-84` puts `$O/gh-limit` (then `$O/gh-rest`)
+ * first on PATH for the lanes IT spawns, and this extension put only the argv shim on the PATH of
+ * every bash call. Lanes spawned from a cmux pane get the login PATH, so they got the guard and not
+ * the cache. Prepending the same directory here makes the layer reach EVERY lane that already has
+ * the guard, without a second mechanism and without touching the layer itself.
+ *
+ * ⛔ ORDER IS THE WHOLE CORRECTNESS ARGUMENT — AND THE GUARD IS THE HALF THAT SURVIVES. The
+ * documented chain is `gh-limit → gh-shim → real gh`: `gh-limit` walks PATH and skips files carrying
+ * the `harness-gh-shim-marker` sentinel **in the first 8 KiB**, and `scripts/gh-shim/gh` keeps its
+ * own marker at byte 26405 — deliberately outside that window — so `gh-limit` resolves the argv
+ * guard as its child and the #984 admin-merge gate stays in the chain.
+ *
+ * ⛔ AND WITH THE ORDER REVERSED IT IS THE QUOTA LAYER THAT IS LOST, NOT THE GUARD (measured, review
+ * round 5). `scripts/gh-shim/gh`'s `_is_harness_layer` also reads the first 8 KiB, and `gh-limit`'s
+ * marker sits at byte 1100 — INSIDE it — so the guard `continue`s past `gh-limit` and resolves the
+ * real `gh`. The result is the guard running with the cache bypassed, i.e. exactly the `averted=0` /
+ * `839 gh-core-floor` state this change exists to end, not a lost merge gate. Say it that way: the
+ * failure an operator will actually meet is "gh-limit is still unused", not "merges are unguarded".
+ *
+ * ⛔ BOTH CONDITIONS, OR NOTHING — see `isGhLimitLayer` for the attested reason the sibling
+ * helper alone is not an identity.
+ */
+export function resolveGhLimitDir(): string | null {
+  const explicit = process.env.AGENT_GH_LIMIT_DIR;
+  const candidates: string[] = [];
+  if (explicit) candidates.push(explicit);
+  // `$O` is the harness's own root (lane.sh: `O="${O:-$HOME/orchestrator}"`), so it resolves the
+  // same directory the controller already trusts rather than guessing a second location.
+  const o = process.env.O || resolvePath(os.homedir(), "orchestrator");
+  candidates.push(resolvePath(o, "gh-limit"));
+  for (const dir of candidates) {
+    try {
+      if (isGhLimitLayer(dir)) return dir;
+    } catch {
+      /* an unreadable candidate is not a match */
+    }
+  }
+  return null;
+}
+
+/**
  * Is `<dir>/gh` present AND EXECUTABLE — i.e. is this directory a shim at all?
  *
  * A PATH entry whose `gh` lacks the execute bit is SKIPPED by the shell, so the real
@@ -221,19 +348,82 @@ function activeGhShimDir(): string | null {
 }
 
 /**
+ * Resolved ONCE per session, with the SAME per-call revalidation `activeGhShimDir` gets and for
+ * the same reason: a session outlives a deployment, and `check-deployed-drift.sh` / a re-bootstrap
+ * can remove or replace `$O/gh-limit`.
+ *
+ * ⛔ STATE, STATED ACCURATELY (a first draft of this comment claimed the opposite): the cache holds
+ * `null` for "checked, absent", and the `!== null` guard below means that state falls THROUGH to
+ * the resolver on every call. That is deliberate, not an oversight — it costs two stats on a box
+ * with no layer, and it is what lets a layer deployed MID-SESSION be picked up instead of staying
+ * invisible until the session restarts (the controller deploys `gh-limit` beside running lanes).
+ * A non-null entry takes the cheap path and is re-validated, so a layer that is REMOVED stops
+ * being injected on the next call rather than for the rest of the session.
+ */
+let ghLimitDirCache: string | null | undefined;
+function activeGhLimitDir(): string | null {
+  if (ghLimitDirCache !== undefined && ghLimitDirCache !== null && isGhLimitLayer(ghLimitDirCache)) {
+    return ghLimitDirCache;
+  }
+  ghLimitDirCache = resolveGhLimitDir();
+  return ghLimitDirCache;
+}
+
+/**
  * Prefix a bash command with the shim directory on PATH.
  *
  * Returns null when there is nothing to do — no shim resolved, or the operator's
  * kill switch is set. The kill switch exists because this touches EVERY bash call:
  * `AGENT_GH_SHIM=0` turns the layer off without editing code.
  *
+ * `limitDir` is the QUOTA layer (`resolveGhLimitDir`). When present it is prepended AHEAD of the
+ * argv shim, so the chain is `gh-limit → gh-shim → real gh` — the order `lane.sh:83-84` already
+ * establishes for controller-spawned lanes and the order `gh-limit`'s own PATH walk expects (it
+ * skips `harness-gh-shim-marker` files, so it resolves the guard as its child). `AGENT_GH_LIMIT=0`
+ * drops ONLY that entry and leaves the argv guard in place: the two switches are independent on
+ * purpose, because a caller may want the admin-merge guard without the quota layer's +155 ms hop.
+ *
  * `export PATH=…` on its OWN LINE, so the command's text is otherwise untouched
  * and its exit status is still the command's (`&&` would change both).
  */
-export function withGhShim(command: string, shimDir: string | null): string | null {
+export function withGhShim(
+  command: string,
+  shimDir: string | null,
+  limitDir: string | null = null,
+): string | null {
   if (process.env.AGENT_GH_SHIM === "0") return null;
   if (!shimDir) return null;
-  return `export PATH=${JSON.stringify(shimDir)}:"$PATH"\n${command}`;
+  const quota = process.env.AGENT_GH_LIMIT === "0" ? null : limitDir;
+  const entries = quota ? [quota, shimDir] : [shimDir];
+  return `export PATH=${entries.map((d) => JSON.stringify(d)).join(":")}:"$PATH"\n${command}`;
+}
+
+/**
+ * The WIRING — resolve the quota layer and compose the prefix, in one place.
+ *
+ * ⛔ THIS EXISTS SO THE WIRING IS TESTABLE (#3477 review rounds 2-3). `activeGhLimitDir` is private
+ * and every other assertion calls `withGhShim` with an EXPLICIT `limitDir`, so `activeGhLimitDir`
+ * returning `null` — or this call site losing its third argument — left the suite at 405 green while
+ * the change was dead: the exact silent re-opening of the defect the change exists to close.
+ *
+ * ⛔ A DEGRADED GUARD MUST NOT COST THE QUOTA LAYER TOO (#3477 review round 3). `withGhShim`
+ * returns `null` when `shimDir` is `null`, and the handler calls it on EVERY box — including the
+ * degraded ones it detects and warns about twelve lines earlier (`ghArgvLayerState`). Coupling the
+ * two entries that way meant a box with a valid `$O/gh-limit` but no resolvable argv guard kept the
+ * measured budget collapse (`839` `gh-core-floor … read refused` in 21 h, `averted=0`) even though
+ * injecting the quota entry ALONE is safe there: `gh-limit` resolves whatever `gh` PATH yields,
+ * i.e. exactly today's status quo, with the cache in front of it. So the quota entry stands on its
+ * own; only the shared kill switches turn it off.
+ */
+export function withGhLayers(command: string, shimDir: string | null): string | null {
+  const limitDir = activeGhLimitDir();
+  if (shimDir) return withGhShim(command, shimDir, limitDir);
+  // The argv guard did not resolve. `AGENT_GH_SHIM=0` is the documented "turn the injection off"
+  // switch and must keep meaning that; `AGENT_GH_LIMIT=0` drops the quota entry by itself.
+  if (process.env.AGENT_GH_SHIM === "0") return null;
+  if (process.env.AGENT_GH_LIMIT === "0") return null;
+  if (!limitDir) return null;
+  return `export PATH=${JSON.stringify(limitDir)}:"$PATH"\n${command}`;
 }
 
 /**
@@ -301,6 +491,89 @@ export function ghShimWillEnforce(shimDir: string | null): boolean {
   // from certainty it no longer has. Cheap — the caller short-circuits on
   // `isAdminMergeCommand` first, so this runs only for admin-merge-class commands.
   return process.env.AGENT_GH_SHIM !== "0" && shimDir !== null && isExecutableShim(shimDir);
+}
+
+/**
+ * The argv layer's state, NAMED — the same three-way answer the refusal and the
+ * log line both read, so they cannot disagree.
+ *
+ *   enforcing — switched on, and the directory we injected holds an executable `gh`.
+ *   disabled  — the OPERATOR set `AGENT_GH_SHIM=0`. A deliberate choice, not a defect.
+ *   degraded  — switched on, but nothing resolved: the layer the merge gate relies
+ *               on is NOT RUNNING, while every other part of the gate still is.
+ */
+export type GhArgvLayerState = "enforcing" | "disabled" | "degraded";
+export function ghArgvLayerState(shimDir: string | null): GhArgvLayerState {
+  if (process.env.AGENT_GH_SHIM === "0") return "disabled";
+  return ghShimWillEnforce(shimDir) ? "enforcing" : "degraded";
+}
+
+/**
+ * ⛔ A GUARD THAT CANNOT LOAD MUST NOT CERTIFY — the admin-merge gate's refusal when
+ * its argv-level layer is absent (#984).
+ *
+ * WHAT THE DEFECT WAS, MEASURED. `#984 argv-level gh shim not found` was printed ONCE
+ * per session as a `⚠️` console line and the gate then certified admin merges exactly
+ * as if the layer were present. Nothing was red, nothing failed, and the protection the
+ * fleet believed it had was simply absent on that box — a `scripts/gh-shim` that no
+ * installer had farmed onto it (measured 2026-11-02: `pi-cell-1`'s account home carried
+ * a six-entry `scripts/` with `gh-shim/gh`, `review-pr.sh` and
+ * `verify-admin-merge-evidence.sh` all MISSING while its lanes ran with that home, and
+ * its own task-run logs carried the warning). This gate is what CERTIFIES an admin
+ * merge; the argv scanner is what proves the merge it certifies is the only one in the
+ * command — the text layer's own stated residual is a token splice (`--ad""min`,
+ * `$'--admin'`) it cannot resolve. So an absent argv layer makes this gate's verdict
+ * UNKNOWN, not PASSING, and UNKNOWN must refuse.
+ *
+ * WHY THIS IS NOT A POLICY CHANGE. The installer already treats a missing shim as
+ * FATAL (`cell-install.sh` fails the install by name without it), and
+ * `docs/ops/ACTIVATION-MATRIX.md` row 1 already records the runtime as DEGRADED.
+ * Refusing here only makes the runtime agree with the installer and with its own
+ * documentation — the gate stops claiming a coverage it does not have. It cannot wedge a
+ * box that was never degraded: on every box where the shim resolved, `shimDir !== null`
+ * and this returns null.
+ *
+ * THE OPERATOR'S OWN SWITCH IS HONOURED. `AGENT_GH_SHIM=0` is a documented, deliberate
+ * kill switch: it returns null here, so a lane that chose the degraded posture keeps the
+ * old behaviour and the gate keeps its fail-closed text path. Only an UNINTENDED
+ * absence refuses.
+ *
+ * Returns the block payload, so the caller's `return` and this message cannot drift.
+ */
+export function ghArgvLayerRefusal(
+  shimDir: string | null,
+): { block: true; reason: string } | null {
+  if (ghArgvLayerState(shimDir) !== "degraded") return null;
+  // ⛔ THE AUDITED OPERATOR OVERRIDE OUTRANKS THIS REFUSAL. `AGENT_ADMIN_MERGE_OVERRIDE=1`
+  // is the landing route recorded in AGENTS.md ("the audited AGENT_ADMIN_MERGE_OVERRIDE=1 …
+  // must be in the AGENT's environment before start"), and it is read deep inside the
+  // evidence branch. Refusing BEFORE that read would silently reverse a recorded decision
+  // and — because both switches must be set before the session starts — leave a lane on a
+  // degraded box with no in-session way to land at all. So the override keeps its route,
+  // and it is audited there as `admin_merge_override`, exactly as on a healthy box. This is
+  // a refusal to CERTIFY without a certifier, never a veto of an explicit operator decision.
+  if (_adminMergeOverride()) return null;
+  return {
+    block: true,
+    reason:
+      "This admin merge cannot be certified: the argv-level `gh` shim (#984) is NOT " +
+      "loaded on this box, so the gate cannot prove the merge in this command is the " +
+      "only one — the text scanner's residual is a token splice it cannot resolve. " +
+      "This is a DEGRADED GUARD, and an unknown is not a pass.\n" +
+      "FIX: install `scripts/gh-shim/gh` AND its sibling `verify-admin-merge-evidence.sh` " +
+      "into whichever directory this extension resolves — for a FARMED install that is " +
+      "`~/.pi/agent/scripts/gh-shim/gh`, and for an extension loaded from a CHECKOUT it is " +
+      "`<checkout>/scripts/gh-shim/gh` (the resolver is `EXTENSION_DIR/../../scripts/gh-shim`). " +
+      "`pi-bootstrap/setup.sh` farms both files (its `merge_gate_srcs` array) and " +
+      "`pi-bootstrap/cell-install.sh` fails the install when the shim is missing, so a " +
+      "rebuild that runs the installer cannot reproduce this state. Alternatively point " +
+      "`AGENT_GH_SHIM_DIR` at a directory holding an EXECUTABLE `gh` shim.\n" +
+      "NOTE: this refusal also fires when the shim SOURCE exists but could not be " +
+      "materialized into `~/.pi/agent/shims` (a read-only or noexec home, a failing copy) — " +
+      "check that directory too before reinstalling.\n" +
+      "To deliberately accept the degraded layer, set `AGENT_GH_SHIM=0` — that is an " +
+      "operator decision, and the gate then runs its fail-closed text path as before.",
+  };
 }
 
 // ── gh invocation seam (testable) ─────────────────────
@@ -4055,6 +4328,20 @@ export interface ReviewRecord {
    * "carried from <sha>". OPTIONAL and NEVER read by a decision. */
   mint?: string;
   carried_from?: string;
+  /** agent-infra#3400 — the OPEN FINDINGS a `not-clean` verdict left behind.
+   * A negative verdict used to be unrecordable at all (the recorder's verdict
+   * list admitted only the three `clean*` tiers), so "a review ran here and it
+   * was NOT clean" lived only in PR prose that no gate reads — how tortoise#3295
+   * came to carry `verdict=clean` in its body while the most recent review at
+   * that head was NOT CLEAN. Written ONLY for `not-clean`, so a `clean` record
+   * can never admit an open finding. Read by the merge gate ONLY to NAME the
+   * finding in its block message: the block itself is `not-clean` not being in
+   * ACCEPTED_VERDICTS, which is unchanged and is why recording one cannot
+   * license a merge. */
+  findings?: number;
+  /** agent-infra#3400 — free-form severity detail (e.g. "1 open P2") the
+   * recorder quoted verbatim. Never parsed: it is display text only. */
+  findings_note?: string;
 }
 
 /**
@@ -6003,6 +6290,28 @@ export function evaluateMergeGate(
     };
   }
   if (!isAcceptedVerdict(record.verdict)) {
+    // agent-infra#3400 — A NEGATIVE VERDICT SAYS MORE THAN "not accepted", AND THE
+    // GATE MUST SAY IT. Before this, `not-clean` was unrecordable, so the only
+    // reachable shape here was a corrupt/foreign verdict and "no record found" was
+    // the honest message. Now a recorded negative is a DIAGNOSIS: which head, and
+    // how many findings are open — the difference between a lane that knows what to
+    // fix and one that reads "no review record found" (the exact confusion the
+    // shared `record-review.sh` reader exists to end).
+    const negFindings = typeof record.findings === "number" ? record.findings : undefined;
+    const negNote = typeof record.findings_note === "string" ? record.findings_note.trim() : "";
+    if (record.verdict === "not-clean") {
+      const count = negFindings === undefined ? "an unrecorded number of" : String(negFindings);
+      return {
+        status: "block",
+        reason: [
+          "✅ Review enforcement (merge registry) gate is working correctly.",
+          `❌ Review record for PR #${pr} says reviewed NOT CLEAN at ${record.head_sha.slice(0, 12)}…: ${count} open finding(s)${negNote ? ` (${negNote})` : ""}.`,
+          "   This is NOT an absent record and NOT a bookkeeping problem: a review RAN on this head and did not pass.",
+          `   → Fix the finding, re-review, then record again: ${RECORD_SH} <PR> <head_sha> clean [owner/repo] --evidence comment:<review-comment-id>`,
+          `   → The negative record is superseded by the clean one at the same head (the newest record is what a reader acts on).`,
+        ].join("\n"),
+      };
+    }
     // #513: two-path remediation — the record's tier is not readable from the
     // record (only the verdict), so both paths are named statically.
     return {
@@ -8059,6 +8368,25 @@ export function auditCommand(command: string, limit = 2000): string {
   );
 }
 
+/**
+ * The CHILD's composed payload on a reap result, as a mergeable record — or `null`.
+ *
+ * #3155: `task_collect` carries it at `details.details` and a terminal `task_status` at
+ * `details.final_details`; BOTH feed the one classifier, so both narrow the same way and through
+ * this one function. ⛔ AN ARRAY IS NOT A PAYLOAD (fresh review): `typeof [] === "object"` and
+ * `[] !== null`, so the obvious guard accepts `[]`, the spread merges nothing, and the run's own
+ * `status: "done"` label decides — certifying a verdict the payload never carried. (A NON-empty
+ * array does the same: spreading it yields index keys, none of which the classifier reads.) ⛔ AN
+ * EMPTY OBJECT IS THE SAME HOLE (round-2 fresh review, measured): `{}` merges nothing either, so
+ * it carries no evidence, and a reap with `final_details: {}` was COUNTED off the view's own `done`
+ * label on BOTH verbs. `null`, primitives, arrays and empty objects are all UNKNOWN.
+ */
+export function composedDetailsOf(payload: unknown): Record<string, unknown> | null {
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) return null;
+  const record = payload as Record<string, unknown>;
+  return Object.keys(record).length === 0 ? null : record;
+}
+
 // ── #2349: the ≥1-dispatch floor says WHAT IT READ ─────────────────────────────
 //
 // The floor counts reviewer dispatches in THIS pi process, and (since #2287) first tries a
@@ -8491,11 +8819,12 @@ export default function (pi: ExtensionAPI) {
     // telling a lane that tried that it never dispatched at all.
     let spawnAttempts: SpawnAttempt[] = [];
     let spawnAttemptsTotal = 0;
-    // #1662 review: run_ids whose terminal `task_collect` already counted as a
-    // reviewer dispatch. `task_collect` is idempotent (the same terminal run
-    // can be reaped repeatedly), so without this a repeated collect inflates
-    // the ≥1-dispatch count and the durable `review_dispatch` audit total.
-    const countedCollectRuns = new Set<string>();
+    // #1662 review / #3155: run_ids whose TERMINAL reap has already counted as a reviewer
+    // dispatch. TWO verbs reap a background run — `task_collect` and a `task_status` that reports
+    // `terminal: true` — and either one may be called repeatedly for the same run (`task_collect`
+    // is idempotent; a poller keeps polling), so the dedupe is keyed by run_id and SHARED between
+    // them: one run is one dispatch however many times, and in whichever order, it is reaped.
+    const countedReapedRuns = new Set<string>();
     // #2148 — the up-front disclosure's state. `preflightInjected` is the once-guard for the
     // model-visible injection (the console line is emitted once by session_start itself);
     // `earlyPushNoticePrinted` is the once-guard for the first-push notice, which must not repeat
@@ -8518,7 +8847,7 @@ export default function (pi: ExtensionAPI) {
       dispatchCount = 0;
       spawnAttempts = [];
       spawnAttemptsTotal = 0;
-      countedCollectRuns.clear();
+      countedReapedRuns.clear();
       preflightInjected = false;
       earlyPushNoticePrinted = false;
       blockRecoverySent = false;
@@ -8628,7 +8957,7 @@ export default function (pi: ExtensionAPI) {
     // ── session_shutdown ───────────────────────────
     pi.on("session_shutdown", async (_event, _ctx) => {
       dispatchCount = 0;
-      countedCollectRuns.clear();
+      countedReapedRuns.clear();
       blockRecoverySent = false;
       // Clear marker file to prevent persistent state leakage across sessions
       try {
@@ -8788,16 +9117,29 @@ export default function (pi: ExtensionAPI) {
 
       if (!extensionEnabled) return undefined;
       const shimDir = activeGhShimDir();
-      if (shimDir === null && !ghShimAbsenceWarned && process.env.AGENT_GH_SHIM !== "0") {
+      // ⛔ LOUD, NOT ⚠️. This line used to be the ONLY surface that knew the guard was
+      // degraded, and it read as advisory — a box could run for weeks in this state with
+      // nobody acting. It now names the consequence and the remedy, and it RECORDS a gate
+      // event so a report can read the state without anyone parsing prose. The refusal
+      // itself is `ghArgvLayerRefusal` at the admin-merge gate below.
+      if (ghArgvLayerState(shimDir) === "degraded" && !ghShimAbsenceWarned) {
         ghShimAbsenceWarned = true;
         console.log(
-          "[review-enforcer] ⚠️  #984 argv-level gh shim not found — only the string scanner " +
-            "is active, so bash token splicing can still hide an admin merge, and a heredoc body " +
-            "written to a script file and run by a LATER command is not followed by any text gate. " +
-            "Set AGENT_GH_SHIM_DIR, or install scripts/gh-shim."
+          "[review-enforcer] 🚫 DEGRADED GUARD — STATE: #984 argv-level gh shim NOT LOADED on " +
+            "this box. The admin-merge gate will REFUSE to certify a merge (an unknown is not " +
+            "a pass): bash token splicing can otherwise hide an admin merge from the string " +
+            "scanner, and a heredoc body written to a script file and run by a LATER command " +
+            "is not followed by any text gate. FIX: install scripts/gh-shim/gh at " +
+            "~/.pi/agent/scripts/gh-shim/gh (setup.sh farms it; cell-install.sh fails without " +
+            "it) or set AGENT_GH_SHIM_DIR. Deliberate acceptance: AGENT_GH_SHIM=0."
         );
+        logGateEvent("gh_shim_degraded", { reason: "argv_layer_absent", command: auditCommand(rawCommand) });
       }
-      const shimmed = withGhShim(rawCommand, shimDir);
+      // The QUOTA layer goes ahead of the argv guard (see `withGhShim`): the guard is what every
+      // lane already got, so resolving the quota dir here is what makes the cache/budget/single-flight
+      // reach the lanes that were bypassing it (#3477). Delegated to `withGhLayers` so the wiring
+      // itself is covered by a test.
+      const shimmed = withGhLayers(rawCommand, shimDir);
       if (shimmed !== null) event.input.command = shimmed;
 
       // #1382: THE GATE READS A DATA MODEL, NOT THE BYTES THE USER TYPED. A heredoc body is stdin
@@ -8818,8 +9160,9 @@ export default function (pi: ExtensionAPI) {
       // readable), so the mask cannot hide an invocation — it corrects a mis-read of one.
       //
       // THE CONDITION WAS WORSE THAN USELESS, it was the bug: this fleet runs with the argv layer
-      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — nothing installs `scripts/gh-shim`, and the
-      // resolver returns null: measured on this cell), so tying the mask to it left the reported
+      // ABSENT (`docs/ops/ACTIVATION-MATRIX.md` row 1 — re-measured 2026-11-02: `pi-bootstrap/setup.sh`
+      // farms `scripts/gh-shim` and `cell-install.sh` fails without it, so a FRESH box has it; the
+      // boxes that logged this were stale installs, and the resolver returned null there), so tying the mask to it left the reported
       // defect refusing the reporter — a harmless `cat >> notes.md <<'EOF'` — in the only
       // environment where anybody hit it. Verified, not assumed: with the shim absent the
       // shim-conditioned build still refuses that command verbatim.
@@ -8882,6 +9225,25 @@ export default function (pi: ExtensionAPI) {
               "gate can only certify ONE PR per call, so it cannot prove the others are " +
               "evidenced. Run them as separate commands.",
           };
+        }
+        // ⛔ THE CERTIFIER IS MISSING, SO THE CERTIFICATION IS UNKNOWN — REFUSE (#3297).
+        // AFTER the compound-merge count on purpose: `merges > 1` is pure TEXT and needs no
+        // argv layer, so a compound command keeps its own, more actionable diagnosis
+        // (#2349) instead of being told to reinstall a shim.
+        //
+        const argvRefusal = ghArgvLayerRefusal(shimDir);
+        if (argvRefusal) {
+          console.log(
+            "[review-enforcer] 🚫 Admin-merge evidence gate blocked (argv layer ABSENT) — " +
+              "STATE: DEGRADED, no #984 shim resolved, so the merge cannot be certified"
+          );
+          // The refused command is in the audit row: this block is the one an operator has
+          // to be able to reconstruct from the log alone after a rebuild lost the shim.
+          logGateEvent("merge_gate_block", {
+            reason: "admin_merge_argv_layer_absent",
+            command: auditCommand(rawCommand),
+          });
+          return argvRefusal;
         }
         // #1485: ZERO merge invocations, and the argv scan POSITIVELY read every
         // `gh` in the command as a non-merge subcommand — there is no merge for an
@@ -9306,10 +9668,35 @@ export default function (pi: ExtensionAPI) {
       // #1662: a `task({ background: true })` dispatch returns at DISPATCH, not
       // completion — counting it would satisfy the ≥1-dispatch gate while the
       // reviewer is still running (a fail-open on the git-op gate). Count the
-      // reviewer when its verdict is actually reaped: the terminal
-      // `task_collect`. The returns-early notice and a not-finished collect are
-      // both ignored.
-      const reviewDetails = (event as { details?: { background?: boolean; terminal?: boolean; run_id?: string } }).details;
+      // reviewer when its verdict is actually reaped. The returns-early notice
+      // and a not-finished reap are both ignored.
+      //
+      // #3155 — THERE ARE TWO REAP VERBS, AND THIS COUNTER KNEW ONE. `task_collect` is the verb
+      // that hands back the final message; `task_status` is the verb a poller uses to drive its
+      // wait, and once a run is TERMINAL it reports the same settled record (`terminal: true`).
+      // Measured on main before this change (in a live `pi -p` session, one background
+      // `task({background:true})` child): polling `task_status` to `done` and then running a git op
+      // printed `reviewer dispatches counted in THIS pi process = 0` and refused; the SAME session
+      // then reaped with `task_collect` and the count read 1. A lane that dispatched five reviewers
+      // and waited on them with the observation verb therefore had real verdicts and an accounting
+      // that read zero — an instrument that cannot tell "no review happened" from "my counter
+      // missed your reviewer", and whose natural remedy was a throwaway re-dispatch (#3155's own
+      // "why it matters"). The floor's datum is a reviewer VERDICT, and a terminal run record
+      // holds one.
+      //
+      // ⛔ COUNTING A TERMINAL STATUS IS NOT COUNTING AT DISPATCH. The fail-open #1662 closed is
+      // counting a lane that has not finished; `terminal: true` means the run IS finished and its
+      // outcome is persisted (the producer's own contract: "i.e. `task_collect` will return the
+      // final message"). An `alive`/`wedged`/`gone` view stays uncounted, and the classification
+      // below is the same one the collect path performs — including its clean-empty arm.
+      const reviewDetails = (event as {
+        details?: {
+          background?: boolean;
+          terminal?: boolean;
+          run_id?: string;
+          final_details?: unknown;
+        };
+      }).details;
       // #1662 review: the pre-spawn refusal / halted-chain / invalid-session-id
       // results are built BEFORE the background branch, so they carry NO
       // `details.background` — a refused `task({ background: true })` would then
@@ -9320,7 +9707,15 @@ export default function (pi: ExtensionAPI) {
       const reviewInput = (event as { input?: { background?: boolean } }).input;
       const isTerminalCollect =
         event.toolName === "task_collect" && reviewDetails?.terminal === true;
-      if (event.toolName !== "task_collect" && event.toolName !== "subagent" && event.toolName !== "task") return undefined;
+      // #3155: the second reap verb — a `task_status` whose view is TERMINAL.
+      const isTerminalStatus =
+        event.toolName === "task_status" && reviewDetails?.terminal === true;
+      if (
+        event.toolName !== "task_collect" &&
+        event.toolName !== "task_status" &&
+        event.toolName !== "subagent" &&
+        event.toolName !== "task"
+      ) return undefined;
       // #285 P2: task sub-agents never count dispatches — review DISPATCH is
       // parent-enforced (#825), and their own in-band [VGATE] dispatches must
       // not be counted/audited as review dispatches. (Today they never reach
@@ -9329,16 +9724,85 @@ export default function (pi: ExtensionAPI) {
       if (isTaskSubAgent()) return undefined;
       if (!extensionEnabled) return undefined;
       if (event.toolName === "task_collect" && !isTerminalCollect) return undefined;
-      // #1662 review: `task_collect` is idempotent — every result carries the
-      // `run_id` it reaped (`details: view`). Count each run's verdict once, so
-      // re-collecting a finished lane cannot inflate the dispatch total (and
-      // the durable review_dispatch audit count) past the real dispatches.
-      if (isTerminalCollect) {
-        const collectRunId =
+      if (event.toolName === "task_status" && !isTerminalStatus) return undefined;
+
+      // #3155: a reap must be CERTIFIED before it counts, and certification is a property of the
+      // REAP — not of the verb. The child's composed payload is the classifier's only evidence that
+      // a verdict exists: the run's own `status` maps a success-but-silent child (`exit 0`, empty
+      // stdout) to `done`, so a classifier reading the label alone counts a reviewer that produced
+      // NOTHING (the #2665 fail-open). `task_collect` carries that payload at `details`; a terminal
+      // `task_status` carries it at `final_details`. Read it from whichever verb fired and classify
+      // through it — the SAME code path, so the two verbs cannot disagree.
+      //
+      // ⛔ THE COLLECT VERB GETS THE SAME GUARD (fresh review of the first version of this fix, P1
+      // — and it was right): applying it to `task_status` only was a false PASS, not a
+      // half-measure. A record with NO composed payload was REFUSED through the observation verb and
+      // COUNTED through the collect verb, because a rejected payload merged to `{}` and left the
+      // view's `status: "done"` label deciding — and the message the guard printed ("reap it with
+      // task_collect") named the lenient verb as the remedy. One rule, both verbs: no payload, no
+      // verdict.
+      //
+      // ⛔ ABSENCE IS NOT A VERDICT — and where the view alone WOULD be one, it is not written to the
+      // ATTEMPT ledger either: that ledger's vocabulary describes spawn OUTCOMES (refused/cut/failed),
+      // and "the producer did not carry a field" is not one — recording it there would ship a false
+      // capacity/refusal claim to the refusal text (#2665's fix exists to stop exactly that), so the
+      // console line is the record. (Where the view's own `status` IS such an outcome, the paragraph
+      // below explains why it must be read as one instead of discarded.)
+      //
+      // ⛔ AND IT SITS BEFORE THE DEDUPE, DELIBERATELY. Marking an uncertifiable reap as "already
+      // counted" would spend that run's ONE slot on a reap that counted nothing, so a later
+      // certifiable one could never count it in this session. Uncounted means unrecorded.
+      const reapComposedDetails = isTerminalCollect
+        ? composedDetailsOf((reviewDetails as { details?: unknown })?.details)
+        : isTerminalStatus
+          ? composedDetailsOf((reviewDetails as { final_details?: unknown })?.final_details)
+          : null;
+      // ⛔ A MISSING PAYLOAD IS ONLY UNCERTIFIABLE WHEN THE VIEW ALONE WOULD OTHERWISE BE A VERDICT
+      // (fresh review, P1). The view's OWN `status`/`reason` is a datum too, and it is one this
+      // ledger's vocabulary already speaks: the producer deliberately writes
+      // `{ status: "failed", reason: "zero-output" }` with NO composed payload for a background
+      // child that produced nothing and was reaped by the hard cap, the silence threshold or the
+      // backstop (`doResolve(undefined)` → `classifyBackgroundOutcome(undefined)`; the #271/#208
+      // "resolveUndefined = !hasOutput" RETRYABLE contract), and the settle writer's
+      // `final_details: result?.details` is then dropped by JSON. Refusing here BEFORE
+      // classification read that record's absence as its only datum and threw the outcome beside it
+      // away, which re-created #2665's headline defect on BOTH verbs: a capacity/retry-exhaustion
+      // death was reported to the lane as "No reviewers were dispatched in this session" and
+      // `spawnAttempts` stayed 0, so `REVIEW-GATE-UNSPAWNABLE` — the one text that tells a lane its
+      // dispatches are dying rather than missing — never fired. (Measured on main and on this
+      // branch's first commit: `task_collect` on that record DID render the capacity diagnosis;
+      // this guard removed it.)
+      //
+      // So classify the VIEW alone first. A NON-verdict outcome is an ATTEMPT and falls through to
+      // the shared dedupe + classification below — the same thing the collect arm always did with a
+      // null payload. Only a view-alone VERDICT (a `done` label with nothing behind it) is
+      // uncertifiable: there the absence really is the only datum, and it fails CLOSED.
+      if ((isTerminalCollect || isTerminalStatus) && reapComposedDetails === null) {
+        const viewAlone = classifySpawnOutcome({
+          details: reviewDetails as Record<string, unknown> | undefined,
+          isError: (event as { isError?: unknown }).isError,
+        });
+        if (viewAlone.outcome === "verdict") {
+          console.error(
+            `[review-enforcer] ⚠️ a TERMINAL ${event.toolName} carried no composed details — NOT counted ` +
+              "as a reviewer dispatch (#3155): a run whose payload is missing cannot be certified as a " +
+              "verdict, and its own `status` label must not stand in for one."
+          );
+          return undefined;
+        }
+      }
+
+      // #1662 review / #3155: both reap verbs are repeatable — `task_collect` is idempotent and a
+      // poller keeps polling — and each result carries the `run_id` it reaped (`details: view`).
+      // Count each run's verdict once, under ONE set shared by both verbs, so re-reaping a finished
+      // lane (in either verb, in either order) cannot inflate the dispatch total and the durable
+      // review_dispatch audit count past the real dispatches.
+      if (isTerminalCollect || isTerminalStatus) {
+        const reapedRunId =
           typeof reviewDetails?.run_id === "string" ? reviewDetails.run_id : "";
-        if (collectRunId) {
-          if (countedCollectRuns.has(collectRunId)) return undefined;
-          countedCollectRuns.add(collectRunId);
+        if (reapedRunId) {
+          if (countedReapedRuns.has(reapedRunId)) return undefined;
+          countedReapedRuns.add(reapedRunId);
         }
       }
 
@@ -9352,22 +9816,15 @@ export default function (pi: ExtensionAPI) {
       // measured (see `shared/spawn-capacity.ts`). The classification reads ONLY fields the
       // producer set, and the evidence it read is carried into the audit row and the refusal.
       const spawn = classifySpawnOutcome({
-        // A terminal `task_collect` result is a `TaskRunStatusView`: the CHILD's composed payload
-        // sits at `view.details`, and the run's own `status`/`reason` sit at the top level. Read
-        // BOTH (nested last, so the child's own `killed`/`exitCode` win), because classifying on
-        // the view alone re-opened the same fail-open one path over (review of #2665): the
-        // background status mapping reports a no-output `clean-empty` settle as `done`, so the
-        // view said "done" while the child's details carried `exitCode:0` with no output — and
-        // the FOREGROUND path already classifies that same shape as `cut`.
-        details: isTerminalCollect
-          ? {
-              ...(reviewDetails as Record<string, unknown>),
-              ...((typeof (reviewDetails as { details?: unknown })?.details === "object" &&
-              (reviewDetails as { details?: unknown }).details !== null
-                ? (reviewDetails as { details: Record<string, unknown> }).details
-                : {}) as Record<string, unknown>),
-            }
-          : (reviewDetails as Record<string, unknown> | undefined),
+        // A terminal reap is a `TaskRunStatusView` / `TaskCollectView`: the CHILD's composed payload
+        // sits at `view.details` (collect) or `view.final_details` (status) — read above, one
+        // narrowing for both verbs — and the run's own `status`/`reason` sit at the top level. Merge
+        // BOTH (payload last, so the child's own `killed`/`exitCode` win): the payload is present by
+        // construction here, because the certification guard above refuses a reap without one.
+        details:
+          isTerminalCollect || isTerminalStatus
+            ? { ...(reviewDetails as Record<string, unknown>), ...(reapComposedDetails ?? {}) }
+            : (reviewDetails as Record<string, unknown> | undefined),
         isError: (event as { isError?: unknown }).isError,
       });
       if (spawn.outcome !== "verdict") {
@@ -9409,12 +9866,25 @@ export default function (pi: ExtensionAPI) {
       if (reviewDetails?.background === true || reviewInput?.background === true) return undefined;
 
       dispatchCount++;
+      const reapVerb = isTerminalCollect
+        ? "task_collect"
+        : isTerminalStatus
+          ? "task_status (terminal)"
+          : event.toolName;
       console.log(
-        `[review-enforcer] 📊 Reviewer dispatch counted (total: ${dispatchCount})`
+        `[review-enforcer] 📊 Reviewer dispatch counted via ${reapVerb} (total: ${dispatchCount})`
       );
       // #60: durable per-event record — the running total is stamped on each
       // entry so the dispatch count is reconstructible from the audit log.
-      logGateEvent("review_dispatch", { dispatch_count: dispatchCount });
+      // #3155: the row also names the REAP VERB. Before this, every row was indistinguishable, so
+      // the audit could not answer "did this lane's reviewers come back through collect or through
+      // status" — the question that would have made the zero-count defect visible in the trail
+      // instead of only in a lane's transcript.
+      logGateEvent("review_dispatch", {
+        dispatch_count: dispatchCount,
+        tool: event.toolName,
+        ...(typeof reviewDetails?.run_id === "string" ? { run_id: reviewDetails.run_id } : {}),
+      });
       return undefined;
     });
 

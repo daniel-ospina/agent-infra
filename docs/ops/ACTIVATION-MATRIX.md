@@ -29,12 +29,13 @@ installer's promise. Where a row is a *state* that no file declares, it says so.
 | **provisioned (on demand)** | a shipped *code path* creates it the first time it needs it. An installer neither creates nor restores it; it reappears with the next run of the controller. |
 | **improvised** | it works today because of something a human or a lane did by hand — a shell-rc line, a hand-written plist, a symlink into a worktree, an operator-pushed file. Nothing re-creates it. |
 | **absent** | it is not there. Not degraded, not partial. A read that *failed* is never recorded as absent — see the abstention notes in rows 8, 10 and 16. |
+| **mixed** | provisioned on some boxes and not on others; the row's own body names which, and every box in it was MEASURED. Used where a single verdict would be a claim about boxes nobody read. |
 
 ## The matrix
 
 | # | component | mac | cell | the file that activates it | divergence risk |
 |---|---|---|---|---|---|
-| 1 | **`gh` shim source** — the argv-level admin-merge guard (`scripts/gh-shim/gh`) | **improvised** | **absent** | *nothing installs it.* `extensions/review-enforcer/index.ts::resolveGhShimDir` resolves `$AGENT_GH_SHIM_DIR`, else `EXTENSION_DIR/../../scripts/gh-shim` | **HIGH** — the only layer a **token** splice cannot defeat (`--ad""min`, `$'--admin'`, `xargs {}`); a *discarded* PATH entry still defeats it, which is the shim's own declared limit (`ghShimWillEnforce`). On this Mac it resolves **only** from `AGENT_GH_SHIM_DIR` in `~/.zshrc:11`; that file is not in the launchd controller's env, and the relative fallback `~/.pi/agent/scripts/gh-shim` is **absent** (probe: resolution returns `null` with the var unset). On `pi-lane-1` `~/.pi/agent/scripts/gh-shim` is absent and `~/.pi/agent/shims/gh → /tmp/cell-ai/.worktrees/tm-1203/scripts/gh-shim/gh` — a **lane's worktree**, i.e. gone when that worktree is reaped. `pi-cell-3` has no `shims/` at all. Degradation is logged (`#984 argv-level gh shim not found`) and the gate silently falls back to string scanning |
+| 1 | **`gh` shim source** — the argv-level admin-merge guard (`scripts/gh-shim/gh`) | **provisioned** | **mixed** (Mac + cells 3/4 present; cell-1's account home stale) | `pi-bootstrap/setup.sh::merge_gate_srcs` farms it and `pi-bootstrap/cell-install.sh` fails the install without it (this column read *nothing installs it* until #3297 — measured stale on 2026-11-02, which is how a cell kept running degraded). `extensions/review-enforcer/index.ts::resolveGhShimDir` resolves `$AGENT_GH_SHIM_DIR`, else `EXTENSION_DIR/../../scripts/gh-shim` | **HIGH** — the only layer a **token** splice cannot defeat (`--ad""min`, `$'--admin'`, `xargs {}`); a *discarded* PATH entry still defeats it, which is the shim's own declared limit (`ghShimWillEnforce`). **Re-measured 2026-11-02 (this column previously read `absent` and was stale):** on this Mac `~/.pi/agent/scripts/gh-shim/gh` is PRESENT and executable (byte-identical to the checkout, farmed 11:37), as is its `verify-admin-merge-evidence.sh` sibling, so resolution succeeds with `AGENT_GH_SHIM_DIR` unset. `pi-cell-3` and `pi-cell-4` are PRESENT+EXEC in both the account home and `/tmp/cell-home`. `pi-cell-1` is the one degraded box: its ACCOUNT home carries a six-entry `scripts/` with `gh-shim/gh`, `review-pr.sh` and the verifier all MISSING — an install that predates the `merge_gate_srcs` farm — while its `/tmp/cell-home` is complete; its own `task-runs/*.log` carry the `#984` warning. Measure the box, never this cell. Degradation was LOGGED ONLY (`#984 argv-level gh shim not found`) and the gate silently fell back to string scanning; **#3297 makes the absent layer REFUSE the admin-merge certification** (`ghArgvLayerRefusal`, one `gh_shim_degraded` gate event, `AGENT_GH_SHIM=0` keeps the old posture) |
 | 2 | **`~/.pi/agent/shims` on PATH** | **improvised** | **absent** *where a tmux server exists to read* | mac: `~/.zshrc` (hand) + the extension's `withGhShim` absolute-path injection; cell: nothing | **MEDIUM** — for the extension's own calls PATH is irrelevant (it injects an absolute dir), so the *guard* does not need this; a lane that types `gh` does. On this box an interactive shell's PATH begins with that directory (twice — inherited, then injected). The **daemon** PATH deliberately excludes it (`install.sh` `add_dir` refuses `*/shims`; `deploy-mac-orchestrator.sh:220` same; `selftest.sh:641-642` and `:2043-2044` pin it) for macOS TCC. The cell controller's measured PATH is stock: `/usr/local/nvm/versions/node/v24.21.0/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin`. ⛔ On `pi-cell-2` there is **no tmux server at all**, so that box's PATH is an **abstention**, not an absent reading |
 | 3 | **extensions loaded** (review-enforcer, verification-gate, sequence-enforcer, loop-enforcer, auto-sync, repo-freshness, reflect-hook, task-heartbeat, session-checks, mcp-client, builtin-tools, …) | **provisioned** | **provisioned** | mac: `pi-bootstrap/setup.sh` (real copies refreshed from `extensions/*`); cell: `pi-bootstrap/cell-install.sh::install_extensions` from `manifest.json`'s ship-list (31 of 32; `cmux-session.ts` denied by design) | **LOW-MED** — content is byte-compared by `--verify`. Residual: a cell never auto-refreshes from a git pull, the Mac does on every `setup.sh` |
 | 4 | **extension runtime deps** (`node_modules` for `builtin-tools`, `mcp-client`, `loop-enforcer`, `custom-provider-qwen`) | **provisioned** | **provisioned** | mac: `setup.sh`; cell: `cell-install.sh::install_extension_deps` (`npm install --ignore-scripts`, scrubbed env) | **LOW** — measured present on both (`builtin-tools/node_modules` exists on the Mac and on `pi-lane-1`) |
@@ -50,11 +51,12 @@ installer's promise. Where a row is a *state* that no file declares, it says so.
 | 14 | **skills + `AGENTS.md` + `settings.json` + sub-agents** | **provisioned** | **provisioned** | mac: `setup.sh`; cell: `cell-install.sh::install_skills` / `install_config` (`settings.json` merged, `AGENTS.md` installed only when absent) | **LOW** — measured present on `pi-lane-1` and `pi-cell-3`; **absent on `pi-cell-2`**, where `/tmp/cell-home/.pi/agent` holds only `audit/` and `skill-reads.json` — i.e. that box never received the layer at all (see 16) |
 | 15 | **state + reviews dirs** (`$O/state`, `$O/logs`, `~/.pi/agent/reviews`) | **provisioned (on demand)** | **provisioned (on demand)** | created by shipped code the first time it needs them, both sides: `orch-loop.sh:251`, `record-review.sh:2140` | **LOW** — an installer neither creates nor restores these, so they are listed under their own legend row rather than as provisioned |
 | 15b | **harness activation on a clock** (`harness-apply-pass.sh` → `cloud-cell-supervisor.sh apply` / `./sync.sh`) | **provisioned** | **provisioned** | `scripts/install-harness-apply-timer.sh`, run by `cloud-cell-bringup.sh --check` on a cell and by hand on a Mac (`com.eldato.harness-apply`); `--status` is the readiness gate | **HIGH until #2416** — this row did not exist, and the measured state was a Mac 91 commits behind `main` and a cell whose `HARNESS-PIN` named a commit its checkout did not have, with every signal reading `auto`. Rows 7-11 answer *what is deployed*; none of them answers *whether the deployed code is still main* — see `docs/ops/harness-apply.md` |
+| 15c | **runner pool autoscale on a clock** (`runner_autoscale.py` — measure the box, derive the ceiling, converge the local pool) | **absent** (source ships; no installer has run) | **improvised** (pi-cell-1 only: this lane ran the installer and armed it; no bring-up or schedule re-creates it) | `scripts/install-runner-autoscale-timer.sh` renders and converges both platforms (`templates/systemd/eldato-runner-autoscale.{service,timer}` / `templates/launchd/runner-autoscale/com.eldato.runner-autoscale.plist`), farmed by `pi-bootstrap/setup.sh`; `--status` reports installed / armed / drift / last tick | **HIGH until #2403** — the converger landed in #2877/#2900 and **nothing ran it**, so a box kept whatever runner count it happened to have: pi-cell-1 measured 5 live against a measured ceiling of 3 (8 cores) while tortoise CI sat at 16-34 queued runs. `--install` is dry-run; `--arm` is a separate dated owner step, and it refuses a box that cannot measure its own ceiling. ⛔ **NOTHING INVOKES THE INSTALLER YET** — no bring-up check, no schedule-of-schedules — which is why the mac column reads `absent` and the cell column reads `improvised` rather than `provisioned`: farming the installer is a copy, not an install (row 8's own precedent), and this lane installed and armed pi-cell-1 by hand. Wiring `install-runner-autoscale-timer.sh --install` into `cloud-cell-bringup.sh --check` (installing DISARMED, like the harness-apply timer it sits beside) is the follow-up that turns this row into `provisioned` — see `docs/ops/runner-autoscale.md` |
 | 16 | **a readiness verdict that measures the merge gate** | **improvised** | **absent** | `cloud-cell-bringup.sh --check` (`CELL READY`) probes home/tools/network/provider/gh auth/push/clone/dispatch-preflight/layer; `cloud-cell-supervisor.sh check` (`CELL CAN RUN A CONTROLLER`) probes `git python3 pi`, `gh auth status`. **Neither probes the admin-merge shim** — the supervisor's only shim probe is its own rate-limit layer (`PATH="$O/gh-limit:$PATH" … gh --version`, `cloud-cell-supervisor.sh:1206`) | **HIGH** — this is the two-definitions-of-ready defect. `gh auth status` answers "is gh authenticated", never "is gh guarded". Measured: `pi-cell-2` has **no operational layer at all**, and `pi-cell-3` has the layer with **no `shims/`** — both can reach their own green banner. ⛔ And the new `activation:` line is **discarded** by the path an operator runs: `cloud-cell-bringup.sh:441` greps the installer's output down to `mode=--verify\|LAYER VERIFIED` |
 
 ## What the matrix says
 
-Counting each **(component, platform)** pair: **8 improvised, 6 absent, 18 provisioned**.
+Counting each **(component, platform)** pair: **8 improvised, 6 absent, 19 provisioned, 1 mixed**, plus 2 `provisioned (on demand)` — **36 pairs in all** (18 rows × 2). Recounted from the table on 2026-11-02 (row 1 moved to provisioned/mixed, row 15c added as absent/improvised).
 
 The measured per-box state behind the cell column, so the generic verdicts above are not misread:
 
@@ -66,10 +68,15 @@ The measured per-box state behind the cell column, so the generic verdicts above
 
 Three things, in order of how much they cost:
 
-1. **The component that gates a merge is the one whose activation is improvised on the Mac and
-   absent on cells** (rows 1-2). Rows 8 and 16 are improvised/absent too — but they cost *recovery*
-   and *truthfulness*, not a merge, and #2130 already owns them. And this is **not** a cell-only
-   defect: the Mac resolves the shim from a shell-rc line the launchd controller does not inherit,
+1. **Row 1 is the component that gates a merge, and it WAS improvised on the Mac and absent on
+   cells** — it is now FARMED (`setup.sh::merge_gate_srcs` provisions `scripts/gh-shim/gh` and its
+   verifier sibling; `cell-install.sh` fails the install without it), re-measured
+   `provisioned`/`mixed` on 2026-11-02. Row 2 is the layer a merge *lane* uses and is still
+   improvised/absent, but it is not the gate: the guard injects its own absolute PATH dir, so a lane
+   that does not type `gh` itself never needed it. Rows 8 and 16 are improvised/absent too — but
+   they cost *recovery* and *truthfulness*, not a merge, and #2130 already owns them. And this is
+   **not** a cell-only defect: before the farm landed the Mac resolved the shim from a shell-rc line
+   the launchd controller does not inherit,
    so "the Mac is activated" is true of interactive sessions and unproven for daemon-born lanes.
 2. **The two rows that make the harness *unattended* are the two that cells do not have** — a
    watchdog (8) and an explicit env (9-11). A cell's controller now has a **shipped** service unit that
@@ -82,17 +89,18 @@ Three things, in order of how much they cost:
 
 ## Ranked fixes — the single change per gap, by landing capability restored
 
-Ranked by how much capability the change restores. #1 is first for a reason: it is the layer that
-decides whether a merge may happen at all, and it is currently the weakest on every cell.
+Ranked by how much capability the change restores. #1 was first for a reason — it is the layer that
+decides whether a merge may happen at all — and it has since LANDED (`merge_gate_srcs`, plus the
+`#3297` runtime refusal), so it is no longer the weakest on every cell: **the live list starts at #2**.
 
 | rank | gap (rows) | the single change | why this one | cost |
 |---|---|---|---|---|
-| **1** | 1 (+2) | **Farm `gh-shim` onto the box**: add it to the farm set `setup.sh` declares (a `gh_shim_srcs` row + a `FARM_LAYOUT` entry in `cell-install.sh`) so it lands at `$DEST/scripts/gh-shim/gh` on **both** platforms | `resolveGhShimDir`'s relative fallback is `EXTENSION_DIR/../../scripts/gh-shim` — that path is `~/.pi/agent/scripts/gh-shim` for a copied install, and it is what a **launchd-born** Mac lane and **every** cell lane resolves. Farming it fixes both sides with one declaration, needs no env var, and the extension then materializes `~/.pi/agent/shims/gh` itself (`materializeGhShim`) | one array + one layout row; `--verify` then byte-compares it for free |
+| ~~1~~ **LANDED** | — | **Farm `gh-shim` onto the box** — DONE: `pi-bootstrap/setup.sh::merge_gate_srcs` declares `gh-shim/gh` **and** `verify-admin-merge-evidence.sh` (one declaration; `cell-install.sh` parses the same set and FAILS the install without the shim, `:477-480`), so it lands at `$DEST/scripts/gh-shim/gh` on **both** platforms. Row 1 re-measured `provisioned`/`mixed` 2026-11-02; the `#3297` runtime half makes an absent layer refuse rather than warn | `resolveGhShimDir`'s relative fallback is `EXTENSION_DIR/../../scripts/gh-shim` — that path is `~/.pi/agent/scripts/gh-shim` for a copied install, and it is what a **launchd-born** Mac lane and **every** cell lane resolves. Farming it fixes both sides with one declaration, needs no env var, and the extension then materializes `~/.pi/agent/shims/gh` itself (`materializeGhShim`) | one array + one layout row; `--verify` then byte-compares it for free |
 | **2** | 9, 10, 11 | **Provision the env, do not inherit it**: a `keys.env` *template* in the repo (PATH incl. `~/.pi/agent/shims`, `MAX_LOAD`, `AGENT_INFRA_PATH`), and make `cloud-cell-bringup.sh --check` refuse `CELL READY` when `keys.env` is absent | measured: one of three live cells has no `keys.env` at all, and **none** of the two that have one sets `PATH` or `MAX_LOAD`. Without it a cell's throttle is the swap gate alone, `AGENT_INFRA_PATH` is a per-cell lottery, and `gh` is unguarded outside the extension | a template + one refusal; the refusal is the part that keeps it true |
 | **3** | 8 | **A cell watchdog**: a `systemd --user` timer (or a tmux-side respawn loop) that restarts a dead controller. The MAC half is now shipped — `templates/launchd/com.eldato.controller-watchdog.plist` → `scripts/orchestrator-harness/watchdog-loop.sh`, with the hand-provisioned `com.eldato.orchestrator-watchdog` added to `templates/launchd/RETIRED` so the installer removes it instead of leaving two mutating watchdogs — but **the job is not installed by the change that ships it**, and a cell still has no scheduler above the tmux session. ⛔ The CELL half is now shipped as `templates/systemd/eldato-orchestrator.service` + `install-controller-service.sh` (#2402), which makes the controller its own restarting unit instead of a watched session: installing it (the bring-up's `check_controller_service` does) is what closes this gap on a box | this is the literal content of the "self-healing" claim; today a cell controller dies silently until the unit is installed. The Mac's capability now exists as source, so what is left is arming it (an installer run) | one installer run on the Mac; a per-cell `install-controller-service.sh` run (the bring-up already does it) |
 | **4** | 11 | **Export `AGENT_INFRA_PATH` in the supervisor's controller command** (`cloud-cell-supervisor.sh::cmd_start`, next to `HOME=/REPO=/O=/OR=`) | restores `session-checks`, `auto-sync` and `sequence-enforcer` on cells, all of which currently skip **silently** — the worst failure shape | one word in a `tmux new-session` string; the README already states the requirement |
 | **5** | 6 | **Activate the git hooks on both**: `git config core.hooksPath .husky` in each repo (or a `husky` prepare step) | restores `commit-msg` + `pre-commit` on the Mac too, where they are also absent today — the row is *not* a cell-specific gap, so it is cheap and everywhere | one config line per repo; per-repo state, so it can never live in the layer |
-| **6** | 16 | **Unify the readiness verdicts** — make `cloud-cell-bringup.sh --check` probe the things the merge gate needs (shim resolvable, `scripts/gh-shim/gh` executable, PATH carries `~/.pi/agent/shims`) and delete the claim that `gh auth status` means "ready" | do this **after** 1-2, or it only turns every cell red. It is the row that stops the class from returning | small read-only probes; the same three the matrix used |
+| **6** | 16 | **Unify the readiness verdicts** — make `cloud-cell-bringup.sh --check` probe the things the merge gate needs (shim resolvable, `scripts/gh-shim/gh` executable, PATH carries `~/.pi/agent/shims`) and delete the claim that `gh auth status` means "ready" | do this **after** 2, or it only turns every cell red. It is the row that stops the class from returning | small read-only probes; the same three the matrix used |
 
 Rows **3, 4, 5, 12, 13, 14, 15** are provisioned on both platforms and need nothing.
 
@@ -136,3 +144,86 @@ $ env -u AGENT_GH_SHIM_DIR CELL_HOME=$HOME cell-install.sh --verify | grep activ
                                 PATH is not measured by this line — see row 2. ⛔ ~/.pi/agent/shims/gh
                                 exists but it is never a resolution CANDIDATE …
 ```
+
+## The QUOTA layer is injected AHEAD of the argv guard (#3477)
+
+`withGhShim` now prefixes **two** directories, in this order:
+
+```
+export PATH="$O/gh-limit":"$HOME/.pi/agent/shims":"$PATH"
+```
+
+`resolveGhLimitDir()` resolves the first entry (`$O/gh-limit`, `$O` = the `O` env or
+`$HOME/orchestrator`). `AGENT_GH_LIMIT=0` drops only that entry (the admin-merge guard survives);
+`AGENT_GH_SHIM=0` still disables the whole injection.
+
+⛔ **Identity is the SENTINEL *plus* `--self`, never the sibling helper — and that is a measured
+rule, not a preference.** Two independent bypasses were recorded, in two review rounds.
+
+1. `gh-limit.py:3296` records that accepting “a `gh` beside a `../gh-limit.py`” as a layer
+   “SILENTLY SKIPPED any other `gh` sitting in such a directory — measured with the tree's own
+   admin-merge guard (`scripts/gh-shim/gh`) placed beside the helper: `gh pr merge --admin` then
+   reached the real gh UNGUARDED”.
+2. The sentinel alone is **not** the quota layer either: it identifies every entry point of the
+   family, and `scripts/orchestrator-harness/gh-rest/gh` carries it at bytes 2602 and 5988 *and* sits
+   beside the same `../gh-limit.py` (`LIMIT_HELPER=…`). That adapter skips harness layers by a
+   **whole-file** marker grep, so prepending it would skip `~/.pi/agent/shims/gh` and exec the real
+   `gh`.
+
+Because this entry is prepended **ahead of** the guard, a wrong directory here is worse than none.
+So `resolveGhLimitDir()` requires all of:
+
+| condition | where it is checked | why |
+|---|---|---|
+| `harness-gh-shim-marker` (byte 1100) | first 8 KiB of `<dir>/gh` | it is a harness entry point |
+| `--self` (byte 5886/6156) | first 8 KiB of `<dir>/gh` | it is THIS layer, not the `gh-rest` adapter (which never passes `--self`) |
+| a regular, executable `gh` | `<dir>/gh` | bash silently skips a PATH entry that is not |
+| the sibling helper | `<dir>/../gh-limit.py`, `existsSync` — **a separate file, no window** | without it the wrapper takes its fail-open arm |
+
+Absent any one of them it resolves to `null` and nothing is injected. The helper is a *different
+file* from the wrapper, so it has no 8 KiB window — the wrapper's own header merely *mentions* the
+path `$SELF_DIR/../gh-limit.py`, so a predicate that only scanned the first 8 KiB for those three
+strings would be satisfied by a layer whose helper is **absent**: the state the third condition
+exists to close, in which the wrapper prints “that call was NOT serialised or backed off” while the
+box believes the cache is in force.
+
+⛔ **The order is the correctness argument — and the GUARD is the half that survives it.** The
+chain is `gh-limit → gh-shim → real gh`. `gh-limit`'s `is_harness_shim` reads only the first 8 KiB,
+and `scripts/gh-shim/gh` keeps its own marker at byte **26405** — deliberately outside that window —
+so the quota layer resolves the argv guard as its CHILD and the #984 admin-merge gate stays in the
+chain.
+
+**Reverse the order and it is the QUOTA LAYER that is lost, not the guard** (measured, review round
+5). `scripts/gh-shim/gh`'s `_is_harness_layer` also reads the first 8 KiB, and `gh-limit`'s marker
+sits at byte **1100** — inside it — so the guard skips `gh-limit` and resolves the real `gh`. The
+failure an operator will actually meet with the wrong order is therefore **“gh-limit is still unused
+on this box”** (`averted=0`, the `839 gh-core-floor … read refused` state returning), not “merges are
+unguarded”. Stated in that direction because the opposite sends the diagnosis to the wrong place —
+and would have a future change that moves the quota dir after the guard reviewed as gate-destroying
+when it actually re-opens this defect.
+
+**Parity, stated precisely.** `lane.sh:83-84` prepends `$O/gh-limit` and then `$O/gh-rest`, so the
+resulting PATH has **`$O/gh-rest` first** (its own comment: “adapter last so `$O/gh-rest` … wins
+where it exists”). This extension composes the **cell** layer only — `resolveGhLimitDir` has no
+`gh-rest` candidate — so it establishes the quota-before-guard half of that order, not the whole of
+it. On a Mac, `install.sh` seeds `$O/gh-rest/gh` and `$O/gh-limit.py` but never creates
+`$O/gh-limit/`, so the resolver returns `null` and pane-spawned Mac lanes get no quota layer; that
+bypass is unchanged by this change and is named here rather than implied away.
+
+**Measured, cell `cmux`, 2026-11-05 — why it was needed.** 11 of 12 live lane `pi` processes had
+**no** `gh-limit` on PATH: they resolved `~/.pi/agent/shims/gh` and then the real `gh`, bypassing
+the cache, the budget and `--stats` entirely. The same box's `gh-limit` events log (21 h, 1005
+lines) recorded **839** `pressure: gh-core-floor … read refused` events and **zero**
+`read-cache: <class> hit`, **zero** `single-flight: shared` and **zero** `conditional: 304` —
+`--stats` read `averted=0` — with `core` at `0/5000` while `graphql` held `4159/5000`.
+Re-verification takes the emitted prefixes, not prose: `rg -c 'read-cache: .* hit' events.log`
+(the literal string `read-cache hit` is not emittable and would read 0 on a healthy cache).
+Cost of the extra hop, measured: `gh --version` 123 ms direct vs **278 ms** through the chain.
+
+**Residual, stated rather than implied.** The quota entry is `$O/gh-limit` (or
+`AGENT_GH_LIMIT_DIR`), which is an operator-controlled absolute path and is **not** neutralised the
+way the shim entry is. A home directory containing a gate word (`/home/admin/…`) therefore lands
+in the injected text, which is the VGATE #984 class that made a checkout path containing `admin`
+look like an admin merge. The default (`$HOME/orchestrator/gh-limit`) is clean and is asserted; a
+non-default `O`/`AGENT_GH_LIMIT_DIR` carrying a gate word is not, and is left visible here rather
+than silently guarded.

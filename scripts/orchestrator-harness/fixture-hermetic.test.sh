@@ -62,17 +62,42 @@ case "$OUT" in *REFUSES*) bad "it refused on directory presence alone" ;; *) ok 
 
 echo "=== H2: a controller executing from a live root -> REFUSES (rc 78), naming pid and root ==="
 ROOT2="$T/root2"; P2="$(plant "$ROOT2" | tail -1)"
-OUT="$(FIXTURE_LIVE_ROOTS="$ROOT2" bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; rc=$?
+# ⛔ `CI=` IS PINNED HERE (agent-infra#3411). Every arm that asserts a REFUSAL must run with the CI
+# marker UNSET, or the arms would only pass on a box that is not itself running in CI — the suite would
+# be green on a laptop and red exactly where this fix is needed, and green where it is vacuous.
+OUT="$(CI= FIXTURE_LIVE_ROOTS="$ROOT2" bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; rc=$?
 ck "it refuses to run a suite on a live cell (rc=$rc, want 78)" "$([ "$rc" -eq 78 ] && echo 0 || echo 1)"
 case "$OUT" in *"pid $P2"*) ok "the refusal names the offending controller (pid $P2), so it is actionable" ;;
               *) bad "the refusal does not name pid $P2: $OUT" ;; esac
 case "$OUT" in *"$ROOT2"*) ok "…and the live root it read" ;; *) bad "the root is not named: $OUT" ;; esac
 
 echo "=== H3: the same box with explicit opt-in -> runs, and says so ==="
-OUT="$(FIXTURE_LIVE_ROOTS="$ROOT2" HARNESS_SUITE_ALLOW_LIVE_CELL=1 bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; rc=$?
+OUT="$(CI= FIXTURE_LIVE_ROOTS="$ROOT2" HARNESS_SUITE_ALLOW_LIVE_CELL=1 bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; rc=$?
 ck "HARNESS_SUITE_ALLOW_LIVE_CELL=1 overrides the refusal (rc=$rc)" "$rc"
 case "$OUT" in *"LIVE cell"*) ok "…and the override is DISCLOSED, not silent" ;; *) bad "the override was silent: $OUT" ;; esac
 alive "$P2" || bad "the guard killed the plant — it must only refuse, never signal"
+
+# ── H3b: CI is not a live cell (agent-infra#3411) ─────────────────────────────────────────────
+# ⛔ THIS IS THE DISCRIMINATOR FOR THE FIX, and it is a PAIR on the SAME live root: the CI arm proves
+# the exemption exists, and the control arms prove it is bounded. Delete the exemption and cycle 1
+# reds (rc 78 where 0 is required); make it unconditional and the CI=false / CI-unset controls red
+# instead (0 where 78 is required). Neither half can pass on its own.
+echo "=== H3b: a CI runner is NOT a live cell — allowed with a warning; an operator run still refuses ==="
+CIOUT="$(CI=true FIXTURE_LIVE_ROOTS="$ROOT2" bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; circ=$?
+ck "CI=true does NOT refuse a suite on an ephemeral runner (rc=$circ, want 0)" "$([ "$circ" -eq 0 ] && echo 0 || echo 1)"
+case "$CIOUT" in *REFUSES*) bad "it still refused under CI=true: $CIOUT" ;; *) ok "…and it printed no refusal" ;; esac
+case "$CIOUT" in *CI*ephemeral*) ok "…and the exemption is DISCLOSED (names CI/the ephemeral runner), not silent" ;;
+                    *) bad "the CI exemption was silent or unnamed: $CIOUT" ;; esac
+case "$CIOUT" in *"pid $P2"*) ok "…and it still names the cell-shaped match (pid $P2), so the log shows what was exempted" ;;
+              *) bad "the exemption did not name the match: $CIOUT" ;; esac
+# ⛔ THE CONTROL LIVES IN THE SAME BLOCK, because the pair is the proof: same root, same plant, only
+# the env differs. An exemption that is not governed by the marker fails one of these three.
+NOCIOUT="$(CI= FIXTURE_LIVE_ROOTS="$ROOT2" bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; nocirc=$?
+ck "…while the CONTROL (CI unset, same live root) still refuses with 78 (rc=$nocirc)" "$([ "$nocirc" -eq 78 ] && echo 0 || echo 1)"
+FALSECIOUT="$(CI=false FIXTURE_LIVE_ROOTS="$ROOT2" bash -c '. "$1"; fixture_guard_placement "x.test.sh"' _ "$HELPER" 2>&1)"; falsecirc=$?
+ck "…and CI=false is NOT truthy — it refuses too (rc=$falsecirc, want 78), so the marker is parsed, not merely present" \
+   "$([ "$falsecirc" -eq 78 ] && echo 0 || echo 1)"
+alive "$P2" || bad "an exemption signalled the plant — the guard must never signal, only allow or refuse"
 fixture_reap_all >/dev/null 2>&1
 
 # ── H4: the leak test (this is the arm that goes RED if the reaper is reverted) ────────────────
@@ -170,7 +195,7 @@ ck "…and the plant is ALIVE before driving the driver (pid $P8) — otherwise 
 # fixture-hermetic.test.sh recurses the same way. The failure direction was safe — rc≠78 reds the arm —
 # but a broken `plant` turned the cheapest shard into an unbounded recursive full-population run.
 if alive "$P8"; then
-  OUT="$(FIXTURE_LIVE_ROOTS="$ROOT8" bash "$SHARDS" 2>&1)"; rc=$?
+  OUT="$(CI= FIXTURE_LIVE_ROOTS="$ROOT8" bash "$SHARDS" 2>&1)"; rc=$?
   ck "the shipped driver REFUSES to run shards on a live cell (rc=$rc, want 78)" "$([ "$rc" -eq 78 ] && echo 0 || echo 1)"
   case "$OUT" in *"REFUSES TO RUN ON A LIVE CELL"*) ok "…with its own refusal, not a shard failure" ;;
                                   *) bad "the refusal text is missing: $OUT" ;; esac

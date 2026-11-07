@@ -19,7 +19,8 @@
 # silent in every direction, so it gets an assertion of its own rather than a paragraph in a README.
 #
 # THE ARMS
-#   A. the rendered job's program IS the pinned tree (never a home-dir copy, never `$O`)
+#   A. the rendered job's program is the STABLE RESOLVER in `$O` — a path that never moves — and, run
+#      now, it RESOLVES to the pinned tree (agent-infra#3309: the two halves whose disagreement is silent)
 #   B. the FIRST pin is materialised by the cells' own materialiser (`apply --force --pin-only`)
 #   C. the installer REFUSES, naming both paths, when: the resolved dir is a copy; the pin's sha and
 #      the resolved tree disagree; the pin record cannot be read; the pin record cannot be examined;
@@ -57,7 +58,7 @@ need() { [ -e "$1" ] || { bad "missing fixture: $1"; return 1; }; }
 T="$(mktemp -d "${TMPDIR:-/tmp}/macpin.XXXXXX")" || { echo "mac-pin-parity: cannot create a temp dir" >&2; exit 2; }
 trap 'rm -rf "$T"' EXIT
 
-sec "A. the rendered job's program is the PINNED tree"
+sec "A. the rendered job's program is STABLE and RESOLVES to the PINNED tree"
 # ── fixture: a real git repo carrying a harness, so "is a worktree at a commit" is TRUE for it and
 # FALSE for a copy. That difference is the whole point — a copy has no answer to `rev-parse HEAD`.
 FX="$T/repo"
@@ -86,8 +87,18 @@ STAGE="$T/stage"; mkdir -p "$STAGE"
 # label seam, reading as `❌ check-class.py is missing or does not parse`); they are shipped companions
 # of install.sh (see install.sh's own drift list), so the stage carries the REAL ones rather than a stub
 # — a stub would pass the parse gate while proving nothing about the ship set.
+# ⛔ AND `orch-pin-exec.sh` IS STAGED FOR A HARDER REASON (agent-infra#3309 review, P1): install.sh SEEDS
+# it from the pinned tree and FALLS BACK to `$HERE/orch-pin-exec.sh`, and `$HERE` here is `$STAGE`. A
+# stage without it made every install-driven arm die at that `die` ("orch-pin-exec.sh not found in the
+# pinned tree … or this checkout"), which is 24 newly-red assertions measured on the head — the shard was
+# red on its own suite and nobody ran it. The stage carries the REAL file so the seeded program is the
+# one under test.
 cp "$INSTALL" "$HARNESS/launchd-cycle.sh" "$TEMPLATE" "$HARNESS/refresh-candidates.sh" \
-   "$HARNESS/merge-reminder.py" "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" "$STAGE/" 2>/dev/null
+   "$HARNESS/merge-reminder.py" "$HARNESS/check-class.py" "$HARNESS/nochk-resolve.py" \
+   "$HARNESS/orch-pin-exec.sh" "$STAGE/" 2>/dev/null
+# ⛔ THE STAGE MUST CARRY IT, OR EVERY ARM READS AS A CONTRACT FAILURE (asserted, not assumed): a silent
+# `cp` failure would re-create the same 24 reds with a misleading cause.
+[ -f "$STAGE/orch-pin-exec.sh" ] || bad "fixture: orch-pin-exec.sh was not staged into $STAGE — the installer cannot seed the stable program and every arm below reads as a contract failure"
 BIN="$T/bin"; mkdir -p "$BIN"
 # install.sh probes the real binaries (gh/network, tmux, pi, jq) and lints the plist with plutil. ALL of
 # them are stubbed IN $BIN: the assertions below are about the RENDERED PROGRAM, not the host's toolchain.
@@ -174,18 +185,27 @@ ck "$(has "$PIN_DIR_REC" "/harness/" && echo 0 || echo 1)" "the dir record names
 ck "$([ "$PIN_SHA_REC" = "$FX_SHA" ] && echo 0 || echo 1)" "the sha record names the pinned commit ($PIN_SHA_REC)"
 ck "$(git -C "$PIN_DIR_REC" rev-parse --git-dir >/dev/null 2>&1 && echo 0 || echo 1)" "the pinned dir IS a git worktree (a copy would fail here)"
 PROG="$(plist_program "$PLIST")"
-ck "$(has "$PROG" "$PIN_DIR_REC" && echo 0 || echo 1)" "the job's program is the PINNED tree ($PROG)"
+# ⛔ THE CONTRACT INVERTED IN #3309 AND THIS ARM ENCODES THE NEW ONE: the rendered program is the STABLE
+# RESOLVER in `$O`, NOT the pin path. (Before: "the job's program IS the pinned tree".) Both halves are
+# asserted, because either alone passes on a broken pair — a plist naming the pin is the #3309 defect,
+# and a resolver that does not resolve is a job that exits 127 on every tick while `launchctl list`
+# still says `loaded`.
+ck "$([ "$PROG" = "$O/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
+   "the job's program is the STABLE RESOLVER \$O/orch-pin-exec.sh ($PROG)"
 case "$PROG" in
-  "$O"/*|"$HOME"/orchestrator/*|*/.cache/orc/*|*/.pi/agent/scripts/*)
-    bad "the job's program is a HOME-DIR copy of a repo script ($PROG) — this is the divergence the suite exists for" ;;
-  *) ok "the job's program is NOT a home-dir copy (not \$O, not ~/orchestrator, not ~/.cache/orc, not ~/.pi/agent/scripts)" ;;
+  "$PIN_DIR_REC"/*|"$HOME"/harness/*)
+    bad "the job's program is INSIDE the pin tree ($PROG) — a hash-named snapshot the pin GC deletes on the next advance: this IS the #3309 defect" ;;
+  *) ok "…and it is OUTSIDE the pin tree, so it survives a pin advance (the path never moves)" ;;
 esac
-# ⛔ THE POSITIVE FORM OF THE SAME RULE, which is what a reviewer needs: no PROGRAM path in the rendered
-# plist belongs to a directory that is not a git worktree at the pin.
-if [ -n "$PROG" ] && git -C "$(dirname "$PROG")" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
-  ok "the program lives in a directory with a commit identity (re-pin can be checked against it)"
+# ⛔ THE POSITIVE FORM OF THE SAME RULE, which is what a reviewer needs: what the job will ACTUALLY run
+# (the resolver's own answer, not the installer's bookkeeping) must be a path with a commit identity.
+RESOLVED="$(env HARNESS_PIN_FILE="$SHOME/.harness-path" /bin/bash "$PROG" --resolve-only 2>&1)"
+ck "$([ -n "$RESOLVED" ] && has "$RESOLVED" "$PIN_DIR_REC" && echo 0 || echo 1)" \
+   "…and run now it RESOLVES to the pinned tree ($RESOLVED)"
+if [ -n "$RESOLVED" ] && git -C "$(dirname "$RESOLVED")" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
+  ok "the RESOLVED program lives in a directory with a commit identity (re-pin can be checked against it)"
 else
-  bad "the program's directory has no commit identity — the job would run code nothing can name ($PROG)"
+  bad "the resolved program's directory has no commit identity — the job would run code nothing can name ($RESOLVED)"
 fi
 # The pin records ride in the daemon's ENVIRONMENT too, or `harness-refresh.sh` (which runs INSIDE the
 # controller's cycle) cannot compare this box to the ref, and the spawn lines lose the harness token.
@@ -204,7 +224,10 @@ out="$(env HOME="$SHOME2" O="$T/o2" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
 rc=$?
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an explicit HARNESS=<checkout harness> installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 P2="$(plist_at "$SHOME2")"
-ck "$([ "$(plist_program "$P2" 2>/dev/null)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" "…and the program is that checkout's orch-loop.sh"
+ck "$([ "$(plist_program "$P2" 2>/dev/null)" = "$T/o2/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
+   "…and the rendered program is the STABLE RESOLVER, not the checkout's orch-loop.sh"
+ck "$([ "$(env HARNESS_PIN_FILE="$SHOME2/.harness-path" /bin/bash "$T/o2/orch-pin-exec.sh" --resolve-only 2>&1)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" \
+   "…and that resolver run now resolves to that checkout's orch-loop.sh"
 ck "$([ -f "$SHOME2/.harness-path" ] && [ -f "$SHOME2/.pi/agent/state/HARNESS-PIN" ] && echo 0 || echo 1)" \
    "…and it MENDED both pin records, so the next reader resolves the same tree"
 
@@ -309,7 +332,10 @@ ck "$([ "$PIN_DIR_A3" != "$FX3H" ] && echo 0 || echo 1)" \
 ck "$([ "$(head -1 "$SHOME3P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX3_SHA" ] && echo 0 || echo 1)" \
    "…and the sha record names that commit"
 P3P="$(plist_at "$SHOME3P")"
-ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" "…and the job execs that tree"
+ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$O3P/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
+   "…and the job execs the STABLE RESOLVER (\$O3P/orch-pin-exec.sh), not the moving pin path"
+ck "$([ "$(env HARNESS_PIN_FILE="$SHOME3P/.harness-path" /bin/bash "$O3P/orch-pin-exec.sh" --resolve-only 2>&1)" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" \
+   "…and that resolver execs THAT tree ($PIN_DIR_A3/orch-loop.sh)"
 # The launcher's verdict on the SAME two records: it must not call the box BROKEN.
 # ⛔ `HARNESS_REPO` IS PART OF THE FIXTURE, NOT DECORATION. `harness-up` resolves the repo whose object
 # DB the pin commit is read in from `HARNESS_REPO`, then this machine's config file, then ITS OWN
@@ -477,8 +503,10 @@ out="$(env HOME="$SHOME8" O="$O7" REPO="$T/repo2" OR="acme/widget" HARNESS="$FXH
         PATH="$BIN:$PATH" bash "$STAGE/install.sh" 2>&1)"; rc=$?
 P8="$(plist_at "$SHOME8")"
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
-ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
-   "…and the job runs the PINNED entrypoint, not \$O's copy"
+ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$O7/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
+   "…and the job runs the STABLE RESOLVER, not \$O's copy of the entrypoint"
+ck "$([ "$(env HARNESS_PIN_FILE="$SHOME8/.harness-path" /bin/bash "$O7/orch-pin-exec.sh" --resolve-only 2>&1)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
+   "…and the resolver picks the PINNED entrypoint (launchd-controller.sh), so the pin's preference is what a tick gets"
 # ⛔ ONE PROGRAM LINE, AND IT NAMES THE PROGRAM THE JOB WILL EXEC (review P5). The installer used to print
 # `harness pinned … the job will exec <pin>/orch-loop.sh` BEFORE `HARNESS_ENTRY` was chosen, so a pin
 # carrying the entrypoint printed two contradictory programs; and the documented recovery `pkill` still
@@ -565,8 +593,12 @@ out="$(env HOME="$SHOME7h" O="$T/o7h" REPO="$FXSP" OR="acme/widget" HARNESS_REPO
         PATH="$SHOME7h/.local/share/pi-node/current/bin:$BIN:$PATH" \
         bash "$STAGE/install.sh" 2>&1)"; rc=$?
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin path containing a SPACE installs (rc=$rc, the post-render assertion accepts the correct program)"
-ck "$(has "$(plist_program "$(plist_at "$SHOME7h")" 2>/dev/null)" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
-   "…and the rendered program IS that path, space and all"
+ck "$([ "$(plist_program "$(plist_at "$SHOME7h")" 2>/dev/null)" = "$T/o7h/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
+   "…and the rendered program is the stable resolver at its space-free path"
+# ⛔ THE SPACE HAZARD MOVED, IT DID NOT DISAPPEAR: the spaced path is now what the RESOLVER must print and
+# exec, so a quoting regression here is a 127 every tick. Asserted on the resolver's own output.
+ck "$(has "$(env HARNESS_PIN_FILE="$SHOME7h/.harness-path" /bin/bash "$T/o7h/orch-pin-exec.sh" --resolve-only 2>&1)" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
+   "…and the resolver returns the SPACED pin path intact ($(env HARNESS_PIN_FILE="$SHOME7h/.harness-path" /bin/bash "$T/o7h/orch-pin-exec.sh" --resolve-only 2>&1))"
 
 # B6c — `set -e` HAZARDS IN THE RECORD CAPTURES (review P4). A pin RECORD that is a directory used to
 # abort the installer with `head`'s status and NO message; the block promises a named rc=78 refusal.
@@ -582,18 +614,25 @@ ck "$(has "$out" "REFUSED (pin)" && echo 0 || echo 1)" "…and the refusal is th
 # the CURRENT template, whose token already agrees with the pin — so a stale/deviant template (a staging
 # copy from an older checkout, the exact "which copy you run decides the effect" hazard in
 # docs/ops/fleet-harness-baseline.md §3.1) would sail through with the suite green (review finding, P2).
-# The mutation below IS that deviant template: one rule rewritten to the pre-change `__O__` program.
+# The mutation below IS that deviant template — and it is the OLD contract (`__HARNESS__/__ENTRY__`, the
+# pin path) rather than `__O__`: #3309's whole subject is that the pin path is what must never be
+# rendered, so the backstop is proved against the shape that actually recurred.
 STAGE_OLD="$T/stage-old"; mkdir -p "$STAGE_OLD"
 cp "$STAGE/install.sh" "$STAGE/launchd-cycle.sh" "$STAGE/refresh-candidates.sh" "$STAGE/merge-reminder.py" \
-   "$STAGE/check-class.py" "$STAGE/nochk-resolve.py" "$STAGE_OLD/" 2>/dev/null
-sed 's|<string>__HARNESS__/__ENTRY__</string>|<string>__O__/orch-loop.sh</string>|' "$TEMPLATE" > "$STAGE_OLD/launchd.plist.template"
+   "$STAGE/check-class.py" "$STAGE/nochk-resolve.py" "$STAGE/orch-pin-exec.sh" "$STAGE_OLD/" 2>/dev/null
+sed 's|<string>__PROGRAM__</string>|<string>__HARNESS__/__ENTRY__</string>|' "$TEMPLATE" > "$STAGE_OLD/launchd.plist.template"
+# ⛔ AND THE MUTATION IS ASSERTED, or a template whose token was renamed makes this arm refuse for the
+# WRONG reason (`__PROGRAM__` rendered literally) and still look green.
+ck "$(has "$(cat "$STAGE_OLD/launchd.plist.template")" '<string>__HARNESS__/__ENTRY__</string>' && echo 0 || echo 1)" \
+   "fixture: the deviant template renders the OLD pin-path contract"
 SHOME10="$T/home10"; mkdir -p "$SHOME10/Library/LaunchAgents"
 out="$(env HOME="$SHOME10" O="$T/o10" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" HARNESS="$FXH" \
         ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 \
         PATH="$BIN:$PATH" bash "$STAGE_OLD/install.sh" 2>&1)"; rc=$?
-ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a template that renders the OLD \`\$O\` program is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
+ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a template that renders the OLD pin path as the program is REFUSED (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$(has "$out" "the plist and the pin disagree" && echo 0 || echo 1)" "…and the refusal says the plist and the pin disagree"
-ck "$(has "$out" "$FXH/orch-loop.sh" && echo 0 || echo 1)" "…and names the program the pin resolved"
+ck "$(has "$out" "$FXH/orch-loop.sh" && echo 0 || echo 1)" "…and names the pin path the deviant template would have installed"
+ck "$(has "$out" "$T/o10/orch-pin-exec.sh" && echo 0 || echo 1)" "…and names the STABLE program it refuses in favour of"
 ck "$([ ! -f "$(plist_at "$SHOME10")" ] && echo 0 || echo 1)" \
    "…and NOTHING was installed (the refusal is atomic: the previous plist is untouched)"
 
@@ -606,11 +645,107 @@ _hs="$(CELL_HOME="$SHOME7f" HOME="$SHOME7f" O="$T/o7f" REPO="$FX" HARNESS_PIN_DI
 ck "$(has "$_hs" "ABSENT" && echo 1 || echo 0)" "a directory-shaped HARNESS-PIN is NOT read as an absent pin"
 ck "$(has "$_hs" "NOT A REGULAR FILE" && echo 0 || echo 1)" "…it is named for what it is"
 
+sec "B8. the #3309 contract is PROVED BY RUNNING the installer, not by reading its source"
+# ⛔ WHY THIS SECTION EXISTS (agent-infra#3309 review, P2 finding 6). The durability suite asserted #3309
+# by grepping install.sh's TEXT for three strings — and those three greps pass on code that carries the
+# silent-abort defect, the false re-run diagnosis and the trailing-slash-fail-open, because all three are
+# about BEHAVIOUR under conditions the grep never creates. So each finding gets an arm here that runs the
+# shipped installer and reads the outcome. Every arm is hermetic ($STAGE + stubs + a sandbox $HOME).
+
+# B8a — THE PIN PREDATES THIS COMMIT: it carries no `orch-pin-exec.sh`, and the installer must still
+# install (seeding from its own checkout). This is the documented fallback, and it is also the condition
+# under which the re-run below becomes the wrong-refusal hazard.
+SHOME_8A="$T/home-8a"; mkdir -p "$SHOME_8A/Library/LaunchAgents"
+O_8A="$T/o-8a"; mkdir -p "$O_8A"
+[ -f "$FXH/orch-pin-exec.sh" ] && bad "fixture: the pin must NOT carry orch-pin-exec.sh for this arm" \
+  || ok "fixture: the pin carries NO orch-pin-exec.sh (the state every pin predating #3309 is in)"
+out="$(env HOME="$SHOME_8A" O="$O_8A" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME_8A/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that does NOT carry orch-pin-exec.sh still installs, seeded from this checkout (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
+ck "$([ -x "$O_8A/orch-pin-exec.sh" ] && echo 0 || echo 1)" "…and the stable program was seeded into \$O"
+ck "$([ "$(env HARNESS_PIN_FILE="$SHOME_8A/.harness-path" /bin/bash "$O_8A/orch-pin-exec.sh" --resolve-only 2>&1)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" \
+   "…and it resolves the pin ($FXH/orch-loop.sh)"
+
+# B8b — A RESOLVER THAT CANNOT RESOLVE MUST BE A REFUSAL, NOT A SILENT rc=127 (review P1 finding 2).
+# `install.sh:1424` was an unguarded `$( … )` under `set -euo pipefail`, and the resolver's failure path is
+# `exit 127` — so the installer aborted with NO message and `2>/dev/null` swallowed the DEAD-SUPERVISOR
+# line, in the change whose premise is "the real defect was silence". This arm seeds a pin carrying a
+# resolver that dies 127 and asserts the installer SPEAKS.
+BX="$T/repo-broken"; mkdir -p "$BX/scripts/orchestrator-harness"
+( cd "$BX" || exit 1
+  git init -q -b main . >/dev/null 2>&1
+  printf '.worktrees/\n' > .gitignore
+  printf '#!/bin/bash\necho loop\n' > scripts/orchestrator-harness/orch-loop.sh
+  cat > scripts/orchestrator-harness/orch-pin-exec.sh <<'BROKEN_STUB'
+#!/usr/bin/env bash
+printf 'PIN-EXEC: DEAD-SUPERVISOR: fixture — the pin record does not resolve\n' >&2
+exit 127
+BROKEN_STUB
+  chmod +x scripts/orchestrator-harness/orch-pin-exec.sh
+  git add -A >/dev/null 2>&1
+  git -c user.email=t@t -c user.name=t commit -qm base >/dev/null 2>&1
+  git update-ref refs/remotes/origin/main HEAD ) >/dev/null 2>&1
+BXH="$BX/scripts/orchestrator-harness"
+SHOME_8B="$T/home-8b"; mkdir -p "$SHOME_8B/Library/LaunchAgents"
+out="$(env HOME="$SHOME_8B" O="$T/o-8b" REPO="$BX" OR="acme/widget" HARNESS_REPO="$BX" HARNESS="$BXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME_8B/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a stable program that CANNOT resolve is refused (rc=$rc, not rc=0)"
+ck "$([ "$rc" -ne 127 ] && echo 0 || echo 1)" "…and the refusal is the INSTALLER's (rc=$rc), not the resolver's bare 127 escaping through an unguarded \$( )"
+ck "$(has "$out" "REFUSED (#3309)" && echo 0 || echo 1)" "…with a REFUSED (#3309) message that the unguarded substitution made UNREACHABLE"
+ck "$(has "$out" "resolves to '<nothing>'" && echo 0 || echo 1)" "…naming that it resolved to nothing"
+ck "$(has "$out" "DEAD-SUPERVISOR" && echo 0 || echo 1)" "…and carrying the resolver's own stderr, which `2>/dev/null` used to discard"
+ck "$([ ! -f "$(plist_at "$SHOME_8B")" ] && echo 0 || echo 1)" "…and NOTHING was installed"
+
+# B8c — A TRAILING SLASH MUST NOT DISABLE THE PIN-ROOT GUARD (review P2 finding 5). `HARNESS_PIN_DIR` is
+# operator-supplied; `"$HARNESS_PIN_DIR"/*` became `/x/harness//*`, which matches NOTHING, so the guard
+# silently disabled itself for exactly the operator who typed the path with a slash. Here `$O` IS inside
+# the pin root, so the guard MUST fire — and before the fix this arm's install would have SUCCEEDED.
+PROOT="$T/pinroot"; mkdir -p "$PROOT/deployed"
+SHOME_8C="$T/home-8c"; mkdir -p "$SHOME_8C/Library/LaunchAgents"
+out="$(env HOME="$SHOME_8C" O="$PROOT/deployed" REPO="$FX" OR="acme/widget" HARNESS_REPO="$FX" HARNESS="$FXH" \
+        HARNESS_PIN_DIR="$PROOT/" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME_8C/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc=$?
+ck "$([ "$rc" -ne 0 ] && echo 0 || echo 1)" "a program INSIDE \$HARNESS_PIN_DIR is refused even when the operator wrote the path with a TRAILING SLASH (rc=$rc)"
+ck "$(has "$out" "INSIDE the harness pin root" && echo 0 || echo 1)" "…and the refusal names the pin root as the reason"
+ck "$([ ! -f "$(plist_at "$SHOME_8C")" ] && echo 0 || echo 1)" "…and NOTHING was installed (the guard was not skipped)"
+
+# B8d — A RE-RUN MUST NOT BE REFUSED WITH A FALSE DIAGNOSIS (review P1 finding 3). After one successful
+# install the plist names `$O/orch-pin-exec.sh`; that file is by DESIGN absent from a pin predating this
+# commit — so the "live-only TCC wrapper" gate fired on the installer's OWN program and refused the
+# second run (measured rc=78, "That file exists in NO commit … PR #2020 lifts it"), making the box
+# un-rerunnable until the next pin advance. The exemption is the SEEDED name.
+out2="$(env HOME="$SHOME_8A" O="$O_8A" REPO="$FX" OR="acme/widget" HARNESS="$FXH" \
+        ELDATO_ALLOW_NON_DARWIN=1 ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 \
+        PATH="$SHOME_8A/.local/share/pi-node/current/bin:$BIN:$PATH" \
+        bash "$STAGE/install.sh" 2>&1)"; rc2=$?
+ck "$([ "$(plist_program "$(plist_at "$SHOME_8A")" 2>/dev/null)" = "$O_8A/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
+   "…the INSTALLED plist names the stable program (so the re-run below is the hazardous shape)"
+ck "$([ "$rc2" -eq 0 ] && echo 0 || echo 1)" "a RE-RUN on that box installs (rc=$rc2, was 78) — the installer is re-runnable"
+ck "$(has "$out2" "LIVE-ONLY entrypoint" && echo 1 || echo 0)" "…and it does NOT claim a live-only TCC wrapper the box does not have"
+# ⛔ AND THE GATE IS NOT GUTTED BY THE EXEMPTION: a genuinely live-only entrypoint is still refused —
+# asserted by the `Program`-key arm above (it names `launchd-controller.sh`, a name the pin does not
+# carry, and its refusal is `LIVE-ONLY entrypoint`). The exemption is ONE seeded name, not the gate.
+ck "$([ -f "$(plist_at "$SHOME_8A")" ] && echo 0 || echo 1)" "…and the plist is still there (the re-run is a no-op render, not a removal)"
+
 sec "C. the LIVE arm: every installed job runs its program from the PIN (macOS)"
 # ⛔ THIS IS THE ARM THAT WOULD HAVE CAUGHT TONIGHT'S STATE. It reads the plists launchd will actually
 # load — not a fixture — and for every job whose program is a script THIS REPO CARRIES it asserts the
-# configured path is inside the pinned tree. A box still pointing at `~/orchestrator/…` or
-# `~/.cache/orc/…` is RED here, by name, with both paths, instead of drifting silently for a week.
+# configured path is either inside the pinned tree OR the STABLE RESOLVER, which must then RESOLVE into
+# it. A box still pointing at `~/orchestrator/…` or `~/.cache/orc/…` is RED here, by name, with both
+# paths, instead of drifting silently for a week.
+# ⛔ AND THE RESOLVER IS NOT A HOLE IN THE RULE (review finding, against the pre-review head of this
+# file): #3309 moved the orchestrator-loop program OFF the pin and onto `$O/orch-pin-exec.sh`, so this arm
+# would have gone RED ON A CORRECT INSTALL — a false red on the very shape the change ships, in the arm
+# its own header calls the one that would have caught the incident. `orch-pin-exec.sh` is a basename this
+# repo carries, so the in-scope filter below happily pulls it in. The rule that actually has to hold for
+# it is the STRONGER one the installer asserts: run now, it resolves INTO the pin. Anything else — a
+# stale pin, an unresolvable record, a wrapper that points somewhere else — is red.
 # SKIPPED-with-a-reason where there is nothing to read (a Linux CI runner has no LaunchAgents); a skip
 # is never a pass, and the reason is printed.
 LG="${MAC_PIN_LAUNCHAGENTS:-$HOME/Library/LaunchAgents}"
@@ -645,6 +780,17 @@ if [ "$PLATFORM" = "Darwin" ]; then
         fi
         case "$prog" in
           "$PIN_TREE"/*) ok "$(basename "$pl" .plist): program is inside the pin ($prog)" ;;
+          */orch-pin-exec.sh)   # the stable resolver (#3309): in scope only if it RESOLVES into the pin NOW
+             if [ ! -f "$prog" ]; then
+               n_bad=$((n_bad+1)); bad "$(basename "$pl" .plist): the program is the stable resolver $prog but THAT FILE IS MISSING — launchd would exit 127 on every tick while still reporting the job loaded"
+             else
+               _resolved="$(env HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}" /bin/bash "$prog" --resolve-only 2>&1)"
+               case "$_resolved" in
+                 "$PIN_TREE"/*) ok "$(basename "$pl" .plist): the program is the stable resolver, and it RESOLVES into the pin ($_resolved)" ;;
+                 *) n_bad=$((n_bad+1))
+                    bad "$(basename "$pl" .plist): the program is the stable resolver $prog but it resolves to '${_resolved:-<nothing>}', not into the pin ($PIN_TREE) — the job would run a tree the pin does not name, or nothing at all" ;;
+               esac
+             fi ;;
           *) n_bad=$((n_bad+1))
              bad "$(basename "$pl" .plist): program is NOT in the pinned tree — configured $prog, pin names $PIN_TREE (this job runs a copy the repo does not pin)" ;;
         esac
@@ -665,7 +811,7 @@ FIX_REGISTER="
 bounded gh presence probe (no bare \`gh auth token\`)|scripts/orchestrator-harness/refresh-candidates.sh|scripts/orchestrator-harness/origination-funnel.test.sh
 the owner's worklist rides the FLEET ADVANCE order|scripts/orchestrator-heartbeat.sh|tests/heartbeat-fleet-advance/run.sh
 cell bring-up traps (born-pinned worktree, global GH_REPO, tmux env)|scripts/cloud-cell-bringup.sh|scripts/cloud-cell-bringup.test.sh
-the Mac's controller runs its launchd program from the pin|scripts/orchestrator-harness/install.sh|scripts/mac-pin-parity.test.sh
+the Mac's controller runs its launchd program from the pin — or from the STABLE resolver, which must resolve into it|scripts/orchestrator-harness/install.sh|scripts/mac-pin-parity.test.sh
 "
 SHARD_LIST="$REPO_ROOT/scripts/run-bash-shards.sh"
 # ⛔ ASK THE DRIVER FOR ITS LIST — NEVER GREP ITS TEXT (agent-infra#2609). The shard list is DERIVED

@@ -48,6 +48,15 @@
 # `scripts/pr-repair-loop.sh`: "`keys.env` remains authoritative for CREDENTIALS … it may not move WHAT
 # this box repairs or WHERE it records that". ⛔ Do NOT "simplify" the save/restore in `lane.sh` away as
 # redundant — this paragraph is the only record that the exception is deliberate.
+#
+# ⛔ AND `LANE_KEY_GATE` IS NOT A MEMBER OF IT EITHER — IT IS ARGV-ONLY (agent-infra#3331, review P1). It
+# was a sixth member for one commit, with `lane.sh` saving and restoring it around this sourcing, and that
+# could not work: on a cell THIS FILE is sourced by the supervisor under `set -a`, so the box's value
+# reaches the lane as ordinary inherited environment and "the value the caller had" is the same string as
+# "the value the file had" — measured, a key-less lane ran to `outcome=done` with `export LANE_KEY_GATE=0`
+# in `keys.env`. A POLICY switch that can be turned off by a CREDENTIALS file is the ambient-env bypass the
+# gate exists to refuse, so the switch moved to the invocation (`lane.sh --key-gate-off`), which no file can
+# set. If you are tempted to add a variable here to disable a gate: that is the defect, not the fix.
 
 _lane_env_file="${ENV_FILE:-${HOME:-/nonexistent}/keys.env}"
 _lane_env_log="${LANE_ENV_LOG:-}"

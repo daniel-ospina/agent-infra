@@ -37,6 +37,25 @@ WT=".worktrees/adopt-$PR"
 # trusting it. It replaces the directory-name probe, which tested a NAME rather than a branch (#2033).
 wt_provision "$REPO" "$WT" "$BR" "origin/$BR"
 _wt_rc=$?
+if [ "$_wt_rc" = 4 ]; then
+  # ── THE PRE-START DISK REFUSAL (agent-infra#3395): nothing was created, so rc 77 makes this log
+  # name the DISK gate rather than a materialisation failure. `worktree add` was never ATTEMPTED —
+  # that is the property that makes the refusal free, and the reason it must not read as an add error.
+  echo "[adopt-fix $PR] $WT_RESULT" | tee -a "$O/logs/adopt-$PR.log"
+  # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review round 5, P2 — MEASURED). BOTH
+  # pre-start arms reach rc 4 with `REFUSED-UNKNOWN`: an unreadable `df`, and a half-deployed `$O`
+  # missing `spawn-gate.sh` (`wt-lifecycle.sh`'s own arm pins that skew). This line used to tell the
+  # operator to "reclaim space; this will NOT clear by waiting" for both — a remedy that CANNOT ARRIVE
+  # for a broken probe or a version skew, which is the #2721 wrong-cause class this PR fixes one file
+  # over in `fix-one.sh`. `$WT_RESULT` already names which arm refused, so the remedy is read from it.
+  case "$WT_RESULT" in
+    *REFUSED-UNKNOWN*)
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-UNKNOWN: nothing was created, and this is NOT a full disk. The free-space probe could not answer, so check that \`df\` is on PATH and that this box's \$O carries spawn-gate.sh AND that the copy it carries DEFINES \`disk_admit\` — a presence check passes on an older copy that still refuses here (a half-deployed or skewed box fails closed here, #2033). Waiting will NOT clear it." | tee -a "$O/logs/adopt-$PR.log" ;;
+    *)
+      echo "[adopt-fix $PR] fixer NOT started (DISK admission, agent-infra#3395) — REFUSED-DISK: nothing created; reclaim space; this will NOT clear by waiting" | tee -a "$O/logs/adopt-$PR.log" ;;
+  esac
+  exit 77
+fi
 if [ "$_wt_rc" != 0 ]; then
   echo "[adopt-fix $PR] $WT_RESULT — cannot adopt $BR" | tee -a "$O/logs/adopt-$PR.log"
   exit 1
@@ -44,12 +63,43 @@ fi
 echo "[adopt-fix $PR] worktree=$WT branch=$BR ($WT_RESULT) $(date)" >> "$O/logs/adopt-$PR.log"
 bash "$O/fix-one.sh" "$REPO" "$OR" "$PR" "$BR" >> "$O/logs/adopt-$PR.log" 2>&1
 rc=$?
+# ⛔ THE DEFERRAL CODE IS ONE NAMED CONSTANT, NOT A LITERAL REPEATED FOUR TIMES (review of PR #3237,
+# finding 2). `spawn-gate.test.sh` now proves that no two gates in this deploy unit claim one code —
+# and it can only do that for a code it can SEE. Four bare `exit 79`s were a claim no scanner could
+# read, which is the same blindness that let 81 be claimed twice: a code nobody can enumerate is a code
+# somebody will claim again. The VALUE is unchanged (79, unassigned elsewhere in scripts/).
+# ⛔ AND IT IS DEFINED HERE, ABOVE THE `if` CHAIN — not beside the arms it serves. Under `set -u` an
+# assignment that sits between one arm's `echo` and the next `elif` is part of THAT arm's body, so it
+# is simply never executed on the paths that reach the other three: measured on the first cut of this
+# change, `adopt-fix.sh`'s cross-box arm exited 1 ("ADOPT_DEFERRED: unbound variable") instead of 79.
+ADOPT_DEFERRED=79
 # 75 = the load gate refused to start the fixer (nothing ran, nothing consumed). 77 = the DISK gate
-# refused it (#1765). Name BOTH here: the fixer's own line is inside fix-$PR.log, and this is the log
-# a manual operator reads (#1720). They are not interchangeable — a load refusal is cleared by the
-# box quietening, a disk refusal only by reclaiming space — so reporting one as the other sends the
-# operator to wait for a remedy that cannot arrive.
-if [ "$rc" = "75" ]; then
+# refused it (#1765). 81 = the MEMORY gate refused it (#2387). 73 = the FORK gate refused it
+# (agent-infra#2293). Name ALL FOUR here: the fixer's own line is inside fix-$PR.log, and this is the
+# log a manual operator reads (#1720). They are not interchangeable — a load refusal is cleared by the
+# box quietening, a memory refusal by resident lanes FINISHING, a disk refusal only by reclaiming
+# space, and a fork refusal only by restarting or draining the BOX from outside — so reporting one as
+# another sends the operator to wait for a remedy that cannot arrive.
+# ⛔ 81, NOT 73 (review of #2591, P1 — the arm this block exists for had it backwards). The renumber
+# AGENT_MEM_REFUSED 73→81 was applied in every sibling and not here, so this branch sat on the literal
+# 73, which is AGENT_FORK_REFUSED: a box out of PROCESSES was reported as "memory", i.e. WITH THE
+# OPPOSITE REMEDY — precisely the false-cause class the comment above says this block prevents — while
+# a real memory refusal (81) matched no arm and fell to `exit "$rc"` writing NO LINE AT ALL.
+# `fix-one.sh` propagates the gate's own code (`exit "$ar"`), so both codes really do arrive here.
+# Read them from the helper's own variables, tolerantly, for the $O-skew reason `fix-one.sh`'s and
+# `lane.sh`'s arms give: this script sources no gate today, so the default is what a caller normally
+# gets — and if it ever sources one, a pre-#2387 copy defines no AGENT_MEM_REFUSED, where the default
+# keeps the arm inert on a tree that can never return 81 instead of aborting under `set -u`.
+if [ "$rc" = "${AGENT_MEM_REFUSED:-81}" ]; then
+  echo "[adopt-fix $PR] fixer NOT started (MEMORY gate) — available memory is below MEM_MIN_AVAIL_MB. This clears when resident lanes finish, NOT by waiting for load; the reading and the floor are in fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "${AGENT_FORK_REFUSED:-73}" ]; then
+  # ⛔ A FORK REFUSAL IS NAMED, NOT LEFT TO FALL THROUGH (the same P1). It is neither a memory nor a
+  # load refusal and its remedy exists nowhere on this box: the box cannot start the retry it is being
+  # told to wait for, so the operator must restart or drain it from OUTSIDE. `fix-one.sh` writes its
+  # fork line to fix-$PR.log only, so without this arm this log got no line — the silence the
+  # capability arm below was added to end.
+  echo "[adopt-fix $PR] fixer NOT started (FORK gate) — this box is out of PROCESSES (agent-infra#2293) and cannot start the retry, so waiting will NOT clear it: restart or drain the BOX from outside. Nothing was pushed and no attempt was consumed; the reading is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
+elif [ "$rc" = "75" ]; then
   echo "[adopt-fix $PR] fixer NOT started (load gate) — re-run when 1-min load is below MAX_LOAD" >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "71" ]; then
   # ⛔ THE CAPABILITY REFUSAL (#2935) IS THE ONE THIS SCRIPT COULD NOT NAME AT ALL (review of #2991,
@@ -62,10 +112,24 @@ elif [ "$rc" = "72" ]; then
   # refused by fix-one.sh with 72. Name it in the log the manual operator reads (#1720/#2694).
   echo "[adopt-fix $PR] fixer NOT started (REPO IDENTITY) — the worktree/branch is not $OR; nothing pushed, no attempt consumed. See $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
 elif [ "$rc" = "77" ]; then
-  # ⛔ CODE 77 IS TWO CONDITIONS (review round 1, P2): below the floor, and above it without the
-  # headroom for one lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the
-  # operator a full filesystem was the cause when it was not.
-  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — either the filesystem is below DISK_MIN_FREE_MB, or it has no headroom for one lane's dependency tree (DISK-NOHEADROOM). The '[disk-gate] REFUSED' line in the spawn log names which, with both terms. Reclaim space (cloud-cell-supervisor.sh prune --caches); waiting will NOT clear it." >> "$O/logs/adopt-$PR.log"
+  # ⛔ CODE 77 IS THREE CONDITIONS, AND THIS ARM NAMED TWO (review round 6, P2 — MEASURED). The third
+  # arrived with agent-infra#3395: `fix-one.sh` now refuses BEFORE creating a worktree, and its log
+  # carries `[disk-admit] REFUSED-DISK(...)` / `REFUSED-UNKNOWN` — there is NO `[disk-gate] REFUSED`
+  # line on that path, so the old sentence sent the operator to grep a string that is absent, which is
+  # the same wrong-cause class the round-1 fix above this one exists for (#2721).
+  # Round 1 (P2) established the first two: below the floor, and above it without the headroom for one
+  # lane's tree (`DISK-NOHEADROOM`, agent-infra#2721). Naming only the floor told the operator a full
+  # filesystem was the cause when it was not.
+  echo "[adopt-fix $PR] fixer NOT started (DISK gate) — one of THREE: (a) the filesystem is below DISK_MIN_FREE_MB, (b) it has no headroom for one lane's dependency tree (DISK-NOHEADROOM), or (c) the worktree was refused BEFORE it was created (agent-infra#3395 — nothing was attempted, no worktree and no branch). The spawn log names which: '[disk-gate] REFUSED' for (a)/(b), '[disk-admit] REFUSED-DISK' or 'REFUSED-UNKNOWN' for (c). " >> "$O/logs/adopt-$PR.log"
+  # ⛔ THE REMEDY FOLLOWS THE CAUSE ON THIS LINE TOO (review cycle 10, P2 — MEASURED). The summary
+  # above names REFUSED-UNKNOWN as one of THREE causes, but the sentence below it used to prescribe
+  # ONE remedy — "Reclaim space (…prune --caches, and --scratch for /tmp); waiting will NOT clear it" —
+  # for all three. For the UNKNOWN cause that remedy CANNOT ARRIVE: the probe could not answer, or
+  # `spawn-gate.sh` is missing, and no amount of pruning fixes either. That is the #2721 wrong-cause
+  # class the three rc-4 arms were fixed for, left standing in the one line this file's own comments
+  # call "the log a manual operator reads (#1720)". The `_c77` arm in disk-admission.test.sh PINNED
+  # the conflation rather than noticing it, so it is extended to assert the distinction.
+  echo "[adopt-fix $PR] remedy follows the cause, not this line: for (a), (b) and 'REFUSED-DISK' it is space -- run 'cloud-cell-supervisor.sh prune --caches' (and --scratch to clear /tmp). For 'REFUSED-UNKNOWN' it is NOT a full disk -- the free-space probe could not answer, or this box's \$O is missing spawn-gate.sh or carries a copy that predates \`disk_admit\` (a half-deployed or skewed box fails closed, #2033) -- so pruning will NOT clear it and the fix is to check that \`df\` is on PATH and that \$O carries spawn-gate.sh WITH \`disk_admit\` defined in it. Waiting clears none of them." >> "$O/logs/adopt-$PR.log"
 # ⛔ THE 79 DEFERRALS ARE NAMED IN THE LOG THE OPERATOR READS (#2333 cycle 6 review, P2).
 # `fix-one.sh` exits 0 for each of them ON PURPOSE — a deferral is not an error the controller should
 # retry, and the controller books the refund through the bail marker — so `adopt-fix <PR>` would return
@@ -75,7 +139,9 @@ elif [ "$rc" = "77" ]; then
 # refusal, which callers translate to 75. Reusing it here would make an operator who applies the
 # repo's documented 76 mapping wait for load to fall while the real cause is a PR-owner LOCK, which no
 # amount of waiting for the box to quieten will clear — the exact wrong-cause class this block exists
-# to fix (#2333 review). 79 is unassigned in scripts/.
+# to fix (#2333 review). 79 is claimed by no other gate in this deploy unit — `spawn-gate.test.sh`
+# proves that across every shipped helper, which is why the code is a NAMED constant here (`ADOPT_DEFERRED`)
+# rather than a literal a scanner cannot enumerate.
 # ⛔ AND THERE IS NO CI-QUEUE ARM ANY MORE (#2927, and #2928's review): `fix-one.sh` no longer reads
 # the CI queue, so it can never write `DEFERRED by the CI-queue gate`. The arm that used to sit here
 # was UNREACHABLE — and worse than dead, because its message told a manual operator to "re-run when
@@ -93,7 +159,7 @@ elif [ "$rc" = "77" ]; then
 # this matches the CAUSE, never a substring shared with the `DEFERRED: the PR-owner lock` arm below.
 elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the LANDER' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock) — a lander owns this PR right now (review/record/merge in flight), so nothing was pushed and no attempt was consumed; the holder and the reason are in $O/logs/fix-$PR.log. Re-run once the lander finishes (it lands the PR, or refuses and releases)." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.log" 2>/dev/null; then
   # ⛔ THE REPAIR IS NAMED (review of PR #2576, cycle 2 — P2). A STALE claim is now TAKEN OVER by
   # `fix-one.sh` itself (#2574 (b)), so this arm is reached only when the takeover lost a race with a
@@ -102,7 +168,7 @@ elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.l
   # the reclaim the older wording promised (the controller's next dispatch) never comes on this
   # surface, because this script exists for the case where nothing is dispatching the PR.
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, not reclaimable) — the lock's holder could not be proven dead (empty/unparseable content, so it is treated as LIVE), or the takeover displaced a peer's claim and could not restore it; nothing was pushed and no attempt was consumed. If this persists and NO worker is live, REPAIR: confirm none is running (pgrep -af 'fix-one.sh|merge-one.sh|cloud-cell-doctor.sh' — a live FIXER also holds this lock, for the whole agent run), then rm -f \"$O/state/mergeclaim-$PR.lock\" and re-run. The exact line is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 # ... and a REFUSAL that can never clear by itself is named here too, with its own repair. It is NOT
 # refundable in fix-one.sh (a re-dispatch cannot change a lock path that is not a lock file, or an
 # unwritable state dir), so an operator who only sees "success" would re-run it for ever.
@@ -112,7 +178,7 @@ elif [ "$rc" = "0" ] && grep -q 'DEFERRED: the PR-owner lock' "$O/logs/fix-$PR.l
 # not wait for a park that cannot arrive.
 elif [ "$rc" = "0" ] && grep -q 'REFUSED (NOT refundable' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (PR-OWNER lock, UNUSABLE) — the lock path cannot be read or created, which no re-dispatch can change, so fix-one.sh does NOT refund it (a CONTROLLER-dispatched run would consume an attempt and park the PR for a human; this manual run booked nothing, so nothing was consumed here). Nothing was pushed. The repair command is in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 # ⛔ THE CROSS-BOX REFUSAL IS THE FOURTH, AND IT WAS THE ONE STILL REPORTING SUCCESS (review of PR
 # #2576, P3). `fix-one.sh` refuses — also rc=0, also nothing pushed — when another BOX already holds
 # `refs/claims/<PR>-<head12>`, and its line is `cross-box fixer claim REFUSED: …`, with no `DEFERRED`
@@ -120,7 +186,7 @@ elif [ "$rc" = "0" ] && grep -q 'REFUSED (NOT refundable' "$O/logs/fix-$PR.log" 
 # SUCCESS for a run that did nothing — the same class the two arms above were added to close.
 elif [ "$rc" = "0" ] && grep -q 'cross-box fixer claim REFUSED' "$O/logs/fix-$PR.log" 2>/dev/null; then
   echo "[adopt-fix $PR] fixer NOT started (CROSS-BOX claim) — another box is already fixing this head, so nothing was pushed and no attempt was consumed; re-run once that worker finishes or its lease expires. The holder and the head are in $O/logs/fix-$PR.log." >> "$O/logs/adopt-$PR.log"
-  exit 79
+  exit "$ADOPT_DEFERRED"
 fi
 # ⛔ Exit with the FIXER's status, EXPLICITLY. `origin/main` ended on `bash "$O/fix-one.sh"`, so
 # `$?` was already the fixer's. The reporting block ABOVE was added by this change, and an `if` with

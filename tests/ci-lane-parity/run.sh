@@ -1900,7 +1900,7 @@ else
     inold { if ($0 == "done") { inold = 0 }; next }
     { print }
   ' "$DRAIN_FIX/scripts/runner-drain.sh" \
-    | sed 's| bash "\$1" </dev/null| bash "$1"|' >"$DRAIN_FIX/scripts/runner-drain-mutant.sh"
+    | sed 's|shard_exec "\$1" </dev/null|shard_exec "$1"|' >"$DRAIN_FIX/scripts/runner-drain-mutant.sh"
   if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-mutant.sh"; then
     fail "the drain mutant did not change the file — the loop's shape or the shard call moved, and this arm now measures nothing"
   else
@@ -1939,7 +1939,7 @@ else
   # mattering.
   printf '%s\n' tests/ci-lane-parity/drain-a.sh tests/ci-lane-parity/drain-b.sh \
                 tests/ci-lane-parity/drain-c.sh >"$TMP/drain-stdin.txt"
-  sed 's| bash "\$1" </dev/null| bash "$1"|' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-nostdin.sh"
+  sed 's|shard_exec "\$1" </dev/null|shard_exec "$1"|' "$DRAIN_FIX/scripts/runner-drain.sh" >"$DRAIN_FIX/scripts/runner-drain-nostdin.sh"
   if cmp -s "$DRAIN_FIX/scripts/runner-drain.sh" "$DRAIN_FIX/scripts/runner-drain-nostdin.sh"; then
     fail "the </dev/null removal did not change the file — the shard call moved, and this arm now measures the UNMUTATED runner"
   else
@@ -2013,7 +2013,7 @@ else
       inold { if ($0 == "done") { inold = 0 }; next }
       { print }
     ' "$SKIP_FIX/scripts/runner-skip.sh" \
-      | sed 's| bash "\$1" </dev/null| bash "$1"|' >"$SKIP_FIX/scripts/runner-skip-mutant.sh"
+      | sed 's|shard_exec "\$1" </dev/null|shard_exec "$1"|' >"$SKIP_FIX/scripts/runner-skip-mutant.sh"
     if cmp -s "$SKIP_FIX/scripts/runner-skip.sh" "$SKIP_FIX/scripts/runner-skip-mutant.sh"; then
       fail "the skip-reason mutant did not change the file — the loop's shape or the shard call moved, and this arm now measures nothing"
     else

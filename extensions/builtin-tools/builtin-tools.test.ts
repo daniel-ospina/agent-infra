@@ -7968,6 +7968,34 @@ test("#1662: a running record whose process is gone reads GONE, never the termin
   }
 });
 
+test("#3155: a TERMINAL status view carries the child's composed details, so a poll can classify the run", () => {
+  const dir = mkdtempSync(join(tmpdir(), "t3155-status-details-"));
+  try {
+    withEnv({ TASK_HEARTBEAT_TIMEOUT_MS: undefined }, () => {
+      // A settled run: the view must expose the SAME payload `collectTaskRun` returns as
+      // `details`, because the run's own `status` cannot distinguish a verdict from a
+      // success-but-silent child (both are `done`).
+      const done = { ...seedRunningRun(dir).rec, status: "done" as const, exit_code: 0, final_content: [{ type: "text", text: "FINAL" }], final_details: { model: "m", provider: "p" }, settled_at: Date.now() };
+      writeRunRecord(dir, done as any);
+      const v = evaluateTaskRunStatus(done.run_id, dir);
+      equal(v.terminal, true, "terminal");
+      equal((v.final_details as any)?.model, "m", "the child's composed details ride on the view");
+      deepEqual(v.final_details, collectTaskRun(done.run_id, dir).details, "the same payload collect hands back");
+      // No composed details on the record ⇒ NULL, never {}: an empty object would let a consumer
+      // read "nothing to see" where the truth is "cannot certify".
+      const bare = { ...seedRunningRun(dir).rec, status: "done" as const, exit_code: 0, settled_at: Date.now() };
+      writeRunRecord(dir, bare as any);
+      equal(evaluateTaskRunStatus(bare.run_id, dir).final_details, null, "absent composed details ⇒ null");
+
+      // A NON-terminal record composes nothing yet, so the field must be absent, not stale.
+      const running = seedRunningRun(dir);
+      equal(evaluateTaskRunStatus(running.id, dir).final_details, undefined, "a non-terminal view carries no composed details");
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("#1662: an unknown run_id reads UNKNOWN (never a crash, never a confident terminal)", () => {
   const dir = mkdtempSync(join(tmpdir(), "t1662-unknown-"));
   try {

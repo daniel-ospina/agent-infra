@@ -34,6 +34,10 @@ Environment=O={{O}}
 Environment=AI={{AI}}
 Environment=REPO_SLUG={{REPO_SLUG}}
 Environment=SEED_REPO={{SEED_REPO}}
+# ⛔ THE CHANNEL THE FLEET LINE RECONCILES AGAINST (issue #3446). Nothing rendered it before, so the
+# instrument could not name the repo whose `refs/boxes/*` it reads — and the drainer refuses to guess
+# (`why=channel-unverified`) rather than read whatever checkout is at hand. Default: the seed checkout.
+Environment=FLEET_REPO={{FLEET_REPO}}
 # ⛔ RENDERED BLANK BY DEFAULT, ON PURPOSE: an explicit value here is a PIN the script never
 # recomputes. Blank means "derive it from this box's cores every tick" (floor(ncpu x 5/2) — the
 # fleet's 2026-10-17 ruling for the lane ceiling), which is what a resized box needs.
