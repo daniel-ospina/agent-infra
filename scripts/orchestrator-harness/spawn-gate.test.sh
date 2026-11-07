@@ -5943,11 +5943,20 @@ done
 # so in the output), so the registry stayed reachable and `rc=0` passed without exercising anything. A
 # test whose setup silently no-ops is decoration. The remote is now REALLY broken — re-pointed at a path
 # that does not exist, with this box's local witness removed so no fallback can answer either.
+# ⛔ AND "THIS BOX'S LOCAL WITNESS" MEANS *THIS FIXTURE'S*, NOT THE BOX'S REAL ONE (measured
+# 2026-11-07). The probe below inherited the ambient fallback — `~/.pi/agent/state/lanes` on a real
+# box, 1574 records here — so the registry answered `readable:true ... FELL BACK to local` with rc 0
+# while the remote was in fact unreachable, and the arm reddened on a CORRECT fail-closed registry.
+# The rig's own (removed) witness is now pinned on the probe, so `rc=3` really does mean "the remote
+# cannot be reached and nothing local can answer" — the fact the arm asserts. Same defect class the
+# suite's own brief-gate note records: a fixture that inherits ambient env cannot make a claim about
+# isolation.
 git -C "$RREG/work" remote set-url origin "$RREG/missing.git"
 rm -rf "$RREG/state/lanes"
 res="$(rdrive "registry-unreachable" 1)"; rc=$?
 rcval="$(sed -n 's/.*rc=\([0-9]*\).*/\1/p' <<<"$res")"
-unreachable="$(python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
+unreachable="$(LANE_REGISTRY_STATE="$RREG/state" LANE_REGISTRY_LOCAL="$RREG/state/lanes" \
+  python3 "$HERE/lane_registry.py" list --remote "$RREG/missing.git" --json 2>&1 >/dev/null; echo "rc=$?")"
 ck "R4 an unreachable registry does not change the lane's rc=$rcval (registry itself: $unreachable)" \
    $([ "${rcval:-x}" = "0" ] && [ "${unreachable##*rc=}" = "3" ] && echo 0 || echo 1)
 git -C "$RREG/work" remote set-url origin "$RREG/origin.git"
