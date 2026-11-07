@@ -28,8 +28,9 @@
 # the arm never looked at, and "no repo in argv" could be satisfied by a plist that named one.
 #
 # HERMETIC: every fixture is a throwaway `git init` under mktemp, HOME is re-rooted, and no real
-# state dir, config file or launchd domain is touched. `git` is the only external dependency and it is
-# already required by the reader itself.
+# state dir, config file or launchd domain is touched. External dependencies: `git`, and `python3` for
+# the doctored-doctor mutation fixtures (both are already required by the reader's own delegated
+# proofs, so the suite needs nothing a real box does not).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # `set -u` comes AFTER the two resolutions on purpose: a harness that streams the shard list into a
@@ -950,6 +951,16 @@ ck "m28 …and it does not refuse (a broken sibling is not a proven fault about 
 printf 'def broken(:\n' > "$T/unloadable-doctor.py"
 ck "m29 an UNLOADABLE sibling doctor still names the TAG hazard (load failure is \`could not ask\`, per verb)" \
    'REPO_SET_DOCTOR="$T/unloadable-doctor.py" run_reader "$T/tagcollide.conf" check 2>&1 | grep -q "tag-collision proof did NOT run"'
+# Round 18, P2: the `norm` verb joined the sentinel list, and `_dupkey` took `__UNASKABLE__` as a
+# NON-EMPTY dedupe key — so EVERY entry keyed to one value and a healthy multi-repo set was refused as
+# DUPLICATE-SLUG (rc 5, wrapper exit 2) purely because the sibling would not load. Measured before the
+# fix: a valid 2-repo fixture + an unloadable sibling went from `OK — 2 repo(s)` to `DUPLICATE-SLUG`/rc
+# 5, which also made the tag warning UNREACHABLE on every multi-repo box — i.e. it disabled the very
+# guard round 17 added. These two arms pin the regression DIRECTLY rather than only via m29.
+ck "m30 …and an unloadable sibling does NOT turn a valid 2-repo set into DUPLICATE-SLUG (rc 0)" \
+   '[ "$(REPO_SET_DOCTOR="$T/unloadable-doctor.py" run_reader_rc "$CONF" check)" = 0 ]'
+ck "m31 …and it does not print DUPLICATE-SLUG for a set whose slugs are plainly distinct" \
+   '! REPO_SET_DOCTOR="$T/unloadable-doctor.py" run_reader "$CONF" check 2>&1 | grep -q "DUPLICATE-SLUG"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
