@@ -106,23 +106,28 @@ EOF
 #  1. `timeout` IS NOT ON macOS — it is coreutils, not a BSD tool — and this suite is run by the operator
 #     of a launchd unit. An arm leaning on it reds on `command not found`, i.e. on the HARNESS, where the
 #     arm exists to prove BEHAVIOUR (the same trap `set -u` is placed after the resolutions for).
-#  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION: the ancestor walk used to LOOP (a
-#     slash-less parent never shortens) and the first absent-path arm to run is `b1`, which had no bound —
-#     so a re-regression WEDGED the shard for its whole CI timeout instead of reddening. Putting the bound
-#     in the helper covers every `run_reader*` call site at once, plus the two round-44 fixture arms below
-#     (`j-emptyrender`, `j16f`), which call it directly; `124` is `timeout`'s own code, so the arms'
-#     arithmetic is unchanged.
+#  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION. The ancestor walk used to LOOP (a
+#     slash-less parent never shortens), and the arm that actually catches it is `j16g` — a RELATIVE path,
+#     the one shape `b1` (whose fixture is ABSOLUTE) cannot exercise: the mutant shortens an absolute path
+#     correctly, so bounding `b1` alone would have proved nothing (the `j16h` note below measures exactly
+#     that). And the NEXT regression may hang on a shape every other arm passes — an absolute path, which
+#     is what every pre-round-44 fixture passes — so a bound attached to one arm can still wedge the shard
+#     for its whole CI timeout from an arm nobody suspected. Putting the bound in the helper covers every
+#     `run_reader*` call site at once, plus the two round-44 fixture arms below (`j-emptyrender`, `j16f`),
+#     which call it directly; `124` is `timeout`'s own code, so the arms' arithmetic is unchanged.
 #     ⛔ BUT IT DOES NOT COVER EVERY ARM, AND SAYING IT DID WAS A FALSE COVERAGE CLAIM (round 44 review,
 #     P2). Three populations bypass the helper and stay unbounded, and they are NAMED rather than counted
 #     on purpose — the counts in the first version of this paragraph were wrong (this file's `f11f`
 #     lesson, one arm over), which is what a count in a comment reliably becomes.
 #       (a) The `bash "$W/pr-doctor-machine.sh"` wrapper arms.
-#       (b) The direct `bash "$READER"` / `/bin/bash "$READER"` arms — the PATH-scoped fault-injection
-#           fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) and the `HOME`-unset arms. Those set `PATH=`
-#           for the CHILD, and the helper itself needs `ps` and `sleep` from the AMBIENT path, so they
-#           cannot simply wrap it. The two round-44 arms below show the shape that DOES work: route the
-#           CHILD's environment through `env` (`REPO_SET_FILE` in both, plus `PATH` in `j16f`) and leave
-#           the helper on the ambient path.
+#       (b) The direct `bash "$READER"` / `/bin/bash "$READER"` arms. The PATH-scoped fault-injection
+#           fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) set `PATH=` for the CHILD, and the helper
+#           itself needs `ps` and `sleep` from the AMBIENT path, so they cannot be wrapped as-is. The
+#           `HOME`-unset arms (`env -u HOME …`) and the plain direct arms do NOT set `PATH`, so those are
+#           simply not wrapped YET — not unwrappable, and saying otherwise was false. The two round-44
+#           arms below show the shape that works for either kind: route the CHILD's environment through
+#           `env` (`REPO_SET_FILE` in both, plus `PATH` in `j16f`) and leave the helper on the ambient
+#           path.
 #       (c) The COPY/MUTANT reader arms (`bash "$M/lib/repo-set.sh"` and the `$NA`/`$ND`/`$NODOC`/`$M2`/
 #           `$M3`/`$M4` siblings), which run a rewritten reader instead of the shipped one.
 #     Nothing hangs there today — every one of those passes an absolute set path, or an empty `HOME` that
