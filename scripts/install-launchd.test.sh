@@ -1621,6 +1621,62 @@ else
     bad "§7c …and the unit installs, as it does on the python path"
 fi
 
+# (c22k) `argv[0]` IS NEVER AN OPTION — in EITHER reader, in BOTH `Program` shapes. With `Program` set,
+# `ProgramArguments[0]` is only the argv[0] NAME launchd passes, and `--repo` is a legal name; without
+# `Program` it is a relative program name. Neither is an option, so neither may supply the `prev`
+# option-context for the element AFTER it. Both readers took `prev = argv[i - 1]` UNCONDITIONALLY, so an
+# argv[0] of `--repo` made the REAL argument at index 1 — an EXECUTED TCC-tree script — read as that
+# option's VALUE: `data` → WARN → INSTALL, i.e. the armed-and-dead unit this whole change exists to
+# remove. MEASURED both directions: `Program=/bin/bash` + `(--repo <TCC script>)` went verdict 2 →
+# verdict 0 (python AND awk — they SHARED the rule, so no differential case could see it).
+# No shipped template carries a `Program` key, so this is a latent hole a future template can walk into
+# (fresh review of #3413, round 10 P2). RED if either reader loses the exemption: the python arm pins
+# `i >= 2`, the `Program` arm pins awk `idx == 0 && prog != ""` → `prev = ""`, and the noprogram arm
+# pins the fallback's bottom `prev = (idx == 0) ? "" : line` (which is also what keeps the two readers
+# in AGREEMENT on the noprogram shape: python's `i >= 2` exempts the same element).
+for _reader in python fallback; do
+  for _shape in program noprogram; do
+    rm -rf "$PROBE_DIR"; mkdir -p "$PROBE_DIR"
+    if [ "$_reader" = python ]; then _interval='<integer>300</integer>'
+    else _interval='<integer>not-a-number</integer>'; fi
+    if [ "$_shape" = program ]; then _progkey='    <key>Program</key><string>/bin/bash</string>'
+    else _progkey=''; fi
+    cat > "$PROBE_DIR/com.eldato.tccprobe.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- agent-infra-plist-version: 0.0.1 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.eldato.tccprobe</string>
+$_progkey
+    <key>ProgramArguments</key>
+    <array>
+        <string>--repo</string>
+        <string>$PROBE_DEAD</string>
+    </array>
+    <key>StartInterval</key>$_interval
+</dict>
+</plist>
+PLIST
+    rm -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist"
+    set +e
+    OUT="$( ( export HOME="$PROBE_HOME" PATH="$T/bin:$PATH" FAKE_LAUNCHCTL_LOG="$LOG" \
+            TEMPLATES_DIR="$PROBE_DIR" AGENTS_DIR="$PROBE_HOME/Library/LaunchAgents" \
+            INSTALL_LAUNCHD_PLISTBUDDY="$FAKE_PB" ELDATO_ALLOW_TEST_HOME=1
+            unset TORTOISE_REPO SWARM_ROOT PYTHON_BIN
+            bash "$INSTALLER" 2>&1 ) )"; RC=$?
+    set -e
+    assert_eq "$RC" "0" "§7c ($_reader/$_shape) a --repo argv[0] does not turn the real argv[1] into DATA"
+    assert_contains "$OUT" "TCC-protected target: $PROBE_DEAD" "§7c ($_reader/$_shape) …the EXECUTED argument is verdicted as a TARGET"
+    assert_not_contains "$OUT" "WARN TCC-protected data argument" "§7c ($_reader/$_shape) …and never as the argv[0] option data value"
+    if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
+        bad "§7c ($_reader/$_shape) …so the unit is not left armed on the box"
+    else
+        ok "§7c ($_reader/$_shape) …so the unit is not left armed on the box"
+    fi
+  done
+done
+
 # A helper for the fallback-arm cases below: the same probe plist as `_probe_install`, but with an
 # unparseable `StartInterval` (so python3 refuses and the PlistBuddy seam is taken) and with the seam
 # pinned. Kept next to its users rather than in the shared helper block, which every OTHER §7c case

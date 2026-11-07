@@ -698,7 +698,16 @@ for i, a in enumerate(argv):
         continue
     if not a.startswith("/"):
         continue
-    prev = argv[i - 1] if i and isinstance(argv[i - 1], str) else ""
+    # ⛔ `argv[0]` IS NEVER AN OPTION, so it can never be the `prev` of element 1. With `Program` set it
+    # is only the argv[0] NAME launchd passes — an arbitrary string, and `--repo` is a legal one — and
+    # without it, a relative program name. Either way element 1 is an EXECUTED positional.
+    # Reading `--repo` out of argv[0] filed a TCC-tree script as `data` → WARN + INSTALL of an
+    # ARMED-AND-DEAD unit, which is the exact class this change exists to close. MEASURED (fresh review
+    # of #3413, round 10 P2), driving the real parsers: `Program=/bin/bash` with
+    # `ProgramArguments=(--repo <TCC script>)` went `exec`/verdict 2 → `data`/verdict 0, and
+    # `Program=/usr/bin/python3` with `(--root <TCC dir>)` the same. Both readers shared the rule, so no
+    # differential case could see it: the fix must be here and in the awk mirror, not in one of them.
+    prev = argv[i - 1] if i >= 2 and isinstance(argv[i - 1], str) else ""
     print("%s\t%s" % ("data" if prev in DATA_OPTIONS else "exec", a))
 PY
 }
@@ -864,7 +873,10 @@ plist_program_args() {
             # python reader (its `skipped.add(0)`). This test comes BEFORE the joined `--opt=` branch,
             # because with `Program` set python emits nothing for a `--script=<TCC>` at argv[0] while
             # the fallback used to emit `exec` there and SKIP a unit python installs (round 3 P2).
-            if (idx == 0 && prog != "") { prev = line; next }
+            # ⛔ `prev = ""`, NOT `prev = line`: argv[0] is never an option, so an element at index 1
+            # must not inherit a `--repo` argv[0] as its data context (fresh review of #3413, round 10
+            # P2 — see the matching arm in the python reader above).
+            if (idx == 0 && prog != "") { prev = ""; next }
             # ⛔ THE `env` HOP, MIRRORED FROM THE PYTHON READER (`:565-641`). It is not decoration: the
             # first POSITIONAL after `env` is the program launchd execs, and `-S` / `--split-string`
             # carries a WHOLE COMMAND LINE inside one element. Without this the fallback classified
@@ -911,7 +923,11 @@ plist_program_args() {
                     printf "unknown\t%s\n", line
                 }
             }
-            prev = line
+            # ⛔ argv[0] IS NEVER AN OPTION, in every arm — including the arms above that `next` before
+            # reaching here (each sets `prev` itself for the same reason). Element 0 keeps `prev` EMPTY,
+            # so element 1 is EXEC rather than inheriting a `--repo` argv[0] as data context (fresh
+            # review of #3413, round 10 P2).
+            prev = (idx == 0) ? "" : line
         }
         END { if (!seen) exit 1 }
     ')" || return 1
