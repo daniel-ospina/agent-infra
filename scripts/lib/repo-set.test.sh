@@ -943,6 +943,13 @@ ck "m27 …and a sibling WITHOUT \`set_tag_collisions\` WARNS instead of silentl
    'REPO_SET_DOCTOR="$MT/pr-doctor.py" run_reader "$T/tagcollide.conf" check | grep -q "the tag-collision proof did NOT run"'
 ck "m28 …and it does not refuse (a broken sibling is not a proven fault about the set)" \
    '[ "$(REPO_SET_DOCTOR="$MT/pr-doctor.py" run_reader_rc "$T/tagcollide.conf" check)" = 0 ]'
+# Round 17, P2: the MODULE-LOAD failure was a third "could not ask" shape the sentinel did not cover.
+# The python exits silently with empty stdout, so `tags` read a DEAD sibling as "no collision" and the
+# one message naming the shared-state hazard never printed. Reachable: a sibling whose annotations need
+# a newer interpreter fails at exec_module.
+printf 'def broken(:\n' > "$T/unloadable-doctor.py"
+ck "m29 an UNLOADABLE sibling doctor still names the TAG hazard (load failure is \`could not ask\`, per verb)" \
+   'REPO_SET_DOCTOR="$T/unloadable-doctor.py" run_reader "$T/tagcollide.conf" check 2>&1 | grep -q "tag-collision proof did NOT run"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
