@@ -1577,7 +1577,8 @@ await test("a REPO entry's unrecognised `type` is reported by the MERGE, and nev
   // that knows the outcome. Pinned in THREE arms because each pins a different edit:
   //   arm 1 pins the base-gate in `asMcpJson` (restore it and a dropped entry is called KEPT again);
   //   arm 2 pins the repo-only call site (delete it and a KEPT entry's note vanishes);
-  //   arm 3 pins the IGNORED case (move the note above the `continue` and an ignored delta is noted).
+  //   arm 3 pins the IGNORED case (move the note above the `continue` and an ignored delta is noted);
+  //   arm 4 pins the DELTA call site (delete only that one and an APPLIED override loses its note).
   const run = async (repoServers: Record<string, unknown>, baseServers: Record<string, unknown>) => {
     const repoDir = tempDir("mcp-repotype-repo-");
     const homeDir = tempDir("mcp-repotype-home-");
@@ -1595,16 +1596,24 @@ await test("a REPO entry's unrecognised `type` is reported by the MERGE, and nev
     return { cfg, logs, typeNotes: logs.filter(l => l.includes('has "type"')) };
   };
 
-  // ARM 1 — DROPPED: nothing to connect to. No "KEPT" claim may survive, and no inert-`type` note
-  // should fire for an entry that is not in the config at all.
+  // ARM 1 — DROPPED: nothing to connect to. ASSERTED IN BOTH DIRECTIONS, because the two halves pin
+  // different edits: no "KEPT" claim catches the restored base-gate, and zero `type` notes catches the
+  // note MOVED above the drop — which would tell the operator its `type` mattered on an entry that is
+  // not in the config at all. (The note text contains no "KEPT", so one assertion cannot see the other.)
   const dropped = await run({ s: { url: "", type: "sse" } }, {});
   equal(Object.keys(dropped.cfg.mcpServers).length, 0, "an entry with only an empty transport is dropped");
   ok(
     !dropped.logs.some(l => l.includes("KEPT")),
     `a DROPPED entry must never be reported as KEPT — got:\n${dropped.logs.join("\n")}`
   );
+  equal(
+    dropped.typeNotes.length,
+    0,
+    `a DROPPED entry earns no inert-\`type\` note — got:\n${dropped.logs.join("\n")}`
+  );
 
-  // ARM 2 — KEPT: the note is owed exactly ONCE (a second copy would mean both readers reported it).
+  // ARM 2 — KEPT (repo-ONLY): the note is owed exactly ONCE (a second copy would mean both readers
+  // reported it).
   const kept = await run({ s: { url: "https://ok.example/mcp", type: "sse", lazy: true } }, {});
   ok(kept.cfg.mcpServers.s, "a repo-only \`type: \"sse\"\` entry is KEPT (it works over \`url\`)");
   equal(kept.typeNotes.length, 1, `exactly one inert-\`type\` note — got:\n${kept.logs.join("\n")}`);
@@ -1621,6 +1630,24 @@ await test("a REPO entry's unrecognised `type` is reported by the MERGE, and nev
     "an ambiguous delta is IGNORED and the base entry kept"
   );
   equal(ignored.typeNotes.length, 0, `an IGNORED delta earns no inert-\`type\` note — got:\n${ignored.logs.join("\n")}`);
+
+  // ARM 4 — DELTA APPLIED: a repo override that changes `url` and carries an unrecognised `type` IS
+  // applied field-by-field, so its note is owed — and it is a DIFFERENT call site from arm 2's, so
+  // deleting only that one must redden the suite (measured: it did not, before this arm existed).
+  const applied = await run(
+    { s: { url: "https://repo.example/mcp", type: "sse", lazy: true } },
+    { s: { url: "https://base.example/mcp", lazy: true } },
+  );
+  equal(
+    (applied.cfg.mcpServers.s as Record<string, unknown>).url,
+    "https://repo.example/mcp",
+    "a repo delta is APPLIED — this is the field-by-field path, not the repo-only one"
+  );
+  equal(
+    applied.typeNotes.length,
+    1,
+    `an APPLIED override's inert-\`type\` is reported once — got:\n${applied.logs.join("\n")}`
+  );
 });
 
 await test("a BASE-layer entry with a prototype-shaped name is refused too", () => {
