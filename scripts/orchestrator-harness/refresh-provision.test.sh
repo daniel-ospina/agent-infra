@@ -1051,8 +1051,31 @@ ck "(g) …and does NOT carry the gh-contended verdict, which is line 3 and neve
 # `gh-limit.py:3439` records "a contended verdict is NOT a limit" as a defect it fixed. A clause saying
 # "quota" here would publish, in the one sentence this change exists to make true, a diagnosis the
 # evidence beside it contradicts.
+# ⛔ A TWO-PHRASE NEGATIVE IS NOT A CONTROL (#3701 review round 14, P2). These rows matched only
+# `quota/throttling` and `out of quota`, so a clause claiming `budget exhausted` — the exact over-claim
+# class they exist to catch — passed: measured, the mutated rc=75 arm kept the suite at 186/0. The
+# predicate below matches ANY affirmative exhaustion wording, on a lower-cased copy so case cannot hide
+# it. ⛔ DECLARED RESIDUAL: this is a TOKEN LIST, not a proof — a novel phrasing that contains none of
+# these stems would still pass. It is a floor, and it is the floor the two mutations that beat the old
+# version now fail.
+claims_exhaustion() {  # <text> — 0 when it asserts an affirmative budget/quota cause
+  local t
+  t="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$t" in
+    *exhaust*|*'out of quota'*|*'out of budget'*|*'quota/throttling'*|*'spent budget'*|\
+    *'budget exceeded'*|*'quota exceeded'*|*'budget is'*|*'quota is'*|*'no budget left'*|\
+    *'budget gone'*|*'throttl'*|*'rate limit exceeded'*)
+      return 0 ;;
+  esac
+  return 1
+}
+# ⛔ POLARITY, AND I GOT IT BACKWARDS FIRST TIME (#3701: caught on this row, not by me). `claims_exhaustion`
+# returns 0 ON A MATCH, like `grep`, so `"$(claims_exhaustion "$x"; echo $?)"` passed when the clause DID
+# claim exhaustion and reddened the correct clause — a fail-open control, plus a false red on the shipped
+# code. The `if` form below inverts it into `ck`'s 0-means-pass convention, and the mutation that beats
+# the old two-phrase row (`… NOT an outage, budget exhausted`) now reds.
 ck "(g) …and claims NO quota/budget exhaustion that rc=75 does not establish" \
-   "$(case "$G_WHY" in *'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
+   "$(if claims_exhaustion "$G_WHY"; then echo 1; else echo 0; fi)"
 ck "(g) …and DOES say nothing was sent, so neither credential nor budget was tested" \
    "$(case "$G_WHY" in *'nothing was sent, so NEITHER the credential NOR the budget was tested'*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ NON-VACUITY: revert ONLY the call-site interpolation in a copy and re-run the SAME fixture. If the
@@ -1129,8 +1152,8 @@ ck "(g5) …and the record names a NON-ANSWER, not a cause" \
    "$(case "$GB_WHY" in *'NON-ANSWER'*) echo 0 ;; *) echo 1 ;; esac)"
 # ⛔ THE OVER-CLAIM THIS ROW EXISTS FOR: the arm once said "not a spent budget", which a shim sleeping
 # out a shared throttle window falsifies — that IS the budget being slept out.
-ck "(g5) …and claims NOTHING about the budget, in either direction" \
-   "$(case "$GB_WHY" in *'spent budget'*|*'nothing was sent'*|*'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
+ck "(g5) …and claims NOTHING about the budget, in either direction (same predicate as (g))" \
+   "$(if claims_exhaustion "$GB_WHY"; then echo 1; else echo 0; fi)"
 # ⛔ (g6) THE OTHER DEFAULT SHAPE — rc=1 with a rate-limit stderr. Without this row, deleting the
 # `$(gh_probe_evidence "$prc")` interpolation from that arm left every other arm green.
 # ⛔ AND ITS PROVENANCE IS NOT CLAIMED ANY MORE (#3701 review round 12, `unverifiable`). This comment
