@@ -16627,6 +16627,273 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
   && fail "(o7) the reported bound is the stale pre-clamp 3600s value" \
   || pass "(o7) the reported bound is the clamped one, not the stale explicit value"
 
+# ── (rd) THE WHOLE-ATTEMPT DEADLINE — the rail's ACTUATION gets a bound ────────
+# A bound on each wait is not a bound on the ATTEMPT (#3223). Measured 2026-11-02:
+# five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's
+# bound. These arms drive the attempt clock EARLIER via the fail-safe seam
+# (ADMIN_MERGE_RAIL_STARTED_AT can only make the attempt OLDER), so the expiry is
+# reached on the FIRST poll and the arm is deterministic in seconds — never a CI
+# timeout standing in for an assertion (#3280 cycle 3).
+echo "   ▸ (rd1–rd7) whole-attempt deadline"
+SCEN="$TMP/scen-p1"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 600 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+p1_rc=$?
+set -e
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, ' "$SCEN/err" \
+  && pass "(rd1) an aged attempt REFUSES by name: REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)" \
+  || fail "(rd1) no REFUSED(rail-deadline:…) line — the attempt deadline is not an actuator"
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, 42\)' "$SCEN/err" \
+  && pass "(rd1) the refusal NAMES the PR, so the next supervisor knows which rail died" \
+  || fail "(rd1) the refusal does not name the PR"
+[ "$p1_rc" -ne 0 ] \
+  && pass "(rd1) expiry EXITS NON-ZERO (rc=$p1_rc) — a failed actuation, not a live process" \
+  || fail "(rd1) expiry exited 0 — the bound would leave a supervisor reading SUCCESS"
+grep -q 'NOT a verdict on any run' "$SCEN/err" \
+  && pass "(rd1) the refusal does NOT claim the run stalled — no false stall diagnosis" \
+  || fail "(rd1) the refusal does not disclaim a stall verdict"
+
+# (rd2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
+# FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT = 18064 + 15600 = 33664s,
+# which is above every phase bound that could carry an attempt there, so a rail
+# can never reach it. An override above the reachable ceiling is CLAMPED to it
+# and the clamp is DISCLOSED — the number the rail reports is the number it used.
+SCEN="$TMP/scen-p2"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+set -e
+grep -q 'CLAMPED to the reachable 3400s' "$SCEN/err" \
+  && pass "(rd2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
+  || fail "(rd2) an unreachable deadline was accepted silently — a bound that can never fire"
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/3400s, 42\)' "$SCEN/err" \
+  && pass "(rd2) the refusal reports the CLAMPED bound, never the unused 33664s" \
+  || fail "(rd2) the refusal reported a bound the rail did not use"
+
+# (rd3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
+# non-integer deadline makes the guard's own `[ -ge ]` ERROR — and under `set -u`
+# without `-e` an erroring `if` body is SKIPPED, so the typo DELETES the bound
+# instead of weakening it. Each arm must REFUSE, naming the knob, never proceed.
+for bad in 10m 99999999999999999999999 0 019864; do
+  SCEN="$TMP/scen-p3-$bad"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE="$bad" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bad_rc=$?
+  set -e
+  if [ "$bad_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_DEADLINE' "$SCEN/err"; then
+    pass "(rd3) ADMIN_MERGE_RAIL_DEADLINE='$bad' is REFUSED BY NAME (rc=2) instead of silently deleting the bound"
+  else
+    fail "(rd3) ADMIN_MERGE_RAIL_DEADLINE='$bad' was accepted (rc=$bad_rc) — a typo disables the guard (fail-open)"
+  fi
+done
+
+# (rd4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
+# MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
+# only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
+# made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
+# guard was never reached". It now asserts the clamp's own DISCLOSURE, which only
+# exists when the clamp ran.
+SCEN="$TMP/scen-p4"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+p4_rc=$?
+set -e
+grep -q 'CLAMPED to now' "$SCEN/err" \
+  && pass "(rd4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
+  || fail "(rd4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
+grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
+  && fail "(rd4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
+  || pass "(rd4) …and it produced no spurious refusal (rc=$p4_rc)"
+
+# (rd5) THE SEAM IS VALIDATED LIKE THE KNOB (review cycle 2 P1). An all-digit
+# 23-digit stamp made `[ -lt ]` ERROR, the erroring body was SKIPPED under `set -u`
+# without `-e`, and the age was silently CANCELLED — the young direction. A leading
+# zero was worse: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL.
+for bads in 999999999999999999999999 01767000000 notanepoch; do
+  SCEN="$TMP/scen-p5-$bads"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT="$bads" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bads_rc=$?
+  set -e
+  if [ "$bads_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_STARTED_AT' "$SCEN/err"; then
+    pass "(rd5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' is REFUSED BY NAME (rc=2), never a silent age-cancel or octal misread"
+  else
+    fail "(rd5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' was accepted (rc=$bads_rc) — the seam's age can be cancelled or misread"
+  fi
+done
+
+# (rd6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
+# used to print the DEFAULT, so `--print-bounds` said 21454 while a real run used
+# 500 — "reported bound ≠ bound used" in the one field an operator greps.
+SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+grep -q '^rail-deadline=500' "$SCEN/out" \
+  && pass "(rd6) --print-bounds reports the bound IN FORCE (500), not the 21454 default" \
+  || fail "(rd6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
+grep -q '^rail-deadline-source=' "$SCEN/out" \
+  && pass "(rd6) --print-bounds carries the derivation, so the number is auditable" \
+  || fail "(rd6) --print-bounds has no rail-deadline-source line"
+# ⛔ COMPUTED, NOT PINNED (review of the rebase, P2). The property is "the addends the line
+# PRINTS sum to the total it PRINTS" — so read both out of the line and add them here. A pinned
+# literal would go stale on any default change (it already did: the line once listed
+# `SELF_EDIT_WAIT` once while the derivation used it TWICE, and printed 20254 beside a 20554
+# bound), and a stale literal is exactly what this arm exists to catch.
+_pb_line="$(grep '^rail-deadline-source=' "$SCEN/out" || true)"
+_pb_terms="$(printf '%s\n' "$_pb_line" | sed -nE \
+  's/.*FIRST_CHECKS_CEILING ([0-9]+)s \+ RERUN_BUDGET ([0-9]+)s \+ 2 x SELF_EDIT_WAIT ([0-9]+)s \+ MERGE_REF_WAIT ([0-9]+)s \+ REPRO_TIMEOUT ([0-9]+)s = ([0-9]+)s.*/\1 \2 \3 \4 \5 \6/p')"
+read -r _pb_fc _pb_rb _pb_se _pb_mr _pb_rp _pb_tot <<< "$_pb_terms"
+if [ -n "${_pb_tot:-}" ] && [ $(( _pb_fc + _pb_rb + 2 * _pb_se + _pb_mr + _pb_rp )) -eq "$_pb_tot" ]; then
+  pass "(rd6) the derivation's own ADDENDS sum to the bound it prints (${_pb_fc}+${_pb_rb}+2x${_pb_se}+${_pb_mr}+${_pb_rp}=${_pb_tot}) — auditable means arithmetic, not a gesture"
+else
+  fail "(rd6) the printed derivation does not add up to the printed bound (terms='${_pb_terms:-<unparsed>}') — reported != used, one field over"
+fi
+
+# (rd7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
+# (main's #3287 review cycle 3, P2 — kept through the integration). (rd6) pins 500,
+# which is BELOW the ceiling, so it never exercises the clamp branch; and the clamp
+# branch is exactly where the surface printed the raw knob beside a refusal that
+# enforced the clamped value. ⛔ COMPUTED, NOT PINNED, for the same reason as (rd6):
+# the expected number is read from the SAME config's unclamped run, so this arm
+# stays true when a phase bound's default changes.
+SCEN="$TMP/scen-q7-base"; mkdir -p "$SCEN"
+SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+_q7_ceiling="$(sed -nE 's/^rail-deadline=([0-9]+) \(in force\)$/\1/p' "$SCEN/out" | head -1)"
+SCEN="$TMP/scen-q7"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+if [ -n "${_q7_ceiling:-}" ] && grep -qx "rail-deadline=${_q7_ceiling} (CLAMPED from 33664)" "$SCEN/out"; then
+  pass "(rd7) at the CLAMP the inspection surface prints the bound IN FORCE (${_q7_ceiling}) and names what it was clamped from"
+else
+  fail "(rd7) the inspection surface reports a bound the rail is not using (wanted 'rail-deadline=${_q7_ceiling:-<unparsed>} (CLAMPED from 33664)', got '$(grep '^rail-deadline=' "$SCEN/out" | tr '\n' ' ')')"
+fi
+grep -q '^rail-deadline=33664' "$SCEN/out" \
+  && fail "(rd7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
+  || pass "(rd7) it does NOT print the raw unreachable value"
+
+# ⛔ (rd8) THE IN-LOOP CALL SITE — THE PROPERTY THE FEATURE EXISTS FOR, AND THE ONE
+# NOTHING ELSE HERE MEASURES (cycle 5 finding 2). Every other arm drives an attempt that is
+# ALREADY aged when the rail starts, so the MAIN-PATH guard decides it and all N in-loop
+# `rail_guard_poll` calls could be DELETED with the suite still green — the "a rail cannot
+# cross four waits and still live" claim would be unverified where it matters.
+# So the clock is made to STEP: `date +%s` returns base + n × step (n = how many times it has
+# been read), which lets the attempt be YOUNG at the main path and OLD by the third poll of a
+# real wait loop. The refusal's own elapsed is then the discriminator — the main path saw
+# `step`, so any `elapsed ≥ bound` can only have been produced by a LATER call site.
+SKEW_BIN="$TMP/skew-bin"; mkdir -p "$SKEW_BIN"
+printf '%s\n' '#!/bin/sh' \
+  '# `date +%s` STEPS by SKEW_CLOCK_STEP on every read; everything else delegates to the REAL' \
+  '# date (`date -r`, `date -d` are used by the mtime paths and must keep working).' \
+  'case "${1:-}" in' \
+  '  +%s) _n=$(cat "$SKEW_COUNTER" 2>/dev/null || echo 0); _n=$((_n + 1)); printf "%s\\n" "$_n" > "$SKEW_COUNTER"' \
+  '       printf "%s\\n" "$(( $(cat "$SKEW_CLOCK_BASE") + _n * $(cat "$SKEW_CLOCK_STEP") ))" ;;' \
+  '  *)   exec /bin/date "$@" ;;' \
+  'esac' > "$SKEW_BIN/date"
+chmod +x "$SKEW_BIN/date"
+
+# (rd8a) NON-VACUITY: the SAME fixture under the REAL clock must NOT refuse. Without this,
+# a scenario that refuses for an unrelated reason would satisfy (rd8b) and the arm would
+# measure nothing about the deadline.
+new_scen dl-inloop-plain
+HEAD_DL="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DL" > "$SCEN/head"
+lane_fail "$HEAD_DL" 9671 > "$SCEN/runs-$HEAD_DL"
+log_failed 'tests/test_deadline.py::test_long' > "$SCEN/log-9671"
+lane_fail maindl 9672 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9672"
+target_shard 9671 "test (b)"
+green_shard 9673 "test (b)" 30
+: > "$SCEN/status-9671"
+_i=0; while [ "$_i" -lt 60 ]; do printf 'in_progress\n' >> "$SCEN/status-9671"; _i=$((_i + 1)); done
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1799 ADMIN_MERGE_RERUN_FLOOR=1 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err" || true
+grep -q 'REFUSED(rail-deadline:' "$TMP/err" \
+  && fail "(rd8a) the real clock refused a young attempt under a 1799s bound — the arm would pass for the wrong reason" \
+  || pass "(rd8a) …with the real clock and the same 1799s bound the attempt is NOT refused (the arms below rest on the CLOCK, not the fixture)"
+
+# (rd8b) THE IN-LOOP SITE. bound 25, step 5: the main path sees elapsed=5 and passes; each
+# later poll adds 5, so the attempt crosses 25 a few polls INTO the loop. ⛔ 25, not 100: the
+# re-run wait's DERIVED stall bound for this fixture is 60s (2 x the 30s green max), and a
+# deadline larger than it would let STALLED win the race and this arm would measure the
+# wrong refusal.
+new_scen dl-inloop
+printf '%s\n' "$HEAD_DL" > "$SCEN/head"
+lane_fail "$HEAD_DL" 9671 > "$SCEN/runs-$HEAD_DL"
+log_failed 'tests/test_deadline.py::test_long' > "$SCEN/log-9671"
+lane_fail maindl 9672 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9672"
+target_shard 9671 "test (b)"
+green_shard 9673 "test (b)" 30
+: > "$SCEN/status-9671"
+_i=0; while [ "$_i" -lt 60 ]; do printf 'in_progress\n' >> "$SCEN/status-9671"; _i=$((_i + 1)); done
+printf '%s\n' "$(/bin/date +%s)" > "$TMP/skew-base"
+printf '5\n' > "$TMP/skew-step"
+printf '0\n' > "$TMP/skew-counter"
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SKEW_BIN:$NOSLEEP_BIN:$PATH" \
+  SKEW_COUNTER="$TMP/skew-counter" SKEW_CLOCK_BASE="$TMP/skew-base" SKEW_CLOCK_STEP="$TMP/skew-step" \
+  ADMIN_MERGE_RAIL_DEADLINE=25 ADMIN_MERGE_RERUN_FLOOR=1 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd8_rc=$?
+set -e
+[ "$rd8_rc" -ne 0 ] \
+  && pass "(rd8b) a stepping clock crosses the bound and the attempt REFUSES (exit $rd8_rc) — the guard is wired into a real wait loop" \
+  || fail "(rd8b) the attempt never refused under a stepping clock — the in-loop guard is not reached"
+_dl_elapsed="$(sed -nE 's/.*REFUSED\(rail-deadline:([0-9]+)s\/25s, 42\).*/\1/p' "$TMP/err" | head -1)"
+if [ -n "${_dl_elapsed:-}" ] && [ "$_dl_elapsed" -ge 25 ]; then
+  pass "(rd8b) the refusal carries elapsed=${_dl_elapsed}s on a 25s bound — the MAIN path saw 5s, so this came from a LATER (in-loop) call site"
+else
+  fail "(rd8b) no REFUSED(rail-deadline:<n>s/25s, 42) with elapsed >= 25 (got '${_dl_elapsed:-<none>}') — the in-loop call site did not decide it"
+fi
+# ⛔ EITHER loop proves it: the deadline is on the head of the FIRST-CHECKS loop as well as
+# the RE-RUN loop, and which one the fixture reaches first is not the property under test —
+# that the guard runs INSIDE a poll loop is. So the evidence is "the surface was POLLED".
+rd8_reads="$(grep -cE '^(run view 9671|run list)' "$SCEN/calls" 2>/dev/null || true)"
+[ "${rd8_reads:-0}" -ge 2 ] \
+  && pass "(rd8b) …and the wait really POLLED ($rd8_reads surface reads) before the bound was crossed" \
+  || fail "(rd8b) the wait loop never polled (${rd8_reads:-0} surface reads) — the refusal is not evidence of an in-loop guard"
+grep -q 'pr merge' "$SCEN/calls" \
+  && fail "(rd8b) a merge was attempted on a deadline refusal" \
+  || pass "(rd8b) …and nothing merged"
+
+# ⛔ (rd9) BOTH `clock-unreadable` ARMS — new fail-closed exits with NO test at all
+# (review of the rebase, P2). They guard the fail-open this change exists to remove: an
+# erroring `[ -ge ]` under `set -u` without `-e` SKIPS its body, so an unreadable clock used
+# to let a 600s-aged attempt under a 60s bound exit 0. `PATH` is the seam that breaks `date`.
+NODATE_BIN="$TMP/nodate-bin"; mkdir -p "$NODATE_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$NODATE_BIN/date"
+chmod +x "$NODATE_BIN/date"
+
+# (rd9a) the START-SEAM branch validates the clock it reads.
+new_scen dl-clock-start
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NODATE_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1800 \
+  ADMIN_MERGE_RAIL_STARTED_AT=$(( $(/bin/date +%s) - 600 )) \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd9a_rc=$?
+set -e
+if [ "$rd9a_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TMP/err"; then
+  pass "(rd9a) an unreadable clock with the START SEAM set REFUSES by name (exit 1), never proceeds unbounded"
+else
+  fail "(rd9a) an unreadable clock at start exited $rd9a_rc and/or did not name clock-unreadable — the clock is unvalidated there"
+fi
+
+# (rd9b) the GUARD branch validates the clock it reads, on the ordinary (no-seam) path.
+new_scen dl-clock-poll
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NODATE_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1800 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd9b_rc=$?
+set -e
+if [ "$rd9b_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TMP/err"; then
+  pass "(rd9b) an unreadable clock at the GUARD REFUSES by name (exit 1) — an unenforceable bound is not a pass"
+else
+  fail "(rd9b) an unreadable clock at the guard exited $rd9b_rc and/or did not name clock-unreadable — the guard would be inert"
+fi
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
@@ -17166,131 +17433,6 @@ for _bad in 0300 abc; do
     && pass "(f) ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${_bad}' is REFUSED (rc=$rc), not coerced" \
     || fail "(f) ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${_bad}' was accepted (rc=$rc): ${_} $(head -2 "$SCEN/fqb" | tr '\n' ' ')"
 done
-# ── (p) THE WHOLE-ATTEMPT DEADLINE — the rail's ACTUATION gets a bound ────────
-# A bound on each wait is not a bound on the ATTEMPT (#3223). Measured 2026-11-02:
-# five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's
-# bound. These arms drive the attempt clock EARLIER via the fail-safe seam
-# (ADMIN_MERGE_RAIL_STARTED_AT can only make the attempt OLDER), so the expiry is
-# reached on the FIRST poll and the arm is deterministic in seconds — never a CI
-# timeout standing in for an assertion (#3280 cycle 3).
-# The section label is `p1–p7`, NOT a bare `(p)`: main's delegation block above asserts under
-# the id `(p)`, so a bare `(p)` header made a red `❌ (p) rail-exit.test.sh FAILED` line
-# indistinguishable from this section's header at triage time. The arms keep their own ids.
-echo "   ▸ (p1–p7) whole-attempt deadline"
-SCEN="$TMP/scen-p1"; mkdir -p "$SCEN"
-set +e
-SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 600 )) \
-  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-p1_rc=$?
-set -e
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, ' "$SCEN/err" \
-  && pass "(p1) an aged attempt REFUSES by name: REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)" \
-  || fail "(p1) no REFUSED(rail-deadline:…) line — the attempt deadline is not an actuator"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, 42\)' "$SCEN/err" \
-  && pass "(p1) the refusal NAMES the PR, so the next supervisor knows which rail died" \
-  || fail "(p1) the refusal does not name the PR"
-[ "$p1_rc" -ne 0 ] \
-  && pass "(p1) expiry EXITS NON-ZERO (rc=$p1_rc) — a failed actuation, not a live process" \
-  || fail "(p1) expiry exited 0 — the bound would leave a supervisor reading SUCCESS"
-grep -q 'NOT a verdict on any run' "$SCEN/err" \
-  && pass "(p1) the refusal does NOT claim the run stalled — no false stall diagnosis" \
-  || fail "(p1) the refusal does not disclaim a stall verdict"
-
-# (p2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
-# FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT = 18064 + 15600 = 33664s,
-# which is above every phase bound that could carry an attempt there, so a rail
-# can never reach it. An override above the reachable ceiling is CLAMPED to it
-# and the clamp is DISCLOSED — the number the rail reports is the number it used.
-SCEN="$TMP/scen-p2"; mkdir -p "$SCEN"
-set +e
-SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
-  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-set -e
-grep -q 'CLAMPED to the reachable 2500s' "$SCEN/err" \
-  && pass "(p2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
-  || fail "(p2) an unreachable deadline was accepted silently — a bound that can never fire"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2500s, 42\)' "$SCEN/err" \
-  && pass "(p2) the refusal reports the CLAMPED bound, never the unused 33664s" \
-  || fail "(p2) the refusal reported a bound the rail did not use"
-
-# (p3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
-# non-integer deadline makes the guard's own `[ -ge ]` ERROR — and under `set -u`
-# without `-e` an erroring `if` body is SKIPPED, so the typo DELETES the bound
-# instead of weakening it. Each arm must REFUSE, naming the knob, never proceed.
-for bad in 10m 99999999999999999999999 0 019864; do
-  SCEN="$TMP/scen-p3-$bad"; mkdir -p "$SCEN"
-  set +e
-  SUITE_RAIL_DEADLINE="$bad" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-  bad_rc=$?
-  set -e
-  if [ "$bad_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_DEADLINE' "$SCEN/err"; then
-    pass "(p3) ADMIN_MERGE_RAIL_DEADLINE='$bad' is REFUSED BY NAME (rc=2) instead of silently deleting the bound"
-  else
-    fail "(p3) ADMIN_MERGE_RAIL_DEADLINE='$bad' was accepted (rc=$bad_rc) — a typo disables the guard (fail-open)"
-  fi
-done
-
-# (p4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
-# MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
-# only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
-# made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
-# guard was never reached". It now asserts the clamp's own DISCLOSURE, which only
-# exists when the clamp ran.
-SCEN="$TMP/scen-p4"; mkdir -p "$SCEN"
-set +e
-SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
-  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-p4_rc=$?
-set -e
-grep -q 'CLAMPED to now' "$SCEN/err" \
-  && pass "(p4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
-  || fail "(p4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
-grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
-  && fail "(p4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
-  || pass "(p4) …and it produced no spurious refusal (rc=$p4_rc)"
-
-# (p5) THE SEAM IS VALIDATED LIKE THE KNOB (review cycle 2 P1). An all-digit
-# 23-digit stamp made `[ -lt ]` ERROR, the erroring body was SKIPPED under `set -u`
-# without `-e`, and the age was silently CANCELLED — the young direction. A leading
-# zero was worse: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL.
-for bads in 999999999999999999999999 01767000000 notanepoch; do
-  SCEN="$TMP/scen-p5-$bads"; mkdir -p "$SCEN"
-  set +e
-  SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT="$bads" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-  bads_rc=$?
-  set -e
-  if [ "$bads_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_STARTED_AT' "$SCEN/err"; then
-    pass "(p5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' is REFUSED BY NAME (rc=2), never a silent age-cancel or octal misread"
-  else
-    fail "(p5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' was accepted (rc=$bads_rc) — the seam's age can be cancelled or misread"
-  fi
-done
-
-# (p6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
-# used to print the DEFAULT, so `--print-bounds` said 20254 while a real run used
-# 500 — "reported bound ≠ bound used" in the one field an operator greps.
-SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
-SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=500' "$SCEN/out" \
-  && pass "(p6) --print-bounds reports the bound IN FORCE (500), not the 20254 default" \
-  || fail "(p6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
-grep -q '^rail-deadline-source=' "$SCEN/out" \
-  && pass "(p6) --print-bounds carries the derivation, so the number is auditable" \
-  || fail "(p6) --print-bounds has no rail-deadline-source line"
-
-# (p7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
-# (review cycle 3, P2). (p6) pins 500, which is BELOW the ceiling, so it never
-# exercised the clamp — and the clamp branch is exactly where the surface printed
-# the raw 33664 beside a refusal that enforced 20254.
-SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
-SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=2500 (CLAMPED from 33664)' "$SCEN/out" \
-  && pass "(p7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
-  || fail "(p7) the inspection surface reports a bound the rail is not using"
-grep -q '^rail-deadline=33664' "$SCEN/out" \
-  && fail "(p7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
-  || pass "(p7) it does NOT print the raw unreachable value"
-
 # ── (q) EVERY `--jq` PROGRAM IN THE THREE DECLARED FORMS MUST COMPILE ─────────
 # #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s
 # RE-RUN read carried an UNTERMINATED jq string — one closing `"` short:
