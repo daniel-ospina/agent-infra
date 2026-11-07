@@ -1577,6 +1577,37 @@ printf '#!/bin/sh\necho PI_RAN >> "$PI_LOG"\nexit 0\n' > "$RIG/bin/pi"
 printf '#!/bin/sh\necho MERGE_ONE_RAN >> "$MERGE_LOG"\nexit "${MERGE_RC:-0}"\n' > "$RO/merge-one.sh"
 printf '#!/bin/sh\nexit 1\n' > "$RIG/bin/gh"
 chmod +x "$RIG/bin/pi" "$RIG/bin/gh" "$RO/merge-one.sh"
+# ── THE FORK INSTRUMENT, SEEDED INTO THIS RIG (agent-infra#2293 / #2843) ────────────────────────
+# ⛔ A RIG THAT SEEDS THE CALLERS BUT NOT THEIR INSTRUMENT IS A HALF-DEPLOYED BOX, and since the fork
+# floor became a REFUSAL (83 `AGENT_HARNESS_SKEW_REFUSED`) instead of a per-launch WARN, every arm
+# below that drives a caller with `O="$RO"` answers 83 — the SPREAD OF THE INSTRUMENT, not the load or
+# disk gate those arms name. That is the same class this file already fights (round 3's HOME fix, the
+# §9 `_rigmiss` loop): a verdict decided by the host's configuration rather than by the code under
+# test. Locally `O`/`AGENT_INFRA_PATH`/`~/orchestrator` can supply the file from the AMBIENT box, so
+# the arms read green here and red on the runner — seed it, so neither can decide.
+# ⛔ A STUB, NOT THE SHIPPED FILE: the shipped `capacity.sh` reads THIS HOST's process population, and
+# a busy runner would then refuse 73 (fork) before the gate an arm names ever ran. The arithmetic has
+# its own suite (`capacity-placement.test.sh`); here the instrument only has to be PRESENT and HEALTHY.
+# ⛔ ONE DEFINITION, EVERY RIG THAT COPIES THE GATE (§11's `$RES` is the second caller). The `$RES` rig
+# copies `spawn-gate.sh` into a directory that holds no harness, drives the REAL `run_agent`, and seeds
+# its validator — but NOT this instrument. With the floor as a refusal, that copy answers 83 (nodeploy)
+# BEFORE the capability resolver the arm exists to exercise ever runs, so the arm reported the SPREAD OF
+# THE INSTRUMENT as a capability-gate behaviour. It read green on a box whose ambient `AGENT_INFRA_PATH`
+# or `~/orchestrator` happened to supply the file and red on the runner, which is the same host-decides
+# class as the round-3 HOME fix and the §9 `_rigmiss` loop. Two heredocs would drift; one seeder cannot.
+seed_capacity_instrument() { # seed_capacity_instrument <dir holding a gate copy>
+  cat > "$1/capacity.sh" <<'CAPEOF'
+# Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
+cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
+cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
+cap_fork_probe() { return 0; }
+CAPEOF
+  [ -f "$1/capacity.sh" ]
+}
+# …and assert it, so a future edit that drops the seed fails HERE naming the file, instead of
+# resurfacing as a bogus 83 two hundred lines later (the `_rigmiss` idiom, applied to the instrument).
+seed_capacity_instrument "$RO"; rc=$?
+ck "the rig carries the fork instrument (a rig without it answers 83 for every load/disk arm)" $rc
 # ── THE CI-QUEUE READING THIS RIG MUST SUPPLY (agent-infra#2296) ────────────────────────────────
 # ⛔ THIS RIG IS NOW A PRECONDITION WITH NOTHING BEHIND IT, KEPT DELIBERATELY (#2927). It was added
 # because `ci-queue.sh` gated EVERY fixer lane on a MEASURED queue read, and an UNREADABLE queue
@@ -2293,6 +2324,11 @@ ck "...and does NOT report the memory refusal as a FORK refusal (each code has i
 cat > "$RO/capacity.sh" <<'CAPSTUB'
 cap_procs_pair_vars() { printf -v "$1" '%s' 15840; printf -v "$2" '%s' 15841; printf -v "$3" '%s' fixture; return 0; }
 cap_h_for_vars() { printf -v "$3" '%s' "$(( ${2:-0} - ${1:-0} ))"; return 0; }
+# ⛔ THE THIRD REQUIRED FUNCTION (merge onto main): `SPAWN_GATE_CAP_NEEDS` demands all three, so this
+# rig — added by #2591 while this branch was open, and therefore unseen by the sweep that seeded every
+# OTHER fork-driver fixture — went INCOMPLETE, and an incomplete module is `nodeploy` (83), not the fork
+# refusal (73) these three arms assert. Seeding it is the same correction, one fixture further out.
+cap_fork_probe() { return 0; }
 CAPSTUB
 printf '3\n' > "$RO/state/fixcount-7"; : > "$PI_LOG"; : > "$MERGE_LOG"; : > "$RO/logs/adopt-7.log"; : > "$RO/logs/fix-7.log"
 ( cd "$RREPO" && O="$RO" FIX_TIMEOUT=5 MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 DISK_GATE_PATH="$RREPO" \
@@ -2565,6 +2601,15 @@ cp "$HERE/cell-lane-preflight.sh" "$RES/cell-lane-preflight.sh"
 # instead of the 71 this arm asserts (measured: 247 passed / 1 failed, the failure being this arm).
 # The subject here is the CAPABILITY resolver, so the validator that gates it must travel with the rig.
 cp "$HERE/brief-gate.sh" "$RES/brief-gate.sh"
+# ⛔ AND THE FORK INSTRUMENT, FOR EXACTLY THE SAME REASON (measured 2026-11-04: this arm alone went red
+# on the runner while the whole file was green locally). Same class as the `$3042` note above and the
+# `$RO` seeder: `run_agent` reads the fork floor BEFORE it reaches the capability probe, and since that
+# floor REFUSES when its instrument is unresolvable, a gate copy in a bare directory answers 83 and the
+# resolver under test never runs. The arm then asserts 71 against 83 — a verdict about the SPREAD of
+# `capacity.sh`, not about the resolver. It passed on any box whose ambient `AGENT_INFRA_PATH` or
+# `~/orchestrator` supplied the file and failed on a bare runner, so the host decided it.
+seed_capacity_instrument "$RES"; rc=$?
+ck "the resolver rig carries the fork instrument too (a bare gate copy answers 83 before the probe runs)" $rc
 # ⛔ AND A CREDENTIAL, BECAUSE THE PROBE REFUSES BEFORE IT MEASURES WITHOUT ONE (#3237). This is the
 # ONLY arm that runs the REAL `cell-lane-preflight.sh`, and that helper gates on the provider key
 # BEFORE it spawns `pi` (`why=keys-unreadable`, exit 2 → the caller's 71). Every other arm presets
@@ -4052,6 +4097,141 @@ ck "...and the refusal NAMES the reading it refused (headroom, the margin, the p
 ok_out="$(fake_edge 400 15641)"
 case "$ok_out" in *"COLLIDE:state=ok"*) rc=0 ;; *) rc=1 ;; esac
 ck "POSITIVE CONTROL: the SAME box with 15k spare pids is ALLOWED (the arm is not a blanket refusal) [$ok_out]" $rc
+
+# ⛔ THE `nodeploy` ARM — the defect this change exists for (measured 2026-11-01). The resolver searched
+# `$O` and "beside me" ONLY, so as the installed `pi` shim at `$HOME/.pi/agent/bin` — a directory that
+# holds no harness — it found nothing whenever the launcher had not exported `O`, and every such lane
+# ran with the fork floor OFF behind a per-launch WARN. Driven at the SHIM (the mode the evidence came
+# from), with a COPY of the gate in an empty directory so the arm is reachable for real: the shipped
+# file's own directory always holds capacity.sh, which is exactly why this arm was never exercised.
+ND="$TMP/nodeploy"; mkdir -p "$ND/gate" "$ND/home"
+cp "$GATE" "$ND/gate/pi"
+: > "$PI_LOG"
+# ⛔ `PI_LOG` IS PASSED IN, AND THE ASSERTION IS "the stub wrote NOTHING" (cycle-2 review, P2). The
+# previous version grepped for a `PI_RAN` string the live stub never prints and did not hand the
+# child a `PI_LOG` at all, so it could not fail: an inert assertion dressed as a coverage claim. The
+# stub at `$TMP/bin/pi` appends one line per invocation, so an EMPTY file is proof it never ran.
+nd_out="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home" PI_LOG="$PI_LOG" PATH="$TMP/bin:/usr/bin:/bin" \
+          bash "$ND/gate/pi" -p noop 2>&1)"; nd_rc=$?
+[ "$nd_rc" -eq 83 ]; rc=$?
+ck "the spawn point REFUSES (83) when capacity.sh is unresolvable — it does not WARN and launch (rc=$nd_rc)" $rc
+[ ! -s "$PI_LOG" ]; rc=$?
+ck "...and the stub pi was NOT invoked (its log is empty) — 'the fork floor is off' is no longer a launch" $rc
+case "$nd_out" in *'fork headroom UNREADABLE'*'searched: '*) rc=0 ;; *) rc=1 ;; esac
+ck "...and the refusal NAMES the directories it searched (an operator is not told to guess) [$nd_out]" $rc
+# ⛔ THE PARTIAL-DEPLOY ARM (cycle-1 P1, cycle-2 P2 — the mechanism had no test): a `capacity.sh`
+# truncated at a function boundary used to satisfy `cap_procs_pair_vars` while `cap_h_for_vars` was
+# MISSING, so the headroom arithmetic was skipped, the two-fork probe passed and the gate answered
+# `ok` — a FALSE PASS. Required now: the whole function set, reported by name.
+mkdir -p "$ND/partial"
+cat > "$ND/partial/capacity.sh" <<'PIPARTIAL'
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 15641; printf -v "$3" '%s' stub; }
+PIPARTIAL
+# The copy's own directory holds no capacity.sh, so point the resolver at the partial one via O.
+nd3="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/partial" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd3" in *'state=nodeploy'*'missing: cap_h_for_vars'*) rc=0 ;; *) rc=1 ;; esac
+ck "an INCOMPLETE capacity.sh is nodeploy naming the missing function, never a false PASS [$nd3]" $rc
+# ⛔ A NON-NUMERIC HEADROOM IS NOT "NO PRESSURE" (cycle-3 review, P1): a module whose
+# `cap_h_for_vars` is PRESENT but writes nothing left the headroom empty, the numeric test was
+# skipped, and the gate answered `ok` on a box with ONE pid of headroom — then launched pi.
+cat > "$ND/nonum/capacity.sh" 2>/dev/null || mkdir -p "$ND/nonum"
+cat > "$ND/nonum/capacity.sh" <<'PINONUM'
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 401; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { :; }
+cap_fork_probe() { :; }
+PINONUM
+nd4="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/nonum" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd4" in *'state=nodeploy'*'NO USABLE NUMBER'*) rc=0 ;; *) rc=1 ;; esac
+ck "a NON-NUMERIC headroom REFUSES (nodeploy) instead of skipping the test and answering ok [$nd4]" $rc
+# ⛔ THE KNOB'S OWN VALIDATION IS DRIVEN THROUGH A MODULE THAT DOES NOT REWRITE IT (merge onto main,
+# after `#3479`). Both `nd5` and `nd9` below set a BAD `CAP_MIN_FORK_HEADROOM` and require the GATE to
+# refuse it. On this branch's base that worked against the shipped `capacity.sh`; `c3839eb7` (#3479)
+# then gave `capacity.sh` its own sanitising seam —
+#   CAP_MIN_FORK_HEADROOM="$(cap_int_seam CAP_MIN_FORK_HEADROOM "${CAP_MIN_FORK_HEADROOM:-200}" 200)"
+# — so the bad value is replaced by 200 BEFORE the gate's `is_limit` arm can see it, and the arm read
+# `state=ok` on a tree where nothing had regressed. That is not a weakening of the arm and not a
+# behaviour change: the GATE's refusal is what protects a spawn whose module is an OLDER deployed copy
+# (no sanitising seam) — the exact skew this whole change is about — so the arms point `O` at a
+# complete module with no knob handling and keep their assertions verbatim. The shipped pair's own
+# behaviour (a typo silently becoming 200) is a separate observation, recorded on the PR rather than
+# asserted here.
+mkdir -p "$ND/knob"
+cat > "$ND/knob/capacity.sh" <<'PIKNOB'
+# Hermetic COMPLETE module with NO `CAP_*` handling: the gate's own knob validation must be the thing
+# under test, so this copy deliberately neither defaults nor sanitises anything.
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 401; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( ${2:-0} - ${1:-0} ))"; return 0; }
+cap_fork_probe() { :; }
+PIKNOB
+nd5="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/knob" CAP_MIN_FORK_HEADROOM=abc HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd5" in *'state=nodeploy'*'CAP_MIN_FORK_HEADROOM'*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a NON-NUMERIC CAP_MIN_FORK_HEADROOM REFUSES too, naming the knob (no silent \`[: integer expression expected\`) [$nd5]" $rc
+# ⛔ NUMERIC-BUT-BEYOND-INTMAX IS NOT A READING EITHER (cycle-5 review, P1 — driven): `[ … -lt … ]`
+# above intmax returns 2, a FALSE condition, so a 24-digit headroom skipped the comparison and the
+# gate answered `ok` and LAUNCHED pi. `is_limit` (is_num AND <= 9 digits) is the file's own predicate
+# for exactly this wrap class.
+mkdir -p "$ND/huge"
+cat > "$ND/huge/capacity.sh" <<'PIHUGE'
+cap_procs_pair_vars() { printf -v "$1" '%s' 400; printf -v "$2" '%s' 401; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { printf -v "$3" '%s' 999999999999999999999999; return 0; }
+cap_fork_probe() { :; }
+PIHUGE
+nd8="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/huge" HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd8" in *'state=nodeploy'*'NO USABLE NUMBER'*) rc=0 ;; *) rc=1 ;; esac
+ck "a headroom BEYOND INTMAX REFUSES — [ -lt ] above intmax is a FALSE condition, so it used to answer ok and launch [$nd8]" $rc
+nd9="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/knob" CAP_MIN_FORK_HEADROOM=999999999999999999999999 HOME="$ND/home" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s" "$s" "$d"' _ "$ND/gate/pi" 2>&1)"
+case "$nd9" in *'state=nodeploy'*'not a usable number'*) rc=0 ;; *) rc=1 ;; esac
+ck "...and a BEYOND-INTMAX CAP_MIN_FORK_HEADROOM REFUSES rather than silently disabling the floor [$nd9]" $rc
+# ⛔ A BROKEN CANDIDATE IS SKIPPED, NOT FATAL (cycle-3 review, P2): one stale `$O/capacity.sh` must not
+# refuse every spawn on a box that holds a complete copy in the next candidate.
+mkdir -p "$ND/mixedO" "$ND/home3/orchestrator"
+cp "$ND/partial/capacity.sh" "$ND/mixedO/capacity.sh"
+cp "$cap_abspath" "$ND/home3/orchestrator/capacity.sh"
+nd6="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/mixedO" HOME="$ND/home3" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; if spawn_gate_load_capacity; then echo COMPLETE; else echo REFUSED; fi' _ "$ND/gate/pi" 2>&1)"
+case "$nd6" in *COMPLETE*) rc=0 ;; *) rc=1 ;; esac
+ck "a STALE \$O copy is SKIPPED and the complete copy further along is used — not a box-wide stall ($nd6)" $rc
+# ⛔ A SKIPPED CANDIDATE'S CONFIG BLOCK MUST NOT RIDE ALONG (cycle-4 review, P1 — measured). Every
+# `CAP_*` knob is assigned BEFORE any function is defined, so sourcing a broken candidate in the
+# gate's OWN shell left ITS floor in force while the gate used another file's arithmetic: a broken
+# `$O` copy setting `CAP_MIN_FORK_HEADROOM=1` plus a complete copy reporting 5 pids of headroom
+# produced `state=ok` and LAUNCHED pi. Candidates are validated in a subshell now, and only the
+# winner is sourced — so this arm is refused by the GOOD file's floor.
+mkdir -p "$ND/poison" "$ND/home4/orchestrator"
+printf 'CAP_MIN_FORK_HEADROOM=1\n' > "$ND/poison/capacity.sh"
+cat > "$ND/home4/orchestrator/capacity.sh" <<'PIGOOD'
+cap_procs_pair_vars() { printf -v "$1" '%s' 995; printf -v "$2" '%s' 1000; printf -v "$3" '%s' stub; }
+cap_h_for_vars() { printf -v "$3" '%s' "$(( $2 - $1 ))"; return 0; }
+cap_fork_probe() { :; }
+PIGOOD
+nd7="$(cd "$ND" && env -u AGENT_INFRA_PATH O="$ND/poison" HOME="$ND/home4" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; spawn_fork_state s d; printf "state=%s|%s|mod=%s" "$s" "$d" "${SPAWN_GATE_CAP_MOD:-}"' _ "$ND/gate/pi" 2>&1)"
+case "$nd7" in *'state=refused'*'min_fork_headroom=200'*"mod=$ND/home4/orchestrator/capacity.sh"*) rc=0 ;; *) rc=1 ;; esac
+ck "a skipped candidate's CAP_MIN_FORK_HEADROOM does NOT survive into the winner — the floor is the GOOD file's, and the module is NAMED by PATH [$nd7]" $rc
+# the RESOLVER fix: `O` unset, but the DOCUMENTED default for it ($HOME/orchestrator) holds the
+# instrument — present rather than merely reported, which is the preferred half of the remedy.
+mkdir -p "$ND/home2/orchestrator"; cp "$cap_abspath" "$ND/home2/orchestrator/capacity.sh"
+nd2="$(cd "$ND" && env -u O -u AGENT_INFRA_PATH HOME="$ND/home2" PATH="$TMP/bin:/usr/bin:/bin" \
+       bash -c '. "$1"; if spawn_gate_load_capacity; then echo RESOLVED; else echo UNREACHABLE; fi' _ "$ND/gate/pi" 2>&1)"
+case "$nd2" in *RESOLVED*) rc=0 ;; *) rc=1 ;; esac
+ck "with O UNSET the instrument is still FOUND in \$HOME/orchestrator — the floor enforces itself where it is installed as pi ($nd2)" $rc
+# ⛔ STRUCTURAL, AND SAID SO: the two 83 arms added for cycle-1 P1/P2 are ordered before the code that
+# would swallow them. This is a grep, not a drive — a behavioural fixture for `merge-one.sh`/`review-pr.sh`
+# needs a whole reviewer/repo rig, and claiming one here would be worse than naming the limit.
+m83="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-83' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+m80="$(grep -n 'AGENT_BRIEF_REFUSED:-80' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+mex="$(grep -n 'THE EXTRACTOR MUST ADMIT' "$HERE/merge-one.sh" | head -1 | cut -d: -f1)"
+[ -n "$m83" ] && [ -n "$m80" ] && [ -n "$mex" ] && [ "$m83" -gt "$m80" ] && [ "$m83" -lt "$mex" ]; rc=$?
+ck "STRUCTURAL: merge-one.sh's 83 arm sits AFTER 80 and BEFORE the verdict extractor ($m80 < $m83 < $mex)" $rc
+r83="$(grep -n 'AGENT_HARNESS_SKEW_REFUSED:-83' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
+rnn="$(grep -n 'THE EXIT STATUS IS THE SIGNAL' "$HERE/../review-pr.sh" | head -1 | cut -d: -f1)"
+[ -n "$r83" ] && [ -n "$rnn" ] && [ "$r83" -lt "$rnn" ]; rc=$?
+ck "STRUCTURAL: review-pr.sh's 83 arm sits BEFORE its non-zero-exit fallthrough ($r83 < $rnn)" $rc
 
 # END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
 # code (74, not 77/75), and the log says why.

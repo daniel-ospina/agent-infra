@@ -1988,6 +1988,29 @@ if [ "$AGENT_RC" = "${AGENT_BRIEF_REFUSED:-80}" ]; then
   echo "[merge $PR] brief refused (harness defect) — no reviewer started; see $L.log" >&2
   exit 80
 fi
+# ⛔ THE SYNC REFUSAL IS ITS OWN ARM (agent-infra#2293 follow-up), and without it this file turns a
+# helper-deploy fault into a REVIEW VERDICT. The spawn point exits `AGENT_HARNESS_SKEW_REFUSED` (83) when
+# ITS copy of `spawn-gate.sh` cannot resolve `capacity.sh` at all; that code matched neither the 76 arm
+# nor the 80 arm above, so the refusal fell through to the verdict extractor, produced an EMPTY verdict,
+# and wrote `needsreview-<PR>-<head>` — spending one of MAX_REVIEW_TRIES per refusal for a review
+# that never started, and PARKING the PR once the budget ran out. That is the #1716/#1720 class this
+# file's own load-gate arm exists to prevent, and no marker may be written for it: no reviewer ran.
+# ⛔ IT IS 83, NOT 81 (this branch was merged onto `#3237`): 81 belongs to `AGENT_MEM_REFUSED` (#2387),
+# the caller-facing memory gate — the arm two blocks up exits it — and a reader default of 81 under the
+# skew name would relabel every sync refusal as that gate. The collision `#3237` moved the harness code
+# off 81 to end. The default must equal the declaration, or `spawn-gate.test.sh`'s guard (g) REDS the
+# tree.
+# ⛔ AND IT CLEARS `AGENT_STARTED` AS WELL AS `REV_STARTED` (merge resolution against `#3441`): the EXIT
+# hook `review_round_spend_at_exit` fires only when BOTH are 1, and `run_agent` sets `AGENT_STARTED=1`
+# before `pi` launches. Clearing only `REV_STARTED` would spend a review round on a helper-deploy
+# fault — the exact defect `#3441` fixed for 76/78/127, reintroduced one code over. No reviewer ran.
+if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
+  REV_STARTED=0
+  AGENT_STARTED=0
+  echo "[merge $PR] reviewer NOT started (HELPER/SYNC gate: capacity.sh not resolvable from the spawn gate) — no verdict, NO marker written; this is not a property of this PR or this box: sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever reviewers run, then re-dispatch. Do NOT dispatch the PR elsewhere: every box with these files refuses identically" >> "$L.log"
+  echo "[merge $PR] reviewer NOT started (helper/sync refusal) — no verdict, no marker; see $L.log" >&2
+  exit "$AGENT_HARNESS_SKEW_REFUSED"
+fi
 # ⛔ THE ROUND IS SPENT **HERE**, AND THIS FILE IS ITS ONLY WRITER (#3441). It sits BELOW every
 # refusal arm above, because those are the arms whose own words are "no reviewer ran":
 #   * `exit 75` — the pi spawn-point LOAD gate refused. (Incoming `AGENT_RC` is 76, which is what the
@@ -2006,6 +2029,9 @@ fi
 #   * `exit 81` — the SPAWN POINT's MEMORY gate refused (incoming 84). Added by #2387 when it was
 #     re-applied onto #3441; it is above the spend for the same reason as the rest, and it clears
 #     BOTH flags so the EXIT recorder stays inert and no round is banked for a reviewer that never ran.
+#   * `exit 83` — the SPAWN POINT's helper/sync floor (`AGENT_HARNESS_SKEW_REFUSED`): the spawn
+#     gate could not resolve `capacity.sh`, so the reviewer never started. Named by the sync arm
+#     above, and it clears BOTH flags for the same reason the memory arm does.
 # And it is below `run_agent` for the reasons the two earlier rounds established: not at the top of the
 # file (a rail merge, a claim race and a duplicate invocation all exit before any review, so the
 # counter counted MERGE ATTEMPTS), and not just above `run_agent` (which would pay before it knows a

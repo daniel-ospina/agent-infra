@@ -39,6 +39,27 @@ export HOME="$TMP/home"
 LEDGER="$HOME/.pi/agent/state/spawn-gate.tsv"
 mkdir -p "$HOME" "$TMP/shim" "$TMP/real" "$TMP/runner" "$TMP/fakebin" "$TMP/O/state"
 
+# ── THE FORK INSTRUMENT, DEPLOYED (agent-infra#2293 / #2843) ──────────────────
+# The spawn point now HARD-REQUIRES `capacity.sh`: it refuses under 83 (`AGENT_HARNESS_SKEW_REFUSED`)
+# when the fork floor cannot be read, instead of warning and launching with the floor OFF. That makes
+# a resolver-less fixture a HALF-DEPLOYED box — every load arm below then answers 83 instead of the
+# 76/0 it asserts, and the suite stops testing the load gate at all.
+# ⛔ A STUB, NOT THE SHIPPED FILE, for the reason the load seam above is stubbed: the shipped
+# `capacity.sh` reads THIS HOST's real process population, so an arm's verdict would be decided by
+# the runner's fork headroom (a busy runner reading `headroom=5` would refuse 73 before the load gate
+# ever ran). This suite is hermetic; the arithmetic has its own suite (`capacity-placement.test.sh`).
+# ⛔ PLACED AT `$HOME/orchestrator` — the DOCUMENTED default harness home, and one of the resolver's
+# candidates — so it covers every shim location this file installs (a copy at `$TMP/shim` AND the
+# symlinked `$TMP/neutral` farm), instead of seeding per-directory.
+mkdir -p "$HOME/orchestrator"
+cat > "$HOME/orchestrator/capacity.sh" <<'CAPEOF'
+# Hermetic HEALTHY instrument stub: the three functions the spawn gate hard-requires, fixed readings.
+cap_procs_pair_vars() { printf -v "${1:?}" '%s' 100; printf -v "${2:?}" '%s' 10000; printf -v "${3:?}" '%s' 'fixture'; }
+cap_h_for_vars() { printf -v "${3:?}" '%s' "$(( ${2:-0} - ${1:-0} ))"; }
+cap_fork_probe() { return 0; }
+CAPEOF
+
+
 # ── the fake REAL pi: records argv, its own PPID and its own pid ──────────────
 # A real executable in a PATH directory BEHIND the shim — the production shape: the shim finds the
 # first `pi` on PATH that is not itself, and execs it.
@@ -142,6 +163,25 @@ reset_probe() { : > "$TMP/probe"; }
 probe_field() { sed -n "s/^$1://p" "$TMP/probe" 2>/dev/null | tail -1; }
 ledger_rows() { if [ -r "$LEDGER" ]; then wc -l < "$LEDGER" | tr -d ' '; else printf '0'; fi; }
 ledger_field() { sed -n "${1}p" "$LEDGER" 2>/dev/null | cut -f"$2"; }
+
+# ── 0b. THE FLOOR'S OWN POLARITY: no instrument is a REFUSAL, not a warning ────
+# agent-infra#2843: this arm was a per-launch WARN that PROCEEDED, so the fork floor was silently off
+# on every box whose launcher had not exported `O`. The refusal is the point of the fix, and it is
+# pinned HERE (at the spawn point, where it is installed) as well as in the gate's own suite: a box
+# with no instrument must start NOTHING and say which dirs it looked in.
+reset_probe
+# ⛔ `O`/`AGENT_INFRA_PATH` ARE SCRUBBED IN A SUBSHELL, because they are the two candidates that make
+# an instrument reachable from OUTSIDE this fixture. Left ambient, this arm is green on a developer
+# box (whose `O` points at a real harness) and red on the runner — the verdict decided by the host, not
+# by the code under test. `unset` removes the export too, so the child shell cannot see either.
+err="$( ( unset O AGENT_INFRA_PATH; HOME="$TMP/nohome" FAKE_LOAD=1 MAX_LOAD=999999999 run_shim runner ) 2>&1 >/dev/null )"; rc=$?
+{ [ "$rc" -eq 83 ] && [ ! -s "$TMP/probe" ]; }; rc2=$?
+[ "$rc2" -eq 0 ] && pass "an installed shim with NO fork instrument REFUSES (83) and starts NOTHING" \
+  || fail "an unreadable fork floor still ADMITTED the spawn (rc=$rc) — the #2843 fail-open is back"
+grep -q 'fork headroom UNREADABLE' <<<"$err" && grep -q 'searched:' <<<"$err" && pass "…and the refusal names what it could not read AND the dirs it searched" \
+  || fail "the no-instrument refusal does not say which inputs it tried: $(head -1 <<<"$err")"
+grep -q 'REFUSED load=' <<<"$err" && fail "a missing instrument was reported as a LOAD refusal — the two remedies differ" \
+  || pass "…and it is NOT reported as a load refusal (load means 'wait', this means 'sync the pair')"
 
 echo "==> pi-shim suite ($GATE)"
 
