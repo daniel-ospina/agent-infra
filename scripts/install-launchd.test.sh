@@ -1027,7 +1027,16 @@ OUT="$(probe_install "$PROBE_HOME" "$PROBE_HOME/Documents/checkout/.venv/bin/pyt
 set -e
 assert_eq "$RC" "0" "§7c a TCC launcher does not fail the install for a target in ANOTHER TCC tree"
 assert_line "$OUT" '^    TCC-protected target: ' "§7c a target in a DIFFERENT TCC tree is refused, not excused by the launcher"
-assert_not_contains "$OUT" "inside the SAME TCC tree" "§7c …and the message does not claim a shared tree"
+# ⛔ THE NEEDLE MUST BE A STRING THE INSTALLER CAN ACTUALLY PRINT. This used to read `inside the SAME
+# TCC tree`, which appears NOWHERE in `scripts/install-launchd.sh` — the same-tree WARN says `inside
+# <root>, the SAME tree this unit's launcher holds a grant for` — so the assertion reported PASS under
+# EVERY mutant, including the one that restores the bare-boolean grant comparison this case exists to
+# exclude (fresh review of #3413 at d9886d32, FINDING 1). Both needles below are behaviour-anchored
+# (`WARN TCC-protected target:` is the arm that arms the unit), and the prose half is pinned in the
+# POSITIVE direction at (c22h) below, so a reworded WARN reddens there instead of making this pair
+# vacuous again.
+assert_not_contains "$OUT" "WARN TCC-protected target:" "§7c …and it is REFUSED, not WARNed as a same-tree target"
+assert_not_contains "$OUT" "the SAME tree" "§7c …and the message does not claim a shared tree"
 if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
     bad "§7c …so it is not installed"
 else
@@ -1816,6 +1825,11 @@ OUT="$(probe_install_fallback "$PROBE_HOME" "$PROBE_TCC_BIN" "$PROBE_DEAD" 2>&1)
 set -e
 assert_eq "$RC" "0" "§7c fallback: an executed target in the launcher's OWN TCC tree WARNS (the binary holds the grant)"
 assert_contains "$OUT" "WARN TCC-protected target: $PROBE_DEAD" "§7c …and says it is the same tree, as the python reader does"
+# ⛔ THE POSITIVE HALF OF THE NEEDLE §7c (c11) RESTS ON. That case asserts the "shared tree" sentence is
+# ABSENT for a DIFFERENT tree, and a negative pin only means something while the sentence still exists to
+# be printed. Pinned HERE, where the same-tree WARN must emit it: reword the WARN without updating (c11)
+# and this row reddens instead of (c11) quietly going vacuous (fresh review of #3413, FINDING 1).
+assert_contains "$OUT" "the SAME tree" "§7c …naming the shared tree in the WARN's own sentence"
 assert_not_contains "$OUT" "SKIP com.eldato.tccprobe" "§7c …so the reaper is not skipped and disarmed"
 if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
     ok "§7c …and the unit is installed"
