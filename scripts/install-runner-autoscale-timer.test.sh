@@ -400,38 +400,39 @@ assert_eq "$RC" 1 "a transient-scratch install is refused (rc 1)"
 assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
     "the refusal names transient scratch, not a scheduler problem"
 assert_contains "$OUT" "127" "the refusal names the measured consequence (127 every tick)"
-# ⛔ AND THE FLEET'S OWN LANE-WORKTREE LAYOUT IS TRANSIENT BY CONSTRUCTION TOO (#3469 review).
-# `templates/systemd/eldato-pr-repair.service:91` records `/tmp/wt-<issue>-<slug>` as the shape a lane
-# creates and the reaper deletes. The predicate matched only `mktemp`'s `tmp.????`, so a lane worktree
-# sailed through — harmless while `tools/install-ci-runner-x64.sh` did not exist, and a SILENT DOOMED
-# PIN once it did (the tree is deleted with the lane, so every pass records `no provisioner`).
-# Pinned through HOME, one of the four values `refuse_unusable_target` judges, and the reachable seam:
-# the install is refused instead of rendering a unit pointed at a tree that will not exist.
-WT="/tmp/wt-runnerautoscale.$$"; mkdir -p "$WT/.pi/agent/scripts" "$WT/.pi/agent/state"
-cp "$T/home/converger.py" "$WT/.pi/agent/scripts/"
-ENVV=(HOME="$WT" RUNNER_AUTOSCALE_SCRIPT="$WT/.pi/agent/scripts/converger.py"
-      RUNNER_AUTOSCALE_STATE_DIR="$WT/.pi/agent/state" RUNNER_AUTOSCALE_ARM_FILE="$WT/arm"
-      SUDO=false)
+# ⛔ AND A PROVISIONER PINNED IN LANE SCRATCH IS REFUSED — THROUGH THE PROVISIONER SEAM, NOT THROUGH
+# HOME/SCRIPT. This scoping is deliberate: `resolve_script` records the opposite decision for the
+# CONVERGER ("a worktree path is SAID OUT LOUD, NOT REFUSED — scheduling a branch's copy is a
+# legitimate test"), so the wider lane-checkout predicate is applied to the PROVISIONER only. A
+# provisioner's whole job is to still exist at the first tick; a converger copy is a legitimate thing
+# to schedule. The shapes are adopted verbatim from `scripts/install-repair-service.sh` (#2697).
+WT="/tmp/wt-runnerautoscale.$$"; mkdir -p "$WT"
+printf '#!/bin/sh\n' >"$WT/inst.sh"; chmod +x "$WT/inst.sh"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT/inst.sh" SUDO=false)
 OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
-assert_eq "$RC" 1 "a /tmp/wt-<issue>-<slug> lane worktree is refused as transient (rc 1)"
+assert_eq "$RC" 1 "a provisioner pinned under /tmp/wt-<issue>-<slug> is REFUSED (rc 1)"
 assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
-    "and the lane-worktree refusal names the same class, not a scheduler problem"
-# ⛔ AND THE *OTHER* LANE CHECKOUT SHAPE THE REPO ALREADY NAMES. `scripts/install-repair-service.sh`
-# refuses a unit exec'd from `*/.worktrees/* | /tmp/wt-* | /tmp/cell-wt-* | /tmp/base-*` (#2697), and
-# this predicate adopts that set rather than inventing a second definition of "lane scratch". The
-# `.worktrees/` shape is the one this repo's own worktree tooling creates, so it gets its own arm: a
-# predicate that covers one shape and not the other is exactly the kind of partial guard this suite
-# exists to catch. (Placed under $T so it matches ONLY the `*/.worktrees/*` alternative, not `/tmp/wt-*`.)
-WT2="$T/.worktrees/lane"
-mkdir -p "$WT2/.pi/agent/scripts" "$WT2/.pi/agent/state"
-cp "$T/home/converger.py" "$WT2/.pi/agent/scripts/"
-ENVV=(HOME="$WT2" RUNNER_AUTOSCALE_SCRIPT="$WT2/.pi/agent/scripts/converger.py"
-      RUNNER_AUTOSCALE_STATE_DIR="$WT2/.pi/agent/state" RUNNER_AUTOSCALE_ARM_FILE="$WT2/arm"
-      SUDO=false)
+    "…naming the class it would create, with the pin it judged"
+assert_contains "$OUT" "PROVISIONER=$WT/inst.sh" "…and the value it judged"
+# ⛔ AND THE *OTHER* LANE CHECKOUT SHAPE THE REPO ALREADY NAMES, because a predicate that covers one
+# shape and not the other is exactly the partial guard this suite exists to catch. Placed under $T so it
+# matches ONLY the `*/.worktrees/*` alternative and not `/tmp/wt-*`.
+WT2="$T/.worktrees/lane"; mkdir -p "$WT2"
+printf '#!/bin/sh\n' >"$WT2/inst.sh"; chmod +x "$WT2/inst.sh"
+ENVV=(RUNNER_AUTOSCALE_PROVISIONER="$WT2/inst.sh" SUDO=false)
 OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
-assert_eq "$RC" 1 "a */.worktrees/<lane> checkout is refused as transient (rc 1)"
-assert_contains "$OUT" "REFUSING a scheduled install rendered from transient scratch space" \
-    "and that refusal names the same class as the /tmp/wt-* arm"
+assert_eq "$RC" 1 "a provisioner pinned under */.worktrees/<lane> is REFUSED (rc 1)"
+assert_contains "$OUT" "PROVISIONER=$WT2/inst.sh" "…and that refusal names the value it judged"
+# ⛔ AND THE OTHER HALF OF THE SCOPING: THE CONVERGER ITSELF IS *NOT* REFUSED FROM A WORKTREE. This is
+# the decision the wider predicate must not swallow (`resolve_script`: a branch's copy is a legitimate
+# thing to schedule — say it out loud, do not refuse it). Without this arm, widening the predicate to
+# the SCRIPT value would look correct to every other assertion in this file.
+WT3="$T/.worktrees/lane3"; mkdir -p "$WT3"
+cp "$T/home/converger.py" "$WT3/converger.py"
+ENVV=(RUNNER_AUTOSCALE_SCRIPT="$WT3/converger.py" SUDO=false)
+OUT="$(run_install Linux - --install)"; RC=$?; ENVV=()
+assert_eq "$RC" 0 "a CONVERGER pinned in a worktree still installs (the recorded decision)"
+assert_contains "$OUT" "is inside a WORKTREE" "…and the worktree is SAID OUT LOUD, as decided"
 
 # ── T6: an old interpreter is refused ─────────────────────────────────────────────────────
 say_case "T6 an interpreter older than 3.12 is refused"

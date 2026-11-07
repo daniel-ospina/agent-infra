@@ -264,7 +264,26 @@ fi
 mkdir -p "$RUNNER_ROOT/gh-runner-x64-5"
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 5 --fallback auto 2>&1); rc=$?
 check "rc 4 on a PRE-EXISTING path without .runner is a REFUSAL" 2 "$rc" "guard-refused" "$out"
-check "…naming the wedged path to clear" 0 0 "rm -rf '$RUNNER_ROOT/gh-runner-x64-5'" "$out"
+check "…naming both possible causes, not just one" 0 0 "stale leftover from an interrupted add or a peer's add" "$out"
+check "…and telling the operator to retry, not to delete" 0 0 "retry on the next pass" "$out"
+case "$out" in
+  *"rm -rf"*) bad "the pre-existing-path refusal must NEVER prescribe rm -rf — a peer's in-flight add holds these exact bytes";;
+  *) ok "the pre-existing-path refusal never prescribes rm -rf";;
+esac
+
+# 18b. ⛔ A DANGLING `.runner` SYMLINK IS THE ONE STATE WHERE THE TWO TOOLS DISAGREE ABOUT THE SAME
+# BYTES: the pool's occupancy test is `[ -e ] || [ -L ]` (answers `already registered — use restart`)
+# while the caller's is `Path(...).exists()`, which follows the link and answers FREE. Exiting 0 with
+# `skipped` would hide a slot that never counts — a false PASS.
+W="$RUNNER_ROOT/gh-runner-x64-8"; mkdir -p "$W"; ln -s /nonexistent/config.json "$W/.runner"
+out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_preclaimed 4) bash "$SUT" --count 8 --fallback auto 2>&1); rc=$?
+check "a dangling .runner symlink is a REFUSAL, not a silent skip" 2 "$rc" "SYMLINK with no target" "$out"
+check "…naming the pool/caller disagreement" 0 0 "reports the slot REGISTERED" "$out"
+case "$out" in
+  *added=1*|*added=0*) bad "a disagreement about occupancy never claims a provision";;
+  *) ok "a disagreement about occupancy never claims a provision";;
+esac
+rm -f "$W/.runner"
 case "$out" in
   *added=1*) bad "a wedged slot never claims to have provisioned";;
   *) ok "a wedged slot never claims to have provisioned";;
@@ -287,12 +306,25 @@ check "…and the dead listener the pool names is in the record" 0 0 "listener=d
 # an operator to delete a registration in progress.
 out=$(CI_RUNNER_POOL_TOOL=$(fake_pool_race) bash "$SUT" --count 7 --fallback auto 2>&1); rc=$?
 check "rc 4 race (path appeared during the call) is a refusal" 2 "$rc" "guard-refused" "$out"
-check "…naming the RACE, not a wedge" 0 0 "another pass took this slot while this add ran" "$out"
+check "…naming the RACE" 0 0 "another pass took this slot while this add ran" "$out"
 check "…and offering the pool's own restart" 0 0 "restart --name gh-runner-x64-7" "$out"
 case "$out" in
   *"rm -rf"*) bad "the race must NEVER prescribe rm -rf over a peer's in-progress registration";;
   *) ok "the race does not prescribe rm -rf over a peer's in-progress registration";;
 esac
+
+# 21. ⛔ THE ADAPTER PRESCRIBES `rm -rf` NOWHERE, AND THAT IS A PINNED PROPERTY, NOT A STYLE CHOICE.
+# `ci_runner_pool.sh::add` creates the dir, copies the template, runs `config.sh` and only THEN writes
+# `.runner`, so a peer's in-flight add is byte-identical to a stale leftover. A refusal that told an
+# operator to delete the path could delete a live registration.
+# ⛔ THE CHECK IS ON OUTPUT LINES, NOT ON THE FILE TEXT: the header and this very comment DISCUSS the
+# ban (`rm -rf` appears in prose explaining why it is never prescribed), so a whole-file grep would
+# red on its own explanation. What matters is whether any MESSAGE the tool prints carries it.
+if grep -nE '^[[:space:]]*(err|printf)[^#]*rm -rf' "$SUT"; then
+  bad "an adapter MESSAGE prescribes rm -rf — it must never tell an operator to delete a path it did not create"
+else
+  ok "no adapter message prescribes rm -rf"
+fi
 
 printf '\n%s\n' "install-ci-runner-x64: pass=$pass fail=$fail"
 [ "$fail" -eq 0 ] || exit 1

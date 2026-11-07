@@ -81,21 +81,18 @@
 #          `<root>/gh-runner-x64-2/.runner` and exited 4, and the pass recorded action-failed
 #          although the runner existed. Two passes adding the same index is a REAL condition here —
 #          the caller takes no inter-pass lock and its own docs note passes racing.
-#        · rc 4 with NO `.runner` → a refusal, and WHICH refusal depends on whether the path existed
-#          BEFORE this call, because the pool's two rc-4 branches differ exactly there:
-#            – the path pre-existed (`name-unavailable … already exists … clear it or pick another
-#              name`) → a permanent WEDGE: `_next_free_slot` counts only `.runner` as occupied, so
-#              it calls that path FREE and asks for the same index forever, while `add` and
-#              `reclaim` refuse it and `reconcile` never enumerates it. Nothing repairs it
-#              automatically and the remedy is a human `rm -rf`, so the message says so.
-#            – the path APPEARED while this add ran (`… appeared while this add ran (another pass
-#              took it) — use restart`) → a RACE WON BY A PEER, and a live peer may be mid-way
-#              through registering that very directory. ⛔ THE `rm -rf` GUIDANCE MUST NEVER BE
-#              PRINTED HERE — it would tell an operator to delete a registration in progress. The
-#              honest report is "another pass took this slot, retry next pass" plus the pool's own
-#              `restart --name`.
-#          Both are exit 2 (an ANSWER, so the caller records `provisioner-refused` instead of a
-#          failure on a 10-minute timer); only the diagnosis and the remedy differ.
+#        · rc 4 with NO `.runner` → a refusal, and the message must NOT tell anyone to delete the path.
+#          `ci_runner_pool.sh::add` creates the directory, copies the template, runs `config.sh` and
+#          only THEN writes `.runner`, so "directory exists without `.runner`" is the NORMAL state of
+#          a peer's in-flight add for its whole window, not a synonym for a stale leftover. The
+#          pre-call capture can tell "appeared during this call" from "was already there", but it
+#          CANNOT tell "a peer started just before my call" from "a residual wedge" — the bytes are
+#          identical. So every rc-4 refusal names the state and both possible causes, and offers only
+#          NON-DESTRUCTIVE remedies (`retry next pass`, `restart --name`); a human clears a path that
+#          persists. ⛔ THIS FILE PRESCRIBES `rm -rf` NOWHERE.
+#        · a symlinked `.runner` whose target is gone is its own refusal: the pool answers `already
+#          registered — use restart` while the caller's `Path.exists()` answers FREE, so `live` never
+#          moves. The message names the disagreement instead of picking a side.
 #
 #   `--fallback auto` is accepted and is the ONLY accepted value: it means "let ci_runner_pool.sh
 #   resolve its own template/kernel/arch", which is what it already does. Passing anything else is
@@ -229,8 +226,18 @@ case "$rc" in
        # the caller's NEXT step repairs it, instead of a refusal it would sit on.
        if [ -e "$DIR/.runner" ]; then
          last=$(printf '%s' "$out" | tail -1 | cut -c1-90)
-         printf 'provisioned slot=%s name=%s root=%s added=1 skipped=0 listener=dead pool=%s\n' \
-           "$COUNT" "$NAME" "$RUNNER_ROOT" "$last"
+         # ⛔ `listener=dead` IS CLAIMED ONLY WHEN THE POOL SAID SO. Its rc-2 arm can also be reached
+         # with `.runner` written by a PEER (a `cannot-measure` gate refusing while another pass
+         # registered the same dir), and asserting a dead listener over someone else's live one would
+         # be a fabricated record. `added=0 skipped=1` is the honest reading in that case.
+         case "$out" in
+           *registered=1*)
+             printf 'provisioned slot=%s name=%s root=%s added=1 skipped=0 listener=dead pool=%s\n' \
+               "$COUNT" "$NAME" "$RUNNER_ROOT" "$last" ;;
+           *)
+             printf 'provisioned slot=%s name=%s root=%s added=0 skipped=1 already-registered-elsewhere pool=%s\n' \
+               "$COUNT" "$NAME" "$RUNNER_ROOT" "$last" ;;
+         esac
          exit 0
        fi
        printf '%s\n' "$out" | tail -3 >&2
@@ -246,14 +253,24 @@ case "$rc" in
        exit 0
      fi
      printf '%s\n' "$out" | tail -3 >&2
-     if [ "$DIR_EXISTED_BEFORE" -eq 1 ]; then
-       # No `.runner`, and the path was ALREADY there before this call: the caller counts it FREE
-       # forever while every pool verb refuses it, and nothing repairs it automatically.
-       err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR already existed without a .runner registration, so runner_autoscale.py counts it FREE while every pool verb refuses it — clear it (rm -rf '$DIR') or name another slot"
+     # ⛔ THIS FILE PRESCRIBES `rm -rf` NOWHERE, AND THAT IS A CORRECTION OF THIS VERY ARM. "Directory
+     # exists without `.runner`" is NOT a synonym for "stale leftover": `ci_runner_pool.sh::add`
+     # creates the directory, copies the template, runs `config.sh` and only then writes `.runner`, so
+     # a peer's add is in exactly this state for its whole window. The pre-call capture above cannot
+     # separate "a peer started before my call" from "a wedge" — the bytes are identical — so telling
+     # an operator to delete the path would tell them to delete a registration in progress, which is
+     # what this file's own header forbids. Report the state, name BOTH possible causes, and give only
+     # the non-destructive remedy: the adapter never deletes a directory it did not create.
+     if [ -L "$DIR/.runner" ]; then
+       # ⛔ THE TWO TOOLS DISAGREE ABOUT THESE BYTES, AND THE RECORD MUST SAY SO RATHER THAN PICK A SIDE.
+       # The pool's occupancy test is `[ -e ] || [ -L ]`, so it answers "already registered — use
+       # restart"; the caller's is `Path(...).exists()`, which follows the link and answers "free". A
+       # dangling `.runner` therefore reads REGISTERED to the pool and FREE to the caller, so `live`
+       # never moves and this index is asked for forever.
+       err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR/.runner is a SYMLINK with no target — the pool tool reports the slot REGISTERED ('use restart') while runner_autoscale.py's .runner test counts it FREE, so live never moves and this index is re-asked every pass; repair the link or name another slot (this adapter never deletes the path)"
+     elif [ "$DIR_EXISTED_BEFORE" -eq 1 ]; then
+       err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): $DIR existed before this pass without a .runner registration — either a stale leftover from an interrupted add or a peer's add that has not written .runner yet; nothing was added, retry on the next pass. If it is still there with no .runner afterwards, a human must inspect and clear it — this adapter never deletes a path it did not create"
      else
-       # ⛔ A DIFFERENT FACT, AND IT MUST NOT CARRY THE `rm -rf` ABOVE: the directory APPEARED
-       # during this call, i.e. another pass won the mkdir race and may be registering it right now.
-       # Telling an operator to delete it would delete a registration in progress.
        err "guard-refused by pool tool for slot $COUNT name=$NAME (nothing added): another pass took this slot while this add ran — $DIR appeared during the call; retry on the next pass, or run: bash $POOL_TOOL restart --name $NAME"
      fi
      exit 2 ;;
