@@ -1297,13 +1297,15 @@ ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 
 # ...and the cap is the DECISION, not just the value: a 2-year-old claim is REAPED at the ceiling, so a
 # deleted cap shows up as a KEPT claim, not as a number.
 # ⛔ AND THIS SEED IS ASSERTED, NOT SWALLOWED (review round 30, agent-infra#3203) — the same rule round 25
-# wrote at A70a above. `pr-3236` was the one fixture this block still planted with `p4_seed … >/dev/null`,
-# and it is the worst place to leave that shape: A85 asserts the ref is ABSENT, which is exactly what a
-# NEVER-PLANTED fixture looks like, so a seed that failed inside the redirect read `✅ "it is really gone"`
-# over a ref that never existed — a verifier PASSing an unverified artifact — while A84's red blamed the
-# 30-day CEILING cap for a fault that was in the fixture instead. Asserting the minted sha (p4_seed prints
-# the commit it pushed, :800) moves the failure to this row, where the message names the seed, and leaves
-# A84/A85 measuring a claim that is proven to exist.
+# wrote at A70a above. `pr-3236` is NOT the only swallowed seed in this block — 13 of them are planted with
+# `p4_seed … >/dev/null` — but it is the only one whose UNIQUE hazard is an ABSENCE assertion: every other
+# swallowed seed sits above an assertion that needs its ref to have existed (A30 `:920` names
+# `pruned … refs/claims/pr-3209`; A84 below names `pruned … refs/claims/pr-3236`). A85 asserts the ref is
+# ABSENT, which is exactly what a NEVER-PLANTED fixture looks like, so a seed that failed inside the
+# redirect read `✅ "it is really gone"` over a ref that never existed — a verifier PASSing an unverified
+# artifact — while A84's red blamed the 30-day CEILING cap for a fault that was in the fixture instead.
+# Asserting the minted sha (p4_seed prints the commit it pushed, :800) moves the failure to this row, where
+# the message names the seed, and leaves A84/A85 measuring a claim that is proven to exist.
 ck "A84a (setup) a 2-YEAR-old unparseable-lease claim is MINTED for the ceiling-cap case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3236 weird3203 HAVOC 63072000 2>/dev/null )"
 outP4CAPB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
                   CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
