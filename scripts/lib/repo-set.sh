@@ -121,8 +121,15 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
 # _rs_norm_path <path> — the canonical SPELLING of a path, without touching the filesystem:
 # repeated separators collapsed, `.` components dropped, trailing `/` removed. It is not a realpath
-# (no symlink or `..` resolution — that needs the filesystem, and this must work for a dir that does
-# not exist yet), and it does not fold case: the caller composes it with `_rs_lower`.
+# (no symlink or `..` resolution), and it does not fold case.
+#
+# ⛔ IT IS NO LONGER ON THE SHIPPED PATH — DO NOT DELETE IT ON THAT BASIS (round 9, P2). `_rs_state_key`
+# replaced its last caller when the state key became an identity walk (it must fold `..` and follow
+# symlinks, which this cannot). It is RETAINED because the suite's non-vacuity mutation expresses the
+# ROUND-6 fallback with it (`repo-set.test.sh`'s injected `_rs_state_key` body), so removing it turns
+# m11/m12 into an assertion about an undefined command — a mutation that cannot apply, which is the
+# "proves nothing" trap those arms exist to avoid. It is also the documented spelling primitive for
+# any future consumer that needs a path normalised without touching the filesystem.
 #
 # ⛔ WHY IT IS NEEDED, MEASURED IN REVIEW ROUND 3 (P2): `/srv/state` and `/srv//state` and
 # `/srv/./state` are ONE DIRECTORY. The shared-state guard compared raw spellings, so a set that named
@@ -172,6 +179,19 @@ EOF_NORM
 #     that exists with `cd -P` (following symlinks), and folding the remainder lexically — valid
 #     because once a prefix does not exist, nothing below it exists either, so no remaining
 #     component can be a symlink and `..` there is pure text.
+#   * ⛔ THAT JUSTIFICATION HAS ONE HOLE, AND IT IS THE TCC SHAPE THIS FILE KEEPS MEETING (round 9,
+#     P2). A component that EXISTS but cannot be ENTERED (EACCES/EPERM/ELOOP — a `mode 000` dir, a
+#     denied ancestor, launchd without Full Disk Access) is not "absent": the walk fell through to
+#     the lexical branch, and every later `..` was then folded textually. Measured with kernel truth:
+#     `a/link -> tgt`, `tgt` mode 000 — `realpath(a/link/../b)` and `realpath(b)` are ONE directory,
+#     and the reader printed `ok` for BOTH entries and `OK — 2 repo(s)` at rc 0, with NO message;
+#     make `tgt` traversable and the SAME fixture REFUSES at rc 1. A false PASS produced purely by a
+#     permission bit is the worst shape, because nothing on the box looks different.
+#     WHAT IT DOES INSTEAD: an unresolvable-but-present component makes the identity UNPROVABLE, so
+#     this function prints NOTHING and the caller WARNS and omits the key from the dedupe. It does
+#     NOT refuse — "only a PROVEN fault refuses" and "existence stays UNREQUIRED" are both recorded
+#     decisions in this file, and a permission denial is not a fact about the set. What must not
+#     happen is the previous SILENT assent: the operator now sees the entry named as ungraded.
 #   * existence stays UNREQUIRED: a set whose state dir the operator creates afterwards must not start
 #     failing. That requirement is about existence, NOT about `..`, so closing the `..` gap reopens
 #     nothing.
@@ -194,7 +214,15 @@ _rs_state_key() {
     esac
     cand="$out/$comp"
     resolved="$( cd -P "$cand" 2>/dev/null && pwd -P )"
-    if [ -n "$resolved" ]; then out="$resolved"; else out="$cand"; fi
+    if [ -n "$resolved" ]; then
+      out="$resolved"
+    elif [ -e "$cand" ] || [ -L "$cand" ]; then
+      # PRESENT but not enterable, so its canonical form is UNPROVABLE. Emit nothing: the caller
+      # warns and leaves this entry out of the dedupe rather than silently folding it lexically.
+      return 0
+    else
+      out="$cand"
+    fi
   done <<EOF_STATE_KEY
 $(printf '%s' "$p" | tr '/' '\n')
 EOF_STATE_KEY
@@ -269,6 +297,12 @@ repo_set_parse() {
   local rc=0 n=0 line tok key val ln=0
   local slug="" checkout="" state=""
   local seen=""           # newline-delimited slugs already taken (no associative arrays on bash 3.2)
+  # ⛔ `_dupkey` MUST BE LOCAL, OR IT LEAKS INTO THE CALLER'S SHELL (round 9, P2). This file's contract
+  # is that it can be SOURCED, and its own n1/n2 arms make caller-shell purity a named defect class.
+  # Measured before this line existed: after `repo_set_parse` + `repo_set_check` in a sourcing shell,
+  # `_dupkey` was still set. It is reassigned every iteration so the reader itself is unaffected — it
+  # is the caller that inherits a variable it never declared.
+  local _dupkey=""
   local -a out=()
 
   while IFS= read -r line || [ -n "$line" ]; do
@@ -572,20 +606,31 @@ repo_set_check() {
       # differing only by case now gets a refusal it did not need — loud, renameable, and strictly
       # cheaper than the collision it prevents.
       # ⛔ SPELLING AND CASE BOTH FOLD (round 3, P2). `/srv/state`, `/srv//state` and `/srv/./state`
-      # are one directory, so a raw comparison passed the collision this arm refuses; `_rs_norm_path`
-      # collapses them without touching the filesystem, and `_rs_lower` covers APFS/HFS+.
+      # are one directory, so a raw comparison passed the collision this arm refuses; the state KEY
+      # collapses them (it folds `//`, `.`, `..` and symlinks), and `_rs_lower` covers APFS/HFS+.
       # ⛔ AND SO DO `..` AND SYMLINKS (round 6, P2). Those two are one directory with their target
-      # and `_rs_norm_path` cannot see it — it never touches the filesystem — so both passed as `ok`.
-      # `_rs_state_key` resolves identity when the path exists and keeps the spelling norm as the
-      # not-yet-created fallback; `_rs_lower` still folds on top, which is what keeps the APFS arm
+      # and a spelling-only comparison cannot see it — it never touches the filesystem — so both
+      # passed as `ok`. `_rs_state_key` is the identity walk that closes it: it resolves every prefix
+      # that exists (so `..` and symlinks are PHYSICAL, not textual) and folds the not-yet-created
+      # remainder lexically; `_rs_lower` still folds case on top, which is what keeps the APFS arm
       # working for a directory that does not exist yet.
+      # ⛔ AN UNPROVABLE KEY WARNS AND IS LEFT OUT OF THE DEDUPE (round 9, P2). `_rs_state_key` prints
+      # nothing when a component is PRESENT but unenterable (EACCES/EPERM/ELOOP — the TCC shape).
+      # Omitting the key is deliberately NOT a refusal: a permission denial is not a fact about the
+      # set, and "only a PROVEN fault refuses" is a recorded decision here. What it must never be is
+      # the previous SILENT assent, where two entries naming ONE directory passed as `ok` with no
+      # message at all; the operator now sees the entry named as ungraded.
       local norm_state
       norm_state="$(_rs_lower "$(_rs_state_key "$state")")"
-      case "$seen_states" in
-        *$'\n'"$norm_state"$'\n'*)
-          problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit" ;;
-      esac
-      seen_states="$seen_states"$'\n'"$norm_state"$'\n'
+      if [ -z "$norm_state" ]; then
+        printf 'repo-set: WARN STATE-UNVERIFIED — %s: could not resolve `%s` to a directory identity (present but not enterable), so this entry is NOT checked for a share with another repo; give it a path this process can traverse\n' "$slug" "$state"
+      else
+        case "$seen_states" in
+          *$'\n'"$norm_state"$'\n'*)
+            problems="$problems; state=$state is shared with another repo in this set — the same silent-sharing failure two controllers would hit" ;;
+        esac
+        seen_states="$seen_states"$'\n'"$norm_state"$'\n'
+      fi
     fi
 
     if [ -n "$problems" ]; then
