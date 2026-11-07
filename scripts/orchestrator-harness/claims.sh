@@ -1233,9 +1233,12 @@ _claim_commit_time() {
   # `$` anchor refuses the whole line where git stops after the tz digits: a trailing token or trailing
   # whitespace, a CR before EOL, a tz field that is NOT exactly 4 digits (`> 1 +000`, `> 1 +0` and
   # `> 1 +00000` are each dated 1 by git 2.43.0), and a TAB or NO separator before it (`<NOW>\t+0000` and
-  # `<NOW>+0000` are both dated NOW) — this parse abstains on every one. (A tz with NO SIGN is NOT in this
-  # set: `git log` refuses that object outright, so there is no git answer to agree with.) Two further
-  # classes abstain in the LENGTH / leading-zero arms BELOW rather than in the anchor: a 13+ digit and a
+  # `<NOW>+0000` are both dated NOW) — this parse abstains on every one. A tz with NO SIGN abstains here
+  # TOO, but it is NOT a divergence: git ACCEPTS and PUSHES that object (MEASURED — `cat-file -t` says
+  # commit, a push to a bare repo lands the ref, and only `git fsck` reports `badTimezone`) and simply has
+  # no committer date for it, so `git log -1 --format=%ct` prints NOTHING at rc 0. There is therefore no
+  # git answer to agree with, and the abstention is the KEEP side. Two further classes abstain in the
+  # LENGTH / leading-zero arms BELOW rather than in the anchor: a 13+ digit and a
   # leading-zero stamp are MEASURED here at git's own value and then rejected there (rounds 19/21) — a
   # deliberate class, not a disagreement. Those arms are pinned by `claim_lanes.test.py` (the 13-digit and
   # `0999` cases) and, for the shell's leading-zero arm, by `test-claims.sh` A33; `claim-reaper.test.sh`

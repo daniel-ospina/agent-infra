@@ -699,7 +699,10 @@ def _commit_body(obj: str) -> str:
 # ABSTAIN where git is more tolerant than the `$` anchor (a trailing token or trailing whitespace, a CR
 # before EOL, a tz field that is not exactly 4 digits, and a TAB or NO separator before it — git dates
 # all of those, and the `$` anchor refuses the whole line for each) — always the KEEP direction, and A79
-# pins that decision. The LENGTH and leading-zero arms below abstain on a 13+ digit or leading-zero stamp
+# pins that decision. A SIGN-LESS tz (`<NOW> 0000`) is 4 digits and abstains here too, but it is not a
+# divergence: git ACCEPTS and PUSHES that object (only `git fsck` reports `badTimezone`) and has no
+# committer date for it — `git log -1 --format=%ct` prints nothing at rc 0, so there is no answer to agree
+# with. The LENGTH and leading-zero arms below abstain on a 13+ digit or leading-zero stamp
 # this pattern itself measures: a second, deliberate class (rounds 19/21, pinned HERE by this suite's
 # 13-digit and `0999` cases; the shell's counterpart leading-zero arm is pinned by `test-claims.sh` A33,
 # and the shell's 12-digit cap has no pin at all), not a disagreement. The shell side is
