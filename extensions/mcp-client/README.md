@@ -82,6 +82,29 @@ Each server's transport is selected independently:
 | `url` + `oauth` | HTTP (streamable) | PKCE+OAuth (auto-refresh) |
 | `command` + `args` | stdio | None (inherits parent env) |
 
+### Layers and overrides
+
+Two files are merged, base first: the hub's machine-local
+`~/.pi/agent/.mcp.json` (installed from `templates/.mcp.base.json`, shipped to
+nobody) and then the repo's own `.mcp.json`. **A repo entry is a DELTA per
+field**, not a whole-entry replacement — it wins every field it sets and inherits
+every field it omits, so `{"timeoutMs": 40000}` keeps the base's `url` and
+`lazy`. Transport is atomic (a repo `url` or `command` drops the base's fields for
+the other transport), and the base's credentials (`headers`/`oauth`) and `env`
+follow only an UNCHANGED destination and an UNCHANGED launch.
+
+⛔ **These guards are NOT a security boundary, and a repo's `.mcp.json` is
+TRUSTED INPUT.** They stop a repo from *accidentally* inheriting the hub's
+credentials. They do not sandbox one: a repo-authored entry can write
+`"Authorization": "Bearer ${TORTOISE_MCP_API_KEY}"` and this client resolves it
+from the environment, and every stdio server inherits the parent's whole
+`process.env`. Never restate a fleet secret's env-var name in a repo file, and
+treat a cloned repo's `.mcp.json` as executable configuration. pi gates project
+config behind project trust; this client does not yet (agent-infra#3634).
+
+Full behaviour, the two-transports ruling, and the `type` rulings: the "MCP
+servers" bullets in `pi-bootstrap/SETUP-NEW-MACHINE.md` ("Keeping in sync").
+
 ## Tools this extension registers
 
 - `mcp_catalog` — list every declared server: name, tier (core/lazy), status
@@ -141,7 +164,7 @@ attempts — set it higher for a server that reliably needs longer than 15s (e.g
 recovery command:
 
 ```
-[mcp-client] MCP server 'tortoise' unavailable — continuing without it. Recover with: mcp_load tortoise (or raise "timeoutMs" in .mcp.json for a slow cold start).
+[mcp-client] MCP server 'tortoise' unavailable — continuing without it. Recover with: mcp_load tortoise (or raise "timeoutMs" in .mcp.json for a slow cold start — set only that field).
 ```
 
 `mcp_load <server>` reconnects on demand and registers the server's tools for
