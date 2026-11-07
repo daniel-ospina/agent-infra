@@ -94,6 +94,7 @@ mk_world() {
   # stand in for the real sweep — the real one writes this file LAST on exit 0. `SWEEP_NO_RECORD=1`
   # reproduces "exit 0 and no record", which is the mismatched-tool shape the hook must refuse.
   printf '%s\n' '#!/usr/bin/env bash' \
+    'if [ "$1" = "--print-status" ]; then echo "status=never"; echo "rc=3"; echo "detail=no pass record at (stub)"; exit 3; fi' \
     'echo "sweep:$*" >> "'"$d"'/events"' \
     'if [ "${SWEEP_NO_RECORD:-0}" != "1" ]; then' \
     '  _sd="${WIP_SWEEP_STATE_DIR:-'"$d"'/O/state}"; mkdir -p "$_sd" 2>/dev/null' \
@@ -155,9 +156,19 @@ run_quiesce() {
 # it was already exported — an already-exported `PATH` still propagates, a `CELL_HOME` set only here does
 # not — so the blast radius varies with position rather than being fixed. The whole env block is therefore
 # one block with NO comment inside it.
+# ⛔ `HARNESS_PIN_FILE` IS PINNED HERE TOO, AND THAT IS THE SAME CLASS OF BUG (#3588 review, cycle 7). The
+# SUT resolves its pinned-tree fallback from `${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}`, and the FLEET
+# EXPORTS `HARNESS_PIN_FILE` on every box it runs on. Inherited, it outranks `$CELL_HOME` — so the two arms
+# that exist to grade the pin record (E7/E8) read the HOST's real record instead of the fixture's: E7
+# reddened on exactly such a host (`wip-sweep: <none found`), while E8 stayed green for the wrong reason
+# (the host record names a tree with no sweep, so "nothing was invoked" proved nothing about the code). A
+# fixture an ambient variable can redirect measures the host, not the SUT. This is the pattern every sibling
+# suite already uses (`scripts/cloud-cell-supervisor.test.sh:1105` — `HARNESS_PIN_FILE="$P/home/.harness-path"`),
+# and arm E7c pins that the fixture record wins over an ambient override.
   PATH="$d/bin:$PATH" HOME="$d/home" \
   REPO="$d/repo" OR="daniel-ospina/tortoise" SCOPE=own MAX_LANES=3 \
   CELL_HOME="$d/home" O="$d/O" HARNESS="$d/repo/scripts/orchestrator-harness" \
+  HARNESS_PIN_FILE="$d/home/.harness-path" \
   SWEEP_RC="$rc" SWEEP_UNPUSHED="${SWEEP_UNPUSHED:-0}" SWEEP_NO_RECORD="${SWEEP_NO_RECORD:-0}" \
   bash "$Q" > "$d/out" 2>&1
   local st=$?
@@ -277,6 +288,7 @@ D="$T/e5e"
 chmod +x "$D/repo/scripts/wip-sweep.sh"
 mkdir -p "$D/home/.pi/agent/scripts"
 printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "$1" = "--print-status" ]; then echo "status=never"; echo "rc=3"; echo "detail=no pass record at (stub)"; exit 3; fi' \
   'echo "sweep:$*" >> "'"$D"'/events"' \
   'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
   'exit 0' > "$D/home/.pi/agent/scripts/wip-sweep.sh"
@@ -325,6 +337,7 @@ PINROOT="$D/pin/0123456789ab"
 mkdir -p "$PINROOT/scripts/orchestrator-harness"
 printf '%s\n' "$PINROOT/scripts/orchestrator-harness" > "$D/home/.harness-path"
 printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "$1" = "--print-status" ]; then echo "status=never"; echo "rc=3"; echo "detail=no pass record at (stub)"; exit 3; fi' \
   'echo "sweep:$*" >> "'"$D"'/events"' \
   'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
   'exit 0' > "$PINROOT/scripts/wip-sweep.sh"
@@ -337,6 +350,43 @@ grep -q '^sweep:' "$D/events" \
 grep -q "wip-sweep: $PINROOT/scripts/wip-sweep.sh" "$D/out" \
   && ok "E7b the step line names the pinned sweep, so the resolution graded is the one that ran" \
   || bad "E7b the step line names something else: $(grep -m1 'wip-sweep:' "$D/out")"
+
+# ⛔ E7c — THE FIXTURE RECORD MUST WIN OVER AN AMBIENT `HARNESS_PIN_FILE` (#3588 review, cycle 7). E7 grades
+# the pin record, so a host that exports `HARNESS_PIN_FILE` (the fleet does) would otherwise grade the HOST's
+# record: measured at the pre-fix suite, E7 reddened with `wip-sweep: <none found` and E8 stayed green for the
+# wrong reason. `run_quiesce` now pins it to the fixture, and this arm proves that precedence instead of
+# assuming it: the caller exports a DECOY record naming a second, fully usable sweep that logs elsewhere, and
+# the fixture's sweep must be the one invoked. It reddens deterministically if that pin is removed, because
+# the decoy is exported and would then resolve (on any host, farmed or not).
+mk_world e7c || { echo "❌ fixture failed (e7c)"; exit 1; }
+D="$T/e7c"
+rm -f "$D/repo/scripts/wip-sweep.sh"
+PINROOT="$D/pin/0123456789ab"
+mkdir -p "$PINROOT/scripts/orchestrator-harness"
+printf '%s\n' "$PINROOT/scripts/orchestrator-harness" > "$D/home/.harness-path"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "$1" = "--print-status" ]; then echo "status=never"; echo "rc=3"; echo "detail=no pass record at (pin stub)"; exit 3; fi' \
+  'echo "sweep:$*" >> "'"$D"'/events"' \
+  'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
+  'exit 0' > "$PINROOT/scripts/wip-sweep.sh"
+chmod +x "$PINROOT/scripts/wip-sweep.sh"
+DEC="$D/decoy/0123456789ab"
+mkdir -p "$DEC/scripts/orchestrator-harness"
+printf '%s\n' "$DEC/scripts/orchestrator-harness" > "$D/decoy-record"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "$1" = "--print-status" ]; then echo "status=never"; echo "rc=3"; echo "detail=no pass record at (decoy)"; exit 3; fi' \
+  'echo "sweep:$*" >> "'"$D"'/decoy-events"' \
+  'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
+  'exit 0' > "$DEC/scripts/wip-sweep.sh"
+chmod +x "$DEC/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+HARNESS_PIN_FILE="$D/decoy-record" run_quiesce e7c 0; RC=$?
+[ ! -s "$D/decoy-events" ] \
+  && ok "E7c an AMBIENT HARNESS_PIN_FILE does not decide this arm — the fixture's record is the one resolved" \
+  || bad "E7c the ambient decoy record won: the suite graded the HOST's pin, not the fixture's ($(tr '\n' ' ' < "$D/decoy-events"))"
+grep -q "wip-sweep: $PINROOT/scripts/wip-sweep.sh" "$D/out" \
+  && ok "E7c2 …and the FIXTURE's pinned sweep is the one named and invoked" \
+  || bad "E7c2 the fixture's pinned sweep was not the one resolved: $(grep -m1 'wip-sweep:' "$D/out")"
 
 mk_world e8 || { echo "❌ fixture failed (e8)"; exit 1; }
 D="$T/e8"
@@ -351,6 +401,66 @@ NINV8="$(grep -c '^sweep:' "$D/events" 2>/dev/null || true)"
 grep -q 'WORK ON THIS BOX WILL NOT BE ARCHIVED' "$D/out" \
   && ok "E8b …and the hook still says the work will not be archived (loud, never a false green)" \
   || bad "E8b the absent-pin path did not warn: $(grep -m1 'wip-sweep:' "$D/out")"
+
+# ⛔ E9 — PARSES IS NOT SWEEPS, AND THIS WAS THE LAST FALSE PASS ON THIS HOOK (#3588 review).
+# `-s` + `bash -n` accepted a TRUNCATED PREFIX of a real `wip-sweep.sh`. MEASURED on whole-line truncations
+# of the shipped sweep at 60/80/100/150 lines: all four PARSE, and `bash <prefix> --apply` exits **0 having
+# archived nothing** — so this hook printed "every dirty worktree … is archived on origin", `DONE`, rc=0,
+# over a box where NOTHING was archived, on the one path where the disk stops existing. It is mechanically
+# producible (`pi-bootstrap/setup.sh` farms with `cp -f`), and no arm covered it, so the `-s` guard itself
+# looked sufficient. The candidate must now BEHAVE in the reader mode this hook already relies on.
+# E9A is the exact truncation shape — a file that parses, and exits 0 printing nothing.
+echo; echo "── E9. a sweep that PARSES but does not ANSWER is not a sweep ──"
+mk_world e9 || { echo "❌ fixture failed (e9)"; exit 1; }
+D="$T/e9"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$D/repo/scripts/wip-sweep.sh"
+chmod +x "$D/repo/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+run_quiesce e9 0; RC=$?
+# ⛔ THE SELECTION LINE IS WHAT THIS ARM READS, not the later FATAL: with a parse-only guard the inert
+# candidate IS selected and produces its own `FATAL: wip-sweep` downstream (an exit-0 pass that wrote no
+# record is refused by F6), so a FATAL grep passes for the WRONG reason. Measured on the parse-only mutant:
+# E9b/E9e/E9e2 reddened and E9a stayed green until it was pointed at the `wip-sweep: <none found` line.
+grep -q 'wip-sweep: <none found' "$D/out" \
+  && ok "E9a a PARSING-but-INERT sweep is NOT SELECTED (it parses, so -s + bash -n accepted it before)" \
+  || bad "E9a an inert sweep was selected: $(grep -m1 '^  wip-sweep:' "$D/out")"
+grep -q 'FATAL: wip-sweep' "$D/out" \
+  && ok "E9a2 …and it is refused loudly, with a FATAL naming the sweep" \
+  || bad "E9a2 the inert sweep was not refused loudly"
+grep -q 'WORK ON THIS BOX WILL NOT BE ARCHIVED' "$D/out" \
+  && ok "E9a3 …and the hook says the work will not be archived" \
+  || bad "E9a3 the inert-sweep path did not state the consequence"
+grep -q 'every dirty worktree' "$D/out" \
+  && bad "E9b the hook still claimed the work was archived on origin over an inert sweep" \
+  || ok "E9b …and it never claims 'every dirty worktree … is archived on origin' off an inert candidate"
+[ "$RC" -ne 0 ] \
+  && ok "E9c an inert sweep makes the run non-zero (rc=$RC)" \
+  || bad "E9c an inert sweep exited 0 — the false PASS this arm exists for"
+grep -q 'DONE — cell has exactly one controller' "$D/out" \
+  && bad "E9d it printed DONE over an inert sweep" \
+  || ok "E9d …and no DONE line, so the run cannot be read as a completed archive"
+# E9e: THE SKIP ITSELF, POSITIVELY. An inert FIRST candidate must not disable the hook — a faithful candidate
+# later in the list (the farmed $HOME path) has to be selected and invoked. That proves the probe SKIPS a
+# bad candidate instead of refusing the hook outright, which a blanket refusal would also satisfy.
+mk_world e9e || { echo "❌ fixture failed (e9e)"; exit 1; }
+D="$T/e9e"
+printf '%s\n' '#!/usr/bin/env bash' 'exit 0' > "$D/repo/scripts/wip-sweep.sh"
+chmod +x "$D/repo/scripts/wip-sweep.sh"
+mkdir -p "$D/home/.pi/agent/scripts"
+printf '%s\n' '#!/usr/bin/env bash' \
+  'if [ "$1" = "--print-status" ]; then echo "status=never"; echo "rc=3"; echo "detail=no pass record at (stub)"; exit 3; fi' \
+  'echo "sweep:$*" >> "'"$D"'/events"' \
+  'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
+  'exit 0' > "$D/home/.pi/agent/scripts/wip-sweep.sh"
+chmod +x "$D/home/.pi/agent/scripts/wip-sweep.sh"
+echo alive > "$D/alive"
+run_quiesce e9e 0; RC=$?
+grep -q '^sweep:--apply' "$D/events" \
+  && ok "E9e an INERT first candidate is SKIPPED — the faithful candidate after it is the one that is armed" \
+  || bad "E9e the inert candidate was taken: nothing was armed (a parse-only guard stops at it)"
+[ "$RC" -eq 0 ] \
+  && ok "E9e2 …and the run still succeeds, so one truncated farm copy does not disable the hook" \
+  || bad "E9e2 the run exited $RC although a usable candidate existed: $(tail -2 "$D/out")"
 
 # ── the success arm (exit code is only judgeable where /proc exists) ─────────────────────────────────
 echo; echo "── F. the success path ──"
