@@ -56,11 +56,29 @@ is_running() { # <pid> — ALIVE, not merely present: a killed child of ours is 
   return 0
 }
 
-proc_ident() { # <pid> -> its start stamp; empty when there is no such process
+proc_ident() { # <pid> -> its start stamp; EMPTY when `ps` could not answer
   # IDENTITY FOR A SIGNAL. pid + start time is effectively unique and — unlike `ppid` —
   # it SURVIVES the reparent-to-1 that is the field signature of #1845, so it is the
   # check that can be applied to a genuine orphan, which a ppid test cannot.
-  ps -o lstart= -p "$1" 2>/dev/null
+  # ⛔ AN ANSWER ONLY IF `ps` SUCCEEDED — the rule `is_running` states one function up,
+  # applied to the identity read (#3622 review round 7, P2). Round 6 taught `is_running` that
+  # "a `ps` that FAILS can still WRITE TO STDOUT — a wrapper, a shim, a future procps printing
+  # a usage/legend banner", and left the sibling read below reading only for EMPTINESS. Both
+  # consumers then treat ANY non-empty read as an authoritative stamp: `still_ours` takes it as
+  # a READABLE MISMATCH, and `reap_pid` takes it as one that may SKIP the signal. So a failed
+  # read that printed inverted both rules at once. Measured 2026-11-07 with a `ps` that printed
+  # "  bogus legend Z" and exited 1, over a live pid whose stamp the REAL `ps` had captured:
+  #   is_running → ALIVE · still_ours → NOT-OURS (a healthy rail read as a stranger)
+  #   reap_pid   → rc 0, "provably gone", WITHOUT SIGNALLING — victim still ALIVE
+  #   the shipped guard → exit 0 ("the rail stopped on its own") with an empty stderr
+  # That is the #1845 signature one level in: a clean stop reported over a running process.
+  # A failed read is therefore worth NOTHING — empty — which is the answer both consumers
+  # already degrade correctly: `still_ours` falls back to the liveness answer, and `reap_pid`
+  # falls through TO the signal. A blank stamp forfeits the pid-recycling protection, which is
+  # the fail-closed direction (#1393 keeps its own half: a READABLE mismatch still never signals).
+  local out
+  out="$(ps -o lstart= -p "$1" 2>/dev/null)" || return 0
+  printf '%s\n' "$out"
 }
 
 still_ours() { # <pid> <ident> — the process we were handed is STILL that process

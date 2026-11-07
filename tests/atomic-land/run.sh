@@ -512,7 +512,10 @@ new_scen() {
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
   # #1845: the guard's per-scenario evidence files. Each spawn truncates its own (`2>"$SCEN/…"`),
   # so this `rm` is belt-and-braces for a scenario that reuses a dir; it is not what protects
-  # against a stale read. The list is exactly what the watchdog scenarios write.
+  # against a stale read — TRUNCATION IS. This list is therefore deliberately NOT exhaustive
+  # (7i/7j/7k also write `wd-err00`, `wd-errbig`, `bp-pid0`, `bp-badpid`, `bp-badsup`,
+  # `ps-why-*` and `victim-ps-*`): a name missing here cannot cause a stale read, and keeping
+  # the list "complete" is drift with nothing behind it (#3622 review round 7, P3).
   rm -f "$SCEN/guard-why" "$SCEN/limit-why" "$SCEN/victim-pid" \
     "$SCEN/wd-err-g-couldnotrun.sh" "$SCEN/wd-err-g-lies124.sh" \
     "$SCEN/wd-err-g-survived.sh" "$SCEN/wd-err-g-lost.sh" \
@@ -1702,21 +1705,32 @@ _real_ps="$(command -v ps)"
 if [ -z "$_real_ps" ]; then
   fail "7k cannot build a ps shim (no real ps on PATH)"
 else
-  # <dir> <the -o option that cannot answer> <empty: answer nothing, rc 0 | fail: rc 1>
+  # <dir> <the -o option that cannot answer> <empty|fail|noise>
+  #   empty  rc 0, prints nothing   (a busybox/slim `ps`: accepts the flag, answers nothing)
+  #   fail   rc 1, prints nothing   (a transient failure on the identity re-read)
+  #   noise  rc 1, PRINTS a legend  (a `ps` that fails *and* writes to stdout — the shape that
+  #                                  made a FAILED identity read look like a readable stamp)
   _ps_shim() {
     mkdir -p "$1"
-    if [ "$3" = fail ]; then
-      printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
-        "$2" "$_real_ps" > "$1/ps"
-    else
-      printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) exit 0 ;;\n  esac\ndone\nexec %s "$@"\n' \
-        "$2" "$_real_ps" > "$1/ps"
-    fi
+    case "$3" in
+      fail)
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
+          "$2" "$_real_ps" > "$1/ps"
+        ;;
+      noise)
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) echo "  bogus legend line from a FAILING ps"; exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
+          "$2" "$_real_ps" > "$1/ps"
+        ;;
+      *)
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) exit 0 ;;\n  esac\ndone\nexec %s "$@"\n' \
+          "$2" "$_real_ps" > "$1/ps"
+        ;;
+    esac
     chmod +x "$1/ps"
   }
   # Drives the SHIPPED guard with one broken `ps` arm, over a live victim, and asserts the
   # externally visible fact the caller reads: a bounded reap (124) and a DEAD victim.
-  _ps_case() { # <label> <option> <empty|fail> <what the shim models>
+  _ps_case() { # <label> <option> <empty|fail|noise> <what the shim models>
     local dir="$SCEN/pshim-$1" v vid rc=0 waited=0
     _ps_shim "$dir" "$2" "$3"
     bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-ps-$1"
@@ -1753,6 +1767,14 @@ else
   # Pre-fix `still_ours` read the blank re-read as "not ours", so the guard exited 0 over a
   # healthy rail and the caller killed the rail it was supposed to be protecting.
   _ps_case lstart-fail 'lstart=' fail 'a ps whose -o lstart= fails after the capture succeeded'
+  # Round 7 (#3622 review, P2): the same failure, but the `ps` PRINTS before it fails. Round 6
+  # taught `is_running` that this shape exists; the sibling identity read still tested only for
+  # EMPTINESS, so this non-empty non-answer became a READABLE MISMATCH: `still_ours` said "not
+  # ours" for a live rail (guard exit 0, nothing signalled) and `reap_pid` answered "provably
+  # gone" while the victim kept running. Measured 2026-11-07; both assertions below red without
+  # the exit-status rule in `proc_ident` (the guard exits 0 and the victim survives) and pass
+  # with it (limit arm fires, victim dead, 124).
+  _ps_case lstart-fail-noisy 'lstart=' noise 'a ps whose -o lstart= FAILS but still prints'
 fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
