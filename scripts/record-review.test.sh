@@ -5187,6 +5187,12 @@ fi
 #     EQUAL the executing sites — so a predicate added without a citation reddens too, and a stale
 #     number REDDENS instead of waiting for a reviewer. ⛔ SCOPE: cites for anything else are NOT
 #     tagged and NOT checked — tagging one REDDENS, since membership is set EQUALITY, not a superset.
+#     ⛔ WHAT IS OUT OF ITS REACH, measured: an UNTAGGED head number elsewhere in this file is
+#     invisible (mutating one to a nonexistent line leaves all four assertions green), every head
+#     number in `tests/record-review/run.sh` is never read, and a RANGE (`:6537-6549`) cannot be
+#     tagged at all because the tag parser reads a run of `:NNNN` tokens and a dash ends it. Those
+#     are still re-derived BY HAND each round: this guard makes the tagged cites un-rottable, it
+#     does not make the rest safe.
 QR_SELF="$SCRIPT_DIR/record-review.test.sh"
 QR_CITE_SITES="$(command grep -n 'grep -qxF' "$RECORD" | command grep -vE '^[0-9]+: *#' \
     | cut -d: -f1 | sort -un | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
@@ -5522,21 +5528,30 @@ STUB_BODY_FAIL=1 STUB_BODY_FAIL_TEXT='gh: Not Found (HTTP 404)' STUB_COMMENTS_FA
 assert_eq "$RECORD_RC" "5" \
     "14.1d(i) …and with the comment failing too the arm is still a NAMED failure (rc 5) [err: $(printf '%s' "$RECORD_ERR" | tr '\n' ' ')]"
 assert_not_contains "$RECORD_ERR" "The marker is kept in" \
-    "14.1d(i) …whose exit-5 message does NOT offer --flush-pending as a remedy for bytes that were never persisted"
-assert_contains "$RECORD_ERR" "NO PENDING MARKER FOR THIS RUN IS ON DISK EITHER" \
-    "14.1d(i) …but names the real state instead — the PENDING MARKER is what is absent, not the record (the line above it says the record IS saved), and the absence is scoped to THIS RUN's marker, because a stale earlier marker for the same PR can still be on disk"
-# ⛔ THE FLUSH CLAIM IS SCOPED TO THIS RUN'S MARKER (#3712 review round 3, follow-up 1).
-# The pending file is keyed by (repo, PR) and `marker_pending_write` OVERWRITES it, so an
-# earlier run's un-flushed marker for the same PR is still there: on a failed persist,
-# `--flush-pending` finds and delivers THAT OLDER marker rather than answering "nothing
-# pending". The absolute form ("would find NOTHING") is true only when no earlier marker
-# exists, which this arm cannot see — so both captures must say WHICH bytes they mean.
-assert_contains "$RECORD_ERR" "for the marker this run owed" \
-    "14.1d(i) …and the exit-5 remedy scopes 'would find NOTHING' to the marker THIS RUN owed (a stale earlier marker for the same PR is still in the pending file)"
-assert_contains "$RECORD_ERR" "it cannot deliver THESE BYTES" \
-    "14.1d(i) …and states the INVARIANT (the flush cannot carry bytes no attempt wrote) instead of enumerating its outputs, which omitted the EMPTY-file and refusal arms"
-assert_not_contains "$RECORD_ERR" "and would answer 'nothing pending'" \
-    "14.1d(i) …never the unscoped form, which predicts the flush's OUTPUT and is false whenever an earlier marker is pending"
+    "14.1d(i) …whose exit-5 message never ASSERTS the marker IS kept in the pending file (it cannot know: it never read it)"
+assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(i) …but states the observed fact instead — THIS run's write failed — which is not 'the record is missing' (the line above says the record IS saved) and not 'the file is empty'"
+# ⛔ THE FLUSH CLAIM IS SCOPED TO THIS RUN'S MARKER, AND ITS OUTCOME IS NEVER PREDICTED
+# (#3712 round 3; REWRITTEN in round 9 after a fresh review falsified the round-3 form).
+# Round 3 reasoned: the pending file is keyed by (repo, PR) and OVERWRITTEN, so an earlier
+# run's marker is still there, therefore "would find NOTHING" is wrong — and replaced it with
+# "it can only deliver an OLDER marker … and neither delivers these bytes". That is ALSO
+# false, and the reason is the determinism of the marker itself: it is built from
+# (PR, verdict, head, diff, repo, key) with no timestamp and no run id, so an EARLIER RUN AT
+# THE SAME HEAD leaves BYTE-IDENTICAL bytes — `--flush-pending` would deliver exactly what
+# this run owed. The process also never READS the file, so it cannot report its contents in
+# either direction. Hence the rule now enforced below: state only what was observed (THIS
+# run's write failed), never predict the flush's OUTPUT, and OFFER the flush in both arms
+# rather than denying it — an incorrect denial costs an operator the working one-command
+# remedy that this whole arm exists to point at.
+assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(i) …and the exit-5 remedy says what WAS observed — this run's write failed — instead of reporting the pending file's contents, which it never read"
+assert_contains "$RECORD_ERR" "TRY --flush-pending" \
+    "14.1d(i) …and still OFFERS the flush: an earlier run at the same head leaves byte-identical bytes, so denying it withdraws a remedy that works (round 9)"
+assert_not_contains "$RECORD_ERR" "would find NOTHING" \
+    "14.1d(i) …while never PREDICTING the flush's output, which depends on a file this run never read"
+assert_not_contains "$RECORD_ERR" "neither delivers these bytes" \
+    "14.1d(i) …and never asserting the flush cannot deliver these bytes — the marker is deterministic, so an earlier run at this head holds exactly them (round 9 falsified this)"
 # ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
 # `post_review_evidence_comment` runs INSIDE this arm and, when its comment READ
 # fails too, used to print "The signed record AND THE BODY MARKER are unaffected" —
@@ -5569,8 +5584,8 @@ assert_contains "$RECORD_ERR" "this note makes NO CLAIM about the body marker" \
 PATCH_FAIL_PR=424365
 STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
     run_record_633 "$PATCH_FAIL_PR" "$SHA" "$DC_CRUNS"
-assert_contains "$RECORD_ERR" "NO PENDING COPY OF THIS RUN'S MARKER IS ON DISK" \
-    "14.1d(j) the PATCH arm's comment-visible message names the real state when BOTH of its persist attempts failed"
+assert_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(j) the PATCH arm's comment-visible message says what was observed — neither of its persist attempts wrote — and not what the file holds"
 assert_not_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j) …and does NOT offer the inert flush as the route to the edited event"
 rm -f "$PEND_CONF_DIR/pending"
@@ -5611,8 +5626,8 @@ STUB_PATCH_FAIL=1 STUB_BODY="PR body — no review evidence yet" \
 rm -f "$T/bin/mv"
 assert_eq "$(cat "$_MV_COUNT" 2>/dev/null || echo 0)" "2" \
     "14.1d(j2) NON-VACUITY: the pending-marker move ran twice and the SECOND one failed (the window below is REACHED, not assumed)"
-assert_not_contains "$RECORD_ERR" "NO PENDING COPY OF THIS RUN'S MARKER IS ON DISK" \
-    "14.1d(j2) …a failed RETRY makes NO absence claim — the pre-PATCH copy is still on disk"
+assert_not_contains "$RECORD_ERR" "THIS RUN WROTE NO PENDING COPY" \
+    "14.1d(j2) …a failed RETRY makes NO 'this run wrote nothing' claim — the pre-PATCH copy is still on disk"
 assert_contains "$RECORD_ERR" "or post the body copy with --flush-pending, to fire" \
     "14.1d(j2) …so the WORKING flush remedy is still offered, instead of the hand-PATCH a false absence claim demands"
 assert_not_contains "$RECORD_ERR" "⚠️ body-marker: could NOT persist" \
