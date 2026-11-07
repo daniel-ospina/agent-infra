@@ -1040,6 +1040,31 @@ cp "$WRAPPER" "$MW/pr-doctor-machine.sh"
 cp "$MN/pr-doctor.py" "$MW/pr-doctor.py"
 ck "m39 a sibling that LOADS but lacks _normalize_slug makes the WRAPPER say 'could not be normalised', not 'is not an owner/name slug'" \
    'o="$(HOME="$T" OR=acme/stale bash "$MW/pr-doctor-machine.sh" 2>&1)"; grep -q "could not be normalised" <<<"$o" && ! grep -q "is not an owner/name slug" <<<"$o"'
+# ⛔ ROUND 35, P2 — THE `_trim` SENTINEL GUARD HAD NO ARM AT ALL. The reviewer at `d8512fe1`
+# MEASURED it by deleting the `'__UNASKABLE__') : ;;` case from a copy: the suite stayed GREEN (163
+# passed / 0 failed, nothing reddening), so the one guard that decides whether a sentinel may become a
+# seam VALUE was a regression channel — the class m32's own comment names ("a fix without an arm is a
+# regression channel"). This head re-measured the SAME mutant with this arm in place: 167 passed / 1
+# failed, and the single red is `m40` — so the arm's non-vacuity is the mutation, not a claim about it.
+# The reachable shape is the one this file already guards elsewhere: a sibling `pr-doctor.py` that is
+# PRESENT but will not LOAD (a truncated or corrupt farmed copy — exactly what `check-farm-drift.sh`
+# exists for) answers `__UNASKABLE__` to EVERY `strip`, so accepting it as a trimmed value makes the
+# wrapper refuse with
+#
+#   OR='__UNASKABLE__' could not be normalised: …
+#
+# — quoting a sentinel as the operator's own setting, in the same "send them at the wrong defect"
+# class rounds 18/29/31 kept closing. ⛔ BOTH STATES EXIT 2, so no exit-code assertion can carry the
+# distinction: the wrapper's TEXT is the only surface that separates them, which is why this arm reads
+# the text (as m39 does for the neighbouring guard).
+MU="$T/wrapunask"; mkdir -p "$MU/lib"
+cp "$READER" "$MU/lib/repo-set.sh"
+cp "$WRAPPER" "$MU/pr-doctor-machine.sh"
+cp "$T/unloadable-doctor.py" "$MU/pr-doctor.py"
+_o40="$(HOME="$T" OR=acme/stale bash "$MU/pr-doctor-machine.sh" 2>&1)"
+E40="OR='acme/stale' could not be normalised"
+ck "m40 an UNLOADABLE sibling does not make the wrapper quote the strip SENTINEL as a seam value" \
+   'grep -qF "$E40" <<<"$_o40" && ! grep -q "__UNASKABLE__" <<<"$_o40"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the

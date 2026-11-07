@@ -565,7 +565,12 @@ repo_set_parse() {
   done < "$f"
 
   if [ "$rc" != 0 ]; then
-    _rs_say 2 "repo-set: REFUSING $f — $rc is not a usable set until the lines above are fixed"
+    # ⛔ THE CODE IS THE RETURN VALUE, NOT THE SENTENCE'S SUBJECT (round 35, P2). This used to read
+    # "REFUSING <file> — 5 is not a usable set until the lines above are fixed", which an operator
+    # reads as "5 is not a usable set": the number is the function's answer (and the RETURN CODES
+    # table is the place that names it), not a thing that can be spoken about. The refusal already
+    # named every fault above it, so the summary says what it measured and stops.
+    _rs_say 2 "repo-set: REFUSING $f — not a usable set until the lines above are fixed"
     return "$rc"
   fi
   if [ "$n" -eq 0 ]; then
