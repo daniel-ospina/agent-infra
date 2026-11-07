@@ -178,7 +178,11 @@ machine's pi instance.
     base's own endpoint. A `lazy`-only override does not change the destination,
     so it keeps them. Host case, default port and surrounding whitespace are
     normalised away before comparing — **a trailing slash is not**, so `/mcp` and
-    `/mcp/` count as different destinations (fail-closed; restate the header).
+    `/mcp/` count as different destinations (fail-closed). Credentials follow a
+    destination only when it is UNCHANGED, so write the repo's `url` exactly as the
+    base writes it; a genuinely different endpoint needs its own entry in the BASE
+    config. Never restate a fleet secret in a repo file — see the trust warning
+    below.
   - Declaring `command` drops the base's `url`/`headers`/`oauth`; declaring `url`
     drops the base's `command`/`args`/`env`/`cwd`. The base's `env` is inherited
     only when the same thing is LAUNCHED — `command` **and** `args` **and** `cwd`,
