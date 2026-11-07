@@ -402,8 +402,8 @@ fi
 # is clean (it is valid syntax) and CI does not shellcheck, so NOTHING caught it — and the sibling arms
 # above assert `! grep "command not found"`, which that noise does not match. This arm pins the
 # OPERATOR-VISIBLE sentence instead, which is the thing the refusal exists to deliver.
-ck "f11b2 the farm-gap refusal quotes the log string VERBATIM (a failed substitution would replace it with '()')" \
-   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; grep -qF "COPY/RENAME FAILED … leaving any" <<<"$o" && ! grep -qF "fails ()" <<<"$o" && ! grep -q "No such file or directory" <<<"$o"'
+ck "f11b2 the farm-gap refusal quotes the log string VERBATIM, with NO failed substitution in its place" \
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; grep -qF "COPY/RENAME FAILED … leaving any" <<<"$o" && ! grep -q "No such file or directory" <<<"$o"'
 # ⛔ THE FARM GAP'S OTHER HALF HAD NO ARM (review at `93833f4d9`, P2). `f11` pins a missing READER;
 # nothing pinned a missing DOCTOR, and `[ ! -f "$DOCTOR" ]` was the ONE guard in this file whose
 # deletion left the suite green. Without it the wrapper announces `grading N repo(s)` and then dies on
@@ -435,19 +435,20 @@ PYNOPY
 _o_np="$(HOME="$T/nopyhome" OR=acme/tor bash "$NP/pr-doctor-machine.sh" 2>&1)"; _rc_np=$?
 ck "f35 no python3 on the box is a NAMED refusal at exit 2, never a grading claim" \
    '[ "$_rc_np" = 2 ] && grep -q "no python3 on this box" <<<"$_o_np"'
-# ⛔ "ON BOTH ENTRY PATHS" IS A CLAIM ABOUT THE GUARD, NOT ABOUT THESE TWO ARMS (round 39, P2). The
-# `[ -z "$PY" ]` guard sits ~90 lines ABOVE both the set branch and the degraded branch, so neither arm
-# reaches a branch at all: they pin the refusal being NAMED at exit 2 in each of the two ENTRY STATES
-# (a set file present, and none), which is the maximum reachable from a fixture. ⛔ The `grading N
-# repo(s)` conjunct therefore belongs to the SET branch and could never fire on the no-set fixture — a
-# mutant reintroducing the claim on that branch alone would have left the old single arm green, which is
-# why there are now two. The non-vacuity is `f35`'s own mutant: delete the guard and BOTH announce a
-# pass before dying on `exec: : not found` at rc 127 (measured: 179 passed / 2 failed, f35 + f36).
-_o_np_set="$(REPO_SET_FILE="$CONF" HOME="$T/nopyhome" bash "$NP/pr-doctor-machine.sh" 2>&1)"; _rc_np_set=$?
-ck "f36 the DEGRADED entry state announces no pass a missing interpreter would silently void" \
+# ⛔ ONE ARM, ONE ENTRY STATE, AND NO DUPLICATE (round 39 split this in two; round 40 merged it back
+# because the split was vacuous). The `[ -z "$PY" ]` guard sits ~90 lines ABOVE both the set branch and
+# the degraded branch, so NO fixture reaches either branch: the set-state and no-set fixtures produce
+# BYTE-IDENTICAL output (the guard reads neither `REPO_SET_FILE` nor `OR`), so `f36b` could not redden
+# without `f36` and its label claimed a branch coverage it did not have. One arm pins the refusal being
+# NAMED at exit 2 in the no-set entry state; the `grading N repo(s)` conjunct is kept because the SET
+# branch owns that claim and deleting the guard DOES let it through there. ⛔ Non-vacuity is `f35`'s own
+# mutant: delete the guard and BOTH branches announce a pass before dying on `exec: : not found` at rc
+# 127 — the mutant's red set is EXACTLY f35 + f36, nothing else, which is what makes this arm
+# load-bearing. ⛔ THE COUNTS ARE DELIBERATELY NOT WRITTEN HERE. THREE lanes change this suite's arm
+# total under this branch, so a per-head "179 passed / 2 failed" written once is wrong by the next
+# commit — that happened twice in this PR's own review trail. The red SET is stable; the totals are not.
+ck "f36 no interpreter: neither entry state announces a pass the missing interpreter would silently void" \
    '[ "$_rc_np" = 2 ] && ! grep -q "Grading the ONE repo" <<<"$_o_np" && ! grep -q "grading .* repo(s)" <<<"$_o_np"'
-ck "f36b …and neither does the SET entry state (the branch that owns the 'grading N repo(s)' claim)" \
-   '[ "$_rc_np_set" = 2 ] && grep -q "no python3 on this box" <<<"$_o_np_set" && ! grep -q "grading .* repo(s)" <<<"$_o_np_set"'
 # ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
 # The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
 # `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
@@ -508,7 +509,10 @@ import re, sys
 names = re.compile(r'(repo_set_[A-Za-z0-9_]+|_rs_[A-Za-z0-9_]+)')
 subst = re.compile(r'\$\([^)]*\)|(?<!\\)`[^`]*`')
 found = set()
-for line in open(sys.argv[1]):
+# ⛔ EXPLICIT UTF-8, because this file and the wrapper are full of em dashes and `⛔`: under an ambient
+# `PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 LC_ALL=POSIX` the default text encoding makes `open()` raise
+# UnicodeDecodeError and BOTH arms red on a correct tree (fail-closed, but a false block all the same).
+for line in open(sys.argv[1], encoding='utf-8'):
     s = line.rstrip('\n')
     if s.lstrip().startswith('#'):      # prose is not a call — nor is a commented-out example
         continue
@@ -535,29 +539,54 @@ ck "f11e the SOURCED guard's list EQUALS the reader functions this wrapper CALLS
    '[ "$_probe_nlist" = 1 ] && [ -z "$_probe_miss" ] && [ -z "$_probe_extra" ]'
 ck "f11e-0 …and that scan is non-vacuous: it really did find the nine names (an empty scan would pass f11e silently)" \
    '[ "$_probe_n" -ge 9 ]'
-# ⛔ THE NAMESPACE f11e SCANS IS NOT AN ASSUMPTION, IT IS PINNED (round 38, P2; round 39 made the pin
-# actually hold). `f11e` can only see calls whose name starts `repo_set_` or `_rs_`; if the reader ever
-# defined a helper outside that scheme, a call to it would be invisible to the scan and the guard could
-# omit it silently. ⛔ THE FIRST VERSION OF THIS ARM ONLY MATCHED `name()` AT COLUMN 0, so `function
-# name {`, `name () {` and an INDENTED definition were all invisible to it while its own comment claimed
-# the property was “a fact about the reader rather than a hope” — measured: three of those styles left
-# the suite green. All three styles are recognised now, and comments are skipped so a prose mention of
-# someone else's function (`configured_repos()`, which belongs to the doctor) is not counted as a
-# definition of this reader's.
+# ⛔ THE NAMESPACE f11e SCANS IS NOT AN ASSUMPTION, IT IS PINNED (round 38, P2; rounds 39-40 made the
+# pin actually hold). `f11e` can only see calls whose name starts `repo_set_` or `_rs_`; if the reader
+# ever defined a helper outside that scheme, a call to it would be invisible to the scan and the guard
+# could omit it silently. ⛔ TWO ROUNDS OF THE PIN WERE THEMSELVES INCOMPLETE, each caught by a reviewer:
+# the first matched `name()` at COLUMN 0 only, so `function name {`, `name () {` and INDENTED definitions
+# were invisible while its own comment claimed the property was “a fact about the reader rather than a
+# hope”; the second still required the `{` on the SAME LINE, so `name()` with the brace on the next line
+# stayed invisible. All of it is covered now — four spellings, any indentation, brace on either line —
+# and comments are skipped so a prose mention of someone else's function (`configured_repos()`, which
+# belongs to the doctor) is not counted as one of this reader's definitions.
+# ⛔ CAPABILITY IS NOT COVERAGE, AND THIS FILE MUST NOT CONFUSE THEM (round 40, P2). The shipped reader
+# happens to use ONE of the forms — 23 definitions, all `name() {` on one line — so the next-line-brace
+# branch and the `function …` spellings are proven by MUTANT (a definition in that style reddens this
+# arm) and NOT by the baseline. A regression that deleted those branches would leave the baseline green;
+# the mutant is what catches it. Said here because the sentence above would otherwise read as "the
+# reader exercises all four", which it does not.
+# ⛔ NO SHELL KEYWORD CAN PASS AS A DEFINITION: a bare `done`/`fi`/`local` line would match the
+# brace-on-the-next-line head pattern, so keywords are excluded by name.
 _reader_defs="$(python3 - "$READER" <<'PYDEFS'
 import re, sys
 
-# `name() {`, `name () {`, `function name {`, `function name() {` — indented or not.
+KEYWORDS = {'if','then','else','elif','fi','for','while','until','do','done','case','esac',
+            'function','local','return','select','time','coproc','declare','typeset','export'}
+# Same-line brace: `name() {`, `name () {`, `function name {`, `function name() {`.
 defn = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*\{')
-out = []
-for line in open(sys.argv[1]):
-    s = line.rstrip('\n')
-    if s.lstrip().startswith('#'):
+# Name only, brace on a later line — `name()` / `function name` then `{`.
+head = re.compile(r'^\s*(?:function\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*(?:\(\s*\))?\s*$')
+
+lines = [l.rstrip('\n') for l in open(sys.argv[1], encoding='utf-8')]
+defs = []
+for i, raw in enumerate(lines):
+    if raw.lstrip().startswith('#'):
         continue
-    m = defn.match(re.sub(r'\s#.*$', '', s))
+    s = re.sub(r'\s#.*$', '', raw)
+    m = defn.match(s)
     if m:
-        out.append(m.group(1))
-print(' '.join(out))
+        defs.append(m.group(1)); continue
+    m = head.match(s)
+    if not m or m.group(1) in KEYWORDS:
+        continue
+    for later in lines[i+1:]:
+        t = later.strip()
+        if not t or t.startswith('#'):
+            continue
+        if t.startswith('{'):
+            defs.append(m.group(1))
+        break
+print(' '.join(defs))
 PYDEFS
 )"
 _reader_defs_n=0; _reader_odd=""
@@ -565,7 +594,7 @@ for _d in $_reader_defs; do
   _reader_defs_n=$(( _reader_defs_n + 1 ))
   case "$_d" in repo_set_*|_rs_*) : ;; *) _reader_odd="$_reader_odd $_d" ;; esac
 done
-ck "f11f every function the READER defines — in ANY of the three definition styles — is in the repo_set_/_rs_ namespace f11e can see" \
+ck "f11f every function the READER defines — in ANY declaration style, brace on either line — is in the repo_set_/_rs_ namespace f11e can see" \
    '[ "$_reader_defs_n" -ge 15 ] && [ -z "$_reader_odd" ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the

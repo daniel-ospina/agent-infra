@@ -159,8 +159,10 @@ if [ -n "$_reader_missing" ]; then
   # ⛔ NO UNESCAPED BACKTICKS IN AN EMITTED LINE (round 38, P1; the co-working lane fixed the same two
   # lines independently, so both fixes landed in one block — the redundancy is in the HISTORY, never in
   # the escapes). ⛔ EVERY backtick below is load-bearing, and unescaping ONE of a pair is WORSE than
-  # unescaping both: the substitution never terminates and swallows the rest of the file (measured on a
-  # copy: 150 passed / 32 failed). Both of these were
+  # unescaping both: the substitution never terminates and swallows the rest of the file (`bash -n`
+  # then fails with `unexpected EOF while looking for matching` and everything downstream of it reds).
+  # The suite's own red count is deliberately not written here — three lanes change this branch's arm
+  # total, so a total written once is wrong by the next commit. Both of these were
   # double-quoted with raw backticks around the quoted farm message, so bash ran
   # `COPY/RENAME FAILED … leaving any` as a COMMAND: every refusal printed
   #   /path/pr-doctor-machine.sh: line N: COPY/RENAME: No such file or directory
