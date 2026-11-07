@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/Daniels-MacBook-Air-new.kfixer-3392-1794082449-p86178-3000e9ee",
+  "_sha": "d92536d4995bc57786a58efc169c148004d954dd",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/Users/danielospina/orchestrator/logs/fix-3392.log"
+    },
+    {
+      "kind": "branch",
+      "value": "main"
+    },
+    {
+      "kind": "sha",
+      "value": "1f4775836e0ba292fc244fb2a5126781eeb8d265"
+    },
+    {
+      "kind": "worktree",
+      "value": "/Users/danielospina/Documents/GitHub/agent-infra"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7270,
+  "ended_at": 1794089719,
+  "exit_code": 143,
+  "heartbeat_at": 1794089719,
+  "host": "Daniels-MacBook-Air-new",
+  "issue": 3392,
+  "kind": "fixer",
+  "lane_id": "Daniels-MacBook-Air-new.kfixer-3392-1794082449-p86178-3000e9ee",
+  "lease_until": 1794097519,
+  "pid": 86178,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794082449,
+  "state": "FAILED",
+  "tag": "3392",
+  "worktree": "/Users/danielospina/Documents/GitHub/agent-infra"
+}
