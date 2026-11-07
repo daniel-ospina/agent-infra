@@ -1432,6 +1432,29 @@ bash "$RR" >/dev/null 2>&1; RCVO=$?
   && ok "V9b …while the ORDINARY mode keeps its shipped exit 1 for a missing argument" \
   || bad "V9b plain-mode missing-argument exit moved (rc=$RCVO, want 1)"
 
+# ⛔ V10 — A SUBDIRECTORY OF A WORKTREE IS NOT A WORKTREE ROOT (#3588 review, cycle 8). The
+# `vunmeasured "not a worktree root: …"` branch had NO arm: the mutation pass reverted it to `exit 1` and
+# both suites stayed at 206/0, so in verdict mode a misrouted path would have reported `dirty` — the
+# caller then "archives" nothing, and `dirty` is the answer this file exists to stop being wrong.
+# `rev-parse --git-dir` succeeds ANYWHERE inside a repo, which is exactly why this branch must exist and
+# must be graded: nothing else in the suite constructs that input.
+mk_repo subroot || { echo "❌ fixture failed (subroot)"; exit 1; }
+mkdir -p "$T/subroot/wt/sub/deeper" || { echo "❌ could not make the subdirectory"; exit 1; }
+echo work > "$T/subroot/wt/sub/deeper/file.txt"
+OVO="$(bash "$RR" --verdict "$T/subroot/wt/sub" 2>&1)"; RCVO=$?
+[ "$RCVO" -eq 2 ] && case "$OVO" in *verdict=cannot-verify*) true ;; *) false ;; esac \
+  && ok "V10 a SUBDIRECTORY answers verdict=cannot-verify, exit 2 — never dirty, never clean" \
+  || bad "V10 a subdirectory of a worktree answered rc=$RCVO (want 2 = cannot-verify): $OVO"
+case "$OVO" in
+  *"not a worktree root"*) ok "V10b …and it SAYS it is not a root, so the caller knows to pass the root" ;;
+  *) bad "V10b the refusal does not name 'not a worktree root': $OVO" ;;
+esac
+# the ordinary mode keeps its shipped exit 1 for the same path (no shipped code moved)
+bash "$RR" "$T/subroot/wt/sub" >/dev/null 2>&1; RCVO=$?
+[ "$RCVO" -eq 1 ] \
+  && ok "V10c plain mode still exits 1 for a subdirectory — the mode is ADDITIVE" \
+  || bad "V10c plain-mode exit moved for a subdirectory (rc=$RCVO, want 1)"
+
 echo; echo "── Summary ───────────────────────────────────────────────────────"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
 [ "$FAIL" -eq 0 ] || { echo "  ❌ FAILURES — fix and re-run"; exit 1; }
