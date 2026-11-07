@@ -8567,16 +8567,21 @@ rail_lc() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 
 # rail_slug_of_remote <url> -> `owner/name`, or nothing (rc 1) when it names no repo.
 #
-# ⛔ WHY A LOCAL PARSER AND NOT `repo_of_checkout` (corrected: the first draft of this
-# comment claimed the rail is farmed to cells, which is FALSE — `pi-bootstrap/setup.sh`'s
-# `merge_gate_srcs` is `(record-review.sh)` and `admin-merge.sh` appears in NO farm array.
-# It is executed from a checkout: `merge-one.sh:515` runs `$REPO/scripts/admin-merge.sh`,
-# `atomic-land.sh` runs `$SELF_DIR/admin-merge.sh`. So `scripts/lib/orchestrator-registry.sh`
-# IS beside it wherever it runs, and a `source` would work.) The reason it is still local is
-# the DEPENDENCY, not availability: this is the last merge gate, and sourcing pulls in
-# `pid-identity.sh` at that library's top level, so a missing or unreadable lib would become a
-# new way for the RAIL ITSELF not to start. A 30-line parse that refuses is a smaller failure
-# surface than a startup dependency on the gate that must always run.
+# ⛔ WHY A LOCAL PARSER AND NOT `repo_of_checkout` (corrected TWICE: the first draft of this
+# comment claimed the rail is farmed to cells, which was FALSE then — `pi-bootstrap/setup.sh`'s
+# `merge_gate_srcs` did not carry it and `admin-merge.sh` appeared in NO farm array — and it IS
+# farmed now, so the `source` half of the original correction no longer holds either). What is
+# true at this head: `merge_gate_srcs` carries `admin-merge.sh` FLAT into `$DEST/scripts/`, beside
+# `ci-failure-set.sh`, `ci_exemption.py` and `ci-workflow-pr-evaluable.sh` — the three helpers this
+# rail refuses without. It is ALSO executed from a checkout (`merge-one.sh` runs
+# `$REPO/scripts/admin-merge.sh`, `atomic-land.sh` runs `$SELF_DIR/admin-merge.sh`).
+# ⛔ SO `scripts/lib/orchestrator-registry.sh` IS **NOT** BESIDE IT on a farm-only box, and the
+# original sentence claiming it always was is the premise this PR falsifies. That is exactly why
+# the parse stays LOCAL: the DEPENDENCY is the objection, not availability. This is the last merge
+# gate, and sourcing pulls in `pid-identity.sh` at that library's top level, so a missing or
+# unreadable lib would become a new way for the RAIL ITSELF not to start — and a farmed rail must
+# not acquire a startup dependency on `scripts/lib/`, which this array does not deliver beside it.
+# A 30-line parse that refuses is a smaller failure surface than that.
 #
 # ⛔ THE COST IS A FOURTH COPY OF THIS PARSE, AND IT IS A DECLARED RESIDUAL rather than a
 # claim the others are wrong: `lib/orchestrator-registry.sh:repo_of_checkout`,
