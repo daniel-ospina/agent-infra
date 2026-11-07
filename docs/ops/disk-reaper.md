@@ -33,13 +33,59 @@ the shipped 3600 s was half of it — see the class note below), and the vendor'
 
 ## Why one entry point
 
-The fleet already reaped ad hoc in four places — `cloud-cell-supervisor.sh prune`,
-the hourly cache pass inside `orch-loop.sh`, `pi-reap-worktrees-launchd.py` (macOS
-only, so cells had nothing), and `cleanup-worktree.sh` at merge time. Four triggers
-and no single answer to *"is this box being reaped, and how much did the last pass
-free?"*. This is the consolidation: one scheduled pass, one pass record, one status
-line, and the existing owners untouched except where a class needed a new policy
-(the merged-head floor below).
+The fleet already ran ad-hoc reap passes from **several** scheduled places —
+among them `cloud-cell-supervisor.sh prune` (the one whose cache arm is ARMED:
+it reaches `pi-cache-reap.sh --apply` at `cloud-cell-supervisor.sh:4875`,
+unattended under pressure), the hourly cache pass inside `orch-loop.sh`, the
+`pi-reap-worktrees-launchd.py` unit (macOS only, so cells had nothing), the
+hourly `com.eldato.pi-cache-reap.plist` unit, and the 6-hourly
+`com.tortoise.worktree-hygiene.plist` (whose step 1 is `pi-reap-worktrees.sh`).
+
+**Most of those shipped DISARMED, deliberately** (#1678: "the reaper may run
+unattended; arming it may not"): the loop's cache pass hardcodes `--dry-run`
+(`scripts/orchestrator-harness/orch-loop.sh:4246`) and so do both unit
+templates — `com.eldato.pi-cache-reap.plist:89`,
+`com.tortoise.worktree-reaper.plist:129` — where arming is an owner edit of that
+argument plus an `install-launchd.sh` re-run; `worktree-hygiene` instead renders
+`--apply` only on an armed box, `--dry-run` otherwise, from
+`{{WORKTREE_HYGIENE_MODE}}`, which `install-launchd.sh` resolves from
+`~/.pi/agent/state/worktree-hygiene.armed`. So **of those legacy passes**, on a
+default install only the `prune` path reclaims anything and the rest merely
+report, which is the distinction this page exists to stop blurring. That is not
+a statement about this page's own pass: on a cell the consolidated timer is
+installed with `--apply` (`install-disk-reaper-timer.sh:108`, run
+unconditionally by `cloud-cell-bringup.sh:2240`), so *it* does reclaim — the
+scoped clause above is the legacy enumeration, not this script. No single one
+answered *"is this box being reaped, and how much did the last pass free?"* —
+and **no count is claimed here**, because a count is the claim
+that made this page wrong in the first place: the point is not how many triggers
+existed, it is that none of them could answer that question. This is the
+consolidation: one scheduled pass, one pass record, one status line, and the
+existing owners untouched except where a class needed a new policy (the
+merged-head floor below).
+
+⛔ **The merge-time teardown is NOT one of them — it is a manual convention, not an
+automation.** An earlier version of this page (and of `scripts/disk-reaper.sh`'s
+header) listed `cleanup-worktree.sh` *at merge time* as a fourth consolidated
+trigger. It never was one: **no automation invokes it.** `merge-one.sh` performs no
+worktree removal at all, `admin-merge.sh` removes only its own scratch worktree,
+and an index-bounded `git grep -n 'cleanup-worktree' origin/main` finds the
+script's only operational **caller** in a **manual step** —
+`skills/commit-workflow/workflow/05-cleanup.md:20`, which a lane has to remember to
+run. (Every other hit is prose or a test — the script's own usage line, comments,
+a scoping doc, the guard extension's README, and guard tests that assert the script
+is *refused* — never an executor.) So what the fleet has at
+merge time is a convention a lane may forget, not a scheduled pass: this script
+neither schedules it nor accounts for it, and a reader who saw it in the list above
+would rightly stop asking why the disk still fills.
+
+Wiring a real merge-time reaper in is deliberately **not** done here — see #3278's
+plan comment §4: the mass such a hook cannot reach is the `no-pr` / `open-pr`
+worktrees, which by definition have *not* merged, so a merge-time trigger would be
+yet another reaper for bytes it can never take. The merge trigger that *does* exist
+and *is* automated is `pi-reap-worktrees.sh` rule 4 (a checkout whose PR `MERGED`
+at that exact head, exempt from the 7-day floor) — and it is one of the scheduled
+passes above, not a merge hook.
 
 Adding a fourth copy of a delete rule would have been the easy path and is
 explicitly refused: `disk-reaper.sh` contains **no `rm` on a filesystem path** (its
