@@ -358,7 +358,9 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
 });
 
 await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER carries the base's credentials", () => {
-  // The shape `docs/quickstart-selfhosted.md` tells a self-host user to write. `lazy` and `timeoutMs`
+  // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write (named
+  // with its repo, as `pi-bootstrap/lib/merge-mcp.py` and `test-cell-install.sh` do — the file is not in
+  // THIS repo, so a bare path resolves to nothing here). `lazy` and `timeoutMs`
   // must be inherited (a name-level spread dropped them → an EAGER connect at every session start on
   // memory-constrained cells, the failure the base entry's own `_comment` records). The base's
   // `headers` must NOT be: `.mcp.json` is a TRACKED file, so inheriting a bearer token into a
