@@ -982,6 +982,37 @@ O_Q6="$(PATH="$T/statusbin:$PATH" WIP_SWEEP_BUDGET=1 WIP_SWEEP_STATE_DIR="$T/sta
 grep -qx 'seen=0' "$T/state-budq2/wip-sweep.status" 2>/dev/null \
   && ok "Q7 seen=0 — a worktree whose classification never completed was NOT examined" \
   || bad "Q7 seen=$(sed -n 's/^seen=//p' "$T/state-budq2/wip-sweep.status" 2>/dev/null) with clean/skipped/dirty/unmeasured all 0 — the identity is false"
+
+# ⛔ Q8/Q9/Q10 — THE BUDGET BOUNDS THE REPO LOOP TOO (#3588 review, cycle 10). The budget was tested before
+# every EXAMINATION, but the loop over REPOS was unguarded and its two pre-examination calls were the only
+# ones not clamped with `cap_timeout`. So "bounds the WHOLE pass" (docs/ops/wip-sweep.md) was false by up
+# to one STATUS_TIMEOUT per REMAINING repo: measured 24 s against a 2 s bound on 4 hanging repos. On a
+# quiesce whose reclaim timeout the operator sizes against that number, the reclaim can then kill the pass
+# MID-ARCHIVE with `status=running` and no `NOT DONE` — the failure the bound exists to prevent.
+# Q9 is the DISCRIMINATOR and it is not timing-based: with the fix, an unreached repo gets a REPO-level row
+# (path `-`), so the index still accounts for it. Reverted, those calls run and the row never appears.
+mk_fixture q8a fix/3485-q8a || { echo "❌ fixture failed (q8a)"; exit 1; }
+mk_fixture q8b fix/3485-q8b || { echo "❌ fixture failed (q8b)"; exit 1; }
+mkdir -p "$T/listbin"
+printf '#!/usr/bin/env bash\ncase " $* " in\n  *" worktree list "*) sleep 4 ;;\nesac\nexec %s "$@"\n' "$REAL_GIT" > "$T/listbin/git"
+chmod +x "$T/listbin/git"
+SECONDS=0
+O_Q8="$(PATH="$T/listbin:$PATH" WIP_SWEEP_BUDGET=1 WIP_SWEEP_STATUS_TIMEOUT=8 WIP_SWEEP_STATE_DIR="$T/state-q8" \
+  bash "$SW" --apply --repo "$T/q8a/wt" --repo "$T/q8b/wt" --repo "$T/budq/wt" 2>&1)"; RC_Q8=$?
+Q8_EL=$SECONDS
+[ "$RC_Q8" -eq 1 ] \
+  && ok "Q8 three repos past an exhausted budget still exit INCOMPLETE (1), not failed" \
+  || bad "Q8 answered $RC_Q8 (want 1): $O_Q8"
+Q8_UNREACHED="$(awk -F'\t' '$3 == "-" && $6 == "unreached" && $11 == "deferred-pass-budget" {c++} END {print c+0}' "$T/state-q8/wip-sweep.tsv" 2>/dev/null)"
+[ "${Q8_UNREACHED:-0}" -ge 2 ] \
+  && ok "Q9 the repos the budget never reached are RECORDED as unreached (${Q8_UNREACHED} repo-level row(s)), not silently skipped" \
+  || bad "Q9 only ${Q8_UNREACHED:-0} repo-level unreached row(s) — the repo loop ran unguarded and the index lost the repos it skipped"
+[ "$Q8_EL" -lt 9 ] \
+  && ok "Q10 the whole pass stayed near the 1 s budget (${Q8_EL}s for 3 repos whose listing takes 4 s each) — the bound covers the REPO loop" \
+  || bad "Q10 the pass took ${Q8_EL}s against a 1 s budget over 3 repos — the repo-level calls are outside the bound (reverted: ~12 s)"
+grep -qx 'status=incomplete' "$T/state-q8/wip-sweep.status" 2>/dev/null \
+  && ok "Q10b …and the record says status=incomplete, so the overrun is legible rather than a green pass" \
+  || bad "Q10b the record says status=$(sed -n 's/^status=//p' "$T/state-q8/wip-sweep.status" 2>/dev/null)"
 [ "$(sed -n 's/^deferred=//p' "$T/state-budq2/wip-sweep.status" 2>/dev/null)" -ge 1 ] 2>/dev/null \
   && ok "Q8 the deferred counter still names the work that never got its turn" \
   || bad "Q8 deferred is not counted: $(sed -n 's/^deferred=//p' "$T/state-budq2/wip-sweep.status" 2>/dev/null)"
