@@ -3,6 +3,19 @@
 #
 #   rail-guard.sh <supervisor-pid> <limit-secs|0> <sentinel> <pid> [ident]
 #
+#   <limit-secs>  the wall-clock bound on the rail. `0` means NO TIME LIMIT — the guard
+#                 then fires only when its supervisor is gone. (That is what `0` means
+#                 HERE; it is NOT "fire now". The old inline loop had no lower guard, so
+#                 `0` fired on its first iteration — a caller that reads "0 seconds" as
+#                 "no patience" would get the opposite of what it expects. No caller passes
+#                 0 today; both meanings are stated so the next one cannot guess wrong.)
+#   <sentinel>    created when the guard FIRES, so the caller can tell "the guard reaped
+#                 it" from "the rail stopped by itself".
+#                 `<sentinel>.report` carries the OUTCOME as one line — `reaped <pid>` or
+#                 `survived <pid>` — because a sentinel alone proves an INTENT, not a reap:
+#                 the caller returns 124 ("the rail was stopped") on it, and a `reap_pid`
+#                 that could not kill would otherwise still be reported as a bound.
+#
 # WHY THIS IS A SEPARATE PROCESS AND NOT A FUNCTION IN run.sh.
 # The suite's watchdog used to be a poll loop inside `run.sh`. `$!` was already the rail
 # (`rail_exec` ends in `exec` — #1532), so the kill was aimed at the right process, and it
@@ -39,7 +52,16 @@
 #
 # The sentinel is how the caller tells "the guard reaped it" from "the rail exited by
 # itself": `run_rail_watchdog` returns 124 only when this script wrote it, so a rail that
-# legitimately stops (rc 1) can never be reported as a watchdog timeout.
+# legitimately stops (rc 1) can never be reported as a watchdog timeout. The
+# `<sentinel>.report` line is the same distinction one level deeper — fired vs PROVED —
+# and the caller refuses a fired-without-proof as a WATCHDOG FAILURE (125), not as 124.
+#
+# ⛔ ONE WINDOW THIS CANNOT CLOSE, stated so nobody over-reads it: the rail is started by
+# the CALLER and the guard is handed its pid, so a supervisor killed between the spawn and
+# the guard's first poll leaves the rail unbounded for that instant. The measured field
+# triggers (shard timeout, operator, cancelled CI job) are seconds-scale, so this is not a
+# practical leak; closing it structurally means the GUARD creates the rail, which is a
+# bigger change than the one that removed the 4h12m-1d19h class.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 2
@@ -70,8 +92,12 @@ while still_ours "$pid" "$ident"; do
   if [ -n "$why" ]; then
     : >"$sentinel" 2>/dev/null
     if reap_pid "$pid" "$ident"; then
+      printf 'reaped %s\n' "$pid" >"$sentinel.report" 2>/dev/null
       echo "rail-guard: reaped pid $pid — $why" >&2
     else
+      # ⛔ NOT SUCCESS. A reap this script cannot prove is a SURVIVOR, and the caller reads
+      # this line to decide whether 124 is allowed to mean "the rail stopped".
+      printf 'survived %s\n' "$pid" >"$sentinel.report" 2>/dev/null
       echo "rail-guard: pid $pid SURVIVED SIGKILL — $why (not reaped)" >&2
     fi
     exit 0
