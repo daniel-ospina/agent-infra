@@ -98,9 +98,11 @@
 #                           rejections and the age floor) still runs for the whole population, so an
 #                           over-budget pass classifies what it saw and preserves the rest — it never
 #                           spends the budget on trees the age floor rejects anyway.
-#   REAP_AW_GITLESS_MAX     OPT-IN count ceiling for the gitless arm (default: UNSET = none). A
-#                           count is a stale proxy for the cost the time bound already measures; set
-#                           this only when a hard ceiling is wanted for its own sake.
+#   REAP_AW_GITLESS_MAX     OPT-IN count ceiling for the gitless arm (default: UNSET = none), applied
+#                           PER ROOT — the counter is reset inside each `sweep_root`, and `ROOTS` is
+#                           colon-separated, so a two-root pass permits two ceilings. A count is a stale
+#                           proxy for the cost the time bound already measures; set this only when a
+#                           hard ceiling is wanted for its own sake.
 #   REAP_AW_PROC_ROOT       the process table root (default /proc; a test seam — pointing it at a
 #                           missing dir makes the census UNREADABLE, which must skip the sweep)
 #   REAP_AW_LIVE_PATHS      the census library (default: lib/live-paths.sh beside this script, then
@@ -652,8 +654,17 @@ sweep_root() { # <root>
         # with each reference canonicalised too (review of #3278 round 2, measured: a non-canonical
         # `--root` spelling reaped /tmp/cell-home, which holds ~9.8 GB of `.pi` / `.venvs` here, and the
         # structural guard — the stamp's ancestor-pin — is absent on the scheduled path).
+        # ⛔ AND `${CELL_HOME}` FALLS BACK TO THE CELL HOME ITSELF, because the guard must not depend on
+        # its callers getting the environment right — MEASURED (#3278, 2026-11-06): the unit renders
+        # `Environment=HOME=/home/cmux`, which IS a directory, so `disk-reaper-run.sh`'s fallback never
+        # substituted, and its `CELL_HOME=` was a shell variable it did not export. The delegate then
+        # compared against `/home/cmux` alone and `/tmp/cell-home` — a live ~20 GB operative home, no
+        # `.git`, so no `main-checkout` guard either — matched NONE of the three references, i.e. the
+        # guard was inert exactly where it is the last thing between an armed pass and
+        # `rm -rf /tmp/cell-home`. Resolving the default HERE covers every caller (the systemd unit, the
+        # darwin plist, a manual run) instead of trusting each one to export it.
         if [ "$gitless" = 1 ]; then
-            for _ref in "${HOME:-}" "${CELL_HOME:-}" "${REAP_AW_STATE_DIR:-}"; do
+            for _ref in "${HOME:-}" "${CELL_HOME:-/tmp/cell-home}" "${REAP_AW_STATE_DIR:-}"; do
                 [ -n "$_ref" ] || continue
                 _refc="$(lp_canon "$_ref" 2>/dev/null)" || _refc=""
                 [ -n "$_refc" ] || _refc="${_ref%/}"
@@ -700,7 +711,7 @@ sweep_root() { # <root>
             # seam means "no count bound"; comparing against an empty string would be a bash error, and
             # the looser read (`-ge` on a non-number) must never become "cap reached" for every tree.
             if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
-                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified this pass; the remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is an operator ceiling, not a default)"; continue
+                KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root operator ceiling, not a default)"; continue
             fi
         fi
         # ⛔ THE TIME BOUND IS THE REAL GUARD, FOR BOTH ARMS, AND IT SITS BEFORE THE EXPENSIVE WORK.
