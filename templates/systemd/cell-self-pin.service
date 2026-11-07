@@ -1,0 +1,93 @@
+[Unit]
+# cell self-pin — keep the layer this cell EXECUTES on origin/main (agent-infra #3194, #2700 C5).
+#
+# WHY THIS UNIT EXISTS AT ALL. `cloud-cell-supervisor.sh apply` refuses while a controller runs, and a
+# running fleet's controller always runs, so `apply --force --pin-only` is the path a live cell has (a
+# bare `--force` without `--pin-only` re-seeds the state dir the running controller executes from — the
+# #2215 skew). This timer is that path, taken only when the pinned HEAD and the ref tip differ (a
+# converged tick costs one `git fetch`).
+#
+# ⛔ IT ADVANCES THE PIN, NOT THE RUNNING PROCESS. A controller keeps the layer it STARTED on until it is
+# restarted, so a pin that is current while the process is stale is a real state — the pass says so in
+# its log line rather than greening it away, and the controller's own `Restart=always` unit is what
+# converges the two on the next restart.
+#
+# ⛔ THIS FILE CARRIES NO PATH INTO A BOOTSTRAP CLONE, AND NO `WorkingDirectory=`. THE MEASURED DEFECT
+# (#3194): the hand-written unit this replaces shipped `WorkingDirectory=/tmp/cell-ai` in a drop-in and
+# hard-coded `cd /tmp/cell-ai` in its script. `/tmp/cell-ai` is the PROVISIONING RECIPE's clone; it is
+# not a live-cell invariant, and on cell-1 it was absent — so systemd failed the unit at the CHDIR step
+# with status 200/CHDIR every ten minutes for as long as the box existed. It never failed on its work;
+# IT COULD NEVER BEGIN.
+#
+#   `WorkingDirectory=` refuses to start a unit at all — before any line of the payload runs, unless it is
+#   given the non-fatal `-` prefix (`systemd.exec(5)`) — so it is the worst possible place to name a
+#   directory that is not a
+#   live-cell invariant. This unit therefore declares NONE: systemd starts it in `/`, and the payload
+#   `cd`s itself to the layer it actually pins, after resolving that layer from the cell's own record.
+#   A resolver that cannot answer is a loud non-zero exit, not a unit that never started.
+#
+# ⛔ THE LAYER IS DERIVED AT RUNTIME FROM THE CELL'S OWN RECORD. `{{PIN_SCRIPT}}` resolves it in this
+# order, and the ORDER is the contract:
+#   base      `${CELL_HOME:-$HOME}` — the SAME expression `cloud-cell-supervisor.sh` and
+#             `cloud-cell-bringup.sh` use (their `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` defaults are
+#             literally these). Pinning a different base than the controller reads is how the two
+#             diverge silently. `--install` REFUSES to render with `CELL_HOME` unset, because the
+#             supervisor's own fallback is `/tmp/cell-home` and an unset base would bake that skew in.
+#   record    `$HARNESS_PIN_FILE` (default `$CELL_HOME/.harness-path`) — the file
+#             `cloud-cell-supervisor.sh`'s `start` READS to decide which tree to exec. Reading the same
+#             file is what makes "the tree that gets pinned" and "the tree that gets executed" one fact
+#             instead of two that happen to look alike. It is FIRST, and it wins whenever git can answer
+#             from it.
+#   fallbacks ⛔ STATED BECAUSE THE CODE HAS THEM: when the record is unusable the pass tries the NEWEST
+#             tree (by mtime) under `$HARNESS_PIN_DIR`, then an operator's `$HARNESS`. Neither is proven
+#             to be the layer the controller runs, so the pass says so on stderr when it lands there (it
+#             must — this is the one path where the pinned tree need not be the EXECUTED tree, so a silent
+#             fallback would be the drift this unit exists to prevent, inside the unit itself); a
+#             cell with none of the three has no layer and gets a NAMED exit 2 rather than a guess.
+#   ref       `$HARNESS_REF` (default `origin/main`), resolved in the RESOLVED LAYER's own git — so the
+#             pin, the verb that performs it and the ref they act on all come from one tree.
+# ⛔ AND IT IS NOT A HARD-CODED PATH IN A DROP-IN. A drop-in `WorkingDirectory=` is rendered once, at
+# provisioning time, and then silently outlives the directory it names; deriving the value on every
+# tick is the only form that cannot go stale.
+#
+# ⛔ NO `-` PREFIX ON ExecStart. A pin pass that cannot run must go RED. The unit's colour (`systemctl
+# --failed`, `Result=` in `systemctl status`) is the only surface that reaches an operator who is not
+# tailing a journal — and #3194 exists precisely because the old unit's colour said "active (running)"
+# while the layer it claimed to pin was 17 commits stale.
+Description=cell self-pin — keep the layer this cell executes on origin/main (agent-infra #3194)
+Documentation=https://github.com/daniel-ospina/agent-infra/blob/main/docs/ops/harness-apply.md
+# It fetches. This ordering only avoids a guaranteed first-fetch failure on a box that boots
+# disconnected — the pass itself REFUSES (`unresolved`/`cannot-verify`) rather than treating an
+# unreadable ref as current, so a disconnected tick is RED and heals on the next one.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User={{USER}}
+Environment=HOME={{HOME}}
+# ⛔ THE BASE IS CARRIED EXPLICITLY, AND IT IS THE SAME VALUE THE ExecStart PATH IS BUILT FROM. The
+# service manager's HOME is not the cell home; a unit that carried only `HOME=` leaves the pass deriving
+# its base from an unrelated value while its own ExecStart sits under the real one — measured: the pass
+# then read `$HOME/.harness-path` while the controller read `$CELL_HOME/.harness-path`, so it pinned a tree
+# the controller never runs. Its siblings (`eldato-orchestrator.service`, `eldato-pr-repair.service`) carry
+# it for the same reason.
+Environment=CELL_HOME={{CELL_HOME}}
+# ⛔ THE PASS IS PINNED BY ABSOLUTE PATH because a oneshot has no shell to resolve one; it is the SAME
+# `$CELL_HOME/.pi/agent/scripts/` base the controller's unit names its supervisor in, so the two units
+# share one resolved base rather than two spellings of it. `--install` REFUSES if it does not exist.
+ExecStart=/bin/bash {{PIN_SCRIPT}}
+# A background convergence, never a deadline: it must not compete with a lane for CPU or I/O.
+Nice=10
+IOSchedulingClass=idle
+# It is one `git fetch` and, at most, one `apply --force`. Ten minutes is ample; the bound exists so a
+# wedged `git` cannot leave the oneshot "activating" for ever with the next tick queued behind it.
+TimeoutStartSec=600
+# ⛔ ONLY THE PASS'S OWN SUCCESS CODES ARE GREEN: 0 AND 11. 0 = current/applied; 11 = `mended` — the
+# pin RECORD was missing/empty and was repaired to the tree `apply` created. 11 is `harness-apply-pass.sh`'s
+# own code for exactly that event (harness-refresh.sh's vocabulary before it), adopted rather than
+# re-invented: excluding it would make a LOST record an unhealable RED on a box that is in fact correct,
+# which is #3133 one layer up. Everything else stays RED — a non-zero here means the layer could not be
+# resolved, the ref could not be read, or `apply` failed, and every one of those is a HUMAN-resolvable
+# state. Greening any of them is the false PASS #3194 is about.
+SuccessExitStatus=0 11
