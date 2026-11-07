@@ -1196,8 +1196,25 @@ _claim_commit_time() {
   # correct one AND the one that stops this reader disagreeing with its own mirror. `LC_ALL=C` on the
   # three stages is the whole fix: `.` becomes byte-oriented, and every shape that measures today still
   # measures the same value.
+  # ⛔ THE PARSE IS ANCHORED ON `> `, WHICH IS THE IDENT'S END — NOT A BARE `.* ` (review round 22,
+  # agent-infra#3203). The greedy `.* ` took the LAST `digits [+-]dddd` pair ANYWHERE on the line
+  # instead of the ident's timestamp field, so the same one-push attack this arm exists to stop came
+  # straight back through a different token: measured on the shipped file,
+  #
+  #   committer a <a@b> <NOW> +0000 1 +0000   -> git %ct = NOW      (0 s old)
+  #                                          -> _claim_commit_time = 1
+  #
+  # and `claim_prune` then DELETED the claim as `1793991810s old, PAST the 18000s bound`. The `> ` anchor
+  # means the accepted stamp is the one in the field git reads, and any OTHER `digits +-dddd` tail is
+  # simply not a match — which lands on rc=1 (unmeasurable, KEPT and NAMED) instead of a forged age.
+  # A76-A78 only exercised a token the `$` anchor REJECTS (`+0000 junk`), so they pinned the shape of the
+  # fallback and not this: A79 drives a token that PARSES and must still not become the value.
+  # ⛔ BOTH PROPERTIES ARE KEPT TOGETHER: byte-orientation (LC_ALL=C) decides WHICH BYTES are examined,
+  # and the `> ` anchor decides WHICH FIELD may become the value. Neither implies the other — a
+  # byte-oriented greedy `.* ` still read a forged second `digits +dddd` tail, and an anchored
+  # locale-dependent `.` still answered differently on two boxes for the same object.
   ct="$(printf '%s' "$raw" | LC_ALL=C sed -n '/^$/q;p' | LC_ALL=C sed -n '/^committer /p' | tail -n 1 \
-        | LC_ALL=C sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
+        | LC_ALL=C sed -n 's/^committer .*> \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
   # ⛔ SELECT THE LAST `committer` LINE *FIRST*, THEN PARSE IT (review round 20, agent-infra#3203). The
   # parse above used to be ONE anchored `sed` piped to `tail -n 1`, which selects "the last line that
   # MATCHES", not "the last committer line". Git dates the object from the last `committer` header

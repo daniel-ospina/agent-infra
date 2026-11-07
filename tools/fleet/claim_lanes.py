@@ -687,7 +687,12 @@ def _commit_body(obj: str) -> str:
 # matches any run, and the LENGTH rule is a SEPARATE arm below — which is why a 13+ digit stamp rejects the
 # object instead of being skipped in favour of an earlier line. A bounded quantifier here silently changed
 # WHICH line's value is judged.
-_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}$", re.M)
+# ⛔ ANCHORED ON `> `, THE IDENT'S END — NOT A BARE `.* ` (review round 22, agent-infra#3203). The greedy
+# `.* ` took the LAST `digits [+-]dddd` pair ANYWHERE on the line rather than the ident's timestamp
+# field, so `committer a <a@b> <NOW> +0000 1 +0000` — a 0-second-old claim — answered `1` here, and the
+# shell's reaper answered the same, deleting a claim `git log --format=%ct` dates as current. The two
+# readers must agree on WHICH field is the stamp, not merely on the line it is on.
+_COMMITTER_TIME_RE = re.compile(r"^committer .*> ([0-9]+) [+-][0-9]{4}$", re.M)
 
 
 def _commit_time(obj: str) -> Optional[int]:

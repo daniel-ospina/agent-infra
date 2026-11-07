@@ -1255,6 +1255,77 @@ outP4JUNKP=$( p4_prune )
 ck "A77 [RED→GREEN] ...so the claim is KEPT and NAMED (an unmeasurable age is not evidence of expiry)" "kept unreadable-lease refs/claims/pr-3233" "$outP4JUNKP"
 p4_has pr-3233 && P4JUNKK=0 || P4JUNKK=1
 ck "A78 [RED→GREEN] ...and it survives the pass instead of being reaped on an earlier forged header" "^0$" "$P4JUNKK"
+# ⛔ A TOKEN THAT PARSES MUST NOT BECOME THE VALUE (review round 22, agent-infra#3203). A76-A78 only
+# drove a token the `$` anchor REJECTS (`+0000 junk`), which pins the SHAPE of the fallback and not the
+# FIELD the parse is allowed to read. The greedy `.* ` therefore survived them and took the LAST
+# `digits [+-]dddd` pair anywhere on the line, so the same one-push attack came back through a token that
+# MATCHES: measured on the shipped file, `committer a <a@b> <NOW> +0000 1 +0000` — a claim `git log
+# --format=%ct` dates as 0 s old — made `_claim_commit_time` answer 1, and `claim_prune` DELETED it as
+# `1793991810s old, PAST the 18000s bound`. The parse is now anchored on `> ` (the ident's end), so the
+# accepted stamp is the field git reads; any other `digits +-dddd` tail simply is not a match and lands
+# on rc=1 (unmeasurable -> KEPT and NAMED).
+P4FIELDFORGE="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> %s +0000 1 +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=field\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4FIELDFORGE:refs/claims/pr-3235" ) 2>/dev/null
+ck "A79a (setup) a claim commit whose committer line carries a SECOND 'digits +dddd' pair is planted" "0" "$( p4_has pr-3235 && echo 0 || echo 1 )"
+P4FIELDRC=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+                && c="$( _git ls-remote origin refs/claims/pr-3235 | awk '{print $1}' )" \
+                && _git fetch -q origin "+refs/claims/pr-3235:$CLAIM_TMP_NS/field3203" \
+                && _claim_commit_time "$CLAIM_TMP_NS/field3203" >/dev/null 2>&1; printf '%s' "$?" ) 2>/dev/null | tail -1 )
+echo "  _claim_commit_time over a committer line with a second 'digits +dddd' pair: rc=$P4FIELDRC"
+ck "A79 [RED→GREEN] the stamp is the IDENT's field (anchored on '> '), never the last 'digits +dddd' token on the line" "^1$" "$P4FIELDRC"
+outP4FIELDP=$( p4_prune )
+ck "A80 [RED→GREEN] ...so a claim git dates as CURRENT is KEPT and NAMED, not reaped as ancient" "kept unreadable-lease refs/claims/pr-3235" "$outP4FIELDP"
+p4_has pr-3235 && P4FIELDK=0 || P4FIELDK=1
+ck "A81 [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4FIELDK"
+# ⛔ THE TWO 30-DAY LITERALS ARE THE ONLY THING KEEPING THE BOUND BOUNDED (review round 22,
+# agent-infra#3203). `_claim_floor_term` and `CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL` are both hard-capped at
+# 2592000 so no knob reaches ~31 years — and NOTHING pinned either cap: deleting one left this whole suite
+# GREEN (measured 281 passed / 0 failed on the tree before this block was hoisted out of the P4JUNK
+# loop — the COUNT follows the block's placement, the GREEN does not) while `MAXAGE=999999999 CEIL=999999999` resolved the bound to 999999999 and
+# a 2-YEAR-old unparseable-lease claim went from `pruned … PAST the 2592000s bound` to `kept … INSIDE the
+# 999999999s bound`, i.e. #3203's eternal hold restored through a knob. The knobs appeared in this suite
+# only BELOW the caps (CEIL=1, CEIL=3600) — the one region the caps do not govern.
+outP4CEILCAP=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 \
+                     CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=991999999 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  MAXAGE=999999999 CEIL=991999999 resolves to: $outP4CEILCAP"
+ck "A82 [RED→GREEN] the CEILING is hard-capped at the 30-day literal, so no override reaches ~31 years" "^2592000$" "$outP4CEILCAP"
+outP4FLOORCAP=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_TTL_MAX=999999999 \
+                      && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  TTL_MAX=999999999 resolves to: $outP4FLOORCAP"
+ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 9-digit term cannot raise the ceiling with it" "^2592000$" "$outP4FLOORCAP"
+# ...and the cap is the DECISION, not just the value: a 2-year-old claim is REAPED at the ceiling, so a
+# deleted cap shows up as a KEPT claim, not as a number.
+p4_seed pr-3236 weird3203 HAVOC 63072000 >/dev/null
+outP4CAPB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
+                  CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
+                  && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+echo "  prune of a 2-YEAR-old claim with both knobs at 999999999:"; printf '%s\n' "$outP4CAPB" | sed 's/^/    /'
+ck "A84 [RED→GREEN] ...so a 2-YEAR-old claim is still REPAIRED at the 30-day ceiling, not kept for 31 years" "pruned unreadable-lease refs/claims/pr-3236" "$outP4CAPB"
+p4_has pr-3236 && P4CAPK=0 || P4CAPK=1
+ck "A85 [RED→GREEN] ...and it is really gone (the bound is a bound at every knob setting)" "^1$" "$P4CAPK"
+# ⛔ A NON-UTF-8 BYTE IN THE COMMITTER NAME MUST NOT MAKE THE AGE UNMEASURABLE (merge of review round 26
+# with round 22, agent-infra#3203). `sed`'s `.` does not consume an INVALID UTF-8 byte under a UTF-8
+# locale, so the SAME object answered its stamp under `LC_ALL=POSIX` and UNMEASURABLE under
+# `LC_ALL=C.UTF-8` — measured, one datum with two answers depending on which box read it, in the field
+# the bounded reap is measured from. The parse is now byte-oriented (`LC_ALL=C` on all three stages), and
+# the caller below deliberately runs under a UTF-8 ambient locale: the function must not inherit it.
+# ⛔ THIS PIN EXISTS BECAUSE THE FIX SHIPPED UNPINNED: removing all three `LC_ALL=C` stages left BOTH
+# suites fully green (the harness's crafted fixtures are all SHAPE hazards — trailing token, extra
+# committer line, NUL, 3-digit tz — and not one carries a non-UTF-8 byte), so the one regression this
+# merge exists to prevent had no assertion at all.
+P4NONUTF="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a\377@b> %s +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=byte\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4NONUTF:refs/claims/pr-3237" ) 2>/dev/null
+ck "A86a (setup) a claim commit whose committer NAME carries an invalid UTF-8 byte is planted" "0" "$( p4_has pr-3237 && echo 0 || echo 1 )"
+P4NONUTFV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL=en_US.UTF-8 && . "$CLAIMS_SH" \
+               && c="$( _git ls-remote origin refs/claims/pr-3237 | awk '{print $1}' )" \
+               && _git fetch -q origin "+refs/claims/pr-3237:$CLAIM_TMP_NS/nonutf3203" \
+               && _claim_commit_time "$CLAIM_TMP_NS/nonutf3203" ) 2>/dev/null | tail -1 )
+echo "  _claim_commit_time over a committer name with a 0xFF byte, under a UTF-8 ambient locale: '$P4NONUTFV'"
+ck "A86 [RED→GREEN] a non-UTF-8 byte in the committer NAME does not stop the stamp being measured (the parse is byte-oriented)" "^${P4NOW}$" "$P4NONUTFV"
+outP4NONUTFP=$( p4_prune )
+ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 18000s bound" "$outP4NONUTFP"
 rm -rf "$P4ORIG" "$P4BOX"
 
 echo

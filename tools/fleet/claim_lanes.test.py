@@ -774,8 +774,10 @@ def l30_committer_acceptance():
     # ⛔ ONE DATUM, ONE ANSWER — in the field the bounded reap is MEASURED FROM (review round 18,
     # agent-infra#3203). `claims.sh`'s `_claim_commit_time` takes the LAST `committer `-prefixed header
     # line (`sed -n '/^committer /p' | tail -n 1`, round 24), parses THAT line with
-    # `sed -n 's/^committer .* \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — NOTHING may
-    # follow the tz digits — and then rejects a stamp longer than 12 digits as UNMEASURABLE
+    # `sed -n 's/^committer .*> \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — anchored on
+    # `> `, the IDENT's end, so the accepted stamp is the field git reads and a second `digits +dddd`
+    # tail cannot forge it (round 22) — NOTHING may follow the tz digits — and then rejects a stamp
+    # longer than 12 digits as UNMEASURABLE
     # (`case … |?????????????*`), which is what keeps `now - ct` out of a wrapped negative. This
     # reader allowed `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and
     # a fresh/aged stamp here.
@@ -841,6 +843,19 @@ def l30_committer_acceptance():
     check(cl._commit_time(obj(forged)) is None,
           "a trailing token on the NEWEST committer header must not fall back to an older stamp "
           "(that is the forged-age steal); got %r" % (cl._commit_time(obj(forged)),))
+    # ⛔ AND THE SAME STEAL THROUGH A TOKEN THAT *PARSES* (review round 22, agent-infra#3203). The forged
+    # shape above only pins the FALLBACK. A greedy `.* ` accepted the LAST `digits [+-]dddd` pair ANYWHERE
+    # on the line, so a second such pair forged the same age by a different token: measured on the shipped
+    # pair, `committer a <a@b> <NOW> +0000 1 +0000` — a claim git dates at the current SECOND — answered `1`
+    # in BOTH layers, and the shell's reaper DELETED it as `1793991810s old, PAST the 18000s bound`. The
+    # pattern is now anchored on `> ` (the ident's end), so the accepted stamp is the field git reads and
+    # any other `digits [+-]dddd` tail is simply not a match (⇒ unmeasurable ⇒ KEPT and NAMED). The oracle
+    # side is A79-A81, which drive the same object through `claim_prune`.
+    field_forged = "committer a <a@b> 1793991810 +0000 1 +0000"
+    check(cl._commit_time(obj(field_forged)) is None,
+          "a SECOND 'digits +dddd' pair on the committer line must not become the stamp "
+          "(the greedy .* read it as '1', dating a 0-second-old claim as ancient); got %r"
+          % (cl._commit_time(obj(field_forged)),))
     no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
     check(cl._commit_time(no_blank) == 1700000000,
           "with NO blank line the shell prints the whole object, so the stamp is still found; got %r"
