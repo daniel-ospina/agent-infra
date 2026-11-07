@@ -1975,8 +1975,11 @@ esac
 # healthiest-looking output this script can print. The two counters added for #2094 must each be able
 # to be NON-ZERO, or the operator gets a column that always reads 0 (the absence of a measurement is
 # not a measurement of emptiness). (a) above already produced the WITHHELD case; assert it there.
+# ⚠️ The matcher names the STABLE part of the line: since agent-infra#3203 the aggregate also covers a
+# lease that cannot be parsed (an ABSTENTION counted as withheld), so "live" is no longer the whole
+# story and the assertion is on the prefix both cases share.
 case "$OUT" in
-  *"WITHHELD by a live cross-box claim"*) ok "claim-withheld: a live peer claim is counted as WITHHELD (the short backlog is claims, not an empty pool)" ;;
+  *"WITHHELD by a cross-box claim"*) ok "claim-withheld: a peer-claim hold (live, or an unparseable-lease abstention) is counted as WITHHELD (the short backlog is claims, not an empty pool)" ;;
   *) bad "claim-withheld: the withheld aggregate did not print — output: $OUT" ;;
 esac
 case "$OUT" in
@@ -2556,14 +2559,17 @@ if [ -s "$DM" ] && grep -q 'release_issue_claim_unspawned' "$DM"; then
     ( N=42; O="$T/dm/o"; REPO="$T/dm/repo"; OR="owner/repo"; BR="feat/42-x"
       LANE_ALIVE="$1"; KILLABLE="$2"; released=0
       # ⛔ THE SLICE IS THE LOOP BODY, SO THE LOOP'S LOCALS MUST BE SUPPLIED. `refresh-scout.test.sh`
-      # runs under `set -u`, and the #2033 merge added `wt_reap_if_empty "$REPO" ".worktrees/$WT" …`
-      # to this branch: `WT` is set two lines above the slice in the real script (`WT="tm-$N"`), but
-      # an extracted slice does not carry it, so the subshell DIED on the unbound variable before it
-      # could print its count and the assertion read '' — a failure of the harness, not of the code.
-      # `wt_reap_if_empty` is stubbed for the same reason `release_issue_claim_unspawned` is: this
-      # check counts RELEASES, and the reap is proven by wt-lifecycle.test.sh's own arms.
+      # runs under `set -u`, and the #2033 merge added a worktree take-back to this branch: `WT` is
+      # set two lines above the slice in the real script (`WT="tm-$N"`), but an extracted slice does
+      # not carry it, so the subshell DIED on the unbound variable before it could print its count and
+      # the assertion read '' — a failure of the harness, not of the code.
+      # ⛔ THE TAKE-BACK IS STUBBED AT ITS OWN NAME (#2047). The slice used to call `wt_reap_if_empty`
+      # directly; it now calls `reap_unused_worktree`, and an UNDEFINED verb in an extracted slice is
+      # exactly the abort this comment exists for — measured: `reap_unused_worktree: command not found`
+      # while the check still reported its count. The reap itself is proven by `dispatch-teardown.test.sh`
+      # and `wt-lifecycle.test.sh`; this check counts RELEASES.
       WT="tm-$N"
-      wt_reap_if_empty() { WT_RESULT="stub: reap not exercised by the release-count check"; return 0; }
+      reap_unused_worktree() { :; }
       chain_gen=""   # the spawner sets this; the extracted branch only USES it
       wt_spawn() { return 1; }                                       # the chain cannot start
       wt_alive() { [ "$LANE_ALIVE" = 1 ]; }

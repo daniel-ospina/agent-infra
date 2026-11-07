@@ -1977,7 +1977,10 @@ PYEOF
   # ── THE FUNNEL'S ARITHMETIC CLOSES IN THE FLOOR BRANCH (review cycle 3, P2) ─────────────────
   # In the fail-closed floor the population IS the listing, so the swept set's parked count must not
   # be printed as an extra part: `26 PRs: 26 un-owned (0 owned, 5 parked)` does not add up.
-  grep -q 'SEL_PARKED=0' <<<"$FLOOR_SRC" 2>/dev/null || true
+  # ⛔ THE DEAD LINE THAT USED TO SIT HERE IS GONE (review cycle 5, P2 — measured). It read
+  # `grep -q 'SEL_PARKED=0' <<<"$FLOOR_SRC" 2>/dev/null || true` BEFORE `_FLOOR_SRC` was assigned, so
+  # every green run printed `line N: FLOOR_SRC: unbound variable` to stderr (and CI logged it): an
+  # assertion-shaped statement that could never assert anything. The real assertion is the `if` below.
   _FLOOR_SRC="$(sed -n '/⛔ AND THE PARKED PART DIES WITH THE POPULATION/,/FLOOR_NOTE=/p' "$ORCH")"
   if grep -q 'SEL_PARKED=0' <<<"$_FLOOR_SRC"; then
     echo "  ok the fail-closed floor re-bases the parked part (funnel arithmetic closes)"; PASS=$((PASS+1))
@@ -3210,6 +3213,15 @@ ISSUES 2')"
   # report.sh run with a stub `gh`: two markers exist, only ONE belongs to an open PR, so the line must
   # read 1 — a raw file count would read 2 and could never return to the 0 indicator (b) asks for.
   RPT="$TMP/rpt"; mkdir -p "$RPT/state" "$RPT/repo" "$TMP/ghstub"
+  # ⛔ THE FIXTURE CHECKOUT MUST BE A REAL CHECKOUT, and every arm below needs it (measured — all of
+  # (9)–(9c4) were RED before this line existed). `report.sh` stopped accepting a bare directory: its
+  # `REPO` goes through `repo-slug.sh`'s `resolve_repo`, which PROVES `git rev-parse --show-toplevel`
+  # answers and refuses by name otherwise, because a REPO that is not the intended checkout is how a
+  # box graded the wrong repo silently (#2040/#3521). A plain `mkdir` therefore made report.sh exit 2
+  # before ANY queue line — the arms then read `[]` and were red for a reason that had nothing to do
+  # with the counting they pin. `git init` is the smallest thing that satisfies the check: the
+  # counting arms never ask the checkout for a commit, a remote or a ref.
+  git init -q "$RPT/repo"
   # ⛔ TWO markers for the SAME open PR and one for a PR that is not open (review round 2, P2): a
   # file count would print 3, an open-PR-only count prints 2, and the correct per-PR count prints 1.
   # The controller used to be able to leave two markers for one PR; report.sh must not report that as
@@ -3283,29 +3295,80 @@ GHOPEN3
   eqv "…and a SUPERSEDED park is not counted as stale evidence" "  stale evidence (needs re-review): 0" "$(printf '%s\n' "$_rpt_superseded" | grep 'stale evidence')"
   rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-newhead"
   rm -f "$RPT/state/parked-6002" "$RPT/state/needsreview-6002-aaa" "$RPT/state/needsreview-6002-ddd"
-  # (9c) …and NO repo/gh at all is its OWN state, not 0 (review round 2, P1). The first form derived
-  # the state from a flag only set inside the "repo AND gh present" arm, so a box without a checkout
-  # printed `open PRs: 0` and `stale evidence: 0` — a blind read presented as a clean queue.
-  _rpt_norepo="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep -E 'open PRs|stale evidence' )"
-  case "$_rpt_norepo" in
-    *"open PRs: 0"*|*"stale evidence (needs re-review): 0"*) echo "  ❌ with no repo checkout report.sh printed a confident 0: [$_rpt_norepo]"; FAIL=$((FAIL+1)) ;;
-    *"needs a repo checkout and gh"*) echo "  ✅ with no repo checkout both lines name the missing dependency instead of printing 0"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ an unreadable environment produced [$_rpt_norepo] — expected the named missing dependency"; FAIL=$((FAIL+1)) ;;
-  esac
+  # (9c) …and a REPO that is not a CHECKOUT is its OWN state, not 0 (review round 2, P1; re-pinned
+  # when `REPO` moved behind `repo-slug.sh`'s `resolve_repo`). The old form read report.sh's own
+  # `[ ! -d "$REPO" ]` arm, which is now UNREACHABLE: `resolve_repo` proves the operator's value is a
+  # checkout before any queue read and refuses by name otherwise, so a bogus REPO is a CONFIGURATION
+  # error rather than a degraded environment. The property this arm exists for is unchanged, and it is
+  # now asserted where it happens: a read that cannot start prints NEITHER `open PRs: 0` NOR
+  # `stale evidence …: 0`, and the refusal names REPO so the operator is not left to invent a third
+  # way to set it.
+  _rpt_norepo_out="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2>"$TMP/rpt-norepo.err" )"; _rpt_norepo_rc=$?
+  # ⛔ A HERE-STRING, NOT A PIPE INTO A QUIET grep (#841/#864 — and this suite's own file is scanned
+  # by scripts/check-no-sigpipe-grep.sh, a HARD gate: the piped form here was refused as an undeclared
+  # SIGPIPE idiom, which reds the `sigpipe-grep` job for a defect in a test). Under `set -o pipefail`
+  # the piped form fails the pipeline when printf takes SIGPIPE, and the `!` in front of it then flips
+  # that failure to TRUE — the arm would pass for the wrong reason. The here-string cannot.
+  if [ "$_rpt_norepo_rc" -eq 2 ] \
+     && ! grep -qE 'open PRs: 0|stale evidence \(needs re-review\): 0' <<<"$_rpt_norepo_out" \
+     && grep -q 'REPO=.* is not a git checkout' "$TMP/rpt-norepo.err"; then
+    echo "  ✅ with no repo checkout report.sh REFUSES by name (rc 2) — it never prints a confident 0"; PASS=$((PASS+1))
+  else
+    echo "  ❌ an unreadable environment produced rc=$_rpt_norepo_rc [$_rpt_norepo_out] [$(head -1 "$TMP/rpt-norepo.err")] — expected the named refusal and no confident 0"; FAIL=$((FAIL+1))
+  fi
   # (9c4) ⛔ AND ON THE DEGRADED PATHS THE PARKED COUNT NAMES ITS OWN PROVENANCE (landing-review note,
-  # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so with no
-  # checkout, or with an unreadable listing, the number that gets printed is the raw `parked-*` FILE
-  # count and a superseded park is indistinguishable from a current one. Printing it UNLABELLED
-  # presents an inflated human queue as a measured one; the stale line on these same two paths already
-  # names its degradation, so the parked line must too. Driven, not grepped: two parks exist, NEITHER
-  # of which can be attributed on these paths (that is the whole reason the count is raw).
+  # P3). Attribution needs the OPEN LISTING — it is the only source of a PR's live head — so where the
+  # listing cannot be read the number that gets printed is the raw `parked-*` FILE count and a
+  # superseded park is indistinguishable from a current one. Printing it UNLABELLED presents an
+  # inflated human queue as a measured one; the stale line on the same path already names its
+  # degradation, so the parked line must too. Driven, not grepped: two parks exist, NEITHER of which
+  # can be attributed on these paths (that is the whole reason the count is raw).
+  # ⛔ TWO DEGRADED PATHS, AND BOTH ARE DRIVEN (review of this delta, P2 — a first cut of this block
+  # said "one degraded path now, not two", which was FALSE). `resolve_repo` retired the missing-
+  # CHECKOUT half of report.sh's `norepo` test ([ ! -d "$REPO" ] can no longer be true — that state is
+  # the refusal asserted in (9c) above), but the state itself is still reachable through the OTHER
+  # half, `! command -v gh`, and it prints the raw count with its own note (report.sh:285). No arm run
+  # by this suite drove that branch any more: every other `bash "$REPORT"` call here either puts a
+  # `gh` stub on PATH or fails at `REPO`, so the note had become unpinned.
   printf '%s\n' livehead > "$RPT/state/parked-6001"
   printf '%s\n' oldhead > "$RPT/state/parked-6999"
-  _rpt_norepo_parked="$( O="$RPT" REPO="$RPT/does-not-exist" bash "$REPORT" 2 2>/dev/null | grep 'parked (needs a human)' )"
-  case "$_rpt_norepo_parked" in
-    *" 2  (raw marker count"*) echo "  ✅ with no repo checkout the parked line KEEPS the count (2) and says it is RAW"; PASS=$((PASS+1)) ;;
-    *) echo "  ❌ with no repo checkout the parked line printed [$_rpt_norepo_parked] — expected '2' plus a raw-provenance note"; FAIL=$((FAIL+1)) ;;
-  esac
+  # ⛔ "NO gh" MUST BE CONSTRUCTED, NOT HOPED FOR. On every host this suite runs on (a CI runner, a
+  # cell, a laptop with the CLI installed) `command -v gh` succeeds, so simply not adding a stub still
+  # exercises the READABLE path while the arm passes. Filtering PATH directories cannot express it
+  # either: `gh` sits in `/usr/bin` beside `git`, and `resolve_repo` needs `git`. So the fixture is
+  # ONE bin dir of symlinks to every entry on PATH except `gh` — the shell, git and the coreutils all
+  # resolve, `command -v gh` fails. The three facts the run depends on are then ASSERTED (git and bash
+  # present, gh absent), so a host where this construction silently produced nothing is a fixture
+  # failure rather than a green arm over the wrong branch.
+  NOGH_BIN="$TMP/nogh-bin"; rm -rf "$NOGH_BIN"; mkdir -p "$NOGH_BIN"
+  _nogh_ifs="$IFS"; IFS=:
+  for _nogh_d in $PATH; do
+    [ -n "$_nogh_d" ] && [ -d "$_nogh_d" ] || continue
+    for _nogh_f in "$_nogh_d"/*; do
+      _nogh_n="${_nogh_f##*/}"
+      [ "$_nogh_n" = gh ] && continue
+      [ -e "$NOGH_BIN/$_nogh_n" ] && continue
+      ln -s "$_nogh_f" "$NOGH_BIN/$_nogh_n" 2>/dev/null || true
+    done
+  done
+  IFS="$_nogh_ifs"
+  if [ -x "$NOGH_BIN/git" ] && [ -x "$NOGH_BIN/bash" ] && [ ! -x "$NOGH_BIN/gh" ]; then
+    _rpt_nogh_out="$( O="$RPT" REPO="$RPT/repo" PATH="$NOGH_BIN" bash "$REPORT" 2 2>/dev/null )"
+    # ⛔ THE ARM MUST IDENTIFY THE BRANCH, NOT JUST THE SENTENCE (review cycle 3, P2 — measured).
+    # Both degraded paths print a raw-count note, so `*" 2  (raw marker count"*` matched either: the
+    # reviewer deleted report.sh's whole `norepo)` case and this arm stayed GREEN on the `*)`
+    # (unreadable-listing) branch, whose note ends "from an unreadable listing" instead. The `norepo`
+    # branch is the one that also degrades the STALE line to `<needs a repo checkout and gh>`, so both
+    # fragments are required here — the parked note's own wording AND that stale line.
+    case "$_rpt_nogh_out" in
+      *"parked (needs a human): 2  (raw marker count"*"without a repo checkout and gh"*"stale evidence (needs re-review): <needs a repo checkout and gh>"*)
+        echo "  ✅ with no gh on PATH the parked line KEEPS the count (2) and says it is RAW — on the norepo branch, which the stale line names"; PASS=$((PASS+1)) ;;
+      *)
+        echo "  ❌ the no-gh run did not read as the norepo branch: [$(printf '%s\n' "$_rpt_nogh_out" | grep -E 'parked \(needs a human\)|stale evidence' | tr '\n' ' ')] — expected the RAW count plus the norepo stale line"; FAIL=$((FAIL+1)) ;;
+    esac
+  else
+    echo "  ❌ could not build a gh-less PATH (git=$([ -x "$NOGH_BIN/git" ] && echo yes || echo no) bash=$([ -x "$NOGH_BIN/bash" ] && echo yes || echo no) gh=$([ -x "$NOGH_BIN/gh" ] && echo present || echo absent)) — the no-gh arm is unproven"; FAIL=$((FAIL+1))
+  fi
   cat > "$TMP/ghstub/gh" <<'GHFAIL2'
 #!/bin/bash
 exit 1

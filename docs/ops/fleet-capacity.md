@@ -235,6 +235,281 @@ In the controller the verdict has three outcomes, and only two of them stop work
   stand-down.
 - `refuse` → `GATE_WHY="capacity-placement(bound=…)"`: nothing is placed, and the bound is named.
 
+## 6a. Expected vs published — a dead box is not a full box (agent-infra #3446)
+
+§6 is fail-closed in **one** direction: a box that cannot publish is INELIGIBLE to its peers. That is
+right for safety, and it has a blind spot — **a dead box and a full box are indistinguishable**, because
+both publish nothing. MEASURED 2026-11-04: `cmux vm ls` reported **5 of 5 machines running** while
+`git ls-remote --refs origin 'refs/boxes/*'` returned **one** ref. Five live, idle boxes were invisible,
+nothing said so, and a controller concluded "there is no usable remote capacity" while ~87 lanes sat
+idle across four running cells.
+
+`cap_fleet_line <repo>` (CLI: `bash capacity.sh fleet-line <repo>`) joins the two readings into **one**
+line, emitted on every controller cycle EXCEPT the fork-exhausted one (that arm must be built from
+shell builtins, because a failed fork terminates the shell — the box is visible through its peers'
+lines instead) and on every drainer tick that OWNS THE LOCK (so a tick that skips a guard still
+reports the fleet). A **HELD** cycle still reports it: the disk-floor hold emits the line before its
+nap, because a box holding for bytes is exactly a *skipping* cycle and grepping `fleet:` on it must not
+read as "instrument not deployed".
+
+```
+fleet: expected=5 published=3 INELIGIBLE=3 extra=1 (pi-cell-3, pi-cell-4, pi-cell-1) src=cmux
+```
+
+**Reproduced against the live fleet while landing this — the reading, not a fixture.** MEASURED
+2026-11-05, from a checkout whose origin is the queue repo the cells publish to:
+
+```
+fleet: expected=5 published=4 INELIGIBLE=2 extra=1 (pi-cell-2, pi-cell-3) src=cmux
+```
+
+Five cells were running per `cmux vm list --json`; two of them (`pi-cell-2`, `pi-cell-3`) held no
+fresh record in `refs/boxes/*` and had been **invisible to the fleet**, exactly the state that read as
+"no usable remote capacity" on 2026-11-04. `extra=1` is the Mac, which publishes but is in no provider
+VM listing — the reconciliation is `published − extra = expected − INELIGIBLE` (4 − 1 = 5 − 2).
+
+- **`expected`** — the boxes that SHOULD be publishing. Resolution order: `CAP_EXPECTED_BOXES` (an
+  explicit roster of `<label>:<boxid>` or bare `<boxid>` tokens), then `CAP_EXPECTED` (an explicit
+  count), then the provider's own inventory (`cmux vm list --json`, **running** machines only; each
+  machine's `network.ipv4` is the very identity `cap_boxid` publishes under, which is what lets the
+  line NAME the missing boxes instead of only counting them). `src=` says which answered.
+- **`published`** — boxes with a **fresh, attributable** record in `refs/boxes/*`. A record older than
+  `CAP_PROBE_TTL` is *not* published: that box stopped republishing, which is the state a dead
+  controller produces. `published` counts every publishing box, including one the expectation does not
+  name (a Mac publishes but is not a provider VM), so it need not sum with `INELIGIBLE` to `expected` —
+  the three fields answer three different questions.
+- **`INELIGIBLE`** — expected boxes with no fresh record. Named in `(…)`; those that DO have a record
+  but only a **stale** one are listed separately in `stale=(…)`, because "up, but its controller stopped
+  publishing" is a different remedy from "gone". **Nothing is named when the channel could not be read**
+  — a membership claim ("these are not publishing") is exactly what an unread read cannot support, so
+  only the counts and `why=` are printed. **It is `unknown` whenever the expectation carries no key** (a
+  bare count, or a roster entry with no boxid): with nothing to match on, `expected − published` is a
+  lower bound, not a count — a publisher the expectation never names inflates `published` and quietly
+  under-reports the gap — so the boxes that ARE provably missing are named and the figure is withheld.
+- **`extra=`** — published boxes the expectation does NOT name, so the three fields are checkable:
+  `published − extra = expected − INELIGIBLE`. Without it a fleet where every expected box is silent but
+  three strangers publish would read `expected=3 published=3 INELIGIBLE=3`, and an eye comparing only
+  the first two numbers sees equality.
+- **`why=`** — present only when a side is unknown, and it names the reason (`provider-inventory-
+  unavailable`, `provider-inventory-unreadable`, `provider-inventory-unparseable`,
+  `expected-count-unparseable`, `expected-count-unusable`, `expected-has-no-boxid`, `roster-empty`,
+  `clock-unreadable`, `clock-skew`, `ttl-unreadable`, `identity-collision`, `channel-unreadable`,
+  `channel-timeout`, `channel-unverified`). `expected-has-no-boxid` means the expectation was READ but cannot be matched
+  record-for-record, so the line names what it can prove and says `INELIGIBLE=unknown` rather than a
+  subtraction. Two of those are worth calling out because each was a fail-OPEN in the first
+  cut of this line: an **unreadable clock** used to make every age negative (so every record looked
+  fresh — the line certified a fleet from a clock it never read), and a roster that **tokenized to
+  nothing** used to read as `expected=0`, a clean bill of health built from no material.
+- **`chan=`** — the channel the PUBLISHED side was read from (the origin URL, scheme, `.git` and any
+  **userinfo** stripped — an `https://x-access-token:…@` origin is a CI convention, and echoing it would
+  write a credential into the drainer's log on every tick). `src=` names the *expected* source only, so
+  without `chan=` a `published=0` was unattributable — which is how the drainer reported a healthy 3-of-5
+  fleet as `published=0 INELIGIBLE=5` while reading a **lane** checkout whose origin is not the queue
+  repo. The field is set only by the call that actually read a repo, so it can never label a reading that
+  did not take one.
+
+  **WHICH CHANNEL A DRAINER READS, in order, and nothing else is assumed:** an explicit `FLEET_REPO` (or
+  the ambient `REPO`); otherwise this drainer's own `SEED_REPO` **only when its origin IS** the
+  `REPO_SLUG` the drainer already knows — the comparison the old default assumed instead of checking;
+  otherwise `why=channel-unverified`. The units render `FLEET_REPO` (`install-drainer-timer.sh` →
+  `DRAINER_FLEET_REPO`, default `DRAINER_SEED_REPO`), so a cell installed by `install-drainer-timer.sh`
+  takes the **first** path — the unit sets the variable explicitly — while the origin comparison protects
+  every other caller (a hand-run tick, the macOS arm, a box whose unit predates this). A cell whose
+  `DRAINER_SEED_REPO` points at a foreign repo still READS it (attributable via `chan=`), it does not
+  refuse: bounded, and stated rather than implied.
+- **A field the shell cannot represent is a REFUSAL, not a PASS.** Every gate is `[ "$x" -ge "$y" ]`, and
+  an ERRORING test is FALSE: a channel record carrying a 20-digit `lpc` bypassed the load ceiling (the
+  diagnostic went to a stderr both readers discard) and `cap_place` answered `place=… eligible=1` for the
+  saturated box; the same held for `disk_free_mb` and `mem_free_mb`. `at` has its own variant —
+  `$(( 10#18446744075502150016 ))` wraps MODULO 2^64, so a stamp five centuries ahead read as *just
+  published* AND never aged out, with both readers agreeing on the wrong thing. Every numeric field is
+  bounded to 12 digits in the one helper both readers already call, which keeps `at` valid past 2286 and
+  every reading well inside int64.
+- **A CEILING the shell cannot compare silently DISABLES its own gate — the other half of the same bug.**
+  The record-side width bound above protects the datum; the values it is compared **against** are seams
+  (`CAP_LPC_CEILING`, `CAP_MIN_DISK_MB`, `CAP_MIN_MEM_MB`, `CAP_MIN_FORK_HEADROOM`), and this repo's own
+  docs spell them in prose in the form that BREAKS them — `CAP_LPC_CEILING` = 8.00 load-per-cpu. A decimal,
+  a unit (`500G`, `512MB`), a leading zero or a 20-digit value makes every `[ "$x" -ge "$y" ]` error, the
+  gate vanishes into a discarded stderr, and placement answers `eligible=1` for a box over the ceiling, out
+  of disk, out of memory or unable to fork. One predicate at load (`cap_int_seam`) applies the **default**
+  and says so on stderr — never the seam as typed (a literal `8.5` would keep the gate broken) and never 0
+  (which would make every box ineligible). The clock is the same datum in a third place: `CAP_NOW` was read
+  straight into `$(( ))`, where 20 digits wrap modulo 2^64 to the record's own `at`, the age computes as 0,
+  and placement certifies precisely the bytes the line reports as `clock-unreadable` — so `now` is
+  width-bounded in `cap_bound_hit`, the one place both readers age a record.
+- **One TTL predicate, consulted by BOTH readers.** `cap_bound_hit` (placement) and the line validate the
+  window through the same helper (`cap_ttl_secs`), and `cap_parse_lsremote` hands awk the VALIDATED
+  number — unvalidated, a duration typo made the line refuse while placement PLACED on the same bytes
+  (`place=h1 eligible=1`), and made awk read `15m` as **15**, silently shrinking the collision window
+  from 900 s to 15 s. A record whose age cannot be computed, or whose stamp is more than one window in
+  the FUTURE, is `probe_unreadable` to placement and `clock-skew`/`ttl-unreadable` to the line — never a
+  hidden difference between "may this box take work" and "is this box publishing".
+
+**The polarity is the point**, and it is the same rule the fleet already applies to check-runs (a
+missing check is not a green check):
+
+- an expectation that cannot be read is **`expected=UNKNOWN` with its reason**, never `expected=0` — a
+  zero would be a claim that the provider runs no machines, which nothing measured;
+- a channel that cannot be read is **`published=UNREADABLE`**, never `published=0`;
+- an **empty** read against a non-empty expectation is an ALARM (`published=0 INELIGIBLE=n`), not a quiet
+  fleet of one. `capacity-placement.test.sh` §15 grades all three, and two of its arms carry a MUTANT
+  that must fail the reproduction (remove the UNKNOWN arm; force a "healthy" line) so the assertions
+  cannot pass on a tree that lost the behaviour.
+
+Exit code: `0` both sides known and attributable · `1` a side is UNKNOWN/UNREADABLE (or the expectation
+carries no key, so missing boxes cannot be named) · `2` the channel itself is unreadable. **The line is
+printed in every one of those cases** — the line carries the state, the exit code carries the
+completeness, so a `$( )` caller still gets the reading.
+
+Seams (all opt-in; a box that sets none calls the provider): `CAP_EXPECTED_BOXES`, `CAP_EXPECTED`,
+`CAP_CMUX_BIN` (path to the provider CLI), `CAP_CMUX_LIST` (an operator's own inventory command line,
+e.g. a bounded wrapper), `CAP_INVENTORY_TIMEOUT` (seconds, default 10), `CAP_CHANNEL_TIMEOUT` (seconds,
+default 10 — the `git ls-remote` half is a network read too).
+
+⛔ **THE INVENTORY CALL IS BOUNDED, AND A TIMEOUT IS A NAMED READING.** `cmux vm list --json` is a
+NETWORK call: unbounded, a wedged provider hangs the **drainer tick that holds the lock** — every later
+tick then exits `SKIP: drainer already running` and the box stops topping up — and it sits on every
+controller cycle. `timeout` is GNU and macOS ships it nowhere, so the bound walks `timeout` →
+`gtimeout` → a bash-native watchdog (the same contract as `repo-authority.sh`'s `_gh_bounded`); a
+timeout reads `provider-inventory-unreadable(<cmd> timed out after <n>s)`, never a quiet fleet. The
+watchdog (the macOS arm) writes the child's stdout to a FILE rather than to the caller's own: `kill`
+reaches the direct pid only, so a descendant the provider left behind would otherwise keep the caller's
+`$( )` open past the bound — measured, that turned a 1 s bound into the child's full 8 s. That path does
+NOT depend on `mktemp` (a per-process name is built by the shell), because a `mktemp` that fails would
+otherwise have to fall back to inheriting stdout — the very hazard — or silently un-bound the caller.
+And the FILE applies to **every** arm, not just the watchdog: `timeout` / `gtimeout` — what every Linux
+cell (and macOS with coreutils) takes — used to hand the child the caller's stdout, so a descendant that
+escaped the child's process group held the caller's `$( )` past the bound (measured: 1 s bound, 12 s
+caller block). The bound exists so the reading can be taken inside the drainer's tick lock, so that leak
+was a wedge, not a slow read. A `CAP_*_TIMEOUT` is normalised NUMERICALLY — `0`, `00` and `000` are all
+"no timeout" to GNU `timeout` while the watchdog arm treats them as an instant expiry, so every all-zero
+spelling, any non-number and anything outside 1…999999999 is the 10 s fallback, decided by ONE helper
+(`cap_bound_secs`) that the timeout DIAGNOSTICS also print (`timed out after 10s`, never `after 0s`).
+The `timeout` arm also KILLS (`-k 1`), because a child that ignores SIGTERM otherwise ran its full
+lifetime under a 1 s bound (measured: 10 s) while the watchdog arm bounded it in 1 s. The kill-after
+status (137) is normalised to 124 ONLY when the clock says the bound really elapsed: a child that killed
+itself returned in 0 s and must not be reported as `timed out after 10s`, which is what a blanket
+normalisation did while the watchdog arm called the same child `exited 137`.
+Its TIMEOUT VERDICT is a sentinel written before the kill, not a `kill -0` liveness race read after
+`wait`: measured over 40 timed runs, the race lost the verdict 14 times (`rc 137`, reported as
+`exited 137` / `channel-unreadable` instead of the documented `timed out after Ns` /
+`channel-timeout`). The bound still fails closed either way — it is the NAME that was lost. The sibling
+reader `lane-artifacts.sh` still calls `cmux vm list` unbounded — pre-existing, and not this line's path.
+
+⛔ **THE CHANNEL READ IS BOUNDED FOR THE SAME REASON.** `cap_read_fleet`'s `git ls-remote` is a network
+read on the same path (`GIT_TERMINAL_PROMPT=0`, so a credential prompt cannot become a lock-holding
+hang); a timeout reads `why=channel-timeout` and `published=UNREADABLE`. This matters most where the
+reading was added: `ai-drainer.sh` takes it BEFORE its guards while holding the tick's lock, so an
+unbounded read there stops every later tick (`SKIP: drainer already running`) and the box stops topping
+up — the same consequence the provider bound exists for, on the other half of the same reading.
+
+A provider that lists **zero** running machines reads as `provider-inventory-unparseable`, not
+`expected=0`: the reader cannot tell an empty listing from one it failed to parse, and guessing zero
+would hide the parse failure (an operator in that state pins `CAP_EXPECTED=0`, which is an explicit
+claim rather than an inference). The same rule covers a machine the extractor **cannot classify**: only
+a status READ as `stopped` is treated as parked, and an unreadable/unknown status (or a case variant
+such as `Running`) refuses the WHOLE listing rather than shrinking `expected` — a smaller denominator
+reads as a whole fleet, which is the false PASS this line exists to kill. A listing the SPLITTER could
+not separate is refused the same way (a `"status"` key count higher than the object count means objects
+are still hiding inside one fragment — the CRLF shape), so an unread listing can never arrive as a
+short fleet.
+
+⛔ **A CELL HAS NO PROVIDER CLI, SO A CELL MUST PIN ITS EXPECTATION.** `cmux vm list` exists on the Mac
+that runs the VMs; a cell is a headless Linux VM with no app and no `cmux` binary
+(`pi-bootstrap/cell-install.sh`). With no seam set, a cell's line therefore reads
+`expected=UNKNOWN published=N INELIGIBLE=unknown why=provider-inventory-unavailable` on every cycle —
+the fail-closed direction, and information-free. That is honest, not healthy: **the reconciliation only
+produces a number where an expectation exists.** A cell that should reconcile must pin
+`CAP_EXPECTED_BOXES` (`pi-cell-1:10.238.144.2,pi-cell-2:10.238.144.6,…`, the roster whose keys are the
+very `network.ipv4` values `cap_boxid` publishes under) or, if only the count is known,
+`CAP_EXPECTED=<n>` (which reports `INELIGIBLE=unknown`, because a count cannot name who is missing).
+
+⛔ **A COUNT THE SHELL CANNOT COMPARE IS A REFUSAL.** A 19+-digit `CAP_EXPECTED` made the count arm's
+loop fail (`integer expression expected`), return 0 with no output, and the line certified
+`expected=0 published=1 INELIGIBLE=0` — the `expected=0` false PASS the instrument forbids. A count must
+be a whole number of at most four digits with no leading zero beyond `0` itself
+(`expected-count-unusable`), and `CAP_EXPECTED=0` remains the one explicit, operator-made zero.
+
+The **leading-zero** refusal is a convention, not a shell limitation, and this document says so because
+it used to say the opposite. MEASURED on bash 5.2.21 and on bash 3.2.57: `[ 0 -lt 08 ]` → rc 0 and
+`[ 8 -lt 010 ]` → rc 0, i.e. `test` compares these **decimally**, and the pre-guard arm on
+`CAP_EXPECTED=08` emitted 8 expected lines rather than zero. `08` is refused because a zero-padded count
+is not a count anyone writes on purpose, and quietly re-reading an operator's value as a different
+number is its own surprise — not because the comparison would fail.
+
+⛔ **A NUMERIC TTL OUT OF RANGE IS THE SAME HOLE AS AN UNCOMPARABLE ONE.** Twenty digits make
+`[ "$age" -gt "$CAP_PROBE_TTL" ]` error, so the stale branch never runs and every record counts fresh —
+measured `expected=3 published=1 INELIGIBLE=2`, rc 0 where the truth is `published=0 INELIGIBLE=3
+stale=(cell-1)`. The TTL is whole seconds, at most ten digits, no leading zero.
+
+⛔ **THE SAME RULE FOR THE FRESHNESS COMPARISON.** `CAP_PROBE_TTL` must be whole seconds: a duration
+typo (`15m`) makes `[ age -gt TTL ]` fail, which would skip the stale branch and count EVERY record
+fresh — measured, a 100,000,000-second-old record read `published=1`, rc 0, with the only diagnostic on
+a stderr both emitters discard. An uncomparable TTL refuses the reading (`why=ttl-unreadable`), exactly
+as an unreadable clock does. A stamp more than the window in the FUTURE is likewise not a clock
+disagreement — a box with a broken RTC would otherwise read `published=1` for ever, and keep reading it
+after it died — so it refuses as `why=clock-skew`; a second or two of skew between two boxes is normal
+and still clamps to "just published".
+
+⛔ **MORE WAYS A SIDE USED TO COUNT SOMETHING IT HAD NOT ESTABLISHED.**
+
+- **A record the line cannot validate is not "this box is not publishing".** `cap_place` refuses such a
+  record (`bound=probe_unreadable`), but the published loop used to DROP it and then report the box as
+  INELIGIBLE with rc 0 — measured `expected=1 published=0 INELIGIBLE=1 (cell-1)` on a record placement
+  refuses (`lpc=18446744073709551615`: every field is bounded, `cap_valid_base_record` returns 1). rc 0
+  claims "both sides known and attributable", and the named cause sends the operator to restart a
+  controller whose record is merely malformed. An unreadable record (or one whose `at` cannot be
+  parsed) now refuses as `why=record-unreadable`, the same answer the collision arm gives: the line and
+  placement must not disagree about who is visible. The rule covers a record with **no attributable key**
+  too (an older peer writes no `boxid`; `cap_parse_lsremote` passes it through, `cap_place` refuses it
+  as `bound=box_unknown`): the line used to drop it and claim the box was missing, and now refuses as
+  `why=box-unreadable`.
+
+- **A collided key is not a published box.** `cap_parse_lsremote` already marks such a record
+  (`collide=1`) and `cap_place` refuses the whole evaluation on it (`bound=identity_collision`),
+  because two machines under one key mean the last writer masks the other — which is #3446's own
+  shape, reached through a key this codebase records as having really collided. The line was dropping
+  the mark it had just been handed: measured, two machines under one key with one of them dead read
+  `expected=1 published=1 INELIGIBLE=0` rc 0 while placement refused the same bytes. It now refuses as
+  `why=identity-collision`: the line and placement must not disagree about who is visible.
+- **A channel-legal `at` must not kill the line.** `at=08` passes the digit check and bash reads it as
+  BAD OCTAL, so the *assignment* aborted — no line at all, against the contract that says one is printed
+  in every case, and the drainer then named a false cause (`why=capacity.sh-incomplete — a STALE copy:
+  re-seed $O`). The age arithmetic is `10#`-prefixed (and a non-digit `now` refuses), so a malformed peer
+  record costs that record's freshness, never the fleet's reading.
+- **Two machines behind one address is a collision, not a typo.** The expected-side dedupe ("the same box
+  named twice is one box") is right for a roster row and wrong for the provider inventory, where the key
+  is `network.ipv4`: measured, 5 running machines with one reusing another's address read
+  `expected=4 published=1 INELIGIBLE=3`, rc 0 — a live machine invisible to the instrument built to stop
+  exactly that. The listing now refuses (`DUPLICATEKEY <addr>`) instead of picking a winner.
+- **A truncated listing is not a shorter fleet.** The round-3 fix caught a body that hid objects inside
+  one fragment; a body CUT between objects runs off the end, leaves nothing hidden, and passed every
+  check — measured on a 5-machine listing cut after object 2: `expected=2 published=2 INELIGIBLE=0`, rc
+  0, naming two of five machines. Completeness is now structural: every `{` needs its `}`, every `[`
+  its `]` (the live provider emits `{"machines":[…]}` — `]}` — so only BALANCE is assumed, not shape).
+- **One token per field, or the line names a box that does not exist.** Each inventory line is
+  `<name> <ipv4|->` and the reader splits on whitespace, so a machine NAME carrying a space
+  (`pi cell 1`) was read as `label=pi`, `bid=cell 1 10.0.0.1` — measured `expected=1 published=1
+  INELIGIBLE=1 (pi)` rc 0: a phantom box named as missing, the real box published beside it, and the
+  line's own `published − extra = expected − INELIGIBLE` invariant broken by a display-only label. The
+  label is normalised to the token charset (`cap_ref_token`, the same sanitiser a roster row's key and
+  label go through); an ADDRESS carrying whitespace is refused with the listing, because it is the
+  join key and a key that cannot be one token can never match a published record. A roster row cannot
+  carry a space at all — `CAP_EXPECTED_BOXES` is split on commas AND whitespace, so `pi cell
+  1:10.0.0.1` is three rows and reads `expected=3 … (pi, cell)`; that is a malformed seam, not a lost
+  label. The **collision compare keeps the raw name**:
+  normalising it first made `pi cell 2` and `pi_cell_2` compare equal, so two distinct machines behind
+  one address collapsed into one expected entry — the exact false PASS the duplicate-address gate
+  (`DUPLICATEKEY`) exists to stop, and one this change briefly re-opened.
+
+owners: `capacity.sh` (`cap_expected_boxes`, `cap_fleet_inventory`, `cap_fleet_line_from`,
+`cap_fleet_line`); callers: `orch-loop.sh` (every cycle, from the fleet read placement already took —
+no second read) and `ai-drainer.sh` (once per tick that owns the lock, **before** any guard that can
+skip, so a skipping tick still reports the fleet). The controller emits it on every cycle with a
+READABLE probe — including the cycle whose own probe failed — plus the DISK-HELD cycle, and
+deliberately not on the fork-exhausted cycle, which is built from shell builtins only because a failed
+fork terminates the shell; a fork-starved box is seen by its PEERS' lines instead.
+
 ## 7. The self-dispatch proof
 
 `orch-loop.sh` appends **one line per cycle** to `$O/state/cycles`:
@@ -261,14 +536,22 @@ state that read as fine on cell-1.
 This is what answers "is it self-dispatching" without a human reading a pane: a live pane shows a
 *process*, a fresh record shows a *cycle*.
 
-## 8. Tests
+### 7.1 Tests
 
 `scripts/orchestrator-harness/capacity-placement.test.sh` (in `scripts/run-bash-shards.sh`, so both
 CI lanes run it): the saturated box skipped and the least-loaded eligible box chosen; an
 unreadable/stale/absent record never chosen; no eligible box ⇒ refusal naming the bound; a controller
 with no record in more than two cycles is `DEGRADED` and one with no record at all is `ABSENT` — never
 `HEALTHY`. Hermetic: clock/host seams, and a local bare repo as the shared origin (real pushes, real
-`ls-remote`).
+`ls-remote`). §15 grades the EXPECTED-vs-PUBLISHED line (§6a): the missing boxes are NAMED, a stale
+record is not counted as published, an empty read against a non-empty expectation is an alarm, an
+unreadable expectation is `expected=UNKNOWN` (never `0`) and an unreadable channel is
+`published=UNREADABLE` (never `0`), the provider's `running` filter and its name→key mapping are
+exercised against a real listing shape (compact AND pretty-printed), and both call sites (`orch-loop.sh`,
+`ai-drainer.sh`) are asserted to emit it — with mutation arms that must fail the reproduction.
+`ai-drainer.test.sh` (`== the fleet line (#3446) ==`) grades the same line behaviourally: one line per
+tick that owns the lock, `published=UNREADABLE` on a channel with no origin, and a NAMED reason when the
+instrument is missing.
 
 ## 8. The other half: the runner POOL is provisioned from this repo
 
@@ -291,6 +574,18 @@ bash scripts/ci_runner_pool.sh reclaim [--name <n>] [--dry-run]
 bash scripts/ci_runner_pool.sh reconcile            # the pass (idempotent; NOT yet scheduled)
                                                    # restart -> reclaim -> add, one pass, that order
 ```
+
+⛔ **THE SCHEDULED CAPACITY AUTHORITY IS A DIFFERENT PASS.** On a box that carries the autoscale
+timer (`eldato-runner-autoscale.timer`, installed + ARMED separately — see
+[runner-autoscale.md](runner-autoscale.md)), `runner_autoscale.py` ticks every 9 minutes and derives
+the ceiling from `min(cores, memory, disk)`. `ci_runner_pool.sh` derives its own ceiling (cores plus a
+memory floor, no disk term), so a hand `reconcile`/`add` on a converged box can put the pool ABOVE
+the converger's measured ceiling; the next tick then reports `over-ceiling` and grows nothing — and
+it never **removes** anything either, so the surplus stays until a human removes it (see
+[runner-autoscale.md](runner-autoscale.md), which states the same limit). Treat `runner_autoscale.py`
+as the scheduled authority
+and `ci_runner_pool.sh` as the manual/incumbent tool: **do not hand-run `reconcile` on a converged
+box.** Reconciling the two for good is #3056.
 
 Rules, each measured rather than preferred:
 
@@ -427,17 +722,111 @@ above) and the same box reports its real slots and can restart its real registra
   arming it (which boxes, which interval) is an operator decision, and this change deliberately does
   not self-arm a timer.
 
-`status --all` is scoped to **this box**: nothing in this repo reports runners **per cell** —
-`capacity.sh`'s probe knows host, cores, load, lanes and disk/memory and **nothing about runners**, and
-neither does the fleet inventory. Nor does any tool list the GitHub-side registry:
-`scripts/ci_runner_gate.sh --status` prints only the gate's mode (`mode=… repo=…`) and counts
-`ubuntu-latest` runners without naming them. The per-cell runner report #2373's clause 2 words is **not**
-delivered by this change; the registry itself is only readable directly, e.g.
-`gh api repos/<owner/name>/actions/runners --jq '.runners[] | {name, status, busy}'`. Within this box the
-table is complete, so a runner this box registered and
-then lost the local evidence for is not in the table — that is why an add whose listener fails keeps
-its `.runner` and says so. `--all` widens nothing: the default view already lists every runner on this
-box, and the flag exists because #2373's clause names it.
+`status --all` is scoped to **this box** — `capacity.sh`'s probe knows host, cores, load, lanes and
+disk/memory and **nothing about runners**, and neither does the fleet inventory. `--all` widens
+nothing: the default view already lists every runner on this box, and the flag exists because #2373's
+clause names it. Within this box the table is complete, so a runner this box registered and then lost
+the local evidence for is not in the table — that is why an add whose listener fails keeps its
+`.runner` and says so.
+
+### 8a. The CROSS-CELL report — `scripts/ci_runner_fleet.sh` (#2429)
+
+One command for the question clause 2 actually asks, which needs **two sources reconciled, never
+summed**: the LOCAL pool on each box (the only place a **dead listener** is visible — a registration
+that is still valid on GitHub and serving no work) and GitHub's registry (the only place a
+registration that **lost its box** is visible — a `/tmp` wipe leaves registrations with no local
+evidence, and a hand-added runner can have a listener with no registration).
+
+```bash
+bash scripts/ci_runner_fleet.sh                     # every running box, per cell, reconciled
+bash scripts/ci_runner_fleet.sh --root /opt         # when a box's installs are all under one parent
+bash scripts/ci_runner_fleet.sh --box pi-cell-3     # one cell (a label the roster does not carry is a
+                                                   # refusal, never a smaller fleet)
+```
+
+It is an **aggregator, not a second probe**: it runs `ci_runner_pool.sh status` ON each cell over the
+fleet's exec transport (`cmux vm exec`) and parses the machine-readable block that tool already
+prints, so the four facts (#2373 clause 2) come from the box itself. Output is one line per cell
+(`cell label=… read=ok host=… ncpu=… ceiling=… slots=… mem_available_mb=… floor_mb=… live=… dead=…`),
+one line per runner (`runner cell=… name=… github_name=… listener=… local=live|DEAD|ORPHANED|QUARANTINE|LIVE-QUAR|UNPROBED github=online|offline|ABSENT|unread … verdict=…`), then `registry-unclaimed` / `name-collision` / `summary`.
+
+⛔ **The claim key is the `github_name`** (the agentName in `.runner`), never the instance directory —
+measured on `pi-cell-5`, directory `gh-runner-x64-2` carries agentName `pi-runner-c5-x64-2`, so
+matching on the directory reports a healthy runner as BOTH unregistered and a phantom.
+
+⛔ **Fail-closed, per cell (#2429 clause 3).** A cell whose pool cannot be read reports
+`read=cannot-measure why=…` — never `0 runners`, the class #2381 closed one layer down. Four distinct
+readings are refused rather than published, and the summary keeps **three separate counters** for the
+three different places an operator must go (`unmeasured=` a CELL, `registry_unread=` a REGISTRY,
+`unjoinable=` an unattributable READING — on BOTH sides: a local row that could not be bound to a
+registration, and a registry row that could not be attributed to a cell, since a fleet where every
+registration is unattributable must not read as a clean one):
+
+- a **complete block behind a non-zero producer rc**. `ci_runner_pool.sh status` exits **2** for "a
+  PARTIAL MEASUREMENT" and still prints `host=`, every row and `summary` — its own words are that
+  `slots=` then "counts a PARTIAL pool". A block alone is not a measurement; the complete-reading codes
+  are 0 and 3, and anything else reports the producer's own `why=` token (e.g.
+  `why=pool-root-incomplete`) where it printed one; an rc=2 shape that prints NO refusal line (the
+  UNPROBED-quarantine case, whose probe stderr the producer discards) reports the report's own
+  `why=pool-partial`, which is named as such so it cannot be mistaken for a producer token.
+- an **unclassifiable line**. A row is recognised by its STATE column being one the producer prints;
+  any other non-blank line refuses the whole cell (`why=block-unparseable`) instead of certifying the
+  rows the parser happened to understand. Measured: an instance directory whose name contains a space
+  was split into a fabricated row, and the registration it really carried was reported as a **phantom**
+  on a fully measured fleet.
+- an **unreadable registry** — and, crucially, the JOIN to it. A local row that cannot be attributed is
+  `verdict=cannot-attribute`, never `unregistered`: one refused registry read used to print every
+  healthy runner on the box as `unregistered`, a defect fabricated from a read that never happened.
+- the GitHub side is an **allow-list**: `online` is agreement, `offline` is `github-offline`, and any
+  other value — including the **empty field** `gh … @tsv` produces for a null status — is
+  `github-unreadable`. A whitespace split collapsed that empty field to `github=false … verdict=ok`.
+
+The same fail-closed rule governs **attribution**: a registry name no cell claims is a phantom only when
+**every** requested cell was measured **and** every registry was read; while either is short — or a box was excluded by `--box` — it is
+`cannot-attribute` (the reason names which side), because that registration may be serving jobs in the
+part nobody could read. ⛔ **And the phantom claim names its REAL boundary**: the roster is the provider's
+**running** inventory (`cap_fleet_inventory` drops a `stopped` machine — an unreadable status is
+UNCLASSIFIED, not parked), so a registration held by a box the operator **parked** appears here with no
+local evidence, exactly like one that lost its box. The reason is therefore
+`no-running-cell-claims-it`, not "no measured cell claims it", and the remedy such a line invites
+(`reclaim`) must not be applied before checking `cmux vm list` for a stopped machine that will need that
+registration when it returns. A `defect` token is carried through with `=` rendered as `:`
+(`verdict=defect-tmpdir-mode:755`), so the remedy printed is the one the defect needs (`chmod 700`,
+not `restart`).
+
+⛔ **`--box` is a SCOPE, not a claim that the rest of the fleet does not exist.** The boxes it excludes
+are counted: a registration they carry is `cannot-attribute(<N>-cell-not-requested)`, never a phantom,
+so a scoped run never prints advice whose remedy is `reclaim` on a live runner, and the summary prints
+`skipped=` for it. A name carried by **more than one registry** (names are unique per repo, and two
+registries are read by default) is attributed to **neither** — but the LOCAL facts still decide first:
+such a row prints `dead-listener` / `orphaned` / `quarantine` / `defect-<token>` where those apply, and
+`cannot-attribute` only when no local fact does (the restart-vs-reclaim and restart-vs-chmod distinctions
+are not lost to an unjoinable name). Every registry row carrying it is
+`cannot-attribute(name-carried-by-more-than-one-registry)`. The per-box `status` block does not say
+which repo an install is registered to, so binding to the first matching row would compute one cell's
+verdict from another repo's registration (a false `ok`, or a false `offline`) and fire a
+`name-collision` on a healthy two-cell fleet. Exit `0` all measured and
+agreed · `2` cannot measure (outranks 3; any of the three counters non-zero) · `3` measured with a named
+defect.
+
+⚠️ **The transport is the current blocker, and it is not this tool's:** measured 2026-11-06 from
+`pi-cell-5`, `cmux vm exec <peer> -- hostname` fails for every peer (`no known daemon matches this
+route; connect with an invitation`) while `cmux vm ls` prints `running reachable linked` —
+**[#2345](https://github.com/daniel-ospina/agent-infra/issues/2345)**, whose own comments record that
+the `--carrier` mode connects fine and the `vm exec` link path simply never spends it. So on the fleet
+as it stands the report returns `cannot-measure` for every cell and exits 2: the honest reading, and
+clause 3 behaving correctly from day one. The transport is a seam (`RUNNER_FLEET_EXEC`), so the
+one-line #2345 fix lands there without touching the aggregation, attribution or exit contract. The
+tool is NOT allowed to route around it with a hand-rolled `--carrier` socket (AGENTS "Fix Broken
+Infrastructure"); its suite proves the aggregation and the reconciliation hermetically
+(`scripts/ci_runner_fleet.test.sh`), with five mutants keeping the measured gate, the producer-rc gate,
+the attribution guard, the claim key and the registry-side `unjoinable` counter honest.
+
+⚠️ Two smaller residuals, stated: the tool reads every cell **through** the transport, including the
+box it runs on (use `ci_runner_pool.sh status` for that one); and `RUNNER_FLEET_ROOTS` exists because a
+box whose installs sit under `/opt` must be read with `RUNNER_ROOT=/opt` while one under
+`/tmp/actions-runner` must not — the tool retries ONCE from the `outside=` list a `pool-root-incomplete`
+refusal names, and leaves a two-parent ambiguity unmeasured rather than picking a root.
 
 `EXIT: 0 ok · 1 usage · 2 could-not-measure/could-not-act (nothing changed, except a registration the
 message names) · 3 REFUSED, nothing changed — `add`: a gate verdict (floor/ceiling); `restart`: no
@@ -477,6 +866,122 @@ action, the age bound sweeps a stale entry and keeps a fresh one (and the operan
 threshold), a missing root is a `defect tmpdir-missing` whose printed remedy restores it, and a mutant
 with the export removed must leave the listener running under whatever temp dir the box gave it.
 
+### 8.1 The ceiling bounds ADDITION only — surplus above it is permanent until a human retires it
+
+⛔ **The ceiling is ONE-DIRECTIONAL: it bounds ADDITION. Nothing in this repo can bring a box that
+is already ABOVE it back down, and that is a live oversubscription, not a theoretical one. Do not
+read "ceiling" as a target the box converges to from either side — a box above it stays above it.**
+
+**The intended count, from the owner's own sizing** (agent-infra#2344 comment 6347825624: *"the
+sustainable counts are 3 on cell-1, 3 on cell-4, 2 on cell-3"*). ⚠️ **Two tools encode it, and they
+are not the same predicate**: `runner_autoscale.py`'s `core_ceiling` (`>=8` cores → 3, `4..7` → 2,
+`1..3` → 1) and `ci_runner_pool.sh`'s `ceil(ncpu / RUNNER_CORES_PER_SLOT)` with
+`RUNNER_CORES_PER_SLOT=3`. They agree on every box in the table and **diverge outside it**: at **7 cores** (`core_ceiling` says 2,
+the division says 3) and at **10+ cores** (`core_ceiling` caps at 3, the division keeps rising). So
+quote the tool you mean rather than "the ceiling":
+
+| box | cores | intended runner slots |
+|---|---|---|
+| cell-1 | 8 | **3** |
+| cell-4 | 8 | **3** |
+| cell-3 | 4 | **2** |
+
+The `cores` column is this doc's own §1 reading (cell-1 `cpu` = 8), not a new measurement.
+
+**The contradiction, as reported 2026-11-03 19:47Z** (a fleet reading quoted in the dispatch that
+produced this section — *not* re-measured while writing it, so treat the numbers as a report and
+re-take them before acting): cell-1 carried **five** runner listeners (`/opt/gh-runner-x64-4` …
+`-8`) against a ceiling of **three** — **167 %** of the intended CI load, on the same 8 cores as
+the agent fleet, with lanes on that box showing static logs for 12+ minutes. Five is not a
+configuration anyone chose: the header of `runner_autoscale.py` records the pool as *"whatever the
+last brief happened to ask for"* (`runnercap2/3/4/5`, `runnerrecon`), and ad-hoc additions outlive
+the briefs that made them.
+
+**Why it stays broken — three separate reasons, so no single fix closes it:**
+
+1. **`over-ceiling` is REPORT-ONLY.** `runner_autoscale.py` derives a ceiling from `core_ceiling`,
+memory **and disk** — `min(by_core, by_mem, by_disk)`, with the memory/disk arms counting runners
+already running because their bytes are already paid for — and when `live > ceil` it sets the
+verdict and *changes nothing*. (The file's own header quotes the two-arm form
+`min(core_ceiling, runners_live + headroom_by_memory)`; that is an **upper bound**, and on a
+disk-tight box the effective ceiling is lower.) The tool is an enforcer in one direction only.
+2. **Removal is an explicit NON-GOAL, not an oversight.** The same file states it will not
+"restart, relabel or remove a runner that is serving (or may be serving) a job" — correct as a
+safety property, and it is why the surplus is permanent: nothing decides *which* runner to drop or
+*when* it is safe to drop it.
+3. **`ci_runner_pool.sh reclaim` is not that verb.** `reclaim` only retires a registration
+**GitHub already deleted** (`probe_listener` rc 0 → `live=$((live + 1))`, *"not touched"*). A live
+surplus runner is **counted and skipped**, and the pass then exits **0** with `retired=0` — which
+reads as "the pool is clean" rather than as a refusal. So the one command an operator would reach
+for answers "nothing to do".
+
+**Retiring a surplus is an OPERATIONAL step with a human decision in it** — no verb in this repo
+removes a live registration, and the drain below is not one. ⚠️ **`RUNNER_ROOT` must be passed**: its
+default is `/tmp/actions-runner`, while the installs this section is about live under `/opt`, and a
+root that excludes a **LIVE** listener is a hard refusal
+(`cannot-measure why=pool-root-incomplete`, rc 2) — ⚠️ `status` prints the table it could see and
+*then* refuses. ⛔ That refusal fires **only for a LIVE listener**: when every listener outside the
+root is **DEAD** the read is silently EMPTY instead (`slots=0`, rc 0 — the caveat in §8 above),
+which is exactly the state step 3b is about — so never read a bare `status` under the default root
+as this box's pool.
+
+```bash
+# 1. LIST this box's installs — RUNNER_ROOT is REQUIRED (default root cannot see /opt)
+RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh status --all
+#    The NAME column is the instance dir's basename, so the install is /opt/<name>. STATE reads
+#    `live` / `DEAD` / `ORPHANED` / `QUARANTINE` (plus `LIVE-QUAR` / `UNPROBED` on a quarantined
+#    install). It does NOT report busy-ness — that comes from the GitHub pool read, so take it
+#    per runner and pick one that is BOTH `live` AND not busy:
+#    gh api repos/daniel-ospina/tortoise/actions/runners --jq '.runners[] | {name, status, busy}'
+#    (ci-queue.sh is NOT a substitute: it publishes one aggregate busy=N over the online runners.)
+
+# 2. STOP the listener so it takes no new job. Which command depends on how it was started:
+#    (a) systemd-managed:  sudo systemctl stop actions.runner.daniel-ospina-tortoise.<agentName>.service
+#        ⚠️ `<agentName>` is the .runner `agentName` (the GITHUB_NAME column), NOT the NAME column:
+#        on a hand-provisioned install they differ (`/opt/gh-runner-x64-1` carries
+#        agentName=pi-runner-cell4-x64-1), and a wrong name is refused as `Failed to stop …: Unit …
+#        not loaded` (older systemd: `Unit … not found`). Read the real
+#        ones with:  systemctl list-unit-files 'actions.runner.*' --no-pager
+#        (That unit is written by `svc.sh install` from `bin/actions.runner.service.template`.)
+#    (b) started by ci_runner_pool.sh: it backgrounds `run.sh` and renders NO unit, and the script
+#        has no `stop` verb — stop the pid that `status` printed for that instance instead.
+
+# 3. Confirm nothing is executing on it before removing anything:
+#    no `Runner.Worker` process in that instance's tree, and no in-flight job for it.
+
+# 3b. REMOVE the unit step 2(a) stopped — BEFORE the directory goes, because svc.sh lives IN it.
+#     Skipping this leaves an ENABLED unit whose WorkingDirectory no longer exists: systemd fails it
+#     at every boot (status=200/CHDIR) and runner_autoscale.py's own unit audit reports it on every
+#     pass until someone deletes that unit file or fixes the path with a drop-in (the audit reads
+#     unit files and their drop-ins, last `WorkingDirectory=` winning — so the finding clears when
+#     the file goes, not only when the same name is re-registered).
+(cd /opt/<name> && sudo ./svc.sh uninstall)     # ⚠️ the cd is REQUIRED, not decoration — see below
+#     `svc.sh` resolves RUNNER_ROOT=$(pwd) and its template at the relative
+#     ./bin/actions.runner.service.template, and its pre-flight ("Must run from runner root or
+#     install is corrupt") fires BEFORE the command dispatch. So `sudo /opt/<name>/svc.sh uninstall`
+#     run from any other cwd — including this repo's root — exits 1 having done NOTHING, with an
+#     error that misdirects at the install instead of at the caller's directory.
+#     (`svc.sh install` has the same requirement.)
+#     (for a 2(b) listener there is no unit — nothing to remove here)
+
+# 4. REMOVE the registration. This needs a REMOVE token, which is a different token kind from
+#    RUNNER_TOKEN (that one feeds `add` and is single-use):
+REMOVE_TOKEN="$(gh api -X POST repos/daniel-ospina/tortoise/actions/runners/remove-token --jq .token)"
+/opt/<name>/config.sh remove --token "$REMOVE_TOKEN"     # <name> from step 1's NAME column
+# then delete ONLY that instance dir; leave every other slot untouched
+```
+
+**Revert** is the ordinary add path, already floor- and ceiling-gated — and it needs the same
+`RUNNER_ROOT`, or it creates the runner under `/tmp/actions-runner` instead of `/opt`:
+`RUNNER_ROOT=/opt bash scripts/ci_runner_pool.sh add --name <name>`. ⚠️ On a box whose pristine
+release still sits under the OLD root, `add` also needs `RUNNER_TEMPLATE`: it defaults to
+`$RUNNER_ROOT/_template`, and a missing `<template>/config.sh` is `cannot-act
+why=runner-template-absent`. So pass `RUNNER_TEMPLATE=/tmp/actions-runner/_template` when that is
+where the unpacked release actually is. No bespoke restore exists, and none is needed.
+
+⛔ **Do not automate the shrink without an owner ruling.** "Fill every machine to the capacity it
+can actually sustain" decided the CEILING; it did not delegate the choice of which live registration
+to destroy, and a wrong pick cancels a running job.
 
 ## 9. The required-check reservation — so the ONE required status never queues behind advisory work
 

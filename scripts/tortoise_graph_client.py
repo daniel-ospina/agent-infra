@@ -23,6 +23,11 @@ HDRS = {
 
 _id = 0
 
+# The retirement notice a retired-but-still-answering tool appends to its payload (#3883).
+# Matched at a LINE start (the notice arrives as its own text content block, joined by `\n`), never as
+# a bare substring: a point whose CONTENT mentions retirement must not make a healthy read fail.
+RETIRED = re.compile(r"(?m)^RETIRED TOOL:.*$")
+
 # An SSE data line: `data:` at column 0, an optional single space, then the payload.
 # RFC 9110 allows no space after the colon, so `startswith("data: ")` dropped legal frames.
 SSE_DATA = re.compile(r"^data:[ \t]?")
@@ -72,7 +77,7 @@ def call(method, params, timeout=30):
         sys.exit(4)
 
 
-def tool(name, args=None):
+def tool(name, args=None, allow_empty=True):
     r = call("tools/call", {"name": name, "arguments": args or {}})
     if "error" in r:
         sys.stderr.write("GRAPH-TOOL-ERROR(%s): %s\n" % (name, json.dumps(r["error"])[:400]))
@@ -96,6 +101,43 @@ def tool(name, args=None):
     if not text.strip():
         sys.stderr.write("GRAPH-EMPTY-RESULT(%s): the tool returned no text — never read as OK\n" % name)
         sys.exit(4)
+    # ⛔ A RETIRED TOOL IS NOT A RESULT. The server keeps answering a retired tool AND appends a
+    # `RETIRED TOOL: …` notice as a SECOND text content block, which the join above folds into the
+    # payload — so `get`/`health`/`stats` printed their JSON *plus* a paragraph, and the documented
+    # contract ("prints the tool result as JSON on stdout") silently stopped holding while every exit
+    # code stayed 0 (#3883 retired `tortoise_get_point`, `tortoise_health` and
+    # `tortoise_list_pointkinds` after the verbs below were written). ⛔ AND #3883 KEPT GOING: it also
+    # retired `tortoise_overview`, the handler those first three were pointed AT, so the replacement
+    # can itself be retired out from under this file. `tortoise_graph_overview(section=…)` is the
+    # currently advertised orientation handler; verify with `tools/list`, never with this comment.
+    # Failing CLOSED here, rather than
+    # stripping the notice, is deliberate: stripping would hide the NEXT retirement behind a clean
+    # exit 0, which is the failure this whole file exists to prevent. The verbs below call the
+    # ADVERTISED handlers; this arm is what makes a future retirement loud instead of corrupt.
+    if RETIRED.search(text):
+        sys.stderr.write(
+            "GRAPH-RETIRED-TOOL(%s): the server reports this tool as RETIRED and mixes the notice into "
+            "the payload, so its answer is not the tool's result. Call the advertised handler instead "
+            "(`tortoise_graph_overview`, `tortoise_get_entity`, `tools/list`). Refusing to print it.\n" % name
+        )
+        sys.stderr.write("  server notice: %s\n" % RETIRED.search(text).group(0)[:300])
+        sys.exit(4)
+    # ⛔ AN EMPTY OBJECT IS NOT AN ANSWER EITHER. The server's not-found convention is `{}` with
+    # `isError: false` (measured on `tortoise_get_point` and `tortoise_get_entity`), so a mistyped id
+    # printed `{}` and exited 0 — a lane asking "did the point land?" got a green from a call that
+    # found nothing. `allow_empty=False` is set by the read-one-entity verb; a LIST verb may legally
+    # answer `[]`, so this cannot be a blanket rule.
+    if not allow_empty:
+        try:
+            parsed = json.loads(text)
+        except ValueError:
+            parsed = None
+        if parsed in ({}, []):
+            sys.stderr.write(
+                "GRAPH-EMPTY-RESULT(%s): the tool answered %s — nothing matched. Never read as OK\n"
+                % (name, text.strip()[:40])
+            )
+            sys.exit(4)
     return text
 
 
@@ -106,7 +148,12 @@ def main(argv):
     verb, rest = argv[0], argv[1:]
 
     if verb == "health":
-        print(tool("tortoise_health"))
+        # ⛔ `tortoise_health` is RETIRED (#3883): it still answers, but is no longer advertised and
+        # appends a retirement notice to its payload. `tortoise_graph_overview(section="health")` is
+        # the advertised handler and returns the SAME object (measured live at a 31248-point graph
+        # size — `tools/list` advertises `tortoise_graph_overview` and NOT `tortoise_overview`, which
+        # #3883 also retired; calling the retired name made this verb exit 4 on every box).
+        print(tool("tortoise_graph_overview", {"section": "health"}))
         return 0
 
     if verb == "search":
@@ -121,11 +168,18 @@ def main(argv):
         if not rest:
             sys.stderr.write("usage: tortoise-graph.sh get <point-id>\n")
             return 2
-        print(tool("tortoise_get_point", {"point_id": rest[0]}))
+        # ⛔ The ADVERTISED handler is `tortoise_get_entity(id, type)` — `tortoise_get_point` is
+        # RETIRED (#3883) and mixes its retirement notice into the payload, so this verb printed a
+        # point object followed by a paragraph. `id` is the parameter name on both; `point_id` is not
+        # a parameter of any tool on the surface (it fails argument validation), which is why this
+        # verb was dead before. A `{}` answer means NOT FOUND, not "here is your point".
+        print(tool("tortoise_get_entity", {"id": rest[0], "type": "point"}, allow_empty=False))
         return 0
 
     if verb == "stats":
-        print(tool("tortoise_list_pointkinds"))
+        # also retired (#3883); the `pointkinds` section is the advertised equivalent and returns the
+        # identical `[{"kind": …, "count": …}, …]` payload.
+        print(tool("tortoise_graph_overview", {"section": "pointkinds"}))
         return 0
 
     if verb in ("evidence", "decision"):
@@ -183,7 +237,12 @@ def main(argv):
                 sys.exit(4)
             print(tool("tortoise_create_operator", {
                 "op_type": "IMPL", "source_id": src,
-                "target_ids": [to], "label": pred, "direction": "unidirectional",
+                # ⛔ `tortoise_create_operator` takes
+                # (op_type, source_id, target_ids, direction, semantics) — there is NO `label`
+                # parameter on the tool, so passing one drops the predicate (or is rejected AFTER
+                # the point was already written, which reports a partial success). The predicate
+                # goes in `semantics`, whose closed vocabulary is what also resolves direction.
+                "target_ids": [to], "semantics": pred, "direction": "unidirectional",
             }))
         return 0
 

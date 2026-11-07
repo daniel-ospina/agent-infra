@@ -74,7 +74,44 @@ const unquote = (s) => {
 // (YAML 1.1 parses a bare `on` as the boolean true, and some formatters quote it).
 function onRegion(text, file) {
   const lines = text.split("\n");
-  const start = lines.findIndex((raw) => /^(?:"on"|'on'|on):[ \t]*(?:#.*)?$/.test(raw));
+  // ⛔ THE KEY NAME IS PARSED, NOT MATCHED AGAINST A LIST OF SPELLINGS. `/^(?:"on"|'on'|on):/` demanded
+  // the colon abutting the name, so `on :` — the SAME key in YAML — slipped past the duplicate guard
+  // below and the reader inspected the FIRST block: appending `on :` carrying `push:` read green with
+  // an effective key set of `['push']` (measured), which is the surface the 7f pin exists for. KEY_RE
+  // already tolerates `[ \t]*:` and every quoting, so the name is read out of the line.
+  const topLevelKeyName = (raw) => {
+    const m = KEY_RE.exec(raw);
+    return m && m[1].length === 0 ? (m[2] ?? m[3] ?? m[4] ?? "").trim() : null;
+  };
+  const onStarts = lines.map((raw, i) => (topLevelKeyName(raw) === "on" ? i : -1)).filter((i) => i >= 0);
+  // ⛔ AND A DUPLICATE TOP-LEVEL `jobs:` IS THE SAME ROOT AT THE LEVEL ABOVE THE JOB ID. YAML keeps the
+  // LAST `jobs:` and discards the rest, so a second block redefines `pipeline-compliance` with no
+  // `if:` at all — and every header in it sits at the same indent, so a reader that only counted job
+  // ids inside the FIRST block found one header, skipped the guard, and read green over an effective
+  // `if` of ABSENT (measured). Counting the container is what makes the job-id check meaningful.
+  const jobsStarts = lines
+    .map((raw, i) => (topLevelKeyName(raw) === "jobs" ? i : -1))
+    .filter((i) => i >= 0);
+  if (jobsStarts.length > 1) {
+    refuse(
+      `${file}: \`jobs:\` appears ${jobsStarts.length} times (lines ${jobsStarts
+        .map((i) => i + 1)
+        .join(", ")}). YAML keeps only the LAST, so no job block read below is the one in force — the guard is UNVERIFIED.`
+    );
+  }
+  // ⛔ A DUPLICATE TOP-LEVEL `on:` IS LAST-WINS IN YAML, and a first-match reader reads the WRONG
+  // block: appending a second `on:` carrying `push:` leaves this pin inspecting the first one and
+  // reporting green (measured: rc=0 while the effective key set was ['push', 'pull_request']). Same
+  // duplicate-key/last-wins root as the duplicate JOB id below, and the same answer — refuse, because
+  // which block is in force is not something this reader can answer (rc 2).
+  if (onStarts.length > 1) {
+    refuse(
+      `${file}: \`on:\` appears ${onStarts.length} times (lines ${onStarts
+        .map((i) => i + 1)
+        .join(", ")}). YAML keeps only the LAST, so which trigger set is in force is not something this reader can answer — the trigger scope is UNVERIFIED.`
+    );
+  }
+  const start = onStarts.length === 1 ? onStarts[0] : -1;
   if (start < 0) refuse(`${file}: no top-level \`on:\` key — nothing to read`);
   const region = [];
   for (let i = start + 1; i < lines.length; i += 1) {
@@ -99,12 +136,56 @@ const KEY_RE = /^([ \t]*)(?:"([^"]*)"|'([^']*)'|([A-Za-z0-9_.-]+))[ \t]*:(.*)$/;
 // and the content lock untouched — `workflow-lock.yml` is not one of the three locked paths), so
 // `edited` was silently re-addable one line away from the assertion that says it is gone. A
 // `pull_request:` trigger on `workflow-lock.yml` would ALSO collapse its trust split.
-function onKeys(region, childIndent) {
-  return region
-    .filter((l) => l.indent === childIndent)
-    .map((l) => keyOf(l))
-    .filter((k) => k !== null)
-    .map((k) => k.key);
+function onKeys(region, childIndent, file = PC_FILE) {
+  const own = region.filter((l) => l.indent === childIndent);
+  // ⛔ A LINE THE READER CANNOT CLASSIFY IS CANNOT-VERIFY, NEVER A SILENT DROP. `.filter((k) => k !==
+  // null)` discarded every line KEY_RE did not match — and YAML's EXPLICIT-KEY syntax (`? push`) is
+  // legal, so a trigger written that way was invisible while being effective (measured: PyYAML key set
+  // `['workflow_call','pull_request','issue_comment','push']`, gate read green). Dropping an
+  // unparsed line is how a gate reports "as decided" about a file it did not fully read.
+  const names = own.map((l) => {
+    const k = keyOf(l);
+    if (k === null) {
+      refuse(
+        `${l.no === undefined ? "" : `line ${l.no}: `}cannot read the key on ${JSON.stringify(
+          l.raw
+        )} under \`on:\` (YAML explicit-key syntax and other shapes this reader does not model). The trigger set is therefore UNVERIFIED.`
+      );
+    }
+    return k.key;
+  });
+  // ⛔ A DUPLICATE TRIGGER NAME IS LAST-WINS TOO — AND IT IS ONE LEVEL ABOVE THE FILTER KEYS, so it
+  // discards the WHOLE block those pins read. Every other last-wins level is refused here (top-level
+  // `on:`, `jobs:`, the job id, a job's `if:`, and the filter keys via `singleKey`); a second
+  // `pull_request:`/`pull_request_target:`/`issue_comment:` block was the remaining hole, and it is the
+  // widest one: an appended second `pull_request:` carrying `branches: [develop]` + `types: [edited]`
+  // makes the required context UNSATISFIABLE on `main` while the reader answers about the FIRST block
+  // and exits 0 (measured, all three files). `trigger()` resolves a name with `findIndex`, i.e. first
+  // match, so nothing downstream can catch it.
+  const seen = new Map();
+  for (let i = 0; i < names.length; i++) {
+    if (seen.has(names[i])) {
+      // ⛔ THE *FIRST* LINE IS THE ONE TO NAME FIRST, AND THE REPEAT IS NAMED TOO. Reporting the
+      // DUPLICATE own line as "first" is a diagnostic that points at the block YAML DISCARDS, so an
+      // operator deleting "the one at line N" removes the block that is NOT in force and silently
+      // changes the effective trigger (measured: the message said "first at line 95" for a first
+      // declaration at line 36).
+      const first = seen.get(names[i]);
+      const where =
+        first.no === undefined
+          ? own[i].no === undefined
+            ? ""
+            : ` (repeated at line ${own[i].no})`
+          : ` (first at line ${first.no}${
+              own[i].no === undefined ? "" : `; repeated at line ${own[i].no}`
+            })`;
+      refuse(
+        `${file}: \`on:\` declares \`${names[i]}:\` more than once${where}. YAML keeps only the LAST block and discards the rest, so which \`${names[i]}:\` is in force is UNANSWERABLE — a reader that takes the first would answer about the block that is NOT in force. Re-run after the duplicate is resolved.`
+      );
+    }
+    seen.set(names[i], own[i]);
+  }
+  return names;
 }
 
 function keyOf(line) {
@@ -155,26 +236,86 @@ function valueLinesFor(entry, lines) {
   return out;
 }
 
+// ⛔ A TRAILING YAML COMMENT IS NOT PART OF THE VALUE. YAML starts a comment at a `#` PRECEDED BY
+// WHITESPACE (outside quotes), so `- opened  # first gate run` is the item `opened`. Reading the whole
+// rest of the line fabricated a list like `[opened # first gate run, synchronize # every push]`, which a
+// SET comparison then reported as "LOST [opened, synchronize]" — rc=1 over a correct workflow, the
+// same "the printed list was FABRICATED" class the value-line reader was fixed for.
+// ⛔ QUOTE STATE IS TRACKED ACROSS THE WHOLE SCALAR, not per character-pair. `indexOf(close, 1)` looked
+// right and is not: YAML's single-quoted escape is a DOUBLED quote, so `'it''s # x'` is the value
+// `it's # x` and a first-match scan truncated it to `it`. A corrupted item is then reported as a
+// missing/extra member — the over-block direction this whole function exists to remove.
+// ⛔ AND A SCALAR THAT *BEGINS* WITH `#` IS A COMMENT, i.e. NO ITEM AT ALL (`- #x` in a block sequence,
+// `types: # note` before a nested sequence). Returning it literally fabricated the item `#x`.
+function stripYamlComment(s) {
+  const t = String(s);
+  if (t.trimStart().startsWith("#")) return "";
+  let quote = null;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (quote) {
+      if (quote === '"' && ch === "\\") {
+        i++;
+        continue;
+      }
+      if (ch === quote) {
+        // A doubled quote inside a SINGLE-quoted scalar is the escape, not the close.
+        if (quote === "'" && t[i + 1] === "'") {
+          i++;
+          continue;
+        }
+        quote = null;
+      }
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      continue;
+    }
+    if (ch === "#" && i > 0 && /\s/.test(t[i - 1])) return t.slice(0, i).trim();
+  }
+  return t;
+}
+
 // readList(entry, valueLines) — a flow list on the key's own line, or a block sequence below it.
 // Returns string[]; refuses anything else (see the exit-2 note in the header).
 function readList(entry, valueLines) {
-  const value = entry.value.trim();
+  const value = stripYamlComment(entry.value.trim()).trim();
   if (value) {
     const m = /^\[(.*)\]$/.exec(value);
     if (!m) refuse(`line ${entry.line.no}: the value of \`${entry.key}:\` is ${JSON.stringify(value)} — not a flow list`);
     return m[1]
       .split(",")
-      .map(unquote)
+      .map((s) => unquote(stripYamlComment(s.trim()).trim()))
       .filter((s) => s.length > 0);
   }
   const items = [];
   for (const l of valueLines) {
     const m = /^[ \t]*-[ \t]+(.*)$/.exec(l.raw);
     if (!m) refuse(`line ${l.no}: expected a \`- item\` block-sequence entry, got ${JSON.stringify(l.raw)}`);
-    const v = unquote(m[1]);
+    const v = unquote(stripYamlComment(m[1]).trim());
     if (v) items.push(v);
   }
   return items;
+}
+
+// singleKey(keys, key, where) — the trigger's ONE `key:` entry, or a refusal if it declares two.
+// ⛔ YAML IS LAST-WINS, SO A DUPLICATE MAKES THE QUESTION UNANSWERABLE — and a `findIndex` reader
+// answers it with the FIRST copy instead, which is the wrong block. Measured: appending a second
+// `types:` (`- created`) under `issue_comment:` leaves the effective set `[created]` (PyYAML) and the
+// read of the first block reported the decided set; same for a second `branches:` (`- develop`). This
+// file already closes last-wins at four other levels (`on:`, `jobs:`, the job id, a job's `if:`), so
+// the same verdict is owed here: CANNOT-VERIFY, never a green read of the wrong block. (The repo's own
+// parser refuses a duplicate key outright — `scripts/workflow-yaml.mjs` throws on it — so this can only
+// fire on a file that is already broken.)
+function singleKey(keys, key, where, file = PC_FILE) {
+  const hits = keys.filter((k) => k.key === key);
+  if (hits.length > 1) {
+    refuse(
+      `${file}: \`${where}\` declares \`${key}:\` ${hits.length} times. YAML keeps the LAST one and discards the rest, so which ${key} set is in force here is UNANSWERABLE — and a reader that takes the first would answer about the wrong block. Re-run after the duplicate is resolved.`
+    );
+  }
+  return hits[0] ?? null;
 }
 
 // trigger(region, childIndent, name, file) — the named trigger's filter keys, or a refusal.
@@ -207,6 +348,257 @@ function extraSet(names, allowed) {
   return names.filter((n) => !allowed.includes(n));
 }
 
+// jobBlock(text, name) — the lines of ONE job under `jobs:`, from its `  <name>:` header up to the next
+// job header (or end of file). Needed because this file asserts things about a SPECIFIC job, and a
+// whole-file `includes()`/regex is satisfied by an identical line in a DIFFERENT job — measured here:
+// `if: github.event_name != 'issue_comment'` appears on BOTH `pipeline-compliance` and
+// `workflow-drift`, so a text-wide match would have reported the required job guarded while its own
+// guard was gone. Scoping by job is what makes the guard assertion non-vacuous.
+// jobsBounds(lines) — [start, end) of the single top-level `jobs:` block.
+//
+// ⛔ A 2-SPACE KEY IS NOT NECESSARILY A JOB. `permissions:` declares its children at two spaces too
+// (`  contents: read`), so scanning the whole file for "a key at indent 2" read `contents`, `issues`
+// and `pull-requests` as jobs — harmless while the check only compared names, but a refusal keyed on a
+// job HEADER's shape fired on `contents: read` and red the live workflow (measured). Job headers are the
+// indent-2 keys INSIDE `jobs:`, and nothing else.
+function jobsBounds(lines) {
+  let start = -1;
+  for (let i = 0; i < lines.length; i += 1) {
+    const m = KEY_RE.exec(lines[i]);
+    if (m && m[1].length === 0 && (m[2] ?? m[3] ?? m[4]) === "jobs") {
+      start = i;
+      break;
+    }
+  }
+  if (start < 0) return null;
+  let end = lines.length;
+  for (let i = start + 1; i < lines.length; i += 1) {
+    const m = KEY_RE.exec(lines[i]);
+    if (m && m[1].length === 0) {
+      end = i;
+      break;
+    }
+  }
+  return { start, end };
+}
+
+function jobBlock(text, name) {
+  const lines = String(text ?? "").split("\n");
+  // ⛔ THE START IS FOUND BY THE SAME RULE AS THE TERMINATOR: the indent SHAPE, then the key NAME read
+  // out of the line — never an enumerated list of header spellings. A spellings regex
+  // (`  name:`, `  "name":`) is the exact anti-pattern the terminator comment below calls out, and it
+  // reopened the duplicate-job-id fail-open ONE CHARACTER away: `  pipeline-compliance :` (space before
+  // the colon), `  pipeline-compliance: &anchor` and `  pipeline-compliance: {name: x}` all matched the
+  // TERMINATOR but not the start rule, so `starts` saw a single header, the duplicate guard was
+  // skipped, and the reader answered about the FIRST (guarded) block while YAML's effective job was
+  // the LAST one — with `if: true`, or with no `if:` at all. Measured: rc=0 over an effective `if` of
+  // `True`. KEY_RE is the one key reader this file already uses; it tolerates quotes, whitespace
+  // before the colon, and any value shape.
+  const bounds = jobsBounds(lines);
+  const inJobs = (i) => bounds !== null && i > bounds.start && i < bounds.end;
+  const nameOfJobHeader = (line) => {
+    const m = KEY_RE.exec(line);
+    if (!m || m[1].length !== 2) return null; // job headers sit at 2 spaces, one level under `jobs:`
+    return (m[2] ?? m[3] ?? m[4] ?? "").trim();
+  };
+  // ⛔ AND AN UNCLASSIFIABLE 2-SPACE LINE IS CANNOT-VERIFY, for the same reason as `onKeys`: YAML's
+  // explicit-key form (`  ? pipeline-compliance` / `  : {if: true}`) is a legal job header this reader
+  // does not model, and skipping it made a duplicate job id — and therefore an effective `if` of
+  // `True` — invisible. Anything at a job header's own indent that is not a key we can read means the
+  // job set is not fully understood, and a partially-read job set must not answer "green".
+  lines.forEach((l, i) => {
+    if (!inJobs(i)) return; // outside `jobs:` a 2-space key is some other block's child
+    if (nameOfJobHeader(l) !== null) return;
+    const m = KEY_RE.exec(l);
+    if (m && m[1].length === 2) return; // a readable sibling key: fine
+    // ⛔ NOT GATED ON THE HEADER INDENT. Gating on 2 spaces refused `  ? push` (a trigger) and
+    // `  ? pipeline-compliance` (a job id) but left the JOB KEY indent (4) unguarded, so
+    //     if: github.event_name != 'issue_comment'
+    //     ? if
+    //     : true
+    // was neither matched by `ownRe` NOR refused — gate ok/rc=0 while YAML's effective `if` is `True`,
+    // i.e. the required job runs on the comment event. That is the same fail-open one indent below the
+    // shape that was already refused. Both indents that can hold a KEY, plus the step-item indent,
+    // are refused here because an explicit key is never modelled anywhere in this reader.
+    if (/^ {2,6}[?:](?:\s|$)/.test(l)) {
+      refuse(
+        `line ${i + 1}: cannot read the key ${JSON.stringify(
+          l
+        )} — YAML explicit-key syntax is not modelled, so the job is UNVERIFIED.`
+      );
+    }
+  });
+  const starts = lines
+    .map((l, i) => ({ l, i }))
+    .filter(({ l, i }) => inJobs(i) && nameOfJobHeader(l) === name)
+    .map(({ i }) => i);
+  // ⛔ A DUPLICATE JOB ID IS LAST-WINS in YAML, and a first-match reader answers about the WRONG job.
+  // Measured: a second `  pipeline-compliance:` appended with no `if:` at all leaves the effective
+  // `if` ABSENT — i.e. the job RUNS on the comment event — while this reader inspected the FIRST
+  // block, found the guard, and reported ok/rc=0. The same class the duplicate-`if:` arms close one
+  // level down; one level up it was open. A reader that cannot answer the question it was asked must
+  // say so (rc 2), never answer "green".
+  if (starts.length > 1) {
+    refuse(
+      `${PC_FILE}: \`${name}\` appears as a JOB ID ${starts.length} times (lines ${starts
+        .map((i) => i + 1)
+        .join(", ")}). YAML keeps only the LAST, so which block is in force is not something this reader can answer — the guard is UNVERIFIED.`
+    );
+  }
+  const start = starts.length === 1 ? starts[0] : -1;
+  // ⛔ Cannot-locate is NOT "the guard is missing". A reader that cannot find the job it was asked
+  // about has to say so (rc 2), because reporting it as a guard FINDING sends the reader after a
+  // fault that does not exist.
+  if (start < 0) refuse(`${PC_FILE}: no \`${name}\` job found under \`jobs:\` — cannot verify its \`if:\``);
+  let end = bounds ? Math.min(lines.length, bounds.end) : lines.length;
+  for (let i = start + 1; i < end; i++) {
+    // ⛔ ANY 2-space-indent YAML key ends the job — matched by INDENT, not by header SHAPE. An
+    // enumerated-shape terminator (`bare`, `# comment`, `"quoted"`) is a list of the spellings someone
+    // thought of, and every spelling it omits lets the block over-extend into a LATER job, where that
+    // job's guard satisfies an assertion about THIS one — the fail-open direction. Measured: with the
+    // guard deleted and the two intervening headers written as flow mappings
+    // (`  revalidate-on-issue-comment: {name: r}`), an enumerated terminator matched neither, the block
+    // ran on into `workflow-drift`'s guard, and the arm read ok/rc=0.
+    // A job's own children live at 4 spaces, so a non-space, non-`#`, non-`-` character at column 2 is
+    // a sibling key and nothing else.
+    if (/^ {2}[^\s#-]/.test(lines[i])) { end = i; break; }
+  }
+  return lines.slice(start, end).join("\n");
+}
+
+// jobKeyIs(block, key, valueRe) — does THIS job's own `key:` line (at the job's key indent, i.e. one
+// level deeper than the job header) match `valueRe`?
+//
+// ⛔ NOT a text search, and the difference is a fail-open rather than tidiness. `^\s*if:` matches a
+// STEP's `if:` just as well as the job's, so a whole-block text match reports the required job guarded
+// while the job itself carries no `if:` at all and therefore RUNS on the comment event. Measured: move
+// `if: github.event_name != 'issue_comment'` from the job to its first step and a text-wide matcher
+// returns ok/rc=0. The key indent is what distinguishes the two, so it is what is asserted.
+// jobIfExprs(block) — the YAML-FOLDED value of each own-level `if:` in a job block, ONE entry per
+// occurrence. A separate reader from `jobKeyIs` on purpose: that one refuses an `if: >-` BLOCK SCALAR
+// for the REQUIRED job's guard (a `>-` body of `guard` + `|| true` folds to TRUE, and its arms pin the
+// refusal), while the revalidation job's own `if:` IS a block scalar in the live file. Stripping a
+// leading block indicator here does not weaken that refusal: it is applied to a DIFFERENT job, whose
+// predicates are required as a conjunction and whose disjunctions are refused below.
+// ⛔ AND "OWN-LEVEL" MEANS THE JOB'S KEY INDENT, NOT "ANYTHING DEEPER THAN THE HEADER". A step's
+// `if:` is 8 spaces deep, so a `keyIndent > headerIndent` test read a STEP guard as the JOB's — in
+// BOTH directions, each measured: (a) delete the job's `if:` and move the same conjunction onto its
+// first step and the job RUNS on every event while this reader reported green (fail-open); (b) put an
+// unrelated `if: always()` on a step and the reader reported a FINDING claiming the JOB's guard is
+// wrong (false block, and a false statement about the job). The job's own keys are all at ONE indent —
+// the shallowest key line deeper than the header, exactly the way `jobKeyIs` derives it — so that is
+// what a job-level `if:` must equal.
+function jobIfExprs(block) {
+  const lines = String(block ?? "").split("\n");
+  const headerIndent = (lines[0] ?? "").length - (lines[0] ?? "").trimStart().length;
+  const ownIndents = lines
+    .slice(1)
+    .map((l) => KEY_RE.exec(l))
+    .filter((m) => m && m[1].length > headerIndent)
+    .map((m) => m[1].length);
+  const jobKeyIndent = ownIndents.length ? Math.min(...ownIndents) : headerIndent + 2;
+  const out = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = /^(\s*)(?:"if"|'if'|if)\s*:(.*)$/.exec(lines[i]);
+    if (!m) continue;
+    const keyIndent = m[1].length;
+    // A STEP's `if:` (deeper than the job's own key indent) is not the job's guard, and an `if:` at or
+    // left of the header belongs to `jobs:` or to the previous job.
+    if (keyIndent !== jobKeyIndent) continue;
+    let v = m[2].trim();
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j];
+      if (l.trim() === "" || /^\s*#/.test(l)) continue;
+      if (l.length - l.trimStart().length <= keyIndent) break;
+      v += (v === "" ? "" : " ") + l.trim();
+    }
+    v = v.replace(/^(?:[>|][+-]?\d?)\s*/, "").trim();
+    // ⛔ A TRAILING YAML COMMENT ON THE GUARD IS NOT PART OF THE EXPRESSION — and here it decides the
+    // verdict. This reader folds the value and then scans it for `||` / bare `true` / `false`, so a
+    // comment whose WORDING contains one of those words turned a byte-for-byte correct guard into a
+    // FINDING that quoted the comment back as if it were the expression (measured: `… = null  # holds
+    // true only for plain issues` -> rc=1; the same line commented `# owns the comment event` -> rc=0).
+    // Every other reader in this file already strips a comment (`PC_COMMENT_GUARD`'s `(?:\s+#.*)?`, and
+    // `stripYamlComment` for lists); this one is stripped by the SAME helper, quote-aware, so `#` inside
+    // a quoted whole-scalar value survives.
+    v = stripYamlComment(v).trim();
+    v = v.replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
+    out.push(v);
+  }
+  return out;
+}
+
+function jobKeyIs(block, key, valueRe) {
+  const lines = String(block ?? "").split("\n");
+  const header = lines[0] ?? "";
+  // ⛔ DERIVED FROM THE FIRST KEY LINE, not `header indent + 2`: YAML requires only that a job's
+  // children are DEEPER than the header, so a body indented to 6 spaces computed a 4-space key indent,
+  // matched no `if:`, and reported a guarded job as unguarded (measured rc=1 on a correct tree).
+  const firstKey = lines
+    .slice(1)
+    .map((l) => KEY_RE.exec(l))
+    .find((m) => m && m[1].length > (header.length - header.trimStart().length));
+  const keyIndent = " ".repeat(
+    firstKey
+      ? firstKey[1].length
+      : header.length - header.trimStart().length + 2
+  );
+  // ⛔ The key is matched in EVERY quoting YAML permits (`if:`, `"if":`, `'if':`). Matching only the
+  // bare spelling left a duplicate written `"if": true` invisible to `every()` — PyYAML confirms that
+  // is the value the workflow evaluates — so the gate read green over an `if: true`.
+  // ⛔ …AND YAML ALSO PERMITS WHITESPACE BEFORE THE COLON (`if :`), which is the SAME key. Requiring the
+  // colon hard against the name left a duplicate `if : true` invisible to `every()` — one space away
+  // from the quoted duplicate this list already closes — so the gate read ok/rc=0 over a job whose
+  // effective `if` is `True` (measured, PyYAML confirms `True`).
+  const ownRe = new RegExp(`^${keyIndent}(?:"${key}"|'${key}'|${key})\\s*:`);
+  // ⛔ And the VALUE is the YAML-FOLDED scalar, not the first line. A plain scalar continues on any
+  // following line indented deeper than the key, so
+  //
+  //     if: github.event_name != 'issue_comment'
+  //       || true
+  //
+  // evaluates to `<guard> || true` and the job RUNS on the comment event — while a line-by-line
+  // matcher sees only the first line, which is the guard verbatim, and reports green. Measured under
+  // PyYAML: the folded value is "… != 'issue_comment' || true" and a line-wise match returned ok/rc=0.
+  // Folding here means that continuation is examined by the SAME rule as the one-line form. Comment
+  // lines are skipped because YAML excludes them from the scalar, and an indent at or left of the key
+  // ends the value.
+  const values = [];
+  for (let i = 0; i < lines.length; i++) {
+    const m = ownRe.exec(lines[i]);
+    if (!m) continue;
+    let value = lines[i].slice(m[0].length).trim();
+    for (let j = i + 1; j < lines.length; j++) {
+      const l = lines[j];
+      if (l.trim() === "" || /^\s*#/.test(l)) continue;
+      if (l.length - l.trimStart().length <= keyIndent.length) break;
+      // No separator when the key's own line carried no value: a leading space can never match the
+      // anchored `wholeRe` below, so `if:` with the guard on the NEXT line — YAML's value being exactly
+      // the guard — was a FALSE BLOCK on a correctly guarded tree (measured: rc=1, YAML
+      // `"… != 'issue_comment'"`).
+      value += (value === "" ? "" : " ") + l.trim();
+    }
+    // ⛔ A WHOLE-SCALAR QUOTED value is the SAME value. `if: "!cancelled() && <guard>"` parses to
+    // exactly the unquoted expression (PyYAML agrees), and quoting the whole scalar is how a
+    // `!`-leading expression is made legal YAML — so refusing it was a false block on a tree that is
+    // guarded. Peel one matching pair of quotes before matching; the inner text still has to match
+    // the whole-expression rule, so this cannot admit anything the unquoted form would not.
+    value = value.replace(/^(['"])([\s\S]*)\1$/, "$2").trim();
+    values.push(value);
+  }
+  // `every()` on a NON-EMPTY list: a duplicate key is caught by requiring EVERY own occurrence to
+  // match, and the `length > 0` half keeps "no such key at all" a FINDING rather than a vacuous pass
+  // (`[].every()` is `true`).
+  //
+  // ⛔ AND THE WHOLE VALUE MUST MATCH — `^(?:…)$`, never a bare `.test()`. The guard pattern's own
+  // shape is a PREFIX (the guard, then an optional `&&` tail), so an unanchored test accepts
+  // `github.event_name != 'issue_comment' || true` by matching the prefix and ignoring the tail —
+  // undoing the very fold above that exists to expose that tail. Measured: unanchored, the folded-`||`
+  // mutant read ok/rc=0.
+  const wholeRe = new RegExp(`^(?:${valueRe.source})\\s*$`);
+  return values.length > 0 && values.every((v) => wholeRe.test(v));
+}
+
 // ── the two facts this file owns ─────────────────────────────────────────────────────────────
 
 function checkWorkflowLock() {
@@ -214,7 +606,7 @@ function checkWorkflowLock() {
   const { region, childIndent } = onRegion(text, WL_FILE);
   const t = trigger(region, childIndent, "pull_request_target", WL_FILE);
 
-  const onSet = onKeys(region, childIndent);
+  const onSet = onKeys(region, childIndent, WL_FILE);
   const extraOn = extraSet(onSet, ["pull_request_target"]);
   if (extraOn.length) {
     findings.push(
@@ -237,14 +629,19 @@ function checkWorkflowLock() {
   // The trigger must stay a pull_request_target: it is the reason the job runs from a copy the PR
   // cannot rewrite (see the workflow's own header). Losing it is not a narrowing, it is the gate
   // existing at all.
-  const typesIdx = t.keys.findIndex((k) => k.key === "types");
-  if (typesIdx < 0) {
+  // A DUPLICATE `types:` IS LAST-WINS TOO — routed through `singleKey` so the first copy can never be
+  // answered for the block YAML actually keeps.
+  const wlTypesEntry = singleKey(t.keys, "types", "pull_request_target:", WL_FILE);
+  if (!wlTypesEntry) {
     findings.push(
       "workflow-lock.yml declares no `types:` under `pull_request_target:`. GitHub's default set happens to be the same three types, but an implicit default carries no artifact: the decision recorded above the trigger stops being readable, and the next editor cannot tell a deliberate three-type set from an inherited one. Write `types: [opened, synchronize, reopened]`."
     );
     return;
   }
-  const entry = t.keys[typesIdx];
+  // ⛔ THE ENTRY `singleKey` RETURNED IS THE ONE READ — not `t.keys[findIndex(...)]`. Binding the
+  // result and then re-finding the key is the first-match read the duplicate rule exists to forbid,
+  // one refactor away from answering about the block YAML discarded.
+  const entry = wlTypesEntry;
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`workflow-lock pull_request_target types: ${items.join(", ") || "<none>"}\n`);
@@ -271,7 +668,7 @@ function checkHarnessSingleSource() {
   const { region, childIndent } = onRegion(text, HSS_FILE);
   const t = trigger(region, childIndent, "pull_request", HSS_FILE);
 
-  const onSet = onKeys(region, childIndent);
+  const onSet = onKeys(region, childIndent, HSS_FILE);
   const extraOn = extraSet(onSet, ["pull_request"]);
   if (extraOn.length) {
     findings.push(
@@ -290,7 +687,9 @@ function checkHarnessSingleSource() {
       `harness-single-source.yml's \`pull_request:\` declares [${extraHss.join(", ")}] besides \`paths:\`. Each of those is a COVERAGE NARROWING on a guard whose whole job is to red a reappearing fork or a drifting deployed copy: \`types: [opened]\` drops every \`synchronize\` (so no later head is ever measured), and \`branches-ignore: [main]\` stops the job firing on any PR in this repo at all — while the path arm stays true. The trigger's only filter is \`paths:\`.`
     );
   }
-  const pathsIdx = t.keys.findIndex((k) => k.key === "paths");
+  // A DUPLICATE `paths:` IS LAST-WINS TOO — see `singleKey`.
+  const hssPathsEntry = singleKey(t.keys, "paths", "pull_request:", HSS_FILE);
+  const pathsIdx = hssPathsEntry ? t.keys.indexOf(hssPathsEntry) : -1;
   const ignoreIdx = t.keys.findIndex((k) => k.key === "paths-ignore");
   if (ignoreIdx >= 0) {
     findings.push(
@@ -327,6 +726,227 @@ function checkHarnessSingleSource() {
 // marker that `record-review.sh` writes AFTER the last push. Removing it there is the mistake this
 // change most invites ("finish the job"), and it would be a silent fail-open: a forged
 // `verdict=clean-micro` marker would ride a stale green check to merge.
+// flowHeaderText(headerValue, lines, i) — the whole of a flow mapping that STARTS on line i.
+//
+// ⛔ A FLOW MAPPING IS NOT CONFINED TO ITS HEADER LINE. `shadow: {` … `}` may run over several lines, so
+// inferring "no `name:` inside it" from the header line's own text is unsound exactly when the mapping
+// continues: the appended block `shadow: {` / `name: pipeline-compliance,` / `}` puts the context name
+// on a following line, the header text does not contain it, and skipping the job made a real second
+// minter invisible — gate ok/rc=0 while a comment event could satisfy the required context (measured).
+// So the header's flow mapping is read to its closing brace first, and `complete` records whether this
+// reader could see the whole of it.
+function flowHeaderText(headerValue, lines, i) {
+  const depth = (s) => {
+    let d = 0;
+    let q = null;
+    for (let k = 0; k < s.length; k += 1) {
+      const ch = s[k];
+      if (q) {
+        if (ch === q) q = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'") q = ch;
+      else if (ch === "{") d += 1;
+      else if (ch === "}") d -= 1;
+    }
+    return d;
+  };
+  let text = String(headerValue ?? "");
+  let d = depth(text);
+  for (let j = i + 1; j < lines.length && d > 0; j += 1) {
+    text += " " + lines[j];
+    d = depth(text);
+  }
+  return { complete: d === 0, text };
+}
+
+// requiredContextJobId(text) — the JOB ID whose `name:` is the required status context.
+//
+// ⛔ BY NAME, AND IT MUST BE UNIQUE. The required context is a NAME (the workflow's header says main
+// branch protection requires exactly `pipeline-compliance`), so the reader has to resolve the name to
+// the job that mints it. Two jobs minting the same context — one guarded, one not — means the comment
+// event satisfies the required context through the unguarded one while every assertion about the
+// guarded job's own `if:` still passes. Measured: rc=0 with a shadow job `name: pipeline-compliance,
+// if: True`. Zero or several matches is a refusal, never a guess.
+// yamlScalar(raw) — the scalar a `key: <raw>` line evaluates to, or null when this reader does not
+// model the shape.
+//
+// ⛔ "THE SAME STRING AS THE TEXT" IS NOT THE SAME AS "THE SAME VALUE". Reading `name:` out of the raw
+// line made a trailing comment (`name: pipeline-compliance  # mints the context`) a DIFFERENT context,
+// so that job became an invisible minter and a shadow declaring the required context went uncounted —
+// rc=0 while the only job minting the context on a comment event was the unguarded one (measured). The
+// mirror also fired: the required job's OWN `name:` carrying a comment read as "0 job(s) mint". YAML
+// drops comments and one matching quote pair and ignores an anchor here, so this does too.
+function yamlScalar(raw) {
+  const s = String(raw ?? "");
+  let out = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      out += ch;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      out += ch;
+      continue;
+    }
+    // A `#` only starts a comment at a token boundary; YAML requires whitespace before it.
+    if (ch === "#" && (i === 0 || /\s/.test(s[i - 1]))) break;
+    out += ch;
+  }
+  // An UNTERMINATED quote is not a scalar this reader can report a value for.
+  if (quote !== null) return null;
+  out = out.trim();
+  if (out === "") return null;
+  out = out.replace(/^&\S+\s*/, ""); // anchor — not part of the value
+  const m = /^(['"])([\s\S]*)\1$/.exec(out);
+  if (m) {
+    // ⛔ A DOUBLE-QUOTED SCALAR IS NOT ITS SOURCE TEXT — YAML DECODES ESCAPES. `name:
+    // "\x70ipeline-compliance"` evaluates to `pipeline-compliance` (pyyaml), yet peeling the quotes and
+    // returning the literal made it a DIFFERENT context: the shadow stopped counting as a minter, the
+    // "exactly one minter" check held, and the gate read ok/rc=0 while a second job minted the required
+    // context with `if: true` (measured, three spellings: `\x70…`, `\u002D…`, and an escaped line
+    // break). Decoding escapes is a YAML parser's job, so rather than half-implement one, any escape in
+    // a double-quoted value is REFUSED — this file's contract is that an unmodelled shape exits 2 and
+    // never guesses. Single-quoted scalars are literal text in YAML, so they need no decoding.
+    if (m[1] === '"' && m[2].includes("\\")) return null;
+    out = m[2];
+  } else if (/^[|>{[]/.test(out) || /^[*&!]/.test(out)) return null; // block/flow/alias: not modelled
+  return out;
+}
+
+function requiredContextJobId(text, contextName = "pipeline-compliance") {
+  const lines = String(text ?? "").split("\n");
+  const bounds = jobsBounds(lines);
+  if (bounds === null) {
+    refuse(`${PC_FILE}: no top-level \`jobs:\` key — the required context's job is UNVERIFIED.`);
+  }
+  const ids = [];
+  for (let i = bounds.start + 1; i < bounds.end; i += 1) {
+    const m = KEY_RE.exec(lines[i]);
+    if (!m || m[1].length !== 2) continue;
+    const id = (m[2] ?? m[3] ?? m[4] ?? "").trim();
+    if (!id) continue;
+    // ⛔ A JOB HEADER MUST BE A PLAIN BLOCK MAPPING. A flow-mapped header
+    // (`shadow: {name: pipeline-compliance, if: true}`) declares a `name:` this reader never sees, so a
+    // minter could hide inside it — refuse rather than read a job whose shape is not modelled.
+    // A flow mapping may also BEGIN on the next line: `shadow:` then `{name: …, if: true}`. The header
+    // line is then empty, so it was read as a BLOCK mapping, its `name:` (inside the braces) was never
+    // matched at a key indent, and the job was counted as minting its id — a real second minter went
+    // invisible (measured rc=0 with pyyaml showing two). The first deeper non-blank, non-comment line
+    // decides which shape this is.
+    // ⛔ A HEADER VALUE THE READER CANNOT CLASSIFY IS REFUSED — never silently treated as an empty block
+    // mapping. `^\s*\{` recognises a flow mapping only when the brace LEADS, so `shadow: &a {name:
+    // pipeline-compliance, if: true}`, `shadow: !!map {…}` and an ALIAS value (`shadow: *shared`) all fell
+    // through to the block path, where no `name:` key line exists — `ctx` stayed the job id, the shadow
+    // was counted as a NON-minter, and a real second minter with `if: true` went invisible (measured:
+    // gate ok/rc=0 with pyyaml showing two jobs named `pipeline-compliance`, on a workflow that admits
+    // `issue_comment`). Three outcomes only: an EMPTY value is a block mapping, a value leading with `{`
+    // is a flow mapping (read to its close), and ANYTHING ELSE — anchor, tag, alias, or a shape not
+    // considered here — is refused, because this reader cannot say whether that job declares a `name:`.
+    const headerValue = (m[5] ?? "").replace(/\s+#.*$/, "").trim();
+    let flowSource = null;
+    if (headerValue.startsWith("{")) {
+      flowSource = { value: m[5], at: i };
+    } else if (headerValue !== "") {
+      refuse(
+        `line ${i + 1}: the \`${id}\` job header carries ${JSON.stringify(
+          headerValue
+        )}, which this reader cannot classify (an anchor, tag, alias or other shape). Whether that job declares a \`name:\` is UNVERIFIED, so the set of jobs minting the required context is too.`
+      );
+    }
+    if (!flowSource) {
+      for (let j = i + 1; j < lines.length; j += 1) {
+        const raw = lines[j];
+        if (raw.trim() === "" || /^\s*#/.test(raw)) continue;
+        if (raw.length - raw.trimStart().length <= 2) break; // next job / top-level key
+        // The body's FIRST line decides the shape too: a flow mapping may open here, and an anchor /
+        // alias / tag here is equally unclassifiable.
+        if (/^\s*\{/.test(raw)) flowSource = { value: raw, at: j };
+        else if (/^\s*[&*!]/.test(raw)) {
+          refuse(
+            `line ${j + 1}: the \`${id}\` job body opens with ${JSON.stringify(
+              raw.trim()
+            )}, which this reader cannot classify (an anchor, tag or alias). Whether that job declares a \`name:\` is UNVERIFIED.`
+          );
+        }
+        break;
+      }
+    }
+    if (flowSource) {
+      const flow = flowHeaderText(flowSource.value, lines, flowSource.at);
+      // ⛔ BUT ONLY WHEN IT COULD MINT THE CONTEXT — and the WHOLE mapping decides that, never the
+      // header line alone (see flowHeaderText). An INCOMPLETE one is refused because this reader
+      // cannot see the `name:` it may contain.
+      // A blanket refusal over every flow-mapped job header
+      // turns a NON-minting sibling (`workflow-drift: {name: …}`) into CANNOT-VERIFY, which both
+      // over-blocks a correct tree and destroys the ability of the block-terminator arms to distinguish
+      // "the block ended here" from "the reader gave up" — measured: the terminator arm read rc=2
+      // instead of rc=1 with the blanket rule. The header text is all a line reader has, so if the
+      // CONTEXT NAME does not appear in it, no `name:` inside can equal the context and the job cannot
+      // mint it; if it does appear, the reader genuinely cannot tell and refuses.
+      // ⛔ AND AN ALIAS OR ANCHOR INSIDE THE MAPPING IS UNREADABLE TOO: `{name: *ctx, if: true}` mints
+      // whatever `*ctx` was bound to, and a line reader cannot resolve it. Refusing `*`/`&`/`!` in the
+      // flow text keeps this the same rule as everywhere else — what cannot be resolved is not green.
+      if (!flow.complete || flow.text.includes(contextName) || /[*&!]/.test(flow.text)) {
+        refuse(
+          `line ${flowSource.at + 1}: the \`${id}\` job${
+            flow.complete ? ` carrying ${JSON.stringify(contextName)}` : " this reader cannot read to its close"
+          } is a FLOW MAPPING, and flow mappings are not modelled — the set of jobs minting the required context is UNVERIFIED.`
+        );
+      }
+      continue; // a COMPLETE flow mapping that cannot name the context, so it cannot mint it
+    }
+    // GitHub uses `name:` when the job declares one, otherwise the id itself.
+    let ctx = id;
+    const nameLines = [];
+    // ⛔ THE KEY INDENT IS DERIVED, NOT ASSUMED TO BE 4. YAML only requires a job's children to be
+    // DEEPER than the header, so hardcoding four spaces read no `name:` at all when a job's children sat
+    // at six — a shadow minting the context became invisible (measured rc=0 with pyyaml showing two
+    // minters), and the correctly guarded required job re-indented the same way read as a lost guard.
+    // The first key line inside the job defines its key indent, exactly as `jobKeyIs` derives it.
+    let keyIndent = null;
+    for (let j = i + 1; j < lines.length; j += 1) {
+      const nm = KEY_RE.exec(lines[j]);
+      if (!nm) continue;
+      const ind = nm[1].length;
+      if (ind <= 2) break; // next job header or a top-level key
+      if (keyIndent === null) keyIndent = ind;
+      if (ind === keyIndent && (nm[2] ?? nm[3] ?? nm[4]) === "name") nameLines.push(nm);
+    }
+    if (nameLines.length > 1) {
+      refuse(
+        `line ${i + 1}: the \`${id}\` job declares \`name:\` ${nameLines.length} times. YAML keeps the LAST, so which context it mints is not something this reader can answer — UNVERIFIED.`
+      );
+    }
+    if (nameLines.length === 1) {
+      const raw = nameLines[0][5] ?? "";
+      const v = yamlScalar(raw);
+      if (v === null) {
+        refuse(
+          `line ${i + 1}: cannot read the \`name:\` value ${JSON.stringify(
+            raw.trim()
+          )} of job \`${id}\` — the context it mints is UNVERIFIED.`
+        );
+      }
+      ctx = v;
+    }
+    ids.push({ id, ctx });
+  }
+  const matching = ids.filter((x) => x.ctx === contextName).map((x) => x.id);
+  if (matching.length !== 1) {
+    refuse(
+      `${PC_FILE}: ${matching.length} job(s) mint the required status context ${JSON.stringify(
+        contextName
+      )}${matching.length ? ` (${matching.join(", ")})` : ""}. Exactly one must, and the guard is asserted on THAT job — with zero or several, which job the merge is gated on is not something this reader can answer.`
+    );
+  }
+  return matching[0];
+}
+
 function checkPipelineComplianceUnchanged() {
   const text = read(PC_FILE);
   const { region, childIndent } = onRegion(text, PC_FILE);
@@ -334,11 +954,153 @@ function checkPipelineComplianceUnchanged() {
 
   // `workflow_call` is legitimate here (consumers reuse this file); anything else is a new run site
   // on the repo's only required context, and a `push:` arm would attach its verdict to main.
-  const extraOn = extraSet(onKeys(region, childIndent), ["workflow_call", "pull_request"]);
+  //
+  // ⛔ `issue_comment` IS ADMITTED, AND ONLY AS A GUARDED PAIR. The comment-triggered revalidation job
+  // exists to re-read a gate verdict after a body edit, and the file's header states at length that it
+  // posts no marker, cannot turn a red green and holds no `contents: write`. But admitting the trigger
+  // by NAME alone would be the fail-open this whole file exists to prevent: the repo's ONLY required
+  // status context is `pipeline-compliance`, and if that JOB ever lost its own guard, a comment event
+  // would produce the verdict a PR head is gated on — a surface no PR head controls. So the widening is
+  // bound to the EVIDENCE that makes it safe (`PC_COMMENT_GUARD` below), and dropping the guard from
+  // the job is refused exactly like an unreviewed new trigger. A genuinely NEW trigger still lands in
+  // `extraOn` and is reported by name, so the arm that says "a new dispatch path must declare itself"
+  // keeps firing.
+  const PC_ALLOWED_ON = ["workflow_call", "pull_request"];
+  const PC_ADMITTED_EXTRA = ["issue_comment"];
+  // ⛔ THE GUARD MUST BE THE WHOLE EXPRESSION, OR THE GUARD **AND** SOMETHING — never "anything then
+  // the guard text". A leading `.*` tolerates a COMPOUND `if:`, but it tolerates it in the WRONG
+  // DIRECTION: `if: true || github.event_name != 'issue_comment'` contains the guard text and
+  // evaluates to TRUE, so the required job DOES run on the comment event while this gate reads green —
+  // the exact fail-open the admission exists to prevent (measured: ok/rc=0 under a leading `.*`).
+  // Conversely a NARROWING suffix (`… && github.event.action != 'deleted'`) is safe by construction —
+  // ANDing with the guard can only exclude more events — yet a leading `.*` refused it (measured:
+  // rc=1). So the shape is `<guard>` optionally followed by `&& …`, optionally wrapped in `${{ }}`
+  // (GitHub documents the wrapper as equivalent, and refusing it is a false block on a guarded tree),
+  // with the event name quotable either way — YAML permits both, and a formatter may switch them.
+  // The `&&` tail excludes `|` ON PURPOSE: `&&` binds tighter than `||`, so `… && x || true`
+  // evaluates to TRUE and the job runs on the comment event — a tail that merely "came after the
+  // guard" is NOT safe (measured: ok/rc=0 with `[^}]*`). A top-level `||` is a disjunction AROUND the
+  // guard, so any `||` in the tail is refused; that also refuses a nested `(a || b)`, which is safe in
+  // itself, and over-blocking is the direction this gate must err in.
+  const PC_COMMENT_GUARD =
+    /(?:\$\{\{\s*)?(?:!cancelled\(\)\s*&&\s*)?github\.event_name\s*!=\s*['"]issue_comment['"](?:\s*&&[^|}]*)?(?:\s*\}\})?(?:\s+#.*)?/;
+  const onNames = onKeys(region, childIndent, PC_FILE);
+  const extraOn = extraSet(onNames, [...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA]);
+  const admitted = extraSet(onNames, PC_ALLOWED_ON).filter((n) => PC_ADMITTED_EXTRA.includes(n));
+  // ⛔ THE REQUIRED CONTEXT IS THE JOB **NAME**, NOT THE JOB ID. The workflow's own header says main
+  // branch protection requires EXACTLY the check context `pipeline-compliance`, and GitHub derives that
+  // context from `jobs.<id>.name` when it is present. Asserting the guard on the ID therefore asserts it
+  // on an identifier that need not be the context: a second job carrying `name: pipeline-compliance`
+  // with `if: true` mints the required context ON A COMMENT EVENT while the guarded `pipeline-compliance`
+  // job still satisfies every assertion about its own `if:` (measured: rc=0, effective shadow job
+  // `name: pipeline-compliance, if: True`). So the job that mints the context is located BY NAME, and
+  // exactly one job may do it.
+  const pcJobId = requiredContextJobId(text);
+  if (
+    admitted.length &&
+    !jobKeyIs(jobBlock(text, pcJobId), "if", PC_COMMENT_GUARD)
+  ) {
+    findings.push(
+      // ⛔ AND IT MUST NOT CLAIM THE GUARD IS *ABSENT*. This reader models a ONE-LINE plain scalar
+      // (optionally `&&`-narrowed, `${{ }}`-wrapped, `!cancelled()`-prefixed, trailing comment
+      // allowed) — NOT a `if: >-` block scalar. Saying "no longer carries" about a job whose guard is
+      // present in a spelling this reader does not model sends the reader after the wrong fault, and
+      // the natural repair for a wrong diagnosis is to loosen this regex, which is how a fail-open is
+      // born. So the message names both possibilities.
+      `pipeline-compliance.yml declares \`${admitted.join(", ")}:\` but its \`pipeline-compliance\` JOB does not carry \`if: github.event_name != 'issue_comment'\` as a WHOLE-EXPRESSION job-level \`if:\` (either the guard is missing, or it is written in a spelling this reader does not model — a plain scalar is understood, on one line or FOLDED across lines, optionally \`&&\`-narrowed, \`\${{ }}\`-wrapped, \`!cancelled()\`-prefixed or carrying a trailing comment; a \`>-\`/\`|\` BLOCK SCALAR is not). The comment trigger is admitted ONLY as a guarded pair: without that guard on the REQUIRED job the COMMENT event satisfies the repo's only required status context, so a comment — not a PR head — produces the verdict a merge is gated on. (A guard on any OTHER job does not satisfy this: \`workflow-drift\` carries its own for its own reasons.)`
+    );
+  }
   if (extraOn.length) {
     findings.push(
-      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides \`workflow_call:\` and \`pull_request:\`. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
+      // The allow-list is BUILT from the constants, never spelled out in prose: prose drifts, and a
+      // FINDING that names an allow-list the file no longer has leaves the reader unable to tell
+      // whether the admitted trigger is admitted or an unreported extra.
+      `pipeline-compliance.yml's \`on:\` declares [${extraOn.join(", ")}] besides ${[...PC_ALLOWED_ON, ...PC_ADMITTED_EXTRA].map((n) => `\`${n}:\``).join(", ")}. A new trigger on the only required status context is a new surface this gate's evidence was never checked against (and a \`push:\` arm would attach its verdict to main, not to a PR head).`
     );
+  }
+
+  // ⛔ THE ADMISSION IS A PAIR *AND* AN OWNED ACTIVITY SET — NOT A NAME. Admitting `issue_comment` to
+  // the allow-list and pinning only the required job's guard leaves the OTHER half of #2467's
+  // justification unpinned, and it is the half that makes the trigger safe: the comment event is
+  // harmless because `revalidate-on-issue-comment` OWNS it and re-runs the EXISTING run. Each of the
+  // four facts below was measured GREEN on this reader before it existed (the mutation and its result
+  // are re-driven, one arm each, in `run.sh` 7i–7m):
+  //   * the `issue_comment:` trigger deleted            → green, so the trigger could vanish silently
+  //   * `issue_comment: types:` reduced to `[created]`    → green, so the retraction edit stopped
+  //     re-reading (retracting a scoping marker is an `edited` activity — the file's own header says
+  //     the arm is BIDIRECTIONAL and a one-sided read leaves the previous GREEN standing)
+  //   * the revalidation job re-pointed at another event, or its body given `&& false` → green, so the
+  //     event had no owner at all while every assertion about the required job still held
+  if (!onNames.includes("issue_comment")) {
+    findings.push(
+      `pipeline-compliance.yml no longer declares \`issue_comment:\`. That trigger is the ADMITTED one (${PC_ADMITTED_EXTRA.map((n) => `\`${n}:\``).join(", ")}): #2467 added it because checks (b) and (d) read the LINKED ISSUE, which fires no \`pull_request\` event, so without it the repo's only required context is non-deterministic in time (measured on PR #3122: two runs of the same check on the same commit disagreed, and only queue latency decided the difference). Removing it silently reopens that window. To remove it, remove it from \`PC_ADMITTED_EXTRA\` in this file AND record the decision it reverses — the allow-list is derived from those constants, never spelled out in prose, so the two cannot drift apart here.`
+    );
+  } else {
+    // ⛔ AND THE ACTIVITY SET IS PART OF THE PAIR. An absent `types:` is ADMISSIBLE here — GitHub's
+    // default for `issue_comment:` is `created`, `edited`, `deleted`, which already covers both
+    // activities this decision needs — but a DECLARED set that lost one of them is a refusal. So the
+    // rule is "the effective set contains both", not "the key is present": refusing an absent key
+    // would be a false block on a workflow that is correct.
+    const ic = trigger(region, childIndent, "issue_comment", PC_FILE);
+    const icTypesEntry = singleKey(ic.keys, "types", "issue_comment:");
+    const icTypes = icTypesEntry ? readList(icTypesEntry, valueLinesFor(icTypesEntry, ic.lines)) : ["created", "edited", "deleted"];
+    const icMissing = ["created", "edited"].filter((a) => !icTypes.includes(a));
+    if (icMissing.length) {
+      findings.push(
+        `pipeline-compliance.yml's \`issue_comment:\` no longer carries the ${icMissing.length > 1 ? "activities" : "activity"} [${icMissing.join(", ")}] (declared: [${icTypes.join(", ")}]). \`created\` is what re-runs the gate for an open PR that cross-references a newly-scoped issue; \`edited\` is what re-reads it after a body edit, and the retraction direction (a scoping marker REMOVED from a comment) is why the file's header calls that arm bidirectional. Without it a retracted marker leaves the previous GREEN standing indefinitely. GitHub's default set for this trigger is \`created, edited, deleted\`, so an ABSENT \`types:\` key is admissible; a declared set missing either activity is not.`
+      );
+    }
+    // ⛔ AND THE EVENT MUST HAVE AN OWNER. `revalidate-on-issue-comment` is what makes the comment
+    // event safe: it re-runs the EXISTING run for each open PR cross-referencing the issue, posts no
+    // marker, holds no `contents: write` and cannot turn a red green. This is asserted on that job BY
+    // NAME, because a guard on any other job says nothing about who owns the event. Its `if:` is a
+    // `>-` BLOCK SCALAR in the live file, which the required job's guard reader deliberately does not
+    // model (a `>-` body of `guard` + `|| true` folds to TRUE) — so it is read here with the block
+    // indicator stripped and both predicates required as a CONJUNCTION, with any `||` or bare
+    // `true`/`false` literal refused. That is the safe direction: ANDing can only exclude more events.
+    // ⛔ AND THE JOB MUST EXIST — checked BEFORE `jobBlock`, because `jobBlock` REFUSES (rc 2,
+    // CANNOT-VERIFY) when it cannot locate a job, which is the right answer for "cannot verify this
+    // job's guard" but the WRONG one here: absence of the OWNER is a fact this reader can state. A
+    // `jobBlock`-first reader made the finding below unreachable (measured: deleting the whole job
+    // produced `CANNOT-VERIFY: no revalidate-on-issue-comment job found`, never this finding).
+    const rvHeader = /^ {2}(?:"revalidate-on-issue-comment"|'revalidate-on-issue-comment'|revalidate-on-issue-comment)\s*:/m.test(
+      text
+    );
+    const rv = rvHeader ? jobBlock(text, "revalidate-on-issue-comment") : "";
+    const rvExprs = jobIfExprs(rv);
+    if (!rvHeader) {
+      findings.push(
+        "pipeline-compliance.yml no longer declares the `revalidate-on-issue-comment` job. It OWNS the `issue_comment:` event that the allow-list admits: on a scoping comment it re-runs the EXISTING gate run for each open PR cross-referencing the issue (it posts no marker, holds no `contents: write` and cannot turn a red green). With the trigger admitted and this job gone, the comment event re-runs nothing — checks (b)/(d) stay non-deterministic in time, which is the #2467 window itself."
+      );
+    } else if (rvExprs.length === 0) {
+      findings.push(
+        "pipeline-compliance.yml's `revalidate-on-issue-comment` job carries no job-level `if:`, so it runs on EVERY event the workflow fires — including `pull_request`, where it would re-run the gate run it is already inside. The job exists to own the `issue_comment` event and nothing else."
+      );
+    } else {
+      for (const expr of rvExprs) {
+        const keysEvent = /github\.event_name\s*==\s*['"]issue_comment['"]/.test(expr);
+        // ⛔ `!github.event.issue.pull_request` IS THE SAME PREDICATE — on a comment event the field is
+        // absent for a plain issue, so the negation is true exactly when the `== null` form is. Not
+        // modelling it minted a FINDING asserting the job's guard "does not require `== null`" about a
+        // tree that DOES require it (measured, rc=1) — a false block AND a false statement. The
+        // unmodelled-shape path is `refuse` (rc 2), never a finding; this shape is modelled instead.
+        const keysIssue = /(?:github\.event\.issue\.pull_request\s*==\s*null|!\s*github\.event\.issue\.pull_request\b)/.test(
+          expr
+        );
+        // ⛔ NOTHING LEGAL IN THE MODELLED CONJUNCTION CARRIES A BARE `true`/`false`. The old pattern
+        // used a `(?<![=!<>])` lookbehind so the harmless `x != true` spelling stayed accepted — but
+        // that lookbehind also suppressed `&& !true`, which is the ALWAYS-FALSE spelling this rule
+        // exists to catch: measured rc=0 on `… == null && !true`, i.e. the owner can never run while
+        // the gate prints ok (the #2467 window, in its minimal adversarial form). Over-blocking a
+        // `!=true` spelling is the safe direction; admitting a never-runs owner is not.
+        const escape = /\|\||\b!?\s*(?:true|false)\b/.test(expr);
+        if (!keysEvent || !keysIssue || escape) {
+          findings.push(
+            `pipeline-compliance.yml's \`revalidate-on-issue-comment\` job \`if:\` is ${JSON.stringify(expr)}, which does not both (i) key on \`github.event_name == 'issue_comment'\` and (ii) require \`github.event.issue.pull_request == null\`, with no \`||\` disjunction and no bare \`true\`/\`false\` literal. That conjunction is what confines the job to comments on ISSUES (a comment on a PR must never re-run that PR's gate) — and it is the whole reason admitting the trigger is safe: the event is owned by a job that re-runs the EXISTING run and can neither post a marker nor turn a red green. A disjunction or an \`&& false\` body makes the owner unable to run while every assertion about the required job still reads true.`
+          );
+        }
+      }
+    }
   }
 
   // ⛔ AND NO PATH FILTER UNDER IT (review cycle 1, P1). This is the change the current sweep most
@@ -353,6 +1115,26 @@ function checkPipelineComplianceUnchanged() {
       `pipeline-compliance.yml's \`pull_request:\` declares [${extraPc.join(", ")}]. It is the repo's ONLY required status context, so a path filter here does not narrow a check — it makes the required context UNSATISFIABLE on every head whose diff does not match: GitHub keeps a path-filtered workflow's checks "Pending", and a PR that requires them cannot merge. Allowed filter keys on this trigger are \`branches\` and \`types\` only.`
     );
   }
+  // ⛔ THE BRANCH FILTER IS CHECKED BEFORE THE `types:` EARLY-RETURN, ON PURPOSE: both facts are about
+  // the required context being SATISFIABLE, and a `types:`-absent tree can also carry a `branches:`
+  // that no longer admits `main`. Checked below the return, the second fact was withheld until the first
+  // was fixed — two red rounds for one edit (measured: `types:` deleted AND `branches: [develop]` emitted
+  // only the `types:` finding, while PyYAML shows the effective trigger is `['branches']`).
+  // ⛔ AND ITS BRANCH FILTER MUST STILL ADMIT main. An absent `branches:` key is ADMISSIBLE — the
+  // trigger then fires for every target branch, which still includes `main`, so the required context is
+  // still satisfiable and no false block is owed. A DECLARED filter that no longer lists `main` is the
+  // dangerous direction and was measured GREEN before this check existed: `pipeline-compliance` would
+  // never run on a PR to `main`, GitHub keeps a non-triggered required check "Pending", and every PR to
+  // `main` becomes unmergeable — the same unsatisfiable-context class as a `paths:` filter here.
+  const brEntry = singleKey(t.keys, "branches", "pull_request:");
+  if (brEntry) {
+    const branches = readList(brEntry, valueLinesFor(brEntry, t.lines));
+    if (!branches.includes("main")) {
+      findings.push(
+        `pipeline-compliance.yml's \`pull_request: branches:\` is [${branches.join(", ") || "<none>"}], which no longer admits \`main\`. This is the repo's ONLY required status context: on a PR to \`main\` the workflow would never trigger, GitHub keeps an untriggered required check "Pending", and that PR can never merge. (An ABSENT \`branches:\` key is admissible — it fires for every target branch and therefore still includes \`main\`.)`
+      );
+    }
+  }
   const idx = t.keys.findIndex((k) => k.key === "types");
   if (idx < 0) {
     findings.push(
@@ -360,13 +1142,46 @@ function checkPipelineComplianceUnchanged() {
     );
     return;
   }
-  const entry = t.keys[idx];
+  // A DUPLICATE `types:` IS LAST-WINS TOO — see `singleKey`. Read before the rest of this section, and
+  // before the branch filter, so a duplicated key can never be answered from the first copy.
+  const singleEntry = singleKey(t.keys, "types", "pull_request:");
+  // ⛔ THE ENTRY `singleKey` RETURNED IS THE ONE READ — see the same note in `checkWorkflowLock`.
+  const entry = singleEntry;
   const valueLines = valueLinesFor(entry, t.lines);
   const items = readList(entry, valueLines);
   process.stdout.write(`pipeline-compliance pull_request types: ${items.join(", ") || "<none>"}\n`);
-  if (!items.includes("edited")) {
+  // ⛔ THE ACTIVITY SET IS A SET, NOT A MEMBERSHIP TEST. The decision is `opened, synchronize,
+  // reopened, edited` — all four, and nothing else:
+  //   * losing `edited` lets a forged `verdict=clean-micro` marker ride a stale green check to merge
+  //     (the marker is written to the PR body AFTER the last push, which is an `edited` activity);
+  //   * losing `synchronize` is the MIRROR fail-open and was measured GREEN on the membership test that
+  //     used to stand here: a new push never re-runs the gate, so the previous head's GREEN keeps
+  //     standing on a body of evidence nobody re-read — the exact staleness `edited` exists to prevent,
+  //     arriving from the other side;
+  //   * losing `opened` means the first commit of a PR is never gated at all;
+  //   * an EXTRA activity is a new run site on the repo's only required context, reported here rather
+  //     than silently admitted.
+  const PC_REQUIRED_TYPES = ["opened", "synchronize", "reopened", "edited"];
+  const lostTypes = PC_REQUIRED_TYPES.filter((a) => !items.includes(a));
+  const extraTypes = items.filter((a) => !PC_REQUIRED_TYPES.includes(a));
+  if (lostTypes.length || extraTypes.length) {
+    const parts = [];
+    if (lostTypes.length) {
+      parts.push(
+        `LOST [${lostTypes.join(", ")}]${
+          lostTypes.includes("edited")
+            ? " — `edited` is the #513 binding: `record-review.sh` PATCHes the marker into the PR body after the last push, so without it a forged `verdict=clean-micro` marker rides a stale green check to merge"
+            : ""
+        }${
+          lostTypes.includes("synchronize")
+            ? " — without `synchronize` a NEW PUSH never re-runs the gate, so the previous head's green keeps standing on evidence nobody re-read"
+            : ""
+        }`
+      );
+    }
+    if (extraTypes.length) parts.push(`ADDS [${extraTypes.join(", ")}], a new run site on the required context`);
     findings.push(
-      "pipeline-compliance.yml's `types:` LOST `edited`. That is the required context and its #513 binding depends on re-running after `record-review.sh` PATCHes the marker into the PR body; without `edited` a forged `verdict=clean-micro` marker rides a stale green check to merge. #3196 scopes this reduction to the ADVISORY guards precisely so this file is untouched."
+      `pipeline-compliance.yml's required-context \`types:\` is [${items.join(", ") || "<none>"}], not the decided set [${PC_REQUIRED_TYPES.join(", ")}]. ${parts.join("; ")}. #3196 scopes a reduction to the ADVISORY guards precisely so this file is untouched.`
     );
   }
 }

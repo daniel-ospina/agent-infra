@@ -106,7 +106,7 @@ from datetime import datetime, timedelta, timezone
 # `tests/inert-capability-effects/run.sh` §1. The remaining shipped callers that do NOT supply it,
 # and are therefore still answered about tortoise, are the direct script callers of this file:
 # `heartbeat-loop.sh:470`, `orchestrator-heartbeat.sh:224`, `cadence-nudge.sh:329,475`, and
-# `lane-scan-fallback.sh:76`. Fixing those, and the required-set half of the same seam, is the open
+# `lane-scan-fallback.sh:81`. Fixing those, and the required-set half of the same seam, is the open
 # work on **#2518** (the live root -- #1989 is CLOSED and its P1s were carried to #2518).
 # Naming them here is so the next lane can find them from the file that knows.
 #

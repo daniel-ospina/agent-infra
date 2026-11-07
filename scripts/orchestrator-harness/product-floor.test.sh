@@ -1405,9 +1405,43 @@ ck "P13(iii) [RED→GREEN] with no product candidate the floor had nothing to ap
 # refresh and driven here (the same `rest_list` seam P7 uses), so the class the floor consults is proven
 # to come from a LISTING and not from an assumption.
 WEF="$T/weqfns.sh"
-{ sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
+# ⛔ THE EXTRACTED BODY DEPENDS ON THE SHIPPED POOL DEFINITION (tortoise#10951). `write_emergency_queue`
+# consults the pool predicate, which is the ONE `POOL_JQ=` line at the top of the shipped refresh — a
+# file-global that a bare function-body extraction does not carry. So the extraction carries it: without
+# this line the body dies on the `${POOL_JQ:?…}` guard's NAMED message (`POOL_JQ is not in scope — a
+# consumer that extracts this function must also extract the POOL_JQ= line from the shipped refresh`),
+# and the P0 emergency class is never produced (measured: 6 P13 failures when the prepend was missing,
+# 0 on the same suite before the pool consolidation). ⛔ DO NOT LOOK FOR bash's bare `POOL_JQ: unbound
+# variable` — that is what the `:?` guard REPLACED, so a NAMED message is the correct outcome here
+# (measured, review cycle 3, P3).
+POOL_DEF="$(sed -n '/^POOL_JQ=/p' "$REFRESH")"
+if [ -z "$POOL_DEF" ]; then
+  ck "P13(iii-b-1) (setup) the shipped refresh carries the pool definition the emergency writer needs" 1
+else
+  ck "P13(iii-b-1) (setup) the shipped refresh carries the pool definition the emergency writer needs" 0
+fi
+{ printf '%s\n' "$POOL_DEF"; sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$WEF"
 [ -s "$WEF" ] && grep -q 'write_emergency_queue()' "$WEF"
 ck "P13(iii-b) (setup) the emergency writer extracts from the shipped refresh" $?
+# ⛔ AND THE NAMED MESSAGE MUST ACTUALLY REACH A READER (review, P3). The sentence above is only worth
+# something if the diagnostic is OBSERVABLE: measured on the no-prepend mutant, the `${POOL_JQ:?…}` text
+# is captured inside `weq()`'s `2>&1` subshell and NONE of the 6 failing P13 arms prints it — a lane
+# saw `file=''` and a red count with no cause, which is the opposite of what the guard was added for
+# (measured: 0 of 6 occurrences of "POOL_JQ is not in scope" in the whole suite's output). So this arm
+# drives the same no-prepend extraction DIRECTLY and asserts the sentence itself.
+{ sed -n '/^weq_degrade() {/,/^}/p' "$REFRESH"; sed -n '/^write_emergency_queue() {/,/^}/p' "$REFRESH"; } > "$T/weqfns-nopool.sh"
+mkdir -p "$T/we1np"
+NOPOOL_OUT="$(
+  (
+    CORE_NOW=; CORE_RESERVE=; REST_WINDOW_FILLED=0
+    rest_list() { printf '%s\n' 10; }
+    # shellcheck source=/dev/null
+    . "$T/weqfns-nopool.sh" || exit 1
+    write_emergency_queue "$T/we1np" daniel-ospina/tortoise daniel-ospina/tortoise
+  ) 2>&1
+)"
+grep -q 'POOL_JQ is not in scope' <<<"$NOPOOL_OUT"
+ck "P13(iii-b) (setup) a consumer that forgets the pool definition fails with the NAMED message, not bash's bare 'unbound variable'" $?
 weq() { # <O> <repo> <PRODUCT_REPOS> <rest_list-rc> [rows] [window-filled] [core-now] [core-reserve]
   local o="$1" repo="$2" pre="$3" rc="$4" lst="${5:-}" wf="${6:-0}" cn="${7:-}" cr="${8:-}"
   (

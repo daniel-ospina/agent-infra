@@ -312,8 +312,8 @@ fi
 # `gh-rest/gh` or `gh-limit/gh` (they landed 2026-10-17/18), so a two-anchor test CERTIFIED a stale
 # harness — a days-old checkout instead of a 1274-commit-old one, with the same measured consequence
 # (every harness `gh` call unserialised, the `gh-limit` PATH layer absent). A source that is genuinely
-# the current harness ships all five, so this is a strict tightening that cannot false-refuse one.
-for anchor in orch-loop.sh claims.sh gh-limit.py gh-rest/gh gh-limit/gh; do
+# the current harness ships all six, so this is a strict tightening that cannot false-refuse one.
+for anchor in orch-loop.sh claims.sh gh-limit.py gh-cred.py gh-rest/gh gh-limit/gh; do
   [ -f "$SRC/$anchor" ] || { fatal "$SRC has no $anchor — refusing to deploy a directory that is not the harness"
     notify "orchestrator: harness deploy FAILED" "$SRC has no $anchor — it is not the harness; nothing was written to $O (#2041)." high; exit 78; }
 done

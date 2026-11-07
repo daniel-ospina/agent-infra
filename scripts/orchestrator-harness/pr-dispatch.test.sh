@@ -21,6 +21,34 @@
 # Hermetic: no network, no tmux, no gh. Run: bash pr-dispatch.test.sh
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ORCH="$HERE/orch-loop.sh"
+# ⛔ THE CAP'S RANGE IS DECLARED AND ENFORCED HERE, BEFORE ANY ARM PRINTS (fresh review of #3441, P2).
+# The ceiling arms seed `$CAP - 1` and `$CAP - 2` to stand one and two rounds BELOW the ceiling, so a
+# cap under 2 makes those seeds 0 / negative — `review_round_read` coerces a negative to 0 and the arms
+# then assert a state they never created. Measured before this guard: `DRIVE_MAX_REVIEW=1` reds 1 arm
+# and `=0` reds 15, which reads as a product REGRESSION when it is the SUITE being driven outside the
+# range its arms are written for — exactly how a real red gets ignored later. Both values are accepted
+# by `install.sh`, so the refusal names each one instead of letting them red silently.
+# ⚠️ `0` is REPORT-ONLY: nothing is dispatched at all, and `(c4e)` drives that mode deliberately on its
+# own. It cannot be the mode the whole suite runs in, because every other dispatch arm would
+# (correctly) see zero reviews and red — the product behaving as documented, not a defect.
+DRIVE_MAX_REVIEW="${DRIVE_MAX_REVIEW:-10}"
+case "$DRIVE_MAX_REVIEW" in ''|*[!0-9]*)
+  echo "❌ DRIVE_MAX_REVIEW='$DRIVE_MAX_REVIEW' is not a number — this suite drives a per-PR round ceiling" >&2; exit 2 ;;
+  0[0-9]*)
+  # ⛔ A LEADING ZERO IS AN OCTAL-LOOKING VALUE, AND `[ "08" -lt 2 ]` ERRORS (round 8 review, P3). The
+  # error makes the range test read FALSE, so the guard passes and `$(( CAP - 1 ))` then aborts — the
+  # very "misleading red" this guard exists to prevent. `is_num`/`is_limit` doctrine: reject the shape.
+  echo "❌ DRIVE_MAX_REVIEW='$DRIVE_MAX_REVIEW' has a leading zero — write it in base 10 (e.g. ${DRIVE_MAX_REVIEW#0}), not as an octal-looking value" >&2; exit 2 ;;
+esac
+if [ "$DRIVE_MAX_REVIEW" -lt 2 ]; then
+  echo "❌ DRIVE_MAX_REVIEW=$DRIVE_MAX_REVIEW is OUTSIDE this suite's declared range (>= 2)." >&2
+  echo "   The ceiling arms seed CAP-1 and CAP-2 to stand one and two rounds below the ceiling; below 2" >&2
+  echo "   those seeds are 0/negative, are coerced to 0, and the arms assert rounds they never created." >&2
+  echo "   ⚠️ MAX_REVIEW=0 is REPORT-ONLY and IS covered — by (c4e), which drives it explicitly on its own." >&2
+  exit 2
+fi
+export DRIVE_MAX_REVIEW
+CAP="$DRIVE_MAX_REVIEW"
 # ⛔ A PER-RUN directory: a fixed path is shared by two concurrent lanes on one box, and one run's
 # truncation would wipe the other's rows mid-flight (a flaky red, and — worse — `acts()` could read the
 # OTHER run's act row and PASS the exact assertion this suite exists for).
@@ -29,6 +57,12 @@ trap 'rm -rf "$TMP"' EXIT
 PASS=0; FAIL=0
 ok()  { echo "  ✅ $1"; PASS=$((PASS+1)); }
 bad() { echo "  ❌ $1"; FAIL=$((FAIL+1)); }
+# ⛔ THE ONE COMMENT-STRIP THE TEXT ARMS SHARE (round-16 review, P3). `!/^[ \t]*#/` drops whole-line
+# comments only, so an INLINE `#` survived and two measured decoys passed GREEN at 191/0:
+#   `: # review_round_clear "$PR"` (a call defanged behind a colon), and
+#   `rm -f … || true   # was: "$O/state/reviewround-$PR"` (the path alive only in a trailing comment).
+# A text arm a comment can satisfy is worse than no arm: it reports coverage it does not have.
+c4mc() { sed 's/[[:space:]]#.*$//' ; }   # drop anything from an inline `#` to EOL
 clear_workers() {
   local f
   for f in "$TMP/O/state"/worker-* "$TMP/O/state/.wt-census"; do
@@ -88,6 +122,14 @@ sed -n '/^review_gate_state() {/,/^}/p' "$ORCH" > "$TMP/rgs.sh"
 sed -n '/# \[reviewdisp:begin\]/,/# \[reviewdisp:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/reviewdisp.sh"
 [ -s "$TMP/reviewdisp.sh" ] && grep -q 'review_disp_decide' "$TMP/reviewdisp.sh" \
   || { echo "FATAL: the [reviewdisp] block is missing from orch-loop.sh — the review key is untested"; exit 1; }
+# ── extraction 1d: the PER-PR REVIEW-ROUND budget (agent-infra#3441) ────────────────────────────
+# Its own block because it answers a DIFFERENT question from [reviewdisp]: rounds spent on the PR
+# (cumulative, a push does NOT re-arm it) vs attempts at ONE head (a push does). A suite that graded
+# only one of them would leave the other free to be inert.
+sed -n '/# \[reviewround:begin\]/,/# \[reviewround:end\]/p' "$ORCH" | sed '1d;$d' > "$TMP/reviewround.sh"
+[ -s "$TMP/reviewround.sh" ] && grep -q 'review_round_exhausted' "$TMP/reviewround.sh" \
+  && grep -q 'review_ceiling_line' "$TMP/reviewround.sh" \
+  || { echo "FATAL: the [reviewround] block is missing from orch-loop.sh — the per-PR round ceiling is untested"; exit 1; }
 # ⛔ `is_limit` IS THE KEY'S VALIDATOR AND IS DEFINED OUTSIDE THE BLOCK. Undefined it is
 # `command not found` (127), so `is_limit "$n" || n=0` coerces EVERY count to 0 and the cap can never
 # bind — the drive would prove an unbounded budget while its own assertions expected one. Extracted,
@@ -166,6 +208,11 @@ drive() {
     # `/state/…` and the review-gate fixer arm would silently take the re-record path instead.
     [ "${NEEDSFIX:-0}" = "1" ] && : > "$O/state/needsfix-$PR-abc1234"
     MF=9; MR=9; MAX_FIX_TRIES=3; MAX_REVIEW_TRIES=3; REQ='ai-review-gate python-ci-gate pipeline-compliance'
+    # ⛔ MAX_REVIEW IS PINNED HERE, NOT INHERITED (#3441, fresh review P2). `install.sh` renders it into the
+    # launchd plist, so every child of a live controller inherits it — the live box is configured for 12,
+    # and a box pinned at 4 makes the ceiling arms below read 10 against a 4 budget. A suite that grades a
+    # limit must set it. `[9]`-style driving is unnecessary: the arms seed the COUNTER, not the cap.
+    MAX_REVIEW="${DRIVE_MAX_REVIEW:-10}"
     REVIEW_GATE='ai-review-gate'; DRAFT=false
     # shellcheck disable=SC1090
     . "$TMP/shq.sh"
@@ -193,6 +240,8 @@ drive() {
     . "$TMP/islimit.sh"
     # shellcheck disable=SC1090
     . "$TMP/reviewdisp.sh"
+    # shellcheck disable=SC1090
+    . "$TMP/reviewround.sh"
     # shellcheck disable=SC1090
     . "$HERE/worker-terminal.sh"
     cmux() {
@@ -633,6 +682,17 @@ seed_revdisp()  { printf '%s %s\n' "$1" "$2" > "$REV_DISP"; }
 # FIXER arm and the whole section would then grade a path it never reached — measured: (a) reported
 # "spawns=1" for a fixer.
 clear_needsfix() { mv "$TMP/O/state/needsfix-4242-abc1234" "$TMP/needsfix.spent.$RANDOM" 2>/dev/null || true; }
+# ── the PER-PR REVIEW-ROUND budget (agent-infra#3441) ────────────────────────────────────────────
+# Same `mv`-not-`rm` rule (#709): the guard treats a `rm` of a `$TMP/…` path as an unverifiable discard.
+ROUND_F="$TMP/O/state/reviewround-4242"
+clear_round() { mv "$ROUND_F" "$TMP/round.spent.$RANDOM" 2>/dev/null || true; }
+seed_round()  { printf '%s\n' "$1" > "$ROUND_F"; }
+# ⛔ THE CAP IS A KNOB THE ARMS MUST DERIVE FROM, NOT REPEAT (round 2 review, P2). `install.sh` renders
+# `MAX_REVIEW` into the launchd plist, so a box pinned to 4 or 12 is an ordinary box; the first version
+# of these arms seeded 9/10 and asserted `rounds=10/10`, which encoded the SHIPPED DEFAULT — the same
+# class this PR fixed in `test_pr_doctor.py`'s saturated-fleet fixture. Every ceiling arm is built from
+# `$CAP`, so the suite tracks the cap it is driving. The range it is driven over is declared and
+# enforced at the TOP of this file (see `DRIVE_MAX_REVIEW` there): CAP >= 2.
 # ⛔ A DRIVE THAT SPAWNS LEAVES A WORKER RECORD, WHICH INFLATES THE NEXT DRIVE'S CENSUS (measured):
 # the `lanes-in-use` fixture says 9, and a leftover `worker-merge-4242` made the same assertion read
 # `review lanes=10/9`. Records are files, so move the ones this fixture's PR could own out of the way —
@@ -702,6 +762,953 @@ if [ "$(spawns)" = "1" ] && [ "$(cat "$REV_DISP" 2>/dev/null)" = "abc1234 2" ] \
 else
   bad "(c2) spawns=$(spawns) key=[$(cat "$REV_DISP" 2>/dev/null)] — the attempt number is not derived from the record"
 fi
+
+# (c4) THE PER-PR REVIEW-ROUND CEILING (agent-infra#3441). ⛔ THE QUESTION IS NOT `reviewdisp`'s:
+# that one is per HEAD and a push re-arms it, so before this the review loop had no bound at all that
+# spanned heads — a PR could buy reviews for ever, one head at a time (measured on #3355: four recorded
+# rounds across four heads, each within its own budget, nothing counting the PR). `MAX_REVIEW` now
+# bounds the rounds a PR may spend and the round AFTER the ceiling is REFUSED and PARKED.
+clear_parked; clear_store; clear_revdisp; clear_round
+# (c4a) BELOW the ceiling it dispatches and the round is SPENT — the counter is not decoration.
+seed_round $(( CAP - 1 ))
+drive 'FAILED:ai-review-gate' rail 0 1
+# ⛔ THE DISPATCH DOES NOT SPEND THE ROUND (round-3 review, P1) — the REVIEWER does, and `merge-one.sh`
+# is the only writer. The controller spent it here until round 3, right after `wt_spawn`, i.e. before the
+# worker existed: a worker that then took the rail-only path, lost a claim race or was refused by its own
+# brief gate still cost a round, and the ceiling could later refuse a genuine review with a false
+# "budget exhausted". So this arm asserts the OPPOSITE of what it used to: the counter is UNCHANGED by a
+# successful dispatch (merge-one writes it when `AGENT_STARTED=1`; (c4g)/(c4g2) pin that structure).
+if [ "$(spawns)" = "1" ] && [ "$(cat "$ROUND_F" 2>/dev/null)" = "$(( CAP - 1 ))" ]; then
+  ok "(c4a) a review at round $(( CAP - 1 ))/$CAP IS dispatched, and the DISPATCH spends nothing (the counter stays $(( CAP - 1 )) — the reviewer pays it, not the controller)"
+else
+  bad "(c4a) spawns=$(spawns) round=[$(cat "$ROUND_F" 2>/dev/null)] (expected $(( CAP - 1 )) unchanged) — the dispatch either did not happen or spent a round it never ran"
+fi
+# (c4b) AT the ceiling the next round is REFUSED, the head is PARKED, and the terminal line names the
+# PR, the rounds spent and the findings — in the log, in the ledger AND in the park reason, which is
+# what makes the diagnosis survive log-quiet (#943).
+clear_parked; clear_store; clear_revdisp; clear_round
+seed_round "$CAP"
+: > "$TMP/O/state/needsfix-4242-dead999"   # findings left by an EARLIER head, still unresolved
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && [ "$(acts)" = "0" ] \
+   && grep -q "REVIEW-CEILING 4242 rounds=$CAP/$CAP head=abc1234 stale_findings=1 heads=dead999" "$TMP/d.log" \
+   && grep -qF "REVIEW-CEILING 4242 rounds=$CAP/$CAP" "$LEDGER" 2>/dev/null \
+   && [ "$(cat "$TMP/O/state/parked-4242" 2>/dev/null)" = "abc1234" ] \
+   && grep -qF "REVIEW-CEILING 4242 rounds=$CAP/$CAP" "$TMP/O/state/parkreason-4242" 2>/dev/null; then
+  ok "(c4b) the round ceiling REFUSES the next review, parks the head, and the line names PR+rounds+findings in the log, the ledger AND the park reason"
+else
+  bad "(c4b) spawns=$(spawns) acts=$(acts) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log") reason=[$(cat "$TMP/O/state/parkreason-4242" 2>/dev/null | head -1)]"
+fi
+mv "$TMP/O/state/needsfix-4242-dead999" "$TMP/deadfix.spent.$RANDOM" 2>/dev/null || true
+# (c4c) THE CEILING IS AN ESCALATION, NOT A VERDICT: the park reason must say so in words an operator
+# can act on, and it must NOT claim the PR was reviewed or passed. A bounded stop that reads as a
+# quality verdict is the one reading this arm must never print.
+if grep -qi 'ESCALATION, not a pass' "$TMP/O/state/parkreason-4242" 2>/dev/null \
+   && grep -qF 'stale_findings names the findings markers' "$TMP/O/state/parkreason-4242" 2>/dev/null; then
+  # ⛔ THE FIELD NAME MUST SURVIVE THE QUOTING (round 2 review, P2): the reason is built inside a
+  # DOUBLE-QUOTED string, so a backticked field name was COMMAND-SUBSTITUTED — the text lost the name
+  # (two spaces where it belonged) and the shell printed "stale_findings: command not found". No arm
+  # covered it, so it stayed green. This one reads the field name it tells the operator to look at.
+  ok "(c4c) the park reason states the ceiling is an ESCALATION, never a pass — and the stale_findings field name survives the quoting"
+else
+  bad "(c4c) the park reason does not say the ceiling is an escalation: [$(head -c 200 "$TMP/O/state/parkreason-4242" 2>/dev/null)]"
+fi
+# (c4d) THE ROUND IS PASSED INTO THE REVIEW ORDER, so the brief the reviewer receives knows which
+# round it is. Acceptance #4 of #3441 is exactly this plumbing (`REV_ROUND`), and a spawn that dropped
+# it would briefing round 7 as round 1 — the mandate would exist and never apply.
+clear_parked; clear_store; clear_revdisp; clear_round
+seed_round $(( CAP - 2 ))
+drive 'FAILED:ai-review-gate' rail 0 1
+# ⛔ THE RUN FILE, NOT THE SPY: `wt_spawn` runs a worker through a per-worker script
+# (`$O/state/run-<name>.sh`) and the layout argv carries only its PATH, so the env the reviewer actually
+# receives is in that file. Measured: grepping `$TMP/spy` found the script name and no env at all.
+if grep -qF "REV_ROUND=$(( CAP - 1 ))" "$TMP/O/state/run-review-4242.sh" 2>/dev/null; then
+  ok "(c4d) the review ORDER carries REV_ROUND=$(( CAP - 1 )) — the round this review spends, derived from the counter"
+else
+  bad "(c4d) the spawn did not carry REV_ROUND: [$(grep -o 'REV_PAID=[^ ]*' "$TMP/O/state/run-review-4242.sh" 2>/dev/null | head -1)] file=$(ls "$TMP/O/state" 2>/dev/null | grep run- | head -3 | tr '\n' ' ')"
+fi
+clear_parked; clear_store; clear_revdisp; clear_round
+
+# (c4e) MAX_REVIEW=0 IS REPORT-ONLY, NOT "EVERYTHING IS EXHAUSTED" (fresh review of #3441, P1).
+# `is_limit 0` is TRUE and `install.sh` accepts `MAX_REVIEW=0`, so a bare `[ 0 -ge 0 ]` parked EVERY
+# PR in the queue with a reason claiming an exhausted budget it had never spent — a false diagnosis
+# manufactured by the knob whose sibling (`MAX_REVIEW_TRIES=0`) means the opposite. Measured before the
+# fix: 13 red arms under `MAX_REVIEW=0`, including "parked=abc1234 … rounds=0/0".
+clear_parked; clear_store; clear_revdisp; clear_round
+DRIVE_MAX_REVIEW=0 drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && ! grep -q 'REVIEW-CEILING' "$TMP/d.log" \
+   && [ ! -e "$TMP/O/state/parked-4242" ] && grep -q 'MAX_REVIEW=0 on this box (REPORT-ONLY' "$TMP/d.log"; then
+  ok "(c4e) MAX_REVIEW=0 is REPORT-ONLY: nothing dispatched, NOTHING parked, and the line says so"
+else
+  bad "(c4e) MAX_REVIEW=0 spawns=$(spawns) parked=[$(cat "$TMP/O/state/parked-4242" 2>/dev/null)] log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+clear_parked; clear_store; clear_revdisp; clear_round
+
+# (c4f) A FAILED SPAWN SPENDS NO ROUND — the `fixcount` rule, and a fresh review showed this arm was
+# MISSING: booking the round before `wt_spawn` (the exact regression the arm's comment forbids) kept
+# this suite fully green, because (c3) checks `reviewdisp` and `parked-` but never the round counter.
+# The seeded value matters: a counter that starts EMPTY cannot distinguish "not spent" from "written 0".
+clear_parked; clear_store; clear_revdisp; clear_round; seed_round $(( CAP - 1 ))
+drive 'FAILED:ai-review-gate' rail 0 0
+if [ "$(cat "$ROUND_F" 2>/dev/null)" = "$(( CAP - 1 ))" ] && [ "$(acts)" = "0" ]; then
+  ok "(c4f) a FAILED review spawn leaves the round counter at $(( CAP - 1 )) — nothing is spent when nothing starts"
+else
+  bad "(c4f) round=[$(cat "$ROUND_F" 2>/dev/null)] acts=$(acts) — a failed spawn consumed a review round"
+fi
+clear_parked; clear_store; clear_revdisp; clear_round
+
+# (c4g) THE OTHER WRITER — WHICH IS NOW THE ONLY WRITER (round-3 review, P1). The controller's arm is
+# driven above; `merge-one.sh` cannot be driven here (it needs gh, claims and the rail), so what is
+# pinned is the INVARIANT that took two review rounds to get right:
+#   * the round must not be written at the top of the file (a rail merge, a claim race, a duplicate
+#     invocation all exit before any review — that was round 2);
+#   * it must not be written just above `run_agent` either, because `run_agent` REFUSES the reviewer in
+#     its own arms (brief gate 80, pi load gate 76) and both say no reviewer ran — that was round 3;
+#   * and the CONTROLLER must not write it at all: its write fired before `merge-one.sh` started.
+# So: ONE writer, and its write sits BELOW `run_agent`, gated on `AGENT_STARTED`. ⛔ THE ANCHOR IS THE
+# `printf` ITSELF, not the diagnostic echo below it — the first version of this arm anchored on the
+# `|| echo` line, which made the window one line wide and let a DELETED write pass (round-3 review, P2).
+# The hazard scan is widened past `exit` to `exec`/`return`/`die`, any of which leaves the function —
+# and it SKIPS COMMENT LINES, because the block above the write legitimately names those words.
+MW="$(dirname "$ORCH")/merge-one.sh"
+# ⛔ COUNT THE WRITERS, DO NOT JUST FIND THE FIRST (round 4 review, P2). This arm's own claim is
+# "merge-one.sh is the ONLY round writer", and the first version located the write with `head -1` and
+# checked only THAT match's placement — so a SECOND writer appended lower in the file was invisible
+# and the arm stayed green. Measured on a copy of the tree: appending a duplicate write gave
+# 158 passed / 0 failed under a claimed "ONLY round writer". A double-spent round reaches
+# `REVIEW-CEILING … rounds=10/10` after ~5 real reviews and parks with a reason asserting a diagnosis
+# that does not exist — the exact false-diagnosis class this PR exists to close. Exclusivity is a
+# COUNT over every write into the counter — and the pattern must tolerate RESPELLINGS (round 5
+# review, P2; widened again by round 7, P2): the first version counted only `> "$_rr_f"`, so a
+# duplicate written as `>"$_rr_f"` (no space), unquoted, with `>>`, or via `| tee "$_rr_f"` left
+# W_COUNT=1 and the arm green; the second still missed `| tee -a "$_rr_f"` (the flag broke the match)
+# and any write to the LITERAL path (`> "$O/state/reviewround-$PR"`). Both were measured green. The
+# scan now allows tee flags, the `>|` noclobber override, and the atomic/file-copy idioms a future
+# lane would reach for (`dd of=`, `cp`, `mv`, `install`) — the ones round 8 measured as green under the
+# round-7 pattern (`>|`, `> tmp && mv tmp counter`, `| dd of=`, `cp`).
+# ⛔ THIS IS A HEURISTIC SCAN, NOT A PROOF, AND SAY SO PLAINLY (round 8 review, P2). No text pattern
+# can enumerate every way a shell writes a file, so the arm must not claim it "cannot be defeated" —
+# the earlier wording did, and each round found another spelling. What it DOES pin is the shape a real
+# second writer takes when a lane edits this file, and the behavioural half (placement below all three
+# refusal arms, the `= "1"` guard ending in `]; then`) is what makes it safe. ⚠️ STATED RESIDUAL: a
+# writer that reaches the counter by a form this pattern does not know is caught by nothing here.
+# Prefer strengthening the behavioural pins to growing this regex.
+W_COUNT="$(grep -cE '(>>?\||>>?|tee)[[:space:]]*(-[A-Za-z]+[[:space:]]+)*"?[^"[:space:]]*(_rr_f|reviewround-)|(dd[[:space:]]+of=|cp[[:space:]]+[^ ]+[[:space:]]+|mv[[:space:]]+[^ ]+[[:space:]]+|install[[:space:]]+[^ ]+[[:space:]]+)"?[^"[:space:]]*(_rr_f|reviewround-)' "$MW" || true)"
+# ⛔ THE PLACEMENT INVARIANT IS ABOUT WHEN THE WRITE **EXECUTES**, NOT WHERE IT IS DEFINED
+# (round 10 review, P1). Round 9 moved the write into `review_round_spend()` so the EXIT trap could
+# reach a reaped reviewer's round — but the helper was then defined BELOW `run_agent`, so the trap
+# fired while only the stub existed and the spend was DEAD CODE. The helper must be defined before the
+# thing it guards; therefore the line the pin checks is the CALL SITE, not the printf:
+#   * the printf (W_LINE) is the ONE write, wherever the helper is defined;
+#   * the ingress call must sit BELOW every refusal arm and be guarded by the exact `= "1"` test;
+#   * the exit hook must be DEFINED before `run_agent` and REGISTERED on the trap BEFORE
+#     `review_abandoned_record` (whose real definition is far below, so the stub otherwise wins).
+# ⛔ THE ANCHOR ACCEPTS BOTH SPELLINGS OF THE WRITE (fresh review of #3441, P2). The write is now
+# ATOMIC — `printf > "$_rr_new" && mv "$_rr_new" "$_rr_f"` — because `printf > "$_rr_f"` truncates
+# before it writes and both readers coerce a TORN (empty) book to 999999999, which parks a healthy PR
+# with a false `REVIEW-CEILING … rounds=999999999/10`. The temp name deliberately does NOT spell the
+# counter path, so `W_COUNT` still counts exactly ONE write into the destination (the `mv`); an anchor
+# that only knew the `> "$_rr_f"` spelling would have found no writer at all and failed the arm for
+# the safer code. Either spelling is accepted here, and the behavioural halves below (inside the
+# helper, below every refusal arm) are unchanged.
+W_LINE="$(grep -nE '^  (\{ )?printf .%s.n. *"\$REVIEW_ROUND" > "\$_rr_(f|new)"' "$MW" | cut -d: -f1 | head -1)"
+[ -n "$W_LINE" ] || W_LINE="$(grep -n '> "\$_rr_f" 2>/dev/null' "$MW" | cut -d: -f1 | head -1)"
+R_LINE="$(grep -n '^run_agent "${REVIEW_TIMEOUT' "$MW" | cut -d: -f1 | head -1)"
+# the guarded ingress CALL — the exact line, so an appended `&& false` / `|| true` cannot satisfy it
+CALL_LINE="$(grep -nxF 'if [ "${AGENT_STARTED:-0}" = "1" ]; then review_round_spend; fi' "$MW" | cut -d: -f1 | head -1)"
+# the exit hook: defined before `run_agent`, and registered FIRST on the trap
+HOOK_LINE="$(grep -n '^review_round_spend_at_exit() {' "$MW" | cut -d: -f1 | head -1)"
+HELPER_LINE="$(grep -n '^review_round_spend() {' "$MW" | cut -d: -f1 | head -1)"
+TRAP_LINE="$(grep -n "^trap 'review_round_spend_at_exit; review_abandoned_record" "$MW" | cut -d: -f1 | head -1)"
+# ⛔ NO TOTAL ORDER BETWEEN ARMS, AND THE ANCHOR'S OWN BODY MUST TERMINATE (round 10 review, P2):
+# a `if [ … ]; then : ; fi` DECOY satisfied both the header text and `arm_close()` while refusing
+# nothing, so the real arm could be moved below the write and the suite stayed green. Each anchor now
+# has to be a refusal that actually EXITS.
+arm_close() { # <anchor-line> -> the line of its closing `fi` (bare, column 0)
+  [ -n "$1" ] || return 0
+  awk -v a="$1" 'NR>a && /^fi$/ {print NR; exit}' "$MW" 2>/dev/null
+}
+# ⛔ THE ARM MUST END BY LEAVING, NOT MERELY CONTAIN AN `exit` SOMEWHERE (round 11 review, P2). The
+# round-10 version accepted any `^\s*exit N` in the block, so `if false; then exit 75; fi` — an
+# UNREACHABLE exit — satisfied it while the arm refused nothing; the real arm could then be moved
+# below the ingress call and the suite stayed GREEN (measured). What the invariant needs is that the
+# LAST thing the arm does is exit, so control cannot fall past it on the refusal path.
+arm_refuses() { # <anchor-line> <close-line> -> 0 when the block's LAST code line is a real `exit`
+  [ -n "$1" ] && [ -n "$2" ] || return 1
+  awk -v a="$1" -v b="$2" 'NR>a && NR<b && !/^[[:space:]]*#/ && NF {last=$0}
+       END{exit !(last ~ /^[[:space:]]*exit[[:space:]]+[0-9]+[[:space:]]*$/)}' "$MW" 2>/dev/null
+}
+A76="$(grep -nE '^if \[ "\$AGENT_RC" = "\$\{PI_GATE_REFUSED:-76\}" \]; then' "$MW" | cut -d: -f1 | head -1)"
+A78="$(grep -nE '^if \[ "\$\{AGENT_STARTED:-0\}" = "1" \] && \{' "$MW" | cut -d: -f1 | head -1)"
+A80="$(grep -nE '^if \[ "\$AGENT_RC" = "\$\{AGENT_BRIEF_REFUSED:-80\}" \]; then' "$MW" | cut -d: -f1 | head -1)"
+A78_OK=0
+if [ -n "$A78" ] && sed -n "${A78}p" "$MW" 2>/dev/null | grep -q 'PI_FORK_REFUSED:-78'; then A78_OK=1; fi
+C76="$(arm_close "${A76:-}")"; C78="$(arm_close "${A78:-}")"; C80="$(arm_close "${A80:-}")"
+LAST_CLOSE=0
+for _c in "${C76:-0}" "${C78:-0}" "${C80:-0}"; do if [ "${_c:-0}" -gt "$LAST_CLOSE" ]; then LAST_CLOSE="${_c:-0}"; fi; done
+ARMS_EXIT=0
+arm_refuses "${A76:-}" "${C76:-}" && arm_refuses "${A78:-}" "${C78:-}" && arm_refuses "${A80:-}" "${C80:-}" && ARMS_EXIT=1
+# ⛔ EVERY REFUSAL ARM MUST CLEAR THE ROUND FLAGS, AND *THAT* WAS PINNED BY NOTHING (round-16 review,
+# P3). The `(c4g)` scan above pins that the spend CALL is below these arms, but not what they DO:
+# measured, deleting BOTH `REV_STARTED=0` and `AGENT_STARTED=0` from the load arm, and both from the
+# fork/127 arm, EACH left the suite GREEN at 191/0. With both flags left at 1 the EXIT hook
+# (`review_round_spend_at_exit`, which requires `REV_STARTED=1` AND `AGENT_STARTED=1`) spends a round
+# for a reviewer that never ran — ten load refusals burn MAX_REVIEW=10 with ZERO reviews and park the PR
+# with `REVIEW-CEILING … rounds=10/10`, the false diagnosis this whole change exists to close.
+# ⛔ THE ARMS THAT FIRE **AFTER** `pi` WAS LAUNCHED (76, 78/127) NEED BOTH FLAGS, because `run_agent`
+# sets `AGENT_STARTED=1` before the spawn; the brief arm (80) returns before that, so `REV_STARTED=0`
+# alone is the documented one-rule invariant there (`merge-one.sh` says so at the arm).
+flags_cleared() { # <start> <close> <needs-agent-flag> <label>
+  local body rc=1 need="the"
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] || { bad "$4: the arm could not be located, so its flags are unverified"; return 0; }
+  # ⛔ WHOLE-LINE COMMENTS ARE FILTERED BEFORE THE STRIP, EXACTLY LIKE THE `(c4m)` SCANS (round-17
+  # review, P3). `c4mc` only removes an INLINE `#` (it requires whitespace before it), so a column-0
+  # comment survived it — measured: deleting BOTH real clears from the load arm and leaving the text in
+  # a `# REV_STARTED=0` / `# AGENT_STARTED=0` comment left this suite GREEN at 195/0 while the arm
+  # genuinely spent a round per refusal. That is the same decoy class round 17 closed next door, left
+  # open here; the two scans must share BOTH halves of the strip or they can drift in the load-bearing
+  # direction.
+  body="$(sed -n "${1},${2}p" "$MW" | awk '!/^[ \t]*#/' | c4mc)"
+  [ "${3:-0}" = "1" ] && need="both the"
+  case "$body" in *'REV_STARTED=0'*) : ;; *) rc=0 ;; esac
+  if [ "${3:-0}" = "1" ]; then case "$body" in *'AGENT_STARTED=0'*) : ;; *) rc=0 ;; esac; fi
+  [ "$rc" -eq 1 ] && ok "$4 clears the round flag(s) it must, so a refusal cannot spend a round through the EXIT hook" \
+    || bad "$4 does NOT clear $need round flag(s) — a refusal at this arm leaves REV_STARTED/AGENT_STARTED at 1, the EXIT hook then SPENDS a round for a reviewer that never ran, and MAX_REVIEW load/fork refusals burn the whole budget and park the PR with a false REVIEW-CEILING diagnosis"
+}
+flags_cleared "${A76:-}" "${C76:-}" 1 "(c4n) the LOAD refusal arm (rc 76 -> exit 75)"
+flags_cleared "${A78:-}" "${C78:-}" 1 "(c4n) the FORK/127 refusal arm (rc 78/127)"
+flags_cleared "${A80:-}" "${C80:-}" 0 "(c4n) the BRIEF refusal arm (rc 80)"
+# ── (c4o) A REPORT-ONLY BOX MUST NOT BANK A ROUND (fresh review of #3441, P2) ───────────────────────
+# `MAX_REVIEW=0` means "this box buys no reviewer rounds". The controller's dispatch arm honours that by
+# dispatching nothing and spending nothing; THIS ingress cannot dispatch-nothing (a direct caller —
+# `chain-<N>`, `fix-one.sh`, `lane-merge.sh`, an operator — asked for the review, and inventing a refusal
+# code for a policy knob would break readers that classify 3/75/80/127), but it MUST NOT SPEND either.
+# Measured before the guard: book 10, MAX_REVIEW=0 → exit 0 and the book became 11. Restoring the knob
+# then parks every such PR at `rounds=11/10` with a REVIEW-CEILING reason asserting a spent budget that
+# nobody configured — the false-diagnosis class this whole change exists to close, manufactured by the
+# knob that was supposed to be inert.
+RRSPEND="$TMP/rrspend.sh"
+# ⛔ `$MW` (set near the top of this file), NOT `$MERGED_ONE_SH` — that one is assigned 100+ lines BELOW
+# this block, and using it here left `$RRSPEND` empty: every `(c4o)` arm then reddened for the wrong
+# reason and `(c4o) MAX_REVIEW=0 banks NO round` passed VACUOUSLY (an absent function writes nothing).
+# Measured by the verifier before this line was corrected: 198/4 at every cap, with `sed: can't read :`
+# in the log. An arm that cannot tell "the guard held" from "there is no writer" is not an arm.
+sed -n '/^review_round_spend() {/,/^}$/p' "$MW" > "$RRSPEND"
+# ⛔ AND ITS CALLEE, EXTRACTED HERE TOO (same ordering class, second variable). `$RRCEIL` — the suite's
+# shared extract of the `[rrceiling]` block — is assigned 100+ lines BELOW this section, so sourcing it
+# here left `_rr_report_only` UNDEFINED: `command not found`, the `if` went false, the guard was skipped
+# and the writer banked a round. The NOHELPER sentinel cannot catch that one, because the WRITER is
+# present — the arm looked like a genuine `book=11`. Measured by the verifier: 201/2 with this block
+# reddening on its own. `$MW` and `$TMP` are both valid here; nothing else is assumed.
+RRCEIL_O="$TMP/rrceiling.o.sh"
+sed -n '/# \[rrceiling:begin\]/,/# \[rrceiling:end\]/p' "$MW" | sed '1d;$d' > "$RRCEIL_O"
+# ⛔ AND THE WRITER'S OWN READER, FOR THE SAME ORDERING REASON AND ONE MORE (fresh review of #3441, P3).
+# `review_round_spend` RE-READS the book before it writes (the refund fix below), so the shipped helper
+# depends on `_rr_read_book` — which sits above it in merge-one.sh, unconditionally, so production always
+# has it. A fixture that sourced only the writer therefore made every spend arm noisy with
+# `_rr_read_book: command not found` (and the following `-ge` errored, leaving the write at the
+# top-of-file value); `(c4t)` caught it as a stderr leak, which is exactly what that arm is for. Extracted
+# HERE rather than at `(c4k)`, 400 lines below, so every arm that drives the writer can source it.
+RRBOOK_O="$TMP/rrbook.o.sh"
+sed -n '/^_rr_read_book() {/,/^}$/p' "$MW" > "$RRBOOK_O"
+if [ -s "$RRSPEND" ]; then
+  ok "(c4o) merge-one.sh::review_round_spend was extracted (declared)"
+else
+  bad "(c4o) review_round_spend could NOT be extracted from merge-one.sh — the report-only spend guard is unverified, and every arm below it would pass VACUOUSLY (an absent writer writes nothing, which looks exactly like a guard that held)"
+fi
+if [ -s "$RRSPEND" ] && ! grep -q '_rr_report_only' "$RRSPEND"; then
+  bad "(c4o) review_round_spend does not consult _rr_report_only — a MAX_REVIEW=0 box banks a round for every direct-ingress review it buys, and a later restore of the knob parks those PRs with a false REVIEW-CEILING diagnosis"
+elif [ -s "$RRSPEND" ]; then
+  ok "(c4o) merge-one.sh::review_round_spend consults the report-only predicate before it writes"
+fi
+# ⛔ THE PREDICATE MUST ACTUALLY RESOLVE (not merely be named). A text grep inside the helper is not
+# enough: the helper names it either way. This is the arm that would have caught the empty `$RRCEIL`.
+if ( . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; command -v _rr_report_only >/dev/null 2>&1 ); then
+  ok "(c4o) _rr_report_only RESOLVES from the [rrceiling] block — the spend helper's predicate is defined, not merely referenced"
+else
+  bad "(c4o) _rr_report_only does not resolve after sourcing the [rrceiling] block — the spend guard is INERT (the \`if\` fails and the writer banks a round) while looking pinned, so every MAX_REVIEW=0 box still fills the counter"
+fi
+rrspend() { # <max> <round> <book-seed> -> the book AS FOUND after the spend, or NOHELPER
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  printf '%s\n' "$3" > "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND="$2"; MAX_REVIEW="$1"
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"
+    # ⛔ A MISSING WRITER MUST NOT LOOK LIKE A HELD GUARD (the vacuous pass the verifier measured): if the
+    # extraction produced nothing, `review_round_spend` is undefined, the book is untouched, and the
+    # "banks NO round" arm would be GREEN for the wrong reason. Say NOHELPER instead.
+    if command -v review_round_spend >/dev/null 2>&1; then review_round_spend; else : > "$d/nohelper"; fi )
+  if [ -f "$d/nohelper" ]; then printf 'NOHELPER\n'; else cat "$d/state/reviewround-777"; fi
+  mv "$d" "$TMP/rrspend.spent.$RANDOM" 2>/dev/null || true
+}
+_got="$(rrspend 0 11 10)"
+[ "$_got" = "10" ] && ok "(c4o) MAX_REVIEW=0 (REPORT-ONLY) banks NO round — the book is left at 10 for a round-11 spend" \
+  || bad "(c4o) MAX_REVIEW=0 BANKED a round (book=$(printf '%s' "$_got"), expected 10) — a box configured to buy no reviewer rounds fills the counter it is then restored against"
+_got="$(rrspend "$CAP" "$CAP" $(( CAP - 1 )))"
+[ "$_got" = "$CAP" ] && ok "(c4o) a NORMAL box still banks the round (book $(( CAP - 1 )) -> $CAP) — the report-only guard does not disarm the spend" \
+  || bad "(c4o) a normal MAX_REVIEW=$CAP box did NOT bank the round (book=$(printf '%s' "$_got")) — the report-only guard is too wide and the ceiling is now inert everywhere"
+_got="$(rrspend garbage 11 10)"
+[ "$_got" = "11" ] && ok "(c4o) a GARBAGE MAX_REVIEW still banks (book 10 -> 11) — an unreadable knob fail-closes toward the ceiling, never toward a free budget" \
+  || bad "(c4o) a GARBAGE MAX_REVIEW did not bank (book=$(printf '%s' "$_got")) — an unreadable knob must coerce to the documented default 10, never to report-only"
+# ⛔ THE WRITE RE-DERIVES THE FLOOR FROM A FRESH READ (fresh review of #3441, P3, MEASURED REFUND).
+# `$REVIEW_ROUND` is computed at the TOP of merge-one.sh, while the ceiling check that runs before the
+# spend reads the book FRESH "because a concurrent reviewer on this box may have written the book
+# since". Both were shipped at once, so the write could put the LOWER top-of-file value back over a
+# HIGHER one another reviewer had just written — refunding a round, the mirror of the `max()` floor.
+# The arm drives exactly that interleaving: round CAP-1 in hand, another writer already at CAP+3. The
+# shipped write must land CAP+4. MUTANT (measured): delete the re-derive block from the extracted
+# helper and this arm reds with the book back at CAP-1.
+_got="$(rrspend "$CAP" $(( CAP - 1 )) $(( CAP + 3 )))"
+[ "$_got" = "$(( CAP + 4 ))" ] && ok "(c4o) a book a CONCURRENT writer moved ahead is never overwritten: round $(( CAP - 1 )) against a book of $(( CAP + 3 )) lands $(( CAP + 4 )), not a REFUND back to $(( CAP - 1 ))" \
+  || bad "(c4o) the spend wrote the TOP-OF-FILE round over a higher book (book=$(( CAP + 3 )) -> $(printf '%s' "$_got"), expected $(( CAP + 4 ))) — the counter moves BACKWARDS, so each such interleaving refunds a round and the per-PR ceiling is loose by exactly as many as happen"
+# ⛔ AND THE WRITER'S CLAMPS, WHICH WERE PINNED BY NOTHING (fresh review of #3441, P3). Both READERS
+# coerce a 10-digit book (the `(c4j)`/`(c4k)` arms BELOW drive both readers), so a writer that EMITS one is invisible until a
+# reader launders it. The reachable one is the SPEND'S OWN clamp, not the top-of-file one: the ceiling
+# check reads the book once, near the top, and the spend re-reads it afterwards, so a book that reached
+# 999999999 during an already-allowed review hands `+ 1` a 10-digit candidate. MUTANT (measured): delete
+# the `[ "${#REVIEW_ROUND}" -gt 9 ] && REVIEW_ROUND=999999999` line INSIDE the re-derivation block and
+# this arm reds with `1000000000`. ⛔ THE TOP-OF-FILE `if` IS NOT THIS ARM'S MUTANT, and the reason is
+# mechanical rather than semantic (fresh review of #3441, P3): that line executes BEFORE the helper and
+# is not inside the extracted function, so deleting it leaves the driven helper BYTE-IDENTICAL — the arm
+# cannot observe it at all. (An earlier version of this comment gave a different reason — that the
+# in-spend clamp clamps first — which is measurably wrong: the in-spend clamp sits inside its own `if`
+# and cannot touch a value arriving from the top-of-file assignment.)
+_got="$(rrspend "$CAP" 5 999999999)"
+[ "$_got" = "999999999" ] && ok "(c4o) the WRITER clamps a spend on a book already at the 9-digit ceiling back to 999999999, never emitting a 10-digit value for a reader to launder" \
+  || bad "(c4o) the spend wrote a 10-digit book ($(printf '%s' "$_got"), expected 999999999) — the reachable clamp (the one inside the re-derivation) is gone, so the writer emits a numeral its own readers must coerce and its 9-digit invariant is false"
+sed 's/if _rr_report_only "${MAX_REVIEW:-}"; then/if false; then/' "$RRSPEND" > "$TMP/rrspend.rev.sh"
+diff -q "$RRSPEND" "$TMP/rrspend.rev.sh" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  M6="$( . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$TMP/rrspend.rev.sh"
+         d="$(mktemp -d)"; mkdir -p "$d/state"; printf '10\n' > "$d/state/reviewround-777"
+         ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=11; MAX_REVIEW=0; review_round_spend )
+         cat "$d/state/reviewround-777"; mv "$d" "$TMP/rrspend.rev.spent.$RANDOM" 2>/dev/null || true )"
+  [ "${M6:-}" = "11" ] && ok "MUTANT-M6: reverting the report-only guard makes MAX_REVIEW=0 bank a round again (book 10 -> 11) — (c4o)'s first arm would report ❌" \
+    || bad "MUTANT-M6 did not behave as a mutant (book=${M6:-<empty>}) — the arm above proves nothing"
+else
+  bad "MUTANT-M6 changed nothing — the report-only anchor no longer matches review_round_spend, so the arm above proves nothing"
+fi
+# PLACEMENT: the guarded ingress CALL sits below every refusal arm's closing `fi` (any arm order), and
+# nothing but comments leaves the script between the last arm and that call.
+# ⛔ THE WRITE MUST LIVE **INSIDE** THE HELPER (round 12 review, P2). Round 11 compared only the
+# CALL site against the refusal arms and merely required `W_LINE > HELPER_LINE`. So the printf could be
+# lifted OUT of the helper and dropped directly above the load arm — W_COUNT stays 1, CALL_LINE still
+# sits below every arm, every other component still satisfied — and a load refusal spends a round
+# again (the exact round-11 defect), suite GREEN. Measured. The write, not merely the call, has to be
+# the helper's own body.
+HELPER_END="$(awk -v a="${HELPER_LINE:-0}" 'NR>a && /^}$/ {print NR; exit}' "$MW" 2>/dev/null)"
+# ⛔ COUNT THE CALL SITES TOO (round 13 review, P2). Pinning the WRITE and ONE anchored call left the
+# CALLERS unobserved: inserting a second spend above the load arm — `review_round_spend` bare, or
+# `[ "${AGENT_STARTED:-0}" = "1" ] && review_round_spend` — kept W_COUNT=1, the write inside the helper
+# and CALL_LINE below every arm, so the suite stayed GREEN while a load refusal spent a round (the
+# round-11 P1 again). There are exactly THREE non-comment mentions by design: the DEFINITION, the EXIT
+# HOOK's call, and the guarded INGRESS call. Anything else is a new spender.
+SPEND_COUNT="$(awk '!/^[[:space:]]*#/ && /review_round_spend([^_]|$)/ {n++} END{print n+0}' "$MW" 2>/dev/null)"
+PLACE_OK=0
+if [ -n "$CALL_LINE" ] && [ -n "$LAST_CLOSE" ] && [ "$LAST_CLOSE" -gt 0 ] \
+   && [ "$CALL_LINE" -gt "$LAST_CLOSE" ] && [ "$ARMS_EXIT" = "1" ] && [ "$A78_OK" = "1" ] \
+   && [ "${SPEND_COUNT:-0}" = "3" ] \
+   && [ -n "$W_LINE" ] && [ -n "$HELPER_LINE" ] && [ -n "$HELPER_END" ] \
+   && [ "$W_LINE" -gt "$HELPER_LINE" ] && [ "$W_LINE" -lt "$HELPER_END" ] \
+   && ! awk -v a="$LAST_CLOSE" -v b="$CALL_LINE" 'NR>a && NR<b && !/^[[:space:]]*#/ && /(^|[^[:alnum:]_])(exit|exec|return|die)[[:space:](]/ {print; found=1} END{exit !found}' "$MW" >/dev/null; then
+  PLACE_OK=1
+fi
+# THE TRAP PATH: the hook is defined BEFORE `run_agent` (a helper defined after the call it must guard
+# is unreachable from the trap — the round-9 defect) and registered FIRST on the trap, ahead of the
+# recorder whose real definition sits far below.
+# ⛔ AND NO LATER `trap … EXIT` MAY SUPERSEDE IT (round 12 review, P2). `merge-one.sh` re-registers
+# its EXIT trap twice (`rm -f "$CLAIM"`, then the claim-release pair), so moving the hook trap UP — a
+# legal-looking position, still before `run_agent` — silently replaces it and a TERM'd reviewer never
+# pays. Measured: 159/0 with the hook trap at the top of the file. The hook's registration must be the
+# LAST EXIT registration before the review starts.
+# ⛔ ANY LINE THAT MENTIONS BOTH `trap` AND `EXIT`, not only a line BEGINNING with `trap` (round 13
+# review, P3): the first version missed a one-line helper that registers the trap (`_rearm() { trap
+# 'rm -f "$CLAIM"' EXIT; }`) and is CALLED in the window, which measurably replaced the hook while the
+# suite stayed green. ⚠️ STATED RESIDUAL: a function DEFINED above the window and merely CALLED inside
+# it still escapes any text scan — the natural form (a third inline re-registration, as at the two
+# sites in `merge-one.sh`) is caught, which is what this pin is for.
+SUPERSEDING_TRAPS="$(awk -v a="${TRAP_LINE:-0}" -v b="${R_LINE:-0}" 'NR>a && NR<b && !/^[[:space:]]*#/ && /trap/ && /EXIT/ {n++} END{print n+0}' "$MW" 2>/dev/null)"
+GUARD_OK=0
+# ⛔ THE TRAP MUST BE REGISTERED **BEFORE** `run_agent`, NOT MERELY EXIST (round 11 review, P2).
+# Moving the `trap … EXIT` line below the review left the earlier bare `trap 'rm -f "$CLAIM"' EXIT` in
+# force during the review, so a TERM mid-review never reached the hook — the round-9 dead-code defect
+# again, with the suite green. Ordering is the whole property.
+if [ -n "$HOOK_LINE" ] && [ -n "$HELPER_LINE" ] && [ -n "$R_LINE" ] && [ -n "$TRAP_LINE" ] \
+   && [ "$HELPER_LINE" -lt "$HOOK_LINE" ] && [ "$HOOK_LINE" -lt "$R_LINE" ] \
+   && [ "$TRAP_LINE" -lt "$R_LINE" ] && [ "${SUPERSEDING_TRAPS:-1}" = "0" ]; then
+  GUARD_OK=1
+fi
+if [ "$PLACE_OK" = "1" ] && [ "$GUARD_OK" = "1" ] && [ "${W_COUNT:-0}" = "1" ]; then
+  ok "(c4g) merge-one.sh is the ONLY round writer; the guarded ingress call sits BELOW all three refusal arms (each of which really exits); the round-spend helper is defined ABOVE run_agent so the EXIT trap can reach it; and the trap hook is registered BEFORE the recorder whose real definition is far below"
+else
+  bad "(c4g) round-writes=$W_COUNT write=${W_LINE:-<none>} helper=${HELPER_LINE:-<none>} hook=${HOOK_LINE:-<none>} trap=${TRAP_LINE:-<none>} ingress-call=${CALL_LINE:-<none>} reviewer-start=${R_LINE:-<none>} load-arm=${A76:-<none>} fork-arm=${A78:-<none>} fork-arm-ok=$A78_OK brief-arm=${A80:-<none>} last-arm-close=${LAST_CLOSE:-<none>} arms-exit=$ARMS_EXIT spend-sites=$SPEND_COUNT superseding-traps=${SUPERSEDING_TRAPS:-?} guard-ok=$GUARD_OK place-ok=$PLACE_OK — the round writer is duplicated (expected exactly 1), the guarded ingress call is missing or sits ABOVE a refusal arm (a refusal would then spend a round for a reviewer that never ran), the helper/hook is defined after run_agent (the EXIT trap cannot reach it), or the trap hook is not registered first: $(awk -v a="${LAST_CLOSE:-0}" -v b="${CALL_LINE:-0}" 'NR>a && NR<b && !/^[[:space:]]*#/ && /(^|[^[:alnum:]_])(exit|exec|return|die)[[:space:](]/ {printf "%s:%s ", NR, $0}' "$MW")"
+fi
+# …and the CONTROLLER must not write it at ALL, and must not carry a dormant second writer either
+# (round-3 review P1 for the call site; fresh review of #3441 P2 for the dead function). A call site in
+# the arm means the dispatch pays before the worker exists; a DEFINITION with no failure handling is a
+# fail-open waiting for the next lane to wire it back in. Both are defects, so the scan asserts the
+# name is ABSENT — not merely uncalled.
+# ⛔ NO PIPE INTO A QUIET GREP (#841/#864 — `scripts/check-no-sigpipe-grep.sh` caught the first version of
+# this arm): capture the non-quiet producer, then test in the shell.
+_rrc_calls="$(awk '!/^[[:space:]]*#/ && /review_round_record/ {print FILENAME":"FNR": "$0}' "$ORCH")"
+case "$_rrc_calls" in
+  *[![:space:]]*) bad "(c4g2) orch-loop.sh still CARRIES review_round_record (a call site, or a dead second writer with no write-failure handling): $(printf '%s' "$_rrc_calls" | head -2 | tr '\n' ';')" ;;
+  *) ok "(c4g2) orch-loop.sh neither CALLS nor DEFINES review_round_record — the dispatch cannot spend a round before the reviewer runs, and no dormant second writer exists to be re-wired" ;;
+esac
+
+# ── (c4h–c4j) THE TWO READERS OF THE ROUND BOOK MUST FAIL CLOSED, ON BOTH INGRESSES ──────────────────
+# ⛔ TWO OPEN FINDINGS FROM THE FRESH REVIEW OF #3441, both fail-open in the same direction: a review the
+# ceiling exists to refuse was still bought.
+#   * merge-one.sh never consulted `MAX_REVIEW` at all. `orch-loop.sh` refuses on its DISPATCH arm, but
+#     `chain-<N>` / `fix-one.sh` / `lane-merge.sh` / a hand-run operator reach merge-one DIRECTLY, so the
+#     documented bound ("exact for controller-dispatched reviews, delayed by at most one direct review")
+#     was one nobody enforced. (c4h)/(c4i) pin the decision and its call site.
+#   * `review_round_read` coerced a CORRUPT or OVERSIZED book to `0` — i.e. garbage read as "nothing spent
+#     yet", resetting the budget. (c4j) pins the coercion, and `merge-one.sh::_rr_read_book` coerces the
+#     same way because two readers of one file must not disagree.
+MERGED_ONE_SH="$(dirname "$ORCH")/merge-one.sh"
+RRCEIL="$TMP/rrceiling.sh"
+sed -n '/# \[rrceiling:begin\]/,/# \[rrceiling:end\]/p' "$MERGED_ONE_SH" | sed '1d;$d' > "$RRCEIL"
+if [ -s "$RRCEIL" ] && grep -q '_rr_ceiling_hit' "$RRCEIL"; then
+  ok "(c4h) merge-one.sh carries the [rrceiling] block — the DIRECT ingress consults the round ceiling"
+else
+  bad "(c4h) the [rrceiling] block is MISSING from merge-one.sh, so only the controller's dispatch arm bounds the round budget and a direct/chain/fix-one review buys round n+1 past it"
+fi
+# Drive the decision itself. ⛔ THE ARMS ARE DERIVED FROM `CAP`, NOT HARDCODED (#3441 round-2 P2): a box
+# pinned to 4 or 12 is an ordinary box.
+rr_drive() { # <book> <max> -> prints REFUSE|allow
+  # shellcheck disable=SC1090
+  ( . "$RRCEIL"; if _rr_ceiling_hit "$1" "$2"; then echo REFUSE; else echo allow; fi )
+}
+for pair in "$(( CAP - 1 )):$CAP:allow" "$CAP:$CAP:REFUSE" "$(( CAP + 1 )):$CAP:REFUSE" \
+            "0:0:allow" "0:$CAP:allow" "garbage:$CAP:REFUSE" \
+            "999999999:$CAP:REFUSE" "1000000000:$CAP:REFUSE"; do
+  b="${pair%%:*}"; rest="${pair#*:}"; m="${rest%%:*}"; want="${rest#*:}"
+  got="$(rr_drive "$b" "$m")"
+  [ "$got" = "$want" ] && ok "(c4h) book=$b max=$m -> $want" \
+    || bad "(c4h) book=$b max=$m -> $got, expected $want — got the opposite decision, so the round ceiling FAILS OPEN on this ingress"
+done
+# ⛔ A BAD `max` FALLS BACK TO THE DOCUMENTED DEFAULT — NOT TO 0 AND NOT TO `garbage`. Asserting the
+# decision on `$CAP:garbage` would encode the SHIPPED DEFAULT 10 (it reads `allow` on a box with
+# `MAX_REVIEW=4`, i.e. a false red), so this arm compares the two answers instead of stating one.
+if [ "$(rr_drive "$CAP" garbage)" = "$(rr_drive "$CAP" 10)" ] && [ "$(rr_drive 10 garbage)" = "REFUSE" ]; then
+  ok "(c4h) a GARBAGE max is coerced to the documented default 10 (same decision as max=10, not to 0/allow)"
+else
+  bad "(c4h) a GARBAGE max is not coerced to 10: garbage=$(rr_drive "$CAP" garbage) max10=$(rr_drive "$CAP" 10) book10/garbage=$(rr_drive 10 garbage) — an unresolvable knob must fall back to the documented default, never to 'allow everything'"
+fi
+# ⛔ AND THE BOUNDARY FROM BELOW, WHICH IS THE HALF THE ARM ABOVE CANNOT SEE (round-16 review, P3).
+# The comparison above holds for ANY fallback >= 10 and for any fallback that is `allow` at $CAP, so a
+# coercion default of 3 stayed GREEN at `DRIVE_MAX_REVIEW=10` and `=12` — i.e. unpinned exactly where
+# the suite ships. `book=9` against a garbage max separates 10 from 3: at 10 it is `allow` (9 < 10), at 3
+# it is REFUSE. Measured: shipped → allow; `max=3` mutant → REFUSE.
+if [ "$(rr_drive 9 garbage)" = "allow" ]; then
+  ok "(c4h) a GARBAGE max is a fallback ABOVE 9 (so a 9-round book is still allowed) — the default is not a small number that would park a PR early"
+else
+  bad "(c4h) a GARBAGE max refuses a book of 9 — the coercion fell back to a SMALL ceiling (3?), so on a box whose MAX_REVIEW is unreadable a PR parks after a few rounds instead of 10, with a REVIEW-CEILING reason asserting a budget that was never the configured one"
+fi
+# ── (c4p) THE TERMINAL LINE'S `rounds=<n>/<max>` FIELD MUST CARRY THE COERCED MAX (fresh review of
+# #3441, P2). The DECISION coerces a garbage / oversized `MAX_REVIEW` through `_rr_coerce_max`, but the
+# park reason and the log echo printed the RAW knob — so the one machine-read line read
+# `REVIEW-CEILING 4242 rounds=10/garbage` while the decision it reported used 10: a line that
+# DISAGREES with the refusal it describes, and a non-numeric field in the format README §4 documents.
+# `orch-loop.sh` cannot reach this (it normalises `MAX_REVIEW` at startup); `merge-one.sh` has no such
+# early normalisation, so it must coerce at the one place it reads.
+# ⛔ TWO HALVES, AND ONLY THE FIRST IS BEHAVIOURAL (stated, not implied): the coercion table below
+# drives the SHIPPED block, and the shape pin after it requires the assignment site to go THROUGH that
+# coercion. A residual remains — a future edit that coerced correctly and then re-read the raw knob
+# somewhere else in the message is caught by nothing here.
+rr_coerce_drive() { # <knob> -> the coerced max, from the SHIPPED block
+  # shellcheck disable=SC1090
+  ( . "$RRCEIL"; _rr_coerce_max "$1" )
+}
+COERCE_BAD=0
+for pair in "garbage:10" "09:10" "00:10" "0:0" "$CAP:$CAP" "1000000000:10" ":10"; do
+  k="${pair%%:*}"; want="${pair#*:}"
+  got="$(rr_coerce_drive "$k")"
+  [ "$got" = "$want" ] || { COERCE_BAD=1; bad "(c4p) MAX_REVIEW='$k' coerces to '$got', expected '$want'"; }
+done
+[ "$COERCE_BAD" = "0" ] && ok "(c4p) _rr_coerce_max maps garbage / leading-zero / oversized / empty to the documented default 10 and keeps only the exact '0' as REPORT-ONLY — the same rule is_limit/is_num applies, so both ingresses coerce one knob one way"
+RC_MAX_ASSIGN="$(grep -nE '^_rr_max=' "$MERGED_ONE_SH" | head -1)"
+RC_MAX_RHS="${RC_MAX_ASSIGN#*_rr_max=}"
+case "$RC_MAX_RHS" in
+  '"$(_rr_coerce_max'*) ok "(c4p) the ceiling's max is assigned THROUGH _rr_coerce_max (:${RC_MAX_ASSIGN%%:*}), so the line cannot print the raw knob again" ;;
+  *) bad "(c4p) _rr_max is assigned from the RAW knob (${RC_MAX_ASSIGN:-<none>}) — the REVIEW-CEILING field can then disagree with the decision that produced it (rounds=10/garbage)" ;;
+esac
+# ── (c4q) THE BOOK WRITE MUST BE ATOMIC — SIBLING, THEN RENAME (fresh review of #3441, P2) ────────
+# A `printf` redirected STRAIGHT ONTO the counter TRUNCATES before it writes, and BOTH readers coerce
+# an EMPTY book to 999999999 on purpose (an unreadable book is corruption, never round 0), so a
+# controller reading inside that window PARKS A HEALTHY PR with `REVIEW-CEILING … rounds=999999999/10`
+# and a reason asserting a budget nobody spent. A rename is atomic, so no reader can see a partial
+# book. ⛔ THIS IS A SHAPE PIN, AND IT IS THE RIGHT KIND HERE: the property ("the bytes never become
+# visible under the counter's name until they are complete") is a property of HOW the file is written,
+# not of what a caller can observe in a test — there is no deterministic way to lose a race on demand
+# in this suite. What it removes is the regression that reintroduces the window, and MUTANT-Q below
+# in this suite. What it removes is the regression that reintroduces the window, and MUTANT-Q below
+# proves it can fail. ⛔ AND IT READS COMMENT-STRIPPED SOURCE, NOT THE EXTRACTED TEXT AS-IS (fresh review
+# of #3441, P3 — MEASURED DECOY): the badge above used to claim extraction made comment text
+# unusable, but extraction drops the block ABOVE the function, not the comments INSIDE it, and the
+# helper is full of them. Restoring the truncating write AND adding one `#` comment inside the helper
+# carrying both literals left this arm GREEN (207/2, the second red being MUTANT-Q's moved anchor). The
+# strip is the SAME `c4mc`-style one `(c4m)`/`(c4n)` use, so the scans cannot drift.
+RRSPEND_CODE="$(awk '!/^[[:space:]]*#/' "$RRSPEND" 2>/dev/null | c4mc)"
+RR_ATOMIC=0
+if [ -n "$RRSPEND_CODE" ] \
+   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' \
+   && printf '%s\n' "$RRSPEND_CODE" | grep -qF 'mv "$_rr_new" "$_rr_f"'; then
+  RR_ATOMIC=1
+  ok "(c4q) the round book is written to a SIBLING and RENAMED onto the counter — a reader can never observe a torn (empty) book, which both readers would read as 999999999 and park a healthy PR"
+else
+  bad "(c4q) review_round_spend does NOT write the book atomically — a `printf` straight onto the counter truncates before it writes, a concurrent reader coerces the empty book to 999999999, and a healthy PR parks with a false REVIEW-CEILING rounds=999999999/10 diagnosis"
+fi
+# ⛔ (c4r) THE FAILURE BRANCH MUST STILL BE REACHABLE, AND A DIRECTORY IS HOW IT BECOMES UNREACHABLE
+# (fresh review of #3441, P2 — a REGRESSION THE ATOMIC WRITE INTRODUCED). `mv` onto an existing
+# DIRECTORY moves the temp INSIDE it and exits 0, so the `|| { rm -f …; echo … CANNOT BE WRITTEN … }`
+# group never fires: the temp is left behind, the log says nothing, and `_rr_read_book` coerces the
+# directory to 999999999 — the false `REVIEW-CEILING … rounds=999999999/10` park this atomicity exists
+# to prevent, reached by a non-torn route, with `_rr_written=1` suppressing the EXIT-hook retry.
+# Driven BEHAVIOURALLY against the SHIPPED helper (so it needs no mutant: dropping the `[ ! -d ]`
+# guard reddens it — that is the defect this arm was written from, measured at 209/0 -> ❌ here).
+rrspend_bookdir() { # -> "named=<0|1> temps=<n>" for a DIRECTORY planted at the counter path
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; MAX_REVIEW=10
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"
+    review_round_spend 2>/dev/null || true
+    n=0; grep -qF 'CANNOT BE WRITTEN' "$d/log.log" 2>/dev/null && n=1
+    printf 'named=%s ' "$n"
+    # ⛔ COUNTED ANYWHERE UNDER state/, not just as a sibling: `mv` onto a DIRECTORY moves the temp
+    # INSIDE it, so a sibling-only count reads 0 on the very failure this arm exists for (measured).
+    t="$(find "$d/state" -name 'reviewround-777.new.*' 2>/dev/null | wc -l | tr -d ' ')"
+    printf 'temps=%s\n' "$t" )
+  mv "$d" "$TMP/rrspend.dir.spent.$RANDOM" 2>/dev/null || true
+}
+RR_DIR="$(rrspend_bookdir)"
+case "$RR_DIR" in
+  'named=1 temps=0') ok "(c4r) an UNWRITABLE counter (a directory at the path) is NAMED in the log and leaves NO temp file behind — the failure branch is reachable, so the operator is not left with a silent false REVIEW-CEILING" ;;
+  *) bad "(c4r) an unwritable counter is NOT reported cleanly ($RR_DIR, expected named=1 temps=0) — a directory at state/reviewround-<PR> makes the rename move the temp INSIDE it and exit 0, so the failure group never fires: the log says nothing, a temp file is left under state/, and the next reader coerces the book to 999999999 and parks a healthy PR with a false REVIEW-CEILING rounds=999999999/10" ;;
+esac
+# ⛔ (c4r2) A FAILED WRITE MUST NOT REPORT A SPEND (verifier of THIS fix round, P1-class). The fix for the
+# EXIT recorder's unconditional "round N spent" echo added an `_rr_banked` flag — and the FIRST version of
+# that fix set it AFTER the `||` chain, so the FAILURE branch (which had no `return`) fell THROUGH to it:
+# a write that provably did not land still marked the round banked, and the recorder printed
+# "review round N spent by the EXIT recorder" directly beside "CANNOT BE WRITTEN — book UNCHANGED". That
+# is the exact defect the flag was added to close, reintroduced by its own plumbing — so it gets an arm,
+# driven through the SHIPPED recorder on BOTH no-bank shapes. Measured before the `return 0` in the
+# failure branch: `dir: named=1 spent=1` and `ro: spent=1` on the report-only box, both GREEN over a book
+# that never moved; `spent=` was named nowhere in this suite.
+RRSPEND_EXIT="$TMP/rrspend.exit.sh"
+awk '/^review_round_spend_at_exit\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$MW" > "$RRSPEND_EXIT"
+rrspend_exit_shape() { # <dir|ro> -> "named=<0|1> spent=<0|1>" for a spend that does NOT bank
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  [ "$1" = "dir" ] && mkdir -p "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; REV_STARTED=1; AGENT_STARTED=1
+    if [ "$1" = "ro" ]; then MAX_REVIEW=0; else MAX_REVIEW=10; fi
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"; . "$RRSPEND_EXIT"
+    command -v review_round_spend_at_exit >/dev/null 2>&1 || { printf 'NOHELPER\n'; exit 0; }
+    review_round_spend_at_exit 2>/dev/null || true
+    n=0; grep -qF 'CANNOT BE WRITTEN' "$d/log.log" 2>/dev/null && n=1
+    s=0; grep -qF 'spent by the EXIT recorder' "$d/log.log" 2>/dev/null && s=1
+    printf 'named=%s spent=%s\n' "$n" "$s" )
+  mv "$d" "$TMP/rrspend.exit.spent.$RANDOM" 2>/dev/null || true
+}
+[ -s "$RRSPEND_EXIT" ] || bad "(c4r2) review_round_spend_at_exit could NOT be extracted from merge-one.sh — the recorder's spend echo is unverified, so both arms below are vacuous"
+RR_EX_DIR="$(rrspend_exit_shape dir)"
+RR_EX_RO="$(rrspend_exit_shape ro)"
+[ "$RR_EX_DIR" = 'named=1 spent=0' ] && ok "(c4r2) a FAILED write (directory at the counter) is NAMED and the EXIT recorder claims NO spend — a grep for 'spent' finds nothing, because the book never moved" \
+  || bad "(c4r2) a FAILED write reported ($RR_EX_DIR, expected named=1 spent=0) — a spend the book never recorded is greppable in the log beside its own CANNOT BE WRITTEN line: the false-report class this change removes, manufactured by the flag added to remove it"
+[ "$RR_EX_RO" = 'named=0 spent=0' ] && ok "(c4r2) a REPORT-ONLY box (MAX_REVIEW=0) banks nothing and the EXIT recorder claims NO spend — the two log lines no longer contradict each other" \
+  || bad "(c4r2) the REPORT-ONLY shape reported ($RR_EX_RO, expected named=0 spent=0) — the recorder still prints 'round N spent' on a box whose book it deliberately leaves untouched"
+# ⛔ (c4s) THE MESSAGE MUST STATE THE REAL CONSEQUENCE AND A REPAIR THAT WORKS (fresh review of #3441,
+# P2). The first version of that line said "the per-PR round ceiling cannot be counted on this path (the
+# per-head budget still binds)" — which reads as an INERT bound. What actually happens is the OPPOSITE
+# and worse: both readers coerce the unreadable book to 999999999, so the next cycle PARKS the PR with
+# `REVIEW-CEILING rounds=999999999/10` and a reason claiming a spent budget nobody spent. And the state
+# had NO exit: every clear site and both printed remedies said `rm -f`, which cannot remove a DIRECTORY.
+# Three claims, each pinned: the message names the false-park consequence, it names a repair, and the
+# repair is `rm -rf`.
+RR_MSG_LINE="$(awk '/review round counter .*CANNOT BE WRITTEN/ && !/^[[:space:]]*#/' "$MERGED_ONE_SH" | head -1)"
+case "$RR_MSG_LINE" in
+  *999999999*) ok "(c4s) the write-failure message names the REAL consequence (a false REVIEW-CEILING park at rounds=999999999) instead of claiming an inert bound" ;;
+  *) bad "(c4s) the write-failure message does not name the false-park consequence — an operator reads 'the ceiling cannot be counted here' as 'the bound is inert', while both readers actually coerce the unreadable book to 999999999 and park the PR on the NEXT cycle" ;;
+esac
+case "$RR_MSG_LINE" in
+  *'rm -rf'*) ok "(c4s) …and the repair it names is rm -rf (rm -f cannot remove the DIRECTORY that is the corruption most likely to cause it)" ;;
+  *) bad "(c4s) the write-failure message names no working repair (no rm -rf) — the state it describes has no exit that the operator is told about, so a directory at the counter outlives every documented remedy" ;;
+esac
+# ⛔ (c4t) THE FAILURE PATH MUST NOT LEAK TO STDERR (fresh review of #3441, P3 — MEASURED). Redirections
+# apply LEFT TO RIGHT, so `printf … > "$_rr_new" … 2>/dev/null` CANNOT retract the shell's own
+# `Permission denied` / `No such file or directory` for that redirect: it was already printed with the
+# ORIGINAL stderr. Driven against the SHIPPED helper on both unwritable shapes.
+rrspend_stderr() { # <shape: readonly|missing> -> the bytes the helper wrote to stderr
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  case "$1" in
+    readonly) chmod 500 "$d/state" ;;   # the redirect into it must fail
+    missing)  rmdir "$d/state" ;;       # no parent at all
+  esac
+  # shellcheck disable=SC1090
+  ( PR=777; L="$d/log"; _rr_f="$d/state/reviewround-777"; REVIEW_ROUND=7; MAX_REVIEW=10
+    . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$RRCEIL_O"; . "$RRBOOK_O"; . "$RRSPEND"
+    review_round_spend ) 2>&1 >/dev/null
+  chmod 700 "$d/state" 2>/dev/null || true
+  mv "$d" "$TMP/rrspend.err.spent.$RANDOM" 2>/dev/null || true
+}
+RR_STDERR="$(rrspend_stderr readonly)$(rrspend_stderr missing)"
+if [ -z "$RR_STDERR" ]; then
+  ok "(c4t) a failed book write leaks NOTHING to stderr on either unwritable shape (read-only state/, missing state/) — the operator gets the log line, not a bare shell error beside it"
+else
+  bad "(c4t) a failed book write LEAKS to stderr: [$(printf '%s' "$RR_STDERR" | tr '\n' ';' | cut -c1-160)] — the redirect is not grouped, so the shell prints the redirect's own error before the trailing 2>/dev/null can apply"
+fi
+# MUTANT-Q: reintroduce the truncating spelling in a COPY and require the pin above to red. Mutation
+# tested rather than asserted, because "the write is atomic" is exactly the kind of claim a later tidy
+# silently reverts while every behavioural arm stays green.
+MWQ="$TMP/mutant-nonatomic.sh"
+# ⛔ THE ANCHOR IS THE printf LINE ONLY (the write moved into a group, so the old
+# `> "$_rr_new" 2>/dev/null` spelling no longer exists). An unaddressed sed would ALSO rewrite the
+# `mv` line's SOURCE and the mutant would fail its own "still renames onto the counter" precondition.
+sed '/printf .%s.n. "\$REVIEW_ROUND"/s|> "\$_rr_new"|> "\$_rr_f"|' "$MERGED_ONE_SH" > "$MWQ"
+diff -q "$MERGED_ONE_SH" "$MWQ" >/dev/null 2>&1; q_rc=$?
+if [ "$q_rc" -ne 0 ]; then
+  sed -n '/^review_round_spend() {/,/^}$/p' "$MWQ" > "$TMP/q-helper.sh"
+  if grep -qF 'mv "$_rr_new" "$_rr_f"' "$TMP/q-helper.sh" \
+     && ! grep -qF 'printf '\''%s\n'\'' "$REVIEW_ROUND" > "$_rr_new"' "$TMP/q-helper.sh"; then
+    ok "MUTANT-Q: with the SIBLING redirect reverted to the counter itself, (c4q)'s pin reports ❌ — the atomicity assertion is live"
+  else
+    bad "MUTANT-Q did not remove the sibling redirect (the sed anchor stopped matching), so (c4q) proves nothing"
+  fi
+else
+  bad "MUTANT-Q produced an UNCHANGED file (the sed anchor stopped matching) — (c4q) is unverified"
+fi
+# MUTANT-P: the raw knob back on the ceiling line must red (c4p)'s shape pin.
+MWP="$TMP/mutant-rawmax.sh"
+sed 's|^_rr_max="$(_rr_coerce_max "${MAX_REVIEW:-}")"$|_rr_max="${MAX_REVIEW:-10}"|' "$MERGED_ONE_SH" > "$MWP"
+RP_ASSIGN="$(grep -nE '^_rr_max=' "$MWP" | head -1)"
+RP_RHS="${RP_ASSIGN#*_rr_max=}"
+case "$RP_RHS" in
+  '"$(_rr_coerce_max'*) bad "MUTANT-P did not revert the assignment (the sed anchor stopped matching) — (c4p) is unverified" ;;
+  *) ok "MUTANT-P: with the ceiling's max read from the RAW knob, (c4p)'s shape pin reports ❌ — the message field is pinned to the coerced value" ;;
+esac
+# ⛔ AND THE CALL SITE, NOT JUST THE FUNCTION — a correct predicate that nothing calls is the round-3
+# defect in a new place. The check must sit ABOVE the reviewer start (`REV_STARTED=1`), because below it
+# the round is already being paid for, and its refusal must NOT be `exit 75` (whose readers report a
+# CAPACITY refusal and would send an operator to wait for a quieter box, which cannot clear a spent budget).
+RC_CALL="$(awk '!/^[[:space:]]*#/ && /_rr_ceiling_hit "/ {print FNR}' "$MERGED_ONE_SH" | head -1)"
+RC_START="$(awk '!/^[[:space:]]*#/ && /^REV_STARTED=1$/ {print FNR}' "$MERGED_ONE_SH" | head -1)"
+RC_EXIT="$(awk -v a="${RC_CALL:-0}" '/^[[:space:]]*#/ {next} NR>a && /^[[:space:]]*exit 3$/ {print NR; exit}' "$MERGED_ONE_SH")"
+if [ -n "$RC_CALL" ] && [ -n "$RC_START" ] && [ "$RC_CALL" -lt "$RC_START" ] && [ -n "$RC_EXIT" ] \
+   && awk -v a="$RC_CALL" -v b="$RC_EXIT" 'NR>a && NR<b && !/^[[:space:]]*#/' "$MERGED_ONE_SH" | grep -q 'park "REVIEW-CEILING'; then
+  ok "(c4i) the ceiling is consulted at merge-one.sh:$RC_CALL — ABOVE the reviewer start (:${RC_START}) so no round is paid for — and the refusal parks a REVIEW-CEILING reason and exits 3, not 75"
+else
+  bad "(c4i) merge-one.sh ceiling call=${RC_CALL:-<none>} reviewer-start=${RC_START:-<none>} exit3=${RC_EXIT:-<none>} — the DIRECT ingress does not refuse at the ceiling, refuses AFTER the round is paid for, or refuses with a code whose readers report a capacity refusal"
+fi
+# Mutants for the decision — the same rule M1/M2 follow: derived FROM the shipped block, and each is
+# asserted to have really changed the file.
+sed 's/\[ "\$book" -ge "\$max" \]/[ "$book" -gt "$max" ]/' "$RRCEIL" > "$TMP/rrceiling.m3.sh"
+diff -q "$RRCEIL" "$TMP/rrceiling.m3.sh" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  M3="$( . "$TMP/rrceiling.m3.sh"; if _rr_ceiling_hit "$CAP" "$CAP"; then echo REFUSE; else echo allow; fi )"
+  [ "$M3" = "allow" ] && ok "MUTANT-M3: '>=' widened to '>' lets a book AT the ceiling buy the next round (allow) — (c4h)'s book=$CAP/$CAP arm would report ❌" \
+    || bad "MUTANT-M3 did not behave as a mutant (got $M3) — the arm above proves nothing"
+else
+  bad "MUTANT-M3 changed nothing — the -ge anchor no longer matches the shipped block, so the arm above proves nothing"
+fi
+sed 's/\[ "\$max" -ge 1 \] || return 1/:/' "$RRCEIL" > "$TMP/rrceiling.m4.sh"
+diff -q "$RRCEIL" "$TMP/rrceiling.m4.sh" >/dev/null 2>&1
+if [ $? -ne 0 ]; then
+  M4="$( . "$TMP/rrceiling.m4.sh"; if _rr_ceiling_hit 0 0; then echo REFUSE; else echo allow; fi )"
+  [ "$M4" = "REFUSE" ] && ok "MUTANT-M4: dropping the report-only guard makes MAX_REVIEW=0 refuse EVERY round — (c4h)'s 0/0 arm would report ❌ (the knob would mean the opposite of REPORT-ONLY)" \
+    || bad "MUTANT-M4 did not behave as a mutant (got $M4)"
+else
+  bad "MUTANT-M4 changed nothing — the report-only guard anchor no longer matches, so the arm above proves nothing"
+fi
+# (c4j) THE READER MUST FAIL CLOSED ON A CORRUPT BOOK. Garbage read as round 0 = a FULL budget, i.e. the
+# ceiling RESETS on exactly the input that should stop it.
+rrread() { # <file-content|__ABSENT__> -> n
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state"
+  [ "$1" = "__ABSENT__" ] || printf '%s' "$1" > "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( O="$d"; . "$TMP/reviewround.sh"; review_round_read 777 )
+  # ⛔ `mv`, NOT `rm` (#709): the guard refuses a discard whose target is a temp path.
+  mv "$d" "$TMP/rrread.spent.$RANDOM" 2>/dev/null || true
+}
+rr_case() { # <label> <content> <want>
+  local got; got="$(rrread "$2")"
+  [ "$got" = "$3" ] && ok "(c4j) $1 -> $3" \
+    || bad "(c4j) $1 -> $got, expected $3 — an unreadable book must coerce to the 9-digit ceiling (fail-closed), never to 0 (which RESETS the budget)"
+}
+rr_case "an ABSENT book is round 0 (nothing spent yet)" '__ABSENT__' 0
+rr_case "a NON-NUMERIC book is the 9-digit ceiling, not 0" 'garbage' 999999999
+rr_case "an OVERLONG book is the 9-digit ceiling, not 0" '1000000000' 999999999
+rr_case "an EMPTY book is the 9-digit ceiling, not 0" '' 999999999
+rr_case "a NEGATIVE book is the 9-digit ceiling, not 0" '-3' 999999999
+rr_case "a plain book is still read as itself" "$(( CAP - 1 ))" "$(( CAP - 1 ))"
+# …and it must be EXHAUSTED at the coerced value, which is the whole point of not resetting it.
+printf 'garbage\n' > "$ROUND_F"
+# ⛔ `islimit.sh` MUST BE SOURCED HERE TOO: `review_round_exhausted` coerces its `<max>` argument with
+# `is_limit`, so an UNRESOLVABLE `is_limit` would silently fall back to 10 and this arm would grade the
+# SHIPPED DEFAULT instead of the cap the suite is driven at (green at 10, a false red at 4 or 12).
+# ⛔ AND `isnum.sh` WITH IT — `is_limit` is `is_num … && [ len -le 9 ]`, so sourcing `islimit.sh` ALONE
+# leaves `is_num` undefined: `is_limit` fails on `command not found`, `|| max=10` masks it, and this arm
+# graded 10 on EVERY cap while printing `is_num: command not found` to the log (measured by the round-17
+# verifier: one line per run, at all four caps). A dependency sourced two-thirds of the way is a guard
+# grading something other than what it claims.
+if ( O="$TMP/O"; . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_exhausted 4242 "$CAP" ); then
+  ok "(c4j) a CORRUPT book is EXHAUSTED at MAX_REVIEW=$CAP — the controller refuses the next review instead of buying a free one"
+else  bad "(c4j) a CORRUPT book does NOT read as exhausted at MAX_REVIEW=$CAP — the ceiling RESET, which is the fail-open the coercion removes"
+fi
+clear_round
+# ⛔ THE CONTROLLER'S HALF OF THE FROM-BELOW BOUNDARY (round-17 review, P3). The `book=9` arm above drives
+# `merge-one.sh::_rr_ceiling_hit` ONLY — the controller has its OWN `max` coercion
+# (`orch-loop.sh::review_round_exhausted`: `is_limit "${max:-}" || max=10`) and it was unpinned from
+# below: changing that fallback to 3 left the suite GREEN at `DRIVE_MAX_REVIEW` 4, 10 AND 12 (measured).
+# A 3 there parks a controller-dispatched PR after three rounds with a REVIEW-CEILING reason asserting a
+# budget nobody configured — the false diagnosis #3441 exists to close, on the higher-volume ingress.
+rr_exh() { # <max-arg> <book> -> REFUSE|allow, through the SHIPPED controller predicate
+  local got
+  seed_round "$2"
+  if ( O="$TMP/O"; . "$TMP/isnum.sh"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_exhausted 4242 "$1" ); then got=REFUSE; else got=allow; fi
+  clear_round
+  printf '%s\n' "$got"
+}
+# Absolute book values, deliberately NOT derived from $CAP: the question is what a GARBAGE knob falls back
+# TO, and the answer (10) is the shipped default rather than the cap the suite is driven at.
+for _pair in "9:allow" "10:REFUSE"; do
+  _b="${_pair%%:*}"; _want="${_pair#*:}"; _got="$(rr_exh garbage "$_b")"
+  [ "$_got" = "$_want" ] && ok "(c4j) controller: a GARBAGE max is coerced to the documented default 10 (book=$_b -> $_want)" \
+    || bad "(c4j) controller: a GARBAGE max on a book of $_b -> $_got, expected $_want — the controller's fallback is not 10, so a box whose MAX_REVIEW is unreadable refuses rounds early (a small fallback) with a REVIEW-CEILING reason asserting a budget that was never configured, or buys past it (a large one)"
+done
+# (c4k) THE SECOND READER MUST FAIL CLOSED TOO — AND IT IS THE ONE NOBODY ELSE EXERCISES (round-14
+# review, P2). `(c4j)` drives `orch-loop.sh::review_round_read`; `(c4h)` passes the book IN as an
+# argument, so neither touches `merge-one.sh::_rr_read_book`, the function that reads the file on the
+# DIRECT ingress. Measured before this arm: reverting that function to the old
+# `is_limit "${v:-}" || v=0` — the exact defect this commit claims to fix — left the suite GREEN at
+# 179/0. Two readers of ONE file that disagree is the failure the README row and the function's own
+# comment both assert cannot happen, so the shared coercion has to be pinned on BOTH sides.
+RRBOOK="$TMP/rrbook.sh"
+sed -n '/^_rr_read_book() {/,/^}/p' "$MERGED_ONE_SH" > "$RRBOOK"
+if [ -s "$RRBOOK" ] && grep -q '999999999' "$RRBOOK"; then
+  ok "(c4k) merge-one.sh::_rr_read_book was extracted (declared)"
+else
+  bad "(c4k) _rr_read_book is MISSING from merge-one.sh — the direct ingress cannot read the round book, so it can neither spend nor refuse on it"
+fi
+rrbook() { # <file-content|__ABSENT__> -> n
+  local d got; d="$(mktemp -d)"; mkdir -p "$d/state"
+  [ "$1" = "__ABSENT__" ] || printf '%s' "$1" > "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  got="$( _rr_f="$d/state/reviewround-777"; . "$RRBOOK"; _rr_read_book )"
+  printf '%s\n' "$got"
+  mv "$d" "$TMP/rrbook.spent.$RANDOM" 2>/dev/null || true
+}
+rrb_case() { # <label> <content> <want>
+  local got; got="$(rrbook "$2")"
+  [ "$got" = "$3" ] && ok "(c4k) $1 -> $3" \
+    || bad "(c4k) $1 -> $got, expected $3 — merge-one.sh's reader DISAGREES with orch-loop.sh's about the same file, so a corrupt book resets the budget on the direct ingress while the controller parks it"
+}
+rrb_case "merge-one: an ABSENT book is round 0" '__ABSENT__' 0
+rrb_case "merge-one: a NON-NUMERIC book is the 9-digit ceiling" 'garbage' 999999999
+rrb_case "merge-one: an OVERLONG book is the 9-digit ceiling" '1000000000' 999999999
+rrb_case "merge-one: an EMPTY book is the 9-digit ceiling" '' 999999999
+rrb_case "merge-one: a NEGATIVE book is the 9-digit ceiling" '-3' 999999999
+rrb_case "merge-one: a plain book is still read as itself" "$(( CAP - 1 ))" "$(( CAP - 1 ))"
+# ⛔ A NON-REGULAR BOOK IS A CORRUPTION, NOT AN ABSENT BOOK (round-15 review, P3). Both readers gated
+# "absent ⇒ 0" on `[ -f ]`, so a stray DIRECTORY at `state/reviewround-<PR>` — the failure mode this
+# tree's own remedies name, `rm -rf a stray directory named parked-$PR` — read as ABSENT: round 0, a FULL
+# budget, while the README row says a corrupt book "reads as EXHAUSTED and parks, instead of RESETTING
+# the budget". Measured before the fix: BOTH readers returned 0 and BOTH ingresses bought the round.
+rrb_dir() { # <which: orch|merge> -> n, with a DIRECTORY standing in for the book
+  local d got; d="$(mktemp -d)"; mkdir -p "$d/state/reviewround-777"
+  case "$1" in
+    orch) got="$( O="$d"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_read 777 )" ;;
+    merge) got="$( _rr_f="$d/state/reviewround-777"; . "$RRBOOK"; _rr_read_book )" ;;
+  esac
+  printf '%s\n' "$got"
+  mv "$d" "$TMP/rrdir.spent.$RANDOM" 2>/dev/null || true
+}
+for _r in orch merge; do
+  _got="$(rrb_dir "$_r")"
+  [ "$_got" = 999999999 ] && ok "(c4l) a NON-REGULAR book (a stray DIRECTORY) reads as the 9-digit ceiling in the $_r reader, not as round 0" \
+    || bad "(c4l) the $_r reader read a DIRECTORY standing in for the book as $_got, expected 999999999 — a non-regular book is CORRUPTION, and treating it as ABSENT hands the PR a FULL budget (the reset the coercion above exists to prevent)"
+done
+# ⛔ THE OTHER NON-REGULAR BOOK DOES NOT FAIL CLOSED — IT HANGS (fresh review of #3441, P2, MEASURED).
+# A DIRECTORY is caught only incidentally (the `read` fails, `v` stays empty, 999999999); a FIFO is
+# `-e`-true and `read -r v < fifo` BLOCKS ON OPEN until a writer appears, so the coercion below is never
+# reached. Measured on the pre-fix code: `rc=124` under a 5 s bound in BOTH readers — and in
+# `orch-loop.sh` that reader is the CONTROLLER'S main loop, so the failure mode is the whole fleet loop
+# wedging with no log line (the #943/#3331 false-silence class at fleet scale), not the fail-closed park
+# the README promises. Both readers now gate on `-f`: absent ⇒ 0, non-regular ⇒ 999999999, never opened.
+# ⛔ THE ARM IS BOUNDED ITSELF, because the failure it detects IS a hang: without a bound the suite would
+# block instead of reporting ❌. A `kill -9` on the reader subshell is the only exit from a blocked FIFO
+# open on every platform (`timeout`/`gtimeout` are not guaranteed where this suite runs).
+rrb_fifo() { # <which: orch|merge> -> the reader's answer, or HANG
+  local d out p i
+  d="$(mktemp -d)"; mkdir -p "$d/state"; mkfifo "$d/state/reviewround-777"
+  out="$TMP/rrfifo.out"
+  rm -f "$out" 2>/dev/null || true
+  case "$1" in
+    orch)  ( O="$d"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_read 777 ) > "$out" 2>/dev/null & ;;
+    merge) ( _rr_f="$d/state/reviewround-777"; . "$RRBOOK"; _rr_read_book ) > "$out" 2>/dev/null & ;;
+  esac
+  p=$!
+  i=0
+  while [ "$i" -lt 5 ] && [ ! -s "$out" ]; do sleep 1; i=$(( i + 1 )); done
+  if [ -s "$out" ]; then wait "$p" 2>/dev/null; cat "$out";
+  else kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null; printf 'HANG\n'; fi
+  mv "$d" "$TMP/rrfifo.spent.$RANDOM" 2>/dev/null || true
+}
+for _r in orch merge; do
+  _got="$(rrb_fifo "$_r")"
+  [ "$_got" = 999999999 ] && ok "(c4l) a FIFO standing in for the book reads as the 9-digit ceiling in the $_r reader — it is neither OPENED (which would block for ever) nor read as round 0" \
+    || bad "(c4l) the $_r reader answered '$_got' for a FIFO at the book path, expected 999999999 — 'HANG' means the reader still OPENS a non-regular book (a fleet-wide wedge in the controller, worse than the park the docs promise), and any other value means it read corruption as a live budget"
+done
+
+# ── (c4m) THE BOOK'S LIFECYCLE IS PART OF THE BOUND, AND IT WAS PINNED BY NOTHING ────────────────────
+# Round-15 review, P3. README and ARCHITECTURE both state the budget is "cleared on MERGED/CLOSED, by
+# prune_orphan_markers, and by merge-one.sh::review_state_clear on a CLEAN verdict". Measured before
+# these arms: deleting `reviewround-$PR` from `review_state_clear`'s `rm -f` and deleting
+# `review_round_clear "$PR"` from the MERGED|CLOSED arm EACH left the suite at 186/0 GREEN. The
+# CLEAN-verdict clear is the one that matters: without it a converged PR carries its spent rounds into
+# its NEXT, unrelated round of work and parks with `REVIEW-CEILING … rounds=10/10`, asserting a budget
+# it never spent — the false-diagnosis class #3441 exists to close, in the opposite direction.
+#
+# ⛔ EACH ARM IS A TEXT SCAN BECAUSE THE CODE PATHS ARE NOT DRIVABLE HERE (they need gh, the rail and a
+# real signed marker). A text scan is weak on its own, so each one names the exact identifier whose loss
+# is the defect, and each was mutant-verified: the mutant that deletes the line reddens its arm.
+# ⛔ COMMENTS ARE STRIPPED FROM EVERY BODY SCANNED BELOW — WHOLE-LINE **AND** TRAILING — AND THAT IS THE
+# WHOLE POINT OF THE STRIP. Two measured decoys, both of which the first version of these arms passed:
+#   `: # review_round_clear "$PR"` (a call defanged behind a colon), and
+#   `rm -f … 2>/dev/null || true   # was: "$O/state/reviewround-$PR"` (the path surviving only in a
+#   trailing comment). `!/^[ \t]*#/` strips whole-line comments ONLY, so both left the suite GREEN at
+#   191/0 while the CLEAN-verdict clear — the one that matters — cleared nothing. A text arm a comment
+#   can satisfy is worse than no arm, because it reports coverage it does not have.
+# `c4mc()` (defined at the top of this file) is the one strip, so all three scans below cannot drift
+# from each other and from the refusal-arm scans in `(c4n)`.
+_clear_body="$(awk '/^review_state_clear\(\) \{/{f=1} f&&!/^[ \t]*#/{print} f&&/^}/{exit}' "$MERGED_ONE_SH" | c4mc)"
+case "$_clear_body" in
+  *'"$O/state/reviewround-$PR"'*) ok "(c4m) merge-one.sh::review_state_clear clears state/reviewround-<PR> on a CLEAN verdict (the loop this bounds CONVERGED, so its spent rounds must not bound the next loop)" ;;
+  *) bad "(c4m) review_state_clear does NOT clear state/reviewround-<PR> — a converged PR carries its spent rounds into its next round of work and parks with a REVIEW-CEILING reason asserting a budget it never spent" ;;
+esac
+_life="$(awk '/case "\$\{PR_ST:-\}" in MERGED\|CLOSED\)/{f=1} f&&!/^[ \t]*#/{print} f&&/^ *esac/{exit}' "$ORCH" | c4mc)"
+case "$_life" in
+  *'review_round_clear "$PR"'*) ok "(c4m) orch-loop.sh's MERGED|CLOSED arm clears the round book through its own helper (one lifecycle, one place — a hand-rolled rm beside it would be a second spelling)" ;;
+  *) bad "(c4m) the MERGED|CLOSED arm does not call review_round_clear — a PR that left the queue keeps its round book for ever (one record per abandoned PR) and the stated lifecycle is false" ;;
+esac
+_prune="$(awk '/^prune_orphan_markers\(\) \{/{f=1} f&&!/^[ \t]*#/{print} f&&/^}/{exit}' "$ORCH" | c4mc)"
+case "$_prune" in
+  *'reviewround-*'*) ok "(c4m) prune_orphan_markers sweeps state/reviewround-* like every sibling marker family" ;;
+  *) bad "(c4m) prune_orphan_markers does NOT sweep state/reviewround-* — the book accumulates one file per dead PR and the documented sweep is false" ;;
+esac
+# ⛔ AND IT MUST REMOVE THAT FAMILY THROUGH ITS OWNER, NOT WITH `rm -f` (fresh review of #3441, P2 —
+# MEASURED). The family was added to the GLOB but the sweep still removed with a bare `rm -f` (and with
+# no redirection at all). For a book that is a DIRECTORY — the corruption both readers park on — that
+# fails (`Is a directory`, rc=1) and the `-ot` gate stays true for a dead PR, so the same error printed
+# on EVERY cycle for ever while `README.md`'s "cleared … by prune_orphan_markers" stayed false. The arm
+# above pins the FAMILY, not the verb; this one pins the verb. It reddens if the routing is reverted to
+# `rm -f "$mf"` for the book (measured), and the behavioural `(c4u)` arm below proves the helper it
+# routes through really does clear a directory.
+case "$_prune" in
+  *'review_round_clear "$mp"'*) ok "(c4u) prune_orphan_markers removes the round book through review_round_clear (the rm -rf owner), so a DIRECTORY book is swept instead of erroring every cycle" ;;
+  *) bad "(c4u) prune_orphan_markers removes state/reviewround-* with a bare rm -f — a DIRECTORY book is never swept (the failure repeats every cycle for a dead PR) and the documented prune remedy is inert" ;;
+esac
+# ── (c4u) THE CORRUPTION BOTH READERS DETECT MUST HAVE AN EXIT (fresh review of #3441, P2) ────────
+# Both readers treat a NON-REGULAR book as corruption and coerce it to 999999999, which PARKS the PR.
+# A stray DIRECTORY at the path is exactly the corruption this tree's remedies name, and it is the one
+# shape `rm -f` cannot remove (`Is a directory`, rc=1) — so with `rm -f` at every clear site, the state
+# had NO exit at all: not the CLEAN-verdict clear, not MERGED/CLOSED, and not the repair the park text
+# prints. The PR stayed parked at `rounds=999999999/10` for ever. Measured before the fix: the
+# directory SURVIVED each of those clears.
+# ⛔ THE CLEAR IS DRIVEN, NOT SCANNED: `review_round_clear` is extracted from the shipped controller.
+rrclear_dir() { # -> "present|gone" for a DIRECTORY planted at the book path
+  local d; d="$(mktemp -d)"; mkdir -p "$d/state/reviewround-777"
+  # shellcheck disable=SC1090
+  ( O="$d"; . "$TMP/islimit.sh"; . "$TMP/reviewround.sh"; review_round_clear 777 )
+  if [ -e "$d/state/reviewround-777" ]; then printf 'present\n'; else printf 'gone\n'; fi
+  mv "$d" "$TMP/rrclear.spent.$RANDOM" 2>/dev/null || true
+}
+RR_CLEARED="$(rrclear_dir)"
+[ "$RR_CLEARED" = "gone" ] && ok "(c4u) a DIRECTORY standing at state/reviewround-<PR> is actually CLEARED by review_round_clear — the MERGED/CLOSED exit reaches the corruption the readers park on" \
+  || bad "(c4u) review_round_clear LEFT the directory in place — \`rm -f\` cannot remove a directory and \`|| true\` hides the failure, so a PR parked at rounds=999999999/10 never clears: not on MERGED/CLOSED, and not through the remedy the park text prints"
+# …and the CLEAN-verdict clear in merge-one.sh must use the same verb. A text pin, because that function
+# needs the rail, gh and a signed marker to run; it names the exact spelling, like (c4m) does.
+_rsc_body="$(awk '/^review_state_clear\(\) \{/{f=1} f&&!/^[ \t]*#/{print} f&&/^}/{exit}' "$MERGED_ONE_SH" | c4mc)"
+case "$_rsc_body" in
+  *'rm -rf'*'reviewround-'*) ok "(c4u) merge-one.sh::review_state_clear removes the book with rm -rf, so a converged PR whose counter became a DIRECTORY is not left permanently parked" ;;
+  *) bad "(c4u) review_state_clear does not remove the book with rm -rf — the CLEAN-verdict clear (the one exit that matters) cannot remove a corrupt non-regular book, and the PR parks for ever with a REVIEW-CEILING reason asserting a budget nobody spent" ;;
+esac
+# …and BOTH printed remedies must name a verb that works. The park texts are strings, so this is the
+# only pin available; it is worth having because the text is what an operator pastes.
+# ⛔ THE SCAN IS RESTRICTED TO THE PARK LINES, AND THAT IS A FIX THIS ARM NEEDED (fresh review of #3441,
+# P2 — MEASURED VACUOUS). Scanning the WHOLE file for `rm -rf … reviewround-` and taking `head -1`
+# matched, in merge-one.sh, the WRITE-FAILURE message above the remedy (added by the same commit) rather
+# than the `REVIEW-CEILING` park text in the ceiling arm — so reverting merge-one.sh's park remedy to
+# `rm -f` left this suite GREEN (measured 217/0). That is baseline row 4 of
+# `docs/ops/review-non-vacuity-baseline.md` in one file over: a phrase that another site prints
+# unconditionally. The grep is now anchored on the `park`/`park_ctrl` call sites, so only a remedy that
+# is actually printed to an operator can satisfy it; the mutant reverts EACH file in turn and both red.
+for _f in "$MERGED_ONE_SH" "$ORCH"; do
+  _park_txt="$(grep -E 'park(_ctrl)? ' "$_f" | grep -o 'rm -rf[^\"]*reviewround-[^\"]*' | head -1)"
+  [ -n "$_park_txt" ] && ok "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy prints rm -rf for the book (the verb that can remove a DIRECTORY)" \
+    || bad "(c4u) $(basename "$_f")'s REVIEW-CEILING remedy (the text an operator PASTES) does not print a working rm -rf for the book — a corrupt (directory) book cannot be cleared with the remedy printed for it, so the documented repair is inert"
+done
+# MUTANT-U: revert EACH file's park remedy in turn and require this arm to red — PER FILE, because the
+# vacuity above was exactly one file satisfying the other's row. The rewrite is applied ONLY to the park
+# lines (awk, not a whole-file sed), so the write-failure message that caused the hole is untouched and
+# the mutant reproduces the real regression rather than a blanket text change.
+for _pair in "$MERGED_ONE_SH:merge-one" "$ORCH:orch-loop"; do
+  _mfu="${_pair%%:*}"; _lbl="${_pair#*:}"
+  awk '/park(_ctrl)? /{gsub(/rm -rf/,"rm -f")} {print}' "$_mfu" > "$TMP/parktxt.$_lbl.sh"
+  _got="$(grep -E 'park(_ctrl)? ' "$TMP/parktxt.$_lbl.sh" | grep -o 'rm -rf[^\"]*reviewround-[^\"]*' | head -1)"
+  if [ -z "$_got" ]; then
+    ok "MUTANT-U: reverting $_lbl's park remedy to rm -f makes (c4u)'s row for it report ❌ — the per-file remedy pin is live"
+  else
+    bad "MUTANT-U could not strip $_lbl's park remedy (the park-line rewrite changed nothing), so (c4u)'s row for that file proves nothing"
+  fi
+done
+
+# ── (c5) NON-VACUITY FOR THE CEILING — two mutants, because the arm makes TWO claims ──────────────
+# The issue's acceptance is explicit: a mutant that SUPPRESSES the line must redden the suite. A suite
+# that only asserted "something was parked" would stay green over a line that was never emitted, and
+# the line IS the deliverable (the operator's diagnosis). Both mutants are derived FROM THE SHIPPED
+# FILES so they track them, and both are asserted to have changed the file — a `sed` whose anchor
+# stopped matching yields an unchanged file and would "prove" nothing.
+cp "$TMP/reviewround.sh" "$TMP/reviewround.orig.sh"
+cp "$TMP/arm.sh" "$TMP/arm.orig.sh"
+# M1 — THE BOUND GOES INERT: the predicate never says "exhausted". This is the dangerous direction
+# (a review is then bought past the ceiling for ever) and it must be visible as a SPAWN, not a park.
+sed 's/-ge "\$max" ]$/-ge 999999999 ]/' "$TMP/reviewround.orig.sh" > "$TMP/reviewround.mut.sh"
+diff -q "$TMP/reviewround.orig.sh" "$TMP/reviewround.mut.sh" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ]; ok_bad=$?
+[ "$ok_bad" -eq 0 ] && ok "MUTANT-M1 really changed review_round_exhausted (the sed anchor still matches the shipped file)" \
+  || bad "MUTANT-M1 did not change the file — the mutation anchor no longer matches, so the arm below proves nothing"
+bash -n "$TMP/reviewround.mut.sh"; ck_m1=$?
+[ "$ck_m1" -eq 0 ] && ok "MUTANT-M1 still parses (a program, not a syntax error that fails for the wrong reason)" \
+  || bad "MUTANT-M1 does not parse — it fails for the wrong reason"
+cp "$TMP/reviewround.mut.sh" "$TMP/reviewround.sh"
+clear_parked; clear_store; clear_revdisp; clear_round; seed_round "$CAP"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "1" ] && ! grep -q 'REVIEW-CEILING' "$TMP/d.log"; then
+  ok "MUTATION-M1: with the ceiling INERT the PR buys the review anyway (spawns=1, no REVIEW-CEILING) — (c4b)'s 'refuses and parks' would report ❌"
+else
+  bad "MUTATION-M1 did not behave as a mutant: spawns=$(spawns) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+cp "$TMP/reviewround.orig.sh" "$TMP/reviewround.sh"
+# M2 — THE LINE GOES, THE PARK STAYS. This is the shape the issue names: a stop that is still a stop
+# but no longer says WHY, i.e. "this PR exhausted its review budget" reading as "the queue stopped".
+grep -v 'review-round budget EXHAUSTED, PARKED' "$TMP/arm.orig.sh" > "$TMP/arm.mut.sh"
+diff -q "$TMP/arm.orig.sh" "$TMP/arm.mut.sh" >/dev/null 2>&1; rc=$?
+[ "$rc" -ne 0 ] && ok "MUTANT-M2 really deleted the terminal line from the shipped arm" \
+  || bad "MUTANT-M2 deleted nothing — the line it targets is gone or renamed, so the arm below proves nothing"
+bash -n "$TMP/arm.mut.sh"; rc=$?
+[ "$rc" -eq 0 ] && ok "MUTANT-M2 still parses" || bad "MUTANT-M2 does not parse"
+cp "$TMP/arm.mut.sh" "$TMP/arm.sh"
+clear_parked; clear_store; clear_revdisp; clear_round; seed_round "$CAP"
+drive 'FAILED:ai-review-gate' rail 0 1
+if [ "$(spawns)" = "0" ] && ! grep -q 'REVIEW-CEILING' "$TMP/d.log"; then
+  ok "MUTATION-M2: with the terminal line suppressed the review is still refused but the LOG SAYS NOTHING — (c4b)'s line assertion would report ❌ (the parked head would be a silent stop)"
+else
+  bad "MUTATION-M2 did not behave as a mutant: spawns=$(spawns) log=$(tr '\n' ';' < "$TMP/d.log")"
+fi
+cp "$TMP/arm.orig.sh" "$TMP/arm.sh"
+clear_parked; clear_store; clear_revdisp; clear_round
 
 # (c3) a FAILED spawn spends NOTHING — the `fixcount` rule, applied to the review budget
 clear_parked; clear_store; clear_revdisp

@@ -244,6 +244,20 @@ remints() { local n; n="$(grep -c '^7 ' "$MRG/recorder-calls" 2>/dev/null)"; pri
 log_has() { grep -qF -- "$1" "$MRG/o/logs/merge-$PR.log" 2>/dev/null; }
 no_park() { [ ! -s "$MRG/o/state/parked-$PR" ]; }
 merged() { [ -s "$MRG/merged" ]; }
+# ⛔ A MERGE IS RECORDED IN ONE OF TWO SPIES, AND `run_merge`'s AUTHORITY DECIDES WHICH: RAIL
+# authority executes the `admin-merge.sh` spy above (`rail-ran`), GATE authority merges with a raw
+# `gh pr merge` (`MERGE_SPY`, `merged`). So a "merges nothing" claim that reads only ONE of them is
+# not SATISFIED under the authority the other one records in — it cannot fire at all. Measured: a
+# `red-surface` arm mutated to fall through to the merge left the suite 96/96 green while the log
+# printed "NOTHING merged" and then `[merge 7] MERGED`. The claim therefore watches BOTH spies, and
+# `merge_ran_whence` names the one that fired so a real failure is diagnosable.
+merge_ran() { rail_ran || merged; }
+merge_ran_whence() {
+  local w=""
+  rail_ran && w="rail"
+  merged && w="${w:+$w+}raw-gh-merge"
+  printf '%s' "${w:-none}"
+}
 
 # ══ 1) THE CENTRAL PROPERTY: `carry` RE-BINDS THE RECORD AND THE MERGE IS REACHED ════════════════
 # The measured shape (#10255): a clean record at a STALE head, the live diff unchanged. The exit-0
@@ -296,6 +310,59 @@ ck "RED→GREEN: …with no paid review" $rc
 rc=0; recorder_saw "--recover-body $PR $OR" || { rc=1; note "calls: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
 ck "…asked --recover-body for THIS PR and repo" $rc
 
+# ══ 3b) #3440 (review round 3): THE RECOVERY ARM ASKS ABOUT THE SURFACE BEFORE IT MERGES ══════════
+# `review_clean_at_head` is a STORE check — "is there a clean record at this head" — and it never
+# looks at CI. The arm used to set CC_OWED=1 and return on that alone, so on the #2872 population
+# (record absent on this box, signed marker in the body at the CURRENT head) a PR-caused red, or an
+# unreadable surface, was read as mergeable with NO check-runs read anywhere in the run — in gate
+# mode nothing else gates step 4. It now asks `--check-carry` and only the two licence tokens cover
+# the head.
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=red-surface FAKE_CC_RC_AFTER=7)"
+rc=0; merge_ran && { rc=1; note "a MERGE ran over a RED surface on the RECOVERY path (via: $(merge_ran_whence))"; }
+ck "RED→GREEN: a RECOVERED record over a RED surface merges NOTHING" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a red build bought a review on the recovery path"; }
+ck "…and buys NO review (a red build is not a review finding, on this path either)" $rc
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked — an unbounded loop"; }
+ck "RED→GREEN(exit-3): …it PARKS, naming the surface, instead of re-looping for ever" $rc
+# ⛔ THE BRANCH ITSELF IS PINNED BY ITS OWN LOG LINE, not only by the outcome: a park is also
+# reachable from the ORDINARY recovery path (which asks --check-carry again and parks), so a mutant
+# that deletes only the new ask can still land on a park. This line is emitted ONLY where the
+# recovered record is already clean at this head — i.e. only by the arm this vector is about.
+rc=0; log_has "check-carry refused the RECOVERED record" || { rc=1; note "the recovery arm did not report its OWN refusal: $(tail -5 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the log shows the RECOVERY arm itself made that decision (its own line, not a downstream one)" $rc
+
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=surface-unknown FAKE_CC_RC_AFTER=8)"
+rc=0; merge_ran && { rc=1; note "a MERGE ran over an UNREADABLE surface on the RECOVERY path (via: $(merge_ran_whence)) — a failed read is not a green one"; }
+ck "RED→GREEN: …and a RECOVERED record over an UNREADABLE surface merges NOTHING" $rc
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a FAILED READ bought a review"; }
+ck "RED→GREEN: a RECOVERED record over an UNREADABLE surface does not buy a review either" $rc
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked"; }
+ck "…and parks (a failed read is its own answer, not a review order)" $rc
+# ⛔ NON-VACUITY, IN THIS FIXTURE: the SAME authority and the SAME recovery answer must be able to
+# MERGE, or the refusal above could be passing because gate authority never reaches a merge at all.
+# Only the surface answer differs — `head` licenses the recovered record.
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_CC_TOKEN_AFTER=head FAKE_CC_RC_AFTER=0)"
+rc=0; merge_ran || { rc=1; note "the same fixture/authority merged NOTHING on a LICENSING answer (spies: $(merge_ran_whence)), so the 'merges NOTHING' claim cannot fire: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "NON-VACUITY: …on 'head' the SAME fixture DOES merge, so that claim can fire" $rc
+
+# ══ 3c) #3440 (review round 4): the ORDINARY recovery arm's surface refusal is PINNED ═══════════
+# `_cc_recover`'s FIRST block asks the surface where the recovered record is already clean at this
+# head (pinned by 3b). Its SECOND `case` — reached when the recovered record does NOT cover this
+# head — has its OWN `7:red-surface|8:surface-unknown` park, and nothing pinned it: deleting that arm
+# leaves the suite green while a PR-caused red buys a review and the PR MERGES (`pi_calls=1`,
+# `merged=y`) — #3440's false PASS on the recovery population. Hence its own vector.
+mkmrg; mkrecorder
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=norecord FAKE_CC_RC=4 FAKE_RECOVER_RC=0 FAKE_RECOVER_HEAD="$OLDH" FAKE_CC_TOKEN_AFTER=red-surface FAKE_CC_RC_AFTER=7)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — the ORDINARY recovery arm bought a review over a red head"; }
+ck "RED→GREEN: a recovered record that does NOT cover the head, over a RED surface, buys NO review" $rc
+rc=0; merge_ran && { rc=1; note "a MERGE ran over a red surface (via: $(merge_ran_whence))"; }
+ck "…and merges NOTHING (a PR-caused red is the gate's refusal, not a review order)" $rc
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "it neither merged nor parked — an unbounded loop"; }
+ck "…and PARKS, so the red surfaces instead of re-looping" $rc
+
 # ══ 4) `nodigest` / `carry-patch` say RE-RECORD, never RE-REVIEW ═════════════════════════════════
 # Both are NON-ZERO rcs. Keying on `rc == 0` treated them as "a fresh review is owed" and bought a
 # full paid review (REVIEW_TIMEOUT = 1800 s) on a rebase — the exact #1377 case.
@@ -329,6 +396,126 @@ rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>
 ck "RED→GREEN(exit-0): …and parks nothing (a transport fault is not the PR's fault)" $rc
 rc=0; log_has "check-carry=unreadable" || { rc=1; note "the log does not name the transport cause: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
 ck "…and SAYS the read failed, so the remedy is a retry and not a re-review" $rc
+
+# ══ 6b) #3440 — THE SURFACE VERDICTS: red is NOT a review, unknown is NOT a merge ═══════════════
+# `--check-carry` grew three surface verdicts. Two are NON-ZERO rcs (`red-surface` 7,
+# `surface-unknown` 8) and the third is exit 0 with a distinct token (`red-base-owned`). Left on
+# the `*)` arm they read as "a fresh review is owed" and buy the 20-40 minute purchase — for a RED
+# BUILD, which a review cannot fix, and for a FAILED READ, which is not a changed artifact.
+#
+# ⛔ WHY `REQ=ai-review-gate`: on a RAIL repo a record bound to this head short-circuits into
+# `rail_attempt` BEFORE `--check-carry` is ever asked (`merge-one.sh`, the rail-mode block), so the
+# surface arms are unreachable there BY CONSTRUCTION and a fixture that used rail mode would pin
+# nothing. Gate authority is where these arms are live.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a RED BUILD was treated as a review finding"; }
+ck "RED→GREEN: 'red-surface' (rc=7) does NOT buy a paid review — a broken build is not a finding" $rc
+rc=0; log_has "check-carry=red-surface" || { rc=1; note "the log does not name the red: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and NAMES the red surface, so the operator is never told a review is the remedy" $rc
+rc=0; merge_ran && { rc=1; note "a MERGE ran on a PR-caused red (via: $(merge_ran_whence)) — the producer had just said NOT mergeable"; }
+ck "RED→GREEN: …and merges nothing (a red the PR caused is not mergeable, whatever the gate says)" $rc
+rc=0; no_park || { rc=1; note "a single red cycle parked the head (the bound is 3): $(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "RED→GREEN(exit-0): …and does NOT park on cycle 1/3 (a flaky shard re-runs green)" $rc
+# ⛔ THE GROUPS ARE LOGGED WHOLE, NOT TRUNCATED (#3440 review, nit 5). Six messages in `merge-one.sh`
+# promise that the failing groups are "named in the check-carry stderr in this log", but the generic
+# stderr line keeps only the first 800 bytes — a big red set, or an earlier diff-read warning, cuts
+# the one datum those messages promise. `_cc_ask` now also logs the `Red group(s):` /
+# `You are accepting:` lines untruncated. The preamble below is LONGER than that window, so the
+# first assertion proves the truncation is real and the second is the pin: delete the untruncated
+# line and it goes red.
+CC_PRE="$(printf 'x%.0s' $(seq 1 900))"
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7 \
+                 FAKE_CC_STDERR="${CC_PRE}
+   Red group(s): CI|verify CI|bash-suites (3).")"
+rc=0; CC_TRUNC="$(command sed -n '/check-carry stderr:/p' "$MRG/o/logs/merge-$PR.log" 2>/dev/null || true)"
+case "$CC_TRUNC" in *"Red group(s):"*) rc=1; note "the preamble did NOT push the group line past the 800-byte window, so this fixture cannot discriminate: $CC_TRUNC" ;; esac
+ck "NON-VACUITY: a >800-byte preamble really does push the group line out of the truncated stderr line" $rc
+unset CC_TRUNC
+rc=0; log_has "check-carry RED GROUPS (untruncated):" && log_has "Red group(s): CI|verify CI|bash-suites (3)" || { rc=1; note "the red groups were NOT logged untruncated, so the log's promise ('the groups are named in this log') is false again: $(tail -4 "$MRG/o/logs/merge-$PR.log" | cut -c1-200)"; }
+ck "RED→GREEN: …so the RED GROUPS are logged WHOLE, which is what the operator-facing messages promise" $rc
+unset CC_PRE
+
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-base-owned FAKE_CC_RC=0)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a base-owned red bought a review"; }
+ck "RED→GREEN: 'red-base-owned' (rc=0) is a CARRY, not a review — the record covers the artifact" $rc
+rc=0; log_has "red-base-owned" || { rc=1; note "the log does not name the base-owned red: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and STATES that the surface is red and base-owned (never a silent green)" $rc
+# ⛔ NON-VACUITY FOR THE `red-surface` CLAIM ABOVE: this licence token drives the SAME fixture on the
+# SAME authority — a clean record AT this head, gate mode — and it MUST reach the raw merge. Without
+# this, "merges nothing" on the red answer could be passing because that fixture never merges.
+rc=0; merge_ran || { rc=1; note "gate authority merged NOTHING on the LICENSING token either (spies: $(merge_ran_whence)) — the red-surface claim above could not fire: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "NON-VACUITY: …and 'red-base-owned' DOES reach the raw merge in this same fixture" $rc
+# ── #3440 REVIEW ROUND 4, P1: `red-base-owned` ARRIVING ON THE CARRY POPULATION ──
+# The producer emits `red-base-owned` from its CARRY arm as well as its head-bound arm, so the
+# ordinary shape — a record at an OLDER head, reviewed diff unchanged, reds that reproduce on the
+# base — arrives with `review_clean_at_head` FALSE. Pre-fix that took the "a review is owed" else
+# branch: a 20-40 minute review the recorder had just proved unnecessary (its own answer says the
+# diff is unchanged), plus a log line asserting a HEAD-BOUND record that did not exist. The fix is
+# the `0:carry` remedy with the red still printed. MUTANT: delete the `elif _cc_rerecord` branch and
+# both assertions below go red (pi_calls=1).
+mkmrg; mkrecorder; write_record "$OLDH" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-base-owned FAKE_CC_RC=0)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls) — a base-owned red on the CARRY population bought a review the recorder had just proved unnecessary"; }
+ck "RED→GREEN: 'red-base-owned' with the record at an OLDER head buys NO review (the 0:carry remedy)" $rc
+rc=0; [ "$(remints)" -ge 1 ] || { rc=1; note "no re-mint ran: $(tr '\n' '|' < "$MRG/recorder-calls")"; }
+ck "…and re-mints the reviewed verdict at the LIVE head, which is what makes the merge legal" $rc
+rc=0; log_has "CARRY — the reviewed diff is unchanged across the head move and every red group reproduces" || { rc=1; note "log: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and NAMES the base-owned red in that log (the red is never a silent green)" $rc
+rc=0; merge_ran || { rc=1; note "the carried record never reached the merge (spies: $(merge_ran_whence))"; }
+ck "…and the carried red-base-owned record DOES reach the merge (licence, not a refusal)" $rc
+
+# ── #3440 REVIEW ROUND 1: the red-surface BOUND, and the streak that has to clear it ──
+# The cap is not decoration: without it a durable PR-caused red re-loops `exit 0` for ever and
+# nothing ever surfaces the failure. Round 1 found the cap UNPINNED (mutating `-ge` to `false`
+# left this suite green) and the counter not actually CONSECUTIVE (nothing cleared it, so an
+# alternating shard burned strikes with no consecutive run). Both are pinned here.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7)"
+rc=0; no_park || { rc=1; note "cycle 1 parked the head (the bound is 3)"; }
+ck "RED→GREEN: the red-surface bound does not fire at cycle 1/3" $rc
+rc=0; [ -f "$MRG/o/state/redsurfacecount-$PR" ] || { rc=1; note "no counter was written, so the bound can never fire (an INERT enforcer)"; }
+ck "…and the counter IS persisted (a bound that cannot fire protects nothing)" $rc
+# cycle 3 at the SAME head → park, with a reason naming the red surface
+mkmrg; mkrecorder; write_record "$HEAD" clean
+printf '%s 2\n' "$HEAD" > "$MRG/o/state/redsurfacecount-$PR"
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7)"
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "the cap (3) did NOT park at cycle 3 — the bound is inert"; }
+ck "RED→GREEN(exit-3): a red surface that persists to the cap PARKS instead of re-looping" $rc
+rc=0; log_has "ABORT: the check surface is RED" || { rc=1; note "the park does not say why: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the abort line names the red surface, not a mystery" $rc
+# The counter being UNWRITABLE must PARK, not loop: a best-effort write makes the bound an INERT
+# ENFORCER (the count is never persisted, so the cap can never fire). Same shape as the sibling
+# diffreadcount vector, and it is the one arm a `|| true` would silently neutralise.
+# ── review round 2: this arm was unpinned (a `|| true` mutant left the suite green) ──
+mkmrg; mkrecorder; write_record "$HEAD" clean
+mkdir -p "$MRG/o/state/redsurfacecount-$PR"   # a DIRECTORY where the counter file must go
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=red-surface FAKE_CC_RC=7)"
+rc=0; [ -s "$MRG/o/state/parked-$PR" ] || { rc=1; note "an unwritable red-surface counter did NOT park — the bound is best-effort and cannot fire"; }
+ck "RED→GREEN(exit-3): an UNWRITABLE red-surface counter parks instead of re-looping for ever" $rc
+rc=0; log_has "redsurfacecount-$PR is unwritable" || { rc=1; note "the abort does not name the unwritable counter: $(tail -4 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and the abort names the counter path" $rc
+rmdir "$MRG/o/state/redsurfacecount-$PR" 2>/dev/null || true
+
+# A READABLE answer clears the streak: alternating red/head must not accumulate strikes.
+mkmrg; mkrecorder; write_record "$HEAD" clean
+printf '%s 2\n' "$HEAD" > "$MRG/o/state/redsurfacecount-$PR"
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=head FAKE_CC_RC=0)"
+rc=0; [ -f "$MRG/o/state/redsurfacecount-$PR" ] && { rc=1; note "a 'head' answer did not clear the red-surface streak — the bound counts lifetime, not consecutive, failures"; }
+ck "RED→GREEN: a readable answer CLEARS the red-surface streak (the cap counts CONSECUTIVE reds)" $rc
+
+mkmrg; mkrecorder; write_record "$HEAD" clean
+out="$(run_merge REQ=ai-review-gate FAKE_CC_TOKEN=surface-unknown FAKE_CC_RC=8)"
+rc=0; [ "$(pi_calls)" = "0" ] || { rc=1; note "pi_calls=$(pi_calls)"; }
+ck "RED→GREEN: 'surface-unknown' (rc=8) pays for NO review — a failed read is not a changed artifact" $rc
+rc=0; no_park || { rc=1; note "parkreason=$(cat "$MRG/o/state/parkreason-$PR" 2>/dev/null)"; }
+ck "RED→GREEN(exit-0): …and parks nothing (a transport fault is not the PR's fault)" $rc
+rc=0; merge_ran && { rc=1; note "gate authority MERGED a head whose read FAILED (via: $(merge_ran_whence)) — a failed read is not a green surface"; }
+ck "RED→GREEN: …and an UNREADABLE surface merges NOTHING on the main path either" $rc
+rc=0; log_has "CHECK SURFACE" || { rc=1; note "the log does not name WHICH read failed: $(tail -6 "$MRG/o/logs/merge-$PR.log")"; }
+ck "…and names the CHECK SURFACE as the failed read, not the diff" $rc
 
 # ══ 7) A HEAD-BOUND ANSWER IS NOT A CLEAN ONE (P1-2, both reviews) ════════════════════════════════
 # `--check-carry` never looks at the verdict: a record saying `issues` bound to this head answers

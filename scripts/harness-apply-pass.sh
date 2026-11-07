@@ -1084,7 +1084,17 @@ if [ "$PASS_MODE" = pin ]; then
         #   The guard `--force` relaxes here is "do not replace the harness tree under a live
         #      controller", and a pin-only advance cannot: it creates a NEW per-commit worktree and
         #      leaves the running one untouched. Nothing else about `apply` changes.
-        OUT="$(bash "$MATERIALISER" apply --force --pin-only 2>&1)"; ACT_RC=$?
+        # ⛔ EVERY RESOLVED VALUE GOES TO THE CHILD ON ITS OWN COMMAND LINE, like the checker 400
+        #      lines above (agent-infra#3593). The materialiser RESOLVES the same paths from ITS
+        #      defaults — `CELL_HOME="${CELL_HOME:-/tmp/cell-home}"` (cloud-cell-supervisor.sh:139),
+        #      then `HARNESS_PIN_DIR`/`HARNESS_PIN_FILE` from it — and a shell variable set HERE is
+        #      invisible to a child unless it is exported. Measured on a cell whose unit sets `HOME`
+        #      and no `CELL_HOME`: this pass resolved `/home/cmux`, the materialiser pinned into
+        #      `/tmp/cell-home/harness/<sha12>`, the re-read below saw no move and reported rc=25
+        #      "nothing moved this box" — a TRUE reading of the WRONG records, and it `finish`es
+        #      BEFORE predicate 4, so on that box the farm grade this whole feature exists to emit
+        #      could never run at all.
+        OUT="$(CELL_HOME="$CELL_HOME" HARNESS_PIN="$PIN_SHA_FILE" HARNESS_PIN_FILE="$PIN_PATH_FILE" HARNESS_PIN_DIR="$PIN_ROOT" HARNESS_REPO="$REPO" HARNESS_REF="$REF" bash "$MATERIALISER" apply --force --pin-only 2>&1)"; ACT_RC=$?
         printf '%s\n' "$OUT" | sed 's/^/  /'
         [ "$ACT_RC" -eq 0 ] || {
             REC_ACTION=materialiser-failed

@@ -5,7 +5,8 @@ This file is a guard rail, not documentation. The watched script signals process
 here exists to prove a specific way it could kill something it must not:
 
   * a subtree that is WORKING                 -> never a candidate (gate 1)
-  * a parked child with a BUSY grandchild     -> never a candidate (gate 1, subtree not process)
+  * a parked child with a BUSY grandchild     -> never a candidate (gate 1: kind rule AND subtree sum)
+  * a parked child with a BUSY nested pi      -> never a candidate (gate 1: subtree sum ALONE)
   * a lane's OWN pi                           -> never a candidate (only dispatched offspring)
   * anything under a human terminal           -> refused outright (gate 2)
   * a chain we cannot prove is the fleet's    -> refused outright (gate 2)
@@ -97,6 +98,43 @@ def stub_rule(tmp_path, status="holder", rc=0):
     return str(p)
 
 
+def parked(W, monkeypatch):
+    """Stub the tick's REAL-WORLD probes — the connection probe and the process age — to constants.
+
+    ⛔ GATE 1's TESTS MUST NOT CONSULT THE HOST'S REAL `lsof` OR `ps` — MEASURED, TWICE, IN OPPOSITE
+    DIRECTIONS. `frozen_subtrees` calls `has_live_connection(pid)` for every pid in a subtree and
+    `_age_seconds(pid, table)` for every candidate, and the gate-1 tables below carry SYNTHETIC pids
+    (300, 301, 36186). Left unstubbed, the real probes decide those tests' verdicts on the host, so
+    the same commit is green or red by where it runs:
+
+      * IN A CONTAINER it is a determinate FALSE FAIL. `lsof 4.95` prints `can't stat() overlay
+        file system` / `nsfs` WARNINGS to stderr on this cell, and `has_live_connection` reads rc=1
+        + non-empty stderr as UNKNOWN (`None`), which REFUSES. Measured on the cell: 5 of 5 runs
+        red, `assert set() == {36186, 36189}` — the CI red at
+        `test_a_frozen_child_of_a_pi_parent_is_a_candidate`.
+      * ON A LOADED RUNNER it is a FLAKE. `lsof` is killed by its own 30 s timeout -> `None` ->
+        refuse. That is how `main` went red at `0b1d1ec65` (run 42235006110, `python-ci / test`),
+        on a test whose own inputs are literals.
+
+    ⛔ AND ON THE `== []` CASES IT IS A SILENT FALSE PASS, which is the worse half: with the probe
+    returning `None`, `frozen_subtrees` refuses EVERY candidate, so "never a candidate" holds
+    whatever gate 1 does. The connection gate has its own tests (`test_a_child_holding_an_
+    established_connection_is_never_a_candidate`, `..._anywhere_in_the_subtree_...`) and they stub
+    this function explicitly; `test_the_connection_probe_still_licenses_a_reap` deliberately does
+    NOT, and reaches the REAL probe through a `subprocess.run` stub — that polarity stays.
+
+    `_age_seconds` is stubbed for the SAME reason, and it was the second input short (cycle-2
+    review): it shells out to `ps -o etime=`, so the gate-1 tests were making real `ps` calls whose
+    answers came back `None` for pids that do not exist. (No COUNT is quoted here on purpose — the
+    first draft said "ten" and the measured number was six, and it moves whenever a test is added.)
+    No assertion reads `age_s` today, so it could not flip a verdict yet — the defect was a docblock
+    claiming hermeticity one input short, and the first `age_s` assertion anyone added would have
+    inherited the host dependence.
+    """
+    monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
+    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
+
+
 def ripen(W, monkeypatch, tmp_path, argv):
     """Put a genuinely ripe candidate in front of `main()`, with the tick internals stubbed."""
     (tmp_path / "ripe.json").write_text(json.dumps(
@@ -109,7 +147,12 @@ def ripen(W, monkeypatch, tmp_path, argv):
                         lambda: {**BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
                                  200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
     monkeypatch.setattr(W.time, "sleep", lambda s: None)
-    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
+    # ⛔ ONE DEFINITION OF THE PROBE CONTRACT, NOT TWO (cycle-2 review). This function used to carry
+    # its own inline `has_live_connection` lambda, identical to `parked()`'s — so a future change to
+    # that contract (a sequenced probe, a different verdict) would reach the gate-1 tests and
+    # SILENTLY NOT reach the `main()` tests below, which is the exact leak class these commits close.
+    # `parked()` is also what stubs `_age_seconds`; calling it keeps both in one place.
+    parked(W, monkeypatch)
     monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py"] + argv)
 
 
@@ -122,17 +165,35 @@ def test_cpu_seconds_parses_every_ps_shape(W):
 
 # ── GATE 1: zero CPU delta, measured over the whole SUBTREE ───────────────────
 
-def test_a_working_child_is_never_a_candidate(W):
+def test_a_working_child_is_never_a_candidate(W, monkeypatch):
     """The one true positive this must never produce: a child doing work."""
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=5.0)}
     b = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=12.5)}
     assert W.frozen_subtrees(a, b) == [], "a child that burned 7.5s of CPU is WORKING"
 
 
-def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W):
-    """⛔ THE SUBTREE, NOT THE PROCESS. A `pi` wrapper sits at ~0 CPU while its own bash child does
-    the work -- judging the process alone would reap a subtree that is demonstrably busy. Measured
-    shape 2026-10-12: Drain's pi at `S+`, +7.70 CPU-s/25s, driving a `curl -sS --http1.1 -m 25`."""
+def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W, monkeypatch):
+    """A parked `pi` whose grandchild is BUSY — and is not a `pi` — is never a candidate.
+
+    ⛔ TWO GATES REFUSE THIS FIXTURE INDEPENDENTLY, SO IT PROVES THEIR CONJUNCTION AND NEITHER ONE
+    ALONE. This docstring has now been wrong in BOTH directions ("subtree not process" — false, the
+    kind rule also fires; "the kind rule" — false, the subtree sum also fires), so it states the
+    exactly measured result. The grandchild is `curl` at `cpu 1.0 -> 2.0`, a delta above `CPU_TOL`,
+    so gate 1's SUBTREE SUM refuses the parent; and it is not a `pi`, so the descendant-KIND rule
+    refuses it too. MEASURED: deleting the kind rule leaves this test GREEN (the sum still refuses);
+    deleting the sum leaves it GREEN (the kind rule still refuses); only removing BOTH reddens it.
+
+    Each property's single-cause test already exists, so nothing is left to this one but the real
+    end-to-end shape: `test_a_live_tool_call_under_the_child_is_never_a_candidate` uses a CPU-FLAT
+    poller (sum 0, so only the kind rule can refuse), and
+    `test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind` uses a BUSY nested `pi`
+    (the one kind the rule ALLOWS, so only the sum can refuse).
+
+    The shape is real: measured 2026-10-12, Drain's `pi` at `S+`, +7.70 CPU-s/25s, driving a
+    `curl -sS --http1.1 -m 25`.
+    """
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
          301: T(300, cpu=1.0, cmd="curl -sS --http1.1 -m 25 ...")}
     b = {**BASE, 200: T(100, cpu=10.0), 300: T(200, cpu=9.0),
@@ -140,8 +201,30 @@ def test_a_parked_child_with_a_busy_grandchild_is_not_a_candidate(W):
     assert W.frozen_subtrees(a, b) == [], "the grandchild is working -- nothing here is frozen"
 
 
-def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W):
+def test_a_busy_descendant_is_excluded_by_the_SUBTREE_sum_not_by_its_kind(W, monkeypatch):
+    """A parked `pi` whose busy descendant is ANOTHER `pi` is refused by the SUBTREE SUM alone.
+
+    ⛔ THIS IS THE ONE SHAPE WHERE THE TWO GATES DISAGREE, AND THAT IS THE WHOLE REASON IT EXISTS.
+    `frozen_subtrees` evaluates the subtree CPU sum FIRST (`lane-watchdog.py:363`) and the
+    "only `pi` may be under a candidate" kind rule after it (`:379`), so every fixture whose
+    descendant is a non-`pi` is refused by the sum anyway and proves nothing about the rule. Here
+    the descendant (400) is a `pi` — the one kind the rule ALLOWS — while it burns 5.0 CPU-s, so the
+    KIND rule would let the parent through and ONLY the sum can refuse it.
+
+    MUTANT that reddens this: the process-only sum (`for q in [pid]:`), which ignores every
+    descendant. MEASURED — that mutant leaves every other gate-1 test green, including the
+    busy-grandchild one, and reddens this test and this test only.
+    """
+    parked(W, monkeypatch)
+    a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 400: T(300, cpu=5.0, cmd="pi")}
+    b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 400: T(300, cpu=10.0, cmd="pi")}
+    assert W.frozen_subtrees(a, b) == [], (
+        "the nested `pi` burned 5.0 CPU-s -- the subtree is WORKING even though the parent is parked")
+
+
+def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W, monkeypatch):
     """The real positive: three children of the orchestrator, `Ss`, dCPU exactly 0, no transcript."""
+    parked(W, monkeypatch)
     a = {**BASE, 1727: T(100, cpu=50.0), 36186: T(1727, cpu=9.69), 36189: T(1727, cpu=8.10)}
     b = {**BASE, 1727: T(100, cpu=50.7), 36186: T(1727, cpu=9.69), 36189: T(1727, cpu=8.10)}
     got = W.frozen_subtrees(a, b)
@@ -150,22 +233,24 @@ def test_a_frozen_child_of_a_pi_parent_is_a_candidate(W):
         assert c["ppid"] == 1727 and c["d_cpu"] == 0.0
 
 
-def test_a_lane_own_pi_is_never_a_candidate(W):
+def test_a_lane_own_pi_is_never_a_candidate(W, monkeypatch):
     """⛔ IT REAPS THE CHILD, NEVER THE LANE. The lane's pi holds the conversation and its context;
     the frozen offspring hold nothing. Killing the parent destroys the work we are trying to save."""
+    parked(W, monkeypatch)
     a = {**BASE, 1727: T(100, cpu=50.0)}
     b = {**BASE, 1727: T(100, cpu=50.0)}
     assert W.frozen_subtrees(a, b) == [], "the lane's own pi must never be a candidate"
 
 
-def test_a_bash_child_is_not_a_candidate(W):
+def test_a_bash_child_is_not_a_candidate(W, monkeypatch):
     """Only dispatched `pi` offspring. A parked `bash` wrapper is not a stuck dispatch."""
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0, cmd="/bin/bash -c x")}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0, cmd="/bin/bash -c x")}
     assert W.frozen_subtrees(a, b) == []
 
 
-def test_a_live_tool_call_under_the_child_is_never_a_candidate(W):
+def test_a_live_tool_call_under_the_child_is_never_a_candidate(W, monkeypatch):
     """⛔ THE P0 REVIEW 2 KILLED. The first attempt at this rule rejected children with a SHELL
     descendant -- which does not survive contact with bash: bash `exec`s a SINGLE SIMPLE COMMAND, so
     `bash -c "gh run watch 123"` leaves NO shell in the tree and the poller IS the descendant. All
@@ -180,6 +265,7 @@ def test_a_live_tool_call_under_the_child_is_never_a_candidate(W):
     and by the reviewer: a tool shell exec'd into its command.
     """
     # bash exec'd into the poller: NO shell survives, exactly as bash behaves
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
          400: T(300, cpu=0.5, cmd="sleep 1800")}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0),
@@ -234,10 +320,11 @@ def test_is_pi_does_not_match_an_argument_named_pi(W):
     assert W.is_pi(T(1, cmd="/bin/bash -c x")) is False
 
 
-def test_the_cpu_tolerance_is_stated_and_tiny(W):
+def test_the_cpu_tolerance_is_stated_and_tiny(W, monkeypatch):
     """The tolerance must be a NAMED constant, because a sub-0.1s twitch has the same signature
     from a parked fork child, a human's prompt redraw, and a timer wake."""
     assert 0 < W.CPU_TOL <= 0.5
+    parked(W, monkeypatch)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0 + W.CPU_TOL * 2)}
     assert W.frozen_subtrees(a, b) == [], "above the tolerance is not frozen"
@@ -368,24 +455,16 @@ def test_dry_run_never_signals(W, monkeypatch, capsys, tmp_path):
     """`--apply` is the only path that signals, and it is off by default: the action is a kill."""
     killed = []
     monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
-    monkeypatch.setattr(W, "STATE", str(tmp_path / "s.json"))
-    monkeypatch.setattr(W, "LOG", str(tmp_path / "l.jsonl"))
-    monkeypatch.setattr(W, "LOCK", str(tmp_path / "w.lock"))
-    monkeypatch.setattr(W, "ps_table", lambda: {
-        **BASE, os.getpid(): T(1, cpu=0.0, cmd="python3"),
-        200: T(100, cpu=1.0), 300: T(200, cpu=1.0)})
-    monkeypatch.setattr(W.time, "sleep", lambda s: None)
-    monkeypatch.setattr(W, "_age_seconds", lambda pid, table: 99999)
-    # ⛔ DRIVE IT ALL THE WAY TO `ripe`, or the test passes vacuously: with an empty state a
-    # candidate is only ever "first observation", so `killed == []` would hold even if --apply
-    # defaulted to True. This state is exactly what a ripe candidate looks like on the next tick.
-    monkeypatch.setattr(W, "STATE", str(tmp_path / "ripe.json"))
-    import json as _json
-    (tmp_path / "ripe.json").write_text(_json.dumps(
-        {"300": {"first_seen": time.time() - W.FROZEN_MIN - 10, "ticks": W.FROZEN_TICKS,
-                 "subtree": [300]}}))
-    monkeypatch.setattr(W.sys, "argv", ["lane-watchdog.py", "--json"])
-    W.main()
+    # ⛔ VIA `ripen()` — THIS TEST WAS THE NINTH LEAK, and the one whose vacuity guard it defeated.
+    # It hand-rolled four of `main()`'s five inputs and left `has_live_connection` reading the host's
+    # REAL `lsof`, so on a box where lsof is unreadable `main()` exited 3 with `reaped: []` and
+    # `connection_unreadable: 1` — and `'"reaped": []'` then held for the REFUSAL, not for the dry
+    # run. EXECUTED both ways: with the host probe in place, deleting the dry-run gate
+    # (`if args.apply and ripe:` -> `if ripe:`) left this test GREEN; with the probe stubbed the same
+    # mutant reddens it. The status line is asserted too, because "exit 3, nothing reaped" and
+    # "exit 0, nothing reaped" are different worlds and the old test only checked the second half.
+    ripen(W, monkeypatch, tmp_path, ["--json"])
+    assert W.main() == 0, "a readable dry run must exit 0 — 3 means the tick REFUSED, not that it held"
     assert killed == [], "a dry run must never signal, even with a ripe candidate"
     assert '"reaped": []' in capsys.readouterr().out
 
@@ -470,16 +549,27 @@ def test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation(W
 
 
 def test_a_victim_that_no_longer_exists_is_not_signalled(W, monkeypatch):
-    """`absent` is not `holder`."""
+    """`absent` is not `holder`.
+
+    ⛔ THE RULE IS STUBBED HERE, AND THAT IS THE POINT (cycle-3 review). Left unstubbed this ran the
+    REAL `scripts/lib/pid-identity.sh` through `subprocess` to answer `absent` for pid 999999, so its
+    verdict rested on a file outside the test — measured: copy `lane-watchdog.py` and this file to a
+    temp dir and it reds (`unknown`, rule not found), with a docstring disclosing none of it. Its
+    subject is `reap()`'s handling of the ABSENT verdict, not the rule's ability to produce one; the
+    real rule keeps its own unstubbed tests
+    (`test_the_real_rule_recognises_this_process_and_refuses_a_wrong_incarnation`), and the
+    off-fence arm is stubbed the same way in its sibling above.
+    """
     killed = []
     monkeypatch.setattr(W.os, "kill", lambda p, s: killed.append(p))
+    monkeypatch.setattr(W, "probe_pid", lambda pid, start, *, lib=None: (False, "absent"))
     table = {**BASE, 200: T(100, cpu=1.0)}
     res = W.reap(dict(pid=999999, ppid=200, subtree=[999999], d_cpu=0.0, age_s=99999,
                       starts={999999: 1000.0}), {}, table, 1)
     assert killed == [] and res["abstained"][0]["reason"].startswith("absent")
 
 
-def test_the_measured_incarnation_is_attached_to_the_candidate(W):
+def test_the_measured_incarnation_is_attached_to_the_candidate(W, monkeypatch):
     """The fence can only check the incarnation the candidate CARRIES, and it must come from the
     SAME snapshot that judged the subtree parked: a later read would record the REPLACEMENT's start,
     so a recycled pid would answer `holder` and be signalled. Remove the attach and every victim
@@ -487,6 +577,7 @@ def test_the_measured_incarnation_is_attached_to_the_candidate(W):
     table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0), 301: T(300, cpu=1.0)}
     table[300]["start"] = 1111.0
     table[301]["start"] = 2222.0
+    parked(W, monkeypatch)
     cands = W.frozen_subtrees(dict(table), dict(table))
     assert cands and cands[0]["starts"] == {300: 1111.0, 301: 2222.0}
 
@@ -750,6 +841,7 @@ def test_an_unknown_connection_state_refuses(W, monkeypatch):
 
 def test_a_child_with_no_connection_is_still_a_candidate(W, monkeypatch):
     """The gate must not make the detector a no-op: the measured orphan held no connection."""
+    parked(W, monkeypatch)          # age + connection stubs; the setattr below sets the POLARITY
     monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
     a = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
     b = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
@@ -821,6 +913,7 @@ def test_a_live_connection_anywhere_in_the_subtree_refuses_the_candidate(W, monk
     provider call this gate exists to protect was killed through its parent.
     """
     tbl = {**BASE, 10: T(100, cpu=1.0), 50: T(10, cpu=1.0), 60: T(50, cpu=1.0)}
+    parked(W, monkeypatch)          # age + connection stubs; the setattrs below set the POLARITY
     monkeypatch.setattr(W, "has_live_connection", lambda pid: pid == 60)
     assert W.frozen_subtrees(tbl, tbl) == [], (
         "a live connection in the subtree must refuse the candidate that would signal it")
@@ -932,6 +1025,7 @@ def test_a_working_probe_is_still_decisive_in_both_directions(W, monkeypatch):
     """The mirror, so the new refusal cannot swallow a working probe: False (no connection) must
     still yield the candidate, and True (an established connection) must still spare it."""
     table = {**BASE, 200: T(100, cpu=1.0), 300: T(200, cpu=1.0)}
+    parked(W, monkeypatch)          # age + connection stubs; the setattrs below set the POLARITY
     monkeypatch.setattr(W, "has_live_connection", lambda pid: False)
     unreadable = []
     assert [c["pid"] for c in W.frozen_subtrees(table, table, unreadable=unreadable)] == [300]

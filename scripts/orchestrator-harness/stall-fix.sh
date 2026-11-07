@@ -291,6 +291,19 @@ gets hidden; the escalation must never grow a release valve" — is NOT reversed
 dispatched to DIAGNOSE the land problem, not to open new work or change dispatch policy. If your
 finding contradicts either, record it and stop; do not adopt over it.
 
+## PREVIOUS WORK — did someone already start this? (agent-infra#3484)
+
+This lane DIAGNOSES the drain, so it has no issue or PR key to look up. It says so rather than
+inventing one — an invented key is worse than an honest `keyless`, because it makes the claim
+unfalsifiable in a way nobody can see.
+
+CLAIM:     unclaimed — a diagnosis dispatch holds no issue/PR key
+WIP:       keyless — the only artifact is this report, and it names what it found
+BRANCH:    none — this lane creates no branch and pushes nothing
+WORKTREE:  none — it reads the box it runs on
+PRIOR:     read the newest `reports/stallfix-*.md` (and `state/drain-stall`) BEFORE you diagnose;
+the previous conclusion is usually the shortest path to this one.
+
 ## Report
 
 `__REPORT__`: the dominant named reason (verbatim), whether it is a real wait or a

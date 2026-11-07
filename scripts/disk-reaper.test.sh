@@ -114,6 +114,14 @@ T="$(cd "$T" && pwd -P)"
 REAP_AW_ROOTS="$T/scratch/absent"
 REAP_DI_ROOTS="$T/scratch/absent"
 export REAP_AW_ROOTS REAP_DI_ROOTS
+# ⛔ AND THE RUNNER `_work` CLASS, FOR THE SAME REASON (its own class is the newest). Its globs are the
+# one seam that can point at a REAL population outside the fixture — `/opt/gh-runner*/_work` on a cell
+# holds 19 G of live CI checkout, and several cases here run the DEFAULT class list with `--apply`. So
+# the seam is pinned at a fixture root that EXISTS and is EMPTY, which is a measured empty population
+# rather than an explicit-but-unmatched refusal (that distinction is the class's own policy).
+mkdir -p "$T/scratch/rw/gh-runner-fixture/_work"
+DISK_REAPER_RUNNER_GLOBS="$T/scratch/rw/gh-runner*/_work"
+export DISK_REAPER_RUNNER_GLOBS
 SLEEPERS=""
 cleanup() {
     local p
@@ -1041,6 +1049,26 @@ PY
     OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
     assert_contains "$OUT" "record ok=1" "T27 a HEALTHY record is read on a Linux-shaped host"
     assert_contains "$OUT" "ALARMS=[]" "T27 ... and contributes no alarm"
+    # (b2) A NON-`ok` CLASS VERDICT IS PRINTED, AND IS NOT A FLEET ALARM (#3057 review, P2). The
+    # reaper records `verdict_runner_work=partial` when it could read PART of the runners' `_work` sink
+    # and not the rest, and `=abstained` when it could read none of it. Both are rc 0 BY DECISION — the
+    # record is the alarm channel and an hourly red for a permission mismatch is the alarm-fatigue shape
+    # this family forbids — so this reader's whole duty is VISIBILITY, and it had none: the class verdict
+    # was never read, and the `detail` naming the abstention was thrown away in the `ok == 1` branch, so a
+    # cell whose sink filled behind a permission mismatch read HEALTHY here for ever.
+    printf 'epoch=%s\nok=1\nrc=0\nfreed_mb=12\ndetail=runner-work census is PARTIAL\nunmeasurable_runner_work=1\nverdict_runner_work=partial\nverdict_duplicate_install=ok\n' "$(date +%s)" \
+        >"$T/t27/home/.pi/agent/state/disk-reaper.status"
+    OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
+    assert_contains "$OUT" "runner-work=partial" "T27 a PARTIAL runner-work census is PRINTED (a field the reader does not print does not exist)"
+    assert_contains "$OUT" "unmeasurable=1" "T27 ... with the unmeasured tally, so the number names its own lower bound"
+    assert_absent "$OUT" "duplicate-install=" "T27 ... and a benign class verdict stays SILENT (a healthy cell gains no noise)"
+    assert_contains "$OUT" "ALARMS=[]" "T27 ... and it is NOT an alarm: rc 0 abstentions are the record's job by recorded decision (alarming here would reverse it fleet-wide)"
+    # (b3) the CONTROL: the same record with every verdict `ok` prints no class note at all, so (b2) is
+    # reading the verdict and not simply echoing every field it can find.
+    printf 'epoch=%s\nok=1\nrc=0\nfreed_mb=12\nverdict_runner_work=ok\n' "$(date +%s)" \
+        >"$T/t27/home/.pi/agent/state/disk-reaper.status"
+    OUT="$(_fh "$T/t27/home" 1 2>&1)"; RC=$?
+    assert_absent "$OUT" "runner-work=" "T27 control: an OK class verdict adds no class note"
 else
     ok "T27 skipped — no python3 on this host"
 fi
@@ -1441,6 +1469,13 @@ assert_contains "$ST" "df could not measure" "T42 ... and its detail says so ins
 assert_contains "$ST" "freed_mb_venv=unmeasured" "T42 ... while still refusing to print a measured 0 for it"
 OUT="$(HOME="$T/home" DISK_REAPER_STATE_DIR="$T/$ENVNAME/state" bash "$REAPER" --print-status 2>&1)"
 assert_contains "$OUT" "freed_mb_unmeasured=venv" "T42 --print-status surfaces it too"
+# ⛔ AND THE PASS TOTAL FOLLOWS, FOR EVERY CAUSE, NOT JUST THE UNATTRIBUTABLE OWNER (#3057 review, P2).
+# The rule this file states — "a sum with an unconfirmed term is not a measurement" — was implemented for
+# `runner-work` alone, so THIS arm (the one T42 drives) still recorded `freed_mb=0` beside
+# `freed_mb_venv=unmeasured`: a confident total for a pass whose reclaim is unknown. Measured, before the
+# fix, on exactly this command line.
+assert_contains "$ST" "freed_mb=unmeasured" "T42 ... and the pass TOTAL is unmeasured too, never a sum with an unknown added as 0"
+assert_absent "$ST" "freed_mb=0" "T42 ... so no surface publishes a measured 0 for this pass"
 
 # ── T43: a worktree checkout under a path with a SPACE is measured at its real path (cycle 6, P2) ─
 ENVNAME=t43
@@ -2618,7 +2653,15 @@ assert_dir "$WT_SP" "T55c and its checkout was still left alone"
 # The token is SPACE-FREE BY CONTRACT: a reason that interpolated a path containing a space
 # (`scratch-unwritable(TMPDIR=/My Temp)`) would split at the space, parse to nothing, and turn this
 # repo's skip back into an anonymous class-wide `verdict=fail-closed` (#2443 review P1).
-OUT="$(REAP_WT_MAIN_PROOF=local GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
+# ⛔ THIS CALL GOES TO THE DELEGATE DIRECTLY (there is no `run_reaper` wrapper here, because the point is
+# the delegate's OWN token), so it must pin `HOME` and the state dir ITSELF. Without them the delegate
+# resolves `STATE_DIR="$HOME/.pi/agent/state"` on the REAL box, takes the real lock, and writes a real
+# offset file: the suite then reddens whenever anything else on the box holds that lock (`FAIL-CLOSED
+# abort: lock held`, rc 3, an EMPTY reason token) — measured at this head as a 1-of-718 failure on one
+# run and a green one on the next, with no file changed in between. That is the same hermeticity rule
+# the header states for every other invocation, applied to the one call that bypasses the wrapper.
+OUT="$(HOME="$T/home" REAP_WT_STATE_DIR="$T/$ENVNAME/state" REAP_WT_LOG="$T/$ENVNAME/state/pi-reap-worktrees.log" \
+      REAP_WT_MAIN_PROOF=local GH_BIN="$T/t55/bin/gh" bash "$HERE/pi-reap-worktrees.sh" --dry-run --repo "$REPO_SP" 2>&1)"; RC=$?
 assert_eq "$RC" "3" "T55c the delegate itself exits 3 for a repo under a spaced path"
 assert_eq "$(printf '%s\n' "$OUT" | sed -n 's/^SKIPPED-REPO: .*reason=//p' | head -1)" \
     "gh-not-authenticated(rc=4)" "T55c the reason token is exact and space-free (a spaced repo path cannot split it)"

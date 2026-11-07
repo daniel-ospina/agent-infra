@@ -109,9 +109,11 @@ import {
   TIER_RULE,
   default as reviewEnforcerFactory,
   resolveGhShimDir,
+  resolveGhLimitDir,
   materializeGhShim,
   NEUTRAL_GH_SHIM_DIR,
   withGhShim,
+  withGhLayers,
   resolveAdminMergeEvidenceVerifier,
   // #2349 — the refusal-state diagnostics. These are MESSAGE builders: nothing
   // below is consulted by a decision, which is what lets the same suite pin
@@ -1972,8 +1974,20 @@ testAsync("#1662: a background dispatch is not counted until its terminal task_c
         const b2 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         ok(b2 && b2.block === true, "a not-finished collect must NOT count");
 
+        // #3155: and neither is a TERMINAL collect whose record carries no composed payload —
+        // certification is a property of the REAP, not of the verb (a payload-less reap is refused
+        // through task_status above, so counting it here would be a false PASS reachable by
+        // following this gate's own advice). The payload is present on a clean success and on the
+        // abort shapes that compose one; it is ABSENT for a child that produced NOTHING and was
+        // reaped by the hard cap / silence threshold / backstop (`doResolve(undefined)` → record
+        // `status:"failed"`, `final_details` dropped), which is why that shape must still be
+        // classified — see the dedicated ATTEMPT test below.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-NOPAYLOAD" } });
+        const b3 = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(b3 && b3.block === true, "a terminal collect with no composed payload must NOT count");
+
         // The terminal collect is the reviewer's completion — now it counts.
-        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done" } });
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-OK", details: { model: "m", provider: "p" } } });
         const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
         equal(allowed, undefined, "the terminal collect satisfies the ≥1-dispatch gate");
       } finally {
@@ -1997,15 +2011,258 @@ testAsync("#1662 review: re-collecting the SAME terminal task_collect is counted
         await fire("tool_result", { toolName: "task", details: { background: true, status: "running" } });
 
         // The verdict is reaped — counted once.
-        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A", details: { model: "m", provider: "p" } } });
 
         // The SAME finished lane is re-collected (`task_collect` is idempotent).
-        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A" } });
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-A", details: { model: "m", provider: "p" } } });
 
         // The durable per-event audit count must not be inflated by the repeat.
         const dispatchLines = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
         equal(dispatchLines.length, 1, "the same run is counted exactly once");
         equal(dispatchLines[0].dispatch_count, 1, "the running total reflects one real dispatch");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: a TERMINAL task_status reap counts as a reviewer dispatch — the SECOND reap verb", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // MEASURED ON MAIN BEFORE THIS FIX (live `pi -p`, one background child): a lane that
+        // polled `task_status` to `done` and then ran a git op was refused with
+        // "reviewer dispatches counted in THIS pi process = 0" — the same session, the same
+        // completed reviewer. Only `task_collect` moved the count. This is that lane.
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "blocked without dispatches");
+
+        // A NON-terminal view is still not a verdict (#1662's fail-open, preserved). ⛔ THE PAYLOAD
+        // IS DELIBERATELY PRESENT HERE (fresh review, P1): without it these cases would fall
+        // through to the missing-payload guard BELOW the `terminal` test and be refused for the
+        // wrong reason — so the only thing that could refuse a non-terminal view *carrying* a
+        // payload was never exercised, and a mutant that counted exactly that survived the suite.
+        // With the payload present, `terminal` is the sole gate on this path.
+        for (const status of ["alive", "wedged", "gone"]) {
+          await fire("tool_result", {
+            toolName: "task_status",
+            details: { terminal: false, status, run_id: `RUN-${status}`, final_details: { model: "m", provider: "p" } },
+          });
+        }
+        const stillBlocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(stillBlocked && stillBlocked.block === true, "a running/wedged/gone view must NOT count as a completed reviewer");
+
+        // The terminal view — the run IS finished and its verdict is persisted. Count it.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", exit_code: 0, run_id: "RUN-3155", final_details: { model: "m", provider: "p" } },
+        });
+        const allowed = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        equal(allowed, undefined, "a terminal status reap satisfies the ≥1-dispatch gate (#3155)");
+
+        // The durable trail names the REAP VERB, so an accounting read can tell the two apart.
+        const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(rows.length, 1, "one counted dispatch");
+        equal(rows[0].tool, "task_status", "the audit row names the verb that reaped it");
+        equal(rows[0].run_id, "RUN-3155", "and the run it reaped");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: a terminal task_status whose child produced NOTHING (clean-empty) must still NOT count", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // THE GUARD MUST STILL REFUSE WHAT IT EXISTS TO REFUSE. The run's own `status` maps a
+        // success-but-silent child to `done`; only the child's composed `exitCode: 0` shows it
+        // produced no verdict. Counting on the label alone would be the #2665 fail-open, one verb
+        // over — so the status arm reads the SAME field the collect arm reads.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", exit_code: 0, run_id: "RUN-EMPTY", final_details: { model: "m", provider: "p", exitCode: 0 } },
+        });
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "a clean-empty settle is NOT a reviewer verdict");
+
+        // And the same view WITH a real verdict text counts — the difference is the payload, not luck.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", exit_code: 0, run_id: "RUN-REAL", final_details: { model: "m", provider: "p" } },
+        });
+        equal(await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } }), undefined, "a real terminal verdict counts");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: a terminal task_status with NO composed details is never counted — absence is not a verdict", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A producer that does not carry `final_details` (version skew) or a record with none:
+        // the datum needed to certify a verdict is MISSING, and the floor fails CLOSED. The
+        // remedy is the terminal `task_collect`, which carries the payload by contract.
+        // A reap whose record carries no composed payload (version skew, a hand-written record, an
+        // EMPTY object — which carries no evidence either — or an ARRAY, empty or not: spreading one
+        // yields index keys the classifier never reads) cannot be certified as a verdict: the datum
+        // is MISSING and the floor fails CLOSED. The NON-empty array case below is what pins
+        // `Array.isArray`; `[]` alone is caught by the empty-keys check, so it pinned nothing.
+        for (const missing of [{}, { final_details: null }, { final_details: [] }, { final_details: [{ model: "m" }] }, { final_details: {} }]) {
+          await fire("tool_result", {
+            toolName: "task_status",
+            details: { terminal: true, status: "done", exit_code: 0, run_id: `RUN-NOEVID-${JSON.stringify(missing)}`, ...missing },
+          });
+        }
+        const blocked = await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } });
+        ok(blocked && blocked.block === true, "an unclassifiable terminal view is neither a dispatch nor an ATTEMPT — it counts nothing and writes no ledger row");
+        const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(rows.length, 0, "no durable dispatch was recorded for it");
+
+        // POSITIVE CONTROL: without it this case would also pass with the status arm REMOVED
+        // entirely (nothing counts at all), which would make it prove nothing.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", run_id: "RUN-CERTIFIED", final_details: { model: "m", provider: "p" } },
+        });
+        equal(await fire("tool_call", { toolName: "bash", input: { command: "git commit -m x" } }), undefined, "a certifiable terminal reap DOES count");
+
+        // ⛔ AND AN UNCERTIFIABLE VIEW MUST NOT SPEND THE RUN'S ONE SLOT. Marking it "already
+        // reaped" would make the documented remedy (`task_collect`, which carries the payload)
+        // look like a repeat and leave the run uncountable for the whole session.
+        await fire("tool_result", { toolName: "task_status", details: { terminal: true, status: "done", run_id: "RUN-REMEDY" } });
+        const afterUncertifiable = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(afterUncertifiable.length, 1, "the uncertifiable view recorded no dispatch");
+        await fire("tool_result", {
+          toolName: "task_collect",
+          details: { terminal: true, status: "done", run_id: "RUN-REMEDY", details: { model: "m", provider: "p" } },
+        });
+        const afterRemedy = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(afterRemedy.length, 2, "the SAME run's terminal collect still counts — an uncounted view is unrecorded");
+        equal(afterRemedy[1].run_id, "RUN-REMEDY", "and it is that run that got counted");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155: status-then-collect of the SAME run counts ONCE (one dedupe, both verbs)", async () => {
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      process.env.PI_MODE = "print";
+      const { pi, fire } = mockPi();
+      (reviewEnforcerFactory as any)(pi);
+      try {
+        await fire("session_start");
+
+        // A lane polls to done, THEN reaps with collect (the documented flow). One reviewer is
+        // one dispatch however many times, and through whichever verb, it is observed.
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", run_id: "RUN-ONE", final_details: { model: "m", provider: "p" } },
+        });
+        // ⛔ ASSERT AFTER THE FIRST REAP, NOT ONLY AT THE END (fresh review, P2): with the status arm
+        // removed entirely the two collects alone still produce 2 rows, so an end-only assertion
+        // cannot tell "counted once" from "not counted at all" — the direction this case is named for.
+        const afterFirst = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(afterFirst.length, 1, "the status reap already counted");
+        equal(afterFirst[0].tool, "task_status", "…through the observation verb");
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-ONE", details: { model: "m", provider: "p" } } });
+        // …and again the other way round, to prove the shared set is order-independent.
+        await fire("tool_result", { toolName: "task_collect", details: { terminal: true, status: "done", run_id: "RUN-TWO", details: { model: "m", provider: "p" } } });
+        await fire("tool_result", {
+          toolName: "task_status",
+          details: { terminal: true, status: "done", run_id: "RUN-TWO", final_details: { model: "m", provider: "p" } },
+        });
+
+        const rows = readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch");
+        equal(rows.length, 2, "two runs ⇒ two counted dispatches, not four");
+        equal(rows.map((r) => r.dispatch_count).join(","), "1,2", "the running total counts runs, not reaps");
+      } finally {
+        process.env.PI_MODE = prevMode;
+      }
+    });
+  });
+});
+
+testAsync("#3155 review: a payload-less reap whose VIEW says the child FAILED is an ATTEMPT — a CAPACITY fault, never 'no reviewers dispatched'", async () => {
+  // THE REAL PRODUCER SHAPE, and the one the certification guard used to throw away. A background
+  // child that produced NOTHING resolves `undefined` (`doResolve(undefined, { reason: "hard-cap" |
+  // "silence-threshold" | "backstop" })` — the #271/#208 "resolveUndefined = !hasOutput" RETRYABLE
+  // arms), so `classifyBackgroundOutcome(undefined)` maps it to
+  // `{ status: "failed", exitCode: null, reason: "zero-output" }`, and the settle writer's
+  // `final_details: result?.details` is dropped by JSON. The record therefore has NO composed
+  // payload but DOES carry an outcome in the classifier's own vocabulary (`shared/spawn-capacity.ts`
+  // reads `details.status`).
+  const cmd = ["git", "commit", "-m", "x"].join(" ");
+  const reap = async (tool: string, details: Record<string, unknown>) => {
+    process.env.PI_MODE = "print";
+    const { pi, fire } = mockPi();
+    (reviewEnforcerFactory as any)(pi);
+    await fire("session_start");
+    await fire("tool_result", { toolName: tool, details });
+    const blocked = await fire("tool_call", { toolName: "bash", input: { command: cmd } });
+    return {
+      blocked: blocked && (blocked as any).block === true,
+      reason: String((blocked && (blocked as any).reason) || ""),
+      dispatchRows: readAuditLines(auditLogPath()).filter((l) => l.event === "review_dispatch").length,
+    };
+  };
+  await withTempHome(async () => {
+    await withMarkerIsolated(async () => {
+      const prevMode = process.env.PI_MODE;
+      try {
+        // ⛔ BOTH VERBS, ONE RULE. The certification guard ran BEFORE classification, so this
+        // record's own `status: "failed"` was never read: the lane was told "No reviewers were
+        // dispatched in this session" — the compliance headline #2665 exists to stop a capacity
+        // fault from wearing — and `spawnAttempts` stayed 0, so `REVIEW-GATE-UNSPAWNABLE` (the one
+        // text that says the dispatches are DYING, not missing) never fired. Measured on `main`:
+        // `task_collect` on this exact record DID render the capacity diagnosis; the guard removed
+        // it, so this is a regression, not a missing nicety.
+        for (const [tool, details] of [
+          ["task_status", { terminal: true, status: "failed", reason: "zero-output", exit_code: null, run_id: "RUN-ZERO-S" }],
+          ["task_collect", { terminal: true, status: "failed", details: null, run_id: "RUN-ZERO-C" }],
+        ] as const) {
+          const r = await reap(tool, details as Record<string, unknown>);
+          ok(r.blocked, `${tool}: a child that produced nothing is NOT a verdict — still refused`);
+          ok(/REVIEW-GATE-UNSPAWNABLE/.test(r.reason), `${tool}: the refusal renders the spawn-fault diagnosis the record reports`);
+          ok(/CAPACITY fault/.test(r.reason), `${tool}: …and names it as a CAPACITY fault`);
+          ok(!/No reviewers were dispatched in this session/.test(r.reason), `${tool}: …never the compliance headline (#2665)`);
+          equal(r.dispatchRows, 0, `${tool}: an ATTEMPT is not a dispatch — nothing was counted`);
+        }
+
+        // ⛔ AND THE GUARD'S OWN JOB SURVIVES: a `done` VIEW WITH NOTHING BEHIND IT is still
+        // uncertifiable — refused, counted nothing, and recorded as NO attempt (there the absence
+        // really is the only datum: the label says "done" and the evidence says nothing).
+        const noPayload = await reap("task_status", { terminal: true, status: "done", exit_code: 0, run_id: "RUN-DONE-NOPAYLOAD" });
+        ok(noPayload.blocked, "a `done` label with nothing behind it is NOT counted");
+        ok(!/REVIEW-GATE-UNSPAWNABLE/.test(noPayload.reason), "…and it records NO attempt — there the missing DATUM is the failure, not the child");
+        equal(noPayload.dispatchRows, 0, "…and it counts nothing");
       } finally {
         process.env.PI_MODE = prevMode;
       }
@@ -6935,6 +7192,301 @@ test("withGhShim (#984): the argv-level gh shim is put on PATH for every bash ca
   equal(withShimInstalled(() => withGhShim("true", "/a b/gh-shim")),
     'export PATH="/a b/gh-shim":"$PATH"\ntrue',
     "a shim path containing a space survives quoting");
+});
+
+test("withGhShim: the QUOTA layer is prepended AHEAD of the argv guard (#3477)", () => {
+  // Measured 2026-11-05 on cell `cmux`: 11 of 12 live lane `pi` processes had NO `gh-limit` on
+  // PATH, so the TTL read cache, single-flight, the account budget and `--stats` were bypassed
+  // entirely — while the box's own layer logged 839 `gh-core-floor … read refused` events and
+  // ZERO `read-cache: <class> hit` / `single-flight: shared` / `conditional: 304` (`--stats` said
+  // `averted=0`) with `core 0/5000` and `graphql 4159/5000`. The fix is composition, so the ORDER
+  // is the assertion: `gh-limit → gh-shim → real gh` is the order `lane.sh:83-84` already
+  // establishes. Reverse it and the QUOTA LAYER is lost, not the guard — `scripts/gh-shim/gh`'s own
+  // 8 KiB marker test skips `gh-limit` (marker at byte 1100), leaving the guard running with the
+  // cache bypassed (measured, review round 5).
+  // ⛔ THE AMBIENT KILL SWITCH MUST BE CLEARED, not just `AGENT_GH_SHIM`: `withShimInstalled`
+  // clears only the latter, so a box that exports `AGENT_GH_LIMIT=0` — the exact box an operator
+  // runs this suite on to check the switch — would get a single-entry prefix and a FALSE RED at
+  // the order assertion below. Same class the file's own header warns about (un-restored env
+  // becomes the posture of every later test).
+  const ORIG = "echo hello";
+  const prevLimit = process.env.AGENT_GH_LIMIT;
+  delete process.env.AGENT_GH_LIMIT;
+  try {
+    const shimmed = withShimInstalled(() =>
+      withGhShim(ORIG, "/repo/scripts/gh-shim", "/o/gh-limit")) as string;
+    ok(shimmed !== null, "a quota dir with a shim dir yields a patched command");
+    equal(shimmed.split("\n").length, 2, "still one prefix line plus the command");
+    ok(shimmed.endsWith(ORIG), "the caller's command is preserved verbatim");
+    ok(shimmed.startsWith('export PATH="/o/gh-limit":"/repo/scripts/gh-shim":"$PATH"'),
+      "the quota layer comes FIRST, then the guard — never the other way round");
+
+    // ⛔ BACKWARD COMPATIBILITY IS A BYTE-LEVEL PROMISE. A box with no quota layer installed must
+    // get EXACTLY the prefix it got before this change; a reordered or re-spelled prefix would be a
+    // silent posture change on every bash call of every consumer that never asked for the layer.
+    equal(withShimInstalled(() => withGhShim("true", "/a b/gh-shim")),
+      'export PATH="/a b/gh-shim":"$PATH"\ntrue',
+      "no quota dir → the injected text is UNCHANGED from before this change");
+    equal(withShimInstalled(() => withGhShim("true", "/a b/gh-shim", null)),
+      'export PATH="/a b/gh-shim":"$PATH"\ntrue',
+      "an explicit null behaves as absent");
+
+    // ⛔ THE TWO KILL SWITCHES ARE INDEPENDENT ON PURPOSE. `AGENT_GH_LIMIT=0` must drop ONLY the
+    // quota entry: a caller who wants the admin-merge guard without the extra hop (measured on cell
+    // `cmux`: 123 ms direct vs 278 ms through the chain) keeps protecting the merge.
+    process.env.AGENT_GH_LIMIT = "0";
+    equal(withShimInstalled(() => withGhShim("true", "/s", "/o/gh-limit")),
+      'export PATH="/s":"$PATH"\ntrue',
+      "AGENT_GH_LIMIT=0 drops only the quota entry and keeps the argv guard");
+    delete process.env.AGENT_GH_LIMIT;
+
+    // …and the pre-existing switch still turns the WHOLE injection off, quota layer included.
+    const prevShim = process.env.AGENT_GH_SHIM;
+    process.env.AGENT_GH_SHIM = "0";
+    equal(withGhShim("true", "/s", "/o/gh-limit"), null, "AGENT_GH_SHIM=0 still disables everything");
+    if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prevShim;
+
+    // ⛔ A SPACE IN EITHER PATH MUST SURVIVE. The prefix is pasted into a shell line, so an unquoted
+    // entry with a space splits into two PATH entries — one of which is the real `gh` being skipped.
+    equal(withShimInstalled(() => withGhShim("true", "/a b/gh-shim", "/q d/gh-limit")),
+      'export PATH="/q d/gh-limit":"/a b/gh-shim":"$PATH"\ntrue',
+      "both entries are JSON-quoted");
+  } finally {
+    if (prevLimit === undefined) delete process.env.AGENT_GH_LIMIT;
+    else process.env.AGENT_GH_LIMIT = prevLimit;
+  }
+});
+
+test("resolveGhLimitDir (#3477): identity is the SENTINEL, never the sibling helper", () => {
+  // ⛔ THIS IS THE REGRESSION TEST FOR A MEASURED BYPASS, AND IT IS THE POINT OF THE WHOLE PREDICATE.
+  // `gh-limit.py:3296` records that accepting "a `gh` beside a `../gh-limit.py`" as a layer
+  // "SILENTLY SKIPPED any other `gh` sitting in such a directory — measured with the tree's own
+  // admin-merge guard placed beside the helper: `gh pr merge --admin` then reached the real gh
+  // UNGUARDED". The first draft of this change repeated exactly that predicate, and because the
+  // quota dir is prepended AHEAD of the guard it would have been worse than not injecting at all.
+  // So: a directory holding an executable `gh` + the helper but WITHOUT the sentinel is NOT a layer.
+  const root = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-ghlimit-"));
+  const prevDir = process.env.AGENT_GH_LIMIT_DIR;
+  const prevO = process.env.O;
+  // Isolate the `$O` fallback: this box really does have `~/orchestrator/gh-limit`, so a test that
+  // only sets AGENT_GH_LIMIT_DIR would fall through to it and assert the wrong directory.
+  process.env.O = root;
+  const setDir = (v: string | undefined): void => {
+    if (v === undefined) delete process.env.AGENT_GH_LIMIT_DIR;
+    else process.env.AGENT_GH_LIMIT_DIR = v;
+  };
+  const MARK = "harness-gh-shim-marker";
+  // The sentinel sits at byte 1100 in the real wrapper and `--self` at 6156 — both inside the 8 KiB
+  // window both existing consumers read (`gh-limit.py:3303`, `scripts/gh-shim/gh:325`). `--self` is
+  // the discriminator that separates the quota wrapper from `gh-rest/gh` (see below).
+  const wrapper = `#!/usr/bin/env bash\n# ${MARK}: every entry point of the gh limit layer carries this line\nexec python3 "$HELPER" --self "$SELF_REAL" -- "$@"\n`;
+  // The REST adapter's shape, measured from the real file: same marker (bytes 2602/5988), same
+  // sibling `../gh-limit.py` (`LIMIT_HELPER=`), and NO `--self`. Accepting it as the quota layer is
+  // a GUARD BYPASS — it skips harness layers by a whole-file marker grep and execs the real gh.
+  const restAdapter = `#!/usr/bin/env bash\n# ${MARK}: every entry point of the gh limit layer carries this line\nLIMIT_HELPER="${'${GH_REST_LIMIT_HELPER:-$SELF_DIR/../gh-limit.py}'}"\nexec python3 "$LIMIT_HELPER" --real-gh "$REAL_GH" -- "$@"\n`;
+  try {
+    const full = resolvePath(root, "full", "gh-limit");
+    fs.mkdirSync(full, { recursive: true });
+    fs.writeFileSync(resolvePath(full, "gh"), wrapper, { mode: 0o755 });
+    fs.writeFileSync(resolvePath(full, "..", "gh-limit.py"), "# helper\n");
+    setDir(full);
+    equal(resolveGhLimitDir(), full, "sentinel + --self + helper + executable → the layer resolves");
+
+    // ── THE BYPASS CLASSES ─────────────────────────────────────────────────────────────────────
+    const impostor = resolvePath(root, "impostor", "gh-limit");
+    fs.mkdirSync(impostor, { recursive: true });
+    fs.writeFileSync(resolvePath(impostor, "gh"), "#!/bin/sh\nexec /usr/bin/gh \"$@\"\n", { mode: 0o755 });
+    fs.writeFileSync(resolvePath(impostor, "..", "gh-limit.py"), "# helper\n");
+    setDir(impostor);
+    equal(resolveGhLimitDir(), null,
+      "executable gh + helper but NO sentinel → null (the exact predicate that bypassed #984)");
+
+    const rest = resolvePath(root, "rest", "gh-limit");
+    fs.mkdirSync(rest, { recursive: true });
+    fs.writeFileSync(resolvePath(rest, "gh"), restAdapter, { mode: 0o755 });
+    fs.writeFileSync(resolvePath(rest, "..", "gh-limit.py"), "# helper\n");
+    setDir(rest);
+    equal(resolveGhLimitDir(), null,
+      "the gh-rest ADAPTER (marker + helper, no --self) → null: accepting it would skip the #984 guard");
+
+    const half = resolvePath(root, "half", "gh-limit");
+    fs.mkdirSync(half, { recursive: true });
+    fs.writeFileSync(resolvePath(half, "gh"), wrapper, { mode: 0o755 });
+    setDir(half);
+    equal(resolveGhLimitDir(), null, "sentinel but NO helper → null (never a half-installed layer)");
+
+    const noexec = resolvePath(root, "noexec", "gh-limit");
+    fs.mkdirSync(noexec, { recursive: true });
+    fs.writeFileSync(resolvePath(noexec, "gh"), wrapper, { mode: 0o644 });
+    fs.writeFileSync(resolvePath(noexec, "..", "gh-limit.py"), "# helper\n");
+    setDir(noexec);
+    equal(resolveGhLimitDir(), null, "a non-executable `gh` is skipped by the shell → not a layer");
+
+    setDir(undefined);
+    equal(resolveGhLimitDir(), null, "no explicit dir and no $O/gh-limit → null (a box without the layer)");
+  } finally {
+    setDir(prevDir);
+    if (prevO === undefined) delete process.env.O;
+    else process.env.O = prevO;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("resolveGhLimitDir (#3477): the REAL tracked wrapper resolves — the 8 KiB window is pinned", () => {
+  // ⛔ THE FIXTURES ABOVE PUT BOTH TOKENS IN THE FIRST ~200 BYTES, so they pass at ANY window size.
+  // The whole design rests on where the tokens ACTUALLY sit in the tracked wrapper — marker at byte
+  // 1100, `--self` at 5886/6156, file 6184 B — and nothing asserted that. Measured (round 4):
+  // `Buffer.alloc(2048)` leaves the suite green while `resolveGhLimitDir()` returns null on every
+  // real box, i.e. the change is 100% dead with a green suite. This reads the real file, so the
+  // window is pinned by the artefact rather than by a comment.
+  const repo = resolvePath(fileURLToPath(new URL(".", import.meta.url)), "..", "..");
+  const real = resolvePath(repo, "scripts", "orchestrator-harness", "gh-limit");
+  // No fixture needed: the wrapper and its sibling `../gh-limit.py` are both tracked.
+  if (!fs.existsSync(resolvePath(real, "gh"))) return; // a trimmed checkout is not a failure
+  const prevDir = process.env.AGENT_GH_LIMIT_DIR;
+  try {
+    process.env.AGENT_GH_LIMIT_DIR = real;
+    equal(resolveGhLimitDir(), real,
+      "the tracked scripts/orchestrator-harness/gh-limit resolves at the real 8 KiB window");
+  } finally {
+    if (prevDir === undefined) delete process.env.AGENT_GH_LIMIT_DIR;
+    else process.env.AGENT_GH_LIMIT_DIR = prevDir;
+  }
+});
+
+test("withGhShim: the injected quota prefix must NOT fabricate a gate-relevant word", () => {
+  // Same hazard the existing shim-dir test pins, now with a SECOND injected path. Other extensions
+  // read the mutated `event.input.command` after this handler, so any word in the injected text can
+  // flip THEIR gates (VGATE #984: a checkout path containing `admin` made `isGitOp` true for a
+  // command that is not a git op). The shim entry is neutralised by construction
+  // (`NEUTRAL_GH_SHIM_DIR`); the quota entry is NOT — it is `$O/gh-limit` or `AGENT_GH_LIMIT_DIR`,
+  // both operator-controlled — which is the residual the doc names.
+  const benign = "echo hello";
+  // ⛔ CLEAR THE KILL SWITCH AND ASSERT THE ENTRY IS THERE (review round 5). Without both, a box that
+  // exports `AGENT_GH_LIMIT=0` — the box this file's own sibling test names as "the exact box an
+  // operator runs this suite on to check the switch" — gets a single-entry prefix and the two gate
+  // assertions below pass VACUOUSLY over text containing no quota path at all. The only guard
+  // against the injected quota path handing another extension a gate word would then be silently
+  // covering nothing.
+  const prevLimit = process.env.AGENT_GH_LIMIT;
+  delete process.env.AGENT_GH_LIMIT;
+  try {
+    const quotaDir = "/home/x/orchestrator/gh-limit";
+    const patched = withShimInstalled(() =>
+      withGhShim(benign, NEUTRAL_GH_SHIM_DIR, quotaDir)) as string;
+    ok(patched.includes(quotaDir),
+      "the quota entry is actually IN the injected text — otherwise the assertions below pass vacuously");
+    equal(isGitOp(patched), isGitOp(benign), "the quota prefix does not fabricate a git op");
+    equal(isAdminMergeCommand(patched), isAdminMergeCommand(benign), "…nor an admin merge");
+  } finally {
+    if (prevLimit === undefined) delete process.env.AGENT_GH_LIMIT;
+    else process.env.AGENT_GH_LIMIT = prevLimit;
+  }
+});
+
+test("withGhLayers (#3477): the WIRING — resolve then compose — is exercised end to end", () => {
+  // ⛔ THE WIRING WAS THE UNTESTED PART (review round 2). `activeGhLimitDir` is private, so every
+  // other assertion here passes an EXPLICIT `limitDir` — meaning the resolver returning `null`, or
+  // the handler dropping the argument, left the suite at 404 green while the change was dead. This
+  // drives the real path with a hermetic fixture: nothing here is a literal the composition merely
+  // restates.
+  // A hermetic `O` root, so the assertion is independent of this box's `$HOME` (a `/home/admin/…`
+  // install is a documented, accepted residual and must not turn the suite RED).
+  const root = fs.mkdtempSync(resolvePath(os.tmpdir(), "re-ghlayers-"));
+  const prevO = process.env.O;
+  const prevLimit = process.env.AGENT_GH_LIMIT;
+  // ⛔ `AGENT_GH_LIMIT_DIR` OUTRANKS `$O` IN THE RESOLVER, so a hermetic `O` alone is not hermetic:
+  // measured on a box exporting the seam this change documents — `AGENT_GH_LIMIT_DIR=$HOME/orchestrator/gh-limit`
+  // → a FALSE RED on the order assertion, i.e. a red over a correct change, in the newly added test.
+  // Same class round 2 fixed one variable over; clear it too.
+  const prevDir = process.env.AGENT_GH_LIMIT_DIR;
+  // ⛔ AND `AGENT_GH_SHIM` IS THE FOURTH, on exactly the same footing as the three above and for the
+  // file's own stated reason (the SAVE/RESTORE rule in the `withGhShim` kill-switch test): the
+  // suite's DECLARED posture is `AGENT_GH_SHIM=0` at the top of this file, and the degraded-path arm
+  // below sets it and then DELETES it. Un-restored, that leaves the variable ABSENT — the OPPOSITE
+  // posture — for every later test in a 12k-line file, which silently makes the declared posture
+  // inert and turns the suite order-dependent (and leaks the value when an assertion throws).
+  // A bare assignment here is the bug that rule exists to prevent; this test had it.
+  const prevShim = process.env.AGENT_GH_SHIM;
+  try {
+    const layer = resolvePath(root, "gh-limit");
+    fs.mkdirSync(layer, { recursive: true });
+    fs.writeFileSync(
+      resolvePath(layer, "gh"),
+      "#!/usr/bin/env bash\n# harness-gh-shim-marker: every entry point of the gh limit layer carries this line\n"
+        + "exec python3 \"$HELPER\" --self \"$SELF_REAL\" -- \"$@\"\n",
+      { mode: 0o755 });
+    fs.writeFileSync(resolvePath(root, "gh-limit.py"), "# helper\n");
+    process.env.O = root;
+    delete process.env.AGENT_GH_LIMIT;
+    delete process.env.AGENT_GH_LIMIT_DIR;
+
+    const wired = withShimInstalled(() => withGhLayers("echo hello", "/repo/scripts/gh-shim")) as string;
+    ok(wired !== null, "the wiring produces a patched command when a layer resolves");
+    equal(wired.startsWith(`export PATH=${JSON.stringify(layer)}:` +
+      `${JSON.stringify("/repo/scripts/gh-shim")}:"$PATH"`), true,
+    "the RESOLVED quota dir is composed ahead of the guard — the whole point of the change");
+
+    // ⛔ AND THE SWITCH REACHES THE WIRING, not just `withGhShim`.
+    process.env.AGENT_GH_LIMIT = "0";
+    equal(withShimInstalled(() => withGhLayers("true", "/s")), 'export PATH="/s":"$PATH"\ntrue',
+      "AGENT_GH_LIMIT=0 is honoured by the wiring itself");
+    delete process.env.AGENT_GH_LIMIT;
+
+    // No layer at this `O` → the guard alone, never a broken PATH entry.
+    fs.rmSync(resolvePath(layer, "gh"));
+    equal(withShimInstalled(() => withGhLayers("true", "/s")), 'export PATH="/s":"$PATH"\ntrue',
+      "a box with no layer degrades to the guard-only prefix (the revalidation drops the removed layer)");
+
+    // ⛔ A DEGRADED GUARD MUST NOT COST THE QUOTA LAYER TOO (review round 3). `withGhShim` returns
+    // null on `!shimDir`, so the naive delegation silently skipped the quota entry on exactly the
+    // boxes the handler already flags `degraded` — leaving the budget collapse in place there.
+    fs.writeFileSync(
+      resolvePath(layer, "gh"),
+      "#!/usr/bin/env bash\n# harness-gh-shim-marker\nexec python3 \"$HELPER\" --self \"$SELF_REAL\" -- \"$@\"\n",
+      { mode: 0o755 });
+    equal(withShimInstalled(() => withGhLayers("true", null)),
+      `export PATH=${JSON.stringify(layer)}:"$PATH"\ntrue`,
+      "no argv guard but a valid quota layer → the quota entry is still injected, alone");
+    // …and BOTH shared switches still win on the degraded path. The `AGENT_GH_LIMIT` arm is a
+    // SEPARATE check from the one inside `withGhShim` — `withGhShim` is not on this path at all — so
+    // it needs its own assertion; measured (round 4): deleting it leaves the suite green, and an
+    // operator who asked for the ordinary `gh` still gets the quota hop and the exhausted bucket.
+    process.env.AGENT_GH_SHIM = "0";
+    equal(withGhLayers("true", null), null, "AGENT_GH_SHIM=0 still disables the degraded-path injection");
+    delete process.env.AGENT_GH_SHIM;
+    process.env.AGENT_GH_LIMIT = "0";
+    equal(withGhLayers("true", null), null,
+      "AGENT_GH_LIMIT=0 disables the degraded-path quota injection too (a separate check from withGhShim's)");
+    delete process.env.AGENT_GH_LIMIT;
+  } finally {
+    if (prevO === undefined) delete process.env.O;
+    else process.env.O = prevO;
+    if (prevLimit === undefined) delete process.env.AGENT_GH_LIMIT;
+    else process.env.AGENT_GH_LIMIT = prevLimit;
+    if (prevDir === undefined) delete process.env.AGENT_GH_LIMIT_DIR;
+    else process.env.AGENT_GH_LIMIT_DIR = prevDir;
+    if (prevShim === undefined) delete process.env.AGENT_GH_SHIM;
+    else process.env.AGENT_GH_SHIM = prevShim;
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("withGhLayers (#3477): TRIPWIRE — the handler must keep calling it (not withGhShim directly)", () => {
+  // ⛔ THIS IS A TRIPWIRE, NOT A BEHAVIOURAL TEST, and it is labelled one deliberately. Measured
+  // (review round 3): reverting the handler to `withGhShim(rawCommand, shimDir)` — making the whole
+  // change DEAD — leaves the suite at 405 passed, 0 failed, because every other assertion supplies
+  // `limitDir` explicitly or calls `withGhLayers` itself. A rebase conflict resolution or a
+  // "simplify the handler" refactor is exactly how that one line goes back, silently, with a green
+  // suite certifying it. The repo already uses this construction for the same reason (the gh-shim
+  // suite's §11(g) tripwire on a TS shape moving without this file being revisited).
+  const here = resolvePath(fileURLToPath(new URL(".", import.meta.url)));
+  const src = fs.readFileSync(resolvePath(here, "index.ts"), "utf8");
+  ok(src.includes("withGhLayers(rawCommand, shimDir)"),
+    "the bash-call handler still composes BOTH gh layers through withGhLayers");
+  ok(!/withGhShim\(rawCommand/.test(src),
+    "the handler must NOT call withGhShim directly — that drops the quota layer silently");
 });
 
 test("withGhShim: the injected prefix must NOT make a benign command look like a git op", () => {

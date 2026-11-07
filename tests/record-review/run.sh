@@ -2296,6 +2296,20 @@ if [ -d "$DELTA_REPO" ]; then
   else
     fail "(33a4) delta_proof_fields() could not be extracted from record-review.sh — re-anchor the pin rather than dropping it"
   fi
+  # (33a7) THE TWO `delta` FEATURES MUST NOT WRITE EACH OTHER'S FIELDS. The `--delta` verb (#10583) and
+  # `--evidence delta:<A>..<B>` (#3299) landed from opposite sides of the same file, and both
+  # put a `delta`-named thing into the SAME signed record while asserting DIFFERENT claims: the
+  # verb writes `delta{from,to,proved,arm}` ("the head moved, the authored change did not"),
+  # the evidence arm writes `delta_range`/`delta_base`/`delta_kind`/`delta_digest` ("a reviewer's
+  # verdict covers A..B"). The evidence arm's builder fired on `[ -n "$DELTA_FROM" ]`, and the
+  # verb set `DELTA_FROM` too — so when the two trees merged, every `--delta` record silently
+  # gained `"delta_range":"<head>.."` with an EMPTY upper bound, an empty base and EMPTY
+  # kind/digest. That is a signed record asserting a range a reviewer never covered, written by
+  # a verb whose whole contract is that NO reviewer ran. Nothing else in either feature's tests
+  # could see it: they each assert their OWN fields' presence, never the other's absence.
+  ! grep -q 'delta_range\|delta_base\|delta_kind\|delta_digest' <<<"$D_REC32" \
+    && pass "(33a7) a --delta record carries NONE of the evidence arm's fields (delta_range/delta_base/delta_kind/delta_digest) — the two delta features share no record field and no global" \
+    || fail "(33a7) the --delta record carries an EVIDENCE-arm delta field it never measured (record='$D_REC32')"
   # (33a5) THE `from` AXIS (#3247 review, P1). The record's `delta.from` must name the head
   # the DECIDING ARM measured, never automatically the record's head: `diff` measures from
   # the prior MARKER's head and `patch` from `PRIOR_PATCH_SHA`, and asserting
@@ -2658,12 +2672,26 @@ cd "$TMP" || true
 echo; echo "── (32) post_marker: a marker already present is NOT re-patched ──"
 awk '/^post_marker\(\) \{/{f=1} f{print} f&&/^\}$/{exit}' "$SRC" > "$TMP/pm-live.sh"
 if [ -s "$TMP/pm-live.sh" ] && grep -q 'post_marker()' "$TMP/pm-live.sh"; then
-  # The MUTANT is the pre-#3347 line, written the way the script spelled it.
-  sed 's#if command grep -qF -- "[$]marker" <<<"[$]body"; then return 0; fi#if printf "%s\\n" "$body" | command grep -qF -- "$marker"; then return 0; fi#' \
+  # The MUTANT is the pre-#3347 line: same call, same flags, only the PRODUCER changed from a
+  # here-string to a pipe. ⛔ THE FLAGS ARE CAPTURED, NOT SPELLED (#2983 moved the live call to
+  # `-qxF` and left this builder spelling `-qF`, so the substitution matched NOTHING and both arms
+  # below went red over a mutant that was never built). ⛔ AND THAT RED WAS NOT HIDDEN: a first draft
+  # of this comment said "no main push runs these shards", which is FALSE — `ci-main.yml` runs the
+  # same shard list on every main push, and main run 42225299527 on cf3c46c6d names this file. The
+  # gap was that nothing forced the builder to be re-checked when the call it mutates changed.
+  # What makes the pre-fix form pre-fix is the PIPE; a capture keeps that the only thing this sed
+  # decides, through any future change of flags.
+  sed -E 's#if command grep (.*) <<<"[$]body"; then return 0; fi#if { printf "%s\\n" "$body"; printf "%s\\n" "$body"; } | command grep \1; then return 0; fi#' \
     "$TMP/pm-live.sh" > "$TMP/pm-old.sh"
-  grep -q 'printf "%s' "$TMP/pm-old.sh" \
-    && pass "(32a) the pre-fix pipe form was rebuilt for the mutation arm (the mutant is real, not a no-op)" \
-    || fail "(32a) could not rebuild the pre-fix pipe form — the mutation arm would be vacuous"
+  # ⛔ A SED THAT MATCHED NOTHING IS NOT A MUTANT. The predecessor tested `grep -q 'printf "%s'`,
+  # which was sound only because this function contains no OTHER `printf` — a coincidence, not a
+  # property. The arm now states the property directly: the two files DIFFER and the new line is the
+  # pipe form, so a future edit that adds a `printf` to this function cannot resurrect the vacuity.
+  if ! cmp -s "$TMP/pm-live.sh" "$TMP/pm-old.sh" && grep -qF '| command grep' "$TMP/pm-old.sh"; then
+    pass "(32a) the pre-fix pipe form was rebuilt for the mutation arm (the mutant is real, not a no-op)"
+  else
+    fail "(32a) could not rebuild the pre-fix pipe form — the mutation arm would be vacuous"
+  fi
   # A stub `gh` that serves the body and RECORDS any PATCH, so "was the body re-written?" is
   # answered by an artifact rather than by an exit status (the old form exits 0 too — it only
   # takes SIGPIPE, which is exactly why a status-only assertion would miss this).
@@ -2687,25 +2715,31 @@ SH
     PM_BODY="$2" PM_PATCH_LOG="$3" HOME="$PMH" PATH="$PMB:$PATH" \
       bash -c 'set -uo pipefail; . "$1"; post_marker owner/repo 42 "$2"; printf "%s" "$?"' _ "$1" "MARKER-LINE-42" 2>/dev/null
   }
-  # ⛔ 1050 LINES, NOT 1200, AND THE BOUND IS NOT THE PIPE — IT IS `MAX_ARG_STRLEN`. `pm_drive` hands
+  # ⛔ 1050 LINES, NOT 1200, AND ONE BOUND IS NOT THE PIPE — IT IS `MAX_ARG_STRLEN`. `pm_drive` hands
   # the body to the child as ONE environment string, and Linux caps a single arg/env string at 131,072
   # bytes; a 1200-line body is 145,214 and the child never starts, so (32c)/(32d)/(32e) fail for a
   # reason that has nothing to do with `post_marker` (measured in a Linux container: "Argument list too
   # long"). Passing it by file would NOT dodge this either — `post_marker` also hands the patched body
-  # to `jq -n --arg body`, argv under the same cap. So the fixture must sit in the window ABOVE the
-  # 64 KiB pipe capacity and BELOW 131,072: 1050 lines x 120 chars ≈ 127 KB. Both bounds are asserted
-  # below, so this cannot silently drift out of the window.
+  # to `jq -n --arg body`, argv under the same cap. So the body must stay BELOW 131,072 and this bound
+  # is asserted below.
+  # ⛔ AND THE SIGPIPE WINDOW IS NOT BODY-SIZE ALONE (measured, review cycle 3 — this was a ~20% FLAKE
+  # of (32c) before the mutant's producer was doubled). A single `printf` of a 127,064-byte body only
+  # just exceeds the 65,536-byte pipe capacity, and GNU grep's single read frees up to another 65,536
+  # before it exits — so on ~1 run in 5 the writer FINISHES before grep exits, no SIGPIPE is raised,
+  # and the pre-fix form correctly finds the marker. Driving the same mutant 60 times gave 46
+  # re-patch / 14 no-re-patch. The window is capacity + ONE READER READ ≈ 131,072 WRITTEN BYTES, which
+  # a single pass of this body cannot guarantee — so the MUTANT writes the body twice (~254 KB). The
+  # body stays small enough to be exec'd; the producer is what makes the window deterministic.
   filler="$(printf 'x%.0s' $(seq 1 120))"
   pm_big="$(for _i in $(seq 1 1050); do printf '%s\n' "$filler"; done)"
   pm_with_marker="$(printf '%s\n%s\n' "MARKER-LINE-42" "$pm_big")"
   pm_bytes=${#pm_with_marker}
-  # BOTH bounds. Too small and the SIGPIPE window never opens (the arm passes vacuously); too large and
-  # the child cannot even be exec'd on Linux (MAX_ARG_STRLEN = 131,072), which reds the arm for a reason
-  # that is not the code under test — measured, not hypothesised.
+  # The body bound, for the ARGV reason above. Larger is NOT better here — above MAX_ARG_STRLEN the
+  # child cannot be exec'd at all — and the SIGPIPE window is the mutant's job, not the body's.
   if [ "$pm_bytes" -gt 65536 ] && [ "$pm_bytes" -lt 131072 ]; then
-    pass "(32b) the fixture body is $pm_bytes bytes — ABOVE the 64 KiB pipe buffer (or the SIGPIPE window never opens) and BELOW Linux's 131,072-byte MAX_ARG_STRLEN (or the driver cannot exec at all)"
+    pass "(32b) the fixture body is $pm_bytes bytes — ABOVE the 64 KiB pipe buffer and BELOW Linux's 131,072-byte MAX_ARG_STRLEN, so the child can be exec'd and one pass of the writer already fills the pipe"
   else
-    fail "(32b) the fixture body is $pm_bytes bytes — it must be in the window (65536, 131072): below it the pre-fix form passes too, above it the child cannot be exec'd on Linux"
+    fail "(32b) the fixture body is $pm_bytes bytes — it must be in the window (65536, 131072): above it the child cannot be exec'd on Linux, and one pass below 65536 would not even fill the pipe"
   fi
   # (32c) NON-VACUITY: the PRE-FIX form, same body, must re-patch.
   : > "$TMP/pm-old.log"
@@ -2778,7 +2812,16 @@ fi
 # so it must be raised with the arm or the arm can be skipped silently; it is not a ceiling.
 # MEASURED: `ALL PASSED (213 assertion(s))` on this tree (macOS, bash 3.2). `bash-suites` REFUSES to
 # run on a live cell (exit 78), so a local ALL PASSED is NOT CI evidence — see the PR comment.
-MIN_ASSERTIONS=213
+# Review round 5 (THE MERGE WITH #10583): 213 -> 214. The `--delta` verb and this PR's
+# `--evidence delta:<A>..<B>` arm merged from opposite sides and shared ONE global
+# (`DELTA_FROM`), so EVERY `--delta` record was minted carrying `delta_range`/`delta_base`/
+# `delta_kind`/`delta_digest` for a range no reviewer covered. Neither feature's tests could
+# see it — each asserted its OWN fields' presence, never the other's absence. (33a7) pins the
+# absence, and it was MEASURED red against the merged tree before the fix: the record read
+# `"delta_range":"30219358085b…0d.."` with an empty base, kind and digest beside a
+# `mint:"delta"` — a signed artifact claiming a reviewed range from the one verb whose
+# contract is that no reviewer ran.
+MIN_ASSERTIONS=214
 case "$MIN_ASSERTIONS" in
   ''|*[!0-9]*)
     echo "❌ MIN_ASSERTIONS is not a non-negative integer ('$MIN_ASSERTIONS') — the pin is deactivated, which is itself a failure"

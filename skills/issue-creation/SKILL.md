@@ -43,8 +43,40 @@ For trivial fixes with zero ambiguity, skip sections 2–4 and create directly:
 - The file being changed has at least one existing test. If the file has zero test coverage and the change touches logic (not pure strings/constants), upgrade to `complexity:standard` — the file needs test infrastructure before adding more code.
 
 ```bash
-gh issue create --title "fix: <one-liner>" --label "complexity:micro" --body "..."
+# CALL 1 of 3 — learn the path first, so the `write` tool has something to write to.
+# It is unique to this CHECKOUT (#729): a fixed /tmp name lets two concurrent lanes publish
+# EACH OTHER's body. (Two sessions in the SAME checkout still share this one — the #729
+# residual, not something this path fixes.) Echo it; do not keep it in a variable (see below).
+echo "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
+
+# CALL 2 of 3 — write the body to THAT path with the `write` tool.
+
+# CALL 3 of 3 — file it. Repeat the derivation INLINE: every bash tool call is a fresh
+# shell, so a `BODY=…` set in an earlier call is empty here and `--body-file "$BODY"`
+# would pass an empty path. (Same rule as `commit-workflow/workflow/02-commit-pr.md`.)
+gh issue create --title "fix: <one-liner>" --label "complexity:micro" \
+  --body-file "${TMPDIR:-/tmp}/pi-issue-body-$(git rev-parse --absolute-git-dir | cksum | cut -d' ' -f1).md"
 ```
+
+**Why `--body-file` and never an inline `--body "…"`** (#3445): an inline body goes *into
+the shell command string*, which the hub-state guard scans for version-control verbs — so an
+issue whose body quotes a **destructive** verb (`git pull`, `git rebase`, `git reset`, a branch
+`-D`, a force-push) is unfilable that way, and infrastructure and guard-bug reports are made of
+exactly those. Passed by file, the body never enters the command string, so nothing scans it (the
+property the guard states for its own payloads: *"File / module / stdin payloads are NOT
+content-gated here"*). Write the body in its own call and `gh issue create` in another; the same
+rule covers any issue/PR body (see `commit-workflow/workflow/02-commit-pr.md`, including the `#729`
+path derivation). Run it **inside the repo**: the name is unique per checkout because of
+`git rev-parse --absolute-git-dir`, so from outside a git repo that substitution yields one shared
+name for every lane on the box (and two sessions in the same checkout share it by construction).
+
+⚠️ **The title and label are ALSO part of the command string.** `--body-file` moves the *body* out of
+it; a `--title "… git pull --ff-only …"` is still scanned, and is still refused. And unlike a hub
+block, **filing from a worktree does not lift the title refusal** (measured: a plain `echo` merely *mentioning* the
+verb is refused from a linked worktree — the refuse happens because no git invocation can be
+resolved in a mention, so the arm cannot worktree-exempt it). So a report whose TITLE names a
+destructive verb keeps the verb in the body and words the title around it ("false block on a
+read-only sync command"). Body and file are solved; the title is not (#3445 Residual 5).
 
 ---
 

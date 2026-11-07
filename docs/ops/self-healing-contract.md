@@ -650,7 +650,11 @@ build the claim commit (`could not build claim commit`, the message that fired 7
 on the Mac with a healthy `[cap]` line — the baseline doc's §4 proof that a `[cap]` line is not a
 deployment proof).
 
-**What repairs it.** A claimant whose box is gone → let `claim-reaper.sh` run; a claim that cannot be
+**What repairs it.** A claimant whose box is gone → the **hourly claim-reaper pass**
+(`claim-reaper-pass.sh`, on the controller's clock beside `claim_prune`, stamp `state/.claim-reaped`, #2048)
+releases it once the operator has ARMED the box with a dated record — unarmed, the pass still runs and
+reports, and a box with RELEASABLE claims it may not take writes `state/.claim-reap-blocked` (which the
+supervisor prints as a ⛔ line) instead of reading like a healthy idle one. A claim that cannot be
 built → fix the cwd/identity (§3.11: `claim-cwd.test.sh` pins `git -C` from a cwd that is not a
 repo).
 

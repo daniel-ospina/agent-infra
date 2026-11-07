@@ -812,7 +812,7 @@ lock_release() { rm -rf "$1" 2>/dev/null; return 0; }
 # LATER deadline, and it can never be shortened by a writer holding a smaller one.
 # Expired files are removed by whoever reads next, so the directory self-cleans.
 cooldown_remaining_ms() {
-  local now f v max=0
+  local now f v max=0 prior
   now="$(now_ms)"
   for f in "$GATE_DIR"/cooldown.*; do
     [ -e "$f" ] || continue
@@ -825,19 +825,102 @@ cooldown_remaining_ms() {
     if [ "$v" -le "$now" ]; then rm -f "$f" 2>/dev/null; continue; fi
     [ "$v" -gt "$max" ] && max="$v"
   done
-  [ "$max" -gt "$now" ] || return 1
-  printf '%s' $(( max - now ))
-  return 0
+  if [ "$max" -gt "$now" ]; then
+    printf '%s' $(( max - now ))
+    return 0
+  fi
+  # NO LIVE WINDOW = NO BUDGET LINE. The file describes a refusal that has ended,
+  # and leaving it behind would hand the next beat a `remaining=0` that is not true
+  # (see write_budget_line). Removed by whoever reads next, like the cooldown files.
+  # ⛔ ONLY WHEN THE WINDOW IT DESCRIBES HAS ACTUALLY EXPIRED. The loop above is a
+  # GLOB SNAPSHOT: a writer that created its `cooldown.*` file after that glob was
+  # expanded is invisible to it, and its freshly written budget line must not be
+  # deleted on the strength of an incomplete read. `budget.until` is the deadline
+  # the line itself was written for, so it is the only thing that may decide this.
+  prior="$(cat "$GATE_DIR/budget.until" 2>/dev/null)"
+  case "$prior" in
+    ''|*[!0-9]*) rm -f "$GATE_DIR/budget" 2>/dev/null ;;
+    *) [ "$prior" -le "$now" ] && rm -f "$GATE_DIR/budget" "$GATE_DIR/budget.until" 2>/dev/null ;;
+  esac
+  return 1
 }
 
 set_cooldown_ms() {
-  local ms="$1" until
+  local ms="$1" exhausted="${2:-0}" until
   case "$ms" in ''|*[!0-9]*) return 0 ;; esac
   [ "$ms" -gt 0 ] || return 0
   until=$(( $(now_ms) + ms ))
   printf '%s\n' "$until" 2>/dev/null > "$GATE_DIR/cooldown.$until.$$"
   # The deadline is also the caller's answer: `secondary.window` records the window it protects.
+  [ "$exhausted" = "1" ] && write_budget_line "$until"
   printf '%s' "$until"
+  return 0
+}
+
+# ── IS THIS REFUSAL THE EXHAUSTED BUDGET, OR THE CONCURRENCY LIMIT? ─────────
+# `rate_limited` matches BOTH classes: the PRIMARY budget ("API rate limit exceeded",
+# the 5000/h bucket this fleet shares) and the SECONDARY/concurrency limit
+# ("secondary rate limit", "abuse detection", 429) — the last of which was measured
+# here at `used: 541` of 5000, i.e. with the budget nowhere near zero. Publishing
+# `remaining=0` for those would assert a quantity nobody measured, in the one
+# artifact whose whole job is to let the next beat tell exhaustion from a product
+# fault.
+# ⛔ "API rate limit ALREADY exceeded for user ID" IS THE **SECONDARY** WORDING, and
+# this fleet has measured it as such: `scripts/orchestrator-harness/gh-limit.py`
+# (SECONDARY_PHRASES), `scripts/pr-doctor.py` ("secondary limit … while the primary
+# budget is nearly untouched — measured core 1599/5000"), and
+# `docs/ops/gh-rate-limits.md` (symptom `API rate limit already exceeded` "while the
+# primary counter reads healthy", measured at 4999/5000). So `already` is EXCLUDED
+# rather than treated as an optional part of the primary phrase — matching it would
+# make the budget line lie in exactly the case it exists to disambiguate.
+budget_signature() {  # <error file> → true when the PRIMARY budget is what refused
+  grep -Eqi 'api rate limit exceeded' "$1" 2>/dev/null \
+    && ! grep -Eqi 'secondary rate limit|abuse detection|already exceeded' "$1" 2>/dev/null
+}
+
+# ── THE BUDGET LINE — ONE CHEAP READ, NO API CALL (#gh-quota) ──────────────
+# A refusal is the ONE moment this gate KNOWS the account is at zero, and that
+# knowledge died with the process: the next beat read a rail's exit 1 as a product
+# fault (measured 2026-11-03 — `gh run list` 403 for user id 81560491 while ~20 lanes
+# each blamed their own PR). The window the gate already writes IS the budget, so the
+# state is published in the cheapest form a reader can consume, in the same write:
+#
+#     cat "${AGENT_GH_GATE_DIR:-$HOME/.pi/agent/gh-gate}/budget"
+#     GH-BUDGET(remaining=0, resets_at=2026-11-03T01:34:00Z)
+#
+# ⛔ It is NOT a second predicate: `remaining=0` means exactly "this gate is holding
+# the box out of calls until resets_at", which is `cooldown_remaining_ms`'s own
+# reading — and it is written only for a PRIMARY-budget refusal (budget_signature),
+# never for the concurrency limit. The gate still never asks the API how healthy it
+# is (STATED LIMITS).
+# ⛔ A READER MUST COMPARE `resets_at`: the line is removed the next time the shim
+# prunes an expired window, so a `cat` with no shim call in between sees the last
+# refusal that happened, not necessarily the current state.
+write_budget_line() {
+  local until_ms="$1" iso secs prior
+  [ "$GATE_ON" -eq 1 ] 2>/dev/null || return 0
+  case "$until_ms" in ''|*[!0-9]*) return 0 ;; esac
+  # MONOTONIC, like `cooldown.*`: a later refusal can only EXTEND the window, so a
+  # writer holding an EARLIER deadline must not shorten what readers see.
+  prior="$(cat "$GATE_DIR/budget.until" 2>/dev/null)"
+  case "$prior" in ''|*[!0-9]*) prior=0 ;; esac
+  [ "$until_ms" -gt "$prior" ] || return 0
+  secs=$(( until_ms / 1000 ))
+  # BOTH spellings, in that order: `-d @<epoch>` is GNU, `-r <epoch>` is BSD/macOS,
+  # and the fleet is both. An unformattable clock still names the epoch rather than
+  # dropping the line — a reader must never get silence where the answer exists.
+  iso="$(date -u -d "@$secs" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$iso" ] || iso="$(date -u -r "$secs" +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+  [ -n "$iso" ] || iso="epoch:${secs}"
+  printf '%s\n' "$until_ms" 2>/dev/null > "$GATE_DIR/budget.until.$$" \
+    && mv -f "$GATE_DIR/budget.until.$$" "$GATE_DIR/budget.until" 2>/dev/null
+  printf 'GH-BUDGET(remaining=0, resets_at=%s)\n' "$iso" 2>/dev/null > "$GATE_DIR/budget.$$" \
+    && mv -f "$GATE_DIR/budget.$$" "$GATE_DIR/budget" 2>/dev/null
+  # KNOWN RESIDUAL (stated, not hidden): `budget.until` is compare-then-write, so two
+  # concurrent refusals can keep the EARLIER deadline — the window a reader sees may
+  # therefore be shorter than the gate is actually holding. `cooldown.*` avoids this
+  # by putting the deadline in the FILENAME; this line keeps the one-file `cat`
+  # contract the fleet reads. A reader must treat `resets_at` as a LOWER bound.
   return 0
 }
 
@@ -1394,6 +1477,12 @@ wait_for_cooldown() {
     if [ "$announced" -eq 0 ]; then
       if discharge_window; then break; fi
       gate_note "the account is in a shared rate-limit window — waiting $(( (rem + 999) / 1000 ))s before this call (budget ${WAIT_BUDGET_MS}ms)"
+      # ⛔ NO STDERR HERE. This runs BEFORE the child, and several call sites parse
+      # `$(gh … 2>&1)` as JSON — a pacing note on a SUCCESSFUL call is a
+      # JSONDecodeError on a good answer (the same reason `gate_note` buffers and
+      # replays only on failure). The readable budget path is named in
+      # `write_budget_line`'s header and in events.log instead.
+      gate_note "if the account BUDGET is what refused, one cheap read says so: cat $GATE_DIR/budget (no API call)"
       announced=1
     fi
     if [ "$spent" -ge "$WAIT_BUDGET_MS" ]; then WAIT_SPENT_MS="$spent"; return 3; fi
@@ -1863,7 +1952,7 @@ run_paced() {
       wait_ms="$(retry_wait_ms "$errf" "$tries")"
       # Share the window with the WHOLE box before deciding whether to sleep in it.
       cd_until=""
-      [ "$GATE_ON" -eq 1 ] && cd_until="$(set_cooldown_ms "$wait_ms")"
+      [ "$GATE_ON" -eq 1 ] && cd_until="$(set_cooldown_ms "$wait_ms" "$(budget_signature "$errf" && printf 1 || printf 0)")"
       # ⛔ RECORD THE KIND OF WINDOW, THE DEADLINE IT PROTECTS, AND THE EVIDENCE BEHIND BOTH.
       # A SECONDARY/ABUSE refusal is invisible to the exempt quota read, so it must never be
       # discharged by one (see `secondary_live`), and neither must one the server itself instructed

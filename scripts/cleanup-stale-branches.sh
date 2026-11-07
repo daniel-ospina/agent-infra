@@ -796,9 +796,11 @@ is_member() {
 # with a different digit count. Bounding the raw string split that one root into
 # two OPPOSITE failures:
 #   * `0000000009` (10 raw characters) PASSED the bound, and then
-#     `date -r 0000000009` FAILED on macOS — it parses that argument as a DATE,
-#     not as seconds, and macOS has no `date -d` fallback. In `--scope remote`
-#     without CLEANUP_BRANCH_LOG that aborted the whole sweep under `set -e`, with
+#     `date -r 0000000009` FAILED on macOS — `-r` is parsed BASE-0 (a leading
+#     zero means OCTAL), so `strtoq` stops at the `9`, the `stat()` fallback then
+#     fails on a string that is not a path, and `date` exits on its usage path.
+#     In `--scope remote` without CLEANUP_BRANCH_LOG that aborted the whole
+#     sweep under `set -e`, with
 #     a raw `date` usage message, rc=1, NO plan and NO delete. Under
 #     CLEANUP_BRANCH_LOG, AND in `--scope both` (where `run_remote_scope || rc=1`
 #     suppresses errexit for the whole function body — F37), the pass runs without
@@ -1356,12 +1358,14 @@ run_remote_scope() {
         # back with `IFS=$'\t' read`, as the local scope already does.
         if [ "$COMMIT_DATE" -lt "$CUTOFF_EPOCH" ]; then
             local COMMIT_DATE_HR
-            # ⛔ F25: `date -r` reads its argument as a DATE STRING on macOS, so a
-            # zero-padded `%ct` such as `0000000009` is rejected (`illegal option
-            # -- d`, no `date -d` on macOS); in `--scope remote` without the log that
-            # aborted the whole sweep under `set -e` with rc=1 before any plan was
-            # printed, and in the modes where errexit is suppressed (F37) the same
-            # value instead emptied the date. `$((10#$...))`
+            # ⛔ F25: `date -r` parses its argument BASE-0 (a leading zero means OCTAL),
+            # so a zero-padded `%ct` such as `0000000009` stops consuming at the `9` and
+            # falls back to `stat("0000000009")`, which fails — `date` then exits on its
+            # usage path (the `illegal option -- d` seen on macOS comes from the `date -d`
+            # fallback on the next line, not from a DATE parse). In `--scope remote`
+            # without the log that aborted the whole sweep under `set -e` with rc=1 before
+            # any plan was printed, and in the modes where errexit is suppressed (F37) the
+            # same value instead emptied the date. `$((10#...))`
             # re-reads the digit string as base 10, so `date` ALWAYS receives plain
             # seconds — the helper above already bounded the normalised value to
             # ≤15 digits, so this arithmetic cannot overflow.

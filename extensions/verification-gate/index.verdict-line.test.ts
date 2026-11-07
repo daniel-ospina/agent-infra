@@ -28,8 +28,10 @@
  *       block-attempt shape (#7591).
  *   (e) a NEGATED PASS (#3164) is a REFUSAL, not an attestation — bare, labelled, quoted, bracketed and
  *       ✅ shapes; in the smart-apostrophe, markdown-emphasis, `neither` and interrogative spellings a
- *       model actually emits; and with the token read at the position the SHAPE anchored, so a second
- *       mid-sentence mention on the same line cannot attest. The AFFIRMATIVE block under it is the guard
+ *       model emits, and in the two vocabulary alternatives the guard CARRIES but a model rarely writes
+ *       (`nor`, `no longer`), which are pinned for coverage rather than for realism; and with the token
+ *       read at the position the SHAPE anchored, so a second mid-sentence mention on the same line
+ *       cannot attest. The AFFIRMATIVE block under it is the guard
  *       against the opposite error (`[no regressions] PASS`, `PASS: 0 failures`, `PASS: nothing to fix`).
  *   (e-latch) three refusals in a row do NOT disable the gate: a refusal is a JUDGMENT, so it must not
  *       count toward the #132 one-way latch that turns the gate off after 3 malformed dispatches.
@@ -43,11 +45,32 @@
  * fail-open is decided; adding a case that passes for the wrong reason is what the (c) note above
  * warns about. Measured and recorded on the issue instead.
  *
- * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 88 cases that
+ * MUTATIONS (each was RUN against THIS file; the number is the measured count of the 90 cases that
  * went red under that single mutation, not an estimate — an unmeasured count here was review r1's
  * second finding):
  *   M1 revert the `verdictLine` helper to the pre-#10219 bare-token hasPass
- *      → 8 red: (a)'s 7 labelled/quoted/bracketed cases + the non-standard-prompt case
+ *      → MEASURED THREE WAYS, because "revert the helper" is not one mutation and a count here is
+ *        only useful if it says which one was run. All re-taken at the 90-case tree; the "8" that
+ *        stood here was measured at 88 cases AND was wrong for every reading (#3164 review r12):
+ *        · LITERAL pre-#10219 — the exact pre-#10219 regex: bare-token arm only, NO capture group,
+ *          NO `(> ` group: 27 red (63 passed / 27 failed). The damage is NOT mostly negations —
+ *          exactly ONE `(e)` negation row reds (`mid-sentence second mention`); the other 12 `(e)`
+ *          reds are replies that MUST ATTEST and are now FALSE-BLOCKED: the 8 `(e) AFFIRMATIVE`
+ *          controls, `(e-cost)`, `one attested line still clears`, the 20k-char tail and the
+ *          real-gate leg. Plus `(a)`'s 13 (which include the bare-`PASS` controls — `the finding's
+ *          exact reply`, `bare PASS, nothing else`, `bold`, `list marker`, `end of a report` — so
+ *          `(a)` is false-blocking too) and `(c)` INTERACTIVE.
+ *        · CAPTURE-ONLY drop — the three arms and the `(> ` group KEPT, the token not captured:
+ *          26 red (64 passed / 26 failed), and `(c)` INTERACTIVE does NOT red. So the `(c)` red
+ *          above is caused by the lost `(> ` group, NOT by the capture: do not attribute it to
+ *          "the capture-dropping reading".
+ *        · BARE-TOKEN ARM ONLY, capture kept — the reading that isolates the LOST labelled/bracketed
+ *          arms: 10 red (80 passed / 10 failed) — `(a)`'s 7 (4 labelled, 2 bracketed, and the
+ *          non-standard-prompt case, which is one of those 7 and NOT an eighth) and the 3 `(e)`
+ *          AFFIRMATIVE rows that read those same shapes (`Result: PASS, nothing to fix`,
+ *          `[no regressions] PASS`, `[no issues] PASS`). `(c)` INTERACTIVE does NOT red here.
+ *        The old "8" was an arithmetic slip on both axes (it over-counted `(a)` by one and omitted
+ *        the rows outside `(a)`), which is why this row now carries the failures and not a net.
  *   M2 revert hasFail to its pre-#10219 arms
  *      → 1 red: (c)'s interactive leg ONLY. ⚠ The print-mode (c) legs pass either way — in print mode a
  *        FAIL the arms miss is refused as `unparseable`, so the assertion holds for the wrong
@@ -65,10 +88,27 @@
  *   NOT mutation-pinned: the line anchor and the `\b` are pinned by (b) as PRE-EXISTING behavior
  *   (they passed before the fix and must keep passing) — they are regressions guards, not
  *   discriminators, and are stated here rather than implied.
- *   M6 revert `hasPass = passAttested(textContent)` to the pre-#3164 expression
- *      → 45 red: every `(e)` negation case (including the list/numbered/prefix/semicolon spellings),
- *      the `(e-cost)` caveat cases, both judgment-remedy cases and the 3-refusal latch case.
- *      MEASURED on this tree (43 passed / 45 failed), not estimated.
+ *   M6 revert `hasPass = passAttested(textContent)` to the pre-#3164 expression — which is BOTH
+ *      disjuncts, exactly as 181f29a9 removed them:
+ *        verdictLine("PASS").test(textContent) || /✅.*PASS(?:\b|:|—)/i.test(textContent)
+ *      (reverting ONLY the first disjunct is NOT this mutation: the `✅` arm survives and both
+ *      `✅ prefixed` rows go green — the trail an earlier draft of this row followed, and why it
+ *      claimed "38 of 40" for a mutant that ADMITS a `✅`-prefixed refusal)
+ *      → 47 red (43 passed / 47 failed), and the set is ALL 40 `(e)` negation rows — both
+ *      `✅ prefixed` rows included — plus the 3 `(e-cost)` caveat cases and the 4 refusal-mechanism
+ *      rows (`a NEGATED PASS is refused by the #285 ceremony`, `a refusal is reported as a
+ *      JUDGMENT`, `the ✅ shape gets the same judgment remedy`, `three refusals do NOT disable the
+ *      gate`).
+ *      ⛔ The two `✅ prefixed` rows are in that set because the pre-#3164 `✅` arm MERGES
+ *      `✅ not verified: PASS` — the #3164 false PASS itself — so they are red because the mutant
+ *      IS the defect. Do not explain them away as having "nothing to do with" this mutation.
+ *      MEASURED on this tree, not estimated — re-measured after the two `(e)` rows were added,
+ *      because this preamble's own standard is that a count here is MEASURED (#3164 review r4) and
+ *      that a QUANTIFIER here is measured too (#3164 review r14: an earlier "38 of 40" was measured
+ *      against a one-disjunct mutant and is false for the expression this row names).
+ *   M7 drop `no\s+longer` and `nor` from `NEGATION_AT_START`
+ *      → 2 red: exactly the two rows that pin them, nothing else — which is what makes them
+ *      discriminators rather than decoration.
  *
  * Hermetic: HOME is redirected to a temp dir before the plugin is imported (the bridge and the
  * audit log are HOME-derived) and every case gets its own throwaway git repo.
@@ -366,6 +406,15 @@ async function main() {
     ["`PASS: neither file verified`", "PASS: neither file verified"],
     ["`PASS: No — two tests are red.`", "PASS: No — two tests are red."],
     ["`PASS? No.`", "PASS? No."],
+    // ⛔ #3164 r3: TWO ALTERNATIVES THE GUARD CARRIES BUT NO CASE PINNED. `NEGATION_AT_START`
+    // admits `no longer` and `nor`, and both DID block — measured on the extracted production
+    // predicates, not asserted anywhere. `nor` comes from the `neither`/`nor` class the cited
+    // judge-parser rule uses; `no longer` is the guard's OWN arm, attributed to that rule nowhere
+    // else. Unpinned vocabulary is one review away from deletion: a future lane tidying the regex
+    // cannot tell these two from an unused arm, and nothing would go red. Each case below is red
+    // against a mutant that removes its alternative from `NEGATION_AT_START` alone.
+    ["`PASS no longer verified`", "PASS no longer verified"],
+    ["`PASS: nor verified` (`nor` is the neither/nor vocabulary)", "PASS: nor verified"],
     ["✅ prefixed `✅ not verified: PASS`", "\u2705 not verified: PASS"],
     // ⛔ THE SEMICOLON (review r2 / VGATE). The first cut ENUMERATED the punctuation that may sit
     // between the token and the negation and omitted `;`, so `PASS; not claimed` merged in all five
