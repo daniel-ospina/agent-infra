@@ -103,9 +103,15 @@ if [ -z "$PY" ]; then
 fi
 
 # ── the reader is sourced ONCE, and every branch below uses ITS verdict ─────────────────────────
-# ⛔ NOT a `bash "$READER" check` SUBPROCESS. The distinction the wrapper needs is the reader's OWN
-# return code (3 absent / 4 empty / 5 malformed), and a subprocess collapses it to 0/1 — which is how
-# a broken file and a missing file become the same branch. One parser, called in-process.
+# ⛔ SOURCED, AND THE REASON IS THE FUNCTIONS, NOT THE EXIT CODE. This block used to say a
+# `bash "$READER" check` subprocess "collapses 3/4/5 to 0/1" — it does NOT (the executed path returns
+# `repo_set_check`'s code verbatim; measured 3/4/5 for absent/empty/malformed, and this repo's suite
+# asserts exactly that through `bash "$READER"` in `repo-set.test.sh`). What a subprocess cannot give
+# this process is the reader's VALUES: `repo_set_file`, `repo_set_doctor_repos`, `_rs_strip`,
+# `_rs_slug_ok`, `_rs_origin_slug`, `_rs_normalize_slug` — every one of which the branches below CALL.
+# Re-parsing the file here, or scraping a subprocess's stdout for them, would be the two-authorities
+# defect the reader exists to remove. One parser, in-process, so the verdict and the values are the
+# same reader's.
 # shellcheck disable=SC1090  # a farmed sibling, resolved above
 . "$READER"
 
