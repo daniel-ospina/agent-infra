@@ -893,7 +893,7 @@ gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; e
 # ⛔ WHICH line that is, is NOT always the most specific one, and the earlier version of this paragraph
 # named the wrong candidates (`floor=`, `resets_in=`, the shim's `gh-contended … wait budget` note):
 # `gh-limit: gh-core-floor …` can never appear on this call at all (see below), and on the rc=75 arm the
-# take quotes the PACING note while `gh-contended` is line 3 — see the `GH_PROBE_CAUSE_MAX` block above
+# take quotes the PACING note while `gh-contended` is line 3 — see the `GH_PROBE_CAUSE_MAX` block below
 # for the measurement. What is true, and all this paragraph should claim, is that whatever the take
 # quotes is the layer's own words rather than a classification of them.
 #
@@ -1138,7 +1138,7 @@ gh_probe_env() {
     # not a quote. That is the honest maximum here and the reason the slot is worth wiring: the record
     # says the layer wrote nothing, instead of having no evidence field at all.
     # ⛔ BUT NOT ALWAYS, AND THE DIFFERENCE IS WHICH ARM OF `gh_probe_bounded` RAN (#3701 round 8,
-    # P2): its perl arm SIGKILLs (`:975-993`), while its `timeout --kill-after=2` fallback sends
+    # P2): its perl arm SIGKILLs (`:994`), while its `timeout --kill-after=2` fallback sends
     # SIGTERM first — and the shim TRAPS term and flushes its buffered notes on exit
     # (`scripts/gh-shim/gh:1828`, `:740-743`, `:744-749`). Measured on the real shim: perl arm `rc=142`
     # with 0 bytes of stderr, timeout arm `rc=124` with 233 bytes of notes. So this record says

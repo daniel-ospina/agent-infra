@@ -937,8 +937,10 @@ ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 #     why=TRANSIENT: the gh environment precondition refused (the refusal line above names which one) …
 #
 # — a POINTER into the log, written into `state/refresh-last`, which is the artifact `orch-loop.sh`
-# builds `[dispatch] BLOCKED: refresh failed — stage=provision` from and which `.refresh-blocked`
-# quotes as "Reason and evidence". A reader of the RECORD therefore got no cause at all: "refused
+# builds `[dispatch] BLOCKED: refresh failed — stage=provision` from. (`.refresh-blocked` is a SEPARATE
+# surface: it quotes the LOG, never this file — `orch-loop.sh:8801` greps `$LOG` for `NOT
+# PROVISIONABLE`, and it is written only on rc=3; see `refresh-candidates.sh`'s own paragraph.) A reader
+# of the RECORD therefore got no cause at all: "refused
 # because auth", "refused because the gh layer would not let the call out" and "refused because the
 # box could not reach GitHub" were indistinguishable in the one sentence an operator reads. That is
 # #3584's own acceptance criterion for the provision stage, and the reason a week of `TRANSIENT`
@@ -980,7 +982,12 @@ shim_note_line() {  # <grep-anchor> <sed-expr>… — the gate_note ARGUMENT, fr
   grep -m1 "^ *gate_note \"$anchor" "$SHIM" \
     | sed -e 's/^ *gate_note "//' -e 's/"$//' "$@"
 }
-SHIM_NOTE="$(shim_note_line 'gh-contended' -e 's/\${WAIT_BUDGET_MS}/120000/')"
+# ⛔ ONE gh CALL HAS ONE `WAIT_BUDGET_MS` (#3701 review round 10, P2). `scripts/gh-shim/gh:1764` assigns
+# it once per call and BOTH notes interpolate that same value, so a capture showing `(budget 1000ms)` on
+# line 1 and `120000ms wait budget` on line 3 is a shape no single call can emit — the same defect class
+# as emitting the wrong line. 1000 is also the value that makes this arm REACHABLE: a wait budget below
+# the probe's 20 s bound is the only way the 75 arm is hit at all.
+SHIM_NOTE="$(shim_note_line 'gh-contended' -e 's/\${WAIT_BUDGET_MS}/1000/')"
 SHIM_PACE="$(shim_note_line 'the account is in a shared rate-limit window — waiting' \
   -e 's/\$(( (rem + 999) \/ 1000 ))/5/' -e 's/\${WAIT_BUDGET_MS}/1000/')"
 SHIM_BUDGET="$(shim_note_line 'if the account BUDGET is what refused' -e 's|\$GATE_DIR|/gate|')"
@@ -1200,7 +1207,7 @@ ck "(g8) …and the tail beyond the cap is NOT in the record" \
 # ⛔ WHAT THE ROW PINS IS THE INTERPOLATION, NOT A PRODUCTION BYTE COUNT. On the default path the
 # probe usually kills the call before the shim flushes, so the capture is often EMPTY and the record
 # says `rc=142, no stderr written` — a NAMED NON-ANSWER. ⛔ But which arm of `gh_probe_bounded` ran
-# decides: perl SIGKILLs (`:975-993`), the `timeout --kill-after=2` fallback sends SIGTERM and the
+# decides: perl SIGKILLs (`:994`), the `timeout --kill-after=2` fallback sends SIGTERM and the
 # shim traps it and flushes (`scripts/gh-shim/gh:1828`, `:740-749`), measured `rc=124` with 233 bytes.
 # The stub writes stderr BEFORE sleeping precisely because a killed shim cannot — the row proves the
 # wiring is live, and the arm's own comment declares both production paths.
