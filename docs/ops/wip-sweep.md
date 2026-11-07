@@ -195,17 +195,30 @@ examination of a worktree, and it always fails the pass (exit 3).
 ⛔ **A LISTING THAT IS SHORTER THAN GIT'S OWN ADMIN RECORDS IS A REPO-LEVEL FAILURE, NOT A CLEAN REPO.**
 The four repo-level notes are `worktree-list-failed` (the call refused), `worktree-list-empty` (it named
 no worktree at all), `worktree-list-unverifiable` (git's common dir could not be resolved or the call
-timed out, so completeness cannot be checked) and `worktree-list-partial`. The last one exists because `git worktree list --porcelain`
-can answer a **subset** with `rc=0` and **completely empty stderr** — so an rc check and a stderr check
-both miss it. Measured shape: damage one worktree's admin record (`.git/worktrees/<name>/gitdir`
-removed), which an interrupted `git worktree add`, a racing `prune`, or a partial restore all produce; a
-4-worktree repo then lists 3 and the omitted worktree is never enumerated, never swept, and the pass used
-to answer `status=ok`. The cross-check is the count of directories in `$(git rev-parse --git-common-dir)
-/worktrees/`, which is git's own authority for how many linked worktrees the repo HAS: a pass requires
-`listed >= admin_dirs + 1` (the `+1` is the main worktree, which has no admin dir; a bare repo has no
-`worktrees/` dir and lists exactly itself, so a missing dir reads as 0). It is **one-sided on purpose** —
-only a listing BELOW the expectation escalates, so a future git that lists more than it holds admin dirs
-can never false-block a sweep that was complete.
+timed out, so completeness cannot be checked) and `worktree-list-partial`.
+The last one exists because `git worktree list --porcelain` can answer a **subset** with `rc=0` and
+**completely empty stderr** — so an rc check and a stderr check both miss it. Measured shape: a
+registration loses `.git/worktrees/<name>/gitdir` (a `prune`/`remove` that died mid-delete, a partial
+restore, a botched repair — **not** an interrupted `git worktree add`, which leaves a *prefix* of
+`mkdir -> locked -> gitdir -> HEAD -> commondir` and so cannot be `gitdir`-less-with-`HEAD`); a
+4-worktree repo then lists 3, the omitted worktree is never enumerated, never swept, and the pass used
+to answer `status=ok`.
+
+The cross-check is a count over `$(git rev-parse --git-common-dir)/worktrees/`, which is git's own
+authority for how many linked worktrees the repo HAS: a pass requires `listed >= admin_dirs + 1` (the
+`+1` is the main worktree, which has no admin dir; a bare repo has no `worktrees/` dir and lists exactly
+itself, so a missing dir reads as 0). **A directory counts as an admin record only if it is a
+registration** — it carries `gitdir`, or `HEAD`, or `commondir`. **Debris is deliberately NOT counted**:
+a `git worktree add` killed between `mkdir` and the `gitdir` write leaves an `{}` or `{locked}` directory
+that is not a registration and that nothing prunes, and counting it made a COMPLETE listing report as
+`PARTIAL` forever — on the quiesce path a false "the work is LOST" FATAL over work that was archived,
+which is how operators learn to disbelieve the one line that must always be believed. The test is
+**ANY-of, not ALL-of**, because damage removes files by deletion from anywhere in that set (requiring
+`gitdir` *and both* others counted 0 for a registration missing `gitdir`+`HEAD`, so a genuine omission
+read `ok`). Where this can be wrong it over-counts, which is fail-closed.
+
+It is **one-sided on purpose** — only a listing BELOW the expectation escalates, so a future git that
+lists more than it holds admin dirs can never false-block a sweep that was complete.
 
 ⛔ **The record is written TWICE: `status=running` before any worktree is touched — and before every
 startup refusal that follows it — then the verdict.** That is what makes an interrupted pass visible. A

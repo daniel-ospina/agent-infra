@@ -923,19 +923,27 @@ sweep_repo() {
     esac
     # A plain glob, not `find`: this path is under `.git/`, maxdepth 1, and a glob cannot descend into
     # anything. With no match the pattern stays literal and the `-d` test fails, so 0 needs no nullglob.
-    # ⛔ COUNT REGISTRATIONS, NOT DIRECTORIES (#3588 review, cycle 3). Counting every directory made the
+    # ⛔ COUNT REGISTRATIONS, NOT DIRECTORIES (#3588 review, cycles 3-4). Counting every directory made the
     # guard FALSE-BLOCK a repo whose listing was COMPLETE: a `git worktree add` killed between
     # `mkdir(.git/worktrees/<name>)` and the `gitdir` write leaves debris that is not a registration at
     # all, and nothing prunes it — so the repo would answer `status=failed`/rc=3 PERMANENTLY and the
     # quiesce would turn that into a false "work is NOT fully archived / LOST" FATAL over work that WAS
     # archived. MEASURED: a healthy 1-worktree repo plus `mkdir .git/worktrees/leftover-empty` reported
-    # "the listing is PARTIAL … NEVER enumerated and NEVER swept", which is simply false. A real
-    # registration carries `gitdir` (git writes mkdir -> locked -> gitdir -> HEAD -> commondir); the
-    # DAMAGED shape this guard exists for loses `gitdir` but keeps `HEAD`+`commondir`, so testing both
-    # spellings keeps the true positive and drops the debris. Both were measured, not assumed.
+    # "the listing is PARTIAL … NEVER enumerated and NEVER swept", which is simply false.
+    # git writes an admin dir in the order `mkdir -> locked -> gitdir -> HEAD -> commondir` (measured), so
+    # an INTERRUPTED add leaves a PREFIX — `{}`, `{locked}`, `{gitdir}`, `{gitdir,HEAD}`, … — while a
+    # DAMAGED registration loses files by deletion (a `prune`/`remove` that died mid-delete, a partial
+    # restore, a botched repair), from anywhere in that set. That asymmetry is why the test is ANY-of
+    # rather than ALL-of: requiring `gitdir` AND both of `HEAD`+`commondir` counted 0 for a registration
+    # that lost `gitdir` plus ONE of the other two, so a genuine omission read `status=ok rc=0` (MEASURED:
+    # `rm gitdir HEAD` over a worktree still holding unswept work → `status=ok`, and this was a coverage
+    # REGRESSION, the false-PASS class this file exists to close). ANY-of keeps the true positive for every
+    # damaged spelling while still excluding debris, and because a prefix that lacks `gitdir` can only be
+    # `{}` or `{locked}`, `HEAD`/`commondir` never exist without `gitdir` in git's own output — so the
+    # ONLY shapes excluded are debris. Where this could be wrong it over-counts, which is fail-CLOSED.
     for wdir in "$common/worktrees"/*/; do
       [ -d "$wdir" ] || continue
-      [ -f "$wdir/gitdir" ] || { [ -f "$wdir/HEAD" ] && [ -f "$wdir/commondir" ]; } || continue
+      [ -f "$wdir/gitdir" ] || [ -f "$wdir/HEAD" ] || [ -f "$wdir/commondir" ] || continue
       admin_n=$((admin_n + 1))
     done
     if [ "$listed" -lt $((admin_n + 1)) ]; then

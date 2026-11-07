@@ -1170,6 +1170,30 @@ O_D2="$(WIP_SWEEP_STATE_DIR="$T/state-debris2" bash "$SW" --apply --repo "$DB2_R
   && ok "S8c debris does NOT mask a real omission — the damaged registration still FAILS the pass (exit 3)" \
   || bad "S8c a real omission was excused because debris was also present (rc=$RC_D2, want 3): $O_D2"
 
+# ⛔ S9 — A REGISTRATION THAT LOST *TWO* FILES IS STILL A REGISTRATION (#3588 review, cycle 4). S8a's
+# fix first required `gitdir` AND both of `HEAD`+`commondir`, which counted 0 for a registration that lost
+# `gitdir` plus ONE of the others — so a genuine omission read `status=ok rc=0`. That is a regression in the
+# PROTECTIVE direction, i.e. exactly the false PASS this file exists to close, and S8c cannot see it
+# because S8c removes only `gitdir`. Both orderings are asserted so the ANY-of test cannot be narrowed
+# back to ALL-of, and the dirty file stays in place: the arm asserts on the work that would be lost.
+for pair in "gitdir HEAD" "gitdir commondir"; do
+  set -- $pair
+  mkdir -p "$T/f4" && rm -rf "$T/f4"/* 2>/dev/null
+  mk_fixture f4 fix/3485-f4 || { echo "x fixture failed (f4)"; exit 1; }
+  F4_REPO="$T/f4/wt"
+  git -C "$F4_REPO" worktree add -q "$T/f4/w2" -b "wip-f4-$2" 2>/dev/null \
+    || { echo "x could not add a linked worktree (f4)"; exit 1; }
+  printf 'precious\n' > "$T/f4/w2/precious.txt"
+  rm -f "$F4_REPO/.git/worktrees/w2/$1" "$F4_REPO/.git/worktrees/w2/$2"
+  O_F4="$(WIP_SWEEP_STATE_DIR="$T/state-f4-$2" bash "$SW" --apply --repo "$F4_REPO" 2>&1)"; RC_F4=$?
+  [ "$RC_F4" -eq 3 ] \
+    && ok "S9 registration missing '$1'+'$2' still counts, so the omitted dirty worktree FAILS the pass (exit 3)" \
+    || bad "S9 a registration missing '$1'+'$2' counted 0, so an OMITTED worktree holding uncommitted work read clean (rc=$RC_F4): $O_F4"
+  grep -q 'worktree-list-partial' "$T/state-f4-$2/wip-sweep.tsv" 2>/dev/null \
+    && ok "S9b …and the note is worktree-list-partial, not a bare 'unknown'" \
+    || bad "S9b the index does not record the partial listing for '$1'+'$2'"
+done
+
 echo
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"
