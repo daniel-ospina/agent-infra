@@ -1212,10 +1212,12 @@ verify_targets() {
                             # runs and does nothing, an unreadable one is 126 — whatever tree it is in.
                             # ⛔ IT DOES NOT SHADOW THE `tcc_exec=1` PATH BELOW. That path SKIPS AND
                             # DISARMS, so verdict 2 is already the safe answer there and a FAIL would
-                            # only take `sync.sh` down with it (#1187). Here the choice is narrower and
-                            # the two ends are not symmetric: arming a dead unit is a SILENT false PASS
-                            # (category A), while declining to arm one is loud and repairable by an
-                            # install step (a re-farm, a chmod — verdict 1's own definition).
+                            # only take `sync.sh` down with it — the "TCC VERDICT COMES FIRST" note at
+                            # the top of this loop is where that rule is recorded and justified. Here
+                            # the choice is narrower and the two ends are not symmetric: arming a dead
+                            # unit is a SILENT false PASS (category A), while declining to arm one is
+                            # loud and repairable by an install step (a re-farm, a chmod — verdict 1's
+                            # own definition).
                             # ⛔ AND IT IS WHY THE TWO READERS STAY IN STEP: python derives `exec` for
                             # `--script <dir>` and this arm derives `unknown`, so a predicate applied to
                             # only the `exec` arm is a reader divergence — the class round 7 fixed on
