@@ -1009,9 +1009,10 @@ def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
     the loose one accepts, 3 of them in `scripts/test_pr_doctor.py` (`[+12]`, and
     two carrying `,`) and 7 in
     `test_no_runner_or_hook_wrapper_is_ever_an_identity` (`#` and `'`). Those ids
-    are permanently BLOCKed: **#3686 is OPEN for them, not closed**, and
-    `test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS` pins that
-    consequence so no lane can read this split as the end of the work.
+    are permanently BLOCKed — the deadlock #3686 reported is STILL LIVE for them,
+    and #3686 closed only for `/` and space, so the remainder is tracked separately
+    as agent-infra#3700. `test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS`
+    pins that consequence so no lane can read this split as the end of the work.
 
     What the loop below asserts is what the predicates must keep doing: an id
     carrying punctuation the strict form does not admit is rejected by it and
@@ -1043,6 +1044,7 @@ def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
 
 
 #: ⛔ THE MEASURED **OPEN** REMAINDER OF #3686 — a pin on a HOLE, not a virtue.
+#: Tracked as agent-infra#3700; #3686 itself closed for `/` and space only.
 #:
 #: Every id below was COLLECTED from this repo's shipped suites (``pytest tests/
 #: scripts/test_pr_doctor.py --collect-only``), never invented, and every one is
@@ -1063,7 +1065,7 @@ _STRICT_FORM_RESIDUAL_IDS = (
 
 
 def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
-    """⛔ THIS LEG PINS A DEFECT THAT IS STILL THERE. DELETE IT WHEN #3686 CLOSES.
+    """⛔ THIS LEG PINS A DEFECT THAT IS STILL THERE. DELETE IT WHEN #3700 CLOSES.
 
     The strict form gates MAIN's rate table and still does not admit `+ , ' # @`,
     so for an id carrying one of them main's row is dropped, the PR-side failure
@@ -1075,10 +1077,10 @@ def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
 
     So this leg reds in BOTH directions it must:
 
-    * a lane WIDENING `rest` to admit one of these characters → the first
-      assertion below fails, which is #3686 being CLOSED: delete this test and the
-      "NOT THE WHOLE PARAMETER SPACE" paragraph in `_NODEID_RE`'s comment, and
-      record the closure on #3686;
+    * a lane WIDENING `rest` to admit one of these characters → the
+      `not is_failure_key` assertion below fails, which is agent-infra#3700 being
+      CLOSED: delete this test and the "NOT THE WHOLE PARAMETER SPACE" paragraph
+      in `_NODEID_RE`'s comment, and record the closure on #3700;
     * a lane NARROWING the strict form further, or re-opening the `_RATES_RE` door
       → `main.rejected` no longer holds the row, so the deadlock these ids pin has
       moved and the measurement here is stale.
@@ -1092,7 +1094,7 @@ def test_the_OPEN_residual_parameter_punctuation_still_DEADLOCKS():
         assert not is_failure_key(nodeid), (
             f"{nodeid!r} is no longer a strict-form residual — `_NODEID_RE` has "
             "been widened. If that was deliberate, DELETE this leg and the "
-            "residual paragraph in its comment, and record the closure on #3686"
+            "residual paragraph in its comment, and record the closure on #3700"
         )
         row = f"{nodeid}\t3\t26"
         main = parse_rates(f"{row}\n")

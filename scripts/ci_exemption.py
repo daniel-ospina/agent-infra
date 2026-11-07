@@ -193,7 +193,9 @@ from pathlib import Path
 #: implicated are ``+ , ' # @``, plus ``( ) " \\`` among the 9 further ids under
 #: ``tests/fixtures/`` that no CI job collects.
 #:
-#: ⛔ FOR THOSE IDS #3686 IS STILL OPEN, in the shape it was reported in: main's
+#: ⛔ FOR THOSE IDS THE DEADLOCK #3686 REPORTED IS STILL LIVE. #3686 itself closed
+#: for ``/`` and space; the remainder is tracked as agent-infra#3700, in the shape
+#: it was reported in: main's
 #: rate row is dropped, a ``NOTE  : rejected main rate row:`` is printed beside
 #: ``BLOCK … absent from main's failure set``, and the id is unexemptible forever.
 #: Rejection is REPORTED (``rejected`` in :class:`RatesResult`), never silently
@@ -206,7 +208,7 @@ from pathlib import Path
 #: the remedy (agent-infra#3687 review, 2026-11-07): it is a moving target that
 #: tracks the suites rather than a character class pytest guarantees, and every
 #: character admitted HERE can purchase an exemption — the stakes #3686's scoping
-#: artifact states. Closing the remainder is a decision for #3686, not a quiet
+#: artifact states. Closing the remainder is a decision for #3700, not a quiet
 #: widening at the guard that decides merges.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
