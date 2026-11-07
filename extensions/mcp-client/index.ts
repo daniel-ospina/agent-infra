@@ -581,7 +581,22 @@ export function mergeMcpLayers(
   };
 }
 
-export interface McpConfigPaths {
+export /**
+ * A parsed `.mcp.json` must be a JSON OBJECT carrying an `mcpServers` object.
+ *
+ * `JSON.parse` admits `null`, arrays and scalars, and every one of those used to pass through as a
+ * "readable" layer that then contributed zero servers with NO message — so `"null"` in a repo file
+ * silently produced the base's config instead (measured, #3612 review). A layer that is not a config
+ * is not a silent zero; it is a stated failure.
+ */
+function asMcpJson(value: unknown): McpJson | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const servers = (value as { mcpServers?: unknown }).mcpServers;
+  if (!servers || typeof servers !== "object" || Array.isArray(servers)) return null;
+  return value as McpJson;
+}
+
+interface McpConfigPaths {
   /** `~/.pi/agent/.mcp.json` — the hub's shared layer. Never ships, may be absent. */
   base: string | null;
   /** The first `.mcp.json` walking up from the cwd — the repo's delta. May be absent. */
@@ -796,28 +811,74 @@ export class McpServerManager {
    * to shadow what a repo declares: `~/.pi/agent/.mcp.json` is machine-local, and letting it override
    * a repo would make one box's config change what a checked-out repo means.
    *
+   * ⛔ A LAYER THAT FAILS TO READ IS SAID SO, BY NAME. A broken repo file must not take the hub's
+   * servers away with it — so the surviving layer is still used — but the base is machine-local, so
+   * silently substituting it is the ONE inversion this merge exists to forbid: a repo pinning its own
+   * local daemon would quietly connect to whatever this box's base points at instead. The warning
+   * names the layer, the path, the reason, and that its servers are NOT in effect.
+   *
    * Read-side only: nothing is written, and `setup.sh`'s `{**dst, **src}` policy for the base file is
-   * untouched. A missing or unparseable layer is logged and skipped — a broken repo file must not take
-   * the hub's servers away with it, and vice versa.
+   * untouched.
+   *
+   * ⛔ `DELTA` IS ONE-WAY. A repo can ADD a server or OVERRIDE one of the base's; it cannot REMOVE a
+   * base server, because the merge is a two-way spread and `McpServerConfig` has no `disabled` field.
+   * A base server that is wrong or unspawnable for one repo cannot be vetoed from that repo — see
+   * #3612 for the tombstone (`"<name>": { "disabled": true }`) that would close this.
    */
   async connectAllLayers(paths: McpConfigPaths): Promise<void> {
-    const read = async (p: string | null): Promise<McpJson | null> => {
+    const read = async (p: string | null, layer: "base" | "repo"): Promise<McpJson | null> => {
       if (!p) return null;
+      let raw: string;
       try {
-        return JSON.parse(await readFile(p, "utf-8")) as McpJson;
-      } catch {
-        console.log(`[mcp-client] Could not read ${p} — skipping that layer`);
+        raw = await readFile(p, "utf-8");
+      } catch (err) {
+        console.log(
+          `[mcp-client] WARN: ${layer} layer ${p} could not be read (${(err as Error).message}) — ` +
+            `its servers are NOT in effect`
+        );
         return null;
       }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch (err) {
+        console.log(
+          `[mcp-client] WARN: ${layer} layer ${p} is not valid JSON (${(err as Error).message}) — ` +
+            `its servers are NOT in effect`
+        );
+        return null;
+      }
+      const config = asMcpJson(parsed);
+      if (!config) {
+        // `JSON.parse` admits `null`, arrays and scalars. Without this arm they read as a HEALTHY
+        // layer that contributes zero servers, with nothing logged (measured: `"null"` in a repo
+        // file silently resolved to the base's servers).
+        console.log(
+          `[mcp-client] WARN: ${layer} layer ${p} is not an object with an "mcpServers" object — ` +
+            `its servers are NOT in effect`
+        );
+        return null;
+      }
+      return config;
     };
-    const base = await read(paths.base);
-    const repo = await read(paths.repo);
+    const base = await read(paths.base, "base");
+    const repo = await read(paths.repo, "repo");
     if (!base && !repo) {
       console.log("[mcp-client] No readable .mcp.json in either layer");
       return;
     }
     const merged = mergeMcpLayers(base, repo);
-    await this.connectConfig({ ...(repo ?? base ?? {}), mcpServers: merged } as McpJson);
+    // State which layers are ACTUALLY supplying servers. A repo whose file failed is the case where
+    // this line is the only thing that tells the operator its entries never applied.
+    const inEffect = [base ? "base" : null, repo ? "repo" : null].filter(Boolean).join(" + ");
+    const count = Object.keys(merged).length;
+    console.log(
+      `[mcp-client] MCP layers in effect: ${inEffect} — ${count} server(s)` +
+        (count === 0 ? " — running with ZERO MCP servers" : "")
+    );
+    // Non-`mcpServers` top-level keys are spread from BOTH layers (repo last, repo wins). Spreading
+    // only the present layer would silently amputate a base-only key the moment a repo file appears.
+    await this.connectConfig({ ...(base ?? {}), ...(repo ?? {}), mcpServers: merged } as McpJson);
   }
 
   private async connectConfig(config: McpJson): Promise<void> {
@@ -1435,9 +1496,10 @@ export class McpServerManager {
 export default async function (pi: ExtensionAPI) {
   const manager = new McpServerManager();
 
-  // #104: resolve .mcp.json with an upward search (cwd → git top-level) and
-  // a ~/.pi/agent/.mcp.json fallback, instead of cwd-only. Log the search
-  // path at warn level so a zero-server session is diagnosable at a glance.
+  // #104: resolve .mcp.json with an upward search (cwd → git top-level) for the REPO's delta, and
+  // resolve ~/.pi/agent/.mcp.json as the hub's BASE layer — BOTH, then merged with the repo winning
+  // (#3612). It is no longer a fallback; naming it one was the defect. Log both paths so a
+  // zero-server session is diagnosable at a glance.
   const searchedDir = process.cwd();
   const layers = resolveMcpConfigPaths(searchedDir);
   if (layers.repo || layers.base) {

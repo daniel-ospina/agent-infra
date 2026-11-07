@@ -20,7 +20,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { ok, equal, deepEqual } from "node:assert/strict";
 
-import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv } from "./index.js";
+import { resolveMcpJsonPath, resolveMcpConfigPaths, mergeMcpLayers, expandEnvVars, buildMcpServerEnv, McpServerManager } from "./index.js";
 
 let passed = 0;
 let failed = 0;
@@ -280,14 +280,8 @@ await test("TASK_HEARTBEAT_NONCE is scrubbed; other env + config.env preserved",
   }
 });
 
-// ── Cleanup + summary ────────────────────────────────────────────────────
-for (const dir of TMP_DIRS) {
-  try {
-    rmSync(dir, { recursive: true, force: true });
-  } catch {
-    /* best-effort */
-  }
-}
+// ── (cleanup + summary moved to the end of this file: leaving the sweep here stranded every
+//    fixture created by the tests below it — six-plus `mcp-layers-*` dirs leaked per run) ──
 
 
 // ══════════════════════════════════════════════════════════════════════════════════════════════
@@ -361,6 +355,138 @@ await test("neither layer → both null (nothing invented)", () => {
     else process.env.HOME = origHome;
   }
 });
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// connectAllLayers — the BINDING, not just the merge function.
+//
+// `mergeMcpLayers`' ordering is pinned above, but that alone does not pin the CALL SITE: calling
+// `mergeMcpLayers(repo, base)` — which re-introduces base-shadows-repo for every session — left this
+// suite 16/16 green (measured in review, #3614). These drive the manager end to end. Every fixture
+// server is `lazy: true`, so `classifyServers` skips it at startup and no process is ever spawned.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+section("connectAllLayers — the layer→argument binding and its failure modes");
+
+/** Capture what the manager logs, so a WARN can be asserted rather than assumed. */
+async function withCapturedLogs(fn: () => Promise<void>): Promise<string[]> {
+  const lines: string[] = [];
+  const orig = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(" "));
+  };
+  try {
+    await fn();
+  } finally {
+    console.log = orig;
+  }
+  return lines;
+}
+
+await test("BOTH layers merge at the CALL SITE — repo wins the collision, base's others survive", async () => {
+  const repoDir = tempDir("mcp-bind-both-repo-");
+  const homeDir = tempDir("mcp-bind-both-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", {
+    mcpServers: { shared: { command: "repo-cmd", lazy: true }, repoOnly: { command: "r", lazy: true } },
+  });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { shared: { command: "base-cmd", lazy: true }, baseOnly: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  await manager.connectAllLayers({
+    base: join(homeDir, ".pi", "agent", ".mcp.json"),
+    repo: join(repoDir, ".mcp.json"),
+  });
+
+  // Runtime read of a TS-private field: this asserts the config the session actually got, which is
+  // the only thing that proves the ARGUMENT ORDER at the call site.
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, { command?: string }> } }).config;
+  equal(cfg.mcpServers.shared?.command, "repo-cmd", "the REPO entry wins — base must never shadow a repo");
+  ok(cfg.mcpServers.baseOnly, "the base's non-colliding server survives");
+  ok(cfg.mcpServers.repoOnly, "the repo's own server is present");
+});
+
+await test("an UNREADABLE repo layer keeps the base's servers AND says so, naming the repo layer", async () => {
+  const repoDir = tempDir("mcp-bind-badrepo-repo-");
+  const homeDir = tempDir("mcp-bind-badrepo-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeFileSync(join(repoDir, ".mcp.json"), '{ "mcpServers": { "shared": { "lazy": true }, } }'); // trailing comma
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { baseOnly: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.baseOnly, "the base's servers are NOT taken away by a broken repo file");
+  ok(
+    logs.some(l => l.includes("WARN") && l.includes("repo layer") && l.includes("NOT in effect")),
+    `a broken repo layer must be reported by NAME and by consequence — got:\n${logs.join("\n")}`
+  );
+  ok(
+    logs.some(l => l.includes("layers in effect")) && !logs.some(l => l.includes("layers in effect: base + repo")),
+    "the in-effect line must NOT claim the repo layer applied"
+  );
+});
+
+await test("a repo layer that parses to `null` is a STATED failure, never a silent zero", async () => {
+  const repoDir = tempDir("mcp-bind-nulljson-repo-");
+  const homeDir = tempDir("mcp-bind-nulljson-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeFileSync(join(repoDir, ".mcp.json"), "null");
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { baseOnly: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  ok(
+    logs.some(l => l.includes("WARN") && l.includes("repo layer") && l.includes("NOT in effect")),
+    `\`null\` is not a config — it must be reported, not read as an empty healthy layer — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("non-`mcpServers` top-level keys survive from BOTH layers (base is not amputated)", async () => {
+  const repoDir = tempDir("mcp-bind-toplevel-repo-");
+  const homeDir = tempDir("mcp-bind-toplevel-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {}, baseDialect: "repo-wins" });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { baseOnly: { command: "b", lazy: true } },
+    futureKey: "from-base",
+  });
+
+  const manager = new McpServerManager();
+  await manager.connectAllLayers({
+    base: join(homeDir, ".pi", "agent", ".mcp.json"),
+    repo: join(repoDir, ".mcp.json"),
+  });
+
+  const cfg = (manager as unknown as { config: Record<string, unknown> }).config;
+  equal(cfg.futureKey, "from-base", "a base-only top-level key must not vanish because a repo file exists");
+  equal(cfg.baseDialect, "repo-wins", "the repo still wins on a top-level collision");
+});
+
+// ── Cleanup + summary (LAST — after every fixture is created) ────────────
+for (const dir of TMP_DIRS) {
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* best-effort */
+  }
+}
 
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
