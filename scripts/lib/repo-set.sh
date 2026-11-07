@@ -883,7 +883,19 @@ repo_set_check() {
     local proof why
     proof="$(_rs_origin_slug "$checkout")"; why="${proof#*$'\t'}"; proof="${proof%%$'\t'*}"
     if [ -n "$proof" ]; then
-      if [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug")" ]; then
+      # ⛔ NORMALISE THE DECLARED SLUG BEFORE COMPARING (round 25, P2). The parse-time dedupe key is
+      # `_rs_normalize_slug "$slug"` BECAUSE `owner/name`, `owner/name.git`, a host prefix and a URL
+      # are ONE repo to the doctor — so comparing the RAW slug here made the same string "one repo"
+      # to one arm and "a different repo" to another. Measured: `slug=acme/alpha.git` over a checkout
+      # whose origin proves `acme/alpha` was REFUSED with "is a checkout of acme/alpha, not
+      # acme/alpha.git" (rc 1, wrapper exit 2) while the doctor would have graded it — the
+      # "reader refuses a pass the doctor runs" class. An unnormalisable answer (sentinel or empty)
+      # falls back to the raw slug, i.e. the previous behaviour, so an unaskable sibling changes
+      # nothing here.
+      local slug_n
+      slug_n="$(_rs_normalize_slug "$slug")"
+      case "$slug_n" in ''|'__UNASKABLE__') slug_n="$slug" ;; esac
+      if [ "$(_rs_lower "$proof")" != "$(_rs_lower "$slug_n")" ]; then
         problems="$problems; $checkout is a checkout of $proof, not $slug — refusing to grade a repo the checkout does not prove"
       fi
     else

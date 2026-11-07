@@ -26,14 +26,19 @@
          (review round 22, P1). It is a `{{TORTOISE_REPO}}`-GATED template — like
          branch-reaper, worktree-reaper and worktree-hygiene, and UNLIKE pi-reap-orphans,
          pi-cache-reap and lane-liveness, whose names all resolve from the INSTALLER'S OWN
-         environment and really are always installed. ⛔ THE REAL RULE IS ROLE VS ENVIRONMENT,
-         NOT "names no placeholder" (round 24, P2: this line said "no placeholder that can
-         resolve EMPTY", which is FALSE — `install-launchd.sh` has a dedicated PATH skip
+         environment and really are always installed. ⛔ THE REAL TEST IS SIMPLY: CAN THIS NAME
+         RESOLVE EMPTY? (round 24, P2 — an earlier version said these three "carry no placeholder
+         that can resolve EMPTY", which is FALSE: `install-launchd.sh` has a dedicated PATH skip
          arm, measured to SKIP pi-cache-reap and lane-liveness when every PATH entry is
-         unreadable). A name resolved from the box's ROLE (`TORTOISE_REPO`, `SWARM_ROOT`,
-         `AI_*`) gates the template; a name resolved from the installer's own environment
-         (`HOME`, `PATH`) does not — so "always installed" holds for those three only while the
-         installer's PATH renders non-empty. The gate fires BEFORE `verify_targets`
+         unreadable. Round 25, P2 — a "role vs environment" dichotomy I substituted for it was
+         ALSO wrong: PYTHON_BIN is resolved from the installer's environment and DOES gate — it
+         is argv[0] of corruption-canary, measured to SKIP when neither the swarm venv nor a
+         python3 resolves.) So: names that CAN resolve empty gate the template — TORTOISE_REPO,
+         SWARM_ROOT, AI_*, and PYTHON_BIN when neither the swarm venv nor a python3 resolves —
+         while HOME and PATH are rendered from the installer's own always-present values, so
+         "always installed" holds for those three only while each of their names renders
+         non-empty. This unit is gated on TORTOISE_REPO, which is the gate that matters here.
+         The gate fires BEFORE `verify_targets`
          (`install-launchd.sh`
          returns SKIP from the placeholder loop), so on a box that resolves no tortoise
          checkout this job is SKIPPED at rc 0 and the target check never runs at all.
