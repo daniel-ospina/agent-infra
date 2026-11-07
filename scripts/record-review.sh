@@ -1282,7 +1282,7 @@ delta_git() { # <root> <git args…>
 delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_*)
   local id="$1" head="$2" range from to cover="" root="" tmp="" norm=""
   local authored="" newest="" n_authored=0 anchor="" dg_rc=0 base_sha="" base_ref=""
-  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha=""
+  local merges_in_range="" evil="" evil_shas="" m="" parents="" pcount="" p1="" p2="" prest="" want="" actual="" cands="" mrc="" body_claim="" stated_from="" stated_to="" stated_sep="" _delta_tok="" E_OUT="" E_RC="" _scan="" _any="" _all_ok="" _sf="" _ss="" _st="" _ok="" _sfs="" _r="" _claim="" _toks="" _tok_rc=0 _tok="" _tsha="" _drivers=""
   range="${id%%+*}"
   [ "$range" != "$id" ] && cover="${id#*+}"
   from="${range%%..*}"; to="${range##*..}"
@@ -1436,6 +1436,34 @@ delta_verify() { # <id: A..B[+artifact]> <head_sha> -> 0 = verified (sets DELTA_
     echo "   delta: the merge walk FAILED — a failed read is not evidence; retry rather than record." >&2
     return 1
   }
+  # ⛔ (7c) THE ORACLE ITSELF IS STEERABLE — a MERGE DRIVER makes `merge-tree` answer rc 0 over a
+  # content-dropping resolution, so the comparison below would call a hand-resolved merge CLEAN.
+  # Found in review, and REPRODUCED: with `.gitattributes` naming `c.txt merge=mydrv` and
+  # `git config merge.mydrv.driver true` in the checkout, `merge-tree --write-tree <lane> <base>`
+  # exits 0 and returns EXACTLY the merge commit's hand-resolved tree — the base's conflicting
+  # edit was dropped by the driver and nobody saw the decision. Every other arm then agrees:
+  # `--no-merges` is empty, `--merges` holds one, tree equality holds, `git diff` is non-empty. The
+  # range classifies merge-only, the cover requirement degrades to "a comment naming A", and a
+  # signed `clean` is minted over lines no reviewer read — class 9's false PASS, reachable with no
+  # more privilege than the replace/graft forgery (7b) already guards.
+  # ⛔ WHY IT IS NOT COVERED BY `delta_git`'s PIN: that pin disables the mechanisms that lie about
+  # HISTORY (`refs/replace/*`, the grafts file). A merge driver lies about MERGING, and
+  # `merge-tree` reads it from the checkout's own config — which the lane owns, since
+  # `DELTA_GIT_DIR` defaults to the lane's worktree. The attribute lives in a TREE (so it can
+  # arrive from the base side) while the driver definition lives in config (so it never appears in
+  # the diff, the record, or the digest). There is no `git` flag that makes merge-tree ignore
+  # drivers, so the honest direction is REFUSE: a checkout that declares one cannot prove a merge
+  # was clean, and this arm's whole value is that proof. Cost is one `git config` read, and only
+  # when the range actually holds a merge (with none, `merge-tree` is never consulted).
+  if [ -n "$merges_in_range" ]; then
+    _drivers="$(delta_git "$root" config --get-regexp '^merge\..*\.driver$' 2>/dev/null || true)"
+    if [ -n "$_drivers" ]; then
+      echo "   delta: the checkout $root DECLARES A CUSTOM MERGE DRIVER — 'merge-tree' would reproduce that driver's resolution, so a hand-resolved conflict and a clean merge become the SAME answer and this range cannot be classified:" >&2
+      printf '%s\n' "$_drivers" | command sed -e 's/^/     /' >&2
+      echo "   A merge driver is read from the checkout's own config, so it never appears in the diff, the record, or the digest. Unset it (git config --unset <key>) or record from a pristine checkout, then retry — a range whose merges cannot be judged is not evidence." >&2
+      return 1
+    fi
+  fi
   evil=""
   while IFS= read -r m; do
     [ -n "$m" ] || continue

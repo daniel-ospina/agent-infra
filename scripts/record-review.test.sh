@@ -8111,7 +8111,7 @@ printf 'base h2\n' > h2.txt; git add -A
 GIT_COMMITTER_DATE='2025-08-01T00:00:00Z' GIT_AUTHOR_DATE='2025-08-01T00:00:00Z' git commit -qm 'base: h2'
 DG_HI_B="$(git rev-parse HEAD)"
 printf '%s\n' '2025-08-01T00:00:00Z' > "$T/dates/$DG_HI_B"
-git checkout -q hidlane >/dev/null 2>&1
+git checkout -q hidlane >/dev/null 2>&1 || true
 git -c core.editor=true merge --no-ff --no-commit "$DG_HI_B" >/dev/null 2>&1 || true
 # the hand edit lives ONLY in the merge commit — the state a reviewer never saw
 printf 'HAND EDIT nobody reviewed\n' >> h1.txt
@@ -8122,11 +8122,21 @@ DG_HI_H="$(git rev-parse HEAD)"
 printf '%s\n' '2025-09-01T00:00:00Z' > "$T/dates/$DG_HI_H"
 # BOTH premises are ASSERTED, or the vector silently stops testing the arm it was written for.
 if [ "$(git rev-list --merges "$DG_HI_L..$DG_HI_H" --not "$DG_HI_B" 2>/dev/null | wc -l | tr -d ' ')" = "1" ]; then
-    ok "20i1 fixture: the range's only new commit is the merge"
+    ok "20i1 fixture: the range's only new MERGE is the merge commit"
 else
     bad "20i1 fixture: the range does not hold exactly one merge — the vector would not test the classifier"
 fi
-DG_HI_PAR="$(git rev-list --parents -n1 "$DG_HI_H" 2>/dev/null)"
+# ⛔ THE PREMISE THE VECTOR ACTUALLY NEEDS IS "NO LANE-AUTHORED (NON-MERGE) COMMIT IN THE RANGE", and
+#    the merge count above does not measure it (review of this change: the range legitimately also
+#    holds the base-side commit, so a LABEL saying "the only new commit is the merge" stayed green
+#    while the property it advertises was gone). Asserted separately, on the excluded walk the
+#    classifier itself uses.
+if [ -z "$(git rev-list --no-merges "$DG_HI_L..$DG_HI_H" --not "$DG_HI_B" 2>/dev/null)" ]; then
+    ok "20i1 fixture: NO lane-authored commit is in the range — the merge is the only thing it holds"
+else
+    bad "20i1 fixture: the range holds a non-merge commit, so it is authored regardless of the driver or the forge — this vector would certify nothing"
+fi
+DG_HI_PAR="$(git rev-list --parents -n1 "$DG_HI_H" 2>/dev/null)" || DG_HI_PAR=""
 read -r _hi_self DG_HI_P1 DG_HI_P2 _hi_rest <<< "$DG_HI_PAR"
 _hi_mtrc=0
 DG_HI_MT="$(git merge-tree --write-tree "$DG_HI_P1" "$DG_HI_P2" 2>/dev/null)" || _hi_mtrc=$?
@@ -8157,8 +8167,8 @@ assert_contains "$RECORD_ERR" "postdates ${DG_HI_H:0:12}" \
 # ⛔ THE FORGERY, PLANTED. The replacement carries the AUTOMATIC tree and the SAME parents, so
 # plain git now answers `<merge>^{tree}` with the tree `merge-tree` produces — the tree-equality
 # test alone cannot catch it, which is exactly why the export exists.
-DG_HI_FAKE="$(git commit-tree "$DG_HI_MT" -p "$DG_HI_P1" -p "$DG_HI_P2" -m 'forged: the automatic merge tree')"
-git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1
+DG_HI_FAKE="$(git commit-tree "$DG_HI_MT" -p "$DG_HI_P1" -p "$DG_HI_P2" -m 'forged: the automatic merge tree')" || DG_HI_FAKE=""
+git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1 || true
 if [ "$(git rev-parse "$DG_HI_H^{tree}")" = "$DG_HI_MT" ]; then
     ok "20i1 control: the replace ref is LIVE — the merge now REPORTS the automatic tree"
 else
@@ -8175,7 +8185,7 @@ run_record_delta $EHI2 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515101" \
 assert_eq "$RECORD_RC" "3" "20i1 WITH the replace ref planted the SAME range is still REFUSED (rc 3)"
 assert_contains "$RECORD_ERR" "postdates ${DG_HI_H:0:12}" \
     "20i1 …and the anchor is STILL the real merge — the pin made the replacement invisible to every arm"
-git replace -d "$DG_HI_H" >/dev/null 2>&1
+git replace -d "$DG_HI_H" >/dev/null 2>&1 || true
 # 20i2 THE GRAFTS FILE is a DIFFERENT mechanism, and `GIT_NO_REPLACE_OBJECTS` does NOT cover it
 #      (`tests/record-review/run.sh` (13) records that lesson for the carry walk). Here the graft
 #      rewrites the merge's PARENTAGE, so plain git stops seeing a merge at all and walks the
@@ -8200,6 +8210,45 @@ assert_contains "$RECORD_ERR" "holds authored content in a MERGE" \
 assert_not_contains "$RECORD_ERR" "contains authored content (1 commit(s))" \
     "20i2 …and NOT the count form a graft-honouring recorder would produce"
 rm -f "$DG/.git/info/grafts"
+
+# 20i3 THE ORACLE ITSELF — A MERGE DRIVER (cycle-2 review, P1; reported with a runnable repro and
+#      reproduced here before the fix). `merge-tree` reads `merge.<name>.driver` from the
+#      CHECKOUT'S OWN CONFIG, which the lane owns (`DELTA_GIT_DIR` defaults to its worktree). A
+#      driver that reports success makes a content-dropping resolution look like a CLEAN merge —
+#      the conflict's other side is discarded and nobody reviewed that decision — and the attribute
+#      naming the driver can arrive from the BASE side while the driver definition never appears in
+#      the diff, the record, or the digest. Measured: `merge-tree` exits 1 without the driver and 0
+#      WITH it, returning exactly the hand resolution's tree.
+#      The range here is the SAME hand-edited merge as 20i1, but with a cover that POSTDATES it —
+#      so the ONLY thing between this input and a minted `clean` is the driver refusal.
+EHI4=425153; rm -f "$(Q2 $EHI4)"
+git config merge.hidrv.driver true || true
+run_record_delta $EHI4 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515301" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+assert_eq "$RECORD_RC" "3" "20i3 a checkout that DECLARES a merge driver is refused (rc 3)"
+assert_contains "$RECORD_ERR" "DECLARES A CUSTOM MERGE DRIVER" "20i3 the refusal names the merge driver"
+assert_contains "$RECORD_ERR" "merge.hidrv.driver" "20i3 …and names the offending config key"
+[ ! -f "$(Q2 $EHI4)" ] && ok "20i3 no record written" || bad "20i3 a clean was minted from a driver-steered oracle"
+# ⛔ CONTROL: unset it and the SAME input is ACCEPTED. Without this the refusal could be caused by
+#    the hand edit rather than the driver, and the vector would certify the wrong thing.
+git config --unset merge.hidrv.driver 2>/dev/null || true
+EHI5=425154; rm -f "$(Q2 $EHI5)"
+run_record_delta $EHI5 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515401" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+assert_eq "$RECORD_RC" "0" "20i3 control: with NO driver declared the same covered range is ACCEPTED (rc 0)"
+# 20i4 THE TOKEN SCAN'S FAILURE ARM (cycle-2 review, P2). `grep` exits 1 for a legitimate
+#      no-match, but a REAL failure of any pipeline member used to produce the same empty list, so
+#      the population loop silently did not execute. A shim is the only way to reach that state:
+#      `command sort` still resolves through PATH, and `$T/bin` is prepended for the recorder.
+printf '#!/bin/sh\nexit 2\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
+EHI6=425155; rm -f "$(Q2 $EHI6)"
+run_record_delta $EHI6 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515501" \
+    STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+rm -f "$T/bin/sort"
+assert_eq "$RECORD_RC" "3" "20i4 a token scan that COULD NOT RUN is refused (rc 3)"
+assert_contains "$RECORD_ERR" "the commit-token scan FAILED" \
+    "20i4 …and the refusal says the SCAN failed, instead of reading as a claim about the claim"
+[ ! -f "$(Q2 $EHI6)" ] && ok "20i4 no record written" || bad "20i4 a scan that never ran still minted a clean"
 
 # ── 20g — MUTATION MATRIX: break each guard, name the vector that goes RED ──
 # ⛔ errexit is OFF for this block on purpose. A mutation harness that ABORTS the
@@ -8633,7 +8682,7 @@ mut_check "M25 the merge-only arm reads the CLAIM, not the raw body" 425216 "$DG
 #       green. With `GIT_NO_REPLACE_OBJECTS` dropped, the planted replacement is read, the
 #       hand-edited merge compares EQUAL to the automatic one, the range classifies merge-only,
 #       and the vector the shipped recorder REFUSES (20i1) is ACCEPTED.
-git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1
+git replace "$DG_HI_H" "$DG_HI_FAKE" >/dev/null 2>&1 || true
 MUT="$(mk_mutant nodelreplace '  GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"' '  GIT_GRAFT_FILE=/dev/null command git -C "$root" "$@"')"
 mut_check "M34 the delta path's REPLACE pin" 425150 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515001" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2025-08-15T00:00:00Z"
 git replace -d "$DG_HI_H" >/dev/null 2>&1
@@ -8657,6 +8706,20 @@ else
     bad "20g M35 the mutant could not be built (mutation anchor missing from the recorder) — this vector was NOT measured"
 fi
 rm -f "$DG/.git/info/grafts"
+# M21b — THE rc CHECK, WHICH M21 DOES NOT MEASURE (cycle-2 review). M21 replaces the SCAN LINE, so
+#        it proves the scan exists, not that a FAILED scan is refused: delete only the rc check and
+#        every vector plus M21 stays green while "no tokens" and "the scan did not run" collapse
+#        back into one value. The sort shim is what makes a pipeline member fail for real.
+printf '#!/bin/sh\nexit 2\n' > "$T/bin/sort"; chmod +x "$T/bin/sort"
+MUT="$(mk_mutant norgcheck '    if [ "$_tok_rc" -gt 1 ]; then' '    if false; then')"
+mut_check "M21b the rc check on the token scan" 425155 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515501" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+rm -f "$T/bin/sort"
+# M36 — THE MERGE-DRIVER REFUSAL (20i3). Deleting it re-accepts a checkout whose oracle is steered
+#       by a driver the lane owns, which is the false PASS the arm exists to stop.
+git config merge.hidrv.driver true || true
+MUT="$(mk_mutant nodriver '    if [ -n "$_drivers" ]; then' '    if false; then')"
+mut_check "M36 the merge-driver refusal" 425153 "$DG_HI_H" "delta:$DG_HI_L..$DG_HI_H+comment:42515301" accepted STUB_BASE_SHA="$DG_HI_B" STUB_EVIDENCE_AT="2026-01-01T00:00:00Z"
+git config --unset merge.hidrv.driver 2>/dev/null || true
 # M8 (the tier arm) is RETIRED WITH ITS ARM: the unsigned local-record premise was a
 # forgery vector (review minted a signed `clean` from one `printf`), so there is no
 # tier left to launder into `clean`. 20h6 keeps its refusal, now reached through the
