@@ -3143,6 +3143,18 @@ _out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, s
   done | LC_ALL=C sort
   [ "$_out_dg_was" = 1 ] || shopt -u dotglob
 }
+# ⛔ A KEY IS NEVER RE-RESOLVED BY PREFIX (review P3, cycle 81). Splitting each map line ONCE, at the LAST `=`, is the
+# only parse that survives a key which is another key's prefix plus `=` (`rank/late` beside `rank/late=1`): a
+# `awk -v p="$k=" 'index($0,p)==1'` lookup over the map returns the OTHER capture's CRC, so a diagnostic either
+# accuses a capture whose output is pinned (measured: a `rank/late` copy of `rank/out` accused while its CRC was in
+# the pinned set) or prints its header and names NOTHING (measured: `late/out` + `late/out=1` → both loops silent).
+# Keys and CRCs are therefore carried together, tab-separated, and lookups match the KEY FIELD exactly.
+# RESIDUAL, stated rather than implied: this tab field is as good as the line is — a filename containing a TAB
+# confuses the field split exactly as one containing a NEWLINE confuses the line split, and neither is exercised here.
+_out_kv() { # stdin: a `key=crc` map -> `key<TAB>crc`
+  awk '{ _k = $0; sub(/=[^=]*$/, "", _k); printf "%s\t%s\n", _k, substr($0, length(_k) + 2) }'
+}
+
 _out_unique() { # the map above, deduped by CONTENT (many fixtures share an arm)
   # ⛔ THE CRC IS THE TAIL AFTER THE LAST `=`, NOT THE FIELD AFTER THE FIRST (review P3, cycle 80): for a capture named
   # `late=1` the old `cut -d= -f2` returned the literal `1`, so its real output CRC never entered the distinct set —
@@ -3173,20 +3185,6 @@ if [ "${RANK_QUEUE_PIN_REPORT:-0}" = "1" ]; then
 fi
 if [ -z "$_out_got" ] || [ -z "$_out_distinct" ]; then
   rc=1; echo "      NO driven case produced output — the output pin would grade nothing"
-elif [ "$_out_distinct" != "$_out_distinct_pin" ]; then
-  _want="$(printf '%s\n' $_out_distinct_pin | wc -l | tr -d ' ')"; _have="$(printf '%s\n' $_out_distinct | wc -l | tr -d ' ')"
-  rc=1; echo "      the set of DISTINCT operator outputs changed ($_want pinned, $_have now) — prose reached the operator:"
-  # ⛔ THE SAME TREATMENT THE OTHER TWO LOOPS GOT (review P3, cycle 80). This one kept the old shape — unquoted word
-  # splitting of the keys, `cut -d= -f1` (which truncates a `=`-bearing name), and a REGEX `grep -m1 "^$_oc="` (a
-  # glob or `[` in a name became a pattern). Measured: with `rank/late` and `rank/late=1` both present it named
-  # `rank/late` TWICE and never named the second capture; with `$TMP/late case/out` it printed
-  # `capture late … <no such capture: late>` and `capture case/out …`.
-  while IFS= read -r _oc; do
-    _oc_crc="$(printf '%s\n' "$_out_got" | awk -v p="$_oc=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
-    printf '%s\n' $_out_distinct_pin | grep -qxF -- "$_oc_crc" || echo "        capture $_oc emits an output no pinned case produces: $(_out_show "$_oc")"
-  done <<EOF
-$(printf '%s\n' "$_out_got" | sed 's/=[^=]*$//' | LC_ALL=C sort -u)
-EOF
 else
   # ⛔ THE ORDER-ONLY CASE IS A SEPARATE VERDICT, AND ONLY A DIFFERING MAP MAY CLAIM A CHANGE (review P3, cycle 74).
   # The previous shape put the order-only diagnostic and the "operator output changed:" header on the SAME branch,
@@ -3205,9 +3203,17 @@ else
     rc=1; echo "      a driven case's operator output changed, appeared, or disappeared:"
   # ⛔ THE UNION OF BOTH SIDES (review P2, cycle 72): looping over the CURRENT map only meant a capture that
   # DISAPPEARED was compared against nothing and named nowhere — the pin would red without saying what was lost.
+  # ⛔ AND THE DISTINCT SET IS A NOTE HERE, NOT A BRANCH (review P3, cycle 81). It used to be an `elif` that REPLACED
+  # this loop, so a capture that DISAPPEARED (a `rm -rf` of a case dir, measured) reddened with the header "prose
+  # reached the operator" and named NO capture at all — a claim about a cause the loss does not support, on the one
+  # path built to say what was lost. The deduped count is informational; the naming below is the verdict.
+    _want="$(printf '%s\n' $_out_distinct_pin | wc -l | tr -d ' ')"; _have="$(printf '%s\n' $_out_distinct | wc -l | tr -d ' ')"
+    [ "$_out_distinct" = "$_out_distinct_pin" ] || echo "      (the deduped set changed too: $_want distinct pinned, $_have now)"
+    _kv_got="$(printf '%s\n' "$_out_got" | _out_kv)"
+    _kv_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | _out_kv)"
     while IFS= read -r _okk; do
-      _old="$(printf '%s' "$_out_pin" | tr '|' '\n' | awk -v p="$_okk=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
-      _new="$(printf '%s\n' "$_out_got" | awk -v p="$_okk=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
+      _old="$(printf '%s\n' "$_kv_pin" | awk -F'\t' -v k="$_okk" '$1==k { print $2; exit }')"
+      _new="$(printf '%s\n' "$_kv_got" | awk -F'\t' -v k="$_okk" '$1==k { print $2; exit }')"
       [ "$_old" = "$_new" ] && continue
       if [ -z "$_new" ]; then
         echo "        capture $_okk DISAPPEARED (pinned $_old)"
@@ -3217,7 +3223,7 @@ else
         echo "        capture $_okk CHANGED: $(_out_show "$_okk")"
       fi
     done <<EOF
-$(printf '%s\n' "$(printf '%s\n' "$_out_got" | sed 's/=[^=]*$//')" "$(printf '%s' "$_out_pin" | tr '|' '\n' | sed 's/=[^=]*$//')" | LC_ALL=C sort -u)
+$(printf '%s\n' "$_kv_got" "$_kv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
   else rc=0
   fi
@@ -3356,18 +3362,22 @@ else
   rc=1; echo "      the pinned population differs at the END of the run — a case directory or capture that appeared after the snapshot cannot hide:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
   # PROMISED list was empty, because `for x in $( … )` split its key on the space and matched nothing.
+  # ⛔ EVERY LOOKUP HERE READS THE KEY FIELD, NEVER A PREFIX (review P3, cycles 79 and 81): `grep -m1x` was parsed as
+  # `-m 1x` (an invalid max count), so every lookup errored to an empty string and the promised list printed NOTHING
+  # while the check reddened; and `awk -v p="$k=" 'index($0,p)==1'` fixed that but still matched a DIFFERENT capture
+  # whose name starts with `$k=`. The keys and CRCs are carried together below, tab-separated.
+  _lkv_new="$(printf '%s\n' "$_out_late" | _out_kv)"
+  _lkv_pin="$(printf '%s\n' "$_out_late_pin" | _out_kv)"
+  _lkv_first="$(printf '%s\n' "$_out_got" | _out_kv)"
   while IFS= read -r _okl; do
-    # ⛔ LITERAL-PREFIX LOOKUP, NOT `grep -m1x` (review P3, cycle 79): `-m1x` is parsed as `-m 1x`, an invalid max
-    # count, so every lookup errored to an empty string and the promised diagnostic list printed NOTHING while the
-    # check still reddened. `index()` also keeps a `=`-bearing filename intact, which a regex/k cut does not.
-    _l_old="$(printf '%s\n' "$_out_late_pin" | awk -v p="$_okl=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
-    _l_new="$(printf '%s\n' "$_out_late" | awk -v p="$_okl=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
+    _l_old="$(printf '%s\n' "$_lkv_pin" | awk -F'\t' -v k="$_okl" '$1==k { print $2; exit }')"
+    _l_new="$(printf '%s\n' "$_lkv_new" | awk -F'\t' -v k="$_okl" '$1==k { print $2; exit }')"
     [ "$_l_old" = "$_l_new" ] && continue
     # ⛔ ALL THREE BRANCHES DERIVE THEIR TIMING FROM `_out_got` (review P3, cycles 78-79). Cycle 78 fixed only the
     # `CHANGED` branch: a key never captured this run was still reported as "VANISHED after the snapshot", and one
     # already present at the first snapshot as "APPEARED after the snapshot" — both false, on the check family whose
     # whole job is to avoid false causes.
-    _l_first="$(printf '%s\n' "$_out_got" | awk -v p="$_okl=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
+    _l_first="$(printf '%s\n' "$_lkv_first" | awk -F'\t' -v k="$_okl" '$1==k { print $2; exit }')"
     if [ -z "$_l_new" ]; then
       if [ -z "$_l_first" ]; then echo "        capture $_okl was NEVER captured this run (pinned $_l_old) — not a late removal"
       else echo "        capture $_okl VANISHED after the snapshot (pinned $_l_old)"; fi
@@ -3377,7 +3387,7 @@ else
     elif [ "$_l_first" = "$_l_old" ]; then echo "        capture $_okl CHANGED AFTER the snapshot: $(_out_show "$_okl")"
     else echo "        capture $_okl DIFFERS FROM THE PINNED CRC (it already did at the first snapshot, so this is value drift, not late creation): $(_out_show "$_okl")"; fi
   done <<EOF
-$(printf '%s\n' "$_out_late" "$_out_late_pin" | sed 's/=[^=]*$//' | LC_ALL=C sort -u)
+$(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
 fi
 ck "the pinned population is UNCHANGED at the END of the run — a case directory or capture created after the snapshot cannot hide" $rc
