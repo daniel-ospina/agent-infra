@@ -1502,12 +1502,10 @@ PY
         # (#3333/#3308/#3231), and under sustained cap saturation \u2014 the NORMAL state, and the only state
         # in which this line runs \u2014 the pass never advances far enough to publish `review-found-issues`, so
         # the false claim could stand indefinitely. That is #3489's invisibility, inverted.
-        # ⛔ AND THE CORRECTED TEXT NEEDS A KEY OF ITS OWN (review round 15, P2, measured): the headless tag
-        # was byte-identical to the one `origin/main` posts, so on every PR that already carried the old
-        # promise the presence check returned before posting and the corrected text was a PERMANENT no-op —
-        # on exactly the heads it was written for (the cap path, where nothing newer is ever posted). The
-        # `notice` basis puts the correction in the key, exactly as `record` does for `review-found-issues`.
-        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review "" notice
+        # ⛔ A REWORDED TEXT NEEDS A NEW KEY EVERY TIME (rounds 15 and 17, both measured): a headless tag is
+        # presence-keyed, so re-wording under an EXISTING key is a permanent no-op on every PR that carries
+        # the old sentence. `notice-restart`, over `notice`, is per-CORRECTION.
+        [ "$_kind" = green ] && [ "$_att" != at-head ] && [ "$_att" != rejected ] && publish_review_state "$repo" "$pr" awaiting-review "" notice-restart
         continue
       fi
       # ⛔ A FAILED HEAD READ IS NOT AN EMPTY HEAD. `gh` failing here used to write the cooldown key
@@ -1565,7 +1563,7 @@ PY
           # the burst counter never moves), so a mergeable green unattested PR got NO auto-rail comment at
           # all — indistinguishable from "a lane is working on it", the #3489 invisibility. The notice text
           # for exactly this population already exists; it is published here.
-          publish_review_state "$repo" "$pr" awaiting-review "" notice
+          publish_review_state "$repo" "$pr" awaiting-review "" notice-restart
           log_line "$repo #$pr AWAITING-REVIEW ($_att) and this box has no reviewer at $REVIEW_SCRIPT — the PR stays unattested until this actuator is RESTARTED with a usable reviewer in place — the check is taken ONCE, before the loop, and never again (said once at start, named here per candidate)"
           continue
         fi
@@ -1640,7 +1638,7 @@ PY
         # ⛔ THE BURST BOUND, AND IT PUBLISHES WHILE IT WAITS: a PR queued behind this repo's own
         # reviews must still not look like a PR waiting on a lane.
         if review_should_defer "$_rdispatched"; then
-          publish_review_state "$repo" "$pr" awaiting-review "" notice
+          publish_review_state "$repo" "$pr" awaiting-review "" notice-restart
           log_line "$repo #$pr AWAITING-REVIEW ($_att at $head) — $_rdispatched review(s) already dispatched for this repo this pass (cap $REVIEW_PER_PASS); this head is next in the queue"
           continue
         fi

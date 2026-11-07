@@ -981,7 +981,7 @@ grep -qF 'continue'  <<<"$(grep -A12 -F '[ "$REVIEW_AVAILABLE" != 1 ]' <<<"$_bra
 # neither deferral path runs, so this is the only exit that can tell such a PR anything — it published
 # nothing, leaving a mergeable green unattested PR with no auto-rail comment at all.
 _ravail=$(sed -n '/^        if \[ "\$REVIEW_AVAILABLE" != 1 \]; then/,/^        fi$/p' "$SUT")
-grep -qF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' <<<"$_ravail" \
+grep -qF 'publish_review_state "$repo" "$pr" awaiting-review "" notice-restart' <<<"$_ravail" \
   || bad "the reviewerless exit must PUBLISH the awaiting-review notice inside its own guard (the block holds: $(printf '%s' "$_ravail" | grep -c 'publish_review_state') publish(es)) — on a box with no reviewer and free capacity this is the only path that runs, and a mergeable green unattested PR that publishes nothing is indistinguishable from one a lane is working on"
 # ⛔ THE TWO STATES THE LOOP MUST PUBLISH FOR ITSELF, PINNED WHERE THE LOOP CALLS THEM (review, P1/P2).
 # Driving `publish_review_state` directly proves the TEXT works, not that anything ever posts it —
@@ -1277,7 +1277,7 @@ _capdef=$(printf '%s\n' "$_capblock" | grep -F 'publish_review_state "$repo" "$p
 # free slot" for a not-clean head that will never be dispatched again — the round-7 P2 this arm exists for.
 # (The tail allows the `notice` basis: the corrected cap-deferral text needs a key of its own, or the old
 # marker — byte-identical to origin/main's — makes the correction a permanent no-op on every PR that has it.)
-_CAPRE='^[[:space:]]*\[ "\$_kind" = green \] && \[ "\$_att" != at-head \] && \[ "\$_att" != rejected \] && publish_review_state "\$repo" "\$pr" awaiting-review "" notice$'
+_CAPRE='^[[:space:]]*\[ "\$_kind" = green \] && \[ "\$_att" != at-head \] && \[ "\$_att" != rejected \] && publish_review_state "\$repo" "\$pr" awaiting-review "" notice-restart$'
 grep -qE "$_CAPRE" <<<"$_capdef" \
   || bad "the cap deferral's gating must stay ONE statement (… [ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ] && [ \"\$_att\" != rejected ] && publish_review_state … awaiting-review) — splitting it with ';' publishes 'awaiting review' for heads no dispatch will ever reach"
 grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]'  <<<"$_capdef" \
@@ -2366,12 +2366,12 @@ grep -qE '^[[:space:]]*\*\[!0-9 *\]\*\)' "$SUT" \
 # follows it there. The `notice` basis puts the correction in the key.
 : > "$COMMENTS"; : > "$POSTED"
 printf '%s\n' '<!-- auto-rail-review:awaiting-review -->' >> "$COMMENTS"   # the main-era marker, already on the PR
-publish_review_state acme/widget 42 awaiting-review "" notice
-[ "$(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS")" = 1 ] \
-  || bad "the corrected headless 'awaiting-review' must POST over a main-era marker (found $(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS") notice marker(s)) — with an unchanged key the presence check returns first and the corrected text can never reach the PRs that already carry the old promise"
-publish_review_state acme/widget 42 awaiting-review "" notice
-[ "$(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS")" = 1 ] \
-  || bad "the notice marker must still be idempotent (found $(grep -cF 'auto-rail-review:awaiting-review:notice' "$COMMENTS") after a repeated publish, want 1) — a correction that re-posts every pass is the thrash the presence rule prevents"
+publish_review_state acme/widget 42 awaiting-review "" notice-restart
+[ "$(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS")" = 1 ] \
+  || bad "the corrected headless 'awaiting-review' must POST over a main-era marker (found $(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS") notice marker(s)) — with an unchanged key the presence check returns first and the corrected text can never reach the PRs that already carry the old promise"
+publish_review_state acme/widget 42 awaiting-review "" notice-restart
+[ "$(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS")" = 1 ] \
+  || bad "the notice marker must still be idempotent (found $(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS") after a repeated publish, want 1) — a correction that re-posts every pass is the thrash the presence rule prevents"
 # …and the plain (no-basis) headless call keeps its own presence semantics, so nothing else is re-posted.
 _n0=$(wc -l < "$COMMENTS")
 publish_review_state acme/widget 42 awaiting-review
@@ -2381,8 +2381,8 @@ publish_review_state acme/widget 42 awaiting-review
 # usable reviewer and free capacity neither deferral path ever runs, so that exit is the ONLY chance such a
 # PR has of being told anything — it published nothing, and a mergeable green unattested PR with no
 # auto-rail comment is indistinguishable from one a lane is working on.
-[ "$(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT")" = 3 ] \
-  || bad "ALL THREE headless call sites must pass the notice basis (found $(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice' "$SUT"), want 3: the cap deferral, the burst deferral, and the reviewerless exit) — one without it leaves that path's corrected text a permanent no-op on every PR that already carries the old marker"
+[ "$(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice-restart' "$SUT")" = 3 ] \
+  || bad "ALL THREE headless call sites must pass the CORRECTED notice basis (found $(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice-restart' "$SUT"), want 3: the cap deferral, the burst deferral, and the reviewerless exit) — one without it leaves that path's corrected text a permanent no-op on every PR that already carries the old marker"
 
 
 # ⛔ A DISPATCH CLAIM IS KEYED BY THE DISPATCH (review round 16, P2, measured end-to-end): the loop posted
