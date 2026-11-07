@@ -131,32 +131,47 @@ err() { echo "wip-sweep: ⛔ $*" >&2; }
 # green over a box that cannot sweep. The checks therefore run once, below, before the reader; pass mode
 # keeps its own exit codes (2 usage, 3 refusal), and reader mode answers failed/3 with the cause.
 # ⛔ THE `status=ok` GUARANTEE MUST HOLD ON WHAT THIS SCRIPT *EMITS*, NOT ONLY ON WHAT IT PASSES THROUGH
-# (round 9). Round 8 closed the passthrough (a record's own extra line); this closes the INTERPOLATION.
-# Every `detail=`/`recorded=` value below is built by splicing a RECORD value, a CALLER value or a PATH
-# into the printed line, so the literal travelled straight through while the exit was 3 — the same
-# consumer-side false green, one hop upstream. Measured at b03c916, each answering `rc=3` and each
-# containing `status=ok` in its own output: `ts=status=ok` in the record → `detail=…('status=ok')…`;
-# `status=status=ok` in the record → `recorded=status=ok` (which is why the round-2 claim that
-# `recorded=`/`recorded_rc=` "cannot collide" was false); `WIP_SWEEP_MAX=status=ok` → the refusal
-# detail; and a state dir whose PATH contains the literal → the never-run detail.
-# REDACTED, not dropped: unlike a passthrough line (whose content is still on disk at $STATUS_FILE),
-# these lines are the ONLY place the cause is stated, so dropping them would trade a false green for an
-# unexplained refusal. The substitution is what `systemctl show`'s machine-readable surface does with
-# untrusted property content — transform the value so a parser cannot be fooled by it, rather than
-# splice it raw. Arm I7f-I7j pin every one of the four routes, and pin that the line SURVIVES.
-_redact() { printf '%s' "${1//status=ok/status=<redacted>}"; }
+# (rounds 9-10). Round 8 closed the passthrough (a record's own extra line). The reader ALSO splices
+# content into its own printed keys, and that content is not always the record's: it can be a CALLER
+# value or a PATH. Measured at b03c916, every one answering `rc=3` with the literal in its own output:
+#   record `ts=status=ok`              → `detail=…('status=ok')…`            stdout + stderr
+#   record `status=status=ok`          → `recorded=status=ok`               stdout  (falsifies the
+#                                        round-2 claim that `recorded=`/`recorded_rc=` cannot collide)
+#   WIP_SWEEP_MAX=status=ok            → `detail=WIP_SWEEP_MAX is not …'status=ok'`   stdout
+#   state dir with `status=ok` in the PATH → `detail=no pass record at …/status=ok/…`  stdout
+# and in the catch-all refusal the record values reached STDERR too, which `2>&1 | grep` — the shape
+# the doc nominates — read as green. `refuse_startup` is redacted on BOTH its surfaces for exactly that
+# reason: a startup refusal is a reader answer like any other.
 
 refuse_startup() {
   if [ "${MODE:-sweep}" = status ]; then
     printf 'status=failed\n'
     printf 'rc=3\n'
-    printf 'detail=%s\n' "$(_redact "$2")"
+    printf 'detail=%s\n' "$(redact "$2")"
     exit 3
   fi
-  err "$(_redact "$2")"
+  err "$(redact "$2")"
   exit "$1"
 }
 note() { echo "wip-sweep: $*" >&2; }
+# ⛔ ONE SINK FOR EVERY VALUE THAT CAME OUT OF THE RECORD (review finding, round 9). `--print-status`
+# must never put the substring `status=ok` on its surface except as its OWN derived verdict — that is
+# the whole point of emitting the derived pair LAST, and `docs/ops/wip-sweep.md` states it as a
+# guarantee. Round 8 closed the PASSTHROUGH lines; the VALUES the reader ECHOES (`recorded=`,
+# `recorded_rc=`, and an unreadable `ts=` quoted inside the reader's own `detail=`) still went out raw,
+# which is the same defect one key over. Measured on a stale record reading `status=note status=ok`:
+# `recorded=note status=ok` was printed while the script exited 3; and a record with `ts=status=ok`
+# printed it inside `detail=`. Values are REDACTED rather than dropped so the audit trail (what the
+# record actually said) survives on the surface; the untouched record is still on disk at $STATUS_FILE.
+# `${var//pat/rep}` is POSIX pattern substitution — bash 3.2 supports it, and `=` is literal in a
+# pattern, so no quoting tricks are needed. `status=<redacted>` cannot itself contain `status=ok`.
+# ⛔ AND THIS SINK IS THE ONLY ONE — it is used for the RECORD-derived reason, for `refuse_startup`'s
+# caller-supplied message (a bad `WIP_SWEEP_MAX` is echoed inside it), and for the never-run and
+# cannot-be-judged messages that name `$STATUS_FILE` (from a caller's `WIP_SWEEP_STATE_DIR`). Redacting
+# a path only when it CARRIES the literal cannot mangle a normal one, so there is no residual here.
+# The substitution itself mirrors what `systemctl show` does with untrusted property content:
+# transform the value so a parser cannot be fooled by it, rather than splice it raw.
+redact() { printf '%s' "${1//status=ok/status=<redacted>}"; }
 
 usage() {
   sed -n '2,/^set -uo pipefail$/p' "${BASH_SOURCE[0]}" 2>/dev/null | sed -n 's/^# \{0,1\}//p'
@@ -471,7 +486,7 @@ if [ "$MODE" = status ]; then
     echo "rc=3"
     # $STATUS_FILE is derived from a CALLER-supplied state dir, so its path is interpolated content like
     # any other: redacted, never dropped (this detail is the only statement of the cause).
-    printf 'detail=%s\n' "$(_redact "no pass record at $STATUS_FILE")"
+    printf 'detail=%s\n' "$(redact "no pass record at $STATUS_FILE")"
     exit 3
   fi
   S_TS="$(sed -n 's/^ts=//p' "$STATUS_FILE")"
@@ -541,19 +556,41 @@ if [ "$MODE" = status ]; then
   # than rewritten because dropping can only REMOVE green, never add it, and the record itself is still
   # on disk at $STATUS_FILE (the refusal below names that path). Arm I7e pins it.
   grep -v '^status=' "$STATUS_FILE" | grep -v '^rc=' | grep -v '^recorded' | grep -v 'status=ok'
-  # ⛔ EVERY VALUE SPLICED IN BELOW IS REDACTED (round 9) — see the `_redact` comment for the four
-  # measured routes and why these are rewritten while the passthrough above is dropped.
-  printf 'recorded=%s\n' "$(_redact "${S_ST:-<none>}")"
-  printf 'recorded_rc=%s\n' "$(_redact "${S_RC:-?}")"
+  # ⛔ AND THE ECHOED VALUES ARE THE SAME GUARANTEE ONE KEY OVER (review finding, round 9). The filter
+  # above drops record LINES; these three lines print record VALUES, which never pass through it. Every
+  # raw value therefore goes through `redact` — the one sink defined beside `note()` at the top, above
+  # every call site — so `recorded=note status=ok` becomes `recorded=note status=<redacted>` and an
+  # unreadable `ts=status=ok` is redacted inside the reader's OWN `detail=` too. The DERIVED `status=`
+  # is printed UNREDACTED below, on purpose: a genuine `status=ok` is this reader's verdict and must
+  # survive (arms I7h/I7h3 pin both halves).
+  # ⛔ ONE REDACTED REASON, USED ON EVERY CHANNEL (review finding, round 10). Round 9 redacted the
+  # STDOUT sinks, and a verifier measured the hole that left: the SAME variables reach STDERR through
+  # the `err` calls below, so `--print-status 2>&1 | grep 'status=ok'` STILL read green off a record
+  # this run judged unjudgeable — the fd-2 mirror of the same defect. The arms could not see it because
+  # they captured stdout with `2>/dev/null`. The reason is therefore built ONCE and redacted ONCE here,
+  # and every channel prints THIS variable, so a future `err` cannot reintroduce the leak.
+  if [ -n "$DERIVED_WHY" ]; then
+    _WHY="$(redact "$DERIVED_WHY")"
+  else
+    _WHY="$(redact "recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'")"
+  fi
+  printf 'recorded=%s\n' "$(redact "${S_ST:-<none>}")"
+  printf 'recorded_rc=%s\n' "$(redact "${S_RC:-?}")"
   printf 'rc=%s\n' "$_DERIVED_RC"
   printf 'status=%s\n' "$DERIVED"
-  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$(_redact "$DERIVED_WHY")"
+  [ -n "$DERIVED_WHY" ] && printf 'detail=%s\n' "$_WHY"
+  # NO NAMED RESIDUAL HERE ANY MORE (round 10 follow-up). This block used to declare `$STATUS_FILE` — the
+  # record PATH, from a caller's `WIP_SWEEP_STATE_DIR` — as an accepted limit, because redacting "would
+  # mangle every message that names where the record lives". Measured, that is not true: `redact` rewrites
+  # only a value that CARRIES the literal, so a normal path is byte-identical and a path that carries it
+  # was a fifth false-green route (it reached the never-run detail and this refusal). The two messages
+  # that print the path therefore redact the assembled line.
   case "$DERIVED" in
     ok) exit 0 ;;
     incomplete) exit 1 ;;
     never) exit 3 ;;
-    stale) err "$(_redact "$DERIVED_WHY")"; exit 3 ;;
-    *) err "$(_redact "the pass record at $STATUS_FILE cannot be judged (${DERIVED_WHY:-recorded status='${S_ST:-<none>}' rc='${S_RC:-?}'}) — a human must look; see $RECORD")"; exit 3 ;;
+    stale) err "$_WHY"; exit 3 ;;
+    *) err "$(redact "the pass record at $STATUS_FILE cannot be judged ($_WHY) — a human must look; see $RECORD")"; exit 3 ;;
   esac
 fi
 

@@ -309,16 +309,23 @@ and nowhere else. The printed `status=` and `rc=` are the **derived** ones, emit
 key=value surface agrees with the exit code; the recorded values are kept beside them as `recorded=` and
 `recorded_rc=` (both preceded by every other key, so each derived value is the LAST occurrence of its
 own key — `detail=` follows `status=`, which is why the rule is per-key, not "derived keys end the
-stream"). **No line this reader emits can contain the substring `status=ok`**, so even a `grep
-'status=ok'` consumer cannot read green off a record this run judged stale — the same polarity
-`disk-reaper.sh --print-status` prints. That covers three surfaces, not one: the keys it CONSTRUCTS (the
-derived pair is emitted last, and the recorded pair is spelled so it cannot collide); the record's own
-extra lines, which are DROPPED (their content is still on disk at `$STATUS_FILE`, which the refusal
-names); and every value it INTERPOLATES into `detail=`/`recorded=` — a record's `ts=`, a caller's
-`WIP_SWEEP_MAX`, a state-dir PATH — which are REDACTED to `status=<redacted>`, because those lines are
-the only place the cause is stated and dropping them would trade a false green for an unexplained
-refusal. A genuine record answering `ok` still prints `status=ok` with exit 0; the redaction applies
-only to spliced content. Two clocks it refuses to
+stream"). **No line this reader emits can contain the substring `status=ok`** except as its own
+verdict, so even a `grep 'status=ok'` consumer cannot read green off a record this run judged stale —
+the same polarity `disk-reaper.sh --print-status` prints. That holds on three surfaces, not one: the
+keys it CONSTRUCTS (the derived pair is emitted last, and the recorded pair is spelled so it cannot
+collide); the record's own extra lines, which are DROPPED (their content is still on disk at
+`$STATUS_FILE`, which the refusal names); and every value it INTERPOLATES into `detail=`/`recorded=` — a
+record's `ts=` or status value, a caller's `WIP_SWEEP_MAX`, a state-dir PATH — which are REDACTED to
+`status=<redacted>`, because those lines are the only place the cause is stated and dropping them would
+trade a false green for an unexplained refusal. This holds on **both channels**: the reason string is
+built and redacted once and every surface prints that variable, so `--print-status 2>&1 | grep
+'status=ok'` cannot read green either — the first cut of this fix redacted only stdout, and the same
+value reached stderr through the refusal message. A genuine record answering `ok` still prints
+`status=ok` with exit 0; redaction applies only to spliced content, so it can never eat a true green.
+Redacting the record PATH rewrites it only when it CARRIES the literal, which is why it is covered here
+rather than declared a limit: a normal path is byte-identical. One limit remains, stated rather than
+implied: a reader handed a malformed **argument** still exits 2 without a record surface at all. Two
+clocks it refuses to
 judge: a `ts=` that is missing or unreadable (an uncomputable age is not freshness), and a `ts=` in the
 FUTURE (a clock step backwards — VM restore, NTP, a cell re-image — would otherwise disable the
 staleness test for the whole skew).
