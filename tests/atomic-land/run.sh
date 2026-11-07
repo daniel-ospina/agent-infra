@@ -1516,7 +1516,20 @@ else
   else
     pass "the guard reaped the child once its supervisor was gone (${_waited}s, limit 120)"
   fi
-  wait "$_guard" 2>/dev/null
+  # ⛔ THE CODE IS THE PROOF, ON THIS ARM TOO (#3622 review round 9, P3). This line used to be a
+  # bare `wait` — the status was discarded, so 7g asserted only "the victim is gone" and "the
+  # reason line names the supervisor arm". A guard whose supervisor arm reaped the victim and then
+  # exited **0** was read by `run_rail_watchdog`'s `0)` arm as "the rail stopped on its own", which
+  # returns the rail's own SIGKILL status as a bounded stop — and 7g still passed. That is the
+  # same shape as the `9ab9aa6b` sentinel bug this suite exists to remove. 7h asserted its code;
+  # this arm did not, so the moment the two arms' exits differ the suite stayed green while the
+  # caller started reporting the rail's status as a watchdog timeout. `$?` must be read
+  # IMMEDIATELY: `wait` is followed by a `grep`, which would replace it (bash manual, Exit Status).
+  _grc=0
+  wait "$_guard" 2>/dev/null || _grc=$?
+  [ "$_grc" -eq 124 ] \
+    && pass "the supervisor arm exited 124 (fired AND proved the reap)" \
+    || fail "the supervisor arm exited $_grc, not 124 — a fired guard read as a clean stop"
   grep -q "supervisor (pid $_dead_sup) is gone" "$SCEN/guard-why" 2>/dev/null \
     && pass "the guard named the SUPERVISOR arm as the reason, so the pass is not the limit arm" \
     || fail "the guard did not record the supervisor arm as its reason ($(tail -1 "$SCEN/guard-why" 2>/dev/null))"
