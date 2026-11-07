@@ -1802,10 +1802,16 @@ reap_stale_workers() {
     # at the ONE place that already walks the census with an age, rather than in a second walk.
     # ⛔ THE HELPER IS NOT IN SCOPE IN EVERY RIG THAT DRIVES THIS FUNCTION (review 2026-11-04, P0).
     # Two shipped extractors pull `reap_stale_workers` + `is_num` + `file_mtime_epoch` out STANDALONE
-    # (`selftest.sh:2751`, `:4092`) and `_wedge_min` is defined ~1,900 lines BELOW this body — so the
-    # call was `command not found`, `$(( * 60 ))` was an ARITHMETIC ERROR, and that ABORTED THE WHOLE
+    # (`selftest.sh:2842`, `:4185` — the line numbers are checked, not remembered: an earlier copy of
+    # this comment cited 2751/4092 and both had drifted) and `_wedge_min` is defined ~1,900 lines BELOW
+    # this body — so the call was `command not found`, `$(( * 60 ))` was an ARITHMETIC ERROR, and that
+    # ABORTED THE WHOLE
     # REAPER (measured: rc=1, no log line written, four assertions red). The `m=` line above is
-    # guarded for exactly this reason; this is the same failure mode one line later. A missing helper
+    # guarded for exactly this reason; this is the same failure mode one line later. ⛔ `worker_log_name`
+    # (added 2026-11-06, for the review family's real log name) is in BOTH preludes for the same reason:
+    # without it `f` resolved to "$O/logs/" — a DIRECTORY — so `[ -f "$f" ] || continue` skipped every
+    # record and the reaper reaped NOTHING while still exiting 0 (four selftest assertions red). Adding
+    # a call from the reaper means adding its helper to both extractors. A missing helper
     # must degrade to the documented bound (STALE_MIN*2 = 80), never abort the pass.
     _wm="$( _wedge_min 2>/dev/null )"; is_num "${_wm:-}" || _wm=80
     if [ "$age" -gt $(( _wm * 60 )) ]; then _wn=$(( _wn + 1 )); _wl="${_wl:+$_wl,}$s(${age}s)"; fi
@@ -3003,13 +3009,21 @@ mp_reason() { # <unowned_prs> <lanes> <workers> [<open_prs>]
 # ⛔ WHAT THE OWNER ASKED FOR, IN HIS OWN SENSE: "we should launch that first priority", then cascade
 # to the rest of the capacity. So the ORDER survives exactly as recorded — PR work is dispatched first
 # and takes slots first (the sweep runs earlier in this pass and its spend is already in `LANES` when
-# the issue batch asks for room) — and the BARRIER goes. What bounds the fleet is unchanged and is the
-# ONLY thing that bounds it: MAX_LANES, MAX_LOAD, the memory floor and fork headroom, all of which
-# still close `GATE_WHY` exactly as before. This allocator adds no pacing, no threshold and no age;
+# the issue batch asks for room). ⛔ THE BARRIER DOES **NOT** GO, and this comment used to claim it did
+# (corrected 2026-11-06, review P2): a level holding on a non-zero count still zeroes the issue batch,
+# so the DISPATCH outcome for `>=1` un-owned PR is the same as before. What goes is the barrier's
+# ability to sit in `GATE_WHY` and mask every capacity gate behind it, plus its unreleasability (the
+# drain escape now grants the slots it spends). ⛔ AND "MAX_LANES/MEM/LOAD ARE THE ONLY THING THAT
+# BOUNDS IT" IS FALSE AND WAS RETRACTED in docs/ops/self-healing-contract.md §6 — the WIP-limit arm
+# (`LANDING_FLOOR`) closes the issue path on its own and a cascade LEVEL withholds the room. They are
+# the only limit on CONCURRENCY. This allocator adds no pacing, no threshold and no age;
 # it answers one question: how many ISSUES may be queued for the room those gates have left.
 # ⛔ OVERRIDES: the 2026-10-18 owner ruling "while ANY un-owned PR remains, issues are not opened",
-# AS AN ABSOLUTE BAR — kept as the ORDER (PRs before issues, first call on every free slot), dropped
-# as a barrier (an idle lane may not be held while a dispatchable issue waits). Reason: 0.7% issue
+# AS AN ABSOLUTE BAR — kept as the ORDER (PRs before issues, first call on every free slot); what is
+# overridden is only that it may not be MASKED into `GATE_WHY` and may not be UNRELEASABLE (the bounded
+# drain escape grants what it spends). It is NOT claimed to be gone: a level on a non-zero count still
+# withholds the room, so the dispatch outcome for `>=1` un-owned PR matches the old barrier, and an idle
+# lane CAN still be held — for at most the escape's bound. Reason: 0.7% issue
 # dispatch over 12.45 days with 6 workers spawned per pass, i.e. the absolute form produced neither
 # draining nor producing. The WIP-limit ruling (`LANDING_FLOOR`, "the fleet is FORCED to raise the
 # landing rate rather than open a 68th PR") is NOT reversed and NOT touched: it is a separate arm on
@@ -3240,6 +3254,27 @@ cascade_level() {
   # Level 1 has no count: one verdict outranks every population below it.
   if [ "${CASCADE_MAIN_RED:-0}" = "1" ]; then
     CASCADE_LEVEL=1; CASCADE_LEVEL_NAME="$(cascade_level_name 1)"
+    return 0
+  fi
+  # ⛔ ZERO UN-OWNED PR WORK IS NOT A LEVEL, AND IT IS TESTED **AFTER** LEVEL 1 ON PURPOSE
+  # (review P1 + P2, 2026-11-06 — both measured). `UPN_WORK` is the pass's own un-owned count with
+  # `SEL_PARKED` already subtracted, so a PR parked at its current head makes the LISTING and the COUNT
+  # disagree: the walk below would resolve a level out of a PR no lane can drain, zero the slots, and
+  # break the issue batch on its first guard — ZERO issues queued every pass, silently, and
+  # unreleasable (the drain escape only runs on the `LO_CHOICE != pr` arm, and this state reaches it as
+  # `issue`, which resets the inert streak). Pre-change that state dispatched, so it was a regression
+  # in the exact class this change exists to remove.
+  # ⛔ THE FIX IS NOT A SECOND PARKED PREDICATE: a parked PR is not work for ANY level, so "is there
+  # un-owned PR work at all" is the count's own question, already answered with the exclusion applied.
+  # ⛔ AND IT MUST NOT BYPASS LEVEL 1. Level 1 is measured from MAIN's own check-runs and does not
+  # depend on how many un-owned PRs exist — so this arm sits AFTER the main-red verdict, not in front
+  # of it. Hoisting it (a first form did) meant a RED main with zero un-owned PRs read "no level", the
+  # issue path opened on the repo's own repair channel, and §6's statement that "a red main closes the
+  # issue path" was false in exactly the state where it matters least but reads worst.
+  # An UNREADABLE count still decides nothing here — the same polarity the empty-listing test below
+  # takes, and the room is then spent as the allocator said.
+  if is_limit "${UPN_WORK:-}" && [ "${UPN_WORK:-0}" -eq 0 ] 2>/dev/null; then
+    CASCADE_LEVEL=5; CASCADE_LEVEL_NAME="$(cascade_level_name 5)"
     return 0
   fi
   list="$(cat "$d/last-open-prs" 2>/dev/null || true)"
@@ -6805,37 +6840,17 @@ PY
   CASCADE_LEVEL=""; CASCADE_LEVEL_NAME="NOT-MEASURED"; CASCADE_MAIN_RED=0
   CASCADE_LEVEL_HOLDS=0
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -gt 0 ]; then
-    # ⛔ THE WALK MUST NOT OVERRULE THE COUNT IT SHADOWS (review P1, 2026-11-06 — measured). The pass's
-    # own un-owned count already EXCLUDES a PR parked at its current head (`SEL_PARKED`, subtracted into
-    # `UPN_WORK`), while `cascade_level` walks the raw listing and excludes nothing but OWNERSHIP. So
-    # with exactly one parked, un-owned PR — a fixer cap / needs-human park, a normal recurring state —
-    # the count said `0 un-owned` and the funnel printed `DISPATCH`, while the walk still resolved a
-    # level, zeroed `CASCADE_ISSUE_SLOTS`, and the batch's first guard broke: ZERO issues queued, every
-    # pass, silently. It was unreleasable too, because the drain escape only runs on the `LO_CHOICE != pr`
-    # arm and this state reaches it as `issue` — which resets the inert streak, so the grant could never
-    # fire. Pre-change that state dispatched (a parked PR made `mp_reason` empty), so it was a
-    # REGRESSION in the exact class this change exists to remove.
-    # ⛔ THE FIX IS NOT A SECOND PARKED PREDICATE. A parked PR is not work for ANY level — no lane can
-    # drain it — so "is there un-owned PR work at all" is the count's question, already answered with
-    # the parked exclusion applied. Ask it once: zero un-owned means nothing above level 5 can hold, and
-    # an UNREADABLE count still decides nothing (the same polarity `cascade_level` takes on its own
-    # empty listing). Re-deriving the parked set here would be the two-definitions defect this file
-    # names, and a second copy is how the count and the walk came to disagree in the first place.
-    if is_limit "${UPN_WORK:-}" && [ "${UPN_WORK:-0}" -eq 0 ] 2>/dev/null; then
-      : # no un-owned PR work (owned or parked-at-head): no level above 5 can hold the room.
-    else
-      cascade_level "$O/state"
-      case "${CASCADE_LEVEL:-?}" in
-        1|2|3|4) # A HIGHER LEVEL HOLDS A NON-ZERO COUNT: the room is not the issue path's this pass.
-                 # ⛔ NOT "has actionable work" (review round 9, P2): the classifier counts CHECK STATE
-                 # only, so this arm cannot know whether a lane could spend the room — the same gap the
-                 # `cascade_level` header and docs/ops/self-healing-contract.md §6 now state. Saying
-                 # "actionable" here made the consumption site disagree with the decision site about
-                 # one question, in a comment that a reader would take as a guarantee.
-                 CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;
-        *) : ;;   # 5 = nothing above → issues; `?` = unmeasured → decide nothing (see cascade_level)
-      esac
-    fi
+    cascade_level "$O/state"
+    case "${CASCADE_LEVEL:-?}" in
+      1|2|3|4) # A HIGHER LEVEL HOLDS A NON-ZERO COUNT: the room is not the issue path's this pass.
+               # ⛔ NOT "has actionable work" (review round 9, P2): the classifier counts CHECK STATE
+               # only, so this arm cannot know whether a lane could spend the room — the same gap the
+               # `cascade_level` header and docs/ops/self-healing-contract.md §6 now state. Saying
+               # "actionable" here made the consumption site disagree with the decision site about
+               # one question, in a comment that a reader would take as a guarantee.
+               CASCADE_ISSUE_SLOTS=0; CASCADE_LEVEL_HOLDS=1 ;;
+      *) : ;;   # 5 = nothing above → issues; `?` = unmeasured → decide nothing (see cascade_level)
+    esac
   fi
   # ⛔ THE PASS ENDED WITH WORK WAITING AND NO ROOM: that is the one state in which the interval is
   # worth spending on a poll (`cascade_wait`) instead of a fixed nap. Work waiting means EITHER issue

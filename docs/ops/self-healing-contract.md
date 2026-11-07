@@ -992,9 +992,19 @@ still where the next cut should start.
   red, (2) merge PRs, (3) fix PRs with post-review findings, (4) the review→findings→fix→re-review
   loop, (5) open new issue work — draining each level before descending, and descending only into the
   capacity the spawn gates left free. **The 2026-10-18 ruling above is REFINED, not reversed**: the
-  ORDERING (PR work outranks new work, and is attempted first) is kept exactly; what is removed is its
-  second effect — that *any* un-owned PR closed the issue path unconditionally. Measured cost of that
-  second effect, 1,219 consecutive cycles: `dispatched>0` in **8** of them (**0.66%**), always
+  ORDERING (PR work outranks new work, and is attempted first) is kept exactly. ⛔ **WHAT IS NOT
+  CLAIMED HERE — corrected 2026-11-06 (review P2).** An earlier draft of this bullet said the ruling's
+  "second effect — that *any* un-owned PR closed the issue path unconditionally" was *removed*. It is
+  not: levels 2-4 partition every un-owned PR, so **the dispatch outcome for `>=1` un-owned PR is the
+  same as the old `GATE_WHY` barrier** (short-circuited only by a park, which the count subtracts, and
+  released only by the bounded drain escape). What the change actually delivers is (i) the barrier's
+  *absolute* form gone from `GATE_WHY`, so it can no longer MASK a capacity gate or hide behind itself,
+  (ii) a WIDENED ownership predicate (a live review/fix/CI lane now counts as owning its PR, so the
+  un-owned population can reach zero where it previously could not), and (iii) the drain escape that
+  grants the slots it spends. The measured recovery therefore comes from (ii) and (iii), NOT from
+  removing the barrier — and the 0.66% below is the cost that motivated the change, not a number this
+  change is known to have fixed. Measured cost of the barrier, 1,219 consecutive cycles:
+  `dispatched>0` in **8** of them (**0.66%**), always
   `dispatched=2`, i.e. **0.054 issues/h against an 8.1/h bound (0.7%)**, while the PR path consumed
   8.59 workers/h — the box was saturated by PR work and produced almost nothing else, and the same
   barrier is what let a stalled drain hide behind itself.
@@ -1053,9 +1063,14 @@ still where the next cut should start.
   - Graded by `test-cascade.sh` (assertion and mutant counts are the suite's own printed totals, not a
     claim made here — each mutation makes a named assertion go RED) plus the existing `test-gates.sh`
     vector tests, `live-ownership.test.sh` and `pr-owner-liveness.test.sh`.
-  **OVERRIDES:** the "WIP limit / stop-starting threshold" reading of the 2026-10-18 ruling — i.e. the
-  absolute "ANY un-owned PR ⇒ the issue path is closed" barrier — because it produced measurable
-  throughput collapse (0.66% of cycles dispatched), not because a vendor or a standard says so.
+  **OVERRIDES:** the 2026-10-18 ruling's **ABSOLUTE form** — "for as long as ANY workable un-owned PR
+  remains, issues are not opened", with no threshold, no age and no evidence arm — as a bar on the
+  *issue path's own existence*. The ORDER is kept (PR work first, first call on every free slot) and a
+  level holding on a non-zero count STILL withholds the room; what is overridden is that the bar may
+  not be *masked* into `GATE_WHY` (where it hid every capacity gate behind it) and that it may not be
+  *unreleasable* (the bounded drain escape now grants what it spends). Reason: 0.7% issue dispatch over
+  12.45 days. ⛔ Read together with the correction above: this marker does NOT claim the barrier is
+  gone, and a reader must not take it as one — see the `OPEN OWNER DECISION` bullet for what remains.
 - **Dispatch is gated on capacity, not on a lane count.** Owner ruling 2026-10-17: *"dispatch should be
   gated on capacity, not on number of lanes"* (`MAX_LANES` is 2.5×cores as a derived *ceiling*, and
   `capacity.sh` explicitly refuses to be a lane cap).

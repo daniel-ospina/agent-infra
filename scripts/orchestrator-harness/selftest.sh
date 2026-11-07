@@ -2832,7 +2832,14 @@ sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP" > "$TMP/reapw-body.sh"
 # the helper PLUS the reaper. Extracting the reaper alone leaves file_mtime_epoch undefined and the
 # reaper silently skips every session (`command not found` -> the `|| continue` guard) — which is
 # exactly what this check caught when the helper was introduced.
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; cat "$TMP/reapw-body.sh"; } > "$TMP/reapw.sh"
+# ⛔ THE PRELUDE IS THE REAPER'S WHOLE DEPENDENCY SET, AND IT GROWS (review P1, 2026-11-06). The
+# reaper also resolves each record's log through `worker_log_name` (a reviewer is spawned as
+# `review-<PR>` but writes `merge-<PR>.log`), so that helper is part of its unit exactly as
+# `file_mtime_epoch` is. Extracting the reaper WITHOUT it made `f` resolve to "$O/logs/" — a
+# DIRECTORY — so `[ -f "$f" ] || continue` skipped every record and the reaper silently reaped
+# nothing: the same "helper missing ⇒ the guard swallows everything" failure this prelude's own
+# comment records for `file_mtime_epoch`. Adding a call to the reaper means adding it here.
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^worker_log_name() {/,/^}/p' "$LOOP"; cat "$TMP/reapw-body.sh"; } > "$TMP/reapw.sh"
 if need "$TMP/reapw.sh" "reap_stale_workers() and its file_mtime_epoch() helper are extracted from the shipped loop"; then
   mkdir -p "$TMP/RW/logs" "$TMP/RW/state"
   : > "$TMP/RW/logs/merge-999.log"; touch -t 202601010000 "$TMP/RW/logs/merge-999.log"
@@ -4175,7 +4182,7 @@ fi
 # The reaper driven with the GNU stat shape: the pre-fix copy ABORTS here (`age: unbound variable`,
 # rc 1) and kills nothing. Assert rc=0 AND the kill decision — stale reaped, fresh spared — so a
 # "fix" that simply stopped reaping cannot pass this.
-{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
+{ grep -m1 '^is_num() {' "$LOOP"; sed -n '/^file_mtime_epoch() {/,/^}/p' "$LOOP"; sed -n '/^worker_log_name() {/,/^}/p' "$LOOP"; sed -n '/^reap_stale_workers() {/,/^}/p' "$LOOP"; } > "$TMP/reapw-gnu.sh"
 if need "$TMP/reapw-gnu.sh" "the reaper and its stat helper are extracted for the GNU-shape drive"; then
   mkdir -p "$TMP/RG/logs" "$TMP/RG/state"
   : > "$TMP/RG/logs/merge-999.log"; touch -t 202601010000 "$TMP/RG/logs/merge-999.log"
