@@ -5533,8 +5533,8 @@ assert_contains "$RECORD_ERR" "NO PENDING MARKER FOR THIS RUN IS ON DISK EITHER"
 # exists, which this arm cannot see — so both captures must say WHICH bytes they mean.
 assert_contains "$RECORD_ERR" "for the marker this run owed" \
     "14.1d(i) …and the exit-5 remedy scopes 'would find NOTHING' to the marker THIS RUN owed (a stale earlier marker for the same PR is still in the pending file)"
-assert_contains "$RECORD_ERR" "can only deliver an OLDER pending marker" \
-    "14.1d(i) …and says what the flush WOULD do in that state, so the second clause is not itself an unscoped prediction"
+assert_contains "$RECORD_ERR" "it cannot deliver THESE BYTES" \
+    "14.1d(i) …and states the INVARIANT (the flush cannot carry bytes no attempt wrote) instead of enumerating its outputs, which omitted the EMPTY-file and refusal arms"
 assert_not_contains "$RECORD_ERR" "and would answer 'nothing pending'" \
     "14.1d(i) …never the unscoped form, which predicts the flush's OUTPUT and is false whenever an earlier marker is pending"
 # ⛔ THE SAME CLASS, ONE CALL FURTHER IN (#3712 review round 2, P3):
