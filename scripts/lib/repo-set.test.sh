@@ -411,6 +411,32 @@ ck "f11b2 the farm-gap refusal quotes the log string VERBATIM, and emits no bash
 # file's header says the whole unit exists to prevent.
 ck "f34 a missing sibling DOCTOR is a NAMED farm gap, and never announces 'grading N repo(s)'" \
    'mv "$W/pr-doctor.py" "$W/pr-doctor.py.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/pr-doctor.py.away" "$W/pr-doctor.py"; [ "$rc" = 2 ] && grep -q "pr-doctor.py is missing" <<<"$o" && ! grep -q "grading .* repo(s)" <<<"$o"'
+# ⛔ THE THIRD ARMLESS GUARD, ONE TO THE LEFT OF `f34` (review at `7159ffab`, P1). `[ -z "$PY" ]` is
+# the same shape as the two above and was the remaining guard in this file whose deletion left the
+# suite at ZERO reds: with it gone the wrapper announces `set: … -> grading N repo(s)` and then dies on
+# `exec: : not found` (rc 127, outside this file's documented 0 / pr-doctor's own rc / 2 contract) — on
+# BOTH entry paths, the set branch and the degraded `Grading the ONE repo` branch. `rc 127` is also a
+# FOURTH exit code the header does not document, which is what makes it unclassifiable for an operator.
+# ⛔ THE OFF-BOX SHAPE HAS TO BE MADE REACHABLE: this box has python3, so the candidates are rewritten
+# to names that cannot resolve, in a COPY — the same technique the suite already uses for `SW` and the
+# doctored doctors. Only the wrapper's own list is rewritten, so nothing else can find an interpreter.
+NP="$T/wrapnopy"; mkdir -p "$NP/lib" "$T/nopyhome"
+cp "$READER" "$NP/lib/repo-set.sh"
+cp "$WRAPPER" "$NP/pr-doctor-machine.sh"
+cp "$REPO_ROOT/scripts/pr-doctor.py" "$NP/pr-doctor.py"
+python3 - "$NP/pr-doctor-machine.sh" <<'PYNOPY'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
+assert s.count(old) == 1, s.count(old)
+open(p, "w").write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
+PYNOPY
+_o_np="$(HOME="$T/nopyhome" OR=acme/tor bash "$NP/pr-doctor-machine.sh" 2>&1)"; _rc_np=$?
+ck "f35 no python3 on the box is a NAMED refusal at exit 2, never a grading claim" \
+   '[ "$_rc_np" = 2 ] && grep -q "no python3 on this box" <<<"$_o_np"'
+ck "f36 …and neither entry path announces a pass a missing interpreter would silently void" \
+   '! grep -q "grading .* repo(s)" <<<"$_o_np" && ! grep -q "Grading the ONE repo" <<<"$_o_np"'
 # ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
 # The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
 # `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
