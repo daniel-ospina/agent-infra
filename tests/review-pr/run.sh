@@ -988,9 +988,16 @@ no_comment; ck $? "no comment posted"
 # NOT read out of the harness, and no file here reads `deploy-harness.sh`. Both halves were mutation-checked:
 # `exit 83` → `exit 1` reds the rc assertion; reverting the sentence to the retired `cp ... *.sh` glob reds the
 # `deploy-harness.sh` and `err_not_has` assertions.
-_skew_rc="$(sed -n 's/^AGENT_HARNESS_SKEW_REFUSED=\([0-9][0-9]*\)$/\1/p' \
+_skew_decl="$(sed -n 's/^AGENT_HARNESS_SKEW_REFUSED=\([0-9][0-9]*\)$/\1/p' \
   "$ROOT/scripts/orchestrator-harness/spawn-gate.sh" 2>/dev/null | head -1)"
-[ -n "$_skew_rc" ] || _skew_rc=83
+# ⛔ A DERIVATION THAT SILENTLY DEFAULTS IS NOT A DERIVATION (round-3 review of #3645, P2 — measured). This
+# block used to be `[ -n "$_skew_rc" ] || _skew_rc=83`, so a declaration the anchor cannot READ — `export
+# AGENT_HARNESS_SKEW_REFUSED=84`, or the value with a trailing comment — fell through to the literal 83 and the
+# whole arm stayed GREEN against a code that had moved. That is the fail-open `spawn-gate.test.sh:45-52` records
+# as measured for this very `^NAME=` anchor. So the read is ASSERTED separately and the value is used verbatim:
+# a reshape reds "the derivation could not read the declaration" instead of quietly testing a stale number.
+[ -n "$_skew_decl" ]; ck $? "the skew code is READABLE from spawn-gate.sh's declaration (got '${_skew_decl:-<none>}') — a reshape must red here, not fall back to a literal"
+_skew_rc="${_skew_decl:-83}"
 echo; echo "§O3 spawn-point HELPER/SYNC refusal (rc=$_skew_rc) => exit $_skew_rc, named as a harness fault"
 reset; printf '' > "$TMP/reviewer-out"; FIXTURE_PI_RC="$_skew_rc"
 run "$SRC" 2284

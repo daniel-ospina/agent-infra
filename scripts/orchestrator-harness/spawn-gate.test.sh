@@ -4262,17 +4262,23 @@ ck "STRUCTURAL: both 83 arms exit the TOLERANT code (merge-one=$_mt, review-pr=$
 # ⛔ THE REMEDY SENTENCE IS A BEHAVIOUR TOO (#3442 non-vacuity; round-2 review of #3645, P2): reverting all
 # three rewritten messages to the retired `cp scripts/orchestrator-harness/*.sh` glob left this suite GREEN —
 # nothing asserted the one sentence an operator acts on after a refusal. #3508 retired that glob (depth-1,
-# unverified, a PARTIAL deploy this very gate then refuses), so it is refused BY NAME here, and each rewritten
-# refusal must name the verified redeploy instead.
+# unverified, a PARTIAL deploy this very gate then refuses), so it is refused BY NAME here, and the verified
+# redeploy is required to be present.
+# ⛔ AND KEYED ON THE SPELLING, NOT ON A SENTENCE (round-3 review of #3645, P2 — measured): the first cut of
+# this pin matched three literal message fragments, so a legitimate REWORD of `:3939` ("cannot be enforced for
+# this spawn" → "can't be enforced at this spawn point") red it with the remedy untouched. A pin that false-reds
+# on prose buys a deletion, not a guarantee — the same class as a stale line citation. So: the glob is refused
+# wherever it appears outside a comment (that is the actual regression shape, and it catches a revert of ANY of
+# the three), and the positive direction is a COUNT, which no reword can move.
+# DECLARED LIMIT, because it is real: this pin reads spelling, not intent, so a future message that WARNS
+# AGAINST the glob ("do NOT run `cp scripts/orchestrator-harness/*.sh`") would red the first assertion too.
+# Describe a remedy by what replaces it, never by naming the retired command.
 _nc="$(grep -n 'cp scripts/orchestrator-harness/\*\.sh' "$HERE/spawn-gate.sh" | grep -v ':[[:space:]]*#')"
 [ -z "$_nc" ]; rc=$?
 ck "STRUCTURAL: the retired cp-glob redeploy survives only in COMMENTS, never in a message (#3508)${_nc:+ — found: $_nc}" $rc
-_miss=""
-for _sig in 'The fork floor cannot be enforced for this spawn' 'could not read the fork instrument' 'this is a DEPLOY/SYNC or CONFIG fault'; do
-  case "$(grep -F "$_sig" "$HERE/spawn-gate.sh")" in *deploy-harness.sh*) : ;; *) _miss="$_miss [$_sig]" ;; esac
-done
-[ -z "$_miss" ]; rc=$?
-ck "STRUCTURAL: each rewritten refusal names the VERIFIED redeploy, not the glob (#3508)${_miss:+ — missing: $_miss}" $rc
+_dhn="$(grep 'deploy-harness.sh' "$HERE/spawn-gate.sh" | grep -vc '^[[:space:]]*#')"
+[ "$_dhn" -ge 3 ]; rc=$?
+ck "STRUCTURAL: the file still PRESCRIBES the verified redeploy in ≥3 non-comment places ($_dhn) — deleting a remedy reds here" $rc
 
 # END TO END through the SHIPPED run_agent: the agent really is not started, the code is the FORK
 # code (74, not 77/75), and the log says why.
