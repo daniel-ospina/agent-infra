@@ -534,21 +534,26 @@ if grep -q 'the queue changed between this pass' <<<"$_rs14" \
 else rc=1; echo "      rowset-refusal '$(printf '%s' "$_rs14" | tr '\n' '|' | head -c 340)' (want the row-set refusal's own sentence and NO record clause)"; fi
 ck "the ROW-SET refusal carries NO tier-window clause even with a clip record present" $rc
 
-# ⛔ WHERE THE RECORD MAY BE SPOKEN ABOUT — TWO STRUCTURAL RULES, NO WORDING LIST (review cycles 68-70).
-# Six consecutive cycles found the same defect in the same construction: a forbidden-WORDING list. Cycle 69's list
-# was still a list — of four record NAMES (`pool-sat|tier-window|tier window|window record`) — and a reviewer put
-# three claims straight through it: ` — a tier was clipped` (names no artefact), a claim composed into a SECOND
-# variable and expanded on the line, and one printed by `cat <<<`; a fourth rode a continuation line. Wordings
-# cannot be enumerated; POSITIONS and REGIONS can. So the property is not about words at all:
-#   (1) THE OPERATOR POPULATION IS PINNED. Every line these two functions can print is a fixed sentence, and each
-#       is pinned below by CRC. ANY prose added to ANY of them — whatever words, wherever on the line, before or
-#       after the channel — changes a CRC and reds. This is the half a wording list cannot outrun. It is a
-#       TRIPWIRE over text, not a semantic gate: a deliberate message change means re-pinning `_pop_pin` below
-#       from the CRCs this check prints, and the diff then shows the re-pin next to the message change.
-#   (2) THE RECORD'S NAMES LIVE IN ONE REGION. Every line that mentions the record (`.pool-sat`, the tier window)
-#       must sit inside the read/compose block — from the `.pool-sat` read guard through the last `_sat_said=`
-#       line — or be a `_why_none=` assignment, and none may precede the read. A claim routed through a second
-#       variable, a continuation line, or a verb that is not an echo violates (2) with no verb list involved.
+# ⛔ WHAT THIS PROPERTY IS, EXACTLY (review cycles 68-71). Six cycles were spent replacing one forbidden-WORDING
+# list with a slightly better list. Cycle 70 replaced it with two rules and a reviewer still broke both, and the
+# lesson is now measured rather than suspected: ANY predicate over a line's SHAPE is a list — the three-verb prefix
+# list, the four-name wording list, and (cycle 70) a print-line TEXT pin, which a claim injected into a variable's
+# VALUE rides straight through (`_inst_said="… — a tier was clipped"`: 167/0, and it prints). So the guarantee is
+# split into the two things that are actually finite:
+#
+#   (1) WHAT THE PIPELINE PRINTS IS PINNED — reported in the OUTPUT-PIN section at the end of this file, once
+#       every arm has been driven. That is the real invariant: an operator can only be misled by text that is
+#       EMITTED. It covers a claim on a print line, in a channel's value, printed by `cat`, by a brace group, by a
+#       helper function, from inside a quoted `#` line, or through a widened region — none of which any source
+#       predicate can enumerate. Scope, stated honestly: it covers every case THIS SUITE DRIVES (§14 drives each
+#       state arm), and a reformat that does not change output does not red it.
+#   (2) THE RECORD'S NAMES LIVE IN ONE REGION, IN ONE SHAPE — here. This is the source-side safety net for text
+#       naming the record that no drive may reach. It is a rule about NAMES, not wordings: a line naming the
+#       record must be read-block plumbing, a `_sat_said=` composition, or a `_why_none=` composition, and it may
+#       not precede the read. The shape allowlist is anchored at the start of the line, so a record name spelled
+#       inside a string (`cat <<< '… _why_none=" …'`) is not exempt, and a print of any kind inside the region is
+#       not exempt either (measured: a `cat <<<` naming the record right after `_sat_said=""` printed on the
+#       DRAINED arm — the arm §14 asserts must stay silent — and stayed 167/0 under cycle 70's position-only rule).
 # Both detectors are FAIL-CLOSED through `_awk_gate`: a detector that cannot run reports DETECTOR-FAILED and reds,
 # never silence (review P2: an awk that rejects its program used to yield empty output, which read as clean).
 _awk_gate() { # $1=awk program, rest=files (the region detector reads its file TWICE) -> stdout = findings; rc 2 = the DETECTOR failed (never a clean read)
@@ -564,121 +569,79 @@ _awk_gate() { # $1=awk program, rest=files (the region detector reads its file T
   printf '%s' "$_ag_o"
   return 0
 }
-_pop_prog='{ line = $0; sub(/^[ \t]+/, "", line); if (line ~ /^(echo|printf|queue_order_refuse)[ (]/) print line }'
+# ⛔ THE ALLOWLIST IS OVER LINE SHAPES, ANCHORED AT THE LINE START — and it is checked against EVERY shape the
+# shipped code actually uses, so a new shape is a deliberate edit here rather than a silent exemption.
 _region_prog='
 FNR == NR {
   if (!_r1s && /\[ -e "\$o\/\.pool-sat" \]/) _r1s = FNR
   if (!_read_at && /^  _sat=""; _sat_junk=0/) _read_at = FNR
-  if (/_sat_said="/) _r1e = FNR
   next
 }
 { line = $0; sub(/^[ \t]+/, "", line) }
 line ~ /^#/ { next }
-line ~ /_why_none="/ {
-  if (!_read_at || FNR < _r1s) print "why-none-before-read " FNR ": " substr(line, 1, 60)
+line !~ /pool-sat|tier-window|tier window|window record/ { next }
+line ~ /^(if|elif) \[/ {
+  if (!_r1s || FNR < _r1s) print "before-read " FNR ": " substr(line, 1, 70)
   next
 }
-line ~ /pool-sat|tier-window|tier window|window record/ {
-  if (_r1s && _r1e && FNR >= _r1s && FNR <= _r1e) next
-  print "outside-region " FNR ": " substr(line, 1, 70)
-}'
-_pop_pin='794523629 1217193846 3449875175 1246035678 1484820831 3614574003 2367692148 2406618603 2471640373 3256525803 3493478597 2071418210 383261823 2177402208 2841344729 3656594574 1369661817 3280589147 2030608365 2580804388'
-_pop_lines="$(_awk_gate "$_pop_prog" "$FNS")"; _pop_rc=$?
+line ~ /^(el)?if _sat_(raw|notopen|unread|junk|tier)=/ { next }
+line ~ /^_sat_(raw|notopen|unread|junk|tier)=/ { next }
+line ~ /^(\*\)|[a-z]+\)) *(_sat_said|_why_none)="/ {
+  if (line ~ /_why_none="/ && (!_read_at || FNR < _r1s)) print "why-none-before-read " FNR ": " substr(line, 1, 70)
+  next
+}
+line ~ /^_sat_said="/ || line ~ /^_why_none="/ {
+  if (line ~ /_why_none="/ && (!_read_at || FNR < _r1s)) print "why-none-before-read " FNR ": " substr(line, 1, 70)
+  next
+}
+line ~ /^\[ .* \] && _sat_said="/ { next }
+{ print "outside-region-or-shape " FNR ": " substr(line, 1, 70) }'
 _pop_bad="$(_awk_gate "$_region_prog" "$FNS" "$FNS")"; _reg_rc=$?
-if [ "$_pop_rc" -ne 0 ]; then
-  rc=1; echo "      the operator-population detector could not run: $_pop_lines"
-elif [ "$_reg_rc" -ne 0 ]; then
+if [ "$_reg_rc" -ne 0 ]; then
   rc=1; echo "      the record-region detector could not run: $_pop_bad"
-elif [ -z "$_pop_lines" ]; then
-  rc=1; echo "      the operator population came back EMPTY — nothing to pin, so this check grades nothing"
-else
-  _pop_n="$(printf '%s\n' "$_pop_lines" | wc -l | tr -d ' ')"
-  _pop_pin_n="$(printf '%s\n' $_pop_pin | wc -l | tr -d ' ')"
-  _pop_got="$(printf '%s\n' "$_pop_lines" | while IFS= read -r _pl; do printf '%s\n' "$(printf '%s' "$_pl" | cksum | cut -d' ' -f1)"; done | tr '\n' ' ' | sed 's/ $//')"
-  if [ "$_pop_n" != "$_pop_pin_n" ]; then
-    rc=1; echo "      the OPERATOR POPULATION changed size ($_pop_pin_n pinned, $_pop_n found) — a line was added to or removed from what these functions print; if that is deliberate, re-pin _pop_pin"
-  elif [ "$_pop_got" != "$_pop_pin" ]; then
-    rc=1; _pi=0
-    for _pv in $_pop_pin; do
-      _pi=$((_pi + 1))
-      [ "$(printf '%s' "$_pop_got" | cut -d' ' -f"$_pi")" = "$_pv" ] && continue
-      echo "      operator line #$_pi CHANGED (pinned CRC $_pv, now $(printf '%s' "$_pop_got" | cut -d' ' -f"$_pi")): $(printf '%s\n' "$_pop_lines" | sed -n "${_pi}p" | head -c 150)"
-      break
-    done
-  elif [ -n "$_pop_bad" ]; then
-    rc=1; echo "      the record is spoken about OUTSIDE the read/compose region (or before the read): $(printf '%s' "$_pop_bad" | tr '\n' '|' | head -c 400)"
-  else rc=0; fi
-fi
-ck "the record's NAMES are confined to the read/compose block and the _why_none assignments, and the OPERATOR POPULATION is pinned line-for-line (no wording list involved)" $rc
+elif [ -n "$_pop_bad" ]; then
+  rc=1; echo "      the record is NAMED outside the read/compose plumbing and shapes (or before the read): $(printf '%s' "$_pop_bad" | tr '\n' '|' | head -c 400)"
+else rc=0; fi
+ck "the record's NAME appears only in the read block and the _sat_said/_why_none compositions, never before the read (a print of any kind inside the region is not exempt)" $rc
 
-# ⛔ NON-VACUITY, one mutant per mechanism — a CRUCIAL word: each mutates a COPY of the shipped function text and
-# requires the rule it targets to red. The first two mutate PROSE NO WORDING LIST CONTAINS, which is the point.
-_mk_pop_mut() { # $1=name $2=sed program -> path on stdout
-  _mp_out="$TMP/fns-$1.sh"
-  sed "$2" "$FNS" > "$_mp_out" 2>/dev/null
-  printf '%s' "$_mp_out"
-}
-_popred() { # $1=file -> 0 when the population rule REDS on that file
-  _pr_rc=0
-  _pr_lines="$(_awk_gate "$_pop_prog" "$1")" || return 1
-  _pr_n="$(printf '%s\n' "$_pr_lines" | wc -l | tr -d ' ')"
-  _pr_got="$(printf '%s\n' "$_pr_lines" | while IFS= read -r _pl; do printf '%s\n' "$(printf '%s' "$_pl" | cksum | cut -d' ' -f1)"; done | tr '\n' ' ' | sed 's/ $//')"
-  [ "$_pr_n" = "$_pop_pin_n" ] && [ "$_pr_got" = "$_pop_pin" ] && return 1
-  return 0
-}
+# ⛔ NON-VACUITY for the names rule — one mutant per hole a reviewer actually found in cycle 70, each mutating a
+# COPY of the shipped function text. The first three place a record-naming PRINT INSIDE the region, which cycle
+# 70's position-only rule exempted wholesale.
 _regred() { # $1=file -> 0 when the region rule REDS on that file
   _rr_out="$(_awk_gate "$_region_prog" "$1" "$1")" || return 1
   [ -n "$_rr_out" ]
 }
-# (a) prose appended INSIDE an installed arm, with NO record name and NO known claim wording
-_m1="$(_mk_pop_mut inline-noname 's/(this is NOT a drained queue)\$_sat_said"/(this is NOT a drained queue) — a tier was clipped$_sat_said"/')"
-if ! cmp -s "$FNS" "$_m1" 2>/dev/null && _popred "$_m1"; then rc=0
-else rc=1; echo "      an appended claim that names NEITHER the record NOR any known wording did not red the population pin (mutation applied: $(cmp -s "$FNS" "$_m1" 2>/dev/null && echo NO || echo yes))"; fi
-ck "non-vacuity: ' — a tier was clipped' appended to an installed arm reds the POPULATION pin (no wording list)" $rc
+_m_e="$TMP/fns-region-cat.sh"
+awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  cat <<< \"[refresh] queue order: the .pool-sat tier-window record says a tier was clipped\"" }' "$FNS" > "$_m_e"
+if ! cmp -s "$FNS" "$_m_e" 2>/dev/null && _regred "$_m_e"; then rc=0
+else rc=1; echo "      a record-naming cat INSIDE the region did not red the names rule (cycle 70 exempted it by position alone)"; fi
+ck "non-vacuity: a record-naming PRINT inside the region reds the names rule (position alone is not an exemption)" $rc
 
-# (b) prose appended to a REFUSAL arm — the arm that returns before the read (the historical family)
-_m2="$(_mk_pop_mut refuse-inline 's/not as arrival order either"/not as arrival order either — a tier was clipped"/')"
-if ! cmp -s "$FNS" "$_m2" 2>/dev/null && _popred "$_m2"; then rc=0
-else rc=1; echo "      the clause appended to the priority-unreadable arm did not red the population pin"; fi
-ck "non-vacuity: the same claim on a REFUSAL arm (which returns before the read) reds the POPULATION pin" $rc
+_m_i="$TMP/fns-region-hash.sh"
+awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  cat <<< \"[refresh] queue order: a tier was clipped\\n# the tier-window record says so\"" }' "$FNS" > "$_m_i"
+if ! cmp -s "$FNS" "$_m_i" 2>/dev/null && _regred "$_m_i"; then rc=0
+else rc=1; echo "      a record name behind a quoted '# the tier-window record' did not red the names rule"; fi
+ck "non-vacuity: a record name inside a quoted '#…' line reds the names rule (a comment ESCAPE is not a comment)" $rc
 
-# (c) a NEW operator line carrying a claim — the population pin is a line-for-line pin, so an added line reds
-_m3="$TMP/fns-newline.sh"
-awk '{ print; if (index($0, "does not add up to the queue")) print "      echo \"[refresh] queue order: a tier was clipped but the order still stands\"" }' "$FNS" > "$_m3"
-if ! cmp -s "$FNS" "$_m3" 2>/dev/null && _popred "$_m3"; then rc=0
-else rc=1; echo "      a NEW operator line carrying a claim did not red the population pin"; fi
-ck "non-vacuity: a NEW operator line carrying a claim reds the POPULATION pin (the pin is line-for-line)" $rc
+_m_j="$TMP/fns-region-substr.sh"
+awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  cat <<< \x27[refresh] queue order: _why_none=\" the tier-window record was clipped\x27" }' "$FNS" > "$_m_j"
+if ! cmp -s "$FNS" "$_m_j" 2>/dev/null && _regred "$_m_j"; then rc=0
+else rc=1; echo "      a record name whose line merely CONTAINS _why_none=\" did not red the names rule — the exemption is a substring test"; fi
+ck "non-vacuity: a line merely CONTAINING the assignment spelling is not exempt — the exemption is anchored, not a substring" $rc
 
-# (d) a claim composed into a SECOND variable: no operator line is touched, only an added assignment — the region
-# rule sees it, and a verb/expansion allowlist over echo lines cannot
-_m4="$TMP/fns-secondvar.sh"
-awk '{ print; if (index($0, "_sat=\"\"; _sat_junk=0")) print "  _sat_extra_said=\" — the .pool-sat record was stale\"" }' "$FNS" > "$_m4"
-if ! cmp -s "$FNS" "$_m4" 2>/dev/null && _regred "$_m4"; then rc=0
-else rc=1; echo "      a record claim composed into a SECOND variable did not red the region rule"; fi
-ck "non-vacuity: a record claim in a SECOND variable reds the REGION rule (no verb list involved)" $rc
+_m_k="$TMP/fns-region-other.sh"
+awk '{ print; if (index($0, "does not add up to the queue")) print "  _other=\"the tier window was clipped\"" }' "$FNS" > "$_m_k"
+if ! cmp -s "$FNS" "$_m_k" 2>/dev/null && _regred "$_m_k"; then rc=0
+else rc=1; echo "      a record name in an unrelated assignment OUTSIDE the region did not red the names rule"; fi
+ck "non-vacuity: a record name in an unrelated variable outside the region reds the names rule" $rc
 
-# (e) a claim on an echo CONTINUATION line — the line the claim sits on does not begin with a verb
-_m5="$TMP/fns-contline.sh"
-awk '{ print; if (index($0, "does not add up to the queue")) print "      \" — the tier-window record was stale\"" }' "$FNS" > "$_m5"
-if ! cmp -s "$FNS" "$_m5" 2>/dev/null && _regred "$_m5"; then rc=0
-else rc=1; echo "      a claim on an echo CONTINUATION line did not red the region rule"; fi
-ck "non-vacuity: a claim on a CONTINUATION line reds the REGION rule" $rc
+_m_l="$TMP/fns-region-preread.sh"
+awk '{ if (index($0, "priority-unreadable: the queue order could NOT")) print "    echo \"[refresh] the tier-window record may be stale\""; print }' "$FNS" > "$_m_l"
+if ! cmp -s "$FNS" "$_m_l" 2>/dev/null && _regred "$_m_l"; then rc=0
+else rc=1; echo "      a record mention placed BEFORE the read block did not red the names rule"; fi
+ck "non-vacuity: a record mention BEFORE the read reds the names rule" $rc
 
-# (f) a claim printed by a verb that is not an echo
-_m6="$TMP/fns-otherverb.sh"
-awk '{ print; if (index($0, "does not add up to the queue")) print "      cat <<< \"[refresh] queue order: the tier-window record was stale\"" }' "$FNS" > "$_m6"
-if ! cmp -s "$FNS" "$_m6" 2>/dev/null && _regred "$_m6"; then rc=0
-else rc=1; echo "      a claim printed by cat did not red the region rule"; fi
-ck "non-vacuity: a claim printed by a NON-ECHO verb reds the REGION rule" $rc
-
-# (g) a mention BEFORE the read — the refusal arms' property
-_m7="$TMP/fns-preread.sh"
-awk '{ if (index($0, "priority-unreadable: the queue order could NOT")) print "    echo \"[refresh] the tier-window record may be stale\""; print }' "$FNS" > "$_m7"
-if ! cmp -s "$FNS" "$_m7" 2>/dev/null && _regred "$_m7"; then rc=0
-else rc=1; echo "      a record mention placed BEFORE the read block did not red the region rule"; fi
-ck "non-vacuity: a record mention BEFORE the read reds the REGION rule" $rc
-
-# (h) the detectors are FAIL-CLOSED: an awk that rejects its own program must report, not return silence
+# (h) the detector is FAIL-CLOSED: an awk that rejects its own program must report, not return silence
 _out="$(_awk_gate 'BEGIN { if (' "$FNS")"; _orc=$?
 if [ "$_orc" -eq 2 ] && printf '%s' "$_out" | grep -q 'DETECTOR-FAILED'; then rc=0
 else rc=1; echo "      a detector that could not run returned rc=$_orc and '$(printf '%s' "$_out" | head -c 80)' — silence would read as clean"; fi
@@ -2966,6 +2929,153 @@ if cmp -s "$FNS" "$MUT_NOSAT2" 2>/dev/null; then rc=1; echo "      the _sat_said
        || grep -qiE 'ended FULL|NEWEST members' "$_d/out-mut" 2>/dev/null; then rc=1; echo "      the mutated source STILL named the window (token or prose) — the check grades the file, not the code"; else rc=0; fi
 fi
 ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappears (the checks can fail)" $rc
+
+# ══ THE OUTPUT PIN — WHAT THE PIPELINE ACTUALLY PRINTS (review P1s, cycle 71) ═════════════════════════════
+# ⛔ THIS IS THE PROPERTY THE WHOLE SECTION EXISTS FOR, AND IT IS THE ONLY ONE THAT IS FINITE. Every earlier rule
+# was a predicate over SOURCE SHAPE, and a reviewer broke each in turn — a claim appended to a print line, a claim
+# in a channel's VALUE (`_inst_said`, `_wrote_said`: 167/0 and it printed), a claim from a NEW print path (`cat`,
+# `{ echo … >&2; }`, a helper function), a claim behind a quoted `#`, a claim exempted by a substring. None of
+# that is enumerable. What IS finite is the set of cases this suite drives and the bytes each one emits on the
+# operator's stdout/stderr — so the emitted text of every driven case is pinned here, normalized for the sandbox
+# path and nothing else. Any prose reaching the operator, by any mechanism, changes one of these CRCs.
+# SCOPE, STATED (so this is not a claim it cannot keep):
+#   * it covers every case THIS SUITE DRIVES — §14 and §6 drive each state arm and each refusal;
+#   * it does not red a source edit that changes no output, which is correct: a reformat cannot mislead an operator;
+#   * three cases are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
+#     running this suite twice (once as cmux, once as root): arm-clip-unread, mh-mode000, sa-unreadable. Root can read a mode-000 file, so those
+#     fixtures take a different branch; they stay graded by the assertions above, and excluding them here keeps the
+#     pin from turning "you ran as root" into a false red. A `case` count difference still reds, so a NEW fixture is
+#     always visible even if its output happens to duplicate a pinned one.
+_out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI dropped)
+  sed -e "s|$TMP/[A-Za-z0-9._-]*|ROOT|g" -e "s|$TMP|ROOT|g" -e 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null
+}
+# ⛔ THE THREE UID-DEPENDENT CASES ARE EXCLUDED FROM BOTH HALVES OF THE PIN (see the scope note above): root can
+# read a mode-000 file, so these fixtures take a different branch and their text is legitimately different. They
+# stay graded by the assertions above; the pin stays silent about them rather than turning "you ran as root" into a
+# false red. Every OTHER case — including any fixture added later — is pinned.
+_out_uid_excluded='arm-clip-unread mh-mode000 sa-unreadable'
+_out_map() { # the pinned population: "<case>=<crc>" per driven case, sorted
+  for _od in "$TMP"/*/; do
+    _on="${_od%/}"; _on="${_on##*/}"
+    [ -s "$_od/out" ] || continue
+    case " $_out_uid_excluded " in *" $_on "*|*" $_on "*) continue ;; esac
+    _out_norm "$_od/out" | awk -v n="$_on" 'BEGIN { } { printf "%s\n", $0 }' > "$TMP/.outnorm.$$.$_on" 2>/dev/null || continue
+    printf '%s=%s\n' "$_on" "$(cksum < "$TMP/.outnorm.$$.$_on" | cut -d' ' -f1)"
+    rm -f "$TMP/.outnorm.$$.$_on"
+  done | sort
+}
+_out_unique() { # the same map over the DRIVER-BUILT outputs only, deduped by content (many fixtures share an arm)
+  _out_map | cut -d= -f2 | sort -u | tr '\n' ' ' | sed 's/ $//'
+}
+# ⛔ THE PIN. `case=crc` for every driven case, and the deduped set of distinct outputs, which is the coarse half:
+# a NEW case whose output duplicates an existing one cannot hide, and a sentence change moves the distinct set.
+_out_pin='arm-clip-devnull=132483589|arm-clip-dir=132483589|arm-clip-nonl=3407422058|arm-clip-nul=4222849383|arm-clip-nulmid=4222849383|arm-drained-clip-mut=1359919113|arm-drained-clip=273058056|arm-refuse-clip=1503384811|arm-refuse-mv=3598440741|arm-refuse-rowset=1567885012|arm-unranked-absent-mut=3696837072|arm-unranked-absent=1943905615|arm14-head=55288939|arm14-severity=1039870059|arm14-totals=2163807204|arm14-uncounted=1336462602|arm14-warn=3086333297|arm14mut-head=1296039546|arm14mut-severity=2810210006|arm14mut-totals=10164873|arm14mut-uncounted=2763562739|arm14mut-warn=3325294582|count-bad-totals=1102770011|count-bad=3104242257|count-drained=273058056|count-foreign-head=3025506656|count-foreign-zero=1053290514|count-gone=3104242257|count-good=1017492502|count-identical=4111658287|count-satcount-gone-mut=3104242257|count-satcount-gone=1187418021|count-satcount-head-mut=3025506656|count-satcount-head=657909655|count-satcount-totals-mut=1102770011|count-satcount-totals=1954371651|count-state-bad-totals=1102770011|count-state-drained=273058056|count-state-foreign-head=3025506656|count-state-foreign-zero=1053290514|count-state-gone=3104242257|count-state-good=1017492502|count-state-none=1943905615|count-state-rev=3123583493|dupnone=2058117218|empty=3865464101|member=1400623074|mh-absent=4029380213|mh-coerce=1460607088|mh-drained=964254667|mh-garbage-refused=105719062|mh-garbage-rev=1840396944|mh-garbage-unranked=2380626246|mh-garbage=1151312335|mh-hw-dir-priority-unreadable=2561788194|mh-hw-dir-severity=4029380213|mh-hw-drained-priority-unreadable=468363226|mh-hw-drained-severity=964254667|mh-hw-garbage-priority-unreadable=105719062|mh-hw-garbage-severity=1151312335|mh-hw-wcfailg-priority-unreadable=2467777652|mh-hw-wcfailg-severity=632953760|mh-revert=605356615|mh-rows=1686707371|mh-unranked-judged=4272221706|mh-unranked-own=2620396432|mh-unranked=3363606256|mh-unreadable=4029380213|mh-wcfail2=1334011946|mh-wcfail=1334011946|mh-wcfailg=632953760|mh-witrev=2241773645|mhr-real-refused=2215093811|mhr-real-unranked=1531456368|mut-droptail=2645416213|mut-member=882446226|mut-nocount=4056022816|nonnum2=3178247719|nonnum=1407898517|nopool=4092273942|norank2=2755054736|norank=2755054736|poolguards-mut=2928854713|prunerace-empty=1567885012|prunerace=1567885012|rank=4021605358|ranked=4245042416|rowset=3718680511|sa-absent=1025215466|sa-coerce=3512885538|sa-dir=1025215466|sa-drained=4253467874|sa-garbage=90999151|sa-headkey=4292339760|sa-unreadable-depth=4292339760|sa-wcfail=263720862|sa-withhead=286439349|sat-mut=4021605358|sat=4021605358|tail=2809272230|witness=4021605358'
+_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1102770011 1151312335 1187418021 1296039546 132483589 1334011946 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1531456368 1567885012 1686707371 1840396944 1943905615 1954371651 2058117218 2163807204 2215093811 2241773645 2380626246 2467777652 2561788194 2620396432 263720862 2645416213 273058056 2755054736 2763562739 2809272230 2810210006 286439349 2928854713 3025506656 3086333297 3104242257 3123583493 3178247719 3325294582 3363606256 3407422058 3512885538 3598440741 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4092273942 4111658287 4222849383 4245042416 4253467874 4272221706 4292339760 468363226 55288939 605356615 632953760 657909655 882446226 90999151 964254667'
+_out_got="$(_out_map)"
+_out_distinct="$(_out_unique)"
+if [ "${RANK_QUEUE_PIN_REPORT:-0}" = "1" ]; then
+  printf 'PIN-CASES>>>%s<<<\n' "$(printf '%s' "$_out_got" | tr '\n' '|')"
+  printf 'PIN-DISTINCT>>>%s<<<\n' "$_out_distinct"
+fi
+if [ -z "$_out_got" ] || [ -z "$_out_distinct" ]; then
+  rc=1; echo "      NO driven case produced output — the output pin would grade nothing"
+elif [ "$_out_distinct" != "$_out_distinct_pin" ]; then
+  _want="$(printf '%s\n' $_out_distinct_pin | wc -l | tr -d ' ')"; _have="$(printf '%s\n' $_out_distinct | wc -l | tr -d ' ')"
+  rc=1; echo "      the set of DISTINCT operator outputs changed ($_want pinned, $_have now) — prose reached the operator:"
+  for _oc in $(printf '%s' "$_out_got" | cut -d= -f1); do
+    _oc_crc="$(printf '%s' "$_out_got" | grep -m1 "^$_oc=" | cut -d= -f2)"
+    printf '%s\n' $_out_distinct_pin | grep -qx "$_oc_crc" || echo "        case $_oc emits an output no pinned case produces: $(head -3 "$TMP/$_oc/out" 2>/dev/null | tr '\n' '|' | head -c 300)"
+  done
+elif [ "$_out_got" != "$(printf '%s' "$_out_pin" | tr '|' '\n')" ]; then
+  rc=1; echo "      a driven case's operator output changed:"
+  while IFS= read -r _oline; do
+    _oc="${_oline%%=*}"
+    printf '%s\n' "$(printf '%s' "$_out_pin" | tr '|' '\n')" | grep -qx "$_oline" && continue
+    echo "        case $_oc: $(head -3 "$TMP/$_oc/out" 2>/dev/null | tr '\n' '|' | head -c 300)"
+  done <<EOF
+$_out_got
+EOF
+  echo "        (pin cases: $(printf '%s' "$_out_pin" | tr '|' ' ' | head -c 200)…)"
+else rc=0; fi
+ck "the EMITTED text of every driven case is pinned (a claim reached the operator by SOME mechanism, or none did)" $rc
+
+# ⛔ NON-VACUITY for the output pin — the mechanisms that beat every source predicate, each required to red.
+# The witness drives the SAME fixture §1 uses (pool '200,300' over queue '300,9,200': both ranked, so the
+# severity arm — the one that prints `$_inst_said` and the head — is the arm under test), with a mutated copy of
+# the shipped function text, and compares the emitted bytes against the PINNED crc for that case.
+_rank_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | grep -m1 '^rank=' | cut -d= -f2)"
+_outred2() { # $1=mutated source -> 0 when the emitted text differs from the pinned 'rank' case
+  _om_d="$TMP/outpin-mut"; rm -rf "$_om_d"; mkdir -p "$_om_d/o"
+  printf '300\n9\n200\n' > "$_om_d/o/candidates.txt"
+  printf '200\n300\n' > "$_om_d/o/.pool"
+  { drive_prologue; cat "$1"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_om_d/drive.sh"
+  ( cd "$_om_d" && HOME="$_om_d" bash drive.sh "$_om_d/o" ) > "$_om_d/out" 2>&1
+  [ -n "$_rank_pin" ] && [ "$(_out_norm "$_om_d/out" | cksum | cut -d' ' -f1)" != "$_rank_pin" ]
+}
+# the shipped source must reproduce the pinned case exactly — otherwise every witness below proves nothing
+_m_base="$TMP/fns-outpin-base.sh"; cp "$FNS" "$_m_base" 2>/dev/null
+if [ -z "$_rank_pin" ] || _outred2 "$_m_base"; then
+  rc=1; echo "      the SHIPPED source does not reproduce the pinned 'rank' output — the witnesses below would red for the wrong reason"
+else rc=0; fi
+ck "the output pin reproduces the shipped 'rank' case byte-for-byte (its witnesses are anchored on a case that really runs)" $rc
+
+# (A2) a claim in a CHANNEL's VALUE — no print line changes, so only the emitted text can see it. The channel is
+# `_wrote_said`, printed on the UNRANKED arm, so this witness runs its own fixture (pool '9' over queue '5,7':
+# the pool ranks none of it) and requires BOTH that the shipped run reproduces a PINNED output and that the
+# mutated run differs from it — the wiring and the discrimination in one check.
+_outrun() { # $1=source $2=queue $3=pool -> crc of the normalized emitted text
+  _rf_d="$TMP/outpin-run"; rm -rf "$_rf_d"; mkdir -p "$_rf_d/o"
+  printf '%s' "$2" > "$_rf_d/o/candidates.txt"; printf '%s' "$3" > "$_rf_d/o/.pool"
+  { drive_prologue; cat "$1"; printf 'queue_order_from_pool "$1"\n'; printf 'exit 0\n'; } > "$_rf_d/drive.sh"
+  ( cd "$_rf_d" && HOME="$_rf_d" bash drive.sh "$_rf_d/o" ) > "$_rf_d/out" 2>&1
+  _out_norm "$_rf_d/out" | cksum | cut -d' ' -f1
+}
+_m_a2="$TMP/fns-outpin-value.sh"
+sed 's/_wrote_said="candidates.txt was left UNTOUCHED/_wrote_said="CLAIM — candidates.txt was left UNTOUCHED/' "$FNS" > "$_m_a2"
+_a2_ship="$(_outrun "$FNS" '5
+7
+' '9
+')"
+_a2_mut="$(_outrun "$_m_a2" '5
+7
+' '9
+')"
+if cmp -s "$FNS" "$_m_a2" 2>/dev/null; then
+  rc=1; echo "      the channel-value mutation did not apply — its anchor drifted"
+elif ! printf '%s\n' $_out_distinct_pin | grep -qx "$_a2_ship"; then
+  rc=1; echo "      the shipped unranked fixture emits an output that is NOT among the pinned ones ($_a2_ship) — the witness is not wired to the pin"
+elif [ "$_a2_ship" != "$_a2_mut" ]; then rc=0
+else rc=1; echo "      a claim in a channel VALUE (_wrote_said) did not change the emitted text — the pin cannot see it"; fi
+ck "non-vacuity: a claim in a CHANNEL VALUE reds the output pin (no print line changed, output pinned)" $rc
+
+# (B) a claim from a NEW print path — a bare `cat` line inside the arm
+_m_b="$TMP/fns-outpin-cat.sh"
+awk '{ print; if (index($0, "severity-first from the pool")) print "    cat <<< \"[refresh] queue order: and a tier was clipped\"" }' "$FNS" > "$_m_b"
+if ! cmp -s "$FNS" "$_m_b" 2>/dev/null && _outred2 "$_m_b"; then rc=0
+else rc=1; echo "      a claim printed by a NEW cat line did not red the output pin"; fi
+ck "non-vacuity: a claim from a NEW print path (cat) reds the output pin" $rc
+
+# (C) a claim through a brace group onto STDERR — a verb-prefix list never sees it
+_m_c="$TMP/fns-outpin-brace.sh"
+awk '{ print; if (index($0, "severity-first from the pool")) print "    { echo \"[refresh] queue order: a tier was clipped\" >&2; }" }' "$FNS" > "$_m_c"
+if ! cmp -s "$FNS" "$_m_c" 2>/dev/null && _outred2 "$_m_c"; then rc=0
+else rc=1; echo "      a claim on stderr via a brace group did not red the output pin"; fi
+ck "non-vacuity: a claim on STDERR via a brace group reds the output pin" $rc
+
+# (D) a claim printed by a HELPER FUNCTION — the printing line is not in the function under study at all
+_m_d="$TMP/fns-outpin-helper.sh"
+awk '{ if (index($0, "severity-first from the pool")) print "    _say_clip() { echo \"[refresh] queue order: a tier was clipped\"; }"; print; if (index($0, "severity-first from the pool")) print "    _say_clip" }' "$FNS" > "$_m_d"
+if ! cmp -s "$FNS" "$_m_d" 2>/dev/null && _outred2 "$_m_d"; then rc=0
+else rc=1; echo "      a claim printed by a helper function did not red the output pin"; fi
+ck "non-vacuity: a claim printed by a HELPER FUNCTION reds the output pin" $rc
+
+# ⛔ AND THE PIN IS NOT OVER-BROAD: a source reformat that changes NO output must stay green. This is the other
+# half of the property — a pin that reds on whitespace would block correct work, which is how a gate gets bypassed.
+_m_k="$TMP/fns-outpin-reformat.sh"
+sed 's/^    echo "\[refresh\] queue order: severity-first/      echo   "[refresh] queue order: severity-first/' "$FNS" > "$_m_k"
+if ! cmp -s "$FNS" "$_m_k" 2>/dev/null && ! _outred2 "$_m_k"; then rc=0
+else rc=1; echo "      a whitespace-only reformat changed the emitted text (applied: $(cmp -s "$FNS" "$_m_k" 2>/dev/null && echo NO || echo yes)) — the pin is over-broad"; fi
+ck "the output pin does NOT red a reformat that changes no output (it grades emitted text, not source layout)" $rc
 
 echo "── rank-queue: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1
