@@ -588,6 +588,22 @@ ck "f53 a DUPLICATE state= is DUPLICATE-KEY, not a silent last-one-wins substitu
 # gets success from a run that validated nothing.
 ck "f54 a bare invocation (no verb) is rc 2, never a silent success" \
    '[ "$(run_reader_rc "$T/severbad.conf" "")" = 2 ]'
+# ⛔ THE LAST LINE WITHOUT A TRAILING NEWLINE IS THE SILENT-SHRINK P1 (sweep at `30642f708`, P1).
+# `read` returns NON-ZERO at EOF even though it filled `$line`, so `while IFS= read -r line` alone never
+# sees a final line with no `\n` — and the reader then certifies a SHORTER set at rc 0. This is `#2281`
+# itself ("the second repo's queue was read by nothing at all") reproduced by a one-token deletion.
+# Measured on a 2-repo file whose last byte is not a newline:
+#     shipped : OK — 2 repo(s)  rc 0   PR_DOCTOR_REPOS carries BOTH entries
+#     deleted : OK — 1 repo(s)  rc 0   wrapper logs `grading 1 repo(s)`, exit 0, no warning anywhere
+# ⛔ EVERY OTHER FIXTURE IN THIS FILE ENDS IN A NEWLINE, which is why nothing saw it. This is the only
+# arm that writes a set the way a hand-edited or `printf`-generated file plausibly can.
+# (`tests/admin-merge/run.sh` pins the same construct for `#1319` in another file; this is the reader.)
+printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/st\nslug=daniel-ospina/agent-infra checkout=%s state=%s/st2' \
+  "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/no-final-nl.conf"
+ck "f55 a set whose LAST line has no trailing newline is read WHOLE — 2 entries, not 1" \
+   'o="$(run_reader "$T/no-final-nl.conf" list)"; [ "$(run_reader_rc "$T/no-final-nl.conf" check)" = 0 ] && [ "$(grep -c . <<<"$o")" = 2 ] && grep -q "OK — 2 repo(s)" <<<"$(run_reader "$T/no-final-nl.conf" check)"'
+ck "f56 …and both entries reach PR_DOCTOR_REPOS, not just the first" \
+   'o="$(run_reader "$T/no-final-nl.conf" doctor-repos)"; case "$o" in *,daniel-ospina/agent-infra=*) : ;; *) false ;; esac'
 # ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
 # The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
 # `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
