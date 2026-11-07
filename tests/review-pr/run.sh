@@ -439,6 +439,9 @@ reset() {
   FIXTURE_LIVE_HEAD_AT_RECORD=""
   FIXTURE_PIN_UNCHECKABLE=0
   FIXTURE_PI_SLEEP=""
+  # The reviewer's model pair (agent-infra#2208/#3413): empty means "let the seam resolve its own
+  # defaults", which is what every scenario except §A5 wants.
+  FIXTURE_LANE_PROVIDER=""; FIXTURE_LANE_MODEL=""
   FIXTURE_COMMENT_RC=0
   unset RECORDER_OVERRIDE GH_REPO RUN_LC_ALL REVIEW_PR_MIN_TIMEOUT REVIEW_PR_KILL_GRACE
 }
@@ -455,6 +458,8 @@ run() {
     AI_REVIEW_GATE_KEY="${FIXTURE_SIGN_KEY:-}" \
     REVIEW_PR_MIN_TIMEOUT="${REVIEW_PR_MIN_TIMEOUT-}" \
     REVIEW_PR_KILL_GRACE="${REVIEW_PR_KILL_GRACE-}" \
+    PI_LANE_PROVIDER="${FIXTURE_LANE_PROVIDER-}" \
+    PI_LANE_MODEL="${FIXTURE_LANE_MODEL-}" \
     LC_ALL="${RUN_LC_ALL-}" \
     bash "$script" "$@" > "$TMP/out.txt" 2> "$TMP/err.txt"
   echo $? > "$TMP/rc"
@@ -514,6 +519,42 @@ case "$P" in *"This PR fixes the thing"*) rc=0;; *) rc=1;; esac; ck $rc "…and 
 case "$P" in *"the linked issue body"*) rc=0;; *) rc=1;; esac; ck $rc "…and the linked issue"
 case "$P" in *'web_search(model="sonar")'*) rc=0;; *) rc=1;; esac; ck $rc "…and names research rung 2 explicitly (web_search model=\"sonar\")"
 case "$(cat "$TMP/pi-argv.txt")" in *"--no-session"*) rc=0;; *) rc=1;; esac; ck $rc "…spawned with --no-session (a genuinely fresh context)"
+# ⛔ THE MODEL PAIR, DRIVEN — not grepped (P2-F of the #3413 review). This seam used to hardcode
+# `--model deepseek-v4-flash`, a LEGACY alias that answers nothing on the box: the reviewer session
+# came up, loaded every extension, and produced ZERO assistant turns while the seam exited 0 with no
+# verdict — a gate failing in the one shape a gate must never fail in. `merge-one.sh`'s `run_agent`
+# was fixed for exactly this (agent-infra#2208) and nothing pinned the sibling, so restoring the
+# literal left the whole suite green. The assertion is on the ARGV THE REVIEWER ACTUALLY RECEIVED.
+case "$(cat "$TMP/pi-argv.txt")" in
+  *"--provider deepseek --model deepseek-flash"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "…spawned on the same resolved model pair as the lane (deepseek/deepseek-flash, agent-infra#2208/#3413) — got: $(cat "$TMP/pi-argv.txt")"
+case "$(cat "$TMP/pi-argv.txt")" in
+  *"deepseek-v4-flash"*) rc=1 ;;
+  *) rc=0 ;;
+esac
+ck $rc "…and NOT the legacy alias deepseek-v4-flash (the pin that made the reviewer answer nothing)"
+
+# ── §A5 the reviewer's model pair resolves from PI_LANE_* (the lane/reviewer invariant) ───────
+# The pair is ENV-OVERRIDABLE BY DESIGN (agent-infra#2208), and the whole point of #3413's second
+# commit is that the lane and its reviewer resolve the SAME two variables. A pin on the default
+# alone would pass a seam that ignored the env entirely, so the override is driven too.
+echo; echo "§A5 the reviewer's model pair resolves from the PI_LANE_* pair"
+reset; printf 'CLEAN\n' > "$TMP/reviewer-out"
+FIXTURE_LANE_PROVIDER="zai"; FIXTURE_LANE_MODEL="qwen3.8-max"
+run "$SRC" 2284
+case "$(cat "$TMP/pi-argv.txt" 2>/dev/null)" in
+  *"--provider zai --model qwen3.8-max"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "…a PI_LANE_* override reaches the reviewer's argv (got: $(cat "$TMP/pi-argv.txt" 2>/dev/null))"
+case "$(cat "$TMP/comment.md" 2>/dev/null)" in
+  *"zai/qwen3.8-max"*) rc=0 ;;
+  *) rc=1 ;;
+esac
+ck $rc "…and the posted review comment names the RESOLVED pair, not a literal baked into the table"
+FIXTURE_LANE_PROVIDER=""; FIXTURE_LANE_MODEL=""
 
 # ── §A2 the RECORD step's own failure arms, and the --repo mode ───────────────
 # ⛔ (P2, fresh review of #2288) THREE GUARDS HAD NO ASSERTION BEHIND THEM and each could be
