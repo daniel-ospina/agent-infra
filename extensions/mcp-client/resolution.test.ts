@@ -358,14 +358,15 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
 });
 
 await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER carries the base's credentials", () => {
-  // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write, named
-  // with its repo as `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/tests/test-cell-install.sh` do
-  // (neither is in THIS repo, so both are cited by full path — a bare name resolves only on the box
-  // that wrote it). `lazy` and `timeoutMs` must be inherited: a name-level spread dropped them, which
-  // was an EAGER connect at every session start on memory-constrained cells, the failure the base
-  // entry's own `_comment` records. The base's `headers` must NOT be — `.mcp.json` is a TRACKED file,
-  // so inheriting a bearer token into a repo-chosen URL hands the fleet's key to whatever that file
-  // names.
+  // The shape `tortoise`'s own `docs/quickstart-selfhosted.md` tells a self-host user to write, spelled
+  // the way `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/tests/test-cell-install.sh` spell it.
+  // ⛔ The CITATION is the reason for the full path: that quickstart page lives in the tortoise repo,
+  // not this one, so a bare name resolves only on the box that wrote the comment. (The two
+  // pi-bootstrap files above ARE tracked here — do not read this as a claim that they are not.)
+  // `lazy` and `timeoutMs` must be inherited: a name-level spread dropped them, which was an EAGER
+  // connect at every session start on memory-constrained cells, the failure the base entry's own
+  // `_comment` records. The base's `headers` must NOT be — `.mcp.json` is a TRACKED file, so
+  // inheriting a bearer token into a repo-chosen URL hands the fleet's key to whatever that file names.
   const merged = mergeMcpLayers(
     {
       mcpServers: {
@@ -1506,6 +1507,51 @@ await test("prototype-shaped server names are rejected (the second lock, not the
     ok(!Object.hasOwn(merged, bad), `\`${bad}\` must not become a server`);
   }
   ok(merged.real, "a normal server still merges");
+});
+
+await test("a BASE layer's empty transport is stripped and dropped at the layer read, and the message says BASE", async () => {
+  // Two behaviours of `asMcpJson` were unpinned, and BOTH are load-bearing for the BASE layer only:
+  // the merge re-strips a repo layer, but a base entry is copied verbatim, so nothing downstream would
+  // catch either one. Measured before this test: deleting the `delete typed[field]` line left the suite
+  // at 68 passed / 0 failed, and so did removing the `label.startsWith("base")` message distinction —
+  // a base `{dead: {url: ""}}` then survived into the catalog while its log still said "that field is
+  // removed", and the base-specific remedy ("Fix that entry in the base config") went untested.
+  const repoDir = tempDir("mcp-basefalsy-repo-");
+  const homeDir = tempDir("mcp-basefalsy-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { mcpServers: {} });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    // `dead` declares only an EMPTY transport: it has nothing to connect to, so the layer read removes
+    // the field and then drops the entry. `ok` is the control — a healthy base entry must survive.
+    mcpServers: { dead: { url: "", lazy: true }, ok: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+  ok(cfg.mcpServers.ok, "a healthy base entry still applies");
+  ok(!("dead" in cfg.mcpServers), "a base entry whose only transport is empty is dropped, not kept as `{url: \"\"}`");
+  ok(
+    logs.some(l => l.includes('entry "dead"') && l.includes("that field is removed")),
+    `the falsy field must be reported as removed — got:\n${logs.join("\n")}`
+  );
+  ok(
+    logs.some(l => l.includes('entry "dead"') && l.includes("declares no usable transport")),
+    `and the entry must be reported as dropped — got:\n${logs.join("\n")}`
+  );
+  // ⛔ The BASE wording is not cosmetic: it is the only thing that sends the reader to the file that
+  // actually contains the entry. A repo-shaped message on a base fault sends them to edit a repo file
+  // that does not have the field.
+  ok(
+    logs.some(l => l.includes("Fix that entry in the base config")),
+    `a BASE fault must name the base config as the place to fix — got:\n${logs.join("\n")}`
+  );
 });
 
 await test("a `null` server ENTRY does not crash the session — it is dropped, with a warning", async () => {

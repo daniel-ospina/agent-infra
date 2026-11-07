@@ -973,7 +973,8 @@ export function mergeMcpLayers(
 }
 
 /**
- * A parsed `.mcp.json` must be a JSON OBJECT carrying an `mcpServers` object.
+ * A parsed `.mcp.json` must be a JSON OBJECT; `mcpServers`, WHEN PRESENT, must be an object. (An
+ * absent `mcpServers` is a layer with no servers, not a broken config — see below.)
  *
  * `JSON.parse` admits `null`, arrays and scalars, and every one of those used to pass through as a
  * "readable" layer that then contributed zero servers with NO message — so `"null"` in a repo file
@@ -1342,8 +1343,11 @@ export class McpServerManager {
   /**
    * Connect from BOTH layers: the hub's base config underneath, the repo's `.mcp.json` over it.
    *
-   * ⛔ MERGE ORDER IS `{ **base, **repo }` — the repo is LAST, so a repo FIELD wins against the base's,
-   * per server and per field. What that means in practice:
+   * ⛔ MERGE PRIORITY IS BASE-FIRST, but the `mcpServers` MERGE IS NOT A SPREAD: it comes from
+   * `mergeMcpLayers`, per server then per field. Only the non-`mcpServers` top-level keys are a plain
+   * `{ **base, **repo }` spread. Stating it as "the merge order is `{ **base, **repo }`" is the
+   * name-level replacement `mergeMcpLayers`' own header records as the FIRST bug of #3614 — do not
+   * reintroduce that framing here. In practice:
    *   * an override that sets only `timeoutMs` / `lazy` / catalog metadata keeps the base's `url`,
    *     `headers`, `oauth` and the rest — the destination and the launch are unchanged;
    *   * an override that CHANGES `url` keeps `lazy`/`timeoutMs` but **DROPS `headers`/`oauth`**, which
