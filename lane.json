@@ -1,0 +1,38 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-78-1794037563-p625489-18545a82",
+  "_sha": "59847cb14dc79d0fa4b0bdadda4f2152cbb7b691",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/opt/ai-runner-cell2-x64-1/_tmp/tmp.qwQYNtYVEs/pg.log"
+    },
+    {
+      "kind": "sha",
+      "value": "11ef0603d74fec94b3f86a48e201ca8d455f6491"
+    },
+    {
+      "kind": "worktree",
+      "value": "/opt/ai-runner-cell2-x64-1/_tmp/tmp.qwQYNtYVEs/lbwt2"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 9,
+  "ended_at": 1794037572,
+  "exit_code": 0,
+  "heartbeat_at": 1794037572,
+  "host": "cmux",
+  "issue": 78,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-78-1794037563-p625489-18545a82",
+  "lease_until": 1794038177,
+  "pid": 625489,
+  "reason": null,
+  "repo": "daniel-ospina/agent-infra",
+  "schema": 1,
+  "started_at": 1794037563,
+  "state": "DONE",
+  "tag": "78",
+  "worktree": "/opt/ai-runner-cell2-x64-1/_tmp/tmp.qwQYNtYVEs/lbwt2"
+}
