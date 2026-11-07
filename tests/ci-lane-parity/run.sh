@@ -1,5 +1,5 @@
 #!/bin/bash
-# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate-gates`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
+# shard: off pinned by its own step in BOTH lanes (ci.yml `bash-suites-gate`, ci-main `script-validate-gate` since #3174 moved it out of `script-validate`) and it drives THIS runner's fast copy - as a shard it would re-enter itself
 # tests/ci-lane-parity/run.sh — #1369 regression suite for scripts/check-ci-lane-parity.sh
 # and the one-runner design it asserts.
 #
@@ -39,15 +39,6 @@
 #      no-op gate.
 #  11. THE RUNNER'S OWN CONTRACT — `--list` prints the shard list (the same source the guard's
 #      floor reads), and it is long enough to be a real list.
-#  12. DERIVATION — the list is DISCOVERED from the tree, not enumerated (#2609), and a slice of it
-#      really covers every shard exactly once.
-#  13. THE SLICE-TO-SLICE PREMISES (#2483) — the two lanes' `matrix.shard` widths must AGREE (the
-#      rail maps `bash-suites (n)` onto `script-validate (n)` and calls it the SAME shard set, which
-#      holds only at equal widths, since slice membership is positional), and a job carrying a
-#      shard axis must set `strategy.fail-fast: false` (at GitHub's default TRUE one failing slice
-#      cancels its siblings, they report `cancelled` — NON-RED to the rail — and ~7/8 of the list
-#      runs unexecuted and unasserted while the job reads as having run). Each has its own mutant
-#      row, plus a both-widened control proving the assertion is the MISMATCH and not the number 8.
 #
 # NOTE ON STYLE: runs inside a command substitution are written as `cmd >file` + `cat file`,
 # never `OUT="$(… bash …)"` — the main-worktree-guard content walker (#1484) refuses to execute
@@ -1432,30 +1423,734 @@ echo '8ac8. A FLOW-MAPPING __proto__ KEY -> rc 2 (it must not hand the guard a n
 # `out[key] = value`, which hits Object.prototype's `__proto__` setter). Fixed at the root: the
 # parser creates OWN properties, as real YAML does. The control below proves flow mappings are still
 # READ (so this pin cannot pass merely because flow style is refused).
-#
-# ⛔ THE COUNTERPART LANE IS SYNTHETIC ON PURPOSE (review of this change, cycle 5, finding 2). These
-# two arms are about FLOW STYLE; comparing the synthetic PR document against the REAL `$MAIN` would
-# add an unrelated 8-way shard matrix on one side and no matrix on the other, which the guard now
-# REFUSES as a width divergence — and then the `__proto__` arm would pass for the width reason
-# instead of the property it names. So the main lane here is a matrix-less stub of the same shape,
-# and each arm measures exactly one thing.
-printf 'name: x\njobs: {script-validate: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}\n' \
-  >"$TMP/ci-main-flow.yml"
 printf 'name: x\non: pull_request\njobs: {__proto__: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}}\n' \
   >"$TMP/ci-pr-proto.yml"
-guard_rc "$TMP/ci-main-flow.yml" "$TMP/ci-pr-proto.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-proto.yml"
 if [ "$RC" -eq 2 ]; then
   pass "a flow-mapping __proto__ key exits 2 (the lane is not declared, so it is not covered)"
 else
   fail "a flow-mapping __proto__ key returned rc $RC (want 2 — a false PASS): $OUT"
 fi
-printf 'name: x\non: pull_request\njobs: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}\n' \
+printf 'name: x\non: pull_request\njobs: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}, {run: "bash scripts/check-ci-lane-parity.sh"}]}}\n' \
   >"$TMP/ci-pr-flowok.yml"
-guard_rc "$TMP/ci-main-flow.yml" "$TMP/ci-pr-flowok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-flowok.yml"
 if [ "$RC" -eq 0 ]; then
   pass "control: an ordinary flow-mapping job IS read (the pin above is not 'flow style is refused')"
 else
   fail "an ordinary flow-mapping job returned rc $RC (want 0): $OUT"
+fi
+
+echo ''
+echo '8ac9. STEP-vs-JOB BOUNDS AND THE MATRIX AXIS — the two ways a SLICED lane reads GREEN over a hole (#3174)'
+# ⛔ A JOB-level `timeout-minutes` trip is reported `cancelled`, which scripts/admin-merge.sh reads
+# NON-RED (`NON_RED_CONC`); a STEP-level trip is `failure`. So a job bound must sit ABOVE the sum of
+# its own step bounds, or the non-red conclusion can pre-empt the red step that actually hung. NOT
+# hypothetical: measured at #3174's review, BOTH bash-3.2 gates (ci-main.yml's `bash32-parse-guard`,
+# ci.yml's `bash32-parse`) carried a 10 min JOB bound over 10 + 5 + 5 = 20 min of steps, and nothing
+# reddened it — while `auto-file-on-failure` is `if: failure()` and does not fire for a `cancelled`
+# need, so that lane's 3.2 red signal could have gone quiet with no red AND no filed issue.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    timeout-minutes: 10\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n        timeout-minutes: 10\n      - run: bash scripts/check-ci-lane-parity.sh\n        timeout-minutes: 3\n' \
+  >"$TMP/ci-pr-bound.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-bound.yml"
+if [ "$RC" -eq 2 ] && grep -q 'timeout-minutes 10' <<<"$OUT"; then
+  pass "a job bound at/below the sum of its step bounds exits 2 (a non-red 'cancelled' could pre-empt the red step)"
+else
+  fail "a job bound at its steps' sum returned rc $RC (want 2, naming the bound): $OUT"
+fi
+# …CONTROL: the same document with the job bound ABOVE the sum is accepted, so the arm above cannot
+# pass merely because every job is refused.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n        timeout-minutes: 10\n      - run: bash scripts/check-ci-lane-parity.sh\n        timeout-minutes: 3\n' \
+  >"$TMP/ci-pr-bound-ok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-bound-ok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "control: the same job with a bound ABOVE its steps' sum is accepted"
+else
+  fail "a correct job bound returned rc $RC (want 0): $OUT"
+fi
+
+# ⛔ AND DELETING ONE STEP BOUND MUST BE CAUGHT, because it is the cheapest way to re-open the whole
+# class: the hang then trips the JOB bound (`cancelled`, NON-RED) and `auto-file-on-failure` is
+# `if: failure()`, so nothing is even filed. Measured (review cycle 2, mutation A) — deleting the
+# shard step's own bound from the live job left the guard GREEN.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    timeout-minutes: 30\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n        timeout-minutes: 3\n' \
+  >"$TMP/ci-pr-nostepbound.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-nostepbound.yml"
+if [ "$RC" -eq 2 ] && grep -q 'carry NO finite step bound' <<<"$OUT"; then
+  pass "a step with NO bound inside a bounded job exits 2 (it would silently fall back to the non-red job trip)"
+else
+  fail "an unbounded step in a bounded job returned rc $RC (want 2): $OUT"
+fi
+
+# ⛔ AND THE RULE IS REPO-WIDE, NOT LANE-SCOPED — the conviction that made the ci.yml scope-add
+# necessary (`bash32-parse`, a NON-lane job with a 10 min job bound over 20 min of steps) would
+# silently return if someone narrowed checkBounds to the audited lane jobs.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n  lintish:\n    runs-on: ubuntu-latest\n    timeout-minutes: 5\n    steps:\n      - run: echo hi\n        timeout-minutes: 10\n' \
+  >"$TMP/ci-pr-nonlane.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-nonlane.yml"
+if [ "$RC" -eq 2 ] && grep -q "lintish" <<<"$OUT"; then
+  pass "a NON-lane job with a job bound below its steps' sum exits 2 (the rule is repo-wide)"
+else
+  fail "a non-lane job bound violation returned rc $RC (want 2, naming it): $OUT"
+fi
+
+# ⛔ AND THE SLICE EXPRESSION ITSELF. The axis can be perfect while the DENOMINATOR is a stale
+# literal: the runner trusts `count` (it only refuses count > listed), so `/12` over an 8-wide matrix
+# leaves 4/12 of the list run by nobody while every arm still passes its own reconciliation.
+sed 's|${{ strategy.job-total }}|12|' "$MAIN" >"$TMP/ci-main-slice12.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-slice12.yml"; then
+  fail "the stale-denominator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-slice12.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "the denominator must be exactly" <<<"$OUT" && grep -qF '${{ matrix.shard }}/12' <<<"$OUT"; then
+    pass "a hard-coded slice denominator exits 2 (a stale /N leaves slices no arm runs)"
+  else
+    fail "a hard-coded slice denominator returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ AND THE MATRIX AXIS IS A COVERAGE CLAIM NOTHING ELSE CHECKS. `BASH_SHARD_SLICE`'s denominator is
+# `strategy.job-total`, so an axis of `[1,1,2]` leaves slice 3 run by NOBODY while every arm still
+# passes its own set assertion (each process only knows its own index). Measured: accepted before.
+# NOTE (#3235 review, P2): these two fixtures declare `fail-fast: false`, because the arm must be
+# diagnosed for ITS OWN defect — without the key the fail-fast refusal (arm (v)) pre-empts the axis
+# diagnosis, and an arm that passes on a different message is a vacuous arm, not a passing one.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+  >"$TMP/ci-pr-axis-dup.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-axis-dup.yml"
+if [ "$RC" -eq 2 ] && grep -q 'shard: \[1, 1, 2\]' <<<"$OUT"; then
+  pass "a matrix axis with a DUPLICATE entry exits 2 (a slice no arm runs is a green hole)"
+else
+  fail "a duplicated matrix axis returned rc $RC (want 2): $OUT"
+fi
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+  >"$TMP/ci-pr-axis-ok.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-axis-ok.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "control: a contiguous, distinct 1..N axis is accepted"
+else
+  fail "a correct matrix axis returned rc $RC (want 0): $OUT"
+fi
+
+# ⛔ AND THE GUARD ITSELF MUST STILL BE THERE. The guard's `guardMentioning` walk is NAME-FREE so a
+# synthetic fixture is not refused for lacking a job NAME — which also meant a document that carries
+# the shard call and NO guard step was GREEN: a copy of ci-main.yml with the whole
+# `script-validate-gate` job deleted exited 0 (measured), i.e. the job running the gate could be
+# removed while every assertion in the guard still passed.
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n' \
+  >"$TMP/ci-pr-noguard.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-noguard.yml"
+if [ "$RC" -eq 2 ] && grep -q 'NO job runs the lane-parity guard itself' <<<"$OUT"; then
+  pass "a lane that calls the runner but runs NO guard step exits 2 (the gate cannot be silently deleted)"
+else
+  fail "a lane with the runner and no guard returned rc $RC (want 2): $OUT"
+fi
+
+# ── THE FOUR SURVIVING FAIL-OPENS FROM THE #3235 REVIEW (each measured green on the code the
+# 2026-11-05 review ran against, and each carries a CONTROL so it pins the PROPERTY, not a spelling).
+
+# ⛔ (g) "THE GUARD RUNS" IS AN INVOCATION, NOT A SUBSTRING (#3235 review, P1, measured). The
+# guard-covering walk used `s.run.includes("check-ci-lane-parity")`, which matches TEXT: rewriting the
+# guard step to a `run: |` block whose only line is the commented-out call left the guard exiting 0
+# while still printing "runs the guard and is unconditional and blocking" — the gate switched off with
+# every gate reporting green. Five mutations below (a comment, the same text inside an `echo`, a
+# heredoc BODY, a NON-EXECUTED `if` branch, and a multi-line script), each of which was measured
+# ACCEPTED by the intermediate "one logical line shaped `bash <path>`" scan — and the `./`-prefix
+# control, which names the SAME program and must stay accepted.
+# ⚠️ The multi-line case is a DECLARED OVER-BLOCK: the arm asserts it is REFUSED (rc 2), not accepted.
+# The step must BE the bare call — a loud false block (category B) rather than a silent false PASS.
+awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+       print "        run: |"; print "          # bash scripts/check-ci-lane-parity.sh"; next }
+     { print }' "$PR" >"$TMP/ci-pr-guardcomment.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guardcomment.yml"; then
+  fail "the commented-guard mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guardcomment.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "a COMMENTED-OUT guard step is not an invocation (rc 2) — a mention is not a gate"
+  else
+    fail "a commented-out guard step satisfied the guard (rc $RC — want 2): $OUT"
+  fi
+  # ⛔ AND THE PER-JOB NOTE MUST NAME WHAT THE JOB ACTUALLY RUNS (#3235 review, P3). `guardMentioning`
+  # also holds jobs that run ONLY the mutation self-test, and the note said "runs the guard" for them —
+  # the exact sentence the substring-test finding quoted as its symptom. Log-only (no coverage decision
+  # reads it), which is precisely why it needs an assertion: nothing else would ever catch it drifting.
+  if grep -qF "runs the guard's MUTATION SELF-TEST and is unconditional and blocking" <<<"$OUT"; then
+    pass "a self-test-only job is announced as running the SELF-TEST, not as running the guard"
+  else
+    fail "the per-job note mis-announced a self-test-only job as running the guard: $OUT"
+  fi
+fi
+awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+       print "        run: echo \"bash scripts/check-ci-lane-parity.sh\""; next }
+     { print }' "$PR" >"$TMP/ci-pr-guardecho.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guardecho.yml"; then
+  fail "the echo-guard mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guardecho.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "an ECHO whose text names the guard is a mention, not an invocation (rc 2)"
+  else
+    fail "an echo of the guard name satisfied the guard (rc $RC — want 2): $OUT"
+  fi
+fi
+awk 'BEGIN { q = sprintf("%c", 39) }
+     /^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+       print "        run: |"
+       print "          cat >/dev/null <<" q "EOF" q
+       print "          bash scripts/check-ci-lane-parity.sh"
+       print "          EOF"; next }
+     { print }' "$PR" >"$TMP/ci-pr-guardheredoc.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guardheredoc.yml"; then
+  fail "the heredoc mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guardheredoc.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "a guard call inside a HEREDOC BODY is text, not an invocation (rc 2)"
+  else
+    fail "a heredoc-bodied guard call satisfied the guard (rc $RC — want 2): $OUT"
+  fi
+fi
+awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+       print "        run: |"; print "          if false; then"; print "            bash scripts/check-ci-lane-parity.sh"; print "          fi"; next }
+     { print }' "$PR" >"$TMP/ci-pr-guardiffalse.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guardiffalse.yml"; then
+  fail "the if-false mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guardiffalse.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "a guard call inside a NON-EXECUTED branch is not an invocation (rc 2)"
+  else
+    fail "an if-false-bodied guard call satisfied the guard (rc $RC — want 2): $OUT"
+  fi
+fi
+# ⚠️ DECLARED OVER-BLOCK, pinned so it cannot become silent: a guard step that runs the call inside a
+# MULTI-LINE script is REFUSED, although it would execute. The remedy is a second step. That direction
+# is a loud false block (category B); the direction that was open is a silent false PASS.
+awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+       print "        run: |"; print "          set -e"; print "          bash scripts/check-ci-lane-parity.sh"; next }
+     { print }' "$PR" >"$TMP/ci-pr-guardmultiline.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guardmultiline.yml"; then
+  fail "the multi-line mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guardmultiline.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "a MULTI-LINE guard step is refused (the declared over-block: the step must BE the bare call)"
+  else
+    fail "a multi-line guard step returned rc $RC (want 2 — the documented over-block): $OUT"
+  fi
+fi
+# …and the matcher is a CANONICAL REPO PATH, not a basename: a same-named file in another directory
+# is a DIFFERENT program and must not satisfy the walk.
+sed 's|^        run: bash scripts/check-ci-lane-parity\.sh$|        run: bash scripts/nested/check-ci-lane-parity.sh|' \
+  "$PR" >"$TMP/ci-pr-guardnested.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guardnested.yml"; then
+  fail "the nested-path mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guardnested.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "a same-named guard in ANOTHER DIRECTORY is a different program (rc 2)"
+  else
+    fail "a nested same-named guard satisfied the walk (rc $RC — want 2): $OUT"
+  fi
+fi
+# FALSE-BLOCK CONTROL: the `./` prefix names the SAME program and must still be accepted.
+sed 's|^        run: bash scripts/check-ci-lane-parity\.sh$|        run: bash ./scripts/check-ci-lane-parity.sh|' \
+  "$PR" >"$TMP/ci-pr-guarddot.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guarddot.yml"; then
+  fail "the ./-prefix control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guarddot.yml"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: a './'-prefixed guard call is the same program and is accepted (no false block)"
+  else
+    fail "a './'-prefixed guard call was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+
+# ⛔ (h) A SECOND MATRIX AXIS MULTIPLIES `strategy.job-total` PAST THE SHARD AXIS (#3235 review, P1,
+# measured). The axis rule compared the `shard:` axis to 1..N and never to job-total — but job-total
+# is the CARTESIAN PRODUCT of every axis, so `shard: [1..8]` plus a two-entry `os:` axis makes the
+# denominator 16 while the axis stays 8, and slices 9..16 are run by NO arm (≈half the 163-suite
+# list) while every arm still passes its own set assertion. Measured on the pre-fix guard: rc 0.
+# CONTROL: the same second axis with ONE combination leaves job-total at 8, so it must be ACCEPTED —
+# the rule is "job-total must equal the axis width", not "a job may have only one axis".
+awk '{ print }
+     /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
+       print "        os:"; print "          - ubuntu-latest"; print "          - ubuntu-22.04" }' \
+  "$MAIN" >"$TMP/ci-main-twoaxis.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-twoaxis.yml"; then
+  fail "the second-axis mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-twoaxis.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'strategy.job-total is 16' <<<"$OUT" && grep -q 'slices 9\.\.16' <<<"$OUT"; then
+    pass "a SECOND matrix axis multiplying job-total past the shard axis exits 2 (slices 9..16 run by nobody)"
+  else
+    fail "a second matrix axis returned rc $RC (want 2): $OUT"
+  fi
+fi
+awk '{ print }
+     /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
+       print "        os:"; print "          - ubuntu-latest" }' \
+  "$MAIN" >"$TMP/ci-main-oneaxis.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-oneaxis.yml"; then
+  fail "the single-combination-axis control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-oneaxis.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: a second axis with ONE combination keeps job-total at 8 and is accepted"
+  else
+    fail "a single-combination second axis was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+# ⛔ AND A ZERO-ARM MATRIX IS THE DEGENERATE CASE OF THE SAME HOLE: `shard: []` creates NO jobs at
+# all, so the entire 163-suite sweep is ungated while every axis assertion is VACUOUSLY true at N=0
+# (`[].every(...) === true`, and `0 !== 0` is false). Measured rc 0 before this arm.
+sed 's|^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$|        shard: []|' "$MAIN" >"$TMP/ci-main-emptyaxis.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-emptyaxis.yml"; then
+  fail "the empty-axis mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-emptyaxis.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "declares 'shard: []'" <<<"$OUT"; then
+    pass "a ZERO-ARM matrix exits 2 (no jobs run, and every axis assertion is vacuous at N=0)"
+  else
+    fail "an empty shard axis returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (i) THE SAME MATRIX SPELLED `include:` ROUTED AROUND THE WHOLE RULE (#3235 review, P2, measured).
+# The block was gated on `Array.isArray(matrix.shard)`, so `matrix: { include: [...] }` (where
+# `matrix.shard` is `undefined`) skipped it entirely and exited 0 — with a duplicated arm, job-total 9
+# against 8 shard values, so slice 9 ran nowhere. A grid this guard cannot COUNT is refused, because
+# a count it cannot derive is not a coverage proof. SCOPING CONTROL: the identical `include:` on a job
+# that does NOT feed the runner is outside the rule and must stay accepted (no blanket refusal).
+awk 'BEGIN { done = 0 }
+     /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ && !done {
+       print "        include:"
+       for (i = 1; i <= 8; i++) print "          - shard: " i
+       done = 1; next }
+     { print }' "$MAIN" >"$TMP/ci-main-include.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-include.yml"; then
+  fail "the include: mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-include.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "no 'shard: [...]' LIST" <<<"$OUT" && grep -qF 'keys: [include]' <<<"$OUT"; then
+    pass "a matrix spelled include: is REFUSED (rc 2) — a grid job-total cannot be derived is not a pass"
+  else
+    fail "an include:-spelled matrix returned rc $RC (want 2): $OUT"
+  fi
+fi
+{ cat "$MAIN"; printf '  unrelated-helper:\n    runs-on: ubuntu-latest\n    strategy:\n      matrix:\n        include:\n          - shard: 1\n          - shard: 1\n    steps:\n      - run: echo hello\n'; } \
+  >"$TMP/ci-main-include-other.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-include-other.yml"; then
+  fail "the unrelated-include control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-include-other.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: an include: matrix on a job that does NOT feed the runner is outside the rule (rc 0)"
+  else
+    fail "an unrelated include: matrix was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+
+# ⛔ (j) THE DENOMINATOR RULE ONLY SCANNED STEP-LEVEL `env:` (#3235 review, P2, measured). A job-level
+# `env:` reaches every step of the job, so moving the slice there — with a hard-coded denominator of
+# 12 on an 8-wide matrix — left 4/12 of the list run by nobody while the guard stayed green. The
+# mutation below DELETES the step env block and re-declares the slice on the job, so the surviving
+# `BASH_SHARD_SLICE` is the job-level one only (asserted by the count, not assumed).
+# CONTROL: the same job-level placement with `strategy.job-total` is accepted — the rule is about the
+# denominator, never about which level declares it.
+awk '{ a[NR] = $0 }
+     END {
+       dropfrom = 0; dropto = 0
+       for (i = 1; i <= NR; i++)
+         if (a[i] == "        env:") {
+           j = i + 1
+           while (j <= NR && a[j] ~ /^          #/) j++
+           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+         }
+       for (i = 1; i <= NR; i++) {
+         if (i >= dropfrom && i <= dropto) continue
+         print a[i]
+         if (a[i] == "    timeout-minutes: 80") {
+           print "    env:"; print "      BASH_SHARD_SLICE: ${{ matrix.shard }}/12"
+         }
+       }
+     }' "$MAIN" >"$TMP/ci-main-jobenv12.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-jobenv12.yml" || [ "$(grep -cE '^[[:space:]]*BASH_SHARD_SLICE:' "$TMP/ci-main-jobenv12.yml")" -ne 1 ] || ! grep -qE '^      BASH_SHARD_SLICE:' "$TMP/ci-main-jobenv12.yml"; then
+  fail "the job-level-env mutation did not land cleanly (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-jobenv12.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "the JOB's env" <<<"$OUT" && grep -qF '${{ matrix.shard }}/12' <<<"$OUT"; then
+    pass "a slice declared in the JOB's env is read too → rc 2 (a job-level /12 bypassed the denominator rule)"
+  else
+    fail "a job-level slice with a hard-coded denominator returned rc $RC (want 2): $OUT"
+  fi
+fi
+sed 's|      BASH_SHARD_SLICE: .*|      BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}|' \
+  "$TMP/ci-main-jobenv12.yml" >"$TMP/ci-main-jobenvok.yml"
+if cmp -s "$TMP/ci-main-jobenv12.yml" "$TMP/ci-main-jobenvok.yml"; then
+  fail "the job-level-env control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-jobenvok.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: the same JOB-level slice with strategy.job-total is accepted (placement is not refused)"
+  else
+    fail "a correct job-level slice was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+
+# ⛔ (k) THE NUMERATOR WAS NEVER CHECKED (#3235 review, P1, measured). The denominator rule only asked
+# for `strategy.job-total`, so `1/${{ strategy.job-total }}` — ONE token — sends EVERY arm to slice 1:
+# that slice runs eight times, the other seven run by nobody, and each arm still passes its own set
+# assertion because every process derives its expected set from its OWN index. On the real list that
+# is 21 of 163 suites executed, 142 never run, at rc 0. The numerator must be `matrix.shard`, the one
+# per-arm index the axis assertion pins to 1..N.
+sed 's|\${{ matrix.shard }}/\${{ strategy.job-total }}|1/${{ strategy.job-total }}|' \
+  "$MAIN" >"$TMP/ci-main-numerator.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-numerator.yml"; then
+  fail "the numerator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-numerator.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be exactly' <<<"$OUT" && grep -qF '1/${{ strategy.job-total }}' <<<"$OUT"; then
+    pass "a slice whose NUMERATOR is not matrix.shard exits 2 (every arm would run the same slice)"
+  else
+    fail "a constant numerator returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (l) THE WORKFLOW'S OWN `env:` REACHES EVERY JOB, so it is a third place a slice can be declared
+# (#3235 review, P2, measured). A workflow-level `/12` — with the step's `env:` deleted — left 52 of
+# 163 suites unrun at rc 0, because `collectSlice` only ever looked at the job and its steps.
+# CONTROL: the same workflow-level placement with the correct expression is accepted.
+awk '{ a[NR] = $0 }
+     END {
+       dropfrom = 0; dropto = 0
+       for (i = 1; i <= NR; i++)
+         if (a[i] == "        env:") {
+           j = i + 1
+           while (j <= NR && a[j] ~ /^          #/) j++
+           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+         }
+       for (i = 1; i <= NR; i++) {
+         if (i >= dropfrom && i <= dropto) continue
+         print a[i]
+       }
+     }' "$MAIN" >"$TMP/ci-main-noenv.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-noenv.yml"; then
+  fail "the workflow-level-env mutation did not change the file (the arm would be vacuous)"
+else
+  { printf 'env:\n  BASH_SHARD_SLICE: ${{ matrix.shard }}/12\n'; cat "$TMP/ci-main-noenv.yml"; } \
+    >"$TMP/ci-main-wfenv12.yml"
+  guard_rc "$TMP/ci-main-wfenv12.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "the WORKFLOW's env" <<<"$OUT" && grep -qF '${{ matrix.shard }}/12' <<<"$OUT"; then
+    pass "a slice declared in the WORKFLOW's env is read too → rc 2 (a workflow-level /12 bypassed the rule)"
+  else
+    fail "a workflow-level slice with a hard-coded denominator returned rc $RC (want 2): $OUT"
+  fi
+  { printf 'env:\n  BASH_SHARD_SLICE: ${{ matrix.shard }}/${{ strategy.job-total }}\n'; cat "$TMP/ci-main-noenv.yml"; } \
+    >"$TMP/ci-main-wfenvok.yml"
+  guard_rc "$TMP/ci-main-wfenvok.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: a WORKFLOW-level slice with the right expression is accepted (placement is not refused)"
+  else
+    fail "a correct workflow-level slice was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+
+# ── ROUND 3 OF THE SAME LOOP: six more openings, including two DECOY BYPASSES ──────────────────
+# Each mutant below was measured GREEN (rc 0) on the previous head.
+
+# ⛔ (m) A SUFFIX IS NOT THE SAME FILE (#3235 review, P2, measured). Round 2 replaced a basename test
+# with `endsWith("/" + canonical)`, which still accepts a DECOY: `bash docs/scripts/check-ci-lane-parity.sh`
+# with a same-named stub in `docs/` exited 0 while the real guard never ran — and the self-test variant
+# did the same on the live path, silencing the program that kills this guard's mutants. Only EQUALITY
+# can tell "the same file" from "a path that ends the same way".
+sed 's|^        run: bash scripts/check-ci-lane-parity\.sh$|        run: bash docs/scripts/check-ci-lane-parity.sh|' \
+  "$PR" >"$TMP/ci-pr-guarddecoy.yml"
+if cmp -s "$PR" "$TMP/ci-pr-guarddecoy.yml"; then
+  fail "the decoy-guard mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-guarddecoy.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'NO step invokes the lane-parity guard as the bare call' <<<"$OUT"; then
+    pass "a DECOY at docs/scripts/… with the same name is a different program (rc 2)"
+  else
+    fail "a decoy guard path satisfied the walk (rc $RC — want 2): $OUT"
+  fi
+fi
+sed 's|^        run: bash tests/ci-lane-parity/run\.sh$|        run: bash docs/tests/ci-lane-parity/run.sh|' \
+  "$PR" >"$TMP/ci-pr-selftestdecoy.yml"
+if cmp -s "$PR" "$TMP/ci-pr-selftestdecoy.yml"; then
+  fail "the decoy-self-test mutation did not change the file (the arm would be vacuous)"
+else
+  # ⛔ THE REQUIREMENT ITSELF IS LIVE-ONLY (`isLive`), so a fixture cannot red on it — and the FIRST
+  # version of this arm was DECORATIVE for that reason: it decoyed only the SELF-TEST step of a job
+  # that still runs the REAL guard, so the per-job note read "runs the guard" whichever way the
+  # self-test matcher behaved (measured by the round-4 reviewer: it stayed GREEN on the pre-fix suffix
+  # matcher). The single-decoy fixture below therefore legitimately stays at rc 0; the arm is the
+  # BOTH-decoys fixture after it, where a suffix-accepting matcher would leave a guard-carrying job
+  # behind (rc 0) and the exact-path matcher sees no guard at all (rc 2).
+  guard_rc "$MAIN" "$TMP/ci-pr-selftestdecoy.yml"
+  if [ "$RC" -ne 0 ]; then
+    fail "the single-decoy self-test fixture should still be accepted (the guard step is intact), got rc $RC: $OUT"
+  else
+    awk '/^        run: bash scripts\/check-ci-lane-parity\.sh$/ {
+           print "        run: bash docs/scripts/check-ci-lane-parity.sh"; next }
+         { print }' "$TMP/ci-pr-selftestdecoy.yml" >"$TMP/ci-pr-bothdecoy.yml"
+    if cmp -s "$TMP/ci-pr-selftestdecoy.yml" "$TMP/ci-pr-bothdecoy.yml"; then
+      fail "the both-decoys mutation did not change the file (the arm would be vacuous)"
+    else
+      guard_rc "$MAIN" "$TMP/ci-pr-bothdecoy.yml"
+      # Both decoy paths still CONTAIN the guard's name, so the truthful diagnosis is the
+      # "mentions it, but NOT as that value — the path differs from the canonical repo-relative one"
+      # branch. What matters is that a suffix-accepting matcher would have left a guard-carrying job
+      # behind and returned rc 0 (the single-decoy fixture above proves that is the live difference).
+      if [ "$RC" -eq 2 ] && grep -q 'NOT as that value' <<<"$OUT"; then
+        pass "with BOTH steps decoyed no step invokes the guard (the self-test matcher rejects a suffix too)"
+      else
+        fail "a decoyed self-test was still counted as a program this job runs (rc $RC — want 2): $OUT"
+      fi
+    fi
+  fi
+fi
+
+# ⛔ (n) `working-directory` REWRITES WHAT `run:` RESOLVES AGAINST (#3235 review, P2, measured). With
+# `working-directory: tests` and a stub at `tests/scripts/check-ci-lane-parity.sh`, the SAME bare call
+# text executed the stub and the guard exited 0 — invisible to any `run:`-text assertion, because the
+# text is byte-identical. It joins if/needs/continue-on-error/shell as a key that changes how a step
+# runs, and `defaults.run.working-directory` (which reaches every job) is refused document-wide.
+awk '{ if ($0 ~ /^  bash-suites-gate:$/) { print; print "    working-directory: tests"; next } print }' \
+  "$PR" >"$TMP/ci-pr-wdir.yml"
+if cmp -s "$PR" "$TMP/ci-pr-wdir.yml"; then
+  fail "the working-directory mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-wdir.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'working-directory' <<<"$OUT"; then
+    pass "a job-level 'working-directory' is refused (the bare call would resolve to another file)"
+  else
+    fail "a working-directory on the guard job returned rc $RC (want 2): $OUT"
+  fi
+fi
+{ printf 'defaults:\n  run:\n    working-directory: tests\n'; cat "$PR"; } >"$TMP/ci-pr-wdirdefaults.yml"
+guard_rc "$MAIN" "$TMP/ci-pr-wdirdefaults.yml"
+if [ "$RC" -eq 2 ] && grep -q 'defaults.run.working-directory' <<<"$OUT"; then
+  pass "workflow-level defaults.run.working-directory is refused (it reaches every job)"
+else
+  fail "defaults.run.working-directory returned rc $RC (want 2): $OUT"
+fi
+
+# ⛔ (o) THE JOB'S CONTAINER ENV IS A FOURTH `env:` LOCATION (#3235 review, P2, measured).
+# `container: { image, env }` reaches every step of the job, so a `/12` there — with the step's own
+# `env:` deleted — left 52 of 163 suites unrun at rc 0.
+awk '{ a[NR] = $0 }
+     END {
+       dropfrom = 0; dropto = 0
+       for (i = 1; i <= NR; i++)
+         if (a[i] == "        env:") {
+           j = i + 1
+           while (j <= NR && a[j] ~ /^          #/) j++
+           if (j <= NR && a[j] ~ /^          BASH_SHARD_SLICE:/) { dropfrom = i; dropto = j; break }
+         }
+       for (i = 1; i <= NR; i++) {
+         if (i >= dropfrom && i <= dropto) continue
+         print a[i]
+         if (a[i] == "    timeout-minutes: 80") {
+           print "    container:"; print "      image: ubuntu:22.04"; print "      env:"
+           print "        BASH_SHARD_SLICE: ${{ matrix.shard }}/12"
+         }
+       }
+     }' "$MAIN" >"$TMP/ci-main-containerenv.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-containerenv.yml"; then
+  fail "the container-env mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-containerenv.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "the job CONTAINER's env" <<<"$OUT"; then
+    pass "a slice declared in the job's CONTAINER env is read too → rc 2 (the fourth location)"
+  else
+    fail "a container-env slice returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (p) A SUBSTRING TEST ON THE EXPRESSION IS THE BUG IT CONDEMNS (#3235 review, P3, measured).
+# `${{ matrix.shard && 1 }}` MENTIONS matrix.shard and evaluates to 1 on every arm, so all eight run
+# slice 1 and 142 of 163 suites never run — at rc 0. Same on the denominator side.
+sed 's|\${{ matrix.shard }}/\${{ strategy.job-total }}|${{ matrix.shard \&\& 1 }}/${{ strategy.job-total }}|' \
+  "$MAIN" >"$TMP/ci-main-hostilenum.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-hostilenum.yml"; then
+  fail "the hostile-numerator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-hostilenum.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be exactly' <<<"$OUT"; then
+    pass "a numerator that MENTIONS matrix.shard but does not use it is refused (rc 2)"
+  else
+    fail "a hostile numerator returned rc $RC (want 2): $OUT"
+  fi
+fi
+sed 's|\${{ matrix.shard }}/\${{ strategy.job-total }}|${{ matrix.shard }}/${{ strategy.job-total \&\& 8 }}|' \
+  "$MAIN" >"$TMP/ci-main-hostileden.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-hostileden.yml"; then
+  fail "the hostile-denominator mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-hostileden.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the denominator must be exactly' <<<"$OUT"; then
+    pass "a denominator that MENTIONS strategy.job-total but pins 8 is refused (rc 2)"
+  else
+    fail "a hostile denominator returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (q) THE MAIN LANE'S TRIGGER WAS NEVER VALIDATED (#3235 review, P2, pre-existing and measured).
+# This file's header lists "a trigger that cannot fire" among the exit-2 refusals, but the arm only
+# existed for the PR lane — so narrowing ci-main's `on.push.branches:` to `['nothing/**']` exited 0,
+# the guard certifying parity over a lane that never executes.
+awk 'BEGIN { skip = 0 }
+     /^  push:$/ { skip = 1; next }
+     skip == 1 && /^    branches:/ { skip = 2; next }
+     skip == 2 { next }
+     { print }' "$MAIN" >"$TMP/ci-main-nopush.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-nopush.yml"; then
+  fail "the no-push-by-trigger mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-nopush.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q "has no 'push:' trigger" <<<"$OUT"; then
+    pass "a main lane with NO push: trigger exits 2 (it would never run)"
+  else
+    fail "a push-less main lane returned rc $RC (want 2): $OUT"
+  fi
+fi
+sed "s|^    branches: \[main, 'integration/\*\*'\]$|    branches: ['nothing-matches-this/**']|" \
+  "$MAIN" >"$TMP/ci-main-badbranches.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-badbranches.yml"; then
+  fail "the bad-branches mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-badbranches.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'none of which can match' <<<"$OUT"; then
+    pass "a push: branches filter that cannot match 'main' exits 2 (the lane would never run)"
+  else
+    fail "an unmatchable branches filter returned rc $RC (want 2): $OUT"
+  fi
+fi
+printf 'name: x\non:\n  push:\n    branches: [main]\njobs:\n  script-validate:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n      - run: bash tests/ci-lane-parity/run.sh\n' \
+  >"$TMP/ci-main-pushok.yml"
+guard_rc "$TMP/ci-main-pushok.yml" "$PR"
+if [ "$RC" -eq 0 ]; then
+  pass "control: a bare 'branches: [main]' push trigger is accepted (no false block on a filter)"
+else
+  fail "a legitimate push branches filter was refused (rc $RC — want 0): $OUT"
+fi
+
+# ── ROUND 4: the push filter, the expression spelling, and two over-blocks that were false blocks ──
+
+# ⛔ (r) THE PUSH FILTER IS AN ALLOWLIST, NOT A KEY-BY-KEY ENUMERATION (#3235 review, P2, measured).
+# Resolving only `branches:` accepted FOUR spellings that make the main lane unable to fire for
+# `main`, all at rc 0: `branches-ignore: ['**']`, `branches: ['**', '!main']` (a negation — GitHub's
+# documented "every branch except …"), `paths: ['docs/**']`, `paths-ignore: ['**']`. Only `branches:`
+# is accepted now, so a key GitHub adds later is refused by default rather than escaping silently.
+push_i=0
+for push_shape in "branches-ignore: ['**']" "branches: ['**', '!main']" "paths: ['docs/**']" "paths-ignore: ['**']"; do
+  push_i=$((push_i + 1))
+  awk -v repl="    $push_shape" '
+    BEGIN { done = 0 }
+    /^    branches: \[main, .integration\/\*\*.?\]$/ && !done { print repl; done = 1; next }
+    { print }' "$MAIN" >"$TMP/ci-main-pushfilter$push_i.yml"
+  if cmp -s "$MAIN" "$TMP/ci-main-pushfilter$push_i.yml"; then
+    fail "the push-filter mutation '$push_shape' did not change the file (the arm would be vacuous)"
+  else
+    guard_rc "$TMP/ci-main-pushfilter$push_i.yml" "$PR"
+    if [ "$RC" -eq 2 ] && grep -qE 'filters its .push:. trigger with|negates branches' <<<"$OUT"; then
+      pass "a push filter '$push_shape' is refused (it can stop the lane firing for main)"
+    else
+      fail "the push filter '$push_shape' returned rc $RC (want 2): $OUT"
+    fi
+  fi
+done
+
+# ⛔ (s) AND `+` MUST NOT BE ESCAPED (#3235 review, P3, measured): GitHub documents it as "one or more
+# of the preceding character", which is exactly a regex `+`, so escaping it refused the VALID filter
+# `ma+in` — a false block in the very matcher that exists to catch a never-firing lane.
+awk 'BEGIN { done = 0 }
+     /^    branches: \[main, .integration\/\*\*.?\]$/ && !done {
+       print "    branches: [ma+in, " sprintf("%c", 39) "integration/**" sprintf("%c", 39) "]"; done = 1; next }
+     { print }' "$MAIN" >"$TMP/ci-main-pushplus.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-pushplus.yml"; then
+  fail "the '+'-glob control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-pushplus.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: 'ma+in' is a valid filter that matches main and is accepted (no false block)"
+  else
+    fail "the valid filter 'ma+in' was refused (rc $RC — want 0): $OUT"
+  fi
+fi
+
+# ⛔ (t) `$ {{ … }}` IS NOT AN EXPRESSION (#3235 review, P3, measured). Squashing ALL whitespace made
+# `$ {{ matrix.shard }}` pass the exact-expression test, although GitHub does not recognise it — the
+# runner receives the literal text. Bounded (the runner still refuses at runtime) but the guard was
+# certifying a slice expression that cannot evaluate per-arm. Only whitespace INSIDE the braces is
+# insignificant.
+sed 's|\${{ matrix.shard }}|$ {{ matrix.shard }}|' "$MAIN" >"$TMP/ci-main-dollarsplit.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-dollarsplit.yml"; then
+  fail "the '$ {{' mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-dollarsplit.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF 'the NUMERATOR must be exactly' <<<"$OUT"; then
+    pass "'\''$ {{ matrix.shard }}'\'' is refused (it is not an expression, only whitespace inside the braces is)"
+  else
+    fail "a '$ {{' expression returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# ⛔ (u) `defaults.run.working-directory: .` IS THE IDENTITY (#3235 review, P3, measured) — it resolves
+# to the same directory GitHub would use anyway, so the blanket `working-directory` refusal made it a
+# FALSE BLOCK with no rewrite behind it. The real rewrite (`tests`) stays refused (arm (n)).
+{ printf 'defaults:\n  run:\n    working-directory: .\n'; cat "$MAIN"; } >"$TMP/ci-main-wdirdot.yml"
+guard_rc "$TMP/ci-main-wdirdot.yml" "$PR"
+if [ "$RC" -eq 0 ]; then
+  pass "control: defaults.run.working-directory '.' is the identity and is accepted (no false block)"
+else
+  fail "'working-directory: .' was refused (rc $RC — want 0): $OUT"
+fi
+
+# ⛔ (v) `fail-fast` WAS UNPINNED (#3235 review, P2, measured at the merge head). The new matrix's
+# own comment calls `fail-fast: false` LOAD-BEARING: with GitHub's default `true`, one arm's genuine
+# failure CANCELS every other arm in progress or queued, and the merge rail reads `cancelled` NON-RED
+# — so the seven arms that never ran read as a non-red slice of a green sweep, and the red arm is
+# exactly the one the #3322 base-owned exclusion excuses. `continue-on-error` (the sibling neutraliser
+# on the same job) was already refused; `fail-fast` was not. BOTH mutations below exited 0 before
+# this arm: `fail-fast: true`, and the key DELETED (GitHub's default is `true`, so absence is the
+# same hole). SCOPING CONTROL: a matrix on a job that does NOT feed the runner is outside the rule.
+sed 's|^      fail-fast: false$|      fail-fast: true|' "$MAIN" >"$TMP/ci-main-fftrue.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-fftrue.yml"; then
+  fail "the fail-fast: true mutation did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-fftrue.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "does not declare 'fail-fast: false'" <<<"$OUT"; then
+    pass "strategy.fail-fast: true → rc 2 (one arm's failure cancels the rest, and the rail reads cancelled NON-RED)"
+  else
+    fail "fail-fast: true returned rc $RC (want 2): $OUT"
+  fi
+fi
+grep -v '^      fail-fast: false$' "$MAIN" >"$TMP/ci-main-ffabsent.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-ffabsent.yml"; then
+  fail "the fail-fast deletion did not change the file (the arm would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-ffabsent.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -qF "does not declare 'fail-fast: false'" <<<"$OUT"; then
+    pass "a DELETED fail-fast key → rc 2 (GitHub's default is true, so absence is the same hole)"
+  else
+    fail "a deleted fail-fast key returned rc $RC (want 2): $OUT"
+  fi
+fi
+{ cat "$MAIN"; printf '  unrelated-matrix:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: true\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: echo hello\n'; } \
+  >"$TMP/ci-main-ffother.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-ffother.yml"; then
+  fail "the unrelated-matrix control did not change the file (the control would be vacuous)"
+else
+  guard_rc "$TMP/ci-main-ffother.yml" "$PR"
+  if [ "$RC" -eq 0 ]; then
+    pass "control: fail-fast on a matrix that does NOT feed the runner is outside the rule (rc 0)"
+  else
+    fail "an unrelated matrix's fail-fast was refused (rc $RC — want 0): $OUT"
+  fi
 fi
 
 # ROOT-CAUSE PIN. The guard refusing the polluted document does not prove the PARSER is fixed —
@@ -1558,7 +2253,8 @@ fi
 echo ""
 echo "8ai. TWO CONSECUTIVE FOLDED STEPS → the first is not dropped (a pending fold must flush)"
 awk '
-  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; pend = 1; next }
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "          --list"; print "        timeout-minutes: 5"; print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "        timeout-minutes: 5"; pend = 1; next }
+  pend && /^        timeout-minutes: / { next }
   pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
   { print }
 ' "$PR" >"$TMP/ci-pr-twofold.yml"
@@ -1578,7 +2274,8 @@ fi
 # rc 1 while this asserted rc 0. (An earlier version put the call in the SECOND fold too, so it
 # passed even when the first was dropped — a vacuous assertion, found by the bug-scan reviewer.)
 awk '
-  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "      - run: >"; print "          echo done"; pend = 1; next }
+  /^      - name: Bash shards/ { print "      - run: >"; print "          bash scripts/run-bash-shards.sh"; print "        timeout-minutes: 5"; print "      - run: >"; print "          echo done"; print "        timeout-minutes: 5"; pend = 1; next }
+  pend && /^        timeout-minutes: / { next }
   pend && /^        run: bash scripts\/run-bash-shards\.sh$/ { pend = 0; next }
   { print }
 ' "$PR" >"$TMP/ci-pr-twofoldok.yml"
@@ -2261,174 +2958,6 @@ if [ "$BADMOD_RC" -eq 1 ] && grep -q 'executed a DIFFERENT SET' <<<"$BADMOD_OUT"
   pass "control: a broken modulus that keeps the COUNT right is caught by the SET assertion"
 else
   fail "a broken modulus was not caught on the set (rc $BADMOD_RC): $(printf '%s' "$BADMOD_OUT" | tail -2 | tr '\n' '|')"
-fi
-
-echo ""
-echo "13. THE SLICE-TO-SLICE PREMISES — equal matrix widths, and fail-fast: false on a shard matrix"
-# ⛔ WHY (agent-infra#2483). Two properties the change now DEPENDS ON were stated as established and
-# asserted NOWHERE — the non-vacuity class this repo treats as a defect, not a nit:
-#
-#   (a) THE WIDTHS MUST AGREE. `scripts/admin-merge.sh` maps a PR-lane `bash-suites (<n>)` red onto
-#       main's `script-validate (<n>)` and states it as an EQUIVALENCE OF THE SAME SHARD SET. Slice
-#       membership is POSITIONAL (`scripts/run-bash-shards.sh`: `slice_pos % slice_count`), so that is
-#       an equivalence only while BOTH lanes have the SAME width — and the width is a hand-kept number
-#       in two files. Widen ONE lane and the rail matches by index across DIFFERENT shards: a
-#       PR-introduced red becomes excludable as base-owned (the fail-open direction), or a base red is
-#       reported as having no counterpart (#2610's false absence). No workflow edit is even needed for
-#       the same drift in list terms — the per-slice sizes are DERIVED, so one added suite re-partitions
-#       both lanes' slices at unchanged widths. The width half is what a guard can see.
-#
-#       ⛔ AND THE WIDTH THAT MATTERS IS `strategy.job-total`, NOT `matrix.shard.length` (review of
-#       #3392 at a4fbb733). GitHub applies `matrix.exclude:`/`matrix.include:` AFTER generating jobs and
-#       `job-total` counts the result, so `exclude: [{shard: 8}]` leaves length 8 while publishing only
-#       7 per-slice checks — equal lengths, different slice sets, the same two defects. 13g/13h pin the
-#       refusal by KEY NAME; without them a fixture that reads `shard.length` looks asserted and is not.
-#
-#   (b) `strategy.fail-fast: false` MUST BE THERE. At GitHub's default TRUE one failing slice CANCELS
-#       the queued and in-progress siblings, those legs report `cancelled` (NON-RED to the rail), and
-#       the runner's per-slice coverage assertion never executes in them — all but one slice of the
-#       list unexecuted and unasserted while the job reads as having run. Deleting the key reddens
-#       NOTHING today: the content lock asserts *unchanged*, not *correct* (#666).
-#
-# Both mutations are COPIES under $TMP; the shipped workflows are not edited, so the lock is untouched.
-
-# 13a. main's lane loses `fail-fast: false` while keeping its shard matrix → rc 2, naming fail-fast.
-awk '
-  /^  script-validate:$/ { injob = 1 }
-  injob && /^      fail-fast: false$/ { injob = 0; next }
-  { print }
-' "$MAIN" >"$TMP/ci-main-nofailfast.yml"
-if cmp -s "$MAIN" "$TMP/ci-main-nofailfast.yml"; then
-  fail "(13a) the fail-fast-drop mutation did not change ci-main.yml — this arm would measure nothing"
-else
-  guard_rc "$TMP/ci-main-nofailfast.yml" "$PR"
-  if [ "$RC" -eq 2 ] && grep -q 'fail-fast' <<<"$OUT"; then
-    pass "(13a) deleting 'fail-fast: false' from main's shard matrix is REFUSED (rc 2, naming fail-fast)"
-  else
-    fail "(13a) a main lane with no fail-fast returned rc $RC (want 2, naming fail-fast): $OUT"
-  fi
-fi
-
-# 13b. ...and the hazard spelled the other way: an explicit `fail-fast: true` → rc 2.
-awk '
-  /^  script-validate:$/ { injob = 1 }
-  injob && /^      fail-fast: false$/ { print "      fail-fast: true"; injob = 0; next }
-  { print }
-' "$MAIN" >"$TMP/ci-main-failfasttrue.yml"
-if cmp -s "$MAIN" "$TMP/ci-main-failfasttrue.yml"; then
-  fail "(13b) the fail-fast:true mutation did not change ci-main.yml"
-else
-  guard_rc "$TMP/ci-main-failfasttrue.yml" "$PR"
-  if [ "$RC" -eq 2 ]; then
-    pass "(13b) 'fail-fast: true' on a shard matrix is REFUSED (rc 2)"
-  else
-    fail "(13b) 'fail-fast: true' returned rc $RC (want 2): $OUT"
-  fi
-fi
-
-# 13c. WIDEN MAIN ONLY (8 → 9). This is the direction that matters for the merge gate: slice n of a
-#      9-wide main is a DIFFERENT set of shards from slice n of an 8-wide PR lane.
-awk '
-  /^  script-validate:$/ { injob = 1 }
-  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
-    print "        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]"; injob = 0; next
-  }
-  { print }
-' "$MAIN" >"$TMP/ci-main-wide9.yml"
-if cmp -s "$MAIN" "$TMP/ci-main-wide9.yml"; then
-  fail "(13c) the main-width mutation did not change ci-main.yml"
-else
-  guard_rc "$TMP/ci-main-wide9.yml" "$PR"
-  if [ "$RC" -eq 2 ] && grep -q 'widths DIFFER' <<<"$OUT"; then
-    pass "(13c) widening ONLY main's shard matrix (8→9) is REFUSED (rc 2, naming the widths)"
-  else
-    fail "(13c) a 9-wide main against an 8-wide PR lane returned rc $RC (want 2, naming the widths): $OUT"
-  fi
-fi
-
-# 13d. WIDEN THE PR LANE ONLY (8 → 9) — the mirror case, and the one that produces #2610's false
-#      absence: `bash-suites (9)`/`(10)` would map to slices no base publishes.
-awk '
-  /^  bash-suites:$/ { injob = 1 }
-  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
-    print "        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]"; injob = 0; next
-  }
-  { print }
-' "$PR" >"$TMP/ci-pr-wide9.yml"
-if cmp -s "$PR" "$TMP/ci-pr-wide9.yml"; then
-  fail "(13d) the PR-width mutation did not change ci.yml"
-else
-  guard_rc "$MAIN" "$TMP/ci-pr-wide9.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'widths DIFFER' <<<"$OUT"; then
-    pass "(13d) widening ONLY the PR lane's shard matrix (8→9) is REFUSED (rc 2, naming the widths)"
-  else
-    fail "(13d) a 9-wide PR lane against an 8-wide main lane returned rc $RC (want 2, naming the widths): $OUT"
-  fi
-fi
-
-# 13e. CONTROL — the refusal above is about the MISMATCH, not about the number 8: BOTH lanes widened
-#      to 9 must be GREEN. Without this row a guard that simply hardcoded "width == 8" would satisfy
-#      13c/13d while refusing a legitimate future widening of both lanes.
-guard_rc "$TMP/ci-main-wide9.yml" "$TMP/ci-pr-wide9.yml"
-if [ "$RC" -eq 0 ]; then
-  pass "(13e) control: both lanes widened to 9 together is GREEN (the assertion is the mismatch, not the width)"
-else
-  fail "(13e) control: two 9-wide lanes were refused (rc $RC) — the arm is measuring the width, not the mismatch: $OUT"
-fi
-
-# 13f. CONTROL — the shipped tree is the green case for BOTH new premises at once (a guard that
-#      refused every matrix would make 13a-13d vacuous; arm 0 already covers the full run, this names
-#      the value it now reads).
-guard_rc "$MAIN" "$PR"
-if [ "$RC" -eq 0 ] && grep -q 'slice width 8 in both lanes' <<<"$OUT"; then
-  pass "(13f) control: the shipped lanes are an 8-wide shard matrix in both lanes, green, with the width read from the documents"
-else
-  fail "(13f) control: the shipped tree did not report an agreed 8-wide slice (rc $RC): $OUT"
-fi
-
-# 13g. THE WIDTH IS `strategy.job-total`, NOT `matrix.shard.length` — a `matrix.exclude:` leaves the
-#      `shard` length alone while REMOVING generated jobs (main then publishes 7 per-slice checks
-#      against the PR lane's 8), so a guard reading length alone certifies equal widths for a lane
-#      that no longer has them: a PR red on `bash-suites (8)` maps to a `script-validate (8)` no base
-#      publishes (#2610's false absence), and a shared `(<5>)` is a different shard SET on each side
-#      (the fail-open direction). Refused by KEY NAME — length cannot state this matrix's width.
-awk '
-  /^  script-validate:$/ { injob = 1 }
-  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
-    print; print "        exclude:"; print "          - shard: 8"; injob = 0; next
-  }
-  { print }
-' "$MAIN" >"$TMP/ci-main-exclude.yml"
-if cmp -s "$MAIN" "$TMP/ci-main-exclude.yml"; then
-  fail "(13g) the matrix-exclude mutation did not change ci-main.yml — this arm would measure nothing"
-else
-  guard_rc "$TMP/ci-main-exclude.yml" "$PR"
-  if [ "$RC" -eq 2 ] && grep -q 'matrix.exclude' <<<"$OUT"; then
-    pass "(13g) a 'matrix.exclude:' beside the shard axis is REFUSED (rc 2, naming the key) — length is not the slice count"
-  else
-    fail "(13g) 'exclude: [{shard: 8}]' on main's matrix returned rc $RC (want 2, naming matrix.exclude): $OUT"
-  fi
-fi
-
-# 13h. ...and the additive spelling, on the PR lane: an `include:` that cannot merge ADDS a job, so it
-#      breaks the same premise from the other side. Mirror arm, so neither key is covered only by
-#      accident of which lane the fixture was cut from.
-awk '
-  /^  bash-suites:$/ { injob = 1 }
-  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
-    print; print "        include:"; print "          - shard: 9"; injob = 0; next
-  }
-  { print }
-' "$PR" >"$TMP/ci-pr-include.yml"
-if cmp -s "$PR" "$TMP/ci-pr-include.yml"; then
-  fail "(13h) the matrix-include mutation did not change ci.yml — this arm would measure nothing"
-else
-  guard_rc "$MAIN" "$TMP/ci-pr-include.yml"
-  if [ "$RC" -eq 2 ] && grep -q 'matrix.include' <<<"$OUT"; then
-    pass "(13h) a 'matrix.include:' beside the shard axis is REFUSED (rc 2, naming the key), on the PR lane too"
-  else
-    fail "(13h) 'include: [{shard: 9}]' on the PR lane's matrix returned rc $RC (want 2, naming matrix.include): $OUT"
-  fi
 fi
 
 echo ""

@@ -61,6 +61,119 @@ is not a launcher for a session:
 | `TimeoutStartSec=60`, `Environment=CONTROLLER_ORPHAN_TIMEOUT=60` | `ExecStart` runs the **whole** of `start`, and service mode **waits** for a controller that is already running. The bound is the process's, **not** `TimeoutStartSec`'s: this unit is `Type=simple`, whose start job completes the moment the main process is forked (`systemd.service(5)`), so that directive cannot bound the wait — an earlier revision claimed it did and the real bound was the supervisor's 3600 s default, with the unit reading `active (running)` throughout. `CONTROLLER_ORPHAN_TIMEOUT` is the wait for a session that outlived its loop; an orphan never exits, so this start can never succeed. It must therefore be short enough that `StartLimitBurst` of those attempts **fit inside** `StartLimitIntervalSec` — `3 × (60 + 15) = 225 s < 300 s` — because systemd refuses the start **after** the burst is exceeded: at the old 120 s default the three failures spanned 405 s, the oldest start aged out of the window before the fourth was refused, and the unit restarted forever while every surface read supervised (`ORCH_START_TIMEOUT_SEC` overrides both; the installer refuses any value that does not fit the arithmetic) |
 | `Environment=CONTROLLER_HANDOVER_TIMEOUT=3600` | the wait for a controller this state dir **owns** and that is still running — the **migration** case, where the box being upgraded is landing PRs right now. Long on purpose: a short bound would fail the upgrade instead of adopting the running controller (`ORCH_HANDOVER_TIMEOUT_SEC` overrides; a whole number ≥ 1) |
 | `StandardOutput/Error=journal` | `journalctl -u eldato-orchestrator.service` is the controller's log in service mode |
+| `Environment=ORCH_SUPERVISOR_PIN=<repo>@<sha>` | which revision the unit **boots**, rendered at install time (#2697). `merged ≠ running` was silent: a farmed copy can be days behind `main` and nothing on the box recorded it, so "which code is this cell executing" was answered by `git -C` guesses at a path the unit merely names. Read it from `systemctl show eldato-orchestrator -p Environment`, or from `--status`'s `supervisor_pin=` row. A supervisor outside any git work tree (a farmed copy) records `unknown@unknown` — this is an observation, never a gate. ⛔ **A hand-edited work tree records `<repo>@<sha>+dirty`**, and a `git status` that cannot be read records `unknown@unknown`: `HEAD` names the commit, never the bytes, so an unqualified `<sha>` for a locally-modified supervisor is a confident wrong answer to "which code is this unit executing" (the same rule the supervisor's own provenance stamp follows — *its commit does not describe its bytes*). ⛔ **It is what the NEXT start executes, not a claim about a live process**: `--install` re-renders the unit but deliberately does not restart a healthy controller, so after a checkout advances the two differ until the unit restarts |
+
+⛔ **The `ExecStart` PATH MUST OUTLIVE THE SHELL THAT RENDERED IT** (#2697). "The file exists at
+render time" is not a property systemd can rely on at boot. Measured on cell-1:
+`ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start` — a **lane worktree** at an
+unmerged branch — so once that path goes the unit's `ExecStart` cannot resolve; `Restart=always` burns the
+unit's start limit (**3 attempts inside 300 s**), systemd converges it to `failed` in well under a minute,
+and **nothing pages** — every surface that asks reads a dead unit, not a retrying one. `/tmp` is not its own
+mount on these cells, so the mechanism is `systemd-tmpfiles --clean` once the entry ages out of the window
+the box's own `tmpfiles.d` sets (`D /tmp … 30d` on this fleet's Ubuntu/systemd-255 image, `10d` on some
+others), not a reboot: the box looks healthy for a while and then goes silently dead.
+
+So the installer **refuses to render** a supervisor that resolves into a lane worktree, or under a
+temporary root that no deployment root on this box declares. The roots it accepts under a temporary root
+are the cell's own home (`CELL_HOME`), the operator's `HOME`, and `$AGENT_INFRA_PATH` — because **the
+cells keep their home under `/tmp`** (`/tmp/cell-home`) and their harness pin under it too
+(`/tmp/cell-home/harness/<sha>/scripts/…`, the shape cell-3 measured as correct), so "under `/tmp`"
+alone cannot be the rule without blocking every cell bring-up. The refusal names the durable
+alternatives (`$AGENT_INFRA_PATH/scripts/…`, the harness pin, and `$HOME/.pi/agent/scripts/…`) and writes
+**nothing** — the preview verb refuses too. ⛔ **The farmed path is only viable on a box that already has
+the file there**: `cloud-cell-supervisor.sh` is in **no** `pi-bootstrap` array (setup.sh records it as a named
+residual owned by #1938), so `bash pi-bootstrap/setup.sh` alone does not create it — the refusal says so
+rather than handing an operator a remedy that cannot be followed.
+
+⛔ **"Lane worktree" is decided by GIT — and by the BRANCH, not by being a worktree.** A name list cannot
+be the guard (the measured shape was `/tmp/wt-2433-fu`; the next lane picks the next name, and a copy
+nested one directory deeper matches no pattern). In a **linked** worktree `git rev-parse
+--absolute-git-dir` answers `<main>/.git/worktrees/<name>` while `--git-common-dir` still answers
+`<main>/.git`; in the **main** clone the two are the same directory. ⛔ Those questions (and the pin's) are
+asked with `GIT_DIR`, `GIT_WORK_TREE`, `GIT_COMMON_DIR` and `GIT_INDEX_FILE` **scrubbed**, because an exported
+`GIT_DIR` at the hub makes both answers the hub's and reads a linked worktree as primary — measured, and
+§P7 arms it.
+
+⛔ **NOT EVERY LINKED WORKTREE IS A LANE'S — the cell's harness pin is one too.** The bring-up creates the
+pin with `git worktree add --detach <pin>/<sha> <sha>`, so a rule that refused every linked worktree
+refused the very shape this document calls correct, and the alternative its own refusal message
+recommends: a loop for an operator with no farm. What makes the #2697 shape wrong is a worktree checked
+out **on a branch** — unmerged code a lane removes when it lands — and git answers that directly
+(`symbolic-ref -q HEAD` succeeds on a branch, fails on a detached HEAD). So a linked worktree **on a
+branch** is refused wherever it lives (`/tmp/wt-x`, `$HOME/wt-x`, `<repo>/.worktrees/x`); a **detached**
+one is admitted ONLY when it is the pin TREE this box records — the path in `$CELL_HOME/.harness-path`
+(override: `HARNESS_PIN_FILE`), or, when no record exists yet, under the bring-up's pin root
+`$CELL_HOME/harness` (override: `HARNESS_PIN_DIR`) — because detached is also the shape the fleet's
+**drainer** gives a lane's
+scratch checkout (`ai-drainer.sh`: `git worktree add -f "$AI/wt-drainer-<name>" "$SEED_REF"`, removed with
+`worktree remove --force` when the lane ends), and that one lives under `$HOME`; **every** other detached
+worktree is refused. The pin tree corroborates itself: its directory basename must be a prefix of the
+commit it actually holds, so a scratch named with an unrelated commit id is refused. A **primary clone**
+under a transient root is admitted only when it is checked out on its **default** branch: a clone on any
+other branch is unmerged work a lane removes, so a lane that isolates by cloning instead of
+`git worktree add` is refused exactly like a linked worktree on a branch, while `/tmp/cell-ai` on `main`
+keeps installing. ⛔ **That branch question is asked for a clone under a TRANSIENT root only** — the walk
+returns "durable" for a path outside every temporary root before any clone rule is consulted (linked
+worktrees are the shape refused *wherever* they live). So a **primary** clone under a durable root (say
+`~/agent-infra`) on a lane branch is **admitted**, and the pin records which revision the unit then runs. That
+is a stated limit, not coverage: the fleet's clones live under `/tmp` (`/tmp/cell-ai`) or under their owning
+lane's checkout, which is the transient shape this rule does cover.
+
+**And a DETACHED primary clone is graded, not waved through.** A detached HEAD has no branch name to grade,
+so the helper used to read it as "nothing to be unmerged at" and admit it — which armed a unit at a clone a
+lane detaches at a PR head (`git clone … && git checkout <pr-head>`) and then removes, i.e. the #2697 class
+in a checkout that had no name. The question available without a name is containment: a detached clone is
+admitted when its HEAD is contained in the clone's default ref (`git merge-base --is-ancestor HEAD
+refs/remotes/origin/<default>` — the clone is pinned at the revision its own deployment carries) and
+refused when it is not. The fleet's only legitimately detached checkout is the harness **pin**, which the
+bring-up creates with `git worktree add --detach` and which the linked-worktree rule grades before this one
+is consulted, so no deployment shape is lost. `merge-base --is-ancestor` is **tri-state** — 0 yes, 1 no,
+128 git could not answer — and a read that cannot be made is reported as CANNOT PROVE and refused, never
+folded into a confident "not contained". The graded ref is the **local** `refs/remotes/origin/HEAD` symref,
+which `git clone` derives from the remote and a caller can rewrite: this guard is an **accident guard**
+(`#2697` was an install from a lane worktree with nothing exported), not a boundary against a caller who
+rewrites its own refs.
+
+**Named residual (detached clone, no default ref):** when the clone carries no default ref to compare
+against (a fixture clone with no `origin`), containment cannot be asked, so a detached clone is admitted.
+There is no evidence to refuse on, and fabricating a refusal would false-block a clone that is in fact
+pinned at its own deployment's revision; the residual is stated rather than papered over.
+
+**Named residual:** the pin has three locators — `HARNESS_PIN_DIR`, `HARNESS_PIN_FILE`, and the record
+itself (`$CELL_HOME/.harness-path`) — and all three are how a real box relocates its pin, so a caller that
+deliberately declares a scratch as its own pin root (or writes a record naming one) can still arm it. This
+is an **accident guard** (`#2697` was an install from a lane worktree with nothing exported), not a
+boundary against an operator who declares the scratch deliberately, who can write the unit anyway. The
+record is box state, not a credential. A **primary** clone under `/tmp` (`/tmp/cell-ai`, the cells' own checkout) is
+untouched; and **no declaration launders a lane checkout**: a caller that names its own worktree as
+`AGENT_INFRA_PATH` does not get to admit it. When git cannot identify the checkout at all (a `.git` entry
+it refuses to read — dubious ownership, an unreadable directory), the answer is **cannot prove**, and it
+is refused rather than admitted. Every git read scrubs an ambient `GIT_DIR`/`GIT_WORK_TREE`/`GIT_COMMON_DIR`
+first, because one exported variable otherwise makes a branch worktree answer as a main clone.
+
+The fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`) are refused
+by name as well — a deliberate **coarse pre-filter** that runs before the git test, so it also refuses a
+detached pin under `.worktrees/` (and says which shape matched). That list is the **same** list
+`scripts/install-repair-service.sh` uses — the suite extracts both `case` statements and compares them, so
+a second hand-kept copy cannot drift.
+
+Two callers, two strengths, one owner of the rule:
+
+| seam | when the named path is not durable |
+|---|---|
+| `ORCH_SUPERVISOR` (an operator's requirement) | **refused** — never silently swapped for something else |
+| `ORCH_SUPERVISOR_PREFER` (a caller's preference: `cloud-cell-bringup.sh` names the layer checkout it just installed, so the unit runs the layer's code rather than a possibly-stale farm) | **skipped, loudly**, and the next durable candidate is used; refused only when no durable candidate exists |
+
+Without the preference strength the bring-up would refuse on a lane layer — `self_root` is the lane's own
+checkout whenever a lane runs it — which is a real shape, and the reason the strength exists. The
+preference is a bodyguard, not a hole: a lane's **linked** worktree is refused by the git rule above
+before the preference is consulted, so what the bring-up loses is only the unmerged-code ExecStart it
+must not arm, and it falls through to the **harness pin** (`$CELL_HOME/harness/<pin-sha>`, the box's own
+pinned revision — `check_harness_pin` runs before `check_controller_service`, so it exists by then) and
+then to the farm. ⛔ The pin is graded at preference strength and is tried **before** the two farm paths
+because a pin is this cell's revision where the farm is a possibly-stale copy; note the farm does not ship
+`cloud-cell-supervisor.sh` at all (#1938's named residual), so on a fresh cell the pin is the only
+durable candidate that exists.
 
 ## Install targets
 

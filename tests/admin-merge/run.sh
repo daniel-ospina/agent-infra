@@ -222,21 +222,6 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/admin-merge-suite.XXXXXX")"
 ADMIN_MERGE_LOCK_ROOT="$TMP/rail-locks"
 export ADMIN_MERGE_LOCK_ROOT
 mkdir -p "$ADMIN_MERGE_LOCK_ROOT"
-# ⛔ THE SUITE MUST NOT INHERIT THE HARNESS'S ACTION-PROOF TOKEN EITHER (#3392 review 5, measured).
-# `admin-merge.sh`'s hold-proof at the ACTION site (#2867) runs whenever `CLAIM_ACTION_CLAIMS_SH` is
-# non-empty — it is the harness's own env, exported into every lane, orchestrator child and reviewer
-# on a fleet box. A fixture that inherits it enters that branch with no claim to present and the rail
-# correctly REFUSES (`reason=no-claim`), so on such a box 46 arms of this suite red out while the tree
-# is fine — measured here: 46 false reds with the harness env, 2057/2057 green with it cleared, and the
-# diff between the two runs is NOTHING (the rail's bytes are identical; the only variable is ambient
-# env). A real regression would then be indistinguishable from those 46, which is the false PASS this
-# suite exists to prevent — so the token is cleared, not left to the caller.
-# ⛔ NO ARM HERE TESTS THE HOLD-PROOF (`grep -c CLAIM_ACTION` over this file is 0 before this line), so
-# clearing it removes inheritance without removing a single assertion; a future arm that wants to
-# exercise the proof must SET the three variables itself, which is the only honest way to test it.
-# `unset` rather than `=`, matching `scripts/run-bash-shards.recap.test.sh` and
-# `tests/run-bash-shards-bound/run.sh` §0: the rail reads PRESENCE, so an empty value is not "absent".
-unset CLAIM_ACTION_CLAIMS_SH CLAIM_ACTION_HEAD_TOKEN CLAIM_ACTION_REPO
 checks=0
 failures=0
 # The two new windows default to "one observation, no waiting" for the WHOLE
@@ -16006,17 +15991,19 @@ grep -q 'run view 9871 ' "$SCEN/calls" \
 # ⛔ THE DECLARED EQUIVALENCE ARM (#2610). That same real split is ALSO the one pair the rail
 # declares equivalent (`script-validate` on main CONTAINS `bash-suites (<n>)` on a PR — header,
 # "THE ONE DECLARED LANE EQUIVALENCE"), so this scenario exercises the mapping arm: the answer
-# must be `base-caused via script-validate ≡ bash-suites (5)`, never "no base counterpart".
+# must be `base-caused via script-validate (5) ≡ bash-suites (5)` — ARM-KEYED since #3174, because
+# main's `script-validate` is a matrix and publishes `script-validate (1)` … `(8)` — never "no base
+# counterpart".
 # Two more arms keep that from becoming a blanket excuse: (n1) a check name the mapping does
 # NOT name (`bash-suites-gate`, the nearest near-miss — a prefix rule would only map it if the
 # digits guard were dropped too, i.e. TWO guards stand between them) keeps today's
 # unqualified absence answer, and (n2) is the mutation — with the equivalence
 # deleted the mapped answer must disappear, so these assertions rest on that arm alone.
-# ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: main has no gate
-# JOB, so its two programs run as STEPS inside `script-validate` (named, not line-cited) and
-# that red also has a base counterpart under the other name. (n1) pins the SCOPING decision
-# (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own note says
-# so rather than claiming the programs differ.
+# ⚠️ `bash-suites-gate` IS A KNOWN RESIDUAL, not an absence of counterpart: since #3174 main DOES
+# publish a `script-validate-gate` job holding the same two programs, but the PR side's name and the
+# base side's name still differ, so that red keeps its unqualified absence answer. (n1) pins the
+# SCOPING decision (one declared pair, as briefed) — it is recorded on #2610, and the mapping's own
+# note says so rather than claiming the programs differ.
 echo "== 79. an unattributable failing run is refused BY NAME, with its base counterpart (#2610) =="
 new_scen named-refusal
 HEAD_NR="f9f90000000000000000000000000000000000ab"
@@ -16026,7 +16013,7 @@ lane_fail "$HEAD_NR" 9901 > "$SCEN/runs-$HEAD_NR"
 echo 'bash-suites (5)' > "$SCEN/jobs-failed-9901"
 write_pr_checks "$(check_run 5001 'bash-suites (5)' completed failure 9901)"
 # The base's OWN surface: the same suite under a DIFFERENT name — the split this repo has.
-write_main_checks "$(check_run 4001 'script-validate' completed failure 6101)"
+write_main_checks "$(check_run 4001 'script-validate (5)' completed failure 6101)"
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6101"
 wf_declares .github/workflows/ci-main.yml push          # …declaring NO pull_request trigger
 main_run_map 6101 push 'CI on main'
@@ -16044,8 +16031,8 @@ grep -q "check 'bash-suites (5)'" "$SCEN/err" \
 grep -q "run 9901" "$SCEN/err" \
   && pass "(b) …and the RUN it failed in" \
   || fail "(b) the refusal names no run"
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
-  && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE: base-caused via script-validate ≡ bash-suites (5)" \
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(c) …and answers the base question BY the DECLARED EQUIVALENCE, ARM-KEYED: base-caused via script-validate (5) ≡ bash-suites (5)" \
   || fail "(c) the declared-equivalence answer is missing: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
 # The shard NAME must be carried: the refusal is about ONE shard, and `bash-suites` alone
 # does not say which one.
@@ -16056,7 +16043,7 @@ grep -q "≡ bash-suites (5) (" "$SCEN/err" \
 # EXEMPTED (its workflow declares no pull_request trigger), so it is NOT in the blocking set.
 # An arm reading only the blocking reds finds no counterpart at all — so the `exempt:` CLASS
 # in this answer is what pins the ALL_REDS reader (the false absence this fixture exists for).
-grep -q 'base: base-caused via script-validate ≡ bash-suites (5) (exempt:' "$SCEN/err" \
+grep -q 'base: base-caused via script-validate (5) ≡ bash-suites (5) (exempt:' "$SCEN/err" \
   && pass "(c) …naming the base's own red as EXEMPT even though it is not in the blocking set" \
   || fail "(c) the base's exempted red is missing from the answer (a blocking-set reader finds no counterpart): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -4)"
 grep -q "NO BASE COUNTERPART" "$SCEN/err" \
@@ -16078,7 +16065,7 @@ log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9921"
 : > "$SCEN/log-9922"
 echo 'test (z)' > "$SCEN/jobs-failed-9922"
 write_pr_checks "$(check_run 5021 'test (z)' completed failure 9922)"
-write_main_checks "$(check_run 4021 'script-validate' completed failure 6103)"
+write_main_checks "$(check_run 4021 'script-validate (5)' completed failure 6103)"
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6103"
 wf_declares .github/workflows/ci-main.yml push
 main_run_map 6103 push 'CI on main'
@@ -16267,36 +16254,6 @@ grep -q "NO BASE COUNTERPART" "$SCEN/err" \
 # not a claim that no counterpart exists — see the note on `declared_base_equivalent`.
 # This is also where the base's EXEMPTED red is re-pinned on the UNMAPPED path: the answer
 # still has to name `script-validate` as the base's red.
-# ⛔ (m1)/(m2) — THE MATRIX-TO-MATRIX ARM (#3392). `declared_base_equivalent` now prints TWO candidates,
-# slice first, because main publishes one check PER SLICE since agent-infra#2483. Without an arm whose
-# base red is `script-validate (5)`, deleting that first candidate leaves every assertion above GREEN —
-# they all publish the bare name and therefore exercise only the legacy fallback — so the stronger
-# equivalence ("the SAME shard set") would be unobserved and could regress silently. That is the #2610
-# false-absence class one naming change away, which is exactly what this pair exists to abolish.
-echo "== 79b. the matrix base is mapped SLICE-TO-SLICE, not by the bare name (#3392) =="
-new_scen named-refusal-slice
-HEAD_NS="f9f90000000000000000000000000000000000ac"
-printf '%s\n' "$HEAD_NS" > "$SCEN/head"
-lane_fail "$HEAD_NS" 9911 > "$SCEN/runs-$HEAD_NS"
-: > "$SCEN/log-9911"
-echo 'bash-suites (5)' > "$SCEN/jobs-failed-9911"
-write_pr_checks "$(check_run 5011 'bash-suites (5)' completed failure 9911)"
-# THE BASE'S OWN SURFACE, post-#2483: one check per slice, same slice number, same shard set.
-write_main_checks "$(check_run 4011 'script-validate (5)' completed failure 6111)"
-printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6111"
-wf_declares .github/workflows/ci-main.yml push
-main_run_map 6111 push 'CI on main'
-{ main_red_n mainnr02 9912 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
-run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-rc=$?
-[ "$rc" -ne 0 ] && pass "(m1) a MATRIX base (script-validate (5)) still BLOCKS the unattributable run (exit $rc)" \
-  || fail "(m1) the rail merged over an unattributable run against a matrix base"
-grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN/err" \
-  && pass "(m2) …and answers SLICE-TO-SLICE: base-caused via script-validate (5) ≡ bash-suites (5) — the same shard set" \
-  || fail "(m2) the slice-to-slice answer is missing (a bare-name-only mapping would print 'NO BASE COUNTERPART' here): $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
-  && fail "(m2) …and does not answer with the BARE name when the base publishes only the slice form" \
-  || pass "(m2) …and the answer is the slice form, not the bare fallback (this fixture publishes only the slice, so it pins that the slice candidate is TRIED; the both-present ordering is pinned by the function contract, not here)"
 new_scen named-refusal-unmapped
 # The scenario dir is captured BY NAME because (n3) re-enters it later: `SCEN` is a global
 # that a later `new_scen` overwrites (the cycle-2 P1), and this arm must not inherit another.
@@ -16307,7 +16264,7 @@ lane_fail "$HEAD_NU" 9951 > "$SCEN/runs-$HEAD_NU"
 : > "$SCEN/log-9951"
 echo 'bash-suites-gate' > "$SCEN/jobs-failed-9951"
 write_pr_checks "$(check_run 5051 'bash-suites-gate' completed failure 9951)"
-write_main_checks "$(check_run 4051 'script-validate' completed failure 6104)"
+write_main_checks "$(check_run 4051 'script-validate (5)' completed failure 6104)"
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6104"
 wf_declares .github/workflows/ci-main.yml push
 main_run_map 6104 push 'CI on main'
@@ -16322,9 +16279,45 @@ grep -q "base: base-caused via" "$SCEN/err" \
 grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
   && pass "(n1) …keeping today's unqualified absence answer" \
   || fail "(n1) the unmapped answer changed: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
-grep -qE "^       red: script-validate$" "$SCEN/err" \
+grep -qE "^       red: script-validate \(5\)$" "$SCEN/err" \
   && pass "(n1) …naming the base's EXEMPTED red in the absence answer (the ALL_REDS reader)" \
   || fail "(n1) the base's exempted red vanished from the unmapped answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
+
+# ── (n1b) ARM-KEYED, NOT A NAME FAMILY (#3174). Main publishes `script-validate (1)` … `(8)` now,
+# and the declaration maps ARM k to ARM k. A base red on a DIFFERENT arm must therefore keep the
+# unqualified absence answer — otherwise the map is "any script-validate red", the blanket family
+# rule the block forbids above.
+# ⛔ WHAT THIS ARM ADDS, STATED CORRECTLY (review cycle 1): it is NOT what kills a mutant that drops
+# `${shard}` and returns the whole-job name — arms (c) above already do, because (c) asserts the
+# exact line `base-caused via script-validate (5) ≡ bash-suites (5)` against a base publishing
+# `script-validate (5)` and a bare-name mutant cannot produce it. What ONLY this arm pins is the
+# FAMILY reading ("any `script-validate (<k>)` red is a counterpart"): every other arm here looks at
+# a MATCHING arm, so a map that ignored the extracted shard and accepted any arm would pass them all.
+new_scen named-refusal-wrongarm
+HEAD_NW="f9f90000000000000000000000000000000000e2"
+printf '%s\n' "$HEAD_NW" > "$SCEN/head"
+lane_fail "$HEAD_NW" 9961 > "$SCEN/runs-$HEAD_NW"
+: > "$SCEN/log-9961"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9961"
+write_pr_checks "$(check_run 5061 'bash-suites (5)' completed failure 9961)"
+write_main_checks "$(check_run 4061 'script-validate (4)' completed failure 6105)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6105"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6105 push 'CI on main'
+{ main_red_n mainnw01 9962 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(n1b) a base red on a DIFFERENT arm still BLOCKS (exit $rc)" \
+  || fail "(n1b) the rail merged over an unattributable red"
+grep -q "base: base-caused via" "$SCEN/err" \
+  && fail "(n1b) base arm 4 was mapped to PR arm 5 — the map ignores the shard it extracted" \
+  || pass "(n1b) …and is NOT mapped to the PR's arm (the mapping is arm-keyed, not a name family)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && pass "(n1b) …keeping the unqualified absence answer for a non-matching arm" \
+  || fail "(n1b) the answer changed for a non-matching arm: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -qE "^       red: script-validate \(4\)$" "$SCEN/err" \
+  && pass "(n1b) …and still NAMES the base's own red on arm 4 in the absence answer" \
+  || fail "(n1b) the base's arm-4 red vanished from the absence answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
 
 # ── (n2) MUTATION: DELETE THE EQUIVALENCE, AND THE MAPPED ANSWER MUST GO. The three (c) arms
 # assert a line the mapping arm alone produces; this proves it. The mutant keeps everything
@@ -16349,7 +16342,7 @@ bash -n "$MUTD2/admin-merge.sh" \
 #   ✅ (n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm
 # while the mapping was absent — a green arm asserted rather than verified. Same shape as (m)'s
 # own precondition: the SAME scenario through the UNMUTATED rail must carry the line first.
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN_EQ/err" 2>/dev/null \
   && pass "(n2) precondition: the UNMUTATED rail on this scenario prints the mapped answer" \
   || fail "(n2) precondition FAILED — the unmutated rail never printed the mapped answer, so the absence arm below would pass vacuously: $(grep -c 'base:' "$SCEN_EQ/err" 2>/dev/null || printf 'unreadable')"
 SCEN="$SCEN_EQ" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" \
@@ -16362,7 +16355,7 @@ qrc=$?
 grep -q "BLOCKED — 1 of 1 failing PR run(s)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
   && pass "(n2) the mutant still refuses at step 1c — the refusal is not what the arm adds" \
   || fail "(n2) the mutant did not reach step 1c (exit $qrc): $(head -3 "$SCEN_EQ/eq-mut-err" 2>/dev/null)"
-grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
   && fail "(n2) deleting the equivalence changed nothing — the (c) assertions pin no line the arm produces" \
   || pass "(n2) deleting the equivalence removes the mapped answer: the (c) assertions rest on that arm"
 grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN_EQ/eq-mut-err" 2>/dev/null \
@@ -16634,16 +16627,289 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
   && fail "(o7) the reported bound is the stale pre-clamp 3600s value" \
   || pass "(o7) the reported bound is the clamped one, not the stale explicit value"
 
+# ── (rd) THE WHOLE-ATTEMPT DEADLINE — the rail's ACTUATION gets a bound ────────
+# A bound on each wait is not a bound on the ATTEMPT (#3223). Measured 2026-11-02:
+# five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's
+# bound. These arms drive the attempt clock EARLIER via the fail-safe seam
+# (ADMIN_MERGE_RAIL_STARTED_AT can only make the attempt OLDER), so the expiry is
+# reached on the FIRST poll and the arm is deterministic in seconds — never a CI
+# timeout standing in for an assertion (#3280 cycle 3).
+echo "   ▸ (rd1–rd7) whole-attempt deadline"
+SCEN="$TMP/scen-p1"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 600 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+p1_rc=$?
+set -e
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, ' "$SCEN/err" \
+  && pass "(rd1) an aged attempt REFUSES by name: REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)" \
+  || fail "(rd1) no REFUSED(rail-deadline:…) line — the attempt deadline is not an actuator"
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, 42\)' "$SCEN/err" \
+  && pass "(rd1) the refusal NAMES the PR, so the next supervisor knows which rail died" \
+  || fail "(rd1) the refusal does not name the PR"
+[ "$p1_rc" -ne 0 ] \
+  && pass "(rd1) expiry EXITS NON-ZERO (rc=$p1_rc) — a failed actuation, not a live process" \
+  || fail "(rd1) expiry exited 0 — the bound would leave a supervisor reading SUCCESS"
+grep -q 'NOT a verdict on any run' "$SCEN/err" \
+  && pass "(rd1) the refusal does NOT claim the run stalled — no false stall diagnosis" \
+  || fail "(rd1) the refusal does not disclaim a stall verdict"
+
+# (rd2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
+# FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT = 18064 + 15600 = 33664s,
+# which is above every phase bound that could carry an attempt there, so a rail
+# can never reach it. An override above the reachable ceiling is CLAMPED to it
+# and the clamp is DISCLOSED — the number the rail reports is the number it used.
+SCEN="$TMP/scen-p2"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+set -e
+grep -q 'CLAMPED to the reachable 3400s' "$SCEN/err" \
+  && pass "(rd2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
+  || fail "(rd2) an unreachable deadline was accepted silently — a bound that can never fire"
+grep -qE 'REFUSED\(rail-deadline:[0-9]+s/3400s, 42\)' "$SCEN/err" \
+  && pass "(rd2) the refusal reports the CLAMPED bound, never the unused 33664s" \
+  || fail "(rd2) the refusal reported a bound the rail did not use"
+
+# (rd3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
+# non-integer deadline makes the guard's own `[ -ge ]` ERROR — and under `set -u`
+# without `-e` an erroring `if` body is SKIPPED, so the typo DELETES the bound
+# instead of weakening it. Each arm must REFUSE, naming the knob, never proceed.
+for bad in 10m 99999999999999999999999 0 019864; do
+  SCEN="$TMP/scen-p3-$bad"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE="$bad" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bad_rc=$?
+  set -e
+  if [ "$bad_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_DEADLINE' "$SCEN/err"; then
+    pass "(rd3) ADMIN_MERGE_RAIL_DEADLINE='$bad' is REFUSED BY NAME (rc=2) instead of silently deleting the bound"
+  else
+    fail "(rd3) ADMIN_MERGE_RAIL_DEADLINE='$bad' was accepted (rc=$bad_rc) — a typo disables the guard (fail-open)"
+  fi
+done
+
+# (rd4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
+# MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
+# only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
+# made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
+# guard was never reached". It now asserts the clamp's own DISCLOSURE, which only
+# exists when the clamp ran.
+SCEN="$TMP/scen-p4"; mkdir -p "$SCEN"
+set +e
+SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
+  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+p4_rc=$?
+set -e
+grep -q 'CLAMPED to now' "$SCEN/err" \
+  && pass "(rd4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
+  || fail "(rd4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
+grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
+  && fail "(rd4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
+  || pass "(rd4) …and it produced no spurious refusal (rc=$p4_rc)"
+
+# (rd5) THE SEAM IS VALIDATED LIKE THE KNOB (review cycle 2 P1). An all-digit
+# 23-digit stamp made `[ -lt ]` ERROR, the erroring body was SKIPPED under `set -u`
+# without `-e`, and the age was silently CANCELLED — the young direction. A leading
+# zero was worse: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL.
+for bads in 999999999999999999999999 01767000000 notanepoch; do
+  SCEN="$TMP/scen-p5-$bads"; mkdir -p "$SCEN"
+  set +e
+  SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT="$bads" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+  bads_rc=$?
+  set -e
+  if [ "$bads_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_STARTED_AT' "$SCEN/err"; then
+    pass "(rd5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' is REFUSED BY NAME (rc=2), never a silent age-cancel or octal misread"
+  else
+    fail "(rd5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' was accepted (rc=$bads_rc) — the seam's age can be cancelled or misread"
+  fi
+done
+
+# (rd6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
+# used to print the DEFAULT, so `--print-bounds` said 21454 while a real run used
+# 500 — "reported bound ≠ bound used" in the one field an operator greps.
+SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+grep -q '^rail-deadline=500' "$SCEN/out" \
+  && pass "(rd6) --print-bounds reports the bound IN FORCE (500), not the 21454 default" \
+  || fail "(rd6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
+grep -q '^rail-deadline-source=' "$SCEN/out" \
+  && pass "(rd6) --print-bounds carries the derivation, so the number is auditable" \
+  || fail "(rd6) --print-bounds has no rail-deadline-source line"
+# ⛔ COMPUTED, NOT PINNED (review of the rebase, P2). The property is "the addends the line
+# PRINTS sum to the total it PRINTS" — so read both out of the line and add them here. A pinned
+# literal would go stale on any default change (it already did: the line once listed
+# `SELF_EDIT_WAIT` once while the derivation used it TWICE, and printed 20254 beside a 20554
+# bound), and a stale literal is exactly what this arm exists to catch.
+_pb_line="$(grep '^rail-deadline-source=' "$SCEN/out" || true)"
+_pb_terms="$(printf '%s\n' "$_pb_line" | sed -nE \
+  's/.*FIRST_CHECKS_CEILING ([0-9]+)s \+ RERUN_BUDGET ([0-9]+)s \+ 2 x SELF_EDIT_WAIT ([0-9]+)s \+ MERGE_REF_WAIT ([0-9]+)s \+ REPRO_TIMEOUT ([0-9]+)s = ([0-9]+)s.*/\1 \2 \3 \4 \5 \6/p')"
+read -r _pb_fc _pb_rb _pb_se _pb_mr _pb_rp _pb_tot <<< "$_pb_terms"
+if [ -n "${_pb_tot:-}" ] && [ $(( _pb_fc + _pb_rb + 2 * _pb_se + _pb_mr + _pb_rp )) -eq "$_pb_tot" ]; then
+  pass "(rd6) the derivation's own ADDENDS sum to the bound it prints (${_pb_fc}+${_pb_rb}+2x${_pb_se}+${_pb_mr}+${_pb_rp}=${_pb_tot}) — auditable means arithmetic, not a gesture"
+else
+  fail "(rd6) the printed derivation does not add up to the printed bound (terms='${_pb_terms:-<unparsed>}') — reported != used, one field over"
+fi
+
+# (rd7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
+# (main's #3287 review cycle 3, P2 — kept through the integration). (rd6) pins 500,
+# which is BELOW the ceiling, so it never exercises the clamp branch; and the clamp
+# branch is exactly where the surface printed the raw knob beside a refusal that
+# enforced the clamped value. ⛔ COMPUTED, NOT PINNED, for the same reason as (rd6):
+# the expected number is read from the SAME config's unclamped run, so this arm
+# stays true when a phase bound's default changes.
+SCEN="$TMP/scen-q7-base"; mkdir -p "$SCEN"
+SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+_q7_ceiling="$(sed -nE 's/^rail-deadline=([0-9]+) \(in force\)$/\1/p' "$SCEN/out" | head -1)"
+SCEN="$TMP/scen-q7"; mkdir -p "$SCEN"
+SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
+if [ -n "${_q7_ceiling:-}" ] && grep -qx "rail-deadline=${_q7_ceiling} (CLAMPED from 33664)" "$SCEN/out"; then
+  pass "(rd7) at the CLAMP the inspection surface prints the bound IN FORCE (${_q7_ceiling}) and names what it was clamped from"
+else
+  fail "(rd7) the inspection surface reports a bound the rail is not using (wanted 'rail-deadline=${_q7_ceiling:-<unparsed>} (CLAMPED from 33664)', got '$(grep '^rail-deadline=' "$SCEN/out" | tr '\n' ' ')')"
+fi
+grep -q '^rail-deadline=33664' "$SCEN/out" \
+  && fail "(rd7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
+  || pass "(rd7) it does NOT print the raw unreachable value"
+
+# ⛔ (rd8) THE IN-LOOP CALL SITE — THE PROPERTY THE FEATURE EXISTS FOR, AND THE ONE
+# NOTHING ELSE HERE MEASURES (cycle 5 finding 2). Every other arm drives an attempt that is
+# ALREADY aged when the rail starts, so the MAIN-PATH guard decides it and all N in-loop
+# `rail_guard_poll` calls could be DELETED with the suite still green — the "a rail cannot
+# cross four waits and still live" claim would be unverified where it matters.
+# So the clock is made to STEP: `date +%s` returns base + n × step (n = how many times it has
+# been read), which lets the attempt be YOUNG at the main path and OLD by the third poll of a
+# real wait loop. The refusal's own elapsed is then the discriminator — the main path saw
+# `step`, so any `elapsed ≥ bound` can only have been produced by a LATER call site.
+SKEW_BIN="$TMP/skew-bin"; mkdir -p "$SKEW_BIN"
+printf '%s\n' '#!/bin/sh' \
+  '# `date +%s` STEPS by SKEW_CLOCK_STEP on every read; everything else delegates to the REAL' \
+  '# date (`date -r`, `date -d` are used by the mtime paths and must keep working).' \
+  'case "${1:-}" in' \
+  '  +%s) _n=$(cat "$SKEW_COUNTER" 2>/dev/null || echo 0); _n=$((_n + 1)); printf "%s\\n" "$_n" > "$SKEW_COUNTER"' \
+  '       printf "%s\\n" "$(( $(cat "$SKEW_CLOCK_BASE") + _n * $(cat "$SKEW_CLOCK_STEP") ))" ;;' \
+  '  *)   exec /bin/date "$@" ;;' \
+  'esac' > "$SKEW_BIN/date"
+chmod +x "$SKEW_BIN/date"
+
+# (rd8a) NON-VACUITY: the SAME fixture under the REAL clock must NOT refuse. Without this,
+# a scenario that refuses for an unrelated reason would satisfy (rd8b) and the arm would
+# measure nothing about the deadline.
+new_scen dl-inloop-plain
+HEAD_DL="d1d1000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_DL" > "$SCEN/head"
+lane_fail "$HEAD_DL" 9671 > "$SCEN/runs-$HEAD_DL"
+log_failed 'tests/test_deadline.py::test_long' > "$SCEN/log-9671"
+lane_fail maindl 9672 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9672"
+target_shard 9671 "test (b)"
+green_shard 9673 "test (b)" 30
+: > "$SCEN/status-9671"
+_i=0; while [ "$_i" -lt 60 ]; do printf 'in_progress\n' >> "$SCEN/status-9671"; _i=$((_i + 1)); done
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NOSLEEP_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1799 ADMIN_MERGE_RERUN_FLOOR=1 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err" || true
+grep -q 'REFUSED(rail-deadline:' "$TMP/err" \
+  && fail "(rd8a) the real clock refused a young attempt under a 1799s bound — the arm would pass for the wrong reason" \
+  || pass "(rd8a) …with the real clock and the same 1799s bound the attempt is NOT refused (the arms below rest on the CLOCK, not the fixture)"
+
+# (rd8b) THE IN-LOOP SITE. bound 25, step 5: the main path sees elapsed=5 and passes; each
+# later poll adds 5, so the attempt crosses 25 a few polls INTO the loop. ⛔ 25, not 100: the
+# re-run wait's DERIVED stall bound for this fixture is 60s (2 x the 30s green max), and a
+# deadline larger than it would let STALLED win the race and this arm would measure the
+# wrong refusal.
+new_scen dl-inloop
+printf '%s\n' "$HEAD_DL" > "$SCEN/head"
+lane_fail "$HEAD_DL" 9671 > "$SCEN/runs-$HEAD_DL"
+log_failed 'tests/test_deadline.py::test_long' > "$SCEN/log-9671"
+lane_fail maindl 9672 > "$SCEN/runs-main"
+log_failed 'tests/test_other.py::test_red_on_main' > "$SCEN/log-9672"
+target_shard 9671 "test (b)"
+green_shard 9673 "test (b)" 30
+: > "$SCEN/status-9671"
+_i=0; while [ "$_i" -lt 60 ]; do printf 'in_progress\n' >> "$SCEN/status-9671"; _i=$((_i + 1)); done
+printf '%s\n' "$(/bin/date +%s)" > "$TMP/skew-base"
+printf '5\n' > "$TMP/skew-step"
+printf '0\n' > "$TMP/skew-counter"
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$SKEW_BIN:$NOSLEEP_BIN:$PATH" \
+  SKEW_COUNTER="$TMP/skew-counter" SKEW_CLOCK_BASE="$TMP/skew-base" SKEW_CLOCK_STEP="$TMP/skew-step" \
+  ADMIN_MERGE_RAIL_DEADLINE=25 ADMIN_MERGE_RERUN_FLOOR=1 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd8_rc=$?
+set -e
+[ "$rd8_rc" -ne 0 ] \
+  && pass "(rd8b) a stepping clock crosses the bound and the attempt REFUSES (exit $rd8_rc) — the guard is wired into a real wait loop" \
+  || fail "(rd8b) the attempt never refused under a stepping clock — the in-loop guard is not reached"
+_dl_elapsed="$(sed -nE 's/.*REFUSED\(rail-deadline:([0-9]+)s\/25s, 42\).*/\1/p' "$TMP/err" | head -1)"
+if [ -n "${_dl_elapsed:-}" ] && [ "$_dl_elapsed" -ge 25 ]; then
+  pass "(rd8b) the refusal carries elapsed=${_dl_elapsed}s on a 25s bound — the MAIN path saw 5s, so this came from a LATER (in-loop) call site"
+else
+  fail "(rd8b) no REFUSED(rail-deadline:<n>s/25s, 42) with elapsed >= 25 (got '${_dl_elapsed:-<none>}') — the in-loop call site did not decide it"
+fi
+# ⛔ EITHER loop proves it: the deadline is on the head of the FIRST-CHECKS loop as well as
+# the RE-RUN loop, and which one the fixture reaches first is not the property under test —
+# that the guard runs INSIDE a poll loop is. So the evidence is "the surface was POLLED".
+rd8_reads="$(grep -cE '^(run view 9671|run list)' "$SCEN/calls" 2>/dev/null || true)"
+[ "${rd8_reads:-0}" -ge 2 ] \
+  && pass "(rd8b) …and the wait really POLLED ($rd8_reads surface reads) before the bound was crossed" \
+  || fail "(rd8b) the wait loop never polled (${rd8_reads:-0} surface reads) — the refusal is not evidence of an in-loop guard"
+grep -q 'pr merge' "$SCEN/calls" \
+  && fail "(rd8b) a merge was attempted on a deadline refusal" \
+  || pass "(rd8b) …and nothing merged"
+
+# ⛔ (rd9) BOTH `clock-unreadable` ARMS — new fail-closed exits with NO test at all
+# (review of the rebase, P2). They guard the fail-open this change exists to remove: an
+# erroring `[ -ge ]` under `set -u` without `-e` SKIPS its body, so an unreadable clock used
+# to let a 600s-aged attempt under a 60s bound exit 0. `PATH` is the seam that breaks `date`.
+NODATE_BIN="$TMP/nodate-bin"; mkdir -p "$NODATE_BIN"
+printf '#!/bin/sh\nexit 1\n' > "$NODATE_BIN/date"
+chmod +x "$NODATE_BIN/date"
+
+# (rd9a) the START-SEAM branch validates the clock it reads.
+new_scen dl-clock-start
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NODATE_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1800 \
+  ADMIN_MERGE_RAIL_STARTED_AT=$(( $(/bin/date +%s) - 600 )) \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd9a_rc=$?
+set -e
+if [ "$rd9a_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TMP/err"; then
+  pass "(rd9a) an unreadable clock with the START SEAM set REFUSES by name (exit 1), never proceeds unbounded"
+else
+  fail "(rd9a) an unreadable clock at start exited $rd9a_rc and/or did not name clock-unreadable — the clock is unvalidated there"
+fi
+
+# (rd9b) the GUARD branch validates the clock it reads, on the ordinary (no-seam) path.
+new_scen dl-clock-poll
+set +e
+SCEN="$SCEN" ADMIN_MERGE_GH="$FAKE" CI_FAILURE_SET_GH="$FAKE" ADMIN_MERGE_POLL_INTERVAL=0 \
+  PATH="$NODATE_BIN:$PATH" ADMIN_MERGE_RAIL_DEADLINE=1800 \
+  bash "$ADM" 42 --main-runs 1 >"$TMP/out" 2>"$TMP/err"
+rd9b_rc=$?
+set -e
+if [ "$rd9b_rc" -eq 1 ] && grep -q 'REFUSED(rail-deadline:clock-unreadable' "$TMP/err"; then
+  pass "(rd9b) an unreadable clock at the GUARD REFUSES by name (exit 1) — an unenforceable bound is not a pass"
+else
+  fail "(rd9b) an unreadable clock at the guard exited $rd9b_rc and/or did not name clock-unreadable — the guard would be inert"
+fi
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
-# is push-only and runs the SAME sweep under the other lane's name — `script-validate`, which
-# was ONE unsharded check when this was measured and is one check per slice since
-# agent-infra#2483 (`script-validate (1..8)`). Both shapes are covered below: §79b `(m2)` uses
-# a SLICE-only base, §80 `(a)` a bare-only one. At measurement main was red on the bare
-# `script-validate`, so every PR was red on the shards — and the rail refused every merge
+# is push-only and runs the SAME sweep as `script-validate`. Main is red on
+# `script-validate`, so every PR is red on the shards — and the rail refused every merge
 # for a red NO diff can clear. Measured 2026-11-05: three unrelated PRs (#3478, #3168,
 # #3486) were red on the identical nine checks, and #3478 had zero unique reds.
+#
+# ⛔ THE BASE NAME IS ARM-KEYED HERE, because THIS PR shards main's lane (#3174):
+# `ci-main.yml`'s `script-validate` became a matrix and now publishes `script-validate (1)`
+# … `(8)`, exactly like the PR's `bash-suites (k)`, and `declared_base_equivalent` maps
+# arm k to arm k. The fixtures below therefore name the SHARDED base red. A bare
+# `script-validate` red is NOT a substituted counterpart: after this lands main publishes
+# it only from a pre-shard run still inside the baseline window, and excusing a PR arm on
+# a whole-sweep name is the name-family reading `(n1b)` exists to refuse (it fails CLOSED
+# instead — the pre-#2610 status quo — until a sharded base run is measured).
 #
 # THE RULE UNDER TEST: a red on the PR's evaluated tree is EXCLUDED from the required
 # surface when the BASE's own check surface (read from GitHub, not from a caller flag)
@@ -16655,9 +16921,8 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 # arm must go RED when the exclusion is deleted.
 echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
 
-# (a) THE FIX — the observed block. main fails `script-validate` (the PRE-MATRIX shape of
-# push-only ci-main.yml: one whole-list check, the sharded PR lane's unsharded twin — the
-# slice-form base is §79b (m2)); the PR's tree is red on `bash-suites (3)`.
+# (a) THE FIX — the observed block. main fails `script-validate (3)` (push-only ci-main.yml,
+# the sharded PR lane's arm-keyed twin); the PR's tree is red on `bash-suites (3)`.
 new_scen baseowned-excluded
 HEAD_BO1="b0b0000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BO1" > "$SCEN/head"
@@ -16669,7 +16934,7 @@ write_pr_checks \
 pr_run_map 7201 pull_request 'CI'
 pr_run_map 7202 pull_request 'CI'
 write_main_checks \
-  "$(check_run 6101 'script-validate' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6101 'script-validate (3)' completed failure 8201 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6102 'extension-tests / lint' completed success 8201)"
 main_run_map 8201 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8201"
@@ -16690,7 +16955,7 @@ grep -q "pr merge" "$SCEN/calls" && pass "(a) …and the merge actually happened
 # by the exclusion line (stderr) and by the evidence comment's exclusion block, so it is the
 # one string that makes the "with the base check that owns it" claim deny-able.
 if grep -q "EXCLUDED from the required surface" "$SCEN/err" \
-   && grep -q "the base itself fails 'script-validate'" "$SCEN/err" \
+   && grep -q "the base itself fails 'script-validate (3)'" "$SCEN/err" \
    && grep -q "bash-suites (3)" "$SCEN/err"; then
   pass "(a) …and the excluded red is REPORTED by name, with the base check that owns it"
 else
@@ -16698,26 +16963,6 @@ else
 fi
 grep -q "THE TREE THIS PR PRODUCES IS RED" "$SCEN/err" \
   && fail "(a) the rail still refused at §4.5" || pass "(a) …and §4.5 did not refuse"
-# ⛔ ONE NAME, AND ONLY THE NAME THAT MATCHED (review cycle 3). `declared_base_equivalent` answers
-# with BOTH the slice-to-slice name and the legacy bare name, so a reader that echoes the whole
-# answer emits a TWO-LINE `base_owned`. That is not cosmetic: this arm's base publishes the BARE
-# `script-validate` and nothing else, so a blob answer claims the base fails `script-validate (3)`
-# — a slice it never published — inside the DURABLE comment. It also puts a raw newline inside the
-# TAB-delimited `MAIN_HEALTH_ALL_REDS` record (`<job>\t<kind>`), splitting one record into two.
-# The assertion is deny-able in the right direction: the slice name must NOT be claimed, because
-# this base does not carry it.
-  _bo_stderr_ok=1
-  grep -q "the base itself fails 'script-validate (3)" "$SCEN/err" && _bo_stderr_ok=0
-  grep -q "the base itself fails 'script-validate' on a workflow" "$SCEN/err" || _bo_stderr_ok=0
-  [ "$_bo_stderr_ok" -eq 1 ] \
-    && pass "(a) …and the owner name is the ONE the base publishes (bare), never a slice it never ran" \
-    || fail "(a) the base-owned name is a multi-candidate blob or the wrong candidate — expected exactly 'script-validate': $(grep -n "base itself fails" "$SCEN/err" 2>/dev/null | head -2)"
-  _bo_comment_ok=1
-  grep -q "the base itself fails 'script-validate (3)" "$SCEN/comment" 2>/dev/null && _bo_comment_ok=0
-  grep -q "the base itself fails 'script-validate'" "$SCEN/comment" 2>/dev/null || _bo_comment_ok=0
-  [ "$_bo_comment_ok" -eq 1 ] \
-    && pass "(a) …the DURABLE comment names the same single owner, so the audit record claims nothing false" \
-    || fail "(a) the durable comment carries the blob/wrong owner name: $(grep -n "base itself fails" "$SCEN/comment" 2>/dev/null | head -2)"
 # ⛔ THE ISOLATION PRECONDITION for (a). The merge above must be earned by the EXCLUSION
 # — not by the tree surface having been read as green, nor by the base red having been
 # classified blocking (which would mean a different code path decided). The base red must
@@ -16730,7 +16975,7 @@ grep -q "NOT pull-request-evaluable" "$SCEN/err" \
 # indistinguishable there from a silent drop (the #6807 rule, same reason).
 if [ -f "$SCEN/comment" ] \
    && grep -q "Tree red(s) EXCLUDED from the required surface" "$SCEN/comment" \
-   && grep -q "the base itself fails 'script-validate'" "$SCEN/comment" \
+   && grep -q "the base itself fails 'script-validate (3)'" "$SCEN/comment" \
    && grep -q "bash-suites (3)" "$SCEN/comment"; then
   pass "(a) …and the DURABLE evidence comment carries the excluded red, not just stderr"
 else
@@ -16765,7 +17010,7 @@ grep -q "EXCLUDED from the required surface" "$SCEN/err" \
 grep -q "pr merge" "$SCEN/calls" && fail "(b) a merge was attempted over a red tree" || pass "(b) no merge attempted"
 
 # (c) THE SECOND GUARD — A PR-EVALUABLE BASE RED IS NOT BASE-OWNED. The base's
-# `script-validate` is red here too, but its workflow DECLARES pull_request, so a PR CAN
+# `script-validate (3)` is red here too, but its workflow DECLARES pull_request, so a PR CAN
 # attach that check and §4.5/§4.6 must keep insisting the repair PR clear it (#1261).
 # This is the arm that keeps the new exclusion off the repair direction.
 new_scen baseowned-base-prevaluable
@@ -16774,7 +17019,7 @@ printf '%s\n' "$HEAD_BO3" > "$SCEN/head"
 lane_pass "$HEAD_BO3" 7121 > "$SCEN/runs-$HEAD_BO3"
 lane_pass mainbo3 7122 > "$SCEN/runs-main"
 write_main_checks \
-  "$(check_run 6121 'script-validate' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  "$(check_run 6121 'script-validate (3)' completed failure 8221 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
 main_run_map 8221 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8221"
 wf_declares .github/workflows/ci-main.yml push pull_request
@@ -16808,7 +17053,7 @@ printf '%s\n' "$HEAD_BO4" > "$SCEN/head"
 lane_pass "$HEAD_BO4" 7131 > "$SCEN/runs-$HEAD_BO4"
 lane_pass mainbo4 7132 > "$SCEN/runs-main"
 write_main_checks \
-  "$(check_run 6131 'script-validate' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
+  "$(check_run 6131 'script-validate (3)' completed failure 8231 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)"
 main_run_map 8231 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8231"
 wf_declares .github/workflows/ci-main.yml push
@@ -16861,7 +17106,7 @@ write_pr_checks \
 pr_run_map 7241 pull_request 'CI'
 pr_run_map 7242 pull_request 'CI'
 write_main_checks \
-  "$(check_run 6141 'script-validate' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6141 'script-validate (3)' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6142 'extension-tests / lint' completed success 8241)"
 main_run_map 8241 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8241"
@@ -16894,7 +17139,7 @@ grep -q "pr merge" "$SCEN/calls" && fail "(e) the mutant merged — no defect re
 # every other assertion green — the vacuous-guard class #3442 exists to end (a test that
 # cannot fail is not a test). This arm makes the conjunct load-bearing: the tree's red is
 # `bash-suites (3)` (so `declared_base_equivalent` WOULD match it) but its run map says
-# `schedule`, and the base is red on `script-validate` under a push-only workflow. Without
+# `schedule`, and the base is red on `script-validate (3)` under a push-only workflow. Without
 # the conjunct the red is excluded as base-owned and the merge proceeds; with it the red is
 # the ANOMALY the header calls it and the rail must still refuse.
 new_scen baseowned-noncode
@@ -16910,7 +17155,7 @@ pr_run_map 7251 pull_request 'CI'
 # models: a run a PR cannot attach re-routed to a check on the head sha.
 pr_run_map 7252 schedule 'CI'
 write_main_checks \
-  "$(check_run 6151 'script-validate' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6151 'script-validate (3)' completed failure 8251 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
   "$(check_run 6152 'extension-tests / lint' completed success 8251)"
 main_run_map 8251 push 'CI on main'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8251"
@@ -16959,8 +17204,8 @@ pr_run_map 7262 pull_request 'CI'
 # guard. The second row is therefore written raw with a different app slug: two identities,
 # one name — the real shape of "two apps publish the same check name".
 write_main_checks \
-  "$(check_run 6161 'script-validate' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
-  "$(printf '{"id":6162,"name":"script-validate","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
+  "$(check_run 6161 'script-validate (3)' completed failure 8261 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(printf '{"id":6162,"name":"script-validate (3)","status":"completed","conclusion":"failure","app":{"slug":"third-party-ci"},"started_at":"2026-01-02T00:00:00Z","completed_at":"2026-01-02T00:01:00Z","html_url":"https://github.com/daniel-ospina/agent-infra/actions/runs/8262/job/1"}')"
 main_run_map 8261 push 'CI on main' 8262 pull_request 'CI'
 printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8261"
 printf 'pull_request\tCI\t.github/workflows/ci.yml\n' > "$SCEN/run-8262"
@@ -17188,131 +17433,6 @@ for _bad in 0300 abc; do
     && pass "(f) ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${_bad}' is REFUSED (rc=$rc), not coerced" \
     || fail "(f) ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${_bad}' was accepted (rc=$rc): ${_} $(head -2 "$SCEN/fqb" | tr '\n' ' ')"
 done
-# ── (p) THE WHOLE-ATTEMPT DEADLINE — the rail's ACTUATION gets a bound ────────
-# A bound on each wait is not a bound on the ATTEMPT (#3223). Measured 2026-11-02:
-# five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's
-# bound. These arms drive the attempt clock EARLIER via the fail-safe seam
-# (ADMIN_MERGE_RAIL_STARTED_AT can only make the attempt OLDER), so the expiry is
-# reached on the FIRST poll and the arm is deterministic in seconds — never a CI
-# timeout standing in for an assertion (#3280 cycle 3).
-# The section label is `p1–p7`, NOT a bare `(p)`: main's delegation block above asserts under
-# the id `(p)`, so a bare `(p)` header made a red `❌ (p) rail-exit.test.sh FAILED` line
-# indistinguishable from this section's header at triage time. The arms keep their own ids.
-echo "   ▸ (p1–p7) whole-attempt deadline"
-SCEN="$TMP/scen-p1"; mkdir -p "$SCEN"
-set +e
-SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 600 )) \
-  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-p1_rc=$?
-set -e
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, ' "$SCEN/err" \
-  && pass "(p1) an aged attempt REFUSES by name: REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)" \
-  || fail "(p1) no REFUSED(rail-deadline:…) line — the attempt deadline is not an actuator"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/60s, 42\)' "$SCEN/err" \
-  && pass "(p1) the refusal NAMES the PR, so the next supervisor knows which rail died" \
-  || fail "(p1) the refusal does not name the PR"
-[ "$p1_rc" -ne 0 ] \
-  && pass "(p1) expiry EXITS NON-ZERO (rc=$p1_rc) — a failed actuation, not a live process" \
-  || fail "(p1) expiry exited 0 — the bound would leave a supervisor reading SUCCESS"
-grep -q 'NOT a verdict on any run' "$SCEN/err" \
-  && pass "(p1) the refusal does NOT claim the run stalled — no false stall diagnosis" \
-  || fail "(p1) the refusal does not disclaim a stall verdict"
-
-# (p2) A BOUND THAT CANNOT FIRE IS REFUSED, NOT TRUSTED. #3287's default is
-# FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT = 18064 + 15600 = 33664s,
-# which is above every phase bound that could carry an attempt there, so a rail
-# can never reach it. An override above the reachable ceiling is CLAMPED to it
-# and the clamp is DISCLOSED — the number the rail reports is the number it used.
-SCEN="$TMP/scen-p2"; mkdir -p "$SCEN"
-set +e
-SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 SUITE_RAIL_STARTED_AT=$(( $(date +%s) - 5000 )) \
-  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-set -e
-grep -q 'CLAMPED to the reachable 2500s' "$SCEN/err" \
-  && pass "(p2) an unreachable deadline is CLAMPED to the SUM of the phase bounds and DISCLOSED" \
-  || fail "(p2) an unreachable deadline was accepted silently — a bound that can never fire"
-grep -qE 'REFUSED\(rail-deadline:[0-9]+s/2500s, 42\)' "$SCEN/err" \
-  && pass "(p2) the refusal reports the CLAMPED bound, never the unused 33664s" \
-  || fail "(p2) the refusal reported a bound the rail did not use"
-
-# (p3) THE KNOB IS VALIDATED BY NAME, NOT DEFAULTED SILENTLY (review P1). A
-# non-integer deadline makes the guard's own `[ -ge ]` ERROR — and under `set -u`
-# without `-e` an erroring `if` body is SKIPPED, so the typo DELETES the bound
-# instead of weakening it. Each arm must REFUSE, naming the knob, never proceed.
-for bad in 10m 99999999999999999999999 0 019864; do
-  SCEN="$TMP/scen-p3-$bad"; mkdir -p "$SCEN"
-  set +e
-  SUITE_RAIL_DEADLINE="$bad" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-  bad_rc=$?
-  set -e
-  if [ "$bad_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_DEADLINE' "$SCEN/err"; then
-    pass "(p3) ADMIN_MERGE_RAIL_DEADLINE='$bad' is REFUSED BY NAME (rc=2) instead of silently deleting the bound"
-  else
-    fail "(p3) ADMIN_MERGE_RAIL_DEADLINE='$bad' was accepted (rc=$bad_rc) — a typo disables the guard (fail-open)"
-  fi
-done
-
-# (p4) THE SEAM CANNOT MAKE THE ATTEMPT YOUNGER (review cycle 1 P1) — AND THE ARM
-# MUST DISCRIMINATE. Review cycle 2 found the first version of this arm asserted
-# only the ABSENCE of a refusal, which the BROKEN code also produced (a future stamp
-# made elapsed negative, so nothing fired): it could not tell "CLAMPED" from "the
-# guard was never reached". It now asserts the clamp's own DISCLOSURE, which only
-# exists when the clamp ran.
-SCEN="$TMP/scen-p4"; mkdir -p "$SCEN"
-set +e
-SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT=$(( $(date +%s) + 86400 )) \
-  run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-p4_rc=$?
-set -e
-grep -q 'CLAMPED to now' "$SCEN/err" \
-  && pass "(p4) a FUTURE start stamp is CLAMPED to now and the clamp is DISCLOSED — the attempt can only be made older" \
-  || fail "(p4) no 'CLAMPED to now' disclosure — the seam's clamp is unseen, so 'clamped' and 'guard absent' look identical"
-grep -qE 'REFUSED\(rail-deadline:' "$SCEN/err" \
-  && fail "(p4) a FUTURE start stamp evaded the deadline — the seam is not fail-safe" \
-  || pass "(p4) …and it produced no spurious refusal (rc=$p4_rc)"
-
-# (p5) THE SEAM IS VALIDATED LIKE THE KNOB (review cycle 2 P1). An all-digit
-# 23-digit stamp made `[ -lt ]` ERROR, the erroring body was SKIPPED under `set -u`
-# without `-e`, and the age was silently CANCELLED — the young direction. A leading
-# zero was worse: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL.
-for bads in 999999999999999999999999 01767000000 notanepoch; do
-  SCEN="$TMP/scen-p5-$bads"; mkdir -p "$SCEN"
-  set +e
-  SUITE_RAIL_DEADLINE=60 SUITE_RAIL_STARTED_AT="$bads" run_admin_here 42 --main-runs 1 >/dev/null 2>&1
-  bads_rc=$?
-  set -e
-  if [ "$bads_rc" -eq 2 ] && grep -q 'refusing ADMIN_MERGE_RAIL_STARTED_AT' "$SCEN/err"; then
-    pass "(p5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' is REFUSED BY NAME (rc=2), never a silent age-cancel or octal misread"
-  else
-    fail "(p5) ADMIN_MERGE_RAIL_STARTED_AT='$bads' was accepted (rc=$bads_rc) — the seam's age can be cancelled or misread"
-  fi
-done
-
-# (p6) THE INSPECTION SURFACE REPORTS THE BOUND IN FORCE (review cycle 2 P2). It
-# used to print the DEFAULT, so `--print-bounds` said 20254 while a real run used
-# 500 — "reported bound ≠ bound used" in the one field an operator greps.
-SCEN="$TMP/scen-p6"; mkdir -p "$SCEN"
-SUITE_RAIL_DEADLINE=500 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=500' "$SCEN/out" \
-  && pass "(p6) --print-bounds reports the bound IN FORCE (500), not the 20254 default" \
-  || fail "(p6) --print-bounds does not report the bound in force — the operator is sent to a number the rail is not using"
-grep -q '^rail-deadline-source=' "$SCEN/out" \
-  && pass "(p6) --print-bounds carries the derivation, so the number is auditable" \
-  || fail "(p6) --print-bounds has no rail-deadline-source line"
-
-# (p7) THE CLAMPED CASE IS THE ONE WHERE "reported" AND "used" USED TO DIVERGE
-# (review cycle 3, P2). (p6) pins 500, which is BELOW the ceiling, so it never
-# exercised the clamp — and the clamp branch is exactly where the surface printed
-# the raw 33664 beside a refusal that enforced 20254.
-SCEN="$TMP/scen-p7"; mkdir -p "$SCEN"
-SUITE_RAIL_DEADLINE=33664 SUITE_FIRST_CHECKS_CEILING=100 run_admin_here 42 --print-bounds >/dev/null 2>&1 || true
-grep -q '^rail-deadline=2500 (CLAMPED from 33664)' "$SCEN/out" \
-  && pass "(p7) at the CLAMP the inspection surface prints the bound IN FORCE and names what it was clamped from" \
-  || fail "(p7) the inspection surface reports a bound the rail is not using"
-grep -q '^rail-deadline=33664' "$SCEN/out" \
-  && fail "(p7) it printed the RAW knob — the #3287 value the clamp exists to reject" \
-  || pass "(p7) it does NOT print the raw unreachable value"
-
 # ── (q) EVERY `--jq` PROGRAM IN THE THREE DECLARED FORMS MUST COMPILE ─────────
 # #2598's sibling, and the reason #2598's own repro could not find it: `wait_for_run`'s
 # RE-RUN read carried an UNTERMINATED jq string — one closing `"` short:
@@ -17472,84 +17592,6 @@ else
     fail "(q) $JQ_BAD rail --jq program(s) do not compile — gh fails EVERY read that uses one"
   fi
 fi
-
-# ── 81. THE HEADER'S STATEMENT OF THE LANE EQUIVALENCE MUST MATCH THE CODE ───────────────────
-# (#3392 review 4) `declared_base_equivalent` answers TWO candidates, slice FIRST, because main is
-# a matrix too (agent-infra#2483) — and three blocks of this header went on describing the
-# pre-change shape in the very commit that changed the code: "the single UNSHARDED base check",
-# "ONE job-level red", and a diagram carrying only the bare containment. That is the class the
-# file itself forbids ~90 lines above ("a citation that rots in the very commit that moves the
-# lines reads to the next lane as proof the claim is false"), and it recurred in FOUR places in
-# the one PR that moved the shape (this file's §80 preamble carried two more copies, corrected
-# with it) — so it is PINNED rather than left to the next reader's judgement. Nothing about
-# behaviour is asserted here: only that the header's statement of the mapping is the one the code
-# implements, which is what the (m2)/(n2) arms assume when they read that header as authority.
-echo "== 81. the header states the TWO-candidate mapping the code implements (#3392) =="
-AMSH="$ROOT/scripts/admin-merge.sh"
-
-# hdr_region <file> <start-anchor> <end-anchor> — the block a claim lives in, located by CONTENT and
-# never by line number: this header is edited by nearly every rail change, which is exactly why its
-# citations rot.
-hdr_region() {
-  awk -v s="${2:-}" -v e="${3:-}" '
-    index($0, s) { inb = 1 }
-    inb && !index($0, s) && index($0, e) { exit }
-    inb { print }
-  ' "$1" 2>/dev/null
-}
-
-# hdr_stale <file> — print ONE LINE PER CLAIM the header must not make about the current shape, and
-# NOTHING when the header is accurate. ⛔ SHARED by the shipped file and the mutant below, so the
-# mutant measures THIS predicate instead of a re-implementation of it (the (n2)/(e) discipline).
-hdr_stale() {
-  local f="${1:-}" diag fails
-  diag="$(hdr_region "$f" '── THE ONE DECLARED LANE EQUIVALENCE' '── A CHECK MAIN ITSELF FAILS')"
-  fails="$(hdr_region "$f" '── A CHECK MAIN ITSELF FAILS' '⛔ WHAT THE SUITE DOES AND DOES NOT PROVE')"
-  # ⛔ A SHRUNKEN REGION IS NOT A CLEAN ONE. If an anchor rots, both extractions come back empty and
-  # every "must be absent" probe below would pass for the wrong reason — the empty-scan vacuity (q)
-  # guards against in its own scan. The floors are MEASURED at this head (98 / 88 lines).
-  [ "$(printf '%s\n' "$diag" | wc -l)" -ge 60 ] || printf '%s\n' 'ANCHOR: the diagram block extracted short/empty'
-  [ "$(printf '%s\n' "$fails" | wc -l)" -ge 55 ] || printf '%s\n' 'ANCHOR: the #3322 block extracted short/empty'
-  # THE DIAGRAM must show the pair the code PREFERS, not only the fallback it still prints.
-  printf '%s\n' "$diag" | grep -qF -- 'script-validate (<n>)  (on the BASE' \
-    || printf '%s\n' 'diagram: the BASE side does not name a SLICE check'
-  printf '%s\n' "$diag" | grep -qF -- '≡ bash-suites (<n>)  (on the PR' \
-    || printf '%s\n' 'diagram: the slice EQUIVALENCE (≡) is not shown'
-  # …and the #3322 block must not restate the pre-change shape as the current one.
-  printf '%s\n' "$fails" | grep -qF -- 'to the single UNSHARDED base' \
-    && printf '%s\n' '#3322: still says the mapping is "to the single UNSHARDED base"'
-  printf '%s\n' "$fails" | grep -qF -- 'ONE job-level red' \
-    && printf '%s\n' '#3322: still says a base publishes the sweep as "ONE job-level red"'
-  printf '%s\n' "$fails" | grep -qF -- 'script-validate (<n>)' \
-    || printf '%s\n' '#3322: never names the slice-form counterpart the code answers FIRST'
-  printf '%s\n' "$fails" | grep -qF -- 'PRE-MATRIX' \
-    || printf '%s\n' '#3322: the lane-granular residual is not scoped to a pre-matrix base'
-}
-
-STALE_HDR="$(hdr_stale "$AMSH")"
-if [ -z "$STALE_HDR" ]; then
-  pass "(81) the header states the slice-first TWO-candidate mapping the code implements (0 stale claims)"
-else
-  fail "(81) the header falsifies the mapping the code implements: $(printf '%s' "$STALE_HDR" | tr '\n' '; ')"
-fi
-
-# ── (81m) MUTATION: THE PIN MUST SEE THE HEADER IT EXISTS TO CATCH. The mutant is the shipped
-# header with the pre-change statements PUT BACK — the two the old residual made, and the old
-# diagram line removed — so a pin that cannot redden on THAT cannot redden on a regression either.
-MUT_HDR="$TMP/mut-header.sh"
-awk '
-  { print }
-  /── A CHECK MAIN ITSELF FAILS IS NOT THIS PR.S SURFACE/ {
-    print "# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base"
-    print "# check `script-validate`, and main publishes the sweep as ONE job-level red."
-  }
-' "$AMSH" | grep -vF -e '≡ bash-suites (<n>)' > "$MUT_HDR"
-MUT_STALE="$(hdr_stale "$MUT_HDR")"
-N_STALE="$(printf '%s\n' "$MUT_STALE" | grep -c . || true)"
-case "$N_STALE" in '' | *[!0-9]*) N_STALE=0 ;; esac
-[ "$N_STALE" -ge 3 ] \
-  && pass "(81m) …and the pin REDDENS on the pre-change header: $N_STALE stale claim(s) seen in the mutant" \
-  || fail "(81m) the pin cannot see the pre-change header ($N_STALE stale claims seen) — it would pass over the regression it exists to catch"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"

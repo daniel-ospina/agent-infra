@@ -66,6 +66,18 @@ PASS=0; FAIL=0
 # would still cascade).
 export LANE_PREFLIGHT=0
 
+# ⛔ THE AMBIENT `WIP_PATH` IS CLEARED FOR THE SAME REASON `LANE_PREFLIGHT` IS — AND IT IS THE SAME
+# DECLARED-SEAM SHAPE, NOT A HIDDEN `unset` (measured 2026-11-07, running this suite FROM A FIXER LANE,
+# which is where lanes run it). A lane's envelope exports `WIP_PATH=<its own worktree>`, and the shipped
+# exit path honours it: `root="${WIP_PATH:-$PWD}"` (spawn-gate.sh). Left in place it OUTRANKS the
+# fixture's `cd "$WT"`, so every rescue arm rescued the CALLER's worktree — 250 passed / 37 failed on a
+# tree whose own `refs/wip/*` is not the one under test — and the same inheritance made the arm push a
+# rescue ref to the CALLER's real origin. Cleared for the same reason the capability gate is: the arms
+# below are about the RESCUE CONTRACT, and the envelope of whoever runs the suite is not their subject.
+# ⛔ NOT VACUOUS: §W0 asserts the declaration is in force, so deleting this line is red on any box whose
+# caller exports `WIP_PATH` (measured: 250/37 with the ambient value, 287/0 with this line).
+export WIP_PATH=
+
 # ⛔ DEFECT B — A FAILING ARM MUST SHOW THE CHILD'S OWN WORDS, NOT A NUMBER.
 # Every arm below used to run `run_agent … >/dev/null 2>&1`. That is how the CI failure above became
 # an unreasoned `rc=71 started=0`: the refusal, its reason (`why=pi-missing`) and the gate that
@@ -241,6 +253,16 @@ PFO="$TMP/pf-O"; mkdir -p "$PFO/logs" "$PFO/state"
 # declaration load-bearing on every box.
 ck "S0 this suite's OWN pre-flight declaration is in force, so the arms below cannot silently inherit a LIVE capability gate" \
   $([ "${LANE_PREFLIGHT:-}" = "0" ] && echo 0 || echo 1)
+# ⛔ W0 IS S0's MIRROR FOR THE OTHER INHERITED VALUE, AND IT EARNS ITS ROW THE SAME WAY. The arms below
+# drive the shipped `run_agent`, whose exit path roots the rescue at `"${WIP_PATH:-$PWD}"` — so a
+# caller's `WIP_PATH` OUTRANKS the fixture's `cd "$WT"` and every rescue arm measures the CALLER's tree
+# instead (measured 2026-11-07 from a fixer lane: 250 passed / 37 failed, and a rescue ref written to the
+# caller's real origin). With the declaration above in place it must read empty HERE, in this shell.
+# Like S0 it can only redden on a box whose caller exports the value — which is the only box where the
+# declaration does anything, so the honest statement is that it makes the line load-bearing there, not
+# that it reddens everywhere.
+ck "W0 this suite CLEARS an inherited WIP_PATH, so the arms below rescue the FIXTURE worktree and not the caller's" \
+  $([ -z "${WIP_PATH:-}" ] && echo 0 || echo 1)
 pi_stub clean
 mkfake_pf pi-missing 2
 : > "$PFO/logs/preflight.log"; rm -f "$PFO/pi.log"
@@ -3434,7 +3456,11 @@ git -C "$WT" checkout -q -b fix/4242-first-attempt 2>/dev/null
 git -C "$WT" push -q -u origin fix/4242-first-attempt 2>/dev/null
 pi_stub dirty
 : > "$O/logs/lane.log"
-PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_RESERVE_MB=0 \
+# ⛔ ALL FOUR DISK TERMS, NOT THREE (disk-admission.test.sh §I). With `DISK_LANE_SELF_MB` unstated the
+# lane-headroom term defaults to this host's own cost (6144 MB), so on a host with free space between
+# the 1 MB floor and that default the arm's subject becomes a DISK-NOHEADROOM refusal instead — the
+# arm then measures the box, not the WIP rescue it exists for.
+PATH="$TMP/bin:$PATH" PI_LOG="$O/pi.log" DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0 \
   drive "$GATE" 300 "issue-shaped" >/dev/null 2>&1
 arm "$O/logs/lane.log"
 PW_REF="$(git -C "$BARE" for-each-ref --format='%(refname)' 'refs/wip/*' 2>/dev/null | grep -c 'refs/wip/issue-4242-first-attempt$' || true)"

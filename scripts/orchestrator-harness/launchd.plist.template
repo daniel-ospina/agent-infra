@@ -98,6 +98,14 @@
     <key>UV_LINK_MODE</key>
     <string>__UV_LINK_MODE__</string>
 
+    <!-- ⛔ THE ENTRYPOINT OVERRIDE REACHES THE DAEMON (#3243 review cycle-2, F3). `orch-pin-exec.sh`
+         selects the controller it execs from `ORCH_ENTRY` in ITS OWN environment; launchd supplies that
+         environment from this file. Rendered ONLY when the operator passed `HARNESS_ENTRY` to
+         install.sh — empty otherwise, so the stub's own preference applies and install-time validation
+         and runtime behaviour can never name different entrypoints. -->
+    <key>ORCH_ENTRY</key>
+    <string>__ORCH_ENTRY__</string>
+
     <!-- target -->
     <key>OR</key>
     <string>__OR__</string>

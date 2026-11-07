@@ -569,6 +569,76 @@ if [ "$NEG_OK" -eq 1 ]; then
                             || bad "truncation-writer: .pool-sat exists for an unsaturated listing ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the signal would fire on every pass and stop meaning anything"
 fi
 
+
+# ⛔ AND THE RECORD IS PER-PASS, NOT ACCUMULATED (review P3, cycle 60). `.pool-sat` is only ever APPENDED to;
+# the ONE thing that makes it describe THIS pass is the `rm -f … "$O/.pool-sat"` in the entry reset. Every
+# case above runs in a FRESH `$D`, so none of them could see that term: dropping it left this suite, rank-queue,
+# pool-filter and product-floor all green — and the next pass then discloses a clip from a read that reported
+# none ("a tier window ended FULL with a next page still advertised" over a listing that fit), i.e. an alarm
+# that cries wolf on every pass after any clip. Driven as the failure needs: TWO passes in ONE `$O`.
+mk_case sat-writer-stale 1000
+mk_gh_sat "$D"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+# ⛔ A FAILED REDIRECTION IS REPORTED BY THE SHELL, NOT BY `tr` (review P3, cycle 61): `cmd < missing 2>/dev/null`
+# still prints `bash: <missing>: No such file or directory` on stderr — the shell reports the redirect before
+# the command's own stderr is redirected. The read is braced, exactly as the shipped reader does it.
+stale_first="$( { tr '\n' ' ' < "$D/o/.pool-sat"; } 2>/dev/null || true)"
+mk_gh "$D" "$(rows 2)"        # THIS pass: a short listing, no full window, no next page
+rf "$D" refresh
+stale_second="$( { tr '\n' ' ' < "$D/o/.pool-sat"; } 2>/dev/null || true)"
+if [ -z "$stale_first" ]; then
+  bad "truncation-stale: the FIRST pass recorded nothing ('$stale_first') — the second-pass assertion below would pass by vacuity"
+elif [ "$RC" -ne 0 ]; then
+  bad "truncation-stale: the second pass did not succeed (rc=$RC) — output: $OUT"
+elif [ -s "$D/o/.pool-sat" ]; then
+  bad "truncation-stale: the SECOND pass (an unsaturated listing) still carries the first pass's clip ('$stale_second') — the record is not per-pass, so the order line would disclose a truncation this read never saw"
+else
+  ok "truncation-stale: a second pass over a SATURATED first pass records NO clip (the .pool-sat reset makes the record per-pass)"
+fi
+# ⛔ NON-VACUITY: delete `"$O/.pool-sat"` from the entry reset and the assertion above must go RED.
+MUT_STALE="$T/mut-stale/refresh-candidates.sh"; mkdir -p "$T/mut-stale"
+sed 's/^rm -f "\$O\/\.pool-err" "\$O\/\.pool-read" "\$O\/\.pool-sat"$/rm -f "$O\/.pool-err" "$O\/.pool-read"/' \
+  "$REFRESH" > "$MUT_STALE"
+# ⛔ THE GATE MEASURES THE TERM IT IS ABOUT (review P3, cycle 63). `cmp -s` cannot distinguish "the anchor
+# drifted" from "the reset no longer carries `.pool-sat` at all" — and the second IS the regression this half
+# exists to catch, so blaming the anchor sent the maintainer to the fixture instead of to the deleted term.
+# Ask for the term first (the `_arm14_mut` precedent: a POSITIVE measurement, then the byte comparison).
+# ⛔ FOUR STATES, FOUR TRUE SENTENCES — MEASURED, NOT GUESSED (review P3, cycles 63-64). Everything that named a
+# cause here was wrong at least once: counting the term ANYWHERE read 4 shipped / 3 with the reset term deleted
+# (`.pool-sat` also appears in the three WRITER lines), and anchoring on the first `^rm -f ... .pool-err` line
+# handed back one of the OTHER reset lines — measured: with the entry reset DELETED the message quoted the
+# partial-read reset (`rm -f "$O/.pool-err" "$O/.pool-read"`) as "its line", so the "not found" branch could
+# never fire. Two counts settle it: HOW MANY unindented reset lines exist, and HOW MANY of them carry the term.
+#   shipped          2 / 1  -> the term is present, the byte comparison below is meaningful
+#   term removed     2 / 0  -> THE REGRESSION this half exists to catch
+#   line deleted     1 / 0  -> the same regression class (the record is no longer reset per pass)
+#   anchor drifted   0 / 0  -> the fixture's own anchor, and the only state that blames it
+_stale_all="$(grep -cE '^rm -f "\$O/\.pool-err" "\$O/\.pool-read"' "$REFRESH" 2>/dev/null)"
+_stale_sat="$(grep -cE '^rm -f "\$O/\.pool-err" "\$O/\.pool-read" "\$O/\.pool-sat"$' "$REFRESH" 2>/dev/null)"
+if [ "${_stale_all:-0}" = "0" ]; then
+  bad "truncation-stale: NO unindented 'rm -f \"\$O/.pool-err\" \"\$O/.pool-read\"' line exists — the fixture's anchor drifted (the script's reset lines changed shape), so this non-vacuity half grades nothing"
+elif [ "${_stale_sat:-0}" = "0" ]; then
+  bad "truncation-stale: none of the ${_stale_all} unindented reset line(s) carries .pool-sat (the shipped script has 2, one of them the entry reset) — the reset LOST its term, or the entry reset line is gone; either way the record is no longer per-pass, which IS the regression this half exists to catch"
+elif cmp -s "$REFRESH" "$MUT_STALE" 2>/dev/null; then
+  bad "truncation-stale: the reset-deletion mutation did not apply — the sed anchor drifted (the term IS present, so this half's own anchor is what to check), so this non-vacuity half grades nothing"
+else
+  D2="$T/sat-writer-stale-mut"; mkdir -p "$D2/home" "$D2/bin" "$D2/o" "$D2/repo/.worktrees/dispatch-scout/tools"
+  git init -q --bare "$D2/origin.git"; git init -q "$D2/repo"; git -C "$D2/repo" remote add origin "$D2/origin.git"
+  printf '1000' > "$D2/core"
+  printf 'claim_issue_preflight() { return 0; }\n' > "$D2/o/claims.sh"
+  mk_gh_sat "$D2"
+  mk_tool "$D2/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+  REFRESH_SAVED2="$REFRESH"; REFRESH="$MUT_STALE"; rf "$D2" refresh; REFRESH="$REFRESH_SAVED2"
+  mk_gh "$D2" "$(rows 2)"
+  REFRESH_SAVED2="$REFRESH"; REFRESH="$MUT_STALE"; rf "$D2" refresh; REFRESH="$REFRESH_SAVED2"
+  if [ -s "$D2/o/.pool-sat" ]; then
+    ok "truncation-stale: with the .pool-sat reset DELETED the second pass still carries the clip ('$(tr '\n' ' ' < "$D2/o/.pool-sat" 2>/dev/null)') — the check above grades the RESET, not a fixture artifact"
+  else
+    bad "truncation-stale: with the .pool-sat reset deleted the clip did NOT persist — the check above is not grading the reset"
+  fi
+fi
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -275,7 +275,7 @@ awk '/^  # \[drain-escape:begin\]/{f=1} f{print} /^  # \[drain-escape:end\]/{if(
 # sentinel; and an extracted `if … then` with no `fi` is a SYNTAX ERROR at EOF, which aborted the source
 # midway (the escape's own log lines still landed, which is exactly how a "wired" test reads green while
 # nothing dispatches — the same failure the real block had).
-awk '/^  if \[ "\$\{LO_CHOICE:-none\}" != "issue" \] && \[ -z "\$GATE_WHY" \]/{f=1} f&&/^  if \[ -z "\$GATE_WHY" \]; then/{print; print "    : > \"\$O/state/dispatched\""; print "  fi"; exit}' "$LOOP" >> "$EXTRACT"
+awk '/^  if \[ "\$\{LO_CHOICE:-none\}" != "issue" \] && \[ -z "\$GATE_WHY" \]/{f=1} f&&/^  if \[ -z "\$GATE_WHY" \]; then/{print; print "    : > \"$" "O/state/dispatched\""; print "  fi"; exit}' "$LOOP" >> "$EXTRACT"
 bash -n "$EXTRACT" || bad "(b-wired) the extracted block is not valid shell — the drive would abort midway"
 check "(b-wired) the block was found in orch-loop.sh (a marker rename would otherwise skip it)" "[ -s '$EXTRACT' ] && grep -q 'pl_escape_open' '$EXTRACT' && grep -q 'LO_CHOICE=issue' '$EXTRACT'"
 

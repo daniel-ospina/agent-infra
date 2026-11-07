@@ -776,6 +776,99 @@ PATH="$_ghdir/bin:$PATH"
 _rdir=$(mktemp -d)
 H=3333333333333333333333333333333333333333
 _marker_count() { grep -cF -- "<!-- auto-rail-review:$1" "$POSTED" 2>/dev/null || true; }
+# ── THE NEXT STATEMENT AFTER AN ANCHOR, COMMENTS AND BLANKS SKIPPED ──────────────────────────────
+# ⛔ "IS THE VERY NEXT LINE THE CONSUMER" IS THE WRONG QUESTION, TWICE OVER (review round 10, P1,
+# measured). It forbids a legitimately inserted COMMENT between two adjacent statements, and — the real
+# defect — it accepts a line that holds a STATEMENT followed by the expected text behind it. What these
+# arms mean is "is the next STATEMENT the consumer", and that is what this answers: the first line after
+# `$1`'s match that is neither blank nor a pure comment. Two anchors separated by documentation are still
+# adjacent; two anchors with a statement between them are not.
+# (`grep -q` below is fed by a here-string, never a pipe — a builtin writer piped into a quiet grep is the
+# SIGPIPE false-negative idiom scripts/check-no-sigpipe-grep.sh refuses, #841/#864.)
+# ⛔ THE PATTERN GOES IN THROUGH THE ENVIRONMENT, NOT `-v` (review round 10, measured): awk processes
+# escape sequences in a `-v` assignment, so `\$\(` arrived as `$(` and the anchored ERE silently became a
+# GROUPING expression — the arm then matched nothing and FAILED OPEN on a correct tree (and would have
+# matched almost anything on a broken one). `ENVIRON` is taken literally.
+_after_stmt() {
+  AS_RE="$1" awk '
+    BEGIN { re = ENVIRON["AS_RE"] }
+    flag && $0 !~ /^[[:space:]]*(#|$)/ { print; exit }
+    !flag && $0 ~ re { flag=1 }
+  ' "$SUT"
+}
+# ⛔ ANY-OCCURRENCE IS NOT A PIN, AND FIRST-MATCH IS NOT THE LIVE STATEMENT (review round 12, P2,
+# MEASURED). `grep -qE` is satisfied by a DECOY duplicate of a pinned block placed above the real one, and
+# `_after_stmt` reads the FIRST anchor it finds — so a duplicated block let the LIVE statements be mutated
+# with every arm green (measured: a copy of the four-line hand-off block, with the live `_rattn=0`, passed).
+# An exactly-once anchor plus a next-statement read is the pair that pins ONE live chain: one occurrence,
+# each successor required to be the next STATEMENT.
+_pin_once() {  # $1 = anchored ERE, $2 = what it pins
+  _n=$(grep -cE "$1" "$SUT" 2>/dev/null || true)
+  [ "${_n:-0}" = 1 ] \
+    || bad "$2 — expected EXACTLY ONE matching line, found ${_n:-0}: a decoy duplicate satisfies an any-occurrence pin while the live statement is mutated (a second, identical copy is not a second safety net, it is a blindfold)"
+}
+_pin_next() {  # $1 = anchor ERE, $2 = the ERE its next STATEMENT must match, $3 = the consequence
+  _nx=$(_after_stmt "$1")
+  grep -qE "$2" <<<"$_nx" \
+    || bad "$3 (found: '${_nx:-MISSING}')"
+}
+
+# ⛔ THE rc-2 DISCRIMINATOR IS PART OF THE GATE (review round 13, P2, measured): the block that publishes
+# `review-found-issues` (rc=7) or `review-record-unbound` (rc=0/5, a clean record whose body marker is missing)
+# is reached by BOTH states, and one line decides which text a head gets. Nothing pinned that line or the
+# pairing of branches to publishes, so `= issues` -> `= clean` (bodies left in place), `!= issues`, exchanging
+# the two bodies, moving the publish INTO the `issues` branch, or hoisting it ABOVE the discriminator all left
+# the suite green — an rc=7 head told "a record EXISTS" when none does, and a clean-but-unbound head told
+# nothing at all (the #3489 invisibility). Both markers are presence-keyed, so the wrong one is the operator's
+# only visible surface and nothing later supersedes it.
+# ⛔ PIN THE BLOCK'S ORDER, NOT A COUNT OF LINES IN THE FILE: relocation keeps an any-occurrence count at 1, so
+# the four statements are pinned as a SEQUENCE inside the extracted rc-2 block.
+# (The `if` anchor tolerates a trailing comment — a comment is not a behaviour change, and an anchor that dies
+# on one reports a "decoy duplicate" that does not exist.)
+_RSTISSUESRE='^[[:space:]]*if \[ "\$_rstate" = issues \]; then([[:space:]]*#.*)?$'
+_rc2=$(sed -n '/^[[:space:]]*if \[ "\$_ract" -eq 2 \]; then$/,/^[[:space:]]*fi$/p' "$SUT")
+[ -n "$_rc2" ] \
+  || bad "the rc-2 window must exist as its own block ('if [ \"\$_ract\" -eq 2 ]; then' … 'fi') — without it the two rc-2 states have no owner"
+[ "$(printf '%s\n' "$_rc2" | grep -cE "$_RSTISSUESRE")" = 1 ] \
+  || bad "the rc-2 discriminator must appear exactly ONCE inside the rc-2 block ('if [ \"\$_rstate\" = issues ]; then') — a swapped ('= clean'), inverted ('!= issues') or duplicated discriminator makes the two rc-2 states publish each other's text, and both markers are presence-keyed so nothing later corrects it"
+_rc2_fi=$(printf '%s\n' "$_rc2" | grep -nE '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head"$' | head -1 | cut -d: -f1)
+_rc2_ru=$(printf '%s\n' "$_rc2" | grep -nE '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-record-unbound "\$head"$' | head -1 | cut -d: -f1)
+_rc2_el=$(printf '%s\n' "$_rc2" | grep -nE '^[[:space:]]*else$' | head -1 | cut -d: -f1)
+_rc2_dis=$(printf '%s\n' "$_rc2" | grep -nE "$_RSTISSUESRE" | head -1 | cut -d: -f1)
+# ⛔ AND THE DISCRIMINATOR MUST BE THE BLOCK'S FIRST STATEMENT (review round 13 verification, category A,
+# measured): inserting `continue` (or `return`) on the line after `if [ "$_ract" -eq 2 ]; then` kept every
+# other arm green while BOTH rc-2 states published NOTHING — the rc=7 head lost its findings notice and the
+# clean-but-unbound head lost the recorder remedy, permanently, since the key never changes without a new
+# head. A successor pin protects a statement; only a FIRST-statement pin protects entry into the block.
+_rc2_first=$(printf '%s\n' "$_rc2" | awk '
+  flag && $0 !~ /^[[:space:]]*(#|$)/ { print; exit }
+  !flag && /^[[:space:]]*if \[ "\$_ract" -eq 2 \]; then$/ { flag=1 }
+')
+grep -qE "$_RSTISSUESRE" <<<"${_rc2_first:-}" \
+  || bad "the rc-2 block must ENTER at its discriminator (first statement found: '${_rc2_first:-MISSING}') — a continue/return or a guard inserted before it silences BOTH rc-2 states at once (the review's findings notice and the recorder remedy), with every other arm green"
+[ -n "$_rc2_fi" ] && [ -n "$_rc2_ru" ] && [ -n "$_rc2_el" ] && [ -n "$_rc2_dis" ] \
+  || bad "the rc-2 block must contain ALL FOUR statements — the discriminator, an 'else', and one publish per branch (found discriminator=${_rc2_dis:-MISSING} else=${_rc2_el:-MISSING} issues-publish=${_rc2_fi:-MISSING} unbound-publish=${_rc2_ru:-MISSING}); a missing publish leaves that state invisible and a missing 'else' leaves it unreachable"
+# ⛔ GUARDED, OR THE FAIL PATH PRINTS BASH NOISE (review round 13 verification): `bad` only sets `fail=1`, so
+# execution continues; comparing an EMPTY value made `[: : integer expression expected` appear on the
+# operator's log beside the real failure. Every operand is defaulted before it is compared.
+: "${_rc2_dis:=0}" "${_rc2_fi:=0}" "${_rc2_el:=0}" "${_rc2_ru:=0}"
+[ "$_rc2_dis" -lt "$_rc2_fi" ] && [ "$_rc2_fi" -lt "$_rc2_el" ] && [ "$_rc2_el" -lt "$_rc2_ru" ] \
+  || bad "in the rc-2 block the ORDER must be discriminator -> review-found-issues publish -> else -> review-record-unbound publish (found discrimin=${_rc2_dis:-?} issues=${_rc2_fi:-?} else=${_rc2_el:-?} unbound=${_rc2_ru:-?}) — moving either publish into the other branch, or hoisting one above the discriminator, publishes a state the loop did not measure (a record claimed where none exists, or a clean-but-unbound head told its review found blocking issues)"
+# ⛔ AND THE `else` BRANCH IS PINNED BY EXECUTION TOO (review round 13 verification, P3, measured): position
+# plus an any-occurrence count left the symmetric hole — wrapping the publish in `if false; then` keeps its
+# line number and its single occurrence while making it DEAD, so a clean-but-unbound head publishes nothing at
+# all and nothing later supersedes that (the #3489 invisibility, made permanent). The `issues` branch was
+# already pinned this way one line above; this is the same shape for the other branch.
+_rc2_elsenext=$(printf '%s\n' "$_rc2" | awk '
+  flag && $0 !~ /^[[:space:]]*(#|$)/ { print; exit }
+  !flag && /^[[:space:]]*else$/ { flag=1 }
+')
+grep -qE '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-record-unbound "\$head"$' <<<"${_rc2_elsenext:-}" \
+  || bad "the 'else' branch must publish review-record-unbound as its FIRST statement (found: '${_rc2_elsenext:-MISSING}') — a guard in front of it turns the publish dead while keeping its position and its single occurrence, and a clean-but-unbound head then publishes nothing at all"
+_pin_next "$_RSTISSUESRE" '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head"$' \
+  "the 'issues' branch must publish review-found-issues (head-bound, no record basis) as its FIRST statement — a comment or a continue statement in between leaves the state unpublishable"
+_pin_once '^[[:space:]]*publish_review_state "\$repo" "\$pr" review-record-unbound "\$head"$' \
+  "review-record-unbound must be published exactly once — the recorder remedy is the only thing that makes a clean-but-unbound head visible, and #3489 is exactly the PR that looked like nobody had looked at it"
 
 # ── STATE 1 — ATTESTED AT HEAD: the rail runs, no reviewer is dispatched ──────────────────────────
 # (Pinned where the decision is MADE, in the search arms above: `green 7 at-head`.) What this arm adds
@@ -841,7 +934,13 @@ awk '/the red arm owns this PR"$/{f=1;next} f&&/^[[:space:]]*continue$/{found=1;
 [ "$(_arm red rejected)"  = skip ] || bad "a RED candidate whose only head-bound record is verdict=not-clean must be SKIPPED, not re-reviewed and not railed (got '$(_arm red rejected)')"
 # …and the loop must PUBLISH that state rather than let it read as 'nobody has looked at this': the head
 # HAS been reviewed and rejected, and the remedy is a fix (a new head), which is what the message says.
-grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"'  <<<"$(grep -A2 -F 'if [ "$_att" = rejected ]; then' "$SUT" || true)" \
+_REJPUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head" record$'
+# ⛔ `-A2` IS A WINDOW, NOT A POSITION (review round 12, P2, MEASURED): three comment lines inserted between
+# the `if` and the publish RED-ed this arm while the publish sat there unchanged — a false block on
+# documentation, and a hole in the other direction the moment a statement is what moves. The next STATEMENT
+# is the question.
+_REJNEXT=$(_after_stmt '^[[:space:]]*if \[ "\$_att" = rejected \]; then$')
+grep -qE "$_REJPUBRE"  <<<"$_REJNEXT" \
   || bad "a NOT-CLEAN record at the head must PUBLISH 'review-found-issues' (head-bound) — otherwise a PR blocked on its own rejected review is indistinguishable from a PR nobody has looked at, which is the #3489 invisibility on the one class where at-head also disables the review arm"
 _empty_arm=$(_arm "" "")
 [ "$_empty_arm" = rail ] || bad "an UNCLASSIFIABLE candidate must default to the RAIL — the arm that spends nothing — never to a paid review (got '$_empty_arm')"
@@ -875,8 +974,15 @@ grep -qF 'continue' <<<"$(grep -A1 -F 'AWAITING-REVIEW ($_att) and its checks ar
 # published `review-in-flight` — a claim that something is running — on a box with no reviewer at all.
 # ⛔ AND NO REVIEWER MEANS NO DISPATCH. Same gate-vs-text distinction: the expression alone is satisfied
 # while the loop dispatches into a reviewer that does not exist and publishes 'review in flight' for it.
-grep -qF 'continue'  <<<"$(grep -A2 -F '[ "$REVIEW_AVAILABLE" != 1 ]' <<<"$_branch" || true)" \
+grep -qF 'continue'  <<<"$(grep -A12 -F '[ "$REVIEW_AVAILABLE" != 1 ]' <<<"$_branch" || true)" \
   || bad "the review branch must REFUSE to dispatch when no reviewer is available — the '[ \"\$REVIEW_AVAILABLE\" != 1 ]' guard must be followed by a 'continue'; without it a box with no reviewer records a dispatch, counts an attempt against the cap, and tells the PR 'review in flight'"
+
+# ⛔ AND THAT EXIT MUST PUBLISH (review round 16, P2, measured): with no usable reviewer AND free capacity
+# neither deferral path runs, so this is the only exit that can tell such a PR anything — it published
+# nothing, leaving a mergeable green unattested PR with no auto-rail comment at all.
+_ravail=$(sed -n '/^        if \[ "\$REVIEW_AVAILABLE" != 1 \]; then/,/^        fi$/p' "$SUT")
+grep -qF 'publish_review_state "$repo" "$pr" awaiting-review "" notice-restart' <<<"$_ravail" \
+  || bad "the reviewerless exit must PUBLISH the awaiting-review notice inside its own guard (the block holds: $(printf '%s' "$_ravail" | grep -c 'publish_review_state') publish(es)) — on a box with no reviewer and free capacity this is the only path that runs, and a mergeable green unattested PR that publishes nothing is indistinguishable from one a lane is working on"
 # ⛔ THE TWO STATES THE LOOP MUST PUBLISH FOR ITSELF, PINNED WHERE THE LOOP CALLS THEM (review, P1/P2).
 # Driving `publish_review_state` directly proves the TEXT works, not that anything ever posts it —
 # measured with this very harness: deleting the loop's `review-record-unbound` publish left the suite
@@ -1113,6 +1219,31 @@ grep -qF 'continue' <<<"$(grep -A2 -F 'log_line "$repo #$pr review $_rstate at $
 # P2, measured): the loop's call is the ONLY thing that makes `$att` non-zero, so dropping the third
 # argument leaves the predicate's attempt term permanently 0, `return 3` unreachable, and a paid review
 # re-bought on every pass — with the suite green, because `_rattn` is still computed and still logged.
+# ⛔ AND THE PER-PASS BURST COUNTER MAY NOT BE ZEROED AGAIN (review round 10, P3, measured): the positional arms
+# pinned WHERE it is reset and where it is bumped, but nothing pinned HOW OFTEN — a second `_rdispatched=0`
+# after the increment leaves `review_should_defer` seeing 0 for every candidate and makes `REVIEW_PER_PASS`
+# inert (one paid reviewer per mergeable-unattested PR per pass). One reset, one increment, no more.
+# ⛔ COUNT THE ASSIGNMENT, NOT ONE SPELLING OF IT (review round 10 verification, P3, measured): the
+# end-anchored `^[[:space:]]*_rdispatched=0$` missed `_rdispatched=0  # reset again`,
+# `_rdispatched=0; _rdispatched=0`, `(( _rdispatched = 0 ))`, `export _rdispatched=0` and an `if`-wrapped
+# reset — each LIVE, each leaving `review_should_defer` seeing 0 for every later candidate and making
+# `REVIEW_PER_PASS` inert, with the suite green.
+# ⛔ COUNT STATEMENTS, NOT DOCUMENTATION (review round 12, P2, MEASURED): the count was taken over the raw
+# file, so a COMMENT mentioning `_rdispatched=0` added a phantom second reset and RED-ed the suite on a
+# comment — a false block, and the opposite of the doctrine the hand-off arms in this same file state
+# ("two anchors separated by documentation are still adjacent"). Comments and blank lines are dropped first —
+# ⛔ AND BY *BOTH* ARMS (review round 13, P2, MEASURED): the increment arm kept its `"$SUT"` FILE OPERAND, so
+# its `printf | grep` pipeline was DEAD — grep read the file and the filter never ran. A comment above the
+# increment that merely NAMED the expression then counted as a second increment and red-ed the suite on a
+# comment, with a message asserting two increments where the file has one. The sentence above claimed the
+# filtering happened; that operand made the claim false for half the block.
+_rd_stmt=$(grep -vE '^[[:space:]]*(#|$)' "$SUT")
+_rd_zero=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*0([^0-9]|$)' | wc -l | tr -d ' ')
+[ "$_rd_zero" = 1 ] \
+  || bad "the per-pass review counter must be SET TO ZERO exactly once per pass (found ${_rd_zero:-0} zeroing assignment(s)) — a reset after the increment, however it is written (bare, '&&', arithmetic, export, inside an if), blinds review_should_defer and disables REVIEW_PER_PASS"
+_rd_inc=$(printf '%s\n' "$_rd_stmt" | grep -oE '(^|[^[:alnum:]_])_rdispatched[[:space:]]*=[[:space:]]*\$\(\(|\(\([[:space:]]*_rdispatched[[:space:]]*=[[:space:]]*_rdispatched' | wc -l | tr -d ' ')
+[ "$_rd_inc" = 1 ] \
+  || bad "the per-pass review counter must have exactly one increment (found ${_rd_inc:-0}) — two increments spend the cap twice as fast, and none makes the cap inert"
 grep -qF 'review_action "$_rstate" "$_rage" "$_rattn"' "$SUT" \
   || bad "the loop must pass the attempt count into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"') — without it the EXHAUSTED branch is unreachable and the bounded retry is unbounded again"
 # ⛔ THE REMAINING STATE PUBLISHES WERE PINNED BY *TEXT*, NEVER BY A CALL (P1/P2 non-vacuity, measured
@@ -1141,13 +1272,26 @@ _capdef=$(printf '%s\n' "$_capblock" | grep -F 'publish_review_state "$repo" "$p
   || bad "the CAP-DEFERRAL block must still PUBLISH 'awaiting-review' for a deferred candidate — measured: deleting it left the suite GREEN, so the state a mergeable unattested PR is in whenever the box is at MAX existed only in the log. Located INSIDE the 'candidate_deferred' block, so a decoy line elsewhere in the file cannot satisfy this arm (a file-wide grep did, measured)"
 [ "$(printf '%s\n' "$_capdef" | grep -cF 'publish_review_state')" -eq 1 ] \
   || bad "the CAP-DEFERRAL block must hold EXACTLY ONE 'awaiting-review' publish — the assertions below are 'any matching line contains this substring', so a second one inside the same block would let either requirement be satisfied by a line that is not the cap-deferral publish"
+# ⛔ ONE STATEMENT, ANCHORED (review round 10, P3, measured): three independent substrings were satisfied after
+# the gating `&&` was replaced by `;`, which publishes "a reviewer is dispatched as soon as this repo has a
+# free slot" for a not-clean head that will never be dispatched again — the round-7 P2 this arm exists for.
+# (The tail allows the `notice` basis: the corrected cap-deferral text needs a key of its own, or the old
+# marker — byte-identical to origin/main's — makes the correction a permanent no-op on every PR that has it.)
+_CAPRE='^[[:space:]]*\[ "\$_kind" = green \] && \[ "\$_att" != at-head \] && \[ "\$_att" != rejected \] && publish_review_state "\$repo" "\$pr" awaiting-review "" notice-restart$'
+grep -qE "$_CAPRE" <<<"$_capdef" \
+  || bad "the cap deferral's gating must stay ONE statement (… [ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ] && [ \"\$_att\" != rejected ] && publish_review_state … awaiting-review) — splitting it with ';' publishes 'awaiting review' for heads no dispatch will ever reach"
 grep -qF '[ "$_kind" = green ] && [ "$_att" != at-head ]'  <<<"$_capdef" \
   || bad "the CAP-DEFERRAL publish line must still START '[ \"\$_kind\" = green ] && [ \"\$_att\" != at-head ]' — it is the only publish that runs while the box is at MAX, i.e. the COMMON state for a mergeable unattested PR (#3489 on the most common path)"
 grep -qF '[ "$_att" != rejected ]'  <<<"$_capdef" \
   || bad "the CAP-DEFERRAL publish must EXCLUDE 'rejected' — its text promises a reviewer 'as soon as this repo has a free slot', but review_candidate_arm maps *:rejected to skip, so a not-clean head (TERMINAL — only a new head gets a review) was left carrying a promise no dispatch would keep; under cap saturation the pass never reaches the review-found-issues publish that would correct it, so the false claim stands indefinitely"
 grep -qF 'publish_review_state "$repo" "$pr" awaiting-review'  <<<"$(grep -A2 -F 'if review_should_defer "$_rdispatched"; then' "$SUT" || true)" \
   || bad "the BURST-BOUND deferral must publish 'awaiting-review' — deleted, the suite stayed GREEN and a head queued behind this repo's REVIEW_PER_PASS budget reads as waiting on a lane"
-grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head"'  <<<"$(grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' <<<"$_branch" || true)" \
+# ⛔ ANCHORED, NO ARGUMENT CAP (review round 9, P3, measured): the prefix pin was satisfied after `record`
+# was appended to the rc=7 call, which makes the comment claim a record EXISTS for a review that wrote none —
+# contradicting the log line written in the same pass, i.e. exactly the defect the split text removes,
+# mirrored. Ending the pattern at `"$head"` tells the two call sites apart by their argument lists.
+_ISSPUBRE='^[[:space:]]*publish_review_state "\$repo" "\$pr" review-found-issues "\$head"$'
+grep -qE "$_ISSPUBRE" <<<"$(grep -A3 -F 'if [ "$_ract" -eq 2 ]; then' <<<"$_branch" || true)" \
   || bad "the loop must PUBLISH 'review-found-issues' from the '\$_ract -eq 2' / issues arm — the state's TEXT and its marker count are pinned, so deleting this CALL left the suite GREEN while a head the reviewer REJECTED (and which the loop will not re-review) stayed as invisible as #3489"
 # ⛔ AND A REFUSAL MUST HAND THE BUDGET BACK (review round 2, P2): `refused` ignores `$att`, so without
 # this reset a run of load refusals leaves the ledger saturated and the FIRST real review that then
@@ -1227,9 +1371,79 @@ printf '%s\n%s\n' "$_now" "$_now" > "$_led"
 printf '%s\n' "$(( _now - REVIEW_ATTEMPT_WINDOW_S - 1 ))" >> "$_led"
 [ "$(review_attempts "$_led")" = 2 ] \
   || bad "a dispatch OLDER than REVIEW_ATTEMPT_WINDOW_S must stop counting (got '$(review_attempts "$_led")', want 2) — a lifetime count turns one transient failure into a permanent EXHAUSTED head, which is the #3489 symptom rebuilt as the fix"
+# ⛔ A CORRUPT LINE FAILS CLOSED (review round 8, P3, measured — this arm used to pin the LENIENT
+# reading). The ledger is append-only, one epoch per paid dispatch, written by this file; a line that is not
+# an epoch means the counter cannot be trusted in EITHER direction, and the untrustworthy direction that
+# costs money is "the corrupt line was a dispatch" — reading past it would forgive up to
+# REVIEW_MAX_ATTEMPTS paid reviews at one head. The previous form of this arm required the count to ignore
+# it, which also made the file's own `REVIEW-LEDGER-UNPARSEABLE` arm unreachable (its awk always printed
+# digits, so the non-numeric case could never fire). Same answer as an unreadable ledger: the CAP.
 printf '%s\n' 'not-a-timestamp' >> "$_led"
-[ "$(review_attempts "$_led")" = 2 ] \
-  || bad "a corrupt ledger line must not be counted as an attempt (got '$(review_attempts "$_led")')"
+[ "$(review_attempts "$_led")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a corrupt ledger line must FAIL CLOSED (got '$(review_attempts "$_led")', want the cap $REVIEW_MAX_ATTEMPTS) — reading past a line that should have been a dispatch count forgives paid reviews at one head, and it makes REVIEW-LEDGER-UNPARSEABLE unreachable"
+grep -qF 'REVIEW-LEDGER-UNPARSEABLE' "$LOG" \
+  || bad "a corrupt ledger must SAY SO in the log (no REVIEW-LEDGER-UNPARSEABLE line) — a silent cap is indistinguishable from the defect it replaces"
+review_ledger_unreadable "$_led" \
+  || bad "review_ledger_unreadable must answer the SAME question as the counter for a corrupt ledger — otherwise the CAP wording (which exists so no comment asserts an unmeasured count) is skipped for exactly the record whose count was never measured"
+# ⛔ "EXISTS BUT IS NOT A REGULAR FILE" IS NOT "NOTHING HAS BEEN SPENT" (review cycle 2, P2, measured).
+# `[ -f "$f" ]` alone answered a DIRECTORY at the ledger path with 0 dispatches — a FREE slot — while the
+# append in `launch_review` to that same path FAILS, so the count was pinned at 0 for ever: one full paid
+# review per COOLDOWN_TRANSIENT_S at that head, no EXHAUSTED state, and `review_ledger_unreadable` calling
+# it "readable" so the CAP wording was skipped too. Both arms below are driven on the SHIPPED functions.
+_leddir="$_rdir/ledger-is-a-dir.attempts"
+rm -rf "$_leddir"; mkdir -p "$_leddir"
+[ "$(review_attempts "$_leddir")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a DIRECTORY at the ledger path must FAIL CLOSED (got '$(review_attempts "$_leddir")', want the cap $REVIEW_MAX_ATTEMPTS) — reading 'not a regular file' as 0 dispatches is a free slot whose append can never succeed, so the head is charged nothing for ever"
+review_ledger_unreadable "$_leddir" \
+  || bad "a DIRECTORY at the ledger path must be reported UNREADABLE by review_ledger_unreadable (rc $?) — its content cannot be counted, which is exactly what that contract promises"
+rm -rf "$_leddir"
+# ⛔ `-e` FOLLOWS THE LINK, SO IT CANNOT SEE AN ENTRY THAT DOES NOT RESOLVE (review cycle 2, P2, measured):
+# a symlink loop and a dangling symlink whose target DIRECTORY is gone both answer "absent" to `-e`, so both
+# read 0 dispatches — a free slot — while the append to that path fails. That is the same permanent-0
+# fail-open the directory arm above closes, in the two shapes `-e` cannot reach, and the declared T2 surface
+# names "broken/looping symlink" explicitly.
+_ledloop="$_rdir/ledger-loop.attempts"
+ln -s "$_ledloop" "$_ledloop" 2>/dev/null
+[ -L "$_ledloop" ] && [ ! -e "$_ledloop" ] \
+  || bad "the SYMLINK LOOP fixture did not build (a self-link must exist and must not resolve) — the arm below would then prove nothing"
+[ "$(review_attempts "$_ledloop")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a SYMLINK LOOP at the ledger path must FAIL CLOSED (got '$(review_attempts "$_ledloop")', want the cap $REVIEW_MAX_ATTEMPTS) — \`-e\` follows the link and answers 'absent', i.e. 0 dispatches, while the append fails: a free slot for ever"
+review_ledger_unreadable "$_ledloop" \
+  || bad "a SYMLINK LOOP must be reported UNREADABLE by review_ledger_unreadable (rc $?) — an entry that does not resolve cannot be counted, which is this function's whole contract"
+rm -f "$_ledloop"
+_leddang="$_rdir/ledger-dangling.attempts"
+ln -s "$_rdir/no-such-dir/ledger" "$_leddang" 2>/dev/null
+[ -L "$_leddang" ] && [ ! -e "$_leddang" ] \
+  || bad "the DANGLING-SYMLINK fixture did not build (a link into a missing directory must exist and must not resolve)"
+[ "$(review_attempts "$_leddang")" = "$REVIEW_MAX_ATTEMPTS" ] \
+  || bad "a DANGLING symlink whose target directory is gone must FAIL CLOSED (got '$(review_attempts "$_leddang")', want the cap $REVIEW_MAX_ATTEMPTS) — the append cannot create it, so 0 is a charge that can never be collected"
+review_ledger_unreadable "$_leddang" \
+  || bad "a DANGLING symlink must be reported UNREADABLE by review_ledger_unreadable (rc $?) — same contract, same answer"
+rm -f "$_leddang"
+# …and the ANTI-OVER-BLOCK control for that split: a link that DOES resolve to a regular ledger is a normal
+# ledger. Without it, `-L` could be satisfied by shorthand that turns every symlinked store into a permanent
+# false EXHAUSTED — the opposite fail-open, and just as wrong.
+_ledreal="$_rdir/ledger-real.attempts"
+printf '%s\n' "$_now" > "$_ledreal"
+_ledlink="$_rdir/ledger-link.attempts"
+ln -s "$_ledreal" "$_ledlink" 2>/dev/null
+[ "$(review_attempts "$_ledlink")" = 1 ] \
+  || bad "a symlink that RESOLVES to a regular ledger must be COUNTED normally (got '$(review_attempts "$_ledlink")', want 1) — the split must classify what the entry resolves to, never the fact that it is a link"
+review_ledger_unreadable "$_ledlink" \
+  && bad "a symlink that resolves to a regular, readable ledger must answer 'readable' (rc 0) — otherwise every symlinked store publishes the CAP as if its count were unmeasured"
+rm -f "$_ledlink" "$_ledreal"
+# …and the over-blocking control for the `-e`/`-f` split itself: an ABSENT path and an EMPTY regular file are
+# still 0 / readable, so the fail-closed arms above did not turn "nothing spent yet" into a permanent
+# EXHAUSTED head.
+[ "$(review_attempts "$_rdir/never-created.attempts")" = 0 ] \
+  || bad "an ABSENT ledger must still read 0 attempts (got '$(review_attempts "$_rdir/never-created.attempts")') — the fail-closed arm must not make a first-ever head un-reviewable"
+review_ledger_unreadable "$_rdir/never-created.attempts" \
+  && bad "an ABSENT ledger must still answer 'readable' (rc 0) — the CAP wording exists for a record whose count could not be MEASURED, not for one that was never written"
+: > "$_rdir/empty-regular.attempts"
+[ "$(review_attempts "$_rdir/empty-regular.attempts")" = 0 ] \
+  || bad "an EMPTY regular ledger must still read 0 attempts (got '$(review_attempts "$_rdir/empty-regular.attempts")') — a fresh head has spent nothing, and the fail-closed split must not touch that"
+review_ledger_unreadable "$_rdir/empty-regular.attempts" \
+  && bad "an EMPTY regular ledger must still answer 'readable' — otherwise every fresh head publishes the CAP as if its count were unmeasured"
 printf '%s\n' "$(( _now - REVIEW_ATTEMPT_WINDOW_S - 1 ))" > "$_led"
 [ "$(review_attempts "$_led")" = 0 ] \
   || bad "a ledger whose entries are ALL outside the window must read 0 attempts (got '$(review_attempts "$_led")') — otherwise a head is EXHAUSTED by history alone"
@@ -1286,8 +1500,58 @@ grep -qF '[ "$_rstate" = refused ] && review_forgive_refusal "$_ratt" "$(review_
 # measured): the consumer was pinned but not this line, so `_rattn=0` — or pointing it at the RECORD —
 # left the suite green with the attempt term permanently zero and the paid retry loop unbounded again,
 # while every driven `review_action` arm still passed on a hand-fed `$att`.
-grep -qF '_rattn=$(review_attempts "$_ratt")' "$SUT" \
+# ⛔ ANCHORED, WHOLE LINE (review round 9, P2, measured): a `grep -qF` substring was satisfied by
+# `_rattn=$(review_attempts "$_ratt"); _rattn=0` on the same line, which makes `review_action`'s attempt
+# bound always true and re-dispatches a paid review on EVERY pass for ever — with this pin green. The
+# suite already anchors its other statement pins (`_PUBRE`/`_RBASRE`) for exactly this reason.
+_RATTRE='^[[:space:]]*_rattn=\$\(review_attempts "\$_ratt"\)$'
+grep -qE "$_RATTRE" "$SUT" \
   || bad "the loop must read the attempt count FROM THE HEAD-KEYED LEDGER — a zeroed or misdirected source leaves the count under the cap, so EXHAUSTED is unreachable in the loop and the paid retry is unbounded while the driven arms stay green"
+# ⛔ AND THE COUNT MUST ARRIVE AT ITS CONSUMER UNMODIFIED — anchored on ITS OWN LINE is NOT enough
+# (review round 10, P1, MEASURED). Round 9 anchored `_rattn=` and stopped there, so a SEPARATE
+# `_rattn=0` line inserted between the read and `_rage=` left the whole suite GREEN: `review_action`'s
+# `[ "$att" -lt "$REVIEW_MAX_ATTEMPTS" ]` is then always true, EXHAUSTED (rc 3) is unreachable, and one
+# PAID dispatch is bought on every pass for ever — the round-2 defect this whole block exists to prevent,
+# reopened one line below its own pin. A statement pin protects a statement; only adjacency protects the
+# HAND-OFF between two of them.
+# ⛔ AND THE THIRD HAND-OFF — `_rstate` — WAS PINNED BY NOTHING (review round 11, P2, MEASURED): the two
+# arms below protect the age and the count, but the STATE feeding the same predicate had no pin at either
+# end, so a `_rstate=clean` line inserted between the read and the counter made `review_action` return 2
+# (`issues|clean) return 2`) and the loop take the `else` arm — publishing "a review record exists but the
+# PR carries no marker" about a record that does not exist, and NEVER DISPATCHING a review: the #3489
+# permanent-invisibility class, on the operator's own surface, with this whole suite GREEN. Commented out
+# instead, `_rstate` is unbound under `set -u` and the actuator aborts at the review arm on every pass.
+# Pinning a state that is read on one line and consumed two lines later is exactly the mistake this block
+# exists to stop, so it is closed here with the same helper rather than left as the one hole in the family.
+_RSTRE='^[[:space:]]*_rstate=\$\(review_state "\$_rout"\)$'
+_RAGERE='^[[:space:]]*_rage=\$\(review_dispatch_age "\$_rout"\); _rage_rc=\$\?$'
+_RACTRE='^[[:space:]]*review_action "\$_rstate" "\$_rage" "\$_rattn"; _ract=\$\?$'
+_RACTIFRE='^[[:space:]]*if \[ "\$_ract" -eq 0 \]; then$'
+# ⛔ THE WHOLE INPUT CHAIN, END TO END — the pins above start at `_rstate=` and pin its SUCCESSORS, so the
+# two values that give those reads their SUBJECT were unpinned (review round 12, P2, MEASURED): inserting
+# `_rout=<decoy record>` (or `_ratt=/dev/null`) immediately before the pinned chain left every arm GREEN
+# while `review_dispatch_age` aged a record nobody read (→ `review_action retry 0 1` = WAIT, so the head is
+# never retried, never exhausted and never re-published) or the counter read a file that yields 0 (→
+# `review_action retry <huge> 0` = DISPATCH, the unbounded-paid-retry defect). Both are the #3489 class the
+# chain exists to close, one link ABOVE where it started. The chain now runs
+#   _rout= → _ratt= → _rstate= → _rattn= → _rage= → review_action → if [ "$_ract" -eq 0 ]
+# and its LAST link is equally load-bearing: `_ract=1` inserted after the predicate forces a DISPATCH for
+# every state, including the clean/attested heads that must never be re-reviewed (also measured GREEN).
+_ROUTAS='^[[:space:]]*_rout="\$RAIL_DIR/review-\$\(printf [^)]*\)-\$pr-\$head\.out"$'
+_RATTAS='^[[:space:]]*_ratt="\$RAIL_DIR/review-\$\(printf [^)]*\)-\$pr-\$head\.attempts"$'
+_pin_once "$_ROUTAS" "the loop must derive the review RECORD path ('_rout=\"\$RAIL_DIR/review-…-\$pr-\$head.out\"')"
+_pin_once "$_RATTAS" "the loop must derive the ATTEMPT-LEDGER path with its own head key ('_ratt=\"\$RAIL_DIR/review-…-\$pr-\$head.attempts\"')"
+_pin_once "$_RSTRE" "the loop must read the review state from the record ('_rstate=\$(review_state \"\$_rout\")') — commented out it is unbound under set -u and aborts the actuator at the review arm; replaced, every head reads as TERMINAL"
+_pin_once "$_RATTRE" "the loop must read the attempt count FROM THE HEAD-KEYED LEDGER — a zeroed or misdirected source leaves the count under the cap, so EXHAUSTED is unreachable in the loop and the paid retry is unbounded while the driven arms stay green"
+_pin_once "$_RAGERE" "the age must be taken by review_dispatch_age ALONE, on its own line (_rage=\$(review_dispatch_age \"\$_rout\"); _rage_rc=\$?)"
+_pin_once "$_RACTRE" "the loop must pass the three measured values into review_action ('review_action \"\$_rstate\" \"\$_rage\" \"\$_rattn\"; _ract=\$?')"
+_pin_once "$_RACTIFRE" "the loop must branch on review_action's OWN result ('if [ \"\$_ract\" -eq 0 ]; then')"
+_pin_next "$_ROUTAS" "$_RATTAS" "the record path must be followed by the attempt-ledger path as the VERY NEXT STATEMENT — an inserted \`_rout=<decoy>\` here is aged instead of the record the loop acts on, and a fresh-epoch decoy reads as age 0 = WAIT for ever"
+_pin_next "$_RATTAS" "$_RSTRE" "the attempt-ledger path must be followed by the state read as the VERY NEXT STATEMENT — an inserted \`_ratt=/dev/null\` here makes review_attempts return 0, so the attempt bound is always true and EXHAUSTED is unreachable"
+_pin_next "$_RSTRE" "$_RATTRE" "the review state must be followed by the attempt count as the VERY NEXT STATEMENT — an inserted \`_rstate=clean\` makes review_action return 2, which publishes a false 'a record exists' claim and buys no review at all, while every other arm stays green"
+_pin_next "$_RATTRE" "$_RAGERE" "the attempt count must be followed by the age read as the VERY NEXT STATEMENT — a statement inserted between them can ZERO the count (measured: \`_rattn=0\`), which makes review_action's attempt bound always true, leaves EXHAUSTED unreachable and buys one PAID dispatch on every pass while the suite stays green"
+_pin_next "$_RAGERE" "$_RACTRE" "the age must reach review_action as the VERY NEXT STATEMENT — a statement before the call on that line, or a line in between, can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the age call itself still matches its pin"
+_pin_next "$_RACTRE" "$_RACTIFRE" "the predicate's RESULT must be the next statement branched on — an \`_ract=1\` inserted after the call forces a DISPATCH for every state, including heads a record already covers"
 # ⛔ AND THE LEDGER IS KEYED BY THE HEAD, like the record it bounds (review round 2, P2, measured):
 # dropping the head from the ledger name turns a PER-HOST/PER-HEAD budget into a PR-LIFETIME one, so the
 # first head that spends 3 attempts poisons every later head of that PR — each new head reads 3, is
@@ -1539,9 +1803,9 @@ grep -qF 'case "$(review_state "$_rout")" in' <<<"$_rdl" \
 #       text still exists; only the whole-line and the count pins see it. Measured the same way.
 # A text pin cannot see reachability, so the arm is pinned as the SHIPPED LINE, and the shape that could
 # shadow it is forbidden outright.
-grep -qxE '^[[:space:]]*pending\)[[:space:]]+publish_review_state "\$repo" "\$pr" review-in-flight "\$head"[[:space:]]*;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*pending\)[[:space:]]+publish_review_state "\$repo" "\$pr" review-in-flight "\$head"( "[^"]*")?[[:space:]]*;;' <<<"$_rdl" \
   || bad "the in-flight publish must BE the 'pending)' arm of the record gate — an ARM, not text that happens to appear near it; without the pending) label the branch is entered for every state and a finished dispatch re-publishes the false claim (INDENTATION IS NOT PINNED: a reformat must not redden this)"
-grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review( "\$head")?[[:space:]]*;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review( "\$head")?( "[^"]*")?[[:space:]]*;;' <<<"$_rdl" \
   || bad "a dispatch that finished WITHOUT a verdict (refused/retry) must publish awaiting-review, not in-flight — and it must be its OWN arm: a catch-all makes this line unreachable while leaving its text intact, which is how the reverted defect stayed GREEN (the optional \"\$head\" argument is required by the corrective-position rule: headless, the publish could supersede an in-flight claim only ONCE)"
 # ⛔ AND THE HEAD ARGUMENT IS NOT DECORATION (review round 6, P2, measured): headless, this corrective
 # publish is presence-keyed and can supersede an in-flight claim only ONCE — a later
@@ -1549,7 +1813,7 @@ grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo
 # alone and never posts another state. The arm above accepts either form (its job is "own arm, not
 # catch-all"), so the argument is pinned here: dropping it alone is invisible to every other arm, which
 # is how this exact defect survived one round.
-grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review "\$head"[[:space:]]*;;' <<<"$_rdl" \
+grep -qxE '^[[:space:]]*refused\|retry\)[[:space:]]+publish_review_state "\$repo" "\$pr" awaiting-review "\$head"( "[^"]*")?[[:space:]]*;;' <<<"$_rdl" \
   || bad "the corrective publish must pass \"\$head\" so it can supersede a NEWER in-flight marker (got: $(printf '%s' "$_rdl" | grep -n 'awaiting-review' | head -1)) — headless it corrects only the first time, leaving 'review in flight' as the PR's last word for ever while nothing runs"
 grep -qE '^[[:space:]]*\*\)' <<<"$_rdl" \
   && bad "no catch-all '*)' arm may exist in the record gate — a '*)' placed before 'refused|retry)' shadows the corrective publish and restores the retry branch's own false 'review in flight' claim (reproduced: the suite stayed GREEN with it)"
@@ -1878,6 +2142,7 @@ publish_review_state acme/widget 42 review-in-flight "$_HF"
 # "dispatched 0m ago, within its 900s window" on every pass and waited FOR EVER: never retried, never
 # exhausted, never published again. The record's mtime is the conservative fallback and is named as such.
 eval "$(sed -n '/^review_age() {/,/^}$/p' "$SUT")"
+eval "$(sed -n '/^review_dispatch_age() {/,/^}$/p' "$SUT")"
 command -v review_age >/dev/null || { echo "FATAL: review_age not found in $SUT"; exit 2; }
 _AG="$_rdir/age.out"
 _now0=$(date +%s)
@@ -1906,12 +2171,340 @@ rm -f "$_AG"
 review_age "$_rdir/absent.out" >/dev/null; [ $? = 2 ] \
   || bad "a MISSING record has nothing measurable and must say so (want rc 2) — 0 would read as a fresh dispatch"
 # …and the loop must actually USE the fallback and NAME it (a function nobody calls is an inert fix)
-grep -qF '_rdat=$(review_age "$_rout"); _rage_rc=$?' "$SUT" \
-  || bad "the loop must age the record through review_age and keep its rc — without the fallback a record with no epoch keeps the 0-age WAIT the P3 named, and without the rc the log cannot name the basis of the age"
+grep -qF '_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?' "$SUT" \
+  || bad "the loop must age the record through review_dispatch_age and keep its rc — without the fallback a record with no epoch keeps the 0-age WAIT the P3 named, and without the rc the log cannot name the basis of the age"
 grep -qF 'measured from the record file' "$SUT" \
   || bad "the WAIT log line must NAME the age's basis when it comes from the record's mtime ('measured from the record file') — otherwise the operator's primary instrument reports a measurement that does not exist, which is the defect class itself"
 grep -qF 'its mtime could not be read, so the age is UNKNOWN' "$SUT" \
   || bad "the WAIT log line must also name the UNMEASURABLE case — a basis that degrades to silence is the same false claim one step later"
+
+# ⛔ THE AGE'S CONSUMPTION MUST BE DRIVEN, NOT PINNED BY TEXT (review round 8, P3, measured): the previous
+# pins checked the CALL and the log's WORDING, so a one-line insertion after the call (`_rdat=$(date +%s)`)
+# restored the permanent-WAIT defect with the whole suite green. `review_dispatch_age` owns the arithmetic,
+# so the suite drives the number the loop acts on.
+command -v review_dispatch_age >/dev/null || { echo "FATAL: review_dispatch_age not found in $SUT"; exit 2; }
+_AD="$_rdir/dispatch-age.out"
+_now1=$(date +%s)
+printf 'REVIEW-DISPATCHED at=%s head=x\n' "$(( _now1 - 5000 ))" > "$_AD"
+_d=$(review_dispatch_age "$_AD"); _drc=$?
+[ "$_drc" = 0 ] && [ "$_d" -ge 4999 ] && [ "$_d" -le 5100 ] \
+  || bad "review_dispatch_age must return the epoch-based age with rc 0 (got rc=$_drc, age='$_d')"
+printf 'REVIEW-EXIT rc=9\n' > "$_AD"
+touch -t 200001010000 "$_AD" 2>/dev/null || true
+_d2=$(review_dispatch_age "$_AD"); _drc2=$?
+[ "$_drc2" = 1 ] || bad "an epoch-less record must be aged from its mtime with rc 1 (got rc=$_drc2, age='$_d2') — rc is what makes the WAIT log name the basis"
+[ "$_d2" -gt 900 ] || bad "an epoch-less, old record must yield an age past the transient window (got ${_d2}s) — a 0 here is the permanent WAIT the P3 named"
+review_action retry "$_d2" 1; _dract=$?
+[ "$_dract" = 1 ] \
+  || bad "with that age the loop must RETRY (review_action returned $_dract, want 1) — otherwise the head is never retried, never exhausted and never re-published"
+# ⛔ AND NOTHING MAY SIT BETWEEN THE CALL AND ITS CONSUMER: an inserted line is how the fallback was discarded
+# while every text pin stayed green.
+# ⛔ THE CALL LINE ITSELF IS PART OF THE PIN (review round 9, P3, measured): the adjacency arm only checked
+# that nothing sat BETWEEN the call and `review_action`, so appending `; _rage=0` to the call line left both
+# pins green while restoring the permanent-WAIT defect (and printing "the age is 0s measured from …").
+# ⛔ AND THE CONSUMER LINE IS ANCHORED, NOT MATCHED AS A SUFFIX (review round 10, P1, MEASURED). The arm
+# that stood here was `case "$_dnext" in *'review_action …'*)`, a glob whose leading `*` swallowed any
+# prefix — so `_rage=0; review_action "$_rstate" "$_rage" "$_rattn"; _ract=$?` satisfied it with the age
+# discarded, restoring the permanent-WAIT defect this block exists to prevent while the age line above
+# still matched its own anchored pin. `_RAGERE`/`_RACTRE` are both `^…$`-anchored and the two are required
+# to be ADJACENT STATEMENTS, so neither a prefix nor an inserted line can sit between the fallback and the
+# predicate that acts on it.
+grep -qE "$_RAGERE" "$SUT" \
+  || bad 'the age must be taken by review_dispatch_age ALONE, on its own line (_rage=$(review_dispatch_age "$_rout"); _rage_rc=$?) — a trailing statement can overwrite the fallback while every other pin stays green'
+_dnext=$(_after_stmt "$_RAGERE")
+grep -qE "$_RACTRE" <<<"$_dnext" \
+  || bad "the age must reach review_action as the VERY NEXT STATEMENT (found: '${_dnext:-MISSING}') — a statement before the call on that line, or a line in between, can overwrite the fallback with a fresh epoch, which restores the permanent-WAIT defect while the age call itself still matches its pin"
+rm -f "$_AD"
+
+# ⛔ THE TWO 'review-found-issues' FACTS MUST NOT SHARE ONE TEXT (review round 8, P3): rc=7 means no record was
+# written; a not-clean record means one WAS. The comment used to say "No attestation was recorded" for both,
+# contradicting the log line written for the same transition in the same pass.
+_b2=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues 1212121212121212121212121212121212121212 record
+_rej=$(sed -n "$(( _b2 + 1 )),\$p" "$POSTED")
+case "$_rej" in
+  *'RECORD EXISTS'*) ;;
+  *) bad "a not-clean-record publish must say the record EXISTS (got: $(printf '%s' "$_rej" | head -1)) — the operator's only visible surface otherwise denies a record the loop has read" ;;
+esac
+case "$_rej" in
+  *'No attestation was recorded'*) bad "a not-clean-record publish must NOT claim 'No attestation was recorded' — that is the rc=7 fact, and stating it here contradicts the log line for the same transition" ;;
+esac
+_b3=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues 3434343434343434343434343434343434343434
+_iss=$(sed -n "$(( _b3 + 1 )),\$p" "$POSTED")
+case "$_iss" in
+  *'No attestation was recorded'*) ;;
+  *) bad "the rc=7 publish must keep saying no attestation was recorded (got: $(printf '%s' "$_iss" | head -1))" ;;
+esac
+# ⛔ AND THE BASIS IS PART OF THE IDEMPOTENCE KEY (review round 10, P2, MEASURED). The arms above drive
+# each text in isolation, so they cannot see the ORDER the loop actually produces: `review-found-issues`
+# is presence-keyed on (state, head), and with the basis absent from the tag whichever text published first
+# OWNED that head. The ordinary flow publishes the rc=7 text first (`review-pr.sh` posts its findings and
+# exits 7) and the `not-clean` record is minted afterwards, so the corrected text — "a record EXISTS" — was
+# a permanent no-op: the PR kept the false claim this round removed, and no driven publish could reveal it
+# because each was published at its own fresh head.
+_HB=5555555555555555555555555555555555555555
+_b4=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues "$_HB"
+publish_review_state acme/widget 42 review-found-issues "$_HB" record
+[ "$(( $(wc -l < "$POSTED") - _b4 ))" = 6 ] \
+  || bad "a rc=7 publish followed by a not-clean-RECORD publish at the SAME head must post TWO comments (got $(( $(wc -l < "$POSTED") - _b4 )) lines) — presence-keyed on (state, head) alone the correction is suppressed, so a PR keeps saying 'No attestation was recorded' about a head that has a record: the false claim this round removed, merely reordered"
+case "$(sed -n "$(( _b4 + 4 )),\$p" "$POSTED")" in
+  *'RECORD EXISTS'*) ;;
+  *) bad "the corrected not-clean-record text must be the NEWEST comment for that head — otherwise the operator reads the stale 'No attestation was recorded' claim" ;;
+esac
+_b5=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 review-found-issues "$_HB" record
+[ "$(wc -l < "$POSTED")" = "$_b5" ] \
+  || bad "re-publishing the SAME basis must still be a no-op — the key change may not turn idempotence into thrash"
+grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head" record' "$SUT" \
+  || bad 'the not-clean-record arm must PASS its basis (review-found-issues "$head" record) — without it the comment falls back to the rc=7 text'
+
+# ⛔ THE CAP-DEFERRAL PROMISE MUST BE ONE THE LOOP CAN KEEP (review round 11, P2, measured): the headless
+# `awaiting-review` is published BEFORE the head is read, and `review_candidate_arm` maps a head whose review
+# found blocking issues to `skip` — an rc=7 review records nothing, so the body-visible `rejected` guard
+# cannot see it. The old text promised "a reviewer is dispatched as soon as this repo has a free slot" for
+# that head, and `review-found-issues:<head>` (already on the PR) meant nothing newer was ever posted: the
+# false promise was the newest auto-rail comment until the head changed.
+: > "$COMMENTS"; : > "$POSTED"   # this block's own baselines: the headless marker was posted by an earlier arm
+_b4=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 awaiting-review
+_cap=$(sed -n "$(( _b4 + 1 )),\$p" "$POSTED")
+case "$_cap" in
+  *'If its current head is reviewable'*) ;;
+  *) bad "the HEADLESS (cap-deferral) 'awaiting-review' must NOT promise a dispatch outright — it runs before the head is read and cannot know whether that head is even dispatchable (got: $(printf '%s' "$_cap" | head -1))" ;;
+esac
+case "$_cap" in
+  *'ALREADY run and found blocking issues'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must name the other real outcome — a head whose review already ran and found blocking issues is not dispatchable — otherwise the comment's only reading is 'a review is coming'" ;;
+esac
+# ⛔ AND EVERY TERMINAL STATE MUST BE NAMED, NOT JUST rc=7 (review round 12, P3, measured): review_action
+# returns 2 (TERMINAL, no window) for `clean` too — a record whose body marker is missing — and 3 for a spent
+# cap including the fail-closed cap of an unreadable ledger. None of the three shows in the PR body, all three
+# are reachable at the cap-deferral publish, and this marker is presence-keyed so nothing later supersedes it.
+# ⛔ AND THE AVAILABILITY FACT, OR THE ENUMERATION IS THE READER'S ONLY READING (review round 14, P3,
+# measured): this publish runs BEFORE the `REVIEW_AVAILABLE != 1` gate, so on a reviewerless box all three
+# enumerated reasons are false and the first sentence is false too — and while that box stays reviewerless
+# nothing head-keyed is ever published to correct it.
+case "$_cap" in
+  *'a usable reviewer exists on this box'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must name the reviewer-availability condition — this publish runs before the availability gate, so without it a mergeable green PR on a reviewerless box reads 'a reviewer is dispatched as soon as this repo has a free slot' with no reviewer in existence to dispatch" ;;
+esac
+for _term in 'a review record exists that the gate cannot bind' 'review attempts are spent'; do
+  case "$_cap" in
+    *"$_term"*) ;;
+    *) bad "the HEADLESS 'awaiting-review' must name the terminal state '$_term' — review_action answers TERMINAL for it at a head the body cannot show, so omitting it promises a reviewer that will never be dispatched, in a marker nothing can supersede" ;;
+  esac
+done
+# ⛔ NAMING THE STATES IS NOT ENOUGH — EACH MUST CARRY ITS OWN OUTCOME (review cycle 2, P2, measured). The
+# three classes were named together and then handed ONE shared consequence ("no reviewer is coming: that
+# verdict is in the reviewer's own comment or in that record"), which is FALSE for two of the three:
+#   * `review_action`'s rc 3 is EXHAUSTED WITHIN THE WINDOW — "terminal until the window rolls, NOT for
+#     ever" — so for a spent counter a reviewer IS coming, and this file's own `review-retries-exhausted`
+#     text says the window "rolls BY ITSELF". Telling the operator to push a NEW head contradicted it.
+#   * a spent counter has NO verdict at all (the state is "the reviewer is not producing a verdict"), so
+#     "that verdict is in the reviewer's own comment or in that record" pointed at a document that does not
+#     exist.
+# The arms below are the discrimination: the shared consequence must be GONE, the roll-by-itself fact and the
+# unreadable-ledger remedy must be PRESENT, and restoring the collapsed text must redden at least one.
+# ⛔ THE SUBJECT IS THE CLAIM, NOT ITS CAPITALISATION (review cycle 2, P2, measured): a `case` on the
+# lowercase sentence reads GREEN for "No reviewer is coming" / "NO reviewer is coming" — the two spellings a
+# future editor (and the file's own comment, which quotes it capitalised) would actually write — so the arm
+# advertised a protection it covered one letter-case of. `[Nn][Oo]` is the portable fix; bash 3.2 has
+# `nocasematch` but relying on a `shopt` that a later line could unset is exactly the fragility being fixed.
+case "$_cap" in
+  *[Nn][Oo]' reviewer is coming'*) bad "the HEADLESS 'awaiting-review' still carries the shared consequence 'no reviewer is coming' (in any capitalisation) — it is false for a SPENT attempt counter (review_action rc 3 is EXHAUSTED WITHIN THE WINDOW: terminal until the window rolls, not for ever) and it collapses three different facts into one remedy" ;;
+esac
+case "$_cap" in
+  *'rolls BY ITSELF'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must state that a SPENT attempt counter's window 'rolls BY ITSELF' — without it the comment's only reading is 'push a new head', which contradicts the sibling review-retries-exhausted text for the same class" ;;
+esac
+case "$_cap" in
+  *'repairing or removing'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must give the UNREADABLE-ledger subclass its OWN remedy ('repairing or removing') — that is the only state of the three that does not heal by itself, and the old '(including when …)' parenthetical hid it behind the spent-counter case" ;;
+esac
+case "$_cap" in
+  *'NO verdict'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must say a spent counter left NO verdict, instead of pointing at 'the reviewer's own comment or that record' — for that class no such document exists" ;;
+esac
+_b5=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 awaiting-review 5656565656565656565656565656565656565656
+_hk=$(sed -n "$(( _b5 + 1 )),\$p" "$POSTED")
+case "$_hk" in
+  *'a reviewer is dispatched as soon as this repo has a free slot'*) ;;
+  *) bad "the HEAD-KEYED 'awaiting-review' must keep the direct promise (got: $(printf '%s' "$_hk" | head -1)) — that publish follows a proven launch, so 'a reviewer is dispatched' is a fact there" ;;
+esac
+case "$_hk" in
+  *'If its current head is reviewable'*) bad "the head-keyed 'awaiting-review' must not carry the headless conditional text — the two publishes state different, measured facts" ;;
+esac
+# …and the text must be chosen by the presence of a head, not always one branch.
+# ⛔ A LINE WINDOW IS NOT A POSITION (review cycle 2, P2, measured): `grep -A12 -F 'awaiting-review)'` sits
+# TWO lines from its limit, so inserting two pure COMMENT lines inside that case arm RED-ed this arm while the
+# split it pins sat there unchanged — the identical false block this file already documents for the `-A2` arm
+# ('a false block on documentation'). The helper that answers "is the next STATEMENT…" is already here; use it.
+_pin_next '^[[:space:]]*awaiting-review\)$' '^[[:space:]]*if \[ -n "\$head" \]; then$' \
+  "publish_review_state must SPLIT the 'awaiting-review' text on the head ('if [ -n \"\$head\" ]; then') — one text for both publishes is either a promise the cap path cannot keep or a hedge where a fact exists"
+
+# ⛔ AND THE DEAD SECOND ARM MUST STAY DELETED (review round 11, P3): the attempt scan always prints
+# "<digits> <digits>", so a `*[!0-9 ]*` case could never fire — an arm advertising a failure mode the code
+# cannot produce, with a message naming a count that never exists.
+# ⛔ THE PATTERN MUST ACTUALLY MATCH THE SPELLING IT NAMES (fresh-context review, P2, measured):
+# the previous pattern carried a `\\` before the space, i.e. an ERE-escaped BACKSLASH followed by a
+# literal space — so it demanded a `\` inside the bracket expression, which neither historically-real
+# spelling contains, and restoring the dead arm in EITHER spelling left this guard GREEN while its own
+# message asserted the branch was pinned. `[!0-9 *]` is one class: it rejects the digits, the space and
+# the `*` of the round-11 spelling, and the `]` that ends main's `[!0-9]` is not in the class, so ONE
+# pattern covers both real shapes. Verified: rc 0 on the round-11 mutant and on origin/main's spelling,
+# rc 1 on this tree.
+grep -qE '^[[:space:]]*\*\[!0-9 *\]\*\)' "$SUT" \
+  && bad "review_attempts must not keep the unreachable '*[!0-9 ]*' arm — the scan above always prints two decimal fields, so that branch is dead code claiming a failure it cannot detect"
+
+# ⛔ THE CORRECTED HEADLESS NOTICE NEEDS A KEY OF ITS OWN (review round 15, P2, measured): the headless tag was
+# byte-identical to the one `origin/main` posts, so on every PR that already carried the old promise the
+# presence check returned before posting and the corrected text was a PERMANENT no-op — on exactly the heads
+# it was written for, because the cap path is where the headless marker is posted and nothing newer ever
+# follows it there. The `notice` basis puts the correction in the key.
+: > "$COMMENTS"; : > "$POSTED"
+printf '%s\n' '<!-- auto-rail-review:awaiting-review -->' >> "$COMMENTS"   # the main-era marker, already on the PR
+publish_review_state acme/widget 42 awaiting-review "" notice-restart
+[ "$(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS")" = 1 ] \
+  || bad "the corrected headless 'awaiting-review' must POST over a main-era marker (found $(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS") notice marker(s)) — with an unchanged key the presence check returns first and the corrected text can never reach the PRs that already carry the old promise"
+publish_review_state acme/widget 42 awaiting-review "" notice-restart
+[ "$(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS")" = 1 ] \
+  || bad "the notice marker must still be idempotent (found $(grep -cF 'auto-rail-review:awaiting-review:notice-restart' "$COMMENTS") after a repeated publish, want 1) — a correction that re-posts every pass is the thrash the presence rule prevents"
+# …and the plain (no-basis) headless call keeps its own presence semantics, so nothing else is re-posted.
+_n0=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 awaiting-review
+[ "$(wc -l < "$COMMENTS")" = "$_n0" ] \
+  || bad "the plain headless 'awaiting-review' must stay presence-keyed (it added $(($(wc -l < "$COMMENTS") - _n0)) comment(s)) — the basis is for the corrected text, not a licence to re-post the old one"
+# ⛔ EVERY HEADLESS SITE, INCLUDING THE REVIEWERLESS EXIT (review round 16, P2, measured): on a box with no
+# usable reviewer and free capacity neither deferral path ever runs, so that exit is the ONLY chance such a
+# PR has of being told anything — it published nothing, and a mergeable green unattested PR with no
+# auto-rail comment is indistinguishable from one a lane is working on.
+[ "$(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice-restart' "$SUT")" = 3 ] \
+  || bad "ALL THREE headless call sites must pass the CORRECTED notice basis (found $(grep -cF 'publish_review_state "$repo" "$pr" awaiting-review "" notice-restart' "$SUT"), want 3: the cap deferral, the burst deferral, and the reviewerless exit) — one without it leaves that path's corrected text a permanent no-op on every PR that already carries the old marker"
+
+
+# ⛔ A DISPATCH CLAIM IS KEYED BY THE DISPATCH (review round 16, P2, measured end-to-end): the loop posted
+# `review-retries-exhausted:<head>` ("not dispatching another review at this revision"), the window then
+# rolled BY ITSELF, the loop dispatched again at the SAME head — and the new claim reused a tag that already
+# existed, so the positional rule suppressed it and the exhausted text stayed the PR's newest comment while
+# up to REVIEW_MAX_ATTEMPTS more reviews were bought. The claim carries the dispatch epoch as its key.
+_H16=$(printf 'a%.0s' $(seq 40))
+: > "$COMMENTS"; : > "$POSTED"
+publish_review_state acme/widget 42 review-in-flight "$_H16" d1700000000
+publish_review_state acme/widget 42 review-retries-exhausted "$_H16"
+publish_review_state acme/widget 42 review-in-flight "$_H16" d1700099999
+[ "$(grep -cF "auto-rail-review:review-in-flight:$_H16" "$COMMENTS")" = 2 ] \
+  || bad "a NEW dispatch at a head that already carries a claim MUST be able to say so (found $(grep -cF "auto-rail-review:review-in-flight:$_H16" "$COMMENTS") in-flight marker(s), want 2: the first dispatch and the one after the exhausted window rolled) — with a (state, head) key the second claim is suppressed by a tag posted BEFORE the exhaustion, so the PR keeps the 'not dispatching another review at this revision' text while the loop pays for more reviews"
+_case_newest=$(grep -oF "auto-rail-review:review-in-flight:$_H16" <<<"$(tail -1 "$COMMENTS")" || true)
+[ -n "$_case_newest" ] \
+  || bad "the newly dispatched claim must be the NEWEST marker on the PR (newest is: $(tail -1 "$COMMENTS")) — a correction that posts but is buried under the exhausted claim has not corrected anything"
+_n16=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 review-in-flight "$_H16" d1700099999
+[ "$(wc -l < "$COMMENTS")" = "$_n16" ] \
+  || bad "a repeat of the SAME dispatch must stay idempotent (added $(( $(wc -l < "$COMMENTS") - _n16 )) comment(s)) — the epoch key exists to let a new dispatch speak, not to re-post every pass"
+# ⛔ THE OTHER ARM: A REPEAT *REFUSAL* AT ONE HEAD MUST ADD NOTHING, AND A RE-DISPATCH AFTER AN EXHAUSTED
+# CLAIM MUST STILL SPEAK (review round 18, P2, measured end-to-end on the shipped functions). This is the pair
+# that the round-16 key broke: `refused` retries on TIME ALONE and spends nothing, so keying its claim by the
+# dispatch epoch posted a new byte-identical comment on every cycle (measured: 3 cycles at one head = 3
+# markers), and the naive fix — dropping the epoch — re-created the round-16 defect on the same arm (measured:
+# awaiting-review → exhausted → awaiting-review left ONE marker, newest = the exhausted text). Both halves are
+# therefore pinned here, together, so neither can be traded for the other.
+_H18=$(printf 'b%.0s' $(seq 40))
+: > "$COMMENTS"; : > "$POSTED"
+publish_review_state acme/widget 42 awaiting-review "$_H18"          # dispatch 1: refused, nothing spent
+_n18=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 awaiting-review "$_H18"          # dispatch 2: refused again, same head
+[ "$(wc -l < "$COMMENTS")" = "$_n18" ] \
+  || bad "a SECOND refusal at the same head must add NOTHING (added $(( $(wc -l < "$COMMENTS") - _n18 )) comment(s)) — a refusal retries on time alone and spends nothing, and its text is identical every cycle, so a per-dispatch key here is one duplicate comment per COOLDOWN_TRANSIENT_S for ever"
+publish_review_state acme/widget 42 review-retries-exhausted "$_H18"
+publish_review_state acme/widget 42 awaiting-review "$_H18"          # the window rolled; a dispatch followed
+[ "$(grep -cF "auto-rail-review:awaiting-review:$_H18" "$COMMENTS")" = 2 ] \
+  || bad "a refusal AFTER an exhausted claim must be able to speak over it (found $(grep -cF "auto-rail-review:awaiting-review:$_H18" "$COMMENTS") awaiting-review marker(s), want 2: the first refusal and the one after the exhausted window rolled) — the exhausted text says the window rolls BY ITSELF, so the loop DOES dispatch again at that head; with the exhaustion left out of the positional comparison the new claim is suppressed by its own pre-exhaustion tag and the PR keeps 'not dispatching another review at this revision' while reviews are bought"
+_case_a18=$(grep -oF "auto-rail-review:awaiting-review:$_H18" <<<"$(tail -1 "$COMMENTS")" || true)
+[ -n "$_case_a18" ] \
+  || bad "the claim that follows a rolled exhaustion window must be the NEWEST marker on the PR (newest is: $(tail -1 "$COMMENTS")) — a correction that posts but is buried under the exhausted claim has not corrected anything"
+_n18b=$(wc -l < "$COMMENTS")
+publish_review_state acme/widget 42 awaiting-review "$_H18"
+[ "$(wc -l < "$COMMENTS")" = "$_n18b" ] \
+  || bad "the post-exhaustion claim must not become a per-pass duplicate (added $(( $(wc -l < "$COMMENTS") - _n18b )) comment(s)) — ONE correction per exhaustion, not one per pass"
+# …and the SAME comparison must let a dispatch that FAILED TO START correct an exhausted claim. On its own fresh
+# head, so nothing above can satisfy it: left out, the PR keeps 'not dispatching another review at this
+# revision' while the loop is actually trying and failing to start one.
+_H18B=$(printf 'c%.0s' $(seq 40))
+publish_review_state acme/widget 42 review-retries-exhausted "$_H18B"
+publish_review_state acme/widget 42 review-dispatch-failed "$_H18B"
+[ "$(grep -cF "auto-rail-review:review-dispatch-failed:$_H18B" "$COMMENTS")" = 1 ] \
+  || bad "a rolled-back dispatch AFTER an exhausted claim must be able to correct it (found $(grep -cF "auto-rail-review:review-dispatch-failed:$_H18B" "$COMMENTS") dispatch-failed marker(s), want 1) — otherwise the PR keeps 'not dispatching another review at this revision' while the loop is actually trying and failing to start one"
+# …and BOTH head-bound claims must carry the key their OWN text is keyed by: the in-flight claim the
+# dispatch epoch (its text carries that dispatch's timestamp), the awaiting-review claim NOTHING (its text is
+# byte-identical on every refusal). ⛔ THE ROUND-16 KEY WAS APPLIED TO BOTH AND THAT IS THE DEFECT (review
+# round 18, P2, measured on the shipped function): three refusal cycles at ONE head posted THREE identical
+# `awaiting-review` comments, because `refused` retries on time alone and spends nothing, so the epoch key
+# made a per-event key out of a per-subject claim — unbounded duplication (one comment per
+# COOLDOWN_TRANSIENT_S per PR) on a state that told the operator nothing new, and every
+# `publish_review_state` call re-reads the whole comment list, so each one inflated every later marker read.
+[ "$(grep -cE 'publish_review_state "\$repo" "\$pr" review-in-flight "\$head" "\$_rdisp"' "$SUT")" = 1 ] \
+  || bad "the in-flight claim must pass the per-dispatch key (found $(grep -cE 'publish_review_state "\$repo" "\$pr" review-in-flight "\$head" "\$_rdisp"' "$SUT"), want 1) — its text names the dispatch's own timestamp, so a re-dispatch at the same head is new truth that must be able to be published"
+# ⛔ AND THE REFUSED ARM MUST NOT PASS ONE (review round 18, P2, measured — see the arms below). Pinned as the
+# WHOLE STATEMENT inside the review branch, so re-adding the epoch (or any third argument) reddens: the tag
+# then already exists for that dispatch and a repeat refusal posts again, for ever. `[|]` and `\)` are the
+# portable spellings — `\|` under `grep -E` is a GNU extension, not POSIX ERE.
+_RAREA='^[[:space:]]*refused[|]retry\) publish_review_state "\$repo" "\$pr" awaiting-review "\$head" ;;$'
+_pin_once "$_RAREA" "the 'refused|retry' arm must publish 'awaiting-review' keyed by (state, head) ONLY ('refused|retry) publish_review_state \"\$repo\" \"\$pr\" awaiting-review \"\$head\" ;;') — keyed by the dispatch epoch every retry cycle posts a NEW byte-identical 'review needed' comment, and a refusal retries on time alone (spending nothing), so the duplication is unbounded: one comment per COOLDOWN_TRANSIENT_S per PR"
+[ "$(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")" = 0 ] \
+  || bad "no head-bound 'awaiting-review' call may pass a per-dispatch key (found $(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")) — that key is per-EVENT and the comment is not: it re-posts the same text every retry cycle"
+[ "$(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")" = 0 ] \
+  || bad "no head-bound 'awaiting-review' call may pass a per-dispatch key (found $(grep -cF 'awaiting-review "$head" "$_rdisp"' "$SUT")) — that key is per-EVENT and the comment is not: it re-posts the same text every retry cycle"
+# ⛔ THE KEY MUST BE DRIVEN, AND NOTHING MAY OVERRIDE IT (review round 17, P2, measured): the literal/whole-file
+# pins above are satisfied by the shipped TEXT, so a statement INSERTED after the key's assignment — `_rdisp=`
+# or `_rdisp=d1700000000` — leaves every arm green (measured on the round-16 head: rc=0, 0 FAIL) while every
+# dispatch claim silently reverts to the `(state, head)` tag this fix exists to escape, i.e. the re-dispatch
+# after a rolled exhaustion window is suppressed again for ever. Three pins close it, and each one alone is
+# not enough: the assignment must EXECUTE to the record's epoch (driven), it must be the ONLY statement that
+# computes the key (a decoy duplicate is not a second safety net), and its successor statements are pinned so
+# no inserted line can clear or replace it (`_pin_next`, the technique this file already uses for the
+# `_rout`→`_ratt`→`_rstate` chain).
+_RDISPA='^[[:space:]]*_rdisp="d\$\(review_dispatched_at "\$_rout"\)"[[:space:]]*$'
+_RDEGRADE='^[[:space:]]*case "\$_rdisp" in d\) _rdisp=;; esac[[:space:]]*$'
+_RDISPATE='^[[:space:]]*case "\$\(review_state "\$_rout"\)" in[[:space:]]*$'
+_pin_once "$_RDISPA" "the loop must compute the per-dispatch key ONCE, as '_rdisp=\"d\$(review_dispatched_at \"\$_rout\")\"' — a constant there is a tag that already exists, i.e. the round-16 defect restored"
+_H16REC="$_rdir/review-dispatch-key.out"
+printf 'REVIEW-DISPATCHED at=1700000000 head=%s repo=acme/widget pr=42\nREVIEW-EXIT rc=0\n' "$_H16" > "$_H16REC"
+_rout_save=${_rout:-}
+_rout=$_H16REC
+_rdisp=
+_rdisp_line=$(grep -E "$_RDISPA" "$SUT")
+eval "$_rdisp_line"
+[ "${_rdisp:-}" = d1700000000 ] \
+  || bad "the per-dispatch key must EXECUTE to the dispatch epoch the record carries (got '${_rdisp:-<empty>}', want 'd1700000000') — an empty or constant key silently restores the (state, head) tag, so the claim that follows a rolled exhaustion window is suppressed and the PR keeps the 'not dispatching another review at this revision' text while the loop buys more reviews"
+_rout=$_rout_save
+_pin_next "$_RDISPA" "$_RDEGRADE" \
+  "the per-dispatch key's only degrade must be the VERY NEXT STATEMENT ('case \"\$_rdisp\" in d) _rdisp=;; esac' — the unmeasurable-epoch arm, which posts nothing rather than thrash) — a statement inserted between them ('_rdisp=', or a fixed 'd<epoch>') disarms the key with every text pin still satisfied"
+_pin_next "$_RDEGRADE" "$_RDISPATE" \
+  "the keyed publishes must be the statement that follows the degrade — a statement between them can override the key after it was both computed and checked, which no other arm in this file can see"
+# …and the family scan must match the tag's PREFIX, or every basis-carrying marker drops out of the pairing
+# the moment one is published — re-creating the permanent 'review in flight' this family exists to correct.
+grep -qF '<!-- auto-rail-review:$_o:$head" ' "$SUT" \
+  || bad "the corrective-position scan must key on the tag PREFIX ('<!-- auto-rail-review:\$_o:head'), not the whole annotated form ('...:\$head -->') — an exact-form match stops counting basis-carrying markers, so the in-flight/awaiting-review pair can no longer correct each other"
+# ⛔ AND A LEDGER THAT CANNOT BE APPENDED TO IS NOT A FREE SLOT (review round 15, P2, measured): a regular file
+# that reads but refuses `>>` (root-owned 0644/0444 after a sudo run, a read-only mount) passed every existing
+# guard, `awk` succeeded, the count stayed 0 for ever and the append failure was only LOGGED — so one paid
+# review was bought on every pass past the bound (measured: 5 dispatches at one head in 5 passes, 0 lines).
+_ROL="$_rdir/readonly.attempts"
+printf '%s\n%s\n' "$(date +%s)" "$(date +%s)" > "$_ROL"
+if chmod 444 "$_ROL" 2>/dev/null && [ ! -w "$_ROL" ]; then
+  [ "$(review_attempts "$_ROL")" = "$REVIEW_MAX_ATTEMPTS" ] \
+    || bad "an UNWRITABLE ledger must FAIL CLOSED (got '$(review_attempts "$_ROL")', want the cap $REVIEW_MAX_ATTEMPTS) — its count can never grow, so reading 2 there buys a paid review on every pass for ever"
+  grep -qF 'REVIEW-LEDGER-UNWRITABLE' "$LOG" \
+    || bad "an unwritable ledger must SAY SO in the log (no REVIEW-LEDGER-UNWRITABLE line) — a silent cap is indistinguishable from the defect it replaces"
+  review_ledger_unreadable "$_ROL" \
+    || bad "review_ledger_unreadable must answer UNCOUNTABLE for an unwritable ledger — otherwise the CAP wording is skipped for exactly the record whose count can never be measured"
+else
+  echo "SKIP: cannot make a ledger unwritable as $(id -un) — the unwritable-ledger arms are INERT on this host"
+fi
+chmod 600 "$_ROL" 2>/dev/null; rm -f "$_ROL"
 
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"

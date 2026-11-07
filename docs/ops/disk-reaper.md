@@ -33,15 +33,61 @@ the shipped 3600 s was half of it — see the class note below), and the vendor'
 
 ## Why one entry point
 
-The fleet already reaped ad hoc in four places — `cloud-cell-supervisor.sh prune`,
-the hourly cache pass inside `orch-loop.sh`, `pi-reap-worktrees-launchd.py` (macOS
-only, so cells had nothing), and `cleanup-worktree.sh` at merge time. Four triggers
-and no single answer to *"is this box being reaped, and how much did the last pass
-free?"*. This is the consolidation: one scheduled pass, one pass record, one status
-line, and the existing owners untouched except where a class needed a new policy
-(the merged-head floor below).
+The fleet already ran ad-hoc reap passes from **several** scheduled places —
+among them `cloud-cell-supervisor.sh prune` (the one whose cache arm is ARMED:
+it reaches `pi-cache-reap.sh --apply` at `cloud-cell-supervisor.sh:4875`,
+unattended under pressure), the hourly cache pass inside `orch-loop.sh`, the
+`pi-reap-worktrees-launchd.py` unit (macOS only, so cells had nothing), the
+hourly `com.eldato.pi-cache-reap.plist` unit, and the 6-hourly
+`com.tortoise.worktree-hygiene.plist` (whose step 1 is `pi-reap-worktrees.sh`).
 
-Adding a fourth copy of a delete rule would have been the easy path and is
+**Most of those shipped DISARMED, deliberately** (#1678: "the reaper may run
+unattended; arming it may not"): the loop's cache pass hardcodes `--dry-run`
+(`scripts/orchestrator-harness/orch-loop.sh:4246`) and so do both unit
+templates — `com.eldato.pi-cache-reap.plist:89`,
+`com.tortoise.worktree-reaper.plist:129` — where arming is an owner edit of that
+argument plus an `install-launchd.sh` re-run; `worktree-hygiene` instead renders
+`--apply` only on an armed box, `--dry-run` otherwise, from
+`{{WORKTREE_HYGIENE_MODE}}`, which `install-launchd.sh` resolves from
+`~/.pi/agent/state/worktree-hygiene.armed`. So **of those legacy passes**, on a
+default install only the `prune` path reclaims anything and the rest merely
+report, which is the distinction this page exists to stop blurring. That is not
+a statement about this page's own pass: on a cell the consolidated timer is
+installed with `--apply` (`install-disk-reaper-timer.sh:108`, run
+unconditionally by `cloud-cell-bringup.sh:2240`), so *it* does reclaim — the
+scoped clause above is the legacy enumeration, not this script. No single one
+answered *"is this box being reaped, and how much did the last pass free?"* —
+and **no count is claimed here**, because a count is the claim
+that made this page wrong in the first place: the point is not how many triggers
+existed, it is that none of them could answer that question. This is the
+consolidation: one scheduled pass, one pass record, one status line, and the
+existing owners untouched except where a class needed a new policy (the
+merged-head floor below).
+
+⛔ **The merge-time teardown is NOT one of them — it is a manual convention, not an
+automation.** An earlier version of this page (and of `scripts/disk-reaper.sh`'s
+header) listed `cleanup-worktree.sh` *at merge time* as a fourth consolidated
+trigger. It never was one: **no automation invokes it.** `merge-one.sh` performs no
+worktree removal at all, `admin-merge.sh` removes only its own scratch worktree,
+and an index-bounded `git grep -n 'cleanup-worktree' origin/main` finds the
+script's only operational **caller** in a **manual step** —
+`skills/commit-workflow/workflow/05-cleanup.md:20`, which a lane has to remember to
+run. (Every other hit is prose or a test — the script's own usage line, comments,
+a scoping doc, the guard extension's README, and guard tests that assert the script
+is *refused* — never an executor.) So what the fleet has at
+merge time is a convention a lane may forget, not a scheduled pass: this script
+neither schedules it nor accounts for it, and a reader who saw it in the list above
+would rightly stop asking why the disk still fills.
+
+Wiring a real merge-time reaper in is deliberately **not** done here — see #3278's
+plan comment §4: the mass such a hook cannot reach is the `no-pr` / `open-pr`
+worktrees, which by definition have *not* merged, so a merge-time trigger would be
+yet another reaper for bytes it can never take. The merge trigger that *does* exist
+and *is* automated is `pi-reap-worktrees.sh` rule 4 (a checkout whose PR `MERGED`
+at that exact head, exempt from the 7-day floor) — and it is one of the scheduled
+passes above, not a merge hook.
+
+Adding another copy of a delete rule would have been the easy path and is
 explicitly refused: `disk-reaper.sh` contains **no `rm` on a filesystem path** (its
 only recursive delete is its own lock), and the test suite pins that
 (`disk-reaper.test.sh` T6).
@@ -705,10 +751,37 @@ have an owner, so "nothing sweeps `/tmp`" is no longer true and this paragraph w
 that claim: `scripts/reap-abandoned-worktrees.sh --include-gitless` (reached from the pass's abandoned
 arm, `DISK_REAPER_GITLESS=0` off-switch) sweeps a `/tmp/<name>` scratch tree with **no `.git` at all**,
 using the liveness witness the objection above asks for (a live-pid cwd/exe census, `reason=live-cwd`)
-plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`) and a
-per-pass cap (`REAP_AW_GITLESS_MAX`, default 10).
+plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`).
+**#3278 changed WHEN #3272's count ceiling is charged, not its size.** The ceiling (`REAP_AW_GITLESS_MAX`,
+default 10 per root) is still the bound on destructive capacity, and it is now taken **after the age
+floor and before the live-pid census** — the unit used to be spent BEFORE the floor was consulted, so
+~89 % of those ten slots went to trees the age test preserved anyway, and on a population of thousands
+the aged trees were never reachable at all (a dry run over 3,314 entries classified 10 and printed
+`gitless-cap` for **3,137**). **An exhausted ceiling also short-circuits the eligibility scan itself**
+(one integer compare, at the top of the gitless branch): with the refusal downstream of the scan a
+capped pass still paid ~6 forks per entry to print rows that say the same thing — measured at 8.98 s
+versus 0.60 s over 300 entries with the census isolated, for a byte-identical pass record. The cost of
+that ordering is a REPORT change, and it is deliberate: past the ceiling a row names the ceiling
+(`gitless-cap`), not the tree's own reason, because the arm did not look. Every outcome there is a
+preserve.
+The pass's **expensive per-candidate work** is additionally bounded, **per
+root**, by a **TIME** bound, `REAP_AW_BUDGET_SECONDS` default 300 s — the eligibility scan over the whole
+population up to the ceiling is *not* budgeted (classifying every entry is the product), and
+`DISK_REAPER_CLASS_TIMEOUT` (1800) bounds each **per-root invocation**, not the whole pass.
+**Raising or removing the ceiling is #3278's P3 — an owner decision, sequenced after P2 — and is not
+part of this change.**
+
+The `home-or-state` guard protects the cell home even when nothing exports `CELL_HOME`: the unit renders
+`Environment=HOME=/home/cmux` (a real directory), so the wrapper's own fallback never fires and
+`/tmp/cell-home` — ~20 GB of live `.pi` state with no `.git` — used to match none of the guard's
+references. The guard now resolves it itself, via `REAP_AW_CELL_HOME_DEFAULT` (default
+`/tmp/cell-home`). ⛔ **That seam is TEST-ONLY: never set it in a systemd unit, a launchd plist, or any
+scheduled artifact.** It is a *substitution*, not an addition — an exported `CELL_HOME` still wins, and
+a wrong value protects a different directory **and drops `/tmp/cell-home`**. It exists so the fallback
+has a behavioural test (a fixture cannot live at `/tmp/cell-home`); it is a default, not a second
+source of truth.
 What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
-`open-pr`/`dirty` proofs) and everything the cap leaves for the next hour.
+`open-pr`/`dirty` proofs) and everything the ceiling and the pass's time bound leave for the next run.
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -1920,10 +1993,13 @@ of that decision, not an optimisation.
   remainder is filed as **#3043** and is still not implemented: it is a different trade from
   `class=runner-work` — a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
   `/tmp/cell-t3/.worktrees/…`), so an mtime floor is not proof of death, and a scratch copy is the only
-  artifact of an unfinished review. Beyond #3272's cap (`REAP_AW_GITLESS_MAX`, default 10 per pass) and
-  the trees a `.git`-owned arm claims, it needs an owner ruling on what scratch counts as evidence — the
-  same reversal-of-a-decision problem `docs/ops/disk-consumers.md` G2 records. Do not "just add an age
-  sweep": it would delete working lanes' trees.
+  artifact of an unfinished review. Beyond the pass's own bounds (the count ceiling,
+  `REAP_AW_GITLESS_MAX` default 10 per root, now charged to AGED candidates — #3278 — and a per-root
+  wall-clock budget on its **expensive per-candidate work**, `REAP_AW_BUDGET_SECONDS` default 300 s, inside
+  a `DISK_REAPER_CLASS_TIMEOUT` of 1800 *per root invocation*) and the trees a `.git`-owned arm claims, it needs an
+  owner ruling on what scratch counts as evidence — the same reversal-of-a-decision problem
+  `docs/ops/disk-consumers.md` G2 records. Do not "just add an age sweep": it would delete working
+  lanes' trees.
 
 ## Measured evidence (2026-10-18, cell-3, this box)
 

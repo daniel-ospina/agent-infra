@@ -1801,6 +1801,213 @@ async function partB() {
       expectTrue(`B13: ${why} → reason names what was observed`,
         reasonRe.test(blockReason1228(r)), `reason=${JSON.stringify(blockReason1228(r)).slice(0, 240)}`);
     }
+    // ── B13b (#3333 review, P0): a BARE RELATIVE interpreter operand ───────────
+    // The shape grammar rejects every word with no `/` and no leading `~` — which is
+    // `directish`'s rule for a COMMAND WORD, and it is right there: a bare command resolves
+    // through PATH. It is WRONG for an INTERPRETER OPERAND, which resolves against the CWD
+    // and is exec'd: `bash undo*.sh` globs the CWD and runs the result. Applying the grammar
+    // at that position DELETED the whole class, so the command was ALLOWED with a script the
+    // guard never read — the #1228 fail-open this arm exists to close, one spelling over.
+    // Measured: every row below was BLOCK on the pre-#3243 head and ALLOW on the head this pin was
+    // added for (`56025bb5`). ⛔ AND IT IS NOT A BATCH-ONLY DEFECT: `origin/main` ALLOWs them too, as
+    // of the measurement (#3311 landed the same operand-branch shape test on main), so this head is
+    // currently the only place the class is closed. That is why the pin lives here and not upstream.
+    // All 16 rows below are BLOCK again on this head.
+    // ⛔ EVERY SPELLING IS `undo-…`-PREFIXED AND UNPREFIXED — `./undo-…*` is NOT the same test:
+    // the grammar's explicit-prefix accept (`/^(?:\.{1,2}|~)\//`) admits a `./`-spelled word
+    // whatever the operand branch does, which is why test-command-position.mjs D6/D7 (all
+    // `./scripts/…`) could not measure this axis at all.
+    // ⛔ NAMED RESIDUAL (measured, identical on `origin/main`, #3333 review P2) — THREE mechanisms
+    // (the difference between the first two decides what a future fix has to touch; the third is not
+    // a wrapper problem at all):
+    // (a) a wrapper the `firstIsShellLike` NAME list does not name leaves the operand in `sp` and it
+    // blocks only on that test — `. undo-1228*.sh`, `runuser -u root -- bash …`, `chroot / bash …`,
+    // `flock /tmp/l bash …`, `strace -f bash …`, `watch -n1 bash …`, `systemd-run --user bash …`,
+    // `unbuffer bash …`;
+    // (b) `extractScriptPath` returns null, so NO operand exists — `"$BASH" undo-1228*.sh`,
+    // `$BASH undo-1228*.sh`, `"$SHELL" undo-1228*.sh` (widening the name set does not reach these);
+    // (c) and the same class one spelling over: a BARE direct-execution glob as the FIRST WORD
+    // (`undo-1228*.sh`, no wrapper) is ALLOW on BOTH builds — `extractScriptPath` yields null and
+    // `directish` needs `/` or `~`, so no candidate is formed. `./undo-1228*.sh` IS blocked.
+    // All are ALLOW on BOTH builds and pre-existing. Closing that is a fail-closed widening tracked
+    // with the rest of this class (#3341), not here.
+    const bare1228 = [
+      ["glob `bash undo-1228*.sh`", "bash undo-1228*.sh"],
+      ["bare `?` `bash undo-1228?.sh`", "bash undo-1228?.sh"],
+      ["char-class `bash undo-1228[g]lob.sh`", "bash undo-1228[g]lob.sh"],
+      ["brace `bash undo-1228{-glob,}.sh`", "bash undo-1228{-glob,}.sh"],
+      ["`sh undo-1228?.sh`", "sh undo-1228?.sh"],
+      ["flag before the operand `bash -x undo-1228*.sh`", "bash -x undo-1228*.sh"],
+      ["trailing ARGUMENT `bash undo-1228*.sh arg`", "bash undo-1228*.sh arg"],
+      ["`sudo bash undo-1228*.sh`", "sudo bash undo-1228*.sh"],
+      ["`env A=1 bash undo-1228*.sh`", "env A=1 bash undo-1228*.sh"],
+      ["extglob, bare `bash -O extglob undo-1228@(-glob|).sh`", "bash -O extglob undo-1228@(-glob|).sh"],
+      ["extglob inside a `-c` payload `bash -c 'bash undo-1228@(-glob|).sh'`", "bash -c 'bash undo-1228@(-glob|).sh'"],
+      ["`bash -c 'bash undo-1228*.sh'`", "bash -c 'bash undo-1228*.sh'"],
+      ["`sh -c 'sh undo-1228?.sh'`", "sh -c 'sh undo-1228?.sh'"],
+      ["`eval 'bash undo-1228*.sh'`", "eval 'bash undo-1228*.sh'"],
+      ["after a separator `true && bash undo-1228*.sh`", "true && bash undo-1228*.sh"],
+      ["nested script that runs a BARE expanded operand", "bash ./outer-bare-1228.sh"],
+    ];
+    // The nested-script fixture, written here (B13's `outer-*` fixtures all spell `./`).
+    write(join(wt, "outer-bare-1228.sh"), "bash undo-1228*.sh\n");
+    for (const [why, cmd] of bare1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(cmd, wt);
+      expectTrue(`B13b: ${why} → BLOCKED`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+      expectTrue(`B13b: ${why} → reason names what was observed`,
+        /not statically resolvable|#709|piped producer/.test(blockReason1228(r)),
+        `reason=${JSON.stringify(blockReason1228(r)).slice(0, 240)}`);
+    }
+    // The POSITIVE control the class needs: the same bare operand spelled LITERALLY stays
+    // gated by the discard effect (not by the expansion arm), so the fix did not simply make
+    // every bare `bash x.sh` fail closed.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const bareLiteral = await bash("bash undo-1228.sh", wt);
+    expectTrue("B13b: a bare LITERAL operand `bash undo-1228.sh` is read and gated by the effect (#709), not refused as unreadable",
+      blocked(bareLiteral) && /#709/.test(blockReason1228(bareLiteral)),
+      `reason=${JSON.stringify(blockReason1228(bareLiteral)).slice(0, 240)}`);
+
+    // ── B13c (#3341): the SHAPE ALPHABET is part of the same fail-open, not a separate issue ──
+    // `wtIsPathShapedScriptWord` FILTERS a path the shell will execute, so a byte it rejects
+    // DELETES the candidate and the arm goes blind. `,` `:` `=` `#` and `^` inside a component are
+    // ordinary filename bytes; a grammar that excluded them made a REAL executed path invisible to
+    // every arm, so nothing was read and the command was ALLOWED.
+    //
+    // ⛔ THE SPELLING HAS TO BE ABSOLUTE, AND THAT IS MEASURED, NOT ASSUMED (#3333 review, P2). A
+    // RELATIVE `x2/undo=1-*.sh` is refused by a DIFFERENT arm — the first-token expansion refusal in
+    // `index.ts` (`_wtExpandedScriptTokenIn`'s caller) — so it BLOCKs even with this grammar stubbed
+    // to `return false`, and a pin written on it would pass for a reason it does not name and would
+    // NOT go red if the alphabet regressed. Verified both ways: with
+    // `wtIsPathShapedScriptWord` replaced by `return false`, every absolute row below turns ALLOW and
+    // every relative one stays BLOCK. Absolute is also the realistic shape (`/tmp/undo*.sh`).
+    // ⛔ And the spellings are UNPREFIXED — the grammar accepts any `./`, `../` or `~/` word in its
+    // PROLOGUE, before a single byte rule runs, so a prefixed probe passes in both builds.
+    const alphaDir = join(wt, "x2");
+    mkdirSync(alphaDir, { recursive: true });
+    for (const base of ["undo=1-x.sh", "undo,2-x.sh", "undo#1-x.sh", "undo:1-x.sh"]) {
+      write(join(alphaDir, base), "git checkout -- dirty.txt\n");
+      // Direct execution needs the executable bit, exactly as B13's `sub-1228/undo.sh` fixture does:
+      // without it the shell cannot execve the file, so "read and gated" is not the behaviour under test.
+      execSync(`chmod +x ${JSON.stringify(join(alphaDir, base))}`);
+    }
+    const alpha1228 = [
+      ["`=` in a component", join(alphaDir, "undo=1-*.sh")],
+      ["`,` in a component", join(alphaDir, "undo,2-*.sh")],
+      ["`#` in a component", join(alphaDir, "undo#1-*.sh")],
+      ["`:` in a component", join(alphaDir, "undo:1-*.sh")],
+    ];
+    for (const [why, cmd] of alpha1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(`'${cmd}'`, wt);
+      expectTrue(`B13c: ${why} → BLOCKED (${cmd})`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+    }
+    // The wrapper form is pinned HERE too, but as what it actually is: the OPERAND branch (commit 1's
+    // P0 fix), not the alphabet. It stays BLOCK with the grammar stubbed, so it is a cross-check of
+    // the operand position and not a second alphabet pin.
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const alphaWrapped = await bash(`bash '${join(alphaDir, "undo=1-*.sh")}'`, wt);
+    expectTrue("B13c: the same behind a wrapper is BLOCKED by the OPERAND branch (not by the alphabet)",
+      blocked(alphaWrapped), JSON.stringify(alphaWrapped)?.slice(0, 200));
+    // POSITIVE control: the LITERAL spelling of the same file stays gated by its EFFECT (#709),
+    // so the alphabet arms above are not just "everything under x2/ is refused".
+    write(join(wt, "dirty.txt"), "MUTANT\n");
+    const alphaLiteral = await bash(`'${join(alphaDir, "undo=1-x.sh")}'`, wt);
+    expectTrue("B13c control: the LITERAL spelling of the same file is read and gated by the effect (#709)",
+      blocked(alphaLiteral) && /#709/.test(blockReason1228(alphaLiteral)),
+      `reason=${JSON.stringify(blockReason1228(alphaLiteral)).slice(0, 240)}`);
+
+    // ── B13d (#3333 review cycle-2, P1-1 + P1-2): two byte rules that DELETED a real executed path ──
+    // Both were NEW fail-opens this head introduced against `origin/main`, and BOTH were invisible to
+    // every suite: the predicate returned `false`, so no arm ever formed a candidate, and the tests that
+    // looked like they covered the position (`./`-prefixed spellings) passed for a different reason.
+    // These arms drive the REAL handler and assert BLOCK, so a re-widening reds here at the level the
+    // user actually hits rather than only at the predicate.
+    //
+    // ⛔ THE FIXTURES ARE NAMED SO THE SPELLING IS THE THING UNDER TEST: `stage1$` is a directory whose
+    // name ends in `$` (spelled `st*$/undo.sh` — the glob is on a LITERAL component), and `q0w` holds
+    // `undox.sh` (spelled `q[0]w/undo[x].sh` — two bracket GROUPS with a `/` between them).
+    const dollarDir = join(wt, "stage1$");
+    mkdirSync(dollarDir, { recursive: true });
+    write(join(dollarDir, "undo.sh"), "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${JSON.stringify(join(dollarDir, "undo.sh"))}`);
+    const bracketDir = join(wt, "q0w");
+    mkdirSync(bracketDir, { recursive: true });
+    write(join(bracketDir, "undox.sh"), "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${JSON.stringify(join(bracketDir, "undox.sh"))}`);
+    // ⛔ F1 (#3333 review cycle-2) — an UNMATCHED `[` must still JUMP. The bound above shipped in a first
+    // cut that assigned `e = -1` when no closer sat in the current component, and then did not jump at
+    // all — so the loop VISITED the group's bytes and the `^` anchor / unbalanced-`${` refusal / alphabet
+    // each deleted the word. Both directories below are ordinary expanded paths; main BLOCKed them and
+    // that cut ALLOWed them, destroying uncommitted work end-to-end.
+    const caretDir = join(wt, "a", "[", "^");
+    mkdirSync(caretDir, { recursive: true });
+    write(join(caretDir, "0"), "git checkout -- dirty.txt\n");
+    execSync(`chmod +x ${JSON.stringify(join(caretDir, "0"))}`);
+    const deleted1228 = [
+      ["P1-1 a `$`-terminated component addressed through a glob, after a separator", "true && st*$/undo.sh"],
+      ["P1-1 …as a `-c` payload", "bash -c 'st*$/undo.sh'"],
+      ["P1-1 …through `eval`", "eval 'st*$/undo.sh'"],
+      ["P1-1 …absolute", `true && '${join(wt, "st*$/undo.sh")}'`],
+      ["P1-1 …a `?` glob on a literal component", "true && sta?e1$/undo.sh"],
+      ["P1-2 two bracket groups with a `/` between them, after a separator", "true && q[0]w/undo[x].sh"],
+      ["P1-2 …as a `-c` payload", "bash -c 'q[0]w/undo[x].sh'"],
+      ["P1-2 …through `eval`", "eval 'q[0]w/undo[x].sh'"],
+      ["P1-2 …absolute", `true && '${join(wt, "q[0]w/undo[x].sh")}'`],
+      ["F1 an UNMATCHED `[` before a `^` component, after a separator", "true && a/[/^/[0]"],
+      ["F1 …through `eval`", "eval 'a/[/^/[0]'"],
+    ];
+    for (const [why, cmd] of deleted1228) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(cmd, wt);
+      expectTrue(`B13d: ${why} → BLOCKED (${cmd})`, blocked(r), JSON.stringify(r)?.slice(0, 200));
+    }
+    // ⛔ F1's other two shapes are PREDICATE-level here on purpose: they need directory/quoting fixtures
+    // (`[b`, a quoted `${`) whose SHELL quoting would be the thing under test rather than the grammar, so
+    // the assertion is made on the predicate where the failure actually lived (each was `false` on the
+    // F1 cut and `true` on `origin/main`). All three are real expanded paths a shell executes.
+    for (const f1 of ["a/[b/c/'${x'/undo]z/d.sh", "a/[/x'|'y/undo]z/w.sh"]) {
+      expectTrue(`B13d: F1 an unmatched \`[\` does not expose its bytes to a rejecting rule (${f1})`,
+        cg.wtIsPathShapedScriptWord(f1) === true);
+    }
+    // ⛔ F1's SECOND shape (#3333 review cycle-4): the jump must start from `origin/main`'s FIRST
+    // closer, not the LAST `]` in the whole word. `[/]/[]` and friends are real executable paths
+    // (unmatched brackets are literal in pathname expansion) that were `true` on main and `false` on
+    // both earlier cuts of this rule, ALLOW-through-the-handler where main BLOCKed. Predicate-level:
+    // the fixture is a directory literally named `[` holding `[]`, which no shell-quoting form can
+    // express portably, so the assertion is made where the failure lived.
+    for (const b of ["[/]/[]", "a[/]/[]", "x[/]/y[]", "[a/b]/[]", "[/]/~[]", "/[]`]`", "[]`]`/"]) {
+      expectTrue(`B13d: F1 the \`[\` jump is main's FIRST closer, so a real path survives (${b})`,
+        cg.wtIsPathShapedScriptWord(b) === true);
+    }
+    // ⛔ THE POSIX FOLD'S OWN FAIL-OPEN (#3333 review cycle-6, F1 — measured, and it shipped for two
+    // cycles). Keying the fold on the PREFIX `[[:` folded words that merely start that way, so the jump
+    // skipped a BACKTICK OPENER and left its partner unbalanced: `[[:]`]`/undo.sh` was `false` here and
+    // `true` on `origin/main`, and through the real handler it went ALLOW where main BLOCKed with
+    // `dirty.txt` reverting to committed. A POSIX class is `[[:name:]]` — `[[:]` is not one — so the
+    // fold must key on the GRAMMAR. These spellings are the pin; `s/[[:space:]]*$//` above stays the
+    // control that the fold still happens where it should.
+    for (const pf of ["[[:]`]`/undo.sh", "[[:x]`]`/undo.sh", "[[:]`]`/u.sh"]) {
+      expectTrue(`B13d: F1 a word that merely PREFIXES like a POSIX class is not folded (${pf})`,
+        cg.wtIsPathShapedScriptWord(pf) === true);
+    }
+    // ⛔ THE POSITIVE CONTROLS the fail-open class needs: the LITERAL spellings stay gated by their
+    // EFFECT (#709), so the arms above are not "everything under these directories is refused", and
+    // the two program-text exclusions this rule exists for are still non-paths.
+    for (const [why, lit] of [
+      ["the `$` directory, spelled literally", join(wt, "stage1$/undo.sh")],
+      ["the bracket directory, spelled literally", join(wt, "q0w/undox.sh")],
+    ]) {
+      write(join(wt, "dirty.txt"), "MUTANT\n");
+      const r = await bash(`bash '${lit}'`, wt);
+      expectTrue(`B13d control: ${why} is read and gated by the effect (#709)`,
+        blocked(r) && /#709/.test(blockReason1228(r)),
+        `reason=${JSON.stringify(blockReason1228(r)).slice(0, 240)}`);
+    }
+    expectTrue("B13d control: the sed expression #3243 was filed for is STILL not a path `s/[[:space:]]*$//`",
+      cg.wtIsPathShapedScriptWord("s/[[:space:]]*$//") === false);
+    expectTrue("B13d control: the awk program is STILL not a path `/^tree=/{t=$2}`",
+      cg.wtIsPathShapedScriptWord("/^tree=/{t=$2}") === false);
     // Documented fail-closed COST, not a bug: an expansion-shaped path is
     // refused WITHOUT reading it, so a glob that happens to match only a clean
     // script blocks too. That is the accepted price of the fix — resolving
@@ -2614,8 +2821,8 @@ if (process.argv.includes("--mutations")) {
     [
       "the path-shaped word grammar (#3243)",
       [[
-        "  if (/^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out)) return true;\n  return /^(?:\\.{1,2}|~)\\//.test(s);",
-        "  return true;",
+        String.raw`  if (/(?:^|\/)\^/.test(out)) return false;`,
+        String.raw`  if (false) return false;`,
       ]],
       (m) => m.wtIsPathShapedScriptWord("/^tree=/{t=$2}"),
       false,
@@ -2625,8 +2832,8 @@ if (process.argv.includes("--mutations")) {
     [
       "the path-shaped word grammar still admits every EXPANSION form",
       [[
-        "  if (/^[A-Za-z0-9._+@!%~\\u0000/-]+$/.test(out) && /[\\/~]/.test(out)) return true;\n  return /^(?:\\.{1,2}|~)\\//.test(s);",
-        "  return true;",
+        String.raw`  if (/(?:^|\/)\^/.test(out)) return false;`,
+        String.raw`  if (false) return false;`,
       ]],
       (m) => ["./undo-3243*.sh", "~/undo.sh", "$WT/.venv/bin/python", "./undo@(-g|).sh", "sub/undo.sh"].every((w) => m.wtIsPathShapedScriptWord(w)),
       true,
@@ -2669,41 +2876,158 @@ if (process.argv.includes("--mutations")) {
     ],
     // F2-c2: this grammar FILTERS a path the shell will execute, so a REJECTION
     // deletes the candidate and blinds the arm. `,` `:` `=` `^` `#` are ordinary
-    // filename bytes and `\\` spells a literal one; the first cut rejected them,
-    // so `./undo,2-*.sh` and `./undo2-\\*.sh` really executed the destructive
-    // script and ran UNGATED (base: BLOCK).
+    // filename bytes and `\` spells a literal one; a cut that rejected them made a
+    // really-executed path invisible to the arm (base: BLOCK).
+    // ⛔ THE PROBES ARE UNPREFIXED ON PURPOSE. The grammar accepts ANY `./`, `../` or `~/`
+    // word in its own PROLOGUE, before a single byte rule can run (that is cycle-7's fix),
+    // so a `./`-spelled probe cannot measure a byte rule at all — it would pass in both builds.
     [
       "a REJECTED path byte does not delete the candidate (#3243 c2 F2)",
       [[
-        "  return /^(?:\\.{1,2}|~)\\//.test(s);",
-        "  return false;",
+        String.raw`  const PLAIN_BYTE = /[A-Za-z0-9._+@!%~^$\u0000/,:=# \t\-\[\]{}();]/;`,
+        String.raw`  const PLAIN_BYTE = /[A-Za-z0-9._+@!%~^$\u0000/:=# \t\-\[\]{}();]/;`,
       ]],
-      (m) => m.wtIsPathShapedScriptWord("./undo,2-X.sh"),
+      (m) => m.wtIsPathShapedScriptWord("sub,2/undo*.sh"),
       true,
       false,
-      "a legal filename byte makes the really-executed path invisible to the arm",
+      "dropping ONE legal filename byte (` , `) makes a really-executed path invisible — and the prologue accept does not rescue an unprefixed one",
     ],
     [
       "an ESCAPED path byte is a LITERAL, not a disqualifier (#3243 c2 F2)",
       [[
-        "    if (ch === \"\\\\\") { out += PH; i++; continue; }",
-        "    if (ch === \"\\\\\") return false;",
+        String.raw`      out += nx === "/" || nx === "~" ? ES : PH;`,
+        String.raw`      return false;`,
       ]],
-      (m) => m.wtIsPathShapedScriptWord("./undo2-\\*.sh"),
+      (m) => m.wtIsPathShapedScriptWord(String.raw`sub/undo2-\*.sh`),
       true,
       false,
-      "`./undo2-\\*.sh` spells a real file and the arm goes blind on it",
+      String.raw`\`sub/undo2-\*.sh\` spells a real file and the arm goes blind on it`,
     ],
     [
-      "…and an awk/sed PROGRAM is still not a path (both builds)",
+      "…and an awk/sed PROGRAM is still not a path in BOTH builds",
+      // An UNRELATED revert, so the control measures the two program-text verdicts and not the
+      // rule the sibling pairs above already mutate: collapsing the escaped-separator sentinel to
+      // a plain placeholder changes no verdict for program text (it contains no backslash), which
+      // is what makes this a control rather than a second copy of pair 1.
       [[
-        "  return /^(?:\\.{1,2}|~)\\//.test(s);",
-        "  return false;",
+        String.raw`      out += nx === "/" || nx === "~" ? ES : PH;`,
+        String.raw`      out += PH;`,
       ]],
       (m) => ["/^tree=/{t=$2}", "s/[[:space:]]*$//"].every((w) => m.wtIsPathShapedScriptWord(w) === false),
       true,
       true,
-      "program TEXT carries no explicit path prefix, so it stays non-path in BOTH builds",
+      "program TEXT stays non-path in BOTH builds — the escaped-separator rule is not what excludes it",
+    ],
+    [
+      "the component-final `$` END-ANCHOR rule (#3243 c9) is load-bearing",
+      // The sed expression #3243 was FILED for is excluded by exactly one rule: a `$` that follows a
+      // glob operator applied to an EXPANSION GROUP. Drop that rule and it must become a script path
+      // again — otherwise the exclusion is an accident of some other byte rule and the next widening
+      // will re-admit it.
+      [[
+        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PH + PG)) return false;`,
+        String.raw`      else if (false) return false;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("s/[[:space:]]*$//"),
+      false,
+      true,
+      "the sed expression #3243 was filed for becomes a script path again",
+    ],
+    [
+      // ⛔ THE P1-1 PAIR (#3333 review cycle-2). The rule above shipped keyed on `out.endsWith(PG)`
+      // alone — any `$` after ANY raw glob — and that DELETED real `$`-terminated directories a shell
+      // expands and execs: `a*$/undo.sh`, `st*$/undo.sh`, `/tmp/*$/undo.sh` were ALLOW at that head and
+      // BLOCK on `origin/main`, through the real handler. Narrowing the test to `PH + PG` (a glob on a
+      // GROUP) is what restores them, so this pair RE-WIDENS the rule and demands the fail-open back.
+      // Without it, the fix is unpinned and the next widening re-admits the class silently.
+      "the `$` END-ANCHOR applies only to a glob on a GROUP, never to a glob on a literal byte (#3333 c2 P1-1)",
+      [[
+        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PH + PG)) return false;`,
+        String.raw`      else if ((s[j] === undefined || s[j] === "/") && out.endsWith(PG)) return false;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("a*$/undo.sh"),
+      true,
+      false,
+      "a real `$`-terminated directory addressed through a glob goes blind again",
+    ],
+    [
+      // ⛔ THE FOLD'S `/`-BOUND PAIR (#3333 review cycle-7, F1 — and the note that used to sit here was
+      // FALSE, measured: it claimed "a pair aimed at it could not fail". It can, and this is it.)
+      // `sl` is the ONLY thing stopping the fold from swallowing a separator, which is what the code
+      // comment says ("it can only ever swallow bytes up to the next `/`"), so it is a pinnable
+      // property, not a structural guarantee. Reverting `lastIndexOf("]", sl)` to `lastIndexOf("]")`
+      // (unbounded) drops a real folded path — `[[:lower:]]x/undo[x].sh` really expands to
+      // `ax/undox.sh` and really executes — while every other arm stays green, which is exactly why it
+      // needs its own pair. (Note the mutant lands on `origin/main`'s answer, not on a new one: head is
+      // the fail-CLOSED side here. The pair pins head's behaviour, not a divergence from main.)
+      "the POSIX fold cannot cross the first `/` — it binds to `sl` (#3333 c7)",
+      [[
+        String.raw`          const inComponent = s.lastIndexOf("]", sl);`,
+        String.raw`          const inComponent = s.lastIndexOf("]");`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("[[:lower:]]x/undo[x].sh"),
+      true,
+      false,
+      "a real folded path goes blind again",
+    ],
+    [
+      // ⛔ THE F1 PAIR (#3333 review cycles 2 and 4 — this rule has now been wrong TWICE, in opposite
+      // directions, and each cut moved the hole instead of closing it).
+      //   cut 1: `e = LAST_CLOSE` unconditionally — swallowed `/` bytes, so `q[0]w/undo[x].sh` was
+      //          deleted (`false`) while `origin/main` kept it.
+      //   cut 2: bound it with `e = -1` when no closer was in reach — the loop then did not jump and
+      //          VISITED the bytes, so the `^` anchor and the unbalanced-`${` refusal deleted real
+      //          paths (`a/[/^/[0]`).
+      //   cut 3 (this one): start from `origin/main`'s own jump — the FIRST closer — so parity holds by
+      //          construction, and depart from it only to fold a POSIX class.
+      // This pair reverts the default back to `LAST_CLOSE` and demands BOTH classes come back: the
+      // cycle-4 `[/]`-family and the cycle-2 `q[0]w/undo[x].sh` family, which the same revert
+      // reproduces — which is also why they share ONE pair rather than two that could never fail
+      // independently of each other.
+      "the `[` jump starts from main's FIRST closer, so a real path is never skipped (#3333 c4 F1)",
+      [[
+        String.raw`      let e = LAST_CLOSE > i ? s.indexOf("]", i + 1) : -1;`,
+        String.raw`      let e = LAST_CLOSE;`,
+      ]],
+      (m) => ["[/]/[]", "a[/]/[]", "x[/]/y[]", "[a/b]/[]", "q[0]w/undo[x].sh", "a[b]c/d[e]"].every((w) => m.wtIsPathShapedScriptWord(w)),
+      true,
+      false,
+      "unmatched brackets stop being literal filename bytes and every `[/]`-shaped real path goes invisible",
+    ],
+    [
+      // ⛔ THE POSIX-CLASS FOLD PAIR (#3333 review cycle-3/4). The fold is the ONE departure from
+      // main's jump: a `[[:…:]]` class consumes its own closers so the group is ONE placeholder instead
+      // of leaking a `]`. That is what keeps the sed exclusion a NAMED rule — remove the fold and `out`
+      // ends `]`+`PG` rather than `PH`+`PG`, so the `$` end-anchor no longer fires and the sed
+      // expression #3243 was filed for becomes a script path again. NOTE this pair is deliberately
+      // separate from the `$` pair above: they pin DIFFERENT rules on the same probe, and neither may
+      // mask the other.
+      "a POSIX character class folds to ONE group, so the sed exclusion is a rule and not a leaked byte (#3333 c3)",
+      [[
+        String.raw`        if (inComponent > e) e = inComponent;`,
+        String.raw`        if (false) e = inComponent;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("s/[[:space:]]*$//"),
+      false,
+      true,
+      "the class leaks its closing `]`, the `$` end-anchor stops matching, and the sed expression becomes a path",
+    ],
+    [
+      // ⛔ THE P2-1 PAIR (#3333 review cycle-2, measured): the prologue accept was the cycle-7 P0 fix
+      // and NOTHING pinned it — every guard suite stayed green with the line deleted. An unpinned fix
+      // is a fix the next simplification silently reverts, so it gets a pair of its own. The probe is
+      // an unbalanced-backtick spelling: the loop's backtick branch `return false`s on it, so the
+      // prologue is the ONLY thing that rescues it (a `./a[b/undo*.sh` probe would pass either way,
+      // because the terminal test rescues that one — which is why this spelling and not that one).
+      "the explicit-prefix accept cannot be pre-empted by a byte rule's `return false` (#3333 c2 P2-1)",
+      [[
+        String.raw`  if (/^(?:\.{1,2}|~)\//.test(s)) return true;`,
+        String.raw`  if (false) return true;`,
+      ]],
+      (m) => m.wtIsPathShapedScriptWord("./a`b/undo.sh"),
+      true,
+      false,
+      "a `./`-prefixed real path with an unbalanced backtick is deleted by the loop again",
     ],
   ];
   for (const [label, reverts, probe, wantBefore, wantAfter, why] of PREDICATE_PAIRS) {
@@ -2723,6 +3047,124 @@ if (process.argv.includes("--mutations")) {
   }
 
   try { rmSync(mutRoot, { recursive: true, force: true }); } catch { /* best-effort */ }
+
+  // ── Part M3 (#3333 review, P1) — the OPERAND-POSITION shape test is load-bearing. ──
+  //
+  // Parts M/M2 mutate `classify-git.mjs`. The P0 lived in `index.ts`, in the branch that
+  // decides whether a WRAPPER'S OPERAND is an executed script, and neither M/M2 nor
+  // test-command-position.mjs D6/D7 could reach it: EVERY D6/D7 row is `./scripts/…`-prefixed,
+  // and the grammar's explicit-prefix accept (`/^(?:\.{1,2}|~)\//`) admits those whatever the
+  // operand branch does — measured, reverting the operand branch at THIS head still
+  // reported 111 passed / 0 failed (131 at `56025bb5`, whose test-command-position.mjs carries 20
+  // more assertions that this branch does not have). So a pin there would have asserted the
+  // position, not tested it.
+  //
+  // This pair puts the defect back (`pathShaped` in FRONT of `firstIsShellLike`) and requires the
+  // B13b spellings to go ALLOW. The mutant is written BESIDE the real file because `index.ts`
+  // imports `../shared/print-mode.js`, `../shared/audit-log.js`, `../shared/branch-ownership.mjs`
+  // and `./classify-git.mjs` RELATIVELY — a copy in a temp dir would fail to resolve them and the
+  // mutation would "prove" something for the wrong reason.
+  if (typeof stripTypeScriptTypes !== "function" ||
+      (typeof register !== "function" && typeof registerHooks !== "function")) {
+    skipped("M3: index.ts operand-branch mutation",
+      `node ${process.versions.node} lacks module.stripTypeScriptTypes (needs Node >= 22.13)`);
+  } else {
+    const MUT_REVERTS = [
+      // (1) the operand branch: `firstIsShellLike` stops being an unconditional pass.
+      [
+        "    (firstIsShellLike || pathShaped(sp) || /^[\"']?\\$/.test(sp))) {",
+        "    (pathShaped(sp) || /^[\"']?\\$/.test(sp))) {",
+      ],
+      // (2) the extglob long form: the same test, second position.
+      ["(firstIsShellLike || pathShaped(w))", "pathShaped(w)"],
+    ];
+    const MUT_SRC = readFileSync(INDEX_TS, "utf8");
+    let mutated = MUT_SRC;
+    let applied = 0;
+    for (const [from, to] of MUT_REVERTS) {
+      if (!mutated.includes(from)) continue;
+      mutated = mutated.split(from).join(to);
+      applied++;
+    }
+    expectTrue("M3: the operand-shape P0 was actually reintroduced into index.ts (every textual revert applied)",
+      applied === MUT_REVERTS.length,
+      `applied ${applied}/${MUT_REVERTS.length} — a stale anchor means the mutation proves less than it claims`);
+
+    // Hermetic hub + LINKED worktree, the same shape Part B uses: the discard has to be real, or
+    // the arm could pass for the wrong reason (a clean tree short-circuits before the script walk).
+    const m3root = realpathSync(mkdtempSync(join(tmpdir(), "m3-")));
+    const m3hub = join(m3root, "hub");
+    const m3wt = join(m3root, "wt");
+    const m3home = join(m3root, "home");
+    const m3Saved = [...HATCH_VARS, "HOME", "PI_SESSION_ID", "SKILL_ENFORCER_DISABLED"]
+      .map((v) => [v, process.env[v]]);
+    const m3PrevCwd = process.cwd();
+    const m3Mut = join(HERE, `.index.mut-${process.pid}-${Math.random().toString(36).slice(2)}.ts`);
+    let m3MutWritten = false;
+    try {
+      execSync(`git init -q -b main "${m3hub}"`, { cwd: m3root, stdio: "ignore" });
+      execSync("git config user.email t@t && git config user.name t", { cwd: m3hub, stdio: "ignore" });
+      writeFileSync(join(m3hub, "dirty.txt"), "v1\n");
+      execSync("git add dirty.txt && git commit -qm base", { cwd: m3hub, stdio: "ignore" });
+      execSync(`git worktree add -q -b feat "${m3wt}"`, { cwd: m3hub, stdio: "ignore" });
+      writeFileSync(join(m3wt, "undo-1228.sh"), "git checkout -- dirty.txt\n");
+      writeFileSync(join(m3wt, "dirty.txt"), "MUTANT\n");
+      mkdirSync(join(m3home, ".pi", "agent"), { recursive: true });
+      // The `pi -p` child env: hatches stripped, no marker session (#617/#623).
+      for (const v of HATCH_VARS) delete process.env[v];
+      delete process.env.PI_SESSION_ID;
+      process.env.HOME = m3home;
+      process.env.SKILL_ENFORCER_DISABLED = "1";
+
+      const driveModule = async (modPath) => {
+        const hooks = await import(new URL("./module-load-hooks.mjs", import.meta.url).href);
+        if (typeof registerHooks !== "function") register(new URL("./module-load-hooks.mjs", import.meta.url), import.meta.url);
+        void hooks;
+        const realWarn = console.warn;
+        console.warn = () => {};
+        let mod;
+        try { mod = await import(pathToFileURL(modPath).href); } finally { console.warn = realWarn; }
+        const handlers = new Map();
+        mod.default({ on(name, fn) { if (!handlers.has(name)) handlers.set(name, []); handlers.get(name).push(fn); } });
+        const toolCall = handlers.get("tool_call")?.[0];
+        if (typeof toolCall !== "function") return { block: false, reason: "<no tool_call handler>" };
+        const prev = process.cwd();
+        process.chdir(m3wt);
+        try { return await toolCall({ toolName: "bash", input: { command: m3cmd } }, undefined); }
+        finally { process.chdir(prev); }
+      };
+      let m3cmd = "";
+      const VERDICT = async (modPath, command) => {
+        m3cmd = command;
+        writeFileSync(join(m3wt, "dirty.txt"), "MUTANT\n");
+        const r = await driveModule(modPath);
+        return r && r.block === true ? "BLOCK" : "ALLOW";
+      };
+      // Skip cleanly if the hooks are not usable at all (partB skipped for the same reason).
+      let probeOk = true;
+      try { await driveModule(INDEX_TS); } catch { probeOk = false; }
+      if (!probeOk) {
+        skipped("M3: index.ts operand-branch mutation", "index.ts does not load in this node");
+      } else {
+        writeFileSync(m3Mut, mutated);
+        m3MutWritten = true;
+        for (const [why, cmd] of [
+          ["bare glob `bash undo-1228*.sh`", "bash undo-1228*.sh"],
+          ["bare extglob `bash -O extglob undo-1228@(-glob|).sh`", "bash -O extglob undo-1228@(-glob|).sh"],
+        ]) {
+          expect(`M3: unmutated — ${why}`, await VERDICT(INDEX_TS, cmd), "BLOCK");
+          expect(`M3: MUTATED — ${why}`, await VERDICT(m3Mut, cmd), "ALLOW");
+        }
+      }
+    } catch (e) {
+      expectTrue("M3: the operand-branch mutation ran", false, String(e?.message ?? e).slice(0, 200));
+    } finally {
+      process.chdir(m3PrevCwd);
+      for (const [k, v] of m3Saved) { if (v === undefined) delete process.env[k]; else process.env[k] = v; }
+      if (m3MutWritten) { try { rmSync(m3Mut, { force: true }); } catch { /* best-effort */ } }
+      try { rmSync(m3root, { recursive: true, force: true }); } catch { /* best-effort */ }
+    }
+  }
 }
 
 console.log(`\n${fail === 0 ? "✅" : "❌"} test-discard-gate: ${pass} passed, ${fail} failed, ${skip} skipped`);

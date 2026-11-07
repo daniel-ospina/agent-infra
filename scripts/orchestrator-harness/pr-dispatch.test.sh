@@ -935,19 +935,43 @@ arm_close() { # <anchor-line> -> the line of its closing `fi` (bare, column 0)
 # LAST thing the arm does is exit, so control cannot fall past it on the refusal path.
 arm_refuses() { # <anchor-line> <close-line> -> 0 when the block's LAST code line is a real `exit`
   [ -n "$1" ] && [ -n "$2" ] || return 1
+  # ⛔ TWO ACCEPTED SPELLINGS, because the arms themselves use two and only one was ever matched
+  # (measured on the merged tree, #3645): the LITERAL `exit 75` for a code this file publishes
+  # itself, and the PROPAGATED `exit "${NAME:-<digits>}"` for a code DECLARED in `spawn-gate.sh`
+  # and never exported (`AGENT_BRIEF_REFUSED` 80, `AGENT_HARNESS_SKEW_REFUSED` 83). The literal-only
+  # pattern made this pin report `arms-exit=0` — "the arms stopped refusing" — for every arm #3645
+  # converted, while the arms were correct. Both requirements that made it a CHECK survive: the LAST
+  # code line must be an `exit` (control cannot fall past the arm on the refusal path), and the
+  # tolerant form must carry a NUMERIC default (`exit "${X:-}"` is a bash usage error, not a refusal
+  # code, and is still rejected).
   awk -v a="$1" -v b="$2" 'NR>a && NR<b && !/^[[:space:]]*#/ && NF {last=$0}
-       END{exit !(last ~ /^[[:space:]]*exit[[:space:]]+[0-9]+[[:space:]]*$/)}' "$MW" 2>/dev/null
+       END{
+         if (last ~ /^[[:space:]]*exit[[:space:]]+[0-9]+[[:space:]]*$/) exit 0
+         if (last ~ /^[[:space:]]*exit[[:space:]]+"[$][{][A-Za-z_][A-Za-z0-9_]*:-[0-9]+[}]"[[:space:]]*$/) exit 0
+         exit 1
+       }' "$MW" 2>/dev/null
 }
 A76="$(grep -nE '^if \[ "\$AGENT_RC" = "\$\{PI_GATE_REFUSED:-76\}" \]; then' "$MW" | cut -d: -f1 | head -1)"
 A78="$(grep -nE '^if \[ "\$\{AGENT_STARTED:-0\}" = "1" \] && \{' "$MW" | cut -d: -f1 | head -1)"
 A80="$(grep -nE '^if \[ "\$AGENT_RC" = "\$\{AGENT_BRIEF_REFUSED:-80\}" \]; then' "$MW" | cut -d: -f1 | head -1)"
+# ⛔ THE SYNC/SKEW ARM (83) IS THE FOURTH REFUSAL ARM, AND THIS PIN NEVER LEARNED IT (measured on the
+# merged tree, #3645). #3645 added it to `merge-one.sh`, and it is a refusal of exactly this class: no
+# reviewer ran, both round flags are cleared, so nothing may be spent. Because the three original
+# anchors did not know it, the window scan below read its `exit "${…:-83}"` as an UNEXPLAINED exit
+# between the last known arm and the ingress call, and reported `place-ok=0` on correct code — a
+# FALSE BLOCK whose only two readings are "delete this pin" and "move the arm". Naming the arm makes
+# the invariant stronger instead: four arms are now each required to exist, to END by exiting, and to
+# clear the flags.
+A83="$(grep -nE '^if \[ "\$AGENT_RC" = "\$\{AGENT_HARNESS_SKEW_REFUSED:-83\}" \]; then' "$MW" | cut -d: -f1 | head -1)"
 A78_OK=0
 if [ -n "$A78" ] && sed -n "${A78}p" "$MW" 2>/dev/null | grep -q 'PI_FORK_REFUSED:-78'; then A78_OK=1; fi
 C76="$(arm_close "${A76:-}")"; C78="$(arm_close "${A78:-}")"; C80="$(arm_close "${A80:-}")"
+C83="$(arm_close "${A83:-}")"
 LAST_CLOSE=0
-for _c in "${C76:-0}" "${C78:-0}" "${C80:-0}"; do if [ "${_c:-0}" -gt "$LAST_CLOSE" ]; then LAST_CLOSE="${_c:-0}"; fi; done
+for _c in "${C76:-0}" "${C78:-0}" "${C80:-0}" "${C83:-0}"; do if [ "${_c:-0}" -gt "$LAST_CLOSE" ]; then LAST_CLOSE="${_c:-0}"; fi; done
 ARMS_EXIT=0
-arm_refuses "${A76:-}" "${C76:-}" && arm_refuses "${A78:-}" "${C78:-}" && arm_refuses "${A80:-}" "${C80:-}" && ARMS_EXIT=1
+arm_refuses "${A76:-}" "${C76:-}" && arm_refuses "${A78:-}" "${C78:-}" && arm_refuses "${A80:-}" "${C80:-}" \
+  && arm_refuses "${A83:-}" "${C83:-}" && ARMS_EXIT=1
 # ⛔ EVERY REFUSAL ARM MUST CLEAR THE ROUND FLAGS, AND *THAT* WAS PINNED BY NOTHING (round-16 review,
 # P3). The `(c4g)` scan above pins that the spend CALL is below these arms, but not what they DO:
 # measured, deleting BOTH `REV_STARTED=0` and `AGENT_STARTED=0` from the load arm, and both from the
@@ -978,6 +1002,11 @@ flags_cleared() { # <start> <close> <needs-agent-flag> <label>
 flags_cleared "${A76:-}" "${C76:-}" 1 "(c4n) the LOAD refusal arm (rc 76 -> exit 75)"
 flags_cleared "${A78:-}" "${C78:-}" 1 "(c4n) the FORK/127 refusal arm (rc 78/127)"
 flags_cleared "${A80:-}" "${C80:-}" 0 "(c4n) the BRIEF refusal arm (rc 80)"
+# ⛔ THE 83 ARM CLEARS BOTH, AND IS PINNED TO THE STRICTER FORM. The sync floor is decided by the
+# SPAWN POINT before any agent runs, and the arm clears `REV_STARTED` AND `AGENT_STARTED` for it; an
+# arm that cleared only `REV_STARTED` here would spend a round on a helper-deploy fault — the #3441
+# defect, one code over.
+flags_cleared "${A83:-}" "${C83:-}" 1 "(c4n) the HELPER/SYNC refusal arm (rc 83)"
 # ── (c4o) A REPORT-ONLY BOX MUST NOT BANK A ROUND (fresh review of #3441, P2) ───────────────────────
 # `MAX_REVIEW=0` means "this box buys no reviewer rounds". The controller's dispatch arm honours that by
 # dispatching nothing and spending nothing; THIS ingress cannot dispatch-nothing (a direct caller —
@@ -1139,7 +1168,7 @@ if [ -n "$HOOK_LINE" ] && [ -n "$HELPER_LINE" ] && [ -n "$R_LINE" ] && [ -n "$TR
   GUARD_OK=1
 fi
 if [ "$PLACE_OK" = "1" ] && [ "$GUARD_OK" = "1" ] && [ "${W_COUNT:-0}" = "1" ]; then
-  ok "(c4g) merge-one.sh is the ONLY round writer; the guarded ingress call sits BELOW all three refusal arms (each of which really exits); the round-spend helper is defined ABOVE run_agent so the EXIT trap can reach it; and the trap hook is registered BEFORE the recorder whose real definition is far below"
+  ok "(c4g) merge-one.sh is the ONLY round writer; the guarded ingress call sits BELOW all four refusal arms (each of which really exits); the round-spend helper is defined ABOVE run_agent so the EXIT trap can reach it; and the trap hook is registered BEFORE the recorder whose real definition is far below"
 else
   bad "(c4g) round-writes=$W_COUNT write=${W_LINE:-<none>} helper=${HELPER_LINE:-<none>} hook=${HOOK_LINE:-<none>} trap=${TRAP_LINE:-<none>} ingress-call=${CALL_LINE:-<none>} reviewer-start=${R_LINE:-<none>} load-arm=${A76:-<none>} fork-arm=${A78:-<none>} fork-arm-ok=$A78_OK brief-arm=${A80:-<none>} last-arm-close=${LAST_CLOSE:-<none>} arms-exit=$ARMS_EXIT spend-sites=$SPEND_COUNT superseding-traps=${SUPERSEDING_TRAPS:-?} guard-ok=$GUARD_OK place-ok=$PLACE_OK — the round writer is duplicated (expected exactly 1), the guarded ingress call is missing or sits ABOVE a refusal arm (a refusal would then spend a round for a reviewer that never ran), the helper/hook is defined after run_agent (the EXIT trap cannot reach it), or the trap hook is not registered first: $(awk -v a="${LAST_CLOSE:-0}" -v b="${CALL_LINE:-0}" 'NR>a && NR<b && !/^[[:space:]]*#/ && /(^|[^[:alnum:]_])(exit|exec|return|die)[[:space:](]/ {printf "%s:%s ", NR, $0}' "$MW")"
 fi

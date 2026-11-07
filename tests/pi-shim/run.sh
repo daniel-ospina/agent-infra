@@ -478,10 +478,26 @@ FAKE_LOAD=0 MAX_LOAD=999999999 MEM_MIN_AVAIL_MB=1 run_shim runner >/dev/null 2>&
 mkdir -p "$TMP/bin84"
 printf '#!/usr/bin/env bash\nexit 84\n' > "$TMP/bin84/pi"
 chmod +x "$TMP/bin84/pi"
-cp "$TMP/bin76/gh" "$TMP/bin84/gh" 2>/dev/null || printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin82/gh"
+# ⛔ THE CAPABILITY GATE IS SUPPLIED A READING HERE TOO — THE 76->75 ARM ABOVE CLOSED THIS HOLE AND
+# THIS SIBLING WAS LEFT BOX-DEPENDENT. `run_agent` asks `cell-lane-preflight.sh` whether the box can
+# complete ONE model call and RETURN, and refuses with 71 BEFORE any spawn when it cannot; the 76->75
+# arm passes `CELL_PREFLIGHT_SH` (see its comment, agent-infra#2935) and this one did not, so it reads
+# the REAL probe — on a CI runner that answers `LANE_CAPABILITY=refused why=keys-unreadable
+# … pi=<unknown> path=<none>`, i.e. `rc=71 started=0`, and the arm never reaches the 84 -> 81 memory
+# translation it exists to test. MEASURED on PR #3603's CI (run 42387640347, job 128448321293) as the
+# shard's ONLY two red assertions — 'a spawn-point MEMORY refusal was not translated for the callers'
+# and 'the translated refusal did not name memory' — on a tree whose base reproduces neither, so a red
+# no base comparison can explain. THE SAME SEAM, the same direction: the answer goes where the gate
+# reads (spawn-gate.sh:3372 honours `CELL_PREFLIGHT_SH` as the first candidate) and nothing here
+# disables the gate. Reproduce the CI shape on any box, before or after this fixture:
+#   CELL_PREFLIGHT_SH=<a probe that refuses> bash tests/pi-shim/run.sh
+printf '#!/usr/bin/env bash\necho "LANE_CAPABILITY=ok why=fixture"\n' > "$TMP/bin84/cell-lane-preflight.sh"
+chmod +x "$TMP/bin84/cell-lane-preflight.sh"
+cp "$TMP/bin76/gh" "$TMP/bin84/gh" 2>/dev/null || printf '#!/usr/bin/env bash\ncase "$*" in\n  *state=open*) echo 0 ;;\n  *state=closed*) : ;;\n  *) exit 1 ;;\nesac\n' > "$TMP/bin84/gh"
 chmod +x "$TMP/bin84/gh"
 rm -f "$TMP/O/state/walltime.tsv"; : > "$TMP/agent.log"
-res="$(PATH="$TMP/bin84:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 bash -c '
+res="$(PATH="$TMP/bin84:$PATH" O="$TMP/O" MAX_LOAD=999999999 DISK_MIN_FREE_MB=1 MEM_MIN_AVAIL_MB=1 \
+  CELL_PREFLIGHT_SH="$TMP/bin84/cell-lane-preflight.sh" bash -c '
   . "$1"
   cd "$4" || exit 2            # a GitHub-origin fixture: the creation gate reads THIS repo
   load1() { printf "1"; }

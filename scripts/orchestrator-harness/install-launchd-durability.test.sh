@@ -919,8 +919,19 @@ ORUN() { # <extra args…>
   # ($SHOME/.harness-path, $SHOME/.pi/agent/state/HARNESS-PIN) — read-only git, no worktree created,
   # nothing outside $T is touched. Without it the materialiser would run `git worktree add` against
   # THIS repository, which a test must never do.
+  # ⛔ HARNESS_REPO IS CLEARED FOR THE SAME REASON AS AI_REVIEW_GATE_KEY — a suite whose verdict depends
+  # on the OPERATOR'S shell is not a test. `install.sh` takes `HARNESS_REPO` from the environment when
+  # it is set (`:905`) and only otherwise derives it from a candidate of its own; a FLEET box exports it
+  # to the cell clone (`HARNESS_REPO=/tmp/cell-ai` here), so the installer resolved the PIN against that
+  # tree instead of the checkout under test. Measured 2026-11-07 on this box: the pin record names this
+  # checkout's HEAD, which is not a commit in the cell clone for ANY unmerged head, so `install.sh`
+  # refused `pin_refuse` rc=78 and §F/§J8 went 32 red — reproduced on `origin/main` plus ONE EMPTY
+  # COMMIT, and green again with the variable scrubbed (317/317) while the diff under test was
+  # unchanged. That is a false FAIL of a required shard, read as "this change broke the installer".
+  # Empty is the "absent" branch the installer already handles (`${HARNESS_REPO:-}`), and a clean CI
+  # runner has it unset, so this is a no-op there.
   env HOME="$SHOME" O="$T/o" REPO="$(cd "$HARNESS/../.." && pwd)" OR="acme/widget" \
-    HARNESS="$HARNESS" \
+    HARNESS="$HARNESS" HARNESS_REPO= \
     ELDATO_ALLOW_TEST_HOME=1 LC_SETTLE=1 START_TIMEOUT=2 FAKE_PLIST="$PLIST" \
     AI_REVIEW_GATE_KEY= \
     PATH="$SHOME/.local/share/pi-node/current/bin:$T/bin:$PATH" \
