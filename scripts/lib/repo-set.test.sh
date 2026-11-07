@@ -104,7 +104,7 @@ out="$(run_reader "$CONF" list)"
 ck "a1 list emits one slug<TAB>checkout<TAB>state line per repo" \
    '[ "$(printf "%s\n" "$out" | wc -l | tr -d " ")" = 2 ]'
 ck "a2 list carries the second repo (the one #2281 is about)" \
-   'printf "%s" "$out" | grep -q "^daniel-ospina/agent-infra\b"'
+   'grep -q "^daniel-ospina/agent-infra\b" <<<"$out"'
 ck "a3 slugs prints the identity only" \
    '[ "$(run_reader "$CONF" slugs | tr "\n" ",")" = "daniel-ospina/tortoise,daniel-ospina/agent-infra," ]'
 ck "a4 doctor-repos renders configured_repos()'s entry form, checkout included" \
@@ -133,7 +133,7 @@ arm() { # arm <label> <code> <line...>
   printf '%s\n' "$@" > "$c"
   local o rc
   o="$(run_reader "$c" list)"; rc="$(run_reader_rc "$c" list)"
-  if [ "$rc" = 5 ] && printf '%s' "$o" | grep -q "$code"; then ok "c-$label ($code)"
+  if [ "$rc" = 5 ] && grep -q "$code" <<<"$o"; then ok "c-$label ($code)"
   else bad "c-$label: expected rc 5 + $code, got rc=$rc / $(printf '%s' "$o" | head -1)"; fi
 }
 arm unknown-key     UNKNOWN-KEY      "slug=o/n checkuot=/x checkout=/y"
@@ -150,7 +150,7 @@ arm duplicate-key   DUPLICATE-KEY    "slug=o/n slug=p/q checkout=$T/tortoise"
 ck "c-empty has its own code (4), distinct from an absent file (3)" \
    'printf "# only comments\n\n" > "$T/empty.conf"; [ "$(run_reader_rc "$T/empty.conf" list)" = 4 ]'
 ck "c-refusing-names-the-file" \
-   'printf "slug=o/n checkout=tortoise\n" > "$T/r.conf"; run_reader "$T/r.conf" list | grep -q "REFUSING $T/r.conf"'
+   'printf "slug=o/n checkout=tortoise\n" > "$T/r.conf"; o="$(run_reader "$T/r.conf" list)"; grep -q "REFUSING $T/r.conf" <<<"$o"'
 ck "c-nothing-emitted-on-a-refusal (a shorter set must not read as a smaller machine)" \
    'printf "slug=o/n checkout=$T/tortoise\nslug=bad checkout=/y\n" > "$T/h.conf"; [ -z "$(run_reader "$T/h.conf" list | grep -v "^repo-set: ")" ]'
 
@@ -160,7 +160,7 @@ proof_arm() { # proof_arm <label> <expected-fragment> <conf-body>
   local c="$T/proof-$label.conf"
   printf '%s\n' "$body" > "$c"
   local o; o="$(run_reader "$c" check)"; local rc; rc="$(run_reader_rc "$c" check)"
-  if [ "$rc" = 1 ] && printf '%s' "$o" | grep -q -- "$frag"; then ok "d-$label"
+  if [ "$rc" = 1 ] && grep -q -- "$frag" <<<"$o"; then ok "d-$label"
   else bad "d-$label: expected rc 1 + '$frag', got rc=$rc"; printf '%s\n' "$o" | sed 's/^/       /'; fi
 }
 # ⛔ ABSENCE IS **NOT PROVABLE** FROM INSIDE A SANDBOX, so a missing checkout WARNS (round 4, P1).
@@ -168,14 +168,14 @@ proof_arm() { # proof_arm <label> <expected-fragment> <conf-body>
 # checkout that exists — the round-3 fix's `[ ! -e ]` refusal was the same defect one syscall over.
 printf 'slug=o/n checkout=%s\n' "$T/nope" > "$T/missing-dir.conf"
 ck "d-missing-dir WARNS and passes (absence cannot be proven from inside a sandbox)" \
-   'o="$(run_reader "$T/missing-dir.conf" check)"; printf "%s" "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/missing-dir.conf" check)" = 0 ]'
+   'o="$(run_reader "$T/missing-dir.conf" check)"; grep -q "WARN CHECKOUT-UNVERIFIED" <<<"$o" && [ "$(run_reader_rc "$T/missing-dir.conf" check)" = 0 ]'
 # ⛔ A NON-WORK-TREE IS A **WARN**, NOT A REFUSAL (review round 3, P1). "There is no git work tree here"
 # cannot be distinguished from "this process could not look" without privilege the reader does not
 # have, and refusing on the second discarded a read-only pass the doctor completes. Only PROVEN faults
 # refuse.
 printf 'slug=o/n checkout=%s\n' "$T/plaindir" > "$T/notree.conf"
 ck "d-not-a-worktree WARNS and passes (an unprovable checkout is graded read-only, not refused)" \
-   'o="$(run_reader "$T/notree.conf" check)"; printf "%s" "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/notree.conf" check)" = 0 ]'
+   'o="$(run_reader "$T/notree.conf" check)"; grep -q "WARN CHECKOUT-UNVERIFIED" <<<"$o" && [ "$(run_reader_rc "$T/notree.conf" check)" = 0 ]'
 proof_arm wrong-provenance "is a checkout of daniel-ospina/somebody-else, not o/n" \
                            "slug=o/n checkout=$T/decoy"
 proof_arm shared-state     "is shared with another repo in this set" \
@@ -203,7 +203,7 @@ if [ "$(id -u)" = 0 ]; then
 else
   printf 'slug=o/n checkout=%s\n' "$T/hidden" > "$T/unreadable-checkout.conf"
   o="$(run_reader "$T/unreadable-checkout.conf" check)"
-  if printf '%s' "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/unreadable-checkout.conf" check)" = 0 ]; then
+  if grep -q "WARN CHECKOUT-UNVERIFIED" <<<"$o" && [ "$(run_reader_rc "$T/unreadable-checkout.conf" check)" = 0 ]; then
     ok "d-unreadable-checkout WARNS and passes (the doctor grades it read-only; refusing would discard that pass)"
   else
     bad "d-unreadable-checkout: expected WARN + rc 0, got rc=$(run_reader_rc "$T/unreadable-checkout.conf" check)"; printf '%s\n' "$o" | sed 's/^/       /'
@@ -217,7 +217,7 @@ else
   chmod 000 "$T/locked"
   printf 'slug=o/n checkout=%s\n' "$T/locked/inner/behind" > "$T/ancestor-denied.conf"
   o="$(run_reader "$T/ancestor-denied.conf" check)"
-  if printf '%s' "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/ancestor-denied.conf" check)" = 0 ]; then
+  if grep -q "WARN CHECKOUT-UNVERIFIED" <<<"$o" && [ "$(run_reader_rc "$T/ancestor-denied.conf" check)" = 0 ]; then
     ok "d-ancestor-denied WARNS and passes (the TCC shape: stat fails EACCES on a checkout that EXISTS)"
   else
     bad "d-ancestor-denied: expected WARN + rc 0, got rc=$(run_reader_rc "$T/ancestor-denied.conf" check)"; printf '%s\n' "$o" | sed 's/^/       /'
@@ -227,16 +227,16 @@ fi
 chmod 755 "$T/hidden" 2>/dev/null
 printf 'slug=o/n checkout=%s\n' "$T/no-origin" > "$T/warn.conf"
 ck "d-unverifiable-origin-warns-and-passes (the launchd/TCC shape)" \
-   'o="$(run_reader "$T/warn.conf" check)"; printf "%s" "$o" | grep -q "WARN CHECKOUT-UNVERIFIED" && [ "$(run_reader_rc "$T/warn.conf" check)" = 0 ]'
+   'o="$(run_reader "$T/warn.conf" check)"; grep -q "WARN CHECKOUT-UNVERIFIED" <<<"$o" && [ "$(run_reader_rc "$T/warn.conf" check)" = 0 ]'
 
 # ── (e) the shipped unit: it execs the wrapper, and names NO repo ─────────────────────────────
 PROG="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$PLIST")"
 ck "e1 the unit execs the farmed machine wrapper" \
-   'printf "%s" "$PROG" | grep -q "pr-doctor-machine.sh"'
+   'grep -q "pr-doctor-machine.sh" <<<"$PROG"'
 ck "e2 the unit names NO repo in its argv (the #2281 defect)" \
-   '! printf "%s" "$PROG" | grep -qE "<string>(--repo|--all-repos|daniel-ospina/)"'
+   '! grep -qE "<string>(--repo|--all-repos|daniel-ospina/)" <<<"$PROG"'
 ck "e3 no repo slug appears ANYWHERE inside ProgramArguments" \
-   '! printf "%s" "$PROG" | grep -q "daniel-ospina"'
+   '! grep -q "daniel-ospina" <<<"$PROG"'
 # ⛔ ARRAY MEMBERSHIP, NOT A GREP OVER THE FILE (#2281 review P2). The first cut grepped the whole of
 # setup.sh for the two names — and this change's own explanatory comments contain both names, so the
 # arm passed with the entries DELETED from the arrays. `fleet_srcs=(…)` / `lib_srcs=(…)` are the
@@ -271,7 +271,7 @@ PY2
 MUT_FARM="$(sed -n 's/^fleet_srcs=(\(.*\))$/\1/p' "$SETUP_MUT")"
 MUT_LIB="$(sed -n 's/^lib_srcs=(\(.*\))$/\1/p' "$SETUP_MUT")"
 ck "e4c the mutation really removed both entries (a mutation that did not apply proves nothing)" \
-   '! printf "%s" "$MUT_FARM$MUT_LIB" | grep -qE "(pr-doctor-machine\.sh|repo-set\.sh)"'
+   '! grep -qE "(pr-doctor-machine\.sh|repo-set\.sh)" <<<"$MUT_FARM$MUT_LIB"'
 ck "e4d …and e4a/e4b' EXACT expressions REDDEN on it — they read the ARRAY, not the prose" \
    '! { case " $MUT_FARM " in *" pr-doctor-machine.sh "*) true ;; *) false ;; esac; } && ! { case " $MUT_LIB " in *" repo-set.sh "*) true ;; *) false ;; esac; }'
 ck "e4e …while the names still appear in setup.sh PROSE (so a file-wide grep would have passed)" \
@@ -312,7 +312,7 @@ out="$(run_wrapper "$CONF")"
 ck "f1 a valid set grades EVERY repo (--all-repos)" \
    '[ "$(printf "%s\n" "$out" | sed -n "s/^ARGV //p")" = "--all-repos" ]'
 ck "f2 the set is handed over in configured_repos()'s entry form" \
-   'printf "%s" "$out" | grep -q "^SET daniel-ospina/tortoise=$T/tortoise,daniel-ospina/agent-infra=$T/agent-infra$"'
+   'grep -q "^SET daniel-ospina/tortoise=$T/tortoise,daniel-ospina/agent-infra=$T/agent-infra$" <<<"$out"'
 ck "f3 the mode line names the file and the count (a box can see what was graded)" \
    'run_wrapper_err "$CONF" | grep -q "grading 2 repo(s)"'
 
@@ -339,20 +339,20 @@ ck "f9 …and the doctor was never executed on that path" \
 ck "f10 the wrapper takes NO arguments (a plist flags nobody reads is the NOT_A_FLEET_READING shape)" \
    'REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" --dry-run >/dev/null 2>&1; [ $? = 2 ]'
 ck "f11 a missing sibling reader is a NAMED farm gap, not a silent one-repo box" \
-   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; printf "%s" "$o" | grep -q "lib_srcs.*declares it"'   # bash-ok
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; grep -q "lib_srcs.*declares it" <<<"$o"'   # bash-ok
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
 # production. These arms drive the REAL proof function: a `REPO` that proves nothing, with no `OR`.
 mkdir -p "$T/unprovable"   # exists, not a work tree
 ck "f13 no set + OR set -> DEGRADED runs the single-repo form (rank 3 names it)" \
-   'o="$(REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; printf "%s" "$o" | grep -q "^ARGV $" && REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null | grep -q "in OR=daniel-ospina/tortoise"'
+   'o="$(REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; grep -q "^ARGV $" <<<"$o" && { e="$(REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; grep -q "in OR=daniel-ospina/tortoise" <<<"$e"; }'
 ck "f14 no set + REPO that PROVES its slug -> DEGRADED runs (rank 4 names it)" \
    'REPO_SET_FILE="$nofile" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1'
 ck "f15 no set + REPO that proves NOTHING + no OR -> REFUSES (rc 2), it does not pretend to grade" \
    '[ "$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f16 …and it says WHY, and names both fixes (create the set / set PR_DOCTOR_REPO or OR)" \
-   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "proves no repo" && printf "%s" "$o" | grep -q "(1) create the repo set above" && printf "%s" "$o" | grep -q "(2) set PR_DOCTOR_REPO=OWNER/NAME or OR=OWNER/NAME"'
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; grep -q "proves no repo" <<<"$o" && grep -q "(1) create the repo set above" <<<"$o" && grep -q "(2) set PR_DOCTOR_REPO=OWNER/NAME or OR=OWNER/NAME" <<<"$o"'
 ck "f17 ...and the doctor was never executed on that path" \
    '[ -z "$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)" ]'
 # ⛔ THE DEGRADED PATH MUST VALIDATE WHAT IT ADVERTISES (review round 3, P2). The first cut adopted
@@ -360,7 +360,7 @@ ck "f17 ...and the doctor was never executed on that path" \
 # same "claims to grade, grades nothing" shape, one arm over. And `PR_DOCTOR_REPO` is rank 2 in
 # `resolve_repo`, ABOVE `OR`: ignoring it refused a pass the doctor would complete.
 ck "f19 no set + OR that is NOT a slug -> REFUSES, and never claims to be grading" \
-   'o="$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo" && [ "$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+   'o="$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; grep -q "is not an owner/name slug" <<<"$o" && ! grep -q "Grading the ONE repo" <<<"$o" && [ "$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f20 no set + OR and REPO naming DIFFERENT repos -> REFUSES (it does not fall through to REPO)" \
    'REPO_SET_FILE="$nofile" OR=daniel-ospina/tortoise REPO="$T/agent-infra" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; [ $? = 2 ]'
 ck "f20b ...and it names BOTH values, so the operator can see which to fix" \
@@ -370,10 +370,10 @@ ck "f20c ...and it never falls through to the REPO proof and grades a repo the d
 ck "f21 no set + PR_DOCTOR_REPO (rank 2) -> the pass RUNS (the doctor honours it above OR)" \
    'REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=daniel-ospina/agent-infra HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f22 no set + PR_DOCTOR_REPO that is NOT a slug -> REFUSES, never claims to be grading" \
-   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=notaslug HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo"'
+   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=notaslug HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; grep -q "is not an owner/name slug" <<<"$o" && ! grep -q "Grading the ONE repo" <<<"$o"'
 # ⛔ RANK 2 IS DECISIVE, BOTH WAYS (review round 4, P2; round 3's rule applied one rank higher).
 ck "f23 no set + PR_DOCTOR_REPO INVALID but OR valid -> REFUSES (rank 2 consumes the decision)" \
-   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "PR_DOCTOR_REPO=.Not A Slug. is not an owner/name slug" && ! printf "%s" "$o" | grep -q "Grading the ONE repo"'
+   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; grep -q "PR_DOCTOR_REPO=.Not A Slug. is not an owner/name slug" <<<"$o" && ! grep -q "Grading the ONE repo" <<<"$o"'
 ck "f24 no set + PR_DOCTOR_REPO as a URL -> RUNS (the doctor own parser normalises it)" \
    'REPO_SET_FILE="$nofile" PR_DOCTOR_REPO=https://github.com/daniel-ospina/agent-infra.git HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f25 no set + PR_DOCTOR_REPO and a PR_DOCTOR_REPO_DIR of ANOTHER repo -> REFUSES" \
@@ -391,17 +391,17 @@ ck "f27 a CR-padded REPO alone -> RUNS (the trim, not a false refusa) " \
 # true only when NOTHING is declared (rank 4 RAISES on a declared-but-unprovable `REPO`, so the cwd is
 # never reached there).
 ck "f28 nothing declared -> the cwd note IS printed (the one state where this wrapper differs)" \
-   'o="$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "CURRENT DIRECTORY" && ! printf "%s" "$o" | grep -q "would exit 2 on its first line"'
+   'o="$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; grep -q "CURRENT DIRECTORY" <<<"$o" && ! grep -q "would exit 2 on its first line" <<<"$o"'
 ck "f29 an INVALID seam -> the cwd note is NOT printed (the doctor refuses there too)" \
-   'o="$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! printf "%s" "$o" | grep -q "CURRENT DIRECTORY"'
+   'o="$(REPO_SET_FILE="$nofile" OR="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! grep -q "CURRENT DIRECTORY" <<<"$o"'
 ck "f30 a declared-but-unprovable REPO -> the cwd note is NOT printed (rank 4 raises first)" \
-   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! printf "%s" "$o" | grep -q "CURRENT DIRECTORY"'
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/unprovable" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; ! grep -q "CURRENT DIRECTORY" <<<"$o"'
 ck "f31 the refusal never says a repo is UNDECLARED when the line above says one IS (no self-contradiction)" \
-   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; printf "%s" "$o" | grep -q "no USABLE repo" && ! printf "%s" "$o" | grep -q "no repo is DECLARED"'
+   'o="$(REPO_SET_FILE="$nofile" PR_DOCTOR_REPO="Not A Slug" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1 >/dev/null)"; grep -q "no USABLE repo" <<<"$o" && ! grep -q "no repo is DECLARED" <<<"$o"'
 ck "f32 a REPO padded with a NON-ASCII space still RUNS (the trim is the doctor str.strip)" \
-   'REPO_SET_FILE="$nofile" REPO="$T/tortoise"$(printf "\302\240") HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/tortoise"$(printf "\302\240") HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; grep -q "^ARGV $" <<<"$o"'
 ck "f33 a seam that is ENTIRELY a non-ASCII space does not flip the wrapper against the doctor" \
-   'REPO_SET_FILE="$nofile" OR="$(printf "\302\240")" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
+   'o="$(REPO_SET_FILE="$nofile" OR="$(printf "\302\240")" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; grep -q "^ARGV $" <<<"$o"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
@@ -453,9 +453,9 @@ open(dst, "w").write(t[:start] + old + t[end:])
 PY
 OLDPROG="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$OLDPLIST")"
 ck "h1 the shipped unit passes e2/e3" \
-   '! printf "%s" "$PROG" | grep -qE "<string>(--repo|--all-repos|daniel-ospina/)"'
+   '! grep -qE "<string>(--repo|--all-repos|daniel-ospina/)" <<<"$PROG"'
 ck "h2 the PRE-#2281 argv would FAIL e2 (the assertion discriminates the change)" \
-   'printf "%s" "$OLDPROG" | grep -qE "<string>(--repo|daniel-ospina/)"'
+   'grep -qE "<string>(--repo|daniel-ospina/)" <<<"$OLDPROG"'
 
 # ── (h2) PARITY: the reader's proof must BE the doctor's, not a second parser ────────────
 # `_rs_origin_slug` delegates to `pr-doctor.py`'s `_origin_slug()` and `_rs_normalize_slug` to
@@ -512,7 +512,7 @@ ck "i1 a slug whose CASE differs from its origin is ACCEPTED (the doctor accepts
    '[ "$(run_reader_rc "$T/case-provenance.conf" check)" = 0 ]'
 printf 'slug=o/n checkout=%s\nslug=O/N checkout=%s\n' "$T/tortoise" "$T/agent-infra" > "$T/case-dup.conf"
 ck "i2 two CASE-spellings of one slug are DUPLICATE-SLUG (the doctor dedupes them to one)" \
-   'o="$(run_reader "$T/case-dup.conf" list)"; printf "%s" "$o" | grep -q "DUPLICATE-SLUG" && [ "$(run_reader_rc "$T/case-dup.conf" list)" = 5 ]'
+   'o="$(run_reader "$T/case-dup.conf" list)"; grep -q "DUPLICATE-SLUG" <<<"$o" && [ "$(run_reader_rc "$T/case-dup.conf" list)" = 5 ]'
 ck "i3 …and doctor-repos never renders the same repo twice under two spellings" \
    '[ -z "$(run_reader_out "$T/case-dup.conf" doctor-repos)" ]'
 
@@ -558,7 +558,7 @@ ck "j11 …and the wrapper never announces a count for it" \
 # never be PROVEN from inside a sandbox. The CODE (5) is right; the message must not claim "the target
 # does not exist" and send an operator whose target is merely unreachable to "fix the link".
 ck "j12 the dangling-link message names OBSERVATION + candidates, not a proven cause" \
-   'o="$(run_reader "$T/dangling.conf" list)"; printf "%s" "$o" | grep -q "does not RESOLVE" && printf "%s" "$o" | grep -q "denies this process" && ! printf "%s" "$o" | grep -q "whose target does not exist"'
+   'o="$(run_reader "$T/dangling.conf" list)"; grep -q "does not RESOLVE" <<<"$o" && grep -q "denies this process" <<<"$o" && ! grep -q "whose target does not exist" <<<"$o"'
 # and a link whose target EXISTS but is denied behind an ancestor must say so, not "target missing"
 if [ "$(id -u)" != 0 ]; then
   mkdir -p "$T/denied"
@@ -566,7 +566,7 @@ if [ "$(id -u)" != 0 ]; then
   chmod 000 "$T/denied"
   ln -s "$T/denied/target.conf" "$T/eacceslink.conf" 2>/dev/null
   ck "j13 a link to an UNREACHABLE (not missing) target still reports the candidates, not a wrong cause" \
-     'o="$(run_reader "$T/eacceslink.conf" list)"; printf "%s" "$o" | grep -q "does not RESOLVE"'
+     'o="$(run_reader "$T/eacceslink.conf" list)"; grep -q "does not RESOLVE" <<<"$o"'
   chmod 755 "$T/denied" 2>/dev/null
 fi
 
@@ -575,7 +575,7 @@ fi
 # a phantom repo. Round-tripping the rendered list through the doctor's own splitter closes the class.
 printf 'slug=daniel-ospina/tortoise checkout=%s/NBSP\302\240weird\n' "$T" > "$T/nbsp.conf"
 ck "j14 a value that the DOCTOR'S splitter would divide refuses (the round-trip, not a character list)" \
-   'o="$(run_reader "$T/nbsp.conf" check)"; [ "$(run_reader_rc "$T/nbsp.conf" check)" = 1 ] && printf "%s" "$o" | grep -q "REFUSED set"'
+   'o="$(run_reader "$T/nbsp.conf" check)"; [ "$(run_reader_rc "$T/nbsp.conf" check)" = 1 ] && grep -q "REFUSED set" <<<"$o"'
 
 # ⛔ THE DUPLICATE KEY IS THE DOCTOR'S NORMALIZED IDENTITY (review round 8, P2): `.git` is a spelling of
 # the same repo to every consumer, and `set_tag_collisions` compares NORMALIZED slugs so it cannot catch
@@ -584,7 +584,7 @@ mkdir -p "$T/tor-plain"
 printf 'slug=daniel-ospina/tortoise checkout=%s\nslug=daniel-ospina/tortoise.git checkout=%s\n' \
   "$T/tortoise" "$T/tor-plain" > "$T/dotgit-dup.conf"
 ck "j15 a .git suffix is the SAME repo -> DUPLICATE-SLUG (the doctor normalizes it too)" \
-   'o="$(run_reader "$T/dotgit-dup.conf" list)"; printf "%s" "$o" | grep -q "DUPLICATE-SLUG" && [ "$(run_reader_rc "$T/dotgit-dup.conf" list)" = 5 ]'
+   'o="$(run_reader "$T/dotgit-dup.conf" list)"; grep -q "DUPLICATE-SLUG" <<<"$o" && [ "$(run_reader_rc "$T/dotgit-dup.conf" list)" = 5 ]'
 
 # ⛔ NO `python3` ON PATH IS THE LAUNCHD SHAPE, and the reader must fall back exactly as the wrapper does
 # (review round 8, P2): with `command -v`-only resolution the tag guard silently no-op'd and the wrapper
@@ -594,14 +594,14 @@ for b in bash sed tr awk grep printf id dirname cat cut wc head mv rm mkdir ln c
   _p="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p" "$NODIR/$b" 2>/dev/null
 done
 ck "j16 with NO python3 on PATH the tag guard still refuses (absolute fallback, like the wrapper)" \
-   'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$NODIR" /bin/bash "$READER" check 2>&1)"; printf "%s" "$o" | grep -q "REFUSED set"'
+   'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$NODIR" /bin/bash "$READER" check 2>&1)"; grep -q "REFUSED set" <<<"$o"'
 
 # ⛔ THE ROUND-TRIP IS BY ENTRIES, NOT BY COUNT (review round 9, P2): a separator at the END of a value
 # is adjacent to the join comma, so the count stayed n and a TRUNCATED checkout passed `check` — a set
 # whose checkout proved a DIFFERENT repo returned rc 0.
 printf 'slug=daniel-ospina/tortoise checkout=%s\302\240\n' "$T/decoy" > "$T/trail-nbsp.conf"
 ck "j17 a TRAILING separator truncates a value -> refused (a count cannot see it)" \
-   'o="$(run_reader "$T/trail-nbsp.conf" check)"; [ "$(run_reader_rc "$T/trail-nbsp.conf" check)" = 1 ] && printf "%s" "$o" | grep -q "REFUSED set"'
+   'o="$(run_reader "$T/trail-nbsp.conf" check)"; [ "$(run_reader_rc "$T/trail-nbsp.conf" check)" = 1 ] && grep -q "REFUSED set" <<<"$o"'
 
 # ⛔ A CONFIG FILE BEHIND A DENIED ANCESTOR IS NOT "ABSENT" (review round 9, P2): `-e` is false for
 # every stat failure, so the plain-file arm read "does not exist" and the box DEGRADED — one repo
@@ -613,7 +613,7 @@ if [ "$(id -u)" != 0 ]; then
   ck "j18 a set behind a denied ancestor is INVALID (5, broken), NOT NO-REPO-SET (3, absent)" \
      '[ "$(run_reader_rc "$T/deep/locked/repos.conf" list)" = 5 ]'
   ck "j19 …and it names the ERRNO class and warns against creating it, rather than diagnosing a cause" \
-     'o="$(run_reader "$T/deep/locked/repos.conf" list)"; printf "%s" "$o" | grep -q "cannot be STAT" && printf "%s" "$o" | grep -q "Do not create the file"'
+     'o="$(run_reader "$T/deep/locked/repos.conf" list)"; grep -q "cannot be STAT" <<<"$o" && grep -q "Do not create the file" <<<"$o"'
   chmod 755 "$T/deep/locked" 2>/dev/null
 fi
 
@@ -647,7 +647,7 @@ ck "j24 a mode-111 parent still proves absence (\`x\` is what stat needs; \`r\` 
 NODOC="$T/no-doctor"; mkdir -p "$NODOC/lib"
 cp "$READER" "$NODOC/lib/repo-set.sh"
 ck "j25 without pr-doctor.py beside it the whole-set proofs are SKIPPED WITH A WARN, and the verdict is NOT a refusal" \
-   'o="$(REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check 2>&1)"; printf "%s" "$o" | grep -q "WHOLE-SET-PROOFS-SKIPPED" && REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check >/dev/null 2>&1'
+   'o="$(REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check 2>&1)"; grep -q "WHOLE-SET-PROOFS-SKIPPED" <<<"$o" && REPO_SET_FILE="$CONF" bash "$NODOC/lib/repo-set.sh" check >/dev/null 2>&1'
 
 # ⛔ THE TWO MUTATIONS THAT WERE GREEN (review round 11, P2): a sibling doctor that EXISTS and imports
 # but LACKS `configured_repos`, and one whose `configured_repos` RAISES. Both are "could not ask", and
@@ -685,7 +685,7 @@ ck "j30 …and it names the errno class rather than telling the operator to crea
 printf 'slug=daniel-ospina/tortoise checkout=%s\nslug=daniel-ospina/agent-infra checkout=%s\302\240\n' \
   "$T/tortoise" "$T/agent-infra" > "$T/second-nbsp.conf"
 ck "j26 a fault on the SECOND entry is reported against entry 2, not entry 1" \
-   'o="$(run_reader "$T/second-nbsp.conf" check)"; printf "%s" "$o" | grep -q "entry 2 of this set" && printf "%s" "$o" | grep -q "agent-infra"'
+   'o="$(run_reader "$T/second-nbsp.conf" check)"; grep -q "entry 2 of this set" <<<"$o" && grep -q "agent-infra" <<<"$o"'
 
 ck "j5 check PROPAGATES 3 for an absent set (a consumer must be able to tell it from a broken file)" \
    '[ "$(run_reader_rc "$nofile" check)" = 3 ]'
@@ -927,7 +927,7 @@ PYI
 # prints `entry 2 … <empty entry>`; reverted prints `entry 2 … reads it as `` `. The two greps below
 # are what discriminate.
 ck "m25 …and an EMPTY ENTRY in the middle is refused and NAMED as \`<empty entry>\` (not a blank field)" \
-   'o="$(REPO_SET_DOCTOR="$MI/pr-doctor.py" run_reader "$CONF" check)"; printf "%s" "$o" | grep -q "entry 2 of this set" && printf "%s" "$o" | grep -q "<empty entry>"'
+   'o="$(REPO_SET_DOCTOR="$MI/pr-doctor.py" run_reader "$CONF" check)"; grep -q "entry 2 of this set" <<<"$o" && grep -q "<empty entry>" <<<"$o"'
 # Round 16, P2: the TAG guard had no sentinel, so a sibling whose `set_tag_collisions` was missing or
 # raised returned "" — byte-identical to "no collision" — and the reader certified a COLLIDING set.
 # Measured before the sentinel: `OK — 2 repo(s)`, rc 0, no message, on a set the shipped doctor refuses.
@@ -992,7 +992,7 @@ ck "m33 …and with that normalisation REVERTED the same fixture is refused (rc 
 # Round 26, P2: the ROUND-24 separator strip also had no arm — reverting `${problems#; }` left the
 # suite green. Asserted on the operator-facing line itself, where the defect was visible.
 ck "m34 a refusal renders 'REFUSED <slug> — <reason>' with NO doubled '—;' separator" \
-   'o="$(run_reader "$T/proof-shared-state.conf" check)"; printf "%s" "$o" | grep -q "— state=" && ! printf "%s" "$o" | grep -q "—;"'
+   'o="$(run_reader "$T/proof-shared-state.conf" check)"; grep -q "— state=" <<<"$o" && ! grep -q "—;" <<<"$o"'
 # Round 30, P2: the round-29 fixes had no arms — a mutated copy that reverted either the `norm`
 # call-time guard or the UNPROVEN warn arm reproduced the defect and left the suite green. The class is
 # "a sibling that LOADS but lacks `_normalize_slug`", which every earlier stale-sibling arm misses:
@@ -1009,13 +1009,13 @@ mk_repo "$T/staleco" acme/stale
 printf 'slug=acme/stale.git checkout=%s state=%s/stalestate\n' "$T/staleco" "$T" > "$T/nonorm.conf"
 printf 'slug=acme/other.git checkout=%s state=%s/stalestate2\n' "$T/staleco" "$T" > "$T/nonorm-wrong.conf"
 ck "m35 a sibling that LOADS but lacks _normalize_slug makes the proof UNPROVEN — WARN, not a false refusal" \
-   'o="$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check)"; [ "$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader_rc "$T/nonorm.conf" check)" = 0 ] && printf "%s" "$o" | grep -q "UNPROVEN"'
+   'o="$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check)"; [ "$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader_rc "$T/nonorm.conf" check)" = 0 ] && grep -q "UNPROVEN" <<<"$o"'
 ck "m36 …and it says why, naming the missing helper (not \`is not an owner/name slug\`)" \
    'REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check | grep -q "could not be normalised"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \
-   'o="$(run_reader "$T/nonorm.conf" check)"; [ "$(run_reader_rc "$T/nonorm.conf" check)" = 0 ] && ! printf "%s" "$o" | grep -q "UNPROVEN"'
+   'o="$(run_reader "$T/nonorm.conf" check)"; [ "$(run_reader_rc "$T/nonorm.conf" check)" = 0 ] && ! grep -q "UNPROVEN" <<<"$o"'
 # ⛔ m35/m36 DO NOT PIN THE `norm` CALL-TIME GUARD, and their comment must not pretend they do
 # (round 30, P2). With the try/except reverted the answer is "" rather than the sentinel, and the
 # case arm is `''|'__UNASKABLE__')` — so an EMPTY answer lands in the SAME WARN branch and both arms
@@ -1027,7 +1027,7 @@ cp "$READER" "$MW/lib/repo-set.sh"
 cp "$WRAPPER" "$MW/pr-doctor-machine.sh"
 cp "$MN/pr-doctor.py" "$MW/pr-doctor.py"
 ck "m39 a sibling that LOADS but lacks _normalize_slug makes the WRAPPER say 'could not be normalised', not 'is not an owner/name slug'" \
-   'o="$(HOME="$T" OR=acme/stale bash "$MW/pr-doctor-machine.sh" 2>&1)"; printf "%s" "$o" | grep -q "could not be normalised" && ! printf "%s" "$o" | grep -q "is not an owner/name slug"'
+   'o="$(HOME="$T" OR=acme/stale bash "$MW/pr-doctor-machine.sh" 2>&1)"; grep -q "could not be normalised" <<<"$o" && ! grep -q "is not an owner/name slug" <<<"$o"'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
