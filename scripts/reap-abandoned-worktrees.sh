@@ -94,8 +94,8 @@
 #                           then $HOME/.pi/orchestrator/.agent-infra-stamp.json; absent = no pin)
 #   REAP_AW_BUDGET_SECONDS  the PER-ROOT TIME bound (default 300) — `deadline` is assigned inside
 #                           `sweep_root`, so a two-root pass permits two budgets, the same scoping the
-#                           count ceiling below has. This is the gitless arm's real
-#                           guard: it gates every EXPENSIVE per-candidate step (the live-pid census,
+#                           count ceiling below has. This is the real guard, for BOTH ARMS: it gates
+#                           every EXPENSIVE per-candidate step (the live-pid census,
 #                           `git status`, the re-probe, removal). Cheap eligibility (the structural
 #                           rejections and the age floor) still runs for the whole population, so an
 #                           over-budget pass classifies what it saw and preserves the rest — it never
@@ -114,9 +114,14 @@
 #                           so the fallback has a BEHAVIOURAL test: a fixture cannot live at
 #                           /tmp/cell-home, so without this seam reverting the guard loop's reference
 #                           left every case green while the real cell home became reapable. It is a
-#                           DEFAULT, NOT A SECOND SOURCE OF TRUTH — an exported `CELL_HOME` still wins,
-#                           and it can only ever PROTECT a different directory, never un-protect one
-#                           (see the assignment below for why the fix is not an exported `CELL_HOME`).
+#                           DEFAULT, NOT A SECOND SOURCE OF TRUTH, and it is a SUBSTITUTION, not a
+#                           union — the same shape as `load_pin` below, and for the same reason: an
+#                           exported `CELL_HOME` still wins, and a WRONG value protects a different
+#                           directory **and drops `/tmp/cell-home`**. Measured (review round 9): the same
+#                           aged tree is PRESERVED when the seam names it, and becomes `remove` when the
+#                           seam names something else. That is the trade an operator already makes by
+#                           setting `CELL_HOME` — which is why this seam is TEST-ONLY and must never be
+#                           set by the unit, the launcher, or any scheduled artifact.
 #   REAP_AW_PROC_ROOT       the process table root (default /proc; a test seam — pointing it at a
 #                           missing dir makes the census UNREADABLE, which must skip the sweep)
 #   REAP_AW_LIVE_PATHS      the census library (default: lib/live-paths.sh beside this script, then
@@ -150,8 +155,10 @@ INCLUDE_GITLESS=0
 # never candidates. `/tmp/actions-runner` is the CI runner install on every cell — removing it
 # breaks every job on the box, which is a worse outcome than the space it holds.
 GITLESS_KEEP="${REAP_AW_GITLESS_KEEP:-/tmp/actions-runner:/tmp/venv-shared*}"
-# ⛔ THE CLASS IS BOUNDED BY **ELAPSED TIME** (`REAP_AW_BUDGET_SECONDS`, default 300; the entry point's
-# `DISK_REAPER_CLASS_TIMEOUT=1800` stays the outer bound) **AND** by the operator's ceiling on how many
+# ⛔ THE CLASS'S EXPENSIVE PER-CANDIDATE WORK IS BOUNDED, PER ROOT, BY **ELAPSED TIME**
+# (`REAP_AW_BUDGET_SECONDS`, default 300; the eligibility scan over the whole population is NOT budgeted
+# — classifying every entry is the product — and the entry point's `DISK_REAPER_CLASS_TIMEOUT=1800`
+# bounds each PER-ROOT invocation, not the whole pass) **AND** by the operator's ceiling on how many
 # AGED trees one root may classify per pass (`REAP_AW_GITLESS_MAX`, default 10).
 #
 # WHY THE CEILING'S UNIT MOVED — AND WHY THE CEILING ITSELF DID NOT (#3278 P1). The count was a
@@ -186,7 +193,7 @@ ROOTS="${REAP_AW_ROOTS:-/tmp}"
 # (`${CELL_HOME}/orchestrator/…` then `${HOME}/.pi/orchestrator/…`), so its list is a SUBSTITUTION, not
 # a union: exporting would make one of the two stamps stop being read, i.e. a tree the other stamp
 # pinned becomes a candidate and `rm -rf` takes it. A local fallback is additive; an exported variable
-# is additive; an exported variable is not. This value touches only the guard loop.
+# is not. This value touches only the guard loop.
 # ⛔ `REAP_AW_CELL_HOME_DEFAULT` EXISTS SO THE FALLBACK ITSELF CAN BE EXERCISED. A fixture cannot live at
 # `/tmp/cell-home` on a real box, so without this seam the fallback had a *resolution* test
 # (`--print-config`) and no behavioural one: reverting the guard loop's reference to a raw
@@ -234,7 +241,7 @@ while [ $# -gt 0 ]; do
                    if [ "$ROOTS_GIVEN" = 1 ]; then ROOTS="$ROOTS:$2"; else ROOTS="$2"; ROOTS_GIVEN=1; fi
                    shift 2 ;;
         --aged-minutes) [ $# -ge 2 ] || die "--aged-minutes needs a number"
-                        num "$2" || die "--aged-minutes must be a decimal number below 2^63 (got '$2')"
+                        num "$2" || die "--aged-minutes must be a decimal number of at most 18 digits (got '$2')"
                         AGED_MINUTES="$2"; shift 2 ;;
         --dirty)   [ $# -ge 2 ] || die "--dirty needs keep|reap"
                    case "$2" in keep|reap) DIRTY_MODE="$2" ;; *) die "--dirty must be keep|reap (got '$2')" ;; esac
@@ -250,9 +257,9 @@ while [ $# -gt 0 ]; do
         *) die "unknown argument: $1 (see --help)" ;;
     esac
 done
-num "$AGED_MINUTES" || die "REAP_AW_AGED_MINUTES must be a decimal number below 2^63 (got '$AGED_MINUTES')"
+num "$AGED_MINUTES" || die "REAP_AW_AGED_MINUTES must be a decimal number of at most 18 digits (got '$AGED_MINUTES')"
 case "$DIRTY_MODE" in keep|reap) ;; *) die "REAP_AW_DIRTY must be keep|reap (got '$DIRTY_MODE')" ;; esac
-num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a decimal number below 2^63 (got '$BUDGET')"
+num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a decimal number of at most 18 digits (got '$BUDGET')"
 # ⛔ THE CEILING IS VALIDATED, NEVER COERCED. A typo must not silently become "no count bound" (the
 # fail-open the pre-#3278 `:-0` spelling would have been) and must not silently become "cap reached"
 # for every tree either — `num` refuses both. ⛔ AND "A TYPO" INCLUDES ONE THAT IS ALL DIGITS BUT TOO
@@ -260,8 +267,8 @@ num "$BUDGET" || die "REAP_AW_BUDGET_SECONDS must be a decimal number below 2^63
 # `[ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]` returning 2 reads as FALSE and the ceiling stops existing.
 # The same bound protects `REAP_AW_AGED_MINUTES`, `REAP_AW_BUDGET_SECONDS` and `REAP_AW_LOCK_STALE_SECONDS`,
 # which are validated by this same function.
-if [ -n "$GITLESS_MAX" ]; then num "$GITLESS_MAX" || die "REAP_AW_GITLESS_MAX must be a decimal number below 2^63 (got '$GITLESS_MAX') — a larger value cannot be COMPARED, so it would silently remove the ceiling instead of raising it"; fi
-num "$LOCK_STALE_SECONDS" || die "REAP_AW_LOCK_STALE_SECONDS must be a decimal number below 2^63 (got '$LOCK_STALE_SECONDS')"
+if [ -n "$GITLESS_MAX" ]; then num "$GITLESS_MAX" || die "REAP_AW_GITLESS_MAX must be a decimal number of at most 18 digits (got '$GITLESS_MAX') — a value that cannot be COMPARED would silently remove the ceiling instead of raising it"; fi
+num "$LOCK_STALE_SECONDS" || die "REAP_AW_LOCK_STALE_SECONDS must be a decimal number of at most 18 digits (got '$LOCK_STALE_SECONDS')"
 
 if [ "$PRINT_CONFIG" = 1 ]; then
     printf 'roots=%s\n' "$ROOTS"
