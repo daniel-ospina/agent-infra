@@ -747,8 +747,9 @@ plist_program_args() {
     #   2. `data` — the VALUE of a `DATA_OPTIONS` long option in the PRECEDING element (`--repo`,
     #      `--root`). Leaving it `unknown` did the same to five shipped units on the documented box.
     #   3. `data`/`exec` for the `--opt=<value>` JOINED spelling, which carries its value inside the
-    #      token — python splits it (`:649-654`) and the fallback used to drop it silently, so a
-    #      `--script=<TCC>` installed armed-and-dead with NO verdict at all.
+    #      token — python splits it in the emission loop's joined `--opt=<value>` arm, and the fallback
+    #      used to drop it silently, so a `--script=<TCC>` installed armed-and-dead with NO verdict at
+    #      all.
     # Reachable on any Mac whose `/usr/bin/python3` shim is executable but exits non-zero (no Command
     # Line Tools), because `plist_python` accepts it on `-x` alone. A guard that silently UNINSTALLS
     # working units on the fallback path is the same fail-open/fail-wrong family as `[ -e ]`.
@@ -877,7 +878,8 @@ plist_program_args() {
             # must not inherit a `--repo` argv[0] as its data context (fresh review of #3413, round 10
             # P2 — see the matching arm in the python reader above).
             if (idx == 0 && prog != "") { prev = ""; next }
-            # ⛔ THE `env` HOP, MIRRORED FROM THE PYTHON READER (`:565-641`). It is not decoration: the
+            # ⛔ THE `env` HOP, MIRRORED FROM THE PYTHON READER (the `launchers[-1] == "env"` block,
+            # from its first positional through its `ENV_VALUE_OPTIONS` consume arm). It is not decoration: the
             # first POSITIONAL after `env` is the program launchd execs, and `-S` / `--split-string`
             # carries a WHOLE COMMAND LINE inside one element. Without this the fallback classified
             # `-S "/bin/bash <script>"` as one path ("broken target: /bin/bash /x.sh" -> verdict 1, the
@@ -903,8 +905,9 @@ plist_program_args() {
                 prev = line
                 next
             }
-            # `--opt=<path>` carries its value INSIDE the token (python splits it at `:649-654`);
-            # dropping it made a `--script=<TCC>` install with no verdict at all.
+            # `--opt=<path>` carries its value INSIDE the token (python splits it in the emission
+            # loop, joined `--opt=<value>` arm); dropping it made a `--script=<TCC>` install with no
+            # verdict at all.
             if (line ~ /^--/ && index(line, "=") > 0) {
                 name = substr(line, 1, index(line, "=") - 1)
                 val = substr(line, index(line, "=") + 1)
