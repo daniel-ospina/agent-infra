@@ -660,6 +660,10 @@ function checkBounds(label, workflowFile) {
   const wf = parse(workflowFile);
   const file = base(workflowFile);
   const jobs = (wf && wf.jobs) || {};
+  // Every width this lane's slice-feeding matrix jobs certify, in file order. Returned so the
+  // CROSS-LANE assertion at the tail can compare the two lanes against each other — a premise the
+  // merge rail's `≡` depends on and which nothing in THIS file could see before (#3392).
+  const sliceWidths = [];
 
   // ⛔ THE WORKFLOW'S OWN `env:` REACHES EVERY JOB, so it is a third place a slice can be declared
   // (#3235 review, P2, measured: a workflow-level `/12` left 52 of 163 suites unrun at rc 0). It is
@@ -844,14 +848,78 @@ function checkBounds(label, workflowFile) {
           )}]' — the axis must be exactly 1..${axis.length}, distinct: BASH_SHARD_SLICE's denominator is strategy.job-total, so a duplicate or a gap leaves a slice that NO arm runs while every arm still passes its own set assertion; exiting 2`
         );
       }
+      // ⛔ CERTIFIED ONLY HERE, after every assertion above has passed: `total.value` is the width
+      // GitHub really publishes (`strategy.job-total`, which equals the axis' length only because the
+      // equivalence with the axis was just proven), so it is the number the cross-lane check below
+      // must compare — never `axis.length`, which is equal to it only by the assertion above.
+      sliceWidths.push({ job: id, width: total.value });
     }
+  }
+  return { file, widths: sliceWidths };
+}
+
+/**
+ * ⛔ THE TWO LANES MUST BE THE SAME WIDTH — the premise `scripts/admin-merge.sh`'s `≡` RESTS ON
+ * (#3392; the follow-up named in that file's `declared_base_equivalent` docblock as
+ * agent-infra#3233).
+ *
+ * Slice membership is POSITIONAL: `scripts/run-bash-shards.sh` assigns a shard to slice
+ * `pos % width`, so `bash-suites (n)` and `script-validate (n)` are the same shard SET only while the
+ * two lanes have the same width. At DIFFERENT widths the rail's map still succeeds and prints
+ * `base-caused via script-validate (n) ≡ bash-suites (n)` about two DISJOINT bodies of work — a false
+ * ATTRIBUTION, and the fail-OPEN direction: `base_owned_check` uses that answer to EXCLUDE a
+ * PR-introduced red from §4.5's required surface. Every other assertion in this file is per-lane and
+ * blind to it, the content lock asserts *unchanged, not correct*, and §13's fixtures mutate one lane
+ * at a time — so before this arm, widening ONE lane's `shard:` array was a one-line edit no check
+ * could see.
+ *
+ * ⛔ IT ASSERTS THE MISMATCH, NEVER THE NUMBER 8. A hard-coded width would refuse the day both lanes
+ * widen together, which is the legitimate edit; the mutant that must redden this is "both lanes 9 and
+ * the guard still green".
+ * ⛔ AND A LANE WITH NO CERTIFIED WIDTH IS DISCLOSED, not read as a pass. A lane whose runner call
+ * carries no `shard:` matrix is an UNSHARDED lane (the pre-#3174 shape of `ci-main.yml`), where the
+ * rail correctly falls back to the bare name and the disclosed lane-granular residual applies — there
+ * is no `≡` to check. Saying so keeps the silence from reading as a verified equality; refusing
+ * would be a false block on a shape the rail already handles.
+ */
+function checkCrossLaneWidth(prBounds, mainBounds) {
+  const pr = prBounds.widths;
+  const main = mainBounds.widths;
+  if (pr.length === 0 || main.length === 0) {
+    const which = pr.length === 0 ? prBounds.file : mainBounds.file;
+    say(
+      `⚠️  check-ci-lane-parity: ${which} feeds the shard runner with NO certifiable 'shard:' matrix — the two lanes' slice widths are NOT compared (an unsharded lane has no slice-to-slice equivalence; the rail falls back to the bare name, its disclosed lane-granular residual)`
+    );
+    return;
+  }
+  // One slice-feeding matrix job per lane is the shape both workflows have, and it is the only shape
+  // for which "the lanes' width" is a single number. More than one is not a violation — it is a
+  // premise this check cannot state, so it is disclosed rather than guessed at.
+  if (pr.length !== 1 || main.length !== 1) {
+    const names = (b) => b.widths.map((w) => `${w.job}(${w.width})`).join(", ");
+    say(
+      `⚠️  check-ci-lane-parity: a lane declares more than one slice-feeding matrix job (PR: ${names(
+        prBounds
+      )}; main: ${names(
+        mainBounds
+      )}) — the two lanes' slice widths are NOT compared, because 'the lane's width' is not a single number here`
+    );
+    return;
+  }
+  const pw = pr[0];
+  const mw = main[0];
+  if (pw.width !== mw.width) {
+    refuse(
+      `the two lanes' shard widths DIFFER — '${pw.job}' (${prBounds.file}) has ${pw.width}, '${mw.job}' (${mainBounds.file}) has ${mw.width} — slice membership is POSITIONAL (a shard runs in slice 'pos % width'), so arm n is a DIFFERENT set of shards in each lane while its NAME is the same: the merge rail's 'script-validate (n) ≡ bash-suites (n)' would print a false ATTRIBUTION and can EXCLUDE a PR-introduced red from the required surface; the widths must match; exiting 2`
+    );
   }
 }
 
 const prCount = checkLane("PR", PR_WORKFLOW, PR_JOB);
 const mainCount = checkLane("main", MAIN_WORKFLOW, MAIN_JOB);
-checkBounds("PR", PR_WORKFLOW);
-checkBounds("main", MAIN_WORKFLOW);
+const prBounds = checkBounds("PR", PR_WORKFLOW);
+const mainBounds = checkBounds("main", MAIN_WORKFLOW);
+checkCrossLaneWidth(prBounds, mainBounds);
 const { shards, globs } = checkRunner();
 
 if (rc === 0 && prCount >= 1 && mainCount >= 1) {

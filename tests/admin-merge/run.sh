@@ -16319,6 +16319,81 @@ grep -qE "^       red: script-validate \(4\)$" "$SCEN/err" \
   && pass "(n1b) …and still NAMES the base's own red on arm 4 in the absence answer" \
   || fail "(n1b) the base's arm-4 red vanished from the absence answer: $(grep -n 'red:' "$SCEN/err" 2>/dev/null | head -3)"
 
+# ── (p1)/(p2)/(p3) THE BARE-NAME FALLBACK (#3392). `declared_base_equivalent` answers with TWO
+# candidates — `script-validate (<n>)` FIRST, the legacy bare `script-validate` second — because a
+# base sha that PREDATES main's matrix (#3174) publishes the whole sweep as ONE bare check and NO
+# per-slice name at all. Before #3392 the map returned the slice name only, so against such a base
+# it matched nothing and the rail printed the unqualified `NO BASE COUNTERPART` — the #2610 FALSE
+# ABSENCE, re-appearing for every pre-matrix base, which is a statement about the base's own red
+# that the rail had not established.
+# ⛔ WHY THESE ARMS ARE NEW RATHER THAN A REWRITE OF (c): every arm above publishes the SLICE form
+# on the base, so all of them pass whichever candidate the map tries first, and (c) in particular
+# passes against a SLICE-ONLY map — it cannot see the fallback added or removed. Deleting the bare
+# candidate reddens ONLY (p1)/(p2) below; that is the non-vacuity this pair buys.
+# ⛔ AND (p3) PINS THE ORDER, not just the presence. Both candidates published is the case where a
+# map that preferred the BARE name would still answer — with the weaker, whole-list claim — so the
+# order is asserted against a base that publishes both.
+echo "== 79c. a PRE-MATRIX base still answers through the bare-name fallback (#3392) =="
+new_scen named-refusal-prematrix
+HEAD_NP="f9f90000000000000000000000000000000000e3"
+printf '%s\n' "$HEAD_NP" > "$SCEN/head"
+lane_fail "$HEAD_NP" 9971 > "$SCEN/runs-$HEAD_NP"
+: > "$SCEN/log-9971"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9971"
+write_pr_checks "$(check_run 5071 'bash-suites (5)' completed failure 9971)"
+# THE BASE'S OWN SURFACE, PRE-#3174: the whole sweep as ONE check, no per-slice name anywhere.
+write_main_checks "$(check_run 4071 'script-validate' completed failure 6107)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6107"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6107 push 'CI on main'
+{ main_red_n mainnp01 9972 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(p1) a PRE-MATRIX base (bare 'script-validate') still BLOCKS the unattributable run (exit $rc)" \
+  || fail "(p1) the rail merged over an unattributable run against a pre-matrix base"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(p1) …and answers through the BARE FALLBACK: base-caused via script-validate ≡ bash-suites (5)" \
+  || fail "(p1) the bare-name fallback is missing — a slice-only map prints 'NO BASE COUNTERPART' about the base's OWN red here: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "NO BASE COUNTERPART FOR THIS CHECK" "$SCEN/err" \
+  && fail "(p1) it also claimed NO BASE COUNTERPART about a red the base really carries (#2610 false absence)" \
+  || pass "(p1) …and does NOT print the false absence"
+# THE MESSAGE MUST MATCH THE SHAPE IT FOUND. A bare `script-validate` is BY DEFINITION a pre-matrix
+# base, which ran the list UNSHARDED — so the whole list, never "a SLICE of it". A branch that used
+# the slice wording here would contradict the very clause that follows it.
+grep -q "UNSHARDED over the WHOLE list" "$SCEN/err" \
+  && pass "(p2) …and its message is the LEGACY shape (UNSHARDED over the WHOLE list), not the slice claim" \
+  || fail "(p2) the bare answer used the slice wording — a whole-list base is not 'a SLICE of it': $(grep -n 'lanes run ONE list' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "is the SAME" "$SCEN/err" \
+  && fail "(p2) …the SLICE branch's 'is the SAME SLICE of it as' wording leaked onto the whole-list answer" \
+  || pass "(p2) …and the slice-only wording is absent"
+# (p3) BOTH PUBLISHED → THE SLICE WINS, because the map prints it first and a reader takes the
+# first candidate the base publishes. A map that preferred the bare name would answer here too —
+# with the weaker claim — so this is the arm that pins the ORDER rather than the presence.
+new_scen named-refusal-bothforms
+HEAD_NB="f9f90000000000000000000000000000000000e4"
+printf '%s\n' "$HEAD_NB" > "$SCEN/head"
+lane_fail "$HEAD_NB" 9991 > "$SCEN/runs-$HEAD_NB"
+: > "$SCEN/log-9991"
+echo 'bash-suites (5)' > "$SCEN/jobs-failed-9991"
+write_pr_checks "$(check_run 5091 'bash-suites (5)' completed failure 9991)"
+write_main_checks \
+  "$(check_run 4091 'script-validate' completed failure 6109)" \
+  "$(check_run 4092 'script-validate (5)' completed failure 6109)"
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-6109"
+wf_declares .github/workflows/ci-main.yml push
+main_run_map 6109 push 'CI on main'
+{ main_red_n mainnb01 9992 1 'tests/test_other.py::test_red_on_main'; } > "$SCEN/runs-main"
+run_admin_here 42 --main-runs 1 >/dev/null 2>&1
+rc=$?
+[ "$rc" -ne 0 ] && pass "(p3) a base publishing BOTH forms still BLOCKS (exit $rc)" \
+  || fail "(p3) the rail merged over an unattributable red against a both-forms base"
+grep -q "base: base-caused via script-validate (5) ≡ bash-suites (5)" "$SCEN/err" \
+  && pass "(p3) …and the SLICE candidate WINS over the bare one — the map's order is slice first" \
+  || fail "(p3) the both-forms base did not answer slice-to-slice, so the candidate order is bare-first: $(grep -n 'base:' "$SCEN/err" 2>/dev/null | head -3)"
+grep -q "base: base-caused via script-validate ≡ bash-suites (5)" "$SCEN/err" \
+  && fail "(p3) the BARE candidate was used while the base published the slice too — the stronger claim was available" \
+  || pass "(p3) …and the weaker bare-name answer is not used when the slice exists"
+
 # ── (n2) MUTATION: DELETE THE EQUIVALENCE, AND THE MAPPED ANSWER MUST GO. The three (c) arms
 # assert a line the mapping arm alone produces; this proves it. The mutant keeps everything
 # else identical — `declared_base_equivalent` returns nothing — so a passing (c) against the
@@ -16981,6 +17056,52 @@ if [ -f "$SCEN/comment" ] \
 else
   fail "(a) the exclusion is absent from the posted evidence — an ephemeral-only report is a silent drop in the durable record"
 fi
+
+# ── (a2) THE BARE-CANDIDATE ARM FOR THE §4.5 READER (#3392). (a) above publishes the SLICE form
+# on the base, so it exercises `base_owned_check`'s SECOND candidate only. A base sha that predates
+# main's matrix (#3174) publishes the whole sweep as ONE bare `script-validate` check, and that is
+# the shape an older base still has — so the reader must resolve the exclusion through the FALLBACK
+# candidate and, crucially, through the ONE candidate that matched.
+# ⛔ AND THE NEGATIVE HALF IS THE POINT: `declared_base_equivalent` now answers with TWO names, and a
+# reader that echoed the whole answer would put `script-validate (3)\nscript-validate` into
+# `base_owned`. That is not cosmetic — this base publishes `script-validate` and NOTHING per slice,
+# so the blob claims a base red under a name the base never published, in the DURABLE comment, and it
+# also puts a raw newline inside the TAB-delimited `MAIN_HEALTH_ALL_REDS` record
+# (`<job>\t<kind>`), splitting one record into two.
+new_scen baseowned-prematrix
+HEAD_BO3="b0b3000000000000000000000000000000000000"
+printf '%s\n' "$HEAD_BO3" > "$SCEN/head"
+lane_pass "$HEAD_BO3" 7141 > "$SCEN/runs-$HEAD_BO3"
+lane_pass mainbo3 7142 > "$SCEN/runs-main"
+write_pr_checks \
+  "$(check_run 5141 'ci / lint' completed success 7241)" \
+  "$(check_run 5142 'bash-suites (3)' completed failure 7242)"
+pr_run_map 7241 pull_request 'CI'
+pr_run_map 7242 pull_request 'CI'
+# THE PRE-MATRIX BASE SURFACE: one whole-list check, no per-slice name at all.
+write_main_checks \
+  "$(check_run 6141 'script-validate' completed failure 8241 2026-01-02T00:00:00Z 2026-01-02T00:01:00Z)" \
+  "$(check_run 6142 'extension-tests / lint' completed success 8241)"
+main_run_map 8241 push 'CI on main'
+printf 'push\tCI on main\t.github/workflows/ci-main.yml\n' > "$SCEN/run-8241"
+wf_declares .github/workflows/ci-main.yml push
+pr_merge_ref true 67c72331b2466a7cd326375621be897366277a89
+run_admin_here 42 >/dev/null 2>&1
+rc=$?
+[ "$rc" -eq 0 ] && pass "(a2) an inherited tree red is excluded against a PRE-MATRIX base too (exit 0)" \
+  || fail "(a2) a base publishing only the BARE name no longer excludes this red — the fallback candidate is not reached by base_owned_check (exit $rc): $(sed -n '1,8p' "$SCEN/err" 2>/dev/null)"
+_bo2_stderr_ok=1
+grep -q "the base itself fails 'script-validate (3)" "$SCEN/err" && _bo2_stderr_ok=0
+grep -q "the base itself fails 'script-validate' on a workflow" "$SCEN/err" || _bo2_stderr_ok=0
+[ "$_bo2_stderr_ok" -eq 1 ] \
+  && pass "(a2) …and the owner name is the ONE the base publishes (bare), never a slice it never ran" \
+  || fail "(a2) the base-owned name is a multi-candidate blob or the wrong candidate — expected exactly 'script-validate': $(grep -n 'base itself fails' "$SCEN/err" 2>/dev/null | head -2)"
+_bo2_comment_ok=1
+grep -q "the base itself fails 'script-validate (3)" "$SCEN/comment" 2>/dev/null && _bo2_comment_ok=0
+grep -q "the base itself fails 'script-validate'" "$SCEN/comment" 2>/dev/null || _bo2_comment_ok=0
+[ "$_bo2_comment_ok" -eq 1 ] \
+  && pass "(a2) …the DURABLE comment names the same single owner, so the audit record claims nothing false" \
+  || fail "(a2) the durable comment carries the blob/wrong owner name: $(grep -n 'base itself fails' "$SCEN/comment" 2>/dev/null | head -2)"
 
 # (b) THE FIRST GUARD — NO BASE MEASUREMENT, NO EXCLUSION. The SAME tree red, but the
 # base surface is GREEN on the equivalent name. That is the #1261 incident (a lint red

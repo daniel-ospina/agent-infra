@@ -1522,7 +1522,7 @@ if [ "$RC" -eq 2 ] && grep -q 'shard: \[1, 1, 2\]' <<<"$OUT"; then
 else
   fail "a duplicated matrix axis returned rc $RC (want 2): $OUT"
 fi
-printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2, 3]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
+printf 'name: x\non: pull_request\njobs:\n  bash-suites:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2, 3, 4, 5, 6, 7, 8]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n' \
   >"$TMP/ci-pr-axis-ok.yml"
 guard_rc "$MAIN" "$TMP/ci-pr-axis-ok.yml"
 if [ "$RC" -eq 0 ]; then
@@ -2029,7 +2029,7 @@ else
     fail "an unmatchable branches filter returned rc $RC (want 2): $OUT"
   fi
 fi
-printf 'name: x\non:\n  push:\n    branches: [main]\njobs:\n  script-validate:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n      - run: bash tests/ci-lane-parity/run.sh\n' \
+printf 'name: x\non:\n  push:\n    branches: [main]\njobs:\n  script-validate:\n    runs-on: ubuntu-latest\n    strategy:\n      fail-fast: false\n      matrix:\n        shard: [1, 2, 3, 4, 5, 6, 7, 8]\n    steps:\n      - run: bash scripts/run-bash-shards.sh\n      - run: bash scripts/check-ci-lane-parity.sh\n      - run: bash tests/ci-lane-parity/run.sh\n' \
   >"$TMP/ci-main-pushok.yml"
 guard_rc "$TMP/ci-main-pushok.yml" "$PR"
 if [ "$RC" -eq 0 ]; then
@@ -2958,6 +2958,73 @@ if [ "$BADMOD_RC" -eq 1 ] && grep -q 'executed a DIFFERENT SET' <<<"$BADMOD_OUT"
   pass "control: a broken modulus that keeps the COUNT right is caught by the SET assertion"
 else
   fail "a broken modulus was not caught on the set (rc $BADMOD_RC): $(printf '%s' "$BADMOD_OUT" | tail -2 | tr '\n' '|')"
+fi
+
+echo ""
+echo "8af. THE TWO LANES MUST BE THE SAME WIDTH — the premise the merge rail's '≡' rests on (#3392)"
+# ⛔ WHY THIS IS NOT DECORATION. `scripts/admin-merge.sh` maps a PR's `bash-suites (n)` red to the
+# base's `script-validate (n)`, and `base_owned_check` uses that answer to EXCLUDE a PR-introduced
+# red from §4.5's required surface. Slice membership is POSITIONAL (`pos % width`), so arm n is the
+# same shard SET in both lanes only at equal widths; at different widths the map still succeeds and
+# reports two DISJOINT bodies of work as one — a false ATTRIBUTION in the fail-OPEN direction.
+# ⛔ AND NOTHING ELSE CAN SEE IT: every other assertion in this suite mutates ONE lane at a time,
+# and the content lock asserts *unchanged, not correct* (`check-workflow-lock.mjs`).
+# The width is a hand-kept number in two files, so widening one is a one-line edit no check saw
+# before this section.
+# ⛔ THE ASSERTION IS THE MISMATCH, NEVER THE NUMBER 8. A hard-coded width would refuse the
+# legitimate "both lanes widen together" edit, so (W3) below is the control that pins it.
+_widen_shard() {  # <file> <out>
+  awk '{ if ($0 == "        shard: [1, 2, 3, 4, 5, 6, 7, 8]") { print "        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]"; next } print }' \
+    "$1" >"$2"
+  grep -q 'shard: \[1, 2, 3, 4, 5, 6, 7, 8, 9\]' "$2"
+}
+if ! _widen_shard "$MAIN" "$TMP/ci-main-w9.yml" || ! _widen_shard "$PR" "$TMP/ci-pr-w9.yml"; then
+  fail "(8af) the width fixtures did not apply — the arms below would be vacuous"
+fi
+# (W1) main wider than the PR. This is the NARROWING direction: every PR arm still has a base arm,
+# so the rail's map SUCCEEDS — and attributes a PR-introduced red to a base red about other work.
+guard_rc "$TMP/ci-main-w9.yml" "$PR"
+if [ "$RC" -eq 2 ] && grep -q 'shard widths DIFFER' <<<"$OUT"; then
+  pass "(W1) main widened 8->9 against the PR's 8 exits 2, naming the width mismatch"
+else
+  fail "(W1) a main lane widened to 9 returned rc $RC (want 2, naming the mismatch): $OUT"
+fi
+# (W2) the same assertion on the other side, so the arm is not main-specific.
+guard_rc "$MAIN" "$TMP/ci-pr-w9.yml"
+if [ "$RC" -eq 2 ] && grep -q 'shard widths DIFFER' <<<"$OUT"; then
+  pass "(W2) the PR widened 8->9 against main's 8 exits 2, naming the width mismatch"
+else
+  fail "(W2) a PR lane widened to 9 returned rc $RC (want 2, naming the mismatch): $OUT"
+fi
+# (W3) CONTROL: both widened together must PASS. A guard that hard-coded 8 — or that refused any
+# width above the shipped one — would redden here, so this is what makes (W1)/(W2) about the
+# MISMATCH rather than about the number.
+guard_rc "$TMP/ci-main-w9.yml" "$TMP/ci-pr-w9.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "(W3) BOTH lanes widened to 9 is accepted — the assertion is the mismatch, not the number 8"
+else
+  fail "(W3) two equally-wide lanes were refused (rc $RC): a hard-coded width would false-block a legitimate widening: $OUT"
+fi
+# (W4) AN UNSHARDED LANE IS DISCLOSED, NOT SILENTLY PASSED. A lane whose runner call carries NO
+# `shard:` matrix has no slice-to-slice equivalence (the pre-#3174 shape of ci-main.yml), and the
+# rail correctly falls back to the bare name for it. The guard must say the comparison did not
+# happen, so its silence cannot be read as a verified equality. The fixture DROPS the whole
+# `strategy:` block — `shard: [8]` would not model this, because a one-arm matrix with a gap is
+# already refused by the axis-must-be-1..N arm above (and would then be measuring that arm).
+awk 'BEGIN { drop = 0 }
+     /^    strategy:$/ { drop = 1; next }
+     drop && /^    steps:$/ { drop = 0 }
+     drop { next }
+     { print }' \
+  "$MAIN" >"$TMP/ci-main-noshard.yml"
+if grep -q '^    strategy:$' "$TMP/ci-main-noshard.yml"; then
+  fail "(W4) the unsharded-lane fixture did not apply — the arm would be vacuous"
+fi
+guard_rc "$TMP/ci-main-noshard.yml" "$PR"
+if [ "$RC" -eq 0 ] && grep -q 'slice widths are NOT compared' <<<"$OUT"; then
+  pass "(W4) an UNSHARDED lane says the widths were NOT compared, so the gap is disclosed rather than read as equal"
+else
+  fail "(W4) an unsharded main lane returned rc $RC and said nothing about the comparison: $OUT"
 fi
 
 echo ""
