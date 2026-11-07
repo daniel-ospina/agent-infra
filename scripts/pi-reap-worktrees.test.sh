@@ -636,8 +636,9 @@ SHIM
 # fixture (review of #3058, P2). The cache is a FILE because the probe runs inside a command
 # substitution, so no in-process variable survives; and it only matters when a pass has MORE THAN
 # ONE candidate that reaches the probe. Counting the shims' invocations is what discriminates
-# "one timeout per remote per pass" from "one per candidate": with the same fixture and a WORKING
-# `ls-remote` both candidates are counted (2), and with a FAILING one the second is suppressed (1).
+# "one probe per remote per pass" from "one per candidate": with the same fixture and a WORKING
+# `ls-remote` N candidates are counted ONCE (#3371 — the advertisement is cached), and with a
+# FAILING one the second candidate is suppressed as well (1).
 for _shim in git-lsremote-count git-lsremote-fail-count; do
 cat >"$T/bin/$_shim" <<'SHIM'
 #!/usr/bin/env bash
@@ -4935,11 +4936,15 @@ assert_eq "$("$REAL_GIT" -C "$BARE" for-each-ref refs/heads | wc -l | tr -d ' ')
 # (1) NON-VACUITY, and it has to come first: with a WORKING counting `ls-remote` every candidate that
 #     reaches the probe is counted. A cache that is never reached cannot be told apart from one that
 #     suppresses a call the fixture never made — this leg is what makes leg (2)'s `1` mean something.
+#     ⛔ THE COUNT IS `1`, NOT `2`, AND THAT IS THE #3371 REGRESSION ARM: the pass advertises each
+#     remote's heads ONCE and answers every candidate from that snapshot, so the count must NOT grow
+#     with the population (it did: one network round trip per candidate, 12 × 0.55 s on the measured
+#     box). Revert `remote_advertise` to a per-candidate `ls-remote` and this arm goes from 1 to 2.
 A26G_CNT_ALIVE="$T/$ENV/cnt-alive"; rm -f "$A26G_CNT_ALIVE"
 OUT="$(FAKE_LSREMOTE_COUNTER="$A26G_CNT_ALIVE" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-count" \
     run_reaper $ENV --dry-run --repo "$REPO")"
-assert_eq "$(cat "$A26G_CNT_ALIVE" 2>/dev/null)" "2" \
-    "A26g non-vacuity: BOTH probe-reaching candidates really do call ls-remote (a working remote costs one call each)"
+assert_eq "$(cat "$A26G_CNT_ALIVE" 2>/dev/null)" "1" \
+    "A26g non-vacuity: a WORKING remote costs ONE ls-remote for the WHOLE pass, not one per candidate (#3371)"
 assert_contains "$(row_for "$OUT" "$WT_A26G1")" "reason=remote-only-ref" \
     "A26g candidate 1 PRESERVEs (stale tracking ref, remote branch gone)"
 assert_contains "$(row_for "$OUT" "$WT_A26G2")" "reason=remote-only-ref" \
@@ -4959,6 +4964,40 @@ assert_contains "$(row_for "$OUT" "$WT_A26G2")" "reason=remote-only-ref" \
     "A26g …and candidate 2 PRESERVEs off the CACHED verdict rather than its own call"
 assert_contains "$OUT" "examined=3 classified=3" \
     "A26g the cached verdict does not shrink the population (all three still examined)"
+
+# ── A26g3: the advertisement ANSWERS, for every candidate, off the ONE read (#3371) ────────────
+# A26g's two legs both end in PRESERVE, so neither can tell "one advertisement per remote" apart
+# from "no advertisement at all" — a cache that never answered, or answered with a truncated or
+# mistyped snapshot, preserves every row and looks identical. This leg is the population A26g
+# cannot build: THREE candidates whose heads the remote really does advertise, so every row must
+# come back REMOVE-eligible (`reason=remote-holds:upstream/…`) while the `ls-remote` count stays at
+# ONE. Both directions are pinned by the same fixture — a per-candidate probe takes the count to 3
+# (the #3371 defect), and a broken/empty snapshot takes the `remote-holds` rows to 0.
+ENV=A26g3; REPO="$(mk_repo $ENV)"
+BARE="$T/$ENV/remote.git"
+"$REAL_GIT" init -q --bare "$BARE"
+"$REAL_GIT" -C "$REPO" remote add upstream "$BARE"
+for _g in 1 2 3; do
+    "$REAL_GIT" -C "$REPO" checkout -q -b "tmp-a26g3$_g"
+    commit_in_wt "$REPO" "$OLD_DATE" "a26g3$_g"
+    _gsha="$("$REAL_GIT" -C "$REPO" rev-parse HEAD)"
+    "$REAL_GIT" -C "$REPO" push -q upstream "tmp-a26g3$_g:refs/heads/feat/a26g3$_g"
+    "$REAL_GIT" -C "$REPO" checkout -q main
+    "$REAL_GIT" -C "$REPO" branch -D "tmp-a26g3$_g" >/dev/null
+    "$REAL_GIT" -C "$REPO" fetch -q upstream
+    "$REAL_GIT" -C "$REPO" worktree add -q --detach "$T/$ENV-det$_g" "$_gsha"
+done
+assert_eq "$("$REAL_GIT" -C "$BARE" for-each-ref refs/heads | wc -l | tr -d ' ')" "3" \
+    "A26g3 precondition: the remote advertises all three branches"
+A26G3_CNT="$T/$ENV/cnt"; rm -f "$A26G3_CNT"
+OUT="$(FAKE_LSREMOTE_COUNTER="$A26G3_CNT" GIT_BIN_OVERRIDE="$T/bin/git-lsremote-count" \
+    run_reaper $ENV --dry-run --repo "$REPO")"
+assert_eq "$(cat "$A26G3_CNT" 2>/dev/null)" "1" \
+    "A26g3 THREE remote-holds candidates cost ONE ls-remote for the whole pass (the advertisement is per remote, not per candidate)"
+assert_eq "$(printf '%s\n' "$OUT" | grep -c 'reason=remote-holds:upstream/feat/a26g3')" "3" \
+    "A26g3 …and all three answers come off that ONE snapshot: every advertised tip is still REMOVE-eligible (a cache that answered nothing, or answered partially, would preserve them)"
+assert_contains "$OUT" "examined=4 classified=4" \
+    "A26g3 non-vacuity: the main checkout plus all three detached records were classified"
 
 # ── A26c: a remote-holds row does NOT block the end-of-pass prune — pinned BOTH ways ─────
 # This is the F7/A23 rule one reason class over, and it is a DECISION with a cost on both sides:
