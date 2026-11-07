@@ -446,7 +446,7 @@ GH_LIMIT_DIR="$TMP/lenv" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 GH_LIMIT_CO
   python3 "$LIMIT" --real-gh "$TMP/envstub" -- pr view 13 >/dev/null 2>&1 || true
 _envline="$(grep '^TOK=' "$GH_CRED_TEST_LOG" | tail -1)"
 ck "the app token is set for ALL four credential names (enterprise hosts read the pair, not GH_TOKEN)" \
-   "$(grep -q '^TOK=tok-.*ENT=tok-.*ENT2=tok-' <<<"$_envline" && echo 0 || echo 1)"
+   "$(printf '%s' "$_envline" | grep -q '^TOK=tok-.*ENT=tok-.*ENT2=tok-' && echo 0 || echo 1)"
 
 # ⛔ THE CLASS IS SET PER CALL, NOT ONCE PER PROCESS. `run()` can be called more than once in one
 # process (the dispatch retry loop calls it per attempt) and the fallback mutates the global, so a
@@ -536,9 +536,9 @@ GH_LIMIT_DIR="$TMP/limit6" GH_LIMIT_READ_CACHE=0 GH_LIMIT_PASS_CACHE=0 GH_LIMIT_
   GH_LIMIT_FLIGHT=0 GH_LIMIT_REAL_GH="$TMP/stub-gh" \
   python3 "$LIMIT" --real-gh "$TMP/stub-gh" -- pr view 12 >/dev/null 2>&1
 stats="$(python3 "$CRED" --stats 2>&1)"; src=$?
-ck "a healthy read is counted on the app arm" "$(grep -q 'arm app' <<<"$stats" && echo 0 || echo 1)"
+ck "a healthy read is counted on the app arm" "$(printf '%s' "$stats" | grep -q 'arm app' && echo 0 || echo 1)"
 ck "  …and the read-on-user regression count stays 0" \
-   "$(grep -q 'reads-on-user-unjustified: 0' <<<"$stats" && echo 0 || echo 1)"
+   "$(printf '%s' "$stats" | grep -q 'reads-on-user-unjustified: 0' && echo 0 || echo 1)"
 ck "  …and --stats exits 0 when nothing is unjustified" "$(ok "$src")"
 
 # The DEFECT, reproduced: force the user credential onto a read. This is what "the layer is not
@@ -549,7 +549,7 @@ GH_CRED_ARM_OVERRIDE=user GH_LIMIT_DIR="$TMP/limit7" GH_LIMIT_READ_CACHE=0 GH_LI
   python3 "$LIMIT" --real-gh "$TMP/stub-gh" -- pr view 13 >/dev/null 2>&1
 stats="$(python3 "$CRED" --stats 2>&1)"; src=$?
 ck "a READ forced onto the user credential IS counted as unjustified" \
-   "$(grep -q 'READS-ON-USER-UNJUSTIFIED n=1' <<<"$stats" && echo 0 || echo 1)"
+   "$(printf '%s' "$stats" | grep -q 'READS-ON-USER-UNJUSTIFIED n=1' && echo 0 || echo 1)"
 ck "  …and --stats then exits non-zero, so a caller can gate on it" \
    "$([ "$src" -ne 0 ] && echo 0 || echo 1)"
 
