@@ -1051,9 +1051,13 @@ bash "$GATE" --check "$TMP/pw-keyless-bare.txt" lane 0 "$HW/work" >/dev/null 2>&
 # on byte-identical briefs: `origin/main` rc 0, the cycle-11 head rc 80 (UNKEYED, a diagnostic about the
 # key, for the documented third form). H51c is the row, and it discriminates on its own — it fails against
 # the cycle-11 head.
-# ⛔ H51d IS THE PARITY ROW, AND ITS CARRIER MATTERS (cycle 13 review, P2): a separator followed by
-# WHITESPACE ONLY must still be refused, so the "reason" must contain a non-whitespace character. The
-# carrier has to be a byte the value reader's trailing trim KEEPS — that trim is `[ \t]+`
+# ⛔ H51d IS THE PARITY ROW, AND ITS CARRIER MATTERS — two findings, in two cycles, and the row is
+# only correct because BOTH were applied: the cycle-13 review found this row VACUOUS (its finding 2: the
+# space/tab carrier collapses under the trim and re-asserted H51b, so it discriminated nothing and was
+# deleted), and the cycle-14 delta review found the remedy wrong (its finding 1, P2: CR, VT and FF
+# SURVIVE that trim and do arrive at the arm as whitespace-only). What the row still has to assert: a
+# separator followed by WHITESPACE ONLY is refused, so the "reason" must contain a non-whitespace
+# character. The carrier has to be a byte the value reader's trailing trim KEEPS — that trim is `[ \t]+`
 # (brief-gate.sh:341), so a space/tab-only value collapses to bare `keyless` and re-asserts H51b (the first
 # version of this row did exactly that and was vacuous). CR survives the trim and arrives at the arm as
 # whitespace-only, so the mutant `[[:space:]]*[![:space:]]*` → `[[:space:]]*` is killed by THIS row
