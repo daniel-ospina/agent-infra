@@ -1204,6 +1204,32 @@ verify_targets() {
                     root="$(tcc_protected_root "$arg")"
                     case "$grants" in
                         *" $root "*)
+                            # ⛔ THE GRANT PROVES READABILITY, NOT THAT THE ARGUMENT IS USABLE. `$grants`
+                            # says this unit's launcher can READ the tree; it says nothing about whether
+                            # the value handed on is a file at all. THIS branch ARMS the unit, so an
+                            # unusable value here is exactly the armed-and-dead state the whole change
+                            # exists to remove: `bash <dir>` is 126 EISDIR on every tick, a 0-byte script
+                            # runs and does nothing, an unreadable one is 126 — whatever tree it is in.
+                            # ⛔ IT DOES NOT SHADOW THE `tcc_exec=1` PATH BELOW. That path SKIPS AND
+                            # DISARMS, so verdict 2 is already the safe answer there and a FAIL would
+                            # only take `sync.sh` down with it (#1187). Here the choice is narrower and
+                            # the two ends are not symmetric: arming a dead unit is a SILENT false PASS
+                            # (category A), while declining to arm one is loud and repairable by an
+                            # install step (a re-farm, a chmod — verdict 1's own definition).
+                            # ⛔ AND IT IS WHY THE TWO READERS STAY IN STEP: python derives `exec` for
+                            # `--script <dir>` and this arm derives `unknown`, so a predicate applied to
+                            # only the `exec` arm is a reader divergence — the class round 7 fixed on
+                            # the launcher role (fresh review of #3413, round 10 P2).
+                            if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
+                                echo "    unreadable or not a regular file: $arg" >&2
+                                echo "        inside a TCC tree this unit's launcher holds a grant for, so" >&2
+                                echo "        the unit WOULD be armed — but a directory, an empty file or an" >&2
+                                echo "        unreadable one is dead on every tick whatever tree it lives in," >&2
+                                echo "        which reads as 'installed' to every instrument that only" >&2
+                                echo "        checks existence." >&2
+                                bad=1
+                                continue
+                            fi
                             echo "    WARN TCC-protected target: $arg" >&2
                             echo "        inside $root, the SAME tree this unit's launcher holds a" >&2
                             echo "        grant for (#1311) — installing, not skipping." >&2
@@ -1312,6 +1338,26 @@ verify_targets() {
                 root="$(tcc_protected_root "$arg")"
                 case "$grants" in
                     *" $root "*)
+                        # ⛔ SAME PREDICATE, SAME REASON, IN THE `exec` ARM. `$grants` proves the launcher
+                        # can READ this tree; it says nothing about whether `$arg` is a usable file. This
+                        # branch ARMS the unit, so a directory (`bash <dir>` → 126 EISDIR every tick), a
+                        # 0-byte script (runs, does nothing) or an unreadable one installed as
+                        # `installed + loaded` and read as healthy to every existence-checking
+                        # instrument — the category-A false PASS this change exists to remove. The
+                        # `launcher` arm already made this call for the x bit in round 9, for the same
+                        # stated reason: a property that is dead on every tick WHATEVER TREE IT LIVES
+                        # IN belongs above the TCC branch. The file-type predicate is such a property;
+                        # the TCC branch only decides whether the unit is skipped (verdict 2), so it
+                        # still governs the `tcc_exec=1` path below (fresh review of #3413, round 10 P2).
+                        if [ ! -f "$arg" ] || [ ! -r "$arg" ] || [ ! -s "$arg" ]; then
+                            echo "    unreadable or not a regular file: $arg" >&2
+                            echo "        inside a TCC tree this unit's launcher holds a grant for, so the" >&2
+                            echo "        unit WOULD be armed — but a directory, an empty file or an unreadable" >&2
+                            echo "        one is dead on every tick whatever tree it lives in, which reads as" >&2
+                            echo "        'installed' to every instrument that only checks existence." >&2
+                            bad=1
+                            continue
+                        fi
                         echo "    WARN TCC-protected target: $arg" >&2
                         echo "        inside $root, the SAME tree this unit's launcher holds a grant" >&2
                         echo "        for (#1311) — installing, not skipping. A DIFFERENT tree is a" >&2

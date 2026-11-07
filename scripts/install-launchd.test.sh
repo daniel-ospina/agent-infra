@@ -844,7 +844,12 @@ PLIST
 mkfakehome "$PROBE_HOME"
 mkdir -p "$PROBE_HOME/Documents/checkout/scripts"
 PROBE_DEAD="$PROBE_HOME/Documents/checkout/scripts/tcc-dead.sh"
-touch "$PROBE_DEAD"; chmod +x "$PROBE_DEAD"
+# ⛔ `mkstub`, NOT `touch`. This fixture models a SCRIPT in the checkout, and the guard refuses a
+# 0-byte executed target (execve gives ENOEXEC) — see `mkstub`'s own comment above. It was left empty
+# here, which made every "same tree, installing" row below bless an INERT unit without anyone deciding
+# to: the fixture's emptiness was incidental to what those rows test (the grant verdict), and it hid
+# the hole (c22h2) pins.
+mkstub "$PROBE_DEAD"
 mkstub "$PROBE_HOME/.pi/agent/scripts/probe-ok.sh"
 # the two `com.tortoise.*` reapers exec the CHECKOUT's own interpreter; §7c (c3) reproduces that shape
 mkdir -p "$PROBE_HOME/Documents/checkout/.venv/bin"
@@ -1817,6 +1822,41 @@ if [ -f "$PROBE_HOME/Library/LaunchAgents/com.eldato.tccprobe.plist" ]; then
 else
     bad "§7c …and the unit is installed"
 fi
+
+# (c22h2) ⛔ THE GRANT PROVES READABILITY, NOT THAT THE ARGUMENT IS USABLE — the other half of (c22h).
+# `$grants` says the launcher can READ the tree; it says NOTHING about whether the value handed on is a
+# file. `--script <DIR>` in the launcher's OWN TCC tree is a KNOWN-executed target, and `bash <dir>` is
+# 126 EISDIR on every tick whatever tree it lives in — yet it installed as `installed + loaded` with only
+# a WARN. That is the armed-and-dead state this change exists to remove, on the one branch that ARMS the
+# unit; the remedy (a re-farm, a chmod) IS an install step, so it FAILS, which is verdict 1's own
+# definition and the same call the `launcher` arm made for the x bit in round 9. BOTH READERS, because
+# python derives `exec` for this value and the fallback derives `unknown`, so a predicate on one arm only
+# is a reader divergence (fresh review of #3413, round 10 P2).
+PROBE_TCC_DIR="$PROBE_HOME/Documents/checkout/scripts/a-directory"
+rm -rf "$PROBE_TCC_DIR"; mkdir -p "$PROBE_TCC_DIR"
+PROBE_TCC_EMPTY="$PROBE_HOME/Documents/checkout/scripts/tcc-empty.sh"
+: > "$PROBE_TCC_EMPTY"; chmod +x "$PROBE_TCC_EMPTY"
+for _probe_shape in "$PROBE_TCC_DIR" "$PROBE_TCC_EMPTY"; do
+    _probe_shape_name="$( [ -d "$_probe_shape" ] && echo DIRECTORY || echo 0-byte )"
+    set +e
+    OUT="$(probe_install "$PROBE_HOME" "$PROBE_TCC_BIN" --script "$_probe_shape" 2>&1)"; RC=$?
+    set -e
+    assert_eq "$RC" "1" "§7c python reader: a $_probe_shape_name executed target in the launcher's OWN TCC tree FAILS the install"
+    assert_contains "$OUT" "unreadable or not a regular file: $_probe_shape" "§7c …and names it, instead of WARNing and arming a dead unit"
+    set +e
+    OUT="$(probe_install_fallback "$PROBE_HOME" "$PROBE_TCC_BIN" --script "$_probe_shape" 2>&1)"; RC=$?
+    set -e
+    assert_eq "$RC" "1" "§7c fallback: the same verdict for a $_probe_shape_name target in the granted tree"
+    assert_contains "$OUT" "unreadable or not a regular file: $_probe_shape" "§7c …so the two readers still agree"
+done
+# POSITIVE CONTROL — the arm must not become a blanket refusal of every same-tree target: a REAL script
+# there is exactly what (c22h) and the two `com.tortoise.*` reapers are, and it must still install.
+set +e
+OUT="$(probe_install "$PROBE_HOME" "$PROBE_TCC_BIN" --script "$PROBE_DEAD" 2>&1)"; RC=$?
+set -e
+assert_eq "$RC" "0" "§7c control: a REAL script in the launcher's OWN TCC tree still WARNS and installs"
+assert_contains "$OUT" "WARN TCC-protected target: $PROBE_DEAD" "§7c …because #1311 measured the launcher's binary holds that grant"
+rm -rf "$PROBE_TCC_DIR"
 
 # (c23) `env -S` splits with ITS OWN grammar: a BACKSLASH-escaped space (`\_`) keeps the command
 # together, and the absolute token after it is still EXECUTED (fresh review of #3413, P3).
