@@ -862,11 +862,17 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
         is_transient_scratch "$SCRIPT"    && bad="SCRIPT=$SCRIPT"
         is_transient_scratch "$HOME"      && bad="${bad:+$bad; }HOME=$HOME"
         is_transient_scratch "$STATE_DIR" && bad="${bad:+$bad; }STATE_DIR=$STATE_DIR"
-        # ⛔ THE PROVISIONER USES THE WIDER PREDICATE, THE OTHER THREE DO NOT. Deliberate scoping:
-        # a scheduled SCRIPT inside a worktree is SAID OUT LOUD, NOT REFUSED (`resolve_script`), while a
-        # provisioner pinned there dies with the lane and leaves a pass that can never ADD capacity.
-        [ -n "$PROVISIONER" ] && is_lane_scratch "$PROVISIONER" && \
-            bad="${bad:+$bad; }PROVISIONER=$PROVISIONER"
+        # ⛔ THE PROVISIONER IS NOT JUDGED HERE, AND THAT IS THE WHOLE POINT (#3469 review).
+        # This function runs on `--disarm` too, and `--disarm` must never be refused: it forces a
+        # DISARMED render where the pin is inert, so refusing it protects nothing and instead strands the
+        # arming record (`STILL ARMED … the record was NOT removed`) — the harm already measured and
+        # written down at `refuse_adopted_provisioner`. A lane-scratch arm here refused `--disarm`
+        # (rc 1, record kept) where origin/main exited 0 and removed it. The provisioner's judgement lives
+        # in `refuse_adopted_provisioner`, which runs on BOTH rendering writers and carries the verified
+        # `FORCE_MODE_FLAG`/`REPORT_ONLY` exemption — one site, one rule, and no way for the two to drift.
+        # (Note the asymmetry with SCRIPT: a scheduled converger copy inside a worktree is SAID OUT LOUD,
+        # NOT REFUSED — see `resolve_script` — while a provisioner pinned there dies with the lane. Two
+        # different facts, stated in the two places each one belongs.)
     fi
     if [ -n "$bad" ]; then
         err "REFUSING a $t install rendered from transient scratch space: $bad"
@@ -1408,10 +1414,20 @@ refuse_adopted_provisioner() {
         esac
     fi
     if is_lane_scratch "$PROVISIONER"; then
+        # ⛔ THIS IS THE ONLY SITE THAT JUDGES THE PROVISIONER'S LOCATION, AND THE WIDER PREDICATE IS
+        # SCOPED TO THIS ONE FIELD ON PURPOSE. A lane checkout (`*/.worktrees/*`, `/tmp/wt-*`,
+        # `/tmp/cell-wt-*`, `/tmp/base-*` — the set `scripts/install-repair-service.sh` enforces, #2697) is
+        # removed with its lane, so a provisioner pinned there leaves a pass that can never ADD capacity.
+        # It is NOT applied to SCRIPT/HOME/STATE_DIR: `resolve_script` records the opposite decision for
+        # the converger ("a worktree path is SAID OUT LOUD, NOT REFUSED — scheduling a branch's copy is a
+        # legitimate test"). ⛔ AND IT IS NOT IN `refuse_unusable_target` EITHER: that function also runs on
+        # `--disarm`, and refusing `--disarm` strands the arming record (measured). This caller is reached
+        # from both rendering writers WITH the exemption, so there is exactly one place that decides.
         err "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE: PROVISIONER=$PROVISIONER"
         err "That tree is removed before the first tick, so every pass reports 'no provisioner' and the box can"
         err "never ADD capacity — the same inert-enforcer shape the writers refuse to CREATE. Re-install from a"
-        err "durable checkout, or set RUNNER_AUTOSCALE_PROVISIONER to a durable path."
+        err "durable checkout, or set RUNNER_AUTOSCALE_PROVISIONER to a durable path (a lane checkout under"
+        err ".worktrees/, /tmp/wt-*, /tmp/cell-wt-* or /tmp/base-* is deleted with its lane)."
         return 1
     fi
     return 0
