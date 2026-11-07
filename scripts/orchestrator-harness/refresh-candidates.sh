@@ -897,17 +897,27 @@ gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; e
 # rate_limit` IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it, and the CORE floor is
 # gated behind `reaches_api` — so `gh-limit: gh-core-floor …` can NEVER appear on THIS call's stderr.
 # (It appears on the CORE reads the same pass makes, which is where an operator's
-# `BUDGET:gh-rest: gh-limit: gh-core-floor remaining=N` log line comes from — a different call.) What
-# CAN refuse the meter is the LAYER BELOW it: `scripts/gh-shim/gh`'s shared cooldown window, which
-# exits 75 with a `gh-contended — a shared gh throttle window outlived this call's …ms wait budget …`
-# note — a burst/concurrency window is invisible to `/rate_limit`, which is exactly why it is the one
-# that bites. A fixture that fed this probe a floor line would grade the label against evidence
-# production cannot emit; `refresh-provision.test.sh`'s `(g)` drives the reachable shape instead.
+# `BUDGET:gh-rest: gh-limit: gh-core-floor remaining=N` log line comes from — a different call.)
+#
+# ⛔ AND WHICH REFUSAL *DOES* REACH IT DEPENDS ON ONE KNOB, SO THE CLAUSES SAY ONLY WHAT THE ARM
+# ESTABLISHES (#3701 review round 2, P2). The layer that CAN stop this call is `scripts/gh-shim/gh`'s
+# shared cooldown window, but `wait_for_cooldown` sleeps out that window and only exits 75 once it has
+# SPENT `AGENT_GH_GATE_WAIT_BUDGET` (default 120 s) — while this probe bounds the same call at
+# `GH_PROBE_TIMEOUT` (default 20 s) and kills its process group. So at DEFAULT settings the shape that
+# arrives is the TIMEOUT (rc=142), not the 75; 75 arrives only when the wait budget is set below the
+# probe bound. Both arms therefore name a NON-ANSWER and claim nothing about WHY — the TIMEOUT arm
+# once said "not a spent budget", which a shim sleeping on a shared throttle window falsifies.
 GH_PROBE_CAUSE=""
 # ⛔ ONE LINE, BOUNDED, AND NEVER THE TOKEN. `gh auth token`'s STDOUT is already discarded by
 # `gh_probe_bounded`; this reads STDERR only. The take must not grow the record without limit either:
 # a `--paginate` refusal can replay a whole error body, and `why=` is a single-line key in a file every
 # beat reads — so the first non-empty line, whitespace-collapsed, truncated.
+# ⛔ AND THE CLAUSE PUTS IT AT THE FRONT (#3701 review round 2, P2). `refresh_cause_brief` prints
+# `why=` cut at 400 characters, and the outer `provision_fail` prefix plus the arm's own verdict words
+# consumed ~200 of them on some arms — so a clause that led with its verdict left under half the
+# beat's window for the evidence. Measured after this ordering: the evidence begins at character ~61
+# on every arm, so ~340 characters of it survive the cut instead of ~186 on the worst one. The cap
+# below still bounds the whole line; only its tail can ever be clipped, and only in the beat.
 GH_PROBE_CAUSE_MAX=320
 gh_probe_evidence() {  # <rc> — the measured answer, one line, or a named non-answer
   local rc="${1:-?}" line
@@ -1067,7 +1077,11 @@ gh_probe_env() {
   [ "$prc" -eq 0 ] && { GH_PROBE_CAUSE=""; gh_probe_err_cleanup; return 0; }
   err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
   if gh_probe_timed_out "$prc"; then
-    GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc), which is an OUTAGE, not a rejected credential and not a spent budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence)"
+    # ⛔ "NOT A SPENT BUDGET" WAS A CLAIM THIS ARM CANNOT MAKE (#3701 review round 2, P1). At DEFAULT
+    # settings the shim spends 120 s sleeping out a shared throttle window before it ever returns 75,
+    # so a probe bounded at 20 s sees THIS arm — and "a shared budget is being slept out" is one of
+    # the things a bound here can mean. It establishes a NON-ANSWER, nothing more.
+    GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc): a NON-ANSWER, which establishes neither a rejected credential nor anything about the budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence)"
     echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
     printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
     gh_probe_err_cleanup
@@ -1093,10 +1107,8 @@ gh_probe_env() {
     gh_probe_err_cleanup
     return "$EXIT_NOT_PROVISIONABLE"
   fi
-  # ⛔ THE AMBIGUOUS ARM NAMES ITS EVIDENCE, NOT JUST ITS ABSENCES. "the API did not answer with a
-  # 401" describes what was NOT seen; it was TRUE and USELESS when the measured answer was the gh
-  # layer declining to let the call out, and only this variable carries that to `state/refresh-last`
-  # (#3584).
+  # ⛔ EVIDENCE FIRST, THEN THE VERDICT (#3701 review round 2, P2) — see `GH_PROBE_CAUSE_MAX`'s note:
+  # leading with verdict words pushed the evidence past half of the beat's 400-character window.
   # ⛔ rc=75 IS NAMED OFF THE EXIT CODE, AND THE CLAUSE CLAIMS ONLY WHAT 75 MEANS (#3701 review, P1).
   # 75 is gh-limit.py's / scripts/gh-shim/gh's EX_TEMPFAIL: "refused LOCALLY, nothing was sent". It
   # is NOT "the account is out of quota" — `gh-limit.py:3446` states that exact inversion as a defect
@@ -1105,13 +1117,15 @@ gh_probe_env() {
   # what is TRUE — nothing was sent, so neither the credential nor the budget was tested — and lets
   # the layer's own line, quoted verbatim, say which local verdict it was. A text match could not
   # name this at all: prose drifts, which is why the repo keys on the rc for this code.
-  # ⛔ THE EVIDENCE COMES FIRST IN THE CLAUSE, DELIBERATELY. `refresh_cause_brief` prints `why=` cut at
-  # 400 characters (origination-funnel.test.sh pins that cut), so a clause built question-first would
-  # push the evidence — the thing this exists to surface — toward the truncation edge on a long stderr
-  # line. Evidence first puts it around character 110 of the beat's line.
+  # ⛔ AND AT DEFAULT KNOBS THIS ARM IS PREDATED BY THE BOUND: the shim sleeps out its
+  # `AGENT_GH_GATE_WAIT_BUDGET` (120 s) before returning 75, and this probe kills the call at
+  # `GH_PROBE_TIMEOUT` (20 s), so the TIMEOUT arm above is the default shape. 75 reaches here only
+  # when an operator sets the wait budget below the probe bound — which is why the arm stays (it is
+  # the documented verdict contract, and gh-limit's own BUSY code shares it) but is not described as
+  # the common case.
   case "$prc" in
-    75) GH_PROBE_CAUSE="answer=REFUSED LOCALLY by the gh layer (rc=75 EX_TEMPFAIL — nothing was sent, so NEITHER the credential NOR the budget was tested): NOT auth and NOT an outage ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence)" ;;
-    *)  GH_PROBE_CAUSE="answer=NO — the call failed, and this is the evidence it wrote ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence) — read that evidence before calling this auth or an outage" ;;
+    75) GH_PROBE_CAUSE="evidence=$(gh_probe_evidence "$prc"); answer=REFUSED LOCALLY by the gh layer (rc=75 EX_TEMPFAIL — nothing was sent, so NEITHER the credential NOR the budget was tested): NOT auth and NOT an outage; question=can the stored credential answer at all (gh api rate_limit, source=$presence)" ;;
+    *)  GH_PROBE_CAUSE="evidence=$(gh_probe_evidence "$prc"); answer=NO — the call failed; read that evidence before calling this auth or an outage; question=can the stored credential answer at all (gh api rate_limit, source=$presence)" ;;
   esac
   echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
@@ -2148,11 +2162,15 @@ refresh_record_write running provision 0 \
 # ⛔ THE CAUSE NAMES THE PRECONDITION (#3584). This used to read `(the refusal line above names which
 # one)`, which is a pointer into the LOG — while `orch-loop.sh` builds its `[dispatch] BLOCKED` line,
 # and `.refresh-blocked` its "Reason and evidence", from the RECORD this sentence is written into. A
-# pointer in the record names nothing to a reader who has only the record; measured on a cell, the
-# record said "the refusal line above names which one" for a budget refusal
-# (`gh-core-floor remaining=312 floor=800 resets_in=7m`) that the beat never showed. So the probe's own
-# measured clause is interpolated here, and a probe that somehow set none is NAMED as such rather than
-# silently reverting to the pointer.
+# pointer in the record names nothing to a reader who has only the record: "refused because auth",
+# "refused because the gh layer declined to let the call out" and "refused because the box could not
+# reach GitHub" all read identically. So the probe's own measured clause is interpolated here, and a
+# probe that somehow set none is NAMED as such rather than silently reverting to the pointer.
+# ⛔ NO SPECIFIC LAYER IS NAMED HERE ANY MORE (#3701 review round 2, P2): an earlier draft of this
+# comment, and of two others in this file, credited the measured refusal to a `gh-core-floor` budget
+# line — which CANNOT refuse this probe's `api rate_limit` call (`gh-limit.py`'s `reaches_api()` is
+# False for the meter, and the floor is gated behind it). The comments now agree with each other and
+# with the code; the arm-by-arm detail is at the `GH_PROBE_CAUSE` definition above.
 gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused [${GH_PROBE_CAUSE:-NO CLAUSE RECORDED by gh_probe_env — the specific precondition was not named}] — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────

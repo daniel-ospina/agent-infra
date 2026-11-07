@@ -73,7 +73,12 @@
 #   (g3) the clause is MEASURED, not constant: a REJECTED credential (HTTP 401) is still rc=3 and is
 #        recorded as rejected, claiming no budget refusal;
 #   (g4) rc=75 with a ZERO-BYTE capture is named off the EXIT CODE, and the empty capture is named as
-#        such — the branch a text classifier could not reach at all.
+#        such — the branch a text classifier could not reach at all;
+#   (g5) the DEFAULT shape: the probe's own 20 s bound fires first (a stub that really sleeps), and the
+#        record says NON-ANSWER — claiming neither a rejected credential NOR anything about the budget
+#        ("not a spent budget" was an over-claim: the shim sleeps 120 s on a shared window before 75);
+#   (g6) the OTHER default shape — rc=1/403 with a real rate-limit stderr, the arm #3584's own
+#        measured scenario took. Without this row that arm's interpolation could be deleted green.
 #   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
 #   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
 #   the label against evidence production cannot emit (#3701 review, P2).
@@ -183,26 +188,29 @@ SH
   chmod +x "$D/bin/gh"
 }
 
-# mk_gh_budget_stub <case-dir> <rc> <stderr-line> — the same `gh`, answering `auth token` from a
-# STORED credential but REFUSING the `api rate_limit` validation read with the given rc and stderr.
-# An EMPTY <stderr-line> writes NOTHING AT ALL (a zero-byte capture) — `printf '%s\n' ""` writes one
-# newline, which is not the same shape and would leave the "no stderr written" branch unexercised
-# (#3701 review, P2).
+# mk_gh_budget_stub <case-dir> <rc> <stderr-line> [<sleep-seconds>] — the same `gh`, answering `auth
+# token` from a STORED credential but REFUSING the `api rate_limit` validation read with the given rc,
+# stderr and (optional) delay. An EMPTY <stderr-line> writes NOTHING AT ALL (a zero-byte capture) —
+# `printf '%s\n' ""` writes one newline, which is not the same shape and would leave the "no stderr
+# written" branch unexercised (#3701 review, P2).
 # ⛔ WHAT CAN ACTUALLY REFUSE THIS CALL (#3701 review, P2 — measured, not assumed). `gh api rate_limit`
 # IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it and the CORE floor is gated behind
 # `reaches_api`, so `gh-limit: gh-core-floor …` can NEVER appear on this probe's stderr — it comes from
-# the CORE reads the same pass makes. The reachable local refusal is one layer DOWN,
-# `scripts/gh-shim/gh:1874`: a shared cooldown window that outlives its own wait budget exits 75 with
-# `gh-contended — a shared gh throttle window outlived this call's …ms wait budget and no exempt quota
-# read cleared it (a burst/concurrency window is never discharged by one)`. So the arms below feed the
-# SHIM's string, not a floor line production cannot emit here.
+# the CORE reads the same pass makes.
+# ⛔ AND THE DEFAULT SHAPE IS THE PROBE'S OWN BOUND, NOT A 75 (#3701 review round 2, P2).
+# `scripts/gh-shim/gh`'s `wait_for_cooldown` sleeps out `AGENT_GH_GATE_WAIT_BUDGET` (default 120 s)
+# before it exits 75 with `gh-contended`; this probe bounds the same call at `GH_PROBE_TIMEOUT`
+# (default 20 s) and kills its process group, so what an operator actually sees at default knobs is
+# the TIMEOUT arm. `(g5)` drives THAT shape with a real sleep; `(g)` drives the 75 verdict contract,
+# which is reachable when the wait budget is set below the probe bound.
 mk_gh_budget_stub() {
-  local D="$1" rc="$2" line="$3"
+  local D="$1" rc="$2" line="$3" nap="${4:-0}"
+  case "$nap" in ''|*[!0-9]*) nap=0 ;; esac
   cat > "$D/bin/gh" <<SH
 #!/bin/bash
 case "\$1 \$2" in
   "auth token") exit 0 ;;
-  *" rate_limit"*) [ -z "$line" ] || printf '%s\\n' "$line" >&2; exit $rc ;;
+  *" rate_limit"*) [ "$nap" -le 0 ] || sleep "$nap"; [ -z "$line" ] || printf '%s\\n' "$line" >&2; exit $rc ;;
   *) printf '[]\\n' ;;
 esac
 SH
@@ -1005,6 +1013,37 @@ ck "(g4) …and the empty capture is NAMED as such, not rendered as an empty par
    "$(case "$G75_WHY" in *'no stderr written'*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(g4) …and it still claims no quota exhaustion" \
    "$(case "$G75_WHY" in *'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ (g5) THE DEFAULT SHAPE IS THE PROBE'S OWN BOUND, NOT A 75 (#3701 review round 2, P2).
+# `scripts/gh-shim/gh`'s `wait_for_cooldown` sleeps out `AGENT_GH_GATE_WAIT_BUDGET` (default 120 s)
+# before returning 75, while this probe bounds the same call at `GH_PROBE_TIMEOUT` (default 20 s) and
+# kills its process group. So on an untouched box a shared throttle window reaches the record through
+# the TIMEOUT arm. The stub really sleeps here (`GH_PROBE_TIMEOUT=1` makes the bound fire in a second),
+# because a fixture that returned instantly would not exercise the arm the bound produces.
+mk_case gh_bound
+mk_gh_budget_stub "$D" 1 'gh: could not reach GitHub' 5
+rp "$D" "" GH_PROBE_TIMEOUT=1
+GB_WHY="$(rec why)"
+ck "(g5) a probe killed by its own bound is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g5) …and the record names a NON-ANSWER, not a cause" \
+   "$(case "$GB_WHY" in *'NON-ANSWER'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ THE OVER-CLAIM THIS ROW EXISTS FOR: the arm once said "not a spent budget", which a shim sleeping
+# out a shared throttle window falsifies — that IS the budget being slept out.
+ck "(g5) …and claims NOTHING about the budget, in either direction" \
+   "$(case "$GB_WHY" in *'spent budget'*|*'nothing was sent'*|*'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ (g6) THE OTHER DEFAULT SHAPE — rc=1/403 with a REAL rate-limit stderr, which is the arm #3584's own
+# measured scenario took (`API rate limit exceeded for user ID …`). Without this row, deleting the
+# `$(gh_probe_evidence "$prc")` interpolation from that arm left every other arm green.
+mk_case gh_default
+mk_gh_budget_stub "$D" 1 'gh: HTTP 403: API rate limit exceeded for user ID 81560491'
+rp "$D"
+GD_WHY="$(rec why)"
+ck "(g6) the default failing arm is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g6) …and the record QUOTES the measured refusal verbatim" \
+   "$(case "$GD_WHY" in *'API rate limit exceeded for user ID 81560491'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g6) …and still names the precondition rather than pointing at the log" \
+   "$(case "$GD_WHY" in *'refusal line above names which one'*) echo 1 ;; *'question='*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g6) …and does NOT reuse another arm's verdict (no REJECTED, no NON-ANSWER)" \
+   "$(case "$GD_WHY" in *'REJECTED'*|*'NON-ANSWER'*) echo 1 ;; *) echo 0 ;; esac)"
 
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here
