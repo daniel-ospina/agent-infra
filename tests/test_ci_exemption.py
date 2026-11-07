@@ -910,7 +910,7 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
 #
 # MEASURED 2026-11-07 on tortoise PR #11362 (run 42340742360): six ids blocked,
 # every one of this shape, each with a REAL main row printed in the same verdict
-# as `NOTE : rejected main rate row: …[tools/cache_evict.py]\t3\t26`, while the
+# as `NOTE  : rejected main rate row: …[tools/cache_evict.py]\t3\t26`, while the
 # same ids were failing on main's own run 42320870743. The chain that matters:
 # `tests/test_entry_point_python_guard.py` parametrizes over `tools/**/*.py`, so
 # an ENTIRE FILE of the census can never be exempted — and while main is red with
@@ -1139,61 +1139,92 @@ def test_the_ROTATION_reader_still_accepts_the_PRE_3686_space_joined_form():
     assert runs == [frozenset({"tests/a.py::t1", "tests/a.py::t2"})]
 
 
-def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format():
+def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format(tmp_path):
     """The cross-language half: the SHIPPED producer, executed, not quoted.
 
     `parse_rotation_runs` is pinned above by behaviour, but nothing there stops
     `ci-failure-set.sh` from reverting to a space join — two languages, one wire
     format, and the Python suite is the part every change runs. So this leg reads
-    the producer's own awk program OUT OF THE SCRIPT and executes it, which pins
+    the producer's own STATEMENTS OUT OF THE SCRIPT and executes them, which pins
     the script's real text with no second copy to drift.
+
+    ⛔ THE WHOLE STATEMENT IS BOUND, NOT THE PIECE THAT LOOKS INTERESTING (review
+    cycle 3, P1). The first two versions extracted the `awk …'{…}'` PROGRAM and the
+    INNER `$(…)` substitution respectively — so a filter appended AFTER either one
+    was outside both the assertion and the execution, and the pin stayed green:
+    `| sed '\t40$//'` deletes the runs column (every rate row then fails to parse,
+    a permanent BLOCK for every PR), and `| sed 's/\t$//'` makes a single spacey id
+    emit a TAB-FREE per-run line (the reader takes its legacy fallback, the id
+    shreds, and E5 EXEMPTS a rotating identity), each with a zero-red suite. An
+    enforcer that cannot see the edit it advertises is inert, so both statements
+    are now bound END TO END and RUN with their own redirection/stream.
     """
     src = (Path(__file__).resolve().parent.parent / "scripts" / "ci-failure-set.sh").read_text()
+    lines = src.splitlines()
 
     # (1) the RATE table: the id must reach the reader byte-for-byte.
-    prog = re.search(r'awk -v k="\$tested" \'(\{ c = \$1;.*?\})\'', src)
-    assert prog, "the rate-table awk program moved — update this pin"
-    nodeid = "tests/test_pages_bindings.py::t[a  b]"
-    proc = subprocess.run(
-        ["awk", "-v", "k=40", prog.group(1)],
-        input=f"      3 {nodeid}\n", capture_output=True, text=True, check=True,
+    heads = [i for i, ln in enumerate(lines) if 'sort "$tmp_all" | uniq -c' in ln]
+    assert len(heads) == 1, (
+        "the rate-table pipeline moved (or was duplicated) — update this pin: "
+        f"{len(heads)} site(s) found"
     )
-    assert proc.stdout == f"{nodeid}\t3\t40\n", (
-        "the rate-table builder RE-KEYED the id (awk rebuilt $0 from its fields, "
-        f"collapsing interior spacing): {proc.stdout!r}"
-    )
-    assert '$1 = ""' not in prog.group(1), (
+    end = heads[0]
+    while lines[end].rstrip().endswith("\\"):
+        end += 1
+    rate_stmt = "\n".join(ln.strip() for ln in lines[heads[0]:end + 1])
+    assert '$1 = ""' not in rate_stmt, (
         "field assignment rebuilds $0 and collapses runs of spaces — the #3686 "
         "second door's silent re-keying"
     )
+    nodeid = "tests/test_pages_bindings.py::t[a  b]"
+    fixture = tmp_path / "ids"
+    fixture.write_text(f"{nodeid}\n{nodeid}\n{nodeid}\n")
+    rate = subprocess.run(
+        ["bash", "-c", 'tmp_all="$1"; tested=40; ' + rate_stmt, "_", str(fixture)],
+        capture_output=True, text=True,
+    )
+    assert rate.returncode == 0, (
+        f"the shipped rate-table statement no longer runs: {rate.stderr!r}"
+    )
+    assert rate.stdout == f"{nodeid}\t3\t40\n", (
+        "the rate-table builder RE-KEYED the id (awk rebuilt $0 from its fields, "
+        "collapsing interior spacing) or a filter was appended to the statement: "
+        f"{rate.stdout!r}"
+    )
 
-    # (2) the per-run sets: TAB-joined, never space-joined — and ⛔ THE INVARIANT IS
-    # EXECUTED, NOT MERELY GREPPED (review cycle 2, P2). The first version asserted the
-    # `tr '\n' '\t'` text and the absence of the space join, and stayed GREEN under the
-    # tidy-up a future reader is most likely to make — appending `| sed 's/\t$//'`, the
-    # mirror of the trailing-space cleanup the OLD form carried. Under it, a run whose
-    # only failing id carries a space emits a TAB-FREE line, `parse_rotation_runs` takes
-    # its legacy fallback, the id is shredded, and E5 EXEMPTS a rotating identity — the
-    # fail-open this whole change exists to prevent, reachable with a zero-red suite.
-    # So the shipped pipeline is BOUND to its text and then RUN.
-    assert "tr '\\n' '\\t'" in src, "the per-run producer is no longer TAB-joined"
+    # (2) the per-run sets: TAB-joined, never space-joined.
     assert src.count("| tr '\\n' ' '") == 0, (
         "a per-run write is SPACE-joined again — a space-parametrized id would be "
         "shredded and E5 blinded"
     )
-    join = "printf '%s\\n' \"$(printf '%s\\n' \"$ids\" | tr '\\n' '\\t')\""
-    assert join in src, (
-        "the per-run TAB join moved or was rewritten — this pin executes the script's "
-        "own pipeline text, so update it here in the same change"
+    writes = [ln.strip() for ln in lines if "per_run" in ln and "tr '\\n' '\\t'" in ln]
+    assert len(writes) == 2, (
+        "the two per-run write sites moved — update this pin: "
+        f"{len(writes)} site(s) found"
     )
+    assert len(set(writes)) == 1, (
+        "the two per-run write sites DIVERGED, so one of them is unpinned: "
+        f"{sorted(set(writes))!r}"
+    )
+    stmt = writes[0]
+    tail = '>> "$per_run"'
+    assert stmt.endswith(tail), (
+        "the per-run write no longer ENDS with its redirection, so this pin cannot "
+        "bind the whole statement (that is how cycle 2's pin went inert): "
+        f"{stmt!r}"
+    )
+    body = stmt[: -len(tail)].rstrip()
     single = "tests/test_x.py::TestK::t[argv14-at the EDGE]"
-    emitted = subprocess.run(
-        ["bash", "-c", 'ids="$1"; ' + join, "_", single],
+    dest = tmp_path / "per-run"
+    subprocess.run(
+        ["bash", "-c", 'ids="$1"; ' + body + ' > "$2"', "_", single, str(dest)],
         capture_output=True, text=True, check=True,
-    ).stdout
-    assert "\t" in emitted.rstrip("\n"), (
-        "a SINGLE-id run emitted a TAB-FREE line, so the reader takes its legacy "
-        "space-split path and shreds a spacey id — E5 goes blind (the reading above)"
+    )
+    emitted = dest.read_text()
+    assert emitted == f"{single}\t\n", (
+        "a SINGLE-id run no longer emits a TAB-bearing line, so the reader takes its "
+        "legacy space-split path and shreds a spacey id — E5 goes blind: "
+        f"{emitted!r}"
     )
     assert parse_rotation_runs(emitted) == [frozenset({single})], (
         "the shipped producer's per-run line does not round-trip through the reader: "
