@@ -566,43 +566,116 @@ function expandExpr(str: string): string {
  * Merge the hub's BASE layer with a repo's DELTA — **per server, then PER FIELD**: the repo wins
  * every field it sets and inherits every field it omits.
  *
- * ⛔ A NAME-LEVEL REPLACEMENT WAS THE BUG (#3614 review). Spreading at the server-name level made an
- * override entry a whole-entry REPLACEMENT, so the two shapes this codebase and its own docs invite
- * both destroyed the base entry:
+ * ⛔ A NAME-LEVEL REPLACEMENT WAS THE FIRST BUG (#3614 review). Spreading at the server-name level
+ * made an override entry a whole-entry REPLACEMENT, so `{"tortoise": {"timeoutMs": 40000}}` — the
+ * recovery hint this file prints — produced an entry with no `command` and no `url` and made the
+ * server permanently unspawnable, and `{"tortoise": {"url": …}}` dropped `lazy: true`, making a
+ * hosted server EAGER at every session start on memory-constrained cells.
  *
- *   {"tortoise": {"url": "http://localhost:8000/mcp"}}   ← docs/quickstart-selfhosted.md's instruction
- *     name-level  → {url} — `headers` (the Authorization bearer) GONE → 401, and `lazy: true` GONE
- *                   → the server is attempted EAGERLY at every session start on memory-constrained
- *                   cells, which the base entry's own `_comment` records as a fleet-wide failure.
- *   {"tortoise": {"timeoutMs": 40000}}                  ← the recovery hint at connectAll's failure log
- *     name-level  → {timeoutMs} — no `command`, no `url` → "has neither 'command' nor 'url'",
- *                   permanently unspawnable, and the `mcp_load` in the same message fails too.
+ * ⛔ BUT A NAIVE PER-FIELD SPREAD IS WORSE, IN TWO WAYS THIS FUNCTION NOW GUARDS AGAINST.
  *
- * Field-level merge matches the platform's own documented precedence for a project entry over a
- * user-level one — it "keeps the rest, including env, headers, and auth" (pi `docs/mcp.md`). The
- * recorded decision in #3612 is about PRECEDENCE (the repo wins), not granularity; this does not
- * reverse it, it makes "DELTA" true at the level an operator actually edits.
+ * 1. **CREDENTIALS MUST NEVER TRAVEL TO A REPO-CHOSEN DESTINATION.** `.mcp.json` is a TRACKED file,
+ *    modifiable by any PR and present in any cloned repo. Inheriting `headers` into a repo entry that
+ *    changes `url` hands the fleet's bearer token to whatever that file names (measured: a repo entry
+ *    `{"url": "http://127.0.0.1:PORT/collect"}` received `Authorization: Bearer <the real key>`);
+ *    inheriting `env` into an entry that changes `command` hands `GEMINI_API_KEY` &c. to a
+ *    repo-chosen process. So base `headers`/`oauth` are inherited ONLY when the destination is
+ *    unchanged, and base `env` ONLY when the command is unchanged. A repo that wants auth at a new
+ *    destination restates it — an explicit, reviewable line, rather than a silent inheritance.
  *
- * The base must never shadow what a repo declares: it is spread FIRST, so every field the repo sets
- * wins — the base is machine-local, and letting it override a repo would make one box's config
- * change what a checked-out repo means.
+ * 2. **TRANSPORT IS ATOMIC.** `connectServer` tests `url` BEFORE `command`, so a merged entry
+ *    carrying both silently ignores the repo's `command` (measured: a repo switching the base's
+ *    hosted server to its own stdio daemon kept talking to the base URL, with no warning). Base
+ *    fields of the OTHER transport are therefore dropped when the repo declares one, and an entry
+ *    declaring both is ambiguous, so it is refused with a warning rather than guessed at.
  *
- * Pure and exported so the ordering is pinned by a test rather than by reading a spread.
+ * ⛔ OVERRIDES: pi's replace-on-transport rule for a project entry — `docs/mcp.md` says "A project
+ * entry replaces a user-level entry with the same name", and its "keeps the rest, including env,
+ * headers, and auth" carve-out is scoped to entries that define NO `command`/`url`/`type` — a fleet
+ * base layer is machine-local and never ships, and repos legitimately delta one field of it, so the
+ * merge is per field with the two guards above instead of a wholesale replacement. Because that is a
+ * deliberate departure from the platform default, it is stated here rather than presented as
+ * convergence; a reader holding `docs/mcp.md` must not "correct" this back without reading why.
+ *
+ * Pure and exported so the ordering and the guards are pinned by tests rather than by reading a spread.
  */
+
+/** Fields that only mean anything for an HTTP transport (dropped when a repo declares stdio). */
+const HTTP_TRANSPORT_FIELDS = ["url", "headers", "oauth", "type"] as const;
+/** Of those, the ones that carry a SECRET, so may not follow a repo to a new destination. */
+const HTTP_CREDENTIAL_FIELDS = ["headers", "oauth"] as const;
+/** Fields that only mean anything for a stdio transport (dropped when a repo declares HTTP). */
+const STDIO_TRANSPORT_FIELDS = ["command", "args", "env", "cwd"] as const;
+/** Of those, the one that carries secrets destined for a spawned process. */
+const STDIO_CREDENTIAL_FIELDS = ["env"] as const;
+
+function isServerEntry(value: unknown): value is McpServerConfig {
+  return !!value && typeof value === "object" && !Array.isArray(value);
+}
+
+/** Does this entry DECLARE the named transport? A placeholder-expanded value still counts. */
+function declares(entry: McpServerConfig, field: "url" | "command"): boolean {
+  const value = field === "url" ? entry.url : entry.command;
+  return typeof value === "string" && value.length > 0;
+}
+
+function same(value: unknown, other: unknown): boolean {
+  return typeof value === "string" && value === other;
+}
+
 export function mergeMcpLayers(
   base: McpJson | null,
   repo: McpJson | null,
 ): Record<string, McpServerConfig> {
   const merged: Record<string, McpServerConfig> = {};
-  for (const layer of [base, repo]) {
-    for (const [name, entry] of Object.entries(layer?.mcpServers ?? {})) {
-      // A non-object entry is not a server, and it must not reach classifyServers, which reads
-      // `cfg.lazy` and would throw out of the extension factory — killing the whole session with no
-      // file or entry named (`{"mcpServers": {"tortoise": null}}` did exactly that). `asMcpJson`
-      // already reports these; this is the belt for a caller that hands the merge raw JSON.
-      if (!entry || typeof entry !== "object" || Array.isArray(entry)) continue;
-      merged[name] = { ...(merged[name] ?? {}), ...(entry as McpServerConfig) };
+  const baseServers = (base?.mcpServers ?? {}) as Record<string, unknown>;
+  const repoServers = (repo?.mcpServers ?? {}) as Record<string, unknown>;
+
+  for (const [name, entry] of Object.entries(baseServers)) {
+    // A non-object entry is not a server, and it must not reach classifyServers, which reads
+    // `cfg.lazy` and would throw out of the extension factory — killing the whole session with no
+    // file or entry named (`{"mcpServers": {"tortoise": null}}` did exactly that). `asMcpJson`
+    // already reports these; this is the belt for a caller that hands the merge raw JSON.
+    if (!isServerEntry(entry)) continue;
+    merged[name] = { ...entry };
+  }
+
+  for (const [name, entry] of Object.entries(repoServers)) {
+    if (!isServerEntry(entry)) continue;
+    const inherited = merged[name];
+    if (!inherited) {
+      merged[name] = { ...entry };
+      continue;
     }
+
+    const repoDeclaresHttp = declares(entry, "url");
+    const repoDeclaresStdio = declares(entry, "command");
+    if (repoDeclaresHttp && repoDeclaresStdio) {
+      // Two transports in one entry is ambiguous, not a delta. Guessing would silently pick `url`
+      // (connectServer tests it first) and ignore the command the operator actually wrote.
+      console.log(
+        `[mcp-client] WARN: repo entry "${name}" declares BOTH "url" and "command" — the entry is ` +
+          `ambiguous, so it is IGNORED. Declare one transport; a repo cannot remove the base's other one.`
+      );
+      delete merged[name];
+      continue;
+    }
+
+    const carry = { ...inherited } as Record<string, unknown>;
+    if (repoDeclaresHttp) {
+      for (const field of STDIO_TRANSPORT_FIELDS) delete carry[field];
+      // Credentials follow the SERVER, not the URL: only inherit them when the destination is the
+      // one they were issued for.
+      if (!same(inherited.url, entry.url)) {
+        for (const field of HTTP_CREDENTIAL_FIELDS) delete carry[field];
+      }
+    } else if (repoDeclaresStdio) {
+      for (const field of HTTP_TRANSPORT_FIELDS) delete carry[field];
+      if (!same(inherited.command, entry.command)) {
+        for (const field of STDIO_CREDENTIAL_FIELDS) delete carry[field];
+      }
+    }
+    merged[name] = { ...carry, ...entry };
   }
   return merged;
 }
@@ -621,10 +694,17 @@ export function mergeMcpLayers(
  * factory, which ends the session with no file, entry or cause named.
  *
  * Non-`mcpServers` top-level keys are preserved — the caller spreads them as the layer's own config.
+ * A layer that OMITS `mcpServers` therefore still contributes its keys (it simply declares no
+ * servers); only a layer whose `mcpServers` is PRESENT but not an object is refused.
  */
 function asMcpJson(value: unknown, label: string): McpJson | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const rawServers = (value as { mcpServers?: unknown }).mcpServers;
+  if (rawServers === undefined) {
+    // No `mcpServers` is not a BROKEN layer — it is a layer with no servers. Rejecting it dropped the
+    // whole file, so its top-level keys vanished and the log called a valid config unusable.
+    return { ...(value as Record<string, unknown>), mcpServers: {} } as McpJson;
+  }
   if (!rawServers || typeof rawServers !== "object" || Array.isArray(rawServers)) return null;
 
   const servers: Record<string, McpServerConfig> = {};

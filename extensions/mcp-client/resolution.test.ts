@@ -324,11 +324,12 @@ await test("a repo entry of the SAME name wins; the base's other servers survive
   ok(merged.onlyBase, "and the base's other servers are not lost");
 });
 
-await test("PER FIELD: an override that sets only `url` KEEPS the base's headers/lazy/timeoutMs", () => {
-  // This is the shape `docs/quickstart-selfhosted.md` tells a self-host user to write, and the shape
-  // the connect-failure log recommends for a slow start. A name-level spread dropped the auth header
-  // (→ 401) and `lazy: true` (→ an EAGER connect at every session start on memory-constrained cells)
-  // or left the entry with no `command`/`url` at all (→ permanently unspawnable).
+await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER carries the base's credentials", () => {
+  // The shape `docs/quickstart-selfhosted.md` tells a self-host user to write. `lazy` and `timeoutMs`
+  // must be inherited (a name-level spread dropped them → an EAGER connect at every session start on
+  // memory-constrained cells, the failure the base entry's own `_comment` records). The base's
+  // `headers` must NOT be: `.mcp.json` is a TRACKED file, so inheriting a bearer token into a
+  // repo-chosen URL hands the fleet's key to whatever that file names.
   const merged = mergeMcpLayers(
     {
       mcpServers: {
@@ -345,31 +346,87 @@ await test("PER FIELD: an override that sets only `url` KEEPS the base's headers
   );
   const t = merged.tortoise as Record<string, unknown> | undefined;
   equal(t?.url, "http://localhost:8000/mcp", "the field the repo DID set wins");
-  deepEqual(t?.headers, { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" },
-    "the inheriting header survives — without it the client sends an empty bearer and gets 401");
-  equal(t?.type, "http", "`type` is inherited, so the entry stays a valid http server");
+  equal(t?.headers, undefined,
+    "the base's Authorization header must NOT follow a repo to a new URL — restating it is the repo's call");
   equal(t?.lazy, true, "`lazy` is inherited — dropping it makes a hosted server EAGER on every cell");
   equal(t?.timeoutMs, 60000, "`timeoutMs` is inherited");
 });
 
-await test("PER FIELD: a `timeoutMs`-only override still has a url, so the server stays spawnable", () => {
+await test("a repo that restates `headers` alongside its own `url` gets exactly those headers", () => {
   const merged = mergeMcpLayers(
-    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", timeoutMs: 60000 } } } as never,
+    { mcpServers: { tortoise: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" } } } } as never,
+    { mcpServers: { tortoise: { url: "https://self.example/mcp", headers: { Authorization: "Bearer ${LOCAL_KEY}" } } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  deepEqual(t?.headers, { Authorization: "Bearer ${LOCAL_KEY}" }, "an explicit header wins outright");
+});
+
+await test("an UNCHANGED url still inherits the base's credentials (a pure delta keeps auth)", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+    { mcpServers: { tortoise: { lazy: false } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.lazy, false, "the repo's toggle wins");
+  deepEqual(t?.headers, { Authorization: "Bearer K" },
+    "the destination is unchanged, so the credentials issued for it still apply");
+});
+
+await test("TRANSPORT IS ATOMIC: a repo `command` drops the base's url AND its credentials", () => {
+  // connectServer tests `url` BEFORE `command`, so a merged entry carrying both silently ignored the
+  // repo's stdio daemon and kept talking to the base endpoint — with no warning.
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, lazy: true } } } as never,
+    { mcpServers: { tortoise: { command: "/usr/bin/python3", args: ["-m", "tortoise.mcp_server"] } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.command, "/usr/bin/python3", "the repo's transport is the one that runs");
+  equal(t?.url, undefined, "the base url must not survive — it would win at connectServer's `if (config.url)`");
+  equal(t?.headers, undefined, "nor may its credentials");
+  equal(t?.lazy, true, "non-transport metadata is still inherited");
+});
+
+await test("TRANSPORT IS ATOMIC: a repo `url` drops the base's command/args/env/cwd", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { command: "/usr/bin/python3", args: ["-m", "x"], env: { SECRET: "s" }, cwd: "/tmp" } } } as never,
+    { mcpServers: { t: { url: "https://self.example/mcp" } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  const entry = merged.t as Record<string, unknown> | undefined;
+  equal(entry?.url, "https://self.example/mcp");
+  for (const field of ["command", "args", "env", "cwd"]) {
+    equal(entry?.[field], undefined, `stdio field ${field} must not survive an HTTP override`);
+  }
+});
+
+await test("an entry declaring BOTH transports is REFUSED, not guessed at", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { t: { url: "https://api.premiselabs.co/mcp/" } } } as never,
+    { mcpServers: { t: { url: "https://self.example/mcp", command: "/bin/sh" } } } as never,
+  );
+  ok(!("t" in merged), "an ambiguous entry is dropped rather than silently resolved to `url`");
+});
+
+await test("a `timeoutMs`-only override keeps EVERY field it did not set, so the server stays spawnable", () => {
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { type: "http", url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer K" }, timeoutMs: 60000 } } } as never,
     { mcpServers: { tortoise: { timeoutMs: 40000 } } } as never,
   );
   const t = merged.tortoise as Record<string, unknown> | undefined;
   equal(t?.timeoutMs, 40000, "the raised budget applies");
   equal(t?.url, "https://api.premiselabs.co/mcp/", "and the url survives — otherwise: neither 'command' nor 'url'");
+  deepEqual(t?.headers, { Authorization: "Bearer K" }, "the destination is unchanged, so auth survives");
 });
 
-await test("a non-object server entry is dropped, never handed to classifyServers", () => {
+await test("a non-object server entry is dropped from EITHER layer, never handed to classifyServers", () => {
   const merged = mergeMcpLayers(
-    { mcpServers: { tortoise: { url: "https://x/mcp" } } } as never,
+    { mcpServers: { tortoise: { url: "https://x/mcp" }, baseGhost: null } } as never,
     { mcpServers: { tortoise: null, ghost: 42 } } as never,
   );
   equal((merged.tortoise as Record<string, unknown> | undefined)?.url, "https://x/mcp",
     "a null override is not an override — the base entry stands, and nothing throws");
-  ok(!("ghost" in merged), "a scalar entry is not a server");
+  ok(!("ghost" in merged), "a scalar entry from the repo layer is not a server");
+  ok(!("baseGhost" in merged), "nor is one from the BASE layer — both loops are guarded");
 });
 
 await test("base ONLY still resolves (the old fallback path, preserved)", () => {
@@ -533,6 +590,37 @@ await test("a `null` server ENTRY does not crash the session — it is dropped, 
   ok(
     logs.some(l => l.includes("WARN") && l.includes('entry "tortoise"') && l.includes("dropped")),
     `a dropped entry must be named, and say removal is impossible — got:\n${logs.join("\n")}`
+  );
+});
+
+await test("a layer with NO `mcpServers` key is a valid layer — its top-level keys survive", async () => {
+  // Rejecting it dropped the whole file: its keys vanished and the log called a valid config
+  // unusable. A layer that declares no servers is not a broken layer.
+  const repoDir = tempDir("mcp-bind-noservers-repo-");
+  const homeDir = tempDir("mcp-bind-noservers-home-");
+  mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+  writeJson(repoDir, ".mcp.json", { autoEnableCodemode: false, _comment: "no servers here" });
+  writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
+    mcpServers: { baseOnly: { command: "b", lazy: true } },
+  });
+
+  const manager = new McpServerManager();
+  const logs = await withCapturedLogs(() =>
+    manager.connectAllLayers({
+      base: join(homeDir, ".pi", "agent", ".mcp.json"),
+      repo: join(repoDir, ".mcp.json"),
+    })
+  );
+
+  const cfg = (manager as unknown as { config: Record<string, unknown> }).config;
+  equal(cfg.autoEnableCodemode, false, "a repo layer's top-level key must not be amputated");
+  ok(
+    (cfg.mcpServers as Record<string, unknown>).baseOnly,
+    "and the base's servers still apply"
+  );
+  ok(
+    !logs.some(l => l.includes("WARN") && l.includes("repo layer")),
+    `a layer that simply declares no servers must not be reported as broken — got:\n${logs.join("\n")}`
   );
 });
 
