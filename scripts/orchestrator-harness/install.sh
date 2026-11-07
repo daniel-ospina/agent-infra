@@ -1200,6 +1200,13 @@ ok "pinned scripts parse ($HARNESS)"
 #     name both — because rendering `$HARNESS/orch-loop.sh` here would silently delete the TCC wrapper,
 #     and silently rendering the home copy is the divergence this whole change exists to end.
 # `HARNESS_ENTRY=<name>` is the deliberate override (a name INSIDE the pinned tree, never a path).
+# ⛔ THE OVERRIDE MUST REACH launchd, NOT JUST THE INSTALLER (#3243 review cycle-2, F3): the stub reads
+# `ORCH_ENTRY` from its OWN environment, and launchd supplies that environment from the plist — never
+# from this shell. So the override is remembered here and RENDERED into the job (only when the operator
+# supplied it; otherwise it is empty and the stub's own preference applies). Without this the install-time
+# probe validated one entrypoint while launchd ran another, and `HARNESS_ENTRY=orch-loop.sh` could not
+# install at all on a box whose pin carries `launchd-controller.sh`.
+HARNESS_ENTRY_EXPLICIT="${HARNESS_ENTRY:-}"
 HARNESS_ENTRY="${HARNESS_ENTRY:-}"
 if [ -z "$HARNESS_ENTRY" ]; then
   if [ -f "$HARNESS/launchd-controller.sh" ]; then HARNESS_ENTRY="launchd-controller.sh"
@@ -1482,6 +1489,7 @@ sed \
   -e "s|__HARNESS__|$(esc "$HARNESS")|g" \
   -e "s|__PROGRAM__|$(esc "$STABLE_PROG")|g" \
   -e "s|__ENTRY__|$(esc "$HARNESS_ENTRY")|g" \
+  -e "s|__ORCH_ENTRY__|$(esc "$HARNESS_ENTRY_EXPLICIT")|g" \
   -e "s|__HARNESS_PIN__|$(esc "$HARNESS_PIN")|g" \
   -e "s|__HARNESS_PIN_FILE__|$(esc "$HARNESS_PIN_FILE")|g" \
   -e "s|__HARNESS_PIN_DIR__|$(esc "$HARNESS_PIN_DIR")|g" \
@@ -1563,8 +1571,14 @@ esac
 # silence", the guard's own failure path was silent. `|| _PIN_EXEC_RESOLVED=""` makes the rc=0 path
 # of the substitution irrelevant and lets the refusal run; stderr is CAPTURED, not discarded, so the
 # resolver's `PIN-EXEC: DEAD-SUPERVISOR:` line reaches the operator in the message.
+# ⛔ AND THE PROBE CARRIES THE RENDERED `ORCH_ENTRY` (#3243 review cycle-2, F3): the plist renders the
+# operator's `HARNESS_ENTRY` into the job's environment, and the stub selects the controller from that
+# variable — so a probe run WITHOUT it validates a different entrypoint than launchd will exec, and an
+# explicit `HARNESS_ENTRY=orch-loop.sh` on a pin that also carries `launchd-controller.sh` is refused
+# (a false block on the documented override). Same value here as in the render, or the check is about
+# a program the box will never run.
 _PIN_EXEC_ERR="$RENDER.pinerr"
-_PIN_EXEC_RESOLVED="$(/bin/bash "$STABLE_PROG" --resolve-only 2>"$_PIN_EXEC_ERR")" || _PIN_EXEC_RESOLVED=""
+_PIN_EXEC_RESOLVED="$(ORCH_ENTRY="$HARNESS_ENTRY_EXPLICIT" /bin/bash "$STABLE_PROG" --resolve-only 2>"$_PIN_EXEC_ERR")" || _PIN_EXEC_RESOLVED=""
 _PIN_EXEC_WHY="$(tr '\n' ' ' < "$_PIN_EXEC_ERR" 2>/dev/null || true)"
 rm -f "$_PIN_EXEC_ERR"
 if [ "$_PIN_EXEC_RESOLVED" != "$HARNESS/$HARNESS_ENTRY" ]; then
@@ -1706,6 +1720,10 @@ DRIFTED=""
 # this lane finish?"; a $O deployed without it makes every such caller import-fail, so it joins the
 # same union as the names above — this one from the #3382 branch, not from main.
 for f in orch-pin-exec.sh orch-loop.sh wt-lifecycle.sh launchd-controller.sh harness-refresh.sh rail-refusal.sh live-ownership.sh pr-owner-liveness.sh repo-slug.sh repo-target.sh claims.sh repo-authority.sh spawn-gate.sh gate-policy.sh lane-bound.sh cell-lane-preflight.sh reviewer-preflight.sh brief-gate.sh mandate-preflight.sh uv-env.sh dispatch-merge.sh lane.sh chain-merge.sh merge-one.sh fix-one.sh refresh-candidates.sh adopt-fix.sh nonblocking-dispatch.sh stall-fix.sh merged-not-closed.sh check-single-source.sh worker-terminal.sh ci-queue.sh check-class.py nochk-resolve.py nochk-guard.sh merge-reminder.py box-status.sh gh-rest/gh gh-limit.py lane-merge.sh lane_registry.py merge-rate.sh key-gate.sh lane-env.sh; do
+  # ⛔ A FILE THE PIN DOES NOT CARRY YET CANNOT BE "DRIFTED" FROM IT (#3243 review cycle-2, F2): on a box
+  # installing ON the commit that introduces `orch-pin-exec.sh`, every run warned that the stub it had
+  # just seeded "differs from the PINNED tree" — noise from a verdict about a file the pin does not have.
+  [ "$f" = "orch-pin-exec.sh" ] && [ ! -f "$SHIPPED/$f" ] && continue
   [ -f "$O/$f" ] || { DRIFTED="$DRIFTED $f(missing)"; continue; }
   diff -q "$SHIPPED/$f" "$O/$f" >/dev/null 2>&1 || DRIFTED="$DRIFTED $f"
 done
@@ -1992,7 +2010,7 @@ case "$ACTION" in
     # (seeded by this installer, above) and the pin's entrypoint (resolved now, exactly as launchd will).
     # A missing resolver bootstraps a job the fleet reads as `loaded` while it exits 127 forever.
     [ -f "$STABLE_PROG" ] || die "$STABLE_PROG is missing, and $LABEL now runs it — refusing to start a job that would exit 127 on every cycle. Re-run this installer to re-seed it."
-    _pin_prog="$(/bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)" || _pin_prog=""
+    _pin_prog="$(ORCH_ENTRY="$HARNESS_ENTRY_EXPLICIT" /bin/bash "$STABLE_PROG" --resolve-only 2>/dev/null)" || _pin_prog=""
     [ -n "$_pin_prog" ] && [ -f "$_pin_prog" ] || die "$LABEL's stable program $STABLE_PROG cannot resolve the pin's controller (got '${_pin_prog:-<nothing>}') — refusing to start a job that would exit 127 on every cycle. Check the pin record ($HARNESS_PIN_FILE) and re-run."
     [ -f "$O/launchd-controller.sh" ] || die "$O/launchd-controller.sh is missing, and the worker surface execs it — refusing to start a job that would exit 127 on every cycle. Sync the harness into \$O first: bash $(shq "$HERE/deploy-harness.sh") --src $(shq "$HERE") --o $(shq "$O")" ;;
 esac

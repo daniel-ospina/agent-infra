@@ -774,11 +774,15 @@ def l30_committer_acceptance():
     # ⛔ ONE DATUM, ONE ANSWER — in the field the bounded reap is MEASURED FROM (review round 18,
     # agent-infra#3203). `claims.sh`'s `_claim_commit_time` takes the LAST `committer `-prefixed header
     # line (`sed -n '/^committer /p' | tail -n 1`, round 24), parses THAT line with
-    # `sed -n 's/^committer .* \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — NOTHING may
-    # follow the tz digits — and then rejects a stamp longer than 12 digits as UNMEASURABLE
-    # (`case … |?????????????*`), which is what keeps `now - ct` out of a wrapped negative. This
-    # reader allowed `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and
-    # a fresh/aged stamp here.
+    # `sed -n 's/^committer .*>[[:blank:]]*\([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p'`
+    # — anchored on the LAST `>` (the IDENT's split point, NOT the first `<`…`>` span) plus git's own
+    # blank class, so the accepted stamp is the field git reads and a second `digits +dddd` tail cannot
+    # forge it (rounds 22, 27, 28; a bare `> ` abstains on `>  1 +0000`, `>1 +0000` and `>\t1 +0000`,
+    # which git dates 1 — the REAP-turned-HOLD that A93–A95 exist to pin) — NOTHING may follow the tz
+    # digits — and then rejects a stamp longer than 12 digits as UNMEASURABLE (`[ "${#ct}" -le 12 ]`, a
+    # separate arm), which is what keeps `now - ct` out of a wrapped negative. This reader allowed
+    # `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and a fresh/aged
+    # stamp here.
     def obj(headers, body="claim owner=c lease_until=9999999999 nonce=x"):
         # a commit object is `<headers>\n\n<body>`; `_commit_time` reads the header block only
         return "tree " + "0" * 39 + "\n" + headers + "\n\n" + body + "\n"
@@ -789,7 +793,7 @@ def l30_committer_acceptance():
         (ok + "\t", None),
         ("committer a <a@b> 17000000000 +0000", 17000000000),   # 11 digits: accepted by both
         ("committer a <a@b> 170000000000 +0000", 170000000000), # 12 digits: still accepted
-        ("committer a <a@b> 1700000000000 +0000", None),        # 13+ ⇒ `?????????????*`: UNMEASURABLE
+        ("committer a <a@b> 1700000000000 +0000", None),        # 13+ ⇒ `[ ${#ct} -le 12 ]`: UNMEASURABLE
         # ⛔ THE THIRD REJECTION ARM (review round 20): `_claim_commit_time` also rejects `0?*`, because a
         # leading-zero operand aborts `$(( now - ct ))` as OCTAL. Round 19 added the arm here and no case
         # pinned it — a mutant that deletes it left the whole suite green.
@@ -841,6 +845,69 @@ def l30_committer_acceptance():
     check(cl._commit_time(obj(forged)) is None,
           "a trailing token on the NEWEST committer header must not fall back to an older stamp "
           "(that is the forged-age steal); got %r" % (cl._commit_time(obj(forged)),))
+    # ⛔ AND THE SAME STEAL THROUGH A TOKEN THAT *PARSES* (review round 22, agent-infra#3203). The forged
+    # shape above only pins the FALLBACK. A greedy `.* ` accepted the LAST `digits [+-]dddd` pair ANYWHERE
+    # on the line, so a second such pair forged the same age by a different token: measured on the shipped
+    # pair, `committer a <a@b> <NOW> +0000 1 +0000` — a claim git dates at the current SECOND — answered `1`
+    # in BOTH layers, and the shell's reaper DELETED it as `1793991810s old, PAST the 18000s bound`. The
+    # pattern is now anchored on `> ` (the ident's end), so the accepted stamp is the field git reads and
+    # any other `digits [+-]dddd` tail is simply not a match (⇒ unmeasurable ⇒ KEPT and NAMED). The oracle
+    # side is A79-A81, which drive the same object through `claim_prune`.
+    field_forged = "committer a <a@b> 1793991810 +0000 1 +0000"
+    check(cl._commit_time(obj(field_forged)) is None,
+          "a SECOND 'digits +dddd' pair on the committer line must not become the stamp "
+          "(the greedy .* read it as '1', dating a 0-second-old claim as ancient); got %r"
+          % (cl._commit_time(obj(field_forged)),))
+    # ⛔ AND THE SAME STEAL THROUGH A SECOND `> ` — AND WHY THE ANSWER IS THE **VALUE**, NOT `None`
+    # (review round 27, agent-infra#3203). A round-27 finding claimed git reads the FIRST `<`…FIRST `>` span,
+    # so `... +0000 > 1 +0000` would be dated NOW by git and only this pattern would answer `1`. MEASURED on
+    # git 2.43.0 (`hash-object -w -t commit --literally` + `git log -1 --format=%ct`): git dates from the
+    # field after the **LAST** `>`, so BOTH shapes below are dated **1** by git — the pattern AGREES, and an
+    # anchor on the mail span answered `None`, i.e. it refused to measure an object git dates 1970. That is
+    # the PERMANENT-HOLD direction: `claim_prune` `continue`s on an unmeasurable age BEFORE the bound is
+    # compared, so a peer appending ` > 1 +0000` would hold its claim for ever (#3203 re-opened). The pin is
+    # therefore on the VALUE git answers, not on an abstention — the two readers must agree with git, not
+    # merely with each other.
+    greedy_forged = "committer a <a@b> 1793991810 +0000 > 1 +0000"
+    check(cl._commit_time(obj(greedy_forged)) == 1,
+          "a forged tail after the LAST '>' is dated 1 by git, so the reader must answer 1, not abstain "
+          "(an abstention here makes a git-ancient claim unreapable); got %r"
+          % (cl._commit_time(obj(greedy_forged)),))
+    greedy_forged_mail = "committer a <a@b> 1793991810 +0000 <c@d> 1 +0000"
+    check(cl._commit_time(obj(greedy_forged_mail)) == 1,
+          "a later '<c@d>' mail-shaped span is not a split point for git either; got %r"
+          % (cl._commit_time(obj(greedy_forged_mail)),))
+    # ...and the reverse sign: a forged LATER stamp after a `>` must be MEASURED as git measures it, so a
+    # peer cannot delay a reap by appending `> <fresh> +0000`. git answers the SAME value here.
+    reverse_sign = "committer a <a@b> 1 +0000 > 1793991810 +0000"
+    check(cl._commit_time(obj(reverse_sign)) == 1793991810,
+          "a forged later stamp after '> ' is the value git reads; got %r"
+          % (cl._commit_time(obj(reverse_sign)),))
+    # ...and a name legitimately carrying a forged-LOOKING token BEFORE the date field still measures.
+    name_with_tail = "committer a > 1 +0000 <a@b> 1793991810 +0000"
+    check(cl._commit_time(obj(name_with_tail)) == 1793991810,
+          "a name carrying '> 1 +0000' still measures the trailing stamp (git's answer); got %r"
+          % (cl._commit_time(obj(name_with_tail)),))
+    # ⛔ AND THE WHITESPACE AFTER THE SPLIT `>` (review round 28, agent-infra#3203). git does NOT require a
+    # space there — it skips whitespace before the date field — so zero, two, three spaces and a TAB all
+    # answer the SAME value. Measured (git 2.43.0, `hash-object -w -t commit --literally` + `git log -1
+    # --format=%ct`): `… > 1 +0000`, `… >  1 +0000`, `… >   1 +0000`, `… >\t1 +0000` and `… >1 +0000` are
+    # ALL dated 1. An anchor of `> ` (exactly one space) answered None on the others — the KEEP/HOLD
+    # direction — and for `>  1 +0000` the PREVIOUS bare-`.* ` pattern had measured git's own answer, so
+    # the narrowing was a REAP turned into a HOLD. `[ \t]*` mirrors the shell's `[[:blank:]]*`.
+    for _label, _line in (
+            ("two spaces", "committer a <a@b> 1793991810 +0000 >  1 +0000"),
+            ("three spaces", "committer a <a@b> 1793991810 +0000 >   1 +0000"),
+            ("a tab", "committer a <a@b> 1793991810 +0000 >\t1 +0000"),
+            ("no space", "committer a <a@b> 1793991810 +0000 >1 +0000")):
+        check(cl._commit_time(obj(_line)) == 1,
+              "a split '>' followed by %s is dated 1 by git, so the reader must answer 1, not abstain; "
+              "got %r" % (_label, cl._commit_time(obj(_line))))
+    # ...and the reverse sign with two spaces: a forged LATER stamp after `>  ` is still what git reads.
+    _rev_ws = "committer a <a@b> 1 +0000 >  1793991810 +0000"
+    check(cl._commit_time(obj(_rev_ws)) == 1793991810,
+          "a forged later stamp after '>' + two spaces is the value git reads; got %r"
+          % (cl._commit_time(obj(_rev_ws)),))
     no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
     check(cl._commit_time(no_blank) == 1700000000,
           "with NO blank line the shell prints the whole object, so the stamp is still found; got %r"
@@ -1884,12 +1951,18 @@ MUTATIONS = [
         "the snapshot fields are Unicode-trimmed, so a lease with a TRAILING separator becomes a pure "
         "digit string and reads as a real (expired) term \u2014 FREE",
     ),
+    # ⛔ THE ANCHOR IS THE SHIPPED LINE, VERBATIM. Rounds 22 and 28 rewrote `_COMMITTER_TIME_RE`
+    # (the `.*> ` field, then the `[ \t]*` blank class) and this mutation kept the pre-round-22
+    # spelling, so `--mutations` aborted here with "anchor not unique … (0 hits)" — every mutation
+    # AFTER this one went unexercised and CI's mutation step read RED. A mutation anchor is a copy of
+    # the shipped line: when the line moves, the anchor moves with it, or the evidence silently stops
+    # being collected.
     Mutation(
         "L30", "reader",
-        '_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}$", re.M)',
-        '_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}[ \\t]*$", re.M)',
-        "the committer stamp is accepted with trailing whitespace and any length, so an object the "
-        "oracle calls UNMEASURABLE is dated here and the bounded reap is measured from a guess",
+        '_COMMITTER_TIME_RE = re.compile(r"^committer .*>[ \\t]*([0-9]+) [+-][0-9]{4}$", re.M)',
+        '_COMMITTER_TIME_RE = re.compile(r"^committer .*>[ \\t]*([0-9]+) [+-][0-9]{4}[ \\t]*$", re.M)',
+        "the committer stamp is accepted with trailing whitespace, so an object the oracle calls "
+        "UNMEASURABLE is dated here and the bounded reap is measured from a guess",
     ),
     Mutation(
         "L30", "reader",

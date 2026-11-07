@@ -54,7 +54,9 @@ export const DISPATCH_RECORD_EXTENSION = "builtin-tools";
 export const DEFAULT_DISPATCH_CLASS = "task";
 
 /** The row contract. Every key is always present; unknown-at-settle values are
- * `null` (or `[]`), never omitted, so a reader destructures without branching.
+ * `null` (or `[]`), never omitted, so a reader destructures without branching
+ * — with ONE exception, `cwd`'s `""` (see its field doc: a string field has no
+ * `null` to say "unknown", and `""` must never be resolved as a path).
  * Fields may be ABSENT in rows written by OTHER versions — readers must
  * tolerate missing identity fields (the plan's tolerance rule). */
 export interface DispatchOutcomeRow {
@@ -84,7 +86,15 @@ export interface DispatchOutcomeRow {
    * now it is the resolved target, so a reader must not infer "the repo the
    * parent worked in" from it. PHYSICAL path (canonicalized where the target
    * exists) — it matches the child's own `getcwd()`. `branch`/`headSha`/
-   * `dirty`/`dirtyPaths` describe THIS directory, never the parent's. */
+   * `dirty`/`dirtyPaths` describe THIS directory, never the parent's.
+   *
+   * ⛔ `""` IS NOT A PATH. It is the #385 orphan-killed contract's value for
+   * "the cwd could not be resolved" — `process.cwd()` THROWS once the
+   * directory has been deleted, which is the reaped-worktree case the
+   * child-side settle exists for, and a string field has no `null` to carry
+   * unknown. Never `resolve`/`join` it: `path.resolve("")` is the READER's own
+   * directory, so a downstream consumer that treats it as a path invents a
+   * location rather than reporting an unknown one. */
   cwd: string;
   branch: string | null;
   headSha: string | null;
@@ -96,11 +106,21 @@ export interface DispatchOutcomeRow {
    * renderer had been corrected before; this aligns the row with it. */
   dirtyPaths: string[] | null;
   /** Why the attempt ended: "hard-cap" | "cut" | "backstop" | "failed" |
-   * the heartbeat `decision.reason`. */
+   * "orphan-killed" | the heartbeat `decision.reason`.
+   *
+   * `"orphan-killed"` is the ONE reason written by the CHILD rather than the
+   * parent: the #385 orphan watchdog fired because the parent disappeared, so
+   * no parent-side settle can ever happen and this row is the last word for
+   * the attempt. It is never `"done"` — a killed dispatch must not read as a
+   * completed one. */
   reason: string;
   toolAgeMaxMs: number | null;
   toolsInFlight: number | null;
-  everSawTool: boolean;
+  /** Did the child ever run a tool — `null` when the settle cannot know: the
+   * #385 orphan watchdog records a kill from inside a process that may have
+   * been mid-tool for an hour, and `false` there would be a confident claim it
+   * never touched one. Same rule as `dirty` (a failed probe is not `false`). */
+  everSawTool: boolean | null;
   /** Best-known locator for the child's transcript: the session `.jsonl` when
    * it already exists, else the child's session DIRECTORY (a zero-output kill
    * can beat the child's first write). `null` on the `--no-session` degrade. */
@@ -111,6 +131,17 @@ export interface DispatchOutcomeRow {
   /** Dispatch class — `"task"` (default) or a caller-declared reviewer/eval
    * class via `TASK_DISPATCH_CLASS`. */
   dispatchClass: string;
+  /** The pid whose DISAPPEARANCE caused this settle — the parent the child was
+   * orphaned from (`null` on every parent-side row, which settles itself and
+   * has no disappearance to attribute). */
+  parentPid: number | null;
+  /** Pids this settle ENUMERATED for the kill: the DIRECT descendant roots and,
+   * when this process leads its own group, the rest of that group. `[]` on
+   * parent-side rows (they record no kill). The kill recurses below these roots
+   * (`treeKill` walks children-first), so a depth-≥2 descendant is signalled
+   * without being NAMED here — the field is "what we enumerated", never a
+   * complete death list. Read it as attribution, not as a body count. */
+  killedPids: number[];
 }
 
 /** Everything the row needs that is NOT derivable inside the writer. */
@@ -131,10 +162,15 @@ export interface DispatchOutcomeInput {
   reason: string;
   toolAgeMaxMs: number | null;
   toolsInFlight: number | null;
-  everSawTool: boolean;
+  everSawTool: boolean | null;
   transcriptPath: string | null;
   exitCode: number | null;
   dispatchClass: string;
+  /** Optional: only a CHILD-side settle (the #385 orphan watchdog) knows the
+   * parent pid it was orphaned from. Absent → `null`. */
+  parentPid?: number | null;
+  /** Optional: only a CHILD-side settle signals a descendant tree. Absent → `[]`. */
+  killedPids?: number[];
 }
 
 /** Result of a write attempt. `skipped` means the gate was explicitly off —
@@ -266,6 +302,8 @@ export function buildDispatchOutcomeRow(
     transcriptPath: input.transcriptPath,
     exitCode: input.exitCode,
     dispatchClass: input.dispatchClass,
+    parentPid: input.parentPid ?? null,
+    killedPids: input.killedPids ?? [],
   };
 }
 
@@ -318,12 +356,54 @@ function readAppendedLines(file: string, from: number, to: number): unknown[] {
 }
 
 /**
+ * Does an appended line name EXACTLY the row we tried to write?
+ *
+ * Extracted so the predicate itself is a unit-test target rather than an
+ * inline closure nobody can falsify without a real write failure.
+ *
+ * ⛔ WHY THE FULL IDENTITY, AND WHY `childSessionId`/`parentPid`/`killedPids`/
+ * `ts` ARE PART OF IT. The confirmation is a read-back of a byte RANGE, so a
+ * concurrent sibling's line lands in the same window; matching too little
+ * makes a FAILED write read as `ok`. `event + dispatchId + attempt + reason`
+ * was sufficient while every row carried a fresh per-dispatch nonce and a
+ * per-leg ordinal. The #385 child-side settle is the first row class whose
+ * tuple DEGENERATES: `dispatchId`/`attempt` are inherited through the child's
+ * env and `reason` is the constant `orphan-killed`, while subagent-tool
+ * children are spawned `--no-session` (so `childSessionId` is null for all of
+ * them) under the SAME dispatcher pid (`parentPid` agrees too).
+ *
+ * ⛔ AND `killedPids` ALONE DOES NOT CLOSE IT (measured on this round's
+ * review): `[]` is the COMMON leaf case — the orphan suite's own log line
+ * prints `killed_pids=-` — so two sibling leaf orphans can still agree on
+ * every field above. `ts` is the discriminator that is free and exact: it is
+ * stamped per ROW by the builder, and `appendLedger` spreads the row AFTER its
+ * own `ts`, so the row's value is the one on the line. Residual: two rows
+ * built in the SAME millisecond are still indistinguishable by `ts` — an
+ * unresolvable tie in the data, not a matching gap.
+ */
+export function appendedLineNamesRow(
+  line: Record<string, unknown>,
+  row: DispatchOutcomeRow,
+): boolean {
+  return (
+    line.event === DISPATCH_RECORD_EVENT &&
+    line.dispatchId === row.dispatchId &&
+    line.childSessionId === row.childSessionId &&
+    line.attempt === row.attempt &&
+    line.reason === row.reason &&
+    line.parentPid === row.parentPid &&
+    line.ts === row.ts &&
+    JSON.stringify(line.killedPids ?? []) === JSON.stringify(row.killedPids ?? [])
+  );
+}
+
+/**
  * Write the outcome row through the SHARED ledger, then CONFIRM it landed.
  *
  * `appendLedger` swallows all exceptions, so success cannot be inferred from
  * it. Confirmation scans the byte range appended during this call for a line
- * matching OUR identity (event + dispatchId + attempt + reason) — robust to a
- * concurrent sibling appending around us, which "is it the last line?" is not.
+ * naming OUR row (`appendedLineNamesRow`) — robust to a concurrent sibling
+ * appending around us, which "is it the last line?" is not.
  */
 export function recordDispatchOutcome(
   row: DispatchOutcomeRow,
@@ -339,13 +419,7 @@ export function recordDispatchOutcome(
       return { ok: false, path, error: "ledger did not grow after append" };
     }
     const lines = readAppendedLines(path, before, after) as Array<Record<string, unknown>>;
-    const found = lines.some(
-      (l) =>
-        l.event === DISPATCH_RECORD_EVENT &&
-        l.dispatchId === row.dispatchId &&
-        l.attempt === row.attempt &&
-        l.reason === row.reason,
-    );
+    const found = lines.some((l) => appendedLineNamesRow(l as Record<string, unknown>, row));
     if (!found) return { ok: false, path, error: "appended row not found on read-back" };
     return { ok: true, path };
   } catch (err) {

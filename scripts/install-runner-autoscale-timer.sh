@@ -45,6 +45,16 @@
 #   * a script path that is not a regular readable file, or one inside a `mktemp` scratch tree (the
 #     measured inert-enforcer: a unit pointing into a directory deleted before the first tick exits 127
 #     on EVERY pass while `list-timers` shows the job scheduled and healthy);
+#   * a PROVISIONER pin inside LANE SCRATCH — a `mktemp` tree, or the repo's own lane-checkout shapes
+#     (`*/.worktrees/*`, `/tmp/wt-*`, `/tmp/cell-wt-*`, `/tmp/base-*`, and the cell shape
+#     `<cellhome>/wt-<slug>`; the same set `scripts/install-repair-service.sh` enforces, #2697).
+#     ⛔ SCOPED TO THE PROVISIONER, AND DELIBERATELY NOT TO THE SCRIPT — an earlier revision of this
+#     header listed the lane shapes under the SCRIPT bullet, which this installer does NOT do: a branch's
+#     converger copy is a legitimate thing to SCHEDULE (`resolve_script`: "a worktree path is SAID OUT
+#     LOUD, NOT REFUSED"), and a suite arm asserts that install still succeeds. A false "refused" here
+#     is an invitation to turn that warning into a refusal and reverse the recorded decision. The two
+#     values differ because a provisioner's whole job is to still exist at the first tick, while a
+#     converger copy may legitimately be a branch under test;
 #   * an interpreter older than 3.12 — the pass refuses itself with exit 2, so the unit would be red
 #     from its first tick for a reason the installer already knew;
 #   * a `--repo` that is not a plain `owner/name` (it is interpolated into the unit's command line);
@@ -196,6 +206,14 @@ is_absolute_path() { case "$1" in /*) return 0 ;; *) return 1 ;; esac; }
 # ⛔ NOT "anything under /tmp": a cell legitimately runs with HOME=/tmp/cell-home and checkouts under
 # /tmp/cell-ai, and refusing those would be a false block on the real target. What is transient by
 # CONSTRUCTION is the `tmp.` + random-suffix name, which is what leaked into the units.
+# ⛔ THIS PREDICATE IS UNCHANGED BY #3469, AND THAT IS DELIBERATE. Widening IT would have reversed a
+# RECORDED DECISION 130 lines above: "⛔ A WORKTREE PATH IS SAID OUT LOUD, NOT REFUSED (scheduling a
+# branch's copy is a legitimate test)" (see `resolve_script`). `refuse_unusable_target` applies this
+# predicate to SCRIPT, HOME and STATE_DIR, so a `*/.worktrees/*` arm here turned a WARNING into a
+# hard refusal for `RUNNER_AUTOSCALE_SCRIPT` — measured: origin/main warns and proceeds, the widened
+# predicate refused, and the remedy it prints ("Re-run from the box's real HOME") does not even apply
+# to a SCRIPT value. So the lane-checkout shapes live in `is_lane_scratch`, which is scoped to the
+# PROVISIONER ONLY — the one value whose whole job is to still exist at the first tick.
 is_transient_scratch() { # is_transient_scratch <path>
     # ⛔ NORMALISE FIRST. macOS sets TMPDIR with a TRAILING SLASH, so `mktemp -d` yields a DOUBLE slash,
     # and a naive prefix test misses the exact install this guard exists to refuse.
@@ -214,6 +232,70 @@ is_transient_scratch() { # is_transient_scratch <path>
         [ -n "$t" ] || continue
         case "$t" in /var/*) t2="/private$t" ;; *) t2="$t" ;; esac
         case "$p" in "$t"/tmp.?*|"$t2"/tmp.?*|"/private$t"/tmp.?*) return 0 ;; esac
+    done
+    return 1
+}
+
+# is_lane_scratch <path> — a LANE CHECKOUT: removed when that lane's worktree is reaped.
+# ⛔ SCOPED TO THE PROVISIONER, NEVER TO THE SCRIPT/HOME/STATE_DIR VALUES. A branch's converger copy is
+# a legitimate thing to SCHEDULE (it is said out loud, not refused — `resolve_script`), while a
+# provisioner pinned there dies with the lane and leaves a pass that can never ADD capacity.
+# ⛔ THE SHAPE SET IS ADOPTED, NOT INVENTED: `scripts/install-repair-service.sh` already refuses to
+# render a unit whose ExecStart lives under the four PREFIX shapes (#2697, "a unit exec'd from it dies
+# when that lane's worktree is reaped"), and `templates/systemd/eldato-pr-repair.service:91` records
+# `/tmp/wt-<issue>-<slug>` as the measured one. Two definitions of "lane scratch" in one repo would be
+# a second answer to one question. `/tmp/cell-ai` and `/tmp/cell-home` stay durable — the false block
+# this whole family guards against.
+# ⛔ AND ONE MORE SHAPE THIS FILE USED TO MISS, MEASURED ON A CELL (agent-infra#3469 review P1). The
+# four prefix shapes above are the lane trees at a TEMPORARY ROOT; a CELL's lanes live one level deeper,
+# under the cell home: `scripts/orchestrator-harness/repo-slug.sh:486-487` RECORDS
+# `git worktree add $HOME/wt-<slug>` as "the fleet's OWN recipe" — and names its caller,
+# `scripts/lane-actions.py` — measuring 8 such trees under `/tmp/cell-home/wt-*`. Those are lane scratch
+# by this repo's own definition — `scripts/pi-reap-worktrees.sh:681` ships
+# `REAP_WT_SCRATCH_GLOB="wt-*|cell-wt-*"` and `is_scratch_path` (`:1250-1263`) applies it to the
+# BASENAME of each `git worktree list` entry — so the prefix-only set left the guard
+# inert on exactly the platform #3469 is about:
+# `--install` from `/tmp/cell-home/wt-<slug>` (candidate 1) was PINNED instead of skipped, so the pin
+# died with the lane, every tick recorded `no provisioner`, and the "can never ADD capacity" warning was
+# suppressed because a pin DID resolve — the inert enforcer, with a green install.
+# ⛔ `*/wt-?*/*` WAS THE FIRST ATTEMPT AND IT WAS TOO BROAD (agent-infra#3469 review, round 3). The rule
+# it claims to transcribe is a BASENAME rule applied to `git worktree list` entries —
+# `scripts/pi-reap-worktrees.sh:1252` does `base="${1%/}"; base="${base##*/}"` — so a `wt-…`
+# component anywhere in the path is NOT the same fact: `/srv/wt-prod/agent-infra/tools/…` is never reaped
+# by that pass, and classifying it as lane scratch would refuse a working configuration while telling its
+# operator to use "a durable path" they already have. So the shape is recognised by the FACT the reaper
+# actually keys on: the component IS a linked worktree. `git worktree add` writes a `.git` FILE at the
+# worktree root (never a directory — that marker is what distinguishes a linked tree from a clone), so an
+# ancestor named `wt-<slug>`/`cell-wt-<slug>` that carries one is exactly a tree the reaper will delete.
+# That covers the CELL recipe (`git worktree add $HOME/wt-<slug>`, recorded at `repo-slug.sh:486-487`) without
+# swallowing a durable directory that merely starts with those letters.
+is_lane_scratch() { # is_lane_scratch <path>
+    local p="${1:-}" d
+    [ -n "$p" ] || return 1
+    is_transient_scratch "$p" && return 0
+    p="$(printf '%s' "$p" | tr -s '/')"
+    case "$p" in
+        */.worktrees/*) return 0 ;;
+    esac
+    # ⛔ NO NAME-ONLY PREFIX ARMS. A NAME alone over-blocks, and it was MEASURED: `/tmp/wt-prod/
+    # agent-infra/tools/…` — a durable checkout whose FIRST component merely starts with `wt-` — matched
+    # the old `/tmp/wt-?*` arm and was refused as lane scratch, while the comment above claimed it was
+    # not; the suite could not see it because its own false-block fixture sits under a mktemp dir, never
+    # at a top-level `/tmp/wt-…` (fresh-context review round 17). `pi-reap-worktrees.sh` keys its glob on
+    # the BASENAME of each `git worktree list` entry, and a plain directory is not one.
+    #
+    # So EVERY shape below is decided by THE MARKER, never by the name: `git worktree add` writes a
+    # `.git` FILE at the worktree root (never a directory — that marker is what distinguishes a linked
+    # tree from a clone). It is checked on the path itself and on every ancestor, so a lane worktree at
+    # ANY depth is caught, and a durable directory that merely shares the prefix is not.
+    d="$p"
+    while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
+        case "${d##*/}" in
+            wt-?*|cell-wt-?*|base-?*)
+                # `-f`, because a linked worktree's `.git` is a FILE and a clone's is a directory
+                [ -f "$d/.git" ] && return 0 ;;
+        esac
+        case "$d" in */*) d="${d%/*}" ;; *) d="" ;; esac
     done
     return 1
 }
@@ -403,8 +485,10 @@ resolve_python() {
 # With no directive systemd's cwd is `/`, which kills the pass's `$PWD/tools/…` candidate, so the
 # install is the ONE moment the path can be measured (the operator is standing in a checkout that has
 # it). ⛔ WARNED, NOT REFUSED: a repair-only schedule is still worth having, and refusing would
-# make this installer unusable on the boxes it exists for (no cell carries that installer today —
-# measured on pi-cell-1). The consequence is named, not implied.
+# make this installer unusable on the boxes it exists for (no cell CARRIED that installer when this was
+# written — measured on pi-cell-1 — and shipping it is what makes candidate 1 resolve there, so the
+# warn-over-refuse argument stands on the repair-only case, not on the installer being absent forever).
+# The consequence is named, not implied.
 PROVISIONER=""
 PROVISIONER_WHY="no tools/install-ci-runner-x64.sh at any candidate"
 resolve_provisioner() {
@@ -421,11 +505,26 @@ resolve_provisioner() {
         return 0
     fi
     for cand in "$INFRA_ROOT/tools/install-ci-runner-x64.sh" \
+                "$(resolve_infra_main)/tools/install-ci-runner-x64.sh" \
                 "${AGENT_INFRA_PATH:-}/tools/install-ci-runner-x64.sh" \
                 "$PWD/tools/install-ci-runner-x64.sh" \
                 "${HOME:-}/.pi/agent/scripts/install-ci-runner-x64.sh"; do
         [ -n "$cand" ] || continue
-        if [ -f "$cand" ] && [ -r "$cand" ]; then PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0; fi
+        [ -f "$cand" ] && [ -r "$cand" ] || continue
+        # ⛔ A CANDIDATE IN TRANSIENT SCRATCH IS NOT A CANDIDATE (agent-infra#3469 review). Pinning one
+        # creates exactly the inert enforcer `refuse_adopted_provisioner` refuses: the tree is deleted
+        # before the first tick, so every pass records `no provisioner` and the box can never ADD
+        # capacity — with the loud warning suppressed, because a pin WAS resolved. ⛔ SKIPPED, NOT
+        # REFUSED: an outright refusal here would false-block `--install` from a lane worktree, which is
+        # where the fleet runs it. Skipping falls through to the next candidate, then to the pin the
+        # installed artifact already carries (`adopt_installed_provisioner`), and finally to the honest
+        # "can never ADD capacity" warning (`warn_provisioner_reach`) — i.e. the pre-#3469 behaviour,
+        # which is the correct one.
+        if is_lane_scratch "$cand"; then
+            err "note: skipping LANE-SCRATCH PROVISIONER CANDIDATE $cand (a lane checkout the reaper removes, so a pin to it could never ADD capacity) — looking for a durable one"
+            continue
+        fi
+        PROVISIONER="$cand"; PROVISIONER_WHY="resolved"; return 0
     done
     return 0
 }
@@ -723,6 +822,23 @@ mode_arg_for() {
 # line, so "no provisioner" cannot degrade into `Environment="RUNNER_AUTOSCALE_PROVISIONER="` — a
 # variable SET TO EMPTY, which is a different fact from an unset one.
 provisioner_env_for() { # provisioner_env_for systemd|launchd
+    # ⛔ `--disarm` MUST NOT WRITE A PIN IT REFUSES TO JUDGE (agent-infra#3469 review P2). `--disarm` is
+    # exempt from `refuse_adopted_provisioner` for the right reason — it forces a DISARMED render, where
+    # the pin is inert, and refusing would strand the arming record instead of disarming the box. But the
+    # render still EMITTED the pin, so `--disarm` exited 0, removed the record, and `--status` on the
+    # artifact it had just written exited 1 (`points into TRANSIENT SCRATCH SPACE`) — a false red on a
+    # legitimately disarmed box, and exactly the writer/reader split this file's T67 class closed.
+    # ⛔ THE REFUSABLE PIN IS THE ONE TO DROP, NOT EVERY PIN: dropping all of them on `--disarm` would
+    # lose a perfectly good adopted pin across an arm-after-disarm on a box whose shell cannot resolve
+    # one, which is a real regression on the ordinary path. So the pin is rendered unless the judgement
+    # site itself would refuse it.
+    # ⛔ AND THE TEST IS THE JUDGEMENT SITE, CALLED — NOT A SECOND COPY OF ITS RULES. A re-implemented
+    # predicate next door is how the writer and the refusal drifted apart in the first place; the
+    # subshell keeps its `err` output and its locals out of this render, and it reads the same globals
+    # (`PROVISIONER`, `TARGET`) that the real call reads.
+    if [ -n "$FORCE_MODE_FLAG" ] && [ "$REPORT_ONLY" != 1 ] && [ -n "$PROVISIONER" ]; then
+        if ! ( refuse_adopted_provisioner ) >/dev/null 2>&1; then printf '%s' ""; return 0; fi
+    fi
     [ -n "$PROVISIONER" ] || { printf '%s' ""; return 0; }
     case "$1" in
         systemd) printf '%s' "Environment=\"RUNNER_AUTOSCALE_PROVISIONER=$PROVISIONER\"" ;;
@@ -810,8 +926,23 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
         is_transient_scratch "$SCRIPT"    && bad="SCRIPT=$SCRIPT"
         is_transient_scratch "$HOME"      && bad="${bad:+$bad; }HOME=$HOME"
         is_transient_scratch "$STATE_DIR" && bad="${bad:+$bad; }STATE_DIR=$STATE_DIR"
-        [ -n "$PROVISIONER" ] && is_transient_scratch "$PROVISIONER" && \
-            bad="${bad:+$bad; }PROVISIONER=$PROVISIONER"
+        # ⛔ THE PROVISIONER IS NOT JUDGED HERE, AND THAT IS THE WHOLE POINT (#3469 review).
+        # This function runs on `--disarm` too, and `--disarm` must never be refused: it forces a
+        # DISARMED render where the pin is inert, so refusing it protects nothing and instead strands the
+        # arming record (`STILL ARMED … the record was NOT removed`) — the harm already measured and
+        # written down at `refuse_adopted_provisioner`. The provisioner's judgement lives ONLY there: it
+        # runs on BOTH rendering writers, applies the SAME three rules (backslash, whitespace, `%`) to the
+        # value that will actually be rendered, and carries the verified `FORCE_MODE_FLAG`/`REPORT_ONLY`
+        # exemption.
+        # ⛔ `PROVISIONER` WAS ALSO IN THE BACKSLASH LOOP BELOW AND IN `refuse_systemd_unsafe_values`, AND
+        # THAT WAS A MEASURED PRE-EXISTING DEFECT (present on origin/main), not just a tidiness issue:
+        # both loops run on `--disarm` without the exemption, so a provisioner pin carrying a backslash, a
+        # space or a `%` refused the disarm and KEPT the record (rc 1, `STILL ARMED`) — the exact stranded
+        # state this file says must be impossible. Removing it from those loops is what makes this file's
+        # own claim ("one site, one rule") true instead of aspirational.
+        # (Note the asymmetry with SCRIPT: a scheduled converger copy inside a worktree is SAID OUT LOUD,
+        # NOT REFUSED — see `resolve_script` — while a provisioner pinned there dies with the lane. Two
+        # different facts, stated in the two places each one belongs.)
     fi
     if [ -n "$bad" ]; then
         err "REFUSING a $t install rendered from transient scratch space: $bad"
@@ -830,7 +961,7 @@ refuse_unusable_target() { # refuse_unusable_target <target-or-"scheduled">
     # by the SCHEDULER's own parser: systemd treats a trailing backslash as a line continuation and
     # applies C-style escapes in `Environment=`, so the value the pass sees would not be this one.
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "SCRIPT=$SCRIPT" "PYTHON=$PYTHON" \
-             "REPO=$REPO" "PROVISIONER=$PROVISIONER"; do
+             "REPO=$REPO"; do
         case "${v#*=}" in
             *\\*) err "REFUSING: ${v%%=*} contains a backslash — the artifact is rendered with sed, where a backslash is an escape, so the rendered path would silently differ from the real one"; return 1 ;;
         esac
@@ -867,7 +998,7 @@ refuse_systemd_unsafe_values() {
     local v
     [ "${TARGET:-}" = "launchd" ] && return 0
     for v in "HOME=$HOME" "PATH=$PATH" "STATE_DIR=$STATE_DIR" "SCRIPT=$SCRIPT" "PYTHON=$PYTHON" \
-             "REPO=$REPO" "PROVISIONER=$PROVISIONER"; do
+             "REPO=$REPO"; do
         case "${v#*=}" in
             *[[:space:]]*) err "REFUSING: ${v%%=*} contains whitespace — systemd splits the rendered unit on it, so the job would never run"; return 1 ;;
             # ⛔ `%` IS A SYSTEMD SPECIFIER, TWICE OVER. systemd expands it at load time (`%h`, `%i`,
@@ -1352,11 +1483,21 @@ refuse_adopted_provisioner() {
             *%*) err "REFUSING: the provisioner pin this install would render contains '%', which systemd expands as a specifier at load time (%h, %i, %n) — the rendered path would differ from the real one"; return 1 ;;
         esac
     fi
-    if is_transient_scratch "$PROVISIONER"; then
+    if is_lane_scratch "$PROVISIONER"; then
+        # ⛔ THIS IS THE ONLY SITE THAT JUDGES THE PROVISIONER'S LOCATION, AND THE WIDER PREDICATE IS
+        # SCOPED TO THIS ONE FIELD ON PURPOSE. A lane checkout (`*/.worktrees/*`, `/tmp/wt-*`,
+        # `/tmp/cell-wt-*`, `/tmp/base-*` — the set `scripts/install-repair-service.sh` enforces, #2697) is
+        # removed with its lane, so a provisioner pinned there leaves a pass that can never ADD capacity.
+        # It is NOT applied to SCRIPT/HOME/STATE_DIR: `resolve_script` records the opposite decision for
+        # the converger ("a worktree path is SAID OUT LOUD, NOT REFUSED — scheduling a branch's copy is a
+        # legitimate test"). ⛔ AND IT IS NOT IN `refuse_unusable_target` EITHER: that function also runs on
+        # `--disarm`, and refusing `--disarm` strands the arming record (measured). This caller is reached
+        # from both rendering writers WITH the exemption, so there is exactly one place that decides.
         err "REFUSING: the provisioner pin this install would render is inside TRANSIENT SCRATCH SPACE: PROVISIONER=$PROVISIONER"
         err "That tree is removed before the first tick, so every pass reports 'no provisioner' and the box can"
         err "never ADD capacity — the same inert-enforcer shape the writers refuse to CREATE. Re-install from a"
-        err "durable checkout, or set RUNNER_AUTOSCALE_PROVISIONER to a durable path."
+        err "durable checkout, or set RUNNER_AUTOSCALE_PROVISIONER to a durable path (a lane checkout under"
+        err ".worktrees/, /tmp/wt-*, /tmp/cell-wt-* or /tmp/base-* is deleted with its lane)."
         return 1
     fi
     return 0
@@ -1912,15 +2053,34 @@ refuse_transient_installed_artifact() { # rc belongs to the CALLER: return 1 and
     local art="$1" bad="" v
     for v in "SCRIPT=${installed_script:-}" \
              "HOME=$(artifact_env_value "$art" HOME)" \
-             "STATE_DIR=$(artifact_env_value "$art" RUNNER_AUTOSCALE_STATE_DIR)" \
-             "PROVISIONER=$(artifact_env_value "$art" RUNNER_AUTOSCALE_PROVISIONER)"; do
+             "STATE_DIR=$(artifact_env_value "$art" RUNNER_AUTOSCALE_STATE_DIR)"; do
         is_transient_scratch "${v#*=}" && bad="${bad:+$bad; }$v"
     done
+    # The provisioner is judged by the WIDER predicate — the same one the writers use for it — so the
+    # reader and the writer still agree about the one value whose job is to survive the first tick.
+    v="PROVISIONER=$(artifact_env_value "$art" RUNNER_AUTOSCALE_PROVISIONER)"
+    is_lane_scratch "${v#*=}" && bad="${bad:+$bad; }$v"
     [ -n "$bad" ] || return 0
     err "the installed artifact points into TRANSIENT SCRATCH SPACE: $bad"
-    err "That tree is removed before the first tick, so every pass exits 127 while the scheduler lists the"
-    err "job as scheduled — the inert-enforcer shape the writing verbs REFUSE TO CREATE. Re-install from"
-    err "the box's real HOME (a login shell or cloud-cell-bringup.sh)."
+    # ⛔ THE CONSEQUENCE AND THE REMEDY ARE PER-FIELD, because they are different failures (fresh-context
+    # review round 17). A doomed SCRIPT/HOME/STATE_DIR makes systemd fail the unit before the tool runs —
+    # exit 127 every tick. A doomed PROVISIONER does NOT: the pass runs fine and records `no provisioner`,
+    # so the 127 sentence and its "re-install from your real HOME" remedy are false for it — the box is
+    # simply unable to ADD capacity, which is the warning `--install` prints in its own words elsewhere.
+    # Saying 127 here would send the operator to fix the wrong value (and, on a box whose HOME is fine,
+    # to re-install into a home that was never the problem).
+    local why=""
+    case "$bad" in
+        *SCRIPT=*|*HOME=*|*STATE_DIR=*)
+            why="every pass exits 127 while the scheduler lists the job as scheduled" ;;
+    esac
+    case "$bad" in
+        *PROVISIONER=*)
+            why="${why:+$why, and }every pass records 'no provisioner' and the box can never ADD capacity" ;;
+    esac
+    err "That tree is removed before the first tick, so $why — the inert-enforcer shape the writing verbs"
+    err "REFUSE TO CREATE. Re-install from a durable checkout (a login shell, cloud-cell-bringup.sh, or the"
+    err "box's real HOME); for a provisioner, a durable path or a repointed RUNNER_AUTOSCALE_PROVISIONER."
     return 1
 }
 

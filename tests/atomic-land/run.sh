@@ -54,10 +54,42 @@ unset AI_REVIEW_GATE_KEY
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RAIL="${ATOMIC_LAND_SUITE_RAIL:-$ROOT/scripts/atomic-land.sh}"
+# The watchdog's reaper and the liveness rules are SHARED with the guard process that
+# actually reaps a hung rail (#1845) — one statement of "is it alive / is it still the
+# same process / kill it and prove it", not two that can drift.
+GUARD="${ATOMIC_LAND_GUARD:-$ROOT/tests/atomic-land/rail-guard.sh}"
+REAP_LIB="$ROOT/tests/atomic-land/reap-lib.sh"
+# ⛔ PREFLIGHT BEFORE THE SOURCE, and before anything can assert on it. `set -uo pipefail` does
+# NOT abort on a failed `.`: a missing reap-lib.sh leaves the primitives UNDEFINED, and a call
+# that cannot resolve exits 127 — which `if is_running …` reads as FALSE, so every survivor and
+# last-resort re-check is skipped and the suite `wait`s on a live pid (measured: unbounded) or
+# reports a rail stopped that is still running. That is the fail-open class this change exists
+# to remove, one level in. `[ -f "$RAIL" ]` below has always had this shape; these are its
+# siblings. A missing GUARD is now a NAMED failure (the `*)` arm returns 125), but starting
+# without it would mean never measuring the reaper at all.
+[ -f "$GUARD" ] || { echo "❌ missing $GUARD"; exit 1; }
+[ -f "$REAP_LIB" ] || { echo "❌ missing $REAP_LIB"; exit 1; }
+# shellcheck source=/dev/null
+. "$REAP_LIB"
+# ⛔ EVERY PRIMITIVE THIS FILE CALLS, not just the one that was easiest to name. A lib can be
+# PRESENT and still not define them (a truncated write, a rename, a bad merge), and a missing
+# `is_running` is the worst of the four: the guard calls it from `still_ours`, so the guard
+# would `exit 0` — "the rail stopped on its own" — over a LIVE rail (measured), and this file's
+# four re-check arms would all skip. Listing only `reap_pid` was a preflight that asserted it
+# had a defence it did not have.
+for _p in is_running proc_ident still_ours reap_pid; do
+  command -v "$_p" >/dev/null 2>&1 \
+    || { echo "❌ $REAP_LIB did not define $_p (truncated or renamed library)"; exit 1; }
+done
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/atomic-land-suite.XXXXXX")"
 checks=0
 failures=0
 
+# #1845: the rail in flight is reaped by `rail-guard.sh` — a SEPARATE process, so it
+# outlives a suite that is killed mid-scenario. Nothing in this script's teardown reaps
+# the rail, deliberately: the suite's EXIT trap is INHERITED by any forked subshell, so a
+# cleanup arm here would be a second, racier owner of the same kill (measured: a TERM'd
+# guard ran the suite's cleanup and `rm -rf`'d the live temp dir mid-run).
 cleanup() { rm -rf "$TMP"; }
 trap cleanup EXIT
 
@@ -478,6 +510,16 @@ new_scen() {
   SCEN_REGISTRY_SYNC=
   unset mb_seq 2>/dev/null || true
   rm -f "$SCEN/state-seq" "$SCEN/state-count" 2>/dev/null || true
+  # #1845: the guard's per-scenario evidence files. Each spawn truncates its own (`2>"$SCEN/…"`),
+  # so this `rm` is belt-and-braces for a scenario that reuses a dir; it is not what protects
+  # against a stale read — TRUNCATION IS. This list is therefore deliberately NOT exhaustive
+  # (7i/7j/7k also write `wd-err00`, `wd-errbig`, `bp-pid0`, `bp-badpid`, `bp-badsup`,
+  # `ps-why-*` and `victim-ps-*`): a name missing here cannot cause a stale read, and keeping
+  # the list "complete" is drift with nothing behind it (#3622 review round 7, P3).
+  rm -f "$SCEN/guard-why" "$SCEN/limit-why" "$SCEN/victim-pid" \
+    "$SCEN/wd-err-g-couldnotrun.sh" "$SCEN/wd-err-g-lies124.sh" \
+    "$SCEN/wd-err-g-survived.sh" "$SCEN/wd-err-g-lost.sh" \
+    "$SCEN/wd-err0" 2>/dev/null || true
   # #1565 fixtures: absent by default, i.e. UNREADABLE protection (the fail-closed
   # default) so every pre-existing scenario keeps refreshing exactly as before.
   rm -f "$SCEN/strict" "$SCEN/mergeable" 2>/dev/null || true
@@ -627,32 +669,200 @@ print(summary, end="")
 PY
 }
 
+# ── reaping a rail: the bound must not depend on the SUITE surviving ─────
+# #1845. The watchdog's kill was already aimed at the RIGHT process (`rail_exec` ends
+# in `exec`, so `$!` is the rail — #1532), and it still leaked: the poll-and-kill loop
+# lived in THIS script, so the moment the suite was killed mid-scenario (a shard
+# timeout, a lane's own watchdog, an operator, a cancelled CI job) nothing bounded the
+# rail any more. The orphan's own state says so — `ppid 1`, cwd `(deleted)`, fd 255 on
+# the deleted mutated rail, still spinning at 10-12% CPU 4h12m to 1d19h later, one per
+# suite run, on a box other lanes share. An enforcer whose termination condition
+# cannot fire is not an enforcer.
+#
+# So the loop lives in `rail-guard.sh`: a separate process, which keeps running after the
+# suite dies and fires on EITHER the limit expiring or the supervisor it was handed being
+# gone. Firing reaps the rail and VERIFIES it is gone; a reap it cannot prove is reported
+# as a survivor, never as success. `tests/atomic-land/reap-lib.sh` holds the rules it
+# shares with this script; `rail-guard.sh`'s own header explains why it must be a SEPARATE
+# process rather than a backgrounded function (an inherited EXIT trap `rm -rf`'d the live
+# suite temp dir — measured, 136 false reds).
+#
+# ⛔ WHAT THIS DOES *NOT* COVER, stated because the bounded claim is the whole point: the
+# window between `rail_exec … &` and `bash "$GUARD" … &` (~4 statements, one of which forks for
+# `proc_ident`) is a moment in which the rail has no guard yet. It is 3 orders of magnitude
+# narrower than "the whole scenario", but it is not zero, so the claim is "a rail cannot outlive
+# the suite that bounds it — modulo the launch window", not "never". And the suite WATCHES the
+# guard (see `run_rail_watchdog`): a child can die where the old in-process loop could not, so a
+# dead guard is reported as an unbounded rail rather than waited on forever.
+#
+# Why not `scripts/lib/bounded.sh`: `tb_timeout` bounds a command's DURATION — a clock cannot
+# express "the process that owns this work is GONE", which is the field condition here (the
+# suite was killed mid-scenario; it did not run out of time). It also kills ONE pid and no
+# child at all, so a rail that forked would leave its child — the #3255 class. (This reaper is
+# one generation BETTER and not a subtree: `pkill -9 -P` reaches DIRECT children only, then the
+# parent — so `rail → admin-merge.sh → gh` still orphans the grandchild once its parent dies.
+# Stated at its real strength; `reap-lib.sh`'s "it and its children" is accurate, "subtree"
+# would not be.) Measured, not assumed: on this box `TB_TIMEOUT_BIN` resolves to GNU `timeout`,
+# and the fallback arm (`tb_watchdog`) arms a timer subshell, so its behaviour is a third thing
+# again — which is
+# itself the reason not to bolt a fourth semantic onto it. Folding a supervisor arm into it
+# would change live reapers, so it is deliberately not done in this change.
+
 # Run the rail under a hard wall-clock watchdog and report its exit status.
 #
 # This exists because the wait bound can fail by HANGING rather than by
 # returning: `--poll 0` makes a nominal poll-count bound unreachable (#1395 item
 # 1), so a guard for that class must be able to kill the rail it is guarding.
-# macOS has no `timeout`, hence the explicit poll-and-kill. 124 = the watchdog
-# fired, i.e. the rail was still running past the limit.
+# macOS has no `timeout`, hence the explicit poll-and-kill. 124 = the watchdog FIRED and
+# PROVED the rail is gone — it does NOT mean "the rail was still running past the limit":
+# the gate's supervisor-death arm returns 124 with the limit nowhere near expiry (7g drives
+# exactly that with a 120s limit). See the function's own docstring for the full contract.
 #
 # The rail is launched through `rail_exec` directly (NOT `( run_rail ... ) &`) so
 # that `$!` is the RAIL: killing a wrapper subshell would leave the rail
 # orphaned, and an orphan on the wait bound spins forever.
+#
+# The KILLING is not done here while the guard is alive (#1845): `rail-guard.sh` — a separate
+# process that survives this script — owns the reap, so that a suite killed mid-scenario still
+# bounds its rail. This function WAITS ON THE GUARD, and reaps the rail itself only as a LAST
+# RESORT (the guard died, refused, or exited without the rail being gone).
+#
+# The guard reports WHETHER it reaped on its EXIT STATUS: 124 = fired AND PROVED the reap,
+# 125 = fired but the rail SURVIVED SIGKILL (or it declined to signal a pid it could not prove
+# was the rail — reap-lib's readable-mismatch rule, in which case NOTHING was signalled),
+# 0 = the rail stopped by itself, 2 = refused (usage, or its own library is missing). It does NOT report WHY there — both arms reach the
+# same `exit 124` and the reason ("the Ns limit expired" vs "its supervisor (pid N) is gone")
+# exists only on its stderr, which is why 7g greps stderr to attribute the arm. And NOT a
+# sentinel file: `: >"$f" 2>/dev/null` does not suppress the redirection's own failure, so on
+# a deleted scratch dir the sentinel was silently absent and this function returned the rail's
+# SIGKILL status (137) as a bounded stop — the exact confusion a sentinel was meant to prevent.
+# An exit status cannot be lost.
+#
+# `<limit-secs>`: a POSITIVE integer. `0` is REFUSED here, even though `rail-guard.sh`
+# documents it as "no time limit": the guard can afford that contract (its supervisor arm
+# still bounds it), but THIS function's own bound is `wait "$gpid"`, so a limit of 0 with a
+# hanging rail keeps the guard alive as long as the rail and blocks the caller forever. A
+# watchdog the suite can switch off is the inert-enforcer shape this change removes.
+#
+# Return codes: the rail's own status; 124 the guard fired AND the rail is VERIFIABLY GONE;
+# 125 THE WATCHDOG ITSELF FAILED (it could not run, it died, or it fired without the rail being
+# gone). 125 exists so "no bound" can never be reported as a plausible-looking rail status.
 run_rail_watchdog() { # <limit-secs> <extra args...>
   local limit="$1"; shift
+  # ⛔ REFUSED, not merely documented: see the header. 125 is the "the watchdog itself
+  # failed" code, so no caller can mistake this for the rail's own outcome.
+  case "$limit" in
+    ''|*[!0-9]*) echo "⚠️ watchdog: the limit must be a positive integer (got '$limit')" >&2; return 125 ;;
+    # ⛔ VALUE, not just SHAPE. `00`/`0000` are all-digits and are not the string `0`, and the
+    # guard's limit arm is `[ "$limit" -gt 0 ]` — false for them — so the bound would be off
+    # while this function's own `wait` was unbounded (measured: never returned). Require at
+    # least one non-zero digit.
+    *[1-9]*) : ;;
+    *) echo "⚠️ watchdog: limit '$limit' is zero — the caller's wait would be unbounded" >&2; return 125 ;;
+  esac
+  # ⛔ AND VALUE-BY-RANGE. A literal too wide for `[ … -gt 0 ]` makes that test ERROR, and a
+  # failing `[` is FALSE, so the limit arm goes silently inert (measured: `[: 999…: integer
+  # expression expected` every poll). The cap is far above any real bound and far below overflow.
+  [ "$limit" -le 86400 ] 2>/dev/null \
+    || { echo "⚠️ watchdog: the limit must be 1..86400 seconds (got '$limit')" >&2; return 125; }
+  local rc=0 grc=0 gpid ident
   rail_exec "$@" >"$SCEN/out" 2>"$SCEN/err" &
-  local pid=$! waited=0
-  while kill -0 "$pid" 2>/dev/null; do
-    if [ "$waited" -ge "$limit" ]; then
-      kill -9 "$pid" 2>/dev/null
-      wait "$pid" 2>/dev/null
+  local pid=$!
+  ident="$(proc_ident "$pid")"
+  # A SEPARATE `bash` (not a backgrounded function): it must survive this script's death,
+  # and a fork inherits this script's EXIT trap — see rail-guard.sh's header.
+  # `$$` is THIS SUITE's pid — in bash it does NOT change inside `( )` or `$( )` (measured: main,
+  # subshell and command-substitution all report the same `$$`, while `$BASHPID` advances), so a
+  # future call from a subshell still hands the guard the right supervisor, and this stays correct
+  # as written. `$BASHPID` would NOT: from a subshell it names a process that dies first, and the
+  # guard's supervisor arm would fire while the suite is alive.
+  bash "$GUARD" "$$" "$limit" "$pid" "$ident" &
+  gpid=$!
+  # ⛔ WAIT ON THE GUARD FIRST, NOT ON THE RAIL. The guard is the ONLY thing here with a bound,
+  # and it exits by itself within one poll of the rail's death — so waiting on IT is bounded
+  # whether the rail hangs or not. Waiting on the RAIL first is precisely how a bound can go
+  # silent: a guard that died on its first statement left nothing bounding the rail, and
+  # `wait "$pid"` then never returned. Measured on an earlier cut — guard SIGKILLed 0.3s in,
+  # limit 5s — the suite was still blocked at t+15s with no timeout, no message and no failure,
+  # i.e. #1845's shape one level up: an enforcer that cannot fire while its caller believes it
+  # is protected. Same shape for a guard that exits 2 (refused) or 127 (could not run).
+  #
+  # ⛔ THE GUARD IS NEVER SIGNALLED — `wait` only. MEASURED, and this is why the TERM is gone:
+  # bash runs an EXIT trap when the shell is KILLED BY A SIGNAL, and a backgrounded command is
+  # briefly a FORK OF THIS SHELL that has not exec'd yet. A `kill -TERM` landing in that window
+  # killed the fork, which then ran the INHERITED `trap cleanup EXIT` and `rm -rf`'d the live
+  # suite temp dir mid-run — 136 of 456 assertions reddened, and all 71 mutation children
+  # "reddened" for the same reason, so the coverage gate printed ✅ while covering nothing.
+  # Reproduced 5/5 on the pre-exec window and 0/1 when the TERM was delayed.
+  wait "$gpid" 2>/dev/null || grc=$?
+  case "$grc" in
+    124)
+      # ⛔ 124 IS THE ONE CODE THAT ASSERTS THE RAIL IS GONE, so it is VERIFIED rather than
+      # trusted. The producer now refuses to emit 124 while the pid lives (rail-guard.sh
+      # re-reads `is_running` before exiting), but a guard is an artifact this function is
+      # HANDED — an older copy, a lane's own build, or the seam 7i uses — and a wrong 124 is
+      # not merely wrong: `wait "$pid"` on a live pid blocks with nothing left to bound it.
+      # Measured before this belt: a stub guard exiting 124 over a live rail kept the caller
+      # blocked past a 30s outer bound, silently. The three sibling arms already verify; this
+      # one did not, which was the asymmetry.
+      if is_running "$pid"; then
+        echo "⚠️ watchdog: the guard reported 124 but pid $pid is STILL RUNNING — the reap was not proved" >&2
+        reap_pid "$pid" "$ident" || return 125
+        if is_running "$pid"; then return 125; fi
+        wait "$pid" 2>/dev/null || rc=$?
+        return 125
+      fi
+      # The rail is a corpse waiting to be collected — this `wait` cannot block.
+      wait "$pid" 2>/dev/null || rc=$?
       return 124
-    fi
-    sleep 1
-    waited=$((waited + 1))
-  done
-  wait "$pid" 2>/dev/null
-  return $?
+      ;;
+    125)
+      # Fired, and the rail outlived 50 SIGKILLs. It is still OUR child, so an unconditional
+      # `wait` would block with nothing left to bound it — one last attempt, then refuse.
+      echo "⚠️ watchdog: the guard reported 125 for rail pid $pid — it SURVIVED SIGKILL, or it was never signalled because it was not provably ours" >&2
+      reap_pid "$pid" "$ident" || return 125
+      # ⛔ AND NEVER `wait` ON A LIVE PID WITH NOTHING LEFT TO BOUND IT. `reap_pid` answers 0
+      # for "gone" AND for "provably NOT ours" — a READABLE identity mismatch, which signals
+      # nothing (reap-lib.sh: only a readable mismatch may skip the signal; an UNREADABLE stamp
+      # falls through TO the signal). So its success is not on its own a licence to block
+      # (#3622 review round 3, P2).
+      if is_running "$pid"; then return 125; fi
+      wait "$pid" 2>/dev/null || rc=$?
+      return 125
+      ;;
+    0) : ;;   # the rail stopped by itself — checked below
+    *)
+      # Died or refused (2 refusal/usage, 127 unable to run, a signal): nothing was bounding
+      # the rail while it lived, so no result of the rail's can be reported as bounded.
+      echo "⚠️ watchdog: the guard exited $grc — nothing was bounding the rail" >&2
+      if is_running "$pid"; then
+        reap_pid "$pid" "$ident" || return 125
+        # ⛔ AND NEVER `wait` ON A LIVE PID WITH NOTHING LEFT TO BOUND IT. `reap_pid` answers
+        # 0 for "gone" AND for "provably NOT ours" — a READABLE identity mismatch, which
+        # signals nothing (an unreadable stamp falls through TO the signal), so its success is
+        # not on its own a licence to block (#3622 review round 3, P2).
+        if is_running "$pid"; then return 125; fi
+      fi
+      wait "$pid" 2>/dev/null || rc=$?
+      return 125
+      ;;
+  esac
+  # The guard exited 0, so it saw the rail go. If the rail is somehow STILL there, the guard
+  # lost the process (a recycled pid, an unreadable state) and the bound went with it — refuse
+  # rather than fall into an unbounded `wait` on it.
+  if is_running "$pid"; then
+    echo "⚠️ watchdog: the guard exited 0 but pid $pid is STILL RUNNING — it lost the process and the bound with it" >&2
+    reap_pid "$pid" "$ident" || return 125
+    # ⛔ AND COLLECT IT, like every sibling arm does. `reap_pid` 0 is also "provably NOT ours",
+    # so the pid may still be live; a bare `return` would leave a SIGKILLed rail as a ZOMBIE
+    # child of this script for the rest of the run. No bound is lost (reap-lib's `is_running`
+    # reads `Z` correctly) — it is the child table and the next reader that suffer.
+    if is_running "$pid"; then return 125; fi
+    wait "$pid" 2>/dev/null || rc=$?
+    return 125
+  fi
+  wait "$pid" 2>/dev/null || rc=$?
+  return $rc
 }
 
 # ═══ 1. the ordered atomic unit on a BEHIND PR ═══════════════════════════
@@ -1145,6 +1355,12 @@ fi
 called "record-review" && fail "recorded without terminal checks" || pass "no record before terminal checks"
 called "admin-merge" && fail "landed without terminal checks" || pass "no land before terminal checks"
 grep -q "not terminal" "$SCEN/err" && pass "the refusal names the wait" || fail "the refusal does not name the wait"
+# ⛔ NO "no survivor behind" ASSERTION HERE, DELIBERATELY (#3622 review, P3). This scenario's
+# rail stops BY ITSELF, so `run_rail_watchdog` has already collected it and any
+# `is_running "$rail_pid"` test is unreachable-true: it cannot fail on the pre-fix code
+# either, so it was a green tick asserting nothing. The survivor claim lives where it can
+# actually turn red — 7g (supervisor-death arm) and 7h (limit arm), both of which drive
+# the guard and assert the victim is GONE.
 
 # ═══ 7c. an unrepresentable wait bound is refused, not silently inert ════
 echo "── 7c. an oversized --wait-timeout is refused instead of disabling the bound"
@@ -1237,6 +1453,356 @@ elif grep -q "value too great for base" "$SCEN/err"; then
   fail "the arithmetic read 08 as octal and aborted silently (no stop, no record)"
 else
   fail "expected a bounded stop naming the wait, got rc $rc"
+fi
+# ⛔ Same reason as 7b: the rail stops by itself here, so a survivor test after
+# `run_rail_watchdog` returns is unreachable-true and is not asserted (see 7g/7h).
+
+# ═══ 7g. a guarded process cannot outlive its SUPERVISOR (#1845) ══════
+# The measured leak is NOT "the kill was aimed at the wrong process" — `$!` has been the
+# rail since #1532. It is that the kill lives in the suite: a suite killed mid-scenario
+# (shard timeout, a lane's watchdog, an operator, a cancelled CI job) leaves its rail
+# with nothing to bound it, and a rail whose wait bound the B14 mutation has made
+# unreachable then spins forever at 10-12% CPU on a box other lanes share (measured:
+# 4h12m to 1d19h, `ppid 1`, cwd `(deleted)`, one per suite run).
+# This drives the GUARD directly: the assertion is about the mechanism that has to fire
+# when the suite is gone, and using a rail instead would make it vacuous on a healthy
+# rail (which stops at its own bound and never needs the guard).
+echo "── 7g. a guarded child is reaped when its SUPERVISOR disappears (#1845)"
+new_scen orphan-guard
+# A supervisor pid that is ALREADY GONE — and DETERMINISTICALLY so. An earlier cut used
+# `sleep 1 & sup=$!; wait`, which leaves a dead pid only until the kernel REUSES that number;
+# a reuse inside the guard's first poll makes `kill -0` answer TRUE, the supervisor arm can
+# never fire, and 7g reds after its 15s window — a flake, not a regression, and one this suite
+# would take 71 times over in mutation mode. `2000000000` is above Linux's `pid_max` ceiling
+# (4194304 default) and above macOS's, so `kill -0` is always ESRCH and the arm under test
+# reads exactly as it does in the field; the assertion is on the guard's REASON line either
+# way, so it stays falsifiable.
+_dead_sup=2000000000
+# A victim whose PARENT exits, so it reparents to init — the field orphan's own shape, and
+# the reason `still_ours` uses a start stamp rather than `ppid`. (The reason is NOT "a
+# background child would linger as a zombie": measured, bash reaps a background child
+# ASYNCHRONOUSLY, so `kill -0` answers FALSE and `is_running` GONE within ~1.5s of its death
+# even without a `wait`. The reparent is about modelling the field case and keeping bash's
+# own reaping out of what this assertion observes — not about zombification.)
+bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-pid"
+_victim="$(cat "$SCEN/victim-pid" 2>/dev/null)"
+if [ -z "$_victim" ]; then
+  fail "7g could not start its victim (no pid was recorded)"
+elif ! is_running "$_victim"; then
+  # ⛔ WITHOUT THIS, A DEAD FIXTURE PRINTS A GREEN TICK. The pass line below reports the
+  # elapsed observation, so a victim that was never running is indistinguishable from a
+  # 0-second reap — the one line a reader quotes as this PR's non-vacuity evidence would be
+  # the line that is unguarded. (The reason-line assertion would still red, so this is test
+  # precision, not a whole-suite false PASS.)
+  fail "7g fixture: the victim (pid $_victim) is not running, so the loop below could iterate zero times"
+else
+  _vident="$(proc_ident "$_victim")"
+  # limit 120s vs a 15s observation window: the LIMIT cannot be what saves us, so only
+  # the supervisor-death arm can make this pass. The guard is invoked as the SUITE invokes
+  # it — same script, same argv shape — so this pins the shipped mechanism, not a copy.
+  # Its stderr is captured so the assertion can name WHICH arm fired: a sentinel-style
+  # "something fired" check passes on the limit arm too, and this scenario must not be able
+  # to pass on the arm it is not testing.
+  bash "$GUARD" "$_dead_sup" 120 "$_victim" "$_vident" 2>"$SCEN/guard-why" &
+  _guard=$!
+  _waited=0
+  while is_running "$_victim" && [ "$_waited" -lt 15 ]; do
+    sleep 1
+    _waited=$((_waited + 1))
+  done
+  if is_running "$_victim"; then
+    fail "a guarded child OUTLIVED its supervisor (${_waited}s and still running, limit 120) — the #1845 leak"
+    reap_pid "$_victim" "$_vident"
+  else
+    pass "the guard reaped the child once its supervisor was gone (${_waited}s, limit 120)"
+  fi
+  # ⛔ THE CODE IS THE PROOF, ON THIS ARM TOO (#3622 review round 9, P3). This line used to be a
+  # bare `wait` — the status was discarded, so 7g asserted only "the victim is gone" and "the
+  # reason line names the supervisor arm". A guard whose supervisor arm reaped the victim and then
+  # exited **0** was read by `run_rail_watchdog`'s `0)` arm as "the rail stopped on its own", which
+  # returns the rail's own SIGKILL status as a bounded stop — and 7g still passed. That is the
+  # same shape as the `9ab9aa6b` sentinel bug this suite exists to remove. 7h asserted its code;
+  # this arm did not, so the moment the two arms' exits differ the suite stayed green while the
+  # caller started reporting the rail's status as a watchdog timeout. `$?` must be read
+  # IMMEDIATELY: `wait` is followed by a `grep`, which would replace it (bash manual, Exit Status).
+  _grc=0
+  wait "$_guard" 2>/dev/null || _grc=$?
+  [ "$_grc" -eq 124 ] \
+    && pass "the supervisor arm exited 124 (fired AND proved the reap)" \
+    || fail "the supervisor arm exited $_grc, not 124 — a fired guard read as a clean stop"
+  grep -q "supervisor (pid $_dead_sup) is gone" "$SCEN/guard-why" 2>/dev/null \
+    && pass "the guard named the SUPERVISOR arm as the reason, so the pass is not the limit arm" \
+    || fail "the guard did not record the supervisor arm as its reason ($(tail -1 "$SCEN/guard-why" 2>/dev/null))"
+fi
+
+# ═══ 7h. the LIMIT arm reaps too (#1845) ═════════════════════════════════
+# 7g's counterpart: there the SUPERVISOR dies, here the clock runs out. The supervisor is
+# ALIVE and the limit is 1s inside a 12s window, so only the limit arm can fire — a guard
+# that never fires is unambiguous rather than a timing guess. Both arms must end in the same
+# externally visible fact, `exit 124` = fired AND proved the reap, because that is the only
+# code the caller is allowed to read as "the rail stopped".
+# Non-vacuity: neuter `reap_pid`'s `pkill`/`kill` lines in a scratch copy of `reap-lib.sh`
+# and this arm's liveness assertion (and 7g's) goes red with the victim still running —
+# measured 2026-11-07, review round 2.
+echo "── 7h. the LIMIT arm reaps too, and reports 124 only when it PROVED the reap (#1845)"
+new_scen limit-guard
+bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-pid"
+_lvictim="$(cat "$SCEN/victim-pid" 2>/dev/null)"
+if [ -z "$_lvictim" ]; then
+  fail "7h could not start its victim (no pid was recorded)"
+elif ! is_running "$_lvictim"; then
+  # Same trap as 7g: a dead fixture would print a 0-second "reaped" tick.
+  fail "7h fixture: the victim (pid $_lvictim) is not running, so the loop below could iterate zero times"
+else
+  _lident="$(proc_ident "$_lvictim")"
+  bash "$GUARD" "$$" 1 "$_lvictim" "$_lident" 2>"$SCEN/limit-why" &
+  _lguard=$!
+  _lwaited=0
+  while is_running "$_lvictim" && [ "$_lwaited" -lt 12 ]; do
+    sleep 1
+    _lwaited=$((_lwaited + 1))
+  done
+  if is_running "$_lvictim"; then
+    fail "a child OUTLIVED the guard's 1s limit (${_lwaited}s, its supervisor alive) — the limit arm never fired"
+    reap_pid "$_lvictim" "$_lident"
+  else
+    pass "the guard reaped the child when its 1s limit expired (${_lwaited}s)"
+  fi
+  _lrc=0
+  wait "$_lguard" 2>/dev/null || _lrc=$?
+  # ⛔ THE CODE IS THE PROOF. 124 is what the caller turns into "the rail stopped"; 125 would
+  # mean the guard fired and could not kill it. Asserting the code here is what stops a
+  # `fired`-but-not-`reaped` guard from being indistinguishable from a bound.
+  [ "$_lrc" -eq 124 ] \
+    && pass "the limit arm exited 124 (fired AND proved the reap)" \
+    || fail "the limit arm exited $_lrc, not 124 — a fired guard that cannot kill would read as a bound"
+  grep -q "the 1s limit expired" "$SCEN/limit-why" 2>/dev/null \
+    && pass "the limit arm named the LIMIT as its reason (not the supervisor arm)" \
+    || fail "the limit arm did not name the limit ($(tail -1 "$SCEN/limit-why" 2>/dev/null))"
+fi
+
+# ═══ 7i. the caller's 125 arms are REACHED, not merely written (#1845) ═
+# 7g/7h drive the GUARD's own contract. Nothing drove the CALLER's last-resort arms — "the
+# guard could not run", "the guard fired without the rail being gone", "the guard lost the
+# process" — because `$GUARD` was not overridable, so no assertion could make the guard fail.
+# A regression that turned one of those arms back into `wait "$pid"` would have reddened
+# nothing.
+# `ATOMIC_LAND_GUARD` is the seam (read once, at startup); this scenario swaps the global for
+# a stub so the shipped code path is what gets exercised.
+# ⛔ WHAT IS AND IS NOT ASSERTED, stated rather than implied: rc 125, the watchdog's own
+# message (a regression reports the RAIL's status and says nothing), and that nothing landed.
+# The "and it never hangs" half is NOT assertable in-process — an assertion about a hang IS
+# the fixture hanging — so it rests on the shard's own bound; the rail here stops by itself
+# (2s), so a skipped reap leaks nothing. What this buys is that the arm is REACHED at all.
+echo "── 7i. EVERY last-resort arm of the caller is reached and bounded (#1845)"
+new_scen dead-guard
+printf '#!/usr/bin/env bash\nexit 7\n'   > "$SCEN/g-couldnotrun.sh"
+printf '#!/usr/bin/env bash\nexit 124\n' > "$SCEN/g-lies124.sh"
+printf '#!/usr/bin/env bash\nexit 125\n' > "$SCEN/g-survived.sh"
+printf '#!/usr/bin/env bash\nexit 0\n'   > "$SCEN/g-lost.sh"
+_saved_guard="$GUARD"
+# Each case hands `run_rail_watchdog` a stub guard THROUGH THE SEAM, with the rail still
+# running, and asserts the arm's code AND its message. All four arms are last-resort reaps:
+# a regression that turned one back into a bare `wait "$pid"` would leave the suite blocked
+# with no bound — the failure they exist to prevent — and before this scenario NONE of them
+# had shipped coverage, because `$GUARD` was not overridable.
+_wd_case() { # <stub> <expected stderr substring> <label>
+  printf '3\n' > "$SCEN/pending"
+  GUARD="$SCEN/$1"
+  run_rail_watchdog 30 42 --repo "$REPO" --poll 0 --wait-timeout 2 2>"$SCEN/wd-err-$1"
+  local _rc=$?
+  GUARD="$_saved_guard"
+  if [ "$_rc" -eq 125 ]; then
+    pass "$3: rc 125 (the watchdog failed) — never the rail's status"
+  else
+    fail "$3: expected rc 125, got $_rc"
+  fi
+  grep -q "$2" "$SCEN/wd-err-$1" 2>/dev/null \
+    && pass "$3: the arm NAMED its reason, so 125 is attributable" \
+    || fail "$3: the arm did not name its reason ($(cat "$SCEN/wd-err-$1" 2>/dev/null || echo EMPTY))"
+}
+_wd_case g-couldnotrun.sh "the guard exited 7"     "a guard that could not run"
+# ⛔ THE ROUND-5 P2 IN ONE LINE: a guard that CLAIMS 124 while the rail lives. 124 is the one
+# code that asserts the rail is gone, and `wait` on a live pid blocks with nothing bounding it
+# (measured pre-fix: still blocked past a 30s outer bound, silently).
+_wd_case g-lies124.sh     "the reap was not proved"  "a guard reporting 124 over a LIVE rail"
+_wd_case g-survived.sh    "SURVIVED SIGKILL"         "a guard that fired but the rail survived"
+_wd_case g-lost.sh        "is STILL RUNNING"         "a guard that exited 0 over a LIVE rail"
+called "admin-merge" && fail "landed despite a watchdog that could not run" || pass "no land on a dead watchdog"
+# And the limit refusal that keeps the whole function from being switchable off. No guard is
+# spawned: the refusal happens before `rail_exec`, so nothing can leak.
+run_rail_watchdog 0 42 --repo "$REPO" --poll 0 --wait-timeout 2 2>"$SCEN/wd-err0"
+rc=$?
+[ "$rc" -eq 125 ] \
+  && pass "limit 0 is refused (rc 125), so the watchdog cannot be switched off by its caller" \
+  || fail "expected rc 125 for a limit of 0, got $rc"
+grep -q "is zero — the caller's wait would be unbounded" "$SCEN/wd-err0" 2>/dev/null \
+  && pass "the refusal says WHY 0 is not allowed here" \
+  || fail "the limit-0 refusal did not name its reason"
+# ⛔ VALUE, not shape: `00` is all-digits and is not the string `0`, and the guard's limit arm
+# (`[ "$limit" -gt 0 ]`) is false for it — so the bound would be off while this function's own
+# `wait` was unbounded (measured: never returned).
+run_rail_watchdog 00 42 --repo "$REPO" --poll 0 --wait-timeout 2 2>"$SCEN/wd-err00"
+rc=$?
+[ "$rc" -eq 125 ] \
+  && pass "limit 00 is refused too (an all-digit zero is still zero)" \
+  || fail "expected rc 125 for a limit of 00, got $rc"
+# A literal too wide for `[ … -gt 0 ]` makes that test ERROR, and a failing `[` is FALSE — the
+# limit arm goes inert with no message.
+run_rail_watchdog 999999999999999999999 42 --repo "$REPO" --poll 0 --wait-timeout 2 2>"$SCEN/wd-errbig"
+rc=$?
+[ "$rc" -eq 125 ] \
+  && pass "an unrepresentable limit is refused, not silently inert" \
+  || fail "expected rc 125 for an oversized limit, got $rc"
+
+# ═══ 7j. a malformed PID is REFUSED, not acted on (#3622 review, P2) ════
+# The guard validated `<limit>` by value and then ACTED on `<pid>` and `<supervisor-pid>` without
+# reading them at all. Three measured consequences, one per wrong answer a program can give:
+# a kill it must not perform (`kill -9 0` is the WHOLE PROCESS GROUP — reproduced: a `setsid`
+# probe ran `rail-guard.sh <sup> 5 0` and its own shell, its victim and the guard all died), a
+# kill of the wrong target (`kill -0 not-a-pid` answers FALSE, so the SUPERVISOR arm fires on the
+# first poll and a HEALTHY rail is reaped), and a FALSE PASS (a non-numeric pid makes `still_ours`
+# false, the loop is never entered, `exit 0` — "the rail stopped on its own" — over nothing).
+# ⛔ The third arm is why the victim below must be a REAL live process: without the refusal there
+# is nothing to observe on the first two, and the third would print a tick with no rail at all.
+echo "── 7j. a malformed <pid>/<supervisor> is refused, and no live process is signalled"
+new_scen bad-pids
+bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-pid"
+_bvictim="$(cat "$SCEN/victim-pid" 2>/dev/null)"
+if [ -z "$_bvictim" ] || ! is_running "$_bvictim"; then
+  fail "7j fixture: the victim is not running, so 'not signalled' would be vacuously true"
+else
+  _bvident="$(proc_ident "$_bvictim")"
+  bash "$GUARD" "$$" 30 0 2>"$SCEN/bp-pid0"
+  _rc=$?
+  [ "$_rc" -eq 2 ] \
+    && pass "pid 0 is REFUSED (rc 2) instead of signalling the whole process group" \
+    || fail "expected rc 2 for pid 0, got $_rc"
+  grep -q "whole process group" "$SCEN/bp-pid0" 2>/dev/null \
+    && pass "the pid-0 refusal names the process-group hazard" \
+    || fail "the pid-0 refusal did not name its reason ($(tail -1 "$SCEN/bp-pid0" 2>/dev/null))"
+  bash "$GUARD" "$$" 30 not-a-pid 2>"$SCEN/bp-badpid"
+  _rc=$?
+  [ "$_rc" -eq 2 ] \
+    && pass "a non-numeric pid is REFUSED (rc 2), not answered with a false 'the rail stopped'" \
+    || fail "expected rc 2 for a non-numeric pid, got $_rc (0 would be a false PASS)"
+  # The destructive direction: an unreadable supervisor reads as GONE, so the supervisor arm fires
+  # on the FIRST poll. Before the refusal this reaped the rail at once, with the limit nowhere
+  # near expiry — i.e. a typo in argv killed the thing the guard exists to protect.
+  bash "$GUARD" not-a-pid 30 "$_bvictim" "$_bvident" 2>"$SCEN/bp-badsup"
+  _rc=$?
+  [ "$_rc" -eq 2 ] \
+    && pass "a non-numeric supervisor is REFUSED (rc 2), not read as 'gone'" \
+    || fail "expected rc 2 for a non-numeric supervisor, got $_rc"
+  is_running "$_bvictim" \
+    && pass "the live victim was NOT signalled by any of the three refusals" \
+    || fail "a refusal SIGNALLED the live victim — the guard killed what it could not read"
+  reap_pid "$_bvictim" "$_bvident"
+fi
+
+# ═══ 7k. a `ps` that cannot answer must not disarm the bound (#1845) ═══
+# The two fail-closed rules that make this reaper safe live in `reap-lib.sh`: `is_running`
+# asks `kill -0` for EXISTENCE and `ps` only for ZOMBIE, and `still_ours` degrades an
+# UNREADABLE identity to the liveness answer. Both were added in review rounds 2 and 3 after a
+# MEASURED false PASS — and until this scenario NEITHER was pinned: no case ever supplied a
+# `ps` that cannot answer, so reverting either one left the whole suite GREEN.
+# Measured 2026-11-07 (#3622 review round 6, P1): with `is_running` restored to its pre-round-2
+# shape (an empty `ps -o stat=` read as GONE) the guard exited 0 — its own "the rail stopped on
+# its own" — over a LIVE victim, and the suite printed ✅; the same for `still_ours` restored
+# to pre-round-3 (a blank re-read read as "not ours"). That is this change's own defect class
+# one level down: a bound that reports a clean stop over a running process, with a green suite.
+# A PATH shim is the only way to exercise it, because the defect IS "what `ps` answers".
+echo '── 7k. a `ps` that cannot answer does not disarm the bound (#1845)'
+new_scen ps-cannot-answer
+_real_ps="$(command -v ps)"
+if [ -z "$_real_ps" ]; then
+  fail "7k cannot build a ps shim (no real ps on PATH)"
+else
+  # <dir> <the -o option that cannot answer> <empty|fail|noise>
+  #   empty  rc 0, prints nothing      (a busybox/slim `ps`: accepts the flag, answers nothing)
+  #   fail   rc 1, prints nothing      (a transient failure on the identity re-read)
+  #   noise  rc 1, PRINTS a `Z` legend (a `ps` that fails *and* writes to stdout — the only
+  #                                     shape that exercises the exit-status rules at all)
+  # ⛔ THE LEGEND CARRIES A `Z` ON PURPOSE. Both `is_running` and `proc_ident` now refuse to
+  # believe a FAILED read, and the ONLY observable difference between "the rule is present" and
+  # "it was deleted" is what the failing `ps` WROTE: a `Z` makes the `*Z*` arm answer "zombie"
+  # for a live pid, and any non-empty line makes a stamp comparison read as a mismatch. A shim
+  # that fails SILENTLY (`fail`) cannot tell the two apart, so the rules would stay unpinned —
+  # the gap round 6 closed for `is_running` and round 7 found still open for `proc_ident`.
+  _ps_shim() {
+    mkdir -p "$1"
+    case "$3" in
+      fail)
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
+          "$2" "$_real_ps" > "$1/ps"
+        ;;
+      noise)
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) echo "Z zombie legend line from a FAILING ps"; exit 1 ;;\n  esac\ndone\nexec %s "$@"\n' \
+          "$2" "$_real_ps" > "$1/ps"
+        ;;
+      *)
+        printf '#!/bin/sh\nfor a in "$@"; do\n  case "$a" in\n    %s) exit 0 ;;\n  esac\ndone\nexec %s "$@"\n' \
+          "$2" "$_real_ps" > "$1/ps"
+        ;;
+    esac
+    chmod +x "$1/ps"
+  }
+  # Drives the SHIPPED guard with one broken `ps` arm, over a live victim, and asserts the
+  # externally visible fact the caller reads: a bounded reap (124) and a DEAD victim.
+  _ps_case() { # <label> <option> <empty|fail|noise> <what the shim models>
+    local dir="$SCEN/pshim-$1" v vid rc=0 waited=0
+    _ps_shim "$dir" "$2" "$3"
+    bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-ps-$1"
+    v="$(cat "$SCEN/victim-ps-$1" 2>/dev/null)"
+    if [ -z "$v" ] || ! is_running "$v"; then
+      # Same trap as 7g/7h: a dead fixture would print a 0-second "reaped" tick.
+      fail "7k/$1 fixture: the victim is not running, so the assertions below prove nothing"
+      return
+    fi
+    # The identity is captured with the REAL `ps` (the shim is only on the GUARD's PATH), so
+    # the $3=fail case really does exercise "a readable capture followed by an unreadable re-read".
+    vid="$(proc_ident "$v")"
+    PATH="$dir:$PATH" bash "$GUARD" "$$" 1 "$v" "$vid" 2>"$SCEN/ps-why-$1" &
+    local g=$!
+    while is_running "$v" && [ "$waited" -lt 12 ]; do
+      sleep 1
+      waited=$((waited + 1))
+    done
+    if is_running "$v"; then
+      fail "7k/$1: the victim OUTLIVED the guard (${waited}s, limit 1) — $4 disarmed the bound"
+      reap_pid "$v" "$vid"
+    else
+      pass "7k/$1: reaped despite $4 (${waited}s, limit 1)"
+    fi
+    wait "$g" 2>/dev/null || rc=$?
+    [ "$rc" -eq 124 ] \
+      && pass "7k/$1: exit 124 (fired AND proved the reap), never a lying 0" \
+      || fail "7k/$1: expected 124, got $rc — a guard that cannot fire reads as a bound"
+  }
+  # Round 2: a slim/busybox `ps` that accepts `-o stat= -p` and prints NOTHING (rc 0).
+  # Pre-fix `is_running` read that as GONE, so the guard's loop never ran and it exited 0.
+  _ps_case stat-empty 'stat=' empty 'a ps whose -o stat= answers nothing (rc 0)'
+  # Round 3: a transient `ps` failure on the IDENTITY re-read only — the capture succeeded.
+  # Pre-fix `still_ours` read the blank re-read as "not ours", so the guard exited 0 over a
+  # healthy rail and the caller killed the rail it was supposed to be protecting.
+  _ps_case lstart-fail 'lstart=' fail 'a ps whose -o lstart= fails after the capture succeeded'
+  # Round 7 (#3622 review, P2): the same failure, but the `ps` PRINTS before it fails. Round 6
+  # taught `is_running` that this shape exists; the sibling identity read still tested only for
+  # EMPTINESS, so this non-empty non-answer became a READABLE MISMATCH: `still_ours` said "not
+  # ours" for a live rail (guard exit 0, nothing signalled) and `reap_pid` answered "provably
+  # gone" while the victim kept running. Measured 2026-11-07; both assertions below red without
+  # the exit-status rule in `proc_ident` (the guard exits 0 and the victim survives) and pass
+  # with it (limit arm fires, victim dead, 124).
+  _ps_case lstart-fail-noisy 'lstart=' noise 'a ps whose -o lstart= FAILS but still prints'
+  # Round 8 (#3622 review round 2, P3): and the SAME rule one function up. `is_running`'s
+  # `|| return 0` is reachable only by a `ps` that FAILS **and prints a `Z`** — with the rule that
+  # is ALIVE (fail-closed); without it the `*Z*` arm reads a live pid as a corpse, the guard exits
+  # 0 over a running rail, and nothing reds. `stat-empty` above cannot see the difference: its
+  # shim exits 0 and prints nothing, so both shapes answer ALIVE. Measured 2026-11-07 by reverting
+  # ONLY the `|| return 0`: `is_running` → GONE for a live pid, all three pre-existing 7k cases
+  # stayed GREEN. So this case is what actually pins the round-6 rule that the 7k header says was
+  # measured.
+  _ps_case stat-fail-noisy 'stat=' noise 'a ps whose -o stat= FAILS but prints a Z legend'
 fi
 
 # ═══ 8. dry-run mutates nothing ══════════════════════════════════════════
