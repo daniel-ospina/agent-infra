@@ -99,16 +99,25 @@
 #                           `git status`, the re-probe, removal). Cheap eligibility (the structural
 #                           rejections and the age floor) still runs for the whole population, so an
 #                           over-budget pass classifies what it saw and preserves the rest — it never
-#                           spends the budget on trees the age floor rejects anyway. It bounds the
-#                           PER-CANDIDATE work, not the whole class: the eligibility scan is
+#                           spends the budget on trees the age floor rejects anyway. ⛔ AND AN EXHAUSTED
+#                           CEILING SHORT-CIRCUITS THE SCAN (see REAP_AW_GITLESS_MAX below), so past it a
+#                           tree costs one integer compare rather than the ~6 forks the
+#                           canonical/keep/state guards need.
+#                           It bounds the PER-CANDIDATE work, not the whole class: the eligibility scan is
 #                           proportional to the population and the outer bound stays
 #                           DISK_REAPER_CLASS_TIMEOUT (1800) in the caller.
 #   REAP_AW_GITLESS_MAX     the gitless arm's count ceiling (default 10), applied PER ROOT — the
 #                           counter is reset inside each `sweep_root`, and `ROOTS` is colon-separated,
 #                           so a two-root pass permits two ceilings — and charged PER AGED CANDIDATE:
 #                           the unit is taken only after the age floor accepts a tree, so a tree the
-#                           floor preserves costs no slot (#3278 P1). Raising or removing the ceiling
-#                           is #3278's P3, an OWNER decision, and is deliberately NOT done here.
+#                           floor preserves costs no slot (#3278 P1). ⛔ AND AN EXHAUSTED CEILING
+#                           SHORT-CIRCUITS THE SCAN, not only the census: it is one integer compare at
+#                           the top of the branch, and without it a capped pass still paid ~6 forks per
+#                           entry to print rows that all say `gitless-cap` — measured on a 300-entry
+#                           fixture with the census isolated: 0.60 s on `2c18ff89a`, 8.98 s with the
+#                           check downstream of the scan, byte-identical pass record. Raising or
+#                           removing the ceiling is #3278's P3, an OWNER decision, and is deliberately
+#                           NOT done here.
 #   REAP_AW_CELL_HOME_DEFAULT  the cell home the gitless guard protects when nothing exports
 #                           `CELL_HOME` (default /tmp/cell-home; a TEST SEAM, and only that). It exists
 #                           so the fallback has a BEHAVIOURAL test: a fixture cannot live at
@@ -686,6 +695,27 @@ sweep_root() { # <root>
             # removed (measured: 89 % of them). The cheap structural rejections below are the only
             # thing that belongs ahead of the age test; the count ceiling and the TIME bound are both
             # applied after it, where the expensive work actually starts.
+            # ⛔ THE COUNT CEILING SHORT-CIRCUITS THE SCAN (#3278 P1, completed in review round 11).
+            # It needs NO per-entry work — one integer compare — so it sits ABOVE everything that forks
+            # or walks. That is the difference between the ceiling being a bound and only a label:
+            # with the check downstream of the scan, an exhausted ceiling still paid ~6 forks per entry
+            # (`git_below`'s two-level walk, `lp_canon`, the home-or-state loop, the keep list, `pinned`)
+            # to print rows that all say `gitless-cap`. MEASURED on a 300-entry fixture with the census
+            # isolated behind a synthetic `/proc`: 8.98 s here versus 0.60 s on `2c18ff89a`, for a
+            # BYTE-IDENTICAL pass record (`candidates=10 kept=290`); on the 3,314-entry root #3278
+            # measured that is ~104 s of the 1800 s class timeout spent classifying trees the ceiling had
+            # already refused, against a population growing ~48.8 trees/hour. `2c18ff89a` carried exactly
+            # this shape and recorded why: "BOTH LIMITS ARE CHECKED BEFORE ANY PER-TREE WORK … the
+            # expensive part of an over-budget arm still ran to the end of the root (measured: 17+ min,
+            # class timeout, rc=3 every hour)". The charge stays where P1 put it — after the age floor —
+            # so a young tree still costs no slot; what changes is that a tree the *ceiling* refuses now
+            # costs one `stat`-free compare instead of the whole scan.
+            # ⛔ SO PAST THE CEILING THE ROW NAMES THE CEILING, not the tree's own reason: this arm did
+            # not look, and `gitless-cap` is the true statement about why the tree was preserved. Every
+            # outcome here is a PRESERVE.
+            if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
+                KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root ceiling, default 10, and it counts AGED candidates only)"; continue
+            fi
             if git_below "$d"; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $d reason=git-below (a .git lives inside the tree, so a git arm owns it)"; continue
             fi
@@ -766,11 +796,12 @@ sweep_root() { # <root>
                 KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=young (age=${age}m < ${AGED_MINUTES}m)"
                 continue
             fi
-            # ⛔ THE COUNT CEILING (`REAP_AW_GITLESS_MAX`, default 10) — CHARGED HERE, AFTER THE AGE
-            # FLOOR AND BEFORE THE CENSUS, and that position is the fix: a young tree costs no slot, so
-            # the ceiling is spent on trees that can actually be removed. The `-n` guard is defensive
-            # (the `:-10` default guarantees a value): comparing against an empty string would be a
-            # bash error, and the looser read (`-ge` on a non-number) must never become "cap reached".
+            # ⛔ THE COUNT CEILING IS CHARGED HERE, AFTER THE AGE FLOOR AND BEFORE THE CENSUS — that
+            # position is #3278's P1: a young tree costs no slot, so the ceiling is spent on trees that
+            # can actually be removed. The O(1) refusal itself is at the TOP of the branch (an exhausted
+            # ceiling must not pay the scan); by construction it cannot fire here, because `GITLESS_DONE`
+            # has not changed since it was read, and a second check site is what made the pre-#3278
+            # ordering ambiguous. The `-n` guard is defensive (the `:-10` default guarantees a value).
             # Raising or removing the ceiling is #3278's P3 — an OWNER decision — not this change.
             if [ -n "$GITLESS_MAX" ] && [ "$GITLESS_DONE" -ge "$GITLESS_MAX" ]; then
                 KEPT=$((KEPT + 1)); log_line "KEPT   $canon reason=gitless-cap (${GITLESS_DONE}/${GITLESS_MAX} classified in THIS ROOT; this root's remainder is PRESERVED for the next run — REAP_AW_GITLESS_MAX is a per-root ceiling, default 10, and it counts AGED candidates only)"; continue
