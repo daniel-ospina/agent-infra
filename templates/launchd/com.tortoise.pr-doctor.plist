@@ -95,10 +95,18 @@
 
          WHERE THE OUTPUT GOES. pr-doctor writes its own bounded pass log at
          $HOME/.pi/agent/state/pr-doctor.log and its PASS VERDICT at
-         .../pr-doctor.status.json; in the multi-repo (`all-repos`) mode the wrapper
-         runs, each repo ALSO gets `pr-doctor.<owner>-<name>.log` and
-         `pr-doctor.<owner>-<name>.status.json` beside them, so one repo's verdict cannot
-         stand in for another's. The launchd capture below is the third surface and
+         .../pr-doctor.status.json. In the multi-repo (`all-repos`) mode this wrapper
+         runs, those two names are NOT written at all: the log and the verdict MOVE to
+         `pr-doctor.<owner>-<name>.log` and `pr-doctor.<owner>-<name>.status.json`, one
+         pair per repo, so one repo's verdict cannot stand in for another's.
+         ⛔ SAY "MOVE", NOT "ALSO". The first version of this paragraph said each repo
+         "ALSO gets" a pair "beside them", which tells an operator the canonical pair
+         still exists — and two readers open it BY NAME: `scripts/heartbeat-loop.sh` and
+         `scripts/lib/fleet-inventory.sh`'s `_fleet_pr_doctor_bound`. On a box whose only
+         launcher is this unit, those readers now read a file nothing writes, and the
+         sentence was the reason nobody would look. (Measured: `apply_repo(multi=True)`
+         REASSIGNS the doctor's module-level log/status names rather than adding to
+         them.) The launchd capture below is the third surface and
          the one its own code names — a pass that dies before it can write either
          still leaves its crash text here (a launchd job's stderr is the only place
          an interpreter-level death lands), which is what makes an import error

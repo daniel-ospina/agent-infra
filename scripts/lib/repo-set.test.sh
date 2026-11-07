@@ -30,7 +30,8 @@
 # HERMETIC: every fixture is a throwaway `git init` under mktemp, HOME is re-rooted, and no real
 # state dir, config file or launchd domain is touched. External dependencies: `git`, and `python3` for
 # the doctored-doctor mutation fixtures (both are already required by the reader's own delegated
-# proofs, so the suite needs nothing a real box does not).
+# proofs, so the suite needs nothing a real box does not — INCLUDING NO `timeout`, which macOS does not
+# ship: `_rs_bound` below is the pure-bash substitute).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # `set -u` comes AFTER the two resolutions on purpose: a harness that streams the shard list into a
@@ -99,11 +100,61 @@ slug=daniel-ospina/agent-infra checkout=$T/agent-infra state=$T/state-ai
 EOF
 
 # run_reader <conf> <verb...> — REPO_SET_FILE pinned per call, never inherited.
-run_reader() { local c="$1"; shift; REPO_SET_FILE="$c" bash "$READER" "$@" 2>&1; }
-run_reader_rc() { local c="$1"; shift; REPO_SET_FILE="$c" bash "$READER" "$@" >/dev/null 2>&1; echo $?; }
+# ⛔ EVERY READER CALL GOES THROUGH A WALL-CLOCK BOUND, AND NOT VIA `timeout` (review-instrumented round
+# 44). Three measured reasons, all from this round:
+#  1. `timeout` IS NOT ON macOS — it is coreutils, not a BSD tool — and this suite is run by the operator
+#     of a launchd unit. An arm leaning on it reds on `command not found`, i.e. on the HARNESS, where the
+#     arm exists to prove BEHAVIOUR (the same trap `set -u` is placed after the resolutions for).
+#  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION: the ancestor walk used to LOOP (a
+#     slash-less parent never shortens) and the first absent-path arm to run is `b1`, which had no bound —
+#     so a re-regression WEDGED the shard for its whole CI timeout instead of reddening. Bounding the
+#     helper bounds every arm; `124` is `timeout`'s own code, so the arms' arithmetic is unchanged.
+#  3. ⛔ IT MUST KILL THE WHOLE TREE, NOT `$!` — and the first cut did not, which made it INERT exactly
+#     where it was needed. Measured: with the walk broken, `_rs_bound` returned 124 at 30.9 s and the
+#     calling `$( )` STILL BLOCKED past 60 s, because the killed reader left children whose stdout IS the
+#     command-substitution pipe — and a substitution returns only when every writer closes it. `timeout`
+#     escapes that by signalling the process GROUP; this walk reproduces it without the tool: collect the
+#     descendants BEFORE any kill (once the parent dies they reparent to init and `pgrep -P` cannot find
+#     them), then TERM and KILL the set.
+_rs_descendants() { # _rs_descendants <pid> — pids below <pid>, space-separated. `ps -A -o pid=,ppid=` is
+  # POSIX enough for both Linux and the macOS BSD ps, and the tree is transitive (the reader execs python).
+  ps -A -o pid=,ppid= 2>/dev/null | awk -v root="$1" '
+    { kid[$1] = $2 }
+    END {
+      mark[root] = 1
+      changed = 1
+      while (changed) {
+        changed = 0
+        for (p in kid) if (!(p in mark) && (kid[p] in mark)) { mark[p] = 1; changed = 1 }
+      }
+      for (p in mark) if (p != root) printf "%s ", p
+    }'
+}
+_rs_bound() { # _rs_bound <secs> <argv...> — stdout/stderr are inherited, so `$( )` captures them normally
+  local secs="$1"; shift
+  "$@" & local pid=$!
+  local n=0 max=$(( secs * 10 ))
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$n" -ge "$max" ]; then
+      local kids; kids="$(_rs_descendants "$pid")"
+      kill -TERM "$pid" $kids 2>/dev/null
+      sleep 0.2
+      kill -KILL "$pid" $kids 2>/dev/null
+      wait "$pid" 2>/dev/null
+      return 124
+    fi
+    sleep 0.1; n=$(( n + 1 ))
+  done
+  wait "$pid" 2>/dev/null
+  return $?
+}
+run_reader() { local c="$1"; shift; REPO_SET_FILE="$c" _rs_bound 30 bash "$READER" "$@" 2>&1; }
+run_reader_rc() { local c="$1"; shift; REPO_SET_FILE="$c" _rs_bound 30 bash "$READER" "$@" >/dev/null 2>&1; echo $?; }
 # `run_reader` merges the refusal text into stdout ON PURPOSE (the arms above grep it). The arms that
 # assert NOTHING was emitted need the stdout-only form, or a correct refusal reads as output.
-run_reader_out() { local c="$1"; shift; REPO_SET_FILE="$c" bash "$READER" "$@" 2>/dev/null; }
+run_reader_out() { local c="$1"; shift; REPO_SET_FILE="$c" _rs_bound 30 bash "$READER" "$@" 2>/dev/null; }
+# run_reader_rel <conf> <verb...> — the same, from the throwaway dir, for the RELATIVE-path arms.
+run_reader_rel() { local c="$1"; shift; ( cd "$T" && REPO_SET_FILE="$c" _rs_bound 30 bash "$READER" "$@" 2>&1 ); }
 
 # ── (a) the valid set ──────────────────────────────────────────────────────────────────────────
 out="$(run_reader "$CONF" list)"
@@ -742,9 +793,11 @@ ck "f11e the SOURCED guard's list EQUALS the reader functions this wrapper CALLS
 # belongs to the doctor) is not counted as one of this reader's definitions.
 # ⛔ CAPABILITY IS NOT COVERAGE (round 40, P2), AND THE FIX FOR THAT IS AN ARM, NOT A SENTENCE (round
 # 41, P2 — this comment previously claimed the extra branches were “proven by MUTANT” when no mutant
-# ran the scan at all). The shipped reader uses ONE spelling — 23 definitions, all `name() {` on one
-# line — so `f11f` alone cannot tell three working branches from three deleted ones. `f11f-0` below runs
-# the same scan against a four-spelling fixture; between them the branches are exercised in the suite.
+# ran the scan at all). The shipped reader uses ONE spelling — every definition is `name() {` on one
+# line — so `f11f` alone cannot tell three working branches from three deleted ones. ⛔ THE COUNT IS NOT
+# WRITTEN HERE: it said `23` and went stale the moment `_rs_require` landed (measured 24 in round 44) —
+# the exact drift this same paragraph is about. `f11f-0` below runs the same scan against a
+# four-spelling fixture; between them the branches are exercised in the suite.
 # ⛔ NO SHELL KEYWORD CAN PASS AS A DEFINITION: a bare `done`/`fi`/`local` line would match the
 # brace-on-the-next-line head pattern, so keywords are excluded by name.
 # ⛔ THE SCAN IS A FILE, NOT A HEREDOC-INLINE, SO IT CAN BE RUN AGAINST A FIXTURE (review round 41,
@@ -1067,6 +1120,14 @@ mkdir -p "$T/dirset"
 ck "j3 a DIRECTORY at the config path is INVALID (5), not NO-REPO-SET (3)" '[ "$(run_reader_rc "$T/dirset" list)" = 5 ]'
 ck "j4 …and it says so rather than claiming the path does not exist" \
    'run_reader "$T/dirset" list | grep -q "exists but is not a regular file"'
+# ⛔ THE PARENTHETICAL NAMED ONE CAUSE FOR THREE STATES (review round 44, P2 — measured). A FIFO and a
+# SOCKET reach this same arm, and a FIFO very much CAN carry lines, so "a directory at the config path
+# cannot name repos" was an unverified specific in an EMITTED refusal — `j3`/`j4` arm only the directory.
+if mkfifo "$T/fifoset" 2>/dev/null; then
+  ck "j4b a FIFO at the config path is INVALID (5) — and the refusal states the RULE, not 'a directory'" \
+     'o="$(run_reader "$T/fifoset" list)"; [ "$(run_reader_rc "$T/fifoset" list)" = 5 ] && grep -q "must be a regular file" <<<"$o" && ! grep -q "a directory at the config path" <<<"$o"'
+  rm -f "$T/fifoset"
+fi
 # ⛔ A DANGLING SYMLINK AT THE CONFIG PATH IS NOT "ABSENT" (review round 7, P2). `-e` follows the
 # link, so a dotfile manager whose target moved (stow/chezmoi) read as "this machine has named no
 # repo" — code 3 — and the wrapper DEGRADED on it: the machine silently stopped grading every repo
@@ -1171,6 +1232,77 @@ ck "j16d no \`tr\` on PATH is a NAMED refusal at rc 5 — never a false DUPLICAT
 # "this set names no repos" (review round 43, P2).
 ck "j16e no \`awk\` on PATH: the \`slugs\` verb refuses at rc 5, never 127 with an empty list" \
    'o="$(REPO_SET_FILE="$CONF" PATH="$T/no-awk" /bin/bash "$READER" slugs 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "awk\` is not on PATH" <<<"$o"'
+# ⛔ THE FIXTURE'S LAYOUT IS THE WHOLE POINT (review-instrumented round 44 — my first version was VACUOUS).
+# `_rs_doctor_py` looks for `$(dirname BASH_SOURCE)/../pr-doctor.py`, so a reader at `$WER/repo-set.sh`
+# resolved its doctor one directory ABOVE `$WER`, where there is none: `_rs_doctor_available` was false, the
+# `else` WARN fired, and the arm's three greps passed with the guard below NEVER EXECUTING — it stayed
+# green under the mutant that deletes it. The reader sits in `$WER/lib/` so the sibling resolves.
+# ⛔ AND THE LABEL IS `j-emptyrender`, NOT `j24`: `j24` already names the mode-111 parent arm, so the first
+# version of this arm silently shared a label with it (two `ok j24` lines in one log).
+WER="$T/wemptyrender"; mkdir -p "$WER/lib"
+cp "$READER" "$WER/lib/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$WER/pr-doctor.py"
+python3 - "$WER/lib/repo-set.sh" <<'PYER'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = "  printf '%s\\n' \"$parsed\" | awk -F'\\t' 'NF{ if (out != \"\") out = out \",\"; out = out $1 \"=\" $2 } END { printf \"%s\", out }'\n  printf '\\n'"
+assert s.count(old) == 1, s.count(old)
+open(p, "w", encoding='utf-8').write(s.replace(old, "  :", 1))
+PYER
+ck "j-emptyrender an EMPTY render with a NON-EMPTY parse is INCOMPLETE (WARN), never a refusal on a false cause" \
+   'o="$(REPO_SET_FILE="$CONF" bash "$WER/lib/repo-set.sh" check 2>&1)"; rc=$?; [ "$rc" = 0 ] && grep -q "WARN WHOLE-SET-PROOFS-SKIPPED" <<<"$o" && grep -q "OK — 2 repo(s)" <<<"$o" && ! grep -q "REFUSED set" <<<"$o"'
+# ⛔ `dirname` WAS THE LAST UNGUARDED EXTERNAL, AND ITS ABSENCE DISARMED THE ABSENCE PROOF (review round 44,
+# P2 — measured). It is gone from the code now (`${d%/*}` is the same parent with no process), and this arm
+# is what makes that more than a tidy-up: with a reader whose interpreter candidates cannot resolve AND a
+# PATH without `dirname`, the ancestor walk is the ONLY thing that can tell "absent" from "untraversable".
+# When it used `dirname`, the walk never ran, answered `/`, and a set that EXISTS behind a `chmod 000`
+# ancestor was reported `NO-REPO-SET … does not exist` at code **3** — the code the wrapper DEGRADES on, so
+# the box grades one repo instead of refusing. Guarded against root for the reason f48 gives.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip j16f (running as root: mode 000 does not deny)\n'
+else
+  ND="$T/no-dirname"; mkdir -p "$ND"
+  for b in sed awk tr grep printf id cat cut wc head mv rm mkdir ln chmod git date env basename uname; do
+    _p4="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p4" "$ND/$b" 2>/dev/null
+  done
+  NI="$T/nointerp-dirname"; mkdir -p "$NI"
+  cp "$READER" "$NI/repo-set.sh"; cp "$REPO_ROOT/scripts/pr-doctor.py" "$NI/pr-doctor.py"
+  python3 - "$NI/repo-set.sh" <<'PYNID'
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+old = "for c in python3 /usr/bin/python3 /usr/local/bin/python3; do"
+assert s.count(old) == 1, s.count(old)
+open(p, "w", encoding='utf-8').write(s.replace(old, "for c in no-such-interp-xyz /no/such/python3; do", 1))
+PYNID
+  mkdir -p "$T/den2/den"
+  printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/den2/den/repos.conf"
+  chmod 000 "$T/den2/den"
+  _o_dn="$(REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/repo-set.sh" check 2>&1)"; _rc_dn=$?
+  chmod 755 "$T/den2/den"
+  ck "j16f no \`dirname\` must not disarm the absence proof (rc 5 INVALID, never the rc 3 the wrapper degrades on)" \
+     '[ "$_rc_dn" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn"'
+fi
+# ⛔ A RELATIVE `REPO_SET_FILE` USED TO HANG THIS READER, AND NO ARM USED ONE (review-instrumented round 44).
+# Removing `dirname` from the ancestor walk left `${d%/*}`, which returns a SLASH-LESS name UNCHANGED — so
+# the walk re-tested the same string forever: `REPO_SET_FILE=repo.conf` gave rc 124 and no output, where the
+# previous code answered `.` and exited to rc 3 NO-REPO-SET. A HANG is worse than the wrong refusal it
+# replaced, and the whole suite stayed green because every other arm passes an absolute `$T/…` path.
+# THE BOUND IS IN THE HELPER, NOT IN THIS ARM — see `_rs_bound` (l.~103): `run_reader_rel` bounds the
+# whole call tree at 30 s, so a regression here REDS at rc 124 in ~30 s instead of wedging the shard (and
+# `b1`, the first absent-path arm, is bounded the same way). Measured on the broken walk: the suite that
+# used to run to its CI cap now finishes in 97 s with this arm as the single `FAIL`.
+ck "j16g a RELATIVE config path TERMINATES — the ancestor walk must not loop on a slash-less parent" \
+   'o="$(run_reader_rel absent-relative.conf check)"; rc=$?; [ "$rc" = 3 ] && grep -q "NO-REPO-SET" <<<"$o"'
+printf 'slug=o/n checkout=%s\n' "$T/tortoise" > "$T/rel.conf"
+# ⛔ THIS ARM IS NOT A LOOP DETECTOR, AND ITS FIRST LABEL CLAIMED IT WAS ("the same walk, the other
+# branch" — measured round 44 and falsified). The walk is entered only under `[ ! -e "$f" ]`, and this
+# fixture's file EXISTS, so the walk never runs; `j16g` above is the only arm whose SUBJECT is the broken
+# walk — `b1` does NOT red on it (it passes an ABSOLUTE path, which the mutant shortens correctly). What
+# this one pins is the OTHER failure a walk fix invites — refusing or mangling a relative path in the
+# course of making the walk terminate — so both halves of the repair have a sensor.
+ck "j16h …and a relative config that EXISTS is still READ, not refused (a walk fix must not break the ordinary read)" \
+   'o="$(run_reader_rel rel.conf list)"; rc=$?; [ "$rc" = 0 ] && grep -q "^o/n" <<<"$o"'
 
 # ⛔ THE ROUND-TRIP IS BY ENTRIES, NOT BY COUNT (review round 9, P2): a separator at the END of a value
 # is adjacent to the join comma, so the count stayed n and a TRUNCATED checkout passed `check` — a set
@@ -1633,6 +1765,15 @@ open(dst, "w", encoding='utf-8').write(t)
 PYO
 ck "m43 a sibling that LOADS but lacks _origin_slug is named as such — not blamed on python3 or a bad load" \
    'o="$(REPO_SET_DOCTOR="$MO/pr-doctor.py" run_reader "$CONF" check 2>&1)"; grep -q "_origin_slug\` is missing, or it raised" <<<"$o" && ! grep -q "no python3, or it would not load" <<<"$o"'
+# ⛔ THE OTHER HALF OF THAT ANSWER: A SIBLING THAT WILL NOT LOAD AT ALL (review round 44, P2 — measured).
+# The load-failure arm wrote a sentinel only for `tags`/`strip`/`norm`; `origin` wrote NOTHING, so it fell
+# through to the caller's residue and the operator was told `the proof child did not start` — in the SAME
+# run whose whole-set WARNs correctly said `would not LOAD`. The child started, imported and raised. Both
+# messages are now true and distinct, which is what this arm pins.
+ME="$T/noload"; mkdir -p "$ME"
+printf 'raise RuntimeError("boom at import")\n' > "$ME/pr-doctor.py"
+ck "m45 a sibling that will not LOAD names the LOAD for origin too — never 'the proof child did not start'" \
+   'o="$(REPO_SET_DOCTOR="$ME/pr-doctor.py" run_reader "$CONF" check 2>&1)"; grep -q "would not LOAD, so no origin can be proved" <<<"$o" && ! grep -q "did not start" <<<"$o" && ! grep -q "cannot see why" <<<"$o"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \
