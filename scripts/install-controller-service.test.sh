@@ -2909,6 +2909,31 @@ if [ -d "$PG_CLONE/.git" ]; then
   grep -qxF "ExecStart=/bin/bash $PG_CLONE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
     && ok '§P7: a PRIMARY clone under /tmp (the /tmp/cell-ai shape) still installs — the rule is not a blanket /tmp refusal' \
     || bad "§P7: refused the cells' own /tmp checkout — this guard would block cell bring-up: $PG_B_OUT"
+  # (b2) THE SAME PRIMARY-CLONE SHAPE, BUT CHECKED OUT ON A LANE BRANCH, IS REFUSED (cycle-6 P2, MEASURED).
+  # A lane that isolates by CLONING instead of `git worktree add` was admitted here, because
+  # `primary_clone_root` is git's main-vs-linked arithmetic and never asked the branch question — and the
+  # bring-up injects `AGENT_INFRA_PATH=$LAYER_ROOT` itself, so the declaration could be the caller's own
+  # clone. The control above stays green because that clone is on `master`/`main`; this one is on `lane/x`.
+  rm -f "$PG/units/eldato-orchestrator.service"
+  PG_LANE_CLONE="$T/lane-clone"; mkdir -p "$PG_LANE_CLONE/scripts"
+  cp "$SUP" "$PG_LANE_CLONE/scripts/cloud-cell-supervisor.sh"
+  if git init -q "$PG_LANE_CLONE" 2>/dev/null \
+     && git -C "$PG_LANE_CLONE" add -A >/dev/null 2>&1 \
+     && git -C "$PG_LANE_CLONE" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1 \
+     && git -C "$PG_LANE_CLONE" checkout -q -b lane/x >/dev/null 2>&1; then
+    PG_B2_RC=0
+    PG_B2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_LANE_CLONE/scripts/cloud-cell-supervisor.sh AGENT_INFRA_PATH=$PG_LANE_CLONE" inst pg --install 2>&1)" || PG_B2_RC=$?
+    grep -qxF "ExecStart=/bin/bash $PG_LANE_CLONE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+      && bad "§P7: a PRIMARY clone checked out on the branch lane/x was ARMED — being a clone is not being merged: $PG_B2_OUT" \
+      || ok '§P7: a PRIMARY clone checked out on a LANE branch is REFUSED (being a clone is not being merged)'
+    case "$PG_B2_OUT" in
+      *'BRANCH lane/x'*) ok '§P7: and the refusal names the unmerged branch it found' ;;
+      *) bad "§P7: the lane-branch clone refusal does not name the branch — $PG_B2_OUT" ;;
+    esac
+    rm -f "$PG/units/eldato-orchestrator.service"
+  else
+    bad '§P7: the fixture could not build the lane-branch clone, so that arm did NOT run'
+  fi
   # (c) a LINKED worktree of that same clone, under a DURABLE root and with a name no pattern matches
   rm -f "$PG/units/eldato-orchestrator.service"
   PG_WT="$PG/home/lane-checkout"
@@ -3033,17 +3058,32 @@ if [ -d "$PG_CLONE/.git" ]; then
         else
           bad '§P7: the fixture could not create the drainer scratch, so that arm did NOT run'
         fi
-        # (3) NAMED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR CLOSED (cycle-5 P1). The pin root is the
-        # BOX locator and these two variables are how a real cell relocates its pin, so a caller that declares
-        # a scratch AS its pin root still arms it. That is an ACCIDENT guard, not a boundary against an operator
-        # who declares the scratch deliberately (who can write the unit anyway) — stated in the installer and
-        # `docs/ops/controller-service.md`. This arm PINS the documented behaviour, so changing it is a visible
-        # decision rather than silent drift in either direction.
+        # (3) NAMED RESIDUAL, ASSERTED SO IT CANNOT BE MISTAKEN FOR CLOSED (cycle-5 P1, corrected cycle-6 P2).
+        # ⛔ THE TREE MUST BE ONE THE NAME ARM CANNOT ADMIT. The first version of this arm used PG_L_TREE, whose
+        # basename IS the commit it holds — so `name_ok=1` admitted it and the flat arm was never consulted: the
+        # arm passed even with the flat `elif` DELETED, i.e. it certified a residual it never exercised (the same
+        # vacuity class this file was being fixed for). PG_F_TREE is named with a FOREIGN commit id, so the name
+        # arm refuses it and only the flat arm (`tree == pin root`) can admit it — which is exactly the residual.
         PG_L3_RC=0
-        PG_L3_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG_L_TREE ORCH_SUPERVISOR=$PG_L_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L3_RC=$?
-        grep -qxF "ExecStart=/bin/bash $PG_L_TREE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+        PG_L3_OUT="$(EXTRA_ENV="HARNESS_PIN_DIR=$PG_F_TREE ORCH_SUPERVISOR=$PG_F_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L3_RC=$?
+        grep -qxF "ExecStart=/bin/bash $PG_F_TREE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
           && ok '§P7: RESIDUAL (documented): a caller that declares a scratch AS its pin root IS admitted — the pin locators belong to the operator' \
           || bad "§P7: the documented residual changed — a declared pin root no longer admits its own tree (rc=$PG_L3_RC): $PG_L3_OUT"
+        rm -f "$PG/units/eldato-orchestrator.service"
+        # (4) THE THIRD LAUNDERING ROUTE IS THE RECORD, AND IT IS A DIFFERENT INPUT FROM THE TWO ENV LOCATORS
+        # (cycle-6 P2). `pin_root_of_this_box` turns a record line `<scratch>/scripts/orchestrator-harness` into
+        # `root=<scratch>`, so a RECORD naming a scratch reaches the same flat arm. Like the env locators the
+        # record is box state a caller can write (it lives under CELL_HOME), so it is the same ACCEPTED RESIDUAL
+        # — but it was left out of both the residual comment and the docs, and had no arm at all. Asserted here
+        # with the foreign-named tree so it too exercises the flat arm, and labelled as residual rather than
+        # claimed closed.
+        printf '%s\n' "$PG_F_TREE/scripts/orchestrator-harness" > "$PG/home/.harness-path"
+        PG_L4_RC=0
+        PG_L4_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_F_TREE/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_L4_RC=$?
+        rm -f "$PG/home/.harness-path"
+        grep -qxF "ExecStart=/bin/bash $PG_F_TREE/scripts/cloud-cell-supervisor.sh start" "$PG/units/eldato-orchestrator.service" 2>/dev/null \
+          && ok '§P7: RESIDUAL (documented): a pin RECORD naming a scratch IS admitted — the record is box state, not a credential' \
+          || bad "§P7: the documented record residual changed — a record naming a scratch no longer admits it (rc=$PG_L4_RC): $PG_L4_OUT"
         rm -f "$PG/units/eldato-orchestrator.service"
       else
         bad '§P7: the fixture could not create the hex-named scratch, so the name/declaration arms did NOT run'
