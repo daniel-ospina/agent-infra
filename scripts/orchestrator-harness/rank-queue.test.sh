@@ -3042,6 +3042,9 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 #       (b) regular files written DIRECTLY under `$TMP` (the `*.sh` fixture helpers, the `*.txt` drive inputs, the
 #           mutant sources) — fixture INPUTS and helpers, never a capture; measured: a claim written to
 #           `$TMP/claim.txt` leaves the suite GREEN. A fixture that captures into a CASE DIR is covered;
+#       (c) the TWO case directories this section itself creates AFTER the snapshot — `outpin-mut/out` and
+#           `outpin-run/out`, each holding a MUTANT run's output by design. They are excluded BY EXACT KEY in the
+#           end-of-run check below, and any other capture that appears after the snapshot reds there;
 #   * four captures are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
 #     running this suite twice (once as cmux, once as root) with an EMPTY exclusion list: `arm-clip-unread/out`,
 #     `mh-mode000/out`, `poolguards/m000.log`, `sa-unreadable/out`. Root can read a mode-000 file, so those fixtures
@@ -3161,6 +3164,10 @@ else
   # else → the union loop, which names each capture that is NEW, CHANGED or DISAPPEARED.
   _got_sorted="$(printf '%s\n' "$_out_got" | LC_ALL=C sort)"
   _pin_sorted="$(printf '%s' "$_out_pin" | tr '|' '\n' | LC_ALL=C sort)"
+  # ⛔ THE GREEN BRANCH ASSIGNS `rc` EXPLICITLY (review P3, cycle 77). It previously fell through with whatever the
+  # PREVIOUS check left, so a failure anywhere earlier turned this into "a claim reached the operator by SOME
+  # mechanism" with no `capture …` line — a prose accusation about a map that was byte-identical to the pin. Every
+  # other check in this file sets `rc` on each path; this one now does too.
   if [ "$_got_sorted" = "$_pin_sorted" ] && [ "$_out_got" != "$(printf '%s' "$_out_pin" | tr '|' '\n')" ]; then
     rc=1; echo "      every pinned capture is present with its pinned CRC and only the MAP SEQUENCE differs — this check's own collation, not the code under test (both sides are compared under LC_ALL=C below)"
   elif [ "$_got_sorted" != "$_pin_sorted" ]; then
@@ -3179,9 +3186,34 @@ else
         echo "        capture $_okk CHANGED: $(_out_show "$_okk")"
       fi
     done
+  else rc=0
   fi
 fi
 ck "the EMITTED text of every driven case is pinned (a claim reached the operator by SOME mechanism, or none did)" $rc
+
+# ⛔ THE POPULATION IS GRADED AGAIN AT THE END OF THE RUN (review P3, cycle 77). `_out_got` is a SNAPSHOT: a case
+# directory — or a new capture inside one — created after it is never compared, and the witnesses below DO create
+# two (`outpin-mut`, `outpin-run`). Measured at the review: a fresh `$TMP/appended-case/out` carrying a clip claim,
+# added just before the tally, left the suite at 177 passed / 0 failed. So the map is taken once more here, the two
+# declared witness captures are set aside BY EXACT KEY, and everything else must still equal the pin. A new case, a
+# new capture in an old case, or a changed byte after the snapshot now reds.
+_out_late="$(printf '%s\n' "$(_out_map)" | grep -vxE '(outpin-mut|outpin-run)/out' | sed '/^$/d')"
+_out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
+if [ -z "$_out_late" ]; then
+  rc=1; echo "      the end-of-run map is EMPTY — this check would grade nothing"
+elif [ "$_out_late" = "$_out_late_pin" ]; then rc=0
+else
+  rc=1; echo "      the pinned population CHANGED after the snapshot — a case directory or capture created later cannot hide:"
+  for _okl in $(printf '%s\n' "$_out_late" "$_out_late_pin" | cut -d= -f1 | LC_ALL=C sort -u); do
+    _l_old="$(printf '%s\n' "$_out_late_pin" | grep -m1 "^$_okl=" | cut -d= -f2)"
+    _l_new="$(printf '%s\n' "$_out_late" | grep -m1 "^$_okl=" | cut -d= -f2)"
+    [ "$_l_old" = "$_l_new" ] && continue
+    if [ -z "$_l_new" ]; then echo "        capture $_okl VANISHED after the snapshot (pinned $_l_old)"
+    elif [ -z "$_l_old" ]; then echo "        capture $_okl APPEARED after the snapshot: $(_out_show "$_okl")"
+    else echo "        capture $_okl CHANGED after the snapshot: $(_out_show "$_okl")"; fi
+  done
+fi
+ck "the pinned population is UNCHANGED at the END of the run — a case directory or capture created after the snapshot cannot hide" $rc
 
 # ⛔ NON-VACUITY for the output pin — the mechanisms that beat every source predicate, each required to red.
 # The witness drives the SAME fixture §1 uses (pool '200,300' over queue '300,9,200': both ranked, so the
