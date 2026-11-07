@@ -1398,7 +1398,7 @@ ln -s "$_ledloop" "$_ledloop" 2>/dev/null
 [ -L "$_ledloop" ] && [ ! -e "$_ledloop" ] \
   || bad "the SYMLINK LOOP fixture did not build (a self-link must exist and must not resolve) — the arm below would then prove nothing"
 [ "$(review_attempts "$_ledloop")" = "$REVIEW_MAX_ATTEMPTS" ] \
-  || bad "a SYMLINK LOOP at the ledger path must FAIL CLOSED (got '$(review_attempts "$_ledloop")', want the cap $REVIEW_MAX_ATTEMPTS) — `-e` follows the link and answers 'absent', i.e. 0 dispatches, while the append fails: a free slot for ever"
+  || bad "a SYMLINK LOOP at the ledger path must FAIL CLOSED (got '$(review_attempts "$_ledloop")', want the cap $REVIEW_MAX_ATTEMPTS) — \`-e\` follows the link and answers 'absent', i.e. 0 dispatches, while the append fails: a free slot for ever"
 review_ledger_unreadable "$_ledloop" \
   || bad "a SYMLINK LOOP must be reported UNREADABLE by review_ledger_unreadable (rc $?) — an entry that does not resolve cannot be counted, which is this function's whole contract"
 rm -f "$_ledloop"
@@ -2273,6 +2273,14 @@ esac
 # returns 2 (TERMINAL, no window) for `clean` too — a record whose body marker is missing — and 3 for a spent
 # cap including the fail-closed cap of an unreadable ledger. None of the three shows in the PR body, all three
 # are reachable at the cap-deferral publish, and this marker is presence-keyed so nothing later supersedes it.
+# ⛔ AND THE AVAILABILITY FACT, OR THE ENUMERATION IS THE READER'S ONLY READING (review round 14, P3,
+# measured): this publish runs BEFORE the `REVIEW_AVAILABLE != 1` gate, so on a reviewerless box all three
+# enumerated reasons are false and the first sentence is false too — and while that box stays reviewerless
+# nothing head-keyed is ever published to correct it.
+case "$_cap" in
+  *'a usable reviewer exists on this box'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must name the reviewer-availability condition — this publish runs before the availability gate, so without it a mergeable green PR on a reviewerless box reads 'a reviewer is dispatched as soon as this repo has a free slot' with no reviewer in existence to dispatch" ;;
+esac
 for _term in 'a review record exists that the gate cannot bind' 'review attempts are spent'; do
   case "$_cap" in
     *"$_term"*) ;;
