@@ -3322,22 +3322,26 @@ else
   PPG_OK_RC=0; PPG_OK_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPG_REPO/scripts/cloud-cell-supervisor.sh" inst ppgiterr --install 2>&1)" || PPG_OK_RC=$?
   if [ "$PPG_OK_RC" -eq 0 ] && grep -qxF "Environment=ORCH_SUPERVISOR_PIN=${PPG_TOP}@${PPG_SHA}" "$PPG/units/eldato-orchestrator.service" 2>/dev/null; then
     ok '§P3: control — the status-failure fixture records a confident pin while git WORKS (so the arm below isolates the read)'
-    # …now the ONLY change: git resolves the tree and tracks the file, but refuses `status`.
+    # …now the ONLY change: git resolves the tree and tracks the file, but refuses the byte read.
+    # ⛔ RETARGETED WITH THE CODE (review-8 P2): the corroboration is now OBJECT-level
+    # (`rev-parse HEAD:<path>` against `hash-object <file>`), not a work-tree `status`, because `status` cannot
+    # be read on the bare-configured clone the cells run. A stub that still failed `status` would have gone
+    # VACUOUS the moment the code stopped calling it — it would pass while proving nothing.
     {
       printf '#!/usr/bin/env bash\n'
-      printf '# a git that answers every question EXCEPT the dirty read — the shape a corrupt index, ENOSPC, EACCES\n'
-      printf '# or safe.directory produces: resolution works, the status read does not.\n'
-      printf 'case "$*" in *"status --porcelain"*) exit 1 ;; esac\n'
+      printf '# a git that answers every question EXCEPT the byte read — the shape a corrupt object, ENOSPC,\n'
+      printf '# EACCES or safe.directory produces: resolution works, hashing the file does not.\n'
+      printf 'case "$*" in *"hash-object"*) exit 1 ;; esac\n'
       printf 'exec %s "$@"\n' "$PPG_GIT"
     } > "$PPG/bin/git"
     chmod +x "$PPG/bin/git"
     rm -f "$PPG/units/eldato-orchestrator.service"
     PPG_ERR_RC=0; PPG_ERR_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPG_REPO/scripts/cloud-cell-supervisor.sh" inst ppgiterr --install 2>&1)" || PPG_ERR_RC=$?
-    [ "$PPG_ERR_RC" -eq 0 ] && ok '§P3: a FAILED dirty read still installs (the pin is an observation, never a gate)' \
+    [ "$PPG_ERR_RC" -eq 0 ] && ok '§P3: a FAILED byte read still installs (the pin is an observation, never a gate)' \
                          || bad "§P3: a failed git status refused the install — a diagnostic must never withhold a supervisor: $PPG_ERR_OUT"
     grep -qxF 'Environment=ORCH_SUPERVISOR_PIN=unknown@unknown' "$PPG/units/eldato-orchestrator.service" 2>/dev/null \
       && ok '§P3: and an unreadable dirty state degrades to unknown@unknown rather than claiming a revision nobody verified' \
-      || bad "§P3: a FAILED git status rendered a confident pin — the recorded revision may not describe the bytes: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPG/units/eldato-orchestrator.service" 2>/dev/null)"
+      || bad "§P3: a FAILED byte read rendered a confident pin — the recorded revision may not describe the bytes: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPG/units/eldato-orchestrator.service" 2>/dev/null)"
   else
     bad "§P3: the status-failure fixture did not render a confident pin while git worked, so the cannot-verify arm proves nothing — $PPG_OK_OUT"
   fi
@@ -3473,6 +3477,22 @@ else
   grep -qxF "Environment=ORCH_SUPERVISOR_PIN=$PPB_REPO@$PPB_SHA" "$PPB/units/eldato-orchestrator.service" 2>/dev/null \
     && ok '§P3: and the pin still names the REPO (not unknown@sha) when git has no top level to report' \
     || bad "§P3: the pin lost its repo half on a bare-configured work tree — expected $PPB_REPO@$PPB_SHA, got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPB/units/eldato-orchestrator.service" 2>/dev/null)"
+  # ⛔ AND A HAND EDIT ON THE BARE-CONFIGURED CLONE IS STILL A HAND EDIT (review-8 P2, MEASURED — this arm
+  # exists because the previous corroboration consulted `git status`, which CANNOT be read on `core.bare=true`,
+  # so the read was skipped and the pin recorded a confident `<repo>@<sha>` for a patched file). The byte
+  # comparison asks `rev-parse HEAD:<path>` against `hash-object <file>`, which needs no work tree and no index,
+  # so the shape the fleet actually runs is graded like any other. Without this arm the fix would be another
+  # claim with nothing behind it, on the one checkout operators patch in place.
+  printf '\n# a hand edit made in place on a cell\n' >> "$PPB_REPO/scripts/cloud-cell-supervisor.sh"
+  rm -f "$PPB/units/eldato-orchestrator.service"
+  PPBD_RC=0; PPBD_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PPB_REPO/scripts/cloud-cell-supervisor.sh" inst ppb --install 2>&1)" || PPBD_RC=$?
+  if [ "$PPBD_RC" -ne 0 ]; then
+    bad "§P3: a hand-edited supervisor on a bare-configured clone REFUSED the install — the pin must never withhold a supervisor: $PPBD_OUT"
+  elif grep -qxF "Environment=ORCH_SUPERVISOR_PIN=$PPB_REPO@$PPB_SHA+dirty" "$PPB/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P3: a hand edit on the bare-configured clone is marked +dirty too (the byte comparison needs no work tree)'
+  else
+    bad "§P3: a HAND-EDITED supervisor on a bare-configured clone recorded a confident revision — expected $PPB_REPO@$PPB_SHA+dirty, got: $(grep -h 'ORCH_SUPERVISOR_PIN' "$PPB/units/eldato-orchestrator.service" 2>/dev/null)"
+  fi
 fi
 # ⛔ AND A UNIT RENDERED BEFORE THE PIN EXISTED DOES NOT BREAK --status: the line reports `absent` and the
 # verdict is untouched, because supervision is not the pin.
@@ -3612,6 +3632,43 @@ grep -qxF "ExecStart=/bin/bash $PREF_FARM start" "$PREF/units/eldato-orchestrato
 PREF2_RC=0; PREF2_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst pref --install 2>&1)" || PREF2_RC=$?
 [ "$PREF2_RC" -ne 0 ] && ok '§P5: the same path as an explicit ORCH_SUPERVISOR is still REFUSED (hard, not skipped)' \
                     || bad "§P5: an explicit non-durable requirement was silently swapped — the operator's decision was overridden: $PREF2_OUT"
+# ⛔ AND THE HARNESS PIN IS A CANDIDATE, NOT JUST A REMEDY IN THE REFUSAL TEXT (review-8 P1, MEASURED). This is
+# the shape that killed a bring-up: the caller's preference is skipped (a lane-owner layer), and the box's only
+# durable supervisor is the harness pin — which the refusal text RECOMMENDS but the candidate list never
+# proposed. The other candidates cannot stand in for it on a fresh cell: `cloud-cell-supervisor.sh` is in no
+# pi-bootstrap array (this file's own refusal text says so, #1938), and `beside` is that same farmed directory.
+# So the install refused and `cloud-cell-bringup.sh` died at `check_controller_service` — a false block on a cell
+# that HAS a durable supervisor. `check_harness_pin` runs BEFORE `check_controller_service` in the bring-up, so
+# the pin is always there by the time this question is asked.
+PREFC="$(arm_root prefc)"; mk_systemctl "$PREFC/bin" "$PREFC/state" "$PREFC/sc.log"; mk_tmux "$PREFC/bin" "$PREFC/tmux.log"
+rm -f "$(farmed_sup "$PREFC")"    # no farm — the fresh-cell shape the false block needed
+PREFC_REPO="$PREFC/home/agent-infra"; mkdir -p "$PREFC_REPO/scripts"
+cp "$SUP" "$PREFC_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PREFC_REPO" 2>/dev/null
+git -C "$PREFC_REPO" add -A >/dev/null 2>&1
+git -C "$PREFC_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+PREFC_SHA="$(git -C "$PREFC_REPO" rev-parse HEAD 2>/dev/null)"
+PREFC_DIR="$PREFC/home/harness/$PREFC_SHA"
+if [ -n "$PREFC_SHA" ] && git -C "$PREFC_REPO" worktree add --detach "$PREFC_DIR" "$PREFC_SHA" >/dev/null 2>&1; then
+  mkdir -p "$PREFC_DIR/scripts/orchestrator-harness"
+  : > "$PREFC_DIR/scripts/orchestrator-harness/orch-loop.sh"
+  printf '%s\n' "$PREFC_DIR/scripts/orchestrator-harness" > "$PREFC/home/.harness-path"
+  PREFC_RC=0
+  PREFC_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR_PREFER=$SCRATCH_P/cloud-cell-supervisor.sh" inst prefc --install 2>&1)" || PREFC_RC=$?
+  if [ "$PREFC_RC" -ne 0 ]; then
+    bad "§P5: with the preference skipped and no farm, the HARNESS PIN did not rescue the install — the bring-up dies on a cell that has a durable supervisor: $PREFC_OUT"
+  elif grep -qxF "ExecStart=/bin/bash $PREFC_DIR/scripts/cloud-cell-supervisor.sh start" "$PREFC/units/eldato-orchestrator.service" 2>/dev/null; then
+    ok '§P5: with the preference skipped and no farm, the unit falls through to the HARNESS PIN — the durable supervisor the box actually has'
+  else
+    bad "§P5: the unit did not name the harness pin — got: $(grep -h '^ExecStart=' "$PREFC/units/eldato-orchestrator.service" 2>/dev/null)"
+  fi
+  case "$PREFC_OUT" in
+    *'NOT rendering ExecStart from'*) ok '§P5: and the skipped preference is still named loudly' ;;
+    *) bad "§P5: the skipped preference went silent — $PREFC_OUT" ;;
+  esac
+else
+  bad '§P5: the harness-pin rescue fixture could not be built, so that arm did NOT run'
+fi
 # …and when NOTHING durable exists, the preference does not rescue the install either: fail closed, naming
 # the durable roots, instead of arming whatever was beside the installer.
 PREFB="$(arm_root prefb)"; mk_systemctl "$PREFB/bin" "$PREFB/state" "$PREFB/sc.log"; mk_tmux "$PREFB/bin" "$PREFB/tmux.log"

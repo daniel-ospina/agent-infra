@@ -273,6 +273,48 @@ pin_root_of_this_box() {
     esac
 }
 
+# pin_supervisor_of_this_box — the supervisor inside the harness pin this box records, or nothing.
+# ⛔ THE REFUSAL'S OWN SECOND REMEDY WAS NEVER A CANDIDATE (review-8 P1, MEASURED). The refusal text tells an
+# operator to use `$CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh`, and on a cell that file is
+# the ONE durable supervisor that actually exists — yet `resolve_supervisor`'s candidate list never proposed
+# it. The other two candidates cannot supply it on a fresh cell: `cloud-cell-supervisor.sh` is in NO
+# pi-bootstrap array (this file's own refusal text records that, #1938), and `beside` is the SAME farmed
+# directory for the farmed installer the bring-up prefers. So when the bring-up's PREFERENCE was skipped for a
+# lane-owner layer, every remaining candidate was absent and the install refused — killing the bring-up on a
+# cell that HAS a durable supervisor, which is the false block the soft preference exists to prevent. And the
+# doc claimed the loss was only the unmerged-code ExecStart because it "falls through to the farm", a file the
+# farm does not ship. The pin is resolved FIRST from the RECORD (exact: the tree the bring-up materialised this
+# run is the one the record names), so "newest pin" is not guessed by glob order; the `<root>/<sha>` scan is the
+# fallback for a box whose record is absent or names only the root.
+pin_supervisor_of_this_box() {
+    local f p tree root t
+    f="${HARNESS_PIN_FILE:-$CELL_HOME/.harness-path}"
+    if [ -f "$f" ]; then
+        p="$(head -1 "$f" 2>/dev/null)"
+        while [ "${p%/}" != "$p" ]; do p="${p%/}"; done
+        case "$p" in
+            */scripts/orchestrator-harness)
+                tree="$(dirname "$(dirname "$p")")"
+                if [ -f "$tree/scripts/cloud-cell-supervisor.sh" ]; then
+                    printf '%s\n' "$tree/scripts/cloud-cell-supervisor.sh"
+                    return 0
+                fi ;;
+        esac
+    fi
+    root="$(pin_root_of_this_box)"
+    [ -n "$root" ] || return 0
+    # the flat-pin layout the guard also admits: the pin ROOT is itself the worktree
+    if [ -f "$root/scripts/cloud-cell-supervisor.sh" ]; then
+        printf '%s\n' "$root/scripts/cloud-cell-supervisor.sh"
+        return 0
+    fi
+    for t in "$root"/*/; do
+        [ -f "${t%/}/scripts/cloud-cell-supervisor.sh" ] \
+            && printf '%s\n' "${t%/}/scripts/cloud-cell-supervisor.sh"
+    done
+    return 0
+}
+
 # linked_worktree_root <resolved supervisor> — the LINKED git worktree this path lives in, or nothing.
 # ⛔ A NAME LIST CANNOT BE THIS GUARD (re-review P1 of #2697). The measured shape was `/tmp/wt-2433-fu`, and
 # a copy nested one fixture deeper (`/tmp/r2697d/wt-2433-fu/…`) matches neither of those patterns nor the
@@ -645,13 +687,21 @@ resolve_supervisor() {
     # On a durable checkout the preference is honoured unchanged; on a LANE WORKTREE — the measured #2697
     # shape — it is SKIPPED with a loud note instead of arming a unit at a path a lane reaps. What counts as
     # durable still has exactly ONE owner (this guard), so the two call sites cannot drift apart.
-    local c r why hard i beside
+    local c r why hard i beside pin_sup
     local -a cands candk
     beside="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"
-    cands=( "${ORCH_SUPERVISOR:-}" "${ORCH_SUPERVISOR_PREFER:-}" \
+    # ⛔ THE HARNESS PIN IS THE THIRD KIND OF CANDIDATE, AND IT IS THE ONE THE REFUSAL ALREADY RECOMMENDS
+    # (review-8 P1, MEASURED). Preference strength, like the layer: it is the box's own pinned revision, not an
+    # operator's named requirement, so an unusable pin is skipped loudly rather than aborting. It sits BEFORE
+    # the two farm candidates because a pin is this cell's revision and the farm is a possibly-stale copy of
+    # another box's; it sits AFTER the layer preference because the layer is the code this bring-up just
+    # installed. Placed after `beside` only in the `cands` literal sense — the ORDER of the loop is what
+    # decides, so index 2 is the pin and the two farm paths follow it.
+    pin_sup="$(pin_supervisor_of_this_box 2>/dev/null | head -1)"
+    cands=( "${ORCH_SUPERVISOR:-}" "${ORCH_SUPERVISOR_PREFER:-}" "$pin_sup" \
             "$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh" "$beside" )
-    candk=( 1 0 0 0 )
-    for i in 0 1 2 3; do
+    candk=( 1 0 0 0 0 )
+    for i in 0 1 2 3 4; do
         c="${cands[$i]}"; hard="${candk[$i]}"
         # ⛔ AN OPERATOR'S REQUIREMENT THAT DOES NOT EXIST IS REFUSED, NEVER SILENTLY SWAPPED (re-review P2).
         # The candidate loop used to `continue` on a missing path for BOTH strengths, so
@@ -743,7 +793,7 @@ resolve_supervisor() {
         break
     done
     [ -n "$SUPERVISOR" ] || {
-        err "no DURABLE cloud-cell-supervisor.sh to render — looked at \$ORCH_SUPERVISOR, \$ORCH_SUPERVISOR_PREFER, \$HOME/.pi/agent/scripts, and beside this installer."
+        err "no DURABLE cloud-cell-supervisor.sh to render — looked at \$ORCH_SUPERVISOR, \$ORCH_SUPERVISOR_PREFER, the harness pin (\$CELL_HOME/harness), \$HOME/.pi/agent/scripts, and beside this installer."
         err "  A unit whose ExecStart a cleaning removes is not supervised: the start limit burns inside a minute,"
         err "  systemd converges it to 'failed', and nothing pages (agent-infra#2697). Name a durable copy:"
         err "    ORCH_SUPERVISOR=${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh bash $0 --install"
@@ -771,7 +821,7 @@ resolve_supervisor() {
 # until it restarts. Read it as "what this box will boot", which is what it measures.
 SUPERVISOR_PIN=""
 supervisor_pin() {
-    local dir repo="" sha="" gd named="" dirty="" dirt_rc=0
+    local dir repo="" sha="" gd named="" dirty="" dirt_rc=0 rel="" want="" got=""
     dir="$(dirname "$SUPERVISOR")"
     # ⛔ THE PIN NAMES A REPO THAT ACTUALLY CARRIES THIS FILE (re-review P2, measured). `git -C <dir> rev-parse`
     # answers the nearest ENCLOSING work tree, whether or not it has anything to do with the supervisor: a farmed
@@ -814,12 +864,24 @@ supervisor_pin() {
             # ⛔ SCOPED TO THE SUPERVISOR FILE, not the whole tree. An unrelated dirty file (the ordinary state
             # of a working checkout) does not change what this unit executes, and flagging it would make the
             # pin cry wolf until operators learned to ignore it — the diagnostic would be dead.
-            # ⛔ AND A READ THAT FAILS IS CANNOT-VERIFY, NEVER "clean" (the `df`/`stamp_write` rule). A
-            # `core.bare` clone has NO work tree, so "dirty" is not a question about it at all: the bare arm is
-            # skipped, or §P3's `<repo>@<sha>` (the cells' own `/tmp/cell-ai` shape) would degrade to
-            # `unknown@unknown` on every cell.
-            if [ -n "$named" ]; then
-                dirty="$("${GIT_SCRUB[@]}" git -C "$dir" status --porcelain -- "$SUPERVISOR" 2>/dev/null)" || dirt_rc=1
+            # ⛔ AND THE CORROBORATION IS OBJECT-LEVEL, NOT A WORK-TREE `status` (review-8 P2, MEASURED — my own
+            # previous version of this block was a FALSE PASS on the shape the fleet actually runs). The dirty
+            # read was guarded by `[ -n "$named" ]`, i.e. it only ran when git NAMED a top level — and this
+            # fleet's `/tmp/cell-ai` is `core.bare=true`, so `--show-toplevel` fails there and the read was
+            # SKIPPED. A hand-edited supervisor on a cell therefore recorded a confident `<repo>@<sha>`, which
+            # is exactly the wrong answer this block exists to stop, on the one checkout operators patch in
+            # place. No arm could see it (`core.bare` was only ever exercised CLEAN).
+            # So the question is asked the way it can always be answered: hash the FILE BYTES and compare them
+            # with the blob `HEAD` holds for that path. That needs no work tree and no index, so it answers
+            # identically on a bare-configured clone, a normal checkout, and one where the file is not tracked
+            # at all (where the tree read fails and the pin degrades — fail-closed).
+            rel="${SUPERVISOR#"$repo"/}"
+            want="$("${GIT_SCRUB[@]}" git -C "$dir" rev-parse "HEAD:$rel" 2>/dev/null)" || dirt_rc=1
+            got="$("${GIT_SCRUB[@]}" git -C "$dir" hash-object -- "$SUPERVISOR" 2>/dev/null)" || dirt_rc=1
+            if [ "$dirt_rc" -ne 0 ] || [ -z "$want" ] || [ -z "$got" ]; then
+                dirt_rc=1
+            elif [ "$want" != "$got" ]; then
+                dirty=1
             fi
         fi
     fi

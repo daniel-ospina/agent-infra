@@ -163,7 +163,12 @@ Without the preference strength the bring-up would refuse on a lane layer — `s
 checkout whenever a lane runs it — which is a real shape, and the reason the strength exists. The
 preference is a bodyguard, not a hole: a lane's **linked** worktree is refused by the git rule above
 before the preference is consulted, so what the bring-up loses is only the unmerged-code ExecStart it
-must not arm, and it falls through to the farm.
+must not arm, and it falls through to the **harness pin** (`$CELL_HOME/harness/<pin-sha>`, the box's own
+pinned revision — `check_harness_pin` runs before `check_controller_service`, so it exists by then) and
+then to the farm. ⛔ The pin is graded at preference strength and is tried **before** the two farm paths
+because a pin is this cell's revision where the farm is a possibly-stale copy; note the farm does not ship
+`cloud-cell-supervisor.sh` at all (#1938's named residual), so on a fresh cell the pin is the only
+durable candidate that exists.
 
 ## Install targets
 
