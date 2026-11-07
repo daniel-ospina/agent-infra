@@ -1,0 +1,34 @@
+{
+  "_ref": "refs/lanes/cmux.kbg-bgok-1794043759-p1839042-d0c68f00",
+  "_sha": "5be75d02d137fe19f17a408724e38438bd7ea303",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/tmp.hEVvMl7MUF/bg-o/bg/bgok.log"
+    },
+    {
+      "kind": "worktree",
+      "value": "/tmp/tmp.hEVvMl7MUF/wt"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 620,
+  "duration_s": 10,
+  "ended_at": 1794043769,
+  "exit_code": 0,
+  "heartbeat_at": 1794043769,
+  "host": "cmux",
+  "issue": null,
+  "kind": "bg",
+  "lane_id": "cmux.kbg-bgok-1794043759-p1839042-d0c68f00",
+  "lease_until": 1794044389,
+  "pid": 1839042,
+  "reason": null,
+  "repo": "owner/repo",
+  "schema": 1,
+  "started_at": 1794043759,
+  "state": "DONE",
+  "tag": "bgok",
+  "worktree": "/tmp/tmp.hEVvMl7MUF/wt"
+}
