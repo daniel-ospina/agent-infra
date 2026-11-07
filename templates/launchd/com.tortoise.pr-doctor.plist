@@ -25,10 +25,16 @@
          ⛔ IT IS NOT AN ALWAYS-INSTALLABLE JOB, AND THIS PARAGRAPH USED TO SAY IT WAS
          (review round 22, P1). It is a `{{TORTOISE_REPO}}`-GATED template — like
          branch-reaper, worktree-reaper and worktree-hygiene, and UNLIKE pi-reap-orphans,
-         pi-cache-reap and lane-liveness, which carry no placeholder that can resolve EMPTY
-         and really are always installed. (They do name placeholders — HOME and PATH — and
-         naming one is not what gates a template; a name that can be UNSET is.) The gate fires
-         BEFORE `verify_targets` (`install-launchd.sh`
+         pi-cache-reap and lane-liveness, whose names all resolve from the INSTALLER'S OWN
+         environment and really are always installed. ⛔ THE REAL RULE IS ROLE VS ENVIRONMENT,
+         NOT "names no placeholder" (round 24, P2: this line said "no placeholder that can
+         resolve EMPTY", which is FALSE — `install-launchd.sh` has a dedicated PATH skip
+         arm, measured to SKIP pi-cache-reap and lane-liveness when every PATH entry is
+         unreadable). A name resolved from the box's ROLE (`TORTOISE_REPO`, `SWARM_ROOT`,
+         `AI_*`) gates the template; a name resolved from the installer's own environment
+         (`HOME`, `PATH`) does not — so "always installed" holds for those three only while the
+         installer's PATH renders non-empty. The gate fires BEFORE `verify_targets`
+         (`install-launchd.sh`
          returns SKIP from the placeholder loop), so on a box that resolves no tortoise
          checkout this job is SKIPPED at rc 0 and the target check never runs at all.
          ⛔ AND THAT IS A REAL LIMIT OF THIS CHANGE, RECORDED HERE RATHER THAN LEFT IMPLIED:
@@ -52,9 +58,16 @@
          placeholder gate greps the RAW template — COMMENTS INCLUDED — so writing a braced
          placeholder token anywhere in this file, even while explaining that the placeholder
          is NOT used, ADDS IT AS A SKIP GATE: measured, the braced form made the installer print
-         `SKIP com.tortoise.pr-doctor: unresolved placeholder(s) — is this a swarm host?` on a
-         box whose only missing name was the one this unit does not need. Every placeholder
-         named in prose in this file must stay unbraced, or `grep -o` it before committing.
+         `SKIP com.tortoise.pr-doctor: unresolved placeholder(s) PYTHON-BIN — is this a swarm
+         host?` (the emitted line names PYTHON_BIN in braces there; it is spelled here with a
+         hyphen ON PURPOSE, see below) on a box whose only missing name was the one this unit
+         does not need. ⛔ THE
+         INVARIANT IS NOT "keep prose names unbraced" (round 24, P2 — the TORTOISE_REPO mention
+         above names one braced, legitimately, because this template already requires that name as
+         a value): a braced name in prose is SAFE only when the template already
+         requires that name as a VALUE token, because then it adds no new gate. A name the
+         template does NOT already require must stay unbraced in prose. When in doubt,
+         `grep -o '{{[A-Z_]*}}'` this file and diff it against `origin/main`.
          (An earlier version of this paragraph justified that by claiming the placeholder
          points at a non-existent venv on a non-swarm box; `install-launchd.sh` actually
          falls back to `command -v python3` when the venv is absent, so that install would
