@@ -889,9 +889,13 @@ gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; e
 # WHAT NAMES IT. Every refusing arm sets `GH_PROBE_CAUSE` to the question it asked and the answer it
 # MEASURED, and the call site interpolates it. NO new classifier and NO new gh call: the clause is
 # rendered from evidence the probe has already paid for (`$GH_PROBE_ERR` — STDERR only — plus the rc),
-# so the gh layer's own refusal line reaches the record with the words that produced it. That matters
-# most for a BUDGET refusal, where the numbers (`remaining=`, `floor=`, `resets_in=`, or the shim's
-# `gh-contended … wait budget` note) ARE the diagnosis.
+# so the layer's own refusal line reaches the record with the words that produced it.
+# ⛔ WHICH line that is, is NOT always the most specific one, and the earlier version of this paragraph
+# named the wrong candidates (`floor=`, `resets_in=`, the shim's `gh-contended … wait budget` note):
+# `gh-limit: gh-core-floor …` can never appear on this call at all (see below), and on the rc=75 arm the
+# take quotes the PACING note while `gh-contended` is line 3 — see the `GH_PROBE_CAUSE_MAX` block above
+# for the measurement. What is true, and all this paragraph should claim, is that whatever the take
+# quotes is the layer's own words rather than a classification of them.
 #
 # ⛔ ONE SHAPE THAT CANNOT ARRIVE HERE, SAID OUT LOUD SO NOBODY CHASES IT (#3701 review, P2). `gh api
 # rate_limit` IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it, and the CORE floor is

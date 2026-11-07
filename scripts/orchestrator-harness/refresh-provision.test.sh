@@ -1046,12 +1046,17 @@ then
   ck "(g2) with the call-site interpolation reverted the pass STILL refuses (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
   ck "(g2) …and its record falls back to the POINTER, so (g) is not vacuous" \
      "$(case "$GM_WHY" in *'refusal line above names which one'*) echo 0 ;; *) echo 1 ;; esac)"
-  # ⛔ AND IT MUST LOSE WHAT `(g)` ACTUALLY PINS — the PACING note (#3701 review round 8, P2). This row
-  # looked for `gh-contended`, which the reverted record could never contain (the revert drops the whole
-  # interpolation for a fixed literal), so it was inert: it stayed green under a mutation that removed
-  # the gh-contended line from the capture entirely. `(g)` now pins the pacing note, so this checks that.
-  ck "(g2) …and the reverted record loses the gh layer's evidence — the PACING note that (g) pins is live" \
-     "$(case "$GM_WHY" in *'shared rate-limit window'*) echo 1 ;; *) echo 0 ;; esac)"
+  # ⛔ AND IT MUST LOSE THE EVIDENCE SLOT ITSELF, not a token inside it (#3701 review round 9, P2). This
+  # row has now been inert twice: first it looked for `gh-contended`, then for the pacing note, and BOTH
+  # are impossible in the reverted record — the revert replaces the whole interpolation with a
+  # compile-time literal, so no capture content can appear either way. A row that cannot red is not a
+  # control. `evidence=` IS the thing the interpolation adds and the literal lacks, so THAT is the
+  # assertion: it reds if the revert stops reverting (anchor drift), which is the failure the control
+  # exists to catch.
+  ck "(g2) …and the reverted record has NO evidence= slot, which the live record does" \
+     "$(case "$GM_WHY" in *'evidence='*) echo 1 ;; *) echo 0 ;; esac)"
+  ck "(g2) …while the UNMUTATED record does have it, so the row above is not vacuous" \
+     "$(case "$G_WHY" in *'evidence='*) echo 0 ;; *) echo 1 ;; esac)"
 else
   bad "(g2) the non-vacuity control could not be produced"
 fi
@@ -1148,7 +1153,7 @@ if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut 
   # ⛔ NON-VACUITY, AND THE REASON THIS ARM IS NOT A TAUTOLOGY: the cut must GENUINELY HAVE FIRED, and the
   # two rows above must not be passing on a clause short enough to fit whole. The test is a BYTE
   # COMPARISON because that is the event itself; the earlier substring form only went absent once the cut
-  # had eaten the whole 38-byte trailing phrase. (The two happen to agree — the phrase IS the tail — which
+  # had eaten the whole 40-byte trailing phrase. (The two happen to agree — the phrase IS the tail — which
   # is why the byte form is the honest way to say it: it states the event instead of inferring it from a
   # phrase whose length must then be kept in step with the suffix.)
   ck "(g7) …with the cut genuinely FIRED (why=… exceeds the 400-byte window)" \
