@@ -528,6 +528,18 @@ await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropp
     logs.some(l => l.includes("declares BOTH") && l.includes("base layer") && l.includes("KEPT")),
     `the base layer must be named in the warning — got:\n${logs.join("\n")}`
   );
+  // ⛔ ENFORCE THE SECTION HEADER'S INVARIANT, not just document it: a fixture without `lazy` is EAGER
+  // and `connectServer` dispatches on `url` FIRST, so this one — ambiguous-but-KEPT — really dials host
+  // `x` (measured: 2 outbound connects per eager fixture under `EAGER_CONNECT_MAX_ATTEMPTS`). Nothing
+  // else in this test notices, so deleting `lazy` from `broken` used to restore live traffic in
+  // silence. The allowlist is passed as an explicit `undefined` ON PURPOSE: `classifyServers` filters by
+  // `PI_MCP_SERVERS` BEFORE it reads `cfg.lazy`, so an assertion on the "lazy server(s) not loaded" log
+  // line instead would be a FALSE RED on any box with that variable exported (measured: 60 passed / 2
+  // failed with `PI_MCP_SERVERS=none`, 62/0 without).
+  ok(
+    classifyServers(cfg.mcpServers as never, undefined).lazySkipped.includes("broken"),
+    "`broken` must be classified LAZY — otherwise this suite opens a real socket to host `x`"
+  );
 });
 
 await test("a `type` that disagrees with the transport is a WARNING, and the delta still applies", async () => {
@@ -832,6 +844,14 @@ await test("a non-string `url`/`command` and a bad name are DROPPED; an unrecogn
   ok(
     cfg.mcpServers.sseType,
     "an unrecognised `type` must NOT drop the entry — the client never reads `type`"
+  );
+  // Same enforcement as `broken` above, and for the same reason: an unrecognised `type` does not stop
+  // this entry being dispatched on its truthy `url`, so a lazy-less `sseType` is a LIVE outbound connect
+  // inside a suite that promises no process is spawned. Explicit `undefined` allowlist keeps the
+  // assertion independent of an exported `PI_MCP_SERVERS` (see `broken`).
+  ok(
+    classifyServers(cfg.mcpServers as never, undefined).lazySkipped.includes("sseType"),
+    "`sseType` must be classified LAZY — otherwise this suite opens a real socket to host `x`"
   );
 });
 

@@ -654,13 +654,15 @@ function isValidServerName(name: string): boolean {
  * therefore reverse that ruling AND zero a self-hosted config the installer certifies — so an
  * unrecognised `type` only earns a warning, never a drop.
  *
- * ⛔ OVERRIDES: the platform rule that `type` is the transport SELECTOR — pi's `docs/mcp.md:78`
- * ("When present, `type` must be `stdio`, `http`, or `streamable-http`") and Agent Client Protocol's
- * "transport variants are selected through this field" both treat a `type` that disagrees with the
- * entry as disqualifying. This client never reads `type` (it dispatches on `url`/`command`), so a
- * `type` can only ever ANNOTATE an entry here — it never selects, refuses or rewrites one. Reason: the
- * sibling ruling in `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/cell-install.sh` is that a
- * self-hosted `type: "sse"` config WORKS as written, so refusing or rewriting it would zero a config
+ * ⛔ OVERRIDES: pi's `sse`-rejection and skip-invalid-entries rules — `docs/mcp.md:79` ("`sse` is
+ * rejected") and `:80` ("Invalid entries are reported and skipped without preventing other servers
+ * from connecting") — this client WARNS and KEEPS such an entry instead of rejecting or skipping it.
+ * ⛔ Do not cite `:78` as the default being overridden: that line says "A `command` selects stdio and
+ * a `url` selects streamable HTTP", i.e. pi dispatches on `url`/`command` exactly as this client does,
+ * so the two agree there and a reader who follows a `:78` citation concludes the override is overstated.
+ * The disagreement is the invalid-`type` HANDLING above, not the dispatch rule. Reason the departure is
+ * kept: the sibling ruling in `pi-bootstrap/lib/merge-mcp.py` and `pi-bootstrap/cell-install.sh` is that
+ * a self-hosted `type: "sse"` config WORKS as written, so refusing or rewriting it would zero a config
  * the installer certifies. ⛔ Read this line before "correcting" the behaviour back to the platform
  * default — that is a reopen of that decision, not a bug fix. The absence of this marker is what let an
  * earlier revision of the PR that introduced this file describe the opposite behaviour in its own body.
