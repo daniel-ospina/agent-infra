@@ -112,17 +112,7 @@ pkill -f '[m]erge-one\.sh' >/dev/null 2>&1 || true
 pkill -f '[f]ix-one\.sh' >/dev/null 2>&1 || true
 sleep 2
 
-# 3. Prove the sweep is complete before restarting — a restart on a dirty cell
-#    just re-creates the problem we are here to fix.
-LEFT="$(ps -eo args 2>/dev/null | grep -c '[o]rch-loop\.sh')"
-if [ "$LEFT" != "0" ]; then
-  step "FATAL: $LEFT orch-loop process(es) survived the sweep"
-  ps -eo pid,etime,args 2>/dev/null | grep '[o]rch-loop\.sh' | cut -c1-160
-  exit 1
-fi
-step "sweep clean: 0 orch-loop, $(tmux ls 2>/dev/null | wc -l | tr -d ' ') tmux session(s)"
-
-# 3b. ⛔ ARCHIVE EVERY DIRTY WORKTREE BEFORE THIS BOX IS HANDED ON (#3485) — THE TOTAL-LOSS ROW.
+# 3. ⛔ ARCHIVE EVERY DIRTY WORKTREE BEFORE THIS BOX IS HANDED ON (#3485) — THE TOTAL-LOSS ROW.
 # A lane's uncommitted work is rescued by `bg-rescue-wip.sh` from inside `run_agent`, so it survives a
 # cap kill. It does NOT survive the two routes that bypass that function, and this script is one of
 # them: an OOM-killed lane, or any lane this quiesce just killed, leaves its work in the working tree
@@ -144,7 +134,21 @@ step "sweep clean: 0 orch-loop, $(tmux ls 2>/dev/null | wc -l | tr -d ' ') tmux 
 # in `cloud-cell-bringup.sh`; adding one is follow-up, and claiming it here would be an inert alarm
 # channel). A missing sweep is the same class as a
 # failing one: "a missing rescuer must never read as nothing to rescue".
+# ⛔ AND IT RUNS UNCONDITIONALLY, BEFORE THE STRAY-CONTROLLER INVARIANT BELOW (#3588 review, cycle 8).
+# The invariant check used to sit here — `LEFT != 0` → `exit 1` — and the archive was step 3b, AFTER it.
+# So on any cell where one orch-loop-looking process outlived the 2 s + 2 s kill window, the script exited
+# before archiving ANYTHING, and the only FATAL named the stray process: nothing on the run said the work
+# had not been archived. That is reachable without a real survivor — the pattern matches any argv
+# containing the string (a `tail -f …/orch-loop.log`, an editor, a monitor grepping it) and a controller
+# still winding down after TERM counts. Preserving the work is unconditional; refusing to REOPEN the cell
+# is the invariant. So the archive runs first, the invariant still aborts (with the archive's own verdict
+# stated in the abort message), and neither concern can silence the other.
+#
+# RESIDUAL, stated rather than implied: a tree a surviving process is still writing may be archived
+# mid-write. That snapshot is incomplete — and it is still strictly better than no snapshot on a box whose
+# disk is about to stop existing, which is what the old ordering produced.
 WIP_RC=0; WIP_WHY=""
+WIP_ONLY_LOCAL=0; WIP_LOCAL_WHY=""
 if [ -z "$SWEEP" ]; then
   WIP_RC=3; WIP_WHY="wip-sweep.sh not found (looked at \$REPO/scripts, the tree the pin record ${HARNESS_PIN_REC} names, $O, \$HOME/.pi/agent/scripts)"
   step "FATAL: wip-sweep: $WIP_WHY"
@@ -159,7 +163,33 @@ else
   WIP_OUT="$(O="$O" WIP_SWEEP_STATE_DIR="$O/state" bash "$SWEEP" --apply --max 0 --repo "$REPO" 2>&1)"; WIP_RC=$?
   printf '%s\n' "$WIP_OUT" | sed 's/^/  wip-sweep: /'
   case "$WIP_RC" in
-    0) step "wip-sweep: every dirty worktree of $REPO is archived on origin (other clones on this box were NOT swept)" ;;
+    0)
+       step "wip-sweep: every dirty worktree of $REPO is archived on origin (other clones on this box were NOT swept)"
+       # ⛔ EXIT 0 IS NOT "THE WORK IS ON ORIGIN" (#3588 review, cycle 8). The sweep exits 0 when
+       # `unpushed_worktrees>0`, and that is CORRECT for the sweep: it cannot archive commits, since
+       # bg-rescue-wip archives UNCOMMITTED work only. But this script's own step-8 invariant is "the work
+       # that was on this box is on origin", so a lane that COMMITTED and never pushed is a clean tree —
+       # nothing dirty, nothing archived, sweep exit 0 — and the old code printed DONE and exited 0 over
+       # commits that died with the VM. The counter that would have caught it was already sitting in the
+       # record, and the sweep's own comment says it is there so "the pass was green and three commits died
+       # with the box" cannot be read off a clean summary — which is exactly what this caller did.
+       # Unreadable is treated as unverified, never as zero: the record is written LAST by the sweep and a
+       # pass that could not write it exits 3, so "exit 0 and no record" means the tool that ran was not
+       # the one that shipped with this hook, and its silence is not evidence.
+       WIP_ST="${WIP_SWEEP_STATUS_FILE:-$O/state/wip-sweep.status}"
+       WIP_UNP=""
+       [ -r "$WIP_ST" ] && WIP_UNP="$(awk -F= '$1=="unpushed_worktrees"{v=$2} END{print v}' "$WIP_ST" 2>/dev/null)"
+       case "${WIP_UNP:-}" in
+         ''|*[!0-9]*)
+           WIP_ONLY_LOCAL=1
+           WIP_LOCAL_WHY="the pass record $WIP_ST is missing or carries no usable unpushed_worktrees= count, so 'every commit on this box is on origin' CANNOT be verified"
+           step "FATAL: wip-sweep: $WIP_LOCAL_WHY" ;;
+         0) : ;;
+         *)
+           WIP_ONLY_LOCAL=1
+           WIP_LOCAL_WHY="$WIP_UNP worktree(s) hold commit(s) that no remote has — bg-rescue-wip archives UNCOMMITTED work only, so those commits exist ONLY on this disk"
+           step "FATAL: wip-sweep: $WIP_LOCAL_WHY" ;;
+       esac ;;
     1) WIP_WHY="the pass was INCOMPLETE (exit 1: work was deferred by the per-pass cap or the budget, so it is NOT archived)"
        step "FATAL: wip-sweep: $WIP_WHY" ;;
     *) WIP_WHY="the pass FAILED (exit $WIP_RC) — see the run above"
@@ -167,6 +197,24 @@ else
        step "FATAL: wip-sweep: work on this box is NOT fully archived; it is LOST if this cell is reclaimed. Record: $O/state/wip-sweep.tsv" ;;
   esac
 fi
+
+# 3b. Prove the KILL sweep is complete before restarting — a restart on a cell that still holds a second
+#     controller re-creates the state this script exists to end. This runs AFTER the archive (see the note
+#     above step 3): the invariant governs the restart, never the rescue.
+LEFT="$(ps -eo args 2>/dev/null | grep -c '[o]rch-loop\.sh')"
+if [ "$LEFT" != "0" ]; then
+  step "FATAL: $LEFT orch-loop process(es) survived the kill sweep"
+  ps -eo pid,etime,args 2>/dev/null | grep '[o]rch-loop\.sh' | cut -c1-160
+  # The archive DID run by now, so say what it concluded. Without this the abort reads as "nothing was at
+  # risk", which is the same false assurance the old ordering produced by never archiving at all.
+  if [ "$WIP_RC" = "0" ] && [ "$WIP_ONLY_LOCAL" = "0" ]; then
+    step "  (the WIP archive HAD already run: every dirty worktree of $REPO is on origin)"
+  else
+    step "FATAL: and the WIP archive is NOT a success: ${WIP_WHY}${WIP_LOCAL_WHY}"
+  fi
+  exit 1
+fi
+step "kill sweep clean: 0 orch-loop, $(tmux ls 2>/dev/null | wc -l | tr -d ' ') tmux session(s)"
 
 # 4. Re-seed the runtime from the harness (the source of truth) and restart ONE.
 [ -d "$REPO" ] || { step "FATAL: no clone at $REPO"; exit 1; }
@@ -242,6 +290,12 @@ esac
 # sees it too.
 if [ "$WIP_RC" != "0" ]; then
   step "NOT DONE — one controller IS restored on $REPO, but the WIP archive did not complete: $WIP_WHY"
+  exit 1
+fi
+# The same invariant, one level finer: an archive that succeeded over DIRTY trees does not cover commits
+# that were never pushed, so the count in the record decides this too (#3588 review, cycle 8).
+if [ "$WIP_ONLY_LOCAL" != "0" ]; then
+  step "NOT DONE — one controller IS restored on $REPO, but WIP exists only on this disk: $WIP_LOCAL_WHY"
   exit 1
 fi
 step "DONE — cell has exactly one controller on $REPO"
