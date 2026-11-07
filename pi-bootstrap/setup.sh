@@ -634,7 +634,7 @@ fi
 # is not itself farmed; the unit names the checkout copy, which is the artifact #2877 landed and the
 # path this installer verifies before rendering. It ships DISARMED: `--install` renders a dry-run
 # unit and timer, and `--arm` (a dated owner step) is what lets the pass ACT.
-fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
+fleet_srcs=(fleet-cost-weekly.sh fleet-cost-report.sh fleet-schedule.py watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh reap-lane-venvs.sh venv-real-cost.py reap-abandoned-worktrees.sh reap-duplicate-installs.sh reap-runner-work.sh disk-reaper.sh disk-reaper-run.sh install-disk-reaper-timer.sh harness-apply-pass.sh install-harness-apply-timer.sh install-runner-autoscale-timer.sh pi-reap-worktrees-launchd.py worktree-disk-probe.sh cleanup-stale-branches.sh ci_runner_gate.sh ask-owner.py beta-progress.py cadence-nudge.sh cadence-timer.sh child-check.py cloud-cell-quiesce.sh cloud-cell-supervisor.sh install-controller-service.sh deploy-crossbox.sh deploy-mac-orchestrator.sh goal-state.py lane-actions.py lane-arm.sh install-lane-arm-timer.sh lane-guard.py lane-read.py lane-scan-fallback.sh lane-watchdog.py lane-wip.py live-workspaces-publisher.py merge-queue.py orch-send.sh orchestrator-heartbeat.sh orphan-reap.py pr-doctor.py objective.py probe-one.py publish-live-workspaces.py safe-send.sh seed-goal-map.py tree-cpu.py _bounce_state.py turn-classify.py turn-end.py unblock-lane.sh undelivered-answers.py worktree-hygiene-sweep.sh registry-sync.sh pr-repair-loop.sh install-repair-service.sh pr-doctor-trigger.py bg-rescue-wip.sh)
 mkdir -p "$DEST/scripts"
 fleet_copied=0
 for base in "${fleet_srcs[@]}"; do
@@ -665,7 +665,23 @@ done
 # down with it. Measured on #3486: `FAIL: install exited 1`, then `GUARD MISSING: …` × 6.
 # A `src` subdirectory with a flat `dest` is exactly what the installer's own reader models, so the
 # test's independent expectation stays a superset of this declaration with no change in semantics.
-mcp_harness_srcs=(lane_registry.py)
+#
+# ⛔ `cloud-cell-doctor.sh` BELONGS IN THIS ARRAY, and the array name is about the SOURCE DIR, not
+# about MCP: this is the repo's only src-one-down / dest-flat farm, and the doctor needs exactly that
+# (`scripts/orchestrator-harness/cloud-cell-doctor.sh` → `$DEST/scripts/cloud-cell-doctor.sh`). That
+# destination is the one `cloud-cell-supervisor.sh`'s `doctor_path()` resolves as
+# `$(dirname "$SUP_SELF")/cloud-cell-doctor.sh`, and the supervisor is farmed here FLAT — so without
+# this entry a fresh `$DEST/scripts` holds a supervisor whose every role `die`s "cloud-cell-doctor.sh
+# not found" (measured shape, #1552/#1899). It was EXEMPTED under #3530 when this array was believed
+# closed to it; the exemption claimed "no FARM_ARRAYS entry can carry it", which was false — the
+# installer loop below is content-agnostic, and `cell-install.sh:FARM_LAYOUT` already maps this array
+# to `scripts/orchestrator-harness → scripts`, so a cell gets it too. Measured 2026-11-07.
+# ⚠️ What farming flat does NOT carry is the doctor's OPTIONAL harness siblings (`lane-reap.sh`,
+# `rail-refusal.sh`, `repo-slug.sh`, `live-ownership.sh`), which it resolves from `$SELF_DIR` — still
+# absent on a farm-only box. But `doctor_path()` prefers `$O` and the checkout's
+# `orchestrator-harness/` BEFORE this flat copy, so the farmed one is the last resort: previously
+# ABSENT (a dead consumer), now PRESENT with degraded optionals.
+mcp_harness_srcs=(lane_registry.py cloud-cell-doctor.sh)
 for base in "${mcp_harness_srcs[@]}"; do
   farm_declared_rel+="scripts/$base"$'\n'
   f="$INFRA_ROOT/scripts/orchestrator-harness/$base"
@@ -920,7 +936,7 @@ fi
 # land as its `../verify-admin-merge-evidence.sh` sibling — the shim resolves the verifier from
 # its own location and fails CLOSED without it, so shipping one without the other produces a gate
 # that refuses EVERY admin merge.
-merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh)
+merge_gate_srcs=(record-review.sh review-pr.sh gh-shim/gh verify-admin-merge-evidence.sh admin-merge.sh)
 # The hosted-graph FALLBACK half (graph-mcp-provision). The MCP entry in
 # templates/.mcp.base.json is the PRIMARY path; this script is what a lane can still use when
 # the MCP client is unavailable from inside the session (#10605: ${TORTOISE_MCP_API_KEY} expanded
