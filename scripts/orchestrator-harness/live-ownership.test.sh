@@ -230,12 +230,23 @@ echo "=== 8) (a)(b)(c) the selection cases, and what the funnel SAYS ==="
 sel3() { lo_select "$@" > "$T/selline"; LO_CHOICE_V="$LO_CHOICE"; line="$(cat "$T/selline")"; }
 sel3 3 0 3 0 42 '' 9; choice="$LO_CHOICE_V"
 eqv "(a) 3 un-owned -> the choice is PR takeover" "pr" "$choice"
-case "$line" in *"issues: SKIPPED (un-owned PRs exist)"*) ok "(a) the funnel SAYS the issue path is shut" ;;
-  *) bad "(a) the funnel did not name the blocked issue path: $line" ;; esac
+# ⛔ THE WORD CHANGED WITH THE OWNER'S REFINEMENT (2026-11-04), and the ASSERTION IS NOT WEAKER FOR IT.
+# The issue path is still not open here — but it is not *closed* either: PR work has the first call on
+# the room, which is a different state with a different remedy (wait/drain, not "unblock"). Pinning
+# "SKIPPED (un-owned PRs exist)" would have made this suite demand the barrier back.
+case "$line" in *"issues: DEFERRED (PR work holds the priority"*) ok "(a) the funnel SAYS the issue path is DEFERRED, not closed" ;;
+  *) bad "(a) the funnel did not name the deferred issue path: $line" ;; esac
 case "$line" in *"#42"*) ok "(a) the funnel names the PR it will take first" ;;
   *) bad "(a) the funnel did not name a target: $line" ;; esac
 case "$line" in *"3 un-owned"*) ok "(a) the funnel carries the count it decided on" ;;
   *) bad "(a) the funnel lost the count: $line" ;; esac
+# ⛔ THE CASCADE ITSELF: IDENTICAL INPUTS EXCEPT THE ONE NEW ONE. `pr_waiting=0` says the PR sweep ran
+# and LEFT ROOM, and the same 3 un-owned PRs must now read as a grant rather than a block. Without
+# this pair the funnel could hard-code either answer and both halves above would still pass.
+sel3 3 0 3 0 42 '' 9 '' '' '' '' 0; choice="$LO_CHOICE_V"
+eqv "(a2) 3 un-owned, but the PR sweep left room -> the CASCADE opens the issue path" "issue" "$choice"
+case "$line" in *"DISPATCH — CASCADE"*) ok "(a2) …and the funnel NAMES the cascade, so the reason is legible" ;;
+  *) bad "(a2) the funnel did not name the cascade: $line" ;; esac
 # (b) 0 un-owned + capacity: issues.
 sel3 0 0 0 0 - '' 7; choice="$LO_CHOICE_V"
 eqv "(b) 0 un-owned + capacity -> dispatch issues" "issue" "$choice"

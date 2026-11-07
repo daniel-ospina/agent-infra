@@ -65,7 +65,7 @@ measurement** — and is marked as such.
 | epic row (or mandate item) | measured 2026-10-24 | verdict |
 |---|---|---|
 | `eldato-orchestrator` on cell-4 — the epic's false-PASS example: *"cell-4's controller unit is `inactive` and it still looked healthy in the fleet report"* | **14:46:01Z** `systemctl is-active eldato-orchestrator` → `inactive`; `enabled` → `not-found`; `0` unit files. **14:50:22Z** → `active` (unit installed 14:47:43Z by #2402), with `MainPID = /bin/bash …/cloud-cell-supervisor.sh start`, whose journal line is `controller already running (pid 684873684873) — this unit supervises the cell now: waiting for it to go, then taking over (a stop or a restart ends this wait)` | **The proxy is wrong in BOTH directions.** At 14:46 an `inactive` unit sat over a **live** controller (pid 684873, `HEALTHY age=180`, `[dispatch]` cycle records, live `merge-*` worker sessions — 3 at 14:46Z, 2 at 14:47Z). At 14:50 an `active` unit means a supervisor **waiting for a foreign pid**, while the running controller executes the **older** snapshot `d4ccaf6ee8e6` and the pin names `130638e40658`. "Unit is active" is not an effect test — measured on the box the epic cites. |
-| **precedence rule: ">N unmerged PRs ⇒ merging outranks new work"** — the epic's cell: *"❌ implemented nowhere"* | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's mandate item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §6, `OVERRIDES:`). |
+| **precedence rule: ">N unmerged PRs ⇒ merging outranks new work"** — the epic's cell: *"❌ implemented nowhere"* | `orch-loop.sh`, the comment above `mp_reason`: *"Merge priority: while any UN-OWNED PR remains, the box's work is the PR queue, not new PRs."* Shipped, and observable: cell-4's newest cycle record reads `dispatched=0 nothing=gate:merge-priority_(5_un-owned_of_13_open_PR(s)_—_PRs_before_issues)` | **Already implemented — and NOT as a threshold.** ⛔ **CORRECTED 2026-11-04:** the *observable* quoted in this row (`nothing=gate:merge-priority_(…)`) is now stale — `merge-priority` no longer assigns `GATE_WHY`, so it no longer appears as a gate at all; it is a LEVEL of the five-level cascade (§6). The row's verdict (no threshold) still holds, and the ordering it describes still ships; what changed is that the ordering stopped being a barrier. #2099 (owner ruling, 2026-10-18) *removed* the threshold: *"for as long as ANY workable un-owned PR remains, issues are not opened — no threshold, no age, no evidence arm"*. The epic's mandate item 4 asks for "a threshold that is a measured number with a written rationale"; **that design is superseded by a recorded owner decision** and must not be re-introduced (see §6, `OVERRIDES:`). |
 | **universal dispatcher (one seam: place this lane on the machine with headroom)** — the epic's cell: *"❌ two ad-hoc scripts (`dispatch_generic.py`, `nonblocking-dispatch.sh`)"* | `capacity.sh` ships `cap_probe_local` / `cap_publish` / `cap_read_fleet` / `cap_place`, is sourced each cycle by `orch-loop.sh` (from `$O`, falling back to its own directory), and every cycle writes `[capacity] placement=… place=… lpc_self=… ceiling_lpc=… bound=…`. Cell-4's cycle record: `placement=place placed_on=cmux bound=none lpc_self=57` | **The seam exists.** Its *real* defect is different and worse: **its fleet view collapses to one box** (§3.10, measured). |
 | *"no machine except the Mac has an actuator that lands anything"* (the epic's own reading of its table) | tortoise **16 PRs merged in the 8 h to 14:50Z**, two of them at **14:47:28Z** and **14:47:52Z**; agent-infra **11** in the same window; cell-4 held live `merge-*` worker sessions at 14:46Z | **Cells do land work.** ⚠️ Attribution is the gap: **no landing record carries the box that landed it** (§3.3), so "can this machine land?" is unanswerable from the artifacts — which is the dispatcher's own question. |
 | **`pr-doctor` actually running** (epic: ❌ on every cell) | cell-4: `pgrep -f '[p]r-doctor.py'` → `0`; `pr-doctor.log` mtime `2026-10-22T12:55:05Z` (2 days); `0` systemd/launchd units matching `pr-doctor` | ✅ **Confirmed on cell-4.** Peers `UNREADABLE` (§1.1). |
@@ -221,7 +221,8 @@ remaining half.
 last line `date: write error: No space left on device` — while the controller was cycling and landing.
 
 **What repairs it.** `nothing=gate:load…` → wait (a load refusal clears itself). `gate:merge-priority`
-→ drain the queue: this is the gate working, not a fault. `placement=refuse bound=…` → the *fleet*
+(since 2026-11-04: a `[cascade] priority=…` line, not a `gate:` refusal) → drain the queue: this is the
+priority working, not a fault. `placement=refuse bound=…` → the *fleet*
 needs a box (`load_per_cpu`), a prune (`disk`), or a restart (`fork_*`). `DEGRADED` (freshness) →
 restart the controller (`cloud-cell-supervisor.sh stop && start`; on the Mac `install.sh --restart`,
 never `unload -w`). `FORK-STARVED` → **from outside the box** (nothing inside can fork to clean up).
@@ -986,6 +987,91 @@ still where the next cut should start.
   merge-queue scheduler — the fleet decided against a number here, because a gate whose opening
   condition the automation cannot meet is a **drain defect, not a licence to open the gate**
   (measured 2026-10-18: three cells at `52 unowned of 54 open PRs`, `lanes=0`, for HOURS).
+- **⭐ THE PRECEDENCE IS AN ORDER — and the BARRIER SURVIVES as levels 2-4, which this bullet must not
+  be read as denying (corrected 2026-11-06; see the correction inside it).**
+  Owner ruling 2026-11-04: the controller fills work down a **five-level cascade** — (1) fix main if
+  red, (2) merge PRs, (3) fix PRs with post-review findings, (4) the review→findings→fix→re-review
+  loop, (5) open new issue work — draining each level before descending, and descending only into the
+  capacity the spawn gates left free. **The 2026-10-18 ruling above is REFINED, not reversed**: the
+  ORDERING (PR work outranks new work, and is attempted first) is kept exactly. ⛔ **WHAT IS NOT
+  CLAIMED HERE — corrected 2026-11-06 (review P2).** An earlier draft of this bullet said the ruling's
+  "second effect — that *any* un-owned PR closed the issue path unconditionally" was *removed*. It is
+  not: levels 2-4 partition every un-owned PR, so **the dispatch outcome for `>=1` un-owned PR is the
+  same as the old `GATE_WHY` barrier** (short-circuited only by a park, which the count subtracts, and
+  released only by the bounded drain escape). What the change actually delivers is (i) the barrier's
+  *absolute* form gone from `GATE_WHY`, so it can no longer MASK a capacity gate or hide behind itself,
+  (ii) a WIDENED ownership predicate (a live review/fix/CI lane now counts as owning its PR, so the
+  un-owned population can reach zero where it previously could not), and (iii) the drain escape that
+  grants the slots it spends. The measured recovery therefore comes from (ii) and (iii), NOT from
+  removing the barrier — and the 0.66% below is the cost that motivated the change, not a number this
+  change is known to have fixed. Measured cost of the barrier, 1,219 consecutive cycles:
+  `dispatched>0` in **8** of them (**0.66%**), always
+  `dispatched=2`, i.e. **0.054 issues/h against an 8.1/h bound (0.7%)**, while the PR path consumed
+  8.59 workers/h — the box was saturated by PR work and produced almost nothing else, and the same
+  barrier is what let a stalled drain hide behind itself.
+  - **Spawn gates remain the ONLY limit on how much runs at once** (`MAX_LANES`, `MAX_LOAD`, the
+    memory floor, fork headroom via `can_spawn`). The cascade adds no pacing, no nap, no new
+    threshold. **It is not the only thing that can withhold work, and this document will not claim it
+    is** (corrected 2026-11-06, review P1): the WIP-limit arm (`LANDING_FLOOR`) still closes the issue
+    path on its own, and a cascade LEVEL holds the room while it drains. So "spawn gates are the only
+    capacity limit" is true of *concurrency*, and false of *dispatch*.
+  - **Level 5 is lowest priority, NOT "always reachable".** It gets what levels 1-4 left free, so on a
+    pass where a level holds, level 5 gets nothing — by design, that is what a priority means.
+    ⛔ **AND THE PRECISE CONSEQUENCE, WHICH AN EARLIER DRAFT OF THIS BULLET OVERSTATED** (corrected
+    2026-11-06 from a fresh-context review). The draft said *"an un-owned PR merely EXISTING no longer
+    closes the issue path"*, and that is **not true of this code**: levels 2-4 partition every un-owned
+    PR (GREEN -> `MERGE`, RED -> `FIX_PR`, everything else -> `REVIEW_PR`), so `n_m + n_f + n_r == n_u`
+    and **level 5 is reached only when there is NO un-owned PR at all**. What this change actually
+    removed is the barrier's *absolute* form — a bare `mp_reason` string assigned into `GATE_WHY`,
+    which closed the issue path while masking every capacity gate behind it. What it did NOT do is
+    make a level with work stop withholding the room, and `test-cascade.sh` now pins the pole (level 5
+    only at zero un-owned PRs) so this is read as measurement, not as a promise.
+  - **⛔ OPEN OWNER DECISION — A LEVEL HOLDS ON A COUNT, NOT ON ACTIONABILITY, AND LEVEL 1 HAS NO
+    ACTOR AT ALL.** The header of `cascade_level` now says what it measures — "the first level with a
+    NON-ZERO COUNT wins" — and that is the gap named here: a COUNT is not actionability, and the
+    classification is a check-state count (`state/prclass.tsv` carries check state only — no
+    mergeability, no review state), so a level holds whether or not a lane could spend the room. Two
+    measured consequences, both pinned in `test-cascade.sh`:
+    - A GREEN-but-unreviewed PR counts as `MERGE` work even though the rail will not merge it, so
+      "mergeable + review-satisfied" is narrower than what the classifier can see.
+    - Level 1 (`FIX_MAIN`) is weaker still: it zeroes the issue batch and nothing in `orch-loop.sh`
+      spawns, orders or nominates work for it, so a red main closes the issue path and does nothing
+      toward fixing main. Its own stated rationale ("main must be green before anything lands on it")
+      is not implemented either — `CASCADE_*` is consumed only by the issue batch, never by the merge
+      path.
+    Making the levels actionability-bounded is a **behavioural policy choice and an owner decision**;
+    this change implements neither form of it and pins the state instead, so the choice is made
+    against a fixture rather than by drift. It is deliberately NOT filed as a bug: the two candidate
+    remedies (bind the hold to a spawnable actor, or narrow level 1's input to what the merge rail
+    itself measures) are policies, not defects to be repaired unilaterally.
+  - **The main-red repair exemption now recognises the title the repo actually files** (fixed
+    2026-11-06). `land_backlog_exempt` recorded the policy — *"a `base-red` / `main-red` repair …
+    holding it would be exactly backwards"* — but its six title patterns matched none of them the only
+    main-red title this repo produces: `ci-main.yml`'s `auto-file-on-failure` writes
+    `main broken by merge: <failing jobs>`. The exemption had therefore never fired for a single
+    auto-filed repair. It now includes the filer's own prefix. This introduces no policy — it makes a
+    recorded decision fire — and `test-cascade.sh` pins both directions (the filer's title IS
+    recognised; an unrelated title is not).
+  - **An unreadable PR listing still fails CLOSED** (no room granted) — the polarity that used to ride
+    along inside the barrier is now enforced where the room is granted, because losing it would make a
+    rate-limited `gh` listing the one condition that dispatches new work. ⛔ **It keys on the ROW FILE,
+    not on the count.** `open_pr_count`'s failure path substitutes a NUMBER (a sticky last-known, else
+    `MERGE_PRIORITY_AT + 1`) and `rm -f`s `state/last-open-prs`, so "unreadable" survives only as an
+    ABSENT row file; a guard keyed on the count would never fire. Measured against a 403 `gh` stub, a
+    count-keyed guard read the failed listing as `26` un-owned and dispatched issue work.
+  - **`merge-priority` no longer assigns `GATE_WHY`**, so it can no longer mask a capacity gate: it is
+    computed into `MP_PRIORITY` and printed as a level, and the capacity arms decide the cycle.
+  - Graded by `test-cascade.sh` (assertion and mutant counts are the suite's own printed totals, not a
+    claim made here — each mutation makes a named assertion go RED) plus the existing `test-gates.sh`
+    vector tests, `live-ownership.test.sh` and `pr-owner-liveness.test.sh`.
+  **OVERRIDES:** the 2026-10-18 ruling's **ABSOLUTE form** — "for as long as ANY workable un-owned PR
+  remains, issues are not opened", with no threshold, no age and no evidence arm — as a bar on the
+  *issue path's own existence*. The ORDER is kept (PR work first, first call on every free slot) and a
+  level holding on a non-zero count STILL withholds the room; what is overridden is that the bar may
+  not be *masked* into `GATE_WHY` (where it hid every capacity gate behind it) and that it may not be
+  *unreleasable* (the bounded drain escape now grants what it spends). Reason: 0.7% issue dispatch over
+  12.45 days. ⛔ Read together with the correction above: this marker does NOT claim the barrier is
+  gone, and a reader must not take it as one — see the `OPEN OWNER DECISION` bullet for what remains.
 - **Dispatch is gated on capacity, not on a lane count.** Owner ruling 2026-10-17: *"dispatch should be
   gated on capacity, not on number of lanes"* (`MAX_LANES` is 2.5×cores as a derived *ceiling*, and
   `capacity.sh` explicitly refuses to be a lane cap).

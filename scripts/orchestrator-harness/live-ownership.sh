@@ -329,7 +329,13 @@ lo_select_rows() {
 
 # ── the choice ────────────────────────────────────────────────────────────────
 # lo_select <total> <owned> <unowned> <parked-excluded> <first-pr|-> <capacity-reason|-> <backlog> \
-#          [<acted> <named-waits> <record|unknown> [<spawned>]]
+#          [<acted> <named-waits> <record|unknown> [<spawned> [<pr-waiting>]]]
+#
+# ⛔ `<pr-waiting>` IS THE CASCADE (owner ruling 2026-11-04), and its absence is NOT zero: an older
+# caller that does not pass it keeps the pre-change behaviour (`1` ⇒ PR work holds the issue path).
+# `0` means the PR sweep ran FIRST this pass, took the room it needed, and left room — so the issue
+# path opens and the line SAYS the order was respected. This is the only place the funnel learns that
+# "un-owned PRs exist" and "the issue path is closed" are two different statements.
 #
 # Prints the ONE-LINE FUNNEL that makes the cycle's choice auditable, and sets LO_CHOICE to
 # pr|issue|none. The ordering IS the rule: un-owned PRs → new issues → nothing.
@@ -358,11 +364,26 @@ lo_select_rows() {
 # module still agree, and a module must never invent a spawn count it was not given.
 lo_select() {
   local total="${1:--}" owned="${2:--}" unowned="${3:--}" parked="${4:-0}" first="${5:--}" cap="${6:-}" backlog="${7:-0}"
-  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}"
-  local prs_why issues_why
+  local acted="${8:-}" waits="${9:-}" rec="${10:-}" spawned="${11:-}" prw="${12:-}" prwhy="${13:-}"
+  local prs_why issues_why pr_waiting _prw_tail
   LO_CHOICE=none
   lo_num "$unowned" || unowned=""
+  # ⛔ A DIGIT STRING IS NOT A COUNT, AND AN OUT-OF-RANGE ONE FAILS **OPEN** HERE (review 2026-11-04,
+  # P1). `lo_num` accepts any run of digits, but `[ 99999999999999999999 -gt 0 ]` ERRORS — and in an
+  # `elif` chain an errored test is FALSE, so control falls past EVERY arm into the final `else`, which
+  # sets `LO_CHOICE=issue` and prints `DISPATCH`. Measured with the shipped function:
+  #   `15 PRs: 99999999999999999999 un-owned -> no un-owned PR left ; issues: DISPATCH (10 in backlog)`
+  # — a pass that prints a dispatch the batch loop then refuses (`CASCADE_ISSUE_SLOTS=0`), i.e. the
+  # false PASS this change's own comment says it prevents. The bound is the same 9 digits `is_limit`
+  # uses in the controller, applied where the arithmetic happens, and the count is treated as the
+  # UNREADABLE case (drain), which is the polarity the count already takes for a non-number.
+  if [ -n "$unowned" ] && [ "${#unowned}" -gt 9 ]; then unowned=""; fi
   lo_num "$parked"  || parked=0
+  # ⛔ THE TWELFTH INPUT IS THE CASCADE (owner ruling 2026-11-04), and its ABSENCE is not "0". An older
+  # caller that does not report it keeps the pre-change behaviour exactly (`pr_waiting=1` ⇒ PR work
+  # holds the issue path), so a stale module and a new caller cannot silently disagree about whether
+  # issues may open — the module must never invent a capacity it was not told about.
+  pr_waiting="${prw:-1}"
   # An ABSENT acted count is not zero: it means the caller does not report it (an older caller), and
   # the old wording must stand. `0` is a MEASURED zero and takes the honest branch below.
   lo_num "$acted" || acted=""
@@ -376,7 +397,7 @@ lo_select() {
     LO_CHOICE=pr
     prs_why="dispatching PR-takeover (un-owned count UNREADABLE — draining rather than opening)"
     issues_why="SKIPPED (un-owned PR fetch unreadable)"
-  elif [ "$unowned" -gt 0 ]; then
+  elif [ "$unowned" -gt 0 ] && [ "$pr_waiting" != "0" ]; then
     LO_CHOICE=pr
     if [ "$spawned" = "0" ] && [ "$rec" = "unknown" ]; then
       # BOTH readings, kept apart: the spawn count WAS measured (0 worker records) while the per-PR
@@ -407,11 +428,55 @@ lo_select() {
     else
       prs_why="dispatching PR-takeover (target not resolved this cycle${spawned:+; $spawned worker(s) spawned})"
     fi
-    issues_why="SKIPPED (un-owned PRs exist)"
+    # ⛔ THE WORD "PRIORITY" IS LOAD-BEARING (owner ruling 2026-11-04). This is the branch a reader
+    # meets on almost every cycle, and it must not say the issue path is CLOSED — it is DEFERRED,
+    # because PR work has the first call on the room the box has. The two readings are different
+    # states with different remedies (wait vs. drain), so they get different words.
+    # ⛔ ONE BOOLEAN, THREE CAUSES — SO THE REASON IS PASSED, NOT INFERRED (review cycle 2, P2).
+    # `pr_waiting=1` is set by ANY of: the priority label, a pyramid LEVEL holding the room with lanes
+    # idle, or an unreadable un-owned count. The first version said "no room left after it" for all
+    # three, which is false in two of them (there IS room; a higher level owns it / nobody could read
+    # the count). The default sentence is unchanged byte for byte, so an older caller keeps it.
+    case "${prwhy:-}" in
+      holds)      _prw_tail=" and a higher level is holding the room this pass" ;;
+      unreadable) _prw_tail=" and the count could not be read, so nothing is opened" ;;
+      *)          _prw_tail=" and no room left after it" ;;
+    esac
+    issues_why="DEFERRED (PR work holds the priority: ${unowned} un-owned PR(s)${_prw_tail})"
   elif [ -n "$cap" ]; then
     LO_CHOICE=none
     prs_why="no un-owned PR left"
+    [ "$unowned" -gt 0 ] && prs_why="PR work dispatched first (${unowned} un-owned PR(s) remain, in flight)"
     issues_why="SKIPPED (no capacity: $cap)"
+  elif [ "$unowned" -gt 0 ]; then
+    # ── THE CASCADE OPENS HERE (owner ruling 2026-11-04) ─────────────────────────────────────
+    # Un-owned PR work EXISTS and the box still has room the PR sweep did not take. The recorded
+    # order is intact (PR work ran first and took the first slots); what is dropped is the barrier
+    # that held the rest of the capacity idle. Measured cost of the barrier: 0.66% of cycles
+    # dispatched ANYTHING over 1,219 cycles.
+    LO_CHOICE=issue
+    prs_why="PR-takeover ran first and took the room it needed (${unowned} un-owned PR(s) remain in flight)"
+    issues_why="DISPATCH — CASCADE ($backlog in backlog; the PR path had the first call on capacity and left room)"
+  elif [ "${prw:-}" = "1" ]; then
+    # ⛔ `"${prw:-}" = "1"`, NOT `"$pr_waiting" != "0"` (measured, 2026-11-06). An ABSENT cascade input
+    # is an OLDER CALLER, and `pr_waiting="${prw:-1}"` defaults it to 1 so the pre-change wording stands
+    # — which is right for the arms above, where `unowned -gt 0` also has to hold. Here there is no such
+    # second conjunct, so keying on the DEFAULT would defer for every caller that never reported the
+    # input at all: `live-ownership.test.sh` case (b) (7 positionals, no cascade arg) went from
+    # `DISPATCH` to `DEFERRED`. This arm fires only on a MEASURED hold, which is the same terse-minus
+    # rule the batch guard and the escape block use one file over.
+    # ⛔ A LEVEL CAN HOLD WITH **ZERO** UN-OWNED PRs, AND THE FUNNEL MUST SAY SO (review P1,
+    # 2026-11-06 — measured). `pr_waiting=1` beside `unowned=0` is exactly "a higher level owns the
+    # room": level 1 (`FIX_MAIN`) is measured from MAIN's own check-runs and does not depend on how
+    # many un-owned PRs exist. Every other arm here gates `pr_waiting` behind `unowned -gt 0`, and the
+    # final arm below is hard-wired to DISPATCH — so without this arm the pass printed
+    # `DISPATCH (10 in backlog)` over a batch whose FIRST guard (`issue_slots -ge 1`) broke
+    # immediately: zero issues queued, every pass, while the tail of this same message claimed the
+    # cascade opens "the moment a slot frees". A printed decision that disagrees with the acted-on one
+    # is the defect this whole change exists to remove, and `unowned == 0` is what makes it reachable.
+    LO_CHOICE=none
+    prs_why="no un-owned PR left"
+    issues_why="DEFERRED (a higher level is holding the room this pass: ${unowned} un-owned PR(s))"
   else
     LO_CHOICE=issue
     prs_why="no un-owned PR left"
