@@ -1128,9 +1128,13 @@ gh_probe_env() {
     # settings the shim spends 120 s sleeping out a shared throttle window before it ever returns 75,
     # so a probe bounded at 20 s sees THIS arm — and "a shared budget is being slept out" is one of
     # the things a bound here can mean. It establishes a NON-ANSWER, nothing more.
-    # ⛔ AND IT CARRIES ITS EVIDENCE (#3701 round 4, P2) — this is the DEFAULT shape at default knobs,
-    # so leaving `err` in the LOG only meant the record on the ordinary path carried no gh-layer line
-    # at all, which is the second half of the acceptance bullet. Verdict leads, evidence closes.
+    # ⛔ AND IT CARRIES ITS EVIDENCE SLOT (#3701 round 4; round 7 corrected WHAT it can say). At
+    # default knobs the shim is SIGKILLed by this probe's bound BEFORE `flush_notes` runs, so the
+    # capture is ZERO bytes and `gh_probe_evidence` renders `rc=142, no stderr written`. That is a
+    # NAMED NON-ANSWER rather than a gh-layer line — the honest maximum on this path, and the reason
+    # the slot is worth wiring: the record says the layer wrote nothing, instead of carrying no
+    # evidence field at all. `(g9)`'s stub writes its stderr BEFORE sleeping, an ordering a SIGKILLed
+    # shim cannot produce, so that row pins the INTERPOLATION, not a production byte count.
     GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s: a NON-ANSWER, which establishes neither a rejected credential nor anything about the budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence); evidence=$(gh_probe_evidence "$prc")"
     echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
     printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
@@ -2212,8 +2216,8 @@ refresh_record_write running provision 0 \
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
 # ⛔ THE CAUSE NAMES THE PRECONDITION (#3584). This used to read `(the refusal line above names which
-# one)`, which is a pointer into the LOG — while `orch-loop.sh` builds its `[dispatch] BLOCKED` line,
-# and `.refresh-blocked` its "Reason and evidence", from the RECORD this sentence is written into. A
+# one)`, which is a pointer into the LOG — while `orch-loop.sh` builds its `[dispatch] BLOCKED` line
+# from the RECORD this sentence is written into (`refresh_cause_brief`). A
 # pointer in the record names nothing to a reader who has only the record: "refused because auth",
 # "refused because the gh layer declined to let the call out" and "refused because the box could not
 # reach GitHub" all read identically. So the probe's own measured clause is interpolated here, and a
@@ -2223,6 +2227,14 @@ refresh_record_write running provision 0 \
 # line — which CANNOT refuse this probe's `api rate_limit` call (`gh-limit.py`'s `reaches_api()` is
 # False for the meter, and the floor is gated behind it). The comments now agree with each other and
 # with the code; the arm-by-arm detail is at the `GH_PROBE_CAUSE` definition above.
+# ⛔ AND `.refresh-blocked` IS **NOT** FIXED BY THIS CHANGE — DECLARED, not omitted (#3701 round 7,
+# P1). An earlier version of this comment claimed that marker's "Reason and evidence" was built from
+# the RECORD too. It is not: `orch-loop.sh:8801` writes that section as
+# `tail -n +$((log_mark+1)) "$LOG" | grep 'NOT PROVISIONABLE' | tail -3` — it quotes the LOG, and it
+# keys on `NOT PROVISIONABLE`, which is the rc=3 arm, so this provision-path cause never reaches it at
+# all. What this change DOES fix is the RECORD (`state/refresh-last`) and everything derived from it —
+# `[dispatch] BLOCKED` via `refresh_cause_brief`. The log-quoting surface is deliberately untouched:
+# it already quotes the refresh's own logged refusal, which is the behaviour that marker wants.
 gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused [${GH_PROBE_CAUSE:-NO CLAUSE RECORDED by gh_probe_env — the specific precondition was not named}] — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
