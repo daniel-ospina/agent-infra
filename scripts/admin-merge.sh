@@ -775,6 +775,14 @@
 #                                         ADMIN_MERGE_POLL_INTERVAL paces the OTHER
 #                                         waits). One `run list` + one Jobs read
 #                                         per pending run per poll.
+#   ADMIN_MERGE_FIRST_CHECKS_POLL_MAX    the CEILING that interval backs off towards
+#                                         while a poll observes NO change (default
+#                                         300). The fleet shares ONE 5000/h API
+#                                         bucket, so a silent surface re-read every
+#                                         60s by every lane is what exhausts it;
+#                                         this bounds that, and can never shorten a
+#                                         wait (the stall/ceiling clocks are
+#                                         seconds, not poll counts).
 #   ADMIN_MERGE_MERGE_REF_WAIT           window (seconds, default 90) on the
 #                                         MERGE-REF wait: GitHub computes
 #                                         mergeable/refs/pull/<N>/merge in a
@@ -1066,6 +1074,20 @@ FIRST_CHECKS_WAIT="${ADMIN_MERGE_FIRST_CHECKS_WAIT:-$FAILSAFE_RERUN_TIMEOUT}"
 FIRST_CHECKS_STALL="${ADMIN_MERGE_FIRST_CHECKS_STALL:-8760}"
 FIRST_CHECKS_CEILING="${ADMIN_MERGE_FIRST_CHECKS_CEILING:-18064}"
 FIRST_CHECKS_POLL="${ADMIN_MERGE_FIRST_CHECKS_POLL:-60}"
+#   FIRST_CHECKS_POLL_MAX the CEILING the interval doubles towards while a poll
+#                        observes NO change (see THE GEOMETRIC BACKOFF below).
+#                        The reason is the FLEET, not the lane: this account's
+#                        5000/h bucket is shared by every lane on every box, and
+#                        ~20 lanes each re-asking the same unanswered question
+#                        every 60 s is what exhausts it. Measured 2026-11-03:
+#                        five rails' logs held 85/75/56/54 FIRST-CHECKS polls on
+#                        heads whose runs never advanced (one run `queued`, 4
+#                        jobs at step 0/0), and the account hit remaining=0 with
+#                        `gh run list` answering 403 to the whole fleet. 300 s is
+#                        the SAME ceiling the MERGE-REF window's own interval
+#                        uses; it is a floor on how often a silent surface is
+#                        re-read, never a shortening of any wait.
+FIRST_CHECKS_POLL_MAX="${ADMIN_MERGE_FIRST_CHECKS_POLL_MAX:-300}"
 # CHECK_UNRESOLVED_BOUND — the bound on ONE thing the FIRST-CHECKS wait never
 # bounded: a check whose NEWEST attempt has no conclusion (`status=queued`/
 # `in_progress`, `conclusion=null`) because the job behind it never got a runner.
@@ -2222,6 +2244,29 @@ validate_timing_knobs() {
     bad=1
     say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL='${FIRST_CHECKS_POLL}' — beyond the usable"
     say_err "   range (max ${POLL_INTERVAL_MAX}s)."
+  fi
+  # The backoff ceiling. Same two-stage discipline as the interval it bounds: a
+  # non-numeric or leading-zero value is REFUSED rather than silently coerced,
+  # because it decides how long a silent surface goes unread.
+  if counter_has_leading_zero "$FIRST_CHECKS_POLL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${FIRST_CHECKS_POLL_MAX}' — a LEADING ZERO"
+    say_err "   is ambiguous: bash ARITHMETIC reads it as OCTAL while 'sleep' sleeps it as DECIMAL."
+  elif ! counter_is_positive "$FIRST_CHECKS_POLL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${FIRST_CHECKS_POLL_MAX}' — the backoff"
+    say_err "   ceiling must be a POSITIVE integer number of seconds."
+  elif counter_exceeds_max "$FIRST_CHECKS_POLL_MAX" "$POLL_INTERVAL_MAX"; then
+    bad=1
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_FIRST_CHECKS_POLL_MAX='${FIRST_CHECKS_POLL_MAX}' — beyond the usable"
+    say_err "   range (max ${POLL_INTERVAL_MAX}s)."
+  elif counter_is_positive "$FIRST_CHECKS_POLL" \
+     && [ "$((10#$FIRST_CHECKS_POLL_MAX))" -lt "$((10#$FIRST_CHECKS_POLL))" ]; then
+    # Not a refusal: a ceiling below the base interval simply means the interval
+    # never grows. Say so once, so nobody reads that as "the backoff is broken".
+    say_err "admin-merge: note — ADMIN_MERGE_FIRST_CHECKS_POLL_MAX (${FIRST_CHECKS_POLL_MAX}s) is below"
+    say_err "   ADMIN_MERGE_FIRST_CHECKS_POLL (${FIRST_CHECKS_POLL}s), so the FIRST-CHECKS interval never backs"
+    say_err "   off. Legal (it is the operator's ceiling), and what the rail's own suite may use."
   fi
   # The MERGE-REF window. 0 is legal and means "one observation, no waiting".
   if counter_has_leading_zero "$MERGE_REF_WAIT"; then
@@ -4842,10 +4887,29 @@ PY
 wait_for_first_checks() {
   local head="$1" waited=0 quiet=0 missing=0 missing_streak=0 total=0 pending=0 rc=0 out="" line status conclusion id created obs
   local now last_clock dt fp summary max_step digest jobs cr_slug scan_rc scan_out
-  local max_step_run fp_run summary_run read_ok n_lines idx
-  local stall_bound ceiling_bound signal_ok poll_step remaining adv wait_word expired
+  local max_step_run fp_run summary_run read_ok n_lines idx cached
+  local stall_bound ceiling_bound signal_ok poll_step poll_max backoff_step remaining adv wait_word expired
   local rederive_left lane_filter_active head_checks
-  local -a jobs_files=() pending_ids=()
+  local -a jobs_files=() pending_ids=() fetched_ids=()
+  # ── THE PER-RUN OBSERVATION CACHE ──────────────────────────────────────
+  # `status.<id>` is the RUN-level status from this poll's run list (the cheap
+  # call, always made); `line.<id>` is that run's last observed Jobs digest line.
+  # They exist so a run that CANNOT advance is not re-read — see the skip in the
+  # probe loop below.
+  # ⛔ FILES, NOT `local -A`. This script runs under `#!/usr/bin/env bash`, and
+  # macOS still ships bash 3.2, where `local -A` is an ERROR: the arrays would be
+  # left undeclared (a stray `local: -A: invalid option` on the rail's stderr) and
+  # a non-numeric id would then become a `bad array subscript`. A directory of
+  # one-line files has no version floor and no subscript arithmetic.
+  # ⛔ NEVER BUILD A PATH TO `rm -rf` FROM AN UNGUARDED VARIABLE — AND NEVER REPAIR THE
+  # GLOBAL TO DO IT. `TMP` is assigned from `mktemp -d` without a `|| exit`, so a failed
+  # mktemp leaves it EMPTY and `$TMP/fc-cache` would be `/fc-cache`. Reassigning `TMP`
+  # here would be worse: the exit trap is `trap 'rm -rf "${TMP:-}"' EXIT` — SINGLE
+  # quoted, so it expands at TRAP time, i.e. after this function ran, and a fallback
+  # written here would turn the trap into `rm -rf /tmp`. Keep both the substitution and
+  # the scope LOCAL.
+  local fcdir="${TMP:-${TMPDIR:-/tmp}}/fc-cache"
+  rm -rf "$fcdir" 2>/dev/null; mkdir -p "$fcdir" 2>/dev/null
   FIRST_CHECKS_WAITED=0; FIRST_CHECKS_QUIET=0; FIRST_CHECKS_OUTCOME=""; FIRST_CHECKS_OBSERVED=""
   FIRST_CHECKS_REDERIVED=""; FIRST_CHECKS_HEAD_CHECKS=""
   FIRST_CHECKS_STATE=""; FIRST_CHECKS_LAST_CHANGE=""; FIRST_CHECKS_TRANSITIONS=0
@@ -4857,6 +4921,12 @@ wait_for_first_checks() {
   poll_step="$FIRST_CHECKS_POLL"
   [ "$poll_step" -gt 0 ] 2>/dev/null || poll_step=1
   poll_step=$((10#$poll_step))
+  # The backoff ceiling never starts BELOW the base interval (see the knob note).
+  poll_max="$FIRST_CHECKS_POLL_MAX"
+  [ "$poll_max" -gt 0 ] 2>/dev/null || poll_max="$poll_step"
+  poll_max=$((10#$poll_max))
+  [ "$poll_max" -lt "$poll_step" ] && poll_max="$poll_step"
+  backoff_step="$poll_step"
   # ── THE 0 SEAM. `ADMIN_MERGE_FIRST_CHECKS_WAIT=0` means "one observation, no
   # waiting" (the pre-#2090 instant refusal, and the rail suite's default). It
   # keeps that meaning for the WHOLE wait: when the legacy window is 0 AND no
@@ -4909,6 +4979,7 @@ wait_for_first_checks() {
         total=$((total + 1))
         [ "$status" = "completed" ] && continue
         pending_ids+=("$id")
+        printf '%s\n' "$status" 2>/dev/null > "$fcdir/status.$id"
         [ -n "$obs" ] && obs="$obs; "
         obs="${obs}run ${id} status=${status} conclusion=${conclusion:--}${created:+ created=${created}}"
       done < <(printf '%s\n' "$out" | awk -F'\t' '{ printf "%s|%s|%s|%s\n", $1, $2, $3, $4 }')
@@ -4974,11 +5045,46 @@ wait_for_first_checks() {
     max_step=0
     if [ "$total" -gt 0 ]; then
       if [ "${#pending_ids[@]}" -gt 0 ] && [ "${#pending_ids[@]}" -le "$FIRST_CHECKS_JOBS_MAX" ]; then
-        jobs_files=()
+        jobs_files=(); fetched_ids=()
         read_ok=1
         for id in "${pending_ids[@]}"; do
+          # ── THE ZERO-STEP GUARD (#gh-quota): a `queued` run's job steps CANNOT
+          # advance, so a Jobs read for it can only re-observe the value already
+          # cached. No runner has picked the run up; every job sits at step 0/0.
+          # The RUN LIST above is the status oracle that tells this wait when the
+          # run actually starts, so the per-run read is spent ONCE per queued
+          # spell and then withheld until the status LEAVES `queued` — which
+          # fails this condition and re-probes. Nothing is assumed about the
+          # surface: the cached line is the real observation, and the fingerprint
+          # it feeds is unchanged, so the stall clock keeps advancing exactly as
+          # it does on a re-read of an unchanged run.
+          #
+          # MEASURED (2026-11-03): five rails' logs on this box held 85 / 75 / 56 /
+          # 54 FIRST-CHECKS polls on heads whose runs never advanced — the 85-poll
+          # one waited ~5185 s on a single `queued` run with 4 jobs at step 0/0,
+          # paying 1 run list + 1 Jobs read per poll, and the account reached
+          # remaining=0 while `gh run list` answered 403 to the whole fleet. The
+          # zero-JOB exclusion (#1623) still gets its ONE read: the first probe
+          # establishes the count, and a run PROVEN to have no jobs is dropped by
+          # the same `jobs == 0` arm as before.
+          cached="$fcdir/line.$id"
+          if [ -f "$cached" ] && [ "$(cat "$fcdir/status.$id" 2>/dev/null)" = "queued" ]; then
+            # ⛔ ONLY A LINE THAT MEASURED SOMETHING IS REUSABLE. `first_checks_digest`
+            # emits `unknown\t0\t\t` when it could not parse the document and
+            # `0\t0\t\t` for a run GitHub never expanded. Both are NON-EMPTY, so
+            # testing "is there a line" alone would make a TRANSIENT unreadable
+            # surface permanent for the whole queued spell (disabling #2481(g), the
+            # fail-then-recover case) and would keep a still-`queued` run that DID
+            # expand excluded forever — which can clear the wait on `pending == 0`
+            # while a run is pending, the pre-#2481 false-clear. A positive job
+            # COUNT is the only thing that proves an observation.
+            case "$(cut -f1 "$cached" 2>/dev/null)" in
+              ''|*[!0-9]*|0) : ;;              # unknown / 0 → re-probe
+              *) continue ;;
+            esac
+          fi
           if fetch_run_jobs "$id" > "$TMP/fc-jobs-$id.json" 2>/dev/null && [ -s "$TMP/fc-jobs-$id.json" ]; then
-            jobs_files+=("$TMP/fc-jobs-$id.json")
+            jobs_files+=("$TMP/fc-jobs-$id.json"); fetched_ids+=("$id")
           else
             rm -f "$TMP/fc-jobs-$id.json"
             read_ok=0
@@ -4990,47 +5096,42 @@ wait_for_first_checks() {
         # unreadable surface.
         [ "$read_ok" -eq 1 ] || pending="${#pending_ids[@]}"
         if [ "$read_ok" -eq 1 ]; then
-          digest="$(first_checks_digest "${jobs_files[@]}")"
-          n_lines="$(printf '%s\n' "$digest" | grep -c . || true)"
-          if [ "$n_lines" -eq "${#pending_ids[@]}" ]; then
-            signal_ok=1
+          # ONE parser call for every run actually read this poll; each line is
+          # filed against its OWN run id, so the skipped (cached) runs keep the
+          # line they were last observed with and the two kinds cannot be paired
+          # with the wrong run.
+          if [ "${#jobs_files[@]}" -gt 0 ]; then
+            digest="$(first_checks_digest "${jobs_files[@]}")"
             idx=0
-            for id in "${pending_ids[@]}"; do
+            for id in "${fetched_ids[@]}"; do
               idx=$((idx + 1))
-              line="$(printf '%s\n' "$digest" | sed -n "${idx}p")"
-              IFS=$'\t' read -r jobs max_step_run fp_run summary_run <<< "$line"
-              jobs="${jobs:-unknown}"
-              max_step_run="${max_step_run:-0}"
-              case "$max_step_run" in ''|*[!0-9]*) max_step_run=0 ;; esac
-              # A run PROVEN to have zero jobs is not in flight (#1623): GitHub
-              # never expanded it, so it must not hold this wait. An UNREADABLE
-              # count is not zero — it stays pending, fail-closed.
-              [ "$jobs" = "0" ] && continue
-              [ "$jobs" = "unknown" ] && signal_ok=0
-              pending=$((pending + 1))
-              [ "$max_step_run" -gt "$max_step" ] && max_step="$max_step_run"
-              [ -n "$fp" ] && fp="$fp || "
-              fp="${fp}run:${id} ${fp_run}"
-              [ -n "$summary" ] && summary="$summary | "
-              summary="${summary}run ${id}: ${summary_run}"
+              printf '%s\n' "$(printf '%s\n' "$digest" | sed -n "${idx}p")" 2>/dev/null > "$fcdir/line.$id"
             done
-          else
-            # ⛔ A SHORT (or empty) DIGEST IS NOT "NO PENDING RUNS" EITHER. The
-            # guarantee two lines up — an unreadable surface can never fall
-            # through to `pending == 0` and CLEAR the wait — has to hold for the
-            # digest as well as for the fetch, because `first_checks_digest` is
-            # `… 2>/dev/null || true`: a parser that dies mid-list (an
-            # unparseable step number the inner handlers do not catch, an
-            # interpreter that cannot run) leaves PARTIAL stdout and no error
-            # anyone sees. Counting that against `pending` read it as "every run
-            # terminal", cleared the wait, and §1b then refused with a false
-            # diagnosis ("the wait CLEARED (the lane was terminal), but a NEW run
-            # appeared") — the pre-#2481 "gave up before classifying" shape.
-            # Same remedy as the failed-read arm: every run stays pending and the
-            # signal is marked missing.
-            pending="${#pending_ids[@]}"
-            signal_ok=0
           fi
+          signal_ok=1
+          for id in "${pending_ids[@]}"; do
+            # A run with NO line at all is one the parser did not answer for: a
+            # SHORT (or empty) digest is not "no pending runs" either. It stays
+            # pending and marks the signal missing, exactly as the previous
+            # whole-digest length check did.
+            line="$(cat "$fcdir/line.$id" 2>/dev/null)"
+            if [ -z "$line" ]; then signal_ok=0; pending=$((pending + 1)); continue; fi
+            IFS=$'\t' read -r jobs max_step_run fp_run summary_run <<< "$line"
+            jobs="${jobs:-unknown}"
+            max_step_run="${max_step_run:-0}"
+            case "$max_step_run" in ''|*[!0-9]*) max_step_run=0 ;; esac
+            # A run PROVEN to have zero jobs is not in flight (#1623): GitHub
+            # never expanded it, so it must not hold this wait. An UNREADABLE
+            # count is not zero — it stays pending, fail-closed.
+            [ "$jobs" = "0" ] && continue
+            [ "$jobs" = "unknown" ] && signal_ok=0
+            pending=$((pending + 1))
+            [ "$max_step_run" -gt "$max_step" ] && max_step="$max_step_run"
+            [ -n "$fp" ] && fp="$fp || "
+            fp="${fp}run:${id} ${fp_run}"
+            [ -n "$summary" ] && summary="$summary | "
+            summary="${summary}run ${id}: ${summary_run}"
+          done
         fi
       elif [ "${#pending_ids[@]}" -gt "$FIRST_CHECKS_JOBS_MAX" ]; then
         pending="${#pending_ids[@]}"
@@ -5225,7 +5326,33 @@ wait_for_first_checks() {
       unobservable)  [ $((FIRST_CHECKS_WAIT - missing)) -lt "$remaining" ] && remaining=$((FIRST_CHECKS_WAIT - missing)) ;;
       *)             [ $((FIRST_CHECKS_WAIT - waited)) -lt "$remaining" ] && remaining=$((FIRST_CHECKS_WAIT - waited)) ;;
     esac
-    adv="$poll_step"
+    # ── THE GEOMETRIC BACKOFF (#gh-quota) ──────────────────────────────────
+    # A poll that observed NO change doubles the interval, up to
+    # FIRST_CHECKS_POLL_MAX; the first observed TRANSITION snaps it back to the
+    # base. WHY (measured, not assumed): this account's 5000/h bucket is shared by
+    # every lane on every box, and a fixed 60 s interval makes ~20 lanes pay the
+    # full rate to re-learn that a silent run is still silent — the common case
+    # (a `queued` head waiting for a runner; one 4380 s step).
+    # ⛔ THIS SHORTENS NO WAIT AND SOFTENS NO VERDICT. The stall clock (`quiet`),
+    # the legacy window (`missing`) and the ceiling are all `$SECONDS` deltas, not
+    # poll counts, so a coarser poll moves WHEN a verdict is reached by at most one
+    # interval and cannot change WHETHER it is reached. The sleep is still clamped
+    # to the remaining room below, so a backoff step can never overshoot a bound.
+    # ⛔ THE STEP IS DRIVEN BY "THIS POLL PRODUCED NO NEW OBSERVATION", NOT BY `quiet`
+    # ALONE. `quiet` advances only in the still-running/same-fingerprint arm; the
+    # `unreadable` (the run list itself refused) and `unobservable` arms advance
+    # `missing` instead. Keying the step on `quiet` alone therefore left a lane that
+    # started during a 403 storm — this change's own incident — paying a full-rate
+    # run-list call for its entire window, while a lane that got one good observation
+    # first backed off: an inconsistency between lanes in the same storm.
+    # The RESET is still the observed transition: `quiet == 0` AND nothing missing.
+    if [ "$quiet" -eq 0 ] && [ "$missing_streak" -eq 0 ]; then
+      backoff_step="$poll_step"
+    else
+      backoff_step=$((backoff_step * 2))
+      [ "$backoff_step" -gt "$poll_max" ] && backoff_step="$poll_max"
+    fi
+    adv="$backoff_step"
     [ "$adv" -gt "$remaining" ] && adv="$remaining"
     # A non-positive remaining is a BUG in the verdict table above, not a reason to
     # spin: floor it at one second (the loop's own bound still applies next poll).
@@ -6668,6 +6795,13 @@ print_bounds() {
   printf 'first-checks-ceiling=%s\n' "$FIRST_CHECKS_CEILING"
   printf 'first-checks-window=%s\n' "$FIRST_CHECKS_WAIT"
   printf 'first-checks-poll=%s\n' "$FIRST_CHECKS_POLL"
+  # ⛔ NAMED `first-checks-poll-ceiling`, NOT `…-poll-max`: a bounds key ending in
+  # `max=<n>` collides with the rail suite's own anchored check that a truncated
+  # shard duration (`max=300s`) never leaks into this table — its grep is a bare
+  # substring, so a second `…max=300` key makes that assertion pass for the wrong
+  # input and the suite red. The value is a CEILING on the interval, which is what
+  # the rest of this table calls one.
+  printf 'first-checks-poll-ceiling=%s\n' "$FIRST_CHECKS_POLL_MAX"
   printf 'first-checks-source=STALL = 2 × the longest MEASURED single step (4380s, "Bash shards"); CEILING = 2 × the slowest MEASURED green run (9032s); STALL is promoted at runtime to 2 × the longest COMPLETED step on the runs being waited on; WINDOW bounds only the states with no progress to observe (no run yet, or an unreadable surface).\n'
 }
 

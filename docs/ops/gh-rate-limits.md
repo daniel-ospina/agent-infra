@@ -524,6 +524,20 @@ Every `gh` call that goes through the argv-level shim (`scripts/gh-shim/gh`, ins
 - state lives in `~/.pi/agent/gh-gate` (`slots/`, `cooldown.*`, `secondary.window`,
   `retry-after.window`, `revalidate.lock`). A stale slot or a dead single-flight holder is reaped
   by PID, so a killed lane cannot wedge the fleet.
+- **when the BUDGET is what refused**, the gate publishes it in one cheap read — no API call:
+
+  ```bash
+  cat "${AGENT_GH_GATE_DIR:-${HOME:-${TMPDIR:-/tmp}}/.pi/agent/gh-gate}/budget"
+  GH-BUDGET(remaining=0, resets_at=2026-11-03T01:34:00Z)
+  ```
+
+  `remaining=0` means "this gate is admitting NO calls until `resets_at`", and it is written
+  only for a PRIMARY-budget refusal — a secondary/concurrency refusal parks the box the same
+  way but says nothing about the account's budget. **Compare `resets_at` before trusting it**:
+  the line is removed on the next gated call that finds its window expired, so a box with no
+  `gh` traffic can hold a stale one. If it is absent, the gate has not seen an exhausted budget.
+  This is the read that tells quota exhaustion (`resets_at` in the future) from a product
+  fault — do not diagnose a rail's exit 1 without it.
 
 ⚠️ **A caller that resolves the real `gh` by absolute path, or clears PATH, is not paced.**
 The one that did deliberately for read-only queries was the retired
