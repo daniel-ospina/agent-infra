@@ -4850,10 +4850,13 @@ cache_reaper_path() {
   # policy run on one box, chosen by two different rules.
   # ONE chain, the same one orchestrator-harness/orch-loop.sh and cloud-cell-bringup.sh use:
   # ${CACHE_REAPER:-} -> the FARMED copy (what the launchd job and the cell clock execute) -> the
-  # copy beside this script. Farmed BEFORE beside-this-script matters: this supervisor is never
-  # farmed (pi-bootstrap/setup.sh's fleet_srcs does not list it), so a lane running it from a
-  # checkout would otherwise arm a copy it is mid-edit on while the hourly bound the operator reads
-  # about is a different file.
+  # copy beside this script. Farmed BEFORE beside-this-script matters for a supervisor run FROM A
+  # CHECKOUT — the cell bring-up and the merge lanes do exactly that — because that sibling is a file
+  # the lane may be mid-edit on while the hourly bound the operator reads about is a different file.
+  # ⛔ THE OLD REASON HERE WAS FALSE: it said "this supervisor is never farmed (pi-bootstrap/setup.sh's
+  # fleet_srcs does not list it)". The supervisor IS farmed flat now (#1938 closed), so for a
+  # FARMED supervisor beside-this-script and the farmed copy are the SAME file and the ordering is
+  # moot — which makes the checkout case the only one that still needs it, not one of two.
   for cand in "${CACHE_REAPER:-}" \
               "${HOME:-}/.pi/agent/scripts/pi-cache-reap.sh" \
               "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/pi-cache-reap.sh"; do

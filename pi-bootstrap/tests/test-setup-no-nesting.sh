@@ -410,12 +410,18 @@ check_fleet_srcs_farmed() {
 # ⚠️ DECLARED RESIDUALS of the extraction — do not describe these as covered:
 #   ⛔ THE FIRST ONE HAS A LIVE MEMBER ON THIS TREE, so none of them is hypothetical:
 #     `scripts/cloud-cell-quiesce.sh` (farmed) locates `cloud-cell-supervisor.sh` by trying
-#     `"$REPO/scripts/…"`, `"$O/…"` and a `/tmp/<repo>/scripts/…` path — a variable-held prefix and a
-#     cross-repo path, i.e. residual (1) and residual (4) at once. That producer is in NO farm array, so
-#     a fresh farm gets the consumer without it and the quiesce degrades to
-#     `supervisor: <none found — will start tmux directly>`. #1938 owns whether it is delivered or stays
-#     cell-only; until it is dispositioned, the `0 undelivered-and-undisclosed` line is a statement about
-#     the DECLARED SURFACE, not a claim about the farm.
+#     `"$REPO/scripts/…"`, `"$O/…"` and two `/tmp/<repo>/scripts/…` paths — a variable-held prefix and
+#     a cross-repo path, i.e. residual (1) and residual (4) at once.
+#     ⛔ THE DELIVERY HALF IS NO LONGER THE PROBLEM, AND THE REASON MOVED. `cloud-cell-supervisor.sh`
+#     IS farmed now (`fleet_srcs`, #1938 closed), so a fresh farm DOES receive it at
+#     `$DEST/scripts/cloud-cell-supervisor.sh`. What still fails is the quiesce's OWN CANDIDATE LIST:
+#     it never looks in `$DEST/scripts/`, so on a farm-only box with no clone it still prints
+#     `supervisor: <none found — will start tmux directly>` and falls back to `tmux kill-server`.
+#     ⛔ That is the residual now, recorded rather than papered over. Adding `$DEST/scripts` to that
+#     list is NOT done here: it changes what the quiesce will EXEC on a box where both a clone and a
+#     farm exist, which is a behaviour decision of its own, not a side effect of a farm entry.
+#     (The degradation is safe — the unbudgeted `tmux kill-server` still sweeps — which is why this
+#     can stay a recorded residual rather than a blocker.)
 #   (1) a path PREFIX held in a variable set elsewhere (`X="$HOME/foo"; "$X/scripts/y.sh"`),
 #   (2) a producer reached through a registry/plugin table,
 #   (3) a `..`-relative join that is not `../scripts/` (e.g. the python `os.path.join(here, "..",
