@@ -147,11 +147,41 @@ _rs_lower() { printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]'; }
 # given path's directory; "" when nothing (not even /) answers. It is the whole basis of the
 # absence proof above: `-e` false under a TRAVERSABLE existing ancestor is proof of absence, and under
 # an untraversable one it is proof of nothing.
+# ⛔ NO `dirname` IN THIS WALK, AND IT IS NOT AN OPTIMISATION (review round 44, P2 — measured). In the
+# ANCESTOR WALK `dirname` was the last unguarded external, and its absence silently DISARMED the absence
+# proof: with it failing, the walk never ran, the function answered `/` (traversable), and a set that
+# EXISTS behind an untraversable ancestor was reported `NO-REPO-SET … does not exist` at code **3** — the
+# one code the wrapper DEGRADES on, so the box then graded one repo instead of refusing. Measured with the
+# interpreter candidates rewritten the way `f48` does it: `dirname` present → rc 5 INVALID; absent → rc 3
+# with `Create it, one repo per line` for a file that is already there. Bash's `${var%/*}` gives the same
+# parent with no process and no dependency, so there is nothing to guard and no new refusal to invent.
+# ⛔ …BUT ONLY WITH THE SLASH-LESS CASE HANDLED: `${d%/*}` on a name with no `/` returns it UNCHANGED,
+# which is a loop that never advances. That is exactly what the first cut of this function did, and it
+# HUNG on a relative `$REPO_SET_FILE` until a reviewer measured it. The `case` arms below are the fix and
+# `j16g`/`j16h` are the arms; see the note inside the function.
+# ⛔ SCOPED TO THE WALK, BECAUSE ONE MORE `dirname` SURVIVES IN THIS FILE AND I OVERCLAIMED IT ONCE (this
+# comment first said it was "the ONE remaining unguarded external in this reader" — falsified by
+# `_rs_doctor_py`, which still uses it). That one is DELIBERATE and stays: it runs inside
+# `$(cd … 2>/dev/null && pwd)`, and a failure yields an empty doctor path — "could not ask", which the
+# reader WARNS on — never a false proof. `dirname` failing on the walk was different in kind: the walk's
+# caller reads a fallback (`/`) as an ANSWER, so the failure became a verdict.
 _rs_nearest_existing_ancestor() {
-  local d; d="$(dirname "${1:-}")"
+  local d="${1:-}"
+  # Strip trailing slashes so `/a/b/` and `/a/b` walk the same parents.
+  while [ "${d%/}" != "$d" ] && [ -n "$d" ]; do d="${d%/}"; done
+  # ⛔ A SLASH-LESS NAME HAS NO PARENT, AND `${d%/*}` SAYS SO BY RETURNING IT UNCHANGED (review-instrumented
+  # round 44 — this was a REGRESSION I introduced, caught by measurement, not by the arm count: every one
+  # of the arms that existed then passed an absolute path, so all of them stayed green). The
+  # first cut did `d="${d%/*}"` and `${d%/*}` on `repo.conf` yields `repo.conf`; the loop then re-tested the
+  # SAME string forever, so a RELATIVE `$REPO_SET_FILE` HUNG the reader — `REPO_SET_FILE=repo.conf` gave
+  # rc 124 with no output, where HEAD's `dirname` answered `.` and the loop exited to rc 3 NO-REPO-SET.
+  # No arm used a relative set path, so nothing reddened. `dirname X` answers `.` for a slash-less X, and
+  # that is what these two `case` arms reproduce; the `*) break` also makes termination STRUCTURAL — every
+  # iteration either shortens `d` (it contains a slash) or leaves the loop.
+  case "$d" in */*) d="${d%/*}" ;; *) d="." ;; esac
   while [ -n "$d" ] && [ "$d" != "/" ] && [ "$d" != "." ]; do
     if [ -e "$d" ]; then printf '%s' "$d"; return 0; fi
-    d="$(dirname "$d")"
+    case "$d" in */*) d="${d%/*}" ;; *) break ;; esac
   done
   [ -e / ] && { printf '/'; return 0; }
   return 0
@@ -510,7 +540,12 @@ repo_set_parse() {
   # path "does not exist", which it plainly does. An existing thing that is not a usable file is the
   # broken-file state (5), never the absent one (3).
   if [ ! -f "$f" ]; then
-    _rs_say 2 "repo-set: INVALID — $f exists but is not a regular file (a directory at the config path cannot name repos)."
+    # ⛔ THE PARENTHETICAL NAMED ONE CAUSE FOR THREE STATES (review round 44, P2 — measured). It said "a
+    # directory at the config path cannot name repos", while a FIFO and a SOCKET reach this same arm and
+    # a FIFO very much can carry lines. Only a directory was armed (`j3`/`j4`), so the emitted sentence
+    # asserted an unverified specific — the "right code, wrong cause" shape the `-L` arm above was
+    # rewritten to avoid. The rule, stated as the rule.
+    _rs_say 2 "repo-set: INVALID — $f exists but is not a regular file (a repo set must be a regular file)."
     return 5
   fi
   if [ ! -r "$f" ]; then
@@ -739,10 +774,14 @@ except Exception:
     #   norm  — "" means "not a slug"         -> sentinel, and the wrapper's rank checks read it as
     #                                               "could not be normalised", not "invalid slug"
     #   split — mapped shell-side by `_rs_split_entries`
-    #   origin— answers its own TAB reason; the try/except below is the arm that made that true (round 42)
-    # The `raise` stays UNCONDITIONAL, so every other verb keeps its exact pre-fix bytes.
+    #   origin— answers its own TAB reason (round 42) **including in THIS arm** (round 44, P2 — measured):
+    #            before that it wrote nothing here, fell through to the caller's residue line, and the
+    #            operator was told `the proof child did not start` about a child that started, imported and
+    #            RAISED. Every verb now answers here.
     if verb in ("tags", "strip", "norm"):
         sys.stdout.write("__UNASKABLE__")
+    elif verb == "origin":
+        sys.stdout.write("\tpr-doctor.py would not LOAD, so no origin can be proved")
     raise SystemExit(0)
 if verb == "strip":
     sys.stdout.write(arg.strip())
@@ -820,9 +859,12 @@ _rs_origin_slug() {
     return 0
   fi
   if [ -z "$out" ]; then
-    # Reached only when the proof child produced NOTHING at all — every other outcome answers with a TAB
-    # reason (round 42). So this names the residue, not a guessed cause.
-    printf '\tpr-doctor.py produced no answer at all (the proof child did not start)'
+    # ⛔ THIS IS A RESIDUE, SO IT MUST NOT NAME A CAUSE (review round 44, P2 — measured). It said `the proof
+    # child did not start`, and with an unloadable sibling BOTH that message AND the whole-set `would not
+    # LOAD` WARNs appeared in ONE run — the child started, imported and raised. Every verb now answers its
+    # own reason (the `elif` in the load arm, the `try/except` around `_origin_slug`), so this line is what
+    # is left when NOTHING came back at all, and it says exactly that.
+    printf '\tpr-doctor.py produced no answer, and this reader cannot see why'
     return 0
   fi
   printf '%s' "$out"
