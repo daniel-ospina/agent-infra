@@ -608,7 +608,7 @@ ST="$T/state-flip"
 mkdir -p "$ST/s"
 printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/s\nslug=daniel-ospina/agent-infra checkout=%s state=%s/s/new/..\n' \
   "$T/tortoise" "$ST" "$T/agent-infra" "$ST" > "$T/state-flip.conf"
-ck "j20 a state dir reached via a NOT-YET-CREATED dir's `..` is refused BEFORE it exists" \
+ck "j20 a state dir reached via a NOT-YET-CREATED dir's \`..\` is refused BEFORE it exists" \
    '[ "$(run_reader_rc "$T/state-flip.conf" check)" = 1 ]'
 mkdir -p "$ST/s/new"
 ck "j21 …and the same verdict AFTER it exists (no flip)" \
@@ -766,6 +766,53 @@ ck "m16 sourcing the reader and running parse+check leaves no \`_dupkey\` in the
 # m11/m12 into an assertion about an undefined command — the "mutation that cannot apply" trap.
 ck "m17 \`_rs_norm_path\` is still defined (the m10 mutation depends on it; deleting it must be deliberate)" \
    '[ -n "$(rs_call _rs_norm_path //a/./b/)" ]'
+# Round 10, P2: the round-9 remedy dropped an entry whose IDENTITY was unprovable, and that ALSO
+# discarded the class which needs NO filesystem at all: two spellings identical after folding `//`,
+# `.`, a trailing `/` and case ARE one directory however the permission bits fall. Measured before the
+# second (SPELLING) axis existed, with the ancestor mode 000: `state=<d>/state` TWICE returned
+# `OK — 2 repo(s)` at rc 0, while the round-8 reader refused the same fixture.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip m18-m20 (running as root: mode 000 is still traversable)\n'
+else
+  mkdir -p "$T/denied"
+  printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/denied/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/denied/state\n' \
+    "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/denied-same.conf"
+  printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/denied/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/denied//./State\n' \
+    "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/denied-spell.conf"
+  printf 'slug=daniel-ospina/tortoise checkout=%s state=%s/denied/state\nslug=daniel-ospina/agent-infra checkout=%s state=%s/denied/other\n' \
+    "$T/tortoise" "$T" "$T/agent-infra" "$T" > "$T/denied-diff.conf"
+  chmod 000 "$T/denied"
+  ck "m18 an UNENTERABLE ancestor does not disable the SPELLING axis (identical state dirs still refuse)" \
+     'run_reader "$T/denied-same.conf" check | grep -q "is shared with another repo in this set"'
+  ck "m19 …and neither do \`//\`, \`.\` or case, under the same denied ancestor" \
+     'run_reader "$T/denied-spell.conf" check | grep -q "is shared with another repo in this set"'
+  ck "m20 …while two genuinely DIFFERENT unenterable state dirs are still accepted (not refuse-everything)" \
+     '[ "$(run_reader_rc "$T/denied-diff.conf" check)" = 0 ]'
+  chmod 755 "$T/denied"
+fi
+# Round 10, P2: the splitter verb re-typed the doctor's regex instead of asking `configured_repos`, so
+# the comment's promise — "any future separator it learns is covered the day the doctor learns it" —
+# was false. A DOCTORED doctor whose splitter also learns `;` is the discriminating fixture: a reader
+# that COPIES the regex certifies OK; a reader that DELEGATES refuses. (Round 9 replaced the count
+# comparison with `_rs_split_divergence`, which compares ENTRIES, so the `splitcount` verb and
+# `_rs_split_count` were dead by the time this landed and were removed — the `split` verb this arm
+# exercises is the one the live path uses.)
+mkdir -p "$T/we;ird"
+printf 'slug=daniel-ospina/tortoise checkout=%s/we;ird\nslug=daniel-ospina/agent-infra checkout=%s\n' \
+  "$T" "$T/agent-infra" > "$T/semi.conf"
+ck "m21 a \`;\` in a checkout is accepted by TODAY's doctor splitter (rc 0) — the control" \
+   '[ "$(run_reader_rc "$T/semi.conf" check)" = 0 ]'
+MD="$T/mutdoc"; mkdir -p "$MD"
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MD/pr-doctor.py" <<'PYM'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src).read()
+old = 'items = [s.strip() for s in re.split(r"[,\\s]+", raw)]'
+assert t.count(old) == 1, "the doctor's splitter moved; the mutation cannot be expressed"
+open(dst, "w").write(t.replace(old, 'items = [s.strip() for s in re.split(r"[,\\s;]+", raw)]'))
+PYM
+ck "m22 …and when the DOCTOR's splitter learns \`;\`, the reader FOLLOWS it and refuses (delegation, not a copy)" \
+   '[ "$(REPO_SET_DOCTOR="$MD/pr-doctor.py" run_reader_rc "$T/semi.conf" check)" = 1 ]'
 
 # ── (n) SOURCING the reader must not change the caller's shell options ────────────────────
 # The file advertises sourcing as its contract, and the PR plans more consumers (the controllers and the
