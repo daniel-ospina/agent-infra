@@ -78,10 +78,15 @@
 #        record says NON-ANSWER — claiming neither a rejected credential NOR anything about the budget
 #        ("not a spent budget" was an over-claim: the shim sleeps 120 s on a shared window before 75);
 #   (g6) the OTHER default shape — rc=1/403 with a real rate-limit stderr, the arm #3584's own
-#        measured scenario took. Without this row that arm's interpolation could be deleted green.
+#        measured scenario took. Without this row that arm's interpolation could be deleted green;
+#   (g7) THE BEAT'S OWN LINE — not just the record. `refresh_cause_brief` cuts `why=` at 400 BYTES
+#        (`orch-loop.sh:2558`), so a clause can be complete in the record and still reach the operator
+#        severed. This arm drives the REAL `refresh_cause_brief` and pins the invariant the clause is
+#        now ordered by: the cut may land inside the EVIDENCE, never inside the verdict.
 #   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
 #   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
-#   the label against evidence production cannot emit (#3701 review, P2).
+#   the label against evidence production cannot emit (#3701 review, P2). The stub's string is
+#   DERIVED from `scripts/gh-shim/gh` itself, so "verbatim" is a fact rather than a transcription.
 #
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
@@ -943,8 +948,24 @@ ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 # shape production cannot emit. What DOES refuse it is the shared-cooldown layer in
 # `scripts/gh-shim/gh:1874`, and this is that layer's own wording.
 mk_case gh_budget
-mk_gh_budget_stub "$D" 75 \
-  "gh-contended - a shared gh throttle window outlived this call's 120000ms wait budget and no exempt quota read cleared it (a burst/concurrency window is never discharged by one) - returning rc=75 rather than hanging into the caller's timeout"
+# ⛔ THE FIXTURE IS THE SHIM'S OWN LINE, BYTES AND ALL (#3701 review round 3, P2 note 1). It used to be
+# a hand-transcribed COPY with ASCII hyphens where the shim writes em dashes — 240 bytes against the
+# real 244 — and those 4 bytes are part of where the beat's cut lands, so a byte budget measured
+# against the copy is measured against the wrong string. Derived here from the shipped source, so the
+# fixture cannot drift from the wording it calls verbatim.
+SHIM_NOTE="$(grep -m1 '^ *gate_note "gh-contended' "$HERE/../../scripts/gh-shim/gh" \
+  | sed -e 's/^ *gate_note "//' -e 's/"$//' -e 's/\${WAIT_BUDGET_MS}/120000/')"
+case "$SHIM_NOTE" in
+  *'gh-contended'*) SHIM_NOTE_NOTE='' ;;
+  *) SHIM_NOTE_NOTE='the shim no longer emits a gh-contended note at this line' ;;
+esac
+case "${SHIM_NOTE:-}" in
+  *'${'*) SHIM_NOTE_NOTE='the derived line still carries an unexpanded shell variable' ;;
+esac
+[ -z "${SHIM_NOTE_NOTE:-}" ] \
+  && ok "(g) the stub's note is the SHIM's own line, derived (${#SHIM_NOTE} chars)" \
+  || bad "(g) the shim's gh-contended note could not be derived — ${SHIM_NOTE_NOTE} (a hand-typed copy is what this row exists to stop)"
+mk_gh_budget_stub "$D" 75 "$SHIM_NOTE"
 rp "$D"
 G_WHY="$(rec why)"
 ck "(g) a locally-refused gh precondition is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
@@ -1044,6 +1065,54 @@ ck "(g6) …and still names the precondition rather than pointing at the log" \
    "$(case "$GD_WHY" in *'refusal line above names which one'*) echo 1 ;; *'question='*) echo 0 ;; *) echo 1 ;; esac)"
 ck "(g6) …and does NOT reuse another arm's verdict (no REJECTED, no NON-ANSWER)" \
    "$(case "$GD_WHY" in *'REJECTED'*|*'NON-ANSWER'*) echo 1 ;; *) echo 0 ;; esac)"
+
+# ── (g7) THE BEAT'S 400-BYTE CUT MUST NOT SEVER THE VERDICT (#3701 review round 3, P2) ────────────
+# ⛔ EVERY ROW ABOVE READS `rec why`, AND `why=` IS UNBOUNDED — `refresh_record_write` writes it whole.
+# The line an OPERATOR sees is `refresh_cause_brief`'s, which cuts it at 400 BYTES (`orch-loop.sh:2558`;
+# `cut -c1-400`, byte-wise), and `provision_fail` has already spent 52 of those on
+# `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
+# `] — no candidate can be judged from this box`. So a suite that reads only the record stays GREEN
+# while the beat prints half a sentence — which is exactly what happened: the round-2 ordering ended
+# the beat line inside "… the budget was tested, so NEI" and dropped `question=` entirely.
+# The invariant pinned here: the cut may land inside the EVIDENCE (variable-length, and whole in the
+# record), never inside the VERDICT (fixed-size, and the thing that names the precondition).
+LOOP="${LOOP:-$HERE/orch-loop.sh}"
+BRIEF="$T/refresh-cause-brief.sh"
+if [ -f "$LOOP" ]; then
+  {
+    awk '/^refresh_record_field\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+    awk '/^refresh_cause_brief\(\)/{f=1} f{print} f&&/^}$/{exit}' "$LOOP"
+  } > "$BRIEF"
+fi
+if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut -c1-400' "$BRIEF"; then
+  mk_case gh_beat
+  mk_gh_budget_stub "$D" 75 "$SHIM_NOTE"
+  rp "$D"
+  GBEAT_WHY="$(rec why)"
+  # The REAL renderer, over the REAL record — not a re-implementation of the cut. ⛔ THE SNAPSHOT IS THE
+  # WHOLE RECORD, not `rec why`: `refresh_cause_brief` parses `why=` back out of the snapshot, so handing
+  # it the bare VALUE renders "no cause recorded" and every row below would grade a line with no clause.
+  GBEAT="$(REC="$(cat "$D/o/state/refresh-last")" bash -c '. "$1"; refresh_cause_brief "$REC"' _ "$BRIEF" 2>&1)"
+  ck "(g7) the beat line still names the precondition COMPLETE (REFUSED LOCALLY, NOT auth/outage)" \
+     "$(case "$GBEAT" in *'REFUSED LOCALLY'*'NOT auth and NOT an outage'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g7) …and still says WHICH question was asked, uncut" \
+     "$(case "$GBEAT" in *'question=can the stored credential answer at all (gh api rate_limit, source='*) echo 0 ;; *) echo 1 ;; esac)"
+  # ⛔ NON-VACUITY, AND THE REASON THIS ARM IS NOT A TAUTOLOGY: the cut must GENUINELY HAVE FIRED, and the
+  # row above must not be passing on a clause short enough to fit whole. The beat loses the clause's
+  # trailing "no candidate can be judged" sentence when the cut fires, so its absence IS the proof.
+  ck "(g7) …with the cut genuinely FIRED (the clause's own tail is outside the window)" \
+     "$(case "$GBEAT" in *'no candidate can be judged from this box'*) echo 1 ;; *) echo 0 ;; esac)"
+  # ⛔ AND THE CUT LANDS IN THE EVIDENCE — the assertion is the PAIR, so neither half can pass vacuously:
+  # the beat KEEPS the evidence's head and LOSES its tail, while the RECORD keeps both.
+  ck "(g7) …and the cut lands INSIDE the evidence (its head survives: the layer names itself)" \
+     "$(case "$GBEAT" in *'evidence=rc=75: gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g7) …proving truncation fired: the note's TAIL is outside the beat window" \
+     "$(case "$GBEAT" in *'returning rc=75 rather than hanging'*) echo 1 ;; *) echo 0 ;; esac)"
+  ck "(g7) …while the RECORD still carries the note WHOLE, so nothing is lost where it is read less often" \
+     "$(case "$GBEAT_WHY" in *'returning rc=75 rather than hanging into the caller'"'"'s timeout'*) echo 0 ;; *) echo 1 ;; esac)"
+else
+  bad "(g7) the real refresh_cause_brief could not be extracted from $LOOP — the beat's cut is ungraded"
+fi
 
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here
