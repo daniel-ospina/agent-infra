@@ -2431,7 +2431,27 @@ check_controller_service() {
   local layer_sup="${LAYER_ROOT:+$LAYER_ROOT/scripts/cloud-cell-supervisor.sh}"
   [ -n "$layer_sup" ] && [ -f "$layer_sup" ] || layer_sup=""
   local -a cenv=(TEMPLATES_DIR="${LAYER_ROOT:+$LAYER_ROOT/templates/systemd}")
-  [ -n "$layer_sup" ] && cenv+=("ORCH_SUPERVISOR=$layer_sup")
+  # ⛔ A PREFERENCE, NOT A REQUIREMENT (agent-infra#2697). This names the layer's own copy so the unit runs
+  # the code this bring-up just installed rather than a possibly-stale farm — but the layer may BE a lane
+  # worktree (`self_root` is one whenever a lane runs this script from its own checkout), and a unit whose
+  # ExecStart a lane reap removes burns its start limit inside a minute, converges to `failed`, and nothing
+  # pages — the measured #2697 defect. The INSTALLER owns the durability rule and skips a non-durable
+  # preference loudly, falling through to the farm. `ORCH_SUPERVISOR` there is a hard requirement and would
+  # have refused instead.
+  [ -n "$layer_sup" ] && cenv+=("ORCH_SUPERVISOR_PREFER=$layer_sup")
+  # ⛔ NAME THE LAYER ROOT TO THE INSTALLER, IF IT IS NOT ON THE PROFILE'S PATH (agent-infra#2697). The
+  # installer REFUSES to render an ExecStart under a temporary root that no deployment root declares, and a
+  # cell's checkout lives under /tmp (`/tmp/cell-ai`). $AGENT_INFRA_PATH is what pi-bootstrap writes into the
+  # profile, so it usually names this same checkout already — but this function's whole premise is that the
+  # layer came from `--check-operational-layer`'s TRUSTED pick, which can differ from the profile (an
+  # `INFRA_ROOT=` declaration, the cell-home checkout). Without this line that trusted layer is a false block
+  # that kills the bring-up at this check.
+  # ⛔ IT CANNOT LAUNDER A LANE'S OWN WORKTREE (re-review P1). This declaration is exactly the escape a
+  # reviewer measured: with the layer being `self_root` — a LANE worktree — declaring it made the installer
+  # admit the very unmerged-code ExecStart #2697 is about. The installer now decides "is this a lane
+  # worktree" by GIT (a LINKED worktree, whatever its name, is refused before any declaration is consulted),
+  # so this line keeps its real job — a cell's PRIMARY clone under /tmp — and cannot admit a worktree.
+  [ -n "${LAYER_ROOT:-}" ] && cenv+=("AGENT_INFRA_PATH=$LAYER_ROOT")
 
   rc=0
   # TEMPLATES_DIR from the SAME checkout the layer came from (the farmed installer copy lives at

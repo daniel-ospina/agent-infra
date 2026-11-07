@@ -1255,6 +1255,249 @@ outP4JUNKP=$( p4_prune )
 ck "A77 [RED→GREEN] ...so the claim is KEPT and NAMED (an unmeasurable age is not evidence of expiry)" "kept unreadable-lease refs/claims/pr-3233" "$outP4JUNKP"
 p4_has pr-3233 && P4JUNKK=0 || P4JUNKK=1
 ck "A78 [RED→GREEN] ...and it survives the pass instead of being reaped on an earlier forged header" "^0$" "$P4JUNKK"
+# ⛔ A TOKEN THAT PARSES MUST NOT BECOME THE VALUE (review round 22, agent-infra#3203). A76-A78 only
+# drove a token the `$` anchor REJECTS (`+0000 junk`), which pins the SHAPE of the fallback and not the
+# FIELD the parse is allowed to read. The greedy `.* ` therefore survived them and took the LAST
+# `digits [+-]dddd` pair anywhere on the line, so the same one-push attack came back through a token that
+# MATCHES: measured on the shipped file, `committer a <a@b> <NOW> +0000 1 +0000` — a claim `git log
+# --format=%ct` dates as 0 s old — made `_claim_commit_time` answer 1, and `claim_prune` DELETED it as
+# `1793991810s old, PAST the 18000s bound`. The parse is now anchored on `> ` (the ident's end), so the
+# accepted stamp is the field git reads; any other `digits +-dddd` tail simply is not a match and lands
+# on rc=1 (unmeasurable -> KEPT and NAMED).
+P4FIELDFORGE="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a@b> %s +0000 1 +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=field\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4FIELDFORGE:refs/claims/pr-3235" ) 2>/dev/null
+ck "A79a (setup) a claim commit whose committer line carries a SECOND 'digits +dddd' pair is planted" "0" "$( p4_has pr-3235 && echo 0 || echo 1 )"
+P4FIELDRC=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+                && c="$( _git ls-remote origin refs/claims/pr-3235 | awk '{print $1}' )" \
+                && _git fetch -q origin "+refs/claims/pr-3235:$CLAIM_TMP_NS/field3203" \
+                && _claim_commit_time "$CLAIM_TMP_NS/field3203" >/dev/null 2>&1; printf '%s' "$?" ) 2>/dev/null | tail -1 )
+echo "  _claim_commit_time over a committer line with a second 'digits +dddd' pair: rc=$P4FIELDRC"
+ck "A79 [RED→GREEN] the stamp is the IDENT's field (anchored on '> '), never the last 'digits +dddd' token on the line" "^1$" "$P4FIELDRC"
+outP4FIELDP=$( p4_prune )
+ck "A80 [RED→GREEN] ...so a claim git dates as CURRENT is KEPT and NAMED, not reaped as ancient" "kept unreadable-lease refs/claims/pr-3235" "$outP4FIELDP"
+p4_has pr-3235 && P4FIELDK=0 || P4FIELDK=1
+ck "A81 [RED→GREEN] ...and its ref survives the pass" "^0$" "$P4FIELDK"
+# ⛔ THE TWO 30-DAY LITERALS ARE THE ONLY THING KEEPING THE BOUND BOUNDED (review round 22,
+# agent-infra#3203). `_claim_floor_term` and `CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL` are both hard-capped at
+# 2592000 so no knob reaches ~31 years — and NOTHING pinned either cap: deleting one left this whole suite
+# GREEN (the COUNT of passes follows where this block sits in the file; the GREEN does not — verified by
+# deleting each cap and re-running: A82-A85 go red) while `MAXAGE=999999999 CEIL=999999999` resolved the bound to 999999999 and
+# a 2-YEAR-old unparseable-lease claim went from `pruned … PAST the 2592000s bound` to `kept … INSIDE the
+# 999999999s bound`, i.e. #3203's eternal hold restored through a knob. The knobs appeared in this suite
+# only BELOW the caps (CEIL=1, CEIL=3600) — the one region the caps do not govern.
+outP4CEILCAP=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 \
+                     CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=991999999 && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  MAXAGE=999999999 CEIL=991999999 resolves to: $outP4CEILCAP"
+ck "A82 [RED→GREEN] the CEILING is hard-capped at the 30-day literal, so no override reaches ~31 years" "^2592000$" "$outP4CEILCAP"
+outP4FLOORCAP=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_TTL_MAX=999999999 \
+                      && . "$CLAIMS_SH" && printf '%s' "$CLAIM_UNREADABLE_LEASE_MAX_AGE" ) 2>/dev/null | tail -1 )
+echo "  TTL_MAX=999999999 resolves to: $outP4FLOORCAP"
+ck "A83 [RED→GREEN] the FLOOR TERM is hard-capped at the 30-day literal, so a 9-digit term cannot raise the ceiling with it" "^2592000$" "$outP4FLOORCAP"
+# ...and the cap is the DECISION, not just the value: a 2-year-old claim is REAPED at the ceiling, so a
+# deleted cap shows up as a KEPT claim, not as a number.
+# ⛔ AND THIS SEED IS ASSERTED, NOT SWALLOWED (review rounds 30–33, agent-infra#3203) — the same rule round
+# 25 wrote at A70a above. `pr-3236` WAS one of 14 seeds this P4 block planted with `p4_seed … >/dev/null` —
+# 13 others still are — and it was the only one OF THOSE 14 whose PAIRED assertion is an ABSENCE: A85 reads
+# `p4_has pr-3236 && … || P4CAPK=1` and asserts `^1$`, and `p4_has` (:806) cannot tell "pruned" from
+# "never planted" — both answer 1. So a seed that failed inside the redirect read `✅ "it is really gone"`
+# over a ref that never existed: a ROW passing an unverified artifact.
+# ⛔ WHAT THIS ROW BUYS, STATED NARROWLY — four earlier drafts of this paragraph claimed more, so the
+# bounds are written down rather than left to the next reader.
+#   * It does NOT change the run's polarity. An absent fixture was ALREADY a red run: A84 greps the prune
+#     output for the literal `pruned … refs/claims/pr-3236`, which a never-planted ref cannot produce, so
+#     A84 was the run-level red all along (the suite's own last command, `[ "$FAIL" -eq 0 ]` — cited by
+#     its TEXT, not a line number, which is what rotted the first draft of this pointer)
+#   * It does NOT stop A84/A85 running. The suite is `set -u`, NOT `set -e` (:69), and `ck` only increments
+#     FAIL (:275-282) — there is no early exit, so both rows still execute.
+#   * It DOES move the failure to a SETUP row whose message NAMES the seed, instead of surfacing as an A84
+#     red that reads like a 30-day-CEILING-cap regression. Attribution is the whole purchase: a red that
+#     names the wrong cause costs a diagnosis.
+# ⛔ THE COUNTS ARE TWO DIFFERENT SETS, AND CONFLATING THEM IS HOW THE PREVIOUS DRAFT WENT WRONG (review
+# round 33). HISTORY: 14 swallowed seeds, of which `pr-3236` was the only absence-paired one. NOW: 13
+# swallowed seeds, and `pr-3236` is NOT among them — A84a plants it with `2>/dev/null` INSIDE the asserted
+# `ck`, which is the whole point of this paragraph. So at this head NONE of the 13 swallowed seeds is
+# absence-paired, and the one absence-paired seed of the original 14 is the asserted one. Citing the 13 by
+# NAME, not by line, for the reason the pointer above records: they are `p4-young`, `p4-future`,
+# `p4-expired`, `pr-3205`, `pr-3206`, `pr-3209`, `pr-3299`, `pr-3213`, `pr-3214`, `pr-3217`, `issue-9001`
+# (twice) and `$P4BGR`. Of those, `pr-3214` is planted and read by NO assertion at all, so its seed can
+# fail silently; that is dead weight rather than a false PASS, it feeds no absence assertion, and it is
+# PRE-EXISTING on `main` — a follow-up (`p4_has pr-3214` beside A39) rather than this change.
+ck "A84a (setup) a 2-YEAR-old unparseable-lease claim is MINTED for the ceiling-cap case" "^[0-9a-f]\{40\}$" "$( p4_seed pr-3236 weird3203 HAVOC 63072000 2>/dev/null )"
+outP4CAPB=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" CLAIM_OWNER_HOST=boxA \
+                  CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999 CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=999999999 \
+                  && . "$CLAIMS_SH" && claim_prune ) 2>&1 )
+echo "  prune of a 2-YEAR-old claim with both knobs at 999999999:"; printf '%s\n' "$outP4CAPB" | sed 's/^/    /'
+ck "A84 [RED→GREEN] ...so a 2-YEAR-old claim is still REPAIRED at the 30-day ceiling, not kept for 31 years" "pruned unreadable-lease refs/claims/pr-3236" "$outP4CAPB"
+p4_has pr-3236 && P4CAPK=0 || P4CAPK=1
+ck "A85 [RED→GREEN] ...and it is really gone (the bound is a bound at every knob setting)" "^1$" "$P4CAPK"
+# ⛔ A NON-UTF-8 BYTE IN THE COMMITTER NAME MUST NOT MAKE THE AGE UNMEASURABLE (merge of review round 26
+# with round 22, agent-infra#3203). `sed`'s `.` does not consume an INVALID UTF-8 byte under a UTF-8
+# locale, so the SAME object answered its stamp under `LC_ALL=POSIX` and UNMEASURABLE under
+# `LC_ALL=C.UTF-8` — measured, one datum with two answers depending on which box read it, in the field
+# the bounded reap is measured from. The parse is now byte-oriented (`LC_ALL=C` on all three stages), and
+# the caller below deliberately runs under a UTF-8 ambient locale: the function must not inherit it.
+# ⛔ THIS PIN EXISTS BECAUSE THE FIX SHIPPED UNPINNED: removing all three `LC_ALL=C` stages left BOTH
+# suites fully green (the harness's crafted fixtures are all SHAPE hazards — trailing token, extra
+# committer line, NUL, 3-digit tz — and not one carries a non-UTF-8 byte), so the one regression this
+# merge exists to prevent had no assertion at all.
+P4NONUTF="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\ncommitter a <a\377@b> %s +0000\n\nclaim owner=weird3203 lease_until=HAVOC nonce=byte\n' "$P4NOW" "$P4NOW" \
+   | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+( cd "$P4BOX" && git push -q --force origin "$P4NONUTF:refs/claims/pr-3237" ) 2>/dev/null
+# ⛔ THE PIN BELOW MUST BE ABLE TO FAIL — A MISSING `en_US.UTF-8` MADE IT INERT (review round 27,
+# agent-infra#3203). A86 relied on `en_US.UTF-8` being INSTALLED: glibc FALLS BACK to `C` when it is not
+# (and the subshell's `2>/dev/null` hid the warning), so `sed` was already byte-oriented and A86/A87 passed
+# with OR without the three `LC_ALL=C` prefixes — a green that measured nothing. Measured with
+# `LC_ALL=xx_YY.UTF-8`: the Q4 mutant is NOT caught, and the pin silently claims a property its box
+# cannot test. So the ambient locale is now the first UTF-8 locale this box actually HAS (`C.UTF-8` is
+# built into modern glibc and is UTF-8 for this purpose), and a box that reports NONE says the pin is
+# inert instead of passing quietly.
+P4UTF8=""
+if command -v locale >/dev/null 2>&1; then
+  while IFS= read -r _p4l; do
+    # ⛔ ANY UTF-8 LOCALE, NOT FOUR LITERALS (review round 28, agent-infra#3203). Matching only
+    # `en_US.UTF-8|en_US.utf8|C.UTF-8|C.utf8` left a box whose only UTF-8 locale is, say, `de_DE.UTF-8`
+    # taking the fallback below — i.e. INERT — which is the very defect this probe was added to close.
+    case "$_p4l" in *.[Uu][Tt][Ff]-8|*.[Uu][Tt][Ff]8) P4UTF8="$_p4l"; break ;; esac
+  done <<<"$(locale -a 2>/dev/null)"
+fi
+if [ -z "$P4UTF8" ]; then
+  echo "  ⚠️ A86/A87: no *.UTF-8/*.utf8 locale reported by 'locale -a' on this box — the byte-orientation"
+  echo "     pin is INERT here: it would pass with the three LC_ALL=C prefixes removed. Not a failure of the"
+  echo "     fix, but the pin cannot measure it on this box — so it is reported as SKIPPED, never as a pass."
+fi
+ck "A86a (setup) a claim commit whose committer NAME carries an invalid UTF-8 byte is planted" "0" "$( p4_has pr-3237 && echo 0 || echo 1 )"
+# ⛔ THE PIN IS ONLY A PIN IF THE BOX CAN RUN IT (review round 28, agent-infra#3203). With no UTF-8 locale
+# installed (glibc falls back to `C`), `sed` is byte-oriented with OR without the three `LC_ALL=C` prefixes,
+# so A86/A87 pass while measuring NOTHING — a false GREEN on the only assertions for the byte-orientation
+# property. The old code reported that in an out-of-band `⚠️` and still incremented PASS. It is now a named
+# SKIP: the RESULT line carries `N SKIPPED`, and an inert pin can never read as a verified property.
+if [ -n "$P4UTF8" ]; then
+  P4NONUTFV=$( ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" LC_ALL="$P4UTF8" && . "$CLAIMS_SH" \
+                 && _git ls-remote origin refs/claims/pr-3237 >/dev/null 2>&1 \
+                 && _git fetch -q origin "+refs/claims/pr-3237:$CLAIM_TMP_NS/nonutf3203" \
+                 && _claim_commit_time "$CLAIM_TMP_NS/nonutf3203" ) 2>/dev/null | tail -1 )
+  echo "  _claim_commit_time over a committer name with a 0xFF byte, under UTF-8 ambient locale '$P4UTF8': '$P4NONUTFV'"
+  ck "A86 [RED→GREEN] a non-UTF-8 byte in the committer NAME does not stop the stamp being measured (the parse is byte-oriented)" "^${P4NOW}$" "$P4NONUTFV"
+  outP4NONUTFP=$( p4_prune )
+  ck "A87 [RED→GREEN] ...so the claim is AGED from that stamp (INSIDE the bound), not reported unmeasurable" "kept unreadable-lease refs/claims/pr-3237 (owner weird3203 .*INSIDE the 18000s bound" "$outP4NONUTFP"
+else
+  echo "  ⏭️ A86/A87 SKIPPED — this box has no UTF-8 locale, so the byte-orientation pin is INERT and cannot"
+  echo "     measure the mutation. Counted as SKIPPED, never as a pass (an inert pin that increments PASS is"
+  echo "     the false GREEN this block exists to prevent)."
+  SKIPPED=$((SKIPPED+1))
+fi
+# ⛔ THE READER'S ANSWER IS PINNED TO **GIT'S OWN ANSWER** (review round 27, agent-infra#3203).
+# A round-27 review finding claimed git reads the FIRST `<`…FIRST `>` span, so that
+# `committer a <a@b> <NOW> +0000 > 1 +0000` is dated NOW by git and only a mail-span anchor could close
+# the steal. MEASURED against git 2.43.0 (`hash-object -w -t commit --literally` + `git log -1
+# --format=%ct`), the premise is FALSE: git dates the object from the field after the **LAST** `>`,
+#
+#   committer a <a@b> <NOW> +0000                     git %ct = <NOW>
+#   committer a <a@b> <NOW> +0000 > 1 +0000           git %ct = 1        <- the claim IS ancient
+#   committer a <a@b> <NOW> +0000 <c@d> 1 +0000       git %ct = 1        <- the claim IS ancient
+#   committer a <a@b> 1 +0000 > <NOW> +0000           git %ct = <NOW>    <- the reverse sign
+#   committer a <a@b> <NOW> +0000 1 +0000             git %ct = <NOW>    <- we ABSTAIN (keep)
+#   committer a <a@b> <NOW> +0000 junk                git %ct = <NOW>    <- we ABSTAIN (keep)
+#
+# and a mail-span anchor answered UNMEASURABLE for the two `> ` shapes — which is the PERMANENT-HOLD
+# direction, not the steal: `claim_prune` `continue`s on an unmeasurable age BEFORE the bound is
+# compared, so a peer appending ` > 1 +0000` would hold its claim FOR EVER (#3203 re-opened through the
+# reaper reporting itself healthy). So the assertion is not "the parser refuses" — it is **the parser
+# answers what git answers**, on both signs, and the LAST two rows are the only permitted divergence:
+# the `$` anchor is a deliberate property of this reader (claim-reaper.test.sh:124 pins it), and it
+# refuses a whole line git would tolerate a trailing token on — always in the KEEP direction.
+#
+# ⛔ EACH ROW ASSERTS GIT'S ANSWER (`p4_git_ct`) AS WELL AS THE READER'S, so a future "fix" that
+# re-derives git's ident split differently cannot pass by agreeing with itself: the oracle is in the
+# assertion, not in a comment.
+p4_plant_committer() { # <ref-name> <committer-line> -> plants it verbatim, pushes, prints the object id
+  local o
+  o="$( ( cd "$P4BOX" && printf 'tree 4b825dc642cb6eb9a060e54bf8d69288fbee4904\nauthor a <a@b> %s +0000\n%s\n\nclaim owner=weird3203 lease_until=HAVOC nonce=forge\n' "$P4NOW" "$2" \
+        | git hash-object -w -t commit --literally --stdin ) 2>/dev/null )"
+  [ -n "$o" ] || return 1
+  ( cd "$P4BOX" && git push -q --force origin "$o:refs/claims/$1" ) 2>/dev/null
+  printf '%s' "$o"
+}
+p4_git_ct() { # <object-id> -> what GIT itself dates it at (the oracle the reader is pinned to)
+  git -C "$P4BOX" log -1 --format=%ct "$1" 2>/dev/null
+}
+p4_ct_val() { # <ref-name> <ns-suffix> -> _claim_commit_time's measured stamp (empty when unmeasurable)
+  ( cd "$P4BOX" && export CLAIM_REPO="$P4BOX" && . "$CLAIMS_SH" \
+    && _git fetch -q origin "+refs/claims/$1:$CLAIM_TMP_NS/$2" \
+    && _claim_commit_time "$CLAIM_TMP_NS/$2" ) 2>/dev/null | tail -1
+}
+# ── row 1: a forged tail after a `>` — GIT says 1970, so the claim is genuinely ancient and MUST be
+# reaped. A reader that abstains here holds a claim for ever; a reader that answers anything but git's
+# value reports an age git contradicts.
+P4G1="$(p4_plant_committer pr-3238 "committer a <a@b> $P4NOW +0000 > 1 +0000")"
+ck "A88a (setup) a committer line with a trailing '> 1 +0000' past the ident is planted" "0" "$( p4_has pr-3238 && echo 0 || echo 1 )"
+ck "A88b (oracle) GIT dates that object at 1, so the claim really is ancient by its own commit" "^1$" "$( p4_git_ct "$P4G1" )"
+ck "A88 [RED→GREEN] the reader answers GIT's value (1) — not an abstention, which would hold the claim for ever" "^1$" "$( p4_ct_val pr-3238 forge3203 )"
+outP4G1=$( p4_prune )
+ck "A88c [RED→GREEN] ...and claim_prune REAPS it (an unmeasurable age would keep it past every bound)" "pruned unreadable-lease refs/claims/pr-3238" "$outP4G1"
+p4_has pr-3238 && P4G1K=0 || P4G1K=1
+ck "A88d [RED→GREEN] ...and the ref is really gone" "^1$" "$P4G1K"
+# ── row 2: the same, through a later mail-SHAPED span. git's split point is the last `>`, so this is
+# dated 1 by git too — the reader must agree, not prefer the `<c@d>` span.
+P4G2="$(p4_plant_committer pr-3239 "committer a <a@b> $P4NOW +0000 <c@d> 1 +0000")"
+ck "A89a (setup) the same forgery through a later '<c@d>' mail-shaped span is planted" "0" "$( p4_has pr-3239 && echo 0 || echo 1 )"
+ck "A89b (oracle) GIT dates that object at 1 as well" "^1$" "$( p4_git_ct "$P4G2" )"
+ck "A89 [RED→GREEN] ...and the reader answers GIT's value, from the LAST '>' span, not the earlier one" "^1$" "$( p4_ct_val pr-3239 forge3204 )"
+outP4G2=$( p4_prune )
+ck "A89c [RED→GREEN] ...so that claim is REAPED too" "pruned unreadable-lease refs/claims/pr-3239" "$outP4G2"
+p4_has pr-3239 && P4G2K=0 || P4G2K=1
+ck "A89d [RED→GREEN] ...and its ref is gone" "^1$" "$P4G2K"
+# ── row 3: the REVERSE sign. A peer forges a FRESH stamp after a `>` to DELAY a reap — git reads that
+# same fresh stamp, so agreeing with git is what defeats it (the reader must not prefer the ident's).
+P4G3="$(p4_plant_committer pr-3240 "committer a <a@b> 1 +0000 > $P4NOW +0000")"
+ck "A90a (setup) a committer line with a forged LATER stamp after '>' is planted" "0" "$( p4_has pr-3240 && echo 0 || echo 1 )"
+ck "A90b (oracle) GIT dates that object at <NOW> — this shape is a FORGED-FRESH claim" "^${P4NOW}$" "$( p4_git_ct "$P4G3" )"
+ck "A90 [RED→GREEN] ...and the reader answers GIT's value, so the forged-fresh stamp cannot buy a delay" "^${P4NOW}$" "$( p4_ct_val pr-3240 revsign3203 )"
+# ── row 4 (the permitted divergence, pinned so it stays in the KEEP direction and is not mistaken for
+# an assertion that the parser is right): a trailing token after the tz makes the `$` anchor refuse the
+# line while git ignores the token. The claim stays KEPT and NAMED — the same decision A79 pins — and
+# the ORACLE assertion records the divergence explicitly rather than leaving it to be rediscovered.
+P4G4="$(p4_plant_committer pr-3241 "committer a <a@b> $P4NOW +0000 1 +0000")"
+ck "A91a (setup) a forged tail with NO '>' in front of it is planted (the shape A79 drives)" "0" "$( p4_has pr-3241 && echo 0 || echo 1 )"
+ck "A91b (oracle) GIT dates that object at <NOW> — the divergence below is a TOLERANCE, not a disagreement" "^${P4NOW}$" "$( p4_git_ct "$P4G4" )"
+ck "A91 [documented divergence] the reader ABSTAINS here (the \`$\` anchor refuses a trailing token), and abstention is the KEEP direction" "^$" "$( p4_ct_val pr-3241 junk3203 )"
+outP4G3G4=$( p4_prune )
+ck "A91c ...so that claim is KEPT and NAMED, never reaped on a stamp git would have had to interpret" "kept unreadable-lease refs/claims/pr-3241" "$outP4G3G4"
+ck "A90c ...while the forged-FRESH claim (git dates it <NOW>) is kept INSIDE the bound, not reaped" "kept unreadable-lease refs/claims/pr-3240" "$outP4G3G4"
+# ── row 5: a name that legitimately carries `> 1 +0000` BEFORE the date field. Any anchor that
+# demanded the FIRST `>` be the split point would refuse this shape git dates fine.
+P4G5="$(p4_plant_committer pr-3242 "committer a > 1 +0000 <a@b> $P4NOW +0000")"
+ck "A92a (setup) a committer NAME carrying '> 1 +0000' before the date field is planted" "0" "$( p4_has pr-3242 && echo 0 || echo 1 )"
+ck "A92b (oracle) GIT dates that object at <NOW>" "^${P4NOW}$" "$( p4_git_ct "$P4G5" )"
+ck "A92 [control] ...and the reader agrees with git (the anchor must not over-reach into names)" "^${P4NOW}$" "$( p4_ct_val pr-3242 nametail3203 )"
+# ── rows 6-8: the WHITESPACE after the split `>` (review round 28, agent-infra#3203). git does NOT
+# require a space there — it skips whitespace before the date field — so zero, two, three spaces and a
+# TAB all answer the SAME value. An anchor of `> ` (EXACTLY one space) abstained on every one of them,
+# and for `>  1 +0000` the PREVIOUS bare-`.* ` parser had measured GIT's own answer — so the `> ` form
+# turned a git-ancient claim's REAP into a HOLD (the #3203 direction). Each row pins git's answer, the
+# reader's, and, where the claim is genuinely ancient, that claim_prune really deletes it.
+P4G6="$(p4_plant_committer pr-3243 "committer a <a@b> $P4NOW +0000 >  1 +0000")"
+ck "A93a (setup) a committer line with TWO spaces after the split '>' is planted" "0" "$( p4_has pr-3243 && echo 0 || echo 1 )"
+ck "A93b (oracle) GIT dates that object at 1 — it skips whitespace after the split '>'" "^1$" "$( p4_git_ct "$P4G6" )"
+ck "A93 [RED→GREEN] ...and the reader answers GIT's value, not an abstention (which would hold the claim)" "^1$" "$( p4_ct_val pr-3243 ws3203 )"
+outP4G6=$( p4_prune )
+ck "A93c [RED→GREEN] ...so claim_prune REAPS it, never keeps a git-ancient claim past every bound" "pruned unreadable-lease refs/claims/pr-3243" "$outP4G6"
+p4_has pr-3243 && P4G6K=0 || P4G6K=1
+ck "A93d [RED→GREEN] ...and the ref is really gone" "^1$" "$P4G6K"
+# ── row 7: NO whitespace at all after the split `>`. git's split point is the `>`, not the `> ` pair.
+P4G7="$(p4_plant_committer pr-3244 "committer a <a@b> $P4NOW +0000 >1 +0000")"
+ck "A94a (setup) a committer line with NO whitespace after the split '>' is planted" "0" "$( p4_has pr-3244 && echo 0 || echo 1 )"
+ck "A94b (oracle) GIT dates that object at 1 as well" "^1$" "$( p4_git_ct "$P4G7" )"
+ck "A94 [RED→GREEN] ...and the reader agrees with git" "^1$" "$( p4_ct_val pr-3244 nows3203 )"
+# ── row 8: a TAB. git skips it, and `[[:blank:]]` is space+TAB by definition, so the anchor must too.
+P4G8="$(p4_plant_committer pr-3245 "committer a <a@b> $P4NOW +0000 >$(printf '\t')1 +0000")"
+ck "A95a (setup) a committer line with a TAB after the split '>' is planted" "0" "$( p4_has pr-3245 && echo 0 || echo 1 )"
+ck "A95b (oracle) GIT dates that object at 1" "^1$" "$( p4_git_ct "$P4G8" )"
+ck "A95 [RED→GREEN] ...and the reader agrees with git, so a TAB cannot buy an abstention" "^1$" "$( p4_ct_val pr-3245 tab3203 )"
+for _p4n in P4G1 P4G2 P4G3 P4G4 P4G5 P4G6 P4G7 P4G8; do
+  [ -n "$(eval "printf '%s' \"\$$_p4n\"")" ] || echo "  ⚠️ $_p4n: the fixture did not plant — the assertions above cannot discriminate"
+done
 rm -rf "$P4ORIG" "$P4BOX"
 
 echo

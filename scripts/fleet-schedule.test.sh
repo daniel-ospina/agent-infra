@@ -3147,8 +3147,12 @@ root, live = sys.argv[3], int(sys.argv[4])
 os.makedirs(root, exist_ok=True)
 m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(root, "loop.lock")
 # Two stubs, so the interleaving is the only thing under test: every pid reads as alive, and only the
-# COMPETITOR reads as a scheduler loop. The competitor's recorded start time is its REAL one, so the
-# identity check recognises it — otherwise the test would be grading the start arm, not this one.
+# COMPETITOR reads as a scheduler loop. Its recorded start time is the REAL one, so the identity
+# check recognises it — otherwise the test would be grading the start arm, not this one.
+# ⛔ KEEP THE APOSTROPHE COUNT IN THIS BODY EVEN (#3625). The bash 3.2 scanner does not know about
+# here-documents inside a command substitution: it walks the body as code, so one odd single-quote
+# opens a state that never closes and the WHOLE FILE fails `bash -n`, reported far below the defect.
+# Verify with `bash scripts/check-bash32-parse.sh` after any edit in here.
 m.pid_alive = lambda p: True
 m.pid_is_our_loop = lambda p: p == live
 competitor_start = m.proc_start_time(live)
@@ -3212,6 +3216,59 @@ grep -q "CLAIM None" <<<"$out19o" \
 grep -q "GUARD OFF" <<<"$out19o" \
   && bad "19o the fallback took the permit path (disclosed) instead of claiming: $out19o" \
   || ok "19o the fallback did NOT fall through to a silent permit"
+
+# 19y — ⛔ THE FALLBACK MUST NOT CLAIM A NAME IT NO LONGER OWNS, AND MUST NOT PERMIT EITHER.
+# `O_EXCL` makes the CREATE atomic, not the write that follows: a contender that reclaims inside it
+# renames our empty claim away and publishes its own, so writing lands in an inode nobody can see.
+# Two ways to get this wrong, and the first cut had both — believing the create (two loops), or
+# permitting (one loop beside a live holder). The fallback must therefore re-examine, and a LIVE
+# holder must come back to the caller as a refusal. Driven in-process, with `link` refusing and
+# `write` letting a real, live loop take the name mid-publish.
+s19y_state="$T/s19ybox"
+env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$s19y_state" FLEET_SCHEDULE_LOCK_ROOT="$L19/y" \
+    python3 "$SCHED" --start >/dev/null 2>&1
+pidY="$(cat "$s19y_state/loop.pid" 2>/dev/null)"
+if [ -n "$pidY" ] && kill -0 "$pidY" 2>/dev/null; then
+  ok "19y baseline: a live loop holds the box lock under $L19/y (pid $pidY)"
+  rec19y="$(python3 -c 'import json,sys;print(json.dumps({"pid":int(sys.argv[1]),"start":sys.argv[2],"state":sys.argv[3]}))' \
+      "$pidY" "$(starttime19 "$pidY")" "$s19y_state")"
+  out19y="$(python3 - "$SCHED" "$T/s19y" "$L19/y" "$rec19y" <<'PY19Y' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(sys.argv[3], "loop.lock")
+os.makedirs(m.STATE, exist_ok=True)
+takeover = sys.argv[4].encode()
+real_link, real_write = os.link, os.write
+def no_link(a, b, *rest, **kw):
+    raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+def takeover_write(fd, data):
+    os.unlink(m.LOOP_LOCK)
+    with open(m.LOOP_LOCK, "wb") as fh:
+        fh.write(takeover)
+    return real_write(fd, data)
+os.link, os.write = no_link, takeover_write
+try:
+    got = m.claim_loop_lock()
+finally:
+    os.link, os.write = real_link, real_write
+print("CLAIM %r" % (got,))
+PY19Y
+)"
+  grep -q 'CLAIM None' <<<"$out19y" \
+    && bad "19y the fallback claimed a lock whose name a live holder took during its write — TWO scheduler loops on one box: $out19y" \
+    || ok "19y the fallback does NOT claim a lock a live holder took during its write"
+  grep -q "CLAIM ($pidY," <<<"$out19y" \
+    && ok "19y it reports the LIVE holder to the caller, so the pass is refused (pid $pidY)" \
+    || bad "19y the fallback did not surface the live holder: $out19y"
+  grep -q 'GUARD OFF' <<<"$out19y" \
+    && bad "19y the fallback PERMITTED the pass beside a live holder: $out19y" \
+    || ok "19y it did not fall through to a disclosed permit beside a live holder"
+else
+  bad "19y baseline loop never came up — the arm grades nothing"
+fi
+kill "$pidY" 2>/dev/null; sleep 1
 
 # 19p — NON-VACUITY for the reclaim's DISCLOSURE. When a third claim takes the name before the
 # restore, the displaced claim's record must be PRESERVED and the outcome ANNOUNCED: deleting it is
@@ -3411,6 +3468,864 @@ kill "$recycU" "$recycU2" 2>/dev/null
 # belt and braces: this arm must not leave a box-lock holder for the arms that follow
 kill "$pidU" 2>/dev/null; sleep 1
 
+# 19v — ⛔ A RELATIVE `FLEET_SCHEDULE_LOCK_ROOT` MUST NOT BE TWO LOCKS. The root is the mutex's NAME,
+# and a name resolved against the caller's cwd here but against `cwd="/"` in the loop child is two
+# names — the parent creates `$PWD/relock`, the child cannot create `/relock` and degrades to
+# `$STATE/loop.lock`, so both homes believe they hold the box and #2890 is reproduced with the guard
+# reporting success (measured by the reviewer: two live loops, no lock file on the parent's path).
+# The arm pins a RELATIVE root from a scratch cwd and asserts the second home is still refused.
+mkdir -p "$T/relcwd" "$T/s19vA" "$T/s19vB"
+out19v_1="$(cd "$T/relcwd" && env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19vA" \
+  FLEET_SCHEDULE_LOCK_ROOT=relock19v python3 "$SCHED" --start 2>&1)"
+pidV="$(cat "$T/s19vA/loop.pid" 2>/dev/null)"
+[ -n "$pidV" ] && kill -0 "$pidV" 2>/dev/null \
+  && ok "19v baseline: a loop holds the box under a RELATIVE lock root (pid $pidV)" \
+  || bad "19v baseline loop never came up under a relative root: $out19v_1"
+[ -f "$T/relcwd/relock19v/loop.lock" ] \
+  && ok "19v the relative root resolved to the CALLER's cwd (dir created where the parent can see it)" \
+  || bad "19v no lock file under the caller's cwd — the root was not made absolute"
+out19v_2="$(cd "$T/relcwd" && env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19vB" \
+  FLEET_SCHEDULE_LOCK_ROOT=relock19v python3 "$SCHED" --start 2>&1)"; rc19v=$?
+[ "$rc19v" -eq 0 ] \
+  && ok "19v --start in a second home under a relative root still exits 0" \
+  || bad "19v --start exited $rc19v: $out19v_2"
+grep -q 'one loop per box, so this state dir starts none' <<<"$out19v_2" \
+  && ok "19v ⛔ the second home is REFUSED under a relative root — one name is one mutex (#2890)" \
+  || bad "19v a relative lock root let a second loop start on the same box: $out19v_2"
+[ ! -f "$T/s19vB/loop.pid" ] \
+  && ok "19v the refused home left no pidfile of its own" \
+  || bad "19v the refused home wrote a pidfile — it ran a loop"
+kill "$pidV" 2>/dev/null; sleep 1
+
+# 19w — `--start` is the revival verb, so the OFF switch it finds must be CLEARED even when the loop
+# is already alive. An OFF set while the loop ran outlived the verb: the loop exited at its next
+# check, the box went dark, and `--start` had answered 0 having changed nothing (#1864's shape).
+s19 "$T/s19w" "$GOOD" --start >/dev/null 2>&1
+pidW="$(cat "$T/s19w/loop.pid" 2>/dev/null)"
+if [ -n "$pidW" ] && kill -0 "$pidW" 2>/dev/null; then
+  ok "19w baseline: a live loop is running for state dir W (pid $pidW)"
+else
+  bad "19w baseline loop never came up — the arm grades nothing"
+fi
+: > "$T/s19w/OFF"
+out19w="$(s19 "$T/s19w" "$GOOD" --start)"; rc19w=$?
+[ "$rc19w" -eq 0 ] \
+  && ok "19w --start over a live own-state loop exits 0" \
+  || bad "19w --start exited $rc19w: $out19w"
+[ ! -e "$T/s19w/OFF" ] \
+  && ok "19w ⛔ --start CLEARED the OFF switch even though the loop was already alive (the box stays scheduled)" \
+  || bad "19w the OFF switch outlived --start — the loop exits at its next check and the box goes dark"
+grep -q 'OFF switch cleared' <<<"$out19w" \
+  && ok "19w --start SAID it cleared the switch (never a silent change)" \
+  || bad "19w --start cleared the switch silently: $out19w"
+s19 "$T/s19w" "$GOOD" --stop >/dev/null 2>&1; sleep 1
+
+# 19x — a TWO-HOME box whose homes declare DIFFERENT job sets. Two things must hold at once:
+#   (1) the verdict grades the HOLDER's declarations, so a job only the caller declares is not
+#       reported as `NEVER RUN` against the holder's stamps (the misleading false FAIL), and
+#   (2) that job is still a FAILURE, because bring-up certifies a cell on rc=0 + `SCHEDULE VERIFIED`
+#       and dies only on a `^ *FAIL` line — a NOTE would print CELL READY for a job no loop on the
+#       box runs, i.e. trade a false FAIL for a false PASS. The holder is started with `--start`
+#       (not `--install`) on purpose: `--start` must also record its declaration set, or the holder's
+#       set is unknown and the caller's set is graded again.
+mkdir -p "$T/tpl19xA" "$T/tpl19xB"
+cp "$GOOD"/*.plist "$T/tpl19xA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19xB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19xA/RETIRED"; printf '# none\n' > "$T/tpl19xB/RETIRED"
+python3 - "$T/tpl19xB" <<'PY19X'
+import plistlib, os, sys
+d = {"Label": "com.test.extra19x", "ProgramArguments": ["/bin/true"], "StartInterval": 3600}
+with open(os.path.join(sys.argv[1], "com.test.extra19x.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19X
+s19 "$T/s19xA" "$T/tpl19xA" --start >/dev/null 2>&1
+pidX="$(cat "$T/s19xA/loop.pid" 2>/dev/null)"
+[ -n "$pidX" ] && kill -0 "$pidX" 2>/dev/null \
+  && ok "19x baseline: home A's loop holds the box (pid $pidX)" \
+  || bad "19x baseline loop never came up"
+[ -f "$T/s19xA/templates-dir" ] \
+  && ok "19x --start recorded its declaration set (the pointer is how a later grade learns it)" \
+  || bad "19x --start did not record templates-dir — a second home cannot know the holder's set"
+out19x="$(s19 "$T/s19xB" "$T/tpl19xB" --install)"; rc19x=$?
+grep -q 'NEVER RUN' <<<"$out19x" \
+  && bad "19x a job only the SECOND home declares was graded NEVER RUN against the holder's stamps: $out19x" \
+  || ok "19x the caller's extra declaration is not graded against the holder's stamps"
+grep -q 'run by NO loop on this box: com.test.extra19x' <<<"$out19x" \
+  && ok "19x ⛔ the divergence is REPORTED — a declaration no loop on the box runs is not silent" \
+  || bad "19x the divergence vanished without a word: $out19x"
+grep -q '^  FAIL' <<<"$out19x" \
+  && ok "19x it is a FAIL line, which is what bring-up's gate reads (a NOTE would certify CELL READY)" \
+  || bad "19x the divergence was not a FAIL line, so bring-up would print CELL READY: $out19x"
+[ "$rc19x" -ne 0 ] \
+  && ok "19x --install exits non-zero on a genuine job-set divergence (rc=$rc19x)" \
+  || bad "19x --install exited 0 over a job no loop on this box runs: $out19x"
+# ⛔ THE POSITIVE CONTROL: with the SAME set on both homes there is no divergence and no FAIL — so
+# the assertions above grade the difference, not a blanket failure.
+out19x2="$(s19 "$T/s19xA" "$T/tpl19xA" --verify)"; rc19x2=$?
+[ "$rc19x2" -eq 0 ] && ! grep -q '^  FAIL' <<<"$out19x2" \
+  && ok "19x CONTROL: the holder's own home verifies clean over the same set (no blanket FAIL)" \
+  || bad "19x CONTROL: the holder's own home failed over its own set (rc=$rc19x2): $out19x2"
+kill "$pidX" 2>/dev/null; sleep 1
+
+# 19z — ⛔ A STALE RECORD ON A LINK-REFUSING ROOT MUST BE RECLAIMED, not permitted for ever. The
+# fallback re-checked the holder but never reclaimed, so a stale or corrupt record made EVERY
+# claimant take the disclosed permit while the dead record sat unchanged — #2890 with the guard
+# announcing its own absence on every pass (measured with two real processes by the [VGATE] pass).
+for stale19z in '{"pid": 999999, "start": "", "state": "/nowhere"}' '{"pid": 1e400}'; do
+  rm -rf "$L19/z"; mkdir -p "$L19/z"
+  printf '%s' "$stale19z" > "$L19/z/loop.lock"
+  out19z="$(python3 - "$SCHED" "$T/s19z" "$L19/z" <<'PY19Z' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(sys.argv[3], "loop.lock")
+os.makedirs(m.STATE, exist_ok=True)
+real_link = os.link
+def no_link(a, b, *rest, **kw):
+    raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+os.link = no_link
+try:
+    got = m.claim_loop_lock()
+finally:
+    os.link = real_link
+print("CLAIM %r" % (got,))
+print("MYPID %d" % os.getpid())
+print("NOW %r" % (m.read_loop_lock(),))
+PY19Z
+)"
+  grep -q 'GUARD OFF' <<<"$out19z" \
+    && bad "19z a stale/corrupt record on a link-refusing root PERMITTED the pass ($stale19z): $out19z" \
+    || ok "19z a stale record ($(echo "$stale19z" | cut -c1-28)…) is RECLAIMED on a link-refusing root"
+  grep -q "CLAIM None" <<<"$out19z" \
+    && ok "19z the reclaim CLAIMED the box afterwards" \
+    || bad "19z the reclaim did not claim: $out19z"
+  own19z="$(grep -o 'MYPID [0-9]*' <<<"$out19z" | awk '{print $2}')"
+  recpid19z="$(sed -n "s/^NOW (\([0-9]*\),.*/\1/p" <<<"$out19z")"
+  [ -n "$own19z" ] && [ "$recpid19z" = "$own19z" ] \
+    && ok "19z the record at the path is now OURS (pid $own19z), not the stale one" \
+    || bad "19z the stale record survived the reclaim (record pid=$recpid19z, ours=$own19z): $out19z"
+done
+
+# 19aa — ⛔ EVERY normalized path knob must reach the child resolved, not just the lock root. The
+# child runs with cwd="/", so a RELATIVE `FLEET_SCHEDULE_STATE` was re-resolved there: measured
+# `PermissionError: /relstate` surfacing as "the loop did not come up", and as root a loop running
+# over a state dir the parent never reads — one that `--stop` cannot reach.
+mkdir -p "$T/relcwd2"
+out19aa="$(cd "$T/relcwd2" && env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE=relstate19aa \
+  FLEET_SCHEDULE_LOCK_ROOT="$L19/aa" python3 "$SCHED" --start 2>&1)"; rc19aa=$?
+[ "$rc19aa" -eq 0 ] \
+  && ok "19aa --start with a RELATIVE state dir exits 0 (the child agrees with the parent)" \
+  || bad "19aa --start exited $rc19aa with a relative state dir: $out19aa"
+[ -f "$T/relcwd2/relstate19aa/loop.pid" ] \
+  && ok "19aa the child wrote its pidfile into the SAME resolved dir the parent reads" \
+  || bad "19aa the child wrote its state somewhere else: $out19aa"
+pidAA="$(cat "$T/relcwd2/relstate19aa/loop.pid" 2>/dev/null)"
+if [ -n "$pidAA" ] && kill -0 "$pidAA" 2>/dev/null; then
+  out19aa2="$(cd "$T/relcwd2" && env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE=relstate19aa \
+    FLEET_SCHEDULE_LOCK_ROOT="$L19/aa" python3 "$SCHED" --stop 2>&1)"
+  sleep 1
+  kill -0 "$pidAA" 2>/dev/null \
+    && bad "19aa --stop could not stop the loop it started (a loop nothing can reach)" \
+    || ok "19aa --stop STOPS the loop it started (one state dir, one spelling)"
+else
+  bad "19aa baseline loop never came up — the arm grades nothing"
+  kill "$pidAA" 2>/dev/null
+fi
+
+# 19ab — ⛔ A PRE-EXISTING lock root keeps ITS mode. `makedirs(exist_ok=True)` cannot tell "just
+# created" from "pre-existing", so the umask correction turned an operator's deliberate 0700 pin
+# into 1777 on the first `--start` — after which any local uid can plant a `loop.lock` naming a live
+# `fleet-schedule --loop` it runs, and every operator loop refuses while `--start` exits 0.
+mkdir -p "$L19/ab"; chmod 0700 "$L19/ab"
+env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ab" FLEET_SCHEDULE_LOCK_ROOT="$L19/ab" \
+    python3 "$SCHED" --start >/dev/null 2>&1
+mode19ab="$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o7777))' "$L19/ab")"
+[ "$mode19ab" = "0o700" ] \
+  && ok "19ab a pre-existing private lock root keeps its 0700 mode (never widened)" \
+  || bad "19ab the lock root was widened to $mode19ab — a foreign uid could plant the box's lock"
+pidAB="$(cat "$T/s19ab/loop.pid" 2>/dev/null)"; kill "$pidAB" 2>/dev/null; sleep 1
+# ⛔ AND A ROOT WE CREATE IS NOT WORLD-WRITABLE EITHER. `makedirs`'s mode is umask-filtered (0o1755
+# under the usual 022), so this cut's `if created: chmod(root, 0o1777)` ADDED world-write that `main`
+# never had — for no benefit: the `st_uid != getuid()` arm refuses a root another uid owns whatever
+# its mode, so a world-writable root can never be SHARED across uids, only ATTACKED. World-write here
+# is the bypass the arm above describes: any local uid can plant a `loop.lock` naming a live
+# `fleet-schedule --loop` it runs, and every operator loop then refuses while `--start` exits 0.
+rm -rf "$L19/ab2"
+# ⛔ UNDER A PERMISSIVE UMASK ON PURPOSE. `makedirs`'s mode is umask-filtered and a umask can only
+# CLEAR bits, so the requested mode is what decides the FLOOR: a requested 0o1777 measured 0o1777
+# here under `umask 0` (services, containers and some CI images set exactly that), which is the
+# plant-a-`loop.lock` bypass this arm exists to refuse. `umask 022` would make the arm pass on a
+# world-writable request, i.e. the arm would be green wherever the operator's umask happened to be
+# conservative and the defect would ship.
+( umask 000
+  env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ab2" FLEET_SCHEDULE_LOCK_ROOT="$L19/ab2" \
+      python3 "$SCHED" --start >/dev/null 2>&1 )
+mode19ab2="$(python3 -c 'import os,sys;print(oct(os.stat(sys.argv[1]).st_mode & 0o0002))' "$L19/ab2")"
+[ "$mode19ab2" = "0o0" ] \
+  && ok "19ab a lock root WE created is NOT world-writable even under umask 000 (requested mode is the floor)" \
+  || bad "19ab a created lock root is world-writable ($mode19ab2) — any uid can plant the box's lock"
+pidAB2="$(cat "$T/s19ab2/loop.pid" 2>/dev/null)"; kill "$pidAB2" 2>/dev/null; sleep 1
+
+# 19ac — ⛔ A RELATIVE `TEMPLATES_DIR` MUST REACH THE CHILD RESOLVED TOO. The child runs `cwd="/"`,
+# so a relative set left it reading `/tpl`: `--start` printed "loop started", the loop logged
+# `template dir not found` every tick and ran ZERO jobs, while cloud-cell-supervisor.sh keys on the
+# exit code and therefore reported a scheduled layer on a cell that runs nothing.
+mkdir -p "$T/relcwd3/tpl19ac"          # relative to the CWD the verb below runs in
+cp "$GOOD"/*.plist "$T/relcwd3/tpl19ac/" 2>/dev/null
+printf '# none\n' > "$T/relcwd3/tpl19ac/RETIRED"
+out19ac="$(cd "$T/relcwd3" && env TEMPLATES_DIR=tpl19ac FLEET_SCHEDULE_STATE="$T/s19ac" \
+  FLEET_SCHEDULE_LOCK_ROOT="$L19/ac" python3 "$SCHED" --start 2>&1)"; rc19ac=$?
+[ "$rc19ac" -eq 0 ] \
+  && ok "19ac --start with a RELATIVE templates dir exits 0" \
+  || bad "19ac --start exited $rc19ac: $out19ac"
+grep -q 'template dir not found' "$T/s19ac/loop.log" 2>/dev/null \
+  && bad "19ac the loop child could not find the declarations (it resolved them against /)" \
+  || ok "19ac the child found the SAME declarations the parent resolved"
+grep -qx "$T/relcwd3/tpl19ac" "$T/s19ac/templates-dir" 2>/dev/null \
+  && ok "19ac the recorded pointer is the RESOLVED path (a later grade can trust it)" \
+  || bad "19ac the pointer records a relative/unresolved path: $(cat "$T/s19ac/templates-dir" 2>/dev/null)"
+pidAC="$(cat "$T/s19ac/loop.pid" 2>/dev/null)"; kill "$pidAC" 2>/dev/null; sleep 1
+
+# 19ad — ⛔ `--start` MUST NOT REWRITE THE DECLARATION POINTER WHEN IT STARTS NOTHING. The pointer
+# says "this is the set the box's loop runs"; on the documented "own-state loop alive, pidfile
+# missing" state this verb falls through and starts nothing, so writing it from the caller's
+# environment made the pointer lie — after which the home that verified clean returned
+# `FAIL … NEVER RUN` for a job its loop had never heard of (the #3029 false FAIL, self-inflicted).
+mkdir -p "$T/tpl19adA" "$T/tpl19adB"
+cp "$GOOD"/*.plist "$T/tpl19adA/" 2>/dev/null; printf '# none\n' > "$T/tpl19adA/RETIRED"
+cp "$GOOD"/*.plist "$T/tpl19adB/" 2>/dev/null; printf '# none\n' > "$T/tpl19adB/RETIRED"
+s19 "$T/s19ad" "$T/tpl19adA" --start >/dev/null 2>&1
+pidAD="$(cat "$T/s19ad/loop.pid" 2>/dev/null)"
+pointer_before="$(cat "$T/s19ad/templates-dir" 2>/dev/null)"
+rm -f "$T/s19ad/loop.pid"          # the documented state: own-state holder, pidfile missing
+out19ad="$(s19 "$T/s19ad" "$T/tpl19adB" --start)"; rc19ad=$?
+[ "$rc19ad" -eq 0 ] \
+  && ok "19ad --start over an own-state holder with no pidfile exits 0" \
+  || bad "19ad --start exited $rc19ad: $out19ad"
+[ "$(cat "$T/s19ad/templates-dir" 2>/dev/null)" = "$pointer_before" ] \
+  && ok "19ad ⛔ the declaration pointer still names the set the RUNNING loop reads" \
+  || bad "19ad --start rewrote the pointer to a set nothing runs ($pointer_before -> $(cat "$T/s19ad/templates-dir" 2>/dev/null))"
+kill "$pidAD" 2>/dev/null; sleep 1
+
+# 19ae — ⛔ THE FALLBACK'S RECLAIM MUST NOT RESTORE BY `rename`. `rename` REPLACES the destination, so
+# putting a displaced claim back would destroy a record a fourth party published in the meantime, and
+# an `os.path.exists` guard only narrows that window (the same read-then-act the claim itself
+# refuses). The ruling is the link path's: PRESERVE the displaced record, never delete it, and SAY SO.
+# Driven deterministically: a LIVE claim takes the name between the staleness read and the rename, so
+# the record we move is live — which is exactly the case the restore was supposed to handle.
+s19 "$T/s19aeLive" "$GOOD" --start >/dev/null 2>&1
+pidAE="$(cat "$T/s19aeLive/loop.pid" 2>/dev/null)"
+if [ -n "$pidAE" ] && kill -0 "$pidAE" 2>/dev/null; then
+  ok "19ae baseline: a real live loop exists to impersonate the fourth party (pid $pidAE)"
+  recAE="$(python3 -c 'import json,sys;print(json.dumps({"pid":int(sys.argv[1]),"start":sys.argv[2],"state":"/fourth"}))' \
+      "$pidAE" "$(starttime19 "$pidAE")")"
+  rm -rf "$L19/ae"; mkdir -p "$L19/ae"
+  printf '{"pid": 999999, "start": "", "state": "/nowhere"}' > "$L19/ae/loop.lock"
+  out19ae="$(python3 - "$SCHED" "$T/s19ae" "$L19/ae" "$recAE" <<'PY19AE' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(sys.argv[3], "loop.lock")
+os.makedirs(m.STATE, exist_ok=True)
+live_rec = sys.argv[4]
+real_link, real_rename, real_write = os.link, os.rename, os.write
+def no_link(a, b, *rest, **kw):
+    raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+def takeover_write(fd, data):
+    # attempt 1: the content window of the create is lost to a third party that publishes a STALE
+    # record. ⛔ KEEP THE APOSTROPHE COUNT IN THIS BODY EVEN (#3625): this here-doc lives inside a
+    # `$( … )`, and the bash 3.2 scanner walks the body as code, so one odd single-quote opens a
+    # state that never closes and the WHOLE FILE fails `bash -n`, far below the defect.
+    os.unlink(m.LOOP_LOCK)
+    with open(m.LOOP_LOCK, "w") as fh:
+        fh.write('{"pid": 999999, "start": "", "state": "/third"}')
+    return real_write(fd, data)
+def racing_rename(src, dst, *rest, **kw):
+    # attempt 2: between the staleness read and the reclaim, a LIVE claim takes the name
+    if src == m.LOOP_LOCK:
+        with open(m.LOOP_LOCK, "w") as fh:
+            fh.write(live_rec)
+    return real_rename(src, dst, *rest, **kw)
+os.link, os.rename, os.write = no_link, racing_rename, takeover_write
+try:
+    got = m.claim_loop_lock()
+finally:
+    os.link, os.rename, os.write = real_link, real_rename, real_write
+print("CLAIM %r" % (got,))
+print("PRESERVED %r" % (sorted(f for f in os.listdir(sys.argv[3]) if ".reclaim." in f),))
+PY19AE
+)"
+  grep -q 'turned out to be LIVE' <<<"$out19ae" \
+    && ok "19ae the displaced LIVE claim is DISCLOSED (never a silent dual-run)" \
+    || bad "19ae a displaced LIVE claim was moved aside with no word: $out19ae"
+  grep -q 'PRESERVED \[\]' <<<"$out19ae" \
+    && bad "19ae the displaced record was DELETED — the evidence is gone: $out19ae" \
+    || ok "19ae the displaced record is PRESERVED on disk (not restored over, not deleted)"
+  # ⛔ THE PASS MUST REFUSE, AND THIS ASSERTION IS THE ONE EARLIER CUTS OMITTED ON PURPOSE. The
+  # omission reasoned "a path-based mutex cannot make this race disappear", which is true — and does
+  # not license the opposite. `permit` + `continue` GUARANTEES the bad outcome: the `rename` freed
+  # `LOOP_LOCK`, `link` still refuses (the arm's precondition), so the next attempt's `O_EXCL` create
+  # SUCCEEDS, the inode check passes, and `claim_loop_lock` returns None = "I hold the box" — two
+  # loops, AND the lock now names the NEWCOMER, so a later `--verify` sees one healthy holder with a
+  # fresh tick and prints `SCHEDULE VERIFIED`. Returning the live holder is already what the sibling
+  # `fallen_holder` arm does 40 lines above; the asymmetry was the defect.
+  grep -q "CLAIM ($pidAE," <<<"$out19ae" \
+    && ok "19ae ⛔ the pass REFUSES by returning the live holder (it does not claim the freed name)" \
+    || bad "19ae the pass did not return the displaced live holder — it goes on to CLAIM the freed name and run beside it (two loops): $out19ae"
+else
+  bad "19ae baseline loop never came up — the arm grades nothing"
+fi
+kill "$pidAE" 2>/dev/null; sleep 1
+
+# 19af — ⛔ `started` MUST BE TRUE FOR THE CHILD THIS VERB SPAWNED, even when its first tick lands
+# after the poll gives up (a slow declaration read on a loaded cell). Returning False there made
+# `--start` print "this state dir starts none" one line after starting one, and — because `--start`
+# records the declaration set only when it started something — left the box with NO recorded set, so
+# the supervisor's bare-env revival exits 3 and only warns. Driven in-process with `loop_pid` stubbed
+# to None, which is exactly "the tick poll never succeeds" without a real 10 s wait per attempt.
+s19af_state="$T/s19af"
+out19af="$(python3 - "$SCHED" "$s19af_state" "$GOOD" "$L19/af" <<'PY19AF' 2>&1
+import importlib.util, os, sys, time
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+m.STATE, m.TEMPLATES_DIR = sys.argv[2], sys.argv[3]
+m.LOOP_LOCK = os.path.join(sys.argv[4], "loop.lock")
+m.LOOP_LOCK_ROOT = sys.argv[4]
+os.environ["FLEET_SCHEDULE_LOCK_ROOT"] = sys.argv[4]
+os.makedirs(sys.argv[4], exist_ok=True)
+os.makedirs(m.STATE, exist_ok=True)
+real_loop_pid = m.loop_pid
+m.loop_pid = lambda: None          # the poll can never see a tick
+try:
+    pid, started = m.spawn_loop()
+finally:
+    m.loop_pid = real_loop_pid
+print("SPAWN %r" % ((pid, started),))
+print("ALIVE %s" % (pid and m.pid_is_our_loop(pid),))
+PY19AF
+)"
+grep -q 'SPAWN ([0-9]*, True)' <<<"$out19af" \
+  && ok "19af ⛔ a slow-first-tick spawn reports started=True (it IS the loop this verb created)" \
+  || bad "19af spawn_loop reported started=False for its own child: $out19af"
+grep -qx 'ALIVE True' <<<"$out19af" \
+  && ok "19af the reported pid really is the loop it started" \
+  || bad "19af the reported pid is not a live loop: $out19af"
+spawned19af="$(grep -o 'SPAWN ([0-9]*' <<<"$out19af" | tr -dc '0-9')"
+kill "$spawned19af" 2>/dev/null; sleep 1
+
+# 19ag — ⛔ A POINTER-SOURCED RELATIVE TEMPLATES_DIR MUST BE RESOLVED TOO. The normalisation ran
+# BEFORE the pointer fallback, so a pointer written by an earlier relative-env run (which
+# remember_templates_dir re-writes verbatim, so it self-perpetuates) reached the `cwd="/"` child
+# unresolved: `--start` printed "loop started", the child logged `template dir not found: /tpl` and
+# ran ZERO jobs — the same false PASS one path over.
+mkdir -p "$T/relcwd4/tpl19ag"
+cp "$GOOD"/*.plist "$T/relcwd4/tpl19ag/" 2>/dev/null
+printf '# none\n' > "$T/relcwd4/tpl19ag/RETIRED"
+mkdir -p "$T/s19ag"
+printf 'tpl19ag\n' > "$T/s19ag/templates-dir"       # a RELATIVE pointer
+# ⛔ A COPY IN A SCRATCH DIR, DELIBERATELY: `resolve_infra_root()` walks up from the SCRIPT's own
+# location, so running the checkout's copy always resolves the real farm's templates and the pointer
+# is never consulted. Only a script with no checkout above it exercises the pointer fallback.
+mkdir -p "$T/bin19ag"; cp "$SCHED" "$T/bin19ag/fleet-schedule.py"
+out19ag="$(cd "$T/relcwd4" && env -u TEMPLATES_DIR -u INFRA_ROOT -u AGENT_INFRA_PATH \
+  FLEET_SCHEDULE_STATE="$T/s19ag" FLEET_SCHEDULE_LOCK_ROOT="$L19/ag" \
+  python3 "$T/bin19ag/fleet-schedule.py" --start 2>&1)"; rc19ag=$?
+[ "$rc19ag" -eq 0 ] \
+  && ok "19ag --start over a relative pointer exits 0" \
+  || bad "19ag --start exited $rc19ag: $out19ag"
+grep -q 'template dir not found' "$T/s19ag/loop.log" 2>/dev/null \
+  && bad "19ag the child could not find the pointer's set (it resolved it against /)" \
+  || ok "19ag the child read the SAME set the pointer named"
+grep -qx "$T/relcwd4/tpl19ag" "$T/s19ag/templates-dir" 2>/dev/null \
+  && ok "19ag the pointer is rewritten RESOLVED (the relative value does not self-perpetuate)" \
+  || bad "19ag the pointer is still relative: $(cat "$T/s19ag/templates-dir" 2>/dev/null)"
+pidAG="$(cat "$T/s19ag/loop.pid" 2>/dev/null)"; kill "$pidAG" 2>/dev/null; sleep 1
+
+# 19ah — ⛔ WHEN THE PARENT DEGRADES, THE CHILD MUST DEGRADE TO THE SAME PATH. The handover matters
+# ONLY when the parent's root comes from something the child does NOT simply inherit: `spawn_loop`
+# POPS `FLEET_SCHEDULE_TMPFS_ROOT`, so a root derived from that knob is the one route where the child
+# could resolve somewhere else. Earlier this arm pinned `FLEET_SCHEDULE_LOCK_ROOT`, which the child
+# inherits verbatim through `os.environ.copy()` — so the arm was GREEN with the handover reverted, and
+# the fix it claimed to pin was graded by nothing (found by the [VGATE] pass with a mutant).
+mkdir -p "$T/notadir19ah"; : > "$T/notadir19ah/file"    # a FILE where the root's parent should be
+# ⛔ AND `FLEET_SCHEDULE_LOCK_ROOT` IS UNSET HERE ON PURPOSE (this suite exports it for hermeticity):
+# leaving it set would pre-empt the TMPFS-derived root and re-create the vacuity above.
+out19ah_a="$(env -u FLEET_SCHEDULE_LOCK_ROOT TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ahA" \
+  FLEET_SCHEDULE_TMPFS_ROOT="$T/notadir19ah/file" python3 "$SCHED" --start 2>&1)"; rc19ah_a=$?
+grep -q 'box lock root .* is unusable' <<<"$out19ah_a" \
+  && ok "19ah baseline: the parent DEGRADES on an unusable TMPFS-derived root (and says so)" \
+  || bad "19ah baseline did not degrade as intended: $out19ah_a"
+[ "$rc19ah_a" -eq 0 ] \
+  && ok "19ah baseline --start exits 0 while degraded" \
+  || bad "19ah baseline --start exited $rc19ah_a: $out19ah_a"
+# ⛔ THE ASSERTION THAT ACTUALLY PINS THE HANDOVER: the CHILD must have claimed the path the PARENT
+# tested. Reverting the handover sends the child to the DEFAULT /dev/shm root, so this file is absent
+# (and on a box whose real scheduler holds /dev/shm, the child then refuses and `--start` reports a
+# false "did not come up").
+[ -f "$T/s19ahA/loop.lock" ] \
+  && ok "19ah ⛔ the child claimed the SAME degraded path the parent tested (\$STATE/loop.lock)" \
+  || bad "19ah the child resolved a DIFFERENT lock path than the parent — the handover did not arrive"
+pidAH="$(cat "$T/s19ahA/loop.pid" 2>/dev/null)"
+[ -n "$pidAH" ] && kill -0 "$pidAH" 2>/dev/null \
+  && ok "19ah the degraded loop is running (pid $pidAH)" \
+  || bad "19ah no degraded loop is running — the arm grades nothing"
+out19ah_b="$(env -u FLEET_SCHEDULE_LOCK_ROOT TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19ahB" \
+  FLEET_SCHEDULE_TMPFS_ROOT="$T/notadir19ah/file" python3 "$SCHED" --start 2>&1)"; rc19ah_b=$?
+grep -q 'did not come up' <<<"$out19ah_b" \
+  && bad "19ah a second home under a degraded root reported 'did not come up' on a scheduled box: $out19ah_b" \
+  || ok "19ah a second home under a degraded root does NOT report a false 'did not come up'"
+[ "$rc19ah_b" -eq 0 ] \
+  && ok "19ah the second home exits 0 under a degraded root" \
+  || bad "19ah the second home exited $rc19ah_b: $out19ah_b"
+# ⛔ BOTH HOMES' LOOPS ARE REAPED: a degraded box legitimately allows one loop per state dir (the
+# documented dual-run residual), so B commonly starts one — leaving it running would leak a holder
+# into every later arm.
+for pidAH in "$T/s19ahA/loop.pid" "$T/s19ahB/loop.pid"; do
+  p="$(cat "$pidAH" 2>/dev/null)"; [ -n "$p" ] && kill "$p" 2>/dev/null
+done
+sleep 1
+
+# 19ai — ⛔ A RELATIVE `INFRA_ROOT` MUST REACH THE CHILD RESOLVED TOO. `INFRA_ROOT` is `abspath`-ed in
+# `resolve_infra_root()` and rendered as `{{AGENT_INFRA_PATH}}` into five shipped templates
+# (ai-drainer, ai-multi-repo, controller-watchdog, objective-reminder, worker-supply), but the child
+# re-derived it from the RAW environment against `cwd="/"`. A relative value therefore rendered a
+# DIFFERENT checkout in the loop than in the parent's inline pass; with none of the child's own
+# fallbacks a checkout the placeholder rendered EMPTY, `render()` classified the job as a named SKIP,
+# and the loop ran ZERO of those five jobs while `--install` printed `SCHEDULE VERIFIED` — the same
+# false PASS as a relative `TEMPLATES_DIR` (19ac), one knob over (measured by the #3636 reviewer).
+# ⛔ A COPY IN A SCRATCH DIR, DELIBERATELY (the same reason as 19ag/19ah): running the CHECKOUT's copy
+# makes the child's `here`-based fallback resolve the real farm, which masks the divergence entirely.
+mkdir -p "$T/bin19ai" "$T/fakeinfra19ai/root/templates/launchd" "$T/relcwd19ai"
+cp "$SCHED" "$T/bin19ai/fleet-schedule.py"
+printf '# none\n' > "$T/fakeinfra19ai/root/templates/launchd/RETIRED"
+MARK19AI="$T/out/marker19ai.log"
+python3 - "$T/fakeinfra19ai/root/templates/launchd" "$MARK19AI" <<'PY19AI'
+import os, plistlib, sys
+d = {"Label": "com.test.ainfra19ai",
+     "ProgramArguments": ["/bin/sh", "-c", "echo ainfra={{AGENT_INFRA_PATH}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.ainfra19ai.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AI
+out19ai="$(cd "$T/relcwd19ai" && env -u AGENT_INFRA_PATH -u TEMPLATES_DIR INFRA_ROOT=../fakeinfra19ai/root \
+  FLEET_SCHEDULE_STATE="$T/s19ai" FLEET_SCHEDULE_LOCK_ROOT="$L19/ai" FLEET_SCHEDULE_TICK=2 \
+  python3 "$T/bin19ai/fleet-schedule.py" --start 2>&1)"; rc19ai=$?
+[ "$rc19ai" -eq 0 ] \
+  && ok "19ai --start with a RELATIVE INFRA_ROOT exits 0" \
+  || bad "19ai --start exited $rc19ai: $out19ai"
+wait19ai=0
+while [ ! -s "$MARK19AI" ] && [ "$wait19ai" -lt 25 ]; do sleep 1; wait19ai=$((wait19ai + 1)); done
+[ -s "$MARK19AI" ] \
+  && ok "19ai the loop child RAN the {{AGENT_INFRA_PATH}} job (it rendered the placeholder)" \
+  || bad "19ai the child never ran the job — INFRA_ROOT resolved differently there: $out19ai / $(tail -3 "$T/s19ai/loop.log" 2>/dev/null)"
+grep -qvx "ainfra=$T/fakeinfra19ai/root" "$MARK19AI" 2>/dev/null \
+  && bad "19ai the child rendered a DIFFERENT {{AGENT_INFRA_PATH}}: $(grep -v '^ainfra=' "$MARK19AI" | head -2)" \
+  || ok "19ai ⛔ the child's render IS the path the parent resolved (one checkout, one argv)"
+pidAI="$(cat "$T/s19ai/loop.pid" 2>/dev/null)"; kill "$pidAI" 2>/dev/null; sleep 1
+
+# 19aj — ⛔ A NAMED SKIP IS NOT A DIVERGENCE. 19x turns a declaration no loop on the box runs into a
+# FAIL on purpose, but a declaration THIS HOST cannot run is a `SKIP … for a named reason` everywhere
+# else in the runtime (`--check` prints DECLARATIONS OK over it and the graded loop continues past it).
+# Counting one as a divergence produced a `^  FAIL`, which `cloud-cell-bringup.sh` `die`s on: two homes
+# with version-skewed checkouts (the operator's vs a cell's farmed copy, which lags by design) plus any
+# shipped template that is a SKIP on a box without swarm/tortoise env bricked bring-up — #3029's shape.
+mkdir -p "$T/tpl19ajA" "$T/tpl19ajB"
+cp "$GOOD"/*.plist "$T/tpl19ajA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19ajB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19ajA/RETIRED"; printf '# none\n' > "$T/tpl19ajB/RETIRED"
+mkplist "$T/tpl19ajB" com.test.skipme "$T/skipme.spec"
+# ⛔ THE PREMISE, ASSERTED: on THIS host the extra declaration is a named SKIP and not a runnable job.
+# Without it the arm would grade an ordinary divergence, and 19x would rightly still demand a FAIL.
+env -u SWARM_ROOT TEMPLATES_DIR="$T/tpl19ajB" FLEET_SCHEDULE_STATE="$T/s19ajB" \
+    python3 "$SCHED" --check > "$T/out/check19aj.txt" 2>&1
+grep -q 'SKIP .*com.test.skipme' "$T/out/check19aj.txt" \
+  && ok "19aj premise: the extra declaration is a NAMED SKIP on this host" \
+  || bad "19aj premise failed — the arm would grade an ordinary divergence: $(cat "$T/out/check19aj.txt")"
+s19 "$T/s19ajA" "$T/tpl19ajA" --install >/dev/null 2>&1
+pidAJ="$(cat "$T/s19ajA/loop.pid" 2>/dev/null)"
+[ -n "$pidAJ" ] && kill -0 "$pidAJ" 2>/dev/null \
+  && ok "19aj baseline: home A's loop holds the box (and its inline pass stamped its jobs)" \
+  || bad "19aj baseline loop never came up — the arm grades nothing"
+out19aj="$(env -u SWARM_ROOT TEMPLATES_DIR="$T/tpl19ajB" FLEET_SCHEDULE_STATE="$T/s19ajB" \
+  FLEET_SCHEDULE_LOCK_ROOT="$L19" python3 "$SCHED" --install 2>&1)"; rc19aj=$?
+grep -q '^  FAIL' <<<"$out19aj" \
+  && bad "19aj a named-SKIP declaration was graded a divergence: $out19aj" \
+  || ok "19aj ⛔ a named SKIP is NOT reported as a declaration no loop on the box runs"
+[ "$rc19aj" -eq 0 ] \
+  && ok "19aj --install exits 0 over a skipped extra declaration (bring-up is not bricked)" \
+  || bad "19aj --install exited $rc19aj over a named SKIP: $out19aj"
+grep -q "NOTE .*DIFFERENT state dir" <<<"$out19aj" \
+  && ok "19aj the two-home state is still DISCLOSED (only the SKIP became non-fatal)" \
+  || bad "19aj the divergence NOTE vanished — the fix over-reached: $out19aj"
+# ⛔ POSITIVE CONTROL: a RUNNABLE extra declaration is STILL a FAIL, so 19x's contract is not softened.
+python3 - "$T/tpl19ajB" <<'PY19AJ'
+import os, plistlib, sys
+d = {"Label": "com.test.extra19aj", "ProgramArguments": ["/bin/true"], "StartInterval": 3600}
+with open(os.path.join(sys.argv[1], "com.test.extra19aj.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AJ
+out19aj2="$(env -u SWARM_ROOT TEMPLATES_DIR="$T/tpl19ajB" FLEET_SCHEDULE_STATE="$T/s19ajB" \
+  FLEET_SCHEDULE_LOCK_ROOT="$L19" python3 "$SCHED" --install 2>&1)"; rc19aj2=$?
+grep -q 'run by NO loop on this box: com.test.extra19aj' <<<"$out19aj2" \
+  && ok "19aj CONTROL: a RUNNABLE extra declaration is still a FAIL (19x's contract intact)" \
+  || bad "19aj CONTROL: the fix swallowed a genuine divergence (rc=$rc19aj2): $out19aj2"
+kill "$pidAJ" 2>/dev/null; sleep 1
+
+# 19ak — ⛔ A RELATIVE `TORTOISE_REPO` MUST REACH THE CHILD RESOLVED TOO, and this one is NOT a matter
+# of taste: `placeholder_values()` decides with `os.path.isdir(tortoise)` whether to KEEP the value or
+# replace it with an absolute fallback checkout, so a relative pin kept its relative form in the parent
+# and was replaced (or emptied) in the child. Measured by the #3636 reviewer: `--install` printed
+# `SCHEDULE VERIFIED — 2 job(s) live` while the loop child rendered `{{TORTOISE_REPO}}` as "" and
+# classified the tortoise job as a named SKIP — the loop ran zero of it and `--verify` never saw it.
+# `absolutize_path_knobs()` now rewrites the knob in the PARENT, so `os.environ.copy()` hands the child
+# the resolved value and both processes render the same argv.
+mkdir -p "$T/bin19ak" "$T/tpl19ak" "$T/relcwd19ak/tort19ak/.git"
+cp "$SCHED" "$T/bin19ak/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19ak/RETIRED"
+MARK19AK="$T/out/marker19ak.log"
+python3 - "$T/tpl19ak" "$MARK19AK" <<'PY19AK'
+import os, plistlib, sys
+d = {"Label": "com.test.tort19ak",
+     "ProgramArguments": ["/bin/sh", "-c", "echo tort={{TORTOISE_REPO}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.tort19ak.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AK
+out19ak="$(cd "$T/relcwd19ak" && env -u CELL_HOME -u SWARM_ROOT TORTOISE_REPO=tort19ak \
+  TEMPLATES_DIR="$T/tpl19ak" FLEET_SCHEDULE_STATE="$T/s19ak" FLEET_SCHEDULE_LOCK_ROOT="$L19/ak" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19ak/fleet-schedule.py" --start 2>&1)"; rc19ak=$?
+[ "$rc19ak" -eq 0 ] \
+  && ok "19ak --start with a RELATIVE TORTOISE_REPO exits 0" \
+  || bad "19ak --start exited $rc19ak: $out19ak"
+wait19ak=0
+while [ ! -s "$MARK19AK" ] && [ "$wait19ak" -lt 25 ]; do sleep 1; wait19ak=$((wait19ak + 1)); done
+[ -s "$MARK19AK" ] \
+  && ok "19ak the loop child RAN the {{TORTOISE_REPO}} job (the placeholder rendered)" \
+  || bad "19ak the child never ran the job — a relative TORTOISE_REPO emptied there: $out19ak / $(tail -3 "$T/s19ak/loop.log" 2>/dev/null)"
+grep -qvx "tort=$T/relcwd19ak/tort19ak" "$MARK19AK" 2>/dev/null \
+  && bad "19ak the child rendered a DIFFERENT {{TORTOISE_REPO}}: $(grep -v '^tort=' "$MARK19AK" | head -2)" \
+  || ok "19ak ⛔ the child's render IS the checkout the parent resolved (one repo, one argv)"
+pidAK="$(cat "$T/s19ak/loop.pid" 2>/dev/null)"; kill "$pidAK" 2>/dev/null; sleep 1
+
+# 19al — ⛔ `--install` MUST NOT REWRITE THE DECLARATION POINTER WHEN THE LOOP WAS ALREADY RUNNING. The
+# pointer became LOAD-BEARING in this change (`cmd_verify` reads it and grades THAT set), and
+# `--install` wrote it unconditionally at the top — so an install with a different TEMPLATES_DIR over an
+# already-running loop replaced "the set the box runs" with "the set this invocation happened to look
+# at". Measured: pointer tplA -> tplB while `loop.log` still start-named tplA, after which a second
+# home's `--verify` graded tplB and left every job of the loop's REAL set ungraded — the same lie 19ad
+# pins for `--start`, injected by the sibling entry point. `--start`'s ruling applies here verbatim:
+# record the set only when this invocation actually STARTED the loop.
+mkdir -p "$T/tpl19alA" "$T/tpl19alB"
+cp "$GOOD"/*.plist "$T/tpl19alA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19alB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19alA/RETIRED"; printf '# none\n' > "$T/tpl19alB/RETIRED"
+s19 "$T/s19al" "$T/tpl19alA" --install >/dev/null 2>&1
+pidAL="$(cat "$T/s19al/loop.pid" 2>/dev/null)"
+[ -n "$pidAL" ] && kill -0 "$pidAL" 2>/dev/null \
+  && ok "19al baseline: --install started a loop for state dir AL" \
+  || bad "19al baseline loop never came up — the arm grades nothing"
+[ "$(cat "$T/s19al/templates-dir" 2>/dev/null)" = "$T/tpl19alA" ] \
+  && ok "19al --install records the declaration set when it STARTED the loop (the pointer is written)" \
+  || bad "19al --install did not record its own set: $(cat "$T/s19al/templates-dir" 2>/dev/null)"
+out19al="$(s19 "$T/s19al" "$T/tpl19alB" --install 2>&1)"
+grep -q 'loop already running' <<<"$out19al" \
+  && ok "19al the second --install found the live loop (so the pointer must not move)" \
+  || bad "19al the second --install did not see the running loop: $out19al"
+[ "$(cat "$T/s19al/templates-dir" 2>/dev/null)" = "$T/tpl19alA" ] \
+  && ok "19al ⛔ --install over a RUNNING loop did NOT rewrite the pointer to a set nothing reads" \
+  || bad "19al --install rewrote the pointer to a set the loop does not read ($T/tpl19alA -> $(cat "$T/s19al/templates-dir" 2>/dev/null))"
+kill "$pidAL" 2>/dev/null; sleep 1
+
+# 19ap — ⛔ A MISSING `loop.pid` MUST NOT LET `--install` REWRITE THE DECLARATION POINTER. 19al pins the
+# pointer rule for the EASY state (pidfile present); it granted no protection in the two states this
+# file documents as reachable — `cmd_loop` leaves the previous pidfile alone when its own write fails,
+# and #3029's recycled pid fails the identity test — because the owner test was `loop_pid()` ONLY. On
+# either, `--install` read "no loop here" over a LIVE loop, rewrote the pointer to the caller's set,
+# and a later `--verify` graded a set nothing runs and printed `SCHEDULE VERIFIED` over it. Measured
+# before the fix: real loop on tplA, `rm loop.pid`, `--install TEMPLATES_DIR=tplB` -> pointer tplB while
+# `loop.log` still start-named tplA. The owner test now reads the identity-verified BOX lock, which is
+# what `--verify` and `--start` already use for the same question.
+mkdir -p "$T/tpl19apA" "$T/tpl19apB"
+cp "$GOOD"/*.plist "$T/tpl19apA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19apB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19apA/RETIRED"; printf '# none\n' > "$T/tpl19apB/RETIRED"
+s19 "$T/s19ap" "$T/tpl19apA" --install >/dev/null 2>&1
+pidAP="$(cat "$T/s19ap/loop.pid" 2>/dev/null)"
+[ -n "$pidAP" ] && kill -0 "$pidAP" 2>/dev/null \
+  && ok "19ap baseline: --install started a loop for state dir AP" \
+  || bad "19ap baseline loop never came up — the arm grades nothing"
+[ "$(cat "$T/s19ap/templates-dir" 2>/dev/null)" = "$T/tpl19apA" ] \
+  && ok "19ap baseline: the pointer names the set the loop started with (A)" \
+  || bad "19ap baseline pointer is not A: $(cat "$T/s19ap/templates-dir" 2>/dev/null)"
+rm -f "$T/s19ap/loop.pid"
+out19ap="$(s19 "$T/s19ap" "$T/tpl19apB" --install 2>&1)"
+[ "$(cat "$T/s19ap/templates-dir" 2>/dev/null)" = "$T/tpl19apA" ] \
+  && ok "19ap ⛔ with loop.pid GONE the live loop was still found through the BOX LOCK, so the pointer did NOT move" \
+  || bad "19ap a missing loop.pid bypassed the owner test — --install rewrote the pointer to a set the live loop never reads ($T/tpl19apA -> $(cat "$T/s19ap/templates-dir" 2>/dev/null))"
+# …and the refusal is per-state-dir, not a blanket: a loop still holds the box, so no SECOND loop may
+# have been started for this state dir either (spawn_loop must defer to the verified holder).
+[ ! -f "$T/s19ap/loop.pid" ] \
+  && ok "19ap --install did not start a second loop for this state dir (it deferred to the box lock's holder)" \
+  || bad "19ap --install started a SECOND loop over a box that already had one (#2890): $(cat "$T/s19ap/loop.pid" 2>/dev/null)"
+kill "$pidAP" 2>/dev/null; sleep 1
+
+# 19am — ⛔ A RELATIVE ARMING RECORD MUST REACH THE CHILD RESOLVED TOO, and this one is not academic:
+# `WORKTREE_HYGIENE_ARM_FILE` / `REAP_ORPHAN_ARM_FILE` OVERRIDE the `home/.pi/agent/state/...` default and
+# are then read with `open()`, so a relative override decided `--apply` vs `--dry-run` by the CALLER's cwd.
+# Measured before the fix: one `SCHEDULE VERIFIED` over a marker carrying `wt=--apply` (the parent's inline
+# pass) AND `wt=--dry-run` (the loop child) — on the two shipped templates that carry these placeholders, so
+# the worktree sweeper's dry-run/apply decision differed between what was certified and what runs.
+mkdir -p "$T/bin19am" "$T/tpl19am" "$T/relcwd19am"
+cp "$SCHED" "$T/bin19am/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19am/RETIRED"
+MARK19AM="$T/out/marker19am.log"
+python3 - "$T/tpl19am" "$MARK19AM" <<'PY19AM'
+import os, plistlib, sys
+d = {"Label": "com.test.wt19am",
+     "ProgramArguments": ["/bin/sh", "-c", "echo wt={{WORKTREE_HYGIENE_MODE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.wt19am.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AM
+# The arming record, RELATIVE to the caller's cwd, carrying the two keys `wt_hygiene_mode()` requires.
+printf 'armed-by=test-19am\narmed-date=2026-11-07\n' > "$T/relcwd19am/armed19am"
+out19am="$(cd "$T/relcwd19am" && env -u CELL_HOME WORKTREE_HYGIENE_ARM_FILE=armed19am \
+  TEMPLATES_DIR="$T/tpl19am" FLEET_SCHEDULE_STATE="$T/s19am" FLEET_SCHEDULE_LOCK_ROOT="$L19/am" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19am/fleet-schedule.py" --start 2>&1)"; rc19am=$?
+[ "$rc19am" -eq 0 ] \
+  && ok "19am --start with a RELATIVE arming record exits 0" \
+  || bad "19am --start exited $rc19am: $out19am"
+wait19am=0
+while [ ! -s "$MARK19AM" ] && [ "$wait19am" -lt 25 ]; do sleep 1; wait19am=$((wait19am + 1)); done
+[ -s "$MARK19AM" ] \
+  && ok "19am the loop child RAN the {{WORKTREE_HYGIENE_MODE}} job" \
+  || bad "19am the child never ran the job: $out19am / $(tail -3 "$T/s19am/loop.log" 2>/dev/null)"
+grep -qvx 'wt=--apply' "$MARK19AM" 2>/dev/null \
+  && bad "19am the child rendered a DIFFERENT {{WORKTREE_HYGIENE_MODE}}: $(head -3 "$MARK19AM")" \
+  || ok "19am ⛔ the child resolved the SAME arming record the parent did (--apply, not --dry-run)"
+pidAM="$(cat "$T/s19am/loop.pid" 2>/dev/null)"; kill "$pidAM" 2>/dev/null; sleep 1
+
+# 19as — ⛔ A RELATIVE `SWARM_ROOT` MUST REACH THE CHILD RESOLVED TOO, and the placeholder that DIVERGES
+# is not `{{SWARM_ROOT}}` (rendered verbatim from the env in BOTH processes) but `{{PYTHON_BIN}}`, which
+# `placeholder_values()` DERIVES from it: `os.access(join(SWARM_ROOT, ".venv/bin/python"), os.X_OK)` is
+# cwd-relative, so a relative swarm root is found by the parent and NOT by the loop child (`cwd="/"`),
+# which falls through to `command -v python3` — two different interpreters rendered into one
+# `SCHEDULE VERIFIED`. This is the sixth of the twelve knobs `absolutize_path_knobs()` normalises and
+# the one #3636's own review measured as UNGRADED: deleting `"SWARM_ROOT"` from that tuple left the
+# suite GREEN, every assertion happy — the guard was advertised covered and was not (#3442).
+mkdir -p "$T/bin19as" "$T/tpl19as" "$T/relcwd19as/swarm19as/.venv/bin"
+cp "$SCHED" "$T/bin19as/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19as/RETIRED"
+# A REAL executable at the path `placeholder_values()` probes: the arm grades the DERIVED placeholder,
+# so the probe has to SUCCEED for the resolved branch to be the one under test.
+printf '#!/bin/sh\nexec python3 "$@"\n' > "$T/relcwd19as/swarm19as/.venv/bin/python"
+chmod +x "$T/relcwd19as/swarm19as/.venv/bin/python"
+MARK19AS="$T/out/marker19as.log"
+python3 - "$T/tpl19as" "$MARK19AS" <<'PY19AS'
+import os, plistlib, sys
+d = {"Label": "com.test.swarm19as",
+     "ProgramArguments": ["/bin/sh", "-c", "echo py={{PYTHON_BIN}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.swarm19as.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AS
+out19as="$(cd "$T/relcwd19as" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u CELL_HOME -u PYTHON_BIN SWARM_ROOT=swarm19as \
+  TEMPLATES_DIR="$T/tpl19as" FLEET_SCHEDULE_STATE="$T/s19as" FLEET_SCHEDULE_LOCK_ROOT="$L19/as" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19as/fleet-schedule.py" --start 2>&1)"; rc19as=$?
+[ "$rc19as" -eq 0 ] \
+  && ok "19as --start with a RELATIVE SWARM_ROOT exits 0" \
+  || bad "19as --start exited $rc19as: $out19as"
+wait19as=0
+while [ ! -s "$MARK19AS" ] && [ "$wait19as" -lt 25 ]; do sleep 1; wait19as=$((wait19as + 1)); done
+[ -s "$MARK19AS" ] \
+  && ok "19as the loop child RAN the {{PYTHON_BIN}} job (the placeholder rendered)" \
+  || bad "19as the child never ran the job: $out19as / $(tail -3 "$T/s19as/loop.log" 2>/dev/null)"
+grep -qvx "py=$T/relcwd19as/swarm19as/.venv/bin/python" "$MARK19AS" 2>/dev/null \
+  && bad "19as the child DERIVED a different {{PYTHON_BIN}} from the same SWARM_ROOT: $(head -3 "$MARK19AS")" \
+  || ok "19as ⛔ the child derived the SAME interpreter the parent resolved (one swarm root, one argv)"
+pidAS="$(cat "$T/s19as/loop.pid" 2>/dev/null)"; kill "$pidAS" 2>/dev/null; sleep 1
+
+# 19at — ⛔ A RELATIVE `CELL_HOME` MUST REACH THE CHILD RESOLVED TOO. `home` is `CELL_HOME or HOME` and
+# BOTH arming records default THROUGH it (`open(home/.pi/agent/state/worktree-hygiene.armed)`,
+# `…/pi-reap-orphans.armed`), so a relative `CELL_HOME` decided the parent's `--apply`/armed answer by the
+# CALLER's cwd while the child (`cwd="/"`) read `/cell…`, hit `OSError` and answered `--dry-run`/disarmed
+# — one `SCHEDULE VERIFIED` over a sweeper that does not sweep and a reaper that does not reap. 19am
+# grades the `*_ARM_FILE` OVERRIDES; this is the DEFAULT they fall back to, and neither had an arm.
+mkdir -p "$T/bin19at" "$T/tpl19at" "$T/relcwd19at/cell19at/.pi/agent/state"
+cp "$SCHED" "$T/bin19at/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19at/RETIRED"
+printf 'armed-by=test-19at\narmed-date=2026-11-07\n' \
+  > "$T/relcwd19at/cell19at/.pi/agent/state/worktree-hygiene.armed"
+printf 'armed-by=test-19at\narmed-date=2026-11-07\n' \
+  > "$T/relcwd19at/cell19at/.pi/agent/state/pi-reap-orphans.armed"
+MARK19AT="$T/out/marker19at.log"
+python3 - "$T/tpl19at" "$MARK19AT" <<'PY19AT'
+import os, plistlib, sys
+d = {"Label": "com.test.cell19at",
+     "ProgramArguments": ["/bin/sh", "-c", "echo wt={{WORKTREE_HYGIENE_MODE}} reap={{REAP_ORPHAN_MODE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.cell19at.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AT
+out19at="$(cd "$T/relcwd19at" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u WORKTREE_HYGIENE_ARM_FILE -u REAP_ORPHAN_ARM_FILE CELL_HOME=cell19at \
+  TEMPLATES_DIR="$T/tpl19at" FLEET_SCHEDULE_STATE="$T/s19at" FLEET_SCHEDULE_LOCK_ROOT="$L19/at" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19at/fleet-schedule.py" --start 2>&1)"; rc19at=$?
+[ "$rc19at" -eq 0 ] \
+  && ok "19at --start with a RELATIVE CELL_HOME exits 0" \
+  || bad "19at --start exited $rc19at: $out19at"
+wait19at=0
+while [ ! -s "$MARK19AT" ] && [ "$wait19at" -lt 25 ]; do sleep 1; wait19at=$((wait19at + 1)); done
+[ -s "$MARK19AT" ] \
+  && ok "19at the loop child RAN the arming-record jobs" \
+  || bad "19at the child never ran the job: $out19at / $(tail -3 "$T/s19at/loop.log" 2>/dev/null)"
+grep -qvx 'wt=--apply reap=0' "$MARK19AT" 2>/dev/null \
+  && bad "19at the child resolved a DIFFERENT CELL_HOME, so the armed records read as UNARMED: $(head -3 "$MARK19AT")" \
+  || ok "19at ⛔ the child found the SAME armed records through the relative CELL_HOME (--apply / armed)"
+pidAT="$(cat "$T/s19at/loop.pid" 2>/dev/null)"; kill "$pidAT" 2>/dev/null; sleep 1
+
+# 19au — ⛔ A RELATIVE `REAP_ORPHAN_ARM_FILE` MUST REACH THE CHILD RESOLVED TOO — the 0-vs-1 twin of the
+# `WORKTREE_HYGIENE_ARM_FILE` leg 19am grades. Both OVERRIDE a path that is opened with `open()`, so a
+# relative override decides armed-vs-disarmed by the CALLER's cwd; measured here on the reaper, where the
+# wrong answer is `1` (dry run) over a record that says the box IS armed, i.e. a reaper that never reaps.
+mkdir -p "$T/bin19au" "$T/tpl19au" "$T/relcwd19au"
+cp "$SCHED" "$T/bin19au/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19au/RETIRED"
+printf 'armed-by=test-19au\narmed-date=2026-11-07\n' > "$T/relcwd19au/armed19au"
+MARK19AU="$T/out/marker19au.log"
+python3 - "$T/tpl19au" "$MARK19AU" <<'PY19AU'
+import os, plistlib, sys
+d = {"Label": "com.test.reap19au",
+     "ProgramArguments": ["/bin/sh", "-c", "echo reap={{REAP_ORPHAN_MODE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.reap19au.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AU
+out19au="$(cd "$T/relcwd19au" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u CELL_HOME -u WORKTREE_HYGIENE_ARM_FILE REAP_ORPHAN_ARM_FILE=armed19au \
+  TEMPLATES_DIR="$T/tpl19au" FLEET_SCHEDULE_STATE="$T/s19au" FLEET_SCHEDULE_LOCK_ROOT="$L19/au" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19au/fleet-schedule.py" --start 2>&1)"; rc19au=$?
+[ "$rc19au" -eq 0 ] \
+  && ok "19au --start with a RELATIVE reaper arming record exits 0" \
+  || bad "19au --start exited $rc19au: $out19au"
+wait19au=0
+while [ ! -s "$MARK19AU" ] && [ "$wait19au" -lt 25 ]; do sleep 1; wait19au=$((wait19au + 1)); done
+[ -s "$MARK19AU" ] \
+  && ok "19au the loop child RAN the {{REAP_ORPHAN_MODE}} job" \
+  || bad "19au the child never ran the job: $out19au / $(tail -3 "$T/s19au/loop.log" 2>/dev/null)"
+grep -qvx 'reap=0' "$MARK19AU" 2>/dev/null \
+  && bad "19au the child resolved a DIFFERENT arming record, so an armed reaper rendered as disarmed: $(head -3 "$MARK19AU")" \
+  || ok "19au ⛔ the child resolved the SAME reaper arming record the parent did (armed, not dry-run)"
+pidAU="$(cat "$T/s19au/loop.pid" 2>/dev/null)"; kill "$pidAU" 2>/dev/null; sleep 1
+
+# 19av — ⛔ THE THREE ENV-VALUED PATH KNOBS MUST REACH THE CHILD RESOLVED TOO — and the `os.sep`
+# CONDITION on the last two is part of the contract, not an optimisation. `PYTHON_BIN`, `PI_NODE_BIN` and
+# `SWARM_ENV_FILE` are rendered VERBATIM into job argv, and the loop child runs with `cwd="/"`, so a
+# relative value pointed the job at `/py` rather than at the caller's `./py`. A BARE name is deliberately
+# left alone (`python3` is a PATH lookup and `abspath("python3")` invents a file that does not exist), so
+# the control row below pins that the normalisation does not over-reach — that is the arm a blanket
+# `abspath` on every knob would redden.
+mkdir -p "$T/bin19av" "$T/tpl19av" "$T/relcwd19av/pib19av"
+cp "$SCHED" "$T/bin19av/fleet-schedule.py"
+printf '# none\n' > "$T/tpl19av/RETIRED"
+printf '#!/bin/sh\nexec python3 "$@"\n' > "$T/relcwd19av/py19av"; chmod +x "$T/relcwd19av/py19av"
+printf '#!/bin/sh\nexit 0\n' > "$T/relcwd19av/pib19av/pi"; chmod +x "$T/relcwd19av/pib19av/pi"
+MARK19AV="$T/out/marker19av.log"
+python3 - "$T/tpl19av" "$MARK19AV" <<'PY19AV'
+import os, plistlib, sys
+d = {"Label": "com.test.paths19av",
+     "ProgramArguments": ["/bin/sh", "-c",
+                         "echo py={{PYTHON_BIN}} pib={{PI_BIN_DIR}} env={{SWARM_ENV_FILE}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.paths19av.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AV
+out19av="$(cd "$T/relcwd19av" && env -u AGENT_INFRA_PATH -u INFRA_ROOT -u CELL_HOME PYTHON_BIN=./py19av PI_NODE_BIN=./pib19av/pi \
+  SWARM_ENV_FILE=swarmenv19av \
+  TEMPLATES_DIR="$T/tpl19av" FLEET_SCHEDULE_STATE="$T/s19av" FLEET_SCHEDULE_LOCK_ROOT="$L19/av" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19av/fleet-schedule.py" --start 2>&1)"; rc19av=$?
+[ "$rc19av" -eq 0 ] \
+  && ok "19av --start with RELATIVE PYTHON_BIN/PI_NODE_BIN/SWARM_ENV_FILE exits 0" \
+  || bad "19av --start exited $rc19av: $out19av"
+wait19av=0
+while [ ! -s "$MARK19AV" ] && [ "$wait19av" -lt 25 ]; do sleep 1; wait19av=$((wait19av + 1)); done
+[ -s "$MARK19AV" ] \
+  && ok "19av the loop child RAN the path-placeholder job" \
+  || bad "19av the child never ran the job: $out19av / $(tail -3 "$T/s19av/loop.log" 2>/dev/null)"
+grep -q "py=$T/relcwd19av/py19av " "$MARK19AV" 2>/dev/null \
+  && ok "19av ⛔ a relative PYTHON_BIN rendered RESOLVED in the child (a job's interpreter is not cwd-relative)" \
+  || bad "19av the child rendered a DIFFERENT {{PYTHON_BIN}}: $(head -3 "$MARK19AV")"
+grep -q "pib=$T/relcwd19av/pib19av " "$MARK19AV" 2>/dev/null \
+  && ok "19av ⛔ a relative PI_NODE_BIN rendered its RESOLVED directory in the child" \
+  || bad "19av the child rendered a DIFFERENT {{PI_BIN_DIR}}: $(head -3 "$MARK19AV")"
+grep -q "env=$T/relcwd19av/swarmenv19av$" "$MARK19AV" 2>/dev/null \
+  && ok "19av ⛔ a relative SWARM_ENV_FILE rendered RESOLVED in the child" \
+  || bad "19av the child rendered a DIFFERENT {{SWARM_ENV_FILE}}: $(head -3 "$MARK19AV")"
+pidAV="$(cat "$T/s19av/loop.pid" 2>/dev/null)"; kill "$pidAV" 2>/dev/null; sleep 1
+# ⛔ THE CONTROL: a BARE `PYTHON_BIN` is a PATH lookup and must stay BARE. Normalising it to `$PWD/python3`
+# would point every job at a file that does not exist — the over-reach a blanket `abspath` would ship.
+MARK19AVB="$T/out/marker19avb.log"
+mkdir -p "$T/tpl19avb"; printf '# none\n' > "$T/tpl19avb/RETIRED"
+python3 - "$T/tpl19avb" "$MARK19AVB" <<'PY19AVB'
+import os, plistlib, sys
+d = {"Label": "com.test.bare19av",
+     "ProgramArguments": ["/bin/sh", "-c", "echo pybare={{PYTHON_BIN}} >> %s" % sys.argv[2]],
+     "StartInterval": 2}
+with open(os.path.join(sys.argv[1], "com.test.bare19av.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19AVB
+out19avb="$(cd "$T/relcwd19av" && env -u CELL_HOME -u AGENT_INFRA_PATH -u INFRA_ROOT PYTHON_BIN=python3 \
+  TEMPLATES_DIR="$T/tpl19avb" FLEET_SCHEDULE_STATE="$T/s19avB" FLEET_SCHEDULE_LOCK_ROOT="$L19/avb" \
+  FLEET_SCHEDULE_TICK=2 python3 "$T/bin19av/fleet-schedule.py" --start 2>&1)"; rc19avb=$?
+wait19avb=0
+while [ ! -s "$MARK19AVB" ] && [ "$wait19avb" -lt 25 ]; do sleep 1; wait19avb=$((wait19avb + 1)); done
+grep -qx 'pybare=python3' "$MARK19AVB" 2>/dev/null \
+  && ok "19av CONTROL: a BARE PYTHON_BIN is left alone (a PATH name is not a path)" \
+  || bad "19av CONTROL: a bare PYTHON_BIN was rewritten to something else: $(head -3 "$MARK19AVB") (rc=$rc19avb)"
+pidAVB="$(cat "$T/s19avB/loop.pid" 2>/dev/null)"; kill "$pidAVB" 2>/dev/null; sleep 1
+
+# 19an — ⛔ AN `--install` THAT STARTS NOTHING MUST STILL RECORD ITS DECLARATION SET. This is the
+# cell-bringup shape: a second state dir installs while another holds the BOX lock, so `spawn_loop`
+# returns the foreign holder with `started=False` — and the pointer is the ONLY thing the supervisor's
+# bare-env revival (`HOME=$CELL_HOME CELL_HOME=$CELL_HOME … --start`, no INFRA_ROOT/TEMPLATES_DIR) has to
+# find the declarations. Gating the write on `started` (the 19al fix, first cut) silently dropped it here:
+# measured `FAIL: no job declarations found` rc=3, which the supervisor logs as a WARN, so a cell that
+# bring-up had just certified ran with no reap, no liveness detection and no canary. `main`'s arm returned
+# rc=0 in the same shape. The rule is "no loop OF THIS STATE DIR is running", not "this verb started one".
+mkdir -p "$T/tpl19anA" "$T/tpl19anB" "$T/bin19an"
+cp "$GOOD"/*.plist "$T/tpl19anA/" 2>/dev/null
+cp "$GOOD"/*.plist "$T/tpl19anB/" 2>/dev/null
+printf '# none\n' > "$T/tpl19anA/RETIRED"; printf '# none\n' > "$T/tpl19anB/RETIRED"
+cp "$SCHED" "$T/bin19an/fleet-schedule.py"
+s19 "$T/s19anA" "$T/tpl19anA" --install >/dev/null 2>&1
+pidAN="$(cat "$T/s19anA/loop.pid" 2>/dev/null)"
+[ -n "$pidAN" ] && kill -0 "$pidAN" 2>/dev/null \
+  && ok "19an baseline: home A's loop holds the box" \
+  || bad "19an baseline loop never came up — the arm grades nothing"
+out19an="$(s19 "$T/s19anB" "$T/tpl19anB" --install 2>&1)"; rc19an=$?
+grep -q 'loop already running' <<<"$out19an" \
+  && ok "19an home B's --install started NOTHING (the box lock is held by A — the bring-up shape)" \
+  || bad "19an home B's --install did not take the foreign-holder path: $out19an"
+[ -f "$T/s19anB/templates-dir" ] \
+  && ok "19an ⛔ home B's declaration set WAS recorded even though it started nothing" \
+  || bad "19an home B recorded NO declaration set — a later bare-env --start there cannot find the declarations"
+[ "$(cat "$T/s19anB/templates-dir" 2>/dev/null)" = "$T/tpl19anB" ] \
+  && ok "19an the pointer names HOME B's set, not the holder's" \
+  || bad "19an the pointer names the wrong set: $(cat "$T/s19anB/templates-dir" 2>/dev/null)"
+# ⛔ THE REVIVAL SHAPE ITSELF, from a scratch-dir copy so the child's `here` fallback cannot mask a
+# missing pointer: no INFRA_ROOT, no AGENT_INFRA_PATH, no TEMPLATES_DIR — only what an install recorded.
+out19an2="$(env -u INFRA_ROOT -u AGENT_INFRA_PATH -u TEMPLATES_DIR \
+  FLEET_SCHEDULE_STATE="$T/s19anB" FLEET_SCHEDULE_LOCK_ROOT="$L19" \
+  python3 "$T/bin19an/fleet-schedule.py" --start 2>&1)"; rc19an2=$?
+[ "$rc19an2" -eq 0 ] \
+  && ok "19an a bare-env --start finds the recorded set and exits 0 (the supervisor's revival works)" \
+  || bad "19an a bare-env --start exited $rc19an2 — the cell runs with no scheduled layer: $out19an2"
+grep -q 'no job declarations found' <<<"$out19an2" \
+  && bad "19an the revival reported 'no job declarations found' (rc=3 is only a WARN to the supervisor)" \
+  || ok "19an the revival did NOT report a missing declaration set"
+kill "$pidAN" 2>/dev/null; sleep 1
+
 # 19g — an UNUSABLE lock root must NOT wedge the box: it degrades to the state dir and DISCLOSES it.
 : > "$T/not-a-dir"
 out19g="$(env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19g" \
@@ -3479,6 +4394,50 @@ if grep -q 'MUTANT' "$MUT19/fleet-schedule-k.py"; then
 else
   bad "19k could not build the start-time mutant (that line moved) — the mutation arm did not run"
 fi
+
+# 19aq — THE FALLBACK'S DISCLOSURE NAMES THE ERROR THAT ACTUALLY STOPPED IT. `os.link` refusing is
+# what SELECTS the `O_EXCL` fallback; the create is a SECOND syscall and can fail on its own
+# (ENOSPC/EDQUOT/EACCES). The permit message was built from the link exception in both arms, so a
+# full disk or an unwritable lock root was disclosed as the LINK's errno — measured at the pre-fix
+# head as `cannot create the box lock at … (OSError: [Errno 95] Operation not supported)` while the
+# create had actually failed with ENOSPC. An operator reading the one line this file emits on the
+# permit path was sent to the wrong cause, on the failure the fallback exists to survive (#2890).
+# Both syscalls are driven in-process so the two errnos cannot coincide.
+out19aq="$(python3 - "$SCHED" "$T/state19aq" <<'PY19AQ' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fleet_schedule_19aq", sys.argv[1])
+fs = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(fs)
+state = sys.argv[2]
+os.makedirs(state, exist_ok=True)
+fs.STATE = state
+fs.LOOP_LOCK = os.path.join(state, "loop.lock")
+real_link, real_open = os.link, os.open
+def no_link(src, dst):
+    raise OSError(errno.EOPNOTSUPP, os.strerror(errno.EOPNOTSUPP))
+def full_disk(path, flags, mode=0o777):
+    raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+os.link = no_link
+os.open = full_disk
+try:
+    verdict = fs.claim_loop_lock()
+finally:
+    os.link, os.open = real_link, real_open
+print("VERDICT", verdict)
+PY19AQ
+)"
+grep -q 'VERDICT None' <<<"$out19aq" \
+  && ok "19aq a create failure on a link-refusing root still PERMITS (the box is not left unscheduled)" \
+  || bad "19aq the create failure did not permit: $out19aq"
+grep -q 'No space left on device' <<<"$out19aq" \
+  && ok "19aq ⛔ the disclosure names the CREATE's own failure (ENOSPC), not the link's" \
+  || bad "19aq the disclosure did not name the create error (ENOSPC): $out19aq"
+grep -q 'Operation not supported' <<<"$out19aq" \
+  && bad "19aq the disclosure reported the LINK errno for a CREATE failure: $out19aq" \
+  || ok "19aq the link errno is NOT reported for a create failure (attribution is per-syscall)"
+grep -q 'cannot create the box lock' <<<"$out19aq" \
+  && ok "19aq the create path is still NAMED as the create path" \
+  || bad "19aq the create failure was not named: $out19aq"
 
 
 echo

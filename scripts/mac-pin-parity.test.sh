@@ -173,6 +173,30 @@ plist_program() { # <plist>
       } }' \
     | awk '!(/^-/) && !/(^|\/)(ba|z|k)?sh$/ && !/\/env$/ { print; exit }'
 }
+# The program the STABLE RESOLVER would exec RIGHT NOW — the stub's OWN `--resolve-only`, run the way
+# launchd runs it (from that arm's HOME, with the pin record the installer wrote there). ⛔ THIS IS THE
+# ASSERTION THAT MATTERS: it is the behaviour the job gets, read out of the artifact launchd parses, not
+# out of the installer's variables.
+# ⛔ AND IT DROPS STDERR, WHERE THE PROBES IT REPLACED CAPTURED IT (`2>&1`) — deliberately, and it is
+# NOT cosmetic: a resolver that dies prints to stderr, and with stderr folded in the capture is a
+# NON-EMPTY string that a `has <resolved> <empty-record>` assertion would accept. Dropping it makes
+# "the resolver said nothing" mean nothing, so the arm fails closed; the A1 arm below then asserts the
+# resolution on both halves (non-empty record AND non-empty resolved).
+#
+# ⛔ AND IT CLEARS `ORCH_ENTRY`, BECAUSE THIS BATCH RENDERS THAT VARIABLE INTO THE PLIST (#3243 review
+# cycle-2, F3). The helper is carried from `3dca11e81` (a commit this branch's merge with `main` dropped;
+# its inline predecessors passed only `HARNESS_PIN_FILE`), and the difference is not cosmetic: an
+# `ORCH_ENTRY` exported in the OPERATOR'S shell was inherited by the resolver and answered for it — a
+# suite whose verdict depends on the caller's environment is not a test, and the P8 arm (a pin that
+# CARRIES launchd-controller.sh) is exactly where it shows: `ORCH_ENTRY=orch-loop.sh` in the shell makes
+# an inline probe report orch-loop.sh and the arm goes RED on a correct install. launchd supplies
+# `ORCH_ENTRY` from the plist, so the empty value here reproduces "the plist did not override the
+# entrypoint".
+stub_prog() { # <stub path> <home with the pin dir record> — the entrypoint the stub resolves to NOW
+  [ -f "$1" ] || return 0
+  env HOME="$2" HARNESS_PIN_FILE="$2/.harness-path" ORCH_ENTRY="" \
+      /bin/bash "$1" --resolve-only 2>/dev/null
+}
 
 # A1 — the FIRST pin, materialised by the cells' own materialiser.
 out="$(RUN HARNESS_MATERIALISER="$REPO_ROOT/scripts/cloud-cell-supervisor.sh" bash "$STAGE/install.sh")"
@@ -199,9 +223,15 @@ case "$PROG" in
 esac
 # ⛔ THE POSITIVE FORM OF THE SAME RULE, which is what a reviewer needs: what the job will ACTUALLY run
 # (the resolver's own answer, not the installer's bookkeeping) must be a path with a commit identity.
-RESOLVED="$(env HARNESS_PIN_FILE="$SHOME/.harness-path" /bin/bash "$PROG" --resolve-only 2>&1)"
-ck "$([ -n "$RESOLVED" ] && has "$RESOLVED" "$PIN_DIR_REC" && echo 0 || echo 1)" \
-   "…and run now it RESOLVES to the pinned tree ($RESOLVED)"
+RESOLVED="$(stub_prog "$PROG" "$SHOME")"
+# ⛔ AN EMPTY NEEDLE MATCHES EVERY HAYSTACK, SO AN EMPTY `PIN_DIR_REC` MADE THIS ARM PASS ON ANY
+# NON-EMPTY `RESOLVED` (batch review cycle-6, P2). `has "$X" ""` is `case "$X" in *""*)` → status 0, so
+# a box where the installer never wrote the dir record — the very state this arm exists to catch —
+# certified "it resolves to the pinned tree". Both halves are now asserted explicitly, and the needle
+# is required to be non-empty: an arm that answers its own question from the ABSENCE of a datum is a
+# false PASS, whichever direction it fails.
+ck "$([ -n "$PIN_DIR_REC" ] && [ -n "$RESOLVED" ] && has "$RESOLVED" "$PIN_DIR_REC" && echo 0 || echo 1)" \
+   "…and run now it RESOLVES to the pinned tree (record='${PIN_DIR_REC}', resolved='${RESOLVED}')"
 if [ -n "$RESOLVED" ] && git -C "$(dirname "$RESOLVED")" rev-parse --verify --quiet 'HEAD^{commit}' >/dev/null 2>&1; then
   ok "the RESOLVED program lives in a directory with a commit identity (re-pin can be checked against it)"
 else
@@ -226,8 +256,8 @@ ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "an explicit HARNESS=<checkout harne
 P2="$(plist_at "$SHOME2")"
 ck "$([ "$(plist_program "$P2" 2>/dev/null)" = "$T/o2/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
    "…and the rendered program is the STABLE RESOLVER, not the checkout's orch-loop.sh"
-ck "$([ "$(env HARNESS_PIN_FILE="$SHOME2/.harness-path" /bin/bash "$T/o2/orch-pin-exec.sh" --resolve-only 2>&1)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" \
-   "…and that resolver run now resolves to that checkout's orch-loop.sh"
+ck "$([ "$(stub_prog "$T/o2/orch-pin-exec.sh" "$SHOME2")" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" \
+   "…and that resolver run now resolves to that checkout's orch-loop.sh ($(stub_prog "$T/o2/orch-pin-exec.sh" "$SHOME2"))"
 ck "$([ -f "$SHOME2/.harness-path" ] && [ -f "$SHOME2/.pi/agent/state/HARNESS-PIN" ] && echo 0 || echo 1)" \
    "…and it MENDED both pin records, so the next reader resolves the same tree"
 
@@ -334,7 +364,7 @@ ck "$([ "$(head -1 "$SHOME3P/.pi/agent/state/HARNESS-PIN" 2>/dev/null)" = "$FX3_
 P3P="$(plist_at "$SHOME3P")"
 ck "$([ "$(plist_program "$P3P" 2>/dev/null)" = "$O3P/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
    "…and the job execs the STABLE RESOLVER (\$O3P/orch-pin-exec.sh), not the moving pin path"
-ck "$([ "$(env HARNESS_PIN_FILE="$SHOME3P/.harness-path" /bin/bash "$O3P/orch-pin-exec.sh" --resolve-only 2>&1)" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" \
+ck "$([ "$(stub_prog "$O3P/orch-pin-exec.sh" "$SHOME3P")" = "$PIN_DIR_A3/orch-loop.sh" ] && echo 0 || echo 1)" \
    "…and that resolver execs THAT tree ($PIN_DIR_A3/orch-loop.sh)"
 # The launcher's verdict on the SAME two records: it must not call the box BROKEN.
 # ⛔ `HARNESS_REPO` IS PART OF THE FIXTURE, NOT DECORATION. `harness-up` resolves the repo whose object
@@ -505,7 +535,7 @@ P8="$(plist_at "$SHOME8")"
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that CARRIES the entrypoint installs (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$([ "$(plist_program "$P8" 2>/dev/null)" = "$O7/orch-pin-exec.sh" ] && echo 0 || echo 1)" \
    "…and the job runs the STABLE RESOLVER, not \$O's copy of the entrypoint"
-ck "$([ "$(env HARNESS_PIN_FILE="$SHOME8/.harness-path" /bin/bash "$O7/orch-pin-exec.sh" --resolve-only 2>&1)" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
+ck "$([ "$(stub_prog "$O7/orch-pin-exec.sh" "$SHOME8")" = "$FXH2/launchd-controller.sh" ] && echo 0 || echo 1)" \
    "…and the resolver picks the PINNED entrypoint (launchd-controller.sh), so the pin's preference is what a tick gets"
 # ⛔ ONE PROGRAM LINE, AND IT NAMES THE PROGRAM THE JOB WILL EXEC (review P5). The installer used to print
 # `harness pinned … the job will exec <pin>/orch-loop.sh` BEFORE `HARNESS_ENTRY` was chosen, so a pin
@@ -597,8 +627,8 @@ ck "$([ "$(plist_program "$(plist_at "$SHOME7h")" 2>/dev/null)" = "$T/o7h/orch-p
    "…and the rendered program is the stable resolver at its space-free path"
 # ⛔ THE SPACE HAZARD MOVED, IT DID NOT DISAPPEAR: the spaced path is now what the RESOLVER must print and
 # exec, so a quoting regression here is a 127 every tick. Asserted on the resolver's own output.
-ck "$(has "$(env HARNESS_PIN_FILE="$SHOME7h/.harness-path" /bin/bash "$T/o7h/orch-pin-exec.sh" --resolve-only 2>&1)" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
-   "…and the resolver returns the SPACED pin path intact ($(env HARNESS_PIN_FILE="$SHOME7h/.harness-path" /bin/bash "$T/o7h/orch-pin-exec.sh" --resolve-only 2>&1))"
+ck "$(has "$(stub_prog "$T/o7h/orch-pin-exec.sh" "$SHOME7h")" "$FXSP/scripts/orchestrator-harness/orch-loop.sh" && echo 0 || echo 1)" \
+   "…and the resolver returns the SPACED pin path intact ($(stub_prog "$T/o7h/orch-pin-exec.sh" "$SHOME7h"))"
 
 # B6c — `set -e` HAZARDS IN THE RECORD CAPTURES (review P4). A pin RECORD that is a directory used to
 # abort the installer with `head`'s status and NO message; the block promises a named rc=78 refusal.
@@ -665,7 +695,7 @@ out="$(env HOME="$SHOME_8A" O="$O_8A" REPO="$FX" OR="acme/widget" HARNESS="$FXH"
         bash "$STAGE/install.sh" 2>&1)"; rc=$?
 ck "$([ "$rc" -eq 0 ] && echo 0 || echo 1)" "a pin that does NOT carry orch-pin-exec.sh still installs, seeded from this checkout (rc=$rc; out=$(printf %s "$out" | tail -2 | tr "\n" " "))"
 ck "$([ -x "$O_8A/orch-pin-exec.sh" ] && echo 0 || echo 1)" "…and the stable program was seeded into \$O"
-ck "$([ "$(env HARNESS_PIN_FILE="$SHOME_8A/.harness-path" /bin/bash "$O_8A/orch-pin-exec.sh" --resolve-only 2>&1)" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" \
+ck "$([ "$(stub_prog "$O_8A/orch-pin-exec.sh" "$SHOME_8A")" = "$FXH/orch-loop.sh" ] && echo 0 || echo 1)" \
    "…and it resolves the pin ($FXH/orch-loop.sh)"
 
 # B8b — A RESOLVER THAT CANNOT RESOLVE MUST BE A REFUSAL, NOT A SILENT rc=127 (review P1 finding 2).
@@ -784,7 +814,10 @@ if [ "$PLATFORM" = "Darwin" ]; then
              if [ ! -f "$prog" ]; then
                n_bad=$((n_bad+1)); bad "$(basename "$pl" .plist): the program is the stable resolver $prog but THAT FILE IS MISSING — launchd would exit 127 on every tick while still reporting the job loaded"
              else
-               _resolved="$(env HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}" /bin/bash "$prog" --resolve-only 2>&1)"
+               # ⛔ `ORCH_ENTRY` IS CLEARED FOR THE SAME REASON `stub_prog` CLEARS IT: the entrypoint is what
+               # the PLIST supplies to launchd, so a value inherited from the operator's shell would answer
+               # for a job that never had it — this arm's whole question is what the INSTALLED job resolves.
+               _resolved="$(env HARNESS_PIN_FILE="${HARNESS_PIN_FILE:-$HOME/.harness-path}" ORCH_ENTRY="" /bin/bash "$prog" --resolve-only 2>&1)"
                case "$_resolved" in
                  "$PIN_TREE"/*) ok "$(basename "$pl" .plist): the program is the stable resolver, and it RESOLVES into the pin ($_resolved)" ;;
                  *) n_bad=$((n_bad+1))

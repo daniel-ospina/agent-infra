@@ -143,9 +143,57 @@ from pathlib import Path
 
 #: A pytest nodeid: ``path/to/test_x.py::[Class::]name`` (params allowed).
 #: Deliberately anchored and narrow — anything else is REJECTED, not guessed.
+#:
+#: OVERRIDES: the ``_NODEID_LOOSE_RE`` rationale ("``_NODEID_RE`` stays narrow for
+#: the RATE/UNION parsers; widening it there would loosen their fail-closed check
+#: for no gain") — the ``/`` in ``rest`` is ADMITTED, because that rationale's own
+#: premise, "for no gain", is measurably false. A pytest parameter legitimately
+#: carries a PATH (``::test_x[tools/cache_evict.py]``), and the ``rest`` class
+#: already admitted ``[``/``]``/``.``/``:``/``-`` — the parameter-SYNTAX characters,
+#: NOT the whole parameter space (see the residual below) — so omitting
+#: ``/`` dropped main's rate row for EVERY such id. The consequence is not a
+#: formatting nicety, it is the exact failure mode :func:`is_failure_key`'s own
+#: docstring forbids: "a dropped main-side row makes the PR-side failure look
+#: unique, which BLOCKS". Measured on tortoise#11365: main's table carries all 10
+#: ``test_entry_point_python_guard.py`` rows — 3/25, 3/25, 1/25, 2/25, 2/25 PER ARM,
+#: five tools each, so ten rows across the two arms — and
+#: ``parse_rates`` rejected all 10, so a PR that touches none of those files was
+#: BLOCKed as "introduced" while the 11 non-path-parameterized main-reds on the
+#: same run were correctly EXEMPT.
+#:
+#: The narrowness that the overridden rationale still justifies is RETAINED: the
+#: ``path`` group stays anchored, and the tail admits only
+#: ``[A-Za-z0-9_\[\]\-.:/]`` — no whitespace, no tab, no empty tail, no missing ``::``.
+#:
+#: ⛔ KNOWN RESIDUAL — never write it as a list, and do not close #3691 on a
+#: whitespace-only fix. `rest` is an allowlist (alnum, ``_``, ``[``, ``]``, ``.``,
+#: ``:``, ``-``, ``/``). Any real id outside it is dropped from MAIN's rate table and
+#: the silent-drop → "absent from main's failure set" → permanent BLOCK follows.
+#: The set is open-ended; every list written here was measurably short.
+#:
+#: pytest escapes PARAMS when needed (``[a\tb]``, ``[caf\xe9]``, ``[a\\b]`` — backslash
+#: sequences, no raw byte) but does NOT escape a test/class NAME (``def test_café``
+#: emits the raw UTF-8 bytes ``c3 a9``). So the character to admit for the first is
+#: ``\``; the second needs a non-ASCII range, which ``\`` does not cover.
+#:
+#: WHICH DOOR. A whitespace id has THREE, not one: ``_RATES_RE``'s nodeid group is
+#: ``\S+`` so it refuses the row, AND the table is rewritten upstream before this
+#: module sees it — ``scripts/ci-failure-set.sh`` builds it with
+#: ``sort | uniq -c | awk '{ c=$1; $1=""; ... }'``, and ``$1 = ""`` REBUILDS ``$0``
+#: joined by OFS, so a whitespace RUN collapses to one space (a SINGLE space passes
+#: verbatim). Widening both doors repairs the single-space rows and leaves the
+#: run-bearing ones unjoined; for those the producer is the third door. This module
+#: already records that mangling for guard keys — see its ``uniq -c | awk`` note.
+#: Every other offending character is ``\S``, so ``_RATES_RE`` matches those rows and
+#: the drop is ``rest`` ALONE — do not send a fixer to ``_RATES_RE`` for a comma.
+#:
+#: The module's own
+#: ``test_the_id_door_and_the_signature_door_name_the_same_spaced_param_id`` pins
+#: ``[chromium-Claude Desktop]`` as a REAL id the loose door must name, so this is
+#: live, not hypothetical. Tracked by agent-infra#3691.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
-    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:]+)$"
+    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"
 )
 
 #: The tokens that open a failure record. One list, so the shell can never
@@ -1020,6 +1068,11 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 # RATE/UNION parsers; widening it there would loosen their fail-closed check for
 # no gain. Dropping a real id here would be fail-OPEN (an undecided id is an
 # unblocked id), which is why this path is deliberately the permissive one.
+#
+# ⛔ SEE ``_NODEID_RE`` ABOVE (its ``OVERRIDES:`` block). The "for no gain" above is
+# measurably false for a parameter that carries a PATH, so ``_NODEID_RE.rest`` now
+# admits ``/``. This paragraph is left verbatim as the record of the rationale that
+# was reopened, not as current policy about paths.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
 # A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
