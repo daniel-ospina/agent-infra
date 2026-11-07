@@ -281,9 +281,23 @@ staleness test for the whole skew).
 ## The quiesce hook
 
 `cloud-cell-quiesce.sh` runs the sweep **after** it has killed every session and **before** it re-seeds
-and restarts one controller (step 3b). Lanes are dead by then, so their trees are final.
+and restarts one controller. Lanes are dead by then, so their trees are final.
+⛔ **The archive runs BEFORE the stray-controller invariant, and that ordering is load-bearing.** The
+`LEFT != 0` check (`FATAL: N orch-loop process(es) survived the kill sweep` → exit 1) used to precede
+the archive, so a single process whose argv contains `orch-loop.sh` — a controller still winding down
+after TERM, a `tail -f` of its log, a monitor grepping for it — exited the quiesce having archived
+**nothing**, with a message naming only the stray. Preserving the work is unconditional; refusing to
+REOPEN a cell that still holds a controller is what the invariant is for, and it still aborts — it just
+no longer runs first. When it does abort, it now also states the archive's own verdict, so its message
+cannot be misread as "nothing was at risk".
 
 - A missing or failing sweep is **loud** (`FATAL:` lines) and makes the quiesce **exit non-zero**.
+- **`DONE` requires the pass record, not just exit 0.** The sweep exits 0 when `unpushed_worktrees>0`
+  (correctly: it cannot archive commits), so the hook reads `$O/state/wip-sweep.status` and refuses
+  `DONE` when that count is non-zero — a lane that committed and never pushed has a clean tree, so
+  nothing is dirty, nothing is archived, and the old code printed `DONE` over commits that then died
+  with the VM. A record that is **unreadable** is refused the same way: unverified is never read as
+  zero, and a sweep that exited 0 without writing its record is not the tool that shipped with this hook.
 - It does **not** abort the quiesce. Aborting would leave the cell with zero controllers — worse than
   the state the script exists to end. Supervision is restored, the run prints `NOT DONE`, and the exit
   code is non-zero for whatever RAN the quiesce.
@@ -317,6 +331,10 @@ and restarts one controller (step 3b). Lanes are dead by then, so their trees ar
   a green pass when work was left behind. On a
   box about to be reclaimed those commits die with it unless the branch is pushed; archiving branch
   commits is a separate capability and is not claimed here.
+  ⛔ **On a quiesce those commits are now a REFUSED `DONE`**, not merely a line above it: the hook reads
+  `unpushed_worktrees=` and exits non-zero (`NOT DONE`) when it is non-zero. The sweep still exits 0 for
+them — it cannot archive commits, so failing its own pass would be a lie about its capability — which is
+  exactly why the reader that DOES destroy the box must read the count rather than the exit code.
 - **It never deletes, and it changes no working tree.** It adds commits to `refs/wip/<slug>` on
   ORIGIN; inside the examined worktree's own repository it writes two refs — the local pin
   `refs/wip-local/<slug>`, and the fetched copy of origin's snapshot `refs/wip-remote/<slug>` that the

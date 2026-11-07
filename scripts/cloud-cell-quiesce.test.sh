@@ -88,9 +88,17 @@ mk_world() {
     'esac' \
     'exit 0' > "$d/repo/scripts/cloud-cell-supervisor.sh" || return 1
   chmod +x "$d/repo/scripts/cloud-cell-supervisor.sh"
-  # The sweep stub: logs its argv and exits $SWEEP_RC (0 by default).
+  # The sweep stub: logs its argv, writes the pass record the hook now reads, and exits $SWEEP_RC.
+  # ⛔ IT WRITES THE RECORD BECAUSE THE HOOK READS IT (#3588 review, cycle 8): `DONE` now requires a
+  # readable `unpushed_worktrees=` count, so a stub that archived nothing and recorded nothing cannot
+  # stand in for the real sweep — the real one writes this file LAST on exit 0. `SWEEP_NO_RECORD=1`
+  # reproduces "exit 0 and no record", which is the mismatched-tool shape the hook must refuse.
   printf '%s\n' '#!/usr/bin/env bash' \
     'echo "sweep:$*" >> "'"$d"'/events"' \
+    'if [ "${SWEEP_NO_RECORD:-0}" != "1" ]; then' \
+    '  _sd="${WIP_SWEEP_STATE_DIR:-'"$d"'/O/state}"; mkdir -p "$_sd" 2>/dev/null' \
+    '  printf "unpushed_worktrees=%s\n" "${SWEEP_UNPUSHED:-0}" > "$_sd/wip-sweep.status" 2>/dev/null' \
+    'fi' \
     'exit "${SWEEP_RC:-0}"' > "$d/repo/scripts/wip-sweep.sh" || return 1
   chmod +x "$d/repo/scripts/wip-sweep.sh"
   # PATH stubs for the process/tmux surface.
@@ -106,9 +114,11 @@ mk_world() {
     'echo "pkill:$*" >> "'"$d"'/events"' \
     'rm -f "'"$d"'/alive"' \
     'exit 0' > "$d/bin/pkill"
-  # ps: one orch-loop line while the stub controller is "alive", none after the kill sweep.
+  # ps: one orch-loop line while the stub controller is "alive", none after the kill sweep. `$d/survive`
+  # makes the line PERSIST past the kill sweep — the "a stray outlived the 2 s + 2 s window" shape the
+  # unconditional-archive arm (H) needs, without touching this host's processes.
   printf '%s\n' '#!/usr/bin/env bash' \
-    'if [ -f "'"$d"'/running" ]; then echo "bash /tmp/cell/orch-loop.sh"; else echo "bash /tmp/cell/other.sh"; fi' \
+    'if [ -f "'"$d"'/survive" ] || [ -f "'"$d"'/running" ]; then echo "bash /tmp/cell/orch-loop.sh"; else echo "bash /tmp/cell/other.sh"; fi' \
     'exit 0' > "$d/bin/ps"
   # pgrep: a pid whose /proc environ carries REPO= (so step 7 verifies it) — the sleeper the caller
   # launches, or a harmless self-reference when there is no /proc.
@@ -148,7 +158,8 @@ run_quiesce() {
   PATH="$d/bin:$PATH" HOME="$d/home" \
   REPO="$d/repo" OR="daniel-ospina/tortoise" SCOPE=own MAX_LANES=3 \
   CELL_HOME="$d/home" O="$d/O" HARNESS="$d/repo/scripts/orchestrator-harness" \
-  SWEEP_RC="$rc" bash "$Q" > "$d/out" 2>&1
+  SWEEP_RC="$rc" SWEEP_UNPUSHED="${SWEEP_UNPUSHED:-0}" SWEEP_NO_RECORD="${SWEEP_NO_RECORD:-0}" \
+  bash "$Q" > "$d/out" 2>&1
   local st=$?
   [ -n "$sleeper" ] && kill "$sleeper" 2>/dev/null
   return "$st"
@@ -267,6 +278,7 @@ chmod +x "$D/repo/scripts/wip-sweep.sh"
 mkdir -p "$D/home/.pi/agent/scripts"
 printf '%s\n' '#!/usr/bin/env bash' \
   'echo "sweep:$*" >> "'"$D"'/events"' \
+  'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
   'exit 0' > "$D/home/.pi/agent/scripts/wip-sweep.sh"
 chmod +x "$D/home/.pi/agent/scripts/wip-sweep.sh"
 echo alive > "$D/alive"
@@ -314,6 +326,7 @@ mkdir -p "$PINROOT/scripts/orchestrator-harness"
 printf '%s\n' "$PINROOT/scripts/orchestrator-harness" > "$D/home/.harness-path"
 printf '%s\n' '#!/usr/bin/env bash' \
   'echo "sweep:$*" >> "'"$D"'/events"' \
+  'mkdir -p "'"$D"'/O/state" 2>/dev/null; printf "unpushed_worktrees=0\n" > "'"$D"'/O/state/wip-sweep.status"' \
   'exit 0' > "$PINROOT/scripts/wip-sweep.sh"
 chmod +x "$PINROOT/scripts/wip-sweep.sh"
 echo alive > "$D/alive"
@@ -354,6 +367,78 @@ if [ "$HAS_PROC" = 1 ]; then
 else
   skip "F2/F3 the success path's EXIT CODE needs /proc/<pid>/environ (step 7), absent on this host — the ordering arms above still ran"
 fi
+
+# ⛔ F4/F5 — EXIT 0 IS NOT "THE WORK IS ON ORIGIN" (#3588 review, cycle 8). The sweep exits 0 when
+# `unpushed_worktrees>0`, and that is right for the sweep (it cannot archive commits). The defect was in
+# THIS hook: it read only the exit code, so a lane that committed and never pushed has a clean tree —
+# nothing dirty, nothing archived, sweep exit 0 — and the quiesce printed DONE and exited 0 over commits
+# that then died with the VM. The counter was already in the record; nothing read it. F5 covers the other
+# half: a record that cannot be read is UNVERIFIED, never zero.
+echo; echo "── F4/F5. exit 0 does not mean the work is on origin — the pass record decides ──"
+if [ "$HAS_PROC" = 1 ]; then
+  mk_world f4 || { echo "❌ fixture failed (f4)"; exit 1; }
+  D="$T/f4"
+  echo alive > "$D/alive"
+  SWEEP_UNPUSHED=2 run_quiesce f4 0; RC=$?
+  [ "$RC" -ne 0 ] \
+    && ok "F4 a green sweep whose record says unpushed_worktrees=2 makes the quiesce NOT DONE (rc=$RC)" \
+    || bad "F4 the quiesce exited 0 over 2 worktrees whose commits exist ONLY on this disk"
+  grep -q 'DONE — cell has exactly one controller' "$D/out" \
+    && bad "F5 it still printed DONE over unpushed commits" \
+    || ok "F5 …and it never printed the DONE line, so a clean summary cannot be read off it"
+  grep -q 'ONLY on this disk' "$D/out" \
+    && ok "F5b …and it names the reason: commits that no remote has" \
+    || bad "F5b the refusal does not say WHY: $(tail -2 "$D/out")"
+  # ⛔ THE COUNT ITSELF, not merely the refusal: F4 alone passes on ANY fail-closed implementation (a
+  # missing record also refuses), so it does not discriminate "read the count" from "regard everything as
+  # unverifiable". Measured: blanking the record path left F4 AND F5 green and only F5b red. Requiring the
+  # number in the message is what proves the count was parsed and carried.
+  grep -q '2 worktree(s) hold commit(s)' "$D/out" \
+    && ok "F5c …and it carries the COUNT (2), so the record was parsed rather than the whole path refused" \
+    || bad "F5c the refusal does not carry the count from the record: $(tail -2 "$D/out")"
+
+  mk_world f6 || { echo "❌ fixture failed (f6)"; exit 1; }
+  D="$T/f6"
+  echo alive > "$D/alive"
+  SWEEP_NO_RECORD=1 run_quiesce f6 0; RC=$?
+  [ "$RC" -ne 0 ] \
+    && ok "F6 exit 0 with NO pass record is NOT DONE (rc=$RC) — unverified is never read as zero" \
+    || bad "F6 an unreadable record was treated as 'nothing unpushed' and the quiesce exited 0"
+  grep -q 'CANNOT be verified' "$D/out" \
+    && ok "F6b …and it says the archive cannot be verified, so the operator knows what is unknown" \
+    || bad "F6b the missing-record refusal does not say the state is unverified: $(tail -2 "$D/out")"
+else
+  skip "F4/F5/F6 the record arms need the same /proc read-back as F2 — the unconditional-archive arm H still ran"
+fi
+
+# ⛔ H — THE ARCHIVE IS UNCONDITIONAL; THE INVARIANT GOVERNS THE RESTART (#3588 review, cycle 8). The
+# stray-controller check (`LEFT != 0` → `exit 1`) used to sit BEFORE the archive, so one process whose
+# argv contains `orch-loop.sh` — a wind-down after TERM, a `tail -f` of its log, a monitor grepping it —
+# made the quiesce exit having archived NOTHING, with a FATAL that named only the stray. Data preservation
+# is unconditional; refusing to REOPEN a cell that still has a controller is what the check is for, and it
+# still aborts. Nothing pinned `LEFT != 0` (the ps stub always cleared on the kill sweep), which is how the
+# ordering stayed wrong. H uses $d/survive to keep the stub reporting an orch-loop past the kill sweep.
+echo; echo "── H. the WIP archive runs even when a surviving controller aborts the restart ──"
+mk_world habort || { echo "❌ fixture failed (habort)"; exit 1; }
+D="$T/habort"
+echo alive > "$D/alive"
+: > "$D/survive"
+run_quiesce habort 0; RC=$?
+grep -q '^sweep:' "$D/events" \
+  && ok "H1 the WIP archive STILL RAN despite the surviving controller (the abort used to skip it entirely)" \
+  || bad "H1 the surviving-controller abort skipped the archive — every dirty worktree on this cell was left local-only: $(tr '\n' ' ' < "$D/events")"
+[ "$RC" -ne 0 ] \
+  && ok "H2 …and the quiesce still REFUSES (rc=$RC) — the invariant is kept, it just no longer preempts the rescue" \
+  || bad "H2 a surviving controller exited 0"
+grep -q 'survived the kill sweep' "$D/out" \
+  && ok "H3 the abort names the KILL sweep, so it cannot be misread as the WIP sweep" \
+  || bad "H3 the abort message still says only 'survived the sweep': $(grep -m1 FATAL "$D/out")"
+grep -q '^supervisor:start' "$D/events" \
+  && bad "H4 the quiesce restarted supervision with a stray controller alive" \
+  || ok "H4 …and supervision was NOT restarted, so the ordering fix did not weaken the invariant"
+grep -q 'HAD already run' "$D/out" \
+  && ok "H5 the abort states the archive's own verdict, so 'nothing was at risk' cannot be inferred from it" \
+  || bad "H5 the abort does not say whether the archive ran: $(grep -m2 'FATAL\|archive' "$D/out")"
 
 # ⛔ G) A REFUSAL IS NOT A PASS, PINNED BY RE-RUNNING THIS SUITE (#3588 review). The stub preflight above
 # refuses when $TMPDIR cannot hold executable stubs (a noexec /tmp). It used to `exit 0` there, so a shard
