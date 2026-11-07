@@ -453,9 +453,20 @@ scratch_supervisor_reason() {
             # TREE ITSELF is graded now, not just its prefix: it must be a PIN TREE — `<pin>/<commit>` as
             # `cloud-cell-bringup.sh` builds it (`git worktree add --detach "$HARNESS_PIN_DIR/$sha"`) — or be
             # exactly the root this box records (the bring-up also accepts a pin that IS the root, when that
-            # path is already a worktree of the repo). `HARNESS_PIN_DIR=$HOME` now admits `$HOME/wt-drainer-x`
-            # only if someone also names THAT directory as the pin root, which is the same declaration the
-            # residual below already names for HOME/CELL_HOME rather than a widening of the rule.
+            # path is already a worktree of the repo).
+            # ⛔ AND A NAME, OR A DECLARATION, IS NOT A PIN (cycle-4 P1, MEASURED — my own previous claim here
+            # was OVERBROAD and is corrected by this). Naming and declaring are both CALLER-CONTROLLED inputs, so
+            # grading them alone defended nothing: measured on a primary clone, the unit was ARMED for
+            #   HARNESS_PIN_DIR=$HOME        + a scratch at `$HOME/<40-hex>`        (the hex basename alone won),
+            #   HARNESS_PIN_DIR=<scratch>    + that scratch                      (the equality arm alone won), and
+            #   HARNESS_PIN_FILE=<a file naming <scratch>/scripts/orchestrator-harness>  (any directory a record
+            #                                                                   names became "the pin").
+            # Every one of those is the drainer scratch #2697 exists to refuse. So the tree must now ALSO
+            # CORROBORATE ITSELF the way the bring-up corroborates a pin — `cloud-cell-bringup.sh` refuses to
+            # call anything its harness pin unless it carries `scripts/orchestrator-harness/orch-loop.sh`
+            # ("this is not a harness tree, and a controller started from it would exit at once"). That is a
+            # property of the TREE, so it cannot be produced by naming a scratch cleverly, and it is exactly
+            # the condition every real pin already satisfies — so it blocks no deployment.
             pin="$(pin_root_of_this_box)"
             tree="${d%|detached}"
             base="$(basename "$tree")"
@@ -467,8 +478,9 @@ scratch_supervisor_reason() {
                     *) [ "${#base}" -ge 7 ] && [ "${#base}" -le 40 ] && pin_ok=1 ;;
                 esac
             fi
+            [ "$pin_ok" -eq 1 ] && [ ! -f "$tree/scripts/orchestrator-harness/orch-loop.sh" ] && pin_ok=0
             if [ "$pin_ok" -ne 1 ] || ! path_under "$tree" "$pin"; then
-                printf 'it lives in a DETACHED GIT WORKTREE %s that is NOT the harness pin this box records (%s) — a pin is a TREE named for the commit it holds (`<pin dir>/<sha>`, what the bring-up creates with `git worktree add --detach`) or the recorded pin root itself; this one is named `%s`, and the fleet drainer builds a lane scratch checkout exactly like it and removes that with `worktree remove` when the lane ends' "$tree" "$pin" "$base"
+                printf 'it lives in a DETACHED GIT WORKTREE %s that is NOT the harness pin this box records (%s) — a pin is a TREE named for the commit it holds (`<pin dir>/<sha>`, what the bring-up creates with `git worktree add --detach`) or the recorded pin root itself, AND it carries `scripts/orchestrator-harness/orch-loop.sh`, which is what the bring-up demands of a pin; this one is named `%s`%s, and the fleet drainer builds a lane scratch checkout exactly like it and removes that with `worktree remove` when the lane ends' "$tree" "$pin" "$base" "$([ -f "$tree/scripts/orchestrator-harness/orch-loop.sh" ] && printf '' || printf ' and carries no harness tree')"
                 return 0
             fi ;;
         *'|branch')
