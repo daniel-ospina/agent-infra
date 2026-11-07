@@ -279,7 +279,7 @@ pin_root_of_this_box() {
 # the ONE DURABLE supervisor — yet `resolve_supervisor`'s candidate list never proposed it. WHY that mattered
 # is narrower than the version first written here, and the correction is the point: `cloud-cell-supervisor.sh`
 # USED to be in NO pi-bootstrap array, so on a fresh cell BOTH other candidates were absent and the install
-# refused outright. Since #1938 closed, `setup.sh`'s `fleet_srcs` farms the supervisor FLAT to
+# refused outright. With the `fleet_srcs` entry this landing adds (#1938), `setup.sh` farms the supervisor FLAT to
 # `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh`, so a correctly-installed box DOES have it — and `beside`
 # then names the SAME directory, because this installer is farmed into that same `$DEST/scripts/`. The two
 # collapse into ONE candidate. What is left is the real reason the pin candidates stay: a box whose farm
@@ -789,7 +789,7 @@ resolve_supervisor() {
                 err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone on its DEFAULT branch — not a worktree, and not a clone on a lane branch)"
                 err "    $CELL_HOME/harness/<pin-sha>/scripts/cloud-cell-supervisor.sh   (the harness pin)"
                 err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm's PATH — see the warning below)"
-                err "  ⛔ THE FARM *DOES* DELIVER THIS FILE NOW (#1938 CLOSED): 'cloud-cell-supervisor.sh' joined"
+                err "  ⛔ THE FARM *DOES* DELIVER THIS FILE AS OF THIS LANDING (#1938): 'cloud-cell-supervisor.sh' joined"
                 err "    setup.sh's fleet_srcs, so 'bash pi-bootstrap/setup.sh' DOES create the .pi/agent/scripts"
                 err "    path above. ⚠️ This line used to say the opposite, because the entry did not exist when it"
                 err "    was written — so on a box installed by an OLDER setup.sh the farmed path may still be ABSENT:"
@@ -812,7 +812,7 @@ resolve_supervisor() {
         err "  systemd converges it to 'failed', and nothing pages (agent-infra#2697). Name a durable copy:"
         err "    ORCH_SUPERVISOR=${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh bash $0 --install"
         err "  ⛔ 'bash pi-bootstrap/setup.sh' DOES create \$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh —"
-        err "    the supervisor IS farmed flat by setup.sh's fleet_srcs (#1938, closed), so RE-RUN THE"
+        err "    the supervisor IS farmed flat by setup.sh's fleet_srcs (#1938), so RE-RUN THE"
         err "    INSTALLER rather than naming a checkout copy by hand."
         err "  Durable roots this box declares: CELL_HOME=$CELL_HOME, HOME=$HOME${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"
         return 1
@@ -2315,7 +2315,7 @@ do_uninstall() {
                     "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)/cloud-cell-supervisor.sh"; do
             [ -n "$_sup" ] && [ -f "$_sup" ] && break || _sup=""
         done
-        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (farmed FLAT by setup.sh's fleet_srcs since #1938 closed — re-run the installer to get it)"
+        [ -n "$_sup" ] || _sup="cloud-cell-supervisor.sh (farmed FLAT by setup.sh's fleet_srcs (the #1938 fix) — re-run the installer to get it)"
     fi
     log_line "uninstalled $p — the controller is no longer supervised: start it by hand with 'bash $_sup start', and note that a tmux controller is NOT restarted by anything (#2402)"
     return 0
