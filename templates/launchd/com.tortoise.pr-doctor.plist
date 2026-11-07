@@ -18,15 +18,29 @@
          REPLACES that hand-made agent with the tracked one — same label, same
          script, now reproducible from source. That replacement is the point.
 
-         THE TARGET IS THE FARMED WRAPPER, like every other always-installable job in
-         this directory (pi-reap-orphans, pi-cache-reap, lane-liveness): setup.sh's
-         fleet-scripts farm copies pr-doctor-machine.sh (fleet_srcs) and
-         lib/repo-set.sh (lib_srcs) to that path BEFORE the launchd convergence step,
-         which is what makes the `<string>` resolve on a fresh box.
-         install-launchd.sh hard-fails a job whose target does not resolve, and that
-         check is deliberately NOT defeated here: a bare `install-launchd.sh` on a box
-         that never ran the farm FAILs this job instead of installing a dead one, which
-         is the correct verdict and the same one every farmed job gets.
+         THE TARGET IS THE FARMED WRAPPER. setup.sh's fleet-scripts farm copies
+         pr-doctor-machine.sh (fleet_srcs) and lib/repo-set.sh (lib_srcs) to that path
+         BEFORE the launchd convergence step, which is what makes the `<string>` resolve
+         on a fresh box.
+         ⛔ IT IS NOT AN ALWAYS-INSTALLABLE JOB, AND THIS PARAGRAPH USED TO SAY IT WAS
+         (review round 22, P1). It is a `{{TORTOISE_REPO}}`-GATED template — like
+         branch-reaper, worktree-reaper and worktree-hygiene, and UNLIKE pi-reap-orphans,
+         pi-cache-reap and lane-liveness, which name no placeholder and really are always
+         installed. The placeholder gate fires BEFORE `verify_targets` (`install-launchd.sh`
+         returns SKIP from the placeholder loop), so on a box that resolves no tortoise
+         checkout this job is SKIPPED at rc 0 and the target check never runs at all.
+         ⛔ AND THAT IS A REAL LIMIT OF THIS CHANGE, RECORDED HERE RATHER THAN LEFT IMPLIED:
+         the wrapper is the ONLY consumer of the repo set, so on a box serving other repos
+         (agent-infra plus a second repo — the shape §1 of #2281 is about) creating
+         `repos.conf` changes nothing until a doctor unit exists for THAT box. The unit that
+         serves it is owed, and it must not be gated on a tortoise checkout. Until it lands
+         the set is correct and unread on those boxes — an installed-but-inert state this
+         file would rather name than hide.
+         WHERE THE PLACEHOLDER DOES RESOLVE, install-launchd.sh hard-fails a job whose
+         target does not resolve, and that check is deliberately NOT defeated here: a bare
+         `install-launchd.sh` after a farm that did not deliver FAILs this job instead of
+         installing a dead one, which is the correct verdict and the same one every farmed
+         job gets.
          The interpreter is resolved BY THE WRAPPER (`python3` on PATH, then
          /usr/bin/python3, then /usr/local/bin/python3), because this unit's
          ProgramArguments names `/bin/bash` + the farmed wrapper and launchd gives a job
@@ -135,6 +149,13 @@
     <!-- ⛔ /tmp, like every other template in this directory: launchd opens these files BEFORE exec,
          and nothing in install-launchd.sh creates $HOME/.pi/agent/state. A capture path whose parent
          may not exist fails at bootstrap, and the job that loses its only crash surface is this one. -->
+    <!-- Captured to /tmp, not $HOME/.pi/agent/state: launchd opens these files BEFORE exec
+         and nothing creates the state dir for it, so the hand-armed unit's
+         $STATE/pr-doctor.launchd.log is DEAD from the moment this installs.
+         NOTE (review round 22, P2): `heartbeat-loop.sh` still prints that old $STATE path on
+         its launchd arms. The /tmp choice here is a recorded decision with the reason above,
+         so the inconsistency is named rather than reversed: read /tmp/pr-doctor.launchd.log
+         for passes installed by THIS unit. -->
     <key>StandardOutPath</key>
     <string>/tmp/pr-doctor.launchd.log</string>
     <key>StandardErrorPath</key>

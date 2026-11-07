@@ -23,7 +23,8 @@
 #                                            judged by is decided PER REPO by `contract_note()` and
 #                                            reported on its own line. A repo whose rubric the
 #                                            classifier cannot hold is still GRADED and is named as
-#                                            `REFUSING TO DISPATCH — … tracked: agent-infra#2518`.
+#                                            `rubric: REFUSING TO DISPATCH -- … Tracked:
+#                                            agent-infra#2518` (quoted as EMITTED, review round 22).
 #                                            ⛔ That refusal is the truthful half: wiring the
 #                                            per-repo rubric is #2518's, and inventing one here
 #                                            would grade every PR by a declaration nobody read.
@@ -58,8 +59,10 @@
 # ⛔ IT MUST NOT RESOLVE THE SET ITSELF. `$HERE/lib/repo-set.sh` is resolved as a sibling so the SAME
 # file works in the checkout (`scripts/lib/repo-set.sh`) and on the farm (`$DEST/scripts/lib/…`,
 # `pi-bootstrap/setup.sh`'s `lib_srcs`). A second parser here would be the two-authorities defect the
-# reader exists to remove — and `check()` is run before every pass, so the list that is graded is the
-# list that was validated, not a value that drifted between the two.
+# reader exists to remove — and `check()` is run before every pass. ⛔ ONE PARSER, ONE FORMAT is what
+# that buys; it is NOT "the graded list is the same bytes as the validated one" (review round 22, P2):
+# the file is read again by `repo_set_doctor_repos`, so a rewrite between the two is not compared. What
+# is guaranteed is that both reads use THIS reader's parser, so they cannot disagree about the FORMAT.
 #
 # ⛔ A FARM GAP IS LOUD, NOT SKIPPED. If the sibling reader is missing the farm did not deliver what
 # `lib_srcs` declares; refusing here names that instead of degrading into a one-repo pass that looks
@@ -69,7 +72,8 @@
 # place an interpreter-level death lands, which is what makes "the wrapper refused" distinguishable
 # from "the doctor died on import".
 #
-# Exit codes: 0 = a pass ran and ended clean; pr-doctor's own rc (2 refuse, 3 blocked, 6 no-capacity,
+# Exit codes: 0 = a pass ran and ended clean; pr-doctor's own rc (2 refuse, 3 UNPLACED — the doctor
+# read the queue and placed the work, but no worker took it; 6 no-capacity,
 # …) when it ran and ended otherwise; 2 = this wrapper refused to start a pass at all.
 
 set -uo pipefail
