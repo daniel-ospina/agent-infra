@@ -705,10 +705,20 @@ have an owner, so "nothing sweeps `/tmp`" is no longer true and this paragraph w
 that claim: `scripts/reap-abandoned-worktrees.sh --include-gitless` (reached from the pass's abandoned
 arm, `DISK_REAPER_GITLESS=0` off-switch) sweeps a `/tmp/<name>` scratch tree with **no `.git` at all**,
 using the liveness witness the objection above asks for (a live-pid cwd/exe census, `reason=live-cwd`)
-plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`) and a
-per-pass cap (`REAP_AW_GITLESS_MAX`, default 10).
+plus a keep list (`REAP_AW_GITLESS_KEEP`, default `/tmp/actions-runner:/tmp/venv-shared*`).
+**#3278 changed WHEN #3272's count ceiling is charged, not its size.** The ceiling (`REAP_AW_GITLESS_MAX`,
+default 10 per root) is still the bound on destructive capacity, and it is now taken **after the age
+floor and before the live-pid census** — the unit used to be spent BEFORE the floor was consulted, so
+~89 % of those ten slots went to trees the age test preserved anyway, and on a population of thousands
+the aged trees were never reachable at all (a dry run over 3,314 entries classified 10 and printed
+`gitless-cap` for **3,137**). The pass's **expensive per-candidate work** is additionally bounded, **per
+root**, by a **TIME** bound, `REAP_AW_BUDGET_SECONDS` default 300 s — the eligibility scan over the whole
+population is *not* budgeted (classifying every entry is the product), and `DISK_REAPER_CLASS_TIMEOUT`
+(1800) bounds each **per-root invocation**, not the whole pass.
+**Raising or removing the ceiling is #3278's P3 — an owner decision, sequenced after P2 — and is not
+part of this change.**
 What **#3043** still covers is the remainder: trees a `.git`-owned arm claims (those keep their own
-`open-pr`/`dirty` proofs) and everything the cap leaves for the next hour.
+`open-pr`/`dirty` proofs) and everything the ceiling and the pass's time bound leave for the next run.
 
 ## Bounded execution — the pass cannot assume GNU `timeout` (#2046)
 
@@ -1920,10 +1930,13 @@ of that decision, not an optimisation.
   remainder is filed as **#3043** and is still not implemented: it is a different trade from
   `class=runner-work` — a live lane's cwd can BE under `/tmp` (measured, a running `pi` lane cwd'd in
   `/tmp/cell-t3/.worktrees/…`), so an mtime floor is not proof of death, and a scratch copy is the only
-  artifact of an unfinished review. Beyond #3272's cap (`REAP_AW_GITLESS_MAX`, default 10 per pass) and
-  the trees a `.git`-owned arm claims, it needs an owner ruling on what scratch counts as evidence — the
-  same reversal-of-a-decision problem `docs/ops/disk-consumers.md` G2 records. Do not "just add an age
-  sweep": it would delete working lanes' trees.
+  artifact of an unfinished review. Beyond the pass's own bounds (the count ceiling,
+  `REAP_AW_GITLESS_MAX` default 10 per root, now charged to AGED candidates — #3278 — and a per-root
+  wall-clock budget on its **expensive per-candidate work**, `REAP_AW_BUDGET_SECONDS` default 300 s, inside
+  a `DISK_REAPER_CLASS_TIMEOUT` of 1800 *per root invocation*) and the trees a `.git`-owned arm claims, it needs an
+  owner ruling on what scratch counts as evidence — the same reversal-of-a-decision problem
+  `docs/ops/disk-consumers.md` G2 records. Do not "just add an age sweep": it would delete working
+  lanes' trees.
 
 ## Measured evidence (2026-10-18, cell-3, this box)
 
