@@ -727,9 +727,20 @@ chmod 644 "$GP/mode000-o/.pool" 2>/dev/null || true
 ck "a NON-REGULAR or UNREADABLE .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take" $rc
 # ⛔ NON-VACUITY: delete the pool-shape guard and the case above must redden.
 PGMUT="$TMP/poolguard-mut.sh"
-sed 's@^  \[ -f "\$pool" \] && \[ -r "\$pool" \] || return 1$@  :@' "$FNS" > "$PGMUT" 2>/dev/null
-if cmp -s "$FNS" "$PGMUT" 2>/dev/null; then
-  rc=1; echo "      the pool-guard deletion did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+# ⛔ ASK FOR THE GUARD FIRST (review P3, cycle 65). `cmp` cannot tell "the anchor drifted" from "the guard is no
+# longer in the shipped function" — and the second IS the regression this half exists to catch, so blaming the
+# anchor sends the maintainer to the fixture instead of to the deleted guard. This is the very sentence §14c's
+# gate stopped saying one cycle ago; the same construction belongs here.
+_pg_gate='  [ -f "$pool" ] && [ -r "$pool" ] || return 1'
+_pg_cause=""
+if ! grep -qF "$_pg_gate" "$FNS" 2>/dev/null; then
+  _pg_cause="the .pool SHAPE GUARD is not in the shipped function at all — there is nothing for this half to delete, and that regression must redden the CONTROL check above (a directory pool then prints 'the pool ranked NONE'), not this mutation gate"
+else
+  sed 's@^  \[ -f "\$pool" \] && \[ -r "\$pool" \] || return 1$@  :@' "$FNS" > "$PGMUT" 2>/dev/null
+  cmp -s "$FNS" "$PGMUT" 2>/dev/null && _pg_cause="the pool-guard deletion did not apply (the guard IS present, so the sed anchor is what drifted) — this non-vacuity half grades nothing"
+fi
+if [ -n "$_pg_cause" ]; then
+  rc=1; echo "      $_pg_cause"
 else
   GPM="$TMP/poolguards-mut"; rm -rf "$GPM"; mkdir -p "$GPM/dir-o/.pool"
   printf '300\n9\n' > "$GPM/dir-o/candidates.txt"
@@ -2179,8 +2190,16 @@ elif [ -n "$(_dwit "$_dwp/midline.trace" '' "$_n_p")" ]; then
 else rc=0; fi
 ck "a mid-line «fn [nonce] echo» sequence names NO witness (the match must START the traced command)" $rc
 
-ck "an echo in a DIFFERENT function names NO witness for the function under test" \
-   "$([ -z "$(_dwit "$_dwp/other.trace" '' "$_n_p")" ] && echo 0 || echo 1)"
+# ⛔ AND THE FIXTURE'S LINE MUST HAVE REACHED THE STREAM (review P3, cycle 65). This was the last BARE absence in
+# the block: cycle 64 gave `assign` and `printf` their positive counterpart, and the same rule applies here — an
+# empty or aborted trace satisfies "names NO witness" for the wrong reason, and then the `fn` conjunct is graded
+# by nothing.
+if ! grep -qF '[refresh] other order: a different function' "$_dwp/other.trace" 2>/dev/null; then
+  rc=1; echo "      the OTHER function's echo is NOT in the trace stream — the fixture never reached the matcher, so its absence proves nothing"
+elif [ -n "$(_dwit "$_dwp/other.trace" '' "$_n_p")" ]; then
+  rc=1; echo "      an echo in ANOTHER function was attributed to the function under test ('$(_dwit "$_dwp/other.trace" '' "$_n_p")')"
+else rc=0; fi
+ck "an echo in a DIFFERENT function names NO witness for the function under test" $rc
 printf '%s\n' \
   "PS4='+\${FUNCNAME[0]:-main} [${_n_p}] '" 'set -x' \
   'queue_order_from_pool() {' \
@@ -2265,6 +2284,44 @@ if grep -q 'unranked:' <<<"$_u14" && grep -q 'P2-moderate tier window was clippe
    && grep -q 'windows=TRUNCATED(P2-moderate)' <<<"$_u14"; then rc=0
 else rc=1; echo "      (a) unranked+clip '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 320)'"; fi
 ck "(14d) the UNRANKED arm names a RECOGNISED clipped tier (and carries windows=TRUNCATED)" $rc
+
+# 14d-quinquies) AND THE UNRANKED ARM'S OTHER DISCLOSURE, IN ITS ABSENT POLARITY (review P2, cycle 65).
+# The §14 control above runs the numeric-head severity arm, which never reaches `_why_none` — so the SECOND
+# independent disclosure on that same operator line had no absent-polarity assertion at all. Measured: making
+# `_why_none`'s absent branch claim a MEASURED CLIP, and making it claim the record could not be USED, each
+# left the suite at 151/0, while a real pass with NO `.pool-sat` printed
+# `(no ranked row was left for this queue, and its tier-window record could not be USED …)` over a file that
+# does not exist. Both directions are asserted on ONE line, and the mutation below must redden it.
+_ud="$TMP/arm-unranked-absent"; rm -rf "$_ud"; mkdir -p "$_ud/o"
+printf 'aaa
+bbb
+' > "$_ud/o/candidates.txt"; printf '200
+' > "$_ud/o/.pool"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_ud/drive.sh"
+( cd "$_ud" && HOME="$_ud" bash drive.sh "$_ud/o" ) > "$_ud/out" 2>&1
+_u14="$(cat "$_ud/out" 2>/dev/null)"
+if grep -q 'STATE=unranked' <<<"$_u14" \
+   && grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_u14" \
+   && ! grep -q 'could not be USED' <<<"$_u14" \
+   && ! grep -q 'tier window was clipped' <<<"$_u14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_u14" \
+   && ! grep -q 'carries no tier name this code recognises' <<<"$_u14"; then rc=0
+else rc=1; echo "      unranked-absent '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 340)' (want STATE=unranked and the plain 'row matched' clause, and NO clip/unusable/foreign-record wording over a record that does not exist)"; fi
+ck "(14d) an ABSENT window record makes the UNRANKED arm claim NO clip and NO unreadable record — the plain clause, nothing else" $rc
+# ⛔ NON-VACUITY: make `_why_none`'s absent branch claim a clip and the check above must redden.
+_mut_ud="$TMP/fns-unranked-mut.sh"
+sed 's@^            _why_none="no P0-blocker/P1-severe/P2-moderate row matched"$@            _why_none="no ranked row was left for this queue — a tier window was clipped, so its newest members were never ranked at all"@' "$FNS" > "$_mut_ud" 2>/dev/null
+if cmp -s "$FNS" "$_mut_ud" 2>/dev/null; then
+  rc=1; echo "      the _why_none mutation did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+else
+  _udm="$TMP/arm-unranked-absent-mut"; rm -rf "$_udm"; mkdir -p "$_udm/o"
+  printf 'aaa\nbbb\n' > "$_udm/o/candidates.txt"; printf '200\n' > "$_udm/o/.pool"
+  { drive_prologue; cat "$_mut_ud"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_udm/drive.sh"
+  ( cd "$_udm" && HOME="$_udm" bash drive.sh "$_udm/o" ) > "$_udm/out" 2>&1
+  if grep -q 'tier window was clipped' "$_udm/out" 2>/dev/null; then rc=0
+  else rc=1; echo "      with _why_none's absent branch made to claim a clip the line did NOT say so — the check above is not grading it: $(tr '\n' '|' < "$_udm/out" | head -c 300)"; fi
+fi
+ck "non-vacuity: making _why_none's absent branch claim a clip reddens the unranked-absent check" $rc
 
 printf 'EVIL-not-a-tier\n' > "$_d14/o/.pool-sat"
 ( cd "$_d14" && HOME="$_d14" bash drive.sh "$_d14/o" ) > "$_d14/out-unrec" 2>&1
