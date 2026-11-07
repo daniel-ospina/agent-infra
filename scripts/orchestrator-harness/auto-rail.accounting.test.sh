@@ -2135,6 +2135,44 @@ publish_review_state acme/widget 42 review-found-issues "$_HB" record
 grep -qF 'publish_review_state "$repo" "$pr" review-found-issues "$head" record' "$SUT" \
   || bad 'the not-clean-record arm must PASS its basis (review-found-issues "$head" record) — without it the comment falls back to the rc=7 text'
 
+# ⛔ THE CAP-DEFERRAL PROMISE MUST BE ONE THE LOOP CAN KEEP (review round 11, P2, measured): the headless
+# `awaiting-review` is published BEFORE the head is read, and `review_candidate_arm` maps a head whose review
+# found blocking issues to `skip` — an rc=7 review records nothing, so the body-visible `rejected` guard
+# cannot see it. The old text promised "a reviewer is dispatched as soon as this repo has a free slot" for
+# that head, and `review-found-issues:<head>` (already on the PR) meant nothing newer was ever posted: the
+# false promise was the newest auto-rail comment until the head changed.
+: > "$COMMENTS"; : > "$POSTED"   # this block's own baselines: the headless marker was posted by an earlier arm
+_b4=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 awaiting-review
+_cap=$(sed -n "$(( _b4 + 1 )),\$p" "$POSTED")
+case "$_cap" in
+  *'If its current head is reviewable'*) ;;
+  *) bad "the HEADLESS (cap-deferral) 'awaiting-review' must NOT promise a dispatch outright — it runs before the head is read and cannot know whether that head is even dispatchable (got: $(printf '%s' "$_cap" | head -1))" ;;
+esac
+case "$_cap" in
+  *'ALREADY run and found blocking issues'*) ;;
+  *) bad "the HEADLESS 'awaiting-review' must name the other real outcome — a head whose review already ran and found blocking issues is not dispatchable — otherwise the comment's only reading is 'a review is coming'" ;;
+esac
+_b5=$(wc -l < "$POSTED")
+publish_review_state acme/widget 42 awaiting-review 5656565656565656565656565656565656565656
+_hk=$(sed -n "$(( _b5 + 1 )),\$p" "$POSTED")
+case "$_hk" in
+  *'a reviewer is dispatched as soon as this repo has a free slot'*) ;;
+  *) bad "the HEAD-KEYED 'awaiting-review' must keep the direct promise (got: $(printf '%s' "$_hk" | head -1)) — that publish follows a proven launch, so 'a reviewer is dispatched' is a fact there" ;;
+esac
+case "$_hk" in
+  *'If its current head is reviewable'*) bad "the head-keyed 'awaiting-review' must not carry the headless conditional text — the two publishes state different, measured facts" ;;
+esac
+# …and the text must be chosen by the presence of a head, not always one branch.
+grep -qF 'if [ -n "$head" ]; then' <<<"$(grep -A12 -F 'awaiting-review)' "$SUT" || true)" \
+  || bad "publish_review_state must SPLIT the 'awaiting-review' text on the head ('if [ -n \"\$head\" ]; then') — one text for both publishes is either a promise the cap path cannot keep or a hedge where a fact exists"
+
+# ⛔ AND THE DEAD SECOND ARM MUST STAY DELETED (review round 11, P3): the attempt scan always prints
+# "<digits> <digits>", so a `*[!0-9 ]*` case could never fire — an arm advertising a failure mode the code
+# cannot produce, with a message naming a count that never exists.
+grep -qE '^[[:space:]]*\*\[!0-9\\ \]\*\)' "$SUT" \
+  && bad "review_attempts must not keep the unreachable '*[!0-9 ]*' arm — the scan above always prints two decimal fields, so that branch is dead code claiming a failure it cannot detect"
+
 PATH=$_oldpath
 rm -rf "$_ghdir" "$_rdir"
 

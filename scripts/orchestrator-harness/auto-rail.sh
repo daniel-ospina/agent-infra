@@ -783,11 +783,9 @@ review_attempts() {  # $1 = the head-keyed attempt ledger; prints the in-window 
   case "${n:-}" in
     '') printf '0\n'; return 0;;
   esac
-  case "$n" in
-    *[!0-9\ ]*)
-      log_line "$f REVIEW-LEDGER-UNPARSEABLE ('$n'): treating this head as EXHAUSTED (fail-closed)"
-      printf '%s\n' "${REVIEW_MAX_ATTEMPTS:-3}"; return 0;;
-  esac
+  # ⛔ ONE ARM, NOT TWO (review round 11, P3, measured): the scan above always prints "<digits> <digits>",
+  # so a `*[!0-9 ]*` case could never fire — it advertised a failure mode the code cannot produce, and its
+  # message named a count that never exists. The pair's second field is the whole test.
   case "${n#* }" in
     1)
       log_line "$f REVIEW-LEDGER-UNPARSEABLE (a line is not an epoch; count would be ${n%% *}): treating this head as EXHAUSTED (fail-closed — a corrupted counter must never forgive a paid dispatch)"
@@ -992,7 +990,21 @@ publish_review_state() {  # $1 repo, $2 pr, $3 state, $4 head (optional); rc 0 =
   fi
   case "$state" in
     awaiting-review)
-      text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot and the environment allows it. **It is not waiting on a lane.**";;
+      # ⛔ THE CAP-DEFERRAL PUBLISH IS HEADLESS, SO IT MAY NOT PROMISE A DISPATCH (review round 11, P2,
+      # measured). It runs BEFORE the head is read, and `review_candidate_arm` maps a head whose review
+      # found blocking issues to `skip` — an rc=7 review records nothing, so the body-visible `rejected`
+      # guard cannot see it. The old text ("a reviewer is dispatched as soon as this repo has a free
+      # slot") was therefore false for that head, and self-perpetuating: `review-found-issues:<head>` is
+      # already on the PR, so nothing newer is ever posted and the promise is the newest auto-rail
+      # comment until the head changes. The text now states only what was measured — no head-bound
+      # attestation — and names both what happens to a reviewable head and what happens to one that was
+      # already reviewed and rejected. The HEAD-KEYED call keeps the direct promise, because that publish
+      # follows a proven launch.
+      if [ -n "$head" ]; then
+        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. auto-rail owns it: a reviewer is dispatched as soon as this repo has a free slot and the environment allows it. **It is not waiting on a lane.**"
+      else
+        text="🔎 **auto-rail: review needed.** This PR is a merge candidate and carries no head-bound review attestation. If its current head is reviewable, auto-rail dispatches a reviewer for it as soon as this repo has a free slot — and if the review at that head has ALREADY run and found blocking issues, that verdict is in the reviewer's own comment and the fix is a new head, not another review. **It is not waiting on a lane.**"
+      fi;;
     review-in-flight)
       text="🔎 **auto-rail: review in flight** at \`${head:0:12}\`. No head-bound attestation existed, so a fresh-context reviewer was dispatched (\`review-pr.sh\`, KIND=reviewer) at $(date -u +%FT%TZ), and its launch was VERIFIED to have started before this comment was posted. auto-rail records nothing itself — any verdict and its attestation come from that reviewer. **It is not waiting on a lane.**";;
     review-found-issues)
@@ -1387,6 +1399,12 @@ PY
         # further down), so this is a no-op on every pass after the first. A RED head is left out: it
         # cannot be landed by an attestation, its owner is the red arm, and its state is already
         # visible as a red check.
+        # ⛔ AND THE PUBLISHED TEXT NO LONGER PROMISES A DISPATCH (review round 11, P2): the headless
+        # `awaiting-review` runs before the head is read, and an rc=7 review records nothing — so a head
+        # whose review found blocking issues is skipped by `review_candidate_arm` while the body-visible
+        # `rejected` guard stays blind to it. The `!= rejected` exclusion below still removes the one class
+        # it CAN see; the text carries the rest by stating only what was measured. See the message split in
+        # `publish_review_state`.
         # ⛔ AND A `rejected` HEAD IS EXCLUDED, BECAUSE THE CLAIM WOULD BE FALSE (P2, review round 7): the
         # text below promises "a reviewer is dispatched as soon as this repo has a free slot", but
         # `review_candidate_arm` maps `*:rejected` to `skip` \u2014 a head whose record says `not-clean` is
