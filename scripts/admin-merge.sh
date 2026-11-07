@@ -87,8 +87,19 @@
 # does not say so answers "NO BASE COUNTERPART FOR THIS CHECK" about a red that is
 # the base's own, and that false absence is what reads as "unattributable".
 #
-#   script-validate        (on the BASE — .github/workflows/ci-main.yml)
-#     ⊇ bash-suites (<n>)  (on the PR   — .github/workflows/ci.yml)
+#   script-validate (<n>)  (on the BASE — ci-main.yml, ONE CHECK PER SLICE — the primary)
+#     ≡ bash-suites (<n>)  (on the PR   — .github/workflows/ci.yml, the SAME shard set)
+#
+#   script-validate        (the PRE-MATRIX base's single whole-list check — the FALLBACK)
+#     ⊇ bash-suites (<n>)
+#
+# ⛔ THE ORDER IS PART OF THE STATEMENT. `declared_base_equivalent` prints the slice pair FIRST
+# and the bare name second, and a reader takes the FIRST candidate the base actually publishes:
+# main is a matrix too now (agent-infra#2483, same width, same derived list, same
+# `BASH_SHARD_SLICE` seam), so slice-to-slice is an equivalence of the same shards, while the
+# bare name is only what an older base sha still calls the whole list. Stating the pair as
+# `⊇ script-validate` ALONE — as this block did until #3392's review — describes the fallback
+# and hides the arm the code prefers.
 #
 # WHY IT IS TRUE — the repo says it about itself. ⚠️ EVERY ci.yml COORDINATE BELOW IS
 # ANCHORED BY ITS QUOTED TEXT, and the quotes are the authority: ci.yml is a busy file
@@ -170,9 +181,14 @@
 #
 # ── A CHECK MAIN ITSELF FAILS IS NOT THIS PR'S SURFACE (#3322) ────────────
 # THE DEFECT. This repo splits its suites by trigger: `ci.yml` is `pull_request`-only
-# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep
-# UNSHARDED, as `script-validate` (cited in ci-main.yml's own comment). Main is red on
-# `script-validate`; every PR is red on the shards. The probe below correctly calls
+# and runs `bash-suites (1..n)`; `ci-main.yml` is `push`-only and runs the SAME sweep under
+# the other lane's name (cited in ci-main.yml's own comment). ⛔ THE NAME MAIN PUBLISHES IS NOT
+# A CONSTANT, AND THAT IS THE TRAP: at the measurement below (2026-11-05) main's
+# `script-validate` was ONE unsharded check, so main was red on `script-validate` while every
+# PR was red on the shards; since agent-infra#2483 main is an 8-way matrix too, so the SAME
+# defect now arrives as `script-validate (1)` … `script-validate (8)`. BOTH shapes must be
+# matched — which is why `declared_base_equivalent` answers slice-first with the bare name as
+# the pre-matrix fallback, and why every reader tries both candidates. The probe below correctly calls
 # main's red NOT-PR-EVALUABLE (#6807) and reports it without blocking — and that left
 # it in NO set the rail could use. §4.5 then read the PR's own tree, saw the shards
 # red, and refused with "a red still here means the repair is incomplete" for a red no
@@ -186,9 +202,10 @@
 #       base ref, not taken from a caller flag — carries a RED whose workflow declares
 #       no `pull_request`/`pull_request_target` trigger (the #6807 class: no PR can
 #       ever attach a check to a head sha for it); and
-#   (ii) that base red's NAME is this tree check's name, or the name
-#       `declared_base_equivalent` declares for it (the one cited pair,
-#       `bash-suites (<n>)` == `script-validate`).
+#   (ii) that base red's NAME is this tree check's name, or one of the names
+#       `declared_base_equivalent` declares for it (the one cited pair: the SLICE
+#       `script-validate (<n>)` first, since main is a matrix too, with the bare
+#       `script-validate` as the pre-matrix fallback).
 # So the evidence is MAIN'S OWN MEASURED SURFACE, and the exclusion fires only where
 # main is red on that suite at read time. Every fail-closed path holds:
 #   * an UNREADABLE or PARTIAL base read excuses NOTHING, but not because the set is empty:
@@ -230,12 +247,19 @@
 #     family, where a base-side reproduction — never a name match — is the only evidence that
 #     could exist.
 # That is a refusal with a reason, never a silent pass.
-# ⛔ THE SECOND RESIDUAL, NAMED: THE EXCLUSION IS LANE-GRANULAR, NOT SHARD-GRANULAR.
-# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base
-# check `script-validate`, so while main is red on it, EVERY shard is excluded — including
-# a shard failure THIS PR introduced, whose cause is on no base. Per-shard attribution is
-# not available from base-side evidence (main publishes the sweep as ONE job-level red),
-# and inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
+# ⛔ THE SECOND RESIDUAL, NAMED: WHERE THE BASE IS STILL UNSHARDED THE EXCLUSION IS
+# LANE-GRANULAR, NOT SHARD-GRANULAR — AND THAT IS NOW THE FALLBACK CASE ONLY.
+# `declared_base_equivalent` answers slice-to-slice FIRST (`bash-suites (<n>)` →
+# `script-validate (<n>)`), and since main is a matrix too (agent-infra#2483) a current base
+# publishes one check per slice — so against a CURRENT base the exclusion is SHARD-GRANULAR:
+# a base red on `script-validate (5)` excludes `bash-suites (5)` and leaves the other shards
+# blocking. The lane-granular reading survives only on a PRE-MATRIX base sha, where the bare
+# `script-validate` fallback matches EVERY `bash-suites (<n>)` — so while such a base is red on
+# its one whole-list check, EVERY shard is excluded, including a shard failure THIS PR
+# introduced whose cause is on no base. (That was the shape at #3322's measurement, 2026-11-05,
+# when main published the sweep as a single whole-list check.) ⛔ EVEN THERE it is not a
+# per-shard attribution: a base-side red under ONE name cannot say WHICH shard is at fault, so
+# inventing a second shard-keyed map is the drift the one-derivation rule forbids. So
 # the guard for an ATTRIBUTABLE failure is deliberately NOT this rule and is untouched by
 # it: `named_unattributable_runs` (step 1c) still names it, and #3415's `bash-shard::`
 # reproduction still runs the residual on a pristine base worktree and refuses anything

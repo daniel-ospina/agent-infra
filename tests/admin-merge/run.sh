@@ -16622,8 +16622,11 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 
 # ── 80. #3322: A CHECK MAIN ITSELF FAILS IS EXCLUDED FROM THE REQUIRED SURFACE ─
 # THE DEFECT. `ci.yml` is pull_request-only (it runs `bash-suites (1..n)`); `ci-main.yml`
-# is push-only and runs the SAME sweep UNSHARDED as `script-validate`. Main is red on
-# `script-validate`, so every PR is red on the shards — and the rail refused every merge
+# is push-only and runs the SAME sweep under the other lane's name — `script-validate`, which
+# was ONE unsharded check when this was measured and is one check per slice since
+# agent-infra#2483 (`script-validate (1..8)`). Both shapes are covered below: §79b `(m2)` uses
+# a SLICE-only base, §80 `(a)` a bare-only one. At measurement main was red on the bare
+# `script-validate`, so every PR was red on the shards — and the rail refused every merge
 # for a red NO diff can clear. Measured 2026-11-05: three unrelated PRs (#3478, #3168,
 # #3486) were red on the identical nine checks, and #3478 had zero unique reds.
 #
@@ -16637,8 +16640,9 @@ grep -qE 'of the (3600|3599|3598)s bound' "$TMP/err" \
 # arm must go RED when the exclusion is deleted.
 echo "== 80. #3322: a check MAIN ITSELF FAILS is excluded from the required surface =="
 
-# (a) THE FIX — the observed block. main fails `script-validate` (push-only ci-main.yml,
-# the sharded PR lane's unsharded twin); the PR's tree is red on `bash-suites (3)`.
+# (a) THE FIX — the observed block. main fails `script-validate` (the PRE-MATRIX shape of
+# push-only ci-main.yml: one whole-list check, the sharded PR lane's unsharded twin — the
+# slice-form base is §79b (m2)); the PR's tree is red on `bash-suites (3)`.
 new_scen baseowned-excluded
 HEAD_BO1="b0b0000000000000000000000000000000000000"
 printf '%s\n' "$HEAD_BO1" > "$SCEN/head"
@@ -17453,6 +17457,84 @@ else
     fail "(q) $JQ_BAD rail --jq program(s) do not compile — gh fails EVERY read that uses one"
   fi
 fi
+
+# ── 81. THE HEADER'S STATEMENT OF THE LANE EQUIVALENCE MUST MATCH THE CODE ───────────────────
+# (#3392 review 4) `declared_base_equivalent` answers TWO candidates, slice FIRST, because main is
+# a matrix too (agent-infra#2483) — and three blocks of this header went on describing the
+# pre-change shape in the very commit that changed the code: "the single UNSHARDED base check",
+# "ONE job-level red", and a diagram carrying only the bare containment. That is the class the
+# file itself forbids ~90 lines above ("a citation that rots in the very commit that moves the
+# lines reads to the next lane as proof the claim is false"), and it recurred in FOUR places in
+# the one PR that moved the shape (this file's §80 preamble carried two more copies, corrected
+# with it) — so it is PINNED rather than left to the next reader's judgement. Nothing about
+# behaviour is asserted here: only that the header's statement of the mapping is the one the code
+# implements, which is what the (m2)/(n2) arms assume when they read that header as authority.
+echo "== 81. the header states the TWO-candidate mapping the code implements (#3392) =="
+AMSH="$ROOT/scripts/admin-merge.sh"
+
+# hdr_region <file> <start-anchor> <end-anchor> — the block a claim lives in, located by CONTENT and
+# never by line number: this header is edited by nearly every rail change, which is exactly why its
+# citations rot.
+hdr_region() {
+  awk -v s="${2:-}" -v e="${3:-}" '
+    index($0, s) { inb = 1 }
+    inb && !index($0, s) && index($0, e) { exit }
+    inb { print }
+  ' "$1" 2>/dev/null
+}
+
+# hdr_stale <file> — print ONE LINE PER CLAIM the header must not make about the current shape, and
+# NOTHING when the header is accurate. ⛔ SHARED by the shipped file and the mutant below, so the
+# mutant measures THIS predicate instead of a re-implementation of it (the (n2)/(e) discipline).
+hdr_stale() {
+  local f="${1:-}" diag fails
+  diag="$(hdr_region "$f" '── THE ONE DECLARED LANE EQUIVALENCE' '── A CHECK MAIN ITSELF FAILS')"
+  fails="$(hdr_region "$f" '── A CHECK MAIN ITSELF FAILS' '⛔ WHAT THE SUITE DOES AND DOES NOT PROVE')"
+  # ⛔ A SHRUNKEN REGION IS NOT A CLEAN ONE. If an anchor rots, both extractions come back empty and
+  # every "must be absent" probe below would pass for the wrong reason — the empty-scan vacuity (q)
+  # guards against in its own scan. The floors are MEASURED at this head (98 / 88 lines).
+  [ "$(printf '%s\n' "$diag" | wc -l)" -ge 60 ] || printf '%s\n' 'ANCHOR: the diagram block extracted short/empty'
+  [ "$(printf '%s\n' "$fails" | wc -l)" -ge 55 ] || printf '%s\n' 'ANCHOR: the #3322 block extracted short/empty'
+  # THE DIAGRAM must show the pair the code PREFERS, not only the fallback it still prints.
+  printf '%s\n' "$diag" | grep -qF -- 'script-validate (<n>)  (on the BASE' \
+    || printf '%s\n' 'diagram: the BASE side does not name a SLICE check'
+  printf '%s\n' "$diag" | grep -qF -- '≡ bash-suites (<n>)  (on the PR' \
+    || printf '%s\n' 'diagram: the slice EQUIVALENCE (≡) is not shown'
+  # …and the #3322 block must not restate the pre-change shape as the current one.
+  printf '%s\n' "$fails" | grep -qF -- 'to the single UNSHARDED base' \
+    && printf '%s\n' '#3322: still says the mapping is "to the single UNSHARDED base"'
+  printf '%s\n' "$fails" | grep -qF -- 'ONE job-level red' \
+    && printf '%s\n' '#3322: still says a base publishes the sweep as "ONE job-level red"'
+  printf '%s\n' "$fails" | grep -qF -- 'script-validate (<n>)' \
+    || printf '%s\n' '#3322: never names the slice-form counterpart the code answers FIRST'
+  printf '%s\n' "$fails" | grep -qF -- 'PRE-MATRIX' \
+    || printf '%s\n' '#3322: the lane-granular residual is not scoped to a pre-matrix base'
+}
+
+STALE_HDR="$(hdr_stale "$AMSH")"
+if [ -z "$STALE_HDR" ]; then
+  pass "(81) the header states the slice-first TWO-candidate mapping the code implements (0 stale claims)"
+else
+  fail "(81) the header falsifies the mapping the code implements: $(printf '%s' "$STALE_HDR" | tr '\n' '; ')"
+fi
+
+# ── (81m) MUTATION: THE PIN MUST SEE THE HEADER IT EXISTS TO CATCH. The mutant is the shipped
+# header with the pre-change statements PUT BACK — the two the old residual made, and the old
+# diagram line removed — so a pin that cannot redden on THAT cannot redden on a regression either.
+MUT_HDR="$TMP/mut-header.sh"
+awk '
+  { print }
+  /── A CHECK MAIN ITSELF FAILS IS NOT THIS PR.S SURFACE/ {
+    print "# `declared_base_equivalent` maps EVERY `bash-suites (<n>)` to the single UNSHARDED base"
+    print "# check `script-validate`, and main publishes the sweep as ONE job-level red."
+  }
+' "$AMSH" | grep -vF -e '≡ bash-suites (<n>)' > "$MUT_HDR"
+MUT_STALE="$(hdr_stale "$MUT_HDR")"
+N_STALE="$(printf '%s\n' "$MUT_STALE" | grep -c . || true)"
+case "$N_STALE" in '' | *[!0-9]*) N_STALE=0 ;; esac
+[ "$N_STALE" -ge 3 ] \
+  && pass "(81m) …and the pin REDDENS on the pre-change header: $N_STALE stale claim(s) seen in the mutant" \
+  || fail "(81m) the pin cannot see the pre-change header ($N_STALE stale claims seen) — it would pass over the regression it exists to catch"
 
 if [ "$failures" -gt 0 ]; then
   echo "❌ $failures of $checks admin-merge test(s) failed"
