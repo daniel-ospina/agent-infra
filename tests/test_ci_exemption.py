@@ -1256,6 +1256,42 @@ def test_the_COMPOSED_path_from_text_to_decide_refuses_a_spacey_id():
     assert [v.nodeid for v in decision.unattributable] == [moved], decision.report()
 
 
+def test_an_EMPTY_rotating_map_cannot_SUPPRESS_the_E5_map_derived_from_rotation():
+    """⛔ "NO MAP" IS NOT "NO EVIDENCE" (#3686 review cycle 9, P2).
+
+    The cycle-7 fix made the FORM un-droppable, but `if rotating is None` still let a
+    caller pass `rotating={}` alongside `rotation=runs` and DROP the E5 map derived from
+    the very evidence it was handed — which exempts a TAB-form id that
+    `detect_rotating_identity` reports as having MOVED, the one class the rail states
+    may never merge. A falsy map is therefore treated as absent and RE-DERIVED; a
+    non-empty map is still honoured, which can only narrow.
+
+    MUTATION: `if not rotating:` → `if rotating is None:` → this id is EXEMPTED and the
+    first assertion reddens.
+    """
+    moved_a = "tests/test_x.py::TestK::test_a[argv7-at the EDGE]"
+    moved_b = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    stable = "tests/other.py::test_y"
+    sig = "sg-3686-suppressed"
+    runs = parse_rotation_runs(f"{stable}\t{moved_a}\n{stable}\t{moved_b}\n")
+    assert detect_rotating_identity(runs), "the fixture must report a MOVING identity"
+
+    main = parse_rates(f"{moved_b}\t3\t26\n")
+    pr = parse_failure_rows(f"{moved_b}\t3\t26\t{sig}\n").failures
+    decision = decide(
+        pr, main.rates,
+        main_signatures={moved_b: frozenset({sig})},
+        rotating={},          # ⛔ the suppression attempt
+        rotation=runs,
+        k_pr=26,
+    )
+    assert [v.nodeid for v in decision.exempt] == [], (
+        "an EMPTY `rotating=` map suppressed the E5 map derived from `rotation=`, so "
+        f"a MOVING identity was EXEMPTED:\n{decision.report()}"
+    )
+    assert [v.nodeid for v in decision.unattributable] == [moved_b], decision.report()
+
+
 def test_the_ROTATION_reader_still_accepts_the_PRE_3686_space_joined_form():
     """The tab-free PARSE must keep working — the FORM is now reported too.
 

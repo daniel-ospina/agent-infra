@@ -885,8 +885,15 @@ def decide(
     # cycle-6 fail-open. Accepting the parsed `RotationRuns` makes the form
     # un-droppable at the boundary: the object that knows the form is the object that
     # supplies it. The explicit flags stay for callers that already have the pieces.
+    # ⛔ AND AN EMPTY `rotating=` MUST NOT SUPPRESS THE DERIVATION (review cycle 9, P2):
+    # `if rotating is None` let `decide(..., rotation=runs, rotating={})` DROP the E5 map
+    # derived from the very evidence it was handed, which exempts a tab-form id that
+    # `detect_rotating_identity` reports as having MOVED — the same fail-open one
+    # argument over. "No map" and "no evidence" are not the same claim, so a falsy map
+    # is treated as absent and re-derived. Supplying a NON-empty map is still honoured
+    # (a caller that already computed one keeps it), which can only narrow.
     if rotation is not None:
-        if rotating is None:
+        if not rotating:
             rotating = detect_rotating_identity(rotation)
         rotation_legacy = rotation_legacy or rotation.has_legacy_lines
 
