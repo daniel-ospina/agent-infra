@@ -3003,9 +3003,12 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # carry-over from earlier runs in that window and were not failing on this run.
 # `blocked=6` is the same run's own count of what was actually red. Earlier
 # revisions of this note said "the same ten tests fail on origin/main itself"
-# and cited a `10 failed, 955 passed` worktree run: the second number cannot be
-# this file (521 tests), so the citation was a whole-suite total misread as a
-# per-file one. Deleted rather than reworded.
+# and cited a `10 failed, 955 passed` worktree run. That citation is deleted
+# rather than reworded: `955 passed` is a WHOLE-SUITE total, not this test
+# module's count, so quoting it as a per-file measurement was wrong on its face.
+# No per-file test count is stated here, because every number written into this
+# block is a claim the next reader is entitled to check — and a bare count
+# invites the local module's own count to be read as the tortoise file's.
 #
 # ⛔ NOT the trunk repair. The sentence here used to read that this "deadlocks the
 # very PR that repairs the trunk (tortoise#11262 / tortoise#11255 is the same
@@ -3018,13 +3021,16 @@ def test_6798_the_row_door_admits_the_non_nodeid_families():
 # the claim — this defect blocks PRs that never touch those files, while #11262 is
 # not blocked by it.
 #
-# ⛔ This note deliberately does NOT say WHICH change landed the corpus guards:
-# #3686's table credits #11262 with "all 3 guards", while #11262's own diff is three
-# files (`tests/test_ci_selection.py`, `tests/test_entry_point_python_guard.py`,
-# `tools/ci_selection.py`) and touches no corpus file, and #11292 is already on
-# main. The two records disagree, so neither claim is restated here — nothing above
-# depends on the answer, and an unverified provenance sentence is exactly the
-# defect this block exists to prevent.
+# ⛔ This note deliberately does NOT say WHICH change landed the corpus guards.
+# #3686's table credits #11262 with "all 3 guards"; I could not reconcile that
+# with #11262's own diff, so no provenance claim is made here. (An earlier
+# revision of this note tried to, and got it wrong in a way worth recording:
+# it enumerated #11262's files and then said it "touches no corpus file" — but
+# `tools/ci_selection.py` IS a corpus file, because tortoise's
+# `CORPUS_DIRS = ("tools", "graph-scripts")`. The enumeration was also already
+# stale — #11262 had moved.) Nothing above depends on the answer, and an
+# unverified provenance sentence is exactly the defect this block exists to
+# prevent — so it is dropped, not restated.
 
 _PATH_PARAM_IDS = (
     "tests/test_entry_point_python_guard.py"
