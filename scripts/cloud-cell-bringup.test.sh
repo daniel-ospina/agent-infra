@@ -104,6 +104,10 @@ T="$(mktemp -d "${TMPDIR:-/tmp}/cloud-cell-1718.XXXXXX")"
 # stopped on the way out — a detached loop outlives the suite otherwise and keeps ticking at a
 # deleted directory.
 export TEMPLATES_DIR="$T/schedule-templates"
+# ⛔ ONE LOOP PER BOX (#2890), pinned into the fixture: without this the scheduled layer this suite
+# brings up would contend with the HOST's own production scheduler (the cell lock is deliberately not
+# scoped to the state dir), so the suite would either fail or silently exercise nothing.
+export FLEET_SCHEDULE_LOCK_ROOT="$T/box-lock"
 mkdir -p "$TEMPLATES_DIR"
 printf '# fixture: nothing retired\n' > "$TEMPLATES_DIR/RETIRED"
 cat > "$TEMPLATES_DIR/com.test.bringup-schedule.plist" <<PLIST

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """tools/fleet/claim_lanes.test.py — the #1777 ref-claim reader acceptance suite.
 
-Thirty-six tests with forty-seven paired mutations: every mutation re-introduces
+Thirty-six tests with forty-eight paired mutations: every mutation re-introduces
 the defect its test exists to catch, so "the test fails without the fix" is an
 EXECUTED claim rather than an asserted one (the standard this repo's
 ``liveness.test.py`` set).
@@ -772,7 +772,8 @@ def l31_owner_no_unicode_trim():
 @test("L30 the committer stamp is accepted exactly as the shell accepts it (no trailing ws, 12-digit cap)")
 def l30_committer_acceptance():
     # ⛔ ONE DATUM, ONE ANSWER — in the field the bounded reap is MEASURED FROM (review round 18,
-    # agent-infra#3203). `claims.sh`'s `_claim_commit_time` takes the stamp with
+    # agent-infra#3203). `claims.sh`'s `_claim_commit_time` takes the LAST `committer `-prefixed header
+    # line (`sed -n '/^committer /p' | tail -n 1`, round 24), parses THAT line with
     # `sed -n 's/^committer .* \([0123456789]\{1,\}\) [+-][0123456789]\{4\}$/\1/p'` — NOTHING may
     # follow the tz digits — and then rejects a stamp longer than 12 digits as UNMEASURABLE
     # (`case … |?????????????*`), which is what keeps `now - ct` out of a wrapped negative. This
@@ -807,21 +808,39 @@ def l30_committer_acceptance():
           "a `committer`-shaped line in the BODY is not a header; got %r"
           % (cl._commit_time(obj(ok, "committer a <a@b> 9999999999 +0000")),))
     # ⛔ AND A LAST HEADER THAT IS PRESENT BUT UNUSABLE DOES NOT FALL BACK (review round 20,
-    # agent-infra#3203). `_claim_commit_time` reads `tail -n 1` of the matching lines and then rejects the
-    # OBJECT — it never considers an earlier `committer` line. A bounded `{1,12}` quantifier made
-    # `findall` skip the unusable line and return the FIRST one's stamp (measured: shell unmeasurable,
-    # this reader 1700000000).
-    # ⛔ TWO SHAPES THE ORACLE *DOES* MEASURE (review round 21): its `sed` matches per line with an
-    # UNBOUNDED run, so a LAST line whose SHAPE does not match (trailing space, 3-digit tz) is SKIPPED and
-    # an earlier valid line wins; and with NO blank line the `sed -n '/^$/q;p'` prints the WHOLE object.
-    # Round 20 refused both (8 of 64 combinations, all conservative). These pin the measured ones.
+    # agent-infra#3203). `_claim_commit_time` takes the LAST `committer `-prefixed header line and
+    # judges THAT line — it never considers an earlier `committer` line. A bounded `{1,12}` quantifier
+    # made `findall` skip the unusable line and return the FIRST one's stamp (measured: shell
+    # unmeasurable, this reader 1700000000).
+    # ⛔ AND NEITHER DOES A LAST LINE WHOSE *SHAPE* DOES NOT MATCH (review round 24). Rounds 20–21
+    # disagreed about the oracle here because the oracle's parse was ONE `sed` piped to `tail -n 1`
+    # ("the last line that MATCHES", so a shape-broken last line was SKIPPED and an earlier valid one
+    # won). Round 24 SPLIT that parse — `sed -n '/^committer /p' | tail -n 1 | sed -n 's/…$/\1/p'`, so
+    # that a newest header carrying a trailing token can no longer forge the age from an OLDER line —
+    # and in doing so it made a shape-broken LAST line UNMEASURABLE rather than skippable. Measured on
+    # the shipped pair: a last line with a trailing space or a 3-digit tz answers UNMEASURABLE from the
+    # oracle (rc 1 — the claim is KEPT and NAMED) and `1700000000` from this reader, and on the
+    # forged-age shape the oracle keeps the claim while this reader reports ~1.79e9 s of age. These
+    # two assertions used to pin the OLD rule under a comment that became FALSE about the oracle; the
+    # rule moved, so the pins move with it.
     shape_bad_last = "committer a <a@b> 1700000000 +0000\ncommitter a <a@b> 1700000001 +0000 "
-    check(cl._commit_time(obj(shape_bad_last)) == 1700000000,
-          "a shape-broken LAST line is SKIPPED, so the earlier valid stamp wins; got %r"
+    check(cl._commit_time(obj(shape_bad_last)) is None,
+          "a shape-broken LAST line is NOT skipped: the oracle judges that line and answers "
+          "unmeasurable, never the earlier valid stamp; got %r"
           % (cl._commit_time(obj(shape_bad_last)),))
     tz_short = "committer a <a@b> 1700000000 +0000\ncommitter a <a@b> 1700000001 +000"
-    check(cl._commit_time(obj(tz_short)) == 1700000000,
-          "a 3-digit tz is a shape mismatch too; got %r" % (cl._commit_time(obj(tz_short)),))
+    check(cl._commit_time(obj(tz_short)) is None,
+          "a 3-digit tz on the LAST line is unmeasurable too, not the earlier stamp; got %r"
+          % (cl._commit_time(obj(tz_short)),))
+    # ⛔ AND THE FORGED-AGE SHAPE THIS CHANGE EXISTS TO CLOSE (review round 24). A newest `committer`
+    # header with any trailing token made the OLD one-stage parse fall through to an EARLIER line —
+    # here `1793991810` — which is the "a claim zero seconds old deleted" measurement. Both layers must
+    # now refuse to measure it, so the assert is on BOTH: this reader `None`, and the oracle `rc 1`
+    # (`scripts/orchestrator-harness/test-claims.sh` A76–A78).
+    forged = "committer a <a@b> 1793991810 +0000\ncommitter a <a@b> 1700000000 +0000 junk"
+    check(cl._commit_time(obj(forged)) is None,
+          "a trailing token on the NEWEST committer header must not fall back to an older stamp "
+          "(that is the forged-age steal); got %r" % (cl._commit_time(obj(forged)),))
     no_blank = "tree " + "0" * 39 + "\ncommitter a <a@b> 1700000000 +0000\n"
     check(cl._commit_time(no_blank) == 1700000000,
           "with NO blank line the shell prints the whole object, so the stamp is still found; got %r"
@@ -1881,14 +1900,36 @@ MUTATIONS = [
     ),
     Mutation(
         "L30", "reader",
-        '    m = _COMMITTER_TIME_RE.findall(head)',
-        '    m = _COMMITTER_TIME_RE.findall(text)',
+        '    lines = [_l for _l in head.split("\\n") if _l.startswith("committer ")]',
+        '    lines = [_l for _l in text.split("\\n") if _l.startswith("committer ")]',
         "the reader scans the WHOLE object, so a `committer`-shaped line in the peer-writable "
         "MESSAGE supplies the age \u2014 the oracle's `sed -n '/^$/q;p'` never looks there",
     ),
+    # ⛔ THE RULE ITSELF, AS A MUTATION (review round 24). Rounds 20–21 pinned the OLD oracle rule (the
+    # last line that MATCHES) and this suite was green; round 24 split the shell's parse into
+    # SELECT-then-PARSE, so that rule is now the DEFECT: a newest `committer` header carrying any
+    # trailing token falls through to an EARLIER line and forges a fresh claim's age. Restoring the
+    # one-stage `findall` must turn L30 RED on `shape_bad_last` / `tz_short` / `forged`.
     Mutation(
         "L30", "reader",
-        '    if m[-1].startswith("0") and len(m[-1]) > 1:\n'
+        '    lines = [_l for _l in head.split("\\n") if _l.startswith("committer ")]\n'
+        '    if not lines:\n'
+        '        return None\n'
+        '    m = _COMMITTER_TIME_RE.match(lines[-1])\n'
+        '    if not m:\n'
+        '        return None\n'
+        '    stamp = m.group(1)',
+        '    _ms = _COMMITTER_TIME_RE.findall(head)\n'
+        '    if not _ms:\n'
+        '        return None\n'
+        '    stamp = _ms[-1]',
+        "the parse is ONE anchored pass over every matching line again (the pre-round-24 oracle rule), "
+        "so a shape-broken LAST `committer` header is SKIPPED and an EARLIER line supplies the age \u2014 "
+        "the forged-age steal the oracle now refuses",
+    ),
+    Mutation(
+        "L30", "reader",
+        '    if stamp.startswith("0") and len(stamp) > 1:\n'
         '        return None',
         '    if False:\n'
         '        return None',

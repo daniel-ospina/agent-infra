@@ -40,7 +40,12 @@ if [ -z "$LAST_LINE" ]; then
 fi
 
 # mtime of the log = last write (works for both stdout and stderr writes).
-MTIME="$(stat -f %m "$LOG" 2>/dev/null || stat -c %Y "$LOG" 2>/dev/null || echo 0)"
+# ⛔ `date -r` FIRST, NEVER `stat -f %m` FIRST (agent-infra#3434): `stat -f %m` is BSD-only, and on GNU
+# coreutils `-f` is `--file-system`, so it prints the filesystem block to STDOUT and exits 1 — the `||`
+# chain then appends the real epoch to that garbage, and `AGE=$(( NOW - MTIME ))` below reads the
+# first word of that block as a VARIABLE NAME — which `set -u` refuses (`File: unbound variable`),
+# so this monitor exits 1, i.e. publishes the "worker STALE" verdict about a live worker.
+MTIME="$(date -r "$LOG" +%s 2>/dev/null || echo 0)"
 AGE=$(( NOW - MTIME ))
 
 echo "── $LOG ──"

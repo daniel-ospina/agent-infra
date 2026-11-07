@@ -122,6 +122,33 @@ MAX_RED_FIX="${MAX_RED_FIX:-4}"
 MAX_RED_FIX_TRIES="${MAX_RED_FIX_TRIES:-2}"
 MIN_SWAP_FREE="${MIN_SWAP_FREE:-600}"
 MIN_MEM_FREE_MB="${MIN_MEM_FREE_MB:-512}"
+# ── the SPAWN gate's memory floor (agent-infra#2387) ─────────────────────────────────────────────
+# These three reach `spawn-gate.sh` through the daemon's environment, so they MUST be rendered: the
+# gate names `MEM_MIN_AVAIL_MB` as the remedy in its own refusal line and the README documents it as
+# the operator lever, and neither is reachable on a plist-managed cell if this installer drops it (a
+# variable that exists only in prose is one nobody can set on the box that needs it). The floor is
+# derived from the two factors — a measured pi lane (1024 MB) times the number of lanes a spawn must
+# leave room for (2, REASON: the second is the peer that peaks alongside it) — so an operator can
+# move either factor and keep the arithmetic auditable, which is what the gate's own line promises.
+MEM_LANE_RESERVE_MB="${MEM_LANE_RESERVE_MB:-1024}"
+MEM_SPAWN_RESERVE_LANES="${MEM_SPAWN_RESERVE_LANES:-2}"
+# ⛔ `10#` ON THE DERIVATION, NOT JUST IN THE GATE (review P3). A bare `$(( ))` parses base 0, so
+# `MEM_LANE_RESERVE_MB=08` aborted the installer HERE ("value too great for base") before the loop's
+# leading-zero arm could name the real problem — the same shell rule this file documents further down
+# and `spawn-gate.sh` already respects. Fail-safe (nothing renders, exit is non-zero), but the operator
+# got a shell error instead of ours.
+# ⛔ AND `10#` FIXED ONLY THE LEADING-ZERO SHAPE (review, P2/P3 — measured). `MEM_LANE_RESERVE_MB=1024M`
+# still aborts at THIS line with bash's own `10#1024M: value too great for base` (exit 1, the validator
+# below never reached), so the operator gets a shell error and no variable name — the exact
+# false-statement the paragraph above claims to have removed. The arithmetic therefore runs ONLY on two
+# plain digit strings; an unusable factor leaves the floor at its shipped default and is then REFUSED BY
+# NAME by the validator loop below, which runs before anything is rendered.
+_mem_whole() { case "${1:-}" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+if _mem_whole "${MEM_LANE_RESERVE_MB:-}" && _mem_whole "${MEM_SPAWN_RESERVE_LANES:-}"; then
+  MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-$(( 10#${MEM_LANE_RESERVE_MB:-1024} * 10#${MEM_SPAWN_RESERVE_LANES:-2} ))}"
+else
+  MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-2048}"
+fi
 BATCH="${BATCH:-2}"
 # The product work floor (agent-infra#2054): how many slots of each batch are filled from
 # `candidates.product.txt` first. 0 disables it — a legitimate setting, so it must be settable through
@@ -793,6 +820,43 @@ if [ -f "$HERE/gh-rest/gh" ]; then
   else
     warn "gh-limit.py missing from the shipped set — gh calls will NOT be serialised or backed off (#1988)"
   fi
+  # ── the credential layer (#3429) ─────────────────────────────────────────────
+  # `gh-limit.py` resolves `gh-cred.py` as a SIBLING, so a box that gets the limit layer must get this
+  # too or every read falls back to the user bucket with the named arm `no-helper` — i.e. the fleet
+  # silently returns to the state #3429 measured (`core` at `0/5000` three times in one day). Same
+  # parse gate and same stage-then-rename as `gh-limit.py`, and for the same reason: it is executed by
+  # every gh call.
+  if [ -f "$HERE/gh-cred.py" ]; then
+    python3 -c 'import ast,sys; ast.parse(open(sys.argv[1]).read())' "$HERE/gh-cred.py" 2>/dev/null \
+      || die "gh-cred.py does not parse"
+    _tmpc="$O/.seed-gh-cred.py.$$"
+    cp "$HERE/gh-cred.py" "$_tmpc" || { rm -f "$_tmpc"; die "cannot stage gh-cred.py into $O"; }
+    chmod 0755 "$_tmpc"             || { rm -f "$_tmpc"; die "cannot chmod gh-cred.py"; }
+    mv -f "$_tmpc" "$O/gh-cred.py"   || { rm -f "$_tmpc"; die "cannot install $O/gh-cred.py"; }
+    # The operator's name for it. `gh-app-token --status` / `--refresh` is the surface the operator
+    # note tells them to reach for, so it is installed beside it. That note lives in
+    # docs/ops/gh-rate-limits.md ("Which credential", "Blast radius") — an operator following the
+    # one warning they get must not be sent to a separate page that does not exist (caught in review:
+    # this comment and the warning below both named one).
+    if [ -f "$HERE/gh-app-token" ]; then
+      _tmpa="$O/.seed-gh-app-token.$$"
+      cp "$HERE/gh-app-token" "$_tmpa" || { rm -f "$_tmpa"; die "cannot stage gh-app-token into $O"; }
+      chmod 0755 "$_tmpa"               || { rm -f "$_tmpa"; die "cannot chmod gh-app-token"; }
+      mv -f "$_tmpa" "$O/gh-app-token"   || { rm -f "$_tmpa"; die "cannot install $O/gh-app-token"; }
+    fi
+    # ⛔ THE PRIVATE KEY IS NOT PART OF THE SHIPPED SET, AND MUST NEVER BE. `deploy-harness.sh`
+    # copies every file under this source tree; the key lives at `~/.pi/agent/gh-app.pem`, outside
+    # every checkout, so no deploy can propagate it to a cell. That is the owner's "do not copy the
+    # private key per lane or per cell" constraint enforced by layout rather than by convention —
+    # see docs/ops/gh-rate-limits.md §Blast radius.
+    if [ -r "${HOME:-/nonexistent}/.pi/agent/gh-app.pem" ]; then
+      ok "gh credential layer installed (App key present — reads use the installation bucket)"
+    else
+      warn "gh credential layer installed but ~/.pi/agent/gh-app.pem is ABSENT — every read stays on the user bucket (arm=no-key). See docs/ops/gh-rate-limits.md §Which credential"
+    fi
+  else
+    warn "gh-cred.py missing from the shipped set — every gh read falls back to the user credential (arm=no-helper, #3429)"
+  fi
   # ⛔ Route the PATH entry through add_dir, NOT a bare assignment: add_dir applies the TCC guard
   # (a physical path under ~/Documents is EPERM for launchd) that no install-time probe can see.
   add_dir "$O/gh-rest"
@@ -1241,7 +1305,7 @@ esc() { sed_esc "$(xml_esc "$1")"; }
 # different ways: '4x' renders a plist that LIES about the ceiling and still exits 0 (only the loop's
 # own coercion saves the run), while '4&5' renders the literal `4__MAX_LANES__5` -- a syntactically
 # VALID plist (plutil -lint passes) whose value reads as non-numeric downstream.
-for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB BATCH PRODUCT_FLOOR CYC; do
+for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE_MIN FUNNEL_MAX_AGE_MIN MAX_FIX MAX_FIX_TRIES MAX_RED_FIX MAX_RED_FIX_TRIES MIN_SWAP_FREE MIN_MEM_FREE_MB MEM_MIN_AVAIL_MB MEM_LANE_RESERVE_MB MEM_SPAWN_RESERVE_LANES BATCH PRODUCT_FLOOR CYC; do
   _v="${!_n}"
   # ⛔ `MAX_REVIEW` IS NO LONGER ONLY CONCURRENCY — SAY SO AT THE RENDER (round 9 review, P2). Since
   # agent-infra#3441 this ONE knob is BOTH the concurrent-`review-<PR>` cap AND the per-PR cumulative
@@ -1275,7 +1339,15 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
     # (never blocking / always stale), which is never what an operator means.
     0) case "$_n" in MERGE_PRIORITY_MAX_AGE_MIN|FUNNEL_MAX_AGE_MIN)
          die "$_n='0' is not a usable window — the loop coerces it to the default, so the plist would lie about the bound" ;;
+         # ⛔ A ZEROED MEMORY FLOOR IS NOT "NO FLOOR" (agent-infra#2387). `spawn-gate.sh` repairs 0 to
+         # the shipped derivation, so a rendered `MEM_MIN_AVAIL_MB=0` would state a disabled gate while
+         # the gate refuses at 2048 — the same "a value this installer accepts must be the value the gate
+         # uses" contract, and here the lie points the wrong way: an operator who wrote 0 to switch the
+         # gate off would keep watching lanes be refused with no way to see why.
+         MEM_MIN_AVAIL_MB|MEM_LANE_RESERVE_MB|MEM_SPAWN_RESERVE_LANES)
+         die "$_n='0' is not usable — the spawn gate repairs a zeroed factor/floor to the shipped default, so the plist would state a bound the gate does not use" ;;
        esac ;;
+
     # ⛔ LEADING ZEROS (P1/P2, second review round, 2026-10-14). `''|*[!0-9]*` accepted `08`, which
     # rendered into the plist and then reached the loop, where `$(( ))` parses base 0 (leading 0 =
     # OCTAL) and `08`/`09` are not octal — on /bin/bash 3.2.57 the failed arithmetic silently
@@ -1342,6 +1414,16 @@ for _n in MAX_LOAD MAX_LANES MAX_REVIEW MERGE_PRIORITY_AT MERGE_PRIORITY_MAX_AGE
   # install.sh exited 0; the loop then compared, errored, and lost the lane cap. No limit here is near
   # a billion, so bound the length.
   [ "${#_v}" -le 9 ] || die "$_n='$_v' is out of range (at most 9 digits)"
+  # ⛔ AND AN OUT-OF-RANGE FACTOR MUST BE REFUSED WHERE IT IS *WRITTEN*, NOT WHERE IT IS DERIVED
+  # (review, P2). `spawn-gate.sh` repairs a memory factor above 249999999 at source time, so a plist
+  # that rendered one would state a reserve the gate never uses — the same lie as the zeroed arm
+  # above, in the other direction. Naming the FACTOR is the difference between a fixable refusal and a
+  # puzzle: without this arm the run was still refused, but by the LENGTH check on `MEM_MIN_AVAIL_MB`,
+  # a value the operator never typed.
+  case "$_n" in
+    MEM_LANE_RESERVE_MB|MEM_SPAWN_RESERVE_LANES)
+      [ "$_v" -le 249999999 ] || die "$_n='$_v' is out of range (at most 249999999) — the spawn gate repairs a factor above that to the shipped default, so the plist would state a floor the gate does not use" ;;
+  esac
 done
 # ⛔ CYC NEEDS A FLOOR, NOT JUST A TYPE CHECK (P3, third review round, 2026-10-14). The loop above
 # deliberately allows `0` — it is a valid integer and every OTHER limit may legitimately be 0 — but
@@ -1426,6 +1508,9 @@ sed \
   -e "s|__MAX_RED_FIX_TRIES__|$MAX_RED_FIX_TRIES|g" \
   -e "s|__MIN_SWAP_FREE__|$MIN_SWAP_FREE|g" \
   -e "s|__MIN_MEM_FREE_MB__|$MIN_MEM_FREE_MB|g" \
+  -e "s|__MEM_MIN_AVAIL_MB__|$MEM_MIN_AVAIL_MB|g" \
+  -e "s|__MEM_LANE_RESERVE_MB__|$MEM_LANE_RESERVE_MB|g" \
+  -e "s|__MEM_SPAWN_RESERVE_LANES__|$MEM_SPAWN_RESERVE_LANES|g" \
   -e "s|__BATCH__|$BATCH|g" \
   -e "s|__PRODUCT_FLOOR__|$PRODUCT_FLOOR|g" \
   -e "s|__CYC__|$CYC|g" \

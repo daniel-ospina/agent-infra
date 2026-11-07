@@ -53,6 +53,52 @@
 #      an INDENT test, so a flow-mapped job header (`  job: {name: x}`) ends the block just as a bare or
 #      commented one does. Not modelled: an `if: >-` block scalar — refused, and the FINDING says so
 #      rather than claiming the guard is absent.
+#  7i. MUTANT: the admitted `issue_comment:` trigger DELETED                   → must FAIL. The
+#      allow-list admits that trigger by name, and an allow-list can only refuse an EXTRA trigger —
+#      never see an ABSENCE. So presence is its own arm: deleting the block left this gate green while
+#      re-opening the #2467 window (checks (b)/(d) stay non-deterministic in time).
+#  7j. MUTANTS: the admitted trigger's ACTIVITY SET — `types:` reduced to `[created]`, and the flow-seq
+#      spelling `[created, edited]` → the first must FAIL, the second must PASS. `edited` is the
+#      retraction direction (a scoping marker REMOVED from a comment), and a one-sided read leaves the
+#      previous GREEN standing for ever. An ABSENT `types:` key stays ADMISSIBLE — GitHub's default for
+#      this trigger is `created, edited, deleted` — so the arm is "the effective set contains both",
+#      never "the key is present" (that would be a false block on a correct workflow).
+#  7k. MUTANTS: the event's OWNER — `revalidate-on-issue-comment` re-pointed at another event, and its
+#      body given `&& false` → each must FAIL. That job is the other half of #2467's justification: it
+#      re-runs the EXISTING run for open PRs cross-referencing the issue and can neither post a marker
+#      nor turn a red green. With it unable to run, the admitted event has no owner while every
+#      assertion about the required job still holds. An `if:` restricted by a NARROWING `&&` suffix,
+#      a one-line plain scalar and a `${{ }}` spelling must all still PASS (ANDing excludes more).
+#  7l. MUTANTS: the required context's ACTIVITY SET is a SET — `synchronize` dropped (the MIRROR
+#      fail-open: a new push never re-runs the gate, so the previous head's green stands) and the whole
+#      set replaced by `[edited]` → each must FAIL, and a REORDERED flow sequence must PASS.
+#  7m. MUTANT: the required context's `branches:` no longer admits `main` → must FAIL. An untriggered
+#      required check stays "Pending", so every PR to `main` becomes unmergeable — the same
+#      unsatisfiable-context class as a `paths:` filter. An ABSENT `branches:` key stays admissible.
+#  7n. MUTANTS: a STEP's `if:` is not the JOB's — both directions. A guard moved from the job onto a
+#      STEP must FAIL (the job then runs on every event) while the step's own `if:` is never read as
+#      the job's; an unrelated step condition (`if: always()`) must PASS. A `keyIndent > headerIndent`
+#      test fails both ways — green over the substitution, and a FALSE BLOCK over the unrelated one.
+#      RENAMING the event-owning job is `rc=1` with a FINDING (a fact) and never `rc=2` (a shrug) —
+#      a header-only delete cannot be used: it reparents the body onto the previous job, which is
+#      (correctly) a duplicate `name:` and a different rc=2 finding (measured).
+#  7o. MUTANTS: a DUPLICATE `types:`/`branches:`/`paths:` is CANNOT-VERIFY (rc 2), never a green read
+#      of the first copy — in ALL THREE workflows this file pins. YAML is last-wins, so the question
+#      "which set is in force" is unanswerable, and a `findIndex` reader would answer about the block
+#      that is not in force (#3196's `edited` reduction, or a `paths: ['**']` no-op, re-addable one
+#      line away with the pin green).
+#  7o-bis. MUTANTS: a DUPLICATE TRIGGER NAME (`pull_request:`, `issue_comment:`, `pull_request_target:`)
+#      in any of the three workflows is CANNOT-VERIFY. It is the level ABOVE the filter keys, so it
+#      discards the whole block they pin: an appended second `pull_request:` carrying
+#      `branches: [develop]` makes the required context unsatisfiable on `main` while the reader answers
+#      about the first block, and an appended second `pull_request_target:` carrying `edited` reverts
+#      #3196 outright. Measured GREEN before this rule.
+#  7p. MUTANTS: legal YAML SPACING THAT CARRIES NO VALUE — a trailing comment on a block-sequence item,
+#      after a flow sequence, on the OWNER's one-line `if:` (whose wording must decide nothing), and on
+#      the KEY line itself — must all PASS. A reader that folds a comment into the value fabricates a
+#      set or a truthiness term and refuses a correct workflow.
+#  7q. MUTANT: `!github.event.issue.pull_request` must PASS — it is the same predicate as `== null`
+#      on a comment event, and a shape the reader DOES model may never be reported as a finding.
 #   8. ADMISSION — through `scripts/ci-workflow-pr-evaluable.sh`, the SAME predicate the merge rail
 #      uses (one implementation of `paths:` matching, never a second): every path the doctor step
 #      can read is admitted, and a docs-only diff is not.
@@ -333,23 +379,40 @@ echo "== 7d. MUTANT: a sibling key's list must not be read as \`types:\` =="
 # Review cycle 2, P2 — the reader used to collect a key's items with a FILTER over every deeper line,
 # so a following sibling's block sequence was attributed to the preceding key. Measured fail-open: an
 # emptied `types:` followed by `branches: [- edited]` printed `types: … edited` and exited 0.
-PC_SIBLING="$TMP/pc-sibling.yml"
-if apply_mutation "$PC" "$PC_SIBLING" \
-  "    types:
+# ⛔ TWO CHAINED MUTATIONS, NOT ONE: the single-mutation form APPENDS a second `branches:` key, which
+# the duplicate-key rule now refuses as CANNOT-VERIFY (exit 2) before the cross-key arm is reached —
+# the arm would then assert rc=1 over a fixture rejected for a different reason. So the SIBLING is
+# filled first (`- main` → `- edited` under the existing `branches:`) and the `types:` block emptied
+# second. No duplicate key, and the shape the arm names is the one it drives.
+PC_SIB1="$TMP/pc-sibling-1.yml"; PC_SIBLING="$TMP/pc-sibling.yml"
+if apply_mutation "$PC" "$PC_SIB1" \
+  "    branches:
+      - main" \
+  "    branches:
+      - edited" \
+  "the sibling list must be fillable"; then
+  if apply_mutation "$PC_SIB1" "$PC_SIBLING" \
+    "    types:
       - opened
       - synchronize
       - reopened
       - edited" \
-  "    types:
-    branches:
-      - edited" \
-  "the cross-key misread must be constructible"; then
-  run_check 1 "a 'types:' emptied and a sibling list carrying 'edited' does not read GREEN" \
-    PC_FILE="$PC_SIBLING"
-  case "$FINDINGS" in
-    *types*) pass "the refusal names \`types:\`, not the sibling's value" ;;
-    *) fail "the refusal did not name \`types:\`" ;;
-  esac
+    "    types:" \
+    "the types block must be emptiable"; then
+    run_check 1 "a 'types:' emptied and a sibling list carrying 'edited' does not read GREEN" \
+      PC_FILE="$PC_SIBLING"
+    # ⛔ AND THE REPORT LINE IS THE CROSS-KEY FACT ITSELF: the misread printed `types: … edited` from
+    # the sibling. Rc alone no longer distinguishes it (an empty `types:` is a refusal on its own now),
+    # so the arm asserts the reader's own account of what it read.
+    case "$LAST_OUT" in
+      *"pull_request types: <none>"*) pass "the reader reports \`types: <none>\` — the sibling's list is NOT attributed to it" ;;
+      *) fail "the reader attributed a value to the emptied \`types:\` — expected the report line to read 'pull_request types: <none>'" ;;
+    esac
+    case "$FINDINGS" in
+      *types*) pass "the refusal names \`types:\`, not the sibling's value" ;;
+      *) fail "the refusal did not name \`types:\`" ;;
+    esac
+  fi
 fi
 
 echo "== 7e. MUTANT: a SECOND \`on:\` trigger re-opening the same coverage =="
@@ -505,11 +568,27 @@ fi
 # Left in place it poisons `every()`: the arm then reads rc=1 whether the block terminated correctly or
 # ran on to EOF, and the suite stays green with the terminator replaced by any broken shape. MEASURED by
 # sabotage: with the terminator reverted to a bare-only enumeration the suite read PASS 64 · FAIL 0.
-# With that `if:` removed, the arm is load-bearing again (correct terminator rc=1, broken rc=0).
+# ⛔ AND SINCE THE EVENT-OWNER PINS LANDED, `rc` ALONE NO LONGER DISCRIMINATES THIS ARM EITHER — an
+# intervening job with NO `if:` is itself a FINDING now (`revalidate-on-issue-comment carries no
+# job-level if:`), so the mutant reads rc=1 whether the terminator is correct or broken. The arm
+# therefore asserts THE SPECIFIC FINDING it exists for: the REQUIRED job's guard reported missing. On a
+# correct terminator that finding is emitted; when the block over-extends into a later job's guard it is
+# not (measured both ways by the reviewer: main's reader 1/0, a naive rc-only assertion 1/1).
 PC_NO_POISON_FIND="    if: >-
       github.event_name == 'issue_comment' &&
       github.event.issue.pull_request == null"
 PC_NO_POISON_REPL="    # the intervening job's block-scalar guard is removed for this mutant"
+# expect_required_guard_missing() — the arm's own verdict, driven, not merely rc.
+expect_required_guard_missing() { # <label> <VAR=value ...>
+  local label="$1"; shift
+  LAST_OUT="$(env "$@" node "$CHECK" 2>&1)"; local rc=$?
+  findings_only
+  if [ "$rc" -eq 1 ] && grep -qF 'JOB does not carry' <<<"$FINDINGS"; then
+    pass "$label"
+  else
+    fail "$label — the REQUIRED job's missing guard was not reported (rc=$rc): the block did not end where it must, so it ran on into a later job's guard"
+  fi
+}
 
 # ⛔ AND THE BLOCK MUST END ON A JOB HEADER THAT CARRIES A COMMENT. A legal header with a trailing YAML
 # comment does not match a bare-only terminator, so the required job's block over-extends into the NEXT
@@ -540,7 +619,7 @@ if apply_mutation "$PC" "$PC_OVEREXT_MID1" \
       "  workflow-drift:  # twin job, same guard
 " \
       "the twin's job header must be commentable"; then
-      run_check 1 "a job header carrying a trailing comment still ENDS the required job's block" PC_FILE="$PC_OVEREXT"
+      expect_required_guard_missing "a job header carrying a trailing comment still ENDS the required job's block (asserted via the REQUIRED-guard finding, not rc alone)" PC_FILE="$PC_OVEREXT"
     fi
   fi
   fi
@@ -576,7 +655,7 @@ if apply_mutation "$PC" "$PC_FLOWEXT_MID1" \
       "  workflow-drift: {name: workflow-drift}
 " \
       "the twin's job header must be flow-mappable"; then
-      run_check 1 "a FLOW-MAPPED job header still ENDS the required job's block" PC_FILE="$PC_FLOWEXT"
+      expect_required_guard_missing "a FLOW-MAPPED job header still ENDS the required job's block (asserted via the REQUIRED-guard finding, not rc alone)" PC_FILE="$PC_FLOWEXT"
     fi
   fi
   fi
@@ -1090,6 +1169,496 @@ if apply_mutation "$PC" "$PC_BLOCK_SCALAR_OR" "$PC_GUARD_ANCHOR" \
       github.event_name != 'issue_comment' || true" \
   "a \`>-\` block scalar with \`||\` must be constructible"; then
   run_check 1 "a \`>-\` body carrying \`|| true\` is REFUSED (that body folds to TRUE)" PC_FILE="$PC_BLOCK_SCALAR_OR"
+fi
+
+echo "== 7i. MUTANT: the ADMITTED \`issue_comment:\` trigger DELETED =="
+# ⛔ AN ALLOW-LIST CANNOT SEE AN ABSENCE. `PC_ADMITTED_EXTRA` admits the trigger by NAME and every other
+# assertion in this file is about what the trigger must CARRY — so deleting the whole block left the
+# gate green (measured) while re-opening the #2467 window it exists to close. The presence arm is
+# separate for that reason, and it is not a presence check in the weakening sense: it is driven, and it
+# reddens on exactly one edit.
+PC_NOICTRIG="$TMP/pc-noic-trigger.yml"
+if apply_mutation "$PC" "$PC_NOICTRIG" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "" \
+  "the admitted comment trigger must be removable"; then
+  run_check 1 "DELETING the admitted \`issue_comment:\` trigger is REFUSED" PC_FILE="$PC_NOICTRIG"
+  case "$FINDINGS" in
+    *"no longer declares"*"issue_comment"*) pass "the refusal NAMES the trigger the workflow lost" ;;
+    *) fail "the refusal did not name the lost trigger in its FINDING line" ;;
+  esac
+fi
+
+echo "== 7j. MUTANTS: the admitted trigger's ACTIVITY SET =="
+# `created` re-runs the gate for an open PR that cross-references a newly-scoped issue; `edited` is the
+# RETRACTION direction — the file's own header calls that arm bidirectional, because a body edit can
+# REMOVE the marker and a one-sided read would leave the previous GREEN standing on evidence that no
+# longer exists.
+PC_IC_NOEDIT="$TMP/pc-ic-noedit.yml"
+if apply_mutation "$PC" "$PC_IC_NOEDIT" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:
+    types:
+      - created" \
+  "the comment trigger must be able to lose \`edited\`"; then
+  run_check 1 "\`issue_comment: types:\` losing \`edited\` is REFUSED (the retraction arm)" PC_FILE="$PC_IC_NOEDIT"
+  case "$FINDINGS" in
+    *edited*) pass "the refusal NAMES the activity the set lost" ;;
+    *) fail "the refusal did not name the lost activity in its FINDING line" ;;
+  esac
+fi
+
+# ⛔ AND THE ARM MUST NOT REFUSE A CORRECT WORKFLOW IN ANOTHER SPELLING. Two directions:
+#  * a FLOW sequence carrying both activities is the same value (YAML permits it) → must PASS;
+#  * an ABSENT `types:` key is ADMISSIBLE — GitHub's default set for `issue_comment:` already contains
+#    both — so a reader that demanded the KEY would falsely block a workflow whose effective set is
+#    exactly right. Both are pinned because the natural over-correction here is "require the key".
+PC_IC_FLOW="$TMP/pc-ic-flow.yml"
+if apply_mutation "$PC" "$PC_IC_FLOW" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:
+    types: [created, edited, deleted]" \
+  "a flow-sequence activity set must be constructible"; then
+  run_check 0 "a FLOW sequence carrying both activities (plus GitHub's \`deleted\`) PASSES" PC_FILE="$PC_IC_FLOW"
+fi
+PC_IC_NOTYPES="$TMP/pc-ic-notypes.yml"
+if apply_mutation "$PC" "$PC_IC_NOTYPES" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:" \
+  "an implicit-default activity set must be constructible"; then
+  run_check 0 "an ABSENT \`issue_comment: types:\` PASSES — GitHub's default already carries both" PC_FILE="$PC_IC_NOTYPES"
+fi
+
+echo "== 7k. MUTANTS: the comment event must have an OWNER =="
+# ⛔ `revalidate-on-issue-comment` IS THE OTHER HALF OF THE ADMISSION. #2467 justifies the trigger
+# because THIS job re-runs the EXISTING run for each open PR cross-referencing the issue; it posts no
+# marker, holds no `contents: write` and cannot turn a red green. Re-point it at another event, or give
+# its body `&& false`, and the admitted event has no owner at all — while every assertion about the
+# required job still reads true (measured GREEN before these arms existed).
+PC_RV_WRONG="$TMP/pc-rv-wrong-event.yml"
+if apply_mutation "$PC" "$PC_RV_WRONG" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "      github.event_name == 'workflow_dispatch'" \
+  "the revalidation job must be re-pointable at another event"; then
+  run_check 1 "re-pointing \`revalidate-on-issue-comment\` at another event is REFUSED" PC_FILE="$PC_RV_WRONG"
+  case "$FINDINGS" in
+    *revalidate-on-issue-comment*) pass "the refusal NAMES the job that lost the event" ;;
+    *) fail "the refusal did not name the revalidation job in its FINDING line" ;;
+  esac
+fi
+PC_RV_FALSE="$TMP/pc-rv-false.yml"
+if apply_mutation "$PC" "$PC_RV_FALSE" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null && false" \
+  "the revalidation body must be poisonable with \`&& false\`"; then
+  run_check 1 "a revalidation body carrying \`&& false\` is REFUSED (it owns the event and can never run)" PC_FILE="$PC_RV_FALSE"
+fi
+
+# ⛔ AND A SAFE NARROWING MUST STILL PASS: `&&` binds tighter than `||`, so an ANDed suffix can only
+# EXCLUDE more events. A reader that refused it would be a false block on a correctly narrowed tree.
+# ⛔ AND THE ALWAYS-FALSE SPELLING, WHICH THE OLD TRUTHINESS RULE ADMITTED. `&& false` was caught; the
+# same intent written `&& !true` was rc=0, because the `(?<![=!<>])` lookbehind suppressed the
+# `!`-prefixed literal — i.e. it suppressed exactly the always-false spelling the rule exists for, while
+# also sparing a harmless `!= true`. Nothing legal in the modelled conjunction carries a bare
+# `true`/`false`, so the refusal is widened (over-blocking a `!=true` spelling is the safe direction).
+PC_RV_BANGTRUE="$TMP/pc-rv-bang-true.yml"
+if apply_mutation "$PC" "$PC_RV_BANGTRUE" \
+  "      github.event.issue.pull_request == null" \
+  "      github.event.issue.pull_request == null && !true" \
+  "the always-false owner body must be constructible"; then
+  run_check 1 "an always-FALSE owner body written \`&& !true\` is REFUSED (the owner can never run)" \
+    PC_FILE="$PC_RV_BANGTRUE"
+fi
+
+PC_RV_NARROW="$TMP/pc-rv-narrow.yml"
+if apply_mutation "$PC" "$PC_RV_NARROW" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null &&
+      github.event.action != 'deleted'" \
+  "a narrowed revalidation guard must be constructible"; then
+  run_check 0 "a NARROWING \`&&\` suffix on the revalidation guard PASSES (ANDing excludes more)" PC_FILE="$PC_RV_NARROW"
+fi
+
+echo "== 7l. MUTANTS: the required context's ACTIVITY SET is a SET =="
+# ⛔ THE MIRROR OF ARM 7, AND IT WAS THE ONE STILL OPEN. Arm 7 pins that `edited` cannot be DROPPED;
+# the old reader tested MEMBERSHIP, so dropping `synchronize` instead was measured GREEN — and that is a
+# fail-open of the same family, from the other side: a new push never re-runs the gate, so the previous
+# head's green check keeps standing on a body of evidence nobody re-read.
+PC_NOSYNC="$TMP/pc-nosync.yml"
+if apply_mutation "$PC" "$PC_NOSYNC" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:
+      - opened
+      - reopened
+      - edited" \
+  "the required context must be able to lose \`synchronize\`"; then
+  run_check 1 "the required context losing \`synchronize\` is REFUSED (a new push would never re-run)" PC_FILE="$PC_NOSYNC"
+  case "$FINDINGS" in
+    *synchronize*) pass "the refusal NAMES the activity and what its loss lets stand" ;;
+    *) fail "the refusal did not name the lost activity in its FINDING line" ;;
+  esac
+fi
+PC_TYPESONLY="$TMP/pc-types-only.yml"
+if apply_mutation "$PC" "$PC_TYPESONLY" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types: [edited]" \
+  "the required context's activity set must be replaceable"; then
+  run_check 1 "the required context reduced to \`types: [edited]\` is REFUSED (three activities lost)" PC_FILE="$PC_TYPESONLY"
+fi
+PC_TYPESREORDER="$TMP/pc-types-reorder.yml"
+if apply_mutation "$PC" "$PC_TYPESREORDER" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types: [edited, reopened, synchronize, opened]" \
+  "a reordered flow-sequence activity set must be constructible"; then
+  run_check 0 "the SAME set in a REORDERED flow sequence PASSES (a set, not a sequence)" PC_FILE="$PC_TYPESREORDER"
+fi
+
+echo "== 7m. MUTANT: the required context's BRANCH FILTER must still admit main =="
+# An untriggered required check stays "Pending" and every PR to `main` is unmergeable — the same
+# unsatisfiable-context class as a `paths:` filter on the required context. An ABSENT `branches:` key is
+# a DIFFERENT fact: the trigger then fires for every target branch, `main` included, so it is pinned as
+# a PASS rather than refused.
+PC_BRANCHES="$TMP/pc-branches.yml"
+if apply_mutation "$PC" "$PC_BRANCHES" \
+  "    branches:
+      - main" \
+  "    branches:
+      - develop" \
+  "the required context's branch filter must be replaceable"; then
+  run_check 1 "the required context's \`branches:\` no longer admitting \`main\` is REFUSED" PC_FILE="$PC_BRANCHES"
+  case "$FINDINGS" in
+    *branches*) pass "the refusal NAMES the branch filter and the unmergeable consequence" ;;
+    *) fail "the refusal did not name the branch filter in its FINDING line" ;;
+  esac
+fi
+# ⛔ AND THE TWO UNSATISFIABLE-CONTEXT FACTS ARE STATED TOGETHER. The branch filter used to be checked
+# BELOW the `types:` early-return, so a tree that had lost `types:` AND narrowed `branches:` to
+# `develop` reported only the first — the operator fixed it, re-ran, and discovered the unmergeable
+# filter a round later (measured: one finding, while PyYAML shows the effective trigger is
+# `['branches']`). One edit, two facts, one run.
+PC_TAINT2="$TMP/pc-types-and-branches2.yml"
+PC_TAINT3="$TMP/pc-types-and-branches3.yml"
+if apply_mutation "$PC" "$PC_TAINT2" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:" \
+  "the types block must be emptiable for the combined arm"; then
+  if apply_mutation "$PC_TAINT2" "$PC_TAINT3" \
+    "    branches:
+      - main" \
+    "    branches:
+      - develop" \
+    "the branch filter must be narrowable for the combined arm"; then
+    run_check 1 "a tree missing \`types:\` AND narrowing \`branches:\` is REFUSED" PC_FILE="$PC_TAINT3"
+    case "$FINDINGS" in
+      *"no longer admits"*) pass "…and the refusal states BOTH facts in one run (the branch filter is not withheld behind the \`types:\` return)" ;;
+      *) fail "the branch filter was withheld: only the \`types:\` fact was reported" ;;
+    esac
+  fi
+fi
+
+PC_NOBRANCHES="$TMP/pc-nobranches.yml"
+if apply_mutation "$PC" "$PC_NOBRANCHES" \
+  "    branches:
+      - main
+" \
+  "" \
+  "an absent branch filter must be constructible"; then
+  run_check 0 "an ABSENT \`branches:\` PASSES — it fires for every target branch, \`main\` included" PC_FILE="$PC_NOBRANCHES"
+fi
+
+echo "== 7n. MUTANTS: a STEP's \`if:\` is not the JOB's — both directions =="
+# ⛔ THE INDENT TEST IS THE WHOLE GUARD. `keyIndent > headerIndent` accepts a STEP's `if:` as the job's,
+# and that is wrong in BOTH directions, each measured: (a) delete the job's `if:` and move the same
+# conjunction onto its first step → the job RUNS on every event while the reader reports green
+# (fail-open, and the `carries no job-level if:` finding never fires); (b) put an unrelated
+# `if: always()` on a step → the reader mints a FINDING claiming the JOB's guard is wrong (false block,
+# and a false statement about the job). Both are driven below.
+PC_RVSTEP_SUBS="$TMP/pc-rvstep-subs.yml"
+if apply_mutation "$PC" "$PC_RVSTEP_SUBS" \
+  "    name: revalidate-on-issue-comment
+    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "    name: revalidate-on-issue-comment" \
+  "the revalidation job's own guard must be removable"; then
+  PC_RVSTEP_SUBS2="$TMP/pc-rvstep-subs2.yml"
+  if apply_mutation "$PC_RVSTEP_SUBS" "$PC_RVSTEP_SUBS2" \
+    "      - uses: actions/checkout@v4" \
+    "      - uses: actions/checkout@v4
+        if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null" \
+    "a step-level guard must be insertable in the revalidation job"; then
+    run_check 1 "a guard moved from the JOB to a STEP is REFUSED (the job still runs on every event)" \
+      PC_FILE="$PC_RVSTEP_SUBS2"
+    case "$FINDINGS" in
+      *"carries no job-level"*) pass "the refusal says the JOB carries no \`if:\` — it does not credit the step's" ;;
+      *) fail "the refusal did not name the job-level \`if:\` as missing" ;;
+    esac
+  fi
+fi
+PC_RVSTEP_ALWAYS="$TMP/pc-rvstep-always.yml"
+if apply_mutation "$PC" "$PC_RVSTEP_ALWAYS" \
+  "      - uses: actions/checkout@v4" \
+  "      - uses: actions/checkout@v4
+        if: always()" \
+  "an unrelated step condition must be insertable"; then
+  run_check 0 "an unrelated STEP condition (\`if: always()\`) does not make the JOB's guard wrong" PC_FILE="$PC_RVSTEP_ALWAYS"
+fi
+
+# ⛔ AND THE ABSENCE OF THE OWNER IS A FACT THIS READER STATES (rc=1), NOT A CANNOT-VERIFY (rc=2).
+# `jobBlock` REFUSES when it cannot locate a job — the right answer for "cannot verify this job's guard",
+# and the wrong one here, because "the job that owns the admitted event is gone" is answerable. The
+# presence check runs FIRST for that reason; this arm is what keeps it first (a refactor back to
+# `jobBlock`-first would silently move the answer to rc=2 with the suite still green).
+PC_RV_GONE="$TMP/pc-rv-gone.yml"
+# ⛔ RENAMED, NOT HEADER-DELETED: deleting only the header leaves the job BODY attached to the previous
+# job, which (correctly) reads as a duplicate `name:` and answers CANNOT-VERIFY — a different finding
+# about a different defect. A rename leaves a syntactically valid workflow in which the admitted event
+# has no owner under the name the decision gives it, which is the state this arm is about.
+if apply_mutation "$PC" "$PC_RV_GONE" \
+  "  revalidate-on-issue-comment:
+" \
+  "  revalidate-renamed:  # renamed: the event owner is gone under its expected name
+" \
+  "the event-owning job must be renamable"; then
+  run_check 1 "RENAMING the event-owning \`revalidate-on-issue-comment\` job is REFUSED (rc=1, not CANNOT-VERIFY)" \
+    PC_FILE="$PC_RV_GONE"
+  case "$FINDINGS" in
+    *"no longer declares"*revalidate-on-issue-comment*) pass "the refusal says the JOB is gone, and names it" ;;
+    *) fail "the refusal did not name the missing event owner" ;;
+  esac
+fi
+
+echo "== 7o. MUTANTS: a DUPLICATE filter key is LAST-WINS, so it is CANNOT-VERIFY =="
+# ⛔ YAML KEEPS THE LAST `types:`/`branches:` AND DISCARDS THE REST. A `findIndex` reader answers about
+# the FIRST copy, i.e. about the block that is NOT in force — measured GREEN in both arms below before
+# the duplicate rule existed. This file already closes last-wins at four other levels (`on:`, `jobs:`,
+# the job id, a job's `if:`); these two are the same guard on the filter keys the pins now READ.
+PC_DUPTYPES="$TMP/pc-dup-types.yml"
+if apply_mutation "$PC" "$PC_DUPTYPES" \
+  "  issue_comment:
+    types:
+      - created
+      - edited" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+    types:
+      - created" \
+  "a duplicated \`types:\` must be constructible"; then
+  run_check 2 "a DUPLICATED \`issue_comment: types:\` is CANNOT-VERIFY (last-wins: the first is not in force)" \
+    PC_FILE="$PC_DUPTYPES"
+fi
+PC_DUPBR="$TMP/pc-dup-branches.yml"
+if apply_mutation "$PC" "$PC_DUPBR" \
+  "    branches:
+      - main" \
+  "    branches:
+      - main
+    branches:
+      - develop" \
+  "a duplicated \`branches:\` must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request: branches:\` is CANNOT-VERIFY" PC_FILE="$PC_DUPBR"
+fi
+# ⛔ THE SAME RULE OWES THE OTHER TWO WORKFLOWS THIS FILE PINS. `workflow-lock.yml` and
+# `harness-single-source.yml` are read with the same `types:`/`paths:` handling, and an appended second
+# key there is the SAME last-wins trap: #3196's `edited` reduction (or a `paths: ['**']` no-op) becomes
+# re-addable one line away with the pin still green. Measured before this rule: rc=0 for both.
+WL_DUPTYPES="$TMP/wl-dup-types.yml"
+if apply_mutation "$WL" "$WL_DUPTYPES" \
+  "    types: [opened, synchronize, reopened]" \
+  "    types: [opened, synchronize, reopened]
+    types: [opened, synchronize, reopened, edited]" \
+  "a duplicated \`types:\` in workflow-lock must be constructible"; then
+  run_check 2 "a DUPLICATED \`types:\` in workflow-lock.yml is CANNOT-VERIFY" WL_FILE="$WL_DUPTYPES"
+fi
+# ⛔ AND THE LEVEL ABOVE THE FILTER KEYS: A DUPLICATE TRIGGER NAME. `onKeys` refuses it now, because
+# YAML keeps the LAST block and discards the rest — so a second `pull_request:` makes the required
+# context unsatisfiable on `main` while the reader answers about the FIRST block. Measured GREEN on
+# all three workflows before this arm existed (each defeats the filter pins one level up: 7j, 7l, 7m
+# and #3196's `edited` reduction).
+PC_DUPTRIG="$TMP/pc-dup-trigger.yml"
+if apply_mutation "$PC" "$PC_DUPTRIG" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+  pull_request:
+    branches: [develop]
+    types: [edited]
+" \
+  "a duplicated \`pull_request:\` trigger must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request:\` trigger is CANNOT-VERIFY (last-wins: the first block is not in force)" \
+    PC_FILE="$PC_DUPTRIG"
+  case "$LAST_OUT" in
+    *CANNOT-VERIFY*"pull_request"*) pass "the refusal names the duplicated trigger" ;;
+    *) fail "the refusal did not name the duplicated trigger" ;;
+  esac
+fi
+PC_DUPIC="$TMP/pc-dup-ictrigger.yml"
+if apply_mutation "$PC" "$PC_DUPIC" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+" \
+  "  issue_comment:
+    types:
+      - created
+      - edited
+  issue_comment:
+    types: [created]
+" \
+  "a duplicated \`issue_comment:\` trigger must be constructible"; then
+  run_check 2 "a DUPLICATED \`issue_comment:\` trigger is CANNOT-VERIFY" PC_FILE="$PC_DUPIC"
+fi
+WL_DUPTRIG="$TMP/wl-dup-trigger.yml"
+if apply_mutation "$WL" "$WL_DUPTRIG" \
+  "    types: [opened, synchronize, reopened]
+" \
+  "    types: [opened, synchronize, reopened]
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited]
+" \
+  "a duplicated \`pull_request_target:\` trigger must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request_target:\` in workflow-lock.yml is CANNOT-VERIFY" WL_FILE="$WL_DUPTRIG"
+fi
+HSS_DUPTRIG="$TMP/hss-dup-trigger.yml"
+if apply_mutation "$HSS" "$HSS_DUPTRIG" \
+  "      - '.github/workflows/harness-single-source.yml'
+" \
+  "      - '.github/workflows/harness-single-source.yml'
+  pull_request:
+    types: [opened]
+" \
+  "a duplicated \`pull_request:\` trigger in harness-single-source must be constructible"; then
+  run_check 2 "a DUPLICATED \`pull_request:\` in harness-single-source.yml is CANNOT-VERIFY" HSS_FILE="$HSS_DUPTRIG"
+fi
+
+HSS_DUPPATHS="$TMP/hss-dup-paths.yml"
+if apply_mutation "$HSS" "$HSS_DUPPATHS" \
+  "      - '.github/workflows/harness-single-source.yml'" \
+  "      - '.github/workflows/harness-single-source.yml'
+    paths:
+      - '**'" \
+  "a duplicated \`paths:\` in harness-single-source must be constructible"; then
+  run_check 2 "a DUPLICATED \`paths:\` in harness-single-source.yml is CANNOT-VERIFY" HSS_FILE="$HSS_DUPPATHS"
+fi
+
+echo "== 7p. MUTANTS: a legal trailing YAML COMMENT is not part of the value =="
+# YAML starts a comment at a `#` PRECEDED BY WHITESPACE, so `- opened  # first gate run` is the item
+# `opened`. Reading the rest of the line fabricated a list, which the required-context set comparison
+# then reported as "LOST [opened, synchronize]" — rc=1 over a CORRECT workflow. Both list shapes are
+# driven: a block sequence and a flow sequence.
+PC_CMT_BLOCK="$TMP/pc-cmt-block.yml"
+if apply_mutation "$PC" "$PC_CMT_BLOCK" \
+  "    types:
+      - opened
+      - synchronize" \
+  "    types:
+      - opened  # the first gate run
+      - synchronize  # every push" \
+  "a commented block sequence must be constructible"; then
+  run_check 0 "a trailing comment on a BLOCK-sequence item does not make the activity set wrong" PC_FILE="$PC_CMT_BLOCK"
+fi
+PC_CMT_FLOW="$TMP/pc-cmt-flow.yml"
+if apply_mutation "$PC" "$PC_CMT_FLOW" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types: [opened, synchronize, reopened, edited]  # the decided set" \
+  "a commented flow sequence must be constructible"; then
+  run_check 0 "a trailing comment after a FLOW sequence does not make the activity set wrong" PC_FILE="$PC_CMT_FLOW"
+fi
+# ⛔ AND THE OWNER'S `if:` TAKES ONE TOO — ITS WORDING DECIDED THE VERDICT BEFORE THIS ARM EXISTED.
+# The folded value was scanned for `||` / bare `true` / `false` WITH THE COMMENT INCLUDED, so a
+# byte-for-byte correct guard was refused whenever its comment happened to say "true". Measured:
+# `… = null  # holds true only for plain issues` -> rc=1, while `# owns the comment event` -> rc=0.
+PC_RV_CMT="$TMP/pc-rv-comment.yml"
+if apply_mutation "$PC" "$PC_RV_CMT" \
+  "    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "    if: github.event_name == 'issue_comment' && github.event.issue.pull_request == null  # holds true only for plain issues" \
+  "a commented owner guard must be constructible"; then
+  run_check 0 "a trailing comment on the OWNER's one-line \`if:\` is not part of the expression (its wording decides nothing)" \
+    PC_FILE="$PC_RV_CMT"
+fi
+# ⛔ AND A COMMENT AFTER THE KEY IS NOT A VALUE: `types:  # note` with the block sequence below it is
+# the same list. A reader that took the comment for the value read the key as "declared with a value"
+# and refused a correct workflow.
+PC_KEY_CMT="$TMP/pc-key-comment.yml"
+if apply_mutation "$PC" "$PC_KEY_CMT" \
+  "    types:
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "    types:  # the decided set, in the decision's own order
+      - opened
+      - synchronize
+      - reopened
+      - edited" \
+  "a commented key must be constructible"; then
+  run_check 0 "a trailing comment ON THE KEY line is not a value — the block sequence below still reads" PC_FILE="$PC_KEY_CMT"
+fi
+
+echo "== 7q. MUTANT: the equivalent NULL test on the revalidation guard =="
+# `!github.event.issue.pull_request` is the SAME predicate as `== null` on a comment event (the field is
+# absent for a plain issue), so refusing it is a false block AND a false statement about the job's
+# guard. The unmodelled-shape path is CANNOT-VERIFY (rc 2), never a minted FINDING — a shape the reader
+# DOES model belongs here as a PASS.
+PC_RV_BANG="$TMP/pc-rv-bang-null.yml"
+if apply_mutation "$PC" "$PC_RV_BANG" \
+  "    if: >-
+      github.event_name == 'issue_comment' &&
+      github.event.issue.pull_request == null" \
+  "    if: >-
+      github.event_name == 'issue_comment' &&
+      !github.event.issue.pull_request" \
+  "the negated null test must be constructible"; then
+  run_check 0 "\`!github.event.issue.pull_request\` is accepted (the same predicate as \`== null\`)" PC_FILE="$PC_RV_BANG"
 fi
 
 echo "== 8. ADMISSION: every path the doctor step can read is admitted =="

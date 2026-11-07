@@ -38,13 +38,24 @@
 # Run: bash repo-target.test.sh            (and `--nonvacuity <rev>` to re-measure the pre-fix tree)
 set -u
 
+# ⛔ THE DISK ADMISSION IS NEUTRALISED FOR THIS SUITE (agent-infra#3395), AND THIS IS TEST HYGIENE.
+# C3 drives the SHIPPED `fix-one.sh`, which now asks the disk predicate through `wt_provision` BEFORE
+# it creates a worktree — so without this the arm is decided by THIS HOST's free space (measured: a
+# `df` reporting 3,584 MB flips C3 from rc=75 to rc=77 on an otherwise-green box, and the arm's
+# failure text then blames worktree materialisation). The idiom is the one `wt-lifecycle.test.sh` and
+# `harness-refresh.test.sh` already use; the gate's own behaviour is pinned in `disk-admission.test.sh`,
+# which STUBS `df` and therefore measures the gate rather than the host.
+# ⛔ ALL THREE TERMS, NOT TWO (review P2, #3409): `disk_worktree_terms` defaults the TREE term to 350 MB
+# when `DISK_LANE_TREE_MB` is unstated, so zeroing only self+reserve still left `need = 350` and C3 was
+# still decided by the host below that floor.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
+
 HERE="$(cd "$(dirname "$0")" && pwd)"
 RT="$HERE/repo-target.sh"
 LANE="$HERE/lane.sh"
 FIX="$HERE/fix-one.sh"
 DM="$HERE/dispatch-merge.sh"
 for f in "$RT" "$LANE" "$FIX" "$DM"; do [ -f "$f" ] || { echo "❌ missing $f"; exit 2; }; done
-
 PASS=0; FAIL=0
 ok()  { PASS=$((PASS+1)); echo "  ✅ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ❌ $1"; }
@@ -263,14 +274,14 @@ FO="$T/o-fix"; mkdir -p "$FO/logs" "$FO/state"
 gh() { return 1; }
 export -f gh 2>/dev/null || true
 
-REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$TT" daniel-ospina/agent-infra 4001 work >/dev/null 2>&1
 c1=$?
 { [ "$c1" -eq 72 ] && grep -q 'daniel-ospina/tortoise' "$FO/logs/fix-4001.log" 2>/dev/null \
     && grep -q 'daniel-ospina/agent-infra' "$FO/logs/fix-4001.log" 2>/dev/null \
     && [ ! -e "$TT/.worktrees/fix-4001" ]; }; ck "C1 PR lane with a checkout/target mismatch -> REFUSED (72), no worktree built" $?
 
-REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4002 feat/not-there >/dev/null 2>&1
 c2=$?
 { [ "$c2" -eq 72 ] \
@@ -290,7 +301,7 @@ c2=$?
 printf '%s\n' "2" > "$FO/state/fixcount-4004"
 printf '%s\n' "$TT" daniel-ospina/agent-infra 4004 work > "$T/argv-4004"
 ( gh() { case "$*" in *headRefOid*) echo "cafebabe"; return 0 ;; esac; return 1; }; export -f gh
-  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 DISK_MIN_FREE_MB=1 \
+  REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=999999 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
     bash "$FIX" --argv "$T/argv-4004" ) >/dev/null 2>&1
 c4=$?
 { [ "$c4" -eq 72 ] && [ -f "$FO/state/fixgate-4004-cafebabe" ] \
@@ -327,7 +338,7 @@ c5=$?
     && [ -f "$AI/.worktrees/fix-4005/precious.txt" ]; }; ck "C5 --argv (CTRL=1) worktree-materialisation refusal -> REFUNDS fixcount and leaves the foreign directory intact (rc=$c5)" $?
 
 "$REAL_GIT" -C "$AI" branch work >/dev/null 2>&1 || true
-REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 DISK_MIN_FREE_MB=1 \
+REAP_LANE_VENV_DISABLE=1 O="$FO" MAX_LOAD=0 MEM_MIN_AVAIL_MB=1 DISK_MIN_FREE_MB=1 \
   bash "$FIX" "$AI" daniel-ospina/agent-infra 4003 work >/dev/null 2>&1
 c3=$?
 { grep -q 'fixer #4003 target check=ok repo=daniel-ospina/agent-infra' "$FO/logs/fix-4003.log" 2>/dev/null \

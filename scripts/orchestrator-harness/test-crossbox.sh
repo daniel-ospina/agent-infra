@@ -50,7 +50,22 @@ CLAIM_CACHE_NS="${CLAIM_CACHE_NS:-refs/claims-cache-verify-$$}"; export CLAIM_CA
 # its own SUBJECT as broken, on exactly the box the gate was written for. It is exported (not a
 # per-call prefix) because the arms reach fix-one.sh through `exec env`, which starts from this env.
 # 1 is the documented neutralizer: a legal, tiny floor that no real filesystem is below.
-DISK_MIN_FREE_MB=1; export DISK_MIN_FREE_MB
+# ⛔ AND THE THREE LANE TERMS GO WITH IT, ON THE SAME LINE — THIS FILE WAS THE ONE SUITE BOTH CENSUSES
+# MISSED (fresh review, P1 — MEASURED). The floor alone stopped being sufficient when #3395 added a
+# PRE-START admission: `wt_provision` → `disk_admit` now charges `max(TREE, SELF) + 4×floor`, i.e.
+# 6,148 MB with the lane terms unstated, so on a box under ~6 GB free every arm here exits 77 BEFORE
+# `claim_acquire` (`fix-one.sh:231` → rc 4 → `:261` exit `${AGENT_DISK_REFUSED:-77}`, with `:260`
+# refunding the gate attempt first) and reports a disk refusal where it asserts a claim outcome — the
+# same wrong-cause class this block already names for the 500 MB floor. It was invisible because the
+# file is named `test-crossbox.sh`, not `*.test.sh`; arm J's and arm K's populations now read
+# `test-*.sh` too. (Arm I's does NOT, and does not need to: the guarantee here is the one-line
+# four-term `export` below, which is arm J's rule and is strictly stronger than arm I's line-shape
+# check — but that is a statement about ARM J, and saying "the censuses" would claim coverage this
+# file does not have from arm I.) It is ONE `export` line because that is the shape arm J treats as an
+# effective neutralisation (`export <four terms>`, the shipped S1 idiom) — split across lines it
+# neutralises just as well but the census cannot see it, and that is the false PASS this block exists
+# against.
+export DISK_MIN_FREE_MB=1 DISK_LANE_TREE_MB=0 DISK_LANE_SELF_MB=0 DISK_LANE_RESERVE_MB=0
 # ⛔ AND SO IS THE LOAD CEILING, FOR THE SAME REASON (verification round, P1). NO arm in this file
 # asserts a LOAD refusal (0 hits for MAX_LOAD outside this block), so the shipped load gate is a pure
 # CONFOUNDER here: every arm that expects the fixer to run instead gets AGENT_LOAD_REFUSED, and the
@@ -67,6 +82,14 @@ DISK_MIN_FREE_MB=1; export DISK_MIN_FREE_MB
 # would look like a no-op. `999999` is six digits, so three further digits still fit and the fourth
 # breaches: real margin, and unmistakably not a ceiling anyone mistook for a device limit.
 MAX_LOAD=999999; export MAX_LOAD
+
+# ⛔ AND THE THIRD GATE (agent-infra#2387). This file's header states the rule for the OTHER two
+# ("the shipped load gate is a pure CONFOUNDER here … the suite reports its own SUBJECT as broken on a
+# box where nothing is wrong with it") and pins `DISK_MIN_FREE_MB=1` + `MAX_LOAD=999999` for exactly
+# that reason. `run_agent` now consults available MEMORY before load, so on a box under the 2048 MB
+# floor every arm below would be decided by the memory gate instead — the same false red, one gate over.
+# `exec env` passes the exported value through to the fix-one.sh children this suite drives.
+MEM_MIN_AVAIL_MB=1; export MEM_MIN_AVAIL_MB
 REF="$CLAIM_NS/777777-${SHA:0:12}"
 PRREF="$CLAIM_NS/pr-777777"          # the LANDING key (agent-infra#1952): one ref per PR, any head
 REF2="$CLAIM_NS/888888-${SHA:0:12}"

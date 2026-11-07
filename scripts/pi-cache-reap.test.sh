@@ -1002,12 +1002,42 @@ assert_contains "$(cat "$SUPERVISOR" 2>/dev/null)" "pi-cache-reap.sh" \
 
 echo
 echo "── 10c. portability pins (the launchd clock is macOS) ──"
-# `date -r <path>` is GNU-only: the BSD/macOS `date -r` takes EPOCH SECONDS, so it returns empty
-# there — every age fell back to 0, a stale lock was never broken (exit 4 = silence to both
-# callers) and the loud mis-set-lock refusal degraded to a silent skip. The family idiom is
-# `stat -f %m || stat -c %Y`.
-assert_not_contains "$(grep -v '^#' "$REAPER")" 'date -r' "no GNU-only 'date -r <path>' in EXECUTED code (it means epoch seconds on macOS)"
-assert_contains "$(cat "$REAPER")" 'stat -f %m' "mtime is read with the family's portable stat idiom"
+# ⛔ CORRECTED (agent-infra#3509 review P2): this rationale used to say `date -r <path>` is
+# GNU-only and returns empty on macOS. That is FALSE — Apple's `date` stat()s a non-numeric `-r`
+# argument (shell_cmds date/date.c:147-157, usage `[-r filename|seconds]`), so the path form is
+# portable. The real macOS trap is the `-r <SECONDS>` form: `strtoq` takes base 0, so a
+# zero-padded epoch is parsed as octal — usually fatal, and silently read as a different number
+# when every digit is an octal one (recorded at cleanup-stale-branches.sh:1361-1372).
+# The arms below still pin ONE probe shape in the reaper (the `box_mtime` family idiom) so a
+# second, differently-shaped mtime read cannot drift in; keep them about the shape, not about a
+# portability claim that has been falsified.
+# ⛔ BOTH ARMS READ THE EXECUTED VIEW — full-line AND trailing comments stripped, not `grep -v '^#'`
+# and never `cat`. A column-0-only strip leaves an INDENTED comment in the view; `cat` leaves every
+# comment; and a full-line-only strip still leaves a TRAILING one (this suite's own arms sit beside
+# prose). In each case a comment alone satisfies an arm, which is a false PASS on the one thing these
+# two lines exist to pin (agent-infra#3509 review, measured: a GNU-only `stat -c` probe carrying a
+# trailing `# … date -r …` passed both arms).
+# ⛔ AND IT IS QUOTE-AWARE (#3509 review round 8). A space-anchored strip (`s/[[:space:]]#.*$//`)
+# still leaves a comment that begins a WORD — `;# …` is a comment in bash and survived, so a GNU-only
+# probe plus `;# … the family idiom is stat -f %m …` satisfied BOTH arms (measured) — while an
+# unconditional strip deletes real code after a `#` inside a quoted string. The scanner is the same
+# one `scripts/mtime-probe-portability.test.sh` carries; keep the two in step.
+reaper_executed_view() {
+    awk '
+        { out = ""; sq = 0; dq = 0; esc = 0; prev = ""
+          for (k = 1; k <= length($0); k++) {
+            c = substr($0, k, 1)
+            if (esc) { out = out c; esc = 0; prev = c; continue }
+            if (c == "\\" && !sq) { out = out c; esc = 1; prev = c; continue }
+            if (!sq && !dq && c == "#" && (k == 1 || prev ~ /[[:space:];&|()<>`]/)) break
+            if (!dq && c == "\047") sq = !sq
+            else if (!sq && c == "\"") dq = !dq
+            out = out c; prev = c
+          }
+          print out }' "$REAPER"
+}
+assert_not_contains "$(reaper_executed_view)" 'date -r' "the reaper keeps a SINGLE probe shape — no second 'date -r' mtime read in EXECUTED code"
+assert_contains "$(reaper_executed_view)" 'stat -f %m' "mtime is read with the family's portable stat idiom (in EXECUTED code)"
 
 echo ""
 echo "── Summary ───────────────────────────────────────────────────────"

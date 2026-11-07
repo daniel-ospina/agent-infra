@@ -82,6 +82,12 @@ release_issue_claim_unspawned() { # <issue>
 #   branch, the `prfixup` shape) reaches it in the field. So the batch publishes what actually reached
 #   a spawn in `$O/.dispatched-ids`, and the controller recounts from that instead of from claims.
 SPAWNED_IDS=""
+# ⛔ AND THE IDS WHOSE **CHAIN** WAS STARTED, which is NOT `SPAWNED_IDS` (review round 3, P3).
+# `SPAWNED_IDS` only grows on a SUCCESSFUL lane spawn, while the chain is attempted regardless — and a
+# failed lane spawn with a LIVE chain is exactly the case this file's own comment forbids releasing
+# ("the chain IS alive and waiting for that PR, so releasing would let a peer duplicate the work"). The
+# disk arm below must skip these too, or a batch stop releases a claim something is still working on.
+CHAIN_IDS=""
 drop_dispatched_rows() {
   local ids="" n tmp
   for n in "$@"; do case "${n:-}" in ''|*[!0-9]*) continue ;; esac; ids="$ids $n"; done
@@ -372,6 +378,65 @@ for N in "$@"; do
   _wt_rc=$?
   case "$_wt_rc" in
     0) echo "#$N: worktree ok — $WT_RESULT" ;;
+    4) # ── THE DISK REFUSAL (agent-infra#3395) STOPS THE BATCH, NOT JUST THIS ISSUE ─────────────
+       # Every issue in this batch creates its worktree on the SAME volume, so a refusal here is a
+       # fact about the BOX: continuing would run the next `git worktree add` into the same full
+       # disk and produce the measured `fatal: cannot create directory …: No space left on device`,
+       # once per remaining issue. The refusal names its own numbers (free/need/box) and the batch stops.
+       # ⛔ AND A STOPPED BATCH RELEASES **EVERY** CLAIM IT WILL NOT ATTEMPT (review round 2, P1).
+       # The controller has ALREADY taken `refs/claims/issue-<N>` for every id it handed us, and this
+       # file's own rule says "Nothing will start" must also mean "nothing stays claimed" — otherwise
+       # each skipped issue is refused by every peer until `CLAIM_ISSUE_TTL` (18,000 s) expires. The
+       # first version released only `$N` and broke, which BOTH left the rest claimed for the lease and
+       # was a regression against the old `*)` arm, where each issue released its own claim as it went.
+       echo "#$N: $WT_RESULT"
+       # ⛔ THE REMEDY IS SELECTED FROM THE VERDICT, NOT HARDCODED (review round 8, P2 — MEASURED).
+       # THIS file was the THIRD rc-4 caller and the only one left printing a single remedy. THREE
+       # arms reach rc 4 carrying `REFUSED-UNKNOWN`, and only one of them is a disk fact:
+       # `wt-lifecycle.sh`'s missing-`spawn-gate.sh` arm (version skew, #2033), `spawn-gate.sh`'s
+       # unreadable-`df` arm, and `wt-lifecycle.sh`'s "refused without naming its numbers" fallback.
+       # Telling an operator whose box cannot answer `df` — or is half-deployed — to "reclaim space"
+       # is a remedy that CANNOT ARRIVE, and because this arm stops the WHOLE batch it stays dark
+       # every cycle until someone reasons past the log line. That is the #2721 wrong-cause class this
+       # PR fixes in the other two callers; `wt-lifecycle.sh`'s own comment said "Both callers", and
+       # that count is why this one was missed. `$WT_RESULT` already names the arm, so read it.
+       # ⛔ NO MULTI-ARM `case` BLOCK HERE ON PURPOSE: dispatch-merge's rc-4 arm is extracted by
+       # disk-admission.test.sh's `arm_of`, which terminates at the first line ENDING in a double
+       # semicolon, so a multi-line `case` placed ahead of this arm's own terminator would truncate
+       # the census's view of it. The one-line `case … esac` below ends in `esac`, so extraction still
+       # reaches the terminator intact.
+       _dm_unknown=0
+       case "$WT_RESULT" in *REFUSED-UNKNOWN*) _dm_unknown=1 ;; esac
+       if [ "$_dm_unknown" -eq 1 ]; then
+         echo "dispatch-merge: stopping the batch — REFUSED-UNKNOWN: the free-space probe could NOT answer, or this box's \$O lacks spawn-gate.sh, or carries a copy that predates \`disk_admit\`, so this is NOT a full disk. Nothing was created. Check that \`df\` is on PATH and that the box's \$O carries spawn-gate.sh WITH \`disk_admit\` defined in it (a half-deployed or skewed box fails closed here, #2033) — waiting will NOT clear it, so re-dispatch once the probe answers."
+       else
+         echo "dispatch-merge: stopping the batch — the disk refusal is a fact about this box, not this issue; reclaim space ('cloud-cell-supervisor.sh prune') and re-dispatch, or let a peer box take the remaining issues"
+       fi
+       # ⛔ NEVER RELEASE A CLAIM FOR AN ISSUE THIS BATCH ALREADY **SPAWNED A LANE OR A CHAIN** FOR
+       # (review rounds 2 and 3). `SPAWNED_IDS` holds the lanes that ARE running; `CHAIN_IDS` holds the
+       # ids whose chain was started even when the lane spawn failed — releasing either lets a peer
+       # duplicate live work (the rule this file states at the chain-start failure path). Only the
+       # remainder — this issue and everything after it that nothing was started for — is released.
+       _dm_unspawned=""
+       _dm_seen=0
+       # ⛔ ITERATE `"$@"` — NOT `"$N" "$@"` (review round 5, P2 — MEASURED). `$N` is already the
+       # element being processed, so putting it FIRST set `_dm_seen=1` on iteration 1 and made the
+       # at-or-after guard below unreachable: a driver with batch `10 11 12` refusing at 11 released
+       # `10 11 12` instead of `11 12`, re-releasing an id an earlier per-issue arm had already
+       # released (`claims.sh` then returns 1 and the log gains a false alarm about work that was never
+       # started). The flag is set BEFORE the spawn/duplicate skips, so reaching this issue opens the
+       # window even when this issue itself is then skipped.
+       for _dm in "$@"; do
+         case "${_dm:-}" in ''|*[!0-9]*) continue ;; esac
+         [ "$_dm" = "$N" ] && _dm_seen=1
+         [ "$_dm_seen" -eq 1 ] || continue
+         case " $SPAWNED_IDS $CHAIN_IDS " in *" $_dm "*) continue ;; esac
+         case " $_dm_unspawned " in *" $_dm "*) continue ;; esac
+         _dm_unspawned="$_dm_unspawned $_dm"
+         release_issue_claim_unspawned "$_dm"
+       done
+       drop_dispatched_rows $_dm_unspawned 2>/dev/null || true
+       break ;;
     *) echo "#$N: $WT_RESULT — skipping (no lane, no chain)"; release_issue_claim_unspawned "$N"; drop_dispatched_rows "$N"; continue ;;
   esac
   WT_ABS="$REPO_ABS/.worktrees/$WT"
@@ -452,6 +517,7 @@ for N in "$@"; do
   # releasing the claim" ordering. Same rule as `${_lan-}` below: every variable this branch reads
   # must be safe when unset.
   if wt_spawn "chain-$N" "${REPO_ABS:-$REPO}" "CHAIN_CLAIM_COMMIT='$chain_gen' bash '$O/chain-merge.sh' '${REPO_ABS:-$REPO}' '$OR' $N '$BR'"; then
+    CHAIN_IDS="$CHAIN_IDS $N"   # the disk arm must not release a claim a live chain holds (round 3, P3)
     echo "        chain-$N (review->record->merge)${HARNESS_TOKEN:+ [harness=$HARNESS_TOKEN]}"
   else
     # The same disclosure on the refusal path (see the lane spawn above): a chain that never started

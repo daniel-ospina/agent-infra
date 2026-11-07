@@ -94,6 +94,8 @@ cleanup() {
   [ -f "$T/state/loop.pid" ] && kill "$(cat "$T/state/loop.pid" 2>/dev/null)" 2>/dev/null
   [ -f "$T/state2/loop.pid" ] && kill "$(cat "$T/state2/loop.pid" 2>/dev/null)" 2>/dev/null
   [ -f "$T/bare-state/loop.pid" ] && kill "$(cat "$T/bare-state/loop.pid" 2>/dev/null)" 2>/dev/null
+  # §19's per-arm state dirs: a loop left behind here keeps ticking at a deleted directory.
+  for _s in "$T"/s19*/loop.pid; do [ -f "$_s" ] && kill "$(cat "$_s" 2>/dev/null)" 2>/dev/null; done
   for p in $(cat "$T"/pids 2>/dev/null); do kill "$p" 2>/dev/null; done
   rm -rf "$T"
 }
@@ -110,6 +112,11 @@ export HOME="$T/home"
 export FLEET_SCHEDULE_STATE="$T/state"
 export FLEET_SCHEDULE_TICK=5
 export FLEET_SCHEDULE_JOB_TIMEOUT=30
+# ⛔ THE BOX LOCK IS PINNED INTO THE FIXTURE (#2890). One scheduler loop per BOX is the invariant, so
+# without this seam every case that starts a loop would CONTEND WITH THIS HOST'S OWN PRODUCTION
+# SCHEDULER — or, on a box with none, with the previous case's loop, since the mutex is deliberately
+# not scoped to the state dir. A per-run root keeps the suite hermetic AND keeps its cases independent.
+export FLEET_SCHEDULE_LOCK_ROOT="$T/box-lock"
 mkdir -p "$T/home" "$T/out"
 
 # ── fixture plists (written with plistlib, the same reader the scheduler uses) ─────────────────
@@ -2888,6 +2895,570 @@ PYMUTUR
 grep -q 'MUTATION RED' <<<"$mout18u" \
   && ok "18u MUTATION (blind return path) produces two holders — the case discriminates" \
   || bad "18u MUTATION stayed refused, so the case grades nothing: $mout18u"
+
+
+# ── 19. ONE LOOP PER BOX, not per $STATE (#2890) ────────────────────────────────────────────────
+# The defect: the loop's single-instance guard is scoped to $STATE, but the resource it guards is
+# the BOX. On cell-4 (2026-11-06, recorded on #2890) SEVEN `--loop` instances ran one job set on one
+# machine, resolving five different state dirs — a cell home, the operator's home, three lane-
+# worktree homes and a stale fixture home. Every one of them was internally correct; none could see
+# the others, and every due reaper/canary/doctor ran seven times, concurrently.
+#
+# Every arm drives the SHIPPED script through its real entry point. `s19` pins the box lock to a
+# per-run root, so the suite stays hermetic and the arms stay independent of each other AND of this
+# host's own production scheduler. Each arm KILLS its loop before the next starts: the whole point is
+# that only one loop may hold the box.
+#
+# ⛔ THE LOCK RECORD IS JSON, AND EVERY ARM BELOW WRITES IT AS JSON. The first cut of §19 wrote it
+# whitespace-separated, which `read_loop_lock()` rejects as corrupt — so 19d/19e were silently
+# exercise the CORRUPT-record path while claiming to grade the dead-pid and recycled-pid arms, and a
+# mutation deleting the whole start-time identity check left them green. Found by the [VGATE] pass.
+echo
+case_ "19. one scheduler loop per BOX, not per \$STATE (#2890)"
+L19="$T/box19"; mkdir -p "$L19"
+X19="$T/box19-x"; mkdir -p "$X19"
+s19() { # s19 <state> <templates> <args...>
+  local st="$1" dir="$2"; shift 2
+  env TEMPLATES_DIR="$dir" FLEET_SCHEDULE_STATE="$st" FLEET_SCHEDULE_LOCK_ROOT="$L19" \
+      python3 "$SCHED" "$@" 2>&1
+}
+s19loop() { # s19loop <state> [script] — foreground --loop, bounded so a NON-refusal cannot hang.
+  timeout 15 env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$1" FLEET_SCHEDULE_LOCK_ROOT="${3:-$L19}" \
+      python3 "${2:-$SCHED}" --loop 2>&1
+}
+lock19() { # lock19 <root> <pid> <start> <state> — write a real (JSON) lock record
+  python3 -c 'import json,sys; print(json.dumps({"pid": int(sys.argv[1]), "start": sys.argv[2], "state": sys.argv[3]}))' \
+    "$2" "$3" "$4" > "$1/loop.lock"
+}
+starttime19() { # starttime19 <pid> — the same /proc field the runtime records
+  python3 -c 'import sys;raw=open("/proc/%s/stat"%sys.argv[1]).read();print(raw[raw.rfind(")")+2:].split()[19])' "$1"
+}
+
+# 19a — the measured condition: a SECOND state dir on the same box.
+s19 "$T/s19a" "$GOOD" --start >/dev/null 2>&1
+pidA="$(cat "$T/s19a/loop.pid" 2>/dev/null)"
+if [ -n "$pidA" ] && kill -0 "$pidA" 2>/dev/null; then
+  ok "19a baseline: a loop is running for state dir A (pid $pidA)"
+else
+  bad "19a baseline loop never came up — the rest of §19 grades nothing"
+fi
+out19a="$(s19loop "$T/s19b")"; rc19a=$?
+[ "$rc19a" -eq 0 ] \
+  && ok "19a a second loop for a DIFFERENT state dir exits 0 (no failure signal on a healthy box)" \
+  || bad "19a the refused second loop exited $rc19a, not 0: $out19a"
+grep -q 'already has a scheduler' <<<"$out19a" \
+  && ok "19a the refusal says the BOX already has a scheduler" \
+  || bad "19a the refusal does not name the condition: $out19a"
+grep -q "pid $pidA" <<<"$out19a" \
+  && ok "19a the refusal NAMES the holding pid ($pidA)" \
+  || bad "19a the refusal does not name the holding pid: $out19a"
+grep -q '\$STATE=' <<<"$out19a" \
+  && ok "19a the refusal names the state dir that holds it" \
+  || bad "19a the refusal does not say where the holder keeps its state: $out19a"
+[ ! -f "$T/s19b/loop.pid" ] \
+  && ok "19a the refused loop left NO loop.pid — it ran no pass of its own" \
+  || bad "19a the refused loop wrote a pidfile: $(cat "$T/s19b/loop.pid" 2>/dev/null)"
+[ ! -f "$T/s19b/tick" ] \
+  && ok "19a the refused loop left NO tick" || bad "19a the refused loop ticked"
+kill -0 "$pidA" 2>/dev/null \
+  && ok "19a the HOLDER survived the refused start" || bad "19a the refused start killed the holder"
+
+# 19b — `--start` from the second home must say "already running", not "did not come up". That false
+# FAIL is what would brick a two-home cell's bring-up (#3029).
+out19b="$(s19 "$T/s19b" "$GOOD" --start)"; rc19b=$?
+[ "$rc19b" -eq 0 ] \
+  && ok "19b --start from the second home exits 0 (no false 'did not come up')" \
+  || bad "19b --start from a second home failed (rc=$rc19b): $out19b"
+grep -q 'loop already running' <<<"$out19b" \
+  && ok "19b --start reports the existing box scheduler instead of failing" \
+  || bad "19b --start did not report the existing scheduler: $out19b"
+# ⛔ AND IT MUST NOT THEN CLAIM IT STARTED ONE. "loop started (pid N)" over a loop this verb did not
+# create is a false report to the operator — and it reported the OTHER home's pid.
+grep -q 'loop started' <<<"$out19b" \
+  && bad "19b --start claimed 'loop started' when it started nothing: $out19b" \
+  || ok "19b --start does not claim to have started a loop it did not start"
+[ ! -f "$T/s19b/loop.pid" ] \
+  && ok "19b the second home started no loop of its own" \
+  || bad "19b a second loop.pid exists for the second home"
+
+# 19c — `--verify` from the second home must not report a DEAD scheduler, and must disclose who does
+# hold the box. ⛔ THIS ARM CANNOT GRADE THE VERDICT-LINE CRASH, AND DOES NOT PRETEND TO: the second
+# home has no job stamps, so `cmd_verify` appends its per-job NEVER-RUN failures and returns BEFORE
+# the verdict line — which is exactly why a `grep 'FAIL:'` here is vacuous (the real failure format
+# is `  FAIL   <label>: …`, three spaces and no colon after FAIL, so the pattern never matched even
+# when the line WAS printed). The [VGATE] pass proved it: all three greps below pass against a
+# pre-fix mutant that still has the `%d`/None crash. The crash is graded by 19c2, the verb bring-up
+# actually runs, which reaches the verdict line because its inline pass writes the stamps first.
+out19c="$(s19 "$T/s19b" "$GOOD" --verify)"
+grep -q 'DIFFERENT state dir' <<<"$out19c" \
+  && ok "19c --verify names that the box is scheduled under another state dir" \
+  || bad "19c --verify does not disclose the foreign holder: $out19c"
+grep -q 'NOT RUNNING' <<<"$out19c" \
+  && bad "19c --verify reported a DEAD scheduler on a scheduled box (the false FAIL that bricks bring-up)" \
+  || ok "19c --verify does not claim the box's scheduler is dead"
+grep -q 'Traceback' <<<"$out19c" \
+  && bad "19c the foreign-holder arm died with a traceback: $out19c" \
+  || ok "19c the foreign-holder arm did not die with a traceback"
+[ "$(s19 "$T/s19b" "$GOOD" --verify >/dev/null 2>&1; echo $?)" -eq 0 ] \
+  && ok "19c --verify from a second home is rc 0 when the holder IS passing (it grades the holder)" \
+  || bad "19c --verify from a second home refuses a box whose holder is passing"
+
+# 19c2 — `--install` is the verb bring-up actually runs, and it reaches the verdict line through
+# `return cmd_verify()`. On a two-home box it must finish cleanly, not die on a format specifier.
+out19c2="$(s19 "$T/s19b" "$GOOD" --install)"; rc19c2=$?
+# ⛔ THE VERDICT LINE MUST HAVE BEEN REACHED, or this arm inherits 19c's blindness. `--install`
+# writes the stamps inline, so every job is fresh and the run reaches `SCHEDULE VERIFIED` — where
+# the pre-fix `%d` on a None pid raised TypeError, which `main`'s net reported as
+# `FAIL: --install: TypeError: %d format: …` and rc=1.
+grep -q 'SCHEDULE VERIFIED' <<<"$out19c2" \
+  && ok "19c2 --install from a second home reached the VERDICT LINE (so 19c2 grades it)" \
+  || bad "19c2 never reached the verdict line, so 19c2 grades nothing about it: $out19c2"
+grep -qE 'FAIL:|Traceback' <<<"$out19c2" \
+  && bad "19c2 --install from a second home crashed or failed: $out19c2" \
+  || ok "19c2 --install from a second home produces no FAIL line and no traceback"
+[ "$rc19c2" -eq 0 ] \
+  && ok "19c2 --install from a second home exits 0 (a two-home cell can still be brought up)" \
+  || bad "19c2 --install from a second home exited $rc19c2: $out19c2"
+kill "$pidA" 2>/dev/null; sleep 1
+[ ! -f "$L19/loop.lock" ] && ok "19c the stopped holder released the box lock" \
+                          || bad "19c the box lock outlived its holder"
+
+# 19d — a stale lock (holder provably gone) is RECLAIMED, not deferred to for ever. This is the arm
+# that stops the guard becoming #1985: a lock whose owner died must never disable the box.
+/bin/true & deadpid=$!; wait "$deadpid" 2>/dev/null
+lock19 "$L19" "$deadpid" "$(starttime19 $$)" "$T/s19-gone"
+out19d="$(s19 "$T/s19d" "$GOOD" --start)"; rc19d=$?
+pid19d="$(cat "$T/s19d/loop.pid" 2>/dev/null)"
+[ -n "$pid19d" ] && kill -0 "$pid19d" 2>/dev/null \
+  && ok "19d a STALE lock (dead holder pid $deadpid) is reclaimed and the loop starts" \
+  || bad "19d a stale lock wedged the box (rc=$rc19d): $out19d"
+kill "$pid19d" 2>/dev/null; sleep 1
+
+# 19e — LIVENESS IS NOT IDENTITY (#1985), part 1: a RECYCLED pid. The pid is ALIVE **and carries the
+# start time the lock records** (it is the pid of the process reading this line, re-used as a
+# stand-in for "the pid now belongs to a different program"), so the START-TIME arm cannot save us —
+# the COMMAND-LINE arm has to. A bare-pid guard defers to a stranger that never releases the lock.
+lock19 "$L19" "$$" "$(starttime19 $$)" "$T/s19-recycled"
+out19e="$(s19 "$T/s19e" "$GOOD" --start)"; rc19e=$?
+pid19e="$(cat "$T/s19e/loop.pid" 2>/dev/null)"
+[ -n "$pid19e" ] && kill -0 "$pid19e" 2>/dev/null \
+  && ok "19e a RECYCLED pid (alive, matching start, not a loop) is not the holder — reclaimed" \
+  || bad "19e a recycled pid blocked the box (rc=$rc19e): $out19e"
+kill "$pid19e" 2>/dev/null; sleep 1
+
+# 19e2 — part 2: the START-TIME arm itself. The lock records a pid that IS a live `fleet-schedule
+# --loop` but with the start time of a DIFFERENT incarnation — exactly what a recycled pid looks like
+# after a SIGKILL. The command-line arm says "alive", so only the start-time comparison can tell that
+# this is not the holder. Without it the box is stopped by a stranger AND cannot repair the lock it
+# defers to.
+s19 "$T/s19e2" "$GOOD" --start >/dev/null 2>&1
+pidE2="$(cat "$T/s19e2/loop.pid" 2>/dev/null)"
+# ⛔ THE BASELINE IS PART OF THE ARM. Without it, a failed `--start` leaves `pidE2` empty, `lock19`
+# dies on `int("")` AFTER the shell already truncated the lock, the second start then reclaims via
+# the CORRUPT-record path (19f2's case) and the arm goes green while grading nothing about the
+# start-time identity — the [VGATE] pass reproduced exactly that.
+if [ -n "$pidE2" ] && kill -0 "$pidE2" 2>/dev/null; then
+  ok "19e2 baseline: a live loop holds the box before the start-time probe (pid $pidE2)"
+else
+  bad "19e2 baseline loop never came up — the arm grades nothing (pidE2='$pidE2')"
+fi
+lock19 "$L19" "$pidE2" "1" "$T/s19-elsewhere"
+out19e2="$(s19 "$T/s19e2b" "$GOOD" --start)"; rc19e2=$?
+pid19e2="$(cat "$T/s19e2b/loop.pid" 2>/dev/null)"
+if [ -n "$pid19e2" ] && kill -0 "$pid19e2" 2>/dev/null && [ "$pid19e2" != "$pidE2" ]; then
+  ok "19e2 a live loop pid with the WRONG start time is not the holder — reclaimed (the start arm is load-bearing)"
+else
+  bad "19e2 the start-time arm did not reclaim a recycled identity (rc=$rc19e2): $out19e2"
+fi
+kill "$pidE2" 2>/dev/null; kill "$pid19e2" 2>/dev/null; sleep 1
+
+# 19f — an EMPTY recorded start time is an ABSENT datum (a box with no readable /proc), so the
+# command line alone decides. The live loop must still be recognised: the identity arm may not
+# silently disable the guard. ⛔ THIS ARM CAUGHT A REAL FAIL-OPEN in the first cut: the record was
+# whitespace-separated, so an empty `start` collapsed the fields, the state PATH was read as a start
+# time, the comparison failed, and a second scheduler JOINED the live one.
+s19 "$T/s19f" "$GOOD" --start >/dev/null 2>&1
+pid19f="$(cat "$T/s19f/loop.pid" 2>/dev/null)"
+lock19 "$L19" "$pid19f" "" "$T/s19f"          # start field deliberately EMPTY
+out19f="$(s19loop "$T/s19f2")"
+grep -q "pid $pid19f" <<<"$out19f" \
+  && ok "19f an EMPTY recorded start time still refuses (the command line alone is enough)" \
+  || bad "19f an empty start field disabled the guard: $out19f"
+kill "$pid19f" 2>/dev/null; sleep 1
+
+# 19f2 — the other side of the same boundary: a CORRUPT record must not wedge the box (#1985). An
+# unreadable lock answers "no readable holder", which RECLAIMS.
+printf 'not json at all\n' > "$L19/loop.lock"
+out19f2="$(s19 "$T/s19f2b" "$GOOD" --start)"; rc19f2=$?
+pid19f2="$(cat "$T/s19f2b/loop.pid" 2>/dev/null)"
+[ -n "$pid19f2" ] && kill -0 "$pid19f2" 2>/dev/null \
+  && ok "19f2 a CORRUPT box lock is reclaimed, not deferred to for ever" \
+  || bad "19f2 a corrupt lock wedged the box (rc=$rc19f2): $out19f2"
+kill "$pid19f2" 2>/dev/null; sleep 1
+
+# 19m — a lock record whose pid is NOT AN INTEGER (`1e400` is valid JSON and parses to `inf`) must be
+# RECLAIMED, not raised out of the recovery path. ⛔ `OverflowError` is not a `ValueError` — the trap
+# `pid_alive` documents. Pre-fix, `--loop`, `--start`, `--install` and `--verify` all died with
+# `OverflowError: cannot convert float infinity to integer`, leaving the cell with no scheduler and
+# its own repair verb refusing. (`{"pid": NaN}` raised ValueError and was already caught — which is
+# what made the gap invisible.)
+printf '{"pid": 1e400, "start": "1", "state": "/elsewhere"}\n' > "$L19/loop.lock"
+out19m="$(s19 "$T/s19m" "$GOOD" --start)"; rc19m=$?
+pid19m="$(cat "$T/s19m/loop.pid" 2>/dev/null)"
+[ -n "$pid19m" ] && kill -0 "$pid19m" 2>/dev/null \
+  && ok "19m a non-finite pid in the lock is reclaimed, not raised (--start works)" \
+  || bad "19m a non-finite pid wedged every verb (rc=$rc19m): $out19m"
+grep -q 'OverflowError' <<<"$out19m" \
+  && bad "19m OverflowError escaped the recovery path: $out19m" \
+  || ok "19m no OverflowError reached the caller"
+kill "$pid19m" 2>/dev/null; sleep 1
+
+# 19n — NON-VACUITY for the RECLAIM ITSELF. The staleness decision is made BEFORE the rename, so a
+# competitor that publishes its OWN live claim inside that window must not have it renamed away and
+# deleted: pre-fix, both starters then conclude they hold the box (the #2890 defect re-created by the
+# lock's own reclaim). Driven in-process so the window is deterministic — `os.rename` is wrapped to
+# install the competitor's record immediately before the move, which is exactly the interleaving the
+# [VGATE] pass reproduced with real kernel ops.
+out19n="$(python3 - "$SCHED" "$T/s19n" "$L19/n" "$$" <<'PY19N' 2>&1
+import importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+root, live = sys.argv[3], int(sys.argv[4])
+os.makedirs(root, exist_ok=True)
+m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(root, "loop.lock")
+# Two stubs, so the interleaving is the only thing under test: every pid reads as alive, and only the
+# COMPETITOR reads as a scheduler loop. The competitor's recorded start time is its REAL one, so the
+# identity check recognises it — otherwise the test would be grading the start arm, not this one.
+m.pid_alive = lambda p: True
+m.pid_is_our_loop = lambda p: p == live
+competitor_start = m.proc_start_time(live)
+# A STALE record is what we judge and decide to reclaim.
+with open(m.LOOP_LOCK, "w") as fh:
+    fh.write(json.dumps({"pid": 999999, "start": "1", "state": "/stale"}))
+real_rename = os.rename
+def racy_rename(src_path, dst_path):
+    # The competitor publishes its LIVE claim the instant before we move the name aside.
+    with open(m.LOOP_LOCK, "w") as fh:
+        fh.write(json.dumps({"pid": live, "start": competitor_start, "state": "/competitor"}))
+    return real_rename(src_path, dst_path)
+os.rename = racy_rename
+try:
+    got = m.claim_loop_lock()
+finally:
+    os.rename = real_rename
+try:
+    survivor = json.load(open(m.LOOP_LOCK))
+except Exception:
+    survivor = None
+print("CLAIM %r" % (got,))
+print("SURVIVOR %r" % (survivor,))
+PY19N
+)"
+grep -q "CLAIM None" <<<"$out19n" \
+  && bad "19n the reclaim STOLE a live claim published inside its own window (claim returned None = 'I hold the box')" \
+  || ok "19n the reclaim did not steal a live claim published inside its window"
+grep -q "'state': '/competitor'" <<<"$out19n" \
+  && ok "19n the competitor's claim SURVIVED the lost reclaim" \
+  || bad "19n the competitor's live claim was destroyed by the reclaim: $out19n"
+
+# 19o — a lock root that refuses `link(2)` (FUSE, some tmpfs) must still be claimable: the guard
+# falls back to the atomic create rather than degrading to a permit. Ungraded until the [VGATE] pass
+# pointed out that a mutant deleting the fallback stayed green.
+out19o="$(python3 - "$SCHED" "$T/s19o" "$L19/o" <<'PY19O' 2>&1
+import errno, importlib.util, os, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+os.makedirs(sys.argv[3], exist_ok=True)
+m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(sys.argv[3], "loop.lock")
+os.makedirs(m.STATE, exist_ok=True)
+real_link = os.link
+def no_link(a, b, *rest, **kw):
+    raise OSError(errno.EOPNOTSUPP, "Operation not supported")
+os.link = no_link
+try:
+    got = m.claim_loop_lock()
+finally:
+    os.link = real_link
+rec = m.read_loop_lock()
+print("CLAIM %r" % (got,))
+print("RECORD %r" % (rec,))
+PY19O
+)"
+grep -q "CLAIM None" <<<"$out19o" \
+  && ok "19o a link-refusing lock root is still CLAIMED (atomic-create fallback)" \
+  || bad "19o a link-refusing root was not claimed — the guard silently permitted: $out19o"
+grep -q "GUARD OFF" <<<"$out19o" \
+  && bad "19o the fallback took the permit path (disclosed) instead of claiming: $out19o" \
+  || ok "19o the fallback did NOT fall through to a silent permit"
+
+# 19p — NON-VACUITY for the reclaim's DISCLOSURE. When a third claim takes the name before the
+# restore, the displaced claim's record must be PRESERVED and the outcome ANNOUNCED: deleting it is
+# how two loops run with nothing in any log. Driven in-process, with `os.link` stubbed to fail only
+# for the RESTORE so the third-party takeover is deterministic.
+out19p="$(python3 - "$SCHED" "$T/s19p" "$L19/p" "$$" <<'PY19P' 2>&1
+import errno, importlib.util, json, os, sys
+spec = importlib.util.spec_from_file_location("fsched", sys.argv[1])
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+root, live = sys.argv[3], int(sys.argv[4])
+os.makedirs(root, exist_ok=True)
+m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(root, "loop.lock")
+m.pid_alive = lambda p: True
+m.pid_is_our_loop = lambda p: p == live
+start = m.proc_start_time(live)
+with open(m.LOOP_LOCK, "w") as fh:
+    fh.write(json.dumps({"pid": 999999, "start": "1", "state": "/stale"}))
+real_rename, real_link = os.rename, os.link
+def racy_rename(a, b):
+    with open(m.LOOP_LOCK, "w") as fh:      # the competitor's LIVE claim lands just before the move
+        fh.write(json.dumps({"pid": live, "start": start, "state": "/competitor"}))
+    return real_rename(a, b)
+def blocked_link(a, b, *r, **k):
+    # A THIRD party takes the freed name — but ONLY for the RESTORE. The initial claim's own
+    # `link(staged, LOOP_LOCK)` must reach the real kernel (it fails EEXIST legitimately, because the
+    # stale record is still there), so the stub fails only when the SOURCE is a `.reclaim.` duplicate.
+    if ".reclaim." in str(a):
+        raise OSError(errno.EEXIST, "File exists")
+    return real_link(a, b, *r, **k)
+os.rename, os.link = racy_rename, blocked_link
+try:
+    got = m.claim_loop_lock()
+finally:
+    os.rename, os.link = real_rename, real_link
+kept = [f for f in os.listdir(root) if ".reclaim." in f]
+print("CLAIM %r" % (got,))
+print("KEPT %r" % (sorted(kept),))
+print("KEPT_RECORD %r" % (json.load(open(os.path.join(root, kept[0]))) if kept else None,))
+PY19P
+)"
+grep -q "'state': '/competitor'" <<<"$out19p" \
+  && ok "19p the DISPLACED live claim is PRESERVED on disk, not deleted" \
+  || bad "19p the restore failure destroyed the displaced claim's record: $out19p"
+grep -q 'GUARD OFF' <<<"$out19p" \
+  && ok "19p the lost restore is DISCLOSED (never a silent second loop)" \
+  || bad "19p the lost restore was silent: $out19p"
+
+# 19q — `--start` must still revive THIS state dir's OWN loop. The box-holder pre-check may only
+# short-circuit for a holder in ANOTHER state dir: an own-state holder whose pidfile went missing (a
+# state this file documents) used to fall into the "this state dir starts none" arm, leaving the
+# operator's OFF switch in place — the loop then exited and the box had no scheduler, while the
+# revival verb answered 0. Found by the [VGATE] pass; this path had no arm at all.
+s19 "$T/s19q" "$GOOD" --start >/dev/null 2>&1
+pidQ="$(cat "$T/s19q/loop.pid" 2>/dev/null)"
+if [ -n "$pidQ" ] && kill -0 "$pidQ" 2>/dev/null; then
+  ok "19q baseline: this state dir's own loop holds the box (pid $pidQ)"
+else
+  bad "19q baseline loop never came up — the arm grades nothing"
+fi
+rm -f "$T/s19q/loop.pid"                     # the documented "loop still runs, no pidfile" state
+: > "$T/s19q/OFF"                            # a deliberate stop the operator is now resuming
+out19q="$(s19 "$T/s19q" "$GOOD" --start)"; rc19q=$?
+[ "$rc19q" -eq 0 ] && ok "19q --start over an own-state holder exits 0" \
+                   || bad "19q --start exited $rc19q: $out19q"
+[ ! -f "$T/s19q/OFF" ] \
+  && ok "19q --start CLEARED the OFF switch for its own loop (the box stays scheduled)" \
+  || bad "19q --start left OFF in place over its own loop — the box dies at the next check: $out19q"
+grep -q 'starts none' <<<"$out19q" \
+  && bad "19q --start claimed 'this state dir starts none' about its OWN holder: $out19q" \
+  || ok "19q --start does not deny starting its own state dir's loop"
+kill "$pidQ" 2>/dev/null; sleep 1
+
+# 19r — `--install` is the verb bring-up runs, and its INLINE first pass is the box-level job set. On
+# a two-home box it must not run those jobs beside the holder's loop: that is the double-execution
+# this change exists to make impossible, and `--install` used to reach its pass before any box check
+# (measured by the [VGATE] pass: one job, two runs, one box).
+mkdir -p "$T/tpl19r"
+MARK19R="$T/out/s19r-marker.log"; : > "$MARK19R"
+python3 - "$T/tpl19r" "$MARK19R" <<'PY19R'
+import plistlib, os, sys
+tpl, mark = sys.argv[1], sys.argv[2]
+open(os.path.join(tpl, "RETIRED"), "w").write("# none\n")
+d = {"Label": "com.test.dup19r",
+     "ProgramArguments": ["/bin/sh", "-c", "echo run >> %s" % mark],
+     "StartInterval": 3600}
+with open(os.path.join(tpl, "com.test.dup19r.plist"), "wb") as fh:
+    plistlib.dump(d, fh)
+PY19R
+# ONE job set for BOTH homes — the real shape. Home A installs first, so its inline pass stamps the
+# job and its loop holds the box; that stamp is what makes the second home's verdict meaningful.
+s19 "$T/s19rA" "$T/tpl19r" --install >/dev/null 2>&1
+pidR="$(cat "$T/s19rA/loop.pid" 2>/dev/null)"
+[ -n "$pidR" ] && kill -0 "$pidR" 2>/dev/null \
+  && ok "19r baseline: a loop holds the box for state dir A (pid $pidR)" \
+  || bad "19r baseline loop never came up"
+n19r_before="$(wc -l < "$MARK19R" 2>/dev/null || echo 0)"
+[ "$n19r_before" -ge 1 ] \
+  && ok "19r baseline: the job has run $n19r_before time(s), so a second run would be visible" \
+  || bad "19r baseline: the job never ran even on the first install — the arm grades nothing"
+out19r="$(s19 "$T/s19rB" "$T/tpl19r" --install)"; rc19r=$?
+n19r_after="$(wc -l < "$MARK19R" 2>/dev/null || echo 0)"
+[ "$n19r_after" -eq "$n19r_before" ] \
+  && ok "19r --install on a two-home box ran NO box-level job ($n19r_after, unchanged)" \
+  || bad "19r --install ran the job BESIDE the live loop ($n19r_before -> $n19r_after): $out19r"
+grep -q 'inline first pass is SKIPPED' <<<"$out19r" \
+  && ok "19r --install SAYS the inline pass was skipped, and why" \
+  || bad "19r --install skipped nothing and did not say so: $out19r"
+grep -q 'SCHEDULE VERIFIED' <<<"$out19r" \
+  && ok "19r --install still reaches a verdict line (bring-up greps for it, so it must exist)" \
+  || bad "19r --install printed no verdict line, so cloud-cell-bringup.sh would die: $out19r"
+[ "$rc19r" -eq 0 ] \
+  && ok "19r --install on a two-home box exits 0 (the box IS scheduled, by the holder)" \
+  || bad "19r --install exited $rc19r on a two-home box: $out19r"
+# ⛔ THE POSITIVE CONTROL, without which the "ran NO job" assertion grades nothing: with the holder
+# gone, the SAME plist in the SAME state dir MUST run. That proves the fixture job is runnable and
+# that the skip above was the guard's doing, not an inert declaration.
+kill "$pidR" 2>/dev/null; sleep 1
+out19r2="$(s19 "$T/s19rB" "$T/tpl19r" --install)"; rc19r2=$?
+n19r_control="$(wc -l < "$MARK19R" 2>/dev/null || echo 0)"
+[ "$n19r_control" -gt "$n19r_after" ] \
+  && ok "19r CONTROL: with no holder, the same --install DOES run the job ($n19r_after -> $n19r_control) — the skip discriminates" \
+  || bad "19r CONTROL: the plist never runs even without a holder, so the skip assertion grades nothing: $out19r2"
+s19 "$T/s19rB" "$T/tpl19r" --stop >/dev/null 2>&1
+sleep 1
+
+# 19s — ⛔ THE WEDGED HOLDER, which is the arm that decides whether the two-home relaxation is a
+# false PASS. `--verify` from a second home must grade the HOLDER's tick: the previous cut SKIPPED the
+# staleness arm entirely and certified a holder whose tick was 3 hours old, which bring-up turns into
+# CELL READY on a cell with no reaping and no liveness detection (#1864, reproduced by [VGATE]).
+s19 "$T/s19s" "$GOOD" --start >/dev/null 2>&1
+pidS="$(cat "$T/s19s/loop.pid" 2>/dev/null)"
+if [ -n "$pidS" ] && kill -0 "$pidS" 2>/dev/null; then
+  ok "19s baseline: a loop holds the box for state dir S (pid $pidS)"
+else
+  bad "19s baseline loop never came up — the arm grades nothing"
+fi
+kill -STOP "$pidS" 2>/dev/null        # frozen: alive, and no longer passing
+touch -d '-1 hour' "$T/s19s/tick" 2>/dev/null || touch -t 197001010000 "$T/s19s/tick"
+out19s="$(s19 "$T/s19w" "$GOOD" --verify)"; rc19s=$?
+[ "$rc19s" -ne 0 ] \
+  && ok "19s --verify REFUSES a box whose foreign holder is wedged (rc=$rc19s)" \
+  || bad "19s --verify CERTIFIED a wedged foreign holder — a false PASS on a dead box: $out19s"
+grep -q 'tick is' <<<"$out19s" \
+  && ok "19s the refusal names the holder's STALE TICK" \
+  || bad "19s the refusal does not name the stale tick: $out19s"
+kill -CONT "$pidS" 2>/dev/null; kill "$pidS" 2>/dev/null; sleep 1
+
+# 19t — a STALE `loop.pid` in the second home (a recycled pid) must not brick a correctly-scheduled
+# box: the foreign arm used to be gated on `not pid`, so one stale byte made bring-up `die` (#3029).
+s19 "$T/s19tA" "$GOOD" --start >/dev/null 2>&1
+pidT="$(cat "$T/s19tA/loop.pid" 2>/dev/null)"
+sleep 30 & recycT=$!; echo "$recycT" >> "$T/pids"
+mkdir -p "$T/s19tB"
+printf '%s\n' "$recycT" > "$T/s19tB/loop.pid"   # the stale, recycled pid in the SECOND home
+out19t="$(s19 "$T/s19tB" "$GOOD" --install)"; rc19t=$?
+grep -q 'is not fleet-schedule' <<<"$out19t" \
+  && bad "19t a stale pidfile in the second home refused a correctly-scheduled box: $out19t" \
+  || ok "19t a stale loop.pid in the second home does NOT refuse the box"
+[ "$rc19t" -eq 0 ] \
+  && ok "19t --install from a home with a stale pidfile exits 0 (bring-up is not bricked)" \
+  || bad "19t --install exited $rc19t over a stale pidfile: $out19t"
+kill "$pidT" 2>/dev/null; kill "$recycT" 2>/dev/null
+
+# 19u — the same stale-pid rule INSIDE the graded dir: a recycled pid in the HOLDER's own loop.pid
+# must not refuse a box whose loop is verifiably alive behind the box lock. `cmd_loop` documents this
+# state (a failed pidfile write leaves the previous file intact), and `loop_pid()` answers "alive",
+# not "is the loop".
+s19 "$T/s19u" "$GOOD" --start >/dev/null 2>&1
+pidU="$(cat "$T/s19u/loop.pid" 2>/dev/null)"
+sleep 30 & recycU=$!; echo "$recycU" >> "$T/pids"
+printf '%s\n' "$recycU" > "$T/s19u/loop.pid"    # a recycled pid in the HOLDER's own dir
+out19u="$(s19 "$T/s19u" "$GOOD" --verify)"; rc19u=$?
+grep -q 'is not fleet-schedule' <<<"$out19u" \
+  && bad "19u a recycled pid in the holder's own loop.pid refused a passing box: $out19u" \
+  || ok "19u a recycled pid in the holder's own loop.pid does NOT refuse the box"
+[ "$rc19u" -eq 0 ] \
+  && ok "19u --verify passes: the identity-verified box lock outranks the pidfile" \
+  || bad "19u --verify exited $rc19u over a stale pidfile and a live loop: $out19u"
+# ⛔ NOT A BLANKET RESCUE: with NO live loop the stale pid must still be refused (case 4b's rule,
+# restated here so this arm cannot be satisfied by weakening the refusal).
+# ⛔ THE PIDFILE IS RESTORED BEFORE `--stop` ON PURPOSE. `cmd_stop` reads its target from `loop.pid`,
+# so stopping while the file holds the recycled pid TERMs an unrelated process, leaves the real loop
+# running, and leaks a BOX-lock holder into every later arm (measured: it turned 19h red). The stop
+# verb's reliance on `loop.pid` is the pre-existing subject of its own follow-up, not this arm's point.
+printf '%s\n' "$pidU" > "$T/s19u/loop.pid"
+s19 "$T/s19u" "$GOOD" --stop >/dev/null 2>&1
+sleep 1
+kill -0 "$pidU" 2>/dev/null && kill -9 "$pidU" 2>/dev/null
+sleep 30 & recycU2=$!; echo "$recycU2" >> "$T/pids"
+printf '%s\n' "$recycU2" > "$T/s19u/loop.pid"   # recycled pid, and NO loop behind it
+out19u2="$(s19 "$T/s19u" "$GOOD" --verify)"; rc19u2=$?
+[ "$rc19u2" -ne 0 ] && grep -q 'NOT RUNNING\|is not fleet-schedule' <<<"$out19u2" \
+  && ok "19u a stale pid with NO live loop is still REFUSED (the rescue is not a blanket pass)" \
+  || bad "19u a dead scheduler behind a stale pid was certified (rc=$rc19u2): $out19u2"
+kill "$recycU" "$recycU2" 2>/dev/null
+# belt and braces: this arm must not leave a box-lock holder for the arms that follow
+kill "$pidU" 2>/dev/null; sleep 1
+
+# 19g — an UNUSABLE lock root must NOT wedge the box: it degrades to the state dir and DISCLOSES it.
+: > "$T/not-a-dir"
+out19g="$(env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19g" \
+             FLEET_SCHEDULE_LOCK_ROOT="$T/not-a-dir/box" \
+             python3 "$SCHED" --start 2>&1)"; rc19g=$?
+pid19g="$(cat "$T/s19g/loop.pid" 2>/dev/null)"
+[ -n "$pid19g" ] && kill -0 "$pid19g" 2>/dev/null \
+  && ok "19g an unusable lock root still starts the loop (the box's alarm is not taken offline)" \
+  || bad "19g an unusable lock root refused to start the scheduler (rc=$rc19g): $out19g"
+grep -q 'box lock root' <<<"$out19g" \
+  && ok "19g the degraded guard is DISCLOSED on stderr, not silent" \
+  || bad "19g the degraded guard ran silently: $out19g"
+kill "$pid19g" 2>/dev/null; sleep 1
+
+# 19h — release on exit: a loop that stops must not leave its lock behind.
+s19 "$T/s19h" "$GOOD" --start >/dev/null 2>&1
+pid19h="$(cat "$T/s19h/loop.pid" 2>/dev/null)"
+[ -f "$L19/loop.lock" ] && ok "19h baseline: the running loop holds the box lock" \
+                       || bad "19h the running loop took no box lock"
+s19 "$T/s19h" "$GOOD" --stop >/dev/null 2>&1
+sleep 1
+[ ! -f "$L19/loop.lock" ] && ok "19h a loop that exited RELEASED its own lock" \
+                          || bad "19h the lock outlived its holder"
+kill "$pid19h" 2>/dev/null
+
+# 19i — NON-VACUITY, arm 1: defuse the CLAIM and the measured condition comes back (two state dirs,
+# two loops, one box).
+MUT19="$T/mut19"; mkdir -p "$MUT19"
+sed 's/^    holder = claim_loop_lock()$/    holder = None  # MUTANT/' "$SCHED" > "$MUT19/fleet-schedule.py"
+if grep -q 'MUTANT' "$MUT19/fleet-schedule.py"; then
+  L19M="$T/box19m"; mkdir -p "$L19M"
+  for arm in m1 m2; do
+    env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19$arm" FLEET_SCHEDULE_LOCK_ROOT="$L19M" \
+        python3 "$MUT19/fleet-schedule.py" --start >/dev/null 2>&1
+  done
+  n19m=0
+  for arm in m1 m2; do
+    p="$(cat "$T/s19$arm/loop.pid" 2>/dev/null)"
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then n19m=$((n19m + 1)); kill "$p" 2>/dev/null; fi
+  done
+  [ "$n19m" -eq 2 ] \
+    && ok "19i MUTATION (claim defused) => TWO loops on one box: the arms discriminate" \
+    || bad "19i MUTATION still produced $n19m loop(s) — §19 grades nothing"
+else
+  bad "19i could not build the mutant (the claim line moved) — the mutation arm did not run"
+fi
+
+# 19k — NON-VACUITY, arm 2: defuse the START-TIME half of the identity and 19e2 must go RED. This is
+# the arm the [VGATE] pass showed was completely ungraded: with the comparison deleted, every §19
+# assertion still passed, so the change's #1985 protection was untested.
+sed 's/^        if observed is not None and observed != start:$/        if False:  # MUTANT/' "$SCHED" \
+  > "$MUT19/fleet-schedule-k.py"
+if grep -q 'MUTANT' "$MUT19/fleet-schedule-k.py"; then
+  L19K="$T/box19k"; mkdir -p "$L19K"
+  env TEMPLATES_DIR="$GOOD" FLEET_SCHEDULE_STATE="$T/s19k" FLEET_SCHEDULE_LOCK_ROOT="$L19K" \
+      python3 "$MUT19/fleet-schedule-k.py" --start >/dev/null 2>&1
+  pidK="$(cat "$T/s19k/loop.pid" 2>/dev/null)"
+  lock19 "$L19K" "$pidK" "1" "$T/s19k-elsewhere"
+  out19k="$(s19loop "$T/s19k2" "$MUT19/fleet-schedule-k.py" "$L19K")"
+  if grep -q "pid $pidK" <<<"$out19k"; then
+    ok "19k MUTATION (start-time arm deleted) => the stale identity is DEFERRED to: 19e2 discriminates"
+  else
+    bad "19k the mutant reclaimed anyway — 19e2 grades nothing: $out19k"
+  fi
+  kill "$pidK" 2>/dev/null
+else
+  bad "19k could not build the start-time mutant (that line moved) — the mutation arm did not run"
+fi
 
 
 echo

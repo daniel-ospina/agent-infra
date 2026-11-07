@@ -256,6 +256,188 @@ disk_low() { # disk_low <free-mb>
   [ "$mb" -lt "$DISK_WARN_FREE_MB" ]
 }
 
+# ── the memory gate (agent-infra#2387) ─────────────────────────────────────────
+# THIS GATE CONSULTED LOAD AND DISK AND SAID NOTHING ABOUT MEMORY, and memory is the resource that
+# kills a box. MEASURED 2026-10-23 on cell-4 (16 GB): `dmesg` recorded SIX "killed process" OOM
+# events inside two hours while the controller kept dispatching, and the runs that died included the
+# P0 capstone lane — and every one of those spawns passed this file's load gate and disk floor. One
+# lane dying takes its whole batch with it, so the cost is not one lane: it is a night of the box's
+# capacity. Cross-check on the same night: cell-3 (4 vCPU) ran at load 14.0 with 14 `pi` resident and
+# cell-1 (8 vCPU) at 8.7 — so the load arm was not holding the fleet near any usable ceiling either.
+#
+# ⛔ WHAT THE INCIDENT'S OWN NUMBERS DO AND DO NOT PROVE (this file's rule: a measurement artifact is
+# not a state). `free -m` reading `available=8379 MB` on that 16 GB cell is a SNAPSHOT taken around
+# the events, and memory freed by the dead lanes cannot be distinguished from memory that was free
+# throughout — the reading is consistent with the OOMs and it does not date them. Worse, the other
+# quoted figure is `rc=143`, which is SIGTERM — the harness's OWN wall-clock watchdog (run_agent
+# below) or the stale-worker reaper — NOT the OOM killer's SIGKILL (137). So the rc=143 lanes are
+# evidence that lanes died, not evidence that memory killed them; the `dmesg` OOM lines are the
+# memory evidence. The defect this gate fixes does not depend on either reading: the spawn path
+# consulted NO memory figure at all, so no floor — not even a raised one — could bind it.
+#
+# THE RESERVE IS MEASURED, NOT GUESSED. A lane's peak working set is `pi` PLUS the test shard it
+# runs, so both halves were measured on this box (2026-10-23):
+#   * `pi` — all 54 resident `pi` processes: mean 56 MB, max 449 MB RSS.
+#   * one pytest shard — four EXECUTING shards against a private FalkorDB (tools/test_lane.py),
+#     `/usr/bin/time -l` maximum resident set size: 151 MB / 164 MB / 359 MB / 564 MB.
+# ⇒ 449 + 564 = 1013 MB for the worst pair observed, so the shipped reserve is 1024 MB (the pair's
+# sum at the mebibyte the unit is expressed in). ⛔ Both figures are SAMPLE MAXIMA (n=54 processes,
+# n=4 shards) and a sample maximum is a LOWER BOUND on the real peak, which is why the floor carries
+# two of them rather than one: MEM_SPAWN_RESERVE_LANES=2 pays for the lane being spawned AND a peer
+# already inside its own peak window — the allocation that actually lands on a peaking box.
+#
+# ⛔ MEMORY IS NOT THE LOAD ARM, AND IT DOES NOT REPLACE IT. MAX_LOAD is derived as 10x cores (ten
+# runnable tasks PER CORE), which is a generous ceiling that binds late; memory binds first because
+# the resident population's peak is what OOM-kills. This gate therefore refuses on the READING, not
+# on a lane count: capacity stays MEASURED (agent-infra#2387 forbids a lane cap, and a fixed number
+# sized for one box is wrong for the next).
+#
+# ⛔ THE POLARITY IS THE DISPATCH GATE'S, NOT THE DISK GATE'S — FAIL CLOSED. The disk floor fails
+# OPEN on an unreadable probe because one bad `df` must not stop every lane on the box for ever; a
+# memory probe that cannot answer is different in kind: there is nothing here that turns "I could not
+# read it" into a number — the reading arrives as an ARGUMENT to `mem_gate_verdict`, and an empty one
+# is never a default that reads as data — and treating an unanswered probe as capacity is exactly how
+# a box talks itself into an OOM. So the verdict is UNREADABLE, it is REFUSED, and it says so with
+# that word. This is the same ruling orch-loop.sh's own memory arm makes (`mem_spawn_ok`,
+# agent-infra#1732: "UNKNOWN is not ample"); the two populations must not disagree about what a
+# failed probe means.
+MEM_LANE_RESERVE_MB="${MEM_LANE_RESERVE_MB:-1024}"
+is_limit "${MEM_LANE_RESERVE_MB:-}" || MEM_LANE_RESERVE_MB=1024
+# A 0 reserve would make every reading pass — the no-op gate this file is written against (the same
+# guard, for the same reason, as DISK_MIN_FREE_MB's and _NCPU's).
+[ "${MEM_LANE_RESERVE_MB:-0}" -ge 1 ] || MEM_LANE_RESERVE_MB=1024
+# ⛔ AND IT MUST LEAVE THE DERIVED FLOOR IN RANGE (review discipline this file already applies to the
+# disk floor's 4x warn band). `is_limit` accepts 9 digits, so it accepts 999999999 — but the floor is
+# reserve x lanes, and 2 x 999999999 is TEN digits: out of range by the very predicate that guards a
+# PROVIDED value. The widest reserve that keeps a 2x floor expressible is 249999999 (2x it is
+# 499999998). An out-of-range value is repaired at SOURCE time, like every other tunable here.
+[ "${MEM_LANE_RESERVE_MB:-0}" -le 249999999 ] || MEM_LANE_RESERVE_MB=1024
+MEM_SPAWN_RESERVE_LANES="${MEM_SPAWN_RESERVE_LANES:-2}"
+is_limit "${MEM_SPAWN_RESERVE_LANES:-}" || MEM_SPAWN_RESERVE_LANES=2
+[ "${MEM_SPAWN_RESERVE_LANES:-0}" -ge 1 ] || MEM_SPAWN_RESERVE_LANES=2
+# ⛔ AND THE UPPER GUARD, WHICH THIS PAIR WAS MISSING (review, P2). The reserve above carries one and
+# the LANE FACTOR did not, so the absurd input the guard exists for was only caught one level down: a
+# 9-digit factor produced a 13-digit floor, `is_limit` rejected THAT, and the floor was repaired to
+# 2048 — while the plist/`$ENV_FILE` an operator reads still stated a lane factor of 999999999, i.e.
+# "a value this installer accepts must be the value the gate uses" broken in the other direction. Both
+# factors are now repaired at SOURCE time by the same bound, so the derivation stays expressible
+# (249999999 x 249999999 is still too wide, which is why the FLOOR keeps its own `is_limit` net
+# below — the two guards are complementary, not redundant).
+[ "${MEM_SPAWN_RESERVE_LANES:-0}" -le 249999999 ] || MEM_SPAWN_RESERVE_LANES=2
+# The FLOOR, in MB, and it is the number the refusal prints. An operator who wants a different floor
+# sets THIS (one knob, no arithmetic to get wrong); the two factors above exist so the default can be
+# audited against the measurement rather than appearing from nowhere.
+MEM_MIN_AVAIL_MB="${MEM_MIN_AVAIL_MB:-$(( 10#${MEM_LANE_RESERVE_MB:-1024} * 10#${MEM_SPAWN_RESERVE_LANES:-2} ))}"
+# ⛔ THE FALLBACK IS A TRUE DEFAULT, NOT A RE-DERIVATION (the MAX_LOAD rule, applied here because it
+# is the same trap): a guard that falls back to `reserve x lanes` is a NO-OP when the garbage CAME
+# from that multiplication — a 9-digit factor (or an operator's absurd MEM_MIN_AVAIL_MB) re-derives
+# the same out-of-range value. Only the shipped literal is genuinely in range there.
+is_limit "${MEM_MIN_AVAIL_MB:-}" || MEM_MIN_AVAIL_MB=2048
+# A 0 floor would satisfy `[ "$mb" -lt 0 ]` for no reading at all, i.e. never refuse — the no-op
+# shape again. Repaired to the shipped derivation.
+[ "${MEM_MIN_AVAIL_MB:-0}" -ge 1 ] || MEM_MIN_AVAIL_MB=2048
+
+# Available memory as MB. Linux: /proc/meminfo `MemAvailable`, falling back to `MemFree`+`Cached` on a
+# kernel too old to expose it; macOS: `free` + `inactive` vm_stat pages.
+#
+# ⛔ `MemAvailable`, NEVER `MemFree`: page cache makes `MemFree` a lie about headroom. MEASURED on
+# this box at the time of writing: vm_stat `Pages free` ≈ 135 MB while `free`+`inactive` ≈ 9 GB — a
+# gate built on free-only would refuse every spawn on a perfectly healthy machine, and on Linux the
+# identical mistake reads `MemFree` in the low hundreds of MB against a ~9 GB `MemAvailable`.
+# ⛔ THIS IS THE SAME FUNCTION orch-loop.sh CARRIES, BYTE FOR BYTE, AND spawn-gate.test.sh PINS THAT.
+# There are now two populations reading available memory — the controller's dispatch gate
+# (agent-infra#1732) and this spawn gate — and two readers that can drift apart would let one say
+# "ample" while the other refuses the spawn it just authorised. The pin is a text equality of the
+# two bodies, so a change to either is a change to both.
+# ⚠️ STATED LIMIT on the macOS branch, deliberately left as one: it sums `free` + `inactive` and not
+# `Pages speculative` (measured here: 477 pages x 16 KiB ≈ 7 MB, i.e. 0.7% of the 1024 MB reserve and
+# inside its noise). Adding it is one edit in BOTH files, which is what the pin above is for.
+# ⛔ A FIELD THAT IS PRESENT BUT NOT A NUMBER IS UNREADABLE, NEVER A READING (review, blocking). The
+# parser used to test only `a != ""`, so `MemAvailable: notanumber kB` reached `printf "%d"` and awk
+# COERCED it to `0` with exit 0 — measured: `probe rc=0 out=0`, i.e. a broken probe was reported as
+# `LOW MemAvailable=0M`, the wait-for-lanes remedy, and a fabricated `0` written into
+# `state/mem-avail.tsv`, the ledger whose stated purpose is to be the measurement an operator trusts
+# after an incident. The regex below is the whole guard: a non-numeric field `exit 1`s like an absent
+# one, so it reaches `mem_gate_verdict`'s UNREADABLE arm (which names the broken probe) and never a
+# number. Same for the macOS page size — see the `ps` guard, which no longer substitutes 16384.
+# The argument is a TEST SEAM (the call site passes nothing), the same idiom as `load1`'s and
+# orch-loop.sh's own `mem_avail_mb`.
+mem_avail_mb() { # [<meminfo-file>]
+  local p="${1:-/proc/meminfo}" mb
+  if [ -r "$p" ]; then
+    mb="$(awk '
+      /^MemAvailable:/ {a=$2}
+      /^MemFree:/ {f=$2}
+      /^Cached:/ {c=$2}
+      END {if (a!="") v=a; else if (f!="" && c!="") v=f+c; else exit 1
+           if (v !~ /^[0-9]+$/) exit 1
+           printf "%d", v/1024}' "$p" 2>/dev/null)" || return 1
+  else
+    mb="$(vm_stat 2>/dev/null | awk '
+      /page size of/ {ps=$8}
+      /Pages free/ {gsub(/[.]/,"",$3); f=$3}
+      /Pages inactive/ {gsub(/[.]/,"",$3); i=$3}
+      END {if (ps !~ /^[0-9]+$/) exit 1; if (f=="" || i=="") exit 1
+           printf "%d", (f+i)*ps/1048576}')" || return 1
+  fi
+  is_num "$mb" || return 1
+  printf '%s\n' "$mb"
+}
+
+# mem_gate_verdict <avail-mb> — the ONE memory gate, three states, and the evidence in the line.
+# Prints ONE line whose FIRST WORD is the state, and returns 0 = OK (spawn allowed), 1 = LOW
+# (refused), 2 = UNREADABLE (refused). The line is what the caller LOGS VERBATIM, which is why it
+# carries the reading, the floor and the arithmetic: a refusal an operator cannot re-compute against
+# the box is the next bug (the `[disk-gate] REFUSED … < floor` shape, one gate over).
+# ⛔ AN ERRORED COMPARISON MUST NOT READ AS "AMPLE". `[ "$mb" -ge F ]` on a value above bash's
+# integer range returns non-zero, so an `if [ low ] … else OK` shape would ALLOW on a reading it
+# could not compare. The disk gate carries that as a STATED LIMIT (its polarity is fail-open, so
+# there it costs one missing warning line); here the polarity is fail-CLOSED and the same shape would
+# be a silent hole, so the comparison is made explicitly in BOTH directions and anything else —
+# blank, non-numeric, or too long to compare — is UNREADABLE.
+mem_gate_verdict() { # <avail-mb>
+  local mb="${1:-}" derive
+  if [ -z "$mb" ]; then
+    printf 'UNREADABLE MemAvailable — the probe answered nothing USABLE (no readable /proc/meminfo, a MemAvailable field that is not a number, or vm_stat did not answer), so there is no reading to compare against mem_min_avail_mb=%sM' "$MEM_MIN_AVAIL_MB"
+    return 2
+  fi
+  case "$mb" in
+    ''|*[!0-9]*)
+      printf 'UNREADABLE MemAvailable=%s — the probe answered something that is not a number, so it is not a reading' "$mb"
+      return 2 ;;
+  esac
+  # 18 digits is above any real memory in MB and below bash's integer range; beyond it the comparison
+  # itself is the thing that fails, and an incomparable reading is UNREADABLE rather than ample.
+  if [ "${#mb}" -gt 18 ]; then
+    printf 'UNREADABLE MemAvailable=%s — %s digits, longer than any comparable reading (the comparison would error and a non-zero comparison is not "ample")' "$mb" "${#mb}"
+    return 2
+  fi
+  if [ "$mb" -lt "$MEM_MIN_AVAIL_MB" ]; then
+    # ⛔ THE ARITHMETIC IS PRINTED ONLY WHEN IT IS THE ONE THAT PRODUCED THE FLOOR (review P3).
+    # `MEM_MIN_AVAIL_MB` is a first-class knob and the default is DERIVED from the two factors, so a
+    # blanket `(= reserve x lanes)` printed `4096M (= 1024M x 2)` for an operator who set 4096 — a
+    # false equation in the one line whose purpose is to let the reader recompute the floor against
+    # the box, and it would steer them to "fix" a reserve that is not what bound. When the floor IS
+    # the derivation the equation is printed; otherwise the derivation is printed as what it is, and
+    # the line says the factors did not bind.
+    derive=$(( 10#${MEM_LANE_RESERVE_MB:-1024} * 10#${MEM_SPAWN_RESERVE_LANES:-2} ))
+    if [ "$MEM_MIN_AVAIL_MB" = "$derive" ]; then
+      printf 'LOW MemAvailable=%sM < mem_min_avail_mb=%sM (= mem_lane_reserve_mb=%sM x mem_spawn_reserve_lanes=%s: one pi lane plus one pytest shard, measured)' \
+        "$mb" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES"
+    else
+      printf 'LOW MemAvailable=%sM < mem_min_avail_mb=%sM (SET BY THE OPERATOR, not the shipped derivation — which is mem_lane_reserve_mb=%sM x mem_spawn_reserve_lanes=%s = %sM, so those factors are NOT what bound this refusal)' \
+        "$mb" "$MEM_MIN_AVAIL_MB" "$MEM_LANE_RESERVE_MB" "$MEM_SPAWN_RESERVE_LANES" "$derive"
+    fi
+    return 1
+  fi
+  [ "$mb" -ge "$MEM_MIN_AVAIL_MB" ] || {
+    printf 'UNREADABLE MemAvailable=%s — the comparison against mem_min_avail_mb=%sM did not succeed in either direction' "$mb" "$MEM_MIN_AVAIL_MB"
+    return 2
+  }
+  printf 'OK MemAvailable=%sM >= mem_min_avail_mb=%sM' "$mb" "$MEM_MIN_AVAIL_MB"
+  return 0
+}
+
 # ── THE HEADROOM GATE — ONE lane's tree, MEASURED (agent-infra#2721) ────────────────────────────
 # The floor above answers "is the filesystem full?". It cannot answer "does the checkout this spawn
 # is about to provision FIT?", and #2721 measured the consequence: cloud cell-4 (8 vCPU) reached
@@ -357,15 +539,29 @@ python_target() { # python_target <path>
 # silently turn the gate into "0 + 0 + 0" (admit always) — the inert-gate class the floor guards at
 # source time. An explicit `0` IS honoured: the test seam neutralises all three in one place, and an
 # operator zeroing the reserve is making a stated choice.
+# ⛔ THE TWO PYTHON-CLASS DEFAULTS (350 marginal / 6,144 worst case) AND THE RESERVE ARE NAMED HERE,
+# IN ONE PLACE, BECAUSE TWO SEAMS NOW READ THEM (review round 2, P2). `disk_lane_costs` (the live arm,
+# below) and `disk_worktree_terms` (the PRE-START seam, above) must not carry separate literals: raise
+# one and the other goes on admitting on the old number — which is #3395's own defect (a refusal one
+# step too late) wearing a constant instead of an ordering. `DISK_LANE_*_PY_DEFAULT` are the shipped
+# numbers, overridable per cell only through the `DISK_LANE_*_MB` seams.
+DISK_LANE_TREE_PY_DEFAULT=350
+DISK_LANE_SELF_PY_DEFAULT=6144
+
+# disk_lane_reserve_default -> 4x the DISPATCH floor. ⛔ Computed from `DISK_MIN_FREE_MB`, NOT from
+# `DISK_WARN_FREE_MB` (review round 3, P2): the band is a NOISE threshold an operator lowers to quiet
+# logs, and wiring enforcement to a diagnostic knob means silencing a warning loosens admission.
+disk_lane_reserve_default() { printf '%s\n' "$(( 10#$DISK_MIN_FREE_MB * 4 ))"; }
+
 disk_lane_costs() { # disk_lane_costs <path>
   local p="${1:-.}" tree self reserve py=0
   python_target "$p" && py=1
-  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree=350; else tree=64; fi
-  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self=6144; else self=64; fi
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; elif [ "$py" = 1 ]; then tree="$DISK_LANE_TREE_PY_DEFAULT"; else tree=64; fi
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; elif [ "$py" = 1 ]; then self="$DISK_LANE_SELF_PY_DEFAULT"; else self=64; fi
   # 4x the DISPATCH floor — the same number the warn band defaults to, derived INDEPENDENTLY: the
   # reserve is enforcement, the band is reporting, and an operator lowering the band to quiet logs must
   # not be lowering admission with it (review round 3, P2).
-  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve=$(( 10#$DISK_MIN_FREE_MB * 4 )); fi
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$(disk_lane_reserve_default)"; fi
   printf '%s %s %s\n' "$tree" "$self" "$reserve"
 }
 
@@ -385,6 +581,302 @@ disk_headroom_ok() { # disk_headroom_ok <free-mb> <tree-mb> <self-mb> <reserve-m
   local mb="${1:-}"
   disk_readable "$mb" || return 0
   [ "$mb" -ge "$(disk_lane_need "${2:-0}" "${3:-0}" "${4:-0}")" ]
+}
+
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# ── THE PRE-START ADMISSION SEAM (agent-infra#3395) — the SAME predicate, READ BEFORE A WORKTREE
+# ════════════════════════════════════════════════════════════════════════════════════════════════
+# Everything above this line is the LIVE-DISPATCH arm: it runs inside `run_agent`, i.e. AFTER the
+# lane's worktree was materialised. #3395 measured what that ordering costs — a dispatch on cell-3
+# (98% used, 3.5 GB free) never reached `run_agent` at all, because the failure happened one step
+# earlier, in the worktree creation itself:
+#
+#   git worktree add -> fatal: cannot create directory at 'tools/ts': No space left on device
+#
+# and the dispatcher that produced it printed `df=` in a log line and asserted nothing. A `df` in a
+# log is a REPORT; a report is not a gate. So the same predicate is now ALSO callable from the shared
+# path the three DISPATCH paths use to create a lane checkout (`wt-lifecycle.sh`'s `wt_provision`, which
+# `dispatch-merge.sh`, `fix-one.sh` and `adopt-fix.sh` route through) and from a stable
+# verb, so a dispatcher that is not this tree's shell code (an ad-hoc pusher on another box) calls
+# THIS function instead of re-implementing `df`. That divergence — harness copy gated, ad-hoc copy
+# not — is the whole defect.
+# ⚠️ SCOPE, STATED (review rounds 2, 4 and 7): those three are the DISPATCH paths' route to a lane
+# checkout — not the only route to one, and not every checkout this tree ever creates. MANY scripts
+# still call `git worktree add` directly and are NOT
+# gated here — `stall-fix.sh` (a throwaway mend checkout), `ai-drainer.sh` (its own per-lane working
+# checkout, `wt-drainer-<name>`, created with a bare `git worktree add` and no admission at all),
+# `refresh-candidates.sh`,
+# `cloud-cell-supervisor.sh` and `cloud-cell-doctor.sh` (cell maintenance / hygiene checkouts), the
+# merge rail's own base-tree creation in `admin-merge.sh`, and `scratch-worktree.sh` (on the live
+# scout path), among others.
+# ⛔ NO COUNT IS GIVEN HERE, DELIBERATELY. This paragraph used to say "Five scripts" and name exactly
+# five. That number was FALSE, and so was every numeral that replaced it: run the census below and you
+# get many more files than five. A hand-maintained count rots, and a reader sizing the exposure from a
+# number nobody re-measures is worse off than one who enumerates. So ENUMERATE instead — this is the
+# script-scoped census, and it deliberately admits comments (a comment-only mention still lists the
+# file), which makes it a SUPERSET to audit rather than a list that can silently shrink. That command
+# filters `\.test\.sh$` and `retired/` and NOTHING ELSE — it does NOT drop the gated callers, so drop
+# those yourself after reading it (the three `wt_provision` callers, and this seam's own
+# `wt-lifecycle.sh`):
+#     git grep -l 'worktree add' -- 'scripts/*.sh' | grep -v '\.test\.sh$' | grep -v retired
+# Moving any of them onto `wt_provision` (or the `--disk-admit` verb) is the follow-up.
+#
+# ⛔ ONE PREDICATE, ON TWO BOUNDS — AND THE DIFFERENCE IS STATED, NOT GLOSSED (review round 2, P2).
+# `disk_admit` reads through `disk_free_mb_target` → `disk_free_mb`, classifies readability through
+# `disk_readable`, and derives its requirement through `disk_worktree_terms`, which takes the SAME
+# `DISK_LANE_SELF_PY_DEFAULT` and `disk_lane_reserve_default()` that the live arm's `disk_lane_costs`
+# uses — one set of numbers, not two. What it does NOT share is the live arm's per-TARGET classifier
+# (`python_target` → the marginal `tree`): see `disk_admit`'s note for why the PRE-START bound is the
+# worst case for any checkout, and README §7.2i for the cost of that choice.
+#
+# ⛔ POLARITY AT THIS SEAM IS FAIL-CLOSED, AND THAT IS NOT A CONTRADICTION OF THE LIVE ARM'S
+# FAIL-OPEN. The file states the distinction above: a PRE-START check may refuse at no cost, while a
+# probe that fails inside a LIVE dispatch path must not stop every lane on the box for ever. This is
+# the pre-start side — nothing has been consumed, no agent is running, and the caller releases its
+# claim — so an unreadable `df` answers REFUSED-UNKNOWN (77) and NAMES itself, exactly as #3395 and
+# #3231 require. The live arm's documented fail-open is deliberately left alone here: flipping it is
+# a fleet-wide availability decision, and it is #3231's for the fork floor, not a side effect of
+# this change.
+#
+# ── THE PER-LANE REQUIREMENT AT THIS SEAM, AND ITS DERIVATION ────────────────────────────────────
+# `self` (6144 MB by default), NOT the marginal `tree` (350 MB), plus the cell's reserve (4x the
+# dispatch floor). The file's own argument for why admission is bounded by `self` applies with full
+# force one step earlier: `tree` is only true while a WARM shared uv cache holds, and the cache is
+# exactly what gets pruned under pressure, so the lane admitted on the strength of the marginal
+# figure is the lane that materialises the whole venv. MEASURED (the #3395 record): two lanes
+# consumed 11 GB in six minutes (~5.5 GB each) on a cell whose `.worktrees` was 36.4 GB of 47 GB —
+# so a single dispatch needs GIGABYTES, and 6 GiB is the measured per-lane worst case already
+# recorded in this file's SELF term, not a new guess. The repo classifier (`python_target`) is NOT
+# consulted here because at this seam the lane's install step is the BRIEF's, not the checkout's: a
+# harness checkout whose lane is told to run a python suite pays the same 5.6 GB venv.
+# ⛔ AND IT IS AN OVERRIDE, WITH A STATED MEANING: `DISK_LANE_SELF_MB` / `DISK_LANE_RESERVE_MB` (the
+# seams this file already documents) set the number for a box whose lanes are MEASURED cheaper. A
+# misspelt/empty override derives the default rather than collapsing to 0 — an admission bound of 0
+# is the inert gate class `disk_floor_num`/`is_limit` exist to reject.
+
+# disk_box_id — WHICH BOX the reading belongs to, for the refusal line. `box=` is not decoration:
+# #3231's lesson is that a reading is only meaningful WITH the box it was taken on, and an operator
+# reading a refusal from a log aggregator has no other way to tell which cell refused.
+# Order: `DISK_BOX` (the deploy/operator seam — a name a human chose), then `CAP_BOXID` if the box's
+# supervisor exported it, then `capacity.sh`'s `cap_boxid` WHEN THAT FILE SITS BESIDE THIS ONE (the
+# fleet's own per-box identity: hardware uuid on the mac, routable IPv4 on the cells). `hostname -s`
+# is the LAST resort and it is a known-weak one — measured SHARED by every cmux cell (`cmux`) — so it
+# is printed rather than withheld: `box=cmux` still beats no box at all, and the reader can see it is
+# not a per-box name. An empty result is printed as UNIDENTIFIED, never dropped from the line.
+disk_box_id() {
+  local b=""
+  if [ -n "${DISK_BOX:-}" ]; then b="$DISK_BOX";
+  elif [ -n "${CAP_BOXID:-}" ]; then b="$CAP_BOXID";
+  else
+    case "${BASH_SOURCE[0]:-}" in
+      */*) if [ -f "${BASH_SOURCE[0]%/*}/capacity.sh" ]; then
+             b="$( ( . "${BASH_SOURCE[0]%/*}/capacity.sh" >/dev/null 2>&1; cap_boxid ) 2>/dev/null )" || b=""
+           fi ;;
+    esac
+    [ -n "$b" ] || b="$(hostname -s 2>/dev/null || hostname 2>/dev/null)" || b=""
+  fi
+  # No space or comma may reach the token: the line is parsed by `costs=$(…)`-style readers and by
+  # operators' greps, and `box=cell 3` would split into two tokens that mean nothing.
+  # ⛔ THE CASE MUST REPLACE, NOT MERELY DEFAULT (review round 1, P2 — MEASURED). The first version
+  # read `case "$b" in ''|*[!…]*) [ -n "$b" ] || b="UNIDENTIFIED" ;; esac`, so a value that CONTAINED
+  # an illegal character kept it: `DISK_BOX="cell 3"` printed `box=cell 3` — the exact two-token split
+  # the comment above promises cannot happen — and `DISK_BOX="cell,3 x"` printed verbatim. It is the
+  # same shape `capacity.sh`'s `cap_host` uses, and there the arm REPLACES; this one now does too.
+  case "$b" in ''|*[!A-Za-z0-9._:-]*) b="UNIDENTIFIED" ;; esac
+  printf '%s' "${b:-UNIDENTIFIED}"
+}
+
+# disk_free_mb_target <path> — free MiB on the filesystem that WILL hold <path>, which may not exist
+# yet (the worktree this admission is about). The nearest EXISTING ancestor is the honest answer for a
+# path that is about to be created ON THAT VOLUME, and it is the same rule `disk-floor.sh`'s
+# `disk_floor_free_mb` already applies to a state dir.
+# ⛔ IT WALKS ONLY WHILE THE PATH DOES **NOT** EXIST — NEVER PAST A `df` THAT FAILED (review round 1,
+# P2, MEASURED). The first version walked on any EMPTY reading, so a target whose own volume was
+# unmeasurable but whose ancestors answered produced ANOTHER volume's number and ADMITTED — the
+# opposite of the fail-closed claim this arm is documented with (measured: a `df` stub failing under
+# `<existing>/realparent` and answering 999999 MB for `/` made `disk_admit` return 0). A path under an
+# existing directory whose `df` fails therefore reaches "I cannot measure the volume this will land
+# on", which is UNREADABLE, not "/ has room". The single-component case (`/tm-1` → `${p%/*}` = "") is
+# clamped to `/` rather than to `.`: a relative `.` would measure the CALLER's cwd, a third volume.
+disk_free_mb_target() { # <path>
+  local p="${1:-.}" mb
+  while :; do
+    if [ -e "$p" ]; then
+      mb="$(disk_free_mb "$p")"
+      [ -n "$mb" ] && printf '%s\n' "$mb"
+      return 0
+    fi
+    case "$p" in ''|.|/) return 0 ;; esac
+    case "$p" in */*) p="${p%/*}"; [ -n "$p" ] || p="/" ;; *) p="." ;; esac
+  done
+}
+
+# disk_mb_gb <mb> — the human term for a refusal line, one decimal, ALWAYS printed with its unit.
+# `awk`'s `printf "%.1f"` (never `print int(…)`): the mawk OFMT/scientific-notation hazard this file
+# documents for `disk_free_mb` applies to every renderer, and a refusal that prints `3.5e+03MB` is a
+# refusal an operator cannot act on. An unreadable/absent value renders `?` — never `0`.
+disk_mb_gb() { # <mb>
+  case "${1:-}" in ''|*[!0-9]*) printf '%s' '?' ;; *) awk -v m="$1" 'BEGIN{printf "%.1fGB", m/1024}' ;; esac
+}
+
+# disk_worktree_need -> the MB a worktree CREATION must find free. See the derivation block above:
+# the lane's worst case, plus the cell's reserve (4x the dispatch floor).
+# ⛔ THE THREE TERMS ARE DERIVED ONCE, IN `disk_worktree_terms`, AND EVERY CONSUMER READS THEM FROM
+# THERE (review round 1, P2, MEASURED). The refusal message used to re-derive the reserve as
+# `$(( need - ${DISK_LANE_SELF_MB:-6144} ))` — i.e. it fed the RAW, UNVALIDATED env value into
+# arithmetic. `DISK_LANE_SELF_MB=12x` (or `6G`, or `6144MB`: all plausible operator spellings) then made
+# the REFUSAL ITSELF die with `need - 12x: value too great for base`: rc 1 (not the documented 77), an
+# EMPTY DISK_ADMIT_LINE, and a `--disk-admit` verb exiting 1 outside its own 0/77/64 contract. That is
+# the input class this file says it tolerates, so the validated terms are emitted in ONE place.
+# ⛔ THE SEAM CHARGES max(tree, self), THROUGH THE LIVE ARM'S OWN `disk_lane_need` (review round 5, P2
+# — MEASURED). It used to derive `self + reserve` and ignore `DISK_LANE_TREE_MB` altogether, so a cell
+# that had RAISED the stated tree cost (docs/ops/disk-reaper.md's own remedy for a repo whose python
+# markers do not match) was admitted by this seam at 2,064 MB while `run_agent` refused the same
+# dispatch at 22,000 MB — measured with `DISK_LANE_TREE_MB=20000 DISK_LANE_SELF_MB=64
+# DISK_MIN_FREE_MB=500`. The worktree was therefore materialised and the refusal arrived one step
+# LATE, which is #3395's defect itself, and it made this block's "raise one and the other goes on
+# admitting on the old number" claim false for the tree term. `max(self, tree) >= self`, so routing
+# through `disk_lane_need` can only strengthen the stated worst-case intent, never weaken it, and one
+# function now decides both bounds.
+disk_worktree_terms() { # -> "<tree> <self> <reserve>", all validated integers
+  local tree=0 self reserve
+  # ⛔ THE DEFAULTS ARE THE NAMED CONSTANTS / THE ONE RESERVE PROBE, NEVER A COPY (review rounds 2
+  # and 3, P2/P3): `disk_lane_costs` (the live arm) and this seam must not carry separate literals —
+  # raise one and the other goes on admitting on the old number, which is #3395's defect wearing a
+  # constant instead of an ordering. (The grep at review round 3 found the literals still here; the
+  # round-2 edit had not landed. It has now, and the seam==live arm asserts it.)
+  # `tree` takes the CLASSIFIER'S PYTHON DEFAULT when the operator has not stated one (review round 6,
+  # P2 — MEASURED). It used to default to 0, which is only harmless while `self` (6,144) exceeds it: an
+  # operator who lowers `DISK_LANE_SELF_MB` — the very remedy `disk_admit`'s own refusal text
+  # recommends — went BELOW the live arm's tree term, so with `DISK_LANE_SELF_MB=64` on a python
+  # target the seam answered 2,064 MB (`terms="0 64 2000"`) while `disk_lane_need` answered 2,350 MB
+  # (`350 64 2000`) — seam < live, i.e. this seam admits the lane `run_agent` then refuses, which is
+  # #3395's defect a third time. 350 is the worst case of the two classifier defaults (350 python, 64
+  # harness), so taking it cannot lower the seam and keeps the shipped default at 8,144 MB (350 <
+  # 6,144). This is why the seam needs no `--repo`: it charges the LARGER class unconditionally.
+  if is_limit "${DISK_LANE_TREE_MB:-}"; then tree="$DISK_LANE_TREE_MB"; else tree="$DISK_LANE_TREE_PY_DEFAULT"; fi
+  if is_limit "${DISK_LANE_SELF_MB:-}"; then self="$DISK_LANE_SELF_MB"; else self="$DISK_LANE_SELF_PY_DEFAULT"; fi
+  if is_limit "${DISK_LANE_RESERVE_MB:-}"; then reserve="$DISK_LANE_RESERVE_MB"; else reserve="$(disk_lane_reserve_default)"; fi
+  # ⛔ AN EXPLICIT `0` IS HONOURED, exactly as `disk_lane_costs` honours it (the file's own word: the
+  # test seam neutralises the terms in one place, and 0 is a STATED choice). Only an ABSENT/garbled
+  # value derives the default, so a typo'd env cannot silently collapse the bound to nothing — while a
+  # suite that deliberately zeroes both terms gets a gate that admits, which is what lets it test the
+  # worktree lifecycle without depending on this host's free space.
+  case "$tree" in ''|*[!0-9]*) tree=0 ;; esac
+  case "$self" in ''|*[!0-9]*) self="$DISK_LANE_SELF_PY_DEFAULT" ;; esac
+  case "$reserve" in ''|*[!0-9]*) reserve=0 ;; esac
+  printf '%s %s %s\n' "$tree" "$self" "$reserve"
+}
+
+disk_worktree_need() { # -> the MB a worktree creation must find free
+  local terms tree self reserve
+  terms="$(disk_worktree_terms)"
+  tree="${terms%% *}"; terms="${terms#* }"
+  self="${terms%% *}"; reserve="${terms#* }"
+  # The live arm's own predicate, so the two seams cannot disagree about the bound (#3395).
+  disk_lane_need "$tree" "$self" "$reserve"
+}
+
+# disk_admit <target-path> [<label>] — THE PRE-START DISK ADMISSION.
+#   prints ONE line on a refusal (nothing on admission unless DISK_ADMIT_VERBOSE=1)
+#   returns 0 ADMITTED · 77 REFUSED; the verdict LINE is the interface (`DISK_ADMIT_LINE`, empty on
+#   admission) — the arm a caller needs to tell apart is `REFUSED-DISK` vs `REFUSED-UNKNOWN`, and it
+#   is IN that line, which is what the callers quote. ⛔ THERE IS NO `DISK_ADMIT_VERDICT` ANY MORE
+#   (review round 3, P3): it was documented as the interface and had no reader anywhere, so a caller
+#   written to the docs would have read a variable that told it nothing.
+# The verdict is in THREE parts, and all three are load-bearing: `REFUSED-DISK` (a reading we took and
+# compared — the arithmetic is printed so it can be re-done from the line), `REFUSED-UNKNOWN` (a
+# reading we could NOT take — the pre-start fail-closed arm), and `free`/`need`/`box` as named terms.
+# A gate that refuses without stating what it measured is indistinguishable from a bug: this fleet has
+# read a CORRECT refusal as a false positive more than once (#3395's own record), and the numbers are
+# what make that impossible.
+#
+# ⛔ THE ARITHMETIC THE LINE PRINTS MUST BE THE ARITHMETIC IT COMPUTED (review round 6, P2 —
+# MEASURED). The sentence used to read `one lane's worst case ${worst}MB = max(tree, self) + reserve`
+# where `worst` was only `max(tree, self)` — an equation false by the reserve on every refusal, printed
+# on a line whose whole purpose is that an operator can re-derive the number from it alone. It now
+# states `need = max(tree, self) + reserve`, which is exactly what `disk_worktree_need` returns.
+# ⛔ THE TOKEN CARRIES THE EXACT MEBIBYTES AS WELL AS THE ROUNDED GiB (review round 1, P2 — MEASURED).
+# One decimal on GiB is not enough to be unambiguous AT THE BOUNDARY: 8,143 MB and 8,144 MB both render
+# `8.0GB`, so the arm that refuses `free = need - 1` printed `free=8.0GB, need=8.0GB` — a correct
+# refusal that reads as free == need, i.e. exactly the false-positive reading this message exists to
+# prevent. The token keeps #3395's specified `free=<GiB>, need=<GiB>, box=<box>` prefix (asserted
+# verbatim by disk-admission.test.sh) and appends the raw figures inside the same parentheses.
+#
+# ⛔ NO `repo` PARAMETER, DELIBERATELY (review round 1, P2 — it was plumbed and unread, which made the
+# "ONE predicate" claim false by ~4x without saying so). This seam does not CLASSIFY the checkout
+# (`python_target`) to derive a marginal `tree`: at this step the brief's install step is unknown, and
+# `tree` is true only while a warm shared uv cache holds — the cache is exactly what gets pruned under
+# pressure, so a seam that admitted on the marginal figure would admit the lane that materialises the
+# whole venv, and nothing has been spent yet here (a refusal costs one re-dispatch). What it does honour
+# is a `tree` the OPERATOR stated for the cell — through the live arm's own `disk_lane_need`, so the
+# bound is `max(tree, self) + reserve`, the same function `run_agent` decides on (review round 5, P2).
+# It is stated in README §7.2i, and the cost of choosing the worst case is named there too: a box at
+# ~5 GB free refuses a harness lane the live gate would have admitted, until an operator states a
+# smaller worst case with DISK_LANE_SELF_MB.
+disk_admit() { # <target> [<label>]
+  # ⛔ THE READING IS NOT CALLED `free` (review round 5, P1 — MEASURED). `check-portability-traps.sh`
+  # reads a bare word in `local` as a CALL, so `local … free …` was counted as a use of the `free`
+  # command macOS lacks: `spawn-gate.sh free-macos-absent: baseline=0 live=1`, which REDS
+  # check-portability-traps.test.sh's own-tree arm on a false finding. The name was also a shadow of
+  # the command in a file that probes memory elsewhere; `avail` says what it is.
+  local target="${1:-.}" label="${2:-disk-admit}" avail need box terms tree self reserve
+  DISK_ADMIT_LINE=""
+  need="$(disk_worktree_need)"
+  terms="$(disk_worktree_terms)"
+  tree="${terms%% *}"; terms="${terms#* }"
+  self="${terms%% *}"; reserve="${terms#* }"
+  box="$(disk_box_id)"
+  avail="$(disk_free_mb_target "$target")"
+  if ! disk_readable "$avail"; then
+    DISK_ADMIT_LINE="[disk-admit] REFUSED-UNKNOWN $label: free=? need=$(disk_mb_gb "$need") box=$box target=$target — the free-space probe could not answer (no readable \`df\` for that path or its nearest EXISTING ancestor), so the lane's headroom CANNOT be verified. Nothing was created, no worktree, no branch; a PRE-START admission fails CLOSED (an unmeasurable box is not an empty one). Check PATH/'df' on this box, or pass the volume explicitly (agent-infra#3395/#3231)"
+    printf '%s\n' "$DISK_ADMIT_LINE"
+    return "$AGENT_DISK_REFUSED"
+  fi
+  # ⛔ ADMIT ONLY ON A COMPARISON THAT SUCCEEDED (review round 2, P2 — this was the ONE place in this
+  # file that failed OPEN on a reading it could not compare). `[ "$avail" -lt "$need" ]` returns 2 when
+  # an all-digit reading exceeds bash's integer range, and the `if` then took the ADMITTED branch:
+  # measured, `avail=99999999999999999999` printed `integer expression expected` and let the worktree be
+  # created — where every other predicate in this file refuses an uncomparable reading. Written as
+  # `need <= avail`, an errored comparison is FALSE, i.e. a refusal.
+  if ! [ "$need" -le "$avail" ]; then
+    DISK_ADMIT_LINE="[disk-admit] REFUSED-DISK(free=$(disk_mb_gb "$avail"), need=$(disk_mb_gb "$need"), box=$box; free_mb=$avail, need_mb=$need) $label: $avail MB free on $target < ${need}MB required (need ${need}MB = max(tree ${tree}MB, self ${self}MB) + reserve ${reserve}MB) — nothing was CREATED by this attempt: no worktree, no branch, no agent, nothing consumed. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish; this does NOT clear by waiting. A box whose lanes are MEASURED cheaper may lower DISK_LANE_SELF_MB deliberately (agent-infra#3395)"
+    printf '%s\n' "$DISK_ADMIT_LINE"
+    return "$AGENT_DISK_REFUSED"
+  fi
+  [ "${DISK_ADMIT_VERBOSE:-0}" = 1 ] && printf '[disk-admit] ADMITTED %s: free=%sMB need=%sMB box=%s target=%s\n' \
+    "$label" "$avail" "$need" "$box" "$target"
+  return 0
+}
+
+# disk_admit_cli [--target P] [--repo P] [--label S] [P] — the VERB, for a caller that is not this
+# tree's shell code. WHY IT EXISTS (#3395): the failure this seam is written against was produced by
+# an AD-HOC dispatcher (`/tmp/robust_push.py`) that printed `df=` and asserted nothing, and no amount
+# of gating inside the harness stops the next ad-hoc script from doing the same — unless there is ONE
+# command it can call to ask the question. This is that command; the predicate behind it is the one
+# `run_agent` and `wt_provision` use, not a copy.
+# Exit: 0 admitted · 77 refused (the line on stdout names the arm and the numbers) · 64 usage.
+disk_admit_cli() {
+  local target="" label="disk-admit"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --target) [ $# -ge 2 ] || { printf 'disk-admit: --target needs a path\n' >&2; return 64; }; target="$2"; shift 2 ;;
+      --repo)   # ⛔ REMOVED, NOT ACCEPTED AND IGNORED: it was plumbed to `disk_admit` and never read
+                # (review round 1, P2), so an operator passing it would believe the checkout's class
+                # narrowed the bound. It does not — this seam charges the lane's worst case for ANY
+                # checkout, and that is stated in README §7.2i rather than implied by a dead flag.
+                printf 'disk-admit: --repo was removed: this seam charges one lane WORST CASE for any checkout (see README 7.2i); set DISK_LANE_SELF_MB to state a smaller one\n' >&2; return 64 ;;
+      --label)  [ $# -ge 2 ] || { printf 'disk-admit: --label needs a value\n' >&2; return 64; }; label="$2"; shift 2 ;;
+      -h|--help)
+        printf 'usage: spawn-gate.sh --disk-admit <target-path> [--label <text>]\n'
+        printf '  exit 0 = ADMITTED · 77 = REFUSED-DISK / REFUSED-UNKNOWN (the line names free, need and box) · 64 = usage\n'
+        return 0 ;;
+      -*) printf 'disk-admit: unknown option %s\n' "$1" >&2; return 64 ;;
+      *)  if [ -z "$target" ]; then target="$1"; else label="$1"; fi; shift ;;
+    esac
+  done
+  [ -n "$target" ] || { printf 'disk-admit: a target path is required (the volume the worktree will be written to)\n' >&2; return 64; }
+  disk_admit "$target" "$label"
 }
 
 # 1-min load average, integer. Empty when the probe fails (see can_spawn).
@@ -1127,8 +1619,8 @@ cap_wip_snapshot() {
 # it. ⛔ THE REASON IS THE CALLEE'S CONTRACT, NOT BRANCH SAFETY (review P2, round 5, PR #2975). An
 # earlier version of this note argued that pushing would "move a branch" — it would not:
 # `bg-rescue-wip.sh` builds its archive with `commit-tree` and pushes `refs/wip/<slug>`, which is NOT a
-# branch and is pushed without force (`:283-296`). The real binding constraint is the callee's own
-# `AT_RISK` rule (`bg-rescue-wip.sh:150-166`): it archives only a NON-EMPTY `git status`, so a
+# branch and is pushed without force (`:326-355`, all three push functions). The real binding constraint is the callee's own
+# `AT_RISK` rule (`bg-rescue-wip.sh:141-157`): it archives only a NON-EMPTY `git status`, so a
 # clean-but-unpushed tree makes it `exit 0` having done nothing, and it never considers `HEAD`'s own
 # commits. Teaching it to archive `HEAD`'s tree when the tree is clean is a change to the SHIPPED
 # tool's contract (and to what "a rescue" means), deliberately not made in this PR — so ask 1 stays
@@ -1183,9 +1675,9 @@ ARCHIVE_MAY_BE_PARTIAL=" — AND this archive may be PARTIAL: bg-rescue-wip.sh e
 # ⛔ AND EXIT 0 DOES NOT PROVE THE ARCHIVE'S TREE IS THE WORKTREE (fresh review, P1 — REPRODUCED, and it
 # FALSIFIED the premise this branch used to leave the `refs/wip/*` arm untouched). Round 18 argued "the
 # callee skips no paths on exit 0", so "its tree is the worktree as it was left" was left standing. That is
-# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:182`) and on failure falls back
-# to `git add -u` with stderr DISCARDED (`:190`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
-# paths only — collecting `SKIPPED` from those alone (`:192-193`). A TRACKED file git cannot read fails both
+# wrong, and `scripts/bg-rescue-wip.sh` shows why: `git add -A` runs first (`:201`) and on failure falls back
+# to `git add -u` with stderr DISCARDED (`:209`), then adds each `git ls-files -o` entry — i.e. UNTRACKED
+# paths only — collecting `SKIPPED` from those alone (`:211-212`). A TRACKED file git cannot read fails both
 # the bulk add and `add -u`, is never in the untracked sweep, and so is in NEITHER the archive NOR the
 # skipped list — `write-tree` succeeds, the push succeeds, the callee exits 0. Reproduced: a tracked,
 # modified `notes.txt` with `chmod 000` produced `rescue=refs/wip/<slug>`, exit 0, no "could NOT be
@@ -2107,7 +2599,7 @@ lane_end_next() {
       refs/wip/*)
         # ⛔ THE THIRD ARM OF THE SAME INVARIANT (review of PR #3399 round 13, P2 — REPRODUCED). `pushed`
         # is granted against the PROVEN push url, and `bg-rescue-wip.sh` writes the archive with
-        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 308/313) — a PUSH, which honours
+        # `git push -q origin "$C:refs/wip/$SLUG"` (lines 328/333/354, all three push functions) — a PUSH, which honours
         # `remote.origin.pushurl`. This instruction was a FETCH through `origin`, which honours
         # `remote.origin.url`. With the two diverging (a configuration this code deliberately supports)
         # the archive lands in the push repository and the artifact's own command answers `fatal:
@@ -2478,7 +2970,7 @@ terminal_wip_rescue() {
   # ⛔ THE ROOT RULE IS THE CALLEE'S OWN, NOT A WEAKER ONE (review P2, round 4, PR #2975). The guard
   # used to be `rev-parse --git-dir`, which SUCCEEDS ANYWHERE INSIDE A REPOSITORY — a subdirectory
   # included — so it ratified a root that this code then MEASURED and handed to `bg-rescue-wip.sh`,
-  # which refuses it one layer down at its own `:96-103` (`--show-toplevel` ≠ `pwd -P`) and returns
+  # which refuses it one layer down at its own `:117-123` (`--show-toplevel` ≠ `pwd -P`) and returns
   # `rescue=FAILED`. So the pre-check could not tell a lane's worktree from a corner of one, and the
   # fleet's record said the RESCUE failed rather than the POINTER. This is the same lesson as the
   # `st_noise` fix above and as `cap_wip_snapshot` (#2045): the gate that decides whether the
@@ -2698,8 +3190,8 @@ terminal_wip_rescue() {
       # every other), it is keyed by branch slug alone, and bg-rescue-wip.sh never removes it. So an
       # EARLIER rescue of the same slug — an earlier `run_agent` for this lane, or a PEER lane on a
       # reused branch (the case named in the header) — survives a run that archives NOTHING:
-      # `bg-rescue-wip.sh:62` exits 2 at `mktemp` and `:156-161` exits 0 on "nothing at risk", both
-      # BEFORE `:247`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
+      # `bg-rescue-wip.sh:81` exits 2 at `mktemp` and `:166-180` exits 0 on "nothing at risk", both
+      # BEFORE `:266`'s update-ref. Treating mere EXISTENCE as proof made the record say "this
       # worktree's work IS archived and pinned" over work that is still single-copy — the full-disk
       # path, which is exactly where the rescue matters most. So read it BEFORE, read it AFTER, and
       # only a CHANGED sha counts as an archive this run produced.
@@ -2719,10 +3211,10 @@ terminal_wip_rescue() {
       # below is a ref that exists, not a claim), and it is readable without a network round trip.
       # Reading it only when rc2 = 0 collapsed THREE callee outcomes into `FAILED` with an EMPTY ref,
       # and two of those three leave a real archive behind:
-      #   * `bg-rescue-wip.sh:363-367` — PUSHED=1 and a partial listing: the commit IS on origin under
+      #   * `bg-rescue-wip.sh:468-480` — PUSHED=1 and a partial listing: the commit IS on origin under
       #     `refs/wip/<slug>`; the skipped paths are what stays local. Reported as "could not archive/
       #     push" (false) with no ref in the ledger — a pushed ref hidden from the fleet record.
-      #   * `:384-396` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
+      #   * `:503-514` — `RESCUED LOCALLY BUT THE PUSH FAILED`: `refs/wip-local/<slug>` is valid and the
       #     callee prints the sha, so the ONE pointer to the archived commit was neither shown nor
       #     recorded, while the line claimed the work was only at $root.
       # So: a ref THIS RUN wrote + rc2≠0 is its own verdict — `archived-local` (work pinned, off-box
@@ -2741,9 +3233,9 @@ terminal_wip_rescue() {
         LANE_END_REF="$local_ref"; LANE_END_RESCUE="refs/wip/$slug"
       elif [ "$rc2" -eq 0 ] && [ "$LANE_END_TREE" = "dirty" ]; then
         # ⛔ rc2=0 DOES NOT PROVE THE CALLEE ARCHIVED NOTHING (review P2, round 5, PR #2975). Exit 0 has
-        # TWO disjoint causes: "nothing at risk" (`bg-rescue-wip.sh:157-161`, reached BEFORE any
-        # archive) and "PUSHED=1 with no skipped paths" (`:362-368`) — and the second one is reached
-        # even when the LOCAL pin failed, because the pin is GUARDED (`:246-252` prints `⚠ could not
+        # TWO disjoint causes: "nothing at risk" (`bg-rescue-wip.sh:166-180`, reached BEFORE any
+        # archive) and "PUSHED=1 with no skipped paths" (`:468-480`) — and the second one is reached
+        # even when the LOCAL pin failed, because the pin is GUARDED (`:262-271` prints `⚠ could not
         # record refs/wip-local/<slug>` and carries on). So on a `dirty` tree, whose non-empty listing
         # proves the callee's own `AT_RISK` was 1, rc2=0 means the archive IS on origin. Recording
         # `nothing` there published "nothing needed saving" over work that is on origin, and made the
@@ -2911,6 +3403,8 @@ cell_preflight_path() {
 #
 # Gated: a refusal does not start the agent at all, and run_agent returns THAT gate's code —
 # AGENT_DISK_REFUSED (77, evaluated FIRST: a full filesystem never clears by waiting),
+# AGENT_MEM_REFUSED (81, evaluated SECOND: a box at its memory floor loses lanes to the OOM killer,
+# and unlike a load refusal the consequence is not slowness but a dead batch — agent-infra#2387),
 # AGENT_LOAD_REFUSED (75, which clears when the box quietens), or AGENT_LAND_BACKLOG (74, the creation
 # back-pressure gate: the repo's open-PR count is over its own measured landing ceiling, which clears
 # only by LANDING an open PR — no amount of waiting on this box helps). The code selects the REMEDY.
@@ -2982,6 +3476,29 @@ AGENT_HARNESS_SKEW_REFUSED=83
 # refusal will NEVER clear on its own, so a caller (or an operator reading a lane log) that treats
 # the two as one waits for an event that cannot happen.
 AGENT_DISK_REFUSED=77
+# The MEMORY gate's refusal (agent-infra#2387). A SEPARATE code from the load refusal because the two
+# gates have different inputs and different evidence, and because a caller that reports them as one
+# sends the operator to the wrong reading: load 14 on a 4-vCPU cell is survivable, a box at its
+# memory floor is not (the OOM killer picks a lane, and a lane's death takes its batch). It is a
+# distinct third remedy too, and the mid one: it clears when RESIDENT LANES FINISH, so a caller can
+# wait — unlike the disk (never clears) and the land backlog (waiting is useless, land instead) — but
+# the wait is on capacity being RELEASED, not on load falling. This file's codes are read by
+# `lane.sh`, `fix-one.sh`, `adopt-fix.sh`, `merge-one.sh`, `chain-merge.sh`, `review-pr.sh` and
+# `pr-doctor.py`.
+#
+# ⛔ 81, NOT 73 (rebase onto main, agent-infra#2387): the codes this change first chose are OCCUPIED on
+# main. 73 has been `AGENT_FORK_REFUSED` since agent-infra#2293 ("a box out of PROCESSES: restart or
+# drain it from outside") and 72 has been `REPO_TARGET_REFUSED` (repo-target.sh, returned through
+# lane.sh/fix-one.sh/adopt-fix.sh). Two gates sharing one code with OPPOSITE remedies is the P0 that
+# #2293's own comment records fixing one layer over, and here it would have been silent: every arm
+# reads a VARIABLE, so both arms would still exist and merely become unreachable — with a fork refusal
+# reported as `gate=mem` ("wait for lanes to finish") on a box that cannot fork the retry at all.
+# The 70s band is full (71 capability, 72 repo-target, 73 fork, 74 land, 75 load, 76 the spawn point,
+# 77 disk, 78 the cannot-verify pair, 79 adopt-fix.sh), and the free sysexits values are statuses a
+# real `pi` can exit for its own reason — the very ambiguity that made #2258 move the brief code to 80.
+# So this pair follows the brief gate's precedent and lives OUTSIDE the sysexits range: 81 for the
+# caller, 84 for the spawn point (translated into 81 by run_agent, so no caller learns a second code).
+AGENT_MEM_REFUSED=81
 # The CREATION back-pressure refusal (agent-infra#2409). A FOURTH code because it has a fourth
 # remedy, and it is the only one whose remedy is not about this box at all: the box is healthy, no
 # filesystem is full, and waiting will not clear it — the REPO has more open PRs than its own
@@ -2996,6 +3513,19 @@ AGENT_LAND_BACKLOG=74
 # depends on a `pi` that exits 75 for its own reason being read as STARTED. 76 is that signal, and
 # run_agent below translates it into AGENT_LOAD_REFUSED so no caller has to learn a new code.
 PI_GATE_REFUSED=76
+# ⛔ AND THE SPAWN POINT NEEDS A MEMORY SIGNAL OF ITS OWN (#2387), for the reason 76 exists at all:
+# it refuses for a SECOND cause now, and one code cannot say which. Reusing 76 would make run_agent
+# translate a memory refusal into AGENT_LOAD_REFUSED and every caller would then print "load" for a
+# box whose load was fine — the exact false-cause class fix-one.sh's disk branch was written to end.
+# ⛔ 84, NOT 72 AND NOT 82 (rebase onto main): 72 is `REPO_TARGET_REFUSED` — repo-target.sh's repo-identity
+# refusal — and 82 is `KEY_GATE_REFUSED` (#3331), both taken since this change first chose one. The
+# original text of this note named only 72;
+# refusal, which lane.sh, fix-one.sh, adopt-fix.sh and dispatch-merge.sh all return — so the internal
+# code this change first chose aliased a LIVE caller-facing gate. It also bought nothing: an internal
+# code exists to be translated (see AGENT_MEM_REFUSED above), and a translated code's only remaining
+# risk is a real `pi` exiting it for its own reason, which 84 — outside the sysexits range, next to
+# the brief gate's 80 — cannot be produced by accident. That is the whole reason 80 exists.
+PI_GATE_MEM_REFUSED=84
 # The BRIEF gate's refusal code (agent-infra#2258). It is NOT interchangeable with the capacity
 # codes: 75 clears when the box quietens, 77 never clears but is a property of the VOLUME, 76 is the
 # installed `pi` refusing for its own reason — and this one is a property of the BRIEF, which no
@@ -3051,23 +3581,95 @@ AGENT_STARTED=0
 BRIEF_GATE_SH=""
 # ── the fork reading, from the fleet's ONE instrument ──────────────────────────────────────────
 # ⛔ NOT A SECOND PROBE. `capacity.sh` already reads the process count against the per-uid/cgroup
-# ceiling and proves it with a two-fork probe; this file CONSUMES it. If the module cannot be found
-# (a hand-copied shim, a fixture), the gate ABSTAINS and SAYS SO — the same polarity as the disk
-# probe's unreadable arm, and for the same reason: an instrument that cannot run must not be reported
-# as a refusal (that would stop every lane on a healthy box) NOR as a silent pass.
+# ceiling and proves it with a two-fork probe; this file CONSUMES it.
+#
+# ⛔ THE CANDIDATE LIST IS THE FILE'S OWN HELPERS' LIST, AND THAT IS A FIX, NOT TIDYING (measured
+# 2026-11-01, agent-infra#2293 follow-up). This file is ALSO the installed `pi` shim at
+# `$HOME/.pi/agent/bin/pi`, whose own directory holds NO harness, and the shim inherits `O` only when
+# the launcher exported it (`orch-loop.sh` sets `O="${O:-$HOME/orchestrator}"` and does NOT export
+# it). The first version of this resolver searched `$O` and "beside me" ONLY, so on every spawn whose
+# `O` was absent it resolved nothing and each of those lanes ran with the fork floor SILENTLY OFF
+# behind a per-launch WARN — while `brief_gate_lib`, `lane_bound_path` and the capability probe in
+# this same file all search four locations and therefore worked. The remedy is the instrument being
+# PRESENT: `$HOME/orchestrator` is the documented default for `O`, so it is searched too, and the
+# paths actually tried are RECORDED for the refusal text below.
 CAP_GATE_MOD_LOADED=0
+# The paths the last resolution attempt searched, space-separated — read by spawn_fork_state so a
+# `nodeploy` refusal can say what it looked for instead of leaving an operator to guess.
+SPAWN_GATE_CAP_TRIED=""
+# WHY resolution failed, in words spawn_fork_state publishes. ABSENT and UNLOADABLE share a remedy but
+# not a sentence: telling an operator a file is missing when it is present and truncated sends them to
+# look for the wrong defect (fresh review, P2).
+SPAWN_GATE_CAP_FAULT=""
+# WHICH module answered — the path that won the walk, or `preloaded`. A gate that consumes a module it
+# cannot name is a gate an operator cannot audit, and cycle 4 measured exactly that: a skipped
+# candidate's config block could ride along with another file's arithmetic and nothing said so.
+SPAWN_GATE_CAP_MOD=""
+# The functions a COMPLETE `capacity.sh` provides to this gate. A copy truncated at a function boundary
+# can satisfy the FIRST one and lack the rest — and then `cap_h_for_vars` fails, the headroom arithmetic
+# is skipped, the two-fork probe passes and the gate answers `ok` with its arithmetic arm silently
+# disabled. That is a FALSE PASS, not a degraded reading, so the whole set is checked (fresh review, P1).
+SPAWN_GATE_CAP_NEEDS="cap_procs_pair_vars cap_h_for_vars cap_fork_probe"
+_cap_mod_missing() { # prints the missing functions, one per line; rc 1 if any is absent
+  local _cmm_f _cmm_n=0
+  for _cmm_f in $SPAWN_GATE_CAP_NEEDS; do
+    declare -f "$_cmm_f" >/dev/null 2>&1 || { printf '%s\n' "$_cmm_f"; _cmm_n=1; }
+  done
+  return "$_cmm_n"
+}
 spawn_gate_load_capacity() {
   [ "${CAP_GATE_MOD_LOADED:-0}" = "1" ] && return 0
-  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
-  local d cand=""
-  for d in "${O:-}" "$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"; do
-    [ -n "$d" ] || continue
-    [ -f "$d/capacity.sh" ] && { cand="$d/capacity.sh"; break; }
+  # ⛔ A MODULE THE CALLING SHELL ALREADY SOURCED IS ACCEPTED, BUT NOT SILENTLY (cycle-3 review, P2):
+  # `SPAWN_GATE_CAP_TRIED` names it as PRELOADED, because this is the one place a mixed pair — this
+  # gate consuming a `capacity.sh` someone else loaded — can be seen at all.
+  _cap_mod_missing >/dev/null 2>&1 && {
+    CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_TRIED='(preloaded in the calling shell)'; SPAWN_GATE_CAP_MOD='preloaded'; SPAWN_GATE_CAP_FAULT=""
+    return 0
+  }
+  local _sgc_d _sgc_here _sgc_bad="" _sgc_probe=""
+  _sgc_here="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  SPAWN_GATE_CAP_TRIED=""; SPAWN_GATE_CAP_MOD=""
+  # `${X:+…}` so an UNSET HOME/O/AGENT_INFRA_PATH contributes NO candidate — a bare `"$HOME/orchestrator"`
+  # with HOME unset would search `/orchestrator` and claim it had tried something real.
+  # ⛔ A BROKEN CANDIDATE IS SKIPPED, NOT FATAL (cycle-3 review, P2). Breaking on the first candidate
+  # that merely EXISTS turned ONE stale file — and `deploy-harness.sh` seeds `$O` per file, so a stale
+  # `$O/capacity.sh` is a documented state — into a refusal for every spawn on a box that has a
+  # complete copy one candidate further along. That is the box-wide stall this change exists to
+  # remove, re-introduced by the fix for it.
+  # ⛔ AND EVERY CANDIDATE IS VALIDATED IN A SUBSHELL BEFORE ANY OF IT IS SOURCED HERE (cycle-4 review,
+  # P1 — measured). `capacity.sh` assigns its whole `CAP_*` knob namespace BEFORE it defines any
+  # function, so sourcing a broken candidate in THIS shell left its knobs in force and the gate then
+  # enforced the BROKEN file's floor while using the good file's arithmetic: a broken `$O` copy setting
+  # `CAP_MIN_FORK_HEADROOM=1`, followed by a complete copy reporting `procs=995/1000 headroom=5`,
+  # produced `state=ok` and launched pi — the exact false PASS this change exists to close, with
+  # nothing logged. A subshell cannot poison this shell, so the winner is the only file ever sourced.
+  for _sgc_d in "${O:-}" "$_sgc_here" \
+                "${AGENT_INFRA_PATH:+$AGENT_INFRA_PATH/scripts/orchestrator-harness}" \
+                "${HOME:+$HOME/orchestrator}" "${HOME:+$HOME/.pi/agent/scripts}"; do
+    [ -n "$_sgc_d" ] || continue
+    SPAWN_GATE_CAP_TRIED="${SPAWN_GATE_CAP_TRIED}${SPAWN_GATE_CAP_TRIED:+ }$_sgc_d"
+    [ -f "$_sgc_d/capacity.sh" ] || continue
+    _sgc_probe="$( ( # shellcheck source=/dev/null
+                     . "$_sgc_d/capacity.sh" 2>/dev/null || { printf 'SOURCEFAIL'; exit 0; }
+                     _cap_mod_missing 2>/dev/null | tr '\n' ' ' ) )"
+    if [ -z "$_sgc_probe" ]; then
+      # shellcheck source=/dev/null
+      if . "$_sgc_d/capacity.sh" 2>/dev/null && _cap_mod_missing >/dev/null 2>&1; then
+        CAP_GATE_MOD_LOADED=1; SPAWN_GATE_CAP_MOD="$_sgc_d/capacity.sh"; SPAWN_GATE_CAP_FAULT=""
+        return 0
+      fi
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh validated in a subshell but could not be loaded here"
+    elif [ "$_sgc_probe" = 'SOURCEFAIL' ]; then
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh could NOT be sourced (corrupt or truncated copy)"
+    else
+      _sgc_bad="$_sgc_bad; $_sgc_d/capacity.sh is INCOMPLETE — missing: $_sgc_probe"
+    fi
   done
-  [ -n "$cand" ] || return 1
-  # shellcheck source=/dev/null
-  . "$cand" 2>/dev/null || return 1
-  declare -f cap_procs_pair_vars >/dev/null 2>&1 && { CAP_GATE_MOD_LOADED=1; return 0; }
+  if [ -n "$_sgc_bad" ]; then
+    SPAWN_GATE_CAP_FAULT="not COMPLETE anywhere it was searched (${_sgc_bad#; }; searched: ${SPAWN_GATE_CAP_TRIED:-nothing})"
+  else
+    SPAWN_GATE_CAP_FAULT="not reachable from this spawn gate (searched: ${SPAWN_GATE_CAP_TRIED:-nothing})"
+  fi
   return 1
 }
 
@@ -3083,17 +3685,46 @@ spawn_fork_state() {
   local _sf_sv="${1:-}" _sf_dv="${2:-}" _sf_p="" _sf_m="" _sf_h="" _sf_prc=0 _sf_src=""
   printf -v "$_sf_sv" '%s' 'unknown'; printf -v "$_sf_dv" '%s' 'no fork reading was taken'
   if ! spawn_gate_load_capacity; then
-    printf -v "$_sf_dv" '%s' 'capacity.sh is not reachable from this spawn gate, so fork headroom was NOT read'
+    # ⛔ `nodeploy`, NOT `unknown`, AND IT REFUSES (at both call sites). The two are different faults
+    # with different remedies: `unknown` is the instrument RAN and could not measure (a reading about
+    # the box, so the gate abstains and says so), while this one means the gate could not find its OWN
+    # instrument — a deploy/sync fault that is identical on every box sharing these files, so waiting,
+    # draining or re-dispatching cannot clear it. A floor that is OFF behind a WARN is the failure mode
+    # the whole layer exists to prevent, and a per-launch WARN is not a report — it is the steady state.
+    printf -v "$_sf_dv" '%s' "capacity.sh is ${SPAWN_GATE_CAP_FAULT:-not reachable from this spawn gate}, so fork headroom was NOT read"
+    printf -v "$_sf_sv" '%s' 'nodeploy'
     return 0
   fi
   if ! cap_procs_pair_vars _sf_p _sf_m _sf_src; then
-    printf -v "$_sf_dv" '%s' 'neither a process count nor a ceiling could be read'
+    printf -v "$_sf_dv" '%s' "neither a process count nor a ceiling could be read from mod=${SPAWN_GATE_CAP_MOD:-?}"
     return 0
   fi
   cap_h_for_vars "$_sf_p" "$_sf_m" _sf_h || _sf_h='?'
-  printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?}"
-  if [ "$_sf_h" != '?' ] && [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
-    printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?})"
+  printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} headroom=${_sf_h} src=${_sf_src:-?} mod=${SPAWN_GATE_CAP_MOD:-?}"
+  # ⛔ A NON-NUMERIC READING IS NOT "NO PRESSURE" (cycle-3 review, P1 — the same false-PASS class this
+  # change exists to close). Measured: a `capacity.sh` whose `cap_h_for_vars` was present but wrote
+  # nothing to `$3` left `_sf_h` EMPTY, and a non-numeric `CAP_MIN_FORK_HEADROOM` made `[ -lt ]` error
+  # with `[: abc: integer expression expected` — both skipped the headroom test, fell through to the
+  # two-fork probe, and the gate answered `ok` on a box with ONE pid of headroom, launching pi. A
+  # non-numeric value on either side now REFUSES under `nodeploy`, because that is a broken instrument
+  # or a broken knob, not an unmeasurable box.
+  # ⛔ `is_limit`, NOT `is_num` (cycle-5 review, P1 — driven): `is_num` accepts an unbounded digit
+  # string, and `[ … -lt … ]` above intmax returns 2, which is a FALSE CONDITION — so a 24-digit
+  # headroom (or knob) skipped the comparison, the gate answered `ok`, and the shim LAUNCHED pi on a
+  # box with 5 pids of headroom. The same wrap class `is_limit` was introduced for on `_NCPU`. Both
+  # sides are bounded to what the arithmetic can actually compare.
+  if [ "$_sf_h" != 'unbounded' ] && ! is_limit "$_sf_h"; then
+    printf -v "$_sf_dv" '%s' "procs=${_sf_p}/${_sf_m} but cap_h_for_vars produced NO USABLE NUMBER (headroom='${_sf_h}' — empty, non-numeric, or beyond 9 digits) from mod=${SPAWN_GATE_CAP_MOD:-?}, so the fork floor cannot be decided"
+    printf -v "$_sf_sv" '%s' 'nodeploy'
+    return 0
+  fi
+  if ! is_limit "${CAP_MIN_FORK_HEADROOM:-200}"; then
+    printf -v "$_sf_dv" '%s' "CAP_MIN_FORK_HEADROOM='${CAP_MIN_FORK_HEADROOM:-}' is not a usable number (empty, non-numeric, or beyond 9 digits — it came from mod=${SPAWN_GATE_CAP_MOD:-?}), so the fork floor cannot be decided (procs=${_sf_p}/${_sf_m}, headroom=${_sf_h})"
+    printf -v "$_sf_sv" '%s' 'nodeploy'
+    return 0
+  fi
+  if [ "$_sf_h" != 'unbounded' ] && [ "$_sf_h" -lt "${CAP_MIN_FORK_HEADROOM:-200}" ]; then
+    printf -v "$_sf_dv" '%s' "headroom=${_sf_h} < min_fork_headroom=${CAP_MIN_FORK_HEADROOM:-200} (procs=${_sf_p}/${_sf_m}, src=${_sf_src:-?}, mod=${SPAWN_GATE_CAP_MOD:-?})"
     printf -v "$_sf_sv" '%s' 'refused'
     return 0
   fi
@@ -3101,11 +3732,11 @@ spawn_fork_state() {
   # rc 254), so the probe must not share fate with the caller it is protecting.
   ( cap_fork_probe ) >/dev/null 2>&1 || _sf_prc=$?
   if [ "$_sf_prc" -eq 254 ]; then
-    printf -v "$_sf_dv" '%s' "the two-fork probe could not fork (rc=254 EAGAIN) with procs=${_sf_p}/${_sf_m}"
+    printf -v "$_sf_dv" '%s' "the two-fork probe could not fork (rc=254 EAGAIN) with procs=${_sf_p}/${_sf_m} (mod=${SPAWN_GATE_CAP_MOD:-?})"
     printf -v "$_sf_sv" '%s' 'refused'
     return 0
   fi
-  [ "$_sf_prc" -eq 0 ] || { printf -v "$_sf_dv" '%s' "the two-fork probe could not be read (rc=$_sf_prc)"; return 0; }
+  [ "$_sf_prc" -eq 0 ] || { printf -v "$_sf_dv" '%s' "the two-fork probe could not be read (rc=$_sf_prc) (mod=${SPAWN_GATE_CAP_MOD:-?})"; return 0; }
   printf -v "$_sf_sv" '%s' 'ok'
   return 0
 }
@@ -3295,8 +3926,16 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     refused)
       echo "[fork-gate] REFUSED $label: $_fdetail — no agent was started, so nothing was consumed. A fork refusal does NOT clear by waiting: this box is out of PROCESSES (agent-infra#2293), and it cannot be cleaned up from inside. Restart it from outside, or let its lanes drain; the controller re-dispatches elsewhere." >> "$log"
       return "$AGENT_FORK_REFUSED" ;;
+    nodeploy)
+      # FAIL CLOSED. 83 is the harness-skew code, because that is what this is: the gate and the
+      # instrument it consumes are not deployed together, so `cp scripts/orchestrator-harness/*.sh $O/`
+      # is the remedy — the same sentence the capability gate publishes for 83, and the same reason
+      # it is not folded into 73 (this box can fork perfectly well).
+      AGENT_STARTED=0
+      echo "[fork-gate] REFUSED $label: $_fdetail. The fork floor cannot be enforced for this spawn, so NO agent was started and nothing was consumed. This is a HELPER/CONSUMER SYNC (or a fork-floor CONFIG) fault, not a reading about this box — every box running these files refuses identically, so do NOT dispatch the item elsewhere. Sync the pair: cp scripts/orchestrator-harness/*.sh \$O/ (or redeploy: bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O)." >> "$log"
+      return "$AGENT_HARNESS_SKEW_REFUSED" ;;
     unknown)
-      echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. Check that capacity.sh sits beside this gate. Proceeding (an unreadable instrument is not a refusal)." >> "$log" ;;
+      echo "[fork-gate] WARN $label: $_fdetail — the fork floor CANNOT be enforced for this spawn. The instrument RAN and could not measure, which is a reading about the box rather than a deploy fault, so this spawn proceeds (an unmeasurable box is not a refusal). If lanes here stall, start from this line." >> "$log" ;;
   esac
   dpath="${DISK_GATE_PATH:-$PWD}"
   dfree="$(disk_free_mb "$dpath")"
@@ -3348,7 +3987,12 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
   # ONE message for BOTH arms that can refuse on headroom (the band branch below and the plain one):
   # two copies of a 4-line verdict is how the numbers in a log start disagreeing with the numbers in
   # the gate. It is rendered here, where the terms are, and printed where the decision is made.
-  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM — this lane costs up to ${_lane_worst}MB (${_lane_tree}MB while the shared uv cache holds, ${_lane_self}MB if sharing is lost) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
+  # ⛔ AND IT CARRIES THE MACHINE-READABLE TOKEN TOO (agent-infra#3395): `REFUSED-DISK(free=, need=, box=)`
+  # is the form an operator's grep and the pre-start seam (`disk_admit`) share, so a reader never has
+  # to know WHICH of the two arms refused to find the numbers. Appended, never substituted: every
+  # existing reader of this line (and `[disk-gate]` grep) stays correct, and the token is one added
+  # fact rather than a re-wording of a sentence other tooling matches on.
+  _lane_nh_msg="[disk-gate] REFUSED $label: DISK-NOHEADROOM REFUSED-DISK(free=$(disk_mb_gb "${dfree:-}"), need=$(disk_mb_gb "$_lane_need"), box=$(disk_box_id)) — this lane costs up to ${_lane_worst}MB (${_lane_tree}MB while the shared uv cache holds, ${_lane_self}MB if sharing is lost) and this cell must keep ${_lane_reserve}MB free, so ${_lane_need}MB is required; only ${dfree:-?}MB is available on $dpath. No agent was started, so nothing was consumed; reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) or let a lane finish, and the controller re-dispatches. This is NOT a load refusal: waiting does not clear it"
   # DURABLE, and written for ALLOWED runs too — a series that only records refusals cannot answer
   # "how close did we get", which is the question that would have caught either incident early.
   # Same append-only shape as walltime.tsv; a refusal writes a row here (unlike walltime, where a
@@ -3411,6 +4055,35 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     # silent while there is room for several lanes.
     echo "[disk-gate] WARN $label: ${dfree}MB free on $dpath is within one lane of the headroom bound (an admitted spawn needs ${_lane_need}MB = worst case ${_lane_worst}MB (marginal ${_lane_tree}MB, and ${_lane_self}MB if sharing is lost) + reserve ${_lane_reserve}MB) — the next lane OF THIS KIND will be refused DISK-NOHEADROOM. Reclaim with 'cloud-cell-supervisor.sh prune' (--caches, and --scratch for /tmp) while there is still room to do it" >> "$log"
   fi
+  # ── the MEMORY gate (#2387). Read FRESH here, for the load gate's reason: the dispatch-time reading
+  # is minutes or hours old by the time a lane spawns, and it is the reading AT THE SPAWN that decides
+  # whether the allocation lands on a box that can absorb it.
+  #
+  # ⛔ IT RUNS AFTER THE DISK GATE (un-clearable first, the rule stated above) and BEFORE THE LOAD
+  # GATE, which reverses the order of the other two. The reason is the same one that puts disk first:
+  # report the constraint whose consequences are worst and least recoverable. Both a load and a memory
+  # refusal clear by waiting, but a box over its load ceiling runs slowly, while a box at its memory
+  # floor OOM-kills a lane and takes that lane's batch with it — so when both are true, the memory
+  # reading is the one an operator must see. (MAX_LOAD is 10x cores and binds late by construction;
+  # memory is what binds first in practice, which is the whole finding behind this gate.)
+  local mav mem_line mem_rc
+  if mav="$(mem_avail_mb)"; then :; else mav=""; fi
+  mem_line="$(mem_gate_verdict "$mav")"; mem_rc=$?
+  # DURABLE, and written for ALLOWED runs too — the disk ledger's own argument, and the one measurement
+  # that would have caught this incident early: a series that records only refusals cannot answer "how
+  # close did we get". Tab-separated: epoch, kind, tag, avail MB (or UNREADABLE), floor MB.
+  if [ -n "${O:-}" ]; then
+    mkdir -p "$O/state" 2>/dev/null || true
+    printf '%s\t%s\t%s\t%s\t%s\n' "$(date +%s)" "${KIND:-agent}" "${TAG:-}" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB" \
+      >> "$O/state/mem-avail.tsv" 2>/dev/null || true
+  fi
+  case "$mem_rc" in
+    0) : ;;
+    1) echo "[mem-gate] REFUSED $label: $mem_line — starting a lane here is the allocation the OOM killer takes a lane for (a cell has recorded six dmesg OOM kills inside two hours), so no agent was started and nothing was consumed. ⛔ This does NOT clear by waiting for load to fall: it clears when resident lanes FINISH and release their working set. The floor is a capacity policy, not a hidden lane cap — change it deliberately with MEM_MIN_AVAIL_MB (or MEM_LANE_RESERVE_MB / MEM_SPAWN_RESERVE_LANES to keep the arithmetic auditable)" >> "$log"
+       return "$AGENT_MEM_REFUSED" ;;
+    *) echo "[mem-gate] REFUSED $label: $mem_line — fail-CLOSED by design, unlike the disk and load probes: a reading we cannot take is not evidence of capacity, and treating it as ample is how a box talks itself into an OOM. No agent started, nothing was consumed; check that /proc/meminfo (Linux) or vm_stat (macOS) is readable, then the next cycle re-dispatches" >> "$log"
+       return "$AGENT_MEM_REFUSED" ;;
+  esac
   l="$(load1)"
   if ! can_spawn "$l"; then
     echo "[load-gate] REFUSED $label: load=$l >= max_load=$MAX_LOAD — no agent started; the controller re-dispatches when load falls, and nothing was consumed" >> "$log"
@@ -3947,6 +4620,17 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     lane_registry_end "$LANE_ID" "$rc" "$label" "$log"
     return "$AGENT_LOAD_REFUSED"
   fi
+  # ⛔ THE SAME TRANSLATION FOR THE SPAWN POINT'S MEMORY REFUSAL (#2387), and it must be a SEPARATE
+  # arm: the two shim codes say two different things, and collapsing them would report a load
+  # refusal for a box whose load is fine — sending the operator to watch a number that will never
+  # move while lanes keep dying. The message does NOT assert why the shim refused (it cannot know
+  # that a `pi` exiting 84 for its own reason did not do so); it points at the [pi-gate] line, which
+  # carries the reading and the arithmetic, and it names the remedy the code selects.
+  if [ "$rc" = "$PI_GATE_MEM_REFUSED" ]; then
+    AGENT_STARTED=0
+    echo "[mem-gate] REFUSED $label: the pi spawn point refused the launch for MEMORY — no agent started, nothing consumed. The [pi-gate] line above carries the reading, the floor and the arithmetic; re-dispatch when resident lanes finish (this will NOT clear by waiting for load to fall). If the [pi-gate] line says UNREADABLE, the probe itself is broken and every spawn on this box is refusing until it is fixed" >> "$log"
+    return "$AGENT_MEM_REFUSED"
+  fi
   # …and the same for the spawn point's FORK refusal (agent-infra#2293): the band between this gate
   # and the shim's is milliseconds, and closing it by trusting an env marker would hand the bypass
   # back. Translated into the FIRST code so callers never learn a second one.
@@ -3955,6 +4639,15 @@ run_agent() { # run_agent <seconds> <logfile> <promptfile> [label]
     echo "[fork-gate] REFUSED $label: the pi spawn point refused the launch (this box could not fork) — no agent started, nothing consumed; the [pi-gate] line above carries the reading, and this box needs an external restart or a drain" >> "$log"
     lane_registry_end "$LANE_ID" "$rc" "$label" "$log"
     return "$AGENT_FORK_REFUSED"
+  fi
+  # …and the spawn point's SYNC refusal: its copy of this gate could not find `capacity.sh` at all
+  # (see the `nodeploy` arm in pi_shim_main). Passed through UNCHANGED — 83 is already this file's
+  # helper-skew code and its remedy is the one that applies, so folding it into 73 would send the
+  # operator to restart a box that can fork perfectly well.
+  if [ "$rc" = "$AGENT_HARNESS_SKEW_REFUSED" ]; then
+    AGENT_STARTED=0
+    echo "[fork-gate] REFUSED $label: the pi spawn point could not read the fork instrument — no agent started, nothing consumed; the [pi-gate] line above names the paths it searched. Sync the helper pair (cp scripts/orchestrator-harness/*.sh \$O/); do NOT re-dispatch the item elsewhere, every box with these files refuses identically" >> "$log"
+    return "$AGENT_HARNESS_SKEW_REFUSED"
   fi
   # agent-infra#1709 item 3: wall_limit is the CAP, not the cost. elapsed is the measured
   # reviewer/fixer/lane wall-time — the load-bearing number for fleet capacity (it was unmeasured).
@@ -4321,18 +5014,24 @@ reap_lane_venv() {
 # runners, a hand-written tmux runner, an interactive session, and a future caller nobody has
 # thought of. A caller cannot opt out by omission because it is not asked.
 #
-# ⛔ ONE ARTIFACT, NOT TWO. The load primitives (the portable core probe, the MAX_LOAD derivation,
-# `can_spawn`, `load1`) live HERE and the installed `pi` is a COPY OF THIS FILE, so the gate a caller
+# ⛔ ONE ARTIFACT, NOT TWO. The load and memory primitives (the portable core probe, the MAX_LOAD
+# derivation, the meminfo/vm_stat probe, `can_spawn`, `load1`, `mem_avail_mb`, `mem_gate_verdict`)
+# live HERE and the installed `pi` is a COPY OF THIS FILE, so the gate a caller
 # sources and the gate the spawn point applies cannot drift apart — the failure a second
 # implementation would guarantee. That is also why the installed name is `pi` rather than a wrapper
 # script: a wrapper that had to resolve a library by path would dangle when a checkout moves (the
 # reapers move worktrees constantly), and a dangling `pi` on PATH breaks every lane on the box.
 #
-# WHAT IT DOES, in this order: take a FRESH reading (the dispatch-time reading is minutes or hours
-# stale by the time a worker spawns); if the reading is at or above the ceiling, REFUSE with a LOUD
-# line naming the reading, the ceiling and what was not started, plus a row in a DURABLE ledger and
-# a running refusal count; otherwise exec the real pi. A refusal consumes nothing: no model call, no
-# session, no lease.
+# WHAT IT DOES, in this order: take a FRESH reading of available MEMORY (#2387) and of load (the
+# dispatch-time readings are minutes or hours stale by the time a worker spawns); if memory is below
+# its floor — or the probe cannot answer, which is UNREADABLE and REFUSED, never a default — REFUSE
+# with a LOUD line naming the reading, the floor and the arithmetic; if load is at or above the
+# ceiling, REFUSE with a LOUD line naming the reading, the ceiling and what was not started; either
+# way a row lands in a DURABLE ledger with a running refusal count; otherwise exec the real pi. A
+# refusal consumes nothing: no model call, no session, no lease. ⛔ The MEMORY arm is what makes this
+# layer answer for the population it exists for: merge-one.sh's unported `run_agent`, a hand-written
+# tmux runner and an interactive session carry no gate of their own, and memory is the resource that
+# OOM-kills a lane rather than merely slowing it.
 #
 # ⛔ STATED LIMITS — what this layer does not cover, each one a DELIBERATE act rather than an
 # omission. A reader who takes the paragraph above as "the gate is now total" will be wrong, and
@@ -4345,6 +5044,17 @@ reap_lane_venv() {
 #     install.sh renders it into the plist, and `orch-loop.sh`/`install.sh` derive it the same way.
 #     A process that sets it has stated a ceiling of its own. MAX_LOAD=0 keeps its documented
 #     meaning: spawn nothing, for ever (`[ 0 -lt 0 ]` is false, so every reading is refused).
+#     ⛔ THE SAME IS TRUE OF THE MEMORY FLOOR (#2387 review), and this file used to deny it: the
+#     bullet below says the memory gate "needs nothing from the caller", which is true of the
+#     READING and false of the FLOOR. `MEM_MIN_AVAIL_MB` (and the two factors behind it:
+#     `MEM_LANE_RESERVE_MB`, `MEM_SPAWN_RESERVE_LANES`) is read from the environment at source time
+#     exactly like MAX_LOAD, so a caller that exports `MEM_MIN_AVAIL_MB=1` has stated a floor of its
+#     own and is not gated on the FLOOR — that disarms the LOW arm only: `mem_gate_verdict` returns
+#     UNREADABLE and refuses BEFORE any comparison, so an unreadable probe stays refused whatever the
+#     floor says. The harness's own suites use it as a NEUTRALISER (`export MEM_MIN_AVAIL_MB=1`) so a
+#     memory-tight box does not answer a load arm with 84; the four values an operator sets
+#     deliberately are stated in README §7 and rendered by install.sh into the plist, so no caller can
+#     claim it did not know.
 #   * INTERACTIVE sessions are gated too, deliberately. "The gate at the spawn point" is not a claim
 #     about print mode, and parsing argv to exempt "interactive" would create a SECOND definition of
 #     what a spawn is — the exact shape (`pi --print` vs `-p` vs an alias) a caller could hide
@@ -4352,10 +5062,21 @@ reap_lane_venv() {
 #   * A box where neither pi-bootstrap/setup.sh nor pi-bootstrap/cell-install.sh has run has no shim.
 #     Both install it (`$DEST/bin/pi`) and the cell installer byte-compares it on `--verify`, so the
 #     state is checked rather than assumed — but it is a state, and it is stated.
-#   * The DISK gate (#1765) is NOT here. Its reading is per-spawn (DISK_GATE_PATH is the worktree the
-#     agent will fill), which a shim cannot know: a spawn through the shim is disk-gated only when
-#     its caller runs through run_agent() above. Named residual, and it is the reason run_agent keeps
-#     its own two gates rather than deferring to this one.
+#   * The DISK gate (#1765) is NOT here FOR A SPAWN. Its reading is per-spawn (DISK_GATE_PATH is the
+#     worktree the agent will fill), which a shim cannot know: a spawn through the shim is disk-gated
+#     only when its caller runs through run_agent() above. Named residual, and it is the reason
+#     run_agent keeps its own two gates rather than deferring to this one. ⛔ BUT THE PREDICATE IS
+#     REACHABLE FROM HERE AS A VERB (`--disk-admit <target>`, agent-infra#3395): it spawns nothing, so
+#     it is not a spawn to gate, and it is what a dispatcher outside this tree calls instead of
+#     re-implementing `df`. The PRE-START arm used by the worktree creation is `disk_admit` below.
+#   * The MEMORY gate (#2387) IS here, and its STATE is read from the box's own probe (/proc/meminfo
+#     or vm_stat), so it needs no ARGUMENT from the caller. Its floor is per-BOX (not per-volume),
+#     which is the real reason it can be enforced at this layer while the disk gate cannot: the disk
+#     reading is per-SPAWN (`DISK_GATE_PATH` is the worktree this agent will fill), so a shim that
+#     cannot know which worktree that is has nothing to measure. ⚠️ A caller CAN take this reading
+#     (`run_agent` does, three functions up), so this is not "the caller could not know" — it is "the
+#     caller need not supply it, and the floor it cannot supply is settable" — see the MAX_LOAD bullet
+#     above, which states that limit for both gates rather than pretending this one is exempt.
 #   * `pi` invocations that never leave the current process — none exist today (there is no in-process
 #     API use of the harness's model calls), and if one appeared it would be outside every PATH gate.
 #   * ⛔ THE `task`/SUB-AGENT DISPATCH IS ANOTHER SPAWN POINT, AND IT DOES NOT PASS THROUGH PATH.
@@ -4392,14 +5113,22 @@ pi_gate_real() { # pi_gate_real <self-path>
   return 1
 }
 
-# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> — one append-only row per pi invocation.
+# pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail_mb> <mem_floor_mb>] — one
+# append-only row per pi invocation.
 # ALLOWED runs are recorded too, for the reason the disk ledger states: a series that records only
 # refusals cannot answer "how close did we get", which is the question that would have caught both
-# incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller.
+# incidents early. Fields: epoch, verdict, load, max_load, pid, ppid, KIND, TAG, cwd, caller,
+# mem_avail, mem_floor.
+# ⛔ THE MEMORY COLUMNS ARE APPENDED, NEVER INSERTED (#2387 review P3). The load/max pair alone left
+# the memory figure persisted NOWHERE for the shim-only population (merge-one's reviewers, hand-written
+# runners, interactive sessions) — the binding reading was written only to stderr, and `mem-avail.tsv`
+# (which run_agent writes) carries the reading of a DIFFERENT moment. Appending keeps every existing
+# `cut -f1-10` reader working (that is why they are last) and `-` marks "not taken", so an absent
+# reading cannot be read as a number.
 # It writes to $HOME/.pi/agent/state (the durable per-box state dir that already holds locks/,
 # reviews/ and audit/) rather than to `$O`, because a hand-written runner — the exact caller this
 # mode exists for — is under no obligation to have `$O` set.
-pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
+pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller> [<mem_avail> <mem_floor>]
   local dir f
   [ -n "${HOME:-}" ] || return 0
   dir="$HOME/.pi/agent/state"
@@ -4415,8 +5144,9 @@ pi_gate_ledger() { # pi_gate_ledger <verdict> <load> <max> <cwd> <caller>
   if [ -f "$f" ] && [ "$(wc -c < "$f" 2>/dev/null || printf '0')" -ge "$PI_GATE_LEDGER_MAX_BYTES" ]; then
     mv -f "$f" "$f.1" 2>/dev/null || :
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$(date +%s)" "${1:-}" "${2:-}" "${3:-}" "$$" "${PPID:-0}" "${KIND:-}" "${TAG:-}" "${4:-}" "${5:-}" \
+    "${6:--}" "${7:--}" \
     >> "$f" 2>/dev/null || return 0
 }
 
@@ -4435,10 +5165,24 @@ pi_gate_refusal_count() {
 
 # pi_shim_main <argv…> — `pi`, as the spawn point sees it.
 # It never returns: the allow path `exec`s (so this process IS the agent, with no extra shell in the
-# tree and the caller's own signals/fds intact), and the refusal path exits PI_GATE_REFUSED.
+# tree and the caller's own signals/fds intact), and the refusal path exits PI_GATE_MEM_REFUSED (a
+# memory refusal, added in #2387) or PI_GATE_REFUSED (load). BOTH are spawn-point codes and neither
+# may be reported to an operator as the other: the remedies differ.
 pi_shim_main() {
-  local self real load cwd caller n item
+  local self real load cwd caller n item mav mem_line mem_rc
   self="${BASH_SOURCE[0]}"
+  # ── THE ADMISSION VERB, FIRST, AND BEFORE THE REAL-PI RESOLUTION (agent-infra#3395) ─────────────
+  # This mode spawns NOTHING, so it is not a spawn to gate: it answers "does this box have room for
+  # one more lane's worktree" for a caller that has no other way to ask (an ad-hoc pusher, a cron
+  # script, a human). It is deliberately reachable here rather than as a second file, for this
+  # file's own "ONE ARTIFACT, NOT TWO" reason — a wrapper that resolved the predicate by path could
+  # dangle, and a dangling admission check is the `df`-in-a-log-line this change exists to replace.
+  # ⛔ It is NOT a bypass: no argv spelling of `--disk-admit` runs an agent, so nothing is ungated.
+  if [ "${1:-}" = "--disk-admit" ]; then
+    shift
+    disk_admit_cli "$@"
+    exit $?
+  fi
   real="$(pi_gate_real "$self")" || {
     # FAIL CLOSED on an unresolvable pi, LOUD: running *some* pi we cannot identify is worse than
     # refusing to run one, and 127 is the shell's own "cannot execute" so a caller quoting the error
@@ -4472,8 +5216,60 @@ pi_shim_main() {
     pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
     exit "$PI_FORK_REFUSED"
   fi
+  if [ "$_fstate" = "nodeploy" ]; then
+    # ⛔ REFUSED, NOT WARNED. Measured 2026-11-01: this arm was a WARN, and because the resolver
+    # searched only `$O` and "beside me" (a directory that holds no harness when this file IS the
+    # installed `pi` shim) it fired on EVERY lane whose launcher had not exported `O` — so the fork
+    # floor was off fleet-wide, silently, one WARN at a time. A gate that cannot read its own input
+    # must say what it could not read and REFUSE; admitting work without the signal treats "capacity
+    # cannot be established" as "capacity is available", which is the one inference an admission
+    # gate may never make. The operator rescue is the real pi by absolute path.
+    printf '[pi-gate] REFUSED fork headroom UNREADABLE: %s. NO pi was started and nothing was consumed.\n' "$_fdetail" >&2
+    printf '[pi-gate]   this is a DEPLOY/SYNC or CONFIG fault, not a reading about this box: sync the pair into one of the searched dirs (cp scripts/orchestrator-harness/*.sh <dir>), fix the fork-floor knob named above, or redeploy the harness (deploy-harness.sh --repo . --o <O>). Operator rescue is the real pi by absolute path (%s)\n' "$real" >&2
+    pi_gate_ledger refused "${load:-?}" "$MAX_LOAD" "$cwd" "$caller"
+    exit "$AGENT_HARNESS_SKEW_REFUSED"
+  fi
   if [ "$_fstate" = "unknown" ]; then
     printf '[pi-gate] WARN fork headroom UNREADABLE: %s — the fork floor cannot be enforced for this launch\n' "$_fdetail" >&2
+  fi
+  # ── MEMORY, BEFORE LOAD (#2387), for run_agent's ordering reason: both refusals clear by waiting,
+  # but the memory one is the reading whose consequence is a dead lane and a lost batch rather than a
+  # slow one. This arm is not redundant with run_agent's: it is the ONLY memory gate that reaches the
+  # population this mode exists for — merge-one.sh's own unported `run_agent` (the `chain-<N>` first
+  # review of every own-lane PR, and fix-one.sh's re-review), a hand-written `tmux new-session … pi`
+  # runner, and an interactive session. The load reading is already taken twice on purpose (here and
+  # in run_agent); memory is taken twice for the same reason and with the same seam.
+  if mav="$(mem_avail_mb)"; then :; else mav=""; fi
+  mem_line="$(mem_gate_verdict "$mav")"; mem_rc=$?
+  if [ "$mem_rc" -ne 0 ]; then
+    n="$(pi_gate_refusal_count)"
+    item="${TAG:-${KIND:-untagged}}"
+    # Same shape as the load refusal below and the same three facts, with the MEMORY reading where the
+    # load reading would be, plus the arithmetic that produced the floor. `UNREADABLE` is carried in
+    # the line by mem_gate_verdict itself when the probe could not answer.
+    printf '[pi-gate] REFUSED (memory) %s — item NOT started: %s (cwd=%s, caller=%s)\n' \
+      "$mem_line" "$item" "$cwd" "$caller" >&2
+    printf '[pi-gate]   refusal #%s, recorded durably in %s/.pi/agent/state/spawn-gate.tsv — nothing was consumed: no model call, no session\n' \
+      "$(( n + 1 ))" "${HOME:-<no HOME>}" >&2
+    # ⛔ ONE REMEDY PER STATE (review P2). LOW and UNREADABLE are both refusals but they CLEAR
+    # DIFFERENTLY: a LOW floor clears when resident lanes finish, and nothing will ever finish to fix a
+    # BROKEN PROBE. Printing the wait-for-lanes advice for an unreadable probe — as this arm used to —
+    # sends the operator to wait for an event that cannot arrive, and it contradicted `run_agent`'s own
+    # arm for the same state. This is the shim, i.e. the only gate merge-one's reviewers and hand-run
+    # `pi`s ever meet, so a wrong remedy here is a wrong remedy for the population the arm exists for.
+    if [ "$mem_rc" -eq 2 ]; then
+      printf '[pi-gate]   remedy: the PROBE is broken, not the box — every spawn re-reads the same failed probe, so this will NOT clear by waiting (for lanes OR for load). Make /proc/meminfo readable, or make `vm_stat` work on this host, and the gate reads a real number again; operator rescue meanwhile is the real pi by absolute path (%s)\n' \
+        "$real" >&2
+    else
+      # The remedy names BOTH routes, for the load arm's reason: a lane must be allowed to FINISH (or to
+      # be stopped deliberately), and an operator who must start a pi anyway has the absolute path.
+      printf '[pi-gate]   remedy: re-dispatch when resident lanes finish and release their working set (this will NOT clear by waiting for load); operator rescue is the real pi by absolute path (%s), or a deliberate MEM_MIN_AVAIL_MB / MAX_LOAD\n' \
+        "$real" >&2
+    fi
+    # The reading and the floor ARE persisted (review P3): the load/max pair below cannot answer "how
+    # close to the floor", which is the question this gate exists to make answerable after the fact.
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
+    exit "$PI_GATE_MEM_REFUSED"
   fi
   if ! can_spawn "$load"; then
     n="$(pi_gate_refusal_count)"
@@ -4489,10 +5285,10 @@ pi_shim_main() {
     # fix. See STATED LIMITS.
     printf '[pi-gate]   remedy: re-dispatch when the 1-min load falls below %s; operator rescue is the real pi by absolute path (%s) or an explicit MAX_LOAD\n' \
       "$MAX_LOAD" "$real" >&2
-    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller"
+    pi_gate_ledger refused "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
     exit "$PI_GATE_REFUSED"
   fi
-  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller"
+  pi_gate_ledger allowed "$load" "$MAX_LOAD" "$cwd" "$caller" "${mav:-UNREADABLE}" "$MEM_MIN_AVAIL_MB"
   exec "$real" "$@"
 }
 

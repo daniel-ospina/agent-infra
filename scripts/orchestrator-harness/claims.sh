@@ -217,6 +217,34 @@ case "${CLAIM_UNREADABLE_LEASE_MAX_AGE:-}" in
   ''|*[!0123456789]*|0*) CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;
   *) [ "${#CLAIM_UNREADABLE_LEASE_MAX_AGE}" -le 9 ] || CLAIM_UNREADABLE_LEASE_MAX_AGE=18000 ;;
 esac
+# ⛔ AND A FLOOR, OR THE BOUND IS A SCHEDULED STEAL (review round 19, agent-infra#3203). The ceiling
+# below stops a ~31-year bound from re-creating the eternal block; WITHOUT a floor the same knob does
+# the OPPOSITE and far worse thing: `CLAIM_UNREADABLE_LEASE_MAX_AGE=1` makes the unattended hourly
+# `claim_prune` reap an unparseable-lease claim SECONDS after it was minted — i.e. it deletes a peer's
+# LIVE claim on a schedule, which is the steal direction this whole arm exists to refuse (the failed
+# test that produced the 2**63 rule was a mis-polarised comparison STEALING a live claim). A bound
+# below the longest lease any caller can mint can always fire INSIDE a live term, so it is not a
+# bound at all.
+# ⛔ CALIBRATED ON THE LONGEST MINTABLE TERM, NOT ON ONE KNOB (review round 20). `CLAIM_ISSUE_TTL` is
+# NOT the longest lease this file can mint: `CLAIM_BRANCH_TTL` (branch claims) and `CLAIM_TTL_MAX`
+# (PR/fix leases) are each first-class overrides with their own digit clamps above, and either can be
+# raised PAST `CLAIM_ISSUE_TTL` — measured, `CLAIM_BRANCH_TTL=40000` mints `lease_until = now + 40000`
+# (a `until - now` delta reads 39996 only because it is taken seconds after the mint; the mint site is
+# `_claim_acquire_at`'s `until=$(( now + ttl ))`), while a floor nailed to 18000 would reap that live
+# branch claim ~22 000 s inside its own term,
+# re-creating exactly the bug this block closes, one knob over. So the FLOOR TERM is the max of all
+# three, computed once into an internal (`_claim_`-prefixed like the helpers, never a knob): the ceiling
+# has to be compared against the TERM, not against whatever the operator configured, or the legitimate
+# "an absurd configured bound is clamped to 7 days" rule below would be defeated by it.
+_claim_floor_term="$CLAIM_ISSUE_TTL"
+[ "$CLAIM_BRANCH_TTL" -gt "$_claim_floor_term" ] && _claim_floor_term="$CLAIM_BRANCH_TTL"
+[ "$CLAIM_TTL_MAX" -gt "$_claim_floor_term" ] && _claim_floor_term="$CLAIM_TTL_MAX"
+# ...and the term is capped at the SAME 30-day literal the ceiling is hard-capped to, or a 9-digit
+# `CLAIM_TTL_MAX=999999999` makes the floor ~31 years and the ceiling-vs-floor rule below raises the
+# CEILING to match it — the floor would then BE the eternal hold this change exists to end.
+[ "$_claim_floor_term" -gt 2592000 ] && _claim_floor_term=2592000
+[ "$CLAIM_UNREADABLE_LEASE_MAX_AGE" -lt "$_claim_floor_term" ] \
+  && CLAIM_UNREADABLE_LEASE_MAX_AGE="$_claim_floor_term"
 # ⛔ AND A CEILING, OR THE BOUND IS DECORATIVE (review, agent-infra#3203). A 9-digit value is ~31
 # years: `CLAIM_UNREADABLE_LEASE_MAX_AGE=999999999` in an ambient environment re-creates the exact
 # eternal block this arm exists to end, while looking like a configured bound. 7 days is far past
@@ -229,6 +257,18 @@ esac
 # ⛔ THE CEILING ITSELF IS HARD-CAPPED (review, agent-infra#3203): an override that can raise the
 # ceiling only re-opens the hole from one level up, so 30 days is a LITERAL, not a knob.
 [ "$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL" -gt 2592000 ] && CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL=2592000
+# ⛔ AND THE CEILING CANNOT UNDERCUT THE FLOOR TERM (review round 20, agent-infra#3203). The hard cap
+# above only fixes an absurdly LARGE configured bound. A ceiling set BELOW the floor term is the same
+# scheduled steal from the other side, and it is the worse direction: measured on the shipped file,
+# `MAXAGE=1 CEIL=1` resolved the bound to 1 s and `claim_prune` DELETED a 2-SECOND-old claim
+# (`… 2s old, PAST the 1s bound`), and `CEIL=3600` alone reaped a 4000 s-old claim that the shipped
+# defaults keep. A bound below the longest mintable term can always fire INSIDE a live term, so it is
+# not a bound at all — the same argument that produced the floor. Unlike a long bound, which every pass
+# NAMES, a steal is SILENT, so the floor term wins this collision. Note it is compared against the TERM
+# and not against the configured value: `MAXAGE=999999999` must still be clamped DOWN to the 7-day
+# ceiling (A30), and comparing against the configured value would let it raise the ceiling instead.
+[ "$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL" -lt "$_claim_floor_term" ] \
+  && CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL="$_claim_floor_term"
 [ "$CLAIM_UNREADABLE_LEASE_MAX_AGE" -gt "$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL" ] \
   && CLAIM_UNREADABLE_LEASE_MAX_AGE="$CLAIM_UNREADABLE_LEASE_MAX_AGE_CEIL"
 
@@ -1146,7 +1186,28 @@ _claim_commit_time() {
   # measured: `sed s/[0-9]/X/` turned `٣` into X, `sed s/[0123456789]/X/` did not. The enumerated `case`
   # below rejects the result, so there is no fail-open today, but the parse must not depend on the
   # downstream guard to stay ASCII.
-  ct="$(printf '%s' "$raw" | sed -n '/^$/q;p' | sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p' | tail -n 1)"
+  # ⛔ THE PARSE IS BYTE-ORIENTED, SO ITS ANSWER DOES NOT DEPEND ON THE BOX'S LOCALE (review round 26).
+  # `sed`'s `.` does not consume an INVALID UTF-8 byte under a UTF-8 locale, so a `committer` line
+  # carrying one (a latin-1 name, or a peer-forged byte — the header is peer-writable) matched here
+  # under `LC_ALL=POSIX` and did NOT under `LC_ALL=C.UTF-8`: measured, the same object answered
+  # `1700000000` on one box and UNMEASURABLE on the next, and `tools/fleet/claim_lanes.py`'s mirror
+  # (which decodes with `errors="replace"`) answered a stamp in both. `git` itself dates that commit
+  # fine — the encoding of a name has nothing to do with its timestamp — so the byte answer is the
+  # correct one AND the one that stops this reader disagreeing with its own mirror. `LC_ALL=C` on the
+  # three stages is the whole fix: `.` becomes byte-oriented, and every shape that measures today still
+  # measures the same value.
+  ct="$(printf '%s' "$raw" | LC_ALL=C sed -n '/^$/q;p' | LC_ALL=C sed -n '/^committer /p' | tail -n 1 \
+        | LC_ALL=C sed -n 's/^committer .* \([0123456789][0123456789]*\) [+-][0123456789][0123456789][0123456789][0123456789]$/\1/p')"
+  # ⛔ SELECT THE LAST `committer` LINE *FIRST*, THEN PARSE IT (review round 20, agent-infra#3203). The
+  # parse above used to be ONE anchored `sed` piped to `tail -n 1`, which selects "the last line that
+  # MATCHES", not "the last committer line". Git dates the object from the last `committer` header
+  # whatever else the line carries, so a newest header with ANY trailing token
+  # (`committer a <a@b> 1 +0000 junk`) is filtered out by the `$` anchor and `tail` then returns an
+  # EARLIER committer line — measured: a claim `git log --format=%ct` dates as 1 s old was reaped with
+  # `the claim commit is 1793991810s old, PAST the 18000s bound`, i.e. the exact forged-age steal the
+  # two-header rule above exists to close, one token over. Selecting and parsing are two steps for that
+  # reason: a NEWEST header this parser cannot read makes the age UNMEASURABLE (rc=1 below, so the
+  # caller keeps and NAMES the claim), never a silent fallback to older text.
   # ⛔ TAIL, NOT HEAD — GIT TAKES THE LAST COMMITTER LINE (review, agent-infra#3203). A crafted commit
   # carrying two `committer` headers (`git hash-object -t commit --literally`, which a strict fsck still
   # accepts) is dated by GIT from the LAST one and by `head -n 1` from the FIRST — so an attacker writes
@@ -2160,7 +2221,7 @@ claim_prune() {
     # the only case where this class still needs a human — stated, not hidden.
     if _lease_unparseable "$until"; then
       if [ -z "${now:-}" ]; then
-        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed AND the LOCAL CLOCK is unreadable, so this claim's age cannot be established: nothing in the unparseable-lease class is reaped on a clock this box cannot read (the orphaned-host arm still is, which is why it still runs) — agent-infra#3203)"
+        echo "kept unreadable-lease $ref (owner $owner — lease_until='${until}' cannot be parsed AND the LOCAL CLOCK is unreadable, so this claim's age cannot be established: nothing in the unparseable-lease class is reaped on a clock this box cannot read, and the orphaned-host arm is NOT consulted for this class either (claim-orphan.test.sh O20 pins that it survives a pass that names its host DEAD) — agent-infra#3203)"
         continue
       fi
       if [ -z "$ct" ]; then
