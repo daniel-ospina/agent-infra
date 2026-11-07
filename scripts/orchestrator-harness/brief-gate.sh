@@ -583,7 +583,12 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
       # H51c is the ADMIT row. H51d is the parity row: a separator followed by WHITESPACE ONLY must still
       # be refused — and its carrier has to be a byte the value reader's trailing trim KEEPS. That trim is
       # `[ \t]+` (the WIP awk above), so a space/tab-only value collapses to bare `keyless` and asserts
-      # nothing new — which is exactly why the FIRST version of H51d was vacuous (cycle 12 finding 2).
+      # nothing new — which is exactly why the FIRST version of H51d was vacuous. ⛔ THAT PROVENANCE IS
+      # TWO STEPS, NOT ONE (checked against this PR's own review record): the row was ADDED by the
+      # cycle-12 fix round, whose finding 3 was the `keyless<TAB>` false block; it was then found VACUOUS
+      # by the cycle-13 review's finding 2, which deleted it — and the cycle-14 delta review's finding 1
+      # restored it with a carrier the trim keeps. An earlier wording cited "cycle 12 finding 2" for the
+      # vacuity, and that finding is the SEPARATOR citation, a different finding in a different cycle.
       # CR survives the trim and really does arrive here as whitespace-only, so H51d uses CR: with it, the
       # plausible-simplification mutant `[[:space:]]*[![:space:]]*` → `[[:space:]]*` is KILLED
       # (`keyless<CR>` 80 → 0) while the bare-`keyless` row alone cannot kill it (80 → 80, measured).
