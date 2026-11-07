@@ -528,6 +528,52 @@ rf "$D" refresh
 [ ! -s "$D/o/.pool-sat" ] && ok "truncation-writer: an UNSATURATED listing writes no .pool-sat (the clause is not emitted for a tier that fit)" \
                           || bad "truncation-writer: .pool-sat exists for an unsaturated listing ('$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null)') — the signal would fire on every pass and stop meaning anything"
 
+# ⛔ AND THE RECORD IS PER-PASS, NOT ACCUMULATED (review P3, cycle 60). `.pool-sat` is only ever APPENDED to;
+# the ONE thing that makes it describe THIS pass is the `rm -f … "$O/.pool-sat"` in the entry reset. Every
+# case above runs in a FRESH `$D`, so none of them could see that term: dropping it left this suite, rank-queue,
+# pool-filter and product-floor all green — and the next pass then discloses a clip from a read that reported
+# none ("a tier window ended FULL with a next page still advertised" over a listing that fit), i.e. an alarm
+# that cries wolf on every pass after any clip. Driven as the failure needs: TWO passes in ONE `$O`.
+mk_case sat-writer-stale 1000
+mk_gh_sat "$D"
+mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+rf "$D" refresh
+stale_first="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+mk_gh "$D" "$(rows 2)"        # THIS pass: a short listing, no full window, no next page
+rf "$D" refresh
+stale_second="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+if [ -z "$stale_first" ]; then
+  bad "truncation-stale: the FIRST pass recorded nothing ('$stale_first') — the second-pass assertion below would pass by vacuity"
+elif [ "$RC" -ne 0 ]; then
+  bad "truncation-stale: the second pass did not succeed (rc=$RC) — output: $OUT"
+elif [ -s "$D/o/.pool-sat" ]; then
+  bad "truncation-stale: the SECOND pass (an unsaturated listing) still carries the first pass's clip ('$stale_second') — the record is not per-pass, so the order line would disclose a truncation this read never saw"
+else
+  ok "truncation-stale: a second pass over a SATURATED first pass records NO clip (the .pool-sat reset makes the record per-pass)"
+fi
+# ⛔ NON-VACUITY: delete `"$O/.pool-sat"` from the entry reset and the assertion above must go RED.
+MUT_STALE="$T/mut-stale/refresh-candidates.sh"; mkdir -p "$T/mut-stale"
+sed 's/^rm -f "\$O\/\.pool-err" "\$O\/\.pool-read" "\$O\/\.pool-sat"$/rm -f "$O\/.pool-err" "$O\/.pool-read"/' \
+  "$REFRESH" > "$MUT_STALE"
+if cmp -s "$REFRESH" "$MUT_STALE" 2>/dev/null; then
+  bad "truncation-stale: the reset-deletion mutation did not apply — the sed anchor drifted, so this non-vacuity half grades nothing"
+else
+  D2="$T/sat-writer-stale-mut"; mkdir -p "$D2/home" "$D2/bin" "$D2/o" "$D2/repo/.worktrees/dispatch-scout/tools"
+  git init -q --bare "$D2/origin.git"; git init -q "$D2/repo"; git -C "$D2/repo" remote add origin "$D2/origin.git"
+  printf '1000' > "$D2/core"
+  printf 'claim_issue_preflight() { return 0; }\n' > "$D2/o/claims.sh"
+  mk_gh_sat "$D2"
+  mk_tool "$D2/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
+  REFRESH_SAVED2="$REFRESH"; REFRESH="$MUT_STALE"; rf "$D2" refresh; REFRESH="$REFRESH_SAVED2"
+  mk_gh "$D2" "$(rows 2)"
+  REFRESH_SAVED2="$REFRESH"; REFRESH="$MUT_STALE"; rf "$D2" refresh; REFRESH="$REFRESH_SAVED2"
+  if [ -s "$D2/o/.pool-sat" ]; then
+    ok "truncation-stale: with the .pool-sat reset DELETED the second pass still carries the clip ('$(tr '\n' ' ' < "$D2/o/.pool-sat" 2>/dev/null)') — the check above grades the RESET, not a fixture artifact"
+  else
+    bad "truncation-stale: with the .pool-sat reset deleted the clip did NOT persist — the check above is not grading the reset"
+  fi
+fi
+
 echo
 echo "  $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

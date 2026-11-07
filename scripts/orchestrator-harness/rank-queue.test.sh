@@ -1546,8 +1546,8 @@ _mh_n="$(wc -l < "$MAINDRV" 2>/dev/null | tr -d ' ')"
 if [ -n "$_mh_n" ] && [ "$_mh_n" -gt 12 ] && grep -q 'handed to dispatch' "$MAINDRV" 2>/dev/null; then rc=0
 else rc=1; echo "      MAIN handoff extraction failed ($_mh_n line(s)) — the drive below would grade an empty file"; fi
 ck "the MAIN handoff's depth-read-and-arms region is extracted from the shipped file" $rc
-main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
-  local d="$TMP/mh-$1" how="$2" st="${3:-severity}"
+main_handoff() {  # <label> <queue-setup> [state] [queued-this-pass] -> sets MHRC/MHOUT
+  local d="$TMP/mh-$1" how="$2" st="${3:-severity}" qp="${4-}"
   rm -rf "$d"; mkdir -p "$d/o"
   case "$how" in
     dir)   mkdir -p "$d/o/candidates.txt" ;;          # unreadable AS A FILE: a directory
@@ -1571,7 +1571,7 @@ main_handoff() {  # <label> <queue-setup> [state] -> sets MHRC/MHOUT
     mode000) printf '300\n200\n' > "$d/o/candidates.txt"; chmod 000 "$d/o/candidates.txt" ;;
   esac
   {
-    printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS=""\n' "$st"
+    printf 'set -u\nQUEUE_ORDER_STATE="%s"\nQUEUED_THIS_PASS="%s"\n' "$st" "$qp"
     printf 'refresh_record_write() { printf "RECORD: %%s\\n" "$*"; }\n'
     # the provenance clause the "handed NOTHING" records compose is stubbed as its own MARKER, so a record
     # that drops the field (or a state the arm forgot to pass) is visible in the row rather than silently ""
@@ -1729,6 +1729,28 @@ if [ "$MHRC" -eq 0 ] && grep -q 'established NO priority order' <<<"$MHOUT" \
    && ! grep -q 'pool-ordered' <<<"$MHOUT"; then rc=0
 else rc=1; echo "      unranked handoff: rc=$MHRC out '$(printf '%s' "$MHOUT" | tr '\n' '|' | head -c 320)' (a priority-unreadable pass may NOT describe its head as 'the highest-ranked CLEAN entry' / 'pool-ordered')"; fi
 ck "an UNRANKED pass never describes its head as 'the highest-ranked CLEAN entry in the pool-ordered queue'" $rc
+# ⛔ AND THE ARM'S OWN WORDS ARE ASSERTED, POSITIVELY (review P3, cycle 60). The check above is a NEGATIVE — any
+# wording other than the severity clause satisfies it — so making the `unranked` arm wear
+# `priority-unreadable`'s text (or `empty`'s) left every suite green, while `handed_why=` in
+# `state/refresh-last` would then claim "this pass established NO priority order" over a pass that DID
+# install one: exactly the false durable claim the arm was added to prevent.
+main_handoff unranked-own rows unranked
+_u1="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+# and the same arm with the head judged BY THIS PASS, so its prefix is exercised too
+main_handoff unranked-judged rows unranked '300 '
+_u2="$(printf '%s\n' "$MHOUT" | grep '^RECORD:' | grep 'handed=' | head -1)"
+if [ -z "$_u1" ] || [ -z "$_u2" ]; then
+  rc=1; echo "      the unranked drives recorded no handoff row ('${_u1:-<none>}' / '${_u2:-<none>}')"
+elif ! grep -q 'the pool ranking NONE of its rows' <<<"$_u1"; then
+  rc=1; echo "      the unranked arm does not name the ranked-none fact: '$_u1'"
+elif grep -q 'established NO priority order' <<<"$_u1" || grep -q 'read an empty queue' <<<"$_u1"; then
+  rc=1; echo "      the unranked arm wears another state's words (priority-unreadable / empty): '$_u1'"
+elif ! grep -q 'judged CLEAN by THIS pass' <<<"$_u2" || ! grep -q 'the pool ranking NONE of its rows' <<<"$_u2"; then
+  rc=1; echo "      the unranked arm does not compose the judged prefix with its own clause: '$_u2'"
+elif grep -q 'carried over from an earlier pass' <<<"$_u2"; then
+  rc=1; echo "      a head this pass JUDGED is recorded as 'carried over from an earlier pass': '$_u2'"
+else rc=0; fi
+ck "the UNRANKED arm names the ranked-none fact in its own words (and composes the judged prefix when it judged the head)" $rc
 main_handoff absent none
 if [ "$MHRC" -eq 0 ] && grep -q 'could NOT be READ' <<<"$MHOUT" \
    && ! grep -q 'No such file or directory' <<<"$MHOUT" \
