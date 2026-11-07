@@ -3128,8 +3128,12 @@ root, live = sys.argv[3], int(sys.argv[4])
 os.makedirs(root, exist_ok=True)
 m.STATE, m.LOOP_LOCK = sys.argv[2], os.path.join(root, "loop.lock")
 # Two stubs, so the interleaving is the only thing under test: every pid reads as alive, and only the
-# COMPETITOR reads as a scheduler loop. The competitor's recorded start time is its REAL one, so the
-# identity check recognises it — otherwise the test would be grading the start arm, not this one.
+# COMPETITOR reads as a scheduler loop. The record of the competitor carries its REAL start time, so
+# the identity check recognises it — otherwise the test would be grading the start arm, not this one.
+# ⛔ NO QUOTE OR BACKTICK CHARACTERS IN THIS BODY (agent-infra#3625): the bash 3.2 substitution
+# scanner does not know about here-documents and walks this text as CODE, so a single one opens a
+# state that never closes and desynchronises the parse ~230 lines below. Reworded, not escaped —
+# the remedy scripts/check-bash32-parse.sh names.
 m.pid_alive = lambda p: True
 m.pid_is_our_loop = lambda p: p == live
 competitor_start = m.proc_start_time(live)
