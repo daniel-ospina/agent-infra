@@ -40,13 +40,24 @@
 # guard's THREE references — HOME, CELL_HOME, the pass state dir), the keep list, `git-below`, the
 # bare-repo refusal, the young floor, the `--dry-run` default, and `--include-gitless` being OPT-IN.
 #
-# ⛔ SEVEN OF THE EIGHT CASES (A, C, D, E, F, G, H) ARE MUTATION-CHECKED (`expect_pass` then
-# `expect_fail` against a mutated copy); only B is not, because its subject (the `--apply` removal) is
-# asserted directly and a mutation of it would only reproduce the same assertion. G IS checked, and
+# ⛔ ALL EIGHT CASES (A–H) ARE MUTATION-CHECKED (`expect_pass` then `expect_fail` against a mutated
+# copy). B was the exception until review round 10, on the reasoning that "its subject (the `--apply`
+# removal) is asserted directly and a mutation of it would only reproduce the same assertion" — that
+# reasoning was wrong in the way agent-infra#3442 exists to catch: it left B's young-tree guarantee
+# GREEN on pre-#3278 code and under every mutation here, so nothing showed it could fail. `MUT_AGEFLOOR`
+# is B's mutant, and it is a REGRESSION mutant rather than a #3278 one (the age floor predates this PR,
+# and the LINKED arm's own floor backstops a deleted gitless one — which is why no mutant of the #3278
+# reorder could ever have reddened B). G IS checked, and
 # round 7 is why an earlier "B, F and G are not" was wrong: emptying the variable (`MUT_CELLHOME`) and
 # reverting its USE SITE (`MUT_CELLHOME_REF`) are DIFFERENT edits, and only the use-site one shows the
 # FALLBACK protects anything. F IS checked by `MUT_NUMBOUND`, because "a bad seam is refused" is true of
 # a digit-shape check while the ceiling is still DELETABLE by an all-digit value it cannot compare.
+# Round 10 also deleted three rows that NO mutation could move (they were measured GREEN under every
+# mutant, every probe and pre-fix code): "all twelve young trees SURVIVED", "and NOT on the age floor
+# (no reason=young)" in case H, and "the bound is REAL in --apply" in case H — the last two because
+# case H's fixture REQUIRES a live holder, which preserves the tree under every order. B's row and D's
+# report row were REPLACED with falsifiable forms rather than deleted; the two H rows were deleted and
+# their behaviour is covered by the rows that name it (`reason=budget` without `reason=live-cwd`).
 # A test that passes against a script with the bound
 # DELETED proves nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation
 # is a case that has silently stopped checking.
@@ -236,7 +247,7 @@ case_a() { # <owner-script>
 
 # ── B: --apply removes the thirteenth and NOTHING else ───────────────────────────────────────
 case_b() { # <owner-script>
-    local owner="$1" i kept=0
+    local owner="$1"
     UNDER_TEST="$owner"
     newfixture b || { case_check 1 "fixture could not be built"; return 1; }
     build_12_young_1_aged "$FB/root"
@@ -245,10 +256,16 @@ case_b() { # <owner-script>
     case_check "$([ ! -d "$FB/root/b13-aged" ] && echo 0 || echo 1)" "the AGED thirteenth tree WAS removed"
     case_check "$(grep -qF "REAPED $FB/root/b13-aged how=rm-gitless" <<<"$OUT" && echo 0 || echo 1)" \
                "and the report names the arm that removed it (how=rm-gitless)"
-    for i in 01 02 03 04 05 06 07 08 09 10 11 12; do
-        [ -d "$FB/root/a$i-young" ] && kept=$((kept + 1))
-    done
-    case_check "$([ "$kept" = 12 ] && echo 0 || echo 1)" "all twelve YOUNG trees SURVIVED ($kept/12)"
+    # ⛔ NOT `all twelve survived`. That assertion was measured GREEN under every mutation of this
+    # diff AND on pre-#3278 code (review round 10, agent-infra#3442 rule 3): the twelve young trees
+    # survive whether the unit is charged before or after the floor, so it attributed nothing to the
+    # fix. THIS is the falsifiable form of the same safety property — they must be preserved ON AGE,
+    # not because a spent slot happened to keep them: under `MUT_CAPPRE` (the pre-fix order) ten of
+    # them print `gitless-cap` and this count is 10, and a mutation that made a young tree removable
+    # removes it AND drops this count. It still catches the failure the survival check was written
+    # for, because a removed tree is not reported `young`.
+    case_check "$([ "$(grep -c 'reason=young' <<<"$OUT")" = 12 ] && echo 0 || echo 1)" \
+               "and the twelve YOUNG trees were preserved ON AGE, not on a spent slot ($(grep -c 'reason=young' <<<"$OUT")/12 reasons=young)"
     return $((CASE_FAIL > 0))
 }
 
@@ -294,8 +311,14 @@ case_d() { # <owner-script>
                "it stops ON THE TIME BUDGET (reason=budget, named per candidate)"
     case_check "$([ -d "$FB/root/b13-aged" ] && echo 0 || echo 1)" \
                "and the bound is REAL in --apply: the aged tree is still there"
-    case_check "$(grep -q '^remove ' <<<"$OUT" && echo 1 || echo 0)" \
-               "no candidate was reported removable either (the bound stops the report as well)"
+    # ⛔ NOT `no line starts with \`remove \``: case D runs `--apply`, and `remove` is printed ONLY under
+    # `DRY_RUN=1`, so that grep could never match and the assertion was measured GREEN in the very
+    # `MUT_BUDGET` run that reaped the tree (review round 10, agent-infra#3442 rule 3). The record is
+    # what a bounded pass must be held to instead, and it DOES vary: with the bound the aged tree never
+    # reaches candidacy, so `candidates=0 reaped=0`; with the bound gone the same pass reports
+    # `candidates=1 reaped=1`.
+    case_check "$(grep -q '^SUMMARY .*candidates=0 reaped=0 kept=13 ' <<<"$OUT" && echo 0 || echo 1)" \
+               "and the bound stopped the pass BEFORE candidacy: the record says candidates=0 reaped=0 (the report is bounded too)"
     case_check "$([ "$(grep -c 'reason=young' <<<"$OUT")" = 12 ] && echo 0 || echo 1)" \
                "the twelve young trees are STILL classified: cheap eligibility is not starved by the bound"
     case_check "$(grep -q 'budget=0s' <<<"$OUT" && echo 0 || echo 1)" \
@@ -480,14 +503,21 @@ case_h() { # <owner-script>
                "a spent-budget pass over a LINKED worktree exits 0 (rc=$OUT_RC)"
     case_check "$(grep -qF "KEPT   $FB/root/a-linked reason=budget" <<<"$OUT" && echo 0 || echo 1)" \
                "the LINKED arm stops on the TIME bound (reason=budget)"
-    case_check "$(grep -q 'reason=young' <<<"$OUT" && echo 1 || echo 0)" \
-               "and NOT on the age floor — the bound precedes the census and the floor (no reason=young)"
+    # ⛔ REMOVED at review round 10 (agent-infra#3442 rule 3): `and NOT on the age floor (no
+    # reason=young)`. The fixture's tree is AGED into the linked arm's floor by construction, so
+    # `reason=young` is unreachable for it — MEASURED GREEN under all eight shipped mutants, four
+    # probes and pre-#3278 code. It claimed an ordering it could not observe. The ordering is proven by
+    # the next assertion instead, which is falsifiable because the holder is present.
     # ⛔ THE ORDER ITSELF: the tree IS held by a live pid, so a census that ran first would have reported
     #    the witness. `budget` with the holder present is what proves the bound went FIRST.
     case_check "$(grep -q 'reason=live-cwd' <<<"$OUT" && echo 1 || echo 0)" \
                "and the CENSUS never ran: the pid holding this tree is not reported (no reason=live-cwd)"
-    case_check "$([ -d "$FB/root/a-linked" ] && echo 0 || echo 1)" \
-               "the bound is REAL in --apply: the linked worktree is still there"
+    # ⛔ REMOVED at review round 10 (agent-infra#3442 rule 3): `the bound is REAL in --apply: the linked
+    # worktree is still there`. This fixture REQUIRES a live holder (it is what makes the census
+    # observable), and that holder preserves the tree under every order — so the assertion stayed GREEN
+    # under `MUT_CENSUS_FIRST`, `MUT_LINKED_BUDGET` and both budget probes, i.e. it could not tell a
+    # working bound from an absent one. The tree's survival is still covered, as a gate rather than as a
+    # bound: case G asserts the live-pid preservation directly for the gitless arm.
     case_check "$(grep -q 'budget=0s' <<<"$OUT" && echo 0 || echo 1)" \
                "the SUMMARY states the bound it ran under (budget=0s)"
     return $((CASE_FAIL > 0))
@@ -524,6 +554,21 @@ if apply_mutation "$OWNER" "$T/mut-cappre/reap-abandoned-worktrees.sh" -e "$MUT_
     expect_fail "MUT_CAPPRE pre-fix shape — case C must go RED too (the ceiling reaches no aged tree)" case_c "$T/mut-cappre/reap-abandoned-worktrees.sh"
 else
     bad "MUT_CAPPRE could not be applied — the #3278 fixture is not checking the pre-fix shape"
+fi
+
+# MUT_AGEFLOOR removes the AGE FLOOR's protective value, so a YOUNG tree becomes a candidate. It is the
+# mutant case B needs and the suite did not carry one: `all twelve young trees SURVIVED` was measured
+# GREEN on pre-#3278 code and under every other mutation here (review round 10, agent-infra#3442 rule 3),
+# so it attributed nothing to any fix. With the floor at 0 the twelve young trees reach candidacy, the
+# ten-slot ceiling removes TEN of them, and case B's `preserved ON AGE` row counts 0 instead of 12.
+# ⛔ THIS IS A REGRESSION MUTANT, not a #3278 mutant: the floor predates this PR, and the young-tree
+# survival property it protects is backstopped by the LINKED arm's own floor when the gitless one is
+# deleted — which is exactly why no mutant of the #3278 reorder alone could ever have reddened case B.
+MUT_AGEFLOOR='s|^AGED_MINUTES=.*|AGED_MINUTES=0|'
+if apply_mutation "$OWNER" "$T/mut-agefloor/reap-abandoned-worktrees.sh" -e "$MUT_AGEFLOOR"; then
+    expect_fail "MUT_AGEFLOOR the age floor preserves nothing — case B must go RED (young trees removed)" case_b "$T/mut-agefloor/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_AGEFLOOR could not be applied — case B's young-tree guarantee is not being checked"
 fi
 
 # MUT_BUDGET makes the time bound never fire: the pass is then bounded by nothing at all.
