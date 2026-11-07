@@ -681,6 +681,27 @@ ck "the TILED marks appear in BODY ORDER (order is what makes the attribution ri
    "$(if [ "$_tiled_order" = "$_tiled_want" ]; then echo 0; else echo 1; fi)"
 ck "  …order actually read: '${_tiled_order:- none}'" \
    "$(if [ -n "$_tiled_order" ]; then echo 0; else echo 1; fi)"
+# ⛔ THE SEQUENCE ALONE IS NOT THE PROPERTY: A MARK CAN MOVE AND KEEP THE SEQUENCE (fresh-context review,
+# P1 — measured). Inserting `stg_mark gate` IMMEDIATELY AFTER the per-PR `stg_mark sweep` leaves the name
+# order byte-identical, so the arm above stays GREEN at 121/0 — while `gate` closes a ~0 interval and the
+# whole fleet-placement / CI-queue / gate-vector block is charged to `l5_issue`, the very misattribution
+# this PR exists to fix. So `gate` is pinned POSITIONALLY: it must sit AFTER the ceiling line that $LOG's
+# own gate rationale names, i.e. after `floor_emergency`'s call site, which is the last thing the stage
+# covers. (Inserting it before the per-PR sweep was already caught; this catches the other direction.)
+# ⛔ THE SEQUENCE ALONE IS NOT THE PROPERTY: A MARK CAN MOVE AND KEEP THE SEQUENCE (fresh-context review,
+# P1 — measured). Inserting `stg_mark gate` IMMEDIATELY AFTER the per-PR `stg_mark sweep` leaves the name
+# order byte-identical, so the arm above stayed GREEN at 121/0 — while `gate` closed a ~0 interval and the
+# whole fleet-placement / CI-queue / gate-vector / floor / funnel block was charged to `l5_issue`, the very
+# misattribution this PR exists to fix. (Inserting it BEFORE the per-PR sweep is already caught by the
+# per-PR-body arm.) So `gate` is pinned POSITIONALLY: the `floor_emergency` work it names must lie INSIDE
+# its interval — i.e. between the per-PR `sweep` mark and the `gate` mark.
+_sw_pr_line="$(grep -nE '^[[:space:]]*stg_mark sweep' <<<"$_loop_nc" | tail -1 | cut -d: -f1)"
+_gate_line="$(grep -nE '^[[:space:]]*stg_mark gate([[:space:]]|$)' <<<"$_loop_nc" | head -1 | cut -d: -f1)"
+_floor_in_gate="$(awk -v a="${_sw_pr_line:-0}" -v b="${_gate_line:-0}" '
+  NR > a && NR < b && /floor_emergency/ && $0 !~ /^[[:space:]]*#/ { f=1 }
+  END { exit !f }' <<<"$_loop_nc" && echo yes || echo no)"
+ck "  …and \`gate\` covers the floor/gate work it names — a \`floor_emergency\` call lies between the per-PR \`sweep\` mark and \`gate\` (sweep@${_sw_pr_line:-?}, gate@${_gate_line:-?}: ${_floor_in_gate})" \
+   "$(if [ "${_floor_in_gate:-no}" = "yes" ]; then echo 0; else echo 1; fi)"
 
 # 9.1d-iii: NO NAP SITE MAY BE DROPPED, and the count is derived from the NAPS the loop performs.
 _nap_n="$(printf '%s\n' "$_loop_nc" | grep -cE '^[[:space:]]*stg_nap_mark([[:space:]]|$)')"
@@ -1059,6 +1080,16 @@ _rec_v="$(get "$STG_FIELD" record)"
 ck "the clock's own semantics: a 1.2 s span between marks is closed INTO the later stage (record=${_rec_v}) — the property the shipped placement relies on" \
    "$(if [ "${_rec_v:-0}" != "ns" ] && [ "${_rec_v:-0}" -ge 1 ] 2>/dev/null; then echo 0; else echo 1; fi)"
 # …and structurally: the shipped closing mark must sit adjacent to the emit it precedes.
+# ⛔ AND IT MUST SIT AFTER THE PREPARATION IT NAMES, NOT MERELY BEFORE `stg_field` (fresh-context review,
+# P2 — measured). Moving BOTH shipped lines (`stg_mark record` and `stg_field STG_FIELD`) up above the
+# `if [ "${CYCREC:-0}" = "1" ]` preparation kept order, kept adjacency and kept the call count, so the
+# suite stayed GREEN at 121/0 — while `record` closed the `l5_issue`->`record` sliver and the
+# `tr`/`sed`/`cut` preparation ran AFTER the last tiled mark, i.e. charged to NO stage at all. That is the
+# P0 shape the comment above says was fixed, so the position is now pinned against the preparation itself.
+_rec_pos="$(grep -nE '^[[:space:]]*stg_mark record([[:space:]]|$)' <<<"$_loop_nc" | head -1 | cut -d: -f1)"
+_prep_pos="$(grep -nE '_cr_ids="\$\(tr' <<<"$_loop_nc" | head -1 | cut -d: -f1)"
+ck "  …and AFTER the ids=/selected= preparation it measures (record@${_rec_pos:-?}, prep@${_prep_pos:-?})" \
+   "$(if [ -n "${_rec_pos:-}" ] && [ -n "${_prep_pos:-}" ] && [ "$_rec_pos" -gt "$_prep_pos" ]; then echo 0; else echo 1; fi)"
 ck "the shipped 'stg_mark record' is immediately before 'stg_field' (the only placement that closes the prep)" \
    "$(if printf '%s\n' "$_loop_nc" | awk 'prev ~ /^[[:space:]]*stg_mark record[[:space:]]*$/ && $0 ~ /^[[:space:]]*stg_field/ {found=1} {prev=$0} END {exit !found}'; then echo 0; else echo 1; fi)"
 
