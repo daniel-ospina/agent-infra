@@ -2812,6 +2812,27 @@ P5_RC=0; P5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.s
 # `scripts/install-repair-service.sh` refuses the same shapes for the repair unit. The installer mirrors it
 # (with a pointer), and this arm is what keeps the mirror honest: a shape added on one side and not the other
 # is exactly the drift that admits the next measured path.
+# ⛔ ONE EXTRACTOR FOR BOTH SIDES, AND IT DOES NOT CARE HOW THE ARM IS SPELLED (cycle-2 P2, MEASURED). Two
+# separately-written parsers drifted exactly as the lists do: the repair side anchored the line end at `)`, so
+# an arm written `…|/srv/scratch-*) die "…" ;;` — body on the pattern's own line — parsed to NOTHING while the
+# arm stayed green, one spelling over from the blindness the previous fix removed. An arm is a line whose text
+# BEFORE the first `)` contains no quote, semicolon or whitespace: a `case` pattern is a bare glob, and a body's
+# first word never is. Both call sites use this ONE function, and the §P6 mutation arm below feeds it an
+# inline-body arm, so the extractor itself is covered rather than trusted.
+shape_list() { # <file> <the case block's opening line> — every pattern token, one per line, deduped
+  awk -v open="$2" '
+    index($0, open) > 0 { inb=1; next }
+    inb && /^[[:space:]]*esac[[:space:]]*$/ { inb=0 }
+    inb {
+      line=$0; sub(/^[[:space:]]+/, "", line)
+      if (line ~ /^#/) next
+      i=index(line, ")"); if (i==0) next
+      pre=substr(line, 1, i-1)
+      if (pre=="" || pre ~ /[";[:space:]]/) next
+      n=split(pre, a, "|")
+      for (k=1; k<=n; k++) if (a[k] != "") print a[k]
+    }' "${1:-}" 2>/dev/null | sort -u
+}
 say_case 'the lane-scratch shape list is identical in this installer and in install-repair-service.sh'
 REPAIR_SH="$(dirname "$INST")/install-repair-service.sh"
 # ⛔ COMPARED AS SETS, NOT GREPPED FOR FOUR LITERALS (re-review P2). The first version of this arm looped a
@@ -2820,8 +2841,7 @@ REPAIR_SH="$(dirname "$INST")/install-repair-service.sh"
 # exact drift the arm exists to catch. Each side is parsed from its own `case` statement and the two sets are
 # `comm`ed, so a shape added OR removed on either side reddens. (§P8 does the same for the OTHER list, the
 # transient roots, against runner_autoscale.py — two lists, two owners, two gates.)
-SH_SHAPES="$(sed -n '/^lane_scratch_shape()/,/^}/p' "$INST" 2>/dev/null \
-  | sed -n 's/^[[:space:]]*\([^)]*\))[[:space:]]*printf.*/\1/p' | tr '|' '\n' | grep -v '^$' | sort -u)"
+SH_SHAPES="$(sed -n '/^lane_scratch_shape()/,/^}/p' "$INST" 2>/dev/null | shape_list - 'case ')"
 REPAIR_SHAPES=""
 if [ -f "$REPAIR_SH" ]; then
   # ⛔ PARSED STRUCTURALLY, NOT BY THE FIRST LINE THAT MENTIONS `.worktrees` (re-review P2, measured). The
@@ -2830,9 +2850,7 @@ if [ -f "$REPAIR_SH" ]; then
   # was INVISIBLE while the arm stayed green — the drift this gate exists to catch, admitted by the gate
   # itself. Reproduced: a mutated `install-repair-service.sh` with that second arm parsed to the SAME set as
   # before. Every pattern line of the `case` is now collected, so an addition reddens like a removal.
-  REPAIR_SHAPES="$(sed -n '/case "\$SCRIPTS_DIR" in/,/esac/p' "$REPAIR_SH" 2>/dev/null \
-    | sed -n 's/^[[:space:]]*\([^#[:space:]][^)]*\))[[:space:]]*$/\1/p' \
-    | tr '|' '\n' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | grep -v '^$' | sort -u)"
+  REPAIR_SHAPES="$(shape_list "$REPAIR_SH" 'case "$SCRIPTS_DIR" in')"
 fi
 if [ -z "$SH_SHAPES" ] || [ -z "$REPAIR_SHAPES" ]; then
   bad '§P6: could not read BOTH shape lists, so drift cannot be shown — an arm that passes on an unreadable side is vacuous'
@@ -2844,6 +2862,21 @@ else
   [ "$SH_SHAPES" = "$REPAIR_SHAPES" ] \
     && ok "§P6: both files name the same $(printf '%s\n' "$SH_SHAPES" | grep -c .) lane-scratch shapes" \
     || bad "§P6: the shape lists DRIFTED — a shape one side refuses is ADMITTED by the other (only-installer=[${P6_ONLY_HERE% }] only-install-repair-service=[${P6_ONLY_REPAIR% }])"
+  # ⛔ AND THE EXTRACTOR IS COVERED ITSELF (cycle-2 P2, MEASURED). A drift gate whose PARSER has a blind spot is
+  # the vacuity this section exists to avoid, and the previous parser was blind to exactly the arm spelling an
+  # author is most likely to add: `pattern) body ;;` on ONE line — measured, it parsed to the identical four
+  # shapes while the repair unit refused two more. The mutant below carries that spelling as a SECOND arm, so a
+  # parser that cannot see it reddens here instead of silently certifying an unread list.
+  P6_MUT="$T/p6-repair-inline.sh"
+  awk '{ print } index($0, "case \"$SCRIPTS_DIR\" in") > 0 { print "        /tmp/inline-a*|/srv/inline-b*) die \"inline body\" ;;" }' \
+    "$REPAIR_SH" > "$P6_MUT" 2>/dev/null
+  P6_MUT_SHAPES="$(shape_list "$P6_MUT" 'case "$SCRIPTS_DIR" in')"
+  case "$P6_MUT_SHAPES" in
+    *'/tmp/inline-a*'*'/srv/inline-b*'*|*'/srv/inline-b*'*'/tmp/inline-a*'*)
+      ok '§P6: an arm written with its body on the SAME line is seen by the extractor (the gate is not blind to the next spelling)' ;;
+    *)
+      bad "§P6: the extractor MISSED an inline-body arm — this gate would stay green over an added shape: got [$(printf '%s ' $P6_MUT_SHAPES)]" ;;
+  esac
 fi
 
 # ── §P7 — "lane worktree" is decided by GIT, and no declaration launders one ─────────────────────
@@ -3086,6 +3119,34 @@ if [ -n "$(git -C "$PPE_REPO" rev-parse HEAD 2>/dev/null)" ]; then
 else
   bad '§P3: the fixture could not create the spaced checkout, so the whitespace arm did NOT run'
 fi
+# ⛔ THE SAME FALSE PASS HAS A SECOND SPELLING, AND IT IS NOT WHITESPACE (cycle-2 P2, MEASURED). `%` is a systemd
+# SPECIFIER prefix and the rendered `Environment=ORCH_SUPERVISOR_PIN=…` / `ExecStart=…` carry the path verbatim, so
+# systemd REWRITES them on a path this installer passes through untouched: `systemd-analyze verify` on
+# `Environment=ORCH_SUPERVISOR_PIN=/tmp/a%x/repo@abc` answers "Failed to resolve specifiers in
+# PIN=/tmp/a%x/repo@abc, ignoring: Invalid slot" — the pin assignment is DROPPED, exactly the drop the whitespace
+# arm exists for — while `verify_unit`'s `grep -qxF` still passes, and `systemd-analyze` will not even grade an
+# ExecStart whose path contains `%`. A `$` is the same shape one layer over (variable expansion in a command
+# line). Both are refused now, and this arm is the one that would have caught the gap.
+PPQ="$(arm_root ppq)"; mk_systemctl "$PPQ/bin" "$PPQ/state" "$PPQ/sc.log"; mk_tmux "$PPQ/bin" "$PPQ/tmux.log"
+PPQ_REPO="$PPQ/home/pct%x"; mkdir -p "$PPQ_REPO/scripts"
+cp "$SUP" "$PPQ_REPO/scripts/cloud-cell-supervisor.sh"
+git init -q "$PPQ_REPO" 2>/dev/null
+git -C "$PPQ_REPO" add -A >/dev/null 2>&1
+git -C "$PPQ_REPO" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+if [ -n "$(git -C "$PPQ_REPO" rev-parse HEAD 2>/dev/null)" ]; then
+  PPQ_RC=0
+  PPQ_OUT="$(ORCH_SUPERVISOR="$PPQ_REPO/scripts/cloud-cell-supervisor.sh" inst ppq --install 2>&1)" || PPQ_RC=$?
+  [ "$PPQ_RC" -ne 0 ] && ok '§P3: a supervisor path containing % (a systemd SPECIFIER) is REFUSED (systemd would drop the pin assignment, and verify_unit would not notice)' \
+                     || bad "§P3: rendered a pin/ExecStart systemd REWRITES for a '%' path — 'Invalid slot' drops the assignment while verify_unit passes: $PPQ_OUT"
+  case "$PPQ_OUT" in
+    *%*specifier*|*specifier*'%'*) ok '§P3: and the refusal names the specifier as the reason' ;;
+    *) bad "§P3: the % refusal does not name the reason — $PPQ_OUT" ;;
+  esac
+  [ ! -f "$PPQ/units/eldato-orchestrator.service" ] \
+    && ok '§P3: and nothing was armed for a path systemd reads differently' || bad '§P3: a %-bearing path still wrote a unit'
+else
+  bad '§P3: the fixture could not create the %-bearing checkout, so the specifier arm did NOT run'
+fi
 # ⛔ A BARE-CONFIGURED PRIMARY CLONE IS THE CELLS' OWN SHAPE, AND IT HAS NO TOP LEVEL TO NAME (re-review P3).
 # Measured on this fleet: `/tmp/cell-ai` answers `core.bare` → true, so `rev-parse --show-toplevel` FAILS while
 # `HEAD` answers — and the pin degraded to `unknown@<sha>` exactly where the doc promises `<repo>@<sha>`.
@@ -3167,6 +3228,35 @@ if [ -n "$PIN_SHA" ] && git -C "$PIN_REPO" worktree add --detach "$PIN_DIR" "$PI
   fi
 else
   bad '§P4: the fixture could not create the detach pin worktree, so §P4 did not run on the shape it names'
+fi
+# ⛔ AND A BENIGN SYMLINK IN THE RECORD'S OWN SPELLING MUST NOT REFUSE THE BOX'S OWN PIN (cycle-2 P1, MEASURED — a
+# FALSE BLOCK, and the loop of recommending the exact path it just refused). `path_under`'s contract is that BOTH
+# arguments are already resolved by `canon_dir`, and the three declared roots are resolved a few lines below in
+# `scratch_supervisor_reason` — but `pin_root_of_this_box` normalised SLASHES only. So `CELL_HOME` (or the record,
+# or `HARNESS_PIN_DIR`) spelled through a symlink — the layout #2666 measures with `/home/op -> /mnt/data/op` —
+# compared git's PHYSICAL toplevel against the unresolved record, refused the box's own harness pin as "NOT the
+# harness pin this box records", and printed that same path as the remedy. Measured before the fix: rc=1 here,
+# while the identical tree spelled physically was admitted. This control is what keeps §P4 from passing only on a
+# fixture whose paths happen to be symlink-free.
+SYM="$(arm_root sym)"; mk_systemctl "$SYM/bin" "$SYM/state" "$SYM/sc.log"; mk_tmux "$SYM/bin" "$SYM/tmux.log"
+SYM_REAL="$SYM/home/deep/ch-real"; SYM_LINK="$SYM/home/ch-link"
+mkdir -p "$SYM_REAL/agent-infra/scripts"
+cp "$SUP" "$SYM_REAL/agent-infra/scripts/cloud-cell-supervisor.sh"
+git init -q "$SYM_REAL/agent-infra" 2>/dev/null
+git -C "$SYM_REAL/agent-infra" add -A >/dev/null 2>&1
+git -C "$SYM_REAL/agent-infra" -c user.email=fixture@example.invalid -c user.name=fixture commit -qm fixture >/dev/null 2>&1
+SYM_SHA="$(git -C "$SYM_REAL/agent-infra" rev-parse HEAD 2>/dev/null)"
+if [ -n "$SYM_SHA" ] && ln -sfn "$SYM_REAL" "$SYM_LINK" 2>/dev/null \
+   && git -C "$SYM_REAL/agent-infra" worktree add -q --detach "$SYM_REAL/harness/$SYM_SHA" "$SYM_SHA" >/dev/null 2>&1; then
+  # THE RECORD THE BRING-UP WRITES when CELL_HOME is spelled through the symlink: the pin TREE physically, the
+  # spelling symlinked — the mismatch no reader could see until it was resolved.
+  printf '%s\n' "$SYM_LINK/harness/$SYM_SHA/scripts/orchestrator-harness" > "$SYM_LINK/.harness-path"
+  SYM_RC=0
+  SYM_OUT="$(EXTRA_ENV="CELL_HOME=$SYM_LINK" ORCH_SUPERVISOR="$SYM_LINK/harness/$SYM_SHA/scripts/cloud-cell-supervisor.sh" inst sym --install 2>&1)" || SYM_RC=$?
+  [ "$SYM_RC" -eq 0 ] && ok '§P4: the box'"'"'s own pin is ADMITTED when CELL_HOME and its record are spelled through a benign symlink (resolved before compared)' \
+                      || bad "§P4: refused the box's OWN pin because the record was compared unresolved — a false block on any symlinked CELL_HOME: $SYM_OUT"
+else
+  bad '§P4: the fixture could not build the symlinked-CELL_HOME pin, so the resolution arm did NOT run'
 fi
 # …and the same path under a temp root that NO root declares is refused, so §P4 is not a blanket pass.
 PINB="$(arm_root pinb)"; mk_systemctl "$PINB/bin" "$PINB/state" "$PINB/sc.log"; mk_tmux "$PINB/bin" "$PINB/tmux.log"
