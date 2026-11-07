@@ -182,7 +182,12 @@ machine's pi instance.
   - Declaring `command` drops the base's `url`/`headers`/`oauth`; declaring `url`
     drops the base's `command`/`args`/`env`/`cwd`. The base's `env` is inherited
     only when the same thing is LAUNCHED — `command` **and** `args` **and** `cwd`,
-    because `args` decides what actually runs.
+    because `args` decides what actually runs. A **transport CHANGE** — a delta that
+    moves the entry between stdio and HTTP — also drops the base's `type`, because
+    it described the OLD transport and inheriting it would leave exactly the
+    incoherent `{ "type": "http", "command": … }` entry the atomicity rule exists
+    to prevent. A delta that keeps the same transport CLASS inherits `type`, even
+    when it restates the `url`.
   - **`type` never disqualifies an entry.** This client selects the transport from
     `url`/`command` alone and never reads `type`, so an unrecognised `type` (even
     `sse`) only earns a warning — a self-hosted entry spelling `type: "sse"` for

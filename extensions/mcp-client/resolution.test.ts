@@ -704,8 +704,11 @@ await test("neither layer → both null (nothing invented)", () => {
 // header claimed that while two fixtures (`broken`, `sseType`) omitted `lazy` and were therefore
 // classified EAGER — each attempting a real outbound connection to host `x` under
 // `connectEagerWithRetry` (2 attempts × the 15s default timeout, a network error being retryable). An
-// assertion that depends on the runner's resolver or proxy is not hermetic. A new fixture here that
-// declares a truthy `url`/`command` MUST carry `lazy: true`.
+// assertion that depends on the runner's resolver or proxy is not hermetic. A NEW fixture here that
+// CONSTRUCTS a manager and declares a truthy `url`/`command` MUST carry `lazy: true` — that is now
+// asserted for `broken` and `sseType` below, so deleting `lazy` from either one goes RED instead of
+// silently restoring live traffic. A test that only inspects the MERGED config (or the layer read) never
+// reaches `connectServer` and needs no `lazy`; scope the rule to the manager-driven tests.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 section("connectAllLayers — the layer→argument binding and its failure modes");
 

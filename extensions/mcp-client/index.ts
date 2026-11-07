@@ -932,7 +932,13 @@ function asMcpJson(value: unknown, label: string): McpJson | null {
       ? // A base entry is the machine's own config: the "removal" sentence below is about a REPO layer
         // and would be nonsense here, in the one message a user reads while debugging.
         `Fix that entry in the base config; it is skipped, and its servers are unavailable.`
-      : `A server cannot be REMOVED from a repo layer; see #3612 for the disabled-tombstone proposal.`;
+      : // ⛔ NAME A LIVE SOURCE, NEVER A DEAD ONE. This used to read "see #3612 for the disabled-tombstone
+        // proposal", and #3612 is CLOSED and proposes no such thing — so the one message a user reads
+        // about removal ended in a dead end (found in review of #3628). `null` is deliberately not a
+        // tombstone: a JSON typo would then silently delete a working server, and the trade-off is a
+        // decision for #3692 rather than something a warning may assert.
+        `A server cannot be REMOVED from a repo layer: a repo entry only adds or overrides fields, and ` +
+        `there is no "disabled" opt-out yet (#3692).`;
 
     if (!isValidServerName(name)) {
       // pi restricts server names to `[A-Za-z0-9_-]` (`docs/mcp.md`), and the prototype-shaped names
