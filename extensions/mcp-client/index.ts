@@ -724,8 +724,16 @@ function declaresTransport(entry: McpServerConfig, field: "url" | "command"): bo
  * silently run over the OTHER transport from the one the operator wrote (measured:
  * `{"type":"http","command":…}` ran over stdio).
  *
- * Evaluated on the EFFECTIVE entry, not the delta: a `{"type":"http"}`-only override is otherwise
- * applied to a stdio base and produces exactly the incoherent entry this rejects.
+ * Evaluated on the EFFECTIVE entry, not the delta: a `{"type":"http"}`-only override applied to a
+ * stdio base produces an incoherent entry (the label says HTTP while `connectServer` dispatches
+ * stdio), and evaluating the DELTA alone would miss it — the delta carries no transport at all.
+ *
+ * ⛔ THIS FUNCTION DETECTS AND REJECTS NOTHING. It returns a boolean; the one caller
+ * (`mergeMcpLayers`) logs a note and then applies the delta anyway. That is deliberate, not an
+ * omission: `type` must never disqualify an entry (see `RECOGNISED_TYPES` and the `OVERRIDES:`
+ * marker above it), so the incoherent entry is KEPT AS WRITTEN and only reported. Do not "fix"
+ * the caller to drop or ignore the delta — that reverses a recorded decision and destroys a
+ * config this client runs.
  */
 function typeDisagrees(entry: McpServerConfig): boolean {
   const type = (entry as Record<string, unknown>).type;

@@ -993,8 +993,9 @@ await test("a `__proto__` key cannot poison the merged map's prototype", () => {
 });
 
 await test("a `type`-only delta on a stdio base is APPLIED (it cannot veto a working entry)", async () => {
-  // Checking the delta alone let `{"type": "http"}` be applied to a stdio base, producing exactly the
-  // incoherent entry the check exists to reject — which is why the check runs on the PROJECTION. The
+  // Checking the delta alone let `{"type": "http"}` be applied to a stdio base, producing the
+  // incoherent entry the check exists to DETECT (it rejects nothing — `type` must never disqualify an
+  // entry, so the delta is applied and only reported) — which is why the check runs on the PROJECTION. The
   // warning is the only thing the operator gets, so it is asserted here: a mutant switching the guard to
   // `typeDisagrees(entry)` (the delta alone) used to leave the whole suite green.
   let merged: Record<string, unknown> = {};
