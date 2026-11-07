@@ -50,6 +50,17 @@
 # why the caller WAITS instead of killing. Any future caller that decides to signal this
 # script must re-measure that decision rather than assume it.
 #
+# ⛔ WHAT THIS DOES *NOT* COVER — one of the deaths named above defeats it, and the claim
+# here is narrower than "no rail ever outlives its suite". `scripts/run-bash-shards.sh`
+# gives each shard its OWN process group (`set -m`) and its timeout kills the GROUP
+# (`kill -TERM -<pgid>`, then KILL). This guard is an ordinary background child in that
+# group, so a SHARD TIMEOUT kills the guard together with the suite. Nothing leaks — the
+# group KILL takes the rail too — but the supervisor-death arm cannot fire for that case.
+# So what the guard actually covers is an INDIVIDUAL process death (an operator's `kill`, a
+# lane's own watchdog, a cancelled CI job that signals one pid) plus the limit. Covering the
+# group case would mean `setsid`, which changes what the guard is a child of and is a
+# different change.
+#
 # The sentinel is how the caller tells "the guard reaped it" from "the rail exited by
 # itself": `run_rail_watchdog` returns 124 only when this script wrote it, so a rail that
 # legitimately stops (rc 1) can never be reported as a watchdog timeout. The
@@ -67,6 +78,14 @@ set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)" || exit 2
 # shellcheck source=/dev/null
 . "$HERE/reap-lib.sh"
+# ⛔ A FAILED SOURCE IS SILENT HERE, so check it. `set -uo pipefail` has no `-e`: without
+# this guard the script would run with its primitives UNDEFINED, hit `still_ours: command
+# not found` in its loop, and EXIT 0 having done nothing — and rc 0 from this script means
+# "the rail is gone". Measured (scratch copy, reap-lib.sh removed): `still_ours: command
+# not found` then `guard rc=0`. run.sh also refuses to start without the lib; this script
+# is separately invocable (7g/7h drive it directly), so it must not trust its caller.
+command -v still_ours >/dev/null 2>&1 \
+  || { echo "rail-guard: reap-lib.sh did not load (still_ours is undefined) — refusing to report a bound" >&2; exit 2; }
 
 if [ "$#" -lt 4 ]; then
   echo "usage: rail-guard.sh <supervisor-pid> <limit-secs|0> <sentinel> <pid> [ident]" >&2

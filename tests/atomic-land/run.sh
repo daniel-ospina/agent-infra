@@ -78,12 +78,12 @@ fail() { checks=$((checks + 1)); echo "   ❌ $1"; failures=$((failures + 1)); }
 [ -f "$RAIL" ] || { echo "❌ missing $RAIL"; exit 1; }
 # ⛔ THE TWO HELPERS GET THE SAME CHECK AS THE RAIL — and the failure they prevent is
 # WORSE than a missing rail. `reap-lib.sh` is sourced under `set -uo pipefail` WITHOUT
-# `-e` (line 44), so a failed `.` is silent: `proc_ident` would simply be undefined, the
-# ident passed to the guard would be empty, and the guard would fail on its own source
-# line at startup. Nothing would then bound the rail, and the `wait` in
-# `run_rail_watchdog` would hang exactly like the pre-#1845 poll loop — the defect this
-# change removes, restored one level up. Measured: a guard that cannot start exits 2 (too
-# few args) or 127 (bad path) and never writes its sentinel.
+# `-e` (line 44), so a failed `.` is SILENT: the callers' primitives stay undefined and
+# every use becomes `command not found`. Measured (scratch copy, reap-lib.sh removed):
+# `rail-guard.sh: still_ours: command not found` followed by `guard rc=0` — a guard that
+# exits 0 having done NOTHING, which a caller reads as "the rail is gone". `rail-guard.sh`
+# refuses that itself since round 2; these checks are what stop the SUITE from starting in
+# that state, because every watchdog assertion below would then be measuring a ghost.
 [ -f "$GUARD" ] || { echo "❌ missing $GUARD"; exit 1; }
 [ -f "$ROOT/tests/atomic-land/reap-lib.sh" ] || { echo "❌ missing $ROOT/tests/atomic-land/reap-lib.sh"; exit 1; }
 command -v reap_pid >/dev/null 2>&1 \
@@ -734,9 +734,14 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
   wait "$gpid" 2>/dev/null || grc=$?
   if [ "$grc" -ne 0 ]; then
     echo "❌ rail-guard.sh exited $grc — nothing was bounding the rail, so its result is not a bound" >&2
-    is_running "$pid" && reap_pid "$pid" "$ident"
-    wait "$pid" 2>/dev/null || rc=$?
     rm -f "$sentinel" "$sentinel.report"
+    # ⛔ A SURVIVOR IS 125, NEVER A `wait`. `reap_pid` answers 1 only when the pid outlived
+    # 50 SIGKILLs — and it is still THIS SHELL'S CHILD then, so `wait` would block with
+    # nothing left to bound it: the hang this arm exists to prevent.
+    if is_running "$pid"; then
+      reap_pid "$pid" "$ident" || return 125
+    fi
+    wait "$pid" 2>/dev/null || true
     return 125
   fi
   if [ -e "$sentinel" ]; then
@@ -760,8 +765,8 @@ run_rail_watchdog() { # <limit-secs> <extra args...>
   # rail now — refuse rather than fall into an unbounded `wait`.
   if is_running "$pid"; then
     echo "❌ rail-guard.sh exited without reaping, but pid $pid is STILL RUNNING — it lost the process and the bound with it" >&2
-    reap_pid "$pid" "$ident"
-    wait "$pid" 2>/dev/null || rc=$?
+    reap_pid "$pid" "$ident" || return 125
+    wait "$pid" 2>/dev/null || true
     return 125
   fi
   wait "$pid" 2>/dev/null || rc=$?
@@ -1420,9 +1425,10 @@ fi
 # leave the victim GONE and write `reaped <pid>`, because that is the line the caller reads
 # before 124 is allowed to mean "the rail stopped". The supervisor is ALIVE, so only the
 # 1s limit can fire, and the 12s window is 12x it — a guard that never fires is unambiguous.
-# Finding the shape non-vacuous: neuter `reap_pid`'s kill in a scratch copy of the lib and
-# the victim survives in both arms and the report says `survived` — i.e. both assertions
-# redden (measured; see the PR comment for the exact mutant).
+# Finding the shape non-vacuous: neuter `reap_pid`'s `pkill`/`kill` lines in a scratch copy of
+# `reap-lib.sh` and the suite reports `❌ 4 of 444 atomic-land test(s) failed` — this arm's
+# liveness AND report assertions, and 7g's, i.e. "fired but the process is still there" cannot
+# be reported as a bound (measured 2026-11-07, round 2).
 echo "── 7h. the LIMIT arm reaps too, and reports the PROOF rather than the intent (#1845)"
 new_scen limit-guard
 bash -c 'sleep 300 & printf "%s\n" "$!" > "$1"' _ "$SCEN/victim-pid"
