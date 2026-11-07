@@ -557,6 +557,53 @@ def test_cli_decide_rotation_is_unattributable_and_gates(tmp_path, capsys):
     assert "UNATTRIBUTABLE" in out
 
 
+def test_cli_decide_LEGACY_tab_free_rotation_marks_a_spacey_id_UNATTRIBUTABLE(tmp_path, capsys):
+    """The CLI must CARRY the form through, or the reader's report is dead code.
+
+    ⛔ #3686 review cycle 6, P1. A tab-free per-run line is the pre-#3686 wire
+    form and cannot represent an id containing a space: the space split shreds it,
+    so ``detect_rotating_identity`` is structurally blind to that id. Since #3686
+    made the same id representable on the RATE side, letting it fall through to the
+    rate comparison would EXEMPT an identity that may have MOVED — where the old
+    code BLOCKED it. The reader counts the lines it read each way and ``decide``
+    refuses to exempt a whitespace-carrying id on that evidence; this test pins the
+    PLUMBING between them, which no unit test covers on its own.
+
+    MUTATION: drop ``rotation=rotation`` from ``_cmd_decide`` → the run EXEMPTS and
+    the ``--unattributable-out``/exit assertions RED (measured, 2 failed: this leg and
+    ``test_cli_decide_rotation_is_unattributable_and_gates``, whose ``rot`` fixture is
+    itself tab-free space-joined, so dropping the plumbing empties its E5 map too).
+    ⛔ NOT a mutation: passing a constant ``rotation_legacy=False`` — that is a
+    NO-OP by design, because ``decide`` ORs the flag with the form DERIVED from
+    ``rotation=`` (``scripts/ci_exemption.py``, the ``rotation is not None`` arm), so
+    a caller can never CLEAR the fail-closed direction (measured, 1 passed).
+    """
+    a = "tests/test_x.py::TestK::test_a[argv14-at the EDGE]"
+    sig = "sg-3686-legacy-cli"
+    pr = _write(tmp_path, "pr.txt", f"{a}\t3\t26\t{sig}\n")
+    mainf = _write(tmp_path, "main.txt", f"{a}\t3\t26\n")
+    msig = _write(tmp_path, "msig.txt", f"{a}\t{sig}\n")
+    # ⛔ NO TAB: exactly what a pre-#3686 producer emits.
+    rot = _write(tmp_path, "rot.txt", "tests/other.py::test_y\n")
+    un = tmp_path / "un.txt"
+
+    rc = main(
+        [
+            "decide", "--pr-failures", pr, "--main-rates", mainf,
+            "--main-signatures", msig, "--rotation", rot,
+            "--unattributable-out", str(un),
+        ]
+    )
+    out = capsys.readouterr().out
+
+    assert rc == 1, (
+        "a spacey id was NOT gated on TAB-FREE per-run evidence — it was exempted "
+        f"on evidence that cannot represent it:\n{out}"
+    )
+    assert un.read_text(encoding="utf-8") == f"{a}\n", out
+    assert "unattributable=1" in out, out
+
+
 def test_cli_decide_without_main_signatures_fails_closed_and_says_so(tmp_path, capsys):
     """No main signature evidence = every signature check BLOCKS, visibly.
 

@@ -143,9 +143,48 @@ from pathlib import Path
 
 #: A pytest nodeid: ``path/to/test_x.py::[Class::]name`` (params allowed).
 #: Deliberately anchored and narrow — anything else is REJECTED, not guessed.
+#:
+#: Used by :func:`parse_rates` (MAIN's rate table). ⛔ ``/`` BELONGS IN THE
+#: ``rest`` CLASS, and its absence was #3686. The ``path`` group has always
+#: admitted ``/``; the PARAMETER SPACE did not, so a parametrized id whose
+#: parameter is itself a path was admitted by the PR-side parser
+#: (:func:`is_failure_key_loose`) and DROPPED here. That is the REAL shape
+#: ``tests/test_entry_point_python_guard.py`` produces for every ``tools/**/*.py``
+#: entry point it censuses --
+#: ``…::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]``
+#: -- so an entire class of main-side rows could never become a rate.
+#:
+#: A dropped main-side row makes the PR-side failure look unique, which BLOCKS
+#: it forever: the exact asymmetry :func:`is_failure_key`'s own docstring forbids
+#: ("the same predicate must gate :func:`parse_rates`, or main's rate row is
+#: dropped and every such failure reads as PR-unique forever"). Measured
+#: 2026-11-07: main's table carried ``…[tools/cache_evict.py]\t3\t26`` and the
+#: verdict still reported the id as "absent from main's failure set". Pinned by
+#: ``tests/test_ci_exemption.py::test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors``.
+#:
+#: ⛔ TWO GAPS, ONE ROOT, AND THE SECOND ONE IS A SPACE (#3686 follow-up). The
+#: parameter space is pytest's, and pytest parameter ids legitimately carry a
+#: SPACE too — ``…::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]``
+#: is a real id from a shipped suite, and it was still dropped here after ``/``
+#: was added (measured on this branch at ``f3d4ff86``: ``STRICT False |
+#: LOOSE True``, and ``parse_rates`` rejected the row main's table carried).
+#: A space is not a different defect from ``/`` — it is the SAME predicate
+#: disagreeing with the PR side, on a character the loose form has always
+#: admitted, so fixing only the character the report named would leave the class
+#: intact. Both are in the class now.
+#:
+#: The class is still DELIBERATELY not ``[^\t]+``: the strict/loose split exists
+#: because a key wrongly ADMITTED here enters the exemption allowlist (see the
+#: stakes in :func:`is_failure_key`), so it is widened to the parameter space our
+#: own suites actually PRODUCE — ``/``, space, and the pytest punctuation around
+#: them — rather than collapsed into the loose form. A parameter carrying some
+#: OTHER character is still rejected, and rejection is REPORTED (``rejected`` in
+#: :class:`RatesResult`, printed as ``NOTE  : rejected main rate row:``), never
+#: silently dropped: that is how a third gap would be MEASURED rather than
+#: discovered as a deadlock.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
-    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:]+)$"
+    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/ ]+)$"
 )
 
 #: The tokens that open a failure record. One list, so the shell can never
@@ -502,8 +541,22 @@ class RatesResult:
         return max((r.runs for r in self.rates.values()), default=0)
 
 
+#: ``<nodeid>\t<failures>\t<runs>``. ⛔ THE NODEID IS DELIMITED BY THE TAB, NOT
+#: BY ``\S`` (#3686 second door). ``\S+`` cannot carry the space a pytest
+#: parameter legitimately contains, so ``…[argv14-at the EDGE]\t3\t26`` — a row
+#: ``ci-failure-set.sh`` EMITS correctly — never even reached
+#: :func:`is_failure_key`, and the id read as PR-unique forever.
+#:
+#: ``[^\t]+`` is the SAME delimiting :data:`_SIG_ROW_RE` already uses on the
+#: signature table, and it is what makes the shape agree across the two tables.
+#: It does NOT loosen the fail-closed field check: the class excludes the tab, so
+#: the line must still be EXACTLY three tab-separated fields with two numeric
+#: tails — a fourth field, or a nodeid carrying a tab, still fails to match and is
+#: rejected. What the row's nodeid is ALLOWED to be remains
+#: :func:`is_failure_key`'s single decision, below, which is what keeps the two
+#: doors from disagreeing again.
 _RATES_RE = re.compile(
-    r"^(?P<nodeid>\S+)\t(?P<failures>[0-9]+)\t(?P<runs>[0-9]+)$"
+    r"^(?P<nodeid>[^\t]+)\t(?P<failures>[0-9]+)\t(?P<runs>[0-9]+)$"
 )
 
 
@@ -695,7 +748,9 @@ def decide(
     *,
     main_signatures: dict[str, frozenset[str]] | None = None,
     rotating: dict[str, frozenset[str]] | None = None,
+    rotation: "RotationRuns | None" = None,
     k_pr: int | None = None,
+    rotation_legacy: bool = False,
 
     # THE RATE TOLERANCE — owner-authorized "Option B" on tortoise #3756, whose deferred
     # residual is PARTLY CLOSED by the TOTAL-failure guard below.
@@ -761,6 +816,27 @@ def decide(
 
     Rules, in order — each one closes a declared class:
 
+    * an id carrying WHITESPACE while ANY per-run line arrived in the TAB-FREE
+      (pre-#3686) form -> **UNATTRIBUTABLE** (#3686 review cycle 6). That form
+      cannot represent a space — the split shreds it — so E5 is structurally blind
+      to such an id; exempting it would be a silent EXEMPT for an identity that may
+      have MOVED, and the pre-#3686 code BLOCKED it. ⛔ THIS ARM RUNS AHEAD OF EVERY
+      ATTRIBUTION RULE — ahead of the E5 rotation test, ahead of absent-from-main,
+      and ahead of the signature and rate rules — because each of those is an
+      ATTRIBUTION, and evidence that cannot SEE the id supports no attribution at
+      all. The one guard that does precede it is the EMPTY-PR-SAMPLE refusal (a PR
+      failure with no measured sample is not an attribution question at all). It is
+      listed here, first, for that reason: a reader who placed it after the rate
+      comparison would re-open the cycle-6 fail-open. Pass ``rotation=`` (the parsed
+      ``RotationRuns``) rather than ``rotating=`` and this is DERIVED for you;
+      passing ``rotating=`` alone means ``rotation_legacy`` defaults to False, which
+      is the FAIL-OPEN value, so a caller doing that on tab-free evidence re-opens
+      the class — a DECLARED RESIDUAL of the explicit-flag surface, measured
+      (``rotating=detect_rotating_identity(<tab-free runs>)`` with no ``rotation=``
+      EXEMPTS the spacey id) and deliberately NOT pinned: the composition leg pins
+      the SAFE path (``rotation=``), and a test that asserted this fail-open would
+      have to be inverted the day someone closes it. Treat ``rotating=``-without-
+      ``rotation=`` as unsupported on tab-free evidence.
     * id ABSENT from main's failure set -> **BLOCK** (nothing shows it pre-exists).
       The baseline is FAILURE-ONLY, so a test main runs and passes leaves no row, which
       makes this neither "known new" nor "unmeasured" — the reason must claim NEITHER.
@@ -806,6 +882,32 @@ def decide(
     decision = Decision()
     sig_main = main_signatures or {}
 
+    # ⛔ THE EVIDENCE FORM IS DERIVED, NOT TRUSTED TO THE CALLER (#3686 review cycle 7,
+    # P2). `rotation_legacy` defaults to False — the PERMISSIVE value — so a caller
+    # that passes `rotating=` (or composes `detect_rotating_identity(parse_rotation_runs(
+    # text))` by hand, which is the obvious thing to write) silently restores the
+    # cycle-6 fail-open. Accepting the parsed `RotationRuns` makes the form
+    # un-droppable at the boundary: the object that knows the form is the object that
+    # supplies it. The explicit flags stay for callers that already have the pieces.
+    # ⛔ AND A SUPPLIED MAP IS UNIONED, NOT SUBSTITUTED (review cycle 10, P2). Cycle 9
+    # made a FALSY map re-derive; a TRUTHY one still replaced the derivation wholesale,
+    # so an unrelated or incomplete map DROPPED the E5 signal from the evidence handed
+    # in beside it — measured: `rotation=runs, rotating={"Other::cls": …}` EXEMPTED an id
+    # `detect_rotating_identity(runs)` reports as having MOVED. The union below is what
+    # makes the earlier sentence ("can only narrow") TRUE instead of aspirational: it
+    # adds keys and per-class ids, never removes them, so no caller can subtract
+    # evidence, and the fail-closed direction is preserved whichever way it is called.
+    if rotation is not None:
+        derived = detect_rotating_identity(rotation)
+        if rotating:
+            rotating = {
+                cls: rotating.get(cls, frozenset()) | derived.get(cls, frozenset())
+                for cls in set(rotating) | set(derived)
+            }
+        else:
+            rotating = derived
+        rotation_legacy = rotation_legacy or rotation.has_legacy_lines
+
     # The floor is PER-ID and has NO table-wide form (review cycle 2). A table-max
     # derivation has no legitimate use: the question is always "does THIS id's row
     # rest on enough runs?", and when the id has no row at all `mr` is None and the
@@ -830,6 +932,28 @@ def decide(
             decision.blocked.append(Verdict(
                 nodeid, True,
                 f"PR rate is unmeasurable ({pr.rate}) — NOT exempt"))
+            continue
+
+        # ⛔ THE EVIDENCE-FORM ARM MUST PRECEDE THE E5 TEST ITSELF (#3686 review
+        # cycle 6, P1). A tab-free (pre-#3686) per-run line CANNOT represent an id
+        # containing a space — the space split shreds it, so the real id is in no
+        # run set and the test five lines below is structurally blind to it. That
+        # is a limit of the WIRE FORM, not of the id, and before #3686 it did not
+        # matter — NOT because "both doors rejected such an id" (they did not: the PR
+        # door admitted it and MAIN's rate door dropped the row, which is #3686
+        # itself) but because that ASYMMETRY meant `mr is None`, so the id came out
+        # BLOCKED. Now that the id is
+        # representable on the rate side, falling through to the rate comparison
+        # would EXEMPT an identity that may have MOVED — the fail-open direction.
+        # UNATTRIBUTABLE is the only correct verdict for evidence that cannot see
+        # the id: it gates, and it says why.
+        if rotation_legacy and any(ch.isspace() for ch in nodeid):
+            decision.unattributable.append(Verdict(
+                nodeid, True,
+                "UNATTRIBUTABLE: the per-run evidence is the pre-#3686 TAB-FREE "
+                "form, which cannot represent an id containing whitespace — the "
+                "space shreds it, so a MOVING identity is invisible to the "
+                "rotation guard and this id cannot be exempted on that evidence"))
             continue
 
         # Required class E5 — ROTATING IDENTITY, checked FIRST. An id whose class was
@@ -1016,10 +1140,19 @@ _SUMMARY_RE = re.compile(r"^(?:FAILED|ERROR)\s+(?P<nodeid>.+?)(?:\s+-\s+(?P<deta
 
 # A LOOSE nodeid: the file/class part stays strict, the ``::`` tail is allowed
 # to carry spaces/brackets because pytest parameter ids legitimately do
-# (``::test_x[chromium-Claude Desktop]``). ``_NODEID_RE`` stays narrow for the
-# RATE/UNION parsers; widening it there would loosen their fail-closed check for
-# no gain. Dropping a real id here would be fail-OPEN (an undecided id is an
-# unblocked id), which is why this path is deliberately the permissive one.
+# (``::test_x[chromium-Claude Desktop]``). ⛔ ``_NODEID_RE`` IS WIDER THAN IT USED
+# TO BE, ON PURPOSE, AND RE-NARROWING IT IS THE #3686 DEADLOCK. This comment used
+# to say the opposite — that `_NODEID_RE` "stays narrow for the RATE/UNION parsers"
+# and that widening it "would loosen their fail-closed check for no gain". The gain
+# turned out to be the whole point: the RATE table reads MAIN's rows, so a
+# character the strict form rejects is a rate row that never exists, and the PR-side
+# failure which the loose form admits then reads PR-unique FOREVER. The strict form
+# now admits the parameter characters our suites actually produce (``/`` and space)
+# while staying deliberately NARROWER than ``[^\t]+`` — because a key wrongly
+# ADMITTED enters the exemption allowlist — so neither predicate is a synonym and
+# neither may be silently swapped for the other. Dropping a real id here would be
+# fail-OPEN (an undecided id is an unblocked id), which is why this path is
+# deliberately the permissive one.
 _NODEID_LOOSE_RE = re.compile(r"^[A-Za-z0-9_./\-]+\.py::[^\t]+$")
 
 # A bare pytest PROGRESS fragment — `[  2%]`, `[100%]`, `[ 47%]`. It is the
@@ -1397,13 +1530,15 @@ def _signature_from(e_line: str | None, exc: str | None) -> str:
 #     with no FAILED line) into a "guard-step" id, i.e. exactly the fail-closed
 #     refusal this change must PRESERVE. It is excluded, and a step carrying
 #     ONLY it stays unattributable.
-#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE. The main RATE
-#     table is built with `uniq -c | awk` and is whitespace-delimited (the count
-#     is field 1, the id field 2), so a key containing a space is mangled there;
-#     and the comparison needs the same identity on both trees despite an orphan
-#     COUNT that changes every run. So the step is slugged into the key and the
-#     error SHAPE rides the key tail AND the signature column the decision
-#     already carries.
+#   * THE IDENTITY IS (STEP, ERROR SHAPE) AND IS WHITESPACE-FREE — and ⛔ NOT
+#     because the rate table cannot carry a space. It CAN: the main rate table's
+#     nodeid is delimited by the TAB (`_RATES_RE`), and #3686's second door is
+#     exactly the bug that made a space unrepresentable there. The guard key
+#     stays whitespace-free because it is a SLUG over a step name and an error
+#     shape, and because the comparison needs the same identity on both trees
+#     despite an orphan COUNT that changes every run. So the step is slugged into
+#     the key and the error SHAPE rides the key tail AND the signature column the
+#     decision already carries.
 
 #: The one prefix no pytest nodeid can produce, so a guard key cannot collide
 #: with a test id.
@@ -1472,7 +1607,9 @@ _GUARD_INT_RE = re.compile(r"\b\d+\b")
 #: the signature gate fails CLOSED on an empty overlap, so a job-level key can
 #: never buy an exemption — it converts an unreadable refusal into a named,
 #: attributable block. The slug charset is exactly `_slug`'s, so the key stays
-#: whitespace-free for the `uniq -c | awk` rate table.
+#: whitespace-free — for the SLUG identity's own sake, not because the rate table
+#: could not carry a space (#3686 retired that rationale: the rate table's nodeid is
+#: TAB-delimited, and a space in one is the second door this change fixed).
 #:
 #: `bash-shard::<path>` (#2643) is a bash SHARD's own identity, and
 #: `runner::<slug>` is a JS/TS aggregate's. Both are file-coarse and both are admitted on a
@@ -1873,7 +2010,9 @@ _EXIT_TRUNCATED_CAPTURE = 4
 #: dropping — that asymmetry is the whole rule.
 
 #: What `_shard_token` leaves verbatim — a PATH, plus `.`/`-`/`_`. `/` is admissible because the
-#: rate table's constraint is WHITESPACE-FREE (`uniq -c | awk`), not slash-free.
+#: key's constraint is WHITESPACE-FREE (a slug identity), not slash-free. (⛔ The rate table is
+#: TAB-delimited since #3686 — a space in a nodeid is exactly the second door that issue names —
+#: so "whitespace-free" is a property of this token, not of the table it travels through.)
 #:
 #: ⛔ THE TOKEN IS ENCODED HERE, NOT BY `quote()`, and that is deliberate. urllib's ALWAYS-safe set
 #: includes `~`, so `quote` never escapes it: a path containing `~` produced
@@ -2150,8 +2289,9 @@ _PIPELINE_CHECK_RE = re.compile(
 _SHA_LIKE_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 
 #: The CLI's whitespace-free key, and the ONLY shape `is_failure_key` admits for
-#: this family. The charset is exactly `_slug`'s, so the key survives the
-#: `uniq -c | awk` rate table and the provenance files.
+#: this family. The charset is exactly `_slug`'s — a slug identity, which is why the
+#: key is whitespace-free — so the key survives the TAB-delimited rate table (#3686)
+#: and the provenance files.
 _PIPELINE_KEY_RE = re.compile(
     r"^pipeline-compliance::(?P<letter>[a-z]{1,4})::(?P<subject>[A-Za-z0-9_.\-]+)$"
 )
@@ -2719,14 +2859,93 @@ def parse_signature_rows(text: str) -> dict[str, frozenset[str]]:
     return {k: frozenset(v) for k, v in out.items()}
 
 
-def parse_rotation_runs(text: str) -> list[frozenset[str]]:
-    """Per-run id sets, one run per non-blank line, ids whitespace-separated."""
+class RotationRuns(list):
+    """``list[frozenset[str]]`` PLUS the wire FORM that produced it.
+
+    ⛔ THE FORM IS PART OF THE EVIDENCE, NOT A TRANSPORT DETAIL (#3686 review
+    cycle 6, P1). The tab-free fallback in :func:`parse_rotation_runs` keeps a
+    pre-#3686 producer's line parsing the way it always did — but that form CANNOT
+    represent an id containing a space: space-splitting shreds
+    ``…[argv14-at the EDGE]`` into ``…[argv14-at`` + ``the`` + ``EDGE]``, so the
+    real id sits in NO run set and :func:`detect_rotating_identity` can never
+    report it.
+
+    Before #3686 that was harmless, because such an id could not be exempted either
+    way: the PR-side door ADMITTED it and MAIN's rate door DROPPED its row (which is
+    #3686 itself), so `mr is None` and the verdict was BLOCK — fail-CLOSED through an
+    asymmetry, not through agreement. After it, the id is representable on the
+    RATE side — so a shredded rotation line turns a previously fail-CLOSED
+    refusal (BLOCK, absent from main's set) into a silent EXEMPT for an identity
+    that provably MOVED, which is the one class the rail states may never merge.
+    ``legacy_lines`` is how :func:`decide` learns the evidence could not see the
+    id, so it refuses to exempt it.
+
+    A plain list was not enough: the caller cannot tell the two forms apart from
+    the parsed sets alone, which is exactly the ambiguity that made the failure
+    silent.
+    """
+
+    __slots__ = ("legacy_lines", "tab_lines")
+
+    def __init__(
+        self,
+        runs=(),
+        *,
+        legacy_lines: int = 0,
+        tab_lines: int = 0,
+    ) -> None:
+        super().__init__(runs)
+        self.legacy_lines = legacy_lines
+        self.tab_lines = tab_lines
+
+    @property
+    def has_legacy_lines(self) -> bool:
+        return self.legacy_lines > 0
+
+
+def parse_rotation_runs(text: str) -> RotationRuns:
+    """Per-run id sets, one run per non-blank line, ids TAB-separated.
+
+    ⛔ TAB, NOT WHITESPACE (#3686 second door). A pytest parameter legitimately
+    carries a SPACE — ``…[argv14-at the EDGE]`` is a real id from a shipped suite
+    — so a whitespace split SHREDS it into fragments. Measured before this
+    change: the real id is in NO run set, ``detect_rotating_identity`` therefore
+    cannot see it, and ``decide``'s E5 guard (the class that may never merge) is
+    INERT for exactly the ids #3686 un-blocked. That turns a permanent BLOCK into
+    a silent EXEMPT for a rotating identity, i.e. it is the fail-open direction
+    of the fix, not a cosmetic wire-format detail. A tab is the one delimiter an
+    id cannot contain — the same delimiting the rate and signature tables use.
+
+    The pre-#3686 producer space-joined the ids and emitted NO tab, so a line
+    carrying no tab is still read the old way. That is deliberate: an older
+    producer (or ``ADMIN_MERGE_FAILURE_SET_SH`` pointing at one) would otherwise
+    be re-parsed as ONE giant id per run, which is a second, quieter way to
+    blind E5.
+
+    ⛔ BUT THE FALLBACK DOES **NOT** KEEP OLD INPUT MEANING WHAT IT ALWAYS
+    MEANT (review cycle 6, P1 — that sentence stood here and was false). It
+    keeps the PARSE the same and flips the VERDICT: for a space-carrying id the
+    old world BLOCKED it — through the #3686 ASYMMETRY (the PR door admitted it,
+    MAIN's rate door dropped its row, so `mr is None`), not through both doors
+    agreeing — while this world, where the id IS representable on the rate side,
+    would EXEMPT it, because the shredded identity is invisible to E5. So the
+    counts ride back with the sets (see :class:`RotationRuns`) and ``decide``
+    refuses to exempt a whitespace-carrying id when any line took this branch.
+    """
     runs: list[frozenset[str]] = []
+    legacy_lines = 0
+    tab_lines = 0
     for raw in text.splitlines():
         if not raw.strip():
             continue
-        runs.append(frozenset(raw.split()))
-    return runs
+        if "\t" in raw:
+            ids = raw.split("\t")
+            tab_lines += 1
+        else:
+            ids = raw.split()
+            legacy_lines += 1
+        runs.append(frozenset(i for i in ids if i))
+    return RotationRuns(runs, legacy_lines=legacy_lines, tab_lines=tab_lines)
 
 
 def render_signature_table(signatures: dict[str, frozenset[str]]) -> str:
@@ -2926,17 +3145,16 @@ def _cmd_decide(args: argparse.Namespace) -> int:
         if args.main_signatures
         else {}
     )
-    rotating = (
-        detect_rotating_identity(parse_rotation_runs(_read(args.rotation)))
-        if args.rotation
-        else {}
-    )
+    rotation = parse_rotation_runs(_read(args.rotation)) if args.rotation else None
 
     decision = decide(
         pr.failures,
         main.rates,
         main_signatures=main_sigs,
-        rotating=rotating,
+        # ⛔ THE PARSED EVIDENCE, not `rotating=` + a separate flag: `decide` derives
+        # BOTH the rotating map and the TAB-FREE arm from it, so the form cannot be
+        # dropped in transit (#3686 review cycle 7).
+        rotation=rotation,
         k_pr=max((f.rate.runs for f in pr.failures.values()), default=None),
         rate_tolerance=args.rate_tolerance,
         min_runs=args.min_runs,
@@ -3038,7 +3256,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     dec.add_argument(
         "--rotation",
-        help="per-run id sets, one run per line (feeds detect_rotating_identity)",
+        help=("per-run id sets, one run per line, ids TAB-separated "
+              "(feeds detect_rotating_identity); a tab-free line is read as the "
+              "pre-#3686 whitespace-joined form"),
     )
     dec.add_argument("--rate-tolerance", type=float, default=1.5)
     dec.add_argument("--min-runs", type=int, default=3)

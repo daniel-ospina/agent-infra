@@ -3056,8 +3056,16 @@ def test_a_non_printable_branch_refuses_the_push_block():
 
     # …and a NORMAL branch still renders exactly ONE fence pair, so the parity assertion above is
     # not a tautology on a brief that happens to carry no fences at all.
+    # ⛔ NARROW TO THE BRANCH REFUSAL, NOT THE BARE WORD (measured on `origin/main`, 2026-11-07):
+    # the RESEARCH FIRST contract spliced into every brief uses "REFUSED" for an unrelated gate
+    # ("the dispatch is REFUSED when `refs/wip/*` holds a snapshot"), so `"REFUSED" not in plain`
+    # graded the PREAMBLE, not this refusal — it went red on a correct brief and would have gone
+    # green on a brief that refused for the wrong reason. The branch refusal is identified by its
+    # own sentence (and the loop-neutralising line it must carry), which is what this asserts.
     plain = pr.brief(_pr(13), "fix-ci", "python-ci-gate", [])
-    assert plain.count("```") == 2 and "REFUSED" not in plain
+    assert plain.count("```") == 2
+    assert "REFUSED: this branch name cannot be rendered safely in this brief" not in plain
+    assert "Steps 3 and 4 of the loop above do NOT apply" not in plain
 
 
 def test_dry_run_reports_the_worktree_refusal(monkeypatch, tmp_path):
