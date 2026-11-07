@@ -46,13 +46,22 @@
 #       /tmp" rule would block every cell bring-up. §P2 grades the RESOLVED path (a symlink onto a
 #       scratch tree is refused, one onto a durable tree is not), and §P3 pins the revision the unit
 #       runs into its environment so `merged ≠ running` is readable from `systemctl show`/`--status`.
-#       §P6 asserts the lane-scratch shape list is IDENTICAL to install-repair-service.sh's (two copies
-#       would drift), §P7 proves a lane worktree is decided by GIT (a LINKED worktree is refused under a
-#       durable root and with a name no pattern matches, a caller cannot launder one by declaring its
-#       own root, and a PRIMARY clone under /tmp — the cells' `/tmp/cell-ai` — still installs), §P8 gates
-#       the OTHER list, the transient roots, against runner_autoscale.py's `TRANSIENT_UNIT_PREFIXES` (the
-#       guard is only as wide as that list, and it is a copy), and §P5 pins the two seam strengths (a
-#       caller's preference is skipped loudly, an operator's requirement is refused).
+#       §P6 and §P8 are the two DRIFT GATES: the lane-scratch SHAPES are identical to
+#       install-repair-service.sh's, and the transient ROOTS are identical to runner_autoscale.py's
+#       `TRANSIENT_UNIT_PREFIXES` (the guard is only as wide as that list, and it is a copy). §P7 proves a
+#       lane worktree is decided by GIT (a LINKED worktree is refused under a durable root and with a name
+#       no pattern matches, a caller cannot launder one by declaring its own root, and a PRIMARY clone under
+#       /tmp — the cells' `/tmp/cell-ai` — still installs), §P4 is the false-block control that a cell's
+#       harness pin under `/tmp/cell-home` still installs, §P9 covers the MEASURED `/tmp/wt-*` spelling as a
+#       SHAPE (and §P is explicit that its own fixture is the root rule, not that shape), and §P5 pins the
+#       two seam strengths (a caller's preference is skipped loudly, an operator's requirement is refused).
+#       ⛔ THE §-LABELS ARE STABLE IDENTIFIERS, NOT ORDINALS — they are cited from the installer, the docs and
+#       this file's own history, so sections are APPENDED rather than renumbered. Emission order below:
+#       §P, §P6, §P7, §P2, §P3, §P4, §P5, §P8, §P9.
+#       ⛔ NAMED RESIDUAL, not silently covered: `transient_root_of`'s relocated-`$TMPDIR` branch has NO arm.
+#       Every root this fixture can create lands under the fixed `$TRANSIENT_ROOTS` list (which fires first),
+#       so the `$TMPDIR` branch can only be the deciding rule on a box whose temp root is outside that list —
+#       not constructible portably from here. Recorded, because a green arm that cannot fail is not coverage.
 #
 # Hermetic: temp HOME/state/unit dirs, stub `systemctl`/`tmux` that RECORD their argv (so "did it call
 # start/stop" is answered by evidence, not by the absence of an error), a stub supervisor built from
@@ -2721,10 +2730,10 @@ esac
 # THE DEFECT. The only guard on the rendered ExecStart was `[ -f "$SUPERVISOR" ]` AT RENDER TIME, so the
 # installer pinned the fleet's dispatcher to whatever checkout the operator happened to run `--install`
 # from. MEASURED on cell-1: `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start` —
-# a LANE WORKTREE at an unmerged branch. Once that path goes, the unit's ExecStart cannot resolve,
-# `Restart=always` retries a 127 for ever, `is-active` reads `activating`, and nothing pages: an
-# inert-enforcer that reads as supervised on every surface. MEASURED again on cell-4 as a TEST render
-# installed as the real unit (`ExecStart=… "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r" --dry-run`).
+# a LANE WORKTREE at an unmerged branch. Once that path goes, the unit's ExecStart cannot resolve; its start
+# limit (3 attempts inside 300 s) burns inside a minute, systemd converges it to `failed`, and nothing pages:
+# an inert enforcer that reads as a dead unit, not a supervised one. MEASURED again on cell-4 as a TEST
+# render installed as the real unit (`ExecStart=… "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r" --dry-run`).
 #
 # ⛔ THE ARMS BELOW ARE PAIRED IN BOTH DIRECTIONS, WHICH IS THE WHOLE POINT: a guard that refused every
 # temporary path would pass the refusal arms and be a FALSE BLOCK on every cell — the cells keep their HOME
@@ -2733,11 +2742,15 @@ esac
 say_case 'install refuses an ExecStart that a cleaning removes, and keeps the roots a cell really uses'
 P="$(arm_root p)"; mk_systemctl "$P/bin" "$P/state" "$P/sc.log"; mk_tmux "$P/bin" "$P/tmux.log"
 # The measured shape: a real supervisor file, under a temp root that no deployment root declares.
+# ⛔ THIS FIXTURE IS NOT THE `/tmp/wt-*` SHAPE, AND THE ARM MUST NOT CLAIM IT IS (re-review P3). `$T` is
+# `<temp>/ctlunit.XXXX`, so `$T/wt-p-fixture` matches no lane-scratch pattern and is refused by the
+# TRANSIENT-ROOT rule. The measured `/tmp/wt-*` path has its own behavioural arm (§P9); this one covers the
+# root rule.
 SCRATCH_P="$T/wt-p-fixture/scripts"; mkdir -p "$SCRATCH_P"
 cp "$SUP" "$SCRATCH_P/cloud-cell-supervisor.sh"
 P_OUT=""; P_RC=0
 P_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.sh" inst p --install 2>&1)" || P_RC=$?
-[ "$P_RC" -ne 0 ] && ok '§P: a scratch-root supervisor (the /tmp/wt-* shape) is REFUSED' \
+[ "$P_RC" -ne 0 ] && ok '§P: a scratch-root supervisor (a temp root no declaration covers) is REFUSED' \
                   || bad "§P: installed a unit whose ExecStart a tmp cleaner removes — the #2697 defect, re-shipped: $P_OUT"
 case "$P_OUT" in
   *"$SCRATCH_P/cloud-cell-supervisor.sh"*) ok '§P: the refusal NAMES the offending path (an operator can see what was rejected)' ;;
@@ -2786,16 +2799,29 @@ P5_RC=0; P5_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$SCRATCH_P/cloud-cell-supervisor.s
 # is exactly the drift that admits the next measured path.
 say_case 'the lane-scratch shape list is identical in this installer and in install-repair-service.sh'
 REPAIR_SH="$(dirname "$INST")/install-repair-service.sh"
-for _sh in '*/.worktrees/*' '/tmp/wt-*' '/tmp/cell-wt-*' '/tmp/base-*'; do
-  grep -qF -- "$_sh" "$INST" \
-    && ok "§P6: the installer refuses the fleet shape $_sh" \
-    || bad "§P6: the installer does not refuse $_sh — install-repair-service.sh does, so the two lists have drifted"
-done
+# ⛔ COMPARED AS SETS, NOT GREPPED FOR FOUR LITERALS (re-review P2). The first version of this arm looped a
+# hardcoded list, so it caught a REMOVAL and was blind to an ADDITION: a shape added to
+# install-repair-service.sh (the authority) left the arm green while this installer kept admitting it — the
+# exact drift the arm exists to catch. Each side is parsed from its own `case` statement and the two sets are
+# `comm`ed, so a shape added OR removed on either side reddens. (§P8 does the same for the OTHER list, the
+# transient roots, against runner_autoscale.py — two lists, two owners, two gates.)
+SH_SHAPES="$(sed -n '/^lane_scratch_shape()/,/^}/p' "$INST" 2>/dev/null \
+  | sed -n 's/^[[:space:]]*\([^)]*\))[[:space:]]*printf.*/\1/p' | tr '|' '\n' | grep -v '^$' | sort -u)"
+REPAIR_SHAPES=""
 if [ -f "$REPAIR_SH" ]; then
-  for _sh in '*/.worktrees/*' '/tmp/wt-*' '/tmp/cell-wt-*' '/tmp/base-*'; do
-    grep -qF -- "$_sh" "$REPAIR_SH" \
-      || bad "§P6: install-repair-service.sh no longer names $_sh — the installer's mirror is now the only copy, so re-derive both"
-  done
+  REPAIR_SHAPES="$(grep -n '\.worktrees' "$REPAIR_SH" 2>/dev/null | grep -m1 ')' \
+    | sed 's/^[0-9]*:[[:space:]]*//; s/)[[:space:]]*$//' | tr '|' '\n' | grep -v '^$' | sort -u)"
+fi
+if [ -z "$SH_SHAPES" ] || [ -z "$REPAIR_SHAPES" ]; then
+  bad '§P6: could not read BOTH shape lists, so drift cannot be shown — an arm that passes on an unreadable side is vacuous'
+else
+  printf '%s\n' "$SH_SHAPES" > "$T/p6-shapes-here.txt"
+  printf '%s\n' "$REPAIR_SHAPES" > "$T/p6-shapes-repair.txt"
+  P6_ONLY_HERE="$(comm -23 "$T/p6-shapes-here.txt" "$T/p6-shapes-repair.txt" | tr '\n' ' ')"
+  P6_ONLY_REPAIR="$(comm -13 "$T/p6-shapes-here.txt" "$T/p6-shapes-repair.txt" | tr '\n' ' ')"
+  [ "$SH_SHAPES" = "$REPAIR_SHAPES" ] \
+    && ok "§P6: both files name the same $(printf '%s\n' "$SH_SHAPES" | grep -c .) lane-scratch shapes" \
+    || bad "§P6: the shape lists DRIFTED — a shape one side refuses is ADMITTED by the other (only-installer=[${P6_ONLY_HERE% }] only-install-repair-service=[${P6_ONLY_REPAIR% }])"
 fi
 
 # ── §P7 — "lane worktree" is decided by GIT, and no declaration launders one ─────────────────────
@@ -2840,6 +2866,22 @@ if [ -d "$PG_CLONE/.git" ]; then
       *'LINKED GIT WORKTREE'*) ok '§P7: and the refusal says GIT reported it as a linked worktree (not "under /tmp")' ;;
       *) bad "§P7: the refusal does not name the git-worktree reason — $PG_C_OUT" ;;
     esac
+    # ⛔ AND "GIT COULD NOT ANSWER" IS NOT "NOT A WORKTREE" (re-review P2). The same path with a git that
+    # FAILS — git's own `dubious ownership` refusal (a shape this repo runs: `CONTROLLER_ALLOW_ROOT=1`),
+    # a wrapper exporting GIT_DIR, or a broken binary — used to read as durable and ARM the worktree, because
+    # `git_dirs` prints nothing for both "not a repo" and "git failed". It must fail CLOSED as UNPROVEN.
+    rm -f "$PG/units/eldato-orchestrator.service"
+    printf '#!/bin/sh\nexit 1\n' > "$PG/bin/git"; chmod +x "$PG/bin/git"
+    PG_D_RC=0; PG_D_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PG_WT/scripts/cloud-cell-supervisor.sh" inst pg --install 2>&1)" || PG_D_RC=$?
+    rm -f "$PG/bin/git"
+    [ "$PG_D_RC" -ne 0 ] && ok '§P7: a checkout git cannot identify is REFUSED as UNPROVEN (a failing git is not "not a worktree")' \
+                        || bad "§P7: a linked worktree was ARMED because git failed to answer — the empty answer was read as durable: $PG_D_OUT"
+    case "$PG_D_OUT" in
+      *'could not identify'*) ok '§P7: and the refusal says git itself could not identify the checkout' ;;
+      *) bad "§P7: the unproven-checkout refusal does not name git as the reason — $PG_D_OUT" ;;
+    esac
+    [ ! -f "$PG/units/eldato-orchestrator.service" ] \
+      && ok '§P7: and the unproven checkout armed nothing' || bad '§P7: the unproven checkout still armed a unit'
   else
     bad '§P7: the fixture could not create a linked worktree, so the git-arithmetic arm did not run'
   fi
@@ -2950,7 +2992,8 @@ PINB_RC=0; PINB_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$PINB_SUP/cloud-cell-superviso
 [ "$PINB_RC" -ne 0 ] && ok '§P4: the same pin SHAPE outside every declared root is still refused (the root decides, not the shape)' \
                     || bad "§P4: a pin-shaped path under no declared root was admitted — the control proves §P4 passes everything: $PINB_OUT"
 
-# ── §P5 — a CALLER's preference is skipped, not obeyed and not fatal ──────────────────────────────# ⛔ THE SECOND CALL SITE (agent-infra#2697). `cloud-cell-bringup.sh` names the LAYER's supervisor because it
+# ── §P5 — a CALLER's preference is skipped, not obeyed and not fatal ──────────────────────────────
+# ⛔ THE SECOND CALL SITE (agent-infra#2697). `cloud-cell-bringup.sh` names the LAYER's supervisor because it
 # wants the unit to run the code the layer install just put there — but `self_root` IS a lane worktree when a
 # lane runs the bring-up from its own checkout, and refusing there would kill the bring-up on the one shape
 # a lane can produce (measured: 23 red arms in cloud-cell-bringup.test.sh). So a PREFERENCE that cannot
@@ -3023,6 +3066,57 @@ else
     && ok "§P8: both lists name the same $(printf '%s\n' "$PY_ROOTS" | grep -c .) transient roots" \
     || bad "§P8: TRANSIENT_ROOTS drifted from runner_autoscale.py's TRANSIENT_UNIT_PREFIXES — a root one side refuses is ADMITTED by the other (only-python=[${P8_ONLY_PY% }] only-shell=[${P8_ONLY_SH% }])"
 fi
+
+# ── §P9 — the MEASURED `/tmp/wt-*` shape is refused AS A SHAPE, on a real path ──────────────────
+say_case 'the measured /tmp/wt-2697-fixture shape is refused by the SHAPE rule, not only by the temp-root rule'
+# ⛔ §P's fixture sits under `$T` (`<temp>/ctlunit.XXXX`), which matches NO lane-scratch pattern — it is
+# refused by the transient-root rule. So before this arm the `/tmp/wt-*` entry of the shape list had NO
+# behavioural coverage: deleting that entry left every §P arm green (re-review P3). This is the measured
+# cell-1 spelling, created at a real `/tmp/wt-*` path.
+rm -f "$P/units/eldato-orchestrator.service"          # so the no-unit assertion is about THIS arm
+WT_DIR="$(mktemp -d /tmp/wt-2697-fixture.XXXXXX 2>/dev/null)" || WT_DIR=""
+if [ -n "$WT_DIR" ]; then
+  mkdir -p "$WT_DIR/scripts"; cp "$SUP" "$WT_DIR/scripts/cloud-cell-supervisor.sh"
+  WT_RC=0; WT_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$WT_DIR/scripts/cloud-cell-supervisor.sh" inst p --install 2>&1)" || WT_RC=$?
+  [ "$WT_RC" -ne 0 ] && ok '§P9: the measured /tmp/wt-2697-fixture shape is REFUSED' \
+                     || bad "§P9: armed the measured cell-1 shape ($WT_DIR) — the #2697 defect, re-shipped: $WT_OUT"
+  # The shape list is what must do the work; on a box where /tmp is itself a symlink the path resolves out of
+  # the pattern, so the wording is asserted only where the spelling survives resolution (Linux cells/CI).
+  if [ "$(cd /tmp && pwd -P 2>/dev/null)" = '/tmp' ]; then
+    case "$WT_OUT" in
+      *'lane-scratch shape /tmp/wt-*'*) ok '§P9: and it is refused AS a lane-scratch shape, not merely as a temporary root' ;;
+      *) bad "§P9: the /tmp/wt-* shape was refused by some OTHER rule — the shape entry is not doing the work: $WT_OUT" ;;
+    esac
+  fi
+  [ ! -f "$P/units/eldato-orchestrator.service" ] \
+    && ok '§P9: and nothing was armed for it' || bad '§P9: a refused shape still left a unit behind'
+  rm -rf "$WT_DIR"
+else
+  bad '§P9: could not create /tmp/wt-2697-fixture.* — the measured shape would have no behavioural arm'
+fi
+
+# ── §P10 — an operator's NAMED supervisor that does not exist is refused, never swapped ────────
+say_case 'a named ORCH_SUPERVISOR that does not exist is REFUSED, never silently replaced'
+# ⛔ THE CONTRACT SAYS "refused — never silently swapped" (docs/ops/controller-service.md, header), and the
+# candidate loop used to `continue` for BOTH strengths: `ORCH_SUPERVISOR=<typo or moved checkout>` armed the
+# farmed copy and printed nothing about the path the operator named (re-review P2). That is the
+# merged-not-running class the seam exists to surface, reintroduced by the fallthrough itself.
+NE="$(arm_root nosup)"; mk_systemctl "$NE/bin" "$NE/state" "$NE/sc.log"; mk_tmux "$NE/bin" "$NE/tmux.log"
+NE_RC=0; NE_OUT="$(EXTRA_ENV="ORCH_SUPERVISOR=$NE/moved-away/cloud-cell-supervisor.sh" inst nosup --install 2>&1)" || NE_RC=$?
+[ "$NE_RC" -ne 0 ] && ok '§P10: a non-existent ORCH_SUPERVISOR is REFUSED (not swapped for the farm)' \
+                   || bad "§P10: an operator's missing supervisor was silently replaced by another copy — the contract says it never is: $NE_OUT"
+case "$NE_OUT" in
+  *'is not a readable file'*) ok '§P10: and the refusal names the path the operator gave as the reason' ;;
+  *) bad "§P10: the refusal does not say the named path is the problem — $NE_OUT" ;;
+esac
+[ ! -f "$NE/units/eldato-orchestrator.service" ] \
+  && ok '§P10: and nothing was armed from the fallthrough' || bad '§P10: a refused requirement still left a unit behind'
+# the control that makes it a contract test rather than a blanket refusal: UNSET installs from the farm
+NE2_RC=0; NE2_OUT="$(inst nosup --install 2>&1)" || NE2_RC=$?
+[ "$NE2_RC" -eq 0 ] && ok '§P10: control — with ORCH_SUPERVISOR unset the farmed copy installs' \
+                   || bad "§P10: refused the default path too — the guard is a false block: $NE2_OUT"
+grep -qxF "ExecStart=/bin/bash $(farmed_sup "$NE") start" "$NE/units/eldato-orchestrator.service" 2>/dev/null \
+  && ok '§P10: and the unit names the farm' || bad '§P10: the default install did not name the farm'
 
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"
