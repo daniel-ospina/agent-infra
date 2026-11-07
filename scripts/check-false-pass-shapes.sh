@@ -73,7 +73,7 @@
 # of baselined, and the residual is STATED here rather than implied by a green run.
 #
 # ⛔ The `check-pipeline-compliance.sh` entry above reads `:1025` where it used to read `:503` (#3509).
-# That one was NOT re-measured: the file has since grown 3456 → 5989 lines, and the function it named
+# That one was NOT re-measured: the file has since grown 3456 → 6060 lines (re-measured after the forward merge onto main da79441c5 — the count MOVES with that file), and the function it named
 # changed shape — `has_review_record()` no longer ends on a literal `return 0` (verdict at `:610`, loop
 # end `:609`) — and neither does `review_record_at_head()` at `:1025`: its `return 0` at `:1023` is a
 # MID-LOOP early return and it ends `return 1` after `done < <(review_store_candidates …)`. The function
