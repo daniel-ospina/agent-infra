@@ -2720,8 +2720,22 @@ _x14="$(cat "$_d14c/out" 2>/dev/null)"
 # `claim-reaper.test.sh` do it.
 if [ -r "$_d14c/o/.pool-sat" ]; then _bis_skipped=1; else _bis_skipped=0; fi
 chmod 644 "$_d14c/o/.pool-sat" 2>/dev/null || true
+# ⛔ A SKIP IS NOT A PASS (review P3, cycle 88). This branch returned `rc=0` on a host where `chmod 000` does not bind
+# (root, or `unshare -r`), so a ✅ was printed for an assertion that ran nothing — against this file's own rule (§:78,
+# `:665`: a detector that cannot run reds rather than returning the silence a clean run returns) and its cited model
+# (`:968`: the skip says so INSTEAD OF passing silently). Measured: `unshare -r bash rank-queue.test.sh` printed
+# `✅ (14d) an UNREADABLE window record …` while the two sibling uid-dependent fixtures reddened honestly.
+# The fixture cannot be made unreadable here, so this branch grades the OTHER polarity of the same code path — on a
+# host where a mode-000 record IS readable the operator line must READ it and must not claim otherwise. Both hosts
+# therefore measure something real, and neither prints ✅ for a run that did not happen.
 if [ "$_bis_skipped" = "1" ]; then
-  rc=0; echo "      (skipped: this user can read a 000 file — running as root?)"
+  if grep -q 'could not be READ' <<<"$_x14" && grep -qi 'permission denied' <<<"$_x14"; then rc=1
+    echo "      this host CAN read a mode-000 record, so the pass must have READ it — it reported 'could not be READ' with a shell permission error: '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
+  elif grep -q 'could not be READ' <<<"$_x14"; then rc=1
+    echo "      this host CAN read a mode-000 record, so the pass must have READ it — it claimed 'could not be READ': '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
+  elif [ -z "$_x14" ]; then rc=1
+    echo "      the fixture produced no output at all on a host that can read a mode-000 file — nothing was graded"
+  else rc=0; echo "      (this host can read a mode-000 file, so NO unreadable branch exists here; graded the readable polarity instead: the pass read the record and did not claim otherwise)"; fi
 elif grep -qi 'permission denied' <<<"$_x14"; then
   rc=1; echo "      the shell's own message reached the operator line '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"
 # ⛔ THE BRANCH ASSERTS ITS OWN NO-CLIP POLARITY, SO THAT CLAIM IS GRADED POSITIVELY (review P2, cycle 67).
@@ -3060,9 +3074,10 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 #   * four captures are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
 #     running this suite twice (once as cmux, once as root) with an EMPTY exclusion list: `arm-clip-unread/out`,
 #     `mh-mode000/out`, `poolguards/m000.log`, `sa-unreadable/out`. Root can read a mode-000 file, so those fixtures
-#     take a different branch; they stay graded by the assertions above, and excluding them here keeps the pin from
-#     turning "you ran as root" into a false red. A capture-count difference still reds, so a NEW fixture is always
-#     visible even if its output happens to duplicate a pinned one.
+#     take a different branch, and their text is graded by HOST-DEPENDENT assertions (each one grades whichever
+#     branch exists — since cycle 88 none of them returns `rc=0` without measuring). Excluding them here keeps the pin
+#     from turning "you ran as root" into a false red. A capture-count difference still reds, so a NEW fixture is
+#     always visible even if its output happens to duplicate a pinned one.
 # ⛔ THE SANDBOX PATH IS ESCAPED FOR THE BRE BEFORE IT BECOMES A PATTERN (review P3, cycle 74). `$TMP` was
 # interpolated into `s|…|` raw, so a legal `TMPDIR` containing `[`, `]`, `*`, `|`, `^`, `$` or `\\` broke the fold
 # and the pin reddened an UNMODIFIED tree with "a claim reached the operator by SOME mechanism" — a confident
@@ -3073,9 +3088,10 @@ _out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI
   sed -e "s|$_out_tmp_esc/[A-Za-z0-9._-]*|ROOT|g" -e "s|$_out_tmp_esc|ROOT|g" -e 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null
 }
 # ⛔ THE FOUR UID-DEPENDENT CASES ARE EXCLUDED FROM BOTH HALVES OF THE PIN (see the scope note above): root can
-# read a mode-000 file, so these fixtures take a different branch and their text is legitimately different. They
-# stay graded by the assertions above; the pin stays silent about them rather than turning "you ran as root" into a
-# false red. Every OTHER case — including any fixture added later — is pinned.
+# read a mode-000 file, so these fixtures take a different branch and their text is legitimately different. Each is
+# graded by ITS OWN host-dependent assertion, which grades whichever branch exists (since cycle 88 the mode-000 arm
+# measures the readable polarity instead of returning a bare `rc=0`); the pin stays silent about them rather than
+# turning "you ran as root" into a false red. Every OTHER case — including any fixture added later — is pinned.
 _out_uid_excluded='arm-clip-unread/out mh-mode000/out poolguards/m000.log sa-unreadable/out'
 # ⛔ A CAPTURE IS EVERY FILE THE FIXTURE LEAVES BEHIND — NOT A SET OF FILENAMES (review P1+P2, cycle 72). Cycle
 # 71 scanned `out` plus `log*`; a reviewer then showed `sat/out-junk` — a fixture's PRIMARY output, holding the
@@ -3382,17 +3398,33 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # drivers — created tens of sections later — were never opened. A guard whose population is fixed before the
 # population exists is the cycle-10 defect one layer up. It now runs immediately before the end pin, over the same
 # glob, and reports how many it actually inspected.
-drivers_total=0; drivers_bare=""
+# ⛔ THE POLARITY IS INVERTED: EVERY `.sh` IS A DRIVER UNLESS IT IS A DECLARED INPUT (review P2, cycle 88). Cycle 87
+# renamed seven probes into the four-pattern list, which fixed today's set and left the mechanism: a driver added
+# under any other name was not even COUNTED (measured: `late-probe.sh`, executed by the suite, left the sweep at 133
+# inspected / 177-0; renamed `drive-late.sh` it reddened). A name list is a whitelist, and a whitelist over a
+# population that grows is the same hole as a filename whitelist over captures (§0). So the sweep now walks EVERY
+# `.sh` under `$TMP` and requires each one to be either
+#   (a) a driver — carrying `set -u`; or
+#   (b) a DECLARED INPUT — a file this suite only feeds to `bash -n` or `cat`s into a driver. The declaration is the
+#       `case` below, and it is the fail-closed direction: an undeclared file reds, so a new input is a visible act
+#       and a new driver is covered by DEFAULT whatever its name.
+# Measured population at this commit: 192 `.sh`, 136 drivers, 56 declared inputs (all `fns*`/`floor-fns.sh`/
+# `main-handoff*`/`*-rev.sh`/`pf-*`/`skip-arm*`/`skip-inert.sh`/`skipwhy-real.sh`/`poolguard-mut.sh` bodies).
+drivers_total=0; drivers_bare=""; inputs_total=0
 while IFS= read -r drv; do
   [ -n "$drv" ] || continue
+  case "${drv##*/}" in
+    fns*|floor-fns.sh|main-handoff*|*-rev.sh|pf-*|skip-arm*|skip-inert.sh|skipwhy-real.sh|poolguard-mut.sh)
+      inputs_total=$(( inputs_total + 1 )); continue ;;
+  esac
   drivers_total=$(( drivers_total + 1 ))
   grep -qx 'set -u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
 done <<EOF
-$(find "$TMP" -type f \( -name 'drive*.sh' -o -name 'one.sh' -o -name 'skipwhy.sh' -o -name 'floor-drive.sh' \) 2>/dev/null | sort)
+$(find "$TMP" -type f -name '*.sh' 2>/dev/null | sort)
 EOF
-if [ "$drivers_total" -ge 4 ] && [ -z "$drivers_bare" ]; then rc=0
-else rc=1; echo "      generated drivers: $drivers_total found; WITHOUT 'set -u':${drivers_bare:- none} (want >=4 drivers, every one under set -u — without it a driver cannot see an unbound-reference abort)"; fi
-ck "every generated driver runs under \`set -u\`, like the shipped code it extracts ($drivers_total generated driver(s) inspected at the END of the run)" $rc
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ -z "$drivers_bare" ]; then rc=0
+else rc=1; echo "      driver(s) WITHOUT 'set -u':${drivers_bare:- none} — every .sh under \$TMP is a DRIVER ($drivers_total, each needing set -u) unless it is a DECLARED INPUT ($inputs_total: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh); an undeclared file lands here"; fi
+ck "every .sh this suite generates is a DRIVER under \`set -u\` or a DECLARED input — the driver set is fail-closed, not a name list ($drivers_total driver(s), $inputs_total declared input(s))" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
 _out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
 if [ -z "$_out_late" ]; then
