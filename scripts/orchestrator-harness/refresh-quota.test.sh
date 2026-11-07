@@ -538,10 +538,13 @@ mk_case sat-writer-stale 1000
 mk_gh_sat "$D"
 mk_tool "$D/repo/.worktrees/dispatch-scout/tools/collision_preflight.py"
 rf "$D" refresh
-stale_first="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+# ⛔ A FAILED REDIRECTION IS REPORTED BY THE SHELL, NOT BY `tr` (review P3, cycle 61): `cmd < missing 2>/dev/null`
+# still prints `bash: <missing>: No such file or directory` on stderr — the shell reports the redirect before
+# the command's own stderr is redirected. The read is braced, exactly as the shipped reader does it.
+stale_first="$( { tr '\n' ' ' < "$D/o/.pool-sat"; } 2>/dev/null || true)"
 mk_gh "$D" "$(rows 2)"        # THIS pass: a short listing, no full window, no next page
 rf "$D" refresh
-stale_second="$(tr '\n' ' ' < "$D/o/.pool-sat" 2>/dev/null || true)"
+stale_second="$( { tr '\n' ' ' < "$D/o/.pool-sat"; } 2>/dev/null || true)"
 if [ -z "$stale_first" ]; then
   bad "truncation-stale: the FIRST pass recorded nothing ('$stale_first') — the second-pass assertion below would pass by vacuity"
 elif [ "$RC" -ne 0 ]; then
