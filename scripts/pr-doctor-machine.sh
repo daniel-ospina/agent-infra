@@ -126,17 +126,40 @@ fi
 # same reader's.
 # shellcheck disable=SC1090  # a farmed sibling, resolved above
 . "$READER"
-# ⛔ SOURCED IS NOT THE SAME AS LOADED (round 34, P2). `[ -f "$READER" ]` above accepts a reader that
+# ⛔ SOURCED IS NOT THE SAME AS LOADED (round 34, P2), AND LOADED IS NOT THE SAME AS BEING THE READER
+# THIS WRAPPER WAS WRITTEN AGAINST (round 37, P1). `[ -f "$READER" ]` above accepts a reader that
 # EXISTS but produces nothing — mode 000, a truncated or corrupt farmed copy (the drift class
 # `check-farm-drift.sh` exists for). The `.` then defines no functions, the probe below returns 127, and
 # the `*)` arm printed `no usable repo set at` followed by an EMPTY path plus two `command not found`
-# lines — the round-33 defect one layer down: a summary naming a file it could not name. Refuse by name
-# here, where the fact is known.
-if ! command -v repo_set_parse >/dev/null 2>&1 \
-   || ! command -v repo_set_check >/dev/null 2>&1 \
-   || ! command -v repo_set_file >/dev/null 2>&1 \
-   || ! command -v repo_set_doctor_repos >/dev/null 2>&1; then
-  _say "REFUSING — $READER exists but could not be SOURCED (unreadable, truncated, or not shell); nothing ran."
+# lines — the round-33 defect one layer down: a summary naming a file it could not name.
+#
+# ⛔ AND PROBING ONLY THE `repo_set_*` FUNCTIONS CLOSED THE TRUNCATION HALF AND LEFT THE SKEW HALF OPEN
+# (round 37, P1 — the round-35 guard's own subject said "every function the wrapper calls" and it
+# probed four of nine). Truncation is not the realistic shape anyway: `setup.sh`'s lib farm copies via
+# write-temp-then-`mv`, so a HALF file cannot land — what lands is `COPY/RENAME FAILED … leaving any
+# previous copy in place`, i.e. a COMPLETE **OLDER** reader beside a NEW wrapper. Every `repo_set_*`
+# exists in that file, so the four-name probe passed, and the wrapper then died five times on
+# `_rs_doctor_available`/`_rs_origin_slug`/`_rs_normalize_slug` before refusing a VALID `OR` with
+# `is not an owner/name slug` — the round-2/3/10 "refuse a pass the doctor runs" shape wearing the
+# round-18/29/31 wrong-cause diagnosis. Measured with `git show 2a698a98:scripts/lib/repo-set.sh` as
+# the sibling; the same env with this branch's reader prints `Grading the ONE repo … OR=…`.
+#
+# ⛔ THE LIST IS THE WRAPPER'S OWN CALL CONTRACT, AND IT IS KEPT HONEST BY A TEST, NOT BY PROSE (see the
+# paragraph above about naming them one by one — that warning is why this cannot be a hand-maintained
+# list with nothing watching it). `f11e` in `scripts/lib/repo-set.test.sh` recomputes the call sites out
+# of THIS file and reddens in BOTH directions: a call the list does not name, and a name the file no
+# longer calls. `f11d` drives the skew shape end to end.
+_reader_needs="repo_set_parse repo_set_check repo_set_file repo_set_doctor_repos _rs_doctor_available _rs_strip _rs_origin_slug _rs_normalize_slug _rs_lower"
+_reader_missing=""
+for _need in $_reader_needs; do
+  command -v "$_need" >/dev/null 2>&1 || _reader_missing="${_reader_missing:+$_reader_missing }$_need"
+done
+if [ -n "$_reader_missing" ]; then
+  _say "REFUSING — $READER cannot be used by this wrapper; it does not provide: $_reader_missing"
+  _say "  Three shapes land here, and the repair is the same for all of them: a reader that is"
+  _say "  unreadable, one truncated mid-file, or an OLDER reader than this wrapper — the state the"
+  _say "  farm deliberately leaves behind when a copy fails (`COPY/RENAME FAILED … leaving any"
+  _say "  previous copy in place`). Nothing ran."
   _say "  Repair the farm: re-run pi-bootstrap/setup.sh — its \`lib_srcs\` declares repo-set.sh."
   exit 2
 fi

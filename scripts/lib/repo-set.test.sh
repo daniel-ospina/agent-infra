@@ -37,14 +37,20 @@ REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # shell (`bash < repo-set.test.sh`) leaves `BASH_SOURCE[0]` unbound, and under `-u` that is an error
 # before a single arm runs — the shard would red on the HARNESS, not on the behaviour.
 set -u
-# ⛔ HERMETIC AGAINST THE REPO'S OWN SEAM ENV (round 31, P2). The wrapper reads PR_DOCTOR_REPO,
-# PR_DOCTOR_REPO_DIR, OR and REPO from the AMBIENT environment, and an operator running this suite in a
-# shell that follows the bootstrap's "export REPO=<checkout>" step saw 6-12 arms go red on a suite that
-# is correct — and the arm to "fix" then is the one being weakened. Measured with each var exported
-# alone: OR -> 8 FAILs, REPO -> 6, PR_DOCTOR_REPO -> 12, PR_DOCTOR_REPO_DIR -> 2. `run-bash-shards.sh`
-# scrubs only its OWN vars, so a caller's env reaches a shard. `orchestrator-bringup.test.sh` does the
-# equivalent with `env -i` for exactly this reason.
-unset OR REPO PR_DOCTOR_REPO PR_DOCTOR_REPO_DIR
+# ⛔ HERMETIC AGAINST THE REPO'S OWN SEAM ENV (round 31, P2; round 37, P2 — AND THE SEAM SET WAS
+# INCOMPLETE). The wrapper reads PR_DOCTOR_REPO, PR_DOCTOR_REPO_DIR, OR and REPO from the AMBIENT
+# environment, and an operator running this suite in a shell that follows the bootstrap's "export
+# REPO=<checkout>" step saw 6-12 arms go red on a suite that is correct — and the arm to "fix" then is
+# the one being weakened. Measured with each var exported alone: OR -> 8 FAILs, REPO -> 6,
+# PR_DOCTOR_REPO -> 12, PR_DOCTOR_REPO_DIR -> 2. ⛔ THE TWO **READER** SEAMS WERE OMITTED, and they are
+# legitimate ambient values too (`REPO_SET_FILE` is the reader's own documented seam): ambient
+# `REPO_SET_FILE=<a valid set>` made `m40` red (the wrapper takes the `--all-repos` branch and never
+# reaches `_trim`) and left `m39` GREEN FOR THE WRONG REASON (the reader's own `CHECKOUT-UNVERIFIED`
+# WARN satisfies its `could not be normalised` grep, not the wrapper's diagnosis the arm exists to
+# pin); ambient `REPO_SET_DOCTOR=<a loadable doctor>` reddened five arms (`j25`, `j28`+`j28-raises`,
+# `m39`, `m40`). `run-bash-shards.sh` scrubs only its OWN vars, so a caller's env reaches a shard.
+# `orchestrator-bringup.test.sh` does the equivalent with `env -i` for exactly this reason.
+unset OR REPO PR_DOCTOR_REPO PR_DOCTOR_REPO_DIR REPO_SET_FILE REPO_SET_DOCTOR
 READER="$HERE/repo-set.sh"
 WRAPPER="$REPO_ROOT/scripts/pr-doctor-machine.sh"
 PLIST="$REPO_ROOT/templates/launchd/com.tortoise.pr-doctor.plist"
@@ -368,10 +374,62 @@ ck "f11 a missing sibling reader is a NAMED farm gap, not a silent one-repo box"
 # ⛔ AND THE GUARD MUST PROBE EVERY FUNCTION THE ARMS CALL, not one: probing only `repo_set_parse` let a
 # copy truncated between `repo_set_check` and `repo_set_doctor_repos` through, and the refusal then named
 # the SET ("is not a usable repo set") instead of the reader. Both shapes are pinned here.
+# ⛔ AND NOT ONLY `repo_set_*` (round 37, P1): the guard probed four of the NINE reader functions this
+# wrapper calls, so a COMPLETE but OLDER reader — the state `setup.sh`'s write-temp-then-`mv` farm
+# deliberately leaves behind when a copy fails — passed the guard and then died on `_rs_*` five times
+# before refusing a VALID `OR` as `is not an owner/name slug`. `f11d` is that shape; `f11e` is what keeps
+# the probe list equal to the wrapper's own call sites in both directions.
+# ⛔ THE ANCHOR PHRASE CHANGED WITH THAT FIX (`could not be SOURCED` -> `cannot be used by this
+# wrapper`), because the old one was a FALSE STATEMENT for the skew shape: that reader sources fine and is
+# simply older. A refusal that names the wrong cause is the class rounds 18/29/31/33 kept closing.
 ck "f11b an UNSOURCEABLE sibling reader (truncated) is refused BY NAME, with no 'command not found' noise" \
-   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "could not be SOURCED" <<<"$o" && ! grep -q "command not found" <<<"$o" && ! grep -q "is not a usable repo set" <<<"$o"'
-ck "f11c …and a mode-000 reader is refused the same way (unreadable, not unparsable)" \
-   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; cp "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; chmod 000 "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; chmod 644 "$W/lib/repo-set.sh"; mv -f "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "could not be SOURCED" <<<"$o" && ! grep -q "command not found" <<<"$o"'
+   'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; head -n "$(grep -n "^repo_set_doctor_repos()" "$READER" | cut -d: -f1)" "$READER" > "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -q "command not found" <<<"$o" && ! grep -q "is not a usable repo set" <<<"$o"'
+# ⛔ THE SIBLING ARMS ALL GUARD `chmod 000` AGAINST ROOT (j1/j2, m13-m15, m18-m20, d-unreadable-checkout):
+# root ignores DAC, so on a root box the source SUCCEEDS, the probes pass, the doctor runs and this arm
+# asserts rc 2 on an rc 0 run — a hard red on a correct tree. Non-root CI masks it, which is exactly the
+# kind of latent red that gets "fixed" by weakening the arm. Same guard, same reason.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip f11c (running as root: mode 000 does not block a read)\n'
+else
+  ck "f11c …and a mode-000 reader is refused the same way (unreadable, not unparsable)" \
+     'mv "$W/lib/repo-set.sh" "$W/lib/repo-set.sh.away"; cp "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; chmod 000 "$W/lib/repo-set.sh"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; chmod 644 "$W/lib/repo-set.sh"; mv -f "$W/lib/repo-set.sh.away" "$W/lib/repo-set.sh"; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && ! grep -q "command not found" <<<"$o"'
+fi
+# ⛔ A COMPLETE-BUT-OLDER READER: THE THIRD SHAPE, AND THE ONE THE FARM ACTUALLY PRODUCES (round 37, P1).
+# The stub provides all four `repo_set_*` functions — so the round-35 probe passed it — and none of the
+# `_rs_*` helpers the wrapper then calls. Before the fix the wrapper emitted five `command not found`
+# lines and refused a VALID `OR` with `is not an owner/name slug`, i.e. the operator was sent to edit a
+# slug that was already right. Built as a STUB rather than `git show <old sha>:scripts/lib/repo-set.sh`
+# so the arm pins the CONTRACT (which names must exist) and not one historical revision of the file.
+SW="$T/skeww"; mkdir -p "$SW/lib"
+cp "$WRAPPER" "$SW/pr-doctor-machine.sh"
+cp "$REPO_ROOT/scripts/pr-doctor.py" "$SW/pr-doctor.py"
+printf 'repo_set_file() { printf %%s "${REPO_SET_FILE:-}"; }\nrepo_set_parse() { return 3; }\nrepo_set_check() { return 0; }\nrepo_set_doctor_repos() { return 0; }\n' > "$SW/lib/repo-set.sh"
+ck "f11d an OLDER reader (all four repo_set_* present, the _rs_* helpers absent) is REFUSED by name, not used" \
+   'o="$(REPO_SET_FILE="$T/none.conf" OR=daniel-ospina/tortoise HOME="$T" bash "$SW/pr-doctor-machine.sh" 2>&1)"; rc=$?; [ "$rc" = 2 ] && grep -q "cannot be used by this wrapper" <<<"$o" && grep -q "_rs_normalize_slug" <<<"$o" && ! grep -q "command not found" <<<"$o" && ! grep -q "is not an owner/name slug" <<<"$o"'
+ck "f11d-0 …and the SHIPPED reader in the same env GRADES that same OR (so f11d reddens on the refusal, not on the setup)" \
+   'o="$(REPO_SET_FILE="$T/none.conf" OR=daniel-ospina/tortoise HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; grep -q "Grading the ONE repo" <<<"$o"'
+# ⛔ AND THE PROBE LIST IS KEPT EQUAL TO THE CALL SITES — BOTH DIRECTIONS (round 37, P1/P2). The wrapper's
+# own comment argues that naming functions one by one is what went wrong three times here, and a probe
+# list nothing watches is that problem with a gate attached: the reviewer MEASURED that dropping the
+# `repo_set_check` and `repo_set_file` probes reddened nothing at all (171/0). So compute the calls out
+# of the file — comment lines excluded (prose is not a call), `command -v` lines excluded (that IS the
+# probe), and the list line excluded (it would trivially satisfy itself) — and require set EQUALITY: a
+# call the list omits reddens, and a name the file no longer calls reddens too (an inert probe refuses a
+# healthy reader for a function nobody wants).
+_probe_calls="$(grep -vE '^[[:space:]]*#' "$WRAPPER" | grep -v 'command -v' | grep -v '^_reader_needs=' | grep -oE '(repo_set_[a-z_]+|_rs_[a-z_]+)' | sort -u | tr '\n' ' ')"
+_probe_list="$(grep -E '^_reader_needs=' "$WRAPPER" | head -1 | cut -d'"' -f2)"
+_probe_miss=""; _probe_extra=""; _probe_n=0
+for _c in $_probe_calls; do
+  _probe_n=$(( _probe_n + 1 ))
+  case " $_probe_list " in *" $_c "*) : ;; *) _probe_miss="$_probe_miss $_c" ;; esac
+done
+for _c in $_probe_list; do
+  case " $_probe_calls " in *" $_c "*) : ;; *) _probe_extra="$_probe_extra $_c" ;; esac
+done
+ck "f11e the SOURCED guard's list EQUALS the reader functions this wrapper CALLS (a call without a probe, or a probe without a call, reddens)" \
+   '[ -z "$_probe_miss" ] && [ -z "$_probe_extra" ]'
+ck "f11e-0 …and that scan is non-vacuous: it really did find the nine names (an empty scan would pass f11e silently)" \
+   '[ "$_probe_n" -ge 9 ]'
 # ⛔ THE DEGRADED PATH MUST NOT CLAIM TO GRADE WHEN IT CANNOT NAME A REPO (review round 2, P1). The
 # doctor's REPO-only arm raises when the checkout's `origin` proves nothing — the TCC shape on the
 # default macOS install — so `f4`'s stub (which echoes argv) would pass on a wrapper that dies in
