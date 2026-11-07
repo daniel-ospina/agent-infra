@@ -680,14 +680,47 @@ def _commit_body(obj: str) -> str:
 # ⛔ THE SHELL'S ACCEPTANCE, EXACTLY (review round 18, agent-infra#3203). `_claim_commit_time` takes the
 # stamp from the LAST `committer `-prefixed header line (see the selection note inside `_commit_time`),
 # parses that ONE line with an ANCHORED shape — NO trailing whitespace before EOL — and then rejects
-# anything longer than 12 digits as UNMEASURABLE (`case … |?????????????*`). This pattern used to allow
+# anything longer than 12 digits as UNMEASURABLE (the check is `[ "${#ct}" -le 12 ]` — a separate arm
+# below the `case`, NOT a `case … |?????????????*` glob: that glob bounds this file's CLOCK fields, the
+# LEASE field is bounded by its own length test (`[ "${#1}" -gt 18 ]`), and `ct` has never used either).
+# This pattern used to allow
 # `[ \t]*$` and any length, so the same object was "unmeasurable" to the oracle and a fresh/aged stamp
 # here: one datum, two answers, in the very field the bounded reap is measured from.
 # ⛔ UNBOUNDED, BECAUSE THE ORACLE'S IS (review round 21, agent-infra#3203): `\([0123456789][0123456789]*\)`
 # matches any run, and the LENGTH rule is a SEPARATE arm below — which is why a 13+ digit stamp rejects the
 # object instead of being skipped in favour of an earlier line. A bounded quantifier here silently changed
 # WHICH line's value is judged.
-_COMMITTER_TIME_RE = re.compile(r"^committer .* ([0-9]+) [+-][0-9]{4}$", re.M)
+# ⛔ THE LAST `>` IS GIT'S OWN SPLIT POINT, AND THE DATE FIELD AFTER IT IS THE STAMP (review round 27,
+# agent-infra#3203). A round-27 review finding claimed git reads the FIRST `<`…FIRST `>` span and dates
+# `committer a <a@b> <NOW> +0000 > 1 +0000` at NOW. MEASURED against git 2.43.0 (`hash-object -w -t commit
+# --literally` + `git log -1 --format=%ct`): git dates from the field after the LAST `>`, so
+# `… <NOW> +0000 > 1 +0000` and `… <NOW> +0000 <c@d> 1 +0000` are dated **1** — this pattern and the
+# shell's agree with git on them. A mail-span anchor (`[^<]*<[^>]*>`) answered None for exactly those,
+# which is the PERMANENT-HOLD direction: `claim_prune` `continue`s on an unmeasurable age BEFORE the bound
+# is compared, so a peer appending ` > 1 +0000` would hold its claim for ever (#3203 re-opened).
+# ⛔ THE INVARIANT: when this reader measures, it must EQUAL `git log -1 --format=%ct`; it may only
+# ABSTAIN where git is more tolerant than the `$` anchor (a trailing token or trailing whitespace, a CR
+# before EOL, a tz field that is not exactly 4 digits, and a TAB or NO separator before it — git dates
+# all of those, and the `$` anchor refuses the whole line for each) — always the KEEP direction, and A79
+# pins that decision. A SIGN-LESS tz (`<NOW> 0000`) is 4 digits and abstains here too, but it is not a
+# divergence: git ACCEPTS and PUSHES that object (only `git fsck` reports `badTimezone`) and has no
+# committer date for it — `git log -1 --format=%ct` prints nothing at rc 0, so there is no answer to agree
+# with. The LENGTH and leading-zero arms below abstain on a 13+ digit or leading-zero stamp
+# this pattern itself measures: a second, deliberate class (rounds 19/21, pinned HERE by this suite's
+# 13-digit and `0999` cases; the shell's counterpart leading-zero arm is pinned by `test-claims.sh` A33,
+# and the shell's 12-digit cap has no pin at all), not a disagreement. The shell side is
+# pinned to the same invariant by `test-claims.sh` A88-A92, which assert git's own answer as well as the
+# reader's.
+# ⛔ ANCHORED ON `>` + ANY WHITESPACE, NOT `> ` + EXACTLY ONE SPACE (review round 28, agent-infra#3203).
+# git skips whitespace after the split `>`, so zero, one, two or three spaces and a TAB all yield the same
+# answer. Measured (git 2.43.0, `hash-object -w -t commit --literally` + `git log -1 --format=%ct`) with
+# `N = 1794013553`: `… > 1 +0000`, `… >  1 +0000`, `… >   1 +0000`, `… >\t1 +0000` and `… >1 +0000` are
+# ALL dated **1**; `… >  N +0000` (reverse sign, two spaces) is dated **N**. A literal single space
+# abstained on every one but the first, and for `>  1 +0000` the PREVIOUS bare-`.* ` parser had measured
+# git's own answer — so the `> ` form silently turned a REAP into a HOLD for a claim git dates 1970.
+# `[ \t]*` here mirrors the shell's `[[:blank:]]*` exactly (space and tab; `\s` must not be used — with
+# `re.M` it would match a NEWLINE and let a stamp on the next header line become the value).
+_COMMITTER_TIME_RE = re.compile(r"^committer .*>[ \t]*([0-9]+) [+-][0-9]{4}$", re.M)
 
 
 def _commit_time(obj: str) -> Optional[int]:
