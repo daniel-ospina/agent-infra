@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-11354-1794066883-p1115161-38aa2aee",
+  "_sha": "8e3975005ebea060e376715cf2a5ed91711af6c1",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11354.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11326-close-mechanism-recipe"
+    },
+    {
+      "kind": "sha",
+      "value": "7919b7f3c11b99ef21fd9448f7aaaa47009d9b42"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-11354"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 6101,
+  "ended_at": 1794072984,
+  "exit_code": 0,
+  "heartbeat_at": 1794072984,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11354-1794066883-p1115161-38aa2aee",
+  "lease_until": 1794080784,
+  "pid": 1115161,
+  "reason": null,
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794066883,
+  "state": "DONE",
+  "tag": "prd-daniel-ospina-tortoise-11354",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-11354"
+}
