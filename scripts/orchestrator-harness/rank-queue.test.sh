@@ -96,10 +96,14 @@ TMP="$(mktemp -d "${TMPDIR:-/tmp}/rank-queue.XXXXXX")" || { echo "❌ SKIP-CANNO
 # `skipwhy-real.sh`, or anything under `fns*`) was waived and never inspected — measured: `pf-late.sh`, executed by
 # the suite, left the sweep at 177/0 while the identical bytes named `late-probe.sh` reddened. That is `set -u`
 # coverage graded by FILENAME, the mechanism this section exists to replace.
-# `BASH_ENV` is sourced by EVERY non-interactive bash this suite starts, so it records the scripts that really run —
-# whatever they are called, and whether or not they end in `.sh` (measured: `late-probe`, a driver with NO
-# extension, was also invisible to the `-name '*.sh'` glob). The hook writes a path and nothing else, so no trace,
-# stdout or stderr of any child changes; the log lives directly under `$TMP` (not a case dir), so it is not a capture.
+# `BASH_ENV` records the scripts that really run — whatever they are called, and whether or not they end in `.sh`
+# (measured: `late-probe`, a driver with NO extension, was also invisible to the `-name '*.sh'` glob).
+# SCOPE, MEASURED rather than asserted (review P3, cycle 90): it is sourced by every non-interactive `bash` started
+# with this environment — NOT by `sh` (dash/ksh ignore it), NOT by `bash --posix`, and NOT through `env -i`; and the
+# hook's own commands ARE traced under `bash -x` and echoed under `bash -v`. No driver is launched with any of those
+# today, so the log is complete for this suite as it stands; a future driver started that way is a gap this comment
+# names instead of an absolute that hides it. The hook writes one path per child and nothing to stdout/stderr when
+# neither `-x` nor `-v` is on; the log lives directly under `$TMP` (not a case dir), so it is not a capture.
 # ⛔ `$0` IS LOGGED ABSOLUTE: drivers are started as `bash drive.sh` from INSIDE their case dir, so a bare `$0` is a
 # relative name that cannot be matched back to a file (measured: 208 entries logged, all `drive.sh`, and the sweep
 # resolved NONE of them). `$PWD/$0` needs no `readlink -f`, which macOS lacks.
@@ -1003,7 +1007,11 @@ else rc=1; echo "      pool-shape: dir rc=$pg_dir_rc rows='$pg_dir_rows' unranke
 [ "$pg_m_skipped" = "1" ] && echo "      (mode-000 half: this user can read a 000 file, so NO unreadable branch exists — graded the readable polarity instead: the pool must have been RANKED)"
 
 chmod 644 "$GP/mode000-o/.pool" 2>/dev/null || true
-ck "a NON-REGULAR or UNREADABLE .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take" $rc
+# ⛔ THE NAME FOLLOWS THE BRANCH (review P3, cycle 90): on a host where a mode-000 file is readable, the unreadable
+# polarity was never exercised, so the ✅ must not claim it. Measured as root before this: ✅ "a NON-REGULAR or
+# UNREADABLE .pool REFUSES the reorder" above a note saying no unreadable branch exists.
+_pg_note=""; [ "$pg_m_skipped" = "1" ] && _pg_note=" [readable host: the READ polarity was graded, not the unreadable one]"
+ck "a NON-REGULAR .pool REFUSES the reorder (priority-unreadable) — never the 'pool ranked NONE' measurement it did not take$_pg_note" $rc
 # ⛔ NON-VACUITY: delete the pool-shape guard and the case above must redden.
 PGMUT="$TMP/poolguard-mut.sh"
 # ⛔ ASK FOR THE GUARD FIRST (review P3, cycle 65). `cmp` cannot tell "the anchor drifted" from "the guard is no
@@ -2784,7 +2792,8 @@ elif grep -q 'could not be READ' <<<"$_x14" \
      && ! grep -q 'windows=TRUNCATED' <<<"$_x14" \
      && ! grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_x14"; then rc=0
 else rc=1; echo "      unreadable record '$(printf '%s' "$_x14" | tr '\n' '|' | head -c 320)'"; fi
-ck "(14d) an UNREADABLE window record asserts NO clip (both clauses) and leaks no shell 'Permission denied'" $rc
+_bis_note=""; [ "${_bis_skipped:-0}" = "1" ] && _bis_note=" [readable host: the READ polarity was graded, not the unreadable one]"
+ck "(14d) a window record is graded on the branch this host actually has: unreadable → NO clip claimed, no shell 'Permission denied'; readable → the record is READ and its tier repeated$_bis_note" $rc
 
 # ⛔ 14d-quater) THE `_sat_unread` CLAUSE NEEDS A FIXTURE THAT DOES NOT DEPEND ON THE CALLER`S UID (review P1,
 # cycle 71). The only fixture that reached it was the chmod-000 one, and that is EXCLUDED from the output pin
@@ -3442,6 +3451,18 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 #       and a new driver is covered by DEFAULT whatever its name.
 # Measured population at this commit: 192 `.sh`, 136 drivers, 56 declared inputs (all `fns*`/`floor-fns.sh`/
 # `main-handoff*`/`*-rev.sh`/`pf-*`/`skip-arm*`/`skip-inert.sh`/`skipwhy-real.sh`/`poolguard-mut.sh` bodies).
+# ⛔ THE OPTION, NOT ONE LINE OF TEXT (review P3, cycle 90). `grep -qx 'set -u'` (cycle 88) and then
+# `grep -qE '^[[:space:]]*set -[A-Za-z]*u'` (cycle 89) both graded a TEXT LINE, which is wrong in both directions:
+# `set -e -u` and `set -o nounset` are real unset-variable protection and were FALSE-BLOCKED with the untrue message
+# "WITHOUT 'set -u'", while a `set -u` sitting inside a quoted heredoc body matches the pattern and protects nothing
+# (running such a file prints the body as DATA). `_setu` reads the `set` COMMAND's words: a dash-word containing `u`,
+# or a bare `nounset` argument (so `set -o nounset` and `set -eu -o nounset` both count).
+# RESIDUAL, stated: a `set -u` inside quoted data still counts if it appears on a line that STARTS with `set` (only a
+# quoted-heredoc body indented under `set` is told apart); the witnesses' own `bash -n` + claim checks are the place
+# that class is separated, not here.
+_setu() { # $1=script -> 0 when a `set` command enables `u`
+  awk '/^[[:space:]]*set[[:space:]]/ { for (i = 2; i <= NF; i++) { if ($i ~ /^-[A-Za-z]*u/) f = 1; if ($i == "nounset") f = 1 } } END { exit !f }' "$1" 2>/dev/null
+}
 drivers_total=0; drivers_bare=""; inputs_total=0
 while IFS= read -r drv; do
   [ -n "$drv" ] || continue
@@ -3450,9 +3471,7 @@ while IFS= read -r drv; do
       inputs_total=$(( inputs_total + 1 )); continue ;;
   esac
   drivers_total=$(( drivers_total + 1 ))
-  # ⛔ THE FLAG'S SPELLING FAMILY, NOT ONE LITERAL LINE (review P3, cycle 89): `grep -qx 'set -u'` reddened a driver
-  # written `set -euo pipefail` — a FALSE BLOCK, and its message ("WITHOUT 'set -u'") was untrue of it.
-  grep -qE '^[[:space:]]*set -[A-Za-z]*u' "$drv" 2>/dev/null || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
+  _setu "$drv" || drivers_bare="$drivers_bare ${drv#"$TMP"/}"
 done <<EOF
 $(find "$TMP" -type f -name '*.sh' 2>/dev/null | sort)
 EOF
@@ -3461,19 +3480,26 @@ EOF
 # that matters (what runs) is read from the `BASH_ENV` log, and each executed script must carry the flag family or be
 # a declared input. `*/bin/*` is the case dirs' own PATH shims (`wc`, `mv`, `cmp`, `sort`, `awk`, `cat`, `tr`), which
 # this suite runs as COMMANDS: declared here by path class, visibly, rather than by a name that can hide a driver.
-exec_total=0; exec_bare=""
+exec_total=0; exec_bare=""; exec_missing=""
 while IFS= read -r _ex; do
   [ -n "$_ex" ] || continue
   case "$_ex" in "$TMP"/*) : ;; *) continue ;; esac
-  [ -f "$_ex" ] || continue
-  case "$_ex" in "$TMP"/*/bin/*) continue ;; esac
+  # ⛔ A LOGGED PATH THAT NO LONGER EXISTS REDS (review P3, cycle 90). `|| continue` let a script that ran and then
+  # removed itself simply leave the population — measured: an executed, self-deleting driver left the sweep at 177/0
+  # with the same count. The absence is a fact about the run, so it is named, not skipped.
+  [ -f "$_ex" ] || { exec_missing="$exec_missing ${_ex#"$TMP"/}"; continue; }
+  # ⛔ THE SHIMS ARE EXEMPT BY NAME, NOT BY DIRECTORY (review P2, cycle 90). A `*/bin/*` PATH class exempted EVERY
+  # executed script there: measured, an `exp3/bin/expshim` that the suite ran was logged and the count stayed at 133 —
+  # and `arm-clip-trshim/bin/tr`, a multi-line executed shim with no `set -u` on the code's own PATH, is ungraded for
+  # exactly that reason. These seven are the suite's PATH doubles; anything else that runs must carry the flag.
+  case "${_ex##*/}" in wc|mv|cmp|sort|awk|cat|tr) [ "${_ex%/*}" != "${_ex%/*/bin}" ] && continue ;; esac
   exec_total=$(( exec_total + 1 ))
-  grep -qE '^[[:space:]]*set -[A-Za-z]*u' "$_ex" 2>/dev/null || exec_bare="$exec_bare ${_ex#"$TMP"/}"
+  _setu "$_ex" || exec_bare="$exec_bare ${_ex#"$TMP"/}"
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
-if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ]; then rc=0
-else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, plus */bin/* shims); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
+else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, plus */bin/* shims); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
 ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
 _out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
