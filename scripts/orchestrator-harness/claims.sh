@@ -1229,8 +1229,13 @@ _claim_commit_time() {
   # reporting itself healthy. That is why the anchor is git's, not the mail span's.
   # ⛔ THE INVARIANT, STATED SO IT CAN BE TESTED: **when this parse measures, it must equal
   # `git log -1 --format=%ct`; it may only ABSTAIN where git is more tolerant than the `$` anchor.**
-  # The ONE remaining divergence class is a tolerance, not a disagreement: git stops reading after the tz
-  # digits and ignores a trailing token, while the `$` anchor refuses the whole line — always in the KEEP
+  # The remaining divergence classes are TOLERANCES, not disagreements — and there is more than one. The
+  # `$` anchor refuses the whole line where git stops after the tz digits: a trailing token, a CR before
+  # EOL, and a tz field that is NOT exactly 4 digits (`> 1 +000`, `> 1 +0` and `> 1 +00000` are each dated
+  # 1 by git 2.43.0; this parse abstains). Two further classes abstain in the LENGTH / leading-zero arms
+  # BELOW rather than in the anchor: a 13+ digit and a leading-zero stamp are MEASURED here at git's own
+  # value and then rejected there (rounds 19/21, pinned by `claim-reaper.test.sh`) — a deliberate class,
+  # not a disagreement. Every one of them lands in the KEEP
   # direction (A79 pins that decision, A88-A92 pin the agreement with git on the shapes where it matters,
   # including the `> 1 +0000` shapes git dates 1970 that must be REAPED and the `1 +0000 > <NOW> +0000`
   # reverse sign that must NOT be). A76-A78 only exercised a token the `$` anchor REJECTS, so they pinned
