@@ -1225,10 +1225,15 @@ ck "the shipped floor_order is extracted WHOLE (the consumer this check drives)"
 # stdout and on stderr) left this suite at 177/0 while `product-floor.test.sh` reddened. Its stdout is the dispatch
 # batch, so prose there is not cosmetic either. The run now lands in `$TMP/floor/out` (pinned by `_out_map`) and the
 # head is read from the FILE.
-floor_head() {  # <product-file> <all-file> -> the row the floor's ONE slot takes
-  mkdir -p "$TMP/floor"
-  ( cd "$TMP" && bash floor-drive.sh 1 "$1" "$2" ) > "$TMP/floor/out" 2>&1
-  head -1 "$TMP/floor/out"
+# ⛔ ONE CAPTURE PER DRIVE, NOT ONE FILE FOR ALL OF THEM (review P2, cycle 80). `$3` is the drive's LABEL: with a single
+# `$TMP/floor/out` every call TRUNCATED the previous one, so only the LAST drive's bytes were pinned and the first
+# drive's stdout from row 2 onward — plus ALL of its stderr — reached no CRC. Measured: a stderr claim firing only in
+# the first drive (`[ "$n" = "300" ] && printf … >&2`) left the suite at 177/0. Each drive now writes
+# `$TMP/floor-<label>/out`, and every label is its own pinned case.
+floor_head() {  # <product-file> <all-file> <label> -> the row the floor's ONE slot takes
+  mkdir -p "$TMP/floor-$3"
+  ( cd "$TMP" && bash floor-drive.sh 1 "$1" "$2" ) > "$TMP/floor-$3/out" 2>&1
+  head -1 "$TMP/floor-$3/out"
 }
 PQ="$TMP/productfollow"; mkdir -p "$PQ/o"
 {
@@ -1248,7 +1253,7 @@ printf '300\n200\n' > "$PQ/o/.pool"
 printf '200\n300\n' > "$PQ/o/candidates.product.txt"
 ( cd "$PQ" && HOME="$PQ" bash drive.sh "$PQ/o" ) > "$PQ/log" 2>&1
 prod_a="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" 2>/dev/null | sed 's/ *$//')"
-head_a="$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt")"
+head_a="$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt" a)"
 # ⛔ AND IT MUST SAY SO (review P3, cycle 54): the only report that the product file was re-sequenced (and
 # how many rows it now holds) could be deleted with the suite green, while all four of its FAILURE lines were
 # pinned. The success sentence is asserted here, on the fixture that emits it.
@@ -1690,7 +1695,7 @@ printf '300\n200\n' > "$PQ/o/.pool"
 printf '200\n300\n' > "$PQ/o/candidates.product.txt"
 ( cd "$PQ" && HOME="$PQ" bash drive-mut.sh "$PQ/o" ) > "$PQ/mutlog" 2>&1
 if [ "$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" | sed 's/ *$//')" = "200 300" ] \
-   && [ "$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt")" = "200" ]; then rc=0
+   && [ "$(floor_head "$PQ/o/candidates.product.txt" "$PQ/o/candidates.txt" b)" = "200" ]; then rc=0
 else
   mut_prod="$(tr '\n' ' ' < "$PQ/o/candidates.product.txt" | sed 's/ *$//')"
   rc=1; echo "      the NO-OP mutant still moved the product file to '$mut_prod' — check 12 proves nothing"
@@ -3076,7 +3081,7 @@ _out_tmp_esc="$(printf '%s' "$TMP" | sed 's/[][\\.*^$|]/\\&/g')"
 _out_norm() { # $1=file -> normalized text on stdout (sandbox paths folded, ANSI dropped)
   sed -e "s|$_out_tmp_esc/[A-Za-z0-9._-]*|ROOT|g" -e "s|$_out_tmp_esc|ROOT|g" -e 's/\x1b\[[0-9;]*m//g' "$1" 2>/dev/null
 }
-# ⛔ THE THREE UID-DEPENDENT CASES ARE EXCLUDED FROM BOTH HALVES OF THE PIN (see the scope note above): root can
+# ⛔ THE FOUR UID-DEPENDENT CASES ARE EXCLUDED FROM BOTH HALVES OF THE PIN (see the scope note above): root can
 # read a mode-000 file, so these fixtures take a different branch and their text is legitimately different. They
 # stay graded by the assertions above; the pin stays silent about them rather than turning "you ran as root" into a
 # false red. Every OTHER case — including any fixture added later — is pinned.
@@ -3138,8 +3143,11 @@ _out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, s
   done | LC_ALL=C sort
   [ "$_out_dg_was" = 1 ] || shopt -u dotglob
 }
-_out_unique() { # the map above, deduped by content (many fixtures share an arm)
-  _out_map | cut -d= -f2 | sort -u | tr '\n' ' ' | sed 's/ $//'
+_out_unique() { # the map above, deduped by CONTENT (many fixtures share an arm)
+  # ⛔ THE CRC IS THE TAIL AFTER THE LAST `=`, NOT THE FIELD AFTER THE FIRST (review P3, cycle 80): for a capture named
+  # `late=1` the old `cut -d= -f2` returned the literal `1`, so its real output CRC never entered the distinct set —
+  # the very half that claims "a new case cannot hide by duplicating an existing output".
+  _out_map | sed 's/.*=//' | sort -u | tr '\n' ' ' | sed 's/ $//'
 }
 # ⛔ THE DIAGNOSTICS NAME A CAPTURE, SO THEY MUST BE ABLE TO SHOW IT (review P3, cycle 74). Three failure messages
 # call `_out_show`; its earlier body printed the capture RAW (sandbox path unfolded, ANSI kept), said nothing when
@@ -3155,8 +3163,8 @@ _out_show() { # $1="<case>/<file>" -> the emitted text (paths folded), first 6 l
 }
 # ⛔ THE PIN. `case=crc` for every driven case, and the deduped set of distinct outputs, which is the coarse half:
 # a NEW case whose output duplicates an existing one cannot hide, and a sentence change moves the distinct set.
-_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-head/out-head=1078605162|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-clip/out-unranked=3407422058|arm-clip/out-unrec=4222849383|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-refuse-rowset/seed=2566848085|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|countguard/cnt-good=527657959|countguard/out-bad=44744305|countguard/out-good=44744305|countguard/pool=2793652360|countguard/q=44744305|dupnone/out=2058117218|empty/out=3865464101|file-identity/cnt-empty=3504554043|file-identity/cnt-mut=1123651361|file-identity/empty=EMPTY|file-identity/out-empty=EMPTY|file-identity/pool=1752088521|file-identity/rank-nrfnr.awk=4062769569|file-identity/rank.awk=2321255770|floor/out=1752088521|guards/absent.log=1657602827|guards/dir.log=2497213199|guards/pool=1752088521|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/cnt=1552948430|mut-member/out=882446226|mut-member/pool=882446226|mut-member/q=2173392615|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace-empty/seed=2566848085|prunerace/out=1567885012|prunerace/seed=2566848085|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out-junk=3228248317|sat/out-sat=3190065530|sat/out=4021605358|skipwhy-empty/out=4267086434|skipwhy-priority-unreadable/out=629343410|skipwhy-severity-uncounted/out=1841947048|skipwhy-severity/out=4160314136|skipwhy-unranked/out=257027211|skipwhy-unset/out=2226175176|tail/out=2809272230|wit-parse/assign.out=EMPTY|wit-parse/decoy.out=3004694436|wit-parse/forge.out=EMPTY|wit-parse/midline.out=EMPTY|wit-parse/other.out=2943144574|wit-parse/printf.out=1142707169|wit-parse/real.out=3673505914|witness/out=4021605358'
-_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1078605162 1102770011 1123651361 1142707169 1151312335 1187418021 1228480870 1296039546 132483589 1334011946 1334591389 1334787953 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1506249713 1531456368 1552948430 1567885012 1657602827 1686707371 1752088521 1806709770 1840396944 1841947048 1943905615 1954371651 2014644524 2058117218 2163807204 2173392615 2215093811 2226175176 2241773645 2321255770 2380626246 2467777652 2497213199 2561788194 2566848085 257027211 2620396432 2632535107 263720862 2645416213 273058056 2755054736 2763562739 2793652360 2809272230 2810210006 286439349 2928806463 2928854713 2943144574 3004694436 3025506656 3086333297 3104242257 3123583493 3178247719 3190065530 3228248317 3325294582 3363606256 3407422058 3504554043 3512885538 3598440741 3673505914 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4062769569 4092273942 4111658287 4160314136 4222849383 4245042416 4253467874 4267086434 4272221706 4292339760 44744305 468363226 527657959 55288939 605356615 629343410 632953760 657909655 882446226 90999151 964254667 982395898 EMPTY'
+_out_pin='arm-clip-devnull/out=132483589|arm-clip-dir/out=132483589|arm-clip-head/out-head=1078605162|arm-clip-nonl/out=3407422058|arm-clip-nul/out=4222849383|arm-clip-nulmid/out=4222849383|arm-clip-trshim/out=1506249713|arm-clip/out-unranked=3407422058|arm-clip/out-unrec=4222849383|arm-drained-clip-mut/out=1359919113|arm-drained-clip/out=273058056|arm-refuse-clip/out=1503384811|arm-refuse-mv/out=3598440741|arm-refuse-rowset/out=1567885012|arm-refuse-rowset/seed=2566848085|arm-unranked-absent-mut/out=3696837072|arm-unranked-absent/out=1943905615|arm14-head/out=55288939|arm14-severity/out=1039870059|arm14-totals/out=2163807204|arm14-uncounted/out=1336462602|arm14-warn/out=3086333297|arm14mut-head/out=1296039546|arm14mut-severity/out=2810210006|arm14mut-totals/out=10164873|arm14mut-uncounted/out=2763562739|arm14mut-warn/out=3325294582|count-bad-totals/out=1102770011|count-bad/out=3104242257|count-drained/out=273058056|count-foreign-head/out=3025506656|count-foreign-zero/out=1053290514|count-gone/out=3104242257|count-good/out=1017492502|count-identical/out=4111658287|count-satcount-gone-mut/out=3104242257|count-satcount-gone/out=1187418021|count-satcount-head-mut/out=3025506656|count-satcount-head/out=657909655|count-satcount-totals-mut/out=1102770011|count-satcount-totals/out=1954371651|count-state-bad-totals/out=1102770011|count-state-drained/out=273058056|count-state-foreign-head/out=3025506656|count-state-foreign-zero/out=1053290514|count-state-gone/out=3104242257|count-state-good/out=1017492502|count-state-none/out=1943905615|count-state-rev/out=3123583493|countguard/cnt-good=527657959|countguard/out-bad=44744305|countguard/out-good=44744305|countguard/pool=2793652360|countguard/q=44744305|dupnone/out=2058117218|empty/out=3865464101|file-identity/cnt-empty=3504554043|file-identity/cnt-mut=1123651361|file-identity/empty=EMPTY|file-identity/out-empty=EMPTY|file-identity/pool=1752088521|file-identity/rank-nrfnr.awk=4062769569|file-identity/rank.awk=2321255770|floor-a/out=3546509858|floor-b/out=1752088521|guards/absent.log=1657602827|guards/dir.log=2497213199|guards/pool=1752088521|member/out=1400623074|mh-absent/out=4029380213|mh-coerce/out=1460607088|mh-drained/out=964254667|mh-garbage-refused/out=105719062|mh-garbage-rev/out=1840396944|mh-garbage-unranked/out=2380626246|mh-garbage/out=1151312335|mh-hw-dir-priority-unreadable/out=2561788194|mh-hw-dir-severity/out=4029380213|mh-hw-drained-priority-unreadable/out=468363226|mh-hw-drained-severity/out=964254667|mh-hw-garbage-priority-unreadable/out=105719062|mh-hw-garbage-severity/out=1151312335|mh-hw-wcfailg-priority-unreadable/out=2467777652|mh-hw-wcfailg-severity/out=632953760|mh-revert/out=605356615|mh-rows/out=1686707371|mh-unranked-judged/out=4272221706|mh-unranked-own/out=2620396432|mh-unranked/out=3363606256|mh-unreadable/out=4029380213|mh-wcfail/out=1334011946|mh-wcfail2/out=1334011946|mh-wcfailg/out=632953760|mh-witrev/out=2241773645|mhr-real-refused/out=2215093811|mhr-real-unranked/out=1531456368|mut-droptail/out=2645416213|mut-member/cnt=1552948430|mut-member/out=882446226|mut-member/pool=882446226|mut-member/q=2173392615|mut-nocount/out=4056022816|nonnum/out=1407898517|nonnum2/out=3178247719|nopool/out=4092273942|norank/out=2755054736|norank2/out=2755054736|pfw-awkfail/out=1334591389|pfw-mvfail/out=2928806463|pfw-unread/out=982395898|poolguards-mut/out=2928854713|poolguards/dir.log=2014644524|productfollow/log2=2632535107|productfollow/log3=1334787953|productfollow/log4=2810210006|productfollow/log5=1806709770|productfollow/log=1228480870|prunerace-empty/out=1567885012|prunerace-empty/seed=2566848085|prunerace/out=1567885012|prunerace/seed=2566848085|rank-prefix/out=EMPTY|rank/out=4021605358|ranked/out=4245042416|rankfmt/out=EMPTY|rankfmt2/out=EMPTY|rowset/out=3718680511|sa-absent/out=1025215466|sa-coerce/out=3512885538|sa-dir/out=1025215466|sa-drained/out=4253467874|sa-garbage/out=90999151|sa-headkey/out=4292339760|sa-unreadable-depth/out=4292339760|sa-wcfail/out=263720862|sa-withhead/out=286439349|sat-mut/out=4021605358|sat/out-junk=3228248317|sat/out-sat=3190065530|sat/out=4021605358|skipwhy-empty/out=4267086434|skipwhy-priority-unreadable/out=629343410|skipwhy-severity-uncounted/out=1841947048|skipwhy-severity/out=4160314136|skipwhy-unranked/out=257027211|skipwhy-unset/out=2226175176|tail/out=2809272230|wit-parse/assign.out=EMPTY|wit-parse/decoy.out=3004694436|wit-parse/forge.out=EMPTY|wit-parse/midline.out=EMPTY|wit-parse/other.out=2943144574|wit-parse/printf.out=1142707169|wit-parse/real.out=3673505914|witness/out=4021605358'
+_out_distinct_pin='10164873 1017492502 1025215466 1039870059 1053290514 105719062 1078605162 1102770011 1123651361 1142707169 1151312335 1187418021 1228480870 1296039546 132483589 1334011946 1334591389 1334787953 1336462602 1359919113 1400623074 1407898517 1460607088 1503384811 1506249713 1531456368 1552948430 1567885012 1657602827 1686707371 1752088521 1806709770 1840396944 1841947048 1943905615 1954371651 2014644524 2058117218 2163807204 2173392615 2215093811 2226175176 2241773645 2321255770 2380626246 2467777652 2497213199 2561788194 2566848085 257027211 2620396432 2632535107 263720862 2645416213 273058056 2755054736 2763562739 2793652360 2809272230 2810210006 286439349 2928806463 2928854713 2943144574 3004694436 3025506656 3086333297 3104242257 3123583493 3178247719 3190065530 3228248317 3325294582 3363606256 3407422058 3504554043 3512885538 3546509858 3598440741 3673505914 3696837072 3718680511 3865464101 4021605358 4029380213 4056022816 4062769569 4092273942 4111658287 4160314136 4222849383 4245042416 4253467874 4267086434 4272221706 4292339760 44744305 468363226 527657959 55288939 605356615 629343410 632953760 657909655 882446226 90999151 964254667 982395898 EMPTY'
 _out_got="$(_out_map)"
 _out_distinct="$(_out_unique)"
 if [ "${RANK_QUEUE_PIN_REPORT:-0}" = "1" ]; then
@@ -3168,10 +3176,17 @@ if [ -z "$_out_got" ] || [ -z "$_out_distinct" ]; then
 elif [ "$_out_distinct" != "$_out_distinct_pin" ]; then
   _want="$(printf '%s\n' $_out_distinct_pin | wc -l | tr -d ' ')"; _have="$(printf '%s\n' $_out_distinct | wc -l | tr -d ' ')"
   rc=1; echo "      the set of DISTINCT operator outputs changed ($_want pinned, $_have now) — prose reached the operator:"
-  for _oc in $(printf '%s' "$_out_got" | cut -d= -f1); do
-    _oc_crc="$(printf '%s' "$_out_got" | grep -m1 "^$_oc=" | cut -d= -f2)"
-    printf '%s\n' $_out_distinct_pin | grep -qx "$_oc_crc" || echo "        capture $_oc emits an output no pinned case produces: $(_out_show "$_oc")"
-  done
+  # ⛔ THE SAME TREATMENT THE OTHER TWO LOOPS GOT (review P3, cycle 80). This one kept the old shape — unquoted word
+  # splitting of the keys, `cut -d= -f1` (which truncates a `=`-bearing name), and a REGEX `grep -m1 "^$_oc="` (a
+  # glob or `[` in a name became a pattern). Measured: with `rank/late` and `rank/late=1` both present it named
+  # `rank/late` TWICE and never named the second capture; with `$TMP/late case/out` it printed
+  # `capture late … <no such capture: late>` and `capture case/out …`.
+  while IFS= read -r _oc; do
+    _oc_crc="$(printf '%s\n' "$_out_got" | awk -v p="$_oc=" 'index($0,p)==1 { print substr($0, length(p)+1); exit }')"
+    printf '%s\n' $_out_distinct_pin | grep -qxF -- "$_oc_crc" || echo "        capture $_oc emits an output no pinned case produces: $(_out_show "$_oc")"
+  done <<EOF
+$(printf '%s\n' "$_out_got" | sed 's/=[^=]*$//' | LC_ALL=C sort -u)
+EOF
 else
   # ⛔ THE ORDER-ONLY CASE IS A SEPARATE VERDICT, AND ONLY A DIFFERING MAP MAY CLAIM A CHANGE (review P3, cycle 74).
   # The previous shape put the order-only diagnostic and the "operator output changed:" header on the SAME branch,
@@ -3327,7 +3342,7 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # this check NEXT TO the first pin — 113 lines before the tally — so a capture added between it and the end was still
 # ungraded (measured: `$TMP/late-case/out` before the tally → 177/0), and its exclusion filter could never match
 # because `_out_map` emits `key=crc` while the filter required the whole line to be `key`. Both are fixed here: the
-# check runs LAST, and the two declared witness captures are set aside by KEY PREFIX (`^…/out=`).
+# check runs LAST, and the two declared witness captures are excluded by EXACT KEY (anchored at the CRC field, below).
 # ⛔ THE EXCLUSION IS BY EXACT KEY, WITH THE BOUNDARY AT THE CRC (review P3, cycle 79). A KEY PREFIX let a file named
 # `out=CLAIM` inside a witness dir ride through the only check that can see it (measured: 177/0). A map line is
 # `<case>/<file>=<crc>` with `<crc>` digits or `EMPTY`, so anchoring on `=(EMPTY|[0-9]+)$` excludes exactly the two
