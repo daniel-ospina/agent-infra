@@ -948,13 +948,16 @@ ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
 # shape production cannot emit. What DOES refuse it is the shared-cooldown layer in
 # `scripts/gh-shim/gh:1874`, and this is that layer's own wording.
 mk_case gh_budget
-# ⛔ THE FIXTURE IS THE SHIM'S OWN LINE, BYTES AND ALL (#3701 review round 3, P2 note 1). It used to be
-# a hand-transcribed COPY with ASCII hyphens where the shim writes em dashes — 240 bytes against the
-# real 244 — and those 4 bytes are part of where the beat's cut lands, so a byte budget measured
-# against the copy is measured against the wrong string. Derived here from the shipped source, so the
-# fixture cannot drift from the wording it calls verbatim.
+# ⛔ THE FIXTURE IS THE SHIM'S OWN STDERR LINE, BYTES AND ALL (#3701 review rounds 3 and 6). It used
+# to be a hand-transcribed COPY with ASCII hyphens where the shim writes em dashes — 240 bytes against
+# the real 244 — and those 4 bytes are part of where the beat's cut lands, so a byte budget measured
+# against the copy is measured against the wrong string. It also stopped short of what actually reaches
+# stderr: `gate_note` (`scripts/gh-shim/gh:679`) writes `gh-gate: %s`, so the line the probe captures is
+# 253 bytes, not the 244 of the note alone. Both halves are derived and prefixed here, so the fixture
+# cannot drift from — and is not 9 bytes short of — the bytes it calls verbatim.
 SHIM_NOTE="$(grep -m1 '^ *gate_note "gh-contended' "$HERE/../../scripts/gh-shim/gh" \
   | sed -e 's/^ *gate_note "//' -e 's/"$//' -e 's/\${WAIT_BUDGET_MS}/120000/')"
+SHIM_LINE="gh-gate: $SHIM_NOTE"
 case "$SHIM_NOTE" in
   *'gh-contended'*) SHIM_NOTE_NOTE='' ;;
   *) SHIM_NOTE_NOTE='the shim no longer emits a gh-contended note at this line' ;;
@@ -963,9 +966,9 @@ case "${SHIM_NOTE:-}" in
   *'${'*) SHIM_NOTE_NOTE='the derived line still carries an unexpanded shell variable' ;;
 esac
 [ -z "${SHIM_NOTE_NOTE:-}" ] \
-  && ok "(g) the stub's note is the SHIM's own line, derived (${#SHIM_NOTE} chars)" \
+  && ok "(g) the stub's stderr line is the SHIM's own, derived (note ${#SHIM_NOTE}, line ${#SHIM_LINE} chars)" \
   || bad "(g) the shim's gh-contended note could not be derived — ${SHIM_NOTE_NOTE} (a hand-typed copy is what this row exists to stop)"
-mk_gh_budget_stub "$D" 75 "$SHIM_NOTE"
+mk_gh_budget_stub "$D" 75 "$SHIM_LINE"
 rp "$D"
 G_WHY="$(rec why)"
 ck "(g) a locally-refused gh precondition is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
@@ -1086,7 +1089,7 @@ if [ -f "$LOOP" ]; then
 fi
 if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut -c1-400' "$BRIEF"; then
   mk_case gh_beat
-  mk_gh_budget_stub "$D" 75 "$SHIM_NOTE"
+  mk_gh_budget_stub "$D" 75 "$SHIM_LINE"
   rp "$D"
   GBEAT_WHY="$(rec why)"
   # The REAL renderer, over the REAL record — not a re-implementation of the cut. ⛔ THE SNAPSHOT IS THE
@@ -1098,22 +1101,23 @@ if [ -s "$BRIEF" ] && grep -q '^refresh_cause_brief()' "$BRIEF" && grep -q 'cut 
   ck "(g7) …and still says WHICH question was asked, uncut" \
      "$(case "$GBEAT" in *'question=can the stored credential answer at all (gh api rate_limit, source='*) echo 0 ;; *) echo 1 ;; esac)"
   # ⛔ NON-VACUITY, AND THE REASON THIS ARM IS NOT A TAUTOLOGY: the cut must GENUINELY HAVE FIRED, and the
-  # row above must not be passing on a clause short enough to fit whole. The beat loses the clause's
-  # trailing "no candidate can be judged" sentence when the cut fires, so its absence IS the proof.
-  # ⛔ NOTE THE COUPLING (review round 4, observation): this row is only reachable while the shim's note
-  # stays over 85 bytes, which is what makes the cut land in the EVIDENCE (92 bytes of evidence room
-  # minus the 7 `rc=75: ` spends). If the shim ever shortens its note below that, the cut legitimately
-  # stops severing the evidence and THIS row reds — with a message about truncation — while the real
-  # cause is fixture drift, so the message names that possibility too.
-  ck "(g7) …with the cut genuinely FIRED (the clause's own tail is outside the window — if this reds, check whether the shim's note was shortened rather than assuming the ordering regressed)" \
-     "$(case "$GBEAT" in *'no candidate can be judged from this box'*) echo 1 ;; *) echo 0 ;; esac)"
+  # two rows above must not be passing on a clause short enough to fit whole. The test is a BYTE
+  # COMPARISON, not a substring: an earlier cut of this row inferred "fired" from the absence of the
+  # clause's trailing phrase, which only goes absent once the cut has eaten ~41 bytes, so the row stayed
+  # green long after the cut had started — the tripwire and the thing it claimed to measure were not the
+  # same event (#3701 review round 6, P2).
+  ck "(g7) …with the cut genuinely FIRED (why=… exceeds the 400-byte window)" \
+     "$([ "$(printf '%s' "$GBEAT_WHY" | wc -c)" -gt 400 ]; echo $?)"
   # ⛔ AND THE CUT LANDS IN THE EVIDENCE — the assertion is the PAIR, so neither half can pass vacuously:
   # the beat KEEPS the evidence's head and LOSES its tail, while the RECORD keeps both.
   ck "(g7) …and the cut lands INSIDE the evidence (its head survives: the layer names itself)" \
-     "$(case "$GBEAT" in *'evidence=rc=75: gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
+     "$(case "$GBEAT" in *'evidence=rc=75: gh-gate: gh-contended'*) echo 0 ;; *) echo 1 ;; esac)"
   ck "(g7) …proving truncation fired: the note's TAIL is outside the beat window" \
      "$(case "$GBEAT" in *'returning rc=75 rather than hanging'*) echo 1 ;; *) echo 0 ;; esac)"
-  ck "(g7) …while the RECORD still carries the note WHOLE, so nothing is lost where it is read less often" \
+  # ⛔ THIS IS THE FIXTURE-DRIFT TRIPWIRE, so its message says so. It is the only row that pins the note's
+  # bytes verbatim: if the shim REWORDS its note, this reds while the rows above stay green — which would
+  # otherwise read as "the fix broke", when the real cause is that the fixture's source moved.
+  ck "(g7) …while the RECORD still carries the note WHOLE, so nothing is lost where it is read less often (if THIS reds, check whether scripts/gh-shim/gh reworded its note before assuming the ordering regressed)" \
      "$(case "$GBEAT_WHY" in *'returning rc=75 rather than hanging into the caller'"'"'s timeout'*) echo 0 ;; *) echo 1 ;; esac)"
 else
   bad "(g7) the real refresh_cause_brief could not be extracted from $LOOP — the beat's cut is ungraded"
