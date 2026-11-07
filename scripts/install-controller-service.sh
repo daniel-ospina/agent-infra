@@ -426,11 +426,33 @@ primary_clone_root() {
     return 1
 }
 
+# primary_clone_on_lane_branch <dir> — prints the branch name when <dir> is a primary clone checked out on a
+# branch that is NOT the clone's default. Empty output + rc 1 when it is on the default (or detached).
+# ⛔ BEING A CLONE IS NOT BEING MERGED (cycle-6 P2, MEASURED). `primary_clone_root` is git's main-vs-linked
+# arithmetic only — it never asks the branch question that `linked_worktree_root` applies to linked
+# worktrees — so a lane that isolates by CLONING instead of `git worktree add` was admitted under a transient
+# root, and `cloud-cell-bringup.sh` injects `AGENT_INFRA_PATH=$LAYER_ROOT` itself, so the declaration could be
+# the caller's own clone. Reproduced: `/tmp/<fixture>/lane-clone` on `master`-less `lane/x` with
+# `AGENT_INFRA_PATH` naming it rendered an ExecStart into it, rc=0. A clone at the DEFAULT branch is a
+# deployment (`/tmp/cell-ai` on `main` must keep working); a clone on any other branch is unmerged work a
+# lane removes, which is the rule this guard already states in words for every other shape.
+primary_clone_on_lane_branch() {
+    local b def
+    b="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short HEAD 2>/dev/null)" || return 1
+    [ -n "$b" ] || return 1                     # detached: no branch to be unmerged at
+    case "$b" in main|master) return 1 ;; esac
+    def="$("${GIT_SCRUB[@]}" git -C "${1:-}" symbolic-ref -q --short refs/remotes/origin/HEAD 2>/dev/null)" || def=""
+    def="${def#origin/}"
+    [ -n "$def" ] && [ "$b" = "$def" ] && return 1
+    printf '%s\n' "$b"
+    return 0
+}
+
 # scratch_supervisor_reason <resolved supervisor> — prints WHY this path is not boot-durable, or nothing
 # when it is. Takes the RESOLVED path: a symlink is a spelling, and `ln -s /tmp/wt-x $HOME/sup` must be
 # refused for the same reason the #2666 unit-dir guard resolves before it grades.
 scratch_supervisor_reason() {
-    local p="${1:-}" d root="" declared="" shape="" pin="" tree="" base="" held="" pin_ok=0 name_ok=0
+    local p="${1:-}" d root="" declared="" shape="" pin="" tree="" base="" held="" b="" pin_ok=0 name_ok=0
     shape="$(lane_scratch_shape "$p")"
     if [ -n "$shape" ]; then
         printf 'it matches the lane-scratch shape %s — a checkout a lane removes when it ends, whose branch is merged nowhere' "$shape"
@@ -545,7 +567,14 @@ scratch_supervisor_reason() {
         case "$d" in "$CANON_UNRESOLVED"*) continue ;; esac
         path_under "$p" "$d" || continue
         if [ "$d" = "$ch" ] || [ "$d" = "$hm" ]; then declared="$d"; break; fi
-        if [ -z "$(transient_root_of "$d")" ] || primary_clone_root "$d"; then declared="$d"; break; fi
+        if [ -z "$(transient_root_of "$d")" ] || { primary_clone_root "$d" && ! primary_clone_on_lane_branch "$d" >/dev/null; }; then declared="$d"; break; fi
+        # ⛔ A CLONE ON AN UNMERGED BRANCH IS A LANE CHECKOUT (cycle-6 P2, MEASURED — see the helper). This is
+        # the one shape the branch rule was not applied to, and the caller can make the declaration itself.
+        if b="$(primary_clone_on_lane_branch "$d")" && [ -n "$b" ]; then
+            printf 'it is under %s, and the root that declares it is a PRIMARY git clone checked out on the BRANCH %s — a clone at the default branch is a deployment, a clone on any other branch is unmerged work a lane removes (a lane that isolates by cloning instead of `git worktree add` lands here), and being a clone is not being merged' \
+                "$root" "$b"
+            return 0
+        fi
     done
     [ -z "$declared" ] || return 1
     printf 'it is under %s, which a reclaim or a tmp cleaner removes (systemd-tmpfiles --clean drops /tmp entries once they age out of this box'\''s window — 30 days on the fleet'\''s Ubuntu/systemd-255 image, 10 on others), and none of the deployment roots this box declares ACCEPTS it — a root may declare a temporary path only when it is itself durable or a primary git clone (CELL_HOME=%s, HOME=%s%s)' \
@@ -719,6 +748,16 @@ supervisor_pin() {
         fi
     fi
     case "$sha" in ''|*[!0-9a-f]*) sha="unknown" ;; esac
+    # ⛔ THE DERIVED `<repo>` IS CHARACTER-GRADED TOO (cycle-6 P3, MEASURED — a FALSE PASS in the pin this PR
+    # adds). The reasoning a few lines above holds for `--show-toplevel`, which is always an ANCESTOR of the
+    # already character-checked supervisor path — it does NOT hold for the `--absolute-git-dir` fallback, which
+    # can answer a path outside the tree (a `.git` pointer at a bare gitdir). Measured:
+    # `SUPERVISOR_PIN=[/tmp/<fixture>/bare dir.git@unknown]` rendered as
+    # `Environment=ORCH_SUPERVISOR_PIN=/tmp/<fixture>/bare dir.git@unknown`, which systemd drops as an invalid
+    # assignment — while `verify_unit`'s `grep -qxF` matched the RAW TEXT and passed. So the unit ships with no
+    # pin and the gate that exists to notice says OK. The pin is an OBSERVATION, never a gate, so degrading it
+    # to `unknown@unknown` costs nothing and keeps the diagnostic honest.
+    case "$repo" in *[[:space:]]*|*'"'*|*"'"*|*\\*|*%*|*'$'*) repo="" ;; esac
     [ -n "$repo" ] || repo="unknown"
     SUPERVISOR_PIN="${repo}@${sha}"
     return 0
