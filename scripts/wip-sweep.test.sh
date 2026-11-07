@@ -1137,6 +1137,39 @@ has "$O_P" 'NEVER enumerated and NEVER swept' \
   && ok "S7g the refusal says the omitted worktrees were never swept, so the reader is not told 'unknown' without a reason" \
   || bad "S7g the refusal does not name what was missed: $O_P"
 
+# ⛔ S8 — THE INVERSE FALSE POSITIVE: DEBRIS IS NOT AN OMITTED WORKTREE (#3588 review, cycle 3).
+# A `git worktree add` killed between `mkdir(.git/worktrees/<name>)` and the `gitdir` write leaves a
+# directory that is not a registration at all, and NOTHING prunes it. Counting every directory made the
+# guard report a COMPLETE listing as PARTIAL, permanently — and on the quiesce path that became a false
+# "the work is LOST" FATAL over work that WAS archived. A guard that cries loss over nothing trains
+# operators to disbelieve the one line that must always be believed, so the debris shape needs its own
+# arm: without it, a future "count everything" edit reds nothing.
+mk_fixture debris fix/3485-debris || { echo "x fixture failed (debris)"; exit 1; }
+DB_REPO="$T/debris/wt"
+mkdir -p "$DB_REPO/.git/worktrees/leftover-empty"                 # the empty dir a killed add leaves
+mkdir -p "$DB_REPO/.git/worktrees/leftover-locked"                # …and the `locked`-only shape
+: > "$DB_REPO/.git/worktrees/leftover-locked/locked"
+O_D="$(WIP_SWEEP_STATE_DIR="$T/state-debris" bash "$SW" --apply --repo "$DB_REPO" 2>&1)"; RC_D=$?
+[ "$RC_D" -eq 0 ] \
+  && ok "S8a debris admin dirs do NOT make a COMPLETE listing read as partial (rc=0)" \
+  || bad "S8a two debris dirs made a healthy, fully-listed repo escalate rc=$RC_D — a permanent false block that calls archived work LOST: $O_D"
+grep -qx 'status=ok' "$T/state-debris/wip-sweep.status" 2>/dev/null \
+  && ok "S8b …and the pass record says ok, so no reader is told a human must look" \
+  || bad "S8b the record says $(sed -n 's/^status=//p' "$T/state-debris/wip-sweep.status" 2>/dev/null)"
+# ⛔ S8c — the TRUE positive must survive the debris arm: debris present AND a real omission must still
+# escalate. Without this, S8a could be satisfied by deleting the guard entirely.
+mk_fixture debris2 fix/3485-debris2 || { echo "x fixture failed (debris2)"; exit 1; }
+DB2_REPO="$T/debris2/wt"
+git -C "$DB2_REPO" worktree add -q "$T/debris2/w2" -b wip-debris2-b 2>/dev/null \
+  || { echo "x could not add a linked worktree (debris2)"; exit 1; }
+printf 'precious\n' > "$T/debris2/w2/precious.txt"
+mkdir -p "$DB2_REPO/.git/worktrees/leftover-empty"
+rm -f "$DB2_REPO/.git/worktrees/w2/gitdir"          # the real omission, alongside the debris
+O_D2="$(WIP_SWEEP_STATE_DIR="$T/state-debris2" bash "$SW" --apply --repo "$DB2_REPO" 2>&1)"; RC_D2=$?
+[ "$RC_D2" -eq 3 ] \
+  && ok "S8c debris does NOT mask a real omission — the damaged registration still FAILS the pass (exit 3)" \
+  || bad "S8c a real omission was excused because debris was also present (rc=$RC_D2, want 3): $O_D2"
+
 echo
 echo "── summary ──"
 echo "  PASS=$PASS FAIL=$FAIL SKIP=$SKIP"

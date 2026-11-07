@@ -907,7 +907,12 @@ sweep_repo() {
     # One-sided ON PURPOSE: only a listing BELOW the expectation escalates, so a future git that lists
     # more records than it holds admin dirs can never false-block a sweep that was complete.
     local admin_n=0 common="" wdir=""
-    common="$(git -C "$repo" rev-parse --git-common-dir 2>/dev/null)" || common=""
+    # ⛔ BOUNDED, LIKE EVERY OTHER SUBPROCESS HERE (#3588 review, cycle 3). This was the ONLY unwrapped git
+    # call in the file, so a degraded filesystem could hang the pass on the path that runs BEFORE the disk
+    # stops existing, breaking the documented `WIP_SWEEP_BUDGET` guarantee an operator sizes a reclaim
+    # timeout against. A timeout is not "assume complete": it lands in the same `worktree-list-unverifiable`
+    # escalation as an unresolvable common dir.
+    common="$(tb_timeout "$STATUS_TIMEOUT" git -C "$repo" rev-parse --git-common-dir 2>/dev/null)" || common=""
     case "$common" in
       '') err "UNMEASURED — could not resolve git's common dir for '$repo', so the completeness of its worktree listing cannot be verified. This repo is not clean, it is unknown."
           N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
@@ -918,7 +923,21 @@ sweep_repo() {
     esac
     # A plain glob, not `find`: this path is under `.git/`, maxdepth 1, and a glob cannot descend into
     # anything. With no match the pattern stays literal and the `-d` test fails, so 0 needs no nullglob.
-    for wdir in "$common/worktrees"/*/; do [ -d "$wdir" ] && admin_n=$((admin_n + 1)); done
+    # ⛔ COUNT REGISTRATIONS, NOT DIRECTORIES (#3588 review, cycle 3). Counting every directory made the
+    # guard FALSE-BLOCK a repo whose listing was COMPLETE: a `git worktree add` killed between
+    # `mkdir(.git/worktrees/<name>)` and the `gitdir` write leaves debris that is not a registration at
+    # all, and nothing prunes it — so the repo would answer `status=failed`/rc=3 PERMANENTLY and the
+    # quiesce would turn that into a false "work is NOT fully archived / LOST" FATAL over work that WAS
+    # archived. MEASURED: a healthy 1-worktree repo plus `mkdir .git/worktrees/leftover-empty` reported
+    # "the listing is PARTIAL … NEVER enumerated and NEVER swept", which is simply false. A real
+    # registration carries `gitdir` (git writes mkdir -> locked -> gitdir -> HEAD -> commondir); the
+    # DAMAGED shape this guard exists for loses `gitdir` but keeps `HEAD`+`commondir`, so testing both
+    # spellings keeps the true positive and drops the debris. Both were measured, not assumed.
+    for wdir in "$common/worktrees"/*/; do
+      [ -d "$wdir" ] || continue
+      [ -f "$wdir/gitdir" ] || { [ -f "$wdir/HEAD" ] && [ -f "$wdir/commondir" ]; } || continue
+      admin_n=$((admin_n + 1))
+    done
     if [ "$listed" -lt $((admin_n + 1)) ]; then
       err "UNMEASURED — 'git worktree list' named $listed worktree(s) for '$repo' but git holds $admin_n admin record(s), so the listing is PARTIAL: the worktree(s) it omitted were NEVER enumerated and NEVER swept. This repo is not clean, it is unknown."
       N_UNMEASURED=$((N_UNMEASURED + 1)); FAILED=1
