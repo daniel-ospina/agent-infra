@@ -459,11 +459,14 @@ fi
 # is not, and is farmed ahead of its caller (see below). No per-producer caller map is kept here on
 # purpose: every line-numbered edge this paragraph used to carry had already drifted (:238 -> :329 by
 # 2026-10-16), and the gate derives and pins the real edges on every run. Read the gate's
-# `DECLARED-*` / `SUMMARY:` lines, not this comment, for the current population. One producer it
-# cannot see is a NAMED residual, not a blank spot: `cloud-cell-supervisor.sh` is exec'd by the farmed
-# `cloud-cell-quiesce.sh` through a variable-held prefix, so it is in no array and a fresh farm gets the
-# consumer without it (the quiesce then falls back to `supervisor: <none found>`) — #1938 owns whether
-# it is delivered or stays cell-only.
+# `DECLARED-*` / `SUMMARY:` lines, not this comment, for the current population. `cloud-cell-supervisor.sh`
+# USED TO BE the one NAMED residual here: `cloud-cell-quiesce.sh` execs it through a variable-held
+# prefix, so the derivation could not see that edge, and a fresh farm got the consumer without it.
+# ⛔ THAT RESIDUAL IS CLOSED (#1938): the supervisor is FARMED below in `fleet_srcs`, beside the
+# `cloud-cell-quiesce.sh` that calls it. It reaches the derived population through a DIFFERENT exec
+# site — `install-controller-service.sh`'s `$(pwd)/cloud-cell-supervisor.sh` — which is why pinning it
+# works even though the quiesce leg stays invisible to the scan. The quiesce's own fallback
+# (`supervisor: <none found>`) is therefore no longer the only outcome on a fresh farm.
 #
 # ⛔ ONE CONSTRAINT HERE IS NOT DERIVED AND MUST BE STATED: `pr-doctor.py` is listed BEFORE
 # `objective.py` (#1872). The driver imports the classifier by path and `SystemExit`s when it finds
@@ -656,12 +659,20 @@ fi
 # whose target does not resolve — so flattening the farm would leave both units unrunnable (exit 1,
 # nothing installed). The copy leg creates the parent directory for exactly this reason.
 # ⚠️ NOT because of `watchdog-loop.sh`'s `$SELF_DIR/../cloud-cell-supervisor.sh` fallback. An earlier
-# draft of this comment claimed the nesting preserved that sibling, and it was FALSE:
-# `cloud-cell-supervisor.sh` is in NO farm array (this file's own "named residual" paragraph above
-# says so and names #1938 as its owner), so the fallback resolves `$SELF_DIR/../cloud-cell-supervisor.sh`
-# to `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` and finds nothing nested OR flat. A
-# justification nobody re-derived is how a false claim outlives the shape it described (review P2-G
-# of #3413). No line-numbered claim about any OTHER script belongs here for the same reason.
+# draft of this comment claimed the nesting preserved that sibling, and it was FALSE THEN:
+# `cloud-cell-supervisor.sh` was in NO farm array, so the fallback resolved
+# `$SELF_DIR/../cloud-cell-supervisor.sh` to `$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh` and
+# found nothing nested OR flat. A justification nobody re-derived is how a false claim outlives the
+# shape it described (review P2-G of #3413). No line-numbered claim about any OTHER script belongs
+# here for the same reason.
+# ⛔ AND THAT FALLBACK NOW RESOLVES — this is a DECLARED BEHAVIOUR CHANGE of the farm entry, not a
+# side effect to be discovered later. `watchdog-loop.sh` is farmed NESTED, so its `$SELF_DIR` is
+# `$DEST/scripts/orchestrator-harness` and `$SELF_DIR/../cloud-cell-supervisor.sh` is
+# `$DEST/scripts/cloud-cell-supervisor.sh` — the file `fleet_srcs` now writes. The cell arm therefore
+# goes from logging `RESTART-UNAVAILABLE` (nothing to run) to issuing
+# `$sup start` (`RESTART_VERB="$sup start"`), which is the arm's documented purpose; a failure there
+# is reported as `RESTART-FAILED` naming that verb, never `verb=unknown`. The nesting is NOT
+# justified by this fallback — the templates naming the nested path is the whole reason, above.
 # agent-infra#2281 §1 adds pr-doctor-machine.sh: the MACHINE-scoped entry point the
 # `com.tortoise.pr-doctor` unit execs. Before it the unit asserted ONE repo in its argv
 # (`--repo daniel-ospina/tortoise`), so a box running two repos graded exactly one and the second

@@ -1053,7 +1053,7 @@ restart_stack() {
         # holds on every platform, and a cell farm deployed by `cp *.sh` (agent-infra#2041) is exactly
         # where this arm is reached. §8c asserts RESTART-FAILED is ABSENT here too.
         RESTART_REFUSED=1
-        log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no $O/cloud-cell-supervisor.sh and no SUPERVISOR set — nothing was restarted"
+        log_line "verdict=RESTART-UNAVAILABLE"$'\t'"note=no supervisor resolved — looked at \$SUPERVISOR, \$O/cloud-cell-supervisor.sh and \$SELF_DIR/../cloud-cell-supervisor.sh; nothing was restarted"
       fi ;;
   esac
   return "$rc"
