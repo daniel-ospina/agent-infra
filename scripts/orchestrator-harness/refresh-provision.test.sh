@@ -63,6 +63,17 @@
 #   (h4) an origin that NAMES the queue target with a trailing slash is the same repo: it PROCEEDS, so
 #       the cause can never report a "DIFFERENT repo" mismatch it did not measure.
 #
+# #3584 — THE GH PRECONDITION MUST NAME ITSELF IN THE RECORD, one arm each:
+#   (g)  a `gh` whose `api rate_limit` validation read is refused BY THE BUDGET records the specific
+#        precondition AND its evidence (`gh-core-floor remaining=… floor=…`) in `state/refresh-last`'s
+#        `why=`, instead of the old pointer `(the refusal line above names which one)`;
+#   (g2) NON-VACUITY: reverting ONLY the call-site interpolation in a copy puts the pointer back and
+#        drops the budget evidence — so (g) measures the record, not the probe's log line;
+#   (g3) the clause is MEASURED, not constant: a REJECTED credential (HTTP 401) is still rc=3 and is
+#        recorded as rejected, claiming no budget refusal;
+#   (g4) rc=75 (`EX_TEMPFAIL` — "refused LOCALLY, nothing was sent", the gh layer's own contract) is
+#        named as budget/throttling off the EXIT CODE, with a stub that writes NOTHING on stderr.
+#
 # HOW. Every arm drives the SHIPPED script inside a sandbox: a real git repo with a real (local, bare)
 # origin and a real `git worktree` scout, so `scout_is_worktree`/`fetch`/`checkout` all run for real
 # and no network is touched. `gh` is a stub, the pre-flight tool is a stub python file TRACKED at
@@ -163,6 +174,25 @@ case "$1 $2" in
             printf 'HTTP/2.0 200 OK\r\ncontent-type: application/json\r\n\r\n%s\n' "$body" ;;
   *" rate_limit"*) printf '%s\n' '{"resources":{"core":{"remaining":4321},"graphql":{"remaining":4000}}}' ;;
   *) printf '[]\n' ;;
+esac
+SH
+  chmod +x "$D/bin/gh"
+}
+
+# mk_gh_budget_stub <case-dir> <rc> <stderr-line> — the same `gh`, answering `auth token` from a
+# STORED credential but REFUSING the `api rate_limit` validation read with the given rc and stderr.
+# This is the shape `gh-limit.py` and `scripts/gh-shim/gh` produce on a box whose CORE pool is inside
+# the reserve: `gh api rate_limit` is exempt from the primary limit, so it is the WINDOW/partition
+# layer that refuses it, and the refusal is a real `gh-limit: gh-core-floor remaining=… floor=…` line
+# (#3584).
+mk_gh_budget_stub() {
+  local D="$1" rc="$2" line="$3"
+  cat > "$D/bin/gh" <<SH
+#!/bin/bash
+case "\$1 \$2" in
+  "auth token") exit 0 ;;
+  *" rate_limit"*) printf '%s\\n' "$line" >&2; exit $rc ;;
+  *) printf '[]\\n' ;;
 esac
 SH
   chmod +x "$D/bin/gh"
@@ -872,6 +902,80 @@ ck "(h3) …and the log makes no #1901 identity claim about it" "$r"
 # the row is not vacuous.
 case "$OUT" in *"unset OR"*) r=1 ;; *) r=0 ;; esac
 ck "(h3) …and offers no 'unset OR' remedy the refusal ignores" "$r"
+
+# ── (g) THE GH PRECONDITION MUST NAME ITSELF IN THE RECORD (#3584) ────────────────────────────────
+# ⛔ THE DEFECT. The call site recorded
+#
+#     why=TRANSIENT: the gh environment precondition refused (the refusal line above names which one) …
+#
+# — a POINTER into the log, written into `state/refresh-last`, which is the artifact `orch-loop.sh`
+# builds `[dispatch] BLOCKED: refresh failed — stage=provision` from and which `.refresh-blocked`
+# quotes as "Reason and evidence". A reader of the RECORD therefore got no cause at all, and the
+# measured case was worse than uninformative: the refusal two log lines above was the BUDGET
+# (`gh-limit: gh-core-floor remaining=312 floor=800 resets_in=7m`), so "refused because quota" and
+# "refused because auth" were indistinguishable in the one sentence an operator reads. That is
+# #3584's own acceptance criterion for the provision stage, and the reason a week of `TRANSIENT`
+# refusals presented with "no visible cause".
+#
+# The rows below drive the SHIPPED pass against a stub whose `gh` refuses exactly that read, and read
+# the RECORD (not the log) — the record is what the beat prints.
+mk_case gh_budget
+mk_gh_budget_stub "$D" 1 \
+  'gh-limit: gh-core-floor remaining=312 floor=800 resets_in=7m - gh rate limit: this is the GitHub BUDGET, not a broken repo, an invalid token, or GitHub being down.'
+rp "$D"
+G_WHY="$(rec why)"
+ck "(g) a budget-refused gh precondition is still TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g) …and the failure is recorded at the provision stage (stage=$(rec stage))" \
+   "$([ "$(rec stage)" = provision ]; echo $?)"
+ck "(g) …and the RECORD names the PRECONDITION, not a pointer to a log line" \
+   "$(case "$G_WHY" in *'refusal line above names which one'*) echo 1 ;; *'question='*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g) …and the record carries the BUDGET EVIDENCE that refused it (remaining=/floor=)" \
+   "$(case "$G_WHY" in *'gh-core-floor remaining=312 floor=800'*) echo 0 ;; *) echo 1 ;; esac)"
+# ⛔ NON-VACUITY: revert ONLY the call-site interpolation in a copy and re-run the SAME fixture. If the
+# record still named the clause, these rows would be measuring the probe's log line rather than what
+# the record carries — i.e. they would be green for a fix that was never applied.
+GM="$T/mut-gh-pointer.sh"
+if mut "$GM" <<'PY'
+import sys
+src = open(sys.argv[1]).read()
+new = src.replace(
+  'provision_fail "$_ghev" "the gh environment precondition refused [${GH_PROBE_CAUSE:-NO CLAUSE RECORDED by gh_probe_env — the specific precondition was not named}] — no candidate can be judged from this box"',
+  'provision_fail "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"')
+assert new != src, "the call-site anchor drifted — nothing was reverted"
+open(sys.argv[2], "w").write(new)
+PY
+then
+  rp "$D" "$GM"; GM_WHY="$(rec why)"
+  ck "(g2) with the call-site interpolation reverted the pass STILL refuses (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+  ck "(g2) …and its record falls back to the POINTER, so (g) is not vacuous" \
+     "$(case "$GM_WHY" in *'refusal line above names which one'*) echo 0 ;; *) echo 1 ;; esac)"
+  ck "(g2) …and the reverted record loses the budget evidence (the row (g) pins is live)" \
+     "$(case "$GM_WHY" in *'gh-core-floor'*) echo 1 ;; *) echo 0 ;; esac)"
+else
+  bad "(g2) the non-vacuity control could not be produced"
+fi
+# ⛔ THE CLAUSE MUST BE THE MEASURED ONE, NOT A CONSTANT. A genuine REJECTED credential must not be
+# recorded as a budget refusal — otherwise "always say quota" would satisfy (g) while telling an
+# operator to wait out a window that will never fix an expired token.
+mk_case gh_401
+mk_gh_budget_stub "$D" 1 'gh: Bad credentials (HTTP 401)'
+rp "$D"
+G401_WHY="$(rec why)"
+ck "(g3) a REJECTED credential is still NOT PROVISIONABLE (rc=$RC, expected 3)" "$([ "$RC" -eq 3 ]; echo $?)"
+ck "(g3) …and the record names the credential as REJECTED, from the evidence it measured" \
+   "$(case "$G401_WHY" in *'REJECTED'*) echo 0 ;; *) echo 1 ;; esac)"
+ck "(g3) …and claims NO budget refusal it did not measure" \
+   "$(case "$G401_WHY" in *'gh-core-floor'*|*'budget'*) echo 1 ;; *) echo 0 ;; esac)"
+# ⛔ rc=75 IS THE GH LAYER'S OWN CONTRACT (`gh-limit.py`'s and `scripts/gh-shim/gh`'s EX_TEMPFAIL —
+# "refused LOCALLY, nothing was sent"). It is read off the EXIT CODE and never off the prose, so this
+# row uses a stub that writes NOTHING on stderr: a text classifier could not name it at all.
+mk_case gh_75
+mk_gh_budget_stub "$D" 75 ''
+rp "$D"
+G75_WHY="$(rec why)"
+ck "(g4) a locally-refused validation read is TRANSIENT (rc=$RC)" "$([ "$RC" -eq 1 ]; echo $?)"
+ck "(g4) …and rc=75 alone is named as budget/throttling, with NO stderr to grep" \
+   "$(case "$G75_WHY" in *'REFUSED LOCALLY'*) echo 0 ;; *) echo 1 ;; esac)"
 
 # ── (h5) THE FOURTH COPY OF THE ACCEPT LIST MUST NOT DRIFT ────────────────────────────────────────
 # ⛔ THE DRIFT THIS PINS WAS LIVE (review of #3188, P2). The predicate has FOUR copies: three here

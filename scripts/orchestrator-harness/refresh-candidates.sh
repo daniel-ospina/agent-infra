@@ -872,6 +872,44 @@ GH_PROBE_ERR=""
 # DEVICE NODE (silently refused for an unprivileged user, destructive for root). One cleanup point, with
 # the guard in it, instead of six call sites that each have to remember.
 gh_probe_err_cleanup() { case "${GH_PROBE_ERR:-}" in ''|/dev/null) return 0 ;; esac; rm -f "$GH_PROBE_ERR" 2>/dev/null || true; }
+# ── WHICH PRECONDITION REFUSED, IN THE RECORD (#3584) ───────────────────────────────────────────
+# ⛔ THE CALL SITE USED TO SAY `the gh environment precondition refused (the refusal line above names
+# which one)`. That sentence is a POINTER, and the artifact `orch-loop.sh` builds its `[dispatch]
+# BLOCKED` line from — `state/refresh-last`'s `why=` — is not the log the pointer points at. Measured
+# on a cell's reported shape: the record read
+#
+#     why=TRANSIENT: the gh environment precondition refused (the refusal line above names which one) …
+#
+# while the refusal two log lines above it was a BUDGET refusal
+# (`gh-limit: gh-core-floor remaining=312 floor=800 resets_in=7m`). So the one sentence an operator
+# reads named neither the precondition nor the budget, and "refused because quota" and "refused
+# because auth" were indistinguishable in the record — the `provision` stage's own acceptance
+# criterion on #3584, and the reason a week of `TRANSIENT` refusals had "no visible cause".
+#
+# WHAT NAMES IT. Every refusing arm sets `GH_PROBE_CAUSE` to the question it asked and the answer it
+# MEASURED, and the call site interpolates it. NO new classifier and NO new gh call: the clause is
+# rendered from evidence the probe has already paid for (`$GH_PROBE_ERR`, the rc) — a budget refusal
+# keeps its own `gh-limit: gh-core-floor remaining=… floor=… resets_in=…` line, so the numbers reach
+# the record with the words that produced them rather than a paraphrase.
+GH_PROBE_CAUSE=""
+# ⛔ ONE LINE, BOUNDED, AND NEVER THE TOKEN. `gh auth token`'s STDOUT is already discarded by
+# `gh_probe_bounded`; this reads STDERR only. The take must not grow the record without limit either:
+# a `--paginate` refusal can replay a whole error body, and `why=` is a single-line key in a file every
+# beat reads — so the first non-empty line, whitespace-collapsed, truncated.
+GH_PROBE_CAUSE_MAX=320
+gh_probe_evidence() {  # <rc> — the measured answer, one line, or a named non-answer
+  local rc="${1:-?}" line
+  line="$( [ -s "${GH_PROBE_ERR:-/dev/null}" ] && awk 'NF{print; exit}' "$GH_PROBE_ERR" 2>/dev/null )"
+  # An EMPTY stderr is NOT "nothing to say": the call failed and wrote no reason, and the rc is then
+  # the whole of the evidence. Say that, instead of rendering an empty parenthetical.
+  if [ -z "$line" ]; then printf 'rc=%s, no stderr written' "$rc"; return 0; fi
+  line="$(printf '%s' "$line" | tr -s '[:space:]' ' ')"
+  # ⛔ AND THE TRUNCATION MARKER IS ASCII. `${line:0:N}` counts CHARACTERS in a UTF-8 locale and BYTES
+  # under `LC_ALL=C` (which a cell's cron-ish environment does provide), so cutting at N can split a
+  # multi-byte sequence and put U+FFFD into a record every beat prints. `...` can never be split.
+  if [ "${#line}" -gt "$GH_PROBE_CAUSE_MAX" ]; then line="${line:0:$GH_PROBE_CAUSE_MAX}..."; fi
+  printf 'rc=%s: %s' "$rc" "$line"
+}
 gh_probe_bounded() { # gh_probe_bounded <secs> <cmd…>; sets GH_PROBE_ERR (stderr of the probe)
   local _s="$1"; shift
   # ⛔ RELEASE THIS FUNCTION'S OWN PREVIOUS PROBE FILE FIRST. Every call mints a NEW `mktemp` path and
@@ -962,7 +1000,9 @@ gh_probe_retry() {
 # 0 = the environment the pre-flight runs in can authenticate; 1 = TRANSIENT; 3 = PERMANENT.
 gh_probe_env() {
   local terr err prc presence=""
+  GH_PROBE_CAUSE=""
   if ! command -v gh >/dev/null 2>&1; then
+    GH_PROBE_CAUSE="answer=NO — gh is not on PATH in this environment; question=is gh on PATH"
     echo "[refresh] NOT PROVISIONABLE: gh is not on PATH — the verdict-deciding surfaces of the collision pre-flight are gh-backed, so no candidate can be judged and a cell on this repo could only MERGE (#1736)"
     return "$EXIT_NOT_PROVISIONABLE"
   fi
@@ -988,6 +1028,7 @@ gh_probe_env() {
     gh_probe_bounded "$GH_PROBE_TIMEOUT" gh auth token; prc=$?
     terr="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
     if gh_probe_timed_out "$prc"; then
+      GH_PROBE_CAUSE="answer=UNKNOWN — the probe did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc), so this is a NON-ANSWER, not an absence and not a rejected credential; question=is a gh credential STORED here (gh auth token)"
       echo "[refresh] TRANSIENT: gh credential PRESENCE UNKNOWN — 'gh auth token' did not answer within ${GH_PROBE_TIMEOUT}s in the environment the pre-flight runs in (HOME=$HOME), so whether a credential is stored here CANNOT BE VERIFIED from this box (rc=$prc). This is NOT 'no credential': a probe that cannot answer is a fact about the probe, not about the credential, and it is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
       printf '%s\n' "$terr" | sed -n '1,2p' | sed 's/^/[refresh]   /'
       echo "[refresh]   fix: put the token in the cell's environment (GH_TOKEN/GITHUB_TOKEN) so presence needs no gh call at all, or raise GH_PROBE_TIMEOUT (now ${GH_PROBE_TIMEOUT}s) if this box's credential store is merely slow; a hung credential helper (gpg/keyring with no tty) is the usual cause"
@@ -995,6 +1036,7 @@ gh_probe_env() {
       return "$EXIT_TRANSIENT"
     fi
     if [ "$prc" -ne 0 ]; then
+      GH_PROBE_CAUSE="answer=NO — nothing is stored for the host gh is configured for ($(gh_probe_evidence "$prc")); question=is a gh credential STORED here (gh auth token)"
       echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
       printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
       echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
@@ -1010,9 +1052,10 @@ gh_probe_env() {
   # TRANSIENT-shaped (the fall-through below is TRANSIENT unless the API answers 401), so it cannot
   # latch anything.
   gh_probe_retry "$GH_PROBE_TIMEOUT" gh api rate_limit; prc=$?
-  [ "$prc" -eq 0 ] && { gh_probe_err_cleanup; return 0; }
+  [ "$prc" -eq 0 ] && { GH_PROBE_CAUSE=""; gh_probe_err_cleanup; return 0; }
   err="$( [ -n "$GH_PROBE_ERR" ] && sed -n '1,4p' "$GH_PROBE_ERR" 2>/dev/null )"
   if gh_probe_timed_out "$prc"; then
+    GH_PROBE_CAUSE="answer=NO — the probe did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc), which is an OUTAGE, not a rejected credential and not a spent budget; question=can the stored credential answer at all (gh api rate_limit, source=$presence)"
     echo "[refresh] TRANSIENT: the gh credential is present (source=$presence) but 'gh api rate_limit' did not answer within ${GH_PROBE_TIMEOUT}s (rc=$prc) in the environment the pre-flight runs in (HOME=$HOME) — a probe that cannot answer is an OUTAGE, not a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736, TOKEN_HANG_FIX)"
     printf '%s\n' "$err" | sed -n '1,2p' | sed 's/^/[refresh]   /'
     gh_probe_err_cleanup
@@ -1031,12 +1074,26 @@ gh_probe_env() {
   # ⚠️ DECLARED RESIDUAL: a credential that GitHub rejects with a 403 is therefore retried
   # indefinitely (loudly, via `FAILED rc=1`) and never writes the permanent marker.
   if grep -q 'HTTP 401' <<<"$err"; then
+    GH_PROBE_CAUSE="answer=NO — GitHub REJECTED it (HTTP 401), which a retry cannot mend; question=is the stored credential ACCEPTED (source=$presence)"
     echo "[refresh] NOT PROVISIONABLE: the gh credential PRESENT for the host gh is configured for (source=$presence) is REJECTED by GitHub (HTTP 401) in the environment the pre-flight runs in (HOME=$HOME) — a retry cannot fix it, and every candidate would be read as a collision (#1736)"
     printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
     echo "[refresh]   fix: re-authenticate gh in THIS home (gh auth login --with-token <token>), then re-run"
     gh_probe_err_cleanup
     return "$EXIT_NOT_PROVISIONABLE"
   fi
+  # ⛔ THE AMBIGUOUS ARM NAMES ITS EVIDENCE, NOT JUST ITS ABSENCES. "the API did not answer with a
+  # 401" describes what was NOT seen; it was TRUE and USELESS — the measured answer was a budget
+  # refusal, and only this variable carries it to `state/refresh-last` (#3584). The rc-75 arm is the
+  # gh layer's own documented contract (EX_TEMPFAIL = "refused LOCALLY, nothing was sent"), read off
+  # the EXIT CODE and never off the prose, so it is named without a text match.
+  # ⛔ THE EVIDENCE COMES FIRST IN THE CLAUSE, DELIBERATELY. `refresh_cause_brief` prints `why=` cut at
+  # 400 characters (origination-funnel.test.sh pins that cut), so a clause built question-first would
+  # push the numbers — the thing this exists to surface — toward the truncation edge on a long stderr
+  # line. Evidence first puts `gh-core-floor remaining=…` around character 110 of the beat's line.
+  case "$prc" in
+    75) GH_PROBE_CAUSE="answer=REFUSED LOCALLY by the gh budget/throttle layer (rc=75 EX_TEMPFAIL — NOTHING was sent): quota/throttling, NOT auth and NOT an outage ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence)" ;;
+    *)  GH_PROBE_CAUSE="answer=NO — the call failed, and this is the evidence it wrote ($(gh_probe_evidence "$prc")); question=can the stored credential answer at all (gh api rate_limit, source=$presence) — read that evidence before calling this auth or an outage" ;;
+  esac
   echo "[refresh] TRANSIENT: a gh credential is PRESENT for the host gh is configured for (source=$presence) but the API did not answer with a 401 in the environment the pre-flight runs in (HOME=$HOME) — treating it as an outage rather than a rejected credential, so this is retried next cycle instead of latching the permanent MERGE-ONLY marker (#1736)"
   printf '%s\n' "$err" | sed -n '1,4p' | sed 's/^/[refresh]   /'
   gh_probe_err_cleanup
@@ -1044,6 +1101,11 @@ gh_probe_env() {
 }
 
 gh_env_verdict() {
+  # `GH_PROBE_CAUSE` is set by every refusing arm and consumed by the CALL SITE below, which is what
+  # puts the specific precondition into `state/refresh-last` (#3584). Clearing it first means an arm
+  # that forgets to name itself reads as "no clause", never as a STALE clause from a previous pass —
+  # a stale flag that records a past state is the defect class this harness keeps paying for.
+  GH_PROBE_CAUSE=""
   # The probe covers the host the pre-flight's own host-LESS calls resolve. The harness's POOL
   # LISTING is a different call — it names `$OR` directly — and it is guarded where it runs: an
   # unreadable listing must not be read as an empty one (see `.pool` in cmd_run).
@@ -2064,7 +2126,15 @@ refresh_record_write running provision 0 \
   "cmd=?"
 # The same environment precondition on the RUN path — and before the scout is provisioned, so a cell
 # that cannot read GitHub refuses in a second instead of after minutes of network work.
-gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused (the refusal line above names which one) — no candidate can be judged from this box"; }
+# ⛔ THE CAUSE NAMES THE PRECONDITION (#3584). This used to read `(the refusal line above names which
+# one)`, which is a pointer into the LOG — while `orch-loop.sh` builds its `[dispatch] BLOCKED` line,
+# and `.refresh-blocked` its "Reason and evidence", from the RECORD this sentence is written into. A
+# pointer in the record names nothing to a reader who has only the record; measured on a cell, the
+# record said "the refusal line above names which one" for a budget refusal
+# (`gh-core-floor remaining=312 floor=800 resets_in=7m`) that the beat never showed. So the probe's own
+# measured clause is interpolated here, and a probe that somehow set none is NAMED as such rather than
+# silently reverting to the pointer.
+gh_env_verdict || { _ghev=$?; provision_fail "$_ghev" "the gh environment precondition refused [${GH_PROBE_CAUSE:-NO CLAUSE RECORDED by gh_probe_env — the specific precondition was not named}] — no candidate can be judged from this box"; }
 
 # ── THE CORE BUDGET IS FINITE AND SHARED — ASK BEFORE YOU SPEND IT (#1736 follow-up) ─────────────
 # MEASURED 2026-10-18 on the live Mac, from consecutive `[refresh]` lines in
