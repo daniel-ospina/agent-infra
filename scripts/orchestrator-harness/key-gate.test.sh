@@ -613,6 +613,20 @@ HRGV1="$(mkhome radius_grant_v1 "$RG_V1_JSON")"
 OUT="$(run_gate "$HRGV1" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
 eqv "${RC:-none}" "0" "3z15y18 a \`/v1\` gateway spelling is the DEFAULT gateway, so the box is not refused (rc=${RC:-none})"
 hasnt "$OUT" "models-json-provider-dropped" "3z15y19 …and never reported as a deleted provider"
+# ⛔ AND A SCHEME-LESS GATEWAY IS NOT THE DEFAULT ONE (round 36, P1, measured): the scheme fallback that stood here
+# made the two arms above pass by treating `radius.pi.dev/v1` as `https://radius.pi.dev` — but `radiusProvider`
+# normalizes only its OWN config URL, while the composed model inherits the RAW `baseUrl` and pi builds the request from
+# it. Measured: `pi -p --provider deepseek --model deepseek-flash` answers `Invalid URL` and exits 1 having sent nothing,
+# so the box is refused, with a reason of its own (the provider is not deleted — the URL cannot be built) and the
+# failure pi actually prints quoted, because a refusal's evidence is what the operator will go and check.
+RG_NOURL_JSON='{"providers":{"deepseek":{"oauth":"radius","baseUrl":"radius.pi.dev/v1","models":[{"id":"deepseek-flash"}]}}}'
+HRGNOURL="$(mkhome radius_grant_nourl "$RG_NOURL_JSON")"
+OUT="$(run_gate "$HRGNOURL" RADIUS_API_KEY=rk)"; RC="$(printf '%s\n' "$OUT" | sed -n 's/^RC=//p' | head -1)"
+ck "3z15y20 a scheme-less gateway \`baseUrl\` REFUSES (rc=${RC:-none}) — pi dies \`Invalid URL\` there" \
+   "$([ "${RC:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "3z15y21 …with its own reason, not the deleted-provider one"
+has "$OUT" "Invalid URL" "3z15y22 …quoting the failure pi actually prints there"
+hasnt "$OUT" 'Unknown provider' "3z15y23 …and NOT quoting a deleted provider, which is a different fact"
 # `composeat <home> <provider> [<model>]` — the compose answer itself, because the DROPPED-provider warning only prints on
 # paths that do not return early: on a refusal the caller returns first, so a `hasnt models-json-provider-dropped` arm cannot
 # fail (measured: the mutant that restored the old order stayed green). The token count is the observable fact.
@@ -1167,6 +1181,14 @@ has "$OUT" "reason=models-json-provider-dropped" "8z42 …with the model-level r
 # \u26d4 AND THE PIN PATH NEEDS THE UNSHIPPED-PROVIDER RULE TOO (round 35, P1, measured): it ignored `no-api`/`no-baseurl`
 # entirely, so `--probe --box-default` printed `check=ok var=MYV` for a `myprov` pin whose bare `pi -p` answers
 # `No API key found for the selected model.` / `Error: Unknown provider "myprov"`.
+# ⛔ AND THE PIN PATH NEEDS THE SCHEME-LESS-GATEWAY REFUSAL TOO (round 36, P1, measured): its own code path would
+# otherwise fall through to the discarded-catalog refusal and quote `Unknown provider`, which is not what pi does here.
+HRGNP="$(mkset pin_radius_grant_nourl "$RG_NOURL_JSON" '{"defaultProvider":"deepseek","defaultModel":"deepseek-flash"}')"
+OUT="$(run_box_at "$HRGNP" "$T/nocwd" RADIUS_API_KEY=rk)"; rc="$(rc_of "$OUT")"
+ck "8z47 a PIN of a granted provider with a scheme-less gateway REFUSES (rc=${rc:-<none>})" \
+   "$([ "${rc:-0}" = "82" ] && echo 0 || echo 1)"
+has "$OUT" "reason=models-json-bad-gateway" "8z48 …with the URL-level reason, not the deleted-provider one"
+hasnt "$OUT" 'Unknown provider' "8z49 …because pi does not delete that provider, it fails to build the URL"
 HMY="$(mkset pin_myprov '{"providers":{"myprov":{"apiKey":"$MYV","models":[{"id":"m1"}]}}}' '{"defaultProvider":"myprov","defaultModel":"m1"}')"
 OUT="$(run_box_at "$HMY" "$T/nocwd" MYV=sk_myv)"; rc="$(rc_of "$OUT")"
 ck "8z43 a PIN of an UNSHIPPED provider with an unbuildable definition is REFUSED (rc=${rc:-<none>})" \

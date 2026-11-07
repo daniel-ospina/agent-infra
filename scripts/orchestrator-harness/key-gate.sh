@@ -1074,8 +1074,17 @@ if sys.argv[2] == "compose":
     # OpenAI-compatible baseUrl uses \u2014 is therefore the DEFAULT one, and the earlier test called it custom: measured,
     # `pi -p` reached the gateway (401) while this gate refused 82 saying the provider was deleted.
     _gw = re.sub(r"/v1/?$", "", _body.get("baseUrl") or "")
-    _gw = _gw if re.match(r"^https?://", _gw, re.I) else "https://" + _gw
-    _grant_default = _grant and _gw.rstrip("/") == "https://radius.pi.dev"
+    # \u26d4 A SCHEME-LESS GATEWAY IS A CERTAIN DEATH, NOT THE DEFAULT ONE (round 36, P1, measured), and the scheme
+    # fallback that used to stand here turned a refusal into a false PASS. `radiusProvider` normalizes its OWN config
+    # URL, but the composed model inherits the RAW provider `baseUrl` (`provider-composer.js:88`) and the pi-messages
+    # API builds from it (`new URL(\`${model.baseUrl.replace(/\\/+$/u, "")}/messages\`)`, `api/pi-messages.js:250`),
+    # so measured `pi -p --provider deepseek --model deepseek-flash` on `baseUrl: "radius.pi.dev/v1"` answers
+    # `Invalid URL` and exits 1 having sent nothing. That is a DIFFERENT fact from `Unknown provider`, so it gets its
+    # own token and its own reason: no credential answers it, and the remedy is the URL.
+    if _grant and not re.match(r"^https?://", _gw, re.I):
+        print("grant-bad-url")
+        raise SystemExit(0)
+    _grant_default = bool(_grant and re.match(r"^https?://", _gw, re.I) and _gw.rstrip("/") == "https://radius.pi.dev")
     _suffix = ":oauth" if _body.get("oauth") else ""
     if _grant_default:
         raise SystemExit(0)
@@ -1939,6 +1948,11 @@ key_gate_box_default_assert() {
   # ⛔ A PROVIDER pi DOES NOT SHIP, which is a fact about the FILE — but ONLY when the table read COMPLETED (round 35
   # review, P1, measured): `key_gate_builtin` is empty for an unread table too, and refusing on that turned a healthy
   # box into `REFUSED … is not a provider pi ships` with a remedy that was not the reason it fired.
+  if [ "$drop" = "grant-bad-url" ] && [ "$quiet" != 1 ]; then
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-bad-gateway why=grant-bad-url model=%s box_default=%s provider=%s settings_json=%s - this pinned provider is a Radius grant whose `baseUrl` carries no http(s) scheme, so the composed model inherits the RAW value and pi builds the request URL from it: measured `pi -p --provider %s --model %s` answers `Invalid URL` and exits 1 before anything is sent. Write the gateway with a scheme (`https://\u2026`), or give the model definition its own absolute `baseUrl` (agent-infra#3443)\n' \
+      "$label" "$dm" "$dm" "$prov" "$sj" "$prov" "$dm"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ -n "$drop" ] && key_gate_builtin_unshipped "$prov" && [ "$drop" != "oauth-no-baseurl" ] && [ "$quiet" != 1 ]; then
     printf '[key-gate] %s check=fail result=REFUSED reason=models-json-provider-dropped why=%s model=%s box_default=%s provider=%s settings_json=%s - `%s` is not a provider pi ships, so the composer has no base model to fall back on: `modelFromJson` throws and `recomposeProvider` DELETES the provider - measured, `pi -p --provider %s --model %s` answers `Error: Unknown provider "%s"`, and a bare `pi -p` on this pin answers `No API key found for the selected model.` No credential answers that; give the model definition its own `api` (and `baseUrl`), or drop it (agent-infra#3443)\n' \
       "$label" "$drop" "$dm" "$dm" "$prov" "$sj" "$prov" "$prov" "$dm" "$prov"
@@ -2246,6 +2260,13 @@ key_gate_assert_main() {
   # var=MYV` (round 29's warn-only policy). NO credential can rescue that box, so no credential answer is honest: the
   # verdict is about the FILE, with the model-level remedy. The default gateway is exempt (the baseline composes the
   # definition; measured `pi -p` reached the gateway), and the token names the model definition that failed.
+  if [ "$drop" = "grant-bad-url" ]; then
+    KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
+    KEY_GATE_REASON="models-json-bad-gateway"
+    printf '[key-gate] %s check=fail result=REFUSED reason=models-json-bad-gateway why=grant-bad-url model=%s provider=%s var=%s models_json=%s - this provider is a Radius grant whose `baseUrl` carries no http(s) scheme. `radiusProvider` normalizes that for its OWN config lookup, but the composed model inherits the RAW value and pi builds the request URL from it, so measured `pi -p --provider %s --model %s` answers `Invalid URL` and exits 1 before anything is sent - no credential can rescue it. Write the gateway with a scheme (`https://\u2026`), or give each model definition its own absolute `baseUrl` (agent-infra#3443)\n' \
+      "$label" "$KEY_GATE_MODEL" "$KEY_GATE_PROVIDER" "$KEY_GATE_VAR" "${KEY_GATE_MODELS_JSON:-<none>}" "$KEY_GATE_PROVIDER" "$KEY_GATE_MODEL"
+    return "$KEY_GATE_REFUSED"
+  fi
   if [ "$grant" = "1" ] && [ -n "$drop" ]; then
     KEY_GATE_VAR="${names:-<none>}"; KEY_GATE_VAR="${KEY_GATE_VAR%%$'\n'*}"
     KEY_GATE_REASON="models-json-provider-dropped"
