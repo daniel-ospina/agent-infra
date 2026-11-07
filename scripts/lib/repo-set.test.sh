@@ -163,6 +163,15 @@ ck "c-empty has its own code (4), distinct from an absent file (3)" \
    'printf "# only comments\n\n" > "$T/empty.conf"; [ "$(run_reader_rc "$T/empty.conf" list)" = 4 ]'
 ck "c-refusing-names-the-file" \
    'printf "slug=o/n checkout=tortoise\n" > "$T/r.conf"; o="$(run_reader "$T/r.conf" list)"; grep -q "REFUSING $T/r.conf" <<<"$o"'
+# ⛔ THE SUMMARY MUST NOT NUMBER ITSELF — AND THAT FIX NEEDED AN ARM (round 36, P2). The line used to
+# read `REFUSING <file> — 5 is not a usable set until the lines above are fixed`, which an operator
+# reads as "5 is not a usable set"; the code is the function's RETURN VALUE and the RETURN CODES table
+# is where it is named. The arm above asserts only the PREFIX (`REFUSING <file>`), so it is satisfied
+# byte-for-byte by the OLD wording: reverting this fix left the suite at 168 passed / 0 failed,
+# measured. Two halves, and both are needed: the first discriminates against a revert of the sentence,
+# the second against anyone restoring the number in a different phrasing.
+ck "c-refusing-does-not-number-itself (the code is the return value, not the sentence's subject)" \
+   'printf "slug=o/n checkout=tortoise\n" > "$T/r2.conf"; o="$(run_reader "$T/r2.conf" list)"; grep -qF "REFUSING $T/r2.conf — not a usable set" <<<"$o" && ! grep -qE " — [0-9]+ is not a usable set" <<<"$o"'
 ck "c-nothing-emitted-on-a-refusal (a shorter set must not read as a smaller machine)" \
    'printf "slug=o/n checkout=$T/tortoise\nslug=bad checkout=/y\n" > "$T/h.conf"; [ -z "$(run_reader "$T/h.conf" list | grep -v "^repo-set: ")" ]'
 
