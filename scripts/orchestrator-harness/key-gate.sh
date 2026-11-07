@@ -1082,19 +1082,44 @@ if sys.argv[2] == "compose":
     # while this gate refused 82 quoting a failure that box never printed. `new URL` throws for exactly one thing here:
     # no parseable scheme (or an empty host on a special scheme). So the discriminator is scheme PRESENCE plus a host for
     # http(s) \u2014 never a spelling.
+    # \u26d4 THE AUTHORITY IS PART OF "WOULD `new URL()` THROW" (round 40, P1, measured): a scheme-presence test passed
+    # two boxes pi REFUSES \u2014 `new URL("https://:8080/v1/messages")` and `new URL("https:// gw.example/v1/messages")` both
+    # throw `ERR_INVALID_URL` (node, measured), and `pi -p` on each answers `Invalid URL`. So for http(s) the authority
+    # must exist, must not carry whitespace, and must not be a bare port. \u26d4 IT IS READ AFTER THE SCHEME\x27S SLASHES,
+    # NOT AS "THE TEXT UP TO THE FIRST `/`": `new URL("https:///gw.example/v1/messages")` PARSES (three slashes are
+    # normalised, measured) and `pi -p` REACHED the network (`fetch failed`) \u2014 a text-up-to-the-first-slash rule
+    # refuses that box, re-creating the false block the last round removed, and so does `urllib.parse.urlsplit`, which
+    # reads `https:/gw.example/...` as having no host at all.
+    # \u26d4 AND A VALUE THAT IS ONLY A SCHEME PLUS SLASHES IS **NOT** REFUSED (round 40, P1, measured): pi builds
+    # `new URL(`${baseUrl.replace(/\/+$/u, "")}/messages`)` (`api/pi-messages.js:251`), so `https://` becomes
+    # `https:/messages`, which PARSES against the literal host `messages` \u2014 `pi -p` answered `fetch failed`, i.e. it
+    # SENT a request. That is a network failure, not the `Invalid URL` this refusal quotes, and a gate that claimed it
+    # would be quoting a failure the box never printed. The check below therefore runs on the vendor\x27s own
+    # strip-then-append, so every arm\x27s verdict agrees with what `pi -p` actually printed.
     def _buildable(v):
         s = str(v).strip()
         m = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*):(.*)$", s, re.S)
         if not m:
             return False
         if m.group(1).lower() in ("http", "https"):
-            return bool(m.group(2).lstrip("/"))
+            rest = (m.group(2).rstrip("/") + "/messages").lstrip("/")
+            auth = re.split(r"[/?#]", rest, 1)[0]
+            return bool(auth) and not re.search(r"\s", auth) and not re.fullmatch(r":\d*", auth)
         return True
-    # The default gateway is compared on the NORMALISED url for the same reason: `https:/radius.pi.dev/v1` is the same
-    # gateway as `https://radius.pi.dev/v1` to `radiusProvider`, so a spelling must not change the verdict.
-    _n = re.match(r"^([A-Za-z][A-Za-z0-9+.\-]*):/*(.*)$", _gw.strip(), re.S)
-    _gw_norm = ("https://" + _n.group(2).lstrip("/")) if (_n and _n.group(1).lower() in ("http", "https")) else _gw.strip()
-    _grant_default = bool(_grant and _gw_norm.rstrip("/") == "https://radius.pi.dev")
+    # \u26d4 THE NORMALISATION IS THE VENDOR\x27S, AND REWRITING A SCHEME IS A FALSE PASS (round 40, P2, measured).
+    # `normalizeRadiusGatewayUrl` (`pi-ai/dist/providers/radius-config.js`) is: prefix `https://` ONLY when
+    # `/^https?:\/\//iu` does NOT match, then strip trailing slashes \u2014 it NEVER rewrites a scheme it was given. So
+    # `http://radius.pi.dev` stays http, `https:/radius.pi.dev` (one slash) does not match and becomes
+    # `https://https:/radius.pi.dev`, and neither equals the default \u2014 `radiusProvider` then takes the EMPTY baseline
+    # (`radius.js:21-24`), `findModelDefaults` finds nothing and `modelFromJson` throws, so `recomposeProvider` DELETES
+    # the provider: measured, `pi -p` on `http://radius.pi.dev` + an api-less definition answers
+    # `Error: Unknown provider "deepseek"` while the old normaliser collapsed the scheme and printed `check=ok` \u2014 a
+    # false PASS on a box pi cannot resolve at all. The last round\x27s spelling tolerance is preserved where the vendor has
+    # it (an added scheme for a scheme-LESS value, and any number of slashes) and dropped where it does not.
+    _gw_raw = _gw.strip()
+    _gw_norm = _gw_raw if re.match(r"^https?://", _gw_raw, re.I) else "https://" + _gw_raw
+    _gw_norm = re.sub(r"/+$", "", _gw_norm)
+    _grant_default = bool(_grant and _gw_norm == "https://radius.pi.dev")
     # \u26d4 NO EARLY RETURN HERE (round 39, P1, measured): `definition.baseUrl` wins at `provider-composer.js:88` on the
     # DEFAULT gateway just as much as on a custom one, so a definition carrying its own scheme-less value is a certain
     # death there too \u2014 measured, `pi -p` \u2192 `Invalid URL` while this gate printed `check=ok`. The default-gateway return
@@ -1129,18 +1154,33 @@ if sys.argv[2] == "compose":
     # shape was measured to RUN (401 from Radius).
     _raw_base = _body.get("baseUrl") or ""
     _models = [m for m in (_body.get("models") or []) if isinstance(m, dict)]
+    # \u26d4 THE URL IS BUILT PER **REQUEST**, SO ONLY THE PINNED DEFINITION CAN BREAK IT (round 40, P3, measured).
+    # pi builds `new URL(`${model.baseUrl...}/messages`)` (`api/pi-messages.js:251`) for the model it is about to use, and
+    # `modelFromJson` (`provider-composer.js:83-116`) never parses a URL \u2014 so a SIBLING definition with an unbuildable
+    # `baseUrl` composes fine and is never reached. Measured: pinned `deepseek-flash` beside
+    # `{id:other, baseUrl:"broken.example/v1"}` \u2014 `pi -p` RAN (`fetch failed`) while this gate refused 82 naming the
+    # healthy pin. The loops below therefore test the URL on the pinned definition only (all definitions when no pin
+    # matches, which is the pre-existing answer). \u26d4 THE `api`/`baseUrl` STRUCTURAL TESTS STAY PER DOCUMENT, because those
+    # are composer-level: `provider-composer.js:173-181` runs `modelFromJson` for EVERY definition and a throw discards
+    # the whole models.json, so a sibling really does take the pinned model with it.
+    _pin = str(sys.argv[4]) if len(sys.argv) > 4 else ""
+    _pinned = [m for m in _models if str(m.get("id")) == _pin] if _pin else []
+    _url_models = _pinned or _models
     def _bad_gw(m):
         print("bad-gateway" + ("-no-api" if not (m.get("api") or _body.get("api")) else ""))
         raise SystemExit(0)
-    for _m in _models:
-        if _m.get("baseUrl") and not _buildable(_m.get("baseUrl")):
+    # \u26d4 THIS TEST SITS ABOVE THE DEFAULT-GATEWAY RETURN (round 40, P2, measured): with the VENDOR\x27S normaliser a
+    # scheme-less gateway (`radius.pi.dev`) IS `https://radius.pi.dev`, so `_grant_default` now fires on it \u2014 and a
+    # return here would skip the effective-`baseUrl` test on exactly the boxes that need it (a definition inheriting the
+    # RAW, scheme-less value dies `Invalid URL` whatever the gateway is). Measured: the normaliser half alone reddened
+    # `3z15y20/21/22`, `32/33`, `8z47/48`, `8z53/54`; the pair is green.
+    for _m in _url_models:
+        _eff = _m.get("baseUrl") or _raw_base
+        if _eff and not _buildable(_eff):
             _bad_gw(_m)
     if _grant_default:
         raise SystemExit(0)
     for _m in _models:
-        _eff = _m.get("baseUrl") or _raw_base
-        if _eff and not _buildable(_eff):
-            _bad_gw(_m)
         if not (_m.get("api") or _body.get("api")):
             print("no-api:" + str(_m.get("id")) + _suffix)
             raise SystemExit(0)
@@ -1491,7 +1531,8 @@ key_gate_builtin_unshipped() {
 }
 
 # key_gate_compose <home> <provider> <model> [<cwd>] -> the reason pi's COMPOSER rejects this provider's
-# models.json (`oauth-no-baseurl` | `no-api:<id>` | `no-baseurl:<id>`), or nothing.
+# models.json (`oauth-no-baseurl` | `no-api:<id>` | `no-baseurl:<id>`) or its pinned definition's URL
+# (`bad-gateway` | `bad-gateway-no-api`), or nothing.
 # ⛔ pi COMPOSES models.json A SECOND TIME and can DISCARD what this gate just read (round 28, P2, measured).
 key_gate_compose() {
   local home="${1:-}" prov="${2:-}" model="${3:-}" cwd="${4:-${PWD:-}}" agent_dir mj
@@ -1504,7 +1545,10 @@ key_gate_compose() {
   # `radius-grant` comes first when a grant holds, and a `no-api:`/`no-baseurl:` line can follow it — so a caller that
   # kept only the first line could not see both, and a second read would spend the bound twice (measured: a blocking
   # models.json then answered outside it, arm 5c).
-  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" 2>/dev/null
+  # \u26d4 THE PIN IS FORWARDED (round 40, P3, measured): the reader used to take `$model` and drop it, so both loops
+  # tested EVERY definition and a sibling\x27s unbuildable `baseUrl` refused a lane whose pinned model is fine. `$model` is
+  # argv[4]; an EMPTY value keeps the pre-existing "every definition" answer.
+  key_gate_bounded "${KEY_GATE_BOUND:-15}" python3 -c "$_KEY_GATE_PY" "$mj" compose "$prov" "$model" 2>/dev/null
 }
 
 # key_gate_value_present <VARNAME> — 0 iff THIS environment holds a non-blank value.
