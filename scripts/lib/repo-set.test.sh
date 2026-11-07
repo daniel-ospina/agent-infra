@@ -27,16 +27,30 @@
 # Without (g)/(h), "a refusal happened" could be satisfied by a fixture that was invalid for a reason
 # the arm never looked at, and "no repo in argv" could be satisfied by a plist that named one.
 #
-# HERMETIC: every fixture is a throwaway `git init` under mktemp, HOME is re-rooted, and no real
-# state dir, config file or launchd domain is touched. External dependencies: `git`, and `python3` for
-# the doctored-doctor mutation fixtures (both are already required by the reader's own delegated
-# proofs, so the suite needs nothing a real box does not).
+# HERMETIC: every fixture is a throwaway `git init` under mktemp, HOME is re-rooted, the box's own
+# repo SEAMS are cleared (below), and no real state dir, config file or launchd domain is touched.
+# External dependencies: `git`, and `python3` for the doctored-doctor mutation fixtures (both are
+# already required by the reader's own delegated proofs, so the suite needs nothing a real box does
+# not).
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
 # `set -u` comes AFTER the two resolutions on purpose: a harness that streams the shard list into a
 # shell (`bash < repo-set.test.sh`) leaves `BASH_SOURCE[0]` unbound, and under `-u` that is an error
 # before a single arm runs — the shard would red on the HARNESS, not on the behaviour.
 set -u
+# ⛔ THE BOX'S OWN SEAMS ARE CLEARED BEFORE A SINGLE ARM RUNS. This suite pins states like "nothing is
+# declared" (`f15`-`f18`, `f28`), and the wrapper and the reader READ those names from the
+# ENVIRONMENT — so on the exact boxes this unit serves, a controller box carrying `OR`, `REPO` and
+# `PR_DOCTOR_REPO` in `keys.env`, the ambient values satisfied the "declared" arms and reddened the
+# "nothing declared" ones. Measured on a running cell, same tree, same commit: `146 passed, 12
+# failed` with the four ambient names inherited, `158 passed, 0 failed` with them cleared. So the
+# hermetic claim above was FALSE in the one environment that matters, and a suite that reds on a
+# healthy tree teaches its reader to ignore it — the inert-instrument shape this file exists to
+# avoid, aimed at itself. Every arm that needs a seam sets it explicitly on its own command line, so
+# clearing them here cannot take away a value an arm meant to test. The list is the names the wrapper
+# (`scripts/pr-doctor-machine.sh`) and the reader (`scripts/lib/repo-set.sh`) actually read:
+# `unset` anything else is not needed, and a name added to that surface belongs here.
+unset OR REPO PR_DOCTOR_REPO PR_DOCTOR_REPOS PR_DOCTOR_REPO_DIR
 READER="$HERE/repo-set.sh"
 WRAPPER="$REPO_ROOT/scripts/pr-doctor-machine.sh"
 PLIST="$REPO_ROOT/templates/launchd/com.tortoise.pr-doctor.plist"
@@ -396,6 +410,14 @@ ck "f33 a seam that is ENTIRELY a non-ASCII space does not flip the wrapper agai
    'REPO_SET_FILE="$nofile" OR="$(printf "\302\240")" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null | grep -q "^ARGV $"'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
+# ⛔ NON-VACUITY OF THE SEAM CLEAR AT THE TOP OF THIS FILE. `f18` asserts a REFUSAL on a box that
+# declares nothing; if the operator's own `OR` reaches this process, that refusal becomes a PASS and
+# `f18` reds. So the ambient value is re-introduced HERE, on `f18`'s exact fixture, and the wrapper is
+# asserted to RUN (rc 0 from the stub) — which is the 12-arm failure this suite reported on a running
+# cell before the clear landed. Together: inherited -> runs/rc 0, cleared -> refuses/rc 2, so the
+# `unset` above is load-bearing rather than decorative.
+ck "f18b …and an INHERITED OR would have made it run (the seam clear is what makes f18 meaningful)" \
+   '[ "$(OR=daniel-ospina/tortoise REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 0 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
    'REPO_SET_FILE="$CONF" bash -c ". \"$READER\"; type repo_set_doctor_repos >/dev/null" >/dev/null 2>&1'
 
