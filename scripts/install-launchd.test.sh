@@ -142,7 +142,9 @@ mkfakehome() { # $1 = home dir
     # resolve at
     # install time (broken-target guard).
     mkdir -p "$1/.pi/agent/scripts"
-    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py worktree-hygiene-sweep.sh cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py; do
+    for f in fleet-cost-weekly.sh fleet-cost-report.sh watch-truncation.sh session-postmortem.sh pi-reap-idle.sh pi-task-session-prune.sh pi-cache-reap.sh pi-reap-orphans.sh pi-reap-worktrees.sh pi-reap-worktrees-launchd.py worktree-hygiene-sweep.sh cleanup-stale-branches.sh ci_runner_gate.sh pr-doctor.py pr-doctor-machine.sh; do
+        # mkstub, not `touch`: a 0-byte executed target is REFUSED by the guard (execve ENOEXEC), so a
+        # fixture that models a farmed script must carry a byte.
         mkstub "$1/.pi/agent/scripts/$f"
     done
     # #1719 — the gate job's plist target. Its farm entry is `fleet_srcs` (setup.sh copies it to
@@ -178,6 +180,15 @@ mkfakehome() { # $1 = home dir
     mkdir -p "$1/.pi/agent/cdpath/cdpathphantom"
     mkdir -p "$1/.pi/agent/scripts/lib"
     mkstub "$1/.pi/agent/scripts/lib/pid-identity.sh"
+    # #2281 §1: pr-doctor's unit now execs the machine wrapper (fleet_srcs), which resolves the repo
+    # SET reader as a sibling `lib/` file (lib_srcs). ⛔ BOTH ARE FIXTURE DATA, NOT A GUARD: the
+    # broken-target arm this loop exists for (`verify_targets`) inspects only ABSOLUTE PATHS in
+    # ProgramArguments, so it sees the wrapper and would NOT notice a missing `lib/repo-set.sh`. That
+    # sibling is caught at RUN time by the wrapper's own farm-gap refusal, which is loud and named —
+    # but it is not an install-time verdict, and a comment here claiming otherwise would send the next
+    # lane looking for a guard that does not exist. The pair is created here so the fixture mirrors
+    # what `setup.sh` actually delivers.
+    mkstub "$1/.pi/agent/scripts/lib/repo-set.sh"
     # #1178 unit 3 — the scheduled lane-liveness report runs the FARMED tools:
     # the driver + its sibling classifier under scripts/fleet/ (the broken-target
     # guard refuses the install when they are absent). NOT tools/fleet/: pi's

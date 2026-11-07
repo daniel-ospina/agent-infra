@@ -99,9 +99,13 @@ WHAT IT DOES, IN ORDER (every step idempotent; safe to run every few minutes)
   6. FILL      while live < target: add ONE runner, printing `mem_available_mb` before and after,
                and stop if the next addition would leave < MEM_RESERVE_MB. A NEW install is
                created by the provisioner (`tools/install-ci-runner-x64.sh`, the one registration
-               path — it downloads and sha256-checks the runner); this file never downloads a
-               binary, and it REFUSES to add when no provisioner is present rather than
-               improvising one.
+               path — which COPIES a pre-unpacked runner from `$RUNNER_ROOT/_template` and refuses
+               with `cannot-act why=runner-template-absent` when that template is not there).
+               ⛔ NOTHING IN THIS REPO DOWNLOADS OR sha256-CHECKS A RUNNER RELEASE — an earlier
+               version of this line said the provisioner did, which the file this change ships
+               contradicts in its own header; a box must be prepared before its first FILL. This
+               file never downloads a binary, and it REFUSES to add when no provisioner is present
+               rather than improvising one.
   7. REFUSE    beyond the ceiling nothing is added and the reading is printed. `--want N` is the
                explicit-request form of the same guard; `--status` is the read-only form.
 
@@ -1362,8 +1366,9 @@ def resolve_labels(
 ) -> str:
     """The ONE place a label set is decided: what the runner already carries, then the floor.
 
-    This mirrors `tools/install-ci-runner-x64.sh::resolve_labels` (the one registration path)
-    instead of inventing a second rule, and it is `auto`: the gate's state is the source of
+    This mirrors the pool tool's registration rule — `scripts/ci_runner_pool.sh::add`, whose label
+    wall is `POOL_LABEL_X64`/`RUNNER_LABELS` (`ci_runner_pool.sh:263`/`:1629`) — instead of inventing a
+    second rule, and it is `auto`: the gate's state is the source of
     truth, so a runner never acquires a permanent claim on the pool. An unknown architecture
     RAISES — `self-hosted`/`Linux`/`<ARCH>` are host-derived and may not be set, so there is no
     safe default to fall back to.
@@ -1510,7 +1515,9 @@ def resolve_labels(
 
 
 # ── actions ───────────────────────────────────────────────────────────────────────────────────
-def _run_split(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
+def _run_split(
+    cmd: list[str], timeout: int = 300, env: dict[str, str] | None = None
+) -> tuple[int, str, str]:
     """ONE spawn, TWO streams KEPT APART.
 
     ⛔ A MERGED STREAM CANNOT ANSWER "WHICH LINE IS THE VALUE" (review finding P2, round 12). `_run`
@@ -1521,15 +1528,15 @@ def _run_split(cmd: list[str], timeout: int = 300) -> tuple[int, str, str]:
     runner's own tooling. The caller that has a VALUE to read must get the stream it is on.
     """
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError) as exc:
         return 127, "", str(exc)
     return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
 
 
-def _run(cmd: list[str], timeout: int = 300) -> tuple[int, str]:
+def _run(cmd: list[str], timeout: int = 300, env: dict[str, str] | None = None) -> tuple[int, str]:
     """The merged-stream form, for the callers whose ONLY question is the exit status."""
-    rc, out, err = _run_split(cmd, timeout)
+    rc, out, err = _run_split(cmd, timeout, env)
     return rc, ((out or "") + (err or "")).strip()
 
 
@@ -2962,14 +2969,28 @@ def resolve_provisioner() -> tuple[str | None, str]:
     )
 
 
-def provision(target_count: int) -> str:
-    """Create/extend the install so that runners 1..target_count exist — via the ONE installer.
+def provision(target_count: int, repo: str = "", root: str = "") -> str:
+    """Add AT MOST ONE install, at slot `target_count` — via the ONE installer.
 
-    ⛔ This file never downloads a runner binary and never builds a `config.sh` argv for a NEW
-    install: download + sha256 verification + the headroom/arch guards are
-    `tools/install-ci-runner-x64.sh`'s job (it is the only registration path). Absent, this
-    REFUSES — improvising a provisioner here is how a second, divergent registration path is
-    born (#9639 exists precisely because there was one).
+    ⛔ NOT A SWEEP, AND THE WORDING IS THE CONTRACT: it used to read "Create/extend the install so that
+    runners 1..target_count exist", which is the "ensure 1..N" sweep the installer explicitly refuses
+    (`tools/install-ci-runner-x64.sh` contract fact 2) because it fills slots this file's per-step
+    memory/disk re-read never budgeted — the over-fill `_next_free_slot`'s comment below describes
+    (#9639). `target_count` is a SLOT INDEX in this file's own numbering, not a count.
+
+    ⛔ THE PRECONDITION THE JOIN DOES NOT CREATE (fresh-context review round 16, P2 — the paragraph
+    above was written when the provisioner did not exist, and it overstated what landing one would
+    buy). NO FILE IN THIS REPO DOWNLOADS OR UNPACKS A RUNNER RELEASE: `tools/install-ci-runner-x64.sh`
+    explicitly disclaims it (no download, no sha256, no `config.sh` argv — all of that is
+    `ci_runner_pool.sh`'s), and `ci_runner_pool.sh::add` copies from `RUNNER_TEMPLATE` (default
+    `$RUNNER_ROOT/_template`), refusing with `cannot-act why=runner-template-absent` when no pristine
+    release has been unpacked there. So the joined pair can add a runner only on a box an operator or
+    a bootstrap has already prepared. Measured 2026-11-07 on a cell: `/opt/gh-runner-x64` and
+    `/opt/gh-runner-cell4` exist and there is NO `/opt/_template`, so an `add` there lands in that
+    refusal rather than an add. What IS true, and is all this file relies on: the headroom/arch gates
+    and the ONE registration path live behind the provisioner, so this file still never improvises
+    one (the reason #9639 exists). Repairing `runner-template-absent` is an unpack, not a download
+    from this code.
     """
     provisioner, why = resolve_provisioner()
     if not provisioner:
@@ -2982,15 +3003,37 @@ def provision(target_count: int) -> str:
             "never downloads a runner binary). Repair/orphan paths still work; point "
             "RUNNER_AUTOSCALE_PROVISIONER (or the unit's `Environment=`) at a readable installer."
         )
+    # ⛔ THE CALLER'S OWN TWO KNOBS TRAVEL WITH THE CALL, BECAUSE A CHILD CANNOT GUESS THEM (review P2).
+    # `--count N` is all the argv carries, so the provisioner resolved its OWN defaults for the other two:
+    # the registration target (`ci_runner_pool.sh:261` — `RUNNER_POOL_REPO`, default `daniel-ospina/tortoise`)
+    # and, absent `--root`, `/opt`. On a repointed box that registered runners into the WRONG pool while
+    # `_live()` (repo-agnostic) counted them, so the pass reported `converged` with zero capacity for this
+    # repo; on a `--root X` box the install landed somewhere `discover()` never looks and the pass recorded
+    # `NO install appeared`. Both are FALSE PASSes, which is why this is a seam and not a default.
+    # The provisioner is the JOIN and translates `RUNNER_AUTOSCALE_REPO` into the pool tool's variable; this
+    # side deliberately does not name a variable that belongs to the tool on the other end of the join.
+    child_env = os.environ.copy()
+    if repo:
+        child_env["RUNNER_AUTOSCALE_REPO"] = repo
+    if root:
+        child_env["RUNNER_AUTOSCALE_RUNNER_ROOT"] = root
     rc, out = _run(
-        ["bash", provisioner, "--count", str(target_count), "--fallback", "auto"], timeout=1800
+        ["bash", provisioner, "--count", str(target_count), "--fallback", "auto"],
+        timeout=1800,
+        env=child_env,
     )
     if rc == 2:
-        # `install-ci-runner-x64.sh` publishes 2 as "GUARD REFUSED — nothing was attempted". That
-        # is its own headroom guard declining, not this tool failing: reported as a REFUSAL in its
-        # own words, so a scheduled pass does not cry failure every 10 minutes over a deliberate
+        # `install-ci-runner-x64.sh` publishes 2 as "A POOL GUARD REFUSED — nothing was attempted".
+        # That is the headroom/gate verdict declining, not this tool failing: reported as a REFUSAL in
+        # its own words, so a scheduled pass does not cry failure every 10 minutes over a deliberate
         # no — and so the two predicates that disagree (its 2 GB+4 GB reserve vs this file's
         # measured 1.5 GB+2 GB, #9672) stay visible instead of being averaged away.
+        # ⛔ AND THE ADAPTER'S **OWN** CONFIGURATION ERRORS ARE DELIBERATELY NOT 2 (they are 6, which
+        # falls through to `ActionFailed` below): a bad `--count`, an unreadable pool tool, or
+        # disagreeing root/base/repo seams are not an answer about capacity, and recording one as a
+        # refusal sent a human to audit capacity arithmetic (`GUARD CONFLICT … a human must decide
+        # which number is wrong`) over what was an environment mistake — or, on a box whose disk arm
+        # also declined, exited 0 and reported a permanently un-provisionable box as clean.
         raise ProvisionerRefused(f"rc=2 {out[-300:]}")
     if rc != 0:
         raise ActionFailed(f"provisioner --count {target_count} rc={rc}: {out[-400:]}")
@@ -3381,8 +3424,11 @@ def converge(
             record["actions"].append(f"repair {c['name']} FAILED: {exc}")
 
     # 6. FILL — one install at a time, at the NEXT FREE SLOT, and measured ---------------------
-    # THE PROVISIONER DOES NOT PROMISE "ADD ONE". `install-ci-runner-x64.sh --count N` means
-    # "ensure slots 1..N exist", where a slot is `$BASE`, `$BASE-2`, `$BASE-3`, … — REPO-AGNOSTIC.
+    # THE PROVISIONER ADDS AT MOST THE ONE INDEX IT WAS ASKED FOR. `install-ci-runner-x64.sh --count N`
+    # names a SLOT INDEX in this file's own numbering (`$BASE`, `$BASE-2`, `$BASE-3`, …) and adds that
+    # slot, or nothing — it does not sweep 1..N (its header states that as contract fact 2, and a suite
+    # arm pins "exactly one add"). An earlier revision of this comment said "ensure slots 1..N exist",
+    # which is the sweep the adapter refuses precisely because it causes the over-fill below.
     # Three consequences, each learned from a real miss:
     #   * the index must be the next FREE SLOT in that numbering, not the install COUNT: this box
     #     carries an ad-hoc `gh-runner-cell4-x64` beside the numbered pair, so a count said 3 while
@@ -3489,7 +3535,7 @@ def converge(
             )
             break
         try:
-            note = provision(index)
+            note = provision(index, repo=repo, root=root)
         except ProvisionerRefused as exc:
             # ⛔ TWO ANSWERS TO TWO DIFFERENT QUESTIONS. The installer budgets space for the WHOLE
             # target plus its reserve; this pass adds ONE runner. So when its guard refuses while

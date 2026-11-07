@@ -164,10 +164,75 @@ machine's pi instance.
   up from your working directory to the repo's git top-level, AND the base config
   at `~/.pi/agent/.mcp.json` — **both** are read and **merged**, so a repo's
   `.mcp.json` is a DELTA on the base, not a replacement for it. On a name
-  collision the **repo's entry wins** (it may pin a different URL or command for
-  its own copy of a server). The base is machine-local and is never shipped, so
-  this is also how an INTERNAL server reaches every repo without being written
-  into a product repo's tracked config. Base servers: brave-search,
+  collision the **repo's entry wins FIELD BY FIELD**: set only the fields that
+  differ and the base's other fields are kept. So `{"tortoise": {"timeoutMs":
+  40000}}` changes just the connect budget and keeps the base's `url`, `type`,
+  `lazy` and headers — a whole-entry override used to leave the entry with no
+  `command` and no `url`, i.e. permanently unspawnable.
+
+  **The merge never inherits a secret into a different destination, and the transport
+  is atomic.** Neither rule is a security boundary — see the warning below.
+
+  - Changing `url` keeps `lazy`, `timeoutMs` and the catalog metadata, but **does
+    not inherit** the base's `headers`/`oauth`: the base's credentials belong to the
+    base's own endpoint. A `lazy`-only override does not change the destination,
+    so it keeps them. Host case, default port and surrounding whitespace are
+    normalised away before comparing — **a trailing slash is not**, so `/mcp` and
+    `/mcp/` count as different destinations (fail-closed). Credentials follow a
+    destination only when it is UNCHANGED, so write the repo's `url` exactly as the
+    base writes it; a genuinely different endpoint needs its own entry in the BASE
+    config. Never restate a fleet secret in a repo file — see the trust warning
+    below.
+  - Declaring `command` drops the base's `url`/`headers`/`oauth`; declaring `url`
+    drops the base's `command`/`args`/`env`/`cwd`. The base's `env` is inherited
+    only when the same thing is LAUNCHED — `command` **and** `args` **and** `cwd`,
+    because `args` decides what actually runs. A **transport CHANGE** — a delta that
+    moves the entry between stdio and HTTP — also drops the base's `type`, because
+    it described the OLD transport and inheriting it would leave exactly the
+    incoherent `{ "type": "http", "command": … }` entry the atomicity rule exists
+    to prevent. A delta that keeps the same transport CLASS inherits `type`, even
+    when it restates the `url`.
+  - **`type` never disqualifies an entry.** This client selects the transport from
+    `url`/`command` alone and never reads `type`, so an unrecognised `type` (even
+    `sse`) only earns a warning — a self-hosted entry spelling `type: "sse"` for
+    its own daemon WORKS, and both `pi-bootstrap/lib/merge-mcp.py` and
+    `pi-bootstrap/cell-install.sh` rule on that explicitly. When a LAYER is read
+    by the extension, a **truthy** non-string `url`/`command` (`["https://…"]`),
+    or a name outside `[A-Za-z0-9_-]`, makes the entry invalid — it is dropped
+    rather than stringified into a live request. (This is the layer reader's
+    guarantee: `McpServerManager.connectAll` parses JSON directly and applies no
+    such filter, so a config handed to that entry point is trusted as written.) A
+    **falsy** value (`""`, `null`, `false`) is treated differently: only that
+    FIELD is removed and the entry kept, because the client dispatches on whether
+    `url` is *truthy*, so `{ "url": "", "command": … }` really does run over the
+    command — dropping the entry would zero a config that works. An entry left
+    with no transport at all is dropped. Names `__proto__`, `constructor` and
+    `prototype` are refused as well — that is this client's own hygiene rule,
+    stricter than pi's charset, which admits all three.
+  - Never declare both transports in one entry. It is ambiguous, and the client
+    resolves it to `url` (that is the order it dispatches in):
+    - as a **repo delta** over a server the base already declares, the delta is
+      IGNORED with a warning and the base's entry is kept;
+    - as a **repo-only** entry, or a **base** entry, it is KEPT with a warning —
+      it works over `url`, so dropping it would zero a working server.
+
+  ⛔ **A repo's `.mcp.json` is TRUSTED INPUT.** These rules stop a repo from
+  *accidentally* inheriting the hub's credentials. They do **not** sandbox one: a
+  repo-authored entry can still write `"Authorization": "Bearer
+  ${TORTOISE_MCP_API_KEY}"` and the client resolves it from the environment — so
+  **never restate a fleet secret's env-var name in a repo file**, and treat a
+  cloned repo's `.mcp.json` as executable configuration. Every stdio server also
+  inherits the parent's whole `process.env`. pi gates project config behind
+  project trust; this client does not (yet).
+
+  There is **no way to REMOVE a base server** from a repo layer (`"<name>": null`
+  is ignored, with a warning, and an ambiguous entry leaves the base entry in
+  place) — #3692 is the open issue for the `disabled` tombstone that would
+  add one. (Not #3612: that issue is closed and proposes no tombstone, so the
+  pointer dead-ended exactly where a reader goes to learn how to turn a server
+  off.) The base is
+  machine-local and is never shipped, so this is also how an INTERNAL server reaches
+  every repo without being written into a product repo's tracked config. Base servers: brave-search,
   playwright-browser, gemini, tortoise (`seo-intelligence`, the Perplexity
   research server) and `orchestrator` (the fleet's own MCP — internal, why it
   lives here and not in a repo). **`exa` is not among them** — it was uninstalled by owner
