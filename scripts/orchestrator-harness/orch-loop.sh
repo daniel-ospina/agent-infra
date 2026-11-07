@@ -6735,8 +6735,20 @@ PY
   # ⛔ AND IT IS `is_limit`, NOT `is_num`: `[ 99999999999999999999 -gt 0 ]` ERRORS, an errored test is
   # FALSE, and that is a fail-OPEN in the opposite direction — `mp_reason` has exactly that hole today
   # for any out-of-range count that is all digits. The room is withheld on both.
+  # ⛔ THE SIGNAL IS THE LISTING, NOT THE COUNT (review cycle 5, P1). `is_limit` on the count can never
+  # fire in production: `open_pr_count`'s failure path ASSUMES A NUMBER (a sticky last-known, else
+  # `MERGE_PRIORITY_AT + 1`), `unowned_pr_count` inherits it, and `UPN`/`UPN_WORK` are coerced numeric
+  # further up — so a `gh` 403 arrived here as `26`, `readable=1` was logged, and the issue batch was
+  # dispatched on a listing nobody read. Measured end to end against a 403 stub before this line
+  # existed: `open=UNKNOWN rc=1 -> assuming 26 (BROAD)` then `issue_slots=10 … DISPATCH — CASCADE`.
+  # The datum that actually separates the two states is the ROW FILE, and `open_pr_count` is the one
+  # place that knows: it `rm -f`s `state/last-open-prs` on the failure path and writes it only on
+  # success. ABSENT ⇒ nobody read the listing ⇒ no room for new work (drain). PRESENT ⇒ a real answer
+  # (possibly "zero open PRs"). The numeric guard stays as defence in depth for a caller-supplied count.
   CASCADE_UPN_UNREADABLE=0
-  if ! is_limit "${UPN_WORK:-${UPN:-0}}"; then
+  CASCADE_LIST="absent"
+  [ -f "$O/state/last-open-prs" ] && CASCADE_LIST="present"
+  if [ "$CASCADE_LIST" = "absent" ] || ! is_limit "${UPN_WORK:-${UPN:-0}}"; then
     CASCADE_UPN_UNREADABLE=1; CASCADE_ISSUE_SLOTS=0
   fi
   # ── THE PYRAMID: WHICH LEVEL HOLDS THE ROOM THIS PASS ──────────────────────────────────────────
@@ -6800,7 +6812,7 @@ PY
   fi
   if [ "${CASCADE_ISSUE_SLOTS:-0}" -eq 0 ] && [ "${CASCADE_PRW:-0}" = "1" ]; then CASCADE_PR_WAITING=1; fi
   # [cascade:end]
-  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
+  echo "[cascade] priority=${MP_PRIORITY:-none} unowned=${UPN_WORK:-${UPN:-?}} readable=$((1 - CASCADE_UPN_UNREADABLE)) list=${CASCADE_LIST:-?} level=${CASCADE_LEVEL:-?}(${CASCADE_LEVEL_NAME}) room=${CASCADE_ROOM:-?} issue_slots=${CASCADE_ISSUE_SLOTS:-?} backlog=${CASCADE_BACKLOG:-?} lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?} can_spawn=${CASCADE_CAN} pr_waiting=${CASCADE_PR_WAITING} wait=${CASCADE_WAIT}" >> "$LOG"
   # ── THE GATE VECTOR, AND WHY THE ARMS STOPPED BEING ONE `elif` CHAIN (#2924, #2927) ──────────────
   # ⛔ ONLY THE FIRST GATE THAT FIRED WAS EVER VISIBLE. `GATE_WHY` is ONE string and the arms were an
   # `elif` chain, so the first arm that fired MASKED every arm behind it — and the arm that fires first

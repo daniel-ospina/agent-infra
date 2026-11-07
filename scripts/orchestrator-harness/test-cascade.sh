@@ -167,8 +167,16 @@ ckin "the vector names the priority and the slots it left, so ordering is legibl
 awk '/^  # \[cascade:begin\]/{f=1} f{print} /^  # \[cascade:end\]/{if(f) exit}' "$ORCH" > "$TMP/cascade-block.sh"
 ck "the [cascade:begin]/[cascade:end] block was found (a marker rename would skip the drive)" \
    "$( [ -s "$TMP/cascade-block.sh" ] && echo found || echo missing )" "found"
-drive_cascade() { # <unowned> <lanes> <max_lanes> <backlog> <can> -> "slots pr_waiting wait"
-  local d="$TMP/dc$$"; rm -rf "$d"; mkdir -p "$d"
+drive_cascade() { # <unowned> <lanes> <max_lanes> <backlog> <can> [<listing present|absent>] -> "slots pr_waiting wait"
+  local d="$TMP/dc$$"; rm -rf "$d"; mkdir -p "$d/state"
+  # ⛔ THE LISTING'S PRESENCE IS AN INPUT (review cycle 5). `open_pr_count` `rm -f`s
+  # `state/last-open-prs` when the read fails and writes it only on success, so ABSENT is the one datum
+  # that says "nobody read this" — and the room guard keys on it. Default `present`, because every other
+  # case here is about the arithmetic, not about a failed listing.
+  case "${6:-present}" in
+    absent) : ;;
+    *) printf '9001:shaA:fix/a 9002:shaB:fix/b\n' > "$d/state/last-open-prs" ;;
+  esac
   ( O="$d"; LOG=/dev/null; UPN_WORK="$1"; UPN="$1"; SEL_TOTAL=15; OPEN_N=15; WORKERS=0
     LANES="$2"; LANES_DISPLAY="$2"; MAX_LANES="$3"; SEL_PARKED=0
     TEST_CAN_SPAWN="$5"
@@ -193,6 +201,13 @@ ck "…and an OUT-OF-RANGE all-digit count does too (is_num passes it, \`[\` wou
    "$(drive_cascade 99999999999999999999 2 25 10 1)" "0 1 0"
 ck "…while the SAME room with a readable count still opens (contrast half)" \
    "$(drive_cascade 5 2 25 10 1)" "10 0 0"
+# ⛔ THE PRODUCTION FAILURE PATH (review cycle 5, P1). When `gh` fails, `open_pr_count` ASSUMES A NUMBER
+# and `rm -f`s the row file — so the count is always numeric and a guard keyed on the count can never
+# fire. The ABSENT row file is the signal, and this is the assertion that would have caught it.
+ck "an ABSENT listing (a failed gh read that still yielded a number) grants NO room" \
+   "$(drive_cascade 26 2 25 10 1 absent)" "0 1 0"
+ck "…and the contrast: the SAME count with the listing PRESENT still opens" \
+   "$(drive_cascade 26 2 25 10 1 present)" "10 0 0"
 
 # ── 5. THE FUNNEL FOLLOWS (lo_select) ──────────────────────────────────────────────────────────
 echo

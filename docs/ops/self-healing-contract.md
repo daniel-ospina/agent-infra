@@ -1020,9 +1020,13 @@ still where the next cut should start.
     the merge rail itself measures* — are a **behavioural policy choice and an owner decision**; this
     change deliberately implements neither and `test-cascade.sh` pins the state so the choice is made
     against evidence rather than by drift.
-  - **An unreadable un-owned count still fails CLOSED** (no room granted) — the polarity that used to
-    ride along inside the barrier is now enforced where the room is granted, because losing it would
-    make a rate-limited `gh` listing the one condition that dispatches new work.
+  - **An unreadable PR listing still fails CLOSED** (no room granted) — the polarity that used to ride
+    along inside the barrier is now enforced where the room is granted, because losing it would make a
+    rate-limited `gh` listing the one condition that dispatches new work. ⛔ **It keys on the ROW FILE,
+    not on the count.** `open_pr_count`'s failure path substitutes a NUMBER (a sticky last-known, else
+    `MERGE_PRIORITY_AT + 1`) and `rm -f`s `state/last-open-prs`, so "unreadable" survives only as an
+    ABSENT row file; a guard keyed on the count would never fire. Measured against a 403 `gh` stub, a
+    count-keyed guard read the failed listing as `26` un-owned and dispatched issue work.
   - **`merge-priority` no longer assigns `GATE_WHY`**, so it can no longer mask a capacity gate: it is
     computed into `MP_PRIORITY` and printed as a level, and the capacity arms decide the cycle.
   - Graded by `test-cascade.sh` (assertion and mutant counts are the suite's own printed totals, not a
