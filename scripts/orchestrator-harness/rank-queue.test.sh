@@ -188,7 +188,7 @@ if [ -n "${RANK_QUEUE_BOOTLOG:-}" ]; then
             exec[[:space:]]*) printf "%s\t%s\t%s\t%s\n" "D" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
             exit|exit[[:space:]]*) printf "%s\t%s\t%s\t%s\n" "E" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;;
 
-            trap[[:space:]]*) case "$BASH_COMMAND" in *EXIT*) printf "%s\t%s\t%s\t%s\n" "D" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;; esac ;;
+            trap[[:space:]]*) case "$BASH_COMMAND" in *EXIT*) printf "%s\t%s\t%s\t%s\n" "T" "$-" "${BASH_SUBSHELL:-0}" "$_b" >> "$RANK_QUEUE_OPTLOG" 2>/dev/null || : ;; esac ;;
           esac' DEBUG
   fi
 fi
@@ -3652,10 +3652,19 @@ ck "the output pin does NOT red a reformat that changes no output (it grades emi
 # `exit` about to run) or `D` (a point-in-time snapshot taken for `exec`), plus the `${BASH_SUBSHELL}` depth at which it
 # was written; only depth 0 counts. The last depth-0 `E` answers; a depth-0 `D` is used only when the script left no end
 # state at all (an `exec`ing shim) and, when there is NO record whatsoever, the sweep names it instead of guessing.
+# ⛔ `T` RECORDS ARE NOT A VERDICT (review P2, cycle 100). The `trap … EXIT` arm snapshots the options at TRAP-INSTALL
+# time, and the script may `set -u`/`set +u` after that — so a `T` record must never be read as an end state (measured:
+# `set -u; trap; set +u` was graded PROTECTED from it, a false PASS where the previous cycle said NO RECORD, and
+# `trap; set -u` was graded bare, naming a correct fixture). `_opts_for` therefore answers from `E`/`D` only;
+# `_trapopts_for` exposes the `T` snapshot separately for the agreement test in the exec sweep.
 _opts_for() { RQ_P="$1" awk -F'\t' '
   { p = $4; for (i = 5; i <= NF; i++) p = p "\t" $i }
   p==ENVIRON["RQ_P"] && ($3=="" || $3=="0") { if ($1=="E") e=$2; else if ($1=="D") d=$2 }
   END { print (e != "" ? e : d) }' "$TMP/.optlog" 2>/dev/null; }
+_trapopts_for() { RQ_P="$1" awk -F'\t' '
+  { p = $4; for (i = 5; i <= NF; i++) p = p "\t" $i }
+  p==ENVIRON["RQ_P"] && ($3=="" || $3=="0") && $1=="T" { t=$2 }
+  END { print t }' "$TMP/.optlog" 2>/dev/null; }
 _setu_verdict() { # $1=script -> 0 when it RUNS under nounset (empirical when possible)
   _o="$(_opts_for "$1")"
   if [ -n "$_o" ]; then case "$_o" in *u*) return 0 ;; *) return 1 ;; esac; fi
@@ -3709,7 +3718,7 @@ while IFS= read -r _il; do
 done <<EOF2
 $(sed '/^$/d' "$TMP/.inlinelog" 2>/dev/null)
 EOF2
-exec_total=0; exec_bare=""; exec_missing=""; exec_foreign=""; exec_norecord=""
+exec_total=0; exec_bare=""; exec_missing=""; exec_foreign=""; exec_norecord=""; exec_unobs=""
 while IFS= read -r _ex; do
   [ -n "$_ex" ] || continue
   # ⛔ A LOGGED PATH OUTSIDE `$TMP` IS NAMED, NOT DROPPED (review P2, cycle 97). `bash /dev/stdin < body` logs
@@ -3731,11 +3740,30 @@ while IFS= read -r _ex; do
   # falls back to the textual parser — and the parser grades a `case` arm or an uncalled `fin()` wrongly in BOTH
   # directions (measured: a bare driver of that shape printed ✅, and a genuinely protected one was named). "Executed
   # but unobservable" must never read as clean. Measured today: 172 executed paths, 172 with a record, 0 without.
-  if [ -z "$(_opts_for "$_ex")" ]; then exec_norecord="$exec_norecord ${_ex#"$TMP"/}"; continue; fi
+  if [ -z "$(_opts_for "$_ex")" ]; then
+    # ⛔ A TRAP-INSTALL SNAPSHOT IS GRADED ONLY WHEN THE PARSER AGREES (review P2, cycle 100). Two independent sources
+    # answering the same question: agreement is evidence, disagreement means the state is NOT observable and must be
+    # named rather than decided by whichever source happens to be consulted first.
+    _tu="$(_trapopts_for "$_ex")"
+    if [ -n "$_tu" ]; then
+      _snap=0; case "$_tu" in *u*) _snap=1 ;; esac
+      _par=0; _setu "$_ex" && _par=1
+      if [ "$_snap" = "$_par" ]; then
+        [ "$_snap" = "1" ] || exec_bare="$exec_bare ${_ex#"$TMP"/}"
+      else
+        exec_unobs="$exec_unobs ${_ex#"$TMP"/}(snapshot=$( [ "$_snap" = 1 ] && echo nounset || echo bare ), parser=$( [ "$_par" = 1 ] && echo nounset || echo bare ))"
+      fi
+      continue
+    fi
+    exec_norecord="$exec_norecord ${_ex#"$TMP"/}"; continue
+  fi
   _setu_verdict "$_ex" || exec_bare="$exec_bare ${_ex#"$TMP"/}"
 done <<EOF
 $(sort -u "$TMP/.bootlog" 2>/dev/null)
 EOF
+if [ -n "$exec_unobs" ]; then
+  echo "      UNOBSERVABLE: the TRAP-INSTALL snapshot and the textual parser DISAGREE about \`set -u\`, so neither can grade it —${exec_unobs} — the script replaces the hook's EXIT trap, so no end state was recorded; add an explicit \`exit 0\` (or drop the own trap) so the shell's end state is observable"
+fi
 if [ -n "$exec_norecord" ]; then
   echo "      NO RECORD: executed but left no end state to grade —${exec_norecord} — these ran, and nothing about their \`set -u\` state could be observed (a script that replaces the hook's EXIT trap and falls off the end does this)"
 fi
@@ -3745,7 +3773,7 @@ fi
 if [ "$inline_total" -ne 0 ]; then
   echo "      INLINE: $inline_total bod$([ "$inline_total" -eq 1 ] && echo y || echo ies) ran through \`bash -c\`/a heredoc feed with no FILE to grade — nothing about their \`set -u\` state could be observed, so extract each into a case dir and run it as a file"
 fi
-if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$exec_foreign" ] && [ -z "$exec_norecord" ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
+if [ "$drivers_total" -ge 4 ] && [ "$inputs_total" -ge 4 ] && [ "$exec_total" -ge 4 ] && [ "$inline_total" -eq 0 ] && [ -z "$exec_foreign" ] && [ -z "$exec_norecord" ] && [ -z "$exec_unobs" ] && [ -z "$drivers_bare" ] && [ -z "$exec_bare" ] && [ -z "$exec_missing" ]; then rc=0
 else rc=1; echo "      driver(s) WITHOUT a \`set -u\` flag:${drivers_bare:- none}; EXECUTED script(s) WITHOUT one:${exec_bare:- none}; EXECUTED then GONE:${exec_missing:- none} — every file under \$TMP is a DRIVER unless it is a DECLARED INPUT ($inputs_total matched: fns*/floor-fns.sh/main-handoff*/*-rev.sh/pf-*/skip-arm*/skip-inert.sh/skipwhy-real.sh/poolguard-mut.sh, no shim exemption); the executed set ($exec_total, from the BASH_ENV log) is the population that is actually graded"; fi
 ck "every script this suite EXECUTES carries a \`set -u\` flag ($exec_total observed) and every generated .sh is a driver under one or a declared input ($drivers_total driver(s), $inputs_total declared input(s)) — the population is what runs, not a name pattern" $rc
 _out_late="$(printf '%s\n' "$(_out_map)" | grep -vE '^outpin-(mut|run)/out=(EMPTY|[0-9]+)$' | sed '/^$/d')"
