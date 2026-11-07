@@ -59,8 +59,10 @@ fi
 #                          ⛔ REFUSED when it resolves into a lane worktree — any LINKED git worktree, whatever
 #                          the name, or the fleet's scratch shapes (`*/.worktrees/*`, `/tmp/wt-*`, …) — or under
 #                          a temporary root that no deployment root declares (agent-infra#2697): a unit whose
-#                          ExecStart a cleaning removes retries a 127 for ever while every surface reads
-#                          supervised. The refusal names the durable alternatives (the farm,
+#                          ExecStart a cleaning removes burns its start limit (3 attempts inside 300 s) and
+#                          converges to `failed` in well under a minute — SILENTLY, because nothing pages on
+#                          it, so the fleet still believes the box has a dispatcher. The refusal names the
+#                          durable alternatives (the farm,
 #                          $AGENT_INFRA_PATH/scripts, the harness pin)
 #   ORCH_SUPERVISOR_PREFER a CALLER's preference (cloud-cell-bringup.sh names the layer checkout it just
 #                          installed). A non-durable one is SKIPPED with a loud note and the next candidate is
@@ -163,8 +165,9 @@ help_text() {
 # `systemd-tmpfiles --clean` once they age out of the window the box's own tmpfiles.d sets — `D /tmp … 30d`
 # on this fleet's Ubuntu/systemd-255 image (`/usr/lib/tmpfiles.d/tmp.conf`), 10d on some others; `/tmp` is
 # not its own mount on these cells, so the CLEANER, not a reboot, is the mechanism. After that the unit's
-# ExecStart cannot resolve, `Restart=always` retries a 127 for ever, `is-active` reads `activating`, and
-# NOTHING pages — and the code
+# ExecStart cannot resolve; `Restart=always` burns the unit's start limit (3 attempts inside 300 s), systemd
+# converges it to `failed` in well under a minute, and NOTHING PAGES — the box is not "supervised and
+# retrying", it is DEAD, while the fleet still believes it has a dispatcher. And the code
 # the dispatcher runs is a branch nobody merged. Same seam, three cells, three different ExecStart shapes,
 # all of them "whatever was beside the installer". Measured again on cell-4 in the shape a TEST render
 # leaves behind: `ExecStart="/usr/local/bin/python3.12" "/tmp/rp3055.SzqD2K/converger.py" --repo "o/r"
@@ -232,13 +235,49 @@ git_dirs() { # <dir> — prints "<absolute-git-dir> <git-common-dir>", both reso
     printf '%s %s linked\n' "$gitdir" "$common"
 }
 
+# git_checkout_unproven <dir> — true when <dir> sits inside a git checkout (a `.git` entry at itself or an
+# ancestor — a DIRECTORY in a main clone, a FILE in a linked worktree) and git could not answer about it.
+# ⛔ "GIT COULD NOT ANSWER" IS NOT "NOT A WORKTREE" (re-review P2). `git_dirs` prints nothing both when the
+# path is not a repository AND when git refused or failed — and the caller read that emptiness as "durable".
+# Reproduced before this fix: a linked worktree under a declared root, with a `git` that exits 1 (git's own
+# `detected dubious ownership` refusal, which THIS repo's `CONTROLLER_ALLOW_ROOT=1` shape can produce; a
+# wrapper exporting GIT_DIR; or git absent), rendered `ExecStart=…/lane-checkout/scripts/…` and armed it.
+# Every other unresolvable branch in this file fails CLOSED (`canon_file`, the #2666 unit-dir guard), and so
+# does this one now: a checkout we cannot interrogate is an UNPROVEN worktree, never a deployment.
+# A farmed copy (no `.git` anywhere above it) is unaffected, which is the shape this must not block.
+git_checkout_unproven() {
+    local d="${1:-}"
+    while [ -n "$d" ] && [ "$d" != "/" ]; do
+        [ -e "$d/.git" ] && return 0
+        d="$(dirname "$d")"
+    done
+    return 1
+}
+
 linked_worktree_root() {
-    local d dirs
+    local d dirs top
     d="$(dirname "${1:-}")"
     dirs="$(git_dirs "$d")"
-    [ -n "$dirs" ] || return 0
+    if [ -z "$dirs" ]; then
+        if git_checkout_unproven "$d"; then
+            if command -v git >/dev/null 2>&1; then
+                printf 'it is inside a git checkout (%s) that git itself could not identify — commonly a repository owned by another user (git refuses with "dubious ownership"), a wrapper or environment exporting GIT_DIR, or an unreadable .git — so whether it is a LINKED worktree (a lane checkout removed when the lane ends) cannot be shown' "$d"
+            else
+                printf 'it is inside a git checkout (%s) but git is not on PATH, so whether it is a LINKED worktree (a lane checkout removed when the lane ends) cannot be shown — install git, or point ORCH_SUPERVISOR at a farmed copy outside any checkout' "$d"
+            fi
+            return 0
+        fi
+        return 0
+    fi
     case "$dirs" in *' linked') ;; *) return 0 ;; esac
-    GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --show-toplevel 2>/dev/null
+    # ⛔ "LINKED" WITH NO NAME IS STILL LINKED. The two rev-parse calls already disagreed with the plain-clone
+    # arithmetic, so an unnamed top level is a worktree we cannot spell — not a reason to admit it.
+    top="$(GIT_OPTIONAL_LOCKS=0 git -C "$d" rev-parse --show-toplevel 2>/dev/null)"
+    if [ -z "$top" ]; then
+        printf 'it is inside a LINKED GIT WORKTREE that git reported but could not name (its git-dir and common-dir already disagreed, and `rev-parse --show-toplevel` then failed) — a lane checkout removed when the lane ends'
+        return 0
+    fi
+    printf '%s\n' "$top"
     return 0
 }
 
@@ -327,6 +366,13 @@ scratch_supervisor_reason() {
     # cells' `/tmp/cell-home` is exactly that, recreated by bring-up. Any OTHER declared root (today that is
     # `AGENT_INFRA_PATH`, the cell's `/tmp/cell-ai` checkout) must itself be durable, or be a PRIMARY git
     # clone: a clone is a deployment, a loose directory of copied scripts under /tmp is a lane's scratch.
+    # ⛔ NAMED RESIDUAL (re-review P3): `HOME` and `CELL_HOME` are TRUSTED BY DESIGN, not graded. A caller
+    # that exports `CELL_HOME=/tmp/scratch` can therefore arm a path under it — the same laundering §P7
+    # closes for `AGENT_INFRA_PATH`, one env var over. It is accepted rather than fixed because grading them
+    # would be a FALSE BLOCK on every cell: a cell's home IS `/tmp/cell-home` (transient, not a git clone, not
+    # the passwd home), so any rule that demanded durability of it would refuse every bring-up — the exact
+    # class `runner_autoscale.py` records. A box's own home is the one root where "temporary" is the design,
+    # so the escape is stated here instead of being claimed closed.
     local ch hm
     ch="$(canon_dir "$CELL_HOME")"; case "$ch" in "$CANON_UNRESOLVED"*) ch="" ;; esac
     hm="$(canon_dir "$HOME")";      case "$hm" in "$CANON_UNRESOLVED"*) hm="" ;; esac
@@ -362,6 +408,19 @@ resolve_supervisor() {
     candk=( 1 0 0 0 )
     for i in 0 1 2 3; do
         c="${cands[$i]}"; hard="${candk[$i]}"
+        # ⛔ AN OPERATOR'S REQUIREMENT THAT DOES NOT EXIST IS REFUSED, NEVER SILENTLY SWAPPED (re-review P2).
+        # The candidate loop used to `continue` on a missing path for BOTH strengths, so
+        # `ORCH_SUPERVISOR=<typo or moved checkout>` armed the farmed copy and printed nothing — the
+        # "merged ≠ running" class this seam exists to surface, reintroduced by the fallthrough itself.
+        # A broken symlink and a directory land here too (`-f` is false for both), which is correct: neither
+        # can be the unit's ExecStart.
+        if [ "$hard" = 1 ] && [ -n "$c" ] && [ ! -f "$c" ]; then
+            err "REFUSING: ORCH_SUPERVISOR=$c is not a readable file, so the supervisor the operator named cannot be the unit's ExecStart."
+            err "  It is NOT silently replaced by another copy: a requirement swapped for whatever happened to be farmed is exactly"
+            err "  the merged-not-running class this seam surfaces (agent-infra#2697). Fix the path, or unset ORCH_SUPERVISOR to accept"
+            err "  the defaults (the farm, then beside this installer)."
+            return 1
+        fi
         [ -n "$c" ] && [ -f "$c" ] || continue
         # ⛔ THE VALUE THE UNIT NAMES IS THE VALUE THAT WAS GRADED — resolved, not as spelled, for the same
         # reason `systemd_unit_dir_refusal` grades the resolved unit directory: otherwise the guard and the
@@ -377,8 +436,9 @@ resolve_supervisor() {
                 err "REFUSING to render an ExecStart that will not survive this box: $r"
                 err "  $why."
                 err "  This is the agent-infra#2697 shape, and it fails SILENTLY: once that path is gone the unit's"
-                err "  ExecStart cannot resolve, Restart=always retries a 127 for ever, is-active reads activating,"
-                err "  and nothing pages — while the fleet believes this box has a supervisor."
+                err "  ExecStart cannot resolve, its start limit (3 attempts inside 300 s) is burned inside a minute,"
+                err "  systemd converges it to 'failed' — and nothing pages. Every surface that asks reads a dead"
+                err "  unit, while the fleet still believes this box has a supervisor."
                 err "  Name a DURABLE supervisor instead, any one of:"
                 err "    $HOME/.pi/agent/scripts/cloud-cell-supervisor.sh        (the farm: bash pi-bootstrap/setup.sh)"
                 err "    ${AGENT_INFRA_PATH:-<checkout>}/scripts/cloud-cell-supervisor.sh  (a PRIMARY clone — not a worktree)"
@@ -397,8 +457,8 @@ resolve_supervisor() {
     done
     [ -n "$SUPERVISOR" ] || {
         err "no DURABLE cloud-cell-supervisor.sh to render — looked at \$ORCH_SUPERVISOR, \$ORCH_SUPERVISOR_PREFER, \$HOME/.pi/agent/scripts, and beside this installer."
-        err "  A unit whose ExecStart a cleaning removes is not supervised: Restart=always retries a 127 for ever,"
-        err "  is-active reads activating, and nothing pages (agent-infra#2697). Farm it first, or name a durable copy:"
+        err "  A unit whose ExecStart a cleaning removes is not supervised: the start limit burns inside a minute,"
+        err "  systemd converges it to 'failed', and nothing pages (agent-infra#2697). Farm it first, or name a durable copy:"
         err "    bash pi-bootstrap/setup.sh   # farms \$HOME/.pi/agent/scripts"
         err "    ORCH_SUPERVISOR=$HOME/.pi/agent/scripts/cloud-cell-supervisor.sh bash $0 --install"
         err "  Durable roots this box declares: CELL_HOME=$CELL_HOME, HOME=$HOME${AGENT_INFRA_PATH:+, AGENT_INFRA_PATH=$AGENT_INFRA_PATH}"

@@ -66,11 +66,12 @@ is not a launcher for a session:
 ⛔ **The `ExecStart` PATH MUST OUTLIVE THE SHELL THAT RENDERED IT** (#2697). "The file exists at
 render time" is not a property systemd can rely on at boot. Measured on cell-1:
 `ExecStart=/bin/bash /tmp/wt-2433-fu/scripts/cloud-cell-supervisor.sh start` — a **lane worktree** at an
-unmerged branch — so once that path goes the unit's `ExecStart` cannot resolve, `Restart=always` retries
-a 127 for ever, `is-active` reads `activating`, and **nothing pages**. `/tmp` is not its own mount on
-these cells, so the mechanism is `systemd-tmpfiles --clean` once the entry ages out of the window the box's
-own `tmpfiles.d` sets (`D /tmp … 30d` on this fleet's Ubuntu/systemd-255 image, `10d` on some others),
-not a reboot: the box looks healthy for a while and then fails silently.
+unmerged branch — so once that path goes the unit's `ExecStart` cannot resolve; `Restart=always` burns the
+unit's start limit (**3 attempts inside 300 s**), systemd converges it to `failed` in well under a minute,
+and **nothing pages** — every surface that asks reads a dead unit, not a retrying one. `/tmp` is not its own
+mount on these cells, so the mechanism is `systemd-tmpfiles --clean` once the entry ages out of the window
+the box's own `tmpfiles.d` sets (`D /tmp … 30d` on this fleet's Ubuntu/systemd-255 image, `10d` on some
+others), not a reboot: the box looks healthy for a while and then goes silently dead.
 
 So the installer **refuses to render** a supervisor that resolves into a lane worktree, or under a
 temporary root that no deployment root on this box declares. The roots it accepts under a temporary root
