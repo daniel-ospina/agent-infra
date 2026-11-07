@@ -564,9 +564,9 @@ else
 fi
 # ⛔ AND ITS ExecStart MUST BE A PATH THAT OUTLIVES THE LANE (agent-infra#2697). The bring-up prefers the
 # LAYER's supervisor; when the layer IS a lane worktree that preference must be skipped, never rendered — a
-# unit whose ExecStart a lane reap removes retries a 127 for ever while every surface reads supervised. This
-# assertion is location-independent on purpose: on a durable checkout the layer path IS correct, and on a
-# worktree the farm is.
+# unit whose ExecStart a lane reap removes burns its start limit, converges to `failed` inside a minute, and
+# nothing pages. This assertion is location-independent on purpose: on a durable checkout the layer path IS
+# correct, and on a worktree the farm is.
 case "$(sed -n 's|^ExecStart=/bin/bash \(.*\) start$|\1|p' "$T/systemd-units/eldato-orchestrator.service" 2>/dev/null | head -1)" in
   */.worktrees/*) bad "the controller unit's ExecStart is a LANE WORKTREE path — the measured #2697 defect, re-shipped: $(grep -h '^ExecStart' "$T/systemd-units/eldato-orchestrator.service")" ;;
   '') bad "the controller unit carries no readable ExecStart — cannot tell what this box would boot" ;;

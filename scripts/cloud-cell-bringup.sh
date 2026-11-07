@@ -2434,9 +2434,10 @@ check_controller_service() {
   # ⛔ A PREFERENCE, NOT A REQUIREMENT (agent-infra#2697). This names the layer's own copy so the unit runs
   # the code this bring-up just installed rather than a possibly-stale farm — but the layer may BE a lane
   # worktree (`self_root` is one whenever a lane runs this script from its own checkout), and a unit whose
-  # ExecStart a lane reap removes is the measured #2697 defect: `Restart=always` retries a 127 for ever and
-  # nothing pages. The INSTALLER owns the durability rule and skips a non-durable preference loudly, falling
-  # through to the farm. `ORCH_SUPERVISOR` there is a hard requirement and would have refused instead.
+  # ExecStart a lane reap removes burns its start limit inside a minute, converges to `failed`, and nothing
+  # pages — the measured #2697 defect. The INSTALLER owns the durability rule and skips a non-durable
+  # preference loudly, falling through to the farm. `ORCH_SUPERVISOR` there is a hard requirement and would
+  # have refused instead.
   [ -n "$layer_sup" ] && cenv+=("ORCH_SUPERVISOR_PREFER=$layer_sup")
   # ⛔ NAME THE LAYER ROOT TO THE INSTALLER, IF IT IS NOT ON THE PROFILE'S PATH (agent-infra#2697). The
   # installer REFUSES to render an ExecStart under a temporary root that no deployment root declares, and a
