@@ -180,6 +180,81 @@ function deepForbiddenKeys(node, path, out) {
   return out;
 }
 
+/**
+ * ── THE SHARD AXIS: WIDTH AND `fail-fast` — the two premises the rail's `≡` mapping rests on ───
+ *
+ * `scripts/admin-merge.sh` maps a PR-lane `bash-suites (<n>)` red onto main's
+ * `script-validate (<n>)` and states it as an **EQUIVALENCE OF THE SAME SHARD SET**. Slice membership
+ * is POSITIONAL (`scripts/run-bash-shards.sh`: `slice_pos % slice_count`, and `(NR - 1) % n == i`),
+ * so slice `n` of one lane covers the same shards as slice `n` of the other ONLY when both lanes have
+ * the same WIDTH and both derive their list from the one runner. The list half is asserted by this
+ * file already (both lanes call the same runner); the WIDTH half is asserted here. Without it,
+ * widening ONE lane's `matrix.shard` — a hand-kept number in two files — leaves the mapping matching
+ * by index across DIFFERENT shard sets: a PR-introduced red could be excluded as base-owned (the
+ * fail-open direction), or a base red could be reported as having no counterpart (#2610's false
+ * absence). No workflow edit at all is needed for the same drift: the per-slice sizes are DERIVED,
+ * so adding one suite shifts the positional numbering under both widths.
+ *
+ * `strategy.fail-fast` is the other property of the same matrix, and the most load-bearing line in
+ * main's change: at GitHub's default `true` one failing slice CANCELS the queued and in-progress
+ * siblings, those legs report `cancelled` — which the merge rail treats as NON-RED — and the
+ * runner's per-slice coverage assertion never executes in them, so all but one of the list's slices
+ * go unexecuted and unasserted while the job reads as "the matrix ran". Deleting the key reddens
+ * nothing on its own (the content lock asserts *unchanged*, not *correct*), so the VALUE is asserted
+ * here.
+ *
+ * Both are VALUE assertions on parsed nodes, per #666. `fail-fast: false` is the string `"false"` to
+ * this reader (scalar types are deliberately not resolved), and `shard:` is a parsed array. A
+ * `strategy:`/`matrix:`/`shard:` this reader cannot resolve to a value is REFUSED rather than
+ * assumed: an unreadable width is not a matched width, and an unreadable `fail-fast` is not a false.
+ */
+const isMapping = (n) => n !== null && typeof n === "object" && !Array.isArray(n);
+
+function shardAxis(label, file, jobName, job) {
+  const noAxis = { width: 0 };
+  const strategy = job.strategy;
+  if (strategy === undefined || strategy === null) return noAxis;
+  if (!isMapping(strategy)) {
+    refuse(
+      `${label} lane job '${jobName}' in ${file} has a 'strategy' that is not a mapping (${JSON.stringify(strategy)}) — its matrix width and 'fail-fast' would then be unassertable, and an unreadable premise is not a satisfied one; exiting 2`
+    );
+  }
+  const matrix = strategy.matrix;
+  if (matrix === undefined || matrix === null) return noAxis;
+  if (!isMapping(matrix)) {
+    refuse(
+      `${label} lane job '${jobName}' in ${file} has a 'strategy.matrix' that is not a mapping (${JSON.stringify(matrix)}) — the shard axis (and so the slice width the rail's slice-to-slice mapping rests on) cannot be read; exiting 2`
+    );
+  }
+  const shard = matrix.shard;
+  if (shard === undefined || shard === null) return noAxis;
+  if (!Array.isArray(shard)) {
+    refuse(
+      `${label} lane job '${jobName}' in ${file} has a 'matrix.shard' this guard cannot resolve to a list (${JSON.stringify(shard)}) — slice membership is positional, so an unreadable width cannot be matched against the other lane's; exiting 2`
+    );
+  }
+  if (shard.length === 0) {
+    refuse(
+      `${label} lane job '${jobName}' in ${file} has an EMPTY 'matrix.shard' axis — a matrix with no slice runs nothing while reading as a matrix that ran; exiting 2`
+    );
+  }
+  const width = shard.length;
+  const hasKey = Object.prototype.hasOwnProperty.call(strategy, "fail-fast");
+  const failFast = hasKey ? String(strategy["fail-fast"]).trim() : null;
+  if (failFast !== "false") {
+    err(
+      `${label} lane job '${jobName}' in ${file} carries a 'matrix.shard' axis (width ${width}) but does not set 'strategy.fail-fast: false' (${
+        hasKey ? `found '${failFast}'` : "the key is ABSENT, and GitHub's default is TRUE"
+      }) — one failing slice then CANCELS its queued and in-progress siblings, those legs report 'cancelled' (which the merge rail treats as NON-RED), and the runner's per-slice coverage assertion never executes in them, so ${
+        width - 1
+      }/${width} of the list can go unexecuted and unasserted while the job reads as having run; exiting 2`
+    );
+    process.exit(2);
+  }
+  note(`   ✅ ${label}: job '${jobName}' is a ${width}-way shard matrix with 'fail-fast: false'`);
+  return { width };
+}
+
 function checkLane(label, workflowFile, jobName) {
   const wf = parse(workflowFile);
   if (!wf || typeof wf !== "object") {
@@ -317,7 +392,7 @@ function checkLane(label, workflowFile, jobName) {
   } else {
     process.stdout.write(`   ✅ ${label} lane (${jobName}) calls ${RUNNER}\n`);
   }
-  return exact;
+  return { exact, ...shardAxis(label, file, jobName, job) };
 }
 
 /**
@@ -373,13 +448,31 @@ function checkRunner() {
   return { shards: shards.length, globs: globs.length };
 }
 
-const prCount = checkLane("PR", PR_WORKFLOW, PR_JOB);
-const mainCount = checkLane("main", MAIN_WORKFLOW, MAIN_JOB);
+const prLane = checkLane("PR", PR_WORKFLOW, PR_JOB);
+const mainLane = checkLane("main", MAIN_WORKFLOW, MAIN_JOB);
 const { shards, globs } = checkRunner();
 
-if (rc === 0 && prCount >= 1 && mainCount >= 1) {
+// THE SLICE WIDTHS MUST AGREE — see shardAxis() for why the rail's `bash-suites (n)` →
+// `script-validate (n)` mapping is only an equivalence of the SAME shard set at equal widths.
+// Both-absent (0/0) is equal and vacuous: with no shard axis in either lane there is no slice to
+// map, and the rail falls back to the bare names.
+if (prLane.width !== mainLane.width) {
+  const shown = (w) => (w === 0 ? "0 (no shard matrix)" : String(w));
+  err(
+    `the two lanes' 'matrix.shard' widths DIFFER — ${PR_JOB} (${base(PR_WORKFLOW)}) has ${shown(
+      prLane.width
+    )}, ${MAIN_JOB} (${base(MAIN_WORKFLOW)}) has ${shown(
+      mainLane.width
+    )}. ${"scripts/admin-merge.sh"} maps 'bash-suites (<n>)' onto 'script-validate (<n>)' and states it as the SAME shard set; slice membership is POSITIONAL (index % width), so at different widths slice n of one lane is a DIFFERENT set of shards from slice n of the other — a PR-introduced red could then be excluded as base-owned, or a base red reported as having no counterpart (#2610). Make the two widths equal; exiting 2`
+  );
+  process.exit(2);
+}
+
+if (rc === 0 && prLane.exact >= 1 && mainLane.exact >= 1) {
   say(
-    `✅ check-ci-lane-parity: both lanes call ${RUNNER} — ${shards} shard(s), ${globs} sweep target(s)`
+    `✅ check-ci-lane-parity: both lanes call ${RUNNER} — ${shards} shard(s), ${globs} sweep target(s), slice width ${
+      prLane.width === 0 ? "none" : prLane.width
+    } in both lanes`
   );
 }
 process.exit(rc);

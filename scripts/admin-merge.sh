@@ -100,6 +100,18 @@
 # bare name is only what an older base sha still calls the whole list. Stating the pair as
 # `⊇ script-validate` ALONE — as this block did until #3392's review — describes the fallback
 # and hides the arm the code prefers.
+# ⛔ AND THE `≡` IS CONDITIONAL, WHICH IS SAID HERE RATHER THAN ASSUMED (review of #3392 at
+# db796b321). Slice membership is POSITIONAL (`slice_pos % slice_count`,
+# `scripts/run-bash-shards.sh`), so the base's `script-validate (<n>)` covers the shards the PR's
+# `bash-suites (<n>)` covers ONLY while (a) both lanes' `matrix.shard` WIDTHS are EQUAL and (b) both
+# lanes DERIVE their list from the one runner. (a) is now ASSERTED rather than assumed: the width is
+# a hand-kept number in two files, so `scripts/check-ci-lane-parity.mjs` REFUSES two lanes whose
+# widths differ, with mutant rows in `tests/ci-lane-parity/run.sh` §13. (b) is asserted at the CALL
+# SITE by the same guard (each lane's step must BE the bare runner call, which is what makes the
+# list one list) — and the part NO CHECK CAN SEE is the positional shift that follows: the per-slice
+# sizes are DERIVED, so adding or removing ONE suite re-partitions BOTH lanes at unchanged widths,
+# and the same `(<n>)` then names a different set of shards on each side. That residual is
+# disclosed with the others below, not excused.
 #
 # WHY IT IS TRUE — the repo says it about itself. ⚠️ EVERY ci.yml COORDINATE BELOW IS
 # ANCHORED BY ITS QUOTED TEXT, and the quotes are the authority: ci.yml is a busy file
@@ -267,6 +279,14 @@
 # refused for its OWN reason — and it is refused BEFORE this exclusion is ever reached, since
 # both attribution legs run ahead of §4.5. The exclusion is a statement about a
 # NAME the base already fails; it is never a licence for a NEW failure inside that name.
+# ⛔ THE THIRD RESIDUAL, NAMED: AT EQUAL WIDTHS THE `(<n>)` PAIRING IS STILL POSITIONAL, AND NOTHING
+# ASSERTS THE DERIVED LIST (a pre-matrix base's lane-granularity is the second, above). Both lanes
+# run the same runner, whose per-slice sizes are DERIVED from the list it discovers — so a commit
+# that adds or removes ONE suite shifts the numbering under both widths at once and no workflow edit
+# occurs for a check to see. The width half (b) is asserted by
+# `scripts/check-ci-lane-parity.mjs`; this half is unassertable by construction, because the same
+# derived list is what makes the two lanes one list. It is stated so a later reader does not
+# mistake equal widths for a guarantee of equal shard SETS.
 # ⛔ WHAT THE SUITE DOES AND DOES NOT PROVE. §80's fixtures carry no failing run, so the
 # "blocked by the decision -> re-run" leg is not entered and §4.5 is the SOLE blocker in
 # every scenario. §80 therefore pins the intended property — an inherited red no longer
@@ -1765,6 +1785,11 @@ fetch_run_failed_job_names() {
 # ⛔ THE ORDER IS THE STATEMENT: slice-to-slice is an EQUIVALENCE OF THE SAME SHARD SET (stronger
 # than the old containment), and the bare name is the weaker legacy candidate. The caller takes the
 # FIRST candidate that actually appears in the base's red list, so an old base still matches.
+# ⛔ AND IT IS CONDITIONAL ON THE TWO PREMISES THE HEADER NAMES: equal `matrix.shard` widths in both
+# lanes (ASSERTED — `scripts/check-ci-lane-parity.mjs`, mutant rows `tests/ci-lane-parity/run.sh`
+# §13) and one DERIVED list (the call site is asserted; the positional shift an added suite causes is
+# not, and is disclosed in the header's third residual). Read `≡` as "the same slice INDEX, which is
+# the same shard set while those hold" — not as an unconditional identity.
 # No exit status is used to mean "no equivalence": an empty stdout is the answer, so a
 # caller can never mistake "not mapped" for a failure of the mapping.
 declared_base_equivalent() {

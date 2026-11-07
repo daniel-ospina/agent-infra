@@ -39,6 +39,15 @@
 #      no-op gate.
 #  11. THE RUNNER'S OWN CONTRACT — `--list` prints the shard list (the same source the guard's
 #      floor reads), and it is long enough to be a real list.
+#  12. DERIVATION — the list is DISCOVERED from the tree, not enumerated (#2609), and a slice of it
+#      really covers every shard exactly once.
+#  13. THE SLICE-TO-SLICE PREMISES (#2483) — the two lanes' `matrix.shard` widths must AGREE (the
+#      rail maps `bash-suites (n)` onto `script-validate (n)` and calls it the SAME shard set, which
+#      holds only at equal widths, since slice membership is positional), and a job carrying a
+#      shard axis must set `strategy.fail-fast: false` (at GitHub's default TRUE one failing slice
+#      cancels its siblings, they report `cancelled` — NON-RED to the rail — and ~7/8 of the list
+#      runs unexecuted and unasserted while the job reads as having run). Each has its own mutant
+#      row, plus a both-widened control proving the assertion is the MISMATCH and not the number 8.
 #
 # NOTE ON STYLE: runs inside a command substitution are written as `cmd >file` + `cat file`,
 # never `OUT="$(… bash …)"` — the main-worktree-guard content walker (#1484) refuses to execute
@@ -1423,9 +1432,18 @@ echo '8ac8. A FLOW-MAPPING __proto__ KEY -> rc 2 (it must not hand the guard a n
 # `out[key] = value`, which hits Object.prototype's `__proto__` setter). Fixed at the root: the
 # parser creates OWN properties, as real YAML does. The control below proves flow mappings are still
 # READ (so this pin cannot pass merely because flow style is refused).
+#
+# ⛔ THE COUNTERPART LANE IS SYNTHETIC ON PURPOSE (review of this change, cycle 5, finding 2). These
+# two arms are about FLOW STYLE; comparing the synthetic PR document against the REAL `$MAIN` would
+# add an unrelated 8-way shard matrix on one side and no matrix on the other, which the guard now
+# REFUSES as a width divergence — and then the `__proto__` arm would pass for the width reason
+# instead of the property it names. So the main lane here is a matrix-less stub of the same shape,
+# and each arm measures exactly one thing.
+printf 'name: x\njobs: {script-validate: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}\n' \
+  >"$TMP/ci-main-flow.yml"
 printf 'name: x\non: pull_request\njobs: {__proto__: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}}\n' \
   >"$TMP/ci-pr-proto.yml"
-guard_rc "$MAIN" "$TMP/ci-pr-proto.yml"
+guard_rc "$TMP/ci-main-flow.yml" "$TMP/ci-pr-proto.yml"
 if [ "$RC" -eq 2 ]; then
   pass "a flow-mapping __proto__ key exits 2 (the lane is not declared, so it is not covered)"
 else
@@ -1433,7 +1451,7 @@ else
 fi
 printf 'name: x\non: pull_request\njobs: {bash-suites: {runs-on: ubuntu-latest, steps: [{run: "bash scripts/run-bash-shards.sh"}]}}\n' \
   >"$TMP/ci-pr-flowok.yml"
-guard_rc "$MAIN" "$TMP/ci-pr-flowok.yml"
+guard_rc "$TMP/ci-main-flow.yml" "$TMP/ci-pr-flowok.yml"
 if [ "$RC" -eq 0 ]; then
   pass "control: an ordinary flow-mapping job IS read (the pin above is not 'flow style is refused')"
 else
@@ -2243,6 +2261,123 @@ if [ "$BADMOD_RC" -eq 1 ] && grep -q 'executed a DIFFERENT SET' <<<"$BADMOD_OUT"
   pass "control: a broken modulus that keeps the COUNT right is caught by the SET assertion"
 else
   fail "a broken modulus was not caught on the set (rc $BADMOD_RC): $(printf '%s' "$BADMOD_OUT" | tail -2 | tr '\n' '|')"
+fi
+
+echo ""
+echo "13. THE SLICE-TO-SLICE PREMISES — equal matrix widths, and fail-fast: false on a shard matrix"
+# ⛔ WHY (agent-infra#2483). Two properties the change now DEPENDS ON were stated as established and
+# asserted NOWHERE — the non-vacuity class this repo treats as a defect, not a nit:
+#
+#   (a) THE WIDTHS MUST AGREE. `scripts/admin-merge.sh` maps a PR-lane `bash-suites (<n>)` red onto
+#       main's `script-validate (<n>)` and states it as an EQUIVALENCE OF THE SAME SHARD SET. Slice
+#       membership is POSITIONAL (`scripts/run-bash-shards.sh`: `slice_pos % slice_count`), so that is
+#       an equivalence only while BOTH lanes have the SAME width — and the width is a hand-kept number
+#       in two files. Widen ONE lane and the rail matches by index across DIFFERENT shards: a
+#       PR-introduced red becomes excludable as base-owned (the fail-open direction), or a base red is
+#       reported as having no counterpart (#2610's false absence). No workflow edit is even needed for
+#       the same drift in list terms — the per-slice sizes are DERIVED, so one added suite re-partitions
+#       both lanes' slices at unchanged widths. The width half is what a guard can see.
+#
+#   (b) `strategy.fail-fast: false` MUST BE THERE. At GitHub's default TRUE one failing slice CANCELS
+#       the queued and in-progress siblings, those legs report `cancelled` (NON-RED to the rail), and
+#       the runner's per-slice coverage assertion never executes in them — all but one slice of the
+#       list unexecuted and unasserted while the job reads as having run. Deleting the key reddens
+#       NOTHING today: the content lock asserts *unchanged*, not *correct* (#666).
+#
+# Both mutations are COPIES under $TMP; the shipped workflows are not edited, so the lock is untouched.
+
+# 13a. main's lane loses `fail-fast: false` while keeping its shard matrix → rc 2, naming fail-fast.
+awk '
+  /^  script-validate:$/ { injob = 1 }
+  injob && /^      fail-fast: false$/ { injob = 0; next }
+  { print }
+' "$MAIN" >"$TMP/ci-main-nofailfast.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-nofailfast.yml"; then
+  fail "(13a) the fail-fast-drop mutation did not change ci-main.yml — this arm would measure nothing"
+else
+  guard_rc "$TMP/ci-main-nofailfast.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'fail-fast' <<<"$OUT"; then
+    pass "(13a) deleting 'fail-fast: false' from main's shard matrix is REFUSED (rc 2, naming fail-fast)"
+  else
+    fail "(13a) a main lane with no fail-fast returned rc $RC (want 2, naming fail-fast): $OUT"
+  fi
+fi
+
+# 13b. ...and the hazard spelled the other way: an explicit `fail-fast: true` → rc 2.
+awk '
+  /^  script-validate:$/ { injob = 1 }
+  injob && /^      fail-fast: false$/ { print "      fail-fast: true"; injob = 0; next }
+  { print }
+' "$MAIN" >"$TMP/ci-main-failfasttrue.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-failfasttrue.yml"; then
+  fail "(13b) the fail-fast:true mutation did not change ci-main.yml"
+else
+  guard_rc "$TMP/ci-main-failfasttrue.yml" "$PR"
+  if [ "$RC" -eq 2 ]; then
+    pass "(13b) 'fail-fast: true' on a shard matrix is REFUSED (rc 2)"
+  else
+    fail "(13b) 'fail-fast: true' returned rc $RC (want 2): $OUT"
+  fi
+fi
+
+# 13c. WIDEN MAIN ONLY (8 → 9). This is the direction that matters for the merge gate: slice n of a
+#      9-wide main is a DIFFERENT set of shards from slice n of an 8-wide PR lane.
+awk '
+  /^  script-validate:$/ { injob = 1 }
+  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
+    print "        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]"; injob = 0; next
+  }
+  { print }
+' "$MAIN" >"$TMP/ci-main-wide9.yml"
+if cmp -s "$MAIN" "$TMP/ci-main-wide9.yml"; then
+  fail "(13c) the main-width mutation did not change ci-main.yml"
+else
+  guard_rc "$TMP/ci-main-wide9.yml" "$PR"
+  if [ "$RC" -eq 2 ] && grep -q 'widths DIFFER' <<<"$OUT"; then
+    pass "(13c) widening ONLY main's shard matrix (8→9) is REFUSED (rc 2, naming the widths)"
+  else
+    fail "(13c) a 9-wide main against an 8-wide PR lane returned rc $RC (want 2, naming the widths): $OUT"
+  fi
+fi
+
+# 13d. WIDEN THE PR LANE ONLY (8 → 9) — the mirror case, and the one that produces #2610's false
+#      absence: `bash-suites (9)`/`(10)` would map to slices no base publishes.
+awk '
+  /^  bash-suites:$/ { injob = 1 }
+  injob && /^        shard: \[1, 2, 3, 4, 5, 6, 7, 8\]$/ {
+    print "        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9]"; injob = 0; next
+  }
+  { print }
+' "$PR" >"$TMP/ci-pr-wide9.yml"
+if cmp -s "$PR" "$TMP/ci-pr-wide9.yml"; then
+  fail "(13d) the PR-width mutation did not change ci.yml"
+else
+  guard_rc "$MAIN" "$TMP/ci-pr-wide9.yml"
+  if [ "$RC" -eq 2 ] && grep -q 'widths DIFFER' <<<"$OUT"; then
+    pass "(13d) widening ONLY the PR lane's shard matrix (8→9) is REFUSED (rc 2, naming the widths)"
+  else
+    fail "(13d) a 9-wide PR lane against an 8-wide main lane returned rc $RC (want 2, naming the widths): $OUT"
+  fi
+fi
+
+# 13e. CONTROL — the refusal above is about the MISMATCH, not about the number 8: BOTH lanes widened
+#      to 9 must be GREEN. Without this row a guard that simply hardcoded "width == 8" would satisfy
+#      13c/13d while refusing a legitimate future widening of both lanes.
+guard_rc "$TMP/ci-main-wide9.yml" "$TMP/ci-pr-wide9.yml"
+if [ "$RC" -eq 0 ]; then
+  pass "(13e) control: both lanes widened to 9 together is GREEN (the assertion is the mismatch, not the width)"
+else
+  fail "(13e) control: two 9-wide lanes were refused (rc $RC) — the arm is measuring the width, not the mismatch: $OUT"
+fi
+
+# 13f. CONTROL — the shipped tree is the green case for BOTH new premises at once (a guard that
+#      refused every matrix would make 13a-13d vacuous; arm 0 already covers the full run, this names
+#      the value it now reads).
+guard_rc "$MAIN" "$PR"
+if [ "$RC" -eq 0 ] && grep -q 'slice width 8 in both lanes' <<<"$OUT"; then
+  pass "(13f) control: the shipped lanes are an 8-wide shard matrix in both lanes, green, with the width read from the documents"
+else
+  fail "(13f) control: the shipped tree did not report an agreed 8-wide slice (rc $RC): $OUT"
 fi
 
 echo ""
