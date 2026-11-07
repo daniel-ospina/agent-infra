@@ -1,0 +1,42 @@
+{
+  "_ref": "refs/lanes/cmux.kprfix-prd-daniel-ospina-tortoise-11217-1794046585-p2290835-7830ee72",
+  "_sha": "774b4f214d3f1a3197392251acbc847be71b5501",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/home/cmux/orchestrator/bg/prd-daniel-ospina-tortoise-11217.log"
+    },
+    {
+      "kind": "branch",
+      "value": "fix/11200-main-red-evidence-affiliation-and-evictor-census"
+    },
+    {
+      "kind": "sha",
+      "value": "7ab0b8c3cf2fe18fa93b4acd05db42cb14018f68"
+    },
+    {
+      "kind": "worktree",
+      "value": "/home/cmux/tortoise/.worktrees/fix-11217"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 7800,
+  "duration_s": 7215,
+  "ended_at": 1794053800,
+  "exit_code": 143,
+  "heartbeat_at": 1794053800,
+  "host": "cmux",
+  "issue": null,
+  "kind": "prfix",
+  "lane_id": "cmux.kprfix-prd-daniel-ospina-tortoise-11217-1794046585-p2290835-7830ee72",
+  "lease_until": 1794061600,
+  "pid": 2290835,
+  "reason": "bound:exceeded-wallclock",
+  "repo": "daniel-ospina/tortoise",
+  "schema": 1,
+  "started_at": 1794046585,
+  "state": "FAILED",
+  "tag": "prd-daniel-ospina-tortoise-11217",
+  "worktree": "/home/cmux/tortoise/.worktrees/fix-11217"
+}
