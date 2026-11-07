@@ -1305,9 +1305,11 @@ export class McpServerManager {
    * ⛔ `DELTA` IS ONE-WAY. A repo can ADD a server, or OVERRIDE fields of one of the base's; it
    * cannot REMOVE a base server, because there is no tombstone in this schema and `McpServerConfig`
    * has no `disabled` field. A base server that is wrong or unspawnable for one repo cannot be vetoed
-   * from that repo — see #3612 for the tombstone (`"<name>": { "disabled": true }`) that would
-   * close this. Writing `"<name>": null` is NOT that: it is dropped with a warning (see `asMcpJson`),
-   * and the base's entry still applies.
+   * from that repo — #3692 is the open issue for the tombstone (`"<name>": { "disabled": true }`) that
+   * would close this. ⛔ Do not point at #3612 here: it is CLOSED and proposes no tombstone, so a
+   * reader who follows it lands on nothing (that dead end was found in review of this PR, in three
+   * places, and this is the last of them). Writing `"<name>": null` is NOT that: it is dropped with a
+   * warning (see `asMcpJson`), and the base's entry still applies.
    */
   async connectAllLayers(paths: McpConfigPaths): Promise<void> {
     const read = async (p: string | null, layer: "base" | "repo"): Promise<McpJson | null> => {

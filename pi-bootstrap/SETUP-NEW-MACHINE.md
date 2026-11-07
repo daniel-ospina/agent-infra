@@ -223,8 +223,10 @@ machine's pi instance.
 
   There is **no way to REMOVE a base server** from a repo layer (`"<name>": null`
   is ignored, with a warning, and an ambiguous entry leaves the base entry in
-  place) — see #3612 for the `disabled` tombstone that would
-  add one. The base is
+  place) — #3692 is the open issue for the `disabled` tombstone that would
+  add one. (Not #3612: that issue is closed and proposes no tombstone, so the
+  pointer dead-ended exactly where a reader goes to learn how to turn a server
+  off.) The base is
   machine-local and is never shipped, so this is also how an INTERNAL server reaches
   every repo without being written into a product repo's tracked config. Base servers: brave-search,
   playwright-browser, gemini, tortoise (`seo-intelligence`, the Perplexity
