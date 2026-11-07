@@ -187,9 +187,12 @@ machine's pi instance.
     `url`/`command` alone and never reads `type`, so an unrecognised `type` (even
     `sse`) only earns a warning — a self-hosted entry spelling `type: "sse"` for
     its own daemon WORKS, and both `pi-bootstrap/lib/merge-mcp.py` and
-    `pi-bootstrap/cell-install.sh` rule on that explicitly. A **truthy** non-string
-    `url`/`command` (`["https://…"]`), or a name outside `[A-Za-z0-9_-]`, makes the
-    entry invalid — it is dropped rather than stringified into a live request. A
+    `pi-bootstrap/cell-install.sh` rule on that explicitly. When a LAYER is read
+    by the extension, a **truthy** non-string `url`/`command` (`["https://…"]`),
+    or a name outside `[A-Za-z0-9_-]`, makes the entry invalid — it is dropped
+    rather than stringified into a live request. (This is the layer reader's
+    guarantee: `McpServerManager.connectAll` parses JSON directly and applies no
+    such filter, so a config handed to that entry point is trusted as written.) A
     **falsy** value (`""`, `null`, `false`) is treated differently: only that
     FIELD is removed and the entry kept, because the client dispatches on whether
     `url` is *truthy*, so `{ "url": "", "command": … }` really does run over the

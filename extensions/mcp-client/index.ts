@@ -759,8 +759,10 @@ export function mergeMcpLayers(
 
   for (const [name, entry] of Object.entries(repoServers)) {
     if (!isServerEntry(entry) || !isValidServerName(name)) continue;
-    // `Object.hasOwn`, never a truthiness read: `merged["constructor"]` on a prototype-bearing object
-    // returns a FUNCTION, so a repo-only server with that name would take the delta path.
+    // `Object.hasOwn`, never a truthiness read. `merged` is null-prototype HERE (below), so this is not
+    // load-bearing today — the name lock above already refuses `constructor`/`__proto__`/`prototype`. It
+    // is the belt for the day this map is built as a plain object: then `merged["constructor"]` would
+    // answer a FUNCTION and a repo-only server with that name would silently take the DELTA path.
     const inherited = Object.hasOwn(merged, name) ? merged[name] : undefined;
     if (!inherited) {
       // No base entry to defend, so the ruling is the same as for the BASE layer: a repo-only entry

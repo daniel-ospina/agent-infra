@@ -961,6 +961,26 @@ await test("a base `type` describing NO transport is dropped when the repo decla
   equal((toHttp.u as Record<string, unknown>)?.type, undefined, "and the same in the other direction");
 });
 
+await test("a BASE-owned incoherent `type` is not blamed on the repo (the note follows the pen that wrote it)", async () => {
+  // The projection can be incoherent because the BASE's label was, and the repo never wrote a `type`.
+  // The note used to fire anyway — sending the operator to edit a repo file that does not contain the
+  // field. At the LAYER level `asMcpJson` reports the base's own contradiction; this test covers the
+  // merge, where no repo attribution is owed at all.
+  let merged: Record<string, unknown> = {};
+  const logs = await withCapturedLogs(async () => {
+    merged = mergeMcpLayers(
+      { mcpServers: { t: { type: "http", command: "/bin/sh", lazy: true } } } as never,
+      { mcpServers: { t: { args: ["-x"] } } } as never,
+    );
+  });
+  const t = merged.t as Record<string, unknown> | undefined;
+  equal(t?.command, "/bin/sh", "the delta applies and the entry is kept");
+  ok(
+    !logs.some(l => l.includes("repo entry") && l.includes("disagrees with its transport")),
+    `the repo wrote no \`type\`, so it must not be blamed — got:\n${logs.join("\n")}`
+  );
+});
+
 await test("a SAME-transport delta INHERITS the base's `type` (a delta declares what it changes, not what it drops)", () => {
   // `delete carry.type` fired whenever the repo declared a transport, so restating the SAME url — or
   // setting only `timeout` on an identical launch — silently dropped a field the repo never touched,
