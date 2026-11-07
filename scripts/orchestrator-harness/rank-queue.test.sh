@@ -3034,9 +3034,14 @@ ck "(14e) non-vacuity: with the clip stripped from the arms the clause disappear
 #   * it pins EVERY REGULAR FILE AT THE TOP LEVEL of a case directory, except the deny-list below — so a fixture's
 #     top-level INPUTS (`pool`, `q`, `seed`, `cnt`, a generated `*.awk`) are pinned too. That is deliberate: a
 #     fixture whose input silently changes grades a different scenario than the one this suite claims to drive.
-#     RESIDUAL, STATED: files a fixture writes INSIDE a case-dir SUBDIRECTORY (the `<case>/o/` per-run object dir
-#     holding `candidates.txt`, `.pool`, `.pool-sat`, the product file) are NOT scanned — they are the code's
-#     INPUTS, not text it prints, and the assertions that read them compare them directly;
+#     RESIDUAL, STATED — TWO unscanned populations, both declared rather than implied:
+#       (a) files a fixture writes INSIDE a case-dir SUBDIRECTORY (the `<case>/o/` per-run object dir holding
+#           `candidates.txt`, `.pool`, `.pool-sat`, the product file) — the code's INPUTS, not text it prints, and
+#           the assertions that read them compare them directly; measured: a claim written into `<case>/o/` leaves
+#           the suite at 176/0;
+#       (b) regular files written DIRECTLY under `$TMP` (the `*.sh` fixture helpers, the `*.txt` drive inputs, the
+#           mutant sources) — fixture INPUTS and helpers, never a capture; measured: a claim written to
+#           `$TMP/claim.txt` leaves the suite GREEN. A fixture that captures into a CASE DIR is covered;
 #   * four captures are DELIBERATELY NOT PINNED because their emitted text depends on the CALLER'S UID, measured by
 #     running this suite twice (once as cmux, once as root) with an EMPTY exclusion list: `arm-clip-unread/out`,
 #     `mh-mode000/out`, `poolguards/m000.log`, `sa-unreadable/out`. Root can read a mode-000 file, so those fixtures
@@ -3065,10 +3070,12 @@ _out_uid_excluded='arm-clip-unread/out mh-mode000/out poolguards/m000.log sa-unr
 # EXCEPT two short deny-lists of things that are not the operator's output —
 #   * by NAME (`order`, `rc`, `out-ctl`, `out-mut`, `mutlog`) — and the reason differs per name, which the earlier
 #     wording hid by saying "each compared inside its own check": ONLY `order` (the queue's post-run bytes) and
-#     `out-mut` (the mutated drive's stdout) are read by a check. `rc` (the drive's exit status), `mutlog` (the
-#     no-op mutant's log, superseded by the product-file assertion that replaced it) and `out-ctl` (the control
-#     drive's stdout — EMPTY on its fixture; the control's evidence is its XTRACE, read via `_dwit`) are recorded
-#     and never compared. They are excluded as post-mortem artefacts, not as graded ones;
+#     `out-mut` (the mutated drive's stdout) are read by a check. `rc` (the drive's exit status) and `mutlog` (the
+#     no-op mutant's log, superseded by the product-file assertion that replaced it) are recorded and never compared
+#     — post-mortem artefacts, excluded as UNGRADED. `out-ctl` is the control run's stdout and is BYTE-IDENTICAL to
+#     the PINNED `arm-clip-head/out-head` (measured: `cmp` reports no difference, and both occupy the same byte
+#     count), so it is not excluded from coverage — its text is pinned under the other name, and pinning both would
+#     only duplicate a key;
 #   * by GLOB (`*.sh`, `trace`, `trace-ctl`, `trace-mut`, `*.trace`, in the `case` just below) — the fixture's own
 #     driver/helper scripts (input, never emitted) and
 #     its XTRACE intermediates. `*.trace` also carries the per-run XTRACE NONCE, which differs on every run:
@@ -3225,25 +3232,39 @@ elif [ "$_a2_ship" != "$_a2_mut" ]; then rc=0
 else rc=1; echo "      a claim in a channel VALUE (_wrote_said) did not change the emitted text — the pin cannot see it"; fi
 ck "non-vacuity: a claim in a CHANNEL VALUE reds the output pin (no print line changed, output pinned)" $rc
 
+# ⛔ THE ANCHOR MUST BE UNIQUE TO THE ARM (review P1, cycle 76). `severity-first from the pool` occurs TWICE in
+# `$FNS`: on the arm's `echo` AND on `skip_order_why`'s `severity)` case pattern, where an inserted COMMAND lands in
+# a pattern position and makes the file UNPARSABLE. The drive then died on `syntax error near unexpected token`, the
+# emitted cksum differed from the pin for that reason, and this witness passed while proving nothing — a control that
+# inserted `:` at the same anchor failed identically. `highest-ranked CLEAN entry` occurs once. And "the output
+# differs" is not the property: every witness below also requires the CLAIM ITSELF to be on the operator's screen,
+# so a parse error (or any other unrelated breakage) reds instead of passing.
+_claim_emitted() { grep -qF "$1" "$TMP/outpin-mut/out" 2>/dev/null; }
 # (B) a claim from a NEW print path — a bare `cat` line inside the arm
 _m_b="$TMP/fns-outpin-cat.sh"
-awk '{ print; if (index($0, "severity-first from the pool")) print "    cat <<< \"[refresh] queue order: and a tier was clipped\"" }' "$FNS" > "$_m_b"
-if ! cmp -s "$FNS" "$_m_b" 2>/dev/null && _outred2 "$_m_b"; then rc=0
-else rc=1; echo "      a claim printed by a NEW cat line did not red the output pin"; fi
+awk '{ print; if (index($0, "highest-ranked CLEAN entry")) print "    cat <<< \"[refresh] queue order: and a tier was clipped\"" }' "$FNS" > "$_m_b"
+if cmp -s "$FNS" "$_m_b" 2>/dev/null; then rc=1; echo "      the (B) anchor drifted — the mutation did not apply"
+elif ! bash -n "$_m_b" 2>/dev/null; then rc=1; echo "      the (B) mutation left an UNPARSABLE source — it would red for a syntax error, not for the claim"
+elif _outred2 "$_m_b" && _claim_emitted 'and a tier was clipped'; then rc=0
+else rc=1; echo "      a claim printed by a NEW cat line did not reach the pin's view"; fi
 ck "non-vacuity: a claim from a NEW print path (cat) reds the output pin" $rc
 
 # (C) a claim through a brace group onto STDERR — a verb-prefix list never sees it
 _m_c="$TMP/fns-outpin-brace.sh"
-awk '{ print; if (index($0, "severity-first from the pool")) print "    { echo \"[refresh] queue order: a tier was clipped\" >&2; }" }' "$FNS" > "$_m_c"
-if ! cmp -s "$FNS" "$_m_c" 2>/dev/null && _outred2 "$_m_c"; then rc=0
-else rc=1; echo "      a claim on stderr via a brace group did not red the output pin"; fi
+awk '{ print; if (index($0, "highest-ranked CLEAN entry")) print "    { echo \"[refresh] queue order: a tier was clipped\" >&2; }" }' "$FNS" > "$_m_c"
+if cmp -s "$FNS" "$_m_c" 2>/dev/null; then rc=1; echo "      the (C) anchor drifted — the mutation did not apply"
+elif ! bash -n "$_m_c" 2>/dev/null; then rc=1; echo "      the (C) mutation left an UNPARSABLE source"
+elif _outred2 "$_m_c" && _claim_emitted 'a tier was clipped'; then rc=0
+else rc=1; echo "      a claim on stderr via a brace group did not reach the pin's view"; fi
 ck "non-vacuity: a claim on STDERR via a brace group reds the output pin" $rc
 
 # (D) a claim printed by a HELPER FUNCTION — the printing line is not in the function under study at all
 _m_d="$TMP/fns-outpin-helper.sh"
-awk '{ if (index($0, "severity-first from the pool")) print "    _say_clip() { echo \"[refresh] queue order: a tier was clipped\"; }"; print; if (index($0, "severity-first from the pool")) print "    _say_clip" }' "$FNS" > "$_m_d"
-if ! cmp -s "$FNS" "$_m_d" 2>/dev/null && _outred2 "$_m_d"; then rc=0
-else rc=1; echo "      a claim printed by a helper function did not red the output pin"; fi
+awk '{ if (index($0, "highest-ranked CLEAN entry")) print "    _say_clip() { echo \"[refresh] queue order: a tier was clipped\"; }"; print; if (index($0, "highest-ranked CLEAN entry")) print "    _say_clip" }' "$FNS" > "$_m_d"
+if cmp -s "$FNS" "$_m_d" 2>/dev/null; then rc=1; echo "      the (D) anchor drifted — the mutation did not apply"
+elif ! bash -n "$_m_d" 2>/dev/null; then rc=1; echo "      the (D) mutation left an UNPARSABLE source"
+elif _outred2 "$_m_d" && _claim_emitted 'a tier was clipped'; then rc=0
+else rc=1; echo "      a claim printed by a helper function did not reach the pin's view"; fi
 ck "non-vacuity: a claim printed by a HELPER FUNCTION reds the output pin" $rc
 
 # (E) a claim on the SECOND PHYSICAL LINE of the arm's quoted string, that line starting with `#`. The names rule
@@ -3251,13 +3272,18 @@ ck "non-vacuity: a claim printed by a HELPER FUNCTION reds the output pin" $rc
 # claim EMITTED from inside a quoted string is this one: the bytes reaching the operator, whatever the source line
 # looked like. Two-state: the shipped source must reproduce the pin, the mutated one must leave it.
 _m_cont="$TMP/fns-outpin-contline.sh"
-awk '{ print; if (index($0, "severity-first from the pool")) { print "      \"and the tier window record says a tier was"; print "# clipped\"" } }' "$FNS" > "$_m_cont"
+# ⛔ THE CLAIM IS APPENDED INSIDE THE ARM'S OWN STRING — the closing quote is dropped and the continuation line
+# (starting with `#`) closes it. That is the exact shape a source-shape rule cannot classify and the pin must grade;
+# inserting a new COMMAND here instead (the previous shape) tested a different thing.
+awk '{ if (index($0, "highest-ranked CLEAN entry")) { sub(/"$/, ""); print; print "# and a tier window was clipped\""; next } print }' "$FNS" > "$_m_cont"
 if cmp -s "$FNS" "$_m_cont" 2>/dev/null; then
   rc=1; echo "      the continuation-line mutation did not apply — its anchor drifted"
+elif ! bash -n "$_m_cont" 2>/dev/null; then
+  rc=1; echo "      the continuation-line mutation left an UNPARSABLE source"
 elif ! grep -qx "$_rank_pin" <<< "$(printf '%s\n' $_out_distinct_pin)"; then
   rc=1; echo "      the shipped 'rank' output is not among the pinned ones — the witness is not wired to the pin"
-elif _outred2 "$_m_cont"; then rc=0
-else rc=1; echo "      a record claim on a '#…'-starting CONTINUATION line changed the emitted text and the output pin did not see it"; fi
+elif _outred2 "$_m_cont" && _claim_emitted '# and a tier window was clipped'; then rc=0
+else rc=1; echo "      a record claim on a '#…'-starting CONTINUATION line did not reach the pin's view"; fi
 ck "non-vacuity: a record claim on a '#…'-starting CONTINUATION line (which the names rule skips) REDS THE OUTPUT PIN" $rc
 
 # ⛔ AND THE PIN IS NOT OVER-BROAD: a source reformat that changes NO output must stay green. This is the other
