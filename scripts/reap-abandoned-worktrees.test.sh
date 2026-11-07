@@ -52,12 +52,21 @@
 # reverting its USE SITE (`MUT_CELLHOME_REF`) are DIFFERENT edits, and only the use-site one shows the
 # FALLBACK protects anything. F IS checked by `MUT_NUMBOUND`, because "a bad seam is refused" is true of
 # a digit-shape check while the ceiling is still DELETABLE by an all-digit value it cannot compare.
-# Round 10 also deleted three rows that NO mutation could move (they were measured GREEN under every
-# mutant, every probe and pre-fix code): "all twelve young trees SURVIVED", "and NOT on the age floor
-# (no reason=young)" in case H, and "the bound is REAL in --apply" in case H — the last two because
-# case H's fixture REQUIRES a live holder, which preserves the tree under every order. B's row and D's
-# report row were REPLACED with falsifiable forms rather than deleted; the two H rows were deleted and
-# their behaviour is covered by the rows that name it (`reason=budget` without `reason=live-cwd`).
+# Round 10 also touched FOUR rows that NO mutation could move — measured GREEN under every mutant,
+# every probe AND pre-#3278 code. Two were REPLACED and two DELETED: a vacuous row is REPLACED wherever
+# a falsifiable form of the same property exists, and DELETED only where it cannot exist at all.
+#   • REPLACED — B's "all twelve young trees SURVIVED": the count is identical whether the unit is
+#     charged before or after the floor, so it attributed nothing to this fix. It is now "preserved ON
+#     AGE, not on a spent slot", which `MUT_AGEFLOOR` reddens (12/12 → 0/12).
+#   • REPLACED — D's `^remove ` row, which could NEVER match: case D runs `--apply`, and `remove ` is
+#     printed only under `DRY_RUN=1`, so it was GREEN in the very `MUT_BUDGET` run that reaped the tree.
+#     It is now "the record says candidates=0 reaped=0", which `MUT_BUDGET` reddens.
+#   • DELETED — case H's "and NOT on the age floor (no reason=young)": the fixture's tree is aged into
+#     the linked arm's floor by construction, so `reason=young` is unreachable for it.
+#   • DELETED — case H's "the bound is REAL in --apply": the fixture REQUIRES a live holder (that is what
+#     makes the census observable) and the holder preserves the tree under every order, so it could not
+#     tell a working bound from an absent one. H's ordering is carried instead by `reason=budget` WITH
+#     the holder present and `reason=live-cwd` absent — the pair a census-first order cannot produce.
 # A test that passes against a script with the bound
 # DELETED proves nothing, and a mutation that cannot be applied is counted a FAILURE — a stale mutation
 # is a case that has silently stopped checking.
