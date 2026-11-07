@@ -935,9 +935,15 @@ GH_PROBE_CAUSE=""
 # (400 − 52; the 46-byte suffix survives only when nothing is cut) — 364 > 348, so the cut still fires
 # and severs `(budget 1000ms)`. The decision below is unchanged, because it is about WHICH part yields,
 # not about which line arrives.
-# Round 2 answered "the verdict", and MEASURED on the real record that is the wrong half: leading with
-# the evidence ends the beat line INSIDE the verdict (`… — nothing was sent, so NEI`), so an operator
-# reads a severed claim and never sees `NOT auth and NOT an outage`, nor which question was asked. The
+# Round 2 answered "the verdict", and MEASURED with the capture this block establishes is real, that
+# pushes out the OTHER half instead — it does not save the verdict, it moves the damage:
+#   * from a captured line of 86 bytes the `question=` is no longer whole, and `source=` is the first
+#     thing lost — the real 101-byte pacing note loses exactly `, source=stored)`;
+#   * from 171 bytes the VERDICT itself is gone, and the 320-byte cap permits 323.
+# (Both boundaries measured with this arm's own clause through the real `refresh_cause_brief`. An earlier
+# version of this paragraph quoted `… — nothing was sent, so NEI`, which only reproduces if the capture
+# is led by the 253-byte `gh-contended` line — a shape the paragraph ABOVE establishes production cannot
+# emit for this arm, so it was quoting a ghost.) The
 # verdict and the question are FIXED-SIZE (245 bytes together, whatever the stderr says); the evidence
 # is the only variable-length part, AND the record keeps it whole — `GH_PROBE_CAUSE_MAX` below bounds
 # the evidence TAKE at 320 (`line` is cut there and the ASCII marker appended, so the take tops out 3

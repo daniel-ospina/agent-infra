@@ -206,9 +206,13 @@ SH
 
 # mk_gh_budget_stub <case-dir> <rc> <stderr-line> [<sleep-seconds>] — the same `gh`, answering `auth
 # token` from a STORED credential but REFUSING the `api rate_limit` validation read with the given rc,
-# stderr and (optional) delay. An EMPTY <stderr-line> writes NOTHING AT ALL (a zero-byte capture) —
-# `printf '%s\n' ""` writes one newline, which is not the same shape and would leave the "no stderr
-# written" branch unexercised (#3701 review, P2).
+# stderr and (optional) delay. An EMPTY <stderr-line> writes NOTHING AT ALL — a ZERO-BYTE capture, which
+# is the shape a probe killed before the shim flushes leaves behind, so that is the one this stub emits.
+# ⛔ AND AN EARLIER JUSTIFICATION HERE WAS WRONG (#3701 review round 16, P2): it said `printf '%s\n' ""`
+# would "leave the `no stderr written` branch unexercised". It does not — `gh_probe_evidence` takes the
+# first NON-EMPTY line (`awk 'NF{print; exit}'`), so a lone newline yields the same empty take and the
+# same branch (measured: forcing the one-newline form leaves the suite green). The zero-byte stub is
+# kept because it is the real shape, not because a newline would change the arm.
 # ⛔ WHAT CAN ACTUALLY REFUSE THIS CALL (#3701 review, P2 — measured, not assumed). `gh api rate_limit`
 # IS THE METER: `gh-limit.py`'s `reaches_api()` answers False for it and the CORE floor is gated behind
 # `reaches_api`, so `gh-limit: gh-core-floor …` can NEVER appear on this probe's stderr — it comes from
@@ -1185,8 +1189,9 @@ ck "(g6) …and does NOT reuse another arm's verdict (no REJECTED, no NON-ANSWER
 # `cut -c1-400`, byte-wise), and `provision_fail` has already spent 52 of those on
 # `TRANSIENT: the gh environment precondition refused [` plus 46 on the trailing
 # `] — no candidate can be judged from this box`. So a suite that reads only the record stays GREEN
-# while the beat prints half a sentence — which is exactly what happened: the round-2 ordering ended
-# the beat line inside "… — nothing was sent, so NEI" and dropped `question=` entirely.
+# while the beat prints half a sentence — which is exactly what happened: with the evidence first, the
+# real 101-byte capture loses `, source=stored)` off the end of `question=`, and from a 171-byte capture
+# the verdict is gone with it (both measured through the real renderer; see the script's own block).
 # The invariant pinned here: the cut may land inside the EVIDENCE (variable-length, and whole in the
 # record), never inside the VERDICT (fixed-size, and the thing that names the precondition).
 LOOP="${LOOP:-$HERE/orch-loop.sh}"
