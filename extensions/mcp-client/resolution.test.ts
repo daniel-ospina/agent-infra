@@ -1569,6 +1569,60 @@ await test("a BASE entry with an unrecognised `type` SURVIVES into the config an
   );
 });
 
+await test("a REPO entry's unrecognised `type` is reported by the MERGE, and never claimed KEPT when it is dropped (#3628 round 10)", async () => {
+  // The layer read sees ONE file, so it cannot know whether the merge will KEEP, IGNORE or DROP this
+  // entry. Reporting from there claimed "the entry is KEPT as written" about an entry the merge then
+  // dropped (measured: `{"url": "", "type": "sse"}` logged KEPT, merged `{}`). The note moved into
+  // `mergeMcpLayers`, AFTER the repo-only drop and the ambiguous-delta `continue` — the only reader
+  // that knows the outcome. Pinned in THREE arms because each pins a different edit:
+  //   arm 1 pins the base-gate in `asMcpJson` (restore it and a dropped entry is called KEPT again);
+  //   arm 2 pins the repo-only call site (delete it and a KEPT entry's note vanishes);
+  //   arm 3 pins the IGNORED case (move the note above the `continue` and an ignored delta is noted).
+  const run = async (repoServers: Record<string, unknown>, baseServers: Record<string, unknown>) => {
+    const repoDir = tempDir("mcp-repotype-repo-");
+    const homeDir = tempDir("mcp-repotype-home-");
+    mkdirSync(join(homeDir, ".pi", "agent"), { recursive: true });
+    writeJson(repoDir, ".mcp.json", { mcpServers: repoServers });
+    writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", { mcpServers: baseServers });
+    const manager = new McpServerManager();
+    const logs = await withCapturedLogs(() =>
+      manager.connectAllLayers({
+        base: join(homeDir, ".pi", "agent", ".mcp.json"),
+        repo: join(repoDir, ".mcp.json"),
+      })
+    );
+    const cfg = (manager as unknown as { config: { mcpServers: Record<string, unknown> } }).config;
+    return { cfg, logs, typeNotes: logs.filter(l => l.includes('has "type"')) };
+  };
+
+  // ARM 1 — DROPPED: nothing to connect to. No "KEPT" claim may survive, and no inert-`type` note
+  // should fire for an entry that is not in the config at all.
+  const dropped = await run({ s: { url: "", type: "sse" } }, {});
+  equal(Object.keys(dropped.cfg.mcpServers).length, 0, "an entry with only an empty transport is dropped");
+  ok(
+    !dropped.logs.some(l => l.includes("KEPT")),
+    `a DROPPED entry must never be reported as KEPT — got:\n${dropped.logs.join("\n")}`
+  );
+
+  // ARM 2 — KEPT: the note is owed exactly ONCE (a second copy would mean both readers reported it).
+  const kept = await run({ s: { url: "https://ok.example/mcp", type: "sse", lazy: true } }, {});
+  ok(kept.cfg.mcpServers.s, "a repo-only \`type: \"sse\"\` entry is KEPT (it works over \`url\`)");
+  equal(kept.typeNotes.length, 1, `exactly one inert-\`type\` note — got:\n${kept.logs.join("\n")}`);
+
+  // ARM 3 — IGNORED: an ambiguous delta is dropped on the floor before the note's call site, so the
+  // operator must NOT be told its \`type\` had no effect on an entry that was never applied at all.
+  const ignored = await run(
+    { s: { url: "https://repo.example/mcp", command: "/bin/sh", type: "sse", lazy: true } },
+    { s: { url: "https://base.example/mcp", lazy: true } },
+  );
+  equal(
+    (ignored.cfg.mcpServers.s as Record<string, unknown>).url,
+    "https://base.example/mcp",
+    "an ambiguous delta is IGNORED and the base entry kept"
+  );
+  equal(ignored.typeNotes.length, 0, `an IGNORED delta earns no inert-\`type\` note — got:\n${ignored.logs.join("\n")}`);
+});
+
 await test("a BASE-layer entry with a prototype-shaped name is refused too", () => {
   const merged = mergeMcpLayers(
     JSON.parse('{"mcpServers":{"constructor":{"command":"/bin/sh"},"real":{"url":"https://ok/mcp"}}}') as never,
