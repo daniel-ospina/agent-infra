@@ -408,8 +408,18 @@ br() {
   # `INFRA_ROOT` is cleared for the same reason as the others: the bring-up tries it FIRST when it
   # resolves the infra checkout, so a developer shell that exports it makes the layer arms grade a
   # DIFFERENT checkout (measured: an ambient decoy's installer ran and the suite still reported 142/0).
+  # `HARNESS_PIN_DIR` / `HARNESS_PIN_FILE` are cleared for the SAME reason, and the measurement is this
+  # suite's own: with them ambient — every cell exports both to its children
+  # (`cloud-cell-supervisor.sh`, `launchd-controller.sh`) — the bring-up grades THIS BOX's pin instead of
+  # the fixture's, `check_harness_pin` FATALs on `/home/cmux/harness exists but is NOT a git worktree of
+  # $T/infra`, and the whole suite collapses (measured on a pin-exporting box: PASS=238 FAIL=78 here vs
+  # PASS=236 FAIL=77 on the unmodified `origin/main`, i.e. 76 arms red for one ambient seam rather than
+  # for anything the PR under test did). That is the identical "host dependency wearing a test's clothes"
+  # class the two paragraphs above record, one seam over; the arms that need a pin ask for one by name
+  # through `BR_EXTRA_ENV`, which is applied AFTER these clears.
   BR_OUT="$(env -u AGENT_INFRA_PATH -u INFRA_ROOT -u TORTOISE_REPO -u DISK_REAPER_REPOS -u GH_REPO \
             -u DEEPSEEK_API_KEY -u ANTHROPIC_API_KEY \
+            -u HARNESS_PIN_DIR -u HARNESS_PIN_FILE \
             PATH="$STUB:$PATH" REPO="${BR_AMBIENT_REPO:-}" GH_REPO="${BR_GH_REPO:-}" \
             ${BR_EXTRA_ENV:+$BR_EXTRA_ENV} \
             CELL_HOME="$T/home" WORKDIR="$T/cell" ENV_FILE="${BR_ENV_FILE:-$T/keys.env}" \
