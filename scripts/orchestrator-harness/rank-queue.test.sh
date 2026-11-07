@@ -3151,6 +3151,8 @@ _out_map() { # the pinned population: "<case>/<file>=<crc>" per captured file, s
 # Keys and CRCs are therefore carried together, tab-separated, and lookups match the KEY FIELD exactly.
 # RESIDUAL, stated rather than implied: this tab field is as good as the line is — a filename containing a TAB
 # confuses the field split exactly as one containing a NEWLINE confuses the line split, and neither is exercised here.
+# A BACKSLASH in a name is NOT in that class and is handled: keys reach `awk` through ENVIRON[], never `-v` (which
+# would run awk's escape processing on them and resolve the capture to nothing).
 _out_kv() { # stdin: a `key=crc` map -> `key<TAB>crc`
   awk '{ _k = $0; sub(/=[^=]*$/, "", _k); printf "%s\t%s\n", _k, substr($0, length(_k) + 2) }'
 }
@@ -3212,15 +3214,22 @@ else
     _kv_got="$(printf '%s\n' "$_out_got" | _out_kv)"
     _kv_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | _out_kv)"
     while IFS= read -r _okk; do
-      _old="$(printf '%s\n' "$_kv_pin" | awk -F'\t' -v k="$_okk" '$1==k { print $2; exit }')"
-      _new="$(printf '%s\n' "$_kv_got" | awk -F'\t' -v k="$_okk" '$1==k { print $2; exit }')"
+      # ⛔ THE KEY REACHES awk THROUGH THE ENVIRONMENT, NOT `-v` (review P3, cycle 83). `-v k="$key"` runs awk's
+      # ESCAPE processing on the value, so a capture whose name contains `\t`, `\n` or `\\` resolved to NOTHING in
+      # both sides, `[ "$_old" = "$_new" ]` skipped it, and the red named no capture at all — the cycle-81 defect back
+      # through another door (measured: a capture `bdir/\tout` was in neither list). ENVIRON[] is passed verbatim.
+      _old="$(printf '%s\n' "$_kv_pin" | K="$_okk" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
+      _new="$(printf '%s\n' "$_kv_got" | K="$_okk" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
       [ "$_old" = "$_new" ] && continue
+      # ⛔ EVERY BRANCH PRINTS ITS DATUM (review P3, cycle 83): `_out_show` truncates at six lines and `$TMP` is
+      # deleted by the EXIT trap, so a change past line 6 used to be reported with NO CRC and NO claim — the shown
+      # prefix indistinguishable from a correct capture (measured: a 9-line capture with the claim on line 9).
       if [ -z "$_new" ]; then
         echo "        capture $_okk DISAPPEARED (pinned $_old)"
       elif [ -z "$_old" ]; then
-        echo "        capture $_okk is NEW: $(_out_show "$_okk")"
+        echo "        capture $_okk is NEW (absent from the pin, now $_new): $(_out_show "$_okk")"
       else
-        echo "        capture $_okk CHANGED: $(_out_show "$_okk")"
+        echo "        capture $_okk CHANGED (pinned $_old, now $_new): $(_out_show "$_okk")"
       fi
     done <<EOF
 $(printf '%s\n' "$_kv_got" "$_kv_pin" | cut -f1 | LC_ALL=C sort -u)
@@ -3238,8 +3247,12 @@ ck "the EMITTED text of every driven case is pinned (a claim reached the operato
 # ⛔ THE ANCHOR IS READ BY ITS OWN KEY, LIKE EVERY OTHER LOOKUP ABOVE (review P3, cycle 82). This was the one map key
 # still resolved by LITERAL PREFIX plus the field after the FIRST `=` — `grep -m1 '^rank/out=' | cut -d= -f2` — so the
 # day a re-pin records any other `rank/out=…` entry (a fixture capturing to `out=1` in the rank case dir) the anchor
-# silently became THAT capture's CRC (`_rank_pin='1'`), and every witness below it reddened for the wrong reason while
-# the map assertion stayed green. `_out_kv` + an exact key match cannot do that.
+# silently became THAT capture's CRC (`_rank_pin='1'`). MEASURED, and narrower than "every witness": the base check,
+# the continuation-line witness (E) and the reformat witness REDDENED for the wrong reason, while the three print-path
+# witnesses (B, C, D) `PASSED VACUOUSLY` — `_outred2`'s `!=` became trivially true, so their "differs from the pin"
+# half graded nothing (their claim-in-output half still held). Both directions are the same defect: a witness must
+# compare against ITS OWN capture. (An EMPTY anchor does fail closed — 172/5 with the base and B/C/D/E red.)
+# `_out_kv` + an exact key match cannot do any of it.
 _rank_pin="$(printf '%s' "$_out_pin" | tr '|' '\n' | _out_kv | awk -F'\t' '$1=="rank/out" { print $2; exit }')"
 _outred2() { # $1=mutated source -> 0 when the emitted text differs from the pinned 'rank' case
   _om_d="$TMP/outpin-mut"; rm -rf "$_om_d"; mkdir -p "$_om_d/o"
@@ -3363,6 +3376,12 @@ _out_late_pin="$(printf '%s' "$_out_pin" | tr '|' '\n')"
 if [ -z "$_out_late" ]; then
   rc=1; echo "      the end-of-run map is EMPTY — this check would grade nothing"
 elif [ "$_out_late" = "$_out_late_pin" ]; then rc=0
+# ⛔ ORDER-ONLY IS ITS OWN VERDICT HERE TOO (review P3, cycle 83). `_out_map` emits an `LC_ALL=C sort`ed map while the
+# pin is a recorded literal, so comparing them as RAW STRINGS made a re-pin that merely MOVED a key red with the
+# difference header and name NO capture (measured: the same 155 keys and CRCs, one moved to the end → 175/2, zero
+# `capture …` lines) — a false cause, and the first check at the top of this section already carries this branch.
+elif [ "$(printf '%s\n' "$_out_late" | LC_ALL=C sort)" = "$(printf '%s\n' "$_out_late_pin" | LC_ALL=C sort)" ]; then
+  rc=1; echo "      every pinned capture is present at the END of the run with its pinned CRC and only the MAP SEQUENCE differs — this check's own ordering, not the code under test"
 else
   rc=1; echo "      the pinned population differs at the END of the run — a case directory or capture that appeared after the snapshot cannot hide:"
   # ⛔ LINE-BY-LINE, NOT WORD SPLITTING (review P3, cycle 79): a case dir named `late case` produced a red whose
@@ -3375,22 +3394,24 @@ else
   _lkv_pin="$(printf '%s\n' "$_out_late_pin" | _out_kv)"
   _lkv_first="$(printf '%s\n' "$_out_got" | _out_kv)"
   while IFS= read -r _okl; do
-    _l_old="$(printf '%s\n' "$_lkv_pin" | awk -F'\t' -v k="$_okl" '$1==k { print $2; exit }')"
-    _l_new="$(printf '%s\n' "$_lkv_new" | awk -F'\t' -v k="$_okl" '$1==k { print $2; exit }')"
+    _l_old="$(printf '%s\n' "$_lkv_pin" | K="$_okl" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
+    _l_new="$(printf '%s\n' "$_lkv_new" | K="$_okl" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
     [ "$_l_old" = "$_l_new" ] && continue
     # ⛔ ALL THREE BRANCHES DERIVE THEIR TIMING FROM `_out_got` (review P3, cycles 78-79). Cycle 78 fixed only the
     # `CHANGED` branch: a key never captured this run was still reported as "VANISHED after the snapshot", and one
     # already present at the first snapshot as "APPEARED after the snapshot" — both false, on the check family whose
     # whole job is to avoid false causes.
-    _l_first="$(printf '%s\n' "$_lkv_first" | awk -F'\t' -v k="$_okl" '$1==k { print $2; exit }')"
+    _l_first="$(printf '%s\n' "$_lkv_first" | K="$_okl" awk -F'\t' '$1==ENVIRON["K"] { print $2; exit }')"
+    # ⛔ EVERY BRANCH PRINTS ITS CRC (review P3, cycle 83) — `_out_show` truncates at six lines and `$TMP` is deleted
+    # by the EXIT trap, so without the datum a change past line 6 is reported as text that looks correct.
     if [ -z "$_l_new" ]; then
       if [ -z "$_l_first" ]; then echo "        capture $_okl was NEVER captured this run (pinned $_l_old) — not a late removal"
       else echo "        capture $_okl VANISHED after the snapshot (pinned $_l_old)"; fi
     elif [ -z "$_l_old" ]; then
-      if [ -z "$_l_first" ]; then echo "        capture $_okl APPEARED after the snapshot: $(_out_show "$_okl")"
-      else echo "        capture $_okl is NEW and was ALREADY there at the first snapshot (both checks red; neither is a late appearance): $(_out_show "$_okl")"; fi
-    elif [ "$_l_first" = "$_l_old" ]; then echo "        capture $_okl CHANGED AFTER the snapshot: $(_out_show "$_okl")"
-    else echo "        capture $_okl DIFFERS FROM THE PINNED CRC (it already did at the first snapshot, so this is value drift, not late creation): $(_out_show "$_okl")"; fi
+      if [ -z "$_l_first" ]; then echo "        capture $_okl APPEARED after the snapshot (now $_l_new): $(_out_show "$_okl")"
+      else echo "        capture $_okl is NEW and was ALREADY there at the first snapshot (both checks red; neither is a late appearance) (now $_l_new): $(_out_show "$_okl")"; fi
+    elif [ "$_l_first" = "$_l_old" ]; then echo "        capture $_okl CHANGED AFTER the snapshot (pinned $_l_old, now $_l_new): $(_out_show "$_okl")"
+    else echo "        capture $_okl DIFFERS FROM THE PINNED CRC (pinned $_l_old, now $_l_new; it already did at the first snapshot, so this is value drift, not late creation): $(_out_show "$_okl")"; fi
   done <<EOF
 $(printf '%s\n' "$_lkv_new" "$_lkv_pin" | cut -f1 | LC_ALL=C sort -u)
 EOF
