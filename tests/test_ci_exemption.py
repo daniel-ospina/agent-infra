@@ -982,6 +982,40 @@ def test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors():
     )
 
 
+def test_the_STRICT_form_stays_NARROWER_than_the_LOOSE_one():
+    """⛔ AGREEMENT IS A CLAIM ABOUT A CORPUS, NOT A LICENCE TO COLLAPSE THE SPLIT.
+
+    The obvious way to "close the class completely" is `rest -> [^\t]+`, i.e. make
+    `_NODEID_RE` identical to `_NODEID_LOOSE_RE`. Nothing reddened under it (measured
+    on this branch AND on `origin/main`, so it is not a gap this change introduced) —
+    yet the code states the narrowness as load-bearing twice: the strict form gates
+    MAIN's rate table, so a character it admits becomes an id that can PURCHASE AN
+    EXEMPTION, and the pytest parameter space is open-ended. That is why the loop above
+    covers `/` and space rather than every character, and why the split must survive a
+    future lane taking the tempting shortcut named in #3686's own scoping artifact.
+
+    So this pins the DIRECTION: an id carrying parameter punctuation neither our
+    suites nor #3686 produce is rejected by the strict form and accepted by the loose
+    one. Deleting the narrowness reddens HERE, by name, instead of shipping silently.
+    """
+    for loose_only in (
+        "tests/test_a.py::t[a,b]",      # a comma — pytest allows it in a parameter
+        "tests/test_a.py::t[a{b}]",     # braces
+        "tests/test_a.py::t[a'b]",      # a quote
+    ):
+        assert not is_failure_key(loose_only), (
+            f"the STRICT form ADMITTED {loose_only!r} — `_NODEID_RE` has been widened "
+            "to (or past) the loose form, so main's rate table would now key ids that "
+            "can purchase an exemption (#3686)"
+        )
+        assert is_failure_key_loose(loose_only), loose_only
+
+    # …and the two DO agree on the characters this change added, so the split is
+    # narrow where it must be and equal where it must be. That pair is the whole claim.
+    for shared in _PARAM_SPACE_CORPUS:
+        assert is_failure_key(shared) and is_failure_key_loose(shared), shared
+
+
 def test_a_path_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
     """The row must survive `parse_rates`, not merely the shape predicate.
 
@@ -1152,7 +1186,7 @@ def test_the_PRODUCER_and_the_READER_AGREE_on_the_rotation_wire_format(tmp_path)
     cycle 3, P1). The first two versions extracted the `awk …'{…}'` PROGRAM and the
     INNER `$(…)` substitution respectively — so a filter appended AFTER either one
     was outside both the assertion and the execution, and the pin stayed green:
-    `| sed '\t40$//'` deletes the runs column (every rate row then fails to parse,
+    `| sed 's/\t40$//'` deletes the runs column (every rate row then fails to parse,
     a permanent BLOCK for every PR), and `| sed 's/\t$//'` makes a single spacey id
     emit a TAB-FREE per-run line (the reader takes its legacy fallback, the id
     shreds, and E5 EXEMPTS a rotating identity), each with a zero-red suite. An
