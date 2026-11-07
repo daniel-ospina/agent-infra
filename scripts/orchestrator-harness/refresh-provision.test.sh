@@ -79,12 +79,19 @@
 #   (g5) the DEFAULT shape: the probe's own 20 s bound fires first (a stub that really sleeps), and the
 #        record says NON-ANSWER — claiming neither a rejected credential NOR anything about the budget
 #        ("not a spent budget" was an over-claim: the shim sleeps 120 s on a shared window before 75);
-#   (g6) the OTHER default shape — rc=1/403 with a real rate-limit stderr, the arm #3584's own
-#        measured scenario took. Without this row that arm's interpolation could be deleted green;
+#   (g6) the OTHER default shape — rc=1 with a rate-limit stderr. Without this row that arm's
+#        interpolation could be deleted green. (Provenance NOT claimed: it is a plausible refusal
+#        shape, not a string quoted from the issue — see the row's own comment.);
 #   (g7) THE BEAT'S OWN LINE — not just the record. `refresh_cause_brief` cuts `why=` at 400 BYTES
 #        (`orch-loop.sh:2559`), so a clause can be complete in the record and still reach the operator
 #        severed. This arm drives the REAL `refresh_cause_brief` and pins the invariant the clause is
-#        now ordered by: the cut may land inside the EVIDENCE, never inside the verdict.
+#        now ordered by: the cut may land inside the EVIDENCE, never inside the verdict;
+#   (g8) the evidence TAKE is BOUNDED — a 1010-byte stderr is cut at the cap, the marker is visible and
+#        the tail beyond it is absent, so deleting the truncation reds three ways;
+#   (g9) the DEFAULT (rate-limit timeout) arm carries an evidence SLOT — the row pins the
+#        interpolation, not a production byte count, because a killed shim may flush nothing;
+#   (g10) the CREDENTIAL-LOOKUP timeout arm carries one too — the arm whose own `fix:` line names a
+#        hung credential helper, so the dropped stderr was exactly the diagnosis it recommends.
 #   ⛔ The stub feeds the SHIM's string, not `gh-core-floor`: this call cannot receive a floor line
 #   (`gh-limit.py`'s `reaches_api()` is False for the meter), and a fixture asserting one would grade
 #   the label against evidence production cannot emit (#3701 review, P2). ALL THREE captured notes are
@@ -1124,9 +1131,13 @@ ck "(g5) …and the record names a NON-ANSWER, not a cause" \
 # out a shared throttle window falsifies — that IS the budget being slept out.
 ck "(g5) …and claims NOTHING about the budget, in either direction" \
    "$(case "$GB_WHY" in *'spent budget'*|*'nothing was sent'*|*'quota/throttling'*|*'out of quota'*) echo 1 ;; *) echo 0 ;; esac)"
-# ⛔ (g6) THE OTHER DEFAULT SHAPE — rc=1/403 with a REAL rate-limit stderr, which is the arm #3584's own
-# measured scenario took (`API rate limit exceeded for user ID …`). Without this row, deleting the
+# ⛔ (g6) THE OTHER DEFAULT SHAPE — rc=1 with a rate-limit stderr. Without this row, deleting the
 # `$(gh_probe_evidence "$prc")` interpolation from that arm left every other arm green.
+# ⛔ AND ITS PROVENANCE IS NOT CLAIMED ANY MORE (#3701 review round 12, `unverifiable`). This comment
+# used to say the string was "#3584's own measured scenario", and a reviewer could not confirm that from
+# the issue: #3584's measured provision refusal was a `gh-core-floor` BUDGET line, which by this file's
+# own reasoning cannot reach this probe at all. The fixture is a plausible rate-limit refusal, not a
+# quoted one, and it says so.
 mk_case gh_default
 mk_gh_budget_stub "$D" 1 'gh: HTTP 403: API rate limit exceeded for user ID 81560491'
 rp "$D"
@@ -1204,7 +1215,7 @@ mk_case gh_cap
 mk_gh_budget_stub "$D" 1 "$LONGNOTE"
 rp "$D"
 GC_WHY="$(rec why)"
-ck "(g8) a 1000-character stderr does not reach the record unbounded (why len=${#GC_WHY})" \
+ck "(g8) a 1010-byte stderr (1000 A's + TAILMARKER) does not reach the record unbounded (why len=${#GC_WHY})" \
    "$([ "${#GC_WHY}" -lt 700 ]; echo $?)"
 ck "(g8) …and the take is closed with the ASCII marker, so the cut is visible" \
    "$(case "$GC_WHY" in *'...'*) echo 0 ;; *) echo 1 ;; esac)"

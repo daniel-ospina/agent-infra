@@ -1109,7 +1109,12 @@ gh_probe_env() {
       return "$EXIT_TRANSIENT"
     fi
     if [ "$prc" -ne 0 ]; then
-      GH_PROBE_CAUSE="answer=NO — nothing is stored for the host gh is configured for ($(gh_probe_evidence "$prc")); question=is a gh credential STORED here (gh auth token)"
+      # ⛔ EVIDENCE CLOSES THIS ARM TOO (#3701 review round 12, P2). It used to sit MID-clause with
+      # `question=` last, which broke the very invariant the sibling arm's comment above claims for
+      # "every other arm": with an evidence value between ~230 and the 323-byte cap, the beat's 400-byte
+      # cut lands in `question=` and severs the half that names the precondition — measured on the real
+      # `refresh_cause_brief` (a 250-byte stderr ends the beat at `…; question=is a gh credential S`).
+      GH_PROBE_CAUSE="answer=NO — nothing is stored for the host gh is configured for; question=is a gh credential STORED here (gh auth token); evidence=$(gh_probe_evidence "$prc")"
       echo "[refresh] NOT PROVISIONABLE: gh has no credential STORED for the host it is configured for, in the environment the pre-flight runs in (HOME=$HOME) — its issue/PR surfaces cannot be read, so the pre-flight would answer from partial evidence and read every candidate as a collision (#1736)"
       printf '%s\n' "$terr" | sed -n '1,4p' | sed 's/^/[refresh]   /'
       echo "[refresh]   fix: authenticate gh in THIS home (gh auth login --with-token <token>), or point HOME at the home that already holds the credentials; set GH_HOST to name a host other than the one gh is configured for, then re-run"
