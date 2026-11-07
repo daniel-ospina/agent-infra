@@ -5182,11 +5182,11 @@ fi
 #     :6634 / :6779). A sibling commit then moved them AGAIN, to :6639 / :6796, and its
 #     response was to delete the numbers — which removes the rot but also removes the reader's
 #     target. Both intents are kept here: the number stays, and it is CHECKED.
-#     Every head line number the comments print is TAGGED `CITE-CHECK:`, and this vector parses
-#     the tagged numbers back OUT and checks them against the recorder's bytes: each one must
-#     land on a `grep -qxF` line, and the deduped set must EQUAL the file's executing sites, so
-#     a predicate added without a citation reddens too (a comment line is not a site — :2415 is
-#     a mention). A stale number now REDDENS here instead of waiting for a reviewer to find it.
+#     Every head number printed FOR A BODY-PRESENCE PREDICATE is TAGGED `CITE-CHECK:`; the tagged
+#     numbers are parsed back OUT, each must land on a `grep -qxF` line, and the deduped set must
+#     EQUAL the executing sites — so a predicate added without a citation reddens too, and a stale
+#     number REDDENS instead of waiting for a reviewer. ⛔ SCOPE: cites for anything else are NOT
+#     tagged and NOT checked — tagging one REDDENS, since membership is set EQUALITY, not a superset.
 QR_SELF="$SCRIPT_DIR/record-review.test.sh"
 QR_CITE_SITES="$(command grep -n 'grep -qxF' "$RECORD" | command grep -vE '^[0-9]+: *#' \
     | cut -d: -f1 | sort -un | tr '\n' ' ' | sed 's/^ *//; s/ *$//')"
