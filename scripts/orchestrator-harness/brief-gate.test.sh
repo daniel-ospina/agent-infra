@@ -1150,6 +1150,17 @@ out="$(TMPDIR=/nonexistent-brief-gate-$$ bash "$GATE" --missing - lane 0 "$HW/wo
 grep -q 'GATE-UNAVAILABLE' <<<"$out"; ck $? "(H56) an unusable TMPDIR answers GATE-UNAVAILABLE from --missing"
 [ "$rc" -eq 78 ]; ck $? "(H56b) …with status 78 (cannot verify), never 0 (got $rc)"
 
+# ── THE ARROW IS NOT REQUIRED FOR A BRACKET KEY (review of #3621, cycle 8, P2): `issue-<4242>
+# refs/wip/issue-4242-first-attempt` (no arrow) was refused with "read the ref you already named",
+# because the claim was derived from the text after the ARROW and there was none. The claim now follows
+# the BRACKET CLOSE, so both spellings agree.
+sed 's|^WIP:.*|WIP:       issue-<4242> refs/wip/issue-4242-first-attempt @ 111111111111|' "$CANON" > "$TMP/pw-noarrow-named.txt"
+bash "$GATE" --check "$TMP/pw-noarrow-named.txt" lane 0 "$HW/work" >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ]; ck $? "(H62) a bracket key with NO ARROW that NAMES its ref is ADMITTED — the claim follows the bracket, not the arrow (got $rc)"
+sed 's|^WIP:.*|WIP:       issue-<4242> none (measured: git ls-remote refs/wip/* at 2026-11-06)|' "$CANON" > "$TMP/pw-noarrow-none.txt"
+miss="$(bash "$GATE" --missing "$TMP/pw-noarrow-none.txt" lane 0 "$HW/work" 2>/dev/null)"
+grep -q 'PREVIOUS-WORK-WIP-CONTRADICTED' <<<"$miss"; ck $? "(H62b) …while the same shape claiming ABSENCE is measured and contradicted (the mirror, so H62 is not a free pass)"
+
 # ── NON-VACUITY: remove the check and the arms above go green.
 MUT_PW="$TMP/mutant-pw.sh"
 # ⛔ THE ANCHOR TRACKS THE CALL SITE (review cycle 2): the reader now takes the ROLE too, and an anchor

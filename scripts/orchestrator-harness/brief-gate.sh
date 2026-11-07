@@ -465,7 +465,7 @@ brief_gate_wip_refs() { # brief_gate_wip_refs <issue> [repo]
 # ⇒ a claim of absence, which is then CHECKED. No word list to defeat, no measurement note that can
 # switch it off, and a GLOB is not a ref.
 brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
-  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val vlow tag claim rest issue ref nval inner tail num head
+  local f="${1:--}" repo="${2:-}" role="${3:-lane}" values val vlow tag claim rest issue ref nval inner after tail num head
   local unkeyed=0 issues="" evidence=""
   values="$(awk "$BRIEF_GATE_WIP_AWK" "$f" 2>/dev/null)"
   [ -n "$values" ] || return 0            # no WIP line at all: the SHAPE token already refuses
@@ -498,8 +498,15 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
     head="${head%%→*}"
     case "$head" in
       issue-"<"*">"*|pr-"<"*">"*)
-        inner="${head#*-<}"; inner="${inner%%>*}"
-        tail="${nval#"$head"}"
+        # ⛔ THE TAIL IS WHAT FOLLOWS THE BRACKET CLOSE, NOT WHAT FOLLOWS THE ARROW (review of #3621,
+        # cycle 8, P2). Deriving it from `head` (the text up to the arrow) threw the claim away whenever
+        # there was NO arrow: `issue-<4242> refs/wip/issue-4242-first-attempt` left `tail` empty, `claim`
+        # empty, and an HONEST brief was refused with "read the ref you already named". Cutting at the
+        # bracket handles both spellings; an UNTERMINATED bracket leaves no trustworthy claim text and is
+        # treated as an absence claim, which is the fail-closed direction.
+        after="${nval#*-<}"
+        inner="${after%%>*}"
+        case "$after" in *">"*) tail="${after#*>}" ;; *) tail="" ;; esac
         num="$(printf '%s' "$inner" | sed -E 's/^[^0-9]*//; s/[^0-9].*$//')"
         case "$head" in
           # ── WHAT THIS ARM DECIDES, ONCE (review of #3621, cycle 6: an earlier draft of this comment said
@@ -511,11 +518,13 @@ brief_gate_previous_work() { # brief_gate_previous_work <file|-> [repo] [role]
           #    refuse its own advice). The coverage limit is therefore "no digit inside the key's first
           #    bracket", not "no number anywhere in the value" — a number OUTSIDE the bracket (`issue-<x>
           #    4242`) leaves the key unparsable and the value is treated as the slot.
-          # 3. The number is joined to the tail WITH A SEPARATOR. MEASURED, so the next reader does not
-          #    have to re-derive it (review of #3621, cycle 7): either line alone is INERT — reverting the
-          #    separator, or reverting `tail` to the cycle-4 `${nval#*>"}`, leaves the key read as `4242`
-          #    and H61 green (0 behavioural differences over 284 probes). Only BOTH together — the
-          #    cycle-4 shape — reconstructs `42424242` and admits it.
+          # 3. The number is joined to the tail WITH A SEPARATOR. Measured, so the next reader does not have
+          #    to re-derive it (review of #3621, cycles 7-8): reverting the SEPARATOR alone changes nothing
+          #    (0 differences over 636 observations). Reverting `tail` to the cycle-4 `"${nval#*>"}"` is NOT
+          #    inert — but only because it discards the claim for an ARROW-LESS bracket key, which is a
+          #    different bug (`tail` now follows the bracket close, cycle 8). For every value whose claim
+          #    follows an arrow, the two lines together are what H61 pins: either alone leaves the key read
+          #    as `4242` and H61 green, and only BOTH reconstruct `42424242` and admit it.
           issue-*) if [ -n "$num" ]; then nval="issue-$num $tail"; else nval="issue-slot"; fi ;;
           *)       if [ -n "$num" ]; then nval="pr-$num $tail";    else nval="pr-slot";    fi ;;
         esac ;;
