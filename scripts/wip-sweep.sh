@@ -350,7 +350,14 @@ rescue_usable() { # rescue_usable <path> — it must actually ANSWER in its docu
   [ -f "$1" ] || return 1
   [ -s "$1" ] || return 1
   local out
-  out="$(bash -- "$1" --verdict /nonexistent-wip-sweep-usability-probe 2>/dev/null)" || :
+  # ⛔ BOUNDED AND STDIN-CLOSED (#3588 review, B3). This probe was the only subprocess in this file running
+  # WITHOUT the watchdog, and it runs on the READER path too — measured: a rescuer that sleeps made
+  # `--print-status` emit nothing at all, killed only by an outer timeout. That is the one failure this pass
+  # cannot survive (the doc: "no unbounded call that can reach the network … it is what the quiesce runs
+  # before the box goes"). `</dev/null` because a candidate that reads stdin would otherwise consume or
+  # wait on the CALLER's input. `tb_timeout` is available here: the library was sourced above,
+  # `tb_resolve_timeout` has succeeded, and `STATUS_TIMEOUT` is already validated.
+  out="$(tb_timeout "${STATUS_TIMEOUT:-60}" bash -- "$1" --verdict /nonexistent-wip-sweep-usability-probe </dev/null 2>/dev/null)" || :
   case "$out" in *verdict=*) return 0 ;; esac
   return 1
 }
