@@ -394,7 +394,24 @@ _rs_slug_ok() {
 }
 
 # repo_set_parse — the SYNTAX half. Emits `slug<TAB>checkout<TAB>state`, or nothing and a refusal.
+# _rs_require <tool> <why> — a tool this reader NEEDS, named rather than assumed.
+#
+# ⛔ THE READER'S OWN DEPENDENCIES WERE INVISIBLE, AND THEIR ABSENCE PRODUCED A FALSE VERDICT (review
+# round 42, P2, measured twice). `sed` trims a line; with `sed` off PATH every line read as blank and a
+# VALID two-repo set came back `NO-ENTRIES — … names no repo (comments and blank lines only)`, rc 4 — a
+# claim about a file that named two repos. `awk` renders the entry list; with `awk` off PATH both
+# `rendered` and `expected` came back empty, `_rs_split_divergence` compared two empty strings as EQUAL,
+# and a set this same reader REFUSES at rc 1 (a tag collision) was certified `OK — 2 repo(s)`, rc 0.
+# That is a FALSE PASS, not a diagnosis defect. Neither tool is a proof: they are the reader's own
+# substrate, so their absence must be a NAMED REFUSAL at the point of use, never a silently smaller set.
+_rs_require() {
+  command -v "$1" >/dev/null 2>&1 && return 0
+  _rs_say 2 "repo-set: REFUSED — \`$1\` is not on PATH, and it is not optional: $2"
+  return 1
+}
+
 repo_set_parse() {
+  _rs_require sed "it trims a line's surrounding whitespace, so without it every line reads as blank and a set full of repos would be reported EMPTY rather than unreadable." || return 5
   local f; f="$(repo_set_file)"
   # ⛔ `-L` BEFORE `-e`: `-e` FOLLOWS the link, so a DANGLING symlink reads as absent and the box
   # silently degrades — measured in review round 7. A dotfile manager whose target moved (stow,
@@ -648,7 +665,11 @@ _rs_doctor_py() {
 #   strip — "" means "nothing to trim"     -> sentinel emitted here
 #   norm  — "" means "not a slug"         -> sentinel emitted here
 #   split — "" means "no divergence"      -> sentinel applied by `_rs_split_entries`
-# (origin needs none: it already reports "no python3, or it would not load" textually.)
+#   origin— "" means "proves nothing"      -> its own TAB reason, written by the `try/except` in the
+#                                            heredoc below; ⛔ it does NOT report "no python3, or it would
+#                                            not load", which this line claimed until round 42 measured a
+#                                            sibling that LOADED and merely LACKED `_origin_slug` being
+#                                            blamed on the interpreter.
 # Keep this list true when adding a verb — a stale contract line here is how the `tags` guard went a
 # whole round reading a dead sibling as agreement.
 #
@@ -702,7 +723,7 @@ except Exception:
     #   norm  — "" means "not a slug"         -> sentinel, and the wrapper's rank checks read it as
     #                                               "could not be normalised", not "invalid slug"
     #   split — mapped shell-side by `_rs_split_entries`
-    #   origin— already reports "no python3, or it would not load"
+    #   origin— answers its own TAB reason; the try/except below is the arm that made that true (round 42)
     # The `raise` stays UNCONDITIONAL, so every other verb keeps its exact pre-fix bytes.
     if verb in ("tags", "strip", "norm"):
         sys.stdout.write("__UNASKABLE__")
@@ -748,8 +769,19 @@ elif verb == "norm":
     except Exception:
         sys.stdout.write("__UNASKABLE__")
 else:
-    slug, why = mod._origin_slug(arg)
-    sys.stdout.write(("%s\t" % slug) if slug else ("\t%s" % why))
+    # ⛔ THIS IS THE ONE VERB WITH NO PER-VERB "COULD NOT ASK" ANSWER (review round 42, P2 — measured).
+    # Every other verb reports its own failure; `_origin_slug` is called bare, so a sibling that LOADS
+    # and simply LACKS it raised AttributeError out of the heredoc, the caller saw empty stdout, and
+    # `_rs_origin_slug` rendered "no python3, or it would not load" — two things that were both false
+    # (python3 resolved; the module imported cleanly). That is the stale-farmed-sibling class the
+    # per-verb sentinels already cover for `strip`/`norm`/`tags`, and it is reachable exactly there.
+    # The `else` clause keeps the success path's bytes unchanged.
+    try:
+        slug, why = mod._origin_slug(arg)
+    except Exception:
+        sys.stdout.write("\tpr-doctor.py's `_origin_slug` is missing, or it raised")
+    else:
+        sys.stdout.write(("%s\t" % slug) if slug else ("\t%s" % why))
 PY_PROOF
 }
 
@@ -759,12 +791,22 @@ _rs_origin_slug() {
   local dir="${1:-}" out
   if [ -z "$dir" ]; then printf '\tno checkout was named'; return 0; fi
   out="$(_rs_with_doctor origin "$dir")"
+  # ⛔ NAME THE SEAM BEFORE THE SIBLING (round 42, P2 — the misdiagnosis round 41 fixed one layer up,
+  # found again here). With a typo'd `REPO_SET_DOCTOR` there is no doctor to ask AND no sibling fallback,
+  # so the branch below reported "was not found beside this reader" — sending an operator to hunt a
+  # sibling that is present. Same cause, same sentence as the whole-set WARN.
+  if [ -z "$out" ] && [ -n "${REPO_SET_DOCTOR:-}" ] && [ ! -f "$REPO_SET_DOCTOR" ]; then
+    printf '\t`REPO_SET_DOCTOR` is set to %s, which is not a file, so no origin can be asked' "$REPO_SET_DOCTOR"
+    return 0
+  fi
   if [ -z "$out" ] && [ -z "$(_rs_doctor_py)" ]; then
     printf '\tpr-doctor.py was not found beside this reader, so no origin can be proved'
     return 0
   fi
   if [ -z "$out" ]; then
-    printf '\tpr-doctor.py could not be asked (no python3, or it would not load)'
+    # Reached only when the proof child produced NOTHING at all — every other outcome answers with a TAB
+    # reason (round 42). So this names the residue, not a guessed cause.
+    printf '\tpr-doctor.py produced no answer at all (the proof child did not start)'
     return 0
   fi
   printf '%s' "$out"
@@ -910,6 +952,9 @@ _rs_normalize_slug() {
 # entries claiming the SAME dir, and that is the arm above.
 repo_set_check() {
   local parsed rc
+  # `awk` is needed HERE and in `repo_set_doctor_repos` to render the entry list. Checked before anything
+  # is proved, because the empty-render fallback below is a REFUSAL, not a comparison.
+  _rs_require awk "it renders the \`slug=checkout\` entry list the splitter round-trip compares against, so without it both sides of that proof are empty and a set this reader refuses would be certified OK." || return 5
   parsed="$(repo_set_parse)"; rc=$?
   # ⛔ PROPAGATE 3/4/5, never fold them into 1 (see RETURN CODES): a consumer must be able to tell a
   # box that names no repo (degrade / report) from one whose file is broken (refuse).
@@ -1081,7 +1126,19 @@ EOF
   if _rs_doctor_available; then
     rendered="$(repo_set_doctor_repos 2>/dev/null)"
     expected="$(printf '%s\n' "$parsed" | awk -F'\t' 'NF{print $1 "=" $2}')"
-    diverged="$(_rs_split_divergence "$rendered" "$expected")"
+    # ⛔ TWO EMPTY STRINGS ARE NOT AN AGREEMENT (review round 42, P2 — measured FALSE PASS).
+    # `_rs_split_divergence` compares the rendered list with the expected one, so when a render FAILS
+    # both sides are empty, they compare EQUAL, and the round-trip "passes" by vacuity: with `awk` off
+    # PATH a set this reader REFUSES at rc 1 (tag collision) was certified `OK — 2 repo(s)`, rc 0. The
+    # guard above refuses a missing `awk`; this one is the second line of defence, because ANY future
+    # reason for an empty render (a `parsed` the renderer cannot express, a child killed mid-pipe) lands
+    # here too. `parsed` is non-empty at this point — an empty set returned 4 long before — so an empty
+    # side means the render did not happen, which is unaskable, never agreement.
+    if [ -n "$parsed" ] && { [ -z "$rendered" ] || [ -z "$expected" ]; }; then
+      diverged="__UNASKABLE__"
+    else
+      diverged="$(_rs_split_divergence "$rendered" "$expected")"
+    fi
   else
     # ⛔ NAME THE CAUSE, DO NOT RECITE THE CANDIDATES (review round 40, P2). The generic sentence below
     # lists "not beside this reader, or no python3 resolves". A seam naming a file that does not exist
@@ -1139,6 +1196,7 @@ repo_set_slugs() {
 
 repo_set_doctor_repos() {
   local parsed rc
+  _rs_require awk "it renders the comma-joined \`slug=checkout\` list this verb exists to produce; without it the list would be EMPTY, and an empty PR_DOCTOR_REPOS reads as a valid set of no repos." || return 5
   parsed="$(repo_set_parse)"; rc=$?
   [ "$rc" = 0 ] || return "$rc"
   # `slug=checkout`, comma-joined — exactly the entry form `configured_repos()` accepts, including the

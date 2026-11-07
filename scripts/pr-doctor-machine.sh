@@ -89,13 +89,24 @@ if [ "$#" -ne 0 ]; then
   _say "  pass a repo with \`pr-doctor.py --repo\` directly if that is what you meant. Nothing ran."
   exit 2
 fi
+# ⛔ `-r` FOR THE DOCTOR, `-f` FOR THE READER — AND THE DIFFERENCE IS A MEASURED REGRESSION, NOT A TASTE
+# (review round 42, P2). `-f` is EXISTENCE, and an UNREADABLE doctor exists, so a `pr-doctor.py` at mode
+# 000 passed this gate, the wrapper announced `grading N repo(s)`, and the exec died with `can't open file
+# … Permission denied` at rc 2 — the code this header defines as "this wrapper refused to start a pass at
+# all": a PASS CLAIM for a run that never started. The DOCTOR gate is `-r` for that reason.
+# ⛔ THE READER GATE STAYS `-f`, because changing it SHADOWED A BETTER MESSAGE (measured): the reader is
+# SOURCED, so an unreadable one is caught by the probe below with "cannot be used by this wrapper; it
+# does not provide: repo_set_parse …" — a diagnosis of the READER. A `-r` gate here intercepted that
+# with "the farm did not deliver a file", i.e. it told an operator with a mode problem to re-run the
+# farm, and it reddened `f11c` (the arm pinning that message) on a correct tree.
 if [ ! -f "$READER" ]; then
   _say "REFUSING — $READER is missing: pi-bootstrap/setup.sh's \`lib_srcs\` declares it, so the farm"
   _say "  did not deliver a file this unit depends on. Nothing ran. Re-run pi-bootstrap/setup.sh."
   exit 2
 fi
-if [ ! -f "$DOCTOR" ]; then
-  _say "REFUSING — $DOCTOR is missing (the farm's \`fleet_srcs\` declares pr-doctor.py). Nothing ran."
+if [ ! -r "$DOCTOR" ]; then
+  _say "REFUSING — $DOCTOR is missing or unreadable (the farm's \`fleet_srcs\` declares pr-doctor.py)."
+  _say "  Nothing ran. An unreadable file is not a missing one: check its mode, do not re-run the farm."
   exit 2
 fi
 
@@ -207,10 +218,19 @@ case "$_rc" in
       _say "  configuration one. Nothing ran."
       exit 2
     }
+    # ⛔ `PYTHONUTF8=1` ON THE DOCTOR TOO — THE ROUND-41 FIX WAS HALF-APPLIED (review round 42, P2, measured).
+    # Round 41 forced UTF-8 mode on the reader's PROOF child so a trimmed value and the doctor's own
+    # `str.strip()` agreed. The wrapper TRIMMED the same value with that child, then `exec`'d the doctor
+    # with no prefix — so under `LC_ALL=POSIX` the doctor decoded the RAW argv, saw the trailing NBSP as a
+    # character rather than whitespace, and REFUSED a repo the wrapper had just announced as proved:
+    #   wrapper: "Grading the ONE repo REPO proves: acme/one (from /tmp/x/co)"
+    #   doctor : REFUSING: REPO=/tmp/x/co  does not name a repository … rc 2
+    # A child that reads the value differently from the caller is not a proof — true of wrapper-vs-doctor
+    # exactly as it was of reader-vs-doctor. One decode now governs both.
     _say "set: $(repo_set_file) -> grading $(printf '%s\n' "$repos" | awk -F, '{print NF}') repo(s)"
     PR_DOCTOR_REPOS="$repos"
     export PR_DOCTOR_REPOS
-    exec "$PY" "$DOCTOR" --all-repos
+    PYTHONUTF8=1 exec "$PY" "$DOCTOR" --all-repos
     ;;
   3)
     # NO-REPO-SET — the single-repo mode, and ONLY when this box can still name a repo.
@@ -369,7 +389,9 @@ case "$_rc" in
       exit 2
     fi
     _say "  Create the repo set above and this same unit grades every repo it names, with no reinstall."
-    exec "$PY" "$DOCTOR"
+    # Same prefix as the `--all-repos` exec above, for the same measured reason: this path passes the
+    # DEGRADED repo through the same seam the doctor re-reads from the environment.
+    PYTHONUTF8=1 exec "$PY" "$DOCTOR"
     ;;
   *)
     repo_set_parse 1>&2

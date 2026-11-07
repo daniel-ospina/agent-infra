@@ -422,6 +422,20 @@ ck "f11b2 the farm-gap refusal quotes the log string VERBATIM, with NO failed su
 # file's header says the whole unit exists to prevent.
 ck "f34 a missing sibling DOCTOR is a NAMED farm gap, and never announces 'grading N repo(s)'" \
    'mv "$W/pr-doctor.py" "$W/pr-doctor.py.away"; o="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; rc=$?; mv "$W/pr-doctor.py.away" "$W/pr-doctor.py"; [ "$rc" = 2 ] && grep -q "pr-doctor.py is missing" <<<"$o" && ! grep -q "grading .* repo(s)" <<<"$o"'
+# ⛔ `-f` IS EXISTENCE, AND AN UNREADABLE FILE EXISTS (review round 42, P2 — measured). The same defect
+# `f34` guards, one permission bit over: a `pr-doctor.py` at mode 000 passed `[ ! -f ]`, the wrapper
+# announced `grading N repo(s)`, and the exec died with `can't open file … Permission denied` at rc 2 —
+# the code this wrapper reserves for "I refused to start a pass at all", so an operator could not tell a
+# refusal from a crash. Guarded against root for the reason f11c gives: root reads mode 000.
+if [ "$(id -u)" = 0 ]; then
+  printf 'skip f34b (running as root: mode 000 does not block a read)\n'
+else
+  chmod 000 "$W/pr-doctor.py"
+  _o_000="$(REPO_SET_FILE="$CONF" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>&1)"; _rc_000=$?
+  chmod 644 "$W/pr-doctor.py"
+  ck "f34b an UNREADABLE sibling doctor is refused BY NAME — never a 'grading N repo(s)' claim for a run that cannot start" \
+     '[ "$_rc_000" = 2 ] && grep -q "missing or unreadable" <<<"$_o_000" && ! grep -q "grading .* repo(s)" <<<"$_o_000" && ! grep -qE "Permission denied|can.t open file" <<<"$_o_000"'
+fi
 # ⛔ THE THIRD ARMLESS GUARD, ONE TO THE LEFT OF `f34` (review at `7159ffab`, P1). `[ -z "$PY" ]` is
 # the same shape as the two above and was the remaining guard in this file whose deletion left the
 # suite at ZERO reds: with it gone the wrapper announces `set: … -> grading N repo(s)` and then dies on
@@ -637,10 +651,12 @@ found = set()
 # ⛔ EXPLICIT UTF-8, because this file and the wrapper are full of em dashes and `⛔`: under an ambient
 # `PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 LC_ALL=POSIX` the default text encoding makes `open()` raise
 # UnicodeDecodeError on a CORRECT tree (fail-closed, but a false block all the same). ⛔ THE FIRST FIX FOR
-# THIS HARDENED ONLY THE TWO SCANS AND ITS COMMENT SAID SO — “BOTH arms red” — while the file holds 31
-# `open()` calls: a reviewer measured 22 arms red under that exact locale, every one an unhardened
-# mutation fixture (round 41, P2). EVERY `open()` in this file now passes `encoding='utf-8'`, and the
-# locale is part of this suite's own matrix below rather than a sentence in a comment.
+# THIS HARDENED ONLY THE TWO SCANS AND ITS COMMENT SAID SO — “BOTH arms red” — while the file holds
+# dozens of `open()` calls: a reviewer measured 22 arms red under that exact locale, every one an
+# unhardened mutation fixture (round 41, P2). EVERY `open()` in this file now passes `encoding='utf-8'`,
+# and the locale is part of this suite's own matrix below rather than a sentence in a comment.
+# ⛔ THE COUNT IS DELIBERATELY ABSENT (round 42): this file's arm count moves under three lanes, so a
+# number written here was already stale — “31” against a measured 32 — twice caught by review.
 for line in open(sys.argv[1], encoding='utf-8'):
     s = line.rstrip('\n')
     if s.lstrip().startswith('#'):      # prose is not a call — nor is a commented-out example
@@ -834,6 +850,47 @@ ck "f32 a REPO padded with a NON-ASCII space still RUNS (the trim is the doctor 
    'o="$(REPO_SET_FILE="$nofile" REPO="$T/tortoise"$(printf "\302\240") HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; grep -q "^ARGV $" <<<"$o"'
 ck "f33 a seam that is ENTIRELY a non-ASCII space does not flip the wrapper against the doctor" \
    'o="$(REPO_SET_FILE="$nofile" OR="$(printf "\302\240")" REPO="$T/tortoise" HOME="$T" bash "$W/pr-doctor-machine.sh" 2>/dev/null)"; grep -q "^ARGV $" <<<"$o"'
+# ⛔ THE WRAPPER TRIMMED THE VALUE AND THEN HANDED THE RAW ONE TO THE DOCTOR (review round 42, P2 —
+# measured). Round 41 forced UTF-8 mode on the reader's proof child so the trim and the doctor's own
+# `str.strip()` agreed — but the wrapper then `exec`'d the doctor with NO prefix, so under `LC_ALL=POSIX`
+# the wrapper announced `Grading the ONE repo REPO proves: acme/one (from …/co)` and the doctor refused
+# that same repo (`REPO=…/co  does not name a repository`, rc 2) because it decoded the RAW argv and saw
+# the trailing NBSP as a character. The stub below answers the only question that matters here — did the
+# child decode the value the caller proved? — without depending on what the real doctor grades.
+# ⛔ `if __name__ == "__main__"` IS LOAD-BEARING, AND ITS ABSENCE MADE THIS ARM NON-DISCRIMINATING (measured).
+# The reader's `strip` proof IMPORTS this file (`spec_from_file_location` + `exec_module`), so a module-level
+# `print` fires inside the PROOF CHILD — which is hard-coded `PYTHONUTF8=1` — and its `strips_to_dir=True`
+# satisfied the grep whatever the exec'd doctor decoded: the arm passed with the fix REVERTED, and the
+# leaked print even became the wrapper's own "REPO proves: …" claim.
+# ⛔ AND THE STUB NEEDS THE PROOF FUNCTIONS, OR THE ARM CANNOT PASS AT ALL (measured immediately after
+# adding the guard). Rank 4 `REPO` runs a provenance proof through the sibling's `_origin_slug`; a stub
+# that defines only `os` makes the wrapper REFUSE at rc 2 before the `exec` that prints this line, so the
+# arm reddened on a CORRECT tree — a blocking red, which is worse than the non-discriminating green it
+# replaced. Same re-exports the shipped `$W` stub carries, so the run reaches the exec'd doctor.
+WD="$T/wdoctor"; mkdir -p "$WD/lib"
+cp "$READER" "$WD/lib/repo-set.sh"; cp "$WRAPPER" "$WD/pr-doctor-machine.sh"
+cat > "$WD/pr-doctor.py" <<'PYSTUB'
+import importlib.util, os, sys
+
+_real = None
+for _c in (os.path.join(os.path.dirname(__file__), "pr-doctor-real.py"),):
+    if os.path.exists(_c):
+        _spec = importlib.util.spec_from_file_location("_prd_real", _c)
+        _real = importlib.util.module_from_spec(_spec); _spec.loader.exec_module(_real)
+        break
+if _real is not None:
+    _slug_from_remote = _real._slug_from_remote
+    _normalize_slug = _real._normalize_slug
+    _origin_slug = _real._origin_slug
+    set_tag_collisions = _real.set_tag_collisions
+    configured_repos = _real.configured_repos
+
+if __name__ == "__main__":
+    print("STUB strips_to_dir=%s" % os.path.isdir(os.environ.get("REPO", "").strip()))
+PYSTUB
+cp "$REPO_ROOT/scripts/pr-doctor.py" "$WD/pr-doctor-real.py"
+ck "f33b …and the DOCTOR decodes the value the same way the wrapper proved it (POSIX locale, trailing NBSP)" \
+   'o="$(REPO_SET_FILE="$nofile" REPO="$T/tortoise"$(printf "\302\240") HOME="$T" LC_ALL=POSIX PYTHONUTF8=0 PYTHONCOERCECLOCALE=0 bash "$WD/pr-doctor-machine.sh" 2>&1)"; [ "$(tail -n 1 <<<"$o")" = "STUB strips_to_dir=True" ]'
 ck "f18 no set + neither OR nor REPO -> REFUSES, naming the set" \
    '[ "$(REPO_SET_FILE="$nofile" HOME="$T" bash "$W/pr-doctor-machine.sh" >/dev/null 2>&1; echo $?)" = 2 ]'
 ck "f12 sourcing the reader runs no verb (a consumer sources it, it is not executed twice)" \
@@ -888,7 +945,7 @@ OLDPROG="$(sed -n '/<key>ProgramArguments<\/key>/,/<\/array>/p' "$OLDPLIST")"
 # 40, P2). Both expressions were the same string, on `$PROG`, which is assigned once and never rebuilt —
 # so `h1` could not redden without `e2`, and the `e3` its label cited (`! grep -q "daniel-ospina"`) was
 # never evaluated. The assertion it claimed is carried by `e2` and `e3` themselves, above. Found by
-# scanning all 152 `ck` arms for expression identity; this file keeps that scan's result rather than a
+# scanning EVERY `ck` arm for expression identity; this file keeps that scan's result rather than a
 # restatement of it.
 ck "h2 the PRE-#2281 argv would FAIL e2 (the assertion discriminates the change)" \
    'grep -qE "<string>(--repo|daniel-ospina/)" <<<"$OLDPROG"'
@@ -1037,6 +1094,24 @@ for b in bash sed tr awk grep printf id dirname cat cut wc head mv rm mkdir ln c
 done
 ck "j16 with NO python3 on PATH the tag guard still refuses (absolute fallback, like the wrapper)" \
    'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$NODIR" /bin/bash "$READER" check 2>&1)"; grep -q "REFUSED set" <<<"$o"'
+# ⛔ THE READER'S OWN SUBSTRATE WAS UNCHECKED, AND ITS ABSENCE PRODUCED BOTH A WRONG CAUSE AND A FALSE
+# PASS (review round 42, P2 — measured twice). `j16` above deliberately KEEPS sed and awk, so neither
+# shape was armed. Two minimal PATHs, one tool short each; both must refuse BY NAME at rc 5, because the
+# alternatives are both worse than a refusal:
+#   sed missing → every line reads blank → `NO-ENTRIES … names no repo`, rc 4, for a file naming two;
+#   awk missing → `rendered` and `expected` both empty → the round-trip compares them EQUAL → rc 0 `OK`
+#                 for a set this same reader REFUSES at rc 1. That second one is a FALSE PASS.
+for _t in sed awk; do
+  _d="$T/no-$_t"; mkdir -p "$_d"
+  for b in bash sed awk tr grep printf id dirname cat cut wc head mv rm mkdir ln chmod git date env basename uname python3; do
+    [ "$b" = "$_t" ] && continue
+    _p2="$(command -v "$b" 2>/dev/null)" && ln -sf "$_p2" "$_d/$b" 2>/dev/null
+  done
+done
+ck "j16b no \`sed\` on PATH is a NAMED refusal at rc 5 — never 'NO-ENTRIES' for a file that names two repos" \
+   'o="$(REPO_SET_FILE="$CONF" PATH="$T/no-sed" /bin/bash "$READER" check 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "sed\` is not on PATH" <<<"$o" && ! grep -q "NO-ENTRIES" <<<"$o"'
+ck "j16c no \`awk\` on PATH is a NAMED refusal at rc 5 — the round-trip must not 'pass' with both sides empty" \
+   'o="$(REPO_SET_FILE="$T/tag-collide.conf" PATH="$T/no-awk" /bin/bash "$READER" check 2>&1)"; rc=$?; [ "$rc" = 5 ] && grep -q "awk\` is not on PATH" <<<"$o" && ! grep -q "OK — " <<<"$o"'
 
 # ⛔ THE ROUND-TRIP IS BY ENTRIES, NOT BY COUNT (review round 9, P2): a separator at the END of a value
 # is adjacent to the join comma, so the count stayed n and a TRUNCATED checkout passed `check` — a set
@@ -1062,8 +1137,13 @@ ck "j17-0 …and the SAME fixture is refused under an ambient POSIX locale (argv
 # this file's round-4 doctrine (nothing PROVEN, nothing WRONG), so the verdict is `OK` on that path —
 # turning it into a refusal would reverse that decision and block every box carrying the reader without
 # the doctor. The arm pins the CAUSE being named, which is the honest part of the fix.
+# ⛔ THE NEGATIVE ASSERTION WAS VACUOUS (review-instrumented round 42): it grepped for "not beside this
+# reader" while the reader's real text is "was not found beside this reader", which does NOT contain that
+# substring — so the conjunct could never fail. It now quotes the actual string, and covers BOTH layers:
+# the whole-set WARN and the PER-LINE `CHECKOUT-UNVERIFIED` reason, which kept blaming a missing sibling
+# (the same misdiagnosis one layer down, measured through the seam).
 ck "j-doctor-seam-a-typo-is-named-as-the-cause-not-as-a-missing-sibling" \
-   'o="$(REPO_SET_DOCTOR="$T/no-such-doctor.py" run_reader "$T/tag-collide.conf" check 2>&1)"; grep -q "REPO_SET_DOCTOR" <<<"$o" && grep -q "not a file" <<<"$o" && ! grep -q "not beside this reader" <<<"$o"'
+   'o="$(REPO_SET_DOCTOR="$T/no-such-doctor.py" run_reader "$T/tag-collide.conf" check 2>&1)"; grep -q "REPO_SET_DOCTOR" <<<"$o" && grep -q "not a file" <<<"$o" && ! grep -q "was not found beside this reader" <<<"$o" && ! grep -q "not beside this reader" <<<"$o"'
 ck "j-doctor-seam-empty-is-not-set (an empty seam takes the sibling path, byte-identical to no seam)" \
    '[ "$(REPO_SET_DOCTOR="" run_reader_rc "$T/tag-collide.conf" check)" = "$(run_reader_rc "$T/tag-collide.conf" check)" ]'
 
@@ -1479,6 +1559,21 @@ ck "m35 a sibling that LOADS but lacks _normalize_slug makes the proof UNPROVEN 
    'o="$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check)"; [ "$(REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader_rc "$T/nonorm.conf" check)" = 0 ] && grep -q "UNPROVEN" <<<"$o"'
 ck "m36 …and it says why, naming the missing helper (not \`is not an owner/name slug\`)" \
    'REPO_SET_DOCTOR="$MN/pr-doctor.py" run_reader "$T/nonorm.conf" check | grep -q "could not be normalised"'
+# ⛔ `origin` WAS THE ONE VERB WITH NO PER-VERB "COULD NOT ASK" ANSWER (review round 42, P2 — measured).
+# `mod._origin_slug(arg)` was called BARE, so a sibling that LOADS and merely LACKS it raised
+# AttributeError, the caller saw empty stdout, and the reader rendered "no python3, or it would not load"
+# — both halves false (python3 resolved; the module imported cleanly). Same stale-farmed-sibling class
+# the `strip`/`norm`/`tags` sentinels already cover. The `del` below is the smallest sibling that LOADS.
+MO="$T/noorigin"; mkdir -p "$MO"
+python3 - "$REPO_ROOT/scripts/pr-doctor.py" "$MO/pr-doctor.py" <<'PYO'
+import sys
+src, dst = sys.argv[1], sys.argv[2]
+t = open(src, encoding='utf-8').read()
+t += "\n\ndel _origin_slug\n"
+open(dst, "w", encoding='utf-8').write(t)
+PYO
+ck "m43 a sibling that LOADS but lacks _origin_slug is named as such — not blamed on python3 or a bad load" \
+   'o="$(REPO_SET_DOCTOR="$MO/pr-doctor.py" run_reader "$CONF" check 2>&1)"; grep -q "_origin_slug\` is missing, or it raised" <<<"$o" && ! grep -q "no python3, or it would not load" <<<"$o"'
 ck "m37 …while the SHIPPED doctor still REFUSES a genuinely different slug on the same checkout (rc 1)" \
    '[ "$(run_reader_rc "$T/nonorm-wrong.conf" check)" = 1 ]'
 ck "m38 …and with the shipped doctor the \`.git\` spelling is simply ACCEPTED, with no WARN" \
