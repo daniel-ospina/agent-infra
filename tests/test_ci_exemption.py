@@ -921,15 +921,30 @@ def test_E3_via_the_real_wire_format_blocks_a_deterministic_regression():
 #: `tools/**/*.py` census (`/` in the parameter); the rest are the other
 #: characters a pytest parameter can carry, so a future narrowing of `rest`
 #: cannot pass by covering only the shape #3686 was reported for.
+#:
+#: ⛔ INCLUDING SPACE (#3686 second door). `[argv14-at the EDGE]` is a real id
+#: from a shipped suite and it was STILL dropped by both Python doors after `/`
+#: was fixed; a corpus that only carries `/` would have called that green.
 _PARAM_SPACE_CORPUS = (
     "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/cache_evict.py]",
     "tests/test_entry_point_python_guard.py::test_guard_refuses_an_old_interpreter_and_passes_the_floor[tools/gen_placement_table.py]",
     "tests/test_entry_point_python_guard.py::test_entry_point_guards_the_interpreter_before_its_imports[tools/longmem_eval/run.py]",
     "tests/test_ci_selection.py::test_surface[tools/ci_selection.py]",
+    "tests/test_pages_bindings.py::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]",
+    "tests/e2e/test_x.py::test_a[chromium-Claude Desktop]",
     "tests/test_a.py::test_param[a/b:c-d.e]",
     "tests/test_a.py::test_param[cache_evict]",
     "tests/test_a.py::TestK::test_param[x]-",
     "tests/test_a.py::TestK::test_param",
+)
+
+
+#: The real id the SECOND door (#3686 follow-up) was measured on: a parameter
+#: carrying a SPACE. `parse_rates` could not represent it at all — `_RATES_RE`'s
+#: nodeid group was `\S+`, so the row `ci-failure-set.sh` emits never reached
+#: :func:`is_failure_key` and read as PR-unique forever.
+_SPACE_PARAM_ID = (
+    "tests/test_pages_bindings.py::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]"
 )
 
 
@@ -996,6 +1011,81 @@ def test_a_path_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED():
     assert nodeid in {v.nodeid for v in decision.exempt}, (
         "the id was neither blocked nor exempted, so the verdict never saw it"
     )
+
+
+def test_a_SPACE_PARAMETRIZED_main_row_becomes_a_MEASURED_rate():
+    r"""The SECOND door (#3686): `_RATES_RE`'s `\S+` could not carry a space.
+
+    This is a different gate from the shape predicate: the wire format itself
+    rejected the row, so widening `_NODEID_RE` alone left the id dropped. The tab
+    is the field delimiter — `_SIG_ROW_RE` already delimits that way — so the
+    nodeid group must be `[^\t]+`.
+
+    MUTATION: restore `(?P<nodeid>\S+)` → `parse_rates` rejects the row and the
+    assertion on `r.rates` fails, because a dropped main-side row is exactly the
+    permanent-BLOCK mechanism this issue names.
+    """
+    r = parse_rates(f"{_SPACE_PARAM_ID}\t3\t26\n")
+
+    assert r.rejected == [], (
+        "parse_rates DROPPED main's row for a space-parametrized id (#3686): "
+        f"{r.rejected}"
+    )
+    assert r.rates[_SPACE_PARAM_ID] == Rate(3, 26)
+
+
+def test_a_SPACE_PARAMETRIZED_failure_is_EXEMPT_not_permanently_BLOCKED():
+    """End to end through `decide` for the space door, mirroring the `/` leg.
+
+    Asserting the parser alone would leave the verdict's own path unpinned, and
+    the verdict is the thing that BLOCKS a PR forever.
+    """
+    sig = "sg-3686-space"
+    main = parse_rates(f"{_SPACE_PARAM_ID}\t3\t26\n")
+    pr = parse_failure_rows(f"{_SPACE_PARAM_ID}\t3\t26\t{sig}\n").failures
+    assert pr, "the PR-side parser dropped the row, so this leg would be vacuous"
+    decision = decide(
+        pr,
+        main.rates,
+        main_signatures={_SPACE_PARAM_ID: frozenset({sig})},
+        k_pr=26,
+        rate_tolerance=1.5,
+    )
+    assert [v.nodeid for v in decision.blocked] == [], (
+        "a space-parametrized id main already fails is still BLOCKED — the "
+        f"#3686 deadlock: {[v.line for v in decision.blocked]}"
+    )
+    assert _SPACE_PARAM_ID in {v.nodeid for v in decision.exempt}, (
+        "the id was neither blocked nor exempted, so the verdict never saw it"
+    )
+
+
+def test_the_rate_table_is_still_EXACTLY_three_TAB_fields():
+    """`[^\t]+` must not have loosened the fail-closed FIELD check.
+
+    The nodeid group became delimiter-driven, which is what lets a space through;
+    the same change must not admit a fourth field, a non-numeric count, or a
+    zero run count.
+
+    MUTATION (verified 2026-11-07): drop the trailing `$` from `_RATES_RE` →
+    `…[argv14-at the EDGE]\t3\t26\textra` matches its own PREFIX, is accepted as
+    3/26, and this test reddens on `rejected == []`. ⛔ A WIDER NODEID GROUP IS
+    NOT that mutation: `(?P<nodeid>.+)` still leaves the two numeric tails
+    anchored, so the four-field line stays rejected and every assertion here
+    passes — the field check is carried by the anchors, not by the group's width.
+    """
+    for line in (
+        f"{_SPACE_PARAM_ID}\t3\t26\textra",
+        f"{_SPACE_PARAM_ID}\t3",
+        f"{_SPACE_PARAM_ID}\tx\t26",
+        f"{_SPACE_PARAM_ID}\t3\t0",
+        f"{_SPACE_PARAM_ID}\t27\t26",
+        "not a key at all\t3\t26",
+    ):
+        r = parse_rates(line + "\n")
+        assert r.rejected == [line], (
+            f"parse_rates ADMITTED a line it must reject: {line!r} -> {r.rates}"
+        )
 
 
 def test_the_total_failure_blocks_through_the_real_wire_format():

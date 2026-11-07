@@ -161,9 +161,30 @@ from pathlib import Path
 #: 2026-11-07: main's table carried ``…[tools/cache_evict.py]\t3\t26`` and the
 #: verdict still reported the id as "absent from main's failure set". Pinned by
 #: ``tests/test_ci_exemption.py::test_a_path_PARAMETRIZED_nodeid_survives_BOTH_doors``.
+#:
+#: ⛔ TWO GAPS, ONE ROOT, AND THE SECOND ONE IS A SPACE (#3686 follow-up). The
+#: parameter space is pytest's, and pytest parameter ids legitimately carry a
+#: SPACE too — ``…::test_the_indexnow_gate_fails_for_each_broken_surface[argv14-at the EDGE]``
+#: is a real id from a shipped suite, and it was still dropped here after ``/``
+#: was added (measured on this branch at ``f3d4ff86``: ``STRICT False |
+#: LOOSE True``, and ``parse_rates`` rejected the row main's table carried).
+#: A space is not a different defect from ``/`` — it is the SAME predicate
+#: disagreeing with the PR side, on a character the loose form has always
+#: admitted, so fixing only the character the report named would leave the class
+#: intact. Both are in the class now.
+#:
+#: The class is still DELIBERATELY not ``[^\t]+``: the strict/loose split exists
+#: because a key wrongly ADMITTED here enters the exemption allowlist (see the
+#: stakes in :func:`is_failure_key`), so it is widened to the parameter space our
+#: own suites actually PRODUCE — ``/``, space, and the pytest punctuation around
+#: them — rather than collapsed into the loose form. A parameter carrying some
+#: OTHER character is still rejected, and rejection is REPORTED (``rejected`` in
+#: :class:`RatesResult`, printed as ``NOTE : rejected main rate row:``), never
+#: silently dropped: that is how a third gap would be MEASURED rather than
+#: discovered as a deadlock.
 _NODEID_RE = re.compile(
     r"^(?P<path>[A-Za-z0-9_./\-]+\.py)"
-    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/]+)$"
+    r"::(?P<rest>[A-Za-z0-9_\[\]\-.:/ ]+)$"
 )
 
 #: The tokens that open a failure record. One list, so the shell can never
@@ -520,8 +541,22 @@ class RatesResult:
         return max((r.runs for r in self.rates.values()), default=0)
 
 
+#: ``<nodeid>\t<failures>\t<runs>``. ⛔ THE NODEID IS DELIMITED BY THE TAB, NOT
+#: BY ``\S`` (#3686 second door). ``\S+`` cannot carry the space a pytest
+#: parameter legitimately contains, so ``…[argv14-at the EDGE]\t3\t26`` — a row
+#: ``ci-failure-set.sh`` EMITS correctly — never even reached
+#: :func:`is_failure_key`, and the id read as PR-unique forever.
+#:
+#: ``[^\t]+`` is the SAME delimiting :data:`_SIG_ROW_RE` already uses on the
+#: signature table, and it is what makes the shape agree across the two tables.
+#: It does NOT loosen the fail-closed field check: the class excludes the tab, so
+#: the line must still be EXACTLY three tab-separated fields with two numeric
+#: tails — a fourth field, or a nodeid carrying a tab, still fails to match and is
+#: rejected. What the row's nodeid is ALLOWED to be remains
+#: :func:`is_failure_key`'s single decision, below, which is what keeps the two
+#: doors from disagreeing again.
 _RATES_RE = re.compile(
-    r"^(?P<nodeid>\S+)\t(?P<failures>[0-9]+)\t(?P<runs>[0-9]+)$"
+    r"^(?P<nodeid>[^\t]+)\t(?P<failures>[0-9]+)\t(?P<runs>[0-9]+)$"
 )
 
 
