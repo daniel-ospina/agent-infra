@@ -115,6 +115,7 @@ JOB_TIMEOUT = 0
 # or the uid — see resolve_loop_lock(). Empty means "not resolved" (a unit test importing this
 # module, or a mode that never reaches a loop).
 LOOP_LOCK = ""
+LOOP_LOCK_ROOT = ""
 
 # The placeholder set — the SAME names `scripts/install-launchd.sh` renders, whose own
 # PLIST_PLACEHOLDERS array is the contract. A name added there and not here turns every cell's
@@ -186,6 +187,64 @@ def resolve_infra_root() -> str:
     # NOT a checkout there, which is why the caller must pass INFRA_ROOT (cloud-cell-bringup.sh
     # does — it already resolved the checkout the layer was installed from).
     return ""
+
+
+def absolutize_path_knobs():
+    """Resolve every CWD-SENSITIVE path knob ONCE, in the parent, before anything renders.
+
+    ⛔ The loop child runs with `cwd="/"` (see `spawn_loop`), and `placeholder_values()` re-reads these
+    knobs there. Any knob whose VALUE is acted on relative to the cwd — `os.path.isdir()`, `os.access()`,
+    `open()` — therefore resolves DIFFERENTLY in the child, and the child then renders a different job
+    argv than the inline pass and `--verify` certified: a placeholder renders empty (a named SKIP, so the
+    job silently never runs) or names a different checkout (so the job runs against something nobody
+    certified). Both are the `SCHEDULE VERIFIED`-over-a-loop-that-runs-nothing false PASS this change
+    exists to remove, and it is NOT just `INFRA_ROOT`:
+
+      TORTOISE_REPO  `os.path.isdir(tortoise)` decides whether the value is kept or replaced by the
+                     fallback scan, so a RELATIVE value can keep its relative form in the parent and
+                     be replaced by an ABSOLUTE checkout in the child (measured).
+      SWARM_ROOT     `os.access(join(SWARM_ROOT, '.venv/bin/python'))` feeds `PYTHON_BIN`, so the same
+                     relative root yields two different interpreters.
+      CELL_HOME      `home` — and `WORKTREE_HYGIENE_MODE` / `REAP_ORPHAN_MODE` / `SWARM_ENV_FILE` are
+                     all derived from it by `open()`.
+      SWARM_ENV_FILE a path read with `open()`.
+      WORKTREE_HYGIENE_ARM_FILE / REAP_ORPHAN_ARM_FILE
+                     the two arming records: each OVERRIDES the `home/.pi/agent/state/...` default and is
+                     then read with `open()`, so a relative override decides `--apply` vs `--dry-run` (and
+                     `0` vs `1` for the reaper) by the CALLER'S cwd — measured end-to-end as a marker
+                     carrying `wt=--apply` from the inline pass and `wt=--dry-run` from the loop child under
+                     one `SCHEDULE VERIFIED`, on the two shipped templates that carry those placeholders.
+                     They are NOT "derived from CELL_HOME" whenever the override is set, which is why the
+                     completeness claim below has to name them explicitly.
+      PYTHON_BIN / PI_NODE_BIN  executables: a value WITH a separator is cwd-resolved; a BARE NAME is a
+                     PATH lookup and is identical in both processes, so it is left alone (abspath on
+                     `python3` would invent a file that does not exist).
+
+    Normalising `os.environ` itself is deliberate: `spawn_loop` passes `os.environ.copy()`, so the child
+    inherits the RESOLVED values without a second handover list to drift out of date — which is exactly
+    how the `INFRA_ROOT` gap happened. `FLEET_SCHEDULE_STATE` / `TEMPLATES_DIR` / `FLEET_SCHEDULE_LOCK_ROOT`
+    still need their explicit handover because they are resolved from DEFAULTS rather than from an env
+    value the child would simply re-read.
+
+    ⛔ EVERY KNOB IN THESE TUPLES IS GRADED, AND A NEW ONE NEEDS ITS OWN ARM (#3442). The completeness this
+    function claims is only worth what the suite can refuse, so §19 names one arm per knob — deleting a
+    knob from the tuples below REDDENS a named row instead of passing quietly (it used to pass quietly on
+    SIX of them: `SWARM_ROOT`, `CELL_HOME`, `SWARM_ENV_FILE`, `REAP_ORPHAN_ARM_FILE`, `PYTHON_BIN`,
+    `PI_NODE_BIN`, whose absence was invisible to every other check). The map, so the next knob cannot
+    repeat it: `TORTOISE_REPO` 19ak · `SWARM_ROOT` 19as (via the DERIVED `{{PYTHON_BIN}}`) · `CELL_HOME`
+    19at (via both arming records) · `SWARM_ENV_FILE` 19av · `WORKTREE_HYGIENE_ARM_FILE` 19am ·
+    `REAP_ORPHAN_ARM_FILE` 19au · `PYTHON_BIN`/`PI_NODE_BIN` 19av plus its CONTROL row, which is what pins
+    the bare-name exemption below.
+    """
+    for knob in ("TORTOISE_REPO", "SWARM_ROOT", "CELL_HOME", "SWARM_ENV_FILE",
+                 "WORKTREE_HYGIENE_ARM_FILE", "REAP_ORPHAN_ARM_FILE"):
+        val = os.environ.get(knob, "")
+        if val:
+            os.environ[knob] = os.path.abspath(val)
+    for knob in ("PYTHON_BIN", "PI_NODE_BIN"):
+        val = os.environ.get(knob, "")
+        if val and os.sep in val:
+            os.environ[knob] = os.path.abspath(val)
 
 
 def wt_hygiene_mode(home: str) -> str:
@@ -1001,22 +1060,52 @@ def resolve_loop_lock():
     stderr. Same arm, same reason, as #2898's recorded decision for an unwritable `$STATE` —
     refusing would take the box's only alarm offline exactly when the box is broken.
     """
-    global LOOP_LOCK
+    global LOOP_LOCK, LOOP_LOCK_ROOT
     root = os.environ.get("FLEET_SCHEDULE_LOCK_ROOT") or os.path.join(
         os.environ.get("FLEET_SCHEDULE_TMPFS_ROOT") or "/dev/shm", "fleet-schedule"
     )
+    # ⛔ ABSOLUTE BEFORE ANYTHING ELSE, for the same reason `STATE` is (see main()): this path IS the
+    # mutex's NAME, and a name that resolves differently in two processes is two mutexes. A RELATIVE
+    # root is resolved against the caller's cwd here but against `cwd="/"` in the loop child
+    # (`spawn_loop`), so the parent creates e.g. `$PWD/relock` while the child — unable to create
+    # `/relock` — degrades to `$STATE/loop.lock`. Both loops then hold DIFFERENT locks, both verbs
+    # print `SCHEDULE VERIFIED`, and #2890 is reproduced with the guard reporting success (measured
+    # by the reviewer with a `FLEET_SCHEDULE_LOCK_ROOT=relock` pin: two live loops on one box and no
+    # lock file on the parent's path).
+    root = os.path.abspath(root)
     why = ""
     try:
         # ⛔ A PRIVILEGED VERB MUST NOT SQUAT THIS ROOT — and `chmod` IS NOT THE ANSWER. `chmod`
         # changes MODE, not OWNERSHIP, so it does nothing about the `st_uid != getuid()` arm below
         # (the [VGATE] pass measured a 1777 root still degrading every operator loop), while it
         # would widen an operator-pinned private `FLEET_SCHEDULE_LOCK_ROOT` to world-writable for no
-        # benefit. So the root is created world-writable (the same 0o1777 shape `/dev/shm` itself
-        # has, which is what the DEFAULT root needs) and an EXISTING root's mode is left exactly as
-        # its owner set it. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
+        # benefit — and a `chmod` UP is exactly what the arm below rejects. The mode is therefore left
+        # alone on a pre-existing root, and requested as 0o755 (umask-cleared only, never upwards) on a
+        # root we create. Residual, named rather than hidden: a `sudo`-run `--start` on a box that
         # has no lock root yet leaves it root-owned, and every operator loop then degrades with the
         # NOTE below — tracked as its own follow-up, since the sound fixes are a chown-uid decision.
-        os.makedirs(root, mode=0o1777, exist_ok=True)
+        # Second residual, named for the same reason: `makedirs` IGNORES `mode` on a directory that
+        # already exists, so a root created by a pre-#3615 run under `umask 022` keeps its 0o1755 and
+        # is never widened — a second uid on a shared box therefore keeps degrading until that
+        # directory is recreated by hand. That is the right trade (widening a directory we did not
+        # create is exactly the bypass rejected above), and it is stated here rather than left as the
+        # one consequence of the no-chmod rule that a reader has to infer.
+        # ⛔ AND NO `chmod`, ON *ANY* ROOT — not even one we create. Widening is the bypass, whichever
+        # directory it happens to: with `loop.lock` writable by others, ANY local uid can create one
+        # naming a live `fleet-schedule --loop` it runs, and every operator loop then refuses while
+        # `--start` exits 0 — the box silently unscheduled, through a guard defeated by the mode of
+        # its own directory. A previous cut corrected a pre-existing root to 0o1777; that was measured
+        # to WEAKEN a fresh root (see below) and is reverted.
+        # ⛔ AND THE REQUESTED MODE IS 0o755, NOT 0o1777 — THE DIFFERENCE IS NOT COSMETIC. `makedirs`'s
+        # mode is UMASK-FILTERED, and a umask can only CLEAR bits, so requesting 0o1777 let a permissive
+        # umask produce a world-writable root: measured 0o1777 under `umask 0` (services, containers and
+        # some CI images do exactly that), which is the plant-a-`loop.lock` bypass above with the guard
+        # reporting nothing. Requesting 0o755 makes "not world-writable" TRUE UNDER EVERY UMASK, and it
+        # costs nothing: the `st_uid != getuid()` arm below refuses a root another uid owns whatever its
+        # mode, so a world-writable root could never be SHARED across uids anyway — only attacked. The
+        # mode of a PRE-EXISTING root is still untouched (`makedirs` ignores `mode` when the dir exists),
+        # so an operator's deliberate 0700 pin survives, which is the distinction that matters here.
+        os.makedirs(root, mode=0o755, exist_ok=True)
         # /dev/shm is 1777 and this name is guessable, so a PRE-EXISTING foreign dir must never
         # become our lock dir (the same ownership rule, and the same reason, as disk-reaper.sh's
         # fallback candidates). Only a pre-existing dir can be foreign — an absent one we create.
@@ -1026,6 +1115,15 @@ def resolve_loop_lock():
             why = "owned by uid %d" % os.stat(root).st_uid
     except OSError as exc:
         why = exc.strerror or type(exc).__name__
+    # ⛔ THE ATTEMPTED ROOT IS RECORDED EVEN WHEN WE DEGRADE, and it is what the child is handed.
+    # Emptying it made parent and child resolve DIFFERENT mutexes: this process then tested the
+    # degraded `$STATE/loop.lock` while the child (no override, `TMPFS_ROOT` dropped) resolved the
+    # DEFAULT `/dev/shm/fleet-schedule`, so the parent's own holder checks were blind to its own
+    # child — a second home's `--start` spawned a child that correctly refused the box lock, the poll
+    # timed out, and `--start` reported "the loop did not come up" over a box that IS scheduled. The
+    # child re-runs this same usability check against the same absolute path, so it degrades in
+    # exactly the same way and both sides agree.
+    LOOP_LOCK_ROOT = root
     if why:
         LOOP_LOCK = os.path.join(STATE, "loop.lock")
         print(
@@ -1114,17 +1212,25 @@ def loop_holder():
     no /proc) is an absent datum, so the command-line check alone decides — which is still strictly
     more than a bare pid.
     """
-    rec = read_loop_lock()
-    if rec is None:
+    return live_holder(record=read_loop_lock())
+
+
+def live_holder(record):
+    """The IDENTITY CHECK ITSELF, for a record not necessarily read from `LOOP_LOCK`.
+
+    Split out because the reclaim paths must judge a record they have MOVED ASIDE, not the one at the
+    lock's path — reading `LOOP_LOCK` there answers about the wrong claim.
+    """
+    if record is None:
         return None
-    pid, start, _state = rec
+    pid, start, _state = record
     if not pid_is_our_loop(pid):
         return None
     if start:
         observed = proc_start_time(pid)
         if observed is not None and observed != start:
             return None
-    return rec
+    return record
 
 
 def same_state_dir(a, b):
@@ -1260,18 +1366,120 @@ def claim_loop_lock():
                     try:
                         fd = os.open(LOOP_LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
                     except FileExistsError:
+                        # ⛔ THE FALLBACK MUST ASK THE SAME QUESTION THE LINK PATH ASKS, AND THEN DO
+                        # THE SAME THING ABOUT IT. A bare `continue` retried the create against a name
+                        # that was still taken, burned all three attempts and landed on a disclosed
+                        # PERMIT — so on any link-refusing root a STALE OR CORRUPT record made every
+                        # claimant permit, i.e. two loops on one box, permanently (measured with two
+                        # real processes: both printed GUARD OFF and the stale record sat byte-
+                        # identical afterwards). A live holder is returned (the caller refuses);
+                        # a provably-gone one is RECLAIMED — by `rename`, which these filesystems do
+                        # allow even when they refuse `link`.
+                        fallen_holder = loop_holder()
+                        if fallen_holder is not None:
+                            return fallen_holder
+                        fallen_aside = "%s.reclaim.%d.%d" % (LOOP_LOCK, os.getpid(), time.time_ns())
+                        try:
+                            os.rename(LOOP_LOCK, fallen_aside)
+                        except OSError:
+                            continue
+                        # ⛔ JUDGE WHAT WE MOVED, NEVER WHAT IS AT THE PATH (the reclaim above makes
+                        # the same point): a claim published between the two reads must survive.
+                        # ⛔ AND IT MUST NOT BE PUT BACK BY `rename` — `rename` REPLACES the
+                        # destination, so a fourth party that filled the freed name in the meantime
+                        # would have its live record DESTROYED, and an `os.path.exists` guard only
+                        # narrows that window (it is the same read-then-act the claim itself refuses).
+                        # The link path cannot restore either on a link-refusing root, and its ruling
+                        # is the one that holds here: KEEP the displaced record, never delete it, and
+                        # SAY SO — a silent two-loop outcome is unacceptable, an evidenced one is
+                        # survivable (this file's `claim_loop_lock` docstring states the same).
+                        # ⛔ AND WHEN THE DISPLACED CLAIM IS LIVE, THIS PASS MUST REFUSE — NOT PERMIT
+                        # AND RETRY. `_permit_without_lock(...)` followed by `continue` was WORSE than
+                        # the permit it looks like: the `rename` above left `LOOP_LOCK` FREE, so the
+                        # next attempt's `O_EXCL` create SUCCEEDS (the link still refuses — that is why
+                        # this arm exists), the inode check passes and `claim_loop_lock` returns None,
+                        # i.e. "I hold the box". The displaced live loop does not re-read the lock, so
+                        # TWO loops run AND the name now records the NEWCOMER — after which `--verify`
+                        # sees one healthy holder with a fresh tick and prints `SCHEDULE VERIFIED`. The
+                        # disclosure that was supposed to make that survivable is one stderr line in
+                        # the starting pass that no instrument reads. The sibling arm 40 lines up
+                        # (`return fallen_holder`) already answers this condition correctly; the
+                        # asymmetry here was the defect.
+                        fallen_live = live_holder(read_loop_lock(fallen_aside))
+                        if fallen_live is not None:
+                            # Best-effort ATOMIC restore. `link` FAILS rather than replacing, so a
+                            # fourth party that took the freed name keeps its own record — the reason
+                            # `rename` is forbidden here does not apply to it. On this root `link`
+                            # cannot succeed (it is the arm's precondition), so the usual outcome is
+                            # the disclosure below with the record preserved at `fallen_aside`.
+                            try:
+                                os.link(fallen_aside, LOOP_LOCK)
+                            except OSError:
+                                print(
+                                    "  WARN   a reclaim on a link-refusing root moved a claim aside "
+                                    "at %s that turned out to be LIVE (%r) and could not be put back "
+                                    "— that claim's record is preserved there and THIS pass refuses "
+                                    "to run beside it (#2890)" % (fallen_aside, fallen_live),
+                                    file=sys.stderr,
+                                )
+                            else:
+                                try:
+                                    os.unlink(fallen_aside)
+                                except OSError:
+                                    pass
+                            return fallen_live
+                        try:
+                            os.unlink(fallen_aside)
+                        except OSError:
+                            pass
                         continue
-                    except OSError:
-                        pass
+                    except OSError as create_exc:
+                        # ⛔ THE DISCLOSURE MUST NAME THE ERROR THAT ACTUALLY STOPPED US. This arm is
+                        # reached when the CREATE fails, but `exc` here is still the LINK error (the
+                        # one that selected the fallback), so using it reported a misdiagnosis: a
+                        # full disk or an unwritable root was disclosed as `Operation not permitted`
+                        # — the link errno — and an operator was sent to the wrong cause on the exact
+                        # failure this fallback exists to survive. Bind the create's own exception,
+                        # and leave the `exc`-based message below to the LINK failure it describes.
+                        return _permit_without_lock(
+                            "cannot create the box lock at %s (%s: %s)"
+                            % (LOOP_LOCK, type(create_exc).__name__, create_exc)
+                        )
                     else:
+                        # ⛔ PUBLISH IS NOT COMPLETE UNTIL THE FILE AT `LOOP_LOCK` IS STILL OURS.
+                        # `O_EXCL` makes only the CREATE atomic; the write that follows is a window,
+                        # and a contender that reclaims inside it RENAMES our (empty) claim away and
+                        # publishes its own. Writing then lands in the inode nobody can see, so
+                        # returning "I hold the box" here would give TWO loops on one box. This is
+                        # the same rule `acquire_lock` states for the per-job lock, and the fallback
+                        # was the one publish path that skipped it. Comparing the inode is enough:
+                        # the reclaimer MOVES our file, so `LOOP_LOCK` afterwards is either absent
+                        # or a different inode, and a write to a moved-but-live inode would
+                        # otherwise look like success.
                         try:
                             os.write(fd, payload.encode())
+                            ours = os.fstat(fd)
                         finally:
                             os.close(fd)
-                        return None
-                # The lock root vanished or became unwritable under us (ENOSPC/EDQUOT/EACCES).
+                        try:
+                            now_at_path = os.stat(LOOP_LOCK)
+                        except OSError:
+                            now_at_path = None
+                        if now_at_path is not None and (now_at_path.st_dev, now_at_path.st_ino) == \
+                                (ours.st_dev, ours.st_ino):
+                            return None
+                        # ⛔ OUR CLAIM IS NOT THE ONE AT THE PATH, SO WE DO NOT HOLD IT. Re-examine
+                        # instead of believing the create: the next attempt asks `loop_holder()` and
+                        # returns a LIVE holder to the caller (which then refuses), or falls into the
+                        # disclosed permit if the root stays unusable. Returning a permit straight
+                        # from here would run this pass beside a scheduler that just beat us.
+                        continue
+                # ⛔ THIS IS THE *LINK* FAILURE, and the message says so. `errno` not in the
+                # fallback set means `os.link` itself was refused (EROFS/EACCES/ENOSPC on the link),
+                # so calling it a create failure named a syscall that never ran. The create's own
+                # failure is disclosed above, from `create_exc`.
                 return _permit_without_lock(
-                    "cannot create the box lock at %s (%s: %s)"
+                    "cannot link the box lock into place at %s (%s: %s)"
                     % (LOOP_LOCK, type(exc).__name__, exc)
                 )
             return None
@@ -2005,13 +2213,61 @@ def spawn_loop():
         print("loop already running (%s)" % describe_holder(holder))
         return holder[0], False
     with open(log_path, "a") as out:
-        subprocess.Popen(
+        # ⛔ THE CHILD RESOLVES ITS OWN PATHS — SO A RELATIVE KNOB MUST BE HANDED OVER RESOLVED.
+        # `subprocess` runs the loop with `cwd="/"`, so every relative path in the inherited
+        # environment means a DIFFERENT path in the child than it did here. `FLEET_SCHEDULE_LOCK_ROOT`
+        # is the mutex's NAME: created against the caller's cwd by this process and against `/` by the
+        # child, the two resolve `relock` to two different directories, the child cannot create
+        # `/relock` and degrades to `$STATE/loop.lock`, and BOTH homes then hold "the box" — #2890
+        # reproduced while both verbs print `SCHEDULE VERIFIED` (measured by the reviewer, and by
+        # case 19v: with the pin `FLEET_SCHEDULE_LOCK_ROOT=relock`, a second home started a second
+        # loop on the same box). Making the root absolute in `resolve_loop_lock` is NOT sufficient —
+        # that fixes this process's reading of the variable, not the one the child reads back out of
+        # the environment. So the resolved directory is passed explicitly, and `FLEET_SCHEDULE_TMPFS_ROOT`
+        # is dropped so it cannot re-derive a relative root on top of it.
+        # ⛔ EVERY NORMALIZED PATH KNOB, NOT JUST THE LOCK ROOT. The same reasoning applies to any
+        # path this process made absolute: the child inherits the RAW environment and re-resolves it
+        # against `cwd="/"`. A relative `FLEET_SCHEDULE_STATE` left the child writing `/relstate` (a
+        # `PermissionError` that surfaced as "the loop did not come up"; as root it created the dir
+        # instead, so the child ran over a state dir the parent never reads and `--stop` set an OFF
+        # switch the child never observed), and a relative `TEMPLATES_DIR` loaded a different job set
+        # than the inline pass and `--verify` had just certified.
+        # ⛔ AND `INFRA_ROOT` IS THE FOURTH KNOB, not an exception to that rule. It is `abspath`-ed
+        # in `resolve_infra_root`, the child re-derives it from the RAW environment against
+        # `cwd="/"`, and `placeholder_values()` renders it as `{{AGENT_INFRA_PATH}}` into five
+        # shipped templates (ai-drainer, ai-multi-repo, controller-watchdog, objective-reminder,
+        # worker-supply). A relative `INFRA_ROOT` therefore rendered a DIFFERENT checkout in the
+        # child than in the parent's inline pass: with none of the child's own fallbacks a checkout,
+        # the placeholder rendered EMPTY, `render()` classified those five jobs as a named SKIP, and
+        # the loop ran ZERO of them while `--install` printed `SCHEDULE VERIFIED` — the same false
+        # PASS as a relative `TEMPLATES_DIR`, one knob over (measured by the #3636 reviewer, who
+        # watched the parent's marker carry the caller's path and the child's carry another).
+        # ⛔ AND `INFRA_ROOT` IS NOT THE LAST ONE EITHER. The rest of the cwd-sensitive set —
+        # `TORTOISE_REPO`, `SWARM_ROOT`, `CELL_HOME`, `SWARM_ENV_FILE`, and the path-valued
+        # `PYTHON_BIN`/`PI_NODE_BIN` — is NOT listed here because `absolutize_path_knobs()` has
+        # already rewritten `os.environ` in the parent, so `os.environ.copy()` below carries them
+        # RESOLVED. A previous cut claimed in this comment that `SWARM_ROOT`/`TORTOISE_REPO` "cannot
+        # diverge because neither is abspath-ed anywhere" — that was FALSE (`placeholder_values()`
+        # does `os.path.isdir()`/`os.access()`/`open()` on them, which is cwd-relative) and the claim
+        # itself was the trap: a reviewer measured `--install` printing `SCHEDULE VERIFIED` over a
+        # loop that skipped its tortoise jobs. Keep the handover list and the absolutise list in sync
+        # — or better, add knobs to `absolutize_path_knobs()` and leave this block alone.
+        child_env = os.environ.copy()
+        child_env["FLEET_SCHEDULE_STATE"] = STATE
+        if TEMPLATES_DIR:
+            child_env["TEMPLATES_DIR"] = TEMPLATES_DIR
+        if LOOP_LOCK_ROOT:
+            child_env["FLEET_SCHEDULE_LOCK_ROOT"] = LOOP_LOCK_ROOT
+        if INFRA_ROOT:
+            child_env["INFRA_ROOT"] = INFRA_ROOT
+        child_env.pop("FLEET_SCHEDULE_TMPFS_ROOT", None)
+        child = subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--loop"],
             stdout=out,
             stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL,
             cwd="/",
-            env=os.environ.copy(),
+            env=child_env,
             start_new_session=True,  # survive the bring-up/exec session that started it
             close_fds=True,
         )
@@ -2028,6 +2284,14 @@ def spawn_loop():
     # ⛔ And a failed poll returns None, never `loop_pid()`: that fallback handed back whatever pid
     # the pidfile held (a recycled pid) and reported it as the loop that had just started.
     spawned_at = time.time()
+    # ⛔ THE CHILD'S OWN PID, so the timeout branch can tell "the box was already scheduled by someone
+    # else" from "the loop I just started is the holder, it just had not ticked yet". Returning
+    # `started=False` for our own child made `--start` print "this state dir starts none" one line
+    # after it started one, and (because `--start` records the declaration set only when it started
+    # something) left the box with NO recorded set — after which the supervisor's bare-env revival
+    # exits 3 and only warns, and a second home grades its own declarations against the holder's
+    # stamps (#3029). Measured by the [VGATE] pass with the declaration read slowed past the poll.
+    child_pid = child.pid
     for _ in range(50):
         time.sleep(0.2)
         pid = loop_pid()
@@ -2041,6 +2305,10 @@ def spawn_loop():
     # pre-check above. Report that holder rather than "did not come up": the box IS scheduled.
     holder = loop_holder()
     if holder is not None:
+        if holder[0] == child_pid:
+            # OUR OWN CHILD: it claimed the box and simply had not stamped its first tick when the
+            # poll expired. It is started; nothing else started it.
+            return holder[0], True
         print(
             "loop already running (%s) — one loop per box, so this state dir starts none (#2890)"
             % describe_holder(holder)
@@ -2257,11 +2525,7 @@ def cmd_status():
 
 def cmd_verify():
     """The gate. Every failure is named; a SKIP is named and counted, never hidden."""
-    global STATE
-    failures = []
-    jobs = load_jobs()
-    now = time.time()
-
+    global STATE, TEMPLATES_DIR
     # ⛔ ONE LOOP PER BOX MEANS ONE STATE DIR CARRIES THE BOX'S EVIDENCE (#2890). When this box's
     # lock is held by a loop over ANOTHER state dir, the honest question is not "does THIS dir have a
     # loop" (it must not) but "is the loop that does have it working". So this verification is
@@ -2276,7 +2540,17 @@ def cmd_verify():
     # Rebinding rather than forking the checks keeps ONE code path, so a new arm added later is
     # graded for a two-home box for free.
     # `STATE` is NOT restored: every caller returns straight out of the process from here.
+    # ⛔ AND THE DECLARATION SET IS REBOUND WITH IT, BEFORE IT IS READ. Stamps are read from the
+    # HOLDER's state dir, so grading the CALLER's declarations against them reported `NEVER RUN` for
+    # a job no loop on this box was ever asked to run — a false FAIL that `cloud-cell-bringup.sh`
+    # turns into `die on any FAIL line`, i.e. the #3029 shape this change exists to remove, re-opened
+    # one branch over (measured by the reviewer: two homes, one extra plist in the verifying home's
+    # set, `rc=1` from both `--install` and `--verify`). The holder remembers its own templates dir,
+    # so the verdict is taken over the set the box actually runs — and the caller's extra
+    # declarations are NAMED rather than dropped, because a job declared in this home and run by no
+    # loop anywhere IS a real gap, just not one this verb can fix.
     holder = loop_holder()
+    caller_templates = TEMPLATES_DIR
     if holder is not None and holder[2] and not same_state_dir(holder[2], STATE):
         print(
             "  NOTE   this box's scheduler runs under a DIFFERENT state dir (%s) — one loop per box "
@@ -2285,7 +2559,95 @@ def cmd_verify():
             flush=True,
         )
         STATE = holder[2]
-
+        holder_templates = ""
+        try:
+            with open(os.path.join(STATE, TEMPLATES_POINTER)) as fh:
+                holder_templates = fh.read().strip()
+        except OSError:
+            holder_templates = ""
+        # ⛔ ABSOLUTE IS PART OF "KNOWN". A holder's pointer is a path in the HOLDER's context; a
+        # RELATIVE one (what the pre-fix writer produced) would be resolved against THIS process's
+        # cwd, so `isdir` and the grade below would silently use whatever same-named directory the
+        # verifier happens to stand in — measured: a decoy `tpl19ag` in the verifier's cwd made
+        # `--verify` claim "its DECLARATION set … (%s)" about a set the holder never reads and then
+        # `FAIL … NEVER RUN` over a healthy box (and a decoy SUBSET is the mirror: a job the holder
+        # never ran goes ungraded). `os.path.abspath` is NOT the fix for the same reason; the honest
+        # answer is the UNKNOWN branch below.
+        if not (holder_templates and os.path.isabs(holder_templates)
+                and os.path.isdir(holder_templates)):
+            # ⛔ AN UNKNOWN SET IS NOT SILENCE, AND "absent" IS NOT THE ONLY WAY TO NOT KNOW IT.
+            # A pointer naming a DELETED checkout is just as unknown as a missing pointer, and the
+            # first cut only disclosed the missing one — so a dangling pointer silently graded the
+            # caller's set and produced `FAIL … NEVER RUN` for a job that had nothing to do with the
+            # problem. Either way the caller's set is what gets graded below, and that fact is SAID.
+            print(
+                "  NOTE   the holder's declaration set is UNKNOWN (%s/templates-dir %s), so THIS "
+                "state dir's declarations are graded against the holder's stamps — a job declared "
+                "here and never run there will read NEVER RUN"
+                % (STATE, "is missing or unreadable" if not holder_templates
+                   else ("names a RELATIVE path (%s), which this process cannot resolve for the "
+                         "holder" % holder_templates if not os.path.isabs(holder_templates)
+                         else "names %s, which is not a directory" % holder_templates)),
+                file=sys.stderr,
+            )
+        if holder_templates and os.path.isabs(holder_templates) and os.path.isdir(holder_templates):
+            TEMPLATES_DIR = holder_templates
+            if not same_state_dir(holder_templates, caller_templates):
+                print(
+                    "  NOTE   and its DECLARATION set, which is the set that actually runs here "
+                    "(%s) — this state dir's set is not graded" % holder_templates,
+                    flush=True,
+                )
+    jobs = load_jobs()
+    failures = []
+    now = time.time()
+    if not same_state_dir(TEMPLATES_DIR, caller_templates):
+        # Best-effort and bounded: name the caller's own declarations that no loop on this box runs.
+        # Wrapped because a broken caller-side set must never turn a box-level verdict into a crash,
+        # and the graded set is restored afterwards so nothing below reads the transient one (this
+        # block is a diagnostic, never a gate — the arms below grade the HOLDER's set).
+        extra = []
+        graded_templates = TEMPLATES_DIR
+        try:
+            graded = {job.label for job in jobs}
+            TEMPLATES_DIR = caller_templates
+            # ⛔ A NAMED SKIP IS NOT A DIVERGENCE. Every other reader of this runtime treats a
+            # declaration whose placeholders cannot resolve on THIS host as a `SKIP … for a named
+            # reason` — `--check` prints `DECLARATIONS OK` over it and the graded loop below
+            # `continue`s past it. Counting one as "a declaration no loop on this box runs" turned
+            # the documented non-fatal state into a `^  FAIL`, which `cloud-cell-bringup.sh` `die`s
+            # on: two homes whose checkouts are version-skewed (the operator's vs a cell's farmed
+            # copy, which lags by design) plus any shipped template that is a SKIP on a box without
+            # swarm/tortoise env bricked bring-up — the #3029 shape this change exists to close.
+            extra = [job.label for job in load_jobs() if job.label not in graded and not job.skip]
+        except Exception as exc:  # noqa: BLE001 — a diagnostic must never fail the verdict
+            # ⛔ "VANISHED WITHOUT A WORD" IS THE FAILURE MODE case 19x NAMES. A caller-side set
+            # that cannot be read means the divergence could not be computed at all; swallowing that
+            # silently would report a clean verdict over an ungraded comparison.
+            print(
+                "  NOTE   this state dir's declaration set (%s) could not be read (%s: %s), so the "
+                "jobs it declares were NOT compared with the holder's"
+                % (caller_templates, type(exc).__name__, exc),
+                file=sys.stderr,
+            )
+            extra = []
+        finally:
+            TEMPLATES_DIR = graded_templates
+        if extra:
+            # ⛔ A FAILURE, NOT A NOTE — and the previous cut got this wrong in the other direction.
+            # The NOTE read as "informational", but `cloud-cell-bringup.sh` certifies a cell on
+            # rc=0 + `SCHEDULE VERIFIED` and dies only on a `^ *FAIL` line, so a declaration this
+            # home installs and NO loop on the box runs was certified CELL READY while the job ran
+            # nowhere: trading the old false FAIL for a false PASS is the one trade the A/B rule
+            # forbids (fail-open). The wording names the cause and the two ways out, because the
+            # condition is a genuine misconfiguration — the box's scheduler runs a different set.
+            failures.append(
+                "%d declaration(s) in %s are run by NO loop on this box: %s%s — the box's scheduler "
+                "runs %s, so nothing here will ever run them; install from the holder's state dir "
+                "or point both at the same declarations"
+                % (len(extra), caller_templates, ", ".join(extra[:5]),
+                   " …" if len(extra) > 5 else "", TEMPLATES_DIR)
+            )
     # ⛔ A STAGED COPY THAT IS NOT THE CHECKOUT IS A FAILURE HERE, not a note: a cell runs
     # $CELL_HOME/.pi/agent/scripts/fleet-schedule.py, so when it differs from the checkout this cell
     # was installed from, the layer being certified is not the layer in the repo — the state in
@@ -2553,7 +2915,69 @@ def cmd_install():
             file=sys.stderr,
         )
         return 1
-    remember_templates_dir()
+
+    # ⛔ THE DECLARATION POINTER IS LOAD-BEARING NOW (`cmd_verify` reads it and grades THAT set), so it
+    # may only be written by an invocation that is the effective OWNER of this state dir's pointer — and
+    # the rule is "no loop OF THIS STATE DIR is already running", NOT "spawn_loop started one". Gating on
+    # `started` was a REGRESSION: on the cell-bringup shape (a second state dir installing while another
+    # holds the BOX lock) `spawn_loop` returns the foreign holder with started=False, so nothing wrote the
+    # pointer — and the pointer is the only thing `cloud-cell-supervisor.sh`'s bare-env revival
+    # (`HOME=$CELL_HOME CELL_HOME=$CELL_HOME … --start`, no INFRA_ROOT/TEMPLATES_DIR) has to find the
+    # declarations. Measured: `FAIL: no job declarations found` rc=3 there, which the supervisor logs as a
+    # WARN, so a cell that bring-up had just certified ran with no reap, no liveness detection and no
+    # canary. The base wrote it here unconditionally (single call site) and returned rc=0 in that shape.
+    # ⛔ AND IT MUST NOT BE OVERWRITTEN WHEN THIS STATE DIR'S OWN LOOP IS ALREADY RUNNING: that loop keeps
+    # reading its own set, so recording the caller's would make a later `--verify` grade a set nothing runs
+    # and print "the set that actually runs here" over a misdescription (measured: pointer tplA -> tplB
+    # while `loop.log` still start-named tplA — the 19al arm).
+    # ⛔ THE OWNER TEST IS THE BOX LOCK'S, NOT THE PIDFILE'S — and getting this wrong re-opened the
+    # 19al defect one precondition over. `loop.pid` is ABSENT in states this file documents as
+    # reachable (`cmd_loop` leaves the previous pidfile alone when its own write fails; 19ad removes
+    # it), and it names a RECYCLED pid in another (#3029's shape, #6 in this change). On either, a
+    # `loop_pid()`-only test reads "no loop here" over a loop that IS running, so `remember_templates_
+    # dir()` overwrote the pointer with the CALLER's set: the live loop kept reading tplA while the
+    # pointer said tplB, so `--verify` then graded a set nothing runs and printed `SCHEDULE VERIFIED`
+    # over it — the identical failure 19al pins, moved one precondition over (measured with a real
+    # loop + `rm loop.pid`: `--install TEMPLATES_DIR=tplB` rewrote the pointer, `loop.log` still named
+    # tplA, `--verify` certified it). Every OTHER "is this state dir's loop running" decision in this
+    # file — `cmd_verify`, `cmd_start` — already reads the identity-verified BOX lock; this one did
+    # not, and `loop_holder()` was called ten lines LATER (for the inline-pass check) and never for
+    # this. So it is read once, HERE, and both decisions use it.
+    # ⛔ BOTH SIGNALS, UNIONED — neither alone is sufficient. The box lock is empty when the lock root
+    # is unusable (the degraded `$STATE/loop.lock` arm), and the pidfile is missing or recycled in the
+    # states above; a loop is running if EITHER says so, and only "neither" may write the pointer.
+    holder = loop_holder()
+    own_via_lock = bool(holder is not None and same_state_dir(holder[2], STATE))
+    own_pid = loop_pid()
+    own_via_pid = bool(own_pid and pid_is_our_loop(own_pid))
+    own_alive = own_via_lock or own_via_pid
+    foreign_holder = None
+    if holder is not None and not same_state_dir(holder[2], STATE):
+        foreign_holder = holder
+    if own_alive:
+        if not os.path.exists(os.path.join(STATE, TEMPLATES_POINTER)):
+            # ⛔ NAME IT INSTEAD OF GUESSING A SET. Writing the caller's here could certify a set the
+            # loop does not read; writing nothing leaves the next bare-env `--start` with no pointer. The
+            # state is answerable by the operator, so it is SAID rather than resolved by a coin flip.
+            print(
+                "  NOTE   a loop for this state dir is running but no declaration set is recorded in "
+                "%s — a later `--start` from an environment without INFRA_ROOT/TEMPLATES_DIR will not "
+                "find the declarations; record it with: %s --install from the loop's own environment"
+                % (STATE, os.path.basename(sys.argv[0])),
+                file=sys.stderr,
+            )
+    else:
+        try:
+            remember_templates_dir()
+        except OSError as exc:
+            # A state dir we cannot write the pointer into must not fail an install; it degrades a later
+            # bare-env `--start` on this home, so it is SAID.
+            print(
+                "  NOTE   could not record the declaration set in %s (%s) — a later `--start` from an "
+                "environment without INFRA_ROOT/TEMPLATES_DIR will not find the declarations"
+                % (STATE, exc),
+                file=sys.stderr,
+            )
 
     # The first pass is run INLINE, before the loop exists, so that `--install` ends with EVIDENCE
     # (a stamp and a log line per runnable job) rather than with a pid. "A unit that loads and
@@ -2576,10 +3000,10 @@ def cmd_install():
     # is exactly the invariant this change claims to establish. Skipping the pass here is not a
     # weaker proof: the holder IS the proof that this box's job set runs, and `cmd_verify` below
     # still grades this state dir's stamps.
-    foreign_holder = None
-    holder = loop_holder()
-    if holder is not None and not same_state_dir(holder[2], STATE):
-        foreign_holder = holder
+    # ⛔ `holder` / `foreign_holder` are read ONCE, ABOVE the pointer decision — that read IS the
+    # identity-verified box lock, and the pointer write must be decided on the same signal that the
+    # inline-pass skip is (a second read here would let the two disagree on a claim published between
+    # them).
     first = []
     for j in ([] if foreign_holder is not None else jobs):
         if j.skip or j.error:
@@ -2641,7 +3065,19 @@ def cmd_install():
 def cmd_start():
     pid = loop_pid()
     if pid and pid_is_our_loop(pid):
-        print("loop already running (pid %d)" % pid)
+        # ⛔ THE OFF SWITCH IS CLEARED EVEN HERE. `--start` is the revival verb (#1864) and an OFF
+        # set while the loop was still alive outlived it: the loop exited at its next check and the
+        # box went dark while `--start` — the one verb an operator reaches for — answered 0 and
+        # changed nothing (measured by the reviewer: `OFF still present? YES`, loop gone one tick
+        # later, `--verify` then `NOT RUNNING` with nothing left to revive it). The own-state holder
+        # with a MISSING pidfile already falls through to the clear below; this is the same ruling
+        # for the same state, not a new one. A FOREIGN holder still changes nothing (next arm).
+        off = os.path.join(STATE, "OFF")
+        if os.path.exists(off):
+            os.unlink(off)
+            print("loop already running (pid %d) — OFF switch cleared" % pid)
+        else:
+            print("loop already running (pid %d)" % pid)
         return 0
     # ⛔ READ THE DECLARATIONS BEFORE SPAWNING, and refuse in the terms the caller keys on.
     # main() returns 3 only when there is no template PATH AT ALL; a remembered templates-dir
@@ -2694,11 +3130,40 @@ def cmd_start():
             "loop already running (%s) — one loop per box, so this state dir starts none (#2890)"
             % describe_holder(holder)
         )
+        # ⛔ A LIVE HOLDER IS NOT NECESSARILY A PASSING ONE, AND THIS VERB CANNOT REVIVE IT. A frozen
+        # loop (`SIGSTOP`ped by a lane, a debugger, a stopped container) still owns the box lock, so
+        # this starts nothing and the tick goes stale — `--verify` will refuse (19s), but the operator
+        # standing here needs to know WHICH home can act, because `--stop` does not consult the box
+        # lock and must be run from the holder's own state dir.
+        print(
+            "        if that loop is not making progress, stop it from ITS OWN state dir: "
+            "FLEET_SCHEDULE_STATE=%s %s --stop" % (holder[2], os.path.basename(sys.argv[0]))
+        )
         return 0
     off = os.path.join(STATE, "OFF")
     if os.path.exists(off):
         os.unlink(off)  # --start is the operator saying "on"; the OFF switch is cleared on purpose
     pid, started = spawn_loop()
+    # ⛔ RECORDED ONLY WHEN THIS VERB ACTUALLY STARTED THE LOOP. The pointer says "this is the set
+    # the box's loop runs", so writing it from a `--start` that started NOTHING is a lie that the
+    # next grade acts on: on the documented "own-state loop alive, pidfile missing" state this verb
+    # falls through and `spawn_loop` returns the existing holder, so a caller with a different
+    # `TEMPLATES_DIR` used to overwrite the pointer with ITS set — after which the very home that
+    # verified clean returned `FAIL … NEVER RUN` for a job its loop has never heard of. That is the
+    # #3029 false FAIL this write exists to remove, injected by the write itself.
+    # (`--install` writes it because its inline pass IS the proof the set ran.)
+    if started:
+        try:
+            remember_templates_dir()
+        except OSError as exc:
+            # A state dir we cannot write the pointer into must not block the revival (`--start` is
+            # what brings a dark cell back); it degrades a later second-home grade, so it is SAID.
+            print(
+                "  NOTE   could not record the declaration set in %s (%s) — a scheduler for another "
+                "state dir on this box will grade ITS OWN declarations against this loop's stamps"
+                % (STATE, exc),
+                file=sys.stderr,
+            )
     if not pid:
         print("FAIL: the scheduler loop did not come up (see %s/loop.log)" % STATE, file=sys.stderr)
         return 1
@@ -2838,6 +3303,21 @@ def main(argv):
                 TEMPLATES_DIR = fh.read().strip()
         except OSError:
             pass
+    # ⛔ ABSOLUTE, AND NORMALISED *AFTER* THE POINTER READ, NOT BEFORE IT. This value is handed to the
+    # loop child, which runs with `cwd="/"`. A RELATIVE `TEMPLATES_DIR=tpl` left the child reading
+    # `/tpl`, so `--start` printed "loop started" while the child logged `template dir not found` on
+    # every tick and ran ZERO jobs — and `cloud-cell-supervisor.sh` keys on the exit code, so it
+    # reported a scheduled layer on a cell that runs nothing. Normalising before the pointer fallback
+    # missed the POINTER-sourced value (a pointer written by any earlier run from a relative env, which
+    # `remember_templates_dir()` then keeps re-writing), so the same false PASS survived one path over
+    # — and `cmd_verify`'s holder-set check would resolve it against whichever cwd the caller had.
+    if TEMPLATES_DIR:
+        TEMPLATES_DIR = os.path.abspath(TEMPLATES_DIR)
+    # ⛔ AND THE SAME RULE FOR EVERY OTHER CWD-SENSITIVE KNOB, in one place rather than one per fix (see
+    # `absolutize_path_knobs`): the child re-reads these against `cwd="/"`, so a relative value rendered
+    # a different argv there — `TORTOISE_REPO=tortoise` measured as a `SCHEDULE VERIFIED` over a loop
+    # that skipped its tortoise jobs entirely. Called BEFORE anything renders or spawns.
+    absolutize_path_knobs()
     TICK = int(os.environ.get("FLEET_SCHEDULE_TICK") or 60)
     JOB_TIMEOUT = int(os.environ.get("FLEET_SCHEDULE_JOB_TIMEOUT") or 1800)
 
