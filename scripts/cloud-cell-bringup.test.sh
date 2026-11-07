@@ -582,6 +582,8 @@ esac
 # ⛔ AND IT IS NOT THE LITERAL "MUST REFUSE" (re-review P1). The installer's fourth candidate is the copy
 # BESIDE ITSELF, so on a DURABLE checkout — which is what CI checks out (`/home/runner/work/…`) — that
 # candidate is legitimately durable and the install must succeed; an arm asserting a refusal would go red on
+# the durable-checkout leg CI itself runs. So this arm asserts the SHAPE property instead of a refusal.
+#
 # ⛔ THE SHAPES, NOT A PREFIX LIST (re-review P2). This arm used to red any `/tmp/*`, `/var/tmp/*`, `/run/*`
 # ExecStart — which contradicts the installer's own contract and is a FALSE RED on the fleet's real deployment
 # shape: a PRIMARY clone under `/tmp` (`/tmp/cell-ai`) and a harness pin under `/tmp/cell-home` are both
