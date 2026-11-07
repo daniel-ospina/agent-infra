@@ -100,15 +100,27 @@ slug=daniel-ospina/agent-infra checkout=$T/agent-infra state=$T/state-ai
 EOF
 
 # run_reader <conf> <verb...> — REPO_SET_FILE pinned per call, never inherited.
-# ⛔ EVERY READER CALL GOES THROUGH A WALL-CLOCK BOUND, AND NOT VIA `timeout` (review-instrumented round
-# 44). Three measured reasons, all from this round:
+# ⛔ THE CALLS THAT MATTER MOST GO THROUGH A WALL-CLOCK BOUND, AND NOT VIA `timeout` (review-instrumented
+# round 44; this header's coverage claim was WRONG as first written — round 44's review measured it — so it
+# now says what is true instead of what was convenient). Three measured reasons, all from this round:
 #  1. `timeout` IS NOT ON macOS — it is coreutils, not a BSD tool — and this suite is run by the operator
 #     of a launchd unit. An arm leaning on it reds on `command not found`, i.e. on the HARNESS, where the
 #     arm exists to prove BEHAVIOUR (the same trap `set -u` is placed after the resolutions for).
 #  2. THE BOUND CANNOT LIVE ONLY IN THE ARM THAT NAMES THE REGRESSION: the ancestor walk used to LOOP (a
 #     slash-less parent never shortens) and the first absent-path arm to run is `b1`, which had no bound —
-#     so a re-regression WEDGED the shard for its whole CI timeout instead of reddening. Bounding the
-#     helper bounds every arm; `124` is `timeout`'s own code, so the arms' arithmetic is unchanged.
+#     so a re-regression WEDGED the shard for its whole CI timeout instead of reddening. Putting the bound
+#     in the helper covers every `run_reader*` call site at once, plus the two round-44 fixture arms below
+#     (`j-emptyrender`, `j16f`), which call it directly; `124` is `timeout`'s own code, so the arms'
+#     arithmetic is unchanged.
+#     ⛔ BUT IT DOES NOT COVER EVERY ARM, AND SAYING IT DID WAS A FALSE COVERAGE CLAIM (round 44 review,
+#     P2). Two populations bypass the helper and stay unbounded: the 44 `bash "$W/pr-doctor-machine.sh"`
+#     wrapper arms, and the ~18 direct `bash "$READER"` / `/bin/bash "$READER"` arms — the PATH-scoped
+#     fault-injection fixtures (`no-sed`, `no-awk`, `no-tr`, `NODIR`) and the `HOME`-unset arms. Those set
+#     `PATH=` for the CHILD, and the helper itself needs `ps` and `sleep` from the AMBIENT path, so they
+#     cannot simply wrap it (the two new arms below scope `PATH` with `env` for exactly this reason).
+#     Nothing hangs there today — every one of those passes an absolute set path, or an empty `HOME` that
+#     shortens to `/` — but a future walk that hangs on an ABSOLUTE path still wedges the shard from those
+#     arms, because absolute is precisely what every pre-round-44 fixture passes.
 #  3. ⛔ IT MUST KILL THE WHOLE TREE, NOT `$!` — and the first cut did not, which made it INERT exactly
 #     where it was needed. Measured: with the walk broken, `_rs_bound` returned 124 at 30.9 s and the
 #     calling `$( )` STILL BLOCKED past 60 s, because the killed reader left children whose stdout IS the
@@ -1250,7 +1262,11 @@ assert s.count(old) == 1, s.count(old)
 open(p, "w", encoding='utf-8').write(s.replace(old, "  :", 1))
 PYER
 ck "j-emptyrender an EMPTY render with a NON-EMPTY parse is INCOMPLETE (WARN), never a refusal on a false cause" \
-   'o="$(REPO_SET_FILE="$CONF" bash "$WER/lib/repo-set.sh" check 2>&1)"; rc=$?; [ "$rc" = 0 ] && grep -q "WARN WHOLE-SET-PROOFS-SKIPPED" <<<"$o" && grep -q "OK — 2 repo(s)" <<<"$o" && ! grep -q "REFUSED set" <<<"$o"'
+   'o="$(_rs_bound 30 env REPO_SET_FILE="$CONF" bash "$WER/lib/repo-set.sh" check 2>&1)"; rc=$?; [ "$rc" = 0 ] && grep -q "WARN WHOLE-SET-PROOFS-SKIPPED" <<<"$o" && grep -q "OK — 2 repo(s)" <<<"$o" && ! grep -q "REFUSED set" <<<"$o"'
+# ⛔ BOUNDED, LIKE THE HELPER CALLS (round 44 review, P2): this arm runs `check`, the verb that CONTAINS
+# the ancestor walk, so leaving it unbounded would have left the arms closest to the regression this
+# change exists to fix outside the bound. `env` scopes REPO_SET_FILE to the child; the helper itself must
+# keep the AMBIENT path, because it needs `ps` and `sleep`.
 # ⛔ `dirname` WAS THE LAST UNGUARDED EXTERNAL, AND ITS ABSENCE DISARMED THE ABSENCE PROOF (review round 44,
 # P2 — measured). It is gone from the code now (`${d%/*}` is the same parent with no process), and this arm
 # is what makes that more than a tidy-up: with a reader whose interpreter candidates cannot resolve AND a
@@ -1278,7 +1294,11 @@ PYNID
   mkdir -p "$T/den2/den"
   printf 'slug=o/n checkout=%s state=%s/st\n' "$T/tortoise" "$T" > "$T/den2/den/repos.conf"
   chmod 000 "$T/den2/den"
-  _o_dn="$(REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/repo-set.sh" check 2>&1)"; _rc_dn=$?
+  # ⛔ BOUNDED, AND THE PATH IS SCOPED WITH `env` SO THE BOUND SURVIVES (round 44 review, P2). This arm
+  # runs `check` on an ABSOLUTE set path — the shape a future walk regression would hang on — so it is
+  # inside the wall-clock bound like the helper calls. Setting `PATH="$ND"` on the helper itself would
+  # disarm the bound (`ps` and `sleep` are not in `$ND`), hence `env PATH=…` for the child alone.
+  _o_dn="$(_rs_bound 30 env REPO_SET_FILE="$T/den2/den/repos.conf" PATH="$ND" /bin/bash "$NI/repo-set.sh" check 2>&1)"; _rc_dn=$?
   chmod 755 "$T/den2/den"
   ck "j16f no \`dirname\` must not disarm the absence proof (rc 5 INVALID, never the rc 3 the wrapper degrades on)" \
      '[ "$_rc_dn" = 5 ] && ! grep -q "does not exist" <<<"$_o_dn"'
@@ -1288,7 +1308,7 @@ fi
 # the walk re-tested the same string forever: `REPO_SET_FILE=repo.conf` gave rc 124 and no output, where the
 # previous code answered `.` and exited to rc 3 NO-REPO-SET. A HANG is worse than the wrong refusal it
 # replaced, and the whole suite stayed green because every other arm passes an absolute `$T/…` path.
-# THE BOUND IS IN THE HELPER, NOT IN THIS ARM — see `_rs_bound` (l.~103): `run_reader_rel` bounds the
+# THE BOUND IS IN THE HELPER, NOT IN THIS ARM — see the coverage note above `_rs_bound`: `run_reader_rel` bounds the
 # whole call tree at 30 s, so a regression here REDS at rc 124 in ~30 s instead of wedging the shard (and
 # `b1`, the first absent-path arm, is bounded the same way). Measured on the broken walk: the suite that
 # used to run to its CI cap now finishes in 97 s with this arm as the single `FAIL`.
