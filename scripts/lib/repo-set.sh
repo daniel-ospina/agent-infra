@@ -134,7 +134,13 @@ _rs_nearest_existing_ancestor() {
 }
 
 # _rs_py_resolve — the interpreter, resolved the same way the wrapper resolves it (`command -v python3`,
-# then the two absolute paths launchd needs when it has no PATH of its own). ONE home for that order.
+# then the two absolute paths launchd needs when it has no PATH of its own). ⛔ ONE HOME FOR THAT ORDER
+# IN THIS FILE — `_rs_doctor_available` and `_rs_with_doctor` both call this; neither carries its own
+# loop (round 15, P2: `_rs_with_doctor` did, which made this doc's "one home" claim false).
+# ⛔ THE WRAPPER HAS ITS OWN COPY AND THAT IS NOT A SECOND AUTHORITY: `scripts/pr-doctor-machine.sh`
+# resolves `$PY` in ITS process because it must `exec` the doctor itself, and it talks to this reader
+# over a subprocess (`bash "$READER" check`), not by sourcing it — so the function is not reachable
+# there. Same order, same three candidates, different process boundary.
 _rs_py_resolve() {
   local c
   for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
@@ -218,13 +224,17 @@ EOF_NORM
   printf '%s' "$out"
 }
 
-# ⛔ `_rs_norm_path` DELIBERATELY DOES NOT COLLAPSE `..`, AND THE SHARED-STATE KEY DOES NOT USE IT FOR
-# THAT (review round 9). Two rounds fixed this arm from opposite directions — one folded `..` here
-# textually, the other (`_rs_state_key`) walks the path and canonicalises each EXISTING prefix with
-# `cd -P` — and the walking one is the correct one: `/a/link/../b` with `/a/link -> /c` is PHYSICALLY
-# `/b`, so a textual fold would call it `/a/b` and get a real directory wrong. `_rs_state_key` is the
-# single authority for the state comparison; this function is only its fallback for the LEADING run of a
-# path, where nothing has been resolved yet and `..` is left to the caller that can look.
+# ⛔ `_rs_norm_path` DELIBERATELY DOES NOT COLLAPSE `..`, AND THE SHARED-STATE KEY DOES NOT CALL IT
+# FOR THAT (review round 9; corrected round 15). Two rounds fixed this arm from opposite directions —
+# one folded `..` here textually, the other (`_rs_state_key`) walks the path and canonicalises each
+# EXISTING prefix with `cd -P` — and the walking one is the correct one: `/a/link/../b` with
+# `/a/link -> /c` is PHYSICALLY `/b`, so a textual fold would call it `/a/b` and get a real directory
+# wrong. ⛔ `_rs_state_key` IS THE SINGLE AUTHORITY AND DOES NOT CALL THIS FUNCTION AT ALL — since round
+# 7's component walk it folds the unresolved remainder itself, inline (`out="$cand"`). The earlier
+# wording here claimed this function was "its fallback for the LEADING run of a path", which described
+# the ROUND-6 shape (`resolved="$(cd -P …)" || resolved="$(_rs_norm_path …)"`) that the walk replaced;
+# saying so again would send a reader looking for a call site that does not exist. This function's only
+# live caller is the state arm's SPELLING axis (m18/m19), which is a DIFFERENT proof, not a fallback.
 
 # _rs_state_key <path> — the IDENTITY of a state dir, for the shared-state refusal. Spelling is not
 # identity, and `_rs_norm_path` alone cannot express that: it folds `//`, `.` and a trailing `/`
@@ -567,11 +577,7 @@ _rs_with_doctor() {
   # the provenance arm silently downgraded from REFUSE to WARN and the tag guard silently no-op'd — so
   # the wrapper announced a pass for a set the doctor then refused wholesale. An absolute fallback is
   # not a nicety here; it is the difference between a proof and a silent skip.
-  py=""
-  local c
-  for c in python3 /usr/bin/python3 /usr/local/bin/python3; do
-    if command -v "$c" >/dev/null 2>&1; then py="$(command -v "$c")"; break; fi
-  done
+  py="$(_rs_py_resolve)"
   [ -n "$py" ] || return 0
   "$py" - "$doc" "$verb" "$arg" <<'PY_PROOF' 2>/dev/null
 import importlib.util, sys
@@ -623,10 +629,6 @@ _rs_origin_slug() {
   printf '%s' "$out"
 }
 
-# _rs_normalize_slug <value> — `owner/name` from anything `_normalize_slug` accepts (a bare slug, a
-# `[HOST/]OWNER/REPO`, a URL, `.git`, an scp-style remote), or "" when it names no repo. Delegated for
-# the same reason: the DEGRADED path advertises a slug and then the doctor re-resolves it, so a
-# stricter parser here refuses values the doctor runs (measured: a `https://github.com/o/n` seam).
 # _rs_tag_collision <comma-joined entries> — the doctor's own SET-LEVEL guard, delegated. It refuses a
 # set whose repo TAGS collide (`acme/tools-api` and `acme-tools/api` both render `acme-tools-api`, so
 # their registers, worker names and status files are one file), and it is the ONE whole-set refusal the
@@ -731,6 +733,10 @@ _rs_strip() {
   return 0
 }
 
+# _rs_normalize_slug <value> — `owner/name` from anything `_normalize_slug` accepts (a bare slug, a
+# `[HOST/]OWNER/REPO`, a URL, `.git`, an scp-style remote), or "" when it names no repo. Delegated for
+# the same reason: the DEGRADED path advertises a slug and then the doctor re-resolves it, so a
+# stricter parser here refuses values the doctor runs (measured: a `https://github.com/o/n` seam).
 _rs_normalize_slug() {
   local v="${1:-}"
   [ -n "$v" ] || return 0
