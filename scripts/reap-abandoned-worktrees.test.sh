@@ -204,6 +204,16 @@ case_a() { # <owner-script>
                "print-config reports the time bound (budget_seconds=300)"
     case_check "$(grep -q '^gitless_max=none$' <<<"$cfg" && echo 0 || echo 1)" \
                "and that NO count ceiling is in force by default (gitless_max=none)"
+    # ⛔ THE CELL HOME THE GUARD WILL PROTECT is an EFFECTIVE BOUND too, and it is the one the measured
+    # `rm -rf /tmp/cell-home` defect turned on. With `CELL_HOME` unset/empty (the unit's shape) it must
+    # resolve to the cell home, not to nothing — a guard reference of `""` is skipped by
+    # `[ -n "$_ref" ] || continue`, i.e. a guard that looks present and protects nothing.
+    case_check "$(grep -qxF 'cell_home_default=/tmp/cell-home' <<<"$cfg" && echo 0 || echo 1)" \
+               "with CELL_HOME unset the guard still has a cell home to protect (cell_home_default=/tmp/cell-home)"
+    cfg="$(HOME="$FB/home" CELL_HOME="$FB/a-custom-home" REAP_AW_STATE_DIR="$FB/state" \
+           bash "$owner" --print-config 2>&1)"
+    case_check "$(grep -qxF "cell_home_default=$FB/a-custom-home" <<<"$cfg" && echo 0 || echo 1)" \
+               "and an exported CELL_HOME still WINS over that default"
     return $((CASE_FAIL > 0))
 }
 
@@ -464,6 +474,17 @@ if apply_mutation "$OWNER" "$T/mut-order/reap-abandoned-worktrees.sh" -e "$MUT_O
     expect_fail "MUT_ORDER the unit charged before the age floor — case E must go RED" case_e "$T/mut-order/reap-abandoned-worktrees.sh"
 else
     bad "MUT_ORDER could not be applied — the ordering is not being checked any more"
+fi
+
+# MUT_CELLHOME removes the guard's cell-home fallback — the value that protects /tmp/cell-home on the
+# unit's path, where nothing exports CELL_HOME. It is a single assignment, so the mutation is exact and
+# case A sees it in `--print-config` (and, behaviourally, the guard reference becomes empty and is
+# skipped — the `rm -rf /tmp/cell-home` shape).
+MUT_CELLHOME='s|^CELL_HOME_DEFAULT="${CELL_HOME:-/tmp/cell-home}"$|CELL_HOME_DEFAULT="${CELL_HOME:-}"|'
+if apply_mutation "$OWNER" "$T/mut-cellhome/reap-abandoned-worktrees.sh" -e "$MUT_CELLHOME"; then
+    expect_fail "MUT_CELLHOME the guard's cell-home fallback removed — case A must go RED" case_a "$T/mut-cellhome/reap-abandoned-worktrees.sh"
+else
+    bad "MUT_CELLHOME could not be applied — the guard's fallback is not being checked any more"
 fi
 
 # MUT_LINKED_BUDGET confines the time bound to the GITLESS arm: the linked arm is then unbounded before
