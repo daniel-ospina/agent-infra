@@ -352,6 +352,29 @@ await test("PER FIELD: a `url`-changing override KEEPS lazy/timeoutMs but NEVER 
   equal(t?.timeoutMs, 60000, "`timeoutMs` is inherited");
 });
 
+await test("PER FIELD: a TWO-FIELD base with ONE field overridden keeps the sibling field", () => {
+  // ⛔ THE MINIMAL DISCRIMINATOR between a FIELD delta and a whole-entry replacement. The base entry has
+  // exactly two fields and the repo restates ONE of them; a name-level merge (`merged[name] = repoEntry`,
+  // which is what this branch replaced) returns `{ timeoutMs: 40000 }` and silently drops `lazy` — the
+  // measured failure that made a hosted server EAGER at every session start on memory-constrained cells.
+  // Neither field is a transport field, so NO transport branch runs here: what this pins is the
+  // `{ ...carry, ...entry }` spread itself, which the larger fixtures above reach only through a branch
+  // that already deletes fields. The key-set assertion is what a whole-entry replacement cannot survive;
+  // asserting the two values alone would still pass if the merge also carried an unrelated third field.
+  const merged = mergeMcpLayers(
+    { mcpServers: { tortoise: { lazy: true, timeoutMs: 60000 } } } as never,
+    { mcpServers: { tortoise: { timeoutMs: 40000 } } } as never,
+  );
+  const t = merged.tortoise as Record<string, unknown> | undefined;
+  equal(t?.timeoutMs, 40000, "the field the repo SET wins");
+  equal(t?.lazy, true, "and the sibling field it did NOT set is inherited, not dropped with the entry");
+  deepEqual(
+    Object.keys(t ?? {}).sort(),
+    ["lazy", "timeoutMs"],
+    "EXACTLY the base's two fields, merged — a whole-entry replacement leaves one key here",
+  );
+});
+
 await test("a repo that restates `headers` alongside its own `url` gets exactly those headers", () => {
   const merged = mergeMcpLayers(
     { mcpServers: { tortoise: { url: "https://api.premiselabs.co/mcp/", headers: { Authorization: "Bearer ${TORTOISE_MCP_API_KEY}" } } } } as never,
@@ -479,7 +502,11 @@ await test("a BASE entry declaring BOTH transports is KEPT with a warning (dropp
   writeJson(repoDir, ".mcp.json", { mcpServers: {} });
   writeJson(join(homeDir, ".pi", "agent"), ".mcp.json", {
     mcpServers: {
-      broken: { url: "https://x/mcp", command: "/bin/sh" },
+      // ⛔ `lazy: true` IS LOAD-BEARING HERE. This entry is ambiguous-but-KEPT, and `connectServer`
+      // dispatches on `url` before `command` — so without `lazy` this fixture is classified EAGER and
+      // the suite really attempts an outbound connection to host `x` (2 attempts × the 15s default
+      // timeout, retryable), making a hermetic assertion depend on the runner's resolver/proxy.
+      broken: { url: "https://x/mcp", command: "/bin/sh", lazy: true },
       fine: { url: "https://ok.example/mcp", lazy: true },
     },
   });
@@ -658,8 +685,15 @@ await test("neither layer → both null (nothing invented)", () => {
 //
 // `mergeMcpLayers`' ordering is pinned above, but that alone does not pin the CALL SITE: calling
 // `mergeMcpLayers(repo, base)` — which re-introduces base-shadows-repo for every session — left this
-// suite 16/16 green (measured in review, #3614). These drive the manager end to end. Every fixture
-// server is `lazy: true`, so `classifyServers` skips it at startup and no process is ever spawned.
+// suite 16/16 green (measured in review, #3614). These drive the manager end to end.
+//
+// ⛔ THE INVARIANT, NOW ACTUALLY ENFORCED: every fixture entry that survives to `connectServer` is
+// `lazy: true`, so `classifyServers` skips it and no process is spawned and no socket is opened. This
+// header claimed that while two fixtures (`broken`, `sseType`) omitted `lazy` and were therefore
+// classified EAGER — each attempting a real outbound connection to host `x` under
+// `connectEagerWithRetry` (2 attempts × the 15s default timeout, a network error being retryable). An
+// assertion that depends on the runner's resolver or proxy is not hermetic. A new fixture here that
+// declares a truthy `url`/`command` MUST carry `lazy: true`.
 // ═════════════════════════════════════════════════════════════════════════════════════════════
 section("connectAllLayers — the layer→argument binding and its failure modes");
 
@@ -765,7 +799,10 @@ await test("a non-string `url`/`command` and a bad name are DROPPED; an unrecogn
     mcpServers: {
       arrayUrl: { url: ["https://attacker.example/collect"] },
       arrayCommand: { command: ["/bin/sh", "-c", "x"] },
-      sseType: { type: "sse", url: "https://x/mcp" },
+      // ⛔ `lazy: true` for the same reason as `broken` above: an unrecognised `type` does not stop
+      // this entry being dispatched on its truthy `url`, so an eager fixture here is a LIVE outbound
+      // connect to host `x` inside a suite that promises no process is spawned.
+      sseType: { type: "sse", url: "https://x/mcp", lazy: true },
       "bad name!": { url: "https://x/mcp" },
       keep: { url: "https://ok.example/mcp", lazy: true },
     },
