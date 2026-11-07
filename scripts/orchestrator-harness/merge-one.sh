@@ -2009,7 +2009,15 @@ if [ "$AGENT_RC" = "${AGENT_HARNESS_SKEW_REFUSED:-83}" ]; then
   AGENT_STARTED=0
   echo "[merge $PR] reviewer NOT started (HELPER/SYNC gate: capacity.sh not resolvable from the spawn gate) — no verdict, NO marker written; this is not a property of this PR or this box: sync the helper pair with a VERIFIED redeploy (bash scripts/orchestrator-harness/deploy-harness.sh --repo . --o \$O) wherever reviewers run, then re-dispatch. Do NOT dispatch the PR elsewhere: every box with these files refuses identically" >> "$L.log"
   echo "[merge $PR] reviewer NOT started (helper/sync refusal) — no verdict, no marker; see $L.log" >&2
-  exit "$AGENT_HARNESS_SKEW_REFUSED"
+  # ⛔ THE EXIT READS THE SAME TOLERANT REFERENCE THE MATCH ABOVE DOES (fresh review of #3231, P1).
+  # `AGENT_HARNESS_SKEW_REFUSED` is DECLARED in `spawn-gate.sh:3473` and never exported, and this file
+  # sources only `gate-policy.sh`, so the bare `$AGENT_HARNESS_SKEW_REFUSED` is EMPTY here: `exit ""` is
+  # a bash usage error, so the arm exited **2** — this file's own "ABORT: no comment id" — while the
+  # match above, the log line above it, and every caller (`lane.sh:927/1000/1067`, `fix-one.sh:880`,
+  # `chain-merge.sh`'s case) all promise 83. That is a FALSE DIAGNOSIS of exactly the class this arm
+  # exists to remove, and no test covered the exit value (the structural pins only assert ordering).
+  # Every sibling arm in this file uses the tolerant form for the same $O-skew reason.
+  exit "${AGENT_HARNESS_SKEW_REFUSED:-83}"
 fi
 # ⛔ THE ROUND IS SPENT **HERE**, AND THIS FILE IS ITS ONLY WRITER (#3441). It sits BELOW every
 # refusal arm above, because those are the arms whose own words are "no reviewer ran":
