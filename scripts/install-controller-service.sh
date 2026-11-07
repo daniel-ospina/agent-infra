@@ -74,6 +74,12 @@ fi
 #                          /tmp, so "under /tmp" alone cannot be the rule). ⛔ IT DOES NOT LAUNDER A WORKTREE:
 #                          a linked worktree is refused before any declaration is consulted, and it finds
 #                          templates too (see TEMPLATES_DIR below)
+#   HARNESS_PIN_FILE       the record naming THIS box's harness pin (default $CELL_HOME/.harness-path). Used
+#                          only to ADMIT a DETACHED linked worktree — the bring-up creates the pin with
+#                          `git worktree add --detach`, so the refusal cannot reject `linked worktree` as a
+#                          class. A detached worktree the record does not name is refused: the fleet's
+#                          drainer gives a LANE's scratch checkout that same shape under $HOME
+#   HARNESS_PIN_DIR        the pin ROOT accepted while no record exists yet (default $CELL_HOME/harness)
 #   ORCH_RESTART_SEC       the rendered RestartSec (default 15; a whole number of seconds, >= 1)
 #   ORCH_START_TIMEOUT_SEC the ORPHAN-handover ceiling (default 60; a whole number, and one that fits
 #                          StartLimitBurst attempts inside StartLimitIntervalSec — see do_install).

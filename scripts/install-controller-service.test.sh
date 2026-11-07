@@ -3714,6 +3714,21 @@ NE2_RC=0; NE2_OUT="$(inst nosup --install 2>&1)" || NE2_RC=$?
 grep -qxF "ExecStart=/bin/bash $(farmed_sup "$NE") start" "$NE/units/eldato-orchestrator.service" 2>/dev/null \
   && ok '§P10: and the unit names the farm' || bad '§P10: the default install did not name the farm'
 
+# ── §P11 — `--help` documents the seams that make a pin refusal actionable ────────────────────
+say_case '--help documents the pin RECORD and its two overrides, not only the refusal'
+# ⛔ A REFUSAL AN OPERATOR CANNOT ACT ON IS HALF A GUARD (review residual, round 6). The ExecStart refusal
+# names "the harness pin" among the durable alternatives, but `--help` documented neither the record that
+# identifies THIS box's pin ($CELL_HOME/.harness-path) nor its root fallback — so the one remedy the message
+# offers was the one seam the usage text did not name. The doc covers both (docs/ops/controller-service.md,
+# "NOT EVERY LINKED WORKTREE IS A LANE'S"); the usage block an operator on a cell actually reads did not.
+HELP_OUT="$(bash "$INST" --help 2>&1)"
+for seam in HARNESS_PIN_FILE HARNESS_PIN_DIR ORCH_SUPERVISOR_PREFER ORCH_SUPERVISOR AGENT_INFRA_PATH; do
+  case "$HELP_OUT" in
+    *"$seam"*) ok "§P11: --help names $seam" ;;
+    *) bad "§P11: --help does not name $seam — an operator reading only the usage text cannot act on the refusal the installer prints" ;;
+  esac
+done
+
 printf '\n────────────────────────────────────────────\n'
 printf 'passed=%s failed=%s\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ] || { printf '❌ FAILURES — fix and re-run\n'; exit 1; }
