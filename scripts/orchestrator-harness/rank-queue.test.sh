@@ -430,6 +430,9 @@ if grep -q 'STATE=empty' <<<"$_e14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_e14" \
    && ! grep -q 'tier window was clipped' <<<"$_e14" \
    && ! grep -q 'could not be USED' <<<"$_e14" \
+   && ! grep -q 'could not be READ' <<<"$_e14" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_e14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_e14" \
    && ! grep -q 'carried no tier name this code recognises' <<<"$_e14"; then rc=0
 else rc=1; echo "      drained+clip '$(printf '%s' "$_e14" | tr '\n' '|' | head -c 340)' (want STATE=empty and NO tier-window clause of any kind: a drained queue has no row that a clipped window could have pushed behind a lower tier, and no order for a record to qualify)"; fi
 ck "the DRAINED arm carries NO tier-window clause even with a clip record present (nothing can be inverted in an empty queue)" $rc
@@ -456,6 +459,72 @@ else
   else rc=1; echo "      with the tier-window clause appended to the drained echo the arm did NOT disclose a clip — the check above is not grading the arm's silence: $(tr '\n' '|' < "$_edm/out" | head -c 320)"; fi
 fi
 ck "non-vacuity: appending the tier-window clause to the DRAINED arm reddens the silence check" $rc
+
+# ⛔ THE THREE REFUSAL ARMS ARE SILENT TOO, AND THEIR SILENCE IS THE SAME CLAIM (review P2, cycle 68).
+# `priority-unreadable` (the reorder did not run) and the two `queue_order_refuse` sentences (row set changed,
+# `mv` failed) all RETURN BEFORE the `.pool-sat` read — it sits after the install — so no measurement of the
+# record has been taken when they print, and a clip clause on any of them would be a claim about an order this
+# pass explicitly reports as UNVERIFIED. Nothing graded that: appending the shipped clause verbatim to any of the
+# three left every suite at 155/0, while the code comment, §14f's header, ARCHITECTURE and README all said the
+# DRAINED arm was the only silent one.
+# Two halves: a BEHAVIOURAL fixture on the arm a sandbox can reach cheaply (`priority-unreadable`, with a
+# recognised clip record present), and an ORDER property that covers all three — no tier-window spelling may
+# appear in the function BEFORE the `.pool-sat` read block, which is what makes the refusal arms silently
+# incapable of carrying one.
+_pr="$TMP/arm-refuse-clip"; rm -rf "$_pr"; mkdir -p "$_pr/o"
+printf '300\n9\n' > "$_pr/o/candidates.txt"; printf 'P1-severe\n' > "$_pr/o/.pool-sat"
+{ drive_prologue; cat "$FNS"; printf 'queue_order_from_pool "$1"\n_rc=$?\nprintf "STATE=%%s\\n" "$QUEUE_ORDER_STATE"\nexit $_rc\n'; } > "$_pr/drive.sh"
+( cd "$_pr" && HOME="$_pr" bash drive.sh "$_pr/o" ) > "$_pr/out" 2>&1
+_pr14="$(cat "$_pr/out" 2>/dev/null)"
+if grep -q 'STATE=priority-unreadable' <<<"$_pr14" \
+   && grep -q 'could NOT be re-derived' <<<"$_pr14" \
+   && ! grep -q 'windows=TRUNCATED' <<<"$_pr14" \
+   && ! grep -q 'tier window was clipped' <<<"$_pr14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_pr14" \
+   && ! grep -q 'could not be USED' <<<"$_pr14" \
+   && ! grep -q 'could not be READ' <<<"$_pr14" \
+   && ! grep -qF 'is NOT A REGULAR FILE' <<<"$_pr14" \
+   && ! grep -q 'carried no tier name this code recognises' <<<"$_pr14"; then rc=0
+else rc=1; echo "      refuse-with-clip-record '$(printf '%s' "$_pr14" | tr '\n' '|' | head -c 340)' (want the refusal's own sentence and NO tier-window clause: the read happens after the install, so this arm measured nothing about the record)"; fi
+ck "the PRIORITY-UNREADABLE arm carries NO tier-window clause even with a clip record present (it returns before the read)" $rc
+
+# ⛔ THE ORDER PROPERTY, which is what covers the `mv`-failure arm too (a sandbox cannot cheaply make `mv` fail
+# without failing an earlier guard): every line in the driven function that mentions a tier-window spelling must
+# come AFTER the `.pool-sat` read block. Read from the SHIPPED source, not a comment.
+_ord_bad="$(awk '
+  { line = $0; sub(/^[ \t]+/, "", line) }
+  /^  _sat=""; _sat_junk=0/ { read_at = NR }
+  line ~ /^#/ { next }
+  /windows=TRUNCATED|tier window was clipped|NEWEST members|NOT A REGULAR FILE|could not be READ/ {
+    if (read_at == 0) print NR ": " substr($0, 1, 90)
+  }' "$FNS" 2>/dev/null)"
+if [ -z "$_ord_bad" ] && grep -q '^  _sat=""; _sat_junk=0' "$FNS" 2>/dev/null; then rc=0
+else rc=1; echo "      a tier-window spelling appears BEFORE the .pool-sat read block, so an arm that returns earlier CAN carry a claim this pass never measured: ${_ord_bad:-<read block itself missing>}"; fi
+ck "no tier-window spelling appears in the function BEFORE the .pool-sat read (the refusal arms cannot carry a claim they never measured)" $rc
+# ⛔ NON-VACUITY: append the clause to the `priority-unreadable` echo — BEFORE the read — and both halves must red.
+_mut_pr="$TMP/fns-refuse-mut.sh"
+_pr_gate='echo "[refresh] priority-unreadable: the queue order could NOT be re-derived'
+_pr_cause=""
+if ! grep -qF "$_pr_gate" "$FNS" 2>/dev/null; then
+  _pr_cause="the priority-unreadable echo is not in the shipped function as spelled — its sentence changed, so this half grades nothing"
+else
+  awk -v g="$_pr_gate" '{ print; if (index($0, g)) print "    echo \" — windows=TRUNCATED(P1-severe): a tier window ended FULL with a next page still advertised\"" }' "$FNS" > "$_mut_pr"
+  cmp -s "$FNS" "$_mut_pr" 2>/dev/null && _pr_cause="the refusal-arm mutation did not apply (the sentence IS present, so the mutation is what drifted)"
+fi
+if [ -n "$_pr_cause" ]; then
+  rc=1; echo "      $_pr_cause"
+else
+  _ord_bad_m="$(awk '
+    { line = $0; sub(/^[ \t]+/, "", line) }
+    /^  _sat=""; _sat_junk=0/ { read_at = NR }
+    line ~ /^#/ { next }
+    /windows=TRUNCATED|tier window was clipped|NEWEST members|NOT A REGULAR FILE|could not be READ/ {
+      if (read_at == 0) print NR ": " substr($0, 1, 90)
+    }' "$_mut_pr" 2>/dev/null)"
+  if [ -n "$_ord_bad_m" ]; then rc=0
+  else rc=1; echo "      with the clause appended to the refusal arm the ORDER property did not see it — the check above grades nothing"; fi
+fi
+ck "non-vacuity: appending the tier-window clause to a REFUSAL arm reddens the order property" $rc
 
 # ── 6) A FAILED REORDER LEAVES THE QUEUE INTACT AND SAYS SO ──────────────────
 # No `.pool` at all: the rank cannot be derived. The queue must stay byte-identical and the state must be
@@ -2364,6 +2433,7 @@ if grep -q 'STATE=unranked' <<<"$_u14" \
    && grep -q 'no P0-blocker/P1-severe/P2-moderate row matched' <<<"$_u14" \
    && ! grep -q 'could not be USED' <<<"$_u14" \
    && ! grep -q 'tier window was clipped' <<<"$_u14" \
+   && ! grep -qiE 'ended FULL|NEWEST members' <<<"$_u14" \
    && ! grep -q 'windows=TRUNCATED' <<<"$_u14" \
    && ! grep -q 'carries no tier name this code recognises' <<<"$_u14"; then rc=0
 else rc=1; echo "      unranked-absent '$(printf '%s' "$_u14" | tr '\n' '|' | head -c 340)' (want STATE=unranked and the plain 'row matched' clause, and NO clip/unusable/foreign-record wording over a record that does not exist)"; fi
@@ -2565,9 +2635,11 @@ ck "(14d) a NUL INSIDE a tier name is not promoted to a recognised tier" $rc
 # 14f) EVERY ARM THAT CAN CARRY THE CLIP DOES — INCLUDING THE ONES A NON-RACING PASS NEVER REACHES.
 #      ⛔ THE POPULATION IS ENUMERATED, NOT ASSUMED (review P3, cycle 63): the WARN arm (`_u > 0 && _r > 0`,
 #      reachable on any MIXED pass) carries the clause too and used to be read by NOTHING — a one-word
-#      regression there was invisible. It is an arm of this table now. The ONE arm that deliberately carries
-#      no clause is the DRAINED one (see `empty`, below): an empty queue holds no row, so no row of a
-#      clipped tier can be sitting behind a lower one and the inversion this clause discloses cannot exist.
+#      regression there was invisible. It is an arm of this table now. FOUR arms deliberately carry no clause,
+#      for two reasons (review P2, cycle 68): the three REFUSAL arms — `priority-unreadable` and the two
+#      `queue_order_refuse` sentences — return BEFORE the `.pool-sat` read, so they measured nothing about the
+#      record and their order is UNVERIFIED by construction; and the DRAINED one (see `empty`, below), which has
+#      a measured record but no row for it to be about. Both silent populations are graded below.
 #      (review P2, cycle 45). §14d grades the two arms a normal pass reaches, so deleting `$_sat_said` from
 #      the severity / severity-uncounted / totals / head arms left EVERY suite green: four disclosures the
 #      product promises and no test could miss. The counts the function reads back come from

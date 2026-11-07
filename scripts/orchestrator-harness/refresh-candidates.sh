@@ -4197,7 +4197,11 @@ queue_order_from_pool() {
     # arm. So that state is covered by THE TOTALS CHECK, which is the guard to redden in a test — not by
     # a shape test here. (Kept as a named absence: an enforcer that can never fire is worse than none.)
     # ⛔ AND `$_sat_said` IS DELIBERATELY SUPPRESSED HERE — ALL OF ITS CLAUSES, NOT ONLY THE CLIP (review
-    # P3, cycles 63+66). Every other arm carries it; this one has no ROW to carry it about. (1) The CLIP
+    # P3, cycles 63+66). The MUTED ARMS ARE FOUR, not one (review P2, cycle 68): the three REFUSAL arms —
+    # `priority-unreadable` and the two `queue_order_refuse` sentences — return BEFORE the `.pool-sat` read, so
+    # they measured nothing about the record and cannot speak to it (their order is UNVERIFIED by construction);
+    # this arm is the fourth, and it is the only one that HAS an order to speak about and still stays silent.
+    # This one has no ROW to carry it about. (1) The CLIP
     # clause: an EMPTY queue holds nothing, so no row from a clipped tier can be sitting behind a lower tier —
     # the inversion the clause exists to disclose cannot exist. (2) The three RECORD-SHAPE clauses
     # (`unrecognised`, NOT A REGULAR FILE, could not be READ) say what this pass could learn about the RECORD;
