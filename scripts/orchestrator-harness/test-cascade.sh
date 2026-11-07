@@ -680,13 +680,13 @@ ck "…and it carries the SLOT GRANT (the fix; without it the escape records wha
 # grade GREEN — the same false PASS `pr-owner-liveness.test.sh` records for its own drive.
 bash -n "$ESCBLK" 2>/dev/null || bad "the extracted [drain-escape] block is not valid shell — the drive would abort midway"
 
-esc_pair() { # <id> <room> <slots> <unread> [<backlog>] -> "<slots> <record|none>"
+esc_pair() { # <id> <room> <slots> <unread> [<backlog>] [<batch>] [<can>] -> "<slots> <record|none>"
   # ⛔ THE FIXTURE DIRECTORY IS DERIVED FROM `$TMP`, NOT FROM A POSITIONAL ARG. The main-worktree-guard
   # refuses any `rm -rf` whose target it cannot resolve statically (a `$1`-derived path reads as a
   # possible WHOLE-TREE discard and fails closed, #709), and that refusal lands on the SUITE, not on the
   # fixture — the whole file becomes unrunnable. `$TMP/ep-<id>` is resolvable, so the discard is
   # statically visible and the suite stays executable.
-  local d="$TMP/ep-$1" room="$2" slots="$3" unread="$4" blg="${5-}"
+  local d="$TMP/ep-$1" room="$2" slots="$3" unread="$4" blg="${5-}" btch="${6:-2}" can="${7-}"
   rm -rf "$d"; mkdir -p "$d/state"
   # Prime the inert-path streak at the bound, so `pl_escape_open` answers YES on the shipped predicate
   # rather than on a fixture that never got there.
@@ -698,7 +698,13 @@ esc_pair() { # <id> <room> <slots> <unread> [<backlog>] -> "<slots> <record|none
     O="$d"; LOG="$d/state/log"; LO_CHOICE=pr; PL_MOD=1; UPN_WORK=2; PRDISP_SPAWNS=0
     DRAIN_ESCAPE_PASSES=2; GATE_WHY="GW_SENTINEL"; LANES_DISPLAY=2; MAX_LANES=7
     CASCADE_ROOM="$room"; CASCADE_ISSUE_SLOTS="$slots"; CASCADE_UPN_UNREADABLE="$unread"
-    CASCADE_BACKLOG="$blg"; BATCH=2
+    # ⛔ `BATCH` IS A REAL KNOB AGAIN (review round 5, P2). A first version hardcoded `BATCH=2`, so the
+    # arm that claims "a large BATCH does not widen it past room/2" ran with BATCH=2 against room=5 —
+    # where `room/2` and `min(BATCH,ROOM)` BOTH yield 2. The arm passed on the very implementation it
+    # exists to reject. `CASCADE_CAN` is likewise explicit: UNSET means the driver-rig contract, and 0
+    # means the allocator refused on load/mem even though the box had room.
+    CASCADE_BACKLOG="$blg"; BATCH="$btch"
+    if [ -n "$can" ]; then CASCADE_CAN="$can"; fi
     . "$ESCBLK"
     printf '%s %s\n' "${CASCADE_ISSUE_SLOTS:-unset}" \
       "$( [ -s "$d/state/drain-escape" ] && echo record || echo none )" ) 2>/dev/null
@@ -724,8 +730,17 @@ ck "an UNREADABLE un-owned count withholds instead of spending a slot (fail-clos
 # never runs (`slots > 0` gate) and NO level is measured. Same false-PASS shape as the defect above.
 ck "an EMPTY BACKLOG withholds: recording an escape over an empty queue is a false PASS" \
    "$(esc_pair 8 5 0 0 0)" "0 none"
-ck "…and BATCH is never the grant: a large BATCH does not widen it past room/2" \
-   "$(esc_pair 9 5 0 0 10)" "2 record"
+ck "…and BATCH is never the grant: BATCH=9 with room=5 still grants 2, not min(BATCH,ROOM)=5" \
+   "$(esc_pair 9 5 0 0 10 9)" "2 record"
+# ⛔ THE CAPACITY-REFUSED STATE (review round 5, P1): `CASCADE_ROOM` is `MAX_LANES - LANES` and knows
+# nothing about the load/mem probe, so room>0 coexists with a REFUSED `can_spawn`. `cascade_issue_slots`
+# returns 0 for it, the issue batch has NO guard on `CASCADE_CAN` (`dispatch-merge.sh`'s `wt_spawn` never
+# consults the load gate), so a grant here would spawn two worker records on a box the allocator refused
+# and consume the room it was given. This arm is the one that would have caught that.
+ck "a REFUSED capacity probe withholds even with room — the allocator refused, so there is no slot" \
+   "$(esc_pair 10 5 0 0 10 2 0)" "0 none"
+ck "…and a GRANTED probe (can=1) still escapes, so the arm above is not passing on a dead path" \
+   "$(esc_pair 11 5 0 0 10 2 1)" "2 record"
 
  echo "=== 14d. the funnel names WHICH of the three states deferred it ==="
 # ⛔ P2 (review cycle 2): one boolean, three causes, one sentence. `holds` and `unreadable` must not
@@ -993,7 +1008,7 @@ PEOF
 # lives in $TMP and has no sibling module beside it).
 export MODP="$HERE/pr-owner-liveness.sh"
 mut "M19 the escape opens the issue path WITHOUT granting the slots it spends (the level-holds no-op restored)" \
-    's/^    if \[ "${CASCADE_ROOM:-1}" -ge 1 \] 2>\/dev\/null && \[ "${CASCADE_UPN_UNREADABLE:-0}" = "0" \] && \[ "${CASCADE_ISSUE_SLOTS-1}" -le 0 \] 2>\/dev\/null; then$/    if false; then/' "$TMP/p-pair.sh"
+    's/^    if \[ "${CASCADE_ROOM:-1}" -ge 1 \] 2>\/dev\/null && \[ "${CASCADE_UPN_UNREADABLE:-0}" = "0" \] && \[ "${CASCADE_CAN:-1}" = "1" \] && \[ "${CASCADE_ISSUE_SLOTS-1}" -le 0 \] 2>\/dev\/null; then$/    if false; then/' "$TMP/p-pair.sh"
 
 # ── 12b-M. MUTANTS FOR THE LEVEL-1 STATE PINS ────────────────────────────────
 # ⛔ `mut`/`mutlo` only ever mutate `$ORCH`/`$LO` and grade FUNCTIONS. The 12b pins are SOURCE facts

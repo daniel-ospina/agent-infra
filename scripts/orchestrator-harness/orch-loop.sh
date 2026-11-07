@@ -7364,8 +7364,20 @@ PY
     # level-holds is precisely the state the valve exists for (review cycle 2's P1: a merge ceiling that
     # keeps refusing leaves a level holding pass after pass). So the escape GRANTS what it needs rather
     # than announcing an action it cannot take.
-    # ⛔ THE GRANT IS THE ALLOCATOR'S OWN ARITHMETIC, NEVER A SECOND ONE (review round 4, P2 x3). A
-    # first version of this grant used `min(BATCH, ROOM)` and was wrong three ways, each measured:
+    # ⛔ THE GRANT REPLAYS THE ALLOCATOR'S INPUTS, AND IT MUST TAKE **ALL** OF THEM — INCLUDING THE
+    # CAPACITY PROBE (review round 5, P1). A first version of this grant called itself "the allocator's
+    # own arithmetic" while reading only `MAX_LANES - LANES`: `cascade_issue_slots` ALSO returns 0 when
+    # the load/mem probe refused (`[ "${ok:-1}" = "1" ] || { printf '0\n'; return 0; }`), and `ok` is
+    # `CASCADE_CAN` computed by `can_spawn` above. `CASCADE_ROOM` never consults `can_spawn`, so
+    # room>0 with `CASCADE_CAN=0` is reachable and was BYTE-IDENTICAL to the level-holds state this
+    # grant exists for. The consequence was worse than the false PASS the grant removes: the issue
+    # batch's own guards are `${CASCADE_ISSUE_SLOTS-1}`, the in-flight dedup and `capacity_yield_live`
+    # — NONE consults `CASCADE_CAN` (`spawn-gate.sh` states it outright: `orch-loop.sh` gates its
+    # decision sites, `dispatch-merge.sh`'s `wt_spawn` does not), so the grant would have queued and
+    # spawned `lane-<N>`/`chain-<N>` on a box the allocator had just refused on load/mem, consuming
+    # the very room it was granted. So the condition below carries `CASCADE_CAN` and the grant cannot
+    # fire on a refused probe. A first version of this grant used `min(BATCH, ROOM)` and was wrong
+    # three further ways, each measured:
     #   • it discarded the 2-RECORDS-PER-ISSUE factor `cascade_issue_slots` treats as load-bearing
     #     ("ONE ISSUE COSTS TWO WORKER RECORDS … Halving is the only reading that cannot overshoot
     #     MAX_LANES"), so `room=2, BATCH=2` granted 2 issues = up to 4 records for 2 free lanes;
@@ -7388,14 +7400,20 @@ PY
     # 1, so the escape recorded a dispatch while the batch's own `${CASCADE_ISSUE_SLOTS-1}` guard
     # errored and broke: the exact false-PASS shape this block exists to remove).
     _egrant=0
-    if [ "${CASCADE_ROOM:-1}" -ge 1 ] 2>/dev/null && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_ISSUE_SLOTS-1}" -le 0 ] 2>/dev/null; then
+    if [ "${CASCADE_ROOM:-1}" -ge 1 ] 2>/dev/null && [ "${CASCADE_UPN_UNREADABLE:-0}" = "0" ] && [ "${CASCADE_CAN:-1}" = "1" ] && [ "${CASCADE_ISSUE_SLOTS-1}" -le 0 ] 2>/dev/null; then
       _egrant=$(( ${CASCADE_ROOM:-0} / 2 ))
       [ "${_egrant:-0}" -ge 1 ] || _egrant=1
       if is_num "${CASCADE_BACKLOG:-}"; then
         [ "${_egrant:-0}" -le "${CASCADE_BACKLOG:-0}" ] || _egrant="${CASCADE_BACKLOG:-0}"
       fi
       CASCADE_ISSUE_SLOTS="$_egrant"
-      [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room `cascade_issue_slots` would have granted (room/2, backlog ${CASCADE_BACKLOG:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
+      # ⛔ NO BACKTICKS IN A DOUBLE-QUOTED `echo` (review round 5, P2): command substitution is LIVE
+      # there, so a backticked function name is EXECUTED at log time and its output substituted. A
+      # first version wrote "the room `cascade_issue_slots` would have granted" and the line printed
+      # "the room 0 would have granted" — a bogus number in the one line whose whole purpose is
+      # auditability — while calling the allocator with no arguments on every escape. The suite could
+      # not see it: its grep matched the prefix BEFORE the backtick.
+      [ "${_egrant:-0}" -ge 1 ] && echo "[dispatch] DRAIN ESCAPE GRANTS ${_egrant} issue slot(s) — the issue path was granted none while ${CASCADE_ROOM} lane(s) were free, so the escape spends the room the allocator would have granted (room/2, backlog ${CASCADE_BACKLOG:-?}) instead of opening a path with nothing to queue into" >> "$LOG"
     fi
     # DOES THIS PASS ACTUALLY HAVE A SLOT TO SPEND? UNSET is the driver-rig/older-caller contract (the
     # escape keeps its pre-change behaviour); an explicit 0, or a grant that produced 0 because the
@@ -7409,13 +7427,13 @@ PY
     if [ "${CASCADE_ROOM:-1}" -le 0 ] 2>/dev/null; then
       echo "[dispatch] DRAIN ESCAPE WITHHELD — the PR path is inert and the box has NO ROOM (lanes=${LANES_DISPLAY:-?}/${MAX_LANES:-?}, issue slots=0), so opening the issue path would dispatch nothing. No escape is taken and no record is written; the cascade opens the issue path by itself the moment a slot frees (owner ruling 2026-11-04)." >> "$LOG"
     elif [ "$_ecan" = "0" ]; then
-      # ⛔ NO SLOT COULD BE GRANTED, SO THERE IS NOTHING TO OPEN (review round 4, P2). Two states reach
-      # here and the old text named only the first, asserting it in the state where it is FALSE: an
-      # UNREADABLE un-owned count (the grant above refuses to spend a slot on a measurement that never
-      # answered), or an EMPTY BACKLOG (the grant is ceilinged by it, and with 0 candidates the batch
-      # queues nothing whatever the slots say). Both are named, because a log line that picks one
-      # cause it did not observe is the same false-PASS class as the record itself.
-      echo "[dispatch] DRAIN ESCAPE WITHHELD — no issue slot could be granted, so opening the issue path would dispatch nothing (issue slots=${CASCADE_ISSUE_SLOTS-0}, backlog=${CASCADE_BACKLOG:-?}, un-owned count ${CASCADE_UPN_UNREADABLE:-0}=1 means UNREADABLE). No escape is taken and no record is written." >> "$LOG"
+      # ⛔ NO SLOT COULD BE GRANTED, SO THERE IS NOTHING TO OPEN (review rounds 4-5, P2/P1). Every state
+      # that reaches here is NAMED WITH ITS OWN MEASURED VALUE, because a log line that picks ONE cause
+      # it did not observe is the same false-PASS class as the record itself. The four inputs are listed
+      # rather than diagnosed: an UNREADABLE un-owned count, a REFUSED capacity probe (load/mem), an
+      # EMPTY BACKLOG (the grant is ceilinged by it, and with 0 candidates no level is measured at all —
+      # the cascade block runs only when slots > 0), or no room.
+      echo "[dispatch] DRAIN ESCAPE WITHHELD — no issue slot could be granted, so opening the issue path would dispatch nothing (issue slots=${CASCADE_ISSUE_SLOTS-0}, backlog=${CASCADE_BACKLOG:-?}, capacity=${CASCADE_CAN:-?} where 0 is a load/mem refusal, un-owned count ${CASCADE_UPN_UNREADABLE:-0}=1 means UNREADABLE). No escape is taken and no record is written; the withholding cause is whichever of those inputs refused." >> "$LOG"
     else
     printf '%s\n' "$(pl_escape_line "$O/state" "${UPN_WORK:-}" "$_eb")" >> "$LOG"
     if PL_ESCAPE_BOUND="$_eb" pl_escape_record "$O/state" "${UPN_WORK:-}" "${PRDISP_SPAWNS:-}"; then
