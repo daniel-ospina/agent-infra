@@ -81,8 +81,33 @@ gets `radiusProvider`, so with NO `apiKey` declared the credential is `RADIUS_AP
 template still wins - `RADIUS_API_KEY` does not substitute for it. A `models` entry with no `api` does NOT drop a granted
 provider on the default gateway (pi composes it from `RADIUS_MODELS`, measured: it reached the gateway), only on a custom one — where pi answers
 `Error: Unknown provider` and no credential can rescue it, so that shape is REFUSED (`reason=models-json-provider-dropped`)
-with a model-level remedy instead of a variable to export. Such a provider also has an oauth handler, so the store
-refusal below never applies to it.
+with a model-level remedy instead of a variable to export. The vendor strips a trailing `/v1` before normalizing
+the gateway, so `https://radius.pi.dev/v1` IS the default one (measured: pi reaches it); and it only ADDS a scheme, never
+rewrites one — `http://radius.pi.dev` and `https:/radius.pi.dev` are CUSTOM gateways, where an api-less definition is
+measured `Error: Unknown provider` (provider DELETED) and therefore refused, not `check=ok`; and an UNSHIPPED provider
+with an unbuildable definition is refused too, because pi deletes it (`Error: Unknown provider`) — only on a COMPLETED
+read of the table, though: an unread table is cannot-say, and an oauth-only provider pi ships (`openai-codex`) has no
+env entry at all, so neither is mistaken for "pi does not ship it". A model definition whose effective `baseUrl` — its
+own, else the one on the provider body — is not an absolute URL is refused as well, for a different measured reason: the
+composed model carries that raw value and pi builds the request from it, so `pi -p` answers `Invalid URL` and exits 1
+(`reason=models-json-bad-gateway`) — write an absolute `https://...` on the definition or the provider body. ⛔ THE TEST IS
+PER **PINNED** DEFINITION (a sibling's broken `baseUrl` is never requested, measured), AND THREE SHAPES ARE DELIBERATELY
+**NOT** REFUSED because pi runs them (each measured): a grant with NO
+`models` array (the gateway normalizes its own config URL; 401 from Radius), a definition carrying its OWN absolute
+`baseUrl` (it wins), and a NON-radius provider body with no `models` array is refused only when that body's own `baseUrl`
+is unbuildable — because only there does every base model inherit it. The test itself is "would `new URL()` throw", not a
+spelling: `https:/host` and surrounding whitespace are accepted by the vendor, so a `^https?://` test refused boxes that
+run, while the AUTHORITY is part of it — `https://:8080/v1` and `https:// gw.example/v1` answer `Invalid URL` (refused),
+and `https:///host` / a bare `https://` PARSE and reach the network (not refused). ⛔ That test mirrors the parser's rules for
+those MEASURED shapes (userinfo split off first, empty host / empty or unclosed IPv6 literal / forbidden code point / bad
+`%` escape refused, tab-NL-CR removed rather than refused, C0-or-space trim, `\` ending the authority like `/`, port
+empty or all-decimal ≤65535 with leading zeros read as the value) — it is NOT a URL-parser emulation: the IPV6 INTERIOR
+is not validated, so `[zzz]`/`[:::]` pass here although node throws, neither the IPv4-number rule nor the
+IDNA/punycode pipeline is reproduced, and a NON-`http(s)` SCHEME is not inspected at all (`ftp://[zzz]/v1` throws in
+node and passes here — pre-existing, unchanged by this change). That gap can only ever be a false PASS, and that is measured: three independent
+fuzz passes against node (~72,000 generated authorities) found ZERO false blocks, with every false pass confined to
+that unemulated surface. Such a provider also has an oauth
+handler, so the store refusal below never applies to it.
 ⛔ **AND ONE STORE SHAPE IS REFUSED, NOT SKIPPED** (measured): an `oauth` entry in `auth.json` for a provider `pi` ships NO
 oauth handler for. The handler set is static — `anthropic github-copilot kimi-coding meta openai-codex openai openrouter radius xai`
 (`pi-ai/dist/providers/`) — and a stored entry SHADOWS the environment, so `pi -p` answers `No API key found for <provider>.` even with the key
