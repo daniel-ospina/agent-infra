@@ -1,0 +1,30 @@
+{
+  "_ref": "refs/lanes/cmux.kfixer-3701-1794091938-p2370826-8663c7a2",
+  "_sha": "83f6b94e2c185e4bea1c7ddfedba6870a5d098e6",
+  "artifacts": [
+    {
+      "kind": "log",
+      "value": "/tmp/mandate-preflight.XjW8MH/seam.log"
+    }
+  ],
+  "attempt": 1,
+  "branch": null,
+  "budget_s": 605,
+  "duration_s": 14,
+  "ended_at": 1794091952,
+  "exit_code": 0,
+  "heartbeat_at": 1794091952,
+  "host": "cmux",
+  "issue": 3701,
+  "kind": "fixer",
+  "lane_id": "cmux.kfixer-3701-1794091938-p2370826-8663c7a2",
+  "lease_until": 1794092557,
+  "pid": 2370826,
+  "reason": null,
+  "repo": null,
+  "schema": 1,
+  "started_at": 1794091938,
+  "state": "DONE",
+  "tag": "3701",
+  "worktree": "/tmp/mutE3701"
+}
