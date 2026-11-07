@@ -1017,6 +1017,7 @@ RERUN_MAX_ATTEMPTS="${ADMIN_MERGE_RERUN_MAX_ATTEMPTS:-3}"
 # CEILING is never reported as a claim that the run STALLED (return 2, not 1).
 RERUN_TIMEOUT_CLAMPED=0
 
+
 # ── THE FIRST-CHECKS WAIT IS PROGRESS-AWARE, NOT A FIXED WINDOW (#2481) ──
 # The head's lane runs must APPEAR and reach status=completed before §1b may
 # compare — the fresh-PR race (no run yet) and the #2090 shape (a run still
@@ -1088,6 +1089,68 @@ FIRST_CHECKS_POLL="${ADMIN_MERGE_FIRST_CHECKS_POLL:-60}"
 #                        uses; it is a floor on how often a silent surface is
 #                        re-read, never a shortening of any wait.
 FIRST_CHECKS_POLL_MAX="${ADMIN_MERGE_FIRST_CHECKS_POLL_MAX:-300}"
+
+# ── THE WHOLE-ATTEMPT DEADLINE — a bound on the ACTUATION, not on one wait ─────
+# #3223's framing, unchanged and still true: "A bound on each wait is not a bound
+# on the ATTEMPT." Every wait below carries its own bound and they are all
+# honest; nothing bounded their SUM, so a rail could cross four waits each
+# inside its own bound and spend hours proving it. Measured 2026-11-02 on the mac
+# box: five agent-infra rails live for 32:46-59:09 (`ZERO-PROGRESS(5/5)`,
+# agent-infra#3287 comment 6582780730), one actuator holding five of its eight
+# slots.
+#
+# ⛔ WHY THE OBVIOUS DEFAULT IS A NO-OP, STATED AS ARITHMETIC. #3287's diff sets
+# `RAIL_DEADLINE = FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT` =
+# `18064 + 4 x 3900 = 33664s` (9h21m04s). The bounds it is the sum OF are the
+# bounds that actually fire: FIRST_CHECKS_CEILING ends a first-checks wait at
+# 18064s, RERUN_BUDGET ends the re-run phase at 1800s, the MERGE-REF window at
+# 90s. A rail cannot legitimately REACH 33664s, because every phase that could
+# carry it there is already bounded well below it — so the deadline is dead code
+# that reads as protection. That is the SAME defect `lane-merge.sh:116-122`
+# records and fixed in its own sizing ("the two sides EQUAL ... an instrument
+# that only fires for a lane that could not exist"): a bound whose value is
+# unreachable is not a bound. It is also 1.36x the 6h53m rail #3223 was written
+# against, so it would not have fired on the case that motivated it either.
+#
+# ⛔ SO THE NUMBER IS THE REACHABLE ONE, DERIVED FROM THE PHASE BOUNDS:
+#     RAIL_DEADLINE = FIRST_CHECKS_CEILING + RERUN_BUDGET + 2 x SELF_EDIT_WAIT + MERGE_REF_WAIT
+#                   = 18064 + 1800 + 2 x 300 + 90 = 20554s  (5h42m34s)
+# i.e. ONE full-length first-checks wait (18064s = 2 x the 9032s slowest measured
+# green run, the rail's own worst-case honest run), one re-run phase (1800s), the
+# self-edit wait (2 x 300s — it has two live call sites per attempt) and the
+# merge-ref window (90s) — and no more. The ceiling is the SUM of the phase bounds
+# this guard supervises, computed by `rail_deadline_default`, so it is never short
+# of what it claims to cover. That is above the worst-case HEALTHY
+# landing this rail knows about (one slow run, one flake re-run), and below
+# #3287's 33664s by 41%, where it actually terminates something. Raising the
+# number is NOT the fix (`:855`): an override above the reachable ceiling is
+# CLAMPED to it and the clamp is DISCLOSED, so the reported bound is never a
+# number the rail did not use.
+#
+# ⛔ FALSE-POSITIVE RISK, DECLARED (this is an ELAPSED bound, not a stall claim).
+# A genuinely healthy attempt needing TWO consecutive near-ceiling first-checks
+# waits would be refused here at 20554s instead of at 2 x 18064s. No such
+# landing is represented in any measurement this rail holds (the observed
+# population at this scale is STUCK, not healthy), and the outcome is exit 1 —
+# a parked head that the next invocation re-runs — never a false green, and never
+# a merge that would otherwise have happened. It is operator-overridable. This is
+# deliberately NOT a progress-liveness bound: the rail ALREADY rejected
+# job/step-transition progress as a stall signal for exactly this wait
+# (`:6256-6261`: `updatedAt` is frozen for a whole long step), so a
+# progress-resetting clock here would fire on a legitimate silent step — the
+# false stall §39 pins out.
+# ⛔ THE VALUES ARE COMPUTED AT CALL TIME, NOT HERE. Two of the four phase bounds
+# this deadline must cover (SELF_EDIT_WAIT, MERGE_REF_WAIT) are declared LATER in
+# this file, so a load-time sum would either crash under `set -u` or silently omit
+# them (see `rail_deadline_default` below). They are also left UNSET until
+# `rail_attempt_start` validates them: an UNVALIDATED non-integer makes `[ -ge ]`
+# ERROR, and under `set -u` without `-e` that SKIPS the guard — a fail-open
+# (`validate_timing_knobs`'s own rule, `:1880-1885`). So the knob is refused BY
+# NAME at start, exactly like every other timing knob, and never merely defaulted.
+RAIL_DEADLINE=""
+RAIL_DEADLINE_CEILING=0
+RAIL_DEADLINE_CLAMPED=0
+RAIL_STARTED_AT=0
 # CHECK_UNRESOLVED_BOUND — the bound on ONE thing the FIRST-CHECKS wait never
 # bounded: a check whose NEWEST attempt has no conclusion (`status=queued`/
 # `in_progress`, `conclusion=null`) because the job behind it never got a runner.
@@ -3115,6 +3178,7 @@ resolve_merge_ref() {
     info "admin-merge: … MERGE-REF wait: GitHub is still computing mergeability (mergeable=${state:-<empty>}; ${waited}s of the ${MERGE_REF_WAIT}s window, attempt $attempt) — waiting."
     adv=$((10#$step))
     [ "$adv" -gt $((MERGE_REF_WAIT - waited)) ] && adv=$((MERGE_REF_WAIT - waited))
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     [ "$adv" -gt 0 ] && sleep "$adv"
     waited=$((waited + adv))
   done
@@ -3227,6 +3291,243 @@ refuse_rerun_budget() {
     say_err "   KNOWN to be slow. A larger --rerun-attempts would NOT help: the wall clock is the bound."
   fi
   say_err "   No merge."
+}
+
+# _rail_knob — sanitise ONE phase bound for the ceiling arithmetic. A non-numeric
+# or leading-zero value is 0 HERE and is refused BY NAME moments later by
+# `validate_timing_knobs`; the point is that a bad operator value must not turn
+# load-time arithmetic into an "unbound variable"/octal crash before the rail can
+# name the knob (review P2, verified: a non-numeric RERUN_BUDGET used to abort
+# with `line 980: <value>: unbound variable` and no message naming it).
+_rail_knob() {
+  case "${1:-}" in ''|*[!0-9]*) printf 0 ;; 0*) printf 0 ;; *) printf '%s' "$1" ;; esac
+}
+
+# rail_deadline_default — the REACHABLE whole-attempt ceiling, derived from every
+# phase bound `rail_guard_poll` supervises. Computed at CALL time because
+# SELF_EDIT_WAIT and MERGE_REF_WAIT are declared later in this file than
+# FIRST_CHECKS_CEILING/RERUN_BUDGET; a load-time sum would omit them (review P2:
+# omitting them made the stated derivation 390s short of the sum it claimed).
+# 2 x SELF_EDIT_WAIT, not 1 x: `settle_self_edit_generation` has TWO live call
+# sites in the §1b loop (:8323 and :8346) and the first deliberately resets
+# `pr_self_edit_retry=0` so the probe runs AGAIN on the re-read, so a single
+# invocation may legitimately spend that bound twice (review cycle 4, P2). The
+# ceiling must be the sum of what the guard actually supervises, or it refuses a
+# healthy attempt with its own phase bounds still unspent — the defect this
+# comment block was written to fix, one term over.
+rail_deadline_default() {
+  printf '%s' "$(( $(_rail_knob "${FIRST_CHECKS_CEILING:-0}") + $(_rail_knob "${RERUN_BUDGET:-0}") + 2 * $(_rail_knob "${SELF_EDIT_WAIT:-0}") + $(_rail_knob "${MERGE_REF_WAIT:-0}") ))"
+}
+
+# rail_now — the attempt clock's only source of time. NO ambient override: an
+# injectable "now" was a bypass in review (a frozen clock makes `elapsed` negative
+# and the guard never fires), and no arm needs it — the START is the driven quantity.
+rail_now() { date +%s; }
+
+# rail_attempt_start — start the whole-attempt clock, and VALIDATE the knob.
+# Idempotent: the FIRST start wins, so a re-entrant path cannot reset the
+# attempt's age (a deadline a caller can restart is not a deadline).
+rail_attempt_start() {
+  [ "${RAIL_STARTED_AT:-0}" -gt 0 ] 2>/dev/null && return 0
+  RAIL_DEADLINE_CEILING="$(rail_deadline_default)"
+  [ -n "${RAIL_DEADLINE:-}" ] || RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$RAIL_DEADLINE_CEILING}"
+  # ⛔ REFUSED BY NAME, NOT DEFAULTED SILENTLY. `[ -ge ]` on a non-integer ERRORS,
+  # and under `set -u` without `-e` an erroring `if` body is SKIPPED — so an
+  # unvalidated typo does not weaken the bound, it DELETES it. Verified in review:
+  # `ADMIN_MERGE_RAIL_DEADLINE=10m` let a 600s-aged attempt proceed. The branches
+  # below are `validate_timing_knobs`' rule (`:1880-1907`) applied to the one
+  # timing knob that was not wired into it.
+  # ORDER IS LOAD-BEARING (review cycle 2, P2): non-numeric and OVER-RANGE are
+  # tested BEFORE any `[ -ge ]`/`[ -le ]`, because an out-of-range all-digit value
+  # makes those comparisons print a raw "integer expression expected" BEFORE any
+  # named refusal — the exact complaint this validation exists to answer. `0` gets
+  # its OWN message: the leading-zero branch used to catch it and tell the operator
+  # to drop a leading zero it did not have.
+  case "${RAIL_DEADLINE:-}" in
+    ''|*[!0-9]*)
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — it must be a POSITIVE integer number of seconds."
+      say_err "   A non-numeric bound makes the deadline's own comparison ERROR, which SKIPS the guard"
+      say_err "   instead of enforcing it (fail-open). Omit it to use the derived ${RAIL_DEADLINE_CEILING}s."
+      exit 2 ;;
+  esac
+  if [ "${#RAIL_DEADLINE}" -gt 9 ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — beyond the usable integer range."
+    say_err "   An all-digit value past the shell's range makes the comparison error out, SKIPPING the guard."
+    exit 2
+  fi
+  if [ "$RAIL_DEADLINE" -eq 0 ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='0' — a zero bound refuses EVERY attempt at its first poll."
+    say_err "   That parks every merge in the fleet instead of bounding a stuck one. Omit it for ${RAIL_DEADLINE_CEILING}s."
+    exit 2
+  fi
+  case "${RAIL_DEADLINE}" in
+    0*)
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — a LEADING ZERO is ambiguous."
+      say_err "   Write it without the leading zero (e.g. '19864', not '019864')."
+      exit 2 ;;
+  esac
+  # TEST SEAM, and it is fail-safe BECAUSE IT IS CLAMPED: an injected start can
+  # only make the attempt OLDER, never younger (review P1: passing a future stamp
+  # made the rail evade its own deadline). A live rail cannot use it to escape.
+  # ⛔ THE CLOCK IS AN INPUT TOO. `rail_now` is the guard's only external
+  # dependency and it was the one value with NO validation: with a `date` that
+  # fails, `[ -lt ]`/`[ -ge ]` errored, the erroring body was SKIPPED (set -u, no
+  # -e), and a 600s-aged attempt under a 60s bound EXITED 0 — an inert enforcer,
+  # the exact class this change removes (review cycle 4, P2). An unreadable clock
+  # REFUSES (exit 1): a deadline that cannot read time must not report success.
+  if [ -n "${ADMIN_MERGE_RAIL_STARTED_AT:-}" ]; then
+    # THE SEAM GETS THE SAME LADDER AS THE KNOB (review cycle 2, P1: an all-digit
+    # 23-digit stamp made `[ -lt ]` ERROR, the erroring `if` body was SKIPPED under
+    # `set -u` without `-e`, and the attempt's age was silently CANCELLED — the
+    # young direction the clamp exists to forbid. A LEADING ZERO was worse than
+    # silent: `[ -lt ]` read it DECIMAL while the age arithmetic read it OCTAL and
+    # the rail refused a healthy attempt with a 1.5-billion-second elapsed).
+    case "$ADMIN_MERGE_RAIL_STARTED_AT" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_STARTED_AT='${ADMIN_MERGE_RAIL_STARTED_AT}' — not an integer epoch."
+        exit 2 ;;
+    esac
+    if [ "${#ADMIN_MERGE_RAIL_STARTED_AT}" -gt 12 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_STARTED_AT='${ADMIN_MERGE_RAIL_STARTED_AT}' — beyond the usable integer range."
+      exit 2
+    fi
+    case "$ADMIN_MERGE_RAIL_STARTED_AT" in
+      0*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_STARTED_AT='${ADMIN_MERGE_RAIL_STARTED_AT}' — a LEADING ZERO is ambiguous (octal vs decimal)."
+        exit 2 ;;
+    esac
+    _real_now="$(rail_now)"
+    case "$_real_now" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:clock-unreadable, ${PR:-?})"
+        say_err "   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline"
+        say_err "   cannot be evaluated. Refusing rather than proceeding with an unenforceable bound."
+        exit 1 ;;
+    esac
+    if [ "$ADMIN_MERGE_RAIL_STARTED_AT" -lt "$_real_now" ]; then
+      RAIL_STARTED_AT="$ADMIN_MERGE_RAIL_STARTED_AT"
+    else
+      # DISCLOSED, so the clamp is on the record and an arm can DISCRIMINATE it
+      # from "the guard was never reached" (cycle 2 P1: the old p4 asserted only
+      # the ABSENCE of a refusal, which the broken code also produced).
+      say_err "admin-merge: note — ADMIN_MERGE_RAIL_STARTED_AT=${ADMIN_MERGE_RAIL_STARTED_AT} is not in the past; CLAMPED to now (${_real_now}). The attempt clock can only be made OLDER, never younger."
+      RAIL_STARTED_AT="$_real_now"
+    fi
+  else
+    RAIL_STARTED_AT="$(rail_now)"
+  fi
+  # THE CLAMP IS DISCLOSED AT START, so the bound the rail actually uses is on
+  # the record from the first poll — not only in a refusal that may never print.
+  if [ "$RAIL_DEADLINE" -gt "$RAIL_DEADLINE_CEILING" ]; then
+    RAIL_DEADLINE_CLAMPED=1
+    say_err "admin-merge: note — ADMIN_MERGE_RAIL_DEADLINE=${RAIL_DEADLINE}s CLAMPED to the reachable ${RAIL_DEADLINE_CEILING}s (FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + RERUN_BUDGET ${RERUN_BUDGET}s + 2 x SELF_EDIT_WAIT ${SELF_EDIT_WAIT:-0}s + MERGE_REF_WAIT ${MERGE_REF_WAIT:-0}s). A deadline ABOVE the sum of the phase bounds it supervises can never fire — every phase that could carry the attempt there is bounded below it — so an unreachable number is refused rather than trusted."
+    RAIL_DEADLINE="$RAIL_DEADLINE_CEILING"
+  fi
+
+  # ⛔ NAMED, NOT SILENT — the one half of #3287's "deadline must EXCEED
+  # FIRST_CHECKS_CEILING" relation that still applies. The relation cannot be a REFUSAL
+  # here: #3294's reviewed contract deliberately ACCEPTS an override below the reachable
+  # ceiling (its `(p1)` 60s and `(p6)` 500s arms pin the bound IN FORCE), and the clamp
+  # above already rejects the dangerous direction (a bound that can never fire). But an
+  # override below FIRST_CHECKS_CEILING still fires in the middle of a first-checks wait
+  # this rail itself declares legal, and #3287 refused it BY NAME at startup precisely so
+  # the operator learned immediately rather than after a wasted attempt. Keep that: name it
+  # on stderr, do not exit. Skipped when the start seam is in use — the seam can only make
+  # the attempt OLDER, so it is how a short bound is driven on purpose.
+  if [ -z "${ADMIN_MERGE_RAIL_STARTED_AT:-}" ] \
+     && [ "$RAIL_DEADLINE" -le "${FIRST_CHECKS_CEILING:-0}" ]; then
+    say_err "admin-merge: note — ADMIN_MERGE_RAIL_DEADLINE=${RAIL_DEADLINE}s is BELOW ADMIN_MERGE_FIRST_CHECKS_CEILING=${FIRST_CHECKS_CEILING}s, so this attempt bound fires DURING a first-checks wait the rail itself declares legal. Every invocation will refuse part-way through a legal wait. Raise it above the ceiling (the derived reachable bound is ${RAIL_DEADLINE_CEILING}s) unless a short bound is exactly what you want."
+  fi
+  # ── THE LEASE TTL IS DERIVED FROM THE RESOLVED BOUND (#3287's relation, #3294's clock) ──
+  # ⛔ THE RELATION IS ENFORCED HERE, NOT IN `validate_rail_bounds`, because it is a
+  # relation between TWO RESOLVED values and the resolution happens on this line — a
+  # load-time derivation cannot express it any more. It is still LOAD-BEARING: a lease
+  # must outlive the attempt that holds it, or a rail still running inside its own
+  # deadline can have its lease stolen and two rails would then hold the same PR.
+  # The +3600 offset is preserved from #3287 so an operator override keeps its meaning.
+  RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$(( RAIL_DEADLINE + 3600 ))}"
+  case "${RAIL_LOCK_TTL}" in
+    ''|*[!0-9]*)
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."
+      exit 2 ;;
+  esac
+  # 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent: a
+  # SIGKILLed rail's lease whose pid was reused by a long-lived fleet process is never
+  # reclaimable and the head is parked.
+  if [ "$RAIL_LOCK_TTL" -le 0 ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."
+    exit 2
+  fi
+  if [ "$RAIL_LOCK_TTL" -le "$RAIL_DEADLINE" ]; then
+    say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' with ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the lease TTL must EXCEED the whole-attempt bound, or a rail still running inside its own deadline can have its lease stolen and two rails would then hold the same PR."
+    exit 2
+  fi
+}
+
+# refuse_rail_deadline <elapsed> — the WHOLE-ATTEMPT refusal, one spelling.
+# Terminal and GREPPABLE (`REFUSED(rail-deadline:<elapsed>s/<bound>s, <pr>)`) and
+# exit 1, so the next supervisor sees a FAILED ACTUATION instead of a live
+# process holding a slot. It never claims the run stalled: the bound that
+# expired is a policy bound on the attempt, and the merge decision is untouched.
+refuse_rail_deadline() {
+  local elapsed="$1"
+  say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s, ${PR:-?})"
+  if [ "${RAIL_DEADLINE_CLAMPED:-0}" -eq 1 ]; then
+    say_err "   The deadline in force was CLAMPED to the reachable ceiling: ${RAIL_DEADLINE_CEILING}s"
+  fi
+  say_err "   The WHOLE-ATTEMPT deadline is ADMIN_MERGE_RAIL_DEADLINE (currently ${RAIL_DEADLINE}s)."
+  say_err "   It exists because a bound on each wait is not a bound on the ATTEMPT: measured 2026-11-02,"
+  say_err "   five rails lived 32:46-59:09 with ZERO progress, each inside its own wait's bound."
+  say_err "   This is NOT a stall claim and NOT a verdict on any run: no merge decision is made here,"
+  say_err "   nothing is cleared green, and the head is parked for the next invocation to re-run."
+  if [ "${RAIL_DEADLINE}" -ge "${RAIL_DEADLINE_CEILING}" ] 2>/dev/null; then
+    # AT THE CEILING THE OLD REMEDY WAS IMPOSSIBLE: "raise it up to the ceiling" is
+    # a no-op when it already IS the ceiling, and following it reproduces the same
+    # refusal after another full attempt (review cycle 2, P2).
+    say_err "   The bound is ALREADY at its reachable ceiling (${RAIL_DEADLINE_CEILING}s = the sum of the"
+    say_err "   phase bounds this guard supervises), so raising ADMIN_MERGE_RAIL_DEADLINE cannot help."
+    say_err "   Raising it means raising a PHASE bound (FIRST_CHECKS_CEILING / RERUN_BUDGET / SELF_EDIT_WAIT"
+    say_err "   / MERGE_REF_WAIT) and saying why — or accepting that this head needs an operator look."
+  else
+    say_err "   Raise it (ADMIN_MERGE_RAIL_DEADLINE) only up to ${RAIL_DEADLINE_CEILING}s — beyond that it cannot fire."
+  fi
+  exit 1
+}
+
+# rail_guard_poll — called at the head of EVERY poll iteration. One clock, one
+# comparison, one exit, so the attempt's age cannot drift between wait loops
+# (`lane-merge.sh:130`: "ONE absolute operation deadline ... instead of
+# resetting a fresh timeout at each phase").
+rail_guard_poll() {
+  local now elapsed
+  rail_attempt_start
+  now="$(rail_now)"
+  case "$now" in
+    ''|*[!0-9]*)
+      say_err "admin-merge: ✗ BLOCK — REFUSED(rail-deadline:clock-unreadable, ${PR:-?})"
+      say_err "   The attempt clock could not be read (`date +%s` failed), so the whole-attempt deadline"
+      say_err "   cannot be evaluated. Refusing rather than proceeding with an unenforceable bound."
+      exit 1 ;;
+  esac
+  elapsed=$(( now - RAIL_STARTED_AT ))
+  if [ "$elapsed" -ge "${RAIL_DEADLINE:-0}" ]; then
+    refuse_rail_deadline "$elapsed"
+  fi
+  # ── #3287's terminal-state re-read, preserved through #3294's clock ──────────
+  # It is ORTHOGONAL to the deadline: it stops a rail early when the PR itself reached
+  # a terminal state (MERGED/CLOSED), where the deadline stops an attempt that outlived
+  # its own bounds. Both were added to this same function on different bases, so the
+  # integration keeps BOTH rather than picking a side.
+  # Throttled on ELAPSED TIME, not tick count: a spinning silent branch polls every ~1s
+  # while a FIRST-CHECKS poll is every 60s, so a tick-based throttle is ~6s in one loop
+  # and ~6min in the other — wrong in both directions. 60s is the value the comment claims.
+  RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
+  if [ -n "${RAIL_LOCK_PR:-}" ] \
+     && [ $((now - RAIL_LAST_TERMINAL_CHECK)) -ge "$RAIL_TERMINAL_CHECK_EVERY" ]; then
+    RAIL_LAST_TERMINAL_CHECK=$now
+    rail_stop_if_pr_terminal
+  fi
+  return 0
 }
 
 # fetch_run_jobs <run-id> → the raw jobs JSON on stdout. The API rather than
@@ -5357,6 +5658,7 @@ wait_for_first_checks() {
     # A non-positive remaining is a BUG in the verdict table above, not a reason to
     # spin: floor it at one second (the loop's own bound still applies next poll).
     [ "$adv" -gt 0 ] || adv=1
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     sleep "$adv"
   done
 }
@@ -5685,6 +5987,7 @@ settle_self_edit_generation() {
     step="$POLL_INTERVAL"
     [ "$step" -gt 0 ] 2>/dev/null || step=1
     [ "$step" -gt $((SELF_EDIT_WAIT - waited)) ] && step=$((SELF_EDIT_WAIT - waited))
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     [ "$step" -gt 0 ] && sleep "$step"
     waited=$((waited + step))
   done
@@ -6668,6 +6971,7 @@ wait_for_run() {
     if [ -z "$status" ] || [ "$status" = "unknown" ]; then
       adv=$((10#$step))
       [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+      rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
       [ "$adv" -gt 0 ] && sleep "$adv"
       unobs=$((unobs + adv)); waited=$((waited + adv)); continue
     fi
@@ -6691,6 +6995,7 @@ wait_for_run() {
     fi
     adv=$((10#$step))
     [ "$adv" -gt $((RERUN_TIMEOUT - waited)) ] && adv=$((RERUN_TIMEOUT - waited))
+    rail_guard_poll   # THE WHOLE-ATTEMPT DEADLINE — checked every poll, so a rail cannot cross four waits and still live
     [ "$adv" -gt 0 ] && sleep "$adv"
     waited=$((waited + adv))
   done
@@ -6792,6 +7097,17 @@ print_bounds() {
   # runs being waited on. It is a floor on patience, never a claim that a shorter
   # silence means a wedged run.
   printf 'first-checks-stall=%s\n' "$FIRST_CHECKS_STALL"
+  # THE BOUND IN FORCE, NOT THE DEFAULT — AND NOT THE RAW KNOB EITHER (cycle 3,
+  # P2 x2). The guard runs ABOVE this function, so `RAIL_DEADLINE` is already
+  # resolved and already CLAMPED; reading `$ADMIN_MERGE_RAIL_DEADLINE` here
+  # reproduced the very fault this line exists to prevent (one invocation printed
+  # `rail-deadline=33664` beside `CLAMPED to the reachable 20254s`). There is no
+  # INVALID arm: a bad knob exits 2 in `rail_attempt_start` before this function
+  # runs, so such an arm could never execute and a comment claiming it would
+  # misdescribe the code.
+  printf 'rail-deadline=%s%s\n' "${RAIL_DEADLINE:-$(rail_deadline_default)}" \
+    "$([ "${RAIL_DEADLINE_CLAMPED:-0}" -eq 1 ] && printf ' (CLAMPED from %s)' "${ADMIN_MERGE_RAIL_DEADLINE:-}" || printf ' (in force)')"
+  printf 'rail-deadline-source=CEILING over the WHOLE ATTEMPT = FIRST_CHECKS_CEILING %ss + RERUN_BUDGET %ss + SELF_EDIT_WAIT %ss + MERGE_REF_WAIT %ss — the SUM of the phase bounds the guard supervises, so a value above it can never fire and is CLAMPED; an attempt may spend one full-length first-checks wait and one re-run phase, and no more.\n' "$(_rail_knob "${FIRST_CHECKS_CEILING:-0}")" "$(_rail_knob "${RERUN_BUDGET:-0}")" "$(_rail_knob "${SELF_EDIT_WAIT:-0}")" "$(_rail_knob "${MERGE_REF_WAIT:-0}")"
   printf 'first-checks-ceiling=%s\n' "$FIRST_CHECKS_CEILING"
   printf 'first-checks-window=%s\n' "$FIRST_CHECKS_WAIT"
   printf 'first-checks-poll=%s\n' "$FIRST_CHECKS_POLL"
@@ -8318,51 +8634,24 @@ RAIL_LOCK_ROOT="${ADMIN_MERGE_LOCK_ROOT:-${HOME}/.pi/agent/state/rail-locks}"
 RAIL_LOCK_HELD=0
 RAIL_LOCK_PATH=""
 RAIL_LOCK_PR=""
-RAIL_STARTED_AT="$(date +%s)"
 RAIL_POLL_TICKS=0
-# ONE ABSOLUTE BOUND FOR THE WHOLE ATTEMPT.
-# ⛔ IT MUST EXCEED EVERY WAIT THE RAIL IS *ALLOWED* TO TAKE, or it becomes a second,
-# tighter gate that false-blocks healthy PRs (review finding 7). A rail legitimately
-# inside `wait_for_first_checks` may spend the FIRST-CHECKS CEILING (18064s by default)
-# and then still owe a RE-RUN wait (derived per shard, >= the fail-safe 3900s) and a
-# re-collection. So the attempt bound is the ceiling plus BOTH fail-safe per-wait
-# bounds, and an expired deadline can only fire on an attempt that has genuinely
-# outlived every window the rail itself declared.
-# ⛔ THE DEFAULT MUST EXCEED WHAT THE RAIL IS ALLOWED TO SPEND, or this becomes a second,
-# tighter gate that false-blocks healthy PRs (cycle-2 finding 3; cycle-3 finding 1 caught
-# the first attempt at this being TIGHTER than the formula it replaced, and still below
-# FIRST_CHECKS_CEILING + one fail-safe re-run wait = 21964s, so a queue-bound PR spending
-# its declared ceiling plus one re-run would have been refused and its head PARKED).
-# The arithmetic it must cover: `wait_for_first_checks` may spend FIRST_CHECKS_CEILING, and
-# the re-run wait is taken ONCE PER FAILING RUN with a bound of max(RERUN_FLOOR, 2 x
-# green_max) that is NOT clamped to the fail-safe. So the default is the ceiling plus FOUR
-# fail-safe re-run waits, and it is EXPRESSED IN TERMS OF THE KNOBS so that raising
-# ADMIN_MERGE_FIRST_CHECKS_CEILING raises the deadline with it (cross-checked in
-# `validate_rail_bounds`).
-# ⛔ SOURCE-TIME ARITHMETIC MUST NOT READ AN UNVALIDATED KNOB (#1690's class, re-hit here).
-# The two lines below run when the file is SOURCED, but `validate_timing_knobs` only runs
-# inside `main()` — so the derivation would be the first thing to touch a knob nobody has
-# validated yet. `018064` is a fine DECIMAL to the validator and ILLEGAL OCTAL to the
-# arithmetic, so the shell died with `value too great for base` at this line instead of
-# emitting the validator's NAMED refusal. Measured on the composed head: the `(P1-18)` arms
-# for ADMIN_MERGE_FIRST_CHECKS_CEILING and ADMIN_MERGE_RERUN_TIMEOUT_FALLBACK both reddened,
-# the message naming a line number instead of a knob.
-# So an operand that is not a plain positive decimal yields 0 here, and the derived default
-# becomes 0. That value is never USED: `validate_timing_knobs` refuses the malformed knob BY
-# NAME and exits before any rail logic runs, and a genuinely-0 deadline (an operator-supplied
-# junk ADMIN_MERGE_RAIL_DEADLINE) is then refused BY NAME by `validate_rail_bounds`.
-_as_dec_or_zero() {
-  case "$1" in ''|*[!0-9]*) printf '0'; return 0 ;; esac
-  if counter_has_leading_zero "$1"; then printf '0'; return 0; fi
-  printf '%s' "$1"
-}
-RAIL_DEADLINE="${ADMIN_MERGE_RAIL_DEADLINE:-$(( $(_as_dec_or_zero "$FIRST_CHECKS_CEILING") + $(_as_dec_or_zero "$FAILSAFE_RERUN_TIMEOUT") * 4 ))}"
-# TTL is DERIVED from the deadline so the two can never cross: a lease must outlive the
-# attempt that holds it, or a rail still running inside its own deadline could have its
-# lease stolen and two rails would then hold the same PR. `validate_rail_bounds` enforces
-# the relation for any operator override. The +3600 goes through the same guard, so a junk
-# ADMIN_MERGE_RAIL_DEADLINE cannot crash the derivation either.
-RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-$(( $(_as_dec_or_zero "$RAIL_DEADLINE") + 3600 ))}"
+# ⛔ THE OPERATOR OVERRIDE IS VISIBLE AT LOAD TIME EVEN THOUGH THE DERIVED VALUE IS NOT.
+# The lease machinery (`rail_lock_acquire`) is exercised STANDALONE by its own harness,
+# with no attempt started, so a TTL that existed only inside `rail_attempt_start` would be
+# invisible there and an explicitly-supplied `ADMIN_MERGE_LOCK_TTL` would silently not
+# expire a lease. The DERIVED default (deadline + 3600) still needs the resolved bound and
+# is set in `rail_attempt_start`; an EMPTY value here means "derive it there".
+RAIL_LOCK_TTL="${ADMIN_MERGE_LOCK_TTL:-}"
+# ONE ABSOLUTE BOUND FOR THE WHOLE ATTEMPT — AND IT IS RESOLVED AT CALL TIME, NOT HERE.
+# ⛔ THIS BLOCK USED TO DERIVE `RAIL_DEADLINE` AND `RAIL_LOCK_TTL` WHEN THE FILE WAS
+# SOURCED (`ADMIN_MERGE_RAIL_DEADLINE:-FIRST_CHECKS_CEILING + 4 x FAILSAFE_RERUN_TIMEOUT`
+# = 33,664s), and to stamp `RAIL_STARTED_AT` here as well. Both are now owned by
+# `rail_attempt_start` (#3294's REACHABLE bound): a load-time default of 33,664s sits
+# ABOVE every phase bound that could carry the attempt there, so it can never fire, and
+# a load-time `RAIL_STARTED_AT` made the idempotent start a no-op that silently skipped
+# the seam and the validation. The reachable ceiling is the SUM of the phase bounds this
+# guard supervises, which are declared LATER in this file — so it can only be computed at
+# call time. See `rail_deadline_default` / `rail_attempt_start`.
 # How many 50ms slices a rail waits for an incumbent lease to publish its pid before it
 # decides. 40 = 2s; the publish gap is microseconds, so this only ever absorbs the gap.
 RAIL_LOCK_PUBLISH_WAIT="${ADMIN_MERGE_LOCK_PUBLISH_WAIT:-40}"
@@ -8423,6 +8712,16 @@ rail_lock_restore() {
 
 rail_lock_acquire() {
   local key="$1" prefix dir holder started now age acquired=0 stale stolen expired=0 _m sage _t
+  # ⛔ THE TTL MUST EXIST ON EVERY PATH THAT REACHES THIS FUNCTION, INCLUDING THE STANDALONE
+  # ONE. `rail_attempt_start` derives it from the RESOLVED deadline, but this function is
+  # also called directly by a harness (and by any future caller) with no attempt started —
+  # where the derived value has not been set yet. Leaving it EMPTY is not harmless: the age
+  # comparisons below are `[ "$RAIL_LOCK_TTL" -gt 0 ]`, which on an empty operand ERRORS and
+  # takes the false branch, silently DISABLING the age bound — the "PR blocked forever
+  # behind a recycled pid" defect the TTL exists to prevent, with only a raw bash
+  # `integer expression expected` as the signal. Measured on this tree before the fix.
+  # The fallback is the same derivation `rail_attempt_start` uses, so the two cannot drift.
+  RAIL_LOCK_TTL="${RAIL_LOCK_TTL:-$(( $(rail_deadline_default) + 3600 ))}"
   RAIL_LOCK_PR="${key##*-}"
   # ⛔⛔ OFF BY DEFAULT — NOT SHIPPED AS A GATE (review cycle 6, MEASURED).
   # The per-PR lease is NOT CERTIFIED and must not hold a merge back until it is. Six
@@ -8641,34 +8940,15 @@ rail_stop_if_pr_terminal() {
 # self-edit wait, the RE-RUN wait, and main's #1417 re-read pass.
 # It is NOT on the two ATTEMPT-bounded retry loops (the head read at :2193 and
 # `poll_merge_artifact`'s attempt loop): those stop after a fixed number of attempts and a
-# deadline check there would add nothing. That distinction is the accurate claim (review
-# finding 9). It decides no verdict:
+# deadline check there would add nothing. It decides no verdict:
 #   1. the whole-attempt deadline (REFUSED(rail-deadline:…) then EXIT);
 #   2. the terminal-state re-read, throttled on ELAPSED TIME (ADMIN_MERGE_TERMINAL_CHECK_EVERY,
-#      default 60s) — NOT on a tick count, which would be ~6s in a wait that polls every
-#      second and ~6min in one that polls every 60s.
-rail_guard_poll() {
-  RAIL_POLL_TICKS=$((RAIL_POLL_TICKS + 1))
-  local now elapsed
-  now="$(date +%s)"
-  elapsed=$((now - RAIL_STARTED_AT))
-  # The terminal re-read is throttled on ELAPSED TIME, not tick count (review finding 8):
-  # a spinning silent branch polls every ~1s while a FIRST-CHECKS poll is every 60s, so a
-  # tick-based throttle is ~6s in one loop and ~6min in the other — wrong in both
-  # directions. 60s is the value the comment claims.
-  RAIL_TERMINAL_CHECK_EVERY="${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}"
-  if [ "${RAIL_DEADLINE:-0}" -gt 0 ] 2>/dev/null && [ "$elapsed" -ge "$RAIL_DEADLINE" ]; then
-    say_err "admin-merge: ✗ REFUSED(rail-deadline:${elapsed}s/${RAIL_DEADLINE}s) — the rail has spent its whole-attempt bound (ADMIN_MERGE_RAIL_DEADLINE, default FIRST_CHECKS_CEILING ${FIRST_CHECKS_CEILING}s + 4 x the fail-safe per-wait bound ${FAILSAFE_RERUN_TIMEOUT}s, i.e. ${RAIL_DEADLINE}s - i.e. every window the rail itself declares). Every individual wait in this rail DOES bound itself; the ATTEMPT is what was unbounded, and it is bounded now. This is a refusal to keep holding the merge slot, NOT a verdict about the PR: no check was made green, widened, skipped or muted, and the head-bound review evidence is untouched. Re-run the rail when the runs are readable — it re-evaluates from scratch."
-    rail_lock_release
-    exit 1
-  fi
-  if [ -n "${RAIL_LOCK_PR:-}" ] \
-     && [ $((now - RAIL_LAST_TERMINAL_CHECK)) -ge "$RAIL_TERMINAL_CHECK_EVERY" ]; then
-    RAIL_LAST_TERMINAL_CHECK=$now
-    rail_stop_if_pr_terminal
-  fi
-  return 0
-}
+#      default 60s) — NOT on a tick count.
+# ⛔ THERE IS EXACTLY ONE DEFINITION OF THIS FUNCTION, and it lives near the deadline
+# machinery it depends on. #3287 (landed on main) and #3294 both ADDED a whole-attempt
+# deadline to different bases; the textual merge kept BOTH definitions, so the later one
+# silently shadowed the other and #3294's reachable bound became dead code. The single
+# surviving definition below implements BOTH concerns.
 validate_rail_bounds() {
   # ⛔ THE TWO NEW KNOBS ARE VALIDATED BEFORE ANYTHING READS THEM (finding 2, cycle 2,
   # MEASURED: `ADMIN_MERGE_RAIL_DEADLINE=7h` made `[ "$RAIL_DEADLINE" -gt 0 ]` error out, so
@@ -8676,26 +8956,62 @@ validate_rail_bounds() {
   # `ADMIN_MERGE_TERMINAL_CHECK_EVERY=60s` never fired. A typo silently restoring the very
   # hang this bound exists to end is the exact defect this file already refuses for every
   # other timing knob, so these two get the same refusal instead of a quiet no-op.
-  case "${RAIL_DEADLINE}" in
-    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the whole-attempt bound must be a positive integer NUMBER OF SECONDS; a non-numeric value makes the deadline comparison error out and silently removes the bound this exists to impose."; exit 2 ;;
-  esac
-  [ "$RAIL_DEADLINE" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — 0 is not 'unlimited', it is a refusal to bound the attempt at all. Set a positive number of seconds."; exit 2; }
-  case "${RAIL_LOCK_TTL}" in
-    ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."; exit 2 ;;
-  esac
-  # ⛔ 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent (finding 4,
-  # cycle 3): `[ "$RAIL_LOCK_TTL" -gt 0 ]` goes false, so a SIGKILLed rail's lease whose pid
-  # was reused by a long-lived fleet process is never reclaimable and the head is parked.
-  # Same refusal as RAIL_DEADLINE=0, for the same reason.
-  [ "$RAIL_LOCK_TTL" -gt 0 ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."; exit 2; }
-  # ⛔ THE TTL MUST OUTLIVE THE ATTEMPT, or a live rail can have its own lease stolen
-  # mid-run by a later rail. Cross-check, matching this file's existing CEILING-vs-STALL rule.
-  [ "$RAIL_LOCK_TTL" -gt "$RAIL_DEADLINE" ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${RAIL_LOCK_TTL}' with ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — the lease TTL must EXCEED the whole-attempt bound, or a rail still running inside its own deadline can have its lease stolen and two rails would then hold the same PR."; exit 2; }
-  # ⛔ THE DEADLINE MUST NOT FIRE BEFORE A WAIT THE RAIL DECLARES MAY LEGALLY FINISH
-  # (cycle-3 finding 1, secondary). Without this, raising ADMIN_MERGE_FIRST_CHECKS_CEILING —
-  # a documented knob — leaves the deadline behind, and the rail refuses DURING a wait it
-  # itself declared legal.
-  [ "$RAIL_DEADLINE" -gt "$FIRST_CHECKS_CEILING" ] || { say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${RAIL_DEADLINE}' — it must EXCEED ADMIN_MERGE_FIRST_CHECKS_CEILING='${FIRST_CHECKS_CEILING}', or the whole-attempt bound fires in the middle of a first-checks wait the rail itself declares legal."; exit 2; }
+  # ⛔ THIS VALIDATES THE **RAW OPERATOR KNOBS**, NOT THE RESOLVED BOUNDS — and that split
+  # is load-bearing after the #3287/#3294 integration, so do not "simplify" it back.
+  #   · A harness (and an operator) calls this function STANDALONE, with no attempt started,
+  #     so `RAIL_DEADLINE`/`RAIL_LOCK_TTL` are still EMPTY here. Validating the RESOLVED
+  #     values made EVERY invocation refuse — including the valid one.
+  #   · The resolved bound (reachable ceiling, clamp, TTL relation) is owned by
+  #     `rail_attempt_start`, which resolves at CALL TIME because two of the four phase
+  #     bounds it sums are declared later in this file than this function runs.
+  # These knobs are refused BY NAME for the same reason as every other timing knob here:
+  # `[ -ge ]` on a non-integer makes the guard's comparison ERROR, and under `set -u`
+  # without `-e` an erroring body is SKIPPED — so a typo DELETES the bound (measured:
+  # `ADMIN_MERGE_RAIL_DEADLINE=7h` ran with NO bound at all).
+  local _raw_deadline="${ADMIN_MERGE_RAIL_DEADLINE:-}"
+  if [ -n "$_raw_deadline" ]; then
+    case "$_raw_deadline" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — the whole-attempt bound must be a positive integer NUMBER OF SECONDS; a non-numeric value makes the deadline comparison error out and silently removes the bound this exists to impose."
+        exit 2 ;;
+    esac
+    # LENGTH BEFORE ANY ARITHMETIC: an all-digit value past the shell's integer range makes
+    # the comparison print a raw overflow instead of a NAMED refusal.
+    if [ "${#_raw_deadline}" -gt 9 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — beyond the usable integer range. An all-digit value past the shell's range makes the comparison error out, SKIPPING the guard."
+      exit 2
+    fi
+    if [ "$_raw_deadline" -eq 0 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — 0 is not 'unlimited', it is a refusal to bound the attempt at all. Set a positive number of seconds."
+      exit 2
+    fi
+    case "$_raw_deadline" in
+      0*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_RAIL_DEADLINE='${_raw_deadline}' — a LEADING ZERO is ambiguous. Write it without the leading zero (e.g. '19864', not '019864')."
+        exit 2 ;;
+    esac
+  fi
+  # ⛔ 0 IS NOT "NO EXPIRY", it is the permanent block this TTL exists to prevent: a
+  # SIGKILLed rail's lease whose pid was reused by a long-lived fleet process is never
+  # reclaimable and the head is parked. The relation to the deadline (a TTL must EXCEED it,
+  # or a live rail can have its own lease stolen mid-run) is enforced in
+  # `rail_attempt_start`, where BOTH operands are resolved.
+  local _raw_ttl="${ADMIN_MERGE_LOCK_TTL:-}"
+  if [ -n "$_raw_ttl" ]; then
+    case "$_raw_ttl" in
+      ''|*[!0-9]*)
+        say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${_raw_ttl}' — the lease TTL must be a positive integer NUMBER OF SECONDS; a non-numeric value disables lease expiry, which can block a PR forever behind a recycled pid."
+        exit 2 ;;
+    esac
+    if [ "${#_raw_ttl}" -gt 9 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${_raw_ttl}' — beyond the usable integer range, so the expiry comparison would error out and never expire."
+      exit 2
+    fi
+    if [ "$_raw_ttl" -eq 0 ]; then
+      say_err "admin-merge: ✗ refusing ADMIN_MERGE_LOCK_TTL='${_raw_ttl}' — 0 is not 'never expire', it is a lease that can block a PR FOREVER behind a recycled pid. Set a positive number of seconds."
+      exit 2
+    fi
+  fi
   case "${ADMIN_MERGE_TERMINAL_CHECK_EVERY:-60}" in
     ''|*[!0-9]*) say_err "admin-merge: ✗ refusing ADMIN_MERGE_TERMINAL_CHECK_EVERY='${ADMIN_MERGE_TERMINAL_CHECK_EVERY}' — it must be a positive integer NUMBER OF SECONDS, or the terminal-state exit never fires."; exit 2 ;;
   esac
@@ -9080,6 +9396,14 @@ main() {
   # which repo's timings were measured and reported — the same leak, one symptom over (§2235
   # review P1: the arm exits ~20 lines before the resolver, and no test covers it because
   # every `--print-bounds <run-id>` arm in the suite passes `--repo`).
+
+  # ⛔ THE ATTEMPT CLOCK STARTS, AND IS CHECKED, BEFORE THE FIRST API CALL — AND
+  # before the repo resolver, which is itself a `gh` call on its fallback arm
+  # (review cycle 2, P2: the guard used to sit BELOW `resolve_rail_repo`, so a
+  # knob/deadline fault was reported as "the repo could not be resolved"). A
+  # deadline wired only into the poll loops bounds nothing on a rail that never
+  # reaches one, and an expired rail must spend no API budget proving it.
+  rail_guard_poll
   resolve_rail_repo "$REPO" || exit 2
   REPO="$RAIL_REPO"
   # ⛔ (c) PER-PR EXCLUSION — before ANY CI work, comment or merge (#3194).
@@ -9107,6 +9431,7 @@ main() {
   case "$PR" in *[!0-9]*) say_err "admin-merge: PR must be numeric (got '$PR')"; exit 2 ;; esac
   [ -x "$CFS" ] || [ -f "$CFS" ] || { say_err "admin-merge: parser not found at $CFS"; exit 1; }
   BASH="${BASH:-bash}"
+
 
   # ── 0. THE REPO IS DECIDED BY EVIDENCE, BEFORE ANY API CALL (#2235) ──────
   # (The resolution itself runs ABOVE `--print-bounds` — see the note there; this is the

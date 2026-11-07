@@ -1,12 +1,12 @@
 ---
-title: "GitHub API rate limits — detection & fallback runbook (#143, #1988)"
+title: "GitHub API rate limits — detection & fallback runbook (#143, #1988, #3429)"
 type: engineering
 domain: operations
 doc_status: live
 subjects.team: organisation-design-team
 created: 2026-08-10
 aboutSubjects: organisation-design-team
-aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, gh-rate-limits, gh-limit
+aboutObjects: agent-infra, issue-143, issue-1762, issue-1988, issue-2139, issue-2143, issue-2227, issue-2342, issue-3429, issue-3584, issue-3627, gh-rate-limits, gh-limit, gh-cred, github-app-installation
 ---
 
 # GitHub API rate limits — detection & fallback runbook
@@ -1060,3 +1060,169 @@ gh api -X PATCH repos/{owner}/{repo}/issues/{n} --input - <<< '{"state":"closed"
 - Prefer one REST call per fact over repeated `gh ... view` calls in loops.
 - PR review records, merges, and issue closes are idempotent-safe: check current state
   before retrying after a rate-limit error.
+
+---
+
+## Which credential — the App installation bucket (#3429)
+
+Everything above bounds **how much** the fleet spends. None of it changed **where** the spend lands,
+and the whole fleet's reads landed on the ONE 5,000/hour `core` budget that the landing rail also
+needs. Measured on #3429: `core` reached `0/5000` at 06:10Z, 07:10Z and 07:20Z on a single day —
+2,609 → 0 in 40 minutes, ~65 calls/min — while GraphQL still held 4,321. The consequence is #3584:
+reads ate the budget `provision` needed, the board came back unparsable, the claim gate went
+INCOMPLETE, dispatch stopped, `DRAIN DEADLOCK — no PR merged in 360m`.
+
+A **GitHub App installation token has its own bucket**, so reads stop competing with the rail's
+writes. Primary sources (docs.github.com, fetched 2026-11-06):
+
+| fact | value | source |
+|---|---|---|
+| installation token lifetime | **1 hour, fixed, not configurable** | *"The installation access token will expire after 1 hour."* — `apps/creating-github-apps/authenticating-with-a-github-app/generating-an-installation-access-token-for-a-github-app` |
+| per-installation primary limit | **5,000/hr base**, `+50/hr` per repo and `+50/hr` per org user beyond 20 each, capped at **12,500** (15,000 GHEC) | `rest/using-the-rest-api/rate-limits-for-the-rest-api` |
+| an app acting **on your behalf** drains YOUR bucket | the installation bucket is separate *because* it does not act on anyone's behalf | same page: *"if an app with a 15,000 request limit makes 10,000 requests on your behalf, you will have exhausted the 5,000 request budget for your personal access tokens"* |
+
+### The one decision function
+
+`scripts/orchestrator-harness/gh-cred.py` answers *which credential* and *why*, as a NAMED arm.
+`gh-limit.py` calls it from the one place it executes the real `gh` (its `run()`), so every call site
+goes through it and none can opt out. The arms, **in order — the order is the security boundary**:
+
+| # | condition | arm | credential |
+|---|---|---|---|
+| 0 | the call is the **meter** (`gh api rate_limit`) or credential **introspection** (`gh auth …`) | `purpose:meter` / `purpose:introspect` | user |
+| 1 | the call is **provably a write** (`gh api` with a non-GET method or data flags) | `write` | user |
+| 1b | the verb is **not on the read allow-list** — which covers every unlisted mutate verb | `not-provably-read` | user |
+| 2 | `GH_CRED_APP=0` | `disabled` | user |
+| 3 | no readable private key | `no-key` | user |
+| 4 | minting the installation token failed (negative-cached for `GH_CRED_MINT_COOLDOWN`, 60 s) | `mint-failed` | user |
+| 5 | the app bucket is at or below the floor (`GH_CRED_FLOOR`, default **500**) | `floor` | user |
+| 6 | the App served the call and it **failed** (dry bucket → `app-dry`, anything else → `app-refused`) | `app-dry` / `app-refused` | user — after ONE retry |
+| 7 | otherwise — **only a provably-read verb** | `app` | **app** |
+
+**Arm 1b is the fail-closed one, and it exists because the first version was not.** That version asked
+`is_mutating()`, whose `MUTATING_PAIRS` is a *partial* table by design (the file says so), so
+`gh issue lock`, `gh run delete`, `gh workflow disable` and `gh issue pin` were all routed to the
+installation token. Nothing in this code checks that the installation is read-only — that is a
+*deployment* assumption — so an install carrying any write permission would have executed those as the
+App bot, unattributable, on the rail's own surfaces. The question is therefore inverted: **the app is
+used only for a verb that is provably a read**, and everything else keeps the user credential. The
+cost of a miss is a read that stays on the user bucket, visible as `not-provably-read` in `--stats`
+and fixed by adding the verb; the cost of the other direction cannot be retried away. Arm 6's trigger
+is **"the app served it and it failed"**, not a text allowlist — an installation 404 (a repo outside
+its scope) and an installation rate-limit 403 read nothing alike, and the first version matched
+neither.
+
+**Arm 0 is not a preference — it is what keeps this change from disarming the layer it sits in.**
+`gh api rate_limit` is what the pacing layer reads to decide whether the *account* is out. Served
+from the installation token it would report the **app's** remaining and tell `gh-limit` the user
+bucket is healthy, clearing a live limit from inside the fix. `gh auth …` is the same class the other
+way: those verbs introspect the credential on disk, so substituting a token would make
+`gh auth token` lie.
+
+**What this change does NOT touch (the #3429 contradiction test).** #3429 keeps the two-bucket
+*pacing* decision function as future work and never claims the App replaces it. So the core floor,
+the budget gates, the box lock / single flight, the documented backoff, the ETag and pass caches, and
+the REST/GraphQL failover all behave exactly as they did. The App changes the credential, never the
+pacing.
+
+### Operator note
+
+```bash
+~/orchestrator/gh-app-token --status    # the APP budget and the USER budget, side by side
+~/orchestrator/gh-app-token --stats     # which arm served what + the read-on-user regression count
+~/orchestrator/gh-app-token --refresh   # force a new installation token
+~/orchestrator/gh-app-token --which -- pr view 123   # which credential WOULD serve this, and why
+```
+
+- **Where the key lives:** `~/.pi/agent/gh-app.pem`, mode `0600`, **static — it is never rotated on a
+  schedule.** App ID `5649054`, installation `179404600`, permissions read-only, no event
+  subscriptions. Nothing in this repo ships or copies it (see *Blast radius*).
+- **Nothing has to be renewed.** The token has a 1-hour ceiling that GitHub does not let us raise; the
+  answer is not a longer token but **zero scheduled maintenance**: mint on demand, cache at 0600,
+  re-mint inside the last 5 minutes (`GH_CRED_RETIRE_MARGIN`), and re-mint transparently when a cached
+  token has already expired. **If a change to this layer needs a timer, a cron or a manual step to
+  keep working, it is wrong.**
+- **How to tell which credential served a call:** each decision writes one line to
+  `~/.pi/agent/gh-cred/decisions.log` (`arm=… kind=… why=… argv=…`) and bumps a counter;
+  `--stats` is the summary. The child also receives `GH_CRED_SERVED_ARM`.
+- **If the key is revoked or deleted:** every read falls back to the user credential with the NAMED
+  arm `mint-failed` (or `no-key`), which is *today's* behaviour and is therefore safe — but it is the
+  bug this change exists to prevent, so `--stats` will show reads accumulating on the user bucket.
+  Re-place the key, run `--refresh`, and the fleet returns to the installation bucket with no restart.
+- **The regression signal:** `--stats` reports `reads-on-user-unjustified`. **It must be 0.** A read
+  served by the user credential with no arm behind it means the layer is not wired, and `--stats`
+  exits **3** so a check can gate on it. Every legitimate fallback names its arm, so the two are
+  never confused.
+- **Turning it off:** `GH_CRED_APP=0` returns the whole fleet to the user credential, with no code
+  change, and every read is then counted as `disabled` (visible, not silent).
+
+### Blast radius, and why the key is not copied to cells
+
+The owner's constraint is explicit: **do not copy the private key per lane or per cell.** That is
+enforced by layout, not by convention — `deploy-harness.sh` copies every file under
+`scripts/orchestrator-harness/`, and the key lives at `~/.pi/agent/gh-app.pem`, outside every
+checkout. So no deploy can propagate it.
+
+- **A box with the key (the controller):** compromise yields **read-only** access to the repositories
+  the App is installed on — the installation holds `checks:read`, `pull_requests:read`,
+  `actions:read`, `contents:read`, `metadata:read` and nothing else. It **cannot** write, merge, push
+  or comment. Revocation is one action (replace the key); live tokens then expire within the hour on
+  their own.
+
+  ⛔ **AND THAT GRANT DOES NOT COVER ISSUES.** `contents:read` is files and commits; an *issue* is a
+  different resource family. Every issue read is therefore REFUSED by the installation — `403 Resource
+  not accessible by integration` where the call is REST (`gh api …/issues/…`), and a GraphQL `errors`
+  body for the `issue` subcommands, which go over the GraphQL transport — matches **no specific arm**,
+  takes the generic `app-refused` fallback, and is answered by the user credential: **two requests per
+  issue read, one burned on the app bucket**, and the spend **repeats on every call**, because a scope
+  refusal records no state (`_app_dry` only remembers a *rate-limit* refusal). A box whose installation
+  does not cover the repository it works on pays the app request forever rather than learning to skip
+  it. That is deliberate — a "this argv's app arm refuses" memory is cross-process product work, not
+  this change — and it is the cheap direction, but it should be known, not discovered from the meter.
+
+  It matters more than it sounds, because issue reads are the fleet's primary read surface. Verified
+  readers include `refresh-candidates.sh` (the board), `merged-not-closed.sh`, `merge-reminder.py`,
+  `turn-end.py`, `undelivered-answers.py`, `lane.sh`, `review-pr.sh` and `turn-classify.py` — so the
+  split this change exists to create does not cover them until the grant is widened.
+
+  **Widening the installation is an OWNER ACTION** — a permissions change on the GitHub App, not a
+  code change: grant **`Issues: read`** on the installation. There is no separate `issue_comments`
+  permission — issue comments sit UNDER the `Issues` permission (GitHub's App permission reference
+  lists `Comments` as an endpoint group inside `Issues`), so `Issues: read` covers `gh issue view`,
+  `gh issue list` and the comment endpoints together. Nothing in the code needs to change for the app
+  arm to start covering issue reads.
+
+  ⛔ **AND READ THE MEASUREMENT AS AN UPPER BOUND, NOT A COUNT.** `app-refused` is the arm a widened
+  grant would shrink, so the `app-refused` count BEFORE and AFTER the grant is what answers "has the
+  grant taken effect?". (Note `--stats` is per-ARM and takes no arguments — it cannot slice by argv.
+  `~/.pi/agent/gh-cred/decisions.log` carries one `arm=… kind=… argv=…` row per **REQUEST** decision
+  — `meter`, `introspect` and every `--which` write NO row, since the write is gated on
+  `purpose == "request" and record` — so it splits the **app ATTEMPTS** by argv, which is not the same
+  number as the refusals: a refusal is only counted, under `app-refused`, with no argv recorded. For an
+  issue-only view of attempts use the log; for refusals use the arm count, which cannot be sliced.)
+  But `app-refused` deliberately covers EVERY non-rate-limit app failure — a genuine 404 for a
+  deleted PR or a bogus path lands there too — so the count is an upper bound on permission refusals,
+  not a measure of them. Splitting 404 into its own arm would sharpen it, and is NOT done here: the
+  two-arm shape is the one this change pins in `gh-cred.test.sh` ("an installation 404 … named
+  arm=app-refused"), and reversing a pinned assertion to refine a diagnostic is not worth it inside a
+  fix round. Filed as #3627.
+
+  A **declared permission map** in `decide()` — routing an issue read straight to the user credential
+  so it never burns the app request — was considered and **rejected**, but NOT because the grant state
+  is unknowable: `POST /app/installations/{id}/access_tokens` returns the granted `permissions` map in
+  its 201 body, and `gh-cred.py:mint()` already receives that body (it reads `token` and `expires_at`
+  and drops the rest), so a LIVE grant map is one field away at zero extra requests. The reason is that
+  a **declared** map goes stale when the grant changes — and a stale map fails in the *dangerous*
+  direction (silently stranding reads on the user bucket, which is #3429's own defect), whereas the
+  current shape fails cheaply: one wasted request, attributed to a named arm. Plumbing the live map
+  into `decide()` is real follow-up work, not part of this change.
+- **A box without the key (the cells):** holds **no App secret at all** — blast radius zero. Its
+  reads fall back to the user credential and report the named arm `no-key`, so an unprotected box is
+  a *visible* condition rather than a silent one.
+
+**The distribution channel is deliberately NOT built here, and that is a decision, not an omission.**
+Minting centrally and shipping short-lived tokens to cells needs a transport; the cheapest correct one
+is a `refs/ghcred/<exp>` ref the boxes already know how to read, and it is filed as follow-up work
+rather than invented inside this change — a half-built secret-distribution path whose failure mode is
+a stale token silently served to a lane is worse than an honestly-unprotected cell that says `no-key`.
+The controller is where #3584's deadlock was measured, so the fix lands where the problem was.
